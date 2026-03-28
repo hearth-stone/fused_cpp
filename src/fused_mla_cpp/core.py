@@ -8,15 +8,20 @@ no external framework dependencies beyond torch.
 """
 from __future__ import annotations
 
+import concurrent.futures
 import logging
 import os
-from typing import Any
+from typing import Any, Callable, List, TypeVar
 
 import torch
 import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
-
+logger.setLevel(logging.DEBUG)
+if not logger.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setLevel(logging.DEBUG)
+    logger.addHandler(_handler)
 # ── C++ extension import (graceful fallback to PyTorch) ──────────────────────
 try:
     from fused_mla_cpp import _C
@@ -25,6 +30,39 @@ except ImportError:
     _C = None
     _HAS_CPP = False
     logger.warning("C++ extension not available, using PyTorch fallback")
+
+# ── Thread count configuration ──────────────────────────────────────────────
+_T = TypeVar("_T")
+_R = TypeVar("_R")
+
+
+def _parallel_map(
+    fn: Callable[[_T], _R],
+    items: List[_T],
+    num_threads: int,
+) -> List[_R]:
+    """Execute fn over items, in parallel when num_threads > 1.
+
+    Each worker thread calls ``torch.set_num_threads(1)`` before executing
+    ``fn`` to prevent nested inter-op / intra-op thread contention.
+
+    :param fn: Callable applied to each item.
+    :param items: List of inputs.
+    :param num_threads: Number of worker threads.  When <= 1 the function
+        falls back to a plain serial loop with no threading overhead.
+    :returns: List of results in the same order as *items*.
+    """
+    if num_threads <= 1 or len(items) <= 1:
+        return [fn(item) for item in items]
+
+    def _worker(item: _T) -> _R:
+        torch.set_num_threads(1)
+        return fn(item)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=num_threads) as pool:
+        futures = [pool.submit(_worker, item) for item in items]
+        return [f.result() for f in futures]
+
 
 # ── DEBUG switches (environment variable controlled) ─────────────────────────
 _DEBUG_USE_ORIG_RMSNORM = os.environ.get("FUSED_MLA_USE_ORIG_RMSNORM", "0") == "1"
@@ -254,6 +292,19 @@ class CPUFusedMLAImpl:
             self._rms_norm = _pytorch_rms_norm
         if _DEBUG_USE_ORIG_ROPE:
             self._apply_rope = _pytorch_apply_rope
+
+        # ── Thread count ─────────────────────────────────────────────────────
+        _env_threads = os.environ.get("FUSED_MLA_NUM_THREADS", "0")
+        try:
+            _env_val = int(_env_threads)
+        except ValueError:
+            _env_val = 0
+        self.num_threads: int = _env_val if _env_val > 0 else torch.get_num_threads()
+        logger.debug(
+            "CPUFusedMLAImpl: num_threads=%d (FUSED_MLA_NUM_THREADS=%r, "
+            "torch.get_num_threads()=%d)",
+            self.num_threads, _env_threads, torch.get_num_threads(),
+        )
 
     def set_attn_impl(self, attn_impl: Any) -> None:
         """No-op for compatibility with FusedMLAAttention."""
