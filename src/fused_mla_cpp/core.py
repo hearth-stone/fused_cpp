@@ -11,7 +11,7 @@ from __future__ import annotations
 import concurrent.futures
 import logging
 import os
-from typing import Any, Callable, List, TypeVar
+from typing import Any, Callable, List, Optional, TypeVar
 
 import torch
 import torch.nn.functional as F
@@ -244,6 +244,10 @@ class CPUFusedMLAImpl:
         qk_head_dim: int,
         v_head_dim: int,
         kv_b_proj: Any,
+        # Tensor Parallelism parameters
+        tp_size: int = 1,
+        tp_rank: int = 0,
+        reduce_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
         **kwargs,
     ) -> None:
         self.num_heads = num_heads
@@ -257,6 +261,19 @@ class CPUFusedMLAImpl:
         self.qk_rope_head_dim = qk_rope_head_dim
         self.qk_head_dim = qk_head_dim
         self.v_head_dim = v_head_dim
+
+        # Tensor Parallelism configuration.
+        # tp_size=1 (default) preserves existing single-rank behaviour with
+        # zero extra overhead.  When tp_size > 1 a reduce operation is
+        # performed after o_proj to sum partial results across all ranks.
+        self.tp_size: int = tp_size
+        self.tp_rank: int = tp_rank
+        # reduce_fn is a Python-level fallback hook used ONLY in unit tests
+        # and development (e.g. to mock the reduce without a real process
+        # group).  In production the C++ extension _C.tp_all_reduce is used
+        # instead and this field is ignored.
+        # Signature: reduce_fn(tensor: torch.Tensor) -> torch.Tensor
+        self.reduce_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = reduce_fn
 
         # Try to extract kv_b_proj weights eagerly.
         self._kv_b_proj_ref: Any | None = None
@@ -321,7 +338,15 @@ class CPUFusedMLAImpl:
             self._kv_b_proj_bias = bias.data.clone()
 
     def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:
-        """Extract loaded weights from kv_b_proj reference, build W_UK_T and W_UV."""
+        """Extract loaded weights from kv_b_proj reference, build W_UK_T and W_UV.
+
+        When tp_size > 1, ``kv_b_proj`` is a ``ColumnParallelLinear`` whose
+        weights have already been sharded by vllm's weight-loading machinery.
+        ``self.num_heads`` therefore equals ``num_local_heads`` (the number of
+        attention heads owned by this rank), and the weight shape is:
+            [num_local_heads * (qk_nope_head_dim + v_head_dim), kv_lora_rank]
+        No additional slicing is required here.
+        """
         if self._kv_b_proj_ref is not None:
             weight = getattr(self._kv_b_proj_ref, "weight", None)
             if weight is not None and weight.numel() > 0:
@@ -339,6 +364,9 @@ class CPUFusedMLAImpl:
             return
 
         kv_b_proj_weight = self._kv_b_proj_weight.to(act_dtype).T
+        # self.num_heads == num_local_heads (already TP-sharded by vllm's
+        # ColumnParallelLinear).  When tp_size == 1 this equals the full
+        # num_heads; when tp_size > 1 it equals num_heads // tp_size.
         assert kv_b_proj_weight.shape == (
             self.kv_lora_rank,
             self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
@@ -494,8 +522,44 @@ class CPUFusedMLAImpl:
             )  # [T_d, H * d_v]
 
         # ── 6. o_proj ─────────────────────────────────────────────────────────
-        # attn_output: [T, H * d_v]  ->  returns: [T, D]
-        return self._linear(wrapper.o_proj, attn_output)
+        # attn_output: [T, H * d_v]  ->  output: [T, D] (partial sum when tp_size > 1)
+        output = self._linear(wrapper.o_proj, attn_output)
+
+        # ── 7. TP all-reduce (skipped when tp_size == 1) ──────────────────────
+        # Each rank holds a partial sum from its local heads after o_proj
+        # (which is computed via F.linear, bypassing RowParallelLinear's
+        # built-in all_reduce).  We must sum across all ranks to obtain the
+        # complete output.
+        #
+        # Priority order:
+        #   1. C++ extension _C.tp_all_reduce  — production path.
+        #      Implemented in the fused_mla_cpp C++ extension; you control the
+        #      transport (shared memory, custom fabric, etc.).  The extension
+        #      is expected to operate in-place and return the tensor.
+        #   2. reduce_fn callable              — unit-test / development path.
+        #      A plain Python callable injected at construction time.  Useful
+        #      for mocking the reduce in tests without a real process group.
+        #   3. torch.distributed.all_reduce   — last-resort fallback.
+        #      Requires an initialised torch.distributed process group.
+        #      Kept only so that the pure-Python build (no _C extension) can
+        #      still be exercised end-to-end in a distributed setting.
+        if self.tp_size > 1:
+            # Contiguous layout is required by the C++ shared-memory
+            # implementation which operates on raw data pointers.
+            output = output.contiguous()
+            if _HAS_CPP and hasattr(_C, "tp_all_reduce"):
+                # Production path: C++ extension handles the transport.
+                output = _C.tp_all_reduce(output, self.tp_rank, self.tp_size)
+            elif self.reduce_fn is not None:
+                # Test / development path: injected Python callable.
+                output = self.reduce_fn(output)
+            else:
+                # Last-resort fallback: torch.distributed (requires a live
+                # process group; not suitable for production CPU inference).
+                import torch.distributed as dist
+                dist.all_reduce(output)
+
+        return output
 
 
     # ── Prefill attention ─────────────────────────────────────────────────────
