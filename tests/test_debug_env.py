@@ -43,7 +43,7 @@ class TestOrigRmsNormEnvVar:
         # Set env var BEFORE reloading the module
         monkeypatch.setenv("FUSED_MLA_USE_ORIG_RMSNORM", "1")
 
-        import fused_mla_cpp.core as core_module
+        import fused_cpp.core as core_module
         importlib.reload(core_module)
 
         try:
@@ -144,7 +144,7 @@ class TestOrigRopeEnvVar:
     def test_orig_rope_calls_wrapper_rotary_emb(self, monkeypatch):
         monkeypatch.setenv("FUSED_MLA_USE_ORIG_ROPE", "1")
 
-        import fused_mla_cpp.core as core_module
+        import fused_cpp.core as core_module
         importlib.reload(core_module)
 
         try:

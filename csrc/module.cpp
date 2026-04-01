@@ -20,7 +20,7 @@ at::Tensor forward_decode(at::Tensor q_nope_proj, at::Tensor q_pe,
                           int64_t kv_lora_rank, int64_t qk_rope_head_dim);
 
 PYBIND11_MODULE(_C, m) {
-    m.doc() = "fused_mla_cpp C++ extension kernels";
+    m.doc() = "fused_cpp C++ extension kernels";
 
     m.def("rms_norm", &rms_norm, "RMSNorm: normalize in fp32, cast back, multiply by weight",
           py::arg("x"), py::arg("weight"), py::arg("eps"));

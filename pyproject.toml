@@ -3,9 +3,9 @@ requires = ["setuptools>=64", "torch"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "fused-mla-cpp"
+name = "fused-cpp"
 version = "0.1.0"
-description = "CPU Fused Multi-head Latent Attention (pure PyTorch)"
+description = "CPU Fused MLA and MoE implementations (pure PyTorch)"
 requires-python = ">=3.9"
 dependencies = ["torch"]
 

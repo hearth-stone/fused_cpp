@@ -2,7 +2,7 @@
 """Tests for edge cases: negative slot_mapping, empty kv_cache, None metadata."""
 import torch
 import pytest
-from fused_mla_cpp.core import CPUFusedMLAImpl, _pytorch_write_kv_cache
+from fused_cpp.mla.impl import CPUFusedMLAImpl, _pytorch_write_kv_cache
 
 
 KV_LORA_RANK = 16

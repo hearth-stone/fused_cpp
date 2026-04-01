@@ -1,19 +1,21 @@
-# fused-mla-cpp
+# fused-cpp
 
-CPU Fused Multi-head Latent Attention — a standalone, pip-installable pure
-PyTorch implementation of the fused MLA forward pass (projection, RoPE,
-KV-cache write, attention, output projection).
+CPU Fused MLA (Multi-head Latent Attention) and MoE (Mixture of Experts) —
+a standalone, pip-installable pure PyTorch implementation.
+
+- **MLA**: fused forward pass (projection, RoPE, KV-cache write, attention, output projection)
+- **MoE**: full-token expert-parallel MoE forward pass
 
 ## Installation
 
 ```bash
-pip install -e fused_mla_cpp/
+pip install -e fused_cpp/
 ```
 
 ## Quick Start
 
 ```python
-from fused_mla_cpp import CPUFusedMLAImpl
+from fused_cpp.mla import CPUFusedMLAImpl
 
 impl = CPUFusedMLAImpl(
     num_heads=16,

@@ -14,8 +14,8 @@ import threading
 import pytest
 import torch
 
-import fused_mla_cpp.core as core_module
-from fused_mla_cpp.core import _parallel_map
+import fused_cpp.core as core_module
+from fused_cpp.mla.impl import _parallel_map
 
 
 # ── Constants shared across tests ────────────────────────────────────────────

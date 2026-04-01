@@ -7,18 +7,18 @@ import torch
 class TestPackageImport:
     """Verify the package is importable."""
 
-    def test_import_fused_mla_cpp(self):
-        import fused_mla_cpp  # noqa: F401
+    def test_import_fused_cpp(self):
+        import fused_cpp  # noqa: F401
 
     def test_import_cpu_fused_mla_impl(self):
-        from fused_mla_cpp import CPUFusedMLAImpl  # noqa: F401
+        from fused_cpp import CPUFusedMLAImpl  # noqa: F401
 
 
 class TestConstructor:
     """Verify CPUFusedMLAImpl constructor accepts all required params."""
 
     def test_constructor_stores_params(self):
-        from fused_mla_cpp import CPUFusedMLAImpl
+        from fused_cpp import CPUFusedMLAImpl
 
         # Minimal mock for kv_b_proj
         kv_b_proj = type("FakeLinear", (), {"weight": torch.zeros(1), "bias": None})()
@@ -51,7 +51,7 @@ class TestConstructor:
         assert impl.v_head_dim == 64
 
     def test_constructor_accepts_kwargs(self):
-        from fused_mla_cpp import CPUFusedMLAImpl
+        from fused_cpp import CPUFusedMLAImpl
 
         kv_b_proj = type("FakeLinear", (), {"weight": torch.zeros(1), "bias": None})()
 
@@ -78,7 +78,7 @@ class TestSetAttnImpl:
     """Verify set_attn_impl is a no-op."""
 
     def test_set_attn_impl_returns_none(self):
-        from fused_mla_cpp import CPUFusedMLAImpl
+        from fused_cpp import CPUFusedMLAImpl
 
         kv_b_proj = type("FakeLinear", (), {"weight": torch.zeros(1), "bias": None})()
 
@@ -101,7 +101,7 @@ class TestSetAttnImpl:
         assert result is None
 
     def test_set_attn_impl_no_side_effects(self):
-        from fused_mla_cpp import CPUFusedMLAImpl
+        from fused_cpp import CPUFusedMLAImpl
 
         kv_b_proj = type("FakeLinear", (), {"weight": torch.zeros(1), "bias": None})()
 

@@ -19,7 +19,7 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from fused_mla_cpp.core import CPUFusedMLAImpl
+from fused_cpp.mla import CPUFusedMLAImpl
 
 
 # ── Shared model dimensions ──────────────────────────────────────────────────

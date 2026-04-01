@@ -2,7 +2,7 @@
 """Tests for process_weights_after_loading verifying W_UK_T and W_UV shapes."""
 import torch
 import pytest
-from fused_mla_cpp import CPUFusedMLAImpl
+from fused_cpp import CPUFusedMLAImpl
 
 
 NUM_HEADS = 4

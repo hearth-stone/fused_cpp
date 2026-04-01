@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Property-based tests for fused_mla_cpp using hypothesis.
+"""Property-based tests for fused_cpp using hypothesis.
 
 Each test validates a correctness property from the design document.
 """
@@ -15,7 +15,7 @@ import pytest
 from hypothesis import given, settings, assume
 from hypothesis import strategies as st
 
-from fused_mla_cpp.core import (
+from fused_cpp.mla.impl import (
     CPUFusedMLAImpl,
     _pytorch_rms_norm,
     _pytorch_apply_rope,
@@ -131,17 +131,17 @@ class TestProperty1NoVllmImports:
     """**Validates: Requirements 1.4**
 
     Property 1: No vllm imports in library source.
-    For any .py file in fused_mla_cpp/fused_mla_cpp/, the file shall contain
+    For any .py file in fused_cpp/, the file shall contain
     zero import statements referencing vllm.
     """
 
     @settings(max_examples=100)
     @given(data=st.data())
     def test_no_vllm_imports(self, data):
-        """Scan all .py files in fused_mla_cpp/fused_mla_cpp/ for absence of
+        """Scan all .py files in fused_cpp/ for absence of
         vllm imports."""
         package_dir = os.path.join(
-            os.path.dirname(__file__), os.pardir, "src", "fused_mla_cpp"
+            os.path.dirname(__file__), os.pardir, "src", "fused_cpp"
         )
         package_dir = os.path.normpath(package_dir)
         py_files = glob.glob(os.path.join(package_dir, "**", "*.py"), recursive=True)
@@ -400,7 +400,7 @@ def absorption_inputs(draw):
 
 # Import C++ extension (skip tests if unavailable)
 try:
-    from fused_mla_cpp import _C
+    from fused_cpp import _C
     _HAS_CPP = True
 except ImportError:
     _C = None

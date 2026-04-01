@@ -1,4 +1,4 @@
-"""Build script for fused_mla_cpp C++ extension."""
+"""Build script for fused_cpp C++ extension."""
 import glob
 
 from setuptools import setup
@@ -9,7 +9,7 @@ sources = sorted(glob.glob("csrc/*.cpp"))
 setup(
     ext_modules=[
         CppExtension(
-            name="fused_mla_cpp._C",
+            name="fused_cpp._C",
             sources=sources,
         ),
     ],

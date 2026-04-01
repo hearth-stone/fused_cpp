@@ -24,7 +24,7 @@ if not logger.handlers:
     logger.addHandler(_handler)
 # ── C++ extension import (graceful fallback to PyTorch) ──────────────────────
 try:
-    from fused_mla_cpp import _C
+    from fused_cpp import _C
     _HAS_CPP = True
 except ImportError:
     _C = None
@@ -401,7 +401,6 @@ class CPUFusedMLAImpl:
             tuple(self.W_UK_T.shape), tuple(self.W_UV.shape),
         )
 
-
     def forward_fused(
         self,
         hidden_states: torch.Tensor,
@@ -526,41 +525,17 @@ class CPUFusedMLAImpl:
         output = self._linear(wrapper.o_proj, attn_output)
 
         # ── 7. TP all-reduce (skipped when tp_size == 1) ──────────────────────
-        # Each rank holds a partial sum from its local heads after o_proj
-        # (which is computed via F.linear, bypassing RowParallelLinear's
-        # built-in all_reduce).  We must sum across all ranks to obtain the
-        # complete output.
-        #
-        # Priority order:
-        #   1. C++ extension _C.tp_all_reduce  — production path.
-        #      Implemented in the fused_mla_cpp C++ extension; you control the
-        #      transport (shared memory, custom fabric, etc.).  The extension
-        #      is expected to operate in-place and return the tensor.
-        #   2. reduce_fn callable              — unit-test / development path.
-        #      A plain Python callable injected at construction time.  Useful
-        #      for mocking the reduce in tests without a real process group.
-        #   3. torch.distributed.all_reduce   — last-resort fallback.
-        #      Requires an initialised torch.distributed process group.
-        #      Kept only so that the pure-Python build (no _C extension) can
-        #      still be exercised end-to-end in a distributed setting.
         if self.tp_size > 1:
-            # Contiguous layout is required by the C++ shared-memory
-            # implementation which operates on raw data pointers.
             output = output.contiguous()
             if _HAS_CPP and hasattr(_C, "tp_all_reduce"):
-                # Production path: C++ extension handles the transport.
                 output = _C.tp_all_reduce(output, self.tp_rank, self.tp_size)
             elif self.reduce_fn is not None:
-                # Test / development path: injected Python callable.
                 output = self.reduce_fn(output)
             else:
-                # Last-resort fallback: torch.distributed (requires a live
-                # process group; not suitable for production CPU inference).
                 import torch.distributed as dist
                 dist.all_reduce(output)
 
         return output
-
 
     # ── Prefill attention ─────────────────────────────────────────────────────
 
@@ -625,8 +600,8 @@ class CPUFusedMLAImpl:
         if total_context_tokens == 0:
             num_tokens, num_heads = q.shape[0], q.shape[1]
             return (
-                torch.zeros(num_tokens, num_heads, self.v_head_dim, dtype=q.dtype, device=q.device),  # [T_p, H, d_v]
-                torch.full((num_heads, num_tokens), float("-inf"), dtype=torch.float32, device=q.device),  # [H, T_p]
+                torch.zeros(num_tokens, num_heads, self.v_head_dim, dtype=q.dtype, device=q.device),
+                torch.full((num_heads, num_tokens), float("-inf"), dtype=torch.float32, device=q.device),
             )
 
         gathered_kv = torch.empty(
@@ -640,7 +615,7 @@ class CPUFusedMLAImpl:
             dst_start = int(cu_seqlens_k[i].item())
             gathered_kv[dst_start:dst_start + ctx_len] = self._gather_kv_cache(
                 kv_cache, block_table[i], ctx_len, block_size
-            )  # fills gathered_kv[dst_start:dst_start+ctx_len]: [ctx_len, R_kv + d_rope]
+            )
 
         kv_c_ctx = gathered_kv[:, :self.kv_lora_rank]  # [T_ctx, R_kv]
         k_pe_ctx = gathered_kv[:, self.kv_lora_rank:].unsqueeze(1)  # [T_ctx, 1, d_rope]
@@ -650,7 +625,7 @@ class CPUFusedMLAImpl:
         )  # [T_ctx, H, d_nope + d_v]
         k_nope_ctx, v_ctx = kv_nope.split(
             [self.qk_nope_head_dim, self.v_head_dim], dim=-1
-        )  # k_nope_ctx: [T_ctx, H, d_nope],  v_ctx: [T_ctx, H, d_v]
+        )
         k_ctx = self._concat_k_nope_k_pe(k_nope_ctx, k_pe_ctx)  # [T_ctx, H, d_qk]
 
         result = self._varlen_attention(
@@ -660,13 +635,11 @@ class CPUFusedMLAImpl:
             max_seqlen_q=prefill_metadata.max_query_len,
             max_seqlen_k=int(context_lens.max().item()),
             causal=False, return_softmax_lse=True,
-        )  # tuple([T_p, H, d_v], [H, T_p])
+        )
         assert isinstance(result, tuple)
         context_output, context_lse = result
-        # context_output: [T_p, H, d_v],  context_lse: [H, T_p]
         assert context_lse is not None
         return context_output, context_lse
-
 
     # ── Decode attention ──────────────────────────────────────────────────────
 
@@ -704,8 +677,6 @@ class CPUFusedMLAImpl:
             )  # [seq_len, R_kv + d_rope]
             kv_c = gathered_kv[:, :self.kv_lora_rank]   # [seq_len, R_kv]
             k_pe_seq = gathered_kv[:, self.kv_lora_rank:]  # [seq_len, d_rope]
-            # q_nope_proj[b]: [H, R_kv],  kv_c.T: [R_kv, seq_len]
-            # q_pe[b]: [H, d_rope],  k_pe_seq.T: [d_rope, seq_len]
             attn_scores = (
                 torch.matmul(q_nope_proj[b], kv_c.T)
                 + torch.matmul(q_pe[b], k_pe_seq.T)
@@ -781,10 +752,10 @@ class CPUFusedMLAImpl:
                     causal_mask = q_idx >= k_idx
                     attn_scores = attn_scores.masked_fill(
                         ~causal_mask.unsqueeze(0).unsqueeze(0), float("-inf")
-                    )  # [1, H, T_qi, T_ki]
+                    )
                 lse_i = torch.logsumexp(attn_scores, dim=-1)  # [1, H, T_qi]
                 assert lse is not None
-                lse[:, q_start:q_end] = lse_i.squeeze(0)  # fills lse[:, q_start:q_end]: [H, T_qi]
+                lse[:, q_start:q_end] = lse_i.squeeze(0)
                 attn_weights = torch.softmax(attn_scores, dim=-1)  # [1, H, T_qi, T_ki]
                 output_i = torch.matmul(attn_weights, v_i)  # [1, H, T_qi, d_qk]
             else:
