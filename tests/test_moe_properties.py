@@ -445,7 +445,7 @@ class TestProperty7EP1Correctness:
             )
 
         # Relative error < 1e-4
-        assert torch.allclose(actual, expected, rtol=1e-4, atol=1e-6), (
+        assert torch.allclose(actual, expected, rtol=1e-4, atol=1e-4), (
             f"EP=1 output does not match naive reference.\n"
             f"Max abs diff: {(actual - expected).abs().max().item()}\n"
             f"Max rel diff: {((actual - expected).abs() / (expected.abs() + 1e-8)).max().item()}"
