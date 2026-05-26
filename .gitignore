@@ -11,3 +11,16 @@ dist/
 .pytest_cache/
 .venv/
 *.egg
+
+# OS / editor
+.DS_Store
+
+# Local tooling state
+.codebuddy/
+
+# Lock files (not tracked for this project)
+uv.lock
+
+# Benchmark result artifacts (keep scripts, drop generated data)
+bench/sdpa/sdpa_versions_*.csv
+bench/sdpa/sdpa_versions_*.json
