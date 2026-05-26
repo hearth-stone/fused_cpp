@@ -1,4 +1,9 @@
 #include <torch/extension.h>
+#include <pybind11/stl.h>
+#include <map>
+#include <string>
+#include <tuple>
+#include <vector>
 
 // Forward declarations — implementations in separate .cpp files
 at::Tensor rms_norm(at::Tensor x, at::Tensor weight, double eps);
@@ -18,6 +23,64 @@ at::Tensor forward_decode(at::Tensor q_nope_proj, at::Tensor q_pe,
                           at::Tensor kv_cache, at::Tensor block_table,
                           at::Tensor seq_lens, double scale,
                           int64_t kv_lora_rank, int64_t qk_rope_head_dim);
+at::Tensor scaled_dot_product_attention(
+    at::Tensor query, at::Tensor key, at::Tensor value,
+    c10::optional<at::Tensor> attn_mask, double dropout_p,
+    bool is_causal, c10::optional<double> scale, bool enable_gqa);
+at::Tensor scaled_dot_product_attention_versioned(
+    at::Tensor query, at::Tensor key, at::Tensor value,
+    c10::optional<at::Tensor> attn_mask, double dropout_p,
+    bool is_causal, c10::optional<double> scale, bool enable_gqa,
+    std::string version);
+std::vector<std::string> list_sdpa_versions();
+std::map<std::string, double> validate_sdpa_flash2_neon_cache_microkernels(
+    std::string dtype, int64_t E, int64_t Sk);
+std::map<std::string, double> benchmark_sdpa_flash2_neon_cache_microkernels(
+    std::string dtype, int64_t E, int64_t Sk, int64_t iterations,
+    int64_t warmup);
+
+// 微内核管理框架 — 见 csrc/sdpa_microkernels/mk_registry.cpp
+std::vector<std::string> list_microkernel_impls();
+std::map<std::string, double> validate_microkernel(
+    std::string impl, std::string dtype, int64_t E, int64_t Sk);
+std::map<std::string, double> benchmark_microkernel(
+    std::string impl, std::string dtype, int64_t E, int64_t Sk,
+    int64_t iterations, int64_t warmup);
+
+// 微内核管理框架 — 见 csrc/sdpa_microkernels/mk_registry.cpp
+std::vector<std::string> list_microkernel_impls();
+std::map<std::string, double> validate_microkernel(
+    std::string impl, std::string dtype, int64_t E, int64_t Sk);
+std::map<std::string, double> benchmark_microkernel(
+    std::string impl, std::string dtype, int64_t E, int64_t Sk,
+    int64_t iterations, int64_t warmup);
+
+// OMP runtime info forward declarations — omp_info.cpp
+std::map<std::string, std::string> get_omp_runtime_info();
+bool has_openmp();
+
+// ACL GEMM forward declarations — acl_gemm.cpp
+int64_t create_acl_gemm_handler(at::Tensor weight, int64_t num_threads,
+                                bool fast_math);
+void acl_gemm(at::Tensor output, at::Tensor input,
+             c10::optional<at::Tensor> bias, int64_t handler_ptr);
+void release_acl_gemm_handler(int64_t handler_ptr);
+
+// KAI GEMM forward declarations — kai_gemm.cpp
+at::Tensor kai_gemm_prepare(at::Tensor weight,
+                            c10::optional<at::Tensor> bias);
+int64_t create_kai_thread_pool(std::vector<int64_t> cpu_ids);
+void destroy_kai_thread_pool(int64_t pool_handle);
+int64_t create_kai_gemm_handler(at::Tensor packed_weight,
+                                int64_t K, int64_t N);
+void kai_gemm(at::Tensor output, at::Tensor input,
+              int64_t handler_ptr, int64_t pool_handle);
+void release_kai_gemm_handler(int64_t handler_ptr);
+
+// ACL affinity forward declarations — acl_affinity.cpp
+void set_acl_thread_affinity(int64_t core_start, int64_t core_end,
+                             int64_t num_threads);
+std::tuple<int64_t, int64_t, int64_t> get_acl_thread_affinity();
 
 PYBIND11_MODULE(_C, m) {
     m.doc() = "fused_cpp C++ extension kernels";
@@ -69,4 +132,130 @@ PYBIND11_MODULE(_C, m) {
           py::arg("kv_cache"), py::arg("block_table"),
           py::arg("seq_lens"), py::arg("scale"),
           py::arg("kv_lora_rank"), py::arg("qk_rope_head_dim"));
+
+    m.def("scaled_dot_product_attention", &scaled_dot_product_attention,
+          "Scaled dot-product attention (SDPA) with float32 accumulation",
+          py::arg("query"), py::arg("key"), py::arg("value"),
+          py::arg("attn_mask") = c10::nullopt,
+          py::arg("dropout_p") = 0.0,
+          py::arg("is_causal") = false,
+          py::arg("scale") = c10::nullopt,
+          py::arg("enable_gqa") = false);
+
+    m.def("scaled_dot_product_attention_versioned",
+          &scaled_dot_product_attention_versioned,
+          "Versioned SDPA: dispatch to a registered kernel by name",
+          py::arg("query"), py::arg("key"), py::arg("value"),
+          py::arg("attn_mask") = c10::nullopt,
+          py::arg("dropout_p") = 0.0,
+          py::arg("is_causal") = false,
+          py::arg("scale") = c10::nullopt,
+          py::arg("enable_gqa") = false,
+          py::arg("version"));
+
+    m.def("list_sdpa_versions", &list_sdpa_versions,
+          "Return the list of registered SDPA version names");
+
+    m.def("validate_sdpa_flash2_neon_cache_microkernels",
+          &validate_sdpa_flash2_neon_cache_microkernels,
+          "Validate flash2_neon_cache QKT/PV micro-kernels against scalar references.",
+          py::arg("dtype") = "bf16",
+          py::arg("E") = 128,
+          py::arg("Sk") = 128,
+          py::call_guard<py::gil_scoped_release>());
+
+    m.def("benchmark_sdpa_flash2_neon_cache_microkernels",
+          &benchmark_sdpa_flash2_neon_cache_microkernels,
+          "Benchmark flash2_neon_cache QKT/PV micro-kernels and return timing/GFLOPS.",
+          py::arg("dtype") = "bf16",
+          py::arg("E") = 128,
+          py::arg("Sk") = 128,
+          py::arg("iterations") = 100000,
+          py::arg("warmup") = 1000,
+          py::call_guard<py::gil_scoped_release>());
+
+    // ── 微内核管理框架 ────────────────────────────────────────────────
+    m.def("list_microkernel_impls", &list_microkernel_impls,
+          "List all microkernel impls registered by the management framework "
+          "(name strings; one per FUSED_CPP_MK_ENABLE_<NAME> compile-time flag).");
+
+    m.def("validate_microkernel", &validate_microkernel,
+          "Validate a microkernel impl against its scalar reference; returns "
+          "max-abs error per op (qkt_8x8 / qkt_8x4 / qkt_tail / pv_8x8 / pv_tail).",
+          py::arg("impl"), py::arg("dtype") = "bf16",
+          py::arg("E") = 128, py::arg("Sk") = 128,
+          py::call_guard<py::gil_scoped_release>());
+
+    m.def("benchmark_microkernel", &benchmark_microkernel,
+          "Benchmark a microkernel impl; returns seconds / us / GFLOPS / "
+          "checksum per op (qkt_8x8 / qkt_8x4 / pv_8x8).",
+          py::arg("impl"), py::arg("dtype") = "bf16",
+          py::arg("E") = 128, py::arg("Sk") = 128,
+          py::arg("iterations") = 100000, py::arg("warmup") = 1000,
+          py::call_guard<py::gil_scoped_release>());
+
+    m.def("get_omp_runtime_info", &get_omp_runtime_info,
+          "Return a snapshot of the current OpenMP runtime configuration "
+          "(env vars + omp_get_max_threads / num_procs).");
+
+    m.def("has_openmp", &has_openmp,
+          "Return True if the C++ extension was linked with OpenMP.");
+
+    // ── ACL GEMM 接口 ──
+#if defined(__aarch64__) && defined(FUSED_CPP_HAS_ACL)
+    m.def("create_acl_gemm_handler", &create_acl_gemm_handler,
+          "Create ACL GEMM handler with weight prepacking",
+          py::arg("weight"), py::arg("num_threads") = 0,
+          py::arg("fast_math") = false);
+
+    m.def("acl_gemm", &acl_gemm,
+          "Execute GEMM using ACL with prepacked weights",
+          py::arg("output"), py::arg("input"),
+          py::arg("bias"), py::arg("handler_ptr"));
+
+    m.def("release_acl_gemm_handler", &release_acl_gemm_handler,
+          "Release ACL GEMM handler and free resources",
+          py::arg("handler_ptr"));
+
+    m.def("set_acl_thread_affinity", &set_acl_thread_affinity,
+          "Set ACL thread affinity and core binding",
+          py::arg("core_start"), py::arg("core_end"),
+          py::arg("num_threads"));
+
+    m.def("get_acl_thread_affinity", &get_acl_thread_affinity,
+          "Get current ACL thread affinity configuration");
+#endif
+
+    // ── KAI GEMM 接口 ──
+#ifdef __aarch64__
+    m.def("kai_gemm_prepare", &kai_gemm_prepare,
+          "Prepare (prepack) weight and optional bias for KAI GEMM",
+          py::arg("weight"), py::arg("bias") = c10::nullopt);
+
+    m.def("create_kai_thread_pool", &create_kai_thread_pool,
+          "Create a KAI thread pool bound to given CPU ids; "
+          "returns an int64 handle owned by the native registry.",
+          py::arg("cpu_ids"));
+
+    m.def("destroy_kai_thread_pool", &destroy_kai_thread_pool,
+          "Destroy a KAI thread pool previously returned by "
+          "create_kai_thread_pool; 0/invalid handles are ignored.",
+          py::arg("pool_handle"));
+
+    m.def("create_kai_gemm_handler", &create_kai_gemm_handler,
+          "Create KAI GEMM handler from packed weight (pure data handler, "
+          "no thread resource attached)",
+          py::arg("packed_weight"), py::arg("K"), py::arg("N"));
+
+    m.def("kai_gemm", &kai_gemm,
+          "Execute GEMM using KleidiAI microkernels; set pool_handle=0 "
+          "for the single-threaded path.",
+          py::arg("output"), py::arg("input"), py::arg("handler_ptr"),
+          py::arg("pool_handle") = 0,
+          py::call_guard<py::gil_scoped_release>());
+
+    m.def("release_kai_gemm_handler", &release_kai_gemm_handler,
+          "Release KAI GEMM handler and free resources",
+          py::arg("handler_ptr"));
+#endif
 }
