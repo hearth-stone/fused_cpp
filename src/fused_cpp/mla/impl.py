@@ -17,7 +17,7 @@ import torch
 import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
+# logger.setLevel(logging.DEBUG)
 if not logger.handlers:
     _handler = logging.StreamHandler()
     _handler.setLevel(logging.DEBUG)
@@ -779,11 +779,23 @@ class CPUFusedMLAImpl:
 
     @staticmethod
     def _linear(layer: Any, x: torch.Tensor) -> torch.Tensor:
-        """Pure torch linear transform (F.linear)."""
+        """Linear transform: 优先使用 cpu_linear（oneDNN/sgl kernel），否则 F.linear。
+
+        CPU 路径下，dispatch_cpu_unquantized_gemm 可能将原始 weight 打包进
+        layer.cpu_linear 并将 layer.weight 替换为 torch.empty(0)。
+        此时直接访问 layer.weight 会报错，需要通过 cpu_linear 执行计算。
+        """
         bias = getattr(layer, "bias", None)
         if getattr(layer, "skip_bias_add", False):
             bias = None
         weight = getattr(layer, "weight", None)
+
+        # 优先使用 cpu_linear（oneDNN/sgl kernel/fallback 均会设置此属性）
+        cpu_linear = getattr(layer, "cpu_linear", None)
+        if cpu_linear is not None:
+            return cpu_linear(x, weight, bias)
+
+        # 无 cpu_linear 时走原始 F.linear 路径
         if weight is None or weight.numel() == 0:
             raise RuntimeError(
                 f"Layer {type(layer).__name__} weight is empty or missing, "
