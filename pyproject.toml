@@ -10,7 +10,28 @@ requires-python = ">=3.9"
 dependencies = ["torch"]
 
 [project.optional-dependencies]
-dev = ["pytest", "hypothesis"]
+dev = ["pytest", "hypothesis", "pytest-benchmark"]
+
+# ── uv 专用：强制 Linux / Windows 上从 PyTorch 官方 CPU 索引拉取 torch ──
+# 本项目是 CPU-only 实现，PyPI 默认 wheel 在 linux x86_64 会带整套 nvidia-*-cu12 (~3GB)，
+# 通过显式声明 source 把它指向 pytorch-cpu 索引即可避免。
+# macOS / Linux aarch64 在 PyPI 上本身就是 CPU wheel，因此不在 marker 中包含，走默认 PyPI。
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cpu", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.pytest.ini_options]
+markers = [
+    "bench: 性能基准测试（默认 skip，需 -m bench 触发）",
+    "equiv: SDPA 多版本等价性矩阵（默认收集）",
+    "slow: 大 shape / 长时间用例（默认 skip，需 -m slow 触发）",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]
