@@ -1317,7 +1317,9 @@ static inline void gemm_qkt_microkernel_8x8_bf16_packqk_seq4_ptr_inner(
 
 // gemm_qkt_microkernel_8x8_bf16_packqk_seq4_bmajor_inner：
 //   B-major 计算顺序版本：同样的 4x1 load，但 16 条 BFMMLA 按 B 操作数复用顺序发射。
-//   其余 pack layout / tail / unzip / scale-store 与 qk_packqk_seq4 完全一致。
+//   inner loop 使用显式 q_ptr/k_ptr 递增，避免每轮重新计算 `(e/4)*32`
+//   packed-offset；其余 pack layout / tail / unzip / scale-store 与
+//   qk_packqk_seq4 完全一致。
 //
 static inline void gemm_qkt_microkernel_8x8_bf16_packqk_seq4_bmajor_inner(
     const uint16_t* Q_seq,             // [E/4 e_block][32 u16 lanes]
@@ -1352,36 +1354,46 @@ static inline void gemm_qkt_microkernel_8x8_bf16_packqk_seq4_bmajor_inner(
   float32x4_t bm30 = vdupq_n_f32(0), bm31 = vdupq_n_f32(0);
   float32x4_t bm32 = vdupq_n_f32(0), bm33 = vdupq_n_f32(0);
 
-  for (; e + 4 <= E; e += 4) {
-    const uint16_t* q_base = Q_seq + (e / 4) * 32;
-    bfloat16x8_t a01 = vreinterpretq_bf16_u16(vld1q_u16(q_base + 0));
-    bfloat16x8_t a23 = vreinterpretq_bf16_u16(vld1q_u16(q_base + 8));
-    bfloat16x8_t a45 = vreinterpretq_bf16_u16(vld1q_u16(q_base + 16));
-    bfloat16x8_t a67 = vreinterpretq_bf16_u16(vld1q_u16(q_base + 24));
+  const uint16_t* q_ptr = Q_seq;
+  const uint16_t* k_ptr = K_seq;
 
-    const uint16_t* k_base = K_seq + (e / 4) * 32;
-    bfloat16x8_t b01 = vreinterpretq_bf16_u16(vld1q_u16(k_base + 0));
-    bfloat16x8_t b23 = vreinterpretq_bf16_u16(vld1q_u16(k_base + 8));
-    bfloat16x8_t b45 = vreinterpretq_bf16_u16(vld1q_u16(k_base + 16));
-    bfloat16x8_t b67 = vreinterpretq_bf16_u16(vld1q_u16(k_base + 24));
+#define FUSED_CPP_QKT_BMAJOR_BLOCK(QPTR, KPTR)                                \
+  do {                                                                         \
+    bfloat16x8_t a01 = vreinterpretq_bf16_u16(vld1q_u16((QPTR) + 0));          \
+    bfloat16x8_t a23 = vreinterpretq_bf16_u16(vld1q_u16((QPTR) + 8));          \
+    bfloat16x8_t a45 = vreinterpretq_bf16_u16(vld1q_u16((QPTR) + 16));         \
+    bfloat16x8_t a67 = vreinterpretq_bf16_u16(vld1q_u16((QPTR) + 24));         \
+    bfloat16x8_t b01 = vreinterpretq_bf16_u16(vld1q_u16((KPTR) + 0));          \
+    bfloat16x8_t b23 = vreinterpretq_bf16_u16(vld1q_u16((KPTR) + 8));          \
+    bfloat16x8_t b45 = vreinterpretq_bf16_u16(vld1q_u16((KPTR) + 16));         \
+    bfloat16x8_t b67 = vreinterpretq_bf16_u16(vld1q_u16((KPTR) + 24));         \
+    bm00 = vbfmmlaq_f32(bm00, a01, b01);                                      \
+    bm10 = vbfmmlaq_f32(bm10, a23, b01);                                      \
+    bm20 = vbfmmlaq_f32(bm20, a45, b01);                                      \
+    bm30 = vbfmmlaq_f32(bm30, a67, b01);                                      \
+    bm01 = vbfmmlaq_f32(bm01, a01, b23);                                      \
+    bm11 = vbfmmlaq_f32(bm11, a23, b23);                                      \
+    bm21 = vbfmmlaq_f32(bm21, a45, b23);                                      \
+    bm31 = vbfmmlaq_f32(bm31, a67, b23);                                      \
+    bm02 = vbfmmlaq_f32(bm02, a01, b45);                                      \
+    bm12 = vbfmmlaq_f32(bm12, a23, b45);                                      \
+    bm22 = vbfmmlaq_f32(bm22, a45, b45);                                      \
+    bm32 = vbfmmlaq_f32(bm32, a67, b45);                                      \
+    bm03 = vbfmmlaq_f32(bm03, a01, b67);                                      \
+    bm13 = vbfmmlaq_f32(bm13, a23, b67);                                      \
+    bm23 = vbfmmlaq_f32(bm23, a45, b67);                                      \
+    bm33 = vbfmmlaq_f32(bm33, a67, b67);                                      \
+  } while (false)
 
-    bm00 = vbfmmlaq_f32(bm00, a01, b01);
-    bm10 = vbfmmlaq_f32(bm10, a23, b01);
-    bm20 = vbfmmlaq_f32(bm20, a45, b01);
-    bm30 = vbfmmlaq_f32(bm30, a67, b01);
-    bm01 = vbfmmlaq_f32(bm01, a01, b23);
-    bm11 = vbfmmlaq_f32(bm11, a23, b23);
-    bm21 = vbfmmlaq_f32(bm21, a45, b23);
-    bm31 = vbfmmlaq_f32(bm31, a67, b23);
-    bm02 = vbfmmlaq_f32(bm02, a01, b45);
-    bm12 = vbfmmlaq_f32(bm12, a23, b45);
-    bm22 = vbfmmlaq_f32(bm22, a45, b45);
-    bm32 = vbfmmlaq_f32(bm32, a67, b45);
-    bm03 = vbfmmlaq_f32(bm03, a01, b67);
-    bm13 = vbfmmlaq_f32(bm13, a23, b67);
-    bm23 = vbfmmlaq_f32(bm23, a45, b67);
-    bm33 = vbfmmlaq_f32(bm33, a67, b67);
+  for (; e + 8 <= E; e += 8, q_ptr += 64, k_ptr += 64) {
+    FUSED_CPP_QKT_BMAJOR_BLOCK(q_ptr, k_ptr);
+    FUSED_CPP_QKT_BMAJOR_BLOCK(q_ptr + 32, k_ptr + 32);
   }
+  for (; e + 4 <= E; e += 4, q_ptr += 32, k_ptr += 32) {
+    FUSED_CPP_QKT_BMAJOR_BLOCK(q_ptr, k_ptr);
+  }
+
+#undef FUSED_CPP_QKT_BMAJOR_BLOCK
 
   // 把 BFMMLA 的 2×2 子块布局重排为「行向 4 lane」布局
   //（与 baseline / packk_seq 完全相同的 unzip）。
