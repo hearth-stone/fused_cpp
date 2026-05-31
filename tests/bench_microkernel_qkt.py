@@ -9,6 +9,11 @@
       - qk_packk_inner（bf16，K 按 row-pair 拼成 [4 pair][E*2]，amortized）
       - qk_packk_seq  （bf16，K 完全按 kernel 访存顺序排成 [E/4][32]，
                         amortized；用 vld1q_u16_x4）
+      - qk_packqk_seq （bf16，Q 与 K 都按 kernel 访存顺序 pre-pack，
+                        amortized；A/B 双侧都用 vld1q_u16_x4。仅 inner-loop
+                        cache 命中场景；不能外推到端到端 SDPA。）
+      - qk_packqk_seq4（bf16，同样 Q/K 双侧 seq pre-pack，但 A/B 双侧都用
+                        4 条独立 vld1q_u16，验证 x4 multi-reg load 是否被串行化。）
       - qk_packk_full（bf16，每次都 pack——pessimistic 下界）
 
 调用模型：thread_local cache 的 `qk_packk_inner` / `qk_packk_seq` 在 microkernel
@@ -40,21 +45,47 @@ import math
 import sys
 from typing import List, Optional, Tuple
 
-# ── 实现 → 测试 dtype 的预定义矩阵 ───────────────────────────────────────
+# ── 实现 → 测试 dtype × 是否接入 SDPA 主路径 ────────────────────────────
 #
 # 每个 impl 对应它**目标改动的 dtype**：
 #   * baseline / scalar          —— 两 dtype 都跑（参考线）
 #   * qk_ublock4                 —— fp32（fp32 路径重写，bf16 fall through）
 #   * qk_packk_full / inner / seq —— bf16（bf16 路径替代 K layout，fp32 fall through）
+#   * qk_packqk_seq              —— bf16（Q/K 双侧 pre-pack + vld1q_u16_x4）
+#   * qk_packqk_seq4             —— bf16（Q/K 双侧 pre-pack + 4 条独立 vld1q_u16）
+#   * qk_packqk_seq4_*           —— bf16（seq4 的指针递增 / B-major / pipe 调度变体）
+#
+# 第三个字段 `wired_to_sdpa`：该 microkernel 是否在 sdpa_flash2_neon_cache.cpp
+# 中通过 REGISTER_SDPA_VERSION 注册成 `flash2_neon_cache_<name>` 入口，可被
+# Python 侧 sdpa_versioned 直接调用。**评估专用 trait（每次需要外层手工 pack
+# 才能用）一律 False**——它们的 GFLOPS 数据仅反映 microkernel 内核本身的
+# 上限，不反映 SDPA 端到端收益。
+#
+# 与 csrc/sdpa_flash2_neon_cache.cpp 末尾的 REGISTER_SDPA_VERSION 列表保持一致。
 
-IMPL_DTYPE_MATRIX: List[Tuple[str, Tuple[str, ...]]] = [
-    ("baseline", ("fp32", "bf16")),
-    ("qk_ublock4", ("fp32",)),
-    ("qk_packk_full", ("bf16",)),
-    ("qk_packk_inner", ("bf16",)),
-    ("qk_packk_seq", ("bf16",)),
-    ("qk_unroll2", ("bf16",)),
+# (impl_name, dtypes, wired_to_sdpa)
+IMPL_DTYPE_MATRIX: List[Tuple[str, Tuple[str, ...], bool]] = [
+    ("baseline", ("fp32", "bf16"), True),
+    ("qk_ublock4", ("fp32",), True),
+    ("qk_packk_full", ("bf16",), False),
+    ("qk_packk_inner", ("bf16",), False),
+    ("qk_packk_seq", ("bf16",), False),
+    ("qk_packqk_seq", ("bf16",), False),
+    ("qk_packqk_seq4", ("bf16",), False),
+    ("qk_packqk_seq4_ptr", ("bf16",), False),
+    ("qk_packqk_seq4_bmajor", ("bf16",), False),
+    ("qk_packqk_seq4_pipe_a", ("bf16",), False),
+    ("qk_packqk_seq4_pipe_b", ("bf16",), False),
+    ("qk_unroll2", ("bf16",), False),
 ]
+
+# 在表格 / 说明中给 eval-only impl 加上 ` *` 后缀，便于一眼看出。
+EVAL_ONLY_SUFFIX = " *"
+
+
+def _label(impl: str, wired: bool) -> str:
+    """显示用：未接入 SDPA 的 microkernel 名后缀加 ` *`。"""
+    return impl if wired else impl + EVAL_ONLY_SUFFIX
 
 # correctness 容忍度：bf16 的 BFMMLA 与 scalar 参考累加序不一致，预期 < 0.1；
 # fp32 的 fma 顺序差异预期 < 1e-4。
@@ -139,17 +170,29 @@ def main() -> int:
 
     C = load_C()
     avail = list(C.list_microkernel_impls())
+    sdpa_versions = set(C.list_sdpa_versions())
     print(f"available microkernel impls: {avail}\n")
 
-    # 过滤出当前 .so 里实际存在的 impl。
-    matrix = [
-        (impl, dtypes)
-        for impl, dtypes in IMPL_DTYPE_MATRIX
-        if impl in avail
-    ]
-    print("test matrix:")
-    for impl, dtypes in matrix:
-        print(f"  {impl:18s} dtypes={list(dtypes)}")
+    # 过滤出当前 .so 里实际存在的 impl，并交叉验证 wired_to_sdpa 字段
+    # 与 sdpa_versions 一致（防止 IMPL_DTYPE_MATRIX 与 .cpp 注册漂移）。
+    matrix: List[Tuple[str, Tuple[str, ...], bool]] = []
+    for impl, dtypes, wired in IMPL_DTYPE_MATRIX:
+        if impl not in avail:
+            continue
+        actual_wired = f"flash2_neon_cache_{impl}" in sdpa_versions
+        if actual_wired != wired:
+            print(
+                f"WARNING: IMPL_DTYPE_MATRIX 中 {impl!r} wired_to_sdpa={wired} "
+                f"但实际 sdpa_versions={'YES' if actual_wired else 'NO'}; "
+                f"以实际为准。请同步 IMPL_DTYPE_MATRIX 与 sdpa_flash2_neon_cache.cpp。"
+            )
+        matrix.append((impl, dtypes, actual_wired))
+
+    eval_only_impls = [impl for impl, _, w in matrix if not w]
+    print("test matrix (* = evaluation-only, NOT wired into SDPA dispatcher):")
+    for impl, dtypes, wired in matrix:
+        flag = "" if wired else "  [eval-only, requires external pack to use]"
+        print(f"  {_label(impl, wired):20s} dtypes={list(dtypes)}{flag}")
     print()
 
     shapes = parse_shapes(args.shapes)
@@ -163,14 +206,17 @@ def main() -> int:
         print("=" * 78)
         for E, Sk in correctness_shapes:
             print(f"  E={E:4d} Sk={Sk:4d}")
-            for impl, dtypes in matrix:
+            for impl, dtypes, wired in matrix:
                 for dtype in dtypes:
                     r = C.validate_microkernel(impl=impl, dtype=dtype, E=E, Sk=Sk)
                     val = r["qkt_8x8_max_abs"]
                     tol = TOL_PER_DTYPE[dtype]
                     ok = val < tol
                     flag = "OK" if ok else f"FAIL (tol={tol})"
-                    print(f"    {impl:18s} {dtype:5s} max_abs={val:.3e}  [{flag}]")
+                    print(
+                        f"    {_label(impl, wired):20s} {dtype:5s} "
+                        f"max_abs={val:.3e}  [{flag}]"
+                    )
                     if not ok:
                         n_fail += 1
         print()
@@ -183,10 +229,20 @@ def main() -> int:
     print("=" * 78)
     print(f"BENCHMARK (best of {args.runs} runs, iters={args.iters}, warmup={args.warmup})")
     print("=" * 78)
+    if eval_only_impls:
+        print(
+            f"NOTE: 标 ` *` 的 impl 是评估专用 microkernel，**未接入 SDPA 主路径**\n"
+            f"      ({', '.join(eval_only_impls)})。\n"
+            f"      它们的 GFLOPS 反映 microkernel 内核本身上限（外层假设已 pre-pack），\n"
+            f"      **不能直接外推为 SDPA 端到端收益**——真实 SDPA 主循环里 Q/K\n"
+            f"      在每个 i-tile 都会变化、每次都需付出 pack overhead。"
+        )
 
     # 按 dtype 分组打印（baseline 同时出现在 fp32 和 bf16）。
     for dtype in ("fp32", "bf16"):
-        impls_for_dtype = [impl for impl, ds in matrix if dtype in ds]
+        impls_for_dtype = [
+            (impl, wired) for impl, ds, wired in matrix if dtype in ds
+        ]
         if not impls_for_dtype:
             continue
         peak = (
@@ -201,11 +257,12 @@ def main() -> int:
               + (f"   (peak ref: {peak} GFLOPS = {peak_label})" if peak else "")
               + " ---")
 
-        # 表头
-        col_impls = "  ".join(f"{im:>16s}" for im in impls_for_dtype)
-        col_speedups = "  ".join(f"{im+'_x':>16s}" for im in impls_for_dtype)
+        # 表头：未接入 SDPA 的 impl 名加 ` *` 后缀
+        labels = [_label(im, w) for im, w in impls_for_dtype]
+        col_impls = "  ".join(f"{lbl:>17s}" for lbl in labels)
+        col_speedups = "  ".join(f"{lbl+'_x':>17s}" for lbl in labels)
         col_pcts = (
-            "  ".join(f"{im+'_%peak':>16s}" for im in impls_for_dtype)
+            "  ".join(f"{lbl+'_%peak':>17s}" for lbl in labels)
             if peak else ""
         )
         print(f"  {'E':>5s} {'Sk':>5s} | {col_impls} | {col_speedups}"
@@ -216,21 +273,21 @@ def main() -> int:
         for E, Sk in shapes:
             # 全部 impl 跑一遍，取每个的最大 GFLOPS
             gf = {}
-            for impl in impls_for_dtype:
+            for impl, _ in impls_for_dtype:
                 gf[impl] = best_of(C, impl, dtype, E, Sk,
                                    args.iters, args.warmup, args.runs)
             base = gf.get("baseline", 0.0) or 1e-9
 
             row = f"  {E:5d} {Sk:5d} |"
-            for impl in impls_for_dtype:
-                row += f"  {gf[impl]:14.2f}  "
+            for impl, _ in impls_for_dtype:
+                row += f"  {gf[impl]:15.2f}  "
             row += " |"
-            for impl in impls_for_dtype:
-                row += f"  {(gf[impl] / base):14.2f}x "
+            for impl, _ in impls_for_dtype:
+                row += f"  {(gf[impl] / base):15.2f}x "
             if peak:
                 row += " |"
-                for impl in impls_for_dtype:
-                    row += f"  {(gf[impl] / peak * 100):14.1f}% "
+                for impl, _ in impls_for_dtype:
+                    row += f"  {(gf[impl] / peak * 100):15.1f}% "
             print(row)
 
     print()
@@ -238,16 +295,33 @@ def main() -> int:
     print("INTERPRETATION GUIDE")
     print("=" * 78)
     print("""\
+图例：impl 名后的 ` *` 表示该 microkernel **未通过 REGISTER_SDPA_VERSION 接入
+SDPA 主路径**——仅供 microkernel benchmark 评估。要让 SDPA 真正用上它，
+需要在主循环外层显式 pack，并加 SDPA 版本绑定。
+
 fp32 路径
   baseline      = 64 个独立 dot product，单累加器 RAW dep chain → ~10 GFLOPS
   qk_ublock4    = 4×4 块 × 16 独立累加器外积扇出 + vpaddq 树 reduce → 接近 fmla peak
 
 bf16 路径（BFMMLA 主路径下）
-  baseline      = 8 vld1_u16(K) + 4 vcombine + 16 BFMMLA。86%~ BFMMLA half-peak
-  qk_packk_full = 每次调用都 pack K（pessimistic 下界，实测总是负收益）
-  qk_packk_inner= K 按 row-pair 拼 [4 pair][E*2]，thread_local 跳过重复 pack
-  qk_packk_seq  = K 完全按 kernel 访存顺序 [E/4][32]，单条 vld1q_u16_x4 拿
-                   一整 cacheline 64 字节。同样 amortized。
+  baseline       = 8 vld1_u16(K) + 4 vcombine + 16 BFMMLA。86%~ BFMMLA half-peak
+  qk_packk_full *= 每次调用都 pack K（pessimistic 下界，实测总是负收益）
+  qk_packk_inner*= K 按 row-pair 拼 [4 pair][E*2]，thread_local 跳过重复 pack
+  qk_packk_seq  *= K 完全按 kernel 访存顺序 [E/4][32]，单条 vld1q_u16_x4 拿
+                    一整 cacheline 64 字节。同样 amortized。
+  qk_packqk_seq *= Q + K 都按 kernel 访存顺序 pre-pack，A/B 双侧都用 vld1q_u16_x4。
+                    Q-LSU 上限测试：检查 baseline 的 8 vld1_u16 + 4 vcombine 是否
+                    仍是瓶颈。⚠️  Q 在真实 SDPA 主路径不会预 pack（每 i-tile 滑窗即
+                    miss），此值不可外推为端到端收益。
+  qk_packqk_seq4*= 同样 Q + K 都按 seq 布局 pre-pack，但 A/B 双侧都改为
+                    4 条独立 vld1q_u16，而不是 vld1q_u16_x4。用于验证目标核
+                    对 multi-reg load 是否串行化；若 seq4 > seq，说明独立 load
+                    更适合该机器。
+  qk_packqk_seq4_ptr*    = seq4 + 显式 q_ptr/k_ptr 每轮 +=32，去掉 (e/4)*32 地址表达式。
+  qk_packqk_seq4_bmajor* = seq4 + 16 条 BFMMLA 按 B 操作数复用顺序发射。
+  qk_packqk_seq4_pipe_a* = seq4 + K 全 load，Q 分批 load 后立即计算对应 A 行组。
+  qk_packqk_seq4_pipe_b* = seq4 + Q 全 load，K 分批 load 后立即计算对应 B 列组。
+  qk_unroll2    *= BFMMLA 主路径 + 2-way k-unroll，摊薄 loop overhead。
 
 Apple Silicon 实测：packk_inner 与 packk_seq 几乎打平（~50 GFLOPS / 90% half-peak），
 说明 BFMMLA 路径下的 K-LSU 已不是瓶颈，剩 ~8% 缺口在 Q 路径 + BFMMLA pipeline。

@@ -1,48 +1,97 @@
 #pragma once
-// ── 微内核 impl：MK_PQuad ─────────────────────────────────────────────────
+// ── 微内核 impl：MK_QkPackqkSeq4BmajorPvPquad ───────────────────────────────
 //
-// PV「P 折成 quad load」改进版，覆盖 **fp32 和 bf16 两条 PV 路径**。
-// QKᵀ 全部沿用 MK_Baseline（本 impl 只改 PV）。
+// 组合 trait：QKᵀ 走 MK_QkPackqkSeq4Bmajor（Q+K 双 pack + B-major BFMMLA
+// 调度 + 4 条独立 vld1q_u16），PV 走 MK_PQuad（fp32 PV 的 P-quad load
+// 调度）。其余 op 与 baseline 一致。
 //
-//   * fp32 baseline：每 4-k 段 32 个 P 标量 load + 8 个 V quad load = 40 LSU。
-//   * fp32 pquad   ：每 4-k 段 8 个 P quad load + 8 个 V quad load = 16 LSU。
-//   * bf16 baseline：每 4-k 段 32 个 P 标量 load + 4 个 V vld1q_u16 = 36 LSU。
-//   * bf16 pquad   ：每 4-k 段 8 个 P quad load + 4 个 V vld1q_u16 = 12 LSU。
+// 设计动机：
+//   * 在 bf16 SDPA 主路径，目前两种最优实现互斥——选 packqk_seq4_bmajor
+//     拿到 bf16 QKᵀ 1.07× 加速，但 fp32 PV 退回 baseline；选 pquad 拿
+//     到 fp32 PV 1.10× 加速，但 bf16 QKᵀ 退回 baseline。组合 trait 把
+//     两个独立维度的优势合并，QKᵀ/PV 各取其最优实现。
 //
-// bf16 pquad 额外多 8 个 widen（vshll_n_u16）ALU op，但 widen 走 ALU 端口、
-// 与 FMA 不抢，可并行隐藏。两者均采用 fp32 pquad 同款软件流水（跨迭代 V
-// 预取放段 2 中段）。
+// 与 MK_QkPackqkSeq4Bmajor 的唯一差别：
+//   * fp32 版本的 pv_8x8 改派到 gemm_pv_microkernel_8x8_fp32_pquad
+//     （而不是 baseline 的 gemm_pv_8x8 fp32 路径）。
 //
-// 寄存器账本与主体相同（~30 NEON reg 稳态），数值上：
-//   * fp32：按位等价（累加顺序逐段一致）
-//   * bf16：与 baseline 等价（widen 后用同样的 fp32 fma）
+// 与 MK_PQuad 的差别：
+//   * bf16 qkt_8x8 改派到 packqk_seq4_bmajor inner（带 Q/K 双 pack 的
+//     thread_local cache）。
 //
-// 编译期开关：FUSED_CPP_MK_ENABLE_PQUAD，默认 1。
+// 数值上：
+//   * bf16 QKᵀ：BFMMLA 累加顺序与 baseline 略有差异（B-major 调度），
+//     按位不等价，与 `packqk_seq4_bmajor` 一致（已在 microkernel 单测
+//     中按 atol/rtol 验证）。
+//   * fp32 PV：与 baseline fp32 PV 按位等价（与 `pquad` 一致）。
+//
+// thread_local cache 复用 packqk_seq4_bmajor 的策略（Q / K 独立 buffer）。
+//
+// 编译期开关：FUSED_CPP_MK_ENABLE_QK_PACKQK_SEQ4_BMAJOR_PV_PQUAD，默认 1。
 
 #include <torch/extension.h>
 #include <cstdint>
+#include <vector>
 
 #include "../neon_cache_config.h"
 #include "../neon_cache_microkernels.h"
 
-#ifndef FUSED_CPP_MK_ENABLE_PQUAD
-#define FUSED_CPP_MK_ENABLE_PQUAD 1
+#ifndef FUSED_CPP_MK_ENABLE_QK_PACKQK_SEQ4_BMAJOR_PV_PQUAD
+#define FUSED_CPP_MK_ENABLE_QK_PACKQK_SEQ4_BMAJOR_PV_PQUAD 1
 #endif
 
 namespace fused_cpp::sdpa_microkernels {
 
-#if FUSED_CPP_MK_ENABLE_PQUAD
-struct MK_PQuad {
-  static constexpr const char* kName = "pquad";
+#if FUSED_CPP_MK_ENABLE_QK_PACKQK_SEQ4_BMAJOR_PV_PQUAD
+struct MK_QkPackqkSeq4BmajorPvPquad {
+  static constexpr const char* kName = "qk_packqk_seq4_bmajor_pv_pquad";
   static constexpr bool kEnabled = true;
 
-  // —— QKᵀ 主体 8×8（与 baseline 同） ——
+  // —— QKᵀ 主体 8×8 bf16：走 packqk_seq4_bmajor（Q+K 双 pack + B-major）——
   static inline void qkt_8x8(
       const at::BFloat16* Q, int64_t q_row_stride,
       const at::BFloat16* K, int64_t k_row_stride,
       int64_t E, float scale, float* scores_buf) {
+#if FUSED_CPP_SDPA_CACHE_HAS_BFMMLA
+    // ── Q 侧 thread_local cache（与 MK_QkPackqkSeq4Bmajor 独立一份）──
+    // 不与其它 trait 共用 buffer：两个 trait 的 cache 失效策略相同，
+    // 但 buffer 共用会让独立判断失效。
+    static thread_local std::vector<uint16_t> q_packed_buf;
+    static thread_local const at::BFloat16* last_Q = nullptr;
+    static thread_local int64_t last_q_row_stride = 0;
+    static thread_local int64_t last_q_E = 0;
+
+    if (Q != last_Q || q_row_stride != last_q_row_stride || E != last_q_E) {
+      q_packed_buf.assign(static_cast<size_t>(8 * E), 0);
+      pack_q_8rows_to_seq_bf16(Q, q_row_stride, E, q_packed_buf.data());
+      last_Q = Q;
+      last_q_row_stride = q_row_stride;
+      last_q_E = E;
+    }
+
+    // ── K 侧 thread_local cache ──
+    static thread_local std::vector<uint16_t> k_packed_buf;
+    static thread_local const at::BFloat16* last_K = nullptr;
+    static thread_local int64_t last_k_row_stride = 0;
+    static thread_local int64_t last_k_E = 0;
+
+    if (K != last_K || k_row_stride != last_k_row_stride || E != last_k_E) {
+      k_packed_buf.assign(static_cast<size_t>(8 * E), 0);
+      pack_k_8rows_to_seq_bf16(K, k_row_stride, E, k_packed_buf.data());
+      last_K = K;
+      last_k_row_stride = k_row_stride;
+      last_k_E = E;
+    }
+
+    gemm_qkt_microkernel_8x8_bf16_packqk_seq4_bmajor_inner(
+        q_packed_buf.data(), Q, q_row_stride,
+        k_packed_buf.data(), K, k_row_stride,
+        E, scale, scores_buf);
+#else
     gemm_qkt_8x8(Q, q_row_stride, K, k_row_stride, E, scale, scores_buf);
+#endif
   }
+  // fp32 QKᵀ：与 baseline 同。
   static inline void qkt_8x8(
       const float* Q, int64_t q_row_stride,
       const float* K, int64_t k_row_stride,
@@ -89,8 +138,7 @@ struct MK_PQuad {
   }
 
   // —— P̂·V 主体 8×8 ——
-  // bf16：派到 _bf16_pquad（V 仍是 bf16，P-端用 quad load + lane FMA；
-  //       widen 后的 fp32 数据和 baseline 一致，数值等价）。
+  // bf16：派到 _bf16_pquad（与 MK_PQuad 一致；V 仍 bf16，P-端 quad load）。
   static inline void pv_8x8(
       const float* P_hat, int64_t P_row_stride,
       const at::BFloat16* V, int64_t v_row_stride,
@@ -103,7 +151,7 @@ struct MK_PQuad {
     gemm_pv_8x8(P_hat, P_row_stride, V, v_row_stride, Sk, O, o_row_stride);
 #endif
   }
-  // fp32：派到新的 _pquad 微内核。
+  // fp32：派到 _pquad 微内核（与 MK_PQuad 一致）。
   static inline void pv_8x8(
       const float* P_hat, int64_t P_row_stride,
       const float* V, int64_t v_row_stride,
@@ -113,7 +161,6 @@ struct MK_PQuad {
     gemm_pv_microkernel_8x8_fp32_pquad(
         P_hat, P_row_stride, V, v_row_stride, Sk, O, o_row_stride);
 #else
-    // 没 NEON 时退到标量兜底（与 gemm_pv_8x8(float) 在无 NEON 分支一致）。
     gemm_pv_8x8(P_hat, P_row_stride, V, v_row_stride, Sk, O, o_row_stride);
 #endif
   }
@@ -138,6 +185,6 @@ struct MK_PQuad {
                  O, o_row_stride, Lq, Ev);
   }
 };
-#endif  // FUSED_CPP_MK_ENABLE_PQUAD
+#endif  // FUSED_CPP_MK_ENABLE_QK_PACKQK_SEQ4_BMAJOR_PV_PQUAD
 
 }  // namespace fused_cpp::sdpa_microkernels

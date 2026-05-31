@@ -6,6 +6,7 @@
 - remove_weight=True 时权重被替换为空张量
 - ACL 不可用时正确回退到后续后端
 """
+import importlib.util
 import platform
 from unittest import mock
 
@@ -20,9 +21,11 @@ try:
 except ImportError:
     _acl_available = False
 
+_vllm_available = importlib.util.find_spec("vllm") is not None
+
 pytestmark = pytest.mark.skipif(
-    not (_is_aarch64 and _acl_available),
-    reason="ACL dispatch 集成测试仅在 AArch64 平台且 ACL 可用时运行",
+    not (_is_aarch64 and _acl_available and _vllm_available),
+    reason="ACL dispatch 集成测试仅在 AArch64、ACL 可用且 vLLM 可导入时运行",
 )
 
 

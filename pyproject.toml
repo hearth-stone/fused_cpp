@@ -1,16 +1,30 @@
 [build-system]
-requires = ["setuptools>=64", "torch"]
+requires = ["setuptools>=64", "wheel", "torch"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "fused-cpp"
 version = "0.1.0"
-description = "CPU Fused MLA and MoE implementations (pure PyTorch)"
+description = "CPU fused MLA, MoE, GEMM, and SDPA kernels for PyTorch"
 requires-python = ">=3.9"
 dependencies = ["torch"]
 
 [project.optional-dependencies]
-dev = ["pytest", "hypothesis", "pytest-benchmark"]
+test = [
+    "pytest",
+    "hypothesis",
+]
+bench = [
+    "pytest",
+    "pytest-benchmark",
+    "openpyxl",
+]
+dev = [
+    "pytest",
+    "hypothesis",
+    "pytest-benchmark",
+    "openpyxl",
+]
 
 # ── uv 专用：强制 Linux / Windows 上从 PyTorch 官方 CPU 索引拉取 torch ──
 # 本项目是 CPU-only 实现，PyPI 默认 wheel 在 linux x86_64 会带整套 nvidia-*-cu12 (~3GB)，

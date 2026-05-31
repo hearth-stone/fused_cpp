@@ -499,6 +499,14 @@ def _bench_write_outputs(out_dir, prefix, records):
     return json_path, csv_path
 
 
+def _bench_effective_gflops(record):
+    """Return the GFLOP/s metric that matches the row's causal mode."""
+    if "gflops" in record:
+        return float(record["gflops"])
+    key = "gflops_causal" if record["is_causal"] else "gflops_total"
+    return float(record[key])
+
+
 def _bench_print_summary(records):
     if not records:
         return
@@ -506,8 +514,8 @@ def _bench_print_summary(records):
     header = (
         f"{'version':<14} {'shape':<24} {'dtype':<5} {'causal':<6} "
         f"{'mean_ms':>10} {'P90_ms':>10} "
-        f"{'gflops_total':>14} {'gflops_causal':>15} "
-        f"{'speedup_pt':>11} {'threads':>8}"
+        f"{'gflops':>12} "
+        f"{'speedup_pt':>11} {'torch_t':>7} {'omp_t':>7}"
     )
     print("=" * len(header))
     print(header)
@@ -519,8 +527,9 @@ def _bench_print_summary(records):
             f"{r['version']:<14} {r['shape']:<24} {r['dtype']:<5} "
             f"{str(r['is_causal']):<6} "
             f"{r['mean_ms']:>10.3f} {r['p90_ms']:>10.3f} "
-            f"{r['gflops_total']:>14.2f} {r['gflops_causal']:>15.2f} "
-            f"{speed_s} {str(r['num_threads']):>8}"
+            f"{_bench_effective_gflops(r):>12.2f} "
+            f"{speed_s} {str(r['num_threads']):>7} "
+            f"{str(r.get('omp_max_threads', '?')):>7}"
         )
     print("=" * len(header))
 
@@ -614,7 +623,7 @@ def _bench_scaling_efficiency(records):
     for r in records:
         key = (r["version"], r["shape"], r["dtype"], r["is_causal"])
         bucket.setdefault(key, []).append(
-            (int(r["sweep_threads"]), float(r["gflops_total"]))
+            (int(r["sweep_threads"]), _bench_effective_gflops(r))
         )
     eff_rows = []
     for (ver, shp, dt, ic), pairs in bucket.items():
@@ -632,7 +641,7 @@ def _bench_scaling_efficiency(records):
                 "dtype":     dt,
                 "is_causal": ic,
                 "threads":   n,
-                "gflops_total": g,
+                "gflops":    g,
                 "efficiency":   eff,
             })
     return eff_rows
@@ -700,6 +709,6 @@ def pytest_sessionfinish(session, exitstatus):  # noqa: D401
             print(
                 f"  {row['version']:<14} {row['shape']:<24} "
                 f"{row['dtype']:<5} causal={row['is_causal']!s:<5} "
-                f"N={row['threads']:>3}  gflops={row['gflops_total']:>9.2f}  "
+                f"N={row['threads']:>3}  gflops={row['gflops']:>9.2f}  "
                 f"eff={row['efficiency']:.3f}"
             )

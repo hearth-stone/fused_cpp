@@ -752,6 +752,1038 @@ static inline void gemm_qkt_microkernel_8x8_bf16_packk_seq_inner(
   vst1q_f32(scores_buf + 7 * 8 + 4, vmulq_f32(c71, vs));
 }
 
+// ── BF16 QKᵀ 8×8：Q 与 K 都按 kernel 访存顺序排布（packqk-seq）────────────
+//
+// 与 pack_k_8rows_to_seq_bf16 + _packk_seq_inner 拓扑对偶：在 packk-seq 已经
+// 把 K 排成 [E/4][32 u16] / 单条 vld1q_u16_x4 拿一整 cacheline 之后，本路径
+// 把 Q 也按同样布局 pre-pack，让 inner kernel 的 Q-LSU 也走 ld1.16b{v0-v3}
+// 一次到位——彻底测「Q + K 双侧都已是 BFMMLA-friendly 连续布局」时 BFMMLA
+// 主循环的理论上限。
+//
+// 收益假设：相对 packk_seq 多省的是 baseline 在 Q 路径上的 8 vld1_u16 +
+// 4 vcombine_u16 + 8 个跨 q_row_stride 的 8 字节 load → 1 vld1q_u16_x4
+// + 4 vreinterpret，cacheline 利用率 1/8 → 1/4，HW prefetcher 看到的是
+// 单一 stride-64 stream（Q），与 K 一起两条独立 stride-64 stream。
+//
+// 与 pack_k_8rows_to_seq_bf16 函数体几乎完全相同，只是参数名 K → Q。
+// 直接复制保留——evaluation prototype 不引入泛型抽象（如未来有第三个 trait
+// 需要，再考虑提取 helper）。E % 4 != 0 时只 pack [0, E&~3) 段；标量 tail
+// 由 inner 函数读原 Q 指针处理。
+inline void pack_q_8rows_to_seq_bf16(
+    const at::BFloat16* Q, int64_t q_row_stride, int64_t E,
+    uint16_t* Q_seq) {
+  const uint16_t* Qp = reinterpret_cast<const uint16_t*>(Q);
+  const int64_t E_main = E & ~int64_t{3};
+  for (int64_t e = 0; e < E_main; e += 4) {
+    uint16_t* dst = Q_seq + (e / 4) * 32;
+    for (int row = 0; row < 8; ++row) {
+      std::memcpy(dst + row * 4, Qp + row * q_row_stride + e, 8);
+    }
+  }
+}
+
+// pack_k_to_seq8：把整段 K 流 pre-pack 成 SDPA 主路径可直接消费的 layout。
+//
+// 输入：K[B, N, S, E]（S 必须是 8 的倍数；E 任意，partial e_block 不 pack）。
+// 输出：K_packed 视为 u16 数组，逻辑上是 K_packed[b, n, s_block, e_block, lane]，
+//       其中 s_block ∈ [0, S/8)，e_block ∈ [0, E_main/4)，lane ∈ [0, 32)。
+//       每个 [E_main/4][32] 子块就是 pack_k_8rows_to_seq_bf16 的输出，正好
+//       与 gemm_qkt_microkernel_8x8_bf16_packqk_seq4_bmajor_inner 的 K_seq
+//       入参对齐。
+//
+// 多线程 collapse(3) over (b, n, s_block)：每个 work unit 写
+//     (E_main / 4) * 32 个 u16 = E_main * 8 字节
+// （bf16 E=192 时 1.5 KiB，远 ≫ 64 字节 cache line，无 false sharing）。
+//
+// 仅 bf16；fp32 路径不应调用本函数（pack 无收益）。模板形参便于调用方按 dtype
+// 分发，但 fp32 实例化是死代码。
+template <typename scalar_t>
+void pack_k_to_seq8(
+    const scalar_t* k_src,
+    uint16_t* k_dst,
+    int64_t B, int64_t N, int64_t S, int64_t E) {
+  TORCH_CHECK(S % 8 == 0,
+              "pack_k_to_seq8 requires S % 8 == 0, got S=", S);
+  static_assert(std::is_same_v<scalar_t, at::BFloat16>,
+                "pack_k_to_seq8: only bf16 is supported");
+  const int64_t S_blocks = S / 8;
+  const int64_t E_main = E & ~int64_t{3};
+  const int64_t e_blocks = E_main / 4;
+  const int64_t kblock_u16 = e_blocks * 32;        // 单个 8-row 子块的 u16 容量
+  const int64_t bn_stride_src = N * S * E;
+  const int64_t n_stride_src = S * E;
+  const int64_t bn_stride_dst = N * S_blocks * kblock_u16;
+  const int64_t n_stride_dst = S_blocks * kblock_u16;
+
+#ifdef _OPENMP
+  #pragma omp parallel for collapse(3) schedule(static)
+#endif
+  for (int64_t b = 0; b < B; ++b) {
+    for (int64_t n = 0; n < N; ++n) {
+      for (int64_t sb = 0; sb < S_blocks; ++sb) {
+        const scalar_t* src = k_src + b * bn_stride_src
+                                    + n * n_stride_src
+                                    + sb * 8 * E;
+        uint16_t* dst = k_dst + b * bn_stride_dst
+                              + n * n_stride_dst
+                              + sb * kblock_u16;
+        pack_k_8rows_to_seq_bf16(src, /*k_row_stride=*/E, E, dst);
+      }
+    }
+  }
+}
+
+// gemm_qkt_microkernel_8x8_bf16_packqk_seq_inner：
+//   计算 scores[8][8] = scale * (Q[8][E] · K[8][E]^T)，Q 与 K 双侧都已
+//   pre-pack 到 [E/4][32 u16] 布局（见 pack_q_8rows_to_seq_bf16 /
+//   pack_k_8rows_to_seq_bf16）。内层用两条 `vld1q_u16_x4` 各自一次拿
+//   4 个 BFMMLA 操作数：A 侧 = 4 个 a-pair（Q），B 侧 = 4 个 b-pair（K）。
+//   16 BFMMLA / unzip / scale-store 与 baseline / packk_seq 完全相同。
+//
+// 调用约束：与 packk_seq inner 一致，E % 4 == 0 时整段走主路径；E % 4 != 0
+// 的 tail 段从 Q_orig / K_orig 读原指针走 widen+FMA 标量补齐（与 baseline
+// 的 tail 实现 bit-for-bit 等价）。
+//
+// 该函数仅供 mk_qk_packqk_seq trait 在 microkernel benchmark 中使用，不接入
+// SDPA 主路径——这是个上限评估原型。
+static inline void gemm_qkt_microkernel_8x8_bf16_packqk_seq_inner(
+    const uint16_t* Q_seq,             // [E/4 e_block][32 u16 lanes]
+    const at::BFloat16* Q_orig,        // 仅用于 e ≥ E&~3 的标量 tail
+    int64_t q_row_stride,
+    const uint16_t* K_seq,             // [E/4 e_block][32 u16 lanes]
+    const at::BFloat16* K_orig,        // 仅用于 e ≥ E&~3 的标量 tail
+    int64_t k_row_stride,
+    int64_t E,
+    float scale,
+    float* scores_buf) {
+  float32x4_t c00 = vdupq_n_f32(0), c01 = vdupq_n_f32(0);
+  float32x4_t c10 = vdupq_n_f32(0), c11 = vdupq_n_f32(0);
+  float32x4_t c20 = vdupq_n_f32(0), c21 = vdupq_n_f32(0);
+  float32x4_t c30 = vdupq_n_f32(0), c31 = vdupq_n_f32(0);
+  float32x4_t c40 = vdupq_n_f32(0), c41 = vdupq_n_f32(0);
+  float32x4_t c50 = vdupq_n_f32(0), c51 = vdupq_n_f32(0);
+  float32x4_t c60 = vdupq_n_f32(0), c61 = vdupq_n_f32(0);
+  float32x4_t c70 = vdupq_n_f32(0), c71 = vdupq_n_f32(0);
+
+  const uint16_t* Qp = reinterpret_cast<const uint16_t*>(Q_orig);
+  const uint16_t* Kp = reinterpret_cast<const uint16_t*>(K_orig);
+  int64_t e = 0;
+
+#if FUSED_CPP_SDPA_CACHE_HAS_BFMMLA
+  float32x4_t bm00 = vdupq_n_f32(0), bm01 = vdupq_n_f32(0);
+  float32x4_t bm02 = vdupq_n_f32(0), bm03 = vdupq_n_f32(0);
+  float32x4_t bm10 = vdupq_n_f32(0), bm11 = vdupq_n_f32(0);
+  float32x4_t bm12 = vdupq_n_f32(0), bm13 = vdupq_n_f32(0);
+  float32x4_t bm20 = vdupq_n_f32(0), bm21 = vdupq_n_f32(0);
+  float32x4_t bm22 = vdupq_n_f32(0), bm23 = vdupq_n_f32(0);
+  float32x4_t bm30 = vdupq_n_f32(0), bm31 = vdupq_n_f32(0);
+  float32x4_t bm32 = vdupq_n_f32(0), bm33 = vdupq_n_f32(0);
+
+  for (; e + 4 <= E; e += 4) {
+    // Q：单条 vld1q_u16_x4 从 packed buffer 拿一整 cacheline 64 字节
+    // = 4 个 BFMMLA A 操作数（与 K-side 完全对偶）。相对 baseline
+    // 省 8 vld1_u16 + 4 vcombine_u16 + 8 个跨 q_row_stride 的 8 字节
+    // load → 1 multi-reg load + 4 vreinterpret。
+    uint16x8x4_t q4 = vld1q_u16_x4(Q_seq + (e / 4) * 32);
+    bfloat16x8_t a01 = vreinterpretq_bf16_u16(q4.val[0]);
+    bfloat16x8_t a23 = vreinterpretq_bf16_u16(q4.val[1]);
+    bfloat16x8_t a45 = vreinterpretq_bf16_u16(q4.val[2]);
+    bfloat16x8_t a67 = vreinterpretq_bf16_u16(q4.val[3]);
+
+    // K：与 packk_seq inner 完全相同——单条 vld1q_u16_x4 拿 4 个 B 操作数。
+    uint16x8x4_t k4 = vld1q_u16_x4(K_seq + (e / 4) * 32);
+    bfloat16x8_t b01 = vreinterpretq_bf16_u16(k4.val[0]);
+    bfloat16x8_t b23 = vreinterpretq_bf16_u16(k4.val[1]);
+    bfloat16x8_t b45 = vreinterpretq_bf16_u16(k4.val[2]);
+    bfloat16x8_t b67 = vreinterpretq_bf16_u16(k4.val[3]);
+
+    bm00 = vbfmmlaq_f32(bm00, a01, b01);
+    bm01 = vbfmmlaq_f32(bm01, a01, b23);
+    bm02 = vbfmmlaq_f32(bm02, a01, b45);
+    bm03 = vbfmmlaq_f32(bm03, a01, b67);
+    bm10 = vbfmmlaq_f32(bm10, a23, b01);
+    bm11 = vbfmmlaq_f32(bm11, a23, b23);
+    bm12 = vbfmmlaq_f32(bm12, a23, b45);
+    bm13 = vbfmmlaq_f32(bm13, a23, b67);
+    bm20 = vbfmmlaq_f32(bm20, a45, b01);
+    bm21 = vbfmmlaq_f32(bm21, a45, b23);
+    bm22 = vbfmmlaq_f32(bm22, a45, b45);
+    bm23 = vbfmmlaq_f32(bm23, a45, b67);
+    bm30 = vbfmmlaq_f32(bm30, a67, b01);
+    bm31 = vbfmmlaq_f32(bm31, a67, b23);
+    bm32 = vbfmmlaq_f32(bm32, a67, b45);
+    bm33 = vbfmmlaq_f32(bm33, a67, b67);
+  }
+
+  // 把 BFMMLA 的 2×2 子块布局重排为「行向 4 lane」布局
+  //（与 baseline / packk_seq 完全相同的 unzip）。
+  auto unzip_pair = [](float32x4_t lo_block, float32x4_t hi_block,
+                       float32x4_t* row_lo, float32x4_t* row_hi) {
+    *row_lo = vcombine_f32(vget_low_f32(lo_block),
+                           vget_low_f32(hi_block));
+    *row_hi = vcombine_f32(vget_high_f32(lo_block),
+                           vget_high_f32(hi_block));
+  };
+  unzip_pair(bm00, bm01, &c00, &c10);
+  unzip_pair(bm02, bm03, &c01, &c11);
+  unzip_pair(bm10, bm11, &c20, &c30);
+  unzip_pair(bm12, bm13, &c21, &c31);
+  unzip_pair(bm20, bm21, &c40, &c50);
+  unzip_pair(bm22, bm23, &c41, &c51);
+  unzip_pair(bm30, bm31, &c60, &c70);
+  unzip_pair(bm32, bm33, &c61, &c71);
+#endif  // FUSED_CPP_SDPA_CACHE_HAS_BFMMLA
+
+  // 标量 tail（E % 4 != 0），直接用原 Q / K 指针。逐字与 packk_seq inner
+  // 一致——两个 stride 各自独立，确保与 baseline bit-for-bit 等价。
+  if (e < E) {
+    float scalar_acc[8 * 8];
+    auto store_cij = [&](int i_row, float* dst) {
+      float32x4_t lo, hi;
+      switch (i_row) {
+        case 0: lo = c00; hi = c01; break;
+        case 1: lo = c10; hi = c11; break;
+        case 2: lo = c20; hi = c21; break;
+        case 3: lo = c30; hi = c31; break;
+        case 4: lo = c40; hi = c41; break;
+        case 5: lo = c50; hi = c51; break;
+        case 6: lo = c60; hi = c61; break;
+        case 7: lo = c70; hi = c71; break;
+        default: lo = vdupq_n_f32(0); hi = vdupq_n_f32(0);
+      }
+      vst1q_f32(dst + 0, lo);
+      vst1q_f32(dst + 4, hi);
+    };
+    auto load_cij = [&](int i_row, const float* src) {
+      float32x4_t lo = vld1q_f32(src + 0);
+      float32x4_t hi = vld1q_f32(src + 4);
+      switch (i_row) {
+        case 0: c00 = lo; c01 = hi; break;
+        case 1: c10 = lo; c11 = hi; break;
+        case 2: c20 = lo; c21 = hi; break;
+        case 3: c30 = lo; c31 = hi; break;
+        case 4: c40 = lo; c41 = hi; break;
+        case 5: c50 = lo; c51 = hi; break;
+        case 6: c60 = lo; c61 = hi; break;
+        case 7: c70 = lo; c71 = hi; break;
+      }
+    };
+    for (int i_row = 0; i_row < 8; ++i_row) store_cij(i_row, scalar_acc + i_row * 8);
+    for (int64_t e2 = e; e2 < E; ++e2) {
+      for (int i_row = 0; i_row < 8; ++i_row) {
+        float qv = bf16_to_fp32_scalar(Qp[i_row * q_row_stride + e2]);
+        for (int j_col = 0; j_col < 8; ++j_col) {
+          float kv = bf16_to_fp32_scalar(Kp[j_col * k_row_stride + e2]);
+          scalar_acc[i_row * 8 + j_col] += qv * kv;
+        }
+      }
+    }
+    for (int i_row = 0; i_row < 8; ++i_row) load_cij(i_row, scalar_acc + i_row * 8);
+  }
+
+  const float32x4_t vs = vdupq_n_f32(scale);
+  vst1q_f32(scores_buf + 0 * 8 + 0, vmulq_f32(c00, vs));
+  vst1q_f32(scores_buf + 0 * 8 + 4, vmulq_f32(c01, vs));
+  vst1q_f32(scores_buf + 1 * 8 + 0, vmulq_f32(c10, vs));
+  vst1q_f32(scores_buf + 1 * 8 + 4, vmulq_f32(c11, vs));
+  vst1q_f32(scores_buf + 2 * 8 + 0, vmulq_f32(c20, vs));
+  vst1q_f32(scores_buf + 2 * 8 + 4, vmulq_f32(c21, vs));
+  vst1q_f32(scores_buf + 3 * 8 + 0, vmulq_f32(c30, vs));
+  vst1q_f32(scores_buf + 3 * 8 + 4, vmulq_f32(c31, vs));
+  vst1q_f32(scores_buf + 4 * 8 + 0, vmulq_f32(c40, vs));
+  vst1q_f32(scores_buf + 4 * 8 + 4, vmulq_f32(c41, vs));
+  vst1q_f32(scores_buf + 5 * 8 + 0, vmulq_f32(c50, vs));
+  vst1q_f32(scores_buf + 5 * 8 + 4, vmulq_f32(c51, vs));
+  vst1q_f32(scores_buf + 6 * 8 + 0, vmulq_f32(c60, vs));
+  vst1q_f32(scores_buf + 6 * 8 + 4, vmulq_f32(c61, vs));
+  vst1q_f32(scores_buf + 7 * 8 + 0, vmulq_f32(c70, vs));
+  vst1q_f32(scores_buf + 7 * 8 + 4, vmulq_f32(c71, vs));
+}
+
+// gemm_qkt_microkernel_8x8_bf16_packqk_seq4_inner：
+//   与 packqk_seq_inner 使用**同一个 seq packed layout**，但 Q/K 双侧都改用
+//   4 条独立 `vld1q_u16`（base+0/8/16/24）而不是单条 `vld1q_u16_x4`。
+//   用于验证「x4 multi-reg load 在目标机器上是否被串行化」；如果目标核有
+//   多 LSU port，4 条独立 load 可能比 x4 更快。
+//
+static inline void gemm_qkt_microkernel_8x8_bf16_packqk_seq4_inner(
+    const uint16_t* Q_seq,             // [E/4 e_block][32 u16 lanes]
+    const at::BFloat16* Q_orig,        // 仅用于 e ≥ E&~3 的标量 tail
+    int64_t q_row_stride,
+    const uint16_t* K_seq,             // [E/4 e_block][32 u16 lanes]
+    const at::BFloat16* K_orig,        // 仅用于 e ≥ E&~3 的标量 tail
+    int64_t k_row_stride,
+    int64_t E,
+    float scale,
+    float* scores_buf) {
+  float32x4_t c00 = vdupq_n_f32(0), c01 = vdupq_n_f32(0);
+  float32x4_t c10 = vdupq_n_f32(0), c11 = vdupq_n_f32(0);
+  float32x4_t c20 = vdupq_n_f32(0), c21 = vdupq_n_f32(0);
+  float32x4_t c30 = vdupq_n_f32(0), c31 = vdupq_n_f32(0);
+  float32x4_t c40 = vdupq_n_f32(0), c41 = vdupq_n_f32(0);
+  float32x4_t c50 = vdupq_n_f32(0), c51 = vdupq_n_f32(0);
+  float32x4_t c60 = vdupq_n_f32(0), c61 = vdupq_n_f32(0);
+  float32x4_t c70 = vdupq_n_f32(0), c71 = vdupq_n_f32(0);
+
+  const uint16_t* Qp = reinterpret_cast<const uint16_t*>(Q_orig);
+  const uint16_t* Kp = reinterpret_cast<const uint16_t*>(K_orig);
+  int64_t e = 0;
+
+#if FUSED_CPP_SDPA_CACHE_HAS_BFMMLA
+  float32x4_t bm00 = vdupq_n_f32(0), bm01 = vdupq_n_f32(0);
+  float32x4_t bm02 = vdupq_n_f32(0), bm03 = vdupq_n_f32(0);
+  float32x4_t bm10 = vdupq_n_f32(0), bm11 = vdupq_n_f32(0);
+  float32x4_t bm12 = vdupq_n_f32(0), bm13 = vdupq_n_f32(0);
+  float32x4_t bm20 = vdupq_n_f32(0), bm21 = vdupq_n_f32(0);
+  float32x4_t bm22 = vdupq_n_f32(0), bm23 = vdupq_n_f32(0);
+  float32x4_t bm30 = vdupq_n_f32(0), bm31 = vdupq_n_f32(0);
+  float32x4_t bm32 = vdupq_n_f32(0), bm33 = vdupq_n_f32(0);
+
+  for (; e + 4 <= E; e += 4) {
+    // Q：仍复用 seq packed layout，但不用 vld1q_u16_x4；改为 4 条独立
+    // vld1q_u16。这样保留单一 stride-64 packed stream 的布局优势，同时让
+    // 微架构可以把 4 个 16B load 分发到多个 LSU port（对 x4 被串行化的核更友好）。
+    const uint16_t* q_base = Q_seq + (e / 4) * 32;
+    bfloat16x8_t a01 = vreinterpretq_bf16_u16(vld1q_u16(q_base + 0));
+    bfloat16x8_t a23 = vreinterpretq_bf16_u16(vld1q_u16(q_base + 8));
+    bfloat16x8_t a45 = vreinterpretq_bf16_u16(vld1q_u16(q_base + 16));
+    bfloat16x8_t a67 = vreinterpretq_bf16_u16(vld1q_u16(q_base + 24));
+
+    // K：同样使用 4 条独立 vld1q_u16，而不是 vld1q_u16_x4。
+    const uint16_t* k_base = K_seq + (e / 4) * 32;
+    bfloat16x8_t b01 = vreinterpretq_bf16_u16(vld1q_u16(k_base + 0));
+    bfloat16x8_t b23 = vreinterpretq_bf16_u16(vld1q_u16(k_base + 8));
+    bfloat16x8_t b45 = vreinterpretq_bf16_u16(vld1q_u16(k_base + 16));
+    bfloat16x8_t b67 = vreinterpretq_bf16_u16(vld1q_u16(k_base + 24));
+
+    bm00 = vbfmmlaq_f32(bm00, a01, b01);
+    bm01 = vbfmmlaq_f32(bm01, a01, b23);
+    bm02 = vbfmmlaq_f32(bm02, a01, b45);
+    bm03 = vbfmmlaq_f32(bm03, a01, b67);
+    bm10 = vbfmmlaq_f32(bm10, a23, b01);
+    bm11 = vbfmmlaq_f32(bm11, a23, b23);
+    bm12 = vbfmmlaq_f32(bm12, a23, b45);
+    bm13 = vbfmmlaq_f32(bm13, a23, b67);
+    bm20 = vbfmmlaq_f32(bm20, a45, b01);
+    bm21 = vbfmmlaq_f32(bm21, a45, b23);
+    bm22 = vbfmmlaq_f32(bm22, a45, b45);
+    bm23 = vbfmmlaq_f32(bm23, a45, b67);
+    bm30 = vbfmmlaq_f32(bm30, a67, b01);
+    bm31 = vbfmmlaq_f32(bm31, a67, b23);
+    bm32 = vbfmmlaq_f32(bm32, a67, b45);
+    bm33 = vbfmmlaq_f32(bm33, a67, b67);
+  }
+
+  // 把 BFMMLA 的 2×2 子块布局重排为「行向 4 lane」布局
+  //（与 baseline / packk_seq 完全相同的 unzip）。
+  auto unzip_pair = [](float32x4_t lo_block, float32x4_t hi_block,
+                       float32x4_t* row_lo, float32x4_t* row_hi) {
+    *row_lo = vcombine_f32(vget_low_f32(lo_block),
+                           vget_low_f32(hi_block));
+    *row_hi = vcombine_f32(vget_high_f32(lo_block),
+                           vget_high_f32(hi_block));
+  };
+  unzip_pair(bm00, bm01, &c00, &c10);
+  unzip_pair(bm02, bm03, &c01, &c11);
+  unzip_pair(bm10, bm11, &c20, &c30);
+  unzip_pair(bm12, bm13, &c21, &c31);
+  unzip_pair(bm20, bm21, &c40, &c50);
+  unzip_pair(bm22, bm23, &c41, &c51);
+  unzip_pair(bm30, bm31, &c60, &c70);
+  unzip_pair(bm32, bm33, &c61, &c71);
+#endif  // FUSED_CPP_SDPA_CACHE_HAS_BFMMLA
+
+  // 标量 tail（E % 4 != 0），直接用原 Q / K 指针。逐字与 packk_seq inner
+  // 一致——两个 stride 各自独立，确保与 baseline bit-for-bit 等价。
+  if (e < E) {
+    float scalar_acc[8 * 8];
+    auto store_cij = [&](int i_row, float* dst) {
+      float32x4_t lo, hi;
+      switch (i_row) {
+        case 0: lo = c00; hi = c01; break;
+        case 1: lo = c10; hi = c11; break;
+        case 2: lo = c20; hi = c21; break;
+        case 3: lo = c30; hi = c31; break;
+        case 4: lo = c40; hi = c41; break;
+        case 5: lo = c50; hi = c51; break;
+        case 6: lo = c60; hi = c61; break;
+        case 7: lo = c70; hi = c71; break;
+        default: lo = vdupq_n_f32(0); hi = vdupq_n_f32(0);
+      }
+      vst1q_f32(dst + 0, lo);
+      vst1q_f32(dst + 4, hi);
+    };
+    auto load_cij = [&](int i_row, const float* src) {
+      float32x4_t lo = vld1q_f32(src + 0);
+      float32x4_t hi = vld1q_f32(src + 4);
+      switch (i_row) {
+        case 0: c00 = lo; c01 = hi; break;
+        case 1: c10 = lo; c11 = hi; break;
+        case 2: c20 = lo; c21 = hi; break;
+        case 3: c30 = lo; c31 = hi; break;
+        case 4: c40 = lo; c41 = hi; break;
+        case 5: c50 = lo; c51 = hi; break;
+        case 6: c60 = lo; c61 = hi; break;
+        case 7: c70 = lo; c71 = hi; break;
+      }
+    };
+    for (int i_row = 0; i_row < 8; ++i_row) store_cij(i_row, scalar_acc + i_row * 8);
+    for (int64_t e2 = e; e2 < E; ++e2) {
+      for (int i_row = 0; i_row < 8; ++i_row) {
+        float qv = bf16_to_fp32_scalar(Qp[i_row * q_row_stride + e2]);
+        for (int j_col = 0; j_col < 8; ++j_col) {
+          float kv = bf16_to_fp32_scalar(Kp[j_col * k_row_stride + e2]);
+          scalar_acc[i_row * 8 + j_col] += qv * kv;
+        }
+      }
+    }
+    for (int i_row = 0; i_row < 8; ++i_row) load_cij(i_row, scalar_acc + i_row * 8);
+  }
+
+  const float32x4_t vs = vdupq_n_f32(scale);
+  vst1q_f32(scores_buf + 0 * 8 + 0, vmulq_f32(c00, vs));
+  vst1q_f32(scores_buf + 0 * 8 + 4, vmulq_f32(c01, vs));
+  vst1q_f32(scores_buf + 1 * 8 + 0, vmulq_f32(c10, vs));
+  vst1q_f32(scores_buf + 1 * 8 + 4, vmulq_f32(c11, vs));
+  vst1q_f32(scores_buf + 2 * 8 + 0, vmulq_f32(c20, vs));
+  vst1q_f32(scores_buf + 2 * 8 + 4, vmulq_f32(c21, vs));
+  vst1q_f32(scores_buf + 3 * 8 + 0, vmulq_f32(c30, vs));
+  vst1q_f32(scores_buf + 3 * 8 + 4, vmulq_f32(c31, vs));
+  vst1q_f32(scores_buf + 4 * 8 + 0, vmulq_f32(c40, vs));
+  vst1q_f32(scores_buf + 4 * 8 + 4, vmulq_f32(c41, vs));
+  vst1q_f32(scores_buf + 5 * 8 + 0, vmulq_f32(c50, vs));
+  vst1q_f32(scores_buf + 5 * 8 + 4, vmulq_f32(c51, vs));
+  vst1q_f32(scores_buf + 6 * 8 + 0, vmulq_f32(c60, vs));
+  vst1q_f32(scores_buf + 6 * 8 + 4, vmulq_f32(c61, vs));
+  vst1q_f32(scores_buf + 7 * 8 + 0, vmulq_f32(c70, vs));
+  vst1q_f32(scores_buf + 7 * 8 + 4, vmulq_f32(c71, vs));
+}
+
+
+// gemm_qkt_microkernel_8x8_bf16_packqk_seq4_ptr_inner：
+//   指针递增版本：消除 `(e/4)*32` 地址表达式，显式 q_ptr/k_ptr 每轮 +32。
+//   其余 pack layout / tail / unzip / scale-store 与 qk_packqk_seq4 完全一致。
+//
+static inline void gemm_qkt_microkernel_8x8_bf16_packqk_seq4_ptr_inner(
+    const uint16_t* Q_seq,             // [E/4 e_block][32 u16 lanes]
+    const at::BFloat16* Q_orig,        // 仅用于 e ≥ E&~3 的标量 tail
+    int64_t q_row_stride,
+    const uint16_t* K_seq,             // [E/4 e_block][32 u16 lanes]
+    const at::BFloat16* K_orig,        // 仅用于 e ≥ E&~3 的标量 tail
+    int64_t k_row_stride,
+    int64_t E,
+    float scale,
+    float* scores_buf) {
+  float32x4_t c00 = vdupq_n_f32(0), c01 = vdupq_n_f32(0);
+  float32x4_t c10 = vdupq_n_f32(0), c11 = vdupq_n_f32(0);
+  float32x4_t c20 = vdupq_n_f32(0), c21 = vdupq_n_f32(0);
+  float32x4_t c30 = vdupq_n_f32(0), c31 = vdupq_n_f32(0);
+  float32x4_t c40 = vdupq_n_f32(0), c41 = vdupq_n_f32(0);
+  float32x4_t c50 = vdupq_n_f32(0), c51 = vdupq_n_f32(0);
+  float32x4_t c60 = vdupq_n_f32(0), c61 = vdupq_n_f32(0);
+  float32x4_t c70 = vdupq_n_f32(0), c71 = vdupq_n_f32(0);
+
+  const uint16_t* Qp = reinterpret_cast<const uint16_t*>(Q_orig);
+  const uint16_t* Kp = reinterpret_cast<const uint16_t*>(K_orig);
+  int64_t e = 0;
+
+#if FUSED_CPP_SDPA_CACHE_HAS_BFMMLA
+  float32x4_t bm00 = vdupq_n_f32(0), bm01 = vdupq_n_f32(0);
+  float32x4_t bm02 = vdupq_n_f32(0), bm03 = vdupq_n_f32(0);
+  float32x4_t bm10 = vdupq_n_f32(0), bm11 = vdupq_n_f32(0);
+  float32x4_t bm12 = vdupq_n_f32(0), bm13 = vdupq_n_f32(0);
+  float32x4_t bm20 = vdupq_n_f32(0), bm21 = vdupq_n_f32(0);
+  float32x4_t bm22 = vdupq_n_f32(0), bm23 = vdupq_n_f32(0);
+  float32x4_t bm30 = vdupq_n_f32(0), bm31 = vdupq_n_f32(0);
+  float32x4_t bm32 = vdupq_n_f32(0), bm33 = vdupq_n_f32(0);
+
+  const uint16_t* q_ptr = Q_seq;
+  const uint16_t* k_ptr = K_seq;
+  for (; e + 4 <= E; e += 4, q_ptr += 32, k_ptr += 32) {
+    bfloat16x8_t a01 = vreinterpretq_bf16_u16(vld1q_u16(q_ptr + 0));
+    bfloat16x8_t a23 = vreinterpretq_bf16_u16(vld1q_u16(q_ptr + 8));
+    bfloat16x8_t a45 = vreinterpretq_bf16_u16(vld1q_u16(q_ptr + 16));
+    bfloat16x8_t a67 = vreinterpretq_bf16_u16(vld1q_u16(q_ptr + 24));
+
+    bfloat16x8_t b01 = vreinterpretq_bf16_u16(vld1q_u16(k_ptr + 0));
+    bfloat16x8_t b23 = vreinterpretq_bf16_u16(vld1q_u16(k_ptr + 8));
+    bfloat16x8_t b45 = vreinterpretq_bf16_u16(vld1q_u16(k_ptr + 16));
+    bfloat16x8_t b67 = vreinterpretq_bf16_u16(vld1q_u16(k_ptr + 24));
+
+    bm00 = vbfmmlaq_f32(bm00, a01, b01);
+    bm01 = vbfmmlaq_f32(bm01, a01, b23);
+    bm02 = vbfmmlaq_f32(bm02, a01, b45);
+    bm03 = vbfmmlaq_f32(bm03, a01, b67);
+    bm10 = vbfmmlaq_f32(bm10, a23, b01);
+    bm11 = vbfmmlaq_f32(bm11, a23, b23);
+    bm12 = vbfmmlaq_f32(bm12, a23, b45);
+    bm13 = vbfmmlaq_f32(bm13, a23, b67);
+    bm20 = vbfmmlaq_f32(bm20, a45, b01);
+    bm21 = vbfmmlaq_f32(bm21, a45, b23);
+    bm22 = vbfmmlaq_f32(bm22, a45, b45);
+    bm23 = vbfmmlaq_f32(bm23, a45, b67);
+    bm30 = vbfmmlaq_f32(bm30, a67, b01);
+    bm31 = vbfmmlaq_f32(bm31, a67, b23);
+    bm32 = vbfmmlaq_f32(bm32, a67, b45);
+    bm33 = vbfmmlaq_f32(bm33, a67, b67);
+  }
+
+  // 把 BFMMLA 的 2×2 子块布局重排为「行向 4 lane」布局
+  //（与 baseline / packk_seq 完全相同的 unzip）。
+  auto unzip_pair = [](float32x4_t lo_block, float32x4_t hi_block,
+                       float32x4_t* row_lo, float32x4_t* row_hi) {
+    *row_lo = vcombine_f32(vget_low_f32(lo_block),
+                           vget_low_f32(hi_block));
+    *row_hi = vcombine_f32(vget_high_f32(lo_block),
+                           vget_high_f32(hi_block));
+  };
+  unzip_pair(bm00, bm01, &c00, &c10);
+  unzip_pair(bm02, bm03, &c01, &c11);
+  unzip_pair(bm10, bm11, &c20, &c30);
+  unzip_pair(bm12, bm13, &c21, &c31);
+  unzip_pair(bm20, bm21, &c40, &c50);
+  unzip_pair(bm22, bm23, &c41, &c51);
+  unzip_pair(bm30, bm31, &c60, &c70);
+  unzip_pair(bm32, bm33, &c61, &c71);
+#endif  // FUSED_CPP_SDPA_CACHE_HAS_BFMMLA
+
+  // 标量 tail（E % 4 != 0），直接用原 Q / K 指针。逐字与 packk_seq inner
+  // 一致——两个 stride 各自独立，确保与 baseline bit-for-bit 等价。
+  if (e < E) {
+    float scalar_acc[8 * 8];
+    auto store_cij = [&](int i_row, float* dst) {
+      float32x4_t lo, hi;
+      switch (i_row) {
+        case 0: lo = c00; hi = c01; break;
+        case 1: lo = c10; hi = c11; break;
+        case 2: lo = c20; hi = c21; break;
+        case 3: lo = c30; hi = c31; break;
+        case 4: lo = c40; hi = c41; break;
+        case 5: lo = c50; hi = c51; break;
+        case 6: lo = c60; hi = c61; break;
+        case 7: lo = c70; hi = c71; break;
+        default: lo = vdupq_n_f32(0); hi = vdupq_n_f32(0);
+      }
+      vst1q_f32(dst + 0, lo);
+      vst1q_f32(dst + 4, hi);
+    };
+    auto load_cij = [&](int i_row, const float* src) {
+      float32x4_t lo = vld1q_f32(src + 0);
+      float32x4_t hi = vld1q_f32(src + 4);
+      switch (i_row) {
+        case 0: c00 = lo; c01 = hi; break;
+        case 1: c10 = lo; c11 = hi; break;
+        case 2: c20 = lo; c21 = hi; break;
+        case 3: c30 = lo; c31 = hi; break;
+        case 4: c40 = lo; c41 = hi; break;
+        case 5: c50 = lo; c51 = hi; break;
+        case 6: c60 = lo; c61 = hi; break;
+        case 7: c70 = lo; c71 = hi; break;
+      }
+    };
+    for (int i_row = 0; i_row < 8; ++i_row) store_cij(i_row, scalar_acc + i_row * 8);
+    for (int64_t e2 = e; e2 < E; ++e2) {
+      for (int i_row = 0; i_row < 8; ++i_row) {
+        float qv = bf16_to_fp32_scalar(Qp[i_row * q_row_stride + e2]);
+        for (int j_col = 0; j_col < 8; ++j_col) {
+          float kv = bf16_to_fp32_scalar(Kp[j_col * k_row_stride + e2]);
+          scalar_acc[i_row * 8 + j_col] += qv * kv;
+        }
+      }
+    }
+    for (int i_row = 0; i_row < 8; ++i_row) load_cij(i_row, scalar_acc + i_row * 8);
+  }
+
+  const float32x4_t vs = vdupq_n_f32(scale);
+  vst1q_f32(scores_buf + 0 * 8 + 0, vmulq_f32(c00, vs));
+  vst1q_f32(scores_buf + 0 * 8 + 4, vmulq_f32(c01, vs));
+  vst1q_f32(scores_buf + 1 * 8 + 0, vmulq_f32(c10, vs));
+  vst1q_f32(scores_buf + 1 * 8 + 4, vmulq_f32(c11, vs));
+  vst1q_f32(scores_buf + 2 * 8 + 0, vmulq_f32(c20, vs));
+  vst1q_f32(scores_buf + 2 * 8 + 4, vmulq_f32(c21, vs));
+  vst1q_f32(scores_buf + 3 * 8 + 0, vmulq_f32(c30, vs));
+  vst1q_f32(scores_buf + 3 * 8 + 4, vmulq_f32(c31, vs));
+  vst1q_f32(scores_buf + 4 * 8 + 0, vmulq_f32(c40, vs));
+  vst1q_f32(scores_buf + 4 * 8 + 4, vmulq_f32(c41, vs));
+  vst1q_f32(scores_buf + 5 * 8 + 0, vmulq_f32(c50, vs));
+  vst1q_f32(scores_buf + 5 * 8 + 4, vmulq_f32(c51, vs));
+  vst1q_f32(scores_buf + 6 * 8 + 0, vmulq_f32(c60, vs));
+  vst1q_f32(scores_buf + 6 * 8 + 4, vmulq_f32(c61, vs));
+  vst1q_f32(scores_buf + 7 * 8 + 0, vmulq_f32(c70, vs));
+  vst1q_f32(scores_buf + 7 * 8 + 4, vmulq_f32(c71, vs));
+}
+
+
+
+// gemm_qkt_microkernel_8x8_bf16_packqk_seq4_bmajor_inner：
+//   B-major 计算顺序版本：同样的 4x1 load，但 16 条 BFMMLA 按 B 操作数复用顺序发射。
+//   其余 pack layout / tail / unzip / scale-store 与 qk_packqk_seq4 完全一致。
+//
+static inline void gemm_qkt_microkernel_8x8_bf16_packqk_seq4_bmajor_inner(
+    const uint16_t* Q_seq,             // [E/4 e_block][32 u16 lanes]
+    const at::BFloat16* Q_orig,        // 仅用于 e ≥ E&~3 的标量 tail
+    int64_t q_row_stride,
+    const uint16_t* K_seq,             // [E/4 e_block][32 u16 lanes]
+    const at::BFloat16* K_orig,        // 仅用于 e ≥ E&~3 的标量 tail
+    int64_t k_row_stride,
+    int64_t E,
+    float scale,
+    float* scores_buf) {
+  float32x4_t c00 = vdupq_n_f32(0), c01 = vdupq_n_f32(0);
+  float32x4_t c10 = vdupq_n_f32(0), c11 = vdupq_n_f32(0);
+  float32x4_t c20 = vdupq_n_f32(0), c21 = vdupq_n_f32(0);
+  float32x4_t c30 = vdupq_n_f32(0), c31 = vdupq_n_f32(0);
+  float32x4_t c40 = vdupq_n_f32(0), c41 = vdupq_n_f32(0);
+  float32x4_t c50 = vdupq_n_f32(0), c51 = vdupq_n_f32(0);
+  float32x4_t c60 = vdupq_n_f32(0), c61 = vdupq_n_f32(0);
+  float32x4_t c70 = vdupq_n_f32(0), c71 = vdupq_n_f32(0);
+
+  const uint16_t* Qp = reinterpret_cast<const uint16_t*>(Q_orig);
+  const uint16_t* Kp = reinterpret_cast<const uint16_t*>(K_orig);
+  int64_t e = 0;
+
+#if FUSED_CPP_SDPA_CACHE_HAS_BFMMLA
+  float32x4_t bm00 = vdupq_n_f32(0), bm01 = vdupq_n_f32(0);
+  float32x4_t bm02 = vdupq_n_f32(0), bm03 = vdupq_n_f32(0);
+  float32x4_t bm10 = vdupq_n_f32(0), bm11 = vdupq_n_f32(0);
+  float32x4_t bm12 = vdupq_n_f32(0), bm13 = vdupq_n_f32(0);
+  float32x4_t bm20 = vdupq_n_f32(0), bm21 = vdupq_n_f32(0);
+  float32x4_t bm22 = vdupq_n_f32(0), bm23 = vdupq_n_f32(0);
+  float32x4_t bm30 = vdupq_n_f32(0), bm31 = vdupq_n_f32(0);
+  float32x4_t bm32 = vdupq_n_f32(0), bm33 = vdupq_n_f32(0);
+
+  for (; e + 4 <= E; e += 4) {
+    const uint16_t* q_base = Q_seq + (e / 4) * 32;
+    bfloat16x8_t a01 = vreinterpretq_bf16_u16(vld1q_u16(q_base + 0));
+    bfloat16x8_t a23 = vreinterpretq_bf16_u16(vld1q_u16(q_base + 8));
+    bfloat16x8_t a45 = vreinterpretq_bf16_u16(vld1q_u16(q_base + 16));
+    bfloat16x8_t a67 = vreinterpretq_bf16_u16(vld1q_u16(q_base + 24));
+
+    const uint16_t* k_base = K_seq + (e / 4) * 32;
+    bfloat16x8_t b01 = vreinterpretq_bf16_u16(vld1q_u16(k_base + 0));
+    bfloat16x8_t b23 = vreinterpretq_bf16_u16(vld1q_u16(k_base + 8));
+    bfloat16x8_t b45 = vreinterpretq_bf16_u16(vld1q_u16(k_base + 16));
+    bfloat16x8_t b67 = vreinterpretq_bf16_u16(vld1q_u16(k_base + 24));
+
+    bm00 = vbfmmlaq_f32(bm00, a01, b01);
+    bm10 = vbfmmlaq_f32(bm10, a23, b01);
+    bm20 = vbfmmlaq_f32(bm20, a45, b01);
+    bm30 = vbfmmlaq_f32(bm30, a67, b01);
+    bm01 = vbfmmlaq_f32(bm01, a01, b23);
+    bm11 = vbfmmlaq_f32(bm11, a23, b23);
+    bm21 = vbfmmlaq_f32(bm21, a45, b23);
+    bm31 = vbfmmlaq_f32(bm31, a67, b23);
+    bm02 = vbfmmlaq_f32(bm02, a01, b45);
+    bm12 = vbfmmlaq_f32(bm12, a23, b45);
+    bm22 = vbfmmlaq_f32(bm22, a45, b45);
+    bm32 = vbfmmlaq_f32(bm32, a67, b45);
+    bm03 = vbfmmlaq_f32(bm03, a01, b67);
+    bm13 = vbfmmlaq_f32(bm13, a23, b67);
+    bm23 = vbfmmlaq_f32(bm23, a45, b67);
+    bm33 = vbfmmlaq_f32(bm33, a67, b67);
+  }
+
+  // 把 BFMMLA 的 2×2 子块布局重排为「行向 4 lane」布局
+  //（与 baseline / packk_seq 完全相同的 unzip）。
+  auto unzip_pair = [](float32x4_t lo_block, float32x4_t hi_block,
+                       float32x4_t* row_lo, float32x4_t* row_hi) {
+    *row_lo = vcombine_f32(vget_low_f32(lo_block),
+                           vget_low_f32(hi_block));
+    *row_hi = vcombine_f32(vget_high_f32(lo_block),
+                           vget_high_f32(hi_block));
+  };
+  unzip_pair(bm00, bm01, &c00, &c10);
+  unzip_pair(bm02, bm03, &c01, &c11);
+  unzip_pair(bm10, bm11, &c20, &c30);
+  unzip_pair(bm12, bm13, &c21, &c31);
+  unzip_pair(bm20, bm21, &c40, &c50);
+  unzip_pair(bm22, bm23, &c41, &c51);
+  unzip_pair(bm30, bm31, &c60, &c70);
+  unzip_pair(bm32, bm33, &c61, &c71);
+#endif  // FUSED_CPP_SDPA_CACHE_HAS_BFMMLA
+
+  // 标量 tail（E % 4 != 0），直接用原 Q / K 指针。逐字与 packk_seq inner
+  // 一致——两个 stride 各自独立，确保与 baseline bit-for-bit 等价。
+  if (e < E) {
+    float scalar_acc[8 * 8];
+    auto store_cij = [&](int i_row, float* dst) {
+      float32x4_t lo, hi;
+      switch (i_row) {
+        case 0: lo = c00; hi = c01; break;
+        case 1: lo = c10; hi = c11; break;
+        case 2: lo = c20; hi = c21; break;
+        case 3: lo = c30; hi = c31; break;
+        case 4: lo = c40; hi = c41; break;
+        case 5: lo = c50; hi = c51; break;
+        case 6: lo = c60; hi = c61; break;
+        case 7: lo = c70; hi = c71; break;
+        default: lo = vdupq_n_f32(0); hi = vdupq_n_f32(0);
+      }
+      vst1q_f32(dst + 0, lo);
+      vst1q_f32(dst + 4, hi);
+    };
+    auto load_cij = [&](int i_row, const float* src) {
+      float32x4_t lo = vld1q_f32(src + 0);
+      float32x4_t hi = vld1q_f32(src + 4);
+      switch (i_row) {
+        case 0: c00 = lo; c01 = hi; break;
+        case 1: c10 = lo; c11 = hi; break;
+        case 2: c20 = lo; c21 = hi; break;
+        case 3: c30 = lo; c31 = hi; break;
+        case 4: c40 = lo; c41 = hi; break;
+        case 5: c50 = lo; c51 = hi; break;
+        case 6: c60 = lo; c61 = hi; break;
+        case 7: c70 = lo; c71 = hi; break;
+      }
+    };
+    for (int i_row = 0; i_row < 8; ++i_row) store_cij(i_row, scalar_acc + i_row * 8);
+    for (int64_t e2 = e; e2 < E; ++e2) {
+      for (int i_row = 0; i_row < 8; ++i_row) {
+        float qv = bf16_to_fp32_scalar(Qp[i_row * q_row_stride + e2]);
+        for (int j_col = 0; j_col < 8; ++j_col) {
+          float kv = bf16_to_fp32_scalar(Kp[j_col * k_row_stride + e2]);
+          scalar_acc[i_row * 8 + j_col] += qv * kv;
+        }
+      }
+    }
+    for (int i_row = 0; i_row < 8; ++i_row) load_cij(i_row, scalar_acc + i_row * 8);
+  }
+
+  const float32x4_t vs = vdupq_n_f32(scale);
+  vst1q_f32(scores_buf + 0 * 8 + 0, vmulq_f32(c00, vs));
+  vst1q_f32(scores_buf + 0 * 8 + 4, vmulq_f32(c01, vs));
+  vst1q_f32(scores_buf + 1 * 8 + 0, vmulq_f32(c10, vs));
+  vst1q_f32(scores_buf + 1 * 8 + 4, vmulq_f32(c11, vs));
+  vst1q_f32(scores_buf + 2 * 8 + 0, vmulq_f32(c20, vs));
+  vst1q_f32(scores_buf + 2 * 8 + 4, vmulq_f32(c21, vs));
+  vst1q_f32(scores_buf + 3 * 8 + 0, vmulq_f32(c30, vs));
+  vst1q_f32(scores_buf + 3 * 8 + 4, vmulq_f32(c31, vs));
+  vst1q_f32(scores_buf + 4 * 8 + 0, vmulq_f32(c40, vs));
+  vst1q_f32(scores_buf + 4 * 8 + 4, vmulq_f32(c41, vs));
+  vst1q_f32(scores_buf + 5 * 8 + 0, vmulq_f32(c50, vs));
+  vst1q_f32(scores_buf + 5 * 8 + 4, vmulq_f32(c51, vs));
+  vst1q_f32(scores_buf + 6 * 8 + 0, vmulq_f32(c60, vs));
+  vst1q_f32(scores_buf + 6 * 8 + 4, vmulq_f32(c61, vs));
+  vst1q_f32(scores_buf + 7 * 8 + 0, vmulq_f32(c70, vs));
+  vst1q_f32(scores_buf + 7 * 8 + 4, vmulq_f32(c71, vs));
+}
+
+
+
+// gemm_qkt_microkernel_8x8_bf16_packqk_seq4_pipe_a_inner：
+//   load/compute 交错版本 A：K 全 load，Q 分批 load 后立即计算该 A 行组。
+//   其余 pack layout / tail / unzip / scale-store 与 qk_packqk_seq4 完全一致。
+//
+static inline void gemm_qkt_microkernel_8x8_bf16_packqk_seq4_pipe_a_inner(
+    const uint16_t* Q_seq,             // [E/4 e_block][32 u16 lanes]
+    const at::BFloat16* Q_orig,        // 仅用于 e ≥ E&~3 的标量 tail
+    int64_t q_row_stride,
+    const uint16_t* K_seq,             // [E/4 e_block][32 u16 lanes]
+    const at::BFloat16* K_orig,        // 仅用于 e ≥ E&~3 的标量 tail
+    int64_t k_row_stride,
+    int64_t E,
+    float scale,
+    float* scores_buf) {
+  float32x4_t c00 = vdupq_n_f32(0), c01 = vdupq_n_f32(0);
+  float32x4_t c10 = vdupq_n_f32(0), c11 = vdupq_n_f32(0);
+  float32x4_t c20 = vdupq_n_f32(0), c21 = vdupq_n_f32(0);
+  float32x4_t c30 = vdupq_n_f32(0), c31 = vdupq_n_f32(0);
+  float32x4_t c40 = vdupq_n_f32(0), c41 = vdupq_n_f32(0);
+  float32x4_t c50 = vdupq_n_f32(0), c51 = vdupq_n_f32(0);
+  float32x4_t c60 = vdupq_n_f32(0), c61 = vdupq_n_f32(0);
+  float32x4_t c70 = vdupq_n_f32(0), c71 = vdupq_n_f32(0);
+
+  const uint16_t* Qp = reinterpret_cast<const uint16_t*>(Q_orig);
+  const uint16_t* Kp = reinterpret_cast<const uint16_t*>(K_orig);
+  int64_t e = 0;
+
+#if FUSED_CPP_SDPA_CACHE_HAS_BFMMLA
+  float32x4_t bm00 = vdupq_n_f32(0), bm01 = vdupq_n_f32(0);
+  float32x4_t bm02 = vdupq_n_f32(0), bm03 = vdupq_n_f32(0);
+  float32x4_t bm10 = vdupq_n_f32(0), bm11 = vdupq_n_f32(0);
+  float32x4_t bm12 = vdupq_n_f32(0), bm13 = vdupq_n_f32(0);
+  float32x4_t bm20 = vdupq_n_f32(0), bm21 = vdupq_n_f32(0);
+  float32x4_t bm22 = vdupq_n_f32(0), bm23 = vdupq_n_f32(0);
+  float32x4_t bm30 = vdupq_n_f32(0), bm31 = vdupq_n_f32(0);
+  float32x4_t bm32 = vdupq_n_f32(0), bm33 = vdupq_n_f32(0);
+
+  for (; e + 4 <= E; e += 4) {
+    const uint16_t* q_base = Q_seq + (e / 4) * 32;
+    const uint16_t* k_base = K_seq + (e / 4) * 32;
+    bfloat16x8_t b01 = vreinterpretq_bf16_u16(vld1q_u16(k_base + 0));
+    bfloat16x8_t b23 = vreinterpretq_bf16_u16(vld1q_u16(k_base + 8));
+    bfloat16x8_t b45 = vreinterpretq_bf16_u16(vld1q_u16(k_base + 16));
+    bfloat16x8_t b67 = vreinterpretq_bf16_u16(vld1q_u16(k_base + 24));
+
+    bfloat16x8_t a01 = vreinterpretq_bf16_u16(vld1q_u16(q_base + 0));
+    bm00 = vbfmmlaq_f32(bm00, a01, b01);
+    bm01 = vbfmmlaq_f32(bm01, a01, b23);
+    bm02 = vbfmmlaq_f32(bm02, a01, b45);
+    bm03 = vbfmmlaq_f32(bm03, a01, b67);
+
+    bfloat16x8_t a23 = vreinterpretq_bf16_u16(vld1q_u16(q_base + 8));
+    bm10 = vbfmmlaq_f32(bm10, a23, b01);
+    bm11 = vbfmmlaq_f32(bm11, a23, b23);
+    bm12 = vbfmmlaq_f32(bm12, a23, b45);
+    bm13 = vbfmmlaq_f32(bm13, a23, b67);
+
+    bfloat16x8_t a45 = vreinterpretq_bf16_u16(vld1q_u16(q_base + 16));
+    bm20 = vbfmmlaq_f32(bm20, a45, b01);
+    bm21 = vbfmmlaq_f32(bm21, a45, b23);
+    bm22 = vbfmmlaq_f32(bm22, a45, b45);
+    bm23 = vbfmmlaq_f32(bm23, a45, b67);
+
+    bfloat16x8_t a67 = vreinterpretq_bf16_u16(vld1q_u16(q_base + 24));
+    bm30 = vbfmmlaq_f32(bm30, a67, b01);
+    bm31 = vbfmmlaq_f32(bm31, a67, b23);
+    bm32 = vbfmmlaq_f32(bm32, a67, b45);
+    bm33 = vbfmmlaq_f32(bm33, a67, b67);
+  }
+
+  // 把 BFMMLA 的 2×2 子块布局重排为「行向 4 lane」布局
+  //（与 baseline / packk_seq 完全相同的 unzip）。
+  auto unzip_pair = [](float32x4_t lo_block, float32x4_t hi_block,
+                       float32x4_t* row_lo, float32x4_t* row_hi) {
+    *row_lo = vcombine_f32(vget_low_f32(lo_block),
+                           vget_low_f32(hi_block));
+    *row_hi = vcombine_f32(vget_high_f32(lo_block),
+                           vget_high_f32(hi_block));
+  };
+  unzip_pair(bm00, bm01, &c00, &c10);
+  unzip_pair(bm02, bm03, &c01, &c11);
+  unzip_pair(bm10, bm11, &c20, &c30);
+  unzip_pair(bm12, bm13, &c21, &c31);
+  unzip_pair(bm20, bm21, &c40, &c50);
+  unzip_pair(bm22, bm23, &c41, &c51);
+  unzip_pair(bm30, bm31, &c60, &c70);
+  unzip_pair(bm32, bm33, &c61, &c71);
+#endif  // FUSED_CPP_SDPA_CACHE_HAS_BFMMLA
+
+  // 标量 tail（E % 4 != 0），直接用原 Q / K 指针。逐字与 packk_seq inner
+  // 一致——两个 stride 各自独立，确保与 baseline bit-for-bit 等价。
+  if (e < E) {
+    float scalar_acc[8 * 8];
+    auto store_cij = [&](int i_row, float* dst) {
+      float32x4_t lo, hi;
+      switch (i_row) {
+        case 0: lo = c00; hi = c01; break;
+        case 1: lo = c10; hi = c11; break;
+        case 2: lo = c20; hi = c21; break;
+        case 3: lo = c30; hi = c31; break;
+        case 4: lo = c40; hi = c41; break;
+        case 5: lo = c50; hi = c51; break;
+        case 6: lo = c60; hi = c61; break;
+        case 7: lo = c70; hi = c71; break;
+        default: lo = vdupq_n_f32(0); hi = vdupq_n_f32(0);
+      }
+      vst1q_f32(dst + 0, lo);
+      vst1q_f32(dst + 4, hi);
+    };
+    auto load_cij = [&](int i_row, const float* src) {
+      float32x4_t lo = vld1q_f32(src + 0);
+      float32x4_t hi = vld1q_f32(src + 4);
+      switch (i_row) {
+        case 0: c00 = lo; c01 = hi; break;
+        case 1: c10 = lo; c11 = hi; break;
+        case 2: c20 = lo; c21 = hi; break;
+        case 3: c30 = lo; c31 = hi; break;
+        case 4: c40 = lo; c41 = hi; break;
+        case 5: c50 = lo; c51 = hi; break;
+        case 6: c60 = lo; c61 = hi; break;
+        case 7: c70 = lo; c71 = hi; break;
+      }
+    };
+    for (int i_row = 0; i_row < 8; ++i_row) store_cij(i_row, scalar_acc + i_row * 8);
+    for (int64_t e2 = e; e2 < E; ++e2) {
+      for (int i_row = 0; i_row < 8; ++i_row) {
+        float qv = bf16_to_fp32_scalar(Qp[i_row * q_row_stride + e2]);
+        for (int j_col = 0; j_col < 8; ++j_col) {
+          float kv = bf16_to_fp32_scalar(Kp[j_col * k_row_stride + e2]);
+          scalar_acc[i_row * 8 + j_col] += qv * kv;
+        }
+      }
+    }
+    for (int i_row = 0; i_row < 8; ++i_row) load_cij(i_row, scalar_acc + i_row * 8);
+  }
+
+  const float32x4_t vs = vdupq_n_f32(scale);
+  vst1q_f32(scores_buf + 0 * 8 + 0, vmulq_f32(c00, vs));
+  vst1q_f32(scores_buf + 0 * 8 + 4, vmulq_f32(c01, vs));
+  vst1q_f32(scores_buf + 1 * 8 + 0, vmulq_f32(c10, vs));
+  vst1q_f32(scores_buf + 1 * 8 + 4, vmulq_f32(c11, vs));
+  vst1q_f32(scores_buf + 2 * 8 + 0, vmulq_f32(c20, vs));
+  vst1q_f32(scores_buf + 2 * 8 + 4, vmulq_f32(c21, vs));
+  vst1q_f32(scores_buf + 3 * 8 + 0, vmulq_f32(c30, vs));
+  vst1q_f32(scores_buf + 3 * 8 + 4, vmulq_f32(c31, vs));
+  vst1q_f32(scores_buf + 4 * 8 + 0, vmulq_f32(c40, vs));
+  vst1q_f32(scores_buf + 4 * 8 + 4, vmulq_f32(c41, vs));
+  vst1q_f32(scores_buf + 5 * 8 + 0, vmulq_f32(c50, vs));
+  vst1q_f32(scores_buf + 5 * 8 + 4, vmulq_f32(c51, vs));
+  vst1q_f32(scores_buf + 6 * 8 + 0, vmulq_f32(c60, vs));
+  vst1q_f32(scores_buf + 6 * 8 + 4, vmulq_f32(c61, vs));
+  vst1q_f32(scores_buf + 7 * 8 + 0, vmulq_f32(c70, vs));
+  vst1q_f32(scores_buf + 7 * 8 + 4, vmulq_f32(c71, vs));
+}
+
+
+
+// gemm_qkt_microkernel_8x8_bf16_packqk_seq4_pipe_b_inner：
+//   load/compute 交错版本 B：Q 全 load，K 分批 load 后立即计算该 B 列组。
+//   其余 pack layout / tail / unzip / scale-store 与 qk_packqk_seq4 完全一致。
+//
+static inline void gemm_qkt_microkernel_8x8_bf16_packqk_seq4_pipe_b_inner(
+    const uint16_t* Q_seq,             // [E/4 e_block][32 u16 lanes]
+    const at::BFloat16* Q_orig,        // 仅用于 e ≥ E&~3 的标量 tail
+    int64_t q_row_stride,
+    const uint16_t* K_seq,             // [E/4 e_block][32 u16 lanes]
+    const at::BFloat16* K_orig,        // 仅用于 e ≥ E&~3 的标量 tail
+    int64_t k_row_stride,
+    int64_t E,
+    float scale,
+    float* scores_buf) {
+  float32x4_t c00 = vdupq_n_f32(0), c01 = vdupq_n_f32(0);
+  float32x4_t c10 = vdupq_n_f32(0), c11 = vdupq_n_f32(0);
+  float32x4_t c20 = vdupq_n_f32(0), c21 = vdupq_n_f32(0);
+  float32x4_t c30 = vdupq_n_f32(0), c31 = vdupq_n_f32(0);
+  float32x4_t c40 = vdupq_n_f32(0), c41 = vdupq_n_f32(0);
+  float32x4_t c50 = vdupq_n_f32(0), c51 = vdupq_n_f32(0);
+  float32x4_t c60 = vdupq_n_f32(0), c61 = vdupq_n_f32(0);
+  float32x4_t c70 = vdupq_n_f32(0), c71 = vdupq_n_f32(0);
+
+  const uint16_t* Qp = reinterpret_cast<const uint16_t*>(Q_orig);
+  const uint16_t* Kp = reinterpret_cast<const uint16_t*>(K_orig);
+  int64_t e = 0;
+
+#if FUSED_CPP_SDPA_CACHE_HAS_BFMMLA
+  float32x4_t bm00 = vdupq_n_f32(0), bm01 = vdupq_n_f32(0);
+  float32x4_t bm02 = vdupq_n_f32(0), bm03 = vdupq_n_f32(0);
+  float32x4_t bm10 = vdupq_n_f32(0), bm11 = vdupq_n_f32(0);
+  float32x4_t bm12 = vdupq_n_f32(0), bm13 = vdupq_n_f32(0);
+  float32x4_t bm20 = vdupq_n_f32(0), bm21 = vdupq_n_f32(0);
+  float32x4_t bm22 = vdupq_n_f32(0), bm23 = vdupq_n_f32(0);
+  float32x4_t bm30 = vdupq_n_f32(0), bm31 = vdupq_n_f32(0);
+  float32x4_t bm32 = vdupq_n_f32(0), bm33 = vdupq_n_f32(0);
+
+  for (; e + 4 <= E; e += 4) {
+    const uint16_t* q_base = Q_seq + (e / 4) * 32;
+    const uint16_t* k_base = K_seq + (e / 4) * 32;
+    bfloat16x8_t a01 = vreinterpretq_bf16_u16(vld1q_u16(q_base + 0));
+    bfloat16x8_t a23 = vreinterpretq_bf16_u16(vld1q_u16(q_base + 8));
+    bfloat16x8_t a45 = vreinterpretq_bf16_u16(vld1q_u16(q_base + 16));
+    bfloat16x8_t a67 = vreinterpretq_bf16_u16(vld1q_u16(q_base + 24));
+
+    bfloat16x8_t b01 = vreinterpretq_bf16_u16(vld1q_u16(k_base + 0));
+    bm00 = vbfmmlaq_f32(bm00, a01, b01);
+    bm10 = vbfmmlaq_f32(bm10, a23, b01);
+    bm20 = vbfmmlaq_f32(bm20, a45, b01);
+    bm30 = vbfmmlaq_f32(bm30, a67, b01);
+
+    bfloat16x8_t b23 = vreinterpretq_bf16_u16(vld1q_u16(k_base + 8));
+    bm01 = vbfmmlaq_f32(bm01, a01, b23);
+    bm11 = vbfmmlaq_f32(bm11, a23, b23);
+    bm21 = vbfmmlaq_f32(bm21, a45, b23);
+    bm31 = vbfmmlaq_f32(bm31, a67, b23);
+
+    bfloat16x8_t b45 = vreinterpretq_bf16_u16(vld1q_u16(k_base + 16));
+    bm02 = vbfmmlaq_f32(bm02, a01, b45);
+    bm12 = vbfmmlaq_f32(bm12, a23, b45);
+    bm22 = vbfmmlaq_f32(bm22, a45, b45);
+    bm32 = vbfmmlaq_f32(bm32, a67, b45);
+
+    bfloat16x8_t b67 = vreinterpretq_bf16_u16(vld1q_u16(k_base + 24));
+    bm03 = vbfmmlaq_f32(bm03, a01, b67);
+    bm13 = vbfmmlaq_f32(bm13, a23, b67);
+    bm23 = vbfmmlaq_f32(bm23, a45, b67);
+    bm33 = vbfmmlaq_f32(bm33, a67, b67);
+  }
+
+  // 把 BFMMLA 的 2×2 子块布局重排为「行向 4 lane」布局
+  //（与 baseline / packk_seq 完全相同的 unzip）。
+  auto unzip_pair = [](float32x4_t lo_block, float32x4_t hi_block,
+                       float32x4_t* row_lo, float32x4_t* row_hi) {
+    *row_lo = vcombine_f32(vget_low_f32(lo_block),
+                           vget_low_f32(hi_block));
+    *row_hi = vcombine_f32(vget_high_f32(lo_block),
+                           vget_high_f32(hi_block));
+  };
+  unzip_pair(bm00, bm01, &c00, &c10);
+  unzip_pair(bm02, bm03, &c01, &c11);
+  unzip_pair(bm10, bm11, &c20, &c30);
+  unzip_pair(bm12, bm13, &c21, &c31);
+  unzip_pair(bm20, bm21, &c40, &c50);
+  unzip_pair(bm22, bm23, &c41, &c51);
+  unzip_pair(bm30, bm31, &c60, &c70);
+  unzip_pair(bm32, bm33, &c61, &c71);
+#endif  // FUSED_CPP_SDPA_CACHE_HAS_BFMMLA
+
+  // 标量 tail（E % 4 != 0），直接用原 Q / K 指针。逐字与 packk_seq inner
+  // 一致——两个 stride 各自独立，确保与 baseline bit-for-bit 等价。
+  if (e < E) {
+    float scalar_acc[8 * 8];
+    auto store_cij = [&](int i_row, float* dst) {
+      float32x4_t lo, hi;
+      switch (i_row) {
+        case 0: lo = c00; hi = c01; break;
+        case 1: lo = c10; hi = c11; break;
+        case 2: lo = c20; hi = c21; break;
+        case 3: lo = c30; hi = c31; break;
+        case 4: lo = c40; hi = c41; break;
+        case 5: lo = c50; hi = c51; break;
+        case 6: lo = c60; hi = c61; break;
+        case 7: lo = c70; hi = c71; break;
+        default: lo = vdupq_n_f32(0); hi = vdupq_n_f32(0);
+      }
+      vst1q_f32(dst + 0, lo);
+      vst1q_f32(dst + 4, hi);
+    };
+    auto load_cij = [&](int i_row, const float* src) {
+      float32x4_t lo = vld1q_f32(src + 0);
+      float32x4_t hi = vld1q_f32(src + 4);
+      switch (i_row) {
+        case 0: c00 = lo; c01 = hi; break;
+        case 1: c10 = lo; c11 = hi; break;
+        case 2: c20 = lo; c21 = hi; break;
+        case 3: c30 = lo; c31 = hi; break;
+        case 4: c40 = lo; c41 = hi; break;
+        case 5: c50 = lo; c51 = hi; break;
+        case 6: c60 = lo; c61 = hi; break;
+        case 7: c70 = lo; c71 = hi; break;
+      }
+    };
+    for (int i_row = 0; i_row < 8; ++i_row) store_cij(i_row, scalar_acc + i_row * 8);
+    for (int64_t e2 = e; e2 < E; ++e2) {
+      for (int i_row = 0; i_row < 8; ++i_row) {
+        float qv = bf16_to_fp32_scalar(Qp[i_row * q_row_stride + e2]);
+        for (int j_col = 0; j_col < 8; ++j_col) {
+          float kv = bf16_to_fp32_scalar(Kp[j_col * k_row_stride + e2]);
+          scalar_acc[i_row * 8 + j_col] += qv * kv;
+        }
+      }
+    }
+    for (int i_row = 0; i_row < 8; ++i_row) load_cij(i_row, scalar_acc + i_row * 8);
+  }
+
+  const float32x4_t vs = vdupq_n_f32(scale);
+  vst1q_f32(scores_buf + 0 * 8 + 0, vmulq_f32(c00, vs));
+  vst1q_f32(scores_buf + 0 * 8 + 4, vmulq_f32(c01, vs));
+  vst1q_f32(scores_buf + 1 * 8 + 0, vmulq_f32(c10, vs));
+  vst1q_f32(scores_buf + 1 * 8 + 4, vmulq_f32(c11, vs));
+  vst1q_f32(scores_buf + 2 * 8 + 0, vmulq_f32(c20, vs));
+  vst1q_f32(scores_buf + 2 * 8 + 4, vmulq_f32(c21, vs));
+  vst1q_f32(scores_buf + 3 * 8 + 0, vmulq_f32(c30, vs));
+  vst1q_f32(scores_buf + 3 * 8 + 4, vmulq_f32(c31, vs));
+  vst1q_f32(scores_buf + 4 * 8 + 0, vmulq_f32(c40, vs));
+  vst1q_f32(scores_buf + 4 * 8 + 4, vmulq_f32(c41, vs));
+  vst1q_f32(scores_buf + 5 * 8 + 0, vmulq_f32(c50, vs));
+  vst1q_f32(scores_buf + 5 * 8 + 4, vmulq_f32(c51, vs));
+  vst1q_f32(scores_buf + 6 * 8 + 0, vmulq_f32(c60, vs));
+  vst1q_f32(scores_buf + 6 * 8 + 4, vmulq_f32(c61, vs));
+  vst1q_f32(scores_buf + 7 * 8 + 0, vmulq_f32(c70, vs));
+  vst1q_f32(scores_buf + 7 * 8 + 4, vmulq_f32(c71, vs));
+}
+
+
+
 // ── BF16 QKᵀ 8×8：BFMMLA 主路径 + 2-way k-unroll（评估用） ──────────────
 //
 // 与 gemm_qkt_microkernel_8x8_bf16 的 BFMMLA 主路径**算法等价**，唯一差别
@@ -1608,31 +2640,36 @@ static inline void gemm_pv_microkernel_8x8_fp32_pquad(
       o60 = vfmaq_laneq_f32(o60, v_lo1, p6, 1); o61 = vfmaq_laneq_f32(o61, v_hi1, p6, 1);
       o70 = vfmaq_laneq_f32(o70, v_lo1, p7, 1); o71 = vfmaq_laneq_f32(o71, v_hi1, p7, 1);
 
-      // ── 段 2 (k+2)：用 p?.lane[2]，预取段 3 V ──
+      // ── 段 2 (k+2)：用 p?.lane[2]，**同时预取段 3 V 和跨迭代下一轮段 0 V** ──
+      // 把跨迭代 v_lo0/hi0 预取从原段 3 末尾搬到这里：距离下一轮段 0 第 1 条
+      // FMA 拉到 ~16 条 FMA（≈8 cycle），完全隐藏 L1 vld1q 5-cycle 延迟。
+      // 寄存器活跃峰值：O(16) + P(8) + v_lo2/hi2 + v_lo3/hi3 + v_lo0_next/hi0_next
+      // = 16 + 8 + 6 = 30，仍在 32 vreg 内。
       o00 = vfmaq_laneq_f32(o00, v_lo2, p0, 2); o01 = vfmaq_laneq_f32(o01, v_hi2, p0, 2);
       o10 = vfmaq_laneq_f32(o10, v_lo2, p1, 2); o11 = vfmaq_laneq_f32(o11, v_hi2, p1, 2);
       o20 = vfmaq_laneq_f32(o20, v_lo2, p2, 2); o21 = vfmaq_laneq_f32(o21, v_hi2, p2, 2);
+      // 跨迭代 V[k+4] 预取：尽早发射，给下一轮段 0 最大隐藏时间。仅当 k+4 仍
+      // 在 Sk4 范围内才发，避免末次迭代越界。
+      if (k + 4 < Sk4) {
+        v_lo0 = vld1q_f32(V + (k + 4) * v_row_stride + 0);
+        v_hi0 = vld1q_f32(V + (k + 4) * v_row_stride + 4);
+      }
       o30 = vfmaq_laneq_f32(o30, v_lo2, p3, 2); o31 = vfmaq_laneq_f32(o31, v_hi2, p3, 2);
       o40 = vfmaq_laneq_f32(o40, v_lo2, p4, 2); o41 = vfmaq_laneq_f32(o41, v_hi2, p4, 2);
       o50 = vfmaq_laneq_f32(o50, v_lo2, p5, 2); o51 = vfmaq_laneq_f32(o51, v_hi2, p5, 2);
+      // 段 3 V 预取保留在段 2 末尾（与 fp32 主体一致）。
       float32x4_t v_lo3 = vld1q_f32(V + (k + 3) * v_row_stride + 0);
       float32x4_t v_hi3 = vld1q_f32(V + (k + 3) * v_row_stride + 4);
       o60 = vfmaq_laneq_f32(o60, v_lo2, p6, 2); o61 = vfmaq_laneq_f32(o61, v_hi2, p6, 2);
       o70 = vfmaq_laneq_f32(o70, v_lo2, p7, 2); o71 = vfmaq_laneq_f32(o71, v_hi2, p7, 2);
 
-      // ── 段 3 (k+3)：用 p?.lane[3]，预取下一轮段 0 V ──
+      // ── 段 3 (k+3)：用 p?.lane[3]，**无 V load**（跨迭代预取已在段 2 完成） ──
       o00 = vfmaq_laneq_f32(o00, v_lo3, p0, 3); o01 = vfmaq_laneq_f32(o01, v_hi3, p0, 3);
       o10 = vfmaq_laneq_f32(o10, v_lo3, p1, 3); o11 = vfmaq_laneq_f32(o11, v_hi3, p1, 3);
       o20 = vfmaq_laneq_f32(o20, v_lo3, p2, 3); o21 = vfmaq_laneq_f32(o21, v_hi3, p2, 3);
       o30 = vfmaq_laneq_f32(o30, v_lo3, p3, 3); o31 = vfmaq_laneq_f32(o31, v_hi3, p3, 3);
       o40 = vfmaq_laneq_f32(o40, v_lo3, p4, 3); o41 = vfmaq_laneq_f32(o41, v_hi3, p4, 3);
       o50 = vfmaq_laneq_f32(o50, v_lo3, p5, 3); o51 = vfmaq_laneq_f32(o51, v_hi3, p5, 3);
-      // 跨迭代：把下一轮段 0 的 V 提前 load 到 v_lo0/v_hi0。仅当 k+4 仍在
-      // Sk4 范围内才发，避免末次迭代越界（与 fp32 主体一致）。
-      if (k + 4 < Sk4) {
-        v_lo0 = vld1q_f32(V + (k + 4) * v_row_stride + 0);
-        v_hi0 = vld1q_f32(V + (k + 4) * v_row_stride + 4);
-      }
       o60 = vfmaq_laneq_f32(o60, v_lo3, p6, 3); o61 = vfmaq_laneq_f32(o61, v_hi3, p6, 3);
       o70 = vfmaq_laneq_f32(o70, v_lo3, p7, 3); o71 = vfmaq_laneq_f32(o71, v_hi3, p7, 3);
     }
@@ -1642,6 +2679,181 @@ static inline void gemm_pv_microkernel_8x8_fp32_pquad(
   for (; k < Sk; ++k) {
     float32x4_t v_lo = vld1q_f32(V + k * v_row_stride + 0);
     float32x4_t v_hi = vld1q_f32(V + k * v_row_stride + 4);
+    float p0 = P_hat[0 * P_row_stride + k];
+    float p1 = P_hat[1 * P_row_stride + k];
+    float p2 = P_hat[2 * P_row_stride + k];
+    float p3 = P_hat[3 * P_row_stride + k];
+    float p4 = P_hat[4 * P_row_stride + k];
+    float p5 = P_hat[5 * P_row_stride + k];
+    float p6 = P_hat[6 * P_row_stride + k];
+    float p7 = P_hat[7 * P_row_stride + k];
+    o00 = vfmaq_n_f32(o00, v_lo, p0); o01 = vfmaq_n_f32(o01, v_hi, p0);
+    o10 = vfmaq_n_f32(o10, v_lo, p1); o11 = vfmaq_n_f32(o11, v_hi, p1);
+    o20 = vfmaq_n_f32(o20, v_lo, p2); o21 = vfmaq_n_f32(o21, v_hi, p2);
+    o30 = vfmaq_n_f32(o30, v_lo, p3); o31 = vfmaq_n_f32(o31, v_hi, p3);
+    o40 = vfmaq_n_f32(o40, v_lo, p4); o41 = vfmaq_n_f32(o41, v_hi, p4);
+    o50 = vfmaq_n_f32(o50, v_lo, p5); o51 = vfmaq_n_f32(o51, v_hi, p5);
+    o60 = vfmaq_n_f32(o60, v_lo, p6); o61 = vfmaq_n_f32(o61, v_hi, p6);
+    o70 = vfmaq_n_f32(o70, v_lo, p7); o71 = vfmaq_n_f32(o71, v_hi, p7);
+  }
+
+  vst1q_f32(O + 0 * o_row_stride + 0, o00);
+  vst1q_f32(O + 0 * o_row_stride + 4, o01);
+  vst1q_f32(O + 1 * o_row_stride + 0, o10);
+  vst1q_f32(O + 1 * o_row_stride + 4, o11);
+  vst1q_f32(O + 2 * o_row_stride + 0, o20);
+  vst1q_f32(O + 2 * o_row_stride + 4, o21);
+  vst1q_f32(O + 3 * o_row_stride + 0, o30);
+  vst1q_f32(O + 3 * o_row_stride + 4, o31);
+  vst1q_f32(O + 4 * o_row_stride + 0, o40);
+  vst1q_f32(O + 4 * o_row_stride + 4, o41);
+  vst1q_f32(O + 5 * o_row_stride + 0, o50);
+  vst1q_f32(O + 5 * o_row_stride + 4, o51);
+  vst1q_f32(O + 6 * o_row_stride + 0, o60);
+  vst1q_f32(O + 6 * o_row_stride + 4, o61);
+  vst1q_f32(O + 7 * o_row_stride + 0, o70);
+  vst1q_f32(O + 7 * o_row_stride + 4, o71);
+}
+
+// gemm_pv_microkernel_8x8_bf16_pquad：bf16 PV「P 折成 quad load」版。
+//
+// 设计完全照搬 gemm_pv_microkernel_8x8_fp32_pquad（P 沿 reduce 维做 4 列
+// quad load + vfmaq_laneq_f32 + 4-k 外展 + V 软件流水），唯一差别在 V 端：
+//   * fp32 pquad：每 k 用 2× vld1q_f32 (lo 4 fp32 + hi 4 fp32)
+//   * bf16 pquad：每 k 用 1× vld1q_u16 (8 bf16) + 2 次 widen→fp32
+//
+// 数值与 gemm_pv_microkernel_8x8_bf16 严格等价（V widen 后用同样的
+// fp32 fma；P 累加顺序逐段一致，跨段的累加顺序也与 baseline 相同）。
+//
+// LSU 账（每 4-k 外层迭代）：
+//   * bf16 baseline：32 P 标量 ldr s + 4 V vld1q_u16 = 36 LSU
+//   * bf16 pquad   ：8 P vld1q_f32 + 4 V vld1q_u16  = 12 LSU （少 3×）
+// widen 是 ALU op（vshll_n_u16），与 FMA 不抢端口，可与 FMA 并行隐藏。
+//
+// 寄存器账（稳态峰值，与 fp32 pquad 对齐）：
+//   16 O 累加器 + 8 P quad + 4 V quad（本段 lo/hi + 下段 lo/hi）
+//   + 2 跨迭代 V 预取（段 2 中段暂存）= ~30 NEON reg，距 32 reg 还有 2。
+//
+// 软件流水：v_lo/hi 在每段末尾预取下一段；跨迭代 V[k+4] 预取放段 2 中段，
+// 给下一轮段 0 的 FMA 留 ~16 条 FMA 距离隐藏 L1 vld1q + widen 延迟。
+static inline void gemm_pv_microkernel_8x8_bf16_pquad(
+    const float* P_hat,
+    int64_t P_row_stride,
+    const at::BFloat16* V,
+    int64_t v_row_stride,
+    int64_t Sk,
+    float* O,
+    int64_t o_row_stride) {
+  float32x4_t o00 = vld1q_f32(O + 0 * o_row_stride + 0);
+  float32x4_t o01 = vld1q_f32(O + 0 * o_row_stride + 4);
+  float32x4_t o10 = vld1q_f32(O + 1 * o_row_stride + 0);
+  float32x4_t o11 = vld1q_f32(O + 1 * o_row_stride + 4);
+  float32x4_t o20 = vld1q_f32(O + 2 * o_row_stride + 0);
+  float32x4_t o21 = vld1q_f32(O + 2 * o_row_stride + 4);
+  float32x4_t o30 = vld1q_f32(O + 3 * o_row_stride + 0);
+  float32x4_t o31 = vld1q_f32(O + 3 * o_row_stride + 4);
+  float32x4_t o40 = vld1q_f32(O + 4 * o_row_stride + 0);
+  float32x4_t o41 = vld1q_f32(O + 4 * o_row_stride + 4);
+  float32x4_t o50 = vld1q_f32(O + 5 * o_row_stride + 0);
+  float32x4_t o51 = vld1q_f32(O + 5 * o_row_stride + 4);
+  float32x4_t o60 = vld1q_f32(O + 6 * o_row_stride + 0);
+  float32x4_t o61 = vld1q_f32(O + 6 * o_row_stride + 4);
+  float32x4_t o70 = vld1q_f32(O + 7 * o_row_stride + 0);
+  float32x4_t o71 = vld1q_f32(O + 7 * o_row_stride + 4);
+
+  const uint16_t* Vp = reinterpret_cast<const uint16_t*>(V);
+
+  // 局部 helper：从 8 bf16 (一行 V 8 列) 同时产生 lo/hi 两个 fp32 quad。
+  // 用 vshll_n_u16 把 bf16 当成 high-half 的 fp32（左移 16 位）。两次
+  // vshll 走 ALU 端口，不占 LSU，能与 FMA 并行隐藏。
+  auto widen_row = [](uint16x8_t bf16x8, float32x4_t& v_lo, float32x4_t& v_hi) {
+    v_lo = vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(bf16x8), 16));
+    v_hi = vreinterpretq_f32_u32(vshll_high_n_u16(bf16x8, 16));
+  };
+
+  const int64_t Sk4 = Sk & ~int64_t{3};
+  int64_t k = 0;
+  if (Sk4 > 0) {
+    // 段 0 V 的预取：load + widen，让循环体第 1 条 FMA 立刻可发射。
+    uint16x8_t vbf0 = vld1q_u16(Vp + 0 * v_row_stride);
+    float32x4_t v_lo0, v_hi0;
+    widen_row(vbf0, v_lo0, v_hi0);
+    for (; k < Sk4; k += 4) {
+      // ── 一次性 load 8 个 P 行 quad（替代每段 8 个 P 标量 load） ──
+      float32x4_t p0 = vld1q_f32(P_hat + 0 * P_row_stride + k);
+      float32x4_t p1 = vld1q_f32(P_hat + 1 * P_row_stride + k);
+      float32x4_t p2 = vld1q_f32(P_hat + 2 * P_row_stride + k);
+      float32x4_t p3 = vld1q_f32(P_hat + 3 * P_row_stride + k);
+      float32x4_t p4 = vld1q_f32(P_hat + 4 * P_row_stride + k);
+      float32x4_t p5 = vld1q_f32(P_hat + 5 * P_row_stride + k);
+      float32x4_t p6 = vld1q_f32(P_hat + 6 * P_row_stride + k);
+      float32x4_t p7 = vld1q_f32(P_hat + 7 * P_row_stride + k);
+
+      // ── 段 0 (k+0)：用 p?.lane[0]，段尾预取段 1 V ──
+      o00 = vfmaq_laneq_f32(o00, v_lo0, p0, 0); o01 = vfmaq_laneq_f32(o01, v_hi0, p0, 0);
+      o10 = vfmaq_laneq_f32(o10, v_lo0, p1, 0); o11 = vfmaq_laneq_f32(o11, v_hi0, p1, 0);
+      o20 = vfmaq_laneq_f32(o20, v_lo0, p2, 0); o21 = vfmaq_laneq_f32(o21, v_hi0, p2, 0);
+      o30 = vfmaq_laneq_f32(o30, v_lo0, p3, 0); o31 = vfmaq_laneq_f32(o31, v_hi0, p3, 0);
+      o40 = vfmaq_laneq_f32(o40, v_lo0, p4, 0); o41 = vfmaq_laneq_f32(o41, v_hi0, p4, 0);
+      o50 = vfmaq_laneq_f32(o50, v_lo0, p5, 0); o51 = vfmaq_laneq_f32(o51, v_hi0, p5, 0);
+      uint16x8_t vbf1 = vld1q_u16(Vp + (k + 1) * v_row_stride);
+      float32x4_t v_lo1, v_hi1;
+      widen_row(vbf1, v_lo1, v_hi1);
+      o60 = vfmaq_laneq_f32(o60, v_lo0, p6, 0); o61 = vfmaq_laneq_f32(o61, v_hi0, p6, 0);
+      o70 = vfmaq_laneq_f32(o70, v_lo0, p7, 0); o71 = vfmaq_laneq_f32(o71, v_hi0, p7, 0);
+
+      // ── 段 1 (k+1)：用 p?.lane[1]，段尾预取段 2 V ──
+      o00 = vfmaq_laneq_f32(o00, v_lo1, p0, 1); o01 = vfmaq_laneq_f32(o01, v_hi1, p0, 1);
+      o10 = vfmaq_laneq_f32(o10, v_lo1, p1, 1); o11 = vfmaq_laneq_f32(o11, v_hi1, p1, 1);
+      o20 = vfmaq_laneq_f32(o20, v_lo1, p2, 1); o21 = vfmaq_laneq_f32(o21, v_hi1, p2, 1);
+      o30 = vfmaq_laneq_f32(o30, v_lo1, p3, 1); o31 = vfmaq_laneq_f32(o31, v_hi1, p3, 1);
+      o40 = vfmaq_laneq_f32(o40, v_lo1, p4, 1); o41 = vfmaq_laneq_f32(o41, v_hi1, p4, 1);
+      o50 = vfmaq_laneq_f32(o50, v_lo1, p5, 1); o51 = vfmaq_laneq_f32(o51, v_hi1, p5, 1);
+      uint16x8_t vbf2 = vld1q_u16(Vp + (k + 2) * v_row_stride);
+      float32x4_t v_lo2, v_hi2;
+      widen_row(vbf2, v_lo2, v_hi2);
+      o60 = vfmaq_laneq_f32(o60, v_lo1, p6, 1); o61 = vfmaq_laneq_f32(o61, v_hi1, p6, 1);
+      o70 = vfmaq_laneq_f32(o70, v_lo1, p7, 1); o71 = vfmaq_laneq_f32(o71, v_hi1, p7, 1);
+
+      // ── 段 2 (k+2)：用 p?.lane[2]，**同时预取段 3 V 和跨迭代下一轮段 0 V** ──
+      // 与 fp32 pquad 同样的"跨迭代 V 预取提前到段 2 中段"调度（A 优化）：
+      // 让下一轮段 0 第 1 条 FMA 距 v_lo0/hi0 预取 ~16 条 FMA，远超 L1 vld1q
+      // + widen 总延迟（~6 cycle），完全隐藏。
+      o00 = vfmaq_laneq_f32(o00, v_lo2, p0, 2); o01 = vfmaq_laneq_f32(o01, v_hi2, p0, 2);
+      o10 = vfmaq_laneq_f32(o10, v_lo2, p1, 2); o11 = vfmaq_laneq_f32(o11, v_hi2, p1, 2);
+      o20 = vfmaq_laneq_f32(o20, v_lo2, p2, 2); o21 = vfmaq_laneq_f32(o21, v_hi2, p2, 2);
+      // 跨迭代 V[k+4] 预取：尽早发射，给下一轮段 0 最大隐藏时间。仅当 k+4
+      // 仍在 Sk4 范围内才发，避免末次迭代越界。
+      if (k + 4 < Sk4) {
+        uint16x8_t vbf0_next = vld1q_u16(Vp + (k + 4) * v_row_stride);
+        widen_row(vbf0_next, v_lo0, v_hi0);
+      }
+      o30 = vfmaq_laneq_f32(o30, v_lo2, p3, 2); o31 = vfmaq_laneq_f32(o31, v_hi2, p3, 2);
+      o40 = vfmaq_laneq_f32(o40, v_lo2, p4, 2); o41 = vfmaq_laneq_f32(o41, v_hi2, p4, 2);
+      o50 = vfmaq_laneq_f32(o50, v_lo2, p5, 2); o51 = vfmaq_laneq_f32(o51, v_hi2, p5, 2);
+      // 段 3 V 预取保留在段 2 末尾。
+      uint16x8_t vbf3 = vld1q_u16(Vp + (k + 3) * v_row_stride);
+      float32x4_t v_lo3, v_hi3;
+      widen_row(vbf3, v_lo3, v_hi3);
+      o60 = vfmaq_laneq_f32(o60, v_lo2, p6, 2); o61 = vfmaq_laneq_f32(o61, v_hi2, p6, 2);
+      o70 = vfmaq_laneq_f32(o70, v_lo2, p7, 2); o71 = vfmaq_laneq_f32(o71, v_hi2, p7, 2);
+
+      // ── 段 3 (k+3)：用 p?.lane[3]，**纯 FMA 段，无 V load** ──
+      o00 = vfmaq_laneq_f32(o00, v_lo3, p0, 3); o01 = vfmaq_laneq_f32(o01, v_hi3, p0, 3);
+      o10 = vfmaq_laneq_f32(o10, v_lo3, p1, 3); o11 = vfmaq_laneq_f32(o11, v_hi3, p1, 3);
+      o20 = vfmaq_laneq_f32(o20, v_lo3, p2, 3); o21 = vfmaq_laneq_f32(o21, v_hi3, p2, 3);
+      o30 = vfmaq_laneq_f32(o30, v_lo3, p3, 3); o31 = vfmaq_laneq_f32(o31, v_hi3, p3, 3);
+      o40 = vfmaq_laneq_f32(o40, v_lo3, p4, 3); o41 = vfmaq_laneq_f32(o41, v_hi3, p4, 3);
+      o50 = vfmaq_laneq_f32(o50, v_lo3, p5, 3); o51 = vfmaq_laneq_f32(o51, v_hi3, p5, 3);
+      o60 = vfmaq_laneq_f32(o60, v_lo3, p6, 3); o61 = vfmaq_laneq_f32(o61, v_hi3, p6, 3);
+      o70 = vfmaq_laneq_f32(o70, v_lo3, p7, 3); o71 = vfmaq_laneq_f32(o71, v_hi3, p7, 3);
+    }
+  }
+
+  // ── 标量尾循环：处理 Sk % 4（与 bf16 baseline 一致） ──
+  for (; k < Sk; ++k) {
+    float32x4_t v_lo = widen_bf16x4_to_fp32(Vp + k * v_row_stride + 0);
+    float32x4_t v_hi = widen_bf16x4_to_fp32(Vp + k * v_row_stride + 4);
     float p0 = P_hat[0 * P_row_stride + k];
     float p1 = P_hat[1 * P_row_stride + k];
     float p2 = P_hat[2 * P_row_stride + k];

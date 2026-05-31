@@ -158,6 +158,65 @@ def test_sdpa_flash2_neon_cache_alias_exact(dtype):
     assert torch.equal(a, b), (a - b).abs().max().item()
 
 
+@pytest.mark.parametrize(
+    "impl",
+    [
+        "qk_packqk_seq",
+        "qk_packqk_seq4",
+        "qk_packqk_seq4_ptr",
+        "qk_packqk_seq4_bmajor",
+        "qk_packqk_seq4_pipe_a",
+        "qk_packqk_seq4_pipe_b",
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize(
+    "head_dim",
+    [32, 64, 128, 33, 67],
+    ids=["E32", "E64", "E128", "E33-tail", "E67-tail"],
+)
+def test_microkernel_packqk_seq_vs_baseline_bit_exact(impl, dtype, head_dim):
+    """Q/K 双 pack 微内核应与 ``baseline`` 在 max-abs 上按位一致。
+
+    (与 framework 的 validate_microkernel 比较——两者都用同一个
+    scalar reference，所以 baseline 与 packqk 系列的 max_abs 应相同。
+    head_dim 33/67 专门测 E % 4 != 0 的 tail 路径。)
+
+    重点：这些 packqk variants 仅 bf16 路径有自己的实现（fp32 fall through
+    到 baseline），所以 fp32 case 期望 max_abs **完全相同**。
+    """
+    if impl not in _impls():
+        pytest.skip(f"{impl} impl not built")
+    dtype_str = "fp32" if dtype == torch.float32 else "bf16"
+    Sk = head_dim  # validate_microkernel 用 (E, Sk) 两个维度
+    base = _C.validate_microkernel(
+        impl="baseline", dtype=dtype_str, E=head_dim, Sk=Sk
+    )
+    pq = _C.validate_microkernel(
+        impl=impl, dtype=dtype_str, E=head_dim, Sk=Sk
+    )
+    # 两者都对同一个 scalar reference 算 max_abs；packqk 系列与 baseline
+    # 的 BFMMLA 累加顺序按位一致（仅 Q/K 来源不同），因此 qkt_8x8 应**完全相同**。
+    base_qkt = float(base["qkt_8x8_max_abs"])
+    pq_qkt = float(pq["qkt_8x8_max_abs"])
+    assert pq_qkt == base_qkt, (
+        f"{impl} qkt_8x8 max_abs={pq_qkt:.3e} != baseline {base_qkt:.3e} "
+        f"(dtype={dtype_str}, E={head_dim})"
+    )
+    # fp32 fall through，5 个 op 全部应与 baseline 完全相同。
+    if dtype_str == "fp32":
+        for op in (
+            "qkt_8x8_max_abs",
+            "qkt_8x4_max_abs",
+            "qkt_tail_max_abs",
+            "pv_8x8_max_abs",
+            "pv_tail_max_abs",
+        ):
+            assert float(pq[op]) == float(base[op]), (
+                f"{impl} {op}={pq[op]} != baseline {base[op]} (fp32 fall through)"
+            )
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_sdpa_flash2_neon_cache_impls_equiv(dtype):
     """所有 ``flash2_neon_cache_<impl>`` 之间在 dtype 容差内一致。"""

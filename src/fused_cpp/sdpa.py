@@ -379,6 +379,30 @@ _CPP_VERSION_META: dict = {
             "l3_kv_resident",
         ),
     ),
+    "flash2_neon_l3kv_packqkv": dict(
+        description=(
+            "L3-resident FlashAttention-2 with K + V multi-thread pre-packed "
+            "at SDPA entry, Q packed once per q-tile inside "
+            "process_q_tile_lc_packqkv (q-tile 内复用，不重复 pack). BFMMLA "
+            "inner uses 4 independent vld1q_u16 + B-major schedule "
+            "(inherits qk_packqk_seq4_bmajor microkernel). bf16-only; fp32 "
+            "delegates to flash2_neon_l3kv_packv. Path B (KV doesn't fit L3) "
+            "falls back to flash2_neon_l3kv_packv to avoid 3x DRAM bandwidth."
+        ),
+        tags=(
+            "flash",
+            "online_softmax",
+            "fa2",
+            "neon",
+            "cache_aware",
+            "multi_thread",
+            "l3_kv_resident",
+            "packed_k",
+            "packed_q",
+            "packed_v",
+            "bf16_only",
+        ),
+    ),
 }
 
 

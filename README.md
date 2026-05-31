@@ -1,7 +1,7 @@
 # fused-cpp
 
 CPU Fused MLA (Multi-head Latent Attention) and MoE (Mixture of Experts) —
-a standalone, pip-installable pure PyTorch implementation.
+a standalone, pip-installable PyTorch extension package.
 
 - **MLA**: fused forward pass (projection, RoPE, KV-cache write, attention, output projection)
 - **MoE**: full-token expert-parallel MoE forward pass
@@ -9,8 +9,25 @@ a standalone, pip-installable pure PyTorch implementation.
 ## Installation
 
 ```bash
-uv pip install -e fused_cpp/
+# Runtime only, from this directory.
+uv pip install -e .
+
+# Tests and benchmark helpers.
+uv pip install -e ".[dev]"
 ```
+
+Equivalent `pip` commands work as well:
+
+```bash
+python -m pip install -e .
+python -m pip install -e ".[dev]"
+```
+
+`uv` is preferred on Linux / Windows because the project maps `torch` to
+the PyTorch CPU wheel index via `tool.uv.sources`.
+
+`vLLM` is intentionally not a default dependency. vLLM-specific integration
+tests are skipped unless vLLM is importable in the active environment.
 
 ## Quick Start
 

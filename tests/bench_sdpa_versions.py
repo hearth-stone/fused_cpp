@@ -53,6 +53,12 @@ BENCH_SHAPES = [
     # (B, N, L, S, E, Ev)
     (1, 8, 64, 64, 64, 64),
     (1, 8, 256, 256, 64, 64),
+    # BGE-small-zh / vLLM-style request batching:
+    # hidden=512, heads=8, head_dim=64, seq_len=512.
+    (1, 8, 512, 512, 64, 64),
+    (2, 8, 512, 512, 64, 64),
+    (4, 8, 512, 512, 64, 64),
+    (8, 8, 512, 512, 64, 64),
     (1, 16, 512, 512, 192, 128),  # MLA
     # DeepSeek-R1 / V3 在 TP=4 下的 prefill MLA 真实形状（non-absorbed 路径）：
     #   num_attention_heads = 128 → 每 rank N = 128 / 4 = 32
@@ -202,6 +208,8 @@ def test_sdpa_bench(sdpa_version, shape, dtype, is_causal):
     flops = compute_sdpa_flops(B, N, L, S, E, Ev, is_causal=is_causal)
     gflops_total = gflops(flops["total_flops"], stats["mean"])
     gflops_causal = gflops(flops["total_flops_causal"], stats["mean"])
+    effective_flops_key = "total_flops_causal" if is_causal else "total_flops"
+    gflops_effective = gflops(flops[effective_flops_key], stats["mean"])
 
     # PyTorch 加速比基线（如同 (shape, dtype, is_causal) 的 pytorch_sdpa
     # 已被这一矩阵跑过，则取最近一次）
@@ -236,6 +244,8 @@ def test_sdpa_bench(sdpa_version, shape, dtype, is_causal):
         "max_ms":    stats["max"]    * 1e3,
         "total_flops":         flops["total_flops"],
         "total_flops_causal":  flops["total_flops_causal"],
+        "effective_flops":     flops[effective_flops_key],
+        "gflops":              gflops_effective,
         "gflops_total":        gflops_total,
         "gflops_causal":       gflops_causal,
         "speedup_vs_pytorch":  speedup,

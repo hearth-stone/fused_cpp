@@ -31,6 +31,8 @@ import types
 import pytest
 import torch
 
+pytest.importorskip("vllm", reason="本测试依赖 vLLM 源码树；请在 vLLM 仓库内运行")
+
 from fused_cpp.moe.awq_moe import (
     AWQExpertWeights,
     awq_moe_expert_ffn_reference,

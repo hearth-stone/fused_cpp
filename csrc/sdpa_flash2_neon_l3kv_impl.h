@@ -34,6 +34,10 @@
 #include "sdpa_tile_sizes.h"
 #include "sdpa_microkernels/neon_cache_microkernels.h"
 #include "sdpa_microkernels/mk_traits.h"
+// process_q_tile_lc_packqkv 直接调用 MK_QkPackqkSeq4BmajorPvPquad 的 PV
+// （bf16 路径走 bf16 PV pquad，fp32 路径走 fp32 PV pquad）。其余路径仍由
+// 调用方通过模板参数 MK 传入 trait，所以这里只需 include 那一个 trait 头。
+#include "sdpa_microkernels/impls/mk_qk_packqk_seq4_bmajor_pv_pquad.h"
 
 namespace fused_cpp::sdpa_flash2_neon_l3kv_impl {
 
@@ -637,6 +641,542 @@ inline void run_path_taskloop(
                 o_acc_pool[my_tid].data(),
                 rmax_pool[my_tid].data(),
                 rsum_pool[my_tid].data());
+          }
+        }
+      }
+    }
+  }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// process_q_tile_lc_packqkv
+//
+// flash2_neon_l3kv_packqkv 专用 fork。与 process_q_tile_lc<MK_Baseline,
+// at::BFloat16, kPackedV=true, kHasMask, kCausal> 的差别只有两处：
+//
+//   1. 入口处把当前 q-tile 的所有完整 8-row 子块一次性 pack 成 seq layout
+//      到 thread-local q_seq_buf；q-tile 内所有 (s_l3, s_l2, qi_inner, s_off)
+//      复用已 packed 的 Q，不再在 microkernel 内部重复 pack。
+//
+//   2. step 1（QKᵀ）改为直接调 gemm_qkt_microkernel_8x8_bf16_packqk_seq4_bmajor_inner
+//      —— Q/K 双侧都吃 packed seq buffer，4 条独立 vld1q_u16 + B-major BFMMLA。
+//      partial K block（s_global % 8 != 0 或 s_off+8 > Sc_cur）自动 fall back
+//      到 baseline 的 qkt_8x4 / qkt_tail 读原始 K。
+//
+// 仅 bf16；fp32 不应进入本路径（packqkv SDPA 入口已 delegate 到 packv）。
+//
+// **维护提醒**：step 2-9 与 process_q_tile_lc 共享语义。修改 step 2-9 时
+// 必须同步两边——它们处于同一文件、命名一致便于查找。
+// ──────────────────────────────────────────────────────────────────────
+
+template <bool kHasMask = false, bool kCausal  = false>
+inline void process_q_tile_lc_packqkv(
+    const at::BFloat16* q_ptr,
+    const uint16_t* k_packed_ptr,                  // [B, N, S/8, E_main/4, 32] u16
+    const at::BFloat16* k_orig_ptr,                // 原始 K，用于 inner 标量 tail / partial path
+    const at::BFloat16* v_packed_ptr,              // [B, N, Ev/8, S, 8]
+    int64_t b, int64_t n, int64_t q0_outer,
+    int64_t Lc_eff,
+    const SdpaParams& p,
+    int64_t q_stride_b, int64_t q_stride_n, int64_t q_stride_l,
+    int64_t k_orig_stride_b, int64_t k_orig_stride_n, int64_t k_orig_stride_s,
+    int64_t k_packed_stride_b, int64_t k_packed_stride_n, int64_t k_sblock_stride,
+    int64_t v_stride_b, int64_t v_stride_n, int64_t v_stride_s,
+    int64_t v_evblock_stride,
+    int64_t m_stride_b, int64_t m_stride_n, int64_t m_stride_l,
+    int64_t o_stride_b, int64_t o_stride_n, int64_t o_stride_l,
+    const TileSizes& ts,
+    float* scores_l1,
+    float* P_hat,
+    float* O_acc,
+    float* running_max,
+    float* running_sum,
+    uint16_t* q_seq_buf
+    ) {
+  using scalar_t = at::BFloat16;
+  const scalar_t* Qrow0 = q_ptr + b * q_stride_b + n * q_stride_n
+                                + q0_outer * q_stride_l;
+
+  // 初始化 q_tile 状态（与 process_q_tile_lc 一致）。
+  for (int64_t i = 0; i < Lc_eff; ++i) {
+    running_max[i] = p.neg_inf;
+    running_sum[i] = 0.0f;
+  }
+  std::memset(O_acc, 0, sizeof(float) * Lc_eff * p.Ev);
+
+  [[maybe_unused]] int64_t causal_lim[64];
+  [[maybe_unused]] int64_t max_causal = -1;
+  if constexpr (kCausal) {
+    for (int64_t i = 0; i < Lc_eff; ++i) {
+      int64_t l_idx = q0_outer + i;
+      causal_lim[i] = l_idx + p.causal_offset;
+      if (causal_lim[i] > max_causal) max_causal = causal_lim[i];
+    }
+  }
+
+  const int64_t LQ_INNER = 8;
+  const int64_t num_inner = ceil_div_pos(Lc_eff, LQ_INNER);
+  const int64_t Sc_l2 = ts.Sc_l2;
+  (void)Sc_l2;
+
+  // ── 入口：一次性 pack 当前 q-tile 的所有完整 8-row 子块 ──
+  // partial inner block（最后一个 < 8 行）不 pack，QKᵀ 走 MK::qkt_tail。
+  const int64_t E_main = p.E & ~int64_t{3};
+  const int64_t qblock_u16 = (E_main / 4) * 32;  // u16，单个 8-row 子块的 packed 容量
+  for (int64_t qi = 0; qi < num_inner; ++qi) {
+    const int64_t Lq_eff_qi = std::min<int64_t>(LQ_INNER, Lc_eff - qi * LQ_INNER);
+    if (Lq_eff_qi == 8) {
+      const scalar_t* Q_block = Qrow0 + qi * LQ_INNER * q_stride_l;
+      uint16_t* Q_seq = q_seq_buf + qi * qblock_u16;
+      ::fused_cpp::sdpa_microkernels::pack_q_8rows_to_seq_bf16(
+          Q_block, q_stride_l, p.E, Q_seq);
+    }
+    // Lq_eff_qi < 8 → 不 pack，QKᵀ 走 baseline qkt_tail
+  }
+
+  // K_packed 在本 (b, n) 的起点
+  const uint16_t* K_packed_bn = k_packed_ptr + b * k_packed_stride_b
+                                             + n * k_packed_stride_n;
+
+  for (int64_t s_l3 = 0; s_l3 < p.S; s_l3 += ts.Sc_l3) {
+    const int64_t s_l3_end = std::min(s_l3 + ts.Sc_l3, p.S);
+
+    if constexpr (kCausal) {
+      if (s_l3 > max_causal) break;
+    }
+
+    for (int64_t s_l2 = s_l3; s_l2 < s_l3_end; s_l2 += ts.Sc_l2) {
+      const int64_t s_l2_end = std::min(s_l2 + ts.Sc_l2, s_l3_end);
+      const int64_t Sc_cur = s_l2_end - s_l2;
+
+      if constexpr (kCausal) {
+        if (s_l2 > max_causal) break;
+      }
+
+      // ── 双缓冲 L2 软件预取 ──
+      // K 走 packed 指针，V 走 packed 指针；两条 stream 都是 stride-连续。
+      {
+        const int64_t s_next = s_l2 + ts.Sc_l2;
+        if (s_next < s_l3_end) {
+          // K_next 起点：packed s_block 索引 = s_next / 8
+          const uint16_t* K_next = K_packed_bn + (s_next / 8) * k_sblock_stride;
+          const scalar_t* V_next = v_packed_ptr + b * v_stride_b
+                                                + n * v_stride_n
+                                                + s_next * v_stride_s;
+          for (int line = 0; line < 4; ++line) {
+            prefetch_l2_keep_impl(reinterpret_cast<const char*>(K_next) + line * 64);
+            prefetch_l2_keep_impl(reinterpret_cast<const char*>(V_next) + line * 64);
+          }
+        }
+      }
+
+      // partial path 的原始 K 起点（用于 qkt_8x4 / qkt_tail / inner 标量 tail）
+      const scalar_t* Krow0_orig = k_orig_ptr + b * k_orig_stride_b
+                                              + n * k_orig_stride_n
+                                              + s_l2 * k_orig_stride_s;
+      // packed K 起点
+      const uint16_t* Krow0_packed = K_packed_bn + (s_l2 / 8) * k_sblock_stride;
+      // V_base：packed [b][n][ev_block=0][s_l2][lane=0]
+      const scalar_t* Vbase = v_packed_ptr + b * v_stride_b + n * v_stride_n
+                                           + s_l2 * v_stride_s;
+
+      for (int line = 0; line < 2; ++line) {
+        prefetch_l1_keep_impl(reinterpret_cast<const char*>(Krow0_packed) + line * 64);
+      }
+
+      for (int64_t qi_inner = 0; qi_inner < num_inner; ++qi_inner) {
+        const int64_t q0_inner = q0_outer + qi_inner * LQ_INNER;
+        const int Lq_eff = static_cast<int>(
+            std::min<int64_t>(LQ_INNER, Lc_eff - qi_inner * LQ_INNER));
+
+        float* scores_8 = scores_l1 + qi_inner * LQ_INNER * Sc_cur;
+        float* p_hat_8  = P_hat     + qi_inner * LQ_INNER * Sc_cur;
+        float* o_acc_8  = O_acc     + qi_inner * LQ_INNER * p.Ev;
+        float* rmax_8   = running_max + qi_inner * LQ_INNER;
+        float* rsum_8   = running_sum + qi_inner * LQ_INNER;
+
+        const scalar_t* Qrow_inner = Qrow0 + qi_inner * LQ_INNER * q_stride_l;
+        const uint16_t* Q_seq_inner = q_seq_buf + qi_inner * qblock_u16;
+
+        if (qi_inner + 2 < num_inner) {
+          for (int line = 0; line < 2; ++line) {
+            prefetch_l1_keep_impl(reinterpret_cast<const char*>(Vbase) + line * 64);
+          }
+        }
+
+        // ── 步骤 1: scores[Lq_eff][Sc_cur] = scale * Q · K^T ──
+        // packed 主路径：full 8x8 + s_global % 8 == 0 + 整 8-row K block 在 packed
+        //                buffer 内 → gemm_qkt_microkernel_8x8_bf16_packqk_seq4_bmajor_inner
+        // partial 路径（Lq_eff < 8 或 s_global 非 8 对齐 或 Sc_cur 末段）：
+        //                走 baseline qkt_8x4 / qkt_tail，读原始 K_orig。
+        int64_t s_off = 0;
+        alignas(64) float tmp_qkt[8 * 8];
+        for (; s_off + 8 <= Sc_cur; s_off += 8) {
+          const int64_t s_global = s_l2 + s_off;
+          const scalar_t* K_tile_orig = Krow0_orig + s_off * k_orig_stride_s;
+          const bool full_k_block = (s_global % 8 == 0)
+                                    && (s_global + 8 <= p.S);
+          if (Lq_eff == 8 && full_k_block) {
+            const uint16_t* K_seq = Krow0_packed
+                                    + (s_off / 8) * k_sblock_stride;
+            ::fused_cpp::sdpa_microkernels::
+                gemm_qkt_microkernel_8x8_bf16_packqk_seq4_bmajor_inner(
+                    Q_seq_inner, Qrow_inner, q_stride_l,
+                    K_seq, K_tile_orig, k_orig_stride_s,
+                    p.E, p.scale_f, tmp_qkt);
+            for (int i = 0; i < 8; ++i) {
+              std::memcpy(scores_8 + i * Sc_cur + s_off,
+                          tmp_qkt + i * 8, sizeof(float) * 8);
+            }
+          } else {
+            // fall back：读原始 K，调 baseline qkt_tail
+            ::fused_cpp::sdpa_microkernels::gemm_qkt_tail(
+                Qrow_inner, q_stride_l, K_tile_orig, k_orig_stride_s,
+                p.E, p.scale_f,
+                scores_8 + s_off, Sc_cur,
+                Lq_eff, 8);
+          }
+        }
+        if (s_off + 4 <= Sc_cur) {
+          const scalar_t* K_tile_orig = Krow0_orig + s_off * k_orig_stride_s;
+          if (Lq_eff == 8) {
+            ::fused_cpp::sdpa_microkernels::gemm_qkt_8x4(
+                Qrow_inner, q_stride_l, K_tile_orig, k_orig_stride_s,
+                p.E, p.scale_f,
+                scores_8 + s_off, Sc_cur);
+          } else {
+            ::fused_cpp::sdpa_microkernels::gemm_qkt_tail(
+                Qrow_inner, q_stride_l, K_tile_orig, k_orig_stride_s,
+                p.E, p.scale_f,
+                scores_8 + s_off, Sc_cur,
+                Lq_eff, 4);
+          }
+          s_off += 4;
+        }
+        if (s_off < Sc_cur) {
+          const scalar_t* K_tile_orig = Krow0_orig + s_off * k_orig_stride_s;
+          ::fused_cpp::sdpa_microkernels::gemm_qkt_tail(
+              Qrow_inner, q_stride_l, K_tile_orig, k_orig_stride_s,
+              p.E, p.scale_f,
+              scores_8 + s_off, Sc_cur,
+              Lq_eff, static_cast<int>(Sc_cur - s_off));
+          s_off = Sc_cur;
+        }
+
+        // ── 步骤 2: additive attention mask（与 process_q_tile_lc 同步）──
+        if constexpr (kHasMask) {
+          for (int i = 0; i < Lq_eff; ++i) {
+            const float* m_row = p.mask_ptr + b * m_stride_b
+                                            + n * m_stride_n
+                                            + (q0_inner + i) * m_stride_l
+                                            + s_l2;
+            float* sc_row = scores_8 + i * Sc_cur;
+            int64_t j = 0;
+#if FUSED_CPP_SDPA_CACHE_HAS_NEON
+            for (; j + 4 <= Sc_cur; j += 4) {
+              vst1q_f32(sc_row + j,
+                        vaddq_f32(vld1q_f32(sc_row + j),
+                                  vld1q_f32(m_row + j)));
+            }
+#endif
+            for (; j < Sc_cur; ++j) {
+              sc_row[j] += m_row[j];
+            }
+          }
+        }
+
+        // ── 步骤 3: causal mask（与 process_q_tile_lc 同步）──
+        if constexpr (kCausal) {
+          for (int i = 0; i < Lq_eff; ++i) {
+            int64_t lim = causal_lim[qi_inner * LQ_INNER + i];
+            float* sc_row = scores_8 + i * Sc_cur;
+            if (s_l2 + Sc_cur - 1 > lim) {
+              for (int64_t j = 0; j < Sc_cur; ++j) {
+                if (s_l2 + j > lim) sc_row[j] = p.neg_inf;
+              }
+            }
+          }
+        }
+
+        // ── 步骤 4–7: 逐行 online softmax（与 process_q_tile_lc 同步）──
+        float row_max[8];
+        for (int i = 0; i < 8; ++i) row_max[i] = p.neg_inf;
+        for (int i = 0; i < Lq_eff; ++i) {
+          const float* sc_row = scores_8 + i * Sc_cur;
+          float m = p.neg_inf;
+          int64_t j = 0;
+#if FUSED_CPP_SDPA_CACHE_HAS_NEON
+          float32x4_t vm = vdupq_n_f32(p.neg_inf);
+          for (; j + 4 <= Sc_cur; j += 4) {
+            vm = vmaxq_f32(vm, vld1q_f32(sc_row + j));
+          }
+          m = vmaxvq_f32(vm);
+#endif
+          for (; j < Sc_cur; ++j) {
+            if (sc_row[j] > m) m = sc_row[j];
+          }
+          row_max[i] = m;
+        }
+
+        float new_max[8], correction[8];
+        for (int i = 0; i < Lq_eff; ++i) {
+          new_max[i] = std::max(rmax_8[i], row_max[i]);
+          correction[i] = std::exp(rmax_8[i] - new_max[i]);
+          rsum_8[i] *= correction[i];
+          scale_inplace_impl(o_acc_8 + i * p.Ev, correction[i], p.Ev);
+        }
+
+        for (int i = 0; i < Lq_eff; ++i) {
+          const float* sc_row = scores_8 + i * Sc_cur;
+          float* p_row = p_hat_8 + i * Sc_cur;
+          float row_sum = vectorized_exp_minus_impl(
+              p_row, sc_row, new_max[i], Sc_cur);
+          rsum_8[i] += row_sum;
+        }
+        for (int i = Lq_eff; i < 8; ++i) {
+          std::memset(p_hat_8 + i * Sc_cur, 0, sizeof(float) * Sc_cur);
+        }
+
+        // ── 步骤 8: O_acc += P_hat · V（packed V 路径，固定 v_row_stride=8）──
+        for (int64_t ev_off = 0; ev_off < p.Ev; ev_off += 8) {
+          if (ev_off + 8 < p.Ev) {
+            const scalar_t* next_block =
+                Vbase + ((ev_off >> 3) + 1) * v_evblock_stride;
+            for (int line = 0; line < 2; ++line) {
+              prefetch_l1_keep_impl(
+                  reinterpret_cast<const char*>(next_block) + line * 64);
+            }
+          }
+
+          const int64_t Ev_cur = std::min<int64_t>(8, p.Ev - ev_off);
+          const scalar_t* V_tile = Vbase + (ev_off >> 3) * v_evblock_stride;
+          float* O_tile = o_acc_8 + ev_off;
+
+          if (Lq_eff == 8 && Ev_cur == 8) {
+            // 直接调 MK_QkPackqkSeq4BmajorPvPquad 的 bf16 PV：bf16 V + bf16 PV pquad
+            // microkernel（5/29 新增 gemm_pv_microkernel_8x8_bf16_pquad，远程 +24%）。
+            // 与 packqkv 的 hardcoded QKᵀ packqk_seq4_bmajor_inner 是同一 trait 的 bf16
+            // 组合，PV 选择对齐到 trait 后语义一致；数值与 baseline gemm_pv_8x8 等价。
+            ::fused_cpp::sdpa_microkernels::MK_QkPackqkSeq4BmajorPvPquad::pv_8x8(
+                p_hat_8, Sc_cur,
+                V_tile, /*v_row_stride=*/8,
+                Sc_cur,
+                O_tile, p.Ev);
+          } else {
+            // tail（Lq_eff < 8 或 Ev_cur < 8）trait 内仍 fall through 到 baseline，
+            // 但通过 trait 入口调用便于将来切换。
+            ::fused_cpp::sdpa_microkernels::MK_QkPackqkSeq4BmajorPvPquad::pv_tail(
+                p_hat_8, Sc_cur,
+                V_tile, /*v_row_stride=*/8,
+                Sc_cur,
+                O_tile, p.Ev,
+                Lq_eff, static_cast<int>(Ev_cur));
+          }
+        }
+
+        // ── 步骤 9: running_max <- new_max ──
+        for (int i = 0; i < Lq_eff; ++i) {
+          rmax_8[i] = new_max[i];
+        }
+      }  // qi_inner
+    }    // s_l2
+  }      // s_l3
+
+  // ── 归一化并写入 o_row（与 process_q_tile_lc 同步）──
+  for (int64_t i = 0; i < Lc_eff; ++i) {
+    float* o_row = p.out_ptr + b * o_stride_b + n * o_stride_n
+                             + (q0_outer + i) * o_stride_l;
+    if (running_sum[i] > 0.0f) {
+      const float inv_sum = 1.0f / running_sum[i];
+      int64_t ev = 0;
+#if FUSED_CPP_SDPA_CACHE_HAS_NEON
+      const float32x4_t vinv = vdupq_n_f32(inv_sum);
+      for (; ev + 4 <= p.Ev; ev += 4) {
+        float32x4_t v = vld1q_f32(O_acc + i * p.Ev + ev);
+        vst1q_f32(o_row + ev, vmulq_f32(v, vinv));
+      }
+#endif
+      for (; ev < p.Ev; ++ev) {
+        o_row[ev] = O_acc[i * p.Ev + ev] * inv_sum;
+      }
+    } else {
+      for (int64_t ev = 0; ev < p.Ev; ++ev) {
+        o_row[ev] = 0.0f;
+      }
+    }
+  }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// run_path_collapse3_packqkv：路径 A 版本（KV fits L3）
+// ──────────────────────────────────────────────────────────────────────
+
+template <bool kHasMask = false, bool kCausal  = false>
+inline void run_path_collapse3_packqkv(
+    const at::BFloat16* q_ptr,
+    const uint16_t* k_packed_ptr,
+    const at::BFloat16* k_orig_ptr,
+    const at::BFloat16* v_packed_ptr,
+    const SdpaParams& p,
+    const TileSizes& ts,
+    int64_t q_stride_b, int64_t q_stride_n, int64_t q_stride_l,
+    int64_t k_orig_stride_b, int64_t k_orig_stride_n, int64_t k_orig_stride_s,
+    int64_t k_packed_stride_b, int64_t k_packed_stride_n, int64_t k_sblock_stride,
+    int64_t v_stride_b, int64_t v_stride_n, int64_t v_stride_s,
+    int64_t v_evblock_stride,
+    int64_t m_stride_b, int64_t m_stride_n, int64_t m_stride_l,
+    int64_t o_stride_b, int64_t o_stride_n, int64_t o_stride_l) {
+  const int64_t LQ_OUTER = ts.Lc_l2;
+  const int64_t num_q_tiles = ceil_div_pos(p.L, LQ_OUTER);
+  const int64_t Sc_l2 = ts.Sc_l2;
+  const int64_t E_main = p.E & ~int64_t{3};
+  const int64_t qblock_u16 = (E_main / 4) * 32;
+  const int64_t num_inner_max = ceil_div_pos(LQ_OUTER, int64_t{8});
+  const int64_t q_seq_buf_size = num_inner_max * qblock_u16;
+
+#ifdef _OPENMP
+  #pragma omp parallel
+#endif
+  {
+    const int64_t sc_max = std::max<int64_t>(8, Sc_l2);
+    std::vector<float> scores_l1_vec(LQ_OUTER * sc_max);
+    std::vector<float> P_hat_vec(LQ_OUTER * sc_max);
+    std::vector<float> O_acc_vec(LQ_OUTER * p.Ev);
+    std::vector<float> running_max_vec(LQ_OUTER);
+    std::vector<float> running_sum_vec(LQ_OUTER);
+    std::vector<uint16_t> q_seq_buf_vec(q_seq_buf_size);
+
+#ifdef _OPENMP
+    #pragma omp for collapse(3) schedule(static)
+#endif
+    for (int64_t b = 0; b < p.B; ++b) {
+      for (int64_t n = 0; n < p.N; ++n) {
+        for (int64_t qi_outer = 0; qi_outer < num_q_tiles; ++qi_outer) {
+          const int64_t q0_outer = qi_outer * LQ_OUTER;
+          const int64_t Lc_eff = std::min<int64_t>(LQ_OUTER, p.L - q0_outer);
+          process_q_tile_lc_packqkv<kHasMask, kCausal>(
+              q_ptr, k_packed_ptr, k_orig_ptr, v_packed_ptr,
+              b, n, q0_outer, Lc_eff, p,
+              q_stride_b, q_stride_n, q_stride_l,
+              k_orig_stride_b, k_orig_stride_n, k_orig_stride_s,
+              k_packed_stride_b, k_packed_stride_n, k_sblock_stride,
+              v_stride_b, v_stride_n, v_stride_s,
+              v_evblock_stride,
+              m_stride_b, m_stride_n, m_stride_l,
+              o_stride_b, o_stride_n, o_stride_l,
+              ts,
+              scores_l1_vec.data(), P_hat_vec.data(), O_acc_vec.data(),
+              running_max_vec.data(), running_sum_vec.data(),
+              q_seq_buf_vec.data());
+        }
+      }
+    }
+  }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// run_path_taskloop_packqkv：路径 B 版本（KV doesn't fit L3）
+//
+// 注意：本路径 packqkv 入口实际上**不会走到**——packqkv SDPA 入口在 Path B
+// 时会 delegate 到 flash2_neon_l3kv_packv 的 path B（避免 K-pack 的 3× 带宽
+// 开销）。本函数保留是为了对称完整，便于未来如果改主意时直接启用。
+// ──────────────────────────────────────────────────────────────────────
+
+template <bool kHasMask = false, bool kCausal  = false>
+inline void run_path_taskloop_packqkv(
+    const at::BFloat16* q_ptr,
+    const uint16_t* k_packed_ptr,
+    const at::BFloat16* k_orig_ptr,
+    const at::BFloat16* v_packed_ptr,
+    const SdpaParams& p,
+    const TileSizes& ts,
+    int num_groups,
+    int64_t q_stride_b, int64_t q_stride_n, int64_t q_stride_l,
+    int64_t k_orig_stride_b, int64_t k_orig_stride_n, int64_t k_orig_stride_s,
+    int64_t k_packed_stride_b, int64_t k_packed_stride_n, int64_t k_sblock_stride,
+    int64_t v_stride_b, int64_t v_stride_n, int64_t v_stride_s,
+    int64_t v_evblock_stride,
+    int64_t m_stride_b, int64_t m_stride_n, int64_t m_stride_l,
+    int64_t o_stride_b, int64_t o_stride_n, int64_t o_stride_l) {
+  const int64_t LQ_OUTER = ts.Lc_l2;
+  const int64_t num_q_tiles = ceil_div_pos(p.L, LQ_OUTER);
+  const int64_t Sc_l2 = ts.Sc_l2;
+  const int64_t sc_max = std::max<int64_t>(8, Sc_l2);
+  const int64_t E_main = p.E & ~int64_t{3};
+  const int64_t qblock_u16 = (E_main / 4) * 32;
+  const int64_t num_inner_max = ceil_div_pos(LQ_OUTER, int64_t{8});
+  const int64_t q_seq_buf_size = num_inner_max * qblock_u16;
+
+  const int total_threads =
+#ifdef _OPENMP
+      omp_get_max_threads();
+#else
+      1;
+#endif
+
+  std::vector<std::vector<float>> scores_l1_pool(total_threads);
+  std::vector<std::vector<float>> p_hat_pool(total_threads);
+  std::vector<std::vector<float>> o_acc_pool(total_threads);
+  std::vector<std::vector<float>> rmax_pool(total_threads);
+  std::vector<std::vector<float>> rsum_pool(total_threads);
+  std::vector<std::vector<uint16_t>> q_seq_pool(total_threads);
+
+#ifdef _OPENMP
+  #pragma omp parallel
+#endif
+  {
+    const int tid =
+#ifdef _OPENMP
+        omp_get_thread_num();
+#else
+        0;
+#endif
+    scores_l1_pool[tid].assign(LQ_OUTER * sc_max, 0.0f);
+    p_hat_pool[tid].assign(LQ_OUTER * sc_max, 0.0f);
+    o_acc_pool[tid].assign(LQ_OUTER * p.Ev, 0.0f);
+    rmax_pool[tid].assign(LQ_OUTER, 0.0f);
+    rsum_pool[tid].assign(LQ_OUTER, 0.0f);
+    q_seq_pool[tid].assign(q_seq_buf_size, 0);
+
+#ifdef _OPENMP
+    #pragma omp barrier
+    #pragma omp single
+#endif
+    {
+      const int64_t grain = std::max<int64_t>(
+          1, num_q_tiles / std::max(1, num_groups));
+      for (int64_t b = 0; b < p.B; ++b) {
+        for (int64_t n = 0; n < p.N; ++n) {
+#ifdef _OPENMP
+          #pragma omp taskloop grainsize(grain) nogroup default(shared) \
+              firstprivate(b, n)
+#endif
+          for (int64_t qi_outer = 0; qi_outer < num_q_tiles; ++qi_outer) {
+            const int my_tid =
+#ifdef _OPENMP
+                omp_get_thread_num();
+#else
+                0;
+#endif
+            const int64_t q0_outer = qi_outer * LQ_OUTER;
+            const int64_t Lc_eff = std::min<int64_t>(LQ_OUTER, p.L - q0_outer);
+            process_q_tile_lc_packqkv<kHasMask, kCausal>(
+                q_ptr, k_packed_ptr, k_orig_ptr, v_packed_ptr,
+                b, n, q0_outer, Lc_eff, p,
+                q_stride_b, q_stride_n, q_stride_l,
+                k_orig_stride_b, k_orig_stride_n, k_orig_stride_s,
+                k_packed_stride_b, k_packed_stride_n, k_sblock_stride,
+                v_stride_b, v_stride_n, v_stride_s,
+                v_evblock_stride,
+                m_stride_b, m_stride_n, m_stride_l,
+                o_stride_b, o_stride_n, o_stride_l,
+                ts,
+                scores_l1_pool[my_tid].data(),
+                p_hat_pool[my_tid].data(),
+                o_acc_pool[my_tid].data(),
+                rmax_pool[my_tid].data(),
+                rsum_pool[my_tid].data(),
+                q_seq_pool[my_tid].data());
           }
         }
       }
