@@ -1505,7 +1505,8 @@ static inline void gemm_qkt_microkernel_8x8_bf16_packqk_seq4_bmajor_inner(
 //   as bf16 P·V with pre-bf16 P. The inner loop uses BFMLAL lane instructions
 //   instead of BFMMLA, avoiding the packed 2x2 block shuffle and matching the
 //   higher-throughput PV pbf16 path.
-static inline void gemm_qkt_microkernel_8x8_bf16_qrow_kcol_bfmlal(
+static inline __attribute__((always_inline)) void
+gemm_qkt_microkernel_8x8_bf16_qrow_kcol_bfmlal(
     const at::BFloat16* Q,
     int64_t q_row_stride,
     const at::BFloat16* K_col,
@@ -3022,7 +3023,8 @@ static inline void gemm_pv_microkernel_8x8_bf16_pbf16_bfmlal(
 //   与 pbf16_bfmlal 主体相同，但 P_hat 已经以 bf16 形式提供，内层只做
 //   bfloat16x4_t load，避免每个 4-k 段 8 次 fp32 load + vcvt_bf16_f32。
 //   这是“softmax 直接产出 bf16 P scratch”方向的 microkernel 上限评估。
-static inline void gemm_pv_microkernel_8x8_bf16_pbf16_prepacked(
+static inline __attribute__((always_inline)) void
+gemm_pv_microkernel_8x8_bf16_pbf16_prepacked(
     const at::BFloat16* P_bf16,
     int64_t P_row_stride,
     const at::BFloat16* V,

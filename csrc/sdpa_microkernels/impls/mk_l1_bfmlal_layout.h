@@ -25,6 +25,7 @@ struct MK_L1BfmlalLayout {
   static constexpr const char* kName = "l1_bfmlal_layout";
   static constexpr bool kEnabled = true;
   static constexpr bool kHasPvPbf16 = true;
+  static constexpr bool kHasQktKcol = true;
 
   static inline void qkt_8x8(
       const at::BFloat16* Q, int64_t q_row_stride,
@@ -49,6 +50,15 @@ struct MK_L1BfmlalLayout {
 #else
     gemm_qkt_8x8(Q, q_row_stride, K, k_row_stride, E, scale, scores_buf);
 #endif
+  }
+
+  // —— QKᵀ 主体 8×8 bf16：K_col[E][8] 已由 benchmark / caller 提供 ——
+  static inline void qkt_8x8_kcol(
+      const at::BFloat16* Q, int64_t q_row_stride,
+      const at::BFloat16* K_col,
+      int64_t E, float scale, float* scores_buf) {
+    gemm_qkt_microkernel_8x8_bf16_qrow_kcol_bfmlal(
+        Q, q_row_stride, K_col, E, scale, scores_buf);
   }
 
   static inline void qkt_8x8(

@@ -10,7 +10,8 @@
 背后调用 ``_C.benchmark_microkernel(impl, dtype, E, Sk, iters, warmup)``，
 该 C++ 入口对每个 impl 的 5 个 op 中的 `qkt_8x8 / qkt_8x4 / pv_8x8` 做
 warmup → steady-state 计时 → GFLOPS = 2*M*N*K*iters / seconds，并附带
-checksum 防止编译器优化掉调用。支持预 bf16 P scratch 的 impl 还会额外打印
+checksum 防止编译器优化掉调用。支持特殊 L1 layout 的 impl 会额外打印
+`qkt_8x8_kcol`；支持预 bf16 P scratch 的 impl 还会额外打印
 `pv_8x8_pbf16`，用于评估 softmax 直接产出 bf16 P̂ 时的 PV 上限。
 
 不依赖 pytest；直接 ``python`` 跑即可。
@@ -77,7 +78,7 @@ def main() -> int:
             return 2
 
     dtypes = [s.strip() for s in args.dtypes.split(",") if s.strip()]
-    ops = ("qkt_8x8", "qkt_8x4", "pv_8x8", "pv_8x8_pbf16")
+    ops = ("qkt_8x8", "qkt_8x8_kcol", "qkt_8x4", "pv_8x8", "pv_8x8_pbf16")
 
     print(f"# E={args.E} Sk={args.Sk} iterations={args.iters} warmup={args.warmup}")
     print(f"# impls={impls} dtypes={dtypes}")

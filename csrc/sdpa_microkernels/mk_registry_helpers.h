@@ -30,6 +30,7 @@
 #include <vector>
 
 #include "neon_cache_config.h"
+#include "neon_cache_microkernels.h"
 
 namespace fused_cpp::sdpa_microkernels {
 
@@ -110,6 +111,18 @@ struct mk_has_pv_pbf16<
 template <class MK>
 inline constexpr bool mk_has_pv_pbf16_v = mk_has_pv_pbf16<MK>::value;
 
+template <class MK, class = void>
+struct mk_has_qkt_kcol : std::false_type {};
+
+template <class MK>
+struct mk_has_qkt_kcol<
+    MK,
+    std::void_t<decltype(MK::kHasQktKcol), decltype(&MK::qkt_8x8_kcol)>>
+    : std::bool_constant<MK::kHasQktKcol> {};
+
+template <class MK>
+inline constexpr bool mk_has_qkt_kcol_v = mk_has_qkt_kcol<MK>::value;
+
 template <typename scalar_t>
 inline float mk_reference_pv_pbf16_value(
     const at::BFloat16* P_bf16, int64_t P_row_stride,
@@ -170,6 +183,23 @@ std::map<std::string, double> validate_microkernels_tmpl(
     }
   }
   result["qkt_8x8_max_abs"] = qkt_8x8_max_abs;
+
+  if constexpr (std::is_same_v<scalar_t, at::BFloat16> &&
+                mk_has_qkt_kcol_v<MK>) {
+    std::vector<at::BFloat16> k_col(8 * E);
+    pack_k_8rows_to_col_bf16(k8.data(), E, E, k_col.data());
+    std::fill(scores.begin(), scores.end(), 0.0f);
+    MK::qkt_8x8_kcol(q.data(), E, k_col.data(), E, kScale, scores.data());
+    double qkt_8x8_kcol_max_abs = 0.0;
+    for (int i = 0; i < 8; ++i) {
+      for (int j = 0; j < 8; ++j) {
+        qkt_8x8_kcol_max_abs = mk_update_max_abs(
+            qkt_8x8_kcol_max_abs, scores[i * 8 + j],
+            mk_reference_qkt_value(q.data(), E, k8.data(), E, E, kScale, i, j));
+      }
+    }
+    result["qkt_8x8_kcol_max_abs"] = qkt_8x8_kcol_max_abs;
+  }
 
   // qkt_8x4 — scores 行步长用 8 与 baseline 兼容
   std::fill(scores.begin(), scores.end(), 0.0f);
@@ -366,6 +396,26 @@ std::map<std::string, double> benchmark_microkernels_tmpl(
                           static_cast<double>(iterations);
   result["qkt_8x8_gflops"] = qkt_8x8_flops / qkt_8x8_sec / 1.0e9;
   result["qkt_8x8_checksum"] = qkt_8x8_checksum;
+
+  if constexpr (std::is_same_v<scalar_t, at::BFloat16> &&
+                mk_has_qkt_kcol_v<MK>) {
+    std::vector<at::BFloat16> k_col(8 * E);
+    pack_k_8rows_to_col_bf16(k8.data(), E, E, k_col.data());
+    auto qkt_8x8_kcol = [&]() {
+      MK::qkt_8x8_kcol(q.data(), E, k_col.data(), E, 1.0f, scores.data());
+      mk_bench_barrier(scores.data());
+    };
+    const double qkt_8x8_kcol_sec =
+        time_microkernel_loop(qkt_8x8_kcol, warmup, iterations);
+    const double qkt_8x8_kcol_checksum =
+        mk_checksum_fp32_buffer(scores.data(), 8 * 8);
+    result["qkt_8x8_kcol_seconds"] = qkt_8x8_kcol_sec;
+    result["qkt_8x8_kcol_us"] =
+        qkt_8x8_kcol_sec * 1.0e6 / static_cast<double>(iterations);
+    result["qkt_8x8_kcol_gflops"] =
+        qkt_8x8_flops / qkt_8x8_kcol_sec / 1.0e9;
+    result["qkt_8x8_kcol_checksum"] = qkt_8x8_kcol_checksum;
+  }
 
   result["qkt_8x4_seconds"] = qkt_8x4_sec;
   result["qkt_8x4_us"] = qkt_8x4_sec * 1.0e6 /
