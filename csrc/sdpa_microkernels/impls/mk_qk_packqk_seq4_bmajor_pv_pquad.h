@@ -2,8 +2,8 @@
 // ── 微内核 impl：MK_QkPackqkSeq4BmajorPvPquad ───────────────────────────────
 //
 // 组合 trait：QKᵀ 走 MK_QkPackqkSeq4Bmajor（Q+K 双 pack + B-major BFMMLA
-// 调度 + 4 条独立 vld1q_u16），PV 走 MK_PQuad（fp32 PV 的 P-quad load
-// 调度）。其余 op 与 baseline 一致。
+// 调度 + 4 条独立 vld1q_u16），PV 走 MK_PQuad（fp32 P-quad；bf16
+// P->bf16 + BFMLAL）。其余 op 与 baseline 一致。
 //
 // 设计动机：
 //   * 在 bf16 SDPA 主路径，目前两种最优实现互斥——选 packqk_seq4_bmajor
@@ -24,6 +24,8 @@
 //     按位不等价，与 `packqk_seq4_bmajor` 一致（已在 microkernel 单测
 //     中按 atol/rtol 验证）。
 //   * fp32 PV：与 baseline fp32 PV 按位等价（与 `pquad` 一致）。
+//   * bf16 PV：P 临时 fp32→bf16 round 后用 BFMLALB/T；非按位等价，
+//     但在 bf16 SDPA / microkernel 容差内。
 //
 // thread_local cache 复用 packqk_seq4_bmajor 的策略（Q / K 独立 buffer）。
 //
@@ -138,7 +140,7 @@ struct MK_QkPackqkSeq4BmajorPvPquad {
   }
 
   // —— P̂·V 主体 8×8 ——
-  // bf16：派到 _bf16_pquad（与 MK_PQuad 一致；V 仍 bf16，P-端 quad load）。
+  // bf16：派到 _bf16_pquad（与 MK_PQuad 一致；BF16 目标走 P->bf16 BFMLAL）。
   static inline void pv_8x8(
       const float* P_hat, int64_t P_row_stride,
       const at::BFloat16* V, int64_t v_row_stride,

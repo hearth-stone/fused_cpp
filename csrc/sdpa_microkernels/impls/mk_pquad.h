@@ -7,15 +7,17 @@
 //   * fp32 baseline：每 4-k 段 32 个 P 标量 load + 8 个 V quad load = 40 LSU。
 //   * fp32 pquad   ：每 4-k 段 8 个 P quad load + 8 个 V quad load = 16 LSU。
 //   * bf16 baseline：每 4-k 段 32 个 P 标量 load + 4 个 V vld1q_u16 = 36 LSU。
-//   * bf16 pquad   ：每 4-k 段 8 个 P quad load + 4 个 V vld1q_u16 = 12 LSU。
+//   * bf16 pquad   ：每 4-k 段 8 个 P quad load + 4 个 V vld1q_bf16，
+//                    P 临时 round 到 bf16 后走 BFMLALB/T lane。
 //
-// bf16 pquad 额外多 8 个 widen（vshll_n_u16）ALU op，但 widen 走 ALU 端口、
-// 与 FMA 不抢，可并行隐藏。两者均采用 fp32 pquad 同款软件流水（跨迭代 V
+// bf16 pquad 的 BFMLAL 快路径避开 V widen；无 BF16 arithmetic 时保留
+// 旧 widen+FMA pquad fallback。fp32 仍采用 pquad 软件流水（跨迭代 V
 // 预取放段 2 中段）。
 //
 // 寄存器账本与主体相同（~30 NEON reg 稳态），数值上：
 //   * fp32：按位等价（累加顺序逐段一致）
-//   * bf16：与 baseline 等价（widen 后用同样的 fp32 fma）
+//   * bf16：P 临时 fp32→bf16 round，非按位等价；microkernel max_abs
+//           约 1.6e-6，SDPA 目标小形状 max_abs 0.0078125
 //
 // 编译期开关：FUSED_CPP_MK_ENABLE_PQUAD，默认 1。
 
@@ -89,8 +91,8 @@ struct MK_PQuad {
   }
 
   // —— P̂·V 主体 8×8 ——
-  // bf16：派到 _bf16_pquad（V 仍是 bf16，P-端用 quad load + lane FMA；
-  //       widen 后的 fp32 数据和 baseline 一致，数值等价）。
+  // bf16：派到 _bf16_pquad；BF16 arithmetic 目标上内部走 P->bf16
+  //       BFMLALB/T lane 快路径，fallback 是旧的 widen+FMA pquad。
   static inline void pv_8x8(
       const float* P_hat, int64_t P_row_stride,
       const at::BFloat16* V, int64_t v_row_stride,
