@@ -782,6 +782,22 @@ inline void pack_q_8rows_to_seq_bf16(
   }
 }
 
+// pack_k_8rows_to_col_bf16:
+//   Evaluation-only L1 layout for QKᵀ-as-PV. K[8][E] is transposed into
+//   K_col[E][8], so each reduce step can load all 8 K columns with one
+//   contiguous bfloat16x8_t.
+inline void pack_k_8rows_to_col_bf16(
+    const at::BFloat16* K, int64_t k_row_stride, int64_t E,
+    at::BFloat16* K_col) {
+  const uint16_t* Kp = reinterpret_cast<const uint16_t*>(K);
+  uint16_t* dst = reinterpret_cast<uint16_t*>(K_col);
+  for (int64_t e = 0; e < E; ++e) {
+    for (int row = 0; row < 8; ++row) {
+      dst[e * 8 + row] = Kp[row * k_row_stride + e];
+    }
+  }
+}
+
 // pack_k_to_seq8：把整段 K 流 pre-pack 成 SDPA 主路径可直接消费的 layout。
 //
 // 输入：K[B, N, S, E]（S 必须是 8 的倍数；E 任意，partial e_block 不 pack）。
@@ -1478,6 +1494,143 @@ static inline void gemm_qkt_microkernel_8x8_bf16_packqk_seq4_bmajor_inner(
   vst1q_f32(scores_buf + 6 * 8 + 4, vmulq_f32(c61, vs));
   vst1q_f32(scores_buf + 7 * 8 + 0, vmulq_f32(c70, vs));
   vst1q_f32(scores_buf + 7 * 8 + 4, vmulq_f32(c71, vs));
+}
+
+
+// gemm_qkt_microkernel_8x8_bf16_qrow_kcol_bfmlal:
+//   L1-only evaluation kernel for an alternate QKT layout:
+//     Q      : row-major Q[8][E]
+//     K_col  : transposed K[E][8]
+//   With K already in reduce-major order, QKᵀ becomes the same compute shape
+//   as bf16 P·V with pre-bf16 P. The inner loop uses BFMLAL lane instructions
+//   instead of BFMMLA, avoiding the packed 2x2 block shuffle and matching the
+//   higher-throughput PV pbf16 path.
+static inline void gemm_qkt_microkernel_8x8_bf16_qrow_kcol_bfmlal(
+    const at::BFloat16* Q,
+    int64_t q_row_stride,
+    const at::BFloat16* K_col,
+    int64_t E,
+    float scale,
+    float* scores_buf) {
+#if FUSED_CPP_SDPA_CACHE_HAS_BF16
+  float32x4_t e0 = vdupq_n_f32(0), d0 = vdupq_n_f32(0);
+  float32x4_t e1 = vdupq_n_f32(0), d1 = vdupq_n_f32(0);
+  float32x4_t e2 = vdupq_n_f32(0), d2 = vdupq_n_f32(0);
+  float32x4_t e3 = vdupq_n_f32(0), d3 = vdupq_n_f32(0);
+  float32x4_t e4 = vdupq_n_f32(0), d4 = vdupq_n_f32(0);
+  float32x4_t e5 = vdupq_n_f32(0), d5 = vdupq_n_f32(0);
+  float32x4_t e6 = vdupq_n_f32(0), d6 = vdupq_n_f32(0);
+  float32x4_t e7 = vdupq_n_f32(0), d7 = vdupq_n_f32(0);
+
+  const bfloat16_t* Qbf = reinterpret_cast<const bfloat16_t*>(Q);
+  const bfloat16_t* Kbf = reinterpret_cast<const bfloat16_t*>(K_col);
+  int64_t k = 0;
+  const int64_t E4 = E & ~int64_t{3};
+  for (; k < E4; k += 4) {
+    bfloat16x4_t q0 = vld1_bf16(Qbf + 0 * q_row_stride + k);
+    bfloat16x4_t q1 = vld1_bf16(Qbf + 1 * q_row_stride + k);
+    bfloat16x4_t q2 = vld1_bf16(Qbf + 2 * q_row_stride + k);
+    bfloat16x4_t q3 = vld1_bf16(Qbf + 3 * q_row_stride + k);
+    bfloat16x4_t q4 = vld1_bf16(Qbf + 4 * q_row_stride + k);
+    bfloat16x4_t q5 = vld1_bf16(Qbf + 5 * q_row_stride + k);
+    bfloat16x4_t q6 = vld1_bf16(Qbf + 6 * q_row_stride + k);
+    bfloat16x4_t q7 = vld1_bf16(Qbf + 7 * q_row_stride + k);
+
+#define FUSED_CPP_QKT_KCOL_BFMLAL_STEP(LANE, VEC)     \
+    do {                                              \
+      e0 = vbfmlalbq_lane_f32(e0, (VEC), q0, (LANE)); \
+      d0 = vbfmlaltq_lane_f32(d0, (VEC), q0, (LANE)); \
+      e1 = vbfmlalbq_lane_f32(e1, (VEC), q1, (LANE)); \
+      d1 = vbfmlaltq_lane_f32(d1, (VEC), q1, (LANE)); \
+      e2 = vbfmlalbq_lane_f32(e2, (VEC), q2, (LANE)); \
+      d2 = vbfmlaltq_lane_f32(d2, (VEC), q2, (LANE)); \
+      e3 = vbfmlalbq_lane_f32(e3, (VEC), q3, (LANE)); \
+      d3 = vbfmlaltq_lane_f32(d3, (VEC), q3, (LANE)); \
+      e4 = vbfmlalbq_lane_f32(e4, (VEC), q4, (LANE)); \
+      d4 = vbfmlaltq_lane_f32(d4, (VEC), q4, (LANE)); \
+      e5 = vbfmlalbq_lane_f32(e5, (VEC), q5, (LANE)); \
+      d5 = vbfmlaltq_lane_f32(d5, (VEC), q5, (LANE)); \
+      e6 = vbfmlalbq_lane_f32(e6, (VEC), q6, (LANE)); \
+      d6 = vbfmlaltq_lane_f32(d6, (VEC), q6, (LANE)); \
+      e7 = vbfmlalbq_lane_f32(e7, (VEC), q7, (LANE)); \
+      d7 = vbfmlaltq_lane_f32(d7, (VEC), q7, (LANE)); \
+    } while (false)
+
+    bfloat16x8_t k0 = vld1q_bf16(Kbf + (k + 0) * 8);
+    FUSED_CPP_QKT_KCOL_BFMLAL_STEP(0, k0);
+    bfloat16x8_t k1 = vld1q_bf16(Kbf + (k + 1) * 8);
+    FUSED_CPP_QKT_KCOL_BFMLAL_STEP(1, k1);
+    bfloat16x8_t k2 = vld1q_bf16(Kbf + (k + 2) * 8);
+    FUSED_CPP_QKT_KCOL_BFMLAL_STEP(2, k2);
+    bfloat16x8_t k3 = vld1q_bf16(Kbf + (k + 3) * 8);
+    FUSED_CPP_QKT_KCOL_BFMLAL_STEP(3, k3);
+
+#undef FUSED_CPP_QKT_KCOL_BFMLAL_STEP
+  }
+
+  float32x4_t c00 = vzip1q_f32(e0, d0), c01 = vzip2q_f32(e0, d0);
+  float32x4_t c10 = vzip1q_f32(e1, d1), c11 = vzip2q_f32(e1, d1);
+  float32x4_t c20 = vzip1q_f32(e2, d2), c21 = vzip2q_f32(e2, d2);
+  float32x4_t c30 = vzip1q_f32(e3, d3), c31 = vzip2q_f32(e3, d3);
+  float32x4_t c40 = vzip1q_f32(e4, d4), c41 = vzip2q_f32(e4, d4);
+  float32x4_t c50 = vzip1q_f32(e5, d5), c51 = vzip2q_f32(e5, d5);
+  float32x4_t c60 = vzip1q_f32(e6, d6), c61 = vzip2q_f32(e6, d6);
+  float32x4_t c70 = vzip1q_f32(e7, d7), c71 = vzip2q_f32(e7, d7);
+
+  const uint16_t* Qp = reinterpret_cast<const uint16_t*>(Q);
+  const uint16_t* Kp = reinterpret_cast<const uint16_t*>(K_col);
+  for (; k < E; ++k) {
+    float32x4_t k_lo = widen_bf16x4_to_fp32(Kp + k * 8 + 0);
+    float32x4_t k_hi = widen_bf16x4_to_fp32(Kp + k * 8 + 4);
+    float q0 = bf16_to_fp32_scalar(Qp[0 * q_row_stride + k]);
+    float q1 = bf16_to_fp32_scalar(Qp[1 * q_row_stride + k]);
+    float q2 = bf16_to_fp32_scalar(Qp[2 * q_row_stride + k]);
+    float q3 = bf16_to_fp32_scalar(Qp[3 * q_row_stride + k]);
+    float q4 = bf16_to_fp32_scalar(Qp[4 * q_row_stride + k]);
+    float q5 = bf16_to_fp32_scalar(Qp[5 * q_row_stride + k]);
+    float q6 = bf16_to_fp32_scalar(Qp[6 * q_row_stride + k]);
+    float q7 = bf16_to_fp32_scalar(Qp[7 * q_row_stride + k]);
+    c00 = vfmaq_n_f32(c00, k_lo, q0); c01 = vfmaq_n_f32(c01, k_hi, q0);
+    c10 = vfmaq_n_f32(c10, k_lo, q1); c11 = vfmaq_n_f32(c11, k_hi, q1);
+    c20 = vfmaq_n_f32(c20, k_lo, q2); c21 = vfmaq_n_f32(c21, k_hi, q2);
+    c30 = vfmaq_n_f32(c30, k_lo, q3); c31 = vfmaq_n_f32(c31, k_hi, q3);
+    c40 = vfmaq_n_f32(c40, k_lo, q4); c41 = vfmaq_n_f32(c41, k_hi, q4);
+    c50 = vfmaq_n_f32(c50, k_lo, q5); c51 = vfmaq_n_f32(c51, k_hi, q5);
+    c60 = vfmaq_n_f32(c60, k_lo, q6); c61 = vfmaq_n_f32(c61, k_hi, q6);
+    c70 = vfmaq_n_f32(c70, k_lo, q7); c71 = vfmaq_n_f32(c71, k_hi, q7);
+  }
+
+  const float32x4_t vs = vdupq_n_f32(scale);
+  vst1q_f32(scores_buf + 0 * 8 + 0, vmulq_f32(c00, vs));
+  vst1q_f32(scores_buf + 0 * 8 + 4, vmulq_f32(c01, vs));
+  vst1q_f32(scores_buf + 1 * 8 + 0, vmulq_f32(c10, vs));
+  vst1q_f32(scores_buf + 1 * 8 + 4, vmulq_f32(c11, vs));
+  vst1q_f32(scores_buf + 2 * 8 + 0, vmulq_f32(c20, vs));
+  vst1q_f32(scores_buf + 2 * 8 + 4, vmulq_f32(c21, vs));
+  vst1q_f32(scores_buf + 3 * 8 + 0, vmulq_f32(c30, vs));
+  vst1q_f32(scores_buf + 3 * 8 + 4, vmulq_f32(c31, vs));
+  vst1q_f32(scores_buf + 4 * 8 + 0, vmulq_f32(c40, vs));
+  vst1q_f32(scores_buf + 4 * 8 + 4, vmulq_f32(c41, vs));
+  vst1q_f32(scores_buf + 5 * 8 + 0, vmulq_f32(c50, vs));
+  vst1q_f32(scores_buf + 5 * 8 + 4, vmulq_f32(c51, vs));
+  vst1q_f32(scores_buf + 6 * 8 + 0, vmulq_f32(c60, vs));
+  vst1q_f32(scores_buf + 6 * 8 + 4, vmulq_f32(c61, vs));
+  vst1q_f32(scores_buf + 7 * 8 + 0, vmulq_f32(c70, vs));
+  vst1q_f32(scores_buf + 7 * 8 + 4, vmulq_f32(c71, vs));
+#else
+  const uint16_t* Qp = reinterpret_cast<const uint16_t*>(Q);
+  const uint16_t* Kp = reinterpret_cast<const uint16_t*>(K_col);
+  for (int i = 0; i < 8; ++i) {
+    for (int j = 0; j < 8; ++j) {
+      float acc = 0.0f;
+      for (int64_t k = 0; k < E; ++k) {
+        acc += bf16_to_fp32_scalar(Qp[i * q_row_stride + k]) *
+               bf16_to_fp32_scalar(Kp[k * 8 + j]);
+      }
+      scores_buf[i * 8 + j] = acc * scale;
+    }
+  }
+#endif
 }
 
 
@@ -2947,12 +3100,12 @@ static inline void gemm_pv_microkernel_8x8_bf16_pbf16_prepacked(
     } while (false)
 
     bfloat16x8_t v0 = vld1q_bf16(Vbf + (k + 0) * v_row_stride);
-    bfloat16x8_t v1 = vld1q_bf16(Vbf + (k + 1) * v_row_stride);
-    bfloat16x8_t v2 = vld1q_bf16(Vbf + (k + 2) * v_row_stride);
-    bfloat16x8_t v3 = vld1q_bf16(Vbf + (k + 3) * v_row_stride);
     FUSED_CPP_PV_PBF16_STEP(0, v0);
+    bfloat16x8_t v1 = vld1q_bf16(Vbf + (k + 1) * v_row_stride);
     FUSED_CPP_PV_PBF16_STEP(1, v1);
+    bfloat16x8_t v2 = vld1q_bf16(Vbf + (k + 2) * v_row_stride);
     FUSED_CPP_PV_PBF16_STEP(2, v2);
+    bfloat16x8_t v3 = vld1q_bf16(Vbf + (k + 3) * v_row_stride);
     FUSED_CPP_PV_PBF16_STEP(3, v3);
 
 #undef FUSED_CPP_PV_PBF16_STEP

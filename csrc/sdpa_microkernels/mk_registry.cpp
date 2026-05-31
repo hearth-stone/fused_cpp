@@ -202,6 +202,9 @@ REGISTER_MK_IF_ENABLED(MK_QkPackqkSeq4PipeA);
 #if FUSED_CPP_MK_ENABLE_QK_PACKQK_SEQ4_PIPE_B
 REGISTER_MK_IF_ENABLED(MK_QkPackqkSeq4PipeB);
 #endif
+#if FUSED_CPP_MK_ENABLE_L1_BFMLAL_LAYOUT
+REGISTER_MK_IF_ENABLED(MK_L1BfmlalLayout);
+#endif
 
 }  // namespace fused_cpp::sdpa_microkernels
 

@@ -45,3 +45,4 @@
 #include "impls/mk_qk_packqk_seq4_bmajor_pv_pquad.h"
 #include "impls/mk_qk_packqk_seq4_pipe_a.h"
 #include "impls/mk_qk_packqk_seq4_pipe_b.h"
+#include "impls/mk_l1_bfmlal_layout.h"
