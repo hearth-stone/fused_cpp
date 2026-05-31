@@ -2865,6 +2865,153 @@ static inline void gemm_pv_microkernel_8x8_bf16_pbf16_bfmlal(
 #endif
 }
 
+// gemm_pv_microkernel_8x8_bf16_pbf16_prepacked：
+//   与 pbf16_bfmlal 主体相同，但 P_hat 已经以 bf16 形式提供，内层只做
+//   bfloat16x4_t load，避免每个 4-k 段 8 次 fp32 load + vcvt_bf16_f32。
+//   这是“softmax 直接产出 bf16 P scratch”方向的 microkernel 上限评估。
+static inline void gemm_pv_microkernel_8x8_bf16_pbf16_prepacked(
+    const at::BFloat16* P_bf16,
+    int64_t P_row_stride,
+    const at::BFloat16* V,
+    int64_t v_row_stride,
+    int64_t Sk,
+    float* O,
+    int64_t o_row_stride) {
+#if FUSED_CPP_SDPA_CACHE_HAS_BF16
+  float32x4_t o0_lo = vld1q_f32(O + 0 * o_row_stride + 0);
+  float32x4_t o0_hi = vld1q_f32(O + 0 * o_row_stride + 4);
+  float32x4_t o1_lo = vld1q_f32(O + 1 * o_row_stride + 0);
+  float32x4_t o1_hi = vld1q_f32(O + 1 * o_row_stride + 4);
+  float32x4_t o2_lo = vld1q_f32(O + 2 * o_row_stride + 0);
+  float32x4_t o2_hi = vld1q_f32(O + 2 * o_row_stride + 4);
+  float32x4_t o3_lo = vld1q_f32(O + 3 * o_row_stride + 0);
+  float32x4_t o3_hi = vld1q_f32(O + 3 * o_row_stride + 4);
+  float32x4_t o4_lo = vld1q_f32(O + 4 * o_row_stride + 0);
+  float32x4_t o4_hi = vld1q_f32(O + 4 * o_row_stride + 4);
+  float32x4_t o5_lo = vld1q_f32(O + 5 * o_row_stride + 0);
+  float32x4_t o5_hi = vld1q_f32(O + 5 * o_row_stride + 4);
+  float32x4_t o6_lo = vld1q_f32(O + 6 * o_row_stride + 0);
+  float32x4_t o6_hi = vld1q_f32(O + 6 * o_row_stride + 4);
+  float32x4_t o7_lo = vld1q_f32(O + 7 * o_row_stride + 0);
+  float32x4_t o7_hi = vld1q_f32(O + 7 * o_row_stride + 4);
+
+  float32x4_t e0 = vuzp1q_f32(o0_lo, o0_hi);
+  float32x4_t d0 = vuzp2q_f32(o0_lo, o0_hi);
+  float32x4_t e1 = vuzp1q_f32(o1_lo, o1_hi);
+  float32x4_t d1 = vuzp2q_f32(o1_lo, o1_hi);
+  float32x4_t e2 = vuzp1q_f32(o2_lo, o2_hi);
+  float32x4_t d2 = vuzp2q_f32(o2_lo, o2_hi);
+  float32x4_t e3 = vuzp1q_f32(o3_lo, o3_hi);
+  float32x4_t d3 = vuzp2q_f32(o3_lo, o3_hi);
+  float32x4_t e4 = vuzp1q_f32(o4_lo, o4_hi);
+  float32x4_t d4 = vuzp2q_f32(o4_lo, o4_hi);
+  float32x4_t e5 = vuzp1q_f32(o5_lo, o5_hi);
+  float32x4_t d5 = vuzp2q_f32(o5_lo, o5_hi);
+  float32x4_t e6 = vuzp1q_f32(o6_lo, o6_hi);
+  float32x4_t d6 = vuzp2q_f32(o6_lo, o6_hi);
+  float32x4_t e7 = vuzp1q_f32(o7_lo, o7_hi);
+  float32x4_t d7 = vuzp2q_f32(o7_lo, o7_hi);
+
+  const bfloat16_t* Pbf = reinterpret_cast<const bfloat16_t*>(P_bf16);
+  const bfloat16_t* Vbf = reinterpret_cast<const bfloat16_t*>(V);
+  int64_t k = 0;
+  const int64_t Sk4 = Sk & ~int64_t{3};
+  for (; k < Sk4; k += 4) {
+    bfloat16x4_t p0 = vld1_bf16(Pbf + 0 * P_row_stride + k);
+    bfloat16x4_t p1 = vld1_bf16(Pbf + 1 * P_row_stride + k);
+    bfloat16x4_t p2 = vld1_bf16(Pbf + 2 * P_row_stride + k);
+    bfloat16x4_t p3 = vld1_bf16(Pbf + 3 * P_row_stride + k);
+    bfloat16x4_t p4 = vld1_bf16(Pbf + 4 * P_row_stride + k);
+    bfloat16x4_t p5 = vld1_bf16(Pbf + 5 * P_row_stride + k);
+    bfloat16x4_t p6 = vld1_bf16(Pbf + 6 * P_row_stride + k);
+    bfloat16x4_t p7 = vld1_bf16(Pbf + 7 * P_row_stride + k);
+
+#define FUSED_CPP_PV_PBF16_STEP(LANE, VEC)           \
+    do {                                             \
+      e0 = vbfmlalbq_lane_f32(e0, (VEC), p0, (LANE));\
+      d0 = vbfmlaltq_lane_f32(d0, (VEC), p0, (LANE));\
+      e1 = vbfmlalbq_lane_f32(e1, (VEC), p1, (LANE));\
+      d1 = vbfmlaltq_lane_f32(d1, (VEC), p1, (LANE));\
+      e2 = vbfmlalbq_lane_f32(e2, (VEC), p2, (LANE));\
+      d2 = vbfmlaltq_lane_f32(d2, (VEC), p2, (LANE));\
+      e3 = vbfmlalbq_lane_f32(e3, (VEC), p3, (LANE));\
+      d3 = vbfmlaltq_lane_f32(d3, (VEC), p3, (LANE));\
+      e4 = vbfmlalbq_lane_f32(e4, (VEC), p4, (LANE));\
+      d4 = vbfmlaltq_lane_f32(d4, (VEC), p4, (LANE));\
+      e5 = vbfmlalbq_lane_f32(e5, (VEC), p5, (LANE));\
+      d5 = vbfmlaltq_lane_f32(d5, (VEC), p5, (LANE));\
+      e6 = vbfmlalbq_lane_f32(e6, (VEC), p6, (LANE));\
+      d6 = vbfmlaltq_lane_f32(d6, (VEC), p6, (LANE));\
+      e7 = vbfmlalbq_lane_f32(e7, (VEC), p7, (LANE));\
+      d7 = vbfmlaltq_lane_f32(d7, (VEC), p7, (LANE));\
+    } while (false)
+
+    bfloat16x8_t v0 = vld1q_bf16(Vbf + (k + 0) * v_row_stride);
+    bfloat16x8_t v1 = vld1q_bf16(Vbf + (k + 1) * v_row_stride);
+    bfloat16x8_t v2 = vld1q_bf16(Vbf + (k + 2) * v_row_stride);
+    bfloat16x8_t v3 = vld1q_bf16(Vbf + (k + 3) * v_row_stride);
+    FUSED_CPP_PV_PBF16_STEP(0, v0);
+    FUSED_CPP_PV_PBF16_STEP(1, v1);
+    FUSED_CPP_PV_PBF16_STEP(2, v2);
+    FUSED_CPP_PV_PBF16_STEP(3, v3);
+
+#undef FUSED_CPP_PV_PBF16_STEP
+  }
+
+  o0_lo = vzip1q_f32(e0, d0); o0_hi = vzip2q_f32(e0, d0);
+  o1_lo = vzip1q_f32(e1, d1); o1_hi = vzip2q_f32(e1, d1);
+  o2_lo = vzip1q_f32(e2, d2); o2_hi = vzip2q_f32(e2, d2);
+  o3_lo = vzip1q_f32(e3, d3); o3_hi = vzip2q_f32(e3, d3);
+  o4_lo = vzip1q_f32(e4, d4); o4_hi = vzip2q_f32(e4, d4);
+  o5_lo = vzip1q_f32(e5, d5); o5_hi = vzip2q_f32(e5, d5);
+  o6_lo = vzip1q_f32(e6, d6); o6_hi = vzip2q_f32(e6, d6);
+  o7_lo = vzip1q_f32(e7, d7); o7_hi = vzip2q_f32(e7, d7);
+
+  const uint16_t* Pp = reinterpret_cast<const uint16_t*>(P_bf16);
+  const uint16_t* Vp = reinterpret_cast<const uint16_t*>(V);
+  for (; k < Sk; ++k) {
+    float32x4_t v_lo = widen_bf16x4_to_fp32(Vp + k * v_row_stride + 0);
+    float32x4_t v_hi = widen_bf16x4_to_fp32(Vp + k * v_row_stride + 4);
+    float p0 = bf16_to_fp32_scalar(Pp[0 * P_row_stride + k]);
+    float p1 = bf16_to_fp32_scalar(Pp[1 * P_row_stride + k]);
+    float p2 = bf16_to_fp32_scalar(Pp[2 * P_row_stride + k]);
+    float p3 = bf16_to_fp32_scalar(Pp[3 * P_row_stride + k]);
+    float p4 = bf16_to_fp32_scalar(Pp[4 * P_row_stride + k]);
+    float p5 = bf16_to_fp32_scalar(Pp[5 * P_row_stride + k]);
+    float p6 = bf16_to_fp32_scalar(Pp[6 * P_row_stride + k]);
+    float p7 = bf16_to_fp32_scalar(Pp[7 * P_row_stride + k]);
+    o0_lo = vfmaq_n_f32(o0_lo, v_lo, p0); o0_hi = vfmaq_n_f32(o0_hi, v_hi, p0);
+    o1_lo = vfmaq_n_f32(o1_lo, v_lo, p1); o1_hi = vfmaq_n_f32(o1_hi, v_hi, p1);
+    o2_lo = vfmaq_n_f32(o2_lo, v_lo, p2); o2_hi = vfmaq_n_f32(o2_hi, v_hi, p2);
+    o3_lo = vfmaq_n_f32(o3_lo, v_lo, p3); o3_hi = vfmaq_n_f32(o3_hi, v_hi, p3);
+    o4_lo = vfmaq_n_f32(o4_lo, v_lo, p4); o4_hi = vfmaq_n_f32(o4_hi, v_hi, p4);
+    o5_lo = vfmaq_n_f32(o5_lo, v_lo, p5); o5_hi = vfmaq_n_f32(o5_hi, v_hi, p5);
+    o6_lo = vfmaq_n_f32(o6_lo, v_lo, p6); o6_hi = vfmaq_n_f32(o6_hi, v_hi, p6);
+    o7_lo = vfmaq_n_f32(o7_lo, v_lo, p7); o7_hi = vfmaq_n_f32(o7_hi, v_hi, p7);
+  }
+
+  vst1q_f32(O + 0 * o_row_stride + 0, o0_lo); vst1q_f32(O + 0 * o_row_stride + 4, o0_hi);
+  vst1q_f32(O + 1 * o_row_stride + 0, o1_lo); vst1q_f32(O + 1 * o_row_stride + 4, o1_hi);
+  vst1q_f32(O + 2 * o_row_stride + 0, o2_lo); vst1q_f32(O + 2 * o_row_stride + 4, o2_hi);
+  vst1q_f32(O + 3 * o_row_stride + 0, o3_lo); vst1q_f32(O + 3 * o_row_stride + 4, o3_hi);
+  vst1q_f32(O + 4 * o_row_stride + 0, o4_lo); vst1q_f32(O + 4 * o_row_stride + 4, o4_hi);
+  vst1q_f32(O + 5 * o_row_stride + 0, o5_lo); vst1q_f32(O + 5 * o_row_stride + 4, o5_hi);
+  vst1q_f32(O + 6 * o_row_stride + 0, o6_lo); vst1q_f32(O + 6 * o_row_stride + 4, o6_hi);
+  vst1q_f32(O + 7 * o_row_stride + 0, o7_lo); vst1q_f32(O + 7 * o_row_stride + 4, o7_hi);
+#else
+  for (int i = 0; i < 8; ++i) {
+    for (int j = 0; j < 8; ++j) {
+      float sum = O[i * o_row_stride + j];
+      for (int64_t k2 = 0; k2 < Sk; ++k2) {
+        sum += static_cast<float>(P_bf16[i * P_row_stride + k2]) *
+               static_cast<float>(V[k2 * v_row_stride + j]);
+      }
+      O[i * o_row_stride + j] = sum;
+    }
+  }
+#endif
+}
+
 // gemm_pv_microkernel_8x8_bf16_pquad：bf16 PV 主入口。
 //
 // BF16-capable 目标上优先派到上面的 pbf16+BFMLAL 快路径；下面保留的

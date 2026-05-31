@@ -26,6 +26,7 @@
 #include <cstdint>
 #include <map>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #include "neon_cache_config.h"
@@ -95,6 +96,31 @@ inline float mk_reference_pv_value(
 
 inline double mk_update_max_abs(double current, float actual, float expected) {
   return std::max(current, static_cast<double>(std::abs(actual - expected)));
+}
+
+template <class MK, class = void>
+struct mk_has_pv_pbf16 : std::false_type {};
+
+template <class MK>
+struct mk_has_pv_pbf16<
+    MK,
+    std::void_t<decltype(MK::kHasPvPbf16), decltype(&MK::pv_8x8_pbf16)>>
+    : std::bool_constant<MK::kHasPvPbf16> {};
+
+template <class MK>
+inline constexpr bool mk_has_pv_pbf16_v = mk_has_pv_pbf16<MK>::value;
+
+template <typename scalar_t>
+inline float mk_reference_pv_pbf16_value(
+    const at::BFloat16* P_bf16, int64_t P_row_stride,
+    const scalar_t* V, int64_t v_row_stride,
+    int64_t Sk, int i, int j) {
+  float sum = 0.0f;
+  for (int64_t k = 0; k < Sk; ++k) {
+    sum += static_cast<float>(P_bf16[i * P_row_stride + k]) *
+           static_cast<float>(V[k * v_row_stride + j]);
+  }
+  return sum;
 }
 
 // ── 通用 validate 模板：对一个具体 (MK, scalar_t) 跑全部 5 个 op ───────
@@ -183,6 +209,26 @@ std::map<std::string, double> validate_microkernels_tmpl(
     }
   }
   result["pv_8x8_max_abs"] = pv_8x8_max_abs;
+
+  if constexpr (std::is_same_v<scalar_t, at::BFloat16> &&
+                mk_has_pv_pbf16_v<MK>) {
+    std::vector<at::BFloat16> p_hat_bf16(8 * Sk);
+    for (int64_t i = 0; i < static_cast<int64_t>(p_hat_bf16.size()); ++i) {
+      p_hat_bf16[i] = static_cast<at::BFloat16>(p_hat[i]);
+    }
+    std::fill(out.begin(), out.end(), 0.0f);
+    MK::pv_8x8_pbf16(p_hat_bf16.data(), Sk, v.data(), 8, Sk, out.data(), 8);
+    double pv_8x8_pbf16_max_abs = 0.0;
+    for (int i = 0; i < 8; ++i) {
+      for (int j = 0; j < 8; ++j) {
+        pv_8x8_pbf16_max_abs = mk_update_max_abs(
+            pv_8x8_pbf16_max_abs, out[i * 8 + j],
+            mk_reference_pv_pbf16_value(
+                p_hat_bf16.data(), Sk, v.data(), 8, Sk, i, j));
+      }
+    }
+    result["pv_8x8_pbf16_max_abs"] = pv_8x8_pbf16_max_abs;
+  }
 
   // pv_tail (Lq=5, Ev=3)
   std::fill(out.begin(), out.end(), 0.0f);
@@ -332,6 +378,30 @@ std::map<std::string, double> benchmark_microkernels_tmpl(
                          static_cast<double>(iterations);
   result["pv_8x8_gflops"] = pv_8x8_flops / pv_8x8_sec / 1.0e9;
   result["pv_8x8_checksum"] = pv_8x8_checksum;
+
+  if constexpr (std::is_same_v<scalar_t, at::BFloat16> &&
+                mk_has_pv_pbf16_v<MK>) {
+    std::vector<at::BFloat16> p_hat_bf16(8 * Sk);
+    for (int64_t i = 0; i < static_cast<int64_t>(p_hat_bf16.size()); ++i) {
+      p_hat_bf16[i] = static_cast<at::BFloat16>(p_hat[i]);
+    }
+    std::fill(out.begin(), out.end(), 0.0f);
+    auto pv_8x8_pbf16 = [&]() {
+      MK::pv_8x8_pbf16(
+          p_hat_bf16.data(), Sk, v.data(), 8, Sk, out.data(), 8);
+      mk_bench_barrier(out.data());
+    };
+    const double pv_8x8_pbf16_sec =
+        time_microkernel_loop(pv_8x8_pbf16, warmup, iterations);
+    const double pv_8x8_pbf16_checksum =
+        mk_checksum_fp32_buffer(out.data(), 8 * 8);
+    result["pv_8x8_pbf16_seconds"] = pv_8x8_pbf16_sec;
+    result["pv_8x8_pbf16_us"] =
+        pv_8x8_pbf16_sec * 1.0e6 / static_cast<double>(iterations);
+    result["pv_8x8_pbf16_gflops"] =
+        pv_8x8_flops / pv_8x8_pbf16_sec / 1.0e9;
+    result["pv_8x8_pbf16_checksum"] = pv_8x8_pbf16_checksum;
+  }
 
   result["qkt_tail_seconds"] = qkt_tail_sec;
   result["qkt_tail_us"] = qkt_tail_sec * 1.0e6 /

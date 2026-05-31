@@ -48,6 +48,7 @@ namespace fused_cpp::sdpa_microkernels {
 struct MK_QkPackqkSeq4BmajorPvPquad {
   static constexpr const char* kName = "qk_packqk_seq4_bmajor_pv_pquad";
   static constexpr bool kEnabled = true;
+  static constexpr bool kHasPvPbf16 = true;
 
   // —— QKᵀ 主体 8×8 bf16：走 packqk_seq4_bmajor（Q+K 双 pack + B-major）——
   static inline void qkt_8x8(
@@ -165,6 +166,16 @@ struct MK_QkPackqkSeq4BmajorPvPquad {
 #else
     gemm_pv_8x8(P_hat, P_row_stride, V, v_row_stride, Sk, O, o_row_stride);
 #endif
+  }
+
+  // —— P̂ 已经是 bf16 的 PV 主体 8×8（microkernel 上限评估） ——
+  static inline void pv_8x8_pbf16(
+      const at::BFloat16* P_bf16, int64_t P_row_stride,
+      const at::BFloat16* V, int64_t v_row_stride,
+      int64_t Sk,
+      float* O, int64_t o_row_stride) {
+    gemm_pv_microkernel_8x8_bf16_pbf16_prepacked(
+        P_bf16, P_row_stride, V, v_row_stride, Sk, O, o_row_stride);
   }
 
   // —— P̂·V 任意尾部（与 baseline 同） ——
