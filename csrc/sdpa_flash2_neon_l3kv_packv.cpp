@@ -366,3 +366,17 @@ void sdpa_flash2_neon_l3kv_packv_qk_ublock4_entry(const SdpaParams& p) {
 REGISTER_SDPA_VERSION("flash2_neon_l3kv_packv_qk_ublock4",
                       sdpa_flash2_neon_l3kv_packv_qk_ublock4_entry);
 #endif
+
+#if FUSED_CPP_MK_ENABLE_L1_BFMLAL_LAYOUT
+namespace {
+void sdpa_flash2_neon_l3kv_packv_l1_bfmlal_layout_entry(
+    const SdpaParams& p) {
+  sdpa_flash2_neon_l3kv_packv_with_mk_impl<
+      ::fused_cpp::sdpa_microkernels::MK_L1BfmlalLayout>(p);
+}
+}  // anonymous namespace
+REGISTER_SDPA_VERSION("flash2_neon_l3kv_packv_l1_bfmlal_layout",
+                      sdpa_flash2_neon_l3kv_packv_l1_bfmlal_layout_entry);
+REGISTER_SDPA_VERSION("flash2_neon_l3kv_l1_bfmlal_layout",
+                      sdpa_flash2_neon_l3kv_packv_l1_bfmlal_layout_entry);
+#endif

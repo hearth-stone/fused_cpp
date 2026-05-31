@@ -22,6 +22,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <type_traits>
 #include <vector>
 
 #include "sdpa_common.h"
@@ -43,6 +44,19 @@ namespace fused_cpp::sdpa_flash2_neon_l3kv_impl {
 
 using ::fused_cpp::sdpa_tile_sizes::TileSizes;
 using ::fused_cpp::sdpa_tile_sizes::ceil_div_pos;
+
+template <class MK, typename scalar_t, class = void>
+struct has_pv_pbf16 : std::false_type {};
+
+template <class MK>
+struct has_pv_pbf16<
+    MK,
+    at::BFloat16,
+    std::void_t<decltype(MK::kHasPvPbf16), decltype(&MK::pv_8x8_pbf16)>>
+    : std::bool_constant<MK::kHasPvPbf16> {};
+
+template <class MK, typename scalar_t>
+inline constexpr bool has_pv_pbf16_v = has_pv_pbf16<MK, scalar_t>::value;
 
 // ──────────────────────────────────────────────────────────────────────
 // 软件预取与向量化 helper（与原 sdpa_flash2_neon_l3kv.cpp 中 helper 等价；
@@ -177,6 +191,7 @@ inline void process_q_tile_lc(
     const TileSizes& ts,
     float* scores_l1,
     float* P_hat,
+    at::BFloat16* P_hat_bf16,
     float* O_acc,
     float* running_max,
     float* running_sum
@@ -263,6 +278,8 @@ inline void process_q_tile_lc(
 
         float* scores_8 = scores_l1 + qi_inner * LQ_INNER * Sc_cur;
         float* p_hat_8  = P_hat     + qi_inner * LQ_INNER * Sc_cur;
+        at::BFloat16* p_hat_bf16_8 =
+            P_hat_bf16 + qi_inner * LQ_INNER * Sc_cur;
         float* o_acc_8  = O_acc     + qi_inner * LQ_INNER * p.Ev;
         float* rmax_8   = running_max + qi_inner * LQ_INNER;
         float* rsum_8   = running_sum + qi_inner * LQ_INNER;
@@ -396,6 +413,11 @@ inline void process_q_tile_lc(
         for (int i = Lq_eff; i < 8; ++i) {
           std::memset(p_hat_8 + i * Sc_cur, 0, sizeof(float) * Sc_cur);
         }
+        if constexpr (has_pv_pbf16_v<MK, scalar_t>) {
+          for (int64_t idx = 0; idx < 8 * Sc_cur; ++idx) {
+            p_hat_bf16_8[idx] = static_cast<at::BFloat16>(p_hat_8[idx]);
+          }
+        }
 
         // ── 步骤 8: O_acc += P_hat · V ──
         // V_tile / v_row_stride 走两条编译期分支：
@@ -443,10 +465,17 @@ inline void process_q_tile_lc(
           float* O_tile = o_acc_8 + ev_off;
 
           if (Lq_eff == 8 && Ev_cur == 8) {
-            MK::pv_8x8(p_hat_8, Sc_cur,
-                       V_tile, v_row_stride_for_mk,
-                       Sc_cur,
-                       O_tile, p.Ev);
+            if constexpr (has_pv_pbf16_v<MK, scalar_t>) {
+              MK::pv_8x8_pbf16(p_hat_bf16_8, Sc_cur,
+                                V_tile, v_row_stride_for_mk,
+                                Sc_cur,
+                                O_tile, p.Ev);
+            } else {
+              MK::pv_8x8(p_hat_8, Sc_cur,
+                         V_tile, v_row_stride_for_mk,
+                         Sc_cur,
+                         O_tile, p.Ev);
+            }
           } else {
             MK::pv_tail(p_hat_8, Sc_cur,
                         V_tile, v_row_stride_for_mk,
@@ -520,6 +549,7 @@ inline void run_path_collapse3(
     const int64_t sc_max = std::max<int64_t>(8, Sc_l2);
     std::vector<float> scores_l1_vec(LQ_OUTER * sc_max);
     std::vector<float> P_hat_vec(LQ_OUTER * sc_max);
+    std::vector<at::BFloat16> P_hat_bf16_vec(LQ_OUTER * sc_max);
     std::vector<float> O_acc_vec(LQ_OUTER * p.Ev);
     std::vector<float> running_max_vec(LQ_OUTER);
     std::vector<float> running_sum_vec(LQ_OUTER);
@@ -542,7 +572,8 @@ inline void run_path_collapse3(
               m_stride_b, m_stride_n, m_stride_l,
               o_stride_b, o_stride_n, o_stride_l,
               ts,
-              scores_l1_vec.data(), P_hat_vec.data(), O_acc_vec.data(),
+              scores_l1_vec.data(), P_hat_vec.data(), P_hat_bf16_vec.data(),
+              O_acc_vec.data(),
               running_max_vec.data(), running_sum_vec.data());
         }
       }
@@ -584,6 +615,7 @@ inline void run_path_taskloop(
 
   std::vector<std::vector<float>> scores_l1_pool(total_threads);
   std::vector<std::vector<float>> p_hat_pool(total_threads);
+  std::vector<std::vector<at::BFloat16>> p_hat_bf16_pool(total_threads);
   std::vector<std::vector<float>> o_acc_pool(total_threads);
   std::vector<std::vector<float>> rmax_pool(total_threads);
   std::vector<std::vector<float>> rsum_pool(total_threads);
@@ -600,6 +632,8 @@ inline void run_path_taskloop(
 #endif
     scores_l1_pool[tid].assign(LQ_OUTER * sc_max, 0.0f);
     p_hat_pool[tid].assign(LQ_OUTER * sc_max, 0.0f);
+    p_hat_bf16_pool[tid].assign(
+        LQ_OUTER * sc_max, static_cast<at::BFloat16>(0.0f));
     o_acc_pool[tid].assign(LQ_OUTER * p.Ev, 0.0f);
     rmax_pool[tid].assign(LQ_OUTER, 0.0f);
     rsum_pool[tid].assign(LQ_OUTER, 0.0f);
@@ -638,6 +672,7 @@ inline void run_path_taskloop(
                 ts,
                 scores_l1_pool[my_tid].data(),
                 p_hat_pool[my_tid].data(),
+                p_hat_bf16_pool[my_tid].data(),
                 o_acc_pool[my_tid].data(),
                 rmax_pool[my_tid].data(),
                 rsum_pool[my_tid].data());

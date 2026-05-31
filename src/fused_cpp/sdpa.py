@@ -403,6 +403,52 @@ _CPP_VERSION_META: dict = {
             "bf16_only",
         ),
     ),
+    "flash2_neon_l3kv_packv_l1_bfmlal_layout": dict(
+        description=(
+            "Experimental L3KV packv SDPA using MK_L1BfmlalLayout: V is "
+            "pre-packed to [B,N,Ev/8,S,8], bf16 QK^T uses the K_col "
+            "BFMLAL microkernel, and bf16 PV converts P_hat scratch to bf16 "
+            "before calling pv_8x8_pbf16. This is the first end-to-end "
+            "wiring of the L1-only 85%+ peak microkernels; K_col/P_bf16 "
+            "production cost is still paid in the SDPA outer path."
+        ),
+        tags=(
+            "flash",
+            "online_softmax",
+            "fa2",
+            "neon",
+            "cache_aware",
+            "multi_thread",
+            "l3_kv_resident",
+            "packed_v",
+            "k_col",
+            "pbf16",
+            "l1_bfmlal_layout",
+            "experimental",
+        ),
+    ),
+    "flash2_neon_l3kv_l1_bfmlal_layout": dict(
+        description=(
+            "Short alias for flash2_neon_l3kv_packv_l1_bfmlal_layout, the "
+            "experimental SDPA path that wires MK_L1BfmlalLayout into the "
+            "packv L3KV topology."
+        ),
+        tags=(
+            "flash",
+            "online_softmax",
+            "fa2",
+            "neon",
+            "cache_aware",
+            "multi_thread",
+            "l3_kv_resident",
+            "packed_v",
+            "k_col",
+            "pbf16",
+            "l1_bfmlal_layout",
+            "experimental",
+            "alias",
+        ),
+    ),
 }
 
 
