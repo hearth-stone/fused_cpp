@@ -26,12 +26,16 @@
 #include <vector>
 
 #include "sdpa_common.h"
+#include "sdpa_profile.h"
 
 #ifdef _OPENMP
 #include <omp.h>
 #endif
 
 #include "sdpa_microkernels/neon_cache_config.h"
+#if FUSED_CPP_SDPA_CACHE_HAS_SVE
+#include <arm_sve.h>
+#endif
 #include "sdpa_tile_sizes.h"
 #include "sdpa_microkernels/neon_cache_microkernels.h"
 #include "sdpa_microkernels/mk_traits.h"
@@ -120,11 +124,60 @@ static inline float32x4_t vexpq_f32_impl(float32x4_t x) {
 
 #endif  // FUSED_CPP_SDPA_CACHE_HAS_NEON
 
+#if FUSED_CPP_SDPA_CACHE_HAS_SVE
+
+// SVE poly6 exp approximation for softmax inputs. It keeps the same clamp
+// envelope as the NEON path so masked -inf lanes become tiny finite values.
+static inline svfloat32_t svexp_poly6_f32_impl(svbool_t pg, svfloat32_t x) {
+  const svfloat32_t kHi = svdup_f32(87.0f);
+  const svfloat32_t kLo = svdup_f32(-87.0f);
+  x = svmin_f32_x(pg, x, kHi);
+  x = svmax_f32_x(pg, x, kLo);
+
+  const svfloat32_t kInvLn2 = svdup_f32(1.4426950408889634f);
+  const svfloat32_t kLn2 = svdup_f32(0.6931471805599453f);
+  const svfloat32_t c0 = svdup_f32(1.0f);
+  const svfloat32_t c1 = svdup_f32(1.0f);
+  const svfloat32_t c2 = svdup_f32(0.5f);
+  const svfloat32_t c3 = svdup_f32(1.0f / 6.0f);
+  const svfloat32_t c4 = svdup_f32(1.0f / 24.0f);
+  const svfloat32_t c5 = svdup_f32(1.0f / 120.0f);
+  const svfloat32_t c6 = svdup_f32(1.0f / 720.0f);
+
+  svfloat32_t fn = svrinta_f32_x(pg, svmul_f32_x(pg, x, kInvLn2));
+  svfloat32_t r = svmls_f32_x(pg, x, fn, kLn2);
+  svint32_t n = svcvt_s32_f32_x(pg, fn);
+
+  svfloat32_t poly = c6;
+  poly = svmla_f32_x(pg, c5, poly, r);
+  poly = svmla_f32_x(pg, c4, poly, r);
+  poly = svmla_f32_x(pg, c3, poly, r);
+  poly = svmla_f32_x(pg, c2, poly, r);
+  poly = svmla_f32_x(pg, c1, poly, r);
+  poly = svmla_f32_x(pg, c0, poly, r);
+
+  return svscale_f32_x(pg, poly, n);
+}
+
+#endif  // FUSED_CPP_SDPA_CACHE_HAS_SVE
+
 inline float vectorized_exp_minus_impl(
     float* dst, const float* src, float new_max, int64_t len) {
   float block_sum = 0.0f;
   int64_t j = 0;
-#if FUSED_CPP_SDPA_CACHE_HAS_NEON
+#if FUSED_CPP_SDPA_CACHE_HAS_SVE
+  const svfloat32_t vmax = svdup_f32(new_max);
+  svfloat32_t vsum = svdup_f32(0.0f);
+  const uint64_t ulen = static_cast<uint64_t>(len);
+  for (; j < len; j += static_cast<int64_t>(svcntw())) {
+    const svbool_t pg = svwhilelt_b32(static_cast<uint64_t>(j), ulen);
+    svfloat32_t s = svld1_f32(pg, src + j);
+    svfloat32_t e = svexp_poly6_f32_impl(pg, svsub_f32_x(pg, s, vmax));
+    svst1_f32(pg, dst + j, e);
+    vsum = svadd_f32_m(pg, vsum, e);
+  }
+  block_sum = svaddv_f32(svptrue_b32(), vsum);
+#elif FUSED_CPP_SDPA_CACHE_HAS_NEON
   const float32x4_t vmax = vdupq_n_f32(new_max);
   float32x4_t vsum = vdupq_n_f32(0.0f);
   for (; j + 4 <= len; j += 4) {
@@ -138,6 +191,30 @@ inline float vectorized_exp_minus_impl(
   for (; j < len; ++j) {
     float e = std::exp(src[j] - new_max);
     dst[j] = e;
+    block_sum += e;
+  }
+  return block_sum;
+}
+
+inline float vectorized_exp_minus_bf16_impl(
+    at::BFloat16* dst, const float* src, float new_max, int64_t len) {
+  float block_sum = 0.0f;
+  int64_t j = 0;
+#if FUSED_CPP_SDPA_CACHE_HAS_NEON && FUSED_CPP_SDPA_CACHE_HAS_BF16
+  const float32x4_t vmax = vdupq_n_f32(new_max);
+  float32x4_t vsum = vdupq_n_f32(0.0f);
+  bfloat16_t* dst_bf16 = reinterpret_cast<bfloat16_t*>(dst);
+  for (; j + 4 <= len; j += 4) {
+    float32x4_t s = vld1q_f32(src + j);
+    float32x4_t e = vexpq_f32_impl(vsubq_f32(s, vmax));
+    vst1_bf16(dst_bf16 + j, vcvt_bf16_f32(e));
+    vsum = vaddq_f32(vsum, e);
+  }
+  block_sum = vaddvq_f32(vsum);
+#endif
+  for (; j < len; ++j) {
+    float e = std::exp(src[j] - new_max);
+    dst[j] = static_cast<at::BFloat16>(e);
     block_sum += e;
   }
   return block_sum;
@@ -199,12 +276,15 @@ inline void process_q_tile_lc(
   const scalar_t* Qrow0 = q_ptr + b * q_stride_b + n * q_stride_n
                                 + q0_outer * q_stride_l;
 
-  // 初始化 q_tile 状态。
-  for (int64_t i = 0; i < Lc_eff; ++i) {
-    running_max[i] = p.neg_inf;
-    running_sum[i] = 0.0f;
+  {
+    FUSED_CPP_SDPA_PROFILE_SCOPE(::fused_cpp::sdpa_profile::Slot::kInit);
+    // 初始化 q_tile 状态。
+    for (int64_t i = 0; i < Lc_eff; ++i) {
+      running_max[i] = p.neg_inf;
+      running_sum[i] = 0.0f;
+    }
+    std::memset(O_acc, 0, sizeof(float) * Lc_eff * p.Ev);
   }
-  std::memset(O_acc, 0, sizeof(float) * Lc_eff * p.Ev);
 
   // causal_lim 仅在 kCausal=true 实例化里使用；非 causal 路径上保留数组
   // 占位（[[maybe_unused]]）以避免后面 step 3 引用时出现 undeclared，
@@ -278,8 +358,10 @@ inline void process_q_tile_lc(
 
         float* scores_8 = scores_l1 + qi_inner * LQ_INNER * Sc_cur;
         float* p_hat_8  = P_hat     + qi_inner * LQ_INNER * Sc_cur;
-        at::BFloat16* p_hat_bf16_8 =
-            P_hat_bf16 + qi_inner * LQ_INNER * Sc_cur;
+        at::BFloat16* p_hat_bf16_8 = nullptr;
+        if constexpr (has_pv_pbf16_v<MK, scalar_t>) {
+          p_hat_bf16_8 = P_hat_bf16 + qi_inner * LQ_INNER * Sc_cur;
+        }
         float* o_acc_8  = O_acc     + qi_inner * LQ_INNER * p.Ev;
         float* rmax_8   = running_max + qi_inner * LQ_INNER;
         float* rsum_8   = running_sum + qi_inner * LQ_INNER;
@@ -292,46 +374,49 @@ inline void process_q_tile_lc(
           }
         }
 
-        // ── 步骤 1: scores[Lq_eff][Sc_cur] = scale * Q · K^T ──
-        int64_t s_off = 0;
-        alignas(64) float tmp_qkt[8 * 8];
-        for (; s_off + 8 <= Sc_cur; s_off += 8) {
-          const scalar_t* K_tile = Krow0 + s_off * k_stride_s;
-          if (Lq_eff == 8) {
-            MK::qkt_8x8(Qrow_inner, q_stride_l, K_tile, k_stride_s,
-                        p.E, p.scale_f, tmp_qkt);
-            for (int i = 0; i < 8; ++i) {
-              std::memcpy(scores_8 + i * Sc_cur + s_off,
-                          tmp_qkt + i * 8, sizeof(float) * 8);
+        {
+          FUSED_CPP_SDPA_PROFILE_SCOPE(::fused_cpp::sdpa_profile::Slot::kQkt);
+          // ── 步骤 1: scores[Lq_eff][Sc_cur] = scale * Q · K^T ──
+          int64_t s_off = 0;
+          alignas(64) float tmp_qkt[8 * 8];
+          for (; s_off + 8 <= Sc_cur; s_off += 8) {
+            const scalar_t* K_tile = Krow0 + s_off * k_stride_s;
+            if (Lq_eff == 8) {
+              MK::qkt_8x8(Qrow_inner, q_stride_l, K_tile, k_stride_s,
+                          p.E, p.scale_f, tmp_qkt);
+              for (int i = 0; i < 8; ++i) {
+                std::memcpy(scores_8 + i * Sc_cur + s_off,
+                            tmp_qkt + i * 8, sizeof(float) * 8);
+              }
+            } else {
+              MK::qkt_tail(Qrow_inner, q_stride_l, K_tile, k_stride_s,
+                           p.E, p.scale_f,
+                           scores_8 + s_off, Sc_cur,
+                           Lq_eff, 8);
             }
-          } else {
+          }
+          if (s_off + 4 <= Sc_cur) {
+            const scalar_t* K_tile = Krow0 + s_off * k_stride_s;
+            if (Lq_eff == 8) {
+              MK::qkt_8x4(Qrow_inner, q_stride_l, K_tile, k_stride_s,
+                          p.E, p.scale_f,
+                          scores_8 + s_off, Sc_cur);
+            } else {
+              MK::qkt_tail(Qrow_inner, q_stride_l, K_tile, k_stride_s,
+                           p.E, p.scale_f,
+                           scores_8 + s_off, Sc_cur,
+                           Lq_eff, 4);
+            }
+            s_off += 4;
+          }
+          if (s_off < Sc_cur) {
+            const scalar_t* K_tile = Krow0 + s_off * k_stride_s;
             MK::qkt_tail(Qrow_inner, q_stride_l, K_tile, k_stride_s,
                          p.E, p.scale_f,
                          scores_8 + s_off, Sc_cur,
-                         Lq_eff, 8);
+                         Lq_eff, static_cast<int>(Sc_cur - s_off));
+            s_off = Sc_cur;
           }
-        }
-        if (s_off + 4 <= Sc_cur) {
-          const scalar_t* K_tile = Krow0 + s_off * k_stride_s;
-          if (Lq_eff == 8) {
-            MK::qkt_8x4(Qrow_inner, q_stride_l, K_tile, k_stride_s,
-                        p.E, p.scale_f,
-                        scores_8 + s_off, Sc_cur);
-          } else {
-            MK::qkt_tail(Qrow_inner, q_stride_l, K_tile, k_stride_s,
-                         p.E, p.scale_f,
-                         scores_8 + s_off, Sc_cur,
-                         Lq_eff, 4);
-          }
-          s_off += 4;
-        }
-        if (s_off < Sc_cur) {
-          const scalar_t* K_tile = Krow0 + s_off * k_stride_s;
-          MK::qkt_tail(Qrow_inner, q_stride_l, K_tile, k_stride_s,
-                       p.E, p.scale_f,
-                       scores_8 + s_off, Sc_cur,
-                       Lq_eff, static_cast<int>(Sc_cur - s_off));
-          s_off = Sc_cur;
         }
 
         // ── 步骤 2: additive attention mask（kHasMask 编译期开关）──
@@ -339,6 +424,7 @@ inline void process_q_tile_lc(
         // load/store 串行约束（A-class 一周 2 LSU）。改 vld/vadd/vst：
         // fp32 4-wide 主体 + 标量尾，主体 IPC ~3，尾巴 ≤ 3 次。
         if constexpr (kHasMask) {
+          FUSED_CPP_SDPA_PROFILE_SCOPE(::fused_cpp::sdpa_profile::Slot::kMask);
           for (int i = 0; i < Lq_eff; ++i) {
             const float* m_row = p.mask_ptr + b * m_stride_b
                                             + n * m_stride_n
@@ -361,6 +447,7 @@ inline void process_q_tile_lc(
 
         // ── 步骤 3: causal mask（按 row；kCausal 编译期开关）──
         if constexpr (kCausal) {
+          FUSED_CPP_SDPA_PROFILE_SCOPE(::fused_cpp::sdpa_profile::Slot::kMask);
           for (int i = 0; i < Lq_eff; ++i) {
             int64_t lim = causal_lim[qi_inner * LQ_INNER + i];
             float* sc_row = scores_8 + i * Sc_cur;
@@ -372,48 +459,54 @@ inline void process_q_tile_lc(
           }
         }
 
-        // ── 步骤 4–7: 逐行 online softmax ──
-        // row-max 用 NEON 4-wide 累加器 + vmaxvq_f32 规约：长度 = Sc_cur
-        // 的标量比较链消除，bf16 / fp32 都受益。非 NaN 输入下与原标量
-        // 实现位等价。
-        float row_max[8];
-        for (int i = 0; i < 8; ++i) row_max[i] = p.neg_inf;
-        for (int i = 0; i < Lq_eff; ++i) {
-          const float* sc_row = scores_8 + i * Sc_cur;
-          float m = p.neg_inf;
-          int64_t j = 0;
+        float new_max[8];
+        {
+          FUSED_CPP_SDPA_PROFILE_SCOPE(::fused_cpp::sdpa_profile::Slot::kSoftmax);
+          // ── 步骤 4–7: 逐行 online softmax ──
+          // row-max 用 NEON 4-wide 累加器 + vmaxvq_f32 规约：长度 = Sc_cur
+          // 的标量比较链消除，bf16 / fp32 都受益。非 NaN 输入下与原标量
+          // 实现位等价。
+          float row_max[8];
+          for (int i = 0; i < 8; ++i) row_max[i] = p.neg_inf;
+          for (int i = 0; i < Lq_eff; ++i) {
+            const float* sc_row = scores_8 + i * Sc_cur;
+            float m = p.neg_inf;
+            int64_t j = 0;
 #if FUSED_CPP_SDPA_CACHE_HAS_NEON
-          float32x4_t vm = vdupq_n_f32(p.neg_inf);
-          for (; j + 4 <= Sc_cur; j += 4) {
-            vm = vmaxq_f32(vm, vld1q_f32(sc_row + j));
-          }
-          m = vmaxvq_f32(vm);
+            float32x4_t vm = vdupq_n_f32(p.neg_inf);
+            for (; j + 4 <= Sc_cur; j += 4) {
+              vm = vmaxq_f32(vm, vld1q_f32(sc_row + j));
+            }
+            m = vmaxvq_f32(vm);
 #endif
-          for (; j < Sc_cur; ++j) {
-            if (sc_row[j] > m) m = sc_row[j];
+            for (; j < Sc_cur; ++j) {
+              if (sc_row[j] > m) m = sc_row[j];
+            }
+            row_max[i] = m;
           }
-          row_max[i] = m;
-        }
 
-        float new_max[8], correction[8];
-        for (int i = 0; i < Lq_eff; ++i) {
-          new_max[i] = std::max(rmax_8[i], row_max[i]);
-          correction[i] = std::exp(rmax_8[i] - new_max[i]);
-          rsum_8[i] *= correction[i];
-          scale_inplace_impl(o_acc_8 + i * p.Ev, correction[i], p.Ev);
-        }
+          float correction[8];
+          for (int i = 0; i < Lq_eff; ++i) {
+            new_max[i] = std::max(rmax_8[i], row_max[i]);
+            correction[i] = std::exp(rmax_8[i] - new_max[i]);
+            rsum_8[i] *= correction[i];
+            scale_inplace_impl(o_acc_8 + i * p.Ev, correction[i], p.Ev);
+          }
 
-        for (int i = 0; i < Lq_eff; ++i) {
-          const float* sc_row = scores_8 + i * Sc_cur;
-          float* p_row = p_hat_8 + i * Sc_cur;
-          float row_sum = vectorized_exp_minus_impl(
-              p_row, sc_row, new_max[i], Sc_cur);
-          rsum_8[i] += row_sum;
-        }
-        for (int i = Lq_eff; i < 8; ++i) {
-          std::memset(p_hat_8 + i * Sc_cur, 0, sizeof(float) * Sc_cur);
+          for (int i = 0; i < Lq_eff; ++i) {
+            const float* sc_row = scores_8 + i * Sc_cur;
+            float* p_row = p_hat_8 + i * Sc_cur;
+            float row_sum = vectorized_exp_minus_impl(
+                p_row, sc_row, new_max[i], Sc_cur);
+            rsum_8[i] += row_sum;
+          }
+          for (int i = Lq_eff; i < 8; ++i) {
+            std::memset(p_hat_8 + i * Sc_cur, 0, sizeof(float) * Sc_cur);
+          }
         }
         if constexpr (has_pv_pbf16_v<MK, scalar_t>) {
+          FUSED_CPP_SDPA_PROFILE_SCOPE(
+              ::fused_cpp::sdpa_profile::Slot::kPConvert);
           for (int64_t idx = 0; idx < 8 * Sc_cur; ++idx) {
             p_hat_bf16_8[idx] = static_cast<at::BFloat16>(p_hat_8[idx]);
           }
@@ -431,7 +524,9 @@ inline void process_q_tile_lc(
         // round-trip（约 5–10 cycle 串行损失）。合并为单次调用后，每个 ev_off
         // 块只付一次 O 累加器加载/写回，PV 内部软件流水跨整个 Sc_cur 不打断。
         // 数值上完全等价：fma 累加序按 k 单调递增，未变。
-        for (int64_t ev_off = 0; ev_off < p.Ev; ev_off += 8) {
+        {
+          FUSED_CPP_SDPA_PROFILE_SCOPE(::fused_cpp::sdpa_profile::Slot::kPv);
+          for (int64_t ev_off = 0; ev_off < p.Ev; ev_off += 8) {
           // ── packv 路径下的 V cold prefetch ──
           // 非 packed 路径上 ev_off += 8 只是行内偏移（同一 cache line 后半），
           // HW prefetcher 已经覆盖。但 packv layout 下 ev_off += 8 = 跳到
@@ -483,6 +578,7 @@ inline void process_q_tile_lc(
                         O_tile, p.Ev,
                         Lq_eff, static_cast<int>(Ev_cur));
           }
+          }
         }
 
         // ── 步骤 9: running_max <- new_max ──
@@ -493,26 +589,29 @@ inline void process_q_tile_lc(
     }    // s_l2
   }      // s_l3
 
-  // ── 归一化并写入 o_row ──
-  for (int64_t i = 0; i < Lc_eff; ++i) {
-    float* o_row = p.out_ptr + b * o_stride_b + n * o_stride_n
-                             + (q0_outer + i) * o_stride_l;
-    if (running_sum[i] > 0.0f) {
-      const float inv_sum = 1.0f / running_sum[i];
-      int64_t ev = 0;
+  {
+    FUSED_CPP_SDPA_PROFILE_SCOPE(::fused_cpp::sdpa_profile::Slot::kFinalize);
+    // ── 归一化并写入 o_row ──
+    for (int64_t i = 0; i < Lc_eff; ++i) {
+      float* o_row = p.out_ptr + b * o_stride_b + n * o_stride_n
+                               + (q0_outer + i) * o_stride_l;
+      if (running_sum[i] > 0.0f) {
+        const float inv_sum = 1.0f / running_sum[i];
+        int64_t ev = 0;
 #if FUSED_CPP_SDPA_CACHE_HAS_NEON
-      const float32x4_t vinv = vdupq_n_f32(inv_sum);
-      for (; ev + 4 <= p.Ev; ev += 4) {
-        float32x4_t v = vld1q_f32(O_acc + i * p.Ev + ev);
-        vst1q_f32(o_row + ev, vmulq_f32(v, vinv));
-      }
+        const float32x4_t vinv = vdupq_n_f32(inv_sum);
+        for (; ev + 4 <= p.Ev; ev += 4) {
+          float32x4_t v = vld1q_f32(O_acc + i * p.Ev + ev);
+          vst1q_f32(o_row + ev, vmulq_f32(v, vinv));
+        }
 #endif
-      for (; ev < p.Ev; ++ev) {
-        o_row[ev] = O_acc[i * p.Ev + ev] * inv_sum;
-      }
-    } else {
-      for (int64_t ev = 0; ev < p.Ev; ++ev) {
-        o_row[ev] = 0.0f;
+        for (; ev < p.Ev; ++ev) {
+          o_row[ev] = O_acc[i * p.Ev + ev] * inv_sum;
+        }
+      } else {
+        for (int64_t ev = 0; ev < p.Ev; ++ev) {
+          o_row[ev] = 0.0f;
+        }
       }
     }
   }
@@ -704,7 +803,8 @@ inline void run_path_taskloop(
 // 必须同步两边——它们处于同一文件、命名一致便于查找。
 // ──────────────────────────────────────────────────────────────────────
 
-template <bool kHasMask = false, bool kCausal  = false>
+template <bool kHasMask = false, bool kCausal  = false,
+          bool kPbf16PV = false>
 inline void process_q_tile_lc_packqkv(
     const at::BFloat16* q_ptr,
     const uint16_t* k_packed_ptr,                  // [B, N, S/8, E_main/4, 32] u16
@@ -723,6 +823,7 @@ inline void process_q_tile_lc_packqkv(
     const TileSizes& ts,
     float* scores_l1,
     float* P_hat,
+    at::BFloat16* P_hat_bf16,
     float* O_acc,
     float* running_max,
     float* running_sum,
@@ -732,12 +833,15 @@ inline void process_q_tile_lc_packqkv(
   const scalar_t* Qrow0 = q_ptr + b * q_stride_b + n * q_stride_n
                                 + q0_outer * q_stride_l;
 
-  // 初始化 q_tile 状态（与 process_q_tile_lc 一致）。
-  for (int64_t i = 0; i < Lc_eff; ++i) {
-    running_max[i] = p.neg_inf;
-    running_sum[i] = 0.0f;
+  {
+    FUSED_CPP_SDPA_PROFILE_SCOPE(::fused_cpp::sdpa_profile::Slot::kInit);
+    // 初始化 q_tile 状态（与 process_q_tile_lc 一致）。
+    for (int64_t i = 0; i < Lc_eff; ++i) {
+      running_max[i] = p.neg_inf;
+      running_sum[i] = 0.0f;
+    }
+    std::memset(O_acc, 0, sizeof(float) * Lc_eff * p.Ev);
   }
-  std::memset(O_acc, 0, sizeof(float) * Lc_eff * p.Ev);
 
   [[maybe_unused]] int64_t causal_lim[64];
   [[maybe_unused]] int64_t max_causal = -1;
@@ -758,15 +862,19 @@ inline void process_q_tile_lc_packqkv(
   // partial inner block（最后一个 < 8 行）不 pack，QKᵀ 走 MK::qkt_tail。
   const int64_t E_main = p.E & ~int64_t{3};
   const int64_t qblock_u16 = (E_main / 4) * 32;  // u16，单个 8-row 子块的 packed 容量
-  for (int64_t qi = 0; qi < num_inner; ++qi) {
-    const int64_t Lq_eff_qi = std::min<int64_t>(LQ_INNER, Lc_eff - qi * LQ_INNER);
-    if (Lq_eff_qi == 8) {
-      const scalar_t* Q_block = Qrow0 + qi * LQ_INNER * q_stride_l;
-      uint16_t* Q_seq = q_seq_buf + qi * qblock_u16;
-      ::fused_cpp::sdpa_microkernels::pack_q_8rows_to_seq_bf16(
-          Q_block, q_stride_l, p.E, Q_seq);
+  {
+    FUSED_CPP_SDPA_PROFILE_SCOPE(::fused_cpp::sdpa_profile::Slot::kQPack);
+    for (int64_t qi = 0; qi < num_inner; ++qi) {
+      const int64_t Lq_eff_qi =
+          std::min<int64_t>(LQ_INNER, Lc_eff - qi * LQ_INNER);
+      if (Lq_eff_qi == 8) {
+        const scalar_t* Q_block = Qrow0 + qi * LQ_INNER * q_stride_l;
+        uint16_t* Q_seq = q_seq_buf + qi * qblock_u16;
+        ::fused_cpp::sdpa_microkernels::pack_q_8rows_to_seq_bf16(
+            Q_block, q_stride_l, p.E, Q_seq);
+      }
+      // Lq_eff_qi < 8 → 不 pack，QKᵀ 走 baseline qkt_tail
     }
-    // Lq_eff_qi < 8 → 不 pack，QKᵀ 走 baseline qkt_tail
   }
 
   // K_packed 在本 (b, n) 的起点
@@ -826,6 +934,10 @@ inline void process_q_tile_lc_packqkv(
 
         float* scores_8 = scores_l1 + qi_inner * LQ_INNER * Sc_cur;
         float* p_hat_8  = P_hat     + qi_inner * LQ_INNER * Sc_cur;
+        at::BFloat16* p_hat_bf16_8 = nullptr;
+        if constexpr (kPbf16PV) {
+          p_hat_bf16_8 = P_hat_bf16 + qi_inner * LQ_INNER * Sc_cur;
+        }
         float* o_acc_8  = O_acc     + qi_inner * LQ_INNER * p.Ev;
         float* rmax_8   = running_max + qi_inner * LQ_INNER;
         float* rsum_8   = running_sum + qi_inner * LQ_INNER;
@@ -839,67 +951,71 @@ inline void process_q_tile_lc_packqkv(
           }
         }
 
-        // ── 步骤 1: scores[Lq_eff][Sc_cur] = scale * Q · K^T ──
-        // packed 主路径：full 8x8 + s_global % 8 == 0 + 整 8-row K block 在 packed
-        //                buffer 内 → gemm_qkt_microkernel_8x8_bf16_packqk_seq4_bmajor_inner
-        // partial 路径（Lq_eff < 8 或 s_global 非 8 对齐 或 Sc_cur 末段）：
-        //                走 baseline qkt_8x4 / qkt_tail，读原始 K_orig。
-        int64_t s_off = 0;
-        alignas(64) float tmp_qkt[8 * 8];
-        for (; s_off + 8 <= Sc_cur; s_off += 8) {
-          const int64_t s_global = s_l2 + s_off;
-          const scalar_t* K_tile_orig = Krow0_orig + s_off * k_orig_stride_s;
-          const bool full_k_block = (s_global % 8 == 0)
-                                    && (s_global + 8 <= p.S);
-          if (Lq_eff == 8 && full_k_block) {
-            const uint16_t* K_seq = Krow0_packed
-                                    + (s_off / 8) * k_sblock_stride;
-            ::fused_cpp::sdpa_microkernels::
-                gemm_qkt_microkernel_8x8_bf16_packqk_seq4_bmajor_inner(
-                    Q_seq_inner, Qrow_inner, q_stride_l,
-                    K_seq, K_tile_orig, k_orig_stride_s,
-                    p.E, p.scale_f, tmp_qkt);
-            for (int i = 0; i < 8; ++i) {
-              std::memcpy(scores_8 + i * Sc_cur + s_off,
-                          tmp_qkt + i * 8, sizeof(float) * 8);
+        {
+          FUSED_CPP_SDPA_PROFILE_SCOPE(::fused_cpp::sdpa_profile::Slot::kQkt);
+          // ── 步骤 1: scores[Lq_eff][Sc_cur] = scale * Q · K^T ──
+          // packed 主路径：full 8x8 + s_global % 8 == 0 + 整 8-row K block 在 packed
+          //                buffer 内 → gemm_qkt_microkernel_8x8_bf16_packqk_seq4_bmajor_inner
+          // partial 路径（Lq_eff < 8 或 s_global 非 8 对齐 或 Sc_cur 末段）：
+          //                走 baseline qkt_8x4 / qkt_tail，读原始 K_orig。
+          int64_t s_off = 0;
+          alignas(64) float tmp_qkt[8 * 8];
+          for (; s_off + 8 <= Sc_cur; s_off += 8) {
+            const int64_t s_global = s_l2 + s_off;
+            const scalar_t* K_tile_orig = Krow0_orig + s_off * k_orig_stride_s;
+            const bool full_k_block = (s_global % 8 == 0)
+                                      && (s_global + 8 <= p.S);
+            if (Lq_eff == 8 && full_k_block) {
+              const uint16_t* K_seq = Krow0_packed
+                                      + (s_off / 8) * k_sblock_stride;
+              ::fused_cpp::sdpa_microkernels::
+                  gemm_qkt_microkernel_8x8_bf16_packqk_seq4_bmajor_inner(
+                      Q_seq_inner, Qrow_inner, q_stride_l,
+                      K_seq, K_tile_orig, k_orig_stride_s,
+                      p.E, p.scale_f, tmp_qkt);
+              for (int i = 0; i < 8; ++i) {
+                std::memcpy(scores_8 + i * Sc_cur + s_off,
+                            tmp_qkt + i * 8, sizeof(float) * 8);
+              }
+            } else {
+              // fall back：读原始 K，调 baseline qkt_tail
+              ::fused_cpp::sdpa_microkernels::gemm_qkt_tail(
+                  Qrow_inner, q_stride_l, K_tile_orig, k_orig_stride_s,
+                  p.E, p.scale_f,
+                  scores_8 + s_off, Sc_cur,
+                  Lq_eff, 8);
             }
-          } else {
-            // fall back：读原始 K，调 baseline qkt_tail
+          }
+          if (s_off + 4 <= Sc_cur) {
+            const scalar_t* K_tile_orig = Krow0_orig + s_off * k_orig_stride_s;
+            if (Lq_eff == 8) {
+              ::fused_cpp::sdpa_microkernels::gemm_qkt_8x4(
+                  Qrow_inner, q_stride_l, K_tile_orig, k_orig_stride_s,
+                  p.E, p.scale_f,
+                  scores_8 + s_off, Sc_cur);
+            } else {
+              ::fused_cpp::sdpa_microkernels::gemm_qkt_tail(
+                  Qrow_inner, q_stride_l, K_tile_orig, k_orig_stride_s,
+                  p.E, p.scale_f,
+                  scores_8 + s_off, Sc_cur,
+                  Lq_eff, 4);
+            }
+            s_off += 4;
+          }
+          if (s_off < Sc_cur) {
+            const scalar_t* K_tile_orig = Krow0_orig + s_off * k_orig_stride_s;
             ::fused_cpp::sdpa_microkernels::gemm_qkt_tail(
                 Qrow_inner, q_stride_l, K_tile_orig, k_orig_stride_s,
                 p.E, p.scale_f,
                 scores_8 + s_off, Sc_cur,
-                Lq_eff, 8);
+                Lq_eff, static_cast<int>(Sc_cur - s_off));
+            s_off = Sc_cur;
           }
-        }
-        if (s_off + 4 <= Sc_cur) {
-          const scalar_t* K_tile_orig = Krow0_orig + s_off * k_orig_stride_s;
-          if (Lq_eff == 8) {
-            ::fused_cpp::sdpa_microkernels::gemm_qkt_8x4(
-                Qrow_inner, q_stride_l, K_tile_orig, k_orig_stride_s,
-                p.E, p.scale_f,
-                scores_8 + s_off, Sc_cur);
-          } else {
-            ::fused_cpp::sdpa_microkernels::gemm_qkt_tail(
-                Qrow_inner, q_stride_l, K_tile_orig, k_orig_stride_s,
-                p.E, p.scale_f,
-                scores_8 + s_off, Sc_cur,
-                Lq_eff, 4);
-          }
-          s_off += 4;
-        }
-        if (s_off < Sc_cur) {
-          const scalar_t* K_tile_orig = Krow0_orig + s_off * k_orig_stride_s;
-          ::fused_cpp::sdpa_microkernels::gemm_qkt_tail(
-              Qrow_inner, q_stride_l, K_tile_orig, k_orig_stride_s,
-              p.E, p.scale_f,
-              scores_8 + s_off, Sc_cur,
-              Lq_eff, static_cast<int>(Sc_cur - s_off));
-          s_off = Sc_cur;
         }
 
         // ── 步骤 2: additive attention mask（与 process_q_tile_lc 同步）──
         if constexpr (kHasMask) {
+          FUSED_CPP_SDPA_PROFILE_SCOPE(::fused_cpp::sdpa_profile::Slot::kMask);
           for (int i = 0; i < Lq_eff; ++i) {
             const float* m_row = p.mask_ptr + b * m_stride_b
                                             + n * m_stride_n
@@ -922,6 +1038,7 @@ inline void process_q_tile_lc_packqkv(
 
         // ── 步骤 3: causal mask（与 process_q_tile_lc 同步）──
         if constexpr (kCausal) {
+          FUSED_CPP_SDPA_PROFILE_SCOPE(::fused_cpp::sdpa_profile::Slot::kMask);
           for (int i = 0; i < Lq_eff; ++i) {
             int64_t lim = causal_lim[qi_inner * LQ_INNER + i];
             float* sc_row = scores_8 + i * Sc_cur;
@@ -933,47 +1050,77 @@ inline void process_q_tile_lc_packqkv(
           }
         }
 
-        // ── 步骤 4–7: 逐行 online softmax（与 process_q_tile_lc 同步）──
-        float row_max[8];
-        for (int i = 0; i < 8; ++i) row_max[i] = p.neg_inf;
-        for (int i = 0; i < Lq_eff; ++i) {
-          const float* sc_row = scores_8 + i * Sc_cur;
-          float m = p.neg_inf;
-          int64_t j = 0;
+        float new_max[8];
+        {
+          FUSED_CPP_SDPA_PROFILE_SCOPE(::fused_cpp::sdpa_profile::Slot::kSoftmax);
+          // ── 步骤 4–7: 逐行 online softmax（与 process_q_tile_lc 同步）──
+          float row_max[8];
+          for (int i = 0; i < 8; ++i) row_max[i] = p.neg_inf;
+          for (int i = 0; i < Lq_eff; ++i) {
+            const float* sc_row = scores_8 + i * Sc_cur;
+            float m = p.neg_inf;
+            int64_t j = 0;
 #if FUSED_CPP_SDPA_CACHE_HAS_NEON
-          float32x4_t vm = vdupq_n_f32(p.neg_inf);
-          for (; j + 4 <= Sc_cur; j += 4) {
-            vm = vmaxq_f32(vm, vld1q_f32(sc_row + j));
-          }
-          m = vmaxvq_f32(vm);
+            float32x4_t vm = vdupq_n_f32(p.neg_inf);
+            for (; j + 4 <= Sc_cur; j += 4) {
+              vm = vmaxq_f32(vm, vld1q_f32(sc_row + j));
+            }
+            m = vmaxvq_f32(vm);
 #endif
-          for (; j < Sc_cur; ++j) {
-            if (sc_row[j] > m) m = sc_row[j];
+            for (; j < Sc_cur; ++j) {
+              if (sc_row[j] > m) m = sc_row[j];
+            }
+            row_max[i] = m;
           }
-          row_max[i] = m;
-        }
 
-        float new_max[8], correction[8];
-        for (int i = 0; i < Lq_eff; ++i) {
-          new_max[i] = std::max(rmax_8[i], row_max[i]);
-          correction[i] = std::exp(rmax_8[i] - new_max[i]);
-          rsum_8[i] *= correction[i];
-          scale_inplace_impl(o_acc_8 + i * p.Ev, correction[i], p.Ev);
-        }
+          float correction[8];
+          for (int i = 0; i < Lq_eff; ++i) {
+            new_max[i] = std::max(rmax_8[i], row_max[i]);
+            correction[i] = std::exp(rmax_8[i] - new_max[i]);
+            rsum_8[i] *= correction[i];
+            scale_inplace_impl(o_acc_8 + i * p.Ev, correction[i], p.Ev);
+          }
 
-        for (int i = 0; i < Lq_eff; ++i) {
-          const float* sc_row = scores_8 + i * Sc_cur;
-          float* p_row = p_hat_8 + i * Sc_cur;
-          float row_sum = vectorized_exp_minus_impl(
-              p_row, sc_row, new_max[i], Sc_cur);
-          rsum_8[i] += row_sum;
-        }
-        for (int i = Lq_eff; i < 8; ++i) {
-          std::memset(p_hat_8 + i * Sc_cur, 0, sizeof(float) * Sc_cur);
+          if constexpr (kPbf16PV) {
+            if (Lq_eff == 8) {
+              for (int i = 0; i < 8; ++i) {
+                const float* sc_row = scores_8 + i * Sc_cur;
+                at::BFloat16* p_row = p_hat_bf16_8 + i * Sc_cur;
+                float row_sum = vectorized_exp_minus_bf16_impl(
+                    p_row, sc_row, new_max[i], Sc_cur);
+                rsum_8[i] += row_sum;
+              }
+            } else {
+              for (int i = 0; i < Lq_eff; ++i) {
+                const float* sc_row = scores_8 + i * Sc_cur;
+                float* p_row = p_hat_8 + i * Sc_cur;
+                float row_sum = vectorized_exp_minus_impl(
+                    p_row, sc_row, new_max[i], Sc_cur);
+                rsum_8[i] += row_sum;
+              }
+              for (int i = Lq_eff; i < 8; ++i) {
+                std::memset(p_hat_8 + i * Sc_cur, 0, sizeof(float) * Sc_cur);
+              }
+            }
+          } else {
+            (void)p_hat_bf16_8;
+            for (int i = 0; i < Lq_eff; ++i) {
+              const float* sc_row = scores_8 + i * Sc_cur;
+              float* p_row = p_hat_8 + i * Sc_cur;
+              float row_sum = vectorized_exp_minus_impl(
+                  p_row, sc_row, new_max[i], Sc_cur);
+              rsum_8[i] += row_sum;
+            }
+            for (int i = Lq_eff; i < 8; ++i) {
+              std::memset(p_hat_8 + i * Sc_cur, 0, sizeof(float) * Sc_cur);
+            }
+          }
         }
 
         // ── 步骤 8: O_acc += P_hat · V（packed V 路径，固定 v_row_stride=8）──
-        for (int64_t ev_off = 0; ev_off < p.Ev; ev_off += 8) {
+        {
+          FUSED_CPP_SDPA_PROFILE_SCOPE(::fused_cpp::sdpa_profile::Slot::kPv);
+          for (int64_t ev_off = 0; ev_off < p.Ev; ev_off += 8) {
           if (ev_off + 8 < p.Ev) {
             const scalar_t* next_block =
                 Vbase + ((ev_off >> 3) + 1) * v_evblock_stride;
@@ -987,16 +1134,34 @@ inline void process_q_tile_lc_packqkv(
           const scalar_t* V_tile = Vbase + (ev_off >> 3) * v_evblock_stride;
           float* O_tile = o_acc_8 + ev_off;
 
-          if (Lq_eff == 8 && Ev_cur == 8) {
+          if constexpr (kPbf16PV) {
+            if (Lq_eff == 8 && Ev_cur == 8) {
+              ::fused_cpp::sdpa_microkernels::MK_QkPackqkSeq4BmajorPvPquad::
+                  pv_8x8_pbf16(
+                      p_hat_bf16_8, Sc_cur,
+                      V_tile, /*v_row_stride=*/8,
+                      Sc_cur,
+                      O_tile, p.Ev);
+            } else {
+              ::fused_cpp::sdpa_microkernels::MK_QkPackqkSeq4BmajorPvPquad::
+                  pv_tail(
+                      p_hat_8, Sc_cur,
+                      V_tile, /*v_row_stride=*/8,
+                      Sc_cur,
+                      O_tile, p.Ev,
+                      Lq_eff, static_cast<int>(Ev_cur));
+            }
+          } else if (Lq_eff == 8 && Ev_cur == 8) {
             // 直接调 MK_QkPackqkSeq4BmajorPvPquad 的 bf16 PV：bf16 V + bf16 PV pquad
             // microkernel（5/29 新增 gemm_pv_microkernel_8x8_bf16_pquad，远程 +24%）。
             // 与 packqkv 的 hardcoded QKᵀ packqk_seq4_bmajor_inner 是同一 trait 的 bf16
             // 组合，PV 选择对齐到 trait 后语义一致；数值与 baseline gemm_pv_8x8 等价。
-            ::fused_cpp::sdpa_microkernels::MK_QkPackqkSeq4BmajorPvPquad::pv_8x8(
-                p_hat_8, Sc_cur,
-                V_tile, /*v_row_stride=*/8,
-                Sc_cur,
-                O_tile, p.Ev);
+            ::fused_cpp::sdpa_microkernels::MK_QkPackqkSeq4BmajorPvPquad::
+                pv_8x8(
+                    p_hat_8, Sc_cur,
+                    V_tile, /*v_row_stride=*/8,
+                    Sc_cur,
+                    O_tile, p.Ev);
           } else {
             // tail（Lq_eff < 8 或 Ev_cur < 8）trait 内仍 fall through 到 baseline，
             // 但通过 trait 入口调用便于将来切换。
@@ -1006,6 +1171,7 @@ inline void process_q_tile_lc_packqkv(
                 Sc_cur,
                 O_tile, p.Ev,
                 Lq_eff, static_cast<int>(Ev_cur));
+          }
           }
         }
 
@@ -1017,26 +1183,29 @@ inline void process_q_tile_lc_packqkv(
     }    // s_l2
   }      // s_l3
 
-  // ── 归一化并写入 o_row（与 process_q_tile_lc 同步）──
-  for (int64_t i = 0; i < Lc_eff; ++i) {
-    float* o_row = p.out_ptr + b * o_stride_b + n * o_stride_n
-                             + (q0_outer + i) * o_stride_l;
-    if (running_sum[i] > 0.0f) {
-      const float inv_sum = 1.0f / running_sum[i];
-      int64_t ev = 0;
+  {
+    FUSED_CPP_SDPA_PROFILE_SCOPE(::fused_cpp::sdpa_profile::Slot::kFinalize);
+    // ── 归一化并写入 o_row（与 process_q_tile_lc 同步）──
+    for (int64_t i = 0; i < Lc_eff; ++i) {
+      float* o_row = p.out_ptr + b * o_stride_b + n * o_stride_n
+                               + (q0_outer + i) * o_stride_l;
+      if (running_sum[i] > 0.0f) {
+        const float inv_sum = 1.0f / running_sum[i];
+        int64_t ev = 0;
 #if FUSED_CPP_SDPA_CACHE_HAS_NEON
-      const float32x4_t vinv = vdupq_n_f32(inv_sum);
-      for (; ev + 4 <= p.Ev; ev += 4) {
-        float32x4_t v = vld1q_f32(O_acc + i * p.Ev + ev);
-        vst1q_f32(o_row + ev, vmulq_f32(v, vinv));
-      }
+        const float32x4_t vinv = vdupq_n_f32(inv_sum);
+        for (; ev + 4 <= p.Ev; ev += 4) {
+          float32x4_t v = vld1q_f32(O_acc + i * p.Ev + ev);
+          vst1q_f32(o_row + ev, vmulq_f32(v, vinv));
+        }
 #endif
-      for (; ev < p.Ev; ++ev) {
-        o_row[ev] = O_acc[i * p.Ev + ev] * inv_sum;
-      }
-    } else {
-      for (int64_t ev = 0; ev < p.Ev; ++ev) {
-        o_row[ev] = 0.0f;
+        for (; ev < p.Ev; ++ev) {
+          o_row[ev] = O_acc[i * p.Ev + ev] * inv_sum;
+        }
+      } else {
+        for (int64_t ev = 0; ev < p.Ev; ++ev) {
+          o_row[ev] = 0.0f;
+        }
       }
     }
   }
@@ -1046,7 +1215,8 @@ inline void process_q_tile_lc_packqkv(
 // run_path_collapse3_packqkv：路径 A 版本（KV fits L3）
 // ──────────────────────────────────────────────────────────────────────
 
-template <bool kHasMask = false, bool kCausal  = false>
+template <bool kHasMask = false, bool kCausal  = false,
+          bool kPbf16PV = false>
 inline void run_path_collapse3_packqkv(
     const at::BFloat16* q_ptr,
     const uint16_t* k_packed_ptr,
@@ -1076,6 +1246,12 @@ inline void run_path_collapse3_packqkv(
     const int64_t sc_max = std::max<int64_t>(8, Sc_l2);
     std::vector<float> scores_l1_vec(LQ_OUTER * sc_max);
     std::vector<float> P_hat_vec(LQ_OUTER * sc_max);
+    std::vector<at::BFloat16> P_hat_bf16_vec;
+    at::BFloat16* P_hat_bf16_ptr = nullptr;
+    if constexpr (kPbf16PV) {
+      P_hat_bf16_vec.resize(LQ_OUTER * sc_max);
+      P_hat_bf16_ptr = P_hat_bf16_vec.data();
+    }
     std::vector<float> O_acc_vec(LQ_OUTER * p.Ev);
     std::vector<float> running_max_vec(LQ_OUTER);
     std::vector<float> running_sum_vec(LQ_OUTER);
@@ -1089,7 +1265,7 @@ inline void run_path_collapse3_packqkv(
         for (int64_t qi_outer = 0; qi_outer < num_q_tiles; ++qi_outer) {
           const int64_t q0_outer = qi_outer * LQ_OUTER;
           const int64_t Lc_eff = std::min<int64_t>(LQ_OUTER, p.L - q0_outer);
-          process_q_tile_lc_packqkv<kHasMask, kCausal>(
+          process_q_tile_lc_packqkv<kHasMask, kCausal, kPbf16PV>(
               q_ptr, k_packed_ptr, k_orig_ptr, v_packed_ptr,
               b, n, q0_outer, Lc_eff, p,
               q_stride_b, q_stride_n, q_stride_l,
@@ -1100,7 +1276,8 @@ inline void run_path_collapse3_packqkv(
               m_stride_b, m_stride_n, m_stride_l,
               o_stride_b, o_stride_n, o_stride_l,
               ts,
-              scores_l1_vec.data(), P_hat_vec.data(), O_acc_vec.data(),
+              scores_l1_vec.data(), P_hat_vec.data(), P_hat_bf16_ptr,
+              O_acc_vec.data(),
               running_max_vec.data(), running_sum_vec.data(),
               q_seq_buf_vec.data());
         }
@@ -1117,7 +1294,8 @@ inline void run_path_collapse3_packqkv(
 // 开销）。本函数保留是为了对称完整，便于未来如果改主意时直接启用。
 // ──────────────────────────────────────────────────────────────────────
 
-template <bool kHasMask = false, bool kCausal  = false>
+template <bool kHasMask = false, bool kCausal  = false,
+          bool kPbf16PV = false>
 inline void run_path_taskloop_packqkv(
     const at::BFloat16* q_ptr,
     const uint16_t* k_packed_ptr,
@@ -1151,6 +1329,7 @@ inline void run_path_taskloop_packqkv(
 
   std::vector<std::vector<float>> scores_l1_pool(total_threads);
   std::vector<std::vector<float>> p_hat_pool(total_threads);
+  std::vector<std::vector<at::BFloat16>> p_hat_bf16_pool(total_threads);
   std::vector<std::vector<float>> o_acc_pool(total_threads);
   std::vector<std::vector<float>> rmax_pool(total_threads);
   std::vector<std::vector<float>> rsum_pool(total_threads);
@@ -1168,6 +1347,9 @@ inline void run_path_taskloop_packqkv(
 #endif
     scores_l1_pool[tid].assign(LQ_OUTER * sc_max, 0.0f);
     p_hat_pool[tid].assign(LQ_OUTER * sc_max, 0.0f);
+    if constexpr (kPbf16PV) {
+      p_hat_bf16_pool[tid].assign(LQ_OUTER * sc_max, at::BFloat16(0.0f));
+    }
     o_acc_pool[tid].assign(LQ_OUTER * p.Ev, 0.0f);
     rmax_pool[tid].assign(LQ_OUTER, 0.0f);
     rsum_pool[tid].assign(LQ_OUTER, 0.0f);
@@ -1195,7 +1377,11 @@ inline void run_path_taskloop_packqkv(
 #endif
             const int64_t q0_outer = qi_outer * LQ_OUTER;
             const int64_t Lc_eff = std::min<int64_t>(LQ_OUTER, p.L - q0_outer);
-            process_q_tile_lc_packqkv<kHasMask, kCausal>(
+            at::BFloat16* p_hat_bf16_ptr = nullptr;
+            if constexpr (kPbf16PV) {
+              p_hat_bf16_ptr = p_hat_bf16_pool[my_tid].data();
+            }
+            process_q_tile_lc_packqkv<kHasMask, kCausal, kPbf16PV>(
                 q_ptr, k_packed_ptr, k_orig_ptr, v_packed_ptr,
                 b, n, q0_outer, Lc_eff, p,
                 q_stride_b, q_stride_n, q_stride_l,
@@ -1208,6 +1394,7 @@ inline void run_path_taskloop_packqkv(
                 ts,
                 scores_l1_pool[my_tid].data(),
                 p_hat_pool[my_tid].data(),
+                p_hat_bf16_ptr,
                 o_acc_pool[my_tid].data(),
                 rmax_pool[my_tid].data(),
                 rsum_pool[my_tid].data(),

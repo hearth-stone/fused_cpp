@@ -19,6 +19,7 @@
   - [`flash2_neon_l3kv`](#flash2_neon_l3kv)
   - [`flash2_neon_l3kv_packv`](#flash2_neon_l3kv_packv)
   - [`flash2_neon_l3kv_packqkv`](#flash2_neon_l3kv_packqkv)
+  - [`flash2_neon_l3kv_packqkv_pbf16pv`](#flash2_neon_l3kv_packqkv_pbf16pv)
 - [Microkernel Trait（MK）](#microkernel-traitmk)
   - [`MK_Baseline`](#mk_baseline)
   - [`MK_Scalar`](#mk_scalar)
@@ -32,7 +33,7 @@
 
 ## 版本注册一览
 
-每个 SDPA 顶层变体（`flash2_neon_cache` / `flash2_neon_l3kv` / `flash2_neon_l3kv_packv`）会和**每一个 enabled MK trait**（baseline / scalar / pquad / qk_ublock4）组合生成一组带后缀的版本名，外加一个不带后缀的「历史名」绑定到 baseline。`l1_bfmlal_layout` 是自由 layout 的实验 trait，目前只接入 packv L3KV 拓扑。当前注册的 22 个名字：
+每个 SDPA 顶层变体（`flash2_neon_cache` / `flash2_neon_l3kv` / `flash2_neon_l3kv_packv`）会和**每一个 enabled MK trait**（baseline / scalar / pquad / qk_ublock4）组合生成一组带后缀的版本名，外加一个不带后缀的「历史名」绑定到 baseline。`l1_bfmlal_layout` 是自由 layout 的实验 trait，目前只接入 packv L3KV 拓扑。当前注册的 23 个名字：
 
 ```
 naive
@@ -61,6 +62,7 @@ flash2_neon_l3kv_packv_l1_bfmlal_layout
 flash2_neon_l3kv_l1_bfmlal_layout       ← = packv_l1_bfmlal_layout
 
 flash2_neon_l3kv_packqkv            ← Q + K + V 预 pack，bf16 BFMMLA 专用，单一注册（无 MK 后缀）
+flash2_neon_l3kv_packqkv_pbf16pv    ← softmax 直接产出 bf16 P scratch，PV 走 pv_8x8_pbf16
 ```
 
 新增 MK trait 或 SDPA 变体时，注册数量会按笛卡尔积扩张；具体注册位置见每个变体的 `csrc/sdpa_flash2_neon_*.cpp` 末尾。
@@ -186,6 +188,19 @@ flash2_neon_l3kv_packqkv            ← Q + K + V 预 pack，bf16 BFMMLA 专用�
   - 改 PV pquad 前（baseline PV）：L=1024 ≈ 54.5 GFLOPS（同 `packv_pquad`）
   - 改 PV pquad 后：L=256 57.6 / L=512 58.4 / **L=1024 59.3 GFLOPS**，端到端 +7~9% vs baseline；L=128 因 pack overhead 占比高略亏 ~2%
 - **建议使用条件**：bf16 prefill long-ctx（L=S ≥ 256），且 KV 装 L3，且 `S % 8 == 0` 且 `Ev % 8 == 0`。短 S（pack overhead 摊不薄）继续用 `flash2_neon_l3kv_packv_pquad`。
+
+---
+
+### `flash2_neon_l3kv_packqkv_pbf16pv`
+
+在 `flash2_neon_l3kv_packqkv` 的 Q/K/V pre-pack 拓扑上，softmax 仍用 fp32 计算 row sum / running sum，但把每个 full 8-row q block 的 `P_hat` 直接写成 bf16 scratch，然后 PV 调 `MK_QkPackqkSeq4BmajorPvPquad::pv_8x8_pbf16`。尾块仍回退 fp32 `P_hat` + `pv_tail`，fp32 输入仍 delegate 到 `flash2_neon_l3kv_packv_pquad`。
+
+- **文件**：`csrc/sdpa_flash2_neon_l3kv_packqkv.cpp`；核心分支在 `process_q_tile_lc_packqkv<..., kPbf16PV=true>`
+- **数值语义**：softmax 归一化分母保持 fp32；只有写给 PV 的概率矩阵降为 bf16。BGE-small-zh 形状旧/新最大绝对差约 `0.0009765625`。
+- **Arm-codex core80 单线程实测**：
+  - BGE-small-zh attention 形状 `B1-N8-L512-S512-E64-Ev64` bf16：non-causal `10.776 → 9.989 ms`（`50.80 → 54.79 GFLOPS`，+7.3%）；causal `12.389 → 11.317 ms`（`22.13 → 24.23 GFLOPS`，+9.5%）。
+  - 长序列 MLA 形状 `B1-N32-L2048-S2048-E192-Ev128` bf16：non-causal `1422.704 → 1276.547 ms`（`60.85 → 67.82 GFLOPS`，+11.5%）；causal `952.715 → 867.951 ms`（`45.46 → 49.89 GFLOPS`，+9.8%）。
+- **profile 组成**：BGE non-causal 下 PV `4.548 → 3.353 ms`，softmax `1.963 → 2.586 ms`；长序列 non-causal 下 PV `577.535 → 429.397 ms`，softmax `129.362 → 169.733 ms`。因此收益主要来自 PV，代价是 softmax 阶段多一次 bf16 store / conversion。
 
 ---
 
@@ -354,6 +369,7 @@ flash2_neon_l3kv_packqkv            ← Q + K + V 预 pack，bf16 BFMMLA 专用�
 
 | 日期 | 改动概述 | 受影响文件 |
 |---|---|---|
+| 2026-06-01 | **新增 SDPA 版本 `flash2_neon_l3kv_packqkv_pbf16pv`**：在 packqkv 的 Q/K/V pre-pack 路径上增加 `kPbf16PV` 模板开关，softmax 计算 fp32 sum 但把 full 8-row block 的 `P_hat` 直接写成 bf16 scratch，PV 改调 `pv_8x8_pbf16`，旧 `flash2_neon_l3kv_packqkv` 保持不变。SVE `FCVT/FCVTNT` 压缩 store 实测 softmax 过慢，最终 bf16-store helper 使用 NEON `vcvt_bf16_f32`。Arm-codex core80 单线程：BGE-small-zh 形状 bf16 non-causal 10.776→9.989 ms（+7.3%）、causal 12.389→11.317 ms（+9.5%）；`B1-N32-L2048-S2048-E192-Ev128` bf16 non-causal 1422.704→1276.547 ms（+11.5%）、causal 952.715→867.951 ms（+9.8%）。 | 改 `csrc/sdpa_flash2_neon_l3kv_impl.h`（新增 `vectorized_exp_minus_bf16_impl`、`process_q_tile_lc_packqkv` / run path 的 `kPbf16PV` 分支与 bf16 P scratch）；改 `csrc/sdpa_flash2_neon_l3kv_packqkv.cpp`（新增版本入口和注册）；改 `src/fused_cpp/sdpa.py`（metadata）；改 `tests/test_sdpa_versions_equiv.py`（packqkv 约束覆盖新版本）；改 `csrc/SDPA_VERSIONS.md` |
 | 2026-05-31 | **新增 SDPA 版本 `flash2_neon_l3kv_packv_l1_bfmlal_layout` 与别名 `flash2_neon_l3kv_l1_bfmlal_layout`**：在 packv L3KV 拓扑上接入 `MK_L1BfmlalLayout`，bf16 QKᵀ 8×8 使用 K_col BFMLAL microkernel，bf16 PV 对支持 `kHasPvPbf16` 的 trait 自动把 `P_hat` scratch 转 bf16 并调用 `pv_8x8_pbf16`。这版用于端到端评估 L1-only 85%+ peak 微内核的外层成本；fp32 仍走同 trait 的普通 fp32 fallback。Arm-codex core80 单线程 BGE-small-zh 形状 bf16：non-causal 12.682 ms（43.16 GFLOPS）vs packv 13.972 ms；causal 14.210 ms（19.30 GFLOPS）vs packv 15.176 ms。 | 改 `csrc/sdpa_flash2_neon_l3kv_impl.h`（增加 `pv_8x8_pbf16` trait 检测、P_hat_bf16 scratch 与 PV 分发）；改 `csrc/sdpa_flash2_neon_l3kv_packv.cpp`（注册新 SDPA 版本与别名）；改 `src/fused_cpp/sdpa.py`（Python registry metadata）；改 `csrc/SDPA_VERSIONS.md` |
 | 2026-05-31 | **新增 L1-only bf16 自由 layout 微内核 `l1_bfmlal_layout`，目标从 90% 调整为 85% 后达标**：新增 `pack_k_8rows_to_col_bf16` 把 K 从 `K[8][E]` 转成 reduce-major `K_col[E][8]`，并新增 `gemm_qkt_microkernel_8x8_bf16_qrow_kcol_bfmlal`，让 QKT 在 microkernel 层变成与 pre-bf16-P PV 相同的 BFMLAL lane 形态。该 trait 只做 L1 工作集上限评估，不考虑 SDPA 外层布局生产成本；`qkt_8x8_kcol` 直接计时 K_col 已由 caller 提供的纯布局路径。Arm-codex core80 单线程、E=Sk=768、iters=1,000,000：`qkt_8x8_kcol` 82.64 GFLOPS、`pv_8x8_pbf16` 82.62 GFLOPS，均约 89.8% of 92 GFLOPS，超过 85% 目标；`validate_microkernel` E/Sk=17/64/512 上 `qkt_8x8_max_abs=0`、`qkt_8x8_kcol_max_abs=0`、`pv_8x8_pbf16_max_abs=0`。 | 新建 `csrc/sdpa_microkernels/impls/mk_l1_bfmlal_layout.h`；改 `csrc/sdpa_microkernels/neon_cache_microkernels.h`（新增 K_col pack helper、QKT K_col BFMLAL 内核，并微调 pbf16 PV load/compute 交错）；改 `csrc/sdpa_microkernels/all_impls.h`、`csrc/sdpa_microkernels/mk_registry.cpp`（注册新 trait）；改 `csrc/sdpa_microkernels/mk_registry_helpers.h`（新增 `qkt_8x8_kcol` validate/bench 可选项）；改 `csrc/SDPA_VERSIONS.md`（新增 trait 章节、迭代表和 changelog） |
 | 2026-05-31 | **bf16 PV pquad 切 BFMLAL 快路径**：`gemm_pv_microkernel_8x8_bf16_pquad` 在 BF16 arithmetic 目标上优先派到新增 `gemm_pv_microkernel_8x8_bf16_pbf16_bfmlal`。每 4-k 段把 8 行 P_hat quad 用 `vcvt_bf16_f32` 临时 round 到 bf16，再用 `vbfmlalbq_lane_f32 / vbfmlaltq_lane_f32` 乘 bf16 V；主体避开 V widen，尾部 Sk%4 保持原 fp32 widen FMA。Arm-codex core80 单线程：`pquad` / `qk_packqk_seq4_bmajor_pv_pquad` 的 bf16 `pv_8x8` 在 Sk=128 从上一轮约 54.8 GFLOPS 提到 E64 59.10 / E128 59.52 / E192 58.68 GFLOPS，约 64–65% of 92 GFLOPS 单核峰值；`validate_microkernel` E=17/64/128/192 max_abs≈1.6e-6，小形状 SDPA 对 naive max_abs=0.0078125。仍未达到 90%，下一步重点是降低 BFMLAL 路径的 P convert / lane 指令开销，或改 PV 数据布局。 | 改 `csrc/sdpa_microkernels/neon_cache_microkernels.h`（新增 pbf16 BFMLAL PV 内核并接到 bf16 pquad）；改 `csrc/sdpa_microkernels/impls/mk_pquad.h`、`csrc/sdpa_microkernels/impls/mk_qk_packqk_seq4_bmajor_pv_pquad.h`（注释同步数值语义）；改 `csrc/SDPA_VERSIONS.md`（本节 + `MK_PQuad` / packqkv 记录） |

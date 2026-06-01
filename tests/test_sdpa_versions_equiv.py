@@ -70,7 +70,10 @@ def _check_capabilities(
     # ── flash2_neon_l3kv_packqkv 专属约束：S % 8 == 0 且 Ev % 8 == 0 ──
     # 不满足时入口 TORCH_CHECK 抛错；equiv 测试矩阵覆盖广，需要在 shape
     # 不兼容时主动 skip，让该版本仅在生产合法形状上参测。
-    if info.name == "flash2_neon_l3kv_packqkv":
+    if info.name in {
+        "flash2_neon_l3kv_packqkv",
+        "flash2_neon_l3kv_packqkv_pbf16pv",
+    }:
         if S % 8 != 0:
             pytest.skip(
                 f"{info.name} requires S % 8 == 0; got S={S}"

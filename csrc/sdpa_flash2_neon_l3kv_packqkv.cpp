@@ -97,25 +97,42 @@ void pack_v_to_evblock8_local(
 // 顶层入口：packqkv (bf16 path)
 // ──────────────────────────────────────────────────────────────────────
 
-void sdpa_flash2_neon_l3kv_packqkv_bf16_impl(const SdpaParams& p) {
+template <bool kPbf16PV>
+void sdpa_flash2_neon_l3kv_packqkv_bf16_impl_tmpl(
+    const SdpaParams& p,
+    const char* version_name) {
   TORCH_CHECK(p.dtype == SdpaDtype::kBFloat16,
               "packqkv bf16 path called with non-bf16 dtype");
   TORCH_CHECK(p.S % 8 == 0,
-              "flash2_neon_l3kv_packqkv requires S % 8 == 0, got S=", p.S,
+              version_name, " requires S % 8 == 0, got S=", p.S,
               "; please use flash2_neon_l3kv_packv for non-aligned S.");
   TORCH_CHECK(p.Ev % 8 == 0,
-              "flash2_neon_l3kv_packqkv requires Ev % 8 == 0, got Ev=", p.Ev);
+              version_name, " requires Ev % 8 == 0, got Ev=", p.Ev);
+  const bool profile_on = ::fused_cpp::sdpa_profile::enabled();
+  if (profile_on) {
+    ::fused_cpp::sdpa_profile::reset();
+  }
+  const uint64_t profile_total_t0 =
+      profile_on ? ::fused_cpp::sdpa_profile::now_ns() : 0;
 
   const auto* q_ptr = static_cast<const at::BFloat16*>(p.q_ptr);
   const auto* k_ptr = static_cast<const at::BFloat16*>(p.k_ptr);
   const auto* v_ptr = static_cast<const at::BFloat16*>(p.v_ptr);
 
   // ── 分配 packed V buffer ──
-  at::Tensor v_packed = at::empty(
-      {p.B, p.N, p.Ev / 8, p.S, 8},
-      at::TensorOptions().dtype(at::kBFloat16));
+  at::Tensor v_packed;
+  {
+    FUSED_CPP_SDPA_PROFILE_SCOPE(::fused_cpp::sdpa_profile::Slot::kVAlloc);
+    v_packed = at::empty(
+        {p.B, p.N, p.Ev / 8, p.S, 8},
+        at::TensorOptions().dtype(at::kBFloat16));
+  }
   auto* v_packed_ptr = static_cast<at::BFloat16*>(v_packed.data_ptr());
-  pack_v_to_evblock8_local<at::BFloat16>(v_ptr, v_packed_ptr, p.B, p.N, p.S, p.Ev);
+  {
+    FUSED_CPP_SDPA_PROFILE_SCOPE(::fused_cpp::sdpa_profile::Slot::kVPack);
+    pack_v_to_evblock8_local<at::BFloat16>(
+        v_ptr, v_packed_ptr, p.B, p.N, p.S, p.Ev);
+  }
 
   // ── strides ──
   const int64_t Eb = p.Ev / 8;
@@ -173,64 +190,95 @@ void sdpa_flash2_neon_l3kv_packqkv_bf16_impl(const SdpaParams& p) {
 
   // 用 BFloat16 dtype 分配（u16 兼容），元素数按 u16 算
   // 注意：at::empty 没有 kU16，用 BF16 alias，因为我们只关心字节数与对齐
-  at::Tensor k_packed = at::empty(
-      {k_packed_total_u16},
-      at::TensorOptions().dtype(at::kBFloat16));
+  at::Tensor k_packed;
+  {
+    FUSED_CPP_SDPA_PROFILE_SCOPE(::fused_cpp::sdpa_profile::Slot::kKAlloc);
+    k_packed = at::empty(
+        {k_packed_total_u16},
+        at::TensorOptions().dtype(at::kBFloat16));
+  }
   auto* k_packed_ptr = reinterpret_cast<uint16_t*>(k_packed.data_ptr());
 
-  ::fused_cpp::sdpa_microkernels::pack_k_to_seq8<at::BFloat16>(
-      k_ptr, k_packed_ptr, p.B, p.N, p.S, p.E);
+  {
+    FUSED_CPP_SDPA_PROFILE_SCOPE(::fused_cpp::sdpa_profile::Slot::kKPack);
+    ::fused_cpp::sdpa_microkernels::pack_k_to_seq8<at::BFloat16>(
+        k_ptr, k_packed_ptr, p.B, p.N, p.S, p.E);
+  }
 
   const int64_t k_sblock_stride = kblock_u16;            // u16 单位
   const int64_t k_packed_stride_n = S_blocks * kblock_u16;
   const int64_t k_packed_stride_b = p.N * k_packed_stride_n;
 
   // ── 4 路 (kHasMask, kCausal) 分发 ──
-  if (p.mask_ptr != nullptr) {
-    if (p.is_causal) {
-      run_path_collapse3_packqkv<true, true>(
-          q_ptr, k_packed_ptr, k_ptr, v_packed_ptr, p, ts,
-          q_stride_b, q_stride_n, q_stride_l,
-          k_orig_stride_b, k_orig_stride_n, k_orig_stride_s,
-          k_packed_stride_b, k_packed_stride_n, k_sblock_stride,
-          v_packed_stride_b, v_packed_stride_n, v_packed_stride_s,
-          v_evblock_stride,
-          m_stride_b, m_stride_n, m_stride_l,
-          o_stride_b, o_stride_n, o_stride_l);
+  {
+    FUSED_CPP_SDPA_PROFILE_SCOPE(::fused_cpp::sdpa_profile::Slot::kMain);
+    if (p.mask_ptr != nullptr) {
+      if (p.is_causal) {
+        run_path_collapse3_packqkv<true, true, kPbf16PV>(
+            q_ptr, k_packed_ptr, k_ptr, v_packed_ptr, p, ts,
+            q_stride_b, q_stride_n, q_stride_l,
+            k_orig_stride_b, k_orig_stride_n, k_orig_stride_s,
+            k_packed_stride_b, k_packed_stride_n, k_sblock_stride,
+            v_packed_stride_b, v_packed_stride_n, v_packed_stride_s,
+            v_evblock_stride,
+            m_stride_b, m_stride_n, m_stride_l,
+            o_stride_b, o_stride_n, o_stride_l);
+      } else {
+        run_path_collapse3_packqkv<true, false, kPbf16PV>(
+            q_ptr, k_packed_ptr, k_ptr, v_packed_ptr, p, ts,
+            q_stride_b, q_stride_n, q_stride_l,
+            k_orig_stride_b, k_orig_stride_n, k_orig_stride_s,
+            k_packed_stride_b, k_packed_stride_n, k_sblock_stride,
+            v_packed_stride_b, v_packed_stride_n, v_packed_stride_s,
+            v_evblock_stride,
+            m_stride_b, m_stride_n, m_stride_l,
+            o_stride_b, o_stride_n, o_stride_l);
+      }
     } else {
-      run_path_collapse3_packqkv<true, false>(
-          q_ptr, k_packed_ptr, k_ptr, v_packed_ptr, p, ts,
-          q_stride_b, q_stride_n, q_stride_l,
-          k_orig_stride_b, k_orig_stride_n, k_orig_stride_s,
-          k_packed_stride_b, k_packed_stride_n, k_sblock_stride,
-          v_packed_stride_b, v_packed_stride_n, v_packed_stride_s,
-          v_evblock_stride,
-          m_stride_b, m_stride_n, m_stride_l,
-          o_stride_b, o_stride_n, o_stride_l);
-    }
-  } else {
-    if (p.is_causal) {
-      run_path_collapse3_packqkv<false, true>(
-          q_ptr, k_packed_ptr, k_ptr, v_packed_ptr, p, ts,
-          q_stride_b, q_stride_n, q_stride_l,
-          k_orig_stride_b, k_orig_stride_n, k_orig_stride_s,
-          k_packed_stride_b, k_packed_stride_n, k_sblock_stride,
-          v_packed_stride_b, v_packed_stride_n, v_packed_stride_s,
-          v_evblock_stride,
-          m_stride_b, m_stride_n, m_stride_l,
-          o_stride_b, o_stride_n, o_stride_l);
-    } else {
-      run_path_collapse3_packqkv<false, false>(
-          q_ptr, k_packed_ptr, k_ptr, v_packed_ptr, p, ts,
-          q_stride_b, q_stride_n, q_stride_l,
-          k_orig_stride_b, k_orig_stride_n, k_orig_stride_s,
-          k_packed_stride_b, k_packed_stride_n, k_sblock_stride,
-          v_packed_stride_b, v_packed_stride_n, v_packed_stride_s,
-          v_evblock_stride,
-          m_stride_b, m_stride_n, m_stride_l,
-          o_stride_b, o_stride_n, o_stride_l);
+      if (p.is_causal) {
+        run_path_collapse3_packqkv<false, true, kPbf16PV>(
+            q_ptr, k_packed_ptr, k_ptr, v_packed_ptr, p, ts,
+            q_stride_b, q_stride_n, q_stride_l,
+            k_orig_stride_b, k_orig_stride_n, k_orig_stride_s,
+            k_packed_stride_b, k_packed_stride_n, k_sblock_stride,
+            v_packed_stride_b, v_packed_stride_n, v_packed_stride_s,
+            v_evblock_stride,
+            m_stride_b, m_stride_n, m_stride_l,
+            o_stride_b, o_stride_n, o_stride_l);
+      } else {
+        run_path_collapse3_packqkv<false, false, kPbf16PV>(
+            q_ptr, k_packed_ptr, k_ptr, v_packed_ptr, p, ts,
+            q_stride_b, q_stride_n, q_stride_l,
+            k_orig_stride_b, k_orig_stride_n, k_orig_stride_s,
+            k_packed_stride_b, k_packed_stride_n, k_sblock_stride,
+            v_packed_stride_b, v_packed_stride_n, v_packed_stride_s,
+            v_evblock_stride,
+            m_stride_b, m_stride_n, m_stride_l,
+            o_stride_b, o_stride_n, o_stride_l);
+      }
     }
   }
+  if (profile_on) {
+    ::fused_cpp::sdpa_profile::add(
+        ::fused_cpp::sdpa_profile::Slot::kTotal,
+        ::fused_cpp::sdpa_profile::now_ns() - profile_total_t0);
+    ::fused_cpp::sdpa_profile::print_summary(
+        version_name,
+        kPbf16PV ? "qk_packqk_seq4_bmajor_pv_pbf16_prepacked"
+                 : "qk_packqk_seq4_bmajor_pv_pquad",
+        p,
+        "A");
+  }
+}
+
+void sdpa_flash2_neon_l3kv_packqkv_bf16_impl(const SdpaParams& p) {
+  sdpa_flash2_neon_l3kv_packqkv_bf16_impl_tmpl<false>(
+      p, "flash2_neon_l3kv_packqkv");
+}
+
+void sdpa_flash2_neon_l3kv_packqkv_pbf16pv_bf16_impl(const SdpaParams& p) {
+  sdpa_flash2_neon_l3kv_packqkv_bf16_impl_tmpl<true>(
+      p, "flash2_neon_l3kv_packqkv_pbf16pv");
 }
 
 void sdpa_flash2_neon_l3kv_packqkv_entry(const SdpaParams& p) {
@@ -244,7 +292,17 @@ void sdpa_flash2_neon_l3kv_packqkv_entry(const SdpaParams& p) {
   sdpa_flash2_neon_l3kv_packqkv_bf16_impl(p);
 }
 
+void sdpa_flash2_neon_l3kv_packqkv_pbf16pv_entry(const SdpaParams& p) {
+  if (p.dtype != SdpaDtype::kBFloat16) {
+    sdpa_dispatch("flash2_neon_l3kv_packv_pquad", p);
+    return;
+  }
+  sdpa_flash2_neon_l3kv_packqkv_pbf16pv_bf16_impl(p);
+}
+
 }  // anonymous namespace
 
 REGISTER_SDPA_VERSION("flash2_neon_l3kv_packqkv",
                       sdpa_flash2_neon_l3kv_packqkv_entry);
+REGISTER_SDPA_VERSION("flash2_neon_l3kv_packqkv_pbf16pv",
+                      sdpa_flash2_neon_l3kv_packqkv_pbf16pv_entry);

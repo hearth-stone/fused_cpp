@@ -292,6 +292,16 @@ def _collect_kleidiai_sources(kai_root):
     return result_files
 
 
+def _host_cpu_has_flag(flag: str) -> bool:
+    """Best-effort Linux host CPU flag probe for native optional features."""
+    try:
+        with open("/proc/cpuinfo", "r", encoding="utf-8", errors="ignore") as f:
+            text = f.read().lower()
+    except OSError:
+        return False
+    return flag.lower() in text.replace("\n", " ").split()
+
+
 sources = sorted(glob.glob("csrc/**/*.cpp", recursive=True))
 is_aarch64 = platform.machine() in ("aarch64", "arm64")
 acl_available, acl_include_dirs, acl_library_dirs = _detect_acl()
@@ -329,8 +339,9 @@ if omp_available:
 #     BF16 + MATMUL_INT8 能力，配合本仓库 sdpa_flash2_neon_cache.cpp 中
 #     针对 Apple clang 的特殊判定（不依赖 __ARM_FEATURE_MATMUL_FP），可正常
 #     生成 bfmmla 指令。M1 不支持 BF16，需显式覆盖。
-#   * Linux aarch64：默认 -march=armv8.6-a+bf16+i8mm，覆盖 GCC 10+ /
-#     LLVM 12+ 生成 bfmmla / i8mm 所需的全部 feature。
+#   * Linux aarch64：默认 -march=armv8.6-a+bf16+i8mm；若宿主
+#     /proc/cpuinfo 暴露 sve，则自动升级为 -march=armv8.6-a+sve+bf16+i8mm，
+#     让 SDPA softmax exp 走 SVE poly6。
 #
 # 用户可通过环境变量 FUSED_CPP_TARGET_CPU 覆盖，例如：
 #   FUSED_CPP_TARGET_CPU=apple-m1   → 退回 widen+FMLA 路径，兼容 M1
@@ -346,7 +357,10 @@ if is_aarch64:
     elif platform.system() == "Darwin":
         extra_compile_args.append("-mcpu=apple-m2")
     else:
-        extra_compile_args.append("-march=armv8.6-a+bf16+i8mm")
+        features = ["bf16", "i8mm"]
+        if _host_cpu_has_flag("sve"):
+            features.insert(0, "sve")
+        extra_compile_args.append("-march=armv8.6-a+" + "+".join(features))
     extra_compile_args.append("-O3")
 
 if use_acl:

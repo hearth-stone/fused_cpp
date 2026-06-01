@@ -29,6 +29,7 @@ The remote Python environment is managed by `uv`.
 
 - Activate script: `/home/zhangxu/codex/fused_cpp/.venv/bin/activate`
 - Python executable: `/home/zhangxu/codex/fused_cpp/.venv/bin/python`
+- Package manager: `uv`
 
 Prefer the explicit Python executable in non-interactive SSH commands, for example:
 
@@ -39,10 +40,17 @@ ssh Arm-codex 'cd /home/zhangxu/codex/fused_cpp && .venv/bin/python -c "from fus
 Avoid relying on the remote system `python`; it may not match the virtualenv ABI used
 to build `fused_cpp._C`.
 
+Install missing benchmark or analysis packages with `uv` when needed. Keep packages in
+the project-local virtualenv instead of using system Python, for example:
+
+```bash
+ssh Arm-codex 'cd /home/zhangxu/codex/fused_cpp && uv pip install <package>'
+```
+
 ### Benchmark Hygiene
 
-For single-thread microbenchmarks, bind the process to core 80 with `taskset` and
-pin both Python and native libraries to one thread:
+For single-thread microbenchmarks, bind each process to one dedicated core with
+`taskset` and pin both Python and native libraries to one thread:
 
 ```bash
 OMP_NUM_THREADS=1 OMP_DYNAMIC=FALSE OMP_PROC_BIND=close \
@@ -50,7 +58,12 @@ MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 \
 taskset -c 80 <command>
 ```
 
-Put `taskset -c 80` immediately before the Python or shell entrypoint, for example:
+The independent benchmark cores are `0`, `80`, `160`, and `240`. These four cores can
+run separate benchmark processes at the same time. Use one benchmark process per core
+and record the core id with the result. Do not put two single-thread benchmarks on the
+same core.
+
+Put `taskset -c <core>` immediately before the Python or shell entrypoint, for example:
 
 ```bash
 OMP_NUM_THREADS=1 OMP_DYNAMIC=FALSE OMP_PROC_BIND=close \
@@ -61,6 +74,14 @@ taskset -c 80 .venv/bin/python tests/bench_microkernel_qkt.py
 When comparing measured GFLOP/s with peak, use the single-core reference values below.
 If a reported single-thread result is above the relevant peak, first check whether the
 thread count, OpenMP runtime, or benchmark FLOP formula is misleading.
+
+### Optimization Log
+
+Record every optimization attempt in the unified file `csrc/SDPA_VERSIONS.md`, even
+when the result does not improve performance. Each entry should include the date,
+kernel/version, hypothesis, exact benchmark command, core id, before/after numbers,
+and the conclusion. This prevents repeating optimizations that were already measured
+and found ineffective.
 
 ## Remote Peak FLOPs Reference
 

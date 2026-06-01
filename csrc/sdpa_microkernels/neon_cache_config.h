@@ -12,6 +12,14 @@
 #endif
 #endif
 
+#ifndef FUSED_CPP_SDPA_CACHE_HAS_SVE
+#if defined(__aarch64__) && defined(__ARM_FEATURE_SVE)
+#define FUSED_CPP_SDPA_CACHE_HAS_SVE 1
+#else
+#define FUSED_CPP_SDPA_CACHE_HAS_SVE 0
+#endif
+#endif
+
 #ifndef FUSED_CPP_SDPA_CACHE_HAS_BF16
 // 不同 GCC 版本的 ACLE 实现有差异：
 //   * GCC 13+ / Clang：定义聚合宏 ``__ARM_FEATURE_BF16``。

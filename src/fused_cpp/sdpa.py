@@ -403,6 +403,29 @@ _CPP_VERSION_META: dict = {
             "bf16_only",
         ),
     ),
+    "flash2_neon_l3kv_packqkv_pbf16pv": dict(
+        description=(
+            "Experimental packqkv variant that keeps the same packed Q/K/V "
+            "layout as flash2_neon_l3kv_packqkv, but writes softmax P_hat "
+            "directly to bf16 scratch and feeds pv_8x8_pbf16. The row sum "
+            "and output normalization remain fp32; fp32 input still delegates "
+            "to flash2_neon_l3kv_packv_pquad."
+        ),
+        tags=(
+            "flash",
+            "online_softmax",
+            "fa2",
+            "neon",
+            "cache_aware",
+            "multi_thread",
+            "l3_kv_resident",
+            "packed_k",
+            "packed_q",
+            "packed_v",
+            "pbf16",
+            "bf16_only",
+        ),
+    ),
     "flash2_neon_l3kv_packv_l1_bfmlal_layout": dict(
         description=(
             "Experimental L3KV packv SDPA using MK_L1BfmlalLayout: V is "

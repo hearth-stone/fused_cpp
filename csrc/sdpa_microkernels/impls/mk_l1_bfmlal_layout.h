@@ -13,6 +13,7 @@
 
 #include "../neon_cache_config.h"
 #include "../neon_cache_microkernels.h"
+#include "../../sdpa_profile.h"
 
 #ifndef FUSED_CPP_MK_ENABLE_L1_BFMLAL_LAYOUT
 #define FUSED_CPP_MK_ENABLE_L1_BFMLAL_LAYOUT 1
@@ -38,6 +39,8 @@ struct MK_L1BfmlalLayout {
     static thread_local int64_t last_E = 0;
 
     if (K != last_K || k_row_stride != last_k_row_stride || E != last_E) {
+      FUSED_CPP_SDPA_PROFILE_DEEP_SCOPE(
+          ::fused_cpp::sdpa_profile::Slot::kKColPack);
       k_col_buf.resize(static_cast<size_t>(8 * E));
       pack_k_8rows_to_col_bf16(K, k_row_stride, E, k_col_buf.data());
       last_K = K;
@@ -45,8 +48,12 @@ struct MK_L1BfmlalLayout {
       last_E = E;
     }
 
-    gemm_qkt_microkernel_8x8_bf16_qrow_kcol_bfmlal(
-        Q, q_row_stride, k_col_buf.data(), E, scale, scores_buf);
+    {
+      FUSED_CPP_SDPA_PROFILE_DEEP_SCOPE(
+          ::fused_cpp::sdpa_profile::Slot::kQktMicro);
+      gemm_qkt_microkernel_8x8_bf16_qrow_kcol_bfmlal(
+          Q, q_row_stride, k_col_buf.data(), E, scale, scores_buf);
+    }
 #else
     gemm_qkt_8x8(Q, q_row_stride, K, k_row_stride, E, scale, scores_buf);
 #endif
