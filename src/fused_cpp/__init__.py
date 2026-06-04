@@ -27,6 +27,11 @@ from fused_cpp.sdpa import (
     scaled_dot_product_attention,
     sdpa_versioned,
 )
+from fused_cpp.sparse_mla import (
+    flash_mla_sparse_fwd_naive,
+    sparse_mla,
+    sparse_mla_naive,
+)
 from fused_cpp.w4a8_linear import (
     unpack_awq_qweight,
     unpack_awq_qzeros,
@@ -56,6 +61,7 @@ __all__ = [
     "available_sdpa_versions",
     "create_acl_gemm",
     "create_kai_gemm",
+    "flash_mla_sparse_fwd_naive",
     "get_acl_affinity",
     "get_sdpa_version",
     "has_cpp_kernels",
@@ -65,6 +71,8 @@ __all__ = [
     "scaled_dot_product_attention",
     "sdpa_versioned",
     "set_acl_affinity",
+    "sparse_mla",
+    "sparse_mla_naive",
     "unpack_awq_qweight",
     "unpack_awq_qzeros",
     "w4a8_linear",
