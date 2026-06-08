@@ -280,12 +280,32 @@ static inline void pack_mqa_v_to_evblock8(
   }
 }
 
+static inline void store_normalized_bf16_row(
+    at::BFloat16* dst,
+    const float* src,
+    float scale,
+    int64_t len) {
+  int64_t i = 0;
+#if FUSED_CPP_SDPA_CACHE_HAS_NEON && FUSED_CPP_SDPA_CACHE_HAS_BF16
+  const float32x4_t vscale = vdupq_n_f32(scale);
+  auto* dst_bf16 = reinterpret_cast<bfloat16_t*>(dst);
+  for (; i + 4 <= len; i += 4) {
+    const float32x4_t v = vld1q_f32(src + i);
+    vst1_bf16(dst_bf16 + i, vcvt_bf16_f32(vmulq_f32(v, vscale)));
+  }
+#endif
+  for (; i < len; ++i) {
+    dst[i] = static_cast<at::BFloat16>(src[i] * scale);
+  }
+}
+
 template <bool kReturnStats>
 static inline void run_path_qtile_heads_packqkv_mqa(
     const at::BFloat16* q_ptr,
     const uint16_t* k_packed_ptr,
     const at::BFloat16* k_orig_ptr,
     const at::BFloat16* v_packed_ptr,
+    at::BFloat16* out_ptr,
     const SdpaParams& p,
     const ::fused_cpp::sdpa_tile_sizes::TileSizes& ts,
     int64_t q_stride_b,
@@ -598,13 +618,14 @@ static inline void run_path_qtile_heads_packqkv_mqa(
             ::fused_cpp::sdpa_profile::Slot::kFinalize);
         for (int64_t n = 0; n < p.N; ++n) {
           const float* o_acc_head = o_acc_vec.data() + n * per_head_o_acc;
-          const float* rmax_head = running_max_vec.data() + n * per_head_state;
           const float* rsum_head = running_sum_vec.data() + n * per_head_state;
           for (int64_t row = 0; row < lc_eff; ++row) {
             const int64_t q = q0_outer + row;
-            float* o_row =
-                p.out_ptr + b * o_stride_b + n * o_stride_n + q * o_stride_l;
+            at::BFloat16* o_row =
+                out_ptr + b * o_stride_b + n * o_stride_n + q * o_stride_l;
             if constexpr (kReturnStats) {
+              const float* rmax_head =
+                  running_max_vec.data() + n * per_head_state;
               const int64_t stats_idx = b * (p.N * p.L) + n * p.L + q;
               if (p.max_logits_ptr != nullptr) {
                 p.max_logits_ptr[stats_idx] = rmax_head[row];
@@ -618,20 +639,10 @@ static inline void run_path_qtile_heads_packqkv_mqa(
             }
             if (rsum_head[row] > 0.0f) {
               const float inv_sum = 1.0f / rsum_head[row];
-              int64_t ev = 0;
-#if FUSED_CPP_SDPA_CACHE_HAS_NEON
-              const float32x4_t vinv = vdupq_n_f32(inv_sum);
-              for (; ev + 4 <= p.Ev; ev += 4) {
-                const float32x4_t v =
-                    vld1q_f32(o_acc_head + row * p.Ev + ev);
-                vst1q_f32(o_row + ev, vmulq_f32(v, vinv));
-              }
-#endif
-              for (; ev < p.Ev; ++ev) {
-                o_row[ev] = o_acc_head[row * p.Ev + ev] * inv_sum;
-              }
+              store_normalized_bf16_row(
+                  o_row, o_acc_head + row * p.Ev, inv_sum, p.Ev);
             } else {
-              std::fill(o_row, o_row + p.Ev, 0.0f);
+              std::fill(o_row, o_row + p.Ev, at::BFloat16(0.0f));
             }
           }
         }
@@ -715,9 +726,7 @@ static inline bool run_dense_packqkv_mqa_fast_path(
         d_v);
   }
 
-  at::Tensor output_fp32 = at::empty(
-      {s_q, h_q, d_v},
-      q.options().dtype(at::kFloat));
+  at::BFloat16* out_ptr = output.data_ptr<at::BFloat16>();
   at::Tensor max_sdpa;
   at::Tensor lse_sdpa;
   if constexpr (kReturnStats) {
@@ -745,7 +754,7 @@ static inline bool run_dense_packqkv_mqa_fast_path(
   p.k_ptr = kv_base;
   p.v_ptr = kv_base;
   p.mask_ptr = nullptr;
-  p.out_ptr = output_fp32.data_ptr<float>();
+  p.out_ptr = nullptr;
   if constexpr (kReturnStats) {
     p.max_logits_ptr = max_sdpa.data_ptr<float>();
     p.lse_ptr = lse_sdpa.data_ptr<float>();
@@ -784,6 +793,7 @@ static inline bool run_dense_packqkv_mqa_fast_path(
         k_packed_ptr,
         kv_base,
         v_packed.data_ptr<at::BFloat16>(),
+        out_ptr,
         p,
         ts,
         q_stride_b,
@@ -807,7 +817,6 @@ static inline bool run_dense_packqkv_mqa_fast_path(
         o_stride_l);
   }
 
-  output.copy_(output_fp32.to(q.scalar_type()));
   if constexpr (kReturnStats) {
     max_logits->copy_(max_sdpa.squeeze(0).permute({1, 0}));
     lse->copy_(lse_sdpa.squeeze(0).permute({1, 0}));
@@ -1466,7 +1475,10 @@ py::object flash_mla_sparse_fwd(
     sink_ptr = &sink_c;
   }
 
-  at::Tensor output_tmp = at::empty({q.size(0), q.size(1), d_v}, q.options());
+  const bool direct_out = out.has_value() && out.value().is_contiguous();
+  at::Tensor output_compute =
+      direct_out ? out.value()
+                 : at::empty({q.size(0), q.size(1), d_v}, q.options());
   at::Tensor max_logits;
   at::Tensor lse;
   if (return_stats) {
@@ -1481,12 +1493,10 @@ py::object flash_mla_sparse_fwd(
   }
 
   const auto finish = [&]() -> py::object {
-    at::Tensor output_result;
-    if (out.has_value()) {
-      out.value().copy_(output_tmp);
+    at::Tensor output_result = output_compute;
+    if (out.has_value() && !direct_out) {
+      out.value().copy_(output_compute);
       output_result = out.value();
-    } else {
-      output_result = output_tmp;
     }
     py::gil_scoped_acquire gil;
     if (return_stats) {
@@ -1503,7 +1513,7 @@ py::object flash_mla_sparse_fwd(
             static_cast<float>(sm_scale),
             d_v,
             sink_ptr,
-            output_tmp,
+            output_compute,
             &max_logits,
             &lse)) {
       return finish();
@@ -1516,7 +1526,7 @@ py::object flash_mla_sparse_fwd(
             static_cast<float>(sm_scale),
             d_v,
             sink_ptr,
-            output_tmp,
+            output_compute,
             nullptr,
             nullptr)) {
       return finish();
@@ -1532,7 +1542,7 @@ py::object flash_mla_sparse_fwd(
           sink_ptr,
           static_cast<float>(sm_scale),
           d_v,
-          output_tmp,
+          output_compute,
           max_logits,
           lse);
     } else {
@@ -1543,7 +1553,7 @@ py::object flash_mla_sparse_fwd(
           sink_ptr,
           static_cast<float>(sm_scale),
           d_v,
-          output_tmp,
+          output_compute,
           max_logits,
           lse);
     }
@@ -1556,7 +1566,7 @@ py::object flash_mla_sparse_fwd(
           sink_ptr,
           static_cast<float>(sm_scale),
           d_v,
-          output_tmp,
+          output_compute,
           max_logits,
           lse);
     } else {
@@ -1567,7 +1577,7 @@ py::object flash_mla_sparse_fwd(
           sink_ptr,
           static_cast<float>(sm_scale),
           d_v,
-          output_tmp,
+          output_compute,
           max_logits,
           lse);
     }
