@@ -32,6 +32,10 @@ at::Tensor scaled_dot_product_attention_versioned(
     c10::optional<at::Tensor> attn_mask, double dropout_p,
     bool is_causal, c10::optional<double> scale, bool enable_gqa,
     std::string version);
+at::Tensor multi_query_attention(
+    at::Tensor query, at::Tensor key, at::Tensor value,
+    c10::optional<at::Tensor> attn_mask, double dropout_p,
+    bool is_causal, c10::optional<double> scale);
 std::vector<std::string> list_sdpa_versions();
 std::map<std::string, double> validate_sdpa_flash2_neon_cache_microkernels(
     std::string dtype, int64_t E, int64_t Sk);
@@ -85,6 +89,62 @@ int64_t create_kai_gemm_handler(at::Tensor packed_weight,
 void kai_gemm(at::Tensor output, at::Tensor input,
               int64_t handler_ptr, int64_t pool_handle);
 void release_kai_gemm_handler(int64_t handler_ptr);
+
+// BF16 tiled fused MoE declarations — fused_moe_bf16_tiled.cpp
+std::tuple<at::Tensor, int64_t, int64_t, at::Tensor, int64_t, int64_t>
+fused_moe_bf16_tiled_prepare_weights(at::Tensor w13_weight,
+                                      at::Tensor w2_weight);
+at::Tensor fused_moe_bf16_tiled(at::Tensor input,
+                                at::Tensor w13_packed,
+                                int64_t w13_K,
+                                int64_t w13_N,
+                                at::Tensor w2_packed,
+                                int64_t w2_K,
+                                int64_t w2_N,
+                                at::Tensor topk_weights,
+                                at::Tensor topk_ids,
+                                c10::optional<at::Tensor> w13_bias,
+                                c10::optional<at::Tensor> w2_bias,
+                                int64_t num_threads,
+                                std::string activation,
+                                int64_t global_num_experts,
+                                bool skip_weighted);
+
+// DeepSeek V4 attn_gemm_parallel_execute fused GEMM declarations
+std::tuple<at::Tensor, int64_t, int64_t>
+fused_wqa_wkv_compressor_kv_score_indexer_compressor_kv_score_indexer_weights_proj_fused_prepare(
+    at::Tensor weight);
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+fused_wqa_wkv_compressor_kv_score_indexer_compressor_kv_score_indexer_weights_proj_fused(
+    at::Tensor hidden_states,
+    at::Tensor fused_wqa_wkv_packed,
+    int64_t fused_wqa_wkv_K,
+    int64_t fused_wqa_wkv_N,
+    at::Tensor compressor_kv_score_packed,
+    int64_t compressor_kv_score_K,
+    int64_t compressor_kv_score_N,
+    at::Tensor indexer_compressor_kv_score_packed,
+    int64_t indexer_compressor_kv_score_K,
+    int64_t indexer_compressor_kv_score_N,
+    at::Tensor indexer_weights_proj_packed,
+    int64_t indexer_weights_proj_K,
+    int64_t indexer_weights_proj_N);
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+fused_wqa_wkv_compressor_kv_score_indexer_compressor_kv_score_indexer_weights_proj_fused_mt(
+    at::Tensor hidden_states,
+    at::Tensor fused_wqa_wkv_packed,
+    int64_t fused_wqa_wkv_K,
+    int64_t fused_wqa_wkv_N,
+    at::Tensor compressor_kv_score_packed,
+    int64_t compressor_kv_score_K,
+    int64_t compressor_kv_score_N,
+    at::Tensor indexer_compressor_kv_score_packed,
+    int64_t indexer_compressor_kv_score_K,
+    int64_t indexer_compressor_kv_score_N,
+    at::Tensor indexer_weights_proj_packed,
+    int64_t indexer_weights_proj_K,
+    int64_t indexer_weights_proj_N,
+    std::vector<int64_t> core_ids);
 
 // ACL affinity forward declarations — acl_affinity.cpp
 void set_acl_thread_affinity(int64_t core_start, int64_t core_end,
@@ -162,6 +222,15 @@ PYBIND11_MODULE(_C, m) {
           py::arg("enable_gqa") = false,
           py::arg("version"));
 
+    m.def("multi_query_attention", &multi_query_attention,
+          "Dense MQA attention with shared single-head K/V",
+          py::arg("query"), py::arg("key"), py::arg("value"),
+          py::arg("attn_mask") = c10::nullopt,
+          py::arg("dropout_p") = 0.0,
+          py::arg("is_causal") = false,
+          py::arg("scale") = c10::nullopt,
+          py::call_guard<py::gil_scoped_release>());
+
     m.def("list_sdpa_versions", &list_sdpa_versions,
           "Return the list of registered SDPA version names");
 
@@ -223,6 +292,53 @@ PYBIND11_MODULE(_C, m) {
     m.def("has_openmp", &has_openmp,
           "Return True if the C++ extension was linked with OpenMP.");
 
+    m.def("fused_wqa_wkv_compressor_kv_score_indexer_compressor_kv_score_indexer_weights_proj_fused_prepare",
+          &fused_wqa_wkv_compressor_kv_score_indexer_compressor_kv_score_indexer_weights_proj_fused_prepare,
+          "Pack one bf16 [K, N] weight for the DeepSeek V4 4-GEMM fused path.",
+          py::arg("weight"),
+          py::call_guard<py::gil_scoped_release>());
+
+    m.def("fused_wqa_wkv_compressor_kv_score_indexer_compressor_kv_score_indexer_weights_proj_fused",
+          &fused_wqa_wkv_compressor_kv_score_indexer_compressor_kv_score_indexer_weights_proj_fused,
+          "Serial DeepSeek V4 attn_gemm_parallel_execute fused path: "
+          "fused_wqa_wkv bf16, compressor_kv_score fp32, "
+          "indexer_compressor_kv_score fp32, indexer_weights_proj bf16.",
+          py::arg("hidden_states"),
+          py::arg("fused_wqa_wkv_packed"),
+          py::arg("fused_wqa_wkv_K"),
+          py::arg("fused_wqa_wkv_N"),
+          py::arg("compressor_kv_score_packed"),
+          py::arg("compressor_kv_score_K"),
+          py::arg("compressor_kv_score_N"),
+          py::arg("indexer_compressor_kv_score_packed"),
+          py::arg("indexer_compressor_kv_score_K"),
+          py::arg("indexer_compressor_kv_score_N"),
+          py::arg("indexer_weights_proj_packed"),
+          py::arg("indexer_weights_proj_K"),
+          py::arg("indexer_weights_proj_N"),
+          py::call_guard<py::gil_scoped_release>());
+
+    m.def("fused_wqa_wkv_compressor_kv_score_indexer_compressor_kv_score_indexer_weights_proj_fused_mt",
+          &fused_wqa_wkv_compressor_kv_score_indexer_compressor_kv_score_indexer_weights_proj_fused_mt,
+          "OpenMP DeepSeek V4 attn_gemm_parallel_execute fused path. "
+          "core_ids controls thread count and per-thread CPU affinity; "
+          "rows are split into contiguous ceil(M / len(core_ids)) chunks.",
+          py::arg("hidden_states"),
+          py::arg("fused_wqa_wkv_packed"),
+          py::arg("fused_wqa_wkv_K"),
+          py::arg("fused_wqa_wkv_N"),
+          py::arg("compressor_kv_score_packed"),
+          py::arg("compressor_kv_score_K"),
+          py::arg("compressor_kv_score_N"),
+          py::arg("indexer_compressor_kv_score_packed"),
+          py::arg("indexer_compressor_kv_score_K"),
+          py::arg("indexer_compressor_kv_score_N"),
+          py::arg("indexer_weights_proj_packed"),
+          py::arg("indexer_weights_proj_K"),
+          py::arg("indexer_weights_proj_N"),
+          py::arg("core_ids"),
+          py::call_guard<py::gil_scoped_release>());
+
     // ── ACL GEMM 接口 ──
 #if defined(__aarch64__) && defined(FUSED_CPP_HAS_ACL)
     m.def("create_acl_gemm_handler", &create_acl_gemm_handler,
@@ -279,5 +395,36 @@ PYBIND11_MODULE(_C, m) {
     m.def("release_kai_gemm_handler", &release_kai_gemm_handler,
           "Release KAI GEMM handler and free resources",
           py::arg("handler_ptr"));
+#endif
+
+    // ── BF16 tiled fused MoE ──
+#ifdef __aarch64__
+    m.def("fused_moe_bf16_tiled_prepare_weights",
+          &fused_moe_bf16_tiled_prepare_weights,
+          "Pack BF16 MoE expert weights for the BF16 tiled fused MoE path.",
+          py::arg("w13_weight"), py::arg("w2_weight"),
+          py::call_guard<py::gil_scoped_release>());
+
+    m.def("fused_moe_bf16_tiled",
+          &fused_moe_bf16_tiled,
+          "Run BF16 tiled fused MoE. Expert route groups are split "
+          "into <=16-token tiles and assigned to a fixed thread count by "
+          "routed-token load.",
+          py::arg("input"),
+          py::arg("w13_packed"),
+          py::arg("w13_K"),
+          py::arg("w13_N"),
+          py::arg("w2_packed"),
+          py::arg("w2_K"),
+          py::arg("w2_N"),
+          py::arg("topk_weights"),
+          py::arg("topk_ids"),
+          py::arg("w13_bias") = c10::nullopt,
+          py::arg("w2_bias") = c10::nullopt,
+          py::arg("num_threads") = 1,
+          py::arg("activation") = "silu",
+          py::arg("global_num_experts") = -1,
+          py::arg("skip_weighted") = false,
+          py::call_guard<py::gil_scoped_release>());
 #endif
 }

@@ -18,6 +18,7 @@ class _BuildExtensionWithFixup(BuildExtension):
     """
 
     def build_extensions(self) -> None:
+        self._compile_bf16gemm_asm_sources()
         super().build_extensions()
         if platform.system() != "Darwin":
             return
@@ -48,6 +49,38 @@ class _BuildExtensionWithFixup(BuildExtension):
                 ["install_name_tool", "-change", dep, f"@rpath/{basename}", so_path],
                 check=True,
             )
+
+    def _compile_bf16gemm_asm_sources(self) -> None:
+        if not bf16gemm_asm_sources:
+            return
+        obj_dir = os.path.join(self.build_temp, "bf16gemm")
+        os.makedirs(obj_dir, exist_ok=True)
+        for ext in self.extensions:
+            extra_objects = list(getattr(ext, "extra_objects", []) or [])
+            for src in bf16gemm_asm_sources:
+                obj = os.path.join(obj_dir, os.path.basename(src) + ".o")
+                self._compile_one_asm(src, obj, ext)
+                if obj not in extra_objects:
+                    extra_objects.append(obj)
+            ext.extra_objects = extra_objects
+
+    def _compile_one_asm(self, src: str, obj: str, ext) -> None:
+        compiler_so = getattr(self.compiler, "compiler_so", None)
+        compiler = compiler_so[0] if isinstance(compiler_so, list) else compiler_so
+        compiler = compiler or os.environ.get("CXX") or "c++"
+
+        extra_compile_args = getattr(ext, "extra_compile_args", []) or []
+        if isinstance(extra_compile_args, dict):
+            extra_compile_args = extra_compile_args.get("cxx", [])
+        asm_args = [
+            arg for arg in extra_compile_args
+            if arg.startswith(("-march=", "-mcpu=", "-O"))
+        ]
+        include_args = [
+            f"-I{inc}" for inc in (getattr(ext, "include_dirs", []) or [])
+        ]
+        cmd = [compiler, "-c", src, "-o", obj, *include_args, *asm_args]
+        subprocess.run(cmd, check=True)
 
 
 def _detect_acl():
@@ -303,6 +336,7 @@ def _host_cpu_has_flag(flag: str) -> bool:
 
 
 sources = sorted(glob.glob("csrc/**/*.cpp", recursive=True))
+bf16gemm_asm_sources = []
 is_aarch64 = platform.machine() in ("aarch64", "arm64")
 acl_available, acl_include_dirs, acl_library_dirs = _detect_acl()
 use_acl = is_aarch64 and acl_available
@@ -348,6 +382,11 @@ if omp_available:
 #   FUSED_CPP_TARGET_CPU="armv9-a+sve2+bf16+i8mm" → SVE2 平台
 # 取值若以 `apple-` 或 `cortex-` 开头则按 -mcpu= 处理，否则按 -march= 处理。
 if is_aarch64:
+    bf16gemm_workspace = os.path.abspath("refs/i8gemm")
+    bf16gemm_lib = os.path.join(bf16gemm_workspace, "lib")
+    include_dirs.extend([bf16gemm_workspace, bf16gemm_lib])
+    bf16gemm_asm_sources.append(os.path.join(bf16gemm_lib, "bf16gemm_k.S"))
+
     target_cpu = os.environ.get("FUSED_CPP_TARGET_CPU", "").strip()
     if target_cpu:
         if target_cpu.startswith(("apple-", "cortex-", "neoverse-")):

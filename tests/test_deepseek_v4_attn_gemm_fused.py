@@ -1,0 +1,131 @@
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+import os
+import platform
+
+import pytest
+import torch
+
+from fused_cpp import _C
+from fused_cpp.deepseek_v4_attn_gemm_fused import (
+    _HAS_DEEPSEEK_V4_ATTN_GEMM_FUSED,
+    deepseek_v4_attn_gemm_fused_prepacked,
+    prepare_deepseek_v4_attn_gemm_weights,
+)
+
+pytestmark = pytest.mark.skipif(
+    platform.machine() not in ("aarch64", "arm64")
+    or not _HAS_DEEPSEEK_V4_ATTN_GEMM_FUSED,
+    reason="DeepSeek V4 fused GEMM kernel is only available on AArch64",
+)
+
+_HAS_OPENMP = bool(getattr(_C, "has_openmp", lambda: False)())
+
+
+def _bf16_randn(*shape: int) -> torch.Tensor:
+    return (torch.randn(*shape) * 0.25).to(torch.bfloat16)
+
+
+def _test_core_ids(count: int) -> list[int]:
+    if hasattr(os, "sched_getaffinity"):
+        allowed = sorted(os.sched_getaffinity(0))
+        return allowed[: min(count, len(allowed))]
+    return list(range(count))
+
+
+@pytest.mark.parametrize(
+    ("M", "K", "Ns"),
+    [
+        (7, 16, (24, 16, 24, 8)),
+        (5, 13, (11, 17, 9, 15)),
+    ],
+)
+def test_deepseek_v4_attn_gemm_fused_matches_torch(
+    M: int,
+    K: int,
+    Ns: tuple[int, int, int, int],
+) -> None:
+    torch.manual_seed(0)
+    hidden_states = _bf16_randn(M, K)
+    weights = tuple(_bf16_randn(K, N) for N in Ns)
+    packed = prepare_deepseek_v4_attn_gemm_weights(
+        weights[0],
+        weights[1],
+        weights[2],
+        weights[3],
+    )
+
+    qr_kv, kv_score, indexer_kv_score, indexer_weights = (
+        deepseek_v4_attn_gemm_fused_prepacked(
+            hidden_states,
+            packed,
+        )
+    )
+
+    ref_qr_kv = (hidden_states.float() @ weights[0].float()).to(torch.bfloat16)
+    ref_kv_score = hidden_states.float() @ weights[1].float()
+    ref_indexer_kv_score = hidden_states.float() @ weights[2].float()
+    ref_indexer_weights = (
+        hidden_states.float() @ weights[3].float()
+    ).to(torch.bfloat16)
+
+    assert qr_kv.dtype == torch.bfloat16
+    assert kv_score.dtype == torch.float32
+    assert indexer_kv_score.dtype == torch.float32
+    assert indexer_weights.dtype == torch.bfloat16
+    assert qr_kv.shape == ref_qr_kv.shape
+    assert kv_score.shape == ref_kv_score.shape
+    assert indexer_kv_score.shape == ref_indexer_kv_score.shape
+    assert indexer_weights.shape == ref_indexer_weights.shape
+
+    torch.testing.assert_close(
+        qr_kv.float(), ref_qr_kv.float(), atol=5e-2, rtol=5e-2
+    )
+    torch.testing.assert_close(kv_score, ref_kv_score, atol=5e-2, rtol=5e-2)
+    torch.testing.assert_close(
+        indexer_kv_score, ref_indexer_kv_score, atol=5e-2, rtol=5e-2
+    )
+    torch.testing.assert_close(
+        indexer_weights.float(),
+        ref_indexer_weights.float(),
+        atol=5e-2,
+        rtol=5e-2,
+    )
+
+
+@pytest.mark.skipif(not _HAS_OPENMP, reason="OpenMP is unavailable")
+def test_deepseek_v4_attn_gemm_fused_mt_matches_serial() -> None:
+    torch.manual_seed(1)
+    M = 17
+    K = 13
+    Ns = (19, 23, 11, 7)
+    hidden_states = _bf16_randn(M, K)
+    weights = tuple(_bf16_randn(K, N) for N in Ns)
+    packed = prepare_deepseek_v4_attn_gemm_weights(
+        weights[0],
+        weights[1],
+        weights[2],
+        weights[3],
+    )
+    core_ids = _test_core_ids(3)
+    if len(core_ids) < 2:
+        pytest.skip("need at least two available CPU cores")
+
+    serial_outputs = deepseek_v4_attn_gemm_fused_prepacked(
+        hidden_states,
+        packed,
+    )
+    mt_outputs = deepseek_v4_attn_gemm_fused_prepacked(
+        hidden_states,
+        packed,
+        cores=core_ids,
+    )
+
+    for serial, mt in zip(serial_outputs, mt_outputs):
+        torch.testing.assert_close(
+            mt.float(),
+            serial.float(),
+            atol=5e-2,
+            rtol=5e-2,
+        )
