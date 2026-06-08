@@ -58,7 +58,7 @@ std::map<std::string, double> validate_microkernel(
 std::map<std::string, double> benchmark_microkernel(
     std::string impl, std::string dtype, int64_t E, int64_t Sk,
     int64_t iterations, int64_t warmup);
-std::tuple<at::Tensor, at::Tensor, at::Tensor> flash_mla_sparse_fwd(
+py::object flash_mla_sparse_fwd(
     at::Tensor q,
     at::Tensor kv,
     at::Tensor indices,
@@ -66,7 +66,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> flash_mla_sparse_fwd(
     c10::optional<int64_t> d_v,
     c10::optional<at::Tensor> attn_sink,
     c10::optional<at::Tensor> topk_length,
-    c10::optional<at::Tensor> out);
+    c10::optional<at::Tensor> out,
+    bool return_stats);
 
 // OMP runtime info forward declarations — omp_info.cpp
 std::map<std::string, std::string> get_omp_runtime_info();
@@ -283,6 +284,7 @@ PYBIND11_MODULE(_C, m) {
           py::arg("attn_sink") = c10::nullopt,
           py::arg("topk_length") = c10::nullopt,
           py::arg("out") = c10::nullopt,
+          py::arg("return_stats") = false,
           py::call_guard<py::gil_scoped_release>());
 
     m.def("get_omp_runtime_info", &get_omp_runtime_info,

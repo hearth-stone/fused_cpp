@@ -280,6 +280,367 @@ static inline void pack_mqa_v_to_evblock8(
   }
 }
 
+template <bool kReturnStats>
+static inline void run_path_qtile_heads_packqkv_mqa(
+    const at::BFloat16* q_ptr,
+    const uint16_t* k_packed_ptr,
+    const at::BFloat16* k_orig_ptr,
+    const at::BFloat16* v_packed_ptr,
+    const SdpaParams& p,
+    const ::fused_cpp::sdpa_tile_sizes::TileSizes& ts,
+    int64_t q_stride_b,
+    int64_t q_stride_n,
+    int64_t q_stride_l,
+    int64_t k_orig_stride_b,
+    int64_t k_orig_stride_n,
+    int64_t k_orig_stride_s,
+    int64_t k_packed_stride_b,
+    int64_t k_packed_stride_n,
+    int64_t k_sblock_stride,
+    int64_t v_stride_b,
+    int64_t v_stride_n,
+    int64_t v_stride_s,
+    int64_t v_evblock_stride,
+    int64_t m_stride_b,
+    int64_t m_stride_n,
+    int64_t m_stride_l,
+    int64_t o_stride_b,
+    int64_t o_stride_n,
+    int64_t o_stride_l) {
+  using ::fused_cpp::sdpa_flash2_neon_l3kv_impl::max_update_impl;
+  using ::fused_cpp::sdpa_flash2_neon_l3kv_impl::prefetch_l1_keep_impl;
+  using ::fused_cpp::sdpa_flash2_neon_l3kv_impl::prefetch_l2_keep_impl;
+  using ::fused_cpp::sdpa_flash2_neon_l3kv_impl::scale_inplace_impl;
+  using ::fused_cpp::sdpa_flash2_neon_l3kv_impl::vectorized_exp_minus_bf16_impl;
+  using ::fused_cpp::sdpa_flash2_neon_l3kv_impl::vectorized_exp_minus_impl;
+
+  constexpr int64_t LQ_OUTER = 8;
+  const int64_t num_q_tiles = (p.L + LQ_OUTER - 1) / LQ_OUTER;
+  const int64_t sc_max = std::max<int64_t>(8, ts.Sc_l2);
+  const int64_t e_main = p.E & ~int64_t{3};
+  const int64_t qblock_u16 = (e_main / 4) * 32;
+  const int64_t per_head_o_acc = LQ_OUTER * p.Ev;
+  const int64_t per_head_state = LQ_OUTER;
+
+#ifdef _OPENMP
+  #pragma omp parallel
+#endif
+  {
+    std::vector<float> scores_l1_vec(LQ_OUTER * sc_max);
+    std::vector<float> p_hat_vec(LQ_OUTER * sc_max);
+    std::vector<at::BFloat16> p_hat_bf16_vec(LQ_OUTER * sc_max);
+    std::vector<float> o_acc_vec(p.N * per_head_o_acc);
+    std::vector<float> running_max_vec(p.N * per_head_state);
+    std::vector<float> running_sum_vec(p.N * per_head_state);
+    std::vector<uint16_t> q_seq_buf_vec(p.N * qblock_u16);
+    alignas(64) float tmp_qkt[LQ_OUTER * LQ_OUTER];
+
+#ifdef _OPENMP
+    #pragma omp for schedule(static)
+#endif
+    for (int64_t task = 0; task < p.B * num_q_tiles; ++task) {
+      const int64_t b = task / num_q_tiles;
+      const int64_t qi_outer = task - b * num_q_tiles;
+      const int64_t q0_outer = qi_outer * LQ_OUTER;
+      const int64_t lc_eff = std::min<int64_t>(LQ_OUTER, p.L - q0_outer);
+
+      {
+        FUSED_CPP_SDPA_PROFILE_SCOPE(::fused_cpp::sdpa_profile::Slot::kInit);
+        std::fill(
+            running_max_vec.begin(),
+            running_max_vec.begin() + p.N * per_head_state,
+            p.neg_inf);
+        std::fill(
+            running_sum_vec.begin(),
+            running_sum_vec.begin() + p.N * per_head_state,
+            0.0f);
+        std::fill(
+            o_acc_vec.begin(),
+            o_acc_vec.begin() + p.N * per_head_o_acc,
+            0.0f);
+      }
+
+      if (lc_eff == LQ_OUTER) {
+        FUSED_CPP_SDPA_PROFILE_SCOPE(::fused_cpp::sdpa_profile::Slot::kQPack);
+        for (int64_t n = 0; n < p.N; ++n) {
+          const at::BFloat16* q_head =
+              q_ptr + b * q_stride_b + n * q_stride_n + q0_outer * q_stride_l;
+          ::fused_cpp::sdpa_microkernels::pack_q_8rows_to_seq_bf16(
+              q_head, q_stride_l, p.E, q_seq_buf_vec.data() + n * qblock_u16);
+        }
+      }
+
+      const uint16_t* k_packed_b = k_packed_ptr + b * k_packed_stride_b;
+
+      for (int64_t s_l3 = 0; s_l3 < p.S; s_l3 += ts.Sc_l3) {
+        const int64_t s_l3_end = std::min(s_l3 + ts.Sc_l3, p.S);
+
+        for (int64_t s_l2 = s_l3; s_l2 < s_l3_end; s_l2 += ts.Sc_l2) {
+          const int64_t s_l2_end = std::min(s_l2 + ts.Sc_l2, s_l3_end);
+          const int64_t sc_cur = s_l2_end - s_l2;
+
+          const int64_t s_next = s_l2 + ts.Sc_l2;
+          if (s_next < s_l3_end) {
+            const uint16_t* k_next =
+                k_packed_b + (s_next / 8) * k_sblock_stride;
+            const at::BFloat16* v_next =
+                v_packed_ptr + b * v_stride_b + s_next * v_stride_s;
+            for (int line = 0; line < 4; ++line) {
+              prefetch_l2_keep_impl(
+                  reinterpret_cast<const char*>(k_next) + line * 64);
+              prefetch_l2_keep_impl(
+                  reinterpret_cast<const char*>(v_next) + line * 64);
+            }
+          }
+
+          const at::BFloat16* krow0_orig =
+              k_orig_ptr + b * k_orig_stride_b + s_l2 * k_orig_stride_s;
+          const uint16_t* krow0_packed =
+              k_packed_b + (s_l2 / 8) * k_sblock_stride;
+          const at::BFloat16* vbase =
+              v_packed_ptr + b * v_stride_b + s_l2 * v_stride_s;
+
+          for (int line = 0; line < 2; ++line) {
+            prefetch_l1_keep_impl(
+                reinterpret_cast<const char*>(krow0_packed) + line * 64);
+            prefetch_l1_keep_impl(
+                reinterpret_cast<const char*>(vbase) + line * 64);
+          }
+
+          for (int64_t n = 0; n < p.N; ++n) {
+            float* scores_8 = scores_l1_vec.data();
+            float* p_hat_8 = p_hat_vec.data();
+            at::BFloat16* p_hat_bf16_8 = p_hat_bf16_vec.data();
+            float* o_acc_8 = o_acc_vec.data() + n * per_head_o_acc;
+            float* rmax_8 = running_max_vec.data() + n * per_head_state;
+            float* rsum_8 = running_sum_vec.data() + n * per_head_state;
+            const at::BFloat16* q_head =
+                q_ptr + b * q_stride_b + n * q_stride_n + q0_outer * q_stride_l;
+            const uint16_t* q_seq = q_seq_buf_vec.data() + n * qblock_u16;
+
+            {
+              FUSED_CPP_SDPA_PROFILE_SCOPE(::fused_cpp::sdpa_profile::Slot::kQkt);
+              int64_t s_off = 0;
+              for (; s_off + 8 <= sc_cur; s_off += 8) {
+                const int64_t s_global = s_l2 + s_off;
+                const at::BFloat16* k_tile_orig =
+                    krow0_orig + s_off * k_orig_stride_s;
+                const bool full_k_block =
+                    (s_global % 8 == 0) && (s_global + 8 <= p.S);
+                if (lc_eff == LQ_OUTER && full_k_block) {
+                  const uint16_t* k_seq =
+                      krow0_packed + (s_off / 8) * k_sblock_stride;
+                  ::fused_cpp::sdpa_microkernels::
+                      gemm_qkt_microkernel_8x8_bf16_packqk_seq4_bmajor_inner(
+                          q_seq,
+                          q_head,
+                          q_stride_l,
+                          k_seq,
+                          k_tile_orig,
+                          k_orig_stride_s,
+                          p.E,
+                          p.scale_f,
+                          tmp_qkt);
+                  for (int row = 0; row < LQ_OUTER; ++row) {
+                    ::fused_cpp::sdpa_pack_utils::copy_f32x8(
+                        tmp_qkt + row * LQ_OUTER,
+                        scores_8 + row * sc_cur + s_off);
+                  }
+                } else {
+                  ::fused_cpp::sdpa_microkernels::gemm_qkt_tail(
+                      q_head,
+                      q_stride_l,
+                      k_tile_orig,
+                      k_orig_stride_s,
+                      p.E,
+                      p.scale_f,
+                      scores_8 + s_off,
+                      sc_cur,
+                      static_cast<int>(lc_eff),
+                      8);
+                }
+              }
+              if (s_off + 4 <= sc_cur) {
+                const at::BFloat16* k_tile_orig =
+                    krow0_orig + s_off * k_orig_stride_s;
+                if (lc_eff == LQ_OUTER) {
+                  ::fused_cpp::sdpa_microkernels::gemm_qkt_8x4(
+                      q_head,
+                      q_stride_l,
+                      k_tile_orig,
+                      k_orig_stride_s,
+                      p.E,
+                      p.scale_f,
+                      scores_8 + s_off,
+                      sc_cur);
+                } else {
+                  ::fused_cpp::sdpa_microkernels::gemm_qkt_tail(
+                      q_head,
+                      q_stride_l,
+                      k_tile_orig,
+                      k_orig_stride_s,
+                      p.E,
+                      p.scale_f,
+                      scores_8 + s_off,
+                      sc_cur,
+                      static_cast<int>(lc_eff),
+                      4);
+                }
+                s_off += 4;
+              }
+              if (s_off < sc_cur) {
+                const at::BFloat16* k_tile_orig =
+                    krow0_orig + s_off * k_orig_stride_s;
+                ::fused_cpp::sdpa_microkernels::gemm_qkt_tail(
+                    q_head,
+                    q_stride_l,
+                    k_tile_orig,
+                    k_orig_stride_s,
+                    p.E,
+                    p.scale_f,
+                    scores_8 + s_off,
+                    sc_cur,
+                    static_cast<int>(lc_eff),
+                    static_cast<int>(sc_cur - s_off));
+              }
+            }
+
+            float new_max[LQ_OUTER];
+            {
+              FUSED_CPP_SDPA_PROFILE_SCOPE(
+                  ::fused_cpp::sdpa_profile::Slot::kSoftmax);
+              for (int row = 0; row < lc_eff; ++row) {
+                const float* scores_row = scores_8 + row * sc_cur;
+                const float tile_max =
+                    max_update_impl(p.neg_inf, scores_row, sc_cur);
+                if (rmax_8[row] == p.neg_inf && tile_max == p.neg_inf) {
+                  new_max[row] = p.neg_inf;
+                } else {
+                  new_max[row] = std::max(rmax_8[row], tile_max);
+                }
+                const float correction =
+                    new_max[row] == p.neg_inf
+                        ? 1.0f
+                        : std::exp(rmax_8[row] - new_max[row]);
+                rsum_8[row] *= correction;
+                scale_inplace_impl(o_acc_8 + row * p.Ev, correction, p.Ev);
+              }
+              if (lc_eff == LQ_OUTER) {
+                for (int row = 0; row < LQ_OUTER; ++row) {
+                  const float* scores_row = scores_8 + row * sc_cur;
+                  at::BFloat16* p_row = p_hat_bf16_8 + row * sc_cur;
+                  rsum_8[row] += vectorized_exp_minus_bf16_impl<5>(
+                      p_row, scores_row, new_max[row], sc_cur);
+                }
+              } else {
+                for (int row = 0; row < lc_eff; ++row) {
+                  const float* scores_row = scores_8 + row * sc_cur;
+                  float* p_row = p_hat_8 + row * sc_cur;
+                  rsum_8[row] += vectorized_exp_minus_impl(
+                      p_row, scores_row, new_max[row], sc_cur);
+                }
+                for (int row = static_cast<int>(lc_eff); row < LQ_OUTER; ++row) {
+                  std::memset(p_hat_8 + row * sc_cur, 0, sizeof(float) * sc_cur);
+                }
+              }
+            }
+
+            {
+              FUSED_CPP_SDPA_PROFILE_SCOPE(::fused_cpp::sdpa_profile::Slot::kPv);
+              for (int64_t ev_off = 0; ev_off < p.Ev; ev_off += 8) {
+                if (ev_off + 8 < p.Ev) {
+                  const at::BFloat16* next_block =
+                      vbase + ((ev_off >> 3) + 1) * v_evblock_stride;
+                  for (int line = 0; line < 2; ++line) {
+                    prefetch_l1_keep_impl(
+                        reinterpret_cast<const char*>(next_block) + line * 64);
+                  }
+                }
+                const int64_t ev_cur = std::min<int64_t>(8, p.Ev - ev_off);
+                const at::BFloat16* v_tile =
+                    vbase + (ev_off >> 3) * v_evblock_stride;
+                float* o_tile = o_acc_8 + ev_off;
+                if (lc_eff == LQ_OUTER && ev_cur == 8) {
+                  ::fused_cpp::sdpa_microkernels::
+                      MK_QkPackqkSeq4BmajorPvPquad::pv_8x8_pbf16(
+                          p_hat_bf16_8,
+                          sc_cur,
+                          v_tile,
+                          /*v_row_stride=*/8,
+                          sc_cur,
+                          o_tile,
+                          p.Ev);
+                } else {
+                  ::fused_cpp::sdpa_microkernels::
+                      MK_QkPackqkSeq4BmajorPvPquad::pv_tail(
+                          p_hat_8,
+                          sc_cur,
+                          v_tile,
+                          /*v_row_stride=*/8,
+                          sc_cur,
+                          o_tile,
+                          p.Ev,
+                          static_cast<int>(lc_eff),
+                          static_cast<int>(ev_cur));
+                }
+              }
+            }
+
+            for (int row = 0; row < lc_eff; ++row) {
+              rmax_8[row] = new_max[row];
+            }
+          }
+        }
+      }
+
+      {
+        FUSED_CPP_SDPA_PROFILE_SCOPE(
+            ::fused_cpp::sdpa_profile::Slot::kFinalize);
+        for (int64_t n = 0; n < p.N; ++n) {
+          const float* o_acc_head = o_acc_vec.data() + n * per_head_o_acc;
+          const float* rmax_head = running_max_vec.data() + n * per_head_state;
+          const float* rsum_head = running_sum_vec.data() + n * per_head_state;
+          for (int64_t row = 0; row < lc_eff; ++row) {
+            const int64_t q = q0_outer + row;
+            float* o_row =
+                p.out_ptr + b * o_stride_b + n * o_stride_n + q * o_stride_l;
+            if constexpr (kReturnStats) {
+              const int64_t stats_idx = b * (p.N * p.L) + n * p.L + q;
+              if (p.max_logits_ptr != nullptr) {
+                p.max_logits_ptr[stats_idx] = rmax_head[row];
+              }
+              if (p.lse_ptr != nullptr) {
+                p.lse_ptr[stats_idx] =
+                    rsum_head[row] > 0.0f
+                        ? rmax_head[row] + std::log(rsum_head[row])
+                        : std::numeric_limits<float>::infinity();
+              }
+            }
+            if (rsum_head[row] > 0.0f) {
+              const float inv_sum = 1.0f / rsum_head[row];
+              int64_t ev = 0;
+#if FUSED_CPP_SDPA_CACHE_HAS_NEON
+              const float32x4_t vinv = vdupq_n_f32(inv_sum);
+              for (; ev + 4 <= p.Ev; ev += 4) {
+                const float32x4_t v =
+                    vld1q_f32(o_acc_head + row * p.Ev + ev);
+                vst1q_f32(o_row + ev, vmulq_f32(v, vinv));
+              }
+#endif
+              for (; ev < p.Ev; ++ev) {
+                o_row[ev] = o_acc_head[row * p.Ev + ev] * inv_sum;
+              }
+            } else {
+              std::fill(o_row, o_row + p.Ev, 0.0f);
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+template <bool kReturnStats>
 static inline bool run_dense_packqkv_mqa_fast_path(
     const at::Tensor& q,
     const at::Tensor& kv,
@@ -288,8 +649,8 @@ static inline bool run_dense_packqkv_mqa_fast_path(
     int64_t d_v,
     const at::Tensor* sink_tensor,
     at::Tensor& output,
-    at::Tensor& max_logits,
-    at::Tensor& lse) {
+    at::Tensor* max_logits,
+    at::Tensor* lse) {
   if (q.scalar_type() != at::kBFloat16 || sink_tensor != nullptr) {
     return false;
   }
@@ -309,8 +670,14 @@ static inline bool run_dense_packqkv_mqa_fast_path(
     return false;
   }
 
-  using ::fused_cpp::sdpa_flash2_neon_l3kv_impl::run_path_collapse3_packqkv;
   using ::fused_cpp::sdpa_tile_sizes::compute_tile_sizes_l3kv;
+
+  const bool profile_on = ::fused_cpp::sdpa_profile::enabled();
+  if (profile_on) {
+    ::fused_cpp::sdpa_profile::reset();
+  }
+  const uint64_t profile_total_t0 =
+      profile_on ? ::fused_cpp::sdpa_profile::now_ns() : 0;
 
   const auto* q_ptr = q.data_ptr<at::BFloat16>();
   const auto* kv_base = kv.data_ptr<at::BFloat16>() + run_start * d_qk;
@@ -324,33 +691,43 @@ static inline bool run_dense_packqkv_mqa_fast_path(
       {s_blocks * kblock_u16},
       q.options());
   auto* k_packed_ptr = reinterpret_cast<uint16_t*>(k_packed.data_ptr());
-  ::fused_cpp::sdpa_microkernels::pack_k_to_seq8<at::BFloat16>(
-      kv_base,
-      k_packed_ptr,
-      /*B=*/1,
-      /*N=*/1,
-      topk,
-      d_qk);
+  {
+    FUSED_CPP_SDPA_PROFILE_SCOPE(::fused_cpp::sdpa_profile::Slot::kKPack);
+    ::fused_cpp::sdpa_microkernels::pack_k_to_seq8<at::BFloat16>(
+        kv_base,
+        k_packed_ptr,
+        /*B=*/1,
+        /*N=*/1,
+        topk,
+        d_qk);
+  }
 
   at::Tensor v_packed = at::empty(
       {d_v / 8, topk, 8},
       q.options());
-  pack_mqa_v_to_evblock8<at::BFloat16>(
-      kv_base,
-      d_qk,
-      v_packed.data_ptr<at::BFloat16>(),
-      topk,
-      d_v);
+  {
+    FUSED_CPP_SDPA_PROFILE_SCOPE(::fused_cpp::sdpa_profile::Slot::kVPack);
+    pack_mqa_v_to_evblock8<at::BFloat16>(
+        kv_base,
+        d_qk,
+        v_packed.data_ptr<at::BFloat16>(),
+        topk,
+        d_v);
+  }
 
   at::Tensor output_fp32 = at::empty(
       {s_q, h_q, d_v},
       q.options().dtype(at::kFloat));
-  at::Tensor max_sdpa = at::empty(
-      {1, h_q, s_q},
-      q.options().dtype(at::kFloat));
-  at::Tensor lse_sdpa = at::empty(
-      {1, h_q, s_q},
-      q.options().dtype(at::kFloat));
+  at::Tensor max_sdpa;
+  at::Tensor lse_sdpa;
+  if constexpr (kReturnStats) {
+    max_sdpa = at::empty(
+        {1, h_q, s_q},
+        q.options().dtype(at::kFloat));
+    lse_sdpa = at::empty(
+        {1, h_q, s_q},
+        q.options().dtype(at::kFloat));
+  }
 
   SdpaParams p{};
   p.B = 1;
@@ -369,8 +746,13 @@ static inline bool run_dense_packqkv_mqa_fast_path(
   p.v_ptr = kv_base;
   p.mask_ptr = nullptr;
   p.out_ptr = output_fp32.data_ptr<float>();
-  p.max_logits_ptr = max_sdpa.data_ptr<float>();
-  p.lse_ptr = lse_sdpa.data_ptr<float>();
+  if constexpr (kReturnStats) {
+    p.max_logits_ptr = max_sdpa.data_ptr<float>();
+    p.lse_ptr = lse_sdpa.data_ptr<float>();
+  } else {
+    p.max_logits_ptr = nullptr;
+    p.lse_ptr = nullptr;
+  }
 
   const auto ts = compute_tile_sizes_l3kv(
       p.B, p.N, p.S, p.L, p.E, p.Ev, sizeof(at::BFloat16));
@@ -395,36 +777,51 @@ static inline bool run_dense_packqkv_mqa_fast_path(
   const int64_t o_stride_n = d_v;
   const int64_t o_stride_l = h_q * d_v;
 
-  run_path_collapse3_packqkv<false, false, false, 5>(
-      q_ptr,
-      k_packed_ptr,
-      kv_base,
-      v_packed.data_ptr<at::BFloat16>(),
-      p,
-      ts,
-      q_stride_b,
-      q_stride_n,
-      q_stride_l,
-      k_orig_stride_b,
-      k_orig_stride_n,
-      k_orig_stride_s,
-      k_packed_stride_b,
-      k_packed_stride_n,
-      k_sblock_stride,
-      v_packed_stride_b,
-      v_packed_stride_n,
-      v_packed_stride_s,
-      v_evblock_stride,
-      m_stride_b,
-      m_stride_n,
-      m_stride_l,
-      o_stride_b,
-      o_stride_n,
-      o_stride_l);
+  {
+    FUSED_CPP_SDPA_PROFILE_SCOPE(::fused_cpp::sdpa_profile::Slot::kMain);
+    run_path_qtile_heads_packqkv_mqa<kReturnStats>(
+        q_ptr,
+        k_packed_ptr,
+        kv_base,
+        v_packed.data_ptr<at::BFloat16>(),
+        p,
+        ts,
+        q_stride_b,
+        q_stride_n,
+        q_stride_l,
+        k_orig_stride_b,
+        k_orig_stride_n,
+        k_orig_stride_s,
+        k_packed_stride_b,
+        k_packed_stride_n,
+        k_sblock_stride,
+        v_packed_stride_b,
+        v_packed_stride_n,
+        v_packed_stride_s,
+        v_evblock_stride,
+        m_stride_b,
+        m_stride_n,
+        m_stride_l,
+        o_stride_b,
+        o_stride_n,
+        o_stride_l);
+  }
 
   output.copy_(output_fp32.to(q.scalar_type()));
-  max_logits.copy_(max_sdpa.squeeze(0).permute({1, 0}));
-  lse.copy_(lse_sdpa.squeeze(0).permute({1, 0}));
+  if constexpr (kReturnStats) {
+    max_logits->copy_(max_sdpa.squeeze(0).permute({1, 0}));
+    lse->copy_(lse_sdpa.squeeze(0).permute({1, 0}));
+  }
+  if (profile_on) {
+    ::fused_cpp::sdpa_profile::add(
+        ::fused_cpp::sdpa_profile::Slot::kTotal,
+        ::fused_cpp::sdpa_profile::now_ns() - profile_total_t0);
+    ::fused_cpp::sdpa_profile::print_summary(
+        "sparse_mla_dense_packqkv_mqa",
+        "qtile_heads_packqkv_mqa",
+        p,
+        "dense_fast_path");
+  }
   return true;
 }
 
@@ -572,7 +969,7 @@ static inline float exp_sum_to(
   return sum;
 }
 
-template <typename scalar_t>
+template <bool kReturnStats, typename scalar_t>
 static inline void update_dense_segment_sdpa_style(
     const scalar_t* q_block,
     int64_t q_row_stride,
@@ -629,14 +1026,16 @@ static inline void update_dense_segment_sdpa_style(
     float* p_row = p_hat.data() + row * seg_len;
     const float tile_max = row_max(scores_row, seg_len);
 
-    const float real_new_max = std::max(real_max[row], tile_max);
-    float real_tile_sum = 0.0f;
-    for (int64_t col = 0; col < seg_len; ++col) {
-      real_tile_sum += std::exp(scores_row[col] - real_new_max);
+    if constexpr (kReturnStats) {
+      const float real_new_max = std::max(real_max[row], tile_max);
+      float real_tile_sum = 0.0f;
+      for (int64_t col = 0; col < seg_len; ++col) {
+        real_tile_sum += std::exp(scores_row[col] - real_new_max);
+      }
+      real_sum[row] = real_sum[row] * std::exp(real_max[row] - real_new_max) +
+                      real_tile_sum;
+      real_max[row] = real_new_max;
     }
-    real_sum[row] = real_sum[row] * std::exp(real_max[row] - real_new_max) +
-                    real_tile_sum;
-    real_max[row] = real_new_max;
 
     const float new_max = std::max(running_max[row], tile_max);
     const float correction = std::exp(running_max[row] - new_max);
@@ -692,7 +1091,7 @@ static inline void update_dense_segment_sdpa_style(
   }
 }
 
-template <typename scalar_t>
+template <bool kReturnStats, typename scalar_t>
 static inline void update_indexed_row(
     const float* scores,
     const int64_t* idx,
@@ -708,14 +1107,16 @@ static inline void update_indexed_row(
     float* real_sum) {
   const float tile_max = row_max(scores, count);
 
-  const float real_new_max = std::max(real_max[row], tile_max);
-  float real_tile_sum = 0.0f;
-  for (int64_t col = 0; col < count; ++col) {
-    real_tile_sum += std::exp(scores[col] - real_new_max);
+  if constexpr (kReturnStats) {
+    const float real_new_max = std::max(real_max[row], tile_max);
+    float real_tile_sum = 0.0f;
+    for (int64_t col = 0; col < count; ++col) {
+      real_tile_sum += std::exp(scores[col] - real_new_max);
+    }
+    real_sum[row] =
+        real_sum[row] * std::exp(real_max[row] - real_new_max) + real_tile_sum;
+    real_max[row] = real_new_max;
   }
-  real_sum[row] =
-      real_sum[row] * std::exp(real_max[row] - real_new_max) + real_tile_sum;
-  real_max[row] = real_new_max;
 
   const float new_max = std::max(running_max[row], tile_max);
   const float correction = std::exp(running_max[row] - new_max);
@@ -766,7 +1167,7 @@ static inline void store_output_row(
   }
 }
 
-template <typename scalar_t>
+template <typename scalar_t, bool kReturnStats>
 static inline void run_sparse_mla_kernel(
     const at::Tensor& q,
     const at::Tensor& kv,
@@ -786,8 +1187,12 @@ static inline void run_sparse_mla_kernel(
   const scalar_t* q_ptr = q.data_ptr<scalar_t>();
   const scalar_t* kv_ptr = kv.data_ptr<scalar_t>();
   scalar_t* out_ptr = output.data_ptr<scalar_t>();
-  float* max_ptr = max_logits.data_ptr<float>();
-  float* lse_ptr = lse.data_ptr<float>();
+  float* max_ptr = nullptr;
+  float* lse_ptr = nullptr;
+  if constexpr (kReturnStats) {
+    max_ptr = max_logits.data_ptr<float>();
+    lse_ptr = lse.data_ptr<float>();
+  }
   const int64_t* idx_ptr = indices_2d.data_ptr<int64_t>();
   const float* sink_ptr =
       sink_tensor == nullptr ? nullptr : sink_tensor->data_ptr<float>();
@@ -807,8 +1212,10 @@ static inline void run_sparse_mla_kernel(
       const float neg_inf = -std::numeric_limits<float>::infinity();
       running_max.fill(neg_inf);
       running_sum.fill(0.0f);
-      real_max.fill(neg_inf);
-      real_sum.fill(0.0f);
+      if constexpr (kReturnStats) {
+        real_max.fill(neg_inf);
+        real_sum.fill(0.0f);
+      }
       std::fill(output_acc.begin(), output_acc.end(), 0.0f);
 
       const scalar_t* q_block =
@@ -824,7 +1231,7 @@ static inline void run_sparse_mla_kernel(
             ", s_kv=",
             s_kv);
         const scalar_t* k_seg = kv_ptr + seg.start * d_qk;
-        update_dense_segment_sdpa_style(
+        update_dense_segment_sdpa_style<kReturnStats>(
             q_block,
             h_q * d_qk,
             k_seg,
@@ -867,7 +1274,7 @@ static inline void run_sparse_mla_kernel(
           if (count == 0) {
             continue;
           }
-          update_indexed_row(
+          update_indexed_row<kReturnStats>(
               scores,
               gathered_idx,
               count,
@@ -898,11 +1305,13 @@ static inline void run_sparse_mla_kernel(
 
       for (int64_t row = 0; row < plan.lq_eff; ++row) {
         const int64_t token = plan.token0 + row;
-        float* max_cell = max_ptr + token * h_q + head;
-        float* lse_cell = lse_ptr + token * h_q + head;
-        if (real_sum[row] > 0.0f) {
-          *max_cell = real_max[row];
-          *lse_cell = real_max[row] + std::log(real_sum[row]);
+        if constexpr (kReturnStats) {
+          float* max_cell = max_ptr + token * h_q + head;
+          float* lse_cell = lse_ptr + token * h_q + head;
+          if (real_sum[row] > 0.0f) {
+            *max_cell = real_max[row];
+            *lse_cell = real_max[row] + std::log(real_sum[row]);
+          }
         }
 
         scalar_t* out_row = out_ptr + (token * h_q + head) * d_v;
@@ -1031,7 +1440,7 @@ static inline void check_sparse_inputs(
 
 }  // namespace
 
-std::tuple<at::Tensor, at::Tensor, at::Tensor> flash_mla_sparse_fwd(
+py::object flash_mla_sparse_fwd(
     at::Tensor q,
     at::Tensor kv,
     at::Tensor indices,
@@ -1039,7 +1448,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> flash_mla_sparse_fwd(
     c10::optional<int64_t> d_v_opt,
     c10::optional<at::Tensor> attn_sink,
     c10::optional<at::Tensor> topk_length,
-    c10::optional<at::Tensor> out) {
+    c10::optional<at::Tensor> out,
+    bool return_stats) {
   const int64_t d_v = d_v_opt.value_or(kv.size(2));
   check_sparse_inputs(q, kv, indices, d_v, attn_sink, topk_length, out);
 
@@ -1057,59 +1467,110 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> flash_mla_sparse_fwd(
   }
 
   at::Tensor output_tmp = at::empty({q.size(0), q.size(1), d_v}, q.options());
-  at::Tensor max_logits = at::full(
-      {q.size(0), q.size(1)},
-      -std::numeric_limits<float>::infinity(),
-      q.options().dtype(at::kFloat));
-  at::Tensor lse = at::full(
-      {q.size(0), q.size(1)},
-      std::numeric_limits<float>::infinity(),
-      q.options().dtype(at::kFloat));
+  at::Tensor max_logits;
+  at::Tensor lse;
+  if (return_stats) {
+    max_logits = at::full(
+        {q.size(0), q.size(1)},
+        -std::numeric_limits<float>::infinity(),
+        q.options().dtype(at::kFloat));
+    lse = at::full(
+        {q.size(0), q.size(1)},
+        std::numeric_limits<float>::infinity(),
+        q.options().dtype(at::kFloat));
+  }
 
-  if (run_dense_packqkv_mqa_fast_path(
-          q_c,
-          kv_c,
-          indices_2d,
-          static_cast<float>(sm_scale),
-          d_v,
-          sink_ptr,
-          output_tmp,
-          max_logits,
-          lse)) {
+  const auto finish = [&]() -> py::object {
+    at::Tensor output_result;
     if (out.has_value()) {
       out.value().copy_(output_tmp);
-      return std::make_tuple(out.value(), max_logits, lse);
+      output_result = out.value();
+    } else {
+      output_result = output_tmp;
     }
-    return std::make_tuple(output_tmp, max_logits, lse);
+    py::gil_scoped_acquire gil;
+    if (return_stats) {
+      return py::cast(std::make_tuple(output_result, max_logits, lse));
+    }
+    return py::cast(output_result);
+  };
+
+  if (return_stats) {
+    if (run_dense_packqkv_mqa_fast_path<true>(
+            q_c,
+            kv_c,
+            indices_2d,
+            static_cast<float>(sm_scale),
+            d_v,
+            sink_ptr,
+            output_tmp,
+            &max_logits,
+            &lse)) {
+      return finish();
+    }
+  } else {
+    if (run_dense_packqkv_mqa_fast_path<false>(
+            q_c,
+            kv_c,
+            indices_2d,
+            static_cast<float>(sm_scale),
+            d_v,
+            sink_ptr,
+            output_tmp,
+            nullptr,
+            nullptr)) {
+      return finish();
+    }
   }
 
   if (q_c.scalar_type() == at::kBFloat16) {
-    run_sparse_mla_kernel<at::BFloat16>(
-        q_c,
-        kv_c,
-        indices_2d,
-        sink_ptr,
-        static_cast<float>(sm_scale),
-        d_v,
-        output_tmp,
-        max_logits,
-        lse);
+    if (return_stats) {
+      run_sparse_mla_kernel<at::BFloat16, true>(
+          q_c,
+          kv_c,
+          indices_2d,
+          sink_ptr,
+          static_cast<float>(sm_scale),
+          d_v,
+          output_tmp,
+          max_logits,
+          lse);
+    } else {
+      run_sparse_mla_kernel<at::BFloat16, false>(
+          q_c,
+          kv_c,
+          indices_2d,
+          sink_ptr,
+          static_cast<float>(sm_scale),
+          d_v,
+          output_tmp,
+          max_logits,
+          lse);
+    }
   } else {
-    run_sparse_mla_kernel<float>(
-        q_c,
-        kv_c,
-        indices_2d,
-        sink_ptr,
-        static_cast<float>(sm_scale),
-        d_v,
-        output_tmp,
-        max_logits,
-        lse);
+    if (return_stats) {
+      run_sparse_mla_kernel<float, true>(
+          q_c,
+          kv_c,
+          indices_2d,
+          sink_ptr,
+          static_cast<float>(sm_scale),
+          d_v,
+          output_tmp,
+          max_logits,
+          lse);
+    } else {
+      run_sparse_mla_kernel<float, false>(
+          q_c,
+          kv_c,
+          indices_2d,
+          sink_ptr,
+          static_cast<float>(sm_scale),
+          d_v,
+          output_tmp,
+          max_logits,
+          lse);
+    }
   }
-
-  if (out.has_value()) {
-    out.value().copy_(output_tmp);
-    return std::make_tuple(out.value(), max_logits, lse);
-  }
-  return std::make_tuple(output_tmp, max_logits, lse);
+  return finish();
 }

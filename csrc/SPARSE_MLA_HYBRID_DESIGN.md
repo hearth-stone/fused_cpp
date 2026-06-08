@@ -83,13 +83,14 @@ flash_mla_sparse_fwd(
     attn_sink=None,
     topk_length=None,
     out=None,
+    return_stats=False,
 )
 ```
 
 新增 C++ binding：
 
 ```cpp
-std::tuple<at::Tensor, at::Tensor, at::Tensor> flash_mla_sparse_fwd(
+py::object flash_mla_sparse_fwd(
     at::Tensor q,
     at::Tensor kv,
     at::Tensor indices,
@@ -97,14 +98,16 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> flash_mla_sparse_fwd(
     c10::optional<int64_t> d_v,
     c10::optional<at::Tensor> attn_sink,
     c10::optional<at::Tensor> topk_length,
-    c10::optional<at::Tensor> out);
+    c10::optional<at::Tensor> out,
+    bool return_stats);
 ```
 
 返回：
 
 - `output`: `[s_q, h_q, d_v]`
-- `max_logits`: `[s_q, h_q]`
-- `lse`: `[s_q, h_q]`
+- 默认只返回 `output`，与 DeepSeek-V4/vLLM sparse attention fallback 对齐。
+- `return_stats=True` 时返回 `(output, max_logits, lse)`；`max_logits/lse`
+  形状为 `[s_q, h_q]`。
 
 注意：为了匹配当前 naive，`max_logits` 和 `lse` 只统计真实 sparse KV logits，
 不包含 `attn_sink`。`attn_sink` 只参与最终 output 的 softmax denominator。
@@ -349,7 +352,7 @@ csrc/sparse_mla_common.h
 - dtype dispatch
 - OpenMP 并行
 - 调用 segment update helper
-- 返回 output/max_logits/lse
+- 默认返回 output；可选返回 output/max_logits/lse
 
 `sparse_mla_common.h` 负责：
 

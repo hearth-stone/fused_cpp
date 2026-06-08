@@ -352,7 +352,8 @@ def sparse_mla_naive(
     attn_sink: Optional[torch.Tensor] = None,
     topk_length: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return_stats: bool = False,
+) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Naive PyTorch implementation of vLLM DeepSeek V4 sparse attention.
 
     The output path intentionally follows
@@ -371,13 +372,14 @@ def sparse_mla_naive(
     Differences from the older FlashMLA-style naive reference in this repo:
     it no longer uses ``topk_length`` to truncate rows, no longer masks
     ``indices >= s_kv``, and gathers contiguous index runs with ``narrow`` /
-    ``cat`` before falling back to ``index_select``. The repo still returns
-    ``max_logits`` and sparse ``lse`` for compatibility; vLLM's helper returns
-    only ``output``. When ``d_v`` is smaller than ``d_qk``, only the value side
-    is sliced; vLLM's DeepSeek V4 CPU fallback uses the full head dimension.
+    ``cat`` before falling back to ``index_select``. By default this matches
+    vLLM's helper and returns only ``output``; set ``return_stats=True`` to
+    return compatibility ``max_logits`` and sparse ``lse``. When ``d_v`` is
+    smaller than ``d_qk``, only the value side is sliced; vLLM's DeepSeek V4 CPU
+    fallback uses the full head dimension.
 
-    Returns ``(output, max_logits, lse)`` with shapes
-    ``[s_q, h_q, d_v]``, ``[s_q, h_q]``, and ``[s_q, h_q]``.
+    Returns ``output`` with shape ``[s_q, h_q, d_v]`` by default, or
+    ``(output, max_logits, lse)`` when ``return_stats=True``.
     """
     if d_v is None:
         d_v = kv.shape[-1]
@@ -514,6 +516,8 @@ def sparse_mla_naive(
         output = out
     else:
         output = out_value
+    if not return_stats:
+        return output
     return output, max_logits, lse
 
 
@@ -526,7 +530,8 @@ def flash_mla_sparse_fwd_naive(
     attn_sink: Optional[torch.Tensor] = None,
     topk_length: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return_stats: bool = False,
+) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compatibility wrapper matching ``flash_mla_sparse_fwd`` arguments."""
     return sparse_mla_naive(
         q,
@@ -537,6 +542,7 @@ def flash_mla_sparse_fwd_naive(
         attn_sink=attn_sink,
         topk_length=topk_length,
         out=out,
+        return_stats=return_stats,
     )
 
 
@@ -549,7 +555,8 @@ def flash_mla_sparse_fwd(
     attn_sink: Optional[torch.Tensor] = None,
     topk_length: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return_stats: bool = False,
+) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compatibility wrapper using the C++ sparse MLA kernel when available."""
     if _HAS_CPP_SPARSE_MLA:
         return _cpp_flash_mla_sparse_fwd(
@@ -561,6 +568,7 @@ def flash_mla_sparse_fwd(
             attn_sink,
             topk_length,
             out,
+            return_stats,
         )
     return flash_mla_sparse_fwd_naive(
         q,
@@ -571,6 +579,7 @@ def flash_mla_sparse_fwd(
         attn_sink=attn_sink,
         topk_length=topk_length,
         out=out,
+        return_stats=return_stats,
     )
 
 

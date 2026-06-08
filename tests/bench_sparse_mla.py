@@ -91,7 +91,7 @@ def _run_sparse_case(
         return flash_mla_sparse_fwd(q, kv, indices, scale, d_v)
 
     out = fn()
-    assert out[0].shape == (s_q, h_q, d_v)
+    assert out.shape == (s_q, h_q, d_v)
     median, min_t, max_t = _bench(fn, warmup, iters)
     flops = _approx_attention_flops(s_q, h_q, topk, d_qk, d_v)
     print(

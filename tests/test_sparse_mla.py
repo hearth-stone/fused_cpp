@@ -116,6 +116,7 @@ def test_sparse_mla_naive_matches_vllm_cpu_sparse_attention() -> None:
         d_v=d_v,
         attn_sink=attn_sink,
         topk_length=topk_length,
+        return_stats=True,
     )
     expected = _vllm_cpu_sparse_attention_reference(
         q,
@@ -136,8 +137,22 @@ def test_sparse_mla_naive_ignores_topk_length_like_vllm() -> None:
     indices = torch.tensor([[[0, 1, 2]], [[3, -1, 4]]], dtype=torch.int32)
     topk_length = torch.zeros(2, dtype=torch.int32)
 
-    actual = sparse_mla_naive(q, kv, indices, 0.25, topk_length=topk_length)
-    expected = sparse_mla_naive(q, kv, indices, 0.25, topk_length=None)
+    actual = sparse_mla_naive(
+        q,
+        kv,
+        indices,
+        0.25,
+        topk_length=topk_length,
+        return_stats=True,
+    )
+    expected = sparse_mla_naive(
+        q,
+        kv,
+        indices,
+        0.25,
+        topk_length=None,
+        return_stats=True,
+    )
 
     assert actual[0].shape == q.shape
     _assert_sparse_close(actual, expected)
@@ -175,7 +190,7 @@ def test_sparse_mla_naive_plan_dense_and_indexed_matches_reference() -> None:
     indices = torch.arange(20, dtype=torch.int32).reshape(1, 1, 20)
     indices = indices.expand(8, 1, 20).clone()
 
-    actual = sparse_mla_naive(q, kv, indices, 0.25, d_v=6)
+    actual = sparse_mla_naive(q, kv, indices, 0.25, d_v=6, return_stats=True)
     expected = _vllm_cpu_sparse_attention_reference(q, kv, indices, 0.25, 6)
 
     _assert_sparse_close(actual, expected)
@@ -186,7 +201,14 @@ def test_sparse_mla_naive_all_invalid_outputs_zero_and_lse_inf() -> None:
     kv = torch.randn(3, 1, 4).bfloat16()
     indices = torch.full((2, 1, 3), -1, dtype=torch.int32)
 
-    out, max_logits, lse = sparse_mla_naive(q, kv, indices, 0.5, d_v=3)
+    out, max_logits, lse = sparse_mla_naive(
+        q,
+        kv,
+        indices,
+        0.5,
+        d_v=3,
+        return_stats=True,
+    )
 
     assert torch.equal(out, torch.zeros_like(out))
     assert torch.all(torch.isneginf(max_logits))
@@ -200,7 +222,14 @@ def test_flash_mla_sparse_fwd_naive_reuses_out_buffer() -> None:
     indices = torch.tensor([[[0, 1]], [[2, 3]], [[4, -1]]], dtype=torch.int32)
     d_v = 4
 
-    expected = flash_mla_sparse_fwd_naive(q, kv, indices, 0.25, d_v=d_v)
+    expected = flash_mla_sparse_fwd_naive(
+        q,
+        kv,
+        indices,
+        0.25,
+        d_v=d_v,
+        return_stats=True,
+    )
     out_buffer = torch.empty_like(expected[0])
     actual = flash_mla_sparse_fwd_naive(
         q,
@@ -209,6 +238,7 @@ def test_flash_mla_sparse_fwd_naive_reuses_out_buffer() -> None:
         0.25,
         d_v=d_v,
         out=out_buffer,
+        return_stats=True,
     )
 
     assert actual[0] is out_buffer
@@ -221,8 +251,22 @@ def test_flash_mla_sparse_fwd_alias_matches_naive() -> None:
     kv = torch.randn(6, 1, 8).bfloat16()
     indices = torch.tensor([[[0, 3, 5]], [[4, -1, 2]]], dtype=torch.int32)
 
-    actual = flash_mla_sparse_fwd(q, kv, indices, 0.375, d_v=5)
-    expected = flash_mla_sparse_fwd_naive(q, kv, indices, 0.375, d_v=5)
+    actual = flash_mla_sparse_fwd(
+        q,
+        kv,
+        indices,
+        0.375,
+        d_v=5,
+        return_stats=True,
+    )
+    expected = flash_mla_sparse_fwd_naive(
+        q,
+        kv,
+        indices,
+        0.375,
+        d_v=5,
+        return_stats=True,
+    )
 
     _assert_sparse_close(actual, expected)
 
@@ -236,7 +280,15 @@ def test_flash_mla_sparse_fwd_cpp_hybrid_dense_and_indexed_matches_naive() -> No
     indices = indices.expand(8, 1, 20).clone()
     attn_sink = torch.tensor([float("-inf"), 0.5], dtype=torch.float32)
 
-    actual = flash_mla_sparse_fwd(q, kv, indices, 0.25, d_v=6, attn_sink=attn_sink)
+    actual = flash_mla_sparse_fwd(
+        q,
+        kv,
+        indices,
+        0.25,
+        d_v=6,
+        attn_sink=attn_sink,
+        return_stats=True,
+    )
     expected = flash_mla_sparse_fwd_naive(
         q,
         kv,
@@ -244,6 +296,7 @@ def test_flash_mla_sparse_fwd_cpp_hybrid_dense_and_indexed_matches_naive() -> No
         0.25,
         d_v=6,
         attn_sink=attn_sink,
+        return_stats=True,
     )
 
     _assert_sparse_close(actual, expected)
@@ -258,15 +311,26 @@ def test_flash_mla_sparse_fwd_cpp_dense_packqkv_fast_path_matches_naive() -> Non
     indices = torch.arange(3, 3 + topk, dtype=torch.int32).reshape(1, 1, topk)
     indices = indices.expand(s_q, 1, topk).clone()
 
-    actual = flash_mla_sparse_fwd(q, kv, indices, 1.0 / (d_qk**0.5), d_v=d_v)
+    output_only = flash_mla_sparse_fwd(q, kv, indices, 1.0 / (d_qk**0.5), d_v=d_v)
+    actual = flash_mla_sparse_fwd(
+        q,
+        kv,
+        indices,
+        1.0 / (d_qk**0.5),
+        d_v=d_v,
+        return_stats=True,
+    )
     expected = flash_mla_sparse_fwd_naive(
         q,
         kv,
         indices,
         1.0 / (d_qk**0.5),
         d_v=d_v,
+        return_stats=True,
     )
 
+    assert isinstance(output_only, torch.Tensor)
+    torch.testing.assert_close(output_only, expected[0], atol=1e-2, rtol=1e-2)
     _assert_sparse_close(actual, expected)
 
 
