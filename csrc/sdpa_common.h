@@ -65,6 +65,11 @@ struct SdpaParams {
 
     // 输出指针始终为 fp32 累加缓冲
     float* out_ptr      = nullptr;
+
+    // Optional fp32 statistics output in contiguous [B, N, L] layout.
+    // Kernels that do not produce these values may leave them untouched.
+    float* max_logits_ptr = nullptr;
+    float* lse_ptr        = nullptr;
 };
 
 // ── 内核函数指针 ──────────────────────────────────────────────────────────

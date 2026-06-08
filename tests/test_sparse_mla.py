@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Tests for the naive FlashMLA sparse prefill MLA reference."""
+"""Tests for the vLLM-style naive sparse prefill MLA reference."""
 
 from __future__ import annotations
 
@@ -7,12 +7,15 @@ import pytest
 import torch
 
 from fused_cpp.sparse_mla import (
+    _HAS_CPP_SPARSE_MLA,
+    _build_sparse_mla_plans,
+    flash_mla_sparse_fwd,
     flash_mla_sparse_fwd_naive,
     sparse_mla_naive,
 )
 
 
-def _flash_mla_sparse_reference(
+def _vllm_cpu_sparse_attention_reference(
     q: torch.Tensor,
     kv: torch.Tensor,
     indices: torch.Tensor,
@@ -20,66 +23,89 @@ def _flash_mla_sparse_reference(
     d_v: int,
     *,
     attn_sink: torch.Tensor | None = None,
-    topk_length: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    s_q, h_q, d_qk = q.shape
-    s_kv = kv.shape[0]
-    topk = indices.shape[-1]
+    def _gather_kv(valid_indices: torch.Tensor) -> torch.Tensor:
+        if valid_indices.numel() == 1:
+            start = int(valid_indices[0].item())
+            return kv_2d.narrow(0, start, 1)
 
-    gather_indices = indices.clone().squeeze(1)
-    if topk_length is not None:
-        valid_by_length = (
-            torch.arange(topk, device=q.device).unsqueeze(0)
-            < topk_length.to(torch.long).unsqueeze(1)
-        )
-        gather_indices = gather_indices.masked_fill(~valid_by_length, -1)
+        breaks = (
+            valid_indices[1:] != valid_indices[:-1] + 1
+        ).nonzero(as_tuple=False).flatten()
+        if breaks.numel() == 0:
+            start = int(valid_indices[0].item())
+            return kv_2d.narrow(0, start, valid_indices.numel())
 
-    invalid = (gather_indices < 0) | (gather_indices >= s_kv)
-    gather_indices = gather_indices.masked_fill(invalid, 0)
-    gathered_kv = kv[:, 0, :].index_select(
-        0,
-        gather_indices.reshape(-1).to(torch.long),
-    ).reshape(s_q, topk, d_qk).float()
+        num_runs = int(breaks.numel()) + 1
+        if num_runs > 4:
+            return kv_2d.index_select(0, valid_indices)
 
-    logits = torch.matmul(q.float(), gathered_kv.transpose(1, 2))
-    logits = logits * sm_scale
-    logits = logits.masked_fill(invalid.unsqueeze(1), float("-inf"))
+        parts: list[torch.Tensor] = []
+        run_start = 0
+        for break_idx_t in breaks:
+            run_end = int(break_idx_t.item()) + 1
+            start = int(valid_indices[run_start].item())
+            parts.append(kv_2d.narrow(0, start, run_end - run_start))
+            run_start = run_end
+        start = int(valid_indices[run_start].item())
+        parts.append(kv_2d.narrow(0, start, valid_indices.numel() - run_start))
+        return torch.cat(parts, dim=0)
 
-    sparse_lse = torch.logsumexp(logits, dim=-1)
-    max_logits = logits.max(dim=-1).values
-
-    if attn_sink is None:
-        output_lse = sparse_lse
+    if kv.ndim == 3:
+        assert kv.shape[1] == 1
+        kv_2d = kv.squeeze(1)
     else:
-        sink = attn_sink.float().reshape(1, h_q).expand(s_q, h_q)
-        output_lse = torch.logsumexp(torch.stack((sparse_lse, sink), dim=0), dim=0)
+        kv_2d = kv
+    s_q, h_q, _ = q.shape
+    out = torch.zeros((s_q, h_q, d_v), dtype=torch.float32, device=q.device)
+    max_logits = torch.full((s_q, h_q), float("-inf"), device=q.device)
+    lse = torch.full((s_q, h_q), float("+inf"), device=q.device)
+    indices_2d = indices.reshape(s_q, -1).to(torch.long)
+    sink = attn_sink[:h_q].to(torch.float32) if attn_sink is not None else None
 
-    output_lse = output_lse.clone()
-    output_lse[output_lse == float("-inf")] = float("+inf")
-    weights = torch.exp(logits - output_lse.unsqueeze(-1))
-    out = torch.matmul(weights, gathered_kv[..., :d_v]).to(q.dtype)
+    for token_idx in range(s_q):
+        valid_indices = indices_2d[token_idx]
+        valid_indices = valid_indices[valid_indices >= 0]
+        if valid_indices.numel() == 0:
+            continue
 
-    sparse_lse = sparse_lse.clone()
-    sparse_lse[sparse_lse == float("-inf")] = float("+inf")
-    return out, max_logits, sparse_lse
+        k_i = _gather_kv(valid_indices).to(torch.float32)
+        logits = torch.matmul(q[token_idx].to(torch.float32), k_i.T) * sm_scale
+        max_logits[token_idx] = logits.max(dim=-1).values
+        lse[token_idx] = torch.logsumexp(logits, dim=-1)
+        if sink is not None:
+            logits = torch.cat([logits, sink[:, None]], dim=-1)
+        probs = torch.softmax(logits, dim=-1)
+        out[token_idx] = torch.matmul(probs[..., : k_i.shape[0]], k_i[:, :d_v])
+
+    return out.to(q.dtype), max_logits, lse
 
 
-def test_sparse_mla_naive_matches_flash_mla_reference_features() -> None:
+def _assert_sparse_close(
+    actual: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    expected: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+) -> None:
+    torch.testing.assert_close(actual[0], expected[0], atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(actual[1], expected[1], atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(actual[2], expected[2], atol=1e-5, rtol=1e-5)
+
+
+def test_sparse_mla_naive_matches_vllm_cpu_sparse_attention() -> None:
     torch.manual_seed(7)
     s_q, h_q, s_kv, d_qk, d_v = 4, 3, 7, 8, 6
     q = torch.randn(s_q, h_q, d_qk).bfloat16()
     kv = torch.randn(s_kv, 1, d_qk).bfloat16()
     indices = torch.tensor(
         [
-            [[0, 3, -1, 6, 7]],
+            [[0, 3, -1, 6, 5]],
             [[2, 5, 1, 4, 0]],
             [[6, 0, 1, 2, 3]],
-            [[4, -2, 2, 1, 8]],
+            [[4, -2, 2, 1, 6]],
         ],
         dtype=torch.int32,
     )
-    topk_length = torch.tensor([5, 3, 0, 2], dtype=torch.int32)
-    attn_sink = torch.tensor([float("-inf"), 0.25, float("+inf")], dtype=torch.float32)
+    topk_length = torch.tensor([2, 1, 0, 2], dtype=torch.int32)
+    attn_sink = torch.tensor([float("-inf"), 0.25, 1.0], dtype=torch.float32)
     sm_scale = 0.125
 
     actual = sparse_mla_naive(
@@ -91,19 +117,68 @@ def test_sparse_mla_naive_matches_flash_mla_reference_features() -> None:
         attn_sink=attn_sink,
         topk_length=topk_length,
     )
-    expected = _flash_mla_sparse_reference(
+    expected = _vllm_cpu_sparse_attention_reference(
         q,
         kv,
         indices,
         sm_scale,
         d_v,
         attn_sink=attn_sink,
-        topk_length=topk_length,
     )
 
-    torch.testing.assert_close(actual[0], expected[0], atol=0, rtol=0)
-    torch.testing.assert_close(actual[1], expected[1], atol=0, rtol=0)
-    torch.testing.assert_close(actual[2], expected[2], atol=0, rtol=0)
+    _assert_sparse_close(actual, expected)
+
+
+def test_sparse_mla_naive_ignores_topk_length_like_vllm() -> None:
+    torch.manual_seed(17)
+    q = torch.randn(2, 2, 6).bfloat16()
+    kv = torch.randn(5, 1, 6).bfloat16()
+    indices = torch.tensor([[[0, 1, 2]], [[3, -1, 4]]], dtype=torch.int32)
+    topk_length = torch.zeros(2, dtype=torch.int32)
+
+    actual = sparse_mla_naive(q, kv, indices, 0.25, topk_length=topk_length)
+    expected = sparse_mla_naive(q, kv, indices, 0.25, topk_length=None)
+
+    assert actual[0].shape == q.shape
+    _assert_sparse_close(actual, expected)
+
+
+def test_sparse_mla_naive_positive_out_of_range_raises_like_vllm() -> None:
+    q = torch.randn(1, 1, 4).bfloat16()
+    kv = torch.randn(3, 1, 4).bfloat16()
+    indices = torch.tensor([[[3]]], dtype=torch.int32)
+
+    with pytest.raises(RuntimeError):
+        sparse_mla_naive(q, kv, indices, 0.5)
+
+
+def test_sparse_mla_plan_extracts_shared_dense_run_and_indexes_tail() -> None:
+    indices = torch.arange(20, dtype=torch.int32).reshape(1, 1, 20)
+    indices = indices.expand(8, 1, 20).clone()
+
+    plan = _build_sparse_mla_plans(indices.reshape(8, -1).to(torch.long))[0]
+
+    assert plan.lq_eff == 8
+    assert len(plan.dense_segments) == 1
+    assert plan.dense_segments[0].start == 0
+    assert plan.dense_segments[0].length == 16
+    assert len(plan.indexed_tiles) == 1
+    assert plan.indexed_tiles[0].valid_mask == (1 << 32) - 1
+    for row in range(8):
+        assert plan.indexed_tiles[0].idx[row] == (16, 17, 18, 19)
+
+
+def test_sparse_mla_naive_plan_dense_and_indexed_matches_reference() -> None:
+    torch.manual_seed(23)
+    q = torch.randn(8, 2, 8).bfloat16()
+    kv = torch.randn(24, 1, 8).bfloat16()
+    indices = torch.arange(20, dtype=torch.int32).reshape(1, 1, 20)
+    indices = indices.expand(8, 1, 20).clone()
+
+    actual = sparse_mla_naive(q, kv, indices, 0.25, d_v=6)
+    expected = _vllm_cpu_sparse_attention_reference(q, kv, indices, 0.25, 6)
+
+    _assert_sparse_close(actual, expected)
 
 
 def test_sparse_mla_naive_all_invalid_outputs_zero_and_lse_inf() -> None:
@@ -137,9 +212,62 @@ def test_flash_mla_sparse_fwd_naive_reuses_out_buffer() -> None:
     )
 
     assert actual[0] is out_buffer
-    torch.testing.assert_close(actual[0], expected[0], atol=0, rtol=0)
-    torch.testing.assert_close(actual[1], expected[1], atol=0, rtol=0)
-    torch.testing.assert_close(actual[2], expected[2], atol=0, rtol=0)
+    _assert_sparse_close(actual, expected)
+
+
+def test_flash_mla_sparse_fwd_alias_matches_naive() -> None:
+    torch.manual_seed(13)
+    q = torch.randn(2, 3, 8).bfloat16()
+    kv = torch.randn(6, 1, 8).bfloat16()
+    indices = torch.tensor([[[0, 3, 5]], [[4, -1, 2]]], dtype=torch.int32)
+
+    actual = flash_mla_sparse_fwd(q, kv, indices, 0.375, d_v=5)
+    expected = flash_mla_sparse_fwd_naive(q, kv, indices, 0.375, d_v=5)
+
+    _assert_sparse_close(actual, expected)
+
+
+@pytest.mark.skipif(not _HAS_CPP_SPARSE_MLA, reason="C++ sparse MLA extension unavailable")
+def test_flash_mla_sparse_fwd_cpp_hybrid_dense_and_indexed_matches_naive() -> None:
+    torch.manual_seed(29)
+    q = torch.randn(8, 2, 8).bfloat16()
+    kv = torch.randn(24, 1, 8).bfloat16()
+    indices = torch.arange(20, dtype=torch.int32).reshape(1, 1, 20)
+    indices = indices.expand(8, 1, 20).clone()
+    attn_sink = torch.tensor([float("-inf"), 0.5], dtype=torch.float32)
+
+    actual = flash_mla_sparse_fwd(q, kv, indices, 0.25, d_v=6, attn_sink=attn_sink)
+    expected = flash_mla_sparse_fwd_naive(
+        q,
+        kv,
+        indices,
+        0.25,
+        d_v=6,
+        attn_sink=attn_sink,
+    )
+
+    _assert_sparse_close(actual, expected)
+
+
+@pytest.mark.skipif(not _HAS_CPP_SPARSE_MLA, reason="C++ sparse MLA extension unavailable")
+def test_flash_mla_sparse_fwd_cpp_dense_packqkv_fast_path_matches_naive() -> None:
+    torch.manual_seed(31)
+    s_q, h_q, s_kv, d_qk, d_v, topk = 16, 4, 32, 16, 16, 16
+    q = torch.randn(s_q, h_q, d_qk).bfloat16()
+    kv = torch.randn(s_kv, 1, d_qk).bfloat16()
+    indices = torch.arange(3, 3 + topk, dtype=torch.int32).reshape(1, 1, topk)
+    indices = indices.expand(s_q, 1, topk).clone()
+
+    actual = flash_mla_sparse_fwd(q, kv, indices, 1.0 / (d_qk**0.5), d_v=d_v)
+    expected = flash_mla_sparse_fwd_naive(
+        q,
+        kv,
+        indices,
+        1.0 / (d_qk**0.5),
+        d_v=d_v,
+    )
+
+    _assert_sparse_close(actual, expected)
 
 
 def test_sparse_mla_naive_rejects_multi_kv_head_sparse_prefill() -> None:
