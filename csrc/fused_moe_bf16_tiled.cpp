@@ -1,7 +1,10 @@
 #include <torch/extension.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -346,36 +349,130 @@ struct TaskRange {
     size_t end = 0;
 };
 
-std::vector<TaskRange> split_tasks_by_tokens(const std::vector<TileTask>& tasks,
-                                             int64_t num_threads) {
-    std::vector<TaskRange> ranges(static_cast<size_t>(num_threads));
-    const int64_t total_rows = std::accumulate(
-        tasks.begin(), tasks.end(), int64_t{0},
-        [](int64_t acc, const TileTask& task) { return acc + task.rows; });
+struct ExpertTaskGroup {
+    size_t begin = 0;
+    size_t end = 0;
+    int64_t rows = 0;
+};
 
-    size_t cursor = 0;
-    int64_t consumed_rows = 0;
-    for (int64_t tid = 0; tid < num_threads; ++tid) {
-        TaskRange range;
-        range.begin = cursor;
-        if (tid == num_threads - 1) {
-            cursor = tasks.size();
-        } else {
-            const int64_t remaining_rows = total_rows - consumed_rows;
-            const int64_t remaining_threads = num_threads - tid;
-            const int64_t target =
-                ceil_div_int64(std::max<int64_t>(remaining_rows, 0),
-                               remaining_threads);
-            int64_t local_rows = 0;
-            while (cursor < tasks.size() &&
-                   (local_rows < target || local_rows == 0)) {
-                local_rows += tasks[cursor].rows;
-                ++cursor;
+struct ThreadScheduleDebug {
+    int64_t rows = 0;
+    int64_t tasks = 0;
+    int64_t ranges = 0;
+    double ms = 0.0;
+    std::vector<int64_t> experts;
+    std::vector<int64_t> expert_rows;
+};
+
+int debug_schedule_level() {
+    const char* value = std::getenv("FUSED_CPP_MOE_SCHEDULE_DEBUG");
+    if (value == nullptr || value[0] == '\0' || value[0] == '0') {
+        return 0;
+    }
+    const int parsed = std::atoi(value);
+    return parsed <= 0 ? 1 : parsed;
+}
+
+ThreadScheduleDebug summarize_thread_schedule(
+    const std::vector<TileTask>& tasks,
+    const std::vector<TaskRange>& ranges) {
+    ThreadScheduleDebug debug;
+    debug.ranges = static_cast<int64_t>(ranges.size());
+    int64_t last_expert = -1;
+    for (const TaskRange& range : ranges) {
+        for (size_t task_idx = range.begin; task_idx < range.end;
+             ++task_idx) {
+            const TileTask& task = tasks[task_idx];
+            debug.rows += task.rows;
+            ++debug.tasks;
+            if (debug.experts.empty() || task.expert != last_expert) {
+                debug.experts.push_back(task.expert);
+                debug.expert_rows.push_back(0);
+                last_expert = task.expert;
             }
-            consumed_rows += local_rows;
+            debug.expert_rows.back() += task.rows;
         }
-        range.end = cursor;
-        ranges[static_cast<size_t>(tid)] = range;
+    }
+    return debug;
+}
+
+void print_schedule_debug_line(const char* label,
+                               int64_t tid,
+                               const ThreadScheduleDebug& debug) {
+    std::fprintf(
+        stderr,
+        "[fused_moe_bf16_tiled][schedule] %s tid=%lld ms=%.3f rows=%lld "
+        "tiles=%lld ranges=%lld experts=%zu experts=[",
+        label,
+        static_cast<long long>(tid),
+        debug.ms,
+        static_cast<long long>(debug.rows),
+        static_cast<long long>(debug.tasks),
+        static_cast<long long>(debug.ranges),
+        debug.experts.size());
+    for (size_t i = 0; i < debug.experts.size(); ++i) {
+        if (i != 0) {
+            std::fprintf(stderr, ",");
+        }
+        std::fprintf(stderr, "%lld:%lld",
+                     static_cast<long long>(debug.experts[i]),
+                     static_cast<long long>(debug.expert_rows[i]));
+    }
+    std::fprintf(stderr, "]\n");
+}
+
+std::vector<std::vector<TaskRange>>
+split_tasks_by_expert_affinity(const std::vector<TileTask>& tasks,
+                               int64_t num_threads) {
+    std::vector<std::vector<TaskRange>> ranges(
+        static_cast<size_t>(num_threads));
+    if (tasks.empty()) {
+        return ranges;
+    }
+
+    std::vector<ExpertTaskGroup> groups;
+    groups.reserve(tasks.size());
+    size_t task_cursor = 0;
+    while (task_cursor < tasks.size()) {
+        ExpertTaskGroup group;
+        group.begin = task_cursor;
+        const int64_t expert = tasks[task_cursor].expert;
+        while (task_cursor < tasks.size() &&
+               tasks[task_cursor].expert == expert) {
+            group.rows += tasks[task_cursor].rows;
+            ++task_cursor;
+        }
+        group.end = task_cursor;
+        groups.push_back(group);
+    }
+
+    std::vector<size_t> order(groups.size());
+    std::iota(order.begin(), order.end(), size_t{0});
+    std::sort(order.begin(), order.end(), [&](size_t lhs, size_t rhs) {
+        if (groups[lhs].rows != groups[rhs].rows) {
+            return groups[lhs].rows > groups[rhs].rows;
+        }
+        return groups[lhs].begin < groups[rhs].begin;
+    });
+
+    std::vector<int64_t> thread_rows(static_cast<size_t>(num_threads), 0);
+    for (size_t group_idx : order) {
+        size_t best_tid = 0;
+        for (size_t tid = 1; tid < thread_rows.size(); ++tid) {
+            if (thread_rows[tid] < thread_rows[best_tid]) {
+                best_tid = tid;
+            }
+        }
+        const ExpertTaskGroup& group = groups[group_idx];
+        ranges[best_tid].push_back(TaskRange{group.begin, group.end});
+        thread_rows[best_tid] += group.rows;
+    }
+
+    for (std::vector<TaskRange>& thread_ranges : ranges) {
+        std::sort(thread_ranges.begin(), thread_ranges.end(),
+                  [](const TaskRange& lhs, const TaskRange& rhs) {
+                      return lhs.begin < rhs.begin;
+                  });
     }
     return ranges;
 }
@@ -608,8 +705,17 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
     const uint16_t* w2_ptr = bf16_data_const(w2.tensor);
 
     const int64_t actual_threads = num_threads;
-    std::vector<TaskRange> ranges =
-        split_tasks_by_tokens(tasks, actual_threads);
+    std::vector<std::vector<TaskRange>> ranges =
+        split_tasks_by_expert_affinity(tasks, actual_threads);
+    const int schedule_debug_level = debug_schedule_level();
+    std::vector<ThreadScheduleDebug> schedule_debug;
+    if (schedule_debug_level > 0) {
+        schedule_debug.reserve(static_cast<size_t>(actual_threads));
+        for (const std::vector<TaskRange>& thread_ranges : ranges) {
+            schedule_debug.push_back(
+                summarize_thread_schedule(tasks, thread_ranges));
+        }
+    }
 
     std::vector<ThreadScratch> scratches(static_cast<size_t>(actual_threads));
     for (ThreadScratch& scratch : scratches) {
@@ -624,72 +730,130 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
     }
 
     run_fixed_threads(actual_threads, [&](int64_t tid) {
+        const auto thread_begin = std::chrono::steady_clock::now();
         ThreadScratch& scratch = scratches[static_cast<size_t>(tid)];
-        const TaskRange range = ranges[static_cast<size_t>(tid)];
-        for (size_t task_idx = range.begin; task_idx < range.end;
-             ++task_idx) {
-            const TileTask& task = tasks[task_idx];
-            const auto& expert_routes = routes[static_cast<size_t>(
-                task.expert)];
-            const int64_t rows = task.rows;
+        const std::vector<TaskRange>& thread_ranges =
+            ranges[static_cast<size_t>(tid)];
+        for (const TaskRange& range : thread_ranges) {
+            for (size_t task_idx = range.begin; task_idx < range.end;
+                 ++task_idx) {
+                const TileTask& task = tasks[task_idx];
+                const auto& expert_routes = routes[static_cast<size_t>(
+                    task.expert)];
+                const int64_t rows = task.rows;
 
-            std::fill(scratch.input.begin(),
-                      scratch.input.begin() + rows * w13.K_pad,
-                      static_cast<uint16_t>(0));
-            for (int64_t m = 0; m < rows; ++m) {
-                const int64_t flat =
-                    expert_routes[static_cast<size_t>(
-                        task.route_begin + m)];
-                const int64_t token = flat / top_k;
-                const uint16_t* src = input_ptr + token * H;
-                uint16_t* dst = scratch.input.data() + m * w13.K_pad;
-                std::copy(src, src + H, dst);
-            }
+                std::fill(scratch.input.begin(),
+                          scratch.input.begin() + rows * w13.K_pad,
+                          static_cast<uint16_t>(0));
+                for (int64_t m = 0; m < rows; ++m) {
+                    const int64_t flat =
+                        expert_routes[static_cast<size_t>(
+                            task.route_begin + m)];
+                    const int64_t token = flat / top_k;
+                    const uint16_t* src = input_ptr + token * H;
+                    uint16_t* dst = scratch.input.data() + m * w13.K_pad;
+                    std::copy(src, src + H, dst);
+                }
 
-            std::fill(scratch.gate_up.begin(),
-                      scratch.gate_up.begin() + rows * w13.N_pad, 0.0f);
-            dispatch_fp32_gemm(
-                scratch.input.data(),
-                w13_ptr + task.expert * w13.packed_stride,
-                scratch.gate_up.data(),
-                scratch.a_reorder.data(),
-                static_cast<int>(rows),
-                static_cast<int>(w13.K_pad),
-                static_cast<int>(w13.N_pad),
-                static_cast<int>(w13.N_pad));
-            apply_gate_up_bias(scratch.gate_up.data(), rows, w13.N_pad,
-                               w13.N, task.expert, w13_bias);
+                std::fill(scratch.gate_up.begin(),
+                          scratch.gate_up.begin() + rows * w13.N_pad, 0.0f);
+                dispatch_fp32_gemm(
+                    scratch.input.data(),
+                    w13_ptr + task.expert * w13.packed_stride,
+                    scratch.gate_up.data(),
+                    scratch.a_reorder.data(),
+                    static_cast<int>(rows),
+                    static_cast<int>(w13.K_pad),
+                    static_cast<int>(w13.N_pad),
+                    static_cast<int>(w13.N_pad));
+                apply_gate_up_bias(scratch.gate_up.data(), rows, w13.N_pad,
+                                   w13.N, task.expert, w13_bias);
 
-            activation_to_bf16(
-                activation, scratch.gate_up.data(),
-                scratch.intermediate.data(), rows, w13.N_pad, w2.K_pad, F);
+                activation_to_bf16(
+                    activation, scratch.gate_up.data(),
+                    scratch.intermediate.data(), rows, w13.N_pad, w2.K_pad,
+                    F);
 
-            std::fill(scratch.down.begin(),
-                      scratch.down.begin() + rows * w2.N_pad, 0.0f);
-            dispatch_fp32_gemm(
-                scratch.intermediate.data(),
-                w2_ptr + task.expert * w2.packed_stride,
-                scratch.down.data(),
-                scratch.a_reorder.data(),
-                static_cast<int>(rows),
-                static_cast<int>(w2.K_pad),
-                static_cast<int>(w2.N_pad),
-                static_cast<int>(w2.N_pad));
+                std::fill(scratch.down.begin(),
+                          scratch.down.begin() + rows * w2.N_pad, 0.0f);
+                dispatch_fp32_gemm(
+                    scratch.intermediate.data(),
+                    w2_ptr + task.expert * w2.packed_stride,
+                    scratch.down.data(),
+                    scratch.a_reorder.data(),
+                    static_cast<int>(rows),
+                    static_cast<int>(w2.K_pad),
+                    static_cast<int>(w2.N_pad),
+                    static_cast<int>(w2.N_pad));
 
-            for (int64_t m = 0; m < rows; ++m) {
-                const int64_t flat =
-                    expert_routes[static_cast<size_t>(
-                        task.route_begin + m)];
-                float* dst = route_out_ptr + flat * H;
-                const float* src = scratch.down.data() + m * w2.N_pad;
-                const int64_t bias_base = task.expert * H;
-                for (int64_t h = 0; h < H; ++h) {
-                    dst[h] = src[h] + read_optional_bias(w2_bias,
-                                                         bias_base + h);
+                for (int64_t m = 0; m < rows; ++m) {
+                    const int64_t flat =
+                        expert_routes[static_cast<size_t>(
+                            task.route_begin + m)];
+                    float* dst = route_out_ptr + flat * H;
+                    const float* src = scratch.down.data() + m * w2.N_pad;
+                    const int64_t bias_base = task.expert * H;
+                    for (int64_t h = 0; h < H; ++h) {
+                        dst[h] = src[h] + read_optional_bias(w2_bias,
+                                                             bias_base + h);
+                    }
                 }
             }
         }
+        if (schedule_debug_level > 0) {
+            const auto thread_end = std::chrono::steady_clock::now();
+            schedule_debug[static_cast<size_t>(tid)].ms =
+                std::chrono::duration<double, std::milli>(
+                    thread_end - thread_begin).count();
+        }
     });
+
+    if (schedule_debug_level > 0) {
+        int64_t longest_tid = -1;
+        int64_t shortest_tid = -1;
+        for (int64_t tid = 0; tid < actual_threads; ++tid) {
+            const ThreadScheduleDebug& debug =
+                schedule_debug[static_cast<size_t>(tid)];
+            if (debug.rows == 0) {
+                continue;
+            }
+            if (longest_tid < 0 ||
+                debug.ms > schedule_debug[static_cast<size_t>(
+                               longest_tid)].ms) {
+                longest_tid = tid;
+            }
+            if (shortest_tid < 0 ||
+                debug.ms < schedule_debug[static_cast<size_t>(
+                               shortest_tid)].ms) {
+                shortest_tid = tid;
+            }
+        }
+        std::fprintf(
+            stderr,
+            "[fused_moe_bf16_tiled][schedule] threads=%lld experts=%lld "
+            "routes=%lld tiles=%zu strategy=expert_affinity_greedy\n",
+            static_cast<long long>(actual_threads),
+            static_cast<long long>(num_experts),
+            static_cast<long long>(num_routes),
+            tasks.size());
+        if (longest_tid >= 0) {
+            print_schedule_debug_line(
+                "longest", longest_tid,
+                schedule_debug[static_cast<size_t>(longest_tid)]);
+        }
+        if (shortest_tid >= 0) {
+            print_schedule_debug_line(
+                "shortest", shortest_tid,
+                schedule_debug[static_cast<size_t>(shortest_tid)]);
+        }
+        if (schedule_debug_level >= 2) {
+            for (int64_t tid = 0; tid < actual_threads; ++tid) {
+                print_schedule_debug_line(
+                    "thread", tid,
+                    schedule_debug[static_cast<size_t>(tid)]);
+            }
+        }
+    }
 
     at::Tensor output_acc = at::zeros(
         {num_tokens, H},
