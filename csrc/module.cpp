@@ -91,6 +91,22 @@ void kai_gemm(at::Tensor output, at::Tensor input,
               int64_t handler_ptr, int64_t pool_handle);
 void release_kai_gemm_handler(int64_t handler_ptr);
 
+// I8 GEMM declarations - i8gemm.cpp
+std::tuple<at::Tensor, at::Tensor, int64_t, int64_t, int64_t, int64_t,
+           std::string>
+i8gemm_prepare(at::Tensor weight, at::Tensor weight_scale,
+               std::string backend);
+void i8gemm_dynamic_scaled_mm(at::Tensor output,
+                              at::Tensor input,
+                              at::Tensor packed_weight,
+                              at::Tensor weight_scale,
+                              c10::optional<at::Tensor> bias,
+                              int64_t K,
+                              int64_t N,
+                              int64_t Kp,
+                              int64_t Np,
+                              int64_t nthreads);
+
 // BF16 tiled fused MoE declarations — fused_moe_bf16_tiled.cpp
 std::tuple<at::Tensor, int64_t, int64_t, at::Tensor, int64_t, int64_t>
 fused_moe_bf16_tiled_prepare_weights(at::Tensor w13_weight,
@@ -293,6 +309,22 @@ PYBIND11_MODULE(_C, m) {
 
     m.def("has_openmp", &has_openmp,
           "Return True if the C++ extension was linked with OpenMP.");
+
+    // ── I8 GEMM 接口 ──
+    m.def("i8gemm_prepare", &i8gemm_prepare,
+          "Prepare int8 [N, K] vLLM linear weight for i8 GEMM.",
+          py::arg("weight"), py::arg("weight_scale"),
+          py::arg("backend") = "auto",
+          py::call_guard<py::gil_scoped_release>());
+
+    m.def("i8gemm_dynamic_scaled_mm", &i8gemm_dynamic_scaled_mm,
+          "Dynamic per-token scaled int8 GEMM with fp32/bf16 output.",
+          py::arg("output"), py::arg("input"),
+          py::arg("packed_weight"), py::arg("weight_scale"),
+          py::arg("bias") = c10::nullopt,
+          py::arg("K"), py::arg("N"), py::arg("Kp"), py::arg("Np"),
+          py::arg("nthreads") = 0,
+          py::call_guard<py::gil_scoped_release>());
 
     m.def("fused_wqa_wkv_compressor_kv_score_indexer_compressor_kv_score_indexer_weights_proj_fused_prepare",
           &fused_wqa_wkv_compressor_kv_score_indexer_compressor_kv_score_indexer_weights_proj_fused_prepare,

@@ -19,6 +19,7 @@ class _BuildExtensionWithFixup(BuildExtension):
 
     def build_extensions(self) -> None:
         self._compile_bf16gemm_asm_sources()
+        self._compile_i8gemm_sources()
         super().build_extensions()
         if platform.system() != "Darwin":
             return
@@ -80,6 +81,51 @@ class _BuildExtensionWithFixup(BuildExtension):
             f"-I{inc}" for inc in (getattr(ext, "include_dirs", []) or [])
         ]
         cmd = [compiler, "-c", src, "-o", obj, *include_args, *asm_args]
+        subprocess.run(cmd, check=True)
+
+    def _compile_i8gemm_sources(self) -> None:
+        if not (i8gemm_c_sources or i8gemm_asm_sources):
+            return
+        obj_dir = os.path.join(self.build_temp, "i8gemm")
+        os.makedirs(obj_dir, exist_ok=True)
+        for ext in self.extensions:
+            extra_objects = list(getattr(ext, "extra_objects", []) or [])
+            for src in [*i8gemm_c_sources, *i8gemm_asm_sources]:
+                obj = os.path.join(obj_dir, os.path.basename(src) + ".o")
+                self._compile_one_i8gemm_source(src, obj, ext)
+                if obj not in extra_objects:
+                    extra_objects.append(obj)
+            ext.extra_objects = extra_objects
+
+    def _compile_one_i8gemm_source(self, src: str, obj: str, ext) -> None:
+        compiler_cmd = getattr(self.compiler, "compiler", None)
+        compiler = compiler_cmd[0] if isinstance(compiler_cmd, list) else compiler_cmd
+        compiler = os.environ.get("CC") or compiler or "cc"
+
+        extra_compile_args = getattr(ext, "extra_compile_args", []) or []
+        if isinstance(extra_compile_args, dict):
+            extra_compile_args = extra_compile_args.get("cxx", [])
+
+        native_args = []
+        keep_next = False
+        for arg in extra_compile_args:
+            if keep_next:
+                native_args.append(arg)
+                keep_next = False
+                continue
+            if arg == "-Xpreprocessor":
+                native_args.append(arg)
+                keep_next = True
+                continue
+            if arg == "-fopenmp" or arg.startswith(("-march=", "-mcpu=", "-O", "-I")):
+                native_args.append(arg)
+
+        if platform.system() != "Windows" and "-fPIC" not in native_args:
+            native_args.append("-fPIC")
+        include_args = [
+            f"-I{inc}" for inc in (getattr(ext, "include_dirs", []) or [])
+        ]
+        cmd = [compiler, "-c", src, "-o", obj, *include_args, *native_args]
         subprocess.run(cmd, check=True)
 
 
@@ -337,6 +383,8 @@ def _host_cpu_has_flag(flag: str) -> bool:
 
 sources = sorted(glob.glob("csrc/**/*.cpp", recursive=True))
 bf16gemm_asm_sources = []
+i8gemm_c_sources = []
+i8gemm_asm_sources = []
 is_aarch64 = platform.machine() in ("aarch64", "arm64")
 acl_available, acl_include_dirs, acl_library_dirs = _detect_acl()
 use_acl = is_aarch64 and acl_available
@@ -401,6 +449,46 @@ if is_aarch64:
             features.insert(0, "sve")
         extra_compile_args.append("-march=armv8.6-a+" + "+".join(features))
     extra_compile_args.append("-O3")
+
+    target_has_sve = (
+        "sve" in target_cpu.lower()
+        if target_cpu
+        else platform.system() != "Darwin" and _host_cpu_has_flag("sve")
+    )
+    i8gemm_backend = "sve" if target_has_sve else "neon"
+    i8gemm_required = [
+        os.path.join(bf16gemm_lib, "i8gemm.h"),
+        os.path.join(bf16gemm_lib, "i8gemm_pack_a_neon.S"),
+    ]
+    if i8gemm_backend == "sve":
+        i8gemm_required.extend([
+            os.path.join(bf16gemm_lib, "i8gemm_sve.c"),
+            os.path.join(bf16gemm_lib, "i8gemm_sve.S"),
+        ])
+    else:
+        i8gemm_required.extend([
+            os.path.join(bf16gemm_lib, "i8gemm_mt.c"),
+            os.path.join(bf16gemm_lib, "i8gemm_k.S"),
+            os.path.join(bf16gemm_lib, "i8gemm_k_bias.S"),
+        ])
+    if omp_available and all(os.path.isfile(p) for p in i8gemm_required):
+        if i8gemm_backend == "sve":
+            i8gemm_c_sources.append(os.path.join(bf16gemm_lib, "i8gemm_sve.c"))
+            i8gemm_asm_sources.extend([
+                os.path.join(bf16gemm_lib, "i8gemm_sve.S"),
+                os.path.join(bf16gemm_lib, "i8gemm_pack_a_neon.S"),
+            ])
+        else:
+            i8gemm_c_sources.append(os.path.join(bf16gemm_lib, "i8gemm_mt.c"))
+            i8gemm_asm_sources.extend([
+                os.path.join(bf16gemm_lib, "i8gemm_k.S"),
+                os.path.join(bf16gemm_lib, "i8gemm_k_bias.S"),
+                os.path.join(bf16gemm_lib, "i8gemm_pack_a_neon.S"),
+            ])
+        define_macros.append(("FUSED_CPP_HAS_I8GEMM", "1"))
+        define_macros.append(
+            ("FUSED_CPP_I8GEMM_BACKEND", f'"{i8gemm_backend}"')
+        )
 
 if use_acl:
     define_macros.append(("FUSED_CPP_HAS_ACL", "1"))

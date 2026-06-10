@@ -16,6 +16,8 @@ from fused_cpp.kai_gemm import (
     kai_gemm,
     kai_gemm_prepare,
 )
+from . import i8gemm
+from fused_cpp.i8gemm import PreparedI8GEMMWeight, _supports_i8gemm
 from fused_cpp.mla import CPUFusedMLAImpl
 from fused_cpp.mla.impl import _HAS_CPP
 from fused_cpp.moe import (
@@ -81,11 +83,13 @@ __all__ = [
     "KAIThreadPool",
     "PreparedDeepSeekV4AttnGemmWeights",
     "PreparedBF16TiledFusedMoEWeights",
+    "PreparedI8GEMMWeight",
     "PreparedWeight",
     "VersionInfo",
     "_HAS_DEEPSEEK_V4_ATTN_GEMM_FUSED",
     "_HAS_BF16_TILED_FUSED_MOE",
     "_supports_acl",
+    "_supports_i8gemm",
     "_supports_kai",
     "acl_gemm",
     "available_sdpa_versions",
@@ -105,6 +109,7 @@ __all__ = [
     "get_sdpa_version",
     "bf16_tiled_fused_moe",
     "has_cpp_kernels",
+    "i8gemm",
     "kai_gemm",
     "kai_gemm_prepare",
     "multi_query_attention",
