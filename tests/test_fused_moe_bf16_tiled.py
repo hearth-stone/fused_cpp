@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import os
 import platform
 
 import pytest
@@ -19,6 +20,24 @@ pytestmark = pytest.mark.skipif(
 
 def _bf16_randn(*shape: int) -> torch.Tensor:
     return (torch.randn(*shape) * 0.2).to(torch.bfloat16)
+
+
+def _bf16_normal(
+    shape: tuple[int, ...],
+    *,
+    generator: torch.Generator,
+    std: float,
+) -> torch.Tensor:
+    tensor = torch.empty(shape, dtype=torch.bfloat16)
+    return tensor.normal_(mean=0.0, std=std, generator=generator)
+
+
+def _first_affinity_cpu() -> int:
+    if hasattr(os, "sched_getaffinity"):
+        cpus = os.sched_getaffinity(0)
+        if cpus:
+            return min(cpus)
+    return 0
 
 
 def _case(seed: int = 0) -> tuple[torch.Tensor, ...]:
@@ -122,6 +141,83 @@ def test_fused_moe_bf16_tiled_threaded_matches_single_thread() -> None:
     torch.testing.assert_close(threaded.float(), serial.float(), atol=0, rtol=0)
 
 
+def test_prepare_fused_moe_bf16_tiled_weights_prepack_threads_matches_serial(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (
+        _hidden_states,
+        w13_weight,
+        w2_weight,
+        _w13_bias,
+        _w2_bias,
+        _topk_weights,
+        _topk_ids,
+    ) = _case(seed=13)
+
+    monkeypatch.setenv("FUSED_CPP_MOE_PREPACK_THREADS", "1")
+    serial = prepare_fused_moe_bf16_tiled_weights(w13_weight, w2_weight)
+
+    monkeypatch.setenv("FUSED_CPP_MOE_PREPACK_THREADS", "3")
+    threaded = prepare_fused_moe_bf16_tiled_weights(w13_weight, w2_weight)
+
+    assert threaded.w13[1:] == serial.w13[1:]
+    assert threaded.w2[1:] == serial.w2[1:]
+    torch.testing.assert_close(threaded.w13[0], serial.w13[0], atol=0, rtol=0)
+    torch.testing.assert_close(threaded.w2[0], serial.w2[0], atol=0, rtol=0)
+
+
+def test_fused_moe_bf16_tiled_hierarchical_core_skip_is_relative(
+    monkeypatch: pytest.MonkeyPatch,
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    (
+        hidden_states,
+        w13_weight,
+        w2_weight,
+        w13_bias,
+        w2_bias,
+        topk_weights,
+        topk_ids,
+    ) = _case(seed=17)
+    packed = prepare_fused_moe_bf16_tiled_weights(w13_weight, w2_weight)
+
+    monkeypatch.setenv("FUSED_CPP_MOE_HIERARCHICAL_N_SPLIT", "1")
+    monkeypatch.setenv("FUSED_CPP_MOE_N_SPLIT_CORE_SKIP", "2")
+    monkeypatch.setenv("FUSED_CPP_MOE_N_SPLIT_GROUPS_PER_PARTITION", "1")
+    monkeypatch.setenv("FUSED_CPP_MOE_SCHEDULE_DEBUG", "1")
+    monkeypatch.delenv("FUSED_CPP_MOE_N_SPLIT_CORE_BASES", raising=False)
+
+    hierarchical = fused_moe_bf16_tiled(
+        hidden_states,
+        packed,
+        topk_weights,
+        topk_ids,
+        w13_bias=w13_bias,
+        w2_bias=w2_bias,
+        num_threads=4,
+    )
+    captured = capfd.readouterr()
+
+    monkeypatch.setenv("FUSED_CPP_MOE_HIERARCHICAL_N_SPLIT", "0")
+    monkeypatch.setenv("FUSED_CPP_MOE_SCHEDULE_DEBUG", "0")
+    serial = fused_moe_bf16_tiled(
+        hidden_states,
+        packed,
+        topk_weights,
+        topk_ids,
+        w13_bias=w13_bias,
+        w2_bias=w2_bias,
+        num_threads=1,
+    )
+
+    first_cpu = _first_affinity_cpu()
+    assert (
+        f"core_bases=[{first_cpu},{first_cpu + 2}]"
+        in captured.err
+    )
+    torch.testing.assert_close(hierarchical.float(), serial.float(), atol=0, rtol=0)
+
+
 def test_fused_moe_bf16_tiled_out_buffer() -> None:
     (
         hidden_states,
@@ -153,3 +249,49 @@ def test_fused_moe_bf16_tiled_out_buffer() -> None:
         num_threads=1,
     )
     torch.testing.assert_close(out_buffer.float(), ref.float(), atol=0, rtol=0)
+
+
+@pytest.mark.slow
+def test_fused_moe_bf16_tiled_deepseek_v4_tp4_rank_shape_smoke() -> None:
+    """DeepSeek V4 Flash TP=4 rank shape smoke with reduced experts."""
+    generator = torch.Generator().manual_seed(20260218)
+    hidden_size = 4096
+    ffn_hidden_size_per_rank = 2048 // 4
+    num_experts = 20
+    top_k = 6
+    total_tokens = 2048
+
+    hidden_states = _bf16_normal(
+        (total_tokens, hidden_size),
+        generator=generator,
+        std=0.01,
+    )
+    w13_weight = _bf16_normal(
+        (num_experts, 2 * ffn_hidden_size_per_rank, hidden_size),
+        generator=generator,
+        std=0.01,
+    )
+    w2_weight = _bf16_normal(
+        (num_experts, hidden_size, ffn_hidden_size_per_rank),
+        generator=generator,
+        std=0.01,
+    )
+    routing_scores = torch.rand(total_tokens, num_experts, generator=generator)
+    topk_weights, topk_ids = torch.topk(routing_scores, k=top_k, dim=-1)
+    topk_weights = torch.softmax(topk_weights, dim=-1)
+    topk_ids = topk_ids.to(torch.int32)
+
+    packed = prepare_fused_moe_bf16_tiled_weights(w13_weight, w2_weight)
+    del w13_weight, w2_weight
+
+    out = fused_moe_bf16_tiled(
+        hidden_states,
+        packed,
+        topk_weights,
+        topk_ids,
+        num_threads=1,
+        activation="silu",
+    )
+
+    assert out.shape == hidden_states.shape
+    assert out.dtype == torch.bfloat16
