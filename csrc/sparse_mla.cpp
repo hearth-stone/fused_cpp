@@ -16,19 +16,35 @@
 #include "sdpa_pack_utils.h"
 #include "sdpa_tile_sizes.h"
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 namespace {
 
 constexpr int64_t kQueryBlock = 8;
+constexpr int64_t kIndexedLq = 4;
 constexpr int64_t kIndexedKt = 4;
-constexpr int64_t kDenseThreshold = 16;
+constexpr int64_t kIndexedRowBlocks = kQueryBlock / kIndexedLq;
+constexpr int64_t kDenseThreshold = 8;
 
 struct DenseSeg {
   int64_t start;
   int64_t length;
 };
 
+struct IndexedQktGroup {
+  int64_t idx = 0;
+  uint16_t slot_mask = 0;
+};
+
 struct IndexedTile {
   std::array<std::array<int64_t, kIndexedKt>, kQueryBlock> idx{};
+  std::array<
+      std::array<IndexedQktGroup, kIndexedLq * kIndexedKt>,
+      kIndexedRowBlocks>
+      qkt_groups{};
+  std::array<uint8_t, kIndexedRowBlocks> qkt_group_count{};
   uint64_t valid_mask = 0;
 };
 
@@ -37,6 +53,14 @@ struct BlockPlan {
   int64_t lq_eff = 0;
   std::vector<DenseSeg> dense_segments;
   std::vector<IndexedTile> indexed_tiles;
+};
+
+struct PackedDenseSeg {
+  DenseSeg seg;
+  int64_t k_sblock_stride = 0;
+  int64_t v_evblock_stride = 0;
+  std::vector<uint16_t> k_packed;
+  std::vector<at::BFloat16> v_packed;
 };
 
 struct Run {
@@ -65,6 +89,51 @@ static inline std::vector<Run> contiguous_runs(const std::vector<int64_t>& value
   }
   runs.push_back({run_pos, run_start, run_len});
   return runs;
+}
+
+static inline void add_indexed_qkt_group(
+    IndexedTile& tile,
+    int64_t row_block,
+    int64_t local_slot,
+    int64_t idx) {
+  const int64_t group_count = tile.qkt_group_count[row_block];
+  for (int64_t group_idx = 0; group_idx < group_count; ++group_idx) {
+    IndexedQktGroup& group = tile.qkt_groups[row_block][group_idx];
+    if (group.idx == idx) {
+      group.slot_mask |= static_cast<uint16_t>(uint16_t{1} << local_slot);
+      return;
+    }
+  }
+  IndexedQktGroup& group = tile.qkt_groups[row_block][group_count];
+  group.idx = idx;
+  group.slot_mask = static_cast<uint16_t>(uint16_t{1} << local_slot);
+  tile.qkt_group_count[row_block] = static_cast<uint8_t>(group_count + 1);
+}
+
+static inline void finalize_indexed_qkt_groups(
+    IndexedTile& tile,
+    int64_t lq_eff) {
+  for (int64_t row_block = 0; row_block < kIndexedRowBlocks; ++row_block) {
+    tile.qkt_group_count[row_block] = 0;
+    for (int64_t local_row = 0; local_row < kIndexedLq; ++local_row) {
+      const int64_t row = row_block * kIndexedLq + local_row;
+      if (row >= lq_eff) {
+        break;
+      }
+      for (int64_t col = 0; col < kIndexedKt; ++col) {
+        const uint64_t global_bit =
+            uint64_t{1} << (row * kIndexedKt + col);
+        if ((tile.valid_mask & global_bit) == 0) {
+          continue;
+        }
+        add_indexed_qkt_group(
+            tile,
+            row_block,
+            local_row * kIndexedKt + col,
+            tile.idx[row][col]);
+      }
+    }
+  }
 }
 
 static inline BlockPlan build_block_plan(
@@ -186,6 +255,7 @@ static inline BlockPlan build_block_plan(
         }
       }
     }
+    finalize_indexed_qkt_groups(tile, plan.lq_eff);
     plan.indexed_tiles.push_back(tile);
   }
 
@@ -266,7 +336,20 @@ static inline void pack_mqa_v_to_evblock8(
     int64_t d_v) {
   const int64_t ev_blocks = d_v / 8;
 #ifdef _OPENMP
-  #pragma omp parallel for schedule(static)
+  if (!omp_in_parallel()) {
+    #pragma omp parallel for schedule(static)
+    for (int64_t ev_block = 0; ev_block < ev_blocks; ++ev_block) {
+      scalar_t* dst_block = v_dst + ev_block * s * 8;
+      const int64_t ev = ev_block * 8;
+      for (int64_t row = 0; row < s; ++row) {
+        std::memcpy(
+            dst_block + row * 8,
+            v_src + row * v_row_stride + ev,
+            8 * sizeof(scalar_t));
+      }
+    }
+    return;
+  }
 #endif
   for (int64_t ev_block = 0; ev_block < ev_blocks; ++ev_block) {
     scalar_t* dst_block = v_dst + ev_block * s * 8;
@@ -278,6 +361,41 @@ static inline void pack_mqa_v_to_evblock8(
           8 * sizeof(scalar_t));
     }
   }
+}
+
+static inline PackedDenseSeg pack_dense_segment_bf16(
+    const at::BFloat16* kv_ptr,
+    int64_t d_qk,
+    int64_t d_v,
+    const DenseSeg& seg) {
+  PackedDenseSeg packed;
+  packed.seg = seg;
+
+  const int64_t e_main = d_qk & ~int64_t{3};
+  const int64_t e_blocks = e_main / 4;
+  packed.k_sblock_stride = e_blocks * 32;
+  packed.v_evblock_stride = seg.length * 8;
+
+  const at::BFloat16* kv_seg = kv_ptr + seg.start * d_qk;
+  const int64_t s_blocks = seg.length / 8;
+  packed.k_packed.resize(
+      static_cast<size_t>(s_blocks * packed.k_sblock_stride));
+  for (int64_t sb = 0; sb < s_blocks; ++sb) {
+    ::fused_cpp::sdpa_microkernels::pack_k_8rows_to_seq_bf16(
+        kv_seg + sb * 8 * d_qk,
+        /*k_row_stride=*/d_qk,
+        d_qk,
+        packed.k_packed.data() + sb * packed.k_sblock_stride);
+  }
+
+  packed.v_packed.resize(static_cast<size_t>((d_v / 8) * seg.length * 8));
+  pack_mqa_v_to_evblock8<at::BFloat16>(
+      kv_seg,
+      d_qk,
+      packed.v_packed.data(),
+      seg.length,
+      d_v);
+  return packed;
 }
 
 static inline void store_normalized_bf16_row(
@@ -850,7 +968,10 @@ static inline float dot_qk(const scalar_t* q, const scalar_t* k, int64_t dim) {
 
 #if FUSED_CPP_SDPA_CACHE_HAS_NEON
 
-static inline float dot_qk(const float* q, const float* k, int64_t dim) {
+[[maybe_unused]] static inline float dot_qk(
+    const float* q,
+    const float* k,
+    int64_t dim) {
   float32x4_t acc = vdupq_n_f32(0.0f);
   int64_t e = 0;
   for (; e + 4 <= dim; e += 4) {
@@ -865,7 +986,7 @@ static inline float dot_qk(const float* q, const float* k, int64_t dim) {
   return sum;
 }
 
-static inline float dot_qk(
+[[maybe_unused]] static inline float dot_qk(
     const at::BFloat16* q,
     const at::BFloat16* k,
     int64_t dim) {
@@ -888,6 +1009,379 @@ static inline float dot_qk(
 }
 
 #endif
+
+template <typename scalar_t>
+static inline void compute_indexed_qkt_4x4_scalar(
+    const scalar_t* q_block,
+    int64_t q_row_stride,
+    const scalar_t* kv,
+    int64_t kv_row_stride,
+    int64_t d_qk,
+    float scale,
+    int64_t s_kv,
+    const IndexedTile& tile,
+    int64_t row_block,
+    int64_t row_count,
+    float* scores) {
+  std::fill(scores, scores + kIndexedLq * kIndexedKt, 0.0f);
+  for (int64_t local_row = 0; local_row < row_count; ++local_row) {
+    const int64_t row = row_block * kIndexedLq + local_row;
+    const scalar_t* q_row = q_block + local_row * q_row_stride;
+    for (int64_t col = 0; col < kIndexedKt; ++col) {
+      const uint64_t global_bit = uint64_t{1} << (row * kIndexedKt + col);
+      if ((tile.valid_mask & global_bit) == 0) {
+        continue;
+      }
+      const int64_t idx = tile.idx[row][col];
+      TORCH_CHECK(
+          idx >= 0 && idx < s_kv,
+          "sparse_mla: index out of range: ",
+          idx,
+          " for s_kv=",
+          s_kv);
+      scores[local_row * kIndexedKt + col] =
+          dot_qk(q_row, kv + idx * kv_row_stride, d_qk) * scale;
+    }
+  }
+}
+
+#if FUSED_CPP_SDPA_CACHE_HAS_NEON
+
+static inline float32x4_t load_as_fp32x4(const float* ptr) {
+  return vld1q_f32(ptr);
+}
+
+static inline float32x4_t load_as_fp32x4(const at::BFloat16* ptr) {
+  const auto* u16 = reinterpret_cast<const uint16_t*>(ptr);
+  const uint16x4_t v = vld1_u16(u16);
+  return vreinterpretq_f32_u32(vshlq_n_u32(vmovl_u16(v), 16));
+}
+
+static inline bool indexed_qkt_row_block_full_valid(
+    const IndexedTile& tile,
+    int64_t row_block) {
+  const uint64_t block_mask =
+      uint64_t{0xffff} << (row_block * kIndexedLq * kIndexedKt);
+  return (tile.valid_mask & block_mask) == block_mask;
+}
+
+template <typename scalar_t>
+static inline void compute_indexed_qkt_4x4_fmla_direct_full(
+    const scalar_t* q_block,
+    int64_t q_row_stride,
+    const scalar_t* kv,
+    int64_t kv_row_stride,
+    int64_t d_qk,
+    float scale,
+    int64_t s_kv,
+    const IndexedTile& tile,
+    int64_t row_block,
+    float* scores) {
+  const int64_t row_base = row_block * kIndexedLq;
+  for (int64_t local_row = 0; local_row < kIndexedLq; ++local_row) {
+    const int64_t row = row_base + local_row;
+    for (int64_t col = 0; col < kIndexedKt; ++col) {
+      const int64_t idx = tile.idx[row][col];
+      TORCH_CHECK(
+          idx >= 0 && idx < s_kv,
+          "sparse_mla: index out of range: ",
+          idx,
+          " for s_kv=",
+          s_kv);
+    }
+  }
+
+  float32x4_t c00 = vdupq_n_f32(0.0f);
+  float32x4_t c01 = vdupq_n_f32(0.0f);
+  float32x4_t c02 = vdupq_n_f32(0.0f);
+  float32x4_t c03 = vdupq_n_f32(0.0f);
+  float32x4_t c10 = vdupq_n_f32(0.0f);
+  float32x4_t c11 = vdupq_n_f32(0.0f);
+  float32x4_t c12 = vdupq_n_f32(0.0f);
+  float32x4_t c13 = vdupq_n_f32(0.0f);
+  float32x4_t c20 = vdupq_n_f32(0.0f);
+  float32x4_t c21 = vdupq_n_f32(0.0f);
+  float32x4_t c22 = vdupq_n_f32(0.0f);
+  float32x4_t c23 = vdupq_n_f32(0.0f);
+  float32x4_t c30 = vdupq_n_f32(0.0f);
+  float32x4_t c31 = vdupq_n_f32(0.0f);
+  float32x4_t c32 = vdupq_n_f32(0.0f);
+  float32x4_t c33 = vdupq_n_f32(0.0f);
+
+  const int64_t i00 = tile.idx[row_base + 0][0];
+  const int64_t i01 = tile.idx[row_base + 0][1];
+  const int64_t i02 = tile.idx[row_base + 0][2];
+  const int64_t i03 = tile.idx[row_base + 0][3];
+  const int64_t i10 = tile.idx[row_base + 1][0];
+  const int64_t i11 = tile.idx[row_base + 1][1];
+  const int64_t i12 = tile.idx[row_base + 1][2];
+  const int64_t i13 = tile.idx[row_base + 1][3];
+  const int64_t i20 = tile.idx[row_base + 2][0];
+  const int64_t i21 = tile.idx[row_base + 2][1];
+  const int64_t i22 = tile.idx[row_base + 2][2];
+  const int64_t i23 = tile.idx[row_base + 2][3];
+  const int64_t i30 = tile.idx[row_base + 3][0];
+  const int64_t i31 = tile.idx[row_base + 3][1];
+  const int64_t i32 = tile.idx[row_base + 3][2];
+  const int64_t i33 = tile.idx[row_base + 3][3];
+
+  int64_t e = 0;
+  for (; e + 4 <= d_qk; e += 4) {
+    const float32x4_t q0 = load_as_fp32x4(q_block + 0 * q_row_stride + e);
+    const float32x4_t q1 = load_as_fp32x4(q_block + 1 * q_row_stride + e);
+    const float32x4_t q2 = load_as_fp32x4(q_block + 2 * q_row_stride + e);
+    const float32x4_t q3 = load_as_fp32x4(q_block + 3 * q_row_stride + e);
+
+    c00 = vfmaq_f32(c00, q0, load_as_fp32x4(kv + i00 * kv_row_stride + e));
+    c01 = vfmaq_f32(c01, q0, load_as_fp32x4(kv + i01 * kv_row_stride + e));
+    c02 = vfmaq_f32(c02, q0, load_as_fp32x4(kv + i02 * kv_row_stride + e));
+    c03 = vfmaq_f32(c03, q0, load_as_fp32x4(kv + i03 * kv_row_stride + e));
+    c10 = vfmaq_f32(c10, q1, load_as_fp32x4(kv + i10 * kv_row_stride + e));
+    c11 = vfmaq_f32(c11, q1, load_as_fp32x4(kv + i11 * kv_row_stride + e));
+    c12 = vfmaq_f32(c12, q1, load_as_fp32x4(kv + i12 * kv_row_stride + e));
+    c13 = vfmaq_f32(c13, q1, load_as_fp32x4(kv + i13 * kv_row_stride + e));
+    c20 = vfmaq_f32(c20, q2, load_as_fp32x4(kv + i20 * kv_row_stride + e));
+    c21 = vfmaq_f32(c21, q2, load_as_fp32x4(kv + i21 * kv_row_stride + e));
+    c22 = vfmaq_f32(c22, q2, load_as_fp32x4(kv + i22 * kv_row_stride + e));
+    c23 = vfmaq_f32(c23, q2, load_as_fp32x4(kv + i23 * kv_row_stride + e));
+    c30 = vfmaq_f32(c30, q3, load_as_fp32x4(kv + i30 * kv_row_stride + e));
+    c31 = vfmaq_f32(c31, q3, load_as_fp32x4(kv + i31 * kv_row_stride + e));
+    c32 = vfmaq_f32(c32, q3, load_as_fp32x4(kv + i32 * kv_row_stride + e));
+    c33 = vfmaq_f32(c33, q3, load_as_fp32x4(kv + i33 * kv_row_stride + e));
+  }
+
+  scores[0] = vaddvq_f32(c00);
+  scores[1] = vaddvq_f32(c01);
+  scores[2] = vaddvq_f32(c02);
+  scores[3] = vaddvq_f32(c03);
+  scores[4] = vaddvq_f32(c10);
+  scores[5] = vaddvq_f32(c11);
+  scores[6] = vaddvq_f32(c12);
+  scores[7] = vaddvq_f32(c13);
+  scores[8] = vaddvq_f32(c20);
+  scores[9] = vaddvq_f32(c21);
+  scores[10] = vaddvq_f32(c22);
+  scores[11] = vaddvq_f32(c23);
+  scores[12] = vaddvq_f32(c30);
+  scores[13] = vaddvq_f32(c31);
+  scores[14] = vaddvq_f32(c32);
+  scores[15] = vaddvq_f32(c33);
+
+  if (e < d_qk) {
+    for (int64_t local_row = 0; local_row < kIndexedLq; ++local_row) {
+      const int64_t row = row_base + local_row;
+      const scalar_t* q_row = q_block + local_row * q_row_stride;
+      for (int64_t col = 0; col < kIndexedKt; ++col) {
+        const int64_t idx = tile.idx[row][col];
+        const scalar_t* k_row = kv + idx * kv_row_stride;
+        float tail_sum = 0.0f;
+        for (int64_t e_tail = e; e_tail < d_qk; ++e_tail) {
+          tail_sum +=
+              scalar_to_float(q_row[e_tail]) * scalar_to_float(k_row[e_tail]);
+        }
+        scores[local_row * kIndexedKt + col] += tail_sum;
+      }
+    }
+  }
+
+  for (int64_t slot = 0; slot < kIndexedLq * kIndexedKt; ++slot) {
+    scores[slot] *= scale;
+  }
+}
+
+template <typename scalar_t>
+static inline void compute_indexed_qkt_4x4_fmla(
+    const scalar_t* q_block,
+    int64_t q_row_stride,
+    const scalar_t* kv,
+    int64_t kv_row_stride,
+    int64_t d_qk,
+    float scale,
+    int64_t s_kv,
+    const IndexedTile& tile,
+    int64_t row_block,
+    int64_t row_count,
+    float* scores) {
+  const int64_t group_count = tile.qkt_group_count[row_block];
+  std::fill(scores, scores + kIndexedLq * kIndexedKt, 0.0f);
+  if (group_count == 0) {
+    return;
+  }
+  if (row_count == kIndexedLq &&
+      group_count == kIndexedLq * kIndexedKt &&
+      indexed_qkt_row_block_full_valid(tile, row_block)) {
+    compute_indexed_qkt_4x4_fmla_direct_full(
+        q_block,
+        q_row_stride,
+        kv,
+        kv_row_stride,
+        d_qk,
+        scale,
+        s_kv,
+        tile,
+        row_block,
+        scores);
+    return;
+  }
+  for (int64_t group_idx = 0; group_idx < group_count; ++group_idx) {
+    const int64_t idx = tile.qkt_groups[row_block][group_idx].idx;
+    TORCH_CHECK(
+        idx >= 0 && idx < s_kv,
+        "sparse_mla: index out of range: ",
+        idx,
+        " for s_kv=",
+        s_kv);
+  }
+
+  float32x4_t c00 = vdupq_n_f32(0.0f);
+  float32x4_t c01 = vdupq_n_f32(0.0f);
+  float32x4_t c02 = vdupq_n_f32(0.0f);
+  float32x4_t c03 = vdupq_n_f32(0.0f);
+  float32x4_t c10 = vdupq_n_f32(0.0f);
+  float32x4_t c11 = vdupq_n_f32(0.0f);
+  float32x4_t c12 = vdupq_n_f32(0.0f);
+  float32x4_t c13 = vdupq_n_f32(0.0f);
+  float32x4_t c20 = vdupq_n_f32(0.0f);
+  float32x4_t c21 = vdupq_n_f32(0.0f);
+  float32x4_t c22 = vdupq_n_f32(0.0f);
+  float32x4_t c23 = vdupq_n_f32(0.0f);
+  float32x4_t c30 = vdupq_n_f32(0.0f);
+  float32x4_t c31 = vdupq_n_f32(0.0f);
+  float32x4_t c32 = vdupq_n_f32(0.0f);
+  float32x4_t c33 = vdupq_n_f32(0.0f);
+
+  int64_t e = 0;
+  for (; e + 4 <= d_qk; e += 4) {
+    const float32x4_t q0 =
+        row_count > 0 ? load_as_fp32x4(q_block + 0 * q_row_stride + e)
+                      : vdupq_n_f32(0.0f);
+    const float32x4_t q1 =
+        row_count > 1 ? load_as_fp32x4(q_block + 1 * q_row_stride + e)
+                      : vdupq_n_f32(0.0f);
+    const float32x4_t q2 =
+        row_count > 2 ? load_as_fp32x4(q_block + 2 * q_row_stride + e)
+                      : vdupq_n_f32(0.0f);
+    const float32x4_t q3 =
+        row_count > 3 ? load_as_fp32x4(q_block + 3 * q_row_stride + e)
+                      : vdupq_n_f32(0.0f);
+
+    for (int64_t group_idx = 0; group_idx < group_count; ++group_idx) {
+      const IndexedQktGroup& group = tile.qkt_groups[row_block][group_idx];
+      const float32x4_t kv_vec =
+          load_as_fp32x4(kv + group.idx * kv_row_stride + e);
+      uint16_t mask = group.slot_mask;
+      while (mask != 0) {
+        const int slot = __builtin_ctz(static_cast<unsigned int>(mask));
+        switch (slot) {
+          case 0: c00 = vfmaq_f32(c00, q0, kv_vec); break;
+          case 1: c01 = vfmaq_f32(c01, q0, kv_vec); break;
+          case 2: c02 = vfmaq_f32(c02, q0, kv_vec); break;
+          case 3: c03 = vfmaq_f32(c03, q0, kv_vec); break;
+          case 4: c10 = vfmaq_f32(c10, q1, kv_vec); break;
+          case 5: c11 = vfmaq_f32(c11, q1, kv_vec); break;
+          case 6: c12 = vfmaq_f32(c12, q1, kv_vec); break;
+          case 7: c13 = vfmaq_f32(c13, q1, kv_vec); break;
+          case 8: c20 = vfmaq_f32(c20, q2, kv_vec); break;
+          case 9: c21 = vfmaq_f32(c21, q2, kv_vec); break;
+          case 10: c22 = vfmaq_f32(c22, q2, kv_vec); break;
+          case 11: c23 = vfmaq_f32(c23, q2, kv_vec); break;
+          case 12: c30 = vfmaq_f32(c30, q3, kv_vec); break;
+          case 13: c31 = vfmaq_f32(c31, q3, kv_vec); break;
+          case 14: c32 = vfmaq_f32(c32, q3, kv_vec); break;
+          case 15: c33 = vfmaq_f32(c33, q3, kv_vec); break;
+          default: break;
+        }
+        mask = static_cast<uint16_t>(mask & (mask - 1));
+      }
+    }
+  }
+
+  scores[0] = vaddvq_f32(c00);
+  scores[1] = vaddvq_f32(c01);
+  scores[2] = vaddvq_f32(c02);
+  scores[3] = vaddvq_f32(c03);
+  scores[4] = vaddvq_f32(c10);
+  scores[5] = vaddvq_f32(c11);
+  scores[6] = vaddvq_f32(c12);
+  scores[7] = vaddvq_f32(c13);
+  scores[8] = vaddvq_f32(c20);
+  scores[9] = vaddvq_f32(c21);
+  scores[10] = vaddvq_f32(c22);
+  scores[11] = vaddvq_f32(c23);
+  scores[12] = vaddvq_f32(c30);
+  scores[13] = vaddvq_f32(c31);
+  scores[14] = vaddvq_f32(c32);
+  scores[15] = vaddvq_f32(c33);
+
+  if (e < d_qk) {
+    for (int64_t local_row = 0; local_row < row_count; ++local_row) {
+      const int64_t row = row_block * kIndexedLq + local_row;
+      const scalar_t* q_row = q_block + local_row * q_row_stride;
+      for (int64_t col = 0; col < kIndexedKt; ++col) {
+        const uint64_t global_bit = uint64_t{1} << (row * kIndexedKt + col);
+        if ((tile.valid_mask & global_bit) == 0) {
+          continue;
+        }
+        const int64_t idx = tile.idx[row][col];
+        const scalar_t* k_row = kv + idx * kv_row_stride;
+        float tail_sum = 0.0f;
+        for (int64_t e_tail = e; e_tail < d_qk; ++e_tail) {
+          tail_sum +=
+              scalar_to_float(q_row[e_tail]) * scalar_to_float(k_row[e_tail]);
+        }
+        scores[local_row * kIndexedKt + col] += tail_sum;
+      }
+    }
+  }
+
+  for (int64_t slot = 0; slot < kIndexedLq * kIndexedKt; ++slot) {
+    scores[slot] *= scale;
+  }
+}
+
+#endif
+
+template <typename scalar_t>
+static inline void compute_indexed_qkt_4x4(
+    const scalar_t* q_block,
+    int64_t q_row_stride,
+    const scalar_t* kv,
+    int64_t kv_row_stride,
+    int64_t d_qk,
+    float scale,
+    int64_t s_kv,
+    const IndexedTile& tile,
+    int64_t row_block,
+    int64_t row_count,
+    float* scores) {
+#if FUSED_CPP_SDPA_CACHE_HAS_NEON
+  compute_indexed_qkt_4x4_fmla(
+      q_block,
+      q_row_stride,
+      kv,
+      kv_row_stride,
+      d_qk,
+      scale,
+      s_kv,
+      tile,
+      row_block,
+      row_count,
+      scores);
+#else
+  compute_indexed_qkt_4x4_scalar(
+      q_block,
+      q_row_stride,
+      kv,
+      kv_row_stride,
+      d_qk,
+      scale,
+      s_kv,
+      tile,
+      row_block,
+      row_count,
+      scores);
+#endif
+}
 
 static inline void scale_row(float* row, float factor, int64_t len) {
   int64_t i = 0;
@@ -976,6 +1470,151 @@ static inline float exp_sum_to(
     sum += p;
   }
   return sum;
+}
+
+template <bool kReturnStats>
+static inline void update_dense_segment_packqkv_style_bf16(
+    const at::BFloat16* q_block,
+    int64_t q_row_stride,
+    const at::BFloat16* kv_seg,
+    int64_t kv_row_stride,
+    const PackedDenseSeg& packed,
+    int64_t d_qk,
+    int64_t d_v,
+    int64_t sc_l2,
+    float scale,
+    float* running_max,
+    float* running_sum,
+    float* output_acc,
+    float* real_max,
+    float* real_sum,
+    std::vector<float>& scores,
+    std::vector<at::BFloat16>& p_hat_bf16,
+    std::vector<uint16_t>& q_seq) {
+  using ::fused_cpp::sdpa_flash2_neon_l3kv_impl::max_update_impl;
+  using ::fused_cpp::sdpa_flash2_neon_l3kv_impl::scale_inplace_impl;
+  using ::fused_cpp::sdpa_flash2_neon_l3kv_impl::vectorized_exp_minus_bf16_impl;
+
+  const int64_t seg_len = packed.seg.length;
+  const int64_t e_main = d_qk & ~int64_t{3};
+  const int64_t qblock_u16 = (e_main / 4) * 32;
+  q_seq.resize(static_cast<size_t>(qblock_u16));
+  ::fused_cpp::sdpa_microkernels::pack_q_8rows_to_seq_bf16(
+      q_block,
+      q_row_stride,
+      d_qk,
+      q_seq.data());
+
+  const int64_t chunk_step =
+      std::max<int64_t>(kQueryBlock, (sc_l2 / kQueryBlock) * kQueryBlock);
+  alignas(64) float tmp_qkt[kQueryBlock * kQueryBlock];
+
+  for (int64_t s_l2 = 0; s_l2 < seg_len; s_l2 += chunk_step) {
+    const int64_t sc_cur = std::min<int64_t>(chunk_step, seg_len - s_l2);
+    scores.resize(static_cast<size_t>(kQueryBlock * sc_cur));
+    p_hat_bf16.resize(static_cast<size_t>(kQueryBlock * sc_cur));
+
+    {
+      FUSED_CPP_SDPA_PROFILE_SCOPE(::fused_cpp::sdpa_profile::Slot::kQkt);
+      int64_t s_off = 0;
+      for (; s_off + kQueryBlock <= sc_cur; s_off += kQueryBlock) {
+        const int64_t s_abs = s_l2 + s_off;
+        const at::BFloat16* k_tile_orig = kv_seg + s_abs * kv_row_stride;
+        const uint16_t* k_seq =
+            packed.k_packed.data() +
+            (s_abs / kQueryBlock) * packed.k_sblock_stride;
+        ::fused_cpp::sdpa_microkernels::
+            gemm_qkt_microkernel_8x8_bf16_packqk_seq4_bmajor_inner(
+                q_seq.data(),
+                q_block,
+                q_row_stride,
+                k_seq,
+                k_tile_orig,
+                kv_row_stride,
+                d_qk,
+                scale,
+                tmp_qkt);
+        for (int64_t row = 0; row < kQueryBlock; ++row) {
+          ::fused_cpp::sdpa_pack_utils::copy_f32x8(
+              tmp_qkt + row * kQueryBlock,
+              scores.data() + row * sc_cur + s_off);
+        }
+      }
+      if (s_off < sc_cur) {
+        const at::BFloat16* k_tile_orig = kv_seg + (s_l2 + s_off) * kv_row_stride;
+        ::fused_cpp::sdpa_microkernels::gemm_qkt_tail(
+            q_block,
+            q_row_stride,
+            k_tile_orig,
+            kv_row_stride,
+            d_qk,
+            scale,
+            scores.data() + s_off,
+            sc_cur,
+            kQueryBlock,
+            static_cast<int>(sc_cur - s_off));
+      }
+    }
+
+    float new_max[kQueryBlock];
+    {
+      FUSED_CPP_SDPA_PROFILE_SCOPE(::fused_cpp::sdpa_profile::Slot::kSoftmax);
+      for (int64_t row = 0; row < kQueryBlock; ++row) {
+        const float* scores_row = scores.data() + row * sc_cur;
+        const float tile_max =
+            max_update_impl(-std::numeric_limits<float>::infinity(),
+                            scores_row,
+                            sc_cur);
+
+        if constexpr (kReturnStats) {
+          const float real_new_max = std::max(real_max[row], tile_max);
+          float real_tile_sum = 0.0f;
+          for (int64_t col = 0; col < sc_cur; ++col) {
+            real_tile_sum += std::exp(scores_row[col] - real_new_max);
+          }
+          real_sum[row] =
+              real_sum[row] * std::exp(real_max[row] - real_new_max) +
+              real_tile_sum;
+          real_max[row] = real_new_max;
+        }
+
+        new_max[row] = std::max(running_max[row], tile_max);
+        const float correction = std::exp(running_max[row] - new_max[row]);
+        running_sum[row] *= correction;
+        scale_inplace_impl(output_acc + row * d_v, correction, d_v);
+
+        at::BFloat16* p_row = p_hat_bf16.data() + row * sc_cur;
+        running_sum[row] += vectorized_exp_minus_bf16_impl<5>(
+            p_row,
+            scores_row,
+            new_max[row],
+            sc_cur);
+      }
+    }
+
+    {
+      FUSED_CPP_SDPA_PROFILE_SCOPE(::fused_cpp::sdpa_profile::Slot::kPv);
+      for (int64_t ev_off = 0; ev_off < d_v; ev_off += 8) {
+        const at::BFloat16* v_tile =
+            packed.v_packed.data() +
+            (ev_off >> 3) * packed.v_evblock_stride +
+            s_l2 * 8;
+        ::fused_cpp::sdpa_microkernels::MK_QkPackqkSeq4BmajorPvPquad::
+            pv_8x8_pbf16(
+                p_hat_bf16.data(),
+                sc_cur,
+                v_tile,
+                /*v_row_stride=*/8,
+                sc_cur,
+                output_acc + ev_off,
+                d_v);
+      }
+    }
+
+    for (int64_t row = 0; row < kQueryBlock; ++row) {
+      running_max[row] = new_max[row];
+    }
+  }
 }
 
 template <bool kReturnStats, typename scalar_t>
@@ -1176,6 +1815,74 @@ static inline void store_output_row(
   }
 }
 
+struct SparseMlaPlanTask {
+  int64_t plan_idx = 0;
+  int64_t work = 0;
+};
+
+static inline int64_t popcount_u64(uint64_t value) {
+#if defined(__GNUC__) || defined(__clang__)
+  return static_cast<int64_t>(__builtin_popcountll(value));
+#else
+  int64_t count = 0;
+  while (value != 0) {
+    value &= value - 1;
+    ++count;
+  }
+  return count;
+#endif
+}
+
+static inline int64_t estimate_plan_attention_pairs(const BlockPlan& plan) {
+  int64_t pairs = 0;
+  for (const DenseSeg& seg : plan.dense_segments) {
+    pairs += plan.lq_eff * seg.length;
+  }
+  for (const IndexedTile& tile : plan.indexed_tiles) {
+    pairs += popcount_u64(tile.valid_mask);
+  }
+  return std::max<int64_t>(pairs, 1);
+}
+
+static inline std::vector<SparseMlaPlanTask> build_sparse_mla_task_order(
+    const std::vector<BlockPlan>& plans) {
+  std::vector<SparseMlaPlanTask> order;
+  order.reserve(plans.size());
+  for (int64_t i = 0; i < static_cast<int64_t>(plans.size()); ++i) {
+    order.push_back({i, estimate_plan_attention_pairs(plans[i])});
+  }
+  std::stable_sort(
+      order.begin(),
+      order.end(),
+      [](const SparseMlaPlanTask& a, const SparseMlaPlanTask& b) {
+        if (a.work != b.work) {
+          return a.work > b.work;
+        }
+        return a.plan_idx > b.plan_idx;
+      });
+  return order;
+}
+
+static inline int sparse_mla_max_parallel_groups_mqa(
+    int64_t s_kv,
+    int64_t d_qk,
+    size_t elem_size,
+    int requested_threads) {
+  if (requested_threads <= 1) {
+    return 1;
+  }
+
+  // sparse MLA currently only supports MQA (`h_kv == 1`), so all query blocks
+  // and heads read the same KV resident set. Unlike the old MHA-style cap,
+  // increasing the number of parallel attention groups does not require one KV
+  // copy per group. If a future cap is needed, it should be based on per-worker
+  // packed scratch, not on raw shared KV bytes.
+  (void)s_kv;
+  (void)d_qk;
+  (void)elem_size;
+  return requested_threads;
+}
+
 template <typename scalar_t, bool kReturnStats>
 static inline void run_sparse_mla_kernel(
     const at::Tensor& q,
@@ -1207,12 +1914,46 @@ static inline void run_sparse_mla_kernel(
       sink_tensor == nullptr ? nullptr : sink_tensor->data_ptr<float>();
 
   const std::vector<BlockPlan> plans = build_sparse_mla_plans(idx_ptr, s_q, topk);
+  const auto dense_ts = ::fused_cpp::sdpa_tile_sizes::compute_tile_sizes_l3kv(
+      /*B=*/1,
+      h_q,
+      topk,
+      s_q,
+      d_qk,
+      d_v,
+      sizeof(scalar_t));
+  const std::vector<SparseMlaPlanTask> task_order =
+      build_sparse_mla_task_order(plans);
 
-  std::vector<float> output_acc(kQueryBlock * d_v);
-  std::vector<float> dense_scores;
-  std::vector<float> dense_p_hat;
+  const auto process_task = [&](int64_t task_pos) {
+    const BlockPlan& plan = plans[task_order[task_pos].plan_idx];
+    std::vector<float> output_acc(kQueryBlock * d_v);
+    std::vector<float> dense_scores;
+    std::vector<float> dense_p_hat;
+    std::vector<at::BFloat16> dense_p_hat_bf16;
+    std::vector<uint16_t> dense_q_seq;
 
-  for (const BlockPlan& plan : plans) {
+    std::vector<PackedDenseSeg> packed_dense_segments;
+    bool use_packqkv_dense_segments = false;
+    if constexpr (std::is_same_v<scalar_t, at::BFloat16>) {
+      use_packqkv_dense_segments =
+          plan.lq_eff == kQueryBlock && d_v % 8 == 0;
+      if (use_packqkv_dense_segments) {
+        packed_dense_segments.reserve(plan.dense_segments.size());
+        for (const DenseSeg& seg : plan.dense_segments) {
+          if (seg.length % kQueryBlock != 0) {
+            use_packqkv_dense_segments = false;
+            break;
+          }
+          packed_dense_segments.push_back(
+              pack_dense_segment_bf16(kv_ptr, d_qk, d_v, seg));
+        }
+      }
+      if (!use_packqkv_dense_segments) {
+        packed_dense_segments.clear();
+      }
+    }
+
     for (int64_t head = 0; head < h_q; ++head) {
       std::array<float, kQueryBlock> running_max;
       std::array<float, kQueryBlock> running_sum;
@@ -1230,7 +1971,10 @@ static inline void run_sparse_mla_kernel(
       const scalar_t* q_block =
           q_ptr + (plan.token0 * h_q + head) * d_qk;
 
-      for (const DenseSeg& seg : plan.dense_segments) {
+      for (int64_t seg_idx = 0;
+           seg_idx < static_cast<int64_t>(plan.dense_segments.size());
+           ++seg_idx) {
+        const DenseSeg& seg = plan.dense_segments[seg_idx];
         TORCH_CHECK(
             seg.start >= 0 && seg.start + seg.length <= s_kv,
             "sparse_mla: index out of range in dense segment start=",
@@ -1240,6 +1984,29 @@ static inline void run_sparse_mla_kernel(
             ", s_kv=",
             s_kv);
         const scalar_t* k_seg = kv_ptr + seg.start * d_qk;
+        if constexpr (std::is_same_v<scalar_t, at::BFloat16>) {
+          if (use_packqkv_dense_segments) {
+            update_dense_segment_packqkv_style_bf16<kReturnStats>(
+                q_block,
+                h_q * d_qk,
+                k_seg,
+                d_qk,
+                packed_dense_segments[seg_idx],
+                d_qk,
+                d_v,
+                dense_ts.Sc_l2,
+                scale,
+                running_max.data(),
+                running_sum.data(),
+                output_acc.data(),
+                real_max.data(),
+                real_sum.data(),
+                dense_scores,
+                dense_p_hat_bf16,
+                dense_q_seq);
+            continue;
+          }
+        }
         update_dense_segment_sdpa_style<kReturnStats>(
             q_block,
             h_q * d_qk,
@@ -1259,43 +2026,57 @@ static inline void run_sparse_mla_kernel(
       }
 
       for (const IndexedTile& tile : plan.indexed_tiles) {
-        for (int64_t row = 0; row < plan.lq_eff; ++row) {
-          int64_t gathered_idx[kIndexedKt];
-          float scores[kIndexedKt];
-          int64_t count = 0;
-          const scalar_t* q_row =
-              q_ptr + ((plan.token0 + row) * h_q + head) * d_qk;
-          for (int64_t col = 0; col < kIndexedKt; ++col) {
-            if ((tile.valid_mask & (uint64_t{1} << (row * kIndexedKt + col))) == 0) {
-              continue;
-            }
-            const int64_t idx = tile.idx[row][col];
-            TORCH_CHECK(
-                idx >= 0 && idx < s_kv,
-                "sparse_mla: index out of range: ",
-                idx,
-                " for s_kv=",
-                s_kv);
-            gathered_idx[count] = idx;
-            scores[count] = dot_qk(q_row, kv_ptr + idx * d_qk, d_qk) * scale;
-            ++count;
-          }
-          if (count == 0) {
-            continue;
-          }
-          update_indexed_row<kReturnStats>(
-              scores,
-              gathered_idx,
-              count,
+        for (int64_t row0 = 0; row0 < plan.lq_eff; row0 += kIndexedLq) {
+          const int64_t row_block = row0 / kIndexedLq;
+          const int64_t row_count =
+              std::min<int64_t>(kIndexedLq, plan.lq_eff - row0);
+          const scalar_t* q_block4 =
+              q_ptr + ((plan.token0 + row0) * h_q + head) * d_qk;
+          float qkt_scores[kIndexedLq * kIndexedKt];
+          compute_indexed_qkt_4x4(
+              q_block4,
+              h_q * d_qk,
               kv_ptr,
               d_qk,
-              d_v,
-              row,
-              running_max.data(),
-              running_sum.data(),
-              output_acc.data(),
-              real_max.data(),
-              real_sum.data());
+              d_qk,
+              scale,
+              s_kv,
+              tile,
+              row_block,
+              row_count,
+              qkt_scores);
+
+          for (int64_t local_row = 0; local_row < row_count; ++local_row) {
+            const int64_t row = row0 + local_row;
+            int64_t gathered_idx[kIndexedKt];
+            float scores[kIndexedKt];
+            int64_t count = 0;
+            for (int64_t col = 0; col < kIndexedKt; ++col) {
+              if ((tile.valid_mask &
+                   (uint64_t{1} << (row * kIndexedKt + col))) == 0) {
+                continue;
+              }
+              gathered_idx[count] = tile.idx[row][col];
+              scores[count] = qkt_scores[local_row * kIndexedKt + col];
+              ++count;
+            }
+            if (count == 0) {
+              continue;
+            }
+            update_indexed_row<kReturnStats>(
+                scores,
+                gathered_idx,
+                count,
+                kv_ptr,
+                d_qk,
+                d_v,
+                row,
+                running_max.data(),
+                running_sum.data(),
+                output_acc.data(),
+                real_max.data(),
+                real_sum.data());
+          }
         }
       }
 
@@ -1335,7 +2116,43 @@ static inline void run_sparse_mla_kernel(
         }
       }
     }
+  };
+
+  const int requested_threads =
+#ifdef _OPENMP
+      omp_get_max_threads();
+#else
+      1;
+#endif
+  const int max_groups = sparse_mla_max_parallel_groups_mqa(
+      s_kv, d_qk, sizeof(scalar_t), requested_threads);
+
+  if (max_groups <= 1 || task_order.size() <= 1) {
+    for (int64_t task_pos = 0;
+         task_pos < static_cast<int64_t>(task_order.size());
+         ++task_pos) {
+      process_task(task_pos);
+    }
+    return;
   }
+
+#ifdef _OPENMP
+  #pragma omp parallel num_threads(max_groups)
+  {
+    #pragma omp for schedule(dynamic, 1)
+    for (int64_t task_pos = 0;
+         task_pos < static_cast<int64_t>(task_order.size());
+         ++task_pos) {
+      process_task(task_pos);
+    }
+  }
+#else
+  for (int64_t task_pos = 0;
+       task_pos < static_cast<int64_t>(task_order.size());
+       ++task_pos) {
+    process_task(task_pos);
+  }
+#endif
 }
 
 static inline bool is_integer_dtype(at::ScalarType dtype) {
