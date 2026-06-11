@@ -70,6 +70,7 @@ def prepare_fused_moe_bf16_tiled_weights(
 
     ``w13_weight`` follows the vLLM layout ``[E, 2 * F, H]`` and ``w2_weight``
     follows ``[E, H, F]``. The returned object is reusable across decode steps.
+    Set ``FUSED_CPP_MOE_PREPACK_THREADS`` to parallelize packing by expert.
     """
     _require_backend()
     if w13_weight.dtype != torch.bfloat16 or w2_weight.dtype != torch.bfloat16:
