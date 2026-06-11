@@ -1,14 +1,14 @@
 # -*- coding: utf-8 -*-
-"""``flash2_neon_l3kv_packqkv`` 专属约束 / fp32 delegate / 端到端等价性。
+"""``flash2_neon_l3kv_packqkv`` 专属约束 / fp32 packK / 端到端等价性。
 
 主等价性矩阵（与 baseline 对比）由
 :mod:`tests.test_sdpa_versions_equiv` 自动覆盖（通过 ``sdpa_version`` fixture
 注入）。本文件只验证 packqkv 特有的边界行为：
 
   1. ``S % 8 == 0`` / ``Ev % 8 == 0`` 强约束 → 不满足时 ``TORCH_CHECK`` 抛错
-  2. fp32 输入 → 直接 delegate 到 ``flash2_neon_l3kv_packv``，bit-exact 一致
+  2. fp32 输入 → 全量 pack K，QKᵀ 走 packed-K fp32 8x8 microkernel
   3. ``E % 4 != 0`` → packed 主路径 + 标量 tail，与 baseline bit-exact
-  4. KV 不装 L3 / Path B → delegate 到 ``flash2_neon_l3kv_packv``
+  4. KV 不装 L3 / Path B → 复用同一 packed-K fp32 path 的 taskloop 调度
 """
 from __future__ import annotations
 
@@ -21,7 +21,6 @@ from fused_cpp import _C  # noqa: E402
 from fused_cpp.sdpa_registry import get_sdpa_version  # noqa: E402
 
 from tests.conftest import (  # noqa: E402
-    SDPA_TOLERANCE,
     assert_tensor_close,
     call_sdpa_version,
 )
@@ -58,7 +57,6 @@ def test_packqkv_registered():
     assert "packed_q" in info.tags
     assert "packed_k" in info.tags
     assert "packed_v" in info.tags
-    assert "bf16_only" in info.tags
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -97,7 +95,7 @@ def test_packqkv_rejects_unaligned_Ev(Ev):
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# 3. fp32 delegate：与 packv fp32 完全等价
+# 3. fp32 packed-K path：与 baseline 在容差内一致
 # ─────────────────────────────────────────────────────────────────────────
 
 
@@ -110,21 +108,17 @@ def test_packqkv_rejects_unaligned_Ev(Ev):
     ],
     ids=["small", "mla"],
 )
-def test_packqkv_fp32_delegates_to_packv(shape):
-    """fp32 输入应 byte-exact 等同 ``flash2_neon_l3kv_packv``（pure delegate）。"""
+def test_packqkv_fp32_packk_vs_baseline(shape):
+    """fp32 输入走 packed-K QKᵀ，应与 baseline 在 fp32 容差内一致。"""
     _registered_or_skip()
-    if "flash2_neon_l3kv_packv" not in _C.list_sdpa_versions():
-        pytest.skip("flash2_neon_l3kv_packv not registered")
     info_packqkv = get_sdpa_version(VERSION_NAME)
-    info_packv = get_sdpa_version("flash2_neon_l3kv_packv")
+    info_baseline = get_sdpa_version("flash2_neon_cache_baseline")
 
     q, k, v = _make_qkv(shape, torch.float32)
     out_packqkv = call_sdpa_version(info_packqkv, q, k, v, is_causal=False)
-    out_packv = call_sdpa_version(info_packv, q, k, v, is_causal=False)
-    # delegate 路径：完全相同实现，应 bit-exact
-    assert torch.equal(out_packqkv, out_packv), (
-        f"fp32 delegate mismatch: max_abs="
-        f"{(out_packqkv - out_packv).abs().max().item():.3e}"
+    out_baseline = call_sdpa_version(info_baseline, q, k, v, is_causal=False)
+    assert_tensor_close(
+        out_packqkv, out_baseline, dtype=torch.float32, context=f"shape={shape}"
     )
 
 

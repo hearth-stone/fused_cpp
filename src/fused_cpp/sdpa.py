@@ -385,9 +385,9 @@ _CPP_VERSION_META: dict = {
             "at SDPA entry, Q packed once per q-tile inside "
             "process_q_tile_lc_packqkv (q-tile 内复用，不重复 pack). BFMMLA "
             "inner uses 4 independent vld1q_u16 + B-major schedule "
-            "(inherits qk_packqk_seq4_bmajor microkernel). bf16-only; fp32 "
-            "delegates to flash2_neon_l3kv_packv. Path B (KV doesn't fit L3) "
-            "falls back to flash2_neon_l3kv_packv to avoid 3x DRAM bandwidth."
+            "(inherits qk_packqk_seq4_bmajor microkernel). fp32 input uses "
+            "full K pre-pack plus a packed-K 8x8 lane-FMLA QK^T microkernel; "
+            "Q stays row-major and is not pre-packed."
         ),
         tags=(
             "flash",
@@ -400,7 +400,6 @@ _CPP_VERSION_META: dict = {
             "packed_k",
             "packed_q",
             "packed_v",
-            "bf16_only",
         ),
     ),
     "flash2_neon_l3kv_packqkv_pbf16pv": dict(
@@ -408,8 +407,9 @@ _CPP_VERSION_META: dict = {
             "Experimental packqkv variant that keeps the same packed Q/K/V "
             "layout as flash2_neon_l3kv_packqkv, but writes softmax P_hat "
             "directly to bf16 scratch and feeds pv_8x8_pbf16. The row sum "
-            "and output normalization remain fp32; fp32 input still delegates "
-            "to flash2_neon_l3kv_packv_pquad."
+            "and output normalization remain fp32. fp32 input uses full K "
+            "pre-pack plus a packed-K 8x8 lane-FMLA QK^T microkernel and "
+            "PV pquad."
         ),
         tags=(
             "flash",
@@ -423,7 +423,52 @@ _CPP_VERSION_META: dict = {
             "packed_q",
             "packed_v",
             "pbf16",
-            "bf16_only",
+        ),
+    ),
+    "flash2_neon_l3kv_packqkv_pbf16pv_exp_poly4": dict(
+        description=(
+            "Same packed Q/K/V + bf16 P_hat PV path as "
+            "flash2_neon_l3kv_packqkv_pbf16pv, but uses a degree-4 NEON "
+            "polynomial approximation for softmax exp in the bf16 P_hat "
+            "materialization path."
+        ),
+        tags=(
+            "flash",
+            "online_softmax",
+            "fa2",
+            "neon",
+            "cache_aware",
+            "multi_thread",
+            "l3_kv_resident",
+            "packed_k",
+            "packed_q",
+            "packed_v",
+            "pbf16",
+            "exp_poly4",
+            "experimental",
+        ),
+    ),
+    "flash2_neon_l3kv_packqkv_pbf16pv_exp_poly6": dict(
+        description=(
+            "Same packed Q/K/V + bf16 P_hat PV path as "
+            "flash2_neon_l3kv_packqkv_pbf16pv, but uses a degree-6 NEON "
+            "polynomial approximation for softmax exp in the bf16 P_hat "
+            "materialization path."
+        ),
+        tags=(
+            "flash",
+            "online_softmax",
+            "fa2",
+            "neon",
+            "cache_aware",
+            "multi_thread",
+            "l3_kv_resident",
+            "packed_k",
+            "packed_q",
+            "packed_v",
+            "pbf16",
+            "exp_poly6",
+            "experimental",
         ),
     ),
     "flash2_neon_l3kv_packv_l1_bfmlal_layout": dict(

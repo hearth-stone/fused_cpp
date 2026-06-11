@@ -73,6 +73,8 @@ def _check_capabilities(
     if info.name in {
         "flash2_neon_l3kv_packqkv",
         "flash2_neon_l3kv_packqkv_pbf16pv",
+        "flash2_neon_l3kv_packqkv_pbf16pv_exp_poly4",
+        "flash2_neon_l3kv_packqkv_pbf16pv_exp_poly6",
     }:
         if S % 8 != 0:
             pytest.skip(

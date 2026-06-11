@@ -526,8 +526,8 @@ inline void process_q_tile_8rows_full(
           MK::qkt_8x8(Qrow0, q_stride_l, K_tile, k_stride_s,
                       p.E, p.scale_f, tmp_qkt);
           for (int i = 0; i < 8; ++i) {
-            std::memcpy(scores_l1 + i * Sc_cur + s_off,
-                        tmp_qkt + i * 8, sizeof(float) * 8);
+            ::fused_cpp::sdpa_pack_utils::copy_f32x8(
+                tmp_qkt + i * 8, scores_l1 + i * Sc_cur + s_off);
           }
         } else {
           MK::qkt_tail(Qrow0, q_stride_l, K_tile, k_stride_s,

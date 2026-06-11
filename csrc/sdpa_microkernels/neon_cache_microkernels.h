@@ -10,8 +10,11 @@
 #include <cstring>
 
 #include "neon_cache_config.h"
+#include "../sdpa_pack_utils.h"
 
 namespace fused_cpp::sdpa_microkernels {
+
+using ::fused_cpp::sdpa_pack_utils::copy_u16x4;
 
 constexpr int MICRO_LQ = 8;
 constexpr int MICRO_SK = 8;
@@ -542,12 +545,19 @@ inline void pack_k_8rows_to_pairs_bf16(
     const uint16_t* row0 = Kp + (2 * pair + 0) * k_row_stride;
     const uint16_t* row1 = Kp + (2 * pair + 1) * k_row_stride;
     uint16_t* dst = K_packed + pair * (E * 2);
-    for (int64_t e = 0; e < E_main; e += 4) {
+    auto pack_e_block = [&](int64_t e) {
       // dst[e*2 + 0..3] = row0[e..e+3]
       // dst[e*2 + 4..7] = row1[e..e+3]
-      // 8 + 8 = 16 字节连续写出，编译器 lower 成单条 stp/str q。
-      std::memcpy(dst + e * 2 + 0, row0 + e, 8);
-      std::memcpy(dst + e * 2 + 4, row1 + e, 8);
+      copy_u16x4(row0 + e, dst + e * 2 + 0);
+      copy_u16x4(row1 + e, dst + e * 2 + 4);
+    };
+    int64_t e = 0;
+    for (; e + 8 <= E_main; e += 8) {
+      pack_e_block(e);
+      pack_e_block(e + 4);
+    }
+    for (; e < E_main; e += 4) {
+      pack_e_block(e);
     }
   }
 }
@@ -584,11 +594,24 @@ inline void pack_k_8rows_to_seq_bf16(
     uint16_t* K_seq) {
   const uint16_t* Kp = reinterpret_cast<const uint16_t*>(K);
   const int64_t E_main = E & ~int64_t{3};
-  for (int64_t e = 0; e < E_main; e += 4) {
+  auto pack_e_block = [&](int64_t e) {
     uint16_t* dst = K_seq + (e / 4) * 32;
-    for (int row = 0; row < 8; ++row) {
-      std::memcpy(dst + row * 4, Kp + row * k_row_stride + e, 8);
-    }
+    copy_u16x4(Kp + 0 * k_row_stride + e, dst + 0 * 4);
+    copy_u16x4(Kp + 1 * k_row_stride + e, dst + 1 * 4);
+    copy_u16x4(Kp + 2 * k_row_stride + e, dst + 2 * 4);
+    copy_u16x4(Kp + 3 * k_row_stride + e, dst + 3 * 4);
+    copy_u16x4(Kp + 4 * k_row_stride + e, dst + 4 * 4);
+    copy_u16x4(Kp + 5 * k_row_stride + e, dst + 5 * 4);
+    copy_u16x4(Kp + 6 * k_row_stride + e, dst + 6 * 4);
+    copy_u16x4(Kp + 7 * k_row_stride + e, dst + 7 * 4);
+  };
+  int64_t e = 0;
+  for (; e + 8 <= E_main; e += 8) {
+    pack_e_block(e);
+    pack_e_block(e + 4);
+  }
+  for (; e < E_main; e += 4) {
+    pack_e_block(e);
   }
 }
 
@@ -774,11 +797,24 @@ inline void pack_q_8rows_to_seq_bf16(
     uint16_t* Q_seq) {
   const uint16_t* Qp = reinterpret_cast<const uint16_t*>(Q);
   const int64_t E_main = E & ~int64_t{3};
-  for (int64_t e = 0; e < E_main; e += 4) {
+  auto pack_e_block = [&](int64_t e) {
     uint16_t* dst = Q_seq + (e / 4) * 32;
-    for (int row = 0; row < 8; ++row) {
-      std::memcpy(dst + row * 4, Qp + row * q_row_stride + e, 8);
-    }
+    copy_u16x4(Qp + 0 * q_row_stride + e, dst + 0 * 4);
+    copy_u16x4(Qp + 1 * q_row_stride + e, dst + 1 * 4);
+    copy_u16x4(Qp + 2 * q_row_stride + e, dst + 2 * 4);
+    copy_u16x4(Qp + 3 * q_row_stride + e, dst + 3 * 4);
+    copy_u16x4(Qp + 4 * q_row_stride + e, dst + 4 * 4);
+    copy_u16x4(Qp + 5 * q_row_stride + e, dst + 5 * 4);
+    copy_u16x4(Qp + 6 * q_row_stride + e, dst + 6 * 4);
+    copy_u16x4(Qp + 7 * q_row_stride + e, dst + 7 * 4);
+  };
+  int64_t e = 0;
+  for (; e + 8 <= E_main; e += 8) {
+    pack_e_block(e);
+    pack_e_block(e + 4);
+  }
+  for (; e < E_main; e += 4) {
+    pack_e_block(e);
   }
 }
 

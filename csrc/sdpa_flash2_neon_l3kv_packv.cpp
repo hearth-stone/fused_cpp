@@ -41,6 +41,7 @@
 #endif
 
 #include "sdpa_microkernels/neon_cache_config.h"
+#include "sdpa_pack_utils.h"
 #include "sdpa_tile_sizes.h"
 #include "sdpa_microkernels/mk_traits.h"
 #include "sdpa_microkernels/all_impls.h"
@@ -53,55 +54,23 @@ using ::fused_cpp::sdpa_tile_sizes::effective_cache_bytes;
 using ::fused_cpp::sdpa_tile_sizes::compute_tile_sizes_l3kv;
 using ::fused_cpp::sdpa_flash2_neon_l3kv_impl::run_path_collapse3;
 using ::fused_cpp::sdpa_flash2_neon_l3kv_impl::run_path_taskloop;
+using ::fused_cpp::sdpa_pack_utils::pack_v_to_evblock8;
 
 // ──────────────────────────────────────────────────────────────────────
 // V pack：[B, N, S, Ev] → [B, N, Ev/8, S, 8]
 //
 // 工作划分：collapse(3) over (b, n, ev_block)，每个工作单元串行扫
-// `S` 行做一个 `8 * sizeof(scalar_t)` 字节的 memcpy。
+// `S` 行做一个 `8 * sizeof(scalar_t)` 字节的向量搬运。
 //
 // * collapse(3) 不 collapse(4)：内层 `s` 循环是顺序写，留给单线程能让
 //   写入流连续、store buffer 友好。
 // * 每个 (b, n, ev_block) 块写出 `S * 8 * sizeof(scalar_t)` 字节
 //   （bf16 S=2048 时 32 KiB，fp32 时 64 KiB），远 ≫ 64 字节 cache line，
 //   不同线程绝不会写同一 line —— 无 false sharing。
-// * memcpy size = 8 * sizeof(scalar_t) 是 16/32 字节常量，编译器内联
-//   成单条 `ldr q + str q`（fp32）或 `ldr d + str d`（bf16）。
+// * 每行 8 个元素的搬运由 sdpa_pack_utils::copy_8_elems 完成；SVE 目标
+//   使用 predicated svld1/svst1，非 SVE 目标退回 memcpy。S 维按 4 行展开，
+//   尾部 0..3 行显式补齐。
 // ──────────────────────────────────────────────────────────────────────
-
-template <typename scalar_t>
-void pack_v_to_evblock8(
-    const scalar_t* v_src,
-    scalar_t* v_dst,
-    int64_t B, int64_t N, int64_t S, int64_t Ev) {
-  const int64_t Eb = Ev / 8;
-  const int64_t bn_stride_src = N * S * Ev;
-  const int64_t n_stride_src = S * Ev;
-  const int64_t bn_stride_dst = N * Eb * S * 8;
-  const int64_t n_stride_dst = Eb * S * 8;
-  const int64_t evblock_stride_dst = S * 8;
-
-#ifdef _OPENMP
-  #pragma omp parallel for collapse(3) schedule(static)
-#endif
-  for (int64_t b = 0; b < B; ++b) {
-    for (int64_t n = 0; n < N; ++n) {
-      for (int64_t eb = 0; eb < Eb; ++eb) {
-        const scalar_t* src = v_src + b * bn_stride_src
-                                    + n * n_stride_src
-                                    + eb * 8;
-        scalar_t* dst = v_dst + b * bn_stride_dst
-                              + n * n_stride_dst
-                              + eb * evblock_stride_dst;
-        for (int64_t s = 0; s < S; ++s) {
-          std::memcpy(dst + s * 8,
-                      src + s * Ev,
-                      8 * sizeof(scalar_t));
-        }
-      }
-    }
-  }
-}
 
 // ──────────────────────────────────────────────────────────────────────
 // 顶层模板：pack V → 调 run_path_*<..., kPackedV=true>。
