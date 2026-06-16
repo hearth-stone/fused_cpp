@@ -11,6 +11,8 @@
 #include <stdexcept>
 #include <cstring>
 
+#include "sdpa_pack_utils.h"
+
 #ifdef __aarch64__
 
 #include "arm_compute/core/Types.h"
@@ -128,7 +130,7 @@ int64_t create_acl_gemm_handler(at::Tensor weight, int64_t num_threads,
     // 将 PyTorch 权重数据拷贝到 ACL 张量
     auto *dst = handler->weight_tensor.buffer();
     auto *src = weight.data_ptr();
-    std::memcpy(dst, src, weight.nbytes());
+    fused_cpp::sdpa_pack_utils::copy_bytes(src, dst, weight.nbytes());
 
     // 调用 prepare() 对权重进行预打包（reorder/pack）
     // prepare 会将权重从原始布局转换为适合 SIMD 内核的交错布局，
