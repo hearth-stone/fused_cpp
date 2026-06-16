@@ -40,8 +40,29 @@ struct SdpaParams {
     const void* k_ptr   = nullptr;
     const void* v_ptr   = nullptr;
 
-    // mask 指针始终是 fp32（或 nullptr）
+    // mask 指针始终是 fp32 contiguous [B,N,L,S]（或 nullptr）
     const float* mask_ptr = nullptr;
+
+    // Optional ggml additive masks [S,L,H_mask,B_mask]. When either is set,
+    // kernels read it directly with byte strides and broadcast H/B by modulo.
+    const uint16_t* mask_f16_ptr = nullptr;
+    int64_t mask_f16_ne0 = 0;
+    int64_t mask_f16_ne1 = 0;
+    int64_t mask_f16_ne2 = 0;
+    int64_t mask_f16_ne3 = 0;
+    int64_t mask_f16_nb0 = 0;
+    int64_t mask_f16_nb1 = 0;
+    int64_t mask_f16_nb2 = 0;
+    int64_t mask_f16_nb3 = 0;
+    const float* mask_f32_ptr = nullptr;
+    int64_t mask_f32_ne0 = 0;
+    int64_t mask_f32_ne1 = 0;
+    int64_t mask_f32_ne2 = 0;
+    int64_t mask_f32_ne3 = 0;
+    int64_t mask_f32_nb0 = 0;
+    int64_t mask_f32_nb1 = 0;
+    int64_t mask_f32_nb2 = 0;
+    int64_t mask_f32_nb3 = 0;
 
     // 输出指针始终为 fp32 累加缓冲
     float* out_ptr      = nullptr;

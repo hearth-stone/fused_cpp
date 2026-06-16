@@ -39,7 +39,7 @@ standalone/fp32_packqkv/libfused_cpp_sdpa_fp32_packqkv.so
 
 ## 导出符号
 
-当前 `.so` 只导出 llama.cpp-facing C ABI：
+当前 `.so` 导出三个 llama.cpp-facing C ABI：
 
 ```c
 int fused_cpp_sdpa_flash2_neon_l3kv_packqkv_pbf16pv_fp32_llamacpp(
@@ -70,9 +70,69 @@ int fused_cpp_sdpa_flash2_neon_l3kv_packqkv_pbf16pv_fp32_llamacpp(
     int64_t o_nb2,
     int64_t o_nb3,
     float scale);
+
+int fused_cpp_sdpa_flash2_neon_l3kv_packqkv_pbf16pv_fp32_llamacpp_mask_f16(
+    const float* q,
+    const float* k,
+    const float* v,
+    const uint16_t* mask,
+    float* out,
+    int64_t B,
+    int64_t H,
+    int64_t L,
+    int64_t S,
+    int64_t D,
+    int64_t DV,
+    /* q/k/v/out byte strides, same as no-mask entry */
+    int64_t q_nb0, int64_t q_nb1, int64_t q_nb2, int64_t q_nb3,
+    int64_t k_nb0, int64_t k_nb1, int64_t k_nb2, int64_t k_nb3,
+    int64_t v_nb0, int64_t v_nb1, int64_t v_nb2, int64_t v_nb3,
+    int64_t o_nb0, int64_t o_nb1, int64_t o_nb2, int64_t o_nb3,
+    /* F16 mask shape/byte strides for [S,L,H_mask,B_mask] */
+    int64_t mask_ne0, int64_t mask_ne1, int64_t mask_ne2, int64_t mask_ne3,
+    int64_t mask_nb0, int64_t mask_nb1, int64_t mask_nb2, int64_t mask_nb3,
+    float scale);
+
+int fused_cpp_sdpa_flash2_neon_l3kv_packqkv_pbf16pv_fp32_llamacpp_mask_f32(
+    const float* q,
+    const float* k,
+    const float* v,
+    const float* mask,
+    float* out,
+    int64_t B,
+    int64_t H,
+    int64_t L,
+    int64_t S,
+    int64_t D,
+    int64_t DV,
+    /* q/k/v/out byte strides, same as no-mask entry */
+    int64_t q_nb0, int64_t q_nb1, int64_t q_nb2, int64_t q_nb3,
+    int64_t k_nb0, int64_t k_nb1, int64_t k_nb2, int64_t k_nb3,
+    int64_t v_nb0, int64_t v_nb1, int64_t v_nb2, int64_t v_nb3,
+    int64_t o_nb0, int64_t o_nb1, int64_t o_nb2, int64_t o_nb3,
+    /* F32 mask shape/byte strides for [S,L,H_mask,B_mask] */
+    int64_t mask_ne0, int64_t mask_ne1, int64_t mask_ne2, int64_t mask_ne3,
+    int64_t mask_nb0, int64_t mask_nb1, int64_t mask_nb2, int64_t mask_nb3,
+    float scale);
 ```
 
 `scale == 0.0f` 时内部使用 `1 / sqrt(D)`。
+
+`mask_f16` / `mask_f32` 入口按 llama.cpp/ggml 的 additive mask 读取：
+
+```text
+mask layout: [S, L, H_mask, B_mask]
+scores += mask[s, l, h % H_mask, b % B_mask]
+```
+
+当前 masked 路径不再 materialize fp32 `[B,H,L,S]`。kernel 在 QK tile 内
+按 ggml stride 直接读取 mask；full 8x8 QK block 在写回 `scores` 前
+把 mask 加到临时 QK block，partial block 在 QK 写回后立即加 mask。
+全 `0` mask block 会跳过加法；全 off block（`-inf`，或有限 mask 值
+`<= -1000`）会跳过 QK、直接写 `-inf` scores，并在当前 Q tile 对应 key
+range 全部 masked 时跳过该段 PV。
+普通 mixed F16 mask 仍需要为相关 score 转换 half；F32 mask 直接按 fp32
+读取。
 
 源码里还保留了 contiguous pointer helper 供 bench 或直接源码接入复用；
 默认 shared library 通过 `fp32_packqkv_sdpa.version` 把它隐藏。
@@ -199,7 +259,9 @@ BGE-small fp32, B=1 H=8 L=S=512 D=DV=64, OMP_NUM_THREADS=1:
 
 shared library:
   nm -D --defined-only libfused_cpp_sdpa_fp32_packqkv.so
-    exports only fused_cpp_sdpa_flash2_neon_l3kv_packqkv_pbf16pv_fp32_llamacpp
+    exports fused_cpp_sdpa_flash2_neon_l3kv_packqkv_pbf16pv_fp32_llamacpp
+    exports fused_cpp_sdpa_flash2_neon_l3kv_packqkv_pbf16pv_fp32_llamacpp_mask_f16
+    exports fused_cpp_sdpa_flash2_neon_l3kv_packqkv_pbf16pv_fp32_llamacpp_mask_f32
   ldd libfused_cpp_sdpa_fp32_packqkv.so
     no torch / libtorch_python / pybind / Python dependency
 

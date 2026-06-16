@@ -272,6 +272,410 @@ inline void scale_inplace_impl(float* buf, float scale, int64_t len) {
   }
 }
 
+inline float fp16_bits_to_float_impl(uint16_t h) {
+  if ((h & 0x7fff) == 0) {
+    return (h & 0x8000) ? -0.0f : 0.0f;
+  }
+  if (h == 0xbc00) {
+    return -1.0f;
+  }
+  if (h == 0xfc00) {
+    return -std::numeric_limits<float>::infinity();
+  }
+  if (h == 0x7c00) {
+    return std::numeric_limits<float>::infinity();
+  }
+
+  const int sign = (h >> 15) & 0x1;
+  const int exp = (h >> 10) & 0x1f;
+  const int mant = h & 0x3ff;
+
+  float value;
+  if (exp == 0) {
+    value = mant == 0 ? 0.0f : std::ldexp(static_cast<float>(mant), -24);
+  } else if (exp == 0x1f) {
+    value = mant == 0
+        ? std::numeric_limits<float>::infinity()
+        : std::numeric_limits<float>::quiet_NaN();
+  } else {
+    value = std::ldexp(1.0f + static_cast<float>(mant) / 1024.0f, exp - 15);
+  }
+  return sign ? -value : value;
+}
+
+inline const char* mask_f16_row_ptr_impl(
+    const SdpaParams& p,
+    int64_t b,
+    int64_t n,
+    int64_t l,
+    int64_t s) {
+  const int64_t mb = b % p.mask_f16_ne3;
+  const int64_t mh = n % p.mask_f16_ne2;
+  return reinterpret_cast<const char*>(p.mask_f16_ptr)
+      + s * p.mask_f16_nb0
+      + l * p.mask_f16_nb1
+      + mh * p.mask_f16_nb2
+      + mb * p.mask_f16_nb3;
+}
+
+inline float load_mask_f16_from_ptr_impl(const char* src) {
+  uint16_t bits = 0;
+  std::memcpy(&bits, src, sizeof(bits));
+  return fp16_bits_to_float_impl(bits);
+}
+
+inline float load_mask_f16_impl(
+    const SdpaParams& p,
+    int64_t b,
+    int64_t n,
+    int64_t l,
+    int64_t s) {
+  return load_mask_f16_from_ptr_impl(
+      mask_f16_row_ptr_impl(p, b, n, l, s));
+}
+
+enum class MaskBlockKind {
+  kMixed,
+  kAllZero,
+  kAllOff,
+};
+
+inline bool mask_f16_bits_is_off_impl(uint16_t bits) {
+  if (bits == 0xfc00) {
+    return true;
+  }
+  if ((bits & 0x8000) == 0) {
+    return false;
+  }
+  if ((bits & 0x7c00) == 0x7c00) {
+    return false;
+  }
+  // Negative finite F16 values are monotonic by raw bits. 0xe3d0 is
+  // float16(-1000), so larger negative finite bit patterns are "off".
+  return bits >= 0xe3d0;
+}
+
+inline MaskBlockKind classify_mask_f16_block_impl(
+    const SdpaParams& p,
+    int64_t b,
+    int64_t n,
+    int64_t l_start,
+    int64_t s_start,
+    int l_count,
+    int s_count) {
+  if (s_count == 8 && p.mask_f16_nb0 == static_cast<int64_t>(sizeof(uint16_t))) {
+    constexpr uint64_t kF16AbsMask4 = 0x7fff7fff7fff7fffULL;
+    constexpr uint64_t kF16NegInf4 = 0xfc00fc00fc00fc00ULL;
+    bool all_zero_8 = true;
+    bool all_neginf_8 = true;
+    for (int i = 0; i < l_count; ++i) {
+      const char* mask_row =
+          mask_f16_row_ptr_impl(p, b, n, l_start + i, s_start);
+      uint64_t lo = 0;
+      uint64_t hi = 0;
+      std::memcpy(&lo, mask_row, sizeof(lo));
+      std::memcpy(&hi, mask_row + sizeof(lo), sizeof(hi));
+      all_zero_8 = all_zero_8 && (((lo | hi) & kF16AbsMask4) == 0);
+      all_neginf_8 = all_neginf_8 && lo == kF16NegInf4 && hi == kF16NegInf4;
+      if (!all_zero_8 && !all_neginf_8) {
+        break;
+      }
+    }
+    if (all_zero_8) {
+      return MaskBlockKind::kAllZero;
+    }
+    if (all_neginf_8) {
+      return MaskBlockKind::kAllOff;
+    }
+  }
+
+  bool all_zero = true;
+  bool all_off = true;
+  for (int i = 0; i < l_count; ++i) {
+    const char* mask_row =
+        mask_f16_row_ptr_impl(p, b, n, l_start + i, s_start);
+    for (int j = 0; j < s_count; ++j) {
+      uint16_t bits = 0;
+      std::memcpy(&bits, mask_row + j * p.mask_f16_nb0, sizeof(bits));
+      const bool is_zero = (bits & 0x7fff) == 0;
+      all_zero = all_zero && is_zero;
+      all_off = all_off && !is_zero && mask_f16_bits_is_off_impl(bits);
+      if (!all_zero && !all_off) {
+        return MaskBlockKind::kMixed;
+      }
+    }
+  }
+  if (all_zero) {
+    return MaskBlockKind::kAllZero;
+  }
+  if (all_off) {
+    return MaskBlockKind::kAllOff;
+  }
+  return MaskBlockKind::kMixed;
+}
+
+inline const char* mask_f32_row_ptr_impl(
+    const SdpaParams& p,
+    int64_t b,
+    int64_t n,
+    int64_t l,
+    int64_t s) {
+  const int64_t mb = b % p.mask_f32_ne3;
+  const int64_t mh = n % p.mask_f32_ne2;
+  return reinterpret_cast<const char*>(p.mask_f32_ptr)
+      + s * p.mask_f32_nb0
+      + l * p.mask_f32_nb1
+      + mh * p.mask_f32_nb2
+      + mb * p.mask_f32_nb3;
+}
+
+inline float load_mask_f32_from_ptr_impl(const char* src) {
+  float value = 0.0f;
+  std::memcpy(&value, src, sizeof(value));
+  return value;
+}
+
+inline bool mask_f32_bits_is_off_impl(uint32_t bits) {
+  if (bits == 0xff800000u) {
+    return true;
+  }
+  // Negative finite fp32 values are monotonic by raw bits. 0xc47a0000 is
+  // -1000.0f, so larger finite negative bit patterns are "off".
+  return bits >= 0xc47a0000u && bits < 0xff800000u;
+}
+
+inline MaskBlockKind classify_mask_f32_block_impl(
+    const SdpaParams& p,
+    int64_t b,
+    int64_t n,
+    int64_t l_start,
+    int64_t s_start,
+    int l_count,
+    int s_count) {
+  if (s_count == 8 && p.mask_f32_nb0 == static_cast<int64_t>(sizeof(float))) {
+    constexpr uint64_t kF32AbsMask2 = 0x7fffffff7fffffffULL;
+    bool all_zero_8 = true;
+    bool all_off_8 = true;
+    for (int i = 0; i < l_count; ++i) {
+      const char* mask_row =
+          mask_f32_row_ptr_impl(p, b, n, l_start + i, s_start);
+      for (int pair = 0; pair < 4; ++pair) {
+        uint64_t bits64 = 0;
+        std::memcpy(&bits64, mask_row + pair * sizeof(bits64),
+                    sizeof(bits64));
+        all_zero_8 = all_zero_8 && ((bits64 & kF32AbsMask2) == 0);
+        const uint32_t lo = static_cast<uint32_t>(bits64);
+        const uint32_t hi = static_cast<uint32_t>(bits64 >> 32);
+        all_off_8 = all_off_8 &&
+            mask_f32_bits_is_off_impl(lo) &&
+            mask_f32_bits_is_off_impl(hi);
+      }
+      if (!all_zero_8 && !all_off_8) {
+        break;
+      }
+    }
+    if (all_zero_8) {
+      return MaskBlockKind::kAllZero;
+    }
+    if (all_off_8) {
+      return MaskBlockKind::kAllOff;
+    }
+  }
+
+  bool all_zero = true;
+  bool all_off = true;
+  for (int i = 0; i < l_count; ++i) {
+    const char* mask_row =
+        mask_f32_row_ptr_impl(p, b, n, l_start + i, s_start);
+    for (int j = 0; j < s_count; ++j) {
+      uint32_t bits = 0;
+      std::memcpy(&bits, mask_row + j * p.mask_f32_nb0, sizeof(bits));
+      const bool is_zero = (bits & 0x7fffffffu) == 0;
+      all_zero = all_zero && is_zero;
+      all_off = all_off && mask_f32_bits_is_off_impl(bits);
+      if (!all_zero && !all_off) {
+        return MaskBlockKind::kMixed;
+      }
+    }
+  }
+  if (all_zero) {
+    return MaskBlockKind::kAllZero;
+  }
+  if (all_off) {
+    return MaskBlockKind::kAllOff;
+  }
+  return MaskBlockKind::kMixed;
+}
+
+inline void mark_pv_skip_block_impl(
+    uint8_t* pv_skip_s,
+    bool& pv_skip_initialized,
+    bool& has_pv_skip,
+    int64_t Sc_cur,
+    int64_t s_start,
+    int s_count) {
+  if (!pv_skip_initialized) {
+    std::memset(pv_skip_s, 0, static_cast<size_t>(Sc_cur));
+    pv_skip_initialized = true;
+  }
+  for (int j = 0; j < s_count; ++j) {
+    pv_skip_s[s_start + j] = 1;
+  }
+  has_pv_skip = true;
+}
+
+inline void fill_tmp_8x8_impl(float* tmp, float value) {
+  for (int i = 0; i < 64; ++i) {
+    tmp[i] = value;
+  }
+}
+
+inline void fill_scores_block_impl(
+    float* scores,
+    int64_t scores_row_stride,
+    int l_count,
+    int s_count,
+    float value) {
+  for (int i = 0; i < l_count; ++i) {
+    float* row = scores + i * scores_row_stride;
+    for (int j = 0; j < s_count; ++j) {
+      row[j] = value;
+    }
+  }
+}
+
+inline void add_mask_f16_to_tmp_8x8_impl(
+    const SdpaParams& p,
+    int64_t b,
+    int64_t n,
+    int64_t l_start,
+    int64_t s_start,
+    float* tmp) {
+  for (int i = 0; i < 8; ++i) {
+    const char* mask_row =
+        mask_f16_row_ptr_impl(p, b, n, l_start + i, s_start);
+    for (int j = 0; j < 8; ++j) {
+      tmp[i * 8 + j] +=
+          load_mask_f16_from_ptr_impl(mask_row + j * p.mask_f16_nb0);
+    }
+  }
+}
+
+inline void add_mask_f16_to_scores_block_impl(
+    const SdpaParams& p,
+    int64_t b,
+    int64_t n,
+    int64_t l_start,
+    int64_t s_start,
+    int l_count,
+    int s_count,
+    float* scores,
+    int64_t scores_row_stride) {
+  for (int i = 0; i < l_count; ++i) {
+    const char* mask_row =
+        mask_f16_row_ptr_impl(p, b, n, l_start + i, s_start);
+    float* row = scores + i * scores_row_stride;
+    for (int j = 0; j < s_count; ++j) {
+      row[j] += load_mask_f16_from_ptr_impl(mask_row + j * p.mask_f16_nb0);
+    }
+  }
+}
+
+inline void add_mask_f32_to_tmp_8x8_impl(
+    const SdpaParams& p,
+    int64_t b,
+    int64_t n,
+    int64_t l_start,
+    int64_t s_start,
+    float* tmp) {
+  for (int i = 0; i < 8; ++i) {
+    const char* mask_row =
+        mask_f32_row_ptr_impl(p, b, n, l_start + i, s_start);
+    for (int j = 0; j < 8; ++j) {
+      tmp[i * 8 + j] +=
+          load_mask_f32_from_ptr_impl(mask_row + j * p.mask_f32_nb0);
+    }
+  }
+}
+
+inline void add_mask_f32_to_scores_block_impl(
+    const SdpaParams& p,
+    int64_t b,
+    int64_t n,
+    int64_t l_start,
+    int64_t s_start,
+    int l_count,
+    int s_count,
+    float* scores,
+    int64_t scores_row_stride) {
+  for (int i = 0; i < l_count; ++i) {
+    const char* mask_row =
+        mask_f32_row_ptr_impl(p, b, n, l_start + i, s_start);
+    float* row = scores + i * scores_row_stride;
+    for (int j = 0; j < s_count; ++j) {
+      row[j] += load_mask_f32_from_ptr_impl(mask_row + j * p.mask_f32_nb0);
+    }
+  }
+}
+
+inline bool has_direct_mask_impl(const SdpaParams& p) {
+  return p.mask_f16_ptr != nullptr || p.mask_f32_ptr != nullptr;
+}
+
+inline MaskBlockKind classify_direct_mask_block_impl(
+    const SdpaParams& p,
+    int64_t b,
+    int64_t n,
+    int64_t l_start,
+    int64_t s_start,
+    int l_count,
+    int s_count) {
+  if (p.mask_f16_ptr != nullptr) {
+    return classify_mask_f16_block_impl(
+        p, b, n, l_start, s_start, l_count, s_count);
+  }
+  if (p.mask_f32_ptr != nullptr) {
+    return classify_mask_f32_block_impl(
+        p, b, n, l_start, s_start, l_count, s_count);
+  }
+  return MaskBlockKind::kMixed;
+}
+
+inline void add_direct_mask_to_tmp_8x8_impl(
+    const SdpaParams& p,
+    int64_t b,
+    int64_t n,
+    int64_t l_start,
+    int64_t s_start,
+    float* tmp) {
+  if (p.mask_f16_ptr != nullptr) {
+    add_mask_f16_to_tmp_8x8_impl(p, b, n, l_start, s_start, tmp);
+  } else if (p.mask_f32_ptr != nullptr) {
+    add_mask_f32_to_tmp_8x8_impl(p, b, n, l_start, s_start, tmp);
+  }
+}
+
+inline void add_direct_mask_to_scores_block_impl(
+    const SdpaParams& p,
+    int64_t b,
+    int64_t n,
+    int64_t l_start,
+    int64_t s_start,
+    int l_count,
+    int s_count,
+    float* scores,
+    int64_t scores_row_stride) {
+  if (p.mask_f16_ptr != nullptr) {
+    add_mask_f16_to_scores_block_impl(
+        p, b, n, l_start, s_start, l_count, s_count,
+        scores, scores_row_stride);
+  } else if (p.mask_f32_ptr != nullptr) {
+    add_mask_f32_to_scores_block_impl(
+        p, b, n, l_start, s_start, l_count, s_count,
+        scores, scores_row_stride);
+  }
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // process_q_tile_lc<MK, scalar_t, kPackedV, kHasMask, kCausal>
 //
@@ -431,6 +835,15 @@ inline void process_q_tile_lc(
           }
         }
 
+        constexpr int64_t kMaxTrackedPvSkip = 4096;
+        uint8_t pv_skip_s[kMaxTrackedPvSkip];
+        const bool has_direct_mask =
+            kHasMask && has_direct_mask_impl(p);
+        const bool track_pv_skip =
+            has_direct_mask && Sc_cur <= kMaxTrackedPvSkip;
+        bool pv_skip_initialized = false;
+        bool has_pv_skip = false;
+
         {
           FUSED_CPP_SDPA_PROFILE_SCOPE(::fused_cpp::sdpa_profile::Slot::kQkt);
           // ── 步骤 1: scores[Lq_eff][Sc_cur] = scale * Q · K^T ──
@@ -438,40 +851,151 @@ inline void process_q_tile_lc(
           alignas(64) float tmp_qkt[8 * 8];
           for (; s_off + 8 <= Sc_active; s_off += 8) {
             const scalar_t* K_tile = Krow0 + s_off * k_stride_s;
+            MaskBlockKind mask_kind = MaskBlockKind::kMixed;
+            if constexpr (kHasMask) {
+              if (has_direct_mask) {
+                mask_kind = classify_direct_mask_block_impl(
+                    p, b, n, q0_inner, s_l2 + s_off, Lq_eff, 8);
+              }
+            }
             if (Lq_eff == 8) {
-              MK::qkt_8x8(Qrow_inner, q_stride_l, K_tile, k_stride_s,
-                          p.E, p.scale_f, tmp_qkt);
+              if (mask_kind == MaskBlockKind::kAllOff) {
+                fill_tmp_8x8_impl(tmp_qkt, p.neg_inf);
+                if (track_pv_skip) {
+                  mark_pv_skip_block_impl(
+                      pv_skip_s, pv_skip_initialized, has_pv_skip,
+                      Sc_cur, s_off, 8);
+                }
+              } else {
+                MK::qkt_8x8(Qrow_inner, q_stride_l, K_tile, k_stride_s,
+                            p.E, p.scale_f, tmp_qkt);
+              }
+              if constexpr (kHasMask) {
+                if (has_direct_mask &&
+                    mask_kind == MaskBlockKind::kMixed) {
+                  add_direct_mask_to_tmp_8x8_impl(
+                      p, b, n, q0_inner, s_l2 + s_off, tmp_qkt);
+                }
+              }
               for (int i = 0; i < 8; ++i) {
                 ::fused_cpp::sdpa_pack_utils::copy_f32x8(
                     tmp_qkt + i * 8, scores_8 + i * Sc_cur + s_off);
               }
             } else {
-              MK::qkt_tail(Qrow_inner, q_stride_l, K_tile, k_stride_s,
-                           p.E, p.scale_f,
-                           scores_8 + s_off, Sc_cur,
-                           Lq_eff, 8);
+              if (mask_kind == MaskBlockKind::kAllOff) {
+                fill_scores_block_impl(
+                    scores_8 + s_off, Sc_cur, Lq_eff, 8, p.neg_inf);
+                if (track_pv_skip) {
+                  mark_pv_skip_block_impl(
+                      pv_skip_s, pv_skip_initialized, has_pv_skip,
+                      Sc_cur, s_off, 8);
+                }
+              } else {
+                MK::qkt_tail(Qrow_inner, q_stride_l, K_tile, k_stride_s,
+                             p.E, p.scale_f,
+                             scores_8 + s_off, Sc_cur,
+                             Lq_eff, 8);
+              }
+              if constexpr (kHasMask) {
+                if (has_direct_mask &&
+                    mask_kind == MaskBlockKind::kMixed) {
+                  add_direct_mask_to_scores_block_impl(
+                      p, b, n, q0_inner, s_l2 + s_off, Lq_eff, 8,
+                      scores_8 + s_off, Sc_cur);
+                }
+              }
             }
           }
           if (s_off + 4 <= Sc_active) {
             const scalar_t* K_tile = Krow0 + s_off * k_stride_s;
+            MaskBlockKind mask_kind = MaskBlockKind::kMixed;
+            if constexpr (kHasMask) {
+              if (has_direct_mask) {
+                mask_kind = classify_direct_mask_block_impl(
+                    p, b, n, q0_inner, s_l2 + s_off, Lq_eff, 4);
+              }
+            }
             if (Lq_eff == 8) {
-              MK::qkt_8x4(Qrow_inner, q_stride_l, K_tile, k_stride_s,
-                          p.E, p.scale_f,
-                          scores_8 + s_off, Sc_cur);
+              if (mask_kind == MaskBlockKind::kAllOff) {
+                fill_scores_block_impl(
+                    scores_8 + s_off, Sc_cur, Lq_eff, 4, p.neg_inf);
+                if (track_pv_skip) {
+                  mark_pv_skip_block_impl(
+                      pv_skip_s, pv_skip_initialized, has_pv_skip,
+                      Sc_cur, s_off, 4);
+                }
+              } else {
+                MK::qkt_8x4(Qrow_inner, q_stride_l, K_tile, k_stride_s,
+                            p.E, p.scale_f,
+                            scores_8 + s_off, Sc_cur);
+              }
+              if constexpr (kHasMask) {
+                if (has_direct_mask &&
+                    mask_kind == MaskBlockKind::kMixed) {
+                  add_direct_mask_to_scores_block_impl(
+                      p, b, n, q0_inner, s_l2 + s_off, Lq_eff, 4,
+                      scores_8 + s_off, Sc_cur);
+                }
+              }
             } else {
-              MK::qkt_tail(Qrow_inner, q_stride_l, K_tile, k_stride_s,
-                           p.E, p.scale_f,
-                           scores_8 + s_off, Sc_cur,
-                           Lq_eff, 4);
+              if (mask_kind == MaskBlockKind::kAllOff) {
+                fill_scores_block_impl(
+                    scores_8 + s_off, Sc_cur, Lq_eff, 4, p.neg_inf);
+                if (track_pv_skip) {
+                  mark_pv_skip_block_impl(
+                      pv_skip_s, pv_skip_initialized, has_pv_skip,
+                      Sc_cur, s_off, 4);
+                }
+              } else {
+                MK::qkt_tail(Qrow_inner, q_stride_l, K_tile, k_stride_s,
+                             p.E, p.scale_f,
+                             scores_8 + s_off, Sc_cur,
+                             Lq_eff, 4);
+              }
+              if constexpr (kHasMask) {
+                if (has_direct_mask &&
+                    mask_kind == MaskBlockKind::kMixed) {
+                  add_direct_mask_to_scores_block_impl(
+                      p, b, n, q0_inner, s_l2 + s_off, Lq_eff, 4,
+                      scores_8 + s_off, Sc_cur);
+                }
+              }
             }
             s_off += 4;
           }
           if (s_off < Sc_active) {
             const scalar_t* K_tile = Krow0 + s_off * k_stride_s;
-            MK::qkt_tail(Qrow_inner, q_stride_l, K_tile, k_stride_s,
-                         p.E, p.scale_f,
-                         scores_8 + s_off, Sc_cur,
-                         Lq_eff, static_cast<int>(Sc_active - s_off));
+            const int tail_width = static_cast<int>(Sc_active - s_off);
+            MaskBlockKind mask_kind = MaskBlockKind::kMixed;
+            if constexpr (kHasMask) {
+              if (has_direct_mask) {
+                mask_kind = classify_direct_mask_block_impl(
+                    p, b, n, q0_inner, s_l2 + s_off, Lq_eff, tail_width);
+              }
+            }
+            if (mask_kind == MaskBlockKind::kAllOff) {
+              fill_scores_block_impl(
+                  scores_8 + s_off, Sc_cur, Lq_eff, tail_width, p.neg_inf);
+              if (track_pv_skip) {
+                mark_pv_skip_block_impl(
+                    pv_skip_s, pv_skip_initialized, has_pv_skip,
+                    Sc_cur, s_off, tail_width);
+              }
+            } else {
+              MK::qkt_tail(Qrow_inner, q_stride_l, K_tile, k_stride_s,
+                           p.E, p.scale_f,
+                           scores_8 + s_off, Sc_cur,
+                           Lq_eff, tail_width);
+            }
+            if constexpr (kHasMask) {
+              if (has_direct_mask &&
+                  mask_kind == MaskBlockKind::kMixed) {
+                add_direct_mask_to_scores_block_impl(
+                    p, b, n, q0_inner, s_l2 + s_off, Lq_eff,
+                    tail_width,
+                    scores_8 + s_off, Sc_cur);
+              }
+            }
             s_off = Sc_active;
           }
         }
@@ -482,22 +1006,26 @@ inline void process_q_tile_lc(
         // fp32 4-wide 主体 + 标量尾，主体 IPC ~3，尾巴 ≤ 3 次。
         if constexpr (kHasMask) {
           FUSED_CPP_SDPA_PROFILE_SCOPE(::fused_cpp::sdpa_profile::Slot::kMask);
-          for (int i = 0; i < Lq_eff; ++i) {
-            const float* m_row = p.mask_ptr + b * m_stride_b
-                                            + n * m_stride_n
-                                            + (q0_inner + i) * m_stride_l
-                                            + s_l2;
-            float* sc_row = scores_8 + i * Sc_cur;
-            int64_t j = 0;
+          if (has_direct_mask) {
+            // Direct ggml mask was applied while writing QK blocks to scores_8.
+          } else {
+            for (int i = 0; i < Lq_eff; ++i) {
+              const float* m_row = p.mask_ptr + b * m_stride_b
+                                              + n * m_stride_n
+                                              + (q0_inner + i) * m_stride_l
+                                              + s_l2;
+              float* sc_row = scores_8 + i * Sc_cur;
+              int64_t j = 0;
 #if FUSED_CPP_SDPA_CACHE_HAS_NEON
-            for (; j + 4 <= Sc_active; j += 4) {
-              vst1q_f32(sc_row + j,
-                        vaddq_f32(vld1q_f32(sc_row + j),
-                                  vld1q_f32(m_row + j)));
-            }
+              for (; j + 4 <= Sc_active; j += 4) {
+                vst1q_f32(sc_row + j,
+                          vaddq_f32(vld1q_f32(sc_row + j),
+                                    vld1q_f32(m_row + j)));
+              }
 #endif
-            for (; j < Sc_active; ++j) {
-              sc_row[j] += m_row[j];
+              for (; j < Sc_active; ++j) {
+                sc_row[j] += m_row[j];
+              }
             }
           }
         }
@@ -554,8 +1082,13 @@ inline void process_q_tile_lc(
             const float* sc_row = scores_8 + i * Sc_cur;
             float* p_row = p_hat_8 + i * Sc_cur;
             const int64_t len_i = softmax_len[i];
-            float row_sum = vectorized_exp_minus_impl(
-                p_row, sc_row, new_max[i], len_i);
+            float row_sum = 0.0f;
+            if (new_max[i] == p.neg_inf) {
+              std::memset(p_row, 0, sizeof(float) * Sc_cur);
+            } else {
+              row_sum = vectorized_exp_minus_impl(
+                  p_row, sc_row, new_max[i], len_i);
+            }
             if (len_i < Sc_cur) {
               std::memset(p_row + len_i, 0,
                           sizeof(float) * (Sc_cur - len_i));
@@ -621,24 +1154,46 @@ inline void process_q_tile_lc(
           }
           float* O_tile = o_acc_8 + ev_off;
 
-          if (Lq_eff == 8 && Ev_cur == 8) {
-            if constexpr (has_pv_pbf16_v<MK, scalar_t>) {
-              MK::pv_8x8_pbf16(p_hat_bf16_8, Sc_cur,
-                                V_tile, v_row_stride_for_mk,
-                                Sc_active,
-                                O_tile, p.Ev);
+          auto run_pv_segment = [&](int64_t k_start, int64_t k_len) {
+            if (k_len <= 0) {
+              return;
+            }
+            const scalar_t* V_seg = V_tile + k_start * v_row_stride_for_mk;
+            if (Lq_eff == 8 && Ev_cur == 8) {
+              if constexpr (has_pv_pbf16_v<MK, scalar_t>) {
+                MK::pv_8x8_pbf16(p_hat_bf16_8 + k_start, Sc_cur,
+                                  V_seg, v_row_stride_for_mk,
+                                  k_len,
+                                  O_tile, p.Ev);
+              } else {
+                MK::pv_8x8(p_hat_8 + k_start, Sc_cur,
+                           V_seg, v_row_stride_for_mk,
+                           k_len,
+                           O_tile, p.Ev);
+              }
             } else {
-              MK::pv_8x8(p_hat_8, Sc_cur,
-                         V_tile, v_row_stride_for_mk,
-                         Sc_active,
-                         O_tile, p.Ev);
+              MK::pv_tail(p_hat_8 + k_start, Sc_cur,
+                          V_seg, v_row_stride_for_mk,
+                          k_len,
+                          O_tile, p.Ev,
+                          Lq_eff, static_cast<int>(Ev_cur));
+            }
+          };
+
+          if (has_pv_skip) {
+            int64_t k = 0;
+            while (k < Sc_active) {
+              while (k < Sc_active && pv_skip_s[k] != 0) {
+                ++k;
+              }
+              const int64_t k_start = k;
+              while (k < Sc_active && pv_skip_s[k] == 0) {
+                ++k;
+              }
+              run_pv_segment(k_start, k - k_start);
             }
           } else {
-            MK::pv_tail(p_hat_8, Sc_cur,
-                        V_tile, v_row_stride_for_mk,
-                        Sc_active,
-                        O_tile, p.Ev,
-                        Lq_eff, static_cast<int>(Ev_cur));
+            run_pv_segment(0, Sc_active);
           }
           }
         }

@@ -6,11 +6,16 @@
 #include <cstdlib>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <random>
 #include <stdexcept>
 #include <string>
 
 namespace {
+
+constexpr uint16_t kF16Zero = 0x0000;
+constexpr uint16_t kF16NegOne = 0xbc00;
+constexpr uint16_t kF16NegInf = 0xfc00;
 
 bool starts_with(const std::string& s, const char* prefix) {
   return s.rfind(prefix, 0) == 0;
@@ -135,6 +140,374 @@ int main(int argc, char** argv) {
               << fp32_packqkv_sdpa::max_abs_diff(
                      out.data(), ref.data(), o_size)
               << "\n";
+
+    if (!cfg.causal) {
+      fp32_packqkv_sdpa::AlignedVector<float> q_ggml(
+          static_cast<size_t>(q_size));
+      fp32_packqkv_sdpa::AlignedVector<float> k_ggml(
+          static_cast<size_t>(k_size));
+      fp32_packqkv_sdpa::AlignedVector<float> v_ggml(
+          static_cast<size_t>(v_size));
+      fp32_packqkv_sdpa::AlignedVector<float> out_ggml(
+          static_cast<size_t>(o_size), 0.0f);
+      fp32_packqkv_sdpa::AlignedVector<float> out_from_ggml(
+          static_cast<size_t>(o_size), 0.0f);
+
+      for (int64_t b = 0; b < cfg.B; ++b) {
+        for (int64_t n = 0; n < cfg.N; ++n) {
+          for (int64_t l = 0; l < cfg.L; ++l) {
+            for (int64_t e = 0; e < cfg.E; ++e) {
+              q_ggml[((b * cfg.L + l) * cfg.N + n) * cfg.E + e] =
+                  q[((b * cfg.N + n) * cfg.L + l) * cfg.E + e];
+            }
+          }
+          for (int64_t s = 0; s < cfg.S; ++s) {
+            for (int64_t e = 0; e < cfg.E; ++e) {
+              k_ggml[((b * cfg.S + s) * cfg.N + n) * cfg.E + e] =
+                  k[((b * cfg.N + n) * cfg.S + s) * cfg.E + e];
+            }
+            for (int64_t ev = 0; ev < cfg.Ev; ++ev) {
+              v_ggml[((b * cfg.S + s) * cfg.N + n) * cfg.Ev + ev] =
+                  v[((b * cfg.N + n) * cfg.S + s) * cfg.Ev + ev];
+            }
+          }
+        }
+      }
+
+      const int64_t elem = static_cast<int64_t>(sizeof(float));
+      const int rc =
+          fused_cpp_sdpa_flash2_neon_l3kv_packqkv_pbf16pv_fp32_llamacpp(
+              q_ggml.data(),
+              k_ggml.data(),
+              v_ggml.data(),
+              out_ggml.data(),
+              cfg.B,
+              cfg.N,
+              cfg.L,
+              cfg.S,
+              cfg.E,
+              cfg.Ev,
+              elem,
+              cfg.E * cfg.N * elem,
+              cfg.E * elem,
+              cfg.E * cfg.N * cfg.L * elem,
+              elem,
+              cfg.E * cfg.N * elem,
+              cfg.E * elem,
+              cfg.E * cfg.N * cfg.S * elem,
+              elem,
+              cfg.Ev * cfg.N * elem,
+              cfg.Ev * elem,
+              cfg.Ev * cfg.N * cfg.S * elem,
+              elem,
+              cfg.Ev * elem,
+              cfg.Ev * cfg.N * elem,
+              cfg.Ev * cfg.N * cfg.L * elem,
+              cfg.scale);
+      if (rc != 0) {
+        throw std::runtime_error("llamacpp strided check failed rc=" +
+                                 std::to_string(rc));
+      }
+
+      for (int64_t b = 0; b < cfg.B; ++b) {
+        for (int64_t n = 0; n < cfg.N; ++n) {
+          for (int64_t l = 0; l < cfg.L; ++l) {
+            for (int64_t ev = 0; ev < cfg.Ev; ++ev) {
+              out_from_ggml[((b * cfg.N + n) * cfg.L + l) * cfg.Ev + ev] =
+                  out_ggml[((b * cfg.L + l) * cfg.N + n) * cfg.Ev + ev];
+            }
+          }
+        }
+      }
+      std::cout << "llamacpp_max_abs_diff="
+                << fp32_packqkv_sdpa::max_abs_diff(
+                       out_from_ggml.data(), ref.data(), o_size)
+                << "\n";
+
+      const int64_t mask_h = 1;
+      const int64_t mask_b = 1;
+      fp32_packqkv_sdpa::AlignedVector<uint16_t> mask_f16(
+          static_cast<size_t>(cfg.S * cfg.L * mask_h * mask_b));
+      fp32_packqkv_sdpa::AlignedVector<float> mask_f32(
+          static_cast<size_t>(cfg.S * cfg.L * mask_h * mask_b));
+      fp32_packqkv_sdpa::AlignedVector<float> mask32(
+          static_cast<size_t>(cfg.B * cfg.N * cfg.L * cfg.S));
+      for (int64_t l = 0; l < cfg.L; ++l) {
+        for (int64_t s = 0; s < cfg.S; ++s) {
+          const bool penalize = ((s + l) % 3) == 0;
+          const float value = penalize ? -1.0f : 0.0f;
+          mask_f16[l * cfg.S + s] = penalize ? kF16NegOne : kF16Zero;
+          mask_f32[l * cfg.S + s] = value;
+          for (int64_t b = 0; b < cfg.B; ++b) {
+            for (int64_t n = 0; n < cfg.N; ++n) {
+              mask32[((b * cfg.N + n) * cfg.L + l) * cfg.S + s] = value;
+            }
+          }
+        }
+      }
+
+      fp32_packqkv_sdpa::AlignedVector<float> ref_masked(
+          static_cast<size_t>(o_size), 0.0f);
+      fp32_packqkv_sdpa::AlignedVector<float> out_mask_ggml(
+          static_cast<size_t>(o_size), 0.0f);
+      fp32_packqkv_sdpa::AlignedVector<float> out_mask_from_ggml(
+          static_cast<size_t>(o_size), 0.0f);
+      fp32_packqkv_sdpa::reference_sdpa_fp32_mask(
+          q.data(), k.data(), v.data(), mask32.data(), ref_masked.data(), cfg);
+
+      const int rc_mask =
+          fused_cpp_sdpa_flash2_neon_l3kv_packqkv_pbf16pv_fp32_llamacpp_mask_f16(
+              q_ggml.data(),
+              k_ggml.data(),
+              v_ggml.data(),
+              mask_f16.data(),
+              out_mask_ggml.data(),
+              cfg.B,
+              cfg.N,
+              cfg.L,
+              cfg.S,
+              cfg.E,
+              cfg.Ev,
+              elem,
+              cfg.E * cfg.N * elem,
+              cfg.E * elem,
+              cfg.E * cfg.N * cfg.L * elem,
+              elem,
+              cfg.E * cfg.N * elem,
+              cfg.E * elem,
+              cfg.E * cfg.N * cfg.S * elem,
+              elem,
+              cfg.Ev * cfg.N * elem,
+              cfg.Ev * elem,
+              cfg.Ev * cfg.N * cfg.S * elem,
+              elem,
+              cfg.Ev * elem,
+              cfg.Ev * cfg.N * elem,
+              cfg.Ev * cfg.N * cfg.L * elem,
+              cfg.S,
+              cfg.L,
+              mask_h,
+              mask_b,
+              static_cast<int64_t>(sizeof(uint16_t)),
+              cfg.S * static_cast<int64_t>(sizeof(uint16_t)),
+              cfg.S * cfg.L * static_cast<int64_t>(sizeof(uint16_t)),
+              cfg.S * cfg.L * mask_h * static_cast<int64_t>(sizeof(uint16_t)),
+              cfg.scale);
+      if (rc_mask != 0) {
+        throw std::runtime_error("llamacpp F16 mask check failed rc=" +
+                                 std::to_string(rc_mask));
+      }
+      for (int64_t b = 0; b < cfg.B; ++b) {
+        for (int64_t n = 0; n < cfg.N; ++n) {
+          for (int64_t l = 0; l < cfg.L; ++l) {
+            for (int64_t ev = 0; ev < cfg.Ev; ++ev) {
+              out_mask_from_ggml[((b * cfg.N + n) * cfg.L + l) * cfg.Ev + ev] =
+                  out_mask_ggml[((b * cfg.L + l) * cfg.N + n) * cfg.Ev + ev];
+            }
+          }
+        }
+      }
+      std::cout << "llamacpp_mask_f16_max_abs_diff="
+                << fp32_packqkv_sdpa::max_abs_diff(
+                       out_mask_from_ggml.data(), ref_masked.data(), o_size)
+                << "\n";
+
+      std::fill(out_mask_ggml.begin(), out_mask_ggml.end(), 0.0f);
+      std::fill(out_mask_from_ggml.begin(), out_mask_from_ggml.end(), 0.0f);
+      const int rc_mask_f32 =
+          fused_cpp_sdpa_flash2_neon_l3kv_packqkv_pbf16pv_fp32_llamacpp_mask_f32(
+              q_ggml.data(),
+              k_ggml.data(),
+              v_ggml.data(),
+              mask_f32.data(),
+              out_mask_ggml.data(),
+              cfg.B,
+              cfg.N,
+              cfg.L,
+              cfg.S,
+              cfg.E,
+              cfg.Ev,
+              elem,
+              cfg.E * cfg.N * elem,
+              cfg.E * elem,
+              cfg.E * cfg.N * cfg.L * elem,
+              elem,
+              cfg.E * cfg.N * elem,
+              cfg.E * elem,
+              cfg.E * cfg.N * cfg.S * elem,
+              elem,
+              cfg.Ev * cfg.N * elem,
+              cfg.Ev * elem,
+              cfg.Ev * cfg.N * cfg.S * elem,
+              elem,
+              cfg.Ev * elem,
+              cfg.Ev * cfg.N * elem,
+              cfg.Ev * cfg.N * cfg.L * elem,
+              cfg.S,
+              cfg.L,
+              mask_h,
+              mask_b,
+              static_cast<int64_t>(sizeof(float)),
+              cfg.S * static_cast<int64_t>(sizeof(float)),
+              cfg.S * cfg.L * static_cast<int64_t>(sizeof(float)),
+              cfg.S * cfg.L * mask_h * static_cast<int64_t>(sizeof(float)),
+              cfg.scale);
+      if (rc_mask_f32 != 0) {
+        throw std::runtime_error("llamacpp F32 mask check failed rc=" +
+                                 std::to_string(rc_mask_f32));
+      }
+      for (int64_t b = 0; b < cfg.B; ++b) {
+        for (int64_t n = 0; n < cfg.N; ++n) {
+          for (int64_t l = 0; l < cfg.L; ++l) {
+            for (int64_t ev = 0; ev < cfg.Ev; ++ev) {
+              out_mask_from_ggml[((b * cfg.N + n) * cfg.L + l) * cfg.Ev + ev] =
+                  out_mask_ggml[((b * cfg.L + l) * cfg.N + n) * cfg.Ev + ev];
+            }
+          }
+        }
+      }
+      std::cout << "llamacpp_mask_f32_max_abs_diff="
+                << fp32_packqkv_sdpa::max_abs_diff(
+                       out_mask_from_ggml.data(), ref_masked.data(), o_size)
+                << "\n";
+
+      std::fill(mask32.begin(), mask32.end(), 0.0f);
+      std::fill(out_mask_ggml.begin(), out_mask_ggml.end(), 0.0f);
+      std::fill(out_mask_from_ggml.begin(), out_mask_from_ggml.end(), 0.0f);
+      std::fill(ref_masked.begin(), ref_masked.end(), 0.0f);
+      for (int64_t l = 0; l < cfg.L; ++l) {
+        for (int64_t s = 0; s < cfg.S; ++s) {
+          const bool disabled = s > l;
+          const float value = disabled
+              ? -std::numeric_limits<float>::infinity()
+              : 0.0f;
+          mask_f16[l * cfg.S + s] = disabled ? kF16NegInf : kF16Zero;
+          mask_f32[l * cfg.S + s] = value;
+          for (int64_t b = 0; b < cfg.B; ++b) {
+            for (int64_t n = 0; n < cfg.N; ++n) {
+              mask32[((b * cfg.N + n) * cfg.L + l) * cfg.S + s] = value;
+            }
+          }
+        }
+      }
+      fp32_packqkv_sdpa::reference_sdpa_fp32_mask(
+          q.data(), k.data(), v.data(), mask32.data(), ref_masked.data(), cfg);
+      const int rc_zeroinf =
+          fused_cpp_sdpa_flash2_neon_l3kv_packqkv_pbf16pv_fp32_llamacpp_mask_f16(
+              q_ggml.data(),
+              k_ggml.data(),
+              v_ggml.data(),
+              mask_f16.data(),
+              out_mask_ggml.data(),
+              cfg.B,
+              cfg.N,
+              cfg.L,
+              cfg.S,
+              cfg.E,
+              cfg.Ev,
+              elem,
+              cfg.E * cfg.N * elem,
+              cfg.E * elem,
+              cfg.E * cfg.N * cfg.L * elem,
+              elem,
+              cfg.E * cfg.N * elem,
+              cfg.E * elem,
+              cfg.E * cfg.N * cfg.S * elem,
+              elem,
+              cfg.Ev * cfg.N * elem,
+              cfg.Ev * elem,
+              cfg.Ev * cfg.N * cfg.S * elem,
+              elem,
+              cfg.Ev * elem,
+              cfg.Ev * cfg.N * elem,
+              cfg.Ev * cfg.N * cfg.L * elem,
+              cfg.S,
+              cfg.L,
+              mask_h,
+              mask_b,
+              static_cast<int64_t>(sizeof(uint16_t)),
+              cfg.S * static_cast<int64_t>(sizeof(uint16_t)),
+              cfg.S * cfg.L * static_cast<int64_t>(sizeof(uint16_t)),
+              cfg.S * cfg.L * mask_h * static_cast<int64_t>(sizeof(uint16_t)),
+              cfg.scale);
+      if (rc_zeroinf != 0) {
+        throw std::runtime_error("llamacpp F16 0/-inf mask check failed rc=" +
+                                 std::to_string(rc_zeroinf));
+      }
+      for (int64_t b = 0; b < cfg.B; ++b) {
+        for (int64_t n = 0; n < cfg.N; ++n) {
+          for (int64_t l = 0; l < cfg.L; ++l) {
+            for (int64_t ev = 0; ev < cfg.Ev; ++ev) {
+              out_mask_from_ggml[((b * cfg.N + n) * cfg.L + l) * cfg.Ev + ev] =
+                  out_mask_ggml[((b * cfg.L + l) * cfg.N + n) * cfg.Ev + ev];
+            }
+          }
+        }
+      }
+      std::cout << "llamacpp_mask_f16_zeroinf_max_abs_diff="
+                << fp32_packqkv_sdpa::max_abs_diff(
+                       out_mask_from_ggml.data(), ref_masked.data(), o_size)
+                << "\n";
+
+      std::fill(out_mask_ggml.begin(), out_mask_ggml.end(), 0.0f);
+      std::fill(out_mask_from_ggml.begin(), out_mask_from_ggml.end(), 0.0f);
+      const int rc_zeroinf_f32 =
+          fused_cpp_sdpa_flash2_neon_l3kv_packqkv_pbf16pv_fp32_llamacpp_mask_f32(
+              q_ggml.data(),
+              k_ggml.data(),
+              v_ggml.data(),
+              mask_f32.data(),
+              out_mask_ggml.data(),
+              cfg.B,
+              cfg.N,
+              cfg.L,
+              cfg.S,
+              cfg.E,
+              cfg.Ev,
+              elem,
+              cfg.E * cfg.N * elem,
+              cfg.E * elem,
+              cfg.E * cfg.N * cfg.L * elem,
+              elem,
+              cfg.E * cfg.N * elem,
+              cfg.E * elem,
+              cfg.E * cfg.N * cfg.S * elem,
+              elem,
+              cfg.Ev * cfg.N * elem,
+              cfg.Ev * elem,
+              cfg.Ev * cfg.N * cfg.S * elem,
+              elem,
+              cfg.Ev * elem,
+              cfg.Ev * cfg.N * elem,
+              cfg.Ev * cfg.N * cfg.L * elem,
+              cfg.S,
+              cfg.L,
+              mask_h,
+              mask_b,
+              static_cast<int64_t>(sizeof(float)),
+              cfg.S * static_cast<int64_t>(sizeof(float)),
+              cfg.S * cfg.L * static_cast<int64_t>(sizeof(float)),
+              cfg.S * cfg.L * mask_h * static_cast<int64_t>(sizeof(float)),
+              cfg.scale);
+      if (rc_zeroinf_f32 != 0) {
+        throw std::runtime_error("llamacpp F32 0/-inf mask check failed rc=" +
+                                 std::to_string(rc_zeroinf_f32));
+      }
+      for (int64_t b = 0; b < cfg.B; ++b) {
+        for (int64_t n = 0; n < cfg.N; ++n) {
+          for (int64_t l = 0; l < cfg.L; ++l) {
+            for (int64_t ev = 0; ev < cfg.Ev; ++ev) {
+              out_mask_from_ggml[((b * cfg.N + n) * cfg.L + l) * cfg.Ev + ev] =
+                  out_mask_ggml[((b * cfg.L + l) * cfg.N + n) * cfg.Ev + ev];
+            }
+          }
+        }
+      }
+      std::cout << "llamacpp_mask_f32_zeroinf_max_abs_diff="
+                << fp32_packqkv_sdpa::max_abs_diff(
+                       out_mask_from_ggml.data(), ref_masked.data(), o_size)
+                << "\n";
+    }
   }
 
   return 0;
