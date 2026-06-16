@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """fused-cpp: CPU Fused MLA and MoE implementations (pure PyTorch)."""
+
 from fused_cpp.acl_gemm import (
     ACLGEMMHandler,
     _supports_acl,
@@ -59,6 +60,7 @@ from fused_cpp.sparse_mla import (
     sparse_mla,
     sparse_mla_naive,
 )
+from fused_cpp.sparse_attn_indexer import cpu_sparse_attn_indexer_op
 from fused_cpp.w4a8_linear import (
     unpack_awq_qweight,
     unpack_awq_qzeros,
@@ -95,6 +97,7 @@ __all__ = [
     "available_sdpa_versions",
     "create_acl_gemm",
     "create_kai_gemm",
+    "cpu_sparse_attn_indexer_op",
     "deepseek_v4_attn_gemm_fused_prepacked",
     "flash_mla_sparse_fwd",
     "flash_mla_sparse_fwd_naive",
