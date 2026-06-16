@@ -11,6 +11,8 @@ dist/
 .pytest_cache/
 .venv/
 *.egg
+refs/
+.codegraph/
 
 # OS / editor
 .DS_Store

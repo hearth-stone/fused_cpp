@@ -16,10 +16,10 @@ rsync -avzP \
     --exclude='.pytest_cache/' \
     --exclude='.benchmarks/' \
     --exclude='.codebuddy/' \
+    --exclude='.codegraph/' \
     --exclude='.claude/' \
     --exclude='.gemini/' \
     --exclude='.venv/' \
     --exclude='bench/sdpa/sdpa_versions_*.csv' \
     --exclude='bench/sdpa/sdpa_versions_*.json' \
-    --exclude='.codegraph/' \
-    ./ "Arm-codex:/home/zhangxu/codex/fused_cpp"
+    ./ "AmazonECS8Cores:/home/ubuntu/zhangxu/fused_cpp"
