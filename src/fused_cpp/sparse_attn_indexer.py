@@ -1,21 +1,49 @@
 # -*- coding: utf-8 -*-
-"""DeepSeek V4 sparse attention indexer CPU baseline.
+"""DeepSeek V4 sparse attention indexer CPU baselines.
 
 This module carries the current vLLM v0.22.0-dsv4 Torch CPU fallback for
 ``cpu_sparse_attn_indexer_op`` into fused_cpp as a standalone baseline.  It
 accepts the same metadata shape by duck typing so it can run with vLLM's
 ``DeepseekV32IndexerMetadata`` objects without making vLLM a package
 dependency.
+
+The public entrypoint is versioned so future native implementations can be
+compared against the strict Torch baseline without changing test and benchmark
+call sites.  Set ``FUSED_CPP_SPARSE_ATTN_INDEXER_VERSION`` or pass
+``version=...`` explicitly.  Supported names:
+
+* ``torch``: strict Python/Torch copy of vLLM's CPU fallback.
+* ``cpp_v0``: initial C++ correctness implementation for prefill.
+* ``auto``: choose ``cpp_v0`` when available for prefill-only metadata, otherwise
+  fall back to ``torch``.
 """
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import torch
 import torch.nn.functional as F
 
-__all__ = ["cpu_sparse_attn_indexer_op"]
+try:
+    from fused_cpp._C import (  # type: ignore[import-untyped]
+        sparse_attn_indexer_prefill_cpp_v0 as _cpp_prefill_v0_impl,
+    )
+
+    _HAS_CPP_SPARSE_ATTN_INDEXER = True
+except (ImportError, AttributeError):
+    _cpp_prefill_v0_impl = None
+    _HAS_CPP_SPARSE_ATTN_INDEXER = False
+
+__all__ = [
+    "_HAS_CPP_SPARSE_ATTN_INDEXER",
+    "available_sparse_attn_indexer_versions",
+    "cpu_sparse_attn_indexer_op",
+    "cpu_sparse_attn_indexer_op_cpp_v0",
+    "cpu_sparse_attn_indexer_op_torch_baseline",
+    "sparse_attn_indexer_op",
+]
 
 
 def _fold_q_weights(q_quant: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
@@ -25,7 +53,7 @@ def _fold_q_weights(q_quant: torch.Tensor, weights: torch.Tensor) -> torch.Tenso
     )
 
 
-def cpu_sparse_attn_indexer_op(
+def cpu_sparse_attn_indexer_op_torch_baseline(
     q_quant: torch.Tensor,
     weights: torch.Tensor,
     kv_cache: torch.Tensor,
@@ -179,3 +207,105 @@ def cpu_sparse_attn_indexer_op(
             topk_indices_buffer[token_idx, :k_take] = idx_local.to(torch.int32)
 
     return topk_indices_buffer
+
+
+def _metadata_has_decode(attn_metadata: Any) -> bool:
+    return (
+        int(getattr(attn_metadata, "num_decodes", 0)) > 0
+        or int(getattr(attn_metadata, "num_decode_tokens", 0)) > 0
+    )
+
+
+def available_sparse_attn_indexer_versions() -> tuple[str, ...]:
+    """Return sparse attention indexer versions importable in this runtime."""
+    versions = ["torch"]
+    if _HAS_CPP_SPARSE_ATTN_INDEXER:
+        versions.append("cpp_v0")
+    versions.append("auto")
+    return tuple(versions)
+
+
+def _normalize_sparse_attn_indexer_version(version: str | None) -> str:
+    value = (
+        version
+        if version is not None
+        else os.environ.get("FUSED_CPP_SPARSE_ATTN_INDEXER_VERSION", "torch")
+    )
+    value = value.lower().replace("-", "_")
+    aliases = {
+        "baseline": "torch",
+        "python": "torch",
+        "pytorch": "torch",
+        "cpp": "cpp_v0",
+        "cxx": "cpp_v0",
+        "native": "cpp_v0",
+    }
+    return aliases.get(value, value)
+
+
+def cpu_sparse_attn_indexer_op_cpp_v0(
+    q_quant: torch.Tensor,
+    weights: torch.Tensor,
+    kv_cache: torch.Tensor,
+    topk_indices_buffer: torch.Tensor,
+    topk_tokens: int,
+    attn_metadata: Any,
+) -> torch.Tensor:
+    """Run the initial C++ prefill-only implementation."""
+    if not _HAS_CPP_SPARSE_ATTN_INDEXER:
+        raise RuntimeError("sparse attention indexer cpp_v0 backend is unavailable")
+    if _metadata_has_decode(attn_metadata):
+        raise NotImplementedError("sparse attention indexer cpp_v0 currently supports prefill only")
+    return _cpp_prefill_v0_impl(
+        q_quant,
+        weights,
+        kv_cache,
+        topk_indices_buffer,
+        topk_tokens,
+        attn_metadata,
+    )
+
+
+def cpu_sparse_attn_indexer_op(
+    q_quant: torch.Tensor,
+    weights: torch.Tensor,
+    kv_cache: torch.Tensor,
+    topk_indices_buffer: torch.Tensor,
+    topk_tokens: int,
+    attn_metadata: Any,
+    *,
+    version: str | None = None,
+) -> torch.Tensor:
+    """Versioned DeepSeek V4 sparse attention indexer entrypoint."""
+    selected = _normalize_sparse_attn_indexer_version(version)
+    if selected == "auto":
+        selected = (
+            "cpp_v0"
+            if _HAS_CPP_SPARSE_ATTN_INDEXER and not _metadata_has_decode(attn_metadata)
+            else "torch"
+        )
+    if selected == "torch":
+        return cpu_sparse_attn_indexer_op_torch_baseline(
+            q_quant,
+            weights,
+            kv_cache,
+            topk_indices_buffer,
+            topk_tokens,
+            attn_metadata,
+        )
+    if selected == "cpp_v0":
+        return cpu_sparse_attn_indexer_op_cpp_v0(
+            q_quant,
+            weights,
+            kv_cache,
+            topk_indices_buffer,
+            topk_tokens,
+            attn_metadata,
+        )
+    raise ValueError(
+        "unknown sparse attention indexer version "
+        f"{selected!r}; available={available_sparse_attn_indexer_versions()}"
+    )
+
+
+sparse_attn_indexer_op = cpu_sparse_attn_indexer_op

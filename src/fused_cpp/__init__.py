@@ -60,7 +60,14 @@ from fused_cpp.sparse_mla import (
     sparse_mla,
     sparse_mla_naive,
 )
-from fused_cpp.sparse_attn_indexer import cpu_sparse_attn_indexer_op
+from fused_cpp.sparse_attn_indexer import (
+    _HAS_CPP_SPARSE_ATTN_INDEXER,
+    available_sparse_attn_indexer_versions,
+    cpu_sparse_attn_indexer_op,
+    cpu_sparse_attn_indexer_op_cpp_v0,
+    cpu_sparse_attn_indexer_op_torch_baseline,
+    sparse_attn_indexer_op,
+)
 from fused_cpp.w4a8_linear import (
     unpack_awq_qweight,
     unpack_awq_qzeros,
@@ -90,14 +97,18 @@ __all__ = [
     "VersionInfo",
     "_HAS_DEEPSEEK_V4_ATTN_GEMM_FUSED",
     "_HAS_BF16_TILED_FUSED_MOE",
+    "_HAS_CPP_SPARSE_ATTN_INDEXER",
     "_supports_acl",
     "_supports_i8gemm",
     "_supports_kai",
     "acl_gemm",
     "available_sdpa_versions",
+    "available_sparse_attn_indexer_versions",
     "create_acl_gemm",
     "create_kai_gemm",
     "cpu_sparse_attn_indexer_op",
+    "cpu_sparse_attn_indexer_op_cpp_v0",
+    "cpu_sparse_attn_indexer_op_torch_baseline",
     "deepseek_v4_attn_gemm_fused_prepacked",
     "flash_mla_sparse_fwd",
     "flash_mla_sparse_fwd_naive",
@@ -125,6 +136,7 @@ __all__ = [
     "scaled_dot_product_attention",
     "sdpa_versioned",
     "set_acl_affinity",
+    "sparse_attn_indexer_op",
     "sparse_mla",
     "sparse_mla_naive",
     "unpack_awq_qweight",

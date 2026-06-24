@@ -68,6 +68,13 @@ py::object flash_mla_sparse_fwd(
     c10::optional<at::Tensor> topk_length,
     c10::optional<at::Tensor> out,
     bool return_stats);
+at::Tensor sparse_attn_indexer_prefill_cpp_v0(
+    at::Tensor q_quant,
+    at::Tensor weights,
+    at::Tensor kv_cache,
+    at::Tensor topk_indices_buffer,
+    int64_t topk_tokens,
+    py::object attn_metadata);
 
 // OMP runtime info forward declarations — omp_info.cpp
 std::map<std::string, std::string> get_omp_runtime_info();
@@ -302,6 +309,17 @@ PYBIND11_MODULE(_C, m) {
           py::arg("out") = c10::nullopt,
           py::arg("return_stats") = false,
           py::call_guard<py::gil_scoped_release>());
+
+    m.def("sparse_attn_indexer_prefill_cpp_v0",
+          &sparse_attn_indexer_prefill_cpp_v0,
+          "Initial DeepSeek V4 sparse attention indexer prefill implementation. "
+          "Matches the vLLM Torch CPU fallback and mutates topk_indices_buffer.",
+          py::arg("q_quant"),
+          py::arg("weights"),
+          py::arg("kv_cache"),
+          py::arg("topk_indices_buffer"),
+          py::arg("topk_tokens"),
+          py::arg("attn_metadata"));
 
     m.def("get_omp_runtime_info", &get_omp_runtime_info,
           "Return a snapshot of the current OpenMP runtime configuration "

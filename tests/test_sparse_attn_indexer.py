@@ -8,7 +8,13 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from fused_cpp import cpu_sparse_attn_indexer_op
+from fused_cpp import (
+    _HAS_CPP_SPARSE_ATTN_INDEXER,
+    available_sparse_attn_indexer_versions,
+    cpu_sparse_attn_indexer_op,
+    cpu_sparse_attn_indexer_op_cpp_v0,
+    cpu_sparse_attn_indexer_op_torch_baseline,
+)
 import fused_cpp.sparse_attn_indexer as sparse_attn_indexer_mod
 
 
@@ -34,6 +40,35 @@ def _topk_for_row(
     k_take = min(topk_tokens, k_rows.shape[0])
     _, indices = torch.topk(torch.mv(k_rows, q_w), k_take, dim=-1)
     return indices.to(torch.int32)
+
+
+def _make_prefill_metadata(
+    *,
+    block_table: torch.Tensor,
+    cu_seqlen_ks: torch.Tensor,
+    cu_seqlen_ke: torch.Tensor,
+    cu_seq_lens: torch.Tensor,
+    total_seq_lens: int,
+    token_start: int,
+    token_end: int,
+    num_reqs: int,
+) -> SimpleNamespace:
+    chunk = SimpleNamespace(
+        block_table=block_table,
+        cu_seqlen_ks=cu_seqlen_ks,
+        cu_seqlen_ke=cu_seqlen_ke,
+        cu_seq_lens=cu_seq_lens,
+        total_seq_lens=total_seq_lens,
+        token_start=token_start,
+        token_end=token_end,
+        num_reqs=num_reqs,
+    )
+    return SimpleNamespace(
+        num_decodes=0,
+        num_decode_tokens=0,
+        num_prefills=num_reqs,
+        prefill=SimpleNamespace(chunks=[chunk]),
+    )
 
 
 def test_cpu_sparse_attn_indexer_short_prefill_skips_scoring(
@@ -85,6 +120,15 @@ def test_cpu_sparse_attn_indexer_short_prefill_skips_scoring(
     assert out is topk_indices
 
 
+def test_cpu_sparse_attn_indexer_version_registry() -> None:
+    """Version registry should expose a stable Python baseline and auto selector."""
+    versions = available_sparse_attn_indexer_versions()
+
+    assert "torch" in versions
+    assert "auto" in versions
+    assert ("cpp_v0" in versions) == _HAS_CPP_SPARSE_ATTN_INDEXER
+
+
 def test_cpu_sparse_attn_indexer_prefill_scores_paged_cache() -> None:
     """Prefill scoring should gather paged K rows and write local topk indices."""
     torch.manual_seed(3)
@@ -101,7 +145,7 @@ def test_cpu_sparse_attn_indexer_prefill_scores_paged_cache() -> None:
         ],
         dtype=torch.int32,
     )
-    chunk = SimpleNamespace(
+    metadata = _make_prefill_metadata(
         block_table=block_table,
         cu_seqlen_ks=torch.tensor([0, 2, 5], dtype=torch.int32),
         cu_seqlen_ke=torch.tensor([5, 5, 8], dtype=torch.int32),
@@ -110,12 +154,6 @@ def test_cpu_sparse_attn_indexer_prefill_scores_paged_cache() -> None:
         token_start=0,
         token_end=3,
         num_reqs=2,
-    )
-    metadata = SimpleNamespace(
-        num_decodes=0,
-        num_decode_tokens=0,
-        num_prefills=1,
-        prefill=SimpleNamespace(chunks=[chunk]),
     )
 
     out = cpu_sparse_attn_indexer_op(
@@ -137,6 +175,173 @@ def test_cpu_sparse_attn_indexer_prefill_scores_paged_cache() -> None:
     expected[2, :topk_tokens] = _topk_for_row(q_w[2], all_k[5:8], topk_tokens)
 
     torch.testing.assert_close(out, expected)
+
+
+@pytest.mark.skipif(
+    not _HAS_CPP_SPARSE_ATTN_INDEXER,
+    reason="sparse attention indexer C++ extension is unavailable",
+)
+@pytest.mark.parametrize("version", ["cpp_v0", "auto"])
+def test_cpu_sparse_attn_indexer_cpp_v0_matches_torch_prefill(version: str) -> None:
+    """The initial C++ prefill path should exactly match the Torch baseline."""
+    torch.manual_seed(11)
+
+    q_quant = torch.randn(5, 3, 7).bfloat16()
+    weights = torch.randn(5, 3)
+    kv_cache = torch.randn(8, 4, 7).bfloat16()
+    block_table = torch.tensor(
+        [
+            [1, 3, 0],
+            [5, 2, 7],
+        ],
+        dtype=torch.int32,
+    )
+    metadata = _make_prefill_metadata(
+        block_table=block_table,
+        cu_seqlen_ks=torch.tensor([0, 1, 4, 6, 8], dtype=torch.int32),
+        cu_seqlen_ke=torch.tensor([5, 5, 8, 8, 10], dtype=torch.int32),
+        cu_seq_lens=torch.tensor([0, 6, 10], dtype=torch.int32),
+        total_seq_lens=10,
+        token_start=0,
+        token_end=5,
+        num_reqs=2,
+    )
+    topk_tokens = 3
+
+    ref_buffer = torch.full((5, 4), 77, dtype=torch.int32)
+    actual_buffer = torch.full((5, 4), 77, dtype=torch.int32)
+    ref = cpu_sparse_attn_indexer_op_torch_baseline(
+        q_quant,
+        weights,
+        kv_cache,
+        ref_buffer,
+        topk_tokens,
+        metadata,
+    )
+    actual = cpu_sparse_attn_indexer_op(
+        q_quant,
+        weights,
+        kv_cache,
+        actual_buffer,
+        topk_tokens,
+        metadata,
+        version=version,
+    )
+    assert actual is actual_buffer
+    torch.testing.assert_close(actual, ref)
+
+
+@pytest.mark.skipif(
+    not _HAS_CPP_SPARSE_ATTN_INDEXER,
+    reason="sparse attention indexer C++ extension is unavailable",
+)
+def test_cpu_sparse_attn_indexer_cpp_v0_writes_sorted_topk() -> None:
+    """C++ topk output should stay sorted by descending score."""
+    q_quant = torch.ones((1, 1, 1), dtype=torch.float32)
+    weights = torch.ones((1, 1), dtype=torch.float32)
+    kv_cache = torch.tensor(
+        [
+            [[0.1], [0.9], [0.3], [0.8]],
+            [[0.2], [0.7], [0.4], [0.6]],
+        ],
+        dtype=torch.float32,
+    )
+    block_table = torch.tensor([[0, 1]], dtype=torch.int32)
+    metadata = _make_prefill_metadata(
+        block_table=block_table,
+        cu_seqlen_ks=torch.tensor([0], dtype=torch.int32),
+        cu_seqlen_ke=torch.tensor([8], dtype=torch.int32),
+        cu_seq_lens=torch.tensor([0, 8], dtype=torch.int32),
+        total_seq_lens=8,
+        token_start=0,
+        token_end=1,
+        num_reqs=1,
+    )
+    topk_indices = torch.full((1, 4), -1, dtype=torch.int32)
+
+    out = cpu_sparse_attn_indexer_op(
+        q_quant,
+        weights,
+        kv_cache,
+        topk_indices,
+        4,
+        metadata,
+        version="cpp_v0",
+    )
+
+    torch.testing.assert_close(
+        out,
+        torch.tensor([[1, 3, 5, 7]], dtype=torch.int32),
+    )
+
+
+@pytest.mark.skipif(
+    not _HAS_CPP_SPARSE_ATTN_INDEXER,
+    reason="sparse attention indexer C++ extension is unavailable",
+)
+def test_cpu_sparse_attn_indexer_cpp_v0_respects_output_column_stride() -> None:
+    """The custom topk path should support non-contiguous output views."""
+    q_quant = torch.ones((1, 1, 1), dtype=torch.float32)
+    weights = torch.ones((1, 1), dtype=torch.float32)
+    kv_cache = torch.tensor(
+        [
+            [[0.1], [0.9], [0.3], [0.8]],
+            [[0.2], [0.7], [0.4], [0.6]],
+        ],
+        dtype=torch.float32,
+    )
+    block_table = torch.tensor([[0, 1]], dtype=torch.int32)
+    metadata = _make_prefill_metadata(
+        block_table=block_table,
+        cu_seqlen_ks=torch.tensor([0], dtype=torch.int32),
+        cu_seqlen_ke=torch.tensor([8], dtype=torch.int32),
+        cu_seq_lens=torch.tensor([0, 8], dtype=torch.int32),
+        total_seq_lens=8,
+        token_start=0,
+        token_end=1,
+        num_reqs=1,
+    )
+    backing = torch.full((1, 8), -1, dtype=torch.int32)
+    topk_indices = backing[:, ::2]
+
+    out = cpu_sparse_attn_indexer_op(
+        q_quant,
+        weights,
+        kv_cache,
+        topk_indices,
+        4,
+        metadata,
+        version="cpp_v0",
+    )
+
+    assert out is topk_indices
+    torch.testing.assert_close(
+        topk_indices,
+        torch.tensor([[1, 3, 5, 7]], dtype=torch.int32),
+    )
+    torch.testing.assert_close(
+        backing[:, 1::2],
+        torch.full((1, 4), -1, dtype=torch.int32),
+    )
+
+
+@pytest.mark.skipif(
+    not _HAS_CPP_SPARSE_ATTN_INDEXER,
+    reason="sparse attention indexer C++ extension is unavailable",
+)
+def test_cpu_sparse_attn_indexer_cpp_v0_rejects_decode() -> None:
+    """cpp_v0 is intentionally prefill-only while decode is out of scope."""
+    metadata = SimpleNamespace(num_decodes=1, num_decode_tokens=1, num_prefills=0)
+
+    with pytest.raises(NotImplementedError, match="prefill only"):
+        cpu_sparse_attn_indexer_op_cpp_v0(
+            torch.ones((1, 1, 4), dtype=torch.bfloat16),
+            torch.ones((1, 1), dtype=torch.float32),
+            torch.ones((1, 4, 4), dtype=torch.bfloat16),
+            torch.full((1, 2), -1, dtype=torch.int32),
+            2,
+            metadata,
+        )
 
 
 def test_cpu_sparse_attn_indexer_decode_expands_block_table() -> None:
