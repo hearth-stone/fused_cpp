@@ -1,0 +1,778 @@
+#include <torch/extension.h>
+
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <cstdlib>
+#include <iomanip>
+#include <iostream>
+#include <limits>
+#include <tuple>
+
+#include "profile_utils.h"
+
+at::Tensor bf16_linear_to_dtype(at::Tensor input,
+                                at::Tensor weight,
+                                bool output_bf16,
+                                int64_t nthreads);
+at::Tensor bf16_linear_prepacked_to_dtype(at::Tensor input,
+                                          at::Tensor packed_weight,
+                                          int64_t K,
+                                          int64_t N,
+                                          int64_t Np,
+                                          bool output_bf16,
+                                          int64_t nthreads);
+
+namespace {
+
+using torch::indexing::Slice;
+using ::fused_cpp::profile::TimePoint;
+
+struct PostGemmStageProfile {
+  double input_check_ms = 0.0;
+  double main_q_gemm_ms = 0.0;
+  double main_q_norm_rope_swa_insert_ms = 0.0;
+  double indexer_q_gemm_ms = 0.0;
+  double indexer_q_rope_weights_ms = 0.0;
+  double mla_save_partial_states_ms = 0.0;
+  double mla_compress_norm_rope_insert_ms = 0.0;
+  double indexer_save_partial_states_ms = 0.0;
+  double indexer_compress_norm_rope_insert_ms = 0.0;
+  double sparse_indexer_short_path_ms = 0.0;
+  double sparse_indexer_gather_ms = 0.0;
+  double sparse_indexer_fold_q_ms = 0.0;
+  double sparse_indexer_score_topk_ms = 0.0;
+};
+
+#if FUSED_CPP_ENABLE_PROFILING
+
+bool PostGemmProfileEnabled() {
+  return ::fused_cpp::profile::env_enabled(
+      "FUSED_CPP_DEEPSEEK_V4_POST_GEMM_PROFILE");
+}
+
+void PrintPostGemmProfile(const PostGemmStageProfile& profile, double total_ms) {
+  const double known_ms = profile.input_check_ms + profile.main_q_gemm_ms +
+      profile.main_q_norm_rope_swa_insert_ms + profile.indexer_q_gemm_ms +
+      profile.indexer_q_rope_weights_ms + profile.mla_save_partial_states_ms +
+      profile.mla_compress_norm_rope_insert_ms + profile.indexer_save_partial_states_ms +
+      profile.indexer_compress_norm_rope_insert_ms + profile.sparse_indexer_short_path_ms +
+      profile.sparse_indexer_gather_ms + profile.sparse_indexer_fold_q_ms +
+      profile.sparse_indexer_score_topk_ms;
+  const double other_ms = std::max(0.0, total_ms - known_ms);
+  const auto pct = [total_ms](double ms) -> double {
+    return total_ms > 0.0 ? (100.0 * ms / total_ms) : 0.0;
+  };
+
+  std::cerr << std::fixed << std::setprecision(3)
+            << "deepseek_v4_post_gemm_stage_profile"
+            << " total_ms=" << total_ms
+            << " input_check_ms=" << profile.input_check_ms << "(" << pct(profile.input_check_ms) << "%)"
+            << " main_q_gemm_ms=" << profile.main_q_gemm_ms << "(" << pct(profile.main_q_gemm_ms) << "%)"
+            << " main_q_norm_rope_swa_insert_ms=" << profile.main_q_norm_rope_swa_insert_ms
+            << "(" << pct(profile.main_q_norm_rope_swa_insert_ms) << "%)"
+            << " indexer_q_gemm_ms=" << profile.indexer_q_gemm_ms << "(" << pct(profile.indexer_q_gemm_ms) << "%)"
+            << " indexer_q_rope_weights_ms=" << profile.indexer_q_rope_weights_ms
+            << "(" << pct(profile.indexer_q_rope_weights_ms) << "%)"
+            << " mla_save_partial_states_ms=" << profile.mla_save_partial_states_ms
+            << "(" << pct(profile.mla_save_partial_states_ms) << "%)"
+            << " mla_compress_norm_rope_insert_ms=" << profile.mla_compress_norm_rope_insert_ms
+            << "(" << pct(profile.mla_compress_norm_rope_insert_ms) << "%)"
+            << " indexer_save_partial_states_ms=" << profile.indexer_save_partial_states_ms
+            << "(" << pct(profile.indexer_save_partial_states_ms) << "%)"
+            << " indexer_compress_norm_rope_insert_ms=" << profile.indexer_compress_norm_rope_insert_ms
+            << "(" << pct(profile.indexer_compress_norm_rope_insert_ms) << "%)"
+            << " sparse_indexer_short_path_ms=" << profile.sparse_indexer_short_path_ms
+            << "(" << pct(profile.sparse_indexer_short_path_ms) << "%)"
+            << " sparse_indexer_gather_ms=" << profile.sparse_indexer_gather_ms
+            << "(" << pct(profile.sparse_indexer_gather_ms) << "%)"
+            << " sparse_indexer_fold_q_ms=" << profile.sparse_indexer_fold_q_ms
+            << "(" << pct(profile.sparse_indexer_fold_q_ms) << "%)"
+            << " sparse_indexer_score_topk_ms=" << profile.sparse_indexer_score_topk_ms
+            << "(" << pct(profile.sparse_indexer_score_topk_ms) << "%)"
+            << " other_ms=" << other_ms << "(" << pct(other_ms) << "%)"
+            << '\n';
+}
+
+#endif  // FUSED_CPP_ENABLE_PROFILING
+
+void CheckCpuTensor(const at::Tensor& tensor, const char* name) {
+  TORCH_CHECK(tensor.device().is_cpu(), name, " must be a CPU tensor");
+}
+
+void CheckDim(const at::Tensor& tensor, const char* name, int64_t dim) {
+  TORCH_CHECK(tensor.dim() == dim, name, " must be ", dim, "-D, got ", tensor.dim(), "-D");
+}
+
+at::Tensor ToLongCpu(const at::Tensor& tensor) {
+  return tensor.to(at::TensorOptions().dtype(at::kLong).device(at::kCPU));
+}
+
+at::Tensor LinearToDtype(const at::Tensor& input, const at::Tensor& weight, at::ScalarType dtype) {
+  TORCH_CHECK(dtype == at::kBFloat16 || dtype == at::kFloat,
+              "LinearToDtype only supports bf16/fp32 output with bf16gemm, got ",
+              dtype);
+  return ::bf16_linear_to_dtype(input, weight, dtype == at::kBFloat16, 0);
+}
+
+at::Tensor LinearPrepackedToDtype(const at::Tensor& input,
+                                  const at::Tensor& packed_weight,
+                                  int64_t K,
+                                  int64_t N,
+                                  int64_t Np,
+                                  at::ScalarType dtype) {
+  TORCH_CHECK(dtype == at::kBFloat16 || dtype == at::kFloat,
+              "LinearPrepackedToDtype only supports bf16/fp32 output with bf16gemm, got ",
+              dtype);
+  return ::bf16_linear_prepacked_to_dtype(input, packed_weight, K, N, Np, dtype == at::kBFloat16, 0);
+}
+
+at::Tensor GptjRopeApply(const at::Tensor& x,
+                         const at::Tensor& cos_sin_cache,
+                         const at::Tensor& positions,
+                         int64_t rope_head_dim) {
+  TORCH_CHECK(rope_head_dim >= 0, "rope_head_dim must be non-negative");
+  if (rope_head_dim == 0) {
+    return x.to(at::kFloat);
+  }
+  TORCH_CHECK(rope_head_dim % 2 == 0, "rope_head_dim must be even, got ", rope_head_dim);
+  CheckDim(cos_sin_cache, "cos_sin_cache", 2);
+  TORCH_CHECK(cos_sin_cache.size(1) >= rope_head_dim,
+              "cos_sin_cache last dim must cover rope_head_dim");
+
+  const int64_t head_dim = x.size(-1);
+  TORCH_CHECK(head_dim >= rope_head_dim,
+              "x last dim must be >= rope_head_dim: ", head_dim, " vs ", rope_head_dim);
+  const int64_t nope_dim = head_dim - rope_head_dim;
+  const int64_t half = rope_head_dim / 2;
+
+  at::Tensor x_float = x.to(at::kFloat);
+  at::Tensor out = x_float.clone();
+  at::Tensor rope = x_float.slice(-1, nope_dim, head_dim);
+  at::Tensor even = rope.slice(-1, 0, rope_head_dim, 2);
+  at::Tensor odd = rope.slice(-1, 1, rope_head_dim, 2);
+
+  at::Tensor pos_long = ToLongCpu(positions).to(x.device());
+  at::Tensor cs_rows;
+  if (pos_long.dim() == 0) {
+    cs_rows = cos_sin_cache.to(at::kFloat).index({pos_long.item<int64_t>()});
+  } else {
+    cs_rows = cos_sin_cache.to(at::kFloat).index_select(0, pos_long.reshape(-1));
+    while (cs_rows.dim() < x.dim()) {
+      cs_rows = cs_rows.unsqueeze(-2);
+    }
+  }
+  at::Tensor cos_v = cs_rows.slice(-1, 0, half);
+  at::Tensor sin_v = cs_rows.slice(-1, half, 2 * half);
+
+  at::Tensor rotated = at::empty_like(rope);
+  rotated.slice(-1, 0, rope_head_dim, 2).copy_(even * cos_v - odd * sin_v);
+  rotated.slice(-1, 1, rope_head_dim, 2).copy_(odd * cos_v + even * sin_v);
+  out.slice(-1, nope_dim, head_dim).copy_(rotated);
+  return out;
+}
+
+at::Tensor GptjRopeApplyScalar(const at::Tensor& x,
+                               const at::Tensor& cos_sin_cache,
+                               int64_t position,
+                               int64_t rope_head_dim) {
+  at::Tensor pos = at::full({}, position, at::TensorOptions().dtype(at::kLong).device(x.device()));
+  return GptjRopeApply(x, cos_sin_cache, pos, rope_head_dim);
+}
+
+at::Tensor PerHeadRmsNormNoWeight(const at::Tensor& q, double eps) {
+  at::Tensor q_float = q.to(at::kFloat);
+  at::Tensor variance = q_float.pow(2).mean(-1, true);
+  return (q_float * at::rsqrt(variance + eps)).to(q.scalar_type());
+}
+
+void QNormRopeKvInsert(const at::Tensor& q,
+                       const at::Tensor& kv,
+                       const at::Tensor& swa_kv_cache,
+                       const at::Tensor& slot_mapping,
+                       const at::Tensor& positions,
+                       const at::Tensor& cos_sin_cache,
+                       double eps) {
+  CheckDim(q, "q", 3);
+  CheckDim(kv, "kv", 2);
+  const int64_t num_tokens = q.size(0);
+  const int64_t head_dim = q.size(2);
+  const int64_t rope_head_dim = cos_sin_cache.size(1);
+  const int64_t nope_head_dim = head_dim - rope_head_dim;
+  TORCH_CHECK(nope_head_dim >= 0, "main q head_dim must be >= rope dim");
+  TORCH_CHECK(kv.size(0) == num_tokens, "kv token count must match q");
+  TORCH_CHECK(kv.size(1) == head_dim, "kv last dim must match q head_dim");
+
+  q.copy_(PerHeadRmsNormNoWeight(q, eps));
+  at::Tensor q_pe = q.slice(-1, nope_head_dim, head_dim).contiguous();
+  at::Tensor k_pe = kv.slice(-1, nope_head_dim, head_dim).unsqueeze(1).contiguous();
+  auto rotated = GptjRopeApply(q_pe, cos_sin_cache, positions, rope_head_dim);
+  q.slice(-1, nope_head_dim, head_dim).copy_(rotated.to(q.scalar_type()));
+  at::Tensor k_rot = GptjRopeApply(k_pe, cos_sin_cache, positions, rope_head_dim).squeeze(1);
+  kv.slice(-1, nope_head_dim, head_dim).copy_(k_rot.to(kv.scalar_type()));
+
+  if (swa_kv_cache.numel() == 0) {
+    return;
+  }
+  at::Tensor slots = ToLongCpu(slot_mapping).reshape({-1});
+  for (int64_t i = 0; i < num_tokens; ++i) {
+    const int64_t slot = slots[i].item<int64_t>();
+    if (slot < 0) {
+      continue;
+    }
+    at::Tensor row = kv.index({i}).to(swa_kv_cache.scalar_type());
+    if (swa_kv_cache.dim() == 2) {
+      swa_kv_cache.index({slot}).copy_(row);
+    } else if (swa_kv_cache.dim() == 3) {
+      const int64_t block_size = swa_kv_cache.size(1);
+      swa_kv_cache.index({slot / block_size, slot % block_size}).copy_(row);
+    } else {
+      TORCH_CHECK(false, "swa_kv_cache must be 2-D or 3-D");
+    }
+  }
+}
+
+void SavePartialStates(const at::Tensor& kv,
+                       const at::Tensor& score,
+                       const at::Tensor& ape,
+                       const at::Tensor& positions,
+                       const at::Tensor& state_cache,
+                       const at::Tensor& slot_mapping,
+                       int64_t compress_ratio) {
+  if (state_cache.numel() == 0) {
+    return;
+  }
+  const int64_t num_tokens = kv.size(0);
+  const int64_t block_size = state_cache.size(1);
+  const int64_t state_width = state_cache.size(-1) / 2;
+  at::Tensor slots = ToLongCpu(slot_mapping).reshape({-1});
+  at::Tensor pos_cpu = ToLongCpu(positions).reshape({-1});
+
+  for (int64_t i = 0; i < num_tokens; ++i) {
+    const int64_t slot = slots[i].item<int64_t>();
+    if (slot < 0) {
+      continue;
+    }
+    const int64_t block = slot / block_size;
+    const int64_t offset = slot % block_size;
+    const int64_t ape_row = std::max<int64_t>(pos_cpu[i].item<int64_t>() % compress_ratio, 0);
+    state_cache.index({block, offset, Slice(0, state_width)}).copy_(kv.index({i}).to(state_cache.scalar_type()));
+    state_cache.index({block, offset, Slice(state_width, 2 * state_width)})
+        .copy_((score.index({i}) + ape.index({ape_row})).to(state_cache.scalar_type()));
+  }
+}
+
+void KvCompressNormRopeInsert(const at::Tensor& state_cache,
+                              const at::Tensor& token_to_req_indices,
+                              const at::Tensor& positions,
+                              const at::Tensor& slot_mapping,
+                              const at::Tensor& block_table,
+                              const at::Tensor& rms_norm_weight,
+                              double rms_norm_eps,
+                              const at::Tensor& cos_sin_cache,
+                              const at::Tensor& kv_cache,
+                              const at::Tensor& kv_slot_mapping,
+                              int64_t compress_ratio) {
+  if (kv_cache.numel() == 0 || state_cache.numel() == 0) {
+    return;
+  }
+  const int64_t num_tokens = positions.size(0);
+  const int64_t state_block_size = state_cache.size(1);
+  const int64_t state_width = state_cache.size(-1) / 2;
+  const int64_t head_dim = rms_norm_weight.size(0);
+  TORCH_CHECK(state_width % head_dim == 0, "state width must be a multiple of head_dim");
+  const int64_t coff = state_width / head_dim;
+  TORCH_CHECK(coff == 1 || coff == 2, "compressor coff must be 1 or 2, got ", coff);
+  const int64_t window = coff * compress_ratio;
+  const int64_t rope_head_dim = cos_sin_cache.size(1);
+  const int64_t kv_cache_block_size = kv_cache.size(1);
+
+  at::Tensor pos_cpu = ToLongCpu(positions).reshape({-1});
+  at::Tensor slot_cpu = ToLongCpu(slot_mapping).reshape({-1});
+  at::Tensor kv_slot_cpu = ToLongCpu(kv_slot_mapping).reshape({-1});
+  at::Tensor req_cpu = ToLongCpu(token_to_req_indices).reshape({-1});
+  at::Tensor rms_weight = rms_norm_weight.to(at::kFloat);
+
+  for (int64_t i = 0; i < num_tokens; ++i) {
+    const int64_t slot = slot_cpu[i].item<int64_t>();
+    if (slot < 0) {
+      continue;
+    }
+    const int64_t position = pos_cpu[i].item<int64_t>();
+    if ((position + 1) % compress_ratio != 0) {
+      continue;
+    }
+    const int64_t kv_slot = kv_slot_cpu[i].item<int64_t>();
+    if (kv_slot < 0) {
+      continue;
+    }
+    const int64_t req_idx = req_cpu[i].item<int64_t>();
+    const int64_t start = position - window + 1;
+
+    std::vector<at::Tensor> kv_rows;
+    std::vector<at::Tensor> score_rows;
+    kv_rows.reserve(static_cast<size_t>(window));
+    score_rows.reserve(static_cast<size_t>(window));
+    for (int64_t t = 0; t < window; ++t) {
+      const int64_t p = start + t;
+      if (p < 0) {
+        kv_rows.push_back(at::zeros({head_dim}, state_cache.options().dtype(at::kFloat)));
+        score_rows.push_back(at::full({head_dim}, -std::numeric_limits<float>::infinity(),
+                                      state_cache.options().dtype(at::kFloat)));
+        continue;
+      }
+      const int64_t logical_block = p / state_block_size;
+      const int64_t logical_offset = p % state_block_size;
+      const int64_t block = block_table.index({req_idx, logical_block}).item<int64_t>();
+      at::Tensor row = state_cache.index({block, logical_offset}).to(at::kFloat);
+      if (coff == 2 && t >= compress_ratio) {
+        kv_rows.push_back(row.slice(0, head_dim, 2 * head_dim));
+        score_rows.push_back(row.slice(0, state_width + head_dim, state_width + 2 * head_dim));
+      } else {
+        kv_rows.push_back(row.slice(0, 0, head_dim));
+        score_rows.push_back(row.slice(0, state_width, state_width + head_dim));
+      }
+    }
+
+    at::Tensor kv_stack = at::stack(kv_rows, 0);
+    at::Tensor score_stack = at::stack(score_rows, 0);
+    at::Tensor all_neg_inf = score_stack.eq(-std::numeric_limits<float>::infinity()).all(0, true);
+    if (all_neg_inf.any().item<bool>()) {
+      score_stack = at::where(all_neg_inf.expand_as(score_stack), at::zeros_like(score_stack), score_stack);
+    }
+    at::Tensor weights = at::softmax(score_stack, 0);
+    at::Tensor compressed = (kv_stack * weights).sum(0);
+    at::Tensor var = compressed.pow(2).mean(-1, false);
+    at::Tensor normed = compressed * at::rsqrt(var + rms_norm_eps) * rms_weight;
+    const int64_t compressed_pos = (position / compress_ratio) * compress_ratio;
+    at::Tensor rotated = GptjRopeApplyScalar(normed, cos_sin_cache, compressed_pos, rope_head_dim);
+
+    const int64_t kv_block = kv_slot / kv_cache_block_size;
+    const int64_t kv_offset = kv_slot % kv_cache_block_size;
+    kv_cache.index({kv_block, kv_offset}).copy_(rotated.to(kv_cache.scalar_type()));
+  }
+}
+
+std::tuple<at::Tensor, at::Tensor> IndexerQRopeQuant(const at::Tensor& positions,
+                                                     const at::Tensor& index_q,
+                                                     const at::Tensor& cos_sin_cache,
+                                                     const at::Tensor& index_weights) {
+  const int64_t rope_dim = cos_sin_cache.size(1);
+  at::Tensor q_rot = GptjRopeApply(index_q, cos_sin_cache, positions, rope_dim).to(at::kBFloat16);
+  const double softmax_scale = std::pow(static_cast<double>(index_q.size(-1)), -0.5);
+  const double head_scale = std::pow(static_cast<double>(index_q.size(1)), -0.5);
+  at::Tensor weights = index_weights.to(at::kFloat) * softmax_scale * head_scale;
+  return std::make_tuple(q_rot, weights);
+}
+
+void SparseAttnIndexerPrefill(const at::Tensor& q_quant,
+                              const at::Tensor& weights,
+                              const at::Tensor& kv_cache,
+                              const at::Tensor& topk_indices_buffer,
+                              int64_t topk_tokens,
+                              const at::Tensor& cu_seq_lens,
+                              const at::Tensor& cu_seqlen_ks,
+                              const at::Tensor& cu_seqlen_ke,
+                              const at::Tensor& block_table,
+                              PostGemmStageProfile* profile) {
+  const int64_t num_tokens = q_quant.size(0);
+  const int64_t head_dim = q_quant.size(-1);
+  const int64_t block_size = kv_cache.size(1);
+  topk_indices_buffer.slice(0, 0, num_tokens).fill_(-1);
+
+  at::Tensor ks_cpu = ToLongCpu(cu_seqlen_ks).reshape({-1});
+  at::Tensor ke_cpu = ToLongCpu(cu_seqlen_ke).reshape({-1});
+  at::Tensor valid_lens = ke_cpu - ks_cpu;
+  if (valid_lens.numel() > 0 && valid_lens.max().item<int64_t>() <= topk_tokens) {
+    FUSED_CPP_PROFILE_START(phase_start);
+    for (int64_t i = 0; i < num_tokens; ++i) {
+      const int64_t valid_len = valid_lens[i].item<int64_t>();
+      if (valid_len <= 0) {
+        continue;
+      }
+      topk_indices_buffer.index({i, Slice(0, valid_len)})
+          .copy_(at::arange(valid_len, topk_indices_buffer.options().dtype(at::kInt)));
+    }
+    FUSED_CPP_PROFILE_ADD_IF_PTR(
+        profile == nullptr ? nullptr : &profile->sparse_indexer_short_path_ms,
+        phase_start);
+    return;
+  }
+
+  at::Tensor cu_cpu = ToLongCpu(cu_seq_lens).reshape({-1});
+  const int64_t num_reqs = cu_cpu.numel() - 1;
+  const int64_t total_seq_lens = cu_cpu[-1].item<int64_t>();
+  FUSED_CPP_PROFILE_START(phase_start);
+  at::Tensor k_gathered = at::empty({total_seq_lens, head_dim}, q_quant.options().dtype(at::kFloat));
+  for (int64_t req = 0; req < num_reqs; ++req) {
+    const int64_t seq_start = cu_cpu[req].item<int64_t>();
+    const int64_t seq_end = cu_cpu[req + 1].item<int64_t>();
+    const int64_t seq_len = seq_end - seq_start;
+    if (seq_len == 0) {
+      continue;
+    }
+    const int64_t num_blocks = (seq_len + block_size - 1) / block_size;
+    at::Tensor block_ids = block_table.index({req, Slice(0, num_blocks)}).to(at::kLong);
+    at::Tensor gathered = kv_cache.index_select(0, block_ids).reshape({num_blocks * block_size, head_dim});
+      k_gathered.index({Slice(seq_start, seq_end)}).copy_(gathered.slice(0, 0, seq_len).to(at::kFloat));
+  }
+  FUSED_CPP_PROFILE_ADD_IF_PTR(
+      profile == nullptr ? nullptr : &profile->sparse_indexer_gather_ms,
+      phase_start);
+
+  FUSED_CPP_PROFILE_RESTART(phase_start);
+  at::Tensor q_w = (q_quant.to(at::kFloat) * weights.to(at::kFloat).unsqueeze(-1)).sum(1);
+  FUSED_CPP_PROFILE_ADD_IF_PTR(
+      profile == nullptr ? nullptr : &profile->sparse_indexer_fold_q_ms,
+      phase_start);
+
+  FUSED_CPP_PROFILE_RESTART(phase_start);
+  at::Tensor logits = at::matmul(q_w, k_gathered.t());
+  for (int64_t i = 0; i < num_tokens; ++i) {
+    const int64_t row_start = ks_cpu[i].item<int64_t>();
+    const int64_t row_end = ke_cpu[i].item<int64_t>();
+    const int64_t valid_len = row_end - row_start;
+    if (valid_len <= 0) {
+      continue;
+    }
+    const int64_t k_take = std::min<int64_t>(topk_tokens, valid_len);
+    at::Tensor row = logits.index({i, Slice(row_start, row_end)});
+    auto topk = row.topk(k_take, -1);
+    at::Tensor idx = std::get<1>(topk).to(at::kInt);
+    topk_indices_buffer.index({i, Slice(0, k_take)}).copy_(idx);
+  }
+  FUSED_CPP_PROFILE_ADD_IF_PTR(
+      profile == nullptr ? nullptr : &profile->sparse_indexer_score_topk_ms,
+      phase_start);
+}
+
+void RunCompressor(const at::Tensor& kv_score,
+                   const at::Tensor& positions,
+                   const at::Tensor& ape,
+                   const at::Tensor& state_cache,
+                   const at::Tensor& state_slot_mapping,
+                   const at::Tensor& token_to_req_indices,
+                   const at::Tensor& block_table,
+                   const at::Tensor& kv_cache,
+                   const at::Tensor& kv_slot_mapping,
+                   const at::Tensor& norm_weight,
+                   const at::Tensor& cos_sin_cache,
+                   int64_t compress_ratio,
+                   double rms_norm_eps,
+                   double* save_partial_states_ms,
+                   double* compress_norm_rope_insert_ms) {
+  const int64_t state_width = ape.size(1);
+  TORCH_CHECK(kv_score.size(1) == 2 * state_width,
+              "kv_score last dim must be 2 * ape width");
+  at::Tensor kv = kv_score.slice(1, 0, state_width);
+  at::Tensor score = kv_score.slice(1, state_width, 2 * state_width);
+  FUSED_CPP_PROFILE_START(phase_start);
+  SavePartialStates(kv, score, ape, positions, state_cache, state_slot_mapping, compress_ratio);
+  FUSED_CPP_PROFILE_ADD_IF_PTR(save_partial_states_ms, phase_start);
+  FUSED_CPP_PROFILE_RESTART(phase_start);
+  KvCompressNormRopeInsert(state_cache, token_to_req_indices, positions, state_slot_mapping,
+                           block_table, norm_weight, rms_norm_eps, cos_sin_cache, kv_cache,
+                           kv_slot_mapping, compress_ratio);
+  FUSED_CPP_PROFILE_ADD_IF_PTR(compress_norm_rope_insert_ms, phase_start);
+}
+
+std::tuple<at::Tensor, at::Tensor> RunPostGemmTail(const at::Tensor& q,
+                                                   const at::Tensor& indexer_q_linear,
+                                                   const at::Tensor& kv_score,
+                                                   const at::Tensor& indexer_kv_score,
+                                                   const at::Tensor& indexer_weights,
+                                                   const at::Tensor& positions,
+                                                   const at::Tensor& main_cos_sin_cache,
+                                                   const at::Tensor& indexer_cos_sin_cache,
+                                                   const at::Tensor& mla_ape,
+                                                   const at::Tensor& mla_state_cache,
+                                                   const at::Tensor& mla_state_slot_mapping,
+                                                   const at::Tensor& mla_token_to_req_indices,
+                                                   const at::Tensor& mla_block_table,
+                                                   const at::Tensor& mla_kv_cache,
+                                                   const at::Tensor& mla_kv_slot_mapping,
+                                                   const at::Tensor& mla_norm_weight,
+                                                   const at::Tensor& indexer_ape,
+                                                   const at::Tensor& indexer_state_cache,
+                                                   const at::Tensor& indexer_state_slot_mapping,
+                                                   const at::Tensor& indexer_token_to_req_indices,
+                                                   const at::Tensor& indexer_block_table,
+                                                   const at::Tensor& indexer_kv_cache,
+                                                   const at::Tensor& indexer_kv_slot_mapping,
+                                                   const at::Tensor& indexer_norm_weight,
+                                                   const at::Tensor& topk_indices_buffer,
+                                                   const at::Tensor& prefill_cu_seq_lens,
+                                                   const at::Tensor& prefill_cu_seqlen_ks,
+                                                   const at::Tensor& prefill_cu_seqlen_ke,
+                                                   const at::Tensor& prefill_block_table,
+                                                   int64_t mla_compress_ratio,
+                                                   double mla_rms_norm_eps,
+                                                   int64_t indexer_compress_ratio,
+                                                   double indexer_rms_norm_eps,
+                                                   int64_t topk_tokens,
+                                                   PostGemmStageProfile* profile) {
+  const int64_t indexer_head_dim = indexer_norm_weight.size(0);
+  TORCH_CHECK(indexer_head_dim > 0, "indexer head_dim must be positive");
+  TORCH_CHECK(indexer_q_linear.size(1) % indexer_head_dim == 0,
+              "indexer q linear out features must be divisible by indexer head_dim");
+  const int64_t indexer_num_heads = indexer_q_linear.size(1) / indexer_head_dim;
+  at::Tensor indexer_q =
+      indexer_q_linear.reshape({indexer_q_linear.size(0), indexer_num_heads, indexer_head_dim});
+
+  FUSED_CPP_PROFILE_START(phase_start);
+  auto indexer_q_and_weights = IndexerQRopeQuant(positions, indexer_q, indexer_cos_sin_cache, indexer_weights);
+  at::Tensor q_quant = std::get<0>(indexer_q_and_weights);
+  at::Tensor scaled_weights = std::get<1>(indexer_q_and_weights);
+  FUSED_CPP_PROFILE_ADD_IF_PTR(
+      profile == nullptr ? nullptr : &profile->indexer_q_rope_weights_ms,
+      phase_start);
+
+  RunCompressor(kv_score, positions, mla_ape, mla_state_cache, mla_state_slot_mapping,
+                mla_token_to_req_indices, mla_block_table, mla_kv_cache, mla_kv_slot_mapping,
+                mla_norm_weight, main_cos_sin_cache, mla_compress_ratio, mla_rms_norm_eps,
+                profile == nullptr ? nullptr : &profile->mla_save_partial_states_ms,
+                profile == nullptr ? nullptr : &profile->mla_compress_norm_rope_insert_ms);
+  RunCompressor(indexer_kv_score, positions, indexer_ape, indexer_state_cache,
+                indexer_state_slot_mapping, indexer_token_to_req_indices, indexer_block_table,
+                indexer_kv_cache, indexer_kv_slot_mapping, indexer_norm_weight,
+                indexer_cos_sin_cache, indexer_compress_ratio, indexer_rms_norm_eps,
+                profile == nullptr ? nullptr : &profile->indexer_save_partial_states_ms,
+                profile == nullptr ? nullptr : &profile->indexer_compress_norm_rope_insert_ms);
+
+  // Keep the migrated native post-GEMM path self-contained.  Do not dispatch
+  // through the retired standalone sparse_attn_indexer_prefill_cpp_v0 symbol.
+  SparseAttnIndexerPrefill(q_quant, scaled_weights, indexer_kv_cache, topk_indices_buffer,
+                           topk_tokens, prefill_cu_seq_lens, prefill_cu_seqlen_ks,
+                           prefill_cu_seqlen_ke, prefill_block_table, profile);
+  return std::make_tuple(q, topk_indices_buffer);
+}
+
+}  // namespace
+
+std::tuple<at::Tensor, at::Tensor> deepseek_v4_post_gemm_parallel_stage(
+    at::Tensor qr,
+    at::Tensor kv,
+    at::Tensor kv_score,
+    at::Tensor indexer_kv_score,
+    at::Tensor indexer_weights,
+    at::Tensor positions,
+    at::Tensor main_wq_b_weight,
+    at::Tensor indexer_wq_b_weight,
+    at::Tensor main_cos_sin_cache,
+    at::Tensor indexer_cos_sin_cache,
+    at::Tensor swa_kv_cache,
+    at::Tensor swa_slot_mapping,
+    at::Tensor mla_ape,
+    at::Tensor mla_state_cache,
+    at::Tensor mla_state_slot_mapping,
+    at::Tensor mla_token_to_req_indices,
+    at::Tensor mla_block_table,
+    at::Tensor mla_kv_cache,
+    at::Tensor mla_kv_slot_mapping,
+    at::Tensor mla_norm_weight,
+    at::Tensor indexer_ape,
+    at::Tensor indexer_state_cache,
+    at::Tensor indexer_state_slot_mapping,
+    at::Tensor indexer_token_to_req_indices,
+    at::Tensor indexer_block_table,
+    at::Tensor indexer_kv_cache,
+    at::Tensor indexer_kv_slot_mapping,
+    at::Tensor indexer_norm_weight,
+    at::Tensor topk_indices_buffer,
+    at::Tensor prefill_cu_seq_lens,
+    at::Tensor prefill_cu_seqlen_ks,
+    at::Tensor prefill_cu_seqlen_ke,
+    at::Tensor prefill_block_table,
+    int64_t main_head_dim,
+    double q_eps,
+    int64_t mla_compress_ratio,
+    double mla_rms_norm_eps,
+    int64_t indexer_compress_ratio,
+    double indexer_rms_norm_eps,
+    int64_t topk_tokens) {
+#if FUSED_CPP_ENABLE_PROFILING
+  const bool profile_enabled = PostGemmProfileEnabled();
+  PostGemmStageProfile profile;
+  PostGemmStageProfile* profile_ptr = profile_enabled ? &profile : nullptr;
+#else
+  PostGemmStageProfile* profile_ptr = nullptr;
+#endif
+  FUSED_CPP_PROFILE_START(total_start);
+  FUSED_CPP_PROFILE_START(phase_start);
+
+  CheckCpuTensor(qr, "qr");
+  CheckCpuTensor(kv, "kv");
+  CheckDim(qr, "qr", 2);
+  CheckDim(kv, "kv", 2);
+  TORCH_CHECK(main_head_dim > 0, "main_head_dim must be positive");
+  TORCH_CHECK(main_wq_b_weight.size(0) % main_head_dim == 0,
+              "main_wq_b_weight out features must be divisible by main_head_dim");
+  TORCH_CHECK(indexer_wq_b_weight.size(0) % indexer_norm_weight.size(0) == 0,
+              "indexer_wq_b_weight out features must be divisible by indexer head_dim");
+  FUSED_CPP_PROFILE_ADD_IF_PTR(
+      profile_ptr == nullptr ? nullptr : &profile_ptr->input_check_ms,
+      phase_start);
+
+  const int64_t main_num_heads = main_wq_b_weight.size(0) / main_head_dim;
+  FUSED_CPP_PROFILE_RESTART(phase_start);
+  at::Tensor q = LinearToDtype(qr, main_wq_b_weight, qr.scalar_type())
+                     .reshape({qr.size(0), main_num_heads, main_head_dim});
+  FUSED_CPP_PROFILE_ADD_IF_PTR(
+      profile_ptr == nullptr ? nullptr : &profile_ptr->main_q_gemm_ms,
+      phase_start);
+
+  FUSED_CPP_PROFILE_RESTART(phase_start);
+  QNormRopeKvInsert(q, kv, swa_kv_cache, swa_slot_mapping, positions, main_cos_sin_cache, q_eps);
+  FUSED_CPP_PROFILE_ADD_IF_PTR(
+      profile_ptr == nullptr ? nullptr : &profile_ptr->main_q_norm_rope_swa_insert_ms,
+      phase_start);
+
+  const int64_t indexer_head_dim = indexer_norm_weight.size(0);
+  FUSED_CPP_PROFILE_RESTART(phase_start);
+  at::Tensor indexer_q_linear = LinearToDtype(qr, indexer_wq_b_weight, qr.scalar_type());
+  TORCH_CHECK(indexer_q_linear.size(1) % indexer_head_dim == 0,
+              "indexer q linear out features must be divisible by indexer head_dim");
+  FUSED_CPP_PROFILE_ADD_IF_PTR(
+      profile_ptr == nullptr ? nullptr : &profile_ptr->indexer_q_gemm_ms,
+      phase_start);
+
+  auto result = RunPostGemmTail(q, indexer_q_linear, kv_score, indexer_kv_score, indexer_weights,
+                                positions, main_cos_sin_cache, indexer_cos_sin_cache, mla_ape,
+                                mla_state_cache, mla_state_slot_mapping, mla_token_to_req_indices,
+                                mla_block_table, mla_kv_cache, mla_kv_slot_mapping, mla_norm_weight,
+                                indexer_ape, indexer_state_cache, indexer_state_slot_mapping,
+                                indexer_token_to_req_indices, indexer_block_table, indexer_kv_cache,
+                                indexer_kv_slot_mapping, indexer_norm_weight, topk_indices_buffer,
+                                prefill_cu_seq_lens, prefill_cu_seqlen_ks, prefill_cu_seqlen_ke,
+                                prefill_block_table, mla_compress_ratio, mla_rms_norm_eps,
+                                indexer_compress_ratio, indexer_rms_norm_eps, topk_tokens, profile_ptr);
+  FUSED_CPP_PROFILE_IF_ENABLED(
+      profile_ptr != nullptr,
+      PrintPostGemmProfile(
+          *profile_ptr,
+          ::fused_cpp::profile::elapsed_ms(total_start)));
+  return result;
+}
+
+std::tuple<at::Tensor, at::Tensor> deepseek_v4_post_gemm_parallel_stage_prepacked(
+    at::Tensor qr,
+    at::Tensor kv,
+    at::Tensor kv_score,
+    at::Tensor indexer_kv_score,
+    at::Tensor indexer_weights,
+    at::Tensor positions,
+    at::Tensor main_wq_b_packed,
+    int64_t main_wq_b_K,
+    int64_t main_wq_b_N,
+    int64_t main_wq_b_Np,
+    at::Tensor indexer_wq_b_packed,
+    int64_t indexer_wq_b_K,
+    int64_t indexer_wq_b_N,
+    int64_t indexer_wq_b_Np,
+    at::Tensor main_cos_sin_cache,
+    at::Tensor indexer_cos_sin_cache,
+    at::Tensor swa_kv_cache,
+    at::Tensor swa_slot_mapping,
+    at::Tensor mla_ape,
+    at::Tensor mla_state_cache,
+    at::Tensor mla_state_slot_mapping,
+    at::Tensor mla_token_to_req_indices,
+    at::Tensor mla_block_table,
+    at::Tensor mla_kv_cache,
+    at::Tensor mla_kv_slot_mapping,
+    at::Tensor mla_norm_weight,
+    at::Tensor indexer_ape,
+    at::Tensor indexer_state_cache,
+    at::Tensor indexer_state_slot_mapping,
+    at::Tensor indexer_token_to_req_indices,
+    at::Tensor indexer_block_table,
+    at::Tensor indexer_kv_cache,
+    at::Tensor indexer_kv_slot_mapping,
+    at::Tensor indexer_norm_weight,
+    at::Tensor topk_indices_buffer,
+    at::Tensor prefill_cu_seq_lens,
+    at::Tensor prefill_cu_seqlen_ks,
+    at::Tensor prefill_cu_seqlen_ke,
+    at::Tensor prefill_block_table,
+    int64_t main_head_dim,
+    double q_eps,
+    int64_t mla_compress_ratio,
+    double mla_rms_norm_eps,
+    int64_t indexer_compress_ratio,
+    double indexer_rms_norm_eps,
+    int64_t topk_tokens) {
+#if FUSED_CPP_ENABLE_PROFILING
+  const bool profile_enabled = PostGemmProfileEnabled();
+  PostGemmStageProfile profile;
+  PostGemmStageProfile* profile_ptr = profile_enabled ? &profile : nullptr;
+#else
+  PostGemmStageProfile* profile_ptr = nullptr;
+#endif
+  FUSED_CPP_PROFILE_START(total_start);
+  FUSED_CPP_PROFILE_START(phase_start);
+
+  CheckCpuTensor(qr, "qr");
+  CheckCpuTensor(kv, "kv");
+  CheckDim(qr, "qr", 2);
+  CheckDim(kv, "kv", 2);
+  TORCH_CHECK(main_head_dim > 0, "main_head_dim must be positive");
+  TORCH_CHECK(main_wq_b_N % main_head_dim == 0,
+              "main_wq_b_N must be divisible by main_head_dim");
+  TORCH_CHECK(indexer_wq_b_N % indexer_norm_weight.size(0) == 0,
+              "indexer_wq_b_N must be divisible by indexer head_dim");
+  FUSED_CPP_PROFILE_ADD_IF_PTR(
+      profile_ptr == nullptr ? nullptr : &profile_ptr->input_check_ms,
+      phase_start);
+
+  const int64_t main_num_heads = main_wq_b_N / main_head_dim;
+  FUSED_CPP_PROFILE_RESTART(phase_start);
+  at::Tensor q = LinearPrepackedToDtype(
+                     qr,
+                     main_wq_b_packed,
+                     main_wq_b_K,
+                     main_wq_b_N,
+                     main_wq_b_Np,
+                     qr.scalar_type())
+                     .reshape({qr.size(0), main_num_heads, main_head_dim});
+  FUSED_CPP_PROFILE_ADD_IF_PTR(
+      profile_ptr == nullptr ? nullptr : &profile_ptr->main_q_gemm_ms,
+      phase_start);
+
+  FUSED_CPP_PROFILE_RESTART(phase_start);
+  QNormRopeKvInsert(q, kv, swa_kv_cache, swa_slot_mapping, positions, main_cos_sin_cache, q_eps);
+  FUSED_CPP_PROFILE_ADD_IF_PTR(
+      profile_ptr == nullptr ? nullptr : &profile_ptr->main_q_norm_rope_swa_insert_ms,
+      phase_start);
+
+  const int64_t indexer_head_dim = indexer_norm_weight.size(0);
+  FUSED_CPP_PROFILE_RESTART(phase_start);
+  at::Tensor indexer_q_linear = LinearPrepackedToDtype(
+      qr,
+      indexer_wq_b_packed,
+      indexer_wq_b_K,
+      indexer_wq_b_N,
+      indexer_wq_b_Np,
+      qr.scalar_type());
+  TORCH_CHECK(indexer_q_linear.size(1) % indexer_head_dim == 0,
+              "indexer q linear out features must be divisible by indexer head_dim");
+  FUSED_CPP_PROFILE_ADD_IF_PTR(
+      profile_ptr == nullptr ? nullptr : &profile_ptr->indexer_q_gemm_ms,
+      phase_start);
+
+  auto result = RunPostGemmTail(q, indexer_q_linear, kv_score, indexer_kv_score, indexer_weights,
+                                positions, main_cos_sin_cache, indexer_cos_sin_cache, mla_ape,
+                                mla_state_cache, mla_state_slot_mapping, mla_token_to_req_indices,
+                                mla_block_table, mla_kv_cache, mla_kv_slot_mapping, mla_norm_weight,
+                                indexer_ape, indexer_state_cache, indexer_state_slot_mapping,
+                                indexer_token_to_req_indices, indexer_block_table, indexer_kv_cache,
+                                indexer_kv_slot_mapping, indexer_norm_weight, topk_indices_buffer,
+                                prefill_cu_seq_lens, prefill_cu_seqlen_ks, prefill_cu_seqlen_ke,
+                                prefill_block_table, mla_compress_ratio, mla_rms_norm_eps,
+                                indexer_compress_ratio, indexer_rms_norm_eps, topk_tokens, profile_ptr);
+  FUSED_CPP_PROFILE_IF_ENABLED(
+      profile_ptr != nullptr,
+      PrintPostGemmProfile(
+          *profile_ptr,
+          ::fused_cpp::profile::elapsed_ms(total_start)));
+  return result;
+}

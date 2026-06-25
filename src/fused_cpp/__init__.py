@@ -18,6 +18,14 @@ from fused_cpp.kai_gemm import (
     kai_gemm_prepare,
 )
 from . import i8gemm
+from . import bf16_linear
+from fused_cpp.bf16_linear import (
+    PreparedBF16LinearWeight,
+    _supports_bf16_linear,
+    linear as bf16_linear_mm,
+    linear_raw as bf16_linear_raw,
+    prepare as prepare_bf16_linear_weight,
+)
 from fused_cpp.i8gemm import PreparedI8GEMMWeight, _supports_i8gemm
 from fused_cpp.mla import CPUFusedMLAImpl
 from fused_cpp.mla.impl import _HAS_CPP
@@ -45,6 +53,20 @@ from fused_cpp.deepseek_v4_attn_gemm_fused import (
     fused_wqa_wkv_compressor_kv_score_indexer_compressor_kv_score_indexer_weights_proj_fused_prepare_weights,
     fused_wqa_wkv_compressor_kv_score_indexer_compressor_kv_score_indexer_weights_proj_fused_prepacked,
     prepare_deepseek_v4_attn_gemm_weights,
+)
+from fused_cpp.deepseek_v4_post_gemm_stage import (
+    CompressorState,
+    PostGemmStageInputs,
+    PreparedDeepSeekV4PostGemmWeights,
+    SWACacheState,
+    SparseIndexerPrefillMetadata,
+    _HAS_DEEPSEEK_V4_POST_GEMM_STAGE,
+    _HAS_DEEPSEEK_V4_POST_GEMM_STAGE_PREPACKED,
+    post_gemm_parallel_stage,
+    post_gemm_parallel_stage_cpp,
+    post_gemm_parallel_stage_cpp_prepacked,
+    post_gemm_parallel_stage_torch_baseline,
+    prepare_deepseek_v4_post_gemm_weights,
 )
 from fused_cpp.sdpa import (
     VersionInfo,
@@ -91,15 +113,24 @@ __all__ = [
     "KAIGEMMHandler",
     "KAIThreadPool",
     "PreparedDeepSeekV4AttnGemmWeights",
+    "PreparedDeepSeekV4PostGemmWeights",
     "PreparedBF16TiledFusedMoEWeights",
+    "PreparedBF16LinearWeight",
     "PreparedI8GEMMWeight",
     "PreparedWeight",
+    "PostGemmStageInputs",
+    "SWACacheState",
+    "SparseIndexerPrefillMetadata",
+    "CompressorState",
     "VersionInfo",
     "_HAS_DEEPSEEK_V4_ATTN_GEMM_FUSED",
     "_HAS_BF16_TILED_FUSED_MOE",
+    "_HAS_DEEPSEEK_V4_POST_GEMM_STAGE",
+    "_HAS_DEEPSEEK_V4_POST_GEMM_STAGE_PREPACKED",
     "_HAS_CPP_SPARSE_ATTN_INDEXER",
     "_supports_acl",
     "_supports_i8gemm",
+    "_supports_bf16_linear",
     "_supports_kai",
     "acl_gemm",
     "available_sdpa_versions",
@@ -122,6 +153,9 @@ __all__ = [
     "get_acl_affinity",
     "get_sdpa_version",
     "bf16_tiled_fused_moe",
+    "bf16_linear",
+    "bf16_linear_mm",
+    "bf16_linear_raw",
     "has_cpp_kernels",
     "i8gemm",
     "kai_gemm",
@@ -130,6 +164,12 @@ __all__ = [
     "multi_query_attention_torch",
     "naive_fused_moe",
     "prepare_deepseek_v4_attn_gemm_weights",
+    "prepare_bf16_linear_weight",
+    "post_gemm_parallel_stage",
+    "post_gemm_parallel_stage_cpp",
+    "post_gemm_parallel_stage_cpp_prepacked",
+    "post_gemm_parallel_stage_torch_baseline",
+    "prepare_deepseek_v4_post_gemm_weights",
     "prepare_fused_moe_bf16_tiled_weights",
     "prepare_bf16_tiled_fused_moe_weights",
     "register_sdpa_version",

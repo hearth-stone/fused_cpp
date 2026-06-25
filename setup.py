@@ -18,7 +18,7 @@ class _BuildExtensionWithFixup(BuildExtension):
     """
 
     def build_extensions(self) -> None:
-        self._compile_bf16gemm_asm_sources()
+        self._compile_bf16gemm_sources()
         self._compile_i8gemm_sources()
         super().build_extensions()
         if platform.system() != "Darwin":
@@ -51,37 +51,24 @@ class _BuildExtensionWithFixup(BuildExtension):
                 check=True,
             )
 
-    def _compile_bf16gemm_asm_sources(self) -> None:
-        if not bf16gemm_asm_sources:
+    def _compile_bf16gemm_sources(self) -> None:
+        if not (bf16gemm_c_sources or bf16gemm_asm_sources):
             return
         obj_dir = os.path.join(self.build_temp, "bf16gemm")
         os.makedirs(obj_dir, exist_ok=True)
         for ext in self.extensions:
             extra_objects = list(getattr(ext, "extra_objects", []) or [])
+            for src in bf16gemm_c_sources:
+                obj = os.path.join(obj_dir, os.path.basename(src) + ".o")
+                self._compile_one_native_source(src, obj, ext)
+                if obj not in extra_objects:
+                    extra_objects.append(obj)
             for src in bf16gemm_asm_sources:
                 obj = os.path.join(obj_dir, os.path.basename(src) + ".o")
-                self._compile_one_asm(src, obj, ext)
+                self._compile_one_native_source(src, obj, ext)
                 if obj not in extra_objects:
                     extra_objects.append(obj)
             ext.extra_objects = extra_objects
-
-    def _compile_one_asm(self, src: str, obj: str, ext) -> None:
-        compiler_so = getattr(self.compiler, "compiler_so", None)
-        compiler = compiler_so[0] if isinstance(compiler_so, list) else compiler_so
-        compiler = compiler or os.environ.get("CXX") or "c++"
-
-        extra_compile_args = getattr(ext, "extra_compile_args", []) or []
-        if isinstance(extra_compile_args, dict):
-            extra_compile_args = extra_compile_args.get("cxx", [])
-        asm_args = [
-            arg for arg in extra_compile_args
-            if arg.startswith(("-march=", "-mcpu=", "-O"))
-        ]
-        include_args = [
-            f"-I{inc}" for inc in (getattr(ext, "include_dirs", []) or [])
-        ]
-        cmd = [compiler, "-c", src, "-o", obj, *include_args, *asm_args]
-        subprocess.run(cmd, check=True)
 
     def _compile_i8gemm_sources(self) -> None:
         if not (i8gemm_c_sources or i8gemm_asm_sources):
@@ -92,12 +79,12 @@ class _BuildExtensionWithFixup(BuildExtension):
             extra_objects = list(getattr(ext, "extra_objects", []) or [])
             for src in [*i8gemm_c_sources, *i8gemm_asm_sources]:
                 obj = os.path.join(obj_dir, os.path.basename(src) + ".o")
-                self._compile_one_i8gemm_source(src, obj, ext)
+                self._compile_one_native_source(src, obj, ext)
                 if obj not in extra_objects:
                     extra_objects.append(obj)
             ext.extra_objects = extra_objects
 
-    def _compile_one_i8gemm_source(self, src: str, obj: str, ext) -> None:
+    def _compile_one_native_source(self, src: str, obj: str, ext) -> None:
         compiler_cmd = getattr(self.compiler, "compiler", None)
         compiler = compiler_cmd[0] if isinstance(compiler_cmd, list) else compiler_cmd
         compiler = os.environ.get("CC") or compiler or "cc"
@@ -381,7 +368,24 @@ def _host_cpu_has_flag(flag: str) -> bool:
     return flag.lower() in text.replace("\n", " ").split()
 
 
+def _env_truthy(name: str) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return False
+    return value.strip().lower() not in ("", "0", "false", "off", "no")
+
+
+def _profiling_enabled_for_build() -> bool:
+    value = os.environ.get("FUSED_CPP_ENABLE_PROFILING")
+    if value is not None:
+        return value.strip().lower() not in ("", "0", "false", "off", "no")
+    build_type = os.environ.get("FUSED_CPP_BUILD_TYPE", "").strip().lower()
+    is_release = _env_truthy("FUSED_CPP_RELEASE") or build_type == "release"
+    return not is_release
+
+
 sources = sorted(glob.glob("csrc/**/*.cpp", recursive=True))
+bf16gemm_c_sources = []
 bf16gemm_asm_sources = []
 i8gemm_c_sources = []
 i8gemm_asm_sources = []
@@ -404,6 +408,10 @@ extra_link_args = []
 include_dirs = ["csrc"]
 library_dirs = []
 define_macros = []
+
+define_macros.append(
+    ("FUSED_CPP_ENABLE_PROFILING", "1" if _profiling_enabled_for_build() else "0")
+)
 
 # OpenMP：在 Linux 上默认启用 -fopenmp；在 macOS 上若检测到 Homebrew 安装的
 # libomp 则启用，否则静默退化为单线程（omp_info 报告 has_openmp=false）。
@@ -433,7 +441,11 @@ if is_aarch64:
     bf16gemm_workspace = os.path.abspath("refs/i8gemm")
     bf16gemm_lib = os.path.join(bf16gemm_workspace, "lib")
     include_dirs.extend([bf16gemm_workspace, bf16gemm_lib])
+    if omp_available:
+        bf16gemm_c_sources.append(os.path.join(bf16gemm_lib, "bf16gemm_mt.c"))
+        define_macros.append(("FUSED_CPP_HAS_BF16GEMM", "1"))
     bf16gemm_asm_sources.append(os.path.join(bf16gemm_lib, "bf16gemm_k.S"))
+    bf16gemm_asm_sources.append(os.path.join(bf16gemm_lib, "bf16gemm_k_bias.S"))
 
     target_cpu = os.environ.get("FUSED_CPP_TARGET_CPU", "").strip()
     if target_cpu:
