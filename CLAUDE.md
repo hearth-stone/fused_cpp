@@ -1,4 +1,5 @@
 @../WORKSPACE.md
+@AGENT.md
 
 ## Local Notes
 
