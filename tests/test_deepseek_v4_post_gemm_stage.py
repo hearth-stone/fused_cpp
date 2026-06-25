@@ -164,7 +164,6 @@ def test_post_gemm_cpp_matches_torch_baseline() -> None:
 
     _assert_close(cpp_q, ref_q, "q")
     assert torch.equal(cpp_topk, ref_topk)
-    _assert_close(cpp_inputs.kv, ref_inputs.kv, "mutated kv")
     _assert_close(cpp_inputs.swa.kv_cache, ref_inputs.swa.kv_cache, "swa kv_cache")
     _assert_close(
         cpp_inputs.mla_compressor.state_cache,
@@ -186,6 +185,24 @@ def test_post_gemm_cpp_matches_torch_baseline() -> None:
         ref_inputs.indexer_compressor.kv_cache,
         "indexer kv_cache",
     )
+
+
+@pytest.mark.skipif(
+    not _HAS_DEEPSEEK_V4_POST_GEMM_STAGE,
+    reason="DeepSeek V4 post-GEMM C++ stage is unavailable",
+)
+def test_post_gemm_cpp_write_kv_env_matches_torch_baseline(monkeypatch) -> None:
+    monkeypatch.setenv("FUSED_CPP_DEEPSEEK_V4_KV_ROPE_WRITE_KV", "1")
+    ref_inputs = _make_inputs(seed=5)
+    cpp_inputs = _make_inputs(seed=5)
+
+    ref_q, ref_topk = post_gemm_parallel_stage_torch_baseline(ref_inputs)
+    cpp_q, cpp_topk = post_gemm_parallel_stage_cpp(cpp_inputs)
+
+    _assert_close(cpp_q, ref_q, "q")
+    assert torch.equal(cpp_topk, ref_topk)
+    _assert_close(cpp_inputs.kv, ref_inputs.kv, "mutated kv")
+    _assert_close(cpp_inputs.swa.kv_cache, ref_inputs.swa.kv_cache, "swa kv_cache")
 
 
 @pytest.mark.skipif(

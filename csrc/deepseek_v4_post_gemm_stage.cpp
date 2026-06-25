@@ -4,12 +4,18 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <iomanip>
 #include <iostream>
 #include <limits>
 #include <tuple>
 
+#include "deepseek_v4_q_norm_rope_sve.h"
 #include "profile_utils.h"
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 at::Tensor bf16_linear_to_dtype(at::Tensor input,
                                 at::Tensor weight,
@@ -96,6 +102,15 @@ void PrintPostGemmProfile(const PostGemmStageProfile& profile, double total_ms) 
 
 #endif  // FUSED_CPP_ENABLE_PROFILING
 
+bool DeepSeekV4KvRopeWriteKvEnabled() {
+  const char* value = std::getenv("FUSED_CPP_DEEPSEEK_V4_KV_ROPE_WRITE_KV");
+  if (value == nullptr) {
+    return false;
+  }
+  return !(value[0] == '\0' || std::strcmp(value, "0") == 0 ||
+           std::strcmp(value, "false") == 0 || std::strcmp(value, "FALSE") == 0);
+}
+
 void CheckCpuTensor(const at::Tensor& tensor, const char* name) {
   TORCH_CHECK(tensor.device().is_cpu(), name, " must be a CPU tensor");
 }
@@ -180,55 +195,310 @@ at::Tensor GptjRopeApplyScalar(const at::Tensor& x,
   return GptjRopeApply(x, cos_sin_cache, pos, rope_head_dim);
 }
 
-at::Tensor PerHeadRmsNormNoWeight(const at::Tensor& q, double eps) {
-  at::Tensor q_float = q.to(at::kFloat);
-  at::Tensor variance = q_float.pow(2).mean(-1, true);
-  return (q_float * at::rsqrt(variance + eps)).to(q.scalar_type());
+void CheckPositionsInRange(const at::Tensor& positions_long,
+                           int64_t num_tokens,
+                           int64_t max_position) {
+  if (num_tokens == 0) {
+    return;
+  }
+  if (positions_long.dim() == 0) {
+    const int64_t pos = positions_long.item<int64_t>();
+    TORCH_CHECK(pos >= 0 && pos < max_position,
+                "position out of cos_sin_cache range: ", pos, " vs ", max_position);
+    return;
+  }
+  const int64_t* pos_data = positions_long.data_ptr<int64_t>();
+  for (int64_t i = 0; i < num_tokens; ++i) {
+    const int64_t pos = pos_data[i];
+    TORCH_CHECK(pos >= 0 && pos < max_position,
+                "position out of cos_sin_cache range: ", pos, " vs ", max_position);
+  }
 }
 
-void QNormRopeKvInsert(const at::Tensor& q,
-                       const at::Tensor& kv,
-                       const at::Tensor& swa_kv_cache,
-                       const at::Tensor& slot_mapping,
-                       const at::Tensor& positions,
-                       const at::Tensor& cos_sin_cache,
-                       double eps) {
+void CheckMainQKvShape(const at::Tensor& q, const at::Tensor& kv) {
+  TORCH_CHECK(kv.size(0) == q.size(0), "kv token count must match q");
+  TORCH_CHECK(kv.size(1) == q.size(2), "kv last dim must match q head_dim");
+}
+
+template <typename scalar_t>
+void QNormRopeFusedImpl(const at::Tensor& q,
+                        const at::Tensor& positions_long,
+                        const at::Tensor& cos_sin_f,
+                        double eps) {
+  const int64_t num_tokens = q.size(0);
+  const int64_t num_heads = q.size(1);
+  const int64_t head_dim = q.size(2);
+  const int64_t rope_head_dim = cos_sin_f.size(1);
+  const int64_t nope_head_dim = head_dim - rope_head_dim;
+  const int64_t rope_half = rope_head_dim / 2;
+  const bool scalar_position = positions_long.dim() == 0;
+
+  scalar_t* q_data = q.data_ptr<scalar_t>();
+  const int64_t q_stride_t = q.stride(0);
+  const int64_t q_stride_h = q.stride(1);
+  const int64_t q_stride_d = q.stride(2);
+  const int64_t* pos_data = scalar_position ? nullptr : positions_long.data_ptr<int64_t>();
+  const int64_t scalar_pos = scalar_position ? positions_long.item<int64_t>() : 0;
+  const float* cos_sin_data = cos_sin_f.data_ptr<float>();
+  const int64_t cos_sin_stride = cos_sin_f.stride(0);
+
+  const int64_t total = num_tokens * num_heads;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+  for (int64_t linear_idx = 0; linear_idx < total; ++linear_idx) {
+    const int64_t token = linear_idx / num_heads;
+    const int64_t head = linear_idx - token * num_heads;
+    scalar_t* q_row = q_data + token * q_stride_t + head * q_stride_h;
+
+    float sum_sq = 0.0f;
+    for (int64_t d = 0; d < head_dim; ++d) {
+      const float v = static_cast<float>(q_row[d * q_stride_d]);
+      sum_sq += v * v;
+    }
+    const float inv_rms =
+        1.0f / std::sqrt(sum_sq / static_cast<float>(head_dim) + static_cast<float>(eps));
+
+    for (int64_t d = 0; d < nope_head_dim; ++d) {
+      const float v = static_cast<float>(q_row[d * q_stride_d]) * inv_rms;
+      q_row[d * q_stride_d] = static_cast<scalar_t>(v);
+    }
+
+    if (rope_head_dim == 0) {
+      continue;
+    }
+
+    const int64_t pos = scalar_position ? scalar_pos : pos_data[token];
+    const float* cs_row = cos_sin_data + pos * cos_sin_stride;
+    const float* cos_row = cs_row;
+    const float* sin_row = cs_row + rope_half;
+    for (int64_t pair = 0; pair < rope_half; ++pair) {
+      const int64_t even_d = nope_head_dim + 2 * pair;
+      const int64_t odd_d = even_d + 1;
+      const float even_norm = static_cast<float>(
+          static_cast<scalar_t>(static_cast<float>(q_row[even_d * q_stride_d]) * inv_rms));
+      const float odd_norm = static_cast<float>(
+          static_cast<scalar_t>(static_cast<float>(q_row[odd_d * q_stride_d]) * inv_rms));
+      const float c = cos_row[pair];
+      const float s = sin_row[pair];
+      q_row[even_d * q_stride_d] = static_cast<scalar_t>(even_norm * c - odd_norm * s);
+      q_row[odd_d * q_stride_d] = static_cast<scalar_t>(odd_norm * c + even_norm * s);
+    }
+  }
+}
+
+void QNormRopeFused(const at::Tensor& q,
+                    const at::Tensor& positions,
+                    const at::Tensor& cos_sin_cache,
+                    double eps) {
   CheckDim(q, "q", 3);
-  CheckDim(kv, "kv", 2);
   const int64_t num_tokens = q.size(0);
   const int64_t head_dim = q.size(2);
   const int64_t rope_head_dim = cos_sin_cache.size(1);
   const int64_t nope_head_dim = head_dim - rope_head_dim;
   TORCH_CHECK(nope_head_dim >= 0, "main q head_dim must be >= rope dim");
-  TORCH_CHECK(kv.size(0) == num_tokens, "kv token count must match q");
-  TORCH_CHECK(kv.size(1) == head_dim, "kv last dim must match q head_dim");
-
-  q.copy_(PerHeadRmsNormNoWeight(q, eps));
-  at::Tensor q_pe = q.slice(-1, nope_head_dim, head_dim).contiguous();
-  at::Tensor k_pe = kv.slice(-1, nope_head_dim, head_dim).unsqueeze(1).contiguous();
-  auto rotated = GptjRopeApply(q_pe, cos_sin_cache, positions, rope_head_dim);
-  q.slice(-1, nope_head_dim, head_dim).copy_(rotated.to(q.scalar_type()));
-  at::Tensor k_rot = GptjRopeApply(k_pe, cos_sin_cache, positions, rope_head_dim).squeeze(1);
-  kv.slice(-1, nope_head_dim, head_dim).copy_(k_rot.to(kv.scalar_type()));
-
-  if (swa_kv_cache.numel() == 0) {
+  TORCH_CHECK(rope_head_dim >= 0, "rope_head_dim must be non-negative");
+  TORCH_CHECK(rope_head_dim % 2 == 0, "rope_head_dim must be even, got ", rope_head_dim);
+  CheckDim(cos_sin_cache, "cos_sin_cache", 2);
+  at::Tensor positions_long = ToLongCpu(positions).contiguous();
+  TORCH_CHECK(
+      positions_long.dim() == 0 || positions_long.numel() == num_tokens,
+      "positions must be scalar or have num_tokens elements");
+  at::Tensor cos_sin_f = cos_sin_cache.to(at::kFloat).contiguous();
+  if (rope_head_dim != 0) {
+    CheckPositionsInRange(positions_long, num_tokens, cos_sin_f.size(0));
+  }
+  if (::fused_cpp::deepseek_v4::q_norm_rope_fused_sve(q, positions_long, cos_sin_f, eps)) {
     return;
   }
-  at::Tensor slots = ToLongCpu(slot_mapping).reshape({-1});
-  for (int64_t i = 0; i < num_tokens; ++i) {
-    const int64_t slot = slots[i].item<int64_t>();
+
+  if (q.scalar_type() == at::kBFloat16) {
+    QNormRopeFusedImpl<at::BFloat16>(q, positions_long, cos_sin_f, eps);
+  } else if (q.scalar_type() == at::kFloat) {
+    QNormRopeFusedImpl<float>(q, positions_long, cos_sin_f, eps);
+  } else {
+    TORCH_CHECK(false, "QNormRopeFused only supports bf16/fp32 q, got ", q.scalar_type());
+  }
+}
+
+template <typename kv_t, typename cache_t>
+void KvRopeCacheInsertFusedImpl(const at::Tensor& kv,
+                                const at::Tensor& swa_kv_cache,
+                                const at::Tensor& slot_mapping_long,
+                                const at::Tensor& positions_long,
+                                const at::Tensor& cos_sin_f,
+                                bool do_rope) {
+  const int64_t num_tokens = kv.size(0);
+  const int64_t head_dim = kv.size(1);
+  const int64_t rope_head_dim = cos_sin_f.size(1);
+  const int64_t nope_head_dim = head_dim - rope_head_dim;
+  const int64_t rope_half = rope_head_dim / 2;
+  const bool scalar_position = positions_long.dim() == 0;
+
+  kv_t* kv_data = kv.data_ptr<kv_t>();
+  const int64_t kv_stride_t = kv.stride(0);
+  const int64_t kv_stride_d = kv.stride(1);
+  const int64_t* pos_data = scalar_position ? nullptr : positions_long.data_ptr<int64_t>();
+  const int64_t scalar_pos = scalar_position ? positions_long.item<int64_t>() : 0;
+  const float* cos_sin_data = cos_sin_f.data_ptr<float>();
+  const int64_t cos_sin_stride = cos_sin_f.stride(0);
+  const bool has_cache = swa_kv_cache.numel() != 0;
+  const int64_t* slot_data = has_cache ? slot_mapping_long.data_ptr<int64_t>() : nullptr;
+
+  cache_t* cache_data = nullptr;
+  int64_t cache_stride_slot = 0;
+  int64_t cache_stride_d = 0;
+  int64_t cache_block_size = 0;
+  int64_t cache_stride_block = 0;
+  int64_t cache_stride_offset = 0;
+  if (has_cache) {
+    cache_data = swa_kv_cache.data_ptr<cache_t>();
+    if (swa_kv_cache.dim() == 2) {
+      cache_stride_slot = swa_kv_cache.stride(0);
+      cache_stride_d = swa_kv_cache.stride(1);
+    } else {
+      cache_block_size = swa_kv_cache.size(1);
+      cache_stride_block = swa_kv_cache.stride(0);
+      cache_stride_offset = swa_kv_cache.stride(1);
+      cache_stride_d = swa_kv_cache.stride(2);
+    }
+  }
+
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+  for (int64_t token = 0; token < num_tokens; ++token) {
+    kv_t* kv_row = kv_data + token * kv_stride_t;
+
+    if (do_rope && rope_head_dim != 0) {
+      const int64_t pos = scalar_position ? scalar_pos : pos_data[token];
+      const float* cs_row = cos_sin_data + pos * cos_sin_stride;
+      const float* cos_row = cs_row;
+      const float* sin_row = cs_row + rope_half;
+      for (int64_t pair = 0; pair < rope_half; ++pair) {
+        const int64_t even_d = nope_head_dim + 2 * pair;
+        const int64_t odd_d = even_d + 1;
+        const float even = static_cast<float>(kv_row[even_d * kv_stride_d]);
+        const float odd = static_cast<float>(kv_row[odd_d * kv_stride_d]);
+        const float c = cos_row[pair];
+        const float s = sin_row[pair];
+        kv_row[even_d * kv_stride_d] = static_cast<kv_t>(even * c - odd * s);
+        kv_row[odd_d * kv_stride_d] = static_cast<kv_t>(odd * c + even * s);
+      }
+    }
+
+    if (!has_cache) {
+      continue;
+    }
+    const int64_t slot = slot_data[token];
     if (slot < 0) {
       continue;
     }
-    at::Tensor row = kv.index({i}).to(swa_kv_cache.scalar_type());
+
+    cache_t* cache_row = nullptr;
     if (swa_kv_cache.dim() == 2) {
-      swa_kv_cache.index({slot}).copy_(row);
-    } else if (swa_kv_cache.dim() == 3) {
-      const int64_t block_size = swa_kv_cache.size(1);
-      swa_kv_cache.index({slot / block_size, slot % block_size}).copy_(row);
+      cache_row = cache_data + slot * cache_stride_slot;
     } else {
-      TORCH_CHECK(false, "swa_kv_cache must be 2-D or 3-D");
+      cache_row = cache_data + (slot / cache_block_size) * cache_stride_block +
+          (slot % cache_block_size) * cache_stride_offset;
     }
+    for (int64_t d = 0; d < head_dim; ++d) {
+      cache_row[d * cache_stride_d] = static_cast<cache_t>(static_cast<float>(kv_row[d * kv_stride_d]));
+    }
+  }
+}
+
+template <typename kv_t>
+void DispatchKvRopeCacheInsertFusedCacheDtype(const at::Tensor& kv,
+                                              const at::Tensor& swa_kv_cache,
+                                              const at::Tensor& slot_mapping_long,
+                                              const at::Tensor& positions_long,
+                                              const at::Tensor& cos_sin_f,
+                                              bool do_rope) {
+  if (swa_kv_cache.numel() == 0 || swa_kv_cache.scalar_type() == at::kBFloat16) {
+    KvRopeCacheInsertFusedImpl<kv_t, at::BFloat16>(
+        kv, swa_kv_cache, slot_mapping_long, positions_long, cos_sin_f, do_rope);
+  } else if (swa_kv_cache.scalar_type() == at::kFloat) {
+    KvRopeCacheInsertFusedImpl<kv_t, float>(
+        kv, swa_kv_cache, slot_mapping_long, positions_long, cos_sin_f, do_rope);
+  } else {
+    TORCH_CHECK(
+        false,
+        "KvRopeCacheInsertFused only supports bf16/fp32 swa_kv_cache, got ",
+        swa_kv_cache.scalar_type());
+  }
+}
+
+void KvRopeCacheInsertFused(const at::Tensor& kv,
+                            const at::Tensor& swa_kv_cache,
+                            const at::Tensor& slot_mapping,
+                            const at::Tensor& positions,
+                            const at::Tensor& cos_sin_cache) {
+  CheckDim(kv, "kv", 2);
+  CheckDim(cos_sin_cache, "cos_sin_cache", 2);
+  const int64_t num_tokens = kv.size(0);
+  const int64_t head_dim = kv.size(1);
+  const int64_t rope_head_dim = cos_sin_cache.size(1);
+  const int64_t nope_head_dim = head_dim - rope_head_dim;
+  TORCH_CHECK(nope_head_dim >= 0, "main kv head_dim must be >= rope dim");
+  TORCH_CHECK(rope_head_dim >= 0, "rope_head_dim must be non-negative");
+  TORCH_CHECK(rope_head_dim % 2 == 0, "rope_head_dim must be even, got ", rope_head_dim);
+  at::Tensor positions_long = ToLongCpu(positions).contiguous();
+  TORCH_CHECK(
+      positions_long.dim() == 0 || positions_long.numel() == num_tokens,
+      "positions must be scalar or have num_tokens elements");
+  at::Tensor slots_long;
+  if (swa_kv_cache.numel() != 0) {
+    TORCH_CHECK(
+        swa_kv_cache.dim() == 2 || swa_kv_cache.dim() == 3,
+        "swa_kv_cache must be 2-D or 3-D");
+    TORCH_CHECK(
+        swa_kv_cache.size(-1) == head_dim,
+        "swa_kv_cache last dim must match kv head_dim");
+    slots_long = ToLongCpu(slot_mapping).reshape({-1}).contiguous();
+    TORCH_CHECK(slots_long.numel() >= num_tokens, "slot_mapping must cover all kv tokens");
+    const int64_t slot_capacity =
+        swa_kv_cache.dim() == 2 ? swa_kv_cache.size(0) : swa_kv_cache.size(0) * swa_kv_cache.size(1);
+    const int64_t* slot_data = slots_long.data_ptr<int64_t>();
+    for (int64_t i = 0; i < num_tokens; ++i) {
+      const int64_t slot = slot_data[i];
+      TORCH_CHECK(slot < slot_capacity,
+                  "slot_mapping slot exceeds swa_kv_cache capacity: ",
+                  slot,
+                  " vs ",
+                  slot_capacity);
+    }
+  } else {
+    slots_long = at::empty({0}, at::TensorOptions().dtype(at::kLong).device(at::kCPU));
+  }
+  at::Tensor cos_sin_f = cos_sin_cache.to(at::kFloat).contiguous();
+  if (rope_head_dim != 0) {
+    CheckPositionsInRange(positions_long, num_tokens, cos_sin_f.size(0));
+  }
+
+  if (!DeepSeekV4KvRopeWriteKvEnabled()) {
+    const bool cache_insert_done =
+        ::fused_cpp::deepseek_v4::kv_rope_cache_insert_fused_sve(
+            kv, swa_kv_cache, slots_long, positions_long, cos_sin_f);
+    if (cache_insert_done) {
+      return;
+    }
+  }
+
+  const bool rope_done =
+      ::fused_cpp::deepseek_v4::kv_rope_fused_sve(kv, positions_long, cos_sin_f);
+  if (rope_done && swa_kv_cache.numel() == 0) {
+    return;
+  }
+
+  if (kv.scalar_type() == at::kBFloat16) {
+    DispatchKvRopeCacheInsertFusedCacheDtype<at::BFloat16>(
+        kv, swa_kv_cache, slots_long, positions_long, cos_sin_f, !rope_done);
+  } else if (kv.scalar_type() == at::kFloat) {
+    DispatchKvRopeCacheInsertFusedCacheDtype<float>(
+        kv, swa_kv_cache, slots_long, positions_long, cos_sin_f, !rope_done);
+  } else {
+    TORCH_CHECK(false, "KvRopeCacheInsertFused only supports bf16/fp32 kv, got ", kv.scalar_type());
   }
 }
 
@@ -622,7 +892,9 @@ std::tuple<at::Tensor, at::Tensor> deepseek_v4_post_gemm_parallel_stage(
       phase_start);
 
   FUSED_CPP_PROFILE_RESTART(phase_start);
-  QNormRopeKvInsert(q, kv, swa_kv_cache, swa_slot_mapping, positions, main_cos_sin_cache, q_eps);
+  CheckMainQKvShape(q, kv);
+  QNormRopeFused(q, positions, main_cos_sin_cache, q_eps);
+  KvRopeCacheInsertFused(kv, swa_kv_cache, swa_slot_mapping, positions, main_cos_sin_cache);
   FUSED_CPP_PROFILE_ADD_IF_PTR(
       profile_ptr == nullptr ? nullptr : &profile_ptr->main_q_norm_rope_swa_insert_ms,
       phase_start);
@@ -739,7 +1011,9 @@ std::tuple<at::Tensor, at::Tensor> deepseek_v4_post_gemm_parallel_stage_prepacke
       phase_start);
 
   FUSED_CPP_PROFILE_RESTART(phase_start);
-  QNormRopeKvInsert(q, kv, swa_kv_cache, swa_slot_mapping, positions, main_cos_sin_cache, q_eps);
+  CheckMainQKvShape(q, kv);
+  QNormRopeFused(q, positions, main_cos_sin_cache, q_eps);
+  KvRopeCacheInsertFused(kv, swa_kv_cache, swa_slot_mapping, positions, main_cos_sin_cache);
   FUSED_CPP_PROFILE_ADD_IF_PTR(
       profile_ptr == nullptr ? nullptr : &profile_ptr->main_q_norm_rope_swa_insert_ms,
       phase_start);

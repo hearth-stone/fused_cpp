@@ -5,6 +5,8 @@
 #include <tuple>
 #include <vector>
 
+#include "deepseek_v4_q_norm_rope_sve.h"
+
 // Forward declarations — implementations in separate .cpp files
 at::Tensor rms_norm(at::Tensor x, at::Tensor weight, double eps);
 at::Tensor apply_rope(at::Tensor x, at::Tensor cos_sin_cache, at::Tensor positions, bool is_neox_style);
@@ -620,6 +622,17 @@ PYBIND11_MODULE(_C, m) {
           py::arg("indexer_compress_ratio"),
           py::arg("indexer_rms_norm_eps"),
           py::arg("topk_tokens"),
+          py::call_guard<py::gil_scoped_release>());
+
+    m.def("deepseek_v4_q_norm_rope_fused_sve",
+          &::fused_cpp::deepseek_v4::q_norm_rope_fused_sve,
+          "Run only the DeepSeek V4 q RMSNorm+RoPE SVE fast path in-place. "
+          "Inputs must already be CPU tensors with q stride(-1)=1, positions "
+          "as int64, and cos_sin_cache as contiguous float32.",
+          py::arg("q"),
+          py::arg("positions_long"),
+          py::arg("cos_sin_f"),
+          py::arg("eps"),
           py::call_guard<py::gil_scoped_release>());
 
     // ── ACL GEMM 接口 ──
