@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
-#include <chrono>
 #include <cmath>
 #include <condition_variable>
 #include <cstdio>
@@ -27,6 +26,7 @@
 
 #ifdef __aarch64__
 #include "gemm_params.h"
+#include "profile_utils.h"
 
 extern "C" {
 void bf16gemm_k_ld(const uint16_t* A, const uint16_t* B_reo, float* C,
@@ -781,11 +781,9 @@ void trace_dispatch_fp32_gemm(MoeTraceCollector& trace,
         dispatch_fp32_gemm(A, B_reo, C, A_reorder, M, K, N, ldc);
         return;
     }
-    const auto begin = std::chrono::steady_clock::now();
+    const auto begin = ::fused_cpp::profile::now();
     dispatch_fp32_gemm(A, B_reo, C, A_reorder, M, K, N, ldc);
-    const auto end = std::chrono::steady_clock::now();
-    const double ms =
-        std::chrono::duration<double, std::milli>(end - begin).count();
+    const double ms = ::fused_cpp::profile::elapsed_ms(begin);
     trace.record_gemm(tid, group, local_tid, expert, route_begin, rows,
                       stage, M, K, N, ldc, 0, N, ms);
 }
@@ -821,12 +819,10 @@ void trace_dispatch_fp32_gemm_n_split(MoeTraceCollector& trace,
     const uint16_t* B_slice = B_reo + start_block * K * kKernelTile;
     float* C_slice = C + range.n_begin;
 
-    const auto begin = std::chrono::steady_clock::now();
+    const auto begin = ::fused_cpp::profile::now();
     dispatch_fp32_gemm(A, B_slice, C_slice, A_reorder, M, K,
                        static_cast<int>(range.n_cols), ldc);
-    const auto end = std::chrono::steady_clock::now();
-    const double ms =
-        std::chrono::duration<double, std::milli>(end - begin).count();
+    const double ms = ::fused_cpp::profile::elapsed_ms(begin);
     trace.record_gemm(tid, group, local_tid, expert, route_begin, rows,
                       stage, M, K, N, ldc, range.n_begin, range.n_cols, ms);
 }
@@ -1168,7 +1164,7 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
 #ifndef __aarch64__
     TORCH_CHECK(false, "fused_moe_bf16_tiled requires AArch64");
 #else
-    const auto moe_trace_begin = std::chrono::steady_clock::now();
+    const auto moe_trace_begin = ::fused_cpp::profile::now();
     MoeTraceCollector moe_trace(moe_trace_config_from_env());
 
     check_bf16_cpu(input, "input");
@@ -1349,7 +1345,7 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
         }
 
         run_fixed_threads(actual_threads, [&](int64_t tid) {
-            const auto thread_begin = std::chrono::steady_clock::now();
+            const auto thread_begin = ::fused_cpp::profile::now();
             ThreadScratch& scratch = scratches[static_cast<size_t>(tid)];
             const std::vector<TaskRange>& thread_ranges =
                 ranges[static_cast<size_t>(tid)];
@@ -1440,10 +1436,8 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
                 }
             }
             if (schedule_debug_level > 0) {
-                const auto thread_end = std::chrono::steady_clock::now();
                 schedule_debug[static_cast<size_t>(tid)].ms =
-                    std::chrono::duration<double, std::milli>(
-                        thread_end - thread_begin).count();
+                    ::fused_cpp::profile::elapsed_ms(thread_begin);
             }
         });
 
@@ -1553,7 +1547,7 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
         run_fixed_threads_pinned(actual_threads, core_for_tid, [&](int64_t tid) {
             const int64_t group = tid / nsplit_group_size;
             const int64_t local_tid = tid % nsplit_group_size;
-            const auto thread_begin = std::chrono::steady_clock::now();
+            const auto thread_begin = ::fused_cpp::profile::now();
             HierarchicalGroupScratch& scratch =
                 *group_scratches[static_cast<size_t>(group)];
             ThreadBarrier& barrier = scratch.barrier;
@@ -1707,10 +1701,8 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
             }
 
             if (schedule_debug_level > 0 && local_tid == 0) {
-                const auto thread_end = std::chrono::steady_clock::now();
                 schedule_debug[static_cast<size_t>(group)].ms =
-                    std::chrono::duration<double, std::milli>(
-                        thread_end - thread_begin).count();
+                    ::fused_cpp::profile::elapsed_ms(thread_begin);
             }
         });
 
@@ -1820,10 +1812,7 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
 
     at::Tensor output = output_acc.to(at::kBFloat16);
     if (moe_trace.enabled()) {
-        const auto moe_trace_end = std::chrono::steady_clock::now();
-        const double e2e_ms =
-            std::chrono::duration<double, std::milli>(
-                moe_trace_end - moe_trace_begin).count();
+        const double e2e_ms = ::fused_cpp::profile::elapsed_ms(moe_trace_begin);
         moe_trace.write_report(moe_trace_strategy,
                                actual_threads,
                                num_tokens,
