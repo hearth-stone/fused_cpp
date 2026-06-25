@@ -26,3 +26,8 @@ uv.lock
 # Benchmark result artifacts (keep scripts, drop generated data)
 bench/sdpa/sdpa_versions_*.csv
 bench/sdpa/sdpa_versions_*.json
+
+# Local scratch / benchmark outputs
+tmp/
+*.dSYM/
+standalone/clean_sdpa/clean_sdpa_bench
