@@ -126,7 +126,46 @@ def test_cpu_sparse_attn_indexer_version_registry() -> None:
 
     assert "torch" in versions
     assert "auto" in versions
-    assert ("cpp_v0" in versions) == _HAS_CPP_SPARSE_ATTN_INDEXER
+    assert "cpp_v0" not in versions
+    assert not _HAS_CPP_SPARSE_ATTN_INDEXER
+
+
+def test_cpu_sparse_attn_indexer_cpp_v0_is_retired() -> None:
+    """Explicit requests for the retired standalone C++ path should fail clearly."""
+    metadata = SimpleNamespace(num_decodes=0, num_decode_tokens=0, num_prefills=0)
+
+    with pytest.raises(RuntimeError, match="cpp_v0 has been retired"):
+        cpu_sparse_attn_indexer_op(
+            torch.ones((1, 1, 4), dtype=torch.bfloat16),
+            torch.ones((1, 1), dtype=torch.float32),
+            torch.ones((1, 4, 4), dtype=torch.bfloat16),
+            torch.full((1, 2), -1, dtype=torch.int32),
+            2,
+            metadata,
+            version="cpp_v0",
+        )
+
+
+def test_cpu_sparse_attn_indexer_cpp_v0_extension_symbol_is_deprecated() -> None:
+    """Bypassing the Python wrapper should still reject the old C++ symbol."""
+    try:
+        from fused_cpp import _C  # type: ignore[attr-defined]
+    except ImportError:
+        pytest.skip("fused_cpp C++ extension unavailable")
+
+    if not hasattr(_C, "sparse_attn_indexer_prefill_cpp_v0"):
+        pytest.skip("retired C++ sparse indexer symbol not present")
+
+    metadata = SimpleNamespace(num_decodes=0, num_decode_tokens=0, num_prefills=0)
+    with pytest.raises(RuntimeError, match="deprecated and must not be used"):
+        _C.sparse_attn_indexer_prefill_cpp_v0(
+            torch.ones((1, 1, 4), dtype=torch.bfloat16),
+            torch.ones((1, 1), dtype=torch.float32),
+            torch.ones((1, 4, 4), dtype=torch.bfloat16),
+            torch.full((1, 2), -1, dtype=torch.int32),
+            2,
+            metadata,
+        )
 
 
 def test_cpu_sparse_attn_indexer_prefill_scores_paged_cache() -> None:

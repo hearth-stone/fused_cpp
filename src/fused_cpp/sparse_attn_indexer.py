@@ -13,9 +13,10 @@ call sites.  Set ``FUSED_CPP_SPARSE_ATTN_INDEXER_VERSION`` or pass
 ``version=...`` explicitly.  Supported names:
 
 * ``torch``: strict Python/Torch copy of vLLM's CPU fallback.
-* ``cpp_v0``: initial C++ correctness implementation for prefill.
-* ``auto``: choose ``cpp_v0`` when available for prefill-only metadata, otherwise
-  fall back to ``torch``.
+* ``auto``: alias for ``torch``.
+
+The old standalone ``cpp_v0`` sparse indexer backend has been retired.  The
+native post-GEMM migration lives in ``deepseek_v4_post_gemm_stage`` instead.
 """
 
 from __future__ import annotations
@@ -26,15 +27,8 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
-try:
-    from fused_cpp._C import (  # type: ignore[import-untyped]
-        sparse_attn_indexer_prefill_cpp_v0 as _cpp_prefill_v0_impl,
-    )
-
-    _HAS_CPP_SPARSE_ATTN_INDEXER = True
-except (ImportError, AttributeError):
-    _cpp_prefill_v0_impl = None
-    _HAS_CPP_SPARSE_ATTN_INDEXER = False
+_cpp_prefill_v0_impl = None
+_HAS_CPP_SPARSE_ATTN_INDEXER = False
 
 __all__ = [
     "_HAS_CPP_SPARSE_ATTN_INDEXER",
@@ -218,11 +212,7 @@ def _metadata_has_decode(attn_metadata: Any) -> bool:
 
 def available_sparse_attn_indexer_versions() -> tuple[str, ...]:
     """Return sparse attention indexer versions importable in this runtime."""
-    versions = ["torch"]
-    if _HAS_CPP_SPARSE_ATTN_INDEXER:
-        versions.append("cpp_v0")
-    versions.append("auto")
-    return tuple(versions)
+    return ("torch", "auto")
 
 
 def _normalize_sparse_attn_indexer_version(version: str | None) -> str:
@@ -251,18 +241,15 @@ def cpu_sparse_attn_indexer_op_cpp_v0(
     topk_tokens: int,
     attn_metadata: Any,
 ) -> torch.Tensor:
-    """Run the initial C++ prefill-only implementation."""
-    if not _HAS_CPP_SPARSE_ATTN_INDEXER:
-        raise RuntimeError("sparse attention indexer cpp_v0 backend is unavailable")
-    if _metadata_has_decode(attn_metadata):
-        raise NotImplementedError("sparse attention indexer cpp_v0 currently supports prefill only")
-    return _cpp_prefill_v0_impl(
-        q_quant,
-        weights,
-        kv_cache,
-        topk_indices_buffer,
-        topk_tokens,
-        attn_metadata,
+    """Retired standalone C++ implementation.
+
+    Kept only to give callers a clear failure if they still request the old
+    backend explicitly.
+    """
+    raise RuntimeError(
+        "sparse attention indexer cpp_v0 has been retired; use version='torch' "
+        "for the standalone baseline or fused_cpp.deepseek_v4_post_gemm_stage "
+        "for the migrated native post-GEMM path"
     )
 
 
@@ -279,11 +266,7 @@ def cpu_sparse_attn_indexer_op(
     """Versioned DeepSeek V4 sparse attention indexer entrypoint."""
     selected = _normalize_sparse_attn_indexer_version(version)
     if selected == "auto":
-        selected = (
-            "cpp_v0"
-            if _HAS_CPP_SPARSE_ATTN_INDEXER and not _metadata_has_decode(attn_metadata)
-            else "torch"
-        )
+        selected = "torch"
     if selected == "torch":
         return cpu_sparse_attn_indexer_op_torch_baseline(
             q_quant,
