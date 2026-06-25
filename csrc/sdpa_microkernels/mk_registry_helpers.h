@@ -21,7 +21,6 @@
 #include <torch/extension.h>
 
 #include <algorithm>
-#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <map>
@@ -31,6 +30,7 @@
 
 #include "neon_cache_config.h"
 #include "neon_cache_microkernels.h"
+#include "../profile_utils.h"
 
 namespace fused_cpp::sdpa_microkernels {
 
@@ -50,14 +50,13 @@ inline double time_microkernel_loop(Fn& fn, int64_t warmup, int64_t iterations) 
     fn();
   }
   mk_bench_barrier(nullptr);
-  const auto t0 = std::chrono::steady_clock::now();
+  const auto t0 = ::fused_cpp::profile::now();
   for (int64_t i = 0; i < iterations; ++i) {
     fn();
     mk_bench_barrier(nullptr);
   }
-  const auto t1 = std::chrono::steady_clock::now();
   mk_bench_barrier(nullptr);
-  return std::chrono::duration<double>(t1 - t0).count();
+  return ::fused_cpp::profile::elapsed_ms(t0) / 1.0e3;
 }
 
 inline double mk_checksum_fp32_buffer(const float* data, int64_t len) {

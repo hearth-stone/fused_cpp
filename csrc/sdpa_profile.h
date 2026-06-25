@@ -1,11 +1,9 @@
 #pragma once
 
-#include <chrono>
 #include <cstdint>
 #include <cstdio>
-#include <cstdlib>
-#include <cstring>
 
+#include "profile_utils.h"
 #include "sdpa_common.h"
 
 namespace fused_cpp::sdpa_profile {
@@ -30,6 +28,8 @@ enum class Slot : int {
   kCount,
 };
 
+#if FUSED_CPP_ENABLE_PROFILING
+
 struct State {
   uint64_t ns[static_cast<int>(Slot::kCount)] = {};
   uint64_t calls[static_cast<int>(Slot::kCount)] = {};
@@ -42,24 +42,21 @@ inline State& state() {
 
 inline bool enabled() {
   static const bool on = []() {
-    const char* env = std::getenv("FUSED_CPP_SDPA_PROFILE");
-    return env != nullptr && std::strcmp(env, "0") != 0;
+    return ::fused_cpp::profile::env_enabled("FUSED_CPP_SDPA_PROFILE");
   }();
   return on;
 }
 
 inline bool deep_enabled() {
   static const bool on = []() {
-    const char* env = std::getenv("FUSED_CPP_SDPA_PROFILE_DEEP");
-    return enabled() && env != nullptr && std::strcmp(env, "0") != 0;
+    return enabled() &&
+        ::fused_cpp::profile::env_enabled("FUSED_CPP_SDPA_PROFILE_DEEP");
   }();
   return on;
 }
 
 inline uint64_t now_ns() {
-  const auto t = std::chrono::steady_clock::now().time_since_epoch();
-  return static_cast<uint64_t>(
-      std::chrono::duration_cast<std::chrono::nanoseconds>(t).count());
+  return ::fused_cpp::profile::now_ns();
 }
 
 inline void reset() {
@@ -221,11 +218,43 @@ inline void print_summary(const char* version,
   }
 }
 
+#else
+
+inline constexpr bool enabled() {
+  return false;
+}
+
+inline constexpr bool deep_enabled() {
+  return false;
+}
+
+inline constexpr uint64_t now_ns() {
+  return 0;
+}
+
+inline void reset() {}
+
+inline void add(Slot /*slot*/, uint64_t /*ns*/) {}
+
+class ScopedTimer {
+ public:
+  explicit ScopedTimer(Slot /*slot*/) {}
+  ScopedTimer(Slot /*slot*/, bool /*active*/) {}
+};
+
+inline void print_summary(const char* /*version*/,
+                          const char* /*kernel*/,
+                          const SdpaParams& /*p*/,
+                          const char* /*path*/) {}
+
+#endif  // FUSED_CPP_ENABLE_PROFILING
+
 }  // namespace fused_cpp::sdpa_profile
 
 #define FUSED_CPP_SDPA_PROFILE_CONCAT_INNER(a, b) a##b
 #define FUSED_CPP_SDPA_PROFILE_CONCAT(a, b) \
   FUSED_CPP_SDPA_PROFILE_CONCAT_INNER(a, b)
+#if FUSED_CPP_ENABLE_PROFILING
 #define FUSED_CPP_SDPA_PROFILE_SCOPE(slot) \
   ::fused_cpp::sdpa_profile::ScopedTimer \
       FUSED_CPP_SDPA_PROFILE_CONCAT(_sdpa_profile_scope_, __LINE__)(slot)
@@ -233,3 +262,7 @@ inline void print_summary(const char* version,
   ::fused_cpp::sdpa_profile::ScopedTimer \
       FUSED_CPP_SDPA_PROFILE_CONCAT(_sdpa_profile_deep_scope_, __LINE__)( \
           slot, ::fused_cpp::sdpa_profile::deep_enabled())
+#else
+#define FUSED_CPP_SDPA_PROFILE_SCOPE(slot) ((void)0)
+#define FUSED_CPP_SDPA_PROFILE_DEEP_SCOPE(slot) ((void)0)
+#endif  // FUSED_CPP_ENABLE_PROFILING
