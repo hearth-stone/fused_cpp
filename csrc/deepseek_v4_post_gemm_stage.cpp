@@ -13,6 +13,10 @@
 #include "deepseek_v4_q_norm_rope_sve.h"
 #include "profile_utils.h"
 
+#ifndef FUSED_CPP_STRICT_MODE
+#define FUSED_CPP_STRICT_MODE 0
+#endif
+
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -308,10 +312,22 @@ void QNormRopeFused(const at::Tensor& q,
   if (rope_head_dim != 0) {
     CheckPositionsInRange(positions_long, num_tokens, cos_sin_f.size(0));
   }
+#if FUSED_CPP_STRICT_MODE
+  TORCH_CHECK(
+      q.scalar_type() == at::kBFloat16,
+      "FUSED_CPP_STRICT_MODE QNormRopeFused only supports bf16 q, got ",
+      q.scalar_type());
+#endif
   if (::fused_cpp::deepseek_v4::q_norm_rope_fused_sve(q, positions_long, cos_sin_f, eps)) {
     return;
   }
 
+#if FUSED_CPP_STRICT_MODE
+  TORCH_CHECK(
+      false,
+      "FUSED_CPP_STRICT_MODE QNormRopeFused requires the SVE bf16 fast path; "
+      "unsupported layout or target");
+#else
   if (q.scalar_type() == at::kBFloat16) {
     QNormRopeFusedImpl<at::BFloat16>(q, positions_long, cos_sin_f, eps);
   } else if (q.scalar_type() == at::kFloat) {
@@ -319,6 +335,7 @@ void QNormRopeFused(const at::Tensor& q,
   } else {
     TORCH_CHECK(false, "QNormRopeFused only supports bf16/fp32 q, got ", q.scalar_type());
   }
+#endif
 }
 
 template <typename kv_t, typename cache_t>
@@ -475,6 +492,18 @@ void KvRopeCacheInsertFused(const at::Tensor& kv,
   if (rope_head_dim != 0) {
     CheckPositionsInRange(positions_long, num_tokens, cos_sin_f.size(0));
   }
+#if FUSED_CPP_STRICT_MODE
+  TORCH_CHECK(
+      kv.scalar_type() == at::kBFloat16,
+      "FUSED_CPP_STRICT_MODE KvRopeCacheInsertFused only supports bf16 kv, got ",
+      kv.scalar_type());
+  if (swa_kv_cache.numel() != 0) {
+    TORCH_CHECK(
+        swa_kv_cache.scalar_type() == at::kBFloat16,
+        "FUSED_CPP_STRICT_MODE KvRopeCacheInsertFused only supports bf16 swa_kv_cache, got ",
+        swa_kv_cache.scalar_type());
+  }
+#endif
 
   if (!DeepSeekV4KvRopeWriteKvEnabled()) {
     const bool cache_insert_done =
@@ -483,6 +512,11 @@ void KvRopeCacheInsertFused(const at::Tensor& kv,
     if (cache_insert_done) {
       return;
     }
+#if FUSED_CPP_STRICT_MODE
+    TORCH_CHECK(
+        swa_kv_cache.numel() == 0,
+        "FUSED_CPP_STRICT_MODE KvRopeCacheInsertFused requires the SVE bf16 cache-insert fast path");
+#endif
   }
 
   const bool rope_done =
@@ -491,6 +525,12 @@ void KvRopeCacheInsertFused(const at::Tensor& kv,
     return;
   }
 
+#if FUSED_CPP_STRICT_MODE
+  TORCH_CHECK(
+      false,
+      "FUSED_CPP_STRICT_MODE KvRopeCacheInsertFused requires the SVE bf16 fast path; "
+      "fallback kv copy/rope path is disabled");
+#else
   if (kv.scalar_type() == at::kBFloat16) {
     DispatchKvRopeCacheInsertFusedCacheDtype<at::BFloat16>(
         kv, swa_kv_cache, slots_long, positions_long, cos_sin_f, !rope_done);
@@ -500,6 +540,7 @@ void KvRopeCacheInsertFused(const at::Tensor& kv,
   } else {
     TORCH_CHECK(false, "KvRopeCacheInsertFused only supports bf16/fp32 kv, got ", kv.scalar_type());
   }
+#endif
 }
 
 void SavePartialStates(const at::Tensor& kv,
@@ -746,79 +787,18 @@ void RunCompressor(const at::Tensor& kv_score,
   FUSED_CPP_PROFILE_ADD_IF_PTR(compress_norm_rope_insert_ms, phase_start);
 }
 
-std::tuple<at::Tensor, at::Tensor> RunPostGemmTail(const at::Tensor& q,
-                                                   const at::Tensor& indexer_q_linear,
-                                                   const at::Tensor& kv_score,
-                                                   const at::Tensor& indexer_kv_score,
-                                                   const at::Tensor& indexer_weights,
-                                                   const at::Tensor& positions,
-                                                   const at::Tensor& main_cos_sin_cache,
-                                                   const at::Tensor& indexer_cos_sin_cache,
-                                                   const at::Tensor& mla_ape,
-                                                   const at::Tensor& mla_state_cache,
-                                                   const at::Tensor& mla_state_slot_mapping,
-                                                   const at::Tensor& mla_token_to_req_indices,
-                                                   const at::Tensor& mla_block_table,
-                                                   const at::Tensor& mla_kv_cache,
-                                                   const at::Tensor& mla_kv_slot_mapping,
-                                                   const at::Tensor& mla_norm_weight,
-                                                   const at::Tensor& indexer_ape,
-                                                   const at::Tensor& indexer_state_cache,
-                                                   const at::Tensor& indexer_state_slot_mapping,
-                                                   const at::Tensor& indexer_token_to_req_indices,
-                                                   const at::Tensor& indexer_block_table,
-                                                   const at::Tensor& indexer_kv_cache,
-                                                   const at::Tensor& indexer_kv_slot_mapping,
-                                                   const at::Tensor& indexer_norm_weight,
-                                                   const at::Tensor& topk_indices_buffer,
-                                                   const at::Tensor& prefill_cu_seq_lens,
-                                                   const at::Tensor& prefill_cu_seqlen_ks,
-                                                   const at::Tensor& prefill_cu_seqlen_ke,
-                                                   const at::Tensor& prefill_block_table,
-                                                   int64_t mla_compress_ratio,
-                                                   double mla_rms_norm_eps,
-                                                   int64_t indexer_compress_ratio,
-                                                   double indexer_rms_norm_eps,
-                                                   int64_t topk_tokens,
-                                                   PostGemmStageProfile* profile) {
-  const int64_t indexer_head_dim = indexer_norm_weight.size(0);
-  TORCH_CHECK(indexer_head_dim > 0, "indexer head_dim must be positive");
-  TORCH_CHECK(indexer_q_linear.size(1) % indexer_head_dim == 0,
-              "indexer q linear out features must be divisible by indexer head_dim");
-  const int64_t indexer_num_heads = indexer_q_linear.size(1) / indexer_head_dim;
-  at::Tensor indexer_q =
-      indexer_q_linear.reshape({indexer_q_linear.size(0), indexer_num_heads, indexer_head_dim});
-
-  FUSED_CPP_PROFILE_START(phase_start);
-  auto indexer_q_and_weights = IndexerQRopeQuant(positions, indexer_q, indexer_cos_sin_cache, indexer_weights);
-  at::Tensor q_quant = std::get<0>(indexer_q_and_weights);
-  at::Tensor scaled_weights = std::get<1>(indexer_q_and_weights);
-  FUSED_CPP_PROFILE_ADD_IF_PTR(
-      profile == nullptr ? nullptr : &profile->indexer_q_rope_weights_ms,
-      phase_start);
-
-  RunCompressor(kv_score, positions, mla_ape, mla_state_cache, mla_state_slot_mapping,
-                mla_token_to_req_indices, mla_block_table, mla_kv_cache, mla_kv_slot_mapping,
-                mla_norm_weight, main_cos_sin_cache, mla_compress_ratio, mla_rms_norm_eps,
-                profile == nullptr ? nullptr : &profile->mla_save_partial_states_ms,
-                profile == nullptr ? nullptr : &profile->mla_compress_norm_rope_insert_ms);
-  RunCompressor(indexer_kv_score, positions, indexer_ape, indexer_state_cache,
-                indexer_state_slot_mapping, indexer_token_to_req_indices, indexer_block_table,
-                indexer_kv_cache, indexer_kv_slot_mapping, indexer_norm_weight,
-                indexer_cos_sin_cache, indexer_compress_ratio, indexer_rms_norm_eps,
-                profile == nullptr ? nullptr : &profile->indexer_save_partial_states_ms,
-                profile == nullptr ? nullptr : &profile->indexer_compress_norm_rope_insert_ms);
-
-  // Keep the migrated native post-GEMM path self-contained.  Do not dispatch
-  // through the retired standalone sparse_attn_indexer_prefill_cpp_v0 symbol.
-  SparseAttnIndexerPrefill(q_quant, scaled_weights, indexer_kv_cache, topk_indices_buffer,
-                           topk_tokens, prefill_cu_seq_lens, prefill_cu_seqlen_ks,
-                           prefill_cu_seqlen_ke, prefill_block_table, profile);
-  return std::make_tuple(q, topk_indices_buffer);
-}
-
 }  // namespace
 
+// Expected dtype contract for DeepSeek V4 post-GEMM stage on Arm CPU:
+// - qr: bf16
+// - kv: bf16
+// - kv_score / indexer_kv_score: fp32
+// - indexer_weights: bf16
+// - returned q: bf16
+// - topk_indices_buffer: int32
+// - swa_kv_cache: bf16
+// - compressor state_cache: fp32
+// - compressor kv_cache: bf16 on CPU
 std::tuple<at::Tensor, at::Tensor> deepseek_v4_post_gemm_parallel_stage(
     at::Tensor qr,
     at::Tensor kv,
@@ -908,22 +888,41 @@ std::tuple<at::Tensor, at::Tensor> deepseek_v4_post_gemm_parallel_stage(
       profile_ptr == nullptr ? nullptr : &profile_ptr->indexer_q_gemm_ms,
       phase_start);
 
-  auto result = RunPostGemmTail(q, indexer_q_linear, kv_score, indexer_kv_score, indexer_weights,
-                                positions, main_cos_sin_cache, indexer_cos_sin_cache, mla_ape,
-                                mla_state_cache, mla_state_slot_mapping, mla_token_to_req_indices,
-                                mla_block_table, mla_kv_cache, mla_kv_slot_mapping, mla_norm_weight,
-                                indexer_ape, indexer_state_cache, indexer_state_slot_mapping,
-                                indexer_token_to_req_indices, indexer_block_table, indexer_kv_cache,
-                                indexer_kv_slot_mapping, indexer_norm_weight, topk_indices_buffer,
-                                prefill_cu_seq_lens, prefill_cu_seqlen_ks, prefill_cu_seqlen_ke,
-                                prefill_block_table, mla_compress_ratio, mla_rms_norm_eps,
-                                indexer_compress_ratio, indexer_rms_norm_eps, topk_tokens, profile_ptr);
+  const int64_t indexer_num_heads = indexer_q_linear.size(1) / indexer_head_dim;
+  at::Tensor indexer_q =
+      indexer_q_linear.reshape({indexer_q_linear.size(0), indexer_num_heads, indexer_head_dim});
+
+  FUSED_CPP_PROFILE_RESTART(phase_start);
+  auto indexer_q_and_weights = IndexerQRopeQuant(positions, indexer_q, indexer_cos_sin_cache, indexer_weights);
+  at::Tensor q_quant = std::get<0>(indexer_q_and_weights);
+  at::Tensor scaled_weights = std::get<1>(indexer_q_and_weights);
+  FUSED_CPP_PROFILE_ADD_IF_PTR(
+      profile_ptr == nullptr ? nullptr : &profile_ptr->indexer_q_rope_weights_ms,
+      phase_start);
+
+  RunCompressor(kv_score, positions, mla_ape, mla_state_cache, mla_state_slot_mapping,
+                mla_token_to_req_indices, mla_block_table, mla_kv_cache, mla_kv_slot_mapping,
+                mla_norm_weight, main_cos_sin_cache, mla_compress_ratio, mla_rms_norm_eps,
+                profile_ptr == nullptr ? nullptr : &profile_ptr->mla_save_partial_states_ms,
+                profile_ptr == nullptr ? nullptr : &profile_ptr->mla_compress_norm_rope_insert_ms);
+  RunCompressor(indexer_kv_score, positions, indexer_ape, indexer_state_cache,
+                indexer_state_slot_mapping, indexer_token_to_req_indices, indexer_block_table,
+                indexer_kv_cache, indexer_kv_slot_mapping, indexer_norm_weight,
+                indexer_cos_sin_cache, indexer_compress_ratio, indexer_rms_norm_eps,
+                profile_ptr == nullptr ? nullptr : &profile_ptr->indexer_save_partial_states_ms,
+                profile_ptr == nullptr ? nullptr : &profile_ptr->indexer_compress_norm_rope_insert_ms);
+
+  // Keep the migrated native post-GEMM path self-contained.  Do not dispatch
+  // through the retired standalone sparse_attn_indexer_prefill_cpp_v0 symbol.
+  SparseAttnIndexerPrefill(q_quant, scaled_weights, indexer_kv_cache, topk_indices_buffer,
+                           topk_tokens, prefill_cu_seq_lens, prefill_cu_seqlen_ks,
+                           prefill_cu_seqlen_ke, prefill_block_table, profile_ptr);
   FUSED_CPP_PROFILE_IF_ENABLED(
       profile_ptr != nullptr,
       PrintPostGemmProfile(
           *profile_ptr,
           ::fused_cpp::profile::elapsed_ms(total_start)));
-  return result;
+  return std::make_tuple(q, topk_indices_buffer);
 }
 
 std::tuple<at::Tensor, at::Tensor> deepseek_v4_post_gemm_parallel_stage_prepacked(
@@ -1033,20 +1032,39 @@ std::tuple<at::Tensor, at::Tensor> deepseek_v4_post_gemm_parallel_stage_prepacke
       profile_ptr == nullptr ? nullptr : &profile_ptr->indexer_q_gemm_ms,
       phase_start);
 
-  auto result = RunPostGemmTail(q, indexer_q_linear, kv_score, indexer_kv_score, indexer_weights,
-                                positions, main_cos_sin_cache, indexer_cos_sin_cache, mla_ape,
-                                mla_state_cache, mla_state_slot_mapping, mla_token_to_req_indices,
-                                mla_block_table, mla_kv_cache, mla_kv_slot_mapping, mla_norm_weight,
-                                indexer_ape, indexer_state_cache, indexer_state_slot_mapping,
-                                indexer_token_to_req_indices, indexer_block_table, indexer_kv_cache,
-                                indexer_kv_slot_mapping, indexer_norm_weight, topk_indices_buffer,
-                                prefill_cu_seq_lens, prefill_cu_seqlen_ks, prefill_cu_seqlen_ke,
-                                prefill_block_table, mla_compress_ratio, mla_rms_norm_eps,
-                                indexer_compress_ratio, indexer_rms_norm_eps, topk_tokens, profile_ptr);
+  const int64_t indexer_num_heads = indexer_q_linear.size(1) / indexer_head_dim;
+  at::Tensor indexer_q =
+      indexer_q_linear.reshape({indexer_q_linear.size(0), indexer_num_heads, indexer_head_dim});
+
+  FUSED_CPP_PROFILE_RESTART(phase_start);
+  auto indexer_q_and_weights = IndexerQRopeQuant(positions, indexer_q, indexer_cos_sin_cache, indexer_weights);
+  at::Tensor q_quant = std::get<0>(indexer_q_and_weights);
+  at::Tensor scaled_weights = std::get<1>(indexer_q_and_weights);
+  FUSED_CPP_PROFILE_ADD_IF_PTR(
+      profile_ptr == nullptr ? nullptr : &profile_ptr->indexer_q_rope_weights_ms,
+      phase_start);
+
+  RunCompressor(kv_score, positions, mla_ape, mla_state_cache, mla_state_slot_mapping,
+                mla_token_to_req_indices, mla_block_table, mla_kv_cache, mla_kv_slot_mapping,
+                mla_norm_weight, main_cos_sin_cache, mla_compress_ratio, mla_rms_norm_eps,
+                profile_ptr == nullptr ? nullptr : &profile_ptr->mla_save_partial_states_ms,
+                profile_ptr == nullptr ? nullptr : &profile_ptr->mla_compress_norm_rope_insert_ms);
+  RunCompressor(indexer_kv_score, positions, indexer_ape, indexer_state_cache,
+                indexer_state_slot_mapping, indexer_token_to_req_indices, indexer_block_table,
+                indexer_kv_cache, indexer_kv_slot_mapping, indexer_norm_weight,
+                indexer_cos_sin_cache, indexer_compress_ratio, indexer_rms_norm_eps,
+                profile_ptr == nullptr ? nullptr : &profile_ptr->indexer_save_partial_states_ms,
+                profile_ptr == nullptr ? nullptr : &profile_ptr->indexer_compress_norm_rope_insert_ms);
+
+  // Keep the migrated native post-GEMM path self-contained.  Do not dispatch
+  // through the retired standalone sparse_attn_indexer_prefill_cpp_v0 symbol.
+  SparseAttnIndexerPrefill(q_quant, scaled_weights, indexer_kv_cache, topk_indices_buffer,
+                           topk_tokens, prefill_cu_seq_lens, prefill_cu_seqlen_ks,
+                           prefill_cu_seqlen_ke, prefill_block_table, profile_ptr);
   FUSED_CPP_PROFILE_IF_ENABLED(
       profile_ptr != nullptr,
       PrintPostGemmProfile(
           *profile_ptr,
           ::fused_cpp::profile::elapsed_ms(total_start)));
-  return result;
+  return std::make_tuple(q, topk_indices_buffer);
 }

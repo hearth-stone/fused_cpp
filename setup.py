@@ -412,6 +412,9 @@ define_macros = []
 define_macros.append(
     ("FUSED_CPP_ENABLE_PROFILING", "1" if _profiling_enabled_for_build() else "0")
 )
+define_macros.append(
+    ("FUSED_CPP_STRICT_MODE", "1" if _env_truthy("FUSED_CPP_STRICT_MODE") else "0")
+)
 
 # OpenMP：在 Linux 上默认启用 -fopenmp；在 macOS 上若检测到 Homebrew 安装的
 # libomp 则启用，否则静默退化为单线程（omp_info 报告 has_openmp=false）。
