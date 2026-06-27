@@ -1973,6 +1973,108 @@ void kv_rope_fused_sve_impl(row_t* kv_data,
   }
 }
 
+template <typename row_t>
+void indexer_q_rope_fused_sve_impl(row_t* q_data,
+                                   const int64_t* pos_data,
+                                   int64_t scalar_pos,
+                                   bool scalar_position,
+                                   const float* cos_sin_data,
+                                   int64_t cos_sin_stride,
+                                   int64_t num_tokens,
+                                   int64_t num_heads,
+                                   int64_t nope_head_dim,
+                                   int64_t rope_half,
+                                   int64_t q_stride_t,
+                                   int64_t q_stride_h) {
+  const int64_t head_groups4 = num_heads / 4;
+#ifdef _OPENMP
+#pragma omp parallel for collapse(2) schedule(static)
+#endif
+  for (int64_t token = 0; token < num_tokens; ++token) {
+    for (int64_t head_group = 0; head_group < head_groups4; ++head_group) {
+      const int64_t head_base = head_group * 4;
+      row_t* row0 = q_data + token * q_stride_t + (head_base + 0) * q_stride_h;
+      row_t* row1 = q_data + token * q_stride_t + (head_base + 1) * q_stride_h;
+      row_t* row2 = q_data + token * q_stride_t + (head_base + 2) * q_stride_h;
+      row_t* row3 = q_data + token * q_stride_t + (head_base + 3) * q_stride_h;
+      const int64_t pos = scalar_position ? scalar_pos : pos_data[token];
+      const float* cs_row = cos_sin_data + pos * cos_sin_stride;
+      if constexpr (std::is_same_v<row_t, float>) {
+        process_f32_kv_rows4_rope_sve(
+            row0,
+            row1,
+            row2,
+            row3,
+            cs_row,
+            cs_row + rope_half,
+            cs_row,
+            cs_row + rope_half,
+            cs_row,
+            cs_row + rope_half,
+            cs_row,
+            cs_row + rope_half,
+            nope_head_dim,
+            rope_half);
+      } else {
+        process_bf16_kv_rows4_rope_sve(
+            row0,
+            row1,
+            row2,
+            row3,
+            cs_row,
+            cs_row + rope_half,
+            cs_row,
+            cs_row + rope_half,
+            cs_row,
+            cs_row + rope_half,
+            cs_row,
+            cs_row + rope_half,
+            nope_head_dim,
+            rope_half);
+      }
+    }
+  }
+
+  int64_t tail_head = head_groups4 * 4;
+  if (tail_head + 1 < num_heads) {
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (int64_t token = 0; token < num_tokens; ++token) {
+      row_t* row0 = q_data + token * q_stride_t + tail_head * q_stride_h;
+      row_t* row1 = q_data + token * q_stride_t + (tail_head + 1) * q_stride_h;
+      const int64_t pos = scalar_position ? scalar_pos : pos_data[token];
+      const float* cs_row = cos_sin_data + pos * cos_sin_stride;
+      if constexpr (std::is_same_v<row_t, float>) {
+        process_f32_kv_rows2_rope_sve(
+            row0, row1, cs_row, cs_row + rope_half, cs_row, cs_row + rope_half,
+            nope_head_dim, rope_half);
+      } else {
+        process_bf16_kv_rows2_rope_sve(
+            row0, row1, cs_row, cs_row + rope_half, cs_row, cs_row + rope_half,
+            nope_head_dim, rope_half);
+      }
+    }
+    tail_head += 2;
+  }
+
+  if (tail_head < num_heads) {
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (int64_t token = 0; token < num_tokens; ++token) {
+      row_t* row = q_data + token * q_stride_t + tail_head * q_stride_h;
+      const int64_t pos = scalar_position ? scalar_pos : pos_data[token];
+      const float* cs_row = cos_sin_data + pos * cos_sin_stride;
+      if constexpr (std::is_same_v<row_t, float>) {
+        process_f32_rope_row_sve(row, cs_row, cs_row + rope_half, nope_head_dim, rope_half, 1.0f);
+      } else {
+        process_bf16_rope_row_sve(row, cs_row, cs_row + rope_half, nope_head_dim, rope_half, 1.0f);
+      }
+    }
+  }
+}
+
 template <typename cache_t>
 FUSED_CPP_ALWAYS_INLINE cache_t* kv_cache_row_from_slot(cache_t* cache_data,
                                                         int64_t slot,
@@ -2413,6 +2515,70 @@ bool q_norm_rope_fused_sve(const at::Tensor& q,
   (void)eps;
 #if FUSED_CPP_STRICT_MODE
   TORCH_CHECK(false, "FUSED_CPP_STRICT_MODE q_norm_rope_fused_sve requires SVE");
+#endif
+  return false;
+#endif
+}
+
+bool indexer_q_rope_fused_sve(const at::Tensor& q,
+                              const at::Tensor& positions_long,
+                              const at::Tensor& cos_sin_f) {
+#if defined(__ARM_FEATURE_SVE)
+#if FUSED_CPP_STRICT_MODE
+  TORCH_CHECK(
+      q.scalar_type() == at::kBFloat16,
+      "FUSED_CPP_STRICT_MODE indexer_q_rope_fused_sve only supports bf16 q, got ",
+      q.scalar_type());
+  TORCH_CHECK(
+      q.stride(2) == 1,
+      "FUSED_CPP_STRICT_MODE indexer q stride(2) must be 1, got ",
+      q.stride(2));
+  TORCH_CHECK(
+      cos_sin_f.stride(1) == 1,
+      "FUSED_CPP_STRICT_MODE indexer cos_sin_f stride(1) must be 1, got ",
+      cos_sin_f.stride(1));
+#else
+  if (q.scalar_type() != at::kBFloat16 || q.stride(2) != 1 || cos_sin_f.stride(1) != 1) {
+    return false;
+  }
+#endif
+  const int64_t num_tokens = q.size(0);
+  const int64_t num_heads = q.size(1);
+  const int64_t head_dim = q.size(2);
+  const int64_t rope_head_dim = cos_sin_f.size(1);
+  const int64_t nope_head_dim = head_dim - rope_head_dim;
+  const int64_t rope_half = rope_head_dim / 2;
+  if (rope_half == 0) {
+    return true;
+  }
+  const bool scalar_position = positions_long.dim() == 0;
+  const int64_t* pos_data = scalar_position ? nullptr : positions_long.data_ptr<int64_t>();
+  const int64_t scalar_pos = scalar_position ? positions_long.item<int64_t>() : 0;
+  const float* cos_sin_data = cos_sin_f.data_ptr<float>();
+  const int64_t cos_sin_stride = cos_sin_f.stride(0);
+  const int64_t q_stride_t = q.stride(0);
+  const int64_t q_stride_h = q.stride(1);
+
+  indexer_q_rope_fused_sve_impl<uint16_t>(
+      reinterpret_cast<uint16_t*>(q.data_ptr<at::BFloat16>()),
+      pos_data,
+      scalar_pos,
+      scalar_position,
+      cos_sin_data,
+      cos_sin_stride,
+      num_tokens,
+      num_heads,
+      nope_head_dim,
+      rope_half,
+      q_stride_t,
+      q_stride_h);
+  return true;
+#else
+  (void)q;
+  (void)positions_long;
+  (void)cos_sin_f;
+#if FUSED_CPP_STRICT_MODE
+  TORCH_CHECK(false, "FUSED_CPP_STRICT_MODE indexer_q_rope_fused_sve requires SVE");
 #endif
   return false;
 #endif

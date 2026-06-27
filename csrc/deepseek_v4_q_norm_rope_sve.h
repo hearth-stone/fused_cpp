@@ -19,4 +19,8 @@ bool kv_rope_cache_insert_fused_sve(const at::Tensor& kv,
                                     const at::Tensor& positions_long,
                                     const at::Tensor& cos_sin_f);
 
+bool indexer_q_rope_fused_sve(const at::Tensor& q,
+                              const at::Tensor& positions_long,
+                              const at::Tensor& cos_sin_f);
+
 }  // namespace fused_cpp::deepseek_v4
