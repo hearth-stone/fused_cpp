@@ -9,9 +9,14 @@
 #include <iostream>
 #include <limits>
 #include <tuple>
+#include <vector>
 
 #include "deepseek_v4_q_norm_rope_sve.h"
 #include "profile_utils.h"
+
+#if defined(__ARM_FEATURE_SVE)
+#include <arm_sve.h>
+#endif
 
 #ifndef FUSED_CPP_STRICT_MODE
 #define FUSED_CPP_STRICT_MODE 0
@@ -126,6 +131,118 @@ void CheckDim(const at::Tensor& tensor, const char* name, int64_t dim) {
 at::Tensor ToLongCpu(const at::Tensor& tensor) {
   return tensor.to(at::TensorOptions().dtype(at::kLong).device(at::kCPU));
 }
+
+#if defined(__ARM_FEATURE_SVE)
+inline void SavePartialStateRowSve(const float* kv_row,
+                                   const float* score_row,
+                                   const float* ape_row,
+                                   float* state_row,
+                                   int64_t state_width) {
+  int64_t d = 0;
+  for (; d < state_width; d += static_cast<int64_t>(svcntw())) {
+    const svbool_t pg = svwhilelt_b32(d, state_width);
+    const svfloat32_t kv_v = svld1_f32(pg, kv_row + d);
+    svst1_f32(pg, state_row + d, kv_v);
+  }
+
+  float* score_state_row = state_row + state_width;
+  d = 0;
+  for (; d < state_width; d += static_cast<int64_t>(svcntw())) {
+    const svbool_t pg = svwhilelt_b32(d, state_width);
+    const svfloat32_t score_v = svld1_f32(pg, score_row + d);
+    const svfloat32_t ape_v = svld1_f32(pg, ape_row + d);
+    const svfloat32_t out_v = svadd_f32_x(pg, score_v, ape_v);
+    svst1_f32(pg, score_state_row + d, out_v);
+  }
+}
+
+bool TrySavePartialStatesSve(const at::Tensor& kv,
+                             const at::Tensor& score,
+                             const at::Tensor& ape,
+                             const at::Tensor& positions,
+                             const at::Tensor& state_cache,
+                             const at::Tensor& slot_mapping,
+                             int64_t compress_ratio) {
+  const int64_t num_tokens = kv.size(0);
+  const int64_t state_width = state_cache.size(-1) / 2;
+  const bool supported =
+      kv.scalar_type() == at::kFloat &&
+      score.scalar_type() == at::kFloat &&
+      ape.scalar_type() == at::kFloat &&
+      state_cache.scalar_type() == at::kFloat &&
+      kv.dim() == 2 &&
+      score.dim() == 2 &&
+      ape.dim() == 2 &&
+      state_cache.dim() == 3 &&
+      score.size(0) == num_tokens &&
+      kv.size(1) == state_width &&
+      score.size(1) == state_width &&
+      ape.size(1) == state_width &&
+      state_cache.size(-1) == 2 * state_width &&
+      kv.stride(1) == 1 &&
+      score.stride(1) == 1 &&
+      ape.stride(1) == 1 &&
+      state_cache.stride(2) == 1 &&
+      compress_ratio > 0;
+
+#if FUSED_CPP_STRICT_MODE
+  TORCH_CHECK(supported,
+              "FUSED_CPP_STRICT_MODE SavePartialStates requires fp32 kv/score/ape/state_cache, "
+              "2-D kv/score/ape, 3-D state_cache, contiguous last dims, and compress_ratio > 0");
+#else
+  if (!supported) {
+    return false;
+  }
+#endif
+
+  at::Tensor slots = ToLongCpu(slot_mapping).reshape({-1}).contiguous();
+  at::Tensor pos_cpu = ToLongCpu(positions).reshape({-1}).contiguous();
+#if FUSED_CPP_STRICT_MODE
+  TORCH_CHECK(slots.numel() >= num_tokens,
+              "FUSED_CPP_STRICT_MODE SavePartialStates slot_mapping must cover all tokens");
+  TORCH_CHECK(pos_cpu.numel() >= num_tokens,
+              "FUSED_CPP_STRICT_MODE SavePartialStates positions must cover all tokens");
+  TORCH_CHECK(ape.size(0) >= compress_ratio,
+              "FUSED_CPP_STRICT_MODE SavePartialStates ape rows must cover compress_ratio");
+#else
+  if (slots.numel() < num_tokens || pos_cpu.numel() < num_tokens || ape.size(0) < compress_ratio) {
+    return false;
+  }
+#endif
+
+  const int64_t block_size = state_cache.size(1);
+  const int64_t* slot_data = slots.data_ptr<int64_t>();
+  const int64_t* pos_data = pos_cpu.data_ptr<int64_t>();
+  const float* kv_data = kv.data_ptr<float>();
+  const float* score_data = score.data_ptr<float>();
+  const float* ape_data = ape.data_ptr<float>();
+  float* state_data = state_cache.data_ptr<float>();
+  const int64_t kv_stride0 = kv.stride(0);
+  const int64_t score_stride0 = score.stride(0);
+  const int64_t ape_stride0 = ape.stride(0);
+  const int64_t state_stride0 = state_cache.stride(0);
+  const int64_t state_stride1 = state_cache.stride(1);
+
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+  for (int64_t i = 0; i < num_tokens; ++i) {
+    const int64_t slot = slot_data[i];
+    if (slot < 0) {
+      continue;
+    }
+    const int64_t block = slot / block_size;
+    const int64_t offset = slot % block_size;
+    const int64_t ape_row = std::max<int64_t>(pos_data[i] % compress_ratio, 0);
+    float* state_row = state_data + block * state_stride0 + offset * state_stride1;
+    const float* kv_row = kv_data + i * kv_stride0;
+    const float* score_row = score_data + i * score_stride0;
+    const float* ape_row_ptr = ape_data + ape_row * ape_stride0;
+    SavePartialStateRowSve(kv_row, score_row, ape_row_ptr, state_row, state_width);
+  }
+  return true;
+}
+#endif
 
 at::Tensor LinearToDtype(const at::Tensor& input, const at::Tensor& weight, at::ScalarType dtype) {
   TORCH_CHECK(dtype == at::kBFloat16 || dtype == at::kFloat,
@@ -553,6 +670,13 @@ void SavePartialStates(const at::Tensor& kv,
   if (state_cache.numel() == 0) {
     return;
   }
+#if defined(__ARM_FEATURE_SVE)
+  if (TrySavePartialStatesSve(kv, score, ape, positions, state_cache, slot_mapping, compress_ratio)) {
+    return;
+  }
+#elif FUSED_CPP_STRICT_MODE
+  TORCH_CHECK(false, "FUSED_CPP_STRICT_MODE SavePartialStates requires SVE");
+#endif
   const int64_t num_tokens = kv.size(0);
   const int64_t block_size = state_cache.size(1);
   const int64_t state_width = state_cache.size(-1) / 2;
@@ -573,6 +697,763 @@ void SavePartialStates(const at::Tensor& kv,
   }
 }
 
+#if defined(__ARM_FEATURE_SVE)
+inline void CopyCompressorKvScoreRowSve4x(const float* kv_src,
+                                          const float* score_src,
+                                          float* kv_dst,
+                                          float* score_dst,
+                                          int64_t head_dim) {
+  const int64_t vl = static_cast<int64_t>(svcntw());
+  const int64_t step = 4 * vl;
+  const svbool_t pg_all = svptrue_b32();
+  int64_t d = 0;
+  for (; d + step <= head_dim; d += step) {
+    const svfloat32_t kv0 = svld1_f32(pg_all, kv_src + d);
+    const svfloat32_t score0 = svld1_f32(pg_all, score_src + d);
+    const svfloat32_t kv1 = svld1_f32(pg_all, kv_src + d + vl);
+    const svfloat32_t score1 = svld1_f32(pg_all, score_src + d + vl);
+    const svfloat32_t kv2 = svld1_f32(pg_all, kv_src + d + 2 * vl);
+    const svfloat32_t score2 = svld1_f32(pg_all, score_src + d + 2 * vl);
+    const svfloat32_t kv3 = svld1_f32(pg_all, kv_src + d + 3 * vl);
+    const svfloat32_t score3 = svld1_f32(pg_all, score_src + d + 3 * vl);
+    svst1_f32(pg_all, kv_dst + d, kv0);
+    svst1_f32(pg_all, score_dst + d, score0);
+    svst1_f32(pg_all, kv_dst + d + vl, kv1);
+    svst1_f32(pg_all, score_dst + d + vl, score1);
+    svst1_f32(pg_all, kv_dst + d + 2 * vl, kv2);
+    svst1_f32(pg_all, score_dst + d + 2 * vl, score2);
+    svst1_f32(pg_all, kv_dst + d + 3 * vl, kv3);
+    svst1_f32(pg_all, score_dst + d + 3 * vl, score3);
+  }
+  for (; d < head_dim; d += vl) {
+    const svbool_t pg = svwhilelt_b32(d, head_dim);
+    const svfloat32_t kv = svld1_f32(pg, kv_src + d);
+    const svfloat32_t score = svld1_f32(pg, score_src + d);
+    svst1_f32(pg, kv_dst + d, kv);
+    svst1_f32(pg, score_dst + d, score);
+  }
+}
+
+inline void FillCompressorPaddingRowSve4x(float* kv_dst,
+                                          float* score_dst,
+                                          int64_t head_dim) {
+  const int64_t vl = static_cast<int64_t>(svcntw());
+  const int64_t step = 4 * vl;
+  const svbool_t pg_all = svptrue_b32();
+  const svfloat32_t zero = svdup_n_f32(0.0f);
+  const svfloat32_t neg_inf = svdup_n_f32(-std::numeric_limits<float>::infinity());
+  int64_t d = 0;
+  for (; d + step <= head_dim; d += step) {
+    svst1_f32(pg_all, kv_dst + d, zero);
+    svst1_f32(pg_all, score_dst + d, neg_inf);
+    svst1_f32(pg_all, kv_dst + d + vl, zero);
+    svst1_f32(pg_all, score_dst + d + vl, neg_inf);
+    svst1_f32(pg_all, kv_dst + d + 2 * vl, zero);
+    svst1_f32(pg_all, score_dst + d + 2 * vl, neg_inf);
+    svst1_f32(pg_all, kv_dst + d + 3 * vl, zero);
+    svst1_f32(pg_all, score_dst + d + 3 * vl, neg_inf);
+  }
+  for (; d < head_dim; d += vl) {
+    const svbool_t pg = svwhilelt_b32(d, head_dim);
+    svst1_f32(pg, kv_dst + d, zero);
+    svst1_f32(pg, score_dst + d, neg_inf);
+  }
+}
+
+bool TryCopyCompressorWindowRowsSve(const at::Tensor& state_cache,
+                                    const at::Tensor& block_table,
+                                    int64_t req_idx,
+                                    int64_t start,
+                                    int64_t compress_ratio,
+                                    int64_t coff,
+                                    int64_t state_block_size,
+                                    int64_t state_width,
+                                    int64_t head_dim,
+                                    at::Tensor& kv_stack,
+                                    at::Tensor& score_stack) {
+  const bool supported =
+      state_cache.scalar_type() == at::kFloat &&
+      block_table.scalar_type() == at::kLong &&
+      kv_stack.scalar_type() == at::kFloat &&
+      score_stack.scalar_type() == at::kFloat &&
+      state_cache.device().is_cpu() &&
+      block_table.device().is_cpu() &&
+      state_cache.dim() == 3 &&
+      block_table.dim() == 2 &&
+      state_cache.stride(2) == 1 &&
+      kv_stack.stride(1) == 1 &&
+      score_stack.stride(1) == 1 &&
+      compress_ratio > 0 &&
+      (coff == 1 || coff == 2);
+
+#if FUSED_CPP_STRICT_MODE
+  TORCH_CHECK(
+      supported,
+      "FUSED_CPP_STRICT_MODE CompressRowsNormRopeInsert SVE copy requires fp32 CPU "
+      "state_cache, int64 CPU 2-D block_table, contiguous last dims, and coff 1/2");
+#else
+  if (!supported) {
+    return false;
+  }
+#endif
+
+  const float* state_data = state_cache.data_ptr<float>();
+  const int64_t* block_data = block_table.data_ptr<int64_t>();
+  float* kv_data = kv_stack.data_ptr<float>();
+  float* score_data = score_stack.data_ptr<float>();
+  const int64_t state_stride_block = state_cache.stride(0);
+  const int64_t state_stride_offset = state_cache.stride(1);
+  const int64_t block_stride_req = block_table.stride(0);
+  const int64_t block_stride_logical = block_table.stride(1);
+  const int64_t kv_stride_row = kv_stack.stride(0);
+  const int64_t score_stride_row = score_stack.stride(0);
+
+  const auto copy_window_row = [&](int64_t out_row, int64_t p, int64_t segment) {
+    float* kv_dst = kv_data + out_row * kv_stride_row;
+    float* score_dst = score_data + out_row * score_stride_row;
+    if (p < 0) {
+      FillCompressorPaddingRowSve4x(kv_dst, score_dst, head_dim);
+      return;
+    }
+    const int64_t logical_block = p / state_block_size;
+    const int64_t logical_offset = p % state_block_size;
+    const int64_t block =
+        block_data[req_idx * block_stride_req + logical_block * block_stride_logical];
+    const float* row =
+        state_data + block * state_stride_block + logical_offset * state_stride_offset;
+    const int64_t kv_start = segment * head_dim;
+    const int64_t score_start = state_width + segment * head_dim;
+    CopyCompressorKvScoreRowSve4x(row + kv_start, row + score_start, kv_dst, score_dst, head_dim);
+  };
+
+  if (coff == 2) {
+    if (compress_ratio != 4) {
+#if FUSED_CPP_STRICT_MODE
+      TORCH_CHECK(false,
+                  "FUSED_CPP_STRICT_MODE coff=2 compressor SVE copy requires compress_ratio=4, got ",
+                  compress_ratio);
+#else
+      return false;
+#endif
+    }
+    copy_window_row(0, start + 0, 0);
+    copy_window_row(1, start + 1, 0);
+    copy_window_row(2, start + 2, 0);
+    copy_window_row(3, start + 3, 0);
+    copy_window_row(4, start + 4, 1);
+    copy_window_row(5, start + 5, 1);
+    copy_window_row(6, start + 6, 1);
+    copy_window_row(7, start + 7, 1);
+  } else {
+    for (int64_t t = 0; t < compress_ratio; ++t) {
+      copy_window_row(t, start + t, 0);
+    }
+  }
+  return true;
+}
+
+template <bool HasPadding>
+void CompressCoff2WindowSveKernel(const float* const kv_src[8],
+                                  const float* const score_src[8],
+                                  int64_t head_dim,
+                                  float* compressed_data) {
+  const svfloat32_t zero = svdup_n_f32(0.0f);
+  const svfloat32_t one = svdup_n_f32(1.0f);
+  const svfloat32_t neg_inf =
+      svdup_n_f32(-std::numeric_limits<float>::infinity());
+  const svfloat32_t min_denom = svdup_n_f32(1.0e-20f);
+  const svfloat32_t exp_hi = svdup_f32(87.0f);
+  const svfloat32_t exp_lo = svdup_f32(-87.0f);
+  const svfloat32_t inv_ln2 = svdup_f32(1.4426950408889634f);
+  const svfloat32_t ln2 = svdup_f32(0.6931471805599453f);
+  const svfloat32_t c0 = svdup_f32(1.0f);
+  const svfloat32_t c1 = svdup_f32(1.0f);
+  const svfloat32_t c2 = svdup_f32(0.5f);
+  const svfloat32_t c3 = svdup_f32(1.0f / 6.0f);
+  const svfloat32_t c4 = svdup_f32(1.0f / 24.0f);
+  const svfloat32_t c5 = svdup_f32(1.0f / 120.0f);
+  const svfloat32_t c6 = svdup_f32(1.0f / 720.0f);
+  const int64_t vl = static_cast<int64_t>(svcntw());
+
+  auto process_chunk = [&](int64_t d, svbool_t pg) {
+    auto load_score = [&](int idx) -> svfloat32_t {
+      if constexpr (HasPadding) {
+        if (score_src[idx] == nullptr) {
+          return neg_inf;
+        }
+      }
+      return svld1_f32(pg, score_src[idx] + d);
+    };
+
+    const svfloat32_t s0 = load_score(0);
+    const svfloat32_t s1 = load_score(1);
+    const svfloat32_t s2 = load_score(2);
+    const svfloat32_t s3 = load_score(3);
+    const svfloat32_t s4 = load_score(4);
+    const svfloat32_t s5 = load_score(5);
+    const svfloat32_t s6 = load_score(6);
+    const svfloat32_t s7 = load_score(7);
+
+    const svfloat32_t m01 = svmax_f32_x(pg, s0, s1);
+    const svfloat32_t m23 = svmax_f32_x(pg, s2, s3);
+    const svfloat32_t m45 = svmax_f32_x(pg, s4, s5);
+    const svfloat32_t m67 = svmax_f32_x(pg, s6, s7);
+    const svfloat32_t m0123 = svmax_f32_x(pg, m01, m23);
+    const svfloat32_t m4567 = svmax_f32_x(pg, m45, m67);
+    const svfloat32_t max_score = svmax_f32_x(pg, m0123, m4567);
+
+    svfloat32_t x0 = svsub_f32_x(pg, s0, max_score);
+    svfloat32_t x1 = svsub_f32_x(pg, s1, max_score);
+    svfloat32_t x2 = svsub_f32_x(pg, s2, max_score);
+    svfloat32_t x3 = svsub_f32_x(pg, s3, max_score);
+    x0 = svmin_f32_x(pg, x0, exp_hi);
+    x1 = svmin_f32_x(pg, x1, exp_hi);
+    x2 = svmin_f32_x(pg, x2, exp_hi);
+    x3 = svmin_f32_x(pg, x3, exp_hi);
+    x0 = svmax_f32_x(pg, x0, exp_lo);
+    x1 = svmax_f32_x(pg, x1, exp_lo);
+    x2 = svmax_f32_x(pg, x2, exp_lo);
+    x3 = svmax_f32_x(pg, x3, exp_lo);
+
+    const svfloat32_t y0 = svmul_f32_x(pg, x0, inv_ln2);
+    const svfloat32_t y1 = svmul_f32_x(pg, x1, inv_ln2);
+    const svfloat32_t y2 = svmul_f32_x(pg, x2, inv_ln2);
+    const svfloat32_t y3 = svmul_f32_x(pg, x3, inv_ln2);
+    const svfloat32_t fn0 = svrinta_f32_x(pg, y0);
+    const svfloat32_t fn1 = svrinta_f32_x(pg, y1);
+    const svfloat32_t fn2 = svrinta_f32_x(pg, y2);
+    const svfloat32_t fn3 = svrinta_f32_x(pg, y3);
+    const svfloat32_t r0 = svmls_f32_x(pg, x0, fn0, ln2);
+    const svfloat32_t r1 = svmls_f32_x(pg, x1, fn1, ln2);
+    const svfloat32_t r2 = svmls_f32_x(pg, x2, fn2, ln2);
+    const svfloat32_t r3 = svmls_f32_x(pg, x3, fn3, ln2);
+    const svint32_t n0 = svcvt_s32_f32_x(pg, fn0);
+    const svint32_t n1 = svcvt_s32_f32_x(pg, fn1);
+    const svint32_t n2 = svcvt_s32_f32_x(pg, fn2);
+    const svint32_t n3 = svcvt_s32_f32_x(pg, fn3);
+
+    svfloat32_t p0 = c6;
+    svfloat32_t p1 = c6;
+    svfloat32_t p2 = c6;
+    svfloat32_t p3 = c6;
+    p0 = svmla_f32_x(pg, c5, p0, r0);
+    p1 = svmla_f32_x(pg, c5, p1, r1);
+    p2 = svmla_f32_x(pg, c5, p2, r2);
+    p3 = svmla_f32_x(pg, c5, p3, r3);
+    p0 = svmla_f32_x(pg, c4, p0, r0);
+    p1 = svmla_f32_x(pg, c4, p1, r1);
+    p2 = svmla_f32_x(pg, c4, p2, r2);
+    p3 = svmla_f32_x(pg, c4, p3, r3);
+    p0 = svmla_f32_x(pg, c3, p0, r0);
+    p1 = svmla_f32_x(pg, c3, p1, r1);
+    p2 = svmla_f32_x(pg, c3, p2, r2);
+    p3 = svmla_f32_x(pg, c3, p3, r3);
+    p0 = svmla_f32_x(pg, c2, p0, r0);
+    p1 = svmla_f32_x(pg, c2, p1, r1);
+    p2 = svmla_f32_x(pg, c2, p2, r2);
+    p3 = svmla_f32_x(pg, c2, p3, r3);
+    p0 = svmla_f32_x(pg, c1, p0, r0);
+    p1 = svmla_f32_x(pg, c1, p1, r1);
+    p2 = svmla_f32_x(pg, c1, p2, r2);
+    p3 = svmla_f32_x(pg, c1, p3, r3);
+    p0 = svmla_f32_x(pg, c0, p0, r0);
+    p1 = svmla_f32_x(pg, c0, p1, r1);
+    p2 = svmla_f32_x(pg, c0, p2, r2);
+    p3 = svmla_f32_x(pg, c0, p3, r3);
+
+    auto scale_exp = [&](int idx, svfloat32_t p, svint32_t n) -> svfloat32_t {
+      if constexpr (HasPadding) {
+        if (score_src[idx] == nullptr) {
+          return zero;
+        }
+      }
+      return svscale_f32_x(pg, p, n);
+    };
+
+    const svfloat32_t e0 = scale_exp(0, p0, n0);
+    const svfloat32_t e1 = scale_exp(1, p1, n1);
+    const svfloat32_t e2 = scale_exp(2, p2, n2);
+    const svfloat32_t e3 = scale_exp(3, p3, n3);
+
+    svfloat32_t x4 = svsub_f32_x(pg, s4, max_score);
+    svfloat32_t x5 = svsub_f32_x(pg, s5, max_score);
+    svfloat32_t x6 = svsub_f32_x(pg, s6, max_score);
+    svfloat32_t x7 = svsub_f32_x(pg, s7, max_score);
+    x4 = svmin_f32_x(pg, x4, exp_hi);
+    x5 = svmin_f32_x(pg, x5, exp_hi);
+    x6 = svmin_f32_x(pg, x6, exp_hi);
+    x7 = svmin_f32_x(pg, x7, exp_hi);
+    x4 = svmax_f32_x(pg, x4, exp_lo);
+    x5 = svmax_f32_x(pg, x5, exp_lo);
+    x6 = svmax_f32_x(pg, x6, exp_lo);
+    x7 = svmax_f32_x(pg, x7, exp_lo);
+
+    const svfloat32_t y4 = svmul_f32_x(pg, x4, inv_ln2);
+    const svfloat32_t y5 = svmul_f32_x(pg, x5, inv_ln2);
+    const svfloat32_t y6 = svmul_f32_x(pg, x6, inv_ln2);
+    const svfloat32_t y7 = svmul_f32_x(pg, x7, inv_ln2);
+    const svfloat32_t fn4 = svrinta_f32_x(pg, y4);
+    const svfloat32_t fn5 = svrinta_f32_x(pg, y5);
+    const svfloat32_t fn6 = svrinta_f32_x(pg, y6);
+    const svfloat32_t fn7 = svrinta_f32_x(pg, y7);
+    const svfloat32_t r4 = svmls_f32_x(pg, x4, fn4, ln2);
+    const svfloat32_t r5 = svmls_f32_x(pg, x5, fn5, ln2);
+    const svfloat32_t r6 = svmls_f32_x(pg, x6, fn6, ln2);
+    const svfloat32_t r7 = svmls_f32_x(pg, x7, fn7, ln2);
+    const svint32_t n4 = svcvt_s32_f32_x(pg, fn4);
+    const svint32_t n5 = svcvt_s32_f32_x(pg, fn5);
+    const svint32_t n6 = svcvt_s32_f32_x(pg, fn6);
+    const svint32_t n7 = svcvt_s32_f32_x(pg, fn7);
+
+    svfloat32_t p4 = c6;
+    svfloat32_t p5 = c6;
+    svfloat32_t p6 = c6;
+    svfloat32_t p7 = c6;
+    p4 = svmla_f32_x(pg, c5, p4, r4);
+    p5 = svmla_f32_x(pg, c5, p5, r5);
+    p6 = svmla_f32_x(pg, c5, p6, r6);
+    p7 = svmla_f32_x(pg, c5, p7, r7);
+    p4 = svmla_f32_x(pg, c4, p4, r4);
+    p5 = svmla_f32_x(pg, c4, p5, r5);
+    p6 = svmla_f32_x(pg, c4, p6, r6);
+    p7 = svmla_f32_x(pg, c4, p7, r7);
+    p4 = svmla_f32_x(pg, c3, p4, r4);
+    p5 = svmla_f32_x(pg, c3, p5, r5);
+    p6 = svmla_f32_x(pg, c3, p6, r6);
+    p7 = svmla_f32_x(pg, c3, p7, r7);
+    p4 = svmla_f32_x(pg, c2, p4, r4);
+    p5 = svmla_f32_x(pg, c2, p5, r5);
+    p6 = svmla_f32_x(pg, c2, p6, r6);
+    p7 = svmla_f32_x(pg, c2, p7, r7);
+    p4 = svmla_f32_x(pg, c1, p4, r4);
+    p5 = svmla_f32_x(pg, c1, p5, r5);
+    p6 = svmla_f32_x(pg, c1, p6, r6);
+    p7 = svmla_f32_x(pg, c1, p7, r7);
+    p4 = svmla_f32_x(pg, c0, p4, r4);
+    p5 = svmla_f32_x(pg, c0, p5, r5);
+    p6 = svmla_f32_x(pg, c0, p6, r6);
+    p7 = svmla_f32_x(pg, c0, p7, r7);
+
+    const svfloat32_t e4 = scale_exp(4, p4, n4);
+    const svfloat32_t e5 = scale_exp(5, p5, n5);
+    const svfloat32_t e6 = scale_exp(6, p6, n6);
+    const svfloat32_t e7 = scale_exp(7, p7, n7);
+
+    const svfloat32_t d01 = svadd_f32_x(pg, e0, e1);
+    const svfloat32_t d23 = svadd_f32_x(pg, e2, e3);
+    const svfloat32_t d45 = svadd_f32_x(pg, e4, e5);
+    const svfloat32_t d67 = svadd_f32_x(pg, e6, e7);
+    const svfloat32_t d0123 = svadd_f32_x(pg, d01, d23);
+    const svfloat32_t d4567 = svadd_f32_x(pg, d45, d67);
+    const svfloat32_t denom = svadd_f32_x(pg, d0123, d4567);
+    const svfloat32_t inv_denom =
+        svdiv_f32_x(pg, one, svmax_f32_x(pg, denom, min_denom));
+
+    auto accumulate = [&](svfloat32_t acc, int idx,
+                          svfloat32_t e) -> svfloat32_t {
+      if constexpr (HasPadding) {
+        if (kv_src[idx] == nullptr) {
+          return acc;
+        }
+      }
+      return svmla_f32_x(
+          pg, acc, svld1_f32(pg, kv_src[idx] + d), svmul_f32_x(pg, e, inv_denom));
+    };
+
+    svfloat32_t acc = zero;
+    acc = accumulate(acc, 0, e0);
+    acc = accumulate(acc, 1, e1);
+    acc = accumulate(acc, 2, e2);
+    acc = accumulate(acc, 3, e3);
+    acc = accumulate(acc, 4, e4);
+    acc = accumulate(acc, 5, e5);
+    acc = accumulate(acc, 6, e6);
+    acc = accumulate(acc, 7, e7);
+    svst1_f32(pg, compressed_data + d, acc);
+  };
+
+  const int64_t full_head_dim = (head_dim / vl) * vl;
+  const svbool_t pg_all = svptrue_b32();
+  int64_t d = 0;
+  for (; d < full_head_dim; d += vl) {
+    process_chunk(d, pg_all);
+  }
+  if (d < head_dim) {
+    process_chunk(d, svwhilelt_b32(d, head_dim));
+  }
+}
+
+bool TryCompressCoff2WindowSve(const at::Tensor& state_cache,
+                               const at::Tensor& block_table,
+                               int64_t req_idx,
+                               int64_t start,
+                               int64_t compress_ratio,
+                               int64_t state_block_size,
+                               int64_t state_width,
+                               int64_t head_dim,
+                               at::Tensor& compressed) {
+  const bool supported =
+      state_cache.scalar_type() == at::kFloat &&
+      block_table.scalar_type() == at::kLong &&
+      compressed.scalar_type() == at::kFloat &&
+      state_cache.device().is_cpu() &&
+      block_table.device().is_cpu() &&
+      state_cache.dim() == 3 &&
+      block_table.dim() == 2 &&
+      state_cache.stride(2) == 1 &&
+      compressed.dim() == 1 &&
+      compressed.size(0) == head_dim &&
+      compressed.stride(0) == 1 &&
+      compress_ratio == 4 &&
+      state_width == 2 * head_dim &&
+      head_dim > 0;
+
+#if FUSED_CPP_STRICT_MODE
+  TORCH_CHECK(
+      supported,
+      "FUSED_CPP_STRICT_MODE coff=2 compressor fused SVE path requires fp32 CPU "
+      "state_cache, int64 CPU 2-D block_table, contiguous compressed output, "
+      "compress_ratio=4, and state_width=2*head_dim");
+#else
+  if (!supported) {
+    return false;
+  }
+#endif
+
+  const float* state_data = state_cache.data_ptr<float>();
+  const int64_t* block_data = block_table.data_ptr<int64_t>();
+  float* compressed_data = compressed.data_ptr<float>();
+  const int64_t state_stride_block = state_cache.stride(0);
+  const int64_t state_stride_offset = state_cache.stride(1);
+  const int64_t block_stride_req = block_table.stride(0);
+  const int64_t block_stride_logical = block_table.stride(1);
+
+  const float* kv_src[8] = {};
+  const float* score_src[8] = {};
+  for (int64_t row_idx = 0; row_idx < 8; ++row_idx) {
+    const int64_t p = start + row_idx;
+    if (p < 0) {
+      continue;
+    }
+    const int64_t logical_block = p / state_block_size;
+    const int64_t logical_offset = p % state_block_size;
+    const int64_t block =
+        block_data[req_idx * block_stride_req + logical_block * block_stride_logical];
+    const float* row =
+        state_data + block * state_stride_block + logical_offset * state_stride_offset;
+    const int64_t segment = row_idx >= 4 ? 1 : 0;
+    kv_src[row_idx] = row + segment * head_dim;
+    score_src[row_idx] = row + state_width + segment * head_dim;
+  }
+
+  if (start < 0) {
+    CompressCoff2WindowSveKernel<true>(kv_src, score_src, head_dim, compressed_data);
+  } else {
+    CompressCoff2WindowSveKernel<false>(kv_src, score_src, head_dim, compressed_data);
+  }
+  return true;
+}
+
+bool TryCompressRowsNormRopeInsertCoff2FusedSve(const at::Tensor& state_cache,
+                                                const at::Tensor& block_table,
+                                                int64_t req_idx,
+                                                int64_t start,
+                                                int64_t compress_ratio,
+                                                int64_t state_block_size,
+                                                int64_t state_width,
+                                                int64_t head_dim,
+                                                const at::Tensor& rms_weight,
+                                                double rms_norm_eps,
+                                                const at::Tensor& cos_sin_cache,
+                                                int64_t compressed_pos,
+                                                int64_t rope_head_dim,
+                                                const at::Tensor& kv_cache,
+                                                int64_t kv_slot,
+                                                int64_t kv_cache_block_size) {
+  at::Tensor compressed = at::empty({head_dim}, state_cache.options().dtype(at::kFloat));
+  if (!TryCompressCoff2WindowSve(state_cache, block_table, req_idx, start, compress_ratio,
+                                 state_block_size, state_width, head_dim, compressed)) {
+    return false;
+  }
+
+  at::Tensor var = compressed.pow(2).mean(-1, false);
+  at::Tensor normed = compressed * at::rsqrt(var + rms_norm_eps) * rms_weight;
+  at::Tensor rotated = GptjRopeApplyScalar(normed, cos_sin_cache, compressed_pos, rope_head_dim);
+
+  const int64_t kv_block = kv_slot / kv_cache_block_size;
+  const int64_t kv_offset = kv_slot % kv_cache_block_size;
+  kv_cache.index({kv_block, kv_offset}).copy_(rotated.to(kv_cache.scalar_type()));
+  return true;
+}
+#endif
+
+void CompressRowsNormRopeInsertCoff1Compute(const at::Tensor& kv_stack,
+                                            const at::Tensor& score_stack,
+                                            const at::Tensor& rms_weight,
+                                            double rms_norm_eps,
+                                            const at::Tensor& cos_sin_cache,
+                                            int64_t compressed_pos,
+                                            int64_t rope_head_dim,
+                                            const at::Tensor& kv_cache,
+                                            int64_t kv_slot,
+                                            int64_t kv_cache_block_size) {
+  TORCH_CHECK(kv_stack.size(0) == score_stack.size(0),
+              "coff=1 compressor kv/score window mismatch");
+  at::Tensor score_for_softmax = score_stack;
+#if !FUSED_CPP_STRICT_MODE
+  at::Tensor all_neg_inf = score_for_softmax.eq(-std::numeric_limits<float>::infinity()).all(0, true);
+  if (all_neg_inf.any().item<bool>()) {
+    score_for_softmax = at::where(all_neg_inf.expand_as(score_for_softmax),
+                                  at::zeros_like(score_for_softmax),
+                                  score_for_softmax);
+  }
+#endif
+  at::Tensor weights = at::softmax(score_for_softmax, 0);
+  at::Tensor compressed = (kv_stack * weights).sum(0);
+  at::Tensor var = compressed.pow(2).mean(-1, false);
+  at::Tensor normed = compressed * at::rsqrt(var + rms_norm_eps) * rms_weight;
+  at::Tensor rotated = GptjRopeApplyScalar(normed, cos_sin_cache, compressed_pos, rope_head_dim);
+
+  const int64_t kv_block = kv_slot / kv_cache_block_size;
+  const int64_t kv_offset = kv_slot % kv_cache_block_size;
+  kv_cache.index({kv_block, kv_offset}).copy_(rotated.to(kv_cache.scalar_type()));
+}
+
+void CompressRowsNormRopeInsertCoff2Compute(const at::Tensor& kv_stack,
+                                            const at::Tensor& score_stack,
+                                            const at::Tensor& rms_weight,
+                                            double rms_norm_eps,
+                                            const at::Tensor& cos_sin_cache,
+                                            int64_t compressed_pos,
+                                            int64_t rope_head_dim,
+                                            const at::Tensor& kv_cache,
+                                            int64_t kv_slot,
+                                            int64_t kv_cache_block_size) {
+  TORCH_CHECK(kv_stack.size(0) == 8 && score_stack.size(0) == 8,
+              "coff=2 compressor compute expects window=8, got kv/score windows ",
+              kv_stack.size(0),
+              "/",
+              score_stack.size(0));
+  at::Tensor score_for_softmax = score_stack;
+#if !FUSED_CPP_STRICT_MODE
+  at::Tensor all_neg_inf = score_for_softmax.eq(-std::numeric_limits<float>::infinity()).all(0, true);
+  if (all_neg_inf.any().item<bool>()) {
+    score_for_softmax = at::where(all_neg_inf.expand_as(score_for_softmax),
+                                  at::zeros_like(score_for_softmax),
+                                  score_for_softmax);
+  }
+#endif
+  at::Tensor weights = at::softmax(score_for_softmax, 0);
+  at::Tensor compressed = (kv_stack * weights).sum(0);
+  at::Tensor var = compressed.pow(2).mean(-1, false);
+  at::Tensor normed = compressed * at::rsqrt(var + rms_norm_eps) * rms_weight;
+  at::Tensor rotated = GptjRopeApplyScalar(normed, cos_sin_cache, compressed_pos, rope_head_dim);
+
+  const int64_t kv_block = kv_slot / kv_cache_block_size;
+  const int64_t kv_offset = kv_slot % kv_cache_block_size;
+  kv_cache.index({kv_block, kv_offset}).copy_(rotated.to(kv_cache.scalar_type()));
+}
+
+void CompressRowsNormRopeInsert(const at::Tensor& state_cache,
+                                const at::Tensor& block_table,
+                                int64_t req_idx,
+                                int64_t start,
+                                int64_t compress_ratio,
+                                int64_t coff,
+                                int64_t state_block_size,
+                                int64_t state_width,
+                                int64_t head_dim,
+                                const at::Tensor& rms_weight,
+                                double rms_norm_eps,
+                                const at::Tensor& cos_sin_cache,
+                                int64_t compressed_pos,
+                                int64_t rope_head_dim,
+                                const at::Tensor& kv_cache,
+                                int64_t kv_slot,
+                                int64_t kv_cache_block_size) {
+#if defined(__ARM_FEATURE_SVE)
+  if (coff == 2 &&
+      TryCompressRowsNormRopeInsertCoff2FusedSve(
+          state_cache, block_table, req_idx, start, compress_ratio, state_block_size,
+          state_width, head_dim, rms_weight, rms_norm_eps, cos_sin_cache,
+          compressed_pos, rope_head_dim, kv_cache, kv_slot, kv_cache_block_size)) {
+    return;
+  }
+#endif
+
+  const int64_t window = coff * compress_ratio;
+  at::Tensor kv_stack = at::empty({window, head_dim}, state_cache.options().dtype(at::kFloat));
+  at::Tensor score_stack = at::empty({window, head_dim}, state_cache.options().dtype(at::kFloat));
+
+#if defined(__ARM_FEATURE_SVE)
+  const bool copied_with_sve =
+      TryCopyCompressorWindowRowsSve(state_cache, block_table, req_idx, start, compress_ratio,
+                                     coff, state_block_size, state_width, head_dim,
+                                     kv_stack, score_stack);
+#elif FUSED_CPP_STRICT_MODE
+  TORCH_CHECK(false, "FUSED_CPP_STRICT_MODE CompressRowsNormRopeInsert requires SVE copy path");
+  const bool copied_with_sve = false;
+#else
+  const bool copied_with_sve = false;
+#endif
+
+  if (!copied_with_sve) {
+    const auto copy_window_row = [&](int64_t out_row, int64_t p, int64_t segment) {
+      at::Tensor kv_out = kv_stack.index({out_row});
+      at::Tensor score_out = score_stack.index({out_row});
+      if (p < 0) {
+        kv_out.zero_();
+        score_out.fill_(-std::numeric_limits<float>::infinity());
+        return;
+      }
+      const int64_t logical_block = p / state_block_size;
+      const int64_t logical_offset = p % state_block_size;
+      const int64_t block = block_table.index({req_idx, logical_block}).item<int64_t>();
+      at::Tensor row = state_cache.index({block, logical_offset}).to(at::kFloat);
+      const int64_t kv_start = segment * head_dim;
+      const int64_t score_start = state_width + segment * head_dim;
+      kv_out.copy_(row.slice(0, kv_start, kv_start + head_dim));
+      score_out.copy_(row.slice(0, score_start, score_start + head_dim));
+    };
+
+    if (coff == 2) {
+      for (int64_t t = 0; t < compress_ratio; ++t) {
+        copy_window_row(t, start + t, 0);
+      }
+      for (int64_t t = 0; t < compress_ratio; ++t) {
+        copy_window_row(compress_ratio + t, start + compress_ratio + t, 1);
+      }
+    } else {
+      for (int64_t t = 0; t < compress_ratio; ++t) {
+        copy_window_row(t, start + t, 0);
+      }
+    }
+  }
+
+  if (coff == 2) {
+    CompressRowsNormRopeInsertCoff2Compute(kv_stack, score_stack, rms_weight, rms_norm_eps,
+                                           cos_sin_cache, compressed_pos, rope_head_dim,
+                                           kv_cache, kv_slot, kv_cache_block_size);
+  } else {
+    CompressRowsNormRopeInsertCoff1Compute(kv_stack, score_stack, rms_weight, rms_norm_eps,
+                                           cos_sin_cache, compressed_pos, rope_head_dim,
+                                           kv_cache, kv_slot, kv_cache_block_size);
+  }
+}
+
+std::vector<int64_t> BuildCompressorActiveIndices(const at::Tensor& pos_cpu,
+                                                  const at::Tensor& slot_cpu,
+                                                  const at::Tensor& kv_slot_cpu,
+                                                  int64_t compress_ratio) {
+  const int64_t num_tokens = pos_cpu.numel();
+  std::vector<int64_t> active_indices;
+  std::vector<int64_t> active_kv_slots;
+  active_indices.reserve(
+      static_cast<size_t>((num_tokens + compress_ratio - 1) / compress_ratio));
+  active_kv_slots.reserve(active_indices.capacity());
+
+  const int64_t* pos_data = pos_cpu.data_ptr<int64_t>();
+  const int64_t* slot_data = slot_cpu.data_ptr<int64_t>();
+  const int64_t* kv_slot_data = kv_slot_cpu.data_ptr<int64_t>();
+  for (int64_t i = 0; i < num_tokens; ++i) {
+    if (slot_data[i] < 0) {
+      continue;
+    }
+    if ((pos_data[i] + 1) % compress_ratio != 0) {
+      continue;
+    }
+    if (kv_slot_data[i] < 0) {
+      continue;
+    }
+    active_indices.push_back(i);
+    active_kv_slots.push_back(kv_slot_data[i]);
+  }
+  std::sort(active_kv_slots.begin(), active_kv_slots.end());
+  for (size_t i = 1; i < active_kv_slots.size(); ++i) {
+    TORCH_CHECK(active_kv_slots[i] != active_kv_slots[i - 1],
+                "kv_slot_mapping[active] must not contain duplicate slots, got duplicate slot ",
+                active_kv_slots[i]);
+  }
+  return active_indices;
+}
+
+void KvCompressNormRopeInsertCoff1(const at::Tensor& state_cache,
+                                   const at::Tensor& block_table,
+                                   const at::Tensor& rms_weight,
+                                   double rms_norm_eps,
+                                   const at::Tensor& cos_sin_cache,
+                                   const at::Tensor& kv_cache,
+                                   const at::Tensor& pos_cpu,
+                                   const at::Tensor& kv_slot_cpu,
+                                   const at::Tensor& req_cpu,
+                                   int64_t compress_ratio,
+                                   int64_t state_block_size,
+                                   int64_t state_width,
+                                   int64_t head_dim,
+                                   int64_t rope_head_dim,
+                                   int64_t kv_cache_block_size,
+                                   const std::vector<int64_t>& active_indices) {
+  const int64_t num_active = static_cast<int64_t>(active_indices.size());
+  const int64_t* pos_data = pos_cpu.data_ptr<int64_t>();
+  const int64_t* kv_slot_data = kv_slot_cpu.data_ptr<int64_t>();
+  const int64_t* req_data = req_cpu.data_ptr<int64_t>();
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) if(num_active > 1)
+#endif
+  for (int64_t active_idx = 0; active_idx < num_active; ++active_idx) {
+    const int64_t i = active_indices[active_idx];
+    const int64_t position = pos_data[i];
+    const int64_t kv_slot = kv_slot_data[i];
+    const int64_t req_idx = req_data[i];
+    const int64_t start = position - compress_ratio + 1;
+
+    const int64_t compressed_pos = (position / compress_ratio) * compress_ratio;
+    CompressRowsNormRopeInsert(state_cache, block_table, req_idx, start, compress_ratio, 1,
+                               state_block_size, state_width, head_dim, rms_weight,
+                               rms_norm_eps, cos_sin_cache, compressed_pos, rope_head_dim,
+                               kv_cache, kv_slot, kv_cache_block_size);
+  }
+}
+
+void KvCompressNormRopeInsertCoff2(const at::Tensor& state_cache,
+                                   const at::Tensor& block_table,
+                                   const at::Tensor& rms_weight,
+                                   double rms_norm_eps,
+                                   const at::Tensor& cos_sin_cache,
+                                   const at::Tensor& kv_cache,
+                                   const at::Tensor& pos_cpu,
+                                   const at::Tensor& kv_slot_cpu,
+                                   const at::Tensor& req_cpu,
+                                   int64_t compress_ratio,
+                                   int64_t state_block_size,
+                                   int64_t state_width,
+                                   int64_t head_dim,
+                                   int64_t rope_head_dim,
+                                   int64_t kv_cache_block_size,
+                                   const std::vector<int64_t>& active_indices) {
+  const int64_t window = 2 * compress_ratio;
+  const int64_t num_active = static_cast<int64_t>(active_indices.size());
+  const int64_t* pos_data = pos_cpu.data_ptr<int64_t>();
+  const int64_t* kv_slot_data = kv_slot_cpu.data_ptr<int64_t>();
+  const int64_t* req_data = req_cpu.data_ptr<int64_t>();
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) if(num_active > 1)
+#endif
+  for (int64_t active_idx = 0; active_idx < num_active; ++active_idx) {
+    const int64_t i = active_indices[active_idx];
+    const int64_t position = pos_data[i];
+    const int64_t kv_slot = kv_slot_data[i];
+    const int64_t req_idx = req_data[i];
+    const int64_t start = position - window + 1;
+
+    const int64_t compressed_pos = (position / compress_ratio) * compress_ratio;
+    CompressRowsNormRopeInsert(state_cache, block_table, req_idx, start, compress_ratio, 2,
+                               state_block_size, state_width, head_dim, rms_weight,
+                               rms_norm_eps, cos_sin_cache, compressed_pos, rope_head_dim,
+                               kv_cache, kv_slot, kv_cache_block_size);
+  }
+}
+
 void KvCompressNormRopeInsert(const at::Tensor& state_cache,
                               const at::Tensor& token_to_req_indices,
                               const at::Tensor& positions,
@@ -587,89 +1468,85 @@ void KvCompressNormRopeInsert(const at::Tensor& state_cache,
   if (kv_cache.numel() == 0 || state_cache.numel() == 0) {
     return;
   }
-  const int64_t num_tokens = positions.size(0);
   const int64_t state_block_size = state_cache.size(1);
   const int64_t state_width = state_cache.size(-1) / 2;
   const int64_t head_dim = rms_norm_weight.size(0);
+  TORCH_CHECK(compress_ratio > 0, "compress_ratio must be positive, got ", compress_ratio);
   TORCH_CHECK(state_width % head_dim == 0, "state width must be a multiple of head_dim");
   const int64_t coff = state_width / head_dim;
   TORCH_CHECK(coff == 1 || coff == 2, "compressor coff must be 1 or 2, got ", coff);
-  const int64_t window = coff * compress_ratio;
+  TORCH_CHECK(coff != 2 || compress_ratio == 4,
+              "coff=2 compressor requires compress_ratio=4, got ",
+              compress_ratio);
   const int64_t rope_head_dim = cos_sin_cache.size(1);
   const int64_t kv_cache_block_size = kv_cache.size(1);
 
-  at::Tensor pos_cpu = ToLongCpu(positions).reshape({-1});
-  at::Tensor slot_cpu = ToLongCpu(slot_mapping).reshape({-1});
-  at::Tensor kv_slot_cpu = ToLongCpu(kv_slot_mapping).reshape({-1});
-  at::Tensor req_cpu = ToLongCpu(token_to_req_indices).reshape({-1});
+  at::Tensor pos_cpu = ToLongCpu(positions).reshape({-1}).contiguous();
+  at::Tensor slot_cpu = ToLongCpu(slot_mapping).reshape({-1}).contiguous();
+  at::Tensor kv_slot_cpu = ToLongCpu(kv_slot_mapping).reshape({-1}).contiguous();
+  at::Tensor req_cpu = ToLongCpu(token_to_req_indices).reshape({-1}).contiguous();
   at::Tensor rms_weight = rms_norm_weight.to(at::kFloat);
+  const std::vector<int64_t> active_indices =
+      BuildCompressorActiveIndices(pos_cpu, slot_cpu, kv_slot_cpu, compress_ratio);
 
-  for (int64_t i = 0; i < num_tokens; ++i) {
-    const int64_t slot = slot_cpu[i].item<int64_t>();
-    if (slot < 0) {
-      continue;
-    }
-    const int64_t position = pos_cpu[i].item<int64_t>();
-    if ((position + 1) % compress_ratio != 0) {
-      continue;
-    }
-    const int64_t kv_slot = kv_slot_cpu[i].item<int64_t>();
-    if (kv_slot < 0) {
-      continue;
-    }
-    const int64_t req_idx = req_cpu[i].item<int64_t>();
-    const int64_t start = position - window + 1;
-
-    std::vector<at::Tensor> kv_rows;
-    std::vector<at::Tensor> score_rows;
-    kv_rows.reserve(static_cast<size_t>(window));
-    score_rows.reserve(static_cast<size_t>(window));
-    for (int64_t t = 0; t < window; ++t) {
-      const int64_t p = start + t;
-      if (p < 0) {
-        kv_rows.push_back(at::zeros({head_dim}, state_cache.options().dtype(at::kFloat)));
-        score_rows.push_back(at::full({head_dim}, -std::numeric_limits<float>::infinity(),
-                                      state_cache.options().dtype(at::kFloat)));
-        continue;
-      }
-      const int64_t logical_block = p / state_block_size;
-      const int64_t logical_offset = p % state_block_size;
-      const int64_t block = block_table.index({req_idx, logical_block}).item<int64_t>();
-      at::Tensor row = state_cache.index({block, logical_offset}).to(at::kFloat);
-      if (coff == 2 && t >= compress_ratio) {
-        kv_rows.push_back(row.slice(0, head_dim, 2 * head_dim));
-        score_rows.push_back(row.slice(0, state_width + head_dim, state_width + 2 * head_dim));
-      } else {
-        kv_rows.push_back(row.slice(0, 0, head_dim));
-        score_rows.push_back(row.slice(0, state_width, state_width + head_dim));
-      }
-    }
-
-    at::Tensor kv_stack = at::stack(kv_rows, 0);
-    at::Tensor score_stack = at::stack(score_rows, 0);
-    at::Tensor all_neg_inf = score_stack.eq(-std::numeric_limits<float>::infinity()).all(0, true);
-    if (all_neg_inf.any().item<bool>()) {
-      score_stack = at::where(all_neg_inf.expand_as(score_stack), at::zeros_like(score_stack), score_stack);
-    }
-    at::Tensor weights = at::softmax(score_stack, 0);
-    at::Tensor compressed = (kv_stack * weights).sum(0);
-    at::Tensor var = compressed.pow(2).mean(-1, false);
-    at::Tensor normed = compressed * at::rsqrt(var + rms_norm_eps) * rms_weight;
-    const int64_t compressed_pos = (position / compress_ratio) * compress_ratio;
-    at::Tensor rotated = GptjRopeApplyScalar(normed, cos_sin_cache, compressed_pos, rope_head_dim);
-
-    const int64_t kv_block = kv_slot / kv_cache_block_size;
-    const int64_t kv_offset = kv_slot % kv_cache_block_size;
-    kv_cache.index({kv_block, kv_offset}).copy_(rotated.to(kv_cache.scalar_type()));
+  if (coff == 2) {
+    KvCompressNormRopeInsertCoff2(state_cache, block_table, rms_weight, rms_norm_eps,
+                                  cos_sin_cache, kv_cache, pos_cpu, kv_slot_cpu,
+                                  req_cpu, compress_ratio,
+                                  state_block_size, state_width, head_dim,
+                                  rope_head_dim, kv_cache_block_size, active_indices);
+    return;
   }
+
+  KvCompressNormRopeInsertCoff1(state_cache, block_table, rms_weight, rms_norm_eps,
+                                cos_sin_cache, kv_cache, pos_cpu, kv_slot_cpu,
+                                req_cpu, compress_ratio,
+                                state_block_size, state_width, head_dim,
+                                rope_head_dim, kv_cache_block_size, active_indices);
 }
 
 std::tuple<at::Tensor, at::Tensor> IndexerQRopeQuant(const at::Tensor& positions,
                                                      const at::Tensor& index_q,
                                                      const at::Tensor& cos_sin_cache,
                                                      const at::Tensor& index_weights) {
+  CheckDim(index_q, "indexer q", 3);
+  CheckDim(cos_sin_cache, "indexer_cos_sin_cache", 2);
   const int64_t rope_dim = cos_sin_cache.size(1);
-  at::Tensor q_rot = GptjRopeApply(index_q, cos_sin_cache, positions, rope_dim).to(at::kBFloat16);
+  TORCH_CHECK(rope_dim >= 0, "indexer rope_dim must be non-negative");
+  TORCH_CHECK(rope_dim % 2 == 0, "indexer rope_dim must be even, got ", rope_dim);
+  TORCH_CHECK(
+      index_q.size(-1) >= rope_dim,
+      "indexer q last dim must be >= rope_dim: ",
+      index_q.size(-1),
+      " vs ",
+      rope_dim);
+  at::Tensor positions_long = ToLongCpu(positions).contiguous();
+  TORCH_CHECK(
+      positions_long.dim() == 0 || positions_long.numel() == index_q.size(0),
+      "positions must be scalar or have indexer q num_tokens elements");
+  at::Tensor cos_sin_f = cos_sin_cache.to(at::kFloat).contiguous();
+  if (rope_dim != 0) {
+    CheckPositionsInRange(positions_long, index_q.size(0), cos_sin_f.size(0));
+  }
+
+  at::Tensor q_rot;
+  if (index_q.scalar_type() == at::kBFloat16) {
+    q_rot = index_q.contiguous();
+    if (::fused_cpp::deepseek_v4::indexer_q_rope_fused_sve(q_rot, positions_long, cos_sin_f)) {
+      const double softmax_scale = std::pow(static_cast<double>(index_q.size(-1)), -0.5);
+      const double head_scale = std::pow(static_cast<double>(index_q.size(1)), -0.5);
+      at::Tensor weights = index_weights.to(at::kFloat) * softmax_scale * head_scale;
+      return std::make_tuple(q_rot, weights);
+    }
+  }
+#if FUSED_CPP_STRICT_MODE
+  TORCH_CHECK(
+      false,
+      "FUSED_CPP_STRICT_MODE IndexerQRopeQuant requires the SVE bf16 rows4 fast path; got q dtype ",
+      index_q.scalar_type());
+#else
+  q_rot = GptjRopeApply(index_q, cos_sin_cache, positions, rope_dim).to(at::kBFloat16);
+#endif
   const double softmax_scale = std::pow(static_cast<double>(index_q.size(-1)), -0.5);
   const double head_scale = std::pow(static_cast<double>(index_q.size(1)), -0.5);
   at::Tensor weights = index_weights.to(at::kFloat) * softmax_scale * head_scale;
