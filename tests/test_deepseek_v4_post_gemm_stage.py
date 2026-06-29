@@ -49,7 +49,7 @@ def _make_compressor_state(
         ),
         state_slot_mapping=torch.arange(num_tokens, dtype=torch.int64),
         token_to_req_indices=torch.zeros(num_tokens, dtype=torch.int64),
-        block_table=torch.arange(num_blocks, dtype=torch.int64).view(1, num_blocks),
+        block_table=torch.arange(num_blocks, dtype=torch.int32).view(1, num_blocks),
         kv_cache=torch.zeros(num_blocks, block_size, head_dim, dtype=torch.bfloat16),
         kv_slot_mapping=torch.arange(num_tokens, dtype=torch.int64),
         norm_weight=(1.0 + torch.randn(head_dim, dtype=torch.float32) * 0.01),
@@ -118,7 +118,7 @@ def _make_inputs(seed: int = 0) -> PostGemmStageInputs:
             cu_seq_lens=torch.tensor([0, num_tokens], dtype=torch.int64),
             cu_seqlen_ks=torch.zeros(num_tokens, dtype=torch.int64),
             cu_seqlen_ke=torch.arange(1, num_tokens + 1, dtype=torch.int64),
-            block_table=torch.arange(num_blocks, dtype=torch.int64).view(1, num_blocks),
+            block_table=torch.arange(num_blocks, dtype=torch.int32).view(1, num_blocks),
             topk_tokens=topk_tokens,
         ),
         main_head_dim=main_head_dim,
@@ -185,6 +185,18 @@ def test_post_gemm_cpp_matches_torch_baseline() -> None:
         ref_inputs.indexer_compressor.kv_cache,
         "indexer kv_cache",
     )
+
+
+@pytest.mark.skipif(
+    not _HAS_DEEPSEEK_V4_POST_GEMM_STAGE,
+    reason="DeepSeek V4 post-GEMM C++ stage is unavailable",
+)
+def test_post_gemm_cpp_rejects_int64_block_tables() -> None:
+    inputs = _make_inputs(seed=7)
+    inputs.mla_compressor.block_table = inputs.mla_compressor.block_table.to(torch.int64)
+
+    with pytest.raises(RuntimeError, match="block_table must be int32"):
+        post_gemm_parallel_stage_cpp(inputs)
 
 
 @pytest.mark.skipif(
