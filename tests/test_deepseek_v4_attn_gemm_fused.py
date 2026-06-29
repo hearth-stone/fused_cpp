@@ -35,26 +35,34 @@ def _test_core_ids(count: int) -> list[int]:
 
 
 @pytest.mark.parametrize(
-    ("M", "K", "Ns"),
+    ("M", "K", "Ns", "variant"),
     [
-        (7, 16, (24, 16, 24, 8)),
-        (5, 13, (11, 17, 9, 15)),
+        (7, 16, (24, 16, 24, 8), "dense"),
+        (7, 16, (24, 16, 24, 8), "c128a"),
+        (7, 16, (24, 16, 24, 8), "c4a"),
+        (5, 13, (11, 17, 9, 15), "c4a"),
     ],
 )
 def test_deepseek_v4_attn_gemm_fused_matches_torch(
     M: int,
     K: int,
     Ns: tuple[int, int, int, int],
+    variant: str,
 ) -> None:
     torch.manual_seed(0)
     hidden_states = _bf16_randn(M, K)
     weights = tuple(_bf16_randn(K, N) for N in Ns)
-    packed = prepare_deepseek_v4_attn_gemm_weights(
-        weights[0],
-        weights[1],
-        weights[2],
-        weights[3],
-    )
+    if variant == "dense":
+        packed = prepare_deepseek_v4_attn_gemm_weights(weights[0])
+    elif variant == "c128a":
+        packed = prepare_deepseek_v4_attn_gemm_weights(weights[0], weights[1])
+    else:
+        packed = prepare_deepseek_v4_attn_gemm_weights(
+            weights[0],
+            weights[1],
+            weights[2],
+            weights[3],
+        )
 
     qr_kv, kv_score, indexer_kv_score, indexer_weights = (
         deepseek_v4_attn_gemm_fused_prepacked(
@@ -64,25 +72,40 @@ def test_deepseek_v4_attn_gemm_fused_matches_torch(
     )
 
     ref_qr_kv = (hidden_states.float() @ weights[0].float()).to(torch.bfloat16)
+
+    assert qr_kv.dtype == torch.bfloat16
+    assert qr_kv.shape == ref_qr_kv.shape
+    torch.testing.assert_close(
+        qr_kv.float(), ref_qr_kv.float(), atol=5e-2, rtol=5e-2
+    )
+
+    if variant == "dense":
+        assert kv_score is None
+        assert indexer_kv_score is None
+        assert indexer_weights is None
+        return
+
     ref_kv_score = hidden_states.float() @ weights[1].float()
+    assert kv_score is not None
+    assert kv_score.dtype == torch.float32
+    assert kv_score.shape == ref_kv_score.shape
+    torch.testing.assert_close(kv_score, ref_kv_score, atol=5e-2, rtol=5e-2)
+
+    if variant == "c128a":
+        assert indexer_kv_score is None
+        assert indexer_weights is None
+        return
+
     ref_indexer_kv_score = hidden_states.float() @ weights[2].float()
     ref_indexer_weights = (
         hidden_states.float() @ weights[3].float()
     ).to(torch.bfloat16)
-
-    assert qr_kv.dtype == torch.bfloat16
-    assert kv_score.dtype == torch.float32
+    assert indexer_kv_score is not None
+    assert indexer_weights is not None
     assert indexer_kv_score.dtype == torch.float32
     assert indexer_weights.dtype == torch.bfloat16
-    assert qr_kv.shape == ref_qr_kv.shape
-    assert kv_score.shape == ref_kv_score.shape
     assert indexer_kv_score.shape == ref_indexer_kv_score.shape
     assert indexer_weights.shape == ref_indexer_weights.shape
-
-    torch.testing.assert_close(
-        qr_kv.float(), ref_qr_kv.float(), atol=5e-2, rtol=5e-2
-    )
-    torch.testing.assert_close(kv_score, ref_kv_score, atol=5e-2, rtol=5e-2)
     torch.testing.assert_close(
         indexer_kv_score, ref_indexer_kv_score, atol=5e-2, rtol=5e-2
     )
@@ -95,19 +118,25 @@ def test_deepseek_v4_attn_gemm_fused_matches_torch(
 
 
 @pytest.mark.skipif(not _HAS_OPENMP, reason="OpenMP is unavailable")
-def test_deepseek_v4_attn_gemm_fused_mt_matches_serial() -> None:
+@pytest.mark.parametrize("variant", ["dense", "c128a", "c4a"])
+def test_deepseek_v4_attn_gemm_fused_mt_matches_serial(variant: str) -> None:
     torch.manual_seed(1)
     M = 17
     K = 13
     Ns = (19, 23, 11, 7)
     hidden_states = _bf16_randn(M, K)
     weights = tuple(_bf16_randn(K, N) for N in Ns)
-    packed = prepare_deepseek_v4_attn_gemm_weights(
-        weights[0],
-        weights[1],
-        weights[2],
-        weights[3],
-    )
+    if variant == "dense":
+        packed = prepare_deepseek_v4_attn_gemm_weights(weights[0])
+    elif variant == "c128a":
+        packed = prepare_deepseek_v4_attn_gemm_weights(weights[0], weights[1])
+    else:
+        packed = prepare_deepseek_v4_attn_gemm_weights(
+            weights[0],
+            weights[1],
+            weights[2],
+            weights[3],
+        )
     core_ids = _test_core_ids(3)
     if len(core_ids) < 2:
         pytest.skip("need at least two available CPU cores")
@@ -123,6 +152,10 @@ def test_deepseek_v4_attn_gemm_fused_mt_matches_serial() -> None:
     )
 
     for serial, mt in zip(serial_outputs, mt_outputs):
+        if serial is None:
+            assert mt is None
+            continue
+        assert mt is not None
         torch.testing.assert_close(
             mt.float(),
             serial.float(),

@@ -155,6 +155,34 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
 std::tuple<at::Tensor, int64_t, int64_t>
 fused_wqa_wkv_compressor_kv_score_indexer_compressor_kv_score_indexer_weights_proj_fused_prepare(
     at::Tensor weight);
+at::Tensor fused_wqa_wkv_fused(at::Tensor hidden_states,
+                               at::Tensor fused_wqa_wkv_packed,
+                               int64_t fused_wqa_wkv_K,
+                               int64_t fused_wqa_wkv_N);
+at::Tensor fused_wqa_wkv_fused_mt(at::Tensor hidden_states,
+                                  at::Tensor fused_wqa_wkv_packed,
+                                  int64_t fused_wqa_wkv_K,
+                                  int64_t fused_wqa_wkv_N,
+                                  std::vector<int64_t> core_ids);
+std::tuple<at::Tensor, at::Tensor>
+fused_wqa_wkv_compressor_kv_score_fused(
+    at::Tensor hidden_states,
+    at::Tensor fused_wqa_wkv_packed,
+    int64_t fused_wqa_wkv_K,
+    int64_t fused_wqa_wkv_N,
+    at::Tensor compressor_kv_score_packed,
+    int64_t compressor_kv_score_K,
+    int64_t compressor_kv_score_N);
+std::tuple<at::Tensor, at::Tensor>
+fused_wqa_wkv_compressor_kv_score_fused_mt(
+    at::Tensor hidden_states,
+    at::Tensor fused_wqa_wkv_packed,
+    int64_t fused_wqa_wkv_K,
+    int64_t fused_wqa_wkv_N,
+    at::Tensor compressor_kv_score_packed,
+    int64_t compressor_kv_score_K,
+    int64_t compressor_kv_score_N,
+    std::vector<int64_t> core_ids);
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor>
 fused_wqa_wkv_compressor_kv_score_indexer_compressor_kv_score_indexer_weights_proj_fused(
     at::Tensor hidden_states,
@@ -479,13 +507,58 @@ PYBIND11_MODULE(_C, m) {
 
     m.def("fused_wqa_wkv_compressor_kv_score_indexer_compressor_kv_score_indexer_weights_proj_fused_prepare",
           &fused_wqa_wkv_compressor_kv_score_indexer_compressor_kv_score_indexer_weights_proj_fused_prepare,
-          "Pack one bf16 [K, N] weight for the DeepSeek V4 4-GEMM fused path.",
+          "Pack one bf16 [K, N] weight for the DeepSeek V4 fused attn GEMM path.",
           py::arg("weight"),
+          py::call_guard<py::gil_scoped_release>());
+
+    m.def("fused_wqa_wkv_fused",
+          &fused_wqa_wkv_fused,
+          "DeepSeek V4 dense attention input GEMM path: fused_wqa_wkv bf16.",
+          py::arg("hidden_states"),
+          py::arg("fused_wqa_wkv_packed"),
+          py::arg("fused_wqa_wkv_K"),
+          py::arg("fused_wqa_wkv_N"),
+          py::call_guard<py::gil_scoped_release>());
+
+    m.def("fused_wqa_wkv_fused_mt",
+          &fused_wqa_wkv_fused_mt,
+          "OpenMP DeepSeek V4 dense attention input GEMM path.",
+          py::arg("hidden_states"),
+          py::arg("fused_wqa_wkv_packed"),
+          py::arg("fused_wqa_wkv_K"),
+          py::arg("fused_wqa_wkv_N"),
+          py::arg("core_ids"),
+          py::call_guard<py::gil_scoped_release>());
+
+    m.def("fused_wqa_wkv_compressor_kv_score_fused",
+          &fused_wqa_wkv_compressor_kv_score_fused,
+          "DeepSeek V4 C128A attention input GEMM path: fused_wqa_wkv bf16 "
+          "and compressor_kv_score fp32.",
+          py::arg("hidden_states"),
+          py::arg("fused_wqa_wkv_packed"),
+          py::arg("fused_wqa_wkv_K"),
+          py::arg("fused_wqa_wkv_N"),
+          py::arg("compressor_kv_score_packed"),
+          py::arg("compressor_kv_score_K"),
+          py::arg("compressor_kv_score_N"),
+          py::call_guard<py::gil_scoped_release>());
+
+    m.def("fused_wqa_wkv_compressor_kv_score_fused_mt",
+          &fused_wqa_wkv_compressor_kv_score_fused_mt,
+          "OpenMP DeepSeek V4 C128A attention input GEMM path.",
+          py::arg("hidden_states"),
+          py::arg("fused_wqa_wkv_packed"),
+          py::arg("fused_wqa_wkv_K"),
+          py::arg("fused_wqa_wkv_N"),
+          py::arg("compressor_kv_score_packed"),
+          py::arg("compressor_kv_score_K"),
+          py::arg("compressor_kv_score_N"),
+          py::arg("core_ids"),
           py::call_guard<py::gil_scoped_release>());
 
     m.def("fused_wqa_wkv_compressor_kv_score_indexer_compressor_kv_score_indexer_weights_proj_fused",
           &fused_wqa_wkv_compressor_kv_score_indexer_compressor_kv_score_indexer_weights_proj_fused,
-          "Serial DeepSeek V4 attn_gemm_parallel_execute fused path: "
+          "Serial DeepSeek V4 C4A attn_gemm_parallel_execute fused path: "
           "fused_wqa_wkv bf16, compressor_kv_score fp32, "
           "indexer_compressor_kv_score fp32, indexer_weights_proj bf16.",
           py::arg("hidden_states"),
@@ -505,7 +578,7 @@ PYBIND11_MODULE(_C, m) {
 
     m.def("fused_wqa_wkv_compressor_kv_score_indexer_compressor_kv_score_indexer_weights_proj_fused_mt",
           &fused_wqa_wkv_compressor_kv_score_indexer_compressor_kv_score_indexer_weights_proj_fused_mt,
-          "OpenMP DeepSeek V4 attn_gemm_parallel_execute fused path. "
+          "OpenMP DeepSeek V4 C4A attn_gemm_parallel_execute fused path. "
           "core_ids controls thread count and per-thread CPU affinity; "
           "rows are split into contiguous ceil(M / len(core_ids)) chunks.",
           py::arg("hidden_states"),
