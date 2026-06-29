@@ -1,7 +1,9 @@
 #include <torch/extension.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <tuple>
 #include <vector>
@@ -17,6 +19,10 @@
 
 #ifdef __aarch64__
 #include "gemm_params.h"
+
+#if defined(__ARM_FEATURE_SVE)
+#include <arm_sve.h>
+#endif
 
 extern "C" {
 void bf16gemm_k_ld(const uint16_t* A, const uint16_t* B_reo, float* C,
@@ -60,6 +66,24 @@ void check_bf16_cpu_2d(const at::Tensor& tensor, const char* name) {
                 tensor.dim(), "-D");
 }
 
+at::Tensor checked_norm_weight_f32(at::Tensor weight,
+                                   int64_t dim,
+                                   const char* name) {
+    TORCH_CHECK(weight.device().is_cpu(), name, " must be a CPU tensor");
+    TORCH_CHECK(weight.dim() == 1, name, " must be 1-D, got ",
+                weight.dim(), "-D");
+    TORCH_CHECK(weight.size(0) == dim,
+                name, " size mismatch: expected ", dim,
+                ", got ", weight.size(0));
+    TORCH_CHECK(weight.scalar_type() == at::kFloat ||
+                    weight.scalar_type() == at::kBFloat16,
+                name, " must have dtype torch.float32 or torch.bfloat16");
+    if (weight.scalar_type() == at::kFloat && weight.is_contiguous()) {
+        return weight;
+    }
+    return weight.to(at::kFloat).contiguous();
+}
+
 void check_int_arg(int64_t value, const char* name) {
     TORCH_CHECK(value > 0, name, " must be positive, got ", value);
     TORCH_CHECK(value <= std::numeric_limits<int>::max(),
@@ -86,6 +110,16 @@ bool bind_current_thread_to_cpu(int64_t cpu_id) {
     return true;
 #endif
 }
+
+#ifdef __linux__
+bool get_current_thread_affinity(cpu_set_t* mask) {
+    return pthread_getaffinity_np(pthread_self(), sizeof(*mask), mask) == 0;
+}
+
+bool set_current_thread_affinity(const cpu_set_t* mask) {
+    return pthread_setaffinity_np(pthread_self(), sizeof(*mask), mask) == 0;
+}
+#endif
 
 uint16_t* bf16_data(at::Tensor& tensor) {
     return reinterpret_cast<uint16_t*>(tensor.data_ptr<at::BFloat16>());
@@ -385,6 +419,185 @@ struct AttnGemmSelectedOutputs {
     at::Tensor indexer_weights;
 };
 
+struct AttnGemmNormedOutputs {
+    at::Tensor qr;
+    at::Tensor kv;
+    at::Tensor kv_score;
+    at::Tensor indexer_kv_score;
+    at::Tensor indexer_weights;
+};
+
+inline float bf16_u16_to_float(uint16_t value) {
+    const uint32_t bits = static_cast<uint32_t>(value) << 16;
+    float result = 0.0f;
+    std::memcpy(&result, &bits, sizeof(result));
+    return result;
+}
+
+inline uint16_t float_to_bf16_u16(float value) {
+    uint32_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    const uint32_t lsb = (bits >> 16) & 1U;
+    const uint32_t rounding_bias = 0x7fffU + lsb;
+    return static_cast<uint16_t>((bits + rounding_bias) >> 16);
+}
+
+#if defined(__ARM_FEATURE_SVE)
+inline svfloat32_t bf16_load_f32_sve(svbool_t pg, const uint16_t* ptr) {
+    const svuint32_t h = svld1uh_u32(pg, ptr);
+    return svreinterpret_f32_u32(svlsl_n_u32_x(pg, h, 16));
+}
+
+inline svuint32_t f32_to_bf16_bits_sve(svbool_t pg, svfloat32_t value) {
+    const svuint32_t bits = svreinterpret_u32_f32(value);
+    const svuint32_t lsb = svand_n_u32_x(pg, svlsr_n_u32_x(pg, bits, 16), 1);
+    const svuint32_t bias = svadd_n_u32_x(pg, lsb, 0x7fff);
+    return svlsr_n_u32_x(pg, svadd_u32_x(pg, bits, bias), 16);
+}
+
+inline void bf16_store_f32_sve(svbool_t pg, uint16_t* ptr,
+                               svfloat32_t value) {
+    svst1h_u32(pg, ptr, f32_to_bf16_bits_sve(pg, value));
+}
+
+float sum_sq_bf16_sve(const uint16_t* row, int64_t dim) {
+    const int64_t vl = static_cast<int64_t>(svcntw());
+    const int64_t step = 4 * vl;
+    const svbool_t pg_all = svptrue_b32();
+    svfloat32_t acc0 = svdup_f32(0.0f);
+    svfloat32_t acc1 = svdup_f32(0.0f);
+    svfloat32_t acc2 = svdup_f32(0.0f);
+    svfloat32_t acc3 = svdup_f32(0.0f);
+    int64_t d = 0;
+    for (; d + step <= dim; d += step) {
+        svfloat32_t v = bf16_load_f32_sve(pg_all, row + d);
+        acc0 = svmla_f32_x(pg_all, acc0, v, v);
+        v = bf16_load_f32_sve(pg_all, row + d + vl);
+        acc1 = svmla_f32_x(pg_all, acc1, v, v);
+        v = bf16_load_f32_sve(pg_all, row + d + 2 * vl);
+        acc2 = svmla_f32_x(pg_all, acc2, v, v);
+        v = bf16_load_f32_sve(pg_all, row + d + 3 * vl);
+        acc3 = svmla_f32_x(pg_all, acc3, v, v);
+    }
+    for (; d < dim; d += vl) {
+        const svbool_t pg = svwhilelt_b32(d, dim);
+        const svfloat32_t v = bf16_load_f32_sve(pg, row + d);
+        acc0 = svmla_f32_m(pg, acc0, v, v);
+    }
+    acc0 = svadd_f32_x(pg_all, acc0, acc1);
+    acc2 = svadd_f32_x(pg_all, acc2, acc3);
+    const svfloat32_t acc = svadd_f32_x(pg_all, acc0, acc2);
+    return svaddv_f32(pg_all, acc);
+}
+
+void rmsnorm_bf16_row_to_bf16_sve(const uint16_t* src,
+                                  uint16_t* dst,
+                                  const float* weight,
+                                  int64_t dim,
+                                  double eps) {
+    const float inv_rms = 1.0f / std::sqrt(
+        sum_sq_bf16_sve(src, dim) / static_cast<float>(dim) +
+        static_cast<float>(eps));
+    const int64_t vl = static_cast<int64_t>(svcntw());
+    int64_t d = 0;
+    for (; d < dim; d += vl) {
+        const svbool_t pg = svwhilelt_b32(d, dim);
+        const svfloat32_t x = bf16_load_f32_sve(pg, src + d);
+        const svfloat32_t w = svld1_f32(pg, weight + d);
+        const svfloat32_t y = svmul_f32_x(
+            pg, svmul_n_f32_x(pg, x, inv_rms), w);
+        bf16_store_f32_sve(pg, dst + d, y);
+    }
+}
+#endif
+
+[[maybe_unused]] float sum_sq_bf16_scalar(const uint16_t* row, int64_t dim) {
+    float sum = 0.0f;
+    for (int64_t i = 0; i < dim; ++i) {
+        const float value = bf16_u16_to_float(row[i]);
+        sum += value * value;
+    }
+    return sum;
+}
+
+[[maybe_unused]] void rmsnorm_bf16_row_to_bf16_scalar(const uint16_t* src,
+                                                      uint16_t* dst,
+                                                      const float* weight,
+                                                      int64_t dim,
+                                                      double eps) {
+    const float inv_rms = 1.0f / std::sqrt(
+        sum_sq_bf16_scalar(src, dim) / static_cast<float>(dim) +
+        static_cast<float>(eps));
+    for (int64_t i = 0; i < dim; ++i) {
+        const float value = bf16_u16_to_float(src[i]) * inv_rms * weight[i];
+        dst[i] = float_to_bf16_u16(value);
+    }
+}
+
+void rmsnorm_bf16_row_to_bf16(const uint16_t* src,
+                              uint16_t* dst,
+                              const float* weight,
+                              int64_t dim,
+                              double eps) {
+#if defined(__ARM_FEATURE_SVE)
+    rmsnorm_bf16_row_to_bf16_sve(src, dst, weight, dim, eps);
+#else
+    rmsnorm_bf16_row_to_bf16_scalar(src, dst, weight, dim, eps);
+#endif
+}
+
+void check_qkv_rmsnorm_args(const PackedWeight& fused_wqa_wkv,
+                            int64_t q_lora_rank,
+                            int64_t kv_dim,
+                            double eps) {
+    check_int_arg(q_lora_rank, "q_lora_rank");
+    check_int_arg(kv_dim, "kv_dim");
+    TORCH_CHECK(fused_wqa_wkv.N == q_lora_rank + kv_dim,
+                "fused_wqa_wkv N mismatch for q/kv RMSNorm: expected ",
+                q_lora_rank + kv_dim, ", got ", fused_wqa_wkv.N);
+    TORCH_CHECK(eps > 0.0, "RMSNorm eps must be positive, got ", eps);
+}
+
+void rmsnorm_qkv_from_qr_kv_ptr(const uint16_t* src,
+                                int64_t qr_kv_stride,
+                                uint16_t* qr_dst,
+                                uint16_t* kv_dst,
+                                const float* q_weight,
+                                const float* kv_weight,
+                                int64_t q_lora_rank,
+                                int64_t kv_dim,
+                                double eps,
+                                int64_t row_start,
+                                int64_t row_count) {
+    for (int64_t row = 0; row < row_count; ++row) {
+        const int64_t global_row = row_start + row;
+        const uint16_t* row_src = src + row * qr_kv_stride;
+        rmsnorm_bf16_row_to_bf16(row_src,
+                                 qr_dst + global_row * q_lora_rank,
+                                 q_weight, q_lora_rank, eps);
+        rmsnorm_bf16_row_to_bf16(row_src + q_lora_rank,
+                                 kv_dst + global_row * kv_dim,
+                                 kv_weight, kv_dim, eps);
+    }
+}
+
+void rmsnorm_qkv_from_qr_kv(const at::Tensor& qr_kv,
+                            int64_t qr_kv_stride,
+                            at::Tensor& qr,
+                            at::Tensor& kv,
+                            const float* q_weight,
+                            const float* kv_weight,
+                            int64_t q_lora_rank,
+                            int64_t kv_dim,
+                            double eps,
+                            int64_t row_start,
+                            int64_t row_count) {
+    rmsnorm_qkv_from_qr_kv_ptr(bf16_data_const(qr_kv), qr_kv_stride,
+                               bf16_data(qr), bf16_data(kv), q_weight,
+                               kv_weight, q_lora_rank, kv_dim, eps,
+                               row_start, row_count);
+}
+
 void check_hidden_states_for_attn_gemm(const at::Tensor& hidden_states,
                                        int64_t* M,
                                        int64_t* K) {
@@ -563,6 +776,11 @@ AttnGemmSelectedOutputs run_attn_gemm_selected_mt(
 
     std::vector<int> bind_failed(static_cast<size_t>(num_threads), 0);
     const int old_dynamic = omp_get_dynamic();
+#if defined(__linux__)
+    cpu_set_t caller_affinity;
+    const bool restore_caller_affinity =
+        get_current_thread_affinity(&caller_affinity);
+#endif
     omp_set_dynamic(0);
 
 #pragma omp parallel num_threads(num_threads)
@@ -612,6 +830,13 @@ AttnGemmSelectedOutputs run_attn_gemm_selected_mt(
     }
 
     omp_set_dynamic(old_dynamic);
+#if defined(__linux__)
+    if (restore_caller_affinity) {
+        TORCH_CHECK(set_current_thread_affinity(&caller_affinity),
+                    "failed to restore caller CPU affinity after "
+                    "deepseek_v4 attn GEMM fused mt");
+    }
+#endif
     for (size_t i = 0; i < bind_failed.size(); ++i) {
         TORCH_CHECK(bind_failed[i] == 0,
                     "failed to bind OpenMP thread ", i, " to CPU ",
@@ -645,6 +870,226 @@ AttnGemmSelectedOutputs run_attn_gemm_selected_mt(
             narrow_output_if_needed(indexer_weights_acc, indexer_weights_proj->N,
                                     indexer_weights_proj->N_pad);
 #endif
+    }
+    return outputs;
+#endif
+}
+
+template <bool kRunCompressor, bool kRunIndexer>
+AttnGemmNormedOutputs run_attn_gemm_normed_serial(
+    const at::Tensor& hidden_states,
+    const PackedWeight& fused_wqa_wkv,
+    const PackedWeight* compressor_kv_score,
+    const PackedWeight* indexer_compressor_kv_score,
+    const PackedWeight* indexer_weights_proj,
+    at::Tensor q_norm_weight,
+    at::Tensor kv_norm_weight,
+    int64_t q_lora_rank,
+    int64_t kv_dim,
+    double eps) {
+    int64_t M = 0;
+    int64_t K = 0;
+    check_hidden_states_for_attn_gemm(hidden_states, &M, &K);
+    check_qkv_rmsnorm_args(fused_wqa_wkv, q_lora_rank, kv_dim, eps);
+    at::Tensor q_weight_f32 = checked_norm_weight_f32(
+        q_norm_weight, q_lora_rank, "q_norm_weight");
+    at::Tensor kv_weight_f32 = checked_norm_weight_f32(
+        kv_norm_weight, kv_dim, "kv_norm_weight");
+
+    AttnGemmSelectedOutputs selected =
+        run_attn_gemm_selected_serial<kRunCompressor, kRunIndexer>(
+            hidden_states, fused_wqa_wkv, compressor_kv_score,
+            indexer_compressor_kv_score, indexer_weights_proj);
+
+    AttnGemmNormedOutputs outputs;
+    outputs.qr = at::empty({M, q_lora_rank}, hidden_states.options());
+    outputs.kv = at::empty({M, kv_dim}, hidden_states.options());
+    rmsnorm_qkv_from_qr_kv(selected.qr_kv, selected.qr_kv.size(1), outputs.qr,
+                           outputs.kv, q_weight_f32.data_ptr<float>(),
+                           kv_weight_f32.data_ptr<float>(), q_lora_rank,
+                           kv_dim, eps, 0, M);
+    if constexpr (kRunCompressor) {
+        outputs.kv_score = selected.kv_score;
+    }
+    if constexpr (kRunIndexer) {
+        outputs.indexer_kv_score = selected.indexer_kv_score;
+        outputs.indexer_weights = selected.indexer_weights;
+    }
+    return outputs;
+}
+
+template <bool kRunCompressor, bool kRunIndexer>
+AttnGemmNormedOutputs run_attn_gemm_normed_mt(
+    const at::Tensor& hidden_states,
+    const PackedWeight& fused_wqa_wkv,
+    const PackedWeight* compressor_kv_score,
+    const PackedWeight* indexer_compressor_kv_score,
+    const PackedWeight* indexer_weights_proj,
+    at::Tensor q_norm_weight,
+    at::Tensor kv_norm_weight,
+    int64_t q_lora_rank,
+    int64_t kv_dim,
+    double eps,
+    const std::vector<int64_t>& core_ids) {
+    if (core_ids.empty()) {
+        return run_attn_gemm_normed_serial<kRunCompressor, kRunIndexer>(
+            hidden_states, fused_wqa_wkv, compressor_kv_score,
+            indexer_compressor_kv_score, indexer_weights_proj, q_norm_weight,
+            kv_norm_weight, q_lora_rank, kv_dim, eps);
+    }
+
+#if !defined(_OPENMP) || !defined(__linux__)
+    return run_attn_gemm_normed_serial<kRunCompressor, kRunIndexer>(
+        hidden_states, fused_wqa_wkv, compressor_kv_score,
+        indexer_compressor_kv_score, indexer_weights_proj, q_norm_weight,
+        kv_norm_weight, q_lora_rank, kv_dim, eps);
+#else
+    int64_t M = 0;
+    int64_t K = 0;
+    check_hidden_states_for_attn_gemm(hidden_states, &M, &K);
+    TORCH_CHECK(core_ids.size() <=
+                    static_cast<size_t>(std::numeric_limits<int>::max()),
+                "core_ids size exceeds int32 limit");
+    for (int64_t core_id : core_ids) {
+        TORCH_CHECK(core_id >= 0, "core_ids must be non-negative, got ",
+                    core_id);
+    }
+    check_selected_weights<kRunCompressor, kRunIndexer>(
+        fused_wqa_wkv, compressor_kv_score, indexer_compressor_kv_score,
+        indexer_weights_proj, K);
+    check_qkv_rmsnorm_args(fused_wqa_wkv, q_lora_rank, kv_dim, eps);
+    at::Tensor q_weight_f32 = checked_norm_weight_f32(
+        q_norm_weight, q_lora_rank, "q_norm_weight");
+    at::Tensor kv_weight_f32 = checked_norm_weight_f32(
+        kv_norm_weight, kv_dim, "kv_norm_weight");
+
+    const int64_t K_pad = fused_wqa_wkv.K_pad;
+    at::Tensor a_storage = make_padded_hidden_states(hidden_states, M, K, K_pad);
+
+    const int64_t num_threads = static_cast<int64_t>(core_ids.size());
+    const int64_t rows_per_thread = ceil_div_int64(std::max<int64_t>(M, 1),
+                                                   num_threads);
+    const int64_t scratch_stride =
+        std::max<int64_t>(1, rows_per_thread * K_pad * 2);
+    at::Tensor scratch = at::empty({num_threads * scratch_stride},
+                                   hidden_states.options());
+    at::Tensor qr_kv_tmp = at::empty(
+        {num_threads, rows_per_thread, fused_wqa_wkv.N_pad},
+        hidden_states.options());
+
+    AttnGemmNormedOutputs outputs;
+    outputs.qr = at::empty({M, q_lora_rank}, hidden_states.options());
+    outputs.kv = at::empty({M, kv_dim}, hidden_states.options());
+    at::Tensor kv_score_acc;
+    at::Tensor indexer_kv_score_acc;
+    at::Tensor indexer_weights_acc;
+    if constexpr (kRunCompressor) {
+        kv_score_acc = at::zeros(
+            {M, compressor_kv_score->N_pad},
+            at::TensorOptions().device(hidden_states.device()).dtype(at::kFloat));
+    }
+    if constexpr (kRunIndexer) {
+        indexer_kv_score_acc = at::zeros(
+            {M, indexer_compressor_kv_score->N_pad},
+            at::TensorOptions().device(hidden_states.device()).dtype(at::kFloat));
+        indexer_weights_acc = at::empty({M, indexer_weights_proj->N_pad},
+                                        hidden_states.options());
+    }
+
+    const uint16_t* a_ptr = bf16_data_const(a_storage);
+    const uint16_t* fused_weight_ptr = bf16_data_const(fused_wqa_wkv.tensor);
+    uint16_t* scratch_ptr = bf16_data(scratch);
+    uint16_t* tmp_ptr = bf16_data(qr_kv_tmp);
+    uint16_t* qr_ptr = bf16_data(outputs.qr);
+    uint16_t* kv_ptr = bf16_data(outputs.kv);
+    const float* q_weight_ptr = q_weight_f32.data_ptr<float>();
+    const float* kv_weight_ptr = kv_weight_f32.data_ptr<float>();
+
+    std::vector<int> bind_failed(static_cast<size_t>(num_threads), 0);
+    const int old_dynamic = omp_get_dynamic();
+#if defined(__linux__)
+    cpu_set_t caller_affinity;
+    const bool restore_caller_affinity =
+        get_current_thread_affinity(&caller_affinity);
+#endif
+    omp_set_dynamic(0);
+
+#pragma omp parallel num_threads(num_threads)
+    {
+        const int tid = omp_get_thread_num();
+        if (tid < static_cast<int>(num_threads) &&
+            !bind_current_thread_to_cpu(core_ids[static_cast<size_t>(tid)])) {
+            bind_failed[static_cast<size_t>(tid)] = 1;
+        }
+
+        const int64_t row_start = static_cast<int64_t>(tid) * rows_per_thread;
+        const int64_t row_count =
+            row_start >= M ? 0 : std::min<int64_t>(rows_per_thread,
+                                                   M - row_start);
+        const int64_t scratch_offset =
+            static_cast<int64_t>(tid) * scratch_stride;
+        uint16_t* thread_tmp =
+            tmp_ptr + static_cast<int64_t>(tid) * rows_per_thread *
+                          fused_wqa_wkv.N_pad;
+
+        if (row_count > 0) {
+            dispatch_bf16_nld_gemm(
+                a_ptr + row_start * K_pad,
+                fused_weight_ptr,
+                thread_tmp,
+                scratch_ptr + scratch_offset,
+                static_cast<int>(row_count),
+                static_cast<int>(K_pad),
+                static_cast<int>(fused_wqa_wkv.N_pad),
+                static_cast<int>(fused_wqa_wkv.N_pad));
+            rmsnorm_qkv_from_qr_kv_ptr(
+                thread_tmp, fused_wqa_wkv.N_pad, qr_ptr, kv_ptr,
+                q_weight_ptr, kv_weight_ptr, q_lora_rank, kv_dim, eps,
+                row_start, row_count);
+        }
+
+        if constexpr (kRunCompressor) {
+            dispatch_fp32_gemm_to_output(a_storage, *compressor_kv_score,
+                                         kv_score_acc, scratch, row_start,
+                                         row_count, scratch_offset);
+        }
+        if constexpr (kRunIndexer) {
+            dispatch_fp32_gemm_to_output(a_storage,
+                                         *indexer_compressor_kv_score,
+                                         indexer_kv_score_acc, scratch,
+                                         row_start, row_count, scratch_offset);
+            dispatch_bf16_gemm_to_output(a_storage, *indexer_weights_proj,
+                                         indexer_weights_acc, scratch,
+                                         row_start, row_count, scratch_offset);
+        }
+    }
+
+    omp_set_dynamic(old_dynamic);
+#if defined(__linux__)
+    if (restore_caller_affinity) {
+        TORCH_CHECK(set_current_thread_affinity(&caller_affinity),
+                    "failed to restore caller CPU affinity after "
+                    "deepseek_v4 attn GEMM+RMSNorm fused mt");
+    }
+#endif
+    for (size_t i = 0; i < bind_failed.size(); ++i) {
+        TORCH_CHECK(bind_failed[i] == 0,
+                    "failed to bind OpenMP thread ", i, " to CPU ",
+                    core_ids[i]);
+    }
+
+    if constexpr (kRunCompressor) {
+        outputs.kv_score = narrow_output_if_needed(
+            kv_score_acc, compressor_kv_score->N,
+            compressor_kv_score->N_pad);
+    }
+    if constexpr (kRunIndexer) {
+        outputs.indexer_kv_score = narrow_output_if_needed(
+            indexer_kv_score_acc, indexer_compressor_kv_score->N,
+            indexer_compressor_kv_score->N_pad);
+        outputs.indexer_weights =
+            narrow_output_if_needed(indexer_weights_acc, indexer_weights_proj->N,
+                                    indexer_weights_proj->N_pad);
     }
     return outputs;
 #endif
@@ -842,6 +1287,212 @@ fused_wqa_wkv_compressor_kv_score_indexer_compressor_kv_score_indexer_weights_pr
         hidden_states, fused_wqa_wkv, &compressor_kv_score,
         &indexer_compressor_kv_score, &indexer_weights_proj, core_ids);
     return std::make_tuple(outputs.qr_kv, outputs.kv_score,
+                           outputs.indexer_kv_score,
+                           outputs.indexer_weights);
+#endif
+}
+
+std::tuple<at::Tensor, at::Tensor>
+fused_wqa_wkv_qkv_rmsnorm_fused(at::Tensor hidden_states,
+                                at::Tensor fused_wqa_wkv_packed,
+                                int64_t fused_wqa_wkv_K,
+                                int64_t fused_wqa_wkv_N,
+                                at::Tensor q_norm_weight,
+                                at::Tensor kv_norm_weight,
+                                int64_t q_lora_rank,
+                                int64_t kv_dim,
+                                double eps) {
+#ifndef __aarch64__
+    TORCH_CHECK(false,
+                "deepseek_v4 attn dense GEMM+RMSNorm fused requires AArch64");
+#else
+    PackedWeight fused_wqa_wkv = checked_packed_weight(
+        fused_wqa_wkv_packed, fused_wqa_wkv_K, fused_wqa_wkv_N,
+        "fused_wqa_wkv");
+    AttnGemmNormedOutputs outputs =
+        run_attn_gemm_normed_serial<false, false>(
+            hidden_states, fused_wqa_wkv, nullptr, nullptr, nullptr,
+            q_norm_weight, kv_norm_weight, q_lora_rank, kv_dim, eps);
+    return std::make_tuple(outputs.qr, outputs.kv);
+#endif
+}
+
+std::tuple<at::Tensor, at::Tensor>
+fused_wqa_wkv_qkv_rmsnorm_fused_mt(at::Tensor hidden_states,
+                                   at::Tensor fused_wqa_wkv_packed,
+                                   int64_t fused_wqa_wkv_K,
+                                   int64_t fused_wqa_wkv_N,
+                                   at::Tensor q_norm_weight,
+                                   at::Tensor kv_norm_weight,
+                                   int64_t q_lora_rank,
+                                   int64_t kv_dim,
+                                   double eps,
+                                   std::vector<int64_t> core_ids) {
+#ifndef __aarch64__
+    TORCH_CHECK(false,
+                "deepseek_v4 attn dense GEMM+RMSNorm fused requires AArch64");
+#else
+    PackedWeight fused_wqa_wkv = checked_packed_weight(
+        fused_wqa_wkv_packed, fused_wqa_wkv_K, fused_wqa_wkv_N,
+        "fused_wqa_wkv");
+    AttnGemmNormedOutputs outputs = run_attn_gemm_normed_mt<false, false>(
+        hidden_states, fused_wqa_wkv, nullptr, nullptr, nullptr,
+        q_norm_weight, kv_norm_weight, q_lora_rank, kv_dim, eps, core_ids);
+    return std::make_tuple(outputs.qr, outputs.kv);
+#endif
+}
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor>
+fused_wqa_wkv_compressor_kv_score_qkv_rmsnorm_fused(
+    at::Tensor hidden_states,
+    at::Tensor fused_wqa_wkv_packed,
+    int64_t fused_wqa_wkv_K,
+    int64_t fused_wqa_wkv_N,
+    at::Tensor compressor_kv_score_packed,
+    int64_t compressor_kv_score_K,
+    int64_t compressor_kv_score_N,
+    at::Tensor q_norm_weight,
+    at::Tensor kv_norm_weight,
+    int64_t q_lora_rank,
+    int64_t kv_dim,
+    double eps) {
+#ifndef __aarch64__
+    TORCH_CHECK(false,
+                "deepseek_v4 attn C128A GEMM+RMSNorm fused requires AArch64");
+#else
+    PackedWeight fused_wqa_wkv = checked_packed_weight(
+        fused_wqa_wkv_packed, fused_wqa_wkv_K, fused_wqa_wkv_N,
+        "fused_wqa_wkv");
+    PackedWeight compressor_kv_score = checked_packed_weight(
+        compressor_kv_score_packed, compressor_kv_score_K,
+        compressor_kv_score_N, "compressor_kv_score");
+    AttnGemmNormedOutputs outputs =
+        run_attn_gemm_normed_serial<true, false>(
+            hidden_states, fused_wqa_wkv, &compressor_kv_score, nullptr,
+            nullptr, q_norm_weight, kv_norm_weight, q_lora_rank, kv_dim, eps);
+    return std::make_tuple(outputs.qr, outputs.kv, outputs.kv_score);
+#endif
+}
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor>
+fused_wqa_wkv_compressor_kv_score_qkv_rmsnorm_fused_mt(
+    at::Tensor hidden_states,
+    at::Tensor fused_wqa_wkv_packed,
+    int64_t fused_wqa_wkv_K,
+    int64_t fused_wqa_wkv_N,
+    at::Tensor compressor_kv_score_packed,
+    int64_t compressor_kv_score_K,
+    int64_t compressor_kv_score_N,
+    at::Tensor q_norm_weight,
+    at::Tensor kv_norm_weight,
+    int64_t q_lora_rank,
+    int64_t kv_dim,
+    double eps,
+    std::vector<int64_t> core_ids) {
+#ifndef __aarch64__
+    TORCH_CHECK(false,
+                "deepseek_v4 attn C128A GEMM+RMSNorm fused requires AArch64");
+#else
+    PackedWeight fused_wqa_wkv = checked_packed_weight(
+        fused_wqa_wkv_packed, fused_wqa_wkv_K, fused_wqa_wkv_N,
+        "fused_wqa_wkv");
+    PackedWeight compressor_kv_score = checked_packed_weight(
+        compressor_kv_score_packed, compressor_kv_score_K,
+        compressor_kv_score_N, "compressor_kv_score");
+    AttnGemmNormedOutputs outputs = run_attn_gemm_normed_mt<true, false>(
+        hidden_states, fused_wqa_wkv, &compressor_kv_score, nullptr, nullptr,
+        q_norm_weight, kv_norm_weight, q_lora_rank, kv_dim, eps, core_ids);
+    return std::make_tuple(outputs.qr, outputs.kv, outputs.kv_score);
+#endif
+}
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+fused_wqa_wkv_compressor_kv_score_indexer_compressor_kv_score_indexer_weights_proj_qkv_rmsnorm_fused(
+    at::Tensor hidden_states,
+    at::Tensor fused_wqa_wkv_packed,
+    int64_t fused_wqa_wkv_K,
+    int64_t fused_wqa_wkv_N,
+    at::Tensor compressor_kv_score_packed,
+    int64_t compressor_kv_score_K,
+    int64_t compressor_kv_score_N,
+    at::Tensor indexer_compressor_kv_score_packed,
+    int64_t indexer_compressor_kv_score_K,
+    int64_t indexer_compressor_kv_score_N,
+    at::Tensor indexer_weights_proj_packed,
+    int64_t indexer_weights_proj_K,
+    int64_t indexer_weights_proj_N,
+    at::Tensor q_norm_weight,
+    at::Tensor kv_norm_weight,
+    int64_t q_lora_rank,
+    int64_t kv_dim,
+    double eps) {
+#ifndef __aarch64__
+    TORCH_CHECK(false, "deepseek_v4 attn C4A GEMM+RMSNorm fused requires AArch64");
+#else
+    PackedWeight fused_wqa_wkv = checked_packed_weight(
+        fused_wqa_wkv_packed, fused_wqa_wkv_K, fused_wqa_wkv_N,
+        "fused_wqa_wkv");
+    PackedWeight compressor_kv_score = checked_packed_weight(
+        compressor_kv_score_packed, compressor_kv_score_K,
+        compressor_kv_score_N, "compressor_kv_score");
+    PackedWeight indexer_compressor_kv_score = checked_packed_weight(
+        indexer_compressor_kv_score_packed, indexer_compressor_kv_score_K,
+        indexer_compressor_kv_score_N, "indexer_compressor_kv_score");
+    PackedWeight indexer_weights_proj = checked_packed_weight(
+        indexer_weights_proj_packed, indexer_weights_proj_K,
+        indexer_weights_proj_N, "indexer_weights_proj");
+    AttnGemmNormedOutputs outputs =
+        run_attn_gemm_normed_serial<true, true>(
+            hidden_states, fused_wqa_wkv, &compressor_kv_score,
+            &indexer_compressor_kv_score, &indexer_weights_proj,
+            q_norm_weight, kv_norm_weight, q_lora_rank, kv_dim, eps);
+    return std::make_tuple(outputs.qr, outputs.kv, outputs.kv_score,
+                           outputs.indexer_kv_score,
+                           outputs.indexer_weights);
+#endif
+}
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+fused_wqa_wkv_compressor_kv_score_indexer_compressor_kv_score_indexer_weights_proj_qkv_rmsnorm_fused_mt(
+    at::Tensor hidden_states,
+    at::Tensor fused_wqa_wkv_packed,
+    int64_t fused_wqa_wkv_K,
+    int64_t fused_wqa_wkv_N,
+    at::Tensor compressor_kv_score_packed,
+    int64_t compressor_kv_score_K,
+    int64_t compressor_kv_score_N,
+    at::Tensor indexer_compressor_kv_score_packed,
+    int64_t indexer_compressor_kv_score_K,
+    int64_t indexer_compressor_kv_score_N,
+    at::Tensor indexer_weights_proj_packed,
+    int64_t indexer_weights_proj_K,
+    int64_t indexer_weights_proj_N,
+    at::Tensor q_norm_weight,
+    at::Tensor kv_norm_weight,
+    int64_t q_lora_rank,
+    int64_t kv_dim,
+    double eps,
+    std::vector<int64_t> core_ids) {
+#ifndef __aarch64__
+    TORCH_CHECK(false, "deepseek_v4 attn C4A GEMM+RMSNorm fused requires AArch64");
+#else
+    PackedWeight fused_wqa_wkv = checked_packed_weight(
+        fused_wqa_wkv_packed, fused_wqa_wkv_K, fused_wqa_wkv_N,
+        "fused_wqa_wkv");
+    PackedWeight compressor_kv_score = checked_packed_weight(
+        compressor_kv_score_packed, compressor_kv_score_K,
+        compressor_kv_score_N, "compressor_kv_score");
+    PackedWeight indexer_compressor_kv_score = checked_packed_weight(
+        indexer_compressor_kv_score_packed, indexer_compressor_kv_score_K,
+        indexer_compressor_kv_score_N, "indexer_compressor_kv_score");
+    PackedWeight indexer_weights_proj = checked_packed_weight(
+        indexer_weights_proj_packed, indexer_weights_proj_K,
+        indexer_weights_proj_N, "indexer_weights_proj");
+    AttnGemmNormedOutputs outputs = run_attn_gemm_normed_mt<true, true>(
+        hidden_states, fused_wqa_wkv, &compressor_kv_score,
+        &indexer_compressor_kv_score, &indexer_weights_proj, q_norm_weight,
+        kv_norm_weight, q_lora_rank, kv_dim, eps, core_ids);
+    return std::make_tuple(outputs.qr, outputs.kv, outputs.kv_score,
                            outputs.indexer_kv_score,
                            outputs.indexer_weights);
 #endif

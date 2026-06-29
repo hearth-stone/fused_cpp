@@ -479,6 +479,7 @@ if is_aarch64:
         i8gemm_required.extend([
             os.path.join(bf16gemm_lib, "i8gemm_sve.c"),
             os.path.join(bf16gemm_lib, "i8gemm_sve.S"),
+            os.path.join(bf16gemm_lib, "i8gemm_hybrid.S"),
         ])
     else:
         i8gemm_required.extend([
@@ -491,6 +492,7 @@ if is_aarch64:
             i8gemm_c_sources.append(os.path.join(bf16gemm_lib, "i8gemm_sve.c"))
             i8gemm_asm_sources.extend([
                 os.path.join(bf16gemm_lib, "i8gemm_sve.S"),
+                os.path.join(bf16gemm_lib, "i8gemm_hybrid.S"),
                 os.path.join(bf16gemm_lib, "i8gemm_pack_a_neon.S"),
             ])
         else:

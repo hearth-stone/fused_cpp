@@ -71,8 +71,28 @@ try:
     from fused_cpp._C import (
         fused_wqa_wkv_compressor_kv_score_fused_mt as _c128a_mt_impl,
     )
+    from fused_cpp._C import (
+        fused_wqa_wkv_compressor_kv_score_indexer_compressor_kv_score_indexer_weights_proj_qkv_rmsnorm_fused
+        as _fused_normed_impl,
+    )
+    from fused_cpp._C import (
+        fused_wqa_wkv_compressor_kv_score_indexer_compressor_kv_score_indexer_weights_proj_qkv_rmsnorm_fused_mt
+        as _fused_normed_mt_impl,
+    )
+    from fused_cpp._C import (
+        fused_wqa_wkv_compressor_kv_score_qkv_rmsnorm_fused
+        as _c128a_normed_impl,
+    )
+    from fused_cpp._C import (
+        fused_wqa_wkv_compressor_kv_score_qkv_rmsnorm_fused_mt
+        as _c128a_normed_mt_impl,
+    )
     from fused_cpp._C import fused_wqa_wkv_fused as _dense_impl
     from fused_cpp._C import fused_wqa_wkv_fused_mt as _dense_mt_impl
+    from fused_cpp._C import fused_wqa_wkv_qkv_rmsnorm_fused as _dense_normed_impl
+    from fused_cpp._C import (
+        fused_wqa_wkv_qkv_rmsnorm_fused_mt as _dense_normed_mt_impl,
+    )
 
     _HAS_DEEPSEEK_V4_ATTN_GEMM_FUSED = True
 except (ImportError, AttributeError):
@@ -83,6 +103,12 @@ except (ImportError, AttributeError):
     _dense_mt_impl = None
     _c128a_impl = None
     _c128a_mt_impl = None
+    _dense_normed_impl = None
+    _dense_normed_mt_impl = None
+    _c128a_normed_impl = None
+    _c128a_normed_mt_impl = None
+    _fused_normed_impl = None
+    _fused_normed_mt_impl = None
     _HAS_DEEPSEEK_V4_ATTN_GEMM_FUSED = False
 
 
@@ -354,16 +380,155 @@ def fused_wqa_wkv_compressor_kv_score_indexer_compressor_kv_score_indexer_weight
     )
 
 
+def fused_wqa_wkv_compressor_kv_score_indexer_compressor_kv_score_indexer_weights_proj_qkv_rmsnorm_fused_prepacked(
+    hidden_states: torch.Tensor,
+    weights: PreparedDeepSeekV4AttnGemmWeights,
+    q_norm_weight: torch.Tensor,
+    kv_norm_weight: torch.Tensor,
+    q_lora_rank: int,
+    kv_dim: int,
+    eps: float,
+    cores: Optional[Sequence[int]] = None,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor | None,
+    torch.Tensor | None,
+    torch.Tensor | None,
+]:
+    """Run pre-packed input GEMMs and return RMS-normalized qr/kv outputs."""
+    if not _HAS_DEEPSEEK_V4_ATTN_GEMM_FUSED:
+        raise RuntimeError("DeepSeek V4 attn GEMM fused kernel is unavailable")
+    normalized_core_ids = _normalize_core_ids(cores)
+    variant = weights.variant
+    q_lora_rank = int(q_lora_rank)
+    kv_dim = int(kv_dim)
+    eps = float(eps)
+
+    if variant == "dense":
+        if normalized_core_ids:
+            qr, kv = _dense_normed_mt_impl(
+                hidden_states,
+                weights.fused_wqa_wkv[0],
+                weights.fused_wqa_wkv[1],
+                weights.fused_wqa_wkv[2],
+                q_norm_weight,
+                kv_norm_weight,
+                q_lora_rank,
+                kv_dim,
+                eps,
+                normalized_core_ids,
+            )
+        else:
+            qr, kv = _dense_normed_impl(
+                hidden_states,
+                weights.fused_wqa_wkv[0],
+                weights.fused_wqa_wkv[1],
+                weights.fused_wqa_wkv[2],
+                q_norm_weight,
+                kv_norm_weight,
+                q_lora_rank,
+                kv_dim,
+                eps,
+            )
+        return qr, kv, None, None, None
+
+    if variant == "c128a":
+        assert weights.compressor_kv_score is not None
+        if normalized_core_ids:
+            qr, kv, kv_score = _c128a_normed_mt_impl(
+                hidden_states,
+                weights.fused_wqa_wkv[0],
+                weights.fused_wqa_wkv[1],
+                weights.fused_wqa_wkv[2],
+                weights.compressor_kv_score[0],
+                weights.compressor_kv_score[1],
+                weights.compressor_kv_score[2],
+                q_norm_weight,
+                kv_norm_weight,
+                q_lora_rank,
+                kv_dim,
+                eps,
+                normalized_core_ids,
+            )
+        else:
+            qr, kv, kv_score = _c128a_normed_impl(
+                hidden_states,
+                weights.fused_wqa_wkv[0],
+                weights.fused_wqa_wkv[1],
+                weights.fused_wqa_wkv[2],
+                weights.compressor_kv_score[0],
+                weights.compressor_kv_score[1],
+                weights.compressor_kv_score[2],
+                q_norm_weight,
+                kv_norm_weight,
+                q_lora_rank,
+                kv_dim,
+                eps,
+            )
+        return qr, kv, kv_score, None, None
+
+    assert weights.compressor_kv_score is not None
+    assert weights.indexer_compressor_kv_score is not None
+    assert weights.indexer_weights_proj is not None
+    if normalized_core_ids:
+        return _fused_normed_mt_impl(
+            hidden_states,
+            weights.fused_wqa_wkv[0],
+            weights.fused_wqa_wkv[1],
+            weights.fused_wqa_wkv[2],
+            weights.compressor_kv_score[0],
+            weights.compressor_kv_score[1],
+            weights.compressor_kv_score[2],
+            weights.indexer_compressor_kv_score[0],
+            weights.indexer_compressor_kv_score[1],
+            weights.indexer_compressor_kv_score[2],
+            weights.indexer_weights_proj[0],
+            weights.indexer_weights_proj[1],
+            weights.indexer_weights_proj[2],
+            q_norm_weight,
+            kv_norm_weight,
+            q_lora_rank,
+            kv_dim,
+            eps,
+            normalized_core_ids,
+        )
+    return _fused_normed_impl(
+        hidden_states,
+        weights.fused_wqa_wkv[0],
+        weights.fused_wqa_wkv[1],
+        weights.fused_wqa_wkv[2],
+        weights.compressor_kv_score[0],
+        weights.compressor_kv_score[1],
+        weights.compressor_kv_score[2],
+        weights.indexer_compressor_kv_score[0],
+        weights.indexer_compressor_kv_score[1],
+        weights.indexer_compressor_kv_score[2],
+        weights.indexer_weights_proj[0],
+        weights.indexer_weights_proj[1],
+        weights.indexer_weights_proj[2],
+        q_norm_weight,
+        kv_norm_weight,
+        q_lora_rank,
+        kv_dim,
+        eps,
+    )
+
+
 prepare_deepseek_v4_attn_gemm_weights = (
     fused_wqa_wkv_compressor_kv_score_indexer_compressor_kv_score_indexer_weights_proj_fused_prepare_weights
 )
 deepseek_v4_attn_gemm_fused_prepacked = (
     fused_wqa_wkv_compressor_kv_score_indexer_compressor_kv_score_indexer_weights_proj_fused_prepacked
 )
+deepseek_v4_attn_gemm_fused_prepacked_normed = (
+    fused_wqa_wkv_compressor_kv_score_indexer_compressor_kv_score_indexer_weights_proj_qkv_rmsnorm_fused_prepacked
+)
 
 
 __all__ = [
     "deepseek_v4_attn_gemm_fused_prepacked",
+    "deepseek_v4_attn_gemm_fused_prepacked_normed",
     "prepare_deepseek_v4_attn_gemm_weights",
     "PreparedDeepSeekV4AttnGemmWeights",
     "PreparedWeight",
@@ -377,4 +542,5 @@ __all__ = [
     "fused_wqa_wkv_compressor_kv_score_indexer_compressor_kv_score_indexer_weights_proj_fused_prepare",
     "fused_wqa_wkv_compressor_kv_score_indexer_compressor_kv_score_indexer_weights_proj_fused_prepare_weights",
     "fused_wqa_wkv_compressor_kv_score_indexer_compressor_kv_score_indexer_weights_proj_fused_prepacked",
+    "fused_wqa_wkv_compressor_kv_score_indexer_compressor_kv_score_indexer_weights_proj_qkv_rmsnorm_fused_prepacked",
 ]
