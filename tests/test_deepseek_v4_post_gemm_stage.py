@@ -9,6 +9,8 @@ from fused_cpp.deepseek_v4_post_gemm_stage import (
     PostGemmStageInputs,
     SWACacheState,
     SparseIndexerPrefillMetadata,
+    _HAS_DEEPSEEK_V4_POST_GEMM_C128A_PREPACKED,
+    _HAS_DEEPSEEK_V4_POST_GEMM_DENSE_PREPACKED,
     _HAS_DEEPSEEK_V4_POST_GEMM_STAGE,
     _HAS_DEEPSEEK_V4_POST_GEMM_STAGE_PREPACKED,
     post_gemm_parallel_stage_cpp,
@@ -126,6 +128,32 @@ def _make_inputs(seed: int = 0) -> PostGemmStageInputs:
     )
 
 
+def _make_dense_inputs(seed: int = 0) -> PostGemmStageInputs:
+    inputs = _make_inputs(seed)
+    inputs.kv_score = None
+    inputs.indexer_kv_score = None
+    inputs.indexer_weights = None
+    inputs.indexer_wq_b_weight = None
+    inputs.indexer_cos_sin_cache = None
+    inputs.mla_compressor = None
+    inputs.indexer_compressor = None
+    inputs.topk_indices_buffer = None
+    inputs.prefill = None
+    return inputs
+
+
+def _make_c128a_inputs(seed: int = 0) -> PostGemmStageInputs:
+    inputs = _make_inputs(seed)
+    inputs.indexer_kv_score = None
+    inputs.indexer_weights = None
+    inputs.indexer_wq_b_weight = None
+    inputs.indexer_cos_sin_cache = None
+    inputs.indexer_compressor = None
+    inputs.topk_indices_buffer = None
+    inputs.prefill = None
+    return inputs
+
+
 def _assert_close(actual: torch.Tensor, expected: torch.Tensor, name: str) -> None:
     torch.testing.assert_close(
         actual.float(),
@@ -149,6 +177,78 @@ def test_post_gemm_torch_baseline_smoke() -> None:
     assert bool((inputs.swa.kv_cache != 0).any())
     assert bool((inputs.mla_compressor.kv_cache != 0).any())
     assert bool((inputs.indexer_compressor.kv_cache != 0).any())
+
+
+def test_post_gemm_dense_torch_baseline_smoke() -> None:
+    inputs = _make_dense_inputs()
+
+    q, topk = post_gemm_parallel_stage_torch_baseline(inputs)
+
+    assert q.shape == (6, 2, 6)
+    assert q.dtype == torch.bfloat16
+    assert topk is None
+    assert bool((inputs.swa.kv_cache != 0).any())
+
+
+def test_post_gemm_c128a_torch_baseline_smoke() -> None:
+    inputs = _make_c128a_inputs()
+
+    q, topk = post_gemm_parallel_stage_torch_baseline(inputs)
+
+    assert q.shape == (6, 2, 6)
+    assert q.dtype == torch.bfloat16
+    assert topk is None
+    assert bool((inputs.swa.kv_cache != 0).any())
+    assert inputs.mla_compressor is not None
+    assert bool((inputs.mla_compressor.kv_cache != 0).any())
+
+
+@pytest.mark.skipif(
+    not _HAS_DEEPSEEK_V4_POST_GEMM_DENSE_PREPACKED,
+    reason="DeepSeek V4 dense post-GEMM prepacked C++ stage is unavailable",
+)
+def test_post_gemm_dense_cpp_prepacked_matches_torch_baseline() -> None:
+    ref_inputs = _make_dense_inputs(seed=11)
+    cpp_inputs = _make_dense_inputs(seed=11)
+    weights = prepare_deepseek_v4_post_gemm_weights(cpp_inputs.main_wq_b_weight)
+
+    ref_q, ref_topk = post_gemm_parallel_stage_torch_baseline(ref_inputs)
+    cpp_q, cpp_topk = post_gemm_parallel_stage_cpp_prepacked(cpp_inputs, weights)
+
+    _assert_close(cpp_q, ref_q, "dense q")
+    assert ref_topk is None
+    assert cpp_topk is None
+    _assert_close(cpp_inputs.swa.kv_cache, ref_inputs.swa.kv_cache, "dense swa kv_cache")
+
+
+@pytest.mark.skipif(
+    not _HAS_DEEPSEEK_V4_POST_GEMM_C128A_PREPACKED,
+    reason="DeepSeek V4 C128A post-GEMM prepacked C++ stage is unavailable",
+)
+def test_post_gemm_c128a_cpp_prepacked_matches_torch_baseline() -> None:
+    ref_inputs = _make_c128a_inputs(seed=12)
+    cpp_inputs = _make_c128a_inputs(seed=12)
+    weights = prepare_deepseek_v4_post_gemm_weights(cpp_inputs.main_wq_b_weight)
+
+    ref_q, ref_topk = post_gemm_parallel_stage_torch_baseline(ref_inputs)
+    cpp_q, cpp_topk = post_gemm_parallel_stage_cpp_prepacked(cpp_inputs, weights)
+
+    _assert_close(cpp_q, ref_q, "c128a q")
+    assert ref_topk is None
+    assert cpp_topk is None
+    _assert_close(cpp_inputs.swa.kv_cache, ref_inputs.swa.kv_cache, "c128a swa kv_cache")
+    assert cpp_inputs.mla_compressor is not None
+    assert ref_inputs.mla_compressor is not None
+    _assert_close(
+        cpp_inputs.mla_compressor.state_cache,
+        ref_inputs.mla_compressor.state_cache,
+        "c128a mla state_cache",
+    )
+    _assert_close(
+        cpp_inputs.mla_compressor.kv_cache,
+        ref_inputs.mla_compressor.kv_cache,
+        "c128a mla kv_cache",
+    )
 
 
 @pytest.mark.skipif(

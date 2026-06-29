@@ -2303,6 +2303,47 @@ void RunCompressor(const at::Tensor& kv_score,
   FUSED_CPP_PROFILE_ADD_IF_PTR(compress_norm_rope_insert_ms, phase_start);
 }
 
+at::Tensor RunMainQAndSwaPrepacked(const at::Tensor& qr,
+                                   const at::Tensor& kv,
+                                   const at::Tensor& positions,
+                                   const at::Tensor& main_wq_b_packed,
+                                   int64_t main_wq_b_K,
+                                   int64_t main_wq_b_N,
+                                   int64_t main_wq_b_Np,
+                                   const at::Tensor& main_cos_sin_cache,
+                                   const at::Tensor& swa_kv_cache,
+                                   const at::Tensor& swa_slot_mapping,
+                                   int64_t main_head_dim,
+                                   double q_eps,
+                                   PostGemmStageProfile* profile_ptr) {
+  TORCH_CHECK(main_head_dim > 0, "main_head_dim must be positive");
+  TORCH_CHECK(main_wq_b_N % main_head_dim == 0,
+              "main_wq_b_N must be divisible by main_head_dim");
+
+  const int64_t main_num_heads = main_wq_b_N / main_head_dim;
+  FUSED_CPP_PROFILE_START(phase_start);
+  at::Tensor q = LinearPrepackedToDtype(
+                     qr,
+                     main_wq_b_packed,
+                     main_wq_b_K,
+                     main_wq_b_N,
+                     main_wq_b_Np,
+                     qr.scalar_type())
+                     .reshape({qr.size(0), main_num_heads, main_head_dim});
+  FUSED_CPP_PROFILE_ADD_IF_PTR(
+      profile_ptr == nullptr ? nullptr : &profile_ptr->main_q_gemm_ms,
+      phase_start);
+
+  FUSED_CPP_PROFILE_RESTART(phase_start);
+  CheckMainQKvShape(q, kv);
+  QNormRopeFused(q, positions, main_cos_sin_cache, q_eps);
+  KvRopeCacheInsertFused(kv, swa_kv_cache, swa_slot_mapping, positions, main_cos_sin_cache);
+  FUSED_CPP_PROFILE_ADD_IF_PTR(
+      profile_ptr == nullptr ? nullptr : &profile_ptr->main_q_norm_rope_swa_insert_ms,
+      phase_start);
+  return q;
+}
+
 }  // namespace
 
 // Expected dtype contract for DeepSeek V4 post-GEMM stage on Arm CPU:
@@ -2441,6 +2482,126 @@ std::tuple<at::Tensor, at::Tensor> deepseek_v4_post_gemm_parallel_stage(
   return std::make_tuple(q, topk_indices_buffer);
 }
 
+at::Tensor deepseek_v4_post_gemm_dense_prepacked(at::Tensor qr,
+                                                 at::Tensor kv,
+                                                 at::Tensor positions,
+                                                 at::Tensor main_wq_b_packed,
+                                                 int64_t main_wq_b_K,
+                                                 int64_t main_wq_b_N,
+                                                 int64_t main_wq_b_Np,
+                                                 at::Tensor main_cos_sin_cache,
+                                                 at::Tensor swa_kv_cache,
+                                                 at::Tensor swa_slot_mapping,
+                                                 int64_t main_head_dim,
+                                                 double q_eps) {
+#if FUSED_CPP_ENABLE_PROFILING
+  const bool profile_enabled = PostGemmProfileEnabled();
+  PostGemmStageProfile profile;
+  PostGemmStageProfile* profile_ptr = profile_enabled ? &profile : nullptr;
+#else
+  PostGemmStageProfile* profile_ptr = nullptr;
+#endif
+  FUSED_CPP_PROFILE_START(total_start);
+  FUSED_CPP_PROFILE_START(phase_start);
+
+  CheckCpuTensor(qr, "qr");
+  CheckCpuTensor(kv, "kv");
+  CheckDim(qr, "qr", 2);
+  CheckDim(kv, "kv", 2);
+  FUSED_CPP_PROFILE_ADD_IF_PTR(
+      profile_ptr == nullptr ? nullptr : &profile_ptr->input_check_ms,
+      phase_start);
+
+  at::Tensor q = RunMainQAndSwaPrepacked(qr,
+                                         kv,
+                                         positions,
+                                         main_wq_b_packed,
+                                         main_wq_b_K,
+                                         main_wq_b_N,
+                                         main_wq_b_Np,
+                                         main_cos_sin_cache,
+                                         swa_kv_cache,
+                                         swa_slot_mapping,
+                                         main_head_dim,
+                                         q_eps,
+                                         profile_ptr);
+  FUSED_CPP_PROFILE_IF_ENABLED(
+      profile_ptr != nullptr,
+      PrintPostGemmProfile(
+          *profile_ptr,
+          ::fused_cpp::profile::elapsed_ms(total_start)));
+  return q;
+}
+
+at::Tensor deepseek_v4_post_gemm_c128a_prepacked(at::Tensor qr,
+                                                 at::Tensor kv,
+                                                 at::Tensor kv_score,
+                                                 at::Tensor positions,
+                                                 at::Tensor main_wq_b_packed,
+                                                 int64_t main_wq_b_K,
+                                                 int64_t main_wq_b_N,
+                                                 int64_t main_wq_b_Np,
+                                                 at::Tensor main_cos_sin_cache,
+                                                 at::Tensor swa_kv_cache,
+                                                 at::Tensor swa_slot_mapping,
+                                                 at::Tensor mla_ape,
+                                                 at::Tensor mla_state_cache,
+                                                 at::Tensor mla_state_slot_mapping,
+                                                 at::Tensor mla_token_to_req_indices,
+                                                 at::Tensor mla_block_table,
+                                                 at::Tensor mla_kv_cache,
+                                                 at::Tensor mla_kv_slot_mapping,
+                                                 at::Tensor mla_norm_weight,
+                                                 int64_t main_head_dim,
+                                                 double q_eps,
+                                                 int64_t mla_compress_ratio,
+                                                 double mla_rms_norm_eps) {
+#if FUSED_CPP_ENABLE_PROFILING
+  const bool profile_enabled = PostGemmProfileEnabled();
+  PostGemmStageProfile profile;
+  PostGemmStageProfile* profile_ptr = profile_enabled ? &profile : nullptr;
+#else
+  PostGemmStageProfile* profile_ptr = nullptr;
+#endif
+  FUSED_CPP_PROFILE_START(total_start);
+  FUSED_CPP_PROFILE_START(phase_start);
+
+  CheckCpuTensor(qr, "qr");
+  CheckCpuTensor(kv, "kv");
+  CheckCpuTensor(kv_score, "kv_score");
+  CheckDim(qr, "qr", 2);
+  CheckDim(kv, "kv", 2);
+  CheckDim(kv_score, "kv_score", 2);
+  FUSED_CPP_PROFILE_ADD_IF_PTR(
+      profile_ptr == nullptr ? nullptr : &profile_ptr->input_check_ms,
+      phase_start);
+
+  at::Tensor q = RunMainQAndSwaPrepacked(qr,
+                                         kv,
+                                         positions,
+                                         main_wq_b_packed,
+                                         main_wq_b_K,
+                                         main_wq_b_N,
+                                         main_wq_b_Np,
+                                         main_cos_sin_cache,
+                                         swa_kv_cache,
+                                         swa_slot_mapping,
+                                         main_head_dim,
+                                         q_eps,
+                                         profile_ptr);
+  RunCompressor(kv_score, positions, mla_ape, mla_state_cache, mla_state_slot_mapping,
+                mla_token_to_req_indices, mla_block_table, mla_kv_cache, mla_kv_slot_mapping,
+                mla_norm_weight, main_cos_sin_cache, mla_compress_ratio, mla_rms_norm_eps,
+                profile_ptr == nullptr ? nullptr : &profile_ptr->mla_save_partial_states_ms,
+                profile_ptr == nullptr ? nullptr : &profile_ptr->mla_compress_norm_rope_insert_ms);
+  FUSED_CPP_PROFILE_IF_ENABLED(
+      profile_ptr != nullptr,
+      PrintPostGemmProfile(
+          *profile_ptr,
+          ::fused_cpp::profile::elapsed_ms(total_start)));
+  return q;
+}
+
 std::tuple<at::Tensor, at::Tensor> deepseek_v4_post_gemm_parallel_stage_prepacked(
     at::Tensor qr,
     at::Tensor kv,
@@ -2502,36 +2663,25 @@ std::tuple<at::Tensor, at::Tensor> deepseek_v4_post_gemm_parallel_stage_prepacke
   CheckCpuTensor(kv, "kv");
   CheckDim(qr, "qr", 2);
   CheckDim(kv, "kv", 2);
-  TORCH_CHECK(main_head_dim > 0, "main_head_dim must be positive");
-  TORCH_CHECK(main_wq_b_N % main_head_dim == 0,
-              "main_wq_b_N must be divisible by main_head_dim");
   TORCH_CHECK(indexer_wq_b_N % indexer_norm_weight.size(0) == 0,
               "indexer_wq_b_N must be divisible by indexer head_dim");
   FUSED_CPP_PROFILE_ADD_IF_PTR(
       profile_ptr == nullptr ? nullptr : &profile_ptr->input_check_ms,
       phase_start);
 
-  const int64_t main_num_heads = main_wq_b_N / main_head_dim;
-  FUSED_CPP_PROFILE_RESTART(phase_start);
-  at::Tensor q = LinearPrepackedToDtype(
-                     qr,
-                     main_wq_b_packed,
-                     main_wq_b_K,
-                     main_wq_b_N,
-                     main_wq_b_Np,
-                     qr.scalar_type())
-                     .reshape({qr.size(0), main_num_heads, main_head_dim});
-  FUSED_CPP_PROFILE_ADD_IF_PTR(
-      profile_ptr == nullptr ? nullptr : &profile_ptr->main_q_gemm_ms,
-      phase_start);
-
-  FUSED_CPP_PROFILE_RESTART(phase_start);
-  CheckMainQKvShape(q, kv);
-  QNormRopeFused(q, positions, main_cos_sin_cache, q_eps);
-  KvRopeCacheInsertFused(kv, swa_kv_cache, swa_slot_mapping, positions, main_cos_sin_cache);
-  FUSED_CPP_PROFILE_ADD_IF_PTR(
-      profile_ptr == nullptr ? nullptr : &profile_ptr->main_q_norm_rope_swa_insert_ms,
-      phase_start);
+  at::Tensor q = RunMainQAndSwaPrepacked(qr,
+                                         kv,
+                                         positions,
+                                         main_wq_b_packed,
+                                         main_wq_b_K,
+                                         main_wq_b_N,
+                                         main_wq_b_Np,
+                                         main_cos_sin_cache,
+                                         swa_kv_cache,
+                                         swa_slot_mapping,
+                                         main_head_dim,
+                                         q_eps,
+                                         profile_ptr);
 
   const int64_t indexer_head_dim = indexer_norm_weight.size(0);
   FUSED_CPP_PROFILE_RESTART(phase_start);

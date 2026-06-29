@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, TypeVar
 
 import torch
 import torch.nn.functional as F
@@ -49,7 +49,29 @@ except (ImportError, AttributeError):
     _cpp_post_gemm_stage_prepacked = None
     _HAS_DEEPSEEK_V4_POST_GEMM_STAGE_PREPACKED = False
 
+try:
+    from fused_cpp._C import (  # type: ignore[import-untyped]
+        deepseek_v4_post_gemm_dense_prepacked as _cpp_post_gemm_dense_prepacked,
+    )
+
+    _HAS_DEEPSEEK_V4_POST_GEMM_DENSE_PREPACKED = True
+except (ImportError, AttributeError):
+    _cpp_post_gemm_dense_prepacked = None
+    _HAS_DEEPSEEK_V4_POST_GEMM_DENSE_PREPACKED = False
+
+try:
+    from fused_cpp._C import (  # type: ignore[import-untyped]
+        deepseek_v4_post_gemm_c128a_prepacked as _cpp_post_gemm_c128a_prepacked,
+    )
+
+    _HAS_DEEPSEEK_V4_POST_GEMM_C128A_PREPACKED = True
+except (ImportError, AttributeError):
+    _cpp_post_gemm_c128a_prepacked = None
+    _HAS_DEEPSEEK_V4_POST_GEMM_C128A_PREPACKED = False
+
 PostGemmStageVersion = Literal["auto", "torch", "cpp"]
+PostGemmStageVariant = Literal["dense", "c128a", "c4a"]
+T = TypeVar("T")
 
 
 @dataclass
@@ -89,14 +111,14 @@ class SparseIndexerPrefillMetadata:
 
 @dataclass(frozen=True)
 class PreparedDeepSeekV4PostGemmWeights:
-    """Prepacked weights for the two post-GEMM bf16 linear layers.
+    """Prepacked weights for post-GEMM bf16 linear layers.
 
     The source weights use PyTorch linear layout ``[N, K]`` and are packed with
     the same opaque backend format as ``fused_cpp.bf16_linear``.
     """
 
     main_wq_b: PreparedBF16LinearWeight
-    indexer_wq_b: PreparedBF16LinearWeight
+    indexer_wq_b: PreparedBF16LinearWeight | None = None
 
 
 @dataclass
@@ -105,22 +127,36 @@ class PostGemmStageInputs:
 
     qr: torch.Tensor
     kv: torch.Tensor
-    kv_score: torch.Tensor
-    indexer_kv_score: torch.Tensor
-    indexer_weights: torch.Tensor
     positions: torch.Tensor
     main_wq_b_weight: torch.Tensor
-    indexer_wq_b_weight: torch.Tensor
     main_cos_sin_cache: torch.Tensor
-    indexer_cos_sin_cache: torch.Tensor
     swa: SWACacheState
-    mla_compressor: CompressorState
-    indexer_compressor: CompressorState
-    topk_indices_buffer: torch.Tensor
-    prefill: SparseIndexerPrefillMetadata
     main_head_dim: int
     q_eps: float
+    kv_score: torch.Tensor | None = None
+    indexer_kv_score: torch.Tensor | None = None
+    indexer_weights: torch.Tensor | None = None
+    indexer_wq_b_weight: torch.Tensor | None = None
+    indexer_cos_sin_cache: torch.Tensor | None = None
+    mla_compressor: CompressorState | None = None
+    indexer_compressor: CompressorState | None = None
+    topk_indices_buffer: torch.Tensor | None = None
+    prefill: SparseIndexerPrefillMetadata | None = None
     prepared_weights: PreparedDeepSeekV4PostGemmWeights | None = None
+
+    def variant(self) -> PostGemmStageVariant:
+        """Infer the compile-time C++ entry to call from present branch state."""
+        if self.indexer_compressor is not None:
+            return "c4a"
+        if self.mla_compressor is not None:
+            return "c128a"
+        return "dense"
+
+
+def _require(value: T | None, name: str) -> T:
+    if value is None:
+        raise ValueError(f"DeepSeek V4 post-GEMM {name} is required")
+    return value
 
 
 def _linear_to_dtype(
@@ -413,7 +449,7 @@ def _sparse_indexer_prefill(
 
 def post_gemm_parallel_stage_torch_baseline(
     inputs: PostGemmStageInputs,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Run the precision baseline with the same side effects as vLLM's CPU path."""
     main_num_heads = inputs.main_wq_b_weight.shape[0] // inputs.main_head_dim
     q = _linear_to_dtype(
@@ -430,165 +466,262 @@ def post_gemm_parallel_stage_torch_baseline(
         inputs.q_eps,
     )
 
-    indexer_head_dim = inputs.indexer_compressor.norm_weight.shape[0]
-    indexer_num_heads = inputs.indexer_wq_b_weight.shape[0] // indexer_head_dim
+    if inputs.variant() == "dense":
+        return q, None
+
+    kv_score = _require(inputs.kv_score, "kv_score")
+    mla_compressor = _require(inputs.mla_compressor, "mla_compressor")
+    _run_compressor(
+        kv_score,
+        inputs.positions,
+        mla_compressor,
+        inputs.main_cos_sin_cache,
+    )
+
+    if inputs.variant() == "c128a":
+        return q, None
+
+    indexer_compressor = _require(inputs.indexer_compressor, "indexer_compressor")
+    indexer_wq_b_weight = _require(inputs.indexer_wq_b_weight, "indexer_wq_b_weight")
+    indexer_cos_sin_cache = _require(inputs.indexer_cos_sin_cache, "indexer_cos_sin_cache")
+    indexer_weights = _require(inputs.indexer_weights, "indexer_weights")
+    indexer_kv_score = _require(inputs.indexer_kv_score, "indexer_kv_score")
+    topk_indices_buffer = _require(inputs.topk_indices_buffer, "topk_indices_buffer")
+    prefill = _require(inputs.prefill, "prefill")
+
+    indexer_head_dim = indexer_compressor.norm_weight.shape[0]
+    indexer_num_heads = indexer_wq_b_weight.shape[0] // indexer_head_dim
     indexer_q = _linear_to_dtype(
         inputs.qr,
-        inputs.indexer_wq_b_weight,
+        indexer_wq_b_weight,
         inputs.qr.dtype,
     ).view(-1, indexer_num_heads, indexer_head_dim)
     q_quant, scaled_weights = _indexer_q_rope_quant(
         inputs.positions,
         indexer_q,
-        inputs.indexer_cos_sin_cache,
-        inputs.indexer_weights,
-    )
-
-    _run_compressor(
-        inputs.kv_score,
-        inputs.positions,
-        inputs.mla_compressor,
-        inputs.main_cos_sin_cache,
+        indexer_cos_sin_cache,
+        indexer_weights,
     )
     _run_compressor(
-        inputs.indexer_kv_score,
+        indexer_kv_score,
         inputs.positions,
-        inputs.indexer_compressor,
-        inputs.indexer_cos_sin_cache,
+        indexer_compressor,
+        indexer_cos_sin_cache,
     )
     _sparse_indexer_prefill(
         q_quant,
         scaled_weights,
-        inputs.indexer_compressor.kv_cache,
-        inputs.topk_indices_buffer,
-        inputs.prefill,
+        indexer_compressor.kv_cache,
+        topk_indices_buffer,
+        prefill,
     )
-    return q, inputs.topk_indices_buffer
+    return q, topk_indices_buffer
 
 
 def prepare_deepseek_v4_post_gemm_weights(
     main_wq_b_weight: torch.Tensor,
-    indexer_wq_b_weight: torch.Tensor,
+    indexer_wq_b_weight: torch.Tensor | None = None,
 ) -> PreparedDeepSeekV4PostGemmWeights:
-    """Prepack the two post-GEMM bf16 linear weights for repeated prefill calls."""
+    """Prepack post-GEMM bf16 linear weights for repeated prefill calls."""
     return PreparedDeepSeekV4PostGemmWeights(
         main_wq_b=_prepare_bf16_linear_weight(main_wq_b_weight),
-        indexer_wq_b=_prepare_bf16_linear_weight(indexer_wq_b_weight),
+        indexer_wq_b=(
+            _prepare_bf16_linear_weight(indexer_wq_b_weight)
+            if indexer_wq_b_weight is not None
+            else None
+        ),
     )
 
 
 def post_gemm_parallel_stage_cpp_prepacked(
     inputs: PostGemmStageInputs,
     weights: PreparedDeepSeekV4PostGemmWeights | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Run the native C++ baseline with prepacked post linear weights."""
-    if not _HAS_DEEPSEEK_V4_POST_GEMM_STAGE_PREPACKED:
-        raise RuntimeError("DeepSeek V4 post-GEMM prepacked C++ stage is unavailable")
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Run the native C++ baseline with a variant-specific prepacked entry."""
     selected_weights = weights if weights is not None else inputs.prepared_weights
     if selected_weights is None:
         raise RuntimeError(
             "post_gemm_parallel_stage_cpp_prepacked requires weights from "
             "prepare_deepseek_v4_post_gemm_weights"
         )
+    variant = inputs.variant()
+
+    if variant == "dense":
+        if not _HAS_DEEPSEEK_V4_POST_GEMM_DENSE_PREPACKED:
+            raise RuntimeError("DeepSeek V4 dense post-GEMM prepacked C++ stage is unavailable")
+        assert _cpp_post_gemm_dense_prepacked is not None
+        q = _cpp_post_gemm_dense_prepacked(
+            inputs.qr,
+            inputs.kv,
+            inputs.positions,
+            selected_weights.main_wq_b.packed_weight,
+            int(selected_weights.main_wq_b.k),
+            int(selected_weights.main_wq_b.n),
+            int(selected_weights.main_wq_b.n_padded),
+            inputs.main_cos_sin_cache,
+            inputs.swa.kv_cache,
+            inputs.swa.slot_mapping,
+            int(inputs.main_head_dim),
+            float(inputs.q_eps),
+        )
+        return q, None
+
+    if variant == "c128a":
+        if not _HAS_DEEPSEEK_V4_POST_GEMM_C128A_PREPACKED:
+            raise RuntimeError("DeepSeek V4 C128A post-GEMM prepacked C++ stage is unavailable")
+        assert _cpp_post_gemm_c128a_prepacked is not None
+        kv_score = _require(inputs.kv_score, "kv_score")
+        mla_compressor = _require(inputs.mla_compressor, "mla_compressor")
+        q = _cpp_post_gemm_c128a_prepacked(
+            inputs.qr,
+            inputs.kv,
+            kv_score,
+            inputs.positions,
+            selected_weights.main_wq_b.packed_weight,
+            int(selected_weights.main_wq_b.k),
+            int(selected_weights.main_wq_b.n),
+            int(selected_weights.main_wq_b.n_padded),
+            inputs.main_cos_sin_cache,
+            inputs.swa.kv_cache,
+            inputs.swa.slot_mapping,
+            mla_compressor.ape,
+            mla_compressor.state_cache,
+            mla_compressor.state_slot_mapping,
+            mla_compressor.token_to_req_indices,
+            mla_compressor.block_table,
+            mla_compressor.kv_cache,
+            mla_compressor.kv_slot_mapping,
+            mla_compressor.norm_weight,
+            int(inputs.main_head_dim),
+            float(inputs.q_eps),
+            int(mla_compressor.compress_ratio),
+            float(mla_compressor.rms_norm_eps),
+        )
+        return q, None
+
+    if not _HAS_DEEPSEEK_V4_POST_GEMM_STAGE_PREPACKED:
+        raise RuntimeError("DeepSeek V4 post-GEMM prepacked C++ stage is unavailable")
+    indexer_wq_b = _require(selected_weights.indexer_wq_b, "prepared indexer_wq_b")
+    kv_score = _require(inputs.kv_score, "kv_score")
+    indexer_kv_score = _require(inputs.indexer_kv_score, "indexer_kv_score")
+    indexer_weights = _require(inputs.indexer_weights, "indexer_weights")
+    indexer_cos_sin_cache = _require(inputs.indexer_cos_sin_cache, "indexer_cos_sin_cache")
+    mla_compressor = _require(inputs.mla_compressor, "mla_compressor")
+    indexer_compressor = _require(inputs.indexer_compressor, "indexer_compressor")
+    topk_indices_buffer = _require(inputs.topk_indices_buffer, "topk_indices_buffer")
+    prefill = _require(inputs.prefill, "prefill")
+    assert _cpp_post_gemm_stage_prepacked is not None
     return _cpp_post_gemm_stage_prepacked(
         inputs.qr,
         inputs.kv,
-        inputs.kv_score,
-        inputs.indexer_kv_score,
-        inputs.indexer_weights,
+        kv_score,
+        indexer_kv_score,
+        indexer_weights,
         inputs.positions,
         selected_weights.main_wq_b.packed_weight,
         int(selected_weights.main_wq_b.k),
         int(selected_weights.main_wq_b.n),
         int(selected_weights.main_wq_b.n_padded),
-        selected_weights.indexer_wq_b.packed_weight,
-        int(selected_weights.indexer_wq_b.k),
-        int(selected_weights.indexer_wq_b.n),
-        int(selected_weights.indexer_wq_b.n_padded),
+        indexer_wq_b.packed_weight,
+        int(indexer_wq_b.k),
+        int(indexer_wq_b.n),
+        int(indexer_wq_b.n_padded),
         inputs.main_cos_sin_cache,
-        inputs.indexer_cos_sin_cache,
+        indexer_cos_sin_cache,
         inputs.swa.kv_cache,
         inputs.swa.slot_mapping,
-        inputs.mla_compressor.ape,
-        inputs.mla_compressor.state_cache,
-        inputs.mla_compressor.state_slot_mapping,
-        inputs.mla_compressor.token_to_req_indices,
-        inputs.mla_compressor.block_table,
-        inputs.mla_compressor.kv_cache,
-        inputs.mla_compressor.kv_slot_mapping,
-        inputs.mla_compressor.norm_weight,
-        inputs.indexer_compressor.ape,
-        inputs.indexer_compressor.state_cache,
-        inputs.indexer_compressor.state_slot_mapping,
-        inputs.indexer_compressor.token_to_req_indices,
-        inputs.indexer_compressor.block_table,
-        inputs.indexer_compressor.kv_cache,
-        inputs.indexer_compressor.kv_slot_mapping,
-        inputs.indexer_compressor.norm_weight,
-        inputs.topk_indices_buffer,
-        inputs.prefill.cu_seq_lens,
-        inputs.prefill.cu_seqlen_ks,
-        inputs.prefill.cu_seqlen_ke,
-        inputs.prefill.block_table,
+        mla_compressor.ape,
+        mla_compressor.state_cache,
+        mla_compressor.state_slot_mapping,
+        mla_compressor.token_to_req_indices,
+        mla_compressor.block_table,
+        mla_compressor.kv_cache,
+        mla_compressor.kv_slot_mapping,
+        mla_compressor.norm_weight,
+        indexer_compressor.ape,
+        indexer_compressor.state_cache,
+        indexer_compressor.state_slot_mapping,
+        indexer_compressor.token_to_req_indices,
+        indexer_compressor.block_table,
+        indexer_compressor.kv_cache,
+        indexer_compressor.kv_slot_mapping,
+        indexer_compressor.norm_weight,
+        topk_indices_buffer,
+        prefill.cu_seq_lens,
+        prefill.cu_seqlen_ks,
+        prefill.cu_seqlen_ke,
+        prefill.block_table,
         int(inputs.main_head_dim),
         float(inputs.q_eps),
-        int(inputs.mla_compressor.compress_ratio),
-        float(inputs.mla_compressor.rms_norm_eps),
-        int(inputs.indexer_compressor.compress_ratio),
-        float(inputs.indexer_compressor.rms_norm_eps),
-        int(inputs.prefill.topk_tokens),
+        int(mla_compressor.compress_ratio),
+        float(mla_compressor.rms_norm_eps),
+        int(indexer_compressor.compress_ratio),
+        float(indexer_compressor.rms_norm_eps),
+        int(prefill.topk_tokens),
     )
 
 
 def post_gemm_parallel_stage_cpp(
     inputs: PostGemmStageInputs,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Run the native torch-API C++ baseline."""
-    if not _HAS_DEEPSEEK_V4_POST_GEMM_STAGE:
-        raise RuntimeError("DeepSeek V4 post-GEMM C++ stage is unavailable")
     if inputs.prepared_weights is not None:
         return post_gemm_parallel_stage_cpp_prepacked(inputs, inputs.prepared_weights)
+    if inputs.variant() != "c4a":
+        weights = prepare_deepseek_v4_post_gemm_weights(inputs.main_wq_b_weight)
+        return post_gemm_parallel_stage_cpp_prepacked(inputs, weights)
+    if not _HAS_DEEPSEEK_V4_POST_GEMM_STAGE:
+        raise RuntimeError("DeepSeek V4 post-GEMM C++ stage is unavailable")
+    kv_score = _require(inputs.kv_score, "kv_score")
+    indexer_kv_score = _require(inputs.indexer_kv_score, "indexer_kv_score")
+    indexer_weights = _require(inputs.indexer_weights, "indexer_weights")
+    indexer_wq_b_weight = _require(inputs.indexer_wq_b_weight, "indexer_wq_b_weight")
+    indexer_cos_sin_cache = _require(inputs.indexer_cos_sin_cache, "indexer_cos_sin_cache")
+    mla_compressor = _require(inputs.mla_compressor, "mla_compressor")
+    indexer_compressor = _require(inputs.indexer_compressor, "indexer_compressor")
+    topk_indices_buffer = _require(inputs.topk_indices_buffer, "topk_indices_buffer")
+    prefill = _require(inputs.prefill, "prefill")
     return _cpp_post_gemm_stage(
         inputs.qr,
         inputs.kv,
-        inputs.kv_score,
-        inputs.indexer_kv_score,
-        inputs.indexer_weights,
+        kv_score,
+        indexer_kv_score,
+        indexer_weights,
         inputs.positions,
         inputs.main_wq_b_weight,
-        inputs.indexer_wq_b_weight,
+        indexer_wq_b_weight,
         inputs.main_cos_sin_cache,
-        inputs.indexer_cos_sin_cache,
+        indexer_cos_sin_cache,
         inputs.swa.kv_cache,
         inputs.swa.slot_mapping,
-        inputs.mla_compressor.ape,
-        inputs.mla_compressor.state_cache,
-        inputs.mla_compressor.state_slot_mapping,
-        inputs.mla_compressor.token_to_req_indices,
-        inputs.mla_compressor.block_table,
-        inputs.mla_compressor.kv_cache,
-        inputs.mla_compressor.kv_slot_mapping,
-        inputs.mla_compressor.norm_weight,
-        inputs.indexer_compressor.ape,
-        inputs.indexer_compressor.state_cache,
-        inputs.indexer_compressor.state_slot_mapping,
-        inputs.indexer_compressor.token_to_req_indices,
-        inputs.indexer_compressor.block_table,
-        inputs.indexer_compressor.kv_cache,
-        inputs.indexer_compressor.kv_slot_mapping,
-        inputs.indexer_compressor.norm_weight,
-        inputs.topk_indices_buffer,
-        inputs.prefill.cu_seq_lens,
-        inputs.prefill.cu_seqlen_ks,
-        inputs.prefill.cu_seqlen_ke,
-        inputs.prefill.block_table,
+        mla_compressor.ape,
+        mla_compressor.state_cache,
+        mla_compressor.state_slot_mapping,
+        mla_compressor.token_to_req_indices,
+        mla_compressor.block_table,
+        mla_compressor.kv_cache,
+        mla_compressor.kv_slot_mapping,
+        mla_compressor.norm_weight,
+        indexer_compressor.ape,
+        indexer_compressor.state_cache,
+        indexer_compressor.state_slot_mapping,
+        indexer_compressor.token_to_req_indices,
+        indexer_compressor.block_table,
+        indexer_compressor.kv_cache,
+        indexer_compressor.kv_slot_mapping,
+        indexer_compressor.norm_weight,
+        topk_indices_buffer,
+        prefill.cu_seq_lens,
+        prefill.cu_seqlen_ks,
+        prefill.cu_seqlen_ke,
+        prefill.block_table,
         int(inputs.main_head_dim),
         float(inputs.q_eps),
-        int(inputs.mla_compressor.compress_ratio),
-        float(inputs.mla_compressor.rms_norm_eps),
-        int(inputs.indexer_compressor.compress_ratio),
-        float(inputs.indexer_compressor.rms_norm_eps),
-        int(inputs.prefill.topk_tokens),
+        int(mla_compressor.compress_ratio),
+        float(mla_compressor.rms_norm_eps),
+        int(indexer_compressor.compress_ratio),
+        float(indexer_compressor.rms_norm_eps),
+        int(prefill.topk_tokens),
     )
 
 
@@ -596,11 +729,17 @@ def post_gemm_parallel_stage(
     inputs: PostGemmStageInputs,
     *,
     version: PostGemmStageVersion | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Dispatch to the requested post-GEMM stage baseline."""
     selected = version or os.getenv("FUSED_CPP_DEEPSEEK_V4_POST_GEMM_STAGE", "auto")
     if selected == "auto":
-        selected = "cpp" if _HAS_DEEPSEEK_V4_POST_GEMM_STAGE else "torch"
+        variant = inputs.variant()
+        cpp_available = (
+            (variant == "dense" and _HAS_DEEPSEEK_V4_POST_GEMM_DENSE_PREPACKED)
+            or (variant == "c128a" and _HAS_DEEPSEEK_V4_POST_GEMM_C128A_PREPACKED)
+            or (variant == "c4a" and _HAS_DEEPSEEK_V4_POST_GEMM_STAGE)
+        )
+        selected = "cpp" if cpp_available else "torch"
     if selected == "torch":
         return post_gemm_parallel_stage_torch_baseline(inputs)
     if selected == "cpp":
@@ -611,10 +750,13 @@ def post_gemm_parallel_stage(
 __all__ = [
     "CompressorState",
     "PostGemmStageInputs",
+    "PostGemmStageVariant",
     "PostGemmStageVersion",
     "PreparedDeepSeekV4PostGemmWeights",
     "SWACacheState",
     "SparseIndexerPrefillMetadata",
+    "_HAS_DEEPSEEK_V4_POST_GEMM_C128A_PREPACKED",
+    "_HAS_DEEPSEEK_V4_POST_GEMM_DENSE_PREPACKED",
     "_HAS_DEEPSEEK_V4_POST_GEMM_STAGE",
     "_HAS_DEEPSEEK_V4_POST_GEMM_STAGE_PREPACKED",
     "post_gemm_parallel_stage_cpp_prepacked",
