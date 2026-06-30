@@ -150,6 +150,24 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
                                 std::string activation,
                                 int64_t global_num_experts,
                                 bool skip_weighted);
+at::Tensor fused_moe_bf16_tiled_scheduled(at::Tensor input,
+                                at::Tensor w13_packed,
+                                int64_t w13_K,
+                                int64_t w13_N,
+                                at::Tensor w2_packed,
+                                int64_t w2_K,
+                                int64_t w2_N,
+                                at::Tensor topk_weights,
+                                at::Tensor topk_ids,
+                                at::Tensor wave_offsets,
+                                at::Tensor team_expert_ids,
+                                at::Tensor team_threads,
+                                c10::optional<at::Tensor> w13_bias,
+                                c10::optional<at::Tensor> w2_bias,
+                                int64_t num_threads,
+                                std::string activation,
+                                int64_t global_num_experts,
+                                bool skip_weighted);
 
 // DeepSeek V4 attn_gemm_parallel_execute fused GEMM declarations
 std::tuple<at::Tensor, int64_t, int64_t>
@@ -1152,6 +1170,32 @@ PYBIND11_MODULE(_C, m) {
           py::arg("w2_N"),
           py::arg("topk_weights"),
           py::arg("topk_ids"),
+          py::arg("w13_bias") = c10::nullopt,
+          py::arg("w2_bias") = c10::nullopt,
+          py::arg("num_threads") = 1,
+          py::arg("activation") = "silu",
+          py::arg("global_num_experts") = -1,
+          py::arg("skip_weighted") = false,
+          py::call_guard<py::gil_scoped_release>());
+
+    m.def("fused_moe_bf16_tiled_scheduled",
+          &fused_moe_bf16_tiled_scheduled,
+          "Run BF16 tiled fused MoE using an externally supplied wave/team "
+          "schedule. wave_offsets defines wave ranges over team_expert_ids; "
+          "team_threads gives the number of cooperative threads for each "
+          "team.",
+          py::arg("input"),
+          py::arg("w13_packed"),
+          py::arg("w13_K"),
+          py::arg("w13_N"),
+          py::arg("w2_packed"),
+          py::arg("w2_K"),
+          py::arg("w2_N"),
+          py::arg("topk_weights"),
+          py::arg("topk_ids"),
+          py::arg("wave_offsets"),
+          py::arg("team_expert_ids"),
+          py::arg("team_threads"),
           py::arg("w13_bias") = c10::nullopt,
           py::arg("w2_bias") = c10::nullopt,
           py::arg("num_threads") = 1,
