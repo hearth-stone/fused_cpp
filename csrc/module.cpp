@@ -428,6 +428,36 @@ std::tuple<at::Tensor, at::Tensor> deepseek_v4_post_gemm_parallel_stage_prepacke
     int64_t indexer_compress_ratio,
     double indexer_rms_norm_eps,
     int64_t topk_tokens);
+void deepseek_v4_dequantize_and_gather_k_cache(at::Tensor out,
+                                               at::Tensor k_cache,
+                                               at::Tensor seq_lens,
+                                               c10::optional<at::Tensor> gather_lens,
+                                               at::Tensor block_table,
+                                               int64_t block_size,
+                                               int64_t offset);
+void deepseek_v4_dequantize_and_gather_dual_k_cache(at::Tensor out,
+                                                    at::Tensor compressed_k_cache,
+                                                    at::Tensor compressed_seq_lens,
+                                                    at::Tensor compressed_block_table,
+                                                    int64_t compressed_block_size,
+                                                    int64_t compressed_offset,
+                                                    bool has_compressed,
+                                                    at::Tensor swa_k_cache,
+                                                    at::Tensor swa_seq_lens,
+                                                    at::Tensor swa_gather_lens,
+                                                    at::Tensor swa_block_table,
+                                                    int64_t swa_block_size,
+                                                    int64_t swa_offset);
+std::tuple<at::Tensor, at::Tensor> deepseek_v4_combine_topk_swa_indices(
+    at::Tensor topk_indices,
+    at::Tensor query_start_loc,
+    at::Tensor seq_lens,
+    at::Tensor gather_lens,
+    int64_t window_size,
+    int64_t compress_ratio,
+    int64_t topk,
+    int64_t M,
+    int64_t N);
 
 // ACL affinity forward declarations — acl_affinity.cpp
 void set_acl_thread_affinity(int64_t core_start, int64_t core_end,
@@ -979,6 +1009,56 @@ PYBIND11_MODULE(_C, m) {
           py::arg("indexer_compress_ratio"),
           py::arg("indexer_rms_norm_eps"),
           py::arg("topk_tokens"),
+          py::call_guard<py::gil_scoped_release>());
+
+    m.def("deepseek_v4_dequantize_and_gather_k_cache",
+          &deepseek_v4_dequantize_and_gather_k_cache,
+          "DeepSeek V4 CPU prefill bf16 paged K-cache gather baseline. CPU "
+          "stores bf16 cache directly, so this is the CPU counterpart of the "
+          "GPU dequantize-and-gather op without FP8 dequantization.",
+          py::arg("out"),
+          py::arg("k_cache"),
+          py::arg("seq_lens"),
+          py::arg("gather_lens"),
+          py::arg("block_table"),
+          py::arg("block_size"),
+          py::arg("offset"),
+          py::call_guard<py::gil_scoped_release>());
+
+    m.def("deepseek_v4_dequantize_and_gather_dual_k_cache",
+          &deepseek_v4_dequantize_and_gather_dual_k_cache,
+          "DeepSeek V4 CPU prefill bf16 paged K-cache dual gather. This "
+          "experimental optimized entrypoint writes the compressed cache "
+          "region and SWA cache region into the same workspace in one call; "
+          "the single-gather op remains the compatibility baseline.",
+          py::arg("out"),
+          py::arg("compressed_k_cache"),
+          py::arg("compressed_seq_lens"),
+          py::arg("compressed_block_table"),
+          py::arg("compressed_block_size"),
+          py::arg("compressed_offset"),
+          py::arg("has_compressed"),
+          py::arg("swa_k_cache"),
+          py::arg("swa_seq_lens"),
+          py::arg("swa_gather_lens"),
+          py::arg("swa_block_table"),
+          py::arg("swa_block_size"),
+          py::arg("swa_offset"),
+          py::call_guard<py::gil_scoped_release>());
+
+    m.def("deepseek_v4_combine_topk_swa_indices",
+          &deepseek_v4_combine_topk_swa_indices,
+          "DeepSeek V4 CPU prefill sparse-index combiner baseline. Combines "
+          "compressed top-k indices with the local SWA window indices.",
+          py::arg("topk_indices"),
+          py::arg("query_start_loc"),
+          py::arg("seq_lens"),
+          py::arg("gather_lens"),
+          py::arg("window_size"),
+          py::arg("compress_ratio"),
+          py::arg("topk"),
+          py::arg("M"),
+          py::arg("N"),
           py::call_guard<py::gil_scoped_release>());
 
     m.def("deepseek_v4_q_norm_rope_fused_sve",
