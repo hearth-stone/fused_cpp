@@ -4,7 +4,10 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import gc
+import json
+import platform
 import statistics
 import sys
 import time
@@ -24,11 +27,13 @@ sys.path.insert(0, str(SRC_DIR))
 from offline_simulator import (  # noqa: E402
     ExpertCostModel,
     Plan,
+    PlanKind,
     active_experts_from_routes,
     build_planner_cost_model,
     build_plans,
     format_ns,
     generate_routes,
+    planner_cost_summary,
     select_auto_planners,
     select_best_plan,
     workload_stats,
@@ -95,6 +100,13 @@ def bridge_tensors(plan: Plan) -> Dict[str, torch.Tensor | int]:
     bridge = plan.to_scheduled_bridge()
     return {
         "num_threads": int(bridge["num_threads"]),
+        "thread_cpu_ids": torch.tensor(
+            bridge.get(
+                "thread_cpu_ids",
+                list(range(int(bridge["num_threads"]))),
+            ),
+            dtype=torch.int32,
+        ),
         "wave_offsets": torch.tensor(bridge["wave_offsets"], dtype=torch.int32),
         "team_expert_ids": torch.tensor(
             bridge["team_expert_ids"],
@@ -133,13 +145,249 @@ def bench_call(
     }
 
 
-def print_result(plan: Plan, result: Dict[str, object]) -> None:
+def timing_to_dict(result: Dict[str, object]) -> Dict[str, object]:
+    times_s = [float(value) for value in result["times_s"]]
+    median_s = float(result["median_s"])
+    best_s = float(result["best_s"])
+    mean_s = float(result["mean_s"])
+    return {
+        "median_s": median_s,
+        "best_s": best_s,
+        "mean_s": mean_s,
+        "times_s": times_s,
+        "median_ms": median_s * 1e3,
+        "best_ms": best_s * 1e3,
+        "mean_ms": mean_s * 1e3,
+        "times_ms": [value * 1e3 for value in times_s],
+        "median_ns": int(round(median_s * 1e9)),
+        "best_ns": int(round(best_s * 1e9)),
+        "mean_ns": int(round(mean_s * 1e9)),
+    }
+
+
+def plan_shape_features(plan: Plan) -> Dict[str, object]:
+    teams = [team for wave in plan.waves for team in wave.teams]
+    multithread_teams = [team for team in teams if team.threads > 1]
+    thread_histogram: Dict[str, int] = {}
+    for team in teams:
+        key = str(team.threads)
+        thread_histogram[key] = thread_histogram.get(key, 0) + 1
+    return {
+        "num_waves": len(plan.waves),
+        "num_teams": len(teams),
+        "num_multithread_teams": len(multithread_teams),
+        "total_team_threads": sum(team.threads for team in teams),
+        "max_team_threads": max((team.threads for team in teams), default=0),
+        "max_teams_per_wave": max((len(wave.teams) for wave in plan.waves), default=0),
+        "thread_histogram": thread_histogram,
+    }
+
+
+def serialize_args(args: argparse.Namespace) -> Dict[str, object]:
+    data: Dict[str, object] = {}
+    for key, value in vars(args).items():
+        if isinstance(value, Path):
+            data[key] = str(value)
+        elif isinstance(value, list):
+            data[key] = [str(item) if isinstance(item, Path) else item for item in value]
+        else:
+            data[key] = value
+    return data
+
+
+def measured_plan_row(
+    plan: Plan,
+    result: Dict[str, object],
+    *,
+    baseline_median_s: float | None,
+    best_measured_median_s: float,
+) -> Dict[str, object]:
+    timing = timing_to_dict(result)
+    shape = plan_shape_features(plan)
+    median_s = float(timing["median_s"])
+    speedup_vs_balanced = (
+        baseline_median_s / median_s if baseline_median_s is not None else None
+    )
+    return {
+        "kind": plan.kind.value,
+        "exactness_scope": plan.exactness_scope,
+        "prediction": {
+            "estimated_plan_cost_ns": plan.estimated_plan_cost_ns,
+            "measured_plan_cost_ns": plan.measured_plan_cost_ns,
+            "estimated_execute_cost_ns": plan.estimated_execute_cost_ns,
+            "estimated_total_cost_ns": plan.estimated_total_cost_ns,
+        },
+        "measured": timing,
+        "measured_speedup_vs_balanced": speedup_vs_balanced,
+        "measured_regret_vs_best": median_s / best_measured_median_s,
+        "shape": shape,
+        "metadata": plan.metadata,
+        "plan": plan.to_dict(),
+    }
+
+
+def build_result_payload(
+    *,
+    args: argparse.Namespace,
+    routes: Sequence[int],
+    stats: Dict[str, float],
+    cost_model: ExpertCostModel,
+    planner_cost_model_summary: str,
+    planner_names: Sequence[str],
+    best: Plan,
+    default_result: Dict[str, object] | None,
+    measured_results: Sequence[tuple[Plan, Dict[str, object]]],
+) -> Dict[str, object]:
+    baseline_median_s = None
+    for plan, result in measured_results:
+        if plan.kind == PlanKind.SORTED_TOKEN_BALANCED_1T:
+            baseline_median_s = float(result["median_s"])
+            break
+    best_measured_median_s = min(
+        (float(result["median_s"]) for _, result in measured_results),
+        default=None,
+    )
+    if best_measured_median_s is None:
+        best_measured_median_s = float("nan")
+
+    active_routes = [
+        {"expert_id": expert_id, "routes": int(route_count)}
+        for expert_id, route_count in enumerate(routes)
+        if route_count > 0
+    ]
+    payload: Dict[str, object] = {
+        "schema_version": 1,
+        "created_unix_s": time.time(),
+        "argv": sys.argv,
+        "python": sys.version,
+        "platform": {
+            "system": platform.system(),
+            "machine": platform.machine(),
+            "processor": platform.processor(),
+            "platform": platform.platform(),
+        },
+        "args": serialize_args(args),
+        "workload": {
+            "distribution": args.distribution,
+            "tokens": args.tokens,
+            "top_k": args.top_k,
+            "num_experts": args.num_experts,
+            "cores": args.cores,
+            "routes": [int(value) for value in routes],
+            "active_routes": active_routes,
+            "stats": stats,
+        },
+        "shape": {
+            "hidden_size": args.hidden_size,
+            "ffn_hidden_size": args.ffn_hidden_size,
+            "activation": args.activation,
+        },
+        "cost_model": {
+            "source": cost_model.source,
+            "metric": cost_model.metric,
+            "cost_table": str(args.cost_table) if args.cost_table is not None else None,
+        },
+        "planner_cost_model": planner_cost_model_summary,
+        "planner_names": list(planner_names),
+        "best_estimated_total": best.kind.value,
+        "default_kernel": (
+            {"kind": "EXISTING_DEFAULT_KERNEL", "measured": timing_to_dict(default_result)}
+            if default_result is not None
+            else None
+        ),
+        "plans": [
+            measured_plan_row(
+                plan,
+                result,
+                baseline_median_s=baseline_median_s,
+                best_measured_median_s=best_measured_median_s,
+            )
+            for plan, result in measured_results
+        ],
+    }
+    return payload
+
+
+def csv_rows_from_payload(payload: Dict[str, object]) -> List[Dict[str, object]]:
+    workload = payload["workload"]
+    shape = payload["shape"]
+    rows: List[Dict[str, object]] = []
+    for plan in payload["plans"]:
+        prediction = plan["prediction"]
+        measured = plan["measured"]
+        plan_shape = plan["shape"]
+        rows.append(
+            {
+                "distribution": workload["distribution"],
+                "tokens": workload["tokens"],
+                "top_k": workload["top_k"],
+                "num_experts": workload["num_experts"],
+                "cores": workload["cores"],
+                "active_experts": workload["stats"]["active_experts"],
+                "gini": workload["stats"]["gini"],
+                "maxvio": workload["stats"]["maxvio"],
+                "hidden_size": shape["hidden_size"],
+                "ffn_hidden_size": shape["ffn_hidden_size"],
+                "activation": shape["activation"],
+                "planner": plan["kind"],
+                "estimated_plan_cost_ns": prediction["estimated_plan_cost_ns"],
+                "measured_plan_cost_ns": prediction["measured_plan_cost_ns"],
+                "estimated_execute_cost_ns": prediction["estimated_execute_cost_ns"],
+                "estimated_total_cost_ns": prediction["estimated_total_cost_ns"],
+                "median_ns": measured["median_ns"],
+                "best_ns": measured["best_ns"],
+                "mean_ns": measured["mean_ns"],
+                "median_ms": measured["median_ms"],
+                "best_ms": measured["best_ms"],
+                "mean_ms": measured["mean_ms"],
+                "measured_speedup_vs_balanced": plan["measured_speedup_vs_balanced"],
+                "measured_regret_vs_best": plan["measured_regret_vs_best"],
+                "num_waves": plan_shape["num_waves"],
+                "num_teams": plan_shape["num_teams"],
+                "num_multithread_teams": plan_shape["num_multithread_teams"],
+                "total_team_threads": plan_shape["total_team_threads"],
+                "max_team_threads": plan_shape["max_team_threads"],
+                "max_teams_per_wave": plan_shape["max_teams_per_wave"],
+                "selected_core_group_shape": plan["metadata"].get(
+                    "selected_core_group_shape",
+                    "",
+                ),
+            }
+        )
+    return rows
+
+
+def write_json(path: Path, payload: Dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, sort_keys=True)
+        f.write("\n")
+
+
+def write_csv(path: Path, rows: Sequence[Dict[str, object]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not rows:
+        raise ValueError("no benchmark rows to write")
+    with path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def print_result(
+    plan: Plan,
+    result: Dict[str, object],
+    baseline_median_s: float | None = None,
+) -> None:
     bridge = plan.to_scheduled_bridge()
     selected_shape = plan.metadata.get("selected_core_group_shape", "")
     median_s = float(result["median_s"])
     best_s = float(result["best_s"])
     mean_s = float(result["mean_s"])
     times = [round(float(value) * 1e3, 3) for value in result["times_s"]]
+    baseline_text = ""
+    if baseline_median_s is not None:
+        baseline_text = f"vs_balanced={baseline_median_s / median_s:>7.3f} "
     print(
         f"{plan.kind.value:<24} "
         f"waves={len(plan.waves):<3} "
@@ -150,6 +398,7 @@ def print_result(plan: Plan, result: Dict[str, object]) -> None:
         f"median_ms={median_s * 1e3:>9.3f} "
         f"best_ms={best_s * 1e3:>9.3f} "
         f"mean_ms={mean_s * 1e3:>9.3f} "
+        f"{baseline_text}"
         f"times_ms={times}"
     )
 
@@ -213,13 +462,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--planner",
         action="append",
-        choices=["all", "auto", "fixed", "uniform", "greedy", "groups"],
+        choices=[
+            "all",
+            "auto",
+            "fixed",
+            "balanced",
+            "uniform",
+            "greedy",
+            "groups",
+        ],
         default=None,
     )
     parser.add_argument(
         "--plan-cost-source",
-        choices=["complexity", "model", "measured"],
+        choices=["complexity", "model", "measured", "native_table", "profile"],
         default="complexity",
+    )
+    parser.add_argument(
+        "--planner-cost-profile",
+        type=Path,
+        default=None,
+        help=(
+            "Native C++ planner cost table. Use with "
+            "--plan-cost-source native_table/profile."
+        ),
     )
     parser.add_argument("--planner-cost", action="append", default=None)
     parser.add_argument(
@@ -236,6 +502,18 @@ def parse_args() -> argparse.Namespace:
         "--include-default",
         action="store_true",
         help="Also time the existing non-scheduled fused_moe_bf16_tiled path.",
+    )
+    parser.add_argument(
+        "--output-json",
+        type=Path,
+        default=None,
+        help="Write structured benchmark results, including full plans, to JSON.",
+    )
+    parser.add_argument(
+        "--output-csv",
+        type=Path,
+        default=None,
+        help="Write one row per measured planner to CSV.",
     )
     return parser.parse_args()
 
@@ -281,8 +559,10 @@ def main() -> int:
     planner_cost_model = build_planner_cost_model(
         source=args.plan_cost_source,
         overrides=args.planner_cost,
+        profile_path=args.planner_cost_profile,
     )
-    planner_names = args.planner or ["groups"]
+    planner_cost_model_text = planner_cost_summary(planner_cost_model)
+    planner_names = args.planner or ["balanced"]
     if "auto" in planner_names:
         if len(planner_names) > 1:
             raise ValueError("--planner auto cannot be combined with other planners")
@@ -333,6 +613,7 @@ def main() -> int:
     )
     print(f"best_estimated_total={best.kind.value}")
 
+    default_result = None
     if args.include_default:
         _, default_result = bench_call(
             lambda: fused_moe_bf16_tiled(
@@ -348,6 +629,7 @@ def main() -> int:
         )
         print_default_result(default_result)
 
+    measured_results: List[tuple[Plan, Dict[str, object]]] = []
     for plan in sorted(plans, key=lambda item: item.estimated_total_cost_ns):
         bridge = bridge_tensors(plan)
         _, result = bench_call(
@@ -359,13 +641,42 @@ def main() -> int:
                 bridge["wave_offsets"],
                 bridge["team_expert_ids"],
                 bridge["team_threads"],
+                thread_cpu_ids=bridge["thread_cpu_ids"],
                 num_threads=int(bridge["num_threads"]),
                 activation=args.activation,
             ),
             warmup=args.warmup,
             runs=args.runs,
         )
-        print_result(plan, result)
+        measured_results.append((plan, result))
+
+    baseline_median_s = None
+    for plan, result in measured_results:
+        if plan.kind == PlanKind.SORTED_TOKEN_BALANCED_1T:
+            baseline_median_s = float(result["median_s"])
+            break
+
+    for plan, result in measured_results:
+        print_result(plan, result, baseline_median_s=baseline_median_s)
+
+    if args.output_json is not None or args.output_csv is not None:
+        payload = build_result_payload(
+            args=args,
+            routes=routes,
+            stats=stats,
+            cost_model=cost_model,
+            planner_cost_model_summary=planner_cost_model_text,
+            planner_names=planner_names,
+            best=best,
+            default_result=default_result,
+            measured_results=measured_results,
+        )
+        if args.output_json is not None:
+            write_json(args.output_json, payload)
+            print(f"wrote_json={args.output_json}")
+        if args.output_csv is not None:
+            write_csv(args.output_csv, csv_rows_from_payload(payload))
+            print(f"wrote_csv={args.output_csv}")
 
     return 0
 

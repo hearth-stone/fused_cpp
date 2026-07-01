@@ -199,6 +199,7 @@ def main() -> int:
             wave_offsets = torch.tensor([0, 1], dtype=torch.int32)
             team_expert_ids = torch.tensor([0], dtype=torch.int32)
             team_threads = torch.tensor([threads], dtype=torch.int32)
+            thread_cpu_ids = torch.arange(threads, dtype=torch.int32)
 
             def run() -> torch.Tensor:
                 return fused_moe_bf16_tiled_scheduled(
@@ -209,6 +210,7 @@ def main() -> int:
                     wave_offsets,
                     team_expert_ids,
                     team_threads,
+                    thread_cpu_ids=thread_cpu_ids,
                     w13_bias=w13_bias,
                     w2_bias=w2_bias,
                     num_threads=threads,

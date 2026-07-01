@@ -105,3 +105,63 @@ When absent, the offline simulator uses a complexity-based planner cost model
 for scoring and still records local Python planner wall time as diagnostics. The
 complexity coefficients should be calibrated with native planner profiling before
 runtime integration.
+
+## Lightweight Native Planner Cost Table
+
+For runtime-style scoring, prefer a compact lookup table instead of the
+complexity formula:
+
+```text
+T_plan(kind, active_experts, cores) -> nanoseconds
+```
+
+The table is generated from native C++ planner timings and scored with nearest
+bucket lookup:
+
+1. choose the nearest `cores` bucket;
+2. choose the nearest `active_experts` bucket within that core bucket;
+3. return the measured cost for `kind`.
+
+Example:
+
+```json
+{
+  "schema_version": 1,
+  "kind": "native_planner_cost_table",
+  "source_profile": "tmp/moe_schedule_bench/native_planner_cost_aws_8c_20260701.json",
+  "metric": "total_native_median_ns",
+  "lookup": "nearest_core_then_nearest_active",
+  "core_buckets": [8],
+  "active_buckets": [1, 2, 4, 6, 8, 16, 32, 64, 128, 192, 256],
+  "planners": [
+    "FIXED_GLOBAL_THREADS",
+    "SORTED_TOKEN_BALANCED_1T",
+    "UNIFORM_WAVES",
+    "ENUMERATE_CORE_GROUPS",
+    "GREEDY_MARGINAL_GAIN"
+  ],
+  "table": {
+    "8": {
+      "FIXED_GLOBAL_THREADS": {
+        "1": 970,
+        "256": 50370
+      },
+      "GREEDY_MARGINAL_GAIN": {
+        "1": 2000,
+        "256": 94770
+      }
+    }
+  }
+}
+```
+
+Use this table with:
+
+```bash
+python -B cpu_moe_schedule_optimization/benchmarks/synthetic_sweep.py \
+  --plan-cost-source native_table \
+  --planner-cost-profile cpu_moe_schedule_optimization/cost_model/profiles/planner_native_table.json
+```
+
+The older complexity model remains available for diagnostics, but should not be
+treated as the runtime planner overhead model.
