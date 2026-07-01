@@ -20,6 +20,7 @@ from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 class PlanKind(str, Enum):
     FIXED_GLOBAL_THREADS = "FIXED_GLOBAL_THREADS"
+    SORTED_TOKEN_BALANCED_1T = "SORTED_TOKEN_BALANCED_1T"
     UNIFORM_WAVES = "UNIFORM_WAVES"
     GREEDY_MARGINAL_GAIN = "GREEDY_MARGINAL_GAIN"
     ENUMERATE_CORE_GROUPS = "ENUMERATE_CORE_GROUPS"
@@ -28,6 +29,12 @@ class PlanKind(str, Enum):
 PLANNER_ALIASES = {
     "fixed": PlanKind.FIXED_GLOBAL_THREADS,
     "fixed_global_threads": PlanKind.FIXED_GLOBAL_THREADS,
+    "balanced": PlanKind.SORTED_TOKEN_BALANCED_1T,
+    "lpt": PlanKind.SORTED_TOKEN_BALANCED_1T,
+    "lpt_balanced": PlanKind.SORTED_TOKEN_BALANCED_1T,
+    "token_balanced": PlanKind.SORTED_TOKEN_BALANCED_1T,
+    "sorted_token_balanced": PlanKind.SORTED_TOKEN_BALANCED_1T,
+    "sorted_token_balanced_1t": PlanKind.SORTED_TOKEN_BALANCED_1T,
     "uniform": PlanKind.UNIFORM_WAVES,
     "uniform_waves": PlanKind.UNIFORM_WAVES,
     "greedy": PlanKind.GREEDY_MARGINAL_GAIN,
@@ -40,6 +47,7 @@ PLANNER_ALIASES = {
 
 DEFAULT_PLANNER_COSTS_NS = {
     PlanKind.FIXED_GLOBAL_THREADS: 1_000,
+    PlanKind.SORTED_TOKEN_BALANCED_1T: 2_000,
     PlanKind.UNIFORM_WAVES: 5_000,
     PlanKind.GREEDY_MARGINAL_GAIN: 20_000,
     PlanKind.ENUMERATE_CORE_GROUPS: 30_000,
@@ -47,6 +55,7 @@ DEFAULT_PLANNER_COSTS_NS = {
 
 COMPLEXITY_COST_COEFFICIENTS_NS = {
     "fixed_base": 500,
+    "balanced_base": 700,
     "uniform_base": 800,
     "greedy_base": 1_000,
     "groups_base": 1_200,
@@ -135,6 +144,7 @@ class Plan:
             wave_offsets.append(len(team_expert_ids))
         return {
             "num_threads": self.num_cores,
+            "thread_cpu_ids": list(range(self.num_cores)),
             "wave_offsets": wave_offsets,
             "team_expert_ids": team_expert_ids,
             "team_threads": team_threads,
@@ -236,6 +246,11 @@ class PlannerCostModel:
     coefficients_ns: Dict[str, int] = field(
         default_factory=lambda: dict(COMPLEXITY_COST_COEFFICIENTS_NS)
     )
+    profile_costs_ns: Dict[PlanKind, List[Tuple[int, int, int]]] = field(
+        default_factory=dict
+    )
+    profile_metric: str = "total_native_median_ns"
+    profile_source: Optional[str] = None
 
     def estimate_ns(
         self,
@@ -250,6 +265,8 @@ class PlannerCostModel:
             return measured_plan_cost_ns
         if kind in self.override_costs_ns:
             return self.override_costs_ns[kind]
+        if self.source in {"native_table", "profile"}:
+            return self.profile_estimate_ns(kind, active_count, num_cores)
         if self.source == "model":
             return self.static_costs_ns[kind]
         if self.source == "complexity":
@@ -261,6 +278,29 @@ class PlannerCostModel:
                 core_group_shape_count=core_group_shape_count,
             )
         raise ValueError(f"unknown planner cost source: {self.source}")
+
+    def profile_estimate_ns(
+        self,
+        kind: PlanKind,
+        active_count: int,
+        num_cores: int,
+    ) -> int:
+        candidates = self.profile_costs_ns.get(kind)
+        if not candidates:
+            return self.static_costs_ns[kind]
+        active_count = max(0, active_count)
+        num_cores = max(1, num_cores)
+        active, cores, cost_ns = min(
+            candidates,
+            key=lambda item: (
+                abs(item[1] - num_cores),
+                abs(item[0] - active_count),
+                item[1],
+                item[0],
+            ),
+        )
+        del active, cores
+        return cost_ns
 
     def complexity_estimate_ns(
         self,
@@ -308,6 +348,17 @@ class PlannerCostModel:
                 "wave_pack_ops": active_count,
                 "gain_scan_ops": 0,
                 "sort_compare_ops": 0,
+                "budget_eval_ops": 1,
+            }
+
+        if kind == PlanKind.SORTED_TOKEN_BALANCED_1T:
+            return {
+                "base": self.coefficients_ns["balanced_base"],
+                "cost_lookup_ops": active_count,
+                "linear_scan_ops": active_count * num_cores,
+                "wave_pack_ops": active_count,
+                "gain_scan_ops": 0,
+                "sort_compare_ops": active_count * log_active,
                 "budget_eval_ops": 1,
             }
 
@@ -383,9 +434,21 @@ class PlannerCostModel:
                 "planner_cost_source": self.source,
                 "planner_cost_override_ns": self.override_costs_ns[kind],
             }
+        if self.source in {"native_table", "profile"}:
+            return {
+                "planner_cost_source": "native_table",
+                "planner_cost_profile": self.profile_source,
+                "planner_cost_profile_metric": self.profile_metric,
+                "planner_cost_profile_ns": self.profile_estimate_ns(
+                    kind,
+                    active_count,
+                    num_cores,
+                ),
+            }
         if self.source == "complexity":
             return {
                 "planner_cost_source": "complexity",
+                "planner_cost_profile": self.profile_source,
                 "planner_cost_complexity_features": self.complexity_features(
                     kind=kind,
                     active_count=active_count,
@@ -530,6 +593,41 @@ def make_wave(wave_id: int, teams: Sequence[Team]) -> Wave:
     )
 
 
+def build_waves_from_sorted_token_balanced_queues(
+    active: Sequence[ExpertWork],
+    num_cores: int,
+    cost_model: ExpertCostModel,
+) -> Tuple[List[Wave], List[int], List[List[int]]]:
+    if num_cores <= 0:
+        raise ValueError("num_cores must be positive")
+
+    queues: List[List[Team]] = [[] for _ in range(num_cores)]
+    route_loads = [0 for _ in range(num_cores)]
+    ordered = sorted(active, key=lambda work: (-work.routes, work.expert_id))
+
+    for work in ordered:
+        core = min(range(num_cores), key=lambda idx: (route_loads[idx], idx))
+        queues[core].append(make_team(work, 1, cost_model))
+        route_loads[core] += work.routes
+
+    waves: List[Wave] = []
+    max_queue_depth = max((len(queue) for queue in queues), default=0)
+    for depth in range(max_queue_depth):
+        teams = [
+            queue[depth]
+            for queue in queues
+            if depth < len(queue)
+        ]
+        if teams:
+            waves.append(make_wave(len(waves), teams))
+
+    expert_queues = [
+        [team.expert_id for team in queue]
+        for queue in queues
+    ]
+    return waves, route_loads, expert_queues
+
+
 def plan_fixed_global_threads(
     active: Sequence[ExpertWork],
     num_cores: int,
@@ -567,6 +665,58 @@ def plan_fixed_global_threads(
         measured_plan_cost_ns=measured_plan_cost_ns,
         estimated_plan_cost_ns=estimated_plan_cost_ns,
         exactness_scope="baseline",
+        metadata=metadata,
+    )
+
+
+def plan_sorted_token_balanced_1t(
+    active: Sequence[ExpertWork],
+    num_cores: int,
+    cost_model: ExpertCostModel,
+    planner_cost_model: PlannerCostModel,
+) -> Plan:
+    start_ns = time.perf_counter_ns()
+    waves, core_route_loads, core_expert_queues = (
+        build_waves_from_sorted_token_balanced_queues(
+            active,
+            num_cores,
+            cost_model,
+        )
+    )
+    measured_plan_cost_ns = time.perf_counter_ns() - start_ns
+    estimated_plan_cost_ns = planner_cost_model.estimate_ns(
+        PlanKind.SORTED_TOKEN_BALANCED_1T,
+        measured_plan_cost_ns,
+        active_count=len(active),
+        num_cores=num_cores,
+    )
+    metadata = {
+        "planner": "offline_simulator.py",
+        "cost_model": cost_model.source,
+        "cost_metric": cost_model.metric,
+        "model_note": (
+            "sorted-routes LPT baseline: one-thread experts assigned to "
+            "the lightest logical core queue by routed-token count"
+        ),
+        "assignment": "largest_routes_to_lightest_core_queue",
+        "core_route_loads": core_route_loads,
+        "core_expert_queues": core_expert_queues,
+    }
+    metadata.update(
+        planner_cost_model.metadata_for(
+            PlanKind.SORTED_TOKEN_BALANCED_1T,
+            active_count=len(active),
+            num_cores=num_cores,
+        )
+    )
+    return Plan(
+        kind=PlanKind.SORTED_TOKEN_BALANCED_1T,
+        num_cores=num_cores,
+        active_experts=list(active),
+        waves=waves,
+        measured_plan_cost_ns=measured_plan_cost_ns,
+        estimated_plan_cost_ns=estimated_plan_cost_ns,
+        exactness_scope="heuristic_baseline",
         metadata=metadata,
     )
 
@@ -1006,22 +1156,24 @@ def select_auto_planners(
         raise ValueError("auto selector requires at least one active expert")
 
     if active <= 1:
-        names = ["fixed", "uniform", "greedy", "groups"]
+        names = ["fixed", "balanced", "uniform", "greedy", "groups"]
         reason = "single_active_expert"
     elif active <= num_cores:
-        names = ["fixed", "uniform", "groups"]
+        names = ["fixed", "balanced", "uniform", "groups"]
         reason = "active_experts_fit_in_cores"
     elif gini < 0.15 and maxvio < 2.0:
-        names = ["fixed"]
+        names = ["balanced"]
         reason = "balanced_load"
     elif gini < 0.65 and maxvio < 16.0:
-        names = ["fixed", "uniform", "groups"]
-        reason = "moderate_skew"
+        # AWS bridge measurements show dense moderate-skew workloads favor
+        # simple one-thread-per-expert schedules over extra grouped waves.
+        names = ["fixed", "balanced", "uniform"]
+        reason = "moderate_skew_dense_fixed_preferred"
     elif active_fraction < 0.35 and gini < 0.70 and maxvio < 32.0:
-        names = ["fixed", "uniform", "groups"]
+        names = ["fixed", "balanced", "uniform", "groups"]
         reason = "sparse_active_moderate_skew"
     else:
-        names = ["fixed", "uniform", "greedy", "groups"]
+        names = ["fixed", "balanced", "uniform", "greedy", "groups"]
         reason = "high_skew"
 
     selector_stats = {
@@ -1062,14 +1214,88 @@ def parse_duration_ns(value: str) -> int:
     return number
 
 
+def load_native_planner_cost_profile(
+    path: Path,
+) -> Tuple[
+    Dict[PlanKind, List[Tuple[int, int, int]]],
+    Dict[PlanKind, int],
+    Dict[str, int],
+    str,
+]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    metric = str(payload.get("metric", "total_native_median_ns"))
+    entries = payload.get("entries", [])
+    if not entries and isinstance(payload.get("table"), dict):
+        expanded_entries = []
+        table = payload["table"]
+        for cores_text, by_planner in table.items():
+            cores = int(cores_text)
+            for planner_name, by_active in by_planner.items():
+                for active_text, cost_ns in by_active.items():
+                    expanded_entries.append(
+                        {
+                            "planner": planner_name,
+                            "cores": cores,
+                            "active_experts": int(active_text),
+                            metric: int(cost_ns),
+                        }
+                    )
+        entries = expanded_entries
+    if not isinstance(entries, list) or not entries:
+        raise ValueError(f"planner cost profile has no entries: {path}")
+
+    profile_costs: Dict[PlanKind, List[Tuple[int, int, int]]] = {}
+    by_kind_values: Dict[PlanKind, List[int]] = {}
+    for entry in entries:
+        kind = normalize_planner_kind(str(entry["planner"]))
+        active_count = int(entry.get("active_experts", entry.get("num_active", 0)))
+        cores = int(entry["cores"])
+        cost_ns = int(entry[metric])
+        profile_costs.setdefault(kind, []).append((active_count, cores, cost_ns))
+        by_kind_values.setdefault(kind, []).append(cost_ns)
+
+    static_costs = dict(DEFAULT_PLANNER_COSTS_NS)
+    for kind, values in by_kind_values.items():
+        ordered = sorted(values)
+        static_costs[kind] = ordered[len(ordered) // 2]
+
+    coefficients = dict(COMPLEXITY_COST_COEFFICIENTS_NS)
+    raw_coefficients = payload.get("calibrated_coefficients_ns", {})
+    if isinstance(raw_coefficients, dict):
+        for key, value in raw_coefficients.items():
+            if key in coefficients:
+                coefficients[key] = int(value)
+
+    return profile_costs, static_costs, coefficients, metric
+
+
 def build_planner_cost_model(
     source: str,
     overrides: Optional[Sequence[str]],
+    profile_path: Optional[Path] = None,
 ) -> PlannerCostModel:
     if source == "measured":
         return PlannerCostModel(
             source="measured",
             static_costs_ns=dict(DEFAULT_PLANNER_COSTS_NS),
+        )
+
+    if source in {"native_table", "profile"}:
+        if profile_path is None:
+            raise ValueError(
+                "--planner-cost-profile is required for "
+                f"source={source}"
+            )
+        profile_costs, static_costs, coefficients, metric = (
+            load_native_planner_cost_profile(profile_path)
+        )
+        return PlannerCostModel(
+            source="native_table",
+            static_costs_ns=static_costs,
+            profile_costs_ns=profile_costs,
+            profile_metric=metric,
+            profile_source=str(profile_path),
+            coefficients_ns=coefficients,
         )
 
     override_costs_ns: Dict[PlanKind, int] = {}
@@ -1086,6 +1312,7 @@ def build_planner_cost_model(
         source=source,
         static_costs_ns=dict(DEFAULT_PLANNER_COSTS_NS),
         override_costs_ns=override_costs_ns,
+        coefficients_ns=dict(COMPLEXITY_COST_COEFFICIENTS_NS),
     )
 
 
@@ -1098,6 +1325,7 @@ def build_plans(
 ) -> List[Plan]:
     planners = {
         "fixed": plan_fixed_global_threads,
+        "balanced": plan_sorted_token_balanced_1t,
         "uniform": plan_uniform_waves,
         "greedy": plan_greedy_marginal_gain,
         "groups": plan_enumerate_core_groups,
@@ -1132,10 +1360,20 @@ def planner_cost_summary(planner_cost_model: PlannerCostModel) -> str:
                 )
             )
             override_text = f" overrides=[{overrides}]"
-        return "source=complexity features=A,C,lookups,scans,sorts,waves" + override_text
+        return (
+            "source=complexity features=A,C,lookups,scans,sorts,waves"
+            + override_text
+        )
 
     if planner_cost_model.source == "measured":
         return "source=measured_python_wall_time"
+
+    if planner_cost_model.source in {"native_table", "profile"}:
+        return (
+            "source=native_table "
+            f"metric={planner_cost_model.profile_metric} "
+            f"profile={planner_cost_model.profile_source}"
+        )
 
     def configured_cost(kind: PlanKind) -> int:
         return planner_cost_model.override_costs_ns.get(
@@ -1146,6 +1384,8 @@ def planner_cost_summary(planner_cost_model: PlannerCostModel) -> str:
     return (
         "source=model "
         f"fixed={format_ns(configured_cost(PlanKind.FIXED_GLOBAL_THREADS))} "
+        "balanced="
+        f"{format_ns(configured_cost(PlanKind.SORTED_TOKEN_BALANCED_1T))} "
         f"uniform={format_ns(configured_cost(PlanKind.UNIFORM_WAVES))} "
         f"greedy={format_ns(configured_cost(PlanKind.GREEDY_MARGINAL_GAIN))} "
         f"groups={format_ns(configured_cost(PlanKind.ENUMERATE_CORE_GROUPS))}"
@@ -1235,7 +1475,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--planner",
         action="append",
-        choices=["all", "auto", "fixed", "uniform", "greedy", "groups"],
+        choices=[
+            "all",
+            "auto",
+            "fixed",
+            "balanced",
+            "uniform",
+            "greedy",
+            "groups",
+        ],
         default=None,
         help="Planner to run. Can be passed multiple times.",
     )
@@ -1247,11 +1495,23 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--plan-cost-source",
-        choices=["complexity", "model", "measured"],
+        choices=["complexity", "model", "measured", "native_table", "profile"],
         default="complexity",
         help=(
-            "Use complexity-based cost, static model cost, or Python measured "
-            "wall time for scoring."
+            "Use complexity-based cost, static model cost, Python measured "
+            "wall time, or a native C++ planner timing table for scoring. "
+            "'profile' is kept as an alias for native_table."
+        ),
+    )
+    parser.add_argument(
+        "--planner-cost-profile",
+        type=Path,
+        default=None,
+        help=(
+            "Native planner cost profile generated by "
+            "benchmarks/profile_native_planner_cost.py or a compact table "
+            "generated by cost_model/build_lightweight_planner_cost.py. Used "
+            "only with --plan-cost-source native_table/profile."
         ),
     )
     parser.add_argument(
@@ -1290,6 +1550,7 @@ def main() -> int:
     planner_cost_model = build_planner_cost_model(
         source=args.plan_cost_source,
         overrides=args.planner_cost,
+        profile_path=args.planner_cost_profile,
     )
     routes = generate_routes(
         distribution=args.distribution,
@@ -1348,6 +1609,11 @@ def main() -> int:
             "cluster_experts": args.cluster_experts,
             "background_fraction": args.background_fraction,
             "plan_cost_source": args.plan_cost_source,
+            "planner_cost_profile": (
+                str(args.planner_cost_profile)
+                if args.planner_cost_profile is not None
+                else None
+            ),
             "planner_cost_model": {
                 "source": planner_cost_model.source,
                 "static_costs_ns": {

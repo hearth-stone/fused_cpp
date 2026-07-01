@@ -82,6 +82,7 @@ T_plan(plan) + T_execute(plan)
 - [`benchmarks/synthetic_sweep.py`](./benchmarks/synthetic_sweep.py)：系统扫描 synthetic routing distributions，比较不同 planner 的 planning-aware / execution-only 结果。
 - [`benchmarks/selector_stress.py`](./benchmarks/selector_stress.py)：参数网格压力测试，用于发现 `AUTO` selector 的 regret 边界。
 - [`benchmarks/scheduled_bridge_bench.py`](./benchmarks/scheduled_bridge_bench.py)：把 offline simulator 生成的 plan 转成 `fused_moe_bf16_tiled_scheduled` 的 bridge tensors，并测真实 C++ kernel 耗时。
+- [`FINDINGS.md`](./FINDINGS.md)：10 个 planner 的 C++ 实现（`csrc/moe_planner/`）、对 Python 的逐位等价、隔离 `T_plan` 基准、以及对 best-of-10 和**精确最优**的 regret 评测结论。C++ 入口：`fused_cpp._C.moe_schedule_plan` / `moe_exact_optimum`。
 
 ## 当前可运行闭环
 
@@ -107,10 +108,11 @@ python cpu_moe_schedule_optimization/planners/offline_simulator.py \
 固定模型默认值为：
 
 ```text
-fixed   = 1 us
-uniform = 5 us
-greedy  = 20 us
-groups  = 30 us
+fixed    = 1 us
+balanced = 2 us
+uniform  = 5 us
+greedy   = 20 us
+groups   = 30 us
 ```
 
 可以用 `--planner-cost` 覆盖：
@@ -121,6 +123,7 @@ python cpu_moe_schedule_optimization/planners/offline_simulator.py \
   --cores 16 \
   --plan-cost-source model \
   --planner-cost fixed=1us \
+  --planner-cost balanced=2us \
   --planner-cost uniform=5us \
   --planner-cost greedy=20us \
   --planner-cost groups=30us
@@ -146,7 +149,11 @@ T_expert(routes, threads) -> ns
 当前 C++ scheduled bridge 会在 team 内根据 GEMM 形状自动选择 M-split 或 N-split，因此修改 kernel 后需要重新 profile 这张表。可以用单 active expert 的真实 kernel 调用生成 JSON：
 
 ```bash
-PYTHONPATH=src .venv/bin/python \
+OMP_NUM_THREADS=1 OMP_DYNAMIC=FALSE OMP_PROC_BIND=close \
+MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 \
+FUSED_CPP_MOE_PIN_THREADS=1 \
+FUSED_CPP_MOE_PIN_THREAD_CPUS=0,1,2,3,4,5,6,7 \
+taskset -c 0-7 .venv/bin/python \
   cpu_moe_schedule_optimization/cost_model/profile_expert_cost.py \
   --output cpu_moe_schedule_optimization/cost_model/profiles/local_dsv4_8c.json \
   --hidden-size 4096 \
@@ -157,13 +164,19 @@ PYTHONPATH=src .venv/bin/python \
   --runs 30
 ```
 
+仓库内当前的 AWS 8 核 pinned profile 是：
+
+```text
+cpu_moe_schedule_optimization/cost_model/profiles/aws_dsv4_8c_pinned_auto_mn_20260630.json
+```
+
 生成后可以让 offline simulator 使用这张表：
 
 ```bash
 python cpu_moe_schedule_optimization/planners/offline_simulator.py \
   --distribution zipf \
   --cores 8 \
-  --cost-table cpu_moe_schedule_optimization/cost_model/profiles/local_dsv4_8c.json
+  --cost-table cpu_moe_schedule_optimization/cost_model/profiles/aws_dsv4_8c_pinned_auto_mn_20260630.json
 ```
 
 也可以直接把它接到真实 scheduled bridge benchmark：
@@ -177,7 +190,7 @@ PYTHONPATH=src .venv/bin/python \
   --top-k 6 \
   --cores 8 \
   --planner groups \
-  --cost-table cpu_moe_schedule_optimization/cost_model/profiles/local_dsv4_8c.json
+  --cost-table cpu_moe_schedule_optimization/cost_model/profiles/aws_dsv4_8c_pinned_auto_mn_20260630.json
 ```
 
 不接真实 routing dump 时，可以先跑 synthetic sweep：
@@ -185,7 +198,8 @@ PYTHONPATH=src .venv/bin/python \
 ```bash
 python -B cpu_moe_schedule_optimization/benchmarks/synthetic_sweep.py \
   --case-set smoke \
-  --cores 16
+  --cores 8 \
+  --cost-table cpu_moe_schedule_optimization/cost_model/profiles/aws_dsv4_8c_pinned_auto_mn_20260630.json
 ```
 
 `--cores` 默认是 16。smoke sweep 里也包含显式的 8-core DSV4-like 场景：
@@ -198,6 +212,7 @@ dsv4_broad_heavytail_8c
 输出会比较：
 
 - `FIXED_GLOBAL_THREADS`
+- `SORTED_TOKEN_BALANCED_1T`
 - `UNIFORM_WAVES`
 - `GREEDY_MARGINAL_GAIN`
 - `ENUMERATE_CORE_GROUPS`
@@ -247,13 +262,16 @@ python -B cpu_moe_schedule_optimization/planners/offline_simulator.py \
 ```json
 {
   "num_threads": 8,
+  "thread_cpu_ids": [0, 1, 2, 3, 4, 5, 6, 7],
   "wave_offsets": [0, 6],
   "team_expert_ids": [0, 1, 2, 3, 4, 5],
   "team_threads": [3, 1, 1, 1, 1, 1]
 }
 ```
 
-这些字段可以直接转成 `torch.int32` tensor 传给 `fused_moe_bf16_tiled_scheduled`。
+这些字段可以直接转成 `torch.int32` tensor 传给
+`fused_moe_bf16_tiled_scheduled`。`thread_cpu_ids` 表示 logical worker
+thread 到 physical CPU id 的映射，长度必须等于 `num_threads`。
 
 ### Real scheduled kernel benchmark
 

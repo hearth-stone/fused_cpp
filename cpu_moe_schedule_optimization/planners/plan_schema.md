@@ -138,6 +138,7 @@ experimental `fused_moe_bf16_tiled_scheduled` C++ entrypoint:
 ```json
 {
   "num_threads": 8,
+  "thread_cpu_ids": [0, 1, 2, 3, 4, 5, 6, 7],
   "wave_offsets": [0, 4, 6],
   "team_expert_ids": [3, 8, 1, 6, 0, 5],
   "team_threads": [4, 2, 1, 1, 4, 4]
@@ -147,6 +148,9 @@ experimental `fused_moe_bf16_tiled_scheduled` C++ entrypoint:
 Rules:
 
 - `num_threads` is the worker thread count passed to the C++ kernel.
+- `thread_cpu_ids` maps logical worker thread id to a physical CPU id. It must
+  have length `num_threads`. If omitted by a legacy caller, the runtime falls
+  back to the environment/default pinning policy.
 - `wave_offsets` has length `num_waves + 1`.
 - Teams in wave `i` are in
   `[wave_offsets[i], wave_offsets[i + 1])`.
@@ -154,8 +158,6 @@ Rules:
 - The sum of `team_threads` inside each wave must be `<= num_threads`.
 - The first bridge implementation requires exactly one team per active expert.
   It does not yet support splitting one expert across multiple teams.
-- Physical core ids are not represented yet. Current plans control logical
-  thread grouping only.
 
 The current C++ bridge accepts these arrays as `torch.int32` or another integer
 CPU dtype and reconstructs the same wave/team structure natively.
@@ -165,6 +167,10 @@ CPU dtype and reconstructs the same wave/team structure natively.
 Current first-stage planner kinds:
 
 - `FIXED_GLOBAL_THREADS`: one thread per expert, packed into waves.
+- `SORTED_TOKEN_BALANCED_1T`: sort active experts by routed-token count and
+  greedily assign each one-thread expert to the lightest logical core queue;
+  the queues are then emitted as wave-aligned scheduled teams. This is the
+  default strong baseline for comparing richer planners.
 - `UNIFORM_WAVES`: enumerate one uniform `threads_per_expert`.
 - `GREEDY_MARGINAL_GAIN`: greedily add thread slots where the model predicts the
   largest expert-time reduction.
