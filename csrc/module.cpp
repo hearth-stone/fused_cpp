@@ -482,8 +482,13 @@ void set_acl_thread_affinity(int64_t core_start, int64_t core_end,
                              int64_t num_threads);
 std::tuple<int64_t, int64_t, int64_t> get_acl_thread_affinity();
 
+// CPU MoE schedule planners — csrc/moe_planner/bindings.cpp
+void register_moe_planner(pybind11::module_& m);
+
 PYBIND11_MODULE(_C, m) {
     m.doc() = "fused_cpp C++ extension kernels";
+
+    register_moe_planner(m);
 
     m.def("rms_norm", &rms_norm, "RMSNorm: normalize in fp32, cast back, multiply by weight",
           py::arg("x"), py::arg("weight"), py::arg("eps"));
