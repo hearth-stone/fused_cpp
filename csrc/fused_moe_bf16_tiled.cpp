@@ -39,6 +39,20 @@ void bf16gemm_k_ld2(const uint16_t* A, const uint16_t* B_reo, float* C,
                     uint16_t* A_reorder, const gemm_params_t* params);
 void bf16gemm_k_ld4(const uint16_t* A, const uint16_t* B_reo, float* C,
                     uint16_t* A_reorder, const gemm_params_t* params);
+// Bias-fused variants: identical to the plain kernels but add a per-column
+// fp32 bias during the (zero-init) store stage. bias points at N fp32 values.
+void bf16gemm_k_ld_bias_f(const uint16_t* A, const uint16_t* B_reo, float* C,
+                          uint16_t* A_reorder, const gemm_params_t* params,
+                          const float* bias);
+void bf16gemm_k_ld1_bias_f(const uint16_t* A, const uint16_t* B_reo, float* C,
+                           uint16_t* A_reorder, const gemm_params_t* params,
+                           const float* bias);
+void bf16gemm_k_ld2_bias_f(const uint16_t* A, const uint16_t* B_reo, float* C,
+                           uint16_t* A_reorder, const gemm_params_t* params,
+                           const float* bias);
+void bf16gemm_k_ld4_bias_f(const uint16_t* A, const uint16_t* B_reo, float* C,
+                           uint16_t* A_reorder, const gemm_params_t* params,
+                           const float* bias);
 }
 #endif
 
@@ -137,6 +151,47 @@ float bf16_bits_to_float(uint16_t bits) {
     return value;
 }
 
+enum class MoeGemmStage {
+    kW13,
+    kW2,
+};
+
+enum class MoeGemmSplit {
+    kM,
+    kN,
+};
+
+MoeGemmSplit choose_moe_gemm_split(MoeGemmStage stage,
+                                   int M,
+                                   int N,
+                                   int64_t group_size) {
+    if (group_size <= 1) {
+        return MoeGemmSplit::kN;
+    }
+
+    if (stage == MoeGemmStage::kW13) {
+        if (group_size == 8 && M >= 512) {
+            return MoeGemmSplit::kM;
+        }
+        if (group_size == 4 && M >= 1024) {
+            return MoeGemmSplit::kM;
+        }
+        if (group_size == 2 && M <= 32) {
+            return MoeGemmSplit::kM;
+        }
+        return group_size > 8 && M > N ? MoeGemmSplit::kM
+                                       : MoeGemmSplit::kN;
+    }
+
+    if (group_size == 8 && M >= 4096) {
+        return MoeGemmSplit::kM;
+    }
+    if (group_size == 4 && M >= 8192) {
+        return MoeGemmSplit::kM;
+    }
+    return group_size > 8 && M > N ? MoeGemmSplit::kM : MoeGemmSplit::kN;
+}
+
 #ifdef __aarch64__
 
 void bf16_pack_b(const uint16_t* B, uint16_t* B_reo, int K, int N) {
@@ -166,7 +221,8 @@ void dispatch_fp32_gemm(const uint16_t* A,
                         int M,
                         int K,
                         int N,
-                        int ldc) {
+                        int ldc,
+                        const float* bias = nullptr) {
     gemm_params_t p;
     p.lda = K;
     p.ldb = K;
@@ -178,7 +234,11 @@ void dispatch_fp32_gemm(const uint16_t* A,
         p.m = m_full;
         p.k = K;
         p.n = N;
-        bf16gemm_k_ld(A, B_reo, C, A_reorder, &p);
+        if (bias != nullptr) {
+            bf16gemm_k_ld_bias_f(A, B_reo, C, A_reorder, &p, bias);
+        } else {
+            bf16gemm_k_ld(A, B_reo, C, A_reorder, &p);
+        }
         processed = m_full;
     }
 
@@ -195,7 +255,11 @@ void dispatch_fp32_gemm(const uint16_t* A,
         p.m = 4;
         p.k = K;
         p.n = N;
-        bf16gemm_k_ld4(At, B_reo, Ct, A_reo_t, &p);
+        if (bias != nullptr) {
+            bf16gemm_k_ld4_bias_f(At, B_reo, Ct, A_reo_t, &p, bias);
+        } else {
+            bf16gemm_k_ld4(At, B_reo, Ct, A_reo_t, &p);
+        }
         processed += 4;
         m_rem -= 4;
         At = A + static_cast<int64_t>(processed) * K;
@@ -206,7 +270,11 @@ void dispatch_fp32_gemm(const uint16_t* A,
         p.m = 2;
         p.k = K;
         p.n = N;
-        bf16gemm_k_ld2(At, B_reo, Ct, A_reo_t, &p);
+        if (bias != nullptr) {
+            bf16gemm_k_ld2_bias_f(At, B_reo, Ct, A_reo_t, &p, bias);
+        } else {
+            bf16gemm_k_ld2(At, B_reo, Ct, A_reo_t, &p);
+        }
         processed += 2;
         m_rem -= 2;
         At = A + static_cast<int64_t>(processed) * K;
@@ -217,70 +285,84 @@ void dispatch_fp32_gemm(const uint16_t* A,
         p.m = 1;
         p.k = K;
         p.n = N;
-        bf16gemm_k_ld1(At, B_reo, Ct, A_reo_t, &p);
+        if (bias != nullptr) {
+            bf16gemm_k_ld1_bias_f(At, B_reo, Ct, A_reo_t, &p, bias);
+        } else {
+            bf16gemm_k_ld1(At, B_reo, Ct, A_reo_t, &p);
+        }
     }
 }
 
-void dispatch_fp32_gemm_n_split(const uint16_t* A,
-                                const uint16_t* B_reo,
-                                float* C,
-                                uint16_t* A_reorder,
-                                int M,
-                                int K,
-                                int N,
-                                int ldc,
-                                int64_t group_size,
-                                int64_t local_tid) {
-    const SplitRange range = n_split_range(N, group_size, local_tid);
+template <MoeGemmSplit Split>
+SplitRange gemm_split_range(int M,
+                            int N,
+                            int64_t group_size,
+                            int64_t local_tid) {
+    if constexpr (Split == MoeGemmSplit::kM) {
+        return m_split_range(M, group_size, local_tid);
+    } else {
+        return n_split_range(N, group_size, local_tid);
+    }
+}
+
+template <MoeGemmSplit Split>
+void dispatch_fp32_gemm_split(const uint16_t* A,
+                              const uint16_t* B_reo,
+                              float* C,
+                              uint16_t* A_reorder,
+                              int M,
+                              int K,
+                              int N,
+                              int ldc,
+                              int64_t group_size,
+                              int64_t local_tid,
+                              const float* bias = nullptr) {
+    const SplitRange range =
+        gemm_split_range<Split>(M, N, group_size, local_tid);
     if (range.size <= 0) {
         return;
     }
 
-    const int64_t start_block = range.begin / kKernelTile;
-    const uint16_t* B_slice = B_reo + start_block * K * kKernelTile;
-    float* C_slice = C + range.begin;
-    dispatch_fp32_gemm(A, B_slice, C_slice, A_reorder, M, K,
-                       static_cast<int>(range.size), ldc);
+    if constexpr (Split == MoeGemmSplit::kM) {
+        const uint16_t* A_slice = A + range.begin * K;
+        float* C_slice = C + range.begin * ldc;
+        // Row split: every thread spans the full N, so bias is unchanged.
+        dispatch_fp32_gemm(A_slice, B_reo, C_slice, A_reorder,
+                           static_cast<int>(range.size), K, N, ldc, bias);
+    } else {
+        const int64_t start_block = range.begin / kKernelTile;
+        const uint16_t* B_slice = B_reo + start_block * K * kKernelTile;
+        float* C_slice = C + range.begin;
+        // Column split: bias is per-column, so offset it by the N range.
+        const float* bias_slice =
+            bias != nullptr ? bias + range.begin : nullptr;
+        dispatch_fp32_gemm(A, B_slice, C_slice, A_reorder, M, K,
+                           static_cast<int>(range.size), ldc, bias_slice);
+    }
 }
 
-void dispatch_fp32_gemm_m_split(const uint16_t* A,
-                                const uint16_t* B_reo,
-                                float* C,
-                                uint16_t* A_reorder,
-                                int M,
-                                int K,
-                                int N,
-                                int ldc,
-                                int64_t group_size,
-                                int64_t local_tid) {
-    const SplitRange range = m_split_range(M, group_size, local_tid);
-    if (range.size <= 0) {
+void dispatch_fp32_gemm_stage_split(MoeGemmStage stage,
+                                    const uint16_t* A,
+                                    const uint16_t* B_reo,
+                                    float* C,
+                                    uint16_t* A_reorder,
+                                    int M,
+                                    int K,
+                                    int N,
+                                    int ldc,
+                                    int64_t group_size,
+                                    int64_t local_tid,
+                                    const float* bias = nullptr) {
+    const MoeGemmSplit split =
+        choose_moe_gemm_split(stage, M, N, group_size);
+    if (split == MoeGemmSplit::kM) {
+        dispatch_fp32_gemm_split<MoeGemmSplit::kM>(
+            A, B_reo, C, A_reorder, M, K, N, ldc, group_size, local_tid,
+            bias);
         return;
     }
-
-    const uint16_t* A_slice = A + range.begin * K;
-    float* C_slice = C + range.begin * ldc;
-    dispatch_fp32_gemm(A_slice, B_reo, C_slice, A_reorder,
-                       static_cast<int>(range.size), K, N, ldc);
-}
-
-void dispatch_fp32_gemm_auto_split(const uint16_t* A,
-                                   const uint16_t* B_reo,
-                                   float* C,
-                                   uint16_t* A_reorder,
-                                   int M,
-                                   int K,
-                                   int N,
-                                   int ldc,
-                                   int64_t group_size,
-                                   int64_t local_tid) {
-    if (M > N) {
-        dispatch_fp32_gemm_m_split(A, B_reo, C, A_reorder, M, K, N, ldc,
-                                   group_size, local_tid);
-        return;
-    }
-    dispatch_fp32_gemm_n_split(A, B_reo, C, A_reorder, M, K, N, ldc,
-                               group_size, local_tid);
+    dispatch_fp32_gemm_split<MoeGemmSplit::kN>(
+        A, B_reo, C, A_reorder, M, K, N, ldc, group_size, local_tid, bias);
 }
 
 #endif
@@ -316,18 +398,6 @@ PackedExperts checked_packed_experts(const at::Tensor& packed,
                          expected_stride};
 }
 
-float read_optional_bias(const c10::optional<at::Tensor>& bias,
-                         int64_t offset) {
-    if (!bias.has_value() || !bias.value().defined()) {
-        return 0.0f;
-    }
-    const at::Tensor& b = bias.value();
-    if (b.scalar_type() == at::kFloat) {
-        return b.data_ptr<float>()[offset];
-    }
-    return bf16_bits_to_float(bf16_data_const(b)[offset]);
-}
-
 void check_optional_bias(const c10::optional<at::Tensor>& bias,
                          int64_t E,
                          int64_t N,
@@ -347,33 +417,36 @@ void check_optional_bias(const c10::optional<at::Tensor>& bias,
     TORCH_CHECK(b.is_contiguous(), name, " must be contiguous");
 }
 
-void apply_gate_up_bias(float* gate_up,
-                        int64_t rows,
-                        int64_t stride,
-                        int64_t N,
-                        int64_t expert,
-                        const c10::optional<at::Tensor>& bias) {
+// Build a per-expert padded fp32 bias buffer [E, N_pad] from an optional
+// [E, N] bias (fp32 or bf16). Padded columns [N, N_pad) are left zero so the
+// fused-bias GEMM kernel contributes nothing there. Returns an undefined
+// tensor when no bias is present, in which case callers fall back to the
+// plain (non-bias) GEMM kernel.
+at::Tensor build_padded_bias_f32(const c10::optional<at::Tensor>& bias,
+                                 int64_t E,
+                                 int64_t N,
+                                 int64_t N_pad) {
     if (!bias.has_value() || !bias.value().defined()) {
-        return;
+        return at::Tensor();
     }
-    const int64_t base = expert * N;
-    for (int64_t m = 0; m < rows; ++m) {
-        float* row = gate_up + m * stride;
-        for (int64_t n = 0; n < N; ++n) {
-            row[n] += read_optional_bias(bias, base + n);
+    at::Tensor out =
+        at::zeros({E, N_pad}, at::TensorOptions().dtype(at::kFloat));
+    float* dst = out.data_ptr<float>();
+    const at::Tensor& b = bias.value();
+    if (b.scalar_type() == at::kFloat) {
+        const float* src = b.data_ptr<float>();
+        for (int64_t e = 0; e < E; ++e) {
+            std::copy(src + e * N, src + e * N + N, dst + e * N_pad);
+        }
+    } else {
+        const uint16_t* src = bf16_data_const(b);
+        for (int64_t e = 0; e < E; ++e) {
+            for (int64_t n = 0; n < N; ++n) {
+                dst[e * N_pad + n] = bf16_bits_to_float(src[e * N + n]);
+            }
         }
     }
-}
-
-void apply_gate_up_bias_range(float* gate_up,
-                              int64_t row_begin,
-                              int64_t rows,
-                              int64_t stride,
-                              int64_t N,
-                              int64_t expert,
-                              const c10::optional<at::Tensor>& bias) {
-    apply_gate_up_bias(gate_up + row_begin * stride, rows, stride, N, expert,
-                       bias);
+    return out;
 }
 
 void silu_and_mul_to_bf16(const float* gate_up,
@@ -557,6 +630,10 @@ struct MoeTraceConfig {
 struct MoeGemmTraceRecord {
     uint64_t seq = 0;
     int64_t tid = -1;
+    int64_t cpu = -1;
+    int64_t affinity_first_cpu = -1;
+    int64_t affinity_cpu_count = 0;
+    int64_t wave = -1;
     int64_t group = -1;
     int64_t local_tid = -1;
     int64_t expert = -1;
@@ -569,6 +646,21 @@ struct MoeGemmTraceRecord {
     int64_t ldc = 0;
     int64_t n_begin = 0;
     int64_t n_cols = 0;
+    double ms = 0.0;
+};
+
+struct MoePhaseTraceRecord {
+    uint64_t seq = 0;
+    int64_t tid = -1;
+    int64_t cpu = -1;
+    int64_t affinity_first_cpu = -1;
+    int64_t affinity_cpu_count = 0;
+    int64_t wave = -1;
+    int64_t group = -1;
+    int64_t local_tid = -1;
+    int64_t expert = -1;
+    int64_t rows = 0;
+    const char* stage = "";
     double ms = 0.0;
 };
 
@@ -651,6 +743,29 @@ int64_t current_affinity_first_cpu() {
     return 0;
 }
 
+std::vector<int64_t> current_affinity_cpus(int64_t fallback_threads) {
+    std::vector<int64_t> cpus;
+#ifdef __linux__
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    if (pthread_getaffinity_np(pthread_self(), sizeof(cpuset), &cpuset) == 0) {
+        for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+            if (CPU_ISSET(cpu, &cpuset)) {
+                cpus.push_back(static_cast<int64_t>(cpu));
+            }
+        }
+    }
+#endif
+    if (cpus.empty()) {
+        const int64_t count = std::max<int64_t>(fallback_threads, 1);
+        cpus.reserve(static_cast<size_t>(count));
+        for (int64_t cpu = 0; cpu < count; ++cpu) {
+            cpus.push_back(cpu);
+        }
+    }
+    return cpus;
+}
+
 std::vector<int64_t> relative_core_bases_from_affinity(int64_t core_skip) {
     const int64_t first_cpu = current_affinity_first_cpu();
     return std::vector<int64_t>{first_cpu, first_cpu + core_skip};
@@ -711,6 +826,7 @@ public:
     }
 
     void record_gemm(int64_t tid,
+                     int64_t wave,
                      int64_t group,
                      int64_t local_tid,
                      int64_t expert,
@@ -731,6 +847,14 @@ public:
         record.seq = next_seq_.fetch_add(uint64_t{1},
                                          std::memory_order_relaxed);
         record.tid = tid;
+#ifdef __linux__
+        record.cpu = sched_getcpu();
+#endif
+        const std::vector<int64_t> affinity_cpus = current_affinity_cpus(1);
+        record.affinity_first_cpu = affinity_cpus.front();
+        record.affinity_cpu_count =
+            static_cast<int64_t>(affinity_cpus.size());
+        record.wave = wave;
         record.group = group;
         record.local_tid = local_tid;
         record.expert = expert;
@@ -746,6 +870,39 @@ public:
         record.ms = ms;
         std::lock_guard<std::mutex> lock(mutex_);
         records_.push_back(record);
+    }
+
+    void record_phase(int64_t tid,
+                      int64_t wave,
+                      int64_t group,
+                      int64_t local_tid,
+                      int64_t expert,
+                      int64_t rows,
+                      const char* stage,
+                      double ms) {
+        if (!enabled()) {
+            return;
+        }
+        MoePhaseTraceRecord record;
+        record.seq = next_seq_.fetch_add(uint64_t{1},
+                                         std::memory_order_relaxed);
+        record.tid = tid;
+#ifdef __linux__
+        record.cpu = sched_getcpu();
+#endif
+        const std::vector<int64_t> affinity_cpus = current_affinity_cpus(1);
+        record.affinity_first_cpu = affinity_cpus.front();
+        record.affinity_cpu_count =
+            static_cast<int64_t>(affinity_cpus.size());
+        record.wave = wave;
+        record.group = group;
+        record.local_tid = local_tid;
+        record.expert = expert;
+        record.rows = rows;
+        record.stage = stage;
+        record.ms = ms;
+        std::lock_guard<std::mutex> lock(mutex_);
+        phase_records_.push_back(record);
     }
 
     void write_report(const char* strategy,
@@ -766,13 +923,20 @@ public:
         }
 
         std::vector<MoeGemmTraceRecord> records;
+        std::vector<MoePhaseTraceRecord> phase_records;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             records = records_;
+            phase_records = phase_records_;
         }
         std::sort(records.begin(), records.end(),
                   [](const MoeGemmTraceRecord& lhs,
                      const MoeGemmTraceRecord& rhs) {
+                      return lhs.seq < rhs.seq;
+                  });
+        std::sort(phase_records.begin(), phase_records.end(),
+                  [](const MoePhaseTraceRecord& lhs,
+                     const MoePhaseTraceRecord& rhs) {
                       return lhs.seq < rhs.seq;
                   });
 
@@ -785,7 +949,8 @@ public:
             "MOE_CALL call_id=%llu strategy=%s e2e_ms=%.6f "
             "threads=%lld tokens=%lld top_k=%lld experts=%lld routes=%lld "
             "H=%lld F=%lld micro_tiles=%zu expert_tasks=%lld "
-            "nsplit_groups=%lld nsplit_group_size=%lld gemm_count=%zu\n",
+            "nsplit_groups=%lld nsplit_group_size=%lld gemm_count=%zu "
+            "phase_count=%zu\n",
             static_cast<unsigned long long>(call_id_),
             strategy,
             e2e_ms,
@@ -800,21 +965,28 @@ public:
             static_cast<long long>(expert_tasks),
             static_cast<long long>(nsplit_groups),
             static_cast<long long>(nsplit_group_size),
-            records.size());
+            records.size(),
+            phase_records.size());
         std::fprintf(
             file,
-            "GEMM_FIELDS call_id seq tid group local_tid expert route_begin "
+            "GEMM_FIELDS call_id seq tid cpu affinity_first_cpu "
+            "affinity_cpu_count wave group local_tid expert route_begin "
             "rows stage M K N ldc n_begin n_cols ms\n");
         for (const MoeGemmTraceRecord& record : records) {
             std::fprintf(
                 file,
-                "GEMM call_id=%llu seq=%llu tid=%lld group=%lld "
-                "local_tid=%lld expert=%lld route_begin=%lld rows=%lld "
-                "stage=%s M=%lld K=%lld N=%lld ldc=%lld n_begin=%lld "
-                "n_cols=%lld ms=%.6f\n",
+                "GEMM call_id=%llu seq=%llu tid=%lld cpu=%lld "
+                "affinity_first_cpu=%lld affinity_cpu_count=%lld wave=%lld "
+                "group=%lld local_tid=%lld expert=%lld route_begin=%lld "
+                "rows=%lld stage=%s M=%lld K=%lld N=%lld ldc=%lld "
+                "n_begin=%lld n_cols=%lld ms=%.6f\n",
                 static_cast<unsigned long long>(call_id_),
                 static_cast<unsigned long long>(record.seq),
                 static_cast<long long>(record.tid),
+                static_cast<long long>(record.cpu),
+                static_cast<long long>(record.affinity_first_cpu),
+                static_cast<long long>(record.affinity_cpu_count),
+                static_cast<long long>(record.wave),
                 static_cast<long long>(record.group),
                 static_cast<long long>(record.local_tid),
                 static_cast<long long>(record.expert),
@@ -829,6 +1001,31 @@ public:
                 static_cast<long long>(record.n_cols),
                 record.ms);
         }
+        std::fprintf(
+            file,
+            "PHASE_FIELDS call_id seq tid cpu affinity_first_cpu "
+            "affinity_cpu_count wave group local_tid expert rows stage ms\n");
+        for (const MoePhaseTraceRecord& record : phase_records) {
+            std::fprintf(
+                file,
+                "PHASE call_id=%llu seq=%llu tid=%lld cpu=%lld "
+                "affinity_first_cpu=%lld affinity_cpu_count=%lld wave=%lld "
+                "group=%lld local_tid=%lld expert=%lld rows=%lld stage=%s "
+                "ms=%.6f\n",
+                static_cast<unsigned long long>(call_id_),
+                static_cast<unsigned long long>(record.seq),
+                static_cast<long long>(record.tid),
+                static_cast<long long>(record.cpu),
+                static_cast<long long>(record.affinity_first_cpu),
+                static_cast<long long>(record.affinity_cpu_count),
+                static_cast<long long>(record.wave),
+                static_cast<long long>(record.group),
+                static_cast<long long>(record.local_tid),
+                static_cast<long long>(record.expert),
+                static_cast<long long>(record.rows),
+                record.stage,
+                record.ms);
+        }
         std::fprintf(file, "MOE_CALL_END call_id=%llu\n",
                      static_cast<unsigned long long>(call_id_));
         std::fclose(file);
@@ -840,6 +1037,7 @@ private:
     std::atomic<uint64_t> next_seq_{0};
     std::mutex mutex_;
     std::vector<MoeGemmTraceRecord> records_;
+    std::vector<MoePhaseTraceRecord> phase_records_;
 };
 
 #ifdef __aarch64__
@@ -847,6 +1045,7 @@ private:
 void trace_dispatch_fp32_gemm(MoeTraceCollector& trace,
                               const char* stage,
                               int64_t tid,
+                              int64_t wave,
                               int64_t group,
                               int64_t local_tid,
                               int64_t expert,
@@ -859,45 +1058,53 @@ void trace_dispatch_fp32_gemm(MoeTraceCollector& trace,
                               int M,
                               int K,
                               int N,
-                              int ldc) {
+                              int ldc,
+                              const float* bias = nullptr) {
     if (!trace.enabled()) {
-        dispatch_fp32_gemm(A, B_reo, C, A_reorder, M, K, N, ldc);
+        dispatch_fp32_gemm(A, B_reo, C, A_reorder, M, K, N, ldc, bias);
         return;
     }
     const auto begin = ::fused_cpp::profile::now();
-    dispatch_fp32_gemm(A, B_reo, C, A_reorder, M, K, N, ldc);
+    dispatch_fp32_gemm(A, B_reo, C, A_reorder, M, K, N, ldc, bias);
     const double ms = ::fused_cpp::profile::elapsed_ms(begin);
-    trace.record_gemm(tid, group, local_tid, expert, route_begin, rows,
+    trace.record_gemm(tid, wave, group, local_tid, expert, route_begin, rows,
                       stage, M, K, N, ldc, 0, N, ms);
 }
 
-void trace_dispatch_fp32_gemm_auto_split(MoeTraceCollector& trace,
-                                         const char* stage,
-                                         int64_t tid,
-                                         int64_t group,
-                                         int64_t local_tid,
-                                         int64_t expert,
-                                         int64_t route_begin,
-                                         int64_t rows,
-                                         const uint16_t* A,
-                                         const uint16_t* B_reo,
-                                         float* C,
-                                         uint16_t* A_reorder,
-                                         int M,
-                                         int K,
-                                         int N,
-                                         int ldc,
-                                         int64_t group_size) {
-    const bool split_m = M > N;
+void trace_dispatch_fp32_gemm_stage_split(MoeTraceCollector& trace,
+                                          const char* stage_name,
+                                          MoeGemmStage stage,
+                                          int64_t tid,
+                                          int64_t wave,
+                                          int64_t group,
+                                          int64_t local_tid,
+                                          int64_t expert,
+                                          int64_t route_begin,
+                                          int64_t rows,
+                                          const uint16_t* A,
+                                          const uint16_t* B_reo,
+                                          float* C,
+                                          uint16_t* A_reorder,
+                                          int M,
+                                          int K,
+                                          int N,
+                                          int ldc,
+                                          int64_t group_size,
+                                          const float* bias = nullptr) {
+    const MoeGemmSplit split = choose_moe_gemm_split(stage, M, N, group_size);
+    const bool split_m = split == MoeGemmSplit::kM;
     const SplitRange range = split_m
-                                 ? m_split_range(M, group_size, local_tid)
-                                 : n_split_range(N, group_size, local_tid);
+                                 ? gemm_split_range<MoeGemmSplit::kM>(
+                                       M, N, group_size, local_tid)
+                                 : gemm_split_range<MoeGemmSplit::kN>(
+                                       M, N, group_size, local_tid);
     if (range.size <= 0) {
         return;
     }
     if (!trace.enabled()) {
-        dispatch_fp32_gemm_auto_split(A, B_reo, C, A_reorder, M, K, N,
-                                      ldc, group_size, local_tid);
+        dispatch_fp32_gemm_stage_split(stage, A, B_reo, C, A_reorder, M,
+                                       K, N, ldc, group_size, local_tid,
+                                       bias);
         return;
     }
 
@@ -907,24 +1114,21 @@ void trace_dispatch_fp32_gemm_auto_split(MoeTraceCollector& trace,
     int64_t trace_n_begin = 0;
     int64_t trace_n_cols = N;
     if (split_m) {
-        const uint16_t* A_slice = A + range.begin * K;
-        float* C_slice = C + range.begin * ldc;
-        dispatch_fp32_gemm(A_slice, B_reo, C_slice, A_reorder,
-                           static_cast<int>(range.size), K, N, ldc);
+        dispatch_fp32_gemm_split<MoeGemmSplit::kM>(
+            A, B_reo, C, A_reorder, M, K, N, ldc, group_size, local_tid,
+            bias);
         trace_route_begin += range.begin;
         trace_rows = range.size;
     } else {
-        const int64_t start_block = range.begin / kKernelTile;
-        const uint16_t* B_slice = B_reo + start_block * K * kKernelTile;
-        float* C_slice = C + range.begin;
-        dispatch_fp32_gemm(A, B_slice, C_slice, A_reorder, M, K,
-                           static_cast<int>(range.size), ldc);
+        dispatch_fp32_gemm_split<MoeGemmSplit::kN>(
+            A, B_reo, C, A_reorder, M, K, N, ldc, group_size, local_tid,
+            bias);
         trace_n_begin = range.begin;
         trace_n_cols = range.size;
     }
     const double ms = ::fused_cpp::profile::elapsed_ms(begin);
-    trace.record_gemm(tid, group, local_tid, expert, trace_route_begin,
-                      trace_rows, stage, M, K, N, ldc, trace_n_begin,
+    trace.record_gemm(tid, wave, group, local_tid, expert, trace_route_begin,
+                      trace_rows, stage_name, M, K, N, ldc, trace_n_begin,
                       trace_n_cols, ms);
 }
 
@@ -1101,6 +1305,59 @@ bool disable_resident_threads() {
     return env_flag_enabled("FUSED_CPP_MOE_DISABLE_RESIDENT_THREADS");
 }
 
+struct ThreadPinningConfig {
+    bool enabled = false;
+    std::vector<int64_t> cpus;
+
+    int64_t core_for_tid(int64_t tid) const {
+        if (!enabled || cpus.empty()) {
+            return -1;
+        }
+        return cpus[static_cast<size_t>(tid) % cpus.size()];
+    }
+};
+
+thread_local const ThreadPinningConfig* g_moe_thread_pinning_override =
+    nullptr;
+
+class ThreadPinningScope {
+public:
+    explicit ThreadPinningScope(const ThreadPinningConfig* config)
+        : previous_(g_moe_thread_pinning_override) {
+        g_moe_thread_pinning_override = config;
+    }
+
+    ThreadPinningScope(const ThreadPinningScope&) = delete;
+    ThreadPinningScope& operator=(const ThreadPinningScope&) = delete;
+
+    ~ThreadPinningScope() {
+        g_moe_thread_pinning_override = previous_;
+    }
+
+private:
+    const ThreadPinningConfig* previous_ = nullptr;
+};
+
+ThreadPinningConfig moe_thread_pinning_config(int64_t num_threads) {
+    if (g_moe_thread_pinning_override != nullptr) {
+        ThreadPinningConfig config = *g_moe_thread_pinning_override;
+        TORCH_CHECK(!config.enabled || !config.cpus.empty(),
+                    "explicit MoE thread pinning requires at least one CPU id");
+        return config;
+    }
+
+    ThreadPinningConfig config;
+    config.enabled = env_flag_enabled("FUSED_CPP_MOE_PIN_THREADS");
+    if (!config.enabled) {
+        return config;
+    }
+    config.cpus = env_int_list_or_default(
+        "FUSED_CPP_MOE_PIN_THREAD_CPUS", current_affinity_cpus(num_threads));
+    TORCH_CHECK(!config.cpus.empty(),
+                "FUSED_CPP_MOE_PIN_THREAD_CPUS must not be empty");
+    return config;
+}
+
 template <typename Fn>
 void run_fixed_threads_spawn(int64_t num_threads, const Fn& fn) {
     if (num_threads <= 1) {
@@ -1139,9 +1396,33 @@ public:
         }
     }
 
-    template <typename Fn>
-    void run(int64_t num_threads, const Fn& fn) {
+    void prepare(int64_t num_threads, const ThreadPinningConfig& pinning) {
         if (num_threads <= 1) {
+            return;
+        }
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+            TORCH_CHECK(!job_active_,
+                        "resident MoE thread pool does not support prepare "
+                        "while a job is active");
+            configure_worker_cores_locked(num_threads, pinning);
+            ensure_workers_locked(num_threads - 1);
+            ++generation_;
+        }
+        start_cv_.notify_all();
+    }
+
+    template <typename Fn>
+    void run(int64_t num_threads,
+             const ThreadPinningConfig& pinning,
+             const Fn& fn) {
+        if (num_threads <= 1) {
+            ThreadAffinityGuard affinity_guard;
+            if (pinning.enabled) {
+                const int64_t core = pinning.core_for_tid(0);
+                report_affinity_bind_error(
+                    0, core, bind_current_thread_to_core(core));
+            }
             fn(0);
             return;
         }
@@ -1154,6 +1435,7 @@ public:
             std::unique_lock<std::mutex> lock(mutex_);
             TORCH_CHECK(!job_active_,
                         "resident MoE thread pool does not support nested jobs");
+            configure_worker_cores_locked(num_threads, pinning);
             ensure_workers_locked(num_threads - 1);
             current_job_ = &job;
             requested_threads_ = num_threads;
@@ -1163,6 +1445,13 @@ public:
             ++generation_;
         }
         start_cv_.notify_all();
+
+        ThreadAffinityGuard affinity_guard;
+        if (pinning.enabled) {
+            const int64_t core = pinning.core_for_tid(0);
+            report_affinity_bind_error(
+                0, core, bind_current_thread_to_core(core));
+        }
 
         try {
             fn(0);
@@ -1188,6 +1477,16 @@ public:
     }
 
 private:
+    void configure_worker_cores_locked(int64_t num_threads,
+                                       const ThreadPinningConfig& pinning) {
+        const int64_t worker_count = std::max<int64_t>(num_threads - 1, 0);
+        worker_cores_.resize(static_cast<size_t>(worker_count), -1);
+        for (int64_t tid = 1; tid < num_threads; ++tid) {
+            worker_cores_[static_cast<size_t>(tid - 1)] =
+                pinning.enabled ? pinning.core_for_tid(tid) : -1;
+        }
+    }
+
     void ensure_workers_locked(int64_t worker_count) {
         while (static_cast<int64_t>(workers_.size()) < worker_count) {
             const int64_t tid = static_cast<int64_t>(workers_.size()) + 1;
@@ -1197,8 +1496,11 @@ private:
 
     void worker_loop(int64_t tid) {
         int64_t seen_generation = 0;
+        int64_t bound_core = std::numeric_limits<int64_t>::min();
         while (true) {
             std::function<void(int64_t)>* job = nullptr;
+            int64_t desired_core = -1;
+            bool should_run_job = false;
             {
                 std::unique_lock<std::mutex> lock(mutex_);
                 start_cv_.wait(lock, [&]() {
@@ -1208,10 +1510,27 @@ private:
                     return;
                 }
                 seen_generation = generation_;
-                if (tid >= requested_threads_) {
-                    continue;
+                if (tid > 0 &&
+                    static_cast<size_t>(tid - 1) < worker_cores_.size()) {
+                    desired_core =
+                        worker_cores_[static_cast<size_t>(tid - 1)];
                 }
-                job = current_job_;
+                should_run_job =
+                    current_job_ != nullptr && tid < requested_threads_;
+                if (should_run_job) {
+                    job = current_job_;
+                }
+            }
+
+            if (desired_core >= 0 && desired_core != bound_core) {
+                const int error = bind_current_thread_to_core(desired_core);
+                report_affinity_bind_error(tid, desired_core, error);
+                if (error == 0) {
+                    bound_core = desired_core;
+                }
+            }
+            if (!should_run_job) {
+                continue;
             }
 
             try {
@@ -1237,6 +1556,7 @@ private:
     std::condition_variable start_cv_;
     std::condition_variable done_cv_;
     std::vector<std::thread> workers_;
+    std::vector<int64_t> worker_cores_;
     std::function<void(int64_t)>* current_job_ = nullptr;
     std::exception_ptr worker_exception_ = nullptr;
     int64_t requested_threads_ = 0;
@@ -1253,11 +1573,21 @@ ResidentThreadPool& moe_resident_thread_pool() {
 
 template <typename Fn>
 void run_fixed_threads(int64_t num_threads, const Fn& fn) {
+    const ThreadPinningConfig pinning = moe_thread_pinning_config(num_threads);
     if (disable_resident_threads()) {
         run_fixed_threads_spawn(num_threads, fn);
         return;
     }
-    moe_resident_thread_pool().run(num_threads, fn);
+    moe_resident_thread_pool().prepare(num_threads, pinning);
+    moe_resident_thread_pool().run(num_threads, pinning, fn);
+}
+
+void prepare_moe_threads_for_operator(int64_t num_threads) {
+    if (disable_resident_threads()) {
+        return;
+    }
+    const ThreadPinningConfig pinning = moe_thread_pinning_config(num_threads);
+    moe_resident_thread_pool().prepare(num_threads, pinning);
 }
 
 template <typename CoreFn, typename Fn>
@@ -1303,13 +1633,19 @@ struct ScheduledWaveRuntime {
     int64_t total_threads = 0;
 };
 
+struct ScheduledScratchUnitConfig {
+    int64_t thread_begin = 0;
+    int64_t threads = 0;
+    int64_t max_rows = 0;
+    int64_t a_reorder_stride = 0;
+};
+
 struct ScheduledTeamScratch {
     explicit ScheduledTeamScratch(int64_t group_size)
-        : barrier(group_size) {}
+        : threads(group_size), barrier(group_size) {}
 
-    int64_t expert = -1;
     int64_t threads = 0;
-    int64_t rows = 0;
+    int64_t max_rows = 0;
     int64_t a_reorder_stride = 0;
     std::vector<uint16_t> input;
     std::vector<uint16_t> intermediate;
@@ -1318,6 +1654,128 @@ struct ScheduledTeamScratch {
     std::vector<float> down;
     ThreadBarrier barrier;
 };
+
+void ensure_scheduled_scratch_capacity(ScheduledTeamScratch& scratch,
+                                       const ScheduledScratchUnitConfig& config,
+                                       const PackedExperts& w13,
+                                       const PackedExperts& w2) {
+    TORCH_CHECK(scratch.threads == config.threads,
+                "scheduled scratch thread count mismatch: scratch=",
+                scratch.threads, " config=", config.threads);
+    scratch.max_rows = std::max(scratch.max_rows, config.max_rows);
+    scratch.a_reorder_stride =
+        std::max(scratch.a_reorder_stride, config.a_reorder_stride);
+    const int64_t rows = scratch.max_rows;
+    scratch.input.resize(static_cast<size_t>(rows * w13.K_pad));
+    scratch.intermediate.resize(static_cast<size_t>(rows * w2.K_pad));
+    scratch.a_reorder.resize(static_cast<size_t>(
+        scratch.threads * scratch.a_reorder_stride));
+    scratch.gate_up.resize(static_cast<size_t>(rows * w13.N_pad));
+    scratch.down.resize(static_cast<size_t>(rows * w2.N_pad));
+}
+
+class ScheduledScratchLease {
+public:
+    ScheduledScratchLease(std::unique_lock<std::mutex> lock,
+                          std::vector<ScheduledTeamScratch*> scratches)
+        : lock_(std::move(lock)), scratches_(std::move(scratches)) {}
+
+    ScheduledScratchLease(const ScheduledScratchLease&) = delete;
+    ScheduledScratchLease& operator=(const ScheduledScratchLease&) = delete;
+    ScheduledScratchLease(ScheduledScratchLease&&) = default;
+    ScheduledScratchLease& operator=(ScheduledScratchLease&&) = default;
+
+    const std::vector<ScheduledTeamScratch*>& scratches() const {
+        return scratches_;
+    }
+
+private:
+    std::unique_lock<std::mutex> lock_;
+    std::vector<ScheduledTeamScratch*> scratches_;
+};
+
+class ResidentScheduledScratchPool {
+public:
+    ResidentScheduledScratchPool() = default;
+
+    ResidentScheduledScratchPool(const ResidentScheduledScratchPool&) = delete;
+    ResidentScheduledScratchPool& operator=(
+        const ResidentScheduledScratchPool&) = delete;
+
+    ScheduledScratchLease lease(
+        const std::vector<ScheduledScratchUnitConfig>& configs,
+        const PackedExperts& w13,
+        const PackedExperts& w2) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        std::vector<ScheduledTeamScratch*> scratches;
+        scratches.reserve(configs.size());
+
+        for (const ScheduledScratchUnitConfig& config : configs) {
+            ScheduledTeamScratch* scratch = find_scratch_locked(config);
+            if (scratch == nullptr) {
+                units_.push_back(ScratchUnit{
+                    config.thread_begin,
+                    config.threads,
+                    std::make_unique<ScheduledTeamScratch>(config.threads)});
+                scratch = units_.back().scratch.get();
+            }
+            ensure_scheduled_scratch_capacity(*scratch, config, w13, w2);
+            scratches.push_back(scratch);
+        }
+
+        return ScheduledScratchLease(std::move(lock), std::move(scratches));
+    }
+
+private:
+    struct ScratchUnit {
+        int64_t thread_begin = 0;
+        int64_t threads = 0;
+        std::unique_ptr<ScheduledTeamScratch> scratch;
+    };
+
+    ScheduledTeamScratch* find_scratch_locked(
+        const ScheduledScratchUnitConfig& config) {
+        for (ScratchUnit& unit : units_) {
+            if (unit.thread_begin == config.thread_begin &&
+                unit.threads == config.threads) {
+                return unit.scratch.get();
+            }
+        }
+        return nullptr;
+    }
+
+    std::mutex mutex_;
+    std::vector<ScratchUnit> units_;
+};
+
+ResidentScheduledScratchPool& resident_scheduled_scratch_pool() {
+    static ResidentScheduledScratchPool pool;
+    return pool;
+}
+
+int64_t stage_a_reorder_stride(MoeGemmStage stage,
+                               int64_t rows,
+                               int64_t K_pad,
+                               int64_t N_pad,
+                               int64_t group_size) {
+    const MoeGemmSplit split = choose_moe_gemm_split(
+        stage, static_cast<int>(rows), static_cast<int>(N_pad), group_size);
+    const int64_t rows_for_thread = split == MoeGemmSplit::kM
+                                        ? ceil_div_int64(rows, group_size)
+                                        : rows;
+    return rows_for_thread * K_pad * 2;
+}
+
+int64_t scheduled_a_reorder_stride(int64_t rows,
+                                   int64_t group_size,
+                                   const PackedExperts& w13,
+                                   const PackedExperts& w2) {
+    return std::max(
+        stage_a_reorder_stride(MoeGemmStage::kW13, rows, w13.K_pad,
+                               w13.N_pad, group_size),
+        stage_a_reorder_stride(MoeGemmStage::kW2, rows, w2.K_pad,
+                               w2.N_pad, group_size));
+}
 
 std::vector<int64_t> tensor_to_i64_vector(at::Tensor tensor,
                                           const char* name) {
@@ -1486,6 +1944,17 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
                 ", got K=", w2.K, " N=", w2.N);
     check_optional_bias(w13_bias, w13.E, w13.N, "w13_bias");
     check_optional_bias(w2_bias, w2.E, w2.N, "w2_bias");
+    // Decide once, up front, whether to use the fused-bias GEMM kernel:
+    // a defined bias yields a padded [E, N_pad] fp32 buffer; otherwise the
+    // base pointer stays null and the plain (non-bias) kernel is used.
+    const at::Tensor w13_bias_f32 =
+        build_padded_bias_f32(w13_bias, w13.E, w13.N, w13.N_pad);
+    const at::Tensor w2_bias_f32 =
+        build_padded_bias_f32(w2_bias, w2.E, w2.N, w2.N_pad);
+    const float* w13_bias_base =
+        w13_bias_f32.defined() ? w13_bias_f32.data_ptr<float>() : nullptr;
+    const float* w2_bias_base =
+        w2_bias_f32.defined() ? w2_bias_f32.data_ptr<float>() : nullptr;
 
     const int64_t num_tokens = input.size(0);
     const int64_t top_k = topk_ids.size(1);
@@ -1506,6 +1975,7 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
     TORCH_CHECK(num_experts <= w13.E,
                 "global_num_experts cannot exceed prepared expert weights: ",
                 num_experts, " > ", w13.E);
+    prepare_moe_threads_for_operator(num_threads);
 
     at::Tensor ids_i64 = topk_ids.to(at::kLong).contiguous();
     at::Tensor weights_f32 = topk_weights.to(at::kFloat).contiguous();
@@ -1537,10 +2007,18 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
         }
     }
 
-    at::Tensor route_out = at::empty(
-        {num_routes, H},
-        at::TensorOptions().device(input.device()).dtype(at::kFloat));
-    float* route_out_ptr = route_out.data_ptr<float>();
+    at::Tensor output = at::empty(
+        {num_tokens, H},
+        at::TensorOptions().device(input.device()).dtype(at::kBFloat16));
+    uint16_t* out_bf16_ptr = bf16_data(output);
+    at::Tensor route_out;
+    float* route_out_ptr = nullptr;
+    if (!skip_weighted) {
+        route_out = at::empty(
+            {num_routes, H},
+            at::TensorOptions().device(input.device()).dtype(at::kFloat));
+        route_out_ptr = route_out.data_ptr<float>();
+    }
     const uint16_t* input_ptr = bf16_data_const(input);
     const uint16_t* w13_ptr = bf16_data_const(w13.tensor);
     const uint16_t* w2_ptr = bf16_data_const(w2.tensor);
@@ -1652,13 +2130,11 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
                         std::copy(src, src + H, dst);
                     }
 
-                    std::fill(scratch.gate_up.begin(),
-                              scratch.gate_up.begin() + rows * w13.N_pad,
-                              0.0f);
                     trace_dispatch_fp32_gemm(
                         moe_trace,
                         "w13",
                         tid,
+                        -1,
                         -1,
                         -1,
                         task.expert,
@@ -1671,22 +2147,21 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
                         static_cast<int>(rows),
                         static_cast<int>(w13.K_pad),
                         static_cast<int>(w13.N_pad),
-                        static_cast<int>(w13.N_pad));
-                    apply_gate_up_bias(scratch.gate_up.data(), rows,
-                                       w13.N_pad, w13.N, task.expert,
-                                       w13_bias);
+                        static_cast<int>(w13.N_pad),
+                        w13_bias_base != nullptr
+                            ? w13_bias_base + task.expert * w13.N_pad
+                            : nullptr);
 
                     activation_to_bf16(
                         activation, scratch.gate_up.data(),
                         scratch.intermediate.data(), rows, w13.N_pad,
                         w2.K_pad, F);
 
-                    std::fill(scratch.down.begin(),
-                              scratch.down.begin() + rows * w2.N_pad, 0.0f);
                     trace_dispatch_fp32_gemm(
                         moe_trace,
                         "w2",
                         tid,
+                        -1,
                         -1,
                         -1,
                         task.expert,
@@ -1699,19 +2174,27 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
                         static_cast<int>(rows),
                         static_cast<int>(w2.K_pad),
                         static_cast<int>(w2.N_pad),
-                        static_cast<int>(w2.N_pad));
+                        static_cast<int>(w2.N_pad),
+                        w2_bias_base != nullptr
+                            ? w2_bias_base + task.expert * w2.N_pad
+                            : nullptr);
 
                     for (int64_t m = 0; m < rows; ++m) {
                         const int64_t flat =
                             expert_routes[static_cast<size_t>(
                                 task.route_begin + m)];
-                        float* dst = route_out_ptr + flat * H;
                         const float* src =
                             scratch.down.data() + m * w2.N_pad;
-                        const int64_t bias_base = task.expert * H;
-                        for (int64_t h = 0; h < H; ++h) {
-                            dst[h] = src[h] + read_optional_bias(
-                                                  w2_bias, bias_base + h);
+                        if (skip_weighted) {
+                            uint16_t* dst = out_bf16_ptr + flat * H;
+                            for (int64_t h = 0; h < H; ++h) {
+                                dst[h] = bf16_bits_from_float(src[h]);
+                            }
+                        } else {
+                            float* dst = route_out_ptr + flat * H;
+                            for (int64_t h = 0; h < H; ++h) {
+                                dst[h] = src[h];
+                            }
                         }
                     }
                 }
@@ -1884,16 +2367,15 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
                             scratch.input.data() + m * w13.K_pad;
                         std::copy(src, src + H, dst);
                     }
-                    std::fill(scratch.gate_up.begin(),
-                              scratch.gate_up.begin() + rows * w13.N_pad,
-                              0.0f);
                 }
                 barrier.wait();
 
-                trace_dispatch_fp32_gemm_auto_split(
+                trace_dispatch_fp32_gemm_stage_split(
                     moe_trace,
                     "w13",
+                    MoeGemmStage::kW13,
                     tid,
+                    -1,
                     group,
                     local_tid,
                     expert,
@@ -1907,30 +2389,26 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
                     static_cast<int>(w13.K_pad),
                     static_cast<int>(w13.N_pad),
                     static_cast<int>(w13.N_pad),
-                    nsplit_group_size);
+                    nsplit_group_size,
+                    w13_bias_base != nullptr
+                        ? w13_bias_base + expert * w13.N_pad
+                        : nullptr);
                 barrier.wait();
 
-                if (local_tid == 0) {
-                    std::fill(scratch.down.begin(),
-                              scratch.down.begin() + rows * w2.N_pad,
-                              0.0f);
-                }
                 const SplitRange activation_range = split_evenly(
                     rows, nsplit_group_size, local_tid);
-                apply_gate_up_bias_range(
-                    scratch.gate_up.data(), activation_range.begin,
-                    activation_range.size, w13.N_pad, w13.N, expert,
-                    w13_bias);
                 activation_range_to_bf16(
                     activation, scratch.gate_up.data(),
                     scratch.intermediate.data(), activation_range.begin,
                     activation_range.size, w13.N_pad, w2.K_pad, F);
                 barrier.wait();
 
-                trace_dispatch_fp32_gemm_auto_split(
+                trace_dispatch_fp32_gemm_stage_split(
                     moe_trace,
                     "w2",
+                    MoeGemmStage::kW2,
                     tid,
+                    -1,
                     group,
                     local_tid,
                     expert,
@@ -1944,7 +2422,10 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
                     static_cast<int>(w2.K_pad),
                     static_cast<int>(w2.N_pad),
                     static_cast<int>(w2.N_pad),
-                    nsplit_group_size);
+                    nsplit_group_size,
+                    w2_bias_base != nullptr
+                        ? w2_bias_base + expert * w2.N_pad
+                        : nullptr);
                 barrier.wait();
 
                 const int64_t h_blocks = w2.N_pad / kKernelTile;
@@ -1968,16 +2449,21 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
                 const int64_t h_end = std::min<int64_t>(
                     H, h_begin + my_blocks * kKernelTile);
                 if (h_begin < h_end) {
-                    const int64_t bias_base = expert * H;
                     for (int64_t m = 0; m < rows; ++m) {
                         const int64_t flat =
                             expert_routes[static_cast<size_t>(m)];
-                        float* dst = route_out_ptr + flat * H;
                         const float* src =
                             scratch.down.data() + m * w2.N_pad;
-                        for (int64_t h = h_begin; h < h_end; ++h) {
-                            dst[h] = src[h] + read_optional_bias(
-                                                  w2_bias, bias_base + h);
+                        if (skip_weighted) {
+                            uint16_t* dst = out_bf16_ptr + flat * H;
+                            for (int64_t h = h_begin; h < h_end; ++h) {
+                                dst[h] = bf16_bits_from_float(src[h]);
+                            }
+                        } else {
+                            float* dst = route_out_ptr + flat * H;
+                            for (int64_t h = h_begin; h < h_end; ++h) {
+                                dst[h] = src[h];
+                            }
                         }
                     }
                 }
@@ -2056,10 +2542,10 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
         }
     }
 
-    at::Tensor output_acc = at::zeros(
-        {num_tokens, H},
-        at::TensorOptions().device(input.device()).dtype(at::kFloat));
-    float* output_ptr = output_acc.data_ptr<float>();
+    // 2a/2b: the weighted merge accumulates per token in a thread-local fp32
+    // buffer and writes the bf16 result straight into `output`. When
+    // skip_weighted is set the scatter already wrote `output` directly, so the
+    // merge is skipped entirely.
     const float* topk_w = weights_f32.data_ptr<float>();
 
     auto merge_routes = [&](int64_t tid) {
@@ -2068,33 +2554,35 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
         const int64_t token_begin = tid * rows_per_thread;
         const int64_t token_end = std::min<int64_t>(
             num_tokens, token_begin + rows_per_thread);
+        std::vector<float> acc(static_cast<size_t>(H));
         for (int64_t token = token_begin; token < token_end; ++token) {
-            float* dst = output_ptr + token * H;
-            if (skip_weighted) {
-                const float* src = route_out_ptr + token * H;
-                std::copy(src, src + H, dst);
-                continue;
-            }
+            uint16_t* dst = out_bf16_ptr + token * H;
+            std::fill(acc.begin(), acc.end(), 0.0f);
             for (int64_t slot = 0; slot < top_k; ++slot) {
                 const int64_t flat = token * top_k + slot;
                 const float weight = topk_w[flat];
                 const float* src = route_out_ptr + flat * H;
                 for (int64_t h = 0; h < H; ++h) {
-                    dst[h] += src[h] * weight;
+                    acc[static_cast<size_t>(h)] += src[h] * weight;
                 }
+            }
+            for (int64_t h = 0; h < H; ++h) {
+                dst[h] = bf16_bits_from_float(acc[static_cast<size_t>(h)]);
             }
         }
     };
-    if (use_hierarchical_nsplit) {
-        auto core_for_tid = [&](int64_t tid) {
-            return nsplit_thread_cores[static_cast<size_t>(tid)];
-        };
-        run_fixed_threads_pinned(actual_threads, core_for_tid, merge_routes);
-    } else {
-        run_fixed_threads(actual_threads, merge_routes);
+    if (!skip_weighted) {
+        if (use_hierarchical_nsplit) {
+            auto core_for_tid = [&](int64_t tid) {
+                return nsplit_thread_cores[static_cast<size_t>(tid)];
+            };
+            run_fixed_threads_pinned(actual_threads, core_for_tid,
+                                     merge_routes);
+        } else {
+            run_fixed_threads(actual_threads, merge_routes);
+        }
     }
 
-    at::Tensor output = output_acc.to(at::kBFloat16);
     if (moe_trace.enabled()) {
         const double e2e_ms = ::fused_cpp::profile::elapsed_ms(moe_trace_begin);
         moe_trace.write_report(moe_trace_strategy,
@@ -2127,6 +2615,7 @@ at::Tensor fused_moe_bf16_tiled_scheduled(at::Tensor input,
                             at::Tensor wave_offsets,
                             at::Tensor team_expert_ids,
                             at::Tensor team_threads,
+                            c10::optional<at::Tensor> thread_cpu_ids,
                             c10::optional<at::Tensor> w13_bias,
                             c10::optional<at::Tensor> w2_bias,
                             int64_t num_threads,
@@ -2138,6 +2627,28 @@ at::Tensor fused_moe_bf16_tiled_scheduled(at::Tensor input,
 #else
     const auto moe_trace_begin = ::fused_cpp::profile::now();
     MoeTraceCollector moe_trace(moe_trace_config_from_env());
+    auto trace_phase_begin = [&]() -> ::fused_cpp::profile::TimePoint {
+        if (!moe_trace.enabled()) {
+            return {};
+        }
+        return ::fused_cpp::profile::now();
+    };
+    auto trace_phase_end =
+        [&](int64_t tid,
+            int64_t wave,
+            int64_t group,
+            int64_t local_tid,
+            int64_t expert,
+            int64_t rows,
+            const char* stage,
+            ::fused_cpp::profile::TimePoint begin) {
+            if (!moe_trace.enabled()) {
+                return;
+            }
+            moe_trace.record_phase(
+                tid, wave, group, local_tid, expert, rows, stage,
+                ::fused_cpp::profile::elapsed_ms(begin));
+        };
 
     check_bf16_cpu(input, "input");
     TORCH_CHECK(input.dim() == 2, "input must be 2-D [tokens, hidden]");
@@ -2177,6 +2688,17 @@ at::Tensor fused_moe_bf16_tiled_scheduled(at::Tensor input,
                 ", got K=", w2.K, " N=", w2.N);
     check_optional_bias(w13_bias, w13.E, w13.N, "w13_bias");
     check_optional_bias(w2_bias, w2.E, w2.N, "w2_bias");
+    // Decide once, up front, whether to use the fused-bias GEMM kernel:
+    // a defined bias yields a padded [E, N_pad] fp32 buffer; otherwise the
+    // base pointer stays null and the plain (non-bias) kernel is used.
+    const at::Tensor w13_bias_f32 =
+        build_padded_bias_f32(w13_bias, w13.E, w13.N, w13.N_pad);
+    const at::Tensor w2_bias_f32 =
+        build_padded_bias_f32(w2_bias, w2.E, w2.N, w2.N_pad);
+    const float* w13_bias_base =
+        w13_bias_f32.defined() ? w13_bias_f32.data_ptr<float>() : nullptr;
+    const float* w2_bias_base =
+        w2_bias_f32.defined() ? w2_bias_f32.data_ptr<float>() : nullptr;
 
     const int64_t num_tokens = input.size(0);
     const int64_t top_k = topk_ids.size(1);
@@ -2198,12 +2720,39 @@ at::Tensor fused_moe_bf16_tiled_scheduled(at::Tensor input,
                 "global_num_experts cannot exceed prepared expert weights: ",
                 num_experts, " > ", w13.E);
 
+    ThreadPinningConfig scheduled_thread_pinning;
+    bool has_scheduled_thread_pinning = false;
+    if (thread_cpu_ids.has_value() && thread_cpu_ids->defined() &&
+        thread_cpu_ids->numel() > 0) {
+        scheduled_thread_pinning.cpus =
+            tensor_to_i64_vector(*thread_cpu_ids, "thread_cpu_ids");
+        TORCH_CHECK(
+            static_cast<int64_t>(scheduled_thread_pinning.cpus.size()) ==
+                num_threads,
+            "thread_cpu_ids must have exactly num_threads entries: got ",
+            scheduled_thread_pinning.cpus.size(), " vs ", num_threads);
+        for (size_t idx = 0; idx < scheduled_thread_pinning.cpus.size();
+             ++idx) {
+            TORCH_CHECK(scheduled_thread_pinning.cpus[idx] >= 0,
+                        "thread_cpu_ids[", idx, "] must be non-negative, got ",
+                        scheduled_thread_pinning.cpus[idx]);
+        }
+        scheduled_thread_pinning.enabled = true;
+        has_scheduled_thread_pinning = true;
+    }
+    ThreadPinningScope scheduled_thread_pinning_scope(
+        has_scheduled_thread_pinning ? &scheduled_thread_pinning : nullptr);
+    prepare_moe_threads_for_operator(num_threads);
+
+    auto phase_begin = trace_phase_begin();
     const std::vector<int64_t> wave_offsets_v =
         tensor_to_i64_vector(wave_offsets, "wave_offsets");
     const std::vector<int64_t> team_expert_ids_v =
         tensor_to_i64_vector(team_expert_ids, "team_expert_ids");
     const std::vector<int64_t> team_threads_v =
         tensor_to_i64_vector(team_threads, "team_threads");
+    trace_phase_end(-1, -1, -1, -1, -1, 0, "plan_materialize",
+                    phase_begin);
     TORCH_CHECK(wave_offsets_v.size() >= 2,
                 "wave_offsets must contain at least [0, num_teams]");
     TORCH_CHECK(wave_offsets_v.front() == 0,
@@ -2217,6 +2766,7 @@ at::Tensor fused_moe_bf16_tiled_scheduled(at::Tensor input,
                 "last wave_offsets entry must equal num_teams=", num_teams,
                 ", got ", wave_offsets_v.back());
 
+    phase_begin = trace_phase_begin();
     at::Tensor ids_i64 = topk_ids.to(at::kLong).contiguous();
     at::Tensor weights_f32 = topk_weights.to(at::kFloat).contiguous();
     const int64_t* ids = ids_i64.data_ptr<int64_t>();
@@ -2231,7 +2781,10 @@ at::Tensor fused_moe_bf16_tiled_scheduled(at::Tensor input,
                     ", valid range [0, ", num_experts, ")");
         routes[static_cast<size_t>(expert)].push_back(flat);
     }
+    trace_phase_end(-1, -1, -1, -1, -1, num_routes, "route_build",
+                    phase_begin);
 
+    phase_begin = trace_phase_begin();
     int64_t active_experts = 0;
     size_t micro_tiles = 0;
     for (const std::vector<int64_t>& expert_routes : routes) {
@@ -2284,6 +2837,9 @@ at::Tensor fused_moe_bf16_tiled_scheduled(at::Tensor input,
     std::vector<ScheduledWaveRuntime> waves;
     waves.reserve(static_cast<size_t>(num_waves));
     std::vector<int64_t> team_thread_starts(static_cast<size_t>(num_teams), 0);
+    std::vector<int64_t> team_scratch_indices(
+        static_cast<size_t>(num_teams), -1);
+    std::vector<ScheduledScratchUnitConfig> scratch_unit_configs;
     for (int64_t wave = 0; wave < num_waves; ++wave) {
         const int64_t begin = wave_offsets_v[static_cast<size_t>(wave)];
         const int64_t end = wave_offsets_v[static_cast<size_t>(wave + 1)];
@@ -2295,43 +2851,70 @@ at::Tensor fused_moe_bf16_tiled_scheduled(at::Tensor input,
                     ") is outside num_teams=", num_teams);
         int64_t wave_threads = 0;
         for (int64_t team = begin; team < end; ++team) {
-            team_thread_starts[static_cast<size_t>(team)] = wave_threads;
-            wave_threads += team_threads_v[static_cast<size_t>(team)];
+            const int64_t thread_begin = wave_threads;
+            const int64_t team_threads =
+                team_threads_v[static_cast<size_t>(team)];
+            team_thread_starts[static_cast<size_t>(team)] = thread_begin;
+            wave_threads += team_threads;
             TORCH_CHECK(wave_threads <= num_threads,
                         "wave ", wave, " uses ", wave_threads,
                         " threads, exceeding num_threads=", num_threads);
+
+            int64_t scratch_idx = -1;
+            for (size_t idx = 0; idx < scratch_unit_configs.size(); ++idx) {
+                const ScheduledScratchUnitConfig& config =
+                    scratch_unit_configs[idx];
+                if (config.thread_begin == thread_begin &&
+                    config.threads == team_threads) {
+                    scratch_idx = static_cast<int64_t>(idx);
+                    break;
+                }
+            }
+            if (scratch_idx < 0) {
+                scratch_idx =
+                    static_cast<int64_t>(scratch_unit_configs.size());
+                scratch_unit_configs.push_back(ScheduledScratchUnitConfig{
+                    thread_begin, team_threads, 0, 0});
+            }
+            ScheduledScratchUnitConfig& scratch_config =
+                scratch_unit_configs[static_cast<size_t>(scratch_idx)];
+            const int64_t rows = team_rows[static_cast<size_t>(team)];
+            scratch_config.max_rows =
+                std::max(scratch_config.max_rows, rows);
+            scratch_config.a_reorder_stride = std::max(
+                scratch_config.a_reorder_stride,
+                scheduled_a_reorder_stride(rows, team_threads, w13, w2));
+            team_scratch_indices[static_cast<size_t>(team)] = scratch_idx;
         }
         waves.push_back(ScheduledWaveRuntime{begin, end, wave_threads});
     }
+    trace_phase_end(-1, -1, -1, -1, -1, num_teams, "plan_validate",
+                    phase_begin);
 
-    at::Tensor route_out = at::empty(
-        {num_routes, H},
-        at::TensorOptions().device(input.device()).dtype(at::kFloat));
-    float* route_out_ptr = route_out.data_ptr<float>();
+    at::Tensor output = at::empty(
+        {num_tokens, H},
+        at::TensorOptions().device(input.device()).dtype(at::kBFloat16));
+    uint16_t* out_bf16_ptr = bf16_data(output);
+    at::Tensor route_out;
+    float* route_out_ptr = nullptr;
+    if (!skip_weighted) {
+        route_out = at::empty(
+            {num_routes, H},
+            at::TensorOptions().device(input.device()).dtype(at::kFloat));
+        route_out_ptr = route_out.data_ptr<float>();
+    }
     const uint16_t* input_ptr = bf16_data_const(input);
     const uint16_t* w13_ptr = bf16_data_const(w13.tensor);
     const uint16_t* w2_ptr = bf16_data_const(w2.tensor);
 
-    std::vector<std::unique_ptr<ScheduledTeamScratch>> scratches;
-    scratches.reserve(static_cast<size_t>(num_teams));
-    for (int64_t team = 0; team < num_teams; ++team) {
-        const int64_t expert = team_expert_ids_v[static_cast<size_t>(team)];
-        const int64_t threads = team_threads_v[static_cast<size_t>(team)];
-        const int64_t rows = team_rows[static_cast<size_t>(team)];
-        auto scratch = std::make_unique<ScheduledTeamScratch>(threads);
-        scratch->expert = expert;
-        scratch->threads = threads;
-        scratch->rows = rows;
-        scratch->a_reorder_stride =
-            rows * std::max(w13.K_pad, w2.K_pad) * 2;
-        scratch->input.resize(static_cast<size_t>(rows * w13.K_pad));
-        scratch->intermediate.resize(static_cast<size_t>(rows * w2.K_pad));
-        scratch->a_reorder.resize(static_cast<size_t>(
-            threads * scratch->a_reorder_stride));
-        scratch->gate_up.resize(static_cast<size_t>(rows * w13.N_pad));
-        scratch->down.resize(static_cast<size_t>(rows * w2.N_pad));
-        scratches.push_back(std::move(scratch));
-    }
+    phase_begin = trace_phase_begin();
+    ScheduledScratchLease scratch_lease =
+        resident_scheduled_scratch_pool().lease(scratch_unit_configs, w13, w2);
+    const std::vector<ScheduledTeamScratch*>& scratches =
+        scratch_lease.scratches();
+    trace_phase_end(-1, -1, -1, -1, -1,
+                    static_cast<int64_t>(scratch_unit_configs.size()),
+                    "scratch_alloc", phase_begin);
 
     const int schedule_debug_level = debug_schedule_level();
     if (schedule_debug_level > 0) {
@@ -2348,6 +2931,7 @@ at::Tensor fused_moe_bf16_tiled_scheduled(at::Tensor input,
 
     moe_trace.reserve(static_cast<size_t>(trace_gemm_hint));
     ThreadBarrier wave_barrier(num_threads);
+    phase_begin = trace_phase_begin();
     run_fixed_threads(num_threads, [&](int64_t tid) {
         for (int64_t wave_idx = 0; wave_idx < num_waves; ++wave_idx) {
             const ScheduledWaveRuntime& wave =
@@ -2369,18 +2953,38 @@ at::Tensor fused_moe_bf16_tiled_scheduled(at::Tensor input,
             }
 
             if (selected_team >= 0) {
+                const int64_t scratch_idx =
+                    team_scratch_indices[static_cast<size_t>(selected_team)];
+                TORCH_CHECK(scratch_idx >= 0,
+                            "missing scratch unit for scheduled team ",
+                            selected_team);
                 ScheduledTeamScratch& scratch =
-                    *scratches[static_cast<size_t>(selected_team)];
+                    *scratches[static_cast<size_t>(scratch_idx)];
                 ThreadBarrier& barrier = scratch.barrier;
-                const int64_t expert = scratch.expert;
-                const int64_t rows = scratch.rows;
-                const int64_t group_size = scratch.threads;
+                const int64_t expert =
+                    team_expert_ids_v[static_cast<size_t>(selected_team)];
+                const int64_t rows =
+                    team_rows[static_cast<size_t>(selected_team)];
+                const int64_t group_size =
+                    team_threads_v[static_cast<size_t>(selected_team)];
+                TORCH_CHECK(scratch.threads == group_size,
+                            "scratch thread count mismatch for team ",
+                            selected_team);
+                TORCH_CHECK(rows <= scratch.max_rows,
+                            "scratch row capacity mismatch for team ",
+                            selected_team);
+                TORCH_CHECK(
+                    scheduled_a_reorder_stride(rows, group_size, w13, w2) <=
+                        scratch.a_reorder_stride,
+                    "scratch A reorder capacity mismatch for team ",
+                    selected_team);
                 const auto& expert_routes =
                     routes[static_cast<size_t>(expert)];
                 uint16_t* a_reorder = scratch.a_reorder.data() +
                     local_tid * scratch.a_reorder_stride;
 
                 if (local_tid == 0) {
+                    auto worker_phase_begin = trace_phase_begin();
                     std::fill(scratch.input.begin(),
                               scratch.input.begin() + rows * w13.K_pad,
                               static_cast<uint16_t>(0));
@@ -2393,16 +2997,18 @@ at::Tensor fused_moe_bf16_tiled_scheduled(at::Tensor input,
                             scratch.input.data() + m * w13.K_pad;
                         std::copy(src, src + H, dst);
                     }
-                    std::fill(scratch.gate_up.begin(),
-                              scratch.gate_up.begin() + rows * w13.N_pad,
-                              0.0f);
+                    trace_phase_end(tid, wave_idx, selected_team, local_tid,
+                                    expert, rows, "gather_input",
+                                    worker_phase_begin);
                 }
                 barrier.wait();
 
-                trace_dispatch_fp32_gemm_auto_split(
+                trace_dispatch_fp32_gemm_stage_split(
                     moe_trace,
                     "w13",
+                    MoeGemmStage::kW13,
                     tid,
+                    wave_idx,
                     selected_team,
                     local_tid,
                     expert,
@@ -2416,29 +3022,30 @@ at::Tensor fused_moe_bf16_tiled_scheduled(at::Tensor input,
                     static_cast<int>(w13.K_pad),
                     static_cast<int>(w13.N_pad),
                     static_cast<int>(w13.N_pad),
-                    group_size);
+                    group_size,
+                    w13_bias_base != nullptr
+                        ? w13_bias_base + expert * w13.N_pad
+                        : nullptr);
                 barrier.wait();
 
-                if (local_tid == 0) {
-                    std::fill(scratch.down.begin(),
-                              scratch.down.begin() + rows * w2.N_pad, 0.0f);
-                }
+                auto worker_phase_begin = trace_phase_begin();
                 const SplitRange activation_range = split_evenly(
                     rows, group_size, local_tid);
-                apply_gate_up_bias_range(
-                    scratch.gate_up.data(), activation_range.begin,
-                    activation_range.size, w13.N_pad, w13.N, expert,
-                    w13_bias);
                 activation_range_to_bf16(
                     activation, scratch.gate_up.data(),
                     scratch.intermediate.data(), activation_range.begin,
                     activation_range.size, w13.N_pad, w2.K_pad, F);
+                trace_phase_end(tid, wave_idx, selected_team, local_tid,
+                                expert, activation_range.size, "activation",
+                                worker_phase_begin);
                 barrier.wait();
 
-                trace_dispatch_fp32_gemm_auto_split(
+                trace_dispatch_fp32_gemm_stage_split(
                     moe_trace,
                     "w2",
+                    MoeGemmStage::kW2,
                     tid,
+                    wave_idx,
                     selected_team,
                     local_tid,
                     expert,
@@ -2452,7 +3059,10 @@ at::Tensor fused_moe_bf16_tiled_scheduled(at::Tensor input,
                     static_cast<int>(w2.K_pad),
                     static_cast<int>(w2.N_pad),
                     static_cast<int>(w2.N_pad),
-                    group_size);
+                    group_size,
+                    w2_bias_base != nullptr
+                        ? w2_bias_base + expert * w2.N_pad
+                        : nullptr);
                 barrier.wait();
 
                 const SplitRange h_range = n_split_range(
@@ -2460,58 +3070,76 @@ at::Tensor fused_moe_bf16_tiled_scheduled(at::Tensor input,
                 const int64_t h_begin = h_range.begin;
                 const int64_t h_end = std::min<int64_t>(
                     H, h_begin + h_range.size);
+                worker_phase_begin = trace_phase_begin();
                 if (h_begin < h_end) {
-                    const int64_t bias_base = expert * H;
                     for (int64_t m = 0; m < rows; ++m) {
                         const int64_t flat =
                             expert_routes[static_cast<size_t>(m)];
-                        float* dst = route_out_ptr + flat * H;
                         const float* src =
                             scratch.down.data() + m * w2.N_pad;
-                        for (int64_t h = h_begin; h < h_end; ++h) {
-                            dst[h] = src[h] + read_optional_bias(
-                                                  w2_bias, bias_base + h);
+                        if (skip_weighted) {
+                            uint16_t* dst = out_bf16_ptr + flat * H;
+                            for (int64_t h = h_begin; h < h_end; ++h) {
+                                dst[h] = bf16_bits_from_float(src[h]);
+                            }
+                        } else {
+                            float* dst = route_out_ptr + flat * H;
+                            for (int64_t h = h_begin; h < h_end; ++h) {
+                                dst[h] = src[h];
+                            }
                         }
                     }
                 }
+                trace_phase_end(tid, wave_idx, selected_team, local_tid,
+                                expert, rows, "scatter_route_out",
+                                worker_phase_begin);
                 barrier.wait();
             }
             wave_barrier.wait();
         }
     });
+    trace_phase_end(-1, -1, -1, -1, -1, num_routes,
+                    "scheduled_compute", phase_begin);
 
-    at::Tensor output_acc = at::zeros(
-        {num_tokens, H},
-        at::TensorOptions().device(input.device()).dtype(at::kFloat));
-    float* output_ptr = output_acc.data_ptr<float>();
+    // 2a/2b: weighted merge writes bf16 straight into `output`; when
+    // skip_weighted is set the scatter already filled `output`, so merge is
+    // skipped.
     const float* topk_w = weights_f32.data_ptr<float>();
 
     auto merge_routes = [&](int64_t tid) {
+        auto worker_phase_begin = trace_phase_begin();
         const int64_t rows_per_thread =
             ceil_div_int64(num_tokens, num_threads);
         const int64_t token_begin = tid * rows_per_thread;
         const int64_t token_end = std::min<int64_t>(
             num_tokens, token_begin + rows_per_thread);
+        std::vector<float> acc(static_cast<size_t>(H));
         for (int64_t token = token_begin; token < token_end; ++token) {
-            float* dst = output_ptr + token * H;
-            if (skip_weighted) {
-                const float* src = route_out_ptr + token * H;
-                std::copy(src, src + H, dst);
-                continue;
-            }
+            uint16_t* dst = out_bf16_ptr + token * H;
+            std::fill(acc.begin(), acc.end(), 0.0f);
             for (int64_t slot = 0; slot < top_k; ++slot) {
                 const int64_t flat = token * top_k + slot;
                 const float weight = topk_w[flat];
                 const float* src = route_out_ptr + flat * H;
                 for (int64_t h = 0; h < H; ++h) {
-                    dst[h] += src[h] * weight;
+                    acc[static_cast<size_t>(h)] += src[h] * weight;
                 }
             }
+            for (int64_t h = 0; h < H; ++h) {
+                dst[h] = bf16_bits_from_float(acc[static_cast<size_t>(h)]);
+            }
         }
+        trace_phase_end(tid, -1, -1, -1, -1,
+                        std::max<int64_t>(0, token_end - token_begin),
+                        "merge_routes", worker_phase_begin);
     };
-    run_fixed_threads(num_threads, merge_routes);
+    phase_begin = trace_phase_begin();
+    if (!skip_weighted) {
+        run_fixed_threads(num_threads, merge_routes);
+    }
+    trace_phase_end(-1, -1, -1, -1, -1, num_tokens, "merge_routes_total",
+                    phase_begin);
 
-    at::Tensor output = output_acc.to(at::kBFloat16);
     if (moe_trace.enabled()) {
         const double e2e_ms = ::fused_cpp::profile::elapsed_ms(moe_trace_begin);
         moe_trace.write_report("external_plan_scheduled",

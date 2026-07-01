@@ -181,6 +181,7 @@ def fused_moe_bf16_tiled_scheduled(
     team_expert_ids: torch.Tensor,
     team_threads: torch.Tensor,
     *,
+    thread_cpu_ids: torch.Tensor | None = None,
     w13_bias: torch.Tensor | None = None,
     w2_bias: torch.Tensor | None = None,
     num_threads: int = 1,
@@ -216,6 +217,13 @@ def fused_moe_bf16_tiled_scheduled(
     _check_integer_schedule_tensor(wave_offsets, "wave_offsets")
     _check_integer_schedule_tensor(team_expert_ids, "team_expert_ids")
     _check_integer_schedule_tensor(team_threads, "team_threads")
+    if thread_cpu_ids is not None:
+        _check_integer_schedule_tensor(thread_cpu_ids, "thread_cpu_ids")
+        if int(thread_cpu_ids.numel()) != int(num_threads):
+            raise ValueError(
+                "thread_cpu_ids must have exactly num_threads entries: "
+                f"got {int(thread_cpu_ids.numel())} vs {int(num_threads)}"
+            )
     if out is not None:
         if tuple(out.shape) != tuple(input.shape):
             raise ValueError(f"out must have shape {tuple(input.shape)}")
@@ -244,6 +252,7 @@ def fused_moe_bf16_tiled_scheduled(
         wave_offsets.contiguous(),
         team_expert_ids.contiguous(),
         team_threads.contiguous(),
+        None if thread_cpu_ids is None else thread_cpu_ids.contiguous(),
         _contiguous_bias(w13_bias),
         _contiguous_bias(w2_bias),
         int(num_threads),

@@ -69,6 +69,101 @@ def _case(seed: int = 0) -> tuple[torch.Tensor, ...]:
     )
 
 
+def _case_top1(seed: int = 0) -> tuple[torch.Tensor, ...]:
+    """Single-route (top_k == 1) case for the skip_weighted fast path."""
+    torch.manual_seed(seed)
+    num_tokens = 37
+    hidden_size = 13
+    ffn_hidden_size = 11
+    num_experts = 4
+    hidden_states = _bf16_randn(num_tokens, hidden_size)
+    w13_weight = _bf16_randn(num_experts, 2 * ffn_hidden_size, hidden_size)
+    w2_weight = _bf16_randn(num_experts, hidden_size, ffn_hidden_size)
+    w13_bias = torch.randn(num_experts, 2 * ffn_hidden_size) * 0.1
+    w2_bias = torch.randn(num_experts, hidden_size) * 0.1
+    topk_ids = torch.tensor(
+        [[i % num_experts] for i in range(num_tokens)], dtype=torch.int32
+    )
+    topk_weights = torch.ones(num_tokens, 1)
+    return (
+        hidden_states,
+        w13_weight,
+        w2_weight,
+        w13_bias,
+        w2_bias,
+        topk_weights,
+        topk_ids,
+    )
+
+
+def test_fused_moe_bf16_tiled_skip_weighted_matches_unit_weighted() -> None:
+    # 2b: with top_k == 1 and unit weights, the skip_weighted fast path
+    # (w2 result written straight to the bf16 output, no route_out / merge)
+    # must bit-match the weighted path. Covers impl A (single + multi thread)
+    # and the scheduled split-GEMM path.
+    (
+        hidden_states,
+        w13_weight,
+        w2_weight,
+        w13_bias,
+        w2_bias,
+        topk_weights,
+        topk_ids,
+    ) = _case_top1(seed=5)
+    packed = prepare_fused_moe_bf16_tiled_weights(w13_weight, w2_weight)
+
+    ref = fused_moe_bf16_tiled(
+        hidden_states,
+        packed,
+        topk_weights,
+        topk_ids,
+        w13_bias=w13_bias,
+        w2_bias=w2_bias,
+        num_threads=1,
+    )
+
+    out_a = fused_moe_bf16_tiled(
+        hidden_states,
+        packed,
+        topk_weights,
+        topk_ids,
+        w13_bias=w13_bias,
+        w2_bias=w2_bias,
+        num_threads=1,
+        skip_weighted=True,
+    )
+    assert out_a.dtype == torch.bfloat16
+    torch.testing.assert_close(out_a.float(), ref.float(), atol=0, rtol=0)
+
+    out_a_mt = fused_moe_bf16_tiled(
+        hidden_states,
+        packed,
+        topk_weights,
+        topk_ids,
+        w13_bias=w13_bias,
+        w2_bias=w2_bias,
+        num_threads=3,
+        skip_weighted=True,
+    )
+    torch.testing.assert_close(out_a_mt.float(), ref.float(), atol=0, rtol=0)
+
+    out_sched = fused_moe_bf16_tiled_scheduled(
+        hidden_states,
+        packed,
+        topk_weights,
+        topk_ids,
+        wave_offsets=torch.tensor([0, 2, 4], dtype=torch.int32),
+        team_expert_ids=torch.tensor([0, 1, 2, 3], dtype=torch.int32),
+        team_threads=torch.tensor([2, 1, 2, 1], dtype=torch.int32),
+        thread_cpu_ids=torch.tensor([0, 1, 2], dtype=torch.int32),
+        w13_bias=w13_bias,
+        w2_bias=w2_bias,
+        num_threads=3,
+        skip_weighted=True,
+    )
+    torch.testing.assert_close(out_sched.float(), ref.float(), atol=0, rtol=0)
+
+
 @pytest.mark.parametrize("activation", ["silu", "swigluoai"])
 def test_fused_moe_bf16_tiled_matches_naive(activation: str) -> None:
     (
@@ -171,12 +266,41 @@ def test_fused_moe_bf16_tiled_scheduled_matches_single_thread() -> None:
         wave_offsets=torch.tensor([0, 2, 4], dtype=torch.int32),
         team_expert_ids=torch.tensor([0, 1, 2, 3], dtype=torch.int32),
         team_threads=torch.tensor([2, 1, 2, 1], dtype=torch.int32),
+        thread_cpu_ids=torch.tensor([0, 1, 2], dtype=torch.int32),
         w13_bias=w13_bias,
         w2_bias=w2_bias,
         num_threads=3,
     )
 
     torch.testing.assert_close(scheduled.float(), serial.float(), atol=0, rtol=0)
+
+
+def test_fused_moe_bf16_tiled_scheduled_rejects_bad_thread_cpu_ids() -> None:
+    (
+        hidden_states,
+        w13_weight,
+        w2_weight,
+        w13_bias,
+        w2_bias,
+        topk_weights,
+        topk_ids,
+    ) = _case(seed=29)
+    packed = prepare_fused_moe_bf16_tiled_weights(w13_weight, w2_weight)
+
+    with pytest.raises(ValueError, match="thread_cpu_ids"):
+        fused_moe_bf16_tiled_scheduled(
+            hidden_states,
+            packed,
+            topk_weights,
+            topk_ids,
+            wave_offsets=torch.tensor([0, 2, 4], dtype=torch.int32),
+            team_expert_ids=torch.tensor([0, 1, 2, 3], dtype=torch.int32),
+            team_threads=torch.tensor([2, 1, 2, 1], dtype=torch.int32),
+            thread_cpu_ids=torch.tensor([0, 1], dtype=torch.int32),
+            w13_bias=w13_bias,
+            w2_bias=w2_bias,
+            num_threads=3,
+        )
 
 
 def test_fused_moe_bf16_tiled_scheduled_m_split_matches_single_thread() -> None:
