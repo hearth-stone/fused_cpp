@@ -30,13 +30,14 @@ The summary reports:
 - Gini coefficient;
 - max load violation versus all-expert mean;
 - best planning-aware plan;
-- speedup versus `FIXED_GLOBAL_THREADS`;
+- speedup versus `SORTED_TOKEN_BALANCED_1T`;
 - auto selector plan and regret versus the best planning-aware plan;
 - best execution-only plan.
 
 The sweep currently includes:
 
 - `FIXED_GLOBAL_THREADS`
+- `SORTED_TOKEN_BALANCED_1T`
 - `UNIFORM_WAVES`
 - `GREEDY_MARGINAL_GAIN`
 - `ENUMERATE_CORE_GROUPS`
@@ -119,6 +120,7 @@ The benchmark converts each `Plan` to:
 wave_offsets
 team_expert_ids
 team_threads
+thread_cpu_ids
 ```
 
 and passes those tensors to `fused_moe_bf16_tiled_scheduled`.
@@ -138,14 +140,118 @@ PYTHONPATH=src .venv/bin/python \
   --cost-table cpu_moe_schedule_optimization/cost_model/profiles/local_dsv4_8c.json
 ```
 
+Structured benchmark results can be written at the same time:
+
+```bash
+PYTHONPATH=src .venv/bin/python \
+  cpu_moe_schedule_optimization/benchmarks/scheduled_bridge_bench.py \
+  --distribution hotspot \
+  --hot-experts 4 \
+  --hot-fraction 0.75 \
+  --tokens 2048 \
+  --top-k 6 \
+  --cores 8 \
+  --planner all \
+  --cost-table cpu_moe_schedule_optimization/cost_model/profiles/aws_dsv4_8c_pinned_auto_mn_20260630.json \
+  --output-json tmp/moe_schedule_bench/hotspot_4x75.json \
+  --output-csv tmp/moe_schedule_bench/hotspot_4x75.csv
+```
+
+The JSON includes the full workload histogram, planner predictions, measured
+timings, plan-shape features, metadata, and the full scheduled bridge plan. The
+CSV keeps one row per planner with the fields needed for cost-model calibration.
+
+## MoE Stage Breakdown
+
+To inspect the scheduled MoE compute flow, enable the C++ trace collector through
+`profile_moe_stage_breakdown.py`:
+
+```bash
+PYTHONPATH=src .venv/bin/python \
+  cpu_moe_schedule_optimization/benchmarks/profile_moe_stage_breakdown.py \
+  --routes 2048 \
+  --threads 1,2,4,8 \
+  --runs 5 \
+  --output-json tmp/moe_schedule_bench/stage_breakdown_2048.json \
+  --output-csv tmp/moe_schedule_bench/stage_breakdown_2048.csv
+```
+
+The script reports C++ traced e2e time and percentage columns for:
+
+```text
+route_build scratch_alloc gather_input w13 activation w2 scatter_route_out
+compute_gap merge_routes_total output_cast other
+```
+
+`compute_gap` is the part of scheduled compute not explained by gather/GEMM/
+activation/scatter. It is useful for spotting synchronization, dispatch, and
+unmeasured per-wave overhead.
+
+## Isolated MoE GEMM M/N Split
+
+Use `profile_w2_gemm_split.py` to isolate either MoE GEMM shape:
+
+```text
+w13: A[M, H] x W13[H, 2F] -> C[M, 2F]
+w2:  A[M, F] x W2[F, H]  -> C[M, H]
+```
+
+For the second GEMM:
+
+```text
+A[M, F] x W2[F, H] -> C[M, H]
+```
+
+The script uses the existing `bf16_linear` wrapper around refs/i8gemm and forces
+the underlying BF16 GEMM split through `BF16_NEON_SPLIT=m|n`. This removes MoE
+routing, activation, scatter, and scheduler overhead from the measurement:
+
+```bash
+PYTHONPATH=src .venv/bin/python \
+  cpu_moe_schedule_optimization/benchmarks/profile_w2_gemm_split.py \
+  --stage w2 \
+  --m-values 16,32,64,128,256,512,1024,1536,2048,3072,4096,6144,8192 \
+  --threads 1,2,4,8 \
+  --splits m,n \
+  --runs 7 \
+  --output-json tmp/moe_schedule_bench/w2_gemm_split.json \
+  --output-csv tmp/moe_schedule_bench/w2_gemm_split.csv
+```
+
+Switch `--stage w13` and output paths to measure the first GEMM:
+
+```bash
+PYTHONPATH=src .venv/bin/python \
+  cpu_moe_schedule_optimization/benchmarks/profile_w2_gemm_split.py \
+  --stage w13 \
+  --m-values 16,32,64,128,256,512,1024,1536,2048,3072,4096,6144,8192 \
+  --threads 1,2,4,8 \
+  --splits m,n \
+  --runs 7 \
+  --output-json tmp/moe_schedule_bench/w13_gemm_split.json \
+  --output-csv tmp/moe_schedule_bench/w13_gemm_split.csv
+```
+
+By default the script sets `BF16_NEON_CLAMP_THREADS=0`, so each requested thread
+count is tested directly. Add `--keep-thread-clamp` to keep the upstream
+refs/i8gemm thread-clamp behavior.
+
+AWS 8 核 pinned profile 已保存为：
+
+```text
+cpu_moe_schedule_optimization/cost_model/profiles/aws_dsv4_8c_pinned_auto_mn_20260630.json
+```
+
 The sweep uses the complexity-based planner cost model by default. For fixed
 planner-cost sensitivity tests, switch to `--plan-cost-source model` and override
 costs in the same style as `offline_simulator.py`:
 
 ```bash
 python -B cpu_moe_schedule_optimization/benchmarks/synthetic_sweep.py \
+  --cost-table cpu_moe_schedule_optimization/cost_model/profiles/aws_dsv4_8c_pinned_auto_mn_20260630.json \
   --plan-cost-source model \
   --planner-cost fixed=1us \
+  --planner-cost balanced=2us \
   --planner-cost uniform=5us \
   --planner-cost greedy=20us \
   --planner-cost groups=30us
