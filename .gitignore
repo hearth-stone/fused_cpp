@@ -31,3 +31,7 @@ bench/sdpa/sdpa_versions_*.json
 tmp/
 *.dSYM/
 standalone/clean_sdpa/clean_sdpa_bench
+standalone/moe_planner/*.o
+standalone/moe_planner/moe_planner
+standalone/moe_planner/moe_planner_omp
+standalone/moe_planner/moe_planner_st
