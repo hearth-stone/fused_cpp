@@ -144,6 +144,9 @@ at::Tensor fused_moe_test_pack_interleaved_gemm(at::Tensor A, at::Tensor w13);
 at::Tensor fused_moe_test_fused_w13_linear(at::Tensor A, at::Tensor w13);
 at::Tensor fused_moe_test_fused_w13_silu(at::Tensor A, at::Tensor w13,
                                          int64_t degree);
+at::Tensor fused_moe_test_team_fused_w13_silu(at::Tensor A, at::Tensor w13,
+                                              int64_t group_size,
+                                              int64_t degree);
 at::Tensor fused_moe_test_team_gemm(at::Tensor A,
                                     at::Tensor B,
                                     int64_t group_size,
@@ -1254,6 +1257,17 @@ PYBIND11_MODULE(_C, m) {
           "degree selects the exp polynomial (5 in Task 3; 4/6 in Task 4).",
           py::arg("A"),
           py::arg("w13"),
+          py::arg("degree") = 5,
+          py::call_guard<py::gil_scoped_release>());
+
+    m.def("fused_moe_test_team_fused_w13_silu",
+          &fused_moe_test_team_fused_w13_silu,
+          "Test-only: N-split cooperative fused w13 SiLU-and-mul. Runs every "
+          "local_tid of a group into one shared buffer; must equal the "
+          "single-thread fused output. Returns intermediate[M,F] bf16.",
+          py::arg("A"),
+          py::arg("w13"),
+          py::arg("group_size"),
           py::arg("degree") = 5,
           py::call_guard<py::gil_scoped_release>());
 

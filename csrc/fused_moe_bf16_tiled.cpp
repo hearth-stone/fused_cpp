@@ -1640,6 +1640,37 @@ void team_gemm(const TeamContext& team, const GemmSplitPlan& plan,
         team.barrier->wait();
     }
 }
+
+// N-split cooperative fused w13 + SiLU-and-mul. Each team member computes its
+// kN column slice of the interleaved 2F weight and writes its disjoint feature
+// columns of `intermediate` (bf16, row stride = ldc). No internal barrier: the
+// caller owns the inter-stage barrier (mirroring trace_dispatch_..._stage_split).
+// `A` is the full [M,K] slice; `team.a_reorder` is this thread's private repack
+// scratch (>= M*K*2), so the A-pack is duplicated across the team (accepted for
+// the kN path; a shared pre-pack is a separate future optimization).
+void team_fused_w13_silu(const TeamContext& team, const uint16_t* A,
+                         const uint16_t* w13_packed, uint16_t* intermediate,
+                         int M, int K, int N13, int ldc, int64_t degree) {
+    const GemmSplitPlan plan{MoeGemmSplit::kN};
+    const SplitRange range = team_gemm_split_range(
+        plan, M, N13, team.group_size, team.local_tid);
+    if (range.size <= 0) {
+        return;
+    }
+    const int64_t start_block = range.begin / kKernelTile;
+    // 8 interleaved columns per block -> 4 output features; feature offset is
+    // range.begin / 2, and this slice produces range.size / 2 features.
+    single_thread_gemm_fused_silu(
+        A,
+        w13_packed + start_block * static_cast<int64_t>(K) * kKernelTile,
+        intermediate + range.begin / 2,
+        team.a_reorder,
+        M,
+        K,
+        static_cast<int>(range.size),
+        ldc,
+        degree);
+}
 #endif  // __aarch64__
 
 struct HierarchicalNSplitConfig {
@@ -3197,6 +3228,71 @@ at::Tensor fused_moe_test_fused_w13_silu(at::Tensor A, at::Tensor w13,
 #endif
 }
 
+// Test-only (N-split): assemble intermediate[M,F] by running team_fused_w13_silu
+// for every local_tid of a group of `group_size` into ONE shared buffer. The
+// result must equal the whole-slice single_thread_gemm_fused_silu output.
+at::Tensor fused_moe_test_team_fused_w13_silu(at::Tensor A, at::Tensor w13,
+                                              int64_t group_size,
+                                              int64_t degree) {
+#ifndef __aarch64__
+    TORCH_CHECK(false,
+                "fused_moe_test_team_fused_w13_silu requires AArch64");
+#else
+    check_bf16_cpu(A, "A");
+    check_bf16_cpu(w13, "w13");
+    TORCH_CHECK(A.dim() == 2, "A must be 2-D [M, H]");
+    TORCH_CHECK(w13.dim() == 2, "w13 must be 2-D [2F, H]");
+    TORCH_CHECK(group_size > 0, "group_size must be positive");
+    A = A.contiguous();
+    w13 = w13.contiguous();
+    const int64_t M = A.size(0);
+    const int64_t H = A.size(1);
+    const int64_t N13 = w13.size(0);
+    TORCH_CHECK(w13.size(1) == H, "w13 second dim must equal H=", H);
+    TORCH_CHECK(N13 % 2 == 0, "w13 output dim must be even, got ", N13);
+    const int64_t F = N13 / 2;
+    check_positive_int(M, "M");
+    check_positive_int(H, "H");
+
+    const int64_t K_pad = ceil_to_multiple(H, kKernelTile);
+    const int64_t F_pad4 = ceil_to_multiple(F, 4);
+    const int64_t N_pad = 2 * F_pad4;
+
+    std::vector<uint16_t> packed(
+        static_cast<size_t>(K_pad * N_pad), static_cast<uint16_t>(0));
+    pack_transposed_expert_weight_interleaved(bf16_data_const(w13), 0, F, H,
+                                              K_pad, N_pad, packed.data());
+
+    std::vector<uint16_t> a_pad(
+        static_cast<size_t>(M * K_pad), static_cast<uint16_t>(0));
+    const uint16_t* a_src = bf16_data_const(A);
+    for (int64_t m = 0; m < M; ++m) {
+        std::copy(a_src + m * H, a_src + m * H + H, a_pad.data() + m * K_pad);
+    }
+    // Per-local_tid private A-reorder scratch (>= M*K_pad*2 each, matching the
+    // single-thread margin that covers m1/m2 tail padding).
+    const int64_t a_reorder_stride = M * K_pad * 2;
+    std::vector<uint16_t> a_reorder(
+        static_cast<size_t>(group_size * a_reorder_stride),
+        static_cast<uint16_t>(0));
+
+    at::Tensor C = at::zeros({M, F_pad4},
+                             at::TensorOptions().dtype(at::kBFloat16));
+    for (int64_t local_tid = 0; local_tid < group_size; ++local_tid) {
+        TeamContext team;
+        team.group_size = group_size;
+        team.local_tid = local_tid;
+        team.barrier = nullptr;
+        team.a_reorder = a_reorder.data() + local_tid * a_reorder_stride;
+        team_fused_w13_silu(team, a_pad.data(), packed.data(), bf16_data(C),
+                            static_cast<int>(M), static_cast<int>(K_pad),
+                            static_cast<int>(N_pad),
+                            static_cast<int>(F_pad4), degree);
+    }
+    return C.slice(1, 0, F).contiguous();
+#endif
+}
+
 // Test-only: run the middle-layer team_gemm on the resident thread pool for a
 // dense A[M,K] x B[N,K]^T -> C[M,N] (fp32). split is "m", "n", or "auto".
 at::Tensor fused_moe_test_team_gemm(at::Tensor A,
@@ -3618,7 +3714,7 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
                     "silu_poly_degree must be 4, 5, or 6, got ",
                     silu_poly_degree);
     }
-    const bool use_hierarchical_nsplit = nsplit_config.enabled && !fuse_silu;
+    const bool use_hierarchical_nsplit = nsplit_config.enabled;
     const char* moe_trace_strategy =
         use_hierarchical_nsplit
             ? "hierarchical_mn_split_dynamic_expert"
@@ -3999,38 +4095,62 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
                 }
                 barrier.wait();
 
-                trace_dispatch_fp32_gemm_stage_split(
-                    moe_trace,
-                    "w13",
-                    MoeGemmStage::kW13,
-                    tid,
-                    -1,
-                    group,
-                    local_tid,
-                    expert,
-                    0,
-                    rows,
-                    scratch.input.data(),
-                    w13_ptr + expert * w13.packed_stride,
-                    scratch.gate_up.data(),
-                    a_reorder,
-                    static_cast<int>(rows),
-                    static_cast<int>(w13.K_pad),
-                    static_cast<int>(w13.N_pad),
-                    static_cast<int>(w13.N_pad),
-                    nsplit_group_size,
-                    w13_bias_base != nullptr
-                        ? w13_bias_base + expert * w13.N_pad
-                        : nullptr);
-                barrier.wait();
+                if (fuse_silu) {
+                    // N-split fused w13 + SiLU-and-mul: each member writes its
+                    // disjoint feature-column slice of intermediate directly
+                    // (bf16, stride w2.K_pad). Collapses the w13 GEMM and the
+                    // activation pass into one stage, dropping a barrier and
+                    // the gate_up fp32 buffer.
+                    TeamContext team;
+                    team.group_size = nsplit_group_size;
+                    team.local_tid = local_tid;
+                    team.barrier = nullptr;
+                    team.a_reorder = a_reorder;
+                    team_fused_w13_silu(
+                        team,
+                        scratch.input.data(),
+                        w13_ptr + expert * w13.packed_stride,
+                        scratch.intermediate.data(),
+                        static_cast<int>(rows),
+                        static_cast<int>(w13.K_pad),
+                        static_cast<int>(w13.N_pad),
+                        static_cast<int>(w2.K_pad),
+                        silu_poly_degree);
+                    barrier.wait();
+                } else {
+                    trace_dispatch_fp32_gemm_stage_split(
+                        moe_trace,
+                        "w13",
+                        MoeGemmStage::kW13,
+                        tid,
+                        -1,
+                        group,
+                        local_tid,
+                        expert,
+                        0,
+                        rows,
+                        scratch.input.data(),
+                        w13_ptr + expert * w13.packed_stride,
+                        scratch.gate_up.data(),
+                        a_reorder,
+                        static_cast<int>(rows),
+                        static_cast<int>(w13.K_pad),
+                        static_cast<int>(w13.N_pad),
+                        static_cast<int>(w13.N_pad),
+                        nsplit_group_size,
+                        w13_bias_base != nullptr
+                            ? w13_bias_base + expert * w13.N_pad
+                            : nullptr);
+                    barrier.wait();
 
-                const SplitRange activation_range = split_evenly(
-                    rows, nsplit_group_size, local_tid);
-                activation_range_to_bf16(
-                    activation, scratch.gate_up.data(),
-                    scratch.intermediate.data(), activation_range.begin,
-                    activation_range.size, w13.N_pad, w2.K_pad, F);
-                barrier.wait();
+                    const SplitRange activation_range = split_evenly(
+                        rows, nsplit_group_size, local_tid);
+                    activation_range_to_bf16(
+                        activation, scratch.gate_up.data(),
+                        scratch.intermediate.data(), activation_range.begin,
+                        activation_range.size, w13.N_pad, w2.K_pad, F);
+                    barrier.wait();
+                }
 
                 trace_dispatch_fp32_gemm_stage_split(
                     moe_trace,
