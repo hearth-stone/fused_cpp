@@ -2053,6 +2053,105 @@ struct MoePhaseTraceRecord {
     double ms = 0.0;
 };
 
+// Backend for scratch-buffer memory, selected once from the environment:
+//   FUSED_CPP_MOE_HUGETLB=1        -> explicit hugetlbfs pages (MAP_HUGETLB),
+//                                     size FUSED_CPP_MOE_HUGETLB_MB (default 32)
+//   FUSED_CPP_MOE_THP != 0 (default)-> anon mmap + madvise(MADV_HUGEPAGE)
+//   FUSED_CPP_MOE_THP == 0         -> plain operator new (4KB pages)
+// Rounding is fixed per mode, so deallocate() recomputes the mmap length from
+// n without extra bookkeeping. hugetlb falls back to a same-length THP mmap if
+// the pool is exhausted (keeps the deallocate length deterministic).
+#ifndef MAP_HUGE_SHIFT
+#define MAP_HUGE_SHIFT 26
+#endif
+#ifndef MAP_HUGETLB
+#define MAP_HUGETLB 0x40000
+#endif
+enum class ScratchBackend { kMalloc, kThp, kHugetlb };
+inline ScratchBackend scratch_backend() {
+    static const ScratchBackend b = [] {
+#ifdef __linux__
+        const char* hg = std::getenv("FUSED_CPP_MOE_HUGETLB");
+        if (hg != nullptr && hg[0] != '0' && hg[0] != '\0')
+            return ScratchBackend::kHugetlb;
+        const char* thp = std::getenv("FUSED_CPP_MOE_THP");
+        if (thp == nullptr || thp[0] != '0') return ScratchBackend::kThp;
+        return ScratchBackend::kMalloc;
+#else
+        return ScratchBackend::kMalloc;
+#endif
+    }();
+    return b;
+}
+inline size_t scratch_hugetlb_bytes() {
+    static const size_t b = [] {
+        const char* mb = std::getenv("FUSED_CPP_MOE_HUGETLB_MB");
+        size_t m = (mb != nullptr) ? static_cast<size_t>(std::atoi(mb)) : 32;
+        if (m == 0) m = 32;
+        return m << 20;
+    }();
+    return b;
+}
+inline size_t round_up_pow2(size_t x, size_t p) { return (x + p - 1) & ~(p - 1); }
+
+template <typename T>
+struct backend_allocator {
+    using value_type = T;
+    backend_allocator() noexcept = default;
+    template <typename U>
+    backend_allocator(const backend_allocator<U>&) noexcept {}
+    T* allocate(std::size_t n) {
+        const size_t bytes = n * sizeof(T);
+#ifdef __linux__
+        const ScratchBackend b = scratch_backend();
+        if (b == ScratchBackend::kHugetlb) {
+            const size_t hp = scratch_hugetlb_bytes();
+            const size_t len = round_up_pow2(bytes, hp);
+            const int shift = __builtin_ctzll(hp);
+            void* pv = ::mmap(nullptr, len, PROT_READ | PROT_WRITE,
+                              MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB |
+                                  (shift << MAP_HUGE_SHIFT),
+                              -1, 0);
+            if (pv == MAP_FAILED) {  // pool exhausted: same-length THP fallback
+                pv = ::mmap(nullptr, len, PROT_READ | PROT_WRITE,
+                            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+                if (pv == MAP_FAILED) throw std::bad_alloc();
+                ::madvise(pv, len, MADV_HUGEPAGE);
+            }
+            return static_cast<T*>(pv);
+        }
+        if (b == ScratchBackend::kThp) {
+            const size_t len = round_up_pow2(bytes, size_t{2} << 20);
+            void* pv = ::mmap(nullptr, len, PROT_READ | PROT_WRITE,
+                              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (pv == MAP_FAILED) throw std::bad_alloc();
+            ::madvise(pv, len, MADV_HUGEPAGE);
+            return static_cast<T*>(pv);
+        }
+#endif
+        return static_cast<T*>(::operator new(bytes));
+    }
+    void deallocate(T* p, std::size_t n) noexcept {
+        const size_t bytes = n * sizeof(T);
+#ifdef __linux__
+        const ScratchBackend b = scratch_backend();
+        if (b == ScratchBackend::kHugetlb) {
+            ::munmap(p, round_up_pow2(bytes, scratch_hugetlb_bytes()));
+            return;
+        }
+        if (b == ScratchBackend::kThp) {
+            ::munmap(p, round_up_pow2(bytes, size_t{2} << 20));
+            return;
+        }
+#endif
+        ::operator delete(p);
+    }
+    template <typename U>
+    bool operator==(const backend_allocator<U>&) const noexcept { return true; }
+    template <typename U>
+    bool operator!=(const backend_allocator<U>&) const noexcept { return false; }
+};
+
 // Allocator that default-initializes (rather than value-initializes) elements,
 // so vector::resize() on a trivial type allocates WITHOUT zeroing. Used for
 // scratch buffers that are fully overwritten before being read (packed_a is
@@ -2086,13 +2185,31 @@ struct HierarchicalGroupScratch {
         : barrier(group_size) {}
 
     std::vector<uint16_t> input;
-    std::vector<uint16_t> intermediate;
+    std::vector<uint16_t, backend_allocator<uint16_t>> intermediate;
     std::vector<uint16_t> a_reorder;
-    std::vector<uint16_t, default_init_allocator<uint16_t>> packed_a;
+    std::vector<uint16_t,
+                default_init_allocator<uint16_t, backend_allocator<uint16_t>>>
+        packed_a;
     std::vector<float> gate_up;
-    std::vector<float, default_init_allocator<float>> down;
+    std::vector<float, default_init_allocator<float, backend_allocator<float>>>
+        down;
     std::atomic<int64_t> current_expert{-1};
     ThreadBarrier barrier;
+};
+
+// Persistent, per-calling-thread scratch pool. Buffers only grow and are reused
+// across calls, so mmap + first-touch faults (and the intermediate zeroing)
+// happen once, not every call. Correct because packed_a/down are fully
+// overwritten before read and intermediate's padding feature-blocks stay zero
+// once zeroed (never written). Keyed by group_size (the barrier is sized to it;
+// a change rebuilds the pool). Memory is retained at the max size ever seen.
+struct HierarchicalScratchPool {
+    int64_t group_size = -1;
+    std::vector<std::unique_ptr<HierarchicalGroupScratch>> groups;
+    template <typename V>
+    static void ensure(V& v, size_t need) {
+        if (v.size() < need) v.resize(need);  // grow only; reuse warm otherwise
+    }
 };
 
 bool env_flag_enabled(const char* name) {
@@ -4635,58 +4752,54 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
         const bool packa_skip_input = fuse_silu && fused_packa;
         const bool packa_skip_gate_up = fuse_silu;
         const auto stage_alloc_t0 = ::fused_cpp::profile::now();
-        std::vector<std::unique_ptr<HierarchicalGroupScratch>>
-            group_scratches;
-        group_scratches.reserve(static_cast<size_t>(nsplit_total_groups));
-        // Advise transparent huge pages for the big scratch buffers. THP is
-        // typically in `madvise` mode, so this is opt-in per-region: it cuts
-        // first-touch faults ~15-23x (2MB vs 4KB pages), ~13-19% e2e on large
-        // single-expert M. Default on; disable with FUSED_CPP_MOE_THP=0. Safe
-        // no-op on non-Linux and on hosts with THP=never. The advised range is
-        // 4KB-aligned (madvise requirement) so the 2MB-aligned interior
-        // collapses to huge pages.
-        static const bool thp_enabled = [] {
-            const char* v = std::getenv("FUSED_CPP_MOE_THP");
-            return v == nullptr || v[0] != '0';  // default on; off only if =0
-        }();
-        auto thp_advise = [&](void* ptr, size_t bytes) {
-#ifdef __linux__
-            if (!thp_enabled || bytes < (size_t{2} << 20)) return;
-            const uintptr_t a = reinterpret_cast<uintptr_t>(ptr);
-            const uintptr_t beg = (a + 4095u) & ~uintptr_t{4095};
-            const uintptr_t end = (a + bytes) & ~uintptr_t{4095};
-            if (end > beg) {
-                madvise(reinterpret_cast<void*>(beg),
-                        static_cast<size_t>(end - beg), MADV_HUGEPAGE);
-            }
-#else
-            (void)ptr; (void)bytes;
-#endif
-        };
-        for (int64_t group = 0; group < nsplit_total_groups; ++group) {
-            auto scratch = std::make_unique<HierarchicalGroupScratch>(
-                nsplit_group_size);
-            scratch->input.resize(static_cast<size_t>(
-                packa_skip_input ? 0 : max_expert_rows * w13.K_pad));
-            scratch->intermediate.resize(static_cast<size_t>(
-                (max_expert_rows + 7) / 8 * 8 * w2.K_pad));
-            thp_advise(scratch->intermediate.data(),
-                       scratch->intermediate.size() * sizeof(uint16_t));
-            scratch->packed_a.resize(static_cast<size_t>(
-                (max_expert_rows + 7) / 8 * 8 * w13.K_pad));
-            thp_advise(scratch->packed_a.data(),
-                       scratch->packed_a.size() * sizeof(uint16_t));
-            scratch->a_reorder.resize(static_cast<size_t>(
-                packa_skip_reorder ? 0
-                                   : nsplit_group_size * a_reorder_stride));
-            scratch->gate_up.resize(static_cast<size_t>(
-                packa_skip_gate_up ? 0 : max_expert_rows * w13.N_pad));
-            scratch->down.resize(static_cast<size_t>(
-                (max_expert_rows + 7) / 8 * 8 * w2.N_pad));
-            thp_advise(scratch->down.data(),
-                       scratch->down.size() * sizeof(float));
-            group_scratches.push_back(std::move(scratch));
+        // Per-calling-thread persistent pool: grow-only, reused across calls,
+        // so mmap + first-touch faults happen once (see HierarchicalScratchPool).
+        // Backend (malloc / THP / hugetlb) is chosen by backend_allocator.
+        thread_local HierarchicalScratchPool scratch_pool;
+        if (scratch_pool.group_size != nsplit_group_size) {
+            scratch_pool.groups.clear();
+            scratch_pool.group_size = nsplit_group_size;
         }
+        while (static_cast<int64_t>(scratch_pool.groups.size()) <
+               nsplit_total_groups) {
+            scratch_pool.groups.push_back(
+                std::make_unique<HierarchicalGroupScratch>(nsplit_group_size));
+        }
+        for (int64_t group = 0; group < nsplit_total_groups; ++group) {
+            HierarchicalGroupScratch& sc = *scratch_pool.groups[group];
+            HierarchicalScratchPool::ensure(
+                sc.input, static_cast<size_t>(
+                              packa_skip_input ? 0
+                                               : max_expert_rows * w13.K_pad));
+            const size_t interm_need = static_cast<size_t>(
+                (max_expert_rows + 7) / 8 * 8 * w2.K_pad);
+            HierarchicalScratchPool::ensure(sc.intermediate, interm_need);
+            // w2 reads intermediate's padding feature-blocks, which must be
+            // zero. With a pool the buffer may be reused across differently
+            // shaped calls, so re-zero the used region each call (pages are
+            // warm -> no faults; ~2MB). packed_a/down are fully overwritten and
+            // need no zeroing.
+            std::memset(sc.intermediate.data(), 0,
+                        interm_need * sizeof(uint16_t));
+            HierarchicalScratchPool::ensure(
+                sc.packed_a,
+                static_cast<size_t>((max_expert_rows + 7) / 8 * 8 * w13.K_pad));
+            HierarchicalScratchPool::ensure(
+                sc.a_reorder,
+                static_cast<size_t>(
+                    packa_skip_reorder ? 0
+                                       : nsplit_group_size * a_reorder_stride));
+            HierarchicalScratchPool::ensure(
+                sc.gate_up, static_cast<size_t>(
+                                packa_skip_gate_up
+                                    ? 0
+                                    : max_expert_rows * w13.N_pad));
+            HierarchicalScratchPool::ensure(
+                sc.down,
+                static_cast<size_t>((max_expert_rows + 7) / 8 * 8 * w2.N_pad));
+        }
+        std::vector<std::unique_ptr<HierarchicalGroupScratch>>&
+            group_scratches = scratch_pool.groups;
         stage_alloc_ms = ::fused_cpp::profile::elapsed_ms(stage_alloc_t0);
 
         ThreadPinningConfig nsplit_pinning;

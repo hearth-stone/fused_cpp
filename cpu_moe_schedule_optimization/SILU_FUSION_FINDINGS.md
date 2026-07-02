@@ -278,3 +278,44 @@ tail 5/6 改 pad8)。此外 packed 尾核 M=1,2(240us)比 repack(170us)略慢—
 
 单专家累计:M=2048 37→32(免清零)→**27.8**(+THP);M=4096 86.6→67→**55.6**。
 跨调用 buffer 池可进一步把"首次一次"也 amortize 掉(未做)。
+
+
+---
+
+# scratch 后端(malloc/THP/hugetlb)+ 全局 buffer 池
+
+把 scratch 内存后端做成运行时可选的 `backend_allocator`(取代之前的
+madvise-on-malloc),并加了一个 per-calling-thread 的持久池(grow-only、跨调用复用)。
+
+## 后端(env 选,默认 THP)
+- `FUSED_CPP_MOE_THP=0`:`operator new`(4KB 页)。
+- 默认 / `FUSED_CPP_MOE_THP!=0`:匿名 `mmap`(2MB 取整)+ `madvise(MADV_HUGEPAGE)`。
+- `FUSED_CPP_MOE_HUGETLB=1`:`mmap(MAP_HUGETLB)`,页大小 `FUSED_CPP_MOE_HUGETLB_MB`
+  (默认 32MB),池耗尽时安全回退到同长度 THP-mmap。
+
+### THP vs hugetlb 实测(单专家)
+| M | malloc 4KB | THP 2MB | hugetlb 32MB |
+|---|---|---|---|
+| 2048 | 32.4ms / 15983 faults | 27.8ms / 119 | 28.3ms / 17 |
+| 4096 | 68.8ms / 40351 | 55.0ms / 234 | 55.1ms / 25 |
+
+**THP ≈ hugetlb(e2e 基本持平)**;hugetlb 缺页更少但不转化为 e2e 优势,还要预留固定
+页池。1GB 权重顺序流式 GEMM 三者也完全一致(顺序访问的 TLB miss 被硬件预取隐藏,
+大页无用)。结论:**THP 是默认;hugetlb 仅作 opt-in**。
+
+## 全局 buffer 池(默认)
+`HierarchicalScratchPool`:per-calling-thread、grow-only、跨调用复用,按 group_size
+keying(barrier 尺寸变则重建)。首次分配付一次 mmap+首触缺页,之后调用复用 warm 页
+→ **稳态零缺页**。correctness:packed_a/down 每次被全量覆盖(无需清零);intermediate
+每次 memset(便宜、warm),防跨形状复用残留(虽 fused 路径 F 必为 8 的倍数、无 feature
+padding,memset 作安全兜底)。
+
+### 池收益(单专家,默认 THP+池)
+| M | 首次调用缺页 | 稳态缺页/次 | e2e |
+|---|---|---|---|
+| 2048 | 184 | **0.0** | **26.4ms**(THP 无池 27.8) |
+| 4096 | 342 | **0.0** | **52.6ms**(THP 无池 55.6) |
+
+## 单专家 e2e 累计
+- M=2048:fallback ~122 → packa 38 → 尾核 37 → 免清零 32 → THP 27.8 → **池 26.4ms**(4.6×)
+- M=4096:~241 → … → THP 55.6 → **池 52.6ms**(4.6×)
