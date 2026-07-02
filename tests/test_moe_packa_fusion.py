@@ -226,3 +226,40 @@ def test_packa_multi_expert_all_tails(degree, gpp):
     assert torch.equal(on.view(torch.int16), off.view(torch.int16)), (
         f"multi-expert all-tails packa mismatch degree={degree} gpp={gpp}"
     )
+
+
+# ── Pool: cross-shape reuse must not leak stale intermediate padding ─────
+def test_packa_pool_cross_shape():
+    # The scratch pool persists across calls on the calling thread and is
+    # reused across differently-sized calls. Verify no stale data leaks: each
+    # shape must match the packa-off fallback bit-for-bit.
+    # F must be a multiple of 8 (fused path). Vary H/F/rows/experts so the
+    # persistent pool grows then reuses buffers of different logical shape;
+    # stale packed_a/down/intermediate from a bigger call must not leak.
+    shapes = [
+        (256, 4096, 512, 8, 2),   # big: dirties the pool
+        (40, 512, 8, 6, 2),       # small rows + small F
+        (48, 256, 16, 5, 2),      # different H/F/strides
+        (37, 512, 24, 4, 1),      # non-8-multiple rows (tails) + F=24
+        (300, 4096, 512, 8, 2),   # grow again, back to big
+    ]
+    for si, (T, H, F, E, tk) in enumerate(shapes):
+        torch.manual_seed(si * 991 + T + F)
+        x = _bf16(T, H)
+        w13 = _bf16(E, 2 * F, H)
+        w2 = _bf16(E, H, F)
+        ids = torch.stack([torch.randperm(E)[:tk] for _ in range(T)]).to(torch.int32)
+        tw = torch.softmax(torch.randn(T, tk), dim=-1)
+        fused_w = prepare_fused_moe_bf16_tiled_weights(w13, w2, fuse_silu=True)
+
+        def run(packa):
+            with _nsplit_packa_env(packa, groups_per_partition=1, core_bases="0"):
+                return fused_moe_bf16_tiled(
+                    x, fused_w, tw, ids, num_threads=8,
+                    activation="silu", silu_poly_degree=5)
+
+        off = run(False)
+        on = run(True)
+        assert torch.equal(on.view(torch.int16), off.view(torch.int16)), (
+            f"pool cross-shape leak at shape#{si} T={T} H={H} F={F}"
+        )
