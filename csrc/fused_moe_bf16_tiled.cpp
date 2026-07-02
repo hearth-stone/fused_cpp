@@ -4377,20 +4377,37 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
     prepare_moe_threads_for_operator(num_threads);
     const int64_t actual_threads = num_threads;
 
+    const bool stage_timing =
+        env_flag_enabled("FUSED_CPP_MOE_STAGE_TIMING");
+    const auto routing_cast_t0 = ::fused_cpp::profile::now();
     at::Tensor ids_i64 = topk_ids.to(at::kLong).contiguous();
     at::Tensor weights_f32 = topk_weights.to(at::kFloat).contiguous();
+    const double routing_cast_ms =
+        ::fused_cpp::profile::elapsed_ms(routing_cast_t0);
     const int64_t* ids = ids_i64.data_ptr<int64_t>();
     const int64_t num_routes = num_tokens * top_k;
 
-    std::vector<std::vector<int64_t>> routes(
-        static_cast<size_t>(num_experts));
+    const auto route_build_t0 = ::fused_cpp::profile::now();
+    std::vector<int64_t> route_counts(static_cast<size_t>(num_experts), 0);
     for (int64_t flat = 0; flat < num_routes; ++flat) {
         const int64_t expert = ids[flat];
         TORCH_CHECK(expert >= 0 && expert < num_experts,
                     "topk_ids out of range: id=", expert,
                     ", valid range [0, ", num_experts, ")");
+        ++route_counts[static_cast<size_t>(expert)];
+    }
+    std::vector<std::vector<int64_t>> routes(
+        static_cast<size_t>(num_experts));
+    for (int64_t expert = 0; expert < num_experts; ++expert) {
+        routes[static_cast<size_t>(expert)].reserve(
+            static_cast<size_t>(route_counts[static_cast<size_t>(expert)]));
+    }
+    for (int64_t flat = 0; flat < num_routes; ++flat) {
+        const int64_t expert = ids[flat];
         routes[static_cast<size_t>(expert)].push_back(flat);
     }
+    const double route_build_ms =
+        ::fused_cpp::profile::elapsed_ms(route_build_t0);
 
     std::vector<ExpertTask> tasks;
     tasks.reserve(static_cast<size_t>(num_experts));
@@ -4674,6 +4691,15 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
         update_expert_schedule_cost_feedback(estimated_schedule_cost,
                                              observed_schedule_ms);
 
+        if (stage_timing) {
+            std::fprintf(stderr,
+                "[fused_moe_bf16_tiled][stage_timing] threads=%lld "
+                "routing_cast_ms=%.3f route_build_ms=%.3f "
+                "schedule_compute_ms=%.3f\n",
+                static_cast<long long>(actual_threads), routing_cast_ms,
+                route_build_ms, observed_schedule_ms);
+        }
+
         if (schedule_debug_level > 0) {
             int64_t longest_tid = -1;
             int64_t shortest_tid = -1;
@@ -4756,8 +4782,6 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
         }
         const int64_t a_reorder_stride =
             max_expert_rows * std::max(w13.K_pad, w2.K_pad) * 2;
-        const bool stage_timing =
-            env_flag_enabled("FUSED_CPP_MOE_STAGE_TIMING");
         double stage_alloc_ms = 0.0;
         // packA fusion frees the per-thread A-reorder scratch (the dominant
         // per-call alloc, ~268MB at G=8): w13 reads packed_a (Part 1) and, with
@@ -5125,10 +5149,13 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
         if (stage_timing) {
             std::fprintf(stderr,
                 "[fused_moe_bf16_tiled][stage_timing] threads=%lld "
-                "scratch_alloc_ms=%.3f gather_ms=%.3f w13_ms=%.3f w2_ms=%.3f "
-                "scatter_ms=%.3f (group0/tid0; excludes barrier waits)\n",
-                static_cast<long long>(actual_threads), stage_alloc_ms,
-                phase_gather_ms, phase_w13_ms, phase_w2_ms, phase_scatter_ms);
+                "routing_cast_ms=%.3f route_build_ms=%.3f "
+                "scratch_alloc_ms=%.3f gather_ms=%.3f w13_ms=%.3f "
+                "w2_ms=%.3f scatter_ms=%.3f "
+                "(gather/w13/w2/scatter are group0/tid0; exclude barrier waits)\n",
+                static_cast<long long>(actual_threads), routing_cast_ms,
+                route_build_ms, stage_alloc_ms, phase_gather_ms,
+                phase_w13_ms, phase_w2_ms, phase_scatter_ms);
         }
         if (schedule_debug_level > 0) {
             int64_t longest_group = -1;
