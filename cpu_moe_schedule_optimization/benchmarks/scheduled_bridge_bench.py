@@ -42,6 +42,7 @@ from offline_simulator import (  # noqa: E402
 from fused_cpp.moe import (  # noqa: E402
     _HAS_BF16_TILED_FUSED_MOE,
     fused_moe_bf16_tiled,
+    fused_moe_bf16_tiled_async,
     fused_moe_bf16_tiled_scheduled,
     prepare_fused_moe_bf16_tiled_weights,
 )
@@ -97,6 +98,11 @@ def topk_from_routes(
 
 
 def bridge_tensors(plan: Plan) -> Dict[str, torch.Tensor | int]:
+    if not plan.supports_scheduled_bridge:
+        raise ValueError(
+            f"{plan.kind.value} requires async task-DAG runtime support and "
+            "cannot run on fused_moe_bf16_tiled_scheduled"
+        )
     bridge = plan.to_scheduled_bridge()
     return {
         "num_threads": int(bridge["num_threads"]),
@@ -113,6 +119,37 @@ def bridge_tensors(plan: Plan) -> Dict[str, torch.Tensor | int]:
             dtype=torch.int32,
         ),
         "team_threads": torch.tensor(bridge["team_threads"], dtype=torch.int32),
+    }
+
+
+def async_tensors(plan: Plan) -> Dict[str, torch.Tensor | int]:
+    if not plan.async_tasks:
+        raise ValueError(f"{plan.kind.value} does not contain async tasks")
+    deps: List[int] = []
+    dep_offsets = [0]
+    for task in plan.async_tasks:
+        deps.extend(int(dep) for dep in task.deps)
+        dep_offsets.append(len(deps))
+    return {
+        "num_threads": int(plan.num_cores),
+        "thread_cpu_ids": torch.tensor(
+            list(range(int(plan.num_cores))),
+            dtype=torch.int32,
+        ),
+        "task_expert_ids": torch.tensor(
+            [int(task.expert_id) for task in plan.async_tasks],
+            dtype=torch.int32,
+        ),
+        "task_core_begins": torch.tensor(
+            [int(task.core_begin) for task in plan.async_tasks],
+            dtype=torch.int32,
+        ),
+        "task_threads": torch.tensor(
+            [int(task.threads) for task in plan.async_tasks],
+            dtype=torch.int32,
+        ),
+        "task_dep_offsets": torch.tensor(dep_offsets, dtype=torch.int32),
+        "task_deps": torch.tensor(deps, dtype=torch.int32),
     }
 
 
@@ -166,6 +203,28 @@ def timing_to_dict(result: Dict[str, object]) -> Dict[str, object]:
 
 
 def plan_shape_features(plan: Plan) -> Dict[str, object]:
+    if plan.async_tasks:
+        thread_histogram: Dict[str, int] = {}
+        for task in plan.async_tasks:
+            key = str(task.threads)
+            thread_histogram[key] = thread_histogram.get(key, 0) + 1
+        return {
+            "num_waves": 0,
+            "num_teams": len(plan.async_tasks),
+            "num_async_tasks": len(plan.async_tasks),
+            "num_multithread_teams": sum(
+                1 for task in plan.async_tasks if task.threads > 1
+            ),
+            "total_team_threads": sum(task.threads for task in plan.async_tasks),
+            "max_team_threads": max(
+                (task.threads for task in plan.async_tasks),
+                default=0,
+            ),
+            "max_teams_per_wave": 0,
+            "thread_histogram": thread_histogram,
+            "runtime_bridge_supported": True,
+            "runtime_bridge": "async_task_dag",
+        }
     teams = [team for wave in plan.waves for team in wave.teams]
     multithread_teams = [team for team in teams if team.threads > 1]
     thread_histogram: Dict[str, int] = {}
@@ -180,6 +239,7 @@ def plan_shape_features(plan: Plan) -> Dict[str, object]:
         "max_team_threads": max((team.threads for team in teams), default=0),
         "max_teams_per_wave": max((len(wave.teams) for wave in plan.waves), default=0),
         "thread_histogram": thread_histogram,
+        "runtime_bridge_supported": True,
     }
 
 
@@ -379,8 +439,15 @@ def print_result(
     result: Dict[str, object],
     baseline_median_s: float | None = None,
 ) -> None:
-    bridge = plan.to_scheduled_bridge()
-    selected_shape = plan.metadata.get("selected_core_group_shape", "")
+    if plan.async_tasks:
+        num_waves = 0
+        num_teams = len(plan.async_tasks)
+        selected_shape = "async_task_dag"
+    else:
+        bridge = plan.to_scheduled_bridge()
+        num_waves = len(plan.waves)
+        num_teams = len(bridge["team_expert_ids"])
+        selected_shape = str(plan.metadata.get("selected_core_group_shape", ""))
     median_s = float(result["median_s"])
     best_s = float(result["best_s"])
     mean_s = float(result["mean_s"])
@@ -390,8 +457,8 @@ def print_result(
         baseline_text = f"vs_balanced={baseline_median_s / median_s:>7.3f} "
     print(
         f"{plan.kind.value:<24} "
-        f"waves={len(plan.waves):<3} "
-        f"teams={len(bridge['team_expert_ids']):<4} "
+        f"waves={num_waves:<3} "
+        f"teams={num_teams:<4} "
         f"shape={selected_shape!s:<18} "
         f"est_execute={format_ns(plan.estimated_execute_cost_ns):>10} "
         f"est_total={format_ns(plan.estimated_total_cost_ns):>10} "
@@ -470,6 +537,7 @@ def parse_args() -> argparse.Namespace:
             "uniform",
             "greedy",
             "groups",
+            "async",
         ],
         default=None,
     )
@@ -631,23 +699,44 @@ def main() -> int:
 
     measured_results: List[tuple[Plan, Dict[str, object]]] = []
     for plan in sorted(plans, key=lambda item: item.estimated_total_cost_ns):
-        bridge = bridge_tensors(plan)
-        _, result = bench_call(
-            lambda bridge=bridge: fused_moe_bf16_tiled_scheduled(
-                hidden_states,
-                packed,
-                topk_weights,
-                topk_ids,
-                bridge["wave_offsets"],
-                bridge["team_expert_ids"],
-                bridge["team_threads"],
-                thread_cpu_ids=bridge["thread_cpu_ids"],
-                num_threads=int(bridge["num_threads"]),
-                activation=args.activation,
-            ),
-            warmup=args.warmup,
-            runs=args.runs,
-        )
+        if plan.async_tasks:
+            async_bridge = async_tensors(plan)
+            _, result = bench_call(
+                lambda async_bridge=async_bridge: fused_moe_bf16_tiled_async(
+                    hidden_states,
+                    packed,
+                    topk_weights,
+                    topk_ids,
+                    async_bridge["task_expert_ids"],
+                    async_bridge["task_core_begins"],
+                    async_bridge["task_threads"],
+                    async_bridge["task_dep_offsets"],
+                    async_bridge["task_deps"],
+                    thread_cpu_ids=async_bridge["thread_cpu_ids"],
+                    num_threads=int(async_bridge["num_threads"]),
+                    activation=args.activation,
+                ),
+                warmup=args.warmup,
+                runs=args.runs,
+            )
+        else:
+            bridge = bridge_tensors(plan)
+            _, result = bench_call(
+                lambda bridge=bridge: fused_moe_bf16_tiled_scheduled(
+                    hidden_states,
+                    packed,
+                    topk_weights,
+                    topk_ids,
+                    bridge["wave_offsets"],
+                    bridge["team_expert_ids"],
+                    bridge["team_threads"],
+                    thread_cpu_ids=bridge["thread_cpu_ids"],
+                    num_threads=int(bridge["num_threads"]),
+                    activation=args.activation,
+                ),
+                warmup=args.warmup,
+                runs=args.runs,
+            )
         measured_results.append((plan, result))
 
     baseline_median_s = None

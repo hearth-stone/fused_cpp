@@ -24,6 +24,7 @@ class PlanKind(str, Enum):
     UNIFORM_WAVES = "UNIFORM_WAVES"
     GREEDY_MARGINAL_GAIN = "GREEDY_MARGINAL_GAIN"
     ENUMERATE_CORE_GROUPS = "ENUMERATE_CORE_GROUPS"
+    ASYNC_INTERVAL_DAG = "ASYNC_INTERVAL_DAG"
 
 
 PLANNER_ALIASES = {
@@ -43,6 +44,11 @@ PLANNER_ALIASES = {
     "core_groups": PlanKind.ENUMERATE_CORE_GROUPS,
     "enumerate": PlanKind.ENUMERATE_CORE_GROUPS,
     "enumerate_core_groups": PlanKind.ENUMERATE_CORE_GROUPS,
+    "async": PlanKind.ASYNC_INTERVAL_DAG,
+    "async_interval": PlanKind.ASYNC_INTERVAL_DAG,
+    "async_interval_dag": PlanKind.ASYNC_INTERVAL_DAG,
+    "dynamic_interval": PlanKind.ASYNC_INTERVAL_DAG,
+    "interval_dag": PlanKind.ASYNC_INTERVAL_DAG,
 }
 
 DEFAULT_PLANNER_COSTS_NS = {
@@ -51,6 +57,7 @@ DEFAULT_PLANNER_COSTS_NS = {
     PlanKind.UNIFORM_WAVES: 5_000,
     PlanKind.GREEDY_MARGINAL_GAIN: 20_000,
     PlanKind.ENUMERATE_CORE_GROUPS: 30_000,
+    PlanKind.ASYNC_INTERVAL_DAG: 40_000,
 }
 
 COMPLEXITY_COST_COEFFICIENTS_NS = {
@@ -59,6 +66,7 @@ COMPLEXITY_COST_COEFFICIENTS_NS = {
     "uniform_base": 800,
     "greedy_base": 1_000,
     "groups_base": 1_200,
+    "async_base": 1_500,
     "cost_lookup": 2,
     "linear_scan": 5,
     "wave_pack": 4,
@@ -114,6 +122,40 @@ class Wave:
 
 
 @dataclass(frozen=True)
+class AsyncTask:
+    task_id: int
+    expert_id: int
+    routes: int
+    threads: int
+    core_begin: int
+    estimated_time_ns: int
+    estimated_start_ns: int
+    estimated_finish_ns: int
+    deps: List[int] = field(default_factory=list)
+    route_begin: int = 0
+
+    @property
+    def core_end(self) -> int:
+        return self.core_begin + self.threads
+
+    def to_dict(self) -> Dict[str, object]:
+        return {
+            "task_id": self.task_id,
+            "expert_id": self.expert_id,
+            "route_begin": self.route_begin,
+            "route_count": self.routes,
+            "routes": self.routes,
+            "threads": self.threads,
+            "core_begin": self.core_begin,
+            "core_end": self.core_end,
+            "deps": list(self.deps),
+            "estimated_time_ns": self.estimated_time_ns,
+            "estimated_start_ns": self.estimated_start_ns,
+            "estimated_finish_ns": self.estimated_finish_ns,
+        }
+
+
+@dataclass(frozen=True)
 class Plan:
     kind: PlanKind
     num_cores: int
@@ -123,17 +165,32 @@ class Plan:
     estimated_plan_cost_ns: int
     exactness_scope: str
     metadata: Dict[str, object] = field(default_factory=dict)
+    async_tasks: List[AsyncTask] = field(default_factory=list)
+    estimated_execute_cost_ns_override: Optional[int] = None
 
     @property
     def estimated_execute_cost_ns(self) -> int:
+        if self.estimated_execute_cost_ns_override is not None:
+            return self.estimated_execute_cost_ns_override
+        if self.async_tasks:
+            return max(task.estimated_finish_ns for task in self.async_tasks)
         return sum(wave.estimated_wave_time_ns for wave in self.waves)
 
     @property
     def estimated_total_cost_ns(self) -> int:
         return self.estimated_plan_cost_ns + self.estimated_execute_cost_ns
 
+    @property
+    def supports_scheduled_bridge(self) -> bool:
+        return not self.async_tasks
+
     def to_scheduled_bridge(self) -> Dict[str, object]:
         """Return tensors-as-lists accepted by fused_moe_bf16_tiled_scheduled."""
+        if not self.supports_scheduled_bridge:
+            raise ValueError(
+                f"{self.kind.value} uses async_tasks and cannot be represented "
+                "by the current wave_offsets scheduled bridge"
+            )
         wave_offsets = [0]
         team_expert_ids: List[int] = []
         team_threads: List[int] = []
@@ -161,7 +218,17 @@ class Plan:
             "estimated_execute_cost_ns": self.estimated_execute_cost_ns,
             "estimated_total_cost_ns": self.estimated_total_cost_ns,
             "exactness_scope": self.exactness_scope,
-            "scheduled_bridge": self.to_scheduled_bridge(),
+            "scheduled_bridge": (
+                self.to_scheduled_bridge()
+                if self.supports_scheduled_bridge
+                else None
+            ),
+            "async_tasks": [task.to_dict() for task in self.async_tasks],
+            "runtime_bridge": (
+                "wave_offsets"
+                if self.supports_scheduled_bridge
+                else "async_task_dag"
+            ),
             "metadata": self.metadata,
         }
 
@@ -415,6 +482,19 @@ class PlannerCostModel:
                 "gain_scan_ops": 0,
                 "sort_compare_ops": active_count * log_active + shape_count * log_active,
                 "budget_eval_ops": shape_count,
+            }
+
+        if kind == PlanKind.ASYNC_INTERVAL_DAG:
+            interval_candidates = num_cores * (num_cores + 1) // 2
+            enum_work = active_count * interval_candidates
+            return {
+                "base": self.coefficients_ns["async_base"],
+                "cost_lookup_ops": active_count * num_cores,
+                "linear_scan_ops": enum_work,
+                "wave_pack_ops": active_count,
+                "gain_scan_ops": 0,
+                "sort_compare_ops": active_count * log_active,
+                "budget_eval_ops": active_count,
             }
 
         raise ValueError(f"unknown plan kind: {kind}")
@@ -909,6 +989,172 @@ def plan_greedy_marginal_gain(
     )
 
 
+def plan_async_interval_dag(
+    active: Sequence[ExpertWork],
+    num_cores: int,
+    cost_model: ExpertCostModel,
+    planner_cost_model: PlannerCostModel,
+) -> Plan:
+    """Precomputed async interval schedule without global wave barriers.
+
+    The planner assigns each expert to a contiguous logical-core interval. A
+    task depends on the last task that touched each core in that interval; this
+    represents local split/join constraints and lets unrelated intervals proceed
+    independently. The current C++ wave bridge cannot execute this yet, so the
+    result is emitted as async_tasks only.
+    """
+    start_ns = time.perf_counter_ns()
+    if num_cores <= 0:
+        raise ValueError("num_cores must be positive")
+
+    ordered = sorted(active, key=lambda work: (-work.routes, work.expert_id))
+
+    def build_for_thread_cap(
+        max_threads_per_task: int,
+    ) -> Tuple[int, int, List[int], List[AsyncTask]]:
+        core_ready_ns = [0 for _ in range(num_cores)]
+        core_last_task: List[Optional[int]] = [None for _ in range(num_cores)]
+        tasks: List[AsyncTask] = []
+        total_core_time_ns = 0
+
+        for work in ordered:
+            current_makespan = max(core_ready_ns, default=0)
+            best: Optional[
+                Tuple[Tuple[int, int, int, int, int, int], int, int, int, int]
+            ] = None
+
+            for threads in range(1, max_threads_per_task + 1):
+                time_ns = cost_model.estimate_ns(work.routes, threads)
+                core_time_ns = threads * time_ns
+                for core_begin in range(0, num_cores - threads + 1):
+                    core_end = core_begin + threads
+                    start_time_ns = max(core_ready_ns[core_begin:core_end])
+                    finish_time_ns = start_time_ns + time_ns
+                    new_makespan_ns = max(current_makespan, finish_time_ns)
+                    objective = (
+                        new_makespan_ns,
+                        finish_time_ns,
+                        core_time_ns,
+                        start_time_ns,
+                        threads,
+                        core_begin,
+                    )
+                    candidate = (
+                        objective,
+                        threads,
+                        core_begin,
+                        start_time_ns,
+                        finish_time_ns,
+                    )
+                    if best is None or candidate[0] < best[0]:
+                        best = candidate
+
+            if best is None:
+                raise ValueError("unable to place async interval task")
+
+            _, threads, core_begin, start_time_ns, finish_time_ns = best
+            core_end = core_begin + threads
+            deps = sorted(
+                {
+                    task_id
+                    for task_id in core_last_task[core_begin:core_end]
+                    if task_id is not None
+                }
+            )
+            task_id = len(tasks)
+            time_ns = finish_time_ns - start_time_ns
+            tasks.append(
+                AsyncTask(
+                    task_id=task_id,
+                    expert_id=work.expert_id,
+                    routes=work.routes,
+                    threads=threads,
+                    core_begin=core_begin,
+                    estimated_time_ns=time_ns,
+                    estimated_start_ns=start_time_ns,
+                    estimated_finish_ns=finish_time_ns,
+                    deps=deps,
+                )
+            )
+            total_core_time_ns += threads * time_ns
+
+            for core in range(core_begin, core_end):
+                core_ready_ns[core] = finish_time_ns
+                core_last_task[core] = task_id
+
+        return (
+            max(core_ready_ns, default=0),
+            total_core_time_ns,
+            core_ready_ns,
+            tasks,
+        )
+
+    best_async: Optional[
+        Tuple[Tuple[int, int, int], int, List[int], List[AsyncTask]]
+    ] = None
+    for max_threads_per_task in range(1, num_cores + 1):
+        execute_ns, total_core_time_ns, core_ready_ns, tasks = build_for_thread_cap(
+            max_threads_per_task
+        )
+        objective = (execute_ns, total_core_time_ns, max_threads_per_task)
+        candidate = (objective, max_threads_per_task, core_ready_ns, tasks)
+        if best_async is None or candidate[0] < best_async[0]:
+            best_async = candidate
+
+    if best_async is None:
+        raise ValueError("unable to build async interval plan")
+
+    _, selected_thread_cap, core_ready_ns, tasks = best_async
+    estimated_execute_ns = max(core_ready_ns, default=0)
+    measured_plan_cost_ns = time.perf_counter_ns() - start_ns
+    estimated_plan_cost_ns = planner_cost_model.estimate_ns(
+        PlanKind.ASYNC_INTERVAL_DAG,
+        measured_plan_cost_ns,
+        active_count=len(active),
+        num_cores=num_cores,
+    )
+    thread_histogram: Dict[str, int] = {}
+    for task in tasks:
+        key = str(task.threads)
+        thread_histogram[key] = thread_histogram.get(key, 0) + 1
+    metadata = {
+        "planner": "offline_simulator.py",
+        "cost_model": cost_model.source,
+        "cost_metric": cost_model.metric,
+        "model_note": (
+            "precomputed async interval DAG: contiguous logical-core "
+            "intervals with local dependency counters; no global wave barrier"
+        ),
+        "runtime_bridge_supported": True,
+        "runtime_bridge": "async_task_dag",
+        "assignment": "largest_routes_list_scheduled_to_best_core_interval",
+        "core_finish_ns": core_ready_ns,
+        "thread_histogram": thread_histogram,
+        "num_async_tasks": len(tasks),
+        "selected_max_threads_per_task": selected_thread_cap,
+        "enumerated_max_threads_per_task": list(range(1, num_cores + 1)),
+    }
+    metadata.update(
+        planner_cost_model.metadata_for(
+            PlanKind.ASYNC_INTERVAL_DAG,
+            active_count=len(active),
+            num_cores=num_cores,
+        )
+    )
+    return Plan(
+        kind=PlanKind.ASYNC_INTERVAL_DAG,
+        num_cores=num_cores,
+        active_experts=list(active),
+        waves=[],
+        measured_plan_cost_ns=measured_plan_cost_ns,
+        estimated_plan_cost_ns=estimated_plan_cost_ns,
+        exactness_scope="heuristic_async_interval_space",
+        metadata=metadata,
+        async_tasks=tasks,
+        estimated_execute_cost_ns_override=estimated_execute_ns,
+    )
+
+
 def allocate_threads_by_marginal_gain(
     active: Sequence[ExpertWork],
     num_cores: int,
@@ -1329,6 +1575,7 @@ def build_plans(
         "uniform": plan_uniform_waves,
         "greedy": plan_greedy_marginal_gain,
         "groups": plan_enumerate_core_groups,
+        "async": plan_async_interval_dag,
     }
     names = list(planners) if "all" in planner_names else list(planner_names)
     unknown = [name for name in names if name not in planners]
@@ -1388,7 +1635,8 @@ def planner_cost_summary(planner_cost_model: PlannerCostModel) -> str:
         f"{format_ns(configured_cost(PlanKind.SORTED_TOKEN_BALANCED_1T))} "
         f"uniform={format_ns(configured_cost(PlanKind.UNIFORM_WAVES))} "
         f"greedy={format_ns(configured_cost(PlanKind.GREEDY_MARGINAL_GAIN))} "
-        f"groups={format_ns(configured_cost(PlanKind.ENUMERATE_CORE_GROUPS))}"
+        f"groups={format_ns(configured_cost(PlanKind.ENUMERATE_CORE_GROUPS))} "
+        f"async={format_ns(configured_cost(PlanKind.ASYNC_INTERVAL_DAG))}"
     )
 
 
@@ -1483,6 +1731,7 @@ def parse_args() -> argparse.Namespace:
             "uniform",
             "greedy",
             "groups",
+            "async",
         ],
         default=None,
         help="Planner to run. Can be passed multiple times.",
@@ -1661,10 +1910,15 @@ def main() -> int:
         )
     print("candidates:")
     for plan in sorted(plans, key=lambda item: item.estimated_total_cost_ns):
+        units_label = (
+            f"tasks={len(plan.async_tasks):<3}"
+            if plan.async_tasks
+            else f"waves={len(plan.waves):<3}"
+        )
         print(
             "  "
             f"{plan.kind.value:<24} "
-            f"waves={len(plan.waves):<3} "
+            f"{units_label} "
             f"plan={format_ns(plan.estimated_plan_cost_ns):>10} "
             f"py_plan={format_ns(plan.measured_plan_cost_ns):>10} "
             f"execute={format_ns(plan.estimated_execute_cost_ns):>10} "

@@ -5,6 +5,7 @@ It is intentionally close to the design document:
 
 ```text
 Plan -> Wave -> Team
+Plan -> AsyncTask DAG
 ```
 
 The same schema can be serialized as JSON by simulators and later translated into
@@ -48,6 +49,8 @@ native C++ runtime structures.
     "team_expert_ids": [7, 9, 13],
     "team_threads": [8, 4, 16]
   },
+  "async_tasks": [],
+  "runtime_bridge": "wave_offsets",
   "metadata": {
     "planner": "offline_simulator.py",
     "cost_metric": "median_ns",
@@ -109,6 +112,44 @@ Rules:
 - `estimated_wave_time_ns = max(team.estimated_time_ns for team in teams)`.
 - Empty waves are invalid.
 
+## AsyncTask
+
+`ASYNC_INTERVAL_DAG` uses a second representation instead of global waves:
+
+```json
+{
+  "task_id": 3,
+  "expert_id": 12,
+  "route_begin": 0,
+  "route_count": 384,
+  "routes": 384,
+  "threads": 2,
+  "core_begin": 1,
+  "core_end": 3,
+  "deps": [0],
+  "estimated_time_ns": 9000000,
+  "estimated_start_ns": 12000000,
+  "estimated_finish_ns": 21000000
+}
+```
+
+Rules:
+
+- One async task executes one expert workload on a contiguous logical-core
+  interval `[core_begin, core_end)`.
+- `deps` contains tasks that must complete before this task can start. These
+  dependencies are derived from core interval reuse, so they encode local
+  split/join constraints without a global wave barrier.
+- `estimated_execute_cost_ns` is the makespan:
+
+```text
+max(task.estimated_finish_ns for task in async_tasks)
+```
+
+- Async plans set `scheduled_bridge = null` because they are not representable
+  as global waves. They set `runtime_bridge = "async_task_dag"` and are executed
+  by the async task-DAG C++ bridge.
+
 ## Plan Cost
 
 ```text
@@ -162,6 +203,36 @@ Rules:
 The current C++ bridge accepts these arrays as `torch.int32` or another integer
 CPU dtype and reconstructs the same wave/team structure natively.
 
+`ASYNC_INTERVAL_DAG` uses a separate async task-DAG bridge instead of this wave
+bridge.
+
+## Async C++ Bridge
+
+`ASYNC_INTERVAL_DAG` is translated to compact task arrays accepted by
+`fused_moe_bf16_tiled_async`:
+
+```json
+{
+  "num_threads": 8,
+  "thread_cpu_ids": [0, 1, 2, 3, 4, 5, 6, 7],
+  "task_expert_ids": [0, 3, 5],
+  "task_core_begins": [0, 4, 6],
+  "task_threads": [4, 2, 2],
+  "task_dep_offsets": [0, 0, 1, 2],
+  "task_deps": [0, 1]
+}
+```
+
+Rules:
+
+- `task_expert_ids`, `task_core_begins`, and `task_threads` have one entry per
+  task.
+- `task_dep_offsets` / `task_deps` are a CSR dependency list. Dependencies must
+  refer to earlier task ids.
+- Each task uses the logical-thread interval
+  `[task_core_begins[i], task_core_begins[i] + task_threads[i])`.
+- The first async bridge supports exactly one task per active expert.
+
 ## Planner Kinds
 
 Current first-stage planner kinds:
@@ -179,6 +250,10 @@ Current first-stage planner kinds:
   experts to larger slots and choose the shape with the lowest estimated
   execution cost. Current implementation caps the candidate shape list at 512
   entries for large core counts; 8-core and 16-core cases are fully enumerated.
+- `ASYNC_INTERVAL_DAG`: list-schedule experts onto contiguous logical-core
+  intervals. Each task depends only on previous tasks that used overlapping
+  cores, so unrelated intervals can advance independently. This models the
+  precomputed + dynamic-triggered schedule needed to avoid global wave waits.
 
 ## Exactness Scope
 
