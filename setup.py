@@ -449,6 +449,9 @@ if is_aarch64:
         define_macros.append(("FUSED_CPP_HAS_BF16GEMM", "1"))
     bf16gemm_asm_sources.append(os.path.join(bf16gemm_lib, "bf16gemm_k.S"))
     bf16gemm_asm_sources.append(os.path.join(bf16gemm_lib, "bf16gemm_k_bias.S"))
+    # fused_cpp-owned packed-C fused-silu kernels (Part 2 of packA fusion).
+    bf16gemm_asm_sources.append(
+        os.path.abspath(os.path.join("csrc", "bf16gemm_silu_packc.S")))
 
     target_cpu = os.environ.get("FUSED_CPP_TARGET_CPU", "").strip()
     if target_cpu:
