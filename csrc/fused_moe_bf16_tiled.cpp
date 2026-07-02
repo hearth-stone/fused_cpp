@@ -53,6 +53,41 @@ void bf16gemm_k_ld2_bias_f(const uint16_t* A, const uint16_t* B_reo, float* C,
 void bf16gemm_k_ld4_bias_f(const uint16_t* A, const uint16_t* B_reo, float* C,
                            uint16_t* A_reorder, const gemm_params_t* params,
                            const float* bias);
+// Fused w13 + gate*up (Task 2: linear, no silu). Interleaved-packed w13,
+// bf16 output C[M, F_pad] (ldc = F_pad), no C load. N spans 2*F_pad packed
+// columns; each 8-col tile yields 4 output features.
+void bf16gemm_k_ld_silu_linear(const uint16_t* A, const uint16_t* B_reo,
+                               uint16_t* C, uint16_t* A_reorder,
+                               const gemm_params_t* params);
+// Fused w13 + SiLU-and-mul (poly4/5/6 exp), interleaved-packed w13, bf16 out.
+void bf16gemm_k_ld_silu_poly4(const uint16_t* A, const uint16_t* B_reo,
+                              uint16_t* C, uint16_t* A_reorder,
+                              const gemm_params_t* params);
+void bf16gemm_k_ld_silu_poly5(const uint16_t* A, const uint16_t* B_reo,
+                              uint16_t* C, uint16_t* A_reorder,
+                              const gemm_params_t* params);
+void bf16gemm_k_ld_silu_poly6(const uint16_t* A, const uint16_t* B_reo,
+                              uint16_t* C, uint16_t* A_reorder,
+                              const gemm_params_t* params);
+// M-tail (m=1/2/4) fused silu kernels.
+void bf16gemm_k_ld_silu_poly4_m1(const uint16_t*, const uint16_t*, uint16_t*,
+                                 uint16_t*, const gemm_params_t*);
+void bf16gemm_k_ld_silu_poly4_m2(const uint16_t*, const uint16_t*, uint16_t*,
+                                 uint16_t*, const gemm_params_t*);
+void bf16gemm_k_ld_silu_poly4_m4(const uint16_t*, const uint16_t*, uint16_t*,
+                                 uint16_t*, const gemm_params_t*);
+void bf16gemm_k_ld_silu_poly5_m1(const uint16_t*, const uint16_t*, uint16_t*,
+                                 uint16_t*, const gemm_params_t*);
+void bf16gemm_k_ld_silu_poly5_m2(const uint16_t*, const uint16_t*, uint16_t*,
+                                 uint16_t*, const gemm_params_t*);
+void bf16gemm_k_ld_silu_poly5_m4(const uint16_t*, const uint16_t*, uint16_t*,
+                                 uint16_t*, const gemm_params_t*);
+void bf16gemm_k_ld_silu_poly6_m1(const uint16_t*, const uint16_t*, uint16_t*,
+                                 uint16_t*, const gemm_params_t*);
+void bf16gemm_k_ld_silu_poly6_m2(const uint16_t*, const uint16_t*, uint16_t*,
+                                 uint16_t*, const gemm_params_t*);
+void bf16gemm_k_ld_silu_poly6_m4(const uint16_t*, const uint16_t*, uint16_t*,
+                                 uint16_t*, const gemm_params_t*);
 }
 #endif
 
@@ -422,6 +457,82 @@ void single_thread_gemm(const uint16_t* A,
             bf16gemm_k_ld1(At, B_reo, Ct, A_reo_t, &p);
         }
     }
+}
+
+// Fused w13 + SiLU-and-mul kernel pointers for a given exp polynomial degree
+// (4/5/6). Signature: (A, B_reo, C_bf16, A_reorder, params). Shared by the
+// test binding and the MoE wiring.
+using FusedSiluKernelFn = void (*)(const uint16_t*, const uint16_t*, uint16_t*,
+                                   uint16_t*, const gemm_params_t*);
+
+struct FusedSiluKernelSet {
+    FusedSiluKernelFn m8 = nullptr;
+    FusedSiluKernelFn m4 = nullptr;
+    FusedSiluKernelFn m2 = nullptr;
+    FusedSiluKernelFn m1 = nullptr;
+};
+
+FusedSiluKernelSet fused_silu_kernels_for_degree(int64_t degree) {
+    switch (degree) {
+        case 4:
+            return {bf16gemm_k_ld_silu_poly4, bf16gemm_k_ld_silu_poly4_m4,
+                    bf16gemm_k_ld_silu_poly4_m2, bf16gemm_k_ld_silu_poly4_m1};
+        case 5:
+            return {bf16gemm_k_ld_silu_poly5, bf16gemm_k_ld_silu_poly5_m4,
+                    bf16gemm_k_ld_silu_poly5_m2, bf16gemm_k_ld_silu_poly5_m1};
+        case 6:
+            return {bf16gemm_k_ld_silu_poly6, bf16gemm_k_ld_silu_poly6_m4,
+                    bf16gemm_k_ld_silu_poly6_m2, bf16gemm_k_ld_silu_poly6_m1};
+        default:
+            return {};
+    }
+}
+
+// Bottom-layer fused w13 + SiLU-and-mul over the whole [M] slice: interleaved
+// w13 in B_reo, bf16 output C[M, ldc] (ldc = F_pad4), N = 2*F_pad4 packed
+// columns. Dispatches m=8 blocks then 4/2/1-row tails, mirroring
+// single_thread_gemm. `degree` picks the exp polynomial (4/5/6).
+void single_thread_gemm_fused_silu(const uint16_t* A,
+                                   const uint16_t* B_reo,
+                                   uint16_t* C,
+                                   uint16_t* A_reorder,
+                                   int M,
+                                   int K,
+                                   int N,
+                                   int ldc,
+                                   int64_t degree) {
+    const FusedSiluKernelSet ks = fused_silu_kernels_for_degree(degree);
+    TORCH_CHECK(ks.m8 != nullptr,
+                "unsupported fused silu exp degree ", degree, " (expected 4/5/6)");
+    gemm_params_t p;
+    p.lda = K;
+    p.ldb = K;
+    p.ldc = ldc;
+
+    int processed = 0;
+    const int m_full = (M / 8) * 8;
+    if (m_full > 0) {
+        p.m = m_full;
+        p.k = K;
+        p.n = N;
+        ks.m8(A, B_reo, C, A_reorder, &p);
+        processed = m_full;
+    }
+    int m_rem = M - processed;
+    auto advance = [&](int rows) {
+        const uint16_t* At = A + static_cast<int64_t>(processed) * K;
+        uint16_t* Ct = C + static_cast<int64_t>(processed) * ldc;
+        uint16_t* Ar = A_reorder + static_cast<int64_t>(processed) * K;
+        p.m = rows;
+        p.k = K;
+        p.n = N;
+        FusedSiluKernelFn fn = (rows == 4) ? ks.m4 : (rows == 2) ? ks.m2 : ks.m1;
+        fn(At, B_reo, Ct, Ar, &p);
+        processed += rows;
+    };
+    if (m_rem >= 4) { advance(4); m_rem -= 4; }
+    if (m_rem >= 2) { advance(2); m_rem -= 2; }
+    if (m_rem >= 1) { advance(1); }
 }
 
 #endif
@@ -1449,27 +1560,39 @@ struct ThreadScheduleDebug {
 class ThreadBarrier {
 public:
     explicit ThreadBarrier(int64_t participants)
-        : participants_(participants), count_(participants) {}
+        : participants_(participants) {}
 
+    // Sense/generation spin barrier. The MoE team stages are µs-scale, so a
+    // mutex+condition_variable barrier (a futex + scheduler wakeup, ~µs, per
+    // wait, x4-5 barriers per expert) dominated the "gap" overhead. All
+    // participants always arrive, so a bounded spin with a yield fallback is
+    // safe and much cheaper.
     void wait() {
-        std::unique_lock<std::mutex> lock(mutex_);
-        const int64_t generation = generation_;
-        --count_;
-        if (count_ == 0) {
-            ++generation_;
-            count_ = participants_;
-            cv_.notify_all();
+        const int64_t gen = generation_.load(std::memory_order_acquire);
+        if (arrived_.fetch_add(1, std::memory_order_acq_rel) + 1 ==
+            participants_) {
+            // Last arrival: reset for the next round, then release the spinners.
+            arrived_.store(0, std::memory_order_relaxed);
+            generation_.store(gen + 1, std::memory_order_release);
             return;
         }
-        cv_.wait(lock, [&]() { return generation_ != generation; });
+        int64_t spins = 0;
+        while (generation_.load(std::memory_order_acquire) == gen) {
+#if defined(__aarch64__)
+            __asm__ __volatile__("yield" ::: "memory");
+#endif
+            if (++spins >= kSpinBudget) {
+                std::this_thread::yield();
+                spins = 0;
+            }
+        }
     }
 
 private:
-    int64_t participants_;
-    int64_t count_;
-    int64_t generation_ = 0;
-    std::mutex mutex_;
-    std::condition_variable cv_;
+    static constexpr int64_t kSpinBudget = 4096;
+    const int64_t participants_;
+    std::atomic<int64_t> arrived_{0};
+    std::atomic<int64_t> generation_{0};
 };
 
 #ifdef __aarch64__
@@ -2783,6 +2906,42 @@ void pack_transposed_expert_weight(const uint16_t* weight,
                 static_cast<int>(N_pad));
 }
 
+// Interleaved w13 pack for the fused SiLU epilogue. w13 weight is
+// [2F, H] = [gate rows 0..F | up rows F..2F], in_features = H (= K13).
+// The fused bf16 kernel produces one intermediate feature per (gate,up)
+// column pair, and its 8x8 tile de-interleaves as cols[0:4]=gate, cols[4:8]=up
+// (see STORE_C_ROWMAJOR). So we lay the packed columns out per 8-col N-block b
+// as [g(4b) g(4b+1) g(4b+2) g(4b+3) | u(4b) u(4b+1) u(4b+2) u(4b+3)]:
+//   gate feature f -> packed column 8*(f/4) + (f%4)
+//   up   feature f -> packed column 8*(f/4) + 4 + (f%4)
+// N_pad must be 2*ceil(F,4) (a multiple of 8). Padded gate/up features in
+// [F, ceil(F,4)) stay zero, so they yield silu(0)*0 = 0 downstream.
+void pack_transposed_expert_weight_interleaved(const uint16_t* weight,
+                                               int64_t expert_offset,
+                                               int64_t F,
+                                               int64_t H,
+                                               int64_t K_pad,
+                                               int64_t N_pad,
+                                               uint16_t* packed_dst) {
+    std::vector<uint16_t> transposed(
+        static_cast<size_t>(K_pad * N_pad), static_cast<uint16_t>(0));
+    for (int64_t f = 0; f < F; ++f) {
+        const int64_t blk = f / 4;
+        const int64_t off = f % 4;
+        const int64_t gate_col = blk * 8 + off;
+        const int64_t up_col = blk * 8 + 4 + off;
+        const uint16_t* gate_row = weight + expert_offset + f * H;
+        const uint16_t* up_row = weight + expert_offset + (F + f) * H;
+        for (int64_t k = 0; k < H; ++k) {
+            transposed[static_cast<size_t>(k * N_pad + gate_col)] =
+                gate_row[k];
+            transposed[static_cast<size_t>(k * N_pad + up_col)] = up_row[k];
+        }
+    }
+    bf16_pack_b(transposed.data(), packed_dst, static_cast<int>(K_pad),
+                static_cast<int>(N_pad));
+}
+
 }  // namespace
 
 // Test-only: expose the middle-layer split plan. Returns the selected split
@@ -2875,6 +3034,166 @@ at::Tensor fused_moe_test_single_thread_gemm(at::Tensor A,
         std::copy(c_ptr + m * N_pad, c_ptr + m * N_pad + N, o_ptr + m * N);
     }
     return out;
+#endif
+}
+
+// Test-only: pack w13[2F, H] with the interleaved gate/up layout, then run the
+// bottom-layer fp32 GEMM. Returns C[M, 2*F_pad] whose columns are in the
+// INTERLEAVED order (8-col blocks of 4 gate + 4 up). Lets a test pin the
+// prepack permutation: interleaved col 8*(f/4)+(f%4) must equal reference
+// gate feature f, and col 8*(f/4)+4+(f%4) must equal reference up feature f.
+at::Tensor fused_moe_test_pack_interleaved_gemm(at::Tensor A, at::Tensor w13) {
+#ifndef __aarch64__
+    TORCH_CHECK(false, "fused_moe_test_pack_interleaved_gemm requires AArch64");
+#else
+    check_bf16_cpu(A, "A");
+    check_bf16_cpu(w13, "w13");
+    TORCH_CHECK(A.dim() == 2, "A must be 2-D [M, H]");
+    TORCH_CHECK(w13.dim() == 2, "w13 must be 2-D [2F, H]");
+    A = A.contiguous();
+    w13 = w13.contiguous();
+    const int64_t M = A.size(0);
+    const int64_t H = A.size(1);
+    const int64_t N13 = w13.size(0);
+    TORCH_CHECK(w13.size(1) == H, "w13 second dim must equal H=", H);
+    TORCH_CHECK(N13 % 2 == 0, "w13 output dim must be even, got ", N13);
+    const int64_t F = N13 / 2;
+    check_positive_int(M, "M");
+    check_positive_int(H, "H");
+
+    const int64_t K_pad = ceil_to_multiple(H, kKernelTile);
+    const int64_t F_pad4 = ceil_to_multiple(F, 4);
+    const int64_t N_pad = 2 * F_pad4;  // multiple of 8
+
+    std::vector<uint16_t> packed(
+        static_cast<size_t>(K_pad * N_pad), static_cast<uint16_t>(0));
+    pack_transposed_expert_weight_interleaved(bf16_data_const(w13), 0, F, H,
+                                              K_pad, N_pad, packed.data());
+
+    std::vector<uint16_t> a_pad(
+        static_cast<size_t>(M * K_pad), static_cast<uint16_t>(0));
+    const uint16_t* a_src = bf16_data_const(A);
+    for (int64_t m = 0; m < M; ++m) {
+        std::copy(a_src + m * H, a_src + m * H + H, a_pad.data() + m * K_pad);
+    }
+    std::vector<uint16_t> a_reorder(
+        static_cast<size_t>(M * K_pad * 2), static_cast<uint16_t>(0));
+
+    at::Tensor C_pad =
+        at::zeros({M, N_pad}, at::TensorOptions().dtype(at::kFloat));
+    single_thread_gemm(a_pad.data(), packed.data(), C_pad.data_ptr<float>(),
+                       a_reorder.data(), static_cast<int>(M),
+                       static_cast<int>(K_pad), static_cast<int>(N_pad),
+                       static_cast<int>(N_pad), nullptr);
+    return C_pad;
+#endif
+}
+
+// Test-only (Task 2): fused w13 kernel with gate*up (NO silu), bf16 output.
+// A[M,H], w13[2F,H]. M must be a multiple of 8 (m=8 kernel only until Task 5).
+// Returns intermediate[M, F] bf16 = (A @ w13_gate^T) * (A @ w13_up^T).
+at::Tensor fused_moe_test_fused_w13_linear(at::Tensor A, at::Tensor w13) {
+#ifndef __aarch64__
+    TORCH_CHECK(false, "fused_moe_test_fused_w13_linear requires AArch64");
+#else
+    check_bf16_cpu(A, "A");
+    check_bf16_cpu(w13, "w13");
+    TORCH_CHECK(A.dim() == 2, "A must be 2-D [M, H]");
+    TORCH_CHECK(w13.dim() == 2, "w13 must be 2-D [2F, H]");
+    A = A.contiguous();
+    w13 = w13.contiguous();
+    const int64_t M = A.size(0);
+    const int64_t H = A.size(1);
+    const int64_t N13 = w13.size(0);
+    TORCH_CHECK(w13.size(1) == H, "w13 second dim must equal H=", H);
+    TORCH_CHECK(N13 % 2 == 0, "w13 output dim must be even, got ", N13);
+    TORCH_CHECK(M % 8 == 0, "M must be a multiple of 8 (m=8 kernel only)");
+    const int64_t F = N13 / 2;
+    check_positive_int(M, "M");
+    check_positive_int(H, "H");
+
+    const int64_t K_pad = ceil_to_multiple(H, kKernelTile);
+    const int64_t F_pad4 = ceil_to_multiple(F, 4);
+    const int64_t N_pad = 2 * F_pad4;  // multiple of 8
+
+    std::vector<uint16_t> packed(
+        static_cast<size_t>(K_pad * N_pad), static_cast<uint16_t>(0));
+    pack_transposed_expert_weight_interleaved(bf16_data_const(w13), 0, F, H,
+                                              K_pad, N_pad, packed.data());
+
+    std::vector<uint16_t> a_pad(
+        static_cast<size_t>(M * K_pad), static_cast<uint16_t>(0));
+    const uint16_t* a_src = bf16_data_const(A);
+    for (int64_t m = 0; m < M; ++m) {
+        std::copy(a_src + m * H, a_src + m * H + H, a_pad.data() + m * K_pad);
+    }
+    std::vector<uint16_t> a_reorder(
+        static_cast<size_t>(M * K_pad * 2), static_cast<uint16_t>(0));
+
+    at::Tensor C = at::zeros({M, F_pad4},
+                             at::TensorOptions().dtype(at::kBFloat16));
+    gemm_params_t p;
+    p.m = static_cast<int>(M);
+    p.k = static_cast<int>(K_pad);
+    p.n = static_cast<int>(N_pad);
+    p.lda = static_cast<int>(K_pad);
+    p.ldb = static_cast<int>(K_pad);
+    p.ldc = static_cast<int>(F_pad4);
+    bf16gemm_k_ld_silu_linear(a_pad.data(), packed.data(), bf16_data(C),
+                              a_reorder.data(), &p);
+    return C.slice(1, 0, F).contiguous();
+#endif
+}
+
+// Test-only (Task 3+): fused w13 SiLU-and-mul kernel, bf16 output [M,F].
+// degree selects the exp polynomial (5 available in Task 3; 4/6 in Task 4).
+// out[m,f] = silu(gate[m,f]) * up[m,f]. M must be a multiple of 8 until Task 5.
+at::Tensor fused_moe_test_fused_w13_silu(at::Tensor A, at::Tensor w13,
+                                         int64_t degree) {
+#ifndef __aarch64__
+    TORCH_CHECK(false, "fused_moe_test_fused_w13_silu requires AArch64");
+#else
+    check_bf16_cpu(A, "A");
+    check_bf16_cpu(w13, "w13");
+    TORCH_CHECK(A.dim() == 2, "A must be 2-D [M, H]");
+    TORCH_CHECK(w13.dim() == 2, "w13 must be 2-D [2F, H]");
+    A = A.contiguous();
+    w13 = w13.contiguous();
+    const int64_t M = A.size(0);
+    const int64_t H = A.size(1);
+    const int64_t N13 = w13.size(0);
+    TORCH_CHECK(w13.size(1) == H, "w13 second dim must equal H=", H);
+    TORCH_CHECK(N13 % 2 == 0, "w13 output dim must be even, got ", N13);
+    const int64_t F = N13 / 2;
+    check_positive_int(M, "M");
+    check_positive_int(H, "H");
+
+    const int64_t K_pad = ceil_to_multiple(H, kKernelTile);
+    const int64_t F_pad4 = ceil_to_multiple(F, 4);
+    const int64_t N_pad = 2 * F_pad4;
+
+    std::vector<uint16_t> packed(
+        static_cast<size_t>(K_pad * N_pad), static_cast<uint16_t>(0));
+    pack_transposed_expert_weight_interleaved(bf16_data_const(w13), 0, F, H,
+                                              K_pad, N_pad, packed.data());
+
+    std::vector<uint16_t> a_pad(
+        static_cast<size_t>(M * K_pad), static_cast<uint16_t>(0));
+    const uint16_t* a_src = bf16_data_const(A);
+    for (int64_t m = 0; m < M; ++m) {
+        std::copy(a_src + m * H, a_src + m * H + H, a_pad.data() + m * K_pad);
+    }
+    std::vector<uint16_t> a_reorder(
+        static_cast<size_t>(M * K_pad * 2), static_cast<uint16_t>(0));
+
+    at::Tensor C = at::zeros({M, F_pad4},
+                             at::TensorOptions().dtype(at::kBFloat16));
+    single_thread_gemm_fused_silu(a_pad.data(), packed.data(), bf16_data(C),
+                                  a_reorder.data(), static_cast<int>(M),
+                                  static_cast<int>(K_pad),
+                                  static_cast<int>(N_pad),
+                                  static_cast<int>(F_pad4), degree);
+    return C.slice(1, 0, F).contiguous();
 #endif
 }
 
@@ -3051,7 +3370,8 @@ std::vector<double> fused_moe_bench_team_gemm(at::Tensor A,
 
 std::tuple<at::Tensor, int64_t, int64_t, at::Tensor, int64_t, int64_t>
 fused_moe_bf16_tiled_prepare_weights(at::Tensor w13_weight,
-                                 at::Tensor w2_weight) {
+                                 at::Tensor w2_weight,
+                                 bool fuse_silu) {
 #ifndef __aarch64__
     TORCH_CHECK(false, "fused_moe_bf16_tiled_prepare_weights requires AArch64");
 #else
@@ -3080,6 +3400,11 @@ fused_moe_bf16_tiled_prepare_weights(at::Tensor w13_weight,
     check_positive_int(H, "hidden size");
     check_positive_int(F, "ffn hidden size");
     check_positive_int(N13, "w13 output size");
+    // Fused-SiLU layout requires F % 8 == 0 so the interleaved N13_pad (=2F)
+    // stays 8-aligned and the fused intermediate stride equals w2's K_pad (=F).
+    TORCH_CHECK(!fuse_silu || F % 8 == 0,
+                "fuse_silu requires ffn hidden size F to be a multiple of 8, "
+                "got F=", F);
 
     const int64_t K13 = H;
     const int64_t K2 = F;
@@ -3110,9 +3435,15 @@ fused_moe_bf16_tiled_prepare_weights(at::Tensor w13_weight,
     const int64_t w2_expert_stride = H * F;
     run_fixed_threads(prepack_threads, [&](int64_t tid) {
         for (int64_t e = tid; e < E; e += prepack_threads) {
-            pack_transposed_expert_weight(
-                w13_ptr, e * w13_expert_stride, N13, H, K13_pad, N13_pad,
-                w13_packed_ptr + e * K13_pad * N13_pad);
+            if (fuse_silu) {
+                pack_transposed_expert_weight_interleaved(
+                    w13_ptr, e * w13_expert_stride, F, H, K13_pad, N13_pad,
+                    w13_packed_ptr + e * K13_pad * N13_pad);
+            } else {
+                pack_transposed_expert_weight(
+                    w13_ptr, e * w13_expert_stride, N13, H, K13_pad, N13_pad,
+                    w13_packed_ptr + e * K13_pad * N13_pad);
+            }
             pack_transposed_expert_weight(
                 w2_ptr, e * w2_expert_stride, H, F, K2_pad, N2_pad,
                 w2_packed_ptr + e * K2_pad * N2_pad);
@@ -3137,7 +3468,9 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
                             int64_t num_threads,
                             std::string activation,
                             int64_t global_num_experts,
-                            bool skip_weighted) {
+                            bool skip_weighted,
+                            bool fuse_silu,
+                            int64_t silu_poly_degree) {
 #ifndef __aarch64__
     TORCH_CHECK(false, "fused_moe_bf16_tiled requires AArch64");
 #else
@@ -3264,7 +3597,28 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
     const int schedule_debug_level = debug_schedule_level();
     const HierarchicalNSplitConfig nsplit_config =
         hierarchical_nsplit_config_from_env();
-    const bool use_hierarchical_nsplit = nsplit_config.enabled;
+    // Fused SiLU-and-mul path (opt-in). Requires the interleaved w13 layout
+    // from prepare_weights(fuse_silu=True) and activation == "silu". F % 8 == 0
+    // makes the fused output stride (F) equal w2's K_pad, so the fused kernel
+    // writes scratch.intermediate directly and the activation pass + gate_up
+    // fp32 buffer are skipped. Only the default per-expert path is wired (Task
+    // 6); hierarchical N-split is left on the legacy path for now.
+    if (fuse_silu) {
+        TORCH_CHECK(activation == "silu",
+                    "fuse_silu only supports activation='silu', got ",
+                    activation);
+        TORCH_CHECK(F % 8 == 0, "fuse_silu requires F % 8 == 0, got F=", F);
+        TORCH_CHECK(w13.N_pad == 2 * F,
+                    "fuse_silu expects interleaved w13 with N_pad=2F (=",
+                    2 * F, "), got N_pad=", w13.N_pad);
+        TORCH_CHECK(w13_bias_base == nullptr,
+                    "fuse_silu does not support w13_bias yet");
+        TORCH_CHECK(silu_poly_degree == 4 || silu_poly_degree == 5 ||
+                        silu_poly_degree == 6,
+                    "silu_poly_degree must be 4, 5, or 6, got ",
+                    silu_poly_degree);
+    }
+    const bool use_hierarchical_nsplit = nsplit_config.enabled && !fuse_silu;
     const char* moe_trace_strategy =
         use_hierarchical_nsplit
             ? "hierarchical_mn_split_dynamic_expert"
@@ -3378,32 +3732,49 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
                         std::copy(src, src + H, dst);
                     }
 
-                    trace_dispatch_fp32_gemm(
-                        moe_trace,
-                        "w13",
-                        tid,
-                        -1,
-                        -1,
-                        -1,
-                        task.expert,
-                        task.route_begin,
-                        rows,
-                        scratch.input.data(),
-                        w13_ptr + task.expert * w13.packed_stride,
-                        scratch.gate_up.data(),
-                        scratch.a_reorder.data(),
-                        static_cast<int>(rows),
-                        static_cast<int>(w13.K_pad),
-                        static_cast<int>(w13.N_pad),
-                        static_cast<int>(w13.N_pad),
-                        w13_bias_base != nullptr
-                            ? w13_bias_base + task.expert * w13.N_pad
-                            : nullptr);
+                    if (fuse_silu) {
+                        // Fused w13 + SiLU-and-mul: interleaved w13 -> bf16
+                        // intermediate directly (skips gate_up + activation).
+                        // ldc = w2.K_pad (== F, since F % 8 == 0), so the
+                        // output stride matches w2's A stride exactly.
+                        single_thread_gemm_fused_silu(
+                            scratch.input.data(),
+                            w13_ptr + task.expert * w13.packed_stride,
+                            scratch.intermediate.data(),
+                            scratch.a_reorder.data(),
+                            static_cast<int>(rows),
+                            static_cast<int>(w13.K_pad),
+                            static_cast<int>(w13.N_pad),
+                            static_cast<int>(w2.K_pad),
+                            silu_poly_degree);
+                    } else {
+                        trace_dispatch_fp32_gemm(
+                            moe_trace,
+                            "w13",
+                            tid,
+                            -1,
+                            -1,
+                            -1,
+                            task.expert,
+                            task.route_begin,
+                            rows,
+                            scratch.input.data(),
+                            w13_ptr + task.expert * w13.packed_stride,
+                            scratch.gate_up.data(),
+                            scratch.a_reorder.data(),
+                            static_cast<int>(rows),
+                            static_cast<int>(w13.K_pad),
+                            static_cast<int>(w13.N_pad),
+                            static_cast<int>(w13.N_pad),
+                            w13_bias_base != nullptr
+                                ? w13_bias_base + task.expert * w13.N_pad
+                                : nullptr);
 
-                    activation_to_bf16(
-                        activation, scratch.gate_up.data(),
-                        scratch.intermediate.data(), rows, w13.N_pad,
-                        w2.K_pad, F);
+                        activation_to_bf16(
+                            activation, scratch.gate_up.data(),
+                            scratch.intermediate.data(), rows, w13.N_pad,
+                            w2.K_pad, F);
+                    }
 
                     trace_dispatch_fp32_gemm(
                         moe_trace,
@@ -3608,18 +3979,22 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
                 const int64_t rows = static_cast<int64_t>(
                     expert_routes.size());
 
-                if (local_tid == 0) {
-                    std::fill(scratch.input.begin(),
-                              scratch.input.begin() + rows * w13.K_pad,
-                              static_cast<uint16_t>(0));
-                    for (int64_t m = 0; m < rows; ++m) {
+                {
+                    // Parallel gather: each team thread copies its own row
+                    // slice (was serial on local_tid==0 with the rest idle).
+                    const SplitRange grange = split_evenly(
+                        rows, nsplit_group_size, local_tid);
+                    for (int64_t m = grange.begin;
+                         m < grange.begin + grange.size; ++m) {
                         const int64_t flat =
                             expert_routes[static_cast<size_t>(m)];
                         const int64_t token = flat / top_k;
-                        const uint16_t* src = input_ptr + token * H;
                         uint16_t* dst =
                             scratch.input.data() + m * w13.K_pad;
-                        std::copy(src, src + H, dst);
+                        std::fill(dst, dst + w13.K_pad,
+                                  static_cast<uint16_t>(0));
+                        std::copy(input_ptr + token * H,
+                                  input_ptr + token * H + H, dst);
                     }
                 }
                 barrier.wait();
@@ -4234,22 +4609,26 @@ at::Tensor fused_moe_bf16_tiled_scheduled(at::Tensor input,
                 uint16_t* a_reorder = scratch.a_reorder.data() +
                     local_tid * scratch.a_reorder_stride;
 
-                if (local_tid == 0) {
+                {
+                    // Parallel gather: each team thread copies its own row
+                    // slice (was serial on local_tid==0 with the rest idle).
                     auto worker_phase_begin = trace_phase_begin();
-                    std::fill(scratch.input.begin(),
-                              scratch.input.begin() + rows * w13.K_pad,
-                              static_cast<uint16_t>(0));
-                    for (int64_t m = 0; m < rows; ++m) {
+                    const SplitRange grange =
+                        split_evenly(rows, group_size, local_tid);
+                    for (int64_t m = grange.begin;
+                         m < grange.begin + grange.size; ++m) {
                         const int64_t flat =
                             expert_routes[static_cast<size_t>(m)];
                         const int64_t token = flat / top_k;
-                        const uint16_t* src = input_ptr + token * H;
                         uint16_t* dst =
                             scratch.input.data() + m * w13.K_pad;
-                        std::copy(src, src + H, dst);
+                        std::fill(dst, dst + w13.K_pad,
+                                  static_cast<uint16_t>(0));
+                        std::copy(input_ptr + token * H,
+                                  input_ptr + token * H + H, dst);
                     }
                     trace_phase_end(tid, wave_idx, selected_team, local_tid,
-                                    expert, rows, "gather_input",
+                                    expert, grange.size, "gather_input",
                                     worker_phase_begin);
                 }
                 barrier.wait();
@@ -4745,19 +5124,22 @@ at::Tensor fused_moe_bf16_tiled_async(at::Tensor input,
         uint16_t* a_reorder = scratch.a_reorder.data() +
             local_tid * scratch.a_reorder_stride;
 
-        if (local_tid == 0) {
+        {
+            // Parallel gather: each team thread copies its own row slice
+            // (was serial on local_tid==0 with the rest idle).
             auto worker_phase_begin = trace_phase_begin();
-            std::fill(scratch.input.begin(),
-                      scratch.input.begin() + rows * w13.K_pad,
-                      static_cast<uint16_t>(0));
-            for (int64_t m = 0; m < rows; ++m) {
+            const SplitRange grange =
+                split_evenly(rows, group_size, local_tid);
+            for (int64_t m = grange.begin;
+                 m < grange.begin + grange.size; ++m) {
                 const int64_t flat = expert_routes[static_cast<size_t>(m)];
                 const int64_t token = flat / top_k;
-                const uint16_t* src = input_ptr + token * H;
                 uint16_t* dst = scratch.input.data() + m * w13.K_pad;
-                std::copy(src, src + H, dst);
+                std::fill(dst, dst + w13.K_pad, static_cast<uint16_t>(0));
+                std::copy(input_ptr + token * H,
+                          input_ptr + token * H + H, dst);
             }
-            trace_phase_end(tid, task_id, local_tid, expert, rows,
+            trace_phase_end(tid, task_id, local_tid, expert, grange.size,
                             "gather_input", worker_phase_begin);
         }
         barrier.wait();

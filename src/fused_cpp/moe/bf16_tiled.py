@@ -16,6 +16,7 @@ class PreparedBF16TiledFusedMoEWeights:
 
     w13: PreparedWeight
     w2: PreparedWeight
+    fused_silu: bool = False
 
 
 try:
@@ -92,12 +93,19 @@ def _check_integer_schedule_tensor(tensor: torch.Tensor, name: str) -> None:
 def prepare_fused_moe_bf16_tiled_weights(
     w13_weight: torch.Tensor,
     w2_weight: torch.Tensor,
+    *,
+    fuse_silu: bool = False,
 ) -> PreparedBF16TiledFusedMoEWeights:
     """Pack dense bf16 expert weights for :func:`fused_moe_bf16_tiled`.
 
     ``w13_weight`` follows the vLLM layout ``[E, 2 * F, H]`` and ``w2_weight``
     follows ``[E, H, F]``. The returned object is reusable across decode steps.
     Set ``FUSED_CPP_MOE_PREPACK_THREADS`` to parallelize packing by expert.
+
+    ``fuse_silu=True`` packs w13 in the interleaved gate/up layout required by
+    the fused SiLU-and-mul GEMM epilogue (requires ``F % 8 == 0`` and
+    ``activation='silu'`` at call time). The returned object carries a
+    ``fused_silu`` flag that :func:`fused_moe_bf16_tiled` honours automatically.
     """
     _require_backend()
     if w13_weight.dtype != torch.bfloat16 or w2_weight.dtype != torch.bfloat16:
@@ -108,10 +116,12 @@ def prepare_fused_moe_bf16_tiled_weights(
     packed = _prepare_bf16_tiled_impl(
         w13_weight.contiguous(),
         w2_weight.contiguous(),
+        bool(fuse_silu),
     )
     return PreparedBF16TiledFusedMoEWeights(
         w13=(packed[0], int(packed[1]), int(packed[2])),
         w2=(packed[3], int(packed[4]), int(packed[5])),
+        fused_silu=bool(fuse_silu),
     )
 
 
@@ -127,9 +137,15 @@ def fused_moe_bf16_tiled(
     activation: Any = "silu",
     global_num_experts: int = -1,
     skip_weighted: bool = False,
+    silu_poly_degree: int = 5,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Run the C++ tiled fused MoE path using BF16 GEMMs."""
+    """Run the C++ tiled fused MoE path using BF16 GEMMs.
+
+    If ``weights`` were prepared with ``fuse_silu=True`` and ``activation`` is
+    ``"silu"``, the w13 GEMM fuses SiLU-and-mul into its store epilogue
+    (``silu_poly_degree`` selects the exp polynomial, 4/5/6).
+    """
     _require_backend()
     if input.dtype != torch.bfloat16:
         raise TypeError(f"input must be torch.bfloat16, got {input.dtype}")
@@ -174,6 +190,8 @@ def fused_moe_bf16_tiled(
         _activation_name(activation),
         int(global_num_experts),
         bool(skip_weighted),
+        bool(weights.fused_silu),
+        int(silu_poly_degree),
     )
     if out is not None:
         out.copy_(result)

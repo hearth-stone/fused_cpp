@@ -140,6 +140,10 @@ fused_moe_test_split_plan(std::string stage, int64_t M, int64_t K, int64_t N,
 at::Tensor fused_moe_test_single_thread_gemm(at::Tensor A,
                                              at::Tensor B,
                                              c10::optional<at::Tensor> bias);
+at::Tensor fused_moe_test_pack_interleaved_gemm(at::Tensor A, at::Tensor w13);
+at::Tensor fused_moe_test_fused_w13_linear(at::Tensor A, at::Tensor w13);
+at::Tensor fused_moe_test_fused_w13_silu(at::Tensor A, at::Tensor w13,
+                                         int64_t degree);
 at::Tensor fused_moe_test_team_gemm(at::Tensor A,
                                     at::Tensor B,
                                     int64_t group_size,
@@ -154,7 +158,8 @@ std::vector<double> fused_moe_bench_team_gemm(at::Tensor A,
                                               int64_t runs);
 std::tuple<at::Tensor, int64_t, int64_t, at::Tensor, int64_t, int64_t>
 fused_moe_bf16_tiled_prepare_weights(at::Tensor w13_weight,
-                                      at::Tensor w2_weight);
+                                      at::Tensor w2_weight,
+                                      bool fuse_silu);
 at::Tensor fused_moe_bf16_tiled(at::Tensor input,
                                 at::Tensor w13_packed,
                                 int64_t w13_K,
@@ -169,7 +174,9 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
                                 int64_t num_threads,
                                 std::string activation,
                                 int64_t global_num_experts,
-                                bool skip_weighted);
+                                bool skip_weighted,
+                                bool fuse_silu,
+                                int64_t silu_poly_degree);
 at::Tensor fused_moe_bf16_tiled_scheduled(at::Tensor input,
                                 at::Tensor w13_packed,
                                 int64_t w13_K,
@@ -1201,6 +1208,7 @@ PYBIND11_MODULE(_C, m) {
           &fused_moe_bf16_tiled_prepare_weights,
           "Pack BF16 MoE expert weights for the BF16 tiled fused MoE path.",
           py::arg("w13_weight"), py::arg("w2_weight"),
+          py::arg("fuse_silu") = false,
           py::call_guard<py::gil_scoped_release>());
 
     m.def("fused_moe_test_split_plan",
@@ -1221,6 +1229,32 @@ PYBIND11_MODULE(_C, m) {
           py::arg("A"),
           py::arg("B"),
           py::arg("bias") = c10::nullopt,
+          py::call_guard<py::gil_scoped_release>());
+
+    m.def("fused_moe_test_pack_interleaved_gemm",
+          &fused_moe_test_pack_interleaved_gemm,
+          "Test-only: pack w13[2F,H] interleaved (4 gate + 4 up per 8-col "
+          "block) and run the fp32 GEMM. Returns C[M, 2*F_pad] in interleaved "
+          "column order.",
+          py::arg("A"),
+          py::arg("w13"),
+          py::call_guard<py::gil_scoped_release>());
+
+    m.def("fused_moe_test_fused_w13_linear",
+          &fused_moe_test_fused_w13_linear,
+          "Test-only (Task 2): fused w13 kernel computing gate*up (no silu), "
+          "bf16 output [M,F]. M must be a multiple of 8.",
+          py::arg("A"),
+          py::arg("w13"),
+          py::call_guard<py::gil_scoped_release>());
+
+    m.def("fused_moe_test_fused_w13_silu",
+          &fused_moe_test_fused_w13_silu,
+          "Test-only: fused w13 SiLU-and-mul kernel, bf16 output [M,F]. "
+          "degree selects the exp polynomial (5 in Task 3; 4/6 in Task 4).",
+          py::arg("A"),
+          py::arg("w13"),
+          py::arg("degree") = 5,
           py::call_guard<py::gil_scoped_release>());
 
     m.def("fused_moe_test_team_gemm",
@@ -1267,6 +1301,8 @@ PYBIND11_MODULE(_C, m) {
           py::arg("activation") = "silu",
           py::arg("global_num_experts") = -1,
           py::arg("skip_weighted") = false,
+          py::arg("fuse_silu") = false,
+          py::arg("silu_poly_degree") = 5,
           py::call_guard<py::gil_scoped_release>());
 
     m.def("fused_moe_bf16_tiled_scheduled",
