@@ -33,11 +33,20 @@ try:
         _fused_moe_bf16_tiled_scheduled_impl = _scheduled_impl
     except (ImportError, AttributeError):
         _fused_moe_bf16_tiled_scheduled_impl = None
+    try:
+        from fused_cpp._C import (  # type: ignore[import-untyped]
+            fused_moe_bf16_tiled_async as _async_impl,
+        )
+
+        _fused_moe_bf16_tiled_async_impl = _async_impl
+    except (ImportError, AttributeError):
+        _fused_moe_bf16_tiled_async_impl = None
 
     _HAS_BF16_TILED_FUSED_MOE = True
 except (ImportError, AttributeError):
     _fused_moe_bf16_tiled_impl = None
     _fused_moe_bf16_tiled_scheduled_impl = None
+    _fused_moe_bf16_tiled_async_impl = None
     _prepare_bf16_tiled_impl = None
     _HAS_BF16_TILED_FUSED_MOE = False
 
@@ -266,8 +275,116 @@ def fused_moe_bf16_tiled_scheduled(
     return result
 
 
+def fused_moe_bf16_tiled_async(
+    input: torch.Tensor,
+    weights: PreparedBF16TiledFusedMoEWeights,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    task_expert_ids: torch.Tensor,
+    task_core_begins: torch.Tensor,
+    task_threads: torch.Tensor,
+    task_dep_offsets: torch.Tensor,
+    task_deps: torch.Tensor,
+    *,
+    thread_cpu_ids: torch.Tensor | None = None,
+    w13_bias: torch.Tensor | None = None,
+    w2_bias: torch.Tensor | None = None,
+    num_threads: int = 1,
+    activation: Any = "silu",
+    global_num_experts: int = -1,
+    skip_weighted: bool = False,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Run BF16 tiled MoE with an async task-DAG schedule.
+
+    Each task computes one active expert on a contiguous logical-thread
+    interval. ``task_dep_offsets`` / ``task_deps`` encode a CSR dependency
+    list, allowing later tasks to start as soon as their own interval is free
+    instead of waiting for a whole wave barrier.
+    """
+    _require_backend()
+    if _fused_moe_bf16_tiled_async_impl is None:
+        raise RuntimeError(
+            "BF16 tiled async MoE backend is unavailable; rebuild the C++ "
+            "extension with fused_moe_bf16_tiled_async support."
+        )
+    if input.dtype != torch.bfloat16:
+        raise TypeError(f"input must be torch.bfloat16, got {input.dtype}")
+    if input.device.type != "cpu":
+        raise ValueError("input must be a CPU tensor")
+    if topk_ids.dtype not in _INTEGER_DTYPES:
+        raise TypeError(f"topk_ids must use an integer dtype, got {topk_ids.dtype}")
+    if not topk_weights.dtype.is_floating_point:
+        raise TypeError(
+            f"topk_weights must use a floating dtype, got {topk_weights.dtype}"
+        )
+    if int(num_threads) <= 0:
+        raise ValueError(f"num_threads must be positive, got {num_threads}")
+    _check_integer_schedule_tensor(task_expert_ids, "task_expert_ids")
+    _check_integer_schedule_tensor(task_core_begins, "task_core_begins")
+    _check_integer_schedule_tensor(task_threads, "task_threads")
+    _check_integer_schedule_tensor(task_dep_offsets, "task_dep_offsets")
+    _check_integer_schedule_tensor(task_deps, "task_deps")
+    if int(task_core_begins.numel()) != int(task_expert_ids.numel()):
+        raise ValueError("task_core_begins must match task_expert_ids length")
+    if int(task_threads.numel()) != int(task_expert_ids.numel()):
+        raise ValueError("task_threads must match task_expert_ids length")
+    if int(task_dep_offsets.numel()) != int(task_expert_ids.numel()) + 1:
+        raise ValueError("task_dep_offsets must have num_tasks + 1 entries")
+    if thread_cpu_ids is not None:
+        _check_integer_schedule_tensor(thread_cpu_ids, "thread_cpu_ids")
+        if int(thread_cpu_ids.numel()) != int(num_threads):
+            raise ValueError(
+                "thread_cpu_ids must have exactly num_threads entries: "
+                f"got {int(thread_cpu_ids.numel())} vs {int(num_threads)}"
+            )
+    if out is not None:
+        if tuple(out.shape) != tuple(input.shape):
+            raise ValueError(f"out must have shape {tuple(input.shape)}")
+        if out.dtype != input.dtype or out.device != input.device:
+            raise ValueError("out must match input dtype and device")
+
+    def _contiguous_bias(bias: torch.Tensor | None) -> torch.Tensor | None:
+        if bias is None:
+            return None
+        if bias.dtype not in (torch.float32, torch.bfloat16):
+            raise TypeError("MoE bias must be torch.float32 or torch.bfloat16")
+        if bias.device.type != "cpu":
+            raise ValueError("MoE bias must be a CPU tensor")
+        return bias.contiguous()
+
+    result = _fused_moe_bf16_tiled_async_impl(
+        input.contiguous(),
+        weights.w13[0],
+        weights.w13[1],
+        weights.w13[2],
+        weights.w2[0],
+        weights.w2[1],
+        weights.w2[2],
+        topk_weights.contiguous(),
+        topk_ids.contiguous(),
+        task_expert_ids.contiguous(),
+        task_core_begins.contiguous(),
+        task_threads.contiguous(),
+        task_dep_offsets.contiguous(),
+        task_deps.contiguous(),
+        None if thread_cpu_ids is None else thread_cpu_ids.contiguous(),
+        _contiguous_bias(w13_bias),
+        _contiguous_bias(w2_bias),
+        int(num_threads),
+        _activation_name(activation),
+        int(global_num_experts),
+        bool(skip_weighted),
+    )
+    if out is not None:
+        out.copy_(result)
+        return out
+    return result
+
+
 bf16_tiled_fused_moe = fused_moe_bf16_tiled
 bf16_tiled_fused_moe_scheduled = fused_moe_bf16_tiled_scheduled
+bf16_tiled_fused_moe_async = fused_moe_bf16_tiled_async
 prepare_bf16_tiled_fused_moe_weights = prepare_fused_moe_bf16_tiled_weights
 
 
@@ -277,8 +394,10 @@ __all__ = [
     "_HAS_BF16_TILED_FUSED_MOE",
     "fused_moe_bf16_tiled",
     "fused_moe_bf16_tiled_scheduled",
+    "fused_moe_bf16_tiled_async",
     "bf16_tiled_fused_moe",
     "bf16_tiled_fused_moe_scheduled",
+    "bf16_tiled_fused_moe_async",
     "prepare_fused_moe_bf16_tiled_weights",
     "prepare_bf16_tiled_fused_moe_weights",
 ]

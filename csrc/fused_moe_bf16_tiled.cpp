@@ -59,7 +59,6 @@ void bf16gemm_k_ld4_bias_f(const uint16_t* A, const uint16_t* B_reo, float* C,
 namespace {
 
 constexpr int64_t kKernelTile = 8;
-constexpr int64_t kMoeTokenTile = 16;
 
 int64_t ceil_div_int64(int64_t x, int64_t y) {
     return (x + y - 1) / y;
@@ -90,10 +89,6 @@ SplitRange split_evenly(int64_t units, int64_t group_size, int64_t local_tid) {
         extra_units * (units_per_thread + 1) +
             (local_tid - extra_units) * units_per_thread,
         units_per_thread};
-}
-
-SplitRange m_split_range(int M, int64_t group_size, int64_t local_tid) {
-    return split_evenly(static_cast<int64_t>(M), group_size, local_tid);
 }
 
 SplitRange n_split_range(int N, int64_t group_size, int64_t local_tid) {
@@ -192,6 +187,138 @@ MoeGemmSplit choose_moe_gemm_split(MoeGemmStage stage,
     return group_size > 8 && M > N ? MoeGemmSplit::kM : MoeGemmSplit::kN;
 }
 
+// ── Middle-layer split planning (arch-independent, pure) ─────────────────
+// M-split with 8-row alignment: distribute floor(M/kKernelTile) 8-row blocks
+// evenly (each such thread runs the fast 8-row `bf16gemm_k_ld` kernel), and
+// place the <kKernelTile remainder rows on a single thread (the owner of the
+// last block, or thread 0 when there are no full blocks).
+SplitRange m_split_range_aligned(int64_t M, int64_t group_size,
+                                 int64_t local_tid) {
+    if (M <= 0 || group_size <= 0 || local_tid < 0 ||
+        local_tid >= group_size) {
+        return SplitRange{};
+    }
+    const int64_t blocks = M / kKernelTile;
+    const int64_t rem = M % kKernelTile;
+    if (blocks == 0) {
+        return local_tid == 0 ? SplitRange{0, M} : SplitRange{};
+    }
+    const SplitRange block_range =
+        split_evenly(blocks, group_size, local_tid);
+    SplitRange range{block_range.begin * kKernelTile,
+                     block_range.size * kKernelTile};
+    const int64_t last_block_owner = std::min(group_size, blocks) - 1;
+    if (rem > 0 && local_tid == last_block_owner) {
+        range.size += rem;
+    }
+    return range;
+}
+
+struct GemmSplitPlan {
+    MoeGemmSplit split = MoeGemmSplit::kN;
+};
+
+// Per-thread work range for a chosen plan. M-split -> row range (8-row aligned
+// save the single remainder thread); N-split -> column range (kKernelTile-block
+// aligned). N is expected already padded to a multiple of kKernelTile.
+SplitRange team_gemm_split_range(const GemmSplitPlan& plan, int64_t M,
+                                 int64_t N, int64_t group_size,
+                                 int64_t local_tid) {
+    if (plan.split == MoeGemmSplit::kM) {
+        return m_split_range_aligned(M, group_size, local_tid);
+    }
+    const SplitRange block_range =
+        split_evenly(N / kKernelTile, group_size, local_tid);
+    return SplitRange{block_range.begin * kKernelTile,
+                      block_range.size * kKernelTile};
+}
+
+// Threads that receive nonzero work under each candidate split.
+int64_t m_split_active_threads(int64_t M, int64_t group_size) {
+    if (M <= 0 || group_size <= 0) {
+        return 0;
+    }
+    const int64_t blocks = M / kKernelTile;
+    if (blocks == 0) {
+        return 1;
+    }
+    return std::min(group_size, blocks);
+}
+
+int64_t n_split_active_threads(int64_t N, int64_t group_size) {
+    if (N <= 0 || group_size <= 0) {
+        return 0;
+    }
+    const int64_t blocks = N / kKernelTile;
+    if (blocks == 0) {
+        return 1;
+    }
+    return std::min(group_size, blocks);
+}
+
+struct GemmSplitContext {
+    MoeGemmStage stage = MoeGemmStage::kW13;
+    int64_t M = 0;
+    int64_t K = 0;
+    int64_t N = 0;
+    int64_t group_size = 1;
+    int64_t m_active_threads = 1;
+    int64_t n_active_threads = 1;
+};
+
+using SplitSelectorFn = MoeGemmSplit (*)(const GemmSplitContext&);
+
+// Split selector — the single seam where the cooperative-team M-vs-N GEMM split
+// is decided. Default: N-split.
+//
+// Why N-split is the default (empirical + structural):
+//  * Measured on AWS Graviton (AmazonECS8Cores, 8-core) for the two MoE GEMM
+//    shapes w13 (K=H=4096, N=2F=1024) and w2 (K=F=512, N=H=4096). Data in
+//    cpu_moe_schedule_optimization/cost_model/profiles/split_mn_aws*.{csv,json}
+//    and cost_model/SPLIT_MN_FINDINGS.md.
+//  * N-split won at EVERY tested (M, group_size); M-split never won. There is NO
+//    crossover even at M/N = 64 (M swept up to 65536):
+//      - small M: N-split keeps the whole team busy, whereas an M-split only has
+//        M/kKernelTile row-blocks and starves threads (N up to ~5x faster);
+//      - large M: the GEMM is compute-bound and N-split's kernel is a stable
+//        ~5-10% more efficient — it works on contiguous packed-B column slices,
+//        while an M-split makes every thread traverse the FULL packed weight
+//        matrix.
+//  * So the decision is not a small-vs-large-M tradeoff; both regimes favor N.
+//
+// The ONLY case that prefers M-split is a shape too narrow in N to fill the team
+// (N/kKernelTile < group_size) while M can — this does not occur for MoE
+// w13/w2. TODO(cost-model): a measured team-GEMM cost table can refine this if
+// future shapes/hardware differ; this selector is the one place to change.
+MoeGemmSplit default_split_selector(const GemmSplitContext& ctx) {
+    // Fall back to M-split only when N-split cannot fill the team (too few
+    // kKernelTile column-blocks) but M-split can. Otherwise default to N-split.
+    if (ctx.group_size > 1 &&
+        ctx.n_active_threads < ctx.group_size &&
+        ctx.m_active_threads > ctx.n_active_threads) {
+        return MoeGemmSplit::kM;
+    }
+    return MoeGemmSplit::kN;  // default
+}
+
+GemmSplitPlan plan_team_gemm_split(MoeGemmStage stage, int64_t M, int64_t K,
+                                   int64_t N, int64_t group_size,
+                                   SplitSelectorFn selector =
+                                       default_split_selector) {
+    GemmSplitContext ctx;
+    ctx.stage = stage;
+    ctx.M = M;
+    ctx.K = K;
+    ctx.N = N;
+    ctx.group_size = std::max<int64_t>(group_size, 1);
+    ctx.m_active_threads = m_split_active_threads(M, ctx.group_size);
+    ctx.n_active_threads = n_split_active_threads(N, ctx.group_size);
+    GemmSplitPlan plan;
+    plan.split =
+        (selector != nullptr ? selector : default_split_selector)(ctx);
+    return plan;
+}
+
 #ifdef __aarch64__
 
 void bf16_pack_b(const uint16_t* B, uint16_t* B_reo, int K, int N) {
@@ -214,7 +341,11 @@ void bf16_pack_b(const uint16_t* B, uint16_t* B_reo, int K, int N) {
     }
 }
 
-void dispatch_fp32_gemm(const uint16_t* A,
+// Bottom layer: single-thread bf16 GEMM over the whole [M, N] slice.
+// Dispatches the i8mm microkernels by M tile (8/4/2/1 rows), optional fused
+// bias. B_reo is the pre-packed weight; A_reorder is per-call scratch. This is
+// the sole compute primitive the middle-layer team_gemm builds on.
+void single_thread_gemm(const uint16_t* A,
                         const uint16_t* B_reo,
                         float* C,
                         uint16_t* A_reorder,
@@ -291,78 +422,6 @@ void dispatch_fp32_gemm(const uint16_t* A,
             bf16gemm_k_ld1(At, B_reo, Ct, A_reo_t, &p);
         }
     }
-}
-
-template <MoeGemmSplit Split>
-SplitRange gemm_split_range(int M,
-                            int N,
-                            int64_t group_size,
-                            int64_t local_tid) {
-    if constexpr (Split == MoeGemmSplit::kM) {
-        return m_split_range(M, group_size, local_tid);
-    } else {
-        return n_split_range(N, group_size, local_tid);
-    }
-}
-
-template <MoeGemmSplit Split>
-void dispatch_fp32_gemm_split(const uint16_t* A,
-                              const uint16_t* B_reo,
-                              float* C,
-                              uint16_t* A_reorder,
-                              int M,
-                              int K,
-                              int N,
-                              int ldc,
-                              int64_t group_size,
-                              int64_t local_tid,
-                              const float* bias = nullptr) {
-    const SplitRange range =
-        gemm_split_range<Split>(M, N, group_size, local_tid);
-    if (range.size <= 0) {
-        return;
-    }
-
-    if constexpr (Split == MoeGemmSplit::kM) {
-        const uint16_t* A_slice = A + range.begin * K;
-        float* C_slice = C + range.begin * ldc;
-        // Row split: every thread spans the full N, so bias is unchanged.
-        dispatch_fp32_gemm(A_slice, B_reo, C_slice, A_reorder,
-                           static_cast<int>(range.size), K, N, ldc, bias);
-    } else {
-        const int64_t start_block = range.begin / kKernelTile;
-        const uint16_t* B_slice = B_reo + start_block * K * kKernelTile;
-        float* C_slice = C + range.begin;
-        // Column split: bias is per-column, so offset it by the N range.
-        const float* bias_slice =
-            bias != nullptr ? bias + range.begin : nullptr;
-        dispatch_fp32_gemm(A, B_slice, C_slice, A_reorder, M, K,
-                           static_cast<int>(range.size), ldc, bias_slice);
-    }
-}
-
-void dispatch_fp32_gemm_stage_split(MoeGemmStage stage,
-                                    const uint16_t* A,
-                                    const uint16_t* B_reo,
-                                    float* C,
-                                    uint16_t* A_reorder,
-                                    int M,
-                                    int K,
-                                    int N,
-                                    int ldc,
-                                    int64_t group_size,
-                                    int64_t local_tid,
-                                    const float* bias = nullptr) {
-    const MoeGemmSplit split =
-        choose_moe_gemm_split(stage, M, N, group_size);
-    if (split == MoeGemmSplit::kM) {
-        dispatch_fp32_gemm_split<MoeGemmSplit::kM>(
-            A, B_reo, C, A_reorder, M, K, N, ldc, group_size, local_tid,
-            bias);
-        return;
-    }
-    dispatch_fp32_gemm_split<MoeGemmSplit::kN>(
-        A, B_reo, C, A_reorder, M, K, N, ldc, group_size, local_tid, bias);
 }
 
 #endif
@@ -563,7 +622,26 @@ void activation_range_to_bf16(const std::string& activation,
     }
 }
 
-struct TileTask {
+enum class MoeActivationKind {
+    kSilu,
+    kGelu,
+    kSwigluOai,
+};
+
+MoeActivationKind moe_activation_kind(const std::string& activation) {
+    if (activation == "silu") {
+        return MoeActivationKind::kSilu;
+    }
+    if (activation == "gelu") {
+        return MoeActivationKind::kGelu;
+    }
+    if (activation == "swigluoai") {
+        return MoeActivationKind::kSwigluOai;
+    }
+    TORCH_CHECK(false, "unsupported MoE activation: ", activation);
+}
+
+struct ExpertTask {
     int64_t expert = 0;
     int64_t route_begin = 0;
     int64_t rows = 0;
@@ -578,7 +656,786 @@ struct ExpertTaskGroup {
     size_t begin = 0;
     size_t end = 0;
     int64_t rows = 0;
+    int64_t threads = 1;
+    int64_t extra_threads = 0;
+    float last_marginal_gain = 0.0f;
 };
+
+float env_float_or_default_local(const char* name, float fallback) {
+    const char* value = std::getenv(name);
+    if (value == nullptr || value[0] == '\0') {
+        return fallback;
+    }
+    char* end = nullptr;
+    const float parsed = std::strtof(value, &end);
+    if (end == value || parsed < 0.0f || !std::isfinite(parsed)) {
+        return fallback;
+    }
+    return parsed;
+}
+
+int64_t env_int_or_default_local(const char* name, int64_t fallback) {
+    const char* value = std::getenv(name);
+    if (value == nullptr || value[0] == '\0') {
+        return fallback;
+    }
+    char* end = nullptr;
+    const long long parsed = std::strtoll(value, &end, 10);
+    if (end == value) {
+        return fallback;
+    }
+    return static_cast<int64_t>(parsed);
+}
+
+struct ExpertScheduleCostAlgorithmShape {
+    float speedup_gain = 0.82f;
+    float speedup_power = 0.72f;
+    float alignment_penalty = 0.15f;
+};
+
+struct ExpertScheduleCostHardwareProfile {
+    float fixed_overhead = 0.0f;
+    float gemm_work_unit = 4194304.0f;
+    float gemm_work_weight = 1.0f;
+    float pack_work_unit = 65536.0f;
+    float a_pack_weight = 0.10f;
+    float weight_pack_weight = 0.0f;
+    float activation_work_unit = 65536.0f;
+    float activation_weight = 0.15f;
+    float post_work_unit = 65536.0f;
+    float post_weight = 0.08f;
+    float thread_linear = 0.35f;
+    float thread_quadratic = 0.02f;
+    float m_split_sync = 0.05f;
+    float n_split_sync = 0.08f;
+    float m_split_cache = 0.02f;
+    float n_split_cache = 0.08f;
+    float n_split_repack_factor = 1.0f;
+    float memory_token_weight = 0.0010f;
+    float memory_thread_weight = 0.0500f;
+    float memory_capacity = 8.0f;
+    float memory_slowdown = 0.35f;
+    float cache_token_weight = 0.0005f;
+    float cache_thread_weight = 0.0300f;
+    float cache_capacity = 8.0f;
+    float cache_slowdown = 0.20f;
+    float bandwidth_work_weight = 0.0010f;
+    float bandwidth_thread_weight = 0.0500f;
+    float bandwidth_capacity = 8.0f;
+    float bandwidth_slowdown = 0.30f;
+    float compute_slowdown = 0.25f;
+    float active_gemm_slowdown = 0.02f;
+};
+
+struct ExpertScheduleCostRuntimeCalibration {
+    std::atomic<float> scale{1.0f};
+    std::atomic<float> bias{0.0f};
+    std::atomic<float> hw_profile_drift{1.0f};
+    std::atomic<uint64_t> observations{0};
+    float update_alpha = 0.10f;
+    int64_t update_interval = 1;
+
+    ExpertScheduleCostRuntimeCalibration(float initial_scale,
+                                         float initial_bias,
+                                         float initial_hw_profile_drift,
+                                         float alpha,
+                                         int64_t interval)
+        : scale(std::max(initial_scale, 1.0e-4f)),
+          bias(initial_bias),
+          hw_profile_drift(std::max(initial_hw_profile_drift, 1.0e-4f)),
+          update_alpha(std::clamp(alpha, 0.0f, 1.0f)),
+          update_interval(std::max<int64_t>(interval, 1)) {}
+};
+
+ExpertScheduleCostAlgorithmShape expert_schedule_algorithm_shape() {
+    return ExpertScheduleCostAlgorithmShape{
+        env_float_or_default_local(
+            "FUSED_CPP_MOE_SCHEDULE_COST_SPEEDUP_GAIN", 0.82f),
+        env_float_or_default_local(
+            "FUSED_CPP_MOE_SCHEDULE_COST_SPEEDUP_POWER", 0.72f),
+        env_float_or_default_local(
+            "FUSED_CPP_MOE_SCHEDULE_COST_ALIGNMENT_PENALTY", 0.15f),
+    };
+}
+
+ExpertScheduleCostHardwareProfile expert_schedule_hardware_profile() {
+    return ExpertScheduleCostHardwareProfile{
+        env_float_or_default_local(
+            "FUSED_CPP_MOE_SCHEDULE_COST_FIXED_OVERHEAD", 0.0f),
+        env_float_or_default_local(
+            "FUSED_CPP_MOE_SCHEDULE_COST_GEMM_WORK_UNIT", 4194304.0f),
+        env_float_or_default_local(
+            "FUSED_CPP_MOE_SCHEDULE_COST_GEMM_WORK_WEIGHT", 1.0f),
+        env_float_or_default_local(
+            "FUSED_CPP_MOE_SCHEDULE_COST_PACK_WORK_UNIT", 65536.0f),
+        env_float_or_default_local(
+            "FUSED_CPP_MOE_SCHEDULE_COST_A_PACK_WEIGHT", 0.10f),
+        env_float_or_default_local(
+            "FUSED_CPP_MOE_SCHEDULE_COST_WEIGHT_PACK_WEIGHT", 0.0f),
+        env_float_or_default_local(
+            "FUSED_CPP_MOE_SCHEDULE_COST_ACTIVATION_WORK_UNIT", 65536.0f),
+        env_float_or_default_local(
+            "FUSED_CPP_MOE_SCHEDULE_COST_ACTIVATION_WEIGHT", 0.15f),
+        env_float_or_default_local(
+            "FUSED_CPP_MOE_SCHEDULE_COST_POST_WORK_UNIT", 65536.0f),
+        env_float_or_default_local(
+            "FUSED_CPP_MOE_SCHEDULE_COST_POST_WEIGHT", 0.08f),
+        env_float_or_default_local(
+            "FUSED_CPP_MOE_SCHEDULE_COST_THREAD_LINEAR", 0.35f),
+        env_float_or_default_local(
+            "FUSED_CPP_MOE_SCHEDULE_COST_THREAD_QUADRATIC", 0.02f),
+        env_float_or_default_local(
+            "FUSED_CPP_MOE_SCHEDULE_COST_M_SPLIT_SYNC", 0.05f),
+        env_float_or_default_local(
+            "FUSED_CPP_MOE_SCHEDULE_COST_N_SPLIT_SYNC", 0.08f),
+        env_float_or_default_local(
+            "FUSED_CPP_MOE_SCHEDULE_COST_M_SPLIT_CACHE", 0.02f),
+        env_float_or_default_local(
+            "FUSED_CPP_MOE_SCHEDULE_COST_N_SPLIT_CACHE", 0.08f),
+        env_float_or_default_local(
+            "FUSED_CPP_MOE_SCHEDULE_COST_N_SPLIT_REPACK_FACTOR", 1.0f),
+        env_float_or_default_local(
+            "FUSED_CPP_MOE_SCHEDULE_COST_MEMORY_TOKEN_WEIGHT", 0.0010f),
+        env_float_or_default_local(
+            "FUSED_CPP_MOE_SCHEDULE_COST_MEMORY_THREAD_WEIGHT", 0.0500f),
+        env_float_or_default_local(
+            "FUSED_CPP_MOE_SCHEDULE_COST_MEMORY_CAPACITY", 8.0f),
+        env_float_or_default_local(
+            "FUSED_CPP_MOE_SCHEDULE_COST_MEMORY_SLOWDOWN", 0.35f),
+        env_float_or_default_local(
+            "FUSED_CPP_MOE_SCHEDULE_COST_CACHE_TOKEN_WEIGHT", 0.0005f),
+        env_float_or_default_local(
+            "FUSED_CPP_MOE_SCHEDULE_COST_CACHE_THREAD_WEIGHT", 0.0300f),
+        env_float_or_default_local(
+            "FUSED_CPP_MOE_SCHEDULE_COST_CACHE_CAPACITY", 8.0f),
+        env_float_or_default_local(
+            "FUSED_CPP_MOE_SCHEDULE_COST_CACHE_SLOWDOWN", 0.20f),
+        env_float_or_default_local(
+            "FUSED_CPP_MOE_SCHEDULE_COST_BANDWIDTH_WORK_WEIGHT", 0.0010f),
+        env_float_or_default_local(
+            "FUSED_CPP_MOE_SCHEDULE_COST_BANDWIDTH_THREAD_WEIGHT", 0.0500f),
+        env_float_or_default_local(
+            "FUSED_CPP_MOE_SCHEDULE_COST_BANDWIDTH_CAPACITY", 8.0f),
+        env_float_or_default_local(
+            "FUSED_CPP_MOE_SCHEDULE_COST_BANDWIDTH_SLOWDOWN", 0.30f),
+        env_float_or_default_local(
+            "FUSED_CPP_MOE_SCHEDULE_COST_COMPUTE_SLOWDOWN", 0.25f),
+        env_float_or_default_local(
+            "FUSED_CPP_MOE_SCHEDULE_COST_ACTIVE_GEMM_SLOWDOWN", 0.02f),
+    };
+}
+
+ExpertScheduleCostRuntimeCalibration&
+expert_schedule_runtime_calibration() {
+    static ExpertScheduleCostRuntimeCalibration calibration(
+        env_float_or_default_local(
+            "FUSED_CPP_MOE_SCHEDULE_COST_INITIAL_SCALE", 1.0f),
+        env_float_or_default_local(
+            "FUSED_CPP_MOE_SCHEDULE_COST_INITIAL_BIAS", 0.0f),
+        env_float_or_default_local(
+            "FUSED_CPP_MOE_SCHEDULE_COST_INITIAL_HW_PROFILE_DRIFT", 1.0f),
+        env_float_or_default_local(
+            "FUSED_CPP_MOE_SCHEDULE_COST_UPDATE_ALPHA", 0.10f),
+        env_int_or_default_local(
+            "FUSED_CPP_MOE_SCHEDULE_COST_UPDATE_INTERVAL", 1));
+    return calibration;
+}
+
+struct ExpertScheduleWorkloadConfig {
+    int64_t w13_k = 0;
+    int64_t w13_n = 0;
+    int64_t w2_k = 0;
+    int64_t w2_n = 0;
+    MoeActivationKind activation = MoeActivationKind::kSilu;
+    bool skip_weighted = false;
+};
+
+struct ExpertScheduleWorkloadShape {
+    int64_t rows = 0;
+    int64_t w13_k = 0;
+    int64_t w13_n = 0;
+    int64_t w2_k = 0;
+    int64_t w2_n = 0;
+    MoeActivationKind activation = MoeActivationKind::kSilu;
+    bool skip_weighted = false;
+};
+
+struct ExpertScheduleGemmStageShape {
+    MoeGemmStage stage = MoeGemmStage::kW13;
+    int64_t M = 0;
+    int64_t K = 0;
+    int64_t N = 0;
+};
+
+struct ExpertScheduleStageCostEstimate {
+    MoeGemmSplit split = MoeGemmSplit::kN;
+    float compute = 0.0f;
+    float pack = 0.0f;
+    float split_overhead = 0.0f;
+    float cache = 0.0f;
+    float total = 0.0f;
+};
+
+struct ExpertScheduleStructuralCost {
+    ExpertScheduleStageCostEstimate w13;
+    ExpertScheduleStageCostEstimate w2;
+    float activation = 0.0f;
+    float post = 0.0f;
+    float thread_penalty = 0.0f;
+    float alignment = 0.0f;
+    float total = 0.0f;
+};
+
+struct ExpertScheduleInterferenceVector {
+    float compute = 0.0f;
+    float memory = 0.0f;
+    float bandwidth = 0.0f;
+    float cache = 0.0f;
+    float active_gemm = 0.0f;
+};
+
+struct ExpertScheduleCostEstimate {
+    ExpertScheduleStructuralCost structural;
+    float hardware_cost = 0.0f;
+    ExpertScheduleInterferenceVector interference;
+    float interference_score = 0.0f;
+    float interference_cost = 0.0f;
+    float total = 0.0f;
+};
+
+struct ExpertScheduleMarginalGain {
+    float structural_gain = 0.0f;
+    float interference_penalty = 0.0f;
+    float total_gain = 0.0f;
+};
+
+ExpertScheduleWorkloadShape make_expert_schedule_workload(
+    const ExpertScheduleWorkloadConfig& config,
+    int64_t rows) {
+    return ExpertScheduleWorkloadShape{
+        std::max<int64_t>(rows, 0),
+        config.w13_k,
+        config.w13_n,
+        config.w2_k,
+        config.w2_n,
+        config.activation,
+        config.skip_weighted};
+}
+
+float normalize_schedule_work(double work, float unit) {
+    const double safe_unit =
+        static_cast<double>(std::max(unit, 1.0e-4f));
+    const double normalized = std::max(0.0, work) / safe_unit;
+    return static_cast<float>(std::min(normalized, 1.0e9));
+}
+
+float activation_cost_multiplier(MoeActivationKind activation) {
+    switch (activation) {
+    case MoeActivationKind::kSilu:
+        return 1.0f;
+    case MoeActivationKind::kGelu:
+        return 1.35f;
+    case MoeActivationKind::kSwigluOai:
+        return 1.20f;
+    }
+    return 1.0f;
+}
+
+float estimate_parallel_speedup(float parallel_units, int64_t threads) {
+    const ExpertScheduleCostAlgorithmShape shape =
+        expert_schedule_algorithm_shape();
+    const float thread_count =
+        static_cast<float>(std::max<int64_t>(threads, 1));
+    const float useful_threads =
+        std::max(1.0f, std::min(std::max(parallel_units, 1.0f),
+                                thread_count));
+    if (useful_threads <= 1.0f) {
+        return 1.0f;
+    }
+    return 1.0f + shape.speedup_gain *
+                      std::pow(useful_threads - 1.0f,
+                               shape.speedup_power);
+}
+
+ExpertScheduleStageCostEstimate estimate_gemm_stage_split_cost(
+    const ExpertScheduleGemmStageShape& stage,
+    int64_t threads,
+    MoeGemmSplit split) {
+    const ExpertScheduleCostHardwareProfile hw =
+        expert_schedule_hardware_profile();
+    const float thread_count =
+        static_cast<float>(std::max<int64_t>(threads, 1));
+    const float parallel_units =
+        split == MoeGemmSplit::kM
+            ? std::max(1.0f, static_cast<float>(stage.M) /
+                                 static_cast<float>(kKernelTile))
+            : std::max(1.0f, static_cast<float>(stage.N) /
+                                 static_cast<float>(kKernelTile));
+    const float speedup = estimate_parallel_speedup(parallel_units, threads);
+    const float gemm_work = normalize_schedule_work(
+        static_cast<double>(stage.M) * static_cast<double>(stage.K) *
+            static_cast<double>(stage.N),
+        hw.gemm_work_unit);
+    const float compute = hw.gemm_work_weight * gemm_work / speedup;
+
+    const float a_pack_repeat =
+        split == MoeGemmSplit::kN
+            ? 1.0f + (thread_count - 1.0f) * hw.n_split_repack_factor
+            : 1.0f;
+    const float a_pack = hw.a_pack_weight * normalize_schedule_work(
+        static_cast<double>(stage.M) * static_cast<double>(stage.K) *
+            static_cast<double>(a_pack_repeat),
+        hw.pack_work_unit);
+    const float b_pack = hw.weight_pack_weight * normalize_schedule_work(
+        static_cast<double>(stage.K) * static_cast<double>(stage.N),
+        hw.pack_work_unit);
+    const float split_sync =
+        thread_count <= 1.0f
+            ? 0.0f
+            : (split == MoeGemmSplit::kM ? hw.m_split_sync
+                                         : hw.n_split_sync) *
+                  (thread_count - 1.0f);
+    const float split_cache_weight =
+        split == MoeGemmSplit::kM ? hw.m_split_cache : hw.n_split_cache;
+    const float split_cache =
+        split_cache_weight * normalize_schedule_work(
+                                 static_cast<double>(stage.M) *
+                                     static_cast<double>(stage.N) *
+                                     static_cast<double>(thread_count),
+                                 hw.pack_work_unit);
+
+    ExpertScheduleStageCostEstimate estimate;
+    estimate.split = split;
+    estimate.compute = compute;
+    estimate.pack = a_pack + b_pack;
+    estimate.split_overhead = split_sync;
+    estimate.cache = split_cache;
+    estimate.total =
+        estimate.compute + estimate.pack + estimate.split_overhead +
+        estimate.cache;
+    return estimate;
+}
+
+ExpertScheduleStageCostEstimate estimate_gemm_stage_cost(
+    const ExpertScheduleGemmStageShape& stage,
+    int64_t threads) {
+    const ExpertScheduleStageCostEstimate m_split =
+        estimate_gemm_stage_split_cost(stage, threads, MoeGemmSplit::kM);
+    const ExpertScheduleStageCostEstimate n_split =
+        estimate_gemm_stage_split_cost(stage, threads, MoeGemmSplit::kN);
+    const int safe_m = static_cast<int>(std::min<int64_t>(
+        std::max<int64_t>(stage.M, 1), std::numeric_limits<int>::max()));
+    const int safe_n = static_cast<int>(std::min<int64_t>(
+        std::max<int64_t>(stage.N, 1), std::numeric_limits<int>::max()));
+    const MoeGemmSplit preferred =
+        choose_moe_gemm_split(stage.stage, safe_m, safe_n, threads);
+    if (std::abs(m_split.total - n_split.total) <= 1.0e-4f) {
+        return preferred == MoeGemmSplit::kM ? m_split : n_split;
+    }
+    return m_split.total < n_split.total ? m_split : n_split;
+}
+
+float estimate_activation_stage_cost(
+    const ExpertScheduleWorkloadShape& workload) {
+    const ExpertScheduleCostHardwareProfile hw =
+        expert_schedule_hardware_profile();
+    return hw.activation_weight *
+           activation_cost_multiplier(workload.activation) *
+           normalize_schedule_work(
+               static_cast<double>(workload.rows) *
+                   static_cast<double>(workload.w2_k),
+               hw.activation_work_unit);
+}
+
+float estimate_post_stage_cost(
+    const ExpertScheduleWorkloadShape& workload) {
+    const ExpertScheduleCostHardwareProfile hw =
+        expert_schedule_hardware_profile();
+    const float output_factor = workload.skip_weighted ? 1.15f : 0.90f;
+    return hw.post_weight * output_factor *
+           normalize_schedule_work(
+               static_cast<double>(workload.rows) *
+                   static_cast<double>(workload.w2_n),
+               hw.post_work_unit);
+}
+
+float estimate_shape_alignment_penalty(
+    const ExpertScheduleWorkloadShape& workload) {
+    const ExpertScheduleCostAlgorithmShape shape =
+        expert_schedule_algorithm_shape();
+    const int64_t row_tail = workload.rows % kKernelTile;
+    const int64_t w13_k_tail = workload.w13_k % kKernelTile;
+    const int64_t w13_n_tail = workload.w13_n % kKernelTile;
+    const int64_t w2_k_tail = workload.w2_k % kKernelTile;
+    const int64_t w2_n_tail = workload.w2_n % kKernelTile;
+    const int64_t tail_count =
+        (row_tail != 0 ? 1 : 0) + (w13_k_tail != 0 ? 1 : 0) +
+        (w13_n_tail != 0 ? 1 : 0) + (w2_k_tail != 0 ? 1 : 0) +
+        (w2_n_tail != 0 ? 1 : 0);
+    return shape.alignment_penalty * static_cast<float>(tail_count);
+}
+
+ExpertScheduleStructuralCost estimate_expert_schedule_structural_cost(
+    const ExpertScheduleWorkloadShape& workload,
+    int64_t threads) {
+    const ExpertScheduleCostHardwareProfile hw =
+        expert_schedule_hardware_profile();
+    const float thread_count =
+        static_cast<float>(std::max<int64_t>(threads, 1));
+    const ExpertScheduleStageCostEstimate w13_cost =
+        estimate_gemm_stage_cost(
+            ExpertScheduleGemmStageShape{MoeGemmStage::kW13, workload.rows,
+                                         workload.w13_k, workload.w13_n},
+            threads);
+    const ExpertScheduleStageCostEstimate w2_cost =
+        estimate_gemm_stage_cost(
+            ExpertScheduleGemmStageShape{MoeGemmStage::kW2, workload.rows,
+                                         workload.w2_k, workload.w2_n},
+            threads);
+    const float activation_cost = estimate_activation_stage_cost(workload);
+    const float post_cost = estimate_post_stage_cost(workload);
+    const float thread_penalty =
+        hw.thread_linear * (thread_count - 1.0f) +
+        hw.thread_quadratic * thread_count * thread_count;
+    const float alignment_cost = estimate_shape_alignment_penalty(workload);
+    ExpertScheduleStructuralCost structural;
+    structural.w13 = w13_cost;
+    structural.w2 = w2_cost;
+    structural.activation = activation_cost;
+    structural.post = post_cost;
+    structural.thread_penalty = thread_penalty;
+    structural.alignment = alignment_cost;
+    structural.total =
+        hw.fixed_overhead + w13_cost.total + activation_cost +
+        w2_cost.total + post_cost + thread_penalty + alignment_cost;
+    return structural;
+}
+
+float estimate_expert_schedule_hardware_cost(
+    const ExpertScheduleStructuralCost& structural) {
+    ExpertScheduleCostRuntimeCalibration& runtime =
+        expert_schedule_runtime_calibration();
+    const float scale = runtime.scale.load(std::memory_order_relaxed);
+    const float drift =
+        runtime.hw_profile_drift.load(std::memory_order_relaxed);
+    const float bias = runtime.bias.load(std::memory_order_relaxed);
+    return scale * drift * structural.total + bias;
+}
+
+struct ExpertScheduleResourceDemand {
+    float compute_threads = 0.0f;
+    float memory_pressure = 0.0f;
+    float memory_bandwidth = 0.0f;
+    float cache_pressure = 0.0f;
+};
+
+struct ExpertScheduleSystemState {
+    float active_compute_threads = 0.0f;
+    float active_memory_pressure = 0.0f;
+    float active_memory_bandwidth = 0.0f;
+    float active_cache_pressure = 0.0f;
+    int64_t active_gemms = 0;
+};
+
+struct ExpertScheduleGemmInterval {
+    float start = 0.0f;
+    float end = 0.0f;
+    ExpertScheduleResourceDemand demand;
+};
+
+ExpertScheduleResourceDemand estimate_expert_resource_demand(
+    const ExpertScheduleWorkloadShape& workload,
+    int64_t threads) {
+    const ExpertScheduleCostHardwareProfile hw =
+        expert_schedule_hardware_profile();
+    const float tokens =
+        static_cast<float>(std::max<int64_t>(workload.rows, 0));
+    const float thread_count =
+        static_cast<float>(std::max<int64_t>(threads, 1));
+    const float stream_work = normalize_schedule_work(
+        static_cast<double>(workload.rows) *
+            static_cast<double>(workload.w13_k + workload.w13_n +
+                                workload.w2_k + workload.w2_n),
+        hw.pack_work_unit);
+    const float cache_work = normalize_schedule_work(
+        static_cast<double>(workload.rows) *
+            static_cast<double>(workload.w13_n + workload.w2_n),
+        hw.pack_work_unit);
+    return ExpertScheduleResourceDemand{
+        thread_count,
+        hw.memory_token_weight * tokens +
+            hw.memory_thread_weight * thread_count,
+        hw.bandwidth_work_weight * stream_work +
+            hw.bandwidth_thread_weight * thread_count,
+        hw.cache_token_weight * tokens +
+            hw.cache_token_weight * cache_work +
+            hw.cache_thread_weight * thread_count,
+    };
+}
+
+ExpertScheduleInterferenceVector estimate_system_interference(
+    const ExpertScheduleSystemState& state,
+    const ExpertScheduleResourceDemand& demand,
+    int64_t num_threads) {
+    const ExpertScheduleCostHardwareProfile hw =
+        expert_schedule_hardware_profile();
+    const float compute_capacity =
+        static_cast<float>(std::max<int64_t>(num_threads, 1));
+    const float memory_capacity = std::max(hw.memory_capacity, 1.0e-4f);
+    const float bandwidth_capacity =
+        std::max(hw.bandwidth_capacity, 1.0e-4f);
+    const float cache_capacity = std::max(hw.cache_capacity, 1.0e-4f);
+    const float compute_over =
+        std::max(0.0f,
+                 (state.active_compute_threads + demand.compute_threads) /
+                         compute_capacity -
+                     1.0f);
+    const float memory_over =
+        std::max(0.0f,
+                 (state.active_memory_pressure +
+                  demand.memory_pressure) /
+                         memory_capacity -
+                     1.0f);
+    const float bandwidth_over =
+        std::max(0.0f,
+                 (state.active_memory_bandwidth +
+                  demand.memory_bandwidth) /
+                         bandwidth_capacity -
+                     1.0f);
+    const float cache_over =
+        std::max(0.0f,
+                 (state.active_cache_pressure + demand.cache_pressure) /
+                         cache_capacity -
+                     1.0f);
+    const float concurrent_gemms =
+        static_cast<float>(std::max<int64_t>(state.active_gemms, 0));
+    return ExpertScheduleInterferenceVector{
+        hw.compute_slowdown * compute_over,
+        hw.memory_slowdown * memory_over,
+        hw.bandwidth_slowdown * bandwidth_over,
+        hw.cache_slowdown * cache_over,
+        hw.active_gemm_slowdown * concurrent_gemms};
+}
+
+float project_interference_vector(
+    const ExpertScheduleInterferenceVector& interference) {
+    const char* mode =
+        std::getenv("FUSED_CPP_MOE_SCHEDULE_INTERFERENCE_PROJECTION");
+    if (mode != nullptr && std::strcmp(mode, "max") == 0) {
+        return std::max({interference.compute, interference.memory,
+                         interference.bandwidth, interference.cache,
+                         interference.active_gemm});
+    }
+    return interference.compute + interference.memory +
+           interference.bandwidth + interference.cache +
+           interference.active_gemm;
+}
+
+ExpertScheduleCostEstimate estimate_expert_schedule_cost_estimate(
+    const ExpertScheduleWorkloadShape& workload,
+    int64_t threads,
+    const ExpertScheduleSystemState& state,
+    int64_t num_threads) {
+    ExpertScheduleCostEstimate estimate;
+    estimate.structural =
+        estimate_expert_schedule_structural_cost(workload, threads);
+    estimate.hardware_cost =
+        estimate_expert_schedule_hardware_cost(estimate.structural);
+    const ExpertScheduleResourceDemand demand =
+        estimate_expert_resource_demand(workload, threads);
+    estimate.interference =
+        estimate_system_interference(state, demand, num_threads);
+    estimate.interference_score =
+        project_interference_vector(estimate.interference);
+    estimate.interference_cost =
+        std::max(0.0f, estimate.hardware_cost) *
+        std::max(0.0f, estimate.interference_score);
+    estimate.total = estimate.hardware_cost + estimate.interference_cost;
+    return estimate;
+}
+
+float estimate_expert_schedule_cost(
+    const ExpertScheduleWorkloadShape& workload,
+    int64_t threads,
+    const ExpertScheduleSystemState& state,
+    int64_t num_threads) {
+    return estimate_expert_schedule_cost_estimate(
+               workload, threads, state, num_threads)
+        .total;
+}
+
+[[maybe_unused]] ExpertScheduleMarginalGain
+expert_schedule_marginal_gain_delta(
+    const ExpertScheduleWorkloadShape& workload,
+    int64_t threads,
+    const ExpertScheduleSystemState& state,
+    int64_t num_threads) {
+    const ExpertScheduleCostEstimate current =
+        estimate_expert_schedule_cost_estimate(workload, threads, state,
+                                               num_threads);
+    const ExpertScheduleCostEstimate next =
+        estimate_expert_schedule_cost_estimate(workload, threads + 1, state,
+                                               num_threads);
+    float structural_gain =
+        current.hardware_cost - next.hardware_cost;
+    if (threads > 1) {
+        const ExpertScheduleCostEstimate previous =
+            estimate_expert_schedule_cost_estimate(
+                workload, threads - 1, state, num_threads);
+        const float previous_gain =
+            std::max(0.0f, previous.hardware_cost - current.hardware_cost);
+        structural_gain =
+            std::min(std::max(0.0f, structural_gain), previous_gain);
+    } else {
+        structural_gain = std::max(0.0f, structural_gain);
+    }
+    const float interference_penalty =
+        std::max(0.0f, next.interference_cost - current.interference_cost);
+    return ExpertScheduleMarginalGain{
+        structural_gain,
+        interference_penalty,
+        std::max(0.0f, structural_gain - interference_penalty)};
+}
+
+[[maybe_unused]] float expert_schedule_marginal_gain(
+    const ExpertScheduleWorkloadShape& workload,
+    int64_t threads,
+    const ExpertScheduleSystemState& state,
+    int64_t num_threads) {
+    return expert_schedule_marginal_gain_delta(
+               workload, threads, state, num_threads)
+        .total_gain;
+}
+
+class ExpertScheduleSystemStateTracker {
+public:
+    ExpertScheduleSystemState state_at(float time) const {
+        ExpertScheduleSystemState state;
+        for (const ExpertScheduleGemmInterval& interval : intervals_) {
+            if (interval.start <= time && time < interval.end) {
+                state.active_compute_threads +=
+                    interval.demand.compute_threads;
+                state.active_memory_pressure +=
+                    interval.demand.memory_pressure;
+                state.active_memory_bandwidth +=
+                    interval.demand.memory_bandwidth;
+                state.active_cache_pressure +=
+                    interval.demand.cache_pressure;
+                ++state.active_gemms;
+            }
+        }
+        return state;
+    }
+
+    void add_interval(float start,
+                      float end,
+                      const ExpertScheduleResourceDemand& demand) {
+        if (end <= start) {
+            return;
+        }
+        intervals_.push_back(ExpertScheduleGemmInterval{start, end, demand});
+    }
+
+private:
+    std::vector<ExpertScheduleGemmInterval> intervals_;
+};
+
+enum class ExpertScheduleBeamPolicy {
+    kLowLatency,
+    kBalanced,
+    kHighThroughput,
+};
+
+struct ExpertScheduleBeamState {
+    ExpertScheduleBeamPolicy policy = ExpertScheduleBeamPolicy::kLowLatency;
+    std::vector<std::vector<TaskRange>> ranges;
+    std::vector<float> thread_load;
+    ExpertScheduleSystemStateTracker system_state_tracker;
+    float predicted_makespan = 0.0f;
+    float predicted_core_time = 0.0f;
+    float score = 0.0f;
+};
+
+int64_t expert_schedule_beam_width() {
+    return std::clamp<int64_t>(
+        env_int_or_default_local("FUSED_CPP_MOE_SCHEDULE_BEAM_WIDTH", 3),
+        1, 8);
+}
+
+float score_expert_schedule_beam(
+    const ExpertScheduleBeamState& state) {
+    if (state.thread_load.empty()) {
+        return 0.0f;
+    }
+    const auto minmax =
+        std::minmax_element(state.thread_load.begin(),
+                            state.thread_load.end());
+    const float min_load = *minmax.first;
+    const float max_load = *minmax.second;
+    const float imbalance = max_load - min_load;
+    const float mean_core_time =
+        state.predicted_core_time /
+        static_cast<float>(std::max<size_t>(state.thread_load.size(), 1));
+    switch (state.policy) {
+    case ExpertScheduleBeamPolicy::kLowLatency:
+        return max_load;
+    case ExpertScheduleBeamPolicy::kBalanced:
+        return max_load + 0.10f * imbalance;
+    case ExpertScheduleBeamPolicy::kHighThroughput:
+        return max_load + 0.05f * mean_core_time;
+    }
+    return max_load;
+}
+
+bool better_expert_schedule_beam(const ExpertScheduleBeamState& lhs,
+                                 const ExpertScheduleBeamState& rhs) {
+    if (lhs.score != rhs.score) {
+        return lhs.score < rhs.score;
+    }
+    if (lhs.predicted_makespan != rhs.predicted_makespan) {
+        return lhs.predicted_makespan < rhs.predicted_makespan;
+    }
+    return lhs.predicted_core_time < rhs.predicted_core_time;
+}
+
+void update_expert_schedule_cost_feedback(float predicted_cost,
+                                          double observed_latency_ms) {
+    if (predicted_cost <= 0.0f || observed_latency_ms <= 0.0) {
+        return;
+    }
+    ExpertScheduleCostRuntimeCalibration& runtime =
+        expert_schedule_runtime_calibration();
+    const uint64_t observation =
+        runtime.observations.fetch_add(uint64_t{1},
+                                       std::memory_order_relaxed) +
+        uint64_t{1};
+    if ((observation % static_cast<uint64_t>(runtime.update_interval)) !=
+        uint64_t{0}) {
+        return;
+    }
+    const float old_scale = runtime.scale.load(std::memory_order_relaxed);
+    const float old_bias = runtime.bias.load(std::memory_order_relaxed);
+    const float old_drift =
+        runtime.hw_profile_drift.load(std::memory_order_relaxed);
+    const float observed_ratio =
+        static_cast<float>(observed_latency_ms) / predicted_cost;
+    const float alpha = std::clamp(runtime.update_alpha, 0.0f, 1.0f);
+    const float correction = (1.0f - alpha) + alpha * observed_ratio;
+    const float new_scale = std::clamp(old_scale * correction, 1.0e-4f,
+                                       1.0e4f);
+    const float drift_correction =
+        (1.0f - 0.25f * alpha) + (0.25f * alpha) * observed_ratio;
+    const float new_drift =
+        std::clamp(old_drift * drift_correction, 1.0e-4f, 1.0e4f);
+    const float residual =
+        static_cast<float>(observed_latency_ms) - predicted_cost;
+    const float new_bias =
+        std::clamp((1.0f - alpha) * old_bias + alpha * residual,
+                   -1.0e4f, 1.0e4f);
+    runtime.scale.store(new_scale, std::memory_order_relaxed);
+    runtime.hw_profile_drift.store(new_drift, std::memory_order_relaxed);
+    runtime.bias.store(new_bias, std::memory_order_relaxed);
+}
 
 struct ThreadScheduleDebug {
     int64_t rows = 0;
@@ -614,6 +1471,53 @@ private:
     std::mutex mutex_;
     std::condition_variable cv_;
 };
+
+#ifdef __aarch64__
+// ── Middle layer: cooperative team GEMM ──────────────────────────────────
+// The upper layer owns the thread pool and hands each worker a TeamContext
+// (its slot in the team + a shared barrier + per-thread A-reorder scratch).
+// Every team member calls team_gemm with the same plan; each computes its
+// slice via the bottom-layer single_thread_gemm, then waits on the barrier so
+// the caller can safely read C once all members have finished this stage.
+// group_size==1 (barrier==null) degenerates to a whole-slice single_thread_gemm.
+struct TeamContext {
+    int64_t group_size = 1;
+    int64_t local_tid = 0;
+    ThreadBarrier* barrier = nullptr;  // shared; may be null when group_size==1
+    uint16_t* a_reorder = nullptr;     // per-thread scratch, >= slice_rows*K*2
+};
+
+void team_gemm(const TeamContext& team, const GemmSplitPlan& plan,
+               const uint16_t* A, const uint16_t* B_packed, float* C,
+               int64_t M, int64_t K, int64_t N, int64_t ldc,
+               const float* bias) {
+    const SplitRange range = team_gemm_split_range(
+        plan, M, N, team.group_size, team.local_tid);
+    if (range.size > 0) {
+        if (plan.split == MoeGemmSplit::kM) {
+            // Row split: each thread spans the full N; bias unchanged.
+            single_thread_gemm(A + range.begin * K, B_packed,
+                               C + range.begin * ldc, team.a_reorder,
+                               static_cast<int>(range.size),
+                               static_cast<int>(K), static_cast<int>(N),
+                               static_cast<int>(ldc), bias);
+        } else {
+            // Column split: B sliced by kKernelTile blocks; bias offset by col.
+            const int64_t start_block = range.begin / kKernelTile;
+            const float* bias_slice =
+                bias != nullptr ? bias + range.begin : nullptr;
+            single_thread_gemm(A, B_packed + start_block * K * kKernelTile,
+                               C + range.begin, team.a_reorder,
+                               static_cast<int>(M), static_cast<int>(K),
+                               static_cast<int>(range.size),
+                               static_cast<int>(ldc), bias_slice);
+        }
+    }
+    if (team.barrier != nullptr) {
+        team.barrier->wait();
+    }
+}
+#endif  // __aarch64__
 
 struct HierarchicalNSplitConfig {
     bool enabled = false;
@@ -913,7 +1817,7 @@ public:
                       int64_t num_routes,
                       int64_t hidden_size,
                       int64_t ffn_hidden_size,
-                      size_t micro_tiles,
+                      size_t schedule_units,
                       int64_t expert_tasks,
                       int64_t nsplit_groups,
                       int64_t nsplit_group_size,
@@ -948,7 +1852,7 @@ public:
             file,
             "MOE_CALL call_id=%llu strategy=%s e2e_ms=%.6f "
             "threads=%lld tokens=%lld top_k=%lld experts=%lld routes=%lld "
-            "H=%lld F=%lld micro_tiles=%zu expert_tasks=%lld "
+            "H=%lld F=%lld schedule_units=%zu expert_tasks=%lld "
             "nsplit_groups=%lld nsplit_group_size=%lld gemm_count=%zu "
             "phase_count=%zu\n",
             static_cast<unsigned long long>(call_id_),
@@ -961,7 +1865,7 @@ public:
             static_cast<long long>(num_routes),
             static_cast<long long>(hidden_size),
             static_cast<long long>(ffn_hidden_size),
-            micro_tiles,
+            schedule_units,
             static_cast<long long>(expert_tasks),
             static_cast<long long>(nsplit_groups),
             static_cast<long long>(nsplit_group_size),
@@ -1060,12 +1964,20 @@ void trace_dispatch_fp32_gemm(MoeTraceCollector& trace,
                               int N,
                               int ldc,
                               const float* bias = nullptr) {
+    // Default mode: one worker owns the whole expert GEMM. Route through the
+    // middle layer as a degenerate group_size==1 team (whole slice, no barrier).
+    TeamContext team;
+    team.group_size = 1;
+    team.local_tid = 0;
+    team.barrier = nullptr;
+    team.a_reorder = A_reorder;
+    const GemmSplitPlan plan{MoeGemmSplit::kN};
     if (!trace.enabled()) {
-        dispatch_fp32_gemm(A, B_reo, C, A_reorder, M, K, N, ldc, bias);
+        team_gemm(team, plan, A, B_reo, C, M, K, N, ldc, bias);
         return;
     }
     const auto begin = ::fused_cpp::profile::now();
-    dispatch_fp32_gemm(A, B_reo, C, A_reorder, M, K, N, ldc, bias);
+    team_gemm(team, plan, A, B_reo, C, M, K, N, ldc, bias);
     const double ms = ::fused_cpp::profile::elapsed_ms(begin);
     trace.record_gemm(tid, wave, group, local_tid, expert, route_begin, rows,
                       stage, M, K, N, ldc, 0, N, ms);
@@ -1091,42 +2003,39 @@ void trace_dispatch_fp32_gemm_stage_split(MoeTraceCollector& trace,
                                           int ldc,
                                           int64_t group_size,
                                           const float* bias = nullptr) {
-    const MoeGemmSplit split = choose_moe_gemm_split(stage, M, N, group_size);
-    const bool split_m = split == MoeGemmSplit::kM;
-    const SplitRange range = split_m
-                                 ? gemm_split_range<MoeGemmSplit::kM>(
-                                       M, N, group_size, local_tid)
-                                 : gemm_split_range<MoeGemmSplit::kN>(
-                                       M, N, group_size, local_tid);
+    // Middle layer: the pluggable selector chooses M vs N; the caller owns the
+    // inter-stage barriers, so team_gemm runs without its own (barrier=null).
+    const GemmSplitPlan plan =
+        plan_team_gemm_split(stage, M, K, N, group_size);
+    const bool split_m = plan.split == MoeGemmSplit::kM;
+    const SplitRange range =
+        team_gemm_split_range(plan, M, N, group_size, local_tid);
     if (range.size <= 0) {
         return;
     }
+    TeamContext team;
+    team.group_size = group_size;
+    team.local_tid = local_tid;
+    team.barrier = nullptr;
+    team.a_reorder = A_reorder;
     if (!trace.enabled()) {
-        dispatch_fp32_gemm_stage_split(stage, A, B_reo, C, A_reorder, M,
-                                       K, N, ldc, group_size, local_tid,
-                                       bias);
+        team_gemm(team, plan, A, B_reo, C, M, K, N, ldc, bias);
         return;
     }
-
     const auto begin = ::fused_cpp::profile::now();
+    team_gemm(team, plan, A, B_reo, C, M, K, N, ldc, bias);
+    const double ms = ::fused_cpp::profile::elapsed_ms(begin);
     int64_t trace_route_begin = route_begin;
     int64_t trace_rows = rows;
     int64_t trace_n_begin = 0;
     int64_t trace_n_cols = N;
     if (split_m) {
-        dispatch_fp32_gemm_split<MoeGemmSplit::kM>(
-            A, B_reo, C, A_reorder, M, K, N, ldc, group_size, local_tid,
-            bias);
         trace_route_begin += range.begin;
         trace_rows = range.size;
     } else {
-        dispatch_fp32_gemm_split<MoeGemmSplit::kN>(
-            A, B_reo, C, A_reorder, M, K, N, ldc, group_size, local_tid,
-            bias);
         trace_n_begin = range.begin;
         trace_n_cols = range.size;
     }
-    const double ms = ::fused_cpp::profile::elapsed_ms(begin);
     trace.record_gemm(tid, wave, group, local_tid, expert, trace_route_begin,
                       trace_rows, stage_name, M, K, N, ldc, trace_n_begin,
                       trace_n_cols, ms);
@@ -1198,7 +2107,7 @@ int debug_schedule_level() {
 }
 
 ThreadScheduleDebug summarize_thread_schedule(
-    const std::vector<TileTask>& tasks,
+    const std::vector<ExpertTask>& tasks,
     const std::vector<TaskRange>& ranges) {
     ThreadScheduleDebug debug;
     debug.ranges = static_cast<int64_t>(ranges.size());
@@ -1206,7 +2115,7 @@ ThreadScheduleDebug summarize_thread_schedule(
     for (const TaskRange& range : ranges) {
         for (size_t task_idx = range.begin; task_idx < range.end;
              ++task_idx) {
-            const TileTask& task = tasks[task_idx];
+            const ExpertTask& task = tasks[task_idx];
             debug.rows += task.rows;
             ++debug.tasks;
             if (debug.experts.empty() || task.expert != last_expert) {
@@ -1226,7 +2135,7 @@ void print_schedule_debug_line(const char* label,
     std::fprintf(
         stderr,
         "[fused_moe_bf16_tiled][schedule] %s tid=%lld ms=%.3f rows=%lld "
-        "tiles=%lld ranges=%lld experts=%zu experts=[",
+        "tasks=%lld ranges=%lld experts=%zu experts=[",
         label,
         static_cast<long long>(tid),
         debug.ms,
@@ -1246,10 +2155,16 @@ void print_schedule_debug_line(const char* label,
 }
 
 std::vector<std::vector<TaskRange>>
-split_tasks_by_expert_affinity(const std::vector<TileTask>& tasks,
-                               int64_t num_threads) {
+split_tasks_by_expert_affinity(const std::vector<ExpertTask>& tasks,
+                               int64_t num_threads,
+                               const ExpertScheduleWorkloadConfig&
+                                   workload_config,
+                               float* estimated_schedule_cost = nullptr) {
     std::vector<std::vector<TaskRange>> ranges(
         static_cast<size_t>(num_threads));
+    if (estimated_schedule_cost != nullptr) {
+        *estimated_schedule_cost = 0.0f;
+    }
     if (tasks.empty()) {
         return ranges;
     }
@@ -1270,33 +2185,111 @@ split_tasks_by_expert_affinity(const std::vector<TileTask>& tasks,
         groups.push_back(group);
     }
 
-    std::vector<size_t> order(groups.size());
-    std::iota(order.begin(), order.end(), size_t{0});
-    std::sort(order.begin(), order.end(), [&](size_t lhs, size_t rhs) {
-        if (groups[lhs].rows != groups[rhs].rows) {
-            return groups[lhs].rows > groups[rhs].rows;
-        }
-        return groups[lhs].begin < groups[rhs].begin;
-    });
+    std::vector<size_t> group_order(groups.size());
+    std::iota(group_order.begin(), group_order.end(), size_t{0});
+    const ExpertScheduleSystemState empty_state;
+    std::sort(group_order.begin(), group_order.end(),
+              [&](size_t lhs, size_t rhs) {
+                  const ExpertScheduleWorkloadShape lhs_workload =
+                      make_expert_schedule_workload(workload_config,
+                                                    groups[lhs].rows);
+                  const ExpertScheduleWorkloadShape rhs_workload =
+                      make_expert_schedule_workload(workload_config,
+                                                    groups[rhs].rows);
+                  const float lhs_cost = estimate_expert_schedule_cost(
+                      lhs_workload, 1, empty_state, num_threads);
+                  const float rhs_cost = estimate_expert_schedule_cost(
+                      rhs_workload, 1, empty_state, num_threads);
+                  if (lhs_cost != rhs_cost) {
+                      return lhs_cost > rhs_cost;
+                  }
+                  if (groups[lhs].rows != groups[rhs].rows) {
+                      return groups[lhs].rows > groups[rhs].rows;
+                  }
+                  return lhs < rhs;
+              });
 
-    std::vector<int64_t> thread_rows(static_cast<size_t>(num_threads), 0);
-    for (size_t group_idx : order) {
-        size_t best_tid = 0;
-        for (size_t tid = 1; tid < thread_rows.size(); ++tid) {
-            if (thread_rows[tid] < thread_rows[best_tid]) {
-                best_tid = tid;
-            }
-        }
-        const ExpertTaskGroup& group = groups[group_idx];
-        ranges[best_tid].push_back(TaskRange{group.begin, group.end});
-        thread_rows[best_tid] += group.rows;
+    const int64_t beam_width = expert_schedule_beam_width();
+    const std::vector<ExpertScheduleBeamPolicy> policies{
+        ExpertScheduleBeamPolicy::kLowLatency,
+        ExpertScheduleBeamPolicy::kBalanced,
+        ExpertScheduleBeamPolicy::kHighThroughput};
+    std::vector<ExpertScheduleBeamState> beams;
+    beams.reserve(policies.size());
+    for (const ExpertScheduleBeamPolicy policy : policies) {
+        ExpertScheduleBeamState state;
+        state.policy = policy;
+        state.ranges.resize(static_cast<size_t>(num_threads));
+        state.thread_load.assign(static_cast<size_t>(num_threads), 0.0f);
+        state.score = score_expert_schedule_beam(state);
+        beams.push_back(std::move(state));
     }
 
-    for (std::vector<TaskRange>& thread_ranges : ranges) {
-        std::sort(thread_ranges.begin(), thread_ranges.end(),
-                  [](const TaskRange& lhs, const TaskRange& rhs) {
-                      return lhs.begin < rhs.begin;
-                  });
+    for (const size_t group_idx : group_order) {
+        const ExpertTaskGroup& group = groups[group_idx];
+        const ExpertScheduleWorkloadShape workload =
+            make_expert_schedule_workload(workload_config, group.rows);
+        std::vector<ExpertScheduleBeamState> expanded;
+        expanded.reserve(beams.size() * static_cast<size_t>(num_threads));
+        for (const ExpertScheduleBeamState& beam : beams) {
+            for (int64_t tid_i = 0; tid_i < num_threads; ++tid_i) {
+                const size_t tid = static_cast<size_t>(tid_i);
+                ExpertScheduleBeamState candidate = beam;
+                const float start = candidate.thread_load[tid];
+                const ExpertScheduleSystemState state =
+                    candidate.system_state_tracker.state_at(start);
+                const ExpertScheduleCostEstimate cost =
+                    estimate_expert_schedule_cost_estimate(
+                        workload, 1, state, num_threads);
+                const float finish = start + cost.total;
+                candidate.ranges[tid].push_back(
+                    TaskRange{group.begin, group.end});
+                candidate.thread_load[tid] = finish;
+                candidate.predicted_makespan =
+                    std::max(candidate.predicted_makespan, finish);
+                candidate.predicted_core_time += cost.total;
+                candidate.system_state_tracker.add_interval(
+                    start, finish,
+                    estimate_expert_resource_demand(workload, 1));
+                candidate.score = score_expert_schedule_beam(candidate);
+                expanded.push_back(std::move(candidate));
+            }
+        }
+
+        std::vector<ExpertScheduleBeamState> next_beams;
+        next_beams.reserve(
+            static_cast<size_t>(beam_width) * policies.size());
+        for (const ExpertScheduleBeamPolicy policy : policies) {
+            std::vector<ExpertScheduleBeamState> policy_candidates;
+            for (ExpertScheduleBeamState& candidate : expanded) {
+                if (candidate.policy == policy) {
+                    policy_candidates.push_back(std::move(candidate));
+                }
+            }
+            std::sort(policy_candidates.begin(), policy_candidates.end(),
+                      better_expert_schedule_beam);
+            const size_t keep = std::min<size_t>(
+                static_cast<size_t>(beam_width), policy_candidates.size());
+            for (size_t idx = 0; idx < keep; ++idx) {
+                next_beams.push_back(std::move(policy_candidates[idx]));
+            }
+        }
+        beams = std::move(next_beams);
+    }
+
+    TORCH_CHECK(!beams.empty(), "unable to build beam MoE schedule");
+    const auto best_it = std::min_element(
+        beams.begin(), beams.end(),
+        [](const ExpertScheduleBeamState& lhs,
+           const ExpertScheduleBeamState& rhs) {
+            if (lhs.predicted_makespan != rhs.predicted_makespan) {
+                return lhs.predicted_makespan < rhs.predicted_makespan;
+            }
+            return lhs.score < rhs.score;
+        });
+    ranges = best_it->ranges;
+    if (estimated_schedule_cost != nullptr) {
+        *estimated_schedule_cost = best_it->predicted_makespan;
     }
     return ranges;
 }
@@ -1590,35 +2583,6 @@ void prepare_moe_threads_for_operator(int64_t num_threads) {
     moe_resident_thread_pool().prepare(num_threads, pinning);
 }
 
-template <typename CoreFn, typename Fn>
-void run_fixed_threads_pinned(int64_t num_threads,
-                              const CoreFn& core_for_tid,
-                              const Fn& fn) {
-    ThreadAffinityGuard affinity_guard;
-    if (num_threads <= 1) {
-        const int64_t core = core_for_tid(0);
-        report_affinity_bind_error(0, core, bind_current_thread_to_core(core));
-        fn(0);
-        return;
-    }
-    std::vector<std::thread> workers;
-    workers.reserve(static_cast<size_t>(num_threads - 1));
-    for (int64_t tid = 1; tid < num_threads; ++tid) {
-        workers.emplace_back([&, tid]() {
-            const int64_t core = core_for_tid(tid);
-            report_affinity_bind_error(
-                tid, core, bind_current_thread_to_core(core));
-            fn(tid);
-        });
-    }
-    const int64_t core = core_for_tid(0);
-    report_affinity_bind_error(0, core, bind_current_thread_to_core(core));
-    fn(0);
-    for (auto& worker : workers) {
-        worker.join();
-    }
-}
-
 struct ThreadScratch {
     std::vector<uint16_t> input;
     std::vector<uint16_t> intermediate;
@@ -1631,6 +2595,14 @@ struct ScheduledWaveRuntime {
     int64_t begin = 0;
     int64_t end = 0;
     int64_t total_threads = 0;
+};
+
+struct AsyncTaskRuntime {
+    int64_t expert = 0;
+    int64_t rows = 0;
+    int64_t core_begin = 0;
+    int64_t threads = 0;
+    int64_t scratch_index = -1;
 };
 
 struct ScheduledScratchUnitConfig {
@@ -1758,12 +2730,14 @@ int64_t stage_a_reorder_stride(MoeGemmStage stage,
                                int64_t K_pad,
                                int64_t N_pad,
                                int64_t group_size) {
-    const MoeGemmSplit split = choose_moe_gemm_split(
-        stage, static_cast<int>(rows), static_cast<int>(N_pad), group_size);
-    const int64_t rows_for_thread = split == MoeGemmSplit::kM
-                                        ? ceil_div_int64(rows, group_size)
-                                        : rows;
-    return rows_for_thread * K_pad * 2;
+    // Worst case: an N-split has every team thread re-reorder the full `rows`
+    // (an M-split needs at most `rows` too). Size for that regardless of which
+    // split the pluggable selector picks, so the per-thread scratch is always
+    // large enough and stays correct if the selector changes.
+    (void)stage;
+    (void)N_pad;
+    (void)group_size;
+    return rows * K_pad * 2;
 }
 
 int64_t scheduled_a_reorder_stride(int64_t rows,
@@ -1810,6 +2784,270 @@ void pack_transposed_expert_weight(const uint16_t* weight,
 }
 
 }  // namespace
+
+// Test-only: expose the middle-layer split plan. Returns the selected split
+// ("m"/"n") plus the per-thread (begin, size) ranges for BOTH the M and N
+// candidates, so tests can pin coverage / disjointness / 8-alignment.
+std::tuple<std::string,
+           std::vector<std::pair<int64_t, int64_t>>,
+           std::vector<std::pair<int64_t, int64_t>>>
+fused_moe_test_split_plan(std::string stage, int64_t M, int64_t K, int64_t N,
+                          int64_t group_size) {
+    TORCH_CHECK(group_size > 0, "group_size must be positive");
+    const MoeGemmStage s =
+        (stage == "w2") ? MoeGemmStage::kW2 : MoeGemmStage::kW13;
+    const GemmSplitPlan plan = plan_team_gemm_split(s, M, K, N, group_size);
+    const std::string selected =
+        (plan.split == MoeGemmSplit::kM) ? "m" : "n";
+    const GemmSplitPlan m_plan{MoeGemmSplit::kM};
+    const GemmSplitPlan n_plan{MoeGemmSplit::kN};
+    std::vector<std::pair<int64_t, int64_t>> m_ranges;
+    std::vector<std::pair<int64_t, int64_t>> n_ranges;
+    m_ranges.reserve(static_cast<size_t>(group_size));
+    n_ranges.reserve(static_cast<size_t>(group_size));
+    for (int64_t t = 0; t < group_size; ++t) {
+        const SplitRange mr =
+            team_gemm_split_range(m_plan, M, N, group_size, t);
+        const SplitRange nr =
+            team_gemm_split_range(n_plan, M, N, group_size, t);
+        m_ranges.emplace_back(mr.begin, mr.size);
+        n_ranges.emplace_back(nr.begin, nr.size);
+    }
+    return std::make_tuple(selected, m_ranges, n_ranges);
+}
+
+// Test-only entry: run the bottom-layer single_thread_gemm for a dense
+// A[M, K] x B[N, K]^T -> C[M, N] (fp32), packing B and padding A/bias exactly
+// like the MoE path. Lets unit tests pin the bottom layer against a reference
+// matmul without going through MoE routing.
+at::Tensor fused_moe_test_single_thread_gemm(at::Tensor A,
+                                             at::Tensor B,
+                                             c10::optional<at::Tensor> bias) {
+#ifndef __aarch64__
+    TORCH_CHECK(false, "fused_moe_test_single_thread_gemm requires AArch64");
+#else
+    check_bf16_cpu(A, "A");
+    check_bf16_cpu(B, "B");
+    TORCH_CHECK(A.dim() == 2, "A must be 2-D [M, K]");
+    TORCH_CHECK(B.dim() == 2, "B must be 2-D [N, K]");
+    A = A.contiguous();
+    B = B.contiguous();
+    const int64_t M = A.size(0);
+    const int64_t K = A.size(1);
+    const int64_t N = B.size(0);
+    TORCH_CHECK(B.size(1) == K, "B second dim must equal K=", K,
+                ", got ", B.size(1));
+    check_positive_int(M, "M");
+    check_positive_int(K, "K");
+    check_positive_int(N, "N");
+    const int64_t K_pad = ceil_to_multiple(K, kKernelTile);
+    const int64_t N_pad = ceil_to_multiple(N, kKernelTile);
+
+    std::vector<uint16_t> packed(
+        static_cast<size_t>(K_pad * N_pad), static_cast<uint16_t>(0));
+    pack_transposed_expert_weight(bf16_data_const(B), 0, N, K, K_pad, N_pad,
+                                  packed.data());
+
+    std::vector<uint16_t> a_pad(
+        static_cast<size_t>(M * K_pad), static_cast<uint16_t>(0));
+    const uint16_t* a_src = bf16_data_const(A);
+    for (int64_t m = 0; m < M; ++m) {
+        std::copy(a_src + m * K, a_src + m * K + K, a_pad.data() + m * K_pad);
+    }
+    std::vector<uint16_t> a_reorder(
+        static_cast<size_t>(M * K_pad * 2), static_cast<uint16_t>(0));
+
+    const at::Tensor bias_f32 = build_padded_bias_f32(bias, 1, N, N_pad);
+    const float* bias_base =
+        bias_f32.defined() ? bias_f32.data_ptr<float>() : nullptr;
+
+    at::Tensor C_pad =
+        at::zeros({M, N_pad}, at::TensorOptions().dtype(at::kFloat));
+    single_thread_gemm(a_pad.data(), packed.data(), C_pad.data_ptr<float>(),
+                       a_reorder.data(), static_cast<int>(M),
+                       static_cast<int>(K_pad), static_cast<int>(N_pad),
+                       static_cast<int>(N_pad), bias_base);
+
+    at::Tensor out = at::empty({M, N}, at::TensorOptions().dtype(at::kFloat));
+    const float* c_ptr = C_pad.data_ptr<float>();
+    float* o_ptr = out.data_ptr<float>();
+    for (int64_t m = 0; m < M; ++m) {
+        std::copy(c_ptr + m * N_pad, c_ptr + m * N_pad + N, o_ptr + m * N);
+    }
+    return out;
+#endif
+}
+
+// Test-only: run the middle-layer team_gemm on the resident thread pool for a
+// dense A[M,K] x B[N,K]^T -> C[M,N] (fp32). split is "m", "n", or "auto".
+at::Tensor fused_moe_test_team_gemm(at::Tensor A,
+                                    at::Tensor B,
+                                    int64_t group_size,
+                                    std::string split,
+                                    c10::optional<at::Tensor> bias) {
+#ifndef __aarch64__
+    TORCH_CHECK(false, "fused_moe_test_team_gemm requires AArch64");
+#else
+    check_bf16_cpu(A, "A");
+    check_bf16_cpu(B, "B");
+    TORCH_CHECK(A.dim() == 2, "A must be 2-D [M, K]");
+    TORCH_CHECK(B.dim() == 2, "B must be 2-D [N, K]");
+    TORCH_CHECK(group_size > 0, "group_size must be positive");
+    A = A.contiguous();
+    B = B.contiguous();
+    const int64_t M = A.size(0);
+    const int64_t K = A.size(1);
+    const int64_t N = B.size(0);
+    TORCH_CHECK(B.size(1) == K, "B second dim must equal K=", K);
+    check_positive_int(M, "M");
+    const int64_t K_pad = ceil_to_multiple(K, kKernelTile);
+    const int64_t N_pad = ceil_to_multiple(N, kKernelTile);
+
+    std::vector<uint16_t> packed(
+        static_cast<size_t>(K_pad * N_pad), static_cast<uint16_t>(0));
+    pack_transposed_expert_weight(bf16_data_const(B), 0, N, K, K_pad, N_pad,
+                                  packed.data());
+    std::vector<uint16_t> a_pad(
+        static_cast<size_t>(M * K_pad), static_cast<uint16_t>(0));
+    const uint16_t* a_src = bf16_data_const(A);
+    for (int64_t m = 0; m < M; ++m) {
+        std::copy(a_src + m * K, a_src + m * K + K, a_pad.data() + m * K_pad);
+    }
+    // Worst case (N-split): each thread re-reorders the full M rows.
+    const int64_t reorder_stride = M * K_pad * 2;
+    std::vector<uint16_t> a_reorder(
+        static_cast<size_t>(group_size * reorder_stride),
+        static_cast<uint16_t>(0));
+
+    const at::Tensor bias_f32 = build_padded_bias_f32(bias, 1, N, N_pad);
+    const float* bias_base =
+        bias_f32.defined() ? bias_f32.data_ptr<float>() : nullptr;
+
+    at::Tensor C_pad =
+        at::zeros({M, N_pad}, at::TensorOptions().dtype(at::kFloat));
+    float* C_ptr = C_pad.data_ptr<float>();
+
+    GemmSplitPlan plan;
+    if (split == "m") {
+        plan.split = MoeGemmSplit::kM;
+    } else if (split == "n") {
+        plan.split = MoeGemmSplit::kN;
+    } else {
+        plan = plan_team_gemm_split(MoeGemmStage::kW13, M, K_pad, N_pad,
+                                    group_size);
+    }
+
+    ThreadBarrier barrier(group_size);
+    run_fixed_threads(group_size, [&](int64_t tid) {
+        TeamContext team;
+        team.group_size = group_size;
+        team.local_tid = tid;
+        team.barrier = group_size > 1 ? &barrier : nullptr;
+        team.a_reorder = a_reorder.data() + tid * reorder_stride;
+        team_gemm(team, plan, a_pad.data(), packed.data(), C_ptr, M, K_pad,
+                  N_pad, N_pad, bias_base);
+    });
+
+    at::Tensor out = at::empty({M, N}, at::TensorOptions().dtype(at::kFloat));
+    const float* c_ptr = C_pad.data_ptr<float>();
+    float* o_ptr = out.data_ptr<float>();
+    for (int64_t m = 0; m < M; ++m) {
+        std::copy(c_ptr + m * N_pad, c_ptr + m * N_pad + N, o_ptr + m * N);
+    }
+    return out;
+#endif
+}
+
+// Test/bench-only: time ONLY the middle-layer team_gemm loop for a dense
+// A[M,K] x B[N,K]^T -> C[M,N]. Weights are packed and A padded ONCE outside the
+// timed region; the whole warmup+timed loop runs inside a single pooled job so
+// per-iteration pool-dispatch overhead is excluded. Returns per-run
+// milliseconds (length `runs`). split is "m", "n", or "auto".
+std::vector<double> fused_moe_bench_team_gemm(at::Tensor A,
+                                              at::Tensor B,
+                                              int64_t group_size,
+                                              std::string split,
+                                              c10::optional<at::Tensor> bias,
+                                              int64_t warmup,
+                                              int64_t runs) {
+#ifndef __aarch64__
+    TORCH_CHECK(false, "fused_moe_bench_team_gemm requires AArch64");
+#else
+    check_bf16_cpu(A, "A");
+    check_bf16_cpu(B, "B");
+    TORCH_CHECK(A.dim() == 2 && B.dim() == 2, "A[M,K], B[N,K] required");
+    TORCH_CHECK(group_size > 0, "group_size must be positive");
+    TORCH_CHECK(runs > 0, "runs must be positive");
+    TORCH_CHECK(warmup >= 0, "warmup must be non-negative");
+    A = A.contiguous();
+    B = B.contiguous();
+    const int64_t M = A.size(0);
+    const int64_t K = A.size(1);
+    const int64_t N = B.size(0);
+    TORCH_CHECK(B.size(1) == K, "B second dim must equal K=", K);
+    check_positive_int(M, "M");
+    const int64_t K_pad = ceil_to_multiple(K, kKernelTile);
+    const int64_t N_pad = ceil_to_multiple(N, kKernelTile);
+
+    std::vector<uint16_t> packed(
+        static_cast<size_t>(K_pad * N_pad), static_cast<uint16_t>(0));
+    pack_transposed_expert_weight(bf16_data_const(B), 0, N, K, K_pad, N_pad,
+                                  packed.data());
+    std::vector<uint16_t> a_pad(
+        static_cast<size_t>(M * K_pad), static_cast<uint16_t>(0));
+    const uint16_t* a_src = bf16_data_const(A);
+    for (int64_t m = 0; m < M; ++m) {
+        std::copy(a_src + m * K, a_src + m * K + K, a_pad.data() + m * K_pad);
+    }
+    const int64_t reorder_stride = M * K_pad * 2;
+    std::vector<uint16_t> a_reorder(
+        static_cast<size_t>(group_size * reorder_stride),
+        static_cast<uint16_t>(0));
+
+    const at::Tensor bias_f32 = build_padded_bias_f32(bias, 1, N, N_pad);
+    const float* bias_base =
+        bias_f32.defined() ? bias_f32.data_ptr<float>() : nullptr;
+    at::Tensor C_pad =
+        at::zeros({M, N_pad}, at::TensorOptions().dtype(at::kFloat));
+    float* C_ptr = C_pad.data_ptr<float>();
+
+    GemmSplitPlan plan;
+    if (split == "m") {
+        plan.split = MoeGemmSplit::kM;
+    } else if (split == "n") {
+        plan.split = MoeGemmSplit::kN;
+    } else {
+        plan = plan_team_gemm_split(MoeGemmStage::kW13, M, K_pad, N_pad,
+                                    group_size);
+    }
+
+    std::vector<double> times_ms(static_cast<size_t>(runs), 0.0);
+    ThreadBarrier barrier(group_size);
+    run_fixed_threads(group_size, [&](int64_t tid) {
+        TeamContext team;
+        team.group_size = group_size;
+        team.local_tid = tid;
+        team.barrier = group_size > 1 ? &barrier : nullptr;
+        team.a_reorder = a_reorder.data() + tid * reorder_stride;
+        for (int64_t r = 0; r < warmup; ++r) {
+            team_gemm(team, plan, a_pad.data(), packed.data(), C_ptr, M, K_pad,
+                      N_pad, N_pad, bias_base);
+        }
+        for (int64_t r = 0; r < runs; ++r) {
+            const auto t0 = ::fused_cpp::profile::now();
+            team_gemm(team, plan, a_pad.data(), packed.data(), C_ptr, M, K_pad,
+                      N_pad, N_pad, bias_base);
+            // team_gemm's end barrier means all threads have finished when tid 0
+            // returns, so tid 0's elapsed captures the full team GEMM time.
+            if (tid == 0) {
+                times_ms[static_cast<size_t>(r)] =
+                    ::fused_cpp::profile::elapsed_ms(t0);
+            }
+        }
+    });
+    return times_ms;
+#endif
+}
 
 std::tuple<at::Tensor, int64_t, int64_t, at::Tensor, int64_t, int64_t>
 fused_moe_bf16_tiled_prepare_weights(at::Tensor w13_weight,
@@ -1976,6 +3214,7 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
                 "global_num_experts cannot exceed prepared expert weights: ",
                 num_experts, " > ", w13.E);
     prepare_moe_threads_for_operator(num_threads);
+    const int64_t actual_threads = num_threads;
 
     at::Tensor ids_i64 = topk_ids.to(at::kLong).contiguous();
     at::Tensor weights_f32 = topk_weights.to(at::kFloat).contiguous();
@@ -1992,18 +3231,17 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
         routes[static_cast<size_t>(expert)].push_back(flat);
     }
 
-    std::vector<TileTask> tasks;
-    tasks.reserve(static_cast<size_t>(
-        ceil_div_int64(num_routes, kMoeTokenTile) + num_experts));
+    std::vector<ExpertTask> tasks;
+    tasks.reserve(static_cast<size_t>(num_experts));
+    int64_t max_expert_rows = 0;
     for (int64_t e = 0; e < num_experts; ++e) {
         const auto& expert_routes = routes[static_cast<size_t>(e)];
-        for (int64_t begin = 0;
-             begin < static_cast<int64_t>(expert_routes.size());
-             begin += kMoeTokenTile) {
-            const int64_t rows = std::min<int64_t>(
-                kMoeTokenTile,
-                static_cast<int64_t>(expert_routes.size()) - begin);
-            tasks.push_back(TileTask{e, begin, rows});
+        const int64_t rows =
+            static_cast<int64_t>(expert_routes.size());
+        if (rows > 0) {
+            check_positive_int(rows, "expert task rows");
+            tasks.push_back(ExpertTask{e, 0, rows});
+            max_expert_rows = std::max(max_expert_rows, rows);
         }
     }
 
@@ -2024,14 +3262,13 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
     const uint16_t* w2_ptr = bf16_data_const(w2.tensor);
 
     const int schedule_debug_level = debug_schedule_level();
-    const int64_t actual_threads = num_threads;
     const HierarchicalNSplitConfig nsplit_config =
         hierarchical_nsplit_config_from_env();
     const bool use_hierarchical_nsplit = nsplit_config.enabled;
     const char* moe_trace_strategy =
         use_hierarchical_nsplit
             ? "hierarchical_mn_split_dynamic_expert"
-            : "expert_affinity_greedy";
+            : "beam_calibrated_interference";
     int64_t moe_trace_expert_tasks = 0;
     for (const std::vector<int64_t>& expert_routes : routes) {
         if (!expert_routes.empty()) {
@@ -2077,8 +3314,18 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
 
     if (!use_hierarchical_nsplit) {
         moe_trace.reserve(tasks.size() * 2);
+        const ExpertScheduleWorkloadConfig workload_config{
+            w13.K_pad,
+            w13.N_pad,
+            w2.K_pad,
+            w2.N_pad,
+            moe_activation_kind(activation),
+            skip_weighted};
+        float estimated_schedule_cost = 0.0f;
         std::vector<std::vector<TaskRange>> ranges =
-            split_tasks_by_expert_affinity(tasks, actual_threads);
+            split_tasks_by_expert_affinity(tasks, actual_threads,
+                                           workload_config,
+                                           &estimated_schedule_cost);
         std::vector<ThreadScheduleDebug> schedule_debug;
         if (schedule_debug_level > 0) {
             schedule_debug.reserve(static_cast<size_t>(actual_threads));
@@ -2092,17 +3339,18 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
             static_cast<size_t>(actual_threads));
         for (ThreadScratch& scratch : scratches) {
             scratch.input.resize(static_cast<size_t>(
-                kMoeTokenTile * w13.K_pad));
+                max_expert_rows * w13.K_pad));
             scratch.intermediate.resize(static_cast<size_t>(
-                kMoeTokenTile * w2.K_pad));
+                max_expert_rows * w2.K_pad));
             scratch.a_reorder.resize(static_cast<size_t>(
-                kMoeTokenTile * std::max(w13.K_pad, w2.K_pad) * 2));
+                max_expert_rows * std::max(w13.K_pad, w2.K_pad) * 2));
             scratch.gate_up.resize(static_cast<size_t>(
-                kMoeTokenTile * w13.N_pad));
+                max_expert_rows * w13.N_pad));
             scratch.down.resize(static_cast<size_t>(
-                kMoeTokenTile * w2.N_pad));
+                max_expert_rows * w2.N_pad));
         }
 
+        const auto schedule_compute_begin = ::fused_cpp::profile::now();
         run_fixed_threads(actual_threads, [&](int64_t tid) {
             const auto thread_begin = ::fused_cpp::profile::now();
             ThreadScratch& scratch = scratches[static_cast<size_t>(tid)];
@@ -2111,7 +3359,7 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
             for (const TaskRange& range : thread_ranges) {
                 for (size_t task_idx = range.begin; task_idx < range.end;
                      ++task_idx) {
-                    const TileTask& task = tasks[task_idx];
+                    const ExpertTask& task = tasks[task_idx];
                     const auto& expert_routes = routes[static_cast<size_t>(
                         task.expert)];
                     const int64_t rows = task.rows;
@@ -2204,6 +3452,10 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
                     ::fused_cpp::profile::elapsed_ms(thread_begin);
             }
         });
+        const double observed_schedule_ms =
+            ::fused_cpp::profile::elapsed_ms(schedule_compute_begin);
+        update_expert_schedule_cost_feedback(estimated_schedule_cost,
+                                             observed_schedule_ms);
 
         if (schedule_debug_level > 0) {
             int64_t longest_tid = -1;
@@ -2228,7 +3480,8 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
             std::fprintf(
                 stderr,
                 "[fused_moe_bf16_tiled][schedule] threads=%lld experts=%lld "
-                "routes=%lld tiles=%zu strategy=expert_affinity_greedy\n",
+                "routes=%lld expert_tasks=%zu "
+                "strategy=beam_calibrated_interference\n",
                 static_cast<long long>(actual_threads),
                 static_cast<long long>(num_experts),
                 static_cast<long long>(num_routes),
@@ -2305,10 +3558,11 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
             group_scratches.push_back(std::move(scratch));
         }
 
-        auto core_for_tid = [&](int64_t tid) {
-            return nsplit_thread_cores[static_cast<size_t>(tid)];
-        };
-        run_fixed_threads_pinned(actual_threads, core_for_tid, [&](int64_t tid) {
+        ThreadPinningConfig nsplit_pinning;
+        nsplit_pinning.enabled = true;
+        nsplit_pinning.cpus = nsplit_thread_cores;
+        ThreadPinningScope nsplit_scope(&nsplit_pinning);
+        run_fixed_threads(actual_threads, [&](int64_t tid) {
             const int64_t group = tid / nsplit_group_size;
             const int64_t local_tid = tid % nsplit_group_size;
             const auto thread_begin = ::fused_cpp::profile::now();
@@ -2499,7 +3753,7 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
             std::fprintf(
                 stderr,
                 "[fused_moe_bf16_tiled][schedule] threads=%lld experts=%lld "
-                "routes=%lld expert_tasks=%zu micro_tiles=%zu "
+                "routes=%lld expert_tasks=%zu schedule_units=%zu "
                 "strategy=hierarchical_mn_split_dynamic_expert "
                 "partitions=%lld groups_per_partition=%lld groups=%lld "
                 "group_size=%lld core_bases=[",
@@ -2573,11 +3827,11 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
     };
     if (!skip_weighted) {
         if (use_hierarchical_nsplit) {
-            auto core_for_tid = [&](int64_t tid) {
-                return nsplit_thread_cores[static_cast<size_t>(tid)];
-            };
-            run_fixed_threads_pinned(actual_threads, core_for_tid,
-                                     merge_routes);
+            ThreadPinningConfig nsplit_pinning;
+            nsplit_pinning.enabled = true;
+            nsplit_pinning.cpus = nsplit_thread_cores;
+            ThreadPinningScope nsplit_scope(&nsplit_pinning);
+            run_fixed_threads(actual_threads, merge_routes);
         } else {
             run_fixed_threads(actual_threads, merge_routes);
         }
@@ -2786,12 +4040,9 @@ at::Tensor fused_moe_bf16_tiled_scheduled(at::Tensor input,
 
     phase_begin = trace_phase_begin();
     int64_t active_experts = 0;
-    size_t micro_tiles = 0;
     for (const std::vector<int64_t>& expert_routes : routes) {
         if (!expert_routes.empty()) {
             ++active_experts;
-            micro_tiles += static_cast<size_t>(ceil_div_int64(
-                static_cast<int64_t>(expert_routes.size()), kMoeTokenTile));
         }
     }
     TORCH_CHECK(num_teams == active_experts,
@@ -3150,9 +4401,557 @@ at::Tensor fused_moe_bf16_tiled_scheduled(at::Tensor input,
                                num_routes,
                                H,
                                F,
-                               micro_tiles,
+                               static_cast<size_t>(active_experts),
                                num_teams,
                                num_teams,
+                               0,
+                               e2e_ms);
+    }
+    return output;
+#endif
+}
+
+at::Tensor fused_moe_bf16_tiled_async(at::Tensor input,
+                            at::Tensor w13_packed,
+                            int64_t w13_K,
+                            int64_t w13_N,
+                            at::Tensor w2_packed,
+                            int64_t w2_K,
+                            int64_t w2_N,
+                            at::Tensor topk_weights,
+                            at::Tensor topk_ids,
+                            at::Tensor task_expert_ids,
+                            at::Tensor task_core_begins,
+                            at::Tensor task_threads,
+                            at::Tensor task_dep_offsets,
+                            at::Tensor task_deps,
+                            c10::optional<at::Tensor> thread_cpu_ids,
+                            c10::optional<at::Tensor> w13_bias,
+                            c10::optional<at::Tensor> w2_bias,
+                            int64_t num_threads,
+                            std::string activation,
+                            int64_t global_num_experts,
+                            bool skip_weighted) {
+#ifndef __aarch64__
+    TORCH_CHECK(false, "fused_moe_bf16_tiled_async requires AArch64");
+#else
+    const auto moe_trace_begin = ::fused_cpp::profile::now();
+    MoeTraceCollector moe_trace(moe_trace_config_from_env());
+    auto trace_phase_begin = [&]() -> ::fused_cpp::profile::TimePoint {
+        if (!moe_trace.enabled()) {
+            return {};
+        }
+        return ::fused_cpp::profile::now();
+    };
+    auto trace_phase_end =
+        [&](int64_t tid,
+            int64_t task,
+            int64_t local_tid,
+            int64_t expert,
+            int64_t rows,
+            const char* stage,
+            ::fused_cpp::profile::TimePoint begin) {
+            if (!moe_trace.enabled()) {
+                return;
+            }
+            moe_trace.record_phase(
+                tid, -1, task, local_tid, expert, rows, stage,
+                ::fused_cpp::profile::elapsed_ms(begin));
+        };
+
+    check_bf16_cpu(input, "input");
+    TORCH_CHECK(input.dim() == 2, "input must be 2-D [tokens, hidden]");
+    TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
+    TORCH_CHECK(topk_ids.device().is_cpu(), "topk_ids must be CPU");
+    TORCH_CHECK(topk_weights.device().is_cpu(), "topk_weights must be CPU");
+    TORCH_CHECK(is_integer_dtype(topk_ids.scalar_type()),
+                "topk_ids must use an integer dtype");
+    TORCH_CHECK(is_floating_dtype(topk_weights.scalar_type()),
+                "topk_weights must use a floating dtype");
+    TORCH_CHECK(topk_ids.dim() == 2, "topk_ids must be 2-D [tokens, top_k]");
+    TORCH_CHECK(topk_weights.dim() == 2,
+                "topk_weights must be 2-D [tokens, top_k]");
+    TORCH_CHECK(topk_ids.sizes() == topk_weights.sizes(),
+                "topk_ids and topk_weights shapes must match");
+    TORCH_CHECK(topk_ids.size(0) == input.size(0),
+                "topk first dimension must match input token count");
+    TORCH_CHECK(topk_ids.size(1) > 0, "top_k must be non-zero");
+    TORCH_CHECK(num_threads > 0, "num_threads must be positive, got ",
+                num_threads);
+    TORCH_CHECK(num_threads <= std::numeric_limits<int>::max(),
+                "num_threads exceeds int32 limit: ", num_threads);
+
+    PackedExperts w13 = checked_packed_experts(w13_packed, w13_K, w13_N,
+                                               "w13_packed");
+    PackedExperts w2 = checked_packed_experts(w2_packed, w2_K, w2_N,
+                                             "w2_packed");
+    TORCH_CHECK(w13.E == w2.E, "w13 and w2 expert count mismatch");
+    TORCH_CHECK(w13.K == input.size(1),
+                "input hidden size mismatch: input H=", input.size(1),
+                ", w13 K=", w13.K);
+    TORCH_CHECK(w13.N % 2 == 0, "w13 N must be even, got ", w13.N);
+    const int64_t F = w13.N / 2;
+    const int64_t H = input.size(1);
+    TORCH_CHECK(w2.K == F && w2.N == H,
+                "w2 shape mismatch: expected K=", F, " N=", H,
+                ", got K=", w2.K, " N=", w2.N);
+    check_optional_bias(w13_bias, w13.E, w13.N, "w13_bias");
+    check_optional_bias(w2_bias, w2.E, w2.N, "w2_bias");
+    const at::Tensor w13_bias_f32 =
+        build_padded_bias_f32(w13_bias, w13.E, w13.N, w13.N_pad);
+    const at::Tensor w2_bias_f32 =
+        build_padded_bias_f32(w2_bias, w2.E, w2.N, w2.N_pad);
+    const float* w13_bias_base =
+        w13_bias_f32.defined() ? w13_bias_f32.data_ptr<float>() : nullptr;
+    const float* w2_bias_base =
+        w2_bias_f32.defined() ? w2_bias_f32.data_ptr<float>() : nullptr;
+
+    const int64_t num_tokens = input.size(0);
+    const int64_t top_k = topk_ids.size(1);
+    if (skip_weighted) {
+        TORCH_CHECK(top_k == 1,
+                    "skip_weighted is only valid when top_k == 1");
+    }
+    if (num_tokens == 0) {
+        return at::empty_like(input);
+    }
+
+    const int64_t num_experts = global_num_experts < 0
+                                    ? w13.E
+                                    : global_num_experts;
+    TORCH_CHECK(num_experts > 0,
+                "global_num_experts must be positive or -1, got ",
+                global_num_experts);
+    TORCH_CHECK(num_experts <= w13.E,
+                "global_num_experts cannot exceed prepared expert weights: ",
+                num_experts, " > ", w13.E);
+
+    ThreadPinningConfig async_thread_pinning;
+    bool has_async_thread_pinning = false;
+    if (thread_cpu_ids.has_value() && thread_cpu_ids->defined() &&
+        thread_cpu_ids->numel() > 0) {
+        async_thread_pinning.cpus =
+            tensor_to_i64_vector(*thread_cpu_ids, "thread_cpu_ids");
+        TORCH_CHECK(
+            static_cast<int64_t>(async_thread_pinning.cpus.size()) ==
+                num_threads,
+            "thread_cpu_ids must have exactly num_threads entries: got ",
+            async_thread_pinning.cpus.size(), " vs ", num_threads);
+        for (size_t idx = 0; idx < async_thread_pinning.cpus.size(); ++idx) {
+            TORCH_CHECK(async_thread_pinning.cpus[idx] >= 0,
+                        "thread_cpu_ids[", idx, "] must be non-negative, got ",
+                        async_thread_pinning.cpus[idx]);
+        }
+        async_thread_pinning.enabled = true;
+        has_async_thread_pinning = true;
+    }
+    ThreadPinningScope async_thread_pinning_scope(
+        has_async_thread_pinning ? &async_thread_pinning : nullptr);
+    prepare_moe_threads_for_operator(num_threads);
+
+    auto phase_begin = trace_phase_begin();
+    const std::vector<int64_t> task_expert_ids_v =
+        tensor_to_i64_vector(task_expert_ids, "task_expert_ids");
+    const std::vector<int64_t> task_core_begins_v =
+        tensor_to_i64_vector(task_core_begins, "task_core_begins");
+    const std::vector<int64_t> task_threads_v =
+        tensor_to_i64_vector(task_threads, "task_threads");
+    const std::vector<int64_t> task_dep_offsets_v =
+        tensor_to_i64_vector(task_dep_offsets, "task_dep_offsets");
+    const std::vector<int64_t> task_deps_v =
+        tensor_to_i64_vector(task_deps, "task_deps");
+    trace_phase_end(-1, -1, -1, -1, 0, "plan_materialize", phase_begin);
+
+    const int64_t num_tasks =
+        static_cast<int64_t>(task_expert_ids_v.size());
+    TORCH_CHECK(num_tasks > 0, "async task plan must not be empty");
+    TORCH_CHECK(static_cast<int64_t>(task_core_begins_v.size()) == num_tasks,
+                "task_core_begins must match task_expert_ids length");
+    TORCH_CHECK(static_cast<int64_t>(task_threads_v.size()) == num_tasks,
+                "task_threads must match task_expert_ids length");
+    TORCH_CHECK(static_cast<int64_t>(task_dep_offsets_v.size()) ==
+                    num_tasks + 1,
+                "task_dep_offsets must have num_tasks + 1 entries");
+    TORCH_CHECK(task_dep_offsets_v.front() == 0,
+                "task_dep_offsets[0] must be 0");
+    TORCH_CHECK(task_dep_offsets_v.back() ==
+                    static_cast<int64_t>(task_deps_v.size()),
+                "last task_dep_offsets entry must equal task_deps length");
+
+    phase_begin = trace_phase_begin();
+    at::Tensor ids_i64 = topk_ids.to(at::kLong).contiguous();
+    at::Tensor weights_f32 = topk_weights.to(at::kFloat).contiguous();
+    const int64_t* ids = ids_i64.data_ptr<int64_t>();
+    const int64_t num_routes = num_tokens * top_k;
+
+    std::vector<std::vector<int64_t>> routes(
+        static_cast<size_t>(num_experts));
+    for (int64_t flat = 0; flat < num_routes; ++flat) {
+        const int64_t expert = ids[flat];
+        TORCH_CHECK(expert >= 0 && expert < num_experts,
+                    "topk_ids out of range: id=", expert,
+                    ", valid range [0, ", num_experts, ")");
+        routes[static_cast<size_t>(expert)].push_back(flat);
+    }
+    trace_phase_end(-1, -1, -1, -1, num_routes, "route_build", phase_begin);
+
+    phase_begin = trace_phase_begin();
+    int64_t active_experts = 0;
+    for (const std::vector<int64_t>& expert_routes : routes) {
+        if (!expert_routes.empty()) {
+            ++active_experts;
+        }
+    }
+    TORCH_CHECK(num_tasks == active_experts,
+                "async bridge currently requires exactly one task per active "
+                "expert: tasks=", num_tasks,
+                " active_experts=", active_experts);
+
+    std::vector<int64_t> seen(static_cast<size_t>(num_experts), 0);
+    std::vector<AsyncTaskRuntime> tasks(static_cast<size_t>(num_tasks));
+    std::vector<ScheduledScratchUnitConfig> scratch_unit_configs;
+    int64_t trace_gemm_hint = 0;
+    for (int64_t task = 0; task < num_tasks; ++task) {
+        const int64_t expert = task_expert_ids_v[static_cast<size_t>(task)];
+        const int64_t core_begin =
+            task_core_begins_v[static_cast<size_t>(task)];
+        const int64_t threads = task_threads_v[static_cast<size_t>(task)];
+        TORCH_CHECK(expert >= 0 && expert < num_experts,
+                    "task_expert_ids[", task, "] out of range: ", expert);
+        TORCH_CHECK(threads > 0,
+                    "task_threads[", task, "] must be positive, got ",
+                    threads);
+        TORCH_CHECK(core_begin >= 0,
+                    "task_core_begins[", task, "] must be non-negative, got ",
+                    core_begin);
+        TORCH_CHECK(core_begin + threads <= num_threads,
+                    "task ", task, " interval [", core_begin, ", ",
+                    core_begin + threads,
+                    ") exceeds num_threads=", num_threads);
+        TORCH_CHECK(seen[static_cast<size_t>(expert)] == 0,
+                    "async bridge currently does not support duplicate expert ",
+                    expert);
+        const int64_t rows =
+            static_cast<int64_t>(routes[static_cast<size_t>(expert)].size());
+        TORCH_CHECK(rows > 0,
+                    "async task contains inactive expert ", expert);
+        check_positive_int(rows, "async task rows");
+        seen[static_cast<size_t>(expert)] = 1;
+
+        int64_t scratch_idx = -1;
+        for (size_t idx = 0; idx < scratch_unit_configs.size(); ++idx) {
+            const ScheduledScratchUnitConfig& config =
+                scratch_unit_configs[idx];
+            if (config.thread_begin == core_begin &&
+                config.threads == threads) {
+                scratch_idx = static_cast<int64_t>(idx);
+                break;
+            }
+        }
+        if (scratch_idx < 0) {
+            scratch_idx = static_cast<int64_t>(scratch_unit_configs.size());
+            scratch_unit_configs.push_back(ScheduledScratchUnitConfig{
+                core_begin, threads, 0, 0});
+        }
+        ScheduledScratchUnitConfig& scratch_config =
+            scratch_unit_configs[static_cast<size_t>(scratch_idx)];
+        scratch_config.max_rows = std::max(scratch_config.max_rows, rows);
+        scratch_config.a_reorder_stride = std::max(
+            scratch_config.a_reorder_stride,
+            scheduled_a_reorder_stride(rows, threads, w13, w2));
+
+        tasks[static_cast<size_t>(task)] =
+            AsyncTaskRuntime{expert, rows, core_begin, threads, scratch_idx};
+        trace_gemm_hint += threads * 2;
+    }
+    for (int64_t expert = 0; expert < num_experts; ++expert) {
+        if (!routes[static_cast<size_t>(expert)].empty()) {
+            TORCH_CHECK(seen[static_cast<size_t>(expert)] == 1,
+                        "async task plan is missing active expert ", expert);
+        }
+    }
+
+    std::vector<std::vector<int64_t>> successors(static_cast<size_t>(num_tasks));
+    std::vector<std::atomic<int64_t>> deps_remaining(
+        static_cast<size_t>(num_tasks));
+    for (int64_t task = 0; task < num_tasks; ++task) {
+        const int64_t begin = task_dep_offsets_v[static_cast<size_t>(task)];
+        const int64_t end = task_dep_offsets_v[static_cast<size_t>(task + 1)];
+        TORCH_CHECK(begin <= end,
+                    "task_dep_offsets must be nondecreasing at task ", task);
+        TORCH_CHECK(begin >= 0 &&
+                        end <= static_cast<int64_t>(task_deps_v.size()),
+                    "task ", task, " dependency range is out of bounds");
+        deps_remaining[static_cast<size_t>(task)].store(end - begin);
+        for (int64_t idx = begin; idx < end; ++idx) {
+            const int64_t dep = task_deps_v[static_cast<size_t>(idx)];
+            TORCH_CHECK(dep >= 0 && dep < num_tasks,
+                        "task dependency out of range: task=", task,
+                        " dep=", dep);
+            TORCH_CHECK(dep != task,
+                        "async task cannot depend on itself: task=", task);
+            TORCH_CHECK(dep < task,
+                        "async task dependencies must refer to earlier tasks: "
+                        "task=", task, " dep=", dep);
+            successors[static_cast<size_t>(dep)].push_back(task);
+        }
+    }
+    trace_phase_end(-1, -1, -1, -1, num_tasks, "plan_validate", phase_begin);
+
+    at::Tensor output = at::empty(
+        {num_tokens, H},
+        at::TensorOptions().device(input.device()).dtype(at::kBFloat16));
+    uint16_t* out_bf16_ptr = bf16_data(output);
+    at::Tensor route_out;
+    float* route_out_ptr = nullptr;
+    if (!skip_weighted) {
+        route_out = at::empty(
+            {num_routes, H},
+            at::TensorOptions().device(input.device()).dtype(at::kFloat));
+        route_out_ptr = route_out.data_ptr<float>();
+    }
+    const uint16_t* input_ptr = bf16_data_const(input);
+    const uint16_t* w13_ptr = bf16_data_const(w13.tensor);
+    const uint16_t* w2_ptr = bf16_data_const(w2.tensor);
+
+    phase_begin = trace_phase_begin();
+    ScheduledScratchLease scratch_lease =
+        resident_scheduled_scratch_pool().lease(scratch_unit_configs, w13, w2);
+    const std::vector<ScheduledTeamScratch*>& scratches =
+        scratch_lease.scratches();
+    trace_phase_end(-1, -1, -1, -1,
+                    static_cast<int64_t>(scratch_unit_configs.size()),
+                    "scratch_alloc", phase_begin);
+
+    moe_trace.reserve(static_cast<size_t>(trace_gemm_hint));
+    std::vector<std::atomic<int64_t>> task_states(
+        static_cast<size_t>(num_tasks));
+    for (int64_t task = 0; task < num_tasks; ++task) {
+        task_states[static_cast<size_t>(task)].store(0);
+    }
+    std::atomic<int64_t> completed_tasks{0};
+
+    auto run_async_task = [&](int64_t tid, int64_t task_id) {
+        const AsyncTaskRuntime& task =
+            tasks[static_cast<size_t>(task_id)];
+        const int64_t local_tid = tid - task.core_begin;
+        ScheduledTeamScratch& scratch =
+            *scratches[static_cast<size_t>(task.scratch_index)];
+        ThreadBarrier& barrier = scratch.barrier;
+        const int64_t expert = task.expert;
+        const int64_t rows = task.rows;
+        const int64_t group_size = task.threads;
+        const auto& expert_routes = routes[static_cast<size_t>(expert)];
+        uint16_t* a_reorder = scratch.a_reorder.data() +
+            local_tid * scratch.a_reorder_stride;
+
+        if (local_tid == 0) {
+            auto worker_phase_begin = trace_phase_begin();
+            std::fill(scratch.input.begin(),
+                      scratch.input.begin() + rows * w13.K_pad,
+                      static_cast<uint16_t>(0));
+            for (int64_t m = 0; m < rows; ++m) {
+                const int64_t flat = expert_routes[static_cast<size_t>(m)];
+                const int64_t token = flat / top_k;
+                const uint16_t* src = input_ptr + token * H;
+                uint16_t* dst = scratch.input.data() + m * w13.K_pad;
+                std::copy(src, src + H, dst);
+            }
+            trace_phase_end(tid, task_id, local_tid, expert, rows,
+                            "gather_input", worker_phase_begin);
+        }
+        barrier.wait();
+
+        trace_dispatch_fp32_gemm_stage_split(
+            moe_trace,
+            "w13",
+            MoeGemmStage::kW13,
+            tid,
+            -1,
+            task_id,
+            local_tid,
+            expert,
+            0,
+            rows,
+            scratch.input.data(),
+            w13_ptr + expert * w13.packed_stride,
+            scratch.gate_up.data(),
+            a_reorder,
+            static_cast<int>(rows),
+            static_cast<int>(w13.K_pad),
+            static_cast<int>(w13.N_pad),
+            static_cast<int>(w13.N_pad),
+            group_size,
+            w13_bias_base != nullptr
+                ? w13_bias_base + expert * w13.N_pad
+                : nullptr);
+        barrier.wait();
+
+        auto worker_phase_begin = trace_phase_begin();
+        const SplitRange activation_range =
+            split_evenly(rows, group_size, local_tid);
+        activation_range_to_bf16(
+            activation, scratch.gate_up.data(), scratch.intermediate.data(),
+            activation_range.begin, activation_range.size, w13.N_pad,
+            w2.K_pad, F);
+        trace_phase_end(tid, task_id, local_tid, expert,
+                        activation_range.size, "activation",
+                        worker_phase_begin);
+        barrier.wait();
+
+        trace_dispatch_fp32_gemm_stage_split(
+            moe_trace,
+            "w2",
+            MoeGemmStage::kW2,
+            tid,
+            -1,
+            task_id,
+            local_tid,
+            expert,
+            0,
+            rows,
+            scratch.intermediate.data(),
+            w2_ptr + expert * w2.packed_stride,
+            scratch.down.data(),
+            a_reorder,
+            static_cast<int>(rows),
+            static_cast<int>(w2.K_pad),
+            static_cast<int>(w2.N_pad),
+            static_cast<int>(w2.N_pad),
+            group_size,
+            w2_bias_base != nullptr
+                ? w2_bias_base + expert * w2.N_pad
+                : nullptr);
+        barrier.wait();
+
+        const SplitRange h_range =
+            n_split_range(static_cast<int>(w2.N_pad), group_size, local_tid);
+        const int64_t h_begin = h_range.begin;
+        const int64_t h_end = std::min<int64_t>(H, h_begin + h_range.size);
+        worker_phase_begin = trace_phase_begin();
+        if (h_begin < h_end) {
+            for (int64_t m = 0; m < rows; ++m) {
+                const int64_t flat = expert_routes[static_cast<size_t>(m)];
+                const float* src = scratch.down.data() + m * w2.N_pad;
+                if (skip_weighted) {
+                    uint16_t* dst = out_bf16_ptr + flat * H;
+                    for (int64_t h = h_begin; h < h_end; ++h) {
+                        dst[h] = bf16_bits_from_float(src[h]);
+                    }
+                } else {
+                    float* dst = route_out_ptr + flat * H;
+                    for (int64_t h = h_begin; h < h_end; ++h) {
+                        dst[h] = src[h];
+                    }
+                }
+            }
+        }
+        trace_phase_end(tid, task_id, local_tid, expert, rows,
+                        "scatter_route_out", worker_phase_begin);
+        barrier.wait();
+
+        if (local_tid == 0) {
+            task_states[static_cast<size_t>(task_id)].store(2);
+            for (const int64_t child :
+                 successors[static_cast<size_t>(task_id)]) {
+                deps_remaining[static_cast<size_t>(child)].fetch_sub(1);
+            }
+            completed_tasks.fetch_add(1);
+        }
+        barrier.wait();
+    };
+
+    phase_begin = trace_phase_begin();
+    run_fixed_threads(num_threads, [&](int64_t tid) {
+        while (completed_tasks.load() < num_tasks) {
+            int64_t selected_task = -1;
+            for (int64_t task_id = 0; task_id < num_tasks; ++task_id) {
+                const AsyncTaskRuntime& task =
+                    tasks[static_cast<size_t>(task_id)];
+                if (tid < task.core_begin ||
+                    tid >= task.core_begin + task.threads) {
+                    continue;
+                }
+                int64_t state =
+                    task_states[static_cast<size_t>(task_id)].load();
+                if (state == 2) {
+                    continue;
+                }
+                if (state == 0) {
+                    if (deps_remaining[static_cast<size_t>(task_id)].load() !=
+                        0) {
+                        continue;
+                    }
+                    int64_t expected = 0;
+                    if (!task_states[static_cast<size_t>(task_id)]
+                             .compare_exchange_strong(expected, 1)) {
+                        state = expected;
+                        if (state != 1) {
+                            continue;
+                        }
+                    }
+                }
+                selected_task = task_id;
+                break;
+            }
+            if (selected_task >= 0) {
+                run_async_task(tid, selected_task);
+            } else {
+                std::this_thread::yield();
+            }
+        }
+    });
+    trace_phase_end(-1, -1, -1, -1, num_routes, "scheduled_compute",
+                    phase_begin);
+
+    const float* topk_w = weights_f32.data_ptr<float>();
+    auto merge_routes = [&](int64_t tid) {
+        auto worker_phase_begin = trace_phase_begin();
+        const int64_t rows_per_thread =
+            ceil_div_int64(num_tokens, num_threads);
+        const int64_t token_begin = tid * rows_per_thread;
+        const int64_t token_end = std::min<int64_t>(
+            num_tokens, token_begin + rows_per_thread);
+        std::vector<float> acc(static_cast<size_t>(H));
+        for (int64_t token = token_begin; token < token_end; ++token) {
+            uint16_t* dst = out_bf16_ptr + token * H;
+            std::fill(acc.begin(), acc.end(), 0.0f);
+            for (int64_t slot = 0; slot < top_k; ++slot) {
+                const int64_t flat = token * top_k + slot;
+                const float weight = topk_w[flat];
+                const float* src = route_out_ptr + flat * H;
+                for (int64_t h = 0; h < H; ++h) {
+                    acc[static_cast<size_t>(h)] += src[h] * weight;
+                }
+            }
+            for (int64_t h = 0; h < H; ++h) {
+                dst[h] = bf16_bits_from_float(acc[static_cast<size_t>(h)]);
+            }
+        }
+        trace_phase_end(tid, -1, -1, -1,
+                        std::max<int64_t>(0, token_end - token_begin),
+                        "merge_routes", worker_phase_begin);
+    };
+    phase_begin = trace_phase_begin();
+    if (!skip_weighted) {
+        run_fixed_threads(num_threads, merge_routes);
+    }
+    trace_phase_end(-1, -1, -1, -1, num_tokens, "merge_routes_total",
+                    phase_begin);
+
+    if (moe_trace.enabled()) {
+        const double e2e_ms = ::fused_cpp::profile::elapsed_ms(moe_trace_begin);
+        moe_trace.write_report("external_plan_async",
+                               num_threads,
+                               num_tokens,
+                               top_k,
+                               num_experts,
+                               num_routes,
+                               H,
+                               F,
+                               static_cast<size_t>(active_experts),
+                               num_tasks,
+                               num_tasks,
                                0,
                                e2e_ms);
     }
