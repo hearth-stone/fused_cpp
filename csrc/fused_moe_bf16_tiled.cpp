@@ -12,6 +12,9 @@
 #ifdef __linux__
 #include <sys/mman.h>
 #endif
+#ifdef __aarch64__
+#include <arm_neon.h>
+#endif
 #include <exception>
 #include <functional>
 #include <limits>
@@ -214,6 +217,21 @@ uint16_t bf16_bits_from_float(float value) {
     static_assert(sizeof(bits) == sizeof(bf));
     std::memcpy(&bits, &bf, sizeof(bits));
     return bits;
+}
+
+// Vectorized fp32 -> bf16 (round-to-nearest-even, matching c10::BFloat16) for
+// the scatter stage. Uses ARM bfcvtn (8/iter) when BF16 intrinsics are
+// available; scalar tail / fallback otherwise. dst is a uint16_t bf16 buffer.
+inline void convert_f32_to_bf16(const float* src, uint16_t* dst, int64_t n) {
+    int64_t i = 0;
+#if defined(__aarch64__) && defined(__ARM_FEATURE_BF16)
+    for (; i + 8 <= n; i += 8) {
+        const bfloat16x8_t b = vcvtq_high_bf16_f32(
+            vcvtq_low_bf16_f32(vld1q_f32(src + i)), vld1q_f32(src + i + 4));
+        vst1q_u16(dst + i, vreinterpretq_u16_bf16(b));
+    }
+#endif
+    for (; i < n; ++i) dst[i] = bf16_bits_from_float(src[i]);
 }
 
 float bf16_bits_to_float(uint16_t bits) {
@@ -2132,7 +2150,7 @@ struct backend_allocator {
         return static_cast<T*>(::operator new(bytes));
     }
     void deallocate(T* p, std::size_t n) noexcept {
-        const size_t bytes = n * sizeof(T);
+        [[maybe_unused]] const size_t bytes = n * sizeof(T);
 #ifdef __linux__
         const ScratchBackend b = scratch_backend();
         if (b == ScratchBackend::kHugetlb) {
@@ -4636,9 +4654,7 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
                             scratch.down.data() + m * w2.N_pad;
                         if (skip_weighted) {
                             uint16_t* dst = out_bf16_ptr + flat * H;
-                            for (int64_t h = 0; h < H; ++h) {
-                                dst[h] = bf16_bits_from_float(src[h]);
-                            }
+                            convert_f32_to_bf16(src, dst, H);
                         } else {
                             float* dst = route_out_ptr + flat * H;
                             for (int64_t h = 0; h < H; ++h) {
@@ -4806,10 +4822,19 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
         nsplit_pinning.enabled = true;
         nsplit_pinning.cpus = nsplit_thread_cores;
         ThreadPinningScope nsplit_scope(&nsplit_pinning);
+        double phase_gather_ms = 0, phase_w13_ms = 0, phase_w2_ms = 0,
+               phase_scatter_ms = 0;  // group 0 / tid 0 only, under stage_timing
         run_fixed_threads(actual_threads, [&](int64_t tid) {
             const int64_t group = tid / nsplit_group_size;
             const int64_t local_tid = tid % nsplit_group_size;
             const auto thread_begin = ::fused_cpp::profile::now();
+            const bool ph_on = stage_timing && group == 0 && local_tid == 0;
+            auto time_phase = [&](double& acc, auto&& fn) {
+                if (!ph_on) { fn(); return; }
+                const auto _t = ::fused_cpp::profile::now();
+                fn();
+                acc += ::fused_cpp::profile::elapsed_ms(_t);
+            };
             HierarchicalGroupScratch& scratch =
                 *group_scratches[static_cast<size_t>(group)];
             ThreadBarrier& barrier = scratch.barrier;
@@ -4862,12 +4887,14 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
                     const int64_t nb = (rows + 7) / 8;
                     const SplitRange brange = split_evenly(
                         nb, nsplit_group_size, local_tid);
+                    time_phase(phase_gather_ms, [&] {
                     gather_pack_a_reorder_m8(
                         input_ptr, H, expert_routes.data(), top_k,
                         scratch.packed_a.data(), static_cast<int>(rows),
                         static_cast<int>(w13.K_pad),
                         static_cast<int>(brange.begin),
                         static_cast<int>(brange.begin + brange.size));
+                    });
                 } else {
                     // Parallel gather: each team thread copies its own row
                     // slice (was serial on local_tid==0 with the rest idle).
@@ -4906,6 +4933,7 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
                         // intermediate directly in w2 pre-packed layout.
                         const int64_t nb = (rows + 7) / 8;
                         if (fused_packa_w2) {
+                            time_phase(phase_w13_ms, [&] {
                             team_fused_w13_silu_packed_packc(
                                 team, scratch.packed_a.data(),
                                 w13_ptr + expert * w13.packed_stride,
@@ -4915,6 +4943,7 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
                                 static_cast<int>(w13.N_pad),
                                 static_cast<int>(w2.K_pad),
                                 silu_poly_degree);
+                            });
                         } else {
                             team_fused_w13_silu_packed(
                                 team, scratch.packed_a.data(),
@@ -5007,6 +5036,7 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
                     w2team.local_tid = local_tid;
                     w2team.barrier = nullptr;
                     w2team.a_reorder = a_reorder;
+                    time_phase(phase_w2_ms, [&] {
                     team_w2_packed(
                         w2team, scratch.intermediate.data(),
                         w2_ptr + expert * w2.packed_stride,
@@ -5015,6 +5045,7 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
                         static_cast<int>(w2.K_pad),
                         static_cast<int>(w2.N_pad),
                         static_cast<int>(w2.N_pad));
+                    });
                 } else {
                     trace_dispatch_fp32_gemm_stage_split(
                         moe_trace,
@@ -5062,6 +5093,7 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
                 const int64_t h_begin = start_block * kKernelTile;
                 const int64_t h_end = std::min<int64_t>(
                     H, h_begin + my_blocks * kKernelTile);
+                time_phase(phase_scatter_ms, [&] {
                 if (h_begin < h_end) {
                     for (int64_t m = 0; m < rows; ++m) {
                         const int64_t flat =
@@ -5070,9 +5102,8 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
                             scratch.down.data() + m * w2.N_pad;
                         if (skip_weighted) {
                             uint16_t* dst = out_bf16_ptr + flat * H;
-                            for (int64_t h = h_begin; h < h_end; ++h) {
-                                dst[h] = bf16_bits_from_float(src[h]);
-                            }
+                            convert_f32_to_bf16(src + h_begin, dst + h_begin,
+                                                h_end - h_begin);
                         } else {
                             float* dst = route_out_ptr + flat * H;
                             for (int64_t h = h_begin; h < h_end; ++h) {
@@ -5081,6 +5112,7 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
                         }
                     }
                 }
+                });
                 barrier.wait();
             }
 
@@ -5093,8 +5125,10 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
         if (stage_timing) {
             std::fprintf(stderr,
                 "[fused_moe_bf16_tiled][stage_timing] threads=%lld "
-                "scratch_alloc_ms=%.3f\n",
-                static_cast<long long>(actual_threads), stage_alloc_ms);
+                "scratch_alloc_ms=%.3f gather_ms=%.3f w13_ms=%.3f w2_ms=%.3f "
+                "scatter_ms=%.3f (group0/tid0; excludes barrier waits)\n",
+                static_cast<long long>(actual_threads), stage_alloc_ms,
+                phase_gather_ms, phase_w13_ms, phase_w2_ms, phase_scatter_ms);
         }
         if (schedule_debug_level > 0) {
             int64_t longest_group = -1;
@@ -5700,9 +5734,8 @@ at::Tensor fused_moe_bf16_tiled_scheduled(at::Tensor input,
                             scratch.down.data() + m * w2.N_pad;
                         if (skip_weighted) {
                             uint16_t* dst = out_bf16_ptr + flat * H;
-                            for (int64_t h = h_begin; h < h_end; ++h) {
-                                dst[h] = bf16_bits_from_float(src[h]);
-                            }
+                            convert_f32_to_bf16(src + h_begin, dst + h_begin,
+                                                h_end - h_begin);
                         } else {
                             float* dst = route_out_ptr + flat * H;
                             for (int64_t h = h_begin; h < h_end; ++h) {
