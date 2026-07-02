@@ -125,3 +125,136 @@ OMP_NUM_THREADS=1 OMP_PROC_BIND=FALSE taskset -c 0-7 \
 # correctness
 pytest -q tests/test_moe_fused_silu_nsplit.py
 ```
+
+
+---
+
+# packA 融合(gather→w13 A、w13 epilogue→w2 A)
+
+## 动机
+单专家 N-split 下,GEMM kernel 在内部把 A strided 重排进 per-thread 的
+`a_reorder`(尺寸 `G × ceil8(rows) × max(w13.K_pad,w2.K_pad) × 2`,G=8、M=2048
+时约 **268MB**)。这份 scratch 每次 forward 都 `malloc` + zero-init,构成单专家
+8 线程 non-GEMM 的绝对大头。实测 G=8 M=2048:`scratch_alloc ≈ 96ms`(占 e2e
+~64%),远超所有 GEMM 的 ~25ms。
+
+## 做法(两部分,`FUSED_CPP_MOE_FUSED_PACKA`,默认 ON)
+- **Part 1(gather → w13 packA)**:`gather_pack_a_reorder_m8` 在收集 token 时
+  直接写成 reorder-m8 packed 布局,w13 用 `bf16gemm_k_ldp_silu_poly*`(读预打包
+  A、跳过 kernel 内 repack)。消除行主序 `scratch.input` 中转 + 独立 pack。
+- **Part 2(w13 epilogue → w2 packA)**:新增 fused_cpp 自有 asm
+  `csrc/bf16gemm_silu_packc.S`(不改 i8gemm),`STORE_C_SILU_POLY*_PACKC_8`
+  把融合 SiLU 的 8×4 输出直接按 reorder-m8 写成 64 连续字节;w2 用
+  `bf16gemm_k_ldp`(packed-read fp32)直接读该 packed intermediate,不再 repack。
+  仅当 w2 无 bias 时启用(packed-read w2 无 bias 变体),否则退化为 Part-1-only。
+
+两部分都启用后,`a_reorder`(及行主序 `input`、非融合才用的 `gate_up`)在
+fused-packa 路径**不再分配**,scratch 只剩一份 ~16MB 的共享 packed_a +
+intermediate + down。
+
+## asm 关键点(零 i8gemm 改动)
+- packed-C 复用 `GEMM_BODY` 不变:M-block 步长 `LDC_B<<3 = ldc*16 =
+  8*F_pad*2` 已与 reorder-m8 一致;只把 `c_adv` 从 8 改成 **64**(一个 reorder
+  K-block = 32 uint16 = 64B)。存储把 8 行 pair 用 `ins v0.d[1],v1.d[0]` 合成
+  q 后连续 `str`。
+- `.macro`/`#define` 是按编译单元作用域,新 .S 与 `bf16gemm_k.S` 各自成 .o,
+  宏名可重复无冲突;只有导出 label 用 `_packc` / `bf16gemm_k_ldp` 新名。
+- reorder-m8 天生 8 行块:m8 kernel 通过 padding 到 8 处理任意 M(bit-identical,
+  含 m=3/37 尾块),故 packc **只做 m8**,不需要 m1/m2/m4 尾块变体(那需要新的
+  部分行 load,且现有 packed-read 尾核与 8 行布局不兼容)。
+
+## 正确性
+`tests/test_moe_packa_fusion.py`:gather_pack 对拍 gather+pack_a_reorder_m8
+(36)、packc 对拍 row-major fused+pack(36)、full MoE packa on/off bit-identical
+(9)。全套 MoE 测试 local + AWS Graviton **各 889 pass + 1 skip**。packa on/off
+输出逐位相同(`torch.equal`)。
+
+## 收益(AWS Graviton, 单专家, G=8, pinned, H=4096 F=512)
+| M | packa OFF e2e | packa ON e2e | 加速 | scratch_alloc OFF→ON |
+|---|---|---|---|---|
+| 512  | 35.6ms | 7.1ms | **5.0×** | — |
+| 2048 | 139.8ms | 38.4ms | **3.6×** | ~88ms → ~9.5ms |
+
+alloc 从 ~88ms(268MB a_reorder + 清零)降到 ~9.5ms;e2e 3.6–5.0×。这是极端
+"全部 token 压 1 专家"场景;真实 MoE 中 token 分散、`max_expert_rows` 小,
+a_reorder 本就较小,收益按比例递减,但 packed 路径无回归(输出逐位一致)。
+
+## 复现
+```bash
+# 关闭 packa 走 fallback 对比:FUSED_CPP_MOE_FUSED_PACKA=0
+# alloc 分解:FUSED_CPP_MOE_STAGE_TIMING=1(默认关)
+pytest -q tests/test_moe_packa_fusion.py
+```
+
+
+---
+
+# packA 尾核融合(按 tail=rows%8 分派,消除小 M padding 回归)
+
+## 动机
+上面的 packA 融合里,packc/packed GEMM 把每个专家的行数一律 pad 到 8 跑 m8。
+对 decode 这种"每专家 1–2 行"的小 M,padding 到 8 浪费大量 compute。实测多专家
+小 M(avg 1.5 行/专家,8 线程)packa **ON 反而比 OFF 慢 26%**。
+
+## 关键测量(AWS Graviton,单线程,GEMM-only,w13 K=4096 N=1024)
+padding 到 8 跑 m8 vs 尾核只算 mr 行:
+| 尾行 M | 尾核(repack) | pad→8(m8) | 说明 |
+|---|---|---|---|
+| 1 | 170us | 411us | 尾核 2.4× |
+| 2 | 170us | 411us | m1/m2 同价(bfmmla 2 行粒度) |
+| 3 | 341us(m2+m1) | 411us | pad→4(m4=224)更优 |
+| 4 | 224us | 411us | m4 |
+| 5 | 370us(m4+m1) | 411us | |
+| 6 | 371us(m4+m2) | 411us | |
+| 7 | 548us(m4+m2+m1)| 411us | pad→8 更优(尾核拆 3 次) |
+
+## packed 世界的尾核实测(Option X:64B 步进只读前 mr 行,无 repack)
+把尾核改成直接读 gather 预打包的 reorder-m8(不 repack、不需 a_reorder):
+| 尾行 | packed 尾核 | pad→8 | packed/pad8 |
+|---|---|---|---|
+| 1 | 241us | 412us | 0.58 |
+| 2 | 240us | 415us | 0.58 |
+| 3 | 277us(m4) | 416us | 0.67 |
+| 4 | 277us(m4) | 413us | 0.67 |
+| 5 | m4+m1=508us | 415us | **1.23 → 改 pad8** |
+| 6 | m4+m2=510us | 418us | **1.23 → 改 pad8** |
+| 7 | pad8=412us | 415us | 0.99 |
+
+**关键发现**:packed 世界与 repack 世界不同。packed 尾核每个子核都要重读整块 B
+(w13 的 B=8MB),所以 tail 5/6 拆成 m4+m1/m4+m2(508/510us,读 B 两次)反而比
+pad→8(415us,读 B 一次)慢。故 packed 的最优表是:
+**{1:m1, 2:m2, 3:m4(pad4), 4:m4, 5:m8, 6:m8, 7:m8}**(与最初按 repack 推的表不同,
+tail 5/6 改 pad8)。此外 packed 尾核 M=1,2(240us)比 repack(170us)略慢——因为
+64B 步进 touch 的 A cache 行是紧凑布局的 8×;但 repack 需要 a_reorder(已被消除),
+所以在 no-a_reorder 路径里 240us 是最优,仍比 pad8 快 1.7×。
+
+## 做法(Option X,gather 不变)
+- gather **完全不改**(仍 `gather_pack_a_reorder_m8`,尾块按 ceil8 补零)。
+- 满块:m8 packc(w13)/ m8 packed(w2)。
+- 尾块:新 packed-read reorder-m8 尾核(`csrc/bf16gemm_silu_packc.S`):新增 64B 步进
+  cached 宏 `LOAD_A0_B0_P{2,4}` + `COMPUTE_*_P{2,4}`(读前 mr 行、A_ADDR 前进 64B 跳过
+  padding 行),packc 尾 store `STORE_C_SILU_POLY*_PACKC_M{1,2,4}`(w13)、复用
+  `STORE_C_{1,2,4}` fp32 rowmajor(w2);9 个 w13 尾核 + 3 个 w2 尾核,全 `a_mode=packed`。
+- C++:`packc_w13_tail_dispatch` / `packed_w2_tail_dispatch` 按 tail 表分派,w13/w2 用
+  **同一策略**(intermediate 写/读行数一致);`team_fused_w13_silu_packed_packc` /
+  `team_w2_packed` 改为按 `rows`(非 ceil8)在 N-slice 内跑满块+尾。
+- **零 repack、零 padding compute 浪费、零额外 a_reorder**;满块热路径与 gather 全程不动。
+
+## 正确性
+`tests/test_moe_packa_fusion.py`:`test_packc_tail_dispatch_matches_pad8`(M∈{1..7,9,11,
+15,16,37,45}×h,f×degree=126 例)对拍 m8-pad packc bit-identical;
+`test_packa_multi_expert_all_tails`(多专家每专家行数覆盖全 tail,gpp=1/8)packa on/off
+`torch.equal`。全套 MoE 测试 local + AWS Graviton **各 1015 pass + 1 skip**。
+
+## 收益(AWS Graviton, 8 线程, H=4096 F=512, packa on/off e2e 比值,<1 = packa 更快)
+| 平均行/专家 | gpp | 尾核前(全 pad8) | 尾核后 |
+|---|---|---|---|
+| 1.5 | 1 | **1.26(慢 26%)** | **0.95(快 5%)** |
+| 4   | 1 | 1.02 | 0.86 |
+| 8   | 1 | 0.97 | 0.91 |
+| 1.5 | 8 | 1.01 | 0.87 |
+| 8   | 8 | 0.36 | 0.84 |
+| 64  | 1 | 0.96 | 0.96 |
+| 2048(大 M) | 1 | 0.28 | 0.28(不变,仍 3.6×) |
+
+小 M padding 回归被彻底消除(avg 1.5 从 1.26 → 0.95),大 M 无影响。
