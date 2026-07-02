@@ -33,6 +33,10 @@
 extern "C" {
 void bf16gemm_k_ld(const uint16_t* A, const uint16_t* B_reo, float* C,
                    uint16_t* A_reorder, const gemm_params_t* params);
+// Packed-read plain fp32 GEMM (fused_cpp-owned asm): A already in reorder-m8
+// layout; no in-kernel repack. Used by the fused-packa w2 stage. m8 only.
+void bf16gemm_k_ldp(const uint16_t* A, const uint16_t* B_reo, float* C,
+                    uint16_t* A_reorder, const gemm_params_t* params);
 void bf16gemm_k_ld1(const uint16_t* A, const uint16_t* B_reo, float* C,
                     uint16_t* A_reorder, const gemm_params_t* params);
 void bf16gemm_k_ld2(const uint16_t* A, const uint16_t* B_reo, float* C,
@@ -69,6 +73,41 @@ void bf16gemm_k_ld_silu_poly5(const uint16_t* A, const uint16_t* B_reo,
 void bf16gemm_k_ld_silu_poly6(const uint16_t* A, const uint16_t* B_reo,
                               uint16_t* C, uint16_t* A_reorder,
                               const gemm_params_t* params);
+// Pre-packed-A fused kernels (a_mode=packed): A already in reorder layout,
+// shared across an N-split team; skip the in-kernel strided repack. m8 only.
+void bf16gemm_k_ldp_silu_poly4(const uint16_t* A, const uint16_t* B_reo,
+                               uint16_t* C, uint16_t* A_reorder,
+                               const gemm_params_t* params);
+void bf16gemm_k_ldp_silu_poly5(const uint16_t* A, const uint16_t* B_reo,
+                               uint16_t* C, uint16_t* A_reorder,
+                               const gemm_params_t* params);
+void bf16gemm_k_ldp_silu_poly6(const uint16_t* A, const uint16_t* B_reo,
+                               uint16_t* C, uint16_t* A_reorder,
+                               const gemm_params_t* params);
+// Packed-C fused kernels (fused_cpp-owned asm): pre-packed A read + reorder-m8
+// packed-C store, so intermediate is written directly in w2 pre-packed layout.
+void bf16gemm_k_ldp_silu_poly4_packc(const uint16_t*, const uint16_t*, uint16_t*,
+                                     uint16_t*, const gemm_params_t*);
+void bf16gemm_k_ldp_silu_poly5_packc(const uint16_t*, const uint16_t*, uint16_t*,
+                                     uint16_t*, const gemm_params_t*);
+void bf16gemm_k_ldp_silu_poly6_packc(const uint16_t*, const uint16_t*, uint16_t*,
+                                     uint16_t*, const gemm_params_t*);
+// Packed-read reorder-m8 M-tail fused-silu kernels (packc store, no repack):
+// consume gather's pre-packed A directly, 64B/8-row-block stride reading only
+// the first mr rows. Used by the per-expert tail dispatch (tail=rows%8).
+void bf16gemm_k_ldp_silu_poly4_packc_m4(const uint16_t*, const uint16_t*, uint16_t*, uint16_t*, const gemm_params_t*);
+void bf16gemm_k_ldp_silu_poly5_packc_m4(const uint16_t*, const uint16_t*, uint16_t*, uint16_t*, const gemm_params_t*);
+void bf16gemm_k_ldp_silu_poly6_packc_m4(const uint16_t*, const uint16_t*, uint16_t*, uint16_t*, const gemm_params_t*);
+void bf16gemm_k_ldp_silu_poly4_packc_m2(const uint16_t*, const uint16_t*, uint16_t*, uint16_t*, const gemm_params_t*);
+void bf16gemm_k_ldp_silu_poly5_packc_m2(const uint16_t*, const uint16_t*, uint16_t*, uint16_t*, const gemm_params_t*);
+void bf16gemm_k_ldp_silu_poly6_packc_m2(const uint16_t*, const uint16_t*, uint16_t*, uint16_t*, const gemm_params_t*);
+void bf16gemm_k_ldp_silu_poly4_packc_m1(const uint16_t*, const uint16_t*, uint16_t*, uint16_t*, const gemm_params_t*);
+void bf16gemm_k_ldp_silu_poly5_packc_m1(const uint16_t*, const uint16_t*, uint16_t*, uint16_t*, const gemm_params_t*);
+void bf16gemm_k_ldp_silu_poly6_packc_m1(const uint16_t*, const uint16_t*, uint16_t*, uint16_t*, const gemm_params_t*);
+// Packed-read reorder-m8 plain fp32 M-tail kernels (rowmajor store) for w2.
+void bf16gemm_k_ldp_m4(const uint16_t*, const uint16_t*, float*, uint16_t*, const gemm_params_t*);
+void bf16gemm_k_ldp_m2(const uint16_t*, const uint16_t*, float*, uint16_t*, const gemm_params_t*);
+void bf16gemm_k_ldp_m1(const uint16_t*, const uint16_t*, float*, uint16_t*, const gemm_params_t*);
 // M-tail (m=1/2/4) fused silu kernels.
 void bf16gemm_k_ld_silu_poly4_m1(const uint16_t*, const uint16_t*, uint16_t*,
                                  uint16_t*, const gemm_params_t*);
@@ -487,6 +526,131 @@ FusedSiluKernelSet fused_silu_kernels_for_degree(int64_t degree) {
             return {};
     }
 }
+
+// Pre-packed-A m8 fused kernel for a given exp degree (4/5/6). Used by the
+// N-split shared-A-pack path where rows are padded to a multiple of 8.
+FusedSiluKernelFn fused_silu_packed_m8_for_degree(int64_t degree) {
+    switch (degree) {
+        case 4: return bf16gemm_k_ldp_silu_poly4;
+        case 5: return bf16gemm_k_ldp_silu_poly5;
+        case 6: return bf16gemm_k_ldp_silu_poly6;
+        default: return nullptr;
+    }
+}
+
+// Packed-C m8 fused kernel: pre-packed A + reorder-m8 packed-C store. Writes
+// intermediate directly in the layout w2 reads as pre-packed A (Part 2). M
+// padded to a multiple of 8.
+FusedSiluKernelFn fused_silu_packc_m8_for_degree(int64_t degree) {
+    switch (degree) {
+        case 4: return bf16gemm_k_ldp_silu_poly4_packc;
+        case 5: return bf16gemm_k_ldp_silu_poly5_packc;
+        case 6: return bf16gemm_k_ldp_silu_poly6_packc;
+        default: return nullptr;
+    }
+}
+
+// Packed-read reorder-m8 fused-silu kernel set {m8, m4, m2, m1} (packc store).
+// m8 is the full-block kernel; m4/m2/m1 are the packed-read tail kernels.
+FusedSiluKernelSet fused_silu_packc_set_for_degree(int64_t degree) {
+    switch (degree) {
+        case 4:
+            return {bf16gemm_k_ldp_silu_poly4_packc,
+                    bf16gemm_k_ldp_silu_poly4_packc_m4,
+                    bf16gemm_k_ldp_silu_poly4_packc_m2,
+                    bf16gemm_k_ldp_silu_poly4_packc_m1};
+        case 5:
+            return {bf16gemm_k_ldp_silu_poly5_packc,
+                    bf16gemm_k_ldp_silu_poly5_packc_m4,
+                    bf16gemm_k_ldp_silu_poly5_packc_m2,
+                    bf16gemm_k_ldp_silu_poly5_packc_m1};
+        case 6:
+            return {bf16gemm_k_ldp_silu_poly6_packc,
+                    bf16gemm_k_ldp_silu_poly6_packc_m4,
+                    bf16gemm_k_ldp_silu_poly6_packc_m2,
+                    bf16gemm_k_ldp_silu_poly6_packc_m1};
+        default:
+            return {};
+    }
+}
+
+#ifdef __aarch64__
+// w13 fused-silu packc dispatch over `rows` (NOT padded to 8): m8 full blocks +
+// per-tail (rows%8) strategy reading gather's pre-packed reorder-m8 A. Pointers
+// packed_A / w13_packed / C are already sliced to this thread's N range.
+//   tail 1->m1, 2->m2, 3->m4(pad4), 4->m4, 5/6/7->m8(pad8). (5,6 pad per
+//   microbench: split tail re-reads B twice, slower than pad-8 in packed path.)
+// reorder-m8: row r within a K-block is at uint16 offset r*4; block b starts at
+// b*8*K (A) and b*8*ldc (packc C).
+void packc_w13_tail_dispatch(const uint16_t* packed_A, const uint16_t* w13_packed,
+                             uint16_t* C, int rows, int K, int N, int ldc,
+                             const FusedSiluKernelSet& ks) {
+    gemm_params_t p;
+    p.k = K; p.n = N; p.lda = K; p.ldb = K; p.ldc = ldc;
+    const int nb_full = rows / 8;
+    const int m_full = nb_full * 8;
+    if (m_full > 0) {
+        p.m = m_full;
+        ks.m8(packed_A, w13_packed, C, nullptr, &p);
+    }
+    const int tail = rows - m_full;
+    if (tail == 0) return;
+    const uint16_t* At = packed_A + static_cast<int64_t>(nb_full) * 8 * K;
+    uint16_t* Ct = C + static_cast<int64_t>(nb_full) * 8 * ldc;
+    auto run = [&](FusedSiluKernelFn fn, int mr, int r0) {
+        p.m = mr;
+        fn(At + static_cast<int64_t>(r0) * 4, w13_packed,
+           Ct + static_cast<int64_t>(r0) * 4, nullptr, &p);
+    };
+    switch (tail) {
+        case 1: run(ks.m1, 1, 0); break;
+        case 2: run(ks.m2, 2, 0); break;
+        case 3: run(ks.m4, 4, 0); break;              // pad to 4 (row3 = gather-zero)
+        case 4: run(ks.m4, 4, 0); break;
+        // tail 5,6: microbench shows m4+m1/m4+m2 re-reads all of B twice
+        // (508/510us) > pad-to-8 m8 (414us) in the packed world, so pad to 8.
+        case 5: run(ks.m8, 8, 0); break;
+        case 6: run(ks.m8, 8, 0); break;
+        case 7: run(ks.m8, 8, 0); break;              // pad to 8 (rows>=tail = gather-zero)
+    }
+}
+
+// w2 plain fp32 packed-read reorder-m8 tail dispatch (same tail table, rowmajor
+// fp32 store). down / w2_packed already sliced to this thread's N range.
+using PlainPackedKernelFn = void (*)(const uint16_t*, const uint16_t*, float*,
+                                     uint16_t*, const gemm_params_t*);
+void packed_w2_tail_dispatch(const uint16_t* packed_A, const uint16_t* w2_packed,
+                             float* down, int rows, int K, int N, int ldc) {
+    gemm_params_t p;
+    p.k = K; p.n = N; p.lda = K; p.ldb = K; p.ldc = ldc;
+    const int nb_full = rows / 8;
+    const int m_full = nb_full * 8;
+    if (m_full > 0) {
+        p.m = m_full;
+        bf16gemm_k_ldp(packed_A, w2_packed, down, nullptr, &p);
+    }
+    const int tail = rows - m_full;
+    if (tail == 0) return;
+    const uint16_t* At = packed_A + static_cast<int64_t>(nb_full) * 8 * K;
+    float* Dt = down + static_cast<int64_t>(nb_full) * 8 * ldc;
+    auto run = [&](PlainPackedKernelFn fn, int mr, int r0) {
+        p.m = mr;
+        fn(At + static_cast<int64_t>(r0) * 4, w2_packed,
+           Dt + static_cast<int64_t>(r0) * ldc, nullptr, &p);
+    };
+    switch (tail) {
+        case 1: run(bf16gemm_k_ldp_m1, 1, 0); break;
+        case 2: run(bf16gemm_k_ldp_m2, 2, 0); break;
+        case 3: run(bf16gemm_k_ldp_m4, 4, 0); break;
+        case 4: run(bf16gemm_k_ldp_m4, 4, 0); break;
+        // tail 5,6,7: pad to 8 (see packc_w13_tail_dispatch note); same strategy
+        // as w13 so intermediate write/read row counts stay consistent.
+        case 5:
+        case 6:
+        case 7: bf16gemm_k_ldp(At, w2_packed, Dt, nullptr, (p.m = 8, &p)); break;
+    }
+}
+#endif  // __aarch64__
 
 // Bottom-layer fused w13 + SiLU-and-mul over the whole [M] slice: interleaved
 // w13 in B_reo, bf16 output C[M, ldc] (ldc = F_pad4), N = 2*F_pad4 packed
@@ -1671,6 +1835,170 @@ void team_fused_w13_silu(const TeamContext& team, const uint16_t* A,
         ldc,
         degree);
 }
+
+// Pack row-major A[total_rows, K] into the m8 reorder layout the bf16gemm
+// cached path expects, for the 8-row blocks [block_begin, block_end). Rows
+// beyond total_rows are zero-padded. `packed` holds ceil(total_rows/8)*8*K
+// uint16. Cooperative: each team member packs its own block range once into a
+// group-shared buffer, eliminating the per-member repack duplication.
+void pack_a_reorder_m8(const uint16_t* A, uint16_t* packed, int total_rows,
+                       int K, int block_begin, int block_end) {
+    const int kb_count = K / 4;
+    for (int mb = block_begin; mb < block_end; ++mb) {
+        uint16_t* blk = packed + static_cast<int64_t>(mb) * 8 * K;
+        for (int kb = 0; kb < kb_count; ++kb) {
+            uint16_t* base = blk + static_cast<int64_t>(kb) * 32;
+            for (int r = 0; r < 8; ++r) {
+                uint16_t* d = base + r * 4;
+                const int gr = mb * 8 + r;
+                if (gr < total_rows) {
+                    const uint16_t* src =
+                        A + static_cast<int64_t>(gr) * K + kb * 4;
+                    d[0] = src[0]; d[1] = src[1]; d[2] = src[2]; d[3] = src[3];
+                } else {
+                    d[0] = 0; d[1] = 0; d[2] = 0; d[3] = 0;
+                }
+            }
+        }
+    }
+}
+
+// Fused gather + m8 reorder pack: read token rows (token = expert_routes[gr] /
+// top_k) straight from row-major input[H] into the m8 reorder layout the
+// bf16gemm cached path expects, for 8-row blocks [block_begin, block_end).
+// Eliminates the row-major scratch.input round-trip. Rows beyond total_rows and
+// columns beyond H (K padding) are zero-filled. `packed` holds
+// ceil(total_rows/8)*8*K_pad uint16. Bit-identical to gather-to-rowmajor(K_pad)
+// followed by pack_a_reorder_m8.
+void gather_pack_a_reorder_m8(const uint16_t* input, int64_t H,
+                              const int64_t* expert_routes, int64_t top_k,
+                              uint16_t* packed, int total_rows, int K_pad,
+                              int block_begin, int block_end) {
+    const int kb_count = K_pad / 4;
+    const int h_full_kb = static_cast<int>(H) / 4;
+    for (int mb = block_begin; mb < block_end; ++mb) {
+        uint16_t* blk = packed + static_cast<int64_t>(mb) * 8 * K_pad;
+        // Precompute the 8 row source pointers once (token = scattered).
+        const uint16_t* srcs[8];
+        for (int r = 0; r < 8; ++r) {
+            const int gr = mb * 8 + r;
+            srcs[r] = (gr < total_rows)
+                          ? input + (expert_routes[gr] / top_k) * H
+                          : nullptr;
+        }
+        // kb outer, r inner: the 8 rows x 4 cols of each K-block are written as
+        // one contiguous 64-byte cache line before advancing. This avoids the
+        // 8x write amplification of the row-outer order (which touched every
+        // output line 8 times, 8 bytes each). Reads become 8 sequential streams.
+        for (int kb = 0; kb < kb_count; ++kb) {
+            uint16_t* d = blk + static_cast<int64_t>(kb) * 32;  // 64 bytes
+            const int k0 = kb * 4;
+            if (kb < h_full_kb) {
+                for (int r = 0; r < 8; ++r) {
+                    const uint16_t* s = srcs[r];
+                    uint16_t* dr = d + r * 4;
+                    if (s != nullptr) {
+                        dr[0] = s[k0]; dr[1] = s[k0 + 1];
+                        dr[2] = s[k0 + 2]; dr[3] = s[k0 + 3];
+                    } else {
+                        dr[0] = 0; dr[1] = 0; dr[2] = 0; dr[3] = 0;
+                    }
+                }
+            } else {
+                for (int r = 0; r < 8; ++r) {
+                    const uint16_t* s = srcs[r];
+                    uint16_t* dr = d + r * 4;
+                    for (int c = 0; c < 4; ++c) {
+                        const int kcol = k0 + c;
+                        dr[c] = (s != nullptr && kcol < H) ? s[kcol]
+                                                           : static_cast<uint16_t>(0);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// N-split fused w13 + SiLU-and-mul reading a group-shared pre-packed A (m8,
+// M_padded a multiple of 8). Each member computes its kN feature-column slice
+// and writes intermediate directly. No per-member A repack. Caller owns the
+// inter-stage barrier.
+void team_fused_w13_silu_packed(const TeamContext& team,
+                                const uint16_t* packed_A,
+                                const uint16_t* w13_packed,
+                                uint16_t* intermediate, int M_padded, int K,
+                                int N13, int ldc, int64_t degree) {
+    FusedSiluKernelFn k8 = fused_silu_packed_m8_for_degree(degree);
+    TORCH_CHECK(k8 != nullptr, "unsupported fused silu exp degree ", degree);
+    const GemmSplitPlan plan{MoeGemmSplit::kN};
+    const SplitRange range = team_gemm_split_range(
+        plan, M_padded, N13, team.group_size, team.local_tid);
+    if (range.size <= 0) {
+        return;
+    }
+    const int64_t start_block = range.begin / kKernelTile;
+    gemm_params_t p;
+    p.m = M_padded;
+    p.k = K;
+    p.n = static_cast<int>(range.size);
+    p.lda = K;
+    p.ldb = K;
+    p.ldc = ldc;
+    k8(packed_A, w13_packed + start_block * static_cast<int64_t>(K) * kKernelTile,
+       intermediate + range.begin / 2, nullptr, &p);
+}
+
+// N-split fused w13 + SiLU-and-mul with a PACKED-C store (Part 2): identical to
+// team_fused_w13_silu_packed but the epilogue writes `intermediate` directly in
+// the reorder-m8 layout w2 consumes as pre-packed A (no w2 repack). Each member
+// owns a disjoint feature-column N-slice; the packed-C base for that slice is
+// `intermediate + range.begin*4` uint16 (feature-block fb0 = range.begin/8, one
+// K-block = 32 uint16). ldc = w2.K_pad. M_padded a multiple of 8.
+void team_fused_w13_silu_packed_packc(const TeamContext& team,
+                                      const uint16_t* packed_A,
+                                      const uint16_t* w13_packed,
+                                      uint16_t* intermediate, int rows,
+                                      int K, int N13, int ldc, int64_t degree) {
+    const FusedSiluKernelSet ks = fused_silu_packc_set_for_degree(degree);
+    TORCH_CHECK(ks.m8 != nullptr, "unsupported fused silu exp degree ", degree);
+    const GemmSplitPlan plan{MoeGemmSplit::kN};
+    const int M_padded = (rows + 7) / 8 * 8;  // N-split range is over columns
+    const SplitRange range = team_gemm_split_range(
+        plan, M_padded, N13, team.group_size, team.local_tid);
+    if (range.size <= 0) {
+        return;
+    }
+    const int64_t start_block = range.begin / kKernelTile;
+    // m8 over full 8-row blocks + per-tail (rows%8) packed dispatch on this
+    // thread's N-slice. No padding-to-8 compute waste for small experts.
+    packc_w13_tail_dispatch(
+        packed_A,
+        w13_packed + start_block * static_cast<int64_t>(K) * kKernelTile,
+        intermediate + range.begin * 4, rows, K,
+        static_cast<int>(range.size), ldc, ks);
+}
+
+// N-split plain fp32 w2 reading a PACKED intermediate (Part 2): each member
+// computes its disjoint w2.N_pad output-column slice from the shared pre-packed
+// A (the packed intermediate). No per-member repack, no a_reorder. down is
+// row-major fp32 [M_padded, N], ldc = N. M_padded a multiple of 8.
+void team_w2_packed(const TeamContext& team, const uint16_t* packed_A,
+                    const uint16_t* w2_packed, float* down, int rows,
+                    int K, int N, int ldc) {
+    const GemmSplitPlan plan{MoeGemmSplit::kN};
+    const int M_padded = (rows + 7) / 8 * 8;
+    const SplitRange range = team_gemm_split_range(
+        plan, M_padded, N, team.group_size, team.local_tid);
+    if (range.size <= 0) {
+        return;
+    }
+    const int64_t start_block = range.begin / kKernelTile;
+    // m8 full blocks + same per-tail dispatch as w13 (fp32 rowmajor store).
+    packed_w2_tail_dispatch(
+        packed_A,
+        w2_packed + start_block * static_cast<int64_t>(K) * kKernelTile,
+        down + range.begin, rows, K, static_cast<int>(range.size), ldc);
+}
 #endif  // __aarch64__
 
 struct HierarchicalNSplitConfig {
@@ -1722,6 +2050,34 @@ struct MoePhaseTraceRecord {
     double ms = 0.0;
 };
 
+// Allocator that default-initializes (rather than value-initializes) elements,
+// so vector::resize() on a trivial type allocates WITHOUT zeroing. Used for
+// scratch buffers that are fully overwritten before being read (packed_a is
+// fully written by the gather+pack; down is fully written by w2). intermediate
+// keeps the default zeroing allocator because w2 reads its padding
+// feature-blocks, which must stay zero.
+template <typename T, typename Base = std::allocator<T>>
+struct default_init_allocator : Base {
+    using base_traits = std::allocator_traits<Base>;
+    template <typename U>
+    struct rebind {
+        using other = default_init_allocator<
+            U, typename base_traits::template rebind_alloc<U>>;
+    };
+    using Base::Base;
+    default_init_allocator() noexcept = default;
+    template <typename U>
+    void construct(U* ptr) noexcept(
+        std::is_nothrow_default_constructible<U>::value) {
+        ::new (static_cast<void*>(ptr)) U;  // default-init: no zero for scalars
+    }
+    template <typename U, typename... Args>
+    void construct(U* ptr, Args&&... args) {
+        base_traits::construct(static_cast<Base&>(*this), ptr,
+                               std::forward<Args>(args)...);
+    }
+};
+
 struct HierarchicalGroupScratch {
     explicit HierarchicalGroupScratch(int64_t group_size)
         : barrier(group_size) {}
@@ -1729,8 +2085,9 @@ struct HierarchicalGroupScratch {
     std::vector<uint16_t> input;
     std::vector<uint16_t> intermediate;
     std::vector<uint16_t> a_reorder;
+    std::vector<uint16_t, default_init_allocator<uint16_t>> packed_a;
     std::vector<float> gate_up;
-    std::vector<float> down;
+    std::vector<float, default_init_allocator<float>> down;
     std::atomic<int64_t> current_expert{-1};
     ThreadBarrier barrier;
 };
@@ -3293,6 +3650,177 @@ at::Tensor fused_moe_test_team_fused_w13_silu(at::Tensor A, at::Tensor w13,
 #endif
 }
 
+// Test-only: pack row-major A[total_rows, K] into the m8 reorder layout via
+// pack_a_reorder_m8 over all 8-row blocks. K must be a multiple of 4. Returns a
+// flat bf16 buffer of length ceil(total_rows/8)*8*K.
+at::Tensor fused_moe_test_pack_a_reorder_m8(at::Tensor A) {
+#ifndef __aarch64__
+    TORCH_CHECK(false, "fused_moe_test_pack_a_reorder_m8 requires AArch64");
+#else
+    check_bf16_cpu(A, "A");
+    TORCH_CHECK(A.dim() == 2, "A must be 2-D [total_rows, K]");
+    A = A.contiguous();
+    const int64_t total_rows = A.size(0);
+    const int64_t K = A.size(1);
+    TORCH_CHECK(K % 4 == 0, "K must be a multiple of 4, got ", K);
+    const int64_t nb = (total_rows + 7) / 8;
+    at::Tensor out = at::zeros({nb * 8 * K},
+                               at::TensorOptions().dtype(at::kBFloat16));
+    pack_a_reorder_m8(bf16_data_const(A), bf16_data(out),
+                      static_cast<int>(total_rows), static_cast<int>(K),
+                      0, static_cast<int>(nb));
+    return out;
+#endif
+}
+
+// Test-only: fused gather + m8 reorder pack. input[num_tokens, H] bf16, routes
+// [rows] int64 (flat indices; token = flat / top_k). Returns a flat bf16 buffer
+// of length ceil(rows/8)*8*K_pad, bit-identical to gather-to-rowmajor(K_pad)
+// followed by pack_a_reorder_m8.
+at::Tensor fused_moe_test_gather_pack_a_reorder_m8(at::Tensor input,
+                                                   at::Tensor routes,
+                                                   int64_t top_k,
+                                                   int64_t K_pad) {
+#ifndef __aarch64__
+    TORCH_CHECK(false,
+                "fused_moe_test_gather_pack_a_reorder_m8 requires AArch64");
+#else
+    check_bf16_cpu(input, "input");
+    TORCH_CHECK(input.dim() == 2, "input must be 2-D [num_tokens, H]");
+    TORCH_CHECK(routes.dim() == 1, "routes must be 1-D [rows]");
+    TORCH_CHECK(routes.scalar_type() == at::kLong, "routes must be int64");
+    TORCH_CHECK(top_k > 0, "top_k must be positive");
+    TORCH_CHECK(K_pad % 4 == 0, "K_pad must be a multiple of 4, got ", K_pad);
+    input = input.contiguous();
+    routes = routes.contiguous();
+    const int64_t H = input.size(1);
+    const int64_t rows = routes.size(0);
+    TORCH_CHECK(K_pad >= H, "K_pad must be >= H");
+    const int64_t nb = (rows + 7) / 8;
+    at::Tensor out = at::zeros({nb * 8 * K_pad},
+                               at::TensorOptions().dtype(at::kBFloat16));
+    gather_pack_a_reorder_m8(bf16_data_const(input), H,
+                             routes.data_ptr<int64_t>(), top_k,
+                             bf16_data(out), static_cast<int>(rows),
+                             static_cast<int>(K_pad), 0,
+                             static_cast<int>(nb));
+    return out;
+#endif
+}
+
+// Test-only: fused w13 SiLU-and-mul with a packed-C (reorder-m8) store. Pads M
+// to a multiple of 8, pre-packs A, runs the packc m8 kernel, and returns the
+// packed intermediate as a flat bf16 buffer of length ceil(M/8)*8*F_pad4. Must
+// equal fused_moe_test_fused_w13_silu (row-major) padded to [ceil8(M), F_pad4]
+// then packed via pack_a_reorder_m8.
+at::Tensor fused_moe_test_fused_w13_silu_packc_tail(at::Tensor A, at::Tensor w13,
+                                                    int64_t degree) {
+#ifndef __aarch64__
+    TORCH_CHECK(false, "fused_moe_test_fused_w13_silu_packc_tail requires AArch64");
+#else
+    check_bf16_cpu(A, "A");
+    check_bf16_cpu(w13, "w13");
+    TORCH_CHECK(A.dim() == 2, "A must be 2-D [M, H]");
+    TORCH_CHECK(w13.dim() == 2, "w13 must be 2-D [2F, H]");
+    A = A.contiguous();
+    w13 = w13.contiguous();
+    const int64_t M = A.size(0);
+    const int64_t H = A.size(1);
+    const int64_t N13 = w13.size(0);
+    TORCH_CHECK(w13.size(1) == H, "w13 second dim must equal H=", H);
+    TORCH_CHECK(N13 % 2 == 0, "w13 output dim must be even, got ", N13);
+    const int64_t F = N13 / 2;
+    check_positive_int(M, "M");
+    check_positive_int(H, "H");
+    const int64_t K_pad = ceil_to_multiple(H, kKernelTile);
+    const int64_t F_pad4 = ceil_to_multiple(F, 4);
+    const int64_t N_pad = 2 * F_pad4;
+    const int64_t Mp = ceil_to_multiple(M, kKernelTile);
+
+    std::vector<uint16_t> packed(
+        static_cast<size_t>(K_pad * N_pad), static_cast<uint16_t>(0));
+    pack_transposed_expert_weight_interleaved(bf16_data_const(w13), 0, F, H,
+                                              K_pad, N_pad, packed.data());
+    std::vector<uint16_t> a_pad(
+        static_cast<size_t>(M * K_pad), static_cast<uint16_t>(0));
+    const uint16_t* a_src = bf16_data_const(A);
+    for (int64_t m = 0; m < M; ++m) {
+        std::copy(a_src + m * H, a_src + m * H + H, a_pad.data() + m * K_pad);
+    }
+    std::vector<uint16_t> packed_a(
+        static_cast<size_t>(Mp * K_pad), static_cast<uint16_t>(0));
+    pack_a_reorder_m8(a_pad.data(), packed_a.data(), static_cast<int>(M),
+                      static_cast<int>(K_pad), 0, static_cast<int>(Mp / 8));
+
+    at::Tensor C = at::zeros({Mp * F_pad4},
+                             at::TensorOptions().dtype(at::kBFloat16));
+    const FusedSiluKernelSet ks = fused_silu_packc_set_for_degree(degree);
+    TORCH_CHECK(ks.m8 != nullptr, "unsupported fused silu exp degree ", degree);
+    packc_w13_tail_dispatch(packed_a.data(), packed.data(), bf16_data(C),
+                            static_cast<int>(M), static_cast<int>(K_pad),
+                            static_cast<int>(N_pad), static_cast<int>(F_pad4),
+                            ks);
+    return C;
+#endif
+}
+
+at::Tensor fused_moe_test_fused_w13_silu_packc(at::Tensor A, at::Tensor w13,
+                                               int64_t degree) {
+#ifndef __aarch64__
+    TORCH_CHECK(false, "fused_moe_test_fused_w13_silu_packc requires AArch64");
+#else
+    check_bf16_cpu(A, "A");
+    check_bf16_cpu(w13, "w13");
+    TORCH_CHECK(A.dim() == 2, "A must be 2-D [M, H]");
+    TORCH_CHECK(w13.dim() == 2, "w13 must be 2-D [2F, H]");
+    A = A.contiguous();
+    w13 = w13.contiguous();
+    const int64_t M = A.size(0);
+    const int64_t H = A.size(1);
+    const int64_t N13 = w13.size(0);
+    TORCH_CHECK(w13.size(1) == H, "w13 second dim must equal H=", H);
+    TORCH_CHECK(N13 % 2 == 0, "w13 output dim must be even, got ", N13);
+    const int64_t F = N13 / 2;
+    check_positive_int(M, "M");
+    check_positive_int(H, "H");
+
+    const int64_t K_pad = ceil_to_multiple(H, kKernelTile);
+    const int64_t F_pad4 = ceil_to_multiple(F, 4);
+    const int64_t N_pad = 2 * F_pad4;
+    const int64_t Mp = ceil_to_multiple(M, kKernelTile);
+
+    std::vector<uint16_t> packed(
+        static_cast<size_t>(K_pad * N_pad), static_cast<uint16_t>(0));
+    pack_transposed_expert_weight_interleaved(bf16_data_const(w13), 0, F, H,
+                                              K_pad, N_pad, packed.data());
+
+    std::vector<uint16_t> a_pad(
+        static_cast<size_t>(M * K_pad), static_cast<uint16_t>(0));
+    const uint16_t* a_src = bf16_data_const(A);
+    for (int64_t m = 0; m < M; ++m) {
+        std::copy(a_src + m * H, a_src + m * H + H, a_pad.data() + m * K_pad);
+    }
+    std::vector<uint16_t> packed_a(
+        static_cast<size_t>(Mp * K_pad), static_cast<uint16_t>(0));
+    pack_a_reorder_m8(a_pad.data(), packed_a.data(), static_cast<int>(M),
+                      static_cast<int>(K_pad), 0, static_cast<int>(Mp / 8));
+
+    at::Tensor C = at::zeros({Mp * F_pad4},
+                             at::TensorOptions().dtype(at::kBFloat16));
+    FusedSiluKernelFn k8 = fused_silu_packc_m8_for_degree(degree);
+    TORCH_CHECK(k8 != nullptr, "unsupported fused silu exp degree ", degree);
+    gemm_params_t p;
+    p.m = static_cast<int>(Mp);
+    p.k = static_cast<int>(K_pad);
+    p.n = static_cast<int>(N_pad);
+    p.lda = static_cast<int>(K_pad);
+    p.ldb = static_cast<int>(K_pad);
+    p.ldc = static_cast<int>(F_pad4);
+    k8(packed_a.data(), packed.data(), bf16_data(C), nullptr, &p);
+    return C;
+#endif
+}
+
 // Test-only: run the middle-layer team_gemm on the resident thread pool for a
 // dense A[M,K] x B[N,K]^T -> C[M,N] (fp32). split is "m", "n", or "auto".
 at::Tensor fused_moe_test_team_gemm(at::Tensor A,
@@ -3460,6 +3988,72 @@ std::vector<double> fused_moe_bench_team_gemm(at::Tensor A,
             }
         }
     });
+    return times_ms;
+#endif
+}
+
+// GEMM-only microbench for the w13 fused-silu packc path (single thread, weight
+// packed once outside the loop). mode 0 = per-tail dispatch over `rows`; mode 1
+// = always-pad-to-8 m8. Returns per-run milliseconds (length `runs`).
+std::vector<double> fused_moe_bench_fused_w13_silu_packc_tail(
+    at::Tensor A, at::Tensor w13, int64_t degree, int64_t mode,
+    int64_t warmup, int64_t runs) {
+#ifndef __aarch64__
+    TORCH_CHECK(false, "requires AArch64");
+#else
+    check_bf16_cpu(A, "A");
+    check_bf16_cpu(w13, "w13");
+    A = A.contiguous();
+    w13 = w13.contiguous();
+    const int64_t M = A.size(0);
+    const int64_t H = A.size(1);
+    const int64_t N13 = w13.size(0);
+    const int64_t F = N13 / 2;
+    const int64_t K_pad = ceil_to_multiple(H, kKernelTile);
+    const int64_t F_pad4 = ceil_to_multiple(F, 4);
+    const int64_t N_pad = 2 * F_pad4;
+    const int64_t Mp = ceil_to_multiple(M, kKernelTile);
+    std::vector<uint16_t> packed(
+        static_cast<size_t>(K_pad * N_pad), static_cast<uint16_t>(0));
+    pack_transposed_expert_weight_interleaved(bf16_data_const(w13), 0, F, H,
+                                              K_pad, N_pad, packed.data());
+    std::vector<uint16_t> a_pad(
+        static_cast<size_t>(M * K_pad), static_cast<uint16_t>(0));
+    const uint16_t* a_src = bf16_data_const(A);
+    for (int64_t m = 0; m < M; ++m) {
+        std::copy(a_src + m * H, a_src + m * H + H, a_pad.data() + m * K_pad);
+    }
+    std::vector<uint16_t> packed_a(
+        static_cast<size_t>(Mp * K_pad), static_cast<uint16_t>(0));
+    pack_a_reorder_m8(a_pad.data(), packed_a.data(), static_cast<int>(M),
+                      static_cast<int>(K_pad), 0, static_cast<int>(Mp / 8));
+    std::vector<uint16_t> C(static_cast<size_t>(Mp * F_pad4), 0);
+    const FusedSiluKernelSet ks = fused_silu_packc_set_for_degree(degree);
+    TORCH_CHECK(ks.m8 != nullptr, "bad degree");
+    auto once = [&]() {
+        if (mode == 0) {
+            packc_w13_tail_dispatch(packed_a.data(), packed.data(), C.data(),
+                                    static_cast<int>(M), static_cast<int>(K_pad),
+                                    static_cast<int>(N_pad),
+                                    static_cast<int>(F_pad4), ks);
+        } else {
+            gemm_params_t p;
+            p.m = static_cast<int>(Mp);
+            p.k = static_cast<int>(K_pad);
+            p.n = static_cast<int>(N_pad);
+            p.lda = static_cast<int>(K_pad);
+            p.ldb = static_cast<int>(K_pad);
+            p.ldc = static_cast<int>(F_pad4);
+            ks.m8(packed_a.data(), packed.data(), C.data(), nullptr, &p);
+        }
+    };
+    for (int64_t r = 0; r < warmup; ++r) once();
+    std::vector<double> times_ms(static_cast<size_t>(runs), 0.0);
+    for (int64_t r = 0; r < runs; ++r) {
+        const auto t0 = ::fused_cpp::profile::now();
+        once();
+        times_ms[static_cast<size_t>(r)] = ::fused_cpp::profile::elapsed_ms(t0);
+    }
     return times_ms;
 #endif
 }
@@ -3715,6 +4309,26 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
                     silu_poly_degree);
     }
     const bool use_hierarchical_nsplit = nsplit_config.enabled;
+    // Shared A pre-pack for the fused N-split path (opt-in, default OFF).
+    // Benchmarks showed no benefit: the A-pack write is a one-time M*K store,
+    // dwarfed by the repeated cached A-reads + compute, so de-duplicating it
+    // changes nothing. Kept behind a flag for experimentation.
+    bool fused_shared_apack = false;
+    if (env_has_value("FUSED_CPP_MOE_FUSED_SHARED_APACK")) {
+        fused_shared_apack = env_flag_enabled("FUSED_CPP_MOE_FUSED_SHARED_APACK");
+    }
+    // packA fusion: fold the A repack into the gather (w13, Part 1) and the
+    // w13 epilogue store (w2, Part 2), so the GEMM kernels only compute and the
+    // per-thread a_reorder scratch is no longer needed. Default ON; set 0 to
+    // fall back to the row-major gather + in-kernel repack path.
+    bool fused_packa = true;
+    if (env_has_value("FUSED_CPP_MOE_FUSED_PACKA")) {
+        fused_packa = env_flag_enabled("FUSED_CPP_MOE_FUSED_PACKA");
+    }
+    // Part 2 (packed intermediate + packed-read w2) additionally requires w2 to
+    // have no bias (the packed-read w2 kernel has no bias variant). When w2 has
+    // bias, only Part 1 applies and w2 falls back to the row-major repack path.
+    const bool fused_packa_w2 = fused_packa && (w2_bias_base == nullptr);
     const char* moe_trace_strategy =
         use_hierarchical_nsplit
             ? "hierarchical_mn_split_dynamic_expert"
@@ -4006,6 +4620,18 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
         }
         const int64_t a_reorder_stride =
             max_expert_rows * std::max(w13.K_pad, w2.K_pad) * 2;
+        const bool stage_timing =
+            env_flag_enabled("FUSED_CPP_MOE_STAGE_TIMING");
+        double stage_alloc_ms = 0.0;
+        // packA fusion frees the per-thread A-reorder scratch (the dominant
+        // per-call alloc, ~268MB at G=8): w13 reads packed_a (Part 1) and, with
+        // Part 2, w2 reads the packed intermediate — neither repacks. Also skip
+        // the row-major input (gather writes packed_a directly) and gate_up
+        // (only used by the non-fused activation path).
+        const bool packa_skip_reorder = fuse_silu && fused_packa_w2;
+        const bool packa_skip_input = fuse_silu && fused_packa;
+        const bool packa_skip_gate_up = fuse_silu;
+        const auto stage_alloc_t0 = ::fused_cpp::profile::now();
         std::vector<std::unique_ptr<HierarchicalGroupScratch>>
             group_scratches;
         group_scratches.reserve(static_cast<size_t>(nsplit_total_groups));
@@ -4013,17 +4639,21 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
             auto scratch = std::make_unique<HierarchicalGroupScratch>(
                 nsplit_group_size);
             scratch->input.resize(static_cast<size_t>(
-                max_expert_rows * w13.K_pad));
+                packa_skip_input ? 0 : max_expert_rows * w13.K_pad));
             scratch->intermediate.resize(static_cast<size_t>(
-                max_expert_rows * w2.K_pad));
+                (max_expert_rows + 7) / 8 * 8 * w2.K_pad));
+            scratch->packed_a.resize(static_cast<size_t>(
+                (max_expert_rows + 7) / 8 * 8 * w13.K_pad));
             scratch->a_reorder.resize(static_cast<size_t>(
-                nsplit_group_size * a_reorder_stride));
+                packa_skip_reorder ? 0
+                                   : nsplit_group_size * a_reorder_stride));
             scratch->gate_up.resize(static_cast<size_t>(
-                max_expert_rows * w13.N_pad));
+                packa_skip_gate_up ? 0 : max_expert_rows * w13.N_pad));
             scratch->down.resize(static_cast<size_t>(
-                max_expert_rows * w2.N_pad));
+                (max_expert_rows + 7) / 8 * 8 * w2.N_pad));
             group_scratches.push_back(std::move(scratch));
         }
+        stage_alloc_ms = ::fused_cpp::profile::elapsed_ms(stage_alloc_t0);
 
         ThreadPinningConfig nsplit_pinning;
         nsplit_pinning.enabled = true;
@@ -4036,8 +4666,10 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
             HierarchicalGroupScratch& scratch =
                 *group_scratches[static_cast<size_t>(group)];
             ThreadBarrier& barrier = scratch.barrier;
-            uint16_t* a_reorder = scratch.a_reorder.data() +
-                local_tid * a_reorder_stride;
+            uint16_t* a_reorder =
+                scratch.a_reorder.empty()
+                    ? nullptr
+                    : scratch.a_reorder.data() + local_tid * a_reorder_stride;
 
             while (true) {
                 if (local_tid == 0) {
@@ -4075,7 +4707,21 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
                 const int64_t rows = static_cast<int64_t>(
                     expert_routes.size());
 
-                {
+                if (fuse_silu && fused_packa) {
+                    // Fused gather + m8 reorder pack (Part 1): write the w13 A
+                    // directly into the packed layout, skipping the row-major
+                    // scratch.input round-trip and the in-kernel repack. Split
+                    // by 8-row blocks so each member packs whole blocks.
+                    const int64_t nb = (rows + 7) / 8;
+                    const SplitRange brange = split_evenly(
+                        nb, nsplit_group_size, local_tid);
+                    gather_pack_a_reorder_m8(
+                        input_ptr, H, expert_routes.data(), top_k,
+                        scratch.packed_a.data(), static_cast<int>(rows),
+                        static_cast<int>(w13.K_pad),
+                        static_cast<int>(brange.begin),
+                        static_cast<int>(brange.begin + brange.size));
+                } else {
                     // Parallel gather: each team thread copies its own row
                     // slice (was serial on local_tid==0 with the rest idle).
                     const SplitRange grange = split_evenly(
@@ -4106,17 +4752,71 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
                     team.local_tid = local_tid;
                     team.barrier = nullptr;
                     team.a_reorder = a_reorder;
-                    team_fused_w13_silu(
-                        team,
-                        scratch.input.data(),
-                        w13_ptr + expert * w13.packed_stride,
-                        scratch.intermediate.data(),
-                        static_cast<int>(rows),
-                        static_cast<int>(w13.K_pad),
-                        static_cast<int>(w13.N_pad),
-                        static_cast<int>(w2.K_pad),
-                        silu_poly_degree);
-                    barrier.wait();
+                    if (fused_packa) {
+                        // A already packed by the fused gather+pack stage; run
+                        // the packed-read fused kernel on the N-slice, no repack.
+                        // With Part 2 (fused_packa_w2) the epilogue writes the
+                        // intermediate directly in w2 pre-packed layout.
+                        const int64_t nb = (rows + 7) / 8;
+                        if (fused_packa_w2) {
+                            team_fused_w13_silu_packed_packc(
+                                team, scratch.packed_a.data(),
+                                w13_ptr + expert * w13.packed_stride,
+                                scratch.intermediate.data(),
+                                static_cast<int>(rows),
+                                static_cast<int>(w13.K_pad),
+                                static_cast<int>(w13.N_pad),
+                                static_cast<int>(w2.K_pad),
+                                silu_poly_degree);
+                        } else {
+                            team_fused_w13_silu_packed(
+                                team, scratch.packed_a.data(),
+                                w13_ptr + expert * w13.packed_stride,
+                                scratch.intermediate.data(),
+                                static_cast<int>(nb * 8),
+                                static_cast<int>(w13.K_pad),
+                                static_cast<int>(w13.N_pad),
+                                static_cast<int>(w2.K_pad),
+                                silu_poly_degree);
+                        }
+                        barrier.wait();
+                    } else if (fused_shared_apack) {
+                        // Pack the w13 A once into the group-shared buffer
+                        // (each member packs its 8-row block range), then all
+                        // members read it for their N-slice: no G-fold repack.
+                        const int64_t nb = (rows + 7) / 8;
+                        const SplitRange brange = split_evenly(
+                            nb, nsplit_group_size, local_tid);
+                        pack_a_reorder_m8(
+                            scratch.input.data(), scratch.packed_a.data(),
+                            static_cast<int>(rows),
+                            static_cast<int>(w13.K_pad),
+                            static_cast<int>(brange.begin),
+                            static_cast<int>(brange.begin + brange.size));
+                        barrier.wait();
+                        team_fused_w13_silu_packed(
+                            team, scratch.packed_a.data(),
+                            w13_ptr + expert * w13.packed_stride,
+                            scratch.intermediate.data(),
+                            static_cast<int>(nb * 8),
+                            static_cast<int>(w13.K_pad),
+                            static_cast<int>(w13.N_pad),
+                            static_cast<int>(w2.K_pad),
+                            silu_poly_degree);
+                        barrier.wait();
+                    } else {
+                        team_fused_w13_silu(
+                            team,
+                            scratch.input.data(),
+                            w13_ptr + expert * w13.packed_stride,
+                            scratch.intermediate.data(),
+                            static_cast<int>(rows),
+                            static_cast<int>(w13.K_pad),
+                            static_cast<int>(w13.N_pad),
+                            static_cast<int>(w2.K_pad),
+                            silu_poly_degree);
+                        barrier.wait();
+                    }
                 } else {
                     trace_dispatch_fp32_gemm_stage_split(
                         moe_trace,
@@ -4152,29 +4852,47 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
                     barrier.wait();
                 }
 
-                trace_dispatch_fp32_gemm_stage_split(
-                    moe_trace,
-                    "w2",
-                    MoeGemmStage::kW2,
-                    tid,
-                    -1,
-                    group,
-                    local_tid,
-                    expert,
-                    0,
-                    rows,
-                    scratch.intermediate.data(),
-                    w2_ptr + expert * w2.packed_stride,
-                    scratch.down.data(),
-                    a_reorder,
-                    static_cast<int>(rows),
-                    static_cast<int>(w2.K_pad),
-                    static_cast<int>(w2.N_pad),
-                    static_cast<int>(w2.N_pad),
-                    nsplit_group_size,
-                    w2_bias_base != nullptr
-                        ? w2_bias_base + expert * w2.N_pad
-                        : nullptr);
+                if (fused_packa_w2) {
+                    // w2 reads the PACKED intermediate directly (no repack);
+                    // N-split over w2.N_pad. M padded to a multiple of 8.
+                    TeamContext w2team;
+                    w2team.group_size = nsplit_group_size;
+                    w2team.local_tid = local_tid;
+                    w2team.barrier = nullptr;
+                    w2team.a_reorder = a_reorder;
+                    team_w2_packed(
+                        w2team, scratch.intermediate.data(),
+                        w2_ptr + expert * w2.packed_stride,
+                        scratch.down.data(),
+                        static_cast<int>(rows),
+                        static_cast<int>(w2.K_pad),
+                        static_cast<int>(w2.N_pad),
+                        static_cast<int>(w2.N_pad));
+                } else {
+                    trace_dispatch_fp32_gemm_stage_split(
+                        moe_trace,
+                        "w2",
+                        MoeGemmStage::kW2,
+                        tid,
+                        -1,
+                        group,
+                        local_tid,
+                        expert,
+                        0,
+                        rows,
+                        scratch.intermediate.data(),
+                        w2_ptr + expert * w2.packed_stride,
+                        scratch.down.data(),
+                        a_reorder,
+                        static_cast<int>(rows),
+                        static_cast<int>(w2.K_pad),
+                        static_cast<int>(w2.N_pad),
+                        static_cast<int>(w2.N_pad),
+                        nsplit_group_size,
+                        w2_bias_base != nullptr
+                            ? w2_bias_base + expert * w2.N_pad
+                            : nullptr);
+                }
                 barrier.wait();
 
                 const int64_t h_blocks = w2.N_pad / kKernelTile;
@@ -4225,6 +4943,12 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
             }
         });
 
+        if (stage_timing) {
+            std::fprintf(stderr,
+                "[fused_moe_bf16_tiled][stage_timing] threads=%lld "
+                "scratch_alloc_ms=%.3f\n",
+                static_cast<long long>(actual_threads), stage_alloc_ms);
+        }
         if (schedule_debug_level > 0) {
             int64_t longest_group = -1;
             int64_t shortest_group = -1;

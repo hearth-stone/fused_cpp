@@ -147,6 +147,15 @@ at::Tensor fused_moe_test_fused_w13_silu(at::Tensor A, at::Tensor w13,
 at::Tensor fused_moe_test_team_fused_w13_silu(at::Tensor A, at::Tensor w13,
                                               int64_t group_size,
                                               int64_t degree);
+at::Tensor fused_moe_test_pack_a_reorder_m8(at::Tensor A);
+at::Tensor fused_moe_test_gather_pack_a_reorder_m8(at::Tensor input,
+                                                   at::Tensor routes,
+                                                   int64_t top_k,
+                                                   int64_t K_pad);
+at::Tensor fused_moe_test_fused_w13_silu_packc(at::Tensor A, at::Tensor w13,
+                                               int64_t degree);
+at::Tensor fused_moe_test_fused_w13_silu_packc_tail(at::Tensor A, at::Tensor w13,
+                                                    int64_t degree);
 at::Tensor fused_moe_test_team_gemm(at::Tensor A,
                                     at::Tensor B,
                                     int64_t group_size,
@@ -159,6 +168,9 @@ std::vector<double> fused_moe_bench_team_gemm(at::Tensor A,
                                               c10::optional<at::Tensor> bias,
                                               int64_t warmup,
                                               int64_t runs);
+std::vector<double> fused_moe_bench_fused_w13_silu_packc_tail(
+    at::Tensor A, at::Tensor w13, int64_t degree, int64_t mode,
+    int64_t warmup, int64_t runs);
 std::tuple<at::Tensor, int64_t, int64_t, at::Tensor, int64_t, int64_t>
 fused_moe_bf16_tiled_prepare_weights(at::Tensor w13_weight,
                                       at::Tensor w2_weight,
@@ -1269,6 +1281,49 @@ PYBIND11_MODULE(_C, m) {
           py::arg("w13"),
           py::arg("group_size"),
           py::arg("degree") = 5,
+          py::call_guard<py::gil_scoped_release>());
+
+    m.def("fused_moe_test_pack_a_reorder_m8",
+          &fused_moe_test_pack_a_reorder_m8,
+          "Test-only: pack row-major A[rows,K] into the m8 reorder layout.",
+          py::arg("A"),
+          py::call_guard<py::gil_scoped_release>());
+
+    m.def("fused_moe_test_fused_w13_silu_packc",
+          &fused_moe_test_fused_w13_silu_packc,
+          "Test-only: fused w13 SiLU-and-mul with packed-C (reorder-m8) store. "
+          "Returns the packed intermediate; equals row-major fused padded+packed.",
+          py::arg("A"),
+          py::arg("w13"),
+          py::arg("degree") = 5,
+          py::call_guard<py::gil_scoped_release>());
+
+    m.def("fused_moe_bench_fused_w13_silu_packc_tail",
+          &fused_moe_bench_fused_w13_silu_packc_tail,
+          "GEMM-only microbench: w13 fused-silu packc, mode 0=per-tail dispatch, "
+          "1=pad-to-8 m8. Returns per-run ms.",
+          py::arg("A"), py::arg("w13"), py::arg("degree") = 5,
+          py::arg("mode") = 0, py::arg("warmup") = 20, py::arg("runs") = 100,
+          py::call_guard<py::gil_scoped_release>());
+
+    m.def("fused_moe_test_fused_w13_silu_packc_tail",
+          &fused_moe_test_fused_w13_silu_packc_tail,
+          "Test-only: fused w13 SiLU-and-mul packed-C with per-tail (rows%8) "
+          "dispatch (m8 full + packed-read reorder-m8 tail kernels). Equals "
+          "fused_moe_test_fused_w13_silu_packc for any M.",
+          py::arg("A"),
+          py::arg("w13"),
+          py::arg("degree") = 5,
+          py::call_guard<py::gil_scoped_release>());
+
+    m.def("fused_moe_test_gather_pack_a_reorder_m8",
+          &fused_moe_test_gather_pack_a_reorder_m8,
+          "Test-only: fused gather + m8 reorder pack from input tokens. "
+          "Bit-identical to gather-to-rowmajor + pack_a_reorder_m8.",
+          py::arg("input"),
+          py::arg("routes"),
+          py::arg("top_k"),
+          py::arg("K_pad"),
           py::call_guard<py::gil_scoped_release>());
 
     m.def("fused_moe_test_team_gemm",
