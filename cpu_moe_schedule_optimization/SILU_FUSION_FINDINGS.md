@@ -258,3 +258,23 @@ tail 5/6 改 pad8)。此外 packed 尾核 M=1,2(240us)比 repack(170us)略慢—
 | 2048(大 M) | 1 | 0.28 | 0.28(不变,仍 3.6×) |
 
 小 M padding 回归被彻底消除(avg 1.5 从 1.26 → 0.95),大 M 无影响。
+
+
+---
+
+# scratch buffer 首次缺页:THP(默认开)
+
+免清零后,packed_a/down 的成本从"串行清零"变成"gather/w2 首次写时的 mmap 缺页"
+(每 4KB 页一次内核陷入 + 清零)。本机基础页 4KB、THP=madvise(不自动),故大 buffer
+用 4KB 页,单专家 M=2048 每次调用 ~16000 次缺页。
+
+对 packed_a/down/intermediate `madvise(MADV_HUGEPAGE)`(默认开,`FUSED_CPP_MOE_THP=0`
+可关;非 Linux / THP=never 时安全 no-op;4KB 对齐后 2MB 对齐的内部区域收敛为大页):
+
+| M | THP off e2e / 缺页 | THP on e2e / 缺页 |
+|---|---|---|
+| 2048 | 31.9ms / 16128 | **27.8ms / 1085**(-13%,15×) |
+| 4096 | 68.4ms / 39996 | **55.6ms / 1702**(-19%,23×) |
+
+单专家累计:M=2048 37→32(免清零)→**27.8**(+THP);M=4096 86.6→67→**55.6**。
+跨调用 buffer 池可进一步把"首次一次"也 amortize 掉(未做)。
