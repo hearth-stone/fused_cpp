@@ -5252,6 +5252,7 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
             }
         }
     };
+    const auto merge_t0 = ::fused_cpp::profile::now();
     if (!skip_weighted) {
         if (use_hierarchical_nsplit) {
             ThreadPinningConfig nsplit_pinning;
@@ -5262,6 +5263,13 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
         } else {
             run_fixed_threads(actual_threads, merge_routes);
         }
+    }
+    if (stage_timing && !skip_weighted) {
+        std::fprintf(stderr,
+            "[fused_moe_bf16_tiled][stage_timing] merge_routes_ms=%.3f "
+            "(top_k=%lld weighted reduce+bf16, all threads)\n",
+            ::fused_cpp::profile::elapsed_ms(merge_t0),
+            static_cast<long long>(top_k));
     }
 
     if (moe_trace.enabled()) {
