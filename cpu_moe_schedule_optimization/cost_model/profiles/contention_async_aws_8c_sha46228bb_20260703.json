@@ -21,90 +21,194 @@
     "path": "fused_moe_bf16_tiled_async",
     "pinning": "interval (thread_cpu_ids, disjoint per task)",
     "omp_proc_bind": "FALSE",
-    "runs": 20,
+    "runs": 30,
     "warmup": 5,
     "derate": "makespan / max_i T_iso(R, threads_i)"
   },
   "routes": [
+    4,
+    8,
+    16,
+    32,
     64,
     512,
     2048
   ],
   "isolated": [
     {
+      "routes": 4,
+      "threads": 1,
+      "median_ns": 414420
+    },
+    {
+      "routes": 4,
+      "threads": 2,
+      "median_ns": 314486
+    },
+    {
+      "routes": 4,
+      "threads": 4,
+      "median_ns": 225245
+    },
+    {
+      "routes": 4,
+      "threads": 6,
+      "median_ns": 204938
+    },
+    {
+      "routes": 4,
+      "threads": 8,
+      "median_ns": 198426
+    },
+    {
+      "routes": 8,
+      "threads": 1,
+      "median_ns": 872399
+    },
+    {
+      "routes": 8,
+      "threads": 2,
+      "median_ns": 548697
+    },
+    {
+      "routes": 8,
+      "threads": 4,
+      "median_ns": 349838
+    },
+    {
+      "routes": 8,
+      "threads": 6,
+      "median_ns": 287899
+    },
+    {
+      "routes": 8,
+      "threads": 8,
+      "median_ns": 249391
+    },
+    {
+      "routes": 16,
+      "threads": 1,
+      "median_ns": 1514058
+    },
+    {
+      "routes": 16,
+      "threads": 2,
+      "median_ns": 826209
+    },
+    {
+      "routes": 16,
+      "threads": 4,
+      "median_ns": 545466
+    },
+    {
+      "routes": 16,
+      "threads": 6,
+      "median_ns": 423104
+    },
+    {
+      "routes": 16,
+      "threads": 8,
+      "median_ns": 366334
+    },
+    {
+      "routes": 32,
+      "threads": 1,
+      "median_ns": 2882135
+    },
+    {
+      "routes": 32,
+      "threads": 2,
+      "median_ns": 1535024
+    },
+    {
+      "routes": 32,
+      "threads": 4,
+      "median_ns": 924389
+    },
+    {
+      "routes": 32,
+      "threads": 6,
+      "median_ns": 704223
+    },
+    {
+      "routes": 32,
+      "threads": 8,
+      "median_ns": 588210
+    },
+    {
       "routes": 64,
       "threads": 1,
-      "median_ns": 5220556
+      "median_ns": 5749587
     },
     {
       "routes": 64,
       "threads": 2,
-      "median_ns": 2927044
+      "median_ns": 2969759
     },
     {
       "routes": 64,
       "threads": 4,
-      "median_ns": 1688001
+      "median_ns": 1731800
     },
     {
       "routes": 64,
       "threads": 6,
-      "median_ns": 1227812
+      "median_ns": 1394814
     },
     {
       "routes": 64,
       "threads": 8,
-      "median_ns": 1020560
+      "median_ns": 1013666
     },
     {
       "routes": 512,
       "threads": 1,
-      "median_ns": 42049828
+      "median_ns": 43489940
     },
     {
       "routes": 512,
       "threads": 2,
-      "median_ns": 22106904
+      "median_ns": 22865544
     },
     {
       "routes": 512,
       "threads": 4,
-      "median_ns": 12569036
+      "median_ns": 13080478
     },
     {
       "routes": 512,
       "threads": 6,
-      "median_ns": 9020353
+      "median_ns": 9018434
     },
     {
       "routes": 512,
       "threads": 8,
-      "median_ns": 6986457
+      "median_ns": 7010849
     },
     {
       "routes": 2048,
       "threads": 1,
-      "median_ns": 166903226
+      "median_ns": 166115617
     },
     {
       "routes": 2048,
       "threads": 2,
-      "median_ns": 87244520
+      "median_ns": 87478960
     },
     {
       "routes": 2048,
       "threads": 4,
-      "median_ns": 49104519
+      "median_ns": 49070256
     },
     {
       "routes": 2048,
       "threads": 6,
-      "median_ns": 35170564
+      "median_ns": 35225402
     },
     {
       "routes": 2048,
       "threads": 8,
-      "median_ns": 27556717
+      "median_ns": 27365174
     }
   ],
   "entries": [
@@ -114,10 +218,54 @@
         4
       ],
       "distinct_experts": 2,
+      "routes": 4,
+      "makespan_ns": 264289,
+      "iso_max_ns": 225245,
+      "derate": 1.1733
+    },
+    {
+      "shape": [
+        4,
+        4
+      ],
+      "distinct_experts": 2,
+      "routes": 8,
+      "makespan_ns": 342561,
+      "iso_max_ns": 349838,
+      "derate": 0.9792
+    },
+    {
+      "shape": [
+        4,
+        4
+      ],
+      "distinct_experts": 2,
+      "routes": 16,
+      "makespan_ns": 561419,
+      "iso_max_ns": 545466,
+      "derate": 1.0292
+    },
+    {
+      "shape": [
+        4,
+        4
+      ],
+      "distinct_experts": 2,
+      "routes": 32,
+      "makespan_ns": 994146,
+      "iso_max_ns": 924389,
+      "derate": 1.0755
+    },
+    {
+      "shape": [
+        4,
+        4
+      ],
+      "distinct_experts": 2,
       "routes": 64,
-      "makespan_ns": 1925928,
-      "iso_max_ns": 1688001,
-      "derate": 1.141
+      "makespan_ns": 1922499,
+      "iso_max_ns": 1731800,
+      "derate": 1.1101
     },
     {
       "shape": [
@@ -126,9 +274,9 @@
       ],
       "distinct_experts": 2,
       "routes": 512,
-      "makespan_ns": 14063006,
-      "iso_max_ns": 12569036,
-      "derate": 1.1189
+      "makespan_ns": 14023461,
+      "iso_max_ns": 13080478,
+      "derate": 1.0721
     },
     {
       "shape": [
@@ -137,9 +285,61 @@
       ],
       "distinct_experts": 2,
       "routes": 2048,
-      "makespan_ns": 53802512,
-      "iso_max_ns": 49104519,
-      "derate": 1.0957
+      "makespan_ns": 53936185,
+      "iso_max_ns": 49070256,
+      "derate": 1.0992
+    },
+    {
+      "shape": [
+        2,
+        2,
+        2,
+        2
+      ],
+      "distinct_experts": 4,
+      "routes": 4,
+      "makespan_ns": 428984,
+      "iso_max_ns": 314486,
+      "derate": 1.3641
+    },
+    {
+      "shape": [
+        2,
+        2,
+        2,
+        2
+      ],
+      "distinct_experts": 4,
+      "routes": 8,
+      "makespan_ns": 580067,
+      "iso_max_ns": 548697,
+      "derate": 1.0572
+    },
+    {
+      "shape": [
+        2,
+        2,
+        2,
+        2
+      ],
+      "distinct_experts": 4,
+      "routes": 16,
+      "makespan_ns": 1044977,
+      "iso_max_ns": 826209,
+      "derate": 1.2648
+    },
+    {
+      "shape": [
+        2,
+        2,
+        2,
+        2
+      ],
+      "distinct_experts": 4,
+      "routes": 32,
+      "makespan_ns": 1980626,
+      "iso_max_ns": 1535024,
+      "derate": 1.2903
     },
     {
       "shape": [
@@ -150,9 +350,9 @@
       ],
       "distinct_experts": 4,
       "routes": 64,
-      "makespan_ns": 3830361,
-      "iso_max_ns": 2927044,
-      "derate": 1.3086
+      "makespan_ns": 3851006,
+      "iso_max_ns": 2969759,
+      "derate": 1.2967
     },
     {
       "shape": [
@@ -163,9 +363,9 @@
       ],
       "distinct_experts": 4,
       "routes": 512,
-      "makespan_ns": 29197260,
-      "iso_max_ns": 22106904,
-      "derate": 1.3207
+      "makespan_ns": 29192616,
+      "iso_max_ns": 22865544,
+      "derate": 1.2767
     },
     {
       "shape": [
@@ -176,9 +376,77 @@
       ],
       "distinct_experts": 4,
       "routes": 2048,
-      "makespan_ns": 114006501,
-      "iso_max_ns": 87244520,
-      "derate": 1.3067
+      "makespan_ns": 114172936,
+      "iso_max_ns": 87478960,
+      "derate": 1.3051
+    },
+    {
+      "shape": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1
+      ],
+      "distinct_experts": 8,
+      "routes": 4,
+      "makespan_ns": 763838,
+      "iso_max_ns": 414420,
+      "derate": 1.8431
+    },
+    {
+      "shape": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1
+      ],
+      "distinct_experts": 8,
+      "routes": 8,
+      "makespan_ns": 1030157,
+      "iso_max_ns": 872399,
+      "derate": 1.1808
+    },
+    {
+      "shape": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1
+      ],
+      "distinct_experts": 8,
+      "routes": 16,
+      "makespan_ns": 1944758,
+      "iso_max_ns": 1514058,
+      "derate": 1.2845
+    },
+    {
+      "shape": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1
+      ],
+      "distinct_experts": 8,
+      "routes": 32,
+      "makespan_ns": 3735147,
+      "iso_max_ns": 2882135,
+      "derate": 1.296
     },
     {
       "shape": [
@@ -193,9 +461,9 @@
       ],
       "distinct_experts": 8,
       "routes": 64,
-      "makespan_ns": 7397069,
-      "iso_max_ns": 5220556,
-      "derate": 1.4169
+      "makespan_ns": 7320700,
+      "iso_max_ns": 5749587,
+      "derate": 1.2733
     },
     {
       "shape": [
@@ -210,9 +478,9 @@
       ],
       "distinct_experts": 8,
       "routes": 512,
-      "makespan_ns": 56791189,
-      "iso_max_ns": 42049828,
-      "derate": 1.3506
+      "makespan_ns": 56210337,
+      "iso_max_ns": 43489940,
+      "derate": 1.2925
     },
     {
       "shape": [
@@ -227,9 +495,57 @@
       ],
       "distinct_experts": 8,
       "routes": 2048,
-      "makespan_ns": 223673058,
-      "iso_max_ns": 166903226,
-      "derate": 1.3401
+      "makespan_ns": 224453486,
+      "iso_max_ns": 166115617,
+      "derate": 1.3512
+    },
+    {
+      "shape": [
+        4,
+        2,
+        2
+      ],
+      "distinct_experts": 3,
+      "routes": 4,
+      "makespan_ns": 401244,
+      "iso_max_ns": 314486,
+      "derate": 1.2759
+    },
+    {
+      "shape": [
+        4,
+        2,
+        2
+      ],
+      "distinct_experts": 3,
+      "routes": 8,
+      "makespan_ns": 550776,
+      "iso_max_ns": 548697,
+      "derate": 1.0038
+    },
+    {
+      "shape": [
+        4,
+        2,
+        2
+      ],
+      "distinct_experts": 3,
+      "routes": 16,
+      "makespan_ns": 1000668,
+      "iso_max_ns": 826209,
+      "derate": 1.2112
+    },
+    {
+      "shape": [
+        4,
+        2,
+        2
+      ],
+      "distinct_experts": 3,
+      "routes": 32,
+      "makespan_ns": 1970329,
+      "iso_max_ns": 1535024,
+      "derate": 1.2836
     },
     {
       "shape": [
@@ -239,9 +555,9 @@
       ],
       "distinct_experts": 3,
       "routes": 64,
-      "makespan_ns": 3617565,
-      "iso_max_ns": 2927044,
-      "derate": 1.2359
+      "makespan_ns": 3615862,
+      "iso_max_ns": 2969759,
+      "derate": 1.2176
     },
     {
       "shape": [
@@ -251,9 +567,9 @@
       ],
       "distinct_experts": 3,
       "routes": 512,
-      "makespan_ns": 26465888,
-      "iso_max_ns": 22106904,
-      "derate": 1.1972
+      "makespan_ns": 26553785,
+      "iso_max_ns": 22865544,
+      "derate": 1.1613
     },
     {
       "shape": [
@@ -263,9 +579,61 @@
       ],
       "distinct_experts": 3,
       "routes": 2048,
-      "makespan_ns": 103676896,
-      "iso_max_ns": 87244520,
-      "derate": 1.1883
+      "makespan_ns": 103679520,
+      "iso_max_ns": 87478960,
+      "derate": 1.1852
+    },
+    {
+      "shape": [
+        4,
+        2,
+        1,
+        1
+      ],
+      "distinct_experts": 4,
+      "routes": 4,
+      "makespan_ns": 639706,
+      "iso_max_ns": 414420,
+      "derate": 1.5436
+    },
+    {
+      "shape": [
+        4,
+        2,
+        1,
+        1
+      ],
+      "distinct_experts": 4,
+      "routes": 8,
+      "makespan_ns": 1057802,
+      "iso_max_ns": 872399,
+      "derate": 1.2125
+    },
+    {
+      "shape": [
+        4,
+        2,
+        1,
+        1
+      ],
+      "distinct_experts": 4,
+      "routes": 16,
+      "makespan_ns": 1776961,
+      "iso_max_ns": 1514058,
+      "derate": 1.1736
+    },
+    {
+      "shape": [
+        4,
+        2,
+        1,
+        1
+      ],
+      "distinct_experts": 4,
+      "routes": 32,
+      "makespan_ns": 3365301,
+      "iso_max_ns": 2882135,
+      "derate": 1.1676
     },
     {
       "shape": [
@@ -276,9 +644,9 @@
       ],
       "distinct_experts": 4,
       "routes": 64,
-      "makespan_ns": 6727560,
-      "iso_max_ns": 5220556,
-      "derate": 1.2887
+      "makespan_ns": 6715482,
+      "iso_max_ns": 5749587,
+      "derate": 1.168
     },
     {
       "shape": [
@@ -289,9 +657,9 @@
       ],
       "distinct_experts": 4,
       "routes": 512,
-      "makespan_ns": 49194079,
-      "iso_max_ns": 42049828,
-      "derate": 1.1699
+      "makespan_ns": 48968118,
+      "iso_max_ns": 43489940,
+      "derate": 1.126
     },
     {
       "shape": [
@@ -302,9 +670,53 @@
       ],
       "distinct_experts": 4,
       "routes": 2048,
-      "makespan_ns": 194219598,
-      "iso_max_ns": 166903226,
-      "derate": 1.1637
+      "makespan_ns": 195087823,
+      "iso_max_ns": 166115617,
+      "derate": 1.1744
+    },
+    {
+      "shape": [
+        6,
+        2
+      ],
+      "distinct_experts": 2,
+      "routes": 4,
+      "makespan_ns": 340259,
+      "iso_max_ns": 314486,
+      "derate": 1.082
+    },
+    {
+      "shape": [
+        6,
+        2
+      ],
+      "distinct_experts": 2,
+      "routes": 8,
+      "makespan_ns": 493930,
+      "iso_max_ns": 548697,
+      "derate": 0.9002
+    },
+    {
+      "shape": [
+        6,
+        2
+      ],
+      "distinct_experts": 2,
+      "routes": 16,
+      "makespan_ns": 891981,
+      "iso_max_ns": 826209,
+      "derate": 1.0796
+    },
+    {
+      "shape": [
+        6,
+        2
+      ],
+      "distinct_experts": 2,
+      "routes": 32,
+      "makespan_ns": 1687147,
+      "iso_max_ns": 1535024,
+      "derate": 1.0991
     },
     {
       "shape": [
@@ -313,9 +725,9 @@
       ],
       "distinct_experts": 2,
       "routes": 64,
-      "makespan_ns": 3255323,
-      "iso_max_ns": 2927044,
-      "derate": 1.1122
+      "makespan_ns": 3259350,
+      "iso_max_ns": 2969759,
+      "derate": 1.0975
     },
     {
       "shape": [
@@ -324,9 +736,9 @@
       ],
       "distinct_experts": 2,
       "routes": 512,
-      "makespan_ns": 24166778,
-      "iso_max_ns": 22106904,
-      "derate": 1.0932
+      "makespan_ns": 24301142,
+      "iso_max_ns": 22865544,
+      "derate": 1.0628
     },
     {
       "shape": [
@@ -335,9 +747,9 @@
       ],
       "distinct_experts": 2,
       "routes": 2048,
-      "makespan_ns": 94673291,
-      "iso_max_ns": 87244520,
-      "derate": 1.0851
+      "makespan_ns": 94382630,
+      "iso_max_ns": 87478960,
+      "derate": 1.0789
     }
   ]
 }

@@ -68,7 +68,31 @@ Largest error is the staggered/partial-occupancy case (derate is calibrated at
 full occupancy; ramp phases with idle cores are slightly over-derated) — still
 within 3%.
 
+## Update (2026-07-03): decode small-M + route-dependent derate
+
+Block 2 re-measured with small-M routes {4,8,16,32} added (was {64,512,2048}), so
+`T_iso` for decode is measured, not extrapolated. Finding: derate is a plateau for
+routes>=16 but **drops toward ~1.0 at routes<=8** (fixed per-call overhead dominates
+tiny-R makespan; little sustained bandwidth to contend). E.g. derate(8,·) =
+{R8:1.18, R16:1.28, R64:1.27, R512:1.29, R2048:1.35}. Tiny-R points are also noisy
+(sub-ms), so `derate(n,R)` uses the **median** over shapes.
+
+The model now keys derate on **(n, routes)**, and each phase uses the **max routes
+among active tasks** (a large active task drives steady-state contention; an
+all-tiny/decode phase gets the low derate). Refreshed validation:
+
+| check                     | median | max   |
+| ------------------------- | ------ | ----- |
+| phase (large-M hetero)    | 1.0%   | 3.5%  |
+| interval-DAG (5 plans)    | 1.6%   | 3.9%  |
+
+Decode absolute prediction improved from +16.6% to **+7.8%** (residual is fixed
+per-call overhead the T_iso model doesn't fully capture; ~0.15ms on a 2ms decode).
+Planner regime choice remains correct in all cases. The numbers in the sections
+above are the earlier {64,512,2048}-only calibration and are superseded by this.
+
 ## Status
+
 
 
 Block 1 (`T_iso`) + block 2 (`derate`) + phase model = complete cost kernel for the
