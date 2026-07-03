@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ⚠ DEPRECATED (wave, 后续不考虑) — see cpu_moe_schedule_optimization/DEPRECATED_WAVE.md
 """Profile native C++ MoE planner latency and emit a planner-cost profile."""
 
 from __future__ import annotations

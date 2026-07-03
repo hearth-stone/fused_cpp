@@ -1,3 +1,4 @@
+# ⚠ DEPRECATED (wave, 后续不考虑) — see cpu_moe_schedule_optimization/DEPRECATED_WAVE.md
 """Twin LOAD_PROPORTIONAL planner for cross-language equivalence testing."""
 
 import math

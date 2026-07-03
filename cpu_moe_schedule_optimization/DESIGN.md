@@ -1,3 +1,5 @@
+> **⚠ DEPRECATED — 本文档中的 wave 调度内容后续不考虑，仅作历史参考。** 见 [DEPRECATED_WAVE.md](DEPRECATED_WAVE.md)。async interval-DAG + cost model 保留并继续。
+
 # CPU MoE Schedule Optimization Design
 
 ## 1. Problem Statement

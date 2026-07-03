@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ⚠ DEPRECATED (wave, 后续不考虑) — see cpu_moe_schedule_optimization/DEPRECATED_WAVE.md
 """Twin implementation of the SQRT_LOAD planner.
 
 This file mirrors csrc/moe_planner/plan_sqrt_load.cpp and is used for

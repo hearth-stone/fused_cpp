@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# ⚠ DEPRECATED: wave/scheduled-bridge path (后续不考虑) — see ../DEPRECATED_WAVE.md;
+#   the async task-DAG path in this file is retained.
 """Run real BF16 tiled MoE timings from offline simulator schedules."""
 
 from __future__ import annotations

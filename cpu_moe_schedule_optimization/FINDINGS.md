@@ -1,3 +1,5 @@
+> **⚠ DEPRECATED — 本文档中的 wave 调度内容后续不考虑，仅作历史参考。** 见 [DEPRECATED_WAVE.md](DEPRECATED_WAVE.md)。async interval-DAG + cost model 保留并继续。
+
 # CPU MoE Planner — C++ 实现与评测结论
 
 本文件汇总将 10 个 MoE 调度 planner 用 C++ 实现、并与精确最优对照后的工程与算法结论，对应

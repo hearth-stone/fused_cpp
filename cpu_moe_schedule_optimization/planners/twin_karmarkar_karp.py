@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ⚠ DEPRECATED (wave, 后续不考虑) — see cpu_moe_schedule_optimization/DEPRECATED_WAVE.md
 """Twin implementation of KARMARKAR_KARP planner for Python equivalence testing.
 
 This implements the IDENTICAL multiway Largest Differencing Method (LDM)
