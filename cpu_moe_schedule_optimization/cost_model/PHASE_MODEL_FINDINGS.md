@@ -45,7 +45,31 @@ early and stop contending; the phase model tracks this and lands within ~3%.
   in the phase sim — keying derate on thread-distribution was **not** adopted, to
   avoid overfitting the sparse (6-shape) data.
 
+## Interval-DAG predictor (deps + staggered starts)
+
+`dag_makespan(tasks)` extends the phase model to a full interval-DAG: event-driven
+over completions, `#active` sets the rate `1/derate(#active)`, a completion frees a
+successor which starts at full work. This exercises dependencies and staggered
+starts that the derate table (independent concurrent tasks) never covered.
+
+Out-of-sample validation on 5 hand-built DAGs (`validate_dag_makespan.py`):
+
+| plan                     | err   |
+| ------------------------ | ----- |
+| concurrent 2×big         | +1.0% |
+| seq chain full8 (deps)   | +0.4% |
+| two waves 4+4            | +0.5% |
+| stagger big+smalls       | +3.2% |
+| hotspot-like             | +0.8% |
+
+**DAG |err|: median 0.8%, max 3.2%.** Pure-dependency chains (derate=1) and pure
+concurrency (derate(2)) both hit their expected values, confirming the mechanics.
+Largest error is the staggered/partial-occupancy case (derate is calibrated at
+full occupancy; ramp phases with idle cores are slightly over-derated) — still
+within 3%.
+
 ## Status
+
 
 Block 1 (`T_iso`) + block 2 (`derate`) + phase model = complete cost kernel for the
 static planner. Re-run `validate_phase_model.py` after any kernel change (the tables

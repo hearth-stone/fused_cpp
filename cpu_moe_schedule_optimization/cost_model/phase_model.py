@@ -94,6 +94,51 @@ class ContentionCostModel:
         return wall
 
 
+    def dag_makespan(self, tasks) -> float:
+        """Interval-DAG makespan. tasks[i] = (routes, threads, deps) where deps
+        is a list of task indices that must finish before task i starts (the
+        async bridge derives these from overlapping core-interval reuse).
+
+        Event-driven over completions: between events the active set is constant,
+        so every active task drains at 1/derate(#active); a completion frees a
+        successor which then starts at full work. Contention uses #active only
+        (derate is calibrated at full occupancy -- partial-occupancy ramp phases
+        are approximated by the same curve; validate before trusting).
+        """
+        K = len(tasks)
+        w = [self.T_iso(r, t) for (r, t, _) in tasks]
+        dep_rem = [len(d) for (_, _, d) in tasks]
+        succ = [[] for _ in range(K)]
+        for i, (_, _, deps) in enumerate(tasks):
+            for d in deps:
+                succ[d].append(i)
+        finish = [None] * K
+        started = [dep_rem[i] == 0 for i in range(K)]
+        t = 0.0
+        guard = 0
+        while any(f is None for f in finish):
+            guard += 1
+            assert guard <= 2 * K + 2, "dag loop did not converge"
+            active = [i for i in range(K) if started[i] and finish[i] is None]
+            if not active:
+                raise ValueError("DAG deadlock (cycle or unreachable task)")
+            n = len(active)
+            rate = 1.0 / self.derate(n)
+            dt = min(w[i] / rate for i in active)
+            t += dt
+            drained = dt * rate
+            for i in active:
+                w[i] -= drained
+            for i in active:
+                if w[i] <= 1e-6:
+                    finish[i] = t
+                    for s in succ[i]:
+                        dep_rem[s] -= 1
+                        if dep_rem[s] == 0:
+                            started[s] = True
+        return max(finish)
+
+
 if __name__ == "__main__":
     import sys
     m = ContentionCostModel(sys.argv[1])
