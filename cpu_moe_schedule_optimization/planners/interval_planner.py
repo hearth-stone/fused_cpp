@@ -94,7 +94,14 @@ class IntervalPlanner:
             ms, tasks = self.score_shape(experts, shape)
             ranked.append((ms, shape, tasks))
         ranked.sort(key=lambda x: x[0])
-        best_ms, best_shape, best_tasks = ranked[0]
+        # Tie-break: within TIE_EPS of the best predicted makespan, prefer the
+        # most cooperative shape (fewest lanes -> widest, best locality, and the
+        # model is most confident there: derate(1)=1 exact, no contention guess).
+        TIE_EPS = 0.03
+        best_ms = ranked[0][0]
+        near = [r for r in ranked if r[0] <= best_ms * (1 + TIE_EPS)]
+        near.sort(key=lambda x: (len(x[1]), x[0]))  # fewest lanes, then makespan
+        best_ms, best_shape, best_tasks = near[0]
         return {
             "shape": best_shape,
             "makespan_ns": best_ms,

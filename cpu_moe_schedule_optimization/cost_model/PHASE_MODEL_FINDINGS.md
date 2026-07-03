@@ -91,6 +91,18 @@ per-call overhead the T_iso model doesn't fully capture; ~0.15ms on a 2ms decode
 Planner regime choice remains correct in all cases. The numbers in the sections
 above are the earlier {64,512,2048}-only calibration and are superseded by this.
 
+## Update (2026-07-03b): overhead-split + planner tie-break
+
+- **Overhead-split**: T_iso(R,t) = O(t) + G(R,t); O(t) (~0.10–0.15ms, the R->0
+  intercept) is fixed per-task overhead not scaled by contention. A task's
+  contended factor is `fo + (1-fo)*derate`, fo=O/T_iso. Decode absolute error
+  **+7.8% -> +4.1%**; large-M unchanged (fo negligible there) — phase 1.0%/3.9%,
+  DAG 2.0%/4.5%. (Only ~2% of the old decode gap was overhead; the rest is
+  sub-ms tiny-R derate noise — not chased further.)
+- **Planner tie-break**: within 3% of the best predicted makespan, prefer the
+  most cooperative shape (fewest lanes). Fixes the balanced-large near-tie
+  (was `[2,2,2,2]`, measured 5% slower than coop; now picks `[8]` = coop).
+
 ## Status
 
 
