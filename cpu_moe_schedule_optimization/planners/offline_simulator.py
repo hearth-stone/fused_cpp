@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ⚠ DEPRECATED (wave, 后续不考虑) — see cpu_moe_schedule_optimization/DEPRECATED_WAVE.md
 """Offline simulator for CPU MoE expert scheduling plans.
 
 This is a research-only tool. It estimates T_plan + T_execute from a routing
@@ -184,6 +185,10 @@ class Plan:
     def supports_scheduled_bridge(self) -> bool:
         return not self.async_tasks
 
+    @property
+    def supports_async_bridge(self) -> bool:
+        return bool(self.async_tasks)
+
     def to_scheduled_bridge(self) -> Dict[str, object]:
         """Return tensors-as-lists accepted by fused_moe_bf16_tiled_scheduled."""
         if not self.supports_scheduled_bridge:
@@ -207,6 +212,36 @@ class Plan:
             "team_threads": team_threads,
         }
 
+    def to_async_bridge(self) -> Dict[str, object]:
+        """Return tensors-as-lists accepted by fused_moe_bf16_tiled_async."""
+        if not self.supports_async_bridge:
+            raise ValueError(
+                f"{self.kind.value} does not contain async_tasks and cannot be "
+                "represented by the async task-DAG bridge"
+            )
+        task_expert_ids: List[int] = []
+        task_core_begins: List[int] = []
+        task_threads: List[int] = []
+        task_dep_offsets = [0]
+        task_deps: List[int] = []
+
+        for task in self.async_tasks:
+            task_expert_ids.append(task.expert_id)
+            task_core_begins.append(task.core_begin)
+            task_threads.append(task.threads)
+            task_deps.extend(task.deps)
+            task_dep_offsets.append(len(task_deps))
+
+        return {
+            "num_threads": self.num_cores,
+            "thread_cpu_ids": list(range(self.num_cores)),
+            "task_expert_ids": task_expert_ids,
+            "task_core_begins": task_core_begins,
+            "task_threads": task_threads,
+            "task_dep_offsets": task_dep_offsets,
+            "task_deps": task_deps,
+        }
+
     def to_dict(self) -> Dict[str, object]:
         return {
             "kind": self.kind.value,
@@ -224,6 +259,11 @@ class Plan:
                 else None
             ),
             "async_tasks": [task.to_dict() for task in self.async_tasks],
+            "async_bridge": (
+                self.to_async_bridge()
+                if self.supports_async_bridge
+                else None
+            ),
             "runtime_bridge": (
                 "wave_offsets"
                 if self.supports_scheduled_bridge

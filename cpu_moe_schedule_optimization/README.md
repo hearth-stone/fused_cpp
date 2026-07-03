@@ -1,3 +1,5 @@
+> **⚠ DEPRECATED — 本文档中的 wave 调度内容后续不考虑，仅作历史参考。** 见 [DEPRECATED_WAVE.md](DEPRECATED_WAVE.md)。async interval-DAG + cost model 保留并继续。
+
 # CPU MoE Schedule Optimization
 
 本目录用于研究和实现 **CPU 上 MoE 推理的 cost-aware runtime scheduler**。
@@ -164,10 +166,10 @@ taskset -c 0-7 .venv/bin/python \
   --runs 30
 ```
 
-仓库内当前的 AWS 8 核 pinned profile 是：
+仓库内当前的 AWS 8 核 profile 是（unpinned；本机实测 pinning 无中位数收益且增尾抖动，见 FINDINGS）：
 
 ```text
-cpu_moe_schedule_optimization/cost_model/profiles/aws_dsv4_8c_pinned_auto_mn_20260630.json
+cpu_moe_schedule_optimization/cost_model/profiles/aws_dsv4_8c_packa_sha46228bb_20260703.json
 ```
 
 生成后可以让 offline simulator 使用这张表：
@@ -176,7 +178,7 @@ cpu_moe_schedule_optimization/cost_model/profiles/aws_dsv4_8c_pinned_auto_mn_202
 python cpu_moe_schedule_optimization/planners/offline_simulator.py \
   --distribution zipf \
   --cores 8 \
-  --cost-table cpu_moe_schedule_optimization/cost_model/profiles/aws_dsv4_8c_pinned_auto_mn_20260630.json
+  --cost-table cpu_moe_schedule_optimization/cost_model/profiles/aws_dsv4_8c_packa_sha46228bb_20260703.json
 ```
 
 也可以直接把它接到真实 scheduled bridge benchmark：
@@ -190,7 +192,7 @@ PYTHONPATH=src .venv/bin/python \
   --top-k 6 \
   --cores 8 \
   --planner groups \
-  --cost-table cpu_moe_schedule_optimization/cost_model/profiles/aws_dsv4_8c_pinned_auto_mn_20260630.json
+  --cost-table cpu_moe_schedule_optimization/cost_model/profiles/aws_dsv4_8c_packa_sha46228bb_20260703.json
 ```
 
 不接真实 routing dump 时，可以先跑 synthetic sweep：
@@ -199,7 +201,7 @@ PYTHONPATH=src .venv/bin/python \
 python -B cpu_moe_schedule_optimization/benchmarks/synthetic_sweep.py \
   --case-set smoke \
   --cores 8 \
-  --cost-table cpu_moe_schedule_optimization/cost_model/profiles/aws_dsv4_8c_pinned_auto_mn_20260630.json
+  --cost-table cpu_moe_schedule_optimization/cost_model/profiles/aws_dsv4_8c_packa_sha46228bb_20260703.json
 ```
 
 `--cores` 默认是 16。smoke sweep 里也包含显式的 8-core DSV4-like 场景：
@@ -216,6 +218,7 @@ dsv4_broad_heavytail_8c
 - `UNIFORM_WAVES`
 - `GREEDY_MARGINAL_GAIN`
 - `ENUMERATE_CORE_GROUPS`
+- `ASYNC_INTERVAL_DAG`
 - `AUTO` selector 的 gated planner subset
 
 并按：
@@ -272,6 +275,44 @@ python -B cpu_moe_schedule_optimization/planners/offline_simulator.py \
 这些字段可以直接转成 `torch.int32` tensor 传给
 `fused_moe_bf16_tiled_scheduled`。`thread_cpu_ids` 表示 logical worker
 thread 到 physical CPU id 的映射，长度必须等于 `num_threads`。
+
+### Async interval DAG simulator
+
+如果只想基于已有 `T_expert(routes, threads)` cost table 推演非 wave 调度，不触碰真实
+MoE/GEMM kernel，可以直接跑 `ASYNC_INTERVAL_DAG`：
+
+```bash
+python -B cpu_moe_schedule_optimization/planners/offline_simulator.py \
+  --distribution lognormal \
+  --lognormal-sigma 2.0 \
+  --tokens 2048 \
+  --top-k 6 \
+  --cores 8 \
+  --planner async \
+  --cost-table cpu_moe_schedule_optimization/cost_model/profiles/aws_dsv4_8c_packa_sha46228bb_20260703.json \
+  --dump-json
+```
+
+这个 planner 做的是纯离线 list scheduling：
+
+```text
+active experts -> contiguous logical-core interval candidates
+               -> earliest-finish placement
+               -> deps from overlapping core intervals
+```
+
+输出里 `async_tasks` 是可读 DAG，`async_bridge` 是紧凑数组：
+
+```text
+task_expert_ids
+task_core_begins
+task_threads
+task_dep_offsets
+task_deps
+```
+
+这些数组对应 `fused_moe_bf16_tiled_async` 的输入格式，但上述命令只运行 Python
+simulator 和已有 JSON cost table，不会执行真实 MoE/GEMM。
 
 ### Real scheduled kernel benchmark
 

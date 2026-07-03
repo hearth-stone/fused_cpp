@@ -1,3 +1,5 @@
+> **⚠ DEPRECATED — 本文档中的 wave 调度内容后续不考虑，仅作历史参考。** 见 [../DEPRECATED_WAVE.md](../DEPRECATED_WAVE.md)。async interval-DAG + cost model 保留并继续。
+
 # Synthetic Benchmarks
 
 This directory contains offline benchmark helpers for synthetic CPU MoE routing
@@ -152,7 +154,7 @@ PYTHONPATH=src .venv/bin/python \
   --top-k 6 \
   --cores 8 \
   --planner all \
-  --cost-table cpu_moe_schedule_optimization/cost_model/profiles/aws_dsv4_8c_pinned_auto_mn_20260630.json \
+  --cost-table cpu_moe_schedule_optimization/cost_model/profiles/aws_dsv4_8c_packa_sha46228bb_20260703.json \
   --output-json tmp/moe_schedule_bench/hotspot_4x75.json \
   --output-csv tmp/moe_schedule_bench/hotspot_4x75.csv
 ```
@@ -236,10 +238,10 @@ By default the script sets `BF16_NEON_CLAMP_THREADS=0`, so each requested thread
 count is tested directly. Add `--keep-thread-clamp` to keep the upstream
 refs/i8gemm thread-clamp behavior.
 
-AWS 8 核 pinned profile 已保存为：
+AWS 8 核 profile 已保存为（unpinned）：
 
 ```text
-cpu_moe_schedule_optimization/cost_model/profiles/aws_dsv4_8c_pinned_auto_mn_20260630.json
+cpu_moe_schedule_optimization/cost_model/profiles/aws_dsv4_8c_packa_sha46228bb_20260703.json
 ```
 
 The sweep uses the complexity-based planner cost model by default. For fixed
@@ -248,7 +250,7 @@ costs in the same style as `offline_simulator.py`:
 
 ```bash
 python -B cpu_moe_schedule_optimization/benchmarks/synthetic_sweep.py \
-  --cost-table cpu_moe_schedule_optimization/cost_model/profiles/aws_dsv4_8c_pinned_auto_mn_20260630.json \
+  --cost-table cpu_moe_schedule_optimization/cost_model/profiles/aws_dsv4_8c_packa_sha46228bb_20260703.json \
   --plan-cost-source model \
   --planner-cost fixed=1us \
   --planner-cost balanced=2us \

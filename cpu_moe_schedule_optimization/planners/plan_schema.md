@@ -1,6 +1,11 @@
 # Plan Schema
 
 This file defines the first offline representation for CPU MoE scheduler output.
+
+> **⚠ DEPRECATED — wave 调度后续不考虑。** 见 [../DEPRECATED_WAVE.md](../DEPRECATED_WAVE.md)。
+> 本文件中的 `Wave` 层、`wave_offsets` scheduled bridge、以及除 `ASYNC_INTERVAL_DAG` 外的
+> 所有 planner kinds 均已废弃,仅作历史参考。**保留并继续**:`ASYNC_INTERVAL_DAG` /
+> async bridge、`Team`、cost model。
 It is intentionally close to the design document:
 
 ```text
@@ -50,6 +55,7 @@ native C++ runtime structures.
     "team_threads": [8, 4, 16]
   },
   "async_tasks": [],
+  "async_bridge": null,
   "runtime_bridge": "wave_offsets",
   "metadata": {
     "planner": "offline_simulator.py",
@@ -96,6 +102,8 @@ Rules:
 - First-stage models ignore `core_mask` and `numa_node`.
 
 ## Wave
+
+> **⚠ DEPRECATED(wave,后续不考虑)** — 见 ../DEPRECATED_WAVE.md。
 
 ```json
 {
@@ -147,8 +155,8 @@ max(task.estimated_finish_ns for task in async_tasks)
 ```
 
 - Async plans set `scheduled_bridge = null` because they are not representable
-  as global waves. They set `runtime_bridge = "async_task_dag"` and are executed
-  by the async task-DAG C++ bridge.
+  as global waves. They set `runtime_bridge = "async_task_dag"` and also expose
+  an `async_bridge` compact tensor representation.
 
 ## Plan Cost
 
@@ -172,6 +180,8 @@ schema. If future experiments show they depend strongly on the plan shape, add
 them as explicit plan-dependent fields instead of hiding them in metadata.
 
 ## Scheduled C++ Bridge
+
+> **⚠ DEPRECATED(wave bridge,后续不考虑)。** 下文 async bridge 保留。
 
 `scheduled_bridge` is the compact tensor representation accepted by the
 experimental `fused_moe_bf16_tiled_scheduled` C++ entrypoint:
@@ -232,10 +242,13 @@ Rules:
 - Each task uses the logical-thread interval
   `[task_core_begins[i], task_core_begins[i] + task_threads[i])`.
 - The first async bridge supports exactly one task per active expert.
+- Offline simulator JSON includes this representation under `async_bridge`.
 
 ## Planner Kinds
 
 Current first-stage planner kinds:
+
+> **⚠ 除 `ASYNC_INTERVAL_DAG` 外的所有 kinds 均已 DEPRECATED(wave,后续不考虑)。**
 
 - `FIXED_GLOBAL_THREADS`: one thread per expert, packed into waves.
 - `SORTED_TOKEN_BALANCED_1T`: sort active experts by routed-token count and
