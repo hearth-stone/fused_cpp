@@ -8,6 +8,8 @@
 #include <tuple>
 #include <vector>
 
+#include "workspace_pool.h"
+
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -677,7 +679,8 @@ AttnGemmSelectedOutputs run_attn_gemm_selected_serial(
 
     const int64_t K_pad = fused_wqa_wkv.K_pad;
     at::Tensor a_storage = make_padded_hidden_states(hidden_states, M, K, K_pad);
-    at::Tensor scratch = at::empty(
+    auto workspace_lease = ::fused_cpp::workspace::acquire();
+    at::Tensor scratch = workspace_lease.empty(
         {std::max<int64_t>(1, std::max<int64_t>(M, 1) * K_pad * 2)},
         hidden_states.options());
 
@@ -740,8 +743,9 @@ AttnGemmSelectedOutputs run_attn_gemm_selected_mt(
                                                    num_threads);
     const int64_t scratch_stride =
         std::max<int64_t>(1, rows_per_thread * K_pad * 2);
-    at::Tensor scratch = at::empty({num_threads * scratch_stride},
-                                   hidden_states.options());
+    auto workspace_lease = ::fused_cpp::workspace::acquire();
+    at::Tensor scratch = workspace_lease.empty({num_threads * scratch_stride},
+                                               hidden_states.options());
 
     AttnGemmSelectedOutputs outputs;
 #if defined(__APPLE__)
@@ -971,9 +975,10 @@ AttnGemmNormedOutputs run_attn_gemm_normed_mt(
                                                    num_threads);
     const int64_t scratch_stride =
         std::max<int64_t>(1, rows_per_thread * K_pad * 2);
-    at::Tensor scratch = at::empty({num_threads * scratch_stride},
-                                   hidden_states.options());
-    at::Tensor qr_kv_tmp = at::empty(
+    auto workspace_lease = ::fused_cpp::workspace::acquire();
+    at::Tensor scratch = workspace_lease.empty({num_threads * scratch_stride},
+                                               hidden_states.options());
+    at::Tensor qr_kv_tmp = workspace_lease.empty(
         {num_threads, rows_per_thread, fused_wqa_wkv.N_pad},
         hidden_states.options());
 

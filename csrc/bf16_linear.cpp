@@ -106,6 +106,57 @@ at::Tensor Bf16LinearPrepackedImpl(const at::Tensor& input,
 #endif
 }
 
+template <bool OutputBf16>
+void Bf16LinearPrepackedOutImpl(const at::Tensor& input,
+                                const at::Tensor& packed_weight,
+                                int64_t K,
+                                int64_t Np,
+                                int64_t nthreads,
+                                const at::Tensor& output) {
+#if defined(FUSED_CPP_HAS_BF16GEMM)
+  const int64_t M = input.size(0);
+  TORCH_CHECK(M <= std::numeric_limits<int>::max(),
+              "bf16_linear_prepacked_to_dtype_out M exceeds int32 kernel limit: ",
+              M);
+  if (M == 0) {
+    return;
+  }
+
+  at::Tensor input_contig = input.contiguous();
+  output.zero_();
+
+  if constexpr (OutputBf16) {
+    bf16gemm_mt_dispatch_nld_b(
+        reinterpret_cast<const bf16_t*>(input_contig.data_ptr<c10::BFloat16>()),
+        reinterpret_cast<const bf16_t*>(packed_weight.data_ptr<c10::BFloat16>()),
+        reinterpret_cast<bf16_t*>(output.data_ptr<c10::BFloat16>()),
+        static_cast<int>(M),
+        static_cast<int>(K),
+        static_cast<int>(Np),
+        static_cast<int>(nthreads));
+  } else {
+    bf16gemm_mt_dispatch(
+        reinterpret_cast<const bf16_t*>(input_contig.data_ptr<c10::BFloat16>()),
+        reinterpret_cast<const bf16_t*>(packed_weight.data_ptr<c10::BFloat16>()),
+        output.data_ptr<float>(),
+        static_cast<int>(M),
+        static_cast<int>(K),
+        static_cast<int>(Np),
+        static_cast<int>(nthreads));
+  }
+#else
+  (void)input;
+  (void)packed_weight;
+  (void)K;
+  (void)Np;
+  (void)nthreads;
+  (void)output;
+  TORCH_CHECK(false,
+              "bf16_linear_prepacked_to_dtype_out requires an AArch64 build "
+              "with refs/i8gemm bf16gemm enabled");
+#endif
+}
+
 }  // namespace
 
 std::tuple<at::Tensor, int64_t, int64_t, int64_t>
@@ -189,6 +240,56 @@ at::Tensor bf16_linear_prepacked_to_dtype(at::Tensor input,
   }
   return Bf16LinearPrepackedImpl<false>(
       input, packed_weight, K, N, Np, nthreads);
+}
+
+void bf16_linear_prepacked_to_dtype_out(at::Tensor input,
+                                        at::Tensor packed_weight,
+                                        int64_t K,
+                                        int64_t N,
+                                        int64_t Np,
+                                        bool output_bf16,
+                                        int64_t nthreads,
+                                        at::Tensor output) {
+  CheckBf16Cpu2d(input, "bf16_linear_prepacked_to_dtype_out input");
+  CheckCpuTensor(packed_weight, "bf16_linear_prepacked_to_dtype_out packed_weight");
+  CheckCpuTensor(output, "bf16_linear_prepacked_to_dtype_out output");
+  TORCH_CHECK(packed_weight.scalar_type() == at::kBFloat16,
+              "bf16_linear_prepacked_to_dtype_out packed_weight must be torch.bfloat16, got ",
+              packed_weight.scalar_type());
+  TORCH_CHECK(packed_weight.is_contiguous(),
+              "bf16_linear_prepacked_to_dtype_out packed_weight must be contiguous");
+  CheckDimInt32(K, "bf16_linear_prepacked_to_dtype_out K");
+  CheckDimInt32(N, "bf16_linear_prepacked_to_dtype_out N");
+  CheckDimInt32(Np, "bf16_linear_prepacked_to_dtype_out Np");
+  TORCH_CHECK(K >= 8 && K % 8 == 0,
+              "bf16_linear_prepacked_to_dtype_out requires K to be aligned to 8, got K=",
+              K);
+  TORCH_CHECK(Np >= N && Np >= 8 && Np % 8 == 0,
+              "bf16_linear_prepacked_to_dtype_out requires Np to be >= N and aligned to 8, got N=",
+              N, " Np=", Np);
+  TORCH_CHECK(input.size(1) == K,
+              "bf16_linear_prepacked_to_dtype_out K mismatch: input K=",
+              input.size(1), " packed K=", K);
+  TORCH_CHECK(packed_weight.numel() == K * Np,
+              "bf16_linear_prepacked_to_dtype_out packed_weight numel mismatch: expected ",
+              K * Np, ", got ", packed_weight.numel());
+  TORCH_CHECK(output.dim() == 2 && output.size(0) == input.size(0) &&
+                  output.size(1) == Np,
+              "bf16_linear_prepacked_to_dtype_out output must be [M, Np], got ",
+              output.sizes(), " expected [", input.size(0), ", ", Np, "]");
+  TORCH_CHECK(output.is_contiguous(),
+              "bf16_linear_prepacked_to_dtype_out output must be contiguous");
+  TORCH_CHECK(output.scalar_type() == (output_bf16 ? at::kBFloat16 : at::kFloat),
+              "bf16_linear_prepacked_to_dtype_out output dtype mismatch: got ",
+              output.scalar_type());
+
+  if (output_bf16) {
+    Bf16LinearPrepackedOutImpl<true>(
+        input, packed_weight, K, Np, nthreads, output);
+  } else {
+    Bf16LinearPrepackedOutImpl<false>(
+        input, packed_weight, K, Np, nthreads, output);
+  }
 }
 
 at::Tensor bf16_linear_to_dtype(at::Tensor input,

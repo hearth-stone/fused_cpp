@@ -15,6 +15,7 @@
 
 #include "deepseek_v4_q_norm_rope_sve.h"
 #include "profile_utils.h"
+#include "workspace_pool.h"
 
 #if defined(__ARM_FEATURE_SVE)
 #include <arm_sve.h>
@@ -39,6 +40,14 @@ at::Tensor bf16_linear_prepacked_to_dtype(at::Tensor input,
                                           int64_t Np,
                                           bool output_bf16,
                                           int64_t nthreads);
+void bf16_linear_prepacked_to_dtype_out(at::Tensor input,
+                                        at::Tensor packed_weight,
+                                        int64_t K,
+                                        int64_t N,
+                                        int64_t Np,
+                                        bool output_bf16,
+                                        int64_t nthreads,
+                                        at::Tensor output);
 
 namespace {
 
@@ -420,6 +429,28 @@ at::Tensor LinearPrepackedToDtype(const at::Tensor& input,
               "LinearPrepackedToDtype only supports bf16/fp32 output with bf16gemm, got ",
               dtype);
   return ::bf16_linear_prepacked_to_dtype(input, packed_weight, K, N, Np, dtype == at::kBFloat16, 0);
+}
+
+at::Tensor LinearPrepackedToDtypeWorkspace(
+    const at::Tensor& input,
+    const at::Tensor& packed_weight,
+    int64_t K,
+    int64_t N,
+    int64_t Np,
+    at::ScalarType dtype,
+    ::fused_cpp::workspace::WorkspaceLease& workspace) {
+  TORCH_CHECK(dtype == at::kBFloat16 || dtype == at::kFloat,
+              "LinearPrepackedToDtypeWorkspace only supports bf16/fp32 output "
+              "with bf16gemm, got ",
+              dtype);
+  if (N != Np) {
+    return LinearPrepackedToDtype(input, packed_weight, K, N, Np, dtype);
+  }
+  at::Tensor output =
+      workspace.empty({input.size(0), Np}, input.options().dtype(dtype));
+  ::bf16_linear_prepacked_to_dtype_out(input, packed_weight, K, N, Np,
+                                       dtype == at::kBFloat16, 0, output);
+  return output;
 }
 
 at::Tensor GptjRopeApply(const at::Tensor& x,
@@ -2683,15 +2714,17 @@ std::tuple<at::Tensor, at::Tensor> deepseek_v4_post_gemm_parallel_stage_prepacke
                                          q_eps,
                                          profile_ptr);
 
+  auto workspace_lease = ::fused_cpp::workspace::acquire();
   const int64_t indexer_head_dim = indexer_norm_weight.size(0);
   FUSED_CPP_PROFILE_RESTART(phase_start);
-  at::Tensor indexer_q_linear = LinearPrepackedToDtype(
+  at::Tensor indexer_q_linear = LinearPrepackedToDtypeWorkspace(
       qr,
       indexer_wq_b_packed,
       indexer_wq_b_K,
       indexer_wq_b_N,
       indexer_wq_b_Np,
-      qr.scalar_type());
+      qr.scalar_type(),
+      workspace_lease);
   TORCH_CHECK(indexer_q_linear.size(1) % indexer_head_dim == 0,
               "indexer q linear out features must be divisible by indexer head_dim");
   FUSED_CPP_PROFILE_ADD_IF_PTR(
