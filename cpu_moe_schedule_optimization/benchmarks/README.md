@@ -1,4 +1,8 @@
 > **⚠ DEPRECATED — 本文档中的 wave 调度内容后续不考虑，仅作历史参考。** 见 [../DEPRECATED_WAVE.md](../DEPRECATED_WAVE.md)。async interval-DAG + cost model 保留并继续。
+>
+> **阶段 1 已删除脚本**：下方 *Synthetic Sweep* / *Auto Selector* / *Selector Stress* / *Scheduled C++ Bridge Benchmark* 四节所述脚本
+> （`synthetic_sweep.py`、`selector_stress.py`、`scheduled_bridge_bench.py`）**已删除**，仅存历史说明。
+> 离线对比多种调度算法请改用 [`../planners/simulate_schedules.py`](../planners/simulate_schedules.py)。
 
 # Synthetic Benchmarks
 

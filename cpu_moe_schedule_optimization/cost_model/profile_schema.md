@@ -108,6 +108,10 @@ runtime integration.
 
 ## Lightweight Native Planner Cost Table
 
+> **⚠ DEPRECATED（阶段 1 已删除相关工具）**：本节描述的是 wave 版 planner 开销表，其生成工具
+> `build_lightweight_planner_cost.py` 与消费者 `synthetic_sweep.py` / `offline_simulator.py` 均已删除。
+> 现行的 plan 开销测量见 [`../planners/bench_planner_overhead.py`](../planners/bench_planner_overhead.py)。以下仅存历史参考。
+
 For runtime-style scoring, prefer a compact lookup table instead of the
 complexity formula:
 

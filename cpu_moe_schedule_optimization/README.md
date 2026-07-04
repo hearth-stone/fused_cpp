@@ -80,65 +80,26 @@ T_plan(plan) + T_execute(plan)
 - [`cost_model/profile_schema.md`](./cost_model/profile_schema.md)：`T_expert(routes, threads)` profiling table 的第一版 schema。
 - [`cost_model/profile_expert_cost.py`](./cost_model/profile_expert_cost.py)：用真实 `fused_moe_bf16_tiled_scheduled` kernel 生成 `T_expert(routes, threads)` cost table。
 - [`planners/plan_schema.md`](./planners/plan_schema.md)：`Plan / Wave / Team` 的第一版输出 schema。
-- [`planners/offline_simulator.py`](./planners/offline_simulator.py)：纯 Python offline simulator，用 synthetic 或 JSON cost table 比较基础 planner。
-- [`benchmarks/synthetic_sweep.py`](./benchmarks/synthetic_sweep.py)：系统扫描 synthetic routing distributions，比较不同 planner 的 planning-aware / execution-only 结果。
-- [`benchmarks/selector_stress.py`](./benchmarks/selector_stress.py)：参数网格压力测试，用于发现 `AUTO` selector 的 regret 边界。
-- [`benchmarks/scheduled_bridge_bench.py`](./benchmarks/scheduled_bridge_bench.py)：把 offline simulator 生成的 plan 转成 `fused_moe_bf16_tiled_scheduled` 的 bridge tensors，并测真实 C++ kernel 耗时。
+- [`cost_model/phase_model.py`](./cost_model/phase_model.py)：`ContentionCostModel` —— 争用感知的事件驱动 makespan 模拟内核(`dag_makespan`)，AWS 实测 ~2% median。
+- [`planners/interval_planner.py`](./planners/interval_planner.py)：`IntervalPlanner` —— async interval-DAG 静态 planner（cost-model 驱动）。
+- [`planners/simulate_schedules.py`](./planners/simulate_schedules.py)：离线对比多种调度算法（coop / expert-parallel / greedy / planner / 各 core 切分）的 makespan。
+- [`planners/planned_moe.py`](./planners/planned_moe.py)：路由直方图 → 缓存 plan → `fused_moe_bf16_tiled_async` 桥。
+- [`planners/bench_planner_overhead.py`](./planners/bench_planner_overhead.py) / [`planners/bench_e2e_scheduling.py`](./planners/bench_e2e_scheduling.py)：plan 开销 / 缓存命中率 + e2e 对比。
 - [`FINDINGS.md`](./FINDINGS.md)：10 个 planner 的 C++ 实现（`csrc/moe_planner/`）、对 Python 的逐位等价、隔离 `T_plan` 基准、以及对 best-of-10 和**精确最优**的 regret 评测结论。C++ 入口：`fused_cpp._C.moe_schedule_plan` / `moe_exact_optimum`。
 
 ## 当前可运行闭环
 
-可以先用 synthetic workload 和 synthetic cost model 跑通 planner selection：
+用路由直方图离线对比多种调度算法（纯 cost model，本地即可运行，无需 kernel/AWS）：
 
 ```bash
-python cpu_moe_schedule_optimization/planners/offline_simulator.py \
-  --distribution zipf \
-  --cores 16
+P=cpu_moe_schedule_optimization/cost_model/profiles/contention_async_aws_8c_sha46228bb_20260703.json
+python cpu_moe_schedule_optimization/planners/simulate_schedules.py $P --preset hotspot
+python cpu_moe_schedule_optimization/planners/simulate_schedules.py $P --experts 512,512,512,512 --shapes
 ```
 
-默认打分使用 complexity-based planner cost model，而不是 Python 原型本身的 wall time。它按 `A`、`C`、cost-table lookup 数、scan 数、sort 规模和 wave packing 操作数估算 `T_plan`。
-
-如需使用固定成本模型做敏感性分析，可以切换到：
-
-```bash
-python cpu_moe_schedule_optimization/planners/offline_simulator.py \
-  --distribution zipf \
-  --cores 16 \
-  --plan-cost-source model
-```
-
-固定模型默认值为：
-
-```text
-fixed    = 1 us
-balanced = 2 us
-uniform  = 5 us
-greedy   = 20 us
-groups   = 30 us
-```
-
-可以用 `--planner-cost` 覆盖：
-
-```bash
-python cpu_moe_schedule_optimization/planners/offline_simulator.py \
-  --distribution zipf \
-  --cores 16 \
-  --plan-cost-source model \
-  --planner-cost fixed=1us \
-  --planner-cost balanced=2us \
-  --planner-cost uniform=5us \
-  --planner-cost greedy=20us \
-  --planner-cost groups=30us
-```
-
-如需查看 Python 原型实际规划开销对总分的影响，可以切换到：
-
-```bash
-python cpu_moe_schedule_optimization/planners/offline_simulator.py \
-  --distribution zipf \
-  --cores 16 \
-  --plan-cost-source measured
-```
+打分使用验证过的 `ContentionCostModel.dag_makespan`（事件驱动 + 争用 derate + overhead-split）。
+新增算法只需在 `simulate_schedules.py` 的 `ALGORITHMS` 注册表里加一个 `fn(experts, planner) -> (label, tasks)`。
+静态 planner 的选型见 `planners/interval_planner.py`；plan 开销 / 缓存命中率见 `planners/bench_planner_overhead.py`。
 
 ## 校准 Expert Cost Model
 
