@@ -45,6 +45,11 @@ PIPELINE_STAGES = [
     "other",
 ]
 
+GATHER_STAGE_ALIASES = ("gather_input", "gather_pack_a")
+W13_STAGE_ALIASES = ("w13", "w13_fused_silu_packc")
+ACTIVATION_STAGE_ALIASES = ("activation",)
+W2_STAGE_ALIASES = ("w2", "w2_packed")
+
 
 def parse_int_list(text: str) -> List[int]:
     values = [int(item.strip()) for item in text.split(",") if item.strip()]
@@ -135,15 +140,33 @@ def parse_trace(path: Path) -> List[Dict[str, object]]:
                 "MoE phase-trace changes"
             )
 
+        def phase_max(*names: str) -> float:
+            values: List[float] = []
+            for name in names:
+                values.extend(phases.get(name, []))
+            return max(values) if values else 0.0
+
+        def gemm_max(*names: str) -> float:
+            values: List[float] = []
+            for name in names:
+                values.extend(gemms.get(name, []))
+            return max(values) if values else 0.0
+
         stage_ms = {
             "plan_materialize": sum(phases.get("plan_materialize", [])),
             "route_build": sum(phases.get("route_build", [])),
             "plan_validate": sum(phases.get("plan_validate", [])),
             "scratch_alloc": sum(phases.get("scratch_alloc", [])),
-            "gather_input": max(phases.get("gather_input", [0.0])),
-            "w13": max(gemms.get("w13", [0.0])),
-            "activation": max(phases.get("activation", [0.0])),
-            "w2": max(gemms.get("w2", [0.0])),
+            "gather_input": phase_max(*GATHER_STAGE_ALIASES),
+            "w13": max(
+                gemm_max(*W13_STAGE_ALIASES),
+                phase_max(*W13_STAGE_ALIASES),
+            ),
+            "activation": phase_max(*ACTIVATION_STAGE_ALIASES),
+            "w2": max(
+                gemm_max(*W2_STAGE_ALIASES),
+                phase_max(*W2_STAGE_ALIASES),
+            ),
             "scatter_route_out": max(phases.get("scatter_route_out", [0.0])),
             "merge_routes_total": sum(phases.get("merge_routes_total", [])),
             "merge_routes_worker_max": max(phases.get("merge_routes", [0.0])),
@@ -236,6 +259,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--std", type=float, default=0.01)
     parser.add_argument("--activation", choices=["silu", "swigluoai"], default="silu")
     parser.add_argument(
+        "--fuse-silu",
+        action="store_true",
+        help="Prepare weights with the fused SiLU epilogue layout.",
+    )
+    parser.add_argument(
         "--weighted-merge",
         action="store_true",
         help="Use weighted top-k merge instead of skip_weighted=True.",
@@ -274,7 +302,7 @@ def main() -> int:
         generator=generator,
         std=args.std,
     )
-    packed = prepare_fused_moe_bf16_tiled_weights(w13, w2)
+    packed = prepare_fused_moe_bf16_tiled_weights(w13, w2, fuse_silu=args.fuse_silu)
 
     print(
         "shape "
@@ -377,6 +405,7 @@ def main() -> int:
             "hidden_size": args.hidden_size,
             "ffn_hidden_size": args.ffn_hidden_size,
             "activation": args.activation,
+            "fuse_silu": args.fuse_silu,
             "top_k": 1,
             "skip_weighted": not args.weighted_merge,
         },
