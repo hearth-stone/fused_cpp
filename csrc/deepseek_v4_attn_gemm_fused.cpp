@@ -2,12 +2,14 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstdint>
 #include <cstring>
 #include <limits>
 #include <tuple>
 #include <vector>
 
+#include "deepseek_v4_attn_gemm_sve.h"
 #include "workspace_pool.h"
 
 #ifdef _OPENMP
@@ -52,12 +54,80 @@ namespace {
 
 constexpr int64_t kTile = 8;
 
+enum class AttnGemmBackend {
+    kNeon,
+    kSve,
+};
+
 int64_t ceil_div_int64(int64_t x, int64_t y) {
     return (x + y - 1) / y;
 }
 
 int64_t ceil_to_multiple(int64_t x, int64_t multiple) {
     return ceil_div_int64(x, multiple) * multiple;
+}
+
+bool env_false_local(const char* name) {
+    const char* value = std::getenv(name);
+    if (value == nullptr) {
+        return false;
+    }
+    return value[0] == '\0' || value[0] == '0' ||
+           std::strcmp(value, "false") == 0 ||
+           std::strcmp(value, "False") == 0 ||
+           std::strcmp(value, "off") == 0 ||
+           std::strcmp(value, "OFF") == 0;
+}
+
+AttnGemmBackend selected_attn_gemm_backend() {
+    const char* backend = std::getenv("FUSED_CPP_POST_GEMM_BACKEND");
+    if (backend == nullptr) {
+        backend = std::getenv("FUSED_CPP_ATTN_GEMM_BACKEND");
+    }
+    if (backend != nullptr) {
+        if (std::strcmp(backend, "sve") == 0 ||
+            std::strcmp(backend, "SVE") == 0) {
+            TORCH_CHECK(::fused_cpp::deepseek_v4::attn_sve::available(),
+                        "FUSED_CPP_ATTN_GEMM_BACKEND=sve requested but this "
+                        "build/CPU does not support SVE BF16");
+            return AttnGemmBackend::kSve;
+        }
+        if (std::strcmp(backend, "neon") == 0 ||
+            std::strcmp(backend, "NEON") == 0 ||
+            std::strcmp(backend, "default") == 0) {
+            return AttnGemmBackend::kNeon;
+        }
+        TORCH_CHECK(std::strcmp(backend, "auto") == 0 ||
+                        std::strcmp(backend, "AUTO") == 0,
+                    "FUSED_CPP_ATTN_GEMM_BACKEND must be one of "
+                    "auto/neon/sve, got ",
+                    backend);
+    }
+
+    // Preserve the existing NEON path by default; SVE is opt-in while it is
+    // being validated across the DeepSeek V4 operator shapes.
+    if (::fused_cpp::deepseek_v4::attn_sve::available() &&
+        std::getenv("FUSED_CPP_ATTN_GEMM_SVE") != nullptr &&
+        !env_false_local("FUSED_CPP_ATTN_GEMM_SVE")) {
+        return AttnGemmBackend::kSve;
+    }
+    return AttnGemmBackend::kNeon;
+}
+
+int64_t attn_gemm_round_k(int64_t K, AttnGemmBackend backend) {
+    if (backend == AttnGemmBackend::kSve) {
+        return ::fused_cpp::deepseek_v4::attn_sve::round_k(
+            static_cast<int>(K));
+    }
+    return ceil_to_multiple(K, kTile);
+}
+
+int64_t attn_gemm_round_n(int64_t N, AttnGemmBackend backend) {
+    if (backend == AttnGemmBackend::kSve) {
+        return ::fused_cpp::deepseek_v4::attn_sve::round_n(
+            static_cast<int>(N));
+    }
+    return ceil_to_multiple(N, kTile);
 }
 
 void check_bf16_cpu_2d(const at::Tensor& tensor, const char* name) {
@@ -166,8 +236,9 @@ PackedWeight checked_packed_weight(at::Tensor packed,
                 name, " packed weight must be contiguous");
     check_int_arg(K, "K");
     check_int_arg(N, "N");
-    const int64_t K_pad = ceil_to_multiple(K, kTile);
-    const int64_t N_pad = ceil_to_multiple(N, kTile);
+    const AttnGemmBackend backend = selected_attn_gemm_backend();
+    const int64_t K_pad = attn_gemm_round_k(K, backend);
+    const int64_t N_pad = attn_gemm_round_n(N, backend);
     TORCH_CHECK(K_pad <= std::numeric_limits<int>::max(),
                 name, " padded K exceeds int32 kernel limit: ", K_pad);
     TORCH_CHECK(N_pad <= std::numeric_limits<int>::max(),
@@ -195,6 +266,11 @@ void dispatch_fp32_gemm(const uint16_t* A,
                         int K,
                         int N,
                         int ldc) {
+    if (selected_attn_gemm_backend() == AttnGemmBackend::kSve) {
+        ::fused_cpp::deepseek_v4::attn_sve::dispatch_f32(
+            A, B_reo, C, A_reorder, M, K, N, ldc);
+        return;
+    }
     gemm_params_t p;
     p.lda = K;
     p.ldb = K;
@@ -285,6 +361,11 @@ void dispatch_bf16_nld_gemm(const uint16_t* A,
                             int K,
                             int N,
                             int ldc) {
+    if (selected_attn_gemm_backend() == AttnGemmBackend::kSve) {
+        ::fused_cpp::deepseek_v4::attn_sve::dispatch_bf16(
+            A, B_reo, C, A_reorder, M, K, N, ldc);
+        return;
+    }
     gemm_params_t p;
     p.lda = K;
     p.ldb = K;
@@ -680,8 +761,13 @@ AttnGemmSelectedOutputs run_attn_gemm_selected_serial(
     const int64_t K_pad = fused_wqa_wkv.K_pad;
     at::Tensor a_storage = make_padded_hidden_states(hidden_states, M, K, K_pad);
     auto workspace_lease = ::fused_cpp::workspace::acquire();
+    const AttnGemmBackend backend = selected_attn_gemm_backend();
+    const int64_t scratch_elems =
+        backend == AttnGemmBackend::kSve
+            ? ::fused_cpp::deepseek_v4::attn_sve::a_scratch_elems(M, K_pad)
+            : std::max<int64_t>(M, 1) * K_pad * 2;
     at::Tensor scratch = workspace_lease.empty(
-        {std::max<int64_t>(1, std::max<int64_t>(M, 1) * K_pad * 2)},
+        {std::max<int64_t>(1, scratch_elems)},
         hidden_states.options());
 
     AttnGemmSelectedOutputs outputs;
@@ -741,8 +827,12 @@ AttnGemmSelectedOutputs run_attn_gemm_selected_mt(
     const int64_t num_threads = static_cast<int64_t>(core_ids.size());
     const int64_t rows_per_thread = ceil_div_int64(std::max<int64_t>(M, 1),
                                                    num_threads);
+    const AttnGemmBackend backend = selected_attn_gemm_backend();
     const int64_t scratch_stride =
-        std::max<int64_t>(1, rows_per_thread * K_pad * 2);
+        backend == AttnGemmBackend::kSve
+            ? ::fused_cpp::deepseek_v4::attn_sve::a_scratch_elems(
+                  rows_per_thread, K_pad)
+            : std::max<int64_t>(1, rows_per_thread * K_pad * 2);
     auto workspace_lease = ::fused_cpp::workspace::acquire();
     at::Tensor scratch = workspace_lease.empty({num_threads * scratch_stride},
                                                hidden_states.options());
@@ -973,8 +1063,12 @@ AttnGemmNormedOutputs run_attn_gemm_normed_mt(
     const int64_t num_threads = static_cast<int64_t>(core_ids.size());
     const int64_t rows_per_thread = ceil_div_int64(std::max<int64_t>(M, 1),
                                                    num_threads);
+    const AttnGemmBackend backend = selected_attn_gemm_backend();
     const int64_t scratch_stride =
-        std::max<int64_t>(1, rows_per_thread * K_pad * 2);
+        backend == AttnGemmBackend::kSve
+            ? ::fused_cpp::deepseek_v4::attn_sve::a_scratch_elems(
+                  rows_per_thread, K_pad)
+            : std::max<int64_t>(1, rows_per_thread * K_pad * 2);
     auto workspace_lease = ::fused_cpp::workspace::acquire();
     at::Tensor scratch = workspace_lease.empty({num_threads * scratch_stride},
                                                hidden_states.options());
@@ -1116,8 +1210,9 @@ fused_wqa_wkv_compressor_kv_score_indexer_compressor_kv_score_indexer_weights_pr
     const int64_t N = weight.size(1);
     check_int_arg(K, "K");
     check_int_arg(N, "N");
-    const int64_t K_pad = ceil_to_multiple(K, kTile);
-    const int64_t N_pad = ceil_to_multiple(N, kTile);
+    const AttnGemmBackend backend = selected_attn_gemm_backend();
+    const int64_t K_pad = attn_gemm_round_k(K, backend);
+    const int64_t N_pad = attn_gemm_round_n(N, backend);
 
     at::Tensor weight_padded;
     if (K_pad == K && N_pad == N && weight.is_contiguous()) {
@@ -1128,8 +1223,14 @@ fused_wqa_wkv_compressor_kv_score_indexer_compressor_kv_score_indexer_weights_pr
     }
 
     at::Tensor packed = at::empty({K_pad * N_pad}, weight.options());
-    bf16_pack_b(bf16_data_const(weight_padded), bf16_data(packed),
-                static_cast<int>(K_pad), static_cast<int>(N_pad));
+    if (backend == AttnGemmBackend::kSve) {
+        ::fused_cpp::deepseek_v4::attn_sve::pack_b(
+            bf16_data_const(weight_padded), bf16_data(packed),
+            static_cast<int>(K_pad), static_cast<int>(N_pad));
+    } else {
+        bf16_pack_b(bf16_data_const(weight_padded), bf16_data(packed),
+                    static_cast<int>(K_pad), static_cast<int>(N_pad));
+    }
     return std::make_tuple(packed, K, N);
 #endif
 }

@@ -13,9 +13,14 @@
 #include <tuple>
 #include <vector>
 
+#include "deepseek_v4_attn_gemm_sve.h"
 #include "deepseek_v4_q_norm_rope_sve.h"
 #include "profile_utils.h"
 #include "workspace_pool.h"
+
+#ifdef __aarch64__
+#include "gemm_params.h"
+#endif
 
 #if defined(__ARM_FEATURE_SVE)
 #include <arm_sve.h>
@@ -27,6 +32,29 @@
 
 #ifdef _OPENMP
 #include <omp.h>
+#endif
+
+#ifdef __aarch64__
+extern "C" {
+void bf16gemm_k_ld(const uint16_t* A, const uint16_t* B_reo, float* C,
+                   uint16_t* A_reorder, const gemm_params_t* params);
+void bf16gemm_k_ld1(const uint16_t* A, const uint16_t* B_reo, float* C,
+                    uint16_t* A_reorder, const gemm_params_t* params);
+void bf16gemm_k_ld2(const uint16_t* A, const uint16_t* B_reo, float* C,
+                    uint16_t* A_reorder, const gemm_params_t* params);
+void bf16gemm_k_ld4(const uint16_t* A, const uint16_t* B_reo, float* C,
+                    uint16_t* A_reorder, const gemm_params_t* params);
+#ifdef __linux__
+void bf16gemm_k_nld_b(const uint16_t* A, const uint16_t* B_reo, uint16_t* C,
+                      uint16_t* A_reorder, const gemm_params_t* params);
+void bf16gemm_k_nld1_b(const uint16_t* A, const uint16_t* B_reo, uint16_t* C,
+                       uint16_t* A_reorder, const gemm_params_t* params);
+void bf16gemm_k_nld2_b(const uint16_t* A, const uint16_t* B_reo, uint16_t* C,
+                       uint16_t* A_reorder, const gemm_params_t* params);
+void bf16gemm_k_nld4_b(const uint16_t* A, const uint16_t* B_reo, uint16_t* C,
+                       uint16_t* A_reorder, const gemm_params_t* params);
+#endif
+}
 #endif
 
 at::Tensor bf16_linear_to_dtype(at::Tensor input,
@@ -129,6 +157,57 @@ bool DeepSeekV4KvRopeWriteKvEnabled() {
   }
   return !(value[0] == '\0' || std::strcmp(value, "0") == 0 ||
            std::strcmp(value, "false") == 0 || std::strcmp(value, "FALSE") == 0);
+}
+
+enum class PostGemmBackend {
+  kNeon,
+  kSve,
+};
+
+bool EnvFalseLocal(const char* name) {
+  const char* value = std::getenv(name);
+  if (value == nullptr) {
+    return false;
+  }
+  return value[0] == '\0' || value[0] == '0' ||
+      std::strcmp(value, "false") == 0 ||
+      std::strcmp(value, "False") == 0 ||
+      std::strcmp(value, "off") == 0 ||
+      std::strcmp(value, "OFF") == 0;
+}
+
+PostGemmBackend SelectedPostGemmBackend() {
+  const char* backend = std::getenv("FUSED_CPP_POST_GEMM_BACKEND");
+  if (backend == nullptr) {
+    backend = std::getenv("FUSED_CPP_ATTN_GEMM_BACKEND");
+  }
+  if (backend != nullptr) {
+    if (std::strcmp(backend, "sve") == 0 ||
+        std::strcmp(backend, "SVE") == 0) {
+      TORCH_CHECK(
+          ::fused_cpp::deepseek_v4::attn_sve::available(),
+          "post GEMM backend=sve requested but this build/CPU does not "
+          "support SVE BF16");
+      return PostGemmBackend::kSve;
+    }
+    if (std::strcmp(backend, "neon") == 0 ||
+        std::strcmp(backend, "NEON") == 0 ||
+        std::strcmp(backend, "default") == 0) {
+      return PostGemmBackend::kNeon;
+    }
+    TORCH_CHECK(
+        std::strcmp(backend, "auto") == 0 ||
+            std::strcmp(backend, "AUTO") == 0,
+        "FUSED_CPP_POST_GEMM_BACKEND/FUSED_CPP_ATTN_GEMM_BACKEND must be "
+        "one of auto/neon/sve, got ",
+        backend);
+  }
+  if (::fused_cpp::deepseek_v4::attn_sve::available() &&
+      std::getenv("FUSED_CPP_ATTN_GEMM_SVE") != nullptr &&
+      !EnvFalseLocal("FUSED_CPP_ATTN_GEMM_SVE")) {
+    return PostGemmBackend::kSve;
+  }
+  return PostGemmBackend::kNeon;
 }
 
 void CheckCpuTensor(const at::Tensor& tensor, const char* name) {
@@ -412,23 +491,281 @@ bool TryWriteSparseIndexerShortPathRaw(const at::Tensor& topk_indices_buffer,
   return true;
 }
 
+const uint16_t* Bf16ConstData(const at::Tensor& tensor) {
+  return reinterpret_cast<const uint16_t*>(
+      tensor.data_ptr<at::BFloat16>());
+}
+
+uint16_t* Bf16Data(const at::Tensor& tensor) {
+  return reinterpret_cast<uint16_t*>(tensor.data_ptr<at::BFloat16>());
+}
+
+#if defined(__aarch64__)
+void DispatchPostGemmF32Neon(const uint16_t* A,
+                             const uint16_t* B_reo,
+                             float* C,
+                             uint16_t* A_reorder,
+                             int M,
+                             int K,
+                             int N,
+                             int ldc) {
+  gemm_params_t p;
+  p.lda = K;
+  p.ldb = K;
+  p.ldc = ldc;
+
+  int processed = 0;
+  const int m_full = (M / 8) * 8;
+  if (m_full > 0) {
+    p.m = m_full;
+    p.k = K;
+    p.n = N;
+    bf16gemm_k_ld(A, B_reo, C, A_reorder, &p);
+    processed = m_full;
+  }
+
+  int m_rem = M - processed;
+  if (m_rem == 0) {
+    return;
+  }
+
+  const uint16_t* At = A + static_cast<int64_t>(processed) * K;
+  float* Ct = C + static_cast<int64_t>(processed) * ldc;
+  uint16_t* A_reo_t = A_reorder + static_cast<int64_t>(processed) * K;
+  if (m_rem >= 4) {
+    p.m = 4;
+    p.k = K;
+    p.n = N;
+    bf16gemm_k_ld4(At, B_reo, Ct, A_reo_t, &p);
+    processed += 4;
+    m_rem -= 4;
+    At = A + static_cast<int64_t>(processed) * K;
+    Ct = C + static_cast<int64_t>(processed) * ldc;
+    A_reo_t = A_reorder + static_cast<int64_t>(processed) * K;
+  }
+  if (m_rem >= 2) {
+    p.m = 2;
+    p.k = K;
+    p.n = N;
+    bf16gemm_k_ld2(At, B_reo, Ct, A_reo_t, &p);
+    processed += 2;
+    m_rem -= 2;
+    At = A + static_cast<int64_t>(processed) * K;
+    Ct = C + static_cast<int64_t>(processed) * ldc;
+    A_reo_t = A_reorder + static_cast<int64_t>(processed) * K;
+  }
+  if (m_rem >= 1) {
+    p.m = 1;
+    p.k = K;
+    p.n = N;
+    bf16gemm_k_ld1(At, B_reo, Ct, A_reo_t, &p);
+  }
+}
+
+void DispatchPostGemmBf16Neon(const uint16_t* A,
+                              const uint16_t* B_reo,
+                              uint16_t* C,
+                              uint16_t* A_reorder,
+                              int M,
+                              int K,
+                              int N,
+                              int ldc) {
+#if defined(__linux__)
+  gemm_params_t p;
+  p.lda = K;
+  p.ldb = K;
+  p.ldc = ldc;
+
+  int processed = 0;
+  const int m_full = (M / 8) * 8;
+  if (m_full > 0) {
+    p.m = m_full;
+    p.k = K;
+    p.n = N;
+    bf16gemm_k_nld_b(A, B_reo, C, A_reorder, &p);
+    processed = m_full;
+  }
+
+  int m_rem = M - processed;
+  if (m_rem == 0) {
+    return;
+  }
+
+  const uint16_t* At = A + static_cast<int64_t>(processed) * K;
+  uint16_t* Ct = C + static_cast<int64_t>(processed) * ldc;
+  uint16_t* A_reo_t = A_reorder + static_cast<int64_t>(processed) * K;
+  if (m_rem >= 4) {
+    p.m = 4;
+    p.k = K;
+    p.n = N;
+    bf16gemm_k_nld4_b(At, B_reo, Ct, A_reo_t, &p);
+    processed += 4;
+    m_rem -= 4;
+    At = A + static_cast<int64_t>(processed) * K;
+    Ct = C + static_cast<int64_t>(processed) * ldc;
+    A_reo_t = A_reorder + static_cast<int64_t>(processed) * K;
+  }
+  if (m_rem >= 2) {
+    p.m = 2;
+    p.k = K;
+    p.n = N;
+    bf16gemm_k_nld2_b(At, B_reo, Ct, A_reo_t, &p);
+    processed += 2;
+    m_rem -= 2;
+    At = A + static_cast<int64_t>(processed) * K;
+    Ct = C + static_cast<int64_t>(processed) * ldc;
+    A_reo_t = A_reorder + static_cast<int64_t>(processed) * K;
+  }
+  if (m_rem >= 1) {
+    p.m = 1;
+    p.k = K;
+    p.n = N;
+    bf16gemm_k_nld1_b(At, B_reo, Ct, A_reo_t, &p);
+  }
+#else
+  std::vector<float> tmp(static_cast<size_t>(M) * static_cast<size_t>(ldc));
+  DispatchPostGemmF32Neon(A, B_reo, tmp.data(), A_reorder, M, K, N, ldc);
+  for (int64_t i = 0; i < static_cast<int64_t>(M) * ldc; ++i) {
+    uint32_t bits;
+    std::memcpy(&bits, &tmp[static_cast<size_t>(i)], sizeof(bits));
+    const uint32_t lsb = (bits >> 16) & 1u;
+    bits += 0x7fffu + lsb;
+    C[i] = static_cast<uint16_t>(bits >> 16);
+  }
+#endif
+}
+#endif
+
+at::Tensor PostLinearPrepackedToDtypeWorkspace(
+    const at::Tensor& input,
+    const at::Tensor& packed_weight,
+    int64_t K,
+    int64_t N,
+    int64_t Np,
+    at::ScalarType dtype,
+    ::fused_cpp::workspace::WorkspaceLease& workspace) {
+  TORCH_CHECK(dtype == at::kBFloat16 || dtype == at::kFloat,
+              "PostLinearPrepackedToDtypeWorkspace only supports bf16/fp32 "
+              "output, got ",
+              dtype);
+  CheckCpuTensor(input, "post GEMM input");
+  CheckCpuTensor(packed_weight, "post GEMM packed_weight");
+  CheckDim(input, "post GEMM input", 2);
+  TORCH_CHECK(input.scalar_type() == at::kBFloat16,
+              "post GEMM input must be torch.bfloat16, got ",
+              input.scalar_type());
+  TORCH_CHECK(packed_weight.scalar_type() == at::kBFloat16 &&
+                  packed_weight.is_contiguous(),
+              "post GEMM packed_weight must be contiguous torch.bfloat16");
+  TORCH_CHECK(input.size(1) == K,
+              "post GEMM K mismatch: input K=", input.size(1),
+              " packed K=", K);
+  TORCH_CHECK(K > 0 && N > 0 && Np >= N,
+              "post GEMM invalid metadata K=", K, " N=", N, " Np=", Np);
+  TORCH_CHECK(K % 8 == 0 && Np % 8 == 0,
+              "post GEMM requires K multiple of 8 and Np multiple of 8, got K=",
+              K, " Np=", Np);
+  TORCH_CHECK(packed_weight.numel() == K * Np,
+              "post GEMM packed_weight numel mismatch: expected ", K * Np,
+              ", got ", packed_weight.numel());
+
+  const int64_t M = input.size(0);
+  at::Tensor output = at::empty({M, Np}, input.options().dtype(dtype));
+  if (M == 0) {
+    return N == Np ? output
+                   : output.narrow(1, 0, N).contiguous();
+  }
+
+#if !defined(__aarch64__)
+  (void)workspace;
+  return ::bf16_linear_prepacked_to_dtype(
+      input, packed_weight, K, N, Np, dtype == at::kBFloat16, 0);
+#else
+  const PostGemmBackend backend = SelectedPostGemmBackend();
+  if (backend == PostGemmBackend::kSve) {
+    TORCH_CHECK(Np % ::fused_cpp::deepseek_v4::attn_sve::n_tile() == 0,
+                "post GEMM SVE packed Np must be multiple of SVE n_tile=",
+                ::fused_cpp::deepseek_v4::attn_sve::n_tile(),
+                ", got ", Np);
+  }
+
+  int64_t num_threads = 1;
+#ifdef _OPENMP
+  num_threads = omp_get_max_threads();
+  if (num_threads <= 0) {
+    num_threads = 1;
+  }
+#endif
+  const int64_t rows_per_thread =
+      (M + num_threads - 1) / num_threads;
+  const int64_t scratch_stride =
+      backend == PostGemmBackend::kSve
+          ? ::fused_cpp::deepseek_v4::attn_sve::a_scratch_elems(
+                rows_per_thread, K)
+          : std::max<int64_t>(1, rows_per_thread * K);
+  at::Tensor scratch = workspace.empty(
+      {std::max<int64_t>(1, num_threads * scratch_stride)},
+      input.options());
+
+  at::Tensor input_contig = input.contiguous();
+  const uint16_t* a_ptr = Bf16ConstData(input_contig);
+  const uint16_t* b_ptr = Bf16ConstData(packed_weight);
+  uint16_t* scratch_ptr = Bf16Data(scratch);
+
+#ifdef _OPENMP
+#pragma omp parallel num_threads(num_threads)
+#endif
+  {
+#ifdef _OPENMP
+    const int64_t tid = omp_get_thread_num();
+#else
+    const int64_t tid = 0;
+#endif
+    const int64_t row_start = tid * rows_per_thread;
+    const int64_t row_count =
+        row_start >= M ? 0 : std::min<int64_t>(rows_per_thread, M - row_start);
+    if (row_count > 0) {
+      uint16_t* thread_scratch =
+          scratch_ptr + tid * scratch_stride;
+      const uint16_t* a_row = a_ptr + row_start * K;
+      if (dtype == at::kBFloat16) {
+        uint16_t* c_row = Bf16Data(output) + row_start * Np;
+        if (backend == PostGemmBackend::kSve) {
+          ::fused_cpp::deepseek_v4::attn_sve::dispatch_bf16(
+              a_row, b_ptr, c_row, thread_scratch,
+              static_cast<int>(row_count), static_cast<int>(K),
+              static_cast<int>(Np), static_cast<int>(Np));
+        } else {
+          DispatchPostGemmBf16Neon(
+              a_row, b_ptr, c_row, thread_scratch,
+              static_cast<int>(row_count), static_cast<int>(K),
+              static_cast<int>(Np), static_cast<int>(Np));
+        }
+      } else {
+        float* c_row = output.data_ptr<float>() + row_start * Np;
+        if (backend == PostGemmBackend::kSve) {
+          ::fused_cpp::deepseek_v4::attn_sve::dispatch_f32(
+              a_row, b_ptr, c_row, thread_scratch,
+              static_cast<int>(row_count), static_cast<int>(K),
+              static_cast<int>(Np), static_cast<int>(Np));
+        } else {
+          DispatchPostGemmF32Neon(
+              a_row, b_ptr, c_row, thread_scratch,
+              static_cast<int>(row_count), static_cast<int>(K),
+              static_cast<int>(Np), static_cast<int>(Np));
+        }
+      }
+    }
+  }
+  return N == Np ? output : output.narrow(1, 0, N).contiguous();
+#endif
+}
+
 at::Tensor LinearToDtype(const at::Tensor& input, const at::Tensor& weight, at::ScalarType dtype) {
   TORCH_CHECK(dtype == at::kBFloat16 || dtype == at::kFloat,
               "LinearToDtype only supports bf16/fp32 output with bf16gemm, got ",
               dtype);
   return ::bf16_linear_to_dtype(input, weight, dtype == at::kBFloat16, 0);
-}
-
-at::Tensor LinearPrepackedToDtype(const at::Tensor& input,
-                                  const at::Tensor& packed_weight,
-                                  int64_t K,
-                                  int64_t N,
-                                  int64_t Np,
-                                  at::ScalarType dtype) {
-  TORCH_CHECK(dtype == at::kBFloat16 || dtype == at::kFloat,
-              "LinearPrepackedToDtype only supports bf16/fp32 output with bf16gemm, got ",
-              dtype);
-  return ::bf16_linear_prepacked_to_dtype(input, packed_weight, K, N, Np, dtype == at::kBFloat16, 0);
 }
 
 at::Tensor LinearPrepackedToDtypeWorkspace(
@@ -444,13 +781,11 @@ at::Tensor LinearPrepackedToDtypeWorkspace(
               "with bf16gemm, got ",
               dtype);
   if (N != Np) {
-    return LinearPrepackedToDtype(input, packed_weight, K, N, Np, dtype);
+    return PostLinearPrepackedToDtypeWorkspace(
+        input, packed_weight, K, N, Np, dtype, workspace);
   }
-  at::Tensor output =
-      workspace.empty({input.size(0), Np}, input.options().dtype(dtype));
-  ::bf16_linear_prepacked_to_dtype_out(input, packed_weight, K, N, Np,
-                                       dtype == at::kBFloat16, 0, output);
-  return output;
+  return PostLinearPrepackedToDtypeWorkspace(
+      input, packed_weight, K, N, Np, dtype, workspace);
 }
 
 at::Tensor GptjRopeApply(const at::Tensor& x,
@@ -2353,13 +2688,15 @@ at::Tensor RunMainQAndSwaPrepacked(const at::Tensor& qr,
 
   const int64_t main_num_heads = main_wq_b_N / main_head_dim;
   FUSED_CPP_PROFILE_START(phase_start);
-  at::Tensor q = LinearPrepackedToDtype(
+  auto workspace_lease = ::fused_cpp::workspace::acquire();
+  at::Tensor q = LinearPrepackedToDtypeWorkspace(
                      qr,
                      main_wq_b_packed,
                      main_wq_b_K,
                      main_wq_b_N,
                      main_wq_b_Np,
-                     qr.scalar_type())
+                     qr.scalar_type(),
+                     workspace_lease)
                      .reshape({qr.size(0), main_num_heads, main_head_dim});
   FUSED_CPP_PROFILE_ADD_IF_PTR(
       profile_ptr == nullptr ? nullptr : &profile_ptr->main_q_gemm_ms,

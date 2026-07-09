@@ -24,9 +24,12 @@ from typing import Literal, TypeVar
 import torch
 import torch.nn.functional as F
 
+from fused_cpp.deepseek_v4_attn_gemm_fused import (
+    fused_wqa_wkv_compressor_kv_score_indexer_compressor_kv_score_indexer_weights_proj_fused_prepare
+    as _prepare_attn_gemm_weight,
+)
 from fused_cpp.bf16_linear import (
     PreparedBF16LinearWeight,
-    prepare as _prepare_bf16_linear_weight,
 )
 
 try:
@@ -523,10 +526,21 @@ def prepare_deepseek_v4_post_gemm_weights(
     indexer_wq_b_weight: torch.Tensor | None = None,
 ) -> PreparedDeepSeekV4PostGemmWeights:
     """Prepack post-GEMM bf16 linear weights for repeated prefill calls."""
+    def prepare_weight(weight: torch.Tensor) -> PreparedBF16LinearWeight:
+        packed, k, n = _prepare_attn_gemm_weight(weight.t().contiguous())
+        k_pad = ((int(k) + 7) // 8) * 8
+        n_padded = int(packed.numel()) // k_pad
+        return PreparedBF16LinearWeight(
+            packed_weight=packed,
+            k=int(k),
+            n=int(n),
+            n_padded=n_padded,
+        )
+
     return PreparedDeepSeekV4PostGemmWeights(
-        main_wq_b=_prepare_bf16_linear_weight(main_wq_b_weight),
+        main_wq_b=prepare_weight(main_wq_b_weight),
         indexer_wq_b=(
-            _prepare_bf16_linear_weight(indexer_wq_b_weight)
+            prepare_weight(indexer_wq_b_weight)
             if indexer_wq_b_weight is not None
             else None
         ),
@@ -667,8 +681,16 @@ def post_gemm_parallel_stage_cpp(
     """Run the native torch-API C++ baseline."""
     if inputs.prepared_weights is not None:
         return post_gemm_parallel_stage_cpp_prepacked(inputs, inputs.prepared_weights)
-    if inputs.variant() != "c4a":
-        weights = prepare_deepseek_v4_post_gemm_weights(inputs.main_wq_b_weight)
+    if _HAS_DEEPSEEK_V4_POST_GEMM_STAGE_PREPACKED:
+        indexer_wq_b_weight = (
+            _require(inputs.indexer_wq_b_weight, "indexer_wq_b_weight")
+            if inputs.variant() == "c4a"
+            else None
+        )
+        weights = prepare_deepseek_v4_post_gemm_weights(
+            inputs.main_wq_b_weight,
+            indexer_wq_b_weight,
+        )
         return post_gemm_parallel_stage_cpp_prepacked(inputs, weights)
     if not _HAS_DEEPSEEK_V4_POST_GEMM_STAGE:
         raise RuntimeError("DeepSeek V4 post-GEMM C++ stage is unavailable")
