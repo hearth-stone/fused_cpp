@@ -20,6 +20,8 @@ rsync -avzP \
     --exclude='.claude/' \
     --exclude='.gemini/' \
     --exclude='.venv/' \
+    --exclude='tmp/' \
+    --exclude='cpu_moe_schedule_optimization/cost_model/profiles/*.json' \
     --exclude='bench/sdpa/sdpa_versions_*.csv' \
     --exclude='bench/sdpa/sdpa_versions_*.json' \
-    ./ "AmazonECS8Cores:/home/ubuntu/zhangxu/fused_cpp"
+    ./ "AmazonECS8Cores:/home/ubuntu/zhangxu/fused_cpp/"

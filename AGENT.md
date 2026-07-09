@@ -59,6 +59,12 @@ Example:
 ssh AmazonECS8Cores 'cd /home/ubuntu/zhangxu/fused_cpp && . .venv/bin/activate && python -c "import sys; print(sys.executable)"'
 ```
 
+### Amazon C5 64 Cores
+
+- Host alias: `AmazonC564Cores`
+- Remote work root: `/home/ubuntu/zhangxu`
+- Benchmark cores: bind benchmark processes to cores `0` through `31`
+
 ## Benchmark Hygiene
 
 For single-thread microbenchmarks, bind each process to one dedicated core with
