@@ -34,6 +34,7 @@
 
 #ifdef __aarch64__
 #include "gemm_params.h"
+#include "moe_sve_fused.h"
 #include "profile_utils.h"
 
 extern "C" {
@@ -79,17 +80,6 @@ void bf16gemm_k_ld_silu_poly5(const uint16_t* A, const uint16_t* B_reo,
 void bf16gemm_k_ld_silu_poly6(const uint16_t* A, const uint16_t* B_reo,
                               uint16_t* C, uint16_t* A_reorder,
                               const gemm_params_t* params);
-// Pre-packed-A fused kernels (a_mode=packed): A already in reorder layout,
-// shared across an N-split team; skip the in-kernel strided repack. m8 only.
-void bf16gemm_k_ldp_silu_poly4(const uint16_t* A, const uint16_t* B_reo,
-                               uint16_t* C, uint16_t* A_reorder,
-                               const gemm_params_t* params);
-void bf16gemm_k_ldp_silu_poly5(const uint16_t* A, const uint16_t* B_reo,
-                               uint16_t* C, uint16_t* A_reorder,
-                               const gemm_params_t* params);
-void bf16gemm_k_ldp_silu_poly6(const uint16_t* A, const uint16_t* B_reo,
-                               uint16_t* C, uint16_t* A_reorder,
-                               const gemm_params_t* params);
 // Packed-C fused kernels (fused_cpp-owned asm): pre-packed A read + reorder-m8
 // packed-C store, so intermediate is written directly in w2 pre-packed layout.
 void bf16gemm_k_ldp_silu_poly4_packc(const uint16_t*, const uint16_t*, uint16_t*,
@@ -114,6 +104,57 @@ void bf16gemm_k_ldp_silu_poly6_packc_m1(const uint16_t*, const uint16_t*, uint16
 void bf16gemm_k_ldp_m4(const uint16_t*, const uint16_t*, float*, uint16_t*, const gemm_params_t*);
 void bf16gemm_k_ldp_m2(const uint16_t*, const uint16_t*, float*, uint16_t*, const gemm_params_t*);
 void bf16gemm_k_ldp_m1(const uint16_t*, const uint16_t*, float*, uint16_t*, const gemm_params_t*);
+#if defined(__ARM_FEATURE_SVE) && defined(__ARM_FEATURE_BF16)
+void moe_sve_w13_silu_poly4_packc_m12(const uint16_t*, const uint16_t*, uint16_t*,
+                                      uint16_t*, const gemm_params_t*);
+void moe_sve_w13_silu_poly5_packc_m12(const uint16_t*, const uint16_t*, uint16_t*,
+                                      uint16_t*, const gemm_params_t*);
+void moe_sve_w13_silu_poly6_packc_m12(const uint16_t*, const uint16_t*, uint16_t*,
+                                      uint16_t*, const gemm_params_t*);
+void moe_sve_w13_silu_poly4_packc_m12_rows(const uint16_t*, const uint16_t*,
+                                           uint16_t*, uint16_t*,
+                                           const gemm_params_t*);
+void moe_sve_w13_silu_poly5_packc_m12_rows(const uint16_t*, const uint16_t*,
+                                           uint16_t*, uint16_t*,
+                                           const gemm_params_t*);
+void moe_sve_w13_silu_poly6_packc_m12_rows(const uint16_t*, const uint16_t*,
+                                           uint16_t*, uint16_t*,
+                                           const gemm_params_t*);
+void moe_sve_w13_silu_poly4_packc(const uint16_t*, const uint16_t*, uint16_t*,
+                                  uint16_t*, const gemm_params_t*);
+void moe_sve_w13_silu_poly5_packc(const uint16_t*, const uint16_t*, uint16_t*,
+                                  uint16_t*, const gemm_params_t*);
+void moe_sve_w13_silu_poly6_packc(const uint16_t*, const uint16_t*, uint16_t*,
+                                  uint16_t*, const gemm_params_t*);
+void moe_sve_w13_silu_poly4_packc_m4(const uint16_t*, const uint16_t*, uint16_t*,
+                                     uint16_t*, const gemm_params_t*);
+void moe_sve_w13_silu_poly5_packc_m4(const uint16_t*, const uint16_t*, uint16_t*,
+                                     uint16_t*, const gemm_params_t*);
+void moe_sve_w13_silu_poly6_packc_m4(const uint16_t*, const uint16_t*, uint16_t*,
+                                     uint16_t*, const gemm_params_t*);
+void moe_sve_w13_silu_poly4_packc_m2(const uint16_t*, const uint16_t*, uint16_t*,
+                                     uint16_t*, const gemm_params_t*);
+void moe_sve_w13_silu_poly5_packc_m2(const uint16_t*, const uint16_t*, uint16_t*,
+                                     uint16_t*, const gemm_params_t*);
+void moe_sve_w13_silu_poly6_packc_m2(const uint16_t*, const uint16_t*, uint16_t*,
+                                     uint16_t*, const gemm_params_t*);
+void moe_sve_w13_silu_poly4_packc_m1(const uint16_t*, const uint16_t*, uint16_t*,
+                                     uint16_t*, const gemm_params_t*);
+void moe_sve_w13_silu_poly5_packc_m1(const uint16_t*, const uint16_t*, uint16_t*,
+                                     uint16_t*, const gemm_params_t*);
+void moe_sve_w13_silu_poly6_packc_m1(const uint16_t*, const uint16_t*, uint16_t*,
+                                     uint16_t*, const gemm_params_t*);
+void moe_sve_w2_packed(const uint16_t*, const uint16_t*, float*, uint16_t*,
+                       const gemm_params_t*);
+void moe_sve_w2_packed_m12(const uint16_t*, const uint16_t*, float*, uint16_t*,
+                           const gemm_params_t*);
+void moe_sve_w2_packed_m4(const uint16_t*, const uint16_t*, float*, uint16_t*,
+                          const gemm_params_t*);
+void moe_sve_w2_packed_m2(const uint16_t*, const uint16_t*, float*, uint16_t*,
+                          const gemm_params_t*);
+void moe_sve_w2_packed_m1(const uint16_t*, const uint16_t*, float*, uint16_t*,
+                          const gemm_params_t*);
+#endif
 // M-tail (m=1/2/4) fused silu kernels.
 void bf16gemm_k_ld_silu_poly4_m1(const uint16_t*, const uint16_t*, uint16_t*,
                                  uint16_t*, const gemm_params_t*);
@@ -139,6 +180,9 @@ void bf16gemm_k_ld_silu_poly6_m4(const uint16_t*, const uint16_t*, uint16_t*,
 namespace {
 
 constexpr int64_t kKernelTile = 8;
+
+int64_t sve_m12_main_rows(int64_t rows);
+int64_t sve_hybrid_packed_rows(int64_t rows);
 
 int64_t ceil_div_int64(int64_t x, int64_t y) {
     return (x + y - 1) / y;
@@ -177,6 +221,14 @@ SplitRange n_split_range(int N, int64_t group_size, int64_t local_tid) {
     return SplitRange{
         block_range.begin * kKernelTile,
         block_range.size * kKernelTile};
+}
+
+SplitRange n_split_range_tile(int N, int64_t group_size, int64_t local_tid,
+                              int64_t tile) {
+    const int64_t t = std::max<int64_t>(tile, kKernelTile);
+    const SplitRange block_range =
+        split_evenly(static_cast<int64_t>(N) / t, group_size, local_tid);
+    return SplitRange{block_range.begin * t, block_range.size * t};
 }
 
 void check_positive_int(int64_t value, const char* name) {
@@ -313,6 +365,21 @@ struct GemmSplitPlan {
     MoeGemmSplit split = MoeGemmSplit::kN;
 };
 
+struct Gemm2DSplitPlan {
+    int64_t tm = 1;
+    int64_t tn = 1;
+    int64_t n_tile = kKernelTile;
+};
+
+struct Gemm2DThreadRange {
+    int64_t m_block_begin = 0;
+    int64_t m_blocks = 0;
+    int64_t row_begin = 0;
+    int64_t rows = 0;
+    int64_t n_begin = 0;
+    int64_t n_cols = 0;
+};
+
 // Per-thread work range for a chosen plan. M-split -> row range (8-row aligned
 // save the single remainder thread); N-split -> column range (kKernelTile-block
 // aligned). N is expected already padded to a multiple of kKernelTile.
@@ -351,6 +418,44 @@ int64_t n_split_active_threads(int64_t N, int64_t group_size) {
     return std::min(group_size, blocks);
 }
 
+Gemm2DSplitPlan plan_2d_gemm_split(int64_t M, int64_t K, int64_t N,
+                                   int64_t group_size, int64_t n_tile) {
+    (void)M;
+    (void)K;
+    (void)N;
+    const int64_t threads = std::max<int64_t>(group_size, 1);
+    const int64_t tile = std::max<int64_t>(n_tile, kKernelTile);
+    return Gemm2DSplitPlan{1, threads, tile};
+}
+
+Gemm2DThreadRange gemm_2d_thread_range(const Gemm2DSplitPlan& plan,
+                                       int64_t M, int64_t N,
+                                       int64_t local_tid) {
+    const int64_t team_threads = plan.tm * plan.tn;
+    if (M <= 0 || N <= 0 || local_tid < 0 || local_tid >= team_threads) {
+        return Gemm2DThreadRange{};
+    }
+    const int64_t m_id = local_tid / plan.tn;
+    const int64_t n_id = local_tid % plan.tn;
+    const int64_t m_blocks_total = ceil_div_int64(M, kKernelTile);
+    const int64_t n_tiles_total = N / plan.n_tile;
+    const SplitRange m_block_range =
+        split_evenly(m_blocks_total, plan.tm, m_id);
+    const SplitRange n_tile_range =
+        split_evenly(n_tiles_total, plan.tn, n_id);
+    Gemm2DThreadRange range;
+    range.m_block_begin = m_block_range.begin;
+    range.m_blocks = m_block_range.size;
+    range.row_begin = m_block_range.begin * kKernelTile;
+    if (range.row_begin < M) {
+        range.rows = std::min<int64_t>(
+            m_block_range.size * kKernelTile, M - range.row_begin);
+    }
+    range.n_begin = n_tile_range.begin * plan.n_tile;
+    range.n_cols = n_tile_range.size * plan.n_tile;
+    return range;
+}
+
 struct GemmSplitContext {
     MoeGemmStage stage = MoeGemmStage::kW13;
     int64_t M = 0;
@@ -386,13 +491,7 @@ using SplitSelectorFn = MoeGemmSplit (*)(const GemmSplitContext&);
 // w13/w2. TODO(cost-model): a measured team-GEMM cost table can refine this if
 // future shapes/hardware differ; this selector is the one place to change.
 MoeGemmSplit default_split_selector(const GemmSplitContext& ctx) {
-    // Fall back to M-split only when N-split cannot fill the team (too few
-    // kKernelTile column-blocks) but M-split can. Otherwise default to N-split.
-    if (ctx.group_size > 1 &&
-        ctx.n_active_threads < ctx.group_size &&
-        ctx.m_active_threads > ctx.n_active_threads) {
-        return MoeGemmSplit::kM;
-    }
+    (void)ctx;
     return MoeGemmSplit::kN;  // default
 }
 
@@ -530,6 +629,8 @@ struct FusedSiluKernelSet {
     FusedSiluKernelFn m4 = nullptr;
     FusedSiluKernelFn m2 = nullptr;
     FusedSiluKernelFn m1 = nullptr;
+    FusedSiluKernelFn m12 = nullptr;
+    FusedSiluKernelFn m12_rows = nullptr;
 };
 
 FusedSiluKernelSet fused_silu_kernels_for_degree(int64_t degree) {
@@ -551,12 +652,8 @@ FusedSiluKernelSet fused_silu_kernels_for_degree(int64_t degree) {
 // Pre-packed-A m8 fused kernel for a given exp degree (4/5/6). Used by the
 // N-split shared-A-pack path where rows are padded to a multiple of 8.
 FusedSiluKernelFn fused_silu_packed_m8_for_degree(int64_t degree) {
-    switch (degree) {
-        case 4: return bf16gemm_k_ldp_silu_poly4;
-        case 5: return bf16gemm_k_ldp_silu_poly5;
-        case 6: return bf16gemm_k_ldp_silu_poly6;
-        default: return nullptr;
-    }
+    (void)degree;
+    return nullptr;
 }
 
 // Packed-C m8 fused kernel: pre-packed A + reorder-m8 packed-C store. Writes
@@ -671,6 +768,186 @@ void packed_w2_tail_dispatch(const uint16_t* packed_A, const uint16_t* w2_packed
         case 7: bf16gemm_k_ldp(At, w2_packed, Dt, nullptr, (p.m = 8, &p)); break;
     }
 }
+
+#if defined(__ARM_FEATURE_SVE) && defined(__ARM_FEATURE_BF16)
+bool sve_w13_split_n_workset_enabled() {
+    const char* value = std::getenv("FUSED_CPP_MOE_W13_SPLIT_N");
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
+
+FusedSiluKernelSet sve_asm_fused_silu_packc_set_for_degree(int64_t degree) {
+    switch (degree) {
+        case 4:
+            return {moe_sve_w13_silu_poly4_packc,
+                    moe_sve_w13_silu_poly4_packc_m4,
+                    moe_sve_w13_silu_poly4_packc_m2,
+                    moe_sve_w13_silu_poly4_packc_m1,
+                    moe_sve_w13_silu_poly4_packc_m12,
+                    moe_sve_w13_silu_poly4_packc_m12_rows};
+        case 5:
+            return {moe_sve_w13_silu_poly5_packc,
+                    moe_sve_w13_silu_poly5_packc_m4,
+                    moe_sve_w13_silu_poly5_packc_m2,
+                    moe_sve_w13_silu_poly5_packc_m1,
+                    moe_sve_w13_silu_poly5_packc_m12,
+                    moe_sve_w13_silu_poly5_packc_m12_rows};
+        case 6:
+            return {moe_sve_w13_silu_poly6_packc,
+                    moe_sve_w13_silu_poly6_packc_m4,
+                    moe_sve_w13_silu_poly6_packc_m2,
+                    moe_sve_w13_silu_poly6_packc_m1,
+                    moe_sve_w13_silu_poly6_packc_m12,
+                    moe_sve_w13_silu_poly6_packc_m12_rows};
+        default:
+            return {};
+    }
+}
+
+void sve_asm_packc_w13_tail_dispatch(const uint16_t* packed_A,
+                                     const uint16_t* w13_packed, uint16_t* C,
+                                     int rows, int K, int N, int ldc,
+                                     const FusedSiluKernelSet& ks) {
+    gemm_params_t p;
+    p.k = K;
+    p.n = N;
+    p.lda = K;
+    p.ldb = K;
+    p.ldc = ldc;
+    const int nb_full = rows / 8;
+    for (int mb = 0; mb < nb_full; ++mb) {
+        p.m = 8;
+        ks.m8(packed_A + static_cast<int64_t>(mb) * 8 * K, w13_packed,
+              C + static_cast<int64_t>(mb) * 8 * ldc, nullptr, &p);
+    }
+    const int tail = rows - nb_full * 8;
+    if (tail == 0) {
+        return;
+    }
+    const uint16_t* At = packed_A + static_cast<int64_t>(nb_full) * 8 * K;
+    uint16_t* Ct = C + static_cast<int64_t>(nb_full) * 8 * ldc;
+    auto run = [&](FusedSiluKernelFn fn, int mr, int r0) {
+        p.m = mr;
+        fn(At + static_cast<int64_t>(r0) * 4, w13_packed,
+           Ct + static_cast<int64_t>(r0) * 4, nullptr, &p);
+    };
+    switch (tail) {
+        case 1: run(ks.m1, 1, 0); break;
+        case 2: run(ks.m2, 2, 0); break;
+        case 3: run(ks.m4, 4, 0); break;
+        case 4: run(ks.m4, 4, 0); break;
+        case 5:
+        case 6:
+        case 7: run(ks.m8, 8, 0); break;
+    }
+}
+
+void sve_asm_packc_w13_hybrid_dispatch(const uint16_t* packed_A,
+                                       const uint16_t* w13_packed,
+                                       uint16_t* C, int rows, int K, int N,
+                                       int ldc, int n_begin,
+                                       const FusedSiluKernelSet& ks) {
+    TORCH_CHECK(ks.m12 != nullptr, "SVE M12 fused silu kernel is unavailable");
+    gemm_params_t p;
+    p.m = 12;
+    p.k = K;
+    p.n = N;
+    p.lda = K;
+    p.ldb = K;
+    p.ldc = ldc;
+    const int main_rows = static_cast<int>(sve_m12_main_rows(rows));
+    if (main_rows > 0) {
+        if (ks.m12_rows != nullptr) {
+            p.m = main_rows;
+            ks.m12_rows(packed_A, w13_packed,
+                        C + static_cast<int64_t>(n_begin) * 6, nullptr, &p);
+        } else {
+            p.m = 12;
+            for (int mb = 0; mb < main_rows; mb += 12) {
+                ks.m12(packed_A + static_cast<int64_t>(mb) * K,
+                       w13_packed,
+                       C + static_cast<int64_t>(mb) * ldc +
+                           static_cast<int64_t>(n_begin) * 6,
+                       nullptr, &p);
+            }
+        }
+    }
+    const int tail = rows - main_rows;
+    if (tail <= 0) {
+        return;
+    }
+    sve_asm_packc_w13_tail_dispatch(
+        packed_A + static_cast<int64_t>(main_rows) * K, w13_packed,
+        C + static_cast<int64_t>(main_rows) * ldc +
+            static_cast<int64_t>(n_begin) * 4,
+        tail, K, N, ldc, ks);
+}
+
+void sve_asm_packed_w2_tail_dispatch(const uint16_t* packed_A,
+                                     const uint16_t* w2_packed, float* down,
+                                     int rows, int K, int N, int ldc) {
+    gemm_params_t p;
+    p.k = K;
+    p.n = N;
+    p.lda = K;
+    p.ldb = K;
+    p.ldc = ldc;
+    const int nb_full = rows / 8;
+    for (int mb = 0; mb < nb_full; ++mb) {
+        p.m = 8;
+        moe_sve_w2_packed(packed_A + static_cast<int64_t>(mb) * 8 * K,
+                          w2_packed,
+                          down + static_cast<int64_t>(mb) * 8 * ldc, nullptr,
+                          &p);
+    }
+    const int tail = rows - nb_full * 8;
+    if (tail == 0) {
+        return;
+    }
+    const uint16_t* At = packed_A + static_cast<int64_t>(nb_full) * 8 * K;
+    float* Dt = down + static_cast<int64_t>(nb_full) * 8 * ldc;
+    auto run = [&](PlainPackedKernelFn fn, int mr, int r0) {
+        p.m = mr;
+        fn(At + static_cast<int64_t>(r0) * 4, w2_packed,
+           Dt + static_cast<int64_t>(r0) * ldc, nullptr, &p);
+    };
+    switch (tail) {
+        case 1: run(moe_sve_w2_packed_m1, 1, 0); break;
+        case 2: run(moe_sve_w2_packed_m2, 2, 0); break;
+        case 3: run(moe_sve_w2_packed_m4, 4, 0); break;
+        case 4: run(moe_sve_w2_packed_m4, 4, 0); break;
+        case 5:
+        case 6:
+        case 7: run(moe_sve_w2_packed, 8, 0); break;
+    }
+}
+
+void sve_asm_packed_w2_hybrid_dispatch(const uint16_t* packed_A,
+                                       const uint16_t* w2_packed, float* down,
+                                       int rows, int K, int N, int ldc) {
+    gemm_params_t p;
+    p.m = 12;
+    p.k = K;
+    p.n = N;
+    p.lda = K;
+    p.ldb = K;
+    p.ldc = ldc;
+    const int main_rows = static_cast<int>(sve_m12_main_rows(rows));
+    for (int mb = 0; mb < main_rows; mb += 12) {
+        moe_sve_w2_packed_m12(packed_A + static_cast<int64_t>(mb) * K,
+                              w2_packed,
+                              down + static_cast<int64_t>(mb) * ldc,
+                              nullptr, &p);
+    }
+    const int tail = rows - main_rows;
+    if (tail <= 0) {
+        return;
+    }
+    sve_asm_packed_w2_tail_dispatch(
+        packed_A + static_cast<int64_t>(main_rows) * K, w2_packed,
+        down + static_cast<int64_t>(main_rows) * ldc, tail, K, N, ldc);
+}
+#endif
+
 #endif  // __aarch64__
 
 // Bottom-layer fused w13 + SiLU-and-mul over the whole [M] slice: interleaved
@@ -730,12 +1007,14 @@ struct PackedExperts {
     int64_t K_pad = 0;
     int64_t N_pad = 0;
     int64_t packed_stride = 0;
+    int64_t n_tile = kKernelTile;
 };
 
 PackedExperts checked_packed_experts(const at::Tensor& packed,
                                      int64_t K,
                                      int64_t N,
-                                     const char* name) {
+                                     const char* name,
+                                     int64_t n_tile = kKernelTile) {
     check_bf16_cpu(packed, name);
     TORCH_CHECK(packed.dim() == 2,
                 name, " must be 2-D [experts, packed_numel]");
@@ -743,14 +1022,15 @@ PackedExperts checked_packed_experts(const at::Tensor& packed,
     check_positive_int(K, "K");
     check_positive_int(N, "N");
     const int64_t K_pad = ceil_to_multiple(K, kKernelTile);
-    const int64_t N_pad = ceil_to_multiple(N, kKernelTile);
+    const int64_t N_pad =
+        ceil_to_multiple(N, std::max<int64_t>(n_tile, kKernelTile));
     const int64_t expected_stride = K_pad * N_pad;
     TORCH_CHECK(packed.size(1) == expected_stride,
                 name, " packed stride mismatch: expected ",
                 expected_stride, ", got ", packed.size(1));
     TORCH_CHECK(packed.size(0) > 0, name, " must contain at least one expert");
     return PackedExperts{packed, packed.size(0), K, N, K_pad, N_pad,
-                         expected_stride};
+                         expected_stride, std::max<int64_t>(n_tile, kKernelTile)};
 }
 
 void check_optional_bias(const c10::optional<at::Tensor>& bias,
@@ -1940,6 +2220,90 @@ void gather_pack_a_reorder_m8(const uint16_t* input, int64_t H,
     }
 }
 
+int64_t sve_m12_main_rows(int64_t rows) {
+    return rows / 12 * 12;
+}
+
+int64_t sve_hybrid_packed_rows(int64_t rows) {
+    const int64_t main = sve_m12_main_rows(rows);
+    const int64_t tail = rows - main;
+    return main + (tail == 0 ? 0 : ceil_to_multiple(tail, int64_t{8}));
+}
+
+void gather_pack_a_reorder_m12(const uint16_t* input, int64_t H,
+                               const int64_t* expert_routes, int64_t top_k,
+                               uint16_t* packed, int total_rows, int K_pad,
+                               int block_begin, int block_end) {
+    const int kb_count = K_pad / 4;
+    const int h_full_kb = static_cast<int>(H) / 4;
+    for (int mb = block_begin; mb < block_end; ++mb) {
+        uint16_t* blk = packed + static_cast<int64_t>(mb) * 12 * K_pad;
+        const uint16_t* srcs[12];
+        for (int r = 0; r < 12; ++r) {
+            const int gr = mb * 12 + r;
+            srcs[r] = (gr < total_rows)
+                          ? input + (expert_routes[gr] / top_k) * H
+                          : nullptr;
+        }
+        for (int kb = 0; kb < kb_count; ++kb) {
+            uint16_t* d = blk + static_cast<int64_t>(kb) * 48;
+            const int k0 = kb * 4;
+            if (kb < h_full_kb) {
+                for (int r = 0; r < 12; ++r) {
+                    const uint16_t* s = srcs[r];
+                    uint16_t* dr = d + r * 4;
+                    if (s != nullptr) {
+                        dr[0] = s[k0]; dr[1] = s[k0 + 1];
+                        dr[2] = s[k0 + 2]; dr[3] = s[k0 + 3];
+                    } else {
+                        dr[0] = 0; dr[1] = 0; dr[2] = 0; dr[3] = 0;
+                    }
+                }
+            } else {
+                for (int r = 0; r < 12; ++r) {
+                    uint16_t* dr = d + r * 4;
+                    const uint16_t* s = srcs[r];
+                    for (int k = 0; k < 4; ++k) {
+                        const int kcol = k0 + k;
+                        dr[k] = (s != nullptr && kcol < H)
+                                    ? s[kcol]
+                                    : static_cast<uint16_t>(0);
+                    }
+                }
+            }
+        }
+    }
+}
+
+void gather_pack_a_reorder_sve_hybrid(const uint16_t* input, int64_t H,
+                                      const int64_t* expert_routes,
+                                      int64_t top_k, uint16_t* packed,
+                                      int total_rows, int K_pad,
+                                      int64_t group_size, int64_t local_tid) {
+    const int64_t main_rows = sve_m12_main_rows(total_rows);
+    const int64_t main_blocks = main_rows / 12;
+    const SplitRange m12_range =
+        split_evenly(main_blocks, group_size, local_tid);
+    gather_pack_a_reorder_m12(input, H, expert_routes, top_k, packed,
+                              static_cast<int>(main_rows), K_pad,
+                              static_cast<int>(m12_range.begin),
+                              static_cast<int>(m12_range.begin + m12_range.size));
+
+    const int64_t tail_rows = total_rows - main_rows;
+    if (tail_rows <= 0) {
+        return;
+    }
+    const int64_t tail_blocks = ceil_div_int64(tail_rows, int64_t{8});
+    const SplitRange tail_range =
+        split_evenly(tail_blocks, group_size, local_tid);
+    gather_pack_a_reorder_m8(
+        input, H, expert_routes + main_rows, top_k,
+        packed + main_rows * static_cast<int64_t>(K_pad),
+        static_cast<int>(tail_rows), K_pad,
+        static_cast<int>(tail_range.begin),
+        static_cast<int>(tail_range.begin + tail_range.size));
+}
+
 // N-split fused w13 + SiLU-and-mul reading a group-shared pre-packed A (m8,
 // M_padded a multiple of 8). Each member computes its kN feature-column slice
 // and writes intermediate directly. No per-member A repack. Caller owns the
@@ -1950,7 +2314,9 @@ void team_fused_w13_silu_packed(const TeamContext& team,
                                 uint16_t* intermediate, int M_padded, int K,
                                 int N13, int ldc, int64_t degree) {
     FusedSiluKernelFn k8 = fused_silu_packed_m8_for_degree(degree);
-    TORCH_CHECK(k8 != nullptr, "unsupported fused silu exp degree ", degree);
+    TORCH_CHECK(k8 != nullptr,
+                "packed-A fused w13 row-major store is unavailable; use "
+                "FUSED_CPP_MOE_FUSED_PACKA=1 with packed w2/packC");
     const GemmSplitPlan plan{MoeGemmSplit::kN};
     const SplitRange range = team_gemm_split_range(
         plan, M_padded, N13, team.group_size, team.local_tid);
@@ -1999,6 +2365,157 @@ void team_fused_w13_silu_packed_packc(const TeamContext& team,
         static_cast<int>(range.size), ldc, ks);
 }
 
+void team_fused_w13_silu_packed_packc_2d(
+    const TeamContext& team, const Gemm2DSplitPlan& plan,
+    const uint16_t* packed_A, const uint16_t* w13_packed,
+    uint16_t* intermediate, int rows, int K, int N13, int ldc,
+    int64_t degree) {
+    const FusedSiluKernelSet ks = fused_silu_packc_set_for_degree(degree);
+    TORCH_CHECK(ks.m8 != nullptr, "unsupported fused silu exp degree ", degree);
+    const Gemm2DThreadRange range =
+        gemm_2d_thread_range(plan, rows, N13, team.local_tid);
+    if (range.rows <= 0 || range.n_cols <= 0) {
+        return;
+    }
+    const int64_t start_block = range.n_begin / kKernelTile;
+    packc_w13_tail_dispatch(
+        packed_A + range.m_block_begin * kKernelTile * static_cast<int64_t>(K),
+        w13_packed + start_block * static_cast<int64_t>(K) * kKernelTile,
+        intermediate + range.m_block_begin * kKernelTile *
+                           static_cast<int64_t>(ldc) +
+            range.n_begin * 4,
+        static_cast<int>(range.rows), K, static_cast<int>(range.n_cols), ldc,
+        ks);
+}
+
+void team_fused_w13_silu_packed_packc_sve(const TeamContext& team,
+                                          const uint16_t* packed_A,
+                                          const uint16_t* w13_packed,
+                                          uint16_t* intermediate, int rows,
+                                          int K, int N13, int ldc,
+                                          int64_t degree, int64_t n_tile) {
+#if defined(__ARM_FEATURE_SVE) && defined(__ARM_FEATURE_BF16)
+    const FusedSiluKernelSet ks =
+        sve_asm_fused_silu_packc_set_for_degree(degree);
+    TORCH_CHECK(ks.m8 != nullptr, "unsupported fused silu exp degree ", degree);
+    auto run_n_range = [&](int64_t n_begin, int64_t n_cols) {
+        const SplitRange range = n_split_range_tile(
+            n_cols, team.group_size, team.local_tid, n_tile);
+        if (range.size <= 0) {
+            return;
+        }
+        const int64_t abs_begin = n_begin + range.begin;
+        const int64_t start_block = abs_begin / n_tile;
+        sve_asm_packc_w13_hybrid_dispatch(
+            packed_A,
+            w13_packed + start_block * static_cast<int64_t>(K) * n_tile,
+            intermediate, rows, K, static_cast<int>(range.size), ldc,
+            static_cast<int>(abs_begin), ks);
+    };
+    const int64_t half_n = N13 / 2;
+    if (sve_w13_split_n_workset_enabled() && N13 % 2 == 0 &&
+        half_n > 0 && half_n % n_tile == 0) {
+        run_n_range(0, half_n);
+        if (team.barrier != nullptr) {
+            team.barrier->wait();
+        }
+        run_n_range(half_n, N13 - half_n);
+    } else {
+        run_n_range(0, N13);
+    }
+#else
+    (void)team;
+    (void)packed_A;
+    (void)w13_packed;
+    (void)intermediate;
+    (void)rows;
+    (void)K;
+    (void)N13;
+    (void)ldc;
+    (void)degree;
+    (void)n_tile;
+    TORCH_CHECK(false, "SVE MoE asm packC kernel is unavailable in this build");
+#endif
+}
+
+void team_fused_w13_silu_packed_packc_sve_2d(
+    const TeamContext& team, const Gemm2DSplitPlan& plan,
+    const uint16_t* packed_A, const uint16_t* w13_packed,
+    uint16_t* intermediate, int rows, int K, int N13, int ldc,
+    int64_t degree) {
+#if defined(__ARM_FEATURE_SVE) && defined(__ARM_FEATURE_BF16)
+    const FusedSiluKernelSet ks =
+        sve_asm_fused_silu_packc_set_for_degree(degree);
+    TORCH_CHECK(ks.m8 != nullptr, "unsupported fused silu exp degree ", degree);
+    auto run_n_range = [&](int64_t n_begin, int64_t n_cols) {
+        Gemm2DSplitPlan subplan = plan;
+        subplan.tn = plan.tm * plan.tn;
+        subplan.tm = 1;
+        const Gemm2DThreadRange range =
+            gemm_2d_thread_range(subplan, rows, n_cols, team.local_tid);
+        if (range.rows <= 0 || range.n_cols <= 0) {
+            return;
+        }
+        const int64_t abs_begin = n_begin + range.n_begin;
+        const int64_t start_block = abs_begin / plan.n_tile;
+        TORCH_CHECK(range.row_begin == 0,
+                    "SVE fused expert only supports N-split ranges");
+        sve_asm_packc_w13_hybrid_dispatch(
+            packed_A,
+            w13_packed + start_block * static_cast<int64_t>(K) * plan.n_tile,
+            intermediate, static_cast<int>(range.rows), K,
+            static_cast<int>(range.n_cols), ldc, static_cast<int>(abs_begin),
+            ks);
+    };
+    const int64_t half_n = N13 / 2;
+    if (sve_w13_split_n_workset_enabled() && N13 % 2 == 0 &&
+        half_n > 0 && half_n % plan.n_tile == 0) {
+        run_n_range(0, half_n);
+        if (team.barrier != nullptr) {
+            team.barrier->wait();
+        }
+        run_n_range(half_n, N13 - half_n);
+    } else {
+        run_n_range(0, N13);
+    }
+#else
+    (void)team;
+    (void)plan;
+    (void)packed_A;
+    (void)w13_packed;
+    (void)intermediate;
+    (void)rows;
+    (void)K;
+    (void)N13;
+    (void)ldc;
+    (void)degree;
+    TORCH_CHECK(false, "SVE MoE asm packC kernel is unavailable in this build");
+#endif
+}
+
+void team_fused_w13_silu_sve(const TeamContext& team, const uint16_t* A,
+                             const uint16_t* w13_packed,
+                             uint16_t* intermediate, int rows, int K,
+                             int N13, int ldc, uint16_t* a_reorder,
+                             int64_t degree, int64_t n_tile) {
+    const SplitRange range = n_split_range_tile(
+        N13, team.group_size, team.local_tid, n_tile);
+    if (range.size <= 0) {
+        return;
+    }
+    const int64_t start_block = range.begin / n_tile;
+    gemm_params_t p;
+    p.m = rows;
+    p.k = K;
+    p.n = static_cast<int>(range.size);
+    p.lda = K;
+    p.ldb = K;
+    p.ldc = ldc;
+    ::fused_cpp::moe_sve::w13_silu_rowmajor(
+        A, w13_packed + start_block * static_cast<int64_t>(K) * n_tile,
+        intermediate + range.begin / 2, a_reorder, &p, degree);
+}
+
 // N-split plain fp32 w2 reading a PACKED intermediate (Part 2): each member
 // computes its disjoint w2.N_pad output-column slice from the shared pre-packed
 // A (the packed intermediate). No per-member repack, no a_reorder. down is
@@ -2019,6 +2536,192 @@ void team_w2_packed(const TeamContext& team, const uint16_t* packed_A,
         packed_A,
         w2_packed + start_block * static_cast<int64_t>(K) * kKernelTile,
         down + range.begin, rows, K, static_cast<int>(range.size), ldc);
+}
+
+void team_w2_packed_2d(const TeamContext& team, const Gemm2DSplitPlan& plan,
+                       const uint16_t* packed_A, const uint16_t* w2_packed,
+                       float* down, int rows, int K, int N, int ldc) {
+    const Gemm2DThreadRange range =
+        gemm_2d_thread_range(plan, rows, N, team.local_tid);
+    if (range.rows <= 0 || range.n_cols <= 0) {
+        return;
+    }
+    const int64_t start_block = range.n_begin / kKernelTile;
+    packed_w2_tail_dispatch(
+        packed_A + range.m_block_begin * kKernelTile * static_cast<int64_t>(K),
+        w2_packed + start_block * static_cast<int64_t>(K) * kKernelTile,
+        down + range.row_begin * static_cast<int64_t>(ldc) + range.n_begin,
+        static_cast<int>(range.rows), K, static_cast<int>(range.n_cols), ldc);
+}
+
+void team_w2_packed_sve(const TeamContext& team, const uint16_t* packed_A,
+                        const uint16_t* w2_packed, float* down, int rows,
+                        int K, int N, int ldc, int64_t n_tile) {
+#if defined(__ARM_FEATURE_SVE) && defined(__ARM_FEATURE_BF16)
+    const SplitRange range = n_split_range_tile(
+        N, team.group_size, team.local_tid, n_tile);
+    if (range.size <= 0) {
+        return;
+    }
+    const int64_t start_block = range.begin / n_tile;
+    sve_asm_packed_w2_hybrid_dispatch(
+        packed_A,
+        w2_packed + start_block * static_cast<int64_t>(K) * n_tile,
+        down + range.begin, rows, K, static_cast<int>(range.size), ldc);
+#else
+    (void)team;
+    (void)packed_A;
+    (void)w2_packed;
+    (void)down;
+    (void)rows;
+    (void)K;
+    (void)N;
+    (void)ldc;
+    (void)n_tile;
+    TORCH_CHECK(false, "SVE MoE asm w2 kernel is unavailable in this build");
+#endif
+}
+
+void team_w2_packed_sve_2d(const TeamContext& team,
+                           const Gemm2DSplitPlan& plan,
+                           const uint16_t* packed_A,
+                           const uint16_t* w2_packed, float* down, int rows,
+                           int K, int N, int ldc) {
+#if defined(__ARM_FEATURE_SVE) && defined(__ARM_FEATURE_BF16)
+    const Gemm2DThreadRange range =
+        gemm_2d_thread_range(plan, rows, N, team.local_tid);
+    if (range.rows <= 0 || range.n_cols <= 0) {
+        return;
+    }
+    const int64_t start_block = range.n_begin / plan.n_tile;
+    TORCH_CHECK(range.row_begin == 0,
+                "SVE fused expert only supports N-split ranges");
+    sve_asm_packed_w2_hybrid_dispatch(
+        packed_A,
+        w2_packed + start_block * static_cast<int64_t>(K) * plan.n_tile,
+        down + range.n_begin, static_cast<int>(range.rows), K,
+        static_cast<int>(range.n_cols), ldc);
+#else
+    (void)team;
+    (void)plan;
+    (void)packed_A;
+    (void)w2_packed;
+    (void)down;
+    (void)rows;
+    (void)K;
+    (void)N;
+    (void)ldc;
+    TORCH_CHECK(false, "SVE MoE asm w2 kernel is unavailable in this build");
+#endif
+}
+
+void team_w2_rowmajor_sve(const TeamContext& team, const uint16_t* A,
+                          const uint16_t* w2_packed, float* down, int rows,
+                          int K, int N, int ldc, uint16_t* a_reorder,
+                          int64_t n_tile) {
+    const SplitRange range = n_split_range_tile(
+        N, team.group_size, team.local_tid, n_tile);
+    if (range.size <= 0) {
+        return;
+    }
+    const int64_t start_block = range.begin / n_tile;
+    gemm_params_t p;
+    p.m = rows;
+    p.k = K;
+    p.n = static_cast<int>(range.size);
+    p.lda = K;
+    p.ldb = K;
+    p.ldc = ldc;
+    ::fused_cpp::moe_sve::w2_rowmajor(
+        A, w2_packed + start_block * static_cast<int64_t>(K) * n_tile,
+        down + range.begin, a_reorder, &p);
+}
+
+void gather_pack_a_reorder_backend(bool use_sve_backend,
+                                   const uint16_t* input,
+                                   int64_t H,
+                                   const int64_t* expert_routes,
+                                   int64_t top_k,
+                                   uint16_t* packed,
+                                   int total_rows,
+                                   int K_pad,
+                                   int block_begin,
+                                   int block_end) {
+#if defined(__ARM_FEATURE_SVE) && defined(__ARM_FEATURE_BF16)
+    if (use_sve_backend) {
+        ::fused_cpp::moe_sve::gather_pack_a(
+            input, H, expert_routes, top_k, packed, total_rows, K_pad,
+            block_begin, block_end);
+        return;
+    }
+#else
+    TORCH_CHECK(!use_sve_backend,
+                "SVE MoE gather+packA is unavailable in this build");
+#endif
+    gather_pack_a_reorder_m8(input, H, expert_routes, top_k, packed,
+                             total_rows, K_pad, block_begin, block_end);
+}
+
+void team_fused_w13_silu_packed_packc_backend(
+    bool use_sve_backend, bool use_2d_split, const TeamContext& team,
+    const Gemm2DSplitPlan& plan, const uint16_t* packed_A,
+    const uint16_t* w13_packed, uint16_t* intermediate, int rows, int K,
+    int N13, int ldc, int64_t degree, int64_t n_tile) {
+#if defined(__ARM_FEATURE_SVE) && defined(__ARM_FEATURE_BF16)
+    if (use_sve_backend) {
+        if (use_2d_split) {
+            team_fused_w13_silu_packed_packc_sve_2d(
+                team, plan, packed_A, w13_packed, intermediate, rows, K, N13,
+                ldc, degree);
+        } else {
+            team_fused_w13_silu_packed_packc_sve(
+                team, packed_A, w13_packed, intermediate, rows, K, N13, ldc,
+                degree, n_tile);
+        }
+        return;
+    }
+#else
+    TORCH_CHECK(!use_sve_backend,
+                "SVE MoE asm packC kernel is unavailable in this build");
+#endif
+    if (use_2d_split) {
+        team_fused_w13_silu_packed_packc_2d(
+            team, plan, packed_A, w13_packed, intermediate, rows, K, N13, ldc,
+            degree);
+    } else {
+        team_fused_w13_silu_packed_packc(
+            team, packed_A, w13_packed, intermediate, rows, K, N13, ldc,
+            degree);
+    }
+}
+
+void team_w2_packed_backend(bool use_sve_backend, bool use_2d_split,
+                            const TeamContext& team,
+                            const Gemm2DSplitPlan& plan,
+                            const uint16_t* packed_A,
+                            const uint16_t* w2_packed, float* down, int rows,
+                            int K, int N, int ldc, int64_t n_tile) {
+#if defined(__ARM_FEATURE_SVE) && defined(__ARM_FEATURE_BF16)
+    if (use_sve_backend) {
+        if (use_2d_split) {
+            team_w2_packed_sve_2d(team, plan, packed_A, w2_packed, down, rows,
+                                  K, N, ldc);
+        } else {
+            team_w2_packed_sve(team, packed_A, w2_packed, down, rows, K, N,
+                               ldc, n_tile);
+        }
+        return;
+    }
+#else
+    TORCH_CHECK(!use_sve_backend,
+                "SVE MoE asm w2 kernel is unavailable in this build");
+#endif
+    if (use_2d_split) {
+        team_w2_packed_2d(team, plan, packed_A, w2_packed, down, rows, K, N,
+                          ldc);
+    } else {
+        team_w2_packed(team, packed_A, w2_packed, down, rows, K, N, ldc);
+    }
 }
 #endif  // __aarch64__
 
@@ -3236,6 +3939,7 @@ struct ThreadScratch {
     std::vector<uint16_t> input;
     std::vector<uint16_t> intermediate;
     std::vector<uint16_t> a_reorder;
+    std::vector<uint16_t> packed_a;
     std::vector<float> gate_up;
     std::vector<float> down;
 };
@@ -3259,6 +3963,7 @@ struct ScheduledScratchUnitConfig {
     int64_t threads = 0;
     int64_t max_rows = 0;
     int64_t a_reorder_stride = 0;
+    bool fused_packa = false;
 };
 
 struct ScheduledTeamScratch {
@@ -3271,6 +3976,7 @@ struct ScheduledTeamScratch {
     std::vector<uint16_t> input;
     std::vector<uint16_t> intermediate;
     std::vector<uint16_t> a_reorder;
+    std::vector<uint16_t> packed_a;
     std::vector<float> gate_up;
     std::vector<float> down;
     ThreadBarrier barrier;
@@ -3287,12 +3993,21 @@ void ensure_scheduled_scratch_capacity(ScheduledTeamScratch& scratch,
     scratch.a_reorder_stride =
         std::max(scratch.a_reorder_stride, config.a_reorder_stride);
     const int64_t rows = scratch.max_rows;
-    scratch.input.resize(static_cast<size_t>(rows * w13.K_pad));
-    scratch.intermediate.resize(static_cast<size_t>(rows * w2.K_pad));
+    const int64_t rows_padded =
+        config.fused_packa ? sve_hybrid_packed_rows(rows)
+                           : ceil_to_multiple(rows, int64_t{kKernelTile});
+    scratch.input.resize(static_cast<size_t>(
+        config.fused_packa ? 0 : rows * w13.K_pad));
+    scratch.intermediate.resize(static_cast<size_t>(
+        (config.fused_packa ? rows_padded : rows) * w2.K_pad));
     scratch.a_reorder.resize(static_cast<size_t>(
         scratch.threads * scratch.a_reorder_stride));
-    scratch.gate_up.resize(static_cast<size_t>(rows * w13.N_pad));
-    scratch.down.resize(static_cast<size_t>(rows * w2.N_pad));
+    scratch.packed_a.resize(static_cast<size_t>(
+        config.fused_packa ? rows_padded * w13.K_pad : 0));
+    scratch.gate_up.resize(static_cast<size_t>(
+        config.fused_packa ? 0 : rows * w13.N_pad));
+    scratch.down.resize(static_cast<size_t>(
+        (config.fused_packa ? rows_padded : rows) * w2.N_pad));
 }
 
 class ScheduledScratchLease {
@@ -3418,7 +4133,8 @@ void pack_transposed_expert_weight(const uint16_t* weight,
                                    int64_t in_features,
                                    int64_t K_pad,
                                    int64_t N_pad,
-                                   uint16_t* packed_dst) {
+                                   uint16_t* packed_dst,
+                                   bool use_sve = false) {
     std::vector<uint16_t> transposed(
         static_cast<size_t>(K_pad * N_pad), static_cast<uint16_t>(0));
     for (int64_t n = 0; n < out_features; ++n) {
@@ -3428,8 +4144,14 @@ void pack_transposed_expert_weight(const uint16_t* weight,
             transposed[static_cast<size_t>(k * N_pad + n)] = src_row[k];
         }
     }
-    bf16_pack_b(transposed.data(), packed_dst, static_cast<int>(K_pad),
-                static_cast<int>(N_pad));
+    if (use_sve) {
+        ::fused_cpp::moe_sve::pack_b(
+            transposed.data(), packed_dst, static_cast<int>(K_pad),
+            static_cast<int>(N_pad));
+    } else {
+        bf16_pack_b(transposed.data(), packed_dst, static_cast<int>(K_pad),
+                    static_cast<int>(N_pad));
+    }
 }
 
 // Interleaved w13 pack for the fused SiLU epilogue. w13 weight is
@@ -3448,7 +4170,8 @@ void pack_transposed_expert_weight_interleaved(const uint16_t* weight,
                                                int64_t H,
                                                int64_t K_pad,
                                                int64_t N_pad,
-                                               uint16_t* packed_dst) {
+                                               uint16_t* packed_dst,
+                                               bool use_sve = false) {
     std::vector<uint16_t> transposed(
         static_cast<size_t>(K_pad * N_pad), static_cast<uint16_t>(0));
     for (int64_t f = 0; f < F; ++f) {
@@ -3464,8 +4187,14 @@ void pack_transposed_expert_weight_interleaved(const uint16_t* weight,
             transposed[static_cast<size_t>(k * N_pad + up_col)] = up_row[k];
         }
     }
-    bf16_pack_b(transposed.data(), packed_dst, static_cast<int>(K_pad),
-                static_cast<int>(N_pad));
+    if (use_sve) {
+        ::fused_cpp::moe_sve::pack_b(
+            transposed.data(), packed_dst, static_cast<int>(K_pad),
+            static_cast<int>(N_pad));
+    } else {
+        bf16_pack_b(transposed.data(), packed_dst, static_cast<int>(K_pad),
+                    static_cast<int>(N_pad));
+    }
 }
 
 }  // namespace
@@ -4196,7 +4925,8 @@ std::vector<double> fused_moe_bench_fused_w13_silu_packc_tail(
 #endif
 }
 
-std::tuple<at::Tensor, int64_t, int64_t, at::Tensor, int64_t, int64_t>
+std::tuple<at::Tensor, int64_t, int64_t, at::Tensor, int64_t, int64_t,
+           int64_t, int64_t>
 fused_moe_bf16_tiled_prepare_weights(at::Tensor w13_weight,
                                  at::Tensor w2_weight,
                                  bool fuse_silu) {
@@ -4237,10 +4967,22 @@ fused_moe_bf16_tiled_prepare_weights(at::Tensor w13_weight,
     const int64_t K13 = H;
     const int64_t K2 = F;
     const int64_t N2 = H;
+    // Default to the SVE fused kernel when fused SiLU is requested and the
+    // runtime supports it.  The NEON path is kept as a legacy/diagnostic
+    // fallback and can be forced with FUSED_CPP_MOE_SVE=0.
+    const bool use_sve_backend =
+        fuse_silu && ::fused_cpp::moe_sve::enabled_by_env();
+    const int64_t backend_id = use_sve_backend
+                                   ? static_cast<int64_t>(
+                                         ::fused_cpp::moe_sve::Backend::kSve)
+                                   : static_cast<int64_t>(
+                                         ::fused_cpp::moe_sve::Backend::kNeon);
+    const int64_t backend_n_tile =
+        use_sve_backend ? ::fused_cpp::moe_sve::n_tile() : kKernelTile;
     const int64_t K13_pad = ceil_to_multiple(K13, kKernelTile);
-    const int64_t N13_pad = ceil_to_multiple(N13, kKernelTile);
+    const int64_t N13_pad = ceil_to_multiple(N13, backend_n_tile);
     const int64_t K2_pad = ceil_to_multiple(K2, kKernelTile);
-    const int64_t N2_pad = ceil_to_multiple(N2, kKernelTile);
+    const int64_t N2_pad = ceil_to_multiple(N2, backend_n_tile);
 
     at::Tensor w13_packed = at::empty(
         {E, K13_pad * N13_pad}, w13_weight.options());
@@ -4266,19 +5008,20 @@ fused_moe_bf16_tiled_prepare_weights(at::Tensor w13_weight,
             if (fuse_silu) {
                 pack_transposed_expert_weight_interleaved(
                     w13_ptr, e * w13_expert_stride, F, H, K13_pad, N13_pad,
-                    w13_packed_ptr + e * K13_pad * N13_pad);
+                    w13_packed_ptr + e * K13_pad * N13_pad, use_sve_backend);
             } else {
                 pack_transposed_expert_weight(
                     w13_ptr, e * w13_expert_stride, N13, H, K13_pad, N13_pad,
-                    w13_packed_ptr + e * K13_pad * N13_pad);
+                    w13_packed_ptr + e * K13_pad * N13_pad, use_sve_backend);
             }
             pack_transposed_expert_weight(
                 w2_ptr, e * w2_expert_stride, H, F, K2_pad, N2_pad,
-                w2_packed_ptr + e * K2_pad * N2_pad);
+                w2_packed_ptr + e * K2_pad * N2_pad, use_sve_backend);
         }
     });
 
-    return std::make_tuple(w13_packed, K13, N13, w2_packed, K2, N2);
+    return std::make_tuple(w13_packed, K13, N13, w2_packed, K2, N2,
+                           backend_id, backend_n_tile);
 #endif
 }
 
@@ -4298,7 +5041,9 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
                             int64_t global_num_experts,
                             bool skip_weighted,
                             bool fuse_silu,
-                            int64_t silu_poly_degree) {
+                            int64_t silu_poly_degree,
+                            int64_t gemm_backend,
+                            int64_t backend_n_tile) {
 #ifndef __aarch64__
     TORCH_CHECK(false, "fused_moe_bf16_tiled requires AArch64");
 #else
@@ -4327,10 +5072,28 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
     TORCH_CHECK(num_threads <= std::numeric_limits<int>::max(),
                 "num_threads exceeds int32 limit: ", num_threads);
 
-    PackedExperts w13 = checked_packed_experts(w13_packed, w13_K, w13_N,
-                                               "w13_packed");
-    PackedExperts w2 = checked_packed_experts(w2_packed, w2_K, w2_N,
-                                             "w2_packed");
+    TORCH_CHECK(gemm_backend == 0 || gemm_backend == 1,
+                "gemm_backend must be 0 (NEON legacy fallback) or "
+                "1 (SVE fused default), got ",
+                gemm_backend);
+    const bool use_sve_backend = gemm_backend == 1;
+    if (use_sve_backend) {
+        TORCH_CHECK(::fused_cpp::moe_sve::available(),
+                    "SVE MoE weights require an SVE BF16 build/runtime");
+        TORCH_CHECK(fuse_silu,
+                    "SVE MoE backend currently requires fuse_silu=True");
+        TORCH_CHECK(backend_n_tile == ::fused_cpp::moe_sve::n_tile(),
+                    "SVE MoE backend_n_tile mismatch: weights use ",
+                    backend_n_tile, ", runtime uses ",
+                    ::fused_cpp::moe_sve::n_tile());
+    } else {
+        backend_n_tile = kKernelTile;
+    }
+
+    PackedExperts w13 = checked_packed_experts(
+        w13_packed, w13_K, w13_N, "w13_packed", backend_n_tile);
+    PackedExperts w2 = checked_packed_experts(
+        w2_packed, w2_K, w2_N, "w2_packed", backend_n_tile);
     TORCH_CHECK(w13.E == w2.E, "w13 and w2 expert count mismatch");
     TORCH_CHECK(w13.K == input.size(1),
                 "input hidden size mismatch: input H=", input.size(1),
@@ -4458,6 +5221,8 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
                     2 * F, "), got N_pad=", w13.N_pad);
         TORCH_CHECK(w13_bias_base == nullptr,
                     "fuse_silu does not support w13_bias yet");
+        TORCH_CHECK(!use_sve_backend || w2_bias_base == nullptr,
+                    "SVE fused MoE does not support w2_bias yet");
         TORCH_CHECK(silu_poly_degree == 4 || silu_poly_degree == 5 ||
                         silu_poly_degree == 6,
                     "silu_poly_degree must be 4, 5, or 6, got ",
@@ -4480,13 +5245,26 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
     if (env_has_value("FUSED_CPP_MOE_FUSED_PACKA")) {
         fused_packa = env_flag_enabled("FUSED_CPP_MOE_FUSED_PACKA");
     }
+    // The SVE backend is now the asm packed-A path. Keep the diagnostic
+    // FUSED_CPP_MOE_FUSED_PACKA switch scoped to the NEON legacy backend so
+    // gemm_backend=1 cannot fall back to the old SVE intrinsic GEMM path.
+    if (use_sve_backend) {
+        fused_packa = true;
+    }
     // Part 2 (packed intermediate + packed-read w2) additionally requires w2 to
     // have no bias (the packed-read w2 kernel has no bias variant). When w2 has
     // bias, only Part 1 applies and w2 falls back to the row-major repack path.
     const bool fused_packa_w2 = fused_packa && (w2_bias_base == nullptr);
+    const bool fused_2d_split =
+        env_flag_enabled("FUSED_CPP_MOE_FUSED_2D_SPLIT");
+    const bool use_fused_2d_split =
+        use_hierarchical_nsplit && fuse_silu && fused_packa_w2 &&
+        fused_2d_split;
     const char* moe_trace_strategy =
         use_hierarchical_nsplit
-            ? "hierarchical_mn_split_dynamic_expert"
+            ? (use_fused_2d_split
+                   ? "hierarchical_fused_2d_split_dynamic_expert"
+                   : "hierarchical_mn_split_dynamic_expert")
             : "beam_calibrated_interference";
     int64_t moe_trace_expert_tasks = 0;
     for (const std::vector<int64_t>& expert_routes : routes) {
@@ -4557,16 +5335,28 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
         std::vector<ThreadScratch> scratches(
             static_cast<size_t>(actual_threads));
         for (ThreadScratch& scratch : scratches) {
+            const int64_t max_k_pad = std::max(w13.K_pad, w2.K_pad);
+            const int64_t max_fused_packa_rows =
+                use_sve_backend ? sve_hybrid_packed_rows(max_expert_rows)
+                                : ceil_to_multiple(max_expert_rows,
+                                                   int64_t{kKernelTile});
+            const int64_t a_reorder_elems =
+                use_sve_backend
+                    ? max_fused_packa_rows * max_k_pad
+                    : max_expert_rows * max_k_pad * 2;
             scratch.input.resize(static_cast<size_t>(
                 max_expert_rows * w13.K_pad));
             scratch.intermediate.resize(static_cast<size_t>(
-                max_expert_rows * w2.K_pad));
-            scratch.a_reorder.resize(static_cast<size_t>(
-                max_expert_rows * std::max(w13.K_pad, w2.K_pad) * 2));
+                (use_sve_backend ? max_fused_packa_rows : max_expert_rows) *
+                w2.K_pad));
+            scratch.a_reorder.resize(static_cast<size_t>(a_reorder_elems));
+            scratch.packed_a.resize(static_cast<size_t>(
+                use_sve_backend ? max_fused_packa_rows * w13.K_pad : 0));
             scratch.gate_up.resize(static_cast<size_t>(
                 max_expert_rows * w13.N_pad));
             scratch.down.resize(static_cast<size_t>(
-                max_expert_rows * w2.N_pad));
+                (use_sve_backend ? max_fused_packa_rows : max_expert_rows) *
+                w2.N_pad));
         }
 
         const auto schedule_compute_begin = ::fused_cpp::profile::now();
@@ -4583,18 +5373,27 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
                         task.expert)];
                     const int64_t rows = task.rows;
 
-                    std::fill(scratch.input.begin(),
-                              scratch.input.begin() + rows * w13.K_pad,
-                              static_cast<uint16_t>(0));
-                    for (int64_t m = 0; m < rows; ++m) {
-                        const int64_t flat =
-                            expert_routes[static_cast<size_t>(
-                                task.route_begin + m)];
-                        const int64_t token = flat / top_k;
-                        const uint16_t* src = input_ptr + token * H;
-                        uint16_t* dst =
-                            scratch.input.data() + m * w13.K_pad;
-                        std::copy(src, src + H, dst);
+                    if (use_sve_backend && fuse_silu) {
+                        gather_pack_a_reorder_sve_hybrid(
+                            input_ptr, H,
+                            expert_routes.data() + task.route_begin, top_k,
+                            scratch.packed_a.data(), static_cast<int>(rows),
+                            static_cast<int>(w13.K_pad), int64_t{1},
+                            int64_t{0});
+                    } else {
+                        std::fill(scratch.input.begin(),
+                                  scratch.input.begin() + rows * w13.K_pad,
+                                  static_cast<uint16_t>(0));
+                        for (int64_t m = 0; m < rows; ++m) {
+                            const int64_t flat =
+                                expert_routes[static_cast<size_t>(
+                                    task.route_begin + m)];
+                            const int64_t token = flat / top_k;
+                            const uint16_t* src = input_ptr + token * H;
+                            uint16_t* dst =
+                                scratch.input.data() + m * w13.K_pad;
+                            std::copy(src, src + H, dst);
+                        }
                     }
 
                     if (fuse_silu) {
@@ -4602,16 +5401,33 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
                         // intermediate directly (skips gate_up + activation).
                         // ldc = w2.K_pad (== F, since F % 8 == 0), so the
                         // output stride matches w2's A stride exactly.
-                        single_thread_gemm_fused_silu(
-                            scratch.input.data(),
-                            w13_ptr + task.expert * w13.packed_stride,
-                            scratch.intermediate.data(),
-                            scratch.a_reorder.data(),
-                            static_cast<int>(rows),
-                            static_cast<int>(w13.K_pad),
-                            static_cast<int>(w13.N_pad),
-                            static_cast<int>(w2.K_pad),
-                            silu_poly_degree);
+                        if (use_sve_backend) {
+                            TeamContext team;
+                            team.group_size = 1;
+                            team.local_tid = 0;
+                            team.barrier = nullptr;
+                            team.a_reorder = nullptr;
+                            team_fused_w13_silu_packed_packc_sve(
+                                team, scratch.packed_a.data(),
+                                w13_ptr + task.expert * w13.packed_stride,
+                                scratch.intermediate.data(),
+                                static_cast<int>(rows),
+                                static_cast<int>(w13.K_pad),
+                                static_cast<int>(w13.N_pad),
+                                static_cast<int>(w2.K_pad),
+                                silu_poly_degree, w13.n_tile);
+                        } else {
+                            single_thread_gemm_fused_silu(
+                                scratch.input.data(),
+                                w13_ptr + task.expert * w13.packed_stride,
+                                scratch.intermediate.data(),
+                                scratch.a_reorder.data(),
+                                static_cast<int>(rows),
+                                static_cast<int>(w13.K_pad),
+                                static_cast<int>(w13.N_pad),
+                                static_cast<int>(w2.K_pad),
+                                silu_poly_degree);
+                        }
                     } else {
                         trace_dispatch_fp32_gemm(
                             moe_trace,
@@ -4641,27 +5457,45 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
                             w2.K_pad, F);
                     }
 
-                    trace_dispatch_fp32_gemm(
-                        moe_trace,
-                        "w2",
-                        tid,
-                        -1,
-                        -1,
-                        -1,
-                        task.expert,
-                        task.route_begin,
-                        rows,
-                        scratch.intermediate.data(),
-                        w2_ptr + task.expert * w2.packed_stride,
-                        scratch.down.data(),
-                        scratch.a_reorder.data(),
-                        static_cast<int>(rows),
-                        static_cast<int>(w2.K_pad),
-                        static_cast<int>(w2.N_pad),
-                        static_cast<int>(w2.N_pad),
-                        w2_bias_base != nullptr
-                            ? w2_bias_base + task.expert * w2.N_pad
-                            : nullptr);
+                    if (use_sve_backend) {
+                        TORCH_CHECK(w2_bias_base == nullptr,
+                                    "SVE fused MoE w2 path does not support "
+                                    "w2_bias yet");
+                        TeamContext team;
+                        team.group_size = 1;
+                        team.local_tid = 0;
+                        team.barrier = nullptr;
+                        team.a_reorder = nullptr;
+                        team_w2_packed_sve(
+                            team, scratch.intermediate.data(),
+                            w2_ptr + task.expert * w2.packed_stride,
+                            scratch.down.data(), static_cast<int>(rows),
+                            static_cast<int>(w2.K_pad),
+                            static_cast<int>(w2.N_pad),
+                            static_cast<int>(w2.N_pad), w2.n_tile);
+                    } else {
+                        trace_dispatch_fp32_gemm(
+                            moe_trace,
+                            "w2",
+                            tid,
+                            -1,
+                            -1,
+                            -1,
+                            task.expert,
+                            task.route_begin,
+                            rows,
+                            scratch.intermediate.data(),
+                            w2_ptr + task.expert * w2.packed_stride,
+                            scratch.down.data(),
+                            scratch.a_reorder.data(),
+                            static_cast<int>(rows),
+                            static_cast<int>(w2.K_pad),
+                            static_cast<int>(w2.N_pad),
+                            static_cast<int>(w2.N_pad),
+                            w2_bias_base != nullptr
+                                ? w2_bias_base + task.expert * w2.N_pad
+                                : nullptr);
+                    }
 
                     for (int64_t m = 0; m < rows; ++m) {
                         const int64_t flat =
@@ -4780,8 +5614,14 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
                 static_cast<int64_t>(
                     routes[static_cast<size_t>(expert)].size()));
         }
+        const int64_t max_fused_packa_rows =
+            use_sve_backend ? sve_hybrid_packed_rows(max_expert_rows)
+                            : ceil_to_multiple(max_expert_rows, int64_t{8});
+        const int64_t max_k_pad = std::max(w13.K_pad, w2.K_pad);
         const int64_t a_reorder_stride =
-            max_expert_rows * std::max(w13.K_pad, w2.K_pad) * 2;
+            use_sve_backend
+                ? max_fused_packa_rows * max_k_pad
+                : max_expert_rows * max_k_pad * 2;
         double stage_alloc_ms = 0.0;
         // packA fusion frees the per-thread A-reorder scratch (the dominant
         // per-call alloc, ~268MB at G=8): w13 reads packed_a (Part 1) and, with
@@ -4812,7 +5652,7 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
                               packa_skip_input ? 0
                                                : max_expert_rows * w13.K_pad));
             const size_t interm_need = static_cast<size_t>(
-                (max_expert_rows + 7) / 8 * 8 * w2.K_pad);
+                max_fused_packa_rows * w2.K_pad);
             HierarchicalScratchPool::ensure(sc.intermediate, interm_need);
             // w2 reads intermediate's padding feature-blocks, which must be
             // zero. With a pool the buffer may be reused across differently
@@ -4823,7 +5663,7 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
                         interm_need * sizeof(uint16_t));
             HierarchicalScratchPool::ensure(
                 sc.packed_a,
-                static_cast<size_t>((max_expert_rows + 7) / 8 * 8 * w13.K_pad));
+                static_cast<size_t>(max_fused_packa_rows * w13.K_pad));
             HierarchicalScratchPool::ensure(
                 sc.a_reorder,
                 static_cast<size_t>(
@@ -4836,7 +5676,7 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
                                     : max_expert_rows * w13.N_pad));
             HierarchicalScratchPool::ensure(
                 sc.down,
-                static_cast<size_t>((max_expert_rows + 7) / 8 * 8 * w2.N_pad));
+                static_cast<size_t>(max_fused_packa_rows * w2.N_pad));
         }
         std::vector<std::unique_ptr<HierarchicalGroupScratch>>&
             group_scratches = scratch_pool.groups;
@@ -4912,12 +5752,20 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
                     const SplitRange brange = split_evenly(
                         nb, nsplit_group_size, local_tid);
                     time_phase(phase_gather_ms, [&] {
-                    gather_pack_a_reorder_m8(
-                        input_ptr, H, expert_routes.data(), top_k,
-                        scratch.packed_a.data(), static_cast<int>(rows),
-                        static_cast<int>(w13.K_pad),
-                        static_cast<int>(brange.begin),
-                        static_cast<int>(brange.begin + brange.size));
+                    if (use_sve_backend) {
+                        gather_pack_a_reorder_sve_hybrid(
+                            input_ptr, H, expert_routes.data(), top_k,
+                            scratch.packed_a.data(), static_cast<int>(rows),
+                            static_cast<int>(w13.K_pad), nsplit_group_size,
+                            local_tid);
+                    } else {
+                        gather_pack_a_reorder_m8(
+                            input_ptr, H, expert_routes.data(), top_k,
+                            scratch.packed_a.data(), static_cast<int>(rows),
+                            static_cast<int>(w13.K_pad),
+                            static_cast<int>(brange.begin),
+                            static_cast<int>(brange.begin + brange.size));
+                    }
                     });
                 } else {
                     // Parallel gather: each team thread copies its own row
@@ -4948,7 +5796,7 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
                     TeamContext team;
                     team.group_size = nsplit_group_size;
                     team.local_tid = local_tid;
-                    team.barrier = nullptr;
+                    team.barrier = nsplit_group_size > 1 ? &barrier : nullptr;
                     team.a_reorder = a_reorder;
                     if (fused_packa) {
                         // A already packed by the fused gather+pack stage; run
@@ -4957,16 +5805,58 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
                         // intermediate directly in w2 pre-packed layout.
                         const int64_t nb = (rows + 7) / 8;
                         if (fused_packa_w2) {
+                            const Gemm2DSplitPlan w13_2d_plan =
+                                plan_2d_gemm_split(
+                                    rows, w13.K_pad, w13.N_pad,
+                                    nsplit_group_size, w13.n_tile);
                             time_phase(phase_w13_ms, [&] {
-                            team_fused_w13_silu_packed_packc(
-                                team, scratch.packed_a.data(),
-                                w13_ptr + expert * w13.packed_stride,
-                                scratch.intermediate.data(),
-                                static_cast<int>(rows),
-                                static_cast<int>(w13.K_pad),
-                                static_cast<int>(w13.N_pad),
-                                static_cast<int>(w2.K_pad),
-                                silu_poly_degree);
+                            if (use_sve_backend) {
+                                if (use_fused_2d_split) {
+                                    team_fused_w13_silu_packed_packc_sve_2d(
+                                        team, w13_2d_plan,
+                                        scratch.packed_a.data(),
+                                        w13_ptr + expert * w13.packed_stride,
+                                        scratch.intermediate.data(),
+                                        static_cast<int>(rows),
+                                        static_cast<int>(w13.K_pad),
+                                        static_cast<int>(w13.N_pad),
+                                        static_cast<int>(w2.K_pad),
+                                        silu_poly_degree);
+                                } else {
+                                    team_fused_w13_silu_packed_packc_sve(
+                                        team, scratch.packed_a.data(),
+                                        w13_ptr + expert * w13.packed_stride,
+                                        scratch.intermediate.data(),
+                                        static_cast<int>(rows),
+                                        static_cast<int>(w13.K_pad),
+                                        static_cast<int>(w13.N_pad),
+                                        static_cast<int>(w2.K_pad),
+                                        silu_poly_degree, w13.n_tile);
+                                }
+                            } else {
+                                if (use_fused_2d_split) {
+                                    team_fused_w13_silu_packed_packc_2d(
+                                        team, w13_2d_plan,
+                                        scratch.packed_a.data(),
+                                        w13_ptr + expert * w13.packed_stride,
+                                        scratch.intermediate.data(),
+                                        static_cast<int>(rows),
+                                        static_cast<int>(w13.K_pad),
+                                        static_cast<int>(w13.N_pad),
+                                        static_cast<int>(w2.K_pad),
+                                        silu_poly_degree);
+                                } else {
+                                    team_fused_w13_silu_packed_packc(
+                                        team, scratch.packed_a.data(),
+                                        w13_ptr + expert * w13.packed_stride,
+                                        scratch.intermediate.data(),
+                                        static_cast<int>(rows),
+                                        static_cast<int>(w13.K_pad),
+                                        static_cast<int>(w13.N_pad),
+                                        static_cast<int>(w2.K_pad),
+                                        silu_poly_degree);
+                                }
+                            }
                             });
                         } else {
                             team_fused_w13_silu_packed(
@@ -5005,16 +5895,28 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
                             silu_poly_degree);
                         barrier.wait();
                     } else {
-                        team_fused_w13_silu(
-                            team,
-                            scratch.input.data(),
-                            w13_ptr + expert * w13.packed_stride,
-                            scratch.intermediate.data(),
-                            static_cast<int>(rows),
-                            static_cast<int>(w13.K_pad),
-                            static_cast<int>(w13.N_pad),
-                            static_cast<int>(w2.K_pad),
-                            silu_poly_degree);
+                        if (use_sve_backend) {
+                            team_fused_w13_silu_sve(
+                                team, scratch.input.data(),
+                                w13_ptr + expert * w13.packed_stride,
+                                scratch.intermediate.data(),
+                                static_cast<int>(rows),
+                                static_cast<int>(w13.K_pad),
+                                static_cast<int>(w13.N_pad),
+                                static_cast<int>(w2.K_pad), a_reorder,
+                                silu_poly_degree, w13.n_tile);
+                        } else {
+                            team_fused_w13_silu(
+                                team,
+                                scratch.input.data(),
+                                w13_ptr + expert * w13.packed_stride,
+                                scratch.intermediate.data(),
+                                static_cast<int>(rows),
+                                static_cast<int>(w13.K_pad),
+                                static_cast<int>(w13.N_pad),
+                                static_cast<int>(w2.K_pad),
+                                silu_poly_degree);
+                        }
                         barrier.wait();
                     }
                 } else {
@@ -5052,48 +5954,97 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
                     barrier.wait();
                 }
 
+                TeamContext w2team;
+                w2team.group_size = nsplit_group_size;
+                w2team.local_tid = local_tid;
+                w2team.barrier = nullptr;
+                w2team.a_reorder = a_reorder;
                 if (fused_packa_w2) {
                     // w2 reads the PACKED intermediate directly (no repack);
                     // N-split over w2.N_pad. M padded to a multiple of 8.
-                    TeamContext w2team;
-                    w2team.group_size = nsplit_group_size;
-                    w2team.local_tid = local_tid;
-                    w2team.barrier = nullptr;
-                    w2team.a_reorder = a_reorder;
+                    const Gemm2DSplitPlan w2_2d_plan =
+                        plan_2d_gemm_split(rows, w2.K_pad, w2.N_pad,
+                                           nsplit_group_size, w2.n_tile);
                     time_phase(phase_w2_ms, [&] {
-                    team_w2_packed(
-                        w2team, scratch.intermediate.data(),
-                        w2_ptr + expert * w2.packed_stride,
-                        scratch.down.data(),
-                        static_cast<int>(rows),
-                        static_cast<int>(w2.K_pad),
-                        static_cast<int>(w2.N_pad),
-                        static_cast<int>(w2.N_pad));
+                    if (use_sve_backend) {
+                        if (use_fused_2d_split) {
+                            team_w2_packed_sve_2d(
+                                w2team, w2_2d_plan,
+                                scratch.intermediate.data(),
+                                w2_ptr + expert * w2.packed_stride,
+                                scratch.down.data(), static_cast<int>(rows),
+                                static_cast<int>(w2.K_pad),
+                                static_cast<int>(w2.N_pad),
+                                static_cast<int>(w2.N_pad));
+                        } else {
+                            team_w2_packed_sve(
+                                w2team, scratch.intermediate.data(),
+                                w2_ptr + expert * w2.packed_stride,
+                                scratch.down.data(),
+                                static_cast<int>(rows),
+                                static_cast<int>(w2.K_pad),
+                                static_cast<int>(w2.N_pad),
+                                static_cast<int>(w2.N_pad),
+                                w2.n_tile);
+                        }
+                    } else {
+                        if (use_fused_2d_split) {
+                            team_w2_packed_2d(
+                                w2team, w2_2d_plan,
+                                scratch.intermediate.data(),
+                                w2_ptr + expert * w2.packed_stride,
+                                scratch.down.data(), static_cast<int>(rows),
+                                static_cast<int>(w2.K_pad),
+                                static_cast<int>(w2.N_pad),
+                                static_cast<int>(w2.N_pad));
+                        } else {
+                            team_w2_packed(
+                                w2team, scratch.intermediate.data(),
+                                w2_ptr + expert * w2.packed_stride,
+                                scratch.down.data(),
+                                static_cast<int>(rows),
+                                static_cast<int>(w2.K_pad),
+                                static_cast<int>(w2.N_pad),
+                                static_cast<int>(w2.N_pad));
+                        }
+                    }
                     });
                 } else {
-                    trace_dispatch_fp32_gemm_stage_split(
-                        moe_trace,
-                        "w2",
-                        MoeGemmStage::kW2,
-                        tid,
-                        -1,
-                        group,
-                        local_tid,
-                        expert,
-                        0,
-                        rows,
-                        scratch.intermediate.data(),
-                        w2_ptr + expert * w2.packed_stride,
-                        scratch.down.data(),
-                        a_reorder,
-                        static_cast<int>(rows),
-                        static_cast<int>(w2.K_pad),
-                        static_cast<int>(w2.N_pad),
-                        static_cast<int>(w2.N_pad),
-                        nsplit_group_size,
-                        w2_bias_base != nullptr
-                            ? w2_bias_base + expert * w2.N_pad
-                            : nullptr);
+                    if (use_sve_backend) {
+                        team_w2_rowmajor_sve(
+                            w2team, scratch.intermediate.data(),
+                            w2_ptr + expert * w2.packed_stride,
+                            scratch.down.data(),
+                            static_cast<int>(rows),
+                            static_cast<int>(w2.K_pad),
+                            static_cast<int>(w2.N_pad),
+                            static_cast<int>(w2.N_pad), a_reorder,
+                            w2.n_tile);
+                    } else {
+                        trace_dispatch_fp32_gemm_stage_split(
+                            moe_trace,
+                            "w2",
+                            MoeGemmStage::kW2,
+                            tid,
+                            -1,
+                            group,
+                            local_tid,
+                            expert,
+                            0,
+                            rows,
+                            scratch.intermediate.data(),
+                            w2_ptr + expert * w2.packed_stride,
+                            scratch.down.data(),
+                            a_reorder,
+                            static_cast<int>(rows),
+                            static_cast<int>(w2.K_pad),
+                            static_cast<int>(w2.N_pad),
+                            static_cast<int>(w2.N_pad),
+                            nsplit_group_size,
+                            w2_bias_base != nullptr
+                                ? w2_bias_base + expert * w2.N_pad
+                                : nullptr);
+                    }
                 }
                 barrier.wait();
 
@@ -5310,7 +6261,11 @@ at::Tensor fused_moe_bf16_tiled_scheduled(at::Tensor input,
                             int64_t num_threads,
                             std::string activation,
                             int64_t global_num_experts,
-                            bool skip_weighted) {
+                            bool skip_weighted,
+                            bool fuse_silu,
+                            int64_t silu_poly_degree,
+                            int64_t gemm_backend,
+                            int64_t backend_n_tile) {
 #ifndef __aarch64__
     TORCH_CHECK(false, "fused_moe_bf16_tiled_scheduled requires AArch64");
 #else
@@ -5361,10 +6316,29 @@ at::Tensor fused_moe_bf16_tiled_scheduled(at::Tensor input,
     TORCH_CHECK(num_threads <= std::numeric_limits<int>::max(),
                 "num_threads exceeds int32 limit: ", num_threads);
 
+    TORCH_CHECK(gemm_backend == 0 || gemm_backend == 1,
+                "gemm_backend must be 0 (NEON legacy fallback) or "
+                "1 (SVE fused default), got ",
+                gemm_backend);
+    const bool use_sve_backend = gemm_backend == 1;
+    if (use_sve_backend) {
+        TORCH_CHECK(::fused_cpp::moe_sve::available(),
+                    "SVE MoE weights require an SVE BF16 build/runtime");
+        TORCH_CHECK(fuse_silu,
+                    "SVE scheduled MoE backend currently requires "
+                    "fuse_silu=True");
+        TORCH_CHECK(backend_n_tile == ::fused_cpp::moe_sve::n_tile(),
+                    "SVE scheduled MoE backend_n_tile mismatch: weights use ",
+                    backend_n_tile, ", runtime uses ",
+                    ::fused_cpp::moe_sve::n_tile());
+    } else {
+        backend_n_tile = kKernelTile;
+    }
+
     PackedExperts w13 = checked_packed_experts(w13_packed, w13_K, w13_N,
-                                               "w13_packed");
+                                               "w13_packed", backend_n_tile);
     PackedExperts w2 = checked_packed_experts(w2_packed, w2_K, w2_N,
-                                             "w2_packed");
+                                             "w2_packed", backend_n_tile);
     TORCH_CHECK(w13.E == w2.E, "w13 and w2 expert count mismatch");
     TORCH_CHECK(w13.K == input.size(1),
                 "input hidden size mismatch: input H=", input.size(1),
@@ -5388,6 +6362,26 @@ at::Tensor fused_moe_bf16_tiled_scheduled(at::Tensor input,
         w13_bias_f32.defined() ? w13_bias_f32.data_ptr<float>() : nullptr;
     const float* w2_bias_base =
         w2_bias_f32.defined() ? w2_bias_f32.data_ptr<float>() : nullptr;
+
+    if (fuse_silu) {
+        TORCH_CHECK(activation == "silu",
+                    "fuse_silu only supports activation='silu', got ",
+                    activation);
+        TORCH_CHECK(F % 8 == 0, "fuse_silu requires F % 8 == 0, got F=", F);
+        TORCH_CHECK(w13.N_pad == 2 * F,
+                    "fuse_silu expects interleaved w13 with N_pad=2F (=",
+                    2 * F, "), got N_pad=", w13.N_pad);
+        TORCH_CHECK(w13_bias_base == nullptr,
+                    "scheduled fuse_silu does not support w13_bias yet");
+        TORCH_CHECK(w2_bias_base == nullptr,
+                    "scheduled fuse_silu does not support w2_bias yet");
+        TORCH_CHECK(silu_poly_degree == 4 || silu_poly_degree == 5 ||
+                        silu_poly_degree == 6,
+                    "silu_poly_degree must be 4, 5, or 6, got ",
+                    silu_poly_degree);
+    }
+    const bool use_fused_2d_split =
+        fuse_silu && env_flag_enabled("FUSED_CPP_MOE_FUSED_2D_SPLIT");
 
     const int64_t num_tokens = input.size(0);
     const int64_t top_k = topk_ids.size(1);
@@ -5560,7 +6554,7 @@ at::Tensor fused_moe_bf16_tiled_scheduled(at::Tensor input,
                 scratch_idx =
                     static_cast<int64_t>(scratch_unit_configs.size());
                 scratch_unit_configs.push_back(ScheduledScratchUnitConfig{
-                    thread_begin, team_threads, 0, 0});
+                    thread_begin, team_threads, 0, 0, fuse_silu});
             }
             ScheduledScratchUnitConfig& scratch_config =
                 scratch_unit_configs[static_cast<size_t>(scratch_idx)];
@@ -5569,7 +6563,11 @@ at::Tensor fused_moe_bf16_tiled_scheduled(at::Tensor input,
                 std::max(scratch_config.max_rows, rows);
             scratch_config.a_reorder_stride = std::max(
                 scratch_config.a_reorder_stride,
-                scheduled_a_reorder_stride(rows, team_threads, w13, w2));
+                fuse_silu ? int64_t{0}
+                          : scheduled_a_reorder_stride(rows, team_threads,
+                                                       w13, w2));
+            scratch_config.fused_packa =
+                scratch_config.fused_packa || fuse_silu;
             team_scratch_indices[static_cast<size_t>(team)] = scratch_idx;
         }
         waves.push_back(ScheduledWaveRuntime{begin, end, wave_threads});
@@ -5659,100 +6657,187 @@ at::Tensor fused_moe_bf16_tiled_scheduled(at::Tensor input,
                 TORCH_CHECK(rows <= scratch.max_rows,
                             "scratch row capacity mismatch for team ",
                             selected_team);
-                TORCH_CHECK(
-                    scheduled_a_reorder_stride(rows, group_size, w13, w2) <=
-                        scratch.a_reorder_stride,
-                    "scratch A reorder capacity mismatch for team ",
-                    selected_team);
+                if (!fuse_silu) {
+                    TORCH_CHECK(
+                        scheduled_a_reorder_stride(rows, group_size, w13, w2) <=
+                            scratch.a_reorder_stride,
+                        "scratch A reorder capacity mismatch for team ",
+                        selected_team);
+                }
                 const auto& expert_routes =
                     routes[static_cast<size_t>(expert)];
-                uint16_t* a_reorder = scratch.a_reorder.data() +
-                    local_tid * scratch.a_reorder_stride;
+                uint16_t* a_reorder =
+                    scratch.a_reorder.empty()
+                        ? nullptr
+                        : scratch.a_reorder.data() +
+                              local_tid * scratch.a_reorder_stride;
 
                 {
-                    // Parallel gather: each team thread copies its own row
-                    // slice (was serial on local_tid==0 with the rest idle).
                     auto worker_phase_begin = trace_phase_begin();
-                    const SplitRange grange =
-                        split_evenly(rows, group_size, local_tid);
-                    for (int64_t m = grange.begin;
-                         m < grange.begin + grange.size; ++m) {
-                        const int64_t flat =
-                            expert_routes[static_cast<size_t>(m)];
-                        const int64_t token = flat / top_k;
-                        uint16_t* dst =
-                            scratch.input.data() + m * w13.K_pad;
-                        std::fill(dst, dst + w13.K_pad,
-                                  static_cast<uint16_t>(0));
-                        std::copy(input_ptr + token * H,
-                                  input_ptr + token * H + H, dst);
+                    if (fuse_silu) {
+                        const int64_t nb = ceil_div_int64(rows, kKernelTile);
+                        const SplitRange brange =
+                            split_evenly(nb, group_size, local_tid);
+                        if (use_sve_backend) {
+                            gather_pack_a_reorder_sve_hybrid(
+                                input_ptr, H, expert_routes.data(), top_k,
+                                scratch.packed_a.data(), static_cast<int>(rows),
+                                static_cast<int>(w13.K_pad), group_size,
+                                local_tid);
+                        } else {
+                            gather_pack_a_reorder_backend(
+                                false, input_ptr, H, expert_routes.data(),
+                                top_k, scratch.packed_a.data(),
+                                static_cast<int>(rows),
+                                static_cast<int>(w13.K_pad),
+                                static_cast<int>(brange.begin),
+                                static_cast<int>(brange.begin + brange.size));
+                        }
+                        trace_phase_end(tid, wave_idx, selected_team, local_tid,
+                                        expert, brange.size * kKernelTile,
+                                        "gather_pack_a", worker_phase_begin);
+                    } else {
+                        // Parallel gather: each team thread copies its own row
+                        // slice (was serial on local_tid==0 with the rest idle).
+                        const SplitRange grange =
+                            split_evenly(rows, group_size, local_tid);
+                        for (int64_t m = grange.begin;
+                             m < grange.begin + grange.size; ++m) {
+                            const int64_t flat =
+                                expert_routes[static_cast<size_t>(m)];
+                            const int64_t token = flat / top_k;
+                            uint16_t* dst =
+                                scratch.input.data() + m * w13.K_pad;
+                            std::fill(dst, dst + w13.K_pad,
+                                      static_cast<uint16_t>(0));
+                            std::copy(input_ptr + token * H,
+                                      input_ptr + token * H + H, dst);
+                        }
+                        trace_phase_end(tid, wave_idx, selected_team, local_tid,
+                                        expert, grange.size, "gather_input",
+                                        worker_phase_begin);
                     }
-                    trace_phase_end(tid, wave_idx, selected_team, local_tid,
-                                    expert, grange.size, "gather_input",
-                                    worker_phase_begin);
                 }
                 barrier.wait();
 
-                trace_dispatch_fp32_gemm_stage_split(
-                    moe_trace,
-                    "w13",
-                    MoeGemmStage::kW13,
-                    tid,
-                    wave_idx,
-                    selected_team,
-                    local_tid,
-                    expert,
-                    0,
-                    rows,
-                    scratch.input.data(),
-                    w13_ptr + expert * w13.packed_stride,
-                    scratch.gate_up.data(),
-                    a_reorder,
-                    static_cast<int>(rows),
-                    static_cast<int>(w13.K_pad),
-                    static_cast<int>(w13.N_pad),
-                    static_cast<int>(w13.N_pad),
-                    group_size,
-                    w13_bias_base != nullptr
-                        ? w13_bias_base + expert * w13.N_pad
-                        : nullptr);
-                barrier.wait();
-
                 auto worker_phase_begin = trace_phase_begin();
-                const SplitRange activation_range = split_evenly(
-                    rows, group_size, local_tid);
-                activation_range_to_bf16(
-                    activation, scratch.gate_up.data(),
-                    scratch.intermediate.data(), activation_range.begin,
-                    activation_range.size, w13.N_pad, w2.K_pad, F);
-                trace_phase_end(tid, wave_idx, selected_team, local_tid,
-                                expert, activation_range.size, "activation",
-                                worker_phase_begin);
+                if (fuse_silu) {
+                    if (local_tid == 0) {
+                        const int64_t rows_padded =
+                            use_sve_backend
+                                ? sve_hybrid_packed_rows(rows)
+                                : ceil_to_multiple(rows, int64_t{kKernelTile});
+                        std::fill(scratch.intermediate.begin(),
+                                  scratch.intermediate.begin() +
+                                      rows_padded * w2.K_pad,
+                                  static_cast<uint16_t>(0));
+                    }
+                    barrier.wait();
+                    TeamContext team;
+                    team.group_size = group_size;
+                    team.local_tid = local_tid;
+                    team.barrier = group_size > 1 ? &barrier : nullptr;
+                    team.a_reorder = nullptr;
+                    const Gemm2DSplitPlan w13_2d_plan = plan_2d_gemm_split(
+                        rows, w13.K_pad, w13.N_pad, group_size, w13.n_tile);
+                    team_fused_w13_silu_packed_packc_backend(
+                        use_sve_backend, use_fused_2d_split, team, w13_2d_plan,
+                        scratch.packed_a.data(),
+                        w13_ptr + expert * w13.packed_stride,
+                        scratch.intermediate.data(), static_cast<int>(rows),
+                        static_cast<int>(w13.K_pad),
+                        static_cast<int>(w13.N_pad),
+                        static_cast<int>(w2.K_pad), silu_poly_degree,
+                        w13.n_tile);
+                    trace_phase_end(tid, wave_idx, selected_team, local_tid,
+                                    expert, rows, "w13_fused_silu_packc",
+                                    worker_phase_begin);
+                } else {
+                    trace_dispatch_fp32_gemm_stage_split(
+                        moe_trace,
+                        "w13",
+                        MoeGemmStage::kW13,
+                        tid,
+                        wave_idx,
+                        selected_team,
+                        local_tid,
+                        expert,
+                        0,
+                        rows,
+                        scratch.input.data(),
+                        w13_ptr + expert * w13.packed_stride,
+                        scratch.gate_up.data(),
+                        a_reorder,
+                        static_cast<int>(rows),
+                        static_cast<int>(w13.K_pad),
+                        static_cast<int>(w13.N_pad),
+                        static_cast<int>(w13.N_pad),
+                        group_size,
+                        w13_bias_base != nullptr
+                            ? w13_bias_base + expert * w13.N_pad
+                            : nullptr);
+                }
                 barrier.wait();
 
-                trace_dispatch_fp32_gemm_stage_split(
-                    moe_trace,
-                    "w2",
-                    MoeGemmStage::kW2,
-                    tid,
-                    wave_idx,
-                    selected_team,
-                    local_tid,
-                    expert,
-                    0,
-                    rows,
-                    scratch.intermediate.data(),
-                    w2_ptr + expert * w2.packed_stride,
-                    scratch.down.data(),
-                    a_reorder,
-                    static_cast<int>(rows),
-                    static_cast<int>(w2.K_pad),
-                    static_cast<int>(w2.N_pad),
-                    static_cast<int>(w2.N_pad),
-                    group_size,
-                    w2_bias_base != nullptr
-                        ? w2_bias_base + expert * w2.N_pad
-                        : nullptr);
+                if (!fuse_silu) {
+                    worker_phase_begin = trace_phase_begin();
+                    const SplitRange activation_range = split_evenly(
+                        rows, group_size, local_tid);
+                    activation_range_to_bf16(
+                        activation, scratch.gate_up.data(),
+                        scratch.intermediate.data(), activation_range.begin,
+                        activation_range.size, w13.N_pad, w2.K_pad, F);
+                    trace_phase_end(tid, wave_idx, selected_team, local_tid,
+                                    expert, activation_range.size, "activation",
+                                    worker_phase_begin);
+                    barrier.wait();
+                }
+
+                worker_phase_begin = trace_phase_begin();
+                if (fuse_silu) {
+                    TeamContext w2team;
+                    w2team.group_size = group_size;
+                    w2team.local_tid = local_tid;
+                    w2team.barrier = nullptr;
+                    w2team.a_reorder = nullptr;
+                    const Gemm2DSplitPlan w2_2d_plan = plan_2d_gemm_split(
+                        rows, w2.K_pad, w2.N_pad, group_size, w2.n_tile);
+                    team_w2_packed_backend(
+                        use_sve_backend, use_fused_2d_split, w2team,
+                        w2_2d_plan, scratch.intermediate.data(),
+                        w2_ptr + expert * w2.packed_stride,
+                        scratch.down.data(), static_cast<int>(rows),
+                        static_cast<int>(w2.K_pad),
+                        static_cast<int>(w2.N_pad),
+                        static_cast<int>(w2.N_pad), w2.n_tile);
+                    trace_phase_end(tid, wave_idx, selected_team, local_tid,
+                                    expert, rows, "w2_packed",
+                                    worker_phase_begin);
+                } else {
+                    trace_dispatch_fp32_gemm_stage_split(
+                        moe_trace,
+                        "w2",
+                        MoeGemmStage::kW2,
+                        tid,
+                        wave_idx,
+                        selected_team,
+                        local_tid,
+                        expert,
+                        0,
+                        rows,
+                        scratch.intermediate.data(),
+                        w2_ptr + expert * w2.packed_stride,
+                        scratch.down.data(),
+                        a_reorder,
+                        static_cast<int>(rows),
+                        static_cast<int>(w2.K_pad),
+                        static_cast<int>(w2.N_pad),
+                        static_cast<int>(w2.N_pad),
+                        group_size,
+                        w2_bias_base != nullptr
+                            ? w2_bias_base + expert * w2.N_pad
+                            : nullptr);
+                }
                 barrier.wait();
 
                 const SplitRange h_range = n_split_range(
@@ -5869,7 +6954,11 @@ at::Tensor fused_moe_bf16_tiled_async(at::Tensor input,
                             int64_t num_threads,
                             std::string activation,
                             int64_t global_num_experts,
-                            bool skip_weighted) {
+                            bool skip_weighted,
+                            bool fuse_silu,
+                            int64_t silu_poly_degree,
+                            int64_t gemm_backend,
+                            int64_t backend_n_tile) {
 #ifndef __aarch64__
     TORCH_CHECK(false, "fused_moe_bf16_tiled_async requires AArch64");
 #else
@@ -5919,10 +7008,28 @@ at::Tensor fused_moe_bf16_tiled_async(at::Tensor input,
     TORCH_CHECK(num_threads <= std::numeric_limits<int>::max(),
                 "num_threads exceeds int32 limit: ", num_threads);
 
+    TORCH_CHECK(gemm_backend == 0 || gemm_backend == 1,
+                "gemm_backend must be 0 (NEON legacy fallback) or "
+                "1 (SVE fused default), got ",
+                gemm_backend);
+    const bool use_sve_backend = gemm_backend == 1;
+    if (use_sve_backend) {
+        TORCH_CHECK(::fused_cpp::moe_sve::available(),
+                    "SVE MoE weights require an SVE BF16 build/runtime");
+        TORCH_CHECK(fuse_silu,
+                    "SVE async MoE backend currently requires fuse_silu=True");
+        TORCH_CHECK(backend_n_tile == ::fused_cpp::moe_sve::n_tile(),
+                    "SVE async MoE backend_n_tile mismatch: weights use ",
+                    backend_n_tile, ", runtime uses ",
+                    ::fused_cpp::moe_sve::n_tile());
+    } else {
+        backend_n_tile = kKernelTile;
+    }
+
     PackedExperts w13 = checked_packed_experts(w13_packed, w13_K, w13_N,
-                                               "w13_packed");
+                                               "w13_packed", backend_n_tile);
     PackedExperts w2 = checked_packed_experts(w2_packed, w2_K, w2_N,
-                                             "w2_packed");
+                                             "w2_packed", backend_n_tile);
     TORCH_CHECK(w13.E == w2.E, "w13 and w2 expert count mismatch");
     TORCH_CHECK(w13.K == input.size(1),
                 "input hidden size mismatch: input H=", input.size(1),
@@ -5943,6 +7050,26 @@ at::Tensor fused_moe_bf16_tiled_async(at::Tensor input,
         w13_bias_f32.defined() ? w13_bias_f32.data_ptr<float>() : nullptr;
     const float* w2_bias_base =
         w2_bias_f32.defined() ? w2_bias_f32.data_ptr<float>() : nullptr;
+
+    if (fuse_silu) {
+        TORCH_CHECK(activation == "silu",
+                    "fuse_silu only supports activation='silu', got ",
+                    activation);
+        TORCH_CHECK(F % 8 == 0, "fuse_silu requires F % 8 == 0, got F=", F);
+        TORCH_CHECK(w13.N_pad == 2 * F,
+                    "fuse_silu expects interleaved w13 with N_pad=2F (=",
+                    2 * F, "), got N_pad=", w13.N_pad);
+        TORCH_CHECK(w13_bias_base == nullptr,
+                    "async fuse_silu does not support w13_bias yet");
+        TORCH_CHECK(w2_bias_base == nullptr,
+                    "async fuse_silu does not support w2_bias yet");
+        TORCH_CHECK(silu_poly_degree == 4 || silu_poly_degree == 5 ||
+                        silu_poly_degree == 6,
+                    "silu_poly_degree must be 4, 5, or 6, got ",
+                    silu_poly_degree);
+    }
+    const bool use_fused_2d_split =
+        fuse_silu && env_flag_enabled("FUSED_CPP_MOE_FUSED_2D_SPLIT");
 
     const int64_t num_tokens = input.size(0);
     const int64_t top_k = topk_ids.size(1);
@@ -6089,14 +7216,16 @@ at::Tensor fused_moe_bf16_tiled_async(at::Tensor input,
         if (scratch_idx < 0) {
             scratch_idx = static_cast<int64_t>(scratch_unit_configs.size());
             scratch_unit_configs.push_back(ScheduledScratchUnitConfig{
-                core_begin, threads, 0, 0});
+                core_begin, threads, 0, 0, fuse_silu});
         }
         ScheduledScratchUnitConfig& scratch_config =
             scratch_unit_configs[static_cast<size_t>(scratch_idx)];
         scratch_config.max_rows = std::max(scratch_config.max_rows, rows);
         scratch_config.a_reorder_stride = std::max(
             scratch_config.a_reorder_stride,
-            scheduled_a_reorder_stride(rows, threads, w13, w2));
+            fuse_silu ? int64_t{0}
+                      : scheduled_a_reorder_stride(rows, threads, w13, w2));
+        scratch_config.fused_packa = scratch_config.fused_packa || fuse_silu;
 
         tasks[static_cast<size_t>(task)] =
             AsyncTaskRuntime{expert, rows, core_begin, threads, scratch_idx};
@@ -6180,89 +7309,167 @@ at::Tensor fused_moe_bf16_tiled_async(at::Tensor input,
         const int64_t rows = task.rows;
         const int64_t group_size = task.threads;
         const auto& expert_routes = routes[static_cast<size_t>(expert)];
-        uint16_t* a_reorder = scratch.a_reorder.data() +
-            local_tid * scratch.a_reorder_stride;
+        uint16_t* a_reorder =
+            scratch.a_reorder.empty()
+                ? nullptr
+                : scratch.a_reorder.data() +
+                      local_tid * scratch.a_reorder_stride;
 
         {
-            // Parallel gather: each team thread copies its own row slice
-            // (was serial on local_tid==0 with the rest idle).
             auto worker_phase_begin = trace_phase_begin();
-            const SplitRange grange =
-                split_evenly(rows, group_size, local_tid);
-            for (int64_t m = grange.begin;
-                 m < grange.begin + grange.size; ++m) {
-                const int64_t flat = expert_routes[static_cast<size_t>(m)];
-                const int64_t token = flat / top_k;
-                uint16_t* dst = scratch.input.data() + m * w13.K_pad;
-                std::fill(dst, dst + w13.K_pad, static_cast<uint16_t>(0));
-                std::copy(input_ptr + token * H,
-                          input_ptr + token * H + H, dst);
+            if (fuse_silu) {
+                const int64_t nb = ceil_div_int64(rows, kKernelTile);
+                const SplitRange brange =
+                    split_evenly(nb, group_size, local_tid);
+                if (use_sve_backend) {
+                    gather_pack_a_reorder_sve_hybrid(
+                        input_ptr, H, expert_routes.data(), top_k,
+                        scratch.packed_a.data(), static_cast<int>(rows),
+                        static_cast<int>(w13.K_pad), group_size, local_tid);
+                } else {
+                    gather_pack_a_reorder_backend(
+                        false, input_ptr, H, expert_routes.data(),
+                        top_k, scratch.packed_a.data(), static_cast<int>(rows),
+                        static_cast<int>(w13.K_pad),
+                        static_cast<int>(brange.begin),
+                        static_cast<int>(brange.begin + brange.size));
+                }
+                trace_phase_end(tid, task_id, local_tid, expert,
+                                brange.size * kKernelTile, "gather_pack_a",
+                                worker_phase_begin);
+            } else {
+                // Parallel gather: each team thread copies its own row slice
+                // (was serial on local_tid==0 with the rest idle).
+                const SplitRange grange =
+                    split_evenly(rows, group_size, local_tid);
+                for (int64_t m = grange.begin;
+                     m < grange.begin + grange.size; ++m) {
+                    const int64_t flat = expert_routes[static_cast<size_t>(m)];
+                    const int64_t token = flat / top_k;
+                    uint16_t* dst = scratch.input.data() + m * w13.K_pad;
+                    std::fill(dst, dst + w13.K_pad,
+                              static_cast<uint16_t>(0));
+                    std::copy(input_ptr + token * H,
+                              input_ptr + token * H + H, dst);
+                }
+                trace_phase_end(tid, task_id, local_tid, expert, grange.size,
+                                "gather_input", worker_phase_begin);
             }
-            trace_phase_end(tid, task_id, local_tid, expert, grange.size,
-                            "gather_input", worker_phase_begin);
         }
         barrier.wait();
 
-        trace_dispatch_fp32_gemm_stage_split(
-            moe_trace,
-            "w13",
-            MoeGemmStage::kW13,
-            tid,
-            -1,
-            task_id,
-            local_tid,
-            expert,
-            0,
-            rows,
-            scratch.input.data(),
-            w13_ptr + expert * w13.packed_stride,
-            scratch.gate_up.data(),
-            a_reorder,
-            static_cast<int>(rows),
-            static_cast<int>(w13.K_pad),
-            static_cast<int>(w13.N_pad),
-            static_cast<int>(w13.N_pad),
-            group_size,
-            w13_bias_base != nullptr
-                ? w13_bias_base + expert * w13.N_pad
-                : nullptr);
-        barrier.wait();
-
         auto worker_phase_begin = trace_phase_begin();
-        const SplitRange activation_range =
-            split_evenly(rows, group_size, local_tid);
-        activation_range_to_bf16(
-            activation, scratch.gate_up.data(), scratch.intermediate.data(),
-            activation_range.begin, activation_range.size, w13.N_pad,
-            w2.K_pad, F);
-        trace_phase_end(tid, task_id, local_tid, expert,
-                        activation_range.size, "activation",
-                        worker_phase_begin);
+        if (fuse_silu) {
+            if (local_tid == 0) {
+                const int64_t rows_padded =
+                    use_sve_backend
+                        ? sve_hybrid_packed_rows(rows)
+                        : ceil_to_multiple(rows, int64_t{kKernelTile});
+                std::fill(scratch.intermediate.begin(),
+                          scratch.intermediate.begin() +
+                              rows_padded * w2.K_pad,
+                          static_cast<uint16_t>(0));
+            }
+            barrier.wait();
+            TeamContext team;
+            team.group_size = group_size;
+            team.local_tid = local_tid;
+            team.barrier = group_size > 1 ? &barrier : nullptr;
+            team.a_reorder = nullptr;
+            const Gemm2DSplitPlan w13_2d_plan = plan_2d_gemm_split(
+                rows, w13.K_pad, w13.N_pad, group_size, w13.n_tile);
+            team_fused_w13_silu_packed_packc_backend(
+                use_sve_backend, use_fused_2d_split, team, w13_2d_plan,
+                scratch.packed_a.data(), w13_ptr + expert * w13.packed_stride,
+                scratch.intermediate.data(), static_cast<int>(rows),
+                static_cast<int>(w13.K_pad), static_cast<int>(w13.N_pad),
+                static_cast<int>(w2.K_pad), silu_poly_degree, w13.n_tile);
+            trace_phase_end(tid, task_id, local_tid, expert, rows,
+                            "w13_fused_silu_packc", worker_phase_begin);
+        } else {
+            trace_dispatch_fp32_gemm_stage_split(
+                moe_trace,
+                "w13",
+                MoeGemmStage::kW13,
+                tid,
+                -1,
+                task_id,
+                local_tid,
+                expert,
+                0,
+                rows,
+                scratch.input.data(),
+                w13_ptr + expert * w13.packed_stride,
+                scratch.gate_up.data(),
+                a_reorder,
+                static_cast<int>(rows),
+                static_cast<int>(w13.K_pad),
+                static_cast<int>(w13.N_pad),
+                static_cast<int>(w13.N_pad),
+                group_size,
+                w13_bias_base != nullptr
+                    ? w13_bias_base + expert * w13.N_pad
+                    : nullptr);
+        }
         barrier.wait();
 
-        trace_dispatch_fp32_gemm_stage_split(
-            moe_trace,
-            "w2",
-            MoeGemmStage::kW2,
-            tid,
-            -1,
-            task_id,
-            local_tid,
-            expert,
-            0,
-            rows,
-            scratch.intermediate.data(),
-            w2_ptr + expert * w2.packed_stride,
-            scratch.down.data(),
-            a_reorder,
-            static_cast<int>(rows),
-            static_cast<int>(w2.K_pad),
-            static_cast<int>(w2.N_pad),
-            static_cast<int>(w2.N_pad),
-            group_size,
-            w2_bias_base != nullptr
-                ? w2_bias_base + expert * w2.N_pad
-                : nullptr);
+        if (!fuse_silu) {
+            worker_phase_begin = trace_phase_begin();
+            const SplitRange activation_range =
+                split_evenly(rows, group_size, local_tid);
+            activation_range_to_bf16(
+                activation, scratch.gate_up.data(), scratch.intermediate.data(),
+                activation_range.begin, activation_range.size, w13.N_pad,
+                w2.K_pad, F);
+            trace_phase_end(tid, task_id, local_tid, expert,
+                            activation_range.size, "activation",
+                            worker_phase_begin);
+            barrier.wait();
+        }
+
+        worker_phase_begin = trace_phase_begin();
+        if (fuse_silu) {
+            TeamContext w2team;
+            w2team.group_size = group_size;
+            w2team.local_tid = local_tid;
+            w2team.barrier = nullptr;
+            w2team.a_reorder = nullptr;
+            const Gemm2DSplitPlan w2_2d_plan = plan_2d_gemm_split(
+                rows, w2.K_pad, w2.N_pad, group_size, w2.n_tile);
+            team_w2_packed_backend(
+                use_sve_backend, use_fused_2d_split, w2team, w2_2d_plan,
+                scratch.intermediate.data(),
+                w2_ptr + expert * w2.packed_stride, scratch.down.data(),
+                static_cast<int>(rows), static_cast<int>(w2.K_pad),
+                static_cast<int>(w2.N_pad), static_cast<int>(w2.N_pad),
+                w2.n_tile);
+            trace_phase_end(tid, task_id, local_tid, expert, rows,
+                            "w2_packed", worker_phase_begin);
+        } else {
+            trace_dispatch_fp32_gemm_stage_split(
+                moe_trace,
+                "w2",
+                MoeGemmStage::kW2,
+                tid,
+                -1,
+                task_id,
+                local_tid,
+                expert,
+                0,
+                rows,
+                scratch.intermediate.data(),
+                w2_ptr + expert * w2.packed_stride,
+                scratch.down.data(),
+                a_reorder,
+                static_cast<int>(rows),
+                static_cast<int>(w2.K_pad),
+                static_cast<int>(w2.N_pad),
+                static_cast<int>(w2.N_pad),
+                group_size,
+                w2_bias_base != nullptr
+                    ? w2_bias_base + expert * w2.N_pad
+                    : nullptr);
+        }
         barrier.wait();
 
         const SplitRange h_range =
@@ -6276,9 +7483,8 @@ at::Tensor fused_moe_bf16_tiled_async(at::Tensor input,
                 const float* src = scratch.down.data() + m * w2.N_pad;
                 if (skip_weighted) {
                     uint16_t* dst = out_bf16_ptr + flat * H;
-                    for (int64_t h = h_begin; h < h_end; ++h) {
-                        dst[h] = bf16_bits_from_float(src[h]);
-                    }
+                    convert_f32_to_bf16(src + h_begin, dst + h_begin,
+                                        h_end - h_begin);
                 } else {
                     float* dst = route_out_ptr + flat * H;
                     for (int64_t h = h_begin; h < h_end; ++h) {

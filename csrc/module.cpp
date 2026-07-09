@@ -171,7 +171,8 @@ std::vector<double> fused_moe_bench_team_gemm(at::Tensor A,
 std::vector<double> fused_moe_bench_fused_w13_silu_packc_tail(
     at::Tensor A, at::Tensor w13, int64_t degree, int64_t mode,
     int64_t warmup, int64_t runs);
-std::tuple<at::Tensor, int64_t, int64_t, at::Tensor, int64_t, int64_t>
+std::tuple<at::Tensor, int64_t, int64_t, at::Tensor, int64_t, int64_t,
+           int64_t, int64_t>
 fused_moe_bf16_tiled_prepare_weights(at::Tensor w13_weight,
                                       at::Tensor w2_weight,
                                       bool fuse_silu);
@@ -191,7 +192,9 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
                                 int64_t global_num_experts,
                                 bool skip_weighted,
                                 bool fuse_silu,
-                                int64_t silu_poly_degree);
+                                int64_t silu_poly_degree,
+                                int64_t gemm_backend,
+                                int64_t backend_n_tile);
 at::Tensor fused_moe_bf16_tiled_scheduled(at::Tensor input,
                                 at::Tensor w13_packed,
                                 int64_t w13_K,
@@ -210,7 +213,11 @@ at::Tensor fused_moe_bf16_tiled_scheduled(at::Tensor input,
                                 int64_t num_threads,
                                 std::string activation,
                                 int64_t global_num_experts,
-                                bool skip_weighted);
+                                bool skip_weighted,
+                                bool fuse_silu,
+                                int64_t silu_poly_degree,
+                                int64_t gemm_backend,
+                                int64_t backend_n_tile);
 at::Tensor fused_moe_bf16_tiled_async(at::Tensor input,
                                 at::Tensor w13_packed,
                                 int64_t w13_K,
@@ -231,7 +238,11 @@ at::Tensor fused_moe_bf16_tiled_async(at::Tensor input,
                                 int64_t num_threads,
                                 std::string activation,
                                 int64_t global_num_experts,
-                                bool skip_weighted);
+                                bool skip_weighted,
+                                bool fuse_silu,
+                                int64_t silu_poly_degree,
+                                int64_t gemm_backend,
+                                int64_t backend_n_tile);
 
 // DeepSeek V4 attn_gemm_parallel_execute fused GEMM declarations
 std::tuple<at::Tensor, int64_t, int64_t>
@@ -1372,6 +1383,8 @@ PYBIND11_MODULE(_C, m) {
           py::arg("skip_weighted") = false,
           py::arg("fuse_silu") = false,
           py::arg("silu_poly_degree") = 5,
+          py::arg("gemm_backend") = 0,
+          py::arg("backend_n_tile") = 8,
           py::call_guard<py::gil_scoped_release>());
 
     m.def("fused_moe_bf16_tiled_scheduled",
@@ -1399,6 +1412,10 @@ PYBIND11_MODULE(_C, m) {
           py::arg("activation") = "silu",
           py::arg("global_num_experts") = -1,
           py::arg("skip_weighted") = false,
+          py::arg("fuse_silu") = false,
+          py::arg("silu_poly_degree") = 5,
+          py::arg("gemm_backend") = 0,
+          py::arg("backend_n_tile") = 8,
           py::call_guard<py::gil_scoped_release>());
 
     m.def("fused_moe_bf16_tiled_async",
@@ -1427,6 +1444,10 @@ PYBIND11_MODULE(_C, m) {
           py::arg("activation") = "silu",
           py::arg("global_num_experts") = -1,
           py::arg("skip_weighted") = false,
+          py::arg("fuse_silu") = false,
+          py::arg("silu_poly_degree") = 5,
+          py::arg("gemm_backend") = 0,
+          py::arg("backend_n_tile") = 8,
           py::call_guard<py::gil_scoped_release>());
 #endif
 }

@@ -17,6 +17,9 @@ class PreparedBF16TiledFusedMoEWeights:
     w13: PreparedWeight
     w2: PreparedWeight
     fused_silu: bool = False
+    # 1=SVE fused kernel default when available; 0=NEON legacy fallback.
+    gemm_backend: int = 0
+    backend_n_tile: int = 8
 
 
 try:
@@ -122,6 +125,8 @@ def prepare_fused_moe_bf16_tiled_weights(
         w13=(packed[0], int(packed[1]), int(packed[2])),
         w2=(packed[3], int(packed[4]), int(packed[5])),
         fused_silu=bool(fuse_silu),
+        gemm_backend=int(packed[6]) if len(packed) > 6 else 0,
+        backend_n_tile=int(packed[7]) if len(packed) > 7 else 8,
     )
 
 
@@ -192,6 +197,8 @@ def fused_moe_bf16_tiled(
         bool(skip_weighted),
         bool(weights.fused_silu),
         int(silu_poly_degree),
+        int(weights.gemm_backend),
+        int(weights.backend_n_tile),
     )
     if out is not None:
         out.copy_(result)
@@ -215,6 +222,7 @@ def fused_moe_bf16_tiled_scheduled(
     activation: Any = "silu",
     global_num_experts: int = -1,
     skip_weighted: bool = False,
+    silu_poly_degree: int = 5,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run the BF16 tiled MoE path using an externally supplied schedule.
@@ -286,6 +294,10 @@ def fused_moe_bf16_tiled_scheduled(
         _activation_name(activation),
         int(global_num_experts),
         bool(skip_weighted),
+        bool(weights.fused_silu),
+        int(silu_poly_degree),
+        int(weights.gemm_backend),
+        int(weights.backend_n_tile),
     )
     if out is not None:
         out.copy_(result)
@@ -311,6 +323,7 @@ def fused_moe_bf16_tiled_async(
     activation: Any = "silu",
     global_num_experts: int = -1,
     skip_weighted: bool = False,
+    silu_poly_degree: int = 5,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run BF16 tiled MoE with an async task-DAG schedule.
@@ -393,6 +406,10 @@ def fused_moe_bf16_tiled_async(
         _activation_name(activation),
         int(global_num_experts),
         bool(skip_weighted),
+        bool(weights.fused_silu),
+        int(silu_poly_degree),
+        int(weights.gemm_backend),
+        int(weights.backend_n_tile),
     )
     if out is not None:
         out.copy_(result)

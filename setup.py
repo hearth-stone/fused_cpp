@@ -466,13 +466,19 @@ if is_aarch64:
         if _host_cpu_has_flag("sve"):
             features.insert(0, "sve")
         extra_compile_args.append("-march=armv8.6-a+" + "+".join(features))
-    extra_compile_args.append("-O3")
+    extra_compile_args.append("-O2")
 
     target_has_sve = (
         "sve" in target_cpu.lower()
         if target_cpu
         else platform.system() != "Darwin" and _host_cpu_has_flag("sve")
     )
+    if target_has_sve:
+        # fused_cpp-owned SVE MoE asm kernels. Do not compile upstream
+        # bf16gemm_sve.S directly here; it exports bf16gemm_k_* symbols that
+        # collide with the NEON bf16gemm objects already linked above.
+        bf16gemm_asm_sources.append(
+            os.path.abspath(os.path.join("csrc", "moe_sve_fused_asm.S")))
     i8gemm_backend = "sve" if target_has_sve else "neon"
     i8gemm_required = [
         os.path.join(bf16gemm_lib, "i8gemm.h"),
@@ -546,7 +552,7 @@ if use_kai:
     # 以免覆盖（多个 -march/-mcpu 时编译器以最后一个为准，会反向降级 BFMMLA
     # 路径）。仅追加 KleidiAI 自身需要的标志。
     extra_compile_args.extend([
-        "-O3",
+        "-O2",
         # KleidiAI 的 .c 源文件中存在 void* -> T* 的隐式转换，
         # 在 C 中合法但 C++ 中不允许。PyTorch CppExtension 统一使用
         # C++ 编译器编译所有源文件，因此需要 -fpermissive 来容忍此类转换。
