@@ -8,6 +8,36 @@
 
 当前阶段仅建立研究文档和工程边界。
 
+## 当前 policy-aware 闭环
+
+Schema v2 路径按完整策略选择表：`TP/EP degree + H/F + global/local
+experts + SVE tile + split-W13 + NUMA/CPU set + LLC + source/binary hash`。
+split/no-split 不再共用 derate，也不跨 F 或拓扑做隐式 nearest-profile
+fallback。
+
+当前实现入口：
+
+- `cost_model/profile_contention_async_dual_rank.py`：两个 NUMA-local rank
+  同步采样；isolated 使用 8 个连续冷权重，contention 使用全部本地专家，
+  mixed-width shape 使用与 planner 相同的 LPT assignment。
+- `cost_model/profile_catalog.py`：严格 profile identity、split pair 与 grid
+  校验。
+- `cost_model/phase_model.py`：M12 bulk/tail、精确 full-call anchor，以及按
+  W13 chunk/W2 瞬时 packed working set 驱动的 stage-aware fallback。
+- `planners/interval_planner.py` / `planned_moe.py`：联合搜索
+  `(w13_split, core_shape)`，返回显式 CPU 集与 operator option，并按完整
+  routing bucket histogram 缓存。
+- `planners/tp_vs_ep_model.py`：按 rank-local histogram 取全局最大 compute，
+  加上通用分层 all-reduce/all-to-all 模型。
+- `planners/validate_policy_planner.py`：双 rank 枚举实测所有 policy/shape，
+  报告预测误差和真实 regret；可用 `--routes-json` 输入真实路由直方图。
+- `POLICY_MODEL_VALIDATION.md`：AWS 64-core TP2/EP2 的完整校准配置、穷举
+  regret 结果和通信模型估计。
+
+完整均匀 workload 直接使用 profile 的 `full_call_*` 曲线，不把短窗口
+group cost 乘以 wave 数。非均匀路由才进入 stage-aware DAG 模拟。跨 profile
+插值保持禁用，直到目标 routing trace 的 regret 验证通过。
+
 ---
 
 ## 背景
@@ -76,8 +106,9 @@ T_plan(plan) + T_execute(plan)
 ## 当前文档
 
 - [`DESIGN.md`](./DESIGN.md)：完整设计文档，定义 plan space、成本模型、严格最优求解方式、multi-plan runtime selector 和阶段性路线图。
+- [`TODO.md`](./TODO.md)：schema-v2 profiling 之后的 policy-aware cost model、planner 与 TP/EP evaluator 待办。
 - [`README.md`](./README.md)：当前入口说明。
-- [`cost_model/profile_schema.md`](./cost_model/profile_schema.md)：`T_expert(routes, threads)` profiling table 的第一版 schema。
+- [`cost_model/profile_schema.md`](./cost_model/profile_schema.md)：当前 policy/topology-aware schema v2，以及 legacy v1 格式。
 - [`cost_model/profile_expert_cost.py`](./cost_model/profile_expert_cost.py)：用真实 `fused_moe_bf16_tiled_scheduled` kernel 生成 `T_expert(routes, threads)` cost table。
 - [`planners/plan_schema.md`](./planners/plan_schema.md)：`Plan / Wave / Team` 的第一版输出 schema。
 - [`cost_model/phase_model.py`](./cost_model/phase_model.py)：`ContentionCostModel` —— 争用感知的事件驱动 makespan 模拟内核(`dag_makespan`)，AWS 实测 ~2% median。

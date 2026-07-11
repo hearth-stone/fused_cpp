@@ -769,12 +769,12 @@ void packed_w2_tail_dispatch(const uint16_t* packed_A, const uint16_t* w2_packed
     }
 }
 
-#if defined(__ARM_FEATURE_SVE) && defined(__ARM_FEATURE_BF16)
 bool sve_w13_split_n_workset_enabled() {
     const char* value = std::getenv("FUSED_CPP_MOE_W13_SPLIT_N");
     return value != nullptr && value[0] != '\0' && value[0] != '0';
 }
 
+#if defined(__ARM_FEATURE_SVE) && defined(__ARM_FEATURE_BF16)
 FusedSiluKernelSet sve_asm_fused_silu_packc_set_for_degree(int64_t degree) {
     switch (degree) {
         case 4:
@@ -2393,7 +2393,9 @@ void team_fused_w13_silu_packed_packc_sve(const TeamContext& team,
                                           const uint16_t* w13_packed,
                                           uint16_t* intermediate, int rows,
                                           int K, int N13, int ldc,
-                                          int64_t degree, int64_t n_tile) {
+                                          int64_t degree, int64_t n_tile,
+                                          bool split_w13 =
+                                              sve_w13_split_n_workset_enabled()) {
 #if defined(__ARM_FEATURE_SVE) && defined(__ARM_FEATURE_BF16)
     const FusedSiluKernelSet ks =
         sve_asm_fused_silu_packc_set_for_degree(degree);
@@ -2413,7 +2415,7 @@ void team_fused_w13_silu_packed_packc_sve(const TeamContext& team,
             static_cast<int>(abs_begin), ks);
     };
     const int64_t half_n = N13 / 2;
-    if (sve_w13_split_n_workset_enabled() && N13 % 2 == 0 &&
+    if (split_w13 && N13 % 2 == 0 &&
         half_n > 0 && half_n % n_tile == 0) {
         run_n_range(0, half_n);
         if (team.barrier != nullptr) {
@@ -2442,7 +2444,8 @@ void team_fused_w13_silu_packed_packc_sve_2d(
     const TeamContext& team, const Gemm2DSplitPlan& plan,
     const uint16_t* packed_A, const uint16_t* w13_packed,
     uint16_t* intermediate, int rows, int K, int N13, int ldc,
-    int64_t degree) {
+    int64_t degree,
+    bool split_w13 = sve_w13_split_n_workset_enabled()) {
 #if defined(__ARM_FEATURE_SVE) && defined(__ARM_FEATURE_BF16)
     const FusedSiluKernelSet ks =
         sve_asm_fused_silu_packc_set_for_degree(degree);
@@ -2468,7 +2471,7 @@ void team_fused_w13_silu_packed_packc_sve_2d(
             ks);
     };
     const int64_t half_n = N13 / 2;
-    if (sve_w13_split_n_workset_enabled() && N13 % 2 == 0 &&
+    if (split_w13 && N13 % 2 == 0 &&
         half_n > 0 && half_n % plan.n_tile == 0) {
         run_n_range(0, half_n);
         if (team.barrier != nullptr) {
@@ -2666,17 +2669,18 @@ void team_fused_w13_silu_packed_packc_backend(
     bool use_sve_backend, bool use_2d_split, const TeamContext& team,
     const Gemm2DSplitPlan& plan, const uint16_t* packed_A,
     const uint16_t* w13_packed, uint16_t* intermediate, int rows, int K,
-    int N13, int ldc, int64_t degree, int64_t n_tile) {
+    int N13, int ldc, int64_t degree, int64_t n_tile,
+    bool split_w13 = sve_w13_split_n_workset_enabled()) {
 #if defined(__ARM_FEATURE_SVE) && defined(__ARM_FEATURE_BF16)
     if (use_sve_backend) {
         if (use_2d_split) {
             team_fused_w13_silu_packed_packc_sve_2d(
                 team, plan, packed_A, w13_packed, intermediate, rows, K, N13,
-                ldc, degree);
+                ldc, degree, split_w13);
         } else {
             team_fused_w13_silu_packed_packc_sve(
                 team, packed_A, w13_packed, intermediate, rows, K, N13, ldc,
-                degree, n_tile);
+                degree, n_tile, split_w13);
         }
         return;
     }
@@ -6958,7 +6962,8 @@ at::Tensor fused_moe_bf16_tiled_async(at::Tensor input,
                             bool fuse_silu,
                             int64_t silu_poly_degree,
                             int64_t gemm_backend,
-                            int64_t backend_n_tile) {
+                            int64_t backend_n_tile,
+                            int64_t w13_split) {
 #ifndef __aarch64__
     TORCH_CHECK(false, "fused_moe_bf16_tiled_async requires AArch64");
 #else
@@ -7013,6 +7018,12 @@ at::Tensor fused_moe_bf16_tiled_async(at::Tensor input,
                 "1 (SVE fused default), got ",
                 gemm_backend);
     const bool use_sve_backend = gemm_backend == 1;
+    TORCH_CHECK(w13_split >= -1 && w13_split <= 1,
+                "w13_split must be -1 (environment), 0, or 1, got ",
+                w13_split);
+    const bool use_w13_split =
+        w13_split < 0 ? sve_w13_split_n_workset_enabled()
+                      : w13_split != 0;
     if (use_sve_backend) {
         TORCH_CHECK(::fused_cpp::moe_sve::available(),
                     "SVE MoE weights require an SVE BF16 build/runtime");
@@ -7383,7 +7394,8 @@ at::Tensor fused_moe_bf16_tiled_async(at::Tensor input,
                 scratch.packed_a.data(), w13_ptr + expert * w13.packed_stride,
                 scratch.intermediate.data(), static_cast<int>(rows),
                 static_cast<int>(w13.K_pad), static_cast<int>(w13.N_pad),
-                static_cast<int>(w2.K_pad), silu_poly_degree, w13.n_tile);
+                static_cast<int>(w2.K_pad), silu_poly_degree, w13.n_tile,
+                use_w13_split);
             trace_phase_end(tid, task_id, local_tid, expert, rows,
                             "w13_fused_silu_packc", worker_phase_begin);
         } else {

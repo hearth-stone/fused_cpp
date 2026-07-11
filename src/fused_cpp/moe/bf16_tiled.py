@@ -324,6 +324,7 @@ def fused_moe_bf16_tiled_async(
     global_num_experts: int = -1,
     skip_weighted: bool = False,
     silu_poly_degree: int = 5,
+    w13_split: bool | None = None,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run BF16 tiled MoE with an async task-DAG schedule.
@@ -331,7 +332,9 @@ def fused_moe_bf16_tiled_async(
     Each task computes one active expert on a contiguous logical-thread
     interval. ``task_dep_offsets`` / ``task_deps`` encode a CSR dependency
     list, allowing later tasks to start as soon as their own interval is free
-    instead of waiting for a whole wave barrier.
+    instead of waiting for a whole wave barrier. ``w13_split`` explicitly
+    selects the two-panel SVE W13 policy; ``None`` preserves the legacy
+    ``FUSED_CPP_MOE_W13_SPLIT_N`` environment fallback.
     """
     _require_backend()
     if _fused_moe_bf16_tiled_async_impl is None:
@@ -410,6 +413,7 @@ def fused_moe_bf16_tiled_async(
         int(silu_poly_degree),
         int(weights.gemm_backend),
         int(weights.backend_n_tile),
+        -1 if w13_split is None else int(bool(w13_split)),
     )
     if out is not None:
         out.copy_(result)

@@ -242,7 +242,8 @@ at::Tensor fused_moe_bf16_tiled_async(at::Tensor input,
                                 bool fuse_silu,
                                 int64_t silu_poly_degree,
                                 int64_t gemm_backend,
-                                int64_t backend_n_tile);
+                                int64_t backend_n_tile,
+                                int64_t w13_split);
 
 // DeepSeek V4 attn_gemm_parallel_execute fused GEMM declarations
 std::tuple<at::Tensor, int64_t, int64_t>
@@ -1448,6 +1449,7 @@ PYBIND11_MODULE(_C, m) {
           py::arg("silu_poly_degree") = 5,
           py::arg("gemm_backend") = 0,
           py::arg("backend_n_tile") = 8,
+          py::arg("w13_split") = -1,
           py::call_guard<py::gil_scoped_release>());
 #endif
 }

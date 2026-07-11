@@ -1,0 +1,6140 @@
+{
+  "schema_version": 2,
+  "kind": "contention_derate",
+  "target": {
+    "machine": "aarch64",
+    "cpu": "aarch64",
+    "host_logical_cores": 64,
+    "aggregate_profiled_cores": 64,
+    "cores_per_rank": 32,
+    "concurrent_ranks": 2,
+    "cpu_ids_by_rank": [
+      [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27,
+        28,
+        29,
+        30,
+        31
+      ],
+      [
+        32,
+        33,
+        34,
+        35,
+        36,
+        37,
+        38,
+        39,
+        40,
+        41,
+        42,
+        43,
+        44,
+        45,
+        46,
+        47,
+        48,
+        49,
+        50,
+        51,
+        52,
+        53,
+        54,
+        55,
+        56,
+        57,
+        58,
+        59,
+        60,
+        61,
+        62,
+        63
+      ]
+    ],
+    "numa_nodes": [
+      0,
+      1
+    ],
+    "llc_bytes_by_rank": [
+      50331648,
+      50331648
+    ],
+    "os": "Linux-7.0.0-1008-aws-aarch64-with-glibc2.43"
+  },
+  "kernel": {
+    "name": "fused_moe_bf16_tiled_async",
+    "backend": "sve",
+    "gemm_backend": 1,
+    "backend_n_tile": 8,
+    "parallel_axis": "N",
+    "w13_split": false,
+    "w13_split_chunks": 1,
+    "git_available": false,
+    "git_commit": null,
+    "git_worktree_dirty": null,
+    "source_sha256": "21853affada8848aaaea863c04e2701be2b77ba0411248ed16fcfccb40470ddf",
+    "extension_path": "/home/ubuntu/zhangxu/fused_cpp/src/fused_cpp/_C.cpython-312-aarch64-linux-gnu.so",
+    "extension_sha256": "2d5fc0411c6f5e0887e9728037fe8249d4758e789e974ed4f30ffca33a77d1da"
+  },
+  "parallelism": {
+    "mode": "tp",
+    "degree": 2,
+    "global_experts": 64,
+    "local_experts": 64
+  },
+  "expert_shape": {
+    "dtype": "bf16",
+    "hidden_size": 4096,
+    "intermediate_size": 1024,
+    "kernel": "fused_moe_bf16_tiled_async",
+    "activation": "silu",
+    "num_experts": 64,
+    "global_experts": 64,
+    "measurement_experts": 64,
+    "isolated_measurement_experts": 8,
+    "expert_selection": "consecutive_window",
+    "weight_reuse": "streaming_distinct_experts",
+    "top_k": 1,
+    "skip_weighted": true
+  },
+  "working_set": {
+    "w13_dense_bytes_per_expert": 16777216,
+    "w2_dense_bytes_per_expert": 8388608,
+    "w13_packed_bytes_per_expert": 16777216,
+    "w2_packed_bytes_per_expert": 8388608,
+    "w13_chunk_bytes_per_expert": 16777216,
+    "max_weight_stage_bytes_per_expert": 16777216
+  },
+  "measurement": {
+    "path": "fused_moe_bf16_tiled_async",
+    "pinning": "interval (thread_cpu_ids, disjoint per task)",
+    "rank_synchronization": "socket_barrier_per_call",
+    "omp_proc_bind": "",
+    "runs": 20,
+    "warmup": 5,
+    "assignment": "earliest_finish_lpt_using_streaming_T_iso",
+    "derate": "full_call_median / LPT_isolated_baseline_makespan",
+    "rank_aggregation": "median_of_pairwise_max",
+    "profile_scope": "concurrent_rank_pair",
+    "generated_at_utc": "2026-07-10T18:04:59.877000+00:00"
+  },
+  "routes": [
+    12,
+    48,
+    192,
+    768,
+    2040
+  ],
+  "isolated_routes": [
+    1,
+    2,
+    4,
+    8,
+    12,
+    24,
+    48,
+    96,
+    192,
+    384,
+    768,
+    1536,
+    2040
+  ],
+  "contention_routes": [
+    12,
+    48,
+    192,
+    768,
+    2040
+  ],
+  "thread_buckets": [
+    1,
+    2,
+    4,
+    8,
+    16,
+    32
+  ],
+  "contention_shapes": [
+    [
+      32
+    ],
+    [
+      16,
+      16
+    ],
+    [
+      16,
+      8,
+      8
+    ],
+    [
+      16,
+      8,
+      4,
+      4
+    ],
+    [
+      16,
+      4,
+      4,
+      4,
+      4
+    ],
+    [
+      8,
+      8,
+      8,
+      8
+    ],
+    [
+      8,
+      8,
+      8,
+      4,
+      4
+    ],
+    [
+      8,
+      8,
+      4,
+      4,
+      4,
+      4
+    ],
+    [
+      8,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4
+    ],
+    [
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4
+    ],
+    [
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2
+    ],
+    [
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1
+    ]
+  ],
+  "isolated": [
+    {
+      "routes": 1,
+      "threads": 1,
+      "median_ns": 680059,
+      "p10_ns": 677716,
+      "p90_ns": 703465,
+      "min_ns": 676692,
+      "mean_ns": 685434,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 5440475,
+      "full_call_p10_ns": 5421726,
+      "full_call_p90_ns": 5627719,
+      "rank_median_ns": [
+        679091,
+        680059
+      ]
+    },
+    {
+      "routes": 1,
+      "threads": 2,
+      "median_ns": 417056,
+      "p10_ns": 415653,
+      "p90_ns": 420618,
+      "min_ns": 414353,
+      "mean_ns": 417905,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 3336452,
+      "full_call_p10_ns": 3325222,
+      "full_call_p90_ns": 3364947,
+      "rank_median_ns": [
+        415984,
+        416987
+      ]
+    },
+    {
+      "routes": 1,
+      "threads": 4,
+      "median_ns": 234576,
+      "p10_ns": 233199,
+      "p90_ns": 237420,
+      "min_ns": 232259,
+      "mean_ns": 235555,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 1876613,
+      "full_call_p10_ns": 1865593,
+      "full_call_p90_ns": 1899363,
+      "rank_median_ns": [
+        231480,
+        234576
+      ]
+    },
+    {
+      "routes": 1,
+      "threads": 8,
+      "median_ns": 161052,
+      "p10_ns": 159914,
+      "p90_ns": 164794,
+      "min_ns": 159673,
+      "mean_ns": 162167,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 1288415,
+      "full_call_p10_ns": 1279312,
+      "full_call_p90_ns": 1318350,
+      "rank_median_ns": [
+        160679,
+        160711
+      ]
+    },
+    {
+      "routes": 1,
+      "threads": 16,
+      "median_ns": 149972,
+      "p10_ns": 143962,
+      "p90_ns": 169575,
+      "min_ns": 141859,
+      "mean_ns": 154117,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 1199780,
+      "full_call_p10_ns": 1151697,
+      "full_call_p90_ns": 1356604,
+      "rank_median_ns": [
+        142994,
+        149972
+      ]
+    },
+    {
+      "routes": 1,
+      "threads": 32,
+      "median_ns": 148336,
+      "p10_ns": 145983,
+      "p90_ns": 158988,
+      "min_ns": 143462,
+      "mean_ns": 150782,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 1186690,
+      "full_call_p10_ns": 1167860,
+      "full_call_p90_ns": 1271906,
+      "rank_median_ns": [
+        146284,
+        148336
+      ]
+    },
+    {
+      "routes": 2,
+      "threads": 1,
+      "median_ns": 664181,
+      "p10_ns": 660966,
+      "p90_ns": 666712,
+      "min_ns": 658394,
+      "mean_ns": 665038,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 5313448,
+      "full_call_p10_ns": 5287730,
+      "full_call_p90_ns": 5333697,
+      "rank_median_ns": [
+        660448,
+        664038
+      ]
+    },
+    {
+      "routes": 2,
+      "threads": 2,
+      "median_ns": 416468,
+      "p10_ns": 414284,
+      "p90_ns": 417851,
+      "min_ns": 413468,
+      "mean_ns": 416685,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 3331744,
+      "full_call_p10_ns": 3314269,
+      "full_call_p90_ns": 3342802,
+      "rank_median_ns": [
+        412411,
+        416468
+      ]
+    },
+    {
+      "routes": 2,
+      "threads": 4,
+      "median_ns": 235322,
+      "p10_ns": 233080,
+      "p90_ns": 237652,
+      "min_ns": 232613,
+      "mean_ns": 235461,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 1882575,
+      "full_call_p10_ns": 1864643,
+      "full_call_p90_ns": 1901217,
+      "rank_median_ns": [
+        231940,
+        235322
+      ]
+    },
+    {
+      "routes": 2,
+      "threads": 8,
+      "median_ns": 163219,
+      "p10_ns": 161721,
+      "p90_ns": 166327,
+      "min_ns": 161078,
+      "mean_ns": 163986,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 1305753,
+      "full_call_p10_ns": 1293767,
+      "full_call_p90_ns": 1330619,
+      "rank_median_ns": [
+        161718,
+        163219
+      ]
+    },
+    {
+      "routes": 2,
+      "threads": 16,
+      "median_ns": 151656,
+      "p10_ns": 139718,
+      "p90_ns": 171721,
+      "min_ns": 137032,
+      "mean_ns": 156603,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 1213254,
+      "full_call_p10_ns": 1117745,
+      "full_call_p90_ns": 1373768,
+      "rank_median_ns": [
+        138602,
+        148084
+      ]
+    },
+    {
+      "routes": 2,
+      "threads": 32,
+      "median_ns": 148052,
+      "p10_ns": 144731,
+      "p90_ns": 156440,
+      "min_ns": 143578,
+      "mean_ns": 150045,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 1184420,
+      "full_call_p10_ns": 1157851,
+      "full_call_p90_ns": 1251520,
+      "rank_median_ns": [
+        145245,
+        148052
+      ]
+    },
+    {
+      "routes": 4,
+      "threads": 1,
+      "median_ns": 682072,
+      "p10_ns": 680517,
+      "p90_ns": 687678,
+      "min_ns": 679946,
+      "mean_ns": 683816,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 5456573,
+      "full_call_p10_ns": 5444142,
+      "full_call_p90_ns": 5501429,
+      "rank_median_ns": [
+        679168,
+        682072
+      ]
+    },
+    {
+      "routes": 4,
+      "threads": 2,
+      "median_ns": 419594,
+      "p10_ns": 418357,
+      "p90_ns": 422436,
+      "min_ns": 416075,
+      "mean_ns": 420345,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 3356751,
+      "full_call_p10_ns": 3346855,
+      "full_call_p90_ns": 3379485,
+      "rank_median_ns": [
+        419594,
+        418250
+      ]
+    },
+    {
+      "routes": 4,
+      "threads": 4,
+      "median_ns": 235112,
+      "p10_ns": 233438,
+      "p90_ns": 238256,
+      "min_ns": 233366,
+      "mean_ns": 235914,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 1880902,
+      "full_call_p10_ns": 1867502,
+      "full_call_p90_ns": 1906052,
+      "rank_median_ns": [
+        232785,
+        235112
+      ]
+    },
+    {
+      "routes": 4,
+      "threads": 8,
+      "median_ns": 163101,
+      "p10_ns": 161456,
+      "p90_ns": 167823,
+      "min_ns": 161248,
+      "mean_ns": 163991,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 1304809,
+      "full_call_p10_ns": 1291642,
+      "full_call_p90_ns": 1342585,
+      "rank_median_ns": [
+        161503,
+        163101
+      ]
+    },
+    {
+      "routes": 4,
+      "threads": 16,
+      "median_ns": 152881,
+      "p10_ns": 138899,
+      "p90_ns": 172797,
+      "min_ns": 135369,
+      "mean_ns": 154388,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 1223049,
+      "full_call_p10_ns": 1111195,
+      "full_call_p90_ns": 1382373,
+      "rank_median_ns": [
+        150831,
+        139537
+      ]
+    },
+    {
+      "routes": 4,
+      "threads": 32,
+      "median_ns": 147088,
+      "p10_ns": 143886,
+      "p90_ns": 154359,
+      "min_ns": 141457,
+      "mean_ns": 148441,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 1176706,
+      "full_call_p10_ns": 1151084,
+      "full_call_p90_ns": 1234869,
+      "rank_median_ns": [
+        144248,
+        147080
+      ]
+    },
+    {
+      "routes": 8,
+      "threads": 1,
+      "median_ns": 885622,
+      "p10_ns": 880803,
+      "p90_ns": 895082,
+      "min_ns": 877307,
+      "mean_ns": 887385,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 7084974,
+      "full_call_p10_ns": 7046427,
+      "full_call_p90_ns": 7160658,
+      "rank_median_ns": [
+        885622,
+        865951
+      ]
+    },
+    {
+      "routes": 8,
+      "threads": 2,
+      "median_ns": 479562,
+      "p10_ns": 477108,
+      "p90_ns": 485821,
+      "min_ns": 476188,
+      "mean_ns": 480438,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 3836500,
+      "full_call_p10_ns": 3816859,
+      "full_call_p90_ns": 3886564,
+      "rank_median_ns": [
+        479562,
+        470053
+      ]
+    },
+    {
+      "routes": 8,
+      "threads": 4,
+      "median_ns": 264550,
+      "p10_ns": 262526,
+      "p90_ns": 267002,
+      "min_ns": 260825,
+      "mean_ns": 265315,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 2116403,
+      "full_call_p10_ns": 2100211,
+      "full_call_p90_ns": 2136020,
+      "rank_median_ns": [
+        264550,
+        260767
+      ]
+    },
+    {
+      "routes": 8,
+      "threads": 8,
+      "median_ns": 169557,
+      "p10_ns": 168027,
+      "p90_ns": 172699,
+      "min_ns": 167511,
+      "mean_ns": 170403,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 1356458,
+      "full_call_p10_ns": 1344218,
+      "full_call_p90_ns": 1381596,
+      "rank_median_ns": [
+        169557,
+        167549
+      ]
+    },
+    {
+      "routes": 8,
+      "threads": 16,
+      "median_ns": 148712,
+      "p10_ns": 145517,
+      "p90_ns": 164717,
+      "min_ns": 143602,
+      "mean_ns": 151357,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 1189697,
+      "full_call_p10_ns": 1164139,
+      "full_call_p90_ns": 1317729,
+      "rank_median_ns": [
+        144888,
+        148229
+      ]
+    },
+    {
+      "routes": 8,
+      "threads": 32,
+      "median_ns": 148785,
+      "p10_ns": 145027,
+      "p90_ns": 160596,
+      "min_ns": 143534,
+      "mean_ns": 150528,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 1190287,
+      "full_call_p10_ns": 1160218,
+      "full_call_p90_ns": 1284764,
+      "rank_median_ns": [
+        146167,
+        148785
+      ]
+    },
+    {
+      "routes": 12,
+      "threads": 1,
+      "median_ns": 1126140,
+      "p10_ns": 1121427,
+      "p90_ns": 1130796,
+      "min_ns": 1119387,
+      "mean_ns": 1126448,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 9009126,
+      "full_call_p10_ns": 8971421,
+      "full_call_p90_ns": 9046362,
+      "rank_median_ns": [
+        1126140,
+        1088098
+      ]
+    },
+    {
+      "routes": 12,
+      "threads": 2,
+      "median_ns": 592926,
+      "p10_ns": 590213,
+      "p90_ns": 596183,
+      "min_ns": 589608,
+      "mean_ns": 593450,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 4743409,
+      "full_call_p10_ns": 4721700,
+      "full_call_p90_ns": 4769458,
+      "rank_median_ns": [
+        592926,
+        573501
+      ]
+    },
+    {
+      "routes": 12,
+      "threads": 4,
+      "median_ns": 323152,
+      "p10_ns": 321854,
+      "p90_ns": 326448,
+      "min_ns": 319456,
+      "mean_ns": 324101,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 2585213,
+      "full_call_p10_ns": 2574830,
+      "full_call_p90_ns": 2611591,
+      "rank_median_ns": [
+        323152,
+        313974
+      ]
+    },
+    {
+      "routes": 12,
+      "threads": 8,
+      "median_ns": 197017,
+      "p10_ns": 194204,
+      "p90_ns": 198678,
+      "min_ns": 193025,
+      "mean_ns": 197512,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 1576138,
+      "full_call_p10_ns": 1553629,
+      "full_call_p90_ns": 1589425,
+      "rank_median_ns": [
+        197017,
+        192929
+      ]
+    },
+    {
+      "routes": 12,
+      "threads": 16,
+      "median_ns": 147504,
+      "p10_ns": 141217,
+      "p90_ns": 168821,
+      "min_ns": 139396,
+      "mean_ns": 149998,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 1180034,
+      "full_call_p10_ns": 1129736,
+      "full_call_p90_ns": 1350567,
+      "rank_median_ns": [
+        146020,
+        139920
+      ]
+    },
+    {
+      "routes": 12,
+      "threads": 32,
+      "median_ns": 156782,
+      "p10_ns": 152251,
+      "p90_ns": 164044,
+      "min_ns": 151516,
+      "mean_ns": 159060,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 1254258,
+      "full_call_p10_ns": 1218008,
+      "full_call_p90_ns": 1312358,
+      "rank_median_ns": [
+        154196,
+        156782
+      ]
+    },
+    {
+      "routes": 24,
+      "threads": 1,
+      "median_ns": 2287490,
+      "p10_ns": 2268260,
+      "p90_ns": 2301505,
+      "min_ns": 2260915,
+      "mean_ns": 2286933,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 18299921,
+      "full_call_p10_ns": 18146080,
+      "full_call_p90_ns": 18412038,
+      "rank_median_ns": [
+        2287490,
+        2199532
+      ]
+    },
+    {
+      "routes": 24,
+      "threads": 2,
+      "median_ns": 1169508,
+      "p10_ns": 1165150,
+      "p90_ns": 1175214,
+      "min_ns": 1164189,
+      "mean_ns": 1169964,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 9356065,
+      "full_call_p10_ns": 9321198,
+      "full_call_p90_ns": 9401713,
+      "rank_median_ns": [
+        1169508,
+        1130884
+      ]
+    },
+    {
+      "routes": 24,
+      "threads": 4,
+      "median_ns": 637712,
+      "p10_ns": 635229,
+      "p90_ns": 641706,
+      "min_ns": 634136,
+      "mean_ns": 638421,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 5101696,
+      "full_call_p10_ns": 5081834,
+      "full_call_p90_ns": 5133643,
+      "rank_median_ns": [
+        637712,
+        628903
+      ]
+    },
+    {
+      "routes": 24,
+      "threads": 8,
+      "median_ns": 388951,
+      "p10_ns": 385797,
+      "p90_ns": 391917,
+      "min_ns": 385107,
+      "mean_ns": 389822,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 3111611,
+      "full_call_p10_ns": 3086380,
+      "full_call_p90_ns": 3135330,
+      "rank_median_ns": [
+        388585,
+        387788
+      ]
+    },
+    {
+      "routes": 24,
+      "threads": 16,
+      "median_ns": 280225,
+      "p10_ns": 276758,
+      "p90_ns": 286612,
+      "min_ns": 276460,
+      "mean_ns": 281547,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 2241799,
+      "full_call_p10_ns": 2214065,
+      "full_call_p90_ns": 2292893,
+      "rank_median_ns": [
+        279436,
+        276525
+      ]
+    },
+    {
+      "routes": 24,
+      "threads": 32,
+      "median_ns": 241761,
+      "p10_ns": 240091,
+      "p90_ns": 250969,
+      "min_ns": 239388,
+      "mean_ns": 244770,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 1934084,
+      "full_call_p10_ns": 1920734,
+      "full_call_p90_ns": 2007752,
+      "rank_median_ns": [
+        241433,
+        241203
+      ]
+    },
+    {
+      "routes": 48,
+      "threads": 1,
+      "median_ns": 4329982,
+      "p10_ns": 4312876,
+      "p90_ns": 4350241,
+      "min_ns": 4307480,
+      "mean_ns": 4332503,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 34639860,
+      "full_call_p10_ns": 34503005,
+      "full_call_p90_ns": 34801931,
+      "rank_median_ns": [
+        4329982,
+        4276366
+      ]
+    },
+    {
+      "routes": 48,
+      "threads": 2,
+      "median_ns": 2254131,
+      "p10_ns": 2230887,
+      "p90_ns": 2262497,
+      "min_ns": 2225609,
+      "mean_ns": 2247674,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 18033050,
+      "full_call_p10_ns": 17847094,
+      "full_call_p90_ns": 18099975,
+      "rank_median_ns": [
+        2254131,
+        2219741
+      ]
+    },
+    {
+      "routes": 48,
+      "threads": 4,
+      "median_ns": 1147892,
+      "p10_ns": 1145969,
+      "p90_ns": 1153975,
+      "min_ns": 1144781,
+      "mean_ns": 1149500,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 9183134,
+      "full_call_p10_ns": 9167755,
+      "full_call_p90_ns": 9231805,
+      "rank_median_ns": [
+        1147892,
+        1134888
+      ]
+    },
+    {
+      "routes": 48,
+      "threads": 8,
+      "median_ns": 658307,
+      "p10_ns": 655371,
+      "p90_ns": 662952,
+      "min_ns": 647330,
+      "mean_ns": 658985,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 5266458,
+      "full_call_p10_ns": 5242971,
+      "full_call_p90_ns": 5303614,
+      "rank_median_ns": [
+        651325,
+        658307
+      ]
+    },
+    {
+      "routes": 48,
+      "threads": 16,
+      "median_ns": 427018,
+      "p10_ns": 419332,
+      "p90_ns": 432689,
+      "min_ns": 417888,
+      "mean_ns": 426891,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 3416146,
+      "full_call_p10_ns": 3354660,
+      "full_call_p90_ns": 3461513,
+      "rank_median_ns": [
+        425004,
+        418935
+      ]
+    },
+    {
+      "routes": 48,
+      "threads": 32,
+      "median_ns": 318108,
+      "p10_ns": 316531,
+      "p90_ns": 324882,
+      "min_ns": 315551,
+      "mean_ns": 319950,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 2544862,
+      "full_call_p10_ns": 2532243,
+      "full_call_p90_ns": 2599057,
+      "rank_median_ns": [
+        309472,
+        318108
+      ]
+    },
+    {
+      "routes": 96,
+      "threads": 1,
+      "median_ns": 8227793,
+      "p10_ns": 8201881,
+      "p90_ns": 8277088,
+      "min_ns": 8188818,
+      "mean_ns": 8233075,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 65822346,
+      "full_call_p10_ns": 65615043,
+      "full_call_p90_ns": 66216698,
+      "rank_median_ns": [
+        8227793,
+        8155163
+      ]
+    },
+    {
+      "routes": 96,
+      "threads": 2,
+      "median_ns": 4215562,
+      "p10_ns": 4204630,
+      "p90_ns": 4242572,
+      "min_ns": 4197928,
+      "mean_ns": 4220207,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 33724503,
+      "full_call_p10_ns": 33637035,
+      "full_call_p90_ns": 33940578,
+      "rank_median_ns": [
+        4215562,
+        4186999
+      ]
+    },
+    {
+      "routes": 96,
+      "threads": 4,
+      "median_ns": 2188905,
+      "p10_ns": 2165911,
+      "p90_ns": 2215168,
+      "min_ns": 2159487,
+      "mean_ns": 2190141,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 17511240,
+      "full_call_p10_ns": 17327290,
+      "full_call_p90_ns": 17721342,
+      "rank_median_ns": [
+        2188905,
+        2175494
+      ]
+    },
+    {
+      "routes": 96,
+      "threads": 8,
+      "median_ns": 1153712,
+      "p10_ns": 1151428,
+      "p90_ns": 1160599,
+      "min_ns": 1149195,
+      "mean_ns": 1155487,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 9229698,
+      "full_call_p10_ns": 9211426,
+      "full_call_p90_ns": 9284795,
+      "rank_median_ns": [
+        1153712,
+        1148496
+      ]
+    },
+    {
+      "routes": 96,
+      "threads": 16,
+      "median_ns": 675208,
+      "p10_ns": 671879,
+      "p90_ns": 678354,
+      "min_ns": 671120,
+      "mean_ns": 676121,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 5401665,
+      "full_call_p10_ns": 5375034,
+      "full_call_p90_ns": 5426838,
+      "rank_median_ns": [
+        673875,
+        674151
+      ]
+    },
+    {
+      "routes": 96,
+      "threads": 32,
+      "median_ns": 453138,
+      "p10_ns": 448856,
+      "p90_ns": 458928,
+      "min_ns": 445604,
+      "mean_ns": 454400,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 3625105,
+      "full_call_p10_ns": 3590846,
+      "full_call_p90_ns": 3671421,
+      "rank_median_ns": [
+        452565,
+        453138
+      ]
+    },
+    {
+      "routes": 192,
+      "threads": 1,
+      "median_ns": 15992050,
+      "p10_ns": 15946467,
+      "p90_ns": 16011048,
+      "min_ns": 15905021,
+      "mean_ns": 15983736,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 127936404,
+      "full_call_p10_ns": 127571739,
+      "full_call_p90_ns": 128088384,
+      "rank_median_ns": [
+        15986717,
+        15903762
+      ]
+    },
+    {
+      "routes": 192,
+      "threads": 2,
+      "median_ns": 8136149,
+      "p10_ns": 8111030,
+      "p90_ns": 8185661,
+      "min_ns": 8109210,
+      "mean_ns": 8148282,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 65089193,
+      "full_call_p10_ns": 64888240,
+      "full_call_p90_ns": 65485289,
+      "rank_median_ns": [
+        8136149,
+        8121053
+      ]
+    },
+    {
+      "routes": 192,
+      "threads": 4,
+      "median_ns": 4163279,
+      "p10_ns": 4144264,
+      "p90_ns": 4223434,
+      "min_ns": 4136815,
+      "mean_ns": 4173931,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 33306236,
+      "full_call_p10_ns": 33154114,
+      "full_call_p90_ns": 33787467,
+      "rank_median_ns": [
+        4156640,
+        4142508
+      ]
+    },
+    {
+      "routes": 192,
+      "threads": 8,
+      "median_ns": 2200957,
+      "p10_ns": 2186973,
+      "p90_ns": 2372654,
+      "min_ns": 2177377,
+      "mean_ns": 2241158,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 17607654,
+      "full_call_p10_ns": 17495781,
+      "full_call_p90_ns": 18981232,
+      "rank_median_ns": [
+        2200957,
+        2175199
+      ]
+    },
+    {
+      "routes": 192,
+      "threads": 16,
+      "median_ns": 1208154,
+      "p10_ns": 1191882,
+      "p90_ns": 1401142,
+      "min_ns": 1183735,
+      "mean_ns": 1251750,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 9665234,
+      "full_call_p10_ns": 9535056,
+      "full_call_p90_ns": 11209139,
+      "rank_median_ns": [
+        1202025,
+        1197002
+      ]
+    },
+    {
+      "routes": 192,
+      "threads": 32,
+      "median_ns": 750529,
+      "p10_ns": 737018,
+      "p90_ns": 1294807,
+      "min_ns": 734472,
+      "mean_ns": 883266,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 6004231,
+      "full_call_p10_ns": 5896150,
+      "full_call_p90_ns": 10358458,
+      "rank_median_ns": [
+        747069,
+        747896
+      ]
+    },
+    {
+      "routes": 384,
+      "threads": 1,
+      "median_ns": 31406974,
+      "p10_ns": 31280527,
+      "p90_ns": 31523203,
+      "min_ns": 31262886,
+      "mean_ns": 31412152,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 251255789,
+      "full_call_p10_ns": 250244220,
+      "full_call_p90_ns": 252185621,
+      "rank_median_ns": [
+        31395190,
+        31131761
+      ]
+    },
+    {
+      "routes": 384,
+      "threads": 2,
+      "median_ns": 15950462,
+      "p10_ns": 15925952,
+      "p90_ns": 15992225,
+      "min_ns": 15920970,
+      "mean_ns": 15955240,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 127603694,
+      "full_call_p10_ns": 127407613,
+      "full_call_p90_ns": 127937800,
+      "rank_median_ns": [
+        15942699,
+        15934715
+      ]
+    },
+    {
+      "routes": 384,
+      "threads": 4,
+      "median_ns": 8220936,
+      "p10_ns": 8194477,
+      "p90_ns": 8252507,
+      "min_ns": 8192013,
+      "mean_ns": 8226581,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 65767489,
+      "full_call_p10_ns": 65555812,
+      "full_call_p90_ns": 66020056,
+      "rank_median_ns": [
+        8217209,
+        8190739
+      ]
+    },
+    {
+      "routes": 384,
+      "threads": 8,
+      "median_ns": 4225000,
+      "p10_ns": 4216422,
+      "p90_ns": 4233734,
+      "min_ns": 4212805,
+      "mean_ns": 4225843,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 33799999,
+      "full_call_p10_ns": 33731378,
+      "full_call_p90_ns": 33869870,
+      "rank_median_ns": [
+        4212469,
+        4225000
+      ]
+    },
+    {
+      "routes": 384,
+      "threads": 16,
+      "median_ns": 2226175,
+      "p10_ns": 2220072,
+      "p90_ns": 2235174,
+      "min_ns": 2217999,
+      "mean_ns": 2227368,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 17809403,
+      "full_call_p10_ns": 17760578,
+      "full_call_p90_ns": 17881392,
+      "rank_median_ns": [
+        2226175,
+        2199551
+      ]
+    },
+    {
+      "routes": 384,
+      "threads": 32,
+      "median_ns": 1301884,
+      "p10_ns": 1299127,
+      "p90_ns": 1307076,
+      "min_ns": 1298516,
+      "mean_ns": 1302871,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 10415070,
+      "full_call_p10_ns": 10393018,
+      "full_call_p90_ns": 10456608,
+      "rank_median_ns": [
+        1301587,
+        1298961
+      ]
+    },
+    {
+      "routes": 768,
+      "threads": 1,
+      "median_ns": 63201793,
+      "p10_ns": 62971293,
+      "p90_ns": 63476424,
+      "min_ns": 62932915,
+      "mean_ns": 63217413,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 505614344,
+      "full_call_p10_ns": 503770343,
+      "full_call_p90_ns": 507811393,
+      "rank_median_ns": [
+        63201793,
+        62218183
+      ]
+    },
+    {
+      "routes": 768,
+      "threads": 2,
+      "median_ns": 32132613,
+      "p10_ns": 32064348,
+      "p90_ns": 32203503,
+      "min_ns": 31982106,
+      "mean_ns": 32126739,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 257060907,
+      "full_call_p10_ns": 256514784,
+      "full_call_p90_ns": 257628025,
+      "rank_median_ns": [
+        32132613,
+        31908185
+      ]
+    },
+    {
+      "routes": 768,
+      "threads": 4,
+      "median_ns": 16455523,
+      "p10_ns": 16404216,
+      "p90_ns": 16495594,
+      "min_ns": 16369183,
+      "mean_ns": 16456419,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 131644187,
+      "full_call_p10_ns": 131233733,
+      "full_call_p90_ns": 131964753,
+      "rank_median_ns": [
+        16454092,
+        16407525
+      ]
+    },
+    {
+      "routes": 768,
+      "threads": 8,
+      "median_ns": 8272773,
+      "p10_ns": 8268813,
+      "p90_ns": 8292300,
+      "min_ns": 8264887,
+      "mean_ns": 8277274,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 66182186,
+      "full_call_p10_ns": 66150510,
+      "full_call_p90_ns": 66338405,
+      "rank_median_ns": [
+        8272642,
+        8269146
+      ]
+    },
+    {
+      "routes": 768,
+      "threads": 16,
+      "median_ns": 4282641,
+      "p10_ns": 4276390,
+      "p90_ns": 4289985,
+      "min_ns": 4271879,
+      "mean_ns": 4283192,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 34261131,
+      "full_call_p10_ns": 34211128,
+      "full_call_p90_ns": 34319880,
+      "rank_median_ns": [
+        4282641,
+        4249419
+      ]
+    },
+    {
+      "routes": 768,
+      "threads": 32,
+      "median_ns": 2419272,
+      "p10_ns": 2413673,
+      "p90_ns": 2430285,
+      "min_ns": 2411996,
+      "mean_ns": 2423682,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 19354176,
+      "full_call_p10_ns": 19309383,
+      "full_call_p90_ns": 19442279,
+      "rank_median_ns": [
+        2411545,
+        2419272
+      ]
+    },
+    {
+      "routes": 1536,
+      "threads": 1,
+      "median_ns": 124750089,
+      "p10_ns": 124575937,
+      "p90_ns": 125015545,
+      "min_ns": 124512246,
+      "mean_ns": 124803796,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 998000709,
+      "full_call_p10_ns": 996607499,
+      "full_call_p90_ns": 1000124360,
+      "rank_median_ns": [
+        124750089,
+        124126877
+      ]
+    },
+    {
+      "routes": 1536,
+      "threads": 2,
+      "median_ns": 63629969,
+      "p10_ns": 63558720,
+      "p90_ns": 63757205,
+      "min_ns": 63537227,
+      "mean_ns": 63647526,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 509039753,
+      "full_call_p10_ns": 508469759,
+      "full_call_p90_ns": 510057639,
+      "rank_median_ns": [
+        63629969,
+        63433520
+      ]
+    },
+    {
+      "routes": 1536,
+      "threads": 4,
+      "median_ns": 32378839,
+      "p10_ns": 32346350,
+      "p90_ns": 32403113,
+      "min_ns": 32340536,
+      "mean_ns": 32376002,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 259030716,
+      "full_call_p10_ns": 258770798,
+      "full_call_p90_ns": 259224900,
+      "rank_median_ns": [
+        32345407,
+        32378839
+      ]
+    },
+    {
+      "routes": 1536,
+      "threads": 8,
+      "median_ns": 16349523,
+      "p10_ns": 16331357,
+      "p90_ns": 16371704,
+      "min_ns": 16324631,
+      "mean_ns": 16351734,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 130796183,
+      "full_call_p10_ns": 130650858,
+      "full_call_p90_ns": 130973634,
+      "rank_median_ns": [
+        16314410,
+        16347638
+      ]
+    },
+    {
+      "routes": 1536,
+      "threads": 16,
+      "median_ns": 8451819,
+      "p10_ns": 8440480,
+      "p90_ns": 8459327,
+      "min_ns": 8430835,
+      "mean_ns": 8450496,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 67614558,
+      "full_call_p10_ns": 67523843,
+      "full_call_p90_ns": 67674615,
+      "rank_median_ns": [
+        8450315,
+        8440215
+      ]
+    },
+    {
+      "routes": 1536,
+      "threads": 32,
+      "median_ns": 4701551,
+      "p10_ns": 4695658,
+      "p90_ns": 4714899,
+      "min_ns": 4695314,
+      "mean_ns": 4704081,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 37612414,
+      "full_call_p10_ns": 37565263,
+      "full_call_p90_ns": 37719193,
+      "rank_median_ns": [
+        4701551,
+        4690675
+      ]
+    },
+    {
+      "routes": 2040,
+      "threads": 1,
+      "median_ns": 164102280,
+      "p10_ns": 163890180,
+      "p90_ns": 164342117,
+      "min_ns": 163798231,
+      "mean_ns": 164112953,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 1312818243,
+      "full_call_p10_ns": 1311121440,
+      "full_call_p90_ns": 1314736934,
+      "rank_median_ns": [
+        163888933,
+        164102280
+      ]
+    },
+    {
+      "routes": 2040,
+      "threads": 2,
+      "median_ns": 83887949,
+      "p10_ns": 83793399,
+      "p90_ns": 84072896,
+      "min_ns": 83744226,
+      "mean_ns": 83908465,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 671103592,
+      "full_call_p10_ns": 670347191,
+      "full_call_p90_ns": 672583168,
+      "rank_median_ns": [
+        83754519,
+        83878957
+      ]
+    },
+    {
+      "routes": 2040,
+      "threads": 4,
+      "median_ns": 42765327,
+      "p10_ns": 42732226,
+      "p90_ns": 42789643,
+      "min_ns": 42726071,
+      "mean_ns": 42772974,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 342122616,
+      "full_call_p10_ns": 341857806,
+      "full_call_p90_ns": 342317141,
+      "rank_median_ns": [
+        42693935,
+        42765327
+      ]
+    },
+    {
+      "routes": 2040,
+      "threads": 8,
+      "median_ns": 21724204,
+      "p10_ns": 21693673,
+      "p90_ns": 21748006,
+      "min_ns": 21675511,
+      "mean_ns": 21722966,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 173793632,
+      "full_call_p10_ns": 173549383,
+      "full_call_p90_ns": 173984047,
+      "rank_median_ns": [
+        21584214,
+        21724204
+      ]
+    },
+    {
+      "routes": 2040,
+      "threads": 16,
+      "median_ns": 11162260,
+      "p10_ns": 11152892,
+      "p90_ns": 11173436,
+      "min_ns": 11150292,
+      "mean_ns": 11163792,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 89298078,
+      "full_call_p10_ns": 89223136,
+      "full_call_p90_ns": 89387488,
+      "rank_median_ns": [
+        11153711,
+        11152440
+      ]
+    },
+    {
+      "routes": 2040,
+      "threads": 32,
+      "median_ns": 6295949,
+      "p10_ns": 6285959,
+      "p90_ns": 6313852,
+      "min_ns": 6281806,
+      "mean_ns": 6299042,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 50367591,
+      "full_call_p10_ns": 50287672,
+      "full_call_p90_ns": 50510813,
+      "rank_median_ns": [
+        6294540,
+        6289031
+      ]
+    }
+  ],
+  "entries": [
+    {
+      "shape": [
+        32
+      ],
+      "distinct_experts": 1,
+      "routes": 12,
+      "makespan_ns": 220976,
+      "full_call_median_ns": 14142478,
+      "measurement_experts": 64,
+      "measurement_groups": 64,
+      "measurement_tasks": 64,
+      "measurement_complete_groups": 64,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        64
+      ],
+      "iso_max_ns": 156782,
+      "iso_baseline_makespan_ns": 10034048,
+      "derate": 1.4094489083568267,
+      "p10_ns": 196977,
+      "p90_ns": 244538,
+      "num_iters": 20,
+      "rank_lane_task_counts": [
+        [
+          64
+        ],
+        [
+          64
+        ]
+      ],
+      "full_call_p10_ns": 12606490,
+      "full_call_p90_ns": 15650442,
+      "rank_median_ns": [
+        220572,
+        220976
+      ],
+      "min_ns": 196891,
+      "mean_ns": 221069
+    },
+    {
+      "shape": [
+        32
+      ],
+      "distinct_experts": 1,
+      "routes": 48,
+      "makespan_ns": 325475,
+      "full_call_median_ns": 20830405,
+      "measurement_experts": 64,
+      "measurement_groups": 64,
+      "measurement_tasks": 64,
+      "measurement_complete_groups": 64,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        64
+      ],
+      "iso_max_ns": 318108,
+      "iso_baseline_makespan_ns": 20358912,
+      "derate": 1.0231590470060483,
+      "p10_ns": 324487,
+      "p90_ns": 326599,
+      "num_iters": 20,
+      "rank_lane_task_counts": [
+        [
+          64
+        ],
+        [
+          64
+        ]
+      ],
+      "full_call_p10_ns": 20767198,
+      "full_call_p90_ns": 20902347,
+      "rank_median_ns": [
+        325475,
+        324229
+      ],
+      "min_ns": 324209,
+      "mean_ns": 325559
+    },
+    {
+      "shape": [
+        32
+      ],
+      "distinct_experts": 1,
+      "routes": 192,
+      "makespan_ns": 729830,
+      "full_call_median_ns": 46709136,
+      "measurement_experts": 64,
+      "measurement_groups": 64,
+      "measurement_tasks": 64,
+      "measurement_complete_groups": 64,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        64
+      ],
+      "iso_max_ns": 750529,
+      "iso_baseline_makespan_ns": 48033856,
+      "derate": 0.9724211189707527,
+      "p10_ns": 728962,
+      "p90_ns": 730699,
+      "num_iters": 20,
+      "rank_lane_task_counts": [
+        [
+          64
+        ],
+        [
+          64
+        ]
+      ],
+      "full_call_p10_ns": 46653560,
+      "full_call_p90_ns": 46764733,
+      "rank_median_ns": [
+        729720,
+        728965
+      ],
+      "min_ns": 728345,
+      "mean_ns": 729776
+    },
+    {
+      "shape": [
+        32
+      ],
+      "distinct_experts": 1,
+      "routes": 768,
+      "makespan_ns": 2407846,
+      "full_call_median_ns": 154102190,
+      "measurement_experts": 64,
+      "measurement_groups": 64,
+      "measurement_tasks": 64,
+      "measurement_complete_groups": 64,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        64
+      ],
+      "iso_max_ns": 2419272,
+      "iso_baseline_makespan_ns": 154833408,
+      "derate": 0.9952773887144563,
+      "p10_ns": 2406562,
+      "p90_ns": 2408907,
+      "num_iters": 20,
+      "rank_lane_task_counts": [
+        [
+          64
+        ],
+        [
+          64
+        ]
+      ],
+      "full_call_p10_ns": 154020018,
+      "full_call_p90_ns": 154170039,
+      "rank_median_ns": [
+        2407846,
+        2400539
+      ],
+      "min_ns": 2404769,
+      "mean_ns": 2407779
+    },
+    {
+      "shape": [
+        32
+      ],
+      "distinct_experts": 1,
+      "routes": 2040,
+      "makespan_ns": 6273161,
+      "full_call_median_ns": 401482341,
+      "measurement_experts": 64,
+      "measurement_groups": 64,
+      "measurement_tasks": 64,
+      "measurement_complete_groups": 64,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        64
+      ],
+      "iso_max_ns": 6295949,
+      "iso_baseline_makespan_ns": 402940736,
+      "derate": 0.9963806215909627,
+      "p10_ns": 6267756,
+      "p90_ns": 6278912,
+      "num_iters": 20,
+      "rank_lane_task_counts": [
+        [
+          64
+        ],
+        [
+          64
+        ]
+      ],
+      "full_call_p10_ns": 401136380,
+      "full_call_p90_ns": 401850389,
+      "rank_median_ns": [
+        6267132,
+        6270580
+      ],
+      "min_ns": 6264079,
+      "mean_ns": 6273569
+    },
+    {
+      "shape": [
+        16,
+        16
+      ],
+      "distinct_experts": 2,
+      "routes": 12,
+      "makespan_ns": 359794,
+      "full_call_median_ns": 11513415,
+      "measurement_experts": 64,
+      "measurement_groups": 32,
+      "measurement_tasks": 64,
+      "measurement_complete_groups": 32,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        32,
+        32
+      ],
+      "iso_max_ns": 147504,
+      "iso_baseline_makespan_ns": 4720128,
+      "derate": 2.4392166907338106,
+      "p10_ns": 347387,
+      "p90_ns": 380305,
+      "num_iters": 20,
+      "rank_lane_task_counts": [
+        [
+          32,
+          32
+        ],
+        [
+          32,
+          32
+        ]
+      ],
+      "full_call_p10_ns": 11116370,
+      "full_call_p90_ns": 12169768,
+      "rank_median_ns": [
+        351820,
+        349415
+      ],
+      "min_ns": 342532,
+      "mean_ns": 362636
+    },
+    {
+      "shape": [
+        16,
+        16
+      ],
+      "distinct_experts": 2,
+      "routes": 48,
+      "makespan_ns": 624712,
+      "full_call_median_ns": 19990795,
+      "measurement_experts": 64,
+      "measurement_groups": 32,
+      "measurement_tasks": 64,
+      "measurement_complete_groups": 32,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        32,
+        32
+      ],
+      "iso_max_ns": 427018,
+      "iso_baseline_makespan_ns": 13664576,
+      "derate": 1.4629648955079178,
+      "p10_ns": 618444,
+      "p90_ns": 631650,
+      "num_iters": 20,
+      "rank_lane_task_counts": [
+        [
+          32,
+          32
+        ],
+        [
+          32,
+          32
+        ]
+      ],
+      "full_call_p10_ns": 19790224,
+      "full_call_p90_ns": 20212790,
+      "rank_median_ns": [
+        618334,
+        623321
+      ],
+      "min_ns": 609700,
+      "mean_ns": 624179
+    },
+    {
+      "shape": [
+        16,
+        16
+      ],
+      "distinct_experts": 2,
+      "routes": 192,
+      "makespan_ns": 1457504,
+      "full_call_median_ns": 46640128,
+      "measurement_experts": 64,
+      "measurement_groups": 32,
+      "measurement_tasks": 64,
+      "measurement_complete_groups": 32,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        32,
+        32
+      ],
+      "iso_max_ns": 1208154,
+      "iso_baseline_makespan_ns": 38660928,
+      "derate": 1.206389251701356,
+      "p10_ns": 1450692,
+      "p90_ns": 1461576,
+      "num_iters": 20,
+      "rank_lane_task_counts": [
+        [
+          32,
+          32
+        ],
+        [
+          32,
+          32
+        ]
+      ],
+      "full_call_p10_ns": 46422146,
+      "full_call_p90_ns": 46770427,
+      "rank_median_ns": [
+        1457504,
+        1436615
+      ],
+      "min_ns": 1443456,
+      "mean_ns": 1456862
+    },
+    {
+      "shape": [
+        16,
+        16
+      ],
+      "distinct_experts": 2,
+      "routes": 768,
+      "makespan_ns": 4917256,
+      "full_call_median_ns": 157352208,
+      "measurement_experts": 64,
+      "measurement_groups": 32,
+      "measurement_tasks": 64,
+      "measurement_complete_groups": 32,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        32,
+        32
+      ],
+      "iso_max_ns": 4282641,
+      "iso_baseline_makespan_ns": 137044512,
+      "derate": 1.1481832121814552,
+      "p10_ns": 4902960,
+      "p90_ns": 4925236,
+      "num_iters": 20,
+      "rank_lane_task_counts": [
+        [
+          32,
+          32
+        ],
+        [
+          32,
+          32
+        ]
+      ],
+      "full_call_p10_ns": 156894718,
+      "full_call_p90_ns": 157607556,
+      "rank_median_ns": [
+        4917256,
+        4878789
+      ],
+      "min_ns": 4893293,
+      "mean_ns": 4916330
+    },
+    {
+      "shape": [
+        16,
+        16
+      ],
+      "distinct_experts": 2,
+      "routes": 2040,
+      "makespan_ns": 12658823,
+      "full_call_median_ns": 405082353,
+      "measurement_experts": 64,
+      "measurement_groups": 32,
+      "measurement_tasks": 64,
+      "measurement_complete_groups": 32,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        32,
+        32
+      ],
+      "iso_max_ns": 11162260,
+      "iso_baseline_makespan_ns": 357192320,
+      "derate": 1.1340735237532542,
+      "p10_ns": 12587050,
+      "p90_ns": 12687347,
+      "num_iters": 20,
+      "rank_lane_task_counts": [
+        [
+          32,
+          32
+        ],
+        [
+          32,
+          32
+        ]
+      ],
+      "full_call_p10_ns": 402785614,
+      "full_call_p90_ns": 405995087,
+      "rank_median_ns": [
+        12658823,
+        12583063
+      ],
+      "min_ns": 12550646,
+      "mean_ns": 12652413
+    },
+    {
+      "shape": [
+        16,
+        8,
+        8
+      ],
+      "distinct_experts": 3,
+      "routes": 12,
+      "makespan_ns": 398677,
+      "full_call_median_ns": 10365621,
+      "measurement_experts": 64,
+      "measurement_groups": 26,
+      "measurement_tasks": 64,
+      "measurement_complete_groups": 21,
+      "measurement_partial_lanes": 1,
+      "lane_task_counts": [
+        26,
+        19,
+        19
+      ],
+      "iso_max_ns": 197017,
+      "iso_baseline_makespan_ns": 3835104,
+      "derate": 2.7028265726301033,
+      "p10_ns": 392026,
+      "p90_ns": 420565,
+      "num_iters": 20,
+      "rank_lane_task_counts": [
+        [
+          26,
+          19,
+          19
+        ],
+        [
+          26,
+          19,
+          19
+        ]
+      ],
+      "full_call_p10_ns": 10192667,
+      "full_call_p90_ns": 10934693,
+      "rank_median_ns": [
+        396558,
+        395157
+      ],
+      "min_ns": 390108,
+      "mean_ns": 403802
+    },
+    {
+      "shape": [
+        16,
+        8,
+        8
+      ],
+      "distinct_experts": 3,
+      "routes": 48,
+      "makespan_ns": 735222,
+      "full_call_median_ns": 20586220,
+      "measurement_experts": 64,
+      "measurement_groups": 28,
+      "measurement_tasks": 64,
+      "measurement_complete_groups": 21,
+      "measurement_partial_lanes": 1,
+      "lane_task_counts": [
+        28,
+        18,
+        18
+      ],
+      "iso_max_ns": 658307,
+      "iso_baseline_makespan_ns": 11956504,
+      "derate": 1.7217591362826459,
+      "p10_ns": 723351,
+      "p90_ns": 751395,
+      "num_iters": 20,
+      "rank_lane_task_counts": [
+        [
+          28,
+          18,
+          18
+        ],
+        [
+          28,
+          18,
+          18
+        ]
+      ],
+      "full_call_p10_ns": 20253826,
+      "full_call_p90_ns": 21039068,
+      "rank_median_ns": [
+        727136,
+        727710
+      ],
+      "min_ns": 712727,
+      "mean_ns": 735647
+    },
+    {
+      "shape": [
+        16,
+        8,
+        8
+      ],
+      "distinct_experts": 3,
+      "routes": 192,
+      "makespan_ns": 1592244,
+      "full_call_median_ns": 47767316,
+      "measurement_experts": 64,
+      "measurement_groups": 30,
+      "measurement_tasks": 64,
+      "measurement_complete_groups": 21,
+      "measurement_partial_lanes": 1,
+      "lane_task_counts": [
+        30,
+        17,
+        17
+      ],
+      "iso_max_ns": 2200957,
+      "iso_baseline_makespan_ns": 37416269,
+      "derate": 1.2766456217213962,
+      "p10_ns": 1579824,
+      "p90_ns": 1612439,
+      "num_iters": 20,
+      "rank_lane_task_counts": [
+        [
+          31,
+          17,
+          16
+        ],
+        [
+          30,
+          17,
+          17
+        ]
+      ],
+      "full_call_p10_ns": 47394744,
+      "full_call_p90_ns": 48373176,
+      "rank_median_ns": [
+        1512909,
+        1592244
+      ],
+      "min_ns": 1568086,
+      "mean_ns": 1594780
+    },
+    {
+      "shape": [
+        16,
+        8,
+        8
+      ],
+      "distinct_experts": 3,
+      "routes": 768,
+      "makespan_ns": 4965311,
+      "full_call_median_ns": 158889967,
+      "measurement_experts": 64,
+      "measurement_groups": 32,
+      "measurement_tasks": 64,
+      "measurement_complete_groups": 21,
+      "measurement_partial_lanes": 1,
+      "lane_task_counts": [
+        32,
+        16,
+        16
+      ],
+      "iso_max_ns": 8272773,
+      "iso_baseline_makespan_ns": 137044512,
+      "derate": 1.1594040847108127,
+      "p10_ns": 4952720,
+      "p90_ns": 4980725,
+      "num_iters": 20,
+      "rank_lane_task_counts": [
+        [
+          32,
+          16,
+          16
+        ],
+        [
+          32,
+          16,
+          16
+        ]
+      ],
+      "full_call_p10_ns": 158487013,
+      "full_call_p90_ns": 159383196,
+      "rank_median_ns": [
+        4944855,
+        4959559
+      ],
+      "min_ns": 4945951,
+      "mean_ns": 4967316
+    },
+    {
+      "shape": [
+        16,
+        8,
+        8
+      ],
+      "distinct_experts": 3,
+      "routes": 2040,
+      "makespan_ns": 12657616,
+      "full_call_median_ns": 405043731,
+      "measurement_experts": 64,
+      "measurement_groups": 32,
+      "measurement_tasks": 64,
+      "measurement_complete_groups": 21,
+      "measurement_partial_lanes": 1,
+      "lane_task_counts": [
+        32,
+        16,
+        16
+      ],
+      "iso_max_ns": 21724204,
+      "iso_baseline_makespan_ns": 357192320,
+      "derate": 1.1339653971283594,
+      "p10_ns": 12628548,
+      "p90_ns": 12680259,
+      "num_iters": 20,
+      "rank_lane_task_counts": [
+        [
+          32,
+          16,
+          16
+        ],
+        [
+          32,
+          16,
+          16
+        ]
+      ],
+      "full_call_p10_ns": 404113546,
+      "full_call_p90_ns": 405768291,
+      "rank_median_ns": [
+        12633525,
+        12633408
+      ],
+      "min_ns": 12584665,
+      "mean_ns": 12654683
+    },
+    {
+      "shape": [
+        16,
+        8,
+        4,
+        4
+      ],
+      "distinct_experts": 4,
+      "routes": 12,
+      "makespan_ns": 419218,
+      "full_call_median_ns": 10061235,
+      "measurement_experts": 64,
+      "measurement_groups": 24,
+      "measurement_tasks": 64,
+      "measurement_complete_groups": 16,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        24,
+        18,
+        11,
+        11
+      ],
+      "iso_max_ns": 323152,
+      "iso_baseline_makespan_ns": 3554672,
+      "derate": 2.8304257045375776,
+      "p10_ns": 410360,
+      "p90_ns": 433093,
+      "num_iters": 20,
+      "rank_lane_task_counts": [
+        [
+          24,
+          18,
+          11,
+          11
+        ],
+        [
+          24,
+          18,
+          11,
+          11
+        ]
+      ],
+      "full_call_p10_ns": 9848638,
+      "full_call_p90_ns": 10394228,
+      "rank_median_ns": [
+        412116,
+        414378
+      ],
+      "min_ns": 408604,
+      "mean_ns": 421187
+    },
+    {
+      "shape": [
+        16,
+        8,
+        4,
+        4
+      ],
+      "distinct_experts": 4,
+      "routes": 48,
+      "makespan_ns": 870681,
+      "full_call_median_ns": 23508389,
+      "measurement_experts": 64,
+      "measurement_groups": 27,
+      "measurement_tasks": 64,
+      "measurement_complete_groups": 16,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        27,
+        17,
+        10,
+        10
+      ],
+      "iso_max_ns": 1147892,
+      "iso_baseline_makespan_ns": 11529486,
+      "derate": 2.0389797949362185,
+      "p10_ns": 861227,
+      "p90_ns": 891257,
+      "num_iters": 20,
+      "rank_lane_task_counts": [
+        [
+          27,
+          17,
+          10,
+          10
+        ],
+        [
+          27,
+          17,
+          10,
+          10
+        ]
+      ],
+      "full_call_p10_ns": 23253113,
+      "full_call_p90_ns": 24063957,
+      "rank_median_ns": [
+        863784,
+        861726
+      ],
+      "min_ns": 851607,
+      "mean_ns": 873243
+    },
+    {
+      "shape": [
+        16,
+        8,
+        4,
+        4
+      ],
+      "distinct_experts": 4,
+      "routes": 192,
+      "makespan_ns": 1710190,
+      "full_call_median_ns": 53015889,
+      "measurement_experts": 64,
+      "measurement_groups": 31,
+      "measurement_tasks": 64,
+      "measurement_complete_groups": 16,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        31,
+        17,
+        8,
+        8
+      ],
+      "iso_max_ns": 4163279,
+      "iso_baseline_makespan_ns": 37452774,
+      "derate": 1.4155397140943418,
+      "p10_ns": 1696604,
+      "p90_ns": 1737729,
+      "num_iters": 20,
+      "rank_lane_task_counts": [
+        [
+          31,
+          16,
+          9,
+          8
+        ],
+        [
+          31,
+          17,
+          8,
+          8
+        ]
+      ],
+      "full_call_p10_ns": 52594704,
+      "full_call_p90_ns": 53869617,
+      "rank_median_ns": [
+        1710190,
+        1575219
+      ],
+      "min_ns": 1684223,
+      "mean_ns": 1714136
+    },
+    {
+      "shape": [
+        16,
+        8,
+        4,
+        4
+      ],
+      "distinct_experts": 4,
+      "routes": 768,
+      "makespan_ns": 5274466,
+      "full_call_median_ns": 168782917,
+      "measurement_experts": 64,
+      "measurement_groups": 32,
+      "measurement_tasks": 64,
+      "measurement_complete_groups": 16,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        32,
+        16,
+        8,
+        8
+      ],
+      "iso_max_ns": 16455523,
+      "iso_baseline_makespan_ns": 137044512,
+      "derate": 1.2315919443749779,
+      "p10_ns": 5256722,
+      "p90_ns": 5290454,
+      "num_iters": 20,
+      "rank_lane_task_counts": [
+        [
+          32,
+          16,
+          8,
+          8
+        ],
+        [
+          32,
+          16,
+          8,
+          8
+        ]
+      ],
+      "full_call_p10_ns": 168215088,
+      "full_call_p90_ns": 169294514,
+      "rank_median_ns": [
+        5274466,
+        5245978
+      ],
+      "min_ns": 5248097,
+      "mean_ns": 5273866
+    },
+    {
+      "shape": [
+        16,
+        8,
+        4,
+        4
+      ],
+      "distinct_experts": 4,
+      "routes": 2040,
+      "makespan_ns": 13601404,
+      "full_call_median_ns": 435244926,
+      "measurement_experts": 64,
+      "measurement_groups": 32,
+      "measurement_tasks": 64,
+      "measurement_complete_groups": 16,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        32,
+        16,
+        8,
+        8
+      ],
+      "iso_max_ns": 42765327,
+      "iso_baseline_makespan_ns": 357192320,
+      "derate": 1.2185170330649886,
+      "p10_ns": 13579043,
+      "p90_ns": 13631528,
+      "num_iters": 20,
+      "rank_lane_task_counts": [
+        [
+          32,
+          16,
+          8,
+          8
+        ],
+        [
+          32,
+          16,
+          8,
+          8
+        ]
+      ],
+      "full_call_p10_ns": 434529361,
+      "full_call_p90_ns": 436208893,
+      "rank_median_ns": [
+        13591514,
+        13583401
+      ],
+      "min_ns": 13566556,
+      "mean_ns": 13605701
+    },
+    {
+      "shape": [
+        16,
+        4,
+        4,
+        4,
+        4
+      ],
+      "distinct_experts": 5,
+      "routes": 12,
+      "makespan_ns": 414368,
+      "full_call_median_ns": 9944821,
+      "measurement_experts": 64,
+      "measurement_groups": 24,
+      "measurement_tasks": 64,
+      "measurement_complete_groups": 12,
+      "measurement_partial_lanes": 4,
+      "lane_task_counts": [
+        24,
+        10,
+        10,
+        10,
+        10
+      ],
+      "iso_max_ns": 323152,
+      "iso_baseline_makespan_ns": 3540096,
+      "derate": 2.809195287359439,
+      "p10_ns": 406900,
+      "p90_ns": 429395,
+      "num_iters": 20,
+      "rank_lane_task_counts": [
+        [
+          24,
+          10,
+          10,
+          10,
+          10
+        ],
+        [
+          24,
+          10,
+          10,
+          10,
+          10
+        ]
+      ],
+      "full_call_p10_ns": 9765584,
+      "full_call_p90_ns": 10305492,
+      "rank_median_ns": [
+        412365,
+        407242
+      ],
+      "min_ns": 400222,
+      "mean_ns": 415759
+    },
+    {
+      "shape": [
+        16,
+        4,
+        4,
+        4,
+        4
+      ],
+      "distinct_experts": 5,
+      "routes": 48,
+      "makespan_ns": 996296,
+      "full_call_median_ns": 25903704,
+      "measurement_experts": 64,
+      "measurement_groups": 26,
+      "measurement_tasks": 64,
+      "measurement_complete_groups": 12,
+      "measurement_partial_lanes": 4,
+      "lane_task_counts": [
+        26,
+        10,
+        10,
+        9,
+        9
+      ],
+      "iso_max_ns": 1147892,
+      "iso_baseline_makespan_ns": 11478920,
+      "derate": 2.256632505497033,
+      "p10_ns": 985871,
+      "p90_ns": 1024156,
+      "num_iters": 20,
+      "rank_lane_task_counts": [
+        [
+          27,
+          10,
+          9,
+          9,
+          9
+        ],
+        [
+          27,
+          10,
+          9,
+          9,
+          9
+        ]
+      ],
+      "full_call_p10_ns": 25632636,
+      "full_call_p90_ns": 26628071,
+      "rank_median_ns": [
+        953050,
+        949218
+      ],
+      "min_ns": 975616,
+      "mean_ns": 1000235
+    },
+    {
+      "shape": [
+        16,
+        4,
+        4,
+        4,
+        4
+      ],
+      "distinct_experts": 5,
+      "routes": 192,
+      "makespan_ns": 1920708,
+      "full_call_median_ns": 59541948,
+      "measurement_experts": 64,
+      "measurement_groups": 31,
+      "measurement_tasks": 64,
+      "measurement_complete_groups": 12,
+      "measurement_partial_lanes": 4,
+      "lane_task_counts": [
+        31,
+        9,
+        8,
+        8,
+        8
+      ],
+      "iso_max_ns": 4163279,
+      "iso_baseline_makespan_ns": 37469511,
+      "derate": 1.589077263378217,
+      "p10_ns": 1885902,
+      "p90_ns": 1945390,
+      "num_iters": 20,
+      "rank_lane_task_counts": [
+        [
+          31,
+          9,
+          8,
+          8,
+          8
+        ],
+        [
+          31,
+          9,
+          8,
+          8,
+          8
+        ]
+      ],
+      "full_call_p10_ns": 58462966,
+      "full_call_p90_ns": 60307099,
+      "rank_median_ns": [
+        1907837,
+        1882701
+      ],
+      "min_ns": 1819416,
+      "mean_ns": 1914308
+    },
+    {
+      "shape": [
+        16,
+        4,
+        4,
+        4,
+        4
+      ],
+      "distinct_experts": 5,
+      "routes": 768,
+      "makespan_ns": 5783963,
+      "full_call_median_ns": 185086838,
+      "measurement_experts": 64,
+      "measurement_groups": 32,
+      "measurement_tasks": 64,
+      "measurement_complete_groups": 12,
+      "measurement_partial_lanes": 4,
+      "lane_task_counts": [
+        32,
+        8,
+        8,
+        8,
+        8
+      ],
+      "iso_max_ns": 16455523,
+      "iso_baseline_makespan_ns": 137044512,
+      "derate": 1.3505600136691354,
+      "p10_ns": 5752339,
+      "p90_ns": 5807317,
+      "num_iters": 20,
+      "rank_lane_task_counts": [
+        [
+          32,
+          8,
+          8,
+          8,
+          8
+        ],
+        [
+          32,
+          8,
+          8,
+          8,
+          8
+        ]
+      ],
+      "full_call_p10_ns": 184074855,
+      "full_call_p90_ns": 185834128,
+      "rank_median_ns": [
+        5783963,
+        5724871
+      ],
+      "min_ns": 5732429,
+      "mean_ns": 5783505
+    },
+    {
+      "shape": [
+        16,
+        4,
+        4,
+        4,
+        4
+      ],
+      "distinct_experts": 5,
+      "routes": 2040,
+      "makespan_ns": 14594409,
+      "full_call_median_ns": 467021088,
+      "measurement_experts": 64,
+      "measurement_groups": 32,
+      "measurement_tasks": 64,
+      "measurement_complete_groups": 12,
+      "measurement_partial_lanes": 4,
+      "lane_task_counts": [
+        32,
+        8,
+        8,
+        8,
+        8
+      ],
+      "iso_max_ns": 42765327,
+      "iso_baseline_makespan_ns": 357192320,
+      "derate": 1.3074779659316302,
+      "p10_ns": 14557180,
+      "p90_ns": 14640606,
+      "num_iters": 20,
+      "rank_lane_task_counts": [
+        [
+          32,
+          8,
+          8,
+          8,
+          8
+        ],
+        [
+          32,
+          8,
+          8,
+          8,
+          8
+        ]
+      ],
+      "full_call_p10_ns": 465829761,
+      "full_call_p90_ns": 468499391,
+      "rank_median_ns": [
+        14583293,
+        14564616
+      ],
+      "min_ns": 14548240,
+      "mean_ns": 14599743
+    },
+    {
+      "shape": [
+        8,
+        8,
+        8,
+        8
+      ],
+      "distinct_experts": 4,
+      "routes": 12,
+      "makespan_ns": 629615,
+      "full_call_median_ns": 10073839,
+      "measurement_experts": 64,
+      "measurement_groups": 16,
+      "measurement_tasks": 64,
+      "measurement_complete_groups": 16,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        16,
+        16,
+        16,
+        16
+      ],
+      "iso_max_ns": 197017,
+      "iso_baseline_makespan_ns": 3152272,
+      "derate": 3.1957391367242423,
+      "p10_ns": 621410,
+      "p90_ns": 654228,
+      "num_iters": 20,
+      "rank_lane_task_counts": [
+        [
+          16,
+          16,
+          16,
+          16
+        ],
+        [
+          16,
+          16,
+          16,
+          16
+        ]
+      ],
+      "full_call_p10_ns": 9942553,
+      "full_call_p90_ns": 10467649,
+      "rank_median_ns": [
+        620873,
+        629615
+      ],
+      "min_ns": 610991,
+      "mean_ns": 634941
+    },
+    {
+      "shape": [
+        8,
+        8,
+        8,
+        8
+      ],
+      "distinct_experts": 4,
+      "routes": 48,
+      "makespan_ns": 1370469,
+      "full_call_median_ns": 21927517,
+      "measurement_experts": 64,
+      "measurement_groups": 16,
+      "measurement_tasks": 64,
+      "measurement_complete_groups": 16,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        16,
+        16,
+        16,
+        16
+      ],
+      "iso_max_ns": 658307,
+      "iso_baseline_makespan_ns": 10532912,
+      "derate": 2.0818095698511483,
+      "p10_ns": 1348449,
+      "p90_ns": 1402333,
+      "num_iters": 20,
+      "rank_lane_task_counts": [
+        [
+          16,
+          16,
+          16,
+          16
+        ],
+        [
+          16,
+          16,
+          16,
+          16
+        ]
+      ],
+      "full_call_p10_ns": 21575184,
+      "full_call_p90_ns": 22437323,
+      "rank_median_ns": [
+        1343176,
+        1370469
+      ],
+      "min_ns": 1336131,
+      "mean_ns": 1372695
+    },
+    {
+      "shape": [
+        8,
+        8,
+        8,
+        8
+      ],
+      "distinct_experts": 4,
+      "routes": 192,
+      "makespan_ns": 3219578,
+      "full_call_median_ns": 51513259,
+      "measurement_experts": 64,
+      "measurement_groups": 16,
+      "measurement_tasks": 64,
+      "measurement_complete_groups": 16,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        16,
+        16,
+        16,
+        16
+      ],
+      "iso_max_ns": 2200957,
+      "iso_baseline_makespan_ns": 35215312,
+      "derate": 1.4628085362412806,
+      "p10_ns": 3129823,
+      "p90_ns": 3308885,
+      "num_iters": 20,
+      "rank_lane_task_counts": [
+        [
+          16,
+          16,
+          16,
+          16
+        ],
+        [
+          16,
+          16,
+          16,
+          16
+        ]
+      ],
+      "full_call_p10_ns": 50077179,
+      "full_call_p90_ns": 52942159,
+      "rank_median_ns": [
+        3211658,
+        3142940
+      ],
+      "min_ns": 3079897,
+      "mean_ns": 3216348
+    },
+    {
+      "shape": [
+        8,
+        8,
+        8,
+        8
+      ],
+      "distinct_experts": 4,
+      "routes": 768,
+      "makespan_ns": 11154107,
+      "full_call_median_ns": 178465707,
+      "measurement_experts": 64,
+      "measurement_groups": 16,
+      "measurement_tasks": 64,
+      "measurement_complete_groups": 16,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        16,
+        16,
+        16,
+        16
+      ],
+      "iso_max_ns": 8272773,
+      "iso_baseline_makespan_ns": 132364368,
+      "derate": 1.3482911579345886,
+      "p10_ns": 11119467,
+      "p90_ns": 11204997,
+      "num_iters": 20,
+      "rank_lane_task_counts": [
+        [
+          16,
+          16,
+          16,
+          16
+        ],
+        [
+          16,
+          16,
+          16,
+          16
+        ]
+      ],
+      "full_call_p10_ns": 177911475,
+      "full_call_p90_ns": 179279956,
+      "rank_median_ns": [
+        11138367,
+        11147053
+      ],
+      "min_ns": 11057822,
+      "mean_ns": 11156230
+    },
+    {
+      "shape": [
+        8,
+        8,
+        8,
+        8
+      ],
+      "distinct_experts": 4,
+      "routes": 2040,
+      "makespan_ns": 27414024,
+      "full_call_median_ns": 438624390,
+      "measurement_experts": 64,
+      "measurement_groups": 16,
+      "measurement_tasks": 64,
+      "measurement_complete_groups": 16,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        16,
+        16,
+        16,
+        16
+      ],
+      "iso_max_ns": 21724204,
+      "iso_baseline_makespan_ns": 347587264,
+      "derate": 1.2619115699244954,
+      "p10_ns": 27349263,
+      "p90_ns": 27474957,
+      "num_iters": 20,
+      "rank_lane_task_counts": [
+        [
+          16,
+          16,
+          16,
+          16
+        ],
+        [
+          16,
+          16,
+          16,
+          16
+        ]
+      ],
+      "full_call_p10_ns": 437588213,
+      "full_call_p90_ns": 439599310,
+      "rank_median_ns": [
+        27413989,
+        27010495
+      ],
+      "min_ns": 27234629,
+      "mean_ns": 27410832
+    },
+    {
+      "shape": [
+        8,
+        8,
+        8,
+        4,
+        4
+      ],
+      "distinct_experts": 5,
+      "routes": 12,
+      "makespan_ns": 605085,
+      "full_call_median_ns": 9681372,
+      "measurement_experts": 64,
+      "measurement_groups": 16,
+      "measurement_tasks": 64,
+      "measurement_complete_groups": 12,
+      "measurement_partial_lanes": 4,
+      "lane_task_counts": [
+        16,
+        15,
+        15,
+        9,
+        9
+      ],
+      "iso_max_ns": 323152,
+      "iso_baseline_makespan_ns": 3152272,
+      "derate": 3.0712362384971854,
+      "p10_ns": 599280,
+      "p90_ns": 613171,
+      "num_iters": 20,
+      "rank_lane_task_counts": [
+        [
+          16,
+          15,
+          15,
+          9,
+          9
+        ],
+        [
+          16,
+          15,
+          15,
+          9,
+          9
+        ]
+      ],
+      "full_call_p10_ns": 9588469,
+      "full_call_p90_ns": 9810735,
+      "rank_median_ns": [
+        603806,
+        600187
+      ],
+      "min_ns": 593474,
+      "mean_ns": 606128
+    },
+    {
+      "shape": [
+        8,
+        8,
+        8,
+        4,
+        4
+      ],
+      "distinct_experts": 5,
+      "routes": 48,
+      "makespan_ns": 1529809,
+      "full_call_median_ns": 24476946,
+      "measurement_experts": 64,
+      "measurement_groups": 16,
+      "measurement_tasks": 64,
+      "measurement_complete_groups": 12,
+      "measurement_partial_lanes": 4,
+      "lane_task_counts": [
+        16,
+        15,
+        15,
+        9,
+        9
+      ],
+      "iso_max_ns": 1147892,
+      "iso_baseline_makespan_ns": 10532912,
+      "derate": 2.3238536503485454,
+      "p10_ns": 1514962,
+      "p90_ns": 1547764,
+      "num_iters": 20,
+      "rank_lane_task_counts": [
+        [
+          16,
+          15,
+          15,
+          9,
+          9
+        ],
+        [
+          16,
+          15,
+          15,
+          9,
+          9
+        ]
+      ],
+      "full_call_p10_ns": 24239393,
+      "full_call_p90_ns": 24764224,
+      "rank_median_ns": [
+        1518757,
+        1517401
+      ],
+      "min_ns": 1512465,
+      "mean_ns": 1533945
+    },
+    {
+      "shape": [
+        8,
+        8,
+        8,
+        4,
+        4
+      ],
+      "distinct_experts": 5,
+      "routes": 192,
+      "makespan_ns": 3417209,
+      "full_call_median_ns": 54675352,
+      "measurement_experts": 64,
+      "measurement_groups": 16,
+      "measurement_tasks": 64,
+      "measurement_complete_groups": 12,
+      "measurement_partial_lanes": 4,
+      "lane_task_counts": [
+        16,
+        16,
+        16,
+        8,
+        8
+      ],
+      "iso_max_ns": 4163279,
+      "iso_baseline_makespan_ns": 35215312,
+      "derate": 1.5526016637308226,
+      "p10_ns": 3364729,
+      "p90_ns": 3460988,
+      "num_iters": 20,
+      "rank_lane_task_counts": [
+        [
+          16,
+          16,
+          16,
+          8,
+          8
+        ],
+        [
+          16,
+          16,
+          16,
+          8,
+          8
+        ]
+      ],
+      "full_call_p10_ns": 53835659,
+      "full_call_p90_ns": 55375804,
+      "rank_median_ns": [
+        3403416,
+        3369228
+      ],
+      "min_ns": 3358009,
+      "mean_ns": 3414056
+    },
+    {
+      "shape": [
+        8,
+        8,
+        8,
+        4,
+        4
+      ],
+      "distinct_experts": 5,
+      "routes": 768,
+      "makespan_ns": 11601833,
+      "full_call_median_ns": 185629331,
+      "measurement_experts": 64,
+      "measurement_groups": 16,
+      "measurement_tasks": 64,
+      "measurement_complete_groups": 12,
+      "measurement_partial_lanes": 4,
+      "lane_task_counts": [
+        16,
+        16,
+        16,
+        8,
+        8
+      ],
+      "iso_max_ns": 16455523,
+      "iso_baseline_makespan_ns": 132364368,
+      "derate": 1.4024116444993717,
+      "p10_ns": 11469317,
+      "p90_ns": 11685600,
+      "num_iters": 20,
+      "rank_lane_task_counts": [
+        [
+          16,
+          16,
+          16,
+          8,
+          8
+        ],
+        [
+          16,
+          16,
+          16,
+          8,
+          8
+        ]
+      ],
+      "full_call_p10_ns": 183509076,
+      "full_call_p90_ns": 186969607,
+      "rank_median_ns": [
+        11579550,
+        11522257
+      ],
+      "min_ns": 11436172,
+      "mean_ns": 11587228
+    },
+    {
+      "shape": [
+        8,
+        8,
+        8,
+        4,
+        4
+      ],
+      "distinct_experts": 5,
+      "routes": 2040,
+      "makespan_ns": 28900952,
+      "full_call_median_ns": 462415230,
+      "measurement_experts": 64,
+      "measurement_groups": 16,
+      "measurement_tasks": 64,
+      "measurement_complete_groups": 12,
+      "measurement_partial_lanes": 4,
+      "lane_task_counts": [
+        16,
+        16,
+        16,
+        8,
+        8
+      ],
+      "iso_max_ns": 42765327,
+      "iso_baseline_makespan_ns": 347587264,
+      "derate": 1.3303572308103901,
+      "p10_ns": 28831986,
+      "p90_ns": 29118268,
+      "num_iters": 20,
+      "rank_lane_task_counts": [
+        [
+          16,
+          16,
+          16,
+          8,
+          8
+        ],
+        [
+          16,
+          16,
+          16,
+          8,
+          8
+        ]
+      ],
+      "full_call_p10_ns": 461311775,
+      "full_call_p90_ns": 465892286,
+      "rank_median_ns": [
+        28896812,
+        28844880
+      ],
+      "min_ns": 28733660,
+      "mean_ns": 28942890
+    },
+    {
+      "shape": [
+        8,
+        8,
+        4,
+        4,
+        4,
+        4
+      ],
+      "distinct_experts": 6,
+      "routes": 12,
+      "makespan_ns": 686072,
+      "full_call_median_ns": 9605008,
+      "measurement_experts": 64,
+      "measurement_groups": 14,
+      "measurement_tasks": 64,
+      "measurement_complete_groups": 10,
+      "measurement_partial_lanes": 4,
+      "lane_task_counts": [
+        14,
+        14,
+        9,
+        9,
+        9,
+        9
+      ],
+      "iso_max_ns": 323152,
+      "iso_baseline_makespan_ns": 2908368,
+      "derate": 3.3025421817321603,
+      "p10_ns": 678008,
+      "p90_ns": 700710,
+      "num_iters": 20,
+      "rank_lane_task_counts": [
+        [
+          14,
+          14,
+          9,
+          9,
+          9,
+          9
+        ],
+        [
+          14,
+          14,
+          9,
+          9,
+          9,
+          9
+        ]
+      ],
+      "full_call_p10_ns": 9492111,
+      "full_call_p90_ns": 9809930,
+      "rank_median_ns": [
+        680608,
+        681901
+      ],
+      "min_ns": 672449,
+      "mean_ns": 687067
+    },
+    {
+      "shape": [
+        8,
+        8,
+        4,
+        4,
+        4,
+        4
+      ],
+      "distinct_experts": 6,
+      "routes": 48,
+      "makespan_ns": 1741394,
+      "full_call_median_ns": 26120920,
+      "measurement_experts": 64,
+      "measurement_groups": 15,
+      "measurement_tasks": 64,
+      "measurement_complete_groups": 10,
+      "measurement_partial_lanes": 4,
+      "lane_task_counts": [
+        15,
+        15,
+        9,
+        9,
+        8,
+        8
+      ],
+      "iso_max_ns": 1147892,
+      "iso_baseline_makespan_ns": 10331028,
+      "derate": 2.5283950445202548,
+      "p10_ns": 1719103,
+      "p90_ns": 1771786,
+      "num_iters": 20,
+      "rank_lane_task_counts": [
+        [
+          15,
+          15,
+          9,
+          9,
+          8,
+          8
+        ],
+        [
+          15,
+          15,
+          9,
+          9,
+          8,
+          8
+        ]
+      ],
+      "full_call_p10_ns": 25786535,
+      "full_call_p90_ns": 26576804,
+      "rank_median_ns": [
+        1734474,
+        1716014
+      ],
+      "min_ns": 1716336,
+      "mean_ns": 1741689
+    },
+    {
+      "shape": [
+        8,
+        8,
+        4,
+        4,
+        4,
+        4
+      ],
+      "distinct_experts": 6,
+      "routes": 192,
+      "makespan_ns": 3797885,
+      "full_call_median_ns": 60766161,
+      "measurement_experts": 64,
+      "measurement_groups": 16,
+      "measurement_tasks": 64,
+      "measurement_complete_groups": 10,
+      "measurement_partial_lanes": 4,
+      "lane_task_counts": [
+        16,
+        16,
+        8,
+        8,
+        8,
+        8
+      ],
+      "iso_max_ns": 4163279,
+      "iso_baseline_makespan_ns": 35215312,
+      "derate": 1.725560773109152,
+      "p10_ns": 3746349,
+      "p90_ns": 3846900,
+      "num_iters": 20,
+      "rank_lane_task_counts": [
+        [
+          16,
+          16,
+          8,
+          8,
+          8,
+          8
+        ],
+        [
+          16,
+          16,
+          8,
+          8,
+          8,
+          8
+        ]
+      ],
+      "full_call_p10_ns": 59941584,
+      "full_call_p90_ns": 61550402,
+      "rank_median_ns": [
+        3761248,
+        3771490
+      ],
+      "min_ns": 3736634,
+      "mean_ns": 3798877
+    },
+    {
+      "shape": [
+        8,
+        8,
+        4,
+        4,
+        4,
+        4
+      ],
+      "distinct_experts": 6,
+      "routes": 768,
+      "makespan_ns": 12305700,
+      "full_call_median_ns": 196891196,
+      "measurement_experts": 64,
+      "measurement_groups": 16,
+      "measurement_tasks": 64,
+      "measurement_complete_groups": 10,
+      "measurement_partial_lanes": 4,
+      "lane_task_counts": [
+        16,
+        16,
+        8,
+        8,
+        8,
+        8
+      ],
+      "iso_max_ns": 16455523,
+      "iso_baseline_makespan_ns": 132364368,
+      "derate": 1.487493945500499,
+      "p10_ns": 12252571,
+      "p90_ns": 12379857,
+      "num_iters": 20,
+      "rank_lane_task_counts": [
+        [
+          16,
+          16,
+          8,
+          8,
+          8,
+          8
+        ],
+        [
+          16,
+          16,
+          8,
+          8,
+          8,
+          8
+        ]
+      ],
+      "full_call_p10_ns": 196041136,
+      "full_call_p90_ns": 198077711,
+      "rank_median_ns": [
+        12217319,
+        12305700
+      ],
+      "min_ns": 12235206,
+      "mean_ns": 12312893
+    },
+    {
+      "shape": [
+        8,
+        8,
+        4,
+        4,
+        4,
+        4
+      ],
+      "distinct_experts": 6,
+      "routes": 2040,
+      "makespan_ns": 30646302,
+      "full_call_median_ns": 490340840,
+      "measurement_experts": 64,
+      "measurement_groups": 16,
+      "measurement_tasks": 64,
+      "measurement_complete_groups": 10,
+      "measurement_partial_lanes": 4,
+      "lane_task_counts": [
+        16,
+        16,
+        8,
+        8,
+        8,
+        8
+      ],
+      "iso_max_ns": 42765327,
+      "iso_baseline_makespan_ns": 347587264,
+      "derate": 1.4106985231771898,
+      "p10_ns": 30600996,
+      "p90_ns": 30775904,
+      "num_iters": 20,
+      "rank_lane_task_counts": [
+        [
+          16,
+          16,
+          8,
+          8,
+          8,
+          8
+        ],
+        [
+          16,
+          16,
+          8,
+          8,
+          8,
+          8
+        ]
+      ],
+      "full_call_p10_ns": 489615937,
+      "full_call_p90_ns": 492414460,
+      "rank_median_ns": [
+        30590816,
+        30625920
+      ],
+      "min_ns": 30576247,
+      "mean_ns": 30702612
+    },
+    {
+      "shape": [
+        8,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4
+      ],
+      "distinct_experts": 7,
+      "routes": 12,
+      "makespan_ns": 698476,
+      "full_call_median_ns": 9778676,
+      "measurement_experts": 64,
+      "measurement_groups": 14,
+      "measurement_tasks": 64,
+      "measurement_complete_groups": 9,
+      "measurement_partial_lanes": 1,
+      "lane_task_counts": [
+        14,
+        9,
+        9,
+        8,
+        8,
+        8,
+        8
+      ],
+      "iso_max_ns": 323152,
+      "iso_baseline_makespan_ns": 2908368,
+      "derate": 3.3622553954657732,
+      "p10_ns": 682305,
+      "p90_ns": 711544,
+      "num_iters": 20,
+      "rank_lane_task_counts": [
+        [
+          14,
+          9,
+          9,
+          8,
+          8,
+          8,
+          8
+        ],
+        [
+          14,
+          9,
+          9,
+          8,
+          8,
+          8,
+          8
+        ]
+      ],
+      "full_call_p10_ns": 9552274,
+      "full_call_p90_ns": 9961624,
+      "rank_median_ns": [
+        687239,
+        688041
+      ],
+      "min_ns": 676646,
+      "mean_ns": 697922
+    },
+    {
+      "shape": [
+        8,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4
+      ],
+      "distinct_experts": 7,
+      "routes": 48,
+      "makespan_ns": 1875228,
+      "full_call_median_ns": 28128428,
+      "measurement_experts": 64,
+      "measurement_groups": 15,
+      "measurement_tasks": 64,
+      "measurement_complete_groups": 9,
+      "measurement_partial_lanes": 1,
+      "lane_task_counts": [
+        15,
+        9,
+        8,
+        8,
+        8,
+        8,
+        8
+      ],
+      "iso_max_ns": 1147892,
+      "iso_baseline_makespan_ns": 10331028,
+      "derate": 2.722713364052445,
+      "p10_ns": 1835103,
+      "p90_ns": 1913655,
+      "num_iters": 20,
+      "rank_lane_task_counts": [
+        [
+          15,
+          9,
+          8,
+          8,
+          8,
+          8,
+          8
+        ],
+        [
+          15,
+          9,
+          8,
+          8,
+          8,
+          8,
+          8
+        ]
+      ],
+      "full_call_p10_ns": 27526554,
+      "full_call_p90_ns": 28704822,
+      "rank_median_ns": [
+        1847624,
+        1856299
+      ],
+      "min_ns": 1828122,
+      "mean_ns": 1879267
+    },
+    {
+      "shape": [
+        8,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4
+      ],
+      "distinct_experts": 7,
+      "routes": 192,
+      "makespan_ns": 4203392,
+      "full_call_median_ns": 67254270,
+      "measurement_experts": 64,
+      "measurement_groups": 16,
+      "measurement_tasks": 64,
+      "measurement_complete_groups": 9,
+      "measurement_partial_lanes": 1,
+      "lane_task_counts": [
+        16,
+        8,
+        8,
+        8,
+        8,
+        8,
+        8
+      ],
+      "iso_max_ns": 4163279,
+      "iso_baseline_makespan_ns": 35215312,
+      "derate": 1.9098019066251635,
+      "p10_ns": 4174446,
+      "p90_ns": 4245412,
+      "num_iters": 20,
+      "rank_lane_task_counts": [
+        [
+          16,
+          8,
+          8,
+          8,
+          8,
+          8,
+          8
+        ],
+        [
+          16,
+          8,
+          8,
+          8,
+          8,
+          8,
+          8
+        ]
+      ],
+      "full_call_p10_ns": 66791142,
+      "full_call_p90_ns": 67926593,
+      "rank_median_ns": [
+        4177825,
+        4192108
+      ],
+      "min_ns": 4162865,
+      "mean_ns": 4210963
+    },
+    {
+      "shape": [
+        8,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4
+      ],
+      "distinct_experts": 7,
+      "routes": 768,
+      "makespan_ns": 13739104,
+      "full_call_median_ns": 219825672,
+      "measurement_experts": 64,
+      "measurement_groups": 16,
+      "measurement_tasks": 64,
+      "measurement_complete_groups": 9,
+      "measurement_partial_lanes": 1,
+      "lane_task_counts": [
+        16,
+        8,
+        8,
+        8,
+        8,
+        8,
+        8
+      ],
+      "iso_max_ns": 16455523,
+      "iso_baseline_makespan_ns": 132364368,
+      "derate": 1.6607616938117364,
+      "p10_ns": 13612162,
+      "p90_ns": 13866120,
+      "num_iters": 20,
+      "rank_lane_task_counts": [
+        [
+          16,
+          8,
+          8,
+          8,
+          8,
+          8,
+          8
+        ],
+        [
+          16,
+          8,
+          8,
+          8,
+          8,
+          8,
+          8
+        ]
+      ],
+      "full_call_p10_ns": 217794594,
+      "full_call_p90_ns": 221857921,
+      "rank_median_ns": [
+        13522870,
+        13732908
+      ],
+      "min_ns": 13537789,
+      "mean_ns": 13737340
+    },
+    {
+      "shape": [
+        8,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4
+      ],
+      "distinct_experts": 7,
+      "routes": 2040,
+      "makespan_ns": 34390265,
+      "full_call_median_ns": 550244249,
+      "measurement_experts": 64,
+      "measurement_groups": 16,
+      "measurement_tasks": 64,
+      "measurement_complete_groups": 9,
+      "measurement_partial_lanes": 1,
+      "lane_task_counts": [
+        16,
+        8,
+        8,
+        8,
+        8,
+        8,
+        8
+      ],
+      "iso_max_ns": 42765327,
+      "iso_baseline_makespan_ns": 347587264,
+      "derate": 1.5830391558880592,
+      "p10_ns": 34025220,
+      "p90_ns": 34752761,
+      "num_iters": 20,
+      "rank_lane_task_counts": [
+        [
+          16,
+          8,
+          8,
+          8,
+          8,
+          8,
+          8
+        ],
+        [
+          16,
+          8,
+          8,
+          8,
+          8,
+          8,
+          8
+        ]
+      ],
+      "full_call_p10_ns": 544403512,
+      "full_call_p90_ns": 556044172,
+      "rank_median_ns": [
+        33934295,
+        34333265
+      ],
+      "min_ns": 33933711,
+      "mean_ns": 34397497
+    },
+    {
+      "shape": [
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4
+      ],
+      "distinct_experts": 8,
+      "routes": 12,
+      "makespan_ns": 1218554,
+      "full_call_median_ns": 9748435,
+      "measurement_experts": 64,
+      "measurement_groups": 8,
+      "measurement_tasks": 64,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8,
+        8,
+        8,
+        8,
+        8,
+        8,
+        8,
+        8
+      ],
+      "iso_max_ns": 323152,
+      "iso_baseline_makespan_ns": 2585216,
+      "derate": 3.7708396513096005,
+      "p10_ns": 1196946,
+      "p90_ns": 1239902,
+      "num_iters": 20,
+      "rank_lane_task_counts": [
+        [
+          8,
+          8,
+          8,
+          8,
+          8,
+          8,
+          8,
+          8
+        ],
+        [
+          8,
+          8,
+          8,
+          8,
+          8,
+          8,
+          8,
+          8
+        ]
+      ],
+      "full_call_p10_ns": 9575567,
+      "full_call_p90_ns": 9919213,
+      "rank_median_ns": [
+        1204353,
+        1204562
+      ],
+      "min_ns": 1189210,
+      "mean_ns": 1218528
+    },
+    {
+      "shape": [
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4
+      ],
+      "distinct_experts": 8,
+      "routes": 48,
+      "makespan_ns": 3736773,
+      "full_call_median_ns": 29894182,
+      "measurement_experts": 64,
+      "measurement_groups": 8,
+      "measurement_tasks": 64,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8,
+        8,
+        8,
+        8,
+        8,
+        8,
+        8,
+        8
+      ],
+      "iso_max_ns": 1147892,
+      "iso_baseline_makespan_ns": 9183136,
+      "derate": 3.255334778881637,
+      "p10_ns": 3666425,
+      "p90_ns": 3783628,
+      "num_iters": 20,
+      "rank_lane_task_counts": [
+        [
+          8,
+          8,
+          8,
+          8,
+          8,
+          8,
+          8,
+          8
+        ],
+        [
+          8,
+          8,
+          8,
+          8,
+          8,
+          8,
+          8,
+          8
+        ]
+      ],
+      "full_call_p10_ns": 29331400,
+      "full_call_p90_ns": 30269022,
+      "rank_median_ns": [
+        3710019,
+        3680642
+      ],
+      "min_ns": 3618464,
+      "mean_ns": 3737758
+    },
+    {
+      "shape": [
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4
+      ],
+      "distinct_experts": 8,
+      "routes": 192,
+      "makespan_ns": 9241633,
+      "full_call_median_ns": 73933071,
+      "measurement_experts": 64,
+      "measurement_groups": 8,
+      "measurement_tasks": 64,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8,
+        8,
+        8,
+        8,
+        8,
+        8,
+        8,
+        8
+      ],
+      "iso_max_ns": 4163279,
+      "iso_baseline_makespan_ns": 33306232,
+      "derate": 2.2197969136827007,
+      "p10_ns": 9158859,
+      "p90_ns": 9409172,
+      "num_iters": 20,
+      "rank_lane_task_counts": [
+        [
+          8,
+          8,
+          8,
+          8,
+          8,
+          8,
+          8,
+          8
+        ],
+        [
+          8,
+          8,
+          8,
+          8,
+          8,
+          8,
+          8,
+          8
+        ]
+      ],
+      "full_call_p10_ns": 73270876,
+      "full_call_p90_ns": 75273373,
+      "rank_median_ns": [
+        9227954,
+        9163543
+      ],
+      "min_ns": 9135926,
+      "mean_ns": 9281238
+    },
+    {
+      "shape": [
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4
+      ],
+      "distinct_experts": 8,
+      "routes": 768,
+      "makespan_ns": 30013713,
+      "full_call_median_ns": 240109708,
+      "measurement_experts": 64,
+      "measurement_groups": 8,
+      "measurement_tasks": 64,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8,
+        8,
+        8,
+        8,
+        8,
+        8,
+        8,
+        8
+      ],
+      "iso_max_ns": 16455523,
+      "iso_baseline_makespan_ns": 131644184,
+      "derate": 1.8239294794823597,
+      "p10_ns": 29846851,
+      "p90_ns": 30203571,
+      "num_iters": 20,
+      "rank_lane_task_counts": [
+        [
+          8,
+          8,
+          8,
+          8,
+          8,
+          8,
+          8,
+          8
+        ],
+        [
+          8,
+          8,
+          8,
+          8,
+          8,
+          8,
+          8,
+          8
+        ]
+      ],
+      "full_call_p10_ns": 238774803,
+      "full_call_p90_ns": 241628566,
+      "rank_median_ns": [
+        29852530,
+        29990519
+      ],
+      "min_ns": 29673510,
+      "mean_ns": 30018383
+    },
+    {
+      "shape": [
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4
+      ],
+      "distinct_experts": 8,
+      "routes": 2040,
+      "makespan_ns": 75807222,
+      "full_call_median_ns": 606457781,
+      "measurement_experts": 64,
+      "measurement_groups": 8,
+      "measurement_tasks": 64,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8,
+        8,
+        8,
+        8,
+        8,
+        8,
+        8,
+        8
+      ],
+      "iso_max_ns": 42765327,
+      "iso_baseline_makespan_ns": 342122616,
+      "derate": 1.7726328299792962,
+      "p10_ns": 74934091,
+      "p90_ns": 76420324,
+      "num_iters": 20,
+      "rank_lane_task_counts": [
+        [
+          8,
+          8,
+          8,
+          8,
+          8,
+          8,
+          8,
+          8
+        ],
+        [
+          8,
+          8,
+          8,
+          8,
+          8,
+          8,
+          8,
+          8
+        ]
+      ],
+      "full_call_p10_ns": 599472730,
+      "full_call_p90_ns": 611362591,
+      "rank_median_ns": [
+        75209679,
+        75518576
+      ],
+      "min_ns": 74554588,
+      "mean_ns": 75765680
+    },
+    {
+      "shape": [
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2
+      ],
+      "distinct_experts": 16,
+      "routes": 12,
+      "makespan_ns": 2354121,
+      "full_call_median_ns": 9416484,
+      "measurement_experts": 64,
+      "measurement_groups": 4,
+      "measurement_tasks": 64,
+      "measurement_complete_groups": 4,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4
+      ],
+      "iso_max_ns": 592926,
+      "iso_baseline_makespan_ns": 2371704,
+      "derate": 3.970345371935115,
+      "p10_ns": 2331166,
+      "p90_ns": 2396910,
+      "num_iters": 20,
+      "rank_lane_task_counts": [
+        [
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4
+        ],
+        [
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4
+        ]
+      ],
+      "full_call_p10_ns": 9324665,
+      "full_call_p90_ns": 9587642,
+      "rank_median_ns": [
+        2348392,
+        2337002
+      ],
+      "min_ns": 2319002,
+      "mean_ns": 2357601
+    },
+    {
+      "shape": [
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2
+      ],
+      "distinct_experts": 16,
+      "routes": 48,
+      "makespan_ns": 8434420,
+      "full_call_median_ns": 33737680,
+      "measurement_experts": 64,
+      "measurement_groups": 4,
+      "measurement_tasks": 64,
+      "measurement_complete_groups": 4,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4
+      ],
+      "iso_max_ns": 2254131,
+      "iso_baseline_makespan_ns": 9016524,
+      "derate": 3.7417612374790994,
+      "p10_ns": 8372971,
+      "p90_ns": 8500322,
+      "num_iters": 20,
+      "rank_lane_task_counts": [
+        [
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4
+        ],
+        [
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4
+        ]
+      ],
+      "full_call_p10_ns": 33491887,
+      "full_call_p90_ns": 34001288,
+      "rank_median_ns": [
+        8432319,
+        8347933
+      ],
+      "min_ns": 8309681,
+      "mean_ns": 8442403
+    },
+    {
+      "shape": [
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2
+      ],
+      "distinct_experts": 16,
+      "routes": 192,
+      "makespan_ns": 26749669,
+      "full_call_median_ns": 106998676,
+      "measurement_experts": 64,
+      "measurement_groups": 4,
+      "measurement_tasks": 64,
+      "measurement_complete_groups": 4,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4
+      ],
+      "iso_max_ns": 8136149,
+      "iso_baseline_makespan_ns": 32544596,
+      "derate": 3.2877555462664216,
+      "p10_ns": 26261280,
+      "p90_ns": 27246064,
+      "num_iters": 20,
+      "rank_lane_task_counts": [
+        [
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4
+        ],
+        [
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4
+        ]
+      ],
+      "full_call_p10_ns": 105045119,
+      "full_call_p90_ns": 108984258,
+      "rank_median_ns": [
+        26602071,
+        26167282
+      ],
+      "min_ns": 26224494,
+      "mean_ns": 26747902
+    },
+    {
+      "shape": [
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2
+      ],
+      "distinct_experts": 16,
+      "routes": 768,
+      "makespan_ns": 89579588,
+      "full_call_median_ns": 358318354,
+      "measurement_experts": 64,
+      "measurement_groups": 4,
+      "measurement_tasks": 64,
+      "measurement_complete_groups": 4,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4
+      ],
+      "iso_max_ns": 32132613,
+      "iso_baseline_makespan_ns": 128530452,
+      "derate": 2.7878090244325913,
+      "p10_ns": 88666150,
+      "p90_ns": 91446293,
+      "num_iters": 20,
+      "rank_lane_task_counts": [
+        [
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4
+        ],
+        [
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4
+        ]
+      ],
+      "full_call_p10_ns": 354664599,
+      "full_call_p90_ns": 365785172,
+      "rank_median_ns": [
+        89310954,
+        88643726
+      ],
+      "min_ns": 88457422,
+      "mean_ns": 90021953
+    },
+    {
+      "shape": [
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2
+      ],
+      "distinct_experts": 16,
+      "routes": 2040,
+      "makespan_ns": 229738692,
+      "full_call_median_ns": 918954767,
+      "measurement_experts": 64,
+      "measurement_groups": 4,
+      "measurement_tasks": 64,
+      "measurement_complete_groups": 4,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4
+      ],
+      "iso_max_ns": 83887949,
+      "iso_baseline_makespan_ns": 335551796,
+      "derate": 2.7386376051463603,
+      "p10_ns": 224899168,
+      "p90_ns": 233617538,
+      "num_iters": 20,
+      "rank_lane_task_counts": [
+        [
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4
+        ],
+        [
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4
+        ]
+      ],
+      "full_call_p10_ns": 899596672,
+      "full_call_p90_ns": 934470154,
+      "rank_median_ns": [
+        228486152,
+        227396833
+      ],
+      "min_ns": 223207130,
+      "mean_ns": 229606164
+    },
+    {
+      "shape": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1
+      ],
+      "distinct_experts": 32,
+      "routes": 12,
+      "makespan_ns": 5016123,
+      "full_call_median_ns": 10032246,
+      "measurement_experts": 64,
+      "measurement_groups": 2,
+      "measurement_tasks": 64,
+      "measurement_complete_groups": 2,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2
+      ],
+      "iso_max_ns": 1126140,
+      "iso_baseline_makespan_ns": 2252280,
+      "derate": 4.454262347487879,
+      "p10_ns": 4811882,
+      "p90_ns": 5045724,
+      "num_iters": 20,
+      "rank_lane_task_counts": [
+        [
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2
+        ],
+        [
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2
+        ]
+      ],
+      "full_call_p10_ns": 9623765,
+      "full_call_p90_ns": 10091449,
+      "rank_median_ns": [
+        4984121,
+        4935482
+      ],
+      "min_ns": 4485728,
+      "mean_ns": 4960621
+    },
+    {
+      "shape": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1
+      ],
+      "distinct_experts": 32,
+      "routes": 48,
+      "makespan_ns": 18895910,
+      "full_call_median_ns": 37791820,
+      "measurement_experts": 64,
+      "measurement_groups": 2,
+      "measurement_tasks": 64,
+      "measurement_complete_groups": 2,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2
+      ],
+      "iso_max_ns": 4329982,
+      "iso_baseline_makespan_ns": 8659964,
+      "derate": 4.363969642368028,
+      "p10_ns": 18732587,
+      "p90_ns": 19101376,
+      "num_iters": 20,
+      "rank_lane_task_counts": [
+        [
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2
+        ],
+        [
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2
+        ]
+      ],
+      "full_call_p10_ns": 37465173,
+      "full_call_p90_ns": 38202751,
+      "rank_median_ns": [
+        18869097,
+        18693207
+      ],
+      "min_ns": 18703272,
+      "mean_ns": 18914772
+    },
+    {
+      "shape": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1
+      ],
+      "distinct_experts": 32,
+      "routes": 192,
+      "makespan_ns": 68083105,
+      "full_call_median_ns": 136166209,
+      "measurement_experts": 64,
+      "measurement_groups": 2,
+      "measurement_tasks": 64,
+      "measurement_complete_groups": 2,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2
+      ],
+      "iso_max_ns": 15992050,
+      "iso_baseline_makespan_ns": 31984100,
+      "derate": 4.257309381849106,
+      "p10_ns": 67247210,
+      "p90_ns": 69194281,
+      "num_iters": 20,
+      "rank_lane_task_counts": [
+        [
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2
+        ],
+        [
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2
+        ]
+      ],
+      "full_call_p10_ns": 134494418,
+      "full_call_p90_ns": 138388563,
+      "rank_median_ns": [
+        67981474,
+        66715396
+      ],
+      "min_ns": 66065708,
+      "mean_ns": 68049799
+    },
+    {
+      "shape": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1
+      ],
+      "distinct_experts": 32,
+      "routes": 768,
+      "makespan_ns": 243914050,
+      "full_call_median_ns": 487828101,
+      "measurement_experts": 64,
+      "measurement_groups": 2,
+      "measurement_tasks": 64,
+      "measurement_complete_groups": 2,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2
+      ],
+      "iso_max_ns": 63201793,
+      "iso_baseline_makespan_ns": 126403586,
+      "derate": 3.859290044192259,
+      "p10_ns": 240377502,
+      "p90_ns": 246043807,
+      "num_iters": 20,
+      "rank_lane_task_counts": [
+        [
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2
+        ],
+        [
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2
+        ]
+      ],
+      "full_call_p10_ns": 480755005,
+      "full_call_p90_ns": 492087613,
+      "rank_median_ns": [
+        242839277,
+        240210028
+      ],
+      "min_ns": 239373618,
+      "mean_ns": 243388052
+    },
+    {
+      "shape": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1
+      ],
+      "distinct_experts": 32,
+      "routes": 2040,
+      "makespan_ns": 620256842,
+      "full_call_median_ns": 1240513684,
+      "measurement_experts": 64,
+      "measurement_groups": 2,
+      "measurement_tasks": 64,
+      "measurement_complete_groups": 2,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2
+      ],
+      "iso_max_ns": 164102280,
+      "iso_baseline_makespan_ns": 328204560,
+      "derate": 3.7796966745373677,
+      "p10_ns": 615648962,
+      "p90_ns": 628765160,
+      "num_iters": 20,
+      "rank_lane_task_counts": [
+        [
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2
+        ],
+        [
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2
+        ]
+      ],
+      "full_call_p10_ns": 1231297925,
+      "full_call_p90_ns": 1257530320,
+      "rank_median_ns": [
+        620256842,
+        615640802
+      ],
+      "min_ns": 613587718,
+      "mean_ns": 621443651
+    }
+  ]
+}

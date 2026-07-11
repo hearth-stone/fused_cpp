@@ -1,5 +1,137 @@
 # Expert Cost Profile Schema
 
+## Schema v2: policy- and topology-bound contention profile
+
+Schema v2 is the active format for SVE fused-MoE scheduling profiles. A profile
+is valid only for the exact kernel policy, sharded expert shape, and NUMA/rank
+execution context recorded in the file. In particular, split-W13 and non-split
+profiles are different calibration domains.
+
+```json
+{
+  "schema_version": 2,
+  "kind": "contention_derate",
+  "target": {
+    "host_logical_cores": 64,
+    "aggregate_profiled_cores": 64,
+    "cores_per_rank": 32,
+    "concurrent_ranks": 2,
+    "cpu_ids_by_rank": [[0, 1], [32, 33]],
+    "numa_nodes": [0, 1],
+    "llc_bytes_by_rank": [50331648, 50331648]
+  },
+  "kernel": {
+    "name": "fused_moe_bf16_tiled_async",
+    "backend": "sve",
+    "backend_n_tile": 8,
+    "parallel_axis": "N",
+    "w13_split": true,
+    "w13_split_chunks": 2,
+    "git_available": true,
+    "git_commit": "...",
+    "git_worktree_dirty": true,
+    "source_sha256": "...",
+    "extension_sha256": "..."
+  },
+  "parallelism": {
+    "mode": "tp",
+    "degree": 2,
+    "global_experts": 64,
+    "local_experts": 64
+  },
+  "expert_shape": {
+    "dtype": "bf16",
+    "hidden_size": 4096,
+    "intermediate_size": 1024,
+    "measurement_experts": 64,
+    "isolated_measurement_experts": 8,
+    "weight_reuse": "streaming_distinct_experts"
+  },
+  "working_set": {
+    "w13_packed_bytes_per_expert": 16777216,
+    "w2_packed_bytes_per_expert": 8388608,
+    "w13_chunk_bytes_per_expert": 8388608,
+    "max_weight_stage_bytes_per_expert": 8388608
+  },
+  "measurement": {
+    "rank_synchronization": "socket_barrier_per_call",
+    "rank_aggregation": "median_of_pairwise_max",
+    "profile_scope": "concurrent_rank_pair",
+    "assignment": "earliest_finish_lpt_using_streaming_T_iso",
+    "derate": "full_call_median / LPT_isolated_baseline_makespan"
+  },
+  "isolated": [],
+  "entries": []
+}
+```
+
+Required v2 identity fields are:
+
+- hardware: profiled CPU sets, NUMA nodes, LLC bytes, cores per rank, and
+  concurrent rank count;
+- kernel: backend, N-split policy, W13 split policy, source hash, and extension
+  binary hash;
+- distributed shape: TP/EP mode and degree, global/local expert counts, H, and
+  sharded F;
+- calibration scope: the full local expert count, activation, dtype, SVE N tile,
+  NUMA nodes, and exact physical CPU sets;
+- working set: actual packed W13/W2 bytes per expert and W13 chunk size;
+- measurement: whether ranks were synchronized and how per-rank samples were
+  reduced to global wall time.
+
+For concurrent ranks, every timed call starts behind a cross-rank barrier. The
+merged sample is `max(rank_sample_i)` for each iteration, and summary statistics
+are computed from those paired maxima. Taking the maximum of two independently
+computed medians is not schema-v2 compliant.
+
+The active generator is `profile_contention_async_dual_rank.py`. The underlying
+single-rank worker is `profile_contention_async.py`; its schema-v2 output records
+one rank and can also be used for single-rank targets.
+
+`git_commit` and `git_worktree_dirty` may be `null` on a deployment host without
+repository metadata. `source_sha256` and `extension_sha256` remain mandatory
+kernel identity fields in that case.
+
+The isolated table uses eight consecutive experts, enough to stream beyond LLC
+without multiplying the slow 1T/large-M points by every local expert. The
+contention table uses all local experts. For mixed-width shapes it assigns
+experts with the same earliest-finish LPT rule as `IntervalPlanner`, records
+`lane_task_counts`, and computes:
+
+```text
+iso_baseline_makespan = max_lanes(lane_tasks * T_iso(M, lane_threads))
+full_call_derate      = full_call_median / iso_baseline_makespan
+```
+
+The complete `full_call_*` curve is the authoritative calibration for a uniform
+full-rank workload. `makespan_ns` remains a normalized diagnostic; it must not
+be multiplied by an arbitrary number of waves.
+
+TP2 and EP2 reproduction commands for the 64-core/two-NUMA target are:
+
+```bash
+PYTHONPATH=src .venv/bin/python \
+  cpu_moe_schedule_optimization/cost_model/profile_contention_async_dual_rank.py \
+  --output tmp/tp2_profile_v2.json --parallel-mode tp --parallel-degree 2 \
+  --hidden-size 4096 --ffn-hidden-size 1024 \
+  --global-experts 64 --local-experts 64 --measurement-experts 0 \
+  --isolated-measurement-experts 8 \
+  --w13-split 1 --warmup 5 --runs 20
+
+PYTHONPATH=src .venv/bin/python \
+  cpu_moe_schedule_optimization/cost_model/profile_contention_async_dual_rank.py \
+  --output tmp/ep2_profile_v2.json --parallel-mode ep --parallel-degree 2 \
+  --hidden-size 4096 --ffn-hidden-size 2048 \
+  --global-experts 64 --local-experts 32 --measurement-experts 0 \
+  --isolated-measurement-experts 8 \
+  --w13-split 1 --warmup 5 --runs 20
+```
+
+Run each command again with `--w13-split 0` for the non-split policy. Defaults
+bind rank 0 to CPUs 0-31/NUMA0 and rank 1 to CPUs 32-63/NUMA1.
+
+## Legacy schema v1
+
 This file defines the first offline schema for the expert execution cost table:
 
 ```text
@@ -9,7 +141,7 @@ T_expert(routes, threads) -> nanoseconds
 The table is measured per machine and per expert kernel shape. The scheduler must
 not assume linear thread scaling.
 
-## JSON Shape
+### JSON Shape
 
 ```json
 {
@@ -54,7 +186,7 @@ not assume linear thread scaling.
 }
 ```
 
-## Required Fields
+### Required Fields
 
 - `schema_version`: integer schema version. Start with `1`.
 - `target`: hardware and OS metadata for reproducibility.
@@ -65,7 +197,7 @@ not assume linear thread scaling.
 - `metric`: default metric used by the scheduler, usually `median_ns`.
 - `entries`: measured `T_expert(routes, threads)` points.
 
-## Entry Rules
+### Entry Rules
 
 Each `entries[]` item must contain:
 
@@ -81,7 +213,7 @@ Recommended optional latency fields:
 - `p99_ns`
 - `stddev_ns`
 
-## Lookup Rules
+### Lookup Rules
 
 The first simulator supports two lookup modes:
 
@@ -92,7 +224,7 @@ Future runtime integration should prefer interpolation or explicit route
 bucketization, but that belongs in the cost model implementation rather than in
 planner logic.
 
-## Planning Cost
+### Planning Cost
 
 `planner_costs` is optional in the first schema. It records measured planner
 overhead:
@@ -106,7 +238,7 @@ for scoring and still records local Python planner wall time as diagnostics. The
 complexity coefficients should be calibrated with native planner profiling before
 runtime integration.
 
-## Lightweight Native Planner Cost Table
+### Lightweight Native Planner Cost Table
 
 > **⚠ DEPRECATED（阶段 1 已删除相关工具）**：本节描述的是 wave 版 planner 开销表，其生成工具
 > `build_lightweight_planner_cost.py` 与消费者 `synthetic_sweep.py` / `offline_simulator.py` 均已删除。
