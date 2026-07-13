@@ -27,16 +27,18 @@ fallback。
 - `planners/interval_planner.py` / `planned_moe.py`：联合搜索
   `(w13_split, core_shape)`，返回显式 CPU 集与 operator option，并按完整
   routing bucket histogram 缓存。
-- `planners/tp_vs_ep_model.py`：按 rank-local histogram 取全局最大 compute，
-  加上通用分层 all-reduce/all-to-all 模型。
+- `planners/tp_vs_ep_model.py`：当前按 rank-local histogram 独立预测并取全局
+  最大 compute，再加上通用分层 all-reduce/all-to-all 模型；尚未建模短 rank
+  完成后长 rank 的争用释放。
 - `planners/validate_policy_planner.py`：双 rank 枚举实测所有 policy/shape，
   报告预测误差和真实 regret；可用 `--routes-json` 输入真实路由直方图。
-- `POLICY_MODEL_VALIDATION.md`：AWS 64-core TP2/EP2 的完整校准配置、穷举
-  regret 结果和通信模型估计。
+- `POLICY_MODEL_VALIDATION.md`：AWS 64-core TP2/EP2 的 2026-07-13 校准配置、
+  synthetic/真实路由 regret、EP2 hotspot 诊断和通信模型估计。
 
 完整均匀 workload 直接使用 profile 的 `full_call_*` 曲线，不把短窗口
 group cost 乘以 wave 数。非均匀路由才进入 stage-aware DAG 模拟。跨 profile
-插值保持禁用，直到目标 routing trace 的 regret 验证通过。
+插值保持禁用。真实 routing summary 已通过 exact-profile regret 验证，但跨
+F、并行度和机器拓扑仍需要独立的 out-of-profile 测量。
 
 ---
 
