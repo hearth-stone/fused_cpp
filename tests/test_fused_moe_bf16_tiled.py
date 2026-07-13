@@ -10,6 +10,7 @@ import torch
 from fused_cpp.moe import _HAS_BF16_TILED_FUSED_MOE
 from fused_cpp.moe import fused_moe_naive
 from fused_cpp.moe import fused_moe_bf16_tiled
+from fused_cpp.moe import fused_moe_bf16_tiled_async
 from fused_cpp.moe import fused_moe_bf16_tiled_scheduled
 from fused_cpp.moe import prepare_fused_moe_bf16_tiled_weights
 
@@ -94,6 +95,151 @@ def _case_top1(seed: int = 0) -> tuple[torch.Tensor, ...]:
         topk_weights,
         topk_ids,
     )
+
+
+def test_sve_m12_silu_and_w2_bf16_route_match_legacy_for_unit_top1(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cover M12, padded-M12 tails 9-11, and smaller tails through all bridges."""
+    monkeypatch.setenv("FUSED_CPP_MOE_SVE", "1")
+    generator = torch.Generator().manual_seed(20260710)
+    hidden_size = 64
+    ffn_hidden_size = 32
+    route_counts = list(range(1, 24))
+    num_experts = len(route_counts)
+    num_tokens = sum(route_counts)
+    hidden_states = _bf16_normal(
+        (num_tokens, hidden_size), generator=generator, std=0.01
+    )
+    w13_weight = _bf16_normal(
+        (num_experts, 2 * ffn_hidden_size, hidden_size),
+        generator=generator,
+        std=0.01,
+    )
+    w2_weight = _bf16_normal(
+        (num_experts, hidden_size, ffn_hidden_size),
+        generator=generator,
+        std=0.01,
+    )
+    topk_ids = torch.cat(
+        [
+            torch.full((count,), expert, dtype=torch.int32)
+            for expert, count in enumerate(route_counts)
+        ]
+    ).reshape(num_tokens, 1)
+    topk_weights = torch.ones((num_tokens, 1), dtype=torch.float32)
+    packed = prepare_fused_moe_bf16_tiled_weights(
+        w13_weight, w2_weight, fuse_silu=True
+    )
+    if packed.gemm_backend != 1:
+        pytest.skip("requires an SVE BF16 build/runtime")
+
+    cpu = _first_affinity_cpu()
+    wave_offsets = torch.arange(num_experts + 1, dtype=torch.int32)
+    expert_ids = torch.arange(num_experts, dtype=torch.int32)
+    one_thread = torch.ones(num_experts, dtype=torch.int32)
+    async_dep_offsets = torch.arange(num_experts + 1, dtype=torch.int32)
+    async_dep_offsets[1:] -= 1
+    async_deps = torch.arange(num_experts - 1, dtype=torch.int32)
+
+    calls = {
+        "normal": lambda degree=5: fused_moe_bf16_tiled(
+            hidden_states,
+            packed,
+            topk_weights,
+            topk_ids,
+            num_threads=1,
+            silu_poly_degree=degree,
+        ),
+        "scheduled": lambda degree=5: fused_moe_bf16_tiled_scheduled(
+            hidden_states,
+            packed,
+            topk_weights,
+            topk_ids,
+            wave_offsets,
+            expert_ids,
+            one_thread,
+            thread_cpu_ids=torch.tensor([cpu], dtype=torch.int32),
+            num_threads=1,
+            silu_poly_degree=degree,
+        ),
+        "async": lambda degree=5: fused_moe_bf16_tiled_async(
+            hidden_states,
+            packed,
+            topk_weights,
+            topk_ids,
+            expert_ids,
+            torch.zeros(num_experts, dtype=torch.int32),
+            one_thread,
+            async_dep_offsets,
+            async_deps,
+            thread_cpu_ids=torch.tensor([cpu], dtype=torch.int32),
+            num_threads=1,
+            silu_poly_degree=degree,
+        ),
+    }
+    for bridge, call in calls.items():
+        monkeypatch.setenv("FUSED_CPP_MOE_SILU_MINIMAX3", "0")
+        monkeypatch.setenv("FUSED_CPP_MOE_W2_BF16_ROUTE", "0")
+        reference = call()
+        monkeypatch.setenv("FUSED_CPP_MOE_W2_BF16_ROUTE", "1")
+        candidate = call()
+        torch.testing.assert_close(
+            candidate.float(),
+            reference.float(),
+            atol=0,
+            rtol=0,
+            msg=lambda message: f"{bridge}: {message}",
+        )
+
+        for degree in (4, 5, 6):
+            monkeypatch.setenv("FUSED_CPP_MOE_SILU_MINIMAX3", "0")
+            monkeypatch.setenv("FUSED_CPP_MOE_SILU_RECIP_NR", "0")
+            monkeypatch.setenv("FUSED_CPP_MOE_SILU_M12_OPT", "0")
+            reference = call(degree)
+            monkeypatch.setenv("FUSED_CPP_MOE_SILU_M12_OPT", "1")
+            candidate = call(degree)
+            torch.testing.assert_close(
+                candidate.float(),
+                reference.float(),
+                atol=0,
+                rtol=0,
+                msg=lambda message, bridge=bridge, degree=degree: (
+                    f"{bridge}/poly{degree}: {message}"
+                ),
+            )
+
+            for recip_steps in (1, 2):
+                monkeypatch.setenv(
+                    "FUSED_CPP_MOE_SILU_RECIP_NR", str(recip_steps)
+                )
+                reciprocal = call(degree)
+                torch.testing.assert_close(
+                    reciprocal.float(),
+                    candidate.float(),
+                    atol=1.0e-6,
+                    rtol=1.0e-2,
+                    msg=lambda message,
+                    bridge=bridge,
+                    degree=degree,
+                    recip_steps=recip_steps: (
+                        f"{bridge}/poly{degree}/recip{recip_steps}: {message}"
+                    ),
+                )
+
+            if degree == 5:
+                monkeypatch.setenv("FUSED_CPP_MOE_SILU_RECIP_NR", "0")
+                monkeypatch.setenv("FUSED_CPP_MOE_SILU_MINIMAX3", "1")
+                minimax3 = call(degree)
+                torch.testing.assert_close(
+                    minimax3.float(),
+                    candidate.float(),
+                    atol=1.0e-6,
+                    rtol=2.0e-2,
+                    msg=lambda message, bridge=bridge: (
+                        f"{bridge}/minimax3: {message}"
+                    ),
+                )
 
 
 def test_fused_moe_bf16_tiled_skip_weighted_matches_unit_weighted() -> None:

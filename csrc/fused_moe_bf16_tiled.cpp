@@ -120,6 +120,69 @@ void moe_sve_w13_silu_poly5_packc_m12_rows(const uint16_t*, const uint16_t*,
 void moe_sve_w13_silu_poly6_packc_m12_rows(const uint16_t*, const uint16_t*,
                                            uint16_t*, uint16_t*,
                                            const gemm_params_t*);
+void moe_sve_w13_silu_poly4_packc_m12_opt(const uint16_t*, const uint16_t*,
+                                          uint16_t*, uint16_t*,
+                                          const gemm_params_t*);
+void moe_sve_w13_silu_poly5_packc_m12_opt(const uint16_t*, const uint16_t*,
+                                          uint16_t*, uint16_t*,
+                                          const gemm_params_t*);
+void moe_sve_w13_silu_poly6_packc_m12_opt(const uint16_t*, const uint16_t*,
+                                          uint16_t*, uint16_t*,
+                                          const gemm_params_t*);
+void moe_sve_w13_silu_poly4_packc_m12_rows_opt(const uint16_t*,
+                                               const uint16_t*, uint16_t*,
+                                               uint16_t*,
+                                               const gemm_params_t*);
+void moe_sve_w13_silu_poly5_packc_m12_rows_opt(const uint16_t*,
+                                               const uint16_t*, uint16_t*,
+                                               uint16_t*,
+                                               const gemm_params_t*);
+void moe_sve_w13_silu_poly6_packc_m12_rows_opt(const uint16_t*,
+                                               const uint16_t*, uint16_t*,
+                                               uint16_t*,
+                                               const gemm_params_t*);
+void moe_sve_w13_silu_poly4_packc_m12_recip1(const uint16_t*, const uint16_t*,
+                                             uint16_t*, uint16_t*,
+                                             const gemm_params_t*);
+void moe_sve_w13_silu_poly5_packc_m12_recip1(const uint16_t*, const uint16_t*,
+                                             uint16_t*, uint16_t*,
+                                             const gemm_params_t*);
+void moe_sve_w13_silu_poly6_packc_m12_recip1(const uint16_t*, const uint16_t*,
+                                             uint16_t*, uint16_t*,
+                                             const gemm_params_t*);
+void moe_sve_w13_silu_poly4_packc_m12_rows_recip1(
+    const uint16_t*, const uint16_t*, uint16_t*, uint16_t*,
+    const gemm_params_t*);
+void moe_sve_w13_silu_poly5_packc_m12_rows_recip1(
+    const uint16_t*, const uint16_t*, uint16_t*, uint16_t*,
+    const gemm_params_t*);
+void moe_sve_w13_silu_poly6_packc_m12_rows_recip1(
+    const uint16_t*, const uint16_t*, uint16_t*, uint16_t*,
+    const gemm_params_t*);
+void moe_sve_w13_silu_poly4_packc_m12_recip2(const uint16_t*, const uint16_t*,
+                                             uint16_t*, uint16_t*,
+                                             const gemm_params_t*);
+void moe_sve_w13_silu_poly5_packc_m12_recip2(const uint16_t*, const uint16_t*,
+                                             uint16_t*, uint16_t*,
+                                             const gemm_params_t*);
+void moe_sve_w13_silu_poly6_packc_m12_recip2(const uint16_t*, const uint16_t*,
+                                             uint16_t*, uint16_t*,
+                                             const gemm_params_t*);
+void moe_sve_w13_silu_poly4_packc_m12_rows_recip2(
+    const uint16_t*, const uint16_t*, uint16_t*, uint16_t*,
+    const gemm_params_t*);
+void moe_sve_w13_silu_poly5_packc_m12_rows_recip2(
+    const uint16_t*, const uint16_t*, uint16_t*, uint16_t*,
+    const gemm_params_t*);
+void moe_sve_w13_silu_poly6_packc_m12_rows_recip2(
+    const uint16_t*, const uint16_t*, uint16_t*, uint16_t*,
+    const gemm_params_t*);
+void moe_sve_w13_silu_minimax3_packc_m12(const uint16_t*, const uint16_t*,
+                                         uint16_t*, uint16_t*,
+                                         const gemm_params_t*);
+void moe_sve_w13_silu_minimax3_packc_m12_rows(const uint16_t*, const uint16_t*,
+                                              uint16_t*, uint16_t*,
+                                              const gemm_params_t*);
 void moe_sve_w13_silu_poly4_packc(const uint16_t*, const uint16_t*, uint16_t*,
                                   uint16_t*, const gemm_params_t*);
 void moe_sve_w13_silu_poly5_packc(const uint16_t*, const uint16_t*, uint16_t*,
@@ -144,6 +207,19 @@ void moe_sve_w13_silu_poly5_packc_m1(const uint16_t*, const uint16_t*, uint16_t*
                                      uint16_t*, const gemm_params_t*);
 void moe_sve_w13_silu_poly6_packc_m1(const uint16_t*, const uint16_t*, uint16_t*,
                                      uint16_t*, const gemm_params_t*);
+void moe_sve_w13_identity_packc_m12(const uint16_t*, const uint16_t*, uint16_t*,
+                                    uint16_t*, const gemm_params_t*);
+void moe_sve_w13_identity_packc_m12_rows(const uint16_t*, const uint16_t*,
+                                         uint16_t*, uint16_t*,
+                                         const gemm_params_t*);
+void moe_sve_w13_identity_packc(const uint16_t*, const uint16_t*, uint16_t*,
+                                uint16_t*, const gemm_params_t*);
+void moe_sve_w13_identity_packc_m4(const uint16_t*, const uint16_t*, uint16_t*,
+                                   uint16_t*, const gemm_params_t*);
+void moe_sve_w13_identity_packc_m2(const uint16_t*, const uint16_t*, uint16_t*,
+                                   uint16_t*, const gemm_params_t*);
+void moe_sve_w13_identity_packc_m1(const uint16_t*, const uint16_t*, uint16_t*,
+                                   uint16_t*, const gemm_params_t*);
 void moe_sve_w2_packed(const uint16_t*, const uint16_t*, float*, uint16_t*,
                        const gemm_params_t*);
 void moe_sve_w2_packed_m12(const uint16_t*, const uint16_t*, float*, uint16_t*,
@@ -154,6 +230,16 @@ void moe_sve_w2_packed_m2(const uint16_t*, const uint16_t*, float*, uint16_t*,
                           const gemm_params_t*);
 void moe_sve_w2_packed_m1(const uint16_t*, const uint16_t*, float*, uint16_t*,
                           const gemm_params_t*);
+void moe_sve_w2_packed_bf16(const uint16_t*, const uint16_t*, uint16_t*,
+                            uint16_t*, const gemm_params_t*);
+void moe_sve_w2_packed_bf16_m12(const uint16_t*, const uint16_t*, uint16_t*,
+                                uint16_t*, const gemm_params_t*);
+void moe_sve_w2_packed_bf16_m4(const uint16_t*, const uint16_t*, uint16_t*,
+                               uint16_t*, const gemm_params_t*);
+void moe_sve_w2_packed_bf16_m2(const uint16_t*, const uint16_t*, uint16_t*,
+                               uint16_t*, const gemm_params_t*);
+void moe_sve_w2_packed_bf16_m1(const uint16_t*, const uint16_t*, uint16_t*,
+                               uint16_t*, const gemm_params_t*);
 #endif
 // M-tail (m=1/2/4) fused silu kernels.
 void bf16gemm_k_ld_silu_poly4_m1(const uint16_t*, const uint16_t*, uint16_t*,
@@ -263,7 +349,7 @@ const uint16_t* bf16_data_const(const at::Tensor& tensor) {
         tensor.data_ptr<at::BFloat16>());
 }
 
-uint16_t bf16_bits_from_float(float value) {
+inline uint16_t bf16_bits_from_float(float value) {
     c10::BFloat16 bf(value);
     uint16_t bits = 0;
     static_assert(sizeof(bits) == sizeof(bf));
@@ -286,11 +372,52 @@ inline void convert_f32_to_bf16(const float* src, uint16_t* dst, int64_t n) {
     for (; i < n; ++i) dst[i] = bf16_bits_from_float(src[i]);
 }
 
-float bf16_bits_to_float(uint16_t bits) {
+inline float bf16_bits_to_float(uint16_t bits) {
     uint32_t widened = static_cast<uint32_t>(bits) << 16;
     float value = 0.0f;
     std::memcpy(&value, &widened, sizeof(value));
     return value;
+}
+
+inline void accumulate_weighted_bf16(float* acc, const uint16_t* src,
+                                     float weight, int64_t n) {
+    int64_t i = 0;
+#if defined(__aarch64__)
+    for (; i + 8 <= n; i += 8) {
+        const uint16x8_t packed = vld1q_u16(src + i);
+        const uint32x4_t lo_bits = vshlq_n_u32(
+            vmovl_u16(vget_low_u16(packed)), 16);
+        const uint32x4_t hi_bits = vshlq_n_u32(
+            vmovl_u16(vget_high_u16(packed)), 16);
+        const float32x4_t lo = vreinterpretq_f32_u32(lo_bits);
+        const float32x4_t hi = vreinterpretq_f32_u32(hi_bits);
+        vst1q_f32(acc + i,
+                  vfmaq_n_f32(vld1q_f32(acc + i), lo, weight));
+        vst1q_f32(acc + i + 4,
+                  vfmaq_n_f32(vld1q_f32(acc + i + 4), hi, weight));
+    }
+#endif
+    for (; i < n; ++i) {
+        acc[i] += bf16_bits_to_float(src[i]) * weight;
+    }
+}
+
+inline void accumulate_weighted_f32(float* acc, const float* src,
+                                    float weight, int64_t n) {
+    int64_t i = 0;
+#if defined(__aarch64__)
+    for (; i + 8 <= n; i += 8) {
+        vst1q_f32(
+            acc + i,
+            vfmaq_n_f32(vld1q_f32(acc + i), vld1q_f32(src + i), weight));
+        vst1q_f32(acc + i + 4,
+                  vfmaq_n_f32(vld1q_f32(acc + i + 4),
+                              vld1q_f32(src + i + 4), weight));
+    }
+#endif
+    for (; i < n; ++i) {
+        acc[i] += src[i] * weight;
+    }
 }
 
 enum class MoeGemmStage {
@@ -769,35 +896,124 @@ void packed_w2_tail_dispatch(const uint16_t* packed_A, const uint16_t* w2_packed
     }
 }
 
+#if defined(__ARM_FEATURE_SVE) && defined(__ARM_FEATURE_BF16)
 bool sve_w13_split_n_workset_enabled() {
     const char* value = std::getenv("FUSED_CPP_MOE_W13_SPLIT_N");
     return value != nullptr && value[0] != '\0' && value[0] != '0';
 }
 
-#if defined(__ARM_FEATURE_SVE) && defined(__ARM_FEATURE_BF16)
+bool sve_w13_skip_silu_enabled() {
+    const char* value = std::getenv("FUSED_CPP_MOE_W13_SKIP_SILU");
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
+
+bool sve_w2_bf16_route_enabled() {
+    const char* value = std::getenv("FUSED_CPP_MOE_W2_BF16_ROUTE");
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
+
+bool sve_w13_m12_epilogue_opt_enabled() {
+    const char* value = std::getenv("FUSED_CPP_MOE_SILU_M12_OPT");
+    if (value == nullptr || value[0] == '\0') {
+        return true;
+    }
+    return value[0] != '0';
+}
+
+int sve_w13_silu_recip_nr_steps() {
+    // Experimental M12 epilogue mode. M8/M4/M2/M1 tails retain exact FDIV.
+    const char* value = std::getenv("FUSED_CPP_MOE_SILU_RECIP_NR");
+    if (value == nullptr || value[0] == '\0') {
+        return 0;
+    }
+    if (value[0] == '1' && value[1] == '\0') {
+        return 1;
+    }
+    if (value[0] == '2' && value[1] == '\0') {
+        return 2;
+    }
+    return 0;
+}
+
+bool sve_w13_silu_minimax3_enabled() {
+    const char* value = std::getenv("FUSED_CPP_MOE_SILU_MINIMAX3");
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
+
 FusedSiluKernelSet sve_asm_fused_silu_packc_set_for_degree(int64_t degree) {
+    if (sve_w13_skip_silu_enabled()) {
+        return {moe_sve_w13_identity_packc,
+                moe_sve_w13_identity_packc_m4,
+                moe_sve_w13_identity_packc_m2,
+                moe_sve_w13_identity_packc_m1,
+                moe_sve_w13_identity_packc_m12,
+                moe_sve_w13_identity_packc_m12_rows};
+    }
+    const bool use_m12_opt = sve_w13_m12_epilogue_opt_enabled();
+    const bool use_minimax3 =
+        use_m12_opt && degree == 5 && sve_w13_silu_minimax3_enabled();
+    const int recip_nr_steps = sve_w13_silu_recip_nr_steps();
+    const auto select_m12 =
+        [use_m12_opt, recip_nr_steps](FusedSiluKernelFn legacy,
+                                     FusedSiluKernelFn exact,
+                                     FusedSiluKernelFn recip1,
+                                     FusedSiluKernelFn recip2) {
+            if (!use_m12_opt) {
+                return legacy;
+            }
+            if (recip_nr_steps == 1) {
+                return recip1;
+            }
+            if (recip_nr_steps == 2) {
+                return recip2;
+            }
+            return exact;
+        };
     switch (degree) {
         case 4:
             return {moe_sve_w13_silu_poly4_packc,
                     moe_sve_w13_silu_poly4_packc_m4,
                     moe_sve_w13_silu_poly4_packc_m2,
                     moe_sve_w13_silu_poly4_packc_m1,
-                    moe_sve_w13_silu_poly4_packc_m12,
-                    moe_sve_w13_silu_poly4_packc_m12_rows};
+                    select_m12(moe_sve_w13_silu_poly4_packc_m12,
+                               moe_sve_w13_silu_poly4_packc_m12_opt,
+                               moe_sve_w13_silu_poly4_packc_m12_recip1,
+                               moe_sve_w13_silu_poly4_packc_m12_recip2),
+                    select_m12(moe_sve_w13_silu_poly4_packc_m12_rows,
+                               moe_sve_w13_silu_poly4_packc_m12_rows_opt,
+                               moe_sve_w13_silu_poly4_packc_m12_rows_recip1,
+                               moe_sve_w13_silu_poly4_packc_m12_rows_recip2)};
         case 5:
             return {moe_sve_w13_silu_poly5_packc,
                     moe_sve_w13_silu_poly5_packc_m4,
                     moe_sve_w13_silu_poly5_packc_m2,
                     moe_sve_w13_silu_poly5_packc_m1,
-                    moe_sve_w13_silu_poly5_packc_m12,
-                    moe_sve_w13_silu_poly5_packc_m12_rows};
+                    use_minimax3
+                        ? moe_sve_w13_silu_minimax3_packc_m12
+                        : select_m12(moe_sve_w13_silu_poly5_packc_m12,
+                                     moe_sve_w13_silu_poly5_packc_m12_opt,
+                                     moe_sve_w13_silu_poly5_packc_m12_recip1,
+                                     moe_sve_w13_silu_poly5_packc_m12_recip2),
+                    use_minimax3
+                        ? moe_sve_w13_silu_minimax3_packc_m12_rows
+                        : select_m12(
+                              moe_sve_w13_silu_poly5_packc_m12_rows,
+                              moe_sve_w13_silu_poly5_packc_m12_rows_opt,
+                              moe_sve_w13_silu_poly5_packc_m12_rows_recip1,
+                              moe_sve_w13_silu_poly5_packc_m12_rows_recip2)};
         case 6:
             return {moe_sve_w13_silu_poly6_packc,
                     moe_sve_w13_silu_poly6_packc_m4,
                     moe_sve_w13_silu_poly6_packc_m2,
                     moe_sve_w13_silu_poly6_packc_m1,
-                    moe_sve_w13_silu_poly6_packc_m12,
-                    moe_sve_w13_silu_poly6_packc_m12_rows};
+                    select_m12(moe_sve_w13_silu_poly6_packc_m12,
+                               moe_sve_w13_silu_poly6_packc_m12_opt,
+                               moe_sve_w13_silu_poly6_packc_m12_recip1,
+                               moe_sve_w13_silu_poly6_packc_m12_recip2),
+                    select_m12(moe_sve_w13_silu_poly6_packc_m12_rows,
+                               moe_sve_w13_silu_poly6_packc_m12_rows_opt,
+                               moe_sve_w13_silu_poly6_packc_m12_rows_recip1,
+                               moe_sve_w13_silu_poly6_packc_m12_rows_recip2)};
         default:
             return {};
     }
@@ -943,6 +1159,73 @@ void sve_asm_packed_w2_hybrid_dispatch(const uint16_t* packed_A,
         return;
     }
     sve_asm_packed_w2_tail_dispatch(
+        packed_A + static_cast<int64_t>(main_rows) * K, w2_packed,
+        down + static_cast<int64_t>(main_rows) * ldc, tail, K, N, ldc);
+}
+
+using PlainPackedBf16KernelFn = void (*)(const uint16_t*, const uint16_t*,
+                                         uint16_t*, uint16_t*,
+                                         const gemm_params_t*);
+
+void sve_asm_packed_w2_bf16_tail_dispatch(
+    const uint16_t* packed_A, const uint16_t* w2_packed, uint16_t* down,
+    int rows, int K, int N, int ldc) {
+    gemm_params_t p;
+    p.k = K;
+    p.n = N;
+    p.lda = K;
+    p.ldb = K;
+    p.ldc = ldc;
+    const int nb_full = rows / 8;
+    for (int mb = 0; mb < nb_full; ++mb) {
+        p.m = 8;
+        moe_sve_w2_packed_bf16(
+            packed_A + static_cast<int64_t>(mb) * 8 * K, w2_packed,
+            down + static_cast<int64_t>(mb) * 8 * ldc, nullptr, &p);
+    }
+    const int tail = rows - nb_full * 8;
+    if (tail == 0) {
+        return;
+    }
+    const uint16_t* At = packed_A + static_cast<int64_t>(nb_full) * 8 * K;
+    uint16_t* Dt = down + static_cast<int64_t>(nb_full) * 8 * ldc;
+    auto run = [&](PlainPackedBf16KernelFn fn, int mr, int r0) {
+        p.m = mr;
+        fn(At + static_cast<int64_t>(r0) * 4, w2_packed,
+           Dt + static_cast<int64_t>(r0) * ldc, nullptr, &p);
+    };
+    switch (tail) {
+        case 1: run(moe_sve_w2_packed_bf16_m1, 1, 0); break;
+        case 2: run(moe_sve_w2_packed_bf16_m2, 2, 0); break;
+        case 3: run(moe_sve_w2_packed_bf16_m4, 4, 0); break;
+        case 4: run(moe_sve_w2_packed_bf16_m4, 4, 0); break;
+        case 5:
+        case 6:
+        case 7: run(moe_sve_w2_packed_bf16, 8, 0); break;
+    }
+}
+
+void sve_asm_packed_w2_bf16_hybrid_dispatch(
+    const uint16_t* packed_A, const uint16_t* w2_packed, uint16_t* down,
+    int rows, int K, int N, int ldc) {
+    gemm_params_t p;
+    p.m = 12;
+    p.k = K;
+    p.n = N;
+    p.lda = K;
+    p.ldb = K;
+    p.ldc = ldc;
+    const int main_rows = static_cast<int>(sve_m12_main_rows(rows));
+    for (int mb = 0; mb < main_rows; mb += 12) {
+        moe_sve_w2_packed_bf16_m12(
+            packed_A + static_cast<int64_t>(mb) * K, w2_packed,
+            down + static_cast<int64_t>(mb) * ldc, nullptr, &p);
+    }
+    const int tail = rows - main_rows;
+    if (tail <= 0) {
+        return;
+    }
+    sve_asm_packed_w2_bf16_tail_dispatch(
         packed_A + static_cast<int64_t>(main_rows) * K, w2_packed,
         down + static_cast<int64_t>(main_rows) * ldc, tail, K, N, ldc);
 }
@@ -2221,13 +2504,20 @@ void gather_pack_a_reorder_m8(const uint16_t* input, int64_t H,
 }
 
 int64_t sve_m12_main_rows(int64_t rows) {
-    return rows / 12 * 12;
+    const int64_t full_rows = rows / 12 * 12;
+    const int64_t tail_rows = rows - full_rows;
+    // M8 plus M1/M2/M4 would stream the entire B slice twice for a 9-11 row
+    // tail. Pad that final block to M12 so both W13 and W2 consume B once.
+    return tail_rows >= 9 ? full_rows + 12 : full_rows;
 }
 
 int64_t sve_hybrid_packed_rows(int64_t rows) {
     const int64_t main = sve_m12_main_rows(rows);
+    if (main >= rows) {
+        return main;
+    }
     const int64_t tail = rows - main;
-    return main + (tail == 0 ? 0 : ceil_to_multiple(tail, int64_t{8}));
+    return main + ceil_to_multiple(tail, int64_t{8});
 }
 
 void gather_pack_a_reorder_m12(const uint16_t* input, int64_t H,
@@ -2285,9 +2575,10 @@ void gather_pack_a_reorder_sve_hybrid(const uint16_t* input, int64_t H,
     const SplitRange m12_range =
         split_evenly(main_blocks, group_size, local_tid);
     gather_pack_a_reorder_m12(input, H, expert_routes, top_k, packed,
-                              static_cast<int>(main_rows), K_pad,
+                              total_rows, K_pad,
                               static_cast<int>(m12_range.begin),
-                              static_cast<int>(m12_range.begin + m12_range.size));
+                              static_cast<int>(m12_range.begin +
+                                               m12_range.size));
 
     const int64_t tail_rows = total_rows - main_rows;
     if (tail_rows <= 0) {
@@ -2418,9 +2709,6 @@ void team_fused_w13_silu_packed_packc_sve(const TeamContext& team,
     if (split_w13 && N13 % 2 == 0 &&
         half_n > 0 && half_n % n_tile == 0) {
         run_n_range(0, half_n);
-        if (team.barrier != nullptr) {
-            team.barrier->wait();
-        }
         run_n_range(half_n, N13 - half_n);
     } else {
         run_n_range(0, N13);
@@ -2474,9 +2762,6 @@ void team_fused_w13_silu_packed_packc_sve_2d(
     if (split_w13 && N13 % 2 == 0 &&
         half_n > 0 && half_n % plan.n_tile == 0) {
         run_n_range(0, half_n);
-        if (team.barrier != nullptr) {
-            team.barrier->wait();
-        }
         run_n_range(half_n, N13 - half_n);
     } else {
         run_n_range(0, N13);
@@ -2618,6 +2903,71 @@ void team_w2_packed_sve_2d(const TeamContext& team,
 #endif
 }
 
+void team_w2_packed_bf16_sve(const TeamContext& team,
+                             const uint16_t* packed_A,
+                             const uint16_t* w2_packed, uint16_t* down,
+                             int rows, int K, int N, int ldc,
+                             int64_t n_tile) {
+#if defined(__ARM_FEATURE_SVE) && defined(__ARM_FEATURE_BF16)
+    const SplitRange range = n_split_range_tile(
+        N, team.group_size, team.local_tid, n_tile);
+    if (range.size <= 0) {
+        return;
+    }
+    const int64_t start_block = range.begin / n_tile;
+    sve_asm_packed_w2_bf16_hybrid_dispatch(
+        packed_A,
+        w2_packed + start_block * static_cast<int64_t>(K) * n_tile,
+        down + range.begin, rows, K, static_cast<int>(range.size), ldc);
+#else
+    (void)team;
+    (void)packed_A;
+    (void)w2_packed;
+    (void)down;
+    (void)rows;
+    (void)K;
+    (void)N;
+    (void)ldc;
+    (void)n_tile;
+    TORCH_CHECK(false,
+                "SVE MoE asm bf16-output w2 kernel is unavailable in this build");
+#endif
+}
+
+void team_w2_packed_bf16_sve_2d(const TeamContext& team,
+                                const Gemm2DSplitPlan& plan,
+                                const uint16_t* packed_A,
+                                const uint16_t* w2_packed, uint16_t* down,
+                                int rows, int K, int N, int ldc) {
+#if defined(__ARM_FEATURE_SVE) && defined(__ARM_FEATURE_BF16)
+    const Gemm2DThreadRange range =
+        gemm_2d_thread_range(plan, rows, N, team.local_tid);
+    if (range.rows <= 0 || range.n_cols <= 0) {
+        return;
+    }
+    const int64_t start_block = range.n_begin / plan.n_tile;
+    TORCH_CHECK(range.row_begin == 0,
+                "SVE fused expert only supports N-split ranges");
+    sve_asm_packed_w2_bf16_hybrid_dispatch(
+        packed_A,
+        w2_packed + start_block * static_cast<int64_t>(K) * plan.n_tile,
+        down + range.n_begin, static_cast<int>(range.rows), K,
+        static_cast<int>(range.n_cols), ldc);
+#else
+    (void)team;
+    (void)plan;
+    (void)packed_A;
+    (void)w2_packed;
+    (void)down;
+    (void)rows;
+    (void)K;
+    (void)N;
+    (void)ldc;
+    TORCH_CHECK(false,
+                "SVE MoE asm bf16-output w2 kernel is unavailable in this build");
+#endif
+}
+
 void team_w2_rowmajor_sve(const TeamContext& team, const uint16_t* A,
                           const uint16_t* w2_packed, float* down, int rows,
                           int K, int N, int ldc, uint16_t* a_reorder,
@@ -2725,6 +3075,20 @@ void team_w2_packed_backend(bool use_sve_backend, bool use_2d_split,
                           ldc);
     } else {
         team_w2_packed(team, packed_A, w2_packed, down, rows, K, N, ldc);
+    }
+}
+
+void team_w2_packed_bf16_sve_backend(
+    bool use_2d_split, const TeamContext& team,
+    const Gemm2DSplitPlan& plan, const uint16_t* packed_A,
+    const uint16_t* w2_packed, uint16_t* down, int rows, int K, int N,
+    int ldc, int64_t n_tile) {
+    if (use_2d_split) {
+        team_w2_packed_bf16_sve_2d(team, plan, packed_A, w2_packed, down,
+                                   rows, K, N, ldc);
+    } else {
+        team_w2_packed_bf16_sve(team, packed_A, w2_packed, down, rows, K, N,
+                                ldc, n_tile);
     }
 }
 #endif  // __aarch64__
@@ -2918,6 +3282,9 @@ struct HierarchicalGroupScratch {
     std::vector<float> gate_up;
     std::vector<float, default_init_allocator<float, backend_allocator<float>>>
         down;
+    std::vector<uint16_t,
+                default_init_allocator<uint16_t, backend_allocator<uint16_t>>>
+        down_bf16;
     std::atomic<int64_t> current_expert{-1};
     ThreadBarrier barrier;
 };
@@ -3946,6 +4313,7 @@ struct ThreadScratch {
     std::vector<uint16_t> packed_a;
     std::vector<float> gate_up;
     std::vector<float> down;
+    std::vector<uint16_t> down_bf16;
 };
 
 struct ScheduledWaveRuntime {
@@ -3968,6 +4336,7 @@ struct ScheduledScratchUnitConfig {
     int64_t max_rows = 0;
     int64_t a_reorder_stride = 0;
     bool fused_packa = false;
+    bool w2_bf16_route = false;
 };
 
 struct ScheduledTeamScratch {
@@ -3983,6 +4352,7 @@ struct ScheduledTeamScratch {
     std::vector<uint16_t> packed_a;
     std::vector<float> gate_up;
     std::vector<float> down;
+    std::vector<uint16_t> down_bf16;
     ThreadBarrier barrier;
 };
 
@@ -4010,8 +4380,15 @@ void ensure_scheduled_scratch_capacity(ScheduledTeamScratch& scratch,
         config.fused_packa ? rows_padded * w13.K_pad : 0));
     scratch.gate_up.resize(static_cast<size_t>(
         config.fused_packa ? 0 : rows * w13.N_pad));
-    scratch.down.resize(static_cast<size_t>(
-        (config.fused_packa ? rows_padded : rows) * w2.N_pad));
+    const size_t down_elements = static_cast<size_t>(
+        (config.fused_packa ? rows_padded : rows) * w2.N_pad);
+    if (config.w2_bf16_route) {
+        if (scratch.down_bf16.size() < down_elements) {
+            scratch.down_bf16.resize(down_elements);
+        }
+    } else if (scratch.down.size() < down_elements) {
+        scratch.down.resize(down_elements);
+    }
 }
 
 class ScheduledScratchLease {
@@ -5194,14 +5571,6 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
         {num_tokens, H},
         at::TensorOptions().device(input.device()).dtype(at::kBFloat16));
     uint16_t* out_bf16_ptr = bf16_data(output);
-    at::Tensor route_out;
-    float* route_out_ptr = nullptr;
-    if (!skip_weighted) {
-        route_out = at::empty(
-            {num_routes, H},
-            at::TensorOptions().device(input.device()).dtype(at::kFloat));
-        route_out_ptr = route_out.data_ptr<float>();
-    }
     const uint16_t* input_ptr = bf16_data_const(input);
     const uint16_t* w13_ptr = bf16_data_const(w13.tensor);
     const uint16_t* w2_ptr = bf16_data_const(w2.tensor);
@@ -5259,6 +5628,25 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
     // have no bias (the packed-read w2 kernel has no bias variant). When w2 has
     // bias, only Part 1 applies and w2 falls back to the row-major repack path.
     const bool fused_packa_w2 = fused_packa && (w2_bias_base == nullptr);
+    bool use_w2_bf16_route = false;
+#if defined(__ARM_FEATURE_SVE) && defined(__ARM_FEATURE_BF16)
+    use_w2_bf16_route = !skip_weighted && use_sve_backend && fuse_silu &&
+        fused_packa_w2 && sve_w2_bf16_route_enabled();
+#endif
+    at::Tensor route_out;
+    float* route_out_ptr = nullptr;
+    uint16_t* route_out_bf16_ptr = nullptr;
+    if (!skip_weighted) {
+        route_out = at::empty(
+            {num_routes, H},
+            at::TensorOptions().device(input.device()).dtype(
+                use_w2_bf16_route ? at::kBFloat16 : at::kFloat));
+        if (use_w2_bf16_route) {
+            route_out_bf16_ptr = bf16_data(route_out);
+        } else {
+            route_out_ptr = route_out.data_ptr<float>();
+        }
+    }
     const bool fused_2d_split =
         env_flag_enabled("FUSED_CPP_MOE_FUSED_2D_SPLIT");
     const bool use_fused_2d_split =
@@ -5358,9 +5746,12 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
                 use_sve_backend ? max_fused_packa_rows * w13.K_pad : 0));
             scratch.gate_up.resize(static_cast<size_t>(
                 max_expert_rows * w13.N_pad));
-            scratch.down.resize(static_cast<size_t>(
+            const size_t down_elements = static_cast<size_t>(
                 (use_sve_backend ? max_fused_packa_rows : max_expert_rows) *
-                w2.N_pad));
+                w2.N_pad);
+            scratch.down.resize(use_w2_bf16_route ? 0 : down_elements);
+            scratch.down_bf16.resize(
+                use_w2_bf16_route ? down_elements : 0);
         }
 
         const auto schedule_compute_begin = ::fused_cpp::profile::now();
@@ -5470,13 +5861,24 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
                         team.local_tid = 0;
                         team.barrier = nullptr;
                         team.a_reorder = nullptr;
-                        team_w2_packed_sve(
-                            team, scratch.intermediate.data(),
-                            w2_ptr + task.expert * w2.packed_stride,
-                            scratch.down.data(), static_cast<int>(rows),
-                            static_cast<int>(w2.K_pad),
-                            static_cast<int>(w2.N_pad),
-                            static_cast<int>(w2.N_pad), w2.n_tile);
+                        if (use_w2_bf16_route) {
+                            team_w2_packed_bf16_sve(
+                                team, scratch.intermediate.data(),
+                                w2_ptr + task.expert * w2.packed_stride,
+                                scratch.down_bf16.data(),
+                                static_cast<int>(rows),
+                                static_cast<int>(w2.K_pad),
+                                static_cast<int>(w2.N_pad),
+                                static_cast<int>(w2.N_pad), w2.n_tile);
+                        } else {
+                            team_w2_packed_sve(
+                                team, scratch.intermediate.data(),
+                                w2_ptr + task.expert * w2.packed_stride,
+                                scratch.down.data(), static_cast<int>(rows),
+                                static_cast<int>(w2.K_pad),
+                                static_cast<int>(w2.N_pad),
+                                static_cast<int>(w2.N_pad), w2.n_tile);
+                        }
                     } else {
                         trace_dispatch_fp32_gemm(
                             moe_trace,
@@ -5505,16 +5907,21 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
                         const int64_t flat =
                             expert_routes[static_cast<size_t>(
                                 task.route_begin + m)];
-                        const float* src =
-                            scratch.down.data() + m * w2.N_pad;
-                        if (skip_weighted) {
+                        if (use_w2_bf16_route) {
+                            const uint16_t* src =
+                                scratch.down_bf16.data() + m * w2.N_pad;
+                            uint16_t* dst = route_out_bf16_ptr + flat * H;
+                            std::copy(src, src + H, dst);
+                        } else if (skip_weighted) {
+                            const float* src =
+                                scratch.down.data() + m * w2.N_pad;
                             uint16_t* dst = out_bf16_ptr + flat * H;
                             convert_f32_to_bf16(src, dst, H);
                         } else {
+                            const float* src =
+                                scratch.down.data() + m * w2.N_pad;
                             float* dst = route_out_ptr + flat * H;
-                            for (int64_t h = 0; h < H; ++h) {
-                                dst[h] = src[h];
-                            }
+                            std::copy(src, src + H, dst);
                         }
                     }
                 }
@@ -5678,9 +6085,13 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
                                 packa_skip_gate_up
                                     ? 0
                                     : max_expert_rows * w13.N_pad));
-            HierarchicalScratchPool::ensure(
-                sc.down,
-                static_cast<size_t>(max_fused_packa_rows * w2.N_pad));
+            const size_t down_need = static_cast<size_t>(
+                max_fused_packa_rows * w2.N_pad);
+            if (use_w2_bf16_route) {
+                HierarchicalScratchPool::ensure(sc.down_bf16, down_need);
+            } else {
+                HierarchicalScratchPool::ensure(sc.down, down_need);
+            }
         }
         std::vector<std::unique_ptr<HierarchicalGroupScratch>>&
             group_scratches = scratch_pool.groups;
@@ -5970,7 +6381,16 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
                         plan_2d_gemm_split(rows, w2.K_pad, w2.N_pad,
                                            nsplit_group_size, w2.n_tile);
                     time_phase(phase_w2_ms, [&] {
-                    if (use_sve_backend) {
+                    if (use_w2_bf16_route) {
+                        team_w2_packed_bf16_sve_backend(
+                            use_fused_2d_split, w2team, w2_2d_plan,
+                            scratch.intermediate.data(),
+                            w2_ptr + expert * w2.packed_stride,
+                            scratch.down_bf16.data(), static_cast<int>(rows),
+                            static_cast<int>(w2.K_pad),
+                            static_cast<int>(w2.N_pad),
+                            static_cast<int>(w2.N_pad), w2.n_tile);
+                    } else if (use_sve_backend) {
                         if (use_fused_2d_split) {
                             team_w2_packed_sve_2d(
                                 w2team, w2_2d_plan,
@@ -6077,17 +6497,24 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
                     for (int64_t m = 0; m < rows; ++m) {
                         const int64_t flat =
                             expert_routes[static_cast<size_t>(m)];
-                        const float* src =
-                            scratch.down.data() + m * w2.N_pad;
-                        if (skip_weighted) {
+                        if (use_w2_bf16_route) {
+                            const uint16_t* src =
+                                scratch.down_bf16.data() + m * w2.N_pad;
+                            uint16_t* dst = route_out_bf16_ptr + flat * H;
+                            std::copy(src + h_begin, src + h_end,
+                                      dst + h_begin);
+                        } else if (skip_weighted) {
+                            const float* src =
+                                scratch.down.data() + m * w2.N_pad;
                             uint16_t* dst = out_bf16_ptr + flat * H;
                             convert_f32_to_bf16(src + h_begin, dst + h_begin,
                                                 h_end - h_begin);
                         } else {
+                            const float* src =
+                                scratch.down.data() + m * w2.N_pad;
                             float* dst = route_out_ptr + flat * H;
-                            for (int64_t h = h_begin; h < h_end; ++h) {
-                                dst[h] = src[h];
-                            }
+                            std::copy(src + h_begin, src + h_end,
+                                      dst + h_begin);
                         }
                     }
                 }
@@ -6197,14 +6624,15 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
             for (int64_t slot = 0; slot < top_k; ++slot) {
                 const int64_t flat = token * top_k + slot;
                 const float weight = topk_w[flat];
-                const float* src = route_out_ptr + flat * H;
-                for (int64_t h = 0; h < H; ++h) {
-                    acc[static_cast<size_t>(h)] += src[h] * weight;
+                if (use_w2_bf16_route) {
+                    const uint16_t* src = route_out_bf16_ptr + flat * H;
+                    accumulate_weighted_bf16(acc.data(), src, weight, H);
+                } else {
+                    const float* src = route_out_ptr + flat * H;
+                    accumulate_weighted_f32(acc.data(), src, weight, H);
                 }
             }
-            for (int64_t h = 0; h < H; ++h) {
-                dst[h] = bf16_bits_from_float(acc[static_cast<size_t>(h)]);
-            }
+            convert_f32_to_bf16(acc.data(), dst, H);
         }
     };
     const auto merge_t0 = ::fused_cpp::profile::now();
@@ -6393,6 +6821,11 @@ at::Tensor fused_moe_bf16_tiled_scheduled(at::Tensor input,
         TORCH_CHECK(top_k == 1,
                     "skip_weighted is only valid when top_k == 1");
     }
+    bool use_w2_bf16_route = false;
+#if defined(__ARM_FEATURE_SVE) && defined(__ARM_FEATURE_BF16)
+    use_w2_bf16_route = !skip_weighted && use_sve_backend && fuse_silu &&
+        w2_bias_base == nullptr && sve_w2_bf16_route_enabled();
+#endif
     if (num_tokens == 0) {
         return at::empty_like(input);
     }
@@ -6558,7 +6991,8 @@ at::Tensor fused_moe_bf16_tiled_scheduled(at::Tensor input,
                 scratch_idx =
                     static_cast<int64_t>(scratch_unit_configs.size());
                 scratch_unit_configs.push_back(ScheduledScratchUnitConfig{
-                    thread_begin, team_threads, 0, 0, fuse_silu});
+                    thread_begin, team_threads, 0, 0, fuse_silu,
+                    use_w2_bf16_route});
             }
             ScheduledScratchUnitConfig& scratch_config =
                 scratch_unit_configs[static_cast<size_t>(scratch_idx)];
@@ -6572,6 +7006,8 @@ at::Tensor fused_moe_bf16_tiled_scheduled(at::Tensor input,
                                                        w13, w2));
             scratch_config.fused_packa =
                 scratch_config.fused_packa || fuse_silu;
+            scratch_config.w2_bf16_route =
+                scratch_config.w2_bf16_route || use_w2_bf16_route;
             team_scratch_indices[static_cast<size_t>(team)] = scratch_idx;
         }
         waves.push_back(ScheduledWaveRuntime{begin, end, wave_threads});
@@ -6585,11 +7021,17 @@ at::Tensor fused_moe_bf16_tiled_scheduled(at::Tensor input,
     uint16_t* out_bf16_ptr = bf16_data(output);
     at::Tensor route_out;
     float* route_out_ptr = nullptr;
+    uint16_t* route_out_bf16_ptr = nullptr;
     if (!skip_weighted) {
         route_out = at::empty(
             {num_routes, H},
-            at::TensorOptions().device(input.device()).dtype(at::kFloat));
-        route_out_ptr = route_out.data_ptr<float>();
+            at::TensorOptions().device(input.device()).dtype(
+                use_w2_bf16_route ? at::kBFloat16 : at::kFloat));
+        if (use_w2_bf16_route) {
+            route_out_bf16_ptr = bf16_data(route_out);
+        } else {
+            route_out_ptr = route_out.data_ptr<float>();
+        }
     }
     const uint16_t* input_ptr = bf16_data_const(input);
     const uint16_t* w13_ptr = bf16_data_const(w13.tensor);
@@ -6806,14 +7248,25 @@ at::Tensor fused_moe_bf16_tiled_scheduled(at::Tensor input,
                     w2team.a_reorder = nullptr;
                     const Gemm2DSplitPlan w2_2d_plan = plan_2d_gemm_split(
                         rows, w2.K_pad, w2.N_pad, group_size, w2.n_tile);
-                    team_w2_packed_backend(
-                        use_sve_backend, use_fused_2d_split, w2team,
-                        w2_2d_plan, scratch.intermediate.data(),
-                        w2_ptr + expert * w2.packed_stride,
-                        scratch.down.data(), static_cast<int>(rows),
-                        static_cast<int>(w2.K_pad),
-                        static_cast<int>(w2.N_pad),
-                        static_cast<int>(w2.N_pad), w2.n_tile);
+                    if (use_w2_bf16_route) {
+                        team_w2_packed_bf16_sve_backend(
+                            use_fused_2d_split, w2team, w2_2d_plan,
+                            scratch.intermediate.data(),
+                            w2_ptr + expert * w2.packed_stride,
+                            scratch.down_bf16.data(), static_cast<int>(rows),
+                            static_cast<int>(w2.K_pad),
+                            static_cast<int>(w2.N_pad),
+                            static_cast<int>(w2.N_pad), w2.n_tile);
+                    } else {
+                        team_w2_packed_backend(
+                            use_sve_backend, use_fused_2d_split, w2team,
+                            w2_2d_plan, scratch.intermediate.data(),
+                            w2_ptr + expert * w2.packed_stride,
+                            scratch.down.data(), static_cast<int>(rows),
+                            static_cast<int>(w2.K_pad),
+                            static_cast<int>(w2.N_pad),
+                            static_cast<int>(w2.N_pad), w2.n_tile);
+                    }
                     trace_phase_end(tid, wave_idx, selected_team, local_tid,
                                     expert, rows, "w2_packed",
                                     worker_phase_begin);
@@ -6854,17 +7307,24 @@ at::Tensor fused_moe_bf16_tiled_scheduled(at::Tensor input,
                     for (int64_t m = 0; m < rows; ++m) {
                         const int64_t flat =
                             expert_routes[static_cast<size_t>(m)];
-                        const float* src =
-                            scratch.down.data() + m * w2.N_pad;
-                        if (skip_weighted) {
+                        if (use_w2_bf16_route) {
+                            const uint16_t* src =
+                                scratch.down_bf16.data() + m * w2.N_pad;
+                            uint16_t* dst = route_out_bf16_ptr + flat * H;
+                            std::copy(src + h_begin, src + h_end,
+                                      dst + h_begin);
+                        } else if (skip_weighted) {
+                            const float* src =
+                                scratch.down.data() + m * w2.N_pad;
                             uint16_t* dst = out_bf16_ptr + flat * H;
                             convert_f32_to_bf16(src + h_begin, dst + h_begin,
                                                 h_end - h_begin);
                         } else {
+                            const float* src =
+                                scratch.down.data() + m * w2.N_pad;
                             float* dst = route_out_ptr + flat * H;
-                            for (int64_t h = h_begin; h < h_end; ++h) {
-                                dst[h] = src[h];
-                            }
+                            std::copy(src + h_begin, src + h_end,
+                                      dst + h_begin);
                         }
                     }
                 }
@@ -6898,14 +7358,15 @@ at::Tensor fused_moe_bf16_tiled_scheduled(at::Tensor input,
             for (int64_t slot = 0; slot < top_k; ++slot) {
                 const int64_t flat = token * top_k + slot;
                 const float weight = topk_w[flat];
-                const float* src = route_out_ptr + flat * H;
-                for (int64_t h = 0; h < H; ++h) {
-                    acc[static_cast<size_t>(h)] += src[h] * weight;
+                if (use_w2_bf16_route) {
+                    const uint16_t* src = route_out_bf16_ptr + flat * H;
+                    accumulate_weighted_bf16(acc.data(), src, weight, H);
+                } else {
+                    const float* src = route_out_ptr + flat * H;
+                    accumulate_weighted_f32(acc.data(), src, weight, H);
                 }
             }
-            for (int64_t h = 0; h < H; ++h) {
-                dst[h] = bf16_bits_from_float(acc[static_cast<size_t>(h)]);
-            }
+            convert_f32_to_bf16(acc.data(), dst, H);
         }
         trace_phase_end(tid, -1, -1, -1, -1,
                         std::max<int64_t>(0, token_end - token_begin),
@@ -7088,6 +7549,11 @@ at::Tensor fused_moe_bf16_tiled_async(at::Tensor input,
         TORCH_CHECK(top_k == 1,
                     "skip_weighted is only valid when top_k == 1");
     }
+    bool use_w2_bf16_route = false;
+#if defined(__ARM_FEATURE_SVE) && defined(__ARM_FEATURE_BF16)
+    use_w2_bf16_route = !skip_weighted && use_sve_backend && fuse_silu &&
+        w2_bias_base == nullptr && sve_w2_bf16_route_enabled();
+#endif
     if (num_tokens == 0) {
         return at::empty_like(input);
     }
@@ -7227,7 +7693,8 @@ at::Tensor fused_moe_bf16_tiled_async(at::Tensor input,
         if (scratch_idx < 0) {
             scratch_idx = static_cast<int64_t>(scratch_unit_configs.size());
             scratch_unit_configs.push_back(ScheduledScratchUnitConfig{
-                core_begin, threads, 0, 0, fuse_silu});
+                core_begin, threads, 0, 0, fuse_silu,
+                use_w2_bf16_route});
         }
         ScheduledScratchUnitConfig& scratch_config =
             scratch_unit_configs[static_cast<size_t>(scratch_idx)];
@@ -7237,6 +7704,8 @@ at::Tensor fused_moe_bf16_tiled_async(at::Tensor input,
             fuse_silu ? int64_t{0}
                       : scheduled_a_reorder_stride(rows, threads, w13, w2));
         scratch_config.fused_packa = scratch_config.fused_packa || fuse_silu;
+        scratch_config.w2_bf16_route =
+            scratch_config.w2_bf16_route || use_w2_bf16_route;
 
         tasks[static_cast<size_t>(task)] =
             AsyncTaskRuntime{expert, rows, core_begin, threads, scratch_idx};
@@ -7282,11 +7751,17 @@ at::Tensor fused_moe_bf16_tiled_async(at::Tensor input,
     uint16_t* out_bf16_ptr = bf16_data(output);
     at::Tensor route_out;
     float* route_out_ptr = nullptr;
+    uint16_t* route_out_bf16_ptr = nullptr;
     if (!skip_weighted) {
         route_out = at::empty(
             {num_routes, H},
-            at::TensorOptions().device(input.device()).dtype(at::kFloat));
-        route_out_ptr = route_out.data_ptr<float>();
+            at::TensorOptions().device(input.device()).dtype(
+                use_w2_bf16_route ? at::kBFloat16 : at::kFloat));
+        if (use_w2_bf16_route) {
+            route_out_bf16_ptr = bf16_data(route_out);
+        } else {
+            route_out_ptr = route_out.data_ptr<float>();
+        }
     }
     const uint16_t* input_ptr = bf16_data_const(input);
     const uint16_t* w13_ptr = bf16_data_const(w13.tensor);
@@ -7448,13 +7923,23 @@ at::Tensor fused_moe_bf16_tiled_async(at::Tensor input,
             w2team.a_reorder = nullptr;
             const Gemm2DSplitPlan w2_2d_plan = plan_2d_gemm_split(
                 rows, w2.K_pad, w2.N_pad, group_size, w2.n_tile);
-            team_w2_packed_backend(
-                use_sve_backend, use_fused_2d_split, w2team, w2_2d_plan,
-                scratch.intermediate.data(),
-                w2_ptr + expert * w2.packed_stride, scratch.down.data(),
-                static_cast<int>(rows), static_cast<int>(w2.K_pad),
-                static_cast<int>(w2.N_pad), static_cast<int>(w2.N_pad),
-                w2.n_tile);
+            if (use_w2_bf16_route) {
+                team_w2_packed_bf16_sve_backend(
+                    use_fused_2d_split, w2team, w2_2d_plan,
+                    scratch.intermediate.data(),
+                    w2_ptr + expert * w2.packed_stride,
+                    scratch.down_bf16.data(), static_cast<int>(rows),
+                    static_cast<int>(w2.K_pad), static_cast<int>(w2.N_pad),
+                    static_cast<int>(w2.N_pad), w2.n_tile);
+            } else {
+                team_w2_packed_backend(
+                    use_sve_backend, use_fused_2d_split, w2team, w2_2d_plan,
+                    scratch.intermediate.data(),
+                    w2_ptr + expert * w2.packed_stride, scratch.down.data(),
+                    static_cast<int>(rows), static_cast<int>(w2.K_pad),
+                    static_cast<int>(w2.N_pad), static_cast<int>(w2.N_pad),
+                    w2.n_tile);
+            }
             trace_phase_end(tid, task_id, local_tid, expert, rows,
                             "w2_packed", worker_phase_begin);
         } else {
@@ -7492,16 +7977,20 @@ at::Tensor fused_moe_bf16_tiled_async(at::Tensor input,
         if (h_begin < h_end) {
             for (int64_t m = 0; m < rows; ++m) {
                 const int64_t flat = expert_routes[static_cast<size_t>(m)];
-                const float* src = scratch.down.data() + m * w2.N_pad;
-                if (skip_weighted) {
+                if (use_w2_bf16_route) {
+                    const uint16_t* src =
+                        scratch.down_bf16.data() + m * w2.N_pad;
+                    uint16_t* dst = route_out_bf16_ptr + flat * H;
+                    std::copy(src + h_begin, src + h_end, dst + h_begin);
+                } else if (skip_weighted) {
+                    const float* src = scratch.down.data() + m * w2.N_pad;
                     uint16_t* dst = out_bf16_ptr + flat * H;
                     convert_f32_to_bf16(src + h_begin, dst + h_begin,
                                         h_end - h_begin);
                 } else {
+                    const float* src = scratch.down.data() + m * w2.N_pad;
                     float* dst = route_out_ptr + flat * H;
-                    for (int64_t h = h_begin; h < h_end; ++h) {
-                        dst[h] = src[h];
-                    }
+                    std::copy(src + h_begin, src + h_end, dst + h_begin);
                 }
             }
         }
@@ -7578,14 +8067,15 @@ at::Tensor fused_moe_bf16_tiled_async(at::Tensor input,
             for (int64_t slot = 0; slot < top_k; ++slot) {
                 const int64_t flat = token * top_k + slot;
                 const float weight = topk_w[flat];
-                const float* src = route_out_ptr + flat * H;
-                for (int64_t h = 0; h < H; ++h) {
-                    acc[static_cast<size_t>(h)] += src[h] * weight;
+                if (use_w2_bf16_route) {
+                    const uint16_t* src = route_out_bf16_ptr + flat * H;
+                    accumulate_weighted_bf16(acc.data(), src, weight, H);
+                } else {
+                    const float* src = route_out_ptr + flat * H;
+                    accumulate_weighted_f32(acc.data(), src, weight, H);
                 }
             }
-            for (int64_t h = 0; h < H; ++h) {
-                dst[h] = bf16_bits_from_float(acc[static_cast<size_t>(h)]);
-            }
+            convert_f32_to_bf16(acc.data(), dst, H);
         }
         trace_phase_end(tid, -1, -1, -1,
                         std::max<int64_t>(0, token_end - token_begin),
