@@ -22,7 +22,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 WORKER = Path(__file__).with_name("profile_contention_async.py")
 DEFAULT_ISOLATED_ROUTES = "1,2,4,8,12,24,48,96,192,384,768,1536,2040"
-DEFAULT_CONTENTION_ROUTES = "12,48,192,768,2040"
+DEFAULT_CONTENTION_ROUTES = "1,2,4,8,12,24,48,192,768,2040"
 DEFAULT_THREADS = "1,2,4,8,16,32"
 DEFAULT_SHAPES = (
     "32;16x2;16,8,8;16,8,4,4;16,4,4,4,4;8x4;"
