@@ -68,7 +68,28 @@ def load_histograms(path: Path | None, total_routes: int, experts: int) -> dict:
     if path is None:
         return histograms
     payload = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(payload, dict) and "histograms" in payload:
+        histograms = {}
+        for name, raw_values in payload["histograms"].items():
+            if not isinstance(raw_values, list) or len(raw_values) != experts:
+                raise ValueError(
+                    f"routing histogram {name!r} must contain {experts} counts"
+                )
+            values = [int(value) for value in raw_values]
+            if any(value < 0 for value in values):
+                raise ValueError(f"routing histogram {name!r} contains negatives")
+            histograms[str(name)] = values
+        if not histograms:
+            raise ValueError("histograms mapping must not be empty")
+        return histograms
     values = payload.get("histogram", payload) if isinstance(payload, dict) else payload
+    if isinstance(payload, dict) and "top_experts" in payload:
+        from workload_catalog import load_routing_workload
+
+        captured = load_routing_workload(path)
+        values = [0] * experts
+        for expert, routes in enumerate(captured.histogram):
+            values[expert % experts] += routes
     if not isinstance(values, list) or len(values) != experts:
         raise ValueError(f"routing histogram must contain {experts} counts")
     trace = [int(value) for value in values]
@@ -84,7 +105,7 @@ def select_models(profile_dir: Path, mode: str):
 
     ffn = 1024 if mode == "tp" else 2048
     local_experts = 64 if mode == "tp" else 32
-    catalog = ProfileCatalog.from_directory(profile_dir, "*_v2_r12_20260711.json")
+    catalog = ProfileCatalog.from_directory(profile_dir, "*_v2_r1_20260713.json")
     query = ProfileQuery(
         mode=mode,
         degree=2,
@@ -111,7 +132,25 @@ def tensor_i32(torch, values):
     return torch.tensor(values, dtype=torch.int32)
 
 
-def build_call(torch, packed, hidden, ids, weights, bridge, split_w13: bool):
+def parse_shape(value: str | None) -> tuple[int, ...] | None:
+    if value is None:
+        return None
+    shape = tuple(int(item) for item in value.split(",") if item.strip())
+    if not shape or any(width <= 0 for width in shape):
+        raise ValueError(f"invalid forced shape: {value!r}")
+    return shape
+
+
+def build_call(
+    torch,
+    packed,
+    hidden,
+    ids,
+    weights,
+    bridge,
+    split_w13: bool,
+    skip_weighted: bool,
+):
     from fused_cpp.moe import fused_moe_bf16_tiled_async
 
     schedule = (
@@ -133,7 +172,7 @@ def build_call(torch, packed, hidden, ids, weights, bridge, split_w13: bool):
             thread_cpu_ids=cpus,
             num_threads=int(bridge["num_threads"]),
             activation="silu",
-            skip_weighted=True,
+            skip_weighted=skip_weighted,
             w13_split=split_w13,
         )
 
@@ -182,7 +221,19 @@ def worker(args: argparse.Namespace) -> int:
     for case_name, global_counts in global_histograms.items():
         counts = local_histogram(global_counts, args.mode, args.rank)
         experts = [(expert, routes) for expert, routes in enumerate(counts) if routes]
-        selected = joint.plan(experts)
+        forced_shape = parse_shape(args.force_shape)
+        if forced_shape is None:
+            selected = joint.plan(experts)
+        else:
+            forced_split = bool(args.force_split)
+            forced_planner = planners[int(forced_split)]
+            predicted, tasks = forced_planner.score_shape(experts, forced_shape)
+            selected = {
+                "w13_split": forced_split,
+                "shape": forced_shape,
+                "makespan_ns": predicted,
+                "bridge": forced_planner.to_async_bridge(tasks),
+            }
         candidates: list[dict] = [
             {
                 "key": "planner",
@@ -192,21 +243,30 @@ def worker(args: argparse.Namespace) -> int:
                 "bridge": selected["bridge"],
             }
         ]
-        for planner in planners:
-            split = bool(planner.model.policy.w13_split)
-            for shape in planner.shapes:
-                predicted, tasks = planner.score_shape(experts, shape)
-                candidates.append(
-                    {
-                        "key": f"{'split' if split else 'nosplit'}:{','.join(map(str, shape))}",
-                        "split": split,
-                        "shape": tuple(shape),
-                        "predicted_ns": float(predicted),
-                        "bridge": planner.to_async_bridge(tasks),
-                    }
-                )
+        if args.noise_only:
+            candidates.append({**candidates[0], "key": "planner_clone"})
+        else:
+            for planner in planners:
+                split = bool(planner.model.policy.w13_split)
+                for shape in planner.shapes:
+                    predicted, tasks = planner.score_shape(experts, shape)
+                    candidates.append(
+                        {
+                            "key": f"{'split' if split else 'nosplit'}:{','.join(map(str, shape))}",
+                            "split": split,
+                            "shape": tuple(shape),
+                            "predicted_ns": float(predicted),
+                            "bridge": planner.to_async_bridge(tasks),
+                        }
+                    )
 
-        tokens = sum(counts)
+        total_routes = sum(counts)
+        if total_routes % args.top_k:
+            raise ValueError(
+                f"local routes {total_routes} are not divisible by "
+                f"top_k={args.top_k}"
+            )
+        tokens = total_routes // args.top_k
         hidden = torch.empty((tokens, 4096), dtype=torch.bfloat16).normal_(
             0.0, 0.01, generator=generator
         )
@@ -216,8 +276,10 @@ def worker(args: argparse.Namespace) -> int:
                 for expert, routes in enumerate(counts)
                 if routes
             ]
-        ).reshape(tokens, 1)
-        weights = torch.ones((tokens, 1), dtype=torch.float32)
+        ).reshape(tokens, args.top_k)
+        weights = torch.full(
+            (tokens, args.top_k), 1.0 / args.top_k, dtype=torch.float32
+        )
         calls = {
             candidate["key"]: build_call(
                 torch,
@@ -227,6 +289,7 @@ def worker(args: argparse.Namespace) -> int:
                 weights,
                 candidate["bridge"],
                 candidate["split"],
+                args.top_k == 1,
             )
             for candidate in candidates
         }
@@ -249,6 +312,17 @@ def worker(args: argparse.Namespace) -> int:
                 output = calls[candidate["key"]]()
                 _ = int(output.view(torch.int16)[0, 0])
                 samples[candidate["key"]].append(time.perf_counter_ns() - begin)
+
+        if args.stage_trace_file is not None:
+            os.environ["FUSED_CPP_MOE_TRACE"] = "1"
+            os.environ["FUSED_CPP_MOE_TRACE_FILE"] = str(args.stage_trace_file)
+            try:
+                sync(sock)
+                output = calls["planner"]()
+                _ = int(output.view(torch.int16)[0, 0])
+            finally:
+                os.environ.pop("FUSED_CPP_MOE_TRACE", None)
+                os.environ.pop("FUSED_CPP_MOE_TRACE_FILE", None)
 
         result["cases"][case_name] = {
             "histogram": counts,
@@ -277,7 +351,7 @@ def run_pair(args: argparse.Namespace, mode: str) -> dict:
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.bind(("127.0.0.1", 0))
     server.listen(2)
-    server.settimeout(1800.0)
+    server.settimeout(1.0)
     port = int(server.getsockname()[1])
     env = os.environ.copy()
     env.update(
@@ -288,6 +362,11 @@ def run_pair(args: argparse.Namespace, mode: str) -> dict:
             "PYTHONPATH": str(ROOT / "src"),
         }
     )
+    if args.stage_trace_dir is not None:
+        args.stage_trace_dir.mkdir(parents=True, exist_ok=True)
+        for rank in range(2):
+            trace_file = args.stage_trace_dir / f"{mode}_rank{rank}.log"
+            trace_file.unlink(missing_ok=True)
 
     with tempfile.TemporaryDirectory(prefix="moe-policy-validation-") as tmp:
         outputs = [Path(tmp) / f"rank{rank}.json" for rank in range(2)]
@@ -318,7 +397,19 @@ def run_pair(args: argparse.Namespace, mode: str) -> dict:
                     str(args.runs),
                     "--seed",
                     str(args.seed),
+                    "--top-k",
+                    str(args.top_k),
                 ]
+                if args.noise_only:
+                    command.append("--noise-only")
+                if args.force_shape is not None:
+                    command.extend(("--force-shape", args.force_shape))
+                    command.extend(("--force-split", str(args.force_split)))
+                if args.stage_trace_dir is not None:
+                    trace_file = (
+                        args.stage_trace_dir / f"{mode}_rank{rank}.log"
+                    )
+                    command.extend(("--stage-trace-file", str(trace_file)))
                 if args.routes_json is not None:
                     command.extend(("--routes-json", str(args.routes_json)))
                 processes.append(
@@ -332,15 +423,27 @@ def run_pair(args: argparse.Namespace, mode: str) -> dict:
                     )
                 )
             while len(connections) < 2:
-                connection, _ = server.accept()
+                for rank, process in enumerate(processes):
+                    if process.poll() is not None and rank not in connections:
+                        stdout, stderr = process.communicate()
+                        raise RuntimeError(
+                            f"{mode} rank{rank} failed before connecting:\n"
+                            f"{stdout}\n{stderr}"
+                        )
+                try:
+                    connection, _ = server.accept()
+                except TimeoutError:
+                    continue
                 connection.settimeout(1800.0)
                 rank = recv_exact(connection, 1)[0]
                 connections[rank] = connection
 
-            case_count = 2 + int(args.routes_json is not None)
+            case_count = len(load_histograms(args.routes_json, 12_288, 64))
             shape_count = len(models[0].supported_shapes)
-            candidate_count = 1 + 2 * shape_count
+            candidate_count = 2 if args.noise_only else 1 + 2 * shape_count
             barriers = case_count * candidate_count * (args.warmup + args.runs)
+            if args.stage_trace_dir is not None:
+                barriers += case_count
             for _ in range(barriers):
                 for rank in range(2):
                     if recv_exact(connections[rank], 1) != b"R":
@@ -376,19 +479,32 @@ def run_pair(args: argparse.Namespace, mode: str) -> dict:
                     entries[0]["samples_ns"], entries[1]["samples_ns"]
                 )
             ]
-            rows.append(
-                {
-                    "key": key,
-                    "rank_plans": [
-                        {"split": entry["split"], "shape": entry["shape"]}
-                        for entry in entries
-                    ],
-                    "predicted_ns": max(entry["predicted_ns"] for entry in entries),
-                    "median_ns": statistics.median(paired),
-                    "p10_ns": percentile(paired, 0.10),
-                    "p90_ns": percentile(paired, 0.90),
-                }
-            )
+            row = {
+                "key": key,
+                "rank_plans": [
+                    {"split": entry["split"], "shape": entry["shape"]}
+                    for entry in entries
+                ],
+                "predicted_ns": max(entry["predicted_ns"] for entry in entries),
+                "median_ns": statistics.median(paired),
+                "p10_ns": percentile(paired, 0.10),
+                "p90_ns": percentile(paired, 0.90),
+                "rank_median_ns": [
+                    statistics.median(entry["samples_ns"])
+                    for entry in entries
+                ],
+                "rank_p10_ns": [
+                    percentile(entry["samples_ns"], 0.10)
+                    for entry in entries
+                ],
+                "rank_p90_ns": [
+                    percentile(entry["samples_ns"], 0.90)
+                    for entry in entries
+                ],
+            }
+            if args.noise_only:
+                row["samples_ns"] = paired
+            rows.append(row)
         fixed = [row for row in rows if row["key"] != "planner"]
         best = min(fixed, key=lambda row: row["median_ns"])
         selected = next(row for row in rows if row["key"] == "planner")
@@ -444,6 +560,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--runs", type=int, default=10)
     parser.add_argument("--seed", type=int, default=20260711)
+    parser.add_argument("--top-k", type=int, default=1)
+    parser.add_argument("--force-shape")
+    parser.add_argument("--force-split", type=int, choices=(0, 1), default=1)
+    parser.add_argument(
+        "--noise-only",
+        action="store_true",
+        help="measure the selected schedule and an identical clone only",
+    )
+    parser.add_argument("--stage-trace-dir", type=Path)
+    parser.add_argument("--stage-trace-file", type=Path)
     parser.add_argument("--output", type=Path)
     return parser.parse_args()
 
@@ -462,6 +588,7 @@ def main() -> int:
         "schema_version": 1,
         "warmup": args.warmup,
         "runs": args.runs,
+        "top_k": args.top_k,
         "results": [],
     }
     for mode in modes:
