@@ -319,3 +319,178 @@ padding,memset 作安全兜底)。
 ## 单专家 e2e 累计
 - M=2048:fallback ~122 → packa 38 → 尾核 37 → 免清零 32 → THP 27.8 → **池 26.4ms**(4.6×)
 - M=4096:~241 → … → THP 55.6 → **池 52.6ms**(4.6×)
+
+
+---
+
+# SVE M12 SiLU: reciprocal refinement 替换 FDIV(2026-07-10)
+
+## 实现
+
+在 M12 fused SiLU epilogue 中保留三种可在同一二进制内切换的除法路径:
+
+- `FUSED_CPP_MOE_SILU_RECIP_NR=0`:精确 `fdiv`,默认。
+- `=1`:`r=frecpe(d); r*=frecps(d,r); y=num*r`。
+- `=2`:在 NR1 后再执行一次 `r*=frecps(d,r)`。
+
+只替换 M12 主路径;M8/M4/M2/M1 尾块继续使用精确 `fdiv`。测试固定使用
+split-W13、BF16 W2 route、poly5,并在 AWS 64-core 机器的 `0-31` 核运行。
+
+## 性能
+
+| 场景 | fdiv | NR1 | NR2 |
+|---|---:|---:|---:|
+| E8/topk6,8 expert × 4T | 18.8968ms | 19.0713ms(-0.92%) | 19.1583ms(-1.37%) |
+| E64 多轮,8 expert × 4T | 20.8551ms | 20.9492ms(-0.45%) | 21.1104ms(-1.21%) |
+| 单 expert,M=2048,1T | 87.2669ms | 88.0700ms(-0.91%) | 88.4186ms(-1.30%) |
+| 单 expert,M=2048,4T | 22.3294ms | 22.5331ms(-0.90%) | 22.6227ms(-1.30%) |
+
+E8 aggregate 为 `8.1823 / 8.1074 / 8.0706 TFLOP/s`。所有场景中 reciprocal
+都稳定慢于 `fdiv`,不是多专家争用或线程数造成的结果。
+
+## 精度(相对当前 fdiv)
+
+E8/topk6 最终输出:
+
+| 模式 | 不同元素 | 1 ULP 内 | rel-L2 |
+|---|---:|---:|---:|
+| NR1 | 1.0351% | 99.7152% | 0.03655% |
+| NR2 | 0.03251% | 99.9913% | 0.00603% |
+
+用 identity-W2 直接导出 SiLU BF16 intermediate,并覆盖 input/weight 多种尺度:
+
+- NR1:约 `0.025%-0.030%` 元素变化,全部在 1 ULP 内,rel-L2
+  `0.0078%-0.0096%`。
+- NR2:约 `0.0001%-0.0010%` 元素变化,全部在 1 ULP 内,rel-L2
+  `0.00048%-0.00194%`。
+
+normal/scheduled/async、poly4/5/6、rows `1..23` 均通过回归。
+
+## 结论
+
+当前优化后的 M12 epilogue 已把两个独立 `fdiv` 相邻发射,硬件能够重叠其延迟。
+NR1 将每次除法换成 4 条有依赖的浮点指令,NR2 换成 6 条,同时与 exp polynomial
+争用乘法/FMA 流水线。因此 reciprocal 虽然精度足够,但没有性能价值。默认继续
+使用 `fdiv`;reciprocal 仅保留为实验开关。下一项实验应通过更低阶的 minimax exp
+polynomial 减少 FMA 数量,而不是继续优化除法。
+
+
+# SVE hybrid tail 9-11: pad to M12 (2026-07-10)
+
+SVE hybrid row planning now rounds a final `9..11` rows up to one M12 block.
+The gather writes zero rows into the padded slots, and W13/W2 use the same M12
+layout; scatter still processes only the real route count. Tails `1..8` retain
+the existing M1/M2/M4/M8 dispatch.
+
+This avoids the previous `M8 + M1/M2/M4` decomposition, which streamed the
+complete B slice twice. The `rows=1..23` normal/scheduled/async regression is
+bit-exact across the FP32/BF16 W2 routes and all poly4/5/6 M12 epilogues.
+
+AWS `0-31`, single-thread streaming-distinct-expert measurements:
+
+| routes | 9 | 10 | 11 | 12 | 21 | 22 | 23 | 24 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| us/expert | 545.9 | 545.8 | 546.4 | 548.3 | 1086.0 | 1086.9 | 1087.6 | 1088.5 |
+
+The flat timing within each group confirms that `9..11` execute as one padded
+M12 block and `21..23` as two M12 blocks.
+
+
+---
+
+# SVE M12 SiLU:更换 exp polynomial(2026-07-10)
+
+## 候选
+
+当前默认 poly5 是 range reduction 后对 `exp(r)` 使用五阶 Taylor polynomial,
+其中 `r∈[-ln(2)/2,ln(2)/2]`。先测试已有 Taylor poly4(少 1 条 FMA),再增加三阶
+near-minimax 候选(少 2 条 FMA):
+
+```text
+p(r) = p0 + r * (p1 + r * (p2 + r * p3))
+p0 = 0.99992455695087079
+p1 = 0.99998492863187383
+p2 = 0.5050222842135581
+p3 = 0.16767011875167742
+```
+
+离线 dense sweep 的 `exp(r)` 最大相对误差:
+
+| polynomial | 最大相对误差 | 相对 poly5 的 FMA 数量 |
+|---|---:|---:|
+| Taylor poly5 | `3.24e-6` | 基线 |
+| Taylor poly4 | `5.57e-5` | -1 |
+| minimax3 | `9.97e-5` | -2 |
+
+minimax3 通过 `FUSED_CPP_MOE_SILU_MINIMAX3=1` 实验性启用,仅覆盖 degree=5 的
+M12 主块;尾块仍使用 poly5。默认关闭,range reduction 和精确 `fdiv` 均不变。
+
+## 性能(AWS 0-31 核)
+
+| 场景 | poly5 | Taylor poly4 | minimax3 | poly6 |
+|---|---:|---:|---:|---:|
+| E8/topk6,8 expert × 4T | 18.8829ms | 18.8294ms(+0.28%) | 18.8350ms(+0.25%) | 18.9122ms(-0.16%) |
+| 单 expert,M=2048,1T | 86.6725ms | 86.3956ms(+0.32%) | 86.3334ms(+0.39%) | 86.7421ms(-0.08%) |
+| E64 多轮,8 expert × 4T | 20.8974ms | 20.8251ms(+0.35%) | 20.7931ms(+0.50%) | 20.9299ms(-0.16%) |
+
+E64 使用 100 次交错 run;E8 使用 80 次,T1 使用 60 次。少 1-2 条 FMA 的实际
+e2e 上限只有约 `0.3%-0.5%`。
+
+## 精度(相对 poly5)
+
+E8/topk6 最终输出:
+
+| polynomial | 不同元素 | 1 ULP 内 | rel-L2 |
+|---|---:|---:|---:|
+| Taylor poly4 | 2.3095% | 99.3837% | 0.05350% |
+| minimax3 | 10.5798% | 97.0309% | 0.11885% |
+| poly6 | 0.1323% | 99.9654% | 0.01293% |
+
+identity-W2 直接观察 intermediate,覆盖 input/weight 多种尺度:
+
+- Taylor poly4:约 `0.053%-0.068%` 元素变化,全部在 1 ULP 内,rel-L2
+  `0.00064%-0.01945%`。
+- minimax3:约 `0.43%-0.44%` 元素变化,全部在 1 ULP 内,rel-L2
+  `0.00165%-0.03580%`。
+
+normal/scheduled/async 和 rows `1..23` 回归通过。尚未做模型级精度评估。
+
+## 结论
+
+polynomial 降阶有正收益,但绝对幅度很小。minimax3 相比 Taylor poly4 在 T1/E64
+只额外获得约 `0.07%-0.15%`,E8 中没有额外收益,同时最终输出误差约增至 2 倍。
+因此默认继续使用 poly5。若后续愿意用约 `0.05%` rel-L2 换取约 `0.3%` 性能,
+优先直接选择已有 Taylor poly4;minimax3 保留为实验模式,不建议直接设为默认。
+
+
+---
+
+# EP4 F=2048 parallel strategy (2026-07-10)
+
+Shape: W13 `K=4096,N=4096` (32 MiB/expert), W2 `K=2048,N=4096`
+(16 MiB/expert). Measurements use AWS cores `0-31`, 16 distinct expert
+weights, eight consecutive experts per timed call, `skip_weighted=True`, and
+30 interleaved runs per strategy. W13 split means two 16 MiB panels; W2 is not
+split.
+
+| strategy | active W13/W2 | M=1024 | M=1536 | M=2048 |
+|---|---:|---:|---:|---:|
+| 1x32, no split | 32/16 MiB | 46.230 ms / 8.919 T | 68.147 ms / 9.076 T | 90.718 ms / 9.090 T |
+| 1x32, split | 16/16 MiB | 46.636 ms / 8.841 T | 69.388 ms / 8.913 T | 93.136 ms / 8.854 T |
+| 2x16, no split | 64/32 MiB | 56.779 ms / 7.262 T | 79.867 ms / 7.744 T | 105.134 ms / 7.844 T |
+| **2x16, split** | **32/32 MiB** | **46.058 ms / 8.952 T** | **67.243 ms / 9.198 T** | **89.492 ms / 9.215 T** |
+| 4x8, no split | 128/64 MiB | 82.241 ms / 5.014 T | 118.532 ms / 5.218 T | 157.251 ms / 5.244 T |
+| 4x8, split | 64/64 MiB | 58.460 ms / 7.053 T | 83.086 ms / 7.444 T | 108.042 ms / 7.633 T |
+
+For two concurrent experts, splitting W13 improves the same `2x16` schedule by
+`23.3%/18.8%/17.5%` at M=`1024/1536/2048`. Compared with the best serial
+candidate (`1x32`, no split), however, `2x16` split is only `0.37%/1.35%/1.37%`
+faster: both strategies already hold their active weight set near the measured
+32 MiB optimum. `4x8` remains slower because even split W13 and unsplit W2 each
+create a 64 MiB active set.
+
+Planner implication: use `1x32` without W13 splitting when only one long expert
+is ready. With at least two independent long experts, `2x16` plus two-panel W13
+is the throughput choice; the gain is clear from roughly M=1536 onward and is
+effectively a tie at M=1024. Do not split W13 for `1x32`, and do not use `4x8`
+for uniform long routes on this 32-core partition.
