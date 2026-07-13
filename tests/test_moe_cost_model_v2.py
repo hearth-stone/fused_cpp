@@ -29,7 +29,7 @@ PROFILE_DIR = COST_MODEL / "profiles"
 
 
 def profile_paths() -> list[Path]:
-    return sorted(PROFILE_DIR.glob("*_v2_r12_20260711.json"))
+    return sorted(PROFILE_DIR.glob("*_v2_r1_20260713.json"))
 
 
 @pytest.fixture(scope="module")
