@@ -20,7 +20,9 @@ from profile_catalog import (  # noqa: E402
     ProfileCompatibilityError,
     ProfileQuery,
 )
+from simulate_schedules import PRESETS  # noqa: E402
 from tp_vs_ep_model import HierarchicalTopology, ParallelLayerEvaluator  # noqa: E402
+from workload_catalog import load_routing_workload  # noqa: E402
 
 
 PROFILE_DIR = COST_MODEL / "profiles"
@@ -166,6 +168,55 @@ def test_policy_aware_cache_and_richer_signature(catalog: ProfileCatalog) -> Non
     cached = planner.plan_spec_for(counts)
     assert cached["shape"] == spec["shape"]
     assert planner.last["cache_hit"] is True
+
+
+def test_real_routing_summary_offline_plan_and_cost_model(
+    catalog: ProfileCatalog,
+) -> None:
+    workload = load_routing_workload()
+    active = [routes for routes in workload.histogram if routes > 0]
+    assert workload.name == "dsv4-real-2048-seq70"
+    assert workload.tail_reconstructed
+    assert workload.routes == workload.tokens * workload.top_k == 12_288
+    assert len(workload.histogram) == workload.num_experts == 256
+    assert len(active) == workload.observed_active_experts == 223
+    assert (min(active), max(active)) == (1, 918)
+    mean = sum(active) / len(active)
+    reconstructed_std = math.sqrt(
+        sum((routes - mean) ** 2 for routes in active) / len(active)
+    )
+    assert reconstructed_std == pytest.approx(
+        workload.observed_routes_std,
+        abs=1e-4,
+    )
+    assert workload.histogram[71] == 918
+    assert workload.histogram[45] == 674
+    assert PRESETS[workload.name] == workload.experts
+
+    policy_planner = PolicyAwarePlanner(
+        models(catalog, "tp", 1024, 64),
+        32,
+    )
+    result = policy_planner.plan(workload.experts)
+    assert math.isfinite(result["makespan_ns"])
+    assert result["makespan_ns"] > 0
+    assert len(result["tasks"]) == workload.observed_active_experts
+    assert sum(task[1] for task in result["tasks"]) == workload.routes
+    assert len(result["bridge"]["task_expert_ids"]) == len(result["tasks"])
+    assert len(result["policy_ranking"]) == 2
+
+    selected = next(
+        planner
+        for planner in policy_planner.planners
+        if planner.model.policy is not None
+        and planner.model.policy.w13_split == result["w13_split"]
+    )
+    rescored_ns, rescored_tasks = selected.score_shape(
+        workload.experts,
+        result["shape"],
+    )
+    assert rescored_ns == pytest.approx(result["makespan_ns"])
+    assert rescored_tasks == result["tasks"]
 
 
 def test_tp_ep_evaluator_and_generic_p2_collectives(

@@ -125,10 +125,16 @@ T_plan(plan) + T_execute(plan)
 ```bash
 P=cpu_moe_schedule_optimization/cost_model/profiles/contention_async_aws_8c_sha46228bb_20260703.json
 python cpu_moe_schedule_optimization/planners/simulate_schedules.py $P --preset hotspot
+python cpu_moe_schedule_optimization/planners/simulate_schedules.py $P --preset dsv4-real-2048-seq70
 python cpu_moe_schedule_optimization/planners/simulate_schedules.py $P --experts 512,512,512,512 --shapes
 ```
 
 打分使用验证过的 `ContentionCostModel.dag_makespan`（事件驱动 + 争用 derate + overhead-split）。
+`dsv4-real-2048-seq70` 固化了 DeepSeek V4 Flash profiler 的
+`rank0/seq70/layer27` 路由摘要。捕获文件只保留 top-16 的精确计数，因此
+剩余 207 个 active experts 使用确定性的矩匹配长尾，使总量、min/max、mean/std
+与捕获摘要一致；长尾 expert ID 仍是合成值。该 preset 用于纯
+planner/cost-model 回归，不宣称恢复了原始完整 `topk_ids`。
 新增算法只需在 `simulate_schedules.py` 的 `ALGORITHMS` 注册表里加一个 `fn(experts, planner) -> (label, tasks)`。
 静态 planner 的选型见 `planners/interval_planner.py`；plan 开销 / 缓存命中率见 `planners/bench_planner_overhead.py`。
 

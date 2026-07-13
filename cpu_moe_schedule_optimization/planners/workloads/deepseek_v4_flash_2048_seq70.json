@@ -1,0 +1,59 @@
+{
+  "schema_version": 1,
+  "name": "dsv4-real-2048-seq70",
+  "kind": "captured_routing_summary",
+  "source": {
+    "capture": "deepseek_v4_flash_bf16/20260629-141213",
+    "analysis_file": "moe_routing_by_layer.csv + moe_routing_top_experts.csv",
+    "rank": 0,
+    "seq": 70,
+    "layer_id": 27
+  },
+  "tokens": 2048,
+  "hidden_size": 4096,
+  "top_k": 6,
+  "num_experts": 256,
+  "routes": 12288,
+  "active_experts": 223,
+  "routes_min": 1,
+  "routes_mean": 55.1031379699707,
+  "routes_max": 918,
+  "routes_std": 119.55164337158203,
+  "top_experts": [
+    {"expert": 71, "routes": 918},
+    {"expert": 45, "routes": 674},
+    {"expert": 50, "routes": 590},
+    {"expert": 134, "routes": 555},
+    {"expert": 35, "routes": 504},
+    {"expert": 118, "routes": 469},
+    {"expert": 178, "routes": 463},
+    {"expert": 120, "routes": 423},
+    {"expert": 164, "routes": 359},
+    {"expert": 91, "routes": 298},
+    {"expert": 233, "routes": 242},
+    {"expert": 121, "routes": 225},
+    {"expert": 238, "routes": 216},
+    {"expert": 112, "routes": 212},
+    {"expert": 255, "routes": 209},
+    {"expert": 8, "routes": 198}
+  ],
+  "tail_reconstruction": {
+    "strategy": "moment_matched_remaining_routes",
+    "expert_ids": "lowest ids not present in top_experts",
+    "route_count_buckets": [
+      {"routes": 1, "experts": 71},
+      {"routes": 6, "experts": 3},
+      {"routes": 10, "experts": 1},
+      {"routes": 13, "experts": 1},
+      {"routes": 17, "experts": 1},
+      {"routes": 26, "experts": 1},
+      {"routes": 27, "experts": 31},
+      {"routes": 28, "experts": 84},
+      {"routes": 30, "experts": 1},
+      {"routes": 39, "experts": 1},
+      {"routes": 153, "experts": 1},
+      {"routes": 197, "experts": 11}
+    ],
+    "note": "The capture retained exact counts for only the top 16 experts. These deterministic tail buckets match the captured active count, total, min, mean, max, and population standard deviation to recorded precision; tail expert ids remain synthetic."
+  }
+}

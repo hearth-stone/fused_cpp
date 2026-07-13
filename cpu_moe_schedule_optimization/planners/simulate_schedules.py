@@ -14,6 +14,7 @@ which is then scored by dag_makespan. Add your own by registering in ALGORITHMS.
 Usage:
   python simulate_schedules.py PROFILE.json --experts 512,512,512,512
   python simulate_schedules.py PROFILE.json --preset hotspot
+  python simulate_schedules.py PROFILE.json --preset dsv4-real-2048-seq70
   python simulate_schedules.py PROFILE.json --preset decode --cores 8 --shapes
 """
 from __future__ import annotations
@@ -23,6 +24,7 @@ from typing import Dict, List, Tuple
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "cost_model"))
 from phase_model import ContentionCostModel          # noqa: E402
 from interval_planner import IntervalPlanner, _partitions  # noqa: E402
+from workload_catalog import default_offline_workloads  # noqa: E402
 
 Experts = List[Tuple[int, int]]      # [(expert_id, routes), ...]
 Tasks = List[Tuple[int, int, int, int, List[int]]]
@@ -35,6 +37,12 @@ PRESETS: Dict[str, Experts] = {
     "decode-many-small":[(i, 8) for i in range(16)],
     "moe256-uniform":   [(i, 48) for i in range(256)],
 }
+PRESETS.update(
+    {
+        name: workload.experts
+        for name, workload in default_offline_workloads().items()
+    }
+)
 
 
 # ---- algorithms: (experts, planner) -> (label, tasks) ----------------------
