@@ -1,0 +1,833 @@
+{
+  "profile": "cpu_moe_schedule_optimization/cost_model/profiles/tiso_formula_amazon_ecs_8c_sve_F512_splitw13_20260714.json",
+  "calibration_routes": [
+    1,
+    2,
+    4,
+    8,
+    12,
+    24,
+    48,
+    192,
+    768,
+    2040
+  ],
+  "calibration_threads": [
+    1,
+    2,
+    4,
+    8
+  ],
+  "formula": {
+    "version": 3,
+    "kind": "separable_route_usl_calibrated",
+    "equation": "O(t) + C(R) * phi_usl(t) * k_phi(t)",
+    "o0": 92373.49598729314,
+    "o1": 110996.57729476664,
+    "alpha": 0.21267476420622347,
+    "beta": -0.01893525633800415,
+    "c_pts": [
+      [
+        1,
+        209531.92671794022
+      ],
+      [
+        2,
+        198605.92671794022
+      ],
+      [
+        4,
+        239296.92671794022
+      ],
+      [
+        8,
+        307422.92671794025
+      ],
+      [
+        12,
+        472909.92671794025
+      ],
+      [
+        24,
+        1121311.9267179403
+      ],
+      [
+        48,
+        2617821.9267179403
+      ],
+      [
+        192,
+        9795426.92671794
+      ],
+      [
+        768,
+        37278450.92671794
+      ],
+      [
+        2040,
+        98652039.92671794
+      ]
+    ],
+    "phi_pts": [
+      [
+        1,
+        1.0
+      ],
+      [
+        2,
+        0.6160765708991687
+      ],
+      [
+        4,
+        0.34553169285713997
+      ],
+      [
+        8,
+        0.17905566797752487
+      ]
+    ],
+    "thread_domain": [
+      1,
+      8
+    ]
+  },
+  "summary": {
+    "calibration": {
+      "count": 40,
+      "median_abs_error_pct": 0.0,
+      "p90_abs_error_pct": 2.8634178150846683,
+      "max_abs_error_pct": 9.75232614853403,
+      "median_signed_error_pct": 0.0
+    },
+    "holdout": {
+      "count": 36,
+      "median_abs_error_pct": 1.4023022370881322,
+      "p90_abs_error_pct": 5.311639030226855,
+      "max_abs_error_pct": 6.698604668332475,
+      "median_signed_error_pct": 0.6933598832565946
+    },
+    "holdout_by_thread": {
+      "1": {
+        "count": 9,
+        "median_abs_error_pct": 0.5018210814127899,
+        "p90_abs_error_pct": 2.723365288215014,
+        "max_abs_error_pct": 3.686147049731847,
+        "median_signed_error_pct": -0.350695269012713
+      },
+      "2": {
+        "count": 9,
+        "median_abs_error_pct": 1.1889158118434495,
+        "p90_abs_error_pct": 2.8506172684136777,
+        "max_abs_error_pct": 3.7652011891015524,
+        "median_signed_error_pct": 1.1805288282311865
+      },
+      "4": {
+        "count": 9,
+        "median_abs_error_pct": 1.8408748935133668,
+        "p90_abs_error_pct": 5.108308676732727,
+        "max_abs_error_pct": 5.586139148896785,
+        "median_signed_error_pct": 1.1157374778964613
+      },
+      "8": {
+        "count": 9,
+        "median_abs_error_pct": 2.0691896784344133,
+        "p90_abs_error_pct": 6.689310358613899,
+        "max_abs_error_pct": 6.698604668332475,
+        "median_signed_error_pct": 2.015448595233771
+      }
+    },
+    "sparse_table_holdout": {
+      "count": 36,
+      "median_abs_error_pct": 0.6294929516648673,
+      "p90_abs_error_pct": 2.841317610802818,
+      "max_abs_error_pct": 8.139754545776034,
+      "median_signed_error_pct": -0.2634635036322053
+    }
+  },
+  "rows": [
+    {
+      "routes": 1,
+      "threads": 1,
+      "kind": "calibration",
+      "measured_ns": 412902.0,
+      "predicted_ns": 412902.0,
+      "error_pct": 0.0,
+      "sparse_table_error_pct": 0.0
+    },
+    {
+      "routes": 1,
+      "threads": 2,
+      "kind": "calibration",
+      "measured_ns": 239062.0,
+      "predicted_ns": 239062.0,
+      "error_pct": 0.0,
+      "sparse_table_error_pct": 0.0
+    },
+    {
+      "routes": 1,
+      "threads": 4,
+      "kind": "calibration",
+      "measured_ns": 163025.0,
+      "predicted_ns": 163025.0,
+      "error_pct": 0.0,
+      "sparse_table_error_pct": 0.0
+    },
+    {
+      "routes": 1,
+      "threads": 8,
+      "kind": "calibration",
+      "measured_ns": 134890.0,
+      "predicted_ns": 134890.0,
+      "error_pct": 0.0,
+      "sparse_table_error_pct": 0.0
+    },
+    {
+      "routes": 2,
+      "threads": 1,
+      "kind": "calibration",
+      "measured_ns": 401976.0,
+      "predicted_ns": 401976.0,
+      "error_pct": 0.0,
+      "sparse_table_error_pct": 0.0
+    },
+    {
+      "routes": 2,
+      "threads": 2,
+      "kind": "calibration",
+      "measured_ns": 250023.0,
+      "predicted_ns": 250023.0,
+      "error_pct": 0.0,
+      "sparse_table_error_pct": 0.0
+    },
+    {
+      "routes": 2,
+      "threads": 4,
+      "kind": "calibration",
+      "measured_ns": 170993.0,
+      "predicted_ns": 170993.0,
+      "error_pct": 0.0,
+      "sparse_table_error_pct": 0.0
+    },
+    {
+      "routes": 2,
+      "threads": 8,
+      "kind": "calibration",
+      "measured_ns": 133355.0,
+      "predicted_ns": 133355.0,
+      "error_pct": 0.0,
+      "sparse_table_error_pct": 0.0
+    },
+    {
+      "routes": 4,
+      "threads": 1,
+      "kind": "calibration",
+      "measured_ns": 442667.0,
+      "predicted_ns": 442667.0,
+      "error_pct": 0.0,
+      "sparse_table_error_pct": 0.0
+    },
+    {
+      "routes": 4,
+      "threads": 2,
+      "kind": "calibration",
+      "measured_ns": 283749.0,
+      "predicted_ns": 283749.0,
+      "error_pct": 0.0,
+      "sparse_table_error_pct": 0.0
+    },
+    {
+      "routes": 4,
+      "threads": 4,
+      "kind": "calibration",
+      "measured_ns": 181949.0,
+      "predicted_ns": 181949.0,
+      "error_pct": 0.0,
+      "sparse_table_error_pct": 0.0
+    },
+    {
+      "routes": 4,
+      "threads": 8,
+      "kind": "calibration",
+      "measured_ns": 139849.0,
+      "predicted_ns": 139849.0,
+      "error_pct": 0.0,
+      "sparse_table_error_pct": 0.0
+    },
+    {
+      "routes": 8,
+      "threads": 1,
+      "kind": "calibration",
+      "measured_ns": 510793.0,
+      "predicted_ns": 510793.0,
+      "error_pct": 0.0,
+      "sparse_table_error_pct": 0.0
+    },
+    {
+      "routes": 8,
+      "threads": 2,
+      "kind": "calibration",
+      "measured_ns": 344026.0,
+      "predicted_ns": 344026.0,
+      "error_pct": 0.0,
+      "sparse_table_error_pct": 0.0
+    },
+    {
+      "routes": 8,
+      "threads": 4,
+      "kind": "calibration",
+      "measured_ns": 225938.0,
+      "predicted_ns": 225938.0,
+      "error_pct": 0.0,
+      "sparse_table_error_pct": 0.0
+    },
+    {
+      "routes": 8,
+      "threads": 8,
+      "kind": "calibration",
+      "measured_ns": 154927.0,
+      "predicted_ns": 154927.0,
+      "error_pct": 0.0,
+      "sparse_table_error_pct": 0.0
+    },
+    {
+      "routes": 12,
+      "threads": 1,
+      "kind": "calibration",
+      "measured_ns": 676280.0,
+      "predicted_ns": 676280.0,
+      "error_pct": 0.0,
+      "sparse_table_error_pct": 0.0
+    },
+    {
+      "routes": 12,
+      "threads": 2,
+      "kind": "calibration",
+      "measured_ns": 446642.0,
+      "predicted_ns": 446642.0,
+      "error_pct": 0.0,
+      "sparse_table_error_pct": 0.0
+    },
+    {
+      "routes": 12,
+      "threads": 4,
+      "kind": "calibration",
+      "measured_ns": 291547.0,
+      "predicted_ns": 291547.0,
+      "error_pct": 0.0,
+      "sparse_table_error_pct": 0.0
+    },
+    {
+      "routes": 12,
+      "threads": 8,
+      "kind": "calibration",
+      "measured_ns": 207567.0,
+      "predicted_ns": 207567.0,
+      "error_pct": 0.0,
+      "sparse_table_error_pct": 0.0
+    },
+    {
+      "routes": 24,
+      "threads": 1,
+      "kind": "calibration",
+      "measured_ns": 1324682.0,
+      "predicted_ns": 1324682.0,
+      "error_pct": 0.0,
+      "sparse_table_error_pct": 0.0
+    },
+    {
+      "routes": 24,
+      "threads": 2,
+      "kind": "calibration",
+      "measured_ns": 847594.0,
+      "predicted_ns": 847594.0,
+      "error_pct": 0.0,
+      "sparse_table_error_pct": 0.0
+    },
+    {
+      "routes": 24,
+      "threads": 4,
+      "kind": "calibration",
+      "measured_ns": 518864.0,
+      "predicted_ns": 518864.0,
+      "error_pct": 0.0,
+      "sparse_table_error_pct": 0.0
+    },
+    {
+      "routes": 24,
+      "threads": 8,
+      "kind": "calibration",
+      "measured_ns": 327369.0,
+      "predicted_ns": 327369.0,
+      "error_pct": 0.0,
+      "sparse_table_error_pct": 0.0
+    },
+    {
+      "routes": 36,
+      "threads": 1,
+      "kind": "holdout",
+      "measured_ns": 1999242.0,
+      "predicted_ns": 2072937.0,
+      "error_pct": 3.686147049731847,
+      "sparse_table_error_pct": 3.686147049731847
+    },
+    {
+      "routes": 36,
+      "threads": 2,
+      "kind": "holdout",
+      "measured_ns": 1270060.0,
+      "predicted_ns": 1299668.1659135625,
+      "error_pct": 2.331241509343074,
+      "sparse_table_error_pct": -1.5617372407602748
+    },
+    {
+      "routes": 36,
+      "threads": 4,
+      "kind": "holdout",
+      "measured_ns": 730506.0,
+      "predicted_ns": 766117.2654095553,
+      "error_pct": 4.874876511562576,
+      "sparse_table_error_pct": -0.5841156677700132
+    },
+    {
+      "routes": 36,
+      "threads": 8,
+      "kind": "holdout",
+      "measured_ns": 432292.0,
+      "predicted_ns": 441004.623041308,
+      "error_pct": 2.015448595233771,
+      "sparse_table_error_pct": 0.11334931018849304
+    },
+    {
+      "routes": 48,
+      "threads": 1,
+      "kind": "calibration",
+      "measured_ns": 2821192.0,
+      "predicted_ns": 2821192.0,
+      "error_pct": 0.0,
+      "sparse_table_error_pct": 0.0
+    },
+    {
+      "routes": 48,
+      "threads": 2,
+      "kind": "calibration",
+      "measured_ns": 1652856.0,
+      "predicted_ns": 1760650.54047172,
+      "error_pct": 6.521713958851838,
+      "sparse_table_error_pct": 0.0
+    },
+    {
+      "routes": 48,
+      "threads": 4,
+      "kind": "calibration",
+      "measured_ns": 933614.0,
+      "predicted_ns": 1024663.0822483745,
+      "error_pct": 9.75232614853403,
+      "sparse_table_error_pct": 0.0
+    },
+    {
+      "routes": 48,
+      "threads": 8,
+      "kind": "calibration",
+      "measured_ns": 538195.0,
+      "predicted_ns": 574983.9218838309,
+      "error_pct": 6.835611977783307,
+      "sparse_table_error_pct": 0.0
+    },
+    {
+      "routes": 72,
+      "threads": 1,
+      "kind": "holdout",
+      "measured_ns": 4106220.0,
+      "predicted_ns": 4017459.5,
+      "error_pct": -2.161610921967161,
+      "sparse_table_error_pct": -2.161610921967161
+    },
+    {
+      "routes": 72,
+      "threads": 2,
+      "kind": "holdout",
+      "measured_ns": 2407014.0,
+      "predicted_ns": 2497642.919749841,
+      "error_pct": 3.7652011891015524,
+      "sparse_table_error_pct": -1.080391167922845
+    },
+    {
+      "routes": 72,
+      "threads": 4,
+      "kind": "holdout",
+      "measured_ns": 1361932.0,
+      "predicted_ns": 1438011.416633353,
+      "error_pct": 5.586139148896785,
+      "sparse_table_error_pct": 1.0838891613776047
+    },
+    {
+      "routes": 72,
+      "threads": 8,
+      "kind": "holdout",
+      "measured_ns": 747617.0,
+      "predicted_ns": 789182.3981761346,
+      "error_pct": 5.559718168010441,
+      "sparse_table_error_pct": -0.36337679141413837
+    },
+    {
+      "routes": 96,
+      "threads": 1,
+      "kind": "holdout",
+      "measured_ns": 5346462.0,
+      "predicted_ns": 5213727.000000001,
+      "error_pct": -2.4826698478358056,
+      "sparse_table_error_pct": -2.4826698478358167
+    },
+    {
+      "routes": 96,
+      "threads": 2,
+      "kind": "holdout",
+      "measured_ns": 3151991.0,
+      "predicted_ns": 3234635.2990279626,
+      "error_pct": 2.621971288241709,
+      "sparse_table_error_pct": -1.358802526191638
+    },
+    {
+      "routes": 96,
+      "threads": 4,
+      "kind": "holdout",
+      "measured_ns": 1763387.0,
+      "predicted_ns": 1851359.751018332,
+      "error_pct": 4.988851058691712,
+      "sparse_table_error_pct": 3.1976342496948584
+    },
+    {
+      "routes": 96,
+      "threads": 8,
+      "kind": "holdout",
+      "measured_ns": 940388.0,
+      "predicted_ns": 1003380.8744684384,
+      "error_pct": 6.698604668332475,
+      "sparse_table_error_pct": 1.192876415550459
+    },
+    {
+      "routes": 144,
+      "threads": 1,
+      "kind": "holdout",
+      "measured_ns": 7689842.0,
+      "predicted_ns": 7606262.000000001,
+      "error_pct": -1.0868883912049099,
+      "sparse_table_error_pct": -1.086888391204921
+    },
+    {
+      "routes": 144,
+      "threads": 2,
+      "kind": "holdout",
+      "measured_ns": 4653682.0,
+      "predicted_ns": 4708620.057584206,
+      "error_pct": 1.1805288282311865,
+      "sparse_table_error_pct": -1.8955886256660004
+    },
+    {
+      "routes": 144,
+      "threads": 4,
+      "kind": "holdout",
+      "measured_ns": 2575577.0,
+      "predicted_ns": 2678056.41978829,
+      "error_pct": 3.9788917119655043,
+      "sparse_table_error_pct": 5.0612477644167875
+    },
+    {
+      "routes": 144,
+      "threads": 8,
+      "kind": "holdout",
+      "measured_ns": 1362773.0,
+      "predicted_ns": 1431777.8270530459,
+      "error_pct": 5.06355989244327,
+      "sparse_table_error_pct": 0.16461533456662014
+    },
+    {
+      "routes": 192,
+      "threads": 1,
+      "kind": "calibration",
+      "measured_ns": 9998797.0,
+      "predicted_ns": 9998797.0,
+      "error_pct": 0.0,
+      "sparse_table_error_pct": 0.0
+    },
+    {
+      "routes": 192,
+      "threads": 2,
+      "kind": "calibration",
+      "measured_ns": 6021773.0,
+      "predicted_ns": 6182604.816140448,
+      "error_pct": 2.67083824216634,
+      "sparse_table_error_pct": 0.0
+    },
+    {
+      "routes": 192,
+      "threads": 4,
+      "kind": "calibration",
+      "measured_ns": 3592093.0,
+      "predicted_ns": 3504753.0885582464,
+      "error_pct": -2.431449058856594,
+      "sparse_table_error_pct": 0.0
+    },
+    {
+      "routes": 192,
+      "threads": 8,
+      "kind": "calibration",
+      "measured_ns": 1778427.0,
+      "predicted_ns": 1860174.7796376534,
+      "error_pct": 4.596633971349595,
+      "sparse_table_error_pct": 0.0
+    },
+    {
+      "routes": 288,
+      "threads": 1,
+      "kind": "holdout",
+      "measured_ns": 14652832.0,
+      "predicted_ns": 14579301.0,
+      "error_pct": -0.5018210814127899,
+      "sparse_table_error_pct": -0.5018210814127899
+    },
+    {
+      "routes": 288,
+      "threads": 2,
+      "kind": "holdout",
+      "measured_ns": 8882866.0,
+      "predicted_ns": 9004546.013450373,
+      "error_pct": 1.369828312735688,
+      "sparse_table_error_pct": -0.13899230270950635
+    },
+    {
+      "routes": 288,
+      "threads": 4,
+      "kind": "holdout",
+      "measured_ns": 5031326.0,
+      "predicted_ns": 5087462.389817148,
+      "error_pct": 1.1157374778964613,
+      "sparse_table_error_pct": 2.485000971910778
+    },
+    {
+      "routes": 288,
+      "threads": 8,
+      "kind": "holdout",
+      "measured_ns": 2626003.0,
+      "predicted_ns": 2680339.983031378,
+      "error_pct": 2.0691896784344133,
+      "sparse_table_error_pct": -0.5249867066666192
+    },
+    {
+      "routes": 384,
+      "threads": 1,
+      "kind": "holdout",
+      "measured_ns": 19227234.0,
+      "predicted_ns": 19159804.999999996,
+      "error_pct": -0.350695269012713,
+      "sparse_table_error_pct": -0.35069526901269077
+    },
+    {
+      "routes": 384,
+      "threads": 2,
+      "kind": "holdout",
+      "measured_ns": 11968786.0,
+      "predicted_ns": 11826487.210760295,
+      "error_pct": -1.1889158118434495,
+      "sparse_table_error_pct": -2.084756131490695
+    },
+    {
+      "routes": 384,
+      "threads": 4,
+      "kind": "holdout",
+      "measured_ns": 6795264.0,
+      "predicted_ns": 6670171.691076048,
+      "error_pct": -1.8408748935133668,
+      "sparse_table_error_pct": -1.098529799578063
+    },
+    {
+      "routes": 384,
+      "threads": 8,
+      "kind": "holdout",
+      "measured_ns": 3751358.0,
+      "predicted_ns": 3500505.186425102,
+      "error_pct": -6.686986781184256,
+      "sparse_table_error_pct": -8.139754545776034
+    },
+    {
+      "routes": 576,
+      "threads": 1,
+      "kind": "holdout",
+      "measured_ns": 28376636.0,
+      "predicted_ns": 28320812.999999996,
+      "error_pct": -0.19672169738513823,
+      "sparse_table_error_pct": -0.19672169738512713
+    },
+    {
+      "routes": 576,
+      "threads": 2,
+      "kind": "holdout",
+      "measured_ns": 17366583.0,
+      "predicted_ns": 17470369.605380148,
+      "error_pct": 0.5976224878558201,
+      "sparse_table_error_pct": 0.28892269711318086
+    },
+    {
+      "routes": 576,
+      "threads": 4,
+      "kind": "holdout",
+      "measured_ns": 9758033.0,
+      "predicted_ns": 9835590.29359385,
+      "error_pct": 0.794804584016573,
+      "sparse_table_error_pct": 0.9336512799249519
+    },
+    {
+      "routes": 576,
+      "threads": 8,
+      "kind": "holdout",
+      "measured_ns": 5100587.0,
+      "predicted_ns": 5140835.593212551,
+      "error_pct": 0.7890972786573691,
+      "sparse_table_error_pct": 0.2548595550538435
+    },
+    {
+      "routes": 768,
+      "threads": 1,
+      "kind": "calibration",
+      "measured_ns": 37481821.0,
+      "predicted_ns": 37481821.0,
+      "error_pct": 0.0,
+      "sparse_table_error_pct": 0.0
+    },
+    {
+      "routes": 768,
+      "threads": 2,
+      "kind": "calibration",
+      "measured_ns": 23114252.0,
+      "predicted_ns": 23114252.0,
+      "error_pct": 0.0,
+      "sparse_table_error_pct": 0.0
+    },
+    {
+      "routes": 768,
+      "threads": 4,
+      "kind": "calibration",
+      "measured_ns": 12977662.0,
+      "predicted_ns": 13001008.89611165,
+      "error_pct": 0.17990063319301974,
+      "sparse_table_error_pct": 0.0
+    },
+    {
+      "routes": 768,
+      "threads": 8,
+      "kind": "calibration",
+      "measured_ns": 6781166.0,
+      "predicted_ns": 6781166.0,
+      "error_pct": 0.0,
+      "sparse_table_error_pct": 0.0
+    },
+    {
+      "routes": 1020,
+      "threads": 1,
+      "kind": "holdout",
+      "measured_ns": 49640016.0,
+      "predicted_ns": 49640739.5754717,
+      "error_pct": 0.001457645524727269,
+      "sparse_table_error_pct": 0.001457645524727269
+    },
+    {
+      "routes": 1020,
+      "threads": 2,
+      "kind": "holdout",
+      "measured_ns": 30852254.0,
+      "predicted_ns": 30605076.86181881,
+      "error_pct": -0.8011639544429738,
+      "sparse_table_error_pct": -0.6748702355597214
+    },
+    {
+      "routes": 1020,
+      "threads": 4,
+      "kind": "holdout",
+      "measured_ns": 17182702.0,
+      "predicted_ns": 17202300.61480651,
+      "error_pct": 0.11406014494408367,
+      "sparse_table_error_pct": 0.005104244779507994
+    },
+    {
+      "routes": 1020,
+      "threads": 8,
+      "kind": "holdout",
+      "measured_ns": 9007141.0,
+      "predicted_ns": 8958289.287415419,
+      "error_pct": -0.5423664688337992,
+      "sparse_table_error_pct": 0.005345234744158489
+    },
+    {
+      "routes": 1536,
+      "threads": 1,
+      "kind": "holdout",
+      "measured_ns": 74631848.0,
+      "predicted_ns": 74537572.8490566,
+      "error_pct": -0.12632026871879365,
+      "sparse_table_error_pct": -0.12632026871879365
+    },
+    {
+      "routes": 1536,
+      "threads": 2,
+      "kind": "holdout",
+      "measured_ns": 46300737.0,
+      "predicted_ns": 45943432.531257324,
+      "error_pct": -0.7717036312892334,
+      "sparse_table_error_pct": -0.5152307651375532
+    },
+    {
+      "routes": 1536,
+      "threads": 4,
+      "kind": "holdout",
+      "measured_ns": 25797072.0,
+      "predicted_ns": 25804945.562610272,
+      "error_pct": 0.03052114833137498,
+      "sparse_table_error_pct": -0.0053381807812336035
+    },
+    {
+      "routes": 1536,
+      "threads": 8,
+      "kind": "holdout",
+      "measured_ns": 13611503.0,
+      "predicted_ns": 13416208.39974223,
+      "error_pct": -1.4347761614405763,
+      "sparse_table_error_pct": -0.3302053098792834
+    },
+    {
+      "routes": 2040,
+      "threads": 1,
+      "kind": "calibration",
+      "measured_ns": 98855410.0,
+      "predicted_ns": 98855410.0,
+      "error_pct": 0.0,
+      "sparse_table_error_pct": 0.0
+    },
+    {
+      "routes": 2040,
+      "threads": 2,
+      "kind": "calibration",
+      "measured_ns": 61121760.0,
+      "predicted_ns": 60925082.25489494,
+      "error_pct": -0.3217802385027113,
+      "sparse_table_error_pct": 0.0
+    },
+    {
+      "routes": 2040,
+      "threads": 4,
+      "kind": "calibration",
+      "measured_ns": 34207529.0,
+      "predicted_ns": 34207529.0,
+      "error_pct": 0.0,
+      "sparse_table_error_pct": 0.0
+    },
+    {
+      "routes": 2040,
+      "threads": 8,
+      "kind": "calibration",
+      "measured_ns": 18019470.0,
+      "predicted_ns": 17770454.974573072,
+      "error_pct": -1.3819220289327472,
+      "sparse_table_error_pct": 0.0
+    }
+  ]
+}
