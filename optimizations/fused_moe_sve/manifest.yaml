@@ -1,0 +1,145 @@
+operator: fused_moe_sve
+
+baseline:
+  id: sve_static_nsplit
+  implementation: csrc/fused_moe_bf16_tiled.cpp
+  entrypoint: team_fused_w13_silu_packed_packc_sve
+  status: reference
+
+features:
+  - id: compute.m_epoch
+    part: compute
+    status: experimental
+    implementation: optimizations/fused_moe_sve/features/elastic_nsplit.cpp
+    hypothesis: >-
+      Calling the existing M12 SVE kernels on row epochs of at least 204 rows
+      costs less than 3 percent versus one full-M call while exposing bounded
+      points at which an expert can change its N-split width.
+    depends_on: []
+    conflicts_with: []
+    correctness: make -C optimizations/fused_moe_sve/benchmarks check
+    benchmark: >-
+      numactl --cpunodebind=0 --membind=0 taskset -c 0-95
+      optimizations/fused_moe_sve/benchmarks/bench_elastic_nsplit
+      --stage w13 --m 2040 --k 4096 --n 4096 --threads 96
+      --epoch-rows 204 --warmup 3 --iters 9 --copies 4
+
+  - id: intermediate.overwrite_elision
+    part: intermediate
+    status: enabled
+    implementation: csrc/fused_moe_bf16_tiled.cpp
+    hypothesis: >-
+      The fused SVE W13 kernels overwrite every packed-intermediate element
+      consumed by the matching W2 tail kernel, so removing the full-buffer zero
+      and its team barrier preserves bitwise output and reduces short-expert
+      latency.
+    depends_on: []
+    conflicts_with: []
+    correctness: >-
+      pytest -q tests/test_fused_moe_bf16_tiled.py
+      -k expert_barrier_elision_reuses_dirty_scratch
+    benchmark: >-
+      numactl --cpunodebind=0 --membind=0 taskset -c 0-95
+      .venv/bin/python
+      optimizations/fused_moe_sve/benchmarks/bench_expert_barriers.py
+      --warmup 4 --runs 17 --sample-ms 10
+
+  - id: scatter.w2_n_owner
+    part: scatter
+    status: enabled
+    implementation: csrc/fused_moe_bf16_tiled.cpp
+    hypothesis: >-
+      Assigning scatter the exact n_tile-aligned range produced by the same W2
+      worker removes the W2-to-scatter team barrier without cross-thread reads
+      and reduces short-expert latency.
+    depends_on: []
+    conflicts_with: []
+    correctness: >-
+      pytest -q tests/test_fused_moe_bf16_tiled.py
+      -k expert_barrier_elision_reuses_dirty_scratch
+    benchmark: >-
+      numactl --cpunodebind=0 --membind=0 taskset -c 0-95
+      .venv/bin/python
+      optimizations/fused_moe_sve/benchmarks/bench_expert_barriers.py
+      --warmup 4 --runs 17 --sample-ms 10
+
+  - id: dispatch.elastic_n_lanes
+    part: dispatch
+    status: experimental
+    implementation: optimizations/fused_moe_sve/features/elastic_nsplit.cpp
+    hypothesis: >-
+      Dynamically claiming one contiguous N lane for each constant-width M
+      phase, with a barrier only where the lane count changes, adds less than
+      5 percent overhead over the epoch-only variant and preserves the A-panel
+      traffic model proportional to participating lanes.
+    depends_on:
+      - compute.m_epoch
+    conflicts_with: []
+    correctness: make -C optimizations/fused_moe_sve/benchmarks check
+    benchmark: >-
+      numactl --cpunodebind=0 --membind=0 taskset -c 0-95
+      optimizations/fused_moe_sve/benchmarks/bench_elastic_nsplit
+      --stage w13 --m 2040 --k 4096 --n 4096 --threads 96
+      --epoch-rows 204 --warmup 3 --iters 9 --copies 4
+
+variants:
+  - id: sve_static_nsplit
+    features: []
+    entrypoint: elastic::Executor::run_static
+    status: reference
+
+  - id: sve_epoch_fixed_nsplit
+    features:
+      - compute.m_epoch
+    entrypoint: elastic::Executor::run_epoch_fixed
+    status: experimental
+
+  - id: sve_epoch_claim_nsplit
+    features:
+      - compute.m_epoch
+      - dispatch.elastic_n_lanes
+    entrypoint: elastic::Executor::run_phase_claim
+    status: experimental
+
+  - id: sve_strict_epoch_claim_nsplit
+    features:
+      - compute.m_epoch
+      - dispatch.elastic_n_lanes
+    entrypoint: elastic::Executor::run_epoch_claim
+    status: benchmark_reference
+
+  - id: sve_fused_expert_barrier_baseline
+    features: []
+    entrypoint: >-
+      FUSED_CPP_MOE_SVE_ELIDE_INTERMEDIATE_ZERO=0
+      FUSED_CPP_MOE_SVE_W2_N_OWNER_SCATTER=0
+      fused_moe_bf16_tiled_{scheduled,async}
+    status: reference
+
+  - id: sve_fused_expert_no_intermediate_zero
+    features:
+      - intermediate.overwrite_elision
+    entrypoint: >-
+      FUSED_CPP_MOE_SVE_ELIDE_INTERMEDIATE_ZERO=1
+      FUSED_CPP_MOE_SVE_W2_N_OWNER_SCATTER=0
+      fused_moe_bf16_tiled_{scheduled,async}
+    status: candidate
+
+  - id: sve_fused_expert_owner_scatter
+    features:
+      - scatter.w2_n_owner
+    entrypoint: >-
+      FUSED_CPP_MOE_SVE_ELIDE_INTERMEDIATE_ZERO=0
+      FUSED_CPP_MOE_SVE_W2_N_OWNER_SCATTER=1
+      fused_moe_bf16_tiled_{scheduled,async}
+    status: candidate
+
+  - id: sve_fused_expert_barrier_elision
+    features:
+      - intermediate.overwrite_elision
+      - scatter.w2_n_owner
+    entrypoint: >-
+      FUSED_CPP_MOE_SVE_ELIDE_INTERMEDIATE_ZERO=1
+      FUSED_CPP_MOE_SVE_W2_N_OWNER_SCATTER=1
+      fused_moe_bf16_tiled_{scheduled,async}
+    status: enabled
