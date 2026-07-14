@@ -32,6 +32,10 @@ from fused_cpp.moe import (  # noqa: E402
     fused_moe_bf16_tiled_async,
     prepare_fused_moe_bf16_tiled_weights,
 )
+try:
+    from iso_formula import fit_from_measurements  # noqa: E402
+except ImportError:  # pragma: no cover - package-style import
+    from .iso_formula import fit_from_measurements  # type: ignore[no-redef]
 
 
 DEFAULT_ISOLATED_ROUTES = "1,2,4,8,12,24,48,96,192,384,768,1536,2040"
@@ -618,6 +622,10 @@ def main() -> int:
     w2_packed_bytes = packed.w2[0].numel() * packed.w2[0].element_size()
     split_chunks = args.w13_split_chunks if args.w13_split else 1
     llc_bytes = args.llc_bytes or detect_llc_bytes(cpu_ids[0])
+    iso_formula = fit_from_measurements(
+        (entry["routes"], entry["threads"], entry["median_ns"])
+        for entry in isolated
+    )
     payload = {
         "schema_version": 2,
         "kind": "contention_derate",
@@ -697,6 +705,7 @@ def main() -> int:
         "thread_buckets": thread_buckets,
         "contention_shapes": shapes,
         "isolated": isolated,
+        "iso_formula": iso_formula.to_dict(),
         "entries": entries,
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)

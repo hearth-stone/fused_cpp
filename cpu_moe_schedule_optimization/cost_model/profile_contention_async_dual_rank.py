@@ -18,6 +18,11 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+try:
+    from iso_formula import fit_from_measurements
+except ImportError:  # pragma: no cover - package-style import
+    from .iso_formula import fit_from_measurements  # type: ignore[no-redef]
+
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKER = Path(__file__).with_name("profile_contention_async.py")
@@ -265,6 +270,10 @@ def merge_profiles(paths: list[Path], output: Path) -> dict:
     merged["measurement"]["profile_scope"] = "concurrent_rank_pair"
     merged["measurement"]["generated_at_utc"] = datetime.now(timezone.utc).isoformat()
     merged["isolated"] = isolated
+    merged["iso_formula"] = fit_from_measurements(
+        (entry["routes"], entry["threads"], entry["median_ns"])
+        for entry in isolated
+    ).to_dict()
     merged["entries"] = entries
     validate_profile(merged)
     output.parent.mkdir(parents=True, exist_ok=True)

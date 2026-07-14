@@ -13,6 +13,7 @@ PLANNERS = ROOT / "cpu_moe_schedule_optimization" / "planners"
 sys.path[:0] = [str(COST_MODEL), str(PLANNERS)]
 
 from interval_planner import PolicyAwarePlanner  # noqa: E402
+from iso_formula import IsoFormula, fit_from_measurements  # noqa: E402
 from phase_model import ContentionCostModel  # noqa: E402
 from planned_moe import PlannedMoE, signature  # noqa: E402
 from profile_catalog import (  # noqa: E402
@@ -55,6 +56,66 @@ def models(catalog: ProfileCatalog, mode: str, ffn: int, local_experts: int):
     )
     no_split, split = catalog.split_pair(query)
     return ContentionCostModel(no_split.path), ContentionCostModel(split.path)
+
+
+def test_iso_formula_recovers_separable_measurements() -> None:
+    alpha, beta = 0.03, 0.001
+    thread_points = [
+        (
+            team,
+            (1.0 + alpha * (team - 1) + beta * team * (team - 1)) / team,
+        )
+        for team in (1, 2, 4, 8)
+    ]
+    truth = IsoFormula(
+        100.0,
+        300.0,
+        alpha,
+        beta,
+        [(route, 10.0 * route) for route in (1, 2, 4, 8, 12, 48, 256, 512)],
+        thread_points,
+    )
+    points = [
+        (route, team, truth.T_iso(route, team))
+        for route in (1, 2, 4, 8, 12, 48, 256, 512)
+        for team in (1, 2, 4, 8)
+    ]
+    fitted = fit_from_measurements(points, phi_route_min=256)
+
+    assert fitted.o0 == pytest.approx(truth.o0)
+    assert fitted.o1 == pytest.approx(truth.o1)
+    assert fitted.alpha == pytest.approx(truth.alpha)
+    assert fitted.beta == pytest.approx(truth.beta)
+    assert fitted.T_iso(96, 4) == pytest.approx(truth.T_iso(96, 4))
+    assert IsoFormula.from_dict(fitted.to_dict()).T_iso(96, 4) == pytest.approx(
+        truth.T_iso(96, 4)
+    )
+    with pytest.raises(ValueError, match="outside calibrated domain"):
+        fitted.T_iso(96, 16)
+
+
+def test_schema_v2_uses_formula_with_table_fallback(catalog: ProfileCatalog) -> None:
+    record = catalog.select(
+        ProfileQuery(
+            mode="tp",
+            degree=2,
+            hidden_size=4096,
+            intermediate_size=1024,
+            local_experts=64,
+            w13_split=True,
+        )
+    )
+    default = ContentionCostModel(record.path)
+    formula = ContentionCostModel(record.path, iso_mode="formula")
+    table = ContentionCostModel(record.path, iso_mode="table")
+
+    assert default.iso_mode == "table"
+    assert formula.iso_mode == "formula"
+    assert formula.iso_formula is not None
+    assert table.iso_mode == "table"
+    assert table.iso_formula is None
+    assert formula.T_iso(24, 8) == table.T_iso(24, 8)
+    assert formula.T_iso(192, 8) != pytest.approx(table.T_iso(192, 8))
 
 
 def test_catalog_requires_exact_policy(catalog: ProfileCatalog) -> None:

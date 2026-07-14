@@ -17,12 +17,14 @@ from bisect import bisect_left
 from pathlib import Path
 
 try:
+    from iso_formula import IsoFormula, fit_from_measurements
     from profile_catalog import (
         ProfileCompatibilityError,
         ProfilePolicy,
         ProfileQuery,
     )
 except ImportError:  # pragma: no cover - package-style import
+    from .iso_formula import IsoFormula, fit_from_measurements
     from .profile_catalog import (
         ProfileCompatibilityError,
         ProfilePolicy,
@@ -39,11 +41,13 @@ class ContentionCostModel:
         *,
         expected_policy: ProfileQuery | None = None,
         use_stage_model: bool | None = None,
+        iso_mode: str | None = None,
     ):
         self.profile_path = Path(derate_profile_path)
         prof = json.loads(self.profile_path.read_text(encoding="utf-8"))
         self.profile = prof
         self.schema_version = int(prof.get("schema_version", 1))
+        formula_payload = prof.get("iso_formula")
         self.policy = (
             ProfilePolicy.from_payload(prof) if self.schema_version >= 2 else None
         )
@@ -76,6 +80,18 @@ class ContentionCostModel:
         self.use_shape_derate = bool(use_shape_derate)
         self.use_stage_model = bool(use_stage_model)
 
+        if iso_mode is None:
+            iso_mode = os.environ.get("FUSED_CPP_COST_MODEL_ISO_MODE")
+        if iso_mode is None:
+            # Existing profiles remain table-backed. A serialized formula is
+            # the profile's explicit opt-in marker for the compact model.
+            iso_mode = "formula" if formula_payload is not None else "table"
+        if iso_mode not in {"formula", "table"}:
+            raise ValueError(
+                f"iso_mode must be 'formula' or 'table', got {iso_mode!r}"
+            )
+        self.iso_mode = iso_mode
+
         self._iso = {
             (int(entry["routes"]), int(entry["threads"])): float(
                 entry["median_ns"]
@@ -86,6 +102,16 @@ class ContentionCostModel:
             threads: sorted(routes for routes, t in self._iso if t == threads)
             for threads in sorted({threads for _, threads in self._iso})
         }
+        self.iso_formula: IsoFormula | None = None
+        if self.iso_mode == "formula":
+            self.iso_formula = (
+                IsoFormula.from_dict(formula_payload)
+                if formula_payload is not None
+                else fit_from_measurements(
+                    (route, team, value)
+                    for (route, team), value in self._iso.items()
+                )
+            )
 
         d2: dict[int, dict[int, list[float]]] = {}
         d3: dict[int, dict[int, dict[int, list[float]]]] = {}
@@ -168,12 +194,15 @@ class ContentionCostModel:
 
         self._O: dict[int, float] = {}
         for threads in self._iso_routes:
-            points = sorted(
-                (routes, value)
-                for (routes, team), value in self._iso.items()
-                if team == threads and routes <= 64
-            )
-            self._O[threads] = self._linear_intercept(points)
+            if self.iso_formula is not None:
+                self._O[threads] = self.iso_formula.O(threads)
+            else:
+                points = sorted(
+                    (routes, value)
+                    for (routes, team), value in self._iso.items()
+                    if team == threads and routes <= 64
+                )
+                self._O[threads] = self._linear_intercept(points)
 
         measurement = prof.get("measurement", {})
         self.call_setup_ns = float(measurement.get("call_setup_ns", 0.0))
@@ -298,6 +327,10 @@ class ContentionCostModel:
         threads = int(threads)
         if routes <= 0:
             return 0.0
+        if threads not in self._iso_routes:
+            raise KeyError(f"no isolated calibration for threads={threads}")
+        if self.iso_formula is not None:
+            return self._formula_iso(routes, threads)
         if (routes, threads) in self._iso:
             return self._iso[(routes, threads)]
         if self.schema_version < 2:
@@ -313,6 +346,33 @@ class ContentionCostModel:
             return base
         tail_time = self._raw_iso_interp(tail, threads)
         return overhead + max(base - overhead, 0.0) + max(tail_time - overhead, 0.0)
+
+    def _formula_iso(self, routes: int, threads: int) -> float:
+        assert self.iso_formula is not None
+        if self.schema_version < 2:
+            return self.iso_formula.T_iso(routes, threads)
+
+        blocks, remainder = divmod(routes, 12)
+        tail = self.m12_tail_capacity(remainder)
+        overhead = self.iso_formula.O(threads)
+        if blocks == 0:
+            return self._raw_iso_interp(tail, threads)
+        # M1/M2/M4/M8 and the first two M12 panels have materially different
+        # startup/thread efficiency from steady-state M12 bulk.  Keep this
+        # bounded measured tail residual and use the formula for the scalable
+        # bulk region.
+        if blocks <= 2:
+            bulk = self._raw_iso_interp(blocks * 12, threads)
+        else:
+            bulk = self.iso_formula.T_iso(blocks * 12, threads)
+        if tail == 0:
+            return bulk
+        tail_time = self._raw_iso_interp(tail, threads)
+        return (
+            overhead
+            + max(bulk - overhead, 0.0)
+            + max(tail_time - overhead, 0.0)
+        )
 
     def profiled_group_time(self, routes: int, shape) -> float:
         signature = self._shape_signature(shape)

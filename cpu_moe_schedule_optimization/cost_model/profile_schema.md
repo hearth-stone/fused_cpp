@@ -60,6 +60,18 @@ profiles are different calibration domains.
     "assignment": "earliest_finish_lpt_using_streaming_T_iso",
     "derate": "full_call_median / LPT_isolated_baseline_makespan"
   },
+  "iso_formula": {
+    "version": 3,
+    "kind": "separable_route_usl_calibrated",
+    "equation": "O(t) + C(R) * phi_usl(t) * k_phi(t)",
+    "o0": 100000.0,
+    "o1": 300000.0,
+    "alpha": 0.001,
+    "beta": 0.0002,
+    "c_pts": [[1, 200000.0], [12, 900000.0], [2040, 165000000.0]],
+    "phi_pts": [[1, 1.0], [2, 0.51], [4, 0.26], [8, 0.13]],
+    "thread_domain": [1, 32]
+  },
   "isolated": [],
   "entries": []
 }
@@ -102,6 +114,28 @@ experts with the same earliest-finish LPT rule as `IntervalPlanner`, records
 iso_baseline_makespan = max_lanes(lane_tasks * T_iso(M, lane_threads))
 full_call_derate      = full_call_median / iso_baseline_makespan
 ```
+
+Schema-v2 profiles carrying `iso_formula` use it by default:
+
+```text
+T_iso(R,t) = O(t) + C(R) * phi_usl(t) * k_phi(t)
+O(t)       = o0 + o1/t
+phi_usl(t) = (1 + alpha(t-1) + beta*t(t-1)) / t
+```
+
+`C(R)` is the one-dimensional single-thread route calibration curve. The
+`phi_pts` values define the one-dimensional correction
+`k_phi(t)=phi_measured(t)/phi_usl(t)`, which is interpolated only over threads
+and never over routes. The generalized-USL formula is valid only in
+`thread_domain`; it is not used to extrapolate to a larger machine.
+M1/M2/M4/M8 and the first two M12 panels retain
+their measured `(tail, threads)` correction because they do not share the
+steady-state M12 thread scaling; larger M uses the formula and composes any
+remainder from the measured tail cost. Profiles without a serialized
+`iso_formula` remain table-backed for compatibility, but can fit it at load time
+with `iso_mode="formula"`. Set `iso_mode="table"` or
+`FUSED_CPP_COST_MODEL_ISO_MODE=table` to run the previous two-dimensional table
+as a validation baseline.
 
 The complete `full_call_*` curve is the authoritative calibration for a uniform
 full-rank workload. `makespan_ns` remains a normalized diagnostic; it must not
