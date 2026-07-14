@@ -317,6 +317,15 @@ SplitRange n_split_range_tile(int N, int64_t group_size, int64_t local_tid,
     return SplitRange{block_range.begin * t, block_range.size * t};
 }
 
+SplitRange w2_scatter_range(int N, int64_t group_size, int64_t local_tid,
+                            int64_t n_tile, bool use_w2_n_owner) {
+    // The owner path deliberately mirrors the W2 kernel's n_tile partition.
+    // Each worker can therefore consume its own stores without a team barrier.
+    return use_w2_n_owner
+               ? n_split_range_tile(N, group_size, local_tid, n_tile)
+               : n_split_range(N, group_size, local_tid);
+}
+
 void check_positive_int(int64_t value, const char* name) {
     TORCH_CHECK(value > 0, name, " must be positive, got ", value);
     TORCH_CHECK(value <= std::numeric_limits<int>::max(),
@@ -3290,11 +3299,11 @@ struct HierarchicalGroupScratch {
 };
 
 // Persistent, per-calling-thread scratch pool. Buffers only grow and are reused
-// across calls, so mmap + first-touch faults (and the intermediate zeroing)
-// happen once, not every call. Correct because packed_a/down are fully
-// overwritten before read and intermediate's padding feature-blocks stay zero
-// once zeroed (never written). Keyed by group_size (the barrier is sized to it;
-// a change rebuilds the pool). Memory is retained at the max size ever seen.
+// across calls, so mmap + first-touch faults happen once, not every call.
+// Correct because packed_a/down and every packed intermediate row consumed by
+// W2 are fully overwritten before read. Keyed by group_size (the barrier is
+// sized to it; a change rebuilds the pool). Memory is retained at the max size
+// ever seen.
 struct HierarchicalScratchPool {
     int64_t group_size = -1;
     std::vector<std::unique_ptr<HierarchicalGroupScratch>> groups;
@@ -3312,6 +3321,10 @@ bool env_flag_enabled(const char* name) {
 bool env_has_value(const char* name) {
     const char* value = std::getenv(name);
     return value != nullptr && value[0] != '\0';
+}
+
+bool env_flag_enabled_by_default(const char* name) {
+    return !env_has_value(name) || env_flag_enabled(name);
 }
 
 int64_t env_int_or_default(const char* name, int64_t fallback) {
@@ -5652,6 +5665,10 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
     const bool use_fused_2d_split =
         use_hierarchical_nsplit && fuse_silu && fused_packa_w2 &&
         fused_2d_split;
+    const bool use_w2_n_owner_scatter =
+        use_sve_backend && fuse_silu && fused_packa_w2 &&
+        env_flag_enabled_by_default(
+            "FUSED_CPP_MOE_SVE_W2_N_OWNER_SCATTER");
     const char* moe_trace_strategy =
         use_hierarchical_nsplit
             ? (use_fused_2d_split
@@ -6470,28 +6487,16 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input,
                                 : nullptr);
                     }
                 }
-                barrier.wait();
-
-                const int64_t h_blocks = w2.N_pad / kKernelTile;
-                const int64_t blocks_per_thread =
-                    h_blocks / nsplit_group_size;
-                const int64_t extra_blocks =
-                    h_blocks % nsplit_group_size;
-                int64_t start_block = 0;
-                int64_t my_blocks = 0;
-                if (local_tid < extra_blocks) {
-                    start_block =
-                        local_tid * (blocks_per_thread + 1);
-                    my_blocks = blocks_per_thread + 1;
-                } else {
-                    start_block =
-                        extra_blocks * (blocks_per_thread + 1) +
-                        (local_tid - extra_blocks) * blocks_per_thread;
-                    my_blocks = blocks_per_thread;
+                if (!use_w2_n_owner_scatter) {
+                    barrier.wait();
                 }
-                const int64_t h_begin = start_block * kKernelTile;
+
+                const SplitRange h_range = w2_scatter_range(
+                    static_cast<int>(w2.N_pad), nsplit_group_size, local_tid,
+                    w2.n_tile, use_w2_n_owner_scatter);
+                const int64_t h_begin = h_range.begin;
                 const int64_t h_end = std::min<int64_t>(
-                    H, h_begin + my_blocks * kKernelTile);
+                    H, h_begin + h_range.size);
                 time_phase(phase_scatter_ms, [&] {
                 if (h_begin < h_end) {
                     for (int64_t m = 0; m < rows; ++m) {
@@ -6814,6 +6819,17 @@ at::Tensor fused_moe_bf16_tiled_scheduled(at::Tensor input,
     }
     const bool use_fused_2d_split =
         fuse_silu && env_flag_enabled("FUSED_CPP_MOE_FUSED_2D_SPLIT");
+    // The SVE packC tails overwrite every row that the matching W2 tail reads.
+    // Both switches default on; setting either environment flag to 0 restores
+    // the corresponding legacy barrier for comparison or diagnosis.
+    const bool elide_intermediate_zero =
+        use_sve_backend && fuse_silu &&
+        env_flag_enabled_by_default(
+            "FUSED_CPP_MOE_SVE_ELIDE_INTERMEDIATE_ZERO");
+    const bool use_w2_n_owner_scatter =
+        use_sve_backend && fuse_silu &&
+        env_flag_enabled_by_default(
+            "FUSED_CPP_MOE_SVE_W2_N_OWNER_SCATTER");
 
     const int64_t num_tokens = input.size(0);
     const int64_t top_k = topk_ids.size(1);
@@ -7168,7 +7184,7 @@ at::Tensor fused_moe_bf16_tiled_scheduled(at::Tensor input,
 
                 auto worker_phase_begin = trace_phase_begin();
                 if (fuse_silu) {
-                    if (local_tid == 0) {
+                    if (!elide_intermediate_zero && local_tid == 0) {
                         const int64_t rows_padded =
                             use_sve_backend
                                 ? sve_hybrid_packed_rows(rows)
@@ -7178,7 +7194,9 @@ at::Tensor fused_moe_bf16_tiled_scheduled(at::Tensor input,
                                       rows_padded * w2.K_pad,
                                   static_cast<uint16_t>(0));
                     }
-                    barrier.wait();
+                    if (!elide_intermediate_zero) {
+                        barrier.wait();
+                    }
                     TeamContext team;
                     team.group_size = group_size;
                     team.local_tid = local_tid;
@@ -7295,10 +7313,13 @@ at::Tensor fused_moe_bf16_tiled_scheduled(at::Tensor input,
                             ? w2_bias_base + expert * w2.N_pad
                             : nullptr);
                 }
-                barrier.wait();
+                if (!use_w2_n_owner_scatter) {
+                    barrier.wait();
+                }
 
-                const SplitRange h_range = n_split_range(
-                    static_cast<int>(w2.N_pad), group_size, local_tid);
+                const SplitRange h_range = w2_scatter_range(
+                    static_cast<int>(w2.N_pad), group_size, local_tid,
+                    w2.n_tile, use_w2_n_owner_scatter);
                 const int64_t h_begin = h_range.begin;
                 const int64_t h_end = std::min<int64_t>(
                     H, h_begin + h_range.size);
@@ -7542,6 +7563,14 @@ at::Tensor fused_moe_bf16_tiled_async(at::Tensor input,
     }
     const bool use_fused_2d_split =
         fuse_silu && env_flag_enabled("FUSED_CPP_MOE_FUSED_2D_SPLIT");
+    const bool elide_intermediate_zero =
+        use_sve_backend && fuse_silu &&
+        env_flag_enabled_by_default(
+            "FUSED_CPP_MOE_SVE_ELIDE_INTERMEDIATE_ZERO");
+    const bool use_w2_n_owner_scatter =
+        use_sve_backend && fuse_silu &&
+        env_flag_enabled_by_default(
+            "FUSED_CPP_MOE_SVE_W2_N_OWNER_SCATTER");
 
     const int64_t num_tokens = input.size(0);
     const int64_t top_k = topk_ids.size(1);
@@ -7846,7 +7875,7 @@ at::Tensor fused_moe_bf16_tiled_async(at::Tensor input,
 
         auto worker_phase_begin = trace_phase_begin();
         if (fuse_silu) {
-            if (local_tid == 0) {
+            if (!elide_intermediate_zero && local_tid == 0) {
                 const int64_t rows_padded =
                     use_sve_backend
                         ? sve_hybrid_packed_rows(rows)
@@ -7856,7 +7885,9 @@ at::Tensor fused_moe_bf16_tiled_async(at::Tensor input,
                               rows_padded * w2.K_pad,
                           static_cast<uint16_t>(0));
             }
-            barrier.wait();
+            if (!elide_intermediate_zero) {
+                barrier.wait();
+            }
             TeamContext team;
             team.group_size = group_size;
             team.local_tid = local_tid;
@@ -7967,10 +7998,13 @@ at::Tensor fused_moe_bf16_tiled_async(at::Tensor input,
                     ? w2_bias_base + expert * w2.N_pad
                     : nullptr);
         }
-        barrier.wait();
+        if (!use_w2_n_owner_scatter) {
+            barrier.wait();
+        }
 
-        const SplitRange h_range =
-            n_split_range(static_cast<int>(w2.N_pad), group_size, local_tid);
+        const SplitRange h_range = w2_scatter_range(
+            static_cast<int>(w2.N_pad), group_size, local_tid, w2.n_tile,
+            use_w2_n_owner_scatter);
         const int64_t h_begin = h_range.begin;
         const int64_t h_end = std::min<int64_t>(H, h_begin + h_range.size);
         worker_phase_begin = trace_phase_begin();
