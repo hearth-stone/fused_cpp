@@ -65,6 +65,15 @@ ssh AmazonECS8Cores 'cd /home/ubuntu/zhangxu/fused_cpp && . .venv/bin/activate &
 - Remote work root: `/home/ubuntu/zhangxu`
 - Benchmark cores: bind benchmark processes to cores `0` through `31`
 
+### Amazon C5 192 Cores
+
+- Host alias: `AmazonC5192Cores`
+- Remote work root: `/home/ubuntu/zhangxu`
+- Remote project root: `/home/ubuntu/zhangxu/fused_cpp`
+- CPU topology: 192 CPUs across two NUMA nodes, `0-95` and `96-191`
+- Keep benchmark processes NUMA-local unless the test explicitly covers both
+  nodes.
+
 ## Benchmark Hygiene
 
 For single-thread microbenchmarks, bind each process to one dedicated core with
