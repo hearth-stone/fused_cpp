@@ -107,6 +107,10 @@ T_plan(plan) + T_execute(plan)
 
 ## 当前文档
 
+- [`MATHEMATICAL_MODEL.md`](./MATHEMATICAL_MODEL.md)：调度数学模型的 source
+  of truth；定义未剪枝问题、求解器编码、当前工程剪枝及同步规则。
+- [`cost_model/T_ISO_FORMULA_VALIDATION.md`](./cost_model/T_ISO_FORMULA_VALIDATION.md)：
+  `T_iso=O(t)+C(R)phi_USL(t)k_phi(t)` 的公式、8 核 SVE/M12 留出验证和原始数据入口。
 - [`DESIGN.md`](./DESIGN.md)：完整设计文档，定义 plan space、成本模型、严格最优求解方式、multi-plan runtime selector 和阶段性路线图。
 - [`TODO.md`](./TODO.md)：schema-v2 profiling 之后的 policy-aware cost model、planner 与 TP/EP evaluator 待办。
 - [`README.md`](./README.md)：当前入口说明。
