@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import platform
+from typing import Optional
 
 import pytest
 import torch
@@ -240,6 +241,131 @@ def test_sve_m12_silu_and_w2_bf16_route_match_legacy_for_unit_top1(
                         f"{bridge}/minimax3: {message}"
                     ),
                 )
+
+
+@pytest.mark.parametrize("bridge", ["scheduled", "async"])
+@pytest.mark.parametrize("w2_bf16_route", [False, True])
+@pytest.mark.parametrize(
+    "elide_zero,owner_scatter",
+    [(True, False), (False, True), (True, True), (None, None)],
+    ids=["no-zero", "owner-scatter", "combined", "default"],
+)
+def test_sve_expert_barrier_elision_reuses_dirty_scratch(
+    monkeypatch: pytest.MonkeyPatch,
+    bridge: str,
+    w2_bf16_route: bool,
+    elide_zero: Optional[bool],
+    owner_scatter: Optional[bool],
+) -> None:
+    """Exercise all M tails while repeatedly reusing dirty team scratch."""
+    monkeypatch.setenv("FUSED_CPP_MOE_SVE", "1")
+    monkeypatch.setenv(
+        "FUSED_CPP_MOE_W2_BF16_ROUTE", "1" if w2_bf16_route else "0"
+    )
+    generator = torch.Generator().manual_seed(20260714)
+    hidden_size = 64
+    ffn_hidden_size = 32
+    route_counts = list(range(24, 0, -1))
+    num_experts = len(route_counts)
+    num_tokens = sum(route_counts)
+    threads = 5
+    affinity = (
+        sorted(os.sched_getaffinity(0))
+        if hasattr(os, "sched_getaffinity")
+        else list(range(threads))
+    )
+    if len(affinity) < threads:
+        pytest.skip(f"requires {threads} available CPUs")
+
+    hidden_states = _bf16_normal(
+        (num_tokens, hidden_size), generator=generator, std=0.01
+    )
+    w13_weight = _bf16_normal(
+        (num_experts, 2 * ffn_hidden_size, hidden_size),
+        generator=generator,
+        std=0.01,
+    )
+    w2_weight = _bf16_normal(
+        (num_experts, hidden_size, ffn_hidden_size),
+        generator=generator,
+        std=0.01,
+    )
+    topk_ids = torch.cat(
+        [
+            torch.full((count,), expert, dtype=torch.int32)
+            for expert, count in enumerate(route_counts)
+        ]
+    ).reshape(num_tokens, 1)
+    topk_weights = torch.ones((num_tokens, 1), dtype=torch.float32)
+    packed = prepare_fused_moe_bf16_tiled_weights(
+        w13_weight, w2_weight, fuse_silu=True
+    )
+    if packed.gemm_backend != 1:
+        pytest.skip("requires an SVE BF16 build/runtime")
+
+    expert_ids = torch.arange(num_experts, dtype=torch.int32)
+    team_threads = torch.full((num_experts,), threads, dtype=torch.int32)
+    thread_cpu_ids = torch.tensor(affinity[:threads], dtype=torch.int32)
+    if bridge == "scheduled":
+        wave_offsets = torch.arange(num_experts + 1, dtype=torch.int32)
+
+        def run() -> torch.Tensor:
+            return fused_moe_bf16_tiled_scheduled(
+                hidden_states,
+                packed,
+                topk_weights,
+                topk_ids,
+                wave_offsets,
+                expert_ids,
+                team_threads,
+                thread_cpu_ids=thread_cpu_ids,
+                num_threads=threads,
+            )
+
+    else:
+        dep_offsets = torch.arange(num_experts + 1, dtype=torch.int32)
+        dep_offsets[1:] -= 1
+        deps = torch.arange(num_experts - 1, dtype=torch.int32)
+
+        def run() -> torch.Tensor:
+            return fused_moe_bf16_tiled_async(
+                hidden_states,
+                packed,
+                topk_weights,
+                topk_ids,
+                expert_ids,
+                torch.zeros(num_experts, dtype=torch.int32),
+                team_threads,
+                dep_offsets,
+                deps,
+                thread_cpu_ids=thread_cpu_ids,
+                num_threads=threads,
+            )
+
+    zero_flag = "FUSED_CPP_MOE_SVE_ELIDE_INTERMEDIATE_ZERO"
+    owner_flag = "FUSED_CPP_MOE_SVE_W2_N_OWNER_SCATTER"
+    monkeypatch.setenv(zero_flag, "0")
+    monkeypatch.setenv(owner_flag, "0")
+    reference = run()
+
+    if elide_zero is None:
+        monkeypatch.delenv(zero_flag)
+        monkeypatch.delenv(owner_flag)
+    else:
+        monkeypatch.setenv(zero_flag, "1" if elide_zero else "0")
+        monkeypatch.setenv(owner_flag, "1" if owner_scatter else "0")
+    for _ in range(3):
+        candidate = run()
+        torch.testing.assert_close(
+            candidate.float(),
+            reference.float(),
+            atol=0,
+            rtol=0,
+            msg=lambda message: (
+                f"{bridge}/bf16_route={w2_bf16_route}/"
+                f"zero={elide_zero}/owner={owner_scatter}: {message}"
+            ),
+        )
 
 
 def test_fused_moe_bf16_tiled_skip_weighted_matches_unit_weighted() -> None:
