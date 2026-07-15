@@ -48,42 +48,36 @@
 namespace {
 
 template <typename scalar_t>
-inline void sdpa_template_kernel_tmpl(
-    const scalar_t* q_ptr,
-    const scalar_t* k_ptr,
-    const scalar_t* v_ptr,
-    const SdpaParams& p) {
+inline void sdpa_template_kernel_tmpl(const scalar_t* q_ptr, const scalar_t* k_ptr, const scalar_t* v_ptr,
+                                      const SdpaParams& p) {
+  // 你的算法实现：以 (b, n, l) 为单位计算 attention，将结果写入 p.out_ptr。
+  //
+  // 注意：
+  //   - 必须支持 p.is_causal（causal_offset = S - L 语义）；
+  //   - 必须支持 MLA 形状（p.E != p.Ev）；
+  //   - 严格在 fp32 累加；最终 cast 由调度层处理（在 sdpa_versions.cpp）。
+  //
+  // 如果你的内核**不**支持某些能力（例如不支持 causal），请在
+  // src/fused_cpp/sdpa.py 的 _CPP_VERSION_META 中给该 version 设置相应
+  // 能力位为 False；测试 / benchmark 会自动 skip 不兼容的组合。
 
-    // 你的算法实现：以 (b, n, l) 为单位计算 attention，将结果写入 p.out_ptr。
-    //
-    // 注意：
-    //   - 必须支持 p.is_causal（causal_offset = S - L 语义）；
-    //   - 必须支持 MLA 形状（p.E != p.Ev）；
-    //   - 严格在 fp32 累加；最终 cast 由调度层处理（在 sdpa_versions.cpp）。
-    //
-    // 如果你的内核**不**支持某些能力（例如不支持 causal），请在
-    // src/fused_cpp/sdpa.py 的 _CPP_VERSION_META 中给该 version 设置相应
-    // 能力位为 False；测试 / benchmark 会自动 skip 不兼容的组合。
-
-    (void)q_ptr; (void)k_ptr; (void)v_ptr; (void)p;  // suppress unused warnings
+  (void)q_ptr;
+  (void)k_ptr;
+  (void)v_ptr;
+  (void)p;  // suppress unused warnings
 }
 
 }  // anonymous namespace
 
 void sdpa_template_impl(const SdpaParams& p) {
-    if (p.dtype == SdpaDtype::kBFloat16) {
-        sdpa_template_kernel_tmpl<at::BFloat16>(
-            static_cast<const at::BFloat16*>(p.q_ptr),
-            static_cast<const at::BFloat16*>(p.k_ptr),
-            static_cast<const at::BFloat16*>(p.v_ptr),
-            p);
-    } else {
-        sdpa_template_kernel_tmpl<float>(
-            static_cast<const float*>(p.q_ptr),
-            static_cast<const float*>(p.k_ptr),
-            static_cast<const float*>(p.v_ptr),
-            p);
-    }
+  if (p.dtype == SdpaDtype::kBFloat16) {
+    sdpa_template_kernel_tmpl<at::BFloat16>(static_cast<const at::BFloat16*>(p.q_ptr),
+                                            static_cast<const at::BFloat16*>(p.k_ptr),
+                                            static_cast<const at::BFloat16*>(p.v_ptr), p);
+  } else {
+    sdpa_template_kernel_tmpl<float>(static_cast<const float*>(p.q_ptr), static_cast<const float*>(p.k_ptr),
+                                     static_cast<const float*>(p.v_ptr), p);
+  }
 }
 
 // 取消下面这一行注释后，本模板会被注册（请改为你的真实版本名）。

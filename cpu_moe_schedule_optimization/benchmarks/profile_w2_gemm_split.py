@@ -95,9 +95,7 @@ def validate_output(
     threads: int,
 ) -> None:
     set_split_env(split)
-    actual = bf16_linear.linear(
-        x, packed, out_dtype=torch.float32, nthreads=threads
-    )
+    actual = bf16_linear.linear(x, packed, out_dtype=torch.float32, nthreads=threads)
     expected = x.float() @ weight.float().T
     torch.testing.assert_close(actual, expected, atol=8e-2, rtol=8e-2)
 
@@ -115,10 +113,7 @@ def parse_args() -> argparse.Namespace:
         "--stage",
         choices=["w13", "w2"],
         default="w2",
-        help=(
-            "MoE GEMM shape to measure. w13 is A[M,H] x W13[H,2F]; "
-            "w2 is A[M,F] x W2[F,H]."
-        ),
+        help=("MoE GEMM shape to measure. w13 is A[M,H] x W13[H,2F]; w2 is A[M,F] x W2[F,H]."),
     )
     parser.add_argument("--hidden-size", type=int, default=4096)
     parser.add_argument("--ffn-hidden-size", type=int, default=512)
@@ -180,30 +175,17 @@ def main() -> int:
     if args.stage == "w13":
         k_dim = args.hidden_size
         n_dim = 2 * args.ffn_hidden_size
-        shape_text = (
-            f"w13: MxH x Hx2F, H={args.hidden_size} "
-            f"F={args.ffn_hidden_size}"
-        )
+        shape_text = f"w13: MxH x Hx2F, H={args.hidden_size} F={args.ffn_hidden_size}"
     else:
         k_dim = args.ffn_hidden_size
         n_dim = args.hidden_size
-        shape_text = (
-            f"w2: MxF x FxH, H={args.hidden_size} "
-            f"F={args.ffn_hidden_size}"
-        )
+        shape_text = f"w2: MxF x FxH, H={args.hidden_size} F={args.ffn_hidden_size}"
 
     weight = bf16_normal((n_dim, k_dim), generator=generator, std=args.std)
     packed = bf16_linear.prepare(weight)
 
-    print(
-        "shape "
-        f"{shape_text}; "
-        "output=float32"
-    )
-    print(
-        "M      threads split median_ms mean_ms min_ms p90_ms gflops "
-        "speedup_vs_t1_same_split"
-    )
+    print(f"shape {shape_text}; output=float32")
+    print("M      threads split median_ms mean_ms min_ms p90_ms gflops speedup_vs_t1_same_split")
 
     rows: List[Dict[str, object]] = []
     baseline_by_split_m: Dict[tuple[str, int], float] = {}
@@ -216,16 +198,12 @@ def main() -> int:
         for threads in threads_list:
             for split in splits:
                 if args.validate:
-                    validate_output(
-                        x, weight, packed, split=split, threads=threads
-                    )
+                    validate_output(x, weight, packed, split=split, threads=threads)
 
                 set_split_env(split)
 
                 def run() -> torch.Tensor:
-                    return bf16_linear.linear(
-                        x, packed, out_dtype=torch.float32, nthreads=threads
-                    )
+                    return bf16_linear.linear(x, packed, out_dtype=torch.float32, nthreads=threads)
 
                 for _ in range(args.warmup):
                     out = run()
@@ -248,9 +226,7 @@ def main() -> int:
                     "min_ms": min(times_ms),
                     "p90_ms": percentile(times_ms, 0.90),
                     "gflops": gflops,
-                    "speedup_vs_t1_same_split": (
-                        baseline_ms / median_ms if median_ms > 0.0 else 0.0
-                    ),
+                    "speedup_vs_t1_same_split": (baseline_ms / median_ms if median_ms > 0.0 else 0.0),
                     "times_ms": times_ms,
                 }
                 rows.append(row)
@@ -268,9 +244,7 @@ def main() -> int:
     comparisons: List[Dict[str, object]] = []
     for (m_value, threads), case_rows in sorted(by_case.items()):
         best = min(case_rows, key=lambda row: float(row["median_ms"]))
-        split_ms = {
-            str(row["split"]): float(row["median_ms"]) for row in case_rows
-        }
+        split_ms = {str(row["split"]): float(row["median_ms"]) for row in case_rows}
         m_ms = split_ms.get("m")
         n_ms = split_ms.get("n")
         comparisons.append(
@@ -281,16 +255,8 @@ def main() -> int:
                 "best_median_ms": best["median_ms"],
                 "m_median_ms": m_ms,
                 "n_median_ms": n_ms,
-                "n_over_m": (
-                    n_ms / m_ms
-                    if m_ms is not None and n_ms is not None and m_ms > 0.0
-                    else None
-                ),
-                "m_over_n": (
-                    m_ms / n_ms
-                    if m_ms is not None and n_ms is not None and n_ms > 0.0
-                    else None
-                ),
+                "n_over_m": (n_ms / m_ms if m_ms is not None and n_ms is not None and m_ms > 0.0 else None),
+                "m_over_n": (m_ms / n_ms if m_ms is not None and n_ms is not None and n_ms > 0.0 else None),
             }
         )
 

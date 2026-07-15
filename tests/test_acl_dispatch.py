@@ -6,6 +6,7 @@
 - remove_weight=True 时权重被替换为空张量
 - ACL 不可用时正确回退到后续后端
 """
+
 import importlib.util
 import platform
 from unittest import mock
@@ -17,6 +18,7 @@ _is_aarch64 = platform.machine() in ("aarch64", "arm64")
 
 try:
     import fused_cpp
+
     _acl_available = fused_cpp._supports_acl
 except ImportError:
     _acl_available = False
@@ -37,13 +39,9 @@ def _make_linear_layer(
 ) -> torch.nn.Module:
     """创建一个模拟的 Linear 层，带有 weight 和可选 bias 属性。"""
     layer = torch.nn.Module()
-    layer.weight = torch.nn.Parameter(
-        torch.randn(N, K, dtype=dtype), requires_grad=False
-    )
+    layer.weight = torch.nn.Parameter(torch.randn(N, K, dtype=dtype), requires_grad=False)
     if with_bias:
-        layer.bias = torch.nn.Parameter(
-            torch.randn(N, dtype=dtype), requires_grad=False
-        )
+        layer.bias = torch.nn.Parameter(torch.randn(N, dtype=dtype), requires_grad=False)
     else:
         layer.bias = None
     return layer
@@ -129,9 +127,14 @@ class TestACLDispatchIntegration:
         # mock fused_cpp._supports_acl 为 False，模拟 ACL 不可用
         with (
             mock.patch("vllm.envs.VLLM_CPU_SGL_KERNEL", False),
-            mock.patch.dict("sys.modules", {"fused_cpp": mock.MagicMock(
-                _supports_acl=False,
-            )}),
+            mock.patch.dict(
+                "sys.modules",
+                {
+                    "fused_cpp": mock.MagicMock(
+                        _supports_acl=False,
+                    )
+                },
+            ),
         ):
             dispatch_cpu_unquantized_gemm(layer, remove_weight=False)
 
@@ -151,9 +154,7 @@ class TestACLDispatchIntegration:
         )
 
         layer = torch.nn.Module()
-        layer.weight = torch.nn.Parameter(
-            torch.empty(256, 128, device="meta"), requires_grad=False
-        )
+        layer.weight = torch.nn.Parameter(torch.empty(256, 128, device="meta"), requires_grad=False)
         layer.bias = None
 
         dispatch_cpu_unquantized_gemm(layer, remove_weight=False)

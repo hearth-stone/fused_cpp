@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """BF16 tiled fused MoE wrapper."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -29,6 +30,7 @@ try:
     from fused_cpp._C import (  # type: ignore[import-untyped]
         fused_moe_bf16_tiled_prepare_weights as _prepare_bf16_tiled_impl,
     )
+
     try:
         from fused_cpp._C import (  # type: ignore[import-untyped]
             fused_moe_bf16_tiled_scheduled as _scheduled_impl,
@@ -65,10 +67,7 @@ _INTEGER_DTYPES = {
 
 def _require_backend() -> None:
     if not _HAS_BF16_TILED_FUSED_MOE:
-        raise RuntimeError(
-            "BF16 tiled fused MoE backend is unavailable "
-            "(requires the C++ extension on AArch64)"
-        )
+        raise RuntimeError("BF16 tiled fused MoE backend is unavailable (requires the C++ extension on AArch64)")
 
 
 def _activation_name(activation: Any) -> str:
@@ -77,10 +76,7 @@ def _activation_name(activation: Any) -> str:
         value = str(value)
     value = {"gelu_pytorch_tanh": "gelu_tanh"}.get(value, value)
     if value not in {"silu", "gelu", "swigluoai"}:
-        raise ValueError(
-            "Unsupported MoE activation "
-            f"{value!r}; supported activations: gelu, silu, swigluoai"
-        )
+        raise ValueError(f"Unsupported MoE activation {value!r}; supported activations: gelu, silu, swigluoai")
     return value
 
 
@@ -159,9 +155,7 @@ def fused_moe_bf16_tiled(
     if topk_ids.dtype not in _INTEGER_DTYPES:
         raise TypeError(f"topk_ids must use an integer dtype, got {topk_ids.dtype}")
     if not topk_weights.dtype.is_floating_point:
-        raise TypeError(
-            f"topk_weights must use a floating dtype, got {topk_weights.dtype}"
-        )
+        raise TypeError(f"topk_weights must use a floating dtype, got {topk_weights.dtype}")
     if int(num_threads) <= 0:
         raise ValueError(f"num_threads must be positive, got {num_threads}")
     if out is not None:
@@ -244,9 +238,7 @@ def fused_moe_bf16_tiled_scheduled(
     if topk_ids.dtype not in _INTEGER_DTYPES:
         raise TypeError(f"topk_ids must use an integer dtype, got {topk_ids.dtype}")
     if not topk_weights.dtype.is_floating_point:
-        raise TypeError(
-            f"topk_weights must use a floating dtype, got {topk_weights.dtype}"
-        )
+        raise TypeError(f"topk_weights must use a floating dtype, got {topk_weights.dtype}")
     if int(num_threads) <= 0:
         raise ValueError(f"num_threads must be positive, got {num_threads}")
     _check_integer_schedule_tensor(wave_offsets, "wave_offsets")
@@ -349,9 +341,7 @@ def fused_moe_bf16_tiled_async(
     if topk_ids.dtype not in _INTEGER_DTYPES:
         raise TypeError(f"topk_ids must use an integer dtype, got {topk_ids.dtype}")
     if not topk_weights.dtype.is_floating_point:
-        raise TypeError(
-            f"topk_weights must use a floating dtype, got {topk_weights.dtype}"
-        )
+        raise TypeError(f"topk_weights must use a floating dtype, got {topk_weights.dtype}")
     if int(num_threads) <= 0:
         raise ValueError(f"num_threads must be positive, got {num_threads}")
     _check_integer_schedule_tensor(task_expert_ids, "task_expert_ids")

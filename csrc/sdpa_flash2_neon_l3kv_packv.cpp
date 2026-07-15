@@ -49,12 +49,12 @@
 
 namespace {
 
-using ::fused_cpp::sdpa_tile_sizes::TileSizes;
-using ::fused_cpp::sdpa_tile_sizes::effective_cache_bytes;
-using ::fused_cpp::sdpa_tile_sizes::compute_tile_sizes_l3kv;
 using ::fused_cpp::sdpa_flash2_neon_l3kv_impl::run_path_collapse3;
 using ::fused_cpp::sdpa_flash2_neon_l3kv_impl::run_path_taskloop;
 using ::fused_cpp::sdpa_pack_utils::pack_v_to_evblock8;
+using ::fused_cpp::sdpa_tile_sizes::compute_tile_sizes_l3kv;
+using ::fused_cpp::sdpa_tile_sizes::effective_cache_bytes;
+using ::fused_cpp::sdpa_tile_sizes::TileSizes;
 
 // ──────────────────────────────────────────────────────────────────────
 // V pack：[B, N, S, Ev] → [B, N, Ev/8, S, 8]
@@ -77,29 +77,21 @@ using ::fused_cpp::sdpa_pack_utils::pack_v_to_evblock8;
 // ──────────────────────────────────────────────────────────────────────
 
 template <class MK, typename scalar_t>
-inline void sdpa_flash2_neon_l3kv_packv_with_mk_tmpl(
-    const scalar_t* q_ptr,
-    const scalar_t* k_ptr,
-    const scalar_t* v_ptr,
-    const SdpaParams& p) {
-  TORCH_CHECK(p.Ev % 8 == 0,
-              "flash2_neon_l3kv_packv requires Ev % 8 == 0, got Ev=", p.Ev);
+inline void sdpa_flash2_neon_l3kv_packv_with_mk_tmpl(const scalar_t* q_ptr, const scalar_t* k_ptr,
+                                                     const scalar_t* v_ptr, const SdpaParams& p) {
+  TORCH_CHECK(p.Ev % 8 == 0, "flash2_neon_l3kv_packv requires Ev % 8 == 0, got Ev=", p.Ev);
   const bool profile_on = ::fused_cpp::sdpa_profile::enabled();
   if (profile_on) {
     ::fused_cpp::sdpa_profile::reset();
   }
-  const uint64_t profile_total_t0 =
-      profile_on ? ::fused_cpp::sdpa_profile::now_ns() : 0;
+  const uint64_t profile_total_t0 = profile_on ? ::fused_cpp::sdpa_profile::now_ns() : 0;
 
   // ── 分配 packed V buffer：B*N*Ev/8*S*8 个元素（= B*N*S*Ev，与原 V 同尺寸）──
-  const auto torch_dtype = (p.dtype == SdpaDtype::kBFloat16)
-                               ? at::kBFloat16 : at::kFloat;
+  const auto torch_dtype = (p.dtype == SdpaDtype::kBFloat16) ? at::kBFloat16 : at::kFloat;
   at::Tensor v_packed;
   {
     FUSED_CPP_SDPA_PROFILE_SCOPE(::fused_cpp::sdpa_profile::Slot::kVAlloc);
-    v_packed = at::empty(
-        {p.B, p.N, p.Ev / 8, p.S, 8},
-        at::TensorOptions().dtype(torch_dtype));
+    v_packed = at::empty({p.B, p.N, p.Ev / 8, p.S, 8}, at::TensorOptions().dtype(torch_dtype));
   }
   scalar_t* v_packed_ptr = static_cast<scalar_t*>(v_packed.data_ptr());
 
@@ -134,16 +126,13 @@ inline void sdpa_flash2_neon_l3kv_packv_with_mk_tmpl(
   const int64_t o_stride_n = p.L * p.Ev;
   const int64_t o_stride_l = p.Ev;
 
-  TileSizes ts = compute_tile_sizes_l3kv(p.B, p.N, p.S, p.L, p.E, p.Ev,
-                                         sizeof(scalar_t));
+  TileSizes ts = compute_tile_sizes_l3kv(p.B, p.N, p.S, p.L, p.E, p.Ev, sizeof(scalar_t));
 
   // path A/B 选择跟原 l3kv 完全一致：packed buffer 跟原 V 同大小，
   // 单 head 工作集 = S * (E + Ev) * sizeof，阈值不变。
-  const int64_t kv_bytes_per_bn =
-      p.S * (p.E + p.Ev) * static_cast<int64_t>(sizeof(scalar_t));
+  const int64_t kv_bytes_per_bn = p.S * (p.E + p.Ev) * static_cast<int64_t>(sizeof(scalar_t));
   const auto& cache_bytes = effective_cache_bytes();
-  const int64_t l3_budget =
-      static_cast<int64_t>(cache_bytes[2] * FUSED_CPP_SDPA_L3_RATIO);
+  const int64_t l3_budget = static_cast<int64_t>(cache_bytes[2] * FUSED_CPP_SDPA_L3_RATIO);
   const bool kv_fits_l3 = kv_bytes_per_bn <= l3_budget;
   const int total_threads =
 #ifdef _OPENMP
@@ -163,130 +152,91 @@ inline void sdpa_flash2_neon_l3kv_packv_with_mk_tmpl(
     if (path_a) {
       if (s_debug_groups) {
         std::fprintf(stderr,
-            "[flash2_neon_l3kv_packv] path=A B=%lld N=%lld L=%lld S=%lld "
-            "E=%lld Ev=%lld kv_bytes=%lld l3_budget=%lld threads=%d "
-            "Lc_l2=%lld Sc_l2=%lld Sc_l3=%lld\n",
-            (long long)p.B, (long long)p.N, (long long)p.L, (long long)p.S,
-            (long long)p.E, (long long)p.Ev,
-            (long long)kv_bytes_per_bn, (long long)l3_budget, total_threads,
-            (long long)ts.Lc_l2, (long long)ts.Sc_l2, (long long)ts.Sc_l3);
+                     "[flash2_neon_l3kv_packv] path=A B=%lld N=%lld L=%lld S=%lld "
+                     "E=%lld Ev=%lld kv_bytes=%lld l3_budget=%lld threads=%d "
+                     "Lc_l2=%lld Sc_l2=%lld Sc_l3=%lld\n",
+                     (long long)p.B, (long long)p.N, (long long)p.L, (long long)p.S, (long long)p.E, (long long)p.Ev,
+                     (long long)kv_bytes_per_bn, (long long)l3_budget, total_threads, (long long)ts.Lc_l2,
+                     (long long)ts.Sc_l2, (long long)ts.Sc_l3);
       }
       // ── 按 (kHasMask, kCausal) 编译期组合分发 packv 模板实例 ──
       if (p.mask_ptr != nullptr) {
         if (p.is_causal) {
           run_path_collapse3<MK, scalar_t, /*kPackedV=*/true,
                              /*kHasMask=*/true, /*kCausal=*/true>(
-              q_ptr, k_ptr, v_packed_ptr, p, ts,
-              q_stride_b, q_stride_n, q_stride_l,
-              k_stride_b, k_stride_n, k_stride_s,
-              v_packed_stride_b, v_packed_stride_n, v_packed_stride_s,
-              v_evblock_stride,
-              m_stride_b, m_stride_n, m_stride_l,
-              o_stride_b, o_stride_n, o_stride_l);
+              q_ptr, k_ptr, v_packed_ptr, p, ts, q_stride_b, q_stride_n, q_stride_l, k_stride_b, k_stride_n, k_stride_s,
+              v_packed_stride_b, v_packed_stride_n, v_packed_stride_s, v_evblock_stride, m_stride_b, m_stride_n,
+              m_stride_l, o_stride_b, o_stride_n, o_stride_l);
         } else {
           run_path_collapse3<MK, scalar_t, /*kPackedV=*/true,
                              /*kHasMask=*/true, /*kCausal=*/false>(
-              q_ptr, k_ptr, v_packed_ptr, p, ts,
-              q_stride_b, q_stride_n, q_stride_l,
-              k_stride_b, k_stride_n, k_stride_s,
-              v_packed_stride_b, v_packed_stride_n, v_packed_stride_s,
-              v_evblock_stride,
-              m_stride_b, m_stride_n, m_stride_l,
-              o_stride_b, o_stride_n, o_stride_l);
+              q_ptr, k_ptr, v_packed_ptr, p, ts, q_stride_b, q_stride_n, q_stride_l, k_stride_b, k_stride_n, k_stride_s,
+              v_packed_stride_b, v_packed_stride_n, v_packed_stride_s, v_evblock_stride, m_stride_b, m_stride_n,
+              m_stride_l, o_stride_b, o_stride_n, o_stride_l);
         }
       } else {
         if (p.is_causal) {
           run_path_collapse3<MK, scalar_t, /*kPackedV=*/true,
                              /*kHasMask=*/false, /*kCausal=*/true>(
-              q_ptr, k_ptr, v_packed_ptr, p, ts,
-              q_stride_b, q_stride_n, q_stride_l,
-              k_stride_b, k_stride_n, k_stride_s,
-              v_packed_stride_b, v_packed_stride_n, v_packed_stride_s,
-              v_evblock_stride,
-              m_stride_b, m_stride_n, m_stride_l,
-              o_stride_b, o_stride_n, o_stride_l);
+              q_ptr, k_ptr, v_packed_ptr, p, ts, q_stride_b, q_stride_n, q_stride_l, k_stride_b, k_stride_n, k_stride_s,
+              v_packed_stride_b, v_packed_stride_n, v_packed_stride_s, v_evblock_stride, m_stride_b, m_stride_n,
+              m_stride_l, o_stride_b, o_stride_n, o_stride_l);
         } else {
           run_path_collapse3<MK, scalar_t, /*kPackedV=*/true,
                              /*kHasMask=*/false, /*kCausal=*/false>(
-              q_ptr, k_ptr, v_packed_ptr, p, ts,
-              q_stride_b, q_stride_n, q_stride_l,
-              k_stride_b, k_stride_n, k_stride_s,
-              v_packed_stride_b, v_packed_stride_n, v_packed_stride_s,
-              v_evblock_stride,
-              m_stride_b, m_stride_n, m_stride_l,
-              o_stride_b, o_stride_n, o_stride_l);
+              q_ptr, k_ptr, v_packed_ptr, p, ts, q_stride_b, q_stride_n, q_stride_l, k_stride_b, k_stride_n, k_stride_s,
+              v_packed_stride_b, v_packed_stride_n, v_packed_stride_s, v_evblock_stride, m_stride_b, m_stride_n,
+              m_stride_l, o_stride_b, o_stride_n, o_stride_l);
         }
       }
     } else {
-      const int max_concurrent_bn =
-          std::max<int>(1, static_cast<int>(l3_budget / kv_bytes_per_bn));
+      const int max_concurrent_bn = std::max<int>(1, static_cast<int>(l3_budget / kv_bytes_per_bn));
       const int total_bn = static_cast<int>(p.B * p.N);
-      const int num_groups = std::min<int>(
-          total_bn, std::min<int>(total_threads, max_concurrent_bn));
+      const int num_groups = std::min<int>(total_bn, std::min<int>(total_threads, max_concurrent_bn));
       if (s_debug_groups) {
         std::fprintf(stderr,
-            "[flash2_neon_l3kv_packv] path=B B=%lld N=%lld L=%lld S=%lld "
-            "E=%lld Ev=%lld kv_bytes=%lld l3_budget=%lld threads=%d "
-            "max_concurrent_bn=%d num_groups=%d Lc_l2=%lld Sc_l2=%lld\n",
-            (long long)p.B, (long long)p.N, (long long)p.L, (long long)p.S,
-            (long long)p.E, (long long)p.Ev,
-            (long long)kv_bytes_per_bn, (long long)l3_budget, total_threads,
-            max_concurrent_bn, num_groups,
-            (long long)ts.Lc_l2, (long long)ts.Sc_l2);
+                     "[flash2_neon_l3kv_packv] path=B B=%lld N=%lld L=%lld S=%lld "
+                     "E=%lld Ev=%lld kv_bytes=%lld l3_budget=%lld threads=%d "
+                     "max_concurrent_bn=%d num_groups=%d Lc_l2=%lld Sc_l2=%lld\n",
+                     (long long)p.B, (long long)p.N, (long long)p.L, (long long)p.S, (long long)p.E, (long long)p.Ev,
+                     (long long)kv_bytes_per_bn, (long long)l3_budget, total_threads, max_concurrent_bn, num_groups,
+                     (long long)ts.Lc_l2, (long long)ts.Sc_l2);
       }
       if (p.mask_ptr != nullptr) {
         if (p.is_causal) {
           run_path_taskloop<MK, scalar_t, /*kPackedV=*/true,
                             /*kHasMask=*/true, /*kCausal=*/true>(
-              q_ptr, k_ptr, v_packed_ptr, p, ts, num_groups,
-              q_stride_b, q_stride_n, q_stride_l,
-              k_stride_b, k_stride_n, k_stride_s,
-              v_packed_stride_b, v_packed_stride_n, v_packed_stride_s,
-              v_evblock_stride,
-              m_stride_b, m_stride_n, m_stride_l,
-              o_stride_b, o_stride_n, o_stride_l);
+              q_ptr, k_ptr, v_packed_ptr, p, ts, num_groups, q_stride_b, q_stride_n, q_stride_l, k_stride_b, k_stride_n,
+              k_stride_s, v_packed_stride_b, v_packed_stride_n, v_packed_stride_s, v_evblock_stride, m_stride_b,
+              m_stride_n, m_stride_l, o_stride_b, o_stride_n, o_stride_l);
         } else {
           run_path_taskloop<MK, scalar_t, /*kPackedV=*/true,
                             /*kHasMask=*/true, /*kCausal=*/false>(
-              q_ptr, k_ptr, v_packed_ptr, p, ts, num_groups,
-              q_stride_b, q_stride_n, q_stride_l,
-              k_stride_b, k_stride_n, k_stride_s,
-              v_packed_stride_b, v_packed_stride_n, v_packed_stride_s,
-              v_evblock_stride,
-              m_stride_b, m_stride_n, m_stride_l,
-              o_stride_b, o_stride_n, o_stride_l);
+              q_ptr, k_ptr, v_packed_ptr, p, ts, num_groups, q_stride_b, q_stride_n, q_stride_l, k_stride_b, k_stride_n,
+              k_stride_s, v_packed_stride_b, v_packed_stride_n, v_packed_stride_s, v_evblock_stride, m_stride_b,
+              m_stride_n, m_stride_l, o_stride_b, o_stride_n, o_stride_l);
         }
       } else {
         if (p.is_causal) {
           run_path_taskloop<MK, scalar_t, /*kPackedV=*/true,
                             /*kHasMask=*/false, /*kCausal=*/true>(
-              q_ptr, k_ptr, v_packed_ptr, p, ts, num_groups,
-              q_stride_b, q_stride_n, q_stride_l,
-              k_stride_b, k_stride_n, k_stride_s,
-              v_packed_stride_b, v_packed_stride_n, v_packed_stride_s,
-              v_evblock_stride,
-              m_stride_b, m_stride_n, m_stride_l,
-              o_stride_b, o_stride_n, o_stride_l);
+              q_ptr, k_ptr, v_packed_ptr, p, ts, num_groups, q_stride_b, q_stride_n, q_stride_l, k_stride_b, k_stride_n,
+              k_stride_s, v_packed_stride_b, v_packed_stride_n, v_packed_stride_s, v_evblock_stride, m_stride_b,
+              m_stride_n, m_stride_l, o_stride_b, o_stride_n, o_stride_l);
         } else {
           run_path_taskloop<MK, scalar_t, /*kPackedV=*/true,
                             /*kHasMask=*/false, /*kCausal=*/false>(
-              q_ptr, k_ptr, v_packed_ptr, p, ts, num_groups,
-              q_stride_b, q_stride_n, q_stride_l,
-              k_stride_b, k_stride_n, k_stride_s,
-              v_packed_stride_b, v_packed_stride_n, v_packed_stride_s,
-              v_evblock_stride,
-              m_stride_b, m_stride_n, m_stride_l,
-              o_stride_b, o_stride_n, o_stride_l);
+              q_ptr, k_ptr, v_packed_ptr, p, ts, num_groups, q_stride_b, q_stride_n, q_stride_l, k_stride_b, k_stride_n,
+              k_stride_s, v_packed_stride_b, v_packed_stride_n, v_packed_stride_s, v_evblock_stride, m_stride_b,
+              m_stride_n, m_stride_l, o_stride_b, o_stride_n, o_stride_l);
         }
       }
     }
   }
   if (profile_on) {
-    ::fused_cpp::sdpa_profile::add(
-        ::fused_cpp::sdpa_profile::Slot::kTotal,
-        ::fused_cpp::sdpa_profile::now_ns() - profile_total_t0);
-    ::fused_cpp::sdpa_profile::print_summary(
-        "flash2_neon_l3kv_packv", MK::kName, p, path_a ? "A" : "B");
+    ::fused_cpp::sdpa_profile::add(::fused_cpp::sdpa_profile::Slot::kTotal,
+                                   ::fused_cpp::sdpa_profile::now_ns() - profile_total_t0);
+    ::fused_cpp::sdpa_profile::print_summary("flash2_neon_l3kv_packv", MK::kName, p, path_a ? "A" : "B");
   }
 }
 
@@ -294,17 +244,12 @@ inline void sdpa_flash2_neon_l3kv_packv_with_mk_tmpl(
 template <class MK>
 inline void sdpa_flash2_neon_l3kv_packv_with_mk_impl(const SdpaParams& p) {
   if (p.dtype == SdpaDtype::kBFloat16) {
-    sdpa_flash2_neon_l3kv_packv_with_mk_tmpl<MK, at::BFloat16>(
-        static_cast<const at::BFloat16*>(p.q_ptr),
-        static_cast<const at::BFloat16*>(p.k_ptr),
-        static_cast<const at::BFloat16*>(p.v_ptr),
-        p);
+    sdpa_flash2_neon_l3kv_packv_with_mk_tmpl<MK, at::BFloat16>(static_cast<const at::BFloat16*>(p.q_ptr),
+                                                               static_cast<const at::BFloat16*>(p.k_ptr),
+                                                               static_cast<const at::BFloat16*>(p.v_ptr), p);
   } else {
     sdpa_flash2_neon_l3kv_packv_with_mk_tmpl<MK, float>(
-        static_cast<const float*>(p.q_ptr),
-        static_cast<const float*>(p.k_ptr),
-        static_cast<const float*>(p.v_ptr),
-        p);
+        static_cast<const float*>(p.q_ptr), static_cast<const float*>(p.k_ptr), static_cast<const float*>(p.v_ptr), p);
   }
 }
 
@@ -317,59 +262,46 @@ inline void sdpa_flash2_neon_l3kv_packv_with_mk_impl(const SdpaParams& p) {
 #if FUSED_CPP_MK_ENABLE_BASELINE
 namespace {
 void sdpa_flash2_neon_l3kv_packv_baseline_entry(const SdpaParams& p) {
-  sdpa_flash2_neon_l3kv_packv_with_mk_impl<
-      ::fused_cpp::sdpa_microkernels::MK_Baseline>(p);
+  sdpa_flash2_neon_l3kv_packv_with_mk_impl<::fused_cpp::sdpa_microkernels::MK_Baseline>(p);
 }
 }  // anonymous namespace
-REGISTER_SDPA_VERSION("flash2_neon_l3kv_packv",
-                      sdpa_flash2_neon_l3kv_packv_baseline_entry);
-REGISTER_SDPA_VERSION("flash2_neon_l3kv_packv_baseline",
-                      sdpa_flash2_neon_l3kv_packv_baseline_entry);
+REGISTER_SDPA_VERSION("flash2_neon_l3kv_packv", sdpa_flash2_neon_l3kv_packv_baseline_entry);
+REGISTER_SDPA_VERSION("flash2_neon_l3kv_packv_baseline", sdpa_flash2_neon_l3kv_packv_baseline_entry);
 #endif
 
 #if FUSED_CPP_MK_ENABLE_SCALAR
 namespace {
 void sdpa_flash2_neon_l3kv_packv_scalar_entry(const SdpaParams& p) {
-  sdpa_flash2_neon_l3kv_packv_with_mk_impl<
-      ::fused_cpp::sdpa_microkernels::MK_Scalar>(p);
+  sdpa_flash2_neon_l3kv_packv_with_mk_impl<::fused_cpp::sdpa_microkernels::MK_Scalar>(p);
 }
 }  // anonymous namespace
-REGISTER_SDPA_VERSION("flash2_neon_l3kv_packv_scalar",
-                      sdpa_flash2_neon_l3kv_packv_scalar_entry);
+REGISTER_SDPA_VERSION("flash2_neon_l3kv_packv_scalar", sdpa_flash2_neon_l3kv_packv_scalar_entry);
 #endif
 
 #if FUSED_CPP_MK_ENABLE_PQUAD
 namespace {
 void sdpa_flash2_neon_l3kv_packv_pquad_entry(const SdpaParams& p) {
-  sdpa_flash2_neon_l3kv_packv_with_mk_impl<
-      ::fused_cpp::sdpa_microkernels::MK_PQuad>(p);
+  sdpa_flash2_neon_l3kv_packv_with_mk_impl<::fused_cpp::sdpa_microkernels::MK_PQuad>(p);
 }
 }  // anonymous namespace
-REGISTER_SDPA_VERSION("flash2_neon_l3kv_packv_pquad",
-                      sdpa_flash2_neon_l3kv_packv_pquad_entry);
+REGISTER_SDPA_VERSION("flash2_neon_l3kv_packv_pquad", sdpa_flash2_neon_l3kv_packv_pquad_entry);
 #endif
 
 #if FUSED_CPP_MK_ENABLE_QK_UBLOCK4
 namespace {
 void sdpa_flash2_neon_l3kv_packv_qk_ublock4_entry(const SdpaParams& p) {
-  sdpa_flash2_neon_l3kv_packv_with_mk_impl<
-      ::fused_cpp::sdpa_microkernels::MK_QkUblock4>(p);
+  sdpa_flash2_neon_l3kv_packv_with_mk_impl<::fused_cpp::sdpa_microkernels::MK_QkUblock4>(p);
 }
 }  // anonymous namespace
-REGISTER_SDPA_VERSION("flash2_neon_l3kv_packv_qk_ublock4",
-                      sdpa_flash2_neon_l3kv_packv_qk_ublock4_entry);
+REGISTER_SDPA_VERSION("flash2_neon_l3kv_packv_qk_ublock4", sdpa_flash2_neon_l3kv_packv_qk_ublock4_entry);
 #endif
 
 #if FUSED_CPP_MK_ENABLE_L1_BFMLAL_LAYOUT
 namespace {
-void sdpa_flash2_neon_l3kv_packv_l1_bfmlal_layout_entry(
-    const SdpaParams& p) {
-  sdpa_flash2_neon_l3kv_packv_with_mk_impl<
-      ::fused_cpp::sdpa_microkernels::MK_L1BfmlalLayout>(p);
+void sdpa_flash2_neon_l3kv_packv_l1_bfmlal_layout_entry(const SdpaParams& p) {
+  sdpa_flash2_neon_l3kv_packv_with_mk_impl<::fused_cpp::sdpa_microkernels::MK_L1BfmlalLayout>(p);
 }
 }  // anonymous namespace
-REGISTER_SDPA_VERSION("flash2_neon_l3kv_packv_l1_bfmlal_layout",
-                      sdpa_flash2_neon_l3kv_packv_l1_bfmlal_layout_entry);
-REGISTER_SDPA_VERSION("flash2_neon_l3kv_l1_bfmlal_layout",
-                      sdpa_flash2_neon_l3kv_packv_l1_bfmlal_layout_entry);
+REGISTER_SDPA_VERSION("flash2_neon_l3kv_packv_l1_bfmlal_layout", sdpa_flash2_neon_l3kv_packv_l1_bfmlal_layout_entry);
+REGISTER_SDPA_VERSION("flash2_neon_l3kv_l1_bfmlal_layout", sdpa_flash2_neon_l3kv_packv_l1_bfmlal_layout_entry);
 #endif

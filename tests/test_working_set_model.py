@@ -48,9 +48,7 @@ def test_owner_cache_fit_recovers_resident_stream_saturation() -> None:
             active_streams=n,
             stream_bytes=stream,
             working_set_bytes=n * stream,
-            bandwidth_bytes_per_second=(
-                limit * (1.0 - math.exp(-n / saturation)) if n <= 8 else 4e12
-            ),
+            bandwidth_bytes_per_second=(limit * (1.0 - math.exp(-n / saturation)) if n <= 8 else 4e12),
         )
         for n in (1, 2, 3, 4, 6, 8, 12)
     ]
@@ -68,10 +66,7 @@ def test_owner_cache_fit_recovers_resident_stream_saturation() -> None:
 
 def test_small_owner_cache_degenerates_to_one_stream() -> None:
     stream = 4 * 2**20
-    observations = [
-        ScanObservation(n, stream, n * stream, (800 - 50 * n) * 1e9)
-        for n in range(1, 9)
-    ]
+    observations = [ScanObservation(n, stream, n * stream, (800 - 50 * n) * 1e9) for n in range(1, 9)]
     fitted = fit_owner_cache_model(
         observations,
         cores=8,

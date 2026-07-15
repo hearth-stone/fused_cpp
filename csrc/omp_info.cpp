@@ -24,8 +24,8 @@
 namespace {
 
 inline std::string env_or_null(const char* name) {
-    const char* v = std::getenv(name);
-    return v ? std::string(v) : std::string("null");
+  const char* v = std::getenv(name);
+  return v ? std::string(v) : std::string("null");
 }
 
 }  // anonymous namespace
@@ -45,31 +45,31 @@ inline std::string env_or_null(const char* name) {
 ///   OMP_NESTED       同上。
 ///   OMP_WAIT_POLICY  同上。
 std::map<std::string, std::string> get_omp_runtime_info() {
-    std::map<std::string, std::string> out;
+  std::map<std::string, std::string> out;
 #ifdef _OPENMP
-    out["max_threads"] = std::to_string(omp_get_max_threads());
-    out["num_procs"]   = std::to_string(omp_get_num_procs());
-    out["has_openmp"]  = "true";
+  out["max_threads"] = std::to_string(omp_get_max_threads());
+  out["num_procs"] = std::to_string(omp_get_num_procs());
+  out["has_openmp"] = "true";
 #else
-    out["max_threads"] = "1";
-    out["num_procs"]   = "1";
-    out["has_openmp"]  = "false";
+  out["max_threads"] = "1";
+  out["num_procs"] = "1";
+  out["has_openmp"] = "false";
 #endif
-    out["OMP_NUM_THREADS"] = env_or_null("OMP_NUM_THREADS");
-    out["OMP_SCHEDULE"]    = env_or_null("OMP_SCHEDULE");
-    out["OMP_PROC_BIND"]   = env_or_null("OMP_PROC_BIND");
-    out["OMP_PLACES"]      = env_or_null("OMP_PLACES");
-    out["OMP_DYNAMIC"]     = env_or_null("OMP_DYNAMIC");
-    out["OMP_NESTED"]      = env_or_null("OMP_NESTED");
-    out["OMP_WAIT_POLICY"] = env_or_null("OMP_WAIT_POLICY");
-    return out;
+  out["OMP_NUM_THREADS"] = env_or_null("OMP_NUM_THREADS");
+  out["OMP_SCHEDULE"] = env_or_null("OMP_SCHEDULE");
+  out["OMP_PROC_BIND"] = env_or_null("OMP_PROC_BIND");
+  out["OMP_PLACES"] = env_or_null("OMP_PLACES");
+  out["OMP_DYNAMIC"] = env_or_null("OMP_DYNAMIC");
+  out["OMP_NESTED"] = env_or_null("OMP_NESTED");
+  out["OMP_WAIT_POLICY"] = env_or_null("OMP_WAIT_POLICY");
+  return out;
 }
 
 /// 是否实际链接了 OpenMP（编译期 ``_OPENMP`` 宏可见）。
 bool has_openmp() {
 #ifdef _OPENMP
-    return true;
+  return true;
 #else
-    return false;
+  return false;
 #endif
 }

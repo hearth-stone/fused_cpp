@@ -3,6 +3,7 @@
 
 Validates: Requirements 2.2, 2.3, 3.1–3.10, 5.6, 6.3, 6.4, 8.4
 """
+
 import pytest
 import torch
 
@@ -10,6 +11,7 @@ import torch
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _make_weights(num_experts, hidden_size, ffn_hidden_size):
     """Create random expert weight tensors."""
@@ -38,9 +40,7 @@ def _make_default_impl(**overrides):
     defaults.update(overrides)
 
     local_num_experts = defaults["num_experts"] // defaults["ep_size"]
-    w_gate, w_up, w_down = _make_weights(local_num_experts,
-                                          defaults["hidden_size"],
-                                          defaults["ffn_hidden_size"])
+    w_gate, w_up, w_down = _make_weights(local_num_experts, defaults["hidden_size"], defaults["ffn_hidden_size"])
     defaults.setdefault("w_gate", w_gate)
     defaults.setdefault("w_up", w_up)
     defaults.setdefault("w_down", w_down)
@@ -209,19 +209,6 @@ class TestZeroRoutedTokens:
 
         w_gate, w_up, w_down = _make_weights(local_num_experts, hidden_size, ffn_hidden_size)
 
-        impl = FusedMoEImpl(
-            num_experts=num_experts,
-            top_k=1,
-            hidden_size=hidden_size,
-            ffn_hidden_size=ffn_hidden_size,
-            w_gate=w_gate,
-            w_up=w_up,
-            w_down=w_down,
-            ep_size=ep_size,
-            ep_rank=ep_rank,
-            scoring_func="softmax",
-        )
-
         T = 4
         hidden = torch.randn(T, hidden_size)
 
@@ -273,8 +260,9 @@ class TestZeroRoutedTokens:
         output = impl2.forward(hidden, logits)
         # With sigmoid(-50) ≈ 0, the weighted expert output should be ~0
         assert output.shape == (T, hidden_size)
-        assert torch.allclose(output, torch.zeros_like(output), atol=1e-5), \
+        assert torch.allclose(output, torch.zeros_like(output), atol=1e-5), (
             "Tokens with near-zero routing weights should produce near-zero output"
+        )
 
 
 class TestSharedExpertWithEP:
@@ -372,6 +360,7 @@ class TestSharedExpertWithEP:
                 def reduce_fn(t):
                     out_list.append(t.clone())
                     return t
+
                 return reduce_fn
 
             node = FusedMoEImpl(
@@ -404,10 +393,7 @@ class TestSharedExpertWithEP:
         ep2_output = routed_sum + shared_out
 
         max_diff = (ep2_output - ref_output).abs().max().item()
-        assert max_diff < 1e-3, (
-            f"EP=2 with shared expert does not match EP=1 reference: "
-            f"max_diff={max_diff:.2e}"
-        )
+        assert max_diff < 1e-3, f"EP=2 with shared expert does not match EP=1 reference: max_diff={max_diff:.2e}"
 
     def test_shared_expert_not_duplicated_by_reduce(self):
         """Shared expert output must appear exactly once after all_reduce.
@@ -450,11 +436,17 @@ class TestSharedExpertWithEP:
 
         # EP=1 reference
         ref_impl = FusedMoEImpl(
-            num_experts=num_experts, top_k=top_k,
-            hidden_size=hidden_size, ffn_hidden_size=ffn_hidden_size,
-            w_gate=all_w_gate, w_up=all_w_up, w_down=all_w_down,
-            ep_size=1, ep_rank=0,
-            scoring_func="sigmoid", renormalize=False,
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            ffn_hidden_size=ffn_hidden_size,
+            w_gate=all_w_gate,
+            w_up=all_w_up,
+            w_down=all_w_down,
+            ep_size=1,
+            ep_rank=0,
+            scoring_func="sigmoid",
+            renormalize=False,
             routed_scaling_factor=1.0,
             shared_expert_gate=shared_gate,
             shared_expert_up=shared_up,
@@ -479,15 +471,21 @@ class TestSharedExpertWithEP:
                 def reduce_fn(t):
                     out_list.append(t.clone())
                     return t
+
                 return reduce_fn
 
             node = FusedMoEImpl(
-                num_experts=num_experts, top_k=top_k,
-                hidden_size=hidden_size, ffn_hidden_size=ffn_hidden_size,
-                w_gate=all_w_gate[start:end], w_up=all_w_up[start:end],
+                num_experts=num_experts,
+                top_k=top_k,
+                hidden_size=hidden_size,
+                ffn_hidden_size=ffn_hidden_size,
+                w_gate=all_w_gate[start:end],
+                w_up=all_w_up[start:end],
                 w_down=all_w_down[start:end],
-                ep_size=ep_size, ep_rank=rank,
-                scoring_func="sigmoid", renormalize=False,
+                ep_size=ep_size,
+                ep_rank=rank,
+                scoring_func="sigmoid",
+                renormalize=False,
                 routed_scaling_factor=1.0,
                 reduce_fn=make_capture(captured),
                 shared_expert_gate=shared_gate,
@@ -512,6 +510,4 @@ class TestSharedExpertWithEP:
         ep2_final = routed_global + shared_out
 
         max_diff = (ep2_final - ref_output).abs().max().item()
-        assert max_diff < 1e-3, (
-            f"Shared expert duplicated by EP reduce: max_diff={max_diff:.2e}"
-        )
+        assert max_diff < 1e-3, f"Shared expert duplicated by EP reduce: max_diff={max_diff:.2e}"

@@ -19,15 +19,11 @@
 
 #include "mk_traits.h"
 
-std::map<std::string, double> validate_sdpa_flash2_neon_cache_microkernels(
-    std::string dtype, int64_t E, int64_t Sk) {
-  return ::fused_cpp::sdpa_microkernels::mk_validate_dispatch(
-      "baseline", dtype, E, Sk);
+std::map<std::string, double> validate_sdpa_flash2_neon_cache_microkernels(std::string dtype, int64_t E, int64_t Sk) {
+  return ::fused_cpp::sdpa_microkernels::mk_validate_dispatch("baseline", dtype, E, Sk);
 }
 
-std::map<std::string, double> benchmark_sdpa_flash2_neon_cache_microkernels(
-    std::string dtype, int64_t E, int64_t Sk,
-    int64_t iterations, int64_t warmup) {
-  return ::fused_cpp::sdpa_microkernels::mk_benchmark_dispatch(
-      "baseline", dtype, E, Sk, iterations, warmup);
+std::map<std::string, double> benchmark_sdpa_flash2_neon_cache_microkernels(std::string dtype, int64_t E, int64_t Sk,
+                                                                            int64_t iterations, int64_t warmup) {
+  return ::fused_cpp::sdpa_microkernels::mk_benchmark_dispatch("baseline", dtype, E, Sk, iterations, warmup);
 }

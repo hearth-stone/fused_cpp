@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """DeepSeek V4 CPU prefill cache/index helper baselines."""
+
 from __future__ import annotations
 
 import torch
@@ -135,9 +136,7 @@ def dequantize_and_gather_k_cache_torch_baseline(
         n_full = int(seq_lens_cpu[i].item())
         if n_full == 0:
             continue
-        n_to_gather = (
-            int(gather_lens_cpu[i].item()) if gather_lens_cpu is not None else n_full
-        )
+        n_to_gather = int(gather_lens_cpu[i].item()) if gather_lens_cpu is not None else n_full
         if n_to_gather == 0:
             continue
 
@@ -146,9 +145,7 @@ def dequantize_and_gather_k_cache_torch_baseline(
         gathered = k_cache.index_select(0, block_ids.to(torch.long))
         gathered = gathered.reshape(num_blocks * block_size, head_dim)
         start = max(0, n_full - n_to_gather)
-        out[i, offset : offset + n_to_gather, :] = gathered[start:n_full].to(
-            out.dtype
-        )
+        out[i, offset : offset + n_to_gather, :] = gathered[start:n_full].to(out.dtype)
 
 
 def dequantize_and_gather_dual_k_cache_torch_baseline(
@@ -214,9 +211,7 @@ def combine_topk_swa_indices_torch_baseline(
         dtype=torch.int32,
         device=topk_indices.device,
     )
-    combined_lens = torch.zeros(
-        num_tokens, dtype=torch.int32, device=topk_indices.device
-    )
+    combined_lens = torch.zeros(num_tokens, dtype=torch.int32, device=topk_indices.device)
     if num_tokens == 0:
         return combined_indices, combined_lens
 
@@ -240,24 +235,16 @@ def combine_topk_swa_indices_torch_baseline(
         for i in range(query_len):
             tok = q_start + i
             pos = start_pos + i
-            topk_len = (
-                min((pos + 1) // compress_ratio, topk)
-                if compress_ratio > 0
-                else 0
-            )
+            topk_len = min((pos + 1) // compress_ratio, topk) if compress_ratio > 0 else 0
             swa_len = min(pos + 1, window_size)
 
             if topk_len > 0:
                 src = topk_indices_i32[tok, :topk_len]
                 combined_indices[tok, :topk_len] = src + (M * batch_idx)
             if swa_len > 0:
-                offsets = torch.arange(
-                    swa_len, dtype=torch.int32, device=topk_indices.device
-                )
+                offsets = torch.arange(swa_len, dtype=torch.int32, device=topk_indices.device)
                 base_off = M * batch_idx + N + (pos - swa_len + 1 - gather_start)
-                combined_indices[tok, topk_len : topk_len + swa_len] = (
-                    base_off + offsets
-                )
+                combined_indices[tok, topk_len : topk_len + swa_len] = base_off + offsets
             combined_lens[tok] = topk_len + swa_len
 
     return combined_indices, combined_lens

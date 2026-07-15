@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """FusedMoEImpl: Pure PyTorch Mixture of Experts with full-token EP optimization."""
+
 from __future__ import annotations
 
 from typing import Callable, Optional
@@ -36,21 +37,13 @@ class FusedMoEImpl:
     ) -> None:
         # Validate ep_size divides num_experts
         if num_experts % ep_size != 0:
-            raise ValueError(
-                f"num_experts ({num_experts}) must be divisible by "
-                f"ep_size ({ep_size})"
-            )
+            raise ValueError(f"num_experts ({num_experts}) must be divisible by ep_size ({ep_size})")
         # Validate scoring_func
         if scoring_func not in ("softmax", "sigmoid"):
-            raise ValueError(
-                f"scoring_func must be 'softmax' or 'sigmoid', "
-                f"got '{scoring_func}'"
-            )
+            raise ValueError(f"scoring_func must be 'softmax' or 'sigmoid', got '{scoring_func}'")
         # Validate ep_rank
         if not (0 <= ep_rank < ep_size):
-            raise ValueError(
-                f"ep_rank ({ep_rank}) must be in [0, ep_size={ep_size})"
-            )
+            raise ValueError(f"ep_rank ({ep_rank}) must be in [0, ep_size={ep_size})")
 
         self.num_experts = num_experts
         self.top_k = top_k
@@ -74,9 +67,7 @@ class FusedMoEImpl:
 
         # Shared expert weights (optional) — fuse gate+up
         if shared_expert_gate is not None and shared_expert_up is not None:
-            self.shared_gate_up = torch.cat(
-                [shared_expert_gate, shared_expert_up], dim=0
-            )  # [2F, H]
+            self.shared_gate_up = torch.cat([shared_expert_gate, shared_expert_up], dim=0)  # [2F, H]
         else:
             self.shared_gate_up = None
         self.shared_expert_down = shared_expert_down
@@ -86,26 +77,26 @@ class FusedMoEImpl:
     @property
     def w_gate(self) -> torch.Tensor:
         """Gate weights: first half of fused w_gate_up."""
-        return self.w_gate_up[:, :self.ffn_hidden_size, :]
+        return self.w_gate_up[:, : self.ffn_hidden_size, :]
 
     @property
     def w_up(self) -> torch.Tensor:
         """Up weights: second half of fused w_gate_up."""
-        return self.w_gate_up[:, self.ffn_hidden_size:, :]
+        return self.w_gate_up[:, self.ffn_hidden_size :, :]
 
     @property
     def shared_expert_gate(self) -> torch.Tensor | None:
         """Shared gate weights: first half of fused shared_gate_up."""
         if self.shared_gate_up is None:
             return None
-        return self.shared_gate_up[:self.shared_gate_up.shape[0] // 2, :]
+        return self.shared_gate_up[: self.shared_gate_up.shape[0] // 2, :]
 
     @property
     def shared_expert_up(self) -> torch.Tensor | None:
         """Shared up weights: second half of fused shared_gate_up."""
         if self.shared_gate_up is None:
             return None
-        return self.shared_gate_up[self.shared_gate_up.shape[0] // 2:, :]
+        return self.shared_gate_up[self.shared_gate_up.shape[0] // 2 :, :]
 
     def forward(
         self,
@@ -122,7 +113,7 @@ class FusedMoEImpl:
             Output tensor of shape [total_tokens, hidden_size].
         """
         # Step 1: Slice router_logits to local expert columns
-        local_logits = router_logits[:, self.expert_start:self.expert_end]
+        local_logits = router_logits[:, self.expert_start : self.expert_end]
 
         # Step 2: Compute scores in float32 for numerical stability
         if self.scoring_func == "softmax":

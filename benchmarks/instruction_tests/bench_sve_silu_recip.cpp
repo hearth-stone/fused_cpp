@@ -22,10 +22,14 @@ enum class DivMode {
 
 const char* ModeName(DivMode mode) {
   switch (mode) {
-    case DivMode::kFdiv: return "fdiv";
-    case DivMode::kRecip1: return "frecpe_1";
-    case DivMode::kRecip2: return "frecpe_2";
-    case DivMode::kRecip3: return "frecpe_3";
+    case DivMode::kFdiv:
+      return "fdiv";
+    case DivMode::kRecip1:
+      return "frecpe_1";
+    case DivMode::kRecip2:
+      return "frecpe_2";
+    case DivMode::kRecip3:
+      return "frecpe_3";
   }
   return "unknown";
 }
@@ -135,10 +139,14 @@ using KernelFn = void (*)(const float*, const float*, float*, std::size_t);
 
 KernelFn FnForMode(DivMode mode) {
   switch (mode) {
-    case DivMode::kFdiv: return &KernelUnroll4<DivMode::kFdiv>;
-    case DivMode::kRecip1: return &KernelUnroll4<DivMode::kRecip1>;
-    case DivMode::kRecip2: return &KernelUnroll4<DivMode::kRecip2>;
-    case DivMode::kRecip3: return &KernelUnroll4<DivMode::kRecip3>;
+    case DivMode::kFdiv:
+      return &KernelUnroll4<DivMode::kFdiv>;
+    case DivMode::kRecip1:
+      return &KernelUnroll4<DivMode::kRecip1>;
+    case DivMode::kRecip2:
+      return &KernelUnroll4<DivMode::kRecip2>;
+    case DivMode::kRecip3:
+      return &KernelUnroll4<DivMode::kRecip3>;
   }
   return nullptr;
 }
@@ -154,8 +162,7 @@ struct Stats {
   double elems_per_s = 0.0;
 };
 
-Stats Bench(KernelFn fn, const float* gate, const float* up, float* out,
-            std::size_t n, int warmup, int iters) {
+Stats Bench(KernelFn fn, const float* gate, const float* up, float* out, std::size_t n, int warmup, int iters) {
   for (int i = 0; i < warmup; ++i) {
     fn(gate, up, out, n);
   }
@@ -250,15 +257,12 @@ int main(int argc, char** argv) {
     up[i] = std::max(-8.0f, std::min(8.0f, dist(rng)));
   }
 
-  std::printf("elems=%zu vl_f32=%zu matrix_like=%.1fM values\n",
-              elems, svcntw(), elems / 1e6);
-  std::printf("%-10s %10s %10s %12s %12s %12s %12s %12s\n",
-              "mode", "median_ms", "min_ms", "Gelem/s",
-              "max_abs", "max_rel", "rms", "bf16_mis%");
+  std::printf("elems=%zu vl_f32=%zu matrix_like=%.1fM values\n", elems, svcntw(), elems / 1e6);
+  std::printf("%-10s %10s %10s %12s %12s %12s %12s %12s\n", "mode", "median_ms", "min_ms", "Gelem/s", "max_abs",
+              "max_rel", "rms", "bf16_mis%");
 
   KernelUnroll4<DivMode::kFdiv>(gate, up, ref, elems);
-  const DivMode modes[] = {
-      DivMode::kFdiv, DivMode::kRecip1, DivMode::kRecip2, DivMode::kRecip3};
+  const DivMode modes[] = {DivMode::kFdiv, DivMode::kRecip1, DivMode::kRecip2, DivMode::kRecip3};
   for (DivMode mode : modes) {
     KernelFn fn = FnForMode(mode);
     Stats s = Bench(fn, gate, up, out, elems, warmup, iters);
@@ -269,11 +273,9 @@ int main(int argc, char** argv) {
       fn(gate, up, out, elems);
       d = Compare(ref, out, elems);
     }
-    std::printf("%-10s %10.3f %10.3f %12.3f %12.6g %12.6g %12.6g %12.4f\n",
-                ModeName(mode), s.median_ms, s.min_ms, s.elems_per_s / 1e9,
-                d.max_abs, d.max_rel, d.rms,
-                100.0 * static_cast<double>(d.bf16_mismatch) /
-                    static_cast<double>(elems));
+    std::printf("%-10s %10.3f %10.3f %12.3f %12.6g %12.6g %12.6g %12.4f\n", ModeName(mode), s.median_ms, s.min_ms,
+                s.elems_per_s / 1e9, d.max_abs, d.max_rel, d.rms,
+                100.0 * static_cast<double>(d.bf16_mismatch) / static_cast<double>(elems));
   }
 
   std::free(gate);

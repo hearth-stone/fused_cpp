@@ -38,12 +38,13 @@ build_ext --inplace``）。脚本只 import ``fused_cpp._C``，不需要 torch S
 speedup + 占指令峰值的百分比（如果传了 --peak-*）。退出码 0 = 全 pass，
 非 0 = 至少一个 max_abs 超过容忍度。
 """
+
 from __future__ import annotations
 
 import argparse
 import math
 import sys
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 
 # ── 实现 → 测试 dtype × 是否接入 SDPA 主路径 ────────────────────────────
 #
@@ -87,6 +88,7 @@ def _label(impl: str, wired: bool) -> str:
     """显示用：未接入 SDPA 的 microkernel 名后缀加 ` *`。"""
     return impl if wired else impl + EVAL_ONLY_SUFFIX
 
+
 # correctness 容忍度：bf16 的 BFMMLA 与 scalar 参考累加序不一致，预期 < 0.1；
 # fp32 的 fma 顺序差异预期 < 1e-4。
 TOL_PER_DTYPE = {"fp32": 5e-3, "bf16": 1e-1}
@@ -116,14 +118,17 @@ def load_C():
     return _C
 
 
-def best_of(C, impl: str, dtype: str, E: int, Sk: int,
-            iters: int, warmup: int, runs: int) -> float:
+def best_of(C, impl: str, dtype: str, E: int, Sk: int, iters: int, warmup: int, runs: int) -> float:
     """跑 ``runs`` 次 benchmark，返回 qkt_8x8 的最大 GFLOPS。"""
     best = 0.0
     for _ in range(runs):
         r = C.benchmark_microkernel(
-            impl=impl, dtype=dtype, E=E, Sk=Sk,
-            iterations=iters, warmup=warmup,
+            impl=impl,
+            dtype=dtype,
+            E=E,
+            Sk=Sk,
+            iterations=iters,
+            warmup=warmup,
         )
         v = r.get("qkt_8x8_gflops")
         if v is None or not math.isfinite(v):
@@ -138,31 +143,35 @@ def main() -> int:
         description=__doc__,
     )
     p.add_argument(
-        "--shapes", nargs="+", default=["192,128", "512,512", "1024,680", "2048,2048"],
+        "--shapes",
+        nargs="+",
+        default=["192,128", "512,512", "1024,680", "2048,2048"],
         help="(E,Sk) 列表，逗号分隔。默认覆盖 short / R1-like / long-ctx / extra-long。",
     )
-    p.add_argument("--iters", type=int, default=4000,
-                   help="每次 benchmark 的内层 iteration 数（默认 4000）")
-    p.add_argument("--warmup", type=int, default=200,
-                   help="warmup iteration 数（默认 200）")
-    p.add_argument("--runs", type=int, default=4,
-                   help="best-of-N 次数（默认 4）")
-    p.add_argument("--peak-fp32", type=float, default=None,
-                   help="本机 fp32 fmla 单核峰值 GFLOPS（用于 %% peak 列）")
+    p.add_argument("--iters", type=int, default=4000, help="每次 benchmark 的内层 iteration 数（默认 4000）")
+    p.add_argument("--warmup", type=int, default=200, help="warmup iteration 数（默认 200）")
+    p.add_argument("--runs", type=int, default=4, help="best-of-N 次数（默认 4）")
+    p.add_argument("--peak-fp32", type=float, default=None, help="本机 fp32 fmla 单核峰值 GFLOPS（用于 %% peak 列）")
     p.add_argument(
-        "--peak-bf16-half", type=float, default=None,
+        "--peak-bf16-half",
+        type=float,
+        default=None,
         help="本机 BFMMLA half-rate 单核峰值 GFLOPS（baseline / packk_* 的参考）",
     )
     p.add_argument(
-        "--peak-bf16-full", type=float, default=None,
+        "--peak-bf16-full",
+        type=float,
+        default=None,
         help="本机 BFMLALB/T full-rate 单核峰值 GFLOPS（信息性参考；当前 microkernel 不走这条）",
     )
     p.add_argument(
-        "--skip-correctness", action="store_true",
+        "--skip-correctness",
+        action="store_true",
         help="跳过正确性检查，只跑 GFLOPS（在已知 impl 正确的机器上加速 sweep）",
     )
     p.add_argument(
-        "--correctness-shapes", nargs="+",
+        "--correctness-shapes",
+        nargs="+",
         default=["32,32", "192,128", "512,512", "1024,680"],
         help="正确性测试用的 (E,Sk) 列表",
     )
@@ -213,17 +222,13 @@ def main() -> int:
                     tol = TOL_PER_DTYPE[dtype]
                     ok = val < tol
                     flag = "OK" if ok else f"FAIL (tol={tol})"
-                    print(
-                        f"    {_label(impl, wired):20s} {dtype:5s} "
-                        f"max_abs={val:.3e}  [{flag}]"
-                    )
+                    print(f"    {_label(impl, wired):20s} {dtype:5s} max_abs={val:.3e}  [{flag}]")
                     if not ok:
                         n_fail += 1
         print()
 
     if n_fail > 0:
-        print(f"WARNING: {n_fail} correctness check(s) failed; bench data below "
-              "may not be meaningful.\n")
+        print(f"WARNING: {n_fail} correctness check(s) failed; bench data below may not be meaningful.\n")
 
     # ── 2. GFLOPS benchmark ────────────────────────────────────────────
     print("=" * 78)
@@ -240,42 +245,26 @@ def main() -> int:
 
     # 按 dtype 分组打印（baseline 同时出现在 fp32 和 bf16）。
     for dtype in ("fp32", "bf16"):
-        impls_for_dtype = [
-            (impl, wired) for impl, ds, wired in matrix if dtype in ds
-        ]
+        impls_for_dtype = [(impl, wired) for impl, ds, wired in matrix if dtype in ds]
         if not impls_for_dtype:
             continue
-        peak = (
-            args.peak_fp32 if dtype == "fp32"
-            else args.peak_bf16_half
-        )
-        peak_label = (
-            "fmla peak" if dtype == "fp32"
-            else "BFMMLA half-rate peak"
-        )
-        print(f"\n--- dtype={dtype}"
-              + (f"   (peak ref: {peak} GFLOPS = {peak_label})" if peak else "")
-              + " ---")
+        peak = args.peak_fp32 if dtype == "fp32" else args.peak_bf16_half
+        peak_label = "fmla peak" if dtype == "fp32" else "BFMMLA half-rate peak"
+        print(f"\n--- dtype={dtype}" + (f"   (peak ref: {peak} GFLOPS = {peak_label})" if peak else "") + " ---")
 
         # 表头：未接入 SDPA 的 impl 名加 ` *` 后缀
         labels = [_label(im, w) for im, w in impls_for_dtype]
         col_impls = "  ".join(f"{lbl:>17s}" for lbl in labels)
-        col_speedups = "  ".join(f"{lbl+'_x':>17s}" for lbl in labels)
-        col_pcts = (
-            "  ".join(f"{lbl+'_%peak':>17s}" for lbl in labels)
-            if peak else ""
-        )
-        print(f"  {'E':>5s} {'Sk':>5s} | {col_impls} | {col_speedups}"
-              + (f" | {col_pcts}" if peak else ""))
-        print("  " + "-" * (12 + len(col_impls) + 3 + len(col_speedups)
-                            + (3 + len(col_pcts) if peak else 0)))
+        col_speedups = "  ".join(f"{lbl + '_x':>17s}" for lbl in labels)
+        col_pcts = "  ".join(f"{lbl + '_%peak':>17s}" for lbl in labels) if peak else ""
+        print(f"  {'E':>5s} {'Sk':>5s} | {col_impls} | {col_speedups}" + (f" | {col_pcts}" if peak else ""))
+        print("  " + "-" * (12 + len(col_impls) + 3 + len(col_speedups) + (3 + len(col_pcts) if peak else 0)))
 
         for E, Sk in shapes:
             # 全部 impl 跑一遍，取每个的最大 GFLOPS
             gf = {}
             for impl, _ in impls_for_dtype:
-                gf[impl] = best_of(C, impl, dtype, E, Sk,
-                                   args.iters, args.warmup, args.runs)
+                gf[impl] = best_of(C, impl, dtype, E, Sk, args.iters, args.warmup, args.runs)
             base = gf.get("baseline", 0.0) or 1e-9
 
             row = f"  {E:5d} {Sk:5d} |"

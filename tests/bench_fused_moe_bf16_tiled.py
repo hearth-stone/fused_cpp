@@ -19,9 +19,7 @@ from fused_cpp.moe import prepare_fused_moe_bf16_tiled_weights
 DEEPSEEK_V4_FLASH_HIDDEN_SIZE = 4096
 DEEPSEEK_V4_FLASH_MOE_INTERMEDIATE_SIZE = 2048
 DEEPSEEK_V4_FLASH_TP_SIZE = 4
-DEEPSEEK_V4_FLASH_FFN_PER_RANK = (
-    DEEPSEEK_V4_FLASH_MOE_INTERMEDIATE_SIZE // DEEPSEEK_V4_FLASH_TP_SIZE
-)
+DEEPSEEK_V4_FLASH_FFN_PER_RANK = DEEPSEEK_V4_FLASH_MOE_INTERMEDIATE_SIZE // DEEPSEEK_V4_FLASH_TP_SIZE
 DEEPSEEK_V4_FLASH_ROUTED_EXPERTS = 256
 DEEPSEEK_V4_FLASH_TOP_K = 6
 
@@ -120,18 +118,12 @@ def _print_result(result: dict[str, object]) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter
-    )
+    parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("--tokens", type=int, default=2048)
-    parser.add_argument("--hidden-size", type=int,
-                        default=DEEPSEEK_V4_FLASH_HIDDEN_SIZE)
-    parser.add_argument("--ffn-hidden-size", type=int,
-                        default=DEEPSEEK_V4_FLASH_FFN_PER_RANK)
-    parser.add_argument("--experts", type=int,
-                        default=DEEPSEEK_V4_FLASH_ROUTED_EXPERTS)
-    parser.add_argument("--top-k", type=int,
-                        default=DEEPSEEK_V4_FLASH_TOP_K)
+    parser.add_argument("--hidden-size", type=int, default=DEEPSEEK_V4_FLASH_HIDDEN_SIZE)
+    parser.add_argument("--ffn-hidden-size", type=int, default=DEEPSEEK_V4_FLASH_FFN_PER_RANK)
+    parser.add_argument("--experts", type=int, default=DEEPSEEK_V4_FLASH_ROUTED_EXPERTS)
+    parser.add_argument("--top-k", type=int, default=DEEPSEEK_V4_FLASH_TOP_K)
     parser.add_argument("--threads", type=int, default=1)
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--runs", type=int, default=5)
@@ -156,10 +148,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     if not _HAS_BF16_TILED_FUSED_MOE:
-        raise RuntimeError(
-            "BF16 tiled fused MoE backend is unavailable; "
-            "build the C++ extension first."
-        )
+        raise RuntimeError("BF16 tiled fused MoE backend is unavailable; build the C++ extension first.")
     if args.top_k > args.experts:
         raise ValueError(f"top_k={args.top_k} cannot exceed experts={args.experts}")
 
@@ -258,13 +247,9 @@ def main() -> None:
             runs=args.runs,
             total_flops=total_flops,
         )
-        max_diff = float(
-            (fused_out.float() - baseline_out.float()).abs().max().item())
+        max_diff = float((fused_out.float() - baseline_out.float()).abs().max().item())
         _print_result(baseline_result)
-        speedup = (
-            float(baseline_result["median_s"]) /
-            float(fused_result["median_s"])
-        )
+        speedup = float(baseline_result["median_s"]) / float(fused_result["median_s"])
         print(f"max_abs_diff_vs_torch_baseline={max_diff:.6f}")
         print(f"speedup_fused_vs_torch_baseline_median={speedup:.3f}x")
 

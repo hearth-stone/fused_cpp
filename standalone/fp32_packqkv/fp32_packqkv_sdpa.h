@@ -29,9 +29,7 @@ struct AlignedAllocator {
     return static_cast<T*>(ptr);
   }
 
-  void deallocate(T* ptr, std::size_t) noexcept {
-    ::free(ptr);
-  }
+  void deallocate(T* ptr, std::size_t) noexcept { ::free(ptr); }
 
   template <typename U>
   struct rebind {
@@ -40,16 +38,12 @@ struct AlignedAllocator {
 };
 
 template <typename T, typename U, std::size_t Alignment>
-inline bool operator==(
-    const AlignedAllocator<T, Alignment>&,
-    const AlignedAllocator<U, Alignment>&) noexcept {
+inline bool operator==(const AlignedAllocator<T, Alignment>&, const AlignedAllocator<U, Alignment>&) noexcept {
   return true;
 }
 
 template <typename T, typename U, std::size_t Alignment>
-inline bool operator!=(
-    const AlignedAllocator<T, Alignment>&,
-    const AlignedAllocator<U, Alignment>&) noexcept {
+inline bool operator!=(const AlignedAllocator<T, Alignment>&, const AlignedAllocator<U, Alignment>&) noexcept {
   return false;
 }
 
@@ -69,27 +63,12 @@ struct Config {
   int64_t s_tile = 0;
 };
 
-void sdpa_fp32_packqkv_pbf16pv(
-    const float* q,
-    const float* k,
-    const float* v,
-    float* out,
-    const Config& cfg);
+void sdpa_fp32_packqkv_pbf16pv(const float* q, const float* k, const float* v, float* out, const Config& cfg);
 
-void reference_sdpa_fp32(
-    const float* q,
-    const float* k,
-    const float* v,
-    float* out,
-    const Config& cfg);
+void reference_sdpa_fp32(const float* q, const float* k, const float* v, float* out, const Config& cfg);
 
-void reference_sdpa_fp32_mask(
-    const float* q,
-    const float* k,
-    const float* v,
-    const float* mask32,
-    float* out,
-    const Config& cfg);
+void reference_sdpa_fp32_mask(const float* q, const float* k, const float* v, const float* mask32, float* out,
+                              const Config& cfg);
 
 double counted_gflops(const Config& cfg, double mean_ms);
 double checksum(const float* data, int64_t size);
@@ -103,125 +82,26 @@ double max_abs_diff(const float* a, const float* b, int64_t size);
 #define FUSED_CPP_FP32_PACKQKV_API __attribute__((visibility("default")))
 #endif
 
-extern "C" FUSED_CPP_FP32_PACKQKV_API int
-fused_cpp_sdpa_flash2_neon_l3kv_packqkv_pbf16pv_fp32_contiguous(
-    const float* q,
-    const float* k,
-    const float* v,
-    float* out,
-    int64_t B,
-    int64_t N,
-    int64_t L,
-    int64_t S,
-    int64_t E,
-    int64_t Ev,
-    int causal,
-    float scale);
+extern "C" FUSED_CPP_FP32_PACKQKV_API int fused_cpp_sdpa_flash2_neon_l3kv_packqkv_pbf16pv_fp32_contiguous(
+    const float* q, const float* k, const float* v, float* out, int64_t B, int64_t N, int64_t L, int64_t S, int64_t E,
+    int64_t Ev, int causal, float scale);
 
-extern "C" FUSED_CPP_FP32_PACKQKV_API int
-fused_cpp_sdpa_flash2_neon_l3kv_packqkv_pbf16pv_fp32_llamacpp(
-    const float* q,
-    const float* k,
-    const float* v,
-    float* out,
-    int64_t B,
-    int64_t H,
-    int64_t L,
-    int64_t S,
-    int64_t D,
-    int64_t DV,
-    int64_t q_nb0,
-    int64_t q_nb1,
-    int64_t q_nb2,
-    int64_t q_nb3,
-    int64_t k_nb0,
-    int64_t k_nb1,
-    int64_t k_nb2,
-    int64_t k_nb3,
-    int64_t v_nb0,
-    int64_t v_nb1,
-    int64_t v_nb2,
-    int64_t v_nb3,
-    int64_t o_nb0,
-    int64_t o_nb1,
-    int64_t o_nb2,
-    int64_t o_nb3,
-    float scale);
+extern "C" FUSED_CPP_FP32_PACKQKV_API int fused_cpp_sdpa_flash2_neon_l3kv_packqkv_pbf16pv_fp32_llamacpp(
+    const float* q, const float* k, const float* v, float* out, int64_t B, int64_t H, int64_t L, int64_t S, int64_t D,
+    int64_t DV, int64_t q_nb0, int64_t q_nb1, int64_t q_nb2, int64_t q_nb3, int64_t k_nb0, int64_t k_nb1, int64_t k_nb2,
+    int64_t k_nb3, int64_t v_nb0, int64_t v_nb1, int64_t v_nb2, int64_t v_nb3, int64_t o_nb0, int64_t o_nb1,
+    int64_t o_nb2, int64_t o_nb3, float scale);
 
-extern "C" FUSED_CPP_FP32_PACKQKV_API int
-fused_cpp_sdpa_flash2_neon_l3kv_packqkv_pbf16pv_fp32_llamacpp_mask_f16(
-    const float* q,
-    const float* k,
-    const float* v,
-    const uint16_t* mask,
-    float* out,
-    int64_t B,
-    int64_t H,
-    int64_t L,
-    int64_t S,
-    int64_t D,
-    int64_t DV,
-    int64_t q_nb0,
-    int64_t q_nb1,
-    int64_t q_nb2,
-    int64_t q_nb3,
-    int64_t k_nb0,
-    int64_t k_nb1,
-    int64_t k_nb2,
-    int64_t k_nb3,
-    int64_t v_nb0,
-    int64_t v_nb1,
-    int64_t v_nb2,
-    int64_t v_nb3,
-    int64_t o_nb0,
-    int64_t o_nb1,
-    int64_t o_nb2,
-    int64_t o_nb3,
-    int64_t mask_ne0,
-    int64_t mask_ne1,
-    int64_t mask_ne2,
-    int64_t mask_ne3,
-    int64_t mask_nb0,
-    int64_t mask_nb1,
-    int64_t mask_nb2,
-    int64_t mask_nb3,
-    float scale);
+extern "C" FUSED_CPP_FP32_PACKQKV_API int fused_cpp_sdpa_flash2_neon_l3kv_packqkv_pbf16pv_fp32_llamacpp_mask_f16(
+    const float* q, const float* k, const float* v, const uint16_t* mask, float* out, int64_t B, int64_t H, int64_t L,
+    int64_t S, int64_t D, int64_t DV, int64_t q_nb0, int64_t q_nb1, int64_t q_nb2, int64_t q_nb3, int64_t k_nb0,
+    int64_t k_nb1, int64_t k_nb2, int64_t k_nb3, int64_t v_nb0, int64_t v_nb1, int64_t v_nb2, int64_t v_nb3,
+    int64_t o_nb0, int64_t o_nb1, int64_t o_nb2, int64_t o_nb3, int64_t mask_ne0, int64_t mask_ne1, int64_t mask_ne2,
+    int64_t mask_ne3, int64_t mask_nb0, int64_t mask_nb1, int64_t mask_nb2, int64_t mask_nb3, float scale);
 
-extern "C" FUSED_CPP_FP32_PACKQKV_API int
-fused_cpp_sdpa_flash2_neon_l3kv_packqkv_pbf16pv_fp32_llamacpp_mask_f32(
-    const float* q,
-    const float* k,
-    const float* v,
-    const float* mask,
-    float* out,
-    int64_t B,
-    int64_t H,
-    int64_t L,
-    int64_t S,
-    int64_t D,
-    int64_t DV,
-    int64_t q_nb0,
-    int64_t q_nb1,
-    int64_t q_nb2,
-    int64_t q_nb3,
-    int64_t k_nb0,
-    int64_t k_nb1,
-    int64_t k_nb2,
-    int64_t k_nb3,
-    int64_t v_nb0,
-    int64_t v_nb1,
-    int64_t v_nb2,
-    int64_t v_nb3,
-    int64_t o_nb0,
-    int64_t o_nb1,
-    int64_t o_nb2,
-    int64_t o_nb3,
-    int64_t mask_ne0,
-    int64_t mask_ne1,
-    int64_t mask_ne2,
-    int64_t mask_ne3,
-    int64_t mask_nb0,
-    int64_t mask_nb1,
-    int64_t mask_nb2,
-    int64_t mask_nb3,
-    float scale);
+extern "C" FUSED_CPP_FP32_PACKQKV_API int fused_cpp_sdpa_flash2_neon_l3kv_packqkv_pbf16pv_fp32_llamacpp_mask_f32(
+    const float* q, const float* k, const float* v, const float* mask, float* out, int64_t B, int64_t H, int64_t L,
+    int64_t S, int64_t D, int64_t DV, int64_t q_nb0, int64_t q_nb1, int64_t q_nb2, int64_t q_nb3, int64_t k_nb0,
+    int64_t k_nb1, int64_t k_nb2, int64_t k_nb3, int64_t v_nb0, int64_t v_nb1, int64_t v_nb2, int64_t v_nb3,
+    int64_t o_nb0, int64_t o_nb1, int64_t o_nb2, int64_t o_nb3, int64_t mask_ne0, int64_t mask_ne1, int64_t mask_ne2,
+    int64_t mask_ne3, int64_t mask_nb0, int64_t mask_nb1, int64_t mask_nb2, int64_t mask_nb3, float scale);

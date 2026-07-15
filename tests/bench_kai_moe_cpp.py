@@ -32,6 +32,7 @@
         --group-splits 1 2 4 5 8 10 20 40 \\
         --warmup 1 --repeat 3
 """
+
 import argparse
 import csv
 import math
@@ -52,6 +53,7 @@ import simulate_moe_routing as smr  # noqa: E402  pylint: disable=wrong-import-p
 
 
 # ── 数据结构 ──
+
 
 @dataclass
 class GEMMSpec:
@@ -79,18 +81,21 @@ class StrategyResult:
     total_flops: float
     wall_time_ms: float
     gflops: float
-    assignment: str = 'roundrobin'
+    assignment: str = "roundrobin"
     speedup_upper: float = 0.0
 
 
 # ── 任务生成 ──
 
+
 def _build_specs(
     num_groups: int,
     m_min: int,
     m_max: int,
-    k1: int, n1: int,
-    k2: int, n2: int,
+    k1: int,
+    n1: int,
+    k2: int,
+    n2: int,
     seed: int,
 ) -> List[GEMMSpec]:
     """生成 ``num_groups`` 组，每组 2 个 GEMM 的 spec 列表（均匀 M 分布）。"""
@@ -105,8 +110,10 @@ def _build_specs(
 
 def _build_specs_from_routing(
     counts: List[int],
-    k1: int, n1: int,
-    k2: int, n2: int,
+    k1: int,
+    n1: int,
+    k2: int,
+    n2: int,
     keep_zero: bool = False,
 ) -> List[GEMMSpec]:
     """根据 per-expert token 计数生成 GEMM spec 列表。
@@ -136,14 +143,20 @@ def _build_inputs_and_outputs(
         gen = torch.Generator().manual_seed(
             seed ^ (s.group_id * 1000003 + s.stage * 19 + s.m),
         )
-        inputs.append(torch.randn(
-            s.m, s.k, dtype=torch.float32, generator=gen,
-        ))
+        inputs.append(
+            torch.randn(
+                s.m,
+                s.k,
+                dtype=torch.float32,
+                generator=gen,
+            )
+        )
         outputs.append(torch.empty(s.m, s.n, dtype=out_dtype))
     return inputs, outputs
 
 
 # ── 权重与 handler 管理 ──
+
 
 class HandlerRegistry:
     """按 ``(K, N)`` 缓存 packed 权重和 handler。
@@ -182,7 +195,9 @@ class HandlerRegistry:
             return existing
         packed = self._get_packed(k, n)
         handler = self._mod.create_kai_gemm_handler(
-            packed, int(k), int(n),
+            packed,
+            int(k),
+            int(n),
         )
         self._handler_cache[key] = handler
         return handler
@@ -200,8 +215,10 @@ class HandlerRegistry:
 
 # ── 任务分配 ──
 
+
 def _assign_roundrobin(
-    specs: List[GEMMSpec], group_splits: int,
+    specs: List[GEMMSpec],
+    group_splits: int,
 ) -> List[List[int]]:
     """按 spec 索引轮询分配（原始行为）。"""
     assignments: List[List[int]] = [[] for _ in range(group_splits)]
@@ -211,11 +228,13 @@ def _assign_roundrobin(
 
 
 def _assign_lpt(
-    specs: List[GEMMSpec], group_splits: int,
+    specs: List[GEMMSpec],
+    group_splits: int,
 ) -> List[List[int]]:
     """LPT 贪心分配：按单次 GEMM FLOPs 降序塞进当前最小负载的 shard。"""
     indexed = sorted(
-        enumerate(specs), key=lambda ispec: -ispec[1].flops(),
+        enumerate(specs),
+        key=lambda ispec: -ispec[1].flops(),
     )
     assignments: List[List[int]] = [[] for _ in range(group_splits)]
     loads: List[float] = [0.0] * group_splits
@@ -227,12 +246,11 @@ def _assign_lpt(
 
 
 def _speedup_upper_bound(
-    assignments: List[List[int]], specs: List[GEMMSpec],
+    assignments: List[List[int]],
+    specs: List[GEMMSpec],
 ) -> float:
     """根据分配结果计算理论 speedup 上限 = total_flops / max_shard_flops。"""
-    shard_flops = [
-        sum(specs[i].flops() for i in group) for group in assignments
-    ]
+    shard_flops = [sum(specs[i].flops() for i in group) for group in assignments]
     total = sum(shard_flops)
     mx = max(shard_flops) if shard_flops else 0.0
     return (total / mx) if mx > 0 else 0.0
@@ -240,14 +258,15 @@ def _speedup_upper_bound(
 
 # ── 策略压测 ──
 
+
 def _split_cpus(cpus: List[int], num_groups: int) -> List[List[int]]:
     """将 ``cpus`` 顺序切分为 ``num_groups`` 段。"""
     if len(cpus) % num_groups != 0:
         raise ValueError(
-            f'可用 CPU 数 {len(cpus)} 无法被 group_splits={num_groups} 整除',
+            f"可用 CPU 数 {len(cpus)} 无法被 group_splits={num_groups} 整除",
         )
     per = len(cpus) // num_groups
-    return [cpus[g * per:(g + 1) * per] for g in range(num_groups)]
+    return [cpus[g * per : (g + 1) * per] for g in range(num_groups)]
 
 
 def _run_one_gemm(
@@ -276,7 +295,7 @@ def _bench_one(
     fused_cpp_mod,
     warmup: int,
     repeat: int,
-    assignment: str = 'roundrobin',
+    assignment: str = "roundrobin",
 ) -> StrategyResult:
     """执行一次策略压测，返回结果。
 
@@ -295,17 +314,17 @@ def _bench_one(
     # 调度线程绑核位置，cpu_ids[1..] 分给 worker。
     pools: List[int] = []
     for cpu_list in group_cpu_lists:
-        pools.append(fused_cpp_mod.create_kai_thread_pool(
-            [int(c) for c in cpu_list],
-        ))
+        pools.append(
+            fused_cpp_mod.create_kai_thread_pool(
+                [int(c) for c in cpu_list],
+            )
+        )
 
     # 为每个 spec 创建（按 (K,N) 去重后的）handler 指针。
-    handler_ptrs: List[int] = [
-        registry.build_handler(s.k, s.n) for s in specs
-    ]
+    handler_ptrs: List[int] = [registry.build_handler(s.k, s.n) for s in specs]
 
     # 将 specs 的索引按策略切分给 group_splits 个 group。
-    if assignment == 'lpt':
+    if assignment == "lpt":
         assignments = _assign_lpt(specs, group_splits)
     else:
         assignments = _assign_roundrobin(specs, group_splits)
@@ -317,8 +336,11 @@ def _bench_one(
             pool_handle = pools[0]
             for i in range(num_gemms):
                 _run_one_gemm(
-                    fused_cpp_mod, handler_ptrs[i], pool_handle,
-                    inputs[i], outputs[i],
+                    fused_cpp_mod,
+                    handler_ptrs[i],
+                    pool_handle,
+                    inputs[i],
+                    outputs[i],
                 )
             return
 
@@ -332,8 +354,11 @@ def _bench_one(
             try:
                 for idx in assignments[gidx]:
                     _run_one_gemm(
-                        fused_cpp_mod, handler_ptrs[idx], pool_handle,
-                        inputs[idx], outputs[idx],
+                        fused_cpp_mod,
+                        handler_ptrs[idx],
+                        pool_handle,
+                        inputs[idx],
+                        outputs[idx],
                     )
             except BaseException as exc:  # pylint: disable=broad-except
                 with exc_lock:
@@ -384,130 +409,135 @@ def _bench_one(
 
 # ── 结果输出 ──
 
+
 def _write_csv(results: List[StrategyResult], path: str) -> None:
-    with open(path, 'w', newline='', encoding='utf-8') as fp:
+    with open(path, "w", newline="", encoding="utf-8") as fp:
         writer = csv.writer(fp)
-        writer.writerow([
-            'strategy', 'assignment', 'total_cpus', 'group_splits',
-            'cpus_per_group', 'num_gemms', 'total_flops', 'wall_time_ms',
-            'gflops', 'speedup_vs_seq', 'speedup_upper',
-        ])
+        writer.writerow(
+            [
+                "strategy",
+                "assignment",
+                "total_cpus",
+                "group_splits",
+                "cpus_per_group",
+                "num_gemms",
+                "total_flops",
+                "wall_time_ms",
+                "gflops",
+                "speedup_vs_seq",
+                "speedup_upper",
+            ]
+        )
         seq = next(
-            (r for r in results if r.strategy == 'sequential'),
+            (r for r in results if r.strategy == "sequential"),
             None,
         )
         base = seq.wall_time_ms if seq else None
         for r in results:
-            speedup = base / r.wall_time_ms if base and r.wall_time_ms > 0 else ''
-            writer.writerow([
-                r.strategy, r.assignment, r.total_cpus, r.group_splits,
-                r.cpus_per_group, r.num_gemms, f'{r.total_flops:.3e}',
-                f'{r.wall_time_ms:.3f}', f'{r.gflops:.2f}',
-                f'{speedup:.3f}' if speedup != '' else '',
-                f'{r.speedup_upper:.3f}',
-            ])
+            speedup = base / r.wall_time_ms if base and r.wall_time_ms > 0 else ""
+            writer.writerow(
+                [
+                    r.strategy,
+                    r.assignment,
+                    r.total_cpus,
+                    r.group_splits,
+                    r.cpus_per_group,
+                    r.num_gemms,
+                    f"{r.total_flops:.3e}",
+                    f"{r.wall_time_ms:.3f}",
+                    f"{r.gflops:.2f}",
+                    f"{speedup:.3f}" if speedup != "" else "",
+                    f"{r.speedup_upper:.3f}",
+                ]
+            )
 
 
 def _print_summary(results: List[StrategyResult]) -> None:
     print()
-    print('=' * 112)
+    print("=" * 112)
     print(
-        f'{"strategy":<12}{"assign":<12}{"cpus":>6}{"x":>4}{"c/g":>5}'
-        f'{"wall_ms":>12}{"GFLOP/s":>12}{"speedup":>10}{"upper":>10}'
-        f'{"eff%":>8}',
+        f"{'strategy':<12}{'assign':<12}{'cpus':>6}{'x':>4}{'c/g':>5}"
+        f"{'wall_ms':>12}{'GFLOP/s':>12}{'speedup':>10}{'upper':>10}"
+        f"{'eff%':>8}",
     )
-    print('=' * 112)
-    seq = next((r for r in results if r.strategy == 'sequential'), None)
+    print("=" * 112)
+    seq = next((r for r in results if r.strategy == "sequential"), None)
     base = seq.wall_time_ms if seq else None
     for r in results:
-        speedup_val = (
-            base / r.wall_time_ms if base and r.wall_time_ms > 0 else 0.0
-        )
-        speedup_str = f'{speedup_val:.2f}x' if speedup_val > 0 else '-'
-        upper_str = f'{r.speedup_upper:.2f}x' if r.speedup_upper > 0 else '-'
-        eff = (
-            100.0 * speedup_val / r.speedup_upper
-            if r.speedup_upper > 0 and speedup_val > 0 else 0.0
-        )
-        eff_str = f'{eff:.1f}%' if eff > 0 else '-'
+        speedup_val = base / r.wall_time_ms if base and r.wall_time_ms > 0 else 0.0
+        speedup_str = f"{speedup_val:.2f}x" if speedup_val > 0 else "-"
+        upper_str = f"{r.speedup_upper:.2f}x" if r.speedup_upper > 0 else "-"
+        eff = 100.0 * speedup_val / r.speedup_upper if r.speedup_upper > 0 and speedup_val > 0 else 0.0
+        eff_str = f"{eff:.1f}%" if eff > 0 else "-"
         print(
-            f'{r.strategy:<12}{r.assignment:<12}{r.total_cpus:>6}'
-            f'{r.group_splits:>4}{r.cpus_per_group:>5}'
-            f'{r.wall_time_ms:>12.2f}{r.gflops:>12.2f}'
-            f'{speedup_str:>10}{upper_str:>10}{eff_str:>8}',
+            f"{r.strategy:<12}{r.assignment:<12}{r.total_cpus:>6}"
+            f"{r.group_splits:>4}{r.cpus_per_group:>5}"
+            f"{r.wall_time_ms:>12.2f}{r.gflops:>12.2f}"
+            f"{speedup_str:>10}{upper_str:>10}{eff_str:>8}",
         )
-    print('=' * 112)
+    print("=" * 112)
 
 
 # ── 主入口 ──
 
+
 def build_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     # —— 路由 / 任务分布 ——
-    parser.add_argument('--routing-mode', default='legacy',
-                        choices=['legacy', 'uniform', 'dirichlet', 'grouped'],
-                        help='GEMM 分布生成模式：legacy 使用 --m-min/--m-max'
-                             '均匀采样（默认，保持旧行为）；其它三种调用'
-                             'simulate_moe_routing 生成真实路由分布')
-    parser.add_argument('--num-tokens', type=int, default=2048,
-                        help='prefill 总 token 数，仅用于非 legacy 模式')
-    parser.add_argument('--num-experts', type=int, default=256,
-                        help='expert 总数，仅用于非 legacy 模式')
-    parser.add_argument('--top-k', type=int, default=8,
-                        help='每 token 激活的 expert 数，仅用于非 legacy 模式')
-    parser.add_argument('--alpha', type=float, default=0.5,
-                        help='Dirichlet 浓度，alpha 越小越偏斜，仅用于'
-                             'dirichlet / grouped 模式')
-    parser.add_argument('--num-route-groups', type=int, default=8,
-                        help='grouped 模式的路由组数，默认 8')
-    parser.add_argument('--top-m-groups', type=int, default=4,
-                        help='grouped 模式每 token 选的组数，默认 4')
-    parser.add_argument('--keep-zero-experts', action='store_true',
-                        help='保留 M=0 的 expert（退化为 M=1 的 GEMM），'
-                             '默认跳过')
+    parser.add_argument(
+        "--routing-mode",
+        default="legacy",
+        choices=["legacy", "uniform", "dirichlet", "grouped"],
+        help="GEMM 分布生成模式：legacy 使用 --m-min/--m-max"
+        "均匀采样（默认，保持旧行为）；其它三种调用"
+        "simulate_moe_routing 生成真实路由分布",
+    )
+    parser.add_argument("--num-tokens", type=int, default=2048, help="prefill 总 token 数，仅用于非 legacy 模式")
+    parser.add_argument("--num-experts", type=int, default=256, help="expert 总数，仅用于非 legacy 模式")
+    parser.add_argument("--top-k", type=int, default=8, help="每 token 激活的 expert 数，仅用于非 legacy 模式")
+    parser.add_argument(
+        "--alpha", type=float, default=0.5, help="Dirichlet 浓度，alpha 越小越偏斜，仅用于dirichlet / grouped 模式"
+    )
+    parser.add_argument("--num-route-groups", type=int, default=8, help="grouped 模式的路由组数，默认 8")
+    parser.add_argument("--top-m-groups", type=int, default=4, help="grouped 模式每 token 选的组数，默认 4")
+    parser.add_argument(
+        "--keep-zero-experts", action="store_true", help="保留 M=0 的 expert（退化为 M=1 的 GEMM），默认跳过"
+    )
     # —— legacy 模式参数 ——
-    parser.add_argument('--num-groups', type=int, default=160,
-                        help='[legacy] 组数（每组 2 个 GEMM），默认 160')
-    parser.add_argument('--m-min', type=int, default=50,
-                        help='[legacy] M 随机范围下界，默认 50')
-    parser.add_argument('--m-max', type=int, default=150,
-                        help='[legacy] M 随机范围上界，默认 150')
+    parser.add_argument("--num-groups", type=int, default=160, help="[legacy] 组数（每组 2 个 GEMM），默认 160")
+    parser.add_argument("--m-min", type=int, default=50, help="[legacy] M 随机范围下界，默认 50")
+    parser.add_argument("--m-max", type=int, default=150, help="[legacy] M 随机范围上界，默认 150")
     # —— GEMM 形状 ——
-    parser.add_argument('--k1', type=int, default=768,
-                        help='GEMM1 的 K，默认 768')
-    parser.add_argument('--n1', type=int, default=5120,
-                        help='GEMM1 的 N，默认 5120')
-    parser.add_argument('--k2', type=int, default=5120,
-                        help='GEMM2 的 K，默认 5120')
-    parser.add_argument('--n2', type=int, default=384,
-                        help='GEMM2 的 N，默认 384')
+    parser.add_argument("--k1", type=int, default=768, help="GEMM1 的 K，默认 768")
+    parser.add_argument("--n1", type=int, default=5120, help="GEMM1 的 N，默认 5120")
+    parser.add_argument("--k2", type=int, default=5120, help="GEMM2 的 K，默认 5120")
+    parser.add_argument("--n2", type=int, default=384, help="GEMM2 的 N，默认 384")
     # —— 调度 / 资源 ——
-    parser.add_argument('--cpus', default='',
-                        help='手动指定可用 CPU 列表（形如 "0-79" 或 '
-                             '"0,1,2,...,79"）；未指定则读取 '
-                             'os.sched_getaffinity(0)')
-    parser.add_argument('--group-splits', nargs='+', type=int,
-                        default=[1, 2, 4, 5, 8, 10, 20],
-                        help='grouped 策略的分组数列表，必须整除 len(cpus)；'
-                             '1 表示 sequential')
-    parser.add_argument('--assignment', nargs='+',
-                        default=['roundrobin'],
-                        choices=['roundrobin', 'lpt'],
-                        help='任务分配策略列表，可同时跑多种对比；'
-                             '默认 roundrobin')
-    parser.add_argument('--dtype', default='bf16',
-                        choices=['fp32', 'bf16'],
-                        help='输出 dtype，默认 bf16')
-    parser.add_argument('--warmup', type=int, default=1,
-                        help='warmup 轮数，默认 1')
-    parser.add_argument('--repeat', type=int, default=3,
-                        help='正式测量轮数，取最短 wall time，默认 3')
-    parser.add_argument('--seed', type=int, default=0,
-                        help='随机种子，默认 0')
-    parser.add_argument('--output-csv', default='bench_kai_moe_cpp.csv',
-                        help='CSV 输出路径')
-    parser.add_argument('--show-histogram', action='store_true',
-                        help='打印 M 分布直方图（仅非 legacy 模式）')
+    parser.add_argument(
+        "--cpus",
+        default="",
+        help='手动指定可用 CPU 列表（形如 "0-79" 或 "0,1,2,...,79"）；未指定则读取 os.sched_getaffinity(0)',
+    )
+    parser.add_argument(
+        "--group-splits",
+        nargs="+",
+        type=int,
+        default=[1, 2, 4, 5, 8, 10, 20],
+        help="grouped 策略的分组数列表，必须整除 len(cpus)；1 表示 sequential",
+    )
+    parser.add_argument(
+        "--assignment",
+        nargs="+",
+        default=["roundrobin"],
+        choices=["roundrobin", "lpt"],
+        help="任务分配策略列表，可同时跑多种对比；默认 roundrobin",
+    )
+    parser.add_argument("--dtype", default="bf16", choices=["fp32", "bf16"], help="输出 dtype，默认 bf16")
+    parser.add_argument("--warmup", type=int, default=1, help="warmup 轮数，默认 1")
+    parser.add_argument("--repeat", type=int, default=3, help="正式测量轮数，取最短 wall time，默认 3")
+    parser.add_argument("--seed", type=int, default=0, help="随机种子，默认 0")
+    parser.add_argument("--output-csv", default="bench_kai_moe_cpp.csv", help="CSV 输出路径")
+    parser.add_argument("--show-histogram", action="store_true", help="打印 M 分布直方图（仅非 legacy 模式）")
     return parser
 
 
@@ -516,12 +546,12 @@ def _parse_cpu_list(s: str) -> Optional[List[int]]:
     if not s:
         return None
     cpus: List[int] = []
-    for part in s.split(','):
+    for part in s.split(","):
         part = part.strip()
         if not part:
             continue
-        if '-' in part:
-            lo_str, hi_str = part.split('-', 1)
+        if "-" in part:
+            lo_str, hi_str = part.split("-", 1)
             lo, hi = int(lo_str), int(hi_str)
             cpus.extend(range(lo, hi + 1))
         else:
@@ -538,25 +568,23 @@ def main() -> int:
     try:
         import fused_cpp  # type: ignore[import-not-found]
     except ImportError as exc:
-        print(f'[ERROR] 无法导入 fused_cpp：{exc}', file=sys.stderr)
+        print(f"[ERROR] 无法导入 fused_cpp：{exc}", file=sys.stderr)
         return 1
 
-    kai_ok = getattr(fused_cpp, '_supports_kai', False)
-    is_aarch64 = platform.machine() in ('aarch64', 'arm64')
+    kai_ok = getattr(fused_cpp, "_supports_kai", False)
+    is_aarch64 = platform.machine() in ("aarch64", "arm64")
     if not (kai_ok and is_aarch64):
         print(
-            '[ERROR] KleidiAI 后端不可用（需要 AArch64 且已启用 KleidiAI 构建）',
+            "[ERROR] KleidiAI 后端不可用（需要 AArch64 且已启用 KleidiAI 构建）",
             file=sys.stderr,
         )
         return 2
 
     mod = fused_cpp._C  # 直接取低层模块
-    for name in ('create_kai_thread_pool', 'destroy_kai_thread_pool',
-                 'create_kai_gemm_handler', 'kai_gemm'):
+    for name in ("create_kai_thread_pool", "destroy_kai_thread_pool", "create_kai_gemm_handler", "kai_gemm"):
         if not hasattr(mod, name):
             print(
-                f'[ERROR] 当前已编译的 fused_cpp 不包含 {name}，'
-                '请重新编译 C++ 扩展',
+                f"[ERROR] 当前已编译的 fused_cpp 不包含 {name}，请重新编译 C++ 扩展",
                 file=sys.stderr,
             )
             return 3
@@ -564,82 +592,102 @@ def main() -> int:
     # 解析可用 CPU。
     cpus = _parse_cpu_list(args.cpus)
     if cpus is None:
-        if hasattr(os, 'sched_getaffinity'):
+        if hasattr(os, "sched_getaffinity"):
             cpus = sorted(os.sched_getaffinity(0))
         else:
             cpus = list(range(os.cpu_count() or 1))
     if not cpus:
-        print('[ERROR] 可用 CPU 列表为空', file=sys.stderr)
+        print("[ERROR] 可用 CPU 列表为空", file=sys.stderr)
         return 4
 
     for x in args.group_splits:
         if x < 1 or len(cpus) % x != 0:
             print(
-                f'[ERROR] group_splits 中的 {x} 无法整除 len(cpus)={len(cpus)}',
+                f"[ERROR] group_splits 中的 {x} 无法整除 len(cpus)={len(cpus)}",
                 file=sys.stderr,
             )
             return 5
 
-    dtype_map = {'fp32': torch.float32, 'bf16': torch.bfloat16}
+    dtype_map = {"fp32": torch.float32, "bf16": torch.bfloat16}
     out_dtype = dtype_map[args.dtype]
 
     # —— 根据 routing-mode 生成 GEMM specs ——
-    if args.routing_mode == 'legacy':
+    if args.routing_mode == "legacy":
         specs = _build_specs(
-            args.num_groups, args.m_min, args.m_max,
-            args.k1, args.n1, args.k2, args.n2, args.seed,
+            args.num_groups,
+            args.m_min,
+            args.m_max,
+            args.k1,
+            args.n1,
+            args.k2,
+            args.n2,
+            args.seed,
         )
         print(
-            f'[INFO] 分布: legacy uniform(M ∈ [{args.m_min}, {args.m_max}]), '
-            f'num_groups={args.num_groups}',
+            f"[INFO] 分布: legacy uniform(M ∈ [{args.m_min}, {args.m_max}]), num_groups={args.num_groups}",
         )
     else:
         route_rng = random.Random(args.seed)
-        if args.routing_mode == 'uniform':
+        if args.routing_mode == "uniform":
             counts = smr._routing_uniform(  # pylint: disable=protected-access
-                args.num_tokens, args.num_experts, args.top_k, route_rng,
+                args.num_tokens,
+                args.num_experts,
+                args.top_k,
+                route_rng,
             )
-        elif args.routing_mode == 'dirichlet':
+        elif args.routing_mode == "dirichlet":
             counts = smr._routing_dirichlet(  # pylint: disable=protected-access
-                args.num_tokens, args.num_experts, args.top_k,
-                args.alpha, route_rng,
+                args.num_tokens,
+                args.num_experts,
+                args.top_k,
+                args.alpha,
+                route_rng,
             )
         else:  # grouped
             counts = smr._routing_grouped(  # pylint: disable=protected-access
-                args.num_tokens, args.num_experts,
-                args.num_route_groups, args.top_m_groups, args.top_k,
-                args.alpha, route_rng,
+                args.num_tokens,
+                args.num_experts,
+                args.num_route_groups,
+                args.top_m_groups,
+                args.top_k,
+                args.alpha,
+                route_rng,
             )
         stats = smr._stats(counts)  # pylint: disable=protected-access
         smr._print_stats(  # pylint: disable=protected-access
-            stats, f'路由分布 ({args.routing_mode})',
+            stats,
+            f"路由分布 ({args.routing_mode})",
         )
         if args.show_histogram:
             smr._print_histogram(counts)  # pylint: disable=protected-access
         specs = _build_specs_from_routing(
-            counts, args.k1, args.n1, args.k2, args.n2,
+            counts,
+            args.k1,
+            args.n1,
+            args.k2,
+            args.n2,
             keep_zero=args.keep_zero_experts,
         )
         print(
-            f'[INFO] 分布: routing={args.routing_mode}, tokens='
-            f'{args.num_tokens}, experts={args.num_experts}, '
-            f'top_k={args.top_k}, 生成 {len(specs)} 个 GEMM '
-            f'(active={stats.active_experts}/{args.num_experts})',
+            f"[INFO] 分布: routing={args.routing_mode}, tokens="
+            f"{args.num_tokens}, experts={args.num_experts}, "
+            f"top_k={args.top_k}, 生成 {len(specs)} 个 GEMM "
+            f"(active={stats.active_experts}/{args.num_experts})",
         )
 
     inputs, outputs = _build_inputs_and_outputs(specs, out_dtype, args.seed)
 
     env_info = {
-        'pid': os.getpid(),
-        'cpu_count': os.cpu_count(),
-        'affinity_size': len(cpus),
-        'affinity_preview': cpus[:4] + (['...'] if len(cpus) > 8 else []) + cpus[-4:],
-        'machine': platform.machine(),
-        'OMP_NUM_THREADS': os.environ.get('OMP_NUM_THREADS', '<unset>'),
+        "pid": os.getpid(),
+        "cpu_count": os.cpu_count(),
+        "affinity_size": len(cpus),
+        "affinity_preview": cpus[:4] + (["..."] if len(cpus) > 8 else []) + cpus[-4:],
+        "machine": platform.machine(),
+        "OMP_NUM_THREADS": os.environ.get("OMP_NUM_THREADS", "<unset>"),
     }
-    print(f'[INFO] env: {env_info}')
+    print(f"[INFO] env: {env_info}")
     print(
-        f'[INFO] 共 {len(specs)} 个 GEMM，total_cpus={len(cpus)}，dtype={args.dtype}',
+        f"[INFO] 共 {len(specs)} 个 GEMM，total_cpus={len(cpus)}，dtype={args.dtype}",
     )
 
     results: List[StrategyResult] = []
@@ -647,13 +695,12 @@ def main() -> int:
     registry = HandlerRegistry(mod, args.seed)
     try:
         for x in args.group_splits:
-            strategy = 'sequential' if x == 1 else 'grouped'
+            strategy = "sequential" if x == 1 else "grouped"
             # sequential 只跑一次（不同 assignment 结果相同）。
-            assign_list = ['roundrobin'] if x == 1 else args.assignment
+            assign_list = ["roundrobin"] if x == 1 else args.assignment
             for assign in assign_list:
                 print(
-                    f'[INFO] 运行 {strategy}(x={x}, assign={assign}) '
-                    f'({len(cpus) // x} CPUs/group) ...',
+                    f"[INFO] 运行 {strategy}(x={x}, assign={assign}) ({len(cpus) // x} CPUs/group) ...",
                 )
                 r = _bench_one(
                     strategy=strategy,
@@ -669,9 +716,9 @@ def main() -> int:
                     assignment=assign,
                 )
                 print(
-                    f'       wall={r.wall_time_ms:.2f} ms, '
-                    f'{r.gflops:.2f} GFLOP/s, '
-                    f'speedup_upper={r.speedup_upper:.2f}x',
+                    f"       wall={r.wall_time_ms:.2f} ms, "
+                    f"{r.gflops:.2f} GFLOP/s, "
+                    f"speedup_upper={r.speedup_upper:.2f}x",
                 )
                 results.append(r)
     finally:
@@ -679,9 +726,9 @@ def main() -> int:
 
     _write_csv(results, args.output_csv)
     _print_summary(results)
-    print(f'\n[OK] CSV  -> {args.output_csv}')
+    print(f"\n[OK] CSV  -> {args.output_csv}")
     return 0
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     sys.exit(main())

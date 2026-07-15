@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """FLOP/s 性能基准测试：自定义 SDPA vs PyTorch F.scaled_dot_product_attention。"""
+
 import gc
 import time
 
@@ -17,7 +18,7 @@ BENCH_ITERS = 20
 
 # MLA 特定参数
 NUM_HEADS = 16
-QK_HEAD_DIM = 192   # qk_nope_head_dim(128) + qk_rope_head_dim(64)
+QK_HEAD_DIM = 192  # qk_nope_head_dim(128) + qk_rope_head_dim(64)
 V_HEAD_DIM = 128
 BATCH_SIZE = 4
 
@@ -25,6 +26,7 @@ SEQ_LENS = [128, 256, 512, 1024, 2048]
 
 
 # ── 辅助函数 ──────────────────────────────────────────────────────────────
+
 
 def _compute_flops(
     batch_size: int,
@@ -67,6 +69,7 @@ def _bench_fn(fn, *args, **kwargs) -> float:
 
 # ── 性能测试 ──────────────────────────────────────────────────────────────
 
+
 @pytest.mark.parametrize("seq_len", SEQ_LENS)
 def test_sdpa_benchmark(seq_len):
     """SDPA 性能基准测试（MLA 参数）。"""
@@ -103,6 +106,7 @@ def test_sdpa_benchmark(seq_len):
 
 # ── 汇总报告 ──────────────────────────────────────────────────────────────
 
+
 def test_sdpa_benchmark_summary():
     """输出格式化的性能报告表格。"""
     torch.manual_seed(42)
@@ -120,17 +124,34 @@ def test_sdpa_benchmark_summary():
     with torch.no_grad():
         for seq_len in SEQ_LENS:
             q = torch.randn(
-                BATCH_SIZE, NUM_HEADS, seq_len, QK_HEAD_DIM, dtype=torch.bfloat16,
+                BATCH_SIZE,
+                NUM_HEADS,
+                seq_len,
+                QK_HEAD_DIM,
+                dtype=torch.bfloat16,
             )
             k = torch.randn(
-                BATCH_SIZE, NUM_HEADS, seq_len, QK_HEAD_DIM, dtype=torch.bfloat16,
+                BATCH_SIZE,
+                NUM_HEADS,
+                seq_len,
+                QK_HEAD_DIM,
+                dtype=torch.bfloat16,
             )
             v = torch.randn(
-                BATCH_SIZE, NUM_HEADS, seq_len, V_HEAD_DIM, dtype=torch.bfloat16,
+                BATCH_SIZE,
+                NUM_HEADS,
+                seq_len,
+                V_HEAD_DIM,
+                dtype=torch.bfloat16,
             )
 
             flops = _compute_flops(
-                BATCH_SIZE, NUM_HEADS, seq_len, seq_len, QK_HEAD_DIM, V_HEAD_DIM,
+                BATCH_SIZE,
+                NUM_HEADS,
+                seq_len,
+                seq_len,
+                QK_HEAD_DIM,
+                V_HEAD_DIM,
             )
 
             custom_time = _bench_fn(scaled_dot_product_attention, q, k, v)

@@ -3,6 +3,7 @@
 
 Each test validates a correctness property from the design document.
 """
+
 from __future__ import annotations
 
 import glob
@@ -40,9 +41,7 @@ class TestProperty1NoOldImports:
 
         py_files = []
         for d in [src_dir, tests_dir]:
-            py_files.extend(
-                glob.glob(os.path.join(d, "**", "*.py"), recursive=True)
-            )
+            py_files.extend(glob.glob(os.path.join(d, "**", "*.py"), recursive=True))
         # Filter out __pycache__
         py_files = [f for f in py_files if "__pycache__" not in f]
         assume(len(py_files) > 0)
@@ -59,15 +58,10 @@ class TestProperty1NoOldImports:
             if stripped.startswith("#"):
                 continue
             # Skip string literals (assertions, docstrings, etc.)
-            if stripped.startswith(("assert ", "\"", "'", "f\"")):
+            if stripped.startswith(("assert ", '"', "'", 'f"')):
                 continue
-            has_import = (
-                stripped.startswith("import fused_mla_cpp")
-                or stripped.startswith("from fused_mla_cpp")
-            )
-            assert not has_import, (
-                f"Found old package import in {filepath}:{line_no}: {stripped}"
-            )
+            has_import = stripped.startswith("import fused_mla_cpp") or stripped.startswith("from fused_mla_cpp")
+            assert not has_import, f"Found old package import in {filepath}:{line_no}: {stripped}"
 
 
 # ── Property 2: Constructor validation — divisibility check ──────────────────
@@ -99,19 +93,29 @@ class TestProperty2ConstructorValidation:
 
         if num_experts % ep_size == 0:
             impl = FusedMoEImpl(
-                num_experts=num_experts, top_k=1,
-                hidden_size=hidden_size, ffn_hidden_size=ffn_hidden_size,
-                w_gate=w_gate, w_up=w_up, w_down=w_down,
-                ep_size=ep_size, ep_rank=0,
+                num_experts=num_experts,
+                top_k=1,
+                hidden_size=hidden_size,
+                ffn_hidden_size=ffn_hidden_size,
+                w_gate=w_gate,
+                w_up=w_up,
+                w_down=w_down,
+                ep_size=ep_size,
+                ep_rank=0,
             )
             assert impl.local_num_experts == num_experts // ep_size
         else:
             with pytest.raises(ValueError):
                 FusedMoEImpl(
-                    num_experts=num_experts, top_k=1,
-                    hidden_size=hidden_size, ffn_hidden_size=ffn_hidden_size,
-                    w_gate=w_gate, w_up=w_up, w_down=w_down,
-                    ep_size=ep_size, ep_rank=0,
+                    num_experts=num_experts,
+                    top_k=1,
+                    hidden_size=hidden_size,
+                    ffn_hidden_size=ffn_hidden_size,
+                    w_gate=w_gate,
+                    w_up=w_up,
+                    w_down=w_down,
+                    ep_size=ep_size,
+                    ep_rank=0,
                 )
 
 
@@ -130,9 +134,7 @@ class TestProperty6NoVllmImports:
     @settings(max_examples=100)
     @given(data=st.data())
     def test_no_vllm_imports_in_moe(self, data):
-        moe_dir = os.path.join(
-            os.path.dirname(__file__), os.pardir, "src", "fused_cpp", "moe"
-        )
+        moe_dir = os.path.join(os.path.dirname(__file__), os.pardir, "src", "fused_cpp", "moe")
         moe_dir = os.path.normpath(moe_dir)
         py_files = glob.glob(os.path.join(moe_dir, "**", "*.py"), recursive=True)
         py_files = [f for f in py_files if "__pycache__" not in f]
@@ -148,15 +150,12 @@ class TestProperty6NoVllmImports:
             stripped = line.strip()
             if stripped.startswith("#"):
                 continue
-            assert "import vllm" not in stripped, (
-                f"Found vllm import in {filepath}:{line_no}: {stripped}"
-            )
-            assert "from vllm" not in stripped, (
-                f"Found vllm from-import in {filepath}:{line_no}: {stripped}"
-            )
+            assert "import vllm" not in stripped, f"Found vllm import in {filepath}:{line_no}: {stripped}"
+            assert "from vllm" not in stripped, f"Found vllm from-import in {filepath}:{line_no}: {stripped}"
 
 
 # ── Hypothesis strategies for MoE tests ──────────────────────────────────────
+
 
 @st.composite
 def moe_config(draw):
@@ -185,6 +184,7 @@ def moe_config(draw):
 def _build_moe(config, **overrides):
     """Build a FusedMoEImpl from a config dict."""
     from fused_cpp.moe import FusedMoEImpl
+
     c = {**config, **overrides}
     local_num = c["num_experts"] // c["ep_size"]
     H, F_ = c["hidden_size"], c["ffn_hidden_size"]
@@ -192,11 +192,17 @@ def _build_moe(config, **overrides):
     w_up = torch.randn(local_num, F_, H)
     w_down = torch.randn(local_num, H, F_)
     return FusedMoEImpl(
-        num_experts=c["num_experts"], top_k=c["top_k"],
-        hidden_size=H, ffn_hidden_size=F_,
-        w_gate=w_gate, w_up=w_up, w_down=w_down,
-        ep_size=c["ep_size"], ep_rank=c["ep_rank"],
-        renormalize=c["renormalize"], scoring_func=c["scoring_func"],
+        num_experts=c["num_experts"],
+        top_k=c["top_k"],
+        hidden_size=H,
+        ffn_hidden_size=F_,
+        w_gate=w_gate,
+        w_up=w_up,
+        w_down=w_down,
+        ep_size=c["ep_size"],
+        ep_rank=c["ep_rank"],
+        renormalize=c["renormalize"],
+        scoring_func=c["scoring_func"],
         **{k: v for k, v in overrides.items() if k not in c},
     )
 
@@ -220,9 +226,7 @@ class TestProperty10OutputShape:
         hidden_states = torch.randn(total_tokens, H)
         router_logits = torch.randn(total_tokens, config["num_experts"])
         output = impl.forward(hidden_states, router_logits)
-        assert output.shape == (total_tokens, H), (
-            f"Expected shape ({total_tokens}, {H}), got {output.shape}"
-        )
+        assert output.shape == (total_tokens, H), f"Expected shape ({total_tokens}, {H}), got {output.shape}"
 
 
 # ── Property 3: Softmax scores sum to 1 and preserve dtype ───────────────────
@@ -252,19 +256,15 @@ class TestProperty3SoftmaxScores:
         input_dtype = router_logits.dtype
 
         # Replicate the scoring logic from FusedMoEImpl.forward
-        local_logits = router_logits[:, impl.expert_start:impl.expert_end]
+        local_logits = router_logits[:, impl.expert_start : impl.expert_end]
         scores = F.softmax(local_logits.float(), dim=-1).to(local_logits.dtype)
 
         # Scores must sum to 1.0 along expert dim (within float32 tolerance)
         sums = scores.sum(dim=-1)
-        assert torch.allclose(sums, torch.ones_like(sums), atol=1e-5), (
-            f"Softmax scores do not sum to 1: {sums}"
-        )
+        assert torch.allclose(sums, torch.ones_like(sums), atol=1e-5), f"Softmax scores do not sum to 1: {sums}"
 
         # Output dtype must match input dtype
-        assert scores.dtype == input_dtype, (
-            f"Expected dtype {input_dtype}, got {scores.dtype}"
-        )
+        assert scores.dtype == input_dtype, f"Expected dtype {input_dtype}, got {scores.dtype}"
 
 
 # ── Property 4: Sigmoid scores in (0,1) and preserve dtype ──────────────────
@@ -293,7 +293,7 @@ class TestProperty4SigmoidScores:
         input_dtype = router_logits.dtype
 
         # Replicate the scoring logic from FusedMoEImpl.forward
-        local_logits = router_logits[:, impl.expert_start:impl.expert_end]
+        local_logits = router_logits[:, impl.expert_start : impl.expert_end]
         scores = torch.sigmoid(local_logits.float()).to(local_logits.dtype)
 
         # Every score must be strictly in (0, 1)
@@ -301,9 +301,7 @@ class TestProperty4SigmoidScores:
         assert (scores < 1).all(), f"Scores not < 1: max={scores.max().item()}"
 
         # Output dtype must match input dtype
-        assert scores.dtype == input_dtype, (
-            f"Expected dtype {input_dtype}, got {scores.dtype}"
-        )
+        assert scores.dtype == input_dtype, f"Expected dtype {input_dtype}, got {scores.dtype}"
 
 
 # ── Property 5: Renormalized top-k weights sum to 1 ─────────────────────────
@@ -331,7 +329,7 @@ class TestProperty5RenormalizedWeights:
         router_logits = torch.randn(total_tokens, config["num_experts"])
 
         # Replicate scoring + top-k + renormalization from FusedMoEImpl.forward
-        local_logits = router_logits[:, impl.expert_start:impl.expert_end]
+        local_logits = router_logits[:, impl.expert_start : impl.expert_end]
         if config["scoring_func"] == "softmax":
             scores = F.softmax(local_logits.float(), dim=-1).to(local_logits.dtype)
         else:
@@ -343,9 +341,7 @@ class TestProperty5RenormalizedWeights:
 
         # Each token's top-k weights must sum to 1.0
         sums = topk_weights.sum(dim=-1)
-        assert torch.allclose(sums, torch.ones_like(sums), atol=1e-5), (
-            f"Renormalized weights do not sum to 1: {sums}"
-        )
+        assert torch.allclose(sums, torch.ones_like(sums), atol=1e-5), f"Renormalized weights do not sum to 1: {sums}"
 
 
 # ── Naive MoE reference for Property 7 & 8 ──────────────────────────────────
@@ -584,6 +580,7 @@ class TestProperty9SharedExpertCorrectness:
 
         # Build impl WITH shared experts using the SAME routed weights
         from fused_cpp.moe import FusedMoEImpl
+
         impl_with_shared = FusedMoEImpl(
             num_experts=config["num_experts"],
             top_k=config["top_k"],
@@ -649,10 +646,7 @@ class TestProperty11Determinism:
             out1 = impl.forward(hidden_states, router_logits)
             out2 = impl.forward(hidden_states, router_logits)
 
-        assert torch.equal(out1, out2), (
-            f"Forward is not deterministic.\n"
-            f"Max diff: {(out1 - out2).abs().max().item()}"
-        )
+        assert torch.equal(out1, out2), f"Forward is not deterministic.\nMax diff: {(out1 - out2).abs().max().item()}"
 
 
 # ── Property 12: Scaling factor applied correctly based on dtype ─────────────
@@ -683,6 +677,7 @@ class TestProperty12ScalingFactor:
         impl_base = _build_moe(config, routed_scaling_factor=1.0)
 
         from fused_cpp.moe import FusedMoEImpl
+
         impl_scaled = FusedMoEImpl(
             num_experts=config["num_experts"],
             top_k=config["top_k"],
@@ -709,8 +704,7 @@ class TestProperty12ScalingFactor:
         # out_scaled should be out_base * scaling_factor
         expected = out_base * scaling_factor
         assert torch.allclose(out_scaled, expected, rtol=1e-4, atol=1e-6), (
-            f"Non-FP16 scaling not applied correctly.\n"
-            f"Max abs diff: {(out_scaled - expected).abs().max().item()}"
+            f"Non-FP16 scaling not applied correctly.\nMax abs diff: {(out_scaled - expected).abs().max().item()}"
         )
 
     @settings(max_examples=100)
@@ -723,8 +717,7 @@ class TestProperty12ScalingFactor:
     def test_scaling_fp16_with_shared_experts(self, config, total_tokens, scaling_factor, shared_ffn):
         """When float16 + shared experts, shared output scaled by 1/routed_scaling_factor."""
         # Use small dimensions to limit FP16 accumulation error
-        config = {**config, "ep_size": 1, "ep_rank": 0,
-                  "hidden_size": 16, "ffn_hidden_size": 32}
+        config = {**config, "ep_size": 1, "ep_rank": 0, "hidden_size": 16, "ffn_hidden_size": 32}
         H = config["hidden_size"]
         F_ = config["ffn_hidden_size"]
         local_num = config["num_experts"]
@@ -749,8 +742,11 @@ class TestProperty12ScalingFactor:
             top_k=config["top_k"],
             hidden_size=H,
             ffn_hidden_size=F_,
-            w_gate=w_gate, w_up=w_up, w_down=w_down,
-            ep_size=1, ep_rank=0,
+            w_gate=w_gate,
+            w_up=w_up,
+            w_down=w_down,
+            ep_size=1,
+            ep_rank=0,
             renormalize=config["renormalize"],
             scoring_func=config["scoring_func"],
             routed_scaling_factor=scaling_factor,
@@ -761,8 +757,11 @@ class TestProperty12ScalingFactor:
             top_k=config["top_k"],
             hidden_size=H,
             ffn_hidden_size=F_,
-            w_gate=w_gate, w_up=w_up, w_down=w_down,
-            ep_size=1, ep_rank=0,
+            w_gate=w_gate,
+            w_up=w_up,
+            w_down=w_down,
+            ep_size=1,
+            ep_rank=0,
             renormalize=config["renormalize"],
             scoring_func=config["scoring_func"],
             routed_scaling_factor=scaling_factor,
@@ -791,10 +790,7 @@ class TestProperty12ScalingFactor:
             expected_shared_scaled = expected_shared * (1.0 / scaling_factor)
 
         # FP16 has limited precision (~3 decimal digits), use generous tolerance
-        assert torch.allclose(
-            shared_contribution.float(), expected_shared_scaled.float(),
-            rtol=5e-2, atol=0.5
-        ), (
+        assert torch.allclose(shared_contribution.float(), expected_shared_scaled.float(), rtol=5e-2, atol=0.5), (
             f"FP16 shared expert scaling not applied correctly.\n"
             f"Max abs diff: {(shared_contribution.float() - expected_shared_scaled.float()).abs().max().item()}"
         )

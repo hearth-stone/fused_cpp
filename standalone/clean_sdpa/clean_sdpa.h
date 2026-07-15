@@ -31,9 +31,7 @@ struct AlignedAllocator {
     return static_cast<T*>(ptr);
   }
 
-  void deallocate(T* ptr, std::size_t) noexcept {
-    ::free(ptr);
-  }
+  void deallocate(T* ptr, std::size_t) noexcept { ::free(ptr); }
 
   template <typename U>
   struct rebind {
@@ -42,16 +40,12 @@ struct AlignedAllocator {
 };
 
 template <typename T, typename U, std::size_t Alignment>
-inline bool operator==(
-    const AlignedAllocator<T, Alignment>&,
-    const AlignedAllocator<U, Alignment>&) noexcept {
+inline bool operator==(const AlignedAllocator<T, Alignment>&, const AlignedAllocator<U, Alignment>&) noexcept {
   return true;
 }
 
 template <typename T, typename U, std::size_t Alignment>
-inline bool operator!=(
-    const AlignedAllocator<T, Alignment>&,
-    const AlignedAllocator<U, Alignment>&) noexcept {
+inline bool operator!=(const AlignedAllocator<T, Alignment>&, const AlignedAllocator<U, Alignment>&) noexcept {
   return false;
 }
 
@@ -72,19 +66,11 @@ struct Config {
   int64_t s_tile = 0;
 };
 
-void sdpa_bf16_packqkv_pbf16pv(
-    const at::BFloat16* q,
-    const at::BFloat16* k,
-    const at::BFloat16* v,
-    float* out,
-    const Config& cfg);
+void sdpa_bf16_packqkv_pbf16pv(const at::BFloat16* q, const at::BFloat16* k, const at::BFloat16* v, float* out,
+                               const Config& cfg);
 
-void reference_sdpa_bf16(
-    const at::BFloat16* q,
-    const at::BFloat16* k,
-    const at::BFloat16* v,
-    float* out,
-    const Config& cfg);
+void reference_sdpa_bf16(const at::BFloat16* q, const at::BFloat16* k, const at::BFloat16* v, float* out,
+                         const Config& cfg);
 
 double counted_gflops(const Config& cfg, double mean_ms);
 double checksum(const float* data, int64_t size);

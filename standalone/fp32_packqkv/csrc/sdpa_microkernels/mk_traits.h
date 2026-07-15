@@ -17,8 +17,7 @@ template <class MK, class = void>
 struct has_enabled : std::false_type {};
 
 template <class MK>
-struct has_enabled<MK, std::void_t<decltype(MK::kEnabled)>>
-    : std::bool_constant<MK::kEnabled> {};
+struct has_enabled<MK, std::void_t<decltype(MK::kEnabled)>> : std::bool_constant<MK::kEnabled> {};
 
 }  // namespace detail
 

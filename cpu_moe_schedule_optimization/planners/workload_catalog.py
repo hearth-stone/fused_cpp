@@ -27,11 +27,7 @@ class RoutingWorkload:
 
     @property
     def experts(self) -> list[tuple[int, int]]:
-        return [
-            (expert, routes)
-            for expert, routes in enumerate(self.histogram)
-            if routes > 0
-        ]
+        return [(expert, routes) for expert, routes in enumerate(self.histogram) if routes > 0]
 
     @property
     def routes(self) -> int:
@@ -88,11 +84,7 @@ def _tail_counts(payload: dict[str, Any], total: int, count: int) -> list[int]:
             tail_cap,
         )
 
-    values = [
-        int(bucket["routes"])
-        for bucket in buckets
-        for _ in range(int(bucket["experts"]))
-    ]
+    values = [int(bucket["routes"]) for bucket in buckets for _ in range(int(bucket["experts"]))]
     if len(values) != count or sum(values) != total:
         raise ValueError("moment-matched routing tail has invalid totals")
     return values
@@ -130,9 +122,7 @@ def load_routing_workload(path: Path = DSV4_REAL_2048_PATH) -> RoutingWorkload:
     tail_active = active_experts - len(top_counts)
     tail_total = routes - sum(top_counts)
     tail_counts = _tail_counts(payload, tail_total, tail_active)
-    tail_experts = [
-        expert for expert in range(num_experts) if expert not in seen
-    ][:tail_active]
+    tail_experts = [expert for expert in range(num_experts) if expert not in seen][:tail_active]
     if len(tail_experts) != tail_active:
         raise ValueError("routing workload does not have enough tail expert ids")
     for expert, count in zip(tail_experts, tail_counts, strict=True):
@@ -150,9 +140,7 @@ def load_routing_workload(path: Path = DSV4_REAL_2048_PATH) -> RoutingWorkload:
     ):
         raise ValueError("reconstructed routing workload has invalid mean")
     mean = sum(active) / len(active)
-    population_std = math.sqrt(
-        sum((count - mean) ** 2 for count in active) / len(active)
-    )
+    population_std = math.sqrt(sum((count - mean) ** 2 for count in active) / len(active))
     if not math.isclose(
         population_std,
         float(payload["routes_std"]),

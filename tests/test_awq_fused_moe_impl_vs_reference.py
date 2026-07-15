@@ -30,6 +30,7 @@
 - 浮点断言使用 :func:`_assert_tensor_close`，同时报告 max_abs / max_rel / cos。
 - 不引入 vLLM 高层 API；仅依赖 PyTorch + fused_cpp。
 """
+
 from __future__ import annotations
 
 import pytest
@@ -61,7 +62,9 @@ def _pack_awq_along_n(unpacked: torch.Tensor) -> torch.Tensor:
     order_idx = torch.tensor(_AWQ_ORDER, dtype=torch.long)
     picked = reshaped.index_select(-1, order_idx)
     shifts = torch.arange(0, 32, 4, dtype=torch.int32).view(
-        *([1] * len(lead)), 1, 8,
+        *([1] * len(lead)),
+        1,
+        8,
     )
     return (picked << shifts).sum(dim=-1).to(torch.int32)
 
@@ -78,9 +81,7 @@ def _make_awq_weight(
     w_int4 = torch.randint(0, 16, (k, n), generator=gen, dtype=torch.int32)
     groups = k // group_size
     z_int4 = torch.randint(0, 16, (groups, n), generator=gen, dtype=torch.int32)
-    scales_fp32 = (
-        torch.rand((groups, n), generator=gen, dtype=torch.float32) * 5e-3 + 1e-3
-    )
+    scales_fp32 = torch.rand((groups, n), generator=gen, dtype=torch.float32) * 5e-3 + 1e-3
     qweight = _pack_awq_along_n(w_int4)
     qzeros = _pack_awq_along_n(z_int4)
     return qweight, qzeros, scales_fp32.to(scales_dtype)
@@ -95,13 +96,25 @@ def _make_expert(
 ) -> AWQExpertWeights:
     """构造单个 AWQ expert（gate / up / down 三个 Linear）。"""
     gate_qw, gate_qz, gate_s = _make_awq_weight(
-        hidden_size, ffn_hidden, group_size, scales_dtype, seed,
+        hidden_size,
+        ffn_hidden,
+        group_size,
+        scales_dtype,
+        seed,
     )
     up_qw, up_qz, up_s = _make_awq_weight(
-        hidden_size, ffn_hidden, group_size, scales_dtype, seed + 1,
+        hidden_size,
+        ffn_hidden,
+        group_size,
+        scales_dtype,
+        seed + 1,
     )
     down_qw, down_qz, down_s = _make_awq_weight(
-        ffn_hidden, hidden_size, group_size, scales_dtype, seed + 2,
+        ffn_hidden,
+        hidden_size,
+        group_size,
+        scales_dtype,
+        seed + 2,
     )
     return AWQExpertWeights(
         gate_qweight=gate_qw,
@@ -141,9 +154,9 @@ def _random_topk(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """随机但合法的 (topk_ids, topk_weights)；softmax 归一权重。"""
     gen = torch.Generator().manual_seed(seed)
-    topk_ids = torch.stack(
-        [torch.randperm(num_experts, generator=gen)[:top_k] for _ in range(num_tokens)]
-    ).to(torch.int64)
+    topk_ids = torch.stack([torch.randperm(num_experts, generator=gen)[:top_k] for _ in range(num_tokens)]).to(
+        torch.int64
+    )
     raw = torch.randn((num_tokens, top_k), generator=gen, dtype=torch.float32)
     topk_weights = torch.softmax(raw, dim=-1)
     return topk_ids, topk_weights
@@ -158,12 +171,8 @@ def _assert_tensor_close(
     cos_sim_threshold: float,
 ) -> None:
     """统一等价性断言：误差 + 余弦相似度 + NaN/Inf 鲁棒性。"""
-    assert actual.shape == ref.shape, (
-        f"shape mismatch: {actual.shape} vs {ref.shape}"
-    )
-    assert actual.dtype == ref.dtype, (
-        f"dtype mismatch: {actual.dtype} vs {ref.dtype}"
-    )
+    assert actual.shape == ref.shape, f"shape mismatch: {actual.shape} vs {ref.shape}"
+    assert actual.dtype == ref.dtype, f"dtype mismatch: {actual.dtype} vs {ref.dtype}"
     for name, t in (("actual", actual), ("ref", ref)):
         n_nan = torch.isnan(t).sum().item()
         n_inf = torch.isinf(t).sum().item()
@@ -182,6 +191,7 @@ def _assert_tensor_close(
 
 
 # ── 1. AWQFusedMoEImpl vs reference 的核心等价性 ───────────────────────────
+
 
 class TestAWQFusedMoEImplEquivalence:
     """``AWQFusedMoEImpl.forward`` 与 dequant 参考路径在容差内一致。"""
@@ -210,14 +220,14 @@ class TestAWQFusedMoEImplEquivalence:
         # Arrange
         num_tokens, num_experts, top_k, h, f_dim, g = scenario
         torch.manual_seed(0)
-        experts = [
-            _make_expert(h, f_dim, g, scales_dtype, seed=e * 7)
-            for e in range(num_experts)
-        ]
+        experts = [_make_expert(h, f_dim, g, scales_dtype, seed=e * 7) for e in range(num_experts)]
         stacked = _stack_experts(experts)
         hidden = torch.randn(num_tokens, h, dtype=torch.bfloat16) * 0.1
         topk_ids, topk_w = _random_topk(
-            num_tokens, num_experts, top_k, seed=123,
+            num_tokens,
+            num_experts,
+            top_k,
+            seed=123,
         )
 
         impl = AWQFusedMoEImpl(
@@ -237,6 +247,7 @@ class TestAWQFusedMoEImplEquivalence:
 
 # ── 2. 堆叠张量 vs list 的数值一致性 ───────────────────────────────────────
 
+
 class TestStackedWeightsSemantics:
     """堆叠张量在 __init__ 中被切成 per-expert view 后，与手工 list 一致。"""
 
@@ -247,14 +258,14 @@ class TestStackedWeightsSemantics:
         h, f_dim, g = 128, 64, 32
         num_experts, top_k, num_tokens = 6, 3, 5
         torch.manual_seed(0)
-        experts = [
-            _make_expert(h, f_dim, g, torch.float16, seed=e * 17)
-            for e in range(num_experts)
-        ]
+        experts = [_make_expert(h, f_dim, g, torch.float16, seed=e * 17) for e in range(num_experts)]
         stacked = _stack_experts(experts)
         hidden = torch.randn(num_tokens, h, dtype=torch.bfloat16) * 0.1
         topk_ids, topk_w = _random_topk(
-            num_tokens, num_experts, top_k, seed=321,
+            num_tokens,
+            num_experts,
+            top_k,
+            seed=321,
         )
 
         impl = AWQFusedMoEImpl(
@@ -278,10 +289,7 @@ class TestStackedWeightsSemantics:
         # Arrange
         h, f_dim, g = 128, 64, 32
         num_experts = 3
-        experts = [
-            _make_expert(h, f_dim, g, torch.float16, seed=e)
-            for e in range(num_experts)
-        ]
+        experts = [_make_expert(h, f_dim, g, torch.float16, seed=e) for e in range(num_experts)]
         stacked = _stack_experts(experts)
 
         # Act
@@ -294,25 +302,23 @@ class TestStackedWeightsSemantics:
 
         # Assert：per-expert view 与堆叠张量共享 data_ptr（torch 基础切片零拷贝）
         for e in range(num_experts):
-            assert impl._experts[e].gate_qweight.data_ptr() == (
-                stacked["gate_qweight"][e].data_ptr()
-            ), f"expert {e} gate_qweight 视图未共享存储"
-            assert impl._experts[e].down_scales.data_ptr() == (
-                stacked["down_scales"][e].data_ptr()
-            ), f"expert {e} down_scales 视图未共享存储"
+            assert impl._experts[e].gate_qweight.data_ptr() == (stacked["gate_qweight"][e].data_ptr()), (
+                f"expert {e} gate_qweight 视图未共享存储"
+            )
+            assert impl._experts[e].down_scales.data_ptr() == (stacked["down_scales"][e].data_ptr()), (
+                f"expert {e} down_scales 视图未共享存储"
+            )
 
 
 # ── 3. 契约 / 形状 / dtype 校验 ────────────────────────────────────────────
+
 
 class TestContractValidation:
     """不合法的输入应显式报错，而非静默产出错误数值。"""
 
     @pytest.fixture
     def base_stacked(self) -> dict[str, torch.Tensor]:
-        experts = [
-            _make_expert(64, 32, 16, torch.float16, seed=e)
-            for e in range(2)
-        ]
+        experts = [_make_expert(64, 32, 16, torch.float16, seed=e) for e in range(2)]
         return _stack_experts(experts)
 
     def test_ep_size_gt_one_raises_not_implemented(
@@ -321,8 +327,11 @@ class TestContractValidation:
     ) -> None:
         with pytest.raises(NotImplementedError, match="ep_size=1"):
             AWQFusedMoEImpl(
-                num_experts=2, hidden_size=64, ffn_hidden_size=32,
-                ep_size=2, **base_stacked,
+                num_experts=2,
+                hidden_size=64,
+                ffn_hidden_size=32,
+                ep_size=2,
+                **base_stacked,
             )
 
     def test_ep_rank_out_of_range_raises(
@@ -333,8 +342,12 @@ class TestContractValidation:
         # 若实现先触发 ep_size!=1 校验，则本用例仅验证 ep_rank 的校验存在。
         with pytest.raises((ValueError, NotImplementedError)):
             AWQFusedMoEImpl(
-                num_experts=2, hidden_size=64, ffn_hidden_size=32,
-                ep_size=1, ep_rank=3, **base_stacked,
+                num_experts=2,
+                hidden_size=64,
+                ffn_hidden_size=32,
+                ep_size=1,
+                ep_rank=3,
+                **base_stacked,
             )
 
     def test_wrong_gate_qweight_shape_raises(
@@ -344,11 +357,14 @@ class TestContractValidation:
         broken = dict(base_stacked)
         # 把 gate_qweight 的 N 维弄错
         broken["gate_qweight"] = torch.zeros(
-            (2, 64, 5), dtype=torch.int32,
+            (2, 64, 5),
+            dtype=torch.int32,
         )
         with pytest.raises(RuntimeError, match="gate_qweight"):
             AWQFusedMoEImpl(
-                num_experts=2, hidden_size=64, ffn_hidden_size=32,
+                num_experts=2,
+                hidden_size=64,
+                ffn_hidden_size=32,
                 **broken,
             )
 
@@ -360,7 +376,9 @@ class TestContractValidation:
         broken["gate_scales"] = broken["gate_scales"].to(torch.float32)
         with pytest.raises(RuntimeError, match="scales"):
             AWQFusedMoEImpl(
-                num_experts=2, hidden_size=64, ffn_hidden_size=32,
+                num_experts=2,
+                hidden_size=64,
+                ffn_hidden_size=32,
                 **broken,
             )
 
@@ -380,7 +398,9 @@ class TestContractValidation:
 
         with pytest.raises(RuntimeError, match="group_size"):
             AWQFusedMoEImpl(
-                num_experts=2, hidden_size=64, ffn_hidden_size=32,
+                num_experts=2,
+                hidden_size=64,
+                ffn_hidden_size=32,
                 **stacked,
             )
 
@@ -389,7 +409,9 @@ class TestContractValidation:
         base_stacked: dict[str, torch.Tensor],
     ) -> None:
         impl = AWQFusedMoEImpl(
-            num_experts=2, hidden_size=64, ffn_hidden_size=32,
+            num_experts=2,
+            hidden_size=64,
+            ffn_hidden_size=32,
             **base_stacked,
         )
         x_fp16 = torch.zeros((3, 64), dtype=torch.float16)
@@ -403,7 +425,9 @@ class TestContractValidation:
         base_stacked: dict[str, torch.Tensor],
     ) -> None:
         impl = AWQFusedMoEImpl(
-            num_experts=2, hidden_size=64, ffn_hidden_size=32,
+            num_experts=2,
+            hidden_size=64,
+            ffn_hidden_size=32,
             **base_stacked,
         )
         x = torch.zeros((3, 32), dtype=torch.bfloat16)
@@ -417,11 +441,13 @@ class TestContractValidation:
         base_stacked: dict[str, torch.Tensor],
     ) -> None:
         impl = AWQFusedMoEImpl(
-            num_experts=2, hidden_size=64, ffn_hidden_size=32,
+            num_experts=2,
+            hidden_size=64,
+            ffn_hidden_size=32,
             **base_stacked,
         )
         x = torch.zeros((3, 64), dtype=torch.bfloat16)
-        bad_ids = torch.tensor([[0], [1], [2]], dtype=torch.int64)      # 2 越界
+        bad_ids = torch.tensor([[0], [1], [2]], dtype=torch.int64)  # 2 越界
         topk_w = torch.ones((3, 1), dtype=torch.float32)
         with pytest.raises(RuntimeError, match="越界"):
             impl.forward(x, topk_w, bad_ids)
@@ -431,17 +457,20 @@ class TestContractValidation:
         base_stacked: dict[str, torch.Tensor],
     ) -> None:
         impl = AWQFusedMoEImpl(
-            num_experts=2, hidden_size=64, ffn_hidden_size=32,
+            num_experts=2,
+            hidden_size=64,
+            ffn_hidden_size=32,
             **base_stacked,
         )
         x = torch.zeros((3, 64), dtype=torch.bfloat16)
         ids = torch.zeros((3, 1), dtype=torch.int64)
-        w = torch.ones((3, 2), dtype=torch.float32)                      # shape 不一致
+        w = torch.ones((3, 2), dtype=torch.float32)  # shape 不一致
         with pytest.raises(RuntimeError, match="形状不一致"):
             impl.forward(x, w, ids)
 
 
 # ── 4. 路由退化：top_k=1 + weight=1 → 对应 expert 稠密 FFN ─────────────────
+
 
 class TestRoutingDegenerate:
     """top_k=1 且权重 1.0 时，MoE 输出等价于 per-token 选中的 expert 朴素 FFN。"""
@@ -454,20 +483,23 @@ class TestRoutingDegenerate:
         num_experts = 3
         num_tokens = 5
         torch.manual_seed(0)
-        experts = [
-            _make_expert(h, f_dim, g, torch.bfloat16, seed=e * 11)
-            for e in range(num_experts)
-        ]
+        experts = [_make_expert(h, f_dim, g, torch.bfloat16, seed=e * 11) for e in range(num_experts)]
         stacked = _stack_experts(experts)
 
-        topk_ids = torch.arange(num_tokens, dtype=torch.int64).remainder(
-            num_experts,
-        ).unsqueeze(-1)
+        topk_ids = (
+            torch.arange(num_tokens, dtype=torch.int64)
+            .remainder(
+                num_experts,
+            )
+            .unsqueeze(-1)
+        )
         topk_w = torch.ones((num_tokens, 1), dtype=torch.float32)
         hidden = torch.randn(num_tokens, h, dtype=torch.bfloat16) * 0.1
 
         impl = AWQFusedMoEImpl(
-            num_experts=num_experts, hidden_size=h, ffn_hidden_size=f_dim,
+            num_experts=num_experts,
+            hidden_size=h,
+            ffn_hidden_size=f_dim,
             **stacked,
         )
 
@@ -481,11 +513,11 @@ class TestRoutingDegenerate:
             gate_w = dequant_awq_to_bf16(w.gate_qweight, w.gate_qzeros, w.gate_scales)
             up_w = dequant_awq_to_bf16(w.up_qweight, w.up_qzeros, w.up_scales)
             down_w = dequant_awq_to_bf16(w.down_qweight, w.down_qzeros, w.down_scales)
-            x_t = hidden[t:t + 1].float()
+            x_t = hidden[t : t + 1].float()
             gate_out = x_t @ gate_w.float()
             up_out = x_t @ up_w.float()
             inter = F.silu(gate_out) * up_out
-            expected[t:t + 1] = inter @ down_w.float()
+            expected[t : t + 1] = inter @ down_w.float()
         ref = expected.to(torch.bfloat16)
 
         # Assert
@@ -493,6 +525,7 @@ class TestRoutingDegenerate:
 
 
 # ── 5. R1 真实 shape 冒烟 ──────────────────────────────────────────────────
+
 
 def test_awq_fused_moe_impl_r1_real_shape_smoke() -> None:
     """R1 真实 shape 子采样：H=7168, F=2048, g=64, num_experts=8, top_k=4。
@@ -505,16 +538,15 @@ def test_awq_fused_moe_impl_r1_real_shape_smoke() -> None:
     h, f_dim, g = 7168, 2048, 64
     num_experts, top_k, num_tokens = 8, 4, 2
     torch.manual_seed(0)
-    experts = [
-        _make_expert(h, f_dim, g, torch.float16, seed=e * 13)
-        for e in range(num_experts)
-    ]
+    experts = [_make_expert(h, f_dim, g, torch.float16, seed=e * 13) for e in range(num_experts)]
     stacked = _stack_experts(experts)
     hidden = torch.randn(num_tokens, h, dtype=torch.bfloat16) * 0.05
     topk_ids, topk_w = _random_topk(num_tokens, num_experts, top_k, seed=7)
 
     impl = AWQFusedMoEImpl(
-        num_experts=num_experts, hidden_size=h, ffn_hidden_size=f_dim,
+        num_experts=num_experts,
+        hidden_size=h,
+        ffn_hidden_size=f_dim,
         **stacked,
     )
 

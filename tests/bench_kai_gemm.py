@@ -20,12 +20,13 @@
     - CSV 文件：``backend,M,K,N,max_threads,output_dtype,avg_ms,min_ms,max_ms,gflops``
     - 终端 Summary：以 shape 为行、backend 为列的 GFLOP/s + 相对 torch 的加速比
 """
+
 import argparse
 import csv
 import platform
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
@@ -51,23 +52,18 @@ class BenchResult:
 
 # ── 通用工具 ──
 
+
 def _parse_shape(token: str) -> Tuple[int, int, int]:
     """解析 ``MxKxN`` 形如字符串为三元组。"""
     parts = token.lower().split("x")
     if len(parts) != 3:
-        raise argparse.ArgumentTypeError(
-            f"非法的 shape: {token!r}，应为 'MxKxN' 形式"
-        )
+        raise argparse.ArgumentTypeError(f"非法的 shape: {token!r}，应为 'MxKxN' 形式")
     try:
         m, k, n = (int(p) for p in parts)
     except ValueError as exc:
-        raise argparse.ArgumentTypeError(
-            f"非法的 shape: {token!r}，所有维度必须为整数"
-        ) from exc
+        raise argparse.ArgumentTypeError(f"非法的 shape: {token!r}，所有维度必须为整数") from exc
     if m < 0 or k <= 0 or n <= 0:
-        raise argparse.ArgumentTypeError(
-            f"非法的 shape: {token!r}，K、N 必须为正且 M 非负"
-        )
+        raise argparse.ArgumentTypeError(f"非法的 shape: {token!r}，K、N 必须为正且 M 非负")
     return m, k, n
 
 
@@ -123,8 +119,8 @@ def _relative_error(out: torch.Tensor, ref: torch.Tensor) -> float:
 
 # ── 参考实现 ──
 
-def _torch_reference(x: torch.Tensor, weight: torch.Tensor,
-                     out_dtype: torch.dtype) -> torch.Tensor:
+
+def _torch_reference(x: torch.Tensor, weight: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
     """使用 torch.mm 在 BF16 中间精度下计算参考结果。
 
     为了与 KAI GEMM 的语义一致（BF16 输入、BF16 累加指令），
@@ -137,12 +133,17 @@ def _torch_reference(x: torch.Tensor, weight: torch.Tensor,
 
 # ── 各 backend 的基准函数 ──
 
+
 def _bench_kai(
-    m: int, k: int, n: int,
-    x: torch.Tensor, weight: torch.Tensor,
+    m: int,
+    k: int,
+    n: int,
+    x: torch.Tensor,
+    weight: torch.Tensor,
     out_dtype: torch.dtype,
     max_threads: int,
-    warmup: int, repeat: int,
+    warmup: int,
+    repeat: int,
     fused_cpp_mod,
 ) -> BenchResult:
     dtype_name = _dtype_name(out_dtype)
@@ -152,6 +153,7 @@ def _bench_kai(
     # 当 max_threads > 1 时创建独立线程池，cpu_ids 简单用 [0, 1, ..] 占位
     # （不绑具体核；KAIThreadPool 的 cpu_ids 仅用于声明总并发度）。
     import fused_cpp as _fcpp  # 延迟导入避免循环
+
     pool = None
     if max_threads > 1:
         pool = _fcpp.KAIThreadPool(list(range(max_threads)))
@@ -159,42 +161,66 @@ def _bench_kai(
     try:
         # 正确性检查
         out = fused_cpp_mod.kai_gemm(
-            handler, x, output_dtype=out_dtype, pool=pool,
+            handler,
+            x,
+            output_dtype=out_dtype,
+            pool=pool,
         )
         ref = _torch_reference(x, weight, out_dtype)
         rel_err = _relative_error(out, ref)
         if rel_err > 0.02:
             return BenchResult(
-                backend="kai", m=m, k=k, n=n, max_threads=max_threads,
+                backend="kai",
+                m=m,
+                k=k,
+                n=n,
+                max_threads=max_threads,
                 output_dtype=dtype_name,
-                avg_ms=0.0, min_ms=0.0, max_ms=0.0, gflops=0.0,
+                avg_ms=0.0,
+                min_ms=0.0,
+                max_ms=0.0,
+                gflops=0.0,
                 status="fail",
                 notes=f"rel_err={rel_err:.4f} > 0.02",
             )
 
         avg, mn, mx = _time_loop(
             lambda: fused_cpp_mod.kai_gemm(
-                handler, x, output_dtype=out_dtype, pool=pool,
+                handler,
+                x,
+                output_dtype=out_dtype,
+                pool=pool,
             ),
-            warmup, repeat,
+            warmup,
+            repeat,
         )
     finally:
         if pool is not None:
             pool.close()
 
     return BenchResult(
-        backend="kai", m=m, k=k, n=n, max_threads=max_threads,
+        backend="kai",
+        m=m,
+        k=k,
+        n=n,
+        max_threads=max_threads,
         output_dtype=dtype_name,
-        avg_ms=avg, min_ms=mn, max_ms=mx,
+        avg_ms=avg,
+        min_ms=mn,
+        max_ms=mx,
         gflops=_compute_gflops(m, k, n, avg),
     )
 
 
 def _bench_torch(
-    m: int, k: int, n: int,
-    x: torch.Tensor, weight: torch.Tensor,
+    m: int,
+    k: int,
+    n: int,
+    x: torch.Tensor,
+    weight: torch.Tensor,
     out_dtype: torch.dtype,
-    warmup: int, repeat: int,
+    warmup: int,
+    repeat: int,
 ) -> BenchResult:
     dtype_name = _dtype_name(out_dtype)
 
@@ -208,18 +234,28 @@ def _bench_torch(
     _run()  # 触发 lazy init
     avg, mn, mx = _time_loop(_run, warmup, repeat)
     return BenchResult(
-        backend="torch", m=m, k=k, n=n, max_threads=0,
+        backend="torch",
+        m=m,
+        k=k,
+        n=n,
+        max_threads=0,
         output_dtype=dtype_name,
-        avg_ms=avg, min_ms=mn, max_ms=mx,
+        avg_ms=avg,
+        min_ms=mn,
+        max_ms=mx,
         gflops=_compute_gflops(m, k, n, avg),
     )
 
 
 def _bench_acl(
-    m: int, k: int, n: int,
-    x: torch.Tensor, weight: torch.Tensor,
+    m: int,
+    k: int,
+    n: int,
+    x: torch.Tensor,
+    weight: torch.Tensor,
     out_dtype: torch.dtype,
-    warmup: int, repeat: int,
+    warmup: int,
+    repeat: int,
     fused_cpp_mod,
 ) -> Optional[BenchResult]:
     dtype_name = _dtype_name(out_dtype)
@@ -245,14 +281,21 @@ def _bench_acl(
     _run()
     avg, mn, mx = _time_loop(_run, warmup, repeat)
     return BenchResult(
-        backend="acl", m=m, k=k, n=n, max_threads=0,
+        backend="acl",
+        m=m,
+        k=k,
+        n=n,
+        max_threads=0,
         output_dtype=dtype_name,
-        avg_ms=avg, min_ms=mn, max_ms=mx,
+        avg_ms=avg,
+        min_ms=mn,
+        max_ms=mx,
         gflops=_compute_gflops(m, k, n, avg),
     )
 
 
 # ── Summary 打印 ──
+
 
 def _print_summary(results: List[BenchResult]) -> None:
     # 以 (M, K, N, dtype) 为行，(backend, max_threads) 为列。
@@ -316,71 +359,116 @@ def _print_summary(results: List[BenchResult]) -> None:
 
 # ── CSV 写入 ──
 
+
 def _write_csv(results: List[BenchResult], path: str) -> None:
-    fields = ["backend", "M", "K", "N", "max_threads", "output_dtype",
-              "avg_ms", "min_ms", "max_ms", "gflops", "status", "notes"]
+    fields = [
+        "backend",
+        "M",
+        "K",
+        "N",
+        "max_threads",
+        "output_dtype",
+        "avg_ms",
+        "min_ms",
+        "max_ms",
+        "gflops",
+        "status",
+        "notes",
+    ]
     with open(path, "w", newline="", encoding="utf-8") as fp:
         writer = csv.writer(fp)
         writer.writerow(fields)
         for r in results:
-            writer.writerow([
-                r.backend, r.m, r.k, r.n, r.max_threads, r.output_dtype,
-                f"{r.avg_ms:.6f}", f"{r.min_ms:.6f}", f"{r.max_ms:.6f}",
-                f"{r.gflops:.3f}", r.status, r.notes,
-            ])
+            writer.writerow(
+                [
+                    r.backend,
+                    r.m,
+                    r.k,
+                    r.n,
+                    r.max_threads,
+                    r.output_dtype,
+                    f"{r.avg_ms:.6f}",
+                    f"{r.min_ms:.6f}",
+                    f"{r.max_ms:.6f}",
+                    f"{r.gflops:.3f}",
+                    r.status,
+                    r.notes,
+                ]
+            )
 
 
 # ── 主入口 ──
+
 
 def build_argparser() -> argparse.ArgumentParser:
     default_shapes = ["1x4096x4096", "32x4096x11008", "128x4096x4096"]
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--shapes", nargs="+", default=default_shapes,
+        "--shapes",
+        nargs="+",
+        default=default_shapes,
         help=f"测试 (M, K, N) 组合，默认 {default_shapes}",
     )
     parser.add_argument(
-        "--max-threads", nargs="+", type=int, default=[1, 2, 4],
+        "--max-threads",
+        nargs="+",
+        type=int,
+        default=[1, 2, 4],
         help="KAI GEMM 最大线程数列表，默认 [1, 2, 4]",
     )
     parser.add_argument(
-        "--warmup", type=int, default=10,
+        "--warmup",
+        type=int,
+        default=10,
         help="预热迭代次数，默认 10",
     )
     parser.add_argument(
-        "--repeat", type=int, default=100,
+        "--repeat",
+        type=int,
+        default=100,
         help="正式测量迭代次数，默认 100",
     )
     parser.add_argument(
-        "--output", default="bench_kai_gemm_results.csv",
+        "--output",
+        default="bench_kai_gemm_results.csv",
         help="CSV 输出文件路径",
     )
     parser.add_argument(
-        "--dtypes", nargs="+", default=["fp32", "bf16"],
+        "--dtypes",
+        nargs="+",
+        default=["fp32", "bf16"],
         help="输出 dtype 列表，可选 fp32/bf16",
     )
     parser.add_argument(
-        "--compare-torch", dest="compare_torch",
-        action="store_true", default=True,
+        "--compare-torch",
+        dest="compare_torch",
+        action="store_true",
+        default=True,
         help="是否对比 torch.mm（默认启用）",
     )
     parser.add_argument(
-        "--no-compare-torch", dest="compare_torch",
+        "--no-compare-torch",
+        dest="compare_torch",
         action="store_false",
         help="关闭 torch.mm 对比",
     )
     parser.add_argument(
-        "--compare-acl", dest="compare_acl",
-        action="store_true", default=True,
+        "--compare-acl",
+        dest="compare_acl",
+        action="store_true",
+        default=True,
         help="是否对比 ACL GEMM（默认启用，不可用时自动跳过）",
     )
     parser.add_argument(
-        "--no-compare-acl", dest="compare_acl",
+        "--no-compare-acl",
+        dest="compare_acl",
         action="store_false",
         help="关闭 ACL 对比",
     )
     parser.add_argument(
-        "--seed", type=int, default=0,
+        "--seed",
+        type=int,
+        default=0,
         help="torch 随机种子",
     )
     return parser
@@ -418,24 +506,49 @@ def main() -> int:
             weight = torch.randn(k, n, dtype=torch.float32)
 
             if args.compare_torch:
-                results.append(_bench_torch(
-                    m, k, n, x, weight, out_dtype,
-                    args.warmup, args.repeat,
-                ))
+                results.append(
+                    _bench_torch(
+                        m,
+                        k,
+                        n,
+                        x,
+                        weight,
+                        out_dtype,
+                        args.warmup,
+                        args.repeat,
+                    )
+                )
 
             if args.compare_acl and acl_ok:
                 acl_r = _bench_acl(
-                    m, k, n, x, weight, out_dtype,
-                    args.warmup, args.repeat, fused_cpp,
+                    m,
+                    k,
+                    n,
+                    x,
+                    weight,
+                    out_dtype,
+                    args.warmup,
+                    args.repeat,
+                    fused_cpp,
                 )
                 if acl_r is not None:
                     results.append(acl_r)
 
             for max_threads in args.max_threads:
-                results.append(_bench_kai(
-                    m, k, n, x, weight, out_dtype, max_threads,
-                    args.warmup, args.repeat, fused_cpp,
-                ))
+                results.append(
+                    _bench_kai(
+                        m,
+                        k,
+                        n,
+                        x,
+                        weight,
+                        out_dtype,
+                        max_threads,
+                        args.warmup,
+                        args.repeat,
+                        fused_cpp,
+                    )
+                )
 
     _write_csv(results, args.output)
     _print_summary(results)

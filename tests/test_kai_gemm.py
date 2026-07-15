@@ -10,6 +10,7 @@
 
 非 AArch64 或 KleidiAI 后端不可用时，整个模块被 ``pytestmark`` 跳过。
 """
+
 import platform
 
 import pytest
@@ -19,6 +20,7 @@ _is_aarch64 = platform.machine() in ("aarch64", "arm64")
 
 try:
     import fused_cpp
+
     _kai_available = getattr(fused_cpp, "_supports_kai", False)
 except ImportError:
     _kai_available = False
@@ -30,6 +32,7 @@ pytestmark = pytest.mark.skipif(
 
 
 # ── 辅助函数 ──
+
 
 def _reference_matmul(
     x: torch.Tensor,
@@ -67,6 +70,7 @@ def _build_handler(
 
 
 # ── Prepare 阶段 ──
+
 
 class TestKAIPrepare:
     """``kai_gemm_prepare`` 的输入校验与返回值。"""
@@ -132,6 +136,7 @@ class TestKAIPrepare:
 
 # ── Handler 生命周期 ──
 
+
 class TestKAIHandlerLifecycle:
     """handler 的创建/销毁，以及 max_threads 参数。"""
 
@@ -162,7 +167,7 @@ _SHAPES = [
     (1, 128, 256),
     (8, 128, 256),
     (32, 512, 1024),
-    (17, 256, 384),   # 非 mr/nr 整数倍
+    (17, 256, 384),  # 非 mr/nr 整数倍
     (64, 768, 512),
 ]
 
@@ -211,7 +216,9 @@ class TestKAIGEMMCorrectness:
 
         result = fused_cpp.kai_gemm(handler, x)
         expected = _reference_matmul(
-            x.reshape(-1, K), weight, out_dtype=torch.float32,
+            x.reshape(-1, K),
+            weight,
+            out_dtype=torch.float32,
         ).reshape(B, M, N)
 
         assert result.shape == (B, M, N)
@@ -228,6 +235,7 @@ class TestKAIGEMMCorrectness:
 
 
 # ── 边界情况 ──
+
 
 class TestKAIEdgeCases:
     """边界输入与异常参数。"""
@@ -249,7 +257,9 @@ class TestKAIEdgeCases:
 
         result = fused_cpp.kai_gemm(handler, x, output_dtype=torch.float32)
         expected = _reference_matmul(
-            x.contiguous(), weight, out_dtype=torch.float32,
+            x.contiguous(),
+            weight,
+            out_dtype=torch.float32,
         )
         torch.testing.assert_close(result, expected, atol=2e-2, rtol=2e-2)
 
@@ -270,6 +280,7 @@ class TestKAIEdgeCases:
 
 # ── 多线程一致性 ──
 
+
 class TestKAIMultiThread:
     """多线程与单线程结果一致性。"""
 
@@ -283,7 +294,11 @@ class TestKAIMultiThread:
         ],
     )
     def test_multi_thread_matches_single(
-        self, M: int, K: int, N: int, max_threads: int,
+        self,
+        M: int,
+        K: int,
+        N: int,
+        max_threads: int,
     ) -> None:
         torch.manual_seed(0)
         weight = torch.randn(K, N, dtype=torch.float32)
@@ -298,7 +313,10 @@ class TestKAIMultiThread:
         # （不指定具体 CPU ID，与单线程相同的计算语义）
         with fused_cpp.KAIThreadPool(list(range(max_threads))) as pool:
             out_mt = fused_cpp.kai_gemm(
-                handler, x, output_dtype=torch.float32, pool=pool,
+                handler,
+                x,
+                output_dtype=torch.float32,
+                pool=pool,
             )
 
         torch.testing.assert_close(out_mt, out_st, atol=0, rtol=0)
@@ -315,6 +333,9 @@ class TestKAIMultiThread:
         out_st = fused_cpp.kai_gemm(handler, x, output_dtype=torch.float32)
         with fused_cpp.KAIThreadPool(list(range(8))) as pool:
             out_mt = fused_cpp.kai_gemm(
-                handler, x, output_dtype=torch.float32, pool=pool,
+                handler,
+                x,
+                output_dtype=torch.float32,
+                pool=pool,
             )
         torch.testing.assert_close(out_mt, out_st, atol=0, rtol=0)

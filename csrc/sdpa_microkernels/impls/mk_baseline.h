@@ -27,91 +27,53 @@ struct MK_Baseline {
   static constexpr bool kEnabled = true;
 
   // —— QKᵀ 主体 8×8 ——
-  static inline void qkt_8x8(
-      const at::BFloat16* Q, int64_t q_row_stride,
-      const at::BFloat16* K, int64_t k_row_stride,
-      int64_t E, float scale, float* scores_buf) {
+  static inline void qkt_8x8(const at::BFloat16* Q, int64_t q_row_stride, const at::BFloat16* K, int64_t k_row_stride,
+                             int64_t E, float scale, float* scores_buf) {
     gemm_qkt_8x8(Q, q_row_stride, K, k_row_stride, E, scale, scores_buf);
   }
-  static inline void qkt_8x8(
-      const float* Q, int64_t q_row_stride,
-      const float* K, int64_t k_row_stride,
-      int64_t E, float scale, float* scores_buf) {
+  static inline void qkt_8x8(const float* Q, int64_t q_row_stride, const float* K, int64_t k_row_stride, int64_t E,
+                             float scale, float* scores_buf) {
     gemm_qkt_8x8(Q, q_row_stride, K, k_row_stride, E, scale, scores_buf);
   }
 
   // —— QKᵀ 退化 8×4 ——
-  static inline void qkt_8x4(
-      const at::BFloat16* Q, int64_t q_row_stride,
-      const at::BFloat16* K, int64_t k_row_stride,
-      int64_t E, float scale,
-      float* scores_buf, int64_t scores_row_stride) {
-    gemm_qkt_8x4(Q, q_row_stride, K, k_row_stride, E, scale,
-                 scores_buf, scores_row_stride);
+  static inline void qkt_8x4(const at::BFloat16* Q, int64_t q_row_stride, const at::BFloat16* K, int64_t k_row_stride,
+                             int64_t E, float scale, float* scores_buf, int64_t scores_row_stride) {
+    gemm_qkt_8x4(Q, q_row_stride, K, k_row_stride, E, scale, scores_buf, scores_row_stride);
   }
-  static inline void qkt_8x4(
-      const float* Q, int64_t q_row_stride,
-      const float* K, int64_t k_row_stride,
-      int64_t E, float scale,
-      float* scores_buf, int64_t scores_row_stride) {
-    gemm_qkt_8x4(Q, q_row_stride, K, k_row_stride, E, scale,
-                 scores_buf, scores_row_stride);
+  static inline void qkt_8x4(const float* Q, int64_t q_row_stride, const float* K, int64_t k_row_stride, int64_t E,
+                             float scale, float* scores_buf, int64_t scores_row_stride) {
+    gemm_qkt_8x4(Q, q_row_stride, K, k_row_stride, E, scale, scores_buf, scores_row_stride);
   }
 
   // —— QKᵀ 任意尾部 ——
-  static inline void qkt_tail(
-      const at::BFloat16* Q, int64_t q_row_stride,
-      const at::BFloat16* K, int64_t k_row_stride,
-      int64_t E, float scale,
-      float* scores_buf, int64_t scores_row_stride,
-      int Lq, int Sk) {
-    gemm_qkt_tail(Q, q_row_stride, K, k_row_stride, E, scale,
-                  scores_buf, scores_row_stride, Lq, Sk);
+  static inline void qkt_tail(const at::BFloat16* Q, int64_t q_row_stride, const at::BFloat16* K, int64_t k_row_stride,
+                              int64_t E, float scale, float* scores_buf, int64_t scores_row_stride, int Lq, int Sk) {
+    gemm_qkt_tail(Q, q_row_stride, K, k_row_stride, E, scale, scores_buf, scores_row_stride, Lq, Sk);
   }
-  static inline void qkt_tail(
-      const float* Q, int64_t q_row_stride,
-      const float* K, int64_t k_row_stride,
-      int64_t E, float scale,
-      float* scores_buf, int64_t scores_row_stride,
-      int Lq, int Sk) {
-    gemm_qkt_tail(Q, q_row_stride, K, k_row_stride, E, scale,
-                  scores_buf, scores_row_stride, Lq, Sk);
+  static inline void qkt_tail(const float* Q, int64_t q_row_stride, const float* K, int64_t k_row_stride, int64_t E,
+                              float scale, float* scores_buf, int64_t scores_row_stride, int Lq, int Sk) {
+    gemm_qkt_tail(Q, q_row_stride, K, k_row_stride, E, scale, scores_buf, scores_row_stride, Lq, Sk);
   }
 
   // —— P̂·V 主体 8×8 ——
-  static inline void pv_8x8(
-      const float* P_hat, int64_t P_row_stride,
-      const at::BFloat16* V, int64_t v_row_stride,
-      int64_t Sk,
-      float* O, int64_t o_row_stride) {
+  static inline void pv_8x8(const float* P_hat, int64_t P_row_stride, const at::BFloat16* V, int64_t v_row_stride,
+                            int64_t Sk, float* O, int64_t o_row_stride) {
     gemm_pv_8x8(P_hat, P_row_stride, V, v_row_stride, Sk, O, o_row_stride);
   }
-  static inline void pv_8x8(
-      const float* P_hat, int64_t P_row_stride,
-      const float* V, int64_t v_row_stride,
-      int64_t Sk,
-      float* O, int64_t o_row_stride) {
+  static inline void pv_8x8(const float* P_hat, int64_t P_row_stride, const float* V, int64_t v_row_stride, int64_t Sk,
+                            float* O, int64_t o_row_stride) {
     gemm_pv_8x8(P_hat, P_row_stride, V, v_row_stride, Sk, O, o_row_stride);
   }
 
   // —— P̂·V 任意尾部 ——
-  static inline void pv_tail(
-      const float* P_hat, int64_t P_row_stride,
-      const at::BFloat16* V, int64_t v_row_stride,
-      int64_t Sk,
-      float* O, int64_t o_row_stride,
-      int Lq, int Ev) {
-    gemm_pv_tail(P_hat, P_row_stride, V, v_row_stride, Sk,
-                 O, o_row_stride, Lq, Ev);
+  static inline void pv_tail(const float* P_hat, int64_t P_row_stride, const at::BFloat16* V, int64_t v_row_stride,
+                             int64_t Sk, float* O, int64_t o_row_stride, int Lq, int Ev) {
+    gemm_pv_tail(P_hat, P_row_stride, V, v_row_stride, Sk, O, o_row_stride, Lq, Ev);
   }
-  static inline void pv_tail(
-      const float* P_hat, int64_t P_row_stride,
-      const float* V, int64_t v_row_stride,
-      int64_t Sk,
-      float* O, int64_t o_row_stride,
-      int Lq, int Ev) {
-    gemm_pv_tail(P_hat, P_row_stride, V, v_row_stride, Sk,
-                 O, o_row_stride, Lq, Ev);
+  static inline void pv_tail(const float* P_hat, int64_t P_row_stride, const float* V, int64_t v_row_stride, int64_t Sk,
+                             float* O, int64_t o_row_stride, int Lq, int Ev) {
+    gemm_pv_tail(P_hat, P_row_stride, V, v_row_stride, Sk, O, o_row_stride, Lq, Ev);
   }
 };
 #endif  // FUSED_CPP_MK_ENABLE_BASELINE

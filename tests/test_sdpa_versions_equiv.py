@@ -17,6 +17,7 @@ S - L`` 语义），而**不**使用 ``F.scaled_dot_product_attention``——后
   * ``is_causal=True and not info.supports_causal`` → skip
   * ``E != Ev (MLA shape) and not info.supports_mla_shape`` → skip
 """
+
 from __future__ import annotations
 
 import pytest
@@ -32,11 +33,11 @@ from tests.conftest import assert_tensor_close, call_sdpa_version
 # 「快」shape：默认收集；「慢」shape 通过 mark.slow 单独驱动。
 FAST_SHAPES = [
     # (B, N, L, S, E, Ev)
-    (1, 8, 1, 1, 64, 64),       # 极端短：L=S=1
-    (2, 8, 16, 16, 64, 64),     # 标准小
-    (1, 4, 8, 16, 32, 32),      # L != S
-    (2, 4, 8, 8, 64, 64),       # 标准多 batch
-    (1, 4, 16, 16, 192, 128),   # MLA 小（qk != v）
+    (1, 8, 1, 1, 64, 64),  # 极端短：L=S=1
+    (2, 8, 16, 16, 64, 64),  # 标准小
+    (1, 4, 8, 16, 32, 32),  # L != S
+    (2, 4, 8, 8, 64, 64),  # 标准多 batch
+    (1, 4, 16, 16, 192, 128),  # MLA 小（qk != v）
 ]
 
 SLOW_SHAPES = [
@@ -56,15 +57,11 @@ REF_VERSION = "naive_torch"
 # ── 辅助 ──────────────────────────────────────────────────────────────────
 
 
-def _check_capabilities(
-    info: VersionInfo, dtype: torch.dtype, is_causal: bool, shape
-) -> None:
+def _check_capabilities(info: VersionInfo, dtype: torch.dtype, is_causal: bool, shape) -> None:
     """根据 :class:`VersionInfo` 能力位决定是否 skip。"""
     B, N, L, S, E, Ev = shape
     is_mla = E != Ev
-    ok, reason = info.supports(
-        dtype=dtype, is_causal=is_causal, mla_shape=is_mla
-    )
+    ok, reason = info.supports(dtype=dtype, is_causal=is_causal, mla_shape=is_mla)
     if not ok:
         pytest.skip(reason)
     # ── flash2_neon_l3kv_packqkv 专属约束：S % 8 == 0 且 Ev % 8 == 0 ──
@@ -77,13 +74,9 @@ def _check_capabilities(
         "flash2_neon_l3kv_packqkv_pbf16pv_exp_poly6",
     }:
         if S % 8 != 0:
-            pytest.skip(
-                f"{info.name} requires S % 8 == 0; got S={S}"
-            )
+            pytest.skip(f"{info.name} requires S % 8 == 0; got S={S}")
         if Ev % 8 != 0:
-            pytest.skip(
-                f"{info.name} requires Ev % 8 == 0; got Ev={Ev}"
-            )
+            pytest.skip(f"{info.name} requires Ev % 8 == 0; got Ev={Ev}")
 
 
 def _shape_id(shape) -> str:
@@ -120,8 +113,7 @@ _PYTORCH_BUILTIN_SDPA_NAMES = frozenset({"pytorch_sdpa", "pytorch_sdpa_math"})
 @pytest.mark.equiv
 @pytest.mark.parametrize("shape", FAST_SHAPES, ids=_shape_id)
 @pytest.mark.parametrize("dtype", DTYPES, ids=_dtype_id)
-@pytest.mark.parametrize("is_causal", CAUSAL_VALUES,
-                         ids=["noncausal", "causal"])
+@pytest.mark.parametrize("is_causal", CAUSAL_VALUES, ids=["noncausal", "causal"])
 def test_sdpa_versions_equiv_fast(sdpa_version, shape, dtype, is_causal):
     """快速等价性矩阵：每个版本对照 ``naive_torch`` 参考实现。"""
     info = sdpa_version
@@ -184,8 +176,7 @@ def test_sdpa_versions_equiv_fast(sdpa_version, shape, dtype, is_causal):
 @pytest.mark.slow
 @pytest.mark.parametrize("shape", SLOW_SHAPES, ids=_shape_id)
 @pytest.mark.parametrize("dtype", DTYPES, ids=_dtype_id)
-@pytest.mark.parametrize("is_causal", CAUSAL_VALUES,
-                         ids=["noncausal", "causal"])
+@pytest.mark.parametrize("is_causal", CAUSAL_VALUES, ids=["noncausal", "causal"])
 def test_sdpa_versions_equiv_slow(sdpa_version, shape, dtype, is_causal):
     """大 shape 等价性矩阵：默认跳过，仅在 ``-m slow`` 时执行。"""
     info = sdpa_version
@@ -218,12 +209,14 @@ def test_sdpa_registry_has_expected_versions():
 
     names = {vi.name for vi in available_sdpa_versions()}
     expected = {
-        "naive_torch", "pytorch_sdpa", "pytorch_sdpa_math",
-        "naive", "flash1", "flash2",
+        "naive_torch",
+        "pytorch_sdpa",
+        "pytorch_sdpa_math",
+        "naive",
+        "flash1",
+        "flash2",
     }
-    assert expected.issubset(names), (
-        f"missing versions: {expected - names}; got {sorted(names)}"
-    )
+    assert expected.issubset(names), f"missing versions: {expected - names}; got {sorted(names)}"
 
 
 # ── flash2_neon vs flash2 交叉验证（NEON 重排误差边界）─────────────────
@@ -237,8 +230,7 @@ def _max_abs(a: torch.Tensor, b: torch.Tensor) -> float:
 @pytest.mark.equiv
 @pytest.mark.parametrize("shape", FAST_SHAPES, ids=_shape_id)
 @pytest.mark.parametrize("dtype", DTYPES, ids=_dtype_id)
-@pytest.mark.parametrize("is_causal", CAUSAL_VALUES,
-                         ids=["noncausal", "causal"])
+@pytest.mark.parametrize("is_causal", CAUSAL_VALUES, ids=["noncausal", "causal"])
 def test_flash2_neon_close_to_flash2(shape, dtype, is_causal):
     """``flash2_neon`` 与 ``flash2`` 的累加顺序差异在 2× 容差内。
 
@@ -282,8 +274,7 @@ def test_flash2_neon_close_to_flash2(shape, dtype, is_causal):
         f"err_flash2={err_flash2:.3e} bound={bound:.3e}"
     )
     assert err_neon <= bound, (
-        f"flash2_neon vs naive_torch error {err_neon:.3e} exceeds "
-        f"2*flash2_err + atol = {bound:.3e} ({ctx})"
+        f"flash2_neon vs naive_torch error {err_neon:.3e} exceeds 2*flash2_err + atol = {bound:.3e} ({ctx})"
     )
 
 
@@ -302,19 +293,16 @@ def test_flash2_neon_close_to_flash2(shape, dtype, is_causal):
 # 末尾 0 tail，Lc_eff=8 所以 inner 全跑 Lq_eff=8）。
 
 MASK_SHAPES = [
-    (1, 4, 32, 32, 64, 64),    # 主路径 + 8x8
-    (1, 2, 12, 20, 64, 64),    # tail：Lq=12（一个 8 + 一个 4 tail）、Sk=20 → 8x8 + 8x4 + 8x4 tail
+    (1, 4, 32, 32, 64, 64),  # 主路径 + 8x8
+    (1, 2, 12, 20, 64, 64),  # tail：Lq=12（一个 8 + 一个 4 tail）、Sk=20 → 8x8 + 8x4 + 8x4 tail
 ]
 
 
 @pytest.mark.equiv
 @pytest.mark.parametrize("shape", MASK_SHAPES, ids=_shape_id)
 @pytest.mark.parametrize("dtype", DTYPES, ids=_dtype_id)
-@pytest.mark.parametrize("is_causal", CAUSAL_VALUES,
-                         ids=["noncausal", "causal"])
-def test_sdpa_versions_equiv_with_attn_mask(
-    sdpa_version, shape, dtype, is_causal
-):
+@pytest.mark.parametrize("is_causal", CAUSAL_VALUES, ids=["noncausal", "causal"])
+def test_sdpa_versions_equiv_with_attn_mask(sdpa_version, shape, dtype, is_causal):
     """带 fp32 attn_mask 时各 SDPA 版本相对 ``naive_torch`` 仍然等价。
 
     动机：``flash2_neon_l3kv*`` 在 P1 优化中把 ``mask_ptr != nullptr`` 提
@@ -328,18 +316,13 @@ def test_sdpa_versions_equiv_with_attn_mask(
 
     # PyTorch 内置 SDPA 在 ``L != S`` + ``is_causal=True`` 用 upper-left 语义
     if info.name in _PYTORCH_BUILTIN_SDPA_NAMES and is_causal and L != S:
-        pytest.skip(
-            f"{info.name} uses upper-left causal mask when L != S; "
-            "skipped for semantic mismatch."
-        )
+        pytest.skip(f"{info.name} uses upper-left causal mask when L != S; skipped for semantic mismatch.")
 
     # PyTorch 内置 SDPA 在 ``is_causal=True`` 时拒绝显式 ``attn_mask``
     # （F.scaled_dot_product_attention 的 API 约束）。本测试目标是 C++ kernel
     # 自身 mask 路径的数值正确性，而非 PyTorch API 兼容性，故这里 skip。
     if info.name in _PYTORCH_BUILTIN_SDPA_NAMES and is_causal:
-        pytest.skip(
-            f"{info.name} disallows attn_mask + is_causal=True at API level"
-        )
+        pytest.skip(f"{info.name} disallows attn_mask + is_causal=True at API level")
 
     ok, reason = info.supports(attn_mask=True)
     if not ok:
@@ -351,9 +334,7 @@ def test_sdpa_versions_equiv_with_attn_mask(
     # 把整行打成 -inf。
     mask = torch.randn(B, N, L, S, generator=g, dtype=torch.float32) * 0.1
 
-    out = call_sdpa_version(
-        info, q, k, v, attn_mask=mask, is_causal=is_causal
-    )
+    out = call_sdpa_version(info, q, k, v, attn_mask=mask, is_causal=is_causal)
 
     if info.name == REF_VERSION:
         try:
@@ -363,19 +344,12 @@ def test_sdpa_versions_equiv_with_attn_mask(
         ok_ref, _ = ref_info.supports(attn_mask=True)
         if not ok_ref:
             pytest.skip("reference version does not support attn_mask")
-        if (
-            ref_info.name in _PYTORCH_BUILTIN_SDPA_NAMES
-            and is_causal and L != S
-        ):
+        if ref_info.name in _PYTORCH_BUILTIN_SDPA_NAMES and is_causal and L != S:
             pytest.skip("reference uses upper-left causal; semantic mismatch")
-        ref = call_sdpa_version(
-            ref_info, q, k, v, attn_mask=mask, is_causal=is_causal
-        )
+        ref = call_sdpa_version(ref_info, q, k, v, attn_mask=mask, is_causal=is_causal)
     else:
         ref_info = get_sdpa_version(REF_VERSION)
-        ref = call_sdpa_version(
-            ref_info, q, k, v, attn_mask=mask, is_causal=is_causal
-        )
+        ref = call_sdpa_version(ref_info, q, k, v, attn_mask=mask, is_causal=is_causal)
 
     ctx = (
         f"version={info.name} source={info.source} shape={_shape_id(shape)} "

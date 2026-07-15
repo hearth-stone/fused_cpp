@@ -4,6 +4,7 @@
 提供 ACLGEMMHandler 类管理 handler 生命周期，
 以及 create_acl_gemm / acl_gemm / set_acl_affinity / get_acl_affinity 等公开接口。
 """
+
 import logging
 
 import torch
@@ -19,6 +20,7 @@ try:
         set_acl_thread_affinity as _set_acl_thread_affinity,
         get_acl_thread_affinity as _get_acl_thread_affinity,
     )
+
     _supports_acl = True
 except ImportError:
     _supports_acl = False
@@ -33,8 +35,7 @@ class ACLGEMMHandler:
         fast_math: 是否启用低精度加速路径。
     """
 
-    def __init__(self, handler_ptr: int, k: int, n: int,
-                 fast_math: bool = False) -> None:
+    def __init__(self, handler_ptr: int, k: int, n: int, fast_math: bool = False) -> None:
         self._handler_ptr = handler_ptr
         self.k = k
         self.n = n
@@ -66,9 +67,7 @@ def create_acl_gemm(
         raise RuntimeError("ACL GEMM 后端不可用（C++ 扩展未编译或非 AArch64 平台）")
 
     if weight.dim() != 2:
-        raise RuntimeError(
-            f"ACL GEMM: 权重张量必须为 2D，当前维度: {weight.dim()}"
-        )
+        raise RuntimeError(f"ACL GEMM: 权重张量必须为 2D，当前维度: {weight.dim()}")
 
     k, n = weight.shape
     handler_ptr = _create_acl_gemm_handler(weight, num_threads, fast_math)

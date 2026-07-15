@@ -81,8 +81,7 @@ template <class MK, class = void>
 struct has_enabled : std::false_type {};
 
 template <class MK>
-struct has_enabled<MK, std::void_t<decltype(MK::kEnabled)>>
-    : std::bool_constant<MK::kEnabled> {};
+struct has_enabled<MK, std::void_t<decltype(MK::kEnabled)>> : std::bool_constant<MK::kEnabled> {};
 
 }  // namespace detail
 
@@ -106,10 +105,8 @@ struct MicrokernelEntry {
   std::map<std::string, double> (*validate_fp32)(int64_t E, int64_t Sk);
   std::map<std::string, double> (*validate_bf16)(int64_t E, int64_t Sk);
 
-  std::map<std::string, double> (*benchmark_fp32)(
-      int64_t E, int64_t Sk, int64_t iterations, int64_t warmup);
-  std::map<std::string, double> (*benchmark_bf16)(
-      int64_t E, int64_t Sk, int64_t iterations, int64_t warmup);
+  std::map<std::string, double> (*benchmark_fp32)(int64_t E, int64_t Sk, int64_t iterations, int64_t warmup);
+  std::map<std::string, double> (*benchmark_bf16)(int64_t E, int64_t Sk, int64_t iterations, int64_t warmup);
 };
 
 // 注册一个 impl。重名直接抛 std::runtime_error。
@@ -122,19 +119,11 @@ std::vector<std::string> mk_list_impls();
 const MicrokernelEntry* mk_find_impl(const std::string& name);
 
 // validate / benchmark 顶层入口。dtype ∈ {"fp32", "bf16"}。
-std::map<std::string, double> mk_validate_dispatch(
-    const std::string& impl_name,
-    const std::string& dtype,
-    int64_t E,
-    int64_t Sk);
+std::map<std::string, double> mk_validate_dispatch(const std::string& impl_name, const std::string& dtype, int64_t E,
+                                                   int64_t Sk);
 
-std::map<std::string, double> mk_benchmark_dispatch(
-    const std::string& impl_name,
-    const std::string& dtype,
-    int64_t E,
-    int64_t Sk,
-    int64_t iterations,
-    int64_t warmup);
+std::map<std::string, double> mk_benchmark_dispatch(const std::string& impl_name, const std::string& dtype, int64_t E,
+                                                    int64_t Sk, int64_t iterations, int64_t warmup);
 
 // ── 注册宏 ──────────────────────────────────────────────────────────────
 //
@@ -146,19 +135,14 @@ std::map<std::string, double> mk_benchmark_dispatch(
 #define MK_REG_CONCAT_INNER(a, b) a##b
 #define MK_REG_CONCAT(a, b) MK_REG_CONCAT_INNER(a, b)
 
-#define REGISTER_MICROKERNEL_IMPL(MK_TYPE)                                  \
-  static int MK_REG_CONCAT(_mk_reg_, __COUNTER__) =                         \
-      ::fused_cpp::sdpa_microkernels::mk_register_impl(                     \
-          ::fused_cpp::sdpa_microkernels::MicrokernelEntry{                 \
-              MK_TYPE::kName,                                               \
-              &::fused_cpp::sdpa_microkernels::                             \
-                  validate_microkernels_tmpl<MK_TYPE, float>,               \
-              &::fused_cpp::sdpa_microkernels::                             \
-                  validate_microkernels_tmpl<MK_TYPE, at::BFloat16>,        \
-              &::fused_cpp::sdpa_microkernels::                             \
-                  benchmark_microkernels_tmpl<MK_TYPE, float>,              \
-              &::fused_cpp::sdpa_microkernels::                             \
-                  benchmark_microkernels_tmpl<MK_TYPE, at::BFloat16>,       \
-          })
+#define REGISTER_MICROKERNEL_IMPL(MK_TYPE)                                                               \
+  static int MK_REG_CONCAT(_mk_reg_, __COUNTER__) =                                                      \
+      ::fused_cpp::sdpa_microkernels::mk_register_impl(::fused_cpp::sdpa_microkernels::MicrokernelEntry{ \
+          MK_TYPE::kName,                                                                                \
+          &::fused_cpp::sdpa_microkernels::validate_microkernels_tmpl<MK_TYPE, float>,                   \
+          &::fused_cpp::sdpa_microkernels::validate_microkernels_tmpl<MK_TYPE, at::BFloat16>,            \
+          &::fused_cpp::sdpa_microkernels::benchmark_microkernels_tmpl<MK_TYPE, float>,                  \
+          &::fused_cpp::sdpa_microkernels::benchmark_microkernels_tmpl<MK_TYPE, at::BFloat16>,           \
+      })
 
 }  // namespace fused_cpp::sdpa_microkernels

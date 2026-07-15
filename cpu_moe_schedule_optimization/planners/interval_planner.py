@@ -50,9 +50,7 @@ class IntervalPlanner:
         self.model = model
         self.num_cores = int(num_cores)
         self.widths = tuple(widths or _default_widths(self.num_cores))
-        self.cpu_ids = tuple(
-            int(cpu) for cpu in (cpu_ids if cpu_ids is not None else range(num_cores))
-        )
+        self.cpu_ids = tuple(int(cpu) for cpu in (cpu_ids if cpu_ids is not None else range(num_cores)))
         if len(self.cpu_ids) != self.num_cores or len(set(self.cpu_ids)) != num_cores:
             raise ValueError("cpu_ids must contain num_cores unique physical CPUs")
 
@@ -65,8 +63,7 @@ class IntervalPlanner:
         self.shapes = tuple(
             shape
             for shape in candidates
-            if sum(shape) == self.num_cores
-            and all(width in self.widths for width in shape)
+            if sum(shape) == self.num_cores and all(width in self.widths for width in shape)
         )
         if not self.shapes:
             raise ProfileCompatibilityError(
@@ -89,8 +86,7 @@ class IntervalPlanner:
             _, routes = experts[index]
             lane = min(
                 range(lane_count),
-                key=lambda candidate: load[candidate]
-                + self.model.T_iso(routes, lanes[candidate][1]),
+                key=lambda candidate: load[candidate] + self.model.T_iso(routes, lanes[candidate][1]),
             )
             lane_experts[lane].append(index)
             load[lane] += self.model.T_iso(routes, lanes[lane][1])
@@ -104,33 +100,22 @@ class IntervalPlanner:
             for index in expert_indices:
                 expert_id, routes = experts[index]
                 dependencies = [previous] if previous is not None else []
-                tasks.append(
-                    (expert_id, routes, core_begin, width, dependencies)
-                )
+                tasks.append((expert_id, routes, core_begin, width, dependencies))
                 previous = len(tasks) - 1
         return tasks
 
     def _score(self, tasks) -> float:
-        return self.model.dag_makespan(
-            [(routes, threads, deps) for _, routes, _, threads, deps in tasks]
-        )
+        return self.model.dag_makespan([(routes, threads, deps) for _, routes, _, threads, deps in tasks])
 
     def _uncertainty(self, experts, shape, makespan: float) -> float:
         if self.model.schema_version < 2:
             return 0.0
         if self._uses_full_workload_anchor(experts):
-            relative = self.model.relative_full_call_uncertainty(
-                experts[0][1], shape
-            )
+            relative = self.model.relative_full_call_uncertainty(experts[0][1], shape)
             return makespan * relative / math.sqrt(self.model.profile_runs)
-        relative = max(
-            self.model.relative_uncertainty(routes, shape)
-            for _, routes in experts
-        )
+        relative = max(self.model.relative_uncertainty(routes, shape) for _, routes in experts)
         waves = max(1, math.ceil(len(experts) / len(shape)))
-        return makespan * relative / math.sqrt(
-            waves * self.model.profile_runs
-        )
+        return makespan * relative / math.sqrt(waves * self.model.profile_runs)
 
     def active_working_set_bytes(self, shape) -> int:
         return len(shape) * self.model.max_stage_bytes
@@ -146,9 +131,7 @@ class IntervalPlanner:
     def score_shape(self, experts, shape):
         signature = tuple(int(value) for value in shape)
         if self.model.schema_version >= 2 and not self.model.supports_shape(signature):
-            raise ProfileCompatibilityError(
-                f"shape {signature} is not present in {self.model.profile_path.name}"
-            )
+            raise ProfileCompatibilityError(f"shape {signature} is not present in {self.model.profile_path.name}")
         lanes = self._lanes(signature)
         tasks = self._build_tasks(experts, lanes, self._assign(experts, lanes))
         if self._uses_full_workload_anchor(experts):
@@ -176,8 +159,7 @@ class IntervalPlanner:
         overlapping = [
             candidate
             for candidate in candidates
-            if candidate["makespan_ns"] - candidate["uncertainty_ns"]
-            <= fastest_upper
+            if candidate["makespan_ns"] - candidate["uncertainty_ns"] <= fastest_upper
             and candidate["pessimistic_ns"] >= fastest_lower
         ]
         return min(
@@ -211,9 +193,7 @@ class IntervalPlanner:
             "makespan_ns": selected["makespan_ns"],
             "uncertainty_ns": selected["uncertainty_ns"],
             "active_working_set_bytes": selected["active_working_set_bytes"],
-            "w13_split": (
-                self.model.policy.w13_split if self.model.policy is not None else None
-            ),
+            "w13_split": (self.model.policy.w13_split if self.model.policy is not None else None),
             "policy": policy,
             "tasks": selected["tasks"],
             "bridge": self.to_async_bridge(selected["tasks"]),
@@ -221,16 +201,10 @@ class IntervalPlanner:
                 {
                     "shape": candidate["shape"],
                     "makespan_ms": round(candidate["makespan_ns"] / 1e6, 6),
-                    "pessimistic_ms": round(
-                        candidate["pessimistic_ns"] / 1e6, 6
-                    ),
-                    "active_working_set_bytes": candidate[
-                        "active_working_set_bytes"
-                    ],
+                    "pessimistic_ms": round(candidate["pessimistic_ns"] / 1e6, 6),
+                    "active_working_set_bytes": candidate["active_working_set_bytes"],
                 }
-                for candidate in sorted(
-                    candidates, key=lambda candidate: candidate["makespan_ns"]
-                )
+                for candidate in sorted(candidates, key=lambda candidate: candidate["makespan_ns"])
             ],
         }
 
@@ -265,14 +239,10 @@ class PolicyAwarePlanner:
             raise ValueError("at least one policy model is required")
         policies = [model.policy for model in models]
         if any(policy is None for policy in policies):
-            raise ProfileCompatibilityError(
-                "joint policy search requires schema-v2 profiles"
-            )
+            raise ProfileCompatibilityError("joint policy search requires schema-v2 profiles")
         base_key = policies[0].key_without_split()
         if any(policy.key_without_split() != base_key for policy in policies[1:]):
-            raise ProfileCompatibilityError(
-                "joint planner profiles differ in more than W13 split policy"
-            )
+            raise ProfileCompatibilityError("joint planner profiles differ in more than W13 split policy")
         self.models = tuple(models)
         self.num_cores = int(num_cores)
         self.cpu_ids = cpu_ids
@@ -296,12 +266,7 @@ class PolicyAwarePlanner:
             shapes,
             key=lambda shape: abs(len(shape) * model.max_stage_bytes - target),
         )
-        keep = {
-            shape
-            for shape in shapes
-            if len(shape) == 1
-            or len(shape) * model.max_stage_bytes <= target * 1.25
-        }
+        keep = {shape for shape in shapes if len(shape) == 1 or len(shape) * model.max_stage_bytes <= target * 1.25}
         keep.update(by_distance[:2])
         lane_counts = {len(shape) for shape in keep}
         for shape in shapes:
@@ -318,11 +283,8 @@ class PolicyAwarePlanner:
                     "result": result,
                     "makespan_ns": result["makespan_ns"],
                     "uncertainty_ns": result["uncertainty_ns"],
-                    "pessimistic_ns": result["makespan_ns"]
-                    + result["uncertainty_ns"],
-                    "active_working_set_bytes": result[
-                        "active_working_set_bytes"
-                    ],
+                    "pessimistic_ns": result["makespan_ns"] + result["uncertainty_ns"],
+                    "active_working_set_bytes": result["active_working_set_bytes"],
                     "shape": result["shape"],
                 }
             )
@@ -335,9 +297,7 @@ class PolicyAwarePlanner:
                 "uncertainty_ms": result["uncertainty_ns"] / 1e6,
                 "active_working_set_bytes": result["active_working_set_bytes"],
             }
-            for result in sorted(
-                policy_results, key=lambda result: result["makespan_ns"]
-            )
+            for result in sorted(policy_results, key=lambda result: result["makespan_ns"])
         ]
         return selected
 

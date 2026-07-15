@@ -28,15 +28,15 @@ extern "C" {
 #endif
 
 enum fused_cpp_sdpa_dtype {
-    FUSED_CPP_SDPA_DTYPE_F32 = 0,
-    FUSED_CPP_SDPA_DTYPE_BF16 = 1,
+  FUSED_CPP_SDPA_DTYPE_F32 = 0,
+  FUSED_CPP_SDPA_DTYPE_BF16 = 1,
 };
 
 typedef struct fused_cpp_sdpa_strides {
-    int64_t b;
-    int64_t n;
-    int64_t t;
-    int64_t d;
+  int64_t b;
+  int64_t n;
+  int64_t t;
+  int64_t d;
 } fused_cpp_sdpa_strides;
 
 FUSED_CPP_SDPA_API const char* fused_cpp_sdpa_last_error(void);
@@ -59,26 +59,13 @@ FUSED_CPP_SDPA_API const char* fused_cpp_sdpa_version_name(int index);
 //
 // Returns 0 on success and -1 on error. Use fused_cpp_sdpa_last_error() for
 // the thread-local error string.
-FUSED_CPP_SDPA_API int fused_cpp_sdpa_forward_strided(
-    const char* version,
-    int dtype,
-    const void* q,
-    const void* k,
-    const void* v,
-    const float* attn_mask,
-    float* out,
-    int64_t B,
-    int64_t N,
-    int64_t L,
-    int64_t S,
-    int64_t E,
-    int64_t Ev,
-    fused_cpp_sdpa_strides q_strides,
-    fused_cpp_sdpa_strides k_strides,
-    fused_cpp_sdpa_strides v_strides,
-    fused_cpp_sdpa_strides out_strides,
-    int is_causal,
-    float scale);
+FUSED_CPP_SDPA_API int fused_cpp_sdpa_forward_strided(const char* version, int dtype, const void* q, const void* k,
+                                                      const void* v, const float* attn_mask, float* out, int64_t B,
+                                                      int64_t N, int64_t L, int64_t S, int64_t E, int64_t Ev,
+                                                      fused_cpp_sdpa_strides q_strides,
+                                                      fused_cpp_sdpa_strides k_strides,
+                                                      fused_cpp_sdpa_strides v_strides,
+                                                      fused_cpp_sdpa_strides out_strides, int is_causal, float scale);
 
 // Convenience entry for llama.cpp / ggml flash-attn input layout, fp32 path.
 //
@@ -92,20 +79,9 @@ FUSED_CPP_SDPA_API int fused_cpp_sdpa_forward_strided(
 // For BGE-small single batch Qcur/Kcur/Vcur this corresponds to physical
 // ggml tensors with ne = [head_dim, n_head, n_tokens] that build_attn views as
 // [head_dim, tokens, heads, batch].
-FUSED_CPP_SDPA_API int fused_cpp_sdpa_forward_ggml_f32(
-    const char* version,
-    const float* q,
-    const float* k,
-    const float* v,
-    float* out,
-    int64_t B,
-    int64_t N,
-    int64_t L,
-    int64_t S,
-    int64_t E,
-    int64_t Ev,
-    int is_causal,
-    float scale);
+FUSED_CPP_SDPA_API int fused_cpp_sdpa_forward_ggml_f32(const char* version, const float* q, const float* k,
+                                                       const float* v, float* out, int64_t B, int64_t N, int64_t L,
+                                                       int64_t S, int64_t E, int64_t Ev, int is_causal, float scale);
 
 #ifdef __cplusplus
 }  // extern "C"

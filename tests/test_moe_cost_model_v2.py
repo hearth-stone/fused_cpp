@@ -76,9 +76,7 @@ def test_iso_formula_recovers_separable_measurements() -> None:
         thread_points,
     )
     points = [
-        (route, team, truth.T_iso(route, team))
-        for route in (1, 2, 4, 8, 12, 48, 256, 512)
-        for team in (1, 2, 4, 8)
+        (route, team, truth.T_iso(route, team)) for route in (1, 2, 4, 8, 12, 48, 256, 512) for team in (1, 2, 4, 8)
     ]
     fitted = fit_from_measurements(points, phi_route_min=256)
 
@@ -87,9 +85,7 @@ def test_iso_formula_recovers_separable_measurements() -> None:
     assert fitted.alpha == pytest.approx(truth.alpha)
     assert fitted.beta == pytest.approx(truth.beta)
     assert fitted.T_iso(96, 4) == pytest.approx(truth.T_iso(96, 4))
-    assert IsoFormula.from_dict(fitted.to_dict()).T_iso(96, 4) == pytest.approx(
-        truth.T_iso(96, 4)
-    )
+    assert IsoFormula.from_dict(fitted.to_dict()).T_iso(96, 4) == pytest.approx(truth.T_iso(96, 4))
     with pytest.raises(ValueError, match="outside calibrated domain"):
         fitted.T_iso(96, 16)
 
@@ -152,11 +148,7 @@ def test_m12_tail_composition(catalog: ProfileCatalog) -> None:
     assert model.T_iso(9, 4) == model.T_iso(12, 4)
 
     overhead = model._O[4]
-    expected = (
-        overhead
-        + (model.T_iso(12, 4) - overhead)
-        + (model.T_iso(1, 4) - overhead)
-    )
+    expected = overhead + (model.T_iso(12, 4) - overhead) + (model.T_iso(1, 4) - overhead)
     assert model.T_iso(13, 4) == pytest.approx(expected)
 
 
@@ -168,9 +160,7 @@ def test_exact_shape_and_stage_working_sets(catalog: ProfileCatalog) -> None:
         split.profiled_group_time(192, (24, 8))
 
     split_worksets = [workset for _, workset in split._task_phases(192, 16)]
-    no_split_worksets = [
-        workset for _, workset in no_split._task_phases(192, 16)
-    ]
+    no_split_worksets = [workset for _, workset in no_split._task_phases(192, 16)]
     assert [value for value in split_worksets if value] == [
         16 * 1024 * 1024,
         16 * 1024 * 1024,
@@ -181,37 +171,25 @@ def test_exact_shape_and_stage_working_sets(catalog: ProfileCatalog) -> None:
         16 * 1024 * 1024,
     ]
     tasks = [(192, 16, []), (192, 16, [])]
-    assert no_split.dag_makespan(tasks) != pytest.approx(
-        no_split.flat_dag_makespan(tasks)
-    )
+    assert no_split.dag_makespan(tasks) != pytest.approx(no_split.flat_dag_makespan(tasks))
 
 
 def test_joint_planner_and_physical_cpu_mapping(catalog: ProfileCatalog) -> None:
     tp_models = models(catalog, "tp", 1024, 64)
     assert all(model.has_full_workload_anchors for model in tp_models)
-    tp = PolicyAwarePlanner(tp_models, 32, cpu_ids=range(32, 64)).plan(
-        [(expert, 192) for expert in range(64)]
-    )
+    tp = PolicyAwarePlanner(tp_models, 32, cpu_ids=range(32, 64)).plan([(expert, 192) for expert in range(64)])
     assert tp["w13_split"] is True
     assert tp["shape"] == (8, 8, 8, 8)
     assert tp["active_working_set_bytes"] == 32 * 1024 * 1024
     assert tp["bridge"]["thread_cpu_ids"] == list(range(32, 64))
 
     split_model = tp_models[1]
-    split_planner = PolicyAwarePlanner(
-        [split_model], 32, cpu_ids=range(32, 64)
-    ).planners[0]
-    anchored_ms, _ = split_planner.score_shape(
-        [(expert, 192) for expert in range(64)], (8, 8, 8, 8)
-    )
-    assert anchored_ms == split_model.profiled_full_call_time(
-        192, (8, 8, 8, 8)
-    )
+    split_planner = PolicyAwarePlanner([split_model], 32, cpu_ids=range(32, 64)).planners[0]
+    anchored_ms, _ = split_planner.score_shape([(expert, 192) for expert in range(64)], (8, 8, 8, 8))
+    assert anchored_ms == split_model.profiled_full_call_time(192, (8, 8, 8, 8))
 
     ep_models = models(catalog, "ep", 2048, 32)
-    ep = PolicyAwarePlanner(ep_models, 32).plan(
-        [(expert, 192) for expert in range(32)]
-    )
+    ep = PolicyAwarePlanner(ep_models, 32).plan([(expert, 192) for expert in range(32)])
     assert ep["w13_split"] is True
     assert ep["shape"] == (32,)
 
@@ -243,9 +221,7 @@ def test_real_routing_summary_offline_plan_and_cost_model(
     assert len(active) == workload.observed_active_experts == 223
     assert (min(active), max(active)) == (1, 918)
     mean = sum(active) / len(active)
-    reconstructed_std = math.sqrt(
-        sum((routes - mean) ** 2 for routes in active) / len(active)
-    )
+    reconstructed_std = math.sqrt(sum((routes - mean) ** 2 for routes in active) / len(active))
     assert reconstructed_std == pytest.approx(
         workload.observed_routes_std,
         abs=1e-4,
@@ -269,8 +245,7 @@ def test_real_routing_summary_offline_plan_and_cost_model(
     selected = next(
         planner
         for planner in policy_planner.planners
-        if planner.model.policy is not None
-        and planner.model.policy.w13_split == result["w13_split"]
+        if planner.model.policy is not None and planner.model.policy.w13_split == result["w13_split"]
     )
     rescored_ns, rescored_tasks = selected.score_shape(
         workload.experts,
@@ -291,13 +266,9 @@ def test_tp_ep_evaluator_and_generic_p2_collectives(
         latency_seconds=1e-6,
     )
     message = 2048 * 4096 * 2
-    assert topology.allreduce_ms(message) == pytest.approx(
-        (message / 20e9 + 2e-6) * 1e3
-    )
+    assert topology.allreduce_ms(message) == pytest.approx((message / 20e9 + 2e-6) * 1e3)
     outgoing = 1024 * 6 * 4096 * 2
-    assert topology.alltoall_ms(outgoing) == pytest.approx(
-        2 * (outgoing / 2 / 20e9 + 1e-6) * 1e3
-    )
+    assert topology.alltoall_ms(outgoing) == pytest.approx(2 * (outgoing / 2 / 20e9 + 1e-6) * 1e3)
 
     evaluator = ParallelLayerEvaluator(
         catalog,
@@ -319,12 +290,8 @@ def test_tp_ep_evaluator_and_generic_p2_collectives(
     hotspot = [768] * 4 + [384] * 12 + [96] * 48
     ep_hotspot = evaluator.evaluate_ep(2048, 6, global_histogram=hotspot)
     assert [rank.routes for rank in ep_hotspot.rank_compute] == [9216, 3072]
-    assert ep_hotspot.compute_ms == max(
-        rank.predicted_ms for rank in ep_hotspot.rank_compute
-    )
-    assert ep_hotspot.rank_compute[0].predicted_ms != pytest.approx(
-        ep_hotspot.rank_compute[1].predicted_ms
-    )
+    assert ep_hotspot.compute_ms == max(rank.predicted_ms for rank in ep_hotspot.rank_compute)
+    assert ep_hotspot.rank_compute[0].predicted_ms != pytest.approx(ep_hotspot.rank_compute[1].predicted_ms)
 
     p4 = HierarchicalTopology(
         ranks=4,
@@ -333,9 +300,5 @@ def test_tp_ep_evaluator_and_generic_p2_collectives(
         inter_bytes_per_second=20e9,
         latency_seconds=1e-6,
     )
-    assert p4.allreduce_ms(message) == pytest.approx(
-        (message / 60e9 + message / 20e9 + 4e-6) * 1e3
-    )
-    assert p4.alltoall_ms(outgoing) == pytest.approx(
-        2 * (outgoing / 20e9 + 3e-6) * 1e3
-    )
+    assert p4.allreduce_ms(message) == pytest.approx((message / 60e9 + message / 20e9 + 4e-6) * 1e3)
+    assert p4.alltoall_ms(outgoing) == pytest.approx(2 * (outgoing / 20e9 + 3e-6) * 1e3)

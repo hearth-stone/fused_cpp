@@ -28,10 +28,7 @@ def _normalize_kv(tensor: torch.Tensor, name: str) -> torch.Tensor:
         return tensor
     if tensor.dim() == 4 and tensor.size(1) == 1:
         return tensor[:, 0]
-    raise ValueError(
-        f"{name} must have shape [B, S, D] or [B, 1, S, D], got "
-        f"{tuple(tensor.shape)}"
-    )
+    raise ValueError(f"{name} must have shape [B, S, D] or [B, 1, S, D], got {tuple(tensor.shape)}")
 
 
 def _normalize_attn_mask(
@@ -43,26 +40,18 @@ def _normalize_attn_mask(
 ) -> torch.Tensor:
     if attn_mask.dim() == 2:
         if attn_mask.shape != (L, S):
-            raise ValueError(
-                f"attn_mask [L, S] shape mismatch: got {tuple(attn_mask.shape)}"
-            )
+            raise ValueError(f"attn_mask [L, S] shape mismatch: got {tuple(attn_mask.shape)}")
         return attn_mask
     if attn_mask.dim() == 3:
         if attn_mask.shape != (B, L, S):
-            raise ValueError(
-                f"attn_mask [B, L, S] shape mismatch: got {tuple(attn_mask.shape)}"
-            )
+            raise ValueError(f"attn_mask [B, L, S] shape mismatch: got {tuple(attn_mask.shape)}")
         return attn_mask[:, None, :, :]
     if attn_mask.dim() == 4:
         if attn_mask.shape != (B, 1, L, S) and attn_mask.shape != (B, N, L, S):
-            raise ValueError(
-                "attn_mask [B, N, L, S] shape mismatch: got "
-                f"{tuple(attn_mask.shape)}"
-            )
+            raise ValueError(f"attn_mask [B, N, L, S] shape mismatch: got {tuple(attn_mask.shape)}")
         return attn_mask
     raise ValueError(
-        "attn_mask must be [L, S], [B, L, S], [B, 1, L, S], or [B, N, L, S], "
-        f"got {tuple(attn_mask.shape)}"
+        f"attn_mask must be [L, S], [B, L, S], [B, 1, L, S], or [B, N, L, S], got {tuple(attn_mask.shape)}"
     )
 
 
@@ -93,15 +82,10 @@ def multi_query_attention_torch(
 
     B, N, L, E = query.shape
     if key.shape[0] != B or key.shape[2] != E:
-        raise ValueError(
-            f"key shape mismatch: expected [B, S, {E}], got {tuple(key.shape)}"
-        )
+        raise ValueError(f"key shape mismatch: expected [B, S, {E}], got {tuple(key.shape)}")
     S = key.shape[1]
     if value.shape[0] != B or value.shape[1] != S:
-        raise ValueError(
-            "value shape mismatch: expected [B, S, Ev], got "
-            f"{tuple(value.shape)}"
-        )
+        raise ValueError(f"value shape mismatch: expected [B, S, Ev], got {tuple(value.shape)}")
     if scale is None:
         scale = 1.0 / math.sqrt(E)
 

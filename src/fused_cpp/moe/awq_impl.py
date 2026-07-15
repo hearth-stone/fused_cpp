@@ -33,6 +33,7 @@
     )
     out = impl.forward(hidden_states, topk_weights, topk_ids)
 """
+
 from __future__ import annotations
 
 import torch
@@ -104,9 +105,7 @@ class AWQFusedMoEImpl:
                 "EP 路径需在 vLLM 侧完成分片与 all-reduce，该能力预计在后续步骤补齐。"
             )
         if not (0 <= ep_rank < ep_size):
-            raise ValueError(
-                f"ep_rank={ep_rank} 越界（ep_size={ep_size}）"
-            )
+            raise ValueError(f"ep_rank={ep_rank} 越界（ep_size={ep_size}）")
 
         self.num_experts = num_experts
         self.hidden_size = hidden_size
@@ -115,9 +114,15 @@ class AWQFusedMoEImpl:
         self.ep_rank = ep_rank
 
         self._validate_stacked_weights(
-            gate_qweight, gate_qzeros, gate_scales,
-            up_qweight, up_qzeros, up_scales,
-            down_qweight, down_qzeros, down_scales,
+            gate_qweight,
+            gate_qzeros,
+            gate_scales,
+            up_qweight,
+            up_qzeros,
+            up_scales,
+            down_qweight,
+            down_qzeros,
+            down_scales,
         )
 
         # 保留堆叠张量引用供诊断 / 后续 EP 使用
@@ -168,9 +173,7 @@ class AWQFusedMoEImpl:
         f = self.ffn_hidden_size
 
         if f % 8 != 0 or h % 8 != 0:
-            raise RuntimeError(
-                f"hidden_size={h}、ffn_hidden_size={f} 必须均为 8 的倍数"
-            )
+            raise RuntimeError(f"hidden_size={h}、ffn_hidden_size={f} 必须均为 8 的倍数")
 
         # gate / up：H → F
         for name, qw, qz, sc in (
@@ -188,8 +191,7 @@ class AWQFusedMoEImpl:
         g_down = f // down_scales.shape[1]
         if not (g_gate == g_up == g_down):
             raise RuntimeError(
-                "gate / up / down 的 group_size 必须一致，当前："
-                f"gate={g_gate}, up={g_up}, down={g_down}"
+                f"gate / up / down 的 group_size 必须一致，当前：gate={g_gate}, up={g_up}, down={g_down}"
             )
         self.group_size = g_gate
 
@@ -205,39 +207,22 @@ class AWQFusedMoEImpl:
     ) -> None:
         """校验某一个投影（gate/up/down）的 3 个张量形状与 dtype。"""
         if qweight.dtype != torch.int32:
-            raise RuntimeError(
-                f"{name}_qweight 必须为 int32，当前 {qweight.dtype}"
-            )
+            raise RuntimeError(f"{name}_qweight 必须为 int32，当前 {qweight.dtype}")
         if qzeros.dtype != torch.int32:
-            raise RuntimeError(
-                f"{name}_qzeros 必须为 int32，当前 {qzeros.dtype}"
-            )
+            raise RuntimeError(f"{name}_qzeros 必须为 int32，当前 {qzeros.dtype}")
         if scales.dtype not in (torch.float16, torch.bfloat16):
-            raise RuntimeError(
-                f"{name}_scales 必须为 fp16 或 bf16，当前 {scales.dtype}"
-            )
+            raise RuntimeError(f"{name}_scales 必须为 fp16 或 bf16，当前 {scales.dtype}")
 
         if qweight.shape != (e, k, n // 8):
-            raise RuntimeError(
-                f"{name}_qweight 形状应为 ({e}, {k}, {n // 8})，"
-                f"当前 {tuple(qweight.shape)}"
-            )
+            raise RuntimeError(f"{name}_qweight 形状应为 ({e}, {k}, {n // 8})，当前 {tuple(qweight.shape)}")
 
         g = qzeros.shape[1]
         if qzeros.shape != (e, g, n // 8):
-            raise RuntimeError(
-                f"{name}_qzeros 形状应为 ({e}, G, {n // 8})，"
-                f"当前 {tuple(qzeros.shape)}"
-            )
+            raise RuntimeError(f"{name}_qzeros 形状应为 ({e}, G, {n // 8})，当前 {tuple(qzeros.shape)}")
         if scales.shape != (e, g, n):
-            raise RuntimeError(
-                f"{name}_scales 形状应为 ({e}, G={g}, {n})，"
-                f"当前 {tuple(scales.shape)}"
-            )
+            raise RuntimeError(f"{name}_scales 形状应为 ({e}, G={g}, {n})，当前 {tuple(scales.shape)}")
         if k % g != 0:
-            raise RuntimeError(
-                f"{name}: K={k} 不能被 groups={g} 整除"
-            )
+            raise RuntimeError(f"{name}: K={k} 不能被 groups={g} 整除")
 
     # ── 入口 ────────────────────────────────────────────────────────────────
 
@@ -255,28 +240,17 @@ class AWQFusedMoEImpl:
         :returns:             ``[T, H]`` bfloat16。
         """
         if hidden_states.dim() != 2:
-            raise RuntimeError(
-                f"hidden_states 必须为 2D [T, H]，当前 {hidden_states.dim()}D"
-            )
+            raise RuntimeError(f"hidden_states 必须为 2D [T, H]，当前 {hidden_states.dim()}D")
         if hidden_states.shape[1] != self.hidden_size:
-            raise RuntimeError(
-                f"hidden_states 最后一维应为 H={self.hidden_size}，"
-                f"当前 {hidden_states.shape[1]}"
-            )
+            raise RuntimeError(f"hidden_states 最后一维应为 H={self.hidden_size}，当前 {hidden_states.shape[1]}")
         if hidden_states.dtype != torch.bfloat16:
-            raise RuntimeError(
-                f"hidden_states 必须为 bfloat16，当前 {hidden_states.dtype}"
-            )
+            raise RuntimeError(f"hidden_states 必须为 bfloat16，当前 {hidden_states.dtype}")
         if topk_ids.shape != topk_weights.shape:
             raise RuntimeError(
-                f"topk_ids 与 topk_weights 形状不一致："
-                f"{tuple(topk_ids.shape)} vs {tuple(topk_weights.shape)}"
+                f"topk_ids 与 topk_weights 形状不一致：{tuple(topk_ids.shape)} vs {tuple(topk_weights.shape)}"
             )
         if topk_ids.shape[0] != hidden_states.shape[0]:
-            raise RuntimeError(
-                f"topk_ids 第 0 维应等于 token 数 {hidden_states.shape[0]}，"
-                f"当前 {topk_ids.shape[0]}"
-            )
+            raise RuntimeError(f"topk_ids 第 0 维应等于 token 数 {hidden_states.shape[0]}，当前 {topk_ids.shape[0]}")
 
         # 越界 id 防御：vLLM 在 EP/expert_map 路径下允许出现 -1 代表 "不在本 rank"，
         # 当前 ep_size=1 不应出现，严格检查以便早报错。
@@ -284,11 +258,11 @@ class AWQFusedMoEImpl:
             id_min = int(topk_ids.min().item())
             id_max = int(topk_ids.max().item())
             if id_min < 0 or id_max >= self.num_experts:
-                raise RuntimeError(
-                    f"topk_ids 越界：min={id_min}, max={id_max}，"
-                    f"合法范围 [0, {self.num_experts})"
-                )
+                raise RuntimeError(f"topk_ids 越界：min={id_min}, max={id_max}，合法范围 [0, {self.num_experts})")
 
         return awq_moe_expert_ffn_w4a8(
-            hidden_states, topk_ids, topk_weights, self._experts,
+            hidden_states,
+            topk_ids,
+            topk_weights,
+            self._experts,
         )

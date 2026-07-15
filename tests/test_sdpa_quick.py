@@ -4,6 +4,7 @@
 用法：
     python fused_cpp/tests/test_sdpa_quick.py
 """
+
 import torch
 import torch.nn.functional as F
 
@@ -121,13 +122,13 @@ def main():
     print("\n=== scale 参数测试 ===")
 
     # 测试15: scale=None vs 手动 scale
-    manual_scale = 1.0 / (64 ** 0.5)
+    manual_scale = 1.0 / (64**0.5)
     out_auto = scaled_dot_product_attention(q, k, v, scale=None)
     out_manual = scaled_dot_product_attention(q, k, v, scale=manual_scale)
     cos15 = cosine_sim(out_auto, out_manual)
     status15 = "✅ PASS" if cos15 >= 0.99999 else "❌ FAIL"
     print(f"  {status15} scale=None vs manual: cos={cos15:.8f}")
-    all_passed &= (cos15 >= 0.99999)
+    all_passed &= cos15 >= 0.99999
 
     print("\n" + "=" * 60)
     if all_passed:

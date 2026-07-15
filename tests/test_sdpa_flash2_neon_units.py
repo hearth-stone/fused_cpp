@@ -14,6 +14,7 @@
 * 平台不要求是 AArch64：``__aarch64__`` 未定义时本测试验证的是 fallback
   标量路径，**仍应通过等价性断言**（与 NEON 路径在容差内一致）。
 """
+
 from __future__ import annotations
 
 import pytest
@@ -36,9 +37,9 @@ from tests.conftest import (  # noqa: E402
 
 def _make_qkv(shape, dtype, seed: int = 0xF2_0E0_0):
     """与多版本等价性测试一致的固定 seed 构造。"""
-    b, n, l, s, e, ev = shape
+    b, n, q_len, s, e, ev = shape
     g = torch.Generator(device="cpu").manual_seed(seed)
-    q = torch.randn(b, n, l, e, generator=g, dtype=torch.float32).to(dtype)
+    q = torch.randn(b, n, q_len, e, generator=g, dtype=torch.float32).to(dtype)
     k = torch.randn(b, n, s, e, generator=g, dtype=torch.float32).to(dtype)
     v = torch.randn(b, n, s, ev, generator=g, dtype=torch.float32).to(dtype)
     return q, k, v
@@ -77,8 +78,7 @@ def test_flash2_neon_vs_flash2_max_abs_report():
         tol = SDPA_TOLERANCE.get(dtype, SDPA_TOLERANCE[torch.float32])
         bound = 2.0 * tol.atol
         assert err <= bound, (
-            f"flash2_neon vs flash2 max_abs={err:.3e} exceeds {bound:.3e} "
-            f"(dtype={dtype}, shape={shape})"
+            f"flash2_neon vs flash2 max_abs={err:.3e} exceeds {bound:.3e} (dtype={dtype}, shape={shape})"
         )
 
 
@@ -102,18 +102,14 @@ def test_flash2_neon_fp32_cosine_vs_naive_torch():
     out_ref = call_sdpa_version(ref, q, k, v, is_causal=False)
 
     cos = _cosine(out_neon, out_ref)
-    assert cos >= 0.99999, (
-        f"flash2_neon fp32 cosine vs naive_torch={cos:.6f} < 0.99999 "
-        f"(shape={shape})"
-    )
+    assert cos >= 0.99999, f"flash2_neon fp32 cosine vs naive_torch={cos:.6f} < 0.99999 (shape={shape})"
 
 
 # ── 3. head_dim 不被 4 整除：覆盖尾部标量回退分支 ────────────────
 
 
 @pytest.mark.equiv
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16],
-                         ids=["fp32", "bf16"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
 def test_flash2_neon_head_dim_tail_remainder(dtype):
     """``head_dim`` 不被 4 整除（``E=11, Ev=7``）时尾部标量回退分支正确。
 
@@ -130,7 +126,8 @@ def test_flash2_neon_head_dim_tail_remainder(dtype):
     out_ref = call_sdpa_version(ref, q, k, v, is_causal=False)
 
     assert_tensor_close(
-        out_neon, out_ref,
+        out_neon,
+        out_ref,
         dtype=dtype,
         context=f"flash2_neon tail-remainder shape={shape} dtype={dtype}",
     )
@@ -157,7 +154,4 @@ def test_flash2_neon_bf16_mla_shape():
     err = _max_abs(out_neon, out_flash2)
     tol = SDPA_TOLERANCE[torch.bfloat16]
     bound = 2.0 * tol.atol
-    assert err <= bound, (
-        f"flash2_neon bf16 MLA shape vs flash2 max_abs={err:.3e} > "
-        f"{bound:.3e} (shape={shape})"
-    )
+    assert err <= bound, f"flash2_neon bf16 MLA shape vs flash2 max_abs={err:.3e} > {bound:.3e} (shape={shape})"

@@ -17,9 +17,7 @@ from fused_cpp.deepseek_v4_attn_gemm_fused import (
 
 
 def _bf16_randn(rows: int, cols: int, scale: float = 0.1) -> torch.Tensor:
-    return (torch.randn(rows, cols, dtype=torch.float32) * scale).to(
-        torch.bfloat16
-    )
+    return (torch.randn(rows, cols, dtype=torch.float32) * scale).to(torch.bfloat16)
 
 
 def _gflops(m: int, k: int, n: int, seconds: float) -> float:
@@ -97,15 +95,9 @@ def main() -> None:
 
     hidden_states = _bf16_randn(args.m, args.k).contiguous()
     fused_wqa_wkv = _bf16_randn(args.k, args.n_fused_wqa_wkv).contiguous()
-    compressor_kv_score = _bf16_randn(
-        args.k, args.n_compressor_kv_score
-    ).contiguous()
-    indexer_compressor_kv_score = _bf16_randn(
-        args.k, args.n_indexer_compressor_kv_score
-    ).contiguous()
-    indexer_weights_proj = _bf16_randn(
-        args.k, args.n_indexer_weights_proj
-    ).contiguous()
+    compressor_kv_score = _bf16_randn(args.k, args.n_compressor_kv_score).contiguous()
+    indexer_compressor_kv_score = _bf16_randn(args.k, args.n_indexer_compressor_kv_score).contiguous()
+    indexer_weights_proj = _bf16_randn(args.k, args.n_indexer_weights_proj).contiguous()
 
     if args.backend == "fused":
         pack_t0 = time.perf_counter()

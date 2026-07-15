@@ -6,11 +6,10 @@ layernorm / rotary_emb are called instead of the internal implementations.
 
 We use importlib.reload to re-evaluate the module-level env var checks.
 """
+
 import importlib
-import os
 import torch
-import pytest
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock
 
 
 NUM_HEADS = 2
@@ -44,18 +43,15 @@ class TestOrigRmsNormEnvVar:
         monkeypatch.setenv("FUSED_MLA_USE_ORIG_RMSNORM", "1")
 
         import fused_cpp.core as core_module
+
         importlib.reload(core_module)
 
         try:
             assert core_module._DEBUG_USE_ORIG_RMSNORM is True
 
             # Build an impl from the reloaded module
-            kv_b_proj_weight = torch.randn(
-                NUM_HEADS * (QK_NOPE_HEAD_DIM + V_HEAD_DIM), KV_LORA_RANK
-            )
-            kv_b_proj = type("FakeLinear", (), {
-                "weight": kv_b_proj_weight, "bias": None
-            })()
+            kv_b_proj_weight = torch.randn(NUM_HEADS * (QK_NOPE_HEAD_DIM + V_HEAD_DIM), KV_LORA_RANK)
+            kv_b_proj = type("FakeLinear", (), {"weight": kv_b_proj_weight, "bias": None})()
 
             impl = core_module.CPUFusedMLAImpl(
                 num_heads=NUM_HEADS,
@@ -145,17 +141,14 @@ class TestOrigRopeEnvVar:
         monkeypatch.setenv("FUSED_MLA_USE_ORIG_ROPE", "1")
 
         import fused_cpp.core as core_module
+
         importlib.reload(core_module)
 
         try:
             assert core_module._DEBUG_USE_ORIG_ROPE is True
 
-            kv_b_proj_weight = torch.randn(
-                NUM_HEADS * (QK_NOPE_HEAD_DIM + V_HEAD_DIM), KV_LORA_RANK
-            )
-            kv_b_proj = type("FakeLinear", (), {
-                "weight": kv_b_proj_weight, "bias": None
-            })()
+            kv_b_proj_weight = torch.randn(NUM_HEADS * (QK_NOPE_HEAD_DIM + V_HEAD_DIM), KV_LORA_RANK)
+            kv_b_proj = type("FakeLinear", (), {"weight": kv_b_proj_weight, "bias": None})()
 
             impl = core_module.CPUFusedMLAImpl(
                 num_heads=NUM_HEADS,

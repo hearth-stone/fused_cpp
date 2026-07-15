@@ -16,6 +16,7 @@ checksum 防止编译器优化掉调用。支持特殊 L1 layout 的 impl 会额
 
 不依赖 pytest；直接 ``python`` 跑即可。
 """
+
 from __future__ import annotations
 
 import argparse
@@ -40,9 +41,7 @@ def _format_row(impl: str, dtype: str, op: str, r: Dict[str, float]) -> str:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(
-        description="Microkernel GFLOPS benchmark (qkt_8x8 / qkt_8x4 / pv_8x8)."
-    )
+    parser = argparse.ArgumentParser(description="Microkernel GFLOPS benchmark (qkt_8x8 / qkt_8x4 / pv_8x8).")
     parser.add_argument(
         "--impls",
         default=None,
@@ -72,9 +71,7 @@ def main() -> int:
         impls = [s.strip() for s in args.impls.split(",") if s.strip()]
         unknown = sorted(set(impls) - set(available))
         if unknown:
-            sys.stderr.write(
-                f"unknown impl names: {unknown}; available: {available}\n"
-            )
+            sys.stderr.write(f"unknown impl names: {unknown}; available: {available}\n")
             return 2
 
     dtypes = [s.strip() for s in args.dtypes.split(",") if s.strip()]

@@ -13,6 +13,7 @@
 规范对齐：本测试仅依赖 vLLM 算子层（``AWQLinearMethod`` / ``AWQConfig``），不引入
 ``LLMEngine`` / ``ModelRunner`` 等高层 API，遵循测试规则 §11.4 vLLM 专项。
 """
+
 from __future__ import annotations
 
 import importlib
@@ -48,6 +49,7 @@ _AWQ_ORDER = (0, 2, 4, 6, 1, 3, 5, 7)
 
 # ── 辅助函数 ──
 
+
 def _pack_awq_along_n(unpacked: torch.Tensor) -> torch.Tensor:
     """沿 N 维按 AWQ interleave 顺序将 int4 (0..15) pack 为 int32。"""
     assert unpacked.shape[-1] % 8 == 0
@@ -57,7 +59,9 @@ def _pack_awq_along_n(unpacked: torch.Tensor) -> torch.Tensor:
     order_idx = torch.tensor(_AWQ_ORDER, dtype=torch.long)
     picked = reshaped.index_select(-1, order_idx)
     shifts = torch.arange(0, 32, 4, dtype=torch.int32).view(
-        *([1] * len(lead)), 1, 8,
+        *([1] * len(lead)),
+        1,
+        8,
     )
     return (picked << shifts).sum(dim=-1).to(torch.int32)
 
@@ -74,9 +78,7 @@ def _build_awq_weights(
     w_int4 = torch.randint(0, 16, (k, n), generator=gen, dtype=torch.int32)
     groups = k // group_size
     z_int4 = torch.randint(0, 16, (groups, n), generator=gen, dtype=torch.int32)
-    scales_fp32 = (
-        torch.rand((groups, n), generator=gen, dtype=torch.float32) * 0.02 + 0.001
-    )
+    scales_fp32 = torch.rand((groups, n), generator=gen, dtype=torch.float32) * 0.02 + 0.001
     qweight = _pack_awq_along_n(w_int4)
     qzeros = _pack_awq_along_n(z_int4)
     return qweight, qzeros, scales_fp32.to(scales_dtype)
@@ -115,12 +117,8 @@ def _assert_tensor_close(
     cos_sim_threshold: float,
 ) -> None:
     """统一等价性断言：误差 + 余弦相似度 + NaN/Inf 鲁棒性。"""
-    assert actual.shape == ref.shape, (
-        f"shape mismatch: {actual.shape} vs {ref.shape}"
-    )
-    assert actual.dtype == ref.dtype, (
-        f"dtype mismatch: {actual.dtype} vs {ref.dtype}"
-    )
+    assert actual.shape == ref.shape, f"shape mismatch: {actual.shape} vs {ref.shape}"
+    assert actual.dtype == ref.dtype, f"dtype mismatch: {actual.dtype} vs {ref.dtype}"
     for name, t in (("actual", actual), ("ref", ref)):
         n_nan = torch.isnan(t).sum().item()
         n_inf = torch.isinf(t).sum().item()
@@ -155,6 +153,7 @@ def _make_awq_method() -> AWQLinearMethod:
 
 # ── 1. 环境变量 + 平台守卫 ──
 
+
 class TestFusedCppDispatchGuard:
     """``_should_use_fused_cpp_awq`` 的开关与平台守卫。"""
 
@@ -167,7 +166,9 @@ class TestFusedCppDispatchGuard:
         """CPU 平台 + 环境变量开 + fused_cpp 可导入 → 走 fused_cpp。"""
         monkeypatch.setattr(vllm_envs, "VLLM_CPU_AWQ_USE_FUSED_CPP", True)
         monkeypatch.setattr(
-            vllm_awq.current_platform, "is_cpu", lambda: True,
+            vllm_awq.current_platform,
+            "is_cpu",
+            lambda: True,
         )
         # 保证 fused_cpp 缓存未被前序失败污染
         monkeypatch.setattr(vllm_awq, "_FUSED_CPP_LOAD_FAILED", False)
@@ -177,7 +178,9 @@ class TestFusedCppDispatchGuard:
         """非 CPU 平台即使开启环境变量也不分派到 fused_cpp。"""
         monkeypatch.setattr(vllm_envs, "VLLM_CPU_AWQ_USE_FUSED_CPP", True)
         monkeypatch.setattr(
-            vllm_awq.current_platform, "is_cpu", lambda: False,
+            vllm_awq.current_platform,
+            "is_cpu",
+            lambda: False,
         )
         assert vllm_awq._should_use_fused_cpp_awq() is False
 
@@ -188,7 +191,9 @@ class TestFusedCppDispatchGuard:
         """fused_cpp 不可导入时应静默回落（返回 False）。"""
         monkeypatch.setattr(vllm_envs, "VLLM_CPU_AWQ_USE_FUSED_CPP", True)
         monkeypatch.setattr(
-            vllm_awq.current_platform, "is_cpu", lambda: True,
+            vllm_awq.current_platform,
+            "is_cpu",
+            lambda: True,
         )
         monkeypatch.setattr(vllm_awq, "_FUSED_CPP_W4A8_LINEAR", None)
         monkeypatch.setattr(vllm_awq, "_FUSED_CPP_LOAD_FAILED", True)
@@ -196,6 +201,7 @@ class TestFusedCppDispatchGuard:
 
 
 # ── 2. AWQLinearMethod._apply_fused_cpp 等价性 ──
+
 
 class TestAWQLinearMethodFusedCpp:
     """分派进入 ``_apply_fused_cpp`` 后的数值等价性。"""
@@ -221,7 +227,11 @@ class TestAWQLinearMethodFusedCpp:
         group_size = 32
         torch.manual_seed(0)
         qweight, qzeros, scales = _build_awq_weights(
-            k, n, group_size, scales_dtype, seed=0,
+            k,
+            n,
+            group_size,
+            scales_dtype,
+            seed=0,
         )
         x = torch.randn(m, k, dtype=torch.bfloat16)
         layer = _make_fake_layer(qweight, qzeros, scales)
@@ -240,7 +250,11 @@ class TestAWQLinearMethodFusedCpp:
         m, k, n, group_size = 8, 128, 64, 32
         torch.manual_seed(1)
         qweight, qzeros, scales = _build_awq_weights(
-            k, n, group_size, torch.bfloat16, seed=1,
+            k,
+            n,
+            group_size,
+            torch.bfloat16,
+            seed=1,
         )
         x = torch.randn(m, k, dtype=torch.bfloat16)
         bias = torch.randn(n, dtype=torch.bfloat16)
@@ -260,7 +274,11 @@ class TestAWQLinearMethodFusedCpp:
         b, s, k, n, group_size = 2, 16, 128, 64, 32
         torch.manual_seed(2)
         qweight, qzeros, scales = _build_awq_weights(
-            k, n, group_size, torch.bfloat16, seed=2,
+            k,
+            n,
+            group_size,
+            torch.bfloat16,
+            seed=2,
         )
         x = torch.randn(b, s, k, dtype=torch.bfloat16)
         layer = _make_fake_layer(qweight, qzeros, scales)
@@ -277,6 +295,7 @@ class TestAWQLinearMethodFusedCpp:
 
 # ── 3. apply() 的分派路径 ──
 
+
 class TestAWQLinearMethodApplyDispatch:
     """验证 ``apply()`` 在守卫开启/关闭下分别走 fused_cpp / 原 AWQ 路径。"""
 
@@ -287,14 +306,20 @@ class TestAWQLinearMethodApplyDispatch:
         """守卫 True 时 ``apply()`` 走 ``_apply_fused_cpp``。"""
         # 强制守卫返回 True，避免依赖真实 current_platform
         monkeypatch.setattr(
-            vllm_awq, "_should_use_fused_cpp_awq", lambda: True,
+            vllm_awq,
+            "_should_use_fused_cpp_awq",
+            lambda: True,
         )
 
         # Arrange
         m, k, n, group_size = 4, 128, 64, 32
         torch.manual_seed(3)
         qweight, qzeros, scales = _build_awq_weights(
-            k, n, group_size, torch.bfloat16, seed=3,
+            k,
+            n,
+            group_size,
+            torch.bfloat16,
+            seed=3,
         )
         x = torch.randn(m, k, dtype=torch.bfloat16)
         layer = _make_fake_layer(qweight, qzeros, scales)
@@ -308,7 +333,9 @@ class TestAWQLinearMethodApplyDispatch:
             return sentinel
 
         monkeypatch.setattr(
-            AWQLinearMethod, "_apply_fused_cpp", _fake_apply_fused_cpp,
+            AWQLinearMethod,
+            "_apply_fused_cpp",
+            _fake_apply_fused_cpp,
         )
 
         # Act
@@ -324,14 +351,20 @@ class TestAWQLinearMethodApplyDispatch:
     ) -> None:
         """守卫 False 时 ``apply()`` 不会调用 ``_apply_fused_cpp``。"""
         monkeypatch.setattr(
-            vllm_awq, "_should_use_fused_cpp_awq", lambda: False,
+            vllm_awq,
+            "_should_use_fused_cpp_awq",
+            lambda: False,
         )
 
         # Arrange
         m, k, n, group_size = 4, 128, 64, 32
         torch.manual_seed(4)
         qweight, qzeros, scales = _build_awq_weights(
-            k, n, group_size, torch.float16, seed=4,
+            k,
+            n,
+            group_size,
+            torch.float16,
+            seed=4,
         )
         x = torch.randn(m, k, dtype=torch.float16)
         layer = _make_fake_layer(qweight, qzeros, scales)
@@ -344,7 +377,9 @@ class TestAWQLinearMethodApplyDispatch:
             raise AssertionError("不应被调用")
 
         monkeypatch.setattr(
-            AWQLinearMethod, "_apply_fused_cpp", _fake_apply_fused_cpp,
+            AWQLinearMethod,
+            "_apply_fused_cpp",
+            _fake_apply_fused_cpp,
         )
 
         # Act / Assert（只验证分派未触发，不验证原 CUDA AWQ 数值结果——该路径需 GPU）
@@ -359,11 +394,16 @@ class TestAWQLinearMethodApplyDispatch:
 
 # ── 4. 冒烟测试：fused_cpp.w4a8_linear 自身可调用 ──
 
+
 def test_fused_cpp_w4a8_linear_smoke() -> None:
     """冒烟测试：``fused_cpp.w4a8_linear`` 在 bf16 scales 下能直接跑通。"""
     k, n, group_size = 64, 32, 32
     qweight, qzeros, scales = _build_awq_weights(
-        k, n, group_size, torch.bfloat16, seed=5,
+        k,
+        n,
+        group_size,
+        torch.bfloat16,
+        seed=5,
     )
     x = torch.randn(2, k, dtype=torch.bfloat16)
     out = fused_cpp.w4a8_linear(x, qweight, qzeros, scales, bias=None)

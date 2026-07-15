@@ -53,9 +53,7 @@
 // （含鲲鹏 RH/CentOS 8 上常见的 gcc-toolset-11/12）只定义细分宏
 // `__ARM_FEATURE_BF16_VECTOR_ARITHMETIC`。BFDOT 等向量指令由后者提供，
 // 因此两个宏只要有一个定义就启用 BF16 dot 路径。
-#if (defined(__ARM_FEATURE_BF16) || \
-     defined(__ARM_FEATURE_BF16_VECTOR_ARITHMETIC)) && \
-    FUSED_CPP_SDPA_HAS_NEON
+#if (defined(__ARM_FEATURE_BF16) || defined(__ARM_FEATURE_BF16_VECTOR_ARITHMETIC)) && FUSED_CPP_SDPA_HAS_NEON
 #define FUSED_CPP_SDPA_HAS_BF16_DOT 1
 #else
 #define FUSED_CPP_SDPA_HAS_BF16_DOT 0
@@ -79,7 +77,7 @@ namespace {
 //      e^x = 2^n * e^r，e^r 用 5 阶多项式近似（误差 < 1e-7）。
 static inline float32x4_t vexpq_f32(float32x4_t x) {
   // 多项式近似系数（针对 e^r, r ∈ [-ln2/2, ln2/2]）
-  const float32x4_t kLn2  = vdupq_n_f32(0.6931471805599453f);
+  const float32x4_t kLn2 = vdupq_n_f32(0.6931471805599453f);
   const float32x4_t kInvLn2 = vdupq_n_f32(1.4426950408889634f);  // 1 / ln2
   const float32x4_t c1 = vdupq_n_f32(1.0f);
   const float32x4_t c2 = vdupq_n_f32(0.5f);
@@ -138,10 +136,7 @@ static inline float dot_fp32_neon(const float* a, const float* b, int64_t len) {
 
 // widen_bf16x8_to_fp32x4_pair：把 8 个 bf16 元素 widen 为两组 fp32x4。
 // bf16 二进制 = fp32 高 16 位，所以 widen 等价于左移 16 位填零。
-static inline void widen_bf16x8_to_fp32x4_pair(
-    const uint16_t* src,
-    float32x4_t* lo,
-    float32x4_t* hi) {
+static inline void widen_bf16x8_to_fp32x4_pair(const uint16_t* src, float32x4_t* lo, float32x4_t* hi) {
   uint16x8_t bf = vld1q_u16(src);
   // 低 4 个：u16 → u32 → << 16 → reinterpret as f32
   uint32x4_t u_lo = vmovl_u16(vget_low_u16(bf));
@@ -157,8 +152,7 @@ static inline void widen_bf16x8_to_fp32x4_pair(
 //
 // 注意：vbfdotq_f32 的累加顺序与标量 std::accumulate 不同，因此跨实现
 // 等价性按 dtype 容差比较，不要求逐元素相等（详见文件头注释）。
-static inline float dot_bf16_neon(
-    const at::BFloat16* a, const at::BFloat16* b, int64_t len) {
+static inline float dot_bf16_neon(const at::BFloat16* a, const at::BFloat16* b, int64_t len) {
   const uint16_t* ap = reinterpret_cast<const uint16_t*>(a);
   const uint16_t* bp = reinterpret_cast<const uint16_t*>(b);
   float32x4_t acc = vdupq_n_f32(0.0f);
@@ -199,8 +193,7 @@ static inline float dot_bf16_neon(
 }
 
 // fma_acc_fp32：output_acc[ev] += scale * src[ev]，4 路展开。
-static inline void fma_acc_fp32_neon(
-    float* acc, const float* src, float scale, int64_t len) {
+static inline void fma_acc_fp32_neon(float* acc, const float* src, float scale, int64_t len) {
   const float32x4_t vs = vdupq_n_f32(scale);
   int64_t ev = 0;
   for (; ev + 4 <= len; ev += 4) {
@@ -218,8 +211,7 @@ static inline void fma_acc_fp32_neon(
 //
 // bf16 输入统一 widen 到 fp32 后再做 fma，跨平台行为一致；不依赖
 // __ARM_FEATURE_BF16（accumulator 与 scale 都是 fp32）。
-static inline void fma_acc_bf16_neon(
-    float* acc, const at::BFloat16* src, float scale, int64_t len) {
+static inline void fma_acc_bf16_neon(float* acc, const at::BFloat16* src, float scale, int64_t len) {
   const uint16_t* sp = reinterpret_cast<const uint16_t*>(src);
   const float32x4_t vs = vdupq_n_f32(scale);
   int64_t ev = 0;
@@ -252,8 +244,7 @@ inline float dot_scalar(const scalar_t* a, const scalar_t* b, int64_t len) {
 }
 
 template <typename scalar_t>
-inline void fma_acc_scalar(
-    float* acc, const scalar_t* src, float scale, int64_t len) {
+inline void fma_acc_scalar(float* acc, const scalar_t* src, float scale, int64_t len) {
   for (int64_t ev = 0; ev < len; ++ev) {
     acc[ev] += scale * static_cast<float>(src[ev]);
   }
@@ -268,8 +259,7 @@ inline float dispatch_dot(const float* a, const float* b, int64_t len) {
 #endif
 }
 
-inline float dispatch_dot(
-    const at::BFloat16* a, const at::BFloat16* b, int64_t len) {
+inline float dispatch_dot(const at::BFloat16* a, const at::BFloat16* b, int64_t len) {
 #if FUSED_CPP_SDPA_HAS_NEON
   return dot_bf16_neon(a, b, len);
 #else
@@ -277,8 +267,7 @@ inline float dispatch_dot(
 #endif
 }
 
-inline void dispatch_fma_acc(
-    float* acc, const float* src, float scale, int64_t len) {
+inline void dispatch_fma_acc(float* acc, const float* src, float scale, int64_t len) {
 #if FUSED_CPP_SDPA_HAS_NEON
   fma_acc_fp32_neon(acc, src, scale, len);
 #else
@@ -286,8 +275,7 @@ inline void dispatch_fma_acc(
 #endif
 }
 
-inline void dispatch_fma_acc(
-    float* acc, const at::BFloat16* src, float scale, int64_t len) {
+inline void dispatch_fma_acc(float* acc, const at::BFloat16* src, float scale, int64_t len) {
 #if FUSED_CPP_SDPA_HAS_NEON
   fma_acc_bf16_neon(acc, src, scale, len);
 #else
@@ -297,8 +285,7 @@ inline void dispatch_fma_acc(
 
 // vectorized_exp_minus：批量计算 dst[j] = exp(src[j] - new_max)，并返回
 // 块累加 sum。NEON 路径下用 vexpq_f32；fallback 走 std::exp。
-inline float vectorized_exp_minus(
-    float* dst, const float* src, float new_max, int64_t len) {
+inline float vectorized_exp_minus(float* dst, const float* src, float new_max, int64_t len) {
   float block_sum = 0.0f;
   int64_t j = 0;
 #if FUSED_CPP_SDPA_HAS_NEON
@@ -344,11 +331,8 @@ constexpr int FLASH2_NEON_BLOCK_S = 64;
 constexpr int64_t FLASH2_NEON_MAX_EV = 4096;
 
 template <typename scalar_t>
-inline void sdpa_flash2_neon_kernel_tmpl(
-    const scalar_t* q_ptr,
-    const scalar_t* k_ptr,
-    const scalar_t* v_ptr,
-    const SdpaParams& p) {
+inline void sdpa_flash2_neon_kernel_tmpl(const scalar_t* q_ptr, const scalar_t* k_ptr, const scalar_t* v_ptr,
+                                         const SdpaParams& p) {
   // ── stride（contiguous [B, N, seq, dim] 布局，与 flash2 一致）──
   const int64_t q_stride_b = p.N * p.L * p.E;
   const int64_t q_stride_n = p.L * p.E;
@@ -370,17 +354,13 @@ inline void sdpa_flash2_neon_kernel_tmpl(
   const int64_t num_blocks = (p.S + BS - 1) / BS;
 
 #ifdef _OPENMP
-  #pragma omp parallel for collapse(2) schedule(static)
+#pragma omp parallel for collapse(2) schedule(static)
 #endif
   for (int64_t b = 0; b < p.B; ++b) {
     for (int64_t n = 0; n < p.N; ++n) {
       for (int64_t l = 0; l < p.L; ++l) {
-        const scalar_t* q_row = q_ptr + b * q_stride_b
-                                      + n * q_stride_n
-                                      + l * q_stride_l;
-        float* o_row = p.out_ptr + b * o_stride_b
-                                 + n * o_stride_n
-                                 + l * o_stride_l;
+        const scalar_t* q_row = q_ptr + b * q_stride_b + n * q_stride_n + l * q_stride_l;
+        float* o_row = p.out_ptr + b * o_stride_b + n * o_stride_n + l * o_stride_l;
 
         // ── Online Softmax 三状态（与 flash2 完全一致）──
         float running_max = p.neg_inf;
@@ -397,8 +377,7 @@ inline void sdpa_flash2_neon_kernel_tmpl(
 
         for (int64_t blk = 0; blk < num_blocks; ++blk) {
           const int64_t block_start = blk * BS;
-          const int64_t block_len = std::min(
-              static_cast<int64_t>(BS), p.S - block_start);
+          const int64_t block_len = std::min(static_cast<int64_t>(BS), p.S - block_start);
 
           // 因果块级 early-exit（与 flash2 完全一致）
           if (p.is_causal && block_start > causal_limit) {
@@ -407,19 +386,14 @@ inline void sdpa_flash2_neon_kernel_tmpl(
 
           // ── 步骤 1: 计算当前块 scores（向量化点积）──
           for (int64_t j = 0; j < block_len; ++j) {
-            const scalar_t* k_row = k_ptr + b * k_stride_b
-                                          + n * k_stride_n
-                                          + (block_start + j) * k_stride_s;
+            const scalar_t* k_row = k_ptr + b * k_stride_b + n * k_stride_n + (block_start + j) * k_stride_s;
             float dot = dispatch_dot(q_row, k_row, p.E);
             scores_buf[j] = dot * p.scale_f;
           }
 
           // ── 步骤 2: additive attention mask ──
           if (p.mask_ptr) {
-            const float* m_row = p.mask_ptr + b * m_stride_b
-                                            + n * m_stride_n
-                                            + l * m_stride_l
-                                            + block_start;
+            const float* m_row = p.mask_ptr + b * m_stride_b + n * m_stride_n + l * m_stride_l + block_start;
             for (int64_t j = 0; j < block_len; ++j) {
               scores_buf[j] += m_row[j];
             }
@@ -454,15 +428,12 @@ inline void sdpa_flash2_neon_kernel_tmpl(
           //
           // 用 NEON vexpq_f32 批量计算 exp_buf[0..block_len)，并返回
           // 块累加 sum；尾部 / fallback 平台走 std::exp。
-          const float block_sum = vectorized_exp_minus(
-              exp_buf, scores_buf, new_max, block_len);
+          const float block_sum = vectorized_exp_minus(exp_buf, scores_buf, new_max, block_len);
           running_sum += block_sum;
 
           // 累加 exp_val * V_row 到 output_acc
           for (int64_t j = 0; j < block_len; ++j) {
-            const scalar_t* v_row = v_ptr + b * v_stride_b
-                                          + n * v_stride_n
-                                          + (block_start + j) * v_stride_s;
+            const scalar_t* v_row = v_ptr + b * v_stride_b + n * v_stride_n + (block_start + j) * v_stride_s;
             dispatch_fma_acc(output_acc, v_row, exp_buf[j], p.Ev);
           }
 
@@ -499,22 +470,16 @@ inline void sdpa_flash2_neon_kernel_tmpl(
 
 // ── dtype-erased 入口（注册到全局表）─────────────────────────────────
 void sdpa_flash2_neon_impl(const SdpaParams& p) {
-  TORCH_CHECK(p.Ev <= FLASH2_NEON_MAX_EV,
-              "sdpa_flash2_neon_impl: v_head_dim (", p.Ev,
+  TORCH_CHECK(p.Ev <= FLASH2_NEON_MAX_EV, "sdpa_flash2_neon_impl: v_head_dim (", p.Ev,
               ") exceeds maximum supported value (", FLASH2_NEON_MAX_EV, ")");
 
   if (p.dtype == SdpaDtype::kBFloat16) {
-    sdpa_flash2_neon_kernel_tmpl<at::BFloat16>(
-        static_cast<const at::BFloat16*>(p.q_ptr),
-        static_cast<const at::BFloat16*>(p.k_ptr),
-        static_cast<const at::BFloat16*>(p.v_ptr),
-        p);
+    sdpa_flash2_neon_kernel_tmpl<at::BFloat16>(static_cast<const at::BFloat16*>(p.q_ptr),
+                                               static_cast<const at::BFloat16*>(p.k_ptr),
+                                               static_cast<const at::BFloat16*>(p.v_ptr), p);
   } else {
-    sdpa_flash2_neon_kernel_tmpl<float>(
-        static_cast<const float*>(p.q_ptr),
-        static_cast<const float*>(p.k_ptr),
-        static_cast<const float*>(p.v_ptr),
-        p);
+    sdpa_flash2_neon_kernel_tmpl<float>(static_cast<const float*>(p.q_ptr), static_cast<const float*>(p.k_ptr),
+                                        static_cast<const float*>(p.v_ptr), p);
   }
 }
 

@@ -78,17 +78,14 @@ constexpr std::size_t kL1ReserveNum = 3;
 constexpr std::size_t kL1ReserveDen = 4;
 
 // 向下对齐到 ``align`` 的整数倍；至少保留 ``align`` 个元素。
-constexpr std::size_t AlignDown(std::size_t v, std::size_t align) {
-    return (v < align) ? align : (v / align) * align;
-}
+constexpr std::size_t AlignDown(std::size_t v, std::size_t align) { return (v < align) ? align : (v / align) * align; }
 
 // ---- Kc ------------------------------------------------------------------
 // A 微面板大小 = mr * Kc * sizeof(bf16) <= L1 * kL1ReserveNum / kL1ReserveDen
 // => Kc <= (L1 * num) / (den * mr * 2)
 constexpr std::size_t ComputeKc() {
-    const std::size_t raw = (kL1CacheBytes * kL1ReserveNum) /
-                            (kL1ReserveDen * kMr * kBf16Bytes);
-    return AlignDown(raw, kKr);
+  const std::size_t raw = (kL1CacheBytes * kL1ReserveNum) / (kL1ReserveDen * kMr * kBf16Bytes);
+  return AlignDown(raw, kKr);
 }
 
 constexpr std::size_t kKc = ComputeKc();
@@ -97,8 +94,8 @@ constexpr std::size_t kKc = ComputeKc();
 // A 分块大小 = Mc * Kc * sizeof(bf16) <= L2
 // => Mc <= L2 / (Kc * 2)
 constexpr std::size_t ComputeMc() {
-    const std::size_t raw = kL2CacheBytes / (kKc * kBf16Bytes);
-    return AlignDown(raw, kMr);
+  const std::size_t raw = kL2CacheBytes / (kKc * kBf16Bytes);
+  return AlignDown(raw, kMr);
 }
 
 constexpr std::size_t kMc = ComputeMc();
@@ -107,8 +104,8 @@ constexpr std::size_t kMc = ComputeMc();
 // B 分块大小（含 bias）= Nc * (Kc * sizeof(bf16) + sizeof(float)) <= L3
 // => Nc <= L3 / (Kc * 2 + 4)
 constexpr std::size_t ComputeNc() {
-    const std::size_t raw = kL3CacheBytes / (kKc * kBf16Bytes + kBiasBytes);
-    return AlignDown(raw, kNr);
+  const std::size_t raw = kL3CacheBytes / (kKc * kBf16Bytes + kBiasBytes);
+  return AlignDown(raw, kNr);
 }
 
 constexpr std::size_t kNc = ComputeNc();

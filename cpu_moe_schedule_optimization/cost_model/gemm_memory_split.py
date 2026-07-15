@@ -9,11 +9,11 @@ where Tm is the number of M partitions and Tn is the number of N partitions.
 This counts duplicated reads without assuming cache reuse.  Use
 ``duplicate_penalty < 1`` to model partial cache reuse of duplicated bytes.
 """
+
 from __future__ import annotations
 
 import argparse
 import json
-import math
 from dataclasses import asdict, dataclass
 from typing import Iterable
 
@@ -123,10 +123,7 @@ def _print_table(candidates: Iterable[GemmMemorySplit], limit: int) -> None:
     rows = list(candidates)
     if limit > 0:
         rows = rows[:limit]
-    print(
-        "split active  M_blk  N_blk  effective     no_cache      "
-        "dup          A_read       B_read"
-    )
+    print("split active  M_blk  N_blk  effective     no_cache      dup          A_read       B_read")
     for s in rows:
         print(
             f"{s.label:>5} {s.active_threads:>6} "
@@ -140,9 +137,7 @@ def _print_table(candidates: Iterable[GemmMemorySplit], limit: int) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter
-    )
+    parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("--M", type=int, required=True)
     parser.add_argument("--N", type=int, required=True)
     parser.add_argument("--K", type=int, required=True)

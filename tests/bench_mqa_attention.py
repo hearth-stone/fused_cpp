@@ -45,20 +45,14 @@ DEFAULT_SHAPES = [
 
 def _make_inputs(shape: Shape, dtype: torch.dtype, seed: int) -> tuple[torch.Tensor, ...]:
     g = torch.Generator(device="cpu").manual_seed(seed)
-    q = torch.randn(
-        shape.B, shape.N, shape.L, shape.E, generator=g, dtype=torch.float32
-    ).to(dtype)
+    q = torch.randn(shape.B, shape.N, shape.L, shape.E, generator=g, dtype=torch.float32).to(dtype)
     k = torch.randn(shape.B, shape.S, shape.E, generator=g, dtype=torch.float32).to(dtype)
     v = torch.randn(shape.B, shape.S, shape.Ev, generator=g, dtype=torch.float32).to(dtype)
     return q, k, v
 
 
 def _flops(shape: Shape, is_causal: bool) -> int:
-    pairs = (
-        compute_causal_effective_pairs(shape.L, shape.S)
-        if is_causal
-        else shape.L * shape.S
-    )
+    pairs = compute_causal_effective_pairs(shape.L, shape.S) if is_causal else shape.L * shape.S
     qk = 2 * shape.B * shape.N * pairs * shape.E
     softmax = 5 * shape.B * shape.N * pairs
     pv = 2 * shape.B * shape.N * pairs * shape.Ev
@@ -102,11 +96,7 @@ def main() -> None:
     args = parser.parse_args()
 
     shapes = args.shape or DEFAULT_SHAPES
-    print(
-        "env "
-        f"OMP_NUM_THREADS={os.environ.get('OMP_NUM_THREADS')} "
-        f"torch_num_threads={torch.get_num_threads()}"
-    )
+    print(f"env OMP_NUM_THREADS={os.environ.get('OMP_NUM_THREADS')} torch_num_threads={torch.get_num_threads()}")
     print(f"dtype={args.dtype} causal={args.causal} warmup={args.warmup} iters={args.iters}")
 
     for shape in shapes:

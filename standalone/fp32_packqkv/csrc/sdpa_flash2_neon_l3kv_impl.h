@@ -48,17 +48,14 @@
 
 namespace fused_cpp::sdpa_flash2_neon_l3kv_impl {
 
-using ::fused_cpp::sdpa_tile_sizes::TileSizes;
 using ::fused_cpp::sdpa_tile_sizes::ceil_div_pos;
+using ::fused_cpp::sdpa_tile_sizes::TileSizes;
 
 template <class MK, typename scalar_t, class = void>
 struct has_pv_pbf16 : std::false_type {};
 
 template <class MK>
-struct has_pv_pbf16<
-    MK,
-    at::BFloat16,
-    std::void_t<decltype(MK::kHasPvPbf16), decltype(&MK::pv_8x8_pbf16)>>
+struct has_pv_pbf16<MK, at::BFloat16, std::void_t<decltype(MK::kHasPvPbf16), decltype(&MK::pv_8x8_pbf16)>>
     : std::bool_constant<MK::kHasPvPbf16> {};
 
 template <class MK, typename scalar_t>
@@ -94,9 +91,8 @@ inline void prefetch_l2_keep_impl(const void* addr) {
 // vexpq_f32：基于 range reduction + 多项式估值的 NEON 向量化 expf 近似。
 template <int kDegree = 5>
 static inline float32x4_t vexpq_f32_poly_impl(float32x4_t x) {
-  static_assert(kDegree == 4 || kDegree == 5 || kDegree == 6,
-                "vexpq_f32_poly_impl supports degree 4, 5, or 6");
-  const float32x4_t kLn2  = vdupq_n_f32(0.6931471805599453f);
+  static_assert(kDegree == 4 || kDegree == 5 || kDegree == 6, "vexpq_f32_poly_impl supports degree 4, 5, or 6");
+  const float32x4_t kLn2 = vdupq_n_f32(0.6931471805599453f);
   const float32x4_t kInvLn2 = vdupq_n_f32(1.4426950408889634f);
   const float32x4_t c0 = vdupq_n_f32(1.0f);
   const float32x4_t c1 = vdupq_n_f32(1.0f);
@@ -138,9 +134,7 @@ static inline float32x4_t vexpq_f32_poly_impl(float32x4_t x) {
   return vmulq_f32(poly, pow2n);
 }
 
-static inline float32x4_t vexpq_f32_impl(float32x4_t x) {
-  return vexpq_f32_poly_impl<5>(x);
-}
+static inline float32x4_t vexpq_f32_impl(float32x4_t x) { return vexpq_f32_poly_impl<5>(x); }
 
 #endif  // FUSED_CPP_SDPA_CACHE_HAS_NEON
 
@@ -181,8 +175,7 @@ static inline svfloat32_t svexp_poly6_f32_impl(svbool_t pg, svfloat32_t x) {
 
 #endif  // FUSED_CPP_SDPA_CACHE_HAS_SVE
 
-inline float vectorized_exp_minus_impl(
-    float* dst, const float* src, float new_max, int64_t len) {
+inline float vectorized_exp_minus_impl(float* dst, const float* src, float new_max, int64_t len) {
   float block_sum = 0.0f;
   int64_t j = 0;
 #if FUSED_CPP_SDPA_CACHE_HAS_SVE
@@ -217,8 +210,7 @@ inline float vectorized_exp_minus_impl(
 }
 
 template <int kExpPolyDegree = 5>
-inline float vectorized_exp_minus_bf16_impl(
-    at::BFloat16* dst, const float* src, float new_max, int64_t len) {
+inline float vectorized_exp_minus_bf16_impl(at::BFloat16* dst, const float* src, float new_max, int64_t len) {
   float block_sum = 0.0f;
   int64_t j = 0;
 #if FUSED_CPP_SDPA_CACHE_HAS_NEON && FUSED_CPP_SDPA_CACHE_HAS_BF16
@@ -227,8 +219,7 @@ inline float vectorized_exp_minus_bf16_impl(
   bfloat16_t* dst_bf16 = reinterpret_cast<bfloat16_t*>(dst);
   for (; j + 4 <= len; j += 4) {
     float32x4_t s = vld1q_f32(src + j);
-    float32x4_t e =
-        vexpq_f32_poly_impl<kExpPolyDegree>(vsubq_f32(s, vmax));
+    float32x4_t e = vexpq_f32_poly_impl<kExpPolyDegree>(vsubq_f32(s, vmax));
     vst1_bf16(dst_bf16 + j, vcvt_bf16_f32(e));
     vsum = vaddq_f32(vsum, e);
   }
@@ -294,28 +285,18 @@ inline float fp16_bits_to_float_impl(uint16_t h) {
   if (exp == 0) {
     value = mant == 0 ? 0.0f : std::ldexp(static_cast<float>(mant), -24);
   } else if (exp == 0x1f) {
-    value = mant == 0
-        ? std::numeric_limits<float>::infinity()
-        : std::numeric_limits<float>::quiet_NaN();
+    value = mant == 0 ? std::numeric_limits<float>::infinity() : std::numeric_limits<float>::quiet_NaN();
   } else {
     value = std::ldexp(1.0f + static_cast<float>(mant) / 1024.0f, exp - 15);
   }
   return sign ? -value : value;
 }
 
-inline const char* mask_f16_row_ptr_impl(
-    const SdpaParams& p,
-    int64_t b,
-    int64_t n,
-    int64_t l,
-    int64_t s) {
+inline const char* mask_f16_row_ptr_impl(const SdpaParams& p, int64_t b, int64_t n, int64_t l, int64_t s) {
   const int64_t mb = b % p.mask_f16_ne3;
   const int64_t mh = n % p.mask_f16_ne2;
-  return reinterpret_cast<const char*>(p.mask_f16_ptr)
-      + s * p.mask_f16_nb0
-      + l * p.mask_f16_nb1
-      + mh * p.mask_f16_nb2
-      + mb * p.mask_f16_nb3;
+  return reinterpret_cast<const char*>(p.mask_f16_ptr) + s * p.mask_f16_nb0 + l * p.mask_f16_nb1 + mh * p.mask_f16_nb2 +
+         mb * p.mask_f16_nb3;
 }
 
 inline float load_mask_f16_from_ptr_impl(const char* src) {
@@ -324,14 +305,8 @@ inline float load_mask_f16_from_ptr_impl(const char* src) {
   return fp16_bits_to_float_impl(bits);
 }
 
-inline float load_mask_f16_impl(
-    const SdpaParams& p,
-    int64_t b,
-    int64_t n,
-    int64_t l,
-    int64_t s) {
-  return load_mask_f16_from_ptr_impl(
-      mask_f16_row_ptr_impl(p, b, n, l, s));
+inline float load_mask_f16_impl(const SdpaParams& p, int64_t b, int64_t n, int64_t l, int64_t s) {
+  return load_mask_f16_from_ptr_impl(mask_f16_row_ptr_impl(p, b, n, l, s));
 }
 
 enum class MaskBlockKind {
@@ -355,22 +330,15 @@ inline bool mask_f16_bits_is_off_impl(uint16_t bits) {
   return bits >= 0xe3d0;
 }
 
-inline MaskBlockKind classify_mask_f16_block_impl(
-    const SdpaParams& p,
-    int64_t b,
-    int64_t n,
-    int64_t l_start,
-    int64_t s_start,
-    int l_count,
-    int s_count) {
+inline MaskBlockKind classify_mask_f16_block_impl(const SdpaParams& p, int64_t b, int64_t n, int64_t l_start,
+                                                  int64_t s_start, int l_count, int s_count) {
   if (s_count == 8 && p.mask_f16_nb0 == static_cast<int64_t>(sizeof(uint16_t))) {
     constexpr uint64_t kF16AbsMask4 = 0x7fff7fff7fff7fffULL;
     constexpr uint64_t kF16NegInf4 = 0xfc00fc00fc00fc00ULL;
     bool all_zero_8 = true;
     bool all_neginf_8 = true;
     for (int i = 0; i < l_count; ++i) {
-      const char* mask_row =
-          mask_f16_row_ptr_impl(p, b, n, l_start + i, s_start);
+      const char* mask_row = mask_f16_row_ptr_impl(p, b, n, l_start + i, s_start);
       uint64_t lo = 0;
       uint64_t hi = 0;
       std::memcpy(&lo, mask_row, sizeof(lo));
@@ -392,8 +360,7 @@ inline MaskBlockKind classify_mask_f16_block_impl(
   bool all_zero = true;
   bool all_off = true;
   for (int i = 0; i < l_count; ++i) {
-    const char* mask_row =
-        mask_f16_row_ptr_impl(p, b, n, l_start + i, s_start);
+    const char* mask_row = mask_f16_row_ptr_impl(p, b, n, l_start + i, s_start);
     for (int j = 0; j < s_count; ++j) {
       uint16_t bits = 0;
       std::memcpy(&bits, mask_row + j * p.mask_f16_nb0, sizeof(bits));
@@ -414,19 +381,11 @@ inline MaskBlockKind classify_mask_f16_block_impl(
   return MaskBlockKind::kMixed;
 }
 
-inline const char* mask_f32_row_ptr_impl(
-    const SdpaParams& p,
-    int64_t b,
-    int64_t n,
-    int64_t l,
-    int64_t s) {
+inline const char* mask_f32_row_ptr_impl(const SdpaParams& p, int64_t b, int64_t n, int64_t l, int64_t s) {
   const int64_t mb = b % p.mask_f32_ne3;
   const int64_t mh = n % p.mask_f32_ne2;
-  return reinterpret_cast<const char*>(p.mask_f32_ptr)
-      + s * p.mask_f32_nb0
-      + l * p.mask_f32_nb1
-      + mh * p.mask_f32_nb2
-      + mb * p.mask_f32_nb3;
+  return reinterpret_cast<const char*>(p.mask_f32_ptr) + s * p.mask_f32_nb0 + l * p.mask_f32_nb1 + mh * p.mask_f32_nb2 +
+         mb * p.mask_f32_nb3;
 }
 
 inline float load_mask_f32_from_ptr_impl(const char* src) {
@@ -444,31 +403,21 @@ inline bool mask_f32_bits_is_off_impl(uint32_t bits) {
   return bits >= 0xc47a0000u && bits < 0xff800000u;
 }
 
-inline MaskBlockKind classify_mask_f32_block_impl(
-    const SdpaParams& p,
-    int64_t b,
-    int64_t n,
-    int64_t l_start,
-    int64_t s_start,
-    int l_count,
-    int s_count) {
+inline MaskBlockKind classify_mask_f32_block_impl(const SdpaParams& p, int64_t b, int64_t n, int64_t l_start,
+                                                  int64_t s_start, int l_count, int s_count) {
   if (s_count == 8 && p.mask_f32_nb0 == static_cast<int64_t>(sizeof(float))) {
     constexpr uint64_t kF32AbsMask2 = 0x7fffffff7fffffffULL;
     bool all_zero_8 = true;
     bool all_off_8 = true;
     for (int i = 0; i < l_count; ++i) {
-      const char* mask_row =
-          mask_f32_row_ptr_impl(p, b, n, l_start + i, s_start);
+      const char* mask_row = mask_f32_row_ptr_impl(p, b, n, l_start + i, s_start);
       for (int pair = 0; pair < 4; ++pair) {
         uint64_t bits64 = 0;
-        std::memcpy(&bits64, mask_row + pair * sizeof(bits64),
-                    sizeof(bits64));
+        std::memcpy(&bits64, mask_row + pair * sizeof(bits64), sizeof(bits64));
         all_zero_8 = all_zero_8 && ((bits64 & kF32AbsMask2) == 0);
         const uint32_t lo = static_cast<uint32_t>(bits64);
         const uint32_t hi = static_cast<uint32_t>(bits64 >> 32);
-        all_off_8 = all_off_8 &&
-            mask_f32_bits_is_off_impl(lo) &&
-            mask_f32_bits_is_off_impl(hi);
+        all_off_8 = all_off_8 && mask_f32_bits_is_off_impl(lo) && mask_f32_bits_is_off_impl(hi);
       }
       if (!all_zero_8 && !all_off_8) {
         break;
@@ -485,8 +434,7 @@ inline MaskBlockKind classify_mask_f32_block_impl(
   bool all_zero = true;
   bool all_off = true;
   for (int i = 0; i < l_count; ++i) {
-    const char* mask_row =
-        mask_f32_row_ptr_impl(p, b, n, l_start + i, s_start);
+    const char* mask_row = mask_f32_row_ptr_impl(p, b, n, l_start + i, s_start);
     for (int j = 0; j < s_count; ++j) {
       uint32_t bits = 0;
       std::memcpy(&bits, mask_row + j * p.mask_f32_nb0, sizeof(bits));
@@ -507,13 +455,8 @@ inline MaskBlockKind classify_mask_f32_block_impl(
   return MaskBlockKind::kMixed;
 }
 
-inline void mark_pv_skip_block_impl(
-    uint8_t* pv_skip_s,
-    bool& pv_skip_initialized,
-    bool& has_pv_skip,
-    int64_t Sc_cur,
-    int64_t s_start,
-    int s_count) {
+inline void mark_pv_skip_block_impl(uint8_t* pv_skip_s, bool& pv_skip_initialized, bool& has_pv_skip, int64_t Sc_cur,
+                                    int64_t s_start, int s_count) {
   if (!pv_skip_initialized) {
     std::memset(pv_skip_s, 0, static_cast<size_t>(Sc_cur));
     pv_skip_initialized = true;
@@ -530,12 +473,7 @@ inline void fill_tmp_8x8_impl(float* tmp, float value) {
   }
 }
 
-inline void fill_scores_block_impl(
-    float* scores,
-    int64_t scores_row_stride,
-    int l_count,
-    int s_count,
-    float value) {
+inline void fill_scores_block_impl(float* scores, int64_t scores_row_stride, int l_count, int s_count, float value) {
   for (int i = 0; i < l_count; ++i) {
     float* row = scores + i * scores_row_stride;
     for (int j = 0; j < s_count; ++j) {
@@ -544,36 +482,21 @@ inline void fill_scores_block_impl(
   }
 }
 
-inline void add_mask_f16_to_tmp_8x8_impl(
-    const SdpaParams& p,
-    int64_t b,
-    int64_t n,
-    int64_t l_start,
-    int64_t s_start,
-    float* tmp) {
+inline void add_mask_f16_to_tmp_8x8_impl(const SdpaParams& p, int64_t b, int64_t n, int64_t l_start, int64_t s_start,
+                                         float* tmp) {
   for (int i = 0; i < 8; ++i) {
-    const char* mask_row =
-        mask_f16_row_ptr_impl(p, b, n, l_start + i, s_start);
+    const char* mask_row = mask_f16_row_ptr_impl(p, b, n, l_start + i, s_start);
     for (int j = 0; j < 8; ++j) {
-      tmp[i * 8 + j] +=
-          load_mask_f16_from_ptr_impl(mask_row + j * p.mask_f16_nb0);
+      tmp[i * 8 + j] += load_mask_f16_from_ptr_impl(mask_row + j * p.mask_f16_nb0);
     }
   }
 }
 
-inline void add_mask_f16_to_scores_block_impl(
-    const SdpaParams& p,
-    int64_t b,
-    int64_t n,
-    int64_t l_start,
-    int64_t s_start,
-    int l_count,
-    int s_count,
-    float* scores,
-    int64_t scores_row_stride) {
+inline void add_mask_f16_to_scores_block_impl(const SdpaParams& p, int64_t b, int64_t n, int64_t l_start,
+                                              int64_t s_start, int l_count, int s_count, float* scores,
+                                              int64_t scores_row_stride) {
   for (int i = 0; i < l_count; ++i) {
-    const char* mask_row =
-        mask_f16_row_ptr_impl(p, b, n, l_start + i, s_start);
+    const char* mask_row = mask_f16_row_ptr_impl(p, b, n, l_start + i, s_start);
     float* row = scores + i * scores_row_stride;
     for (int j = 0; j < s_count; ++j) {
       row[j] += load_mask_f16_from_ptr_impl(mask_row + j * p.mask_f16_nb0);
@@ -581,36 +504,21 @@ inline void add_mask_f16_to_scores_block_impl(
   }
 }
 
-inline void add_mask_f32_to_tmp_8x8_impl(
-    const SdpaParams& p,
-    int64_t b,
-    int64_t n,
-    int64_t l_start,
-    int64_t s_start,
-    float* tmp) {
+inline void add_mask_f32_to_tmp_8x8_impl(const SdpaParams& p, int64_t b, int64_t n, int64_t l_start, int64_t s_start,
+                                         float* tmp) {
   for (int i = 0; i < 8; ++i) {
-    const char* mask_row =
-        mask_f32_row_ptr_impl(p, b, n, l_start + i, s_start);
+    const char* mask_row = mask_f32_row_ptr_impl(p, b, n, l_start + i, s_start);
     for (int j = 0; j < 8; ++j) {
-      tmp[i * 8 + j] +=
-          load_mask_f32_from_ptr_impl(mask_row + j * p.mask_f32_nb0);
+      tmp[i * 8 + j] += load_mask_f32_from_ptr_impl(mask_row + j * p.mask_f32_nb0);
     }
   }
 }
 
-inline void add_mask_f32_to_scores_block_impl(
-    const SdpaParams& p,
-    int64_t b,
-    int64_t n,
-    int64_t l_start,
-    int64_t s_start,
-    int l_count,
-    int s_count,
-    float* scores,
-    int64_t scores_row_stride) {
+inline void add_mask_f32_to_scores_block_impl(const SdpaParams& p, int64_t b, int64_t n, int64_t l_start,
+                                              int64_t s_start, int l_count, int s_count, float* scores,
+                                              int64_t scores_row_stride) {
   for (int i = 0; i < l_count; ++i) {
-    const char* mask_row =
-        mask_f32_row_ptr_impl(p, b, n, l_start + i, s_start);
+    const char* mask_row = mask_f32_row_ptr_impl(p, b, n, l_start + i, s_start);
     float* row = scores + i * scores_row_stride;
     for (int j = 0; j < s_count; ++j) {
       row[j] += load_mask_f32_from_ptr_impl(mask_row + j * p.mask_f32_nb0);
@@ -618,36 +526,21 @@ inline void add_mask_f32_to_scores_block_impl(
   }
 }
 
-inline bool has_direct_mask_impl(const SdpaParams& p) {
-  return p.mask_f16_ptr != nullptr || p.mask_f32_ptr != nullptr;
-}
+inline bool has_direct_mask_impl(const SdpaParams& p) { return p.mask_f16_ptr != nullptr || p.mask_f32_ptr != nullptr; }
 
-inline MaskBlockKind classify_direct_mask_block_impl(
-    const SdpaParams& p,
-    int64_t b,
-    int64_t n,
-    int64_t l_start,
-    int64_t s_start,
-    int l_count,
-    int s_count) {
+inline MaskBlockKind classify_direct_mask_block_impl(const SdpaParams& p, int64_t b, int64_t n, int64_t l_start,
+                                                     int64_t s_start, int l_count, int s_count) {
   if (p.mask_f16_ptr != nullptr) {
-    return classify_mask_f16_block_impl(
-        p, b, n, l_start, s_start, l_count, s_count);
+    return classify_mask_f16_block_impl(p, b, n, l_start, s_start, l_count, s_count);
   }
   if (p.mask_f32_ptr != nullptr) {
-    return classify_mask_f32_block_impl(
-        p, b, n, l_start, s_start, l_count, s_count);
+    return classify_mask_f32_block_impl(p, b, n, l_start, s_start, l_count, s_count);
   }
   return MaskBlockKind::kMixed;
 }
 
-inline void add_direct_mask_to_tmp_8x8_impl(
-    const SdpaParams& p,
-    int64_t b,
-    int64_t n,
-    int64_t l_start,
-    int64_t s_start,
-    float* tmp) {
+inline void add_direct_mask_to_tmp_8x8_impl(const SdpaParams& p, int64_t b, int64_t n, int64_t l_start, int64_t s_start,
+                                            float* tmp) {
   if (p.mask_f16_ptr != nullptr) {
     add_mask_f16_to_tmp_8x8_impl(p, b, n, l_start, s_start, tmp);
   } else if (p.mask_f32_ptr != nullptr) {
@@ -655,24 +548,13 @@ inline void add_direct_mask_to_tmp_8x8_impl(
   }
 }
 
-inline void add_direct_mask_to_scores_block_impl(
-    const SdpaParams& p,
-    int64_t b,
-    int64_t n,
-    int64_t l_start,
-    int64_t s_start,
-    int l_count,
-    int s_count,
-    float* scores,
-    int64_t scores_row_stride) {
+inline void add_direct_mask_to_scores_block_impl(const SdpaParams& p, int64_t b, int64_t n, int64_t l_start,
+                                                 int64_t s_start, int l_count, int s_count, float* scores,
+                                                 int64_t scores_row_stride) {
   if (p.mask_f16_ptr != nullptr) {
-    add_mask_f16_to_scores_block_impl(
-        p, b, n, l_start, s_start, l_count, s_count,
-        scores, scores_row_stride);
+    add_mask_f16_to_scores_block_impl(p, b, n, l_start, s_start, l_count, s_count, scores, scores_row_stride);
   } else if (p.mask_f32_ptr != nullptr) {
-    add_mask_f32_to_scores_block_impl(
-        p, b, n, l_start, s_start, l_count, s_count,
-        scores, scores_row_stride);
+    add_mask_f32_to_scores_block_impl(p, b, n, l_start, s_start, l_count, s_count, scores, scores_row_stride);
   }
 }
 
@@ -689,33 +571,17 @@ inline void add_direct_mask_to_scores_block_impl(
 // 不需要它们的实例化里彻底剔除。SDPA 入口按 4 种组合分发模板实例。
 // ──────────────────────────────────────────────────────────────────────
 
-template <class MK, typename scalar_t,
-          bool kPackedV = false,
-          bool kHasMask = false,
-          bool kCausal  = false>
-inline void process_q_tile_lc(
-    const scalar_t* q_ptr,
-    const scalar_t* k_ptr,
-    const scalar_t* v_ptr,
-    int64_t b, int64_t n, int64_t q0_outer,
-    int64_t Lc_eff,
-    const SdpaParams& p,
-    int64_t q_stride_b, int64_t q_stride_n, int64_t q_stride_l,
-    int64_t k_stride_b, int64_t k_stride_n, int64_t k_stride_s,
-    int64_t v_stride_b, int64_t v_stride_n, int64_t v_stride_s,
-    int64_t v_evblock_stride,        // 仅 kPackedV=true 时有意义；非 packed 传 0
-    int64_t m_stride_b, int64_t m_stride_n, int64_t m_stride_l,
-    int64_t o_stride_b, int64_t o_stride_n, int64_t o_stride_l,
-    const TileSizes& ts,
-    float* scores_l1,
-    float* P_hat,
-    at::BFloat16* P_hat_bf16,
-    float* O_acc,
-    float* running_max,
-    float* running_sum
-    ) {
-  const scalar_t* Qrow0 = q_ptr + b * q_stride_b + n * q_stride_n
-                                + q0_outer * q_stride_l;
+template <class MK, typename scalar_t, bool kPackedV = false, bool kHasMask = false, bool kCausal = false>
+inline void process_q_tile_lc(const scalar_t* q_ptr, const scalar_t* k_ptr, const scalar_t* v_ptr, int64_t b, int64_t n,
+                              int64_t q0_outer, int64_t Lc_eff, const SdpaParams& p, int64_t q_stride_b,
+                              int64_t q_stride_n, int64_t q_stride_l, int64_t k_stride_b, int64_t k_stride_n,
+                              int64_t k_stride_s, int64_t v_stride_b, int64_t v_stride_n, int64_t v_stride_s,
+                              int64_t v_evblock_stride,  // 仅 kPackedV=true 时有意义；非 packed 传 0
+                              int64_t m_stride_b, int64_t m_stride_n, int64_t m_stride_l, int64_t o_stride_b,
+                              int64_t o_stride_n, int64_t o_stride_l, const TileSizes& ts, float* scores_l1,
+                              float* P_hat, at::BFloat16* P_hat_bf16, float* O_acc, float* running_max,
+                              float* running_sum) {
+  const scalar_t* Qrow0 = q_ptr + b * q_stride_b + n * q_stride_n + q0_outer * q_stride_l;
 
   {
     FUSED_CPP_SDPA_PROFILE_SCOPE(::fused_cpp::sdpa_profile::Slot::kInit);
@@ -767,12 +633,8 @@ inline void process_q_tile_lc(
       {
         const int64_t s_next = s_l2 + ts.Sc_l2;
         if (s_next < s_l3_end) {
-          const scalar_t* K_next = k_ptr + b * k_stride_b
-                                         + n * k_stride_n
-                                         + s_next * k_stride_s;
-          const scalar_t* V_next = v_ptr + b * v_stride_b
-                                         + n * v_stride_n
-                                         + s_next * v_stride_s;
+          const scalar_t* K_next = k_ptr + b * k_stride_b + n * k_stride_n + s_next * k_stride_s;
+          const scalar_t* V_next = v_ptr + b * v_stride_b + n * v_stride_n + s_next * v_stride_s;
           for (int line = 0; line < 4; ++line) {
             prefetch_l2_keep_impl(reinterpret_cast<const char*>(K_next) + line * 64);
             prefetch_l2_keep_impl(reinterpret_cast<const char*>(V_next) + line * 64);
@@ -781,12 +643,10 @@ inline void process_q_tile_lc(
       }
 
       // K_tile / V_tile 起始指针。
-      const scalar_t* Krow0 = k_ptr + b * k_stride_b + n * k_stride_n
-                                    + s_l2 * k_stride_s;
+      const scalar_t* Krow0 = k_ptr + b * k_stride_b + n * k_stride_n + s_l2 * k_stride_s;
       // packed 路径下 Vbase 指向 [b][n][ev_block=0][s_l2][lane=0]，
       // 后面再按 (ev_off>>3) * v_evblock_stride 跳到正确 ev_block。
-      const scalar_t* Vbase = v_ptr + b * v_stride_b + n * v_stride_n
-                                    + s_l2 * v_stride_s;
+      const scalar_t* Vbase = v_ptr + b * v_stride_b + n * v_stride_n + s_l2 * v_stride_s;
 
       for (int line = 0; line < 2; ++line) {
         prefetch_l1_keep_impl(reinterpret_cast<const char*>(Krow0) + line * 64);
@@ -794,35 +654,31 @@ inline void process_q_tile_lc(
 
       for (int64_t qi_inner = 0; qi_inner < num_inner; ++qi_inner) {
         const int64_t q0_inner = q0_outer + qi_inner * LQ_INNER;
-        const int Lq_eff = static_cast<int>(
-            std::min<int64_t>(LQ_INNER, Lc_eff - qi_inner * LQ_INNER));
+        const int Lq_eff = static_cast<int>(std::min<int64_t>(LQ_INNER, Lc_eff - qi_inner * LQ_INNER));
 
         float* scores_8 = scores_l1 + qi_inner * LQ_INNER * Sc_cur;
-        float* p_hat_8  = P_hat     + qi_inner * LQ_INNER * Sc_cur;
+        float* p_hat_8 = P_hat + qi_inner * LQ_INNER * Sc_cur;
         at::BFloat16* p_hat_bf16_8 = nullptr;
         if constexpr (has_pv_pbf16_v<MK, scalar_t>) {
           p_hat_bf16_8 = P_hat_bf16 + qi_inner * LQ_INNER * Sc_cur;
         }
-        float* o_acc_8  = O_acc     + qi_inner * LQ_INNER * p.Ev;
-        float* rmax_8   = running_max + qi_inner * LQ_INNER;
-        float* rsum_8   = running_sum + qi_inner * LQ_INNER;
+        float* o_acc_8 = O_acc + qi_inner * LQ_INNER * p.Ev;
+        float* rmax_8 = running_max + qi_inner * LQ_INNER;
+        float* rsum_8 = running_sum + qi_inner * LQ_INNER;
 
         const scalar_t* Qrow_inner = Qrow0 + qi_inner * LQ_INNER * q_stride_l;
         int64_t Sc_active = Sc_cur;
         int64_t softmax_len[8];
         for (int i = 0; i < 8; ++i) softmax_len[i] = Sc_cur;
         if constexpr (kCausal) {
-          const int64_t q_inner_max_causal =
-              causal_lim[qi_inner * LQ_INNER + Lq_eff - 1];
-          Sc_active = std::min<int64_t>(
-              Sc_cur, q_inner_max_causal - s_l2 + 1);
+          const int64_t q_inner_max_causal = causal_lim[qi_inner * LQ_INNER + Lq_eff - 1];
+          Sc_active = std::min<int64_t>(Sc_cur, q_inner_max_causal - s_l2 + 1);
           if (Sc_active <= 0) {
             continue;
           }
           for (int i = 0; i < Lq_eff; ++i) {
             const int64_t lim = causal_lim[qi_inner * LQ_INNER + i];
-            softmax_len[i] = std::max<int64_t>(
-                0, std::min<int64_t>(Sc_active, lim - s_l2 + 1));
+            softmax_len[i] = std::max<int64_t>(0, std::min<int64_t>(Sc_active, lim - s_l2 + 1));
           }
           for (int i = Lq_eff; i < 8; ++i) {
             softmax_len[i] = 0;
@@ -837,10 +693,8 @@ inline void process_q_tile_lc(
 
         constexpr int64_t kMaxTrackedPvSkip = 4096;
         uint8_t pv_skip_s[kMaxTrackedPvSkip];
-        const bool has_direct_mask =
-            kHasMask && has_direct_mask_impl(p);
-        const bool track_pv_skip =
-            has_direct_mask && Sc_cur <= kMaxTrackedPvSkip;
+        const bool has_direct_mask = kHasMask && has_direct_mask_impl(p);
+        const bool track_pv_skip = has_direct_mask && Sc_cur <= kMaxTrackedPvSkip;
         bool pv_skip_initialized = false;
         bool has_pv_skip = false;
 
@@ -854,54 +708,40 @@ inline void process_q_tile_lc(
             MaskBlockKind mask_kind = MaskBlockKind::kMixed;
             if constexpr (kHasMask) {
               if (has_direct_mask) {
-                mask_kind = classify_direct_mask_block_impl(
-                    p, b, n, q0_inner, s_l2 + s_off, Lq_eff, 8);
+                mask_kind = classify_direct_mask_block_impl(p, b, n, q0_inner, s_l2 + s_off, Lq_eff, 8);
               }
             }
             if (Lq_eff == 8) {
               if (mask_kind == MaskBlockKind::kAllOff) {
                 fill_tmp_8x8_impl(tmp_qkt, p.neg_inf);
                 if (track_pv_skip) {
-                  mark_pv_skip_block_impl(
-                      pv_skip_s, pv_skip_initialized, has_pv_skip,
-                      Sc_cur, s_off, 8);
+                  mark_pv_skip_block_impl(pv_skip_s, pv_skip_initialized, has_pv_skip, Sc_cur, s_off, 8);
                 }
               } else {
-                MK::qkt_8x8(Qrow_inner, q_stride_l, K_tile, k_stride_s,
-                            p.E, p.scale_f, tmp_qkt);
+                MK::qkt_8x8(Qrow_inner, q_stride_l, K_tile, k_stride_s, p.E, p.scale_f, tmp_qkt);
               }
               if constexpr (kHasMask) {
-                if (has_direct_mask &&
-                    mask_kind == MaskBlockKind::kMixed) {
-                  add_direct_mask_to_tmp_8x8_impl(
-                      p, b, n, q0_inner, s_l2 + s_off, tmp_qkt);
+                if (has_direct_mask && mask_kind == MaskBlockKind::kMixed) {
+                  add_direct_mask_to_tmp_8x8_impl(p, b, n, q0_inner, s_l2 + s_off, tmp_qkt);
                 }
               }
               for (int i = 0; i < 8; ++i) {
-                ::fused_cpp::sdpa_pack_utils::copy_f32x8(
-                    tmp_qkt + i * 8, scores_8 + i * Sc_cur + s_off);
+                ::fused_cpp::sdpa_pack_utils::copy_f32x8(tmp_qkt + i * 8, scores_8 + i * Sc_cur + s_off);
               }
             } else {
               if (mask_kind == MaskBlockKind::kAllOff) {
-                fill_scores_block_impl(
-                    scores_8 + s_off, Sc_cur, Lq_eff, 8, p.neg_inf);
+                fill_scores_block_impl(scores_8 + s_off, Sc_cur, Lq_eff, 8, p.neg_inf);
                 if (track_pv_skip) {
-                  mark_pv_skip_block_impl(
-                      pv_skip_s, pv_skip_initialized, has_pv_skip,
-                      Sc_cur, s_off, 8);
+                  mark_pv_skip_block_impl(pv_skip_s, pv_skip_initialized, has_pv_skip, Sc_cur, s_off, 8);
                 }
               } else {
-                MK::qkt_tail(Qrow_inner, q_stride_l, K_tile, k_stride_s,
-                             p.E, p.scale_f,
-                             scores_8 + s_off, Sc_cur,
+                MK::qkt_tail(Qrow_inner, q_stride_l, K_tile, k_stride_s, p.E, p.scale_f, scores_8 + s_off, Sc_cur,
                              Lq_eff, 8);
               }
               if constexpr (kHasMask) {
-                if (has_direct_mask &&
-                    mask_kind == MaskBlockKind::kMixed) {
-                  add_direct_mask_to_scores_block_impl(
-                      p, b, n, q0_inner, s_l2 + s_off, Lq_eff, 8,
-                      scores_8 + s_off, Sc_cur);
+                if (has_direct_mask && mask_kind == MaskBlockKind::kMixed) {
+                  add_direct_mask_to_scores_block_impl(p, b, n, q0_inner, s_l2 + s_off, Lq_eff, 8, scores_8 + s_off,
+                                                       Sc_cur);
                 }
               }
             }
@@ -911,53 +751,38 @@ inline void process_q_tile_lc(
             MaskBlockKind mask_kind = MaskBlockKind::kMixed;
             if constexpr (kHasMask) {
               if (has_direct_mask) {
-                mask_kind = classify_direct_mask_block_impl(
-                    p, b, n, q0_inner, s_l2 + s_off, Lq_eff, 4);
+                mask_kind = classify_direct_mask_block_impl(p, b, n, q0_inner, s_l2 + s_off, Lq_eff, 4);
               }
             }
             if (Lq_eff == 8) {
               if (mask_kind == MaskBlockKind::kAllOff) {
-                fill_scores_block_impl(
-                    scores_8 + s_off, Sc_cur, Lq_eff, 4, p.neg_inf);
+                fill_scores_block_impl(scores_8 + s_off, Sc_cur, Lq_eff, 4, p.neg_inf);
                 if (track_pv_skip) {
-                  mark_pv_skip_block_impl(
-                      pv_skip_s, pv_skip_initialized, has_pv_skip,
-                      Sc_cur, s_off, 4);
+                  mark_pv_skip_block_impl(pv_skip_s, pv_skip_initialized, has_pv_skip, Sc_cur, s_off, 4);
                 }
               } else {
-                MK::qkt_8x4(Qrow_inner, q_stride_l, K_tile, k_stride_s,
-                            p.E, p.scale_f,
-                            scores_8 + s_off, Sc_cur);
+                MK::qkt_8x4(Qrow_inner, q_stride_l, K_tile, k_stride_s, p.E, p.scale_f, scores_8 + s_off, Sc_cur);
               }
               if constexpr (kHasMask) {
-                if (has_direct_mask &&
-                    mask_kind == MaskBlockKind::kMixed) {
-                  add_direct_mask_to_scores_block_impl(
-                      p, b, n, q0_inner, s_l2 + s_off, Lq_eff, 4,
-                      scores_8 + s_off, Sc_cur);
+                if (has_direct_mask && mask_kind == MaskBlockKind::kMixed) {
+                  add_direct_mask_to_scores_block_impl(p, b, n, q0_inner, s_l2 + s_off, Lq_eff, 4, scores_8 + s_off,
+                                                       Sc_cur);
                 }
               }
             } else {
               if (mask_kind == MaskBlockKind::kAllOff) {
-                fill_scores_block_impl(
-                    scores_8 + s_off, Sc_cur, Lq_eff, 4, p.neg_inf);
+                fill_scores_block_impl(scores_8 + s_off, Sc_cur, Lq_eff, 4, p.neg_inf);
                 if (track_pv_skip) {
-                  mark_pv_skip_block_impl(
-                      pv_skip_s, pv_skip_initialized, has_pv_skip,
-                      Sc_cur, s_off, 4);
+                  mark_pv_skip_block_impl(pv_skip_s, pv_skip_initialized, has_pv_skip, Sc_cur, s_off, 4);
                 }
               } else {
-                MK::qkt_tail(Qrow_inner, q_stride_l, K_tile, k_stride_s,
-                             p.E, p.scale_f,
-                             scores_8 + s_off, Sc_cur,
+                MK::qkt_tail(Qrow_inner, q_stride_l, K_tile, k_stride_s, p.E, p.scale_f, scores_8 + s_off, Sc_cur,
                              Lq_eff, 4);
               }
               if constexpr (kHasMask) {
-                if (has_direct_mask &&
-                    mask_kind == MaskBlockKind::kMixed) {
-                  add_direct_mask_to_scores_block_impl(
-                      p, b, n, q0_inner, s_l2 + s_off, Lq_eff, 4,
-                      scores_8 + s_off, Sc_cur);
+                if (has_direct_mask && mask_kind == MaskBlockKind::kMixed) {
+                  add_direct_mask_to_scores_block_impl(p, b, n, q0_inner, s_l2 + s_off, Lq_eff, 4, scores_8 + s_off,
+                                                       Sc_cur);
                 }
               }
             }
@@ -969,31 +794,22 @@ inline void process_q_tile_lc(
             MaskBlockKind mask_kind = MaskBlockKind::kMixed;
             if constexpr (kHasMask) {
               if (has_direct_mask) {
-                mask_kind = classify_direct_mask_block_impl(
-                    p, b, n, q0_inner, s_l2 + s_off, Lq_eff, tail_width);
+                mask_kind = classify_direct_mask_block_impl(p, b, n, q0_inner, s_l2 + s_off, Lq_eff, tail_width);
               }
             }
             if (mask_kind == MaskBlockKind::kAllOff) {
-              fill_scores_block_impl(
-                  scores_8 + s_off, Sc_cur, Lq_eff, tail_width, p.neg_inf);
+              fill_scores_block_impl(scores_8 + s_off, Sc_cur, Lq_eff, tail_width, p.neg_inf);
               if (track_pv_skip) {
-                mark_pv_skip_block_impl(
-                    pv_skip_s, pv_skip_initialized, has_pv_skip,
-                    Sc_cur, s_off, tail_width);
+                mark_pv_skip_block_impl(pv_skip_s, pv_skip_initialized, has_pv_skip, Sc_cur, s_off, tail_width);
               }
             } else {
-              MK::qkt_tail(Qrow_inner, q_stride_l, K_tile, k_stride_s,
-                           p.E, p.scale_f,
-                           scores_8 + s_off, Sc_cur,
-                           Lq_eff, tail_width);
+              MK::qkt_tail(Qrow_inner, q_stride_l, K_tile, k_stride_s, p.E, p.scale_f, scores_8 + s_off, Sc_cur, Lq_eff,
+                           tail_width);
             }
             if constexpr (kHasMask) {
-              if (has_direct_mask &&
-                  mask_kind == MaskBlockKind::kMixed) {
-                add_direct_mask_to_scores_block_impl(
-                    p, b, n, q0_inner, s_l2 + s_off, Lq_eff,
-                    tail_width,
-                    scores_8 + s_off, Sc_cur);
+              if (has_direct_mask && mask_kind == MaskBlockKind::kMixed) {
+                add_direct_mask_to_scores_block_impl(p, b, n, q0_inner, s_l2 + s_off, Lq_eff, tail_width,
+                                                     scores_8 + s_off, Sc_cur);
               }
             }
             s_off = Sc_active;
@@ -1010,17 +826,12 @@ inline void process_q_tile_lc(
             // Direct ggml mask was applied while writing QK blocks to scores_8.
           } else {
             for (int i = 0; i < Lq_eff; ++i) {
-              const float* m_row = p.mask_ptr + b * m_stride_b
-                                              + n * m_stride_n
-                                              + (q0_inner + i) * m_stride_l
-                                              + s_l2;
+              const float* m_row = p.mask_ptr + b * m_stride_b + n * m_stride_n + (q0_inner + i) * m_stride_l + s_l2;
               float* sc_row = scores_8 + i * Sc_cur;
               int64_t j = 0;
 #if FUSED_CPP_SDPA_CACHE_HAS_NEON
               for (; j + 4 <= Sc_active; j += 4) {
-                vst1q_f32(sc_row + j,
-                          vaddq_f32(vld1q_f32(sc_row + j),
-                                    vld1q_f32(m_row + j)));
+                vst1q_f32(sc_row + j, vaddq_f32(vld1q_f32(sc_row + j), vld1q_f32(m_row + j)));
               }
 #endif
               for (; j < Sc_active; ++j) {
@@ -1086,12 +897,10 @@ inline void process_q_tile_lc(
             if (new_max[i] == p.neg_inf) {
               std::memset(p_row, 0, sizeof(float) * Sc_cur);
             } else {
-              row_sum = vectorized_exp_minus_impl(
-                  p_row, sc_row, new_max[i], len_i);
+              row_sum = vectorized_exp_minus_impl(p_row, sc_row, new_max[i], len_i);
             }
             if (len_i < Sc_cur) {
-              std::memset(p_row + len_i, 0,
-                          sizeof(float) * (Sc_cur - len_i));
+              std::memset(p_row + len_i, 0, sizeof(float) * (Sc_cur - len_i));
             }
             rsum_8[i] += row_sum;
           }
@@ -1100,8 +909,7 @@ inline void process_q_tile_lc(
           }
         }
         if constexpr (has_pv_pbf16_v<MK, scalar_t>) {
-          FUSED_CPP_SDPA_PROFILE_SCOPE(
-              ::fused_cpp::sdpa_profile::Slot::kPConvert);
+          FUSED_CPP_SDPA_PROFILE_SCOPE(::fused_cpp::sdpa_profile::Slot::kPConvert);
           for (int64_t idx = 0; idx < 8 * Sc_cur; ++idx) {
             p_hat_bf16_8[idx] = static_cast<at::BFloat16>(p_hat_8[idx]);
           }
@@ -1122,79 +930,68 @@ inline void process_q_tile_lc(
         {
           FUSED_CPP_SDPA_PROFILE_SCOPE(::fused_cpp::sdpa_profile::Slot::kPv);
           for (int64_t ev_off = 0; ev_off < p.Ev; ev_off += 8) {
-          // ── packv 路径下的 V cold prefetch ──
-          // 非 packed 路径上 ev_off += 8 只是行内偏移（同一 cache line 后半），
-          // HW prefetcher 已经覆盖。但 packv layout 下 ev_off += 8 = 跳到
-          // 下一个 ev_block，物理地址跨 S*32 字节（典型 S=2048 fp32 时
-          // 64KiB），远超 stride prefetcher 跟踪窗口（A-class typical
-          // ≤4KiB stride）。在每次 ev_off 切换时把下一个 ev_block 起始的
-          // 2 cache line 提前进 L1，覆盖 ~80–200 cycle 的 LLC→L1 延迟，
-          // 与 PV inner 循环并行。
-          if constexpr (kPackedV) {
-            if (ev_off + 8 < p.Ev) {
-              const scalar_t* next_block =
-                  Vbase + ((ev_off >> 3) + 1) * v_evblock_stride;
-              for (int line = 0; line < 2; ++line) {
-                prefetch_l1_keep_impl(
-                    reinterpret_cast<const char*>(next_block) + line * 64);
+            // ── packv 路径下的 V cold prefetch ──
+            // 非 packed 路径上 ev_off += 8 只是行内偏移（同一 cache line 后半），
+            // HW prefetcher 已经覆盖。但 packv layout 下 ev_off += 8 = 跳到
+            // 下一个 ev_block，物理地址跨 S*32 字节（典型 S=2048 fp32 时
+            // 64KiB），远超 stride prefetcher 跟踪窗口（A-class typical
+            // ≤4KiB stride）。在每次 ev_off 切换时把下一个 ev_block 起始的
+            // 2 cache line 提前进 L1，覆盖 ~80–200 cycle 的 LLC→L1 延迟，
+            // 与 PV inner 循环并行。
+            if constexpr (kPackedV) {
+              if (ev_off + 8 < p.Ev) {
+                const scalar_t* next_block = Vbase + ((ev_off >> 3) + 1) * v_evblock_stride;
+                for (int line = 0; line < 2; ++line) {
+                  prefetch_l1_keep_impl(reinterpret_cast<const char*>(next_block) + line * 64);
+                }
               }
             }
-          }
 
-          const int64_t Ev_cur = std::min<int64_t>(8, p.Ev - ev_off);
+            const int64_t Ev_cur = std::min<int64_t>(8, p.Ev - ev_off);
 
-          const scalar_t* V_tile;
-          int64_t v_row_stride_for_mk;
-          if constexpr (kPackedV) {
-            V_tile = Vbase + (ev_off >> 3) * v_evblock_stride;  // k=0 起点
-            v_row_stride_for_mk = 8;
-          } else {
-            V_tile = Vbase + ev_off;                             // k=0 起点
-            v_row_stride_for_mk = v_stride_s;
-          }
-          float* O_tile = o_acc_8 + ev_off;
-
-          auto run_pv_segment = [&](int64_t k_start, int64_t k_len) {
-            if (k_len <= 0) {
-              return;
+            const scalar_t* V_tile;
+            int64_t v_row_stride_for_mk;
+            if constexpr (kPackedV) {
+              V_tile = Vbase + (ev_off >> 3) * v_evblock_stride;  // k=0 起点
+              v_row_stride_for_mk = 8;
+            } else {
+              V_tile = Vbase + ev_off;  // k=0 起点
+              v_row_stride_for_mk = v_stride_s;
             }
-            const scalar_t* V_seg = V_tile + k_start * v_row_stride_for_mk;
-            if (Lq_eff == 8 && Ev_cur == 8) {
-              if constexpr (has_pv_pbf16_v<MK, scalar_t>) {
-                MK::pv_8x8_pbf16(p_hat_bf16_8 + k_start, Sc_cur,
-                                  V_seg, v_row_stride_for_mk,
-                                  k_len,
-                                  O_tile, p.Ev);
+            float* O_tile = o_acc_8 + ev_off;
+
+            auto run_pv_segment = [&](int64_t k_start, int64_t k_len) {
+              if (k_len <= 0) {
+                return;
+              }
+              const scalar_t* V_seg = V_tile + k_start * v_row_stride_for_mk;
+              if (Lq_eff == 8 && Ev_cur == 8) {
+                if constexpr (has_pv_pbf16_v<MK, scalar_t>) {
+                  MK::pv_8x8_pbf16(p_hat_bf16_8 + k_start, Sc_cur, V_seg, v_row_stride_for_mk, k_len, O_tile, p.Ev);
+                } else {
+                  MK::pv_8x8(p_hat_8 + k_start, Sc_cur, V_seg, v_row_stride_for_mk, k_len, O_tile, p.Ev);
+                }
               } else {
-                MK::pv_8x8(p_hat_8 + k_start, Sc_cur,
-                           V_seg, v_row_stride_for_mk,
-                           k_len,
-                           O_tile, p.Ev);
+                MK::pv_tail(p_hat_8 + k_start, Sc_cur, V_seg, v_row_stride_for_mk, k_len, O_tile, p.Ev, Lq_eff,
+                            static_cast<int>(Ev_cur));
+              }
+            };
+
+            if (has_pv_skip) {
+              int64_t k = 0;
+              while (k < Sc_active) {
+                while (k < Sc_active && pv_skip_s[k] != 0) {
+                  ++k;
+                }
+                const int64_t k_start = k;
+                while (k < Sc_active && pv_skip_s[k] == 0) {
+                  ++k;
+                }
+                run_pv_segment(k_start, k - k_start);
               }
             } else {
-              MK::pv_tail(p_hat_8 + k_start, Sc_cur,
-                          V_seg, v_row_stride_for_mk,
-                          k_len,
-                          O_tile, p.Ev,
-                          Lq_eff, static_cast<int>(Ev_cur));
+              run_pv_segment(0, Sc_active);
             }
-          };
-
-          if (has_pv_skip) {
-            int64_t k = 0;
-            while (k < Sc_active) {
-              while (k < Sc_active && pv_skip_s[k] != 0) {
-                ++k;
-              }
-              const int64_t k_start = k;
-              while (k < Sc_active && pv_skip_s[k] == 0) {
-                ++k;
-              }
-              run_pv_segment(k_start, k - k_start);
-            }
-          } else {
-            run_pv_segment(0, Sc_active);
-          }
           }
         }
 
@@ -1203,25 +1000,22 @@ inline void process_q_tile_lc(
           rmax_8[i] = new_max[i];
         }
       }  // qi_inner
-    }    // s_l2
-  }      // s_l3
+    }  // s_l2
+  }  // s_l3
 
   {
     FUSED_CPP_SDPA_PROFILE_SCOPE(::fused_cpp::sdpa_profile::Slot::kFinalize);
     // ── 归一化并写入 o_row ──
     for (int64_t i = 0; i < Lc_eff; ++i) {
-      float* o_row = p.out_ptr + b * o_stride_b + n * o_stride_n
-                               + (q0_outer + i) * o_stride_l;
+      float* o_row = p.out_ptr + b * o_stride_b + n * o_stride_n + (q0_outer + i) * o_stride_l;
       if (p.max_logits_ptr != nullptr || p.lse_ptr != nullptr) {
         const int64_t stats_idx = b * (p.N * p.L) + n * p.L + q0_outer + i;
         if (p.max_logits_ptr != nullptr) {
           p.max_logits_ptr[stats_idx] = running_max[i];
         }
         if (p.lse_ptr != nullptr) {
-          p.lse_ptr[stats_idx] =
-              running_sum[i] > 0.0f
-                  ? running_max[i] + std::log(running_sum[i])
-                  : std::numeric_limits<float>::infinity();
+          p.lse_ptr[stats_idx] = running_sum[i] > 0.0f ? running_max[i] + std::log(running_sum[i])
+                                                       : std::numeric_limits<float>::infinity();
         }
       }
       if (running_sum[i] > 0.0f) {
@@ -1250,28 +1044,19 @@ inline void process_q_tile_lc(
 // 路径 A：collapse(3) over (B, N, q_tile)
 // ──────────────────────────────────────────────────────────────────────
 
-template <class MK, typename scalar_t,
-          bool kPackedV = false,
-          bool kHasMask = false,
-          bool kCausal  = false>
-inline void run_path_collapse3(
-    const scalar_t* q_ptr,
-    const scalar_t* k_ptr,
-    const scalar_t* v_ptr,
-    const SdpaParams& p,
-    const TileSizes& ts,
-    int64_t q_stride_b, int64_t q_stride_n, int64_t q_stride_l,
-    int64_t k_stride_b, int64_t k_stride_n, int64_t k_stride_s,
-    int64_t v_stride_b, int64_t v_stride_n, int64_t v_stride_s,
-    int64_t v_evblock_stride,
-    int64_t m_stride_b, int64_t m_stride_n, int64_t m_stride_l,
-    int64_t o_stride_b, int64_t o_stride_n, int64_t o_stride_l) {
+template <class MK, typename scalar_t, bool kPackedV = false, bool kHasMask = false, bool kCausal = false>
+inline void run_path_collapse3(const scalar_t* q_ptr, const scalar_t* k_ptr, const scalar_t* v_ptr, const SdpaParams& p,
+                               const TileSizes& ts, int64_t q_stride_b, int64_t q_stride_n, int64_t q_stride_l,
+                               int64_t k_stride_b, int64_t k_stride_n, int64_t k_stride_s, int64_t v_stride_b,
+                               int64_t v_stride_n, int64_t v_stride_s, int64_t v_evblock_stride, int64_t m_stride_b,
+                               int64_t m_stride_n, int64_t m_stride_l, int64_t o_stride_b, int64_t o_stride_n,
+                               int64_t o_stride_l) {
   const int64_t LQ_OUTER = ts.Lc_l2;
   const int64_t num_q_tiles = ceil_div_pos(p.L, LQ_OUTER);
   const int64_t Sc_l2 = ts.Sc_l2;
 
 #ifdef _OPENMP
-  #pragma omp parallel
+#pragma omp parallel
 #endif
   {
     const int64_t sc_max = std::max<int64_t>(8, Sc_l2);
@@ -1283,7 +1068,7 @@ inline void run_path_collapse3(
     std::vector<float> running_sum_vec(LQ_OUTER);
 
 #ifdef _OPENMP
-    #pragma omp for collapse(3) schedule(static)
+#pragma omp for collapse(3) schedule(static)
 #endif
     for (int64_t b = 0; b < p.B; ++b) {
       for (int64_t n = 0; n < p.N; ++n) {
@@ -1291,18 +1076,10 @@ inline void run_path_collapse3(
           const int64_t q0_outer = qi_outer * LQ_OUTER;
           const int64_t Lc_eff = std::min<int64_t>(LQ_OUTER, p.L - q0_outer);
           process_q_tile_lc<MK, scalar_t, kPackedV, kHasMask, kCausal>(
-              q_ptr, k_ptr, v_ptr,
-              b, n, q0_outer, Lc_eff, p,
-              q_stride_b, q_stride_n, q_stride_l,
-              k_stride_b, k_stride_n, k_stride_s,
-              v_stride_b, v_stride_n, v_stride_s,
-              v_evblock_stride,
-              m_stride_b, m_stride_n, m_stride_l,
-              o_stride_b, o_stride_n, o_stride_l,
-              ts,
-              scores_l1_vec.data(), P_hat_vec.data(), P_hat_bf16_vec.data(),
-              O_acc_vec.data(),
-              running_max_vec.data(), running_sum_vec.data());
+              q_ptr, k_ptr, v_ptr, b, n, q0_outer, Lc_eff, p, q_stride_b, q_stride_n, q_stride_l, k_stride_b,
+              k_stride_n, k_stride_s, v_stride_b, v_stride_n, v_stride_s, v_evblock_stride, m_stride_b, m_stride_n,
+              m_stride_l, o_stride_b, o_stride_n, o_stride_l, ts, scores_l1_vec.data(), P_hat_vec.data(),
+              P_hat_bf16_vec.data(), O_acc_vec.data(), running_max_vec.data(), running_sum_vec.data());
         }
       }
     }
@@ -1313,23 +1090,13 @@ inline void run_path_collapse3(
 // 路径 B：omp single + taskloop
 // ──────────────────────────────────────────────────────────────────────
 
-template <class MK, typename scalar_t,
-          bool kPackedV = false,
-          bool kHasMask = false,
-          bool kCausal  = false>
-inline void run_path_taskloop(
-    const scalar_t* q_ptr,
-    const scalar_t* k_ptr,
-    const scalar_t* v_ptr,
-    const SdpaParams& p,
-    const TileSizes& ts,
-    int num_groups,
-    int64_t q_stride_b, int64_t q_stride_n, int64_t q_stride_l,
-    int64_t k_stride_b, int64_t k_stride_n, int64_t k_stride_s,
-    int64_t v_stride_b, int64_t v_stride_n, int64_t v_stride_s,
-    int64_t v_evblock_stride,
-    int64_t m_stride_b, int64_t m_stride_n, int64_t m_stride_l,
-    int64_t o_stride_b, int64_t o_stride_n, int64_t o_stride_l) {
+template <class MK, typename scalar_t, bool kPackedV = false, bool kHasMask = false, bool kCausal = false>
+inline void run_path_taskloop(const scalar_t* q_ptr, const scalar_t* k_ptr, const scalar_t* v_ptr, const SdpaParams& p,
+                              const TileSizes& ts, int num_groups, int64_t q_stride_b, int64_t q_stride_n,
+                              int64_t q_stride_l, int64_t k_stride_b, int64_t k_stride_n, int64_t k_stride_s,
+                              int64_t v_stride_b, int64_t v_stride_n, int64_t v_stride_s, int64_t v_evblock_stride,
+                              int64_t m_stride_b, int64_t m_stride_n, int64_t m_stride_l, int64_t o_stride_b,
+                              int64_t o_stride_n, int64_t o_stride_l) {
   const int64_t LQ_OUTER = ts.Lc_l2;
   const int64_t num_q_tiles = ceil_div_pos(p.L, LQ_OUTER);
   const int64_t Sc_l2 = ts.Sc_l2;
@@ -1349,7 +1116,7 @@ inline void run_path_taskloop(
   std::vector<std::vector<float>> rsum_pool(total_threads);
 
 #ifdef _OPENMP
-  #pragma omp parallel
+#pragma omp parallel
 #endif
   {
     const int tid =
@@ -1360,24 +1127,21 @@ inline void run_path_taskloop(
 #endif
     scores_l1_pool[tid].assign(LQ_OUTER * sc_max, 0.0f);
     p_hat_pool[tid].assign(LQ_OUTER * sc_max, 0.0f);
-    p_hat_bf16_pool[tid].assign(
-        LQ_OUTER * sc_max, static_cast<at::BFloat16>(0.0f));
+    p_hat_bf16_pool[tid].assign(LQ_OUTER * sc_max, static_cast<at::BFloat16>(0.0f));
     o_acc_pool[tid].assign(LQ_OUTER * p.Ev, 0.0f);
     rmax_pool[tid].assign(LQ_OUTER, 0.0f);
     rsum_pool[tid].assign(LQ_OUTER, 0.0f);
 
 #ifdef _OPENMP
-    #pragma omp barrier
-    #pragma omp single
+#pragma omp barrier
+#pragma omp single
 #endif
     {
-      const int64_t grain = std::max<int64_t>(
-          1, num_q_tiles / std::max(1, num_groups));
+      const int64_t grain = std::max<int64_t>(1, num_q_tiles / std::max(1, num_groups));
       for (int64_t b = 0; b < p.B; ++b) {
         for (int64_t n = 0; n < p.N; ++n) {
 #ifdef _OPENMP
-          #pragma omp taskloop grainsize(grain) nogroup default(shared) \
-              firstprivate(b, n)
+#pragma omp taskloop grainsize(grain) nogroup default(shared) firstprivate(b, n)
 #endif
           for (int64_t qi_outer = 0; qi_outer < num_q_tiles; ++qi_outer) {
             const int my_tid =
@@ -1389,21 +1153,11 @@ inline void run_path_taskloop(
             const int64_t q0_outer = qi_outer * LQ_OUTER;
             const int64_t Lc_eff = std::min<int64_t>(LQ_OUTER, p.L - q0_outer);
             process_q_tile_lc<MK, scalar_t, kPackedV, kHasMask, kCausal>(
-                q_ptr, k_ptr, v_ptr,
-                b, n, q0_outer, Lc_eff, p,
-                q_stride_b, q_stride_n, q_stride_l,
-                k_stride_b, k_stride_n, k_stride_s,
-                v_stride_b, v_stride_n, v_stride_s,
-                v_evblock_stride,
-                m_stride_b, m_stride_n, m_stride_l,
-                o_stride_b, o_stride_n, o_stride_l,
-                ts,
-                scores_l1_pool[my_tid].data(),
-                p_hat_pool[my_tid].data(),
-                p_hat_bf16_pool[my_tid].data(),
-                o_acc_pool[my_tid].data(),
-                rmax_pool[my_tid].data(),
-                rsum_pool[my_tid].data());
+                q_ptr, k_ptr, v_ptr, b, n, q0_outer, Lc_eff, p, q_stride_b, q_stride_n, q_stride_l, k_stride_b,
+                k_stride_n, k_stride_s, v_stride_b, v_stride_n, v_stride_s, v_evblock_stride, m_stride_b, m_stride_n,
+                m_stride_l, o_stride_b, o_stride_n, o_stride_l, ts, scores_l1_pool[my_tid].data(),
+                p_hat_pool[my_tid].data(), p_hat_bf16_pool[my_tid].data(), o_acc_pool[my_tid].data(),
+                rmax_pool[my_tid].data(), rsum_pool[my_tid].data());
           }
         }
       }
@@ -1432,35 +1186,22 @@ inline void run_path_taskloop(
 // 必须同步两边——它们处于同一文件、命名一致便于查找。
 // ──────────────────────────────────────────────────────────────────────
 
-template <bool kHasMask = false, bool kCausal  = false,
-          bool kPbf16PV = false, int kExpPolyDegree = 5>
-inline void process_q_tile_lc_packqkv(
-    const at::BFloat16* q_ptr,
-    const uint16_t* k_packed_ptr,                  // [B, N, S/8, E_main/4, 32] u16
-    const at::BFloat16* k_orig_ptr,                // 原始 K，用于 inner 标量 tail / partial path
-    const at::BFloat16* v_packed_ptr,              // [B, N, Ev/8, S, 8]
-    int64_t b, int64_t n, int64_t q0_outer,
-    int64_t Lc_eff,
-    const SdpaParams& p,
-    int64_t q_stride_b, int64_t q_stride_n, int64_t q_stride_l,
-    int64_t k_orig_stride_b, int64_t k_orig_stride_n, int64_t k_orig_stride_s,
-    int64_t k_packed_stride_b, int64_t k_packed_stride_n, int64_t k_sblock_stride,
-    int64_t v_stride_b, int64_t v_stride_n, int64_t v_stride_s,
-    int64_t v_evblock_stride,
-    int64_t m_stride_b, int64_t m_stride_n, int64_t m_stride_l,
-    int64_t o_stride_b, int64_t o_stride_n, int64_t o_stride_l,
-    const TileSizes& ts,
-    float* scores_l1,
-    float* P_hat,
-    at::BFloat16* P_hat_bf16,
-    float* O_acc,
-    float* running_max,
-    float* running_sum,
-    uint16_t* q_seq_buf
-    ) {
+template <bool kHasMask = false, bool kCausal = false, bool kPbf16PV = false, int kExpPolyDegree = 5>
+inline void process_q_tile_lc_packqkv(const at::BFloat16* q_ptr,
+                                      const uint16_t* k_packed_ptr,      // [B, N, S/8, E_main/4, 32] u16
+                                      const at::BFloat16* k_orig_ptr,    // 原始 K，用于 inner 标量 tail / partial path
+                                      const at::BFloat16* v_packed_ptr,  // [B, N, Ev/8, S, 8]
+                                      int64_t b, int64_t n, int64_t q0_outer, int64_t Lc_eff, const SdpaParams& p,
+                                      int64_t q_stride_b, int64_t q_stride_n, int64_t q_stride_l,
+                                      int64_t k_orig_stride_b, int64_t k_orig_stride_n, int64_t k_orig_stride_s,
+                                      int64_t k_packed_stride_b, int64_t k_packed_stride_n, int64_t k_sblock_stride,
+                                      int64_t v_stride_b, int64_t v_stride_n, int64_t v_stride_s,
+                                      int64_t v_evblock_stride, int64_t m_stride_b, int64_t m_stride_n,
+                                      int64_t m_stride_l, int64_t o_stride_b, int64_t o_stride_n, int64_t o_stride_l,
+                                      const TileSizes& ts, float* scores_l1, float* P_hat, at::BFloat16* P_hat_bf16,
+                                      float* O_acc, float* running_max, float* running_sum, uint16_t* q_seq_buf) {
   using scalar_t = at::BFloat16;
-  const scalar_t* Qrow0 = q_ptr + b * q_stride_b + n * q_stride_n
-                                + q0_outer * q_stride_l;
+  const scalar_t* Qrow0 = q_ptr + b * q_stride_b + n * q_stride_n + q0_outer * q_stride_l;
 
   {
     FUSED_CPP_SDPA_PROFILE_SCOPE(::fused_cpp::sdpa_profile::Slot::kInit);
@@ -1494,21 +1235,18 @@ inline void process_q_tile_lc_packqkv(
   {
     FUSED_CPP_SDPA_PROFILE_SCOPE(::fused_cpp::sdpa_profile::Slot::kQPack);
     for (int64_t qi = 0; qi < num_inner; ++qi) {
-      const int64_t Lq_eff_qi =
-          std::min<int64_t>(LQ_INNER, Lc_eff - qi * LQ_INNER);
+      const int64_t Lq_eff_qi = std::min<int64_t>(LQ_INNER, Lc_eff - qi * LQ_INNER);
       if (Lq_eff_qi == 8) {
         const scalar_t* Q_block = Qrow0 + qi * LQ_INNER * q_stride_l;
         uint16_t* Q_seq = q_seq_buf + qi * qblock_u16;
-        ::fused_cpp::sdpa_microkernels::pack_q_8rows_to_seq_bf16(
-            Q_block, q_stride_l, p.E, Q_seq);
+        ::fused_cpp::sdpa_microkernels::pack_q_8rows_to_seq_bf16(Q_block, q_stride_l, p.E, Q_seq);
       }
       // Lq_eff_qi < 8 → 不 pack，QKᵀ 走 baseline qkt_tail
     }
   }
 
   // K_packed 在本 (b, n) 的起点
-  const uint16_t* K_packed_bn = k_packed_ptr + b * k_packed_stride_b
-                                             + n * k_packed_stride_n;
+  const uint16_t* K_packed_bn = k_packed_ptr + b * k_packed_stride_b + n * k_packed_stride_n;
 
   for (int64_t s_l3 = 0; s_l3 < p.S; s_l3 += ts.Sc_l3) {
     const int64_t s_l3_end = std::min(s_l3 + ts.Sc_l3, p.S);
@@ -1532,9 +1270,7 @@ inline void process_q_tile_lc_packqkv(
         if (s_next < s_l3_end) {
           // K_next 起点：packed s_block 索引 = s_next / 8
           const uint16_t* K_next = K_packed_bn + (s_next / 8) * k_sblock_stride;
-          const scalar_t* V_next = v_packed_ptr + b * v_stride_b
-                                                + n * v_stride_n
-                                                + s_next * v_stride_s;
+          const scalar_t* V_next = v_packed_ptr + b * v_stride_b + n * v_stride_n + s_next * v_stride_s;
           for (int line = 0; line < 4; ++line) {
             prefetch_l2_keep_impl(reinterpret_cast<const char*>(K_next) + line * 64);
             prefetch_l2_keep_impl(reinterpret_cast<const char*>(V_next) + line * 64);
@@ -1543,14 +1279,11 @@ inline void process_q_tile_lc_packqkv(
       }
 
       // partial path 的原始 K 起点（用于 qkt_8x4 / qkt_tail / inner 标量 tail）
-      const scalar_t* Krow0_orig = k_orig_ptr + b * k_orig_stride_b
-                                              + n * k_orig_stride_n
-                                              + s_l2 * k_orig_stride_s;
+      const scalar_t* Krow0_orig = k_orig_ptr + b * k_orig_stride_b + n * k_orig_stride_n + s_l2 * k_orig_stride_s;
       // packed K 起点
       const uint16_t* Krow0_packed = K_packed_bn + (s_l2 / 8) * k_sblock_stride;
       // V_base：packed [b][n][ev_block=0][s_l2][lane=0]
-      const scalar_t* Vbase = v_packed_ptr + b * v_stride_b + n * v_stride_n
-                                           + s_l2 * v_stride_s;
+      const scalar_t* Vbase = v_packed_ptr + b * v_stride_b + n * v_stride_n + s_l2 * v_stride_s;
 
       for (int line = 0; line < 2; ++line) {
         prefetch_l1_keep_impl(reinterpret_cast<const char*>(Krow0_packed) + line * 64);
@@ -1558,18 +1291,17 @@ inline void process_q_tile_lc_packqkv(
 
       for (int64_t qi_inner = 0; qi_inner < num_inner; ++qi_inner) {
         const int64_t q0_inner = q0_outer + qi_inner * LQ_INNER;
-        const int Lq_eff = static_cast<int>(
-            std::min<int64_t>(LQ_INNER, Lc_eff - qi_inner * LQ_INNER));
+        const int Lq_eff = static_cast<int>(std::min<int64_t>(LQ_INNER, Lc_eff - qi_inner * LQ_INNER));
 
         float* scores_8 = scores_l1 + qi_inner * LQ_INNER * Sc_cur;
-        float* p_hat_8  = P_hat     + qi_inner * LQ_INNER * Sc_cur;
+        float* p_hat_8 = P_hat + qi_inner * LQ_INNER * Sc_cur;
         at::BFloat16* p_hat_bf16_8 = nullptr;
         if constexpr (kPbf16PV) {
           p_hat_bf16_8 = P_hat_bf16 + qi_inner * LQ_INNER * Sc_cur;
         }
-        float* o_acc_8  = O_acc     + qi_inner * LQ_INNER * p.Ev;
-        float* rmax_8   = running_max + qi_inner * LQ_INNER;
-        float* rsum_8   = running_sum + qi_inner * LQ_INNER;
+        float* o_acc_8 = O_acc + qi_inner * LQ_INNER * p.Ev;
+        float* rmax_8 = running_max + qi_inner * LQ_INNER;
+        float* rsum_8 = running_sum + qi_inner * LQ_INNER;
 
         const scalar_t* Qrow_inner = Qrow0 + qi_inner * LQ_INNER * q_stride_l;
         const uint16_t* Q_seq_inner = q_seq_buf + qi_inner * qblock_u16;
@@ -1579,17 +1311,14 @@ inline void process_q_tile_lc_packqkv(
         int64_t softmax_len[8];
         for (int i = 0; i < 8; ++i) softmax_len[i] = Sc_cur;
         if constexpr (kCausal) {
-          const int64_t q_inner_max_causal =
-              causal_lim[qi_inner * LQ_INNER + Lq_eff - 1];
-          Sc_active = std::min<int64_t>(
-              Sc_cur, q_inner_max_causal - s_l2 + 1);
+          const int64_t q_inner_max_causal = causal_lim[qi_inner * LQ_INNER + Lq_eff - 1];
+          Sc_active = std::min<int64_t>(Sc_cur, q_inner_max_causal - s_l2 + 1);
           if (Sc_active <= 0) {
             continue;
           }
           for (int i = 0; i < Lq_eff; ++i) {
             const int64_t lim = causal_lim[qi_inner * LQ_INNER + i];
-            softmax_len[i] = std::max<int64_t>(
-                0, std::min<int64_t>(Sc_active, lim - s_l2 + 1));
+            softmax_len[i] = std::max<int64_t>(0, std::min<int64_t>(Sc_active, lim - s_l2 + 1));
           }
           for (int i = Lq_eff; i < 8; ++i) {
             softmax_len[i] = 0;
@@ -1625,49 +1354,34 @@ inline void process_q_tile_lc_packqkv(
           for (; s_off + 8 <= Sc_active; s_off += 8) {
             const int64_t s_global = s_l2 + s_off;
             const scalar_t* K_tile_orig = Krow0_orig + s_off * k_orig_stride_s;
-            const bool full_k_block = (s_global % 8 == 0)
-                                      && (s_global + 8 <= p.S);
+            const bool full_k_block = (s_global % 8 == 0) && (s_global + 8 <= p.S);
             if (Lq_eff == 8 && full_k_block) {
-              const uint16_t* K_seq = Krow0_packed
-                                      + (s_off / 8) * k_sblock_stride;
-              ::fused_cpp::sdpa_microkernels::
-                  gemm_qkt_microkernel_8x8_bf16_packqk_seq4_bmajor_inner(
-                      Q_seq_inner, Qrow_inner, q_stride_l,
-                      K_seq, K_tile_orig, k_orig_stride_s,
-                      p.E, p.scale_f, tmp_qkt);
+              const uint16_t* K_seq = Krow0_packed + (s_off / 8) * k_sblock_stride;
+              ::fused_cpp::sdpa_microkernels::gemm_qkt_microkernel_8x8_bf16_packqk_seq4_bmajor_inner(
+                  Q_seq_inner, Qrow_inner, q_stride_l, K_seq, K_tile_orig, k_orig_stride_s, p.E, p.scale_f, tmp_qkt);
               for (int i = 0; i < 8; ++i) {
-                ::fused_cpp::sdpa_pack_utils::copy_f32x8(
-                    tmp_qkt + i * 8, scores_8 + i * Sc_cur + s_off);
+                ::fused_cpp::sdpa_pack_utils::copy_f32x8(tmp_qkt + i * 8, scores_8 + i * Sc_cur + s_off);
                 if constexpr (!kHasMask && !kCausal) {
 #if FUSED_CPP_SDPA_CACHE_HAS_NEON
-                  fused_row_max_lo[i] = vmaxq_f32(
-                      fused_row_max_lo[i], vld1q_f32(tmp_qkt + i * 8));
-                  fused_row_max_hi[i] = vmaxq_f32(
-                      fused_row_max_hi[i], vld1q_f32(tmp_qkt + i * 8 + 4));
+                  fused_row_max_lo[i] = vmaxq_f32(fused_row_max_lo[i], vld1q_f32(tmp_qkt + i * 8));
+                  fused_row_max_hi[i] = vmaxq_f32(fused_row_max_hi[i], vld1q_f32(tmp_qkt + i * 8 + 4));
 #else
-                  fused_row_max[i] = max_update_impl(
-                      fused_row_max[i], tmp_qkt + i * 8, 8);
+                  fused_row_max[i] = max_update_impl(fused_row_max[i], tmp_qkt + i * 8, 8);
 #endif
                 }
               }
             } else {
               // fall back：读原始 K，调 baseline qkt_tail
-              ::fused_cpp::sdpa_microkernels::gemm_qkt_tail(
-                  Qrow_inner, q_stride_l, K_tile_orig, k_orig_stride_s,
-                  p.E, p.scale_f,
-                  scores_8 + s_off, Sc_cur,
-                  Lq_eff, 8);
+              ::fused_cpp::sdpa_microkernels::gemm_qkt_tail(Qrow_inner, q_stride_l, K_tile_orig, k_orig_stride_s, p.E,
+                                                            p.scale_f, scores_8 + s_off, Sc_cur, Lq_eff, 8);
               if constexpr (!kHasMask && !kCausal) {
                 for (int i = 0; i < Lq_eff; ++i) {
 #if FUSED_CPP_SDPA_CACHE_HAS_NEON
                   const float* row = scores_8 + i * Sc_cur + s_off;
-                  fused_row_max_lo[i] = vmaxq_f32(
-                      fused_row_max_lo[i], vld1q_f32(row));
-                  fused_row_max_hi[i] = vmaxq_f32(
-                      fused_row_max_hi[i], vld1q_f32(row + 4));
+                  fused_row_max_lo[i] = vmaxq_f32(fused_row_max_lo[i], vld1q_f32(row));
+                  fused_row_max_hi[i] = vmaxq_f32(fused_row_max_hi[i], vld1q_f32(row + 4));
 #else
-                  fused_row_max[i] = max_update_impl(
-                      fused_row_max[i], scores_8 + i * Sc_cur + s_off, 8);
+                  fused_row_max[i] = max_update_impl(fused_row_max[i], scores_8 + i * Sc_cur + s_off, 8);
 #endif
                 }
               }
@@ -1677,26 +1391,18 @@ inline void process_q_tile_lc_packqkv(
             const scalar_t* K_tile_orig = Krow0_orig + s_off * k_orig_stride_s;
             const int64_t s_start = s_off;
             if (Lq_eff == 8) {
-              ::fused_cpp::sdpa_microkernels::gemm_qkt_8x4(
-                  Qrow_inner, q_stride_l, K_tile_orig, k_orig_stride_s,
-                  p.E, p.scale_f,
-                  scores_8 + s_off, Sc_cur);
+              ::fused_cpp::sdpa_microkernels::gemm_qkt_8x4(Qrow_inner, q_stride_l, K_tile_orig, k_orig_stride_s, p.E,
+                                                           p.scale_f, scores_8 + s_off, Sc_cur);
             } else {
-              ::fused_cpp::sdpa_microkernels::gemm_qkt_tail(
-                  Qrow_inner, q_stride_l, K_tile_orig, k_orig_stride_s,
-                  p.E, p.scale_f,
-                  scores_8 + s_off, Sc_cur,
-                  Lq_eff, 4);
+              ::fused_cpp::sdpa_microkernels::gemm_qkt_tail(Qrow_inner, q_stride_l, K_tile_orig, k_orig_stride_s, p.E,
+                                                            p.scale_f, scores_8 + s_off, Sc_cur, Lq_eff, 4);
             }
             if constexpr (!kHasMask && !kCausal) {
               for (int i = 0; i < Lq_eff; ++i) {
 #if FUSED_CPP_SDPA_CACHE_HAS_NEON
-                fused_row_max_lo[i] = vmaxq_f32(
-                    fused_row_max_lo[i],
-                    vld1q_f32(scores_8 + i * Sc_cur + s_start));
+                fused_row_max_lo[i] = vmaxq_f32(fused_row_max_lo[i], vld1q_f32(scores_8 + i * Sc_cur + s_start));
 #else
-                fused_row_max[i] = max_update_impl(
-                    fused_row_max[i], scores_8 + i * Sc_cur + s_start, 4);
+                fused_row_max[i] = max_update_impl(fused_row_max[i], scores_8 + i * Sc_cur + s_start, 4);
 #endif
               }
             }
@@ -1706,16 +1412,11 @@ inline void process_q_tile_lc_packqkv(
             const scalar_t* K_tile_orig = Krow0_orig + s_off * k_orig_stride_s;
             const int64_t s_start = s_off;
             const int tail_width = static_cast<int>(Sc_active - s_off);
-            ::fused_cpp::sdpa_microkernels::gemm_qkt_tail(
-                Qrow_inner, q_stride_l, K_tile_orig, k_orig_stride_s,
-                p.E, p.scale_f,
-                scores_8 + s_off, Sc_cur,
-                Lq_eff, tail_width);
+            ::fused_cpp::sdpa_microkernels::gemm_qkt_tail(Qrow_inner, q_stride_l, K_tile_orig, k_orig_stride_s, p.E,
+                                                          p.scale_f, scores_8 + s_off, Sc_cur, Lq_eff, tail_width);
             if constexpr (!kHasMask && !kCausal) {
               for (int i = 0; i < Lq_eff; ++i) {
-                fused_row_max[i] = max_update_impl(
-                    fused_row_max[i], scores_8 + i * Sc_cur + s_start,
-                    tail_width);
+                fused_row_max[i] = max_update_impl(fused_row_max[i], scores_8 + i * Sc_cur + s_start, tail_width);
               }
             }
             s_off = Sc_cur;
@@ -1723,8 +1424,7 @@ inline void process_q_tile_lc_packqkv(
 #if FUSED_CPP_SDPA_CACHE_HAS_NEON
           if constexpr (!kHasMask && !kCausal) {
             for (int i = 0; i < Lq_eff; ++i) {
-              const float32x4_t vmax = vmaxq_f32(
-                  fused_row_max_lo[i], fused_row_max_hi[i]);
+              const float32x4_t vmax = vmaxq_f32(fused_row_max_lo[i], fused_row_max_hi[i]);
               fused_row_max[i] = std::max(fused_row_max[i], vmaxvq_f32(vmax));
             }
           }
@@ -1735,18 +1435,14 @@ inline void process_q_tile_lc_packqkv(
         if constexpr (kHasMask) {
           FUSED_CPP_SDPA_PROFILE_SCOPE(::fused_cpp::sdpa_profile::Slot::kMask);
           for (int i = 0; i < Lq_eff; ++i) {
-            const float* m_row = p.mask_ptr + b * m_stride_b
-                                            + n * m_stride_n
-                                            + (q0_inner + i) * m_stride_l
-                                            + s_l2;
+            const float* m_row = p.mask_ptr + b * m_stride_b + n * m_stride_n + (q0_inner + i) * m_stride_l + s_l2;
             float* sc_row = scores_8 + i * Sc_cur;
             float m = p.neg_inf;
             int64_t j = 0;
 #if FUSED_CPP_SDPA_CACHE_HAS_NEON
             float32x4_t vm = vdupq_n_f32(p.neg_inf);
             for (; j + 4 <= Sc_active; j += 4) {
-              float32x4_t v = vaddq_f32(vld1q_f32(sc_row + j),
-                                         vld1q_f32(m_row + j));
+              float32x4_t v = vaddq_f32(vld1q_f32(sc_row + j), vld1q_f32(m_row + j));
               vst1q_f32(sc_row + j, v);
               if constexpr (!kCausal) {
                 vm = vmaxq_f32(vm, v);
@@ -1774,11 +1470,9 @@ inline void process_q_tile_lc_packqkv(
           for (int i = 0; i < Lq_eff; ++i) {
             int64_t lim = causal_lim[qi_inner * LQ_INNER + i];
             float* sc_row = scores_8 + i * Sc_cur;
-            const int64_t valid = std::max<int64_t>(
-                0, std::min<int64_t>(Sc_active, lim - s_l2 + 1));
+            const int64_t valid = std::max<int64_t>(0, std::min<int64_t>(Sc_active, lim - s_l2 + 1));
             softmax_len[i] = valid;
-            fused_row_max[i] =
-                max_update_impl(p.neg_inf, sc_row, valid);
+            fused_row_max[i] = max_update_impl(p.neg_inf, sc_row, valid);
           }
         }
 
@@ -1808,11 +1502,9 @@ inline void process_q_tile_lc_packqkv(
                 const float* sc_row = scores_8 + i * Sc_cur;
                 at::BFloat16* p_row = p_hat_bf16_8 + i * Sc_cur;
                 const int64_t len_i = softmax_len[i];
-                float row_sum = vectorized_exp_minus_bf16_impl<kExpPolyDegree>(
-                    p_row, sc_row, new_max[i], len_i);
+                float row_sum = vectorized_exp_minus_bf16_impl<kExpPolyDegree>(p_row, sc_row, new_max[i], len_i);
                 if (len_i < Sc_cur) {
-                  std::memset(p_row + len_i, 0,
-                              sizeof(at::BFloat16) * (Sc_cur - len_i));
+                  std::memset(p_row + len_i, 0, sizeof(at::BFloat16) * (Sc_cur - len_i));
                 }
                 rsum_8[i] += row_sum;
               }
@@ -1821,11 +1513,9 @@ inline void process_q_tile_lc_packqkv(
                 const float* sc_row = scores_8 + i * Sc_cur;
                 float* p_row = p_hat_8 + i * Sc_cur;
                 const int64_t len_i = softmax_len[i];
-                float row_sum = vectorized_exp_minus_impl(
-                    p_row, sc_row, new_max[i], len_i);
+                float row_sum = vectorized_exp_minus_impl(p_row, sc_row, new_max[i], len_i);
                 if (len_i < Sc_cur) {
-                  std::memset(p_row + len_i, 0,
-                              sizeof(float) * (Sc_cur - len_i));
+                  std::memset(p_row + len_i, 0, sizeof(float) * (Sc_cur - len_i));
                 }
                 rsum_8[i] += row_sum;
               }
@@ -1839,11 +1529,9 @@ inline void process_q_tile_lc_packqkv(
               const float* sc_row = scores_8 + i * Sc_cur;
               float* p_row = p_hat_8 + i * Sc_cur;
               const int64_t len_i = softmax_len[i];
-              float row_sum = vectorized_exp_minus_impl(
-                  p_row, sc_row, new_max[i], len_i);
+              float row_sum = vectorized_exp_minus_impl(p_row, sc_row, new_max[i], len_i);
               if (len_i < Sc_cur) {
-                std::memset(p_row + len_i, 0,
-                            sizeof(float) * (Sc_cur - len_i));
+                std::memset(p_row + len_i, 0, sizeof(float) * (Sc_cur - len_i));
               }
               rsum_8[i] += row_sum;
             }
@@ -1857,57 +1545,40 @@ inline void process_q_tile_lc_packqkv(
         {
           FUSED_CPP_SDPA_PROFILE_SCOPE(::fused_cpp::sdpa_profile::Slot::kPv);
           for (int64_t ev_off = 0; ev_off < p.Ev; ev_off += 8) {
-          if (ev_off + 8 < p.Ev) {
-            const scalar_t* next_block =
-                Vbase + ((ev_off >> 3) + 1) * v_evblock_stride;
-            for (int line = 0; line < 2; ++line) {
-              prefetch_l1_keep_impl(
-                  reinterpret_cast<const char*>(next_block) + line * 64);
+            if (ev_off + 8 < p.Ev) {
+              const scalar_t* next_block = Vbase + ((ev_off >> 3) + 1) * v_evblock_stride;
+              for (int line = 0; line < 2; ++line) {
+                prefetch_l1_keep_impl(reinterpret_cast<const char*>(next_block) + line * 64);
+              }
             }
-          }
 
-          const int64_t Ev_cur = std::min<int64_t>(8, p.Ev - ev_off);
-          const scalar_t* V_tile = Vbase + (ev_off >> 3) * v_evblock_stride;
-          float* O_tile = o_acc_8 + ev_off;
+            const int64_t Ev_cur = std::min<int64_t>(8, p.Ev - ev_off);
+            const scalar_t* V_tile = Vbase + (ev_off >> 3) * v_evblock_stride;
+            float* O_tile = o_acc_8 + ev_off;
 
-          if constexpr (kPbf16PV) {
-            if (Lq_eff == 8 && Ev_cur == 8) {
-              ::fused_cpp::sdpa_microkernels::MK_QkPackqkSeq4BmajorPvPquad::
-                  pv_8x8_pbf16(
-                      p_hat_bf16_8, Sc_cur,
-                      V_tile, /*v_row_stride=*/8,
-                      Sc_active,
-                      O_tile, p.Ev);
+            if constexpr (kPbf16PV) {
+              if (Lq_eff == 8 && Ev_cur == 8) {
+                ::fused_cpp::sdpa_microkernels::MK_QkPackqkSeq4BmajorPvPquad::pv_8x8_pbf16(
+                    p_hat_bf16_8, Sc_cur, V_tile, /*v_row_stride=*/8, Sc_active, O_tile, p.Ev);
+              } else {
+                ::fused_cpp::sdpa_microkernels::MK_QkPackqkSeq4BmajorPvPquad::pv_tail(
+                    p_hat_8, Sc_cur, V_tile, /*v_row_stride=*/8, Sc_active, O_tile, p.Ev, Lq_eff,
+                    static_cast<int>(Ev_cur));
+              }
+            } else if (Lq_eff == 8 && Ev_cur == 8) {
+              // 直接调 MK_QkPackqkSeq4BmajorPvPquad 的 bf16 PV：bf16 V + bf16 PV pquad
+              // microkernel（5/29 新增 gemm_pv_microkernel_8x8_bf16_pquad，远程 +24%）。
+              // 与 packqkv 的 hardcoded QKᵀ packqk_seq4_bmajor_inner 是同一 trait 的 bf16
+              // 组合，PV 选择对齐到 trait 后语义一致；数值与 baseline gemm_pv_8x8 等价。
+              ::fused_cpp::sdpa_microkernels::MK_QkPackqkSeq4BmajorPvPquad::pv_8x8(
+                  p_hat_8, Sc_cur, V_tile, /*v_row_stride=*/8, Sc_active, O_tile, p.Ev);
             } else {
-              ::fused_cpp::sdpa_microkernels::MK_QkPackqkSeq4BmajorPvPquad::
-                  pv_tail(
-                      p_hat_8, Sc_cur,
-                      V_tile, /*v_row_stride=*/8,
-                      Sc_active,
-                      O_tile, p.Ev,
-                      Lq_eff, static_cast<int>(Ev_cur));
+              // tail（Lq_eff < 8 或 Ev_cur < 8）trait 内仍 fall through 到 baseline，
+              // 但通过 trait 入口调用便于将来切换。
+              ::fused_cpp::sdpa_microkernels::MK_QkPackqkSeq4BmajorPvPquad::pv_tail(
+                  p_hat_8, Sc_cur, V_tile, /*v_row_stride=*/8, Sc_active, O_tile, p.Ev, Lq_eff,
+                  static_cast<int>(Ev_cur));
             }
-          } else if (Lq_eff == 8 && Ev_cur == 8) {
-            // 直接调 MK_QkPackqkSeq4BmajorPvPquad 的 bf16 PV：bf16 V + bf16 PV pquad
-            // microkernel（5/29 新增 gemm_pv_microkernel_8x8_bf16_pquad，远程 +24%）。
-            // 与 packqkv 的 hardcoded QKᵀ packqk_seq4_bmajor_inner 是同一 trait 的 bf16
-            // 组合，PV 选择对齐到 trait 后语义一致；数值与 baseline gemm_pv_8x8 等价。
-            ::fused_cpp::sdpa_microkernels::MK_QkPackqkSeq4BmajorPvPquad::
-                pv_8x8(
-                    p_hat_8, Sc_cur,
-                    V_tile, /*v_row_stride=*/8,
-                    Sc_active,
-                    O_tile, p.Ev);
-          } else {
-            // tail（Lq_eff < 8 或 Ev_cur < 8）trait 内仍 fall through 到 baseline，
-            // 但通过 trait 入口调用便于将来切换。
-            ::fused_cpp::sdpa_microkernels::MK_QkPackqkSeq4BmajorPvPquad::pv_tail(
-                p_hat_8, Sc_cur,
-                V_tile, /*v_row_stride=*/8,
-                Sc_active,
-                O_tile, p.Ev,
-                Lq_eff, static_cast<int>(Ev_cur));
-          }
           }
         }
 
@@ -1916,25 +1587,22 @@ inline void process_q_tile_lc_packqkv(
           rmax_8[i] = new_max[i];
         }
       }  // qi_inner
-    }    // s_l2
-  }      // s_l3
+    }  // s_l2
+  }  // s_l3
 
   {
     FUSED_CPP_SDPA_PROFILE_SCOPE(::fused_cpp::sdpa_profile::Slot::kFinalize);
     // ── 归一化并写入 o_row（与 process_q_tile_lc 同步）──
     for (int64_t i = 0; i < Lc_eff; ++i) {
-      float* o_row = p.out_ptr + b * o_stride_b + n * o_stride_n
-                               + (q0_outer + i) * o_stride_l;
+      float* o_row = p.out_ptr + b * o_stride_b + n * o_stride_n + (q0_outer + i) * o_stride_l;
       if (p.max_logits_ptr != nullptr || p.lse_ptr != nullptr) {
         const int64_t stats_idx = b * (p.N * p.L) + n * p.L + q0_outer + i;
         if (p.max_logits_ptr != nullptr) {
           p.max_logits_ptr[stats_idx] = running_max[i];
         }
         if (p.lse_ptr != nullptr) {
-          p.lse_ptr[stats_idx] =
-              running_sum[i] > 0.0f
-                  ? running_max[i] + std::log(running_sum[i])
-                  : std::numeric_limits<float>::infinity();
+          p.lse_ptr[stats_idx] = running_sum[i] > 0.0f ? running_max[i] + std::log(running_sum[i])
+                                                       : std::numeric_limits<float>::infinity();
         }
       }
       if (running_sum[i] > 0.0f) {
@@ -1963,22 +1631,16 @@ inline void process_q_tile_lc_packqkv(
 // run_path_collapse3_packqkv：路径 A 版本（KV fits L3）
 // ──────────────────────────────────────────────────────────────────────
 
-template <bool kHasMask = false, bool kCausal  = false,
-          bool kPbf16PV = false, int kExpPolyDegree = 5>
-inline void run_path_collapse3_packqkv(
-    const at::BFloat16* q_ptr,
-    const uint16_t* k_packed_ptr,
-    const at::BFloat16* k_orig_ptr,
-    const at::BFloat16* v_packed_ptr,
-    const SdpaParams& p,
-    const TileSizes& ts,
-    int64_t q_stride_b, int64_t q_stride_n, int64_t q_stride_l,
-    int64_t k_orig_stride_b, int64_t k_orig_stride_n, int64_t k_orig_stride_s,
-    int64_t k_packed_stride_b, int64_t k_packed_stride_n, int64_t k_sblock_stride,
-    int64_t v_stride_b, int64_t v_stride_n, int64_t v_stride_s,
-    int64_t v_evblock_stride,
-    int64_t m_stride_b, int64_t m_stride_n, int64_t m_stride_l,
-    int64_t o_stride_b, int64_t o_stride_n, int64_t o_stride_l) {
+template <bool kHasMask = false, bool kCausal = false, bool kPbf16PV = false, int kExpPolyDegree = 5>
+inline void run_path_collapse3_packqkv(const at::BFloat16* q_ptr, const uint16_t* k_packed_ptr,
+                                       const at::BFloat16* k_orig_ptr, const at::BFloat16* v_packed_ptr,
+                                       const SdpaParams& p, const TileSizes& ts, int64_t q_stride_b, int64_t q_stride_n,
+                                       int64_t q_stride_l, int64_t k_orig_stride_b, int64_t k_orig_stride_n,
+                                       int64_t k_orig_stride_s, int64_t k_packed_stride_b, int64_t k_packed_stride_n,
+                                       int64_t k_sblock_stride, int64_t v_stride_b, int64_t v_stride_n,
+                                       int64_t v_stride_s, int64_t v_evblock_stride, int64_t m_stride_b,
+                                       int64_t m_stride_n, int64_t m_stride_l, int64_t o_stride_b, int64_t o_stride_n,
+                                       int64_t o_stride_l) {
   const int64_t LQ_OUTER = ts.Lc_l2;
   const int64_t num_q_tiles = ceil_div_pos(p.L, LQ_OUTER);
   const int64_t Sc_l2 = ts.Sc_l2;
@@ -1988,7 +1650,7 @@ inline void run_path_collapse3_packqkv(
   const int64_t q_seq_buf_size = num_inner_max * qblock_u16;
 
 #ifdef _OPENMP
-  #pragma omp parallel
+#pragma omp parallel
 #endif
   {
     const int64_t sc_max = std::max<int64_t>(8, Sc_l2);
@@ -2006,29 +1668,19 @@ inline void run_path_collapse3_packqkv(
     std::vector<uint16_t> q_seq_buf_vec(q_seq_buf_size);
 
 #ifdef _OPENMP
-    #pragma omp for collapse(3) schedule(static)
+#pragma omp for collapse(3) schedule(static)
 #endif
     for (int64_t b = 0; b < p.B; ++b) {
       for (int64_t n = 0; n < p.N; ++n) {
         for (int64_t qi_outer = 0; qi_outer < num_q_tiles; ++qi_outer) {
           const int64_t q0_outer = qi_outer * LQ_OUTER;
           const int64_t Lc_eff = std::min<int64_t>(LQ_OUTER, p.L - q0_outer);
-          process_q_tile_lc_packqkv<
-              kHasMask, kCausal, kPbf16PV, kExpPolyDegree>(
-              q_ptr, k_packed_ptr, k_orig_ptr, v_packed_ptr,
-              b, n, q0_outer, Lc_eff, p,
-              q_stride_b, q_stride_n, q_stride_l,
-              k_orig_stride_b, k_orig_stride_n, k_orig_stride_s,
-              k_packed_stride_b, k_packed_stride_n, k_sblock_stride,
-              v_stride_b, v_stride_n, v_stride_s,
-              v_evblock_stride,
-              m_stride_b, m_stride_n, m_stride_l,
-              o_stride_b, o_stride_n, o_stride_l,
-              ts,
-              scores_l1_vec.data(), P_hat_vec.data(), P_hat_bf16_ptr,
-              O_acc_vec.data(),
-              running_max_vec.data(), running_sum_vec.data(),
-              q_seq_buf_vec.data());
+          process_q_tile_lc_packqkv<kHasMask, kCausal, kPbf16PV, kExpPolyDegree>(
+              q_ptr, k_packed_ptr, k_orig_ptr, v_packed_ptr, b, n, q0_outer, Lc_eff, p, q_stride_b, q_stride_n,
+              q_stride_l, k_orig_stride_b, k_orig_stride_n, k_orig_stride_s, k_packed_stride_b, k_packed_stride_n,
+              k_sblock_stride, v_stride_b, v_stride_n, v_stride_s, v_evblock_stride, m_stride_b, m_stride_n, m_stride_l,
+              o_stride_b, o_stride_n, o_stride_l, ts, scores_l1_vec.data(), P_hat_vec.data(), P_hat_bf16_ptr,
+              O_acc_vec.data(), running_max_vec.data(), running_sum_vec.data(), q_seq_buf_vec.data());
         }
       }
     }
@@ -2043,23 +1695,16 @@ inline void run_path_collapse3_packqkv(
 // 开销）。本函数保留是为了对称完整，便于未来如果改主意时直接启用。
 // ──────────────────────────────────────────────────────────────────────
 
-template <bool kHasMask = false, bool kCausal  = false,
-          bool kPbf16PV = false, int kExpPolyDegree = 5>
-inline void run_path_taskloop_packqkv(
-    const at::BFloat16* q_ptr,
-    const uint16_t* k_packed_ptr,
-    const at::BFloat16* k_orig_ptr,
-    const at::BFloat16* v_packed_ptr,
-    const SdpaParams& p,
-    const TileSizes& ts,
-    int num_groups,
-    int64_t q_stride_b, int64_t q_stride_n, int64_t q_stride_l,
-    int64_t k_orig_stride_b, int64_t k_orig_stride_n, int64_t k_orig_stride_s,
-    int64_t k_packed_stride_b, int64_t k_packed_stride_n, int64_t k_sblock_stride,
-    int64_t v_stride_b, int64_t v_stride_n, int64_t v_stride_s,
-    int64_t v_evblock_stride,
-    int64_t m_stride_b, int64_t m_stride_n, int64_t m_stride_l,
-    int64_t o_stride_b, int64_t o_stride_n, int64_t o_stride_l) {
+template <bool kHasMask = false, bool kCausal = false, bool kPbf16PV = false, int kExpPolyDegree = 5>
+inline void run_path_taskloop_packqkv(const at::BFloat16* q_ptr, const uint16_t* k_packed_ptr,
+                                      const at::BFloat16* k_orig_ptr, const at::BFloat16* v_packed_ptr,
+                                      const SdpaParams& p, const TileSizes& ts, int num_groups, int64_t q_stride_b,
+                                      int64_t q_stride_n, int64_t q_stride_l, int64_t k_orig_stride_b,
+                                      int64_t k_orig_stride_n, int64_t k_orig_stride_s, int64_t k_packed_stride_b,
+                                      int64_t k_packed_stride_n, int64_t k_sblock_stride, int64_t v_stride_b,
+                                      int64_t v_stride_n, int64_t v_stride_s, int64_t v_evblock_stride,
+                                      int64_t m_stride_b, int64_t m_stride_n, int64_t m_stride_l, int64_t o_stride_b,
+                                      int64_t o_stride_n, int64_t o_stride_l) {
   const int64_t LQ_OUTER = ts.Lc_l2;
   const int64_t num_q_tiles = ceil_div_pos(p.L, LQ_OUTER);
   const int64_t Sc_l2 = ts.Sc_l2;
@@ -2085,7 +1730,7 @@ inline void run_path_taskloop_packqkv(
   std::vector<std::vector<uint16_t>> q_seq_pool(total_threads);
 
 #ifdef _OPENMP
-  #pragma omp parallel
+#pragma omp parallel
 #endif
   {
     const int tid =
@@ -2105,17 +1750,15 @@ inline void run_path_taskloop_packqkv(
     q_seq_pool[tid].assign(q_seq_buf_size, 0);
 
 #ifdef _OPENMP
-    #pragma omp barrier
-    #pragma omp single
+#pragma omp barrier
+#pragma omp single
 #endif
     {
-      const int64_t grain = std::max<int64_t>(
-          1, num_q_tiles / std::max(1, num_groups));
+      const int64_t grain = std::max<int64_t>(1, num_q_tiles / std::max(1, num_groups));
       for (int64_t b = 0; b < p.B; ++b) {
         for (int64_t n = 0; n < p.N; ++n) {
 #ifdef _OPENMP
-          #pragma omp taskloop grainsize(grain) nogroup default(shared) \
-              firstprivate(b, n)
+#pragma omp taskloop grainsize(grain) nogroup default(shared) firstprivate(b, n)
 #endif
           for (int64_t qi_outer = 0; qi_outer < num_q_tiles; ++qi_outer) {
             const int my_tid =
@@ -2130,25 +1773,13 @@ inline void run_path_taskloop_packqkv(
             if constexpr (kPbf16PV) {
               p_hat_bf16_ptr = p_hat_bf16_pool[my_tid].data();
             }
-            process_q_tile_lc_packqkv<
-                kHasMask, kCausal, kPbf16PV, kExpPolyDegree>(
-                q_ptr, k_packed_ptr, k_orig_ptr, v_packed_ptr,
-                b, n, q0_outer, Lc_eff, p,
-                q_stride_b, q_stride_n, q_stride_l,
-                k_orig_stride_b, k_orig_stride_n, k_orig_stride_s,
-                k_packed_stride_b, k_packed_stride_n, k_sblock_stride,
-                v_stride_b, v_stride_n, v_stride_s,
-                v_evblock_stride,
-                m_stride_b, m_stride_n, m_stride_l,
-                o_stride_b, o_stride_n, o_stride_l,
-                ts,
-                scores_l1_pool[my_tid].data(),
-                p_hat_pool[my_tid].data(),
-                p_hat_bf16_ptr,
-                o_acc_pool[my_tid].data(),
-                rmax_pool[my_tid].data(),
-                rsum_pool[my_tid].data(),
-                q_seq_pool[my_tid].data());
+            process_q_tile_lc_packqkv<kHasMask, kCausal, kPbf16PV, kExpPolyDegree>(
+                q_ptr, k_packed_ptr, k_orig_ptr, v_packed_ptr, b, n, q0_outer, Lc_eff, p, q_stride_b, q_stride_n,
+                q_stride_l, k_orig_stride_b, k_orig_stride_n, k_orig_stride_s, k_packed_stride_b, k_packed_stride_n,
+                k_sblock_stride, v_stride_b, v_stride_n, v_stride_s, v_evblock_stride, m_stride_b, m_stride_n,
+                m_stride_l, o_stride_b, o_stride_n, o_stride_l, ts, scores_l1_pool[my_tid].data(),
+                p_hat_pool[my_tid].data(), p_hat_bf16_ptr, o_acc_pool[my_tid].data(), rmax_pool[my_tid].data(),
+                rsum_pool[my_tid].data(), q_seq_pool[my_tid].data());
           }
         }
       }

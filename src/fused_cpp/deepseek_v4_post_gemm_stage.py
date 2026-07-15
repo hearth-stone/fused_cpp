@@ -25,8 +25,7 @@ import torch
 import torch.nn.functional as F
 
 from fused_cpp.deepseek_v4_attn_gemm_fused import (
-    fused_wqa_wkv_compressor_kv_score_indexer_compressor_kv_score_indexer_weights_proj_fused_prepare
-    as _prepare_attn_gemm_weight,
+    fused_wqa_wkv_compressor_kv_score_indexer_compressor_kv_score_indexer_weights_proj_fused_prepare as _prepare_attn_gemm_weight,
 )
 from fused_cpp.bf16_linear import (
     PreparedBF16LinearWeight,
@@ -273,12 +272,10 @@ def _save_partial_states(
     block_idx = valid_slots // block_size
     pos_in_block = valid_slots % block_size
     ape_rows = (positions[valid].to(torch.int64) % state.compress_ratio).clamp_min(0)
-    state.state_cache[block_idx, pos_in_block, :state_width] = kv[valid].to(
+    state.state_cache[block_idx, pos_in_block, :state_width] = kv[valid].to(state.state_cache.dtype)
+    state.state_cache[block_idx, pos_in_block, state_width:] = (score[valid] + state.ape[ape_rows]).to(
         state.state_cache.dtype
     )
-    state.state_cache[block_idx, pos_in_block, state_width:] = (
-        score[valid] + state.ape[ape_rows]
-    ).to(state.state_cache.dtype)
 
 
 def _kv_compress_norm_rope_insert(
@@ -321,9 +318,7 @@ def _kv_compress_norm_rope_insert(
         for t in range(window):
             p = start + t
             if p < 0:
-                kv_rows.append(
-                    torch.zeros(head_dim, dtype=torch.float32, device=state.state_cache.device)
-                )
+                kv_rows.append(torch.zeros(head_dim, dtype=torch.float32, device=state.state_cache.device))
                 score_rows.append(
                     torch.full(
                         (head_dim,),
@@ -357,9 +352,7 @@ def _kv_compress_norm_rope_insert(
         normed = compressed * torch.rsqrt(compressed.pow(2).mean() + state.rms_norm_eps) * rms_w
         compressed_pos = (position // state.compress_ratio) * state.compress_ratio
         rotated = _gptj_rope_apply(normed, cos_sin_cache, compressed_pos, rope_head_dim)
-        state.kv_cache[kv_slot // kv_block_size, kv_slot % kv_block_size] = rotated.to(
-            state.kv_cache.dtype
-        )
+        state.kv_cache[kv_slot // kv_block_size, kv_slot % kv_block_size] = rotated.to(state.kv_cache.dtype)
 
 
 def _run_compressor(
@@ -526,6 +519,7 @@ def prepare_deepseek_v4_post_gemm_weights(
     indexer_wq_b_weight: torch.Tensor | None = None,
 ) -> PreparedDeepSeekV4PostGemmWeights:
     """Prepack post-GEMM bf16 linear weights for repeated prefill calls."""
+
     def prepare_weight(weight: torch.Tensor) -> PreparedBF16LinearWeight:
         packed, k, n = _prepare_attn_gemm_weight(weight.t().contiguous())
         k_pad = ((int(k) + 7) // 8) * 8
@@ -539,11 +533,7 @@ def prepare_deepseek_v4_post_gemm_weights(
 
     return PreparedDeepSeekV4PostGemmWeights(
         main_wq_b=prepare_weight(main_wq_b_weight),
-        indexer_wq_b=(
-            prepare_weight(indexer_wq_b_weight)
-            if indexer_wq_b_weight is not None
-            else None
-        ),
+        indexer_wq_b=(prepare_weight(indexer_wq_b_weight) if indexer_wq_b_weight is not None else None),
     )
 
 
@@ -555,8 +545,7 @@ def post_gemm_parallel_stage_cpp_prepacked(
     selected_weights = weights if weights is not None else inputs.prepared_weights
     if selected_weights is None:
         raise RuntimeError(
-            "post_gemm_parallel_stage_cpp_prepacked requires weights from "
-            "prepare_deepseek_v4_post_gemm_weights"
+            "post_gemm_parallel_stage_cpp_prepacked requires weights from prepare_deepseek_v4_post_gemm_weights"
         )
     variant = inputs.variant()
 
@@ -683,9 +672,7 @@ def post_gemm_parallel_stage_cpp(
         return post_gemm_parallel_stage_cpp_prepacked(inputs, inputs.prepared_weights)
     if _HAS_DEEPSEEK_V4_POST_GEMM_STAGE_PREPACKED:
         indexer_wq_b_weight = (
-            _require(inputs.indexer_wq_b_weight, "indexer_wq_b_weight")
-            if inputs.variant() == "c4a"
-            else None
+            _require(inputs.indexer_wq_b_weight, "indexer_wq_b_weight") if inputs.variant() == "c4a" else None
         )
         weights = prepare_deepseek_v4_post_gemm_weights(
             inputs.main_wq_b_weight,

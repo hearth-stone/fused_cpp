@@ -24,6 +24,7 @@ Usage:
       --iters 200000 --warmup 5000
   python benchmarks/bench_microkernel_l1.py --E 1024 --Sk 1024
 """
+
 from __future__ import annotations
 
 import argparse
@@ -142,9 +143,7 @@ def run_one_dtype(
     Sk_override: int,
 ) -> None:
     E = E_override if E_override > 0 else derive_E(l1_bytes, sizeof_elt, target_frac)
-    Sk = Sk_override if Sk_override > 0 else derive_Sk(
-        l1_bytes, sizeof_elt, target_frac
-    )
+    Sk = Sk_override if Sk_override > 0 else derive_Sk(l1_bytes, sizeof_elt, target_frac)
 
     ws_qkt = 16 * E * sizeof_elt + 256
     ws_pv = (32 + 8 * sizeof_elt) * Sk + 256
@@ -162,11 +161,11 @@ def run_one_dtype(
     r = _C.benchmark_microkernel(impl, dtype, E, Sk, iters, warmup)
 
     rows: List[Tuple[str, int, int, int, float, float]] = [
-        ("qkt_8x8",  8, 8, E,  r["qkt_8x8_us"],  r["qkt_8x8_gflops"]),
-        ("qkt_8x4",  8, 4, E,  r["qkt_8x4_us"],  r["qkt_8x4_gflops"]),
-        ("qkt_tail", 5, 3, E,  r["qkt_tail_us"], r["qkt_tail_gflops"]),
-        ("pv_8x8",   8, 8, Sk, r["pv_8x8_us"],   r["pv_8x8_gflops"]),
-        ("pv_tail",  5, 3, Sk, r["pv_tail_us"],  r["pv_tail_gflops"]),
+        ("qkt_8x8", 8, 8, E, r["qkt_8x8_us"], r["qkt_8x8_gflops"]),
+        ("qkt_8x4", 8, 4, E, r["qkt_8x4_us"], r["qkt_8x4_gflops"]),
+        ("qkt_tail", 5, 3, E, r["qkt_tail_us"], r["qkt_tail_gflops"]),
+        ("pv_8x8", 8, 8, Sk, r["pv_8x8_us"], r["pv_8x8_gflops"]),
+        ("pv_tail", 5, 3, Sk, r["pv_tail_us"], r["pv_tail_gflops"]),
     ]
     print(
         f"  {'op':<10}{'M':>4}{'N':>4}{'K':>8}"
@@ -177,53 +176,60 @@ def run_one_dtype(
         flops = _microkernel_flops(M, N, K)
         bytes_per_call = _microkernel_bytes(op, M, N, K, sizeof_elt)
         ai = _arithmetic_intensity(flops, bytes_per_call)
-        print(
-            f"  {op:<10}{M:>4}{N:>4}{K:>8}"
-            f"{flops:>14}{bytes_per_call:>14}{ai:>12.4f}"
-            f"{us:>14.4f}{gflops:>12.2f}"
-        )
+        print(f"  {op:<10}{M:>4}{N:>4}{K:>8}{flops:>14}{bytes_per_call:>14}{ai:>12.4f}{us:>14.4f}{gflops:>12.2f}")
     print()
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description=(
-            "L1-resident microkernel throughput benchmark for "
-            "fused_cpp._C.benchmark_microkernel"
-        )
+        description=("L1-resident microkernel throughput benchmark for fused_cpp._C.benchmark_microkernel")
     )
     parser.add_argument(
-        "--impl", default="baseline",
-        help="microkernel impl name (default: baseline). "
-        "Use _C.list_microkernel_impls() to list all enabled impls.",
+        "--impl",
+        default="baseline",
+        help="microkernel impl name (default: baseline). Use _C.list_microkernel_impls() to list all enabled impls.",
     )
     parser.add_argument(
-        "--dtypes", nargs="+", default=["bf16", "fp32"],
+        "--dtypes",
+        nargs="+",
+        default=["bf16", "fp32"],
         choices=["bf16", "bfloat16", "fp32", "float32", "float"],
         help="dtypes to sweep (default: bf16 fp32)",
     )
     parser.add_argument(
-        "--target-frac", type=float, default=0.5,
+        "--target-frac",
+        type=float,
+        default=0.5,
         help="working set / L1d ratio used to derive E and Sk (default 0.5)",
     )
     parser.add_argument(
-        "--iters", type=int, default=100_000,
+        "--iters",
+        type=int,
+        default=100_000,
         help="benchmark iterations per op (default 100k)",
     )
     parser.add_argument(
-        "--warmup", type=int, default=2_000,
+        "--warmup",
+        type=int,
+        default=2_000,
         help="warmup iterations per op (default 2k)",
     )
     parser.add_argument(
-        "--E", type=int, default=0,
+        "--E",
+        type=int,
+        default=0,
         help="override head_dim E (0 = auto from L1)",
     )
     parser.add_argument(
-        "--Sk", type=int, default=0,
+        "--Sk",
+        type=int,
+        default=0,
         help="override Sk for pv_* (0 = auto from L1)",
     )
     parser.add_argument(
-        "--l1-bytes", type=int, default=0,
+        "--l1-bytes",
+        type=int,
+        default=0,
         help="override detected L1d size (0 = auto)",
     )
     args = parser.parse_args()
@@ -238,9 +244,7 @@ def main() -> None:
     )
 
     if args.impl not in impls:
-        raise SystemExit(
-            f"impl '{args.impl}' not registered; available: {impls}"
-        )
+        raise SystemExit(f"impl '{args.impl}' not registered; available: {impls}")
 
     for dt in args.dtypes:
         sizeof_elt = 2 if dt in ("bf16", "bfloat16") else 4

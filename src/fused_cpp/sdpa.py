@@ -19,6 +19,7 @@
 新增 SDPA 变种只需通过 :func:`register_sdpa_version` 装饰器注册即可，
 框架本身**不感知**具体内核实现，详见 :mod:`fused_cpp.sdpa_registry`。
 """
+
 import logging
 import math
 from typing import Optional
@@ -41,6 +42,7 @@ try:
         scaled_dot_product_attention_versioned as _cpp_sdpa_versioned,
         list_sdpa_versions as _cpp_list_sdpa_versions,
     )
+
     _HAS_CPP_SDPA = True
 except ImportError:
     _HAS_CPP_SDPA = False
@@ -50,9 +52,7 @@ except ImportError:
     def _cpp_list_sdpa_versions():  # type: ignore[no-redef]
         return []
 
-    logger.info(
-        "fused_cpp C++ SDPA 扩展不可用，将回退到 PyTorch 原生实现"
-    )
+    logger.info("fused_cpp C++ SDPA 扩展不可用，将回退到 PyTorch 原生实现")
 
 # ``torch.nn.attention.sdpa_kernel`` 与 ``SDPBackend`` 在 PyTorch 2.3+
 # 提供；旧版本不存在时 ``pytorch_sdpa_math`` 会降级为“不限定后端”
@@ -60,15 +60,13 @@ except ImportError:
 try:
     from torch.nn.attention import SDPBackend as _SDPBackend  # type: ignore
     from torch.nn.attention import sdpa_kernel as _sdpa_kernel  # type: ignore
+
     _HAS_SDP_BACKEND_API = True
 except ImportError:  # pragma: no cover - 只在 torch < 2.3 出现
     _SDPBackend = None  # type: ignore[assignment]
     _sdpa_kernel = None  # type: ignore[assignment]
     _HAS_SDP_BACKEND_API = False
-    logger.info(
-        "torch.nn.attention.sdpa_kernel API 不可用，"
-        "pytorch_sdpa_math 将回退到默认后端选择"
-    )
+    logger.info("torch.nn.attention.sdpa_kernel API 不可用，pytorch_sdpa_math 将回退到默认后端选择")
 
 __all__ = [
     "VersionInfo",
@@ -81,6 +79,7 @@ __all__ = [
 
 
 # ── 默认入口（向后兼容，行为零回归）────────────────────────────────────
+
 
 def scaled_dot_product_attention(
     query: torch.Tensor,
@@ -108,12 +107,20 @@ def scaled_dot_product_attention(
     """
     if _HAS_CPP_SDPA:
         return _cpp_sdpa(
-            query, key, value,
-            attn_mask, dropout_p, is_causal, scale, enable_gqa,
+            query,
+            key,
+            value,
+            attn_mask,
+            dropout_p,
+            is_causal,
+            scale,
+            enable_gqa,
         )
 
     return F.scaled_dot_product_attention(
-        query, key, value,
+        query,
+        key,
+        value,
         attn_mask=attn_mask,
         dropout_p=dropout_p,
         is_causal=is_causal,
@@ -184,7 +191,9 @@ def _pytorch_sdpa(
     offset **不一致**）。等价性测试中应避免该组合直接互比。
     """
     return F.scaled_dot_product_attention(
-        query, key, value,
+        query,
+        key,
+        value,
         attn_mask=attn_mask,
         is_causal=is_causal,
         scale=scale,
@@ -219,10 +228,7 @@ register_sdpa_version(
     supports_causal=True,
     supports_attn_mask=True,
     supports_mla_shape=True,
-    description=(
-        "Direct call to torch.nn.functional.scaled_dot_product_attention; "
-        "the official PyTorch baseline."
-    ),
+    description=("Direct call to torch.nn.functional.scaled_dot_product_attention; the official PyTorch baseline."),
     tags=("baseline", "python_fallback"),
 )(_pytorch_sdpa)
 
@@ -253,19 +259,20 @@ def _pytorch_sdpa_math(
     if _HAS_SDP_BACKEND_API:
         with _sdpa_kernel(_SDPBackend.MATH):
             return F.scaled_dot_product_attention(
-                query, key, value,
+                query,
+                key,
+                value,
                 attn_mask=attn_mask,
                 is_causal=is_causal,
                 scale=scale,
             )
     # 旧版 PyTorch 不提供 sdpa_kernel；退为默认后端调用 + 一条 warning，
     # 避免静默失去“MATH 后端”语义。
-    logger.warning(
-        "pytorch_sdpa_math: torch.nn.attention.sdpa_kernel 不可用，"
-        "本次调用将使用 PyTorch 默认后端选择"
-    )
+    logger.warning("pytorch_sdpa_math: torch.nn.attention.sdpa_kernel 不可用，本次调用将使用 PyTorch 默认后端选择")
     return F.scaled_dot_product_attention(
-        query, key, value,
+        query,
+        key,
+        value,
         attn_mask=attn_mask,
         is_causal=is_causal,
         scale=scale,
@@ -537,8 +544,14 @@ def _make_cpp_callable(version_name: str):
     ) -> torch.Tensor:
         if _HAS_CPP_SDPA:
             return _cpp_sdpa_versioned(
-                query, key, value,
-                attn_mask, 0.0, is_causal, scale, False,
+                query,
+                key,
+                value,
+                attn_mask,
+                0.0,
+                is_causal,
+                scale,
+                False,
                 version_name,
             )
         # 降级到同名 Python fallback（若存在）
@@ -548,15 +561,23 @@ def _make_cpp_callable(version_name: str):
             info = None
         if info is not None and info.source == "python":
             return info.callable(
-                query, key, value,
-                attn_mask=attn_mask, is_causal=is_causal, scale=scale,
+                query,
+                key,
+                value,
+                attn_mask=attn_mask,
+                is_causal=is_causal,
+                scale=scale,
             )
         # 降级到 naive_torch 作为最后兜底
         try:
             info = get_sdpa_version("naive_torch")
             return info.callable(
-                query, key, value,
-                attn_mask=attn_mask, is_causal=is_causal, scale=scale,
+                query,
+                key,
+                value,
+                attn_mask=attn_mask,
+                is_causal=is_causal,
+                scale=scale,
             )
         except KeyError:
             raise RuntimeError(
@@ -638,31 +659,19 @@ def sdpa_versioned(
     :raises ValueError: ``version`` 未注册；错误信息会列出当前可用版本。
     """
     if dropout_p != 0.0:
-        logger.warning(
-            "sdpa_versioned: dropout_p=%s ignored (inference only)", dropout_p
-        )
+        logger.warning("sdpa_versioned: dropout_p=%s ignored (inference only)", dropout_p)
     try:
         info = get_sdpa_version(version)
     except KeyError:
         avail = sorted(v.name for v in available_sdpa_versions())
-        raise ValueError(
-            f"sdpa_versioned: version={version!r} is not registered; "
-            f"available versions: {avail}"
-        )
+        raise ValueError(f"sdpa_versioned: version={version!r} is not registered; available versions: {avail}")
 
     with torch.no_grad():
         return info.callable(
-            query, key, value,
+            query,
+            key,
+            value,
             attn_mask=attn_mask,
             is_causal=is_causal,
             scale=scale,
         )
-
-    return F.scaled_dot_product_attention(
-        query, key, value,
-        attn_mask=attn_mask,
-        dropout_p=dropout_p,
-        is_causal=is_causal,
-        scale=scale,
-        enable_gqa=enable_gqa,
-    )

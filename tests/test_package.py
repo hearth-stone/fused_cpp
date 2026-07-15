@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """Tests for package importability, constructor signature, and set_attn_impl."""
-import pytest
+
 import torch
 
 

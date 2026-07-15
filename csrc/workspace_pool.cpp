@@ -22,14 +22,11 @@ bool EnvDisabled() {
   if (value == nullptr) {
     return false;
   }
-  return std::strcmp(value, "0") == 0 || std::strcmp(value, "false") == 0 ||
-      std::strcmp(value, "FALSE") == 0 || std::strcmp(value, "off") == 0 ||
-      std::strcmp(value, "OFF") == 0;
+  return std::strcmp(value, "0") == 0 || std::strcmp(value, "false") == 0 || std::strcmp(value, "FALSE") == 0 ||
+         std::strcmp(value, "off") == 0 || std::strcmp(value, "OFF") == 0;
 }
 
-std::size_t RoundUp(std::size_t value, std::size_t align) {
-  return (value + align - 1) / align * align;
-}
+std::size_t RoundUp(std::size_t value, std::size_t align) { return (value + align - 1) / align * align; }
 
 std::size_t DTypeBytes(at::ScalarType dtype) {
   switch (dtype) {
@@ -56,8 +53,7 @@ std::size_t Numel(at::IntArrayRef sizes) {
   for (int64_t dim : sizes) {
     TORCH_CHECK(dim >= 0, "workspace tensor dimension must be non-negative");
     const auto u = static_cast<std::size_t>(dim);
-    TORCH_CHECK(u == 0 || n <= std::numeric_limits<std::size_t>::max() / u,
-                "workspace tensor numel overflow");
+    TORCH_CHECK(u == 0 || n <= std::numeric_limits<std::size_t>::max() / u, "workspace tensor numel overflow");
     n *= u;
   }
   return n;
@@ -107,8 +103,7 @@ struct Slab {
   Slab() = default;
   Slab(const Slab&) = delete;
   Slab& operator=(const Slab&) = delete;
-  Slab(Slab&& other) noexcept
-      : ptr(other.ptr), capacity(other.capacity), offset(other.offset) {
+  Slab(Slab&& other) noexcept : ptr(other.ptr), capacity(other.capacity), offset(other.offset) {
     other.ptr = nullptr;
     other.capacity = 0;
     other.offset = 0;
@@ -190,15 +185,12 @@ class WorkspacePoolImpl {
     Slab slab;
     slab.capacity = RoundUp(bytes, kHugePageBytes);
 #if defined(__unix__) || defined(__APPLE__)
-    slab.ptr = mmap(nullptr, slab.capacity, PROT_READ | PROT_WRITE,
-                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    TORCH_CHECK(slab.ptr != MAP_FAILED, "workspace mmap failed for ",
-                slab.capacity, " bytes");
+    slab.ptr = mmap(nullptr, slab.capacity, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    TORCH_CHECK(slab.ptr != MAP_FAILED, "workspace mmap failed for ", slab.capacity, " bytes");
     PreferHugePages(slab.ptr, slab.capacity);
 #else
     slab.ptr = std::aligned_alloc(kHugePageBytes, slab.capacity);
-    TORCH_CHECK(slab.ptr != nullptr, "workspace aligned_alloc failed for ",
-                slab.capacity, " bytes");
+    TORCH_CHECK(slab.ptr != nullptr, "workspace aligned_alloc failed for ", slab.capacity, " bytes");
 #endif
     Prefault(slab.ptr, slab.capacity);
     CollapseHugePages(slab.ptr, slab.capacity);
@@ -218,14 +210,11 @@ class WorkspacePool {
   WorkspacePoolImpl& impl() { return GlobalPool(); }
 };
 
-WorkspaceLease::WorkspaceLease(WorkspacePool& pool)
-    : pool_(pool), lock_(pool_.impl().mu) {
+WorkspaceLease::WorkspaceLease(WorkspacePool& pool) : pool_(pool), lock_(pool_.impl().mu) {
   pool_.impl().reset_offsets();
 }
 
-WorkspaceLease::~WorkspaceLease() {
-  pool_.impl().reset_offsets();
-}
+WorkspaceLease::~WorkspaceLease() { pool_.impl().reset_offsets(); }
 
 void* WorkspaceLease::alloc_bytes(std::size_t bytes, std::size_t alignment) {
   TORCH_CHECK(!EnvDisabled(),
@@ -234,8 +223,7 @@ void* WorkspaceLease::alloc_bytes(std::size_t bytes, std::size_t alignment) {
   return pool_.impl().alloc(bytes, alignment);
 }
 
-at::Tensor WorkspaceLease::empty(at::IntArrayRef sizes, at::TensorOptions options,
-                                 std::size_t alignment) {
+at::Tensor WorkspaceLease::empty(at::IntArrayRef sizes, at::TensorOptions options, std::size_t alignment) {
   TORCH_CHECK(options.device().is_cpu(), "workspace tensors must be CPU tensors");
   const at::ScalarType dtype = options.dtype().toScalarType();
   const std::size_t bytes = Numel(sizes) * DTypeBytes(dtype);
@@ -254,20 +242,12 @@ WorkspaceLease acquire() {
   return WorkspaceLease(pool);
 }
 
-bool enabled() {
-  return !EnvDisabled();
-}
+bool enabled() { return !EnvDisabled(); }
 
-std::size_t capacity_bytes() {
-  return GlobalPool().capacity_bytes();
-}
+std::size_t capacity_bytes() { return GlobalPool().capacity_bytes(); }
 
-std::size_t high_water_bytes() {
-  return GlobalPool().high_water;
-}
+std::size_t high_water_bytes() { return GlobalPool().high_water; }
 
-void reset_stats() {
-  GlobalPool().high_water = 0;
-}
+void reset_stats() { GlobalPool().high_water = 0; }
 
 }  // namespace fused_cpp::workspace

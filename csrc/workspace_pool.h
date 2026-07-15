@@ -21,8 +21,7 @@ class WorkspaceLease {
   ~WorkspaceLease();
 
   void* alloc_bytes(std::size_t bytes, std::size_t alignment = 64);
-  at::Tensor empty(at::IntArrayRef sizes, at::TensorOptions options,
-                   std::size_t alignment = 64);
+  at::Tensor empty(at::IntArrayRef sizes, at::TensorOptions options, std::size_t alignment = 64);
 
  private:
   WorkspacePool& pool_;

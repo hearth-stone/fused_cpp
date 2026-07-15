@@ -72,9 +72,7 @@ def load_histograms(path: Path | None, total_routes: int, experts: int) -> dict:
         histograms = {}
         for name, raw_values in payload["histograms"].items():
             if not isinstance(raw_values, list) or len(raw_values) != experts:
-                raise ValueError(
-                    f"routing histogram {name!r} must contain {experts} counts"
-                )
+                raise ValueError(f"routing histogram {name!r} must contain {experts} counts")
             values = [int(value) for value in raw_values]
             if any(value < 0 for value in values):
                 raise ValueError(f"routing histogram {name!r} contains negatives")
@@ -201,12 +199,8 @@ def worker(args: argparse.Namespace) -> int:
     local_experts = 64 if args.mode == "tp" else 32
 
     generator = torch.Generator().manual_seed(args.seed + args.rank)
-    w13 = torch.empty(
-        (local_experts, 2 * ffn, 4096), dtype=torch.bfloat16
-    ).normal_(0.0, 0.01, generator=generator)
-    w2 = torch.empty(
-        (local_experts, 4096, ffn), dtype=torch.bfloat16
-    ).normal_(0.0, 0.01, generator=generator)
+    w13 = torch.empty((local_experts, 2 * ffn, 4096), dtype=torch.bfloat16).normal_(0.0, 0.01, generator=generator)
+    w2 = torch.empty((local_experts, 4096, ffn), dtype=torch.bfloat16).normal_(0.0, 0.01, generator=generator)
     packed = prepare_fused_moe_bf16_tiled_weights(w13, w2, fuse_silu=True)
     del w13, w2
 
@@ -262,24 +256,13 @@ def worker(args: argparse.Namespace) -> int:
 
         total_routes = sum(counts)
         if total_routes % args.top_k:
-            raise ValueError(
-                f"local routes {total_routes} are not divisible by "
-                f"top_k={args.top_k}"
-            )
+            raise ValueError(f"local routes {total_routes} are not divisible by top_k={args.top_k}")
         tokens = total_routes // args.top_k
-        hidden = torch.empty((tokens, 4096), dtype=torch.bfloat16).normal_(
-            0.0, 0.01, generator=generator
-        )
+        hidden = torch.empty((tokens, 4096), dtype=torch.bfloat16).normal_(0.0, 0.01, generator=generator)
         ids = torch.cat(
-            [
-                torch.full((routes,), expert, dtype=torch.int32)
-                for expert, routes in enumerate(counts)
-                if routes
-            ]
+            [torch.full((routes,), expert, dtype=torch.int32) for expert, routes in enumerate(counts) if routes]
         ).reshape(tokens, args.top_k)
-        weights = torch.full(
-            (tokens, args.top_k), 1.0 / args.top_k, dtype=torch.float32
-        )
+        weights = torch.full((tokens, args.top_k), 1.0 / args.top_k, dtype=torch.float32)
         calls = {
             candidate["key"]: build_call(
                 torch,
@@ -406,9 +389,7 @@ def run_pair(args: argparse.Namespace, mode: str) -> dict:
                     command.extend(("--force-shape", args.force_shape))
                     command.extend(("--force-split", str(args.force_split)))
                 if args.stage_trace_dir is not None:
-                    trace_file = (
-                        args.stage_trace_dir / f"{mode}_rank{rank}.log"
-                    )
+                    trace_file = args.stage_trace_dir / f"{mode}_rank{rank}.log"
                     command.extend(("--stage-trace-file", str(trace_file)))
                 if args.routes_json is not None:
                     command.extend(("--routes-json", str(args.routes_json)))
@@ -426,10 +407,7 @@ def run_pair(args: argparse.Namespace, mode: str) -> dict:
                 for rank, process in enumerate(processes):
                     if process.poll() is not None and rank not in connections:
                         stdout, stderr = process.communicate()
-                        raise RuntimeError(
-                            f"{mode} rank{rank} failed before connecting:\n"
-                            f"{stdout}\n{stderr}"
-                        )
+                        raise RuntimeError(f"{mode} rank{rank} failed before connecting:\n{stdout}\n{stderr}")
                 try:
                     connection, _ = server.accept()
                 except TimeoutError:
@@ -455,9 +433,7 @@ def run_pair(args: argparse.Namespace, mode: str) -> dict:
             for rank, process in enumerate(processes):
                 stdout, stderr = process.communicate(timeout=1800.0)
                 if process.returncode:
-                    raise RuntimeError(
-                        f"{mode} rank{rank} failed:\n{stdout}\n{stderr}"
-                    )
+                    raise RuntimeError(f"{mode} rank{rank} failed:\n{stdout}\n{stderr}")
                 worker_results.append(json.loads(outputs[rank].read_text()))
         finally:
             server.close()
@@ -473,34 +449,17 @@ def run_pair(args: argparse.Namespace, mode: str) -> dict:
         rows = []
         for key in rank_cases[0]["candidates"]:
             entries = [case["candidates"][key] for case in rank_cases]
-            paired = [
-                max(left, right)
-                for left, right in zip(
-                    entries[0]["samples_ns"], entries[1]["samples_ns"]
-                )
-            ]
+            paired = [max(left, right) for left, right in zip(entries[0]["samples_ns"], entries[1]["samples_ns"])]
             row = {
                 "key": key,
-                "rank_plans": [
-                    {"split": entry["split"], "shape": entry["shape"]}
-                    for entry in entries
-                ],
+                "rank_plans": [{"split": entry["split"], "shape": entry["shape"]} for entry in entries],
                 "predicted_ns": max(entry["predicted_ns"] for entry in entries),
                 "median_ns": statistics.median(paired),
                 "p10_ns": percentile(paired, 0.10),
                 "p90_ns": percentile(paired, 0.90),
-                "rank_median_ns": [
-                    statistics.median(entry["samples_ns"])
-                    for entry in entries
-                ],
-                "rank_p10_ns": [
-                    percentile(entry["samples_ns"], 0.10)
-                    for entry in entries
-                ],
-                "rank_p90_ns": [
-                    percentile(entry["samples_ns"], 0.90)
-                    for entry in entries
-                ],
+                "rank_median_ns": [statistics.median(entry["samples_ns"]) for entry in entries],
+                "rank_p10_ns": [percentile(entry["samples_ns"], 0.10) for entry in entries],
+                "rank_p90_ns": [percentile(entry["samples_ns"], 0.90) for entry in entries],
             }
             if args.noise_only:
                 row["samples_ns"] = paired
@@ -511,9 +470,7 @@ def run_pair(args: argparse.Namespace, mode: str) -> dict:
         raw_regret = selected["median_ns"] / best["median_ns"] - 1.0
         selected["raw_regret"] = raw_regret
         selected["regret"] = max(raw_regret, 0.0)
-        selected["prediction_error"] = (
-            selected["predicted_ns"] / selected["median_ns"] - 1.0
-        )
+        selected["prediction_error"] = selected["predicted_ns"] / selected["median_ns"] - 1.0
         merged["cases"][case_name] = {
             "rank_histograms": [case["histogram"] for case in rank_cases],
             "best_fixed": best,
@@ -532,15 +489,12 @@ def print_summary(result: dict) -> None:
     for name, case in result["cases"].items():
         selected = case["selected"]
         best = case["best_fixed"]
-        plans = "/".join(
-            f"{'S' if plan['split'] else 'N'}:{tuple(plan['shape'])}"
-            for plan in selected["rank_plans"]
-        )
+        plans = "/".join(f"{'S' if plan['split'] else 'N'}:{tuple(plan['shape'])}" for plan in selected["rank_plans"])
         print(
-            f"{name:<10} {plans:<48} {selected['predicted_ns']/1e6:9.3f} "
-            f"{selected['median_ns']/1e6:10.3f} {best['median_ns']/1e6:9.3f} "
-            f"{selected['regret']*100:7.2f}% "
-            f"{selected['prediction_error']*100:+7.2f}%"
+            f"{name:<10} {plans:<48} {selected['predicted_ns'] / 1e6:9.3f} "
+            f"{selected['median_ns'] / 1e6:10.3f} {best['median_ns'] / 1e6:9.3f} "
+            f"{selected['regret'] * 100:7.2f}% "
+            f"{selected['prediction_error'] * 100:+7.2f}%"
         )
 
 

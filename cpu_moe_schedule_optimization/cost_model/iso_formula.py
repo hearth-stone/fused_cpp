@@ -83,9 +83,7 @@ class IsoFormula:
         self._rs = [route for route, _ in self._cr]
         self._cv = [value for _, value in self._cr]
 
-        self._phi = sorted(
-            (int(threads), float(value)) for threads, value in phi_pts
-        )
+        self._phi = sorted((int(threads), float(value)) for threads, value in phi_pts)
         if not self._phi or self._phi[0][0] != 1:
             raise ValueError("phi calibration must include threads=1")
         self.min_threads = self._phi[0][0]
@@ -95,35 +93,23 @@ class IsoFormula:
         for threads, measured in self._phi:
             baseline = self._phi_usl(threads)
             if baseline <= 0.0:
-                raise ValueError(
-                    f"fitted USL baseline phi({threads})={baseline} is non-positive"
-                )
+                raise ValueError(f"fitted USL baseline phi({threads})={baseline} is non-positive")
             self._pk.append(measured / baseline)
 
-    def O(self, threads: float) -> float:
+    def O(self, threads: float) -> float:  # noqa: E743 - mathematical O(t) term
         if threads <= 0:
             raise ValueError(f"threads must be positive, got {threads}")
         return max(self.o0 + self.o1 / threads, 0.0)
 
     def _phi_usl(self, threads: float) -> float:
-        return (
-            1.0
-            + self.alpha * (threads - 1.0)
-            + self.beta * threads * (threads - 1.0)
-        ) / threads
+        return (1.0 + self.alpha * (threads - 1.0) + self.beta * threads * (threads - 1.0)) / threads
 
     def phi_baseline(self, threads: float) -> float:
         if threads < self.min_threads or threads > self.max_threads:
-            raise ValueError(
-                f"threads={threads} is outside calibrated domain "
-                f"[{self.min_threads}, {self.max_threads}]"
-            )
+            raise ValueError(f"threads={threads} is outside calibrated domain [{self.min_threads}, {self.max_threads}]")
         value = self._phi_usl(threads)
         if value <= 0.0:
-            raise ValueError(
-                f"fitted phi({threads})={value} is non-positive inside the "
-                "calibration domain"
-            )
+            raise ValueError(f"fitted phi({threads})={value} is non-positive inside the calibration domain")
         return value
 
     def _phi_correction(self, threads: float) -> float:
@@ -135,11 +121,7 @@ class IsoFormula:
         if self._pt[index] == threads:
             return self._pk[index]
         t0, t1 = self._pt[index - 1], self._pt[index]
-        return self._pk[index - 1] + (
-            (self._pk[index] - self._pk[index - 1])
-            * (threads - t0)
-            / (t1 - t0)
-        )
+        return self._pk[index - 1] + ((self._pk[index] - self._pk[index - 1]) * (threads - t0) / (t1 - t0))
 
     def phi(self, threads: float) -> float:
         """Return USL scaling with a route-independent measured correction."""
@@ -157,11 +139,7 @@ class IsoFormula:
         if points[index] == threads:
             return values[index]
         t0, t1 = points[index - 1], points[index]
-        return values[index - 1] + (
-            (values[index] - values[index - 1])
-            * (threads - t0)
-            / (t1 - t0)
-        )
+        return values[index - 1] + ((values[index] - values[index - 1]) * (threads - t0) / (t1 - t0))
 
     def C(self, routes: float) -> float:
         """Interpolate single-thread route work; extrapolate linearly at ends."""
@@ -227,16 +205,15 @@ def fit_from_measurements(
 
     overhead_by_thread: dict[int, float] = {}
     for team in threads:
-        small = sorted(
-            (route, iso[(route, team)])
-            for route in routes
-            if (route, team) in iso and route <= 64
-        )
+        small = sorted((route, iso[(route, team)]) for route in routes if (route, team) in iso and route <= 64)
         overhead_by_thread[team] = (
-            max(_fit_affine(
-                [float(route) for route, _ in small],
-                [value for _, value in small],
-            )[0], 0.0)
+            max(
+                _fit_affine(
+                    [float(route) for route, _ in small],
+                    [value for _, value in small],
+                )[0],
+                0.0,
+            )
             if len(small) >= 2
             else 0.0
         )
@@ -253,11 +230,7 @@ def fit_from_measurements(
     def compute_part(route: int, team: int) -> float:
         return max(iso[(route, team)] - fitted_overhead(team), 1e-9)
 
-    c_pts = [
-        (route, compute_part(route, 1))
-        for route in routes
-        if (route, 1) in iso
-    ]
+    c_pts = [(route, compute_part(route, 1)) for route in routes if (route, 1) in iso]
 
     bulk_routes = [route for route in routes if route >= phi_route_min]
     if not bulk_routes:
@@ -271,9 +244,7 @@ def fit_from_measurements(
             if (route, team) in iso and (route, 1) in iso
         ]
         if not ratios:
-            raise ValueError(
-                f"no route shared by threads=1 and threads={team} for phi fit"
-            )
+            raise ValueError(f"no route shared by threads=1 and threads={team} for phi fit")
         phi_measured[team] = statistics.median(ratios)
         all_ratios = [
             compute_part(route, team) / compute_part(route, 1)
@@ -322,8 +293,7 @@ def fit_from_profile(path: str | Path) -> IsoFormula:
     with Path(path).open(encoding="utf-8") as handle:
         profile = json.load(handle)
     return fit_from_measurements(
-        (entry["routes"], entry["threads"], entry["median_ns"])
-        for entry in profile["isolated"]
+        (entry["routes"], entry["threads"], entry["median_ns"]) for entry in profile["isolated"]
     )
 
 
@@ -332,10 +302,7 @@ def _main(paths: list[str]) -> int:
         formula = fit_from_profile(path)
         diag = formula._diag
         print(f"\n=== {os.path.basename(path)} ===")
-        print(
-            "  O(t) = %.4f + %.4f/t  (ms)"
-            % (formula.o0 / 1e6, formula.o1 / 1e6)
-        )
+        print("  O(t) = %.4f + %.4f/t  (ms)" % (formula.o0 / 1e6, formula.o1 / 1e6))
         print(
             "  phi_usl(t): alpha=%.6f beta=%.7f, domain=[%d,%d]"
             % (
@@ -345,9 +312,7 @@ def _main(paths: list[str]) -> int:
                 formula.max_threads,
             )
         )
-        print("  %-4s %10s %10s %10s %10s %18s" % (
-            "t", "O_meas", "phi_meas", "phi_usl", "phi_cal", "phi ratio spread"
-        ))
+        print("  %-4s %10s %10s %10s %10s %18s" % ("t", "O_meas", "phi_meas", "phi_usl", "phi_cal", "phi ratio spread"))
         for team in diag["threads"]:
             low, high = diag["phi_spread"][team]
             print(
@@ -362,10 +327,7 @@ def _main(paths: list[str]) -> int:
                     high,
                 )
             )
-        errors = [
-            abs(formula.T_iso(route, team) - value) / value
-            for (route, team), value in diag["iso"].items()
-        ]
+        errors = [abs(formula.T_iso(route, team) - value) / value for (route, team), value in diag["iso"].items()]
         worst = sorted(
             (
                 abs(formula.T_iso(route, team) - value) / value,

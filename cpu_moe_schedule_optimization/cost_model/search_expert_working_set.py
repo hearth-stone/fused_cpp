@@ -83,9 +83,7 @@ def parse_active_experts(text: str, total_cores: int, num_experts: int) -> list[
     return values
 
 
-def assign_by_thread_capacity(
-    measurement_experts: int, shape: list[int]
-) -> list[list[int]]:
+def assign_by_thread_capacity(measurement_experts: int, shape: list[int]) -> list[list[int]]:
     """Balance equal-route tasks without requiring a pre-calibrated cost table."""
     lanes: list[list[int]] = [[] for _ in shape]
     for expert in range(measurement_experts):
@@ -109,11 +107,7 @@ def summarize_search(entries: list[dict], throughput_tolerance: float) -> list[d
     summaries: list[dict] = []
     keys = sorted({(entry["allocation"], entry["routes"]) for entry in entries})
     for allocation, routes in keys:
-        rows = [
-            entry
-            for entry in entries
-            if entry["allocation"] == allocation and entry["routes"] == routes
-        ]
+        rows = [entry for entry in entries if entry["allocation"] == allocation and entry["routes"] == routes]
         best = max(rows, key=lambda entry: entry["aggregate_tflops"])
         cutoff = best["aggregate_tflops"] * (1.0 - throughput_tolerance)
         near_peak = [entry for entry in rows if entry["aggregate_tflops"] >= cutoff]
@@ -137,17 +131,13 @@ def summarize_search(entries: list[dict], throughput_tolerance: float) -> list[d
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Search concurrent packed expert weight working-set limits."
-    )
+    parser = argparse.ArgumentParser(description="Search concurrent packed expert weight working-set limits.")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--hidden-size", type=int, default=4096)
     parser.add_argument("--ffn-hidden-size", type=int, default=2048)
     parser.add_argument("--num-experts", type=int, default=32)
     parser.add_argument("--global-experts", type=int, default=64)
-    parser.add_argument(
-        "--parallel-mode", choices=("standalone", "tp", "ep"), default="ep"
-    )
+    parser.add_argument("--parallel-mode", choices=("standalone", "tp", "ep"), default="ep")
     parser.add_argument("--parallel-degree", type=int, default=2)
     parser.add_argument("--route-buckets", default=DEFAULT_ROUTES)
     parser.add_argument(
@@ -183,21 +173,13 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    cpu_ids = (
-        parse_cpu_ids(args.cpu_ids) if args.cpu_ids is not None else available_cpu_ids()
-    )
+    cpu_ids = parse_cpu_ids(args.cpu_ids) if args.cpu_ids is not None else available_cpu_ids()
     total_cores = len(cpu_ids)
-    active_values = parse_active_experts(
-        args.active_experts, total_cores, args.num_experts
-    )
+    active_values = parse_active_experts(args.active_experts, total_cores, args.num_experts)
     routes_values = parse_int_list(args.route_buckets)
-    measurement_experts = clamp_measurement_experts(
-        args.num_experts, args.measurement_experts
-    )
+    measurement_experts = clamp_measurement_experts(args.num_experts, args.measurement_experts)
     if active_values[-1] > measurement_experts:
-        raise ValueError(
-            "--measurement-experts must be at least the largest active-expert point"
-        )
+        raise ValueError("--measurement-experts must be at least the largest active-expert point")
     if args.global_experts < args.num_experts:
         raise ValueError("--global-experts cannot be smaller than --num-experts")
     if not 0.0 <= args.throughput_tolerance < 1.0:
@@ -205,11 +187,7 @@ def main() -> int:
     if args.w13_split and args.w13_split_chunks != 2:
         raise ValueError("the current split-W13 kernel has exactly two chunks")
 
-    allocations = (
-        ["one-thread", "uniform-cores"]
-        if args.allocation == "both"
-        else [args.allocation]
-    )
+    allocations = ["one-thread", "uniform-cores"] if args.allocation == "both" else [args.allocation]
     torch.set_num_threads(1)
     os.environ["FUSED_CPP_MOE_W13_SPLIT_N"] = "1" if args.w13_split else "0"
     generator = torch.Generator().manual_seed(args.seed)
@@ -257,17 +235,10 @@ def main() -> int:
                     std=args.std,
                     lane_experts=lane_experts,
                 )
-                samples = measure(
-                    run, warmup=args.warmup, runs=args.runs, sync_client=sync_client
-                )
+                samples = measure(run, warmup=args.warmup, runs=args.runs, sync_client=sync_client)
                 timing = summarize_times(samples)
                 median_ns = timing["median_ns"]
-                tflops = (
-                    tasks
-                    * expert_flops(routes, args.hidden_size, args.ffn_hidden_size)
-                    / median_ns
-                    / 1e3
-                )
+                tflops = tasks * expert_flops(routes, args.hidden_size, args.ffn_hidden_size) / median_ns / 1e3
                 entry = {
                     "allocation": allocation,
                     "active_experts": active_experts,
@@ -276,9 +247,7 @@ def main() -> int:
                     "routes": routes,
                     "working_set_bytes": active_experts * stage_bytes,
                     "working_set_mib": active_experts * stage_bytes / 2**20,
-                    "working_set_to_llc": (
-                        active_experts * stage_bytes / llc_bytes if llc_bytes else None
-                    ),
+                    "working_set_to_llc": (active_experts * stage_bytes / llc_bytes if llc_bytes else None),
                     "full_call_median_ns": median_ns,
                     "full_call_p10_ns": timing["p10_ns"],
                     "full_call_p90_ns": timing["p90_ns"],

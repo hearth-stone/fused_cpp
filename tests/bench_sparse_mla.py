@@ -30,20 +30,11 @@ def _bench(fn: Callable[[], object], warmup: int, iters: int) -> tuple[float, fl
 
 
 def _dense_indices(s_q: int, topk: int) -> torch.Tensor:
-    return (
-        torch.arange(topk, dtype=torch.int32)
-        .reshape(1, 1, topk)
-        .expand(s_q, 1, topk)
-        .clone()
-    )
+    return torch.arange(topk, dtype=torch.int32).reshape(1, 1, topk).expand(s_q, 1, topk).clone()
 
 
 def _hybrid_indices(s_q: int, s_kv: int, topk: int, shared: int = 64) -> torch.Tensor:
-    common = (
-        torch.arange(shared, dtype=torch.int32)
-        .reshape(1, 1, shared)
-        .expand(s_q, 1, shared)
-    )
+    common = torch.arange(shared, dtype=torch.int32).reshape(1, 1, shared).expand(s_q, 1, shared)
     tail = torch.randint(shared, s_kv, (s_q, 1, topk - shared), dtype=torch.int32)
     return torch.cat([common, tail], dim=-1).clone()
 

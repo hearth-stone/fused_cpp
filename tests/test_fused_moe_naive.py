@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """Tests for the naive fused MoE expert FFN."""
+
 from __future__ import annotations
 
 import pytest
@@ -40,7 +41,7 @@ def _token_reference(
         for slot_idx in range(topk_ids.shape[1]):
             expert_id = int(topk_ids[token_idx, slot_idx].item())
             gate_up = F.linear(
-                input[token_idx:token_idx + 1],
+                input[token_idx : token_idx + 1],
                 w13_weight[expert_id],
                 None if w13_bias is None else w13_bias[expert_id],
             )
@@ -66,12 +67,8 @@ def _random_case(seed: int = 0) -> tuple[torch.Tensor, ...]:
     num_experts = 4
     top_k = 2
     input = torch.randn(num_tokens, hidden_size, generator=generator)
-    w13_weight = torch.randn(
-        num_experts, 2 * ffn_hidden_size, hidden_size, generator=generator
-    )
-    w2_weight = torch.randn(
-        num_experts, hidden_size, ffn_hidden_size, generator=generator
-    )
+    w13_weight = torch.randn(num_experts, 2 * ffn_hidden_size, hidden_size, generator=generator)
+    w2_weight = torch.randn(num_experts, hidden_size, ffn_hidden_size, generator=generator)
     w13_bias = torch.randn(num_experts, 2 * ffn_hidden_size, generator=generator)
     w2_bias = torch.randn(num_experts, hidden_size, generator=generator)
     topk_ids = torch.tensor(
@@ -86,9 +83,7 @@ def _random_case(seed: int = 0) -> tuple[torch.Tensor, ...]:
         ],
         dtype=torch.int32,
     )
-    topk_weights = torch.softmax(
-        torch.randn(num_tokens, top_k, generator=generator), dim=-1
-    )
+    topk_weights = torch.softmax(torch.randn(num_tokens, top_k, generator=generator), dim=-1)
     return input, w13_weight, w2_weight, w13_bias, w2_bias, topk_weights, topk_ids
 
 
@@ -105,9 +100,7 @@ def test_fused_moe_naive_imports() -> None:
 def test_fused_moe_naive_matches_token_reference(activation: str) -> None:
     from fused_cpp.moe import fused_moe_naive
 
-    input, w13_weight, w2_weight, w13_bias, w2_bias, topk_weights, topk_ids = (
-        _random_case(seed=123)
-    )
+    input, w13_weight, w2_weight, w13_bias, w2_bias, topk_weights, topk_ids = _random_case(seed=123)
 
     out = fused_moe_naive(
         input,
@@ -136,9 +129,7 @@ def test_fused_moe_naive_matches_token_reference(activation: str) -> None:
 def test_fused_moe_naive_out_buffer() -> None:
     from fused_cpp.moe import fused_moe_naive
 
-    input, w13_weight, w2_weight, w13_bias, w2_bias, topk_weights, topk_ids = (
-        _random_case(seed=7)
-    )
+    input, w13_weight, w2_weight, w13_bias, w2_bias, topk_weights, topk_ids = _random_case(seed=7)
     out_buffer = torch.empty_like(input)
     ret = fused_moe_naive(
         input,
@@ -166,9 +157,7 @@ def test_fused_moe_naive_out_buffer() -> None:
 def test_fused_moe_naive_skip_weighted_matches_preweighted_input() -> None:
     from fused_cpp.moe import fused_moe_naive
 
-    input, w13_weight, w2_weight, w13_bias, w2_bias, _, topk_ids_2 = (
-        _random_case(seed=99)
-    )
+    input, w13_weight, w2_weight, w13_bias, w2_bias, _, topk_ids_2 = _random_case(seed=99)
     topk_ids = topk_ids_2[:, :1].contiguous()
     topk_weights = torch.rand(input.shape[0], 1)
     weighted_input = input * topk_weights.to(input.dtype)

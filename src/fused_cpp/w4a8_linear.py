@@ -40,6 +40,7 @@
 
 本实现不依赖 vLLM / C++ 扩展，可作为 AWQ 等价性对比的参考路径。
 """
+
 from __future__ import annotations
 
 import os
@@ -79,14 +80,13 @@ AWQ_ORDER: tuple[int, ...] = (0, 2, 4, 6, 1, 3, 5, 7)
 
 # 逆序：给定输出 N 维第 j 列，应当取第 AWQ_REVERSE_ORDER[j] 个 nibble
 # 由 AWQ_ORDER 反推：[0, 4, 1, 5, 2, 6, 3, 7]
-AWQ_REVERSE_ORDER: tuple[int, ...] = tuple(
-    AWQ_ORDER.index(j) for j in range(8)
-)
+AWQ_REVERSE_ORDER: tuple[int, ...] = tuple(AWQ_ORDER.index(j) for j in range(8))
 
 _BIT_SHIFTS = torch.arange(0, 32, 4, dtype=torch.int32)
 
 
 # ── 形状校验 ──
+
 
 def _check_shapes(
     x: torch.Tensor,
@@ -102,9 +102,7 @@ def _check_shapes(
     if qzeros.dtype != torch.int32:
         raise RuntimeError(f"qzeros 必须为 int32，当前 dtype={qzeros.dtype}")
     if scales.dtype not in (torch.float16, torch.bfloat16):
-        raise RuntimeError(
-            f"scales 必须为 float16 或 bfloat16，当前 dtype={scales.dtype}"
-        )
+        raise RuntimeError(f"scales 必须为 float16 或 bfloat16，当前 dtype={scales.dtype}")
 
     if qweight.dim() != 2 or qzeros.dim() != 2 or scales.dim() != 2:
         raise RuntimeError("qweight / qzeros / scales 必须均为 2D")
@@ -116,13 +114,9 @@ def _check_shapes(
     groups_s, n_s = scales.shape
 
     if n_over_8_z != n_over_8:
-        raise RuntimeError(
-            f"qzeros N 维应与 qweight 一致: {n_over_8_z} vs {n_over_8}"
-        )
+        raise RuntimeError(f"qzeros N 维应与 qweight 一致: {n_over_8_z} vs {n_over_8}")
     if groups_z != groups_s:
-        raise RuntimeError(
-            f"qzeros 和 scales 的 group 维不一致: {groups_z} vs {groups_s}"
-        )
+        raise RuntimeError(f"qzeros 和 scales 的 group 维不一致: {groups_z} vs {groups_s}")
     if n_s != n:
         raise RuntimeError(f"scales 的 N 维应为 {n}，当前为 {n_s}")
     if k % groups_z != 0:
@@ -138,6 +132,7 @@ def _check_shapes(
 
 # ── AWQ 解包 ──
 
+
 def _unpack_int4_along_n_awq(packed: torch.Tensor) -> torch.Tensor:
     """沿 N 方向解包 AWQ int32 → int8（含 interleave 反重排）。
 
@@ -149,15 +144,17 @@ def _unpack_int4_along_n_awq(packed: torch.Tensor) -> torch.Tensor:
     lead = packed.shape[:-1]
     n_over_8 = packed.shape[-1]
 
-    shifts = _BIT_SHIFTS.to(packed.device)                        # [8]
+    shifts = _BIT_SHIFTS.to(packed.device)  # [8]
     # 逐 nibble 提取 → [..., N//8, 8]（第 8 维按 pack 内顺序，即 AWQ_ORDER）
     unpacked = (packed.unsqueeze(-1) >> shifts.view(*([1] * len(lead)), 1, 8)) & 0xF
 
     # 反 interleave：按 AWQ_REVERSE_ORDER 取 nibble，使得输出沿 N 维是自然顺序
     reverse_idx = torch.tensor(
-        AWQ_REVERSE_ORDER, dtype=torch.long, device=packed.device,
+        AWQ_REVERSE_ORDER,
+        dtype=torch.long,
+        device=packed.device,
     )
-    unpacked = unpacked.index_select(-1, reverse_idx)             # [..., N//8, 8]
+    unpacked = unpacked.index_select(-1, reverse_idx)  # [..., N//8, 8]
     return unpacked.reshape(*lead, n_over_8 * 8).to(torch.int8)
 
 
@@ -177,6 +174,7 @@ def unpack_awq_qzeros(qzeros: torch.Tensor) -> torch.Tensor:
 
 # ── 激活量化 ──
 
+
 def _quantize_activation_per_token(
     x: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -185,7 +183,7 @@ def _quantize_activation_per_token(
     :returns: ``(x_q [M, K] int8, x_scale [M] float32)``
     """
     x_fp32 = x.to(torch.float32)
-    max_abs = x_fp32.abs().amax(dim=-1)                           # [M]
+    max_abs = x_fp32.abs().amax(dim=-1)  # [M]
     # max_abs 为 0 的行 scale 置 1.0 以避免除零（此时 x_q 为全 0）
     scale = torch.where(
         max_abs > 0,
@@ -245,6 +243,7 @@ def _int8_gemm(
 
 # ── 主算子 ──
 
+
 def w4a8_linear(
     x: torch.Tensor,
     qweight: torch.Tensor,
@@ -280,30 +279,36 @@ def w4a8_linear(
     # 空输入短路
     if x.numel() == 0:
         return torch.empty(
-            (*x.shape[:-1], n), dtype=torch.bfloat16, device=x.device,
+            (*x.shape[:-1], n),
+            dtype=torch.bfloat16,
+            device=x.device,
         )
 
     # 环境变量开关：跳过实际计算，直接返回全零结果（profile/形状采集用）。
     if _env_truthy(_SKIP_COMPUTE_ENV):
         return torch.zeros(
-            (*x.shape[:-1], n), dtype=torch.bfloat16, device=x.device,
+            (*x.shape[:-1], n),
+            dtype=torch.bfloat16,
+            device=x.device,
         )
 
     orig_shape = x.shape
-    x_2d = x.contiguous().reshape(-1, k)                          # [M, K] bf16
+    x_2d = x.contiguous().reshape(-1, k)  # [M, K] bf16
 
     # 1) 激活 per-token int8 量化
-    x_q, x_scale = _quantize_activation_per_token(x_2d)           # int8, fp32
+    x_q, x_scale = _quantize_activation_per_token(x_2d)  # int8, fp32
 
     # 2) AWQ 权重 / 零点解包（一次性到 int8 自然排布的 [K, N] / [G, N]）
-    w_q = unpack_awq_qweight(qweight.contiguous())                # [K, N] int8
-    w_z = unpack_awq_qzeros(qzeros.contiguous())                  # [G, N] int8
-    w_scale = scales.contiguous().to(torch.float32)               # [G, N] fp32
+    w_q = unpack_awq_qweight(qweight.contiguous())  # [K, N] int8
+    w_z = unpack_awq_qzeros(qzeros.contiguous())  # [G, N] int8
+    w_scale = scales.contiguous().to(torch.float32)  # [G, N] fp32
 
     # 3) per-group int8 GEMM，fp32 累加
     groups_k = k // group_size
     out_fp32 = torch.zeros(
-        (x_q.shape[0], n), dtype=torch.float32, device=x.device,
+        (x_q.shape[0], n),
+        dtype=torch.float32,
+        device=x.device,
     )
     for g in range(groups_k):
         k0 = g * group_size
@@ -311,12 +316,9 @@ def w4a8_linear(
 
         # 本 group 的中心化权重：w_q - w_z ∈ [-15, 15]，可容纳于 int8。
         # 先转 int16 做减法，避免 uint-like nibble 值在 int8 上出现意外溢出语义。
-        w_block_i8 = (
-            w_q[k0:k1].to(torch.int16)
-            - w_z[g].to(torch.int16).unsqueeze(0)
-        ).to(torch.int8)                                          # [gs, N]
+        w_block_i8 = (w_q[k0:k1].to(torch.int16) - w_z[g].to(torch.int16).unsqueeze(0)).to(torch.int8)  # [gs, N]
 
-        acc = _int8_gemm(x_q[:, k0:k1], w_block_i8)               # [M, N] int32
+        acc = _int8_gemm(x_q[:, k0:k1], w_block_i8)  # [M, N] int32
 
         out_fp32.add_(acc.to(torch.float32) * w_scale[g].unsqueeze(0))
 
@@ -325,9 +327,7 @@ def w4a8_linear(
 
     if bias is not None:
         if bias.shape != (n,):
-            raise RuntimeError(
-                f"bias 形状应为 ({n},)，当前为 {tuple(bias.shape)}"
-            )
+            raise RuntimeError(f"bias 形状应为 ({n},)，当前为 {tuple(bias.shape)}")
         out_fp32.add_(bias.to(torch.float32))
 
     return out_fp32.to(torch.bfloat16).reshape(*orig_shape[:-1], n)

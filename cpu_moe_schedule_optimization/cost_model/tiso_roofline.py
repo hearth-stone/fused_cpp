@@ -71,12 +71,7 @@ class AuxWork:
 
     @property
     def total_bytes(self) -> int:
-        return (
-            self.input_read_bytes
-            + self.packed_a_write_bytes
-            + self.down_read_bytes
-            + self.output_write_bytes
-        )
+        return self.input_read_bytes + self.packed_a_write_bytes + self.down_read_bytes + self.output_write_bytes
 
 
 @dataclass(frozen=True)
@@ -149,9 +144,7 @@ def fused_expert_work(
     # W13 is [M,H] x [H,2F], then fused SiLU writes BF16 [M,F].
     w13 = GemmWork(
         flops=4 * effective_rows * h * f,
-        a_read_bytes=(
-            BF16_BYTES * effective_rows * h * n_partitions * int(w13_n_ranges)
-        ),
+        a_read_bytes=(BF16_BYTES * effective_rows * h * n_partitions * int(w13_n_ranges)),
         b_read_bytes=BF16_BYTES * panel_count * h * (2 * f),
         c_write_bytes=BF16_BYTES * store_rows * f,
     )
@@ -290,11 +283,7 @@ def fit_bulk_observations(
     intermediate_size = int(expert["intermediate_size"])
     axis = str(profile.get("kernel", {}).get("parallel_axis", "N"))
     kernel = profile.get("kernel", {})
-    w13_n_ranges = (
-        int(kernel.get("w13_split_chunks", 2))
-        if bool(kernel.get("w13_split", False))
-        else 1
-    )
+    w13_n_ranges = int(kernel.get("w13_split_chunks", 2)) if bool(kernel.get("w13_split", False)) else 1
     isolated = profile["isolated"]
     thread_values = sorted({int(entry["threads"]) for entry in isolated})
     output: list[BulkObservation] = []
@@ -309,9 +298,7 @@ def fit_bulk_observations(
         points = [(routes / M_PANEL, latency) for routes, latency in samples]
         intercept, panel_ns = _linear_fit(points)
         if panel_ns <= 0.0:
-            raise ValueError(
-                f"non-positive steady panel time for threads={threads}: {panel_ns}"
-            )
+            raise ValueError(f"non-positive steady panel time for threads={threads}: {panel_ns}")
         panel_work = fused_expert_work(
             M_PANEL,
             threads,
@@ -320,10 +307,7 @@ def fit_bulk_observations(
             parallel_axis=axis,
             w13_n_ranges=w13_n_ranges,
         )
-        errors = [
-            abs((intercept + panels * panel_ns) / measured - 1.0)
-            for panels, measured in points
-        ]
+        errors = [abs((intercept + panels * panel_ns) / measured - 1.0) for panels, measured in points]
         seconds = panel_ns / 1e9
         output.append(
             BulkObservation(
@@ -344,11 +328,7 @@ def fit_bulk_observations(
 def build_report(profile: dict, profile_path: str, min_routes: int) -> dict:
     observations = fit_bulk_observations(profile, min_routes=min_routes)
     kernel = profile.get("kernel", {})
-    w13_n_ranges = (
-        int(kernel.get("w13_split_chunks", 2))
-        if bool(kernel.get("w13_split", False))
-        else 1
-    )
+    w13_n_ranges = int(kernel.get("w13_split_chunks", 2)) if bool(kernel.get("w13_split", False)) else 1
     return {
         "schema_version": 1,
         "kind": "explainable_tiso_roofline_shadow",
@@ -378,10 +358,7 @@ def build_report(profile: dict, profile_path: str, min_routes: int) -> dict:
 
 
 def _print_report(report: dict) -> None:
-    print(
-        "T  points  intercept_ms  panel_us  req_TF/s  req_L3_GB/s  "
-        "AI(F/B)  fit_med%  fit_max%"
-    )
+    print("T  points  intercept_ms  panel_us  req_TF/s  req_L3_GB/s  AI(F/B)  fit_med%  fit_max%")
     for row in report["observations"]:
         print(
             f"{row['threads']:<2d} {row['points']:>6d} "
@@ -396,9 +373,7 @@ def _print_report(report: dict) -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(
-        description="Derive explainable bulk T_iso roofline observations"
-    )
+    parser = argparse.ArgumentParser(description="Derive explainable bulk T_iso roofline observations")
     parser.add_argument("profile", type=Path)
     parser.add_argument("--min-routes", type=int, default=192)
     parser.add_argument("--output", type=Path)

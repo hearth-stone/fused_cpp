@@ -15,6 +15,7 @@
 前 3 项是直接对微内核 op 的单测；第 4 项串到完整 SDPA 主循环，确认
 模板化重构（``template <class MK>``）没破坏热路径语义。
 """
+
 from __future__ import annotations
 
 import math
@@ -81,10 +82,7 @@ def test_microkernel_validate(impl, dtype, shape):
     for op in VALIDATE_OPS:
         v = float(result[op])
         assert math.isfinite(v), (impl, dtype, op, v, result)
-        assert v <= tol, (
-            f"impl={impl} dtype={dtype} {op}={v:.3e} > tol={tol:.3e} "
-            f"E={E} Sk={Sk} result={result}"
-        )
+        assert v <= tol, f"impl={impl} dtype={dtype} {op}={v:.3e} > tol={tol:.3e} E={E} Sk={Sk} result={result}"
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -95,9 +93,7 @@ def test_microkernel_validate(impl, dtype, shape):
 @pytest.mark.parametrize("impl", _impls())
 @pytest.mark.parametrize("dtype", ["fp32", "bf16"])
 def test_microkernel_benchmark_smoke(impl, dtype):
-    result = _C.benchmark_microkernel(
-        impl=impl, dtype=dtype, E=64, Sk=64, iterations=200, warmup=10
-    )
+    result = _C.benchmark_microkernel(impl=impl, dtype=dtype, E=64, Sk=64, iterations=200, warmup=10)
     assert result["direct_microkernel"] == 1.0
     for op in BENCHMARK_OPS:
         sec = float(result[f"{op}_seconds"])
@@ -140,9 +136,7 @@ def test_sdpa_versions_have_per_impl_entries():
 
 
 def _run_sdpa(version: str, q, k, v):
-    return _C.scaled_dot_product_attention_versioned(
-        q, k, v, None, 0.0, False, None, False, version
-    )
+    return _C.scaled_dot_product_attention_versioned(q, k, v, None, 0.0, False, None, False, version)
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
@@ -189,19 +183,14 @@ def test_microkernel_packqk_seq_vs_baseline_bit_exact(impl, dtype, head_dim):
         pytest.skip(f"{impl} impl not built")
     dtype_str = "fp32" if dtype == torch.float32 else "bf16"
     Sk = head_dim  # validate_microkernel 用 (E, Sk) 两个维度
-    base = _C.validate_microkernel(
-        impl="baseline", dtype=dtype_str, E=head_dim, Sk=Sk
-    )
-    pq = _C.validate_microkernel(
-        impl=impl, dtype=dtype_str, E=head_dim, Sk=Sk
-    )
+    base = _C.validate_microkernel(impl="baseline", dtype=dtype_str, E=head_dim, Sk=Sk)
+    pq = _C.validate_microkernel(impl=impl, dtype=dtype_str, E=head_dim, Sk=Sk)
     # 两者都对同一个 scalar reference 算 max_abs；packqk 系列与 baseline
     # 的 BFMMLA 累加顺序按位一致（仅 Q/K 来源不同），因此 qkt_8x8 应**完全相同**。
     base_qkt = float(base["qkt_8x8_max_abs"])
     pq_qkt = float(pq["qkt_8x8_max_abs"])
     assert pq_qkt == base_qkt, (
-        f"{impl} qkt_8x8 max_abs={pq_qkt:.3e} != baseline {base_qkt:.3e} "
-        f"(dtype={dtype_str}, E={head_dim})"
+        f"{impl} qkt_8x8 max_abs={pq_qkt:.3e} != baseline {base_qkt:.3e} (dtype={dtype_str}, E={head_dim})"
     )
     # fp32 fall through，5 个 op 全部应与 baseline 完全相同。
     if dtype_str == "fp32":
@@ -212,9 +201,7 @@ def test_microkernel_packqk_seq_vs_baseline_bit_exact(impl, dtype, head_dim):
             "pv_8x8_max_abs",
             "pv_tail_max_abs",
         ):
-            assert float(pq[op]) == float(base[op]), (
-                f"{impl} {op}={pq[op]} != baseline {base[op]} (fp32 fall through)"
-            )
+            assert float(pq[op]) == float(base[op]), f"{impl} {op}={pq[op]} != baseline {base[op]} (fp32 fall through)"
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])

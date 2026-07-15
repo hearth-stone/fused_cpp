@@ -127,7 +127,7 @@ def _run_equal_len_segments(args: argparse.Namespace, seq_lens: list[int]) -> No
         "deepseek_v4_flash_2048_two_triangles,"
         f"{args.version},{str(args.dtype).replace('torch.', '')},"
         f"{batch},{args.heads},{seq_len},{seq_len},{args.qk_dim},{args.v_dim},"
-        f"{sum(seq_lens)},\"{','.join(map(str, seq_lens))}\",{pairs},"
+        f'{sum(seq_lens)},"{",".join(map(str, seq_lens))}",{pairs},'
         f"{median * 1e3:.3f},{min_t * 1e3:.3f},{max_t * 1e3:.3f},"
         f"{flops / median / 1e9:.2f}",
         flush=True,
@@ -170,7 +170,7 @@ def _run_global(args: argparse.Namespace, total_tokens: int) -> None:
         "deepseek_v4_flash_2048_one_triangle,"
         f"{args.version},{str(args.dtype).replace('torch.', '')},"
         f"1,{args.heads},{total_tokens},{total_tokens},{args.qk_dim},{args.v_dim},"
-        f"{total_tokens},\"{total_tokens}\",{pairs},"
+        f'{total_tokens},"{total_tokens}",{pairs},'
         f"{median * 1e3:.3f},{min_t * 1e3:.3f},{max_t * 1e3:.3f},"
         f"{flops / median / 1e9:.2f}",
         flush=True,
@@ -216,8 +216,7 @@ def main() -> None:
     total_tokens = sum(args.seq_lens)
     print(f"torch_threads={torch.get_num_threads()}")
     print(
-        "case,version,dtype,B,N,L,S,E,Ev,total_tokens,seq_lens,"
-        "effective_pairs,median_ms,min_ms,max_ms,effective_gflops"
+        "case,version,dtype,B,N,L,S,E,Ev,total_tokens,seq_lens,effective_pairs,median_ms,min_ms,max_ms,effective_gflops"
     )
     _run_equal_len_segments(args, args.seq_lens)
     if args.compare_global:

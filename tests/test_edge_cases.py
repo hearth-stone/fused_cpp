@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """Tests for edge cases: negative slot_mapping, empty kv_cache, None metadata."""
+
 import torch
-import pytest
 from fused_cpp.mla.impl import CPUFusedMLAImpl, _pytorch_write_kv_cache
 
 
@@ -54,9 +54,6 @@ class TestEmptyKvCache:
 
     def test_empty_kv_cache_no_write(self):
         kv_cache = torch.empty(0, BLOCK_SIZE, HEAD_SIZE)
-        kv_c = torch.randn(2, KV_LORA_RANK)
-        k_pe = torch.randn(2, QK_ROPE_HEAD_DIM)
-        slot_mapping = torch.tensor([0, 1])
 
         # The forward_fused method checks kv_cache.numel() > 0 before calling
         # _write_kv_cache_cpu. Verify the guard works by checking numel.

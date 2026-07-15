@@ -15,6 +15,7 @@
 本测试通过 ``monkeypatch`` 打桩 ``current_platform.is_cpu`` 及环境变量，
 不启动真正的 vLLM engine。
 """
+
 from __future__ import annotations
 
 import pytest
@@ -55,7 +56,10 @@ class TestAwqConfigGetQuantMethodFusedMoe:
     """CPU / 非 CPU × 环境变量开关下的 FusedMoE 分派策略。"""
 
     def test_cpu_with_env_on_routes_to_cpu_awq_fused_moe(
-        self, awq_config, fake_fused_moe_layer, monkeypatch,
+        self,
+        awq_config,
+        fake_fused_moe_layer,
+        monkeypatch,
     ) -> None:
         """CPU 平台 + VLLM_CPU_AWQ_USE_FUSED_CPP=1 时应返回 ``CPUAWQFusedMoEMethod``。"""
         # Arrange
@@ -66,13 +70,16 @@ class TestAwqConfigGetQuantMethodFusedMoe:
         )
 
         monkeypatch.setattr(
-            awq_mod.current_platform, "is_cpu", lambda: True,
+            awq_mod.current_platform,
+            "is_cpu",
+            lambda: True,
         )
         monkeypatch.setattr(envs, "VLLM_CPU_AWQ_USE_FUSED_CPP", True, raising=False)
 
         # Act
         method = awq_config.get_quant_method(
-            fake_fused_moe_layer, prefix="model.layers.0.mlp.experts",
+            fake_fused_moe_layer,
+            prefix="model.layers.0.mlp.experts",
         )
 
         # Assert
@@ -81,7 +88,10 @@ class TestAwqConfigGetQuantMethodFusedMoe:
         )
 
     def test_cpu_with_env_off_does_not_route_to_cpu_awq_fused_moe(
-        self, awq_config, fake_fused_moe_layer, monkeypatch,
+        self,
+        awq_config,
+        fake_fused_moe_layer,
+        monkeypatch,
     ) -> None:
         """CPU 平台但环境变量未开启时**不应**返回 ``CPUAWQFusedMoEMethod``。
 
@@ -97,7 +107,9 @@ class TestAwqConfigGetQuantMethodFusedMoe:
         )
 
         monkeypatch.setattr(
-            awq_mod.current_platform, "is_cpu", lambda: True,
+            awq_mod.current_platform,
+            "is_cpu",
+            lambda: True,
         )
         monkeypatch.setattr(envs, "VLLM_CPU_AWQ_USE_FUSED_CPP", False, raising=False)
 
@@ -105,7 +117,8 @@ class TestAwqConfigGetQuantMethodFusedMoe:
         # 是否落在 CPUAWQFusedMoEMethod；异常时也视为"未走到新路径"，合法。
         try:
             method = awq_config.get_quant_method(
-                fake_fused_moe_layer, prefix="model.layers.0.mlp.experts",
+                fake_fused_moe_layer,
+                prefix="model.layers.0.mlp.experts",
             )
         except Exception:
             method = None
@@ -116,14 +129,19 @@ class TestAwqConfigGetQuantMethodFusedMoe:
         )
 
     def test_non_cpu_platform_preserves_marlin_path(
-        self, awq_config, fake_fused_moe_layer, monkeypatch,
+        self,
+        awq_config,
+        fake_fused_moe_layer,
+        monkeypatch,
     ) -> None:
         """非 CPU 分支必须保持 marlin-first 策略，不走 fused_cpp。"""
         # Arrange
         import vllm.model_executor.layers.quantization.awq as awq_mod
 
         monkeypatch.setattr(
-            awq_mod.current_platform, "is_cpu", lambda: False,
+            awq_mod.current_platform,
+            "is_cpu",
+            lambda: False,
         )
 
         called: dict[str, bool] = {"marlin": False}
@@ -140,24 +158,26 @@ class TestAwqConfigGetQuantMethodFusedMoe:
                 return "marlin-method-sentinel"
 
         monkeypatch.setattr(
-            marlin_mod, "AWQMarlinConfig", _FakeAWQMarlinConfig,
+            marlin_mod,
+            "AWQMarlinConfig",
+            _FakeAWQMarlinConfig,
         )
         from vllm.model_executor.layers.quantization.utils import (
             marlin_utils,
         )
 
         monkeypatch.setattr(
-            marlin_utils, "check_moe_marlin_supports_layer",
+            marlin_utils,
+            "check_moe_marlin_supports_layer",
             lambda layer, group_size: True,
         )
 
         # Act
         result = awq_config.get_quant_method(
-            fake_fused_moe_layer, prefix="model.layers.0.mlp.experts",
+            fake_fused_moe_layer,
+            prefix="model.layers.0.mlp.experts",
         )
 
         # Assert
         assert called["marlin"], "非 CPU 分支必须触达 AWQMarlinConfig"
-        assert result == "marlin-method-sentinel", (
-            f"应返回 AWQMarlinConfig 产生的 method，实际 {result!r}"
-        )
+        assert result == "marlin-method-sentinel", f"应返回 AWQMarlinConfig 产生的 method，实际 {result!r}"

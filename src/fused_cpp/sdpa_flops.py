@@ -20,9 +20,10 @@
 
 约定：``attn_mask`` 不参与 FLOPs 折扣（避免 mask 稀疏度差异污染版本对比）。
 """
+
 from __future__ import annotations
 
-from typing import Dict, Optional
+from typing import Dict
 
 __all__ = [
     "compute_sdpa_flops",
@@ -55,9 +56,9 @@ def compute_causal_effective_pairs(L: int, S: int) -> int:
     offset = S - L
 
     # 段 a: l < -offset  → S_eff = 0
-    a_end = max(0, -offset)            # 不含此值
+    a_end = max(0, -offset)  # 不含此值
     # 段 c: l > S - 1 - offset → S_eff = S
-    c_start = (S - 1 - offset) + 1     # 含此值
+    c_start = (S - 1 - offset) + 1  # 含此值
     if c_start > L:
         c_start = L
     if c_start < 0:

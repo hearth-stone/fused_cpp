@@ -10,6 +10,7 @@ Covers:
   - reduce_fn=None path: when tp_size > 1 and no reduce_fn is provided the
     impl falls back to torch.distributed.all_reduce (tested via a mock).
 """
+
 from __future__ import annotations
 
 import math
@@ -38,13 +39,18 @@ LOCAL_HEADS = NUM_HEADS // TP_SIZE  # = 1
 
 # ── Fake layer helpers ───────────────────────────────────────────────────────
 
+
 def _fake_linear(weight: torch.Tensor, bias: torch.Tensor | None = None) -> Any:
     """Return a minimal fake linear layer object."""
-    return type("FakeLinear", (), {
-        "weight": weight,
-        "bias": bias,
-        "skip_bias_add": False,
-    })()
+    return type(
+        "FakeLinear",
+        (),
+        {
+            "weight": weight,
+            "bias": bias,
+            "skip_bias_add": False,
+        },
+    )()
 
 
 def _make_wrapper(
@@ -57,6 +63,7 @@ def _make_wrapper(
 ) -> Any:
     """Build a minimal wrapper object that forward_fused reads from."""
     from unittest.mock import MagicMock
+
     wrapper = MagicMock()
     wrapper.q_lora_rank = None
     wrapper.num_heads = num_heads
@@ -69,10 +76,14 @@ def _make_wrapper(
     wrapper.kv_a_proj_with_mqa = _fake_linear(kv_a_proj_weight)
     wrapper.kv_b_proj = _fake_linear(kv_b_proj_weight)
     wrapper.o_proj = _fake_linear(o_proj_weight)
-    wrapper.kv_a_layernorm = type("FakeLN", (), {
-        "weight": kv_a_ln_weight,
-        "variance_epsilon": 1e-6,
-    })()
+    wrapper.kv_a_layernorm = type(
+        "FakeLN",
+        (),
+        {
+            "weight": kv_a_ln_weight,
+            "variance_epsilon": 1e-6,
+        },
+    )()
     wrapper.rotary_emb = None
     return wrapper
 
@@ -80,6 +91,7 @@ def _make_wrapper(
 def _make_attn_metadata(num_tokens: int) -> Any:
     """Build a minimal attn_metadata for prefill-only (no decode)."""
     from unittest.mock import MagicMock
+
     meta = MagicMock()
     meta.num_decode_tokens = 0
     meta.num_decodes = 0
@@ -95,6 +107,7 @@ def _make_attn_metadata(num_tokens: int) -> Any:
 
 
 # ── Weight factories ─────────────────────────────────────────────────────────
+
 
 def _make_full_weights(seed: int = 0) -> dict:
     """Create a full set of deterministic weights for NUM_HEADS heads."""
@@ -173,9 +186,9 @@ def _run_tp4_collect_partials(weights: dict, hidden: torch.Tensor) -> List[torch
     partials: List[torch.Tensor] = []
 
     for rank in range(TP_SIZE):
-        kv_b_local = weights["kv_b_proj_w"][rank * rows_kv_b:(rank + 1) * rows_kv_b]
-        q_local = weights["q_proj_w"][rank * rows_q:(rank + 1) * rows_q]
-        o_local = weights["o_proj_w"][:, rank * cols_o:(rank + 1) * cols_o]
+        kv_b_local = weights["kv_b_proj_w"][rank * rows_kv_b : (rank + 1) * rows_kv_b]
+        q_local = weights["q_proj_w"][rank * rows_q : (rank + 1) * rows_q]
+        o_local = weights["o_proj_w"][:, rank * cols_o : (rank + 1) * cols_o]
 
         captured: List[torch.Tensor] = []
 
@@ -183,6 +196,7 @@ def _run_tp4_collect_partials(weights: dict, hidden: torch.Tensor) -> List[torch
             def reduce_fn(t: torch.Tensor) -> torch.Tensor:
                 out_list.append(t.clone())
                 return t
+
             return reduce_fn
 
         impl = CPUFusedMLAImpl(
@@ -224,14 +238,13 @@ def _run_tp4_collect_partials(weights: dict, hidden: torch.Tensor) -> List[torch
 
 # ── TP=1 regression tests ────────────────────────────────────────────────────
 
+
 class TestTP1Regression:
     """TP=1 must behave identically to the pre-TP baseline."""
 
     def test_tp_size_defaults_to_1(self):
         """Default constructor has tp_size=1, tp_rank=0, reduce_fn=None."""
-        kv_b_proj = _fake_linear(torch.randn(
-            NUM_HEADS * (QK_NOPE_HEAD_DIM + V_HEAD_DIM), KV_LORA_RANK
-        ))
+        kv_b_proj = _fake_linear(torch.randn(NUM_HEADS * (QK_NOPE_HEAD_DIM + V_HEAD_DIM), KV_LORA_RANK))
         impl = CPUFusedMLAImpl(
             num_heads=NUM_HEADS,
             head_size=QK_HEAD_DIM,
@@ -297,6 +310,7 @@ class TestTP1Regression:
 
 # ── TP=4 correctness tests ───────────────────────────────────────────────────
 
+
 class TestTP4Correctness:
     """Simulate TP=4 and verify numerical correctness against TP=1 reference.
 
@@ -326,13 +340,9 @@ class TestTP4Correctness:
         assert len(partials) == TP_SIZE
         tp4_out = torch.stack(partials, dim=0).sum(dim=0)  # simulate all_reduce
 
-        assert tp4_out.shape == ref.shape, (
-            f"Shape mismatch: tp4={tp4_out.shape}, ref={ref.shape}"
-        )
+        assert tp4_out.shape == ref.shape, f"Shape mismatch: tp4={tp4_out.shape}, ref={ref.shape}"
         max_diff = (tp4_out - ref).abs().max().item()
-        assert max_diff < 1e-4, (
-            f"TP=4 output differs from TP=1 reference: max_diff={max_diff:.2e}"
-        )
+        assert max_diff < 1e-4, f"TP=4 output differs from TP=1 reference: max_diff={max_diff:.2e}"
 
     def test_reduce_fn_called_exactly_once_per_rank(self):
         """reduce_fn must be called exactly once per forward pass when tp_size > 1."""
@@ -346,9 +356,10 @@ class TestTP4Correctness:
                 def fn(t: torch.Tensor) -> torch.Tensor:
                     counter[0] += 1
                     return t
+
                 return fn
 
-            kv_b_local = weights["kv_b_proj_w"][:LOCAL_HEADS * (QK_NOPE_HEAD_DIM + V_HEAD_DIM)]
+            kv_b_local = weights["kv_b_proj_w"][: LOCAL_HEADS * (QK_NOPE_HEAD_DIM + V_HEAD_DIM)]
             impl = CPUFusedMLAImpl(
                 num_heads=LOCAL_HEADS,
                 head_size=QK_HEAD_DIM,
@@ -369,10 +380,10 @@ class TestTP4Correctness:
             impl.process_weights_after_loading(act_dtype=torch.float32)
             wrapper = _make_wrapper(
                 num_heads=LOCAL_HEADS,
-                q_proj_weight=weights["q_proj_w"][:LOCAL_HEADS * QK_HEAD_DIM],
+                q_proj_weight=weights["q_proj_w"][: LOCAL_HEADS * QK_HEAD_DIM],
                 kv_a_proj_weight=weights["kv_a_proj_w"],
                 kv_b_proj_weight=kv_b_local,
-                o_proj_weight=weights["o_proj_w"][:, :LOCAL_HEADS * V_HEAD_DIM],
+                o_proj_weight=weights["o_proj_w"][:, : LOCAL_HEADS * V_HEAD_DIM],
                 kv_a_ln_weight=weights["kv_a_ln_w"],
             )
             impl.forward_fused(
@@ -382,9 +393,7 @@ class TestTP4Correctness:
                 torch.zeros(1, 1, KV_LORA_RANK + QK_ROPE_HEAD_DIM),
                 _make_attn_metadata(2),
             )
-            assert call_count[0] == 1, (
-                f"rank {rank}: reduce_fn should be called exactly once, got {call_count[0]}"
-            )
+            assert call_count[0] == 1, f"rank {rank}: reduce_fn should be called exactly once, got {call_count[0]}"
 
     def test_output_is_contiguous_before_reduce(self):
         """The tensor passed to reduce_fn must be contiguous."""
@@ -395,7 +404,7 @@ class TestTP4Correctness:
             received_contiguous.append(t.is_contiguous())
             return t
 
-        kv_b_local = weights["kv_b_proj_w"][:LOCAL_HEADS * (QK_NOPE_HEAD_DIM + V_HEAD_DIM)]
+        kv_b_local = weights["kv_b_proj_w"][: LOCAL_HEADS * (QK_NOPE_HEAD_DIM + V_HEAD_DIM)]
         impl = CPUFusedMLAImpl(
             num_heads=LOCAL_HEADS,
             head_size=QK_HEAD_DIM,
@@ -416,10 +425,10 @@ class TestTP4Correctness:
         impl.process_weights_after_loading(act_dtype=torch.float32)
         wrapper = _make_wrapper(
             num_heads=LOCAL_HEADS,
-            q_proj_weight=weights["q_proj_w"][:LOCAL_HEADS * QK_HEAD_DIM],
+            q_proj_weight=weights["q_proj_w"][: LOCAL_HEADS * QK_HEAD_DIM],
             kv_a_proj_weight=weights["kv_a_proj_w"],
             kv_b_proj_weight=kv_b_local,
-            o_proj_weight=weights["o_proj_w"][:, :LOCAL_HEADS * V_HEAD_DIM],
+            o_proj_weight=weights["o_proj_w"][:, : LOCAL_HEADS * V_HEAD_DIM],
             kv_a_ln_weight=weights["kv_a_ln_w"],
         )
         impl.forward_fused(
@@ -435,7 +444,7 @@ class TestTP4Correctness:
     def test_fallback_all_reduce_called_when_reduce_fn_none(self):
         """When reduce_fn=None and tp_size > 1, torch.distributed.all_reduce is called."""
         weights = _make_full_weights(seed=99)
-        kv_b_local = weights["kv_b_proj_w"][:LOCAL_HEADS * (QK_NOPE_HEAD_DIM + V_HEAD_DIM)]
+        kv_b_local = weights["kv_b_proj_w"][: LOCAL_HEADS * (QK_NOPE_HEAD_DIM + V_HEAD_DIM)]
         impl = CPUFusedMLAImpl(
             num_heads=LOCAL_HEADS,
             head_size=QK_HEAD_DIM,
@@ -456,10 +465,10 @@ class TestTP4Correctness:
         impl.process_weights_after_loading(act_dtype=torch.float32)
         wrapper = _make_wrapper(
             num_heads=LOCAL_HEADS,
-            q_proj_weight=weights["q_proj_w"][:LOCAL_HEADS * QK_HEAD_DIM],
+            q_proj_weight=weights["q_proj_w"][: LOCAL_HEADS * QK_HEAD_DIM],
             kv_a_proj_weight=weights["kv_a_proj_w"],
             kv_b_proj_weight=kv_b_local,
-            o_proj_weight=weights["o_proj_w"][:, :LOCAL_HEADS * V_HEAD_DIM],
+            o_proj_weight=weights["o_proj_w"][:, : LOCAL_HEADS * V_HEAD_DIM],
             kv_a_ln_weight=weights["kv_a_ln_w"],
         )
 

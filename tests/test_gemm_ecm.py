@@ -141,9 +141,7 @@ def test_ecm_prediction_uses_matrix_or_nonoverlap_critical_path() -> None:
         matrix_bound.fixed_ns + matrix_bound.matrix_ns + matrix_bound.epilogue_ns
     )
     assert transfer_bound.bottleneck == "load_transfer"
-    assert transfer_bound.body_ns == pytest.approx(
-        transfer_bound.l1_load_ns + transfer_bound.llc_ns
-    )
+    assert transfer_bound.body_ns == pytest.approx(transfer_bound.l1_load_ns + transfer_bound.llc_ns)
 
 
 def _synthetic_stage_profile(*, w13_panel_ns: float) -> dict:
@@ -183,9 +181,7 @@ def test_stage_report_validates_panel_model_on_holdout_routes() -> None:
         identity_source="identity.json",
     )
 
-    observations = {
-        (row["stage"], row["threads"]): row for row in report["observations"]
-    }
+    observations = {(row["stage"], row["threads"]): row for row in report["observations"]}
     assert observations[("w13", 1)]["panel_ns"] == pytest.approx(620_000.0)
     assert observations[("w2", 1)]["panel_ns"] == pytest.approx(300_000.0)
     assert observations[("w13", 1)]["holdout_max_error"] == pytest.approx(0.0)

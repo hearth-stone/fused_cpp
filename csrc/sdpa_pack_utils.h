@@ -81,13 +81,7 @@ inline void copy_8_elems(const scalar_t* src, scalar_t* dst) {
 }
 
 template <typename scalar_t>
-void pack_v_to_evblock8(
-    const scalar_t* v_src,
-    scalar_t* v_dst,
-    int64_t B,
-    int64_t N,
-    int64_t S,
-    int64_t Ev) {
+void pack_v_to_evblock8(const scalar_t* v_src, scalar_t* v_dst, int64_t B, int64_t N, int64_t S, int64_t Ev) {
   const int64_t Eb = Ev / 8;
   const int64_t bn_stride_src = N * S * Ev;
   const int64_t n_stride_src = S * Ev;
@@ -96,17 +90,13 @@ void pack_v_to_evblock8(
   const int64_t evblock_stride_dst = S * 8;
 
 #ifdef _OPENMP
-  #pragma omp parallel for collapse(3) schedule(static)
+#pragma omp parallel for collapse(3) schedule(static)
 #endif
   for (int64_t b = 0; b < B; ++b) {
     for (int64_t n = 0; n < N; ++n) {
       for (int64_t eb = 0; eb < Eb; ++eb) {
-        const scalar_t* src = v_src + b * bn_stride_src
-                                    + n * n_stride_src
-                                    + eb * 8;
-        scalar_t* dst = v_dst + b * bn_stride_dst
-                              + n * n_stride_dst
-                              + eb * evblock_stride_dst;
+        const scalar_t* src = v_src + b * bn_stride_src + n * n_stride_src + eb * 8;
+        scalar_t* dst = v_dst + b * bn_stride_dst + n * n_stride_dst + eb * evblock_stride_dst;
         int64_t s = 0;
         for (; s + 4 <= S; s += 4) {
           copy_8_elems(src + (s + 0) * Ev, dst + (s + 0) * 8);

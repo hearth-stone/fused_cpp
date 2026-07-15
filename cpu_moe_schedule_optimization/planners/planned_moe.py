@@ -18,14 +18,8 @@ _BUCKETS = [1, 2, 4, 8, 12, 24, 48, 96, 192, 384, 768, 1536, 2040, 4096, 8192]
 def route_counts(topk_ids, num_experts: int) -> List[Tuple[int, int]]:
     import torch
 
-    counts = torch.bincount(
-        topk_ids.reshape(-1).to(torch.int64), minlength=num_experts
-    )
-    return [
-        (expert, int(routes))
-        for expert, routes in enumerate(counts.tolist())
-        if routes > 0
-    ]
+    counts = torch.bincount(topk_ids.reshape(-1).to(torch.int64), minlength=num_experts)
+    return [(expert, int(routes)) for expert, routes in enumerate(counts.tolist()) if routes > 0]
 
 
 def _bucket(value: int) -> int:
@@ -38,9 +32,7 @@ def _quantile(values: list[int], fraction: float) -> int:
     return ordered[index]
 
 
-def signature(
-    counts: List[Tuple[int, int]], policy_identity: tuple[object, ...] = ()
-) -> Tuple[object, ...]:
+def signature(counts: List[Tuple[int, int]], policy_identity: tuple[object, ...] = ()) -> Tuple[object, ...]:
     """Policy-bound bucket histogram; expert ids do not affect shape choice."""
     routes = [count for _, count in counts]
     if not routes:
@@ -78,14 +70,9 @@ class PlannedMoE:
             raise ValueError("at least one cost model is required")
         self.num_cores = int(num_cores)
         self.cpu_ids = tuple(cpu_ids) if cpu_ids is not None else tuple(range(num_cores))
-        self.interval_planners = tuple(
-            IntervalPlanner(model, num_cores, cpu_ids=self.cpu_ids)
-            for model in self.models
-        )
+        self.interval_planners = tuple(IntervalPlanner(model, num_cores, cpu_ids=self.cpu_ids) for model in self.models)
         self.policy_planner = (
-            PolicyAwarePlanner(self.models, num_cores, cpu_ids=self.cpu_ids)
-            if len(self.models) > 1
-            else None
+            PolicyAwarePlanner(self.models, num_cores, cpu_ids=self.cpu_ids) if len(self.models) > 1 else None
         )
         self.policy_identity = tuple(
             (
@@ -115,9 +102,7 @@ class PlannedMoE:
         model = self.models[planner_index]
         return {
             "shape": shape,
-            "w13_split": (
-                model.policy.w13_split if model.policy is not None else None
-            ),
+            "w13_split": (model.policy.w13_split if model.policy is not None else None),
             "policy": (
                 {
                     "profile": str(model.profile_path),

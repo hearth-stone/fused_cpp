@@ -18,9 +18,7 @@ CASES = (
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Sweep the standalone elastic SVE fused GEMM experiment"
-    )
+    parser = argparse.ArgumentParser(description="Sweep the standalone elastic SVE fused GEMM experiment")
     parser.add_argument(
         "--binary",
         type=pathlib.Path,
@@ -38,9 +36,7 @@ def parse_args():
         action="append",
         help="Run only a named case; may be specified more than once",
     )
-    parser.add_argument(
-        "--quick", action="store_true", help="Use 3 iterations and 2 data copies"
-    )
+    parser.add_argument("--quick", action="store_true", help="Use 3 iterations and 2 data copies")
     return parser.parse_args()
 
 
@@ -71,9 +67,7 @@ def run_case(args, case_name, stage, k, n, threads):
         str(args.cpu_start),
     ]
     print(f"\n### {case_name} threads={threads}", flush=True)
-    completed = subprocess.run(
-        command, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
-    )
+    completed = subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     print(completed.stdout, end="", flush=True)
     if completed.returncode != 0:
         raise subprocess.CalledProcessError(completed.returncode, command)
@@ -113,10 +107,7 @@ def main():
         print(f"wrote {len(records)} records to {args.output}")
 
     summaries = [r for r in records if r["record_type"] == "summary"]
-    print(
-        "\ncase                 T  fragment%  phase%  strict%  "
-        "elastic/static%  elastic/phase%"
-    )
+    print("\ncase                 T  fragment%  phase%  strict%  elastic/static%  elastic/phase%")
     print("--------------------------------------------------------------------------------")
     for record in summaries:
         print(

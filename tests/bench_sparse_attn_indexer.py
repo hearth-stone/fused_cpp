@@ -38,9 +38,7 @@ def _make_prefill_metadata(
     if query_len > model_seq_len:
         raise ValueError("per-request query length must not exceed model_seq_len")
 
-    cu_seq_lens = torch.arange(
-        0, (num_reqs + 1) * indexer_seq_len, indexer_seq_len, dtype=torch.int32
-    )
+    cu_seq_lens = torch.arange(0, (num_reqs + 1) * indexer_seq_len, indexer_seq_len, dtype=torch.int32)
     starts = []
     ends = []
     for req_idx in range(num_reqs):
@@ -152,9 +150,7 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
-    indexer_seq_len = (
-        args.seq_len if args.seq_len is not None else args.model_seq_len // args.compress_ratio
-    )
+    indexer_seq_len = args.seq_len if args.seq_len is not None else args.model_seq_len // args.compress_ratio
     torch.manual_seed(args.seed)
     metadata = _make_prefill_metadata(
         num_tokens=args.tokens,

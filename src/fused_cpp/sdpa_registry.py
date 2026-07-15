@@ -15,6 +15,7 @@
   * 元数据中 ``supports_*`` 系列「能力位」用于 ``pytest_generate_tests`` 钩子
     在收集阶段自动 skip 不兼容的测试组合。
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
@@ -76,22 +77,13 @@ class VersionInfo:
         :return: ``(ok, reason)``；``ok`` 为 False 时 ``reason`` 给出缺失能力。
         """
         if dtype is not None and dtype not in self.supports_dtypes:
-            return False, (
-                f"version={self.name!r} does not support dtype={dtype}"
-            )
+            return False, (f"version={self.name!r} does not support dtype={dtype}")
         if is_causal and not self.supports_causal:
-            return False, (
-                f"version={self.name!r} does not support is_causal=True"
-            )
+            return False, (f"version={self.name!r} does not support is_causal=True")
         if attn_mask and not self.supports_attn_mask:
-            return False, (
-                f"version={self.name!r} does not support attn_mask"
-            )
+            return False, (f"version={self.name!r} does not support attn_mask")
         if mla_shape and not self.supports_mla_shape:
-            return False, (
-                f"version={self.name!r} does not support MLA shape "
-                f"(qk_head_dim != v_head_dim)"
-            )
+            return False, (f"version={self.name!r} does not support MLA shape (qk_head_dim != v_head_dim)")
         return True, ""
 
 
@@ -153,19 +145,13 @@ def register_sdpa_version(
     :return: 直接返回原始 callable，便于链式调用。
     """
     if source not in _VALID_SOURCES:
-        raise ValueError(
-            f"invalid source={source!r}; must be one of "
-            f"{sorted(_VALID_SOURCES)}"
-        )
+        raise ValueError(f"invalid source={source!r}; must be one of {sorted(_VALID_SOURCES)}")
     if not isinstance(name, str) or not name:
         raise ValueError(f"version name must be a non-empty str, got {name!r}")
 
     def _decorator(fn: SdpaCallable) -> SdpaCallable:
         if name in _REGISTRY and not override:
-            raise ValueError(
-                f"SDPA version {name!r} is already registered; "
-                f"pass override=True to replace it"
-            )
+            raise ValueError(f"SDPA version {name!r} is already registered; pass override=True to replace it")
         info = VersionInfo(
             name=name,
             callable=fn,
@@ -195,10 +181,7 @@ def get_sdpa_version(name: str) -> VersionInfo:
     """
     if name not in _REGISTRY:
         available = sorted(_REGISTRY.keys())
-        raise KeyError(
-            f"SDPA version {name!r} is not registered; "
-            f"available versions: {available}"
-        )
+        raise KeyError(f"SDPA version {name!r} is not registered; available versions: {available}")
     return _REGISTRY[name]
 
 

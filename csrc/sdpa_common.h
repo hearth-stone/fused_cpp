@@ -31,45 +31,45 @@
 // 直接以整型 enum 表示，避免在头文件中引入 ATen 依赖。
 // 取值与常用 ScalarType 一一对应，转换在 sdpa_versions.cpp 完成。
 enum class SdpaDtype : int32_t {
-    kFloat32  = 0,
-    kBFloat16 = 1,
+  kFloat32 = 0,
+  kBFloat16 = 1,
 };
 
 // ── SDPA 参数结构体 ──────────────────────────────────────────────────────
 struct SdpaParams {
-    // ── 形状 ──
-    int64_t B   = 0;   ///< batch_size
-    int64_t N   = 0;   ///< num_heads
-    int64_t L   = 0;   ///< query seq_len
-    int64_t S   = 0;   ///< key/value seq_len
-    int64_t E   = 0;   ///< qk_head_dim
-    int64_t Ev  = 0;   ///< v_head_dim
+  // ── 形状 ──
+  int64_t B = 0;   ///< batch_size
+  int64_t N = 0;   ///< num_heads
+  int64_t L = 0;   ///< query seq_len
+  int64_t S = 0;   ///< key/value seq_len
+  int64_t E = 0;   ///< qk_head_dim
+  int64_t Ev = 0;  ///< v_head_dim
 
-    // ── 标量/掩码控制 ──
-    float scale_f       = 0.0f;             ///< 缩放因子
-    float neg_inf       = 0.0f;             ///< -infinity 占位
-    int64_t causal_offset = 0;              ///< S - L
-    bool is_causal      = false;
-    SdpaDtype dtype     = SdpaDtype::kFloat32;
+  // ── 标量/掩码控制 ──
+  float scale_f = 0.0f;       ///< 缩放因子
+  float neg_inf = 0.0f;       ///< -infinity 占位
+  int64_t causal_offset = 0;  ///< S - L
+  bool is_causal = false;
+  SdpaDtype dtype = SdpaDtype::kFloat32;
 
-    // ── 数据指针（dtype-erased）──
-    // q_ptr / k_ptr / v_ptr 的实际类型由 dtype 决定：
-    //   dtype == kFloat32  -> const float*
-    //   dtype == kBFloat16 -> const at::BFloat16* (二进制等价于 uint16_t)
-    const void* q_ptr   = nullptr;
-    const void* k_ptr   = nullptr;
-    const void* v_ptr   = nullptr;
+  // ── 数据指针（dtype-erased）──
+  // q_ptr / k_ptr / v_ptr 的实际类型由 dtype 决定：
+  //   dtype == kFloat32  -> const float*
+  //   dtype == kBFloat16 -> const at::BFloat16* (二进制等价于 uint16_t)
+  const void* q_ptr = nullptr;
+  const void* k_ptr = nullptr;
+  const void* v_ptr = nullptr;
 
-    // mask 指针始终是 fp32（或 nullptr）
-    const float* mask_ptr = nullptr;
+  // mask 指针始终是 fp32（或 nullptr）
+  const float* mask_ptr = nullptr;
 
-    // 输出指针始终为 fp32 累加缓冲
-    float* out_ptr      = nullptr;
+  // 输出指针始终为 fp32 累加缓冲
+  float* out_ptr = nullptr;
 
-    // Optional fp32 statistics output in contiguous [B, N, L] layout.
-    // Kernels that do not produce these values may leave them untouched.
-    float* max_logits_ptr = nullptr;
-    float* lse_ptr        = nullptr;
+  // Optional fp32 statistics output in contiguous [B, N, L] layout.
+  // Kernels that do not produce these values may leave them untouched.
+  float* max_logits_ptr = nullptr;
+  float* lse_ptr = nullptr;
 };
 
 // ── 内核函数指针 ──────────────────────────────────────────────────────────
@@ -103,5 +103,4 @@ void sdpa_dispatch(const std::string& name, const SdpaParams& p);
 #define SDPA_REG_CONCAT(a, b) SDPA_REG_CONCAT_INNER(a, b)
 
 #define REGISTER_SDPA_VERSION(name, fn) \
-    static int SDPA_REG_CONCAT(_sdpa_reg_, __COUNTER__) = \
-        sdpa_register_version((name), (fn))
+  static int SDPA_REG_CONCAT(_sdpa_reg_, __COUNTER__) = sdpa_register_version((name), (fn))

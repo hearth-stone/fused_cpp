@@ -15,6 +15,7 @@ On the AWS machine, pin the whole process, e.g.:
 
 Output: a per-shape winner/ratio table, a crossover map, and CSV/JSON dumps.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -99,11 +100,7 @@ def main() -> int:
     for stage, dims in shapes.items():
         K, N = dims["K"], dims["N"]
         weight = bf16_normal((N, K), gen, args.std)  # [N, K]
-        bias = (
-            torch.randn(N, dtype=torch.float32, generator=gen) * 0.1
-            if args.with_bias
-            else None
-        )
+        bias = torch.randn(N, dtype=torch.float32, generator=gen) * 0.1 if args.with_bias else None
         print(f"\n=== stage={stage}  K={K}  N={N}  (N_blocks={N // 8}) ===")
         print("M      T     m_ms      n_ms      winner  n/m     m_gflops  n_gflops")
         for M in m_values:
@@ -111,9 +108,7 @@ def main() -> int:
             for T in thread_list:
                 res: Dict[str, float] = {}
                 for split in ("m", "n"):
-                    times = _C.fused_moe_bench_team_gemm(
-                        A, weight, T, split, bias, args.warmup, args.runs
-                    )
+                    times = _C.fused_moe_bench_team_gemm(A, weight, T, split, bias, args.warmup, args.runs)
                     res[split] = float(statistics.median(times))
                 flops = 2.0 * M * K * N
                 m_ms, n_ms = res["m"], res["n"]
@@ -138,8 +133,7 @@ def main() -> int:
                 )
                 mark = "" if T > 1 else "  (T=1: split irrelevant)"
                 print(
-                    f"{M:<6} {T:<5} {m_ms:9.4f} {n_ms:9.4f} {winner:<7} "
-                    f"{n_over_m:6.3f}  {m_g:8.1f}  {n_g:8.1f}{mark}"
+                    f"{M:<6} {T:<5} {m_ms:9.4f} {n_ms:9.4f} {winner:<7} {n_over_m:6.3f}  {m_g:8.1f}  {n_g:8.1f}{mark}"
                 )
 
     print("\n=== winner map (rows=M, cols=T>1); '.' = tie (<3%) ===")
@@ -152,10 +146,7 @@ def main() -> int:
         for M in ms:
             cells = []
             for t in ts:
-                r = next(
-                    x for x in srows
-                    if int(x["M"]) == M and int(x["threads"]) == t
-                )
+                r = next(x for x in srows if int(x["M"]) == M and int(x["threads"]) == t)
                 ratio = float(r["n_over_m"])
                 if 0.97 <= ratio <= 1.03:
                     cells.append("   .")
@@ -187,8 +178,17 @@ def main() -> int:
             w = csv.DictWriter(
                 f,
                 fieldnames=[
-                    "stage", "K", "N", "M", "threads", "m_ms", "n_ms",
-                    "winner", "n_over_m", "m_gflops", "n_gflops",
+                    "stage",
+                    "K",
+                    "N",
+                    "M",
+                    "threads",
+                    "m_ms",
+                    "n_ms",
+                    "winner",
+                    "n_over_m",
+                    "m_gflops",
+                    "n_gflops",
                 ],
             )
             w.writeheader()

@@ -49,9 +49,7 @@ class ProfilePolicy:
         if not llc_values or any(value is None for value in llc_values):
             raise ProfileCompatibilityError("profile is missing LLC identity")
         if len({int(value) for value in llc_values}) != 1:
-            raise ProfileCompatibilityError(
-                "heterogeneous per-rank LLC profiles are not supported"
-            )
+            raise ProfileCompatibilityError("heterogeneous per-rank LLC profiles are not supported")
         cpu_ids_by_rank = target.get("cpu_ids_by_rank")
         if cpu_ids_by_rank is None:
             cpu_ids_by_rank = [target.get("cpu_ids", [])]
@@ -61,9 +59,7 @@ class ProfilePolicy:
         source_sha = kernel.get("source_sha256")
         extension_sha = kernel.get("extension_sha256")
         if not source_sha or not extension_sha:
-            raise ProfileCompatibilityError(
-                "schema-v2 profile requires source and extension hashes"
-            )
+            raise ProfileCompatibilityError("schema-v2 profile requires source and extension hashes")
         return cls(
             mode=str(parallelism["mode"]),
             degree=int(parallelism["degree"]),
@@ -82,9 +78,7 @@ class ProfilePolicy:
             concurrent_ranks=int(target["concurrent_ranks"]),
             llc_bytes_per_rank=int(llc_values[0]),
             numa_nodes=tuple(int(value) for value in numa_nodes),
-            cpu_ids_by_rank=tuple(
-                tuple(int(cpu) for cpu in cpu_ids) for cpu_ids in cpu_ids_by_rank
-            ),
+            cpu_ids_by_rank=tuple(tuple(int(cpu) for cpu in cpu_ids) for cpu_ids in cpu_ids_by_rank),
             source_sha256=str(source_sha),
             extension_sha256=str(extension_sha),
         )
@@ -166,15 +160,11 @@ class ProfileCatalog:
         for raw_path in paths:
             path = Path(raw_path)
             payload = json.loads(path.read_text(encoding="utf-8"))
-            records.append(
-                ProfileRecord(path, payload, ProfilePolicy.from_payload(payload))
-            )
+            records.append(ProfileRecord(path, payload, ProfilePolicy.from_payload(payload)))
         return cls(records)
 
     @classmethod
-    def from_directory(
-        cls, directory: str | Path, pattern: str = "*_v2_*.json"
-    ) -> "ProfileCatalog":
+    def from_directory(cls, directory: str | Path, pattern: str = "*_v2_*.json") -> "ProfileCatalog":
         return cls.from_paths(sorted(Path(directory).glob(pattern)))
 
     def select(self, query: ProfileQuery) -> ProfileRecord:
@@ -182,41 +172,26 @@ class ProfileCatalog:
         if len(matches) == 1:
             return matches[0]
         if not matches:
-            details = {
-                record.path.name: record.policy.mismatch(query)
-                for record in self.records
-            }
-            raise ProfileCompatibilityError(
-                f"no exact profile matches {query}; mismatches={details}"
-            )
+            details = {record.path.name: record.policy.mismatch(query) for record in self.records}
+            raise ProfileCompatibilityError(f"no exact profile matches {query}; mismatches={details}")
         raise ProfileCompatibilityError(
-            "profile query is ambiguous: "
-            + ", ".join(record.path.name for record in matches)
+            "profile query is ambiguous: " + ", ".join(record.path.name for record in matches)
         )
 
     def split_pair(self, query: ProfileQuery) -> tuple[ProfileRecord, ProfileRecord]:
         if query.w13_split is not None:
             raise ValueError("split_pair query must leave w13_split unspecified")
-        no_split = self.select(
-            ProfileQuery(**{**query.__dict__, "w13_split": False})
-        )
+        no_split = self.select(ProfileQuery(**{**query.__dict__, "w13_split": False}))
         split = self.select(ProfileQuery(**{**query.__dict__, "w13_split": True}))
         if no_split.policy.key_without_split() != split.policy.key_without_split():
             raise ProfileCompatibilityError("split/no-split profiles are not a pair")
         if self._grid_signature(no_split.payload) != self._grid_signature(split.payload):
-            raise ProfileCompatibilityError(
-                "split/no-split profiles use different route/thread/shape grids"
-            )
+            raise ProfileCompatibilityError("split/no-split profiles use different route/thread/shape grids")
         return no_split, split
 
     @staticmethod
     def _grid_signature(payload: dict) -> tuple[object, ...]:
-        isolated = tuple(
-            sorted(
-                (int(entry["routes"]), int(entry["threads"]))
-                for entry in payload["isolated"]
-            )
-        )
+        isolated = tuple(sorted((int(entry["routes"]), int(entry["threads"])) for entry in payload["isolated"]))
         contention = tuple(
             sorted(
                 (

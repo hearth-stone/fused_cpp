@@ -83,9 +83,7 @@ def _case_top1(seed: int = 0) -> tuple[torch.Tensor, ...]:
     w2_weight = _bf16_randn(num_experts, hidden_size, ffn_hidden_size)
     w13_bias = torch.randn(num_experts, 2 * ffn_hidden_size) * 0.1
     w2_bias = torch.randn(num_experts, hidden_size) * 0.1
-    topk_ids = torch.tensor(
-        [[i % num_experts] for i in range(num_tokens)], dtype=torch.int32
-    )
+    topk_ids = torch.tensor([[i % num_experts] for i in range(num_tokens)], dtype=torch.int32)
     topk_weights = torch.ones(num_tokens, 1)
     return (
         hidden_states,
@@ -109,9 +107,7 @@ def test_sve_m12_silu_and_w2_bf16_route_match_legacy_for_unit_top1(
     route_counts = list(range(1, 24))
     num_experts = len(route_counts)
     num_tokens = sum(route_counts)
-    hidden_states = _bf16_normal(
-        (num_tokens, hidden_size), generator=generator, std=0.01
-    )
+    hidden_states = _bf16_normal((num_tokens, hidden_size), generator=generator, std=0.01)
     w13_weight = _bf16_normal(
         (num_experts, 2 * ffn_hidden_size, hidden_size),
         generator=generator,
@@ -123,15 +119,10 @@ def test_sve_m12_silu_and_w2_bf16_route_match_legacy_for_unit_top1(
         std=0.01,
     )
     topk_ids = torch.cat(
-        [
-            torch.full((count,), expert, dtype=torch.int32)
-            for expert, count in enumerate(route_counts)
-        ]
+        [torch.full((count,), expert, dtype=torch.int32) for expert, count in enumerate(route_counts)]
     ).reshape(num_tokens, 1)
     topk_weights = torch.ones((num_tokens, 1), dtype=torch.float32)
-    packed = prepare_fused_moe_bf16_tiled_weights(
-        w13_weight, w2_weight, fuse_silu=True
-    )
+    packed = prepare_fused_moe_bf16_tiled_weights(w13_weight, w2_weight, fuse_silu=True)
     if packed.gemm_backend != 1:
         pytest.skip("requires an SVE BF16 build/runtime")
 
@@ -205,25 +196,18 @@ def test_sve_m12_silu_and_w2_bf16_route_match_legacy_for_unit_top1(
                 reference.float(),
                 atol=0,
                 rtol=0,
-                msg=lambda message, bridge=bridge, degree=degree: (
-                    f"{bridge}/poly{degree}: {message}"
-                ),
+                msg=lambda message, bridge=bridge, degree=degree: f"{bridge}/poly{degree}: {message}",
             )
 
             for recip_steps in (1, 2):
-                monkeypatch.setenv(
-                    "FUSED_CPP_MOE_SILU_RECIP_NR", str(recip_steps)
-                )
+                monkeypatch.setenv("FUSED_CPP_MOE_SILU_RECIP_NR", str(recip_steps))
                 reciprocal = call(degree)
                 torch.testing.assert_close(
                     reciprocal.float(),
                     candidate.float(),
                     atol=1.0e-6,
                     rtol=1.0e-2,
-                    msg=lambda message,
-                    bridge=bridge,
-                    degree=degree,
-                    recip_steps=recip_steps: (
+                    msg=lambda message, bridge=bridge, degree=degree, recip_steps=recip_steps: (
                         f"{bridge}/poly{degree}/recip{recip_steps}: {message}"
                     ),
                 )
@@ -237,9 +221,7 @@ def test_sve_m12_silu_and_w2_bf16_route_match_legacy_for_unit_top1(
                     candidate.float(),
                     atol=1.0e-6,
                     rtol=2.0e-2,
-                    msg=lambda message, bridge=bridge: (
-                        f"{bridge}/minimax3: {message}"
-                    ),
+                    msg=lambda message, bridge=bridge: f"{bridge}/minimax3: {message}",
                 )
 
 
@@ -259,9 +241,7 @@ def test_sve_expert_barrier_elision_reuses_dirty_scratch(
 ) -> None:
     """Exercise all M tails while repeatedly reusing dirty team scratch."""
     monkeypatch.setenv("FUSED_CPP_MOE_SVE", "1")
-    monkeypatch.setenv(
-        "FUSED_CPP_MOE_W2_BF16_ROUTE", "1" if w2_bf16_route else "0"
-    )
+    monkeypatch.setenv("FUSED_CPP_MOE_W2_BF16_ROUTE", "1" if w2_bf16_route else "0")
     generator = torch.Generator().manual_seed(20260714)
     hidden_size = 64
     ffn_hidden_size = 32
@@ -269,17 +249,11 @@ def test_sve_expert_barrier_elision_reuses_dirty_scratch(
     num_experts = len(route_counts)
     num_tokens = sum(route_counts)
     threads = 5
-    affinity = (
-        sorted(os.sched_getaffinity(0))
-        if hasattr(os, "sched_getaffinity")
-        else list(range(threads))
-    )
+    affinity = sorted(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else list(range(threads))
     if len(affinity) < threads:
         pytest.skip(f"requires {threads} available CPUs")
 
-    hidden_states = _bf16_normal(
-        (num_tokens, hidden_size), generator=generator, std=0.01
-    )
+    hidden_states = _bf16_normal((num_tokens, hidden_size), generator=generator, std=0.01)
     w13_weight = _bf16_normal(
         (num_experts, 2 * ffn_hidden_size, hidden_size),
         generator=generator,
@@ -291,15 +265,10 @@ def test_sve_expert_barrier_elision_reuses_dirty_scratch(
         std=0.01,
     )
     topk_ids = torch.cat(
-        [
-            torch.full((count,), expert, dtype=torch.int32)
-            for expert, count in enumerate(route_counts)
-        ]
+        [torch.full((count,), expert, dtype=torch.int32) for expert, count in enumerate(route_counts)]
     ).reshape(num_tokens, 1)
     topk_weights = torch.ones((num_tokens, 1), dtype=torch.float32)
-    packed = prepare_fused_moe_bf16_tiled_weights(
-        w13_weight, w2_weight, fuse_silu=True
-    )
+    packed = prepare_fused_moe_bf16_tiled_weights(w13_weight, w2_weight, fuse_silu=True)
     if packed.gemm_backend != 1:
         pytest.skip("requires an SVE BF16 build/runtime")
 
@@ -362,8 +331,7 @@ def test_sve_expert_barrier_elision_reuses_dirty_scratch(
             atol=0,
             rtol=0,
             msg=lambda message: (
-                f"{bridge}/bf16_route={w2_bf16_route}/"
-                f"zero={elide_zero}/owner={owner_scatter}: {message}"
+                f"{bridge}/bf16_route={w2_bf16_route}/zero={elide_zero}/owner={owner_scatter}: {message}"
             ),
         )
 
@@ -685,10 +653,7 @@ def test_fused_moe_bf16_tiled_hierarchical_core_skip_is_relative(
     )
 
     first_cpu = _first_affinity_cpu()
-    assert (
-        f"core_bases=[{first_cpu},{first_cpu + 2}]"
-        in captured.err
-    )
+    assert f"core_bases=[{first_cpu},{first_cpu + 2}]" in captured.err
     torch.testing.assert_close(hierarchical.float(), serial.float(), atol=0, rtol=0)
 
 

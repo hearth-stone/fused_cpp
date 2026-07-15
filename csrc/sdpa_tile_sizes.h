@@ -41,19 +41,19 @@
 // ──────────────────────────────────────────────────────────────────────
 
 #ifndef FUSED_CPP_SDPA_L1_BYTES
-#define FUSED_CPP_SDPA_L1_BYTES 65536          // 64 KB
+#define FUSED_CPP_SDPA_L1_BYTES 65536  // 64 KB
 #define FUSED_CPP_SDPA_L1_BYTES_USER_OVERRIDE 0
 #else
 #define FUSED_CPP_SDPA_L1_BYTES_USER_OVERRIDE 1
 #endif
 #ifndef FUSED_CPP_SDPA_L2_BYTES
-#define FUSED_CPP_SDPA_L2_BYTES 1310720        // 1280 KB
+#define FUSED_CPP_SDPA_L2_BYTES 1310720  // 1280 KB
 #define FUSED_CPP_SDPA_L2_BYTES_USER_OVERRIDE 0
 #else
 #define FUSED_CPP_SDPA_L2_BYTES_USER_OVERRIDE 1
 #endif
 #ifndef FUSED_CPP_SDPA_L3_BYTES
-#define FUSED_CPP_SDPA_L3_BYTES 73400320       // 70 MB
+#define FUSED_CPP_SDPA_L3_BYTES 73400320  // 70 MB
 #define FUSED_CPP_SDPA_L3_BYTES_USER_OVERRIDE 0
 #else
 #define FUSED_CPP_SDPA_L3_BYTES_USER_OVERRIDE 1
@@ -79,12 +79,9 @@ static_assert(FUSED_CPP_SDPA_L2_RATIO > 0.0 && FUSED_CPP_SDPA_L2_RATIO <= 1.0,
               "FUSED_CPP_SDPA_L2_RATIO must be in (0.0, 1.0]");
 static_assert(FUSED_CPP_SDPA_L3_RATIO > 0.0 && FUSED_CPP_SDPA_L3_RATIO <= 1.0,
               "FUSED_CPP_SDPA_L3_RATIO must be in (0.0, 1.0]");
-static_assert(FUSED_CPP_SDPA_L1_BYTES > 0,
-              "FUSED_CPP_SDPA_L1_BYTES must be positive");
-static_assert(FUSED_CPP_SDPA_L2_BYTES > 0,
-              "FUSED_CPP_SDPA_L2_BYTES must be positive");
-static_assert(FUSED_CPP_SDPA_L3_BYTES > 0,
-              "FUSED_CPP_SDPA_L3_BYTES must be positive");
+static_assert(FUSED_CPP_SDPA_L1_BYTES > 0, "FUSED_CPP_SDPA_L1_BYTES must be positive");
+static_assert(FUSED_CPP_SDPA_L2_BYTES > 0, "FUSED_CPP_SDPA_L2_BYTES must be positive");
+static_assert(FUSED_CPP_SDPA_L3_BYTES > 0, "FUSED_CPP_SDPA_L3_BYTES must be positive");
 
 namespace fused_cpp::sdpa_tile_sizes {
 
@@ -110,8 +107,8 @@ inline int64_t probe_cache_bytes_one_level(int level) {
   // 拿不到（旧 macOS 或 Intel mac）才回退到无后缀 key。
   const char* keys_apple[3][2] = {
       {"hw.perflevel0.l1dcachesize", "hw.l1dcachesize"},
-      {"hw.perflevel0.l2cachesize",  "hw.l2cachesize"},
-      {"hw.perflevel0.l3cachesize",  "hw.l3cachesize"},
+      {"hw.perflevel0.l2cachesize", "hw.l2cachesize"},
+      {"hw.perflevel0.l3cachesize", "hw.l3cachesize"},
   };
   if (level < 1 || level > 3) return -1;
   for (int i = 0; i < 2; ++i) {
@@ -154,12 +151,9 @@ inline int64_t probe_cache_bytes_one_level(int level) {
     char path_level[256];
     char path_type[256];
     char path_size[256];
-    std::snprintf(path_level, sizeof(path_level),
-                  "/sys/devices/system/cpu/cpu0/cache/index%d/level", idx);
-    std::snprintf(path_type, sizeof(path_type),
-                  "/sys/devices/system/cpu/cpu0/cache/index%d/type", idx);
-    std::snprintf(path_size, sizeof(path_size),
-                  "/sys/devices/system/cpu/cpu0/cache/index%d/size", idx);
+    std::snprintf(path_level, sizeof(path_level), "/sys/devices/system/cpu/cpu0/cache/index%d/level", idx);
+    std::snprintf(path_type, sizeof(path_type), "/sys/devices/system/cpu/cpu0/cache/index%d/type", idx);
+    std::snprintf(path_size, sizeof(path_size), "/sys/devices/system/cpu/cpu0/cache/index%d/size", idx);
 
     FILE* fp_level = std::fopen(path_level, "r");
     if (fp_level == nullptr) {
@@ -177,10 +171,12 @@ inline int64_t probe_cache_bytes_one_level(int level) {
     std::fclose(fp_type);
     (void)nread;
     for (size_t i = 0; i < sizeof(type_buf); ++i) {
-      if (type_buf[i] == '\n' || type_buf[i] == '\r') { type_buf[i] = '\0'; break; }
+      if (type_buf[i] == '\n' || type_buf[i] == '\r') {
+        type_buf[i] = '\0';
+        break;
+      }
     }
-    if (std::strcmp(type_buf, "Data") != 0 &&
-        std::strcmp(type_buf, "Unified") != 0) {
+    if (std::strcmp(type_buf, "Data") != 0 && std::strcmp(type_buf, "Unified") != 0) {
       continue;
     }
 
@@ -199,10 +195,20 @@ inline int64_t probe_cache_bytes_one_level(int level) {
     if (matched < 1 || num <= 0) continue;
     int64_t bytes = static_cast<int64_t>(num);
     switch (suffix) {
-      case 'K': case 'k': bytes *= 1024;             break;
-      case 'M': case 'm': bytes *= 1024 * 1024;      break;
-      case 'G': case 'g': bytes *= 1024 * 1024 * 1024LL; break;
-      default: /* 纯字节 */ break;
+      case 'K':
+      case 'k':
+        bytes *= 1024;
+        break;
+      case 'M':
+      case 'm':
+        bytes *= 1024 * 1024;
+        break;
+      case 'G':
+      case 'g':
+        bytes *= 1024 * 1024 * 1024LL;
+        break;
+      default: /* 纯字节 */
+        break;
     }
     if (bytes > 0) {
       return bytes;
@@ -244,15 +250,12 @@ inline const std::array<int64_t, 3>& effective_cache_bytes() {
     const char* dbg = std::getenv("FUSED_CPP_SDPA_DEBUG_TILE");
     if (dbg != nullptr && std::strcmp(dbg, "1") == 0) {
       std::fprintf(stderr,
-          "[sdpa_tile_sizes] effective L1/L2/L3 bytes = "
-          "%lld / %lld / %lld  (override=%d/%d/%d, probed=%lld/%lld/%lld)\n",
-          static_cast<long long>(result[0]),
-          static_cast<long long>(result[1]),
-          static_cast<long long>(result[2]),
-          kUserOverride[0], kUserOverride[1], kUserOverride[2],
-          static_cast<long long>(probed[0]),
-          static_cast<long long>(probed[1]),
-          static_cast<long long>(probed[2]));
+                   "[sdpa_tile_sizes] effective L1/L2/L3 bytes = "
+                   "%lld / %lld / %lld  (override=%d/%d/%d, probed=%lld/%lld/%lld)\n",
+                   static_cast<long long>(result[0]), static_cast<long long>(result[1]),
+                   static_cast<long long>(result[2]), kUserOverride[0], kUserOverride[1], kUserOverride[2],
+                   static_cast<long long>(probed[0]), static_cast<long long>(probed[1]),
+                   static_cast<long long>(probed[2]));
     }
     return result;
   }();
@@ -263,9 +266,7 @@ inline const std::array<int64_t, 3>& effective_cache_bytes() {
 // 整数算术 helper
 // ──────────────────────────────────────────────────────────────────────
 
-inline int64_t ceil_div_pos(int64_t x, int64_t y) {
-  return (x + y - 1) / y;
-}
+inline int64_t ceil_div_pos(int64_t x, int64_t y) { return (x + y - 1) / y; }
 
 inline int64_t floor_to_mult_min(int64_t x, int64_t m) {
   if (x < m) return m;
@@ -287,14 +288,8 @@ struct TileSizes {
 
 // compute_tile_sizes：与 sdpa_flash2_neon_cache.cpp 历史版本完全一致的
 // 推导。Lc_l2 固定 64（或 floor_to_mult_min(L, 8)）。
-inline TileSizes compute_tile_sizes(
-    int64_t B,
-    int64_t N,
-    int64_t S,
-    int64_t L,
-    int64_t E,
-    int64_t Ev,
-    int64_t sizeof_elt) {
+inline TileSizes compute_tile_sizes(int64_t B, int64_t N, int64_t S, int64_t L, int64_t E, int64_t Ev,
+                                    int64_t sizeof_elt) {
   (void)B;
   (void)N;
 
@@ -303,12 +298,9 @@ inline TileSizes compute_tile_sizes(
   constexpr int64_t Ev_micro = 8;
 
   const auto& cache_bytes = effective_cache_bytes();
-  const int64_t l3_budget =
-      static_cast<int64_t>(cache_bytes[2] * FUSED_CPP_SDPA_L3_RATIO);
-  const int64_t l2_budget =
-      static_cast<int64_t>(cache_bytes[1] * FUSED_CPP_SDPA_L2_RATIO);
-  const int64_t l1_budget =
-      static_cast<int64_t>(cache_bytes[0] * FUSED_CPP_SDPA_L1_RATIO);
+  const int64_t l3_budget = static_cast<int64_t>(cache_bytes[2] * FUSED_CPP_SDPA_L3_RATIO);
+  const int64_t l2_budget = static_cast<int64_t>(cache_bytes[1] * FUSED_CPP_SDPA_L2_RATIO);
+  const int64_t l1_budget = static_cast<int64_t>(cache_bytes[0] * FUSED_CPP_SDPA_L1_RATIO);
   (void)l1_budget;
 
   int64_t Lc_l2_cand = 64;
@@ -317,15 +309,10 @@ inline TileSizes compute_tile_sizes(
   }
   int64_t Lc_l2 = std::max<int64_t>(Lc_l2_cand, Lq_micro);
 
-  const int64_t l2_const_bytes =
-      Lc_l2 * E * sizeof_elt
-      + Lc_l2 * Ev * 4
-      + Lc_l2 * 2 * 4;
+  const int64_t l2_const_bytes = Lc_l2 * E * sizeof_elt + Lc_l2 * Ev * 4 + Lc_l2 * 2 * 4;
 
-  const int64_t per_sc =
-      2 * (E + Ev) * sizeof_elt + Lc_l2 * 4;
-  const int64_t l2_remain = std::max<int64_t>(
-      0, l2_budget - l2_const_bytes);
+  const int64_t per_sc = 2 * (E + Ev) * sizeof_elt + Lc_l2 * 4;
+  const int64_t l2_remain = std::max<int64_t>(0, l2_budget - l2_const_bytes);
 
   int64_t Sc_l2_cap;
   if (per_sc <= 0) {
@@ -377,14 +364,13 @@ inline TileSizes compute_tile_sizes(
 
 #ifdef FUSED_CPP_SDPA_DEBUG_TILES
   std::fprintf(stderr,
-      "[sdpa_tile_sizes] tiles: B=%lld N=%lld S=%lld L=%lld E=%lld "
-      "Ev=%lld sizeof_elt=%lld -> "
-      "Sc_l3=%lld Sc_l2=%lld Lc_l2=%lld Sk_micro=%lld Lq_micro=%lld "
-      "Ev_micro=%lld\n",
-      (long long)B, (long long)N, (long long)S, (long long)L,
-      (long long)E, (long long)Ev, (long long)sizeof_elt,
-      (long long)ts.Sc_l3, (long long)ts.Sc_l2, (long long)ts.Lc_l2,
-      (long long)ts.Sk_micro, (long long)ts.Lq_micro, (long long)ts.Ev_micro);
+               "[sdpa_tile_sizes] tiles: B=%lld N=%lld S=%lld L=%lld E=%lld "
+               "Ev=%lld sizeof_elt=%lld -> "
+               "Sc_l3=%lld Sc_l2=%lld Lc_l2=%lld Sk_micro=%lld Lq_micro=%lld "
+               "Ev_micro=%lld\n",
+               (long long)B, (long long)N, (long long)S, (long long)L, (long long)E, (long long)Ev,
+               (long long)sizeof_elt, (long long)ts.Sc_l3, (long long)ts.Sc_l2, (long long)ts.Lc_l2,
+               (long long)ts.Sk_micro, (long long)ts.Lq_micro, (long long)ts.Ev_micro);
 #endif
 
   return ts;
@@ -406,30 +392,19 @@ inline TileSizes compute_tile_sizes(
 //                 + 2 * Sc_l2 * 4           // scores + P_hat fp32（per row）
 //
 // Lc_cap = (l2_budget * 0.5) / per_row_bytes，clamp 到 [8, 64] 且 8 倍数。
-inline TileSizes compute_tile_sizes_l3kv(
-    int64_t B,
-    int64_t N,
-    int64_t S,
-    int64_t L,
-    int64_t E,
-    int64_t Ev,
-    int64_t sizeof_elt) {
+inline TileSizes compute_tile_sizes_l3kv(int64_t B, int64_t N, int64_t S, int64_t L, int64_t E, int64_t Ev,
+                                         int64_t sizeof_elt) {
   TileSizes ts = compute_tile_sizes(B, N, S, L, E, Ev, sizeof_elt);
 
   const auto& cache_bytes = effective_cache_bytes();
-  const int64_t l2_budget =
-      static_cast<int64_t>(cache_bytes[1] * FUSED_CPP_SDPA_L2_RATIO);
+  const int64_t l2_budget = static_cast<int64_t>(cache_bytes[1] * FUSED_CPP_SDPA_L2_RATIO);
 
   // 给 l3kv 内核的 accumulator 用一半 L2 预算（剩下一半给双缓冲 K/V tile
   // + L2 const overhead）。
   const int64_t f_l2 = l2_budget / 2;
 
   // 注意：scores + P_hat = 2 * Sc_l2 * 4 / row。
-  const int64_t per_row_bytes =
-      sizeof_elt * E
-      + 4 * Ev
-      + 2 * 4
-      + 2 * ts.Sc_l2 * 4;
+  const int64_t per_row_bytes = sizeof_elt * E + 4 * Ev + 2 * 4 + 2 * ts.Sc_l2 * 4;
   if (per_row_bytes <= 0) {
     return ts;
   }
@@ -451,10 +426,10 @@ inline TileSizes compute_tile_sizes_l3kv(
 
 #ifdef FUSED_CPP_SDPA_DEBUG_TILES
   std::fprintf(stderr,
-      "[sdpa_tile_sizes] l3kv refined: per_row_bytes=%lld Lc_cap=%lld -> "
-      "Lc_l2=%lld (Sc_l2=%lld Sc_l3=%lld)\n",
-      (long long)per_row_bytes, (long long)Lc_cap, (long long)ts.Lc_l2,
-      (long long)ts.Sc_l2, (long long)ts.Sc_l3);
+               "[sdpa_tile_sizes] l3kv refined: per_row_bytes=%lld Lc_cap=%lld -> "
+               "Lc_l2=%lld (Sc_l2=%lld Sc_l3=%lld)\n",
+               (long long)per_row_bytes, (long long)Lc_cap, (long long)ts.Lc_l2, (long long)ts.Sc_l2,
+               (long long)ts.Sc_l3);
 #endif
 
   return ts;

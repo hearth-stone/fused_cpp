@@ -15,6 +15,7 @@
   cd /home/zhangxu/vllm-aarch64/fused_cpp
   python tests/run_medium_bench_st.py
 """
+
 from __future__ import annotations
 
 import gc
@@ -32,22 +33,22 @@ import torch.nn.functional as F
 
 torch.set_num_threads(1)
 
-from fused_cpp._C import (
+from fused_cpp._C import (  # noqa: E402 - thread environment must be set first
     scaled_dot_product_attention_versioned as cpp_sdpa,
     list_sdpa_versions,
 )
-from fused_cpp.sdpa_flops import compute_sdpa_flops, gflops
+from fused_cpp.sdpa_flops import compute_sdpa_flops, gflops  # noqa: E402
 
 
 SHAPES = [
     # (label, B, N, L, S, E, Ev)
-    ("std    256",   1,  8,  256,  256,  64,  64),
-    ("std    512",   1,  8,  512,  512,  64,  64),
-    ("std    1024",  1,  8, 1024, 1024,  64,  64),
-    ("std128 1024",  1,  8, 1024, 1024, 128, 128),
-    ("MLA    512",   1, 16,  512,  512, 192, 128),
-    ("MLA    1024",  1, 16, 1024, 1024, 192, 128),
-    ("multi-bn",     2, 16, 1024, 1024, 128, 128),
+    ("std    256", 1, 8, 256, 256, 64, 64),
+    ("std    512", 1, 8, 512, 512, 64, 64),
+    ("std    1024", 1, 8, 1024, 1024, 64, 64),
+    ("std128 1024", 1, 8, 1024, 1024, 128, 128),
+    ("MLA    512", 1, 16, 512, 512, 192, 128),
+    ("MLA    1024", 1, 16, 1024, 1024, 192, 128),
+    ("multi-bn", 2, 16, 1024, 1024, 128, 128),
 ]
 
 DTYPES = [("fp32", torch.float32), ("bf16", torch.bfloat16)]
@@ -60,8 +61,8 @@ VERSIONS = list_sdpa_versions()
 
 def make_qkv(B, N, L, S, E, Ev, dtype, seed=1234):
     g = torch.Generator(device="cpu").manual_seed(seed)
-    q = torch.randn(B, N, L, E,  generator=g, dtype=torch.float32).to(dtype)
-    k = torch.randn(B, N, S, E,  generator=g, dtype=torch.float32).to(dtype)
+    q = torch.randn(B, N, L, E, generator=g, dtype=torch.float32).to(dtype)
+    k = torch.randn(B, N, S, E, generator=g, dtype=torch.float32).to(dtype)
     v = torch.randn(B, N, S, Ev, generator=g, dtype=torch.float32).to(dtype)
     return q, k, v
 
@@ -92,37 +93,33 @@ def bench_torch_math(q, k, v):
             with sdpa_kernel(SDPBackend.MATH):
                 F.scaled_dot_product_attention(q, k, v, is_causal=IS_CAUSAL)
     except Exception:
+
         def call():
             F.scaled_dot_product_attention(q, k, v, is_causal=IS_CAUSAL)
+
     return time_one(call)
 
 
 def fmt_row(name, ms_med, gfs, ms_min):
-    return (f"  {name:<32} {ms_med:>9.2f} ms  {gfs:>8.1f} GF/s   "
-            f"(min {ms_min:.2f} ms)")
+    return f"  {name:<32} {ms_med:>9.2f} ms  {gfs:>8.1f} GF/s   (min {ms_min:.2f} ms)"
 
 
 def main() -> None:
-    print(f"OMP_NUM_THREADS={os.environ.get('OMP_NUM_THREADS')}, "
-          f"torch.get_num_threads()={torch.get_num_threads()}")
+    print(f"OMP_NUM_THREADS={os.environ.get('OMP_NUM_THREADS')}, torch.get_num_threads()={torch.get_num_threads()}")
     print(f"warmup={WARMUP}, iters={ITERS}, is_causal={IS_CAUSAL}")
     print(f"Registered C++ versions: {VERSIONS}")
     print()
 
-    for (label, B, N, L, S, E, Ev) in SHAPES:
-        flops = compute_sdpa_flops(
-            B, N, L, S, E, Ev, is_causal=IS_CAUSAL
-        )["total_flops"]
-        print(f"=== {label}  shape=(B={B},N={N},L={L},S={S},E={E},Ev={Ev})  "
-              f"total_flops={flops/1e9:.2f} G ===")
+    for label, B, N, L, S, E, Ev in SHAPES:
+        flops = compute_sdpa_flops(B, N, L, S, E, Ev, is_causal=IS_CAUSAL)["total_flops"]
+        print(f"=== {label}  shape=(B={B},N={N},L={L},S={S},E={E},Ev={Ev})  total_flops={flops / 1e9:.2f} G ===")
         for dt_label, dtype in DTYPES:
             q, k, v = make_qkv(B, N, L, S, E, Ev, dtype)
             print(f"  -- dtype={dt_label} --")
 
             try:
                 ms, mmin = bench_torch_math(q, k, v)
-                print(fmt_row("torch.F.sdpa(MATH)",
-                              ms * 1000, gflops(flops, ms), mmin * 1000))
+                print(fmt_row("torch.F.sdpa(MATH)", ms * 1000, gflops(flops, ms), mmin * 1000))
             except Exception as exc:
                 print(f"  torch.F.sdpa(MATH) FAILED: {exc}")
 

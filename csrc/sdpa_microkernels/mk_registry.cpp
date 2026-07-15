@@ -45,17 +45,14 @@ int mk_register_impl(const MicrokernelEntry& entry) {
   auto& reg = registry();
   std::string key(entry.name);
   if (reg.map.find(key) != reg.map.end()) {
-    throw std::runtime_error(
-        std::string("mk_register_impl: duplicate impl name '") + key + "'");
+    throw std::runtime_error(std::string("mk_register_impl: duplicate impl name '") + key + "'");
   }
   reg.map.emplace(key, entry);
   reg.names.emplace_back(std::move(key));
   return 0;
 }
 
-std::vector<std::string> mk_list_impls() {
-  return registry().names;
-}
+std::vector<std::string> mk_list_impls() { return registry().names; }
 
 const MicrokernelEntry* mk_find_impl(const std::string& name) {
   auto& reg = registry();
@@ -68,8 +65,7 @@ namespace {
 const MicrokernelEntry& must_find(const std::string& name) {
   const MicrokernelEntry* e = mk_find_impl(name);
   if (e == nullptr) {
-    std::string msg = "Microkernel impl '" + name +
-                      "' is not registered; available: [";
+    std::string msg = "Microkernel impl '" + name + "' is not registered; available: [";
     auto& reg = registry();
     for (size_t i = 0; i < reg.names.size(); ++i) {
       if (i) msg += ", ";
@@ -81,20 +77,13 @@ const MicrokernelEntry& must_find(const std::string& name) {
   return *e;
 }
 
-bool dtype_is_bf16(const std::string& dtype) {
-  return dtype == "bf16" || dtype == "bfloat16";
-}
-bool dtype_is_fp32(const std::string& dtype) {
-  return dtype == "fp32" || dtype == "float32" || dtype == "float";
-}
+bool dtype_is_bf16(const std::string& dtype) { return dtype == "bf16" || dtype == "bfloat16"; }
+bool dtype_is_fp32(const std::string& dtype) { return dtype == "fp32" || dtype == "float32" || dtype == "float"; }
 
 }  // anonymous namespace
 
-std::map<std::string, double> mk_validate_dispatch(
-    const std::string& impl_name,
-    const std::string& dtype,
-    int64_t E,
-    int64_t Sk) {
+std::map<std::string, double> mk_validate_dispatch(const std::string& impl_name, const std::string& dtype, int64_t E,
+                                                   int64_t Sk) {
   TORCH_CHECK(E > 0, "mk_validate: E must be > 0");
   TORCH_CHECK(Sk > 0, "mk_validate: Sk must be > 0");
   const MicrokernelEntry& entry = must_find(impl_name);
@@ -106,16 +95,12 @@ std::map<std::string, double> mk_validate_dispatch(
   }
   TORCH_CHECK(false,
               "mk_validate: dtype must be 'bf16'/'bfloat16' or "
-              "'fp32'/'float32'/'float', got '", dtype, "'");
+              "'fp32'/'float32'/'float', got '",
+              dtype, "'");
 }
 
-std::map<std::string, double> mk_benchmark_dispatch(
-    const std::string& impl_name,
-    const std::string& dtype,
-    int64_t E,
-    int64_t Sk,
-    int64_t iterations,
-    int64_t warmup) {
+std::map<std::string, double> mk_benchmark_dispatch(const std::string& impl_name, const std::string& dtype, int64_t E,
+                                                    int64_t Sk, int64_t iterations, int64_t warmup) {
   TORCH_CHECK(E > 0, "mk_benchmark: E must be > 0");
   TORCH_CHECK(Sk > 0, "mk_benchmark: Sk must be > 0");
   TORCH_CHECK(iterations > 0, "mk_benchmark: iterations must be > 0");
@@ -129,7 +114,8 @@ std::map<std::string, double> mk_benchmark_dispatch(
   }
   TORCH_CHECK(false,
               "mk_benchmark: dtype must be 'bf16'/'bfloat16' or "
-              "'fp32'/'float32'/'float', got '", dtype, "'");
+              "'fp32'/'float32'/'float', got '",
+              dtype, "'");
 }
 
 // ── enabled impl 的注册（由本文件唯一持有，避免分散）──────────────────
@@ -143,19 +129,21 @@ std::map<std::string, double> mk_benchmark_dispatch(
 // 不过为了让「禁用某个 impl 时本文件依然能编译」，我们用 has_enabled SFINAE
 // 探测：若 MK 类型存在 + kEnabled=true 才注册。
 
-#define REGISTER_MK_IF_ENABLED(MK_TYPE)                                     \
-  namespace { static int MK_REG_CONCAT(_mk_cond_reg_, __COUNTER__) = []() { \
-    if constexpr (mk_is_enabled_v<MK_TYPE>) {                               \
-      mk_register_impl(MicrokernelEntry{                                    \
-          MK_TYPE::kName,                                                   \
-          &validate_microkernels_tmpl<MK_TYPE, float>,                      \
-          &validate_microkernels_tmpl<MK_TYPE, at::BFloat16>,               \
-          &benchmark_microkernels_tmpl<MK_TYPE, float>,                     \
-          &benchmark_microkernels_tmpl<MK_TYPE, at::BFloat16>,              \
-      });                                                                   \
-    }                                                                       \
-    return 0;                                                               \
-  }(); }
+#define REGISTER_MK_IF_ENABLED(MK_TYPE)                         \
+  namespace {                                                   \
+  static int MK_REG_CONCAT(_mk_cond_reg_, __COUNTER__) = []() { \
+    if constexpr (mk_is_enabled_v<MK_TYPE>) {                   \
+      mk_register_impl(MicrokernelEntry{                        \
+          MK_TYPE::kName,                                       \
+          &validate_microkernels_tmpl<MK_TYPE, float>,          \
+          &validate_microkernels_tmpl<MK_TYPE, at::BFloat16>,   \
+          &benchmark_microkernels_tmpl<MK_TYPE, float>,         \
+          &benchmark_microkernels_tmpl<MK_TYPE, at::BFloat16>,  \
+      });                                                       \
+    }                                                           \
+    return 0;                                                   \
+  }();                                                          \
+  }
 
 #if FUSED_CPP_MK_ENABLE_BASELINE
 REGISTER_MK_IF_ENABLED(MK_Baseline);
@@ -210,19 +198,13 @@ REGISTER_MK_IF_ENABLED(MK_L1BfmlalLayout);
 
 // ── 给 module.cpp 暴露的 C++ 函数（dtype-erased，按字符串）──────────────
 
-std::vector<std::string> list_microkernel_impls() {
-  return ::fused_cpp::sdpa_microkernels::mk_list_impls();
+std::vector<std::string> list_microkernel_impls() { return ::fused_cpp::sdpa_microkernels::mk_list_impls(); }
+
+std::map<std::string, double> validate_microkernel(std::string impl, std::string dtype, int64_t E, int64_t Sk) {
+  return ::fused_cpp::sdpa_microkernels::mk_validate_dispatch(impl, dtype, E, Sk);
 }
 
-std::map<std::string, double> validate_microkernel(
-    std::string impl, std::string dtype, int64_t E, int64_t Sk) {
-  return ::fused_cpp::sdpa_microkernels::mk_validate_dispatch(
-      impl, dtype, E, Sk);
-}
-
-std::map<std::string, double> benchmark_microkernel(
-    std::string impl, std::string dtype, int64_t E, int64_t Sk,
-    int64_t iterations, int64_t warmup) {
-  return ::fused_cpp::sdpa_microkernels::mk_benchmark_dispatch(
-      impl, dtype, E, Sk, iterations, warmup);
+std::map<std::string, double> benchmark_microkernel(std::string impl, std::string dtype, int64_t E, int64_t Sk,
+                                                    int64_t iterations, int64_t warmup) {
+  return ::fused_cpp::sdpa_microkernels::mk_benchmark_dispatch(impl, dtype, E, Sk, iterations, warmup);
 }

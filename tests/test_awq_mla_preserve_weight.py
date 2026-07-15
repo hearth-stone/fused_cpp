@@ -16,6 +16,7 @@
 
 规范对齐：仅依赖 vLLM + fused_cpp 本体，不引入 LLMEngine / ModelRunner。
 """
+
 from __future__ import annotations
 
 import importlib
@@ -46,22 +47,26 @@ def _pack_awq_along_n(unpacked: torch.Tensor) -> torch.Tensor:
     order_idx = torch.tensor(_AWQ_ORDER, dtype=torch.long)
     picked = reshaped.index_select(-1, order_idx)
     shifts = torch.arange(0, 32, 4, dtype=torch.int32).view(
-        *([1] * len(lead)), 1, 8,
+        *([1] * len(lead)),
+        1,
+        8,
     )
     return (picked << shifts).sum(dim=-1).to(torch.int32)
 
 
 def _build_awq_params(
-    k: int, n: int, group_size: int, *, seed: int = 0,
+    k: int,
+    n: int,
+    group_size: int,
+    *,
+    seed: int = 0,
 ) -> tuple[torch.nn.Parameter, torch.nn.Parameter, torch.nn.Parameter]:
     """构造随机 AWQ (qweight, qzeros, scales=bf16) 三件套。"""
     gen = torch.Generator().manual_seed(seed)
     w_int4 = torch.randint(0, 16, (k, n), generator=gen, dtype=torch.int32)
     groups = k // group_size
     z_int4 = torch.randint(0, 16, (groups, n), generator=gen, dtype=torch.int32)
-    scales_bf16 = (
-        torch.rand((groups, n), generator=gen, dtype=torch.float32) * 0.02 + 0.001
-    ).to(torch.bfloat16)
+    scales_bf16 = (torch.rand((groups, n), generator=gen, dtype=torch.float32) * 0.02 + 0.001).to(torch.bfloat16)
     qweight = torch.nn.Parameter(_pack_awq_along_n(w_int4), requires_grad=False)
     qzeros = torch.nn.Parameter(_pack_awq_along_n(z_int4), requires_grad=False)
     scales = torch.nn.Parameter(scales_bf16, requires_grad=False)
@@ -70,8 +75,7 @@ def _build_awq_params(
 
 def _make_awq_method() -> AWQLinearMethod:
     """以最小合法配置构造 AWQLinearMethod 实例。"""
-    cfg = AWQConfig(weight_bits=4, group_size=128, zero_point=True,
-                    modules_to_not_convert=[])
+    cfg = AWQConfig(weight_bits=4, group_size=128, zero_point=True, modules_to_not_convert=[])
     return AWQLinearMethod(cfg)
 
 
@@ -101,6 +105,7 @@ class _FakeLinear(torch.nn.Module):
 
 # ── 1. MLA kv_b_proj 场景：必须生成 layer.weight 与 layer.cpu_linear ──
 
+
 @pytest.mark.parametrize(
     "k,n,group_size",
     [
@@ -120,6 +125,7 @@ def test_preserve_weight_materializes_dense_weight_and_cpu_linear(
     monkeypatch.setattr(vllm_envs, "VLLM_CPU_AWQ_USE_FUSED_CPP", True)
     # 强制 CPU 平台判定（在 macOS / AArch64 上都应返回 True，但这里显式保证）
     import vllm.platforms as _plat
+
     monkeypatch.setattr(_plat.current_platform, "is_cpu", lambda: True)
 
     layer = _FakeLinear(k=k, n=n, group_size=group_size, preserve=True)
@@ -131,9 +137,7 @@ def test_preserve_weight_materializes_dense_weight_and_cpu_linear(
     # Assert：weight 存在且 shape 正确
     assert hasattr(layer, "weight"), "layer.weight 未生成"
     assert layer.weight.dtype == torch.bfloat16
-    assert tuple(layer.weight.shape) == (n, k), (
-        f"expect [N={n}, K={k}], got {tuple(layer.weight.shape)}"
-    )
+    assert tuple(layer.weight.shape) == (n, k), f"expect [N={n}, K={k}], got {tuple(layer.weight.shape)}"
 
     # Assert：cpu_linear 存在且可调用
     assert hasattr(layer, "cpu_linear"), "layer.cpu_linear 未挂载"
@@ -147,6 +151,7 @@ def test_preserve_weight_materializes_dense_weight_and_cpu_linear(
 
 # ── 2. 反量化数值与 fused_cpp 参考一致 ──
 
+
 def test_materialized_weight_matches_dequant_reference(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -154,6 +159,7 @@ def test_materialized_weight_matches_dequant_reference(
     经 transpose 后）。"""
     monkeypatch.setattr(vllm_envs, "VLLM_CPU_AWQ_USE_FUSED_CPP", True)
     import vllm.platforms as _plat
+
     monkeypatch.setattr(_plat.current_platform, "is_cpu", lambda: True)
 
     k, n, group_size = 256, 128, 64
@@ -172,6 +178,7 @@ def test_materialized_weight_matches_dequant_reference(
 
 # ── 3. 非 MLA 场景不受影响 ──
 
+
 def test_regular_awq_linear_does_not_materialize_weight(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -179,21 +186,19 @@ def test_regular_awq_linear_does_not_materialize_weight(
     不挂 ``layer.weight`` / ``layer.cpu_linear``。"""
     monkeypatch.setattr(vllm_envs, "VLLM_CPU_AWQ_USE_FUSED_CPP", True)
     import vllm.platforms as _plat
+
     monkeypatch.setattr(_plat.current_platform, "is_cpu", lambda: True)
 
     layer = _FakeLinear(k=128, n=64, group_size=128, preserve=False)
     method = _make_awq_method()
     method.process_weights_after_loading(layer)
 
-    assert not hasattr(layer, "weight") or layer.weight is None, (
-        "普通 AWQ Linear 不应生成 layer.weight"
-    )
-    assert not hasattr(layer, "cpu_linear"), (
-        "普通 AWQ Linear 不应挂 layer.cpu_linear"
-    )
+    assert not hasattr(layer, "weight") or layer.weight is None, "普通 AWQ Linear 不应生成 layer.weight"
+    assert not hasattr(layer, "cpu_linear"), "普通 AWQ Linear 不应挂 layer.cpu_linear"
 
 
 # ── 4. 环境变量守卫 ──
+
 
 def test_preserve_weight_noop_when_fused_cpp_disabled(
     monkeypatch: pytest.MonkeyPatch,

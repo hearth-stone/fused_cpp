@@ -57,22 +57,19 @@
 
 namespace {
 
-using ::fused_cpp::sdpa_tile_sizes::TileSizes;
-using ::fused_cpp::sdpa_tile_sizes::effective_cache_bytes;
-using ::fused_cpp::sdpa_tile_sizes::compute_tile_sizes_l3kv;
 using ::fused_cpp::sdpa_flash2_neon_l3kv_impl::run_path_collapse3;
 using ::fused_cpp::sdpa_flash2_neon_l3kv_impl::run_path_taskloop;
+using ::fused_cpp::sdpa_tile_sizes::compute_tile_sizes_l3kv;
+using ::fused_cpp::sdpa_tile_sizes::effective_cache_bytes;
+using ::fused_cpp::sdpa_tile_sizes::TileSizes;
 
 // ──────────────────────────────────────────────────────────────────────
 // 顶层模板：dtype-specialized 实现入口（kPackedV=false 走原始 V）。
 // ──────────────────────────────────────────────────────────────────────
 
 template <class MK, typename scalar_t>
-inline void sdpa_flash2_neon_l3kv_with_mk_tmpl(
-    const scalar_t* q_ptr,
-    const scalar_t* k_ptr,
-    const scalar_t* v_ptr,
-    const SdpaParams& p) {
+inline void sdpa_flash2_neon_l3kv_with_mk_tmpl(const scalar_t* q_ptr, const scalar_t* k_ptr, const scalar_t* v_ptr,
+                                               const SdpaParams& p) {
   const int64_t q_stride_b = p.N * p.L * p.E;
   const int64_t q_stride_n = p.L * p.E;
   const int64_t q_stride_l = p.E;
@@ -89,14 +86,11 @@ inline void sdpa_flash2_neon_l3kv_with_mk_tmpl(
   const int64_t o_stride_n = p.L * p.Ev;
   const int64_t o_stride_l = p.Ev;
 
-  TileSizes ts = compute_tile_sizes_l3kv(p.B, p.N, p.S, p.L, p.E, p.Ev,
-                                         sizeof(scalar_t));
+  TileSizes ts = compute_tile_sizes_l3kv(p.B, p.N, p.S, p.L, p.E, p.Ev, sizeof(scalar_t));
 
-  const int64_t kv_bytes_per_bn =
-      p.S * (p.E + p.Ev) * static_cast<int64_t>(sizeof(scalar_t));
+  const int64_t kv_bytes_per_bn = p.S * (p.E + p.Ev) * static_cast<int64_t>(sizeof(scalar_t));
   const auto& cache_bytes = effective_cache_bytes();
-  const int64_t l3_budget =
-      static_cast<int64_t>(cache_bytes[2] * FUSED_CPP_SDPA_L3_RATIO);
+  const int64_t l3_budget = static_cast<int64_t>(cache_bytes[2] * FUSED_CPP_SDPA_L3_RATIO);
   const bool kv_fits_l3 = kv_bytes_per_bn <= l3_budget;
   const int total_threads =
 #ifdef _OPENMP
@@ -114,13 +108,12 @@ inline void sdpa_flash2_neon_l3kv_with_mk_tmpl(
   if (kv_fits_l3 || total_threads == 1) {
     if (s_debug_groups) {
       std::fprintf(stderr,
-          "[flash2_neon_l3kv] path=A (collapse3) B=%lld N=%lld L=%lld "
-          "S=%lld E=%lld Ev=%lld kv_bytes=%lld l3_budget=%lld threads=%d "
-          "Lc_l2=%lld Sc_l2=%lld Sc_l3=%lld\n",
-          (long long)p.B, (long long)p.N, (long long)p.L, (long long)p.S,
-          (long long)p.E, (long long)p.Ev,
-          (long long)kv_bytes_per_bn, (long long)l3_budget, total_threads,
-          (long long)ts.Lc_l2, (long long)ts.Sc_l2, (long long)ts.Sc_l3);
+                   "[flash2_neon_l3kv] path=A (collapse3) B=%lld N=%lld L=%lld "
+                   "S=%lld E=%lld Ev=%lld kv_bytes=%lld l3_budget=%lld threads=%d "
+                   "Lc_l2=%lld Sc_l2=%lld Sc_l3=%lld\n",
+                   (long long)p.B, (long long)p.N, (long long)p.L, (long long)p.S, (long long)p.E, (long long)p.Ev,
+                   (long long)kv_bytes_per_bn, (long long)l3_budget, total_threads, (long long)ts.Lc_l2,
+                   (long long)ts.Sc_l2, (long long)ts.Sc_l3);
     }
     // ── 按 (kHasMask, kCausal) 编译期组合分发模板实例 ──
     // 4 种组合各自展成一份 path-A 调用。模板参数透传到 process_q_tile_lc,
@@ -130,107 +123,71 @@ inline void sdpa_flash2_neon_l3kv_with_mk_tmpl(
       if (p.is_causal) {
         run_path_collapse3<MK, scalar_t, /*kPackedV=*/false,
                            /*kHasMask=*/true, /*kCausal=*/true>(
-            q_ptr, k_ptr, v_ptr, p, ts,
-            q_stride_b, q_stride_n, q_stride_l,
-            k_stride_b, k_stride_n, k_stride_s,
+            q_ptr, k_ptr, v_ptr, p, ts, q_stride_b, q_stride_n, q_stride_l, k_stride_b, k_stride_n, k_stride_s,
             v_stride_b, v_stride_n, v_stride_s,
-            /*v_evblock_stride=*/0,
-            m_stride_b, m_stride_n, m_stride_l,
-            o_stride_b, o_stride_n, o_stride_l);
+            /*v_evblock_stride=*/0, m_stride_b, m_stride_n, m_stride_l, o_stride_b, o_stride_n, o_stride_l);
       } else {
         run_path_collapse3<MK, scalar_t, /*kPackedV=*/false,
                            /*kHasMask=*/true, /*kCausal=*/false>(
-            q_ptr, k_ptr, v_ptr, p, ts,
-            q_stride_b, q_stride_n, q_stride_l,
-            k_stride_b, k_stride_n, k_stride_s,
+            q_ptr, k_ptr, v_ptr, p, ts, q_stride_b, q_stride_n, q_stride_l, k_stride_b, k_stride_n, k_stride_s,
             v_stride_b, v_stride_n, v_stride_s,
-            /*v_evblock_stride=*/0,
-            m_stride_b, m_stride_n, m_stride_l,
-            o_stride_b, o_stride_n, o_stride_l);
+            /*v_evblock_stride=*/0, m_stride_b, m_stride_n, m_stride_l, o_stride_b, o_stride_n, o_stride_l);
       }
     } else {
       if (p.is_causal) {
         run_path_collapse3<MK, scalar_t, /*kPackedV=*/false,
                            /*kHasMask=*/false, /*kCausal=*/true>(
-            q_ptr, k_ptr, v_ptr, p, ts,
-            q_stride_b, q_stride_n, q_stride_l,
-            k_stride_b, k_stride_n, k_stride_s,
+            q_ptr, k_ptr, v_ptr, p, ts, q_stride_b, q_stride_n, q_stride_l, k_stride_b, k_stride_n, k_stride_s,
             v_stride_b, v_stride_n, v_stride_s,
-            /*v_evblock_stride=*/0,
-            m_stride_b, m_stride_n, m_stride_l,
-            o_stride_b, o_stride_n, o_stride_l);
+            /*v_evblock_stride=*/0, m_stride_b, m_stride_n, m_stride_l, o_stride_b, o_stride_n, o_stride_l);
       } else {
         run_path_collapse3<MK, scalar_t, /*kPackedV=*/false,
                            /*kHasMask=*/false, /*kCausal=*/false>(
-            q_ptr, k_ptr, v_ptr, p, ts,
-            q_stride_b, q_stride_n, q_stride_l,
-            k_stride_b, k_stride_n, k_stride_s,
+            q_ptr, k_ptr, v_ptr, p, ts, q_stride_b, q_stride_n, q_stride_l, k_stride_b, k_stride_n, k_stride_s,
             v_stride_b, v_stride_n, v_stride_s,
-            /*v_evblock_stride=*/0,
-            m_stride_b, m_stride_n, m_stride_l,
-            o_stride_b, o_stride_n, o_stride_l);
+            /*v_evblock_stride=*/0, m_stride_b, m_stride_n, m_stride_l, o_stride_b, o_stride_n, o_stride_l);
       }
     }
   } else {
-    const int max_concurrent_bn =
-        std::max<int>(1, static_cast<int>(l3_budget / kv_bytes_per_bn));
+    const int max_concurrent_bn = std::max<int>(1, static_cast<int>(l3_budget / kv_bytes_per_bn));
     const int total_bn = static_cast<int>(p.B * p.N);
-    const int num_groups = std::min<int>(
-        total_bn, std::min<int>(total_threads, max_concurrent_bn));
+    const int num_groups = std::min<int>(total_bn, std::min<int>(total_threads, max_concurrent_bn));
     if (s_debug_groups) {
       std::fprintf(stderr,
-          "[flash2_neon_l3kv] path=B (taskloop) B=%lld N=%lld L=%lld "
-          "S=%lld E=%lld Ev=%lld kv_bytes=%lld l3_budget=%lld threads=%d "
-          "max_concurrent_bn=%d num_groups=%d Lc_l2=%lld Sc_l2=%lld\n",
-          (long long)p.B, (long long)p.N, (long long)p.L, (long long)p.S,
-          (long long)p.E, (long long)p.Ev,
-          (long long)kv_bytes_per_bn, (long long)l3_budget, total_threads,
-          max_concurrent_bn, num_groups,
-          (long long)ts.Lc_l2, (long long)ts.Sc_l2);
+                   "[flash2_neon_l3kv] path=B (taskloop) B=%lld N=%lld L=%lld "
+                   "S=%lld E=%lld Ev=%lld kv_bytes=%lld l3_budget=%lld threads=%d "
+                   "max_concurrent_bn=%d num_groups=%d Lc_l2=%lld Sc_l2=%lld\n",
+                   (long long)p.B, (long long)p.N, (long long)p.L, (long long)p.S, (long long)p.E, (long long)p.Ev,
+                   (long long)kv_bytes_per_bn, (long long)l3_budget, total_threads, max_concurrent_bn, num_groups,
+                   (long long)ts.Lc_l2, (long long)ts.Sc_l2);
     }
     if (p.mask_ptr != nullptr) {
       if (p.is_causal) {
         run_path_taskloop<MK, scalar_t, /*kPackedV=*/false,
                           /*kHasMask=*/true, /*kCausal=*/true>(
-            q_ptr, k_ptr, v_ptr, p, ts, num_groups,
-            q_stride_b, q_stride_n, q_stride_l,
-            k_stride_b, k_stride_n, k_stride_s,
-            v_stride_b, v_stride_n, v_stride_s,
-            /*v_evblock_stride=*/0,
-            m_stride_b, m_stride_n, m_stride_l,
-            o_stride_b, o_stride_n, o_stride_l);
+            q_ptr, k_ptr, v_ptr, p, ts, num_groups, q_stride_b, q_stride_n, q_stride_l, k_stride_b, k_stride_n,
+            k_stride_s, v_stride_b, v_stride_n, v_stride_s,
+            /*v_evblock_stride=*/0, m_stride_b, m_stride_n, m_stride_l, o_stride_b, o_stride_n, o_stride_l);
       } else {
         run_path_taskloop<MK, scalar_t, /*kPackedV=*/false,
                           /*kHasMask=*/true, /*kCausal=*/false>(
-            q_ptr, k_ptr, v_ptr, p, ts, num_groups,
-            q_stride_b, q_stride_n, q_stride_l,
-            k_stride_b, k_stride_n, k_stride_s,
-            v_stride_b, v_stride_n, v_stride_s,
-            /*v_evblock_stride=*/0,
-            m_stride_b, m_stride_n, m_stride_l,
-            o_stride_b, o_stride_n, o_stride_l);
+            q_ptr, k_ptr, v_ptr, p, ts, num_groups, q_stride_b, q_stride_n, q_stride_l, k_stride_b, k_stride_n,
+            k_stride_s, v_stride_b, v_stride_n, v_stride_s,
+            /*v_evblock_stride=*/0, m_stride_b, m_stride_n, m_stride_l, o_stride_b, o_stride_n, o_stride_l);
       }
     } else {
       if (p.is_causal) {
         run_path_taskloop<MK, scalar_t, /*kPackedV=*/false,
                           /*kHasMask=*/false, /*kCausal=*/true>(
-            q_ptr, k_ptr, v_ptr, p, ts, num_groups,
-            q_stride_b, q_stride_n, q_stride_l,
-            k_stride_b, k_stride_n, k_stride_s,
-            v_stride_b, v_stride_n, v_stride_s,
-            /*v_evblock_stride=*/0,
-            m_stride_b, m_stride_n, m_stride_l,
-            o_stride_b, o_stride_n, o_stride_l);
+            q_ptr, k_ptr, v_ptr, p, ts, num_groups, q_stride_b, q_stride_n, q_stride_l, k_stride_b, k_stride_n,
+            k_stride_s, v_stride_b, v_stride_n, v_stride_s,
+            /*v_evblock_stride=*/0, m_stride_b, m_stride_n, m_stride_l, o_stride_b, o_stride_n, o_stride_l);
       } else {
         run_path_taskloop<MK, scalar_t, /*kPackedV=*/false,
                           /*kHasMask=*/false, /*kCausal=*/false>(
-            q_ptr, k_ptr, v_ptr, p, ts, num_groups,
-            q_stride_b, q_stride_n, q_stride_l,
-            k_stride_b, k_stride_n, k_stride_s,
-            v_stride_b, v_stride_n, v_stride_s,
-            /*v_evblock_stride=*/0,
-            m_stride_b, m_stride_n, m_stride_l,
-            o_stride_b, o_stride_n, o_stride_l);
+            q_ptr, k_ptr, v_ptr, p, ts, num_groups, q_stride_b, q_stride_n, q_stride_l, k_stride_b, k_stride_n,
+            k_stride_s, v_stride_b, v_stride_n, v_stride_s,
+            /*v_evblock_stride=*/0, m_stride_b, m_stride_n, m_stride_l, o_stride_b, o_stride_n, o_stride_l);
       }
     }
   }
@@ -240,17 +197,12 @@ inline void sdpa_flash2_neon_l3kv_with_mk_tmpl(
 template <class MK>
 inline void sdpa_flash2_neon_l3kv_with_mk_impl(const SdpaParams& p) {
   if (p.dtype == SdpaDtype::kBFloat16) {
-    sdpa_flash2_neon_l3kv_with_mk_tmpl<MK, at::BFloat16>(
-        static_cast<const at::BFloat16*>(p.q_ptr),
-        static_cast<const at::BFloat16*>(p.k_ptr),
-        static_cast<const at::BFloat16*>(p.v_ptr),
-        p);
+    sdpa_flash2_neon_l3kv_with_mk_tmpl<MK, at::BFloat16>(static_cast<const at::BFloat16*>(p.q_ptr),
+                                                         static_cast<const at::BFloat16*>(p.k_ptr),
+                                                         static_cast<const at::BFloat16*>(p.v_ptr), p);
   } else {
     sdpa_flash2_neon_l3kv_with_mk_tmpl<MK, float>(
-        static_cast<const float*>(p.q_ptr),
-        static_cast<const float*>(p.k_ptr),
-        static_cast<const float*>(p.v_ptr),
-        p);
+        static_cast<const float*>(p.q_ptr), static_cast<const float*>(p.k_ptr), static_cast<const float*>(p.v_ptr), p);
   }
 }
 
@@ -264,45 +216,36 @@ inline void sdpa_flash2_neon_l3kv_with_mk_impl(const SdpaParams& p) {
 #if FUSED_CPP_MK_ENABLE_BASELINE
 namespace {
 void sdpa_flash2_neon_l3kv_baseline_entry(const SdpaParams& p) {
-  sdpa_flash2_neon_l3kv_with_mk_impl<
-      ::fused_cpp::sdpa_microkernels::MK_Baseline>(p);
+  sdpa_flash2_neon_l3kv_with_mk_impl<::fused_cpp::sdpa_microkernels::MK_Baseline>(p);
 }
 }  // anonymous namespace
-REGISTER_SDPA_VERSION("flash2_neon_l3kv",
-                      sdpa_flash2_neon_l3kv_baseline_entry);
-REGISTER_SDPA_VERSION("flash2_neon_l3kv_baseline",
-                      sdpa_flash2_neon_l3kv_baseline_entry);
+REGISTER_SDPA_VERSION("flash2_neon_l3kv", sdpa_flash2_neon_l3kv_baseline_entry);
+REGISTER_SDPA_VERSION("flash2_neon_l3kv_baseline", sdpa_flash2_neon_l3kv_baseline_entry);
 #endif
 
 #if FUSED_CPP_MK_ENABLE_SCALAR
 namespace {
 void sdpa_flash2_neon_l3kv_scalar_entry(const SdpaParams& p) {
-  sdpa_flash2_neon_l3kv_with_mk_impl<
-      ::fused_cpp::sdpa_microkernels::MK_Scalar>(p);
+  sdpa_flash2_neon_l3kv_with_mk_impl<::fused_cpp::sdpa_microkernels::MK_Scalar>(p);
 }
 }  // anonymous namespace
-REGISTER_SDPA_VERSION("flash2_neon_l3kv_scalar",
-                      sdpa_flash2_neon_l3kv_scalar_entry);
+REGISTER_SDPA_VERSION("flash2_neon_l3kv_scalar", sdpa_flash2_neon_l3kv_scalar_entry);
 #endif
 
 #if FUSED_CPP_MK_ENABLE_PQUAD
 namespace {
 void sdpa_flash2_neon_l3kv_pquad_entry(const SdpaParams& p) {
-  sdpa_flash2_neon_l3kv_with_mk_impl<
-      ::fused_cpp::sdpa_microkernels::MK_PQuad>(p);
+  sdpa_flash2_neon_l3kv_with_mk_impl<::fused_cpp::sdpa_microkernels::MK_PQuad>(p);
 }
 }  // anonymous namespace
-REGISTER_SDPA_VERSION("flash2_neon_l3kv_pquad",
-                      sdpa_flash2_neon_l3kv_pquad_entry);
+REGISTER_SDPA_VERSION("flash2_neon_l3kv_pquad", sdpa_flash2_neon_l3kv_pquad_entry);
 #endif
 
 #if FUSED_CPP_MK_ENABLE_QK_UBLOCK4
 namespace {
 void sdpa_flash2_neon_l3kv_qk_ublock4_entry(const SdpaParams& p) {
-  sdpa_flash2_neon_l3kv_with_mk_impl<
-      ::fused_cpp::sdpa_microkernels::MK_QkUblock4>(p);
+  sdpa_flash2_neon_l3kv_with_mk_impl<::fused_cpp::sdpa_microkernels::MK_QkUblock4>(p);
 }
 }  // anonymous namespace
-REGISTER_SDPA_VERSION("flash2_neon_l3kv_qk_ublock4",
-                      sdpa_flash2_neon_l3kv_qk_ublock4_entry);
+REGISTER_SDPA_VERSION("flash2_neon_l3kv_qk_ublock4", sdpa_flash2_neon_l3kv_qk_ublock4_entry);
 #endif

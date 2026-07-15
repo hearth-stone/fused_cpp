@@ -48,34 +48,22 @@ class ContentionCostModel:
         self.profile = prof
         self.schema_version = int(prof.get("schema_version", 1))
         formula_payload = prof.get("iso_formula")
-        self.policy = (
-            ProfilePolicy.from_payload(prof) if self.schema_version >= 2 else None
-        )
+        self.policy = ProfilePolicy.from_payload(prof) if self.schema_version >= 2 else None
         if expected_policy is not None:
             if self.policy is None:
-                raise ProfileCompatibilityError(
-                    "cannot apply a policy query to a legacy profile"
-                )
+                raise ProfileCompatibilityError("cannot apply a policy query to a legacy profile")
             mismatch = self.policy.mismatch(expected_policy)
             if mismatch:
-                raise ProfileCompatibilityError(
-                    f"profile {self.profile_path.name} is incompatible: {mismatch}"
-                )
+                raise ProfileCompatibilityError(f"profile {self.profile_path.name} is incompatible: {mismatch}")
 
         if use_max_team_derate is None:
-            use_max_team_derate = os.environ.get(
-                "FUSED_CPP_COST_MODEL_MAX_TEAM_DERATE", "0"
-            ) == "1"
+            use_max_team_derate = os.environ.get("FUSED_CPP_COST_MODEL_MAX_TEAM_DERATE", "0") == "1"
         if use_shape_derate is None:
             configured = os.environ.get("FUSED_CPP_COST_MODEL_SHAPE_DERATE")
-            use_shape_derate = (
-                self.schema_version >= 2 if configured is None else configured == "1"
-            )
+            use_shape_derate = self.schema_version >= 2 if configured is None else configured == "1"
         if use_stage_model is None:
             configured = os.environ.get("FUSED_CPP_COST_MODEL_STAGE_AWARE")
-            use_stage_model = (
-                self.schema_version >= 2 if configured is None else configured != "0"
-            )
+            use_stage_model = self.schema_version >= 2 if configured is None else configured != "0"
         self.use_max_team_derate = bool(use_max_team_derate)
         self.use_shape_derate = bool(use_shape_derate)
         self.use_stage_model = bool(use_stage_model)
@@ -87,16 +75,11 @@ class ContentionCostModel:
             # the profile's explicit opt-in marker for the compact model.
             iso_mode = "formula" if formula_payload is not None else "table"
         if iso_mode not in {"formula", "table"}:
-            raise ValueError(
-                f"iso_mode must be 'formula' or 'table', got {iso_mode!r}"
-            )
+            raise ValueError(f"iso_mode must be 'formula' or 'table', got {iso_mode!r}")
         self.iso_mode = iso_mode
 
         self._iso = {
-            (int(entry["routes"]), int(entry["threads"])): float(
-                entry["median_ns"]
-            )
-            for entry in prof["isolated"]
+            (int(entry["routes"]), int(entry["threads"])): float(entry["median_ns"]) for entry in prof["isolated"]
         }
         self._iso_routes = {
             threads: sorted(routes for routes, t in self._iso if t == threads)
@@ -107,10 +90,7 @@ class ContentionCostModel:
             self.iso_formula = (
                 IsoFormula.from_dict(formula_payload)
                 if formula_payload is not None
-                else fit_from_measurements(
-                    (route, team, value)
-                    for (route, team), value in self._iso.items()
-                )
+                else fit_from_measurements((route, team, value) for (route, team), value in self._iso.items())
             )
 
         d2: dict[int, dict[int, list[float]]] = {}
@@ -131,22 +111,14 @@ class ContentionCostModel:
             if shape:
                 signature = self._shape_signature(int(value) for value in shape)
                 max_team = signature[0]
-                d3.setdefault(n, {}).setdefault(routes, {}).setdefault(
-                    max_team, []
-                ).append(derate)
+                d3.setdefault(n, {}).setdefault(routes, {}).setdefault(max_team, []).append(derate)
                 ds.setdefault(signature, {}).setdefault(routes, []).append(derate)
-                group_curves.setdefault(signature, {})[routes] = float(
-                    entry["makespan_ns"]
-                )
+                group_curves.setdefault(signature, {})[routes] = float(entry["makespan_ns"])
                 full_call_curves.setdefault(signature, {})[routes] = float(
                     entry.get("full_call_median_ns", entry["makespan_ns"])
                 )
-                p10_curves.setdefault(signature, {})[routes] = float(
-                    entry.get("p10_ns", entry["makespan_ns"])
-                )
-                p90_curves.setdefault(signature, {})[routes] = float(
-                    entry.get("p90_ns", entry["makespan_ns"])
-                )
+                p10_curves.setdefault(signature, {})[routes] = float(entry.get("p10_ns", entry["makespan_ns"]))
+                p90_curves.setdefault(signature, {})[routes] = float(entry.get("p90_ns", entry["makespan_ns"]))
                 full_call_p10_curves.setdefault(signature, {})[routes] = float(
                     entry.get(
                         "full_call_p10_ns",
@@ -160,24 +132,17 @@ class ContentionCostModel:
                     )
                 )
         self._derate2d = {
-            n: {routes: statistics.median(values) for routes, values in curve.items()}
-            for n, curve in d2.items()
+            n: {routes: statistics.median(values) for routes, values in curve.items()} for n, curve in d2.items()
         }
         self._derate3d = {
             n: {
-                routes: {
-                    max_team: statistics.median(values)
-                    for max_team, values in by_team.items()
-                }
+                routes: {max_team: statistics.median(values) for max_team, values in by_team.items()}
                 for routes, by_team in curve.items()
             }
             for n, curve in d3.items()
         }
         self._derate_shape = {
-            signature: {
-                routes: statistics.median(values)
-                for routes, values in curve.items()
-            }
+            signature: {routes: statistics.median(values) for routes, values in curve.items()}
             for signature, curve in ds.items()
         }
         self._group_curves = group_curves
@@ -187,9 +152,7 @@ class ContentionCostModel:
         self._full_call_p10_curves = full_call_p10_curves
         self._full_call_p90_curves = full_call_p90_curves
         self._dn = sorted(self._derate2d)
-        self._dr = sorted(
-            {routes for curve in self._derate2d.values() for routes in curve}
-        )
+        self._dr = sorted({routes for curve in self._derate2d.values() for routes in curve})
         self._shape_keys = tuple(sorted(self._derate_shape))
 
         self._O: dict[int, float] = {}
@@ -198,9 +161,7 @@ class ContentionCostModel:
                 self._O[threads] = self.iso_formula.O(threads)
             else:
                 points = sorted(
-                    (routes, value)
-                    for (routes, team), value in self._iso.items()
-                    if team == threads and routes <= 64
+                    (routes, value) for (routes, team), value in self._iso.items() if team == threads and routes <= 64
                 )
                 self._O[threads] = self._linear_intercept(points)
 
@@ -208,25 +169,15 @@ class ContentionCostModel:
         self.call_setup_ns = float(measurement.get("call_setup_ns", 0.0))
         self.profile_runs = max(int(measurement.get("runs", 1)), 1)
         working_set = prof.get("working_set", {})
-        self.w13_chunk_bytes = int(
-            working_set.get("w13_chunk_bytes_per_expert", 0)
-        )
+        self.w13_chunk_bytes = int(working_set.get("w13_chunk_bytes_per_expert", 0))
         self.w2_bytes = int(working_set.get("w2_packed_bytes_per_expert", 0))
-        self.max_stage_bytes = int(
-            working_set.get("max_weight_stage_bytes_per_expert", 0)
-        )
-        self.w13_split_chunks = (
-            int(self.policy.w13_split_chunks) if self.policy is not None else 1
-        )
+        self.max_stage_bytes = int(working_set.get("max_weight_stage_bytes_per_expert", 0))
+        self.w13_split_chunks = int(self.policy.w13_split_chunks) if self.policy is not None else 1
         expert_shape = prof.get("expert_shape", {})
         self.measurement_experts = int(expert_shape.get("measurement_experts", 0))
-        self.local_experts = (
-            int(self.policy.local_experts) if self.policy is not None else 0
-        )
+        self.local_experts = int(self.policy.local_experts) if self.policy is not None else 0
         self.has_full_workload_anchors = (
-            self.schema_version >= 2
-            and self.local_experts > 0
-            and self.measurement_experts == self.local_experts
+            self.schema_version >= 2 and self.local_experts > 0 and self.measurement_experts == self.local_experts
         )
 
     @staticmethod
@@ -240,16 +191,12 @@ class ContentionCostModel:
         sxx = sum(value * value for value in xs)
         sxy = sum(x * y for x, y in zip(xs, ys))
         denominator = count * sxx - sx * sx
-        slope = (
-            (count * sxy - sx * sy) / denominator if denominator else 0.0
-        )
+        slope = (count * sxy - sx * sy) / denominator if denominator else 0.0
         return max((sy - slope * sx) / count, 0.0)
 
     @staticmethod
     def _shape_signature(threads) -> tuple[int, ...]:
-        return tuple(
-            sorted((int(value) for value in threads if int(value) > 0), reverse=True)
-        )
+        return tuple(sorted((int(value) for value in threads if int(value) > 0), reverse=True))
 
     @property
     def supported_shapes(self) -> tuple[tuple[int, ...], ...]:
@@ -368,19 +315,13 @@ class ContentionCostModel:
         if tail == 0:
             return bulk
         tail_time = self._raw_iso_interp(tail, threads)
-        return (
-            overhead
-            + max(bulk - overhead, 0.0)
-            + max(tail_time - overhead, 0.0)
-        )
+        return overhead + max(bulk - overhead, 0.0) + max(tail_time - overhead, 0.0)
 
     def profiled_group_time(self, routes: int, shape) -> float:
         signature = self._shape_signature(shape)
         curve = self._group_curves.get(signature)
         if curve is None:
-            raise ProfileCompatibilityError(
-                f"shape {signature} was not measured in {self.profile_path.name}"
-            )
+            raise ProfileCompatibilityError(f"shape {signature} was not measured in {self.profile_path.name}")
         effective = self.m12_effective_rows(routes)
         return self._interp_linear(curve, effective)
 
@@ -388,9 +329,7 @@ class ContentionCostModel:
         signature = self._shape_signature(shape)
         curve = self._full_call_curves.get(signature)
         if curve is None:
-            raise ProfileCompatibilityError(
-                f"shape {signature} was not measured in {self.profile_path.name}"
-            )
+            raise ProfileCompatibilityError(f"shape {signature} was not measured in {self.profile_path.name}")
         effective = self.m12_effective_rows(routes)
         return self._interp_linear(curve, effective)
 
@@ -399,25 +338,19 @@ class ContentionCostModel:
         p10_curve = self._p10_curves.get(signature)
         p90_curve = self._p90_curves.get(signature)
         if p10_curve is None or p90_curve is None:
-            raise ProfileCompatibilityError(
-                f"shape {signature} was not measured in {self.profile_path.name}"
-            )
+            raise ProfileCompatibilityError(f"shape {signature} was not measured in {self.profile_path.name}")
         effective = self.m12_effective_rows(routes)
         return (
             self._interp_linear(p10_curve, effective),
             self._interp_linear(p90_curve, effective),
         )
 
-    def profiled_full_call_interval(
-        self, routes: int, shape
-    ) -> tuple[float, float]:
+    def profiled_full_call_interval(self, routes: int, shape) -> tuple[float, float]:
         signature = self._shape_signature(shape)
         p10_curve = self._full_call_p10_curves.get(signature)
         p90_curve = self._full_call_p90_curves.get(signature)
         if p10_curve is None or p90_curve is None:
-            raise ProfileCompatibilityError(
-                f"shape {signature} was not measured in {self.profile_path.name}"
-            )
+            raise ProfileCompatibilityError(f"shape {signature} was not measured in {self.profile_path.name}")
         effective = self.m12_effective_rows(routes)
         return (
             self._interp_linear(p10_curve, effective),
@@ -456,9 +389,7 @@ class ContentionCostModel:
         effective = None if routes is None else self.m12_effective_rows(routes)
         return self._interp_log_route(curve, effective)
 
-    def _derate_at_n_route(
-        self, n: int, route_point: int, max_threads: int | None
-    ) -> float:
+    def _derate_at_n_route(self, n: int, route_point: int, max_threads: int | None) -> float:
         if (
             self.use_max_team_derate
             and max_threads is not None
@@ -518,8 +449,7 @@ class ContentionCostModel:
             self._shape_signature(threads for _, threads in tasks),
         )
         return self.call_setup_ns + max(
-            self.T_iso(routes, threads)
-            * (self._fo(routes, threads) + (1 - self._fo(routes, threads)) * derate)
+            self.T_iso(routes, threads) * (self._fo(routes, threads) + (1 - self._fo(routes, threads)) * derate)
             for routes, threads in tasks
         )
 
@@ -538,10 +468,7 @@ class ContentionCostModel:
         count = len(tasks)
         routes = [value for value, _, _ in tasks]
         threads = [value for _, value, _ in tasks]
-        remaining = [
-            self.T_iso(route_count, team)
-            for route_count, team, _ in tasks
-        ]
+        remaining = [self.T_iso(route_count, team) for route_count, team, _ in tasks]
         dependency_count, successors, started = self._dag_state(tasks)
         finished = [False] * count
         wall = self.call_setup_ns
@@ -550,11 +477,7 @@ class ContentionCostModel:
             guard += 1
             if guard > 2 * count + 2:
                 raise RuntimeError("flat DAG simulation did not converge")
-            active = [
-                index
-                for index in range(count)
-                if started[index] and not finished[index]
-            ]
+            active = [index for index in range(count) if started[index] and not finished[index]]
             if not active:
                 raise ValueError("DAG deadlock (cycle or unreachable task)")
             slowdown = self.derate(
@@ -608,13 +531,9 @@ class ContentionCostModel:
         total_bytes = sum(worksets[index] for index in compute_active)
         equivalent = total_bytes / self.max_stage_bytes
         shape = self._shape_signature(threads[index] for index in compute_active)
-        homogeneous_max_stage = all(
-            worksets[index] == self.max_stage_bytes for index in compute_active
-        )
+        homogeneous_max_stage = all(worksets[index] == self.max_stage_bytes for index in compute_active)
         if homogeneous_max_stage:
-            exact = self._shape_derate(
-                max(routes[index] for index in compute_active), shape
-            )
+            exact = self._shape_derate(max(routes[index] for index in compute_active), shape)
             if exact is not None:
                 return exact
         return self._derate_float(
@@ -627,10 +546,7 @@ class ContentionCostModel:
         count = len(tasks)
         routes = [int(value) for value, _, _ in tasks]
         threads = [int(value) for _, value, _ in tasks]
-        phases = [
-            self._task_phases(route_count, team)
-            for route_count, team, _ in tasks
-        ]
+        phases = [self._task_phases(route_count, team) for route_count, team, _ in tasks]
         phase_index = [0] * count
         remaining = [task_phases[0][0] for task_phases in phases]
         dependency_count, successors, started = self._dag_state(tasks)
@@ -642,30 +558,19 @@ class ContentionCostModel:
             guard += 1
             if guard > 2 * max_events:
                 raise RuntimeError("stage-aware DAG simulation did not converge")
-            active = [
-                index
-                for index in range(count)
-                if started[index] and not finished[index]
-            ]
+            active = [index for index in range(count) if started[index] and not finished[index]]
             if not active:
                 raise ValueError("DAG deadlock (cycle or unreachable task)")
             worksets = [0] * count
             for index in active:
                 worksets[index] = phases[index][phase_index[index]][1]
-            slowdown = self._working_set_derate(
-                active, routes, threads, worksets
-            )
-            effective = {
-                index: (1.0 if worksets[index] == 0 else slowdown)
-                for index in active
-            }
+            slowdown = self._working_set_derate(active, routes, threads, worksets)
+            effective = {index: (1.0 if worksets[index] == 0 else slowdown) for index in active}
             elapsed = min(remaining[index] * effective[index] for index in active)
             wall += elapsed
             for index in active:
                 remaining[index] -= elapsed / effective[index]
-            completed_phases = [
-                index for index in active if remaining[index] <= 1e-6
-            ]
+            completed_phases = [index for index in active if remaining[index] <= 1e-6]
             for index in completed_phases:
                 phase_index[index] += 1
                 if phase_index[index] < len(phases[index]):

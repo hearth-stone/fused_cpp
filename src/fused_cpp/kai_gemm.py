@@ -13,6 +13,7 @@
     - ``kai_gemm_prepare`` 为无状态的纯函数，返回 ``(packed_weight, K, N)`` 元组。
     - 后端不可用时（非 AArch64 或 C++ 扩展未编译），所有入口抛 ``RuntimeError``。
 """
+
 import logging
 from typing import List, Optional, Tuple, Union
 
@@ -30,6 +31,7 @@ try:
         create_kai_thread_pool as _create_kai_thread_pool,
         destroy_kai_thread_pool as _destroy_kai_thread_pool,
     )
+
     _supports_kai = True
 except ImportError:
     _supports_kai = False
@@ -38,9 +40,7 @@ except ImportError:
 def _require_backend() -> None:
     """后端不可用时抛出统一的 RuntimeError。"""
     if not _supports_kai:
-        raise RuntimeError(
-            "KleidiAI GEMM 后端不可用（C++ 扩展未编译或非 AArch64 平台）"
-        )
+        raise RuntimeError("KleidiAI GEMM 后端不可用（C++ 扩展未编译或非 AArch64 平台）")
 
 
 class KAIThreadPool:
@@ -88,7 +88,7 @@ class KAIThreadPool:
                 pass
             self._handle = 0
 
-    def __enter__(self) -> 'KAIThreadPool':
+    def __enter__(self) -> "KAIThreadPool":
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
@@ -147,31 +147,21 @@ def kai_gemm_prepare(
     _require_backend()
 
     if weight.dim() != 2:
-        raise RuntimeError(
-            f"KAI GEMM prepare: 权重张量必须为 2D [K, N]，当前 dim={weight.dim()}"
-        )
+        raise RuntimeError(f"KAI GEMM prepare: 权重张量必须为 2D [K, N]，当前 dim={weight.dim()}")
     if not weight.is_contiguous():
         raise RuntimeError("KAI GEMM prepare: 权重张量必须 contiguous（行主序）")
     if weight.dtype not in (torch.float32, torch.bfloat16):
-        raise RuntimeError(
-            f"KAI GEMM prepare: 权重 dtype 仅支持 float32/bfloat16，当前 {weight.dtype}"
-        )
+        raise RuntimeError(f"KAI GEMM prepare: 权重 dtype 仅支持 float32/bfloat16，当前 {weight.dtype}")
 
     k, n = int(weight.shape[0]), int(weight.shape[1])
 
     if bias is not None:
         if bias.dim() != 1:
-            raise RuntimeError(
-                f"KAI GEMM prepare: bias 必须为 1D，当前 dim={bias.dim()}"
-            )
+            raise RuntimeError(f"KAI GEMM prepare: bias 必须为 1D，当前 dim={bias.dim()}")
         if int(bias.shape[0]) != n:
-            raise RuntimeError(
-                f"KAI GEMM prepare: bias 长度必须等于 N={n}，实际 {int(bias.shape[0])}"
-            )
+            raise RuntimeError(f"KAI GEMM prepare: bias 长度必须等于 N={n}，实际 {int(bias.shape[0])}")
         if bias.dtype != torch.float32:
-            raise RuntimeError(
-                f"KAI GEMM prepare: bias dtype 必须为 float32，当前 {bias.dtype}"
-            )
+            raise RuntimeError(f"KAI GEMM prepare: bias dtype 必须为 float32，当前 {bias.dtype}")
         bias = bias.contiguous()
 
     packed_weight = _kai_gemm_prepare(weight, bias)
@@ -198,14 +188,14 @@ def create_kai_gemm(
     _require_backend()
 
     if max_threads < 1:
-        raise RuntimeError(
-            f"KAI GEMM: max_threads 必须 >=1，当前 {max_threads}"
-        )
+        raise RuntimeError(f"KAI GEMM: max_threads 必须 >=1，当前 {max_threads}")
     if not packed_weight.is_contiguous():
         packed_weight = packed_weight.contiguous()
 
     handler_ptr = _create_kai_gemm_handler(
-        packed_weight, int(k), int(n),
+        packed_weight,
+        int(k),
+        int(n),
     )
     return KAIGEMMHandler(
         handler_ptr=handler_ptr,
@@ -239,20 +229,14 @@ def kai_gemm(
     _require_backend()
 
     if x.shape[-1] != handler.k:
-        raise RuntimeError(
-            f"KAI GEMM: 输入最后一维 ({x.shape[-1]}) 与 handler.k ({handler.k}) 不一致"
-        )
+        raise RuntimeError(f"KAI GEMM: 输入最后一维 ({x.shape[-1]}) 与 handler.k ({handler.k}) 不一致")
     if x.dtype != torch.float32:
-        raise RuntimeError(
-            f"KAI GEMM: 输入 dtype 必须为 float32，当前 {x.dtype}"
-        )
+        raise RuntimeError(f"KAI GEMM: 输入 dtype 必须为 float32，当前 {x.dtype}")
 
     # 默认输出 dtype 与输入一致（float32）。
     out_dtype = output_dtype if output_dtype is not None else x.dtype
     if out_dtype not in (torch.float32, torch.bfloat16):
-        raise RuntimeError(
-            f"KAI GEMM: output_dtype 仅支持 float32/bfloat16，当前 {out_dtype}"
-        )
+        raise RuntimeError(f"KAI GEMM: output_dtype 仅支持 float32/bfloat16，当前 {out_dtype}")
 
     batch_shape = x.shape[:-1]
     output_shape = (*batch_shape, handler.n)
@@ -275,8 +259,10 @@ def kai_gemm(
 
     output = torch.empty(output_shape, dtype=out_dtype)
     _kai_gemm_impl(
-        output.reshape(-1, handler.n), x_2d,
-        handler._handler_ptr, pool_handle,
+        output.reshape(-1, handler.n),
+        x_2d,
+        handler._handler_ptr,
+        pool_handle,
     )
 
     return output

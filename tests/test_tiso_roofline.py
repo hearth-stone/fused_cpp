@@ -96,11 +96,7 @@ def test_roofline_uses_active_compute_or_memory_ceiling() -> None:
 
 
 def test_64core_profile_bulk_observations_have_physical_units() -> None:
-    path = (
-        COST_MODEL
-        / "profiles"
-        / "contention_async_amazon_c5_64c_tp2_sve_F1024_splitw13_v2_r1_20260713.json"
-    )
+    path = COST_MODEL / "profiles" / "contention_async_amazon_c5_64c_tp2_sve_F1024_splitw13_v2_r1_20260713.json"
     profile = json.loads(path.read_text(encoding="utf-8"))
     observations = {row.threads: row for row in fit_bulk_observations(profile)}
 

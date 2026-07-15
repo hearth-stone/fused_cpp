@@ -14,6 +14,7 @@ Run pinned:
   OMP_NUM_THREADS=1 OMP_PROC_BIND=FALSE taskset -c 0-7 \
     python cpu_moe_schedule_optimization/benchmarks/bench_fused_silu_nsplit.py
 """
+
 from __future__ import annotations
 
 import argparse
@@ -38,9 +39,7 @@ def nsplit_env(enabled, groups_per_partition=1, core_bases="0"):
     saved = {k: os.environ.get(k) for k in _KEYS}
     if enabled:
         os.environ["FUSED_CPP_MOE_HIERARCHICAL_N_SPLIT"] = "1"
-        os.environ["FUSED_CPP_MOE_N_SPLIT_GROUPS_PER_PARTITION"] = str(
-            groups_per_partition
-        )
+        os.environ["FUSED_CPP_MOE_N_SPLIT_GROUPS_PER_PARTITION"] = str(groups_per_partition)
         os.environ["FUSED_CPP_MOE_N_SPLIT_CORE_BASES"] = core_bases
     else:
         os.environ.pop("FUSED_CPP_MOE_HIERARCHICAL_N_SPLIT", None)
@@ -94,8 +93,8 @@ def main():
     for G in group_list:
         if T % G != 0:
             continue
-        total_groups = T // G          # each group has G threads
-        E = total_groups               # one active expert per group
+        total_groups = T // G  # each group has G threads
+        E = total_groups  # one active expert per group
         w13 = _bf16(E, 2 * F, H)
         w2 = _bf16(E, H, F)
         base_w = prepare_fused_moe_bf16_tiled_weights(w13, w2)
@@ -103,9 +102,7 @@ def main():
         for rows in row_list:
             tokens = E * rows
             x = _bf16(tokens, H)
-            ids = torch.tensor(
-                [[i % E] for i in range(tokens)], dtype=torch.int32
-            )
+            ids = torch.tensor([[i % E] for i in range(tokens)], dtype=torch.int32)
             w = torch.ones(tokens, 1)
 
             def run(weights, enabled, degree=5):
@@ -115,17 +112,19 @@ def main():
                     core_bases="0",
                 ):
                     return fused_moe_bf16_tiled(
-                        x, weights, w, ids, num_threads=T,
-                        activation="silu", silu_poly_degree=degree,
+                        x,
+                        weights,
+                        w,
+                        ids,
+                        num_threads=T,
+                        activation="silu",
+                        silu_poly_degree=degree,
                     )
 
             nf = _time(lambda: run(fused_w, True), args.warmup, args.runs)
             nl = _time(lambda: run(base_w, True), args.warmup, args.runs)
             df = _time(lambda: run(fused_w, False), args.warmup, args.runs)
-            print(
-                f"{rows:5d} {G:3d}  {nf:12.3f}  {nl:13.3f}  {df:13.3f}  "
-                f"{nl / nf:12.3f}"
-            )
+            print(f"{rows:5d} {G:3d}  {nf:12.3f}  {nl:13.3f}  {df:13.3f}  {nl / nf:12.3f}")
 
 
 if __name__ == "__main__":

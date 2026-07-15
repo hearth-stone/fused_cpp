@@ -11,13 +11,9 @@
 
 namespace {
 
-bool starts_with(const std::string& s, const char* prefix) {
-  return s.rfind(prefix, 0) == 0;
-}
+bool starts_with(const std::string& s, const char* prefix) { return s.rfind(prefix, 0) == 0; }
 
-int64_t parse_i64(const std::string& s) {
-  return std::strtoll(s.c_str(), nullptr, 10);
-}
+int64_t parse_i64(const std::string& s) { return std::strtoll(s.c_str(), nullptr, 10); }
 
 int64_t get_i64_arg(int& i, int argc, char** argv, const std::string& arg) {
   const auto pos = arg.find('=');
@@ -31,11 +27,10 @@ int64_t get_i64_arg(int& i, int argc, char** argv, const std::string& arg) {
 }
 
 void usage(const char* argv0) {
-  std::cout
-      << "usage: " << argv0 << " [options]\n"
-      << "  --B=1 --N=8 --L=512 --S=512 --E=64 --Ev=64\n"
-      << "  --causal | --noncausal\n"
-      << "  --iters=20 --warmup=5 --s-tile=0 --check\n";
+  std::cout << "usage: " << argv0 << " [options]\n"
+            << "  --B=1 --N=8 --L=512 --S=512 --E=64 --Ev=64\n"
+            << "  --causal | --noncausal\n"
+            << "  --iters=20 --warmup=5 --s-tile=0 --check\n";
 }
 
 }  // namespace
@@ -108,25 +103,18 @@ int main(int argc, char** argv) {
     clean_sdpa::sdpa_bf16_packqkv_pbf16pv(q.data(), k.data(), v.data(), out.data(), cfg);
   }
   const auto t1 = std::chrono::steady_clock::now();
-  const double mean_ms =
-      std::chrono::duration<double, std::milli>(t1 - t0).count() /
-      static_cast<double>(iters);
+  const double mean_ms = std::chrono::duration<double, std::milli>(t1 - t0).count() / static_cast<double>(iters);
 
   std::cout << std::fixed << std::setprecision(3);
-  std::cout << "shape=B" << cfg.B << "-N" << cfg.N
-            << "-L" << cfg.L << "-S" << cfg.S
-            << "-E" << cfg.E << "-Ev" << cfg.Ev
+  std::cout << "shape=B" << cfg.B << "-N" << cfg.N << "-L" << cfg.L << "-S" << cfg.S << "-E" << cfg.E << "-Ev" << cfg.Ev
             << " causal=" << (cfg.causal ? "true" : "false") << "\n";
-  std::cout << "mean_ms=" << mean_ms
-            << " gflops=" << clean_sdpa::counted_gflops(cfg, mean_ms)
-            << " checksum=" << clean_sdpa::checksum(out.data(), o_size)
-            << "\n";
+  std::cout << "mean_ms=" << mean_ms << " gflops=" << clean_sdpa::counted_gflops(cfg, mean_ms)
+            << " checksum=" << clean_sdpa::checksum(out.data(), o_size) << "\n";
 
   if (check) {
     clean_sdpa::AlignedVector<float> ref(static_cast<size_t>(o_size), 0.0f);
     clean_sdpa::reference_sdpa_bf16(q.data(), k.data(), v.data(), ref.data(), cfg);
-    std::cout << "max_abs_diff=" << clean_sdpa::max_abs_diff(out.data(), ref.data(), o_size)
-              << "\n";
+    std::cout << "max_abs_diff=" << clean_sdpa::max_abs_diff(out.data(), ref.data(), o_size) << "\n";
   }
 
   return 0;

@@ -4,6 +4,7 @@
 The opt-in fused path (prepare with fuse_silu=True) must match the baseline
 w13+activation MoE within a tolerance covering bf16 rounding + the poly exp.
 """
+
 from __future__ import annotations
 
 import platform
@@ -44,17 +45,13 @@ def _moe_case(num_tokens, hidden, ffn, num_experts, top_k, seed=0):
 def test_fused_silu_moe_matches_baseline(degree, num_threads, num_tokens):
     # F must be a multiple of 8 for the fused path.
     hidden, ffn, num_experts, top_k = 128, 64, 4, 2
-    x, w13, w2, tw, ti = _moe_case(
-        num_tokens, hidden, ffn, num_experts, top_k, seed=degree + num_tokens
-    )
+    x, w13, w2, tw, ti = _moe_case(num_tokens, hidden, ffn, num_experts, top_k, seed=degree + num_tokens)
 
     base_w = prepare_fused_moe_bf16_tiled_weights(w13, w2)
     fused_w = prepare_fused_moe_bf16_tiled_weights(w13, w2, fuse_silu=True)
     assert fused_w.fused_silu is True
 
-    ref = fused_moe_bf16_tiled(
-        x, base_w, tw, ti, num_threads=num_threads, activation="silu"
-    )
+    ref = fused_moe_bf16_tiled(x, base_w, tw, ti, num_threads=num_threads, activation="silu")
     out = fused_moe_bf16_tiled(
         x,
         fused_w,

@@ -66,9 +66,7 @@ def make_run(
 ) -> Callable[[], torch.Tensor]:
     expert_ids = torch.tensor([0], dtype=torch.int32)
     team_threads = torch.tensor([threads], dtype=torch.int32)
-    cpu_ids = torch.tensor(
-        sorted(os.sched_getaffinity(0))[:threads], dtype=torch.int32
-    )
+    cpu_ids = torch.tensor(sorted(os.sched_getaffinity(0))[:threads], dtype=torch.int32)
     common = {
         "thread_cpu_ids": cpu_ids,
         "num_threads": threads,
@@ -130,9 +128,7 @@ def benchmark_case(
 ) -> list[dict[str, object]]:
     topk_ids = torch.zeros((routes, 1), dtype=torch.int32)
     topk_weights = torch.ones((routes, 1), dtype=torch.float32)
-    run = make_run(
-        path, hidden, packed, topk_weights, topk_ids, threads, weighted
-    )
+    run = make_run(path, hidden, packed, topk_weights, topk_ids, threads, weighted)
 
     outputs: dict[str, torch.Tensor] = {}
     for name, elide_zero, owner_scatter in VARIANTS:
@@ -146,16 +142,11 @@ def benchmark_case(
             reference,
             atol=0,
             rtol=0,
-            msg=lambda message, name=name: (
-                f"path={path} routes={routes} threads={threads} "
-                f"variant={name}: {message}"
-            ),
+            msg=lambda message, name=name: f"path={path} routes={routes} threads={threads} variant={name}: {message}",
         )
 
     for warmup_index in range(warmup):
-        order = VARIANTS[warmup_index % len(VARIANTS) :] + VARIANTS[
-            : warmup_index % len(VARIANTS)
-        ]
+        order = VARIANTS[warmup_index % len(VARIANTS) :] + VARIANTS[: warmup_index % len(VARIANTS)]
         for _, elide_zero, owner_scatter in order:
             set_variant(elide_zero, owner_scatter)
             run()
@@ -182,9 +173,7 @@ def benchmark_case(
             begin = time.perf_counter_ns()
             for _ in range(inner_iters):
                 output = run()
-            elapsed_ms = (
-                (time.perf_counter_ns() - begin) / 1.0e6 / inner_iters
-            )
+            elapsed_ms = (time.perf_counter_ns() - begin) / 1.0e6 / inner_iters
             samples[name].append(elapsed_ms)
             sink ^= int(output.view(torch.int16)[0, 0])
 
@@ -193,11 +182,7 @@ def benchmark_case(
     for name, elide_zero, owner_scatter in VARIANTS:
         variant_samples = samples[name]
         median_ms = statistics.median(variant_samples)
-        stddev_ms = (
-            statistics.stdev(variant_samples)
-            if len(variant_samples) > 1
-            else 0.0
-        )
+        stddev_ms = statistics.stdev(variant_samples) if len(variant_samples) > 1 else 0.0
         record = {
             "path": path,
             "routes": routes,
@@ -226,12 +211,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--hidden-size", type=int, default=4096)
     parser.add_argument("--ffn-hidden-size", type=int, default=512)
-    parser.add_argument(
-        "--routes", type=parse_ints, default=parse_ints("12,48,192,768,2040")
-    )
-    parser.add_argument(
-        "--threads", type=parse_ints, default=parse_ints("8,16,32,48,64,96")
-    )
+    parser.add_argument("--routes", type=parse_ints, default=parse_ints("12,48,192,768,2040"))
+    parser.add_argument("--threads", type=parse_ints, default=parse_ints("8,16,32,48,64,96"))
     parser.add_argument("--paths", default="scheduled,async")
     parser.add_argument("--warmup", type=int, default=4)
     parser.add_argument("--runs", type=int, default=17)
@@ -249,38 +230,31 @@ def main() -> int:
     paths = [path for path in args.paths.split(",") if path]
     if not paths or any(path not in ("scheduled", "async") for path in paths):
         raise ValueError(f"invalid paths: {args.paths}")
-    if (
-        args.warmup < 0
-        or args.runs <= 0
-        or args.sample_ms <= 0
-        or args.max_inner_iters <= 0
-    ):
+    if args.warmup < 0 or args.runs <= 0 or args.sample_ms <= 0 or args.max_inner_iters <= 0:
         raise ValueError("warmup, runs, sample-ms, or max-inner-iters is invalid")
     if max(args.threads) > len(os.sched_getaffinity(0)):
         raise ValueError("thread count exceeds the process CPU affinity")
 
     os.environ["FUSED_CPP_MOE_SVE"] = "1"
-    os.environ["FUSED_CPP_MOE_W13_SPLIT_N"] = (
-        "0" if args.no_split_w13 else "1"
-    )
+    os.environ["FUSED_CPP_MOE_W13_SPLIT_N"] = "0" if args.no_split_w13 else "1"
     os.environ["FUSED_CPP_MOE_W2_BF16_ROUTE"] = "1" if args.weighted else "0"
     torch.set_num_threads(1)
     torch.set_num_interop_threads(1)
     generator = torch.Generator().manual_seed(args.seed)
-    w13 = torch.empty(
-        (1, 2 * args.ffn_hidden_size, args.hidden_size), dtype=torch.bfloat16
-    ).normal_(mean=0.0, std=0.01, generator=generator)
-    w2 = torch.empty(
-        (1, args.hidden_size, args.ffn_hidden_size), dtype=torch.bfloat16
-    ).normal_(mean=0.0, std=0.01, generator=generator)
+    w13 = torch.empty((1, 2 * args.ffn_hidden_size, args.hidden_size), dtype=torch.bfloat16).normal_(
+        mean=0.0, std=0.01, generator=generator
+    )
+    w2 = torch.empty((1, args.hidden_size, args.ffn_hidden_size), dtype=torch.bfloat16).normal_(
+        mean=0.0, std=0.01, generator=generator
+    )
     packed = prepare_fused_moe_bf16_tiled_weights(w13, w2, fuse_silu=True)
     if packed.gemm_backend != 1:
         raise RuntimeError("benchmark requires the SVE BF16 backend")
 
     hidden_by_routes = {
-        routes: torch.empty(
-            (routes, args.hidden_size), dtype=torch.bfloat16
-        ).normal_(mean=0.0, std=0.01, generator=generator)
+        routes: torch.empty((routes, args.hidden_size), dtype=torch.bfloat16).normal_(
+            mean=0.0, std=0.01, generator=generator
+        )
         for routes in args.routes
     }
     records: list[dict[str, object]] = []

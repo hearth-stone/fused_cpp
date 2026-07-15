@@ -40,17 +40,9 @@ class HierarchicalTopology:
         """Hierarchical reduce-scatter/all-reduce/all-gather bandwidth model."""
         group = self.ranks_per_group
         group_count = self.groups
-        intra_bytes = (
-            2.0 * (group - 1) / group * message_bytes if group > 1 else 0.0
-        )
-        inter_bytes = (
-            2.0 * (group_count - 1) / group_count * message_bytes
-            if group_count > 1
-            else 0.0
-        )
-        stages = (2 * (group - 1) if group > 1 else 0) + (
-            2 * (group_count - 1) if group_count > 1 else 0
-        )
+        intra_bytes = 2.0 * (group - 1) / group * message_bytes if group > 1 else 0.0
+        inter_bytes = 2.0 * (group_count - 1) / group_count * message_bytes if group_count > 1 else 0.0
+        stages = (2 * (group - 1) if group > 1 else 0) + (2 * (group_count - 1) if group_count > 1 else 0)
         seconds = (
             intra_bytes / self.intra_bytes_per_second
             + inter_bytes / self.inter_bytes_per_second
@@ -63,11 +55,7 @@ class HierarchicalTopology:
         group = self.ranks_per_group
         ranks = self.ranks
         intra_load = outgoing_bytes_per_rank * max(group - 1, 0) / ranks
-        inter_link_load = (
-            outgoing_bytes_per_rank * group * group / ranks
-            if self.groups > 1
-            else 0.0
-        )
+        inter_link_load = outgoing_bytes_per_rank * group * group / ranks if self.groups > 1 else 0.0
         one_way = max(
             intra_load / self.intra_bytes_per_second,
             inter_link_load / self.inter_bytes_per_second,
@@ -104,10 +92,7 @@ def partition_ep_histogram(global_histogram: list[int], ranks: int) -> list[list
     if len(global_histogram) % ranks:
         raise ValueError("global expert count must be divisible by EP degree")
     local_experts = len(global_histogram) // ranks
-    return [
-        global_histogram[rank * local_experts : (rank + 1) * local_experts]
-        for rank in range(ranks)
-    ]
+    return [global_histogram[rank * local_experts : (rank + 1) * local_experts] for rank in range(ranks)]
 
 
 def load_rank_histograms(path: Path, ranks: int, local_experts: int) -> list[list[int]]:
@@ -154,9 +139,7 @@ class ParallelLayerEvaluator:
         self.cores_per_rank = int(cores_per_rank)
         self.dtype_bytes = int(dtype_bytes)
 
-    def _models(
-        self, mode: str, intermediate_size: int, local_experts: int
-    ) -> list[ContentionCostModel]:
+    def _models(self, mode: str, intermediate_size: int, local_experts: int) -> list[ContentionCostModel]:
         query = ProfileQuery(
             mode=mode,
             degree=self.topology.ranks,
@@ -195,11 +178,7 @@ class ParallelLayerEvaluator:
             raise ValueError("profile does not contain one physical CPU set per rank")
         rank_results: list[RankCompute] = []
         for rank, histogram in enumerate(rank_histograms):
-            experts = [
-                (expert, routes)
-                for expert, routes in enumerate(histogram)
-                if routes > 0
-            ]
+            experts = [(expert, routes) for expert, routes in enumerate(histogram) if routes > 0]
             if not experts:
                 rank_results.append(RankCompute(rank, 0, 0, False, (), 0.0))
                 continue
@@ -232,26 +211,18 @@ class ParallelLayerEvaluator:
     ) -> ParallelResult:
         total_routes = int(tokens) * int(top_k)
         histogram = (
-            uniform_histogram(total_routes, self.global_experts)
-            if global_histogram is None
-            else list(global_histogram)
+            uniform_histogram(total_routes, self.global_experts) if global_histogram is None else list(global_histogram)
         )
         if len(histogram) != self.global_experts or sum(histogram) != total_routes:
-            raise ValueError(
-                "TP global histogram must match global_experts and tokens * top_k"
-            )
+            raise ValueError("TP global histogram must match global_experts and tokens * top_k")
         rank_histograms = [list(histogram) for _ in range(self.topology.ranks)]
         sharded_intermediate = self.full_intermediate_size // self.topology.ranks
         if sharded_intermediate * self.topology.ranks != self.full_intermediate_size:
             raise ValueError("full intermediate size must divide TP degree")
-        compute, rank_compute = self._compute(
-            "tp", rank_histograms, sharded_intermediate
-        )
+        compute, rank_compute = self._compute("tp", rank_histograms, sharded_intermediate)
         message_bytes = int(tokens) * self.hidden_size * self.dtype_bytes
         communication = self.topology.allreduce_ms(message_bytes)
-        return ParallelResult(
-            "tp", compute, communication, compute + communication, rank_compute
-        )
+        return ParallelResult("tp", compute, communication, compute + communication, rank_compute)
 
     def evaluate_ep(
         self,
@@ -268,35 +239,16 @@ class ParallelLayerEvaluator:
         total_routes = int(tokens) * int(top_k)
         if rank_histograms is None:
             if global_histogram is None:
-                global_histogram = uniform_histogram(
-                    total_routes, self.global_experts
-                )
-            if (
-                len(global_histogram) != self.global_experts
-                or sum(global_histogram) != total_routes
-            ):
-                raise ValueError(
-                    "EP global histogram must match global_experts and tokens * top_k"
-                )
-            rank_histograms = partition_ep_histogram(
-                global_histogram, self.topology.ranks
-            )
+                global_histogram = uniform_histogram(total_routes, self.global_experts)
+            if len(global_histogram) != self.global_experts or sum(global_histogram) != total_routes:
+                raise ValueError("EP global histogram must match global_experts and tokens * top_k")
+            rank_histograms = partition_ep_histogram(global_histogram, self.topology.ranks)
         elif sum(sum(histogram) for histogram in rank_histograms) != total_routes:
             raise ValueError("EP rank histograms must sum to tokens * top_k")
-        compute, rank_compute = self._compute(
-            "ep", rank_histograms, self.full_intermediate_size
-        )
-        outgoing_per_rank = (
-            int(tokens)
-            / self.topology.ranks
-            * int(top_k)
-            * self.hidden_size
-            * self.dtype_bytes
-        )
+        compute, rank_compute = self._compute("ep", rank_histograms, self.full_intermediate_size)
+        outgoing_per_rank = int(tokens) / self.topology.ranks * int(top_k) * self.hidden_size * self.dtype_bytes
         communication = self.topology.alltoall_ms(outgoing_per_rank)
-        return ParallelResult(
-            "ep", compute, communication, compute + communication, rank_compute
-        )
+        return ParallelResult("ep", compute, communication, compute + communication, rank_compute)
 
 
 def parse_args() -> argparse.Namespace:
@@ -351,9 +303,7 @@ def main() -> int:
     if args.ep_routes is not None:
         if global_histogram is not None:
             raise ValueError("--ep-routes and --global-routes are mutually exclusive")
-        ep_histograms = load_rank_histograms(
-            args.ep_routes, args.ranks, args.experts // args.ranks
-        )
+        ep_histograms = load_rank_histograms(args.ep_routes, args.ranks, args.experts // args.ranks)
     tp = evaluator.evaluate_tp(args.tokens, args.topk, global_histogram)
     ep = evaluator.evaluate_ep(
         args.tokens,
@@ -364,10 +314,7 @@ def main() -> int:
     if args.json:
         print(json.dumps({"tp": asdict(tp), "ep": asdict(ep)}, indent=2))
     else:
-        print(
-            f"T={args.tokens} topk={args.topk} E={args.experts} "
-            f"H={args.hidden} F={args.f_full} P={args.ranks}"
-        )
+        print(f"T={args.tokens} topk={args.topk} E={args.experts} H={args.hidden} F={args.f_full} P={args.ranks}")
         for result in (tp, ep):
             print(
                 f"{result.mode.upper():<3} compute={result.compute_ms:8.3f} ms "

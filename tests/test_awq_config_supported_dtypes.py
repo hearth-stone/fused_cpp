@@ -14,6 +14,7 @@
 本测试用 ``monkeypatch`` 打桩 ``current_platform.is_cpu()`` 的返回值，覆盖
 CPU 分支与非 CPU 分支；不依赖任何模型权重、不触发 engine 初始化。
 """
+
 from __future__ import annotations
 
 import pytest
@@ -44,7 +45,9 @@ class TestAwqConfigSupportedActDtypes:
         import vllm.model_executor.layers.quantization.awq as awq_mod
 
         monkeypatch.setattr(
-            awq_mod.current_platform, "is_cpu", lambda: True,
+            awq_mod.current_platform,
+            "is_cpu",
+            lambda: True,
         )
 
         # Act
@@ -52,9 +55,7 @@ class TestAwqConfigSupportedActDtypes:
 
         # Assert
         assert torch.half in dtypes, f"fp16 应始终被支持，实际 {dtypes}"
-        assert torch.bfloat16 in dtypes, (
-            f"CPU 平台必须支持 bf16 以匹配 R1-AWQ + --dtype=bfloat16，实际 {dtypes}"
-        )
+        assert torch.bfloat16 in dtypes, f"CPU 平台必须支持 bf16 以匹配 R1-AWQ + --dtype=bfloat16，实际 {dtypes}"
 
     def test_non_cpu_platform_only_fp16(self, awq_config, monkeypatch) -> None:
         """GPU / 其他平台必须保持原有 fp16-only 契约。"""
@@ -62,13 +63,13 @@ class TestAwqConfigSupportedActDtypes:
         import vllm.model_executor.layers.quantization.awq as awq_mod
 
         monkeypatch.setattr(
-            awq_mod.current_platform, "is_cpu", lambda: False,
+            awq_mod.current_platform,
+            "is_cpu",
+            lambda: False,
         )
 
         # Act
         dtypes = awq_config.get_supported_act_dtypes()
 
         # Assert
-        assert dtypes == [torch.half], (
-            f"非 CPU 平台应仅返回 [torch.half]，实际 {dtypes}"
-        )
+        assert dtypes == [torch.half], f"非 CPU 平台应仅返回 [torch.half]，实际 {dtypes}"

@@ -1,4 +1,5 @@
 """Build script for fused_cpp C++ extension."""
+
 import glob
 import os
 import platform
@@ -34,7 +35,9 @@ class _BuildExtensionWithFixup(BuildExtension):
         """将 .so 中引用的相对路径 dylib 替换为 @rpath 形式。"""
         result = subprocess.run(
             ["otool", "-L", so_path],
-            capture_output=True, text=True, check=False,
+            capture_output=True,
+            text=True,
+            check=False,
         )
         for line in result.stdout.splitlines()[1:]:
             dep = line.strip().split()[0]
@@ -109,9 +112,7 @@ class _BuildExtensionWithFixup(BuildExtension):
 
         if platform.system() != "Windows" and "-fPIC" not in native_args:
             native_args.append("-fPIC")
-        include_args = [
-            f"-I{inc}" for inc in (getattr(ext, "include_dirs", []) or [])
-        ]
+        include_args = [f"-I{inc}" for inc in (getattr(ext, "include_dirs", []) or [])]
         cmd = [compiler, "-c", src, "-o", obj, *include_args, *native_args]
         subprocess.run(cmd, check=True)
 
@@ -230,8 +231,8 @@ def _detect_openmp():
 
         # 3) Homebrew 默认路径
         for brew_root in (
-            "/opt/homebrew/opt/libomp",   # Apple Silicon
-            "/usr/local/opt/libomp",      # Intel mac
+            "/opt/homebrew/opt/libomp",  # Apple Silicon
+            "/usr/local/opt/libomp",  # Intel mac
         ):
             candidates.append(("brew", brew_root))
 
@@ -239,7 +240,9 @@ def _detect_openmp():
         try:
             brew_prefix = subprocess.run(
                 ["brew", "--prefix", "libomp"],
-                capture_output=True, text=True, check=False,
+                capture_output=True,
+                text=True,
+                check=False,
             ).stdout.strip()
             if brew_prefix:
                 candidates.append(("brew", brew_prefix))
@@ -259,7 +262,8 @@ def _detect_openmp():
                 continue
 
             compile_args = [
-                "-Xpreprocessor", "-fopenmp",
+                "-Xpreprocessor",
+                "-fopenmp",
                 f"-I{inc}",
             ]
             if kind == "pytorch" and os.path.isfile(libomp_dylib):
@@ -318,8 +322,9 @@ def _detect_kleidiai():
         if not root:
             continue
         # 判定条件：存在 kai/kai_common.h 且存在 kai/ukernels/matmul 子目录
-        if (os.path.isfile(os.path.join(root, "kai", "kai_common.h")) and
-                os.path.isdir(os.path.join(root, "kai", "ukernels", "matmul"))):
+        if os.path.isfile(os.path.join(root, "kai", "kai_common.h")) and os.path.isdir(
+            os.path.join(root, "kai", "ukernels", "matmul")
+        ):
             return True, os.path.abspath(root)
 
     return False, ""
@@ -344,8 +349,7 @@ def _collect_kleidiai_sources(kai_root):
         # FP32-output 8x12 BFMMLA microkernel
         # BF16 输出通过 FP32 微内核 + thread-local scratch 再转换实现，
         # 因此无需编译 f16 变体（f16 表示 IEEE half，并非 BF16）。
-        "kai/ukernels/matmul/matmul_clamp_f32_bf16p_bf16p/"
-        "kai_matmul_clamp_f32_bf16p8x4_bf16p12x4b_8x12_neon_mmla.c",
+        "kai/ukernels/matmul/matmul_clamp_f32_bf16p_bf16p/kai_matmul_clamp_f32_bf16p8x4_bf16p12x4b_8x12_neon_mmla.c",
     ]
     result_files = []
     for rel in rel_files:
@@ -409,12 +413,8 @@ include_dirs = ["csrc"]
 library_dirs = []
 define_macros = []
 
-define_macros.append(
-    ("FUSED_CPP_ENABLE_PROFILING", "1" if _profiling_enabled_for_build() else "0")
-)
-define_macros.append(
-    ("FUSED_CPP_STRICT_MODE", "1" if _env_truthy("FUSED_CPP_STRICT_MODE") else "0")
-)
+define_macros.append(("FUSED_CPP_ENABLE_PROFILING", "1" if _profiling_enabled_for_build() else "0"))
+define_macros.append(("FUSED_CPP_STRICT_MODE", "1" if _env_truthy("FUSED_CPP_STRICT_MODE") else "0"))
 
 # OpenMP：在 Linux 上默认启用 -fopenmp；在 macOS 上若检测到 Homebrew 安装的
 # libomp 则启用，否则静默退化为单线程（omp_info 报告 has_openmp=false）。
@@ -450,8 +450,7 @@ if is_aarch64:
     bf16gemm_asm_sources.append(os.path.join(bf16gemm_lib, "bf16gemm_k.S"))
     bf16gemm_asm_sources.append(os.path.join(bf16gemm_lib, "bf16gemm_k_bias.S"))
     # fused_cpp-owned packed-C fused-silu kernels (Part 2 of packA fusion).
-    bf16gemm_asm_sources.append(
-        os.path.abspath(os.path.join("csrc", "bf16gemm_silu_packc.S")))
+    bf16gemm_asm_sources.append(os.path.abspath(os.path.join("csrc", "bf16gemm_silu_packc.S")))
 
     target_cpu = os.environ.get("FUSED_CPP_TARGET_CPU", "").strip()
     if target_cpu:
@@ -469,52 +468,55 @@ if is_aarch64:
     extra_compile_args.append("-O2")
 
     target_has_sve = (
-        "sve" in target_cpu.lower()
-        if target_cpu
-        else platform.system() != "Darwin" and _host_cpu_has_flag("sve")
+        "sve" in target_cpu.lower() if target_cpu else platform.system() != "Darwin" and _host_cpu_has_flag("sve")
     )
     if target_has_sve:
         # fused_cpp-owned SVE MoE asm kernels. Do not compile upstream
         # bf16gemm_sve.S directly here; it exports bf16gemm_k_* symbols that
         # collide with the NEON bf16gemm objects already linked above.
-        bf16gemm_asm_sources.append(
-            os.path.abspath(os.path.join("csrc", "moe_sve_fused_asm.S")))
+        bf16gemm_asm_sources.append(os.path.abspath(os.path.join("csrc", "moe_sve_fused_asm.S")))
     i8gemm_backend = "sve" if target_has_sve else "neon"
     i8gemm_required = [
         os.path.join(bf16gemm_lib, "i8gemm.h"),
         os.path.join(bf16gemm_lib, "i8gemm_pack_a_neon.S"),
     ]
     if i8gemm_backend == "sve":
-        i8gemm_required.extend([
-            os.path.join(bf16gemm_lib, "i8gemm_sve.c"),
-            os.path.join(bf16gemm_lib, "i8gemm_sve.S"),
-            os.path.join(bf16gemm_lib, "i8gemm_hybrid.S"),
-        ])
+        i8gemm_required.extend(
+            [
+                os.path.join(bf16gemm_lib, "i8gemm_sve.c"),
+                os.path.join(bf16gemm_lib, "i8gemm_sve.S"),
+                os.path.join(bf16gemm_lib, "i8gemm_hybrid.S"),
+            ]
+        )
     else:
-        i8gemm_required.extend([
-            os.path.join(bf16gemm_lib, "i8gemm_mt.c"),
-            os.path.join(bf16gemm_lib, "i8gemm_k.S"),
-            os.path.join(bf16gemm_lib, "i8gemm_k_bias.S"),
-        ])
+        i8gemm_required.extend(
+            [
+                os.path.join(bf16gemm_lib, "i8gemm_mt.c"),
+                os.path.join(bf16gemm_lib, "i8gemm_k.S"),
+                os.path.join(bf16gemm_lib, "i8gemm_k_bias.S"),
+            ]
+        )
     if omp_available and all(os.path.isfile(p) for p in i8gemm_required):
         if i8gemm_backend == "sve":
             i8gemm_c_sources.append(os.path.join(bf16gemm_lib, "i8gemm_sve.c"))
-            i8gemm_asm_sources.extend([
-                os.path.join(bf16gemm_lib, "i8gemm_sve.S"),
-                os.path.join(bf16gemm_lib, "i8gemm_hybrid.S"),
-                os.path.join(bf16gemm_lib, "i8gemm_pack_a_neon.S"),
-            ])
+            i8gemm_asm_sources.extend(
+                [
+                    os.path.join(bf16gemm_lib, "i8gemm_sve.S"),
+                    os.path.join(bf16gemm_lib, "i8gemm_hybrid.S"),
+                    os.path.join(bf16gemm_lib, "i8gemm_pack_a_neon.S"),
+                ]
+            )
         else:
             i8gemm_c_sources.append(os.path.join(bf16gemm_lib, "i8gemm_mt.c"))
-            i8gemm_asm_sources.extend([
-                os.path.join(bf16gemm_lib, "i8gemm_k.S"),
-                os.path.join(bf16gemm_lib, "i8gemm_k_bias.S"),
-                os.path.join(bf16gemm_lib, "i8gemm_pack_a_neon.S"),
-            ])
+            i8gemm_asm_sources.extend(
+                [
+                    os.path.join(bf16gemm_lib, "i8gemm_k.S"),
+                    os.path.join(bf16gemm_lib, "i8gemm_k_bias.S"),
+                    os.path.join(bf16gemm_lib, "i8gemm_pack_a_neon.S"),
+                ]
+            )
         define_macros.append(("FUSED_CPP_HAS_I8GEMM", "1"))
-        define_macros.append(
-            ("FUSED_CPP_I8GEMM_BACKEND", f'"{i8gemm_backend}"')
-        )
+        define_macros.append(("FUSED_CPP_I8GEMM_BACKEND", f'"{i8gemm_backend}"'))
 
 if use_acl:
     define_macros.append(("FUSED_CPP_HAS_ACL", "1"))
@@ -551,13 +553,15 @@ if use_kai:
     # -mcpu=apple-m2 / -march=armv8.6-a+bf16+i8mm 提供，这里不再追加 -march=
     # 以免覆盖（多个 -march/-mcpu 时编译器以最后一个为准，会反向降级 BFMMLA
     # 路径）。仅追加 KleidiAI 自身需要的标志。
-    extra_compile_args.extend([
-        "-O2",
-        # KleidiAI 的 .c 源文件中存在 void* -> T* 的隐式转换，
-        # 在 C 中合法但 C++ 中不允许。PyTorch CppExtension 统一使用
-        # C++ 编译器编译所有源文件，因此需要 -fpermissive 来容忍此类转换。
-        "-fpermissive",
-    ])
+    extra_compile_args.extend(
+        [
+            "-O2",
+            # KleidiAI 的 .c 源文件中存在 void* -> T* 的隐式转换，
+            # 在 C 中合法但 C++ 中不允许。PyTorch CppExtension 统一使用
+            # C++ 编译器编译所有源文件，因此需要 -fpermissive 来容忍此类转换。
+            "-fpermissive",
+        ]
+    )
 else:
     # 未启用 KleidiAI 时，不追加外部 KleidiAI C 源，保留 csrc/kai_gemm.cpp
     # 编译其 stub 实现，避免 module.cpp 中的 KAI 绑定出现未解析符号。

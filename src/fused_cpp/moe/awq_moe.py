@@ -44,6 +44,7 @@ key ``model.layers.L.mlp.experts.E.{gate_proj,up_proj,down_proj}.{qweight,qzeros
 scoring`` / ``e_score_correction_bias``）**不**在本模块出现；Step 2 接入 vLLM
 时直接复用 vLLM 已有的 ``FusedMoE.select_experts``。
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -121,11 +122,9 @@ def dequant_awq_to_bf16(
     w_z_full = w_z.repeat_interleave(group_size, dim=0)
     s_full = scales.to(torch.float32).repeat_interleave(group_size, dim=0)
 
-    w_fp = (w_q - w_z_full) * s_full                                # [K, N] fp32
+    w_fp = (w_q - w_z_full) * s_full  # [K, N] fp32
     if w_fp.shape != (k, n):
-        raise RuntimeError(
-            f"反量化结果形状异常：{tuple(w_fp.shape)} 期望 {(k, n)}"
-        )
+        raise RuntimeError(f"反量化结果形状异常：{tuple(w_fp.shape)} 期望 {(k, n)}")
     return w_fp.to(torch.bfloat16)
 
 
@@ -146,7 +145,7 @@ def _expert_ffn_bf16(
     # fp32 累加保证 SiLU 与乘法前的数值精度
     gate_out = torch.matmul(x.to(torch.float32), gate_w.to(torch.float32))
     up_out = torch.matmul(x.to(torch.float32), up_w.to(torch.float32))
-    intermediate = F.silu(gate_out) * up_out                        # [T, F]
+    intermediate = F.silu(gate_out) * up_out  # [T, F]
     out = torch.matmul(intermediate, down_w.to(torch.float32))
     return out.to(torch.bfloat16)
 
@@ -174,13 +173,9 @@ def _dispatch_tokens_to_experts(
     t, h = hidden_states.shape
     topk = topk_ids.shape[1]
     if topk_ids.shape != (t, topk):
-        raise RuntimeError(
-            f"topk_ids 形状应为 ({t}, {topk})，当前 {tuple(topk_ids.shape)}"
-        )
+        raise RuntimeError(f"topk_ids 形状应为 ({t}, {topk})，当前 {tuple(topk_ids.shape)}")
     if topk_weights.shape != (t, topk):
-        raise RuntimeError(
-            f"topk_weights 形状应为 ({t}, {topk})，当前 {tuple(topk_weights.shape)}"
-        )
+        raise RuntimeError(f"topk_weights 形状应为 ({t}, {topk})，当前 {tuple(topk_weights.shape)}")
 
     # 用 fp32 做累加，避免 top_k=8 重复加法的 bf16 精度坍塌
     output = torch.zeros((t, h), dtype=torch.float32, device=hidden_states.device)
@@ -188,20 +183,17 @@ def _dispatch_tokens_to_experts(
 
     # 每个 expert 挑出所有 (token_idx, slot_idx) 对，拼成一次 FFN
     for e in range(num_experts):
-        match = (topk_ids == e).nonzero(as_tuple=False)             # [n_e, 2]
+        match = (topk_ids == e).nonzero(as_tuple=False)  # [n_e, 2]
         if match.numel() == 0:
             continue
         tok_idx = match[:, 0]
         slot_idx = match[:, 1]
 
-        x_sub = hidden_states.index_select(0, tok_idx)              # [n_e, H]
-        y_sub = expert_fn(e, x_sub)                                 # [n_e, H]
+        x_sub = hidden_states.index_select(0, tok_idx)  # [n_e, H]
+        y_sub = expert_fn(e, x_sub)  # [n_e, H]
         if y_sub.shape != x_sub.shape:
-            raise RuntimeError(
-                f"expert {e} 输出形状 {tuple(y_sub.shape)} 与输入"
-                f"{tuple(x_sub.shape)} 不一致"
-            )
-        w = weights_fp32[tok_idx, slot_idx].unsqueeze(-1)           # [n_e, 1]
+            raise RuntimeError(f"expert {e} 输出形状 {tuple(y_sub.shape)} 与输入{tuple(x_sub.shape)} 不一致")
+        w = weights_fp32[tok_idx, slot_idx].unsqueeze(-1)  # [n_e, 1]
         # 用 index_add_ 以避免重复 token 被覆盖（scatter_add 语义）
         output.index_add_(0, tok_idx, y_sub.to(torch.float32) * w)
 
@@ -226,9 +218,7 @@ def awq_moe_expert_ffn_reference(
     :returns:             ``[T, H]`` bf16。
     """
     if hidden_states.dtype != torch.bfloat16:
-        raise RuntimeError(
-            f"hidden_states 必须为 bfloat16，当前 {hidden_states.dtype}"
-        )
+        raise RuntimeError(f"hidden_states 必须为 bfloat16，当前 {hidden_states.dtype}")
 
     # 惰性 dequant：遇到用不上的 expert 不做反量化
     dequant_cache: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
@@ -249,7 +239,11 @@ def awq_moe_expert_ffn_reference(
         return _expert_ffn_bf16(x_sub, gate_w, up_w, down_w)
 
     return _dispatch_tokens_to_experts(
-        hidden_states, topk_ids, topk_weights, len(experts), _fn,
+        hidden_states,
+        topk_ids,
+        topk_weights,
+        len(experts),
+        _fn,
     )
 
 
@@ -267,9 +261,7 @@ def awq_moe_expert_ffn_w4a8(
     :returns: ``[T, H]`` bf16。
     """
     if hidden_states.dtype != torch.bfloat16:
-        raise RuntimeError(
-            f"hidden_states 必须为 bfloat16，当前 {hidden_states.dtype}"
-        )
+        raise RuntimeError(f"hidden_states 必须为 bfloat16，当前 {hidden_states.dtype}")
 
     def _fn(e: int, x_sub: torch.Tensor) -> torch.Tensor:
         w = experts[e]
@@ -286,5 +278,9 @@ def awq_moe_expert_ffn_w4a8(
         )
 
     return _dispatch_tokens_to_experts(
-        hidden_states, topk_ids, topk_weights, len(experts), _fn,
+        hidden_states,
+        topk_ids,
+        topk_weights,
+        len(experts),
+        _fn,
     )

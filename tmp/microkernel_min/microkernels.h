@@ -24,9 +24,7 @@
 // 用 __APPLE__ 兜底，与原 neon_cache_config.h:41 行为一致。
 #ifndef HAS_BFMMLA
 #if defined(__aarch64__) && \
-    (defined(__ARM_FEATURE_BF16) || \
-     defined(__ARM_FEATURE_BF16_VECTOR_ARITHMETIC) || \
-     defined(__APPLE__))
+    (defined(__ARM_FEATURE_BF16) || defined(__ARM_FEATURE_BF16_VECTOR_ARITHMETIC) || defined(__APPLE__))
 #define HAS_BFMMLA 1
 #else
 #define HAS_BFMMLA 0
@@ -61,9 +59,7 @@ static inline float32x4_t widen_bf16x4_to_fp32(const uint16_t* src) {
 // Q 和 K 形状对称，但语义不同（Q 是 8 行 query、K 是 8 行 key）；
 // 调用方各传自己的 row_stride 即可。
 
-inline void pack_q_8rows_to_seq_bf16(
-    const uint16_t* Q, int64_t q_row_stride, int64_t E,
-    uint16_t* Q_seq) {
+inline void pack_q_8rows_to_seq_bf16(const uint16_t* Q, int64_t q_row_stride, int64_t E, uint16_t* Q_seq) {
   const int64_t E_main = E & ~int64_t{3};
   for (int64_t e = 0; e < E_main; e += 4) {
     uint16_t* dst = Q_seq + (e / 4) * 32;
@@ -73,9 +69,7 @@ inline void pack_q_8rows_to_seq_bf16(
   }
 }
 
-inline void pack_k_8rows_to_seq_bf16(
-    const uint16_t* K, int64_t k_row_stride, int64_t E,
-    uint16_t* K_seq) {
+inline void pack_k_8rows_to_seq_bf16(const uint16_t* K, int64_t k_row_stride, int64_t E, uint16_t* K_seq) {
   const int64_t E_main = E & ~int64_t{3};
   for (int64_t e = 0; e < E_main; e += 4) {
     uint16_t* dst = K_seq + (e / 4) * 32;
@@ -97,16 +91,10 @@ inline void pack_k_8rows_to_seq_bf16(
 // 输出：
 //   scores_buf  [8][8] fp32，行向 4 lane 布局
 
-static inline void gemm_qkt_microkernel_8x8_bf16_packqk_seq4_bmajor_inner(
-    const uint16_t* Q_seq,
-    const uint16_t* Q_orig,
-    int64_t q_row_stride,
-    const uint16_t* K_seq,
-    const uint16_t* K_orig,
-    int64_t k_row_stride,
-    int64_t E,
-    float scale,
-    float* scores_buf) {
+static inline void gemm_qkt_microkernel_8x8_bf16_packqk_seq4_bmajor_inner(const uint16_t* Q_seq, const uint16_t* Q_orig,
+                                                                          int64_t q_row_stride, const uint16_t* K_seq,
+                                                                          const uint16_t* K_orig, int64_t k_row_stride,
+                                                                          int64_t E, float scale, float* scores_buf) {
   float32x4_t c00 = vdupq_n_f32(0), c01 = vdupq_n_f32(0);
   float32x4_t c10 = vdupq_n_f32(0), c11 = vdupq_n_f32(0);
   float32x4_t c20 = vdupq_n_f32(0), c21 = vdupq_n_f32(0);
@@ -160,8 +148,7 @@ static inline void gemm_qkt_microkernel_8x8_bf16_packqk_seq4_bmajor_inner(
   }
 
   // BFMMLA 输出是 2×2 子块布局，重排为「行向 4 lane」便于 store。
-  auto unzip_pair = [](float32x4_t lo_block, float32x4_t hi_block,
-                       float32x4_t* row_lo, float32x4_t* row_hi) {
+  auto unzip_pair = [](float32x4_t lo_block, float32x4_t hi_block, float32x4_t* row_lo, float32x4_t* row_hi) {
     *row_lo = vcombine_f32(vget_low_f32(lo_block), vget_low_f32(hi_block));
     *row_hi = vcombine_f32(vget_high_f32(lo_block), vget_high_f32(hi_block));
   };
@@ -181,15 +168,41 @@ static inline void gemm_qkt_microkernel_8x8_bf16_packqk_seq4_bmajor_inner(
     auto store_cij = [&](int i_row, float* dst) {
       float32x4_t lo, hi;
       switch (i_row) {
-        case 0: lo = c00; hi = c01; break;
-        case 1: lo = c10; hi = c11; break;
-        case 2: lo = c20; hi = c21; break;
-        case 3: lo = c30; hi = c31; break;
-        case 4: lo = c40; hi = c41; break;
-        case 5: lo = c50; hi = c51; break;
-        case 6: lo = c60; hi = c61; break;
-        case 7: lo = c70; hi = c71; break;
-        default: lo = vdupq_n_f32(0); hi = vdupq_n_f32(0);
+        case 0:
+          lo = c00;
+          hi = c01;
+          break;
+        case 1:
+          lo = c10;
+          hi = c11;
+          break;
+        case 2:
+          lo = c20;
+          hi = c21;
+          break;
+        case 3:
+          lo = c30;
+          hi = c31;
+          break;
+        case 4:
+          lo = c40;
+          hi = c41;
+          break;
+        case 5:
+          lo = c50;
+          hi = c51;
+          break;
+        case 6:
+          lo = c60;
+          hi = c61;
+          break;
+        case 7:
+          lo = c70;
+          hi = c71;
+          break;
+        default:
+          lo = vdupq_n_f32(0);
+          hi = vdupq_n_f32(0);
       }
       vst1q_f32(dst + 0, lo);
       vst1q_f32(dst + 4, hi);
@@ -198,14 +211,38 @@ static inline void gemm_qkt_microkernel_8x8_bf16_packqk_seq4_bmajor_inner(
       float32x4_t lo = vld1q_f32(src + 0);
       float32x4_t hi = vld1q_f32(src + 4);
       switch (i_row) {
-        case 0: c00 = lo; c01 = hi; break;
-        case 1: c10 = lo; c11 = hi; break;
-        case 2: c20 = lo; c21 = hi; break;
-        case 3: c30 = lo; c31 = hi; break;
-        case 4: c40 = lo; c41 = hi; break;
-        case 5: c50 = lo; c51 = hi; break;
-        case 6: c60 = lo; c61 = hi; break;
-        case 7: c70 = lo; c71 = hi; break;
+        case 0:
+          c00 = lo;
+          c01 = hi;
+          break;
+        case 1:
+          c10 = lo;
+          c11 = hi;
+          break;
+        case 2:
+          c20 = lo;
+          c21 = hi;
+          break;
+        case 3:
+          c30 = lo;
+          c31 = hi;
+          break;
+        case 4:
+          c40 = lo;
+          c41 = hi;
+          break;
+        case 5:
+          c50 = lo;
+          c51 = hi;
+          break;
+        case 6:
+          c60 = lo;
+          c61 = hi;
+          break;
+        case 7:
+          c70 = lo;
+          c71 = hi;
+          break;
       }
     };
     for (int i_row = 0; i_row < 8; ++i_row) store_cij(i_row, scalar_acc + i_row * 8);
@@ -254,14 +291,9 @@ static inline void gemm_qkt_microkernel_8x8_bf16_packqk_seq4_bmajor_inner(
 // vfmaq_laneq_f32 在 P quad 内做 lane 索引；段 2 中段提前发跨迭代 V[k+4]
 // 预取（方案 A 调度优化）。
 
-static inline void gemm_pv_microkernel_8x8_bf16_pquad(
-    const float* P_hat,
-    int64_t P_row_stride,
-    const uint16_t* V,
-    int64_t v_row_stride,
-    int64_t Sk,
-    float* O,
-    int64_t o_row_stride) {
+static inline void gemm_pv_microkernel_8x8_bf16_pquad(const float* P_hat, int64_t P_row_stride, const uint16_t* V,
+                                                      int64_t v_row_stride, int64_t Sk, float* O,
+                                                      int64_t o_row_stride) {
   float32x4_t o00 = vld1q_f32(O + 0 * o_row_stride + 0);
   float32x4_t o01 = vld1q_f32(O + 0 * o_row_stride + 4);
   float32x4_t o10 = vld1q_f32(O + 1 * o_row_stride + 0);
@@ -303,57 +335,89 @@ static inline void gemm_pv_microkernel_8x8_bf16_pquad(
       float32x4_t p7 = vld1q_f32(P_hat + 7 * P_row_stride + k);
 
       // 段 0 (lane 0)：用 v_lo0/hi0；段尾预取段 1 V
-      o00 = vfmaq_laneq_f32(o00, v_lo0, p0, 0); o01 = vfmaq_laneq_f32(o01, v_hi0, p0, 0);
-      o10 = vfmaq_laneq_f32(o10, v_lo0, p1, 0); o11 = vfmaq_laneq_f32(o11, v_hi0, p1, 0);
-      o20 = vfmaq_laneq_f32(o20, v_lo0, p2, 0); o21 = vfmaq_laneq_f32(o21, v_hi0, p2, 0);
-      o30 = vfmaq_laneq_f32(o30, v_lo0, p3, 0); o31 = vfmaq_laneq_f32(o31, v_hi0, p3, 0);
-      o40 = vfmaq_laneq_f32(o40, v_lo0, p4, 0); o41 = vfmaq_laneq_f32(o41, v_hi0, p4, 0);
-      o50 = vfmaq_laneq_f32(o50, v_lo0, p5, 0); o51 = vfmaq_laneq_f32(o51, v_hi0, p5, 0);
+      o00 = vfmaq_laneq_f32(o00, v_lo0, p0, 0);
+      o01 = vfmaq_laneq_f32(o01, v_hi0, p0, 0);
+      o10 = vfmaq_laneq_f32(o10, v_lo0, p1, 0);
+      o11 = vfmaq_laneq_f32(o11, v_hi0, p1, 0);
+      o20 = vfmaq_laneq_f32(o20, v_lo0, p2, 0);
+      o21 = vfmaq_laneq_f32(o21, v_hi0, p2, 0);
+      o30 = vfmaq_laneq_f32(o30, v_lo0, p3, 0);
+      o31 = vfmaq_laneq_f32(o31, v_hi0, p3, 0);
+      o40 = vfmaq_laneq_f32(o40, v_lo0, p4, 0);
+      o41 = vfmaq_laneq_f32(o41, v_hi0, p4, 0);
+      o50 = vfmaq_laneq_f32(o50, v_lo0, p5, 0);
+      o51 = vfmaq_laneq_f32(o51, v_hi0, p5, 0);
       uint16x8_t vbf1 = vld1q_u16(V + (k + 1) * v_row_stride);
       float32x4_t v_lo1, v_hi1;
       widen_row(vbf1, v_lo1, v_hi1);
-      o60 = vfmaq_laneq_f32(o60, v_lo0, p6, 0); o61 = vfmaq_laneq_f32(o61, v_hi0, p6, 0);
-      o70 = vfmaq_laneq_f32(o70, v_lo0, p7, 0); o71 = vfmaq_laneq_f32(o71, v_hi0, p7, 0);
+      o60 = vfmaq_laneq_f32(o60, v_lo0, p6, 0);
+      o61 = vfmaq_laneq_f32(o61, v_hi0, p6, 0);
+      o70 = vfmaq_laneq_f32(o70, v_lo0, p7, 0);
+      o71 = vfmaq_laneq_f32(o71, v_hi0, p7, 0);
 
       // 段 1 (lane 1)：用 v_lo1/hi1；段尾预取段 2 V
-      o00 = vfmaq_laneq_f32(o00, v_lo1, p0, 1); o01 = vfmaq_laneq_f32(o01, v_hi1, p0, 1);
-      o10 = vfmaq_laneq_f32(o10, v_lo1, p1, 1); o11 = vfmaq_laneq_f32(o11, v_hi1, p1, 1);
-      o20 = vfmaq_laneq_f32(o20, v_lo1, p2, 1); o21 = vfmaq_laneq_f32(o21, v_hi1, p2, 1);
-      o30 = vfmaq_laneq_f32(o30, v_lo1, p3, 1); o31 = vfmaq_laneq_f32(o31, v_hi1, p3, 1);
-      o40 = vfmaq_laneq_f32(o40, v_lo1, p4, 1); o41 = vfmaq_laneq_f32(o41, v_hi1, p4, 1);
-      o50 = vfmaq_laneq_f32(o50, v_lo1, p5, 1); o51 = vfmaq_laneq_f32(o51, v_hi1, p5, 1);
+      o00 = vfmaq_laneq_f32(o00, v_lo1, p0, 1);
+      o01 = vfmaq_laneq_f32(o01, v_hi1, p0, 1);
+      o10 = vfmaq_laneq_f32(o10, v_lo1, p1, 1);
+      o11 = vfmaq_laneq_f32(o11, v_hi1, p1, 1);
+      o20 = vfmaq_laneq_f32(o20, v_lo1, p2, 1);
+      o21 = vfmaq_laneq_f32(o21, v_hi1, p2, 1);
+      o30 = vfmaq_laneq_f32(o30, v_lo1, p3, 1);
+      o31 = vfmaq_laneq_f32(o31, v_hi1, p3, 1);
+      o40 = vfmaq_laneq_f32(o40, v_lo1, p4, 1);
+      o41 = vfmaq_laneq_f32(o41, v_hi1, p4, 1);
+      o50 = vfmaq_laneq_f32(o50, v_lo1, p5, 1);
+      o51 = vfmaq_laneq_f32(o51, v_hi1, p5, 1);
       uint16x8_t vbf2 = vld1q_u16(V + (k + 2) * v_row_stride);
       float32x4_t v_lo2, v_hi2;
       widen_row(vbf2, v_lo2, v_hi2);
-      o60 = vfmaq_laneq_f32(o60, v_lo1, p6, 1); o61 = vfmaq_laneq_f32(o61, v_hi1, p6, 1);
-      o70 = vfmaq_laneq_f32(o70, v_lo1, p7, 1); o71 = vfmaq_laneq_f32(o71, v_hi1, p7, 1);
+      o60 = vfmaq_laneq_f32(o60, v_lo1, p6, 1);
+      o61 = vfmaq_laneq_f32(o61, v_hi1, p6, 1);
+      o70 = vfmaq_laneq_f32(o70, v_lo1, p7, 1);
+      o71 = vfmaq_laneq_f32(o71, v_hi1, p7, 1);
 
       // 段 2 (lane 2)：同时预取段 3 V 和跨迭代段 0 V（方案 A）
-      o00 = vfmaq_laneq_f32(o00, v_lo2, p0, 2); o01 = vfmaq_laneq_f32(o01, v_hi2, p0, 2);
-      o10 = vfmaq_laneq_f32(o10, v_lo2, p1, 2); o11 = vfmaq_laneq_f32(o11, v_hi2, p1, 2);
-      o20 = vfmaq_laneq_f32(o20, v_lo2, p2, 2); o21 = vfmaq_laneq_f32(o21, v_hi2, p2, 2);
+      o00 = vfmaq_laneq_f32(o00, v_lo2, p0, 2);
+      o01 = vfmaq_laneq_f32(o01, v_hi2, p0, 2);
+      o10 = vfmaq_laneq_f32(o10, v_lo2, p1, 2);
+      o11 = vfmaq_laneq_f32(o11, v_hi2, p1, 2);
+      o20 = vfmaq_laneq_f32(o20, v_lo2, p2, 2);
+      o21 = vfmaq_laneq_f32(o21, v_hi2, p2, 2);
       if (k + 4 < Sk4) {
         uint16x8_t vbf0_next = vld1q_u16(V + (k + 4) * v_row_stride);
         widen_row(vbf0_next, v_lo0, v_hi0);
       }
-      o30 = vfmaq_laneq_f32(o30, v_lo2, p3, 2); o31 = vfmaq_laneq_f32(o31, v_hi2, p3, 2);
-      o40 = vfmaq_laneq_f32(o40, v_lo2, p4, 2); o41 = vfmaq_laneq_f32(o41, v_hi2, p4, 2);
-      o50 = vfmaq_laneq_f32(o50, v_lo2, p5, 2); o51 = vfmaq_laneq_f32(o51, v_hi2, p5, 2);
+      o30 = vfmaq_laneq_f32(o30, v_lo2, p3, 2);
+      o31 = vfmaq_laneq_f32(o31, v_hi2, p3, 2);
+      o40 = vfmaq_laneq_f32(o40, v_lo2, p4, 2);
+      o41 = vfmaq_laneq_f32(o41, v_hi2, p4, 2);
+      o50 = vfmaq_laneq_f32(o50, v_lo2, p5, 2);
+      o51 = vfmaq_laneq_f32(o51, v_hi2, p5, 2);
       uint16x8_t vbf3 = vld1q_u16(V + (k + 3) * v_row_stride);
       float32x4_t v_lo3, v_hi3;
       widen_row(vbf3, v_lo3, v_hi3);
-      o60 = vfmaq_laneq_f32(o60, v_lo2, p6, 2); o61 = vfmaq_laneq_f32(o61, v_hi2, p6, 2);
-      o70 = vfmaq_laneq_f32(o70, v_lo2, p7, 2); o71 = vfmaq_laneq_f32(o71, v_hi2, p7, 2);
+      o60 = vfmaq_laneq_f32(o60, v_lo2, p6, 2);
+      o61 = vfmaq_laneq_f32(o61, v_hi2, p6, 2);
+      o70 = vfmaq_laneq_f32(o70, v_lo2, p7, 2);
+      o71 = vfmaq_laneq_f32(o71, v_hi2, p7, 2);
 
       // 段 3 (lane 3)：纯 FMA，无 V load
-      o00 = vfmaq_laneq_f32(o00, v_lo3, p0, 3); o01 = vfmaq_laneq_f32(o01, v_hi3, p0, 3);
-      o10 = vfmaq_laneq_f32(o10, v_lo3, p1, 3); o11 = vfmaq_laneq_f32(o11, v_hi3, p1, 3);
-      o20 = vfmaq_laneq_f32(o20, v_lo3, p2, 3); o21 = vfmaq_laneq_f32(o21, v_hi3, p2, 3);
-      o30 = vfmaq_laneq_f32(o30, v_lo3, p3, 3); o31 = vfmaq_laneq_f32(o31, v_hi3, p3, 3);
-      o40 = vfmaq_laneq_f32(o40, v_lo3, p4, 3); o41 = vfmaq_laneq_f32(o41, v_hi3, p4, 3);
-      o50 = vfmaq_laneq_f32(o50, v_lo3, p5, 3); o51 = vfmaq_laneq_f32(o51, v_hi3, p5, 3);
-      o60 = vfmaq_laneq_f32(o60, v_lo3, p6, 3); o61 = vfmaq_laneq_f32(o61, v_hi3, p6, 3);
-      o70 = vfmaq_laneq_f32(o70, v_lo3, p7, 3); o71 = vfmaq_laneq_f32(o71, v_hi3, p7, 3);
+      o00 = vfmaq_laneq_f32(o00, v_lo3, p0, 3);
+      o01 = vfmaq_laneq_f32(o01, v_hi3, p0, 3);
+      o10 = vfmaq_laneq_f32(o10, v_lo3, p1, 3);
+      o11 = vfmaq_laneq_f32(o11, v_hi3, p1, 3);
+      o20 = vfmaq_laneq_f32(o20, v_lo3, p2, 3);
+      o21 = vfmaq_laneq_f32(o21, v_hi3, p2, 3);
+      o30 = vfmaq_laneq_f32(o30, v_lo3, p3, 3);
+      o31 = vfmaq_laneq_f32(o31, v_hi3, p3, 3);
+      o40 = vfmaq_laneq_f32(o40, v_lo3, p4, 3);
+      o41 = vfmaq_laneq_f32(o41, v_hi3, p4, 3);
+      o50 = vfmaq_laneq_f32(o50, v_lo3, p5, 3);
+      o51 = vfmaq_laneq_f32(o51, v_hi3, p5, 3);
+      o60 = vfmaq_laneq_f32(o60, v_lo3, p6, 3);
+      o61 = vfmaq_laneq_f32(o61, v_hi3, p6, 3);
+      o70 = vfmaq_laneq_f32(o70, v_lo3, p7, 3);
+      o71 = vfmaq_laneq_f32(o71, v_hi3, p7, 3);
     }
   }
 
@@ -369,14 +433,22 @@ static inline void gemm_pv_microkernel_8x8_bf16_pquad(
     float p5 = P_hat[5 * P_row_stride + k];
     float p6 = P_hat[6 * P_row_stride + k];
     float p7 = P_hat[7 * P_row_stride + k];
-    o00 = vfmaq_n_f32(o00, v_lo, p0); o01 = vfmaq_n_f32(o01, v_hi, p0);
-    o10 = vfmaq_n_f32(o10, v_lo, p1); o11 = vfmaq_n_f32(o11, v_hi, p1);
-    o20 = vfmaq_n_f32(o20, v_lo, p2); o21 = vfmaq_n_f32(o21, v_hi, p2);
-    o30 = vfmaq_n_f32(o30, v_lo, p3); o31 = vfmaq_n_f32(o31, v_hi, p3);
-    o40 = vfmaq_n_f32(o40, v_lo, p4); o41 = vfmaq_n_f32(o41, v_hi, p4);
-    o50 = vfmaq_n_f32(o50, v_lo, p5); o51 = vfmaq_n_f32(o51, v_hi, p5);
-    o60 = vfmaq_n_f32(o60, v_lo, p6); o61 = vfmaq_n_f32(o61, v_hi, p6);
-    o70 = vfmaq_n_f32(o70, v_lo, p7); o71 = vfmaq_n_f32(o71, v_hi, p7);
+    o00 = vfmaq_n_f32(o00, v_lo, p0);
+    o01 = vfmaq_n_f32(o01, v_hi, p0);
+    o10 = vfmaq_n_f32(o10, v_lo, p1);
+    o11 = vfmaq_n_f32(o11, v_hi, p1);
+    o20 = vfmaq_n_f32(o20, v_lo, p2);
+    o21 = vfmaq_n_f32(o21, v_hi, p2);
+    o30 = vfmaq_n_f32(o30, v_lo, p3);
+    o31 = vfmaq_n_f32(o31, v_hi, p3);
+    o40 = vfmaq_n_f32(o40, v_lo, p4);
+    o41 = vfmaq_n_f32(o41, v_hi, p4);
+    o50 = vfmaq_n_f32(o50, v_lo, p5);
+    o51 = vfmaq_n_f32(o51, v_hi, p5);
+    o60 = vfmaq_n_f32(o60, v_lo, p6);
+    o61 = vfmaq_n_f32(o61, v_hi, p6);
+    o70 = vfmaq_n_f32(o70, v_lo, p7);
+    o71 = vfmaq_n_f32(o71, v_hi, p7);
   }
 
   vst1q_f32(O + 0 * o_row_stride + 0, o00);

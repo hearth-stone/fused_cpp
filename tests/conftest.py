@@ -14,9 +14,11 @@
 预留扩展点：
   * 任务 9 会在本文件中追加 ``--sdpa-thread-sweep`` 等 CLI 选项。
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
 
 import pytest
@@ -46,16 +48,14 @@ SDPA_TOLERANCE = {
     torch.float32: _DTypeTol(atol=1e-5, rtol=1e-5, cos_min=0.9999),
     torch.float64: _DTypeTol(atol=1e-7, rtol=1e-7, cos_min=0.999999),
     torch.bfloat16: _DTypeTol(atol=5e-2, rtol=5e-2, cos_min=0.999),
-    torch.float16:  _DTypeTol(atol=1e-2, rtol=1e-2, cos_min=0.999),
+    torch.float16: _DTypeTol(atol=1e-2, rtol=1e-2, cos_min=0.999),
 }
 
 
 # ── 等价性断言工具 ────────────────────────────────────────────────────────
 
 
-def _err_metrics(
-    actual: torch.Tensor, ref: torch.Tensor
-) -> Tuple[float, float, float, int, int]:
+def _err_metrics(actual: torch.Tensor, ref: torch.Tensor) -> Tuple[float, float, float, int, int]:
     """计算 max_abs / max_rel / cosine / nan_count / inf_count。"""
     a = actual.detach().float()
     b = ref.detach().float()
@@ -63,11 +63,9 @@ def _err_metrics(
     max_abs = float(diff.max().item()) if diff.numel() > 0 else 0.0
     denom = b.abs().clamp(min=1e-12)
     max_rel = float((diff / denom).max().item()) if diff.numel() > 0 else 0.0
-    cos = float(
-        F.cosine_similarity(
-            a.flatten().unsqueeze(0), b.flatten().unsqueeze(0)
-        ).item()
-    ) if a.numel() > 0 else 1.0
+    cos = (
+        float(F.cosine_similarity(a.flatten().unsqueeze(0), b.flatten().unsqueeze(0)).item()) if a.numel() > 0 else 1.0
+    )
     nan_count = int(torch.isnan(a).sum().item())
     inf_count = int(torch.isinf(a).sum().item())
     return max_abs, max_rel, cos, nan_count, inf_count
@@ -105,10 +103,7 @@ def assert_tensor_close(
     :raises AssertionError: 任意一项检查失败。
     """
     if actual.shape != ref.shape:
-        raise AssertionError(
-            f"shape mismatch: actual={tuple(actual.shape)} vs "
-            f"ref={tuple(ref.shape)} ({context})"
-        )
+        raise AssertionError(f"shape mismatch: actual={tuple(actual.shape)} vs ref={tuple(ref.shape)} ({context})")
 
     # 选择默认容差
     eff_dtype = dtype if dtype is not None else actual.dtype
@@ -143,10 +138,7 @@ def assert_tensor_close(
 
     # 2) Cosine
     if cos < eff_cos:
-        raise AssertionError(
-            f"cosine similarity too low: cos={cos:.6f} < {eff_cos} ({context})\n"
-            f"  metrics={metrics}"
-        )
+        raise AssertionError(f"cosine similarity too low: cos={cos:.6f} < {eff_cos} ({context})\n  metrics={metrics}")
 
     # 3) max_abs
     ref_abs_max = float(ref.detach().float().abs().max().item()) if ref.numel() > 0 else 0.0
@@ -155,8 +147,7 @@ def assert_tensor_close(
         # 找到误差最大点的索引便于定位
         diff = (actual.detach().float() - ref.detach().float()).abs()
         argmax_flat = int(diff.argmax().item())
-        bad_idx = tuple(int(x) for x in
-                        torch.unravel_index(torch.tensor(argmax_flat), diff.shape))
+        bad_idx = tuple(int(x) for x in torch.unravel_index(torch.tensor(argmax_flat), diff.shape))
         raise AssertionError(
             f"max_abs={max_abs:.3e} exceeds bound atol+rtol*|ref|_max={elementwise_bound:.3e} "
             f"at index {bad_idx} ({context})\n"
@@ -186,10 +177,7 @@ def pytest_addoption(parser):  # noqa: D401
         "--sdpa-tags",
         action="store",
         default=None,
-        help=(
-            "Comma-separated tag whitelist; only versions whose `tags` "
-            "intersect this set are expanded."
-        ),
+        help=("Comma-separated tag whitelist; only versions whose `tags` intersect this set are expanded."),
     )
     group.addoption(
         "--sdpa-thread-sweep",
@@ -229,10 +217,7 @@ def pytest_addoption(parser):  # noqa: D401
         "--sdpa-bench-output-dir",
         action="store",
         default=None,
-        help=(
-            "Directory where the SDPA benchmark CSV/JSON files are written. "
-            "Defaults to '<repo>/bench/sdpa/'."
-        ),
+        help=("Directory where the SDPA benchmark CSV/JSON files are written. Defaults to '<repo>/bench/sdpa/'."),
     )
 
 
@@ -272,9 +257,7 @@ def _apply_thread_pin(n_threads, *, set_env: bool = True, verbose: bool = False)
     if n_threads is None:
         return torch.get_num_threads()
     if n_threads < 1:
-        raise ValueError(
-            f"_apply_thread_pin: n_threads must be >= 1, got {n_threads}"
-        )
+        raise ValueError(f"_apply_thread_pin: n_threads must be >= 1, got {n_threads}")
 
     import os as _os
 
@@ -300,6 +283,7 @@ def _apply_thread_pin(n_threads, *, set_env: bool = True, verbose: bool = False)
     if verbose:
         try:
             from fused_cpp import _C  # type: ignore
+
             omp_max = _C.get_omp_runtime_info().get("max_threads", "?")
         except Exception:
             omp_max = "?"
@@ -368,23 +352,21 @@ def pytest_generate_tests(metafunc):  # noqa: D401
     config = metafunc.config
     name_filter = _parse_csv(config.getoption("--sdpa-versions", default=None))
     tag_filter = _parse_csv(config.getoption("--sdpa-tags", default=None))
-    versions = _filter_sdpa_versions(
-        available_sdpa_versions(), name_filter, tag_filter
-    )
+    versions = _filter_sdpa_versions(available_sdpa_versions(), name_filter, tag_filter)
     if not versions:
         # 过滤后为空：生成一条 skip 用例，避免报错 "empty parametrize"。
         metafunc.parametrize(
             "sdpa_version",
-            [pytest.param(
-                None,
-                id="no-version-matches-filter",
-                marks=pytest.mark.skip(reason="no SDPA version matches filter"),
-            )],
+            [
+                pytest.param(
+                    None,
+                    id="no-version-matches-filter",
+                    marks=pytest.mark.skip(reason="no SDPA version matches filter"),
+                )
+            ],
         )
         return
-    metafunc.parametrize(
-        "sdpa_version", versions, ids=[vi.name for vi in versions]
-    )
+    metafunc.parametrize("sdpa_version", versions, ids=[vi.name for vi in versions])
 
 
 def pytest_configure(config):  # noqa: D401
@@ -443,8 +425,12 @@ def call_sdpa_version(
     """
     with torch.no_grad():
         return info.callable(
-            query, key, value,
-            attn_mask=attn_mask, is_causal=is_causal, scale=scale,
+            query,
+            key,
+            value,
+            attn_mask=attn_mask,
+            is_causal=is_causal,
+            scale=scale,
         )
 
 
@@ -471,8 +457,7 @@ def get_sdpa_bench_records() -> _List[Dict[str, Any]]:
     return list(_BENCH_RECORDS)
 
 
-def _resolve_bench_output_dir(config) -> "Path":
-    from pathlib import Path
+def _resolve_bench_output_dir(config) -> Path:
     raw = config.getoption("--sdpa-bench-output-dir", default=None)
     if raw:
         out = Path(raw).expanduser().resolve()
@@ -486,10 +471,11 @@ def _resolve_bench_output_dir(config) -> "Path":
 def _bench_write_outputs(out_dir, prefix, records):
     import csv as _csv
     import json as _json
+
     if not records:
         return None, None
     json_path = out_dir / f"{prefix}.json"
-    csv_path  = out_dir / f"{prefix}.csv"
+    csv_path = out_dir / f"{prefix}.csv"
     json_path.write_text(_json.dumps(records, indent=2))
     fields = list(records[0].keys())
     with csv_path.open("w", newline="") as f:
@@ -598,7 +584,10 @@ def _bench_run_thread_sweep(out_dir, threads, orig_args):
         # 显式把 --sdpa-num-threads=N 追加进子进程命令行，子进程 bench 会
         # 在每条用例前调 torch.set_num_threads(N) 二次保险。
         cmd = [
-            _sys.executable, "-m", "pytest", *cleaned,
+            _sys.executable,
+            "-m",
+            "pytest",
+            *cleaned,
             f"--sdpa-num-threads={n}",
         ]
         print(f"\n[sweep] OMP_NUM_THREADS={n} → {' '.join(cmd)}")
@@ -622,9 +611,7 @@ def _bench_scaling_efficiency(records):
     bucket = {}
     for r in records:
         key = (r["version"], r["shape"], r["dtype"], r["is_causal"])
-        bucket.setdefault(key, []).append(
-            (int(r["sweep_threads"]), _bench_effective_gflops(r))
-        )
+        bucket.setdefault(key, []).append((int(r["sweep_threads"]), _bench_effective_gflops(r)))
     eff_rows = []
     for (ver, shp, dt, ic), pairs in bucket.items():
         pairs.sort()
@@ -635,15 +622,17 @@ def _bench_scaling_efficiency(records):
         for n, g in pairs:
             denom = n * base_g
             eff = (g / denom) if denom > 0 else 0.0
-            eff_rows.append({
-                "version":   ver,
-                "shape":     shp,
-                "dtype":     dt,
-                "is_causal": ic,
-                "threads":   n,
-                "gflops":    g,
-                "efficiency":   eff,
-            })
+            eff_rows.append(
+                {
+                    "version": ver,
+                    "shape": shp,
+                    "dtype": dt,
+                    "is_causal": ic,
+                    "threads": n,
+                    "gflops": g,
+                    "efficiency": eff,
+                }
+            )
     return eff_rows
 
 
@@ -654,6 +643,7 @@ def pytest_sessionfinish(session, exitstatus):  # noqa: D401
     子不产生任何附加输出。
     """
     import datetime as _dt
+
     if not _BENCH_RECORDS:
         return
     config = session.config
@@ -674,14 +664,12 @@ def pytest_sessionfinish(session, exitstatus):  # noqa: D401
 
     try:
         from fused_cpp import _C  # type: ignore
+
         has_omp = bool(_C.has_openmp())
     except Exception:
         has_omp = False
     if not has_omp:
-        print(
-            "\n[sweep] skipped: C++ extension was built without OpenMP. "
-            "Re-build with libomp to enable thread sweep."
-        )
+        print("\n[sweep] skipped: C++ extension was built without OpenMP. Re-build with libomp to enable thread sweep.")
         return
 
     try:

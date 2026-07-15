@@ -71,9 +71,7 @@ def _check_sparse_inputs(
     if kv.dim() != 3:
         raise ValueError(f"kv must be 3-D [s_kv, h_kv, d_qk], got {tuple(kv.shape)}")
     if indices.dim() != 3:
-        raise ValueError(
-            f"indices must be 3-D [s_q, h_kv, topk], got {tuple(indices.shape)}"
-        )
+        raise ValueError(f"indices must be 3-D [s_q, h_kv, topk], got {tuple(indices.shape)}")
     if indices.dtype not in _INTEGER_DTYPES:
         raise TypeError(f"indices must use an integer dtype, got {indices.dtype}")
     s_q, h_q, d_qk = q.shape
@@ -84,13 +82,11 @@ def _check_sparse_inputs(
         raise ValueError(f"q/kv d_qk mismatch: q={d_qk}, kv={kv_d}")
     if h_kv != 1:
         raise NotImplementedError(
-            "sparse_mla_naive currently matches vLLM DeepSeek V4 sparse CPU "
-            "fallback, which requires h_kv == 1"
+            "sparse_mla_naive currently matches vLLM DeepSeek V4 sparse CPU fallback, which requires h_kv == 1"
         )
     if indices.shape[0] != s_q or indices.shape[1] != h_kv:
         raise ValueError(
-            "indices shape must be [s_q, h_kv, topk], got "
-            f"{tuple(indices.shape)} for s_q={s_q}, h_kv={h_kv}"
+            f"indices shape must be [s_q, h_kv, topk], got {tuple(indices.shape)} for s_q={s_q}, h_kv={h_kv}"
         )
     if d_v <= 0 or d_v > d_qk:
         raise ValueError(f"d_v must satisfy 0 < d_v <= d_qk, got d_v={d_v}, d_qk={d_qk}")
@@ -99,21 +95,15 @@ def _check_sparse_inputs(
     if attn_sink is not None:
         if attn_sink.dim() != 1 or attn_sink.numel() < h_q:
             raise ValueError(
-                "attn_sink must be 1-D with at least h_q entries, got "
-                f"{tuple(attn_sink.shape)} for h_q={h_q}"
+                f"attn_sink must be 1-D with at least h_q entries, got {tuple(attn_sink.shape)} for h_q={h_q}"
             )
         if attn_sink.device != q.device:
             raise ValueError("attn_sink must be on the same device as q")
     if topk_length is not None:
         if topk_length.dtype not in _INTEGER_DTYPES:
-            raise TypeError(
-                f"topk_length must use an integer dtype, got {topk_length.dtype}"
-            )
+            raise TypeError(f"topk_length must use an integer dtype, got {topk_length.dtype}")
         if topk_length.dim() != 1 or topk_length.numel() != s_q:
-            raise ValueError(
-                "topk_length must be [s_q], got "
-                f"{tuple(topk_length.shape)} for s_q={s_q}"
-            )
+            raise ValueError(f"topk_length must be [s_q], got {tuple(topk_length.shape)} for s_q={s_q}")
         if topk_length.device != q.device:
             raise ValueError("topk_length must be on the same device as q")
     if out is not None:
@@ -141,9 +131,7 @@ def _gather_kv_vllm_cpu(kv: torch.Tensor, valid_indices: torch.Tensor) -> torch.
         start = int(valid_indices[0].item())
         return kv.narrow(0, start, 1)
 
-    breaks = (
-        valid_indices[1:] != valid_indices[:-1] + 1
-    ).nonzero(as_tuple=False).flatten()
+    breaks = (valid_indices[1:] != valid_indices[:-1] + 1).nonzero(as_tuple=False).flatten()
     if breaks.numel() == 0:
         start = int(valid_indices[0].item())
         return kv.narrow(0, start, valid_indices.numel())
@@ -235,9 +223,7 @@ def _build_block_plan(
 
     leftovers: list[list[int]] = []
     for row, row_consumed in zip(rows, consumed):
-        leftovers.append(
-            [value for value, was_consumed in zip(row, row_consumed) if not was_consumed]
-        )
+        leftovers.append([value for value, was_consumed in zip(row, row_consumed) if not was_consumed])
 
     indexed_tiles: list[_IndexedTile] = []
     max_leftover = max((len(row) for row in leftovers), default=0)
@@ -255,9 +241,7 @@ def _build_block_plan(
                 else:
                     cols.append(0)
             tile_rows.append(tuple(cols))
-        indexed_tiles.append(
-            _IndexedTile(idx=tuple(tile_rows), valid_mask=valid_mask)
-        )
+        indexed_tiles.append(_IndexedTile(idx=tuple(tile_rows), valid_mask=valid_mask))
 
     return _BlockPlan(
         token0=token0,
@@ -279,9 +263,7 @@ def _build_sparse_mla_plans(
         for token_idx in range(token0, min(token0 + _QUERY_BLOCK, s_q)):
             row = indices_2d[token_idx]
             rows.append([int(v) for v in row[row >= 0].tolist()])
-        plans.append(
-            _build_block_plan(token0, rows, dense_threshold=dense_threshold)
-        )
+        plans.append(_build_block_plan(token0, rows, dense_threshold=dense_threshold))
     return tuple(plans)
 
 
@@ -298,10 +280,7 @@ def _update_online_row(
     row_max = scores.max()
 
     real_new_max = torch.maximum(real_max[row], row_max)
-    real_sum[row] = (
-        real_sum[row] * torch.exp(real_max[row] - real_new_max)
-        + torch.exp(scores - real_new_max).sum()
-    )
+    real_sum[row] = real_sum[row] * torch.exp(real_max[row] - real_new_max) + torch.exp(scores - real_new_max).sum()
     real_max[row] = real_new_max
 
     new_max = torch.maximum(running_max[row], row_max)

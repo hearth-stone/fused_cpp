@@ -4,6 +4,7 @@
 测试 handler 创建/销毁、GEMM 计算正确性、多种输入形状、
 bias 有/无、非连续输入、不支持的 dtype/维度等场景。
 """
+
 import platform
 
 import pytest
@@ -14,6 +15,7 @@ _is_aarch64 = platform.machine() in ("aarch64", "arm64")
 
 try:
     import fused_cpp
+
     _acl_available = fused_cpp._supports_acl
 except ImportError:
     _acl_available = False
@@ -26,6 +28,7 @@ pytestmark = pytest.mark.skipif(
 
 # ── 辅助函数 ──
 
+
 def _reference_linear(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -37,13 +40,13 @@ def _reference_linear(
 
 # ── Handler 创建与销毁 ──
 
+
 class TestACLGEMMHandlerLifecycle:
     """测试 handler 的创建和销毁。"""
 
     @pytest.mark.parametrize("fast_math", [False, True], ids=["precise", "fast"])
     @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-    def test_create_and_release(self, dtype: torch.dtype,
-                                fast_math: bool) -> None:
+    def test_create_and_release(self, dtype: torch.dtype, fast_math: bool) -> None:
         """handler 创建后应持有有效指针，销毁后资源应被释放。"""
         K, N = 128, 256
         weight = torch.randn(K, N, dtype=dtype)
@@ -73,6 +76,7 @@ class TestACLGEMMHandlerLifecycle:
 
 # ── GEMM 计算正确性 ──
 
+
 class TestACLGEMMCorrectness:
     """测试 GEMM 计算结果与 torch.nn.functional.linear 的一致性。"""
 
@@ -88,7 +92,11 @@ class TestACLGEMMCorrectness:
         ],
     )
     def test_gemm_2d_no_bias(
-        self, M: int, K: int, N: int, dtype: torch.dtype,
+        self,
+        M: int,
+        K: int,
+        N: int,
+        dtype: torch.dtype,
         fast_math: bool,
     ) -> None:
         """2D 输入、无偏置的 GEMM 正确性。"""
@@ -115,8 +123,7 @@ class TestACLGEMMCorrectness:
 
     @pytest.mark.parametrize("fast_math", [False, True], ids=["precise", "fast"])
     @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-    def test_gemm_2d_with_bias(self, dtype: torch.dtype,
-                                fast_math: bool) -> None:
+    def test_gemm_2d_with_bias(self, dtype: torch.dtype, fast_math: bool) -> None:
         """2D 输入、有偏置的 GEMM 正确性。"""
         M, K, N = 8, 128, 256
         weight = torch.randn(K, N, dtype=dtype)

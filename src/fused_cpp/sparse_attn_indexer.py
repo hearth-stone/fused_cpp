@@ -42,9 +42,7 @@ __all__ = [
 
 def _fold_q_weights(q_quant: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
     """Fold per-head indexer weights into Q for scalar K dot products."""
-    return (q_quant.to(torch.float32) * weights.to(torch.float32).unsqueeze(-1)).sum(
-        dim=1
-    )
+    return (q_quant.to(torch.float32) * weights.to(torch.float32).unsqueeze(-1)).sum(dim=1)
 
 
 def cpu_sparse_attn_indexer_op_torch_baseline(
@@ -105,10 +103,7 @@ def cpu_sparse_attn_indexer_op_torch_baseline(
             cu_seqlen_ks_cpu = chunk.cu_seqlen_ks.to("cpu")
             cu_seqlen_ke_cpu = chunk.cu_seqlen_ke.to("cpu")
             valid_lens_cpu = cu_seqlen_ke_cpu - cu_seqlen_ks_cpu
-            if (
-                valid_lens_cpu.numel() > 0
-                and int(valid_lens_cpu.max().item()) <= topk_tokens
-            ):
+            if valid_lens_cpu.numel() > 0 and int(valid_lens_cpu.max().item()) <= topk_tokens:
                 for i in range(num_chunk_tokens):
                     valid_len = int(valid_lens_cpu[i].item())
                     if valid_len <= 0:
@@ -153,9 +148,7 @@ def cpu_sparse_attn_indexer_op_torch_baseline(
                 row = logits[i, ks_i:ke_i]
                 k_take = min(topk_tokens, valid_len)
                 _, idx_local = torch.topk(row, k_take, dim=-1)
-                topk_indices_buffer[token_start + i, :k_take] = idx_local.to(
-                    torch.int32
-                )
+                topk_indices_buffer[token_start + i, :k_take] = idx_local.to(torch.int32)
 
     if has_decode:
         decode_metadata = attn_metadata.decode
@@ -204,10 +197,7 @@ def cpu_sparse_attn_indexer_op_torch_baseline(
 
 
 def _metadata_has_decode(attn_metadata: Any) -> bool:
-    return (
-        int(getattr(attn_metadata, "num_decodes", 0)) > 0
-        or int(getattr(attn_metadata, "num_decode_tokens", 0)) > 0
-    )
+    return int(getattr(attn_metadata, "num_decodes", 0)) > 0 or int(getattr(attn_metadata, "num_decode_tokens", 0)) > 0
 
 
 def available_sparse_attn_indexer_versions() -> tuple[str, ...]:
@@ -216,11 +206,7 @@ def available_sparse_attn_indexer_versions() -> tuple[str, ...]:
 
 
 def _normalize_sparse_attn_indexer_version(version: str | None) -> str:
-    value = (
-        version
-        if version is not None
-        else os.environ.get("FUSED_CPP_SPARSE_ATTN_INDEXER_VERSION", "torch")
-    )
+    value = version if version is not None else os.environ.get("FUSED_CPP_SPARSE_ATTN_INDEXER_VERSION", "torch")
     value = value.lower().replace("-", "_")
     aliases = {
         "baseline": "torch",
@@ -286,8 +272,7 @@ def cpu_sparse_attn_indexer_op(
             attn_metadata,
         )
     raise ValueError(
-        "unknown sparse attention indexer version "
-        f"{selected!r}; available={available_sparse_attn_indexer_versions()}"
+        f"unknown sparse attention indexer version {selected!r}; available={available_sparse_attn_indexer_versions()}"
     )
 
 

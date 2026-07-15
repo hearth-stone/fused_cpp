@@ -28,13 +28,13 @@ PlanResult run_planner(PlanKind kind, const Workload& w);
 
 // Convenience: prepare the workload from a routing histogram and run one
 // planner end to end.
-PlanResult plan_from_routes(PlanKind kind, const int32_t* routes_hist,
-                            int num_experts, int num_cores, const CostModel& cm);
+PlanResult plan_from_routes(PlanKind kind, const int32_t* routes_hist, int num_experts, int num_cores,
+                            const CostModel& cm);
 
 // Copy the workload's active-expert view into the result.
 inline void fill_active(PlanResult& r, const Workload& w) {
-    r.active_expert_ids = w.expert_ids;
-    r.active_routes = w.routes;
+  r.active_expert_ids = w.expert_ids;
+  r.active_routes = w.routes;
 }
 
 }  // namespace moe_planner

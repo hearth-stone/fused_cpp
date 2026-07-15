@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """Tests for the public ``fused_cpp.i8gemm`` wrapper."""
+
 from __future__ import annotations
 
 import pytest
@@ -44,9 +45,7 @@ def _reference_dynamic_scaled_mm(
         (9, 31, 13, torch.bfloat16),
     ],
 )
-def test_dynamic_scaled_mm_matches_reference(
-    M: int, K: int, N: int, out_dtype: torch.dtype
-) -> None:
+def test_dynamic_scaled_mm_matches_reference(M: int, K: int, N: int, out_dtype: torch.dtype) -> None:
     torch.manual_seed(0)
     weight = torch.randint(-16, 17, (N, K), dtype=torch.int8)
     weight_scale = torch.rand(N, dtype=torch.float32) * 0.05 + 0.01
@@ -54,12 +53,8 @@ def test_dynamic_scaled_mm_matches_reference(
     x = torch.randn(M, K, dtype=torch.bfloat16)
 
     packed = i8gemm.prepare(weight, weight_scale)
-    out = i8gemm.dynamic_scaled_mm(
-        x, packed, bias=bias, out_dtype=out_dtype, nthreads=0
-    )
-    expected = _reference_dynamic_scaled_mm(
-        x, weight, weight_scale, bias=bias, out_dtype=out_dtype
-    )
+    out = i8gemm.dynamic_scaled_mm(x, packed, bias=bias, out_dtype=out_dtype, nthreads=0)
+    expected = _reference_dynamic_scaled_mm(x, weight, weight_scale, bias=bias, out_dtype=out_dtype)
 
     assert out.shape == (M, N)
     assert out.dtype == out_dtype
@@ -75,9 +70,7 @@ def test_dynamic_scaled_mm_supports_batched_input_and_scalar_scale() -> None:
 
     packed = i8gemm.prepare(weight, weight_scale)
     out = i8gemm.dynamic_scaled_mm(x, packed, out_dtype=torch.bfloat16)
-    expected = _reference_dynamic_scaled_mm(
-        x, weight, weight_scale, out_dtype=torch.bfloat16
-    )
+    expected = _reference_dynamic_scaled_mm(x, weight, weight_scale, out_dtype=torch.bfloat16)
 
     assert out.shape == (batch, M, N)
     torch.testing.assert_close(out, expected, atol=0, rtol=0)

@@ -5,6 +5,7 @@ Task 1: `gather_pack_a_reorder_m8` must produce a byte-for-byte identical
 packed buffer to the two-step reference (gather tokens into a row-major,
 K_pad-padded buffer, then `pack_a_reorder_m8`).
 """
+
 from __future__ import annotations
 
 import platform
@@ -43,9 +44,7 @@ def _reference_packed(input_tokens, routes, top_k, k_pad):
 def _fused_packed(input_tokens, routes, top_k, k_pad):
     from fused_cpp import _C
 
-    return _C.fused_moe_test_gather_pack_a_reorder_m8(
-        input_tokens, routes, top_k, k_pad
-    )
+    return _C.fused_moe_test_gather_pack_a_reorder_m8(input_tokens, routes, top_k, k_pad)
 
 
 @pytest.mark.parametrize("top_k", [1, 2, 6])
@@ -65,9 +64,7 @@ def test_gather_pack_matches_two_step(rows, h, top_k):
 
     assert ref.shape == out.shape
     # bit-identical
-    assert torch.equal(
-        ref.view(torch.int16), out.view(torch.int16)
-    ), f"mismatch rows={rows} h={h} top_k={top_k}"
+    assert torch.equal(ref.view(torch.int16), out.view(torch.int16)), f"mismatch rows={rows} h={h} top_k={top_k}"
 
 
 # ── Part 1 threaded e2e: FUSED_CPP_MOE_FUSED_PACKA on vs off ──────────────
@@ -89,9 +86,7 @@ _NSPLIT_ENV_KEYS = (
 def _nsplit_packa_env(packa, groups_per_partition=1, core_bases="0"):
     saved = {k: os.environ.get(k) for k in _NSPLIT_ENV_KEYS}
     os.environ["FUSED_CPP_MOE_HIERARCHICAL_N_SPLIT"] = "1"
-    os.environ["FUSED_CPP_MOE_N_SPLIT_GROUPS_PER_PARTITION"] = str(
-        groups_per_partition
-    )
+    os.environ["FUSED_CPP_MOE_N_SPLIT_GROUPS_PER_PARTITION"] = str(groups_per_partition)
     os.environ["FUSED_CPP_MOE_N_SPLIT_CORE_BASES"] = core_bases
     os.environ["FUSED_CPP_MOE_FUSED_PACKA"] = "1" if packa else "0"
     try:
@@ -126,8 +121,13 @@ def test_packa_on_off_equivalence(degree, num_tokens):
     def run(packa):
         with _nsplit_packa_env(packa, groups_per_partition=1, core_bases="0"):
             return fused_moe_bf16_tiled(
-                x, fused_w, tw, ti, num_threads=4,
-                activation="silu", silu_poly_degree=degree,
+                x,
+                fused_w,
+                tw,
+                ti,
+                num_threads=4,
+                activation="silu",
+                silu_poly_degree=degree,
             )
 
     off = run(False)
@@ -165,9 +165,7 @@ def test_packc_matches_rowmajor_then_pack(m, h, f, degree):
     pk = _C.fused_moe_test_fused_w13_silu_packc(a, w13, degree)
 
     assert ref.shape == pk.shape, (ref.shape, pk.shape)
-    assert torch.equal(ref.view(torch.int16), pk.view(torch.int16)), (
-        f"packc mismatch m={m} h={h} f={f} degree={degree}"
-    )
+    assert torch.equal(ref.view(torch.int16), pk.view(torch.int16)), f"packc mismatch m={m} h={h} f={f} degree={degree}"
 
 
 # ── Task 1: per-tail (rows%8) packed dispatch bit-identity vs m8-pad packc ──
@@ -216,8 +214,13 @@ def test_packa_multi_expert_all_tails(degree, gpp):
     def run(packa):
         with _nsplit_packa_env(packa, groups_per_partition=gpp, core_bases="0"):
             return fused_moe_bf16_tiled(
-                x, fused_w, tw, ti, num_threads=8,
-                activation="silu", silu_poly_degree=degree,
+                x,
+                fused_w,
+                tw,
+                ti,
+                num_threads=8,
+                activation="silu",
+                silu_poly_degree=degree,
             )
 
     off = run(False)
@@ -237,11 +240,11 @@ def test_packa_pool_cross_shape():
     # persistent pool grows then reuses buffers of different logical shape;
     # stale packed_a/down/intermediate from a bigger call must not leak.
     shapes = [
-        (256, 4096, 512, 8, 2),   # big: dirties the pool
-        (40, 512, 8, 6, 2),       # small rows + small F
-        (48, 256, 16, 5, 2),      # different H/F/strides
-        (37, 512, 24, 4, 1),      # non-8-multiple rows (tails) + F=24
-        (300, 4096, 512, 8, 2),   # grow again, back to big
+        (256, 4096, 512, 8, 2),  # big: dirties the pool
+        (40, 512, 8, 6, 2),  # small rows + small F
+        (48, 256, 16, 5, 2),  # different H/F/strides
+        (37, 512, 24, 4, 1),  # non-8-multiple rows (tails) + F=24
+        (300, 4096, 512, 8, 2),  # grow again, back to big
     ]
     for si, (T, H, F, E, tk) in enumerate(shapes):
         torch.manual_seed(si * 991 + T + F)
@@ -254,9 +257,7 @@ def test_packa_pool_cross_shape():
 
         def run(packa):
             with _nsplit_packa_env(packa, groups_per_partition=1, core_bases="0"):
-                return fused_moe_bf16_tiled(
-                    x, fused_w, tw, ids, num_threads=8,
-                    activation="silu", silu_poly_degree=5)
+                return fused_moe_bf16_tiled(x, fused_w, tw, ids, num_threads=8, activation="silu", silu_poly_degree=5)
 
         off = run(False)
         on = run(True)

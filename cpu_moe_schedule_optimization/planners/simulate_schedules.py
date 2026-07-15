@@ -17,32 +17,30 @@ Usage:
   python simulate_schedules.py PROFILE.json --preset dsv4-real-2048-seq70
   python simulate_schedules.py PROFILE.json --preset decode --cores 8 --shapes
 """
+
 from __future__ import annotations
-import argparse, os, sys
+import argparse
+import os
+import sys
 from typing import Dict, List, Tuple
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "cost_model"))
-from phase_model import ContentionCostModel          # noqa: E402
-from interval_planner import IntervalPlanner, _partitions  # noqa: E402
+from phase_model import ContentionCostModel  # noqa: E402
+from interval_planner import IntervalPlanner  # noqa: E402
 from workload_catalog import default_offline_workloads  # noqa: E402
 
-Experts = List[Tuple[int, int]]      # [(expert_id, routes), ...]
+Experts = List[Tuple[int, int]]  # [(expert_id, routes), ...]
 Tasks = List[Tuple[int, int, int, int, List[int]]]
 
 PRESETS: Dict[str, Experts] = {
-    "balanced-large":   [(i, 512) for i in range(4)],
-    "balanced-8":       [(i, 256) for i in range(8)],
-    "hotspot":          [(0, 1536), (1, 256), (2, 128), (3, 64), (4, 64)],
-    "one-dominant":     [(0, 2048), (1, 64), (2, 64)],
-    "decode-many-small":[(i, 8) for i in range(16)],
-    "moe256-uniform":   [(i, 48) for i in range(256)],
+    "balanced-large": [(i, 512) for i in range(4)],
+    "balanced-8": [(i, 256) for i in range(8)],
+    "hotspot": [(0, 1536), (1, 256), (2, 128), (3, 64), (4, 64)],
+    "one-dominant": [(0, 2048), (1, 64), (2, 64)],
+    "decode-many-small": [(i, 8) for i in range(16)],
+    "moe256-uniform": [(i, 48) for i in range(256)],
 }
-PRESETS.update(
-    {
-        name: workload.experts
-        for name, workload in default_offline_workloads().items()
-    }
-)
+PRESETS.update({name: workload.experts for name, workload in default_offline_workloads().items()})
 
 
 # ---- algorithms: (experts, planner) -> (label, tasks) ----------------------
@@ -79,7 +77,7 @@ def alg_greedy_listsched(experts: Experts, pl: IntervalPlanner):
             for th in widths:
                 t_iso = pl.model.T_iso(routes, th)
                 for cb in range(0, N - th + 1):
-                    start = max(core_ready[cb:cb + th])
+                    start = max(core_ready[cb : cb + th])
                     fin = start + t_iso
                     key = (fin, th, cb)
                     if pick is None or key < pick[0]:
@@ -124,16 +122,25 @@ def run(experts: Experts, cores: int, model: ContentionCostModel, all_shapes: bo
     rows.sort(key=lambda r: r[1])
     best = rows[0][1]
     floor = ideal_lower_bound_ns(experts, pl)
-    print("workload: %d experts, routes=%s  cores=%d" %
-          (len(experts), [r for _, r in experts] if len(experts) <= 16 else
-           "min/med/max=%d/%d/%d" % (min(r for _, r in experts),
-                                     sorted(r for _, r in experts)[len(experts)//2],
-                                     max(r for _, r in experts)), cores))
+    print(
+        "workload: %d experts, routes=%s  cores=%d"
+        % (
+            len(experts),
+            [r for _, r in experts]
+            if len(experts) <= 16
+            else "min/med/max=%d/%d/%d"
+            % (
+                min(r for _, r in experts),
+                sorted(r for _, r in experts)[len(experts) // 2],
+                max(r for _, r in experts),
+            ),
+            cores,
+        )
+    )
     print("ideal floor (balanced, no contention/overhead) = %.3f ms\n" % (floor / 1e6))
     print("  %-34s %10s %8s %8s" % ("algorithm", "makespan", "vs_best", "vs_floor"))
     for label, ms, _ in rows:
-        print("  %-34s %8.3f ms %7.2fx %7.2fx" %
-              (label, ms / 1e6, ms / best, ms / floor))
+        print("  %-34s %8.3f ms %7.2fx %7.2fx" % (label, ms / 1e6, ms / best, ms / floor))
 
 
 def parse_experts(s: str) -> Experts:
@@ -141,8 +148,7 @@ def parse_experts(s: str) -> Experts:
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("profile", help="contention derate profile JSON (block-2)")
     g = ap.add_mutually_exclusive_group(required=True)
     g.add_argument("--experts", type=parse_experts, help="comma-separated route counts")

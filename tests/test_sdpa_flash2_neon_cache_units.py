@@ -19,6 +19,7 @@
 * 平台不要求是 AArch64：``__aarch64__`` 未定义时本测试验证的是 fallback
   标量路径，**仍应通过等价性断言**（与 NEON 路径在容差内一致）。
 """
+
 from __future__ import annotations
 
 import os
@@ -36,7 +37,6 @@ from fused_cpp.sdpa_registry import get_sdpa_version  # noqa: E402
 
 from tests.conftest import (  # noqa: E402
     SDPA_TOLERANCE,
-    assert_tensor_close,
     call_sdpa_version,
 )
 
@@ -49,9 +49,9 @@ VERSION_NAME = "flash2_neon_cache"
 
 def _make_qkv(shape, dtype, seed: int = 0xCA_C8E_AA):
     """与多版本等价性测试一致的固定 seed 构造。"""
-    b, n, l, s, e, ev = shape
+    b, n, q_len, s, e, ev = shape
     g = torch.Generator(device="cpu").manual_seed(seed)
-    q = torch.randn(b, n, l, e, generator=g, dtype=torch.float32).to(dtype)
+    q = torch.randn(b, n, q_len, e, generator=g, dtype=torch.float32).to(dtype)
     k = torch.randn(b, n, s, e, generator=g, dtype=torch.float32).to(dtype)
     v = torch.randn(b, n, s, ev, generator=g, dtype=torch.float32).to(dtype)
     return q, k, v
@@ -69,9 +69,7 @@ def test_flash2_neon_cache_registered_and_callable():
     """``flash2_neon_cache`` 在 Python 层注册成功，``info.source == "cpp"``。"""
     info = get_sdpa_version(VERSION_NAME)
     assert info.name == VERSION_NAME, info
-    assert info.source == "cpp", (
-        f"{VERSION_NAME} expected source='cpp' but got {info.source!r}"
-    )
+    assert info.source == "cpp", f"{VERSION_NAME} expected source='cpp' but got {info.source!r}"
     assert "cache_aware" in info.tags, info.tags
     assert "multi_thread" in info.tags, info.tags
 
@@ -83,16 +81,14 @@ def test_flash2_neon_cache_registered_and_callable():
 @pytest.mark.parametrize(
     "shape",
     [
-        (1, 2, 16, 16, 32, 32),       # 主体：所有维度都是 8 的倍数
-        (2, 4, 33, 70, 72, 40),       # 全维度非 8 整除：尾部 case
-        (1, 4, 8, 8, 8, 8),           # 最小 tile
-        (1, 1, 17, 9, 13, 7),         # 极端奇形
+        (1, 2, 16, 16, 32, 32),  # 主体：所有维度都是 8 的倍数
+        (2, 4, 33, 70, 72, 40),  # 全维度非 8 整除：尾部 case
+        (1, 4, 8, 8, 8, 8),  # 最小 tile
+        (1, 1, 17, 9, 13, 7),  # 极端奇形
     ],
     ids=["square", "tail-all-dims", "min-tile", "odd-shapes"],
 )
-@pytest.mark.parametrize(
-    "dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"]
-)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
 def test_flash2_neon_cache_vs_flash2_neon_equiv(shape, dtype):
     """``flash2_neon_cache`` 与 ``flash2_neon`` 在多 shape × dtype 下等价。"""
     cache = get_sdpa_version(VERSION_NAME)
@@ -106,10 +102,7 @@ def test_flash2_neon_cache_vs_flash2_neon_equiv(shape, dtype):
     tol = SDPA_TOLERANCE.get(dtype, SDPA_TOLERANCE[torch.float32])
     # cache-aware 主循环算法上与 flash2_neon 等价；累加顺序差异给 2× 容差。
     bound = 2.0 * tol.atol
-    assert err <= bound, (
-        f"{VERSION_NAME} vs flash2_neon max_abs={err:.3e} > {bound:.3e} "
-        f"(dtype={dtype}, shape={shape})"
-    )
+    assert err <= bound, f"{VERSION_NAME} vs flash2_neon max_abs={err:.3e} > {bound:.3e} (dtype={dtype}, shape={shape})"
 
 
 # ── 3. 大形状 + bf16 BFMMLA 主路径与 flash2 一致 ───────────────────
@@ -133,19 +126,14 @@ def test_flash2_neon_cache_bf16_mla_shape():
     err = _max_abs(out_cache, out_flash2)
     tol = SDPA_TOLERANCE[torch.bfloat16]
     bound = 2.0 * tol.atol
-    assert err <= bound, (
-        f"{VERSION_NAME} bf16 MLA shape vs flash2 max_abs={err:.3e} > "
-        f"{bound:.3e} (shape={shape})"
-    )
+    assert err <= bound, f"{VERSION_NAME} bf16 MLA shape vs flash2 max_abs={err:.3e} > {bound:.3e} (shape={shape})"
 
 
 # ── 4. causal + attn_mask 端到端 ─────────────────────────────────
 
 
 @pytest.mark.equiv
-@pytest.mark.parametrize(
-    "dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"]
-)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
 def test_flash2_neon_cache_causal_and_mask(dtype):
     """causal=True + additive ``attn_mask`` 下 cache 内核与 ``flash2`` 一致。
 
@@ -161,20 +149,13 @@ def test_flash2_neon_cache_causal_and_mask(dtype):
     g = torch.Generator(device="cpu").manual_seed(0xCAFECAFE)
     mask = torch.randn(1, 2, 17, 33, generator=g, dtype=torch.float32) * 0.5
 
-    out_cache = call_sdpa_version(
-        cache, q, k, v, is_causal=True, attn_mask=mask
-    )
-    out_flash2 = call_sdpa_version(
-        flash2, q, k, v, is_causal=True, attn_mask=mask
-    )
+    out_cache = call_sdpa_version(cache, q, k, v, is_causal=True, attn_mask=mask)
+    out_flash2 = call_sdpa_version(flash2, q, k, v, is_causal=True, attn_mask=mask)
 
     err = _max_abs(out_cache, out_flash2)
     tol = SDPA_TOLERANCE.get(dtype, SDPA_TOLERANCE[torch.float32])
     bound = 2.0 * tol.atol
-    assert err <= bound, (
-        f"{VERSION_NAME} causal+mask vs flash2 max_abs={err:.3e} > "
-        f"{bound:.3e} (dtype={dtype})"
-    )
+    assert err <= bound, f"{VERSION_NAME} causal+mask vs flash2 max_abs={err:.3e} > {bound:.3e} (dtype={dtype})"
 
 
 # ── 5. 多线程 vs 单线程一致性 ──────────────────────────────────
@@ -222,10 +203,10 @@ def _run_with_threads(num_threads: int) -> dict:
     )
     if res.returncode != 0:
         raise RuntimeError(
-            f"thread test script failed (OMP_NUM_THREADS={num_threads}): "
-            f"stdout={res.stdout!r} stderr={res.stderr!r}"
+            f"thread test script failed (OMP_NUM_THREADS={num_threads}): stdout={res.stdout!r} stderr={res.stderr!r}"
         )
     import json
+
     # 子进程可能输出 numpy import 警告，提取最后一行 JSON。
     last = res.stdout.strip().splitlines()[-1]
     return json.loads(last)
@@ -247,8 +228,7 @@ def test_flash2_neon_cache_thread_count_consistency():
     diff = abs(info_1t["checksum"] - info_4t["checksum"])
     rel = diff / (abs(info_1t["checksum"]) + 1e-12)
     assert rel < 1e-6, (
-        f"1-thread vs 4-thread checksum mismatch: "
-        f"{info_1t['checksum']} vs {info_4t['checksum']} (rel={rel:.3e})"
+        f"1-thread vs 4-thread checksum mismatch: {info_1t['checksum']} vs {info_4t['checksum']} (rel={rel:.3e})"
     )
 
 
@@ -273,7 +253,4 @@ def test_flash2_neon_cache_reference_shape_bf16():
     err = _max_abs(out_cache, out_flash2)
     tol = SDPA_TOLERANCE[torch.bfloat16]
     bound = 2.0 * tol.atol
-    assert err <= bound, (
-        f"{VERSION_NAME} reference shape vs flash2 max_abs={err:.3e} > "
-        f"{bound:.3e} (shape={shape})"
-    )
+    assert err <= bound, f"{VERSION_NAME} reference shape vs flash2 max_abs={err:.3e} > {bound:.3e} (shape={shape})"

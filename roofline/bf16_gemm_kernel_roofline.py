@@ -21,7 +21,6 @@ import os
 import re
 import statistics
 import sys
-import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable
@@ -218,9 +217,7 @@ def measure_w13_ms(
     trace_file: Path,
     fuse_silu: bool,
 ) -> float:
-    w13 = bf16_normal(
-        (1, 2 * ffn_hidden_size, hidden_size), generator=generator, std=std
-    )
+    w13 = bf16_normal((1, 2 * ffn_hidden_size, hidden_size), generator=generator, std=std)
     w2 = bf16_normal((1, hidden_size, ffn_hidden_size), generator=generator, std=std)
     packed = prepare_fused_moe_bf16_tiled_weights(w13, w2, fuse_silu=fuse_silu)
     hidden = bf16_normal((routes, hidden_size), generator=generator, std=std)
@@ -300,9 +297,7 @@ def row_from_json(row: dict, peak_tflops: float | None, bandwidth_gbs: float | N
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter
-    )
+    parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("--hidden-size", type=int, default=4096)
     parser.add_argument("--ffn-hidden-size", type=int, default=2048)
     parser.add_argument("--routes", default="48,96,192,384,768,1024")
@@ -338,10 +333,7 @@ def main() -> int:
 
     if args.input_json is not None:
         payload = json.loads(args.input_json.read_text(encoding="utf-8"))
-        rows = [
-            row_from_json(row, args.peak_tflops, args.bandwidth_gbs)
-            for row in payload["rows"]
-        ]
+        rows = [row_from_json(row, args.peak_tflops, args.bandwidth_gbs) for row in payload["rows"]]
         print_table(rows)
         return 0
 
@@ -413,10 +405,7 @@ def main() -> int:
                 "n": 2 * args.ffn_hidden_size,
                 "m_panel": args.m_panel,
                 "include_c_write": not args.no_c_write,
-                "kernel_memory_model": (
-                    "A*M*K duplicated by N partitions; "
-                    "B*K*N streamed once per M panel"
-                ),
+                "kernel_memory_model": ("A*M*K duplicated by N partitions; B*K*N streamed once per M panel"),
             },
             "warmup": args.warmup,
             "runs": args.runs,

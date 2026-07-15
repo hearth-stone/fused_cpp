@@ -29,6 +29,31 @@ the PyTorch CPU wheel index via `tool.uv.sources`.
 `vLLM` is intentionally not a default dependency. vLLM-specific integration
 tests are skipped unless vLLM is importable in the active environment.
 
+## Code Style
+
+Install the pinned formatting tools without installing the runtime dependencies:
+
+```bash
+python -m pip install -r requirements-style.txt
+```
+
+Check Python lint/formatting and C/C++ formatting with the same entrypoint used
+by CI:
+
+```bash
+bash scripts/check_code_style.sh
+```
+
+Apply all safe Ruff fixes, Ruff formatting, and clang-format formatting:
+
+```bash
+bash scripts/format_code.sh
+```
+
+Python uses Ruff with a 120-column limit. C/C++ uses clang-format 20.1.5 with
+Google style and a 120-column limit. The frozen `refs/` directory and assembly
+sources are intentionally excluded from automatic formatting.
+
 ## Quick Start
 
 ```python

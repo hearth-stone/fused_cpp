@@ -20,11 +20,8 @@ static inline float bf16_to_fp32_ref(uint16_t bf) {
 }
 
 // QKᵀ: scores_buf[i*8 + j] = scale * sum_e(Q[i*qs + e] * K[j*ks + e])
-static inline void qkt_ref(
-    const uint16_t* Q, int64_t q_row_stride,
-    const uint16_t* K, int64_t k_row_stride,
-    int64_t E, float scale,
-    float* scores_buf) {
+static inline void qkt_ref(const uint16_t* Q, int64_t q_row_stride, const uint16_t* K, int64_t k_row_stride, int64_t E,
+                           float scale, float* scores_buf) {
   for (int i = 0; i < 8; ++i) {
     for (int j = 0; j < 8; ++j) {
       float s = 0.0f;
@@ -40,11 +37,8 @@ static inline void qkt_ref(
 
 // PV: O[i*os + ev] += sum_k(P_hat[i*ps + k] * V[k*vs + ev])
 // 与 microkernel 一样 accumulate 进 O。
-static inline void pv_ref(
-    const float* P_hat, int64_t P_row_stride,
-    const uint16_t* V, int64_t v_row_stride,
-    int64_t Sk,
-    float* O, int64_t o_row_stride) {
+static inline void pv_ref(const float* P_hat, int64_t P_row_stride, const uint16_t* V, int64_t v_row_stride, int64_t Sk,
+                          float* O, int64_t o_row_stride) {
   for (int i = 0; i < 8; ++i) {
     for (int ev = 0; ev < 8; ++ev) {
       float s = O[i * o_row_stride + ev];

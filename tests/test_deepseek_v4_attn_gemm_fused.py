@@ -16,8 +16,7 @@ from fused_cpp.deepseek_v4_attn_gemm_fused import (
 )
 
 pytestmark = pytest.mark.skipif(
-    platform.machine() not in ("aarch64", "arm64")
-    or not _HAS_DEEPSEEK_V4_ATTN_GEMM_FUSED,
+    platform.machine() not in ("aarch64", "arm64") or not _HAS_DEEPSEEK_V4_ATTN_GEMM_FUSED,
     reason="DeepSeek V4 fused GEMM kernel is only available on AArch64",
 )
 
@@ -76,20 +75,16 @@ def test_deepseek_v4_attn_gemm_fused_matches_torch(
             weights[3],
         )
 
-    qr_kv, kv_score, indexer_kv_score, indexer_weights = (
-        deepseek_v4_attn_gemm_fused_prepacked(
-            hidden_states,
-            packed,
-        )
+    qr_kv, kv_score, indexer_kv_score, indexer_weights = deepseek_v4_attn_gemm_fused_prepacked(
+        hidden_states,
+        packed,
     )
 
     ref_qr_kv = (hidden_states.float() @ weights[0].float()).to(torch.bfloat16)
 
     assert qr_kv.dtype == torch.bfloat16
     assert qr_kv.shape == ref_qr_kv.shape
-    torch.testing.assert_close(
-        qr_kv.float(), ref_qr_kv.float(), atol=5e-2, rtol=5e-2
-    )
+    torch.testing.assert_close(qr_kv.float(), ref_qr_kv.float(), atol=5e-2, rtol=5e-2)
 
     if variant == "dense":
         assert kv_score is None
@@ -109,18 +104,14 @@ def test_deepseek_v4_attn_gemm_fused_matches_torch(
         return
 
     ref_indexer_kv_score = hidden_states.float() @ weights[2].float()
-    ref_indexer_weights = (
-        hidden_states.float() @ weights[3].float()
-    ).to(torch.bfloat16)
+    ref_indexer_weights = (hidden_states.float() @ weights[3].float()).to(torch.bfloat16)
     assert indexer_kv_score is not None
     assert indexer_weights is not None
     assert indexer_kv_score.dtype == torch.float32
     assert indexer_weights.dtype == torch.bfloat16
     assert indexer_kv_score.shape == ref_indexer_kv_score.shape
     assert indexer_weights.shape == ref_indexer_weights.shape
-    torch.testing.assert_close(
-        indexer_kv_score, ref_indexer_kv_score, atol=5e-2, rtol=5e-2
-    )
+    torch.testing.assert_close(indexer_kv_score, ref_indexer_kv_score, atol=5e-2, rtol=5e-2)
     torch.testing.assert_close(
         indexer_weights.float(),
         ref_indexer_weights.float(),
@@ -203,16 +194,14 @@ def test_deepseek_v4_attn_gemm_fused_normed_matches_torch(
             weights[3],
         )
 
-    qr, kv, kv_score, indexer_kv_score, indexer_weights = (
-        deepseek_v4_attn_gemm_fused_prepacked_normed(
-            hidden_states,
-            packed,
-            q_norm_weight,
-            kv_norm_weight,
-            q_lora_rank,
-            kv_dim,
-            eps,
-        )
+    qr, kv, kv_score, indexer_kv_score, indexer_weights = deepseek_v4_attn_gemm_fused_prepacked_normed(
+        hidden_states,
+        packed,
+        q_norm_weight,
+        kv_norm_weight,
+        q_lora_rank,
+        kv_dim,
+        eps,
     )
 
     ref_qr_kv = (hidden_states.float() @ weights[0].float()).to(torch.bfloat16)
@@ -241,14 +230,10 @@ def test_deepseek_v4_attn_gemm_fused_normed_matches_torch(
         return
 
     ref_indexer_kv_score = hidden_states.float() @ weights[2].float()
-    ref_indexer_weights = (
-        hidden_states.float() @ weights[3].float()
-    ).to(torch.bfloat16)
+    ref_indexer_weights = (hidden_states.float() @ weights[3].float()).to(torch.bfloat16)
     assert indexer_kv_score is not None
     assert indexer_weights is not None
-    torch.testing.assert_close(
-        indexer_kv_score, ref_indexer_kv_score, atol=5e-2, rtol=5e-2
-    )
+    torch.testing.assert_close(indexer_kv_score, ref_indexer_kv_score, atol=5e-2, rtol=5e-2)
     torch.testing.assert_close(
         indexer_weights.float(),
         ref_indexer_weights.float(),

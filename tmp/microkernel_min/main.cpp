@@ -86,8 +86,7 @@ struct DiffStat {
   float first_bad_expect = 0.0f;
 };
 
-static DiffStat compare(const float* actual, const float* expect,
-                        int rows, int cols, float atol, float rtol) {
+static DiffStat compare(const float* actual, const float* expect, int rows, int cols, float atol, float rtol) {
   DiffStat s;
   for (int i = 0; i < rows; ++i) {
     for (int j = 0; j < cols; ++j) {
@@ -109,11 +108,10 @@ static DiffStat compare(const float* actual, const float* expect,
 }
 
 // ── 测试单个 (E, Sk) 的 QKᵀ + PV ──
-static int test_one(int64_t E, int64_t Sk, std::mt19937& rng,
-                    const char* label) {
+static int test_one(int64_t E, int64_t Sk, std::mt19937& rng, const char* label) {
   // QKᵀ：Q [8][E] bf16，K [8][E] bf16，scores [8][8] fp32
   std::vector<uint16_t> Q(8 * E), K(8 * E);
-  std::vector<uint16_t> Q_seq((E / 4) * 32 + 32, 0);   // 多分配防越界
+  std::vector<uint16_t> Q_seq((E / 4) * 32 + 32, 0);  // 多分配防越界
   std::vector<uint16_t> K_seq((E / 4) * 32 + 32, 0);
   std::vector<float> scores_actual(8 * 8, 0.0f);
   std::vector<float> scores_expect(8 * 8, 0.0f);
@@ -123,26 +121,21 @@ static int test_one(int64_t E, int64_t Sk, std::mt19937& rng,
   pack_k_8rows_to_seq_bf16(K.data(), E, E, K_seq.data());
 
   const float scale = 1.0f / std::sqrt(static_cast<float>(E));
-  gemm_qkt_microkernel_8x8_bf16_packqk_seq4_bmajor_inner(
-      Q_seq.data(), Q.data(), E,
-      K_seq.data(), K.data(), E,
-      E, scale, scores_actual.data());
+  gemm_qkt_microkernel_8x8_bf16_packqk_seq4_bmajor_inner(Q_seq.data(), Q.data(), E, K_seq.data(), K.data(), E, E, scale,
+                                                         scores_actual.data());
   qkt_ref(Q.data(), E, K.data(), E, E, scale, scores_expect.data());
 
   // bf16 精度：abs ~ 0.01 * sqrt(E)（每元素相对 ulp 1/256）
   // 用宽松阈值，重点是发现量级错误而非 ULP 精度
   const float atol_qkt = 0.05f;
   const float rtol_qkt = 0.05f;
-  DiffStat ds_qkt = compare(scores_actual.data(), scores_expect.data(),
-                            8, 8, atol_qkt, rtol_qkt);
+  DiffStat ds_qkt = compare(scores_actual.data(), scores_expect.data(), 8, 8, atol_qkt, rtol_qkt);
 
   bool qkt_ok = (ds_qkt.first_bad_i < 0);
-  std::printf("  %s QKᵀ E=%4lld         max_abs=%.4f max_rel=%.4f  %s\n",
-              label, (long long)E, ds_qkt.max_abs, ds_qkt.max_rel,
-              qkt_ok ? "PASS" : "FAIL");
+  std::printf("  %s QKᵀ E=%4lld         max_abs=%.4f max_rel=%.4f  %s\n", label, (long long)E, ds_qkt.max_abs,
+              ds_qkt.max_rel, qkt_ok ? "PASS" : "FAIL");
   if (!qkt_ok) {
-    std::printf("    first bad [%d,%d]: actual=%.6f expect=%.6f\n",
-                ds_qkt.first_bad_i, ds_qkt.first_bad_j,
+    std::printf("    first bad [%d,%d]: actual=%.6f expect=%.6f\n", ds_qkt.first_bad_i, ds_qkt.first_bad_j,
                 ds_qkt.first_bad_actual, ds_qkt.first_bad_expect);
   }
 
@@ -158,23 +151,18 @@ static int test_one(int64_t E, int64_t Sk, std::mt19937& rng,
 
   std::vector<float> O_actual = O_init;
   std::vector<float> O_expect = O_init;
-  gemm_pv_microkernel_8x8_bf16_pquad(
-      P.data(), Sk, V.data(), 8, Sk,
-      O_actual.data(), 8);
+  gemm_pv_microkernel_8x8_bf16_pquad(P.data(), Sk, V.data(), 8, Sk, O_actual.data(), 8);
   pv_ref(P.data(), Sk, V.data(), 8, Sk, O_expect.data(), 8);
 
   // PV 累加 Sk 项；bf16 V 引入 ~0.01 * Sk 累积误差（最坏估计）
   const float atol_pv = std::max(0.05f, 0.005f * static_cast<float>(Sk));
   const float rtol_pv = 0.05f;
-  DiffStat ds_pv = compare(O_actual.data(), O_expect.data(),
-                           8, 8, atol_pv, rtol_pv);
+  DiffStat ds_pv = compare(O_actual.data(), O_expect.data(), 8, 8, atol_pv, rtol_pv);
   bool pv_ok = (ds_pv.first_bad_i < 0);
-  std::printf("  %s PV  Sk=%4lld        max_abs=%.4f max_rel=%.4f  %s\n",
-              label, (long long)Sk, ds_pv.max_abs, ds_pv.max_rel,
-              pv_ok ? "PASS" : "FAIL");
+  std::printf("  %s PV  Sk=%4lld        max_abs=%.4f max_rel=%.4f  %s\n", label, (long long)Sk, ds_pv.max_abs,
+              ds_pv.max_rel, pv_ok ? "PASS" : "FAIL");
   if (!pv_ok) {
-    std::printf("    first bad [%d,%d]: actual=%.6f expect=%.6f\n",
-                ds_pv.first_bad_i, ds_pv.first_bad_j,
+    std::printf("    first bad [%d,%d]: actual=%.6f expect=%.6f\n", ds_pv.first_bad_i, ds_pv.first_bad_j,
                 ds_pv.first_bad_actual, ds_pv.first_bad_expect);
   }
 
@@ -184,13 +172,13 @@ static int test_one(int64_t E, int64_t Sk, std::mt19937& rng,
 static int cmd_test() {
   std::printf("=== Correctness test ===\n");
   std::mt19937 rng(42);
-  struct Shape { int64_t E, Sk; const char* tag; };
+  struct Shape {
+    int64_t E, Sk;
+    const char* tag;
+  };
   Shape shapes[] = {
-    {  64, 128, "[E=64  Sk=128]" },
-    { 128, 128, "[E=128 Sk=128]" },
-    { 192, 128, "[E=192 Sk=128]" },
-    { 192, 512, "[E=192 Sk=512]" },
-    {  64,   8, "[E=64  Sk=8  ]" },
+      {64, 128, "[E=64  Sk=128]"},  {128, 128, "[E=128 Sk=128]"}, {192, 128, "[E=192 Sk=128]"},
+      {192, 512, "[E=192 Sk=512]"}, {64, 8, "[E=64  Sk=8  ]"},
   };
   int fails = 0;
   for (const auto& s : shapes) {
@@ -230,19 +218,15 @@ static double bench_qkt(int64_t E, int iters, int warmup) {
 
   // warmup
   for (int i = 0; i < warmup; ++i) {
-    gemm_qkt_microkernel_8x8_bf16_packqk_seq4_bmajor_inner(
-        Q_seq.data(), Q.data(), E,
-        K_seq.data(), K.data(), E,
-        E, scale, scores.data());
+    gemm_qkt_microkernel_8x8_bf16_packqk_seq4_bmajor_inner(Q_seq.data(), Q.data(), E, K_seq.data(), K.data(), E, E,
+                                                           scale, scores.data());
   }
   bench_barrier(scores.data());
 
   auto t0 = std::chrono::steady_clock::now();
   for (int i = 0; i < iters; ++i) {
-    gemm_qkt_microkernel_8x8_bf16_packqk_seq4_bmajor_inner(
-        Q_seq.data(), Q.data(), E,
-        K_seq.data(), K.data(), E,
-        E, scale, scores.data());
+    gemm_qkt_microkernel_8x8_bf16_packqk_seq4_bmajor_inner(Q_seq.data(), Q.data(), E, K_seq.data(), K.data(), E, E,
+                                                           scale, scores.data());
     bench_barrier(scores.data());
   }
   auto t1 = std::chrono::steady_clock::now();
@@ -264,21 +248,16 @@ static double bench_pv(int64_t Sk, int iters, int warmup) {
   std::vector<float> O(8 * 8, 0.0f);
   for (int64_t i = 0; i < static_cast<int64_t>(V.size()); ++i)
     V[i] = fp32_to_bf16(0.015f * static_cast<float>((i % 9) + 1));
-  for (int64_t i = 0; i < static_cast<int64_t>(P.size()); ++i)
-    P[i] = 0.005f * static_cast<float>((i % 5) + 1);
+  for (int64_t i = 0; i < static_cast<int64_t>(P.size()); ++i) P[i] = 0.005f * static_cast<float>((i % 5) + 1);
 
   for (int i = 0; i < warmup; ++i) {
-    gemm_pv_microkernel_8x8_bf16_pquad(
-        P.data(), Sk, V.data(), 8, Sk,
-        O.data(), 8);
+    gemm_pv_microkernel_8x8_bf16_pquad(P.data(), Sk, V.data(), 8, Sk, O.data(), 8);
   }
   bench_barrier(O.data());
 
   auto t0 = std::chrono::steady_clock::now();
   for (int i = 0; i < iters; ++i) {
-    gemm_pv_microkernel_8x8_bf16_pquad(
-        P.data(), Sk, V.data(), 8, Sk,
-        O.data(), 8);
+    gemm_pv_microkernel_8x8_bf16_pquad(P.data(), Sk, V.data(), 8, Sk, O.data(), 8);
     bench_barrier(O.data());
   }
   auto t1 = std::chrono::steady_clock::now();
@@ -291,17 +270,14 @@ static double bench_pv(int64_t Sk, int iters, int warmup) {
 
 static int cmd_bench(int64_t E, int64_t Sk, int iters, int warmup) {
   std::printf("=== Benchmark (single-threaded, hot L1) ===\n");
-  std::printf("  E=%lld  Sk=%lld  iters=%d  warmup=%d\n",
-              (long long)E, (long long)Sk, iters, warmup);
+  std::printf("  E=%lld  Sk=%lld  iters=%d  warmup=%d\n", (long long)E, (long long)Sk, iters, warmup);
   std::printf("  -------------------------------------------\n");
 
   double gflops_qkt = bench_qkt(E, iters, warmup);
-  std::printf("  QKᵀ packqk_seq4_bmajor (E=%lld)         %8.2f GFLOPS\n",
-              (long long)E, gflops_qkt);
+  std::printf("  QKᵀ packqk_seq4_bmajor (E=%lld)         %8.2f GFLOPS\n", (long long)E, gflops_qkt);
 
   double gflops_pv = bench_pv(Sk, iters, warmup);
-  std::printf("  PV  bf16_pquad           (Sk=%lld)        %8.2f GFLOPS\n",
-              (long long)Sk, gflops_pv);
+  std::printf("  PV  bf16_pquad           (Sk=%lld)        %8.2f GFLOPS\n", (long long)Sk, gflops_pv);
 
   std::printf("=== Done ===\n");
   return 0;
@@ -326,10 +302,22 @@ int main(int argc, char** argv) {
   for (int i = 2; i < argc; ++i) {
     std::string arg = argv[i];
     int64_t v;
-    if (parse_kv(arg, "E", &v))      { E = v; continue; }
-    if (parse_kv(arg, "Sk", &v))     { Sk = v; continue; }
-    if (parse_kv(arg, "iters", &v))  { iters = static_cast<int>(v); continue; }
-    if (parse_kv(arg, "warmup", &v)) { warmup = static_cast<int>(v); continue; }
+    if (parse_kv(arg, "E", &v)) {
+      E = v;
+      continue;
+    }
+    if (parse_kv(arg, "Sk", &v)) {
+      Sk = v;
+      continue;
+    }
+    if (parse_kv(arg, "iters", &v)) {
+      iters = static_cast<int>(v);
+      continue;
+    }
+    if (parse_kv(arg, "warmup", &v)) {
+      warmup = static_cast<int>(v);
+      continue;
+    }
     std::fprintf(stderr, "Unknown arg: %s\n", arg.c_str());
     return 1;
   }

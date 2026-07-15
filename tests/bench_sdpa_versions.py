@@ -20,6 +20,7 @@
    scaling 表 + ``efficiency = gflops(N) / (N * gflops(1))``。
    ``_C.has_openmp() == False`` 时自动 skip Thread Sweep。
 """
+
 from __future__ import annotations
 
 import gc
@@ -104,17 +105,20 @@ def _omp_snapshot() -> Dict[str, str]:
     snap: Dict[str, str] = {}
     try:
         from fused_cpp import _C  # type: ignore
+
         snap.update(dict(_C.get_omp_runtime_info()))
     except Exception:
-        snap.update({
-            "max_threads": "1",
-            "num_procs": "1",
-            "has_openmp": "false",
-            "OMP_NUM_THREADS": os.environ.get("OMP_NUM_THREADS", "null"),
-            "OMP_SCHEDULE":    os.environ.get("OMP_SCHEDULE", "null"),
-            "OMP_PROC_BIND":   os.environ.get("OMP_PROC_BIND", "null"),
-            "OMP_PLACES":      os.environ.get("OMP_PLACES", "null"),
-        })
+        snap.update(
+            {
+                "max_threads": "1",
+                "num_procs": "1",
+                "has_openmp": "false",
+                "OMP_NUM_THREADS": os.environ.get("OMP_NUM_THREADS", "null"),
+                "OMP_SCHEDULE": os.environ.get("OMP_SCHEDULE", "null"),
+                "OMP_PROC_BIND": os.environ.get("OMP_PROC_BIND", "null"),
+                "OMP_PLACES": os.environ.get("OMP_PLACES", "null"),
+            }
+        )
     snap["torch_num_threads"] = str(torch.get_num_threads())
     try:
         snap["torch_num_interop_threads"] = str(torch.get_num_interop_threads())
@@ -141,13 +145,13 @@ def _run_bench(fn, args, kwargs) -> Dict[str, float]:
     p90 = samples[max(int(round(n * 0.9)) - 1, 0)] if n > 0 else 0.0
     p99 = samples[max(int(round(n * 0.99)) - 1, 0)] if n > 0 else 0.0
     return {
-        "mean":   statistics.mean(samples),
+        "mean": statistics.mean(samples),
         "stddev": statistics.pstdev(samples) if n > 1 else 0.0,
         "median": statistics.median(samples),
-        "p90":    p90,
-        "p99":    p99,
-        "min":    samples[0],
-        "max":    samples[-1],
+        "p90": p90,
+        "p99": p99,
+        "min": samples[0],
+        "max": samples[-1],
     }
 
 
@@ -182,8 +186,7 @@ def _sdpa_bench_pin_threads(request):
 @pytest.mark.bench
 @pytest.mark.parametrize("shape", BENCH_SHAPES, ids=_shape_id)
 @pytest.mark.parametrize("dtype", BENCH_DTYPES, ids=_dtype_id)
-@pytest.mark.parametrize("is_causal", BENCH_CAUSAL,
-                         ids=["noncausal", "causal"])
+@pytest.mark.parametrize("is_causal", BENCH_CAUSAL, ids=["noncausal", "causal"])
 def test_sdpa_bench(sdpa_version, shape, dtype, is_causal):
     """单次基准：测量 (version, shape, dtype, is_causal) 配置。"""
     info: VersionInfo = sdpa_version
@@ -191,9 +194,7 @@ def test_sdpa_bench(sdpa_version, shape, dtype, is_causal):
 
     # ── 能力位过滤 ──
     is_mla = E != Ev
-    ok, reason = info.supports(
-        dtype=dtype, is_causal=is_causal, mla_shape=is_mla
-    )
+    ok, reason = info.supports(dtype=dtype, is_causal=is_causal, mla_shape=is_mla)
     if not ok:
         pytest.skip(reason)
 
@@ -227,35 +228,40 @@ def test_sdpa_bench(sdpa_version, shape, dtype, is_causal):
 
     omp = _omp_snapshot()
     record: Dict[str, Any] = {
-        "version":   info.name,
-        "source":    info.source,
-        "shape":     _shape_id(shape),
-        "dtype":     _dtype_id(dtype),
+        "version": info.name,
+        "source": info.source,
+        "shape": _shape_id(shape),
+        "dtype": _dtype_id(dtype),
         "is_causal": bool(is_causal),
-        "B": B, "N": N, "L": L, "S": S, "E": E, "Ev": Ev,
+        "B": B,
+        "N": N,
+        "L": L,
+        "S": S,
+        "E": E,
+        "Ev": Ev,
         "warmup_iters": WARMUP_ITERS,
-        "bench_iters":  BENCH_ITERS,
-        "mean_ms":   stats["mean"]   * 1e3,
+        "bench_iters": BENCH_ITERS,
+        "mean_ms": stats["mean"] * 1e3,
         "stddev_ms": stats["stddev"] * 1e3,
         "median_ms": stats["median"] * 1e3,
-        "p90_ms":    stats["p90"]    * 1e3,
-        "p99_ms":    stats["p99"]    * 1e3,
-        "min_ms":    stats["min"]    * 1e3,
-        "max_ms":    stats["max"]    * 1e3,
-        "total_flops":         flops["total_flops"],
-        "total_flops_causal":  flops["total_flops_causal"],
-        "effective_flops":     flops[effective_flops_key],
-        "gflops":              gflops_effective,
-        "gflops_total":        gflops_total,
-        "gflops_causal":       gflops_causal,
-        "speedup_vs_pytorch":  speedup,
+        "p90_ms": stats["p90"] * 1e3,
+        "p99_ms": stats["p99"] * 1e3,
+        "min_ms": stats["min"] * 1e3,
+        "max_ms": stats["max"] * 1e3,
+        "total_flops": flops["total_flops"],
+        "total_flops_causal": flops["total_flops_causal"],
+        "effective_flops": flops[effective_flops_key],
+        "gflops": gflops_effective,
+        "gflops_total": gflops_total,
+        "gflops_causal": gflops_causal,
+        "speedup_vs_pytorch": speedup,
         # 优先记录 PyTorch intra-op 线程数（它才是 pytorch_sdpa 路径的
         # 真实并行度）；omp_get_max_threads() 同时作为备考信息记在
         # ``omp_max_threads`` 里。
-        "num_threads":      str(torch.get_num_threads()),
-        "omp_max_threads":  omp.get("max_threads"),
-        "omp_schedule":     omp.get("OMP_SCHEDULE"),
-        "omp_proc_bind":    omp.get("OMP_PROC_BIND"),
-        "has_openmp":       omp.get("has_openmp"),
+        "num_threads": str(torch.get_num_threads()),
+        "omp_max_threads": omp.get("max_threads"),
+        "omp_schedule": omp.get("OMP_SCHEDULE"),
+        "omp_proc_bind": omp.get("OMP_PROC_BIND"),
+        "has_openmp": omp.get("has_openmp"),
     }
     record_sdpa_bench(record)

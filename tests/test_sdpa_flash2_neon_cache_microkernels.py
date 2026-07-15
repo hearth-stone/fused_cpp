@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """``flash2_neon_cache`` 解耦微内核的接口级测试。"""
+
 from __future__ import annotations
 
 import math

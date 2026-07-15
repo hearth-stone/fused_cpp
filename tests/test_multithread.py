@@ -8,10 +8,9 @@ Covers:
 - FUSED_MLA_NUM_THREADS env var override
 - torch.get_num_threads() default path
 """
-import os
+
 import threading
 
-import pytest
 import torch
 
 import fused_cpp.core as core_module
@@ -31,9 +30,7 @@ HEAD_SIZE = KV_LORA_RANK + QK_ROPE_HEAD_DIM
 
 def _make_impl():
     """Build a minimal CPUFusedMLAImpl instance."""
-    kv_b_proj_weight = torch.randn(
-        NUM_HEADS * (QK_NOPE_HEAD_DIM + V_HEAD_DIM), KV_LORA_RANK
-    )
+    kv_b_proj_weight = torch.randn(NUM_HEADS * (QK_NOPE_HEAD_DIM + V_HEAD_DIM), KV_LORA_RANK)
     kv_b_proj = type("FakeLinear", (), {"weight": kv_b_proj_weight, "bias": None})()
     return core_module.CPUFusedMLAImpl(
         num_heads=NUM_HEADS,
@@ -52,6 +49,7 @@ def _make_impl():
 
 
 # ── Tests for _parallel_map ───────────────────────────────────────────────────
+
 
 class TestParallelMap:
     """Unit tests for the _parallel_map utility function."""
@@ -77,8 +75,8 @@ class TestParallelMap:
     def test_parallel_execution_result_order(self):
         """Parallel execution must preserve input order in the output."""
         items = list(range(10))
-        results = _parallel_map(lambda x: x ** 2, items, num_threads=4)
-        assert results == [x ** 2 for x in items]
+        results = _parallel_map(lambda x: x**2, items, num_threads=4)
+        assert results == [x**2 for x in items]
 
     def test_parallel_execution_uses_worker_threads(self):
         """With num_threads > 1 and multiple items, workers run in non-main threads."""
@@ -132,6 +130,7 @@ class TestParallelMap:
 
 
 # ── Tests for CPUFusedMLAImpl thread-count initialization ─────────────────────
+
 
 class TestNumThreadsInit:
     """Tests for FUSED_MLA_NUM_THREADS env var and torch.get_num_threads() path."""

@@ -21,6 +21,7 @@
 - 所有张量 seed 固定，`assert_tensor_close` 同时报告 max_abs / max_rel / cos。
 - 不引入 vLLM 高层 API；仅依赖 PyTorch 与 fused_cpp 自身。
 """
+
 from __future__ import annotations
 
 import pytest
@@ -57,7 +58,9 @@ def _pack_awq_along_n(unpacked: torch.Tensor) -> torch.Tensor:
     order_idx = torch.tensor(_AWQ_ORDER, dtype=torch.long)
     picked = reshaped.index_select(-1, order_idx)
     shifts = torch.arange(0, 32, 4, dtype=torch.int32).view(
-        *([1] * len(lead)), 1, 8,
+        *([1] * len(lead)),
+        1,
+        8,
     )
     return (picked << shifts).sum(dim=-1).to(torch.int32)
 
@@ -75,9 +78,7 @@ def _make_awq_weight(
     groups = k // group_size
     z_int4 = torch.randint(0, 16, (groups, n), generator=gen, dtype=torch.int32)
     # 让 scales 幅值与 R1 接近（~1e-3），避免过大幅度触发激活 outlier
-    scales_fp32 = (
-        torch.rand((groups, n), generator=gen, dtype=torch.float32) * 5e-3 + 1e-3
-    )
+    scales_fp32 = torch.rand((groups, n), generator=gen, dtype=torch.float32) * 5e-3 + 1e-3
     qweight = _pack_awq_along_n(w_int4)
     qzeros = _pack_awq_along_n(z_int4)
     return qweight, qzeros, scales_fp32.to(scales_dtype)
@@ -92,13 +93,25 @@ def _make_expert(
 ) -> AWQExpertWeights:
     """构造单个 AWQ expert（gate / up / down 三个 Linear）。"""
     gate_qw, gate_qz, gate_s = _make_awq_weight(
-        hidden_size, ffn_hidden, group_size, scales_dtype, seed,
+        hidden_size,
+        ffn_hidden,
+        group_size,
+        scales_dtype,
+        seed,
     )
     up_qw, up_qz, up_s = _make_awq_weight(
-        hidden_size, ffn_hidden, group_size, scales_dtype, seed + 1,
+        hidden_size,
+        ffn_hidden,
+        group_size,
+        scales_dtype,
+        seed + 1,
     )
     down_qw, down_qz, down_s = _make_awq_weight(
-        ffn_hidden, hidden_size, group_size, scales_dtype, seed + 2,
+        ffn_hidden,
+        hidden_size,
+        group_size,
+        scales_dtype,
+        seed + 2,
     )
     return AWQExpertWeights(
         gate_qweight=gate_qw,
@@ -125,9 +138,9 @@ def _random_topk(
     R1 实际运行时的数值范围（top_k=8, renormalize=True）。
     """
     gen = torch.Generator().manual_seed(seed)
-    topk_ids = torch.stack(
-        [torch.randperm(num_experts, generator=gen)[:top_k] for _ in range(num_tokens)]
-    ).to(torch.int64)
+    topk_ids = torch.stack([torch.randperm(num_experts, generator=gen)[:top_k] for _ in range(num_tokens)]).to(
+        torch.int64
+    )
     raw = torch.randn((num_tokens, top_k), generator=gen, dtype=torch.float32)
     topk_weights = torch.softmax(raw, dim=-1)
     return topk_ids, topk_weights
@@ -142,12 +155,8 @@ def _assert_tensor_close(
     cos_sim_threshold: float,
 ) -> None:
     """统一等价性断言：误差 + 余弦相似度 + NaN/Inf 鲁棒性。"""
-    assert actual.shape == ref.shape, (
-        f"shape mismatch: {actual.shape} vs {ref.shape}"
-    )
-    assert actual.dtype == ref.dtype, (
-        f"dtype mismatch: {actual.dtype} vs {ref.dtype}"
-    )
+    assert actual.shape == ref.shape, f"shape mismatch: {actual.shape} vs {ref.shape}"
+    assert actual.dtype == ref.dtype, f"dtype mismatch: {actual.dtype} vs {ref.dtype}"
     for name, t in (("actual", actual), ("ref", ref)):
         n_nan = torch.isnan(t).sum().item()
         n_inf = torch.isinf(t).sum().item()
@@ -166,6 +175,7 @@ def _assert_tensor_close(
 
 
 # ── 1. dequant_awq_to_bf16 的自洽性 ──
+
 
 class TestDequantAwqToBf16:
     """``dequant_awq_to_bf16`` 与 :func:`fused_cpp.w4a8_linear` 的数值一致性。"""
@@ -189,7 +199,11 @@ class TestDequantAwqToBf16:
 
         k, n, group_size = 128, 64, 32
         qweight, qzeros, scales = _make_awq_weight(
-            k, n, group_size, scales_dtype, seed=0,
+            k,
+            n,
+            group_size,
+            scales_dtype,
+            seed=0,
         )
         torch.manual_seed(0)
         # 用小幅激活减少 int8 激活量化截断噪声
@@ -206,6 +220,7 @@ class TestDequantAwqToBf16:
 
 # ── 2. MoE reference vs w4a8 的端到端等价性 ──
 
+
 class TestAwqMoeEquivalence:
     """``awq_moe_expert_ffn_w4a8`` 与 reference 在容差内一致。"""
 
@@ -218,9 +233,9 @@ class TestAwqMoeEquivalence:
         "scenario",
         [
             # (num_tokens, num_experts, top_k, hidden, ffn, group_size)
-            (4, 4, 2, 128, 64, 32),         # 最小矩阵
-            (8, 8, 4, 256, 128, 32),        # 中等
-            (16, 16, 8, 1024, 256, 64),     # 接近 R1 拓扑（num_experts 子采样）
+            (4, 4, 2, 128, 64, 32),  # 最小矩阵
+            (8, 8, 4, 256, 128, 32),  # 中等
+            (16, 16, 8, 1024, 256, 64),  # 接近 R1 拓扑（num_experts 子采样）
         ],
         ids=["tiny", "mid", "r1-ish"],
     )
@@ -233,13 +248,13 @@ class TestAwqMoeEquivalence:
         # Arrange
         num_tokens, num_experts, top_k, h, f_dim, g = scenario
         torch.manual_seed(0)
-        experts = [
-            _make_expert(h, f_dim, g, scales_dtype, seed=e * 7)
-            for e in range(num_experts)
-        ]
+        experts = [_make_expert(h, f_dim, g, scales_dtype, seed=e * 7) for e in range(num_experts)]
         hidden = torch.randn(num_tokens, h, dtype=torch.bfloat16) * 0.1
         topk_ids, topk_w = _random_topk(
-            num_tokens, num_experts, top_k, seed=123,
+            num_tokens,
+            num_experts,
+            top_k,
+            seed=123,
         )
 
         # Act
@@ -251,6 +266,7 @@ class TestAwqMoeEquivalence:
 
 
 # ── 3. 路由退化情形：top_k=1 + weight=1 → 对应 expert 的稠密 FFN ──
+
 
 class TestRoutingDegenerate:
     """路由退化为恒等时，MoE 输出应精确等于对应 expert 的朴素 FFN 输出。"""
@@ -264,15 +280,16 @@ class TestRoutingDegenerate:
         num_experts = 3
         num_tokens = 5
         torch.manual_seed(0)
-        experts = [
-            _make_expert(h, f_dim, g, torch.bfloat16, seed=e * 11)
-            for e in range(num_experts)
-        ]
+        experts = [_make_expert(h, f_dim, g, torch.bfloat16, seed=e * 11) for e in range(num_experts)]
 
         # 每 token 选 expert = token_idx % num_experts
-        topk_ids = torch.arange(num_tokens, dtype=torch.int64).remainder(
-            num_experts,
-        ).unsqueeze(-1)                                             # [T, 1]
+        topk_ids = (
+            torch.arange(num_tokens, dtype=torch.int64)
+            .remainder(
+                num_experts,
+            )
+            .unsqueeze(-1)
+        )  # [T, 1]
         topk_w = torch.ones((num_tokens, 1), dtype=torch.float32)
         hidden = torch.randn(num_tokens, h, dtype=torch.bfloat16) * 0.1
 
@@ -287,11 +304,11 @@ class TestRoutingDegenerate:
             gate_w = dequant_awq_to_bf16(w.gate_qweight, w.gate_qzeros, w.gate_scales)
             up_w = dequant_awq_to_bf16(w.up_qweight, w.up_qzeros, w.up_scales)
             down_w = dequant_awq_to_bf16(w.down_qweight, w.down_qzeros, w.down_scales)
-            x_t = hidden[t:t + 1].float()
+            x_t = hidden[t : t + 1].float()
             gate_out = x_t @ gate_w.float()
             up_out = x_t @ up_w.float()
             inter = F.silu(gate_out) * up_out
-            expected[t:t + 1] = inter @ down_w.float()
+            expected[t : t + 1] = inter @ down_w.float()
         ref = expected.to(torch.bfloat16)
 
         # Assert
@@ -299,6 +316,7 @@ class TestRoutingDegenerate:
 
 
 # ── 4. R1 真实 shape 冒烟 ──
+
 
 def test_r1_real_shape_smoke() -> None:
     """R1 真实 shape 子采样（8 个 expert）下，w4a8 与 reference 在容差内一致。
@@ -314,10 +332,7 @@ def test_r1_real_shape_smoke() -> None:
     h, f_dim, g = 7168, 2048, 64
     num_experts, top_k, num_tokens = 8, 4, 2
     torch.manual_seed(0)
-    experts = [
-        _make_expert(h, f_dim, g, torch.float16, seed=e * 13)
-        for e in range(num_experts)
-    ]
+    experts = [_make_expert(h, f_dim, g, torch.float16, seed=e * 13) for e in range(num_experts)]
     hidden = torch.randn(num_tokens, h, dtype=torch.bfloat16) * 0.05
     topk_ids, topk_w = _random_topk(num_tokens, num_experts, top_k, seed=7)
 

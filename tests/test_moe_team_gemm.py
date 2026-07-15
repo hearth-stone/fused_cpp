@@ -5,6 +5,7 @@ Task 1: the bottom-layer single-thread GEMM (`fused_moe_test_single_thread_gemm`
 must match a reference fp32 matmul across M values, both MoE stage shapes, and
 with/without bias.
 """
+
 from __future__ import annotations
 
 import platform
@@ -28,8 +29,8 @@ def _single_thread_gemm(A, B, bias=None):
 
 # w13: A[M, H] x W13[2F, H]^T -> [M, 2F];  w2: A[M, F] x W2[H, F]^T -> [M, H]
 _SHAPES = {
-    "w13": (256, 512),   # (K=H, N=2F) for H=256, F=256
-    "w2": (256, 256),    # (K=F, N=H)
+    "w13": (256, 512),  # (K=H, N=2F) for H=256, F=256
+    "w2": (256, 256),  # (K=F, N=H)
 }
 _M_VALUES = [1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 32, 64, 100, 128]
 
@@ -215,17 +216,13 @@ def test_hierarchical_matches_default(monkeypatch, num_threads):
     inp, packed, topk_w, topk_i = _build_moe_case()
 
     monkeypatch.delenv("FUSED_CPP_MOE_HIERARCHICAL_N_SPLIT", raising=False)
-    out_default = fused_moe_bf16_tiled(
-        inp, packed, topk_w, topk_i, num_threads=num_threads, activation="silu"
-    )
+    out_default = fused_moe_bf16_tiled(inp, packed, topk_w, topk_i, num_threads=num_threads, activation="silu")
 
     # 1 partition, 1 group -> group_size == num_threads (cooperative team GEMM).
     monkeypatch.setenv("FUSED_CPP_MOE_HIERARCHICAL_N_SPLIT", "1")
     monkeypatch.setenv("FUSED_CPP_MOE_N_SPLIT_CORE_BASES", "0")
     monkeypatch.setenv("FUSED_CPP_MOE_N_SPLIT_GROUPS_PER_PARTITION", "1")
-    out_hier = fused_moe_bf16_tiled(
-        inp, packed, topk_w, topk_i, num_threads=num_threads, activation="silu"
-    )
+    out_hier = fused_moe_bf16_tiled(inp, packed, topk_w, topk_i, num_threads=num_threads, activation="silu")
 
     torch.testing.assert_close(out_hier, out_default, atol=2e-2, rtol=2e-2)
 
@@ -238,17 +235,13 @@ def test_hierarchical_multi_group(monkeypatch, num_threads):
     inp, packed, topk_w, topk_i = _build_moe_case(seed=1)
 
     monkeypatch.delenv("FUSED_CPP_MOE_HIERARCHICAL_N_SPLIT", raising=False)
-    out_default = fused_moe_bf16_tiled(
-        inp, packed, topk_w, topk_i, num_threads=num_threads, activation="silu"
-    )
+    out_default = fused_moe_bf16_tiled(inp, packed, topk_w, topk_i, num_threads=num_threads, activation="silu")
 
     # groups == num_threads -> group_size == 1 (degenerate teams, still routed).
     monkeypatch.setenv("FUSED_CPP_MOE_HIERARCHICAL_N_SPLIT", "1")
     monkeypatch.setenv("FUSED_CPP_MOE_N_SPLIT_CORE_BASES", "0")
     monkeypatch.setenv("FUSED_CPP_MOE_N_SPLIT_GROUPS_PER_PARTITION", str(num_threads))
-    out_hier = fused_moe_bf16_tiled(
-        inp, packed, topk_w, topk_i, num_threads=num_threads, activation="silu"
-    )
+    out_hier = fused_moe_bf16_tiled(inp, packed, topk_w, topk_i, num_threads=num_threads, activation="silu")
 
     torch.testing.assert_close(out_hier, out_default, atol=2e-2, rtol=2e-2)
 
@@ -263,9 +256,7 @@ def test_async_matches_default(num_threads):
     from fused_cpp.moe import fused_moe_bf16_tiled, fused_moe_bf16_tiled_async
 
     inp, packed, topk_w, topk_i = _build_moe_case(seed=2)
-    out_default = fused_moe_bf16_tiled(
-        inp, packed, topk_w, topk_i, num_threads=num_threads, activation="silu"
-    )
+    out_default = fused_moe_bf16_tiled(inp, packed, topk_w, topk_i, num_threads=num_threads, activation="silu")
 
     active = torch.unique(topk_i.reshape(-1)).to(torch.int32).tolist()
     n = len(active)
@@ -282,8 +273,8 @@ def test_async_matches_default(num_threads):
         topk_w,
         topk_i,
         torch.tensor(active, dtype=torch.int32),
-        torch.zeros(n, dtype=torch.int32),                     # task_core_begins
-        torch.full((n,), num_threads, dtype=torch.int32),      # task_threads
+        torch.zeros(n, dtype=torch.int32),  # task_core_begins
+        torch.full((n,), num_threads, dtype=torch.int32),  # task_threads
         torch.tensor(dep_offsets, dtype=torch.int32),
         torch.tensor(deps, dtype=torch.int32),
         num_threads=num_threads,

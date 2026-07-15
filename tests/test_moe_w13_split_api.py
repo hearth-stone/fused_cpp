@@ -52,35 +52,27 @@ def test_async_w13_split_is_forwarded_as_tristate(monkeypatch) -> None:
 
 
 @pytest.mark.skipif(
-    platform.machine() not in ("aarch64", "arm64")
-    or not bf16_tiled._HAS_BF16_TILED_FUSED_MOE,
+    platform.machine() not in ("aarch64", "arm64") or not bf16_tiled._HAS_BF16_TILED_FUSED_MOE,
     reason="requires the AArch64 BF16 MoE extension",
 )
 def test_async_explicit_w13_split_overrides_environment(monkeypatch) -> None:
     generator = torch.Generator().manual_seed(20260711)
     hidden_size, intermediate_size, experts = 64, 32, 2
-    w13 = torch.empty(
-        (experts, 2 * intermediate_size, hidden_size), dtype=torch.bfloat16
-    ).normal_(0.0, 0.01, generator=generator)
-    w2 = torch.empty(
-        (experts, hidden_size, intermediate_size), dtype=torch.bfloat16
-    ).normal_(0.0, 0.01, generator=generator)
-    packed = bf16_tiled.prepare_fused_moe_bf16_tiled_weights(
-        w13, w2, fuse_silu=True
+    w13 = torch.empty((experts, 2 * intermediate_size, hidden_size), dtype=torch.bfloat16).normal_(
+        0.0, 0.01, generator=generator
     )
+    w2 = torch.empty((experts, hidden_size, intermediate_size), dtype=torch.bfloat16).normal_(
+        0.0, 0.01, generator=generator
+    )
+    packed = bf16_tiled.prepare_fused_moe_bf16_tiled_weights(w13, w2, fuse_silu=True)
     if packed.gemm_backend != 1:
         pytest.skip("requires the SVE backend")
 
     routes = (12, 24)
     tokens = sum(routes)
-    hidden = torch.empty((tokens, hidden_size), dtype=torch.bfloat16).normal_(
-        0.0, 0.01, generator=generator
-    )
+    hidden = torch.empty((tokens, hidden_size), dtype=torch.bfloat16).normal_(0.0, 0.01, generator=generator)
     topk_ids = torch.cat(
-        [
-            torch.full((count,), expert, dtype=torch.int32)
-            for expert, count in enumerate(routes)
-        ]
+        [torch.full((count,), expert, dtype=torch.int32) for expert, count in enumerate(routes)]
     ).reshape(tokens, 1)
     topk_weights = torch.ones((tokens, 1), dtype=torch.float32)
     task_experts = torch.arange(experts, dtype=torch.int32)

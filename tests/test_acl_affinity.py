@@ -4,6 +4,7 @@
 测试 set_acl_affinity / get_acl_affinity 的设置与查询一致性，
 无效核心范围的处理，以及核心绑定变更后 GEMM 仍能正常执行。
 """
+
 import os
 import platform
 import sys
@@ -16,6 +17,7 @@ _is_linux = sys.platform.startswith("linux")
 
 try:
     import fused_cpp
+
     _acl_available = fused_cpp._supports_acl
 except ImportError:
     _acl_available = False

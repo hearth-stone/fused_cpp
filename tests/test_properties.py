@@ -3,6 +3,7 @@
 
 Each test validates a correctness property from the design document.
 """
+
 from __future__ import annotations
 
 import glob
@@ -17,16 +18,16 @@ from hypothesis import strategies as st
 
 from fused_cpp.mla.impl import (
     CPUFusedMLAImpl,
-    _pytorch_rms_norm,
-    _pytorch_apply_rope,
-    _pytorch_write_kv_cache,
-    _pytorch_gather_kv_cache,
-    _pytorch_merge_attn_states,
-    _pytorch_concat_k_nope_k_pe,
+    _pytorch_apply_rope as _impl_pytorch_apply_rope,
+    _pytorch_gather_kv_cache as _impl_pytorch_gather_kv_cache,
+    _pytorch_merge_attn_states as _impl_pytorch_merge_attn_states,
+    _pytorch_rms_norm as _impl_pytorch_rms_norm,
+    _pytorch_write_kv_cache as _impl_pytorch_write_kv_cache,
 )
 
 
 # ── Hypothesis strategies ────────────────────────────────────────────────────
+
 
 @st.composite
 def rms_norm_inputs(draw):
@@ -140,9 +141,7 @@ class TestProperty1NoVllmImports:
     def test_no_vllm_imports(self, data):
         """Scan all .py files in fused_cpp/ for absence of
         vllm imports."""
-        package_dir = os.path.join(
-            os.path.dirname(__file__), os.pardir, "src", "fused_cpp"
-        )
+        package_dir = os.path.join(os.path.dirname(__file__), os.pardir, "src", "fused_cpp")
         package_dir = os.path.normpath(package_dir)
         py_files = glob.glob(os.path.join(package_dir, "**", "*.py"), recursive=True)
         # Filter out __pycache__
@@ -161,12 +160,8 @@ class TestProperty1NoVllmImports:
             # Skip comments
             if stripped.startswith("#"):
                 continue
-            assert "import vllm" not in stripped, (
-                f"Found vllm import in {filepath}: {stripped}"
-            )
-            assert "from vllm" not in stripped, (
-                f"Found vllm from-import in {filepath}: {stripped}"
-            )
+            assert "import vllm" not in stripped, f"Found vllm import in {filepath}: {stripped}"
+            assert "from vllm" not in stripped, f"Found vllm from-import in {filepath}: {stripped}"
 
 
 # ── Property 2: RMSNorm output has unit RMS ──────────────────────────────────
@@ -184,13 +179,11 @@ class TestProperty2RMSNormUnitRMS:
     @given(inputs=rms_norm_inputs())
     def test_rms_norm_unit_rms(self, inputs):
         x, weight, eps = inputs
-        result = _pytorch_rms_norm(x, weight, eps)
+        result = _impl_pytorch_rms_norm(x, weight, eps)
 
         # RMS of each row should be ≈ 1.0
         rms = result.float().pow(2).mean(dim=-1).sqrt()
-        assert torch.allclose(rms, torch.ones_like(rms), atol=1e-4), (
-            f"RMS not approximately 1.0: {rms}"
-        )
+        assert torch.allclose(rms, torch.ones_like(rms), atol=1e-4), f"RMS not approximately 1.0: {rms}"
         # Output dtype should match input dtype
         assert result.dtype == x.dtype
 
@@ -211,9 +204,7 @@ class TestProperty3RoPEPreservesNorm:
     def test_rope_preserves_norm(self, inputs):
         x, cos_sin_cache, positions, is_neox_style = inputs
 
-        result = _pytorch_apply_rope(
-            x, cos_sin_cache, positions, is_neox_style
-        )
+        result = _impl_pytorch_apply_rope(x, cos_sin_cache, positions, is_neox_style)
 
         # L2 norm per token per head
         input_norms = torch.norm(x.float(), dim=-1)
@@ -252,20 +243,16 @@ class TestProperty4KVCacheRoundTrip:
         kv_cache = torch.zeros(num_blocks, block_size, head_size)
 
         # Write
-        _pytorch_write_kv_cache(kv_c, k_pe, kv_cache, slot_mapping)
+        _impl_pytorch_write_kv_cache(kv_c, k_pe, kv_cache, slot_mapping)
 
         # Build block_table for gathering: sequential block indices
         block_table = torch.arange(num_blocks, dtype=torch.long)
 
         # Gather
-        gathered = _pytorch_gather_kv_cache(
-            kv_cache, block_table, num_tokens, block_size
-        )
+        gathered = _impl_pytorch_gather_kv_cache(kv_cache, block_table, num_tokens, block_size)
 
         expected = torch.cat([kv_c, k_pe], dim=-1)
-        assert torch.equal(gathered, expected), (
-            f"Round trip mismatch:\ngathered={gathered}\nexpected={expected}"
-        )
+        assert torch.equal(gathered, expected), f"Round trip mismatch:\ngathered={gathered}\nexpected={expected}"
 
 
 # ── Property 5: LSE merge with zero-contribution is identity ──────────────────
@@ -289,7 +276,7 @@ class TestProperty5LSEMergeIdentity:
         zero_output = torch.zeros_like(output)
         neg_inf_lse = torch.full_like(lse, float("-inf"))
 
-        merged = _pytorch_merge_attn_states(
+        merged = _impl_pytorch_merge_attn_states(
             prefix_output=output,
             prefix_lse=lse,
             suffix_output=zero_output,
@@ -297,8 +284,7 @@ class TestProperty5LSEMergeIdentity:
         )
 
         assert torch.allclose(merged.float(), output.float(), atol=1e-5), (
-            f"Merge with zero-contribution should be identity.\n"
-            f"merged={merged}\noriginal={output}"
+            f"Merge with zero-contribution should be identity.\nmerged={merged}\noriginal={output}"
         )
 
 
@@ -340,7 +326,9 @@ class TestProperty7CausalAttentionMasking:
 
         # Full causal attention
         out_full = impl._varlen_attention(
-            q=q, k=k, v=v,
+            q=q,
+            k=k,
+            v=v,
             cu_seqlens_q=cu_seqlens,
             cu_seqlens_k=cu_seqlens,
             max_seqlen_q=seq_len,
@@ -356,11 +344,13 @@ class TestProperty7CausalAttentionMasking:
             v_masked = v.clone()
             # Zero out positions > i
             if i + 1 < seq_len:
-                k_masked[i + 1:] = 0.0
-                v_masked[i + 1:] = 0.0
+                k_masked[i + 1 :] = 0.0
+                v_masked[i + 1 :] = 0.0
 
             out_masked = impl._varlen_attention(
-                q=q, k=k_masked, v=v_masked,
+                q=q,
+                k=k_masked,
+                v=v_masked,
                 cu_seqlens_q=cu_seqlens,
                 cu_seqlens_k=cu_seqlens,
                 max_seqlen_q=seq_len,
@@ -369,15 +359,13 @@ class TestProperty7CausalAttentionMasking:
                 return_softmax_lse=False,
             )
 
-            assert torch.allclose(
-                out_full[i].float(), out_masked[i].float(), atol=1e-5
-            ), (
-                f"Causal masking violated at position {i}.\n"
-                f"full={out_full[i]}\nmasked={out_masked[i]}"
+            assert torch.allclose(out_full[i].float(), out_masked[i].float(), atol=1e-5), (
+                f"Causal masking violated at position {i}.\nfull={out_full[i]}\nmasked={out_masked[i]}"
             )
 
 
 # ── Hypothesis strategy for absorption matrices ──────────────────────────────
+
 
 @st.composite
 def absorption_inputs(draw):
@@ -401,6 +389,7 @@ def absorption_inputs(draw):
 # Import C++ extension (skip tests if unavailable)
 try:
     from fused_cpp import _C
+
     _HAS_CPP = True
 except ImportError:
     _C = None
@@ -430,13 +419,9 @@ class TestProperty2RMSNormUnitRMSCpp:
 
         # With weight=ones, per-row RMS should be ≈ 1.0
         rms = result.float().pow(2).mean(dim=-1).sqrt()
-        assert torch.allclose(rms, torch.ones_like(rms), atol=1e-4), (
-            f"C++ RMS not approximately 1.0: {rms}"
-        )
+        assert torch.allclose(rms, torch.ones_like(rms), atol=1e-4), f"C++ RMS not approximately 1.0: {rms}"
         # Output dtype must match input dtype
-        assert result.dtype == x.dtype, (
-            f"dtype mismatch: expected {x.dtype}, got {result.dtype}"
-        )
+        assert result.dtype == x.dtype, f"dtype mismatch: expected {x.dtype}, got {result.dtype}"
 
 
 # ── Property 3 (C++): RoPE preserves vector norm ─────────────────────────────
@@ -486,17 +471,19 @@ class TestProperty8AbsorptionMatricesShapeCpp:
         kv_b_proj_weight, num_heads, qk_nope_head_dim, v_head_dim, kv_lora_rank = inputs
 
         W_UK_T, W_UV = _C.build_absorption_matrices(
-            kv_b_proj_weight, num_heads, qk_nope_head_dim,
-            v_head_dim, kv_lora_rank, torch.float32,
+            kv_b_proj_weight,
+            num_heads,
+            qk_nope_head_dim,
+            v_head_dim,
+            kv_lora_rank,
+            torch.float32,
         )
 
         assert W_UK_T.shape == (num_heads, qk_nope_head_dim, kv_lora_rank), (
-            f"W_UK_T shape mismatch: expected {(num_heads, qk_nope_head_dim, kv_lora_rank)}, "
-            f"got {tuple(W_UK_T.shape)}"
+            f"W_UK_T shape mismatch: expected {(num_heads, qk_nope_head_dim, kv_lora_rank)}, got {tuple(W_UK_T.shape)}"
         )
         assert W_UV.shape == (num_heads, kv_lora_rank, v_head_dim), (
-            f"W_UV shape mismatch: expected {(num_heads, kv_lora_rank, v_head_dim)}, "
-            f"got {tuple(W_UV.shape)}"
+            f"W_UV shape mismatch: expected {(num_heads, kv_lora_rank, v_head_dim)}, got {tuple(W_UV.shape)}"
         )
         assert W_UK_T.is_contiguous(), "W_UK_T is not contiguous"
         assert W_UV.is_contiguous(), "W_UV is not contiguous"
@@ -542,9 +529,7 @@ class TestProperty4KVCacheRoundTripCpp:
         gathered = _C.gather_kv_cache(kv_cache, block_table, num_tokens, block_size)
 
         expected = torch.cat([kv_c, k_pe], dim=-1)
-        assert torch.equal(gathered, expected), (
-            f"C++ round trip mismatch:\ngathered={gathered}\nexpected={expected}"
-        )
+        assert torch.equal(gathered, expected), f"C++ round trip mismatch:\ngathered={gathered}\nexpected={expected}"
 
 
 # ── Property 6 (C++): LSE merge with zero-contribution is identity ────────────
@@ -578,8 +563,7 @@ class TestProperty6LSEMergeIdentityCpp:
         )
 
         assert torch.allclose(merged.float(), output.float(), atol=1e-5), (
-            f"C++ merge with zero-contribution should be identity.\n"
-            f"merged={merged}\noriginal={output}"
+            f"C++ merge with zero-contribution should be identity.\nmerged={merged}\noriginal={output}"
         )
 
 
@@ -608,10 +592,16 @@ class TestProperty5CausalAttentionMaskingCpp:
 
         # Full causal attention via C++ kernel
         out_full = _C.varlen_attention(
-            q, k, v,
-            cu_seqlens, cu_seqlens,
-            seq_len, seq_len,
-            scale, True, False,
+            q,
+            k,
+            v,
+            cu_seqlens,
+            cu_seqlens,
+            seq_len,
+            seq_len,
+            scale,
+            True,
+            False,
         )
 
         # For each position i, zero out future K/V (positions > i)
@@ -620,21 +610,24 @@ class TestProperty5CausalAttentionMaskingCpp:
             k_masked = k.clone()
             v_masked = v.clone()
             if i + 1 < seq_len:
-                k_masked[i + 1:] = 0.0
-                v_masked[i + 1:] = 0.0
+                k_masked[i + 1 :] = 0.0
+                v_masked[i + 1 :] = 0.0
 
             out_masked = _C.varlen_attention(
-                q, k_masked, v_masked,
-                cu_seqlens, cu_seqlens,
-                seq_len, seq_len,
-                scale, True, False,
+                q,
+                k_masked,
+                v_masked,
+                cu_seqlens,
+                cu_seqlens,
+                seq_len,
+                seq_len,
+                scale,
+                True,
+                False,
             )
 
-            assert torch.allclose(
-                out_full[i].float(), out_masked[i].float(), atol=1e-5
-            ), (
-                f"C++ causal masking violated at position {i}.\n"
-                f"full={out_full[i]}\nmasked={out_masked[i]}"
+            assert torch.allclose(out_full[i].float(), out_masked[i].float(), atol=1e-5), (
+                f"C++ causal masking violated at position {i}.\nfull={out_full[i]}\nmasked={out_masked[i]}"
             )
 
 
@@ -642,26 +635,97 @@ class TestProperty5CausalAttentionMaskingCpp:
 # Feature: cpp-kernel-migration, Property 1: C++ source code constraints
 
 # Standard C++ headers that are allowed in #include <...> directives
-_ALLOWED_STD_HEADERS = frozenset({
-    "algorithm", "any", "array", "atomic", "bitset",
-    "cassert", "ccomplex", "cctype", "cerrno", "cfenv", "cfloat",
-    "charconv", "chrono", "cinttypes", "climits", "clocale",
-    "cmath", "codecvt", "complex", "condition_variable", "csetjmp",
-    "csignal", "cstdarg", "cstddef", "cstdint", "cstdio", "cstdlib",
-    "cstring", "ctime", "cuchar", "cwchar", "cwctype",
-    "deque", "exception", "execution", "filesystem", "format",
-    "forward_list", "fstream", "functional", "future",
-    "initializer_list", "iomanip", "ios", "iosfwd", "iostream",
-    "istream", "iterator", "limits", "list", "locale",
-    "map", "memory", "memory_resource", "mutex",
-    "new", "numeric", "optional", "ostream",
-    "queue", "random", "ranges", "ratio", "regex",
-    "scoped_allocator", "set", "shared_mutex", "span", "sstream",
-    "stack", "stdexcept", "streambuf", "string", "string_view",
-    "system_error", "thread", "tuple", "type_traits", "typeindex",
-    "typeinfo", "unordered_map", "unordered_set", "utility",
-    "valarray", "variant", "vector", "version",
-})
+_ALLOWED_STD_HEADERS = frozenset(
+    {
+        "algorithm",
+        "any",
+        "array",
+        "atomic",
+        "bitset",
+        "cassert",
+        "ccomplex",
+        "cctype",
+        "cerrno",
+        "cfenv",
+        "cfloat",
+        "charconv",
+        "chrono",
+        "cinttypes",
+        "climits",
+        "clocale",
+        "cmath",
+        "codecvt",
+        "complex",
+        "condition_variable",
+        "csetjmp",
+        "csignal",
+        "cstdarg",
+        "cstddef",
+        "cstdint",
+        "cstdio",
+        "cstdlib",
+        "cstring",
+        "ctime",
+        "cuchar",
+        "cwchar",
+        "cwctype",
+        "deque",
+        "exception",
+        "execution",
+        "filesystem",
+        "format",
+        "forward_list",
+        "fstream",
+        "functional",
+        "future",
+        "initializer_list",
+        "iomanip",
+        "ios",
+        "iosfwd",
+        "iostream",
+        "istream",
+        "iterator",
+        "limits",
+        "list",
+        "locale",
+        "map",
+        "memory",
+        "memory_resource",
+        "mutex",
+        "new",
+        "numeric",
+        "optional",
+        "ostream",
+        "queue",
+        "random",
+        "ranges",
+        "ratio",
+        "regex",
+        "scoped_allocator",
+        "set",
+        "shared_mutex",
+        "span",
+        "sstream",
+        "stack",
+        "stdexcept",
+        "streambuf",
+        "string",
+        "string_view",
+        "system_error",
+        "thread",
+        "tuple",
+        "type_traits",
+        "typeindex",
+        "typeinfo",
+        "unordered_map",
+        "unordered_set",
+        "utility",
+        "valarray",
+        "variant",
+        "vector",
+        "version",
+    }
+)
 
 
 def _is_allowed_include(include_path: str) -> bool:
@@ -717,9 +781,7 @@ class TestProperty1CppSourceConstraints:
         definitions."""
         import re
 
-        csrc_dir = os.path.join(
-            os.path.dirname(__file__), os.pardir, "csrc"
-        )
+        csrc_dir = os.path.join(os.path.dirname(__file__), os.pardir, "csrc")
         csrc_dir = os.path.normpath(csrc_dir)
         cpp_files = glob.glob(os.path.join(csrc_dir, "**", "*.cpp"), recursive=True)
         assume(len(cpp_files) > 0)
@@ -745,33 +807,25 @@ class TestProperty1CppSourceConstraints:
             if include_match:
                 include_path = include_match.group(1)
                 assert _is_allowed_include(include_path), (
-                    f"Disallowed third-party include in {filename}:{line_no}: "
-                    f"{stripped}"
+                    f"Disallowed third-party include in {filename}:{line_no}: {stripped}"
                 )
 
             # Check for torch::autograd usage
-            assert "torch::autograd" not in stripped, (
-                f"Found torch::autograd usage in {filename}:{line_no}: "
-                f"{stripped}"
-            )
+            assert "torch::autograd" not in stripped, f"Found torch::autograd usage in {filename}:{line_no}: {stripped}"
 
             # Check for backward function definitions
-            backward_match = re.search(
-                r'\b(backward)\s*\(', stripped
-            )
+            backward_match = re.search(r"\b(backward)\s*\(", stripped)
             if backward_match:
                 # Allow comments mentioning backward, only flag definitions
                 # A definition would look like: type backward(...) or
                 # something backward(...)
                 # Exclude if it's inside a string or comment
                 if not stripped.startswith("//") and not stripped.startswith("/*"):
-                    assert False, (
-                        f"Found backward function definition in "
-                        f"{filename}:{line_no}: {stripped}"
-                    )
+                    assert False, f"Found backward function definition in {filename}:{line_no}: {stripped}"
 
 
 # ── Hypothesis strategies for Property 7 ──────────────────────────────────────
+
 
 @st.composite
 def rms_norm_inputs_with_weight(draw):
@@ -834,8 +888,7 @@ def forward_decode_inputs(draw):
     block_size = draw(st.integers(min_value=1, max_value=4))
 
     # Each sequence has some length
-    seq_lens_list = [draw(st.integers(min_value=1, max_value=6))
-                     for _ in range(batch_size)]
+    seq_lens_list = [draw(st.integers(min_value=1, max_value=6)) for _ in range(batch_size)]
     max_seq_len = max(seq_lens_list)
     max_blocks_per_seq = (max_seq_len + block_size - 1) // block_size
 
@@ -857,11 +910,11 @@ def forward_decode_inputs(draw):
         block_offset += n_blocks
 
     scale = 1.0 / math.sqrt(kv_lora_rank + qk_rope_head_dim)
-    return (q_nope_proj, q_pe, kv_cache, block_table, seq_lens,
-            scale, kv_lora_rank, qk_rope_head_dim)
+    return (q_nope_proj, q_pe, kv_cache, block_table, seq_lens, scale, kv_lora_rank, qk_rope_head_dim)
 
 
 # ── Pure PyTorch reference implementations (no C++ dispatch) ──────────────────
+
 
 def _pytorch_rms_norm(x, weight, eps):
     """Pure PyTorch RMSNorm (no C++ dispatch)."""
@@ -907,24 +960,23 @@ def _pytorch_write_kv_cache(kv_c, k_pe, kv_cache, slot_mapping):
 def _pytorch_gather_kv_cache(kv_cache, block_table, seq_len, block_size):
     """Pure PyTorch gather_kv_cache (no C++ dispatch)."""
     head_size = kv_cache.shape[2]
-    gathered = torch.empty(seq_len, head_size, dtype=kv_cache.dtype,
-                           device=kv_cache.device)
+    gathered = torch.empty(seq_len, head_size, dtype=kv_cache.dtype, device=kv_cache.device)
     num_full_blocks = seq_len // block_size
     remainder = seq_len % block_size
     for block_idx in range(num_full_blocks):
         block_num = int(block_table[block_idx].item())
         start = block_idx * block_size
-        gathered[start:start + block_size] = kv_cache[block_num]
+        gathered[start : start + block_size] = kv_cache[block_num]
     if remainder > 0:
         block_num = int(block_table[num_full_blocks].item())
         start = num_full_blocks * block_size
-        gathered[start:start + remainder] = kv_cache[block_num, :remainder]
+        gathered[start : start + remainder] = kv_cache[block_num, :remainder]
     return gathered
 
 
-def _pytorch_varlen_attention(q, k, v, cu_seqlens_q, cu_seqlens_k,
-                              max_seqlen_q, max_seqlen_k, scale,
-                              causal, return_softmax_lse):
+def _pytorch_varlen_attention(
+    q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, scale, causal, return_softmax_lse
+):
     """Pure PyTorch varlen_attention (no C++ dispatch)."""
     batch_size = cu_seqlens_q.shape[0] - 1
     total_q_tokens = q.shape[0]
@@ -932,11 +984,12 @@ def _pytorch_varlen_attention(q, k, v, cu_seqlens_q, cu_seqlens_k,
     v_head_dim = v.shape[2]
     qk_head_dim = q.shape[2]
 
-    output = torch.zeros(total_q_tokens, num_heads, v_head_dim,
-                         dtype=q.dtype, device=q.device)
-    lse = (torch.full((num_heads, total_q_tokens), float("-inf"),
-                      dtype=torch.float32, device=q.device)
-           if return_softmax_lse else None)
+    output = torch.zeros(total_q_tokens, num_heads, v_head_dim, dtype=q.dtype, device=q.device)
+    lse = (
+        torch.full((num_heads, total_q_tokens), float("-inf"), dtype=torch.float32, device=q.device)
+        if return_softmax_lse
+        else None
+    )
 
     cu_q_cpu = cu_seqlens_q.cpu().numpy()
     cu_k_cpu = cu_seqlens_k.cpu().numpy()
@@ -959,16 +1012,15 @@ def _pytorch_varlen_attention(q, k, v, cu_seqlens_q, cu_seqlens_k,
                 q_idx = torch.arange(seq_q, device=q.device).unsqueeze(1)
                 k_idx = torch.arange(seq_k, device=q.device).unsqueeze(0)
                 causal_mask = q_idx >= k_idx
-                attn_scores = attn_scores.masked_fill(
-                    ~causal_mask.unsqueeze(0).unsqueeze(0), float("-inf"))
+                attn_scores = attn_scores.masked_fill(~causal_mask.unsqueeze(0).unsqueeze(0), float("-inf"))
             lse_i = torch.logsumexp(attn_scores, dim=-1)
             lse[:, q_start:q_end] = lse_i.squeeze(0)
             attn_weights = torch.softmax(attn_scores, dim=-1)
             output_i = torch.matmul(attn_weights, v_i)
         else:
             output_i = F.scaled_dot_product_attention(
-                q_i, k_i, v_i, attn_mask=None, dropout_p=0.0,
-                is_causal=causal, scale=scale)
+                q_i, k_i, v_i, attn_mask=None, dropout_p=0.0, is_causal=causal, scale=scale
+            )
         output[q_start:q_end] = output_i[0, :, :, :v_head_dim].transpose(0, 1)
 
     if return_softmax_lse:
@@ -976,8 +1028,7 @@ def _pytorch_varlen_attention(q, k, v, cu_seqlens_q, cu_seqlens_k,
     return output
 
 
-def _pytorch_merge_attn_states(prefix_output, prefix_lse,
-                               suffix_output, suffix_lse):
+def _pytorch_merge_attn_states(prefix_output, prefix_lse, suffix_output, suffix_lse):
     """Pure PyTorch merge_attn_states (no C++ dispatch)."""
     p_lse = prefix_lse.transpose(0, 1).unsqueeze(-1).float()
     s_lse = suffix_lse.transpose(0, 1).unsqueeze(-1).float()
@@ -987,8 +1038,7 @@ def _pytorch_merge_attn_states(prefix_output, prefix_lse,
     out_se = p_se + s_se
     p_scale = p_se / out_se
     s_scale = s_se / out_se
-    merged = (p_scale * prefix_output.float()
-              + s_scale * suffix_output.float()).to(prefix_output.dtype)
+    merged = (p_scale * prefix_output.float() + s_scale * suffix_output.float()).to(prefix_output.dtype)
     return merged
 
 
@@ -998,39 +1048,31 @@ def _pytorch_concat_k_nope_k_pe(k_nope, k_pe):
     return torch.cat([k_nope, k_pe_expanded], dim=-1)
 
 
-def _pytorch_build_absorption_matrices(kv_b_proj_weight, num_heads,
-                                       qk_nope_head_dim, v_head_dim,
-                                       kv_lora_rank, dtype):
+def _pytorch_build_absorption_matrices(kv_b_proj_weight, num_heads, qk_nope_head_dim, v_head_dim, kv_lora_rank, dtype):
     """Pure PyTorch build_absorption_matrices (no C++ dispatch)."""
     kv_b_proj_weight_t = kv_b_proj_weight.to(dtype).T
-    kv_b_proj_weight_t = kv_b_proj_weight_t.view(
-        kv_lora_rank, num_heads, qk_nope_head_dim + v_head_dim)
-    w_uk, w_uv = kv_b_proj_weight_t.split(
-        [qk_nope_head_dim, v_head_dim], dim=-1)
+    kv_b_proj_weight_t = kv_b_proj_weight_t.view(kv_lora_rank, num_heads, qk_nope_head_dim + v_head_dim)
+    w_uk, w_uv = kv_b_proj_weight_t.split([qk_nope_head_dim, v_head_dim], dim=-1)
     W_UK_T = w_uk.permute(1, 2, 0).contiguous()
     W_UV = w_uv.transpose(0, 1).contiguous()
     return W_UK_T, W_UV
 
 
-def _pytorch_forward_decode(q_nope_proj, q_pe, kv_cache, block_table,
-                            seq_lens, scale, kv_lora_rank, qk_rope_head_dim):
+def _pytorch_forward_decode(q_nope_proj, q_pe, kv_cache, block_table, seq_lens, scale, kv_lora_rank, qk_rope_head_dim):
     """Pure PyTorch forward_decode (no C++ dispatch)."""
     batch_size = q_nope_proj.shape[0]
     num_heads = q_nope_proj.shape[1]
     block_size = kv_cache.shape[1]
-    output = torch.zeros(batch_size, num_heads, kv_lora_rank,
-                         dtype=q_nope_proj.dtype, device=q_nope_proj.device)
+    output = torch.zeros(batch_size, num_heads, kv_lora_rank, dtype=q_nope_proj.dtype, device=q_nope_proj.device)
     seq_lens_cpu = seq_lens.cpu()
     for b in range(batch_size):
         seq_len = int(seq_lens_cpu[b].item())
         if seq_len == 0:
             continue
-        gathered_kv = _pytorch_gather_kv_cache(
-            kv_cache, block_table[b], seq_len, block_size)
+        gathered_kv = _pytorch_gather_kv_cache(kv_cache, block_table[b], seq_len, block_size)
         kv_c = gathered_kv[:, :kv_lora_rank]
         k_pe_seq = gathered_kv[:, kv_lora_rank:]
-        attn_scores = (torch.matmul(q_nope_proj[b], kv_c.T)
-                       + torch.matmul(q_pe[b], k_pe_seq.T)) * scale
+        attn_scores = (torch.matmul(q_nope_proj[b], kv_c.T) + torch.matmul(q_pe[b], k_pe_seq.T)) * scale
         attn_weights = F.softmax(attn_scores, dim=-1)
         output[b] = torch.matmul(attn_weights, kv_c)
     return output
@@ -1059,7 +1101,7 @@ class TestProperty7CppPytorchEquivalence:
         cpp_result = _C.rms_norm(x, weight, eps)
         py_result = _pytorch_rms_norm(x, weight, eps)
         assert torch.allclose(cpp_result, py_result, atol=1e-5), (
-            f"rms_norm mismatch: max diff={( cpp_result - py_result).abs().max()}"
+            f"rms_norm mismatch: max diff={(cpp_result - py_result).abs().max()}"
         )
 
     @settings(max_examples=100)
@@ -1087,14 +1129,12 @@ class TestProperty7CppPytorchEquivalence:
         kv_cache_cpp = torch.zeros(num_blocks, block_size, head_size)
         _C.write_kv_cache(kv_c, k_pe, kv_cache_cpp, slot_mapping)
         block_table = torch.arange(num_blocks, dtype=torch.long)
-        cpp_result = _C.gather_kv_cache(kv_cache_cpp, block_table,
-                                        num_tokens, block_size)
+        cpp_result = _C.gather_kv_cache(kv_cache_cpp, block_table, num_tokens, block_size)
 
         # PyTorch path
         kv_cache_py = torch.zeros(num_blocks, block_size, head_size)
         _pytorch_write_kv_cache(kv_c, k_pe, kv_cache_py, slot_mapping)
-        py_result = _pytorch_gather_kv_cache(kv_cache_py, block_table,
-                                             num_tokens, block_size)
+        py_result = _pytorch_gather_kv_cache(kv_cache_py, block_table, num_tokens, block_size)
 
         assert torch.allclose(cpp_result, py_result, atol=1e-5), (
             f"kv_cache mismatch: max diff={(cpp_result - py_result).abs().max()}"
@@ -1131,12 +1171,8 @@ class TestProperty7CppPytorchEquivalence:
         scale = 1.0 / math.sqrt(head_dim)
         cu_seqlens = torch.tensor([0, seq_len], dtype=torch.int32)
 
-        cpp_result = _C.varlen_attention(
-            q, k, v, cu_seqlens, cu_seqlens,
-            seq_len, seq_len, scale, True, False)
-        py_result = _pytorch_varlen_attention(
-            q, k, v, cu_seqlens, cu_seqlens,
-            seq_len, seq_len, scale, True, False)
+        cpp_result = _C.varlen_attention(q, k, v, cu_seqlens, cu_seqlens, seq_len, seq_len, scale, True, False)
+        py_result = _pytorch_varlen_attention(q, k, v, cu_seqlens, cu_seqlens, seq_len, seq_len, scale, True, False)
 
         assert torch.allclose(cpp_result, py_result, atol=1e-5), (
             f"varlen_attention mismatch: max diff={(cpp_result - py_result).abs().max()}"
@@ -1146,15 +1182,14 @@ class TestProperty7CppPytorchEquivalence:
     @given(inputs=forward_decode_inputs())
     def test_forward_decode_equivalence(self, inputs):
         """forward_decode: C++ vs PyTorch equivalence."""
-        (q_nope_proj, q_pe, kv_cache, block_table, seq_lens,
-         scale, kv_lora_rank, qk_rope_head_dim) = inputs
+        (q_nope_proj, q_pe, kv_cache, block_table, seq_lens, scale, kv_lora_rank, qk_rope_head_dim) = inputs
 
         cpp_result = _C.forward_decode(
-            q_nope_proj, q_pe, kv_cache, block_table, seq_lens,
-            scale, kv_lora_rank, qk_rope_head_dim)
+            q_nope_proj, q_pe, kv_cache, block_table, seq_lens, scale, kv_lora_rank, qk_rope_head_dim
+        )
         py_result = _pytorch_forward_decode(
-            q_nope_proj, q_pe, kv_cache, block_table, seq_lens,
-            scale, kv_lora_rank, qk_rope_head_dim)
+            q_nope_proj, q_pe, kv_cache, block_table, seq_lens, scale, kv_lora_rank, qk_rope_head_dim
+        )
 
         assert torch.allclose(cpp_result, py_result, atol=1e-5), (
             f"forward_decode mismatch: max diff={(cpp_result - py_result).abs().max()}"
@@ -1169,8 +1204,7 @@ class TestProperty7CppPytorchEquivalence:
         suffix_lse = torch.randn_like(lse)
 
         cpp_result = _C.merge_attn_states(output, lse, suffix_output, suffix_lse)
-        py_result = _pytorch_merge_attn_states(output, lse,
-                                               suffix_output, suffix_lse)
+        py_result = _pytorch_merge_attn_states(output, lse, suffix_output, suffix_lse)
 
         assert torch.allclose(cpp_result, py_result, atol=1e-5), (
             f"merge_attn_states mismatch: max diff={(cpp_result - py_result).abs().max()}"
@@ -1192,15 +1226,14 @@ class TestProperty7CppPytorchEquivalence:
     @given(inputs=absorption_inputs())
     def test_build_absorption_matrices_equivalence(self, inputs):
         """build_absorption_matrices: C++ vs PyTorch equivalence."""
-        (kv_b_proj_weight, num_heads, qk_nope_head_dim,
-         v_head_dim, kv_lora_rank) = inputs
+        (kv_b_proj_weight, num_heads, qk_nope_head_dim, v_head_dim, kv_lora_rank) = inputs
 
         cpp_W_UK_T, cpp_W_UV = _C.build_absorption_matrices(
-            kv_b_proj_weight, num_heads, qk_nope_head_dim,
-            v_head_dim, kv_lora_rank, torch.float32)
+            kv_b_proj_weight, num_heads, qk_nope_head_dim, v_head_dim, kv_lora_rank, torch.float32
+        )
         py_W_UK_T, py_W_UV = _pytorch_build_absorption_matrices(
-            kv_b_proj_weight, num_heads, qk_nope_head_dim,
-            v_head_dim, kv_lora_rank, torch.float32)
+            kv_b_proj_weight, num_heads, qk_nope_head_dim, v_head_dim, kv_lora_rank, torch.float32
+        )
 
         assert torch.allclose(cpp_W_UK_T, py_W_UK_T, atol=1e-5), (
             f"W_UK_T mismatch: max diff={(cpp_W_UK_T - py_W_UK_T).abs().max()}"

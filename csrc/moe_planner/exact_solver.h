@@ -18,9 +18,9 @@
 namespace moe_planner {
 
 struct ExactResult {
-    bool feasible;       // false if num_active > max_active (DP too large)
-    int num_active;
-    int64_t execute_ns;  // optimal sum-of-wave-max; -1 when infeasible
+  bool feasible;  // false if num_active > max_active (DP too large)
+  int num_active;
+  int64_t execute_ns;  // optimal sum-of-wave-max; -1 when infeasible
 };
 
 // Exact optimum via subset DP. Refuses (feasible=false) when num_active exceeds

@@ -32,6 +32,7 @@ from fused_cpp.moe import (  # noqa: E402
     fused_moe_bf16_tiled_async,
     prepare_fused_moe_bf16_tiled_weights,
 )
+
 try:
     from iso_formula import fit_from_measurements  # noqa: E402
 except ImportError:  # pragma: no cover - package-style import
@@ -44,20 +45,7 @@ DEFAULT_THREADS = "1,2,4,8,16,32"
 DEFAULT_NUM_PROFILE_EXPERTS = 64
 DEFAULT_MEASUREMENT_EXPERTS = 0
 DEFAULT_ISOLATED_MEASUREMENT_EXPERTS = 8
-DEFAULT_SHAPES = (
-    "32;"
-    "16x2;"
-    "16,8,8;"
-    "16,8,4,4;"
-    "16,4,4,4,4;"
-    "8x4;"
-    "8,8,8,4,4;"
-    "8,8,4,4,4,4;"
-    "8,4,4,4,4,4,4;"
-    "4x8;"
-    "2x16;"
-    "1x32"
-)
+DEFAULT_SHAPES = "32;16x2;16,8,8;16,8,4,4;16,4,4,4,4;8x4;8,8,8,4,4;8,8,4,4,4,4;8,4,4,4,4,4,4;4x8;2x16;1x32"
 
 
 def parse_int_list(text: str) -> list[int]:
@@ -228,8 +216,7 @@ def summarize_times(values: list[int]) -> dict:
 def clamp_measurement_experts(num_experts: int, requested: int) -> int:
     if num_experts < 2:
         raise ValueError(
-            "--num-experts must be at least 2; single-expert hot-cache "
-            "profiling is intentionally unsupported"
+            "--num-experts must be at least 2; single-expert hot-cache profiling is intentionally unsupported"
         )
     if requested == 0:
         return num_experts
@@ -325,9 +312,7 @@ def make_async_run(
     task_dep_offsets = torch.tensor(dep_offsets, dtype=torch.int32)
     task_deps = torch.tensor(deps, dtype=torch.int32)
     if core > len(cpu_ids):
-        raise ValueError(
-            f"shape {shape} needs {core} CPUs, but only {len(cpu_ids)} were provided"
-        )
+        raise ValueError(f"shape {shape} needs {core} CPUs, but only {len(cpu_ids)} were provided")
     thread_cpu_ids = torch.tensor(cpu_ids[:core], dtype=torch.int32)
 
     def run() -> torch.Tensor:
@@ -400,10 +385,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--route-buckets",
         default=None,
-        help=(
-            "Legacy alias: when set, uses the same route buckets for isolated "
-            "and contention measurements."
-        ),
+        help=("Legacy alias: when set, uses the same route buckets for isolated and contention measurements."),
     )
     parser.add_argument("--isolated-route-buckets", default=DEFAULT_ISOLATED_ROUTES)
     parser.add_argument("--contention-route-buckets", default=DEFAULT_CONTENTION_ROUTES)
@@ -454,15 +436,9 @@ def main() -> int:
     max_shape_cores = max(sum(shape) for shape in shapes)
     max_threads = max(thread_buckets)
     required_cpus = max(max_shape_cores, max_threads)
-    cpu_ids = (
-        parse_cpu_ids(args.cpu_ids)
-        if args.cpu_ids is not None
-        else list(range(required_cpus))
-    )
+    cpu_ids = parse_cpu_ids(args.cpu_ids) if args.cpu_ids is not None else list(range(required_cpus))
     if len(cpu_ids) < required_cpus:
-        raise ValueError(
-            f"profile requires {required_cpus} CPUs, got {len(cpu_ids)}: {cpu_ids}"
-        )
+        raise ValueError(f"profile requires {required_cpus} CPUs, got {len(cpu_ids)}: {cpu_ids}")
     if args.concurrent_ranks <= 0:
         raise ValueError("--concurrent-ranks must be positive")
     if not 0 <= args.rank_id < args.concurrent_ranks:
@@ -474,18 +450,11 @@ def main() -> int:
     global_experts = args.global_experts or args.num_experts
     if global_experts < args.num_experts:
         raise ValueError("--global-experts cannot be smaller than --num-experts")
-    measurement_experts = clamp_measurement_experts(
-        args.num_experts, args.measurement_experts
-    )
-    isolated_measurement_experts = clamp_measurement_experts(
-        args.num_experts, args.isolated_measurement_experts
-    )
+    measurement_experts = clamp_measurement_experts(args.num_experts, args.measurement_experts)
+    isolated_measurement_experts = clamp_measurement_experts(args.num_experts, args.isolated_measurement_experts)
     missing_contention_routes = sorted(set(contention_routes) - set(isolated_routes))
     if missing_contention_routes:
-        raise ValueError(
-            "contention routes must also be present in isolated routes: "
-            f"{missing_contention_routes}"
-        )
+        raise ValueError(f"contention routes must also be present in isolated routes: {missing_contention_routes}")
 
     shape_threads = sorted({t for shape in shapes for t in shape})
     missing = [t for t in shape_threads if t not in thread_buckets]
@@ -554,9 +523,7 @@ def main() -> int:
     entries: list[dict] = []
     for shape in shapes:
         for routes in contention_routes:
-            lane_experts = assign_uniform_experts(
-                measurement_experts, shape, routes, iso_lookup
-            )
+            lane_experts = assign_uniform_experts(measurement_experts, shape, routes, iso_lookup)
             run, num_groups, num_tasks, lane_task_counts = make_async_run(
                 packed=packed,
                 hidden_size=args.hidden_size,
@@ -576,15 +543,10 @@ def main() -> int:
                 runs=args.runs,
                 sync_client=sync_client,
             )
-            group_times = [
-                max(1, int(round(value / num_groups))) for value in full_times
-            ]
+            group_times = [max(1, int(round(value / num_groups))) for value in full_times]
             summary = summarize_times(group_times)
             iso_max = max(iso_lookup[(routes, threads)] for threads in shape)
-            iso_baseline = max(
-                count * iso_lookup[(routes, threads)]
-                for count, threads in zip(lane_task_counts, shape)
-            )
+            iso_baseline = max(count * iso_lookup[(routes, threads)] for count, threads in zip(lane_task_counts, shape))
             full_call_median = int(statistics.median(full_times))
             derate = float(full_call_median) / float(iso_baseline)
             entry = {
@@ -622,10 +584,7 @@ def main() -> int:
     w2_packed_bytes = packed.w2[0].numel() * packed.w2[0].element_size()
     split_chunks = args.w13_split_chunks if args.w13_split else 1
     llc_bytes = args.llc_bytes or detect_llc_bytes(cpu_ids[0])
-    iso_formula = fit_from_measurements(
-        (entry["routes"], entry["threads"], entry["median_ns"])
-        for entry in isolated
-    )
+    iso_formula = fit_from_measurements((entry["routes"], entry["threads"], entry["median_ns"]) for entry in isolated)
     payload = {
         "schema_version": 2,
         "kind": "contention_derate",
@@ -673,17 +632,11 @@ def main() -> int:
             "skip_weighted": True,
         },
         "working_set": {
-            "w13_dense_bytes_per_expert": (
-                2 * args.ffn_hidden_size * args.hidden_size * 2
-            ),
-            "w2_dense_bytes_per_expert": (
-                args.hidden_size * args.ffn_hidden_size * 2
-            ),
+            "w13_dense_bytes_per_expert": (2 * args.ffn_hidden_size * args.hidden_size * 2),
+            "w2_dense_bytes_per_expert": (args.hidden_size * args.ffn_hidden_size * 2),
             "w13_packed_bytes_per_expert": w13_packed_bytes // args.num_experts,
             "w2_packed_bytes_per_expert": w2_packed_bytes // args.num_experts,
-            "w13_chunk_bytes_per_expert": (
-                w13_packed_bytes // args.num_experts // split_chunks
-            ),
+            "w13_chunk_bytes_per_expert": (w13_packed_bytes // args.num_experts // split_chunks),
             "max_weight_stage_bytes_per_expert": max(
                 w13_packed_bytes // args.num_experts // split_chunks,
                 w2_packed_bytes // args.num_experts,

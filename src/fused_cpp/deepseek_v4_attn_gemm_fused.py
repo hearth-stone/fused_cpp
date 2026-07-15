@@ -28,23 +28,13 @@ class PreparedDeepSeekV4AttnGemmWeights:
     @property
     def variant(self) -> str:
         has_compressor = self.compressor_kv_score is not None
-        has_indexer = (
-            self.indexer_compressor_kv_score is not None
-            or self.indexer_weights_proj is not None
-        )
+        has_indexer = self.indexer_compressor_kv_score is not None or self.indexer_weights_proj is not None
         if not has_compressor and has_indexer:
             raise ValueError("indexer GEMM weights require compressor_kv_score")
-        if (
-            self.indexer_compressor_kv_score is None
-            and self.indexer_weights_proj is not None
-        ) or (
-            self.indexer_compressor_kv_score is not None
-            and self.indexer_weights_proj is None
+        if (self.indexer_compressor_kv_score is None and self.indexer_weights_proj is not None) or (
+            self.indexer_compressor_kv_score is not None and self.indexer_weights_proj is None
         ):
-            raise ValueError(
-                "indexer_compressor_kv_score and indexer_weights_proj "
-                "must be provided together"
-            )
+            raise ValueError("indexer_compressor_kv_score and indexer_weights_proj must be provided together")
         if not has_compressor:
             return "dense"
         if not has_indexer:
@@ -54,16 +44,13 @@ class PreparedDeepSeekV4AttnGemmWeights:
 
 try:
     from fused_cpp._C import (
-        fused_wqa_wkv_compressor_kv_score_indexer_compressor_kv_score_indexer_weights_proj_fused
-        as _fused_impl,
+        fused_wqa_wkv_compressor_kv_score_indexer_compressor_kv_score_indexer_weights_proj_fused as _fused_impl,
     )
     from fused_cpp._C import (
-        fused_wqa_wkv_compressor_kv_score_indexer_compressor_kv_score_indexer_weights_proj_fused_mt
-        as _fused_mt_impl,
+        fused_wqa_wkv_compressor_kv_score_indexer_compressor_kv_score_indexer_weights_proj_fused_mt as _fused_mt_impl,
     )
     from fused_cpp._C import (
-        fused_wqa_wkv_compressor_kv_score_indexer_compressor_kv_score_indexer_weights_proj_fused_prepare
-        as _prepare_impl,
+        fused_wqa_wkv_compressor_kv_score_indexer_compressor_kv_score_indexer_weights_proj_fused_prepare as _prepare_impl,
     )
     from fused_cpp._C import (
         fused_wqa_wkv_compressor_kv_score_fused as _c128a_impl,
@@ -72,20 +59,16 @@ try:
         fused_wqa_wkv_compressor_kv_score_fused_mt as _c128a_mt_impl,
     )
     from fused_cpp._C import (
-        fused_wqa_wkv_compressor_kv_score_indexer_compressor_kv_score_indexer_weights_proj_qkv_rmsnorm_fused
-        as _fused_normed_impl,
+        fused_wqa_wkv_compressor_kv_score_indexer_compressor_kv_score_indexer_weights_proj_qkv_rmsnorm_fused as _fused_normed_impl,
     )
     from fused_cpp._C import (
-        fused_wqa_wkv_compressor_kv_score_indexer_compressor_kv_score_indexer_weights_proj_qkv_rmsnorm_fused_mt
-        as _fused_normed_mt_impl,
+        fused_wqa_wkv_compressor_kv_score_indexer_compressor_kv_score_indexer_weights_proj_qkv_rmsnorm_fused_mt as _fused_normed_mt_impl,
     )
     from fused_cpp._C import (
-        fused_wqa_wkv_compressor_kv_score_qkv_rmsnorm_fused
-        as _c128a_normed_impl,
+        fused_wqa_wkv_compressor_kv_score_qkv_rmsnorm_fused as _c128a_normed_impl,
     )
     from fused_cpp._C import (
-        fused_wqa_wkv_compressor_kv_score_qkv_rmsnorm_fused_mt
-        as _c128a_normed_mt_impl,
+        fused_wqa_wkv_compressor_kv_score_qkv_rmsnorm_fused_mt as _c128a_normed_mt_impl,
     )
     from fused_cpp._C import fused_wqa_wkv_fused as _dense_impl
     from fused_cpp._C import fused_wqa_wkv_fused_mt as _dense_mt_impl
@@ -128,43 +111,21 @@ def fused_wqa_wkv_compressor_kv_score_indexer_compressor_kv_score_indexer_weight
     indexer_weights_proj: torch.Tensor | None = None,
 ) -> PreparedDeepSeekV4AttnGemmWeights:
     """Pack present bf16 [K, N] weights for reuse across fused calls."""
-    prepare_weight = (
-        fused_wqa_wkv_compressor_kv_score_indexer_compressor_kv_score_indexer_weights_proj_fused_prepare
-    )
-    has_indexer = (
-        indexer_compressor_kv_score is not None
-        or indexer_weights_proj is not None
-    )
+    prepare_weight = fused_wqa_wkv_compressor_kv_score_indexer_compressor_kv_score_indexer_weights_proj_fused_prepare
+    has_indexer = indexer_compressor_kv_score is not None or indexer_weights_proj is not None
     if compressor_kv_score is None and has_indexer:
         raise ValueError("indexer GEMM weights require compressor_kv_score")
-    if (
-        indexer_compressor_kv_score is None
-        and indexer_weights_proj is not None
-    ) or (
-        indexer_compressor_kv_score is not None
-        and indexer_weights_proj is None
+    if (indexer_compressor_kv_score is None and indexer_weights_proj is not None) or (
+        indexer_compressor_kv_score is not None and indexer_weights_proj is None
     ):
-        raise ValueError(
-            "indexer_compressor_kv_score and indexer_weights_proj "
-            "must be provided together"
-        )
+        raise ValueError("indexer_compressor_kv_score and indexer_weights_proj must be provided together")
     return PreparedDeepSeekV4AttnGemmWeights(
         fused_wqa_wkv=prepare_weight(fused_wqa_wkv),
-        compressor_kv_score=(
-            prepare_weight(compressor_kv_score)
-            if compressor_kv_score is not None
-            else None
-        ),
+        compressor_kv_score=(prepare_weight(compressor_kv_score) if compressor_kv_score is not None else None),
         indexer_compressor_kv_score=(
-            prepare_weight(indexer_compressor_kv_score)
-            if indexer_compressor_kv_score is not None
-            else None
+            prepare_weight(indexer_compressor_kv_score) if indexer_compressor_kv_score is not None else None
         ),
-        indexer_weights_proj=(
-            prepare_weight(indexer_weights_proj)
-            if indexer_weights_proj is not None
-            else None
-        ),
+        indexer_weights_proj=(prepare_weight(indexer_weights_proj) if indexer_weights_proj is not None else None),
     )
 
 

@@ -61,8 +61,7 @@ def clamp_measurement_experts(num_experts: int, requested: int) -> int:
         raise ValueError("--measurement-experts must be positive")
     if num_experts < 2:
         raise ValueError(
-            "--num-experts must be at least 2; single-expert hot-cache "
-            "profiling is intentionally unsupported"
+            "--num-experts must be at least 2; single-expert hot-cache profiling is intentionally unsupported"
         )
     return min(num_experts, requested)
 
@@ -176,9 +175,7 @@ def main() -> int:
         raise RuntimeError("BF16 tiled fused MoE backend is unavailable")
     if args.hidden_size <= 0 or args.ffn_hidden_size <= 0:
         raise ValueError("hidden and FFN sizes must be positive")
-    measurement_experts = clamp_measurement_experts(
-        args.num_experts, args.measurement_experts
-    )
+    measurement_experts = clamp_measurement_experts(args.num_experts, args.measurement_experts)
     if args.warmup < 0:
         raise ValueError("--warmup must be non-negative")
     if args.runs <= 0:
@@ -200,25 +197,29 @@ def main() -> int:
         generator=generator,
         std=args.std,
     )
-    packed = prepare_fused_moe_bf16_tiled_weights(
-        w13_weight, w2_weight, fuse_silu=args.fuse_silu
-    )
+    packed = prepare_fused_moe_bf16_tiled_weights(w13_weight, w2_weight, fuse_silu=args.fuse_silu)
 
     w13_bias = None
     w2_bias = None
     if args.with_bias:
-        w13_bias = torch.randn(
-            args.num_experts,
-            2 * args.ffn_hidden_size,
-            generator=generator,
-            dtype=torch.float32,
-        ) * args.std
-        w2_bias = torch.randn(
-            args.num_experts,
-            args.hidden_size,
-            generator=generator,
-            dtype=torch.float32,
-        ) * args.std
+        w13_bias = (
+            torch.randn(
+                args.num_experts,
+                2 * args.ffn_hidden_size,
+                generator=generator,
+                dtype=torch.float32,
+            )
+            * args.std
+        )
+        w2_bias = (
+            torch.randn(
+                args.num_experts,
+                args.hidden_size,
+                generator=generator,
+                dtype=torch.float32,
+            )
+            * args.std
+        )
 
     entries = []
     for routes in route_buckets:
@@ -232,18 +233,12 @@ def main() -> int:
             begin = local_expert * routes
             end = begin + routes
             topk_ids[begin:end, 0] = local_expert
-        topk_weights = torch.ones(
-            (routes * measurement_experts, 1), dtype=torch.float32
-        )
+        topk_weights = torch.ones((routes * measurement_experts, 1), dtype=torch.float32)
 
         for threads in thread_buckets:
-            wave_offsets = torch.arange(
-                measurement_experts + 1, dtype=torch.int32
-            )
+            wave_offsets = torch.arange(measurement_experts + 1, dtype=torch.int32)
             team_expert_ids = torch.arange(measurement_experts, dtype=torch.int32)
-            team_threads = torch.full(
-                (measurement_experts,), threads, dtype=torch.int32
-            )
+            team_threads = torch.full((measurement_experts,), threads, dtype=torch.int32)
             thread_cpu_ids = torch.arange(threads, dtype=torch.int32)
 
             def run() -> torch.Tensor:
@@ -265,10 +260,7 @@ def main() -> int:
                 )
 
             full_times_ns = measure_call(run, warmup=args.warmup, runs=args.runs)
-            times_ns = [
-                max(1, int(round(value / measurement_experts)))
-                for value in full_times_ns
-            ]
+            times_ns = [max(1, int(round(value / measurement_experts))) for value in full_times_ns]
             entry = entry_from_times(routes, threads, times_ns)
             entry["measurement_experts"] = measurement_experts
             entry["full_call_median_ns"] = int(statistics.median(full_times_ns))

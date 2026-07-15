@@ -46,17 +46,14 @@ struct BFloat16 {
   uint16_t x;
 
   BFloat16() : x(0) {}
-  explicit BFloat16(float value)
-      : x(clean_sdpa_torch_shim::float_to_bf16_bits(value)) {}
+  explicit BFloat16(float value) : x(clean_sdpa_torch_shim::float_to_bf16_bits(value)) {}
 
   BFloat16& operator=(float value) {
     x = clean_sdpa_torch_shim::float_to_bf16_bits(value);
     return *this;
   }
 
-  operator float() const {
-    return clean_sdpa_torch_shim::bf16_bits_to_float(x);
-  }
+  operator float() const { return clean_sdpa_torch_shim::bf16_bits_to_float(x); }
 };
 
 static_assert(sizeof(BFloat16) == sizeof(uint16_t));
@@ -65,10 +62,10 @@ static_assert(alignof(BFloat16) == alignof(uint16_t));
 }  // namespace at
 
 #ifndef TORCH_CHECK
-#define TORCH_CHECK(cond, ...)                                           \
-  do {                                                                   \
-    if (!(cond)) {                                                       \
-      ::clean_sdpa_torch_shim::throw_check(__VA_ARGS__);                 \
-    }                                                                    \
+#define TORCH_CHECK(cond, ...)                           \
+  do {                                                   \
+    if (!(cond)) {                                       \
+      ::clean_sdpa_torch_shim::throw_check(__VA_ARGS__); \
+    }                                                    \
   } while (false)
 #endif

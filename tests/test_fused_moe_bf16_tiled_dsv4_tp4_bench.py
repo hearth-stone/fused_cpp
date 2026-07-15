@@ -31,8 +31,7 @@ pytestmark = [
         or not hasattr(os, "sched_setaffinity")
         or not _HAS_BF16_TILED_FUSED_MOE,
         reason=(
-            "DeepSeek V4 TP=4 MoE benchmark requires Linux AArch64, "
-            "sched_setaffinity, and the fused_cpp C++ extension"
+            "DeepSeek V4 TP=4 MoE benchmark requires Linux AArch64, sched_setaffinity, and the fused_cpp C++ extension"
         ),
     ),
 ]
@@ -64,8 +63,7 @@ class DSV4TP4MoEBenchConfig:
     def ffn_per_rank(self) -> int:
         if self.moe_intermediate_size % self.tp_size != 0:
             raise ValueError(
-                "moe_intermediate_size must be divisible by tp_size: "
-                f"{self.moe_intermediate_size=} {self.tp_size=}"
+                f"moe_intermediate_size must be divisible by tp_size: {self.moe_intermediate_size=} {self.tp_size=}"
             )
         return self.moe_intermediate_size // self.tp_size
 
@@ -84,9 +82,7 @@ def _config_from_env() -> DSV4TP4MoEBenchConfig:
     defaults = DSV4TP4MoEBenchConfig()
     return DSV4TP4MoEBenchConfig(
         tokens=_env_int("FUSED_CPP_DSV4_MOE_BENCH_TOKENS", defaults.tokens),
-        hidden_size=_env_int(
-            "FUSED_CPP_DSV4_MOE_BENCH_HIDDEN_SIZE", defaults.hidden_size
-        ),
+        hidden_size=_env_int("FUSED_CPP_DSV4_MOE_BENCH_HIDDEN_SIZE", defaults.hidden_size),
         moe_intermediate_size=_env_int(
             "FUSED_CPP_DSV4_MOE_BENCH_MOE_INTERMEDIATE_SIZE",
             defaults.moe_intermediate_size,
@@ -111,16 +107,12 @@ def _config_from_env() -> DSV4TP4MoEBenchConfig:
         runs=_env_int("FUSED_CPP_DSV4_MOE_BENCH_RUNS", defaults.runs),
         seed=_env_int("FUSED_CPP_DSV4_MOE_BENCH_SEED", defaults.seed),
         std=_env_float("FUSED_CPP_DSV4_MOE_BENCH_STD", defaults.std),
-        activation=os.environ.get(
-            "FUSED_CPP_DSV4_MOE_BENCH_ACTIVATION", defaults.activation
-        ),
+        activation=os.environ.get("FUSED_CPP_DSV4_MOE_BENCH_ACTIVATION", defaults.activation),
         barrier_timeout_s=_env_float(
             "FUSED_CPP_DSV4_MOE_BENCH_TIMEOUT_S",
             defaults.barrier_timeout_s,
         ),
-        prepack_threads=_env_int(
-            "FUSED_CPP_MOE_PREPACK_THREADS", defaults.prepack_threads
-        ),
+        prepack_threads=_env_int("FUSED_CPP_MOE_PREPACK_THREADS", defaults.prepack_threads),
     )
 
 
@@ -157,9 +149,7 @@ def _set_vllm_like_rank_env(rank: int, config: DSV4TP4MoEBenchConfig) -> list[in
     os.environ["OMP_PROC_BIND"] = "true"
     os.environ["FUSED_CPP_MOE_HIERARCHICAL_N_SPLIT"] = "1"
     os.environ["FUSED_CPP_MOE_N_SPLIT_CORE_SKIP"] = str(config.core_skip)
-    os.environ["FUSED_CPP_MOE_N_SPLIT_GROUPS_PER_PARTITION"] = str(
-        config.groups_per_partition
-    )
+    os.environ["FUSED_CPP_MOE_N_SPLIT_GROUPS_PER_PARTITION"] = str(config.groups_per_partition)
     os.environ["FUSED_CPP_MOE_PREPACK_THREADS"] = str(config.prepack_threads)
     torch.set_num_threads(config.threads_per_rank)
     return cpus
@@ -209,10 +199,7 @@ def _routing_counts_from_entry(entry: dict[str, Any]) -> list[tuple[int, int]]:
     top_k = int(entry["top_k"])
     routes = int(entry["routes"])
     if routes != tokens * top_k:
-        raise ValueError(
-            f"routing routes must equal tokens * top_k, got {routes=} "
-            f"{tokens=} {top_k=}"
-        )
+        raise ValueError(f"routing routes must equal tokens * top_k, got {routes=} {tokens=} {top_k=}")
 
     num_experts = int(entry["num_experts"])
     active_experts = int(entry["active_experts"])
@@ -236,10 +223,7 @@ def _routing_counts_from_entry(entry: dict[str, Any]) -> list[tuple[int, int]]:
     if top_sum > routes:
         raise ValueError(f"routing top_experts route sum exceeds routes={routes}")
     if len(top_counts) > active_experts:
-        raise ValueError(
-            f"top_experts has more entries than active_experts: "
-            f"{len(top_counts)=} {active_experts=}"
-        )
+        raise ValueError(f"top_experts has more entries than active_experts: {len(top_counts)=} {active_experts=}")
 
     tail_active = active_experts - len(top_counts)
     if tail_active <= 0:
@@ -248,14 +232,9 @@ def _routing_counts_from_entry(entry: dict[str, Any]) -> list[tuple[int, int]]:
             f"expected {routes}, but no active tail experts are available"
         )
 
-    tail_experts = [
-        expert for expert in range(num_experts) if expert not in seen
-    ][:tail_active]
+    tail_experts = [expert for expert in range(num_experts) if expert not in seen][:tail_active]
     if len(tail_experts) != tail_active:
-        raise ValueError(
-            f"not enough experts to synthesize routing tail: "
-            f"{tail_active=} {len(tail_experts)=}"
-        )
+        raise ValueError(f"not enough experts to synthesize routing tail: {tail_active=} {len(tail_experts)=}")
 
     tail_total = routes - top_sum
     tail_min = int(entry.get("routes_min", 1))
@@ -268,8 +247,7 @@ def _routing_counts_from_entry(entry: dict[str, Any]) -> list[tuple[int, int]]:
         remaining = tail_total - tail_min * tail_active
         if remaining < 0:
             raise ValueError(
-                f"routing tail total is too small for routes_min: "
-                f"{tail_total=} {tail_min=} {tail_active=}"
+                f"routing tail total is too small for routes_min: {tail_total=} {tail_min=} {tail_active=}"
             )
         tail_cap = min(count for _, count in top_counts) - 1
         tail_cap = max(tail_cap, tail_min)
@@ -285,10 +263,7 @@ def _routing_counts_from_entry(entry: dict[str, Any]) -> list[tuple[int, int]]:
                 remaining -= 1
                 progressed = True
             if not progressed:
-                raise ValueError(
-                    f"routing tail cannot fit below top_experts: "
-                    f"{tail_total=} {tail_cap=}"
-                )
+                raise ValueError(f"routing tail cannot fit below top_experts: {tail_total=} {tail_cap=}")
 
     return top_counts + list(zip(tail_experts, tail_counts, strict=True))
 
@@ -306,16 +281,11 @@ def _make_topk_from_routing_entry(entry: dict[str, Any]) -> tuple[torch.Tensor, 
             token = flat % tokens
             slot = flat // tokens
             if slot >= top_k:
-                raise ValueError(
-                    f"routing top_experts route sum exceeds routes={routes}"
-                )
+                raise ValueError(f"routing top_experts route sum exceeds routes={routes}")
             topk_ids[token, slot] = expert
         cursor += count
     if cursor != routes:
-        raise ValueError(
-            f"routing route sum mismatch: got {cursor}, "
-            f"expected {routes}"
-        )
+        raise ValueError(f"routing route sum mismatch: got {cursor}, expected {routes}")
     topk_weights = torch.full(
         (tokens, top_k),
         1.0 / float(top_k),
@@ -359,16 +329,20 @@ def _bench_rank_worker(
             generator=data_gen,
             std=config.std,
         )
-        topk_weights, topk_ids = _make_topk(
-            config.tokens,
-            config.experts,
-            config.top_k,
-            generator=route_gen,
-        ) if config.routing_dir is None else _make_topk_from_routing_entry(
-            _load_moe_routing_entry(
-                config.routing_dir,
-                rank=rank,
-                seq=config.routing_seq,
+        topk_weights, topk_ids = (
+            _make_topk(
+                config.tokens,
+                config.experts,
+                config.top_k,
+                generator=route_gen,
+            )
+            if config.routing_dir is None
+            else _make_topk_from_routing_entry(
+                _load_moe_routing_entry(
+                    config.routing_dir,
+                    rank=rank,
+                    seq=config.routing_seq,
+                )
             )
         )
 
@@ -377,9 +351,7 @@ def _bench_rank_worker(
         pack_s = time.perf_counter() - pack_t0
         del w13_weight, w2_weight
 
-        counts = torch.bincount(
-            topk_ids.flatten().to(torch.int64), minlength=config.experts
-        )
+        counts = torch.bincount(topk_ids.flatten().to(torch.int64), minlength=config.experts)
 
         def run_once() -> torch.Tensor:
             return fused_moe_bf16_tiled(
@@ -449,9 +421,7 @@ def _collect_results(
             for proc in processes:
                 if proc.is_alive():
                     proc.terminate()
-            raise TimeoutError(
-                f"timed out waiting for {len(processes) - len(rows)} rank results"
-            )
+            raise TimeoutError(f"timed out waiting for {len(processes) - len(rows)} rank results")
     return sorted(rows, key=lambda row: int(row["rank"]))
 
 
@@ -517,9 +487,7 @@ def _run_tp4_bound_bench(config: DSV4TP4MoEBenchConfig) -> None:
 
     required_max_cpu = max(max(_rank_cpus(rank, config)) for rank in range(4))
     if (os.cpu_count() or 0) <= required_max_cpu:
-        pytest.skip(
-            f"need CPU id {required_max_cpu}, but os.cpu_count()={os.cpu_count()}"
-        )
+        pytest.skip(f"need CPU id {required_max_cpu}, but os.cpu_count()={os.cpu_count()}")
 
     ctx = mp.get_context("spawn")
     barrier = ctx.Barrier(config.tp_size, timeout=config.barrier_timeout_s)
@@ -550,11 +518,7 @@ def _run_tp4_bound_bench(config: DSV4TP4MoEBenchConfig) -> None:
         joined = "\n".join(str(row["error"]) for row in failures)
         pytest.fail(joined)
 
-    bad_exitcodes = [
-        (proc.name, proc.pid, proc.exitcode)
-        for proc in processes
-        if proc.exitcode not in (0, None)
-    ]
+    bad_exitcodes = [(proc.name, proc.pid, proc.exitcode) for proc in processes if proc.exitcode not in (0, None)]
     if bad_exitcodes:
         pytest.fail(f"rank process failures: {bad_exitcodes}")
 
@@ -572,9 +536,7 @@ def test_fused_moe_bf16_tiled_deepseek_v4_flash_tp4_2000_tokens_arm_codex_layout
     defaults = DSV4TP4MoEBenchConfig()
     config = DSV4TP4MoEBenchConfig(
         tokens=_env_int("FUSED_CPP_DSV4_MOE_BENCH_TOKENS", 2000),
-        hidden_size=_env_int(
-            "FUSED_CPP_DSV4_MOE_BENCH_HIDDEN_SIZE", defaults.hidden_size
-        ),
+        hidden_size=_env_int("FUSED_CPP_DSV4_MOE_BENCH_HIDDEN_SIZE", defaults.hidden_size),
         moe_intermediate_size=_env_int(
             "FUSED_CPP_DSV4_MOE_BENCH_MOE_INTERMEDIATE_SIZE",
             defaults.moe_intermediate_size,
@@ -593,16 +555,12 @@ def test_fused_moe_bf16_tiled_deepseek_v4_flash_tp4_2000_tokens_arm_codex_layout
         runs=_env_int("FUSED_CPP_DSV4_MOE_BENCH_RUNS", defaults.runs),
         seed=_env_int("FUSED_CPP_DSV4_MOE_BENCH_SEED", defaults.seed),
         std=_env_float("FUSED_CPP_DSV4_MOE_BENCH_STD", defaults.std),
-        activation=os.environ.get(
-            "FUSED_CPP_DSV4_MOE_BENCH_ACTIVATION", defaults.activation
-        ),
+        activation=os.environ.get("FUSED_CPP_DSV4_MOE_BENCH_ACTIVATION", defaults.activation),
         barrier_timeout_s=_env_float(
             "FUSED_CPP_DSV4_MOE_BENCH_TIMEOUT_S",
             defaults.barrier_timeout_s,
         ),
-        prepack_threads=_env_int(
-            "FUSED_CPP_MOE_PREPACK_THREADS", defaults.prepack_threads
-        ),
+        prepack_threads=_env_int("FUSED_CPP_MOE_PREPACK_THREADS", defaults.prepack_threads),
     )
     _run_tp4_bound_bench(config)
 
@@ -642,16 +600,12 @@ def test_fused_moe_bf16_tiled_deepseek_v4_flash_tp4_profiler_routing_arm_codex_l
         runs=_env_int("FUSED_CPP_DSV4_MOE_BENCH_RUNS", defaults.runs),
         seed=_env_int("FUSED_CPP_DSV4_MOE_BENCH_SEED", defaults.seed),
         std=_env_float("FUSED_CPP_DSV4_MOE_BENCH_STD", defaults.std),
-        activation=os.environ.get(
-            "FUSED_CPP_DSV4_MOE_BENCH_ACTIVATION", defaults.activation
-        ),
+        activation=os.environ.get("FUSED_CPP_DSV4_MOE_BENCH_ACTIVATION", defaults.activation),
         barrier_timeout_s=_env_float(
             "FUSED_CPP_DSV4_MOE_BENCH_TIMEOUT_S",
             defaults.barrier_timeout_s,
         ),
-        prepack_threads=_env_int(
-            "FUSED_CPP_MOE_PREPACK_THREADS", defaults.prepack_threads
-        ),
+        prepack_threads=_env_int("FUSED_CPP_MOE_PREPACK_THREADS", defaults.prepack_threads),
         routing_dir=routing_dir,
         routing_seq=routing_seq,
     )
@@ -673,10 +627,7 @@ def test_fused_moe_bf16_tiled_deepseek_v4_flash_tp4_profiler_routing_2048_arm_co
     routing_seq = _env_int("FUSED_CPP_DSV4_MOE_ROUTING_SEQ", 70)
     routing_entry = _load_moe_routing_entry(routing_dir, rank=0, seq=routing_seq)
     if int(routing_entry["tokens"]) != target_tokens:
-        pytest.fail(
-            f"routing_seq={routing_seq} has tokens={routing_entry['tokens']}, "
-            f"expected {target_tokens}"
-        )
+        pytest.fail(f"routing_seq={routing_seq} has tokens={routing_entry['tokens']}, expected {target_tokens}")
 
     defaults = DSV4TP4MoEBenchConfig()
     config = DSV4TP4MoEBenchConfig(
@@ -700,16 +651,12 @@ def test_fused_moe_bf16_tiled_deepseek_v4_flash_tp4_profiler_routing_2048_arm_co
         runs=_env_int("FUSED_CPP_DSV4_MOE_BENCH_RUNS", defaults.runs),
         seed=_env_int("FUSED_CPP_DSV4_MOE_BENCH_SEED", defaults.seed),
         std=_env_float("FUSED_CPP_DSV4_MOE_BENCH_STD", defaults.std),
-        activation=os.environ.get(
-            "FUSED_CPP_DSV4_MOE_BENCH_ACTIVATION", defaults.activation
-        ),
+        activation=os.environ.get("FUSED_CPP_DSV4_MOE_BENCH_ACTIVATION", defaults.activation),
         barrier_timeout_s=_env_float(
             "FUSED_CPP_DSV4_MOE_BENCH_TIMEOUT_S",
             defaults.barrier_timeout_s,
         ),
-        prepack_threads=_env_int(
-            "FUSED_CPP_MOE_PREPACK_THREADS", defaults.prepack_threads
-        ),
+        prepack_threads=_env_int("FUSED_CPP_MOE_PREPACK_THREADS", defaults.prepack_threads),
         routing_dir=routing_dir,
         routing_seq=routing_seq,
     )

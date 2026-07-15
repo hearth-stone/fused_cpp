@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """数值正确性测试：自定义 SDPA vs PyTorch F.scaled_dot_product_attention。"""
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -8,6 +9,7 @@ from fused_cpp.sdpa import scaled_dot_product_attention, _HAS_CPP_SDPA
 
 
 # ── 辅助函数 ──────────────────────────────────────────────────────────────
+
 
 def _cosine_similarity(a: torch.Tensor, b: torch.Tensor) -> float:
     """计算两个张量的余弦相似度（展平后）。"""
@@ -39,6 +41,7 @@ IS_CAUSAL_LIST = [True, False]
 
 # ── 标准 SDPA 测试（qk_head_dim == v_head_dim） ──────────────────────────
 
+
 @pytest.mark.parametrize("batch_size", BATCH_SIZES)
 @pytest.mark.parametrize("seq_len", SEQ_LENS)
 @pytest.mark.parametrize("num_heads", NUM_HEADS_LIST)
@@ -62,10 +65,7 @@ def test_sdpa_standard(batch_size, seq_len, num_heads, dtype, is_causal):
     max_abs, max_rel = _error_metrics(out, ref)
 
     # 打印辅助信息
-    print(
-        f"\n[标准 SDPA] B={batch_size}, L={seq_len}, N={num_heads}, "
-        f"dtype={dtype}, causal={is_causal}"
-    )
+    print(f"\n[标准 SDPA] B={batch_size}, L={seq_len}, N={num_heads}, dtype={dtype}, causal={is_causal}")
     print(f"  余弦相似度: {cos_sim:.6f}")
     print(f"  最大绝对误差: {max_abs:.6e}")
     print(f"  最大相对误差: {max_rel:.6e}")
@@ -79,6 +79,7 @@ def test_sdpa_standard(batch_size, seq_len, num_heads, dtype, is_causal):
 
 
 # ── MLA 场景测试（qk_head_dim != v_head_dim） ────────────────────────────
+
 
 @pytest.mark.parametrize("batch_size", BATCH_SIZES)
 @pytest.mark.parametrize("seq_len", SEQ_LENS)
@@ -114,12 +115,12 @@ def test_sdpa_mla(batch_size, seq_len, dtype, is_causal):
 
     threshold = 0.9999 if dtype == torch.float32 else 0.999
     assert cos_sim >= threshold, (
-        f"余弦相似度 {cos_sim:.6f} < {threshold} "
-        f"(MLA, B={batch_size}, L={seq_len}, dtype={dtype}, causal={is_causal})"
+        f"余弦相似度 {cos_sim:.6f} < {threshold} (MLA, B={batch_size}, L={seq_len}, dtype={dtype}, causal={is_causal})"
     )
 
 
 # ── attn_mask 测试 ────────────────────────────────────────────────────────
+
 
 @pytest.mark.parametrize("dtype", DTYPES, ids=["fp32", "bf16"])
 def test_sdpa_attn_mask(dtype):
@@ -149,12 +150,11 @@ def test_sdpa_attn_mask(dtype):
     print(f"  最大相对误差: {max_rel:.6e}")
 
     threshold = 0.9999 if dtype == torch.float32 else 0.999
-    assert cos_sim >= threshold, (
-        f"余弦相似度 {cos_sim:.6f} < {threshold} (attn_mask, dtype={dtype})"
-    )
+    assert cos_sim >= threshold, f"余弦相似度 {cos_sim:.6f} < {threshold} (attn_mask, dtype={dtype})"
 
 
 # ── scale=None 自动计算测试 ───────────────────────────────────────────────
+
 
 def test_sdpa_auto_scale():
     """测试 scale=None 时自动计算缩放因子的行为。"""
@@ -171,17 +171,16 @@ def test_sdpa_auto_scale():
     # scale=None（自动计算）
     out_auto = scaled_dot_product_attention(q, k, v, scale=None)
     # 手动指定 scale
-    manual_scale = 1.0 / (head_dim ** 0.5)
+    manual_scale = 1.0 / (head_dim**0.5)
     out_manual = scaled_dot_product_attention(q, k, v, scale=manual_scale)
 
     cos_sim = _cosine_similarity(out_auto, out_manual)
     print(f"\n[auto_scale] 余弦相似度: {cos_sim:.6f}")
-    assert cos_sim >= 0.99999, (
-        f"scale=None 与手动 scale 结果不一致，余弦相似度 {cos_sim:.6f}"
-    )
+    assert cos_sim >= 0.99999, f"scale=None 与手动 scale 结果不一致，余弦相似度 {cos_sim:.6f}"
 
 
 # ── enable_gqa=True 报错测试 ─────────────────────────────────────────────
+
 
 def test_sdpa_enable_gqa_error():
     """测试 enable_gqa=True 时抛出错误。"""
@@ -194,6 +193,7 @@ def test_sdpa_enable_gqa_error():
 
 
 # ── C++ 扩展可用性检查 ───────────────────────────────────────────────────
+
 
 def test_cpp_sdpa_available():
     """验证 C++ SDPA 扩展已正确加载。"""

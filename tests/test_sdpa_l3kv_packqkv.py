@@ -10,6 +10,7 @@
   3. ``E % 4 != 0`` → packed 主路径 + 标量 tail，与 baseline bit-exact
   4. KV 不装 L3 / Path B → 复用同一 packed-K fp32 path 的 taskloop 调度
 """
+
 from __future__ import annotations
 
 import pytest
@@ -74,9 +75,7 @@ def test_packqkv_rejects_unaligned_S(S):
     k = torch.randn(B, N, S, E, dtype=torch.bfloat16)
     v = torch.randn(B, N, S, Ev, dtype=torch.bfloat16)
     with pytest.raises(RuntimeError, match=r"S % 8 == 0"):
-        _C.scaled_dot_product_attention_versioned(
-            q, k, v, None, 0.0, False, None, False, VERSION_NAME
-        )
+        _C.scaled_dot_product_attention_versioned(q, k, v, None, 0.0, False, None, False, VERSION_NAME)
 
 
 @pytest.mark.equiv
@@ -89,9 +88,7 @@ def test_packqkv_rejects_unaligned_Ev(Ev):
     k = torch.randn(B, N, S, E, dtype=torch.bfloat16)
     v = torch.randn(B, N, S, Ev, dtype=torch.bfloat16)
     with pytest.raises(RuntimeError, match=r"Ev % 8 == 0"):
-        _C.scaled_dot_product_attention_versioned(
-            q, k, v, None, 0.0, False, None, False, VERSION_NAME
-        )
+        _C.scaled_dot_product_attention_versioned(q, k, v, None, 0.0, False, None, False, VERSION_NAME)
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -117,9 +114,7 @@ def test_packqkv_fp32_packk_vs_baseline(shape):
     q, k, v = _make_qkv(shape, torch.float32)
     out_packqkv = call_sdpa_version(info_packqkv, q, k, v, is_causal=False)
     out_baseline = call_sdpa_version(info_baseline, q, k, v, is_causal=False)
-    assert_tensor_close(
-        out_packqkv, out_baseline, dtype=torch.float32, context=f"shape={shape}"
-    )
+    assert_tensor_close(out_packqkv, out_baseline, dtype=torch.float32, context=f"shape={shape}")
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -131,11 +126,11 @@ def test_packqkv_fp32_packk_vs_baseline(shape):
 @pytest.mark.parametrize(
     "shape",
     [
-        (1, 4, 16, 16, 64, 64),       # 标准小
-        (1, 4, 16, 16, 192, 128),     # MLA 小
-        (1, 4, 64, 64, 192, 128),     # 中等
-        (1, 8, 256, 256, 64, 64),     # 中等长
-        (1, 4, 32, 64, 192, 128),     # L != S
+        (1, 4, 16, 16, 64, 64),  # 标准小
+        (1, 4, 16, 16, 192, 128),  # MLA 小
+        (1, 4, 64, 64, 192, 128),  # 中等
+        (1, 8, 256, 256, 64, 64),  # 中等长
+        (1, 4, 32, 64, 192, 128),  # L != S
     ],
     ids=["small", "mla-small", "mla-mid", "mid-long", "L_neq_S"],
 )
@@ -151,9 +146,7 @@ def test_packqkv_bf16_vs_baseline(shape, is_causal):
     out_baseline = call_sdpa_version(info_baseline, q, k, v, is_causal=is_causal)
 
     ctx = f"shape={shape} is_causal={is_causal}"
-    assert_tensor_close(
-        out_packqkv, out_baseline, dtype=torch.bfloat16, context=ctx
-    )
+    assert_tensor_close(out_packqkv, out_baseline, dtype=torch.bfloat16, context=ctx)
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -175,9 +168,7 @@ def test_packqkv_bf16_unaligned_E(E):
     out_baseline = call_sdpa_version(info_baseline, q, k, v, is_causal=False)
 
     ctx = f"E={E}"
-    assert_tensor_close(
-        out_packqkv, out_baseline, dtype=torch.bfloat16, context=ctx
-    )
+    assert_tensor_close(out_packqkv, out_baseline, dtype=torch.bfloat16, context=ctx)
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -197,13 +188,6 @@ def test_packqkv_with_mask_and_causal():
     g = torch.Generator(device="cpu").manual_seed(0xC0FE)
     mask = torch.randn(B, N, L, S, generator=g, dtype=torch.float32) * 0.5
 
-    out_packqkv = call_sdpa_version(
-        info_packqkv, q, k, v, is_causal=True, attn_mask=mask
-    )
-    out_baseline = call_sdpa_version(
-        info_baseline, q, k, v, is_causal=True, attn_mask=mask
-    )
-    assert_tensor_close(
-        out_packqkv, out_baseline, dtype=torch.bfloat16,
-        context="mask+causal"
-    )
+    out_packqkv = call_sdpa_version(info_packqkv, q, k, v, is_causal=True, attn_mask=mask)
+    out_baseline = call_sdpa_version(info_baseline, q, k, v, is_causal=True, attn_mask=mask)
+    assert_tensor_close(out_packqkv, out_baseline, dtype=torch.bfloat16, context="mask+causal")

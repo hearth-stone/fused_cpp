@@ -24,6 +24,7 @@ TP>1 的切分逻辑通过 monkeypatch 验证两点：
 所有 vLLM 的分布式依赖由 monkeypatch 替身实现，避免初始化真正的 torch
 distributed 环境。
 """
+
 from __future__ import annotations
 
 import types
@@ -54,7 +55,9 @@ def _pack_awq_along_n(unpacked: torch.Tensor) -> torch.Tensor:
     order_idx = torch.tensor(_AWQ_ORDER, dtype=torch.long)
     picked = reshaped.index_select(-1, order_idx)
     shifts = torch.arange(0, 32, 4, dtype=torch.int32).view(
-        *([1] * len(lead)), 1, 8,
+        *([1] * len(lead)),
+        1,
+        8,
     )
     return (picked << shifts).sum(dim=-1).to(torch.int32)
 
@@ -70,9 +73,7 @@ def _make_awq_weight(
     w_int4 = torch.randint(0, 16, (k, n), generator=gen, dtype=torch.int32)
     groups = k // group_size
     z_int4 = torch.randint(0, 16, (groups, n), generator=gen, dtype=torch.int32)
-    scales_fp32 = (
-        torch.rand((groups, n), generator=gen, dtype=torch.float32) * 5e-3 + 1e-3
-    )
+    scales_fp32 = torch.rand((groups, n), generator=gen, dtype=torch.float32) * 5e-3 + 1e-3
     qweight = _pack_awq_along_n(w_int4)
     qzeros = _pack_awq_along_n(z_int4)
     return qweight, qzeros, scales_fp32.to(scales_dtype)
@@ -89,20 +90,28 @@ def _make_expert(
     up_qw, up_qz, up_s = _make_awq_weight(h, f_dim, g, scales_dtype, seed + 1)
     down_qw, down_qz, down_s = _make_awq_weight(f_dim, h, g, scales_dtype, seed + 2)
     return AWQExpertWeights(
-        gate_qweight=gate_qw, gate_qzeros=gate_qz, gate_scales=gate_s,
-        up_qweight=up_qw, up_qzeros=up_qz, up_scales=up_s,
-        down_qweight=down_qw, down_qzeros=down_qz, down_scales=down_s,
+        gate_qweight=gate_qw,
+        gate_qzeros=gate_qz,
+        gate_scales=gate_s,
+        up_qweight=up_qw,
+        up_qzeros=up_qz,
+        up_scales=up_s,
+        down_qweight=down_qw,
+        down_qzeros=down_qz,
+        down_scales=down_s,
     )
 
 
 def _random_topk(
-    num_tokens: int, num_experts: int, top_k: int, seed: int,
+    num_tokens: int,
+    num_experts: int,
+    top_k: int,
+    seed: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     gen = torch.Generator().manual_seed(seed)
-    topk_ids = torch.stack(
-        [torch.randperm(num_experts, generator=gen)[:top_k]
-         for _ in range(num_tokens)]
-    ).to(torch.int64)
+    topk_ids = torch.stack([torch.randperm(num_experts, generator=gen)[:top_k] for _ in range(num_tokens)]).to(
+        torch.int64
+    )
     raw = torch.randn((num_tokens, top_k), generator=gen, dtype=torch.float32)
     return topk_ids, torch.softmax(raw, dim=-1)
 
@@ -111,7 +120,9 @@ def _assert_close(
     actual: torch.Tensor,
     ref: torch.Tensor,
     *,
-    rtol: float, atol: float, cos_sim_threshold: float,
+    rtol: float,
+    atol: float,
+    cos_sim_threshold: float,
 ) -> None:
     assert actual.shape == ref.shape
     assert actual.dtype == ref.dtype
@@ -131,6 +142,7 @@ def _assert_close(
 
 
 # ── vLLM 依赖的轻量 mock ───────────────────────────────────────────────────
+
 
 def _patch_vllm_distributed(monkeypatch: pytest.MonkeyPatch, *, tp_rank: int, tp_size: int) -> None:
     """替换 awq.py 内的 ``get_tensor_model_parallel_rank`` / ``get_tp_group``，
@@ -163,8 +175,10 @@ def _instantiate_method(
     )
 
     cfg = AWQConfig(
-        weight_bits=4, group_size=group_size,
-        zero_point=True, modules_to_not_convert=None,
+        weight_bits=4,
+        group_size=group_size,
+        zero_point=True,
+        modules_to_not_convert=None,
     )
     moe_cfg = _build_fake_moe_config()
     return CPUAWQFusedMoEMethod(cfg, moe_cfg)  # type: ignore[arg-type]
@@ -176,6 +190,7 @@ class _FakeLayer(torch.nn.Module):
 
 # ── 测试 1：create_weights 形状契约 ────────────────────────────────────────
 
+
 def test_create_weights_registers_correct_shapes(monkeypatch: pytest.MonkeyPatch) -> None:
     """create_weights 应按 AWQ 原生布局注册 w13_*/w2_* 六个 Parameter。"""
     # Arrange
@@ -185,8 +200,10 @@ def test_create_weights_registers_correct_shapes(monkeypatch: pytest.MonkeyPatch
 
     # Act
     method.create_weights(
-        layer=layer, num_experts=num_experts,
-        hidden_size=h, intermediate_size_per_partition=f_dim,
+        layer=layer,
+        num_experts=num_experts,
+        hidden_size=h,
+        intermediate_size_per_partition=f_dim,
         params_dtype=torch.bfloat16,
     )
 
@@ -212,6 +229,7 @@ def test_create_weights_registers_correct_shapes(monkeypatch: pytest.MonkeyPatch
 
 # ── 测试 2：weight_loader 的 w13 前/后半写入正确 ────────────────────────────
 
+
 def _load_expert(
     layer: torch.nn.Module,
     expert: AWQExpertWeights,
@@ -223,14 +241,14 @@ def _load_expert(
     """
     calls = (
         (layer.w13_qweight, expert.gate_qweight, "experts.N.gate_proj.qweight", "w1"),
-        (layer.w13_qzeros,  expert.gate_qzeros,  "experts.N.gate_proj.qzeros",  "w1"),
-        (layer.w13_scales,  expert.gate_scales,  "experts.N.gate_proj.scales",  "w1"),
-        (layer.w13_qweight, expert.up_qweight,   "experts.N.up_proj.qweight",   "w3"),
-        (layer.w13_qzeros,  expert.up_qzeros,    "experts.N.up_proj.qzeros",    "w3"),
-        (layer.w13_scales,  expert.up_scales,    "experts.N.up_proj.scales",    "w3"),
-        (layer.w2_qweight,  expert.down_qweight, "experts.N.down_proj.qweight", "w2"),
-        (layer.w2_qzeros,   expert.down_qzeros,  "experts.N.down_proj.qzeros",  "w2"),
-        (layer.w2_scales,   expert.down_scales,  "experts.N.down_proj.scales",  "w2"),
+        (layer.w13_qzeros, expert.gate_qzeros, "experts.N.gate_proj.qzeros", "w1"),
+        (layer.w13_scales, expert.gate_scales, "experts.N.gate_proj.scales", "w1"),
+        (layer.w13_qweight, expert.up_qweight, "experts.N.up_proj.qweight", "w3"),
+        (layer.w13_qzeros, expert.up_qzeros, "experts.N.up_proj.qzeros", "w3"),
+        (layer.w13_scales, expert.up_scales, "experts.N.up_proj.scales", "w3"),
+        (layer.w2_qweight, expert.down_qweight, "experts.N.down_proj.qweight", "w2"),
+        (layer.w2_qzeros, expert.down_qzeros, "experts.N.down_proj.qzeros", "w2"),
+        (layer.w2_scales, expert.down_scales, "experts.N.down_proj.scales", "w2"),
     )
     for param, loaded, name, shard_id in calls:
         layer.weight_loader(param, loaded, name, shard_id, expert_id)
@@ -245,14 +263,14 @@ def test_weight_loader_writes_w1_front_w3_back(
     method = _instantiate_method(monkeypatch, group_size=g)
     layer = _FakeLayer()
     method.create_weights(
-        layer=layer, num_experts=num_experts, hidden_size=h,
-        intermediate_size_per_partition=f_dim, params_dtype=torch.bfloat16,
+        layer=layer,
+        num_experts=num_experts,
+        hidden_size=h,
+        intermediate_size_per_partition=f_dim,
+        params_dtype=torch.bfloat16,
     )
 
-    experts = [
-        _make_expert(h, f_dim, g, torch.bfloat16, seed=e * 13)
-        for e in range(num_experts)
-    ]
+    experts = [_make_expert(h, f_dim, g, torch.bfloat16, seed=e * 13) for e in range(num_experts)]
 
     # Act
     for e, exp in enumerate(experts):
@@ -262,22 +280,28 @@ def test_weight_loader_writes_w1_front_w3_back(
     pack_f = f_dim // 8
     for e, exp in enumerate(experts):
         assert torch.equal(
-            layer.w13_qweight[e, :, :pack_f], exp.gate_qweight,
+            layer.w13_qweight[e, :, :pack_f],
+            exp.gate_qweight,
         ), f"expert {e}: w1 前半 qweight 写入错误"
         assert torch.equal(
-            layer.w13_qweight[e, :, pack_f:], exp.up_qweight,
+            layer.w13_qweight[e, :, pack_f:],
+            exp.up_qweight,
         ), f"expert {e}: w3 后半 qweight 写入错误"
         assert torch.equal(
-            layer.w13_scales[e, :, :f_dim], exp.gate_scales,
+            layer.w13_scales[e, :, :f_dim],
+            exp.gate_scales,
         )
         assert torch.equal(
-            layer.w13_scales[e, :, f_dim:], exp.up_scales,
+            layer.w13_scales[e, :, f_dim:],
+            exp.up_scales,
         )
         assert torch.equal(
-            layer.w13_qzeros[e, :, :pack_f], exp.gate_qzeros,
+            layer.w13_qzeros[e, :, :pack_f],
+            exp.gate_qzeros,
         )
         assert torch.equal(
-            layer.w13_qzeros[e, :, pack_f:], exp.up_qzeros,
+            layer.w13_qzeros[e, :, pack_f:],
+            exp.up_qzeros,
         )
         assert torch.equal(layer.w2_qweight[e], exp.down_qweight)
         assert torch.equal(layer.w2_qzeros[e], exp.down_qzeros)
@@ -286,10 +310,11 @@ def test_weight_loader_writes_w1_front_w3_back(
 
 # ── 测试 3：完整 pipeline 数值等价性 ─────────────────────────────────────
 
+
 @pytest.mark.parametrize(
     "scenario",
     [
-        (4, 4, 2, 128, 64, 32),     # (T, E, top_k, H, F, g)
+        (4, 4, 2, 128, 64, 32),  # (T, E, top_k, H, F, g)
         (8, 8, 4, 256, 128, 32),
     ],
     ids=["tiny", "mid"],
@@ -305,14 +330,14 @@ def test_end_to_end_pipeline_matches_reference(
     method = _instantiate_method(monkeypatch, group_size=g)
     layer = _FakeLayer()
     method.create_weights(
-        layer=layer, num_experts=num_experts, hidden_size=h,
-        intermediate_size_per_partition=f_dim, params_dtype=torch.bfloat16,
+        layer=layer,
+        num_experts=num_experts,
+        hidden_size=h,
+        intermediate_size_per_partition=f_dim,
+        params_dtype=torch.bfloat16,
     )
     torch.manual_seed(0)
-    experts = [
-        _make_expert(h, f_dim, g, torch.bfloat16, seed=e * 7)
-        for e in range(num_experts)
-    ]
+    experts = [_make_expert(h, f_dim, g, torch.bfloat16, seed=e * 7) for e in range(num_experts)]
     for e, exp in enumerate(experts):
         _load_expert(layer, exp, expert_id=e)
 
@@ -323,8 +348,11 @@ def test_end_to_end_pipeline_matches_reference(
 
     # Act
     out = method.apply(
-        layer=layer, x=hidden, topk_weights=topk_w,
-        topk_ids=topk_ids, shared_experts_input=None,
+        layer=layer,
+        x=hidden,
+        topk_weights=topk_w,
+        topk_ids=topk_ids,
+        shared_experts_input=None,
     )
     ref = awq_moe_expert_ffn_reference(hidden, topk_ids, topk_w, experts)
 
@@ -334,6 +362,7 @@ def test_end_to_end_pipeline_matches_reference(
 
 # ── 测试 4：apply 对 3D 输入的 reshape 契约 ────────────────────────────────
 
+
 def test_apply_handles_3d_input(monkeypatch: pytest.MonkeyPatch) -> None:
     """当调用方传入 ``[B, S, H]`` 时，apply 应内部压成 2D 并还原形状。"""
     # Arrange
@@ -342,13 +371,13 @@ def test_apply_handles_3d_input(monkeypatch: pytest.MonkeyPatch) -> None:
     method = _instantiate_method(monkeypatch, group_size=g)
     layer = _FakeLayer()
     method.create_weights(
-        layer=layer, num_experts=num_experts, hidden_size=h,
-        intermediate_size_per_partition=f_dim, params_dtype=torch.bfloat16,
+        layer=layer,
+        num_experts=num_experts,
+        hidden_size=h,
+        intermediate_size_per_partition=f_dim,
+        params_dtype=torch.bfloat16,
     )
-    experts = [
-        _make_expert(h, f_dim, g, torch.bfloat16, seed=e)
-        for e in range(num_experts)
-    ]
+    experts = [_make_expert(h, f_dim, g, torch.bfloat16, seed=e) for e in range(num_experts)]
     for e, exp in enumerate(experts):
         _load_expert(layer, exp, expert_id=e)
     method.process_weights_after_loading(layer)
@@ -358,8 +387,11 @@ def test_apply_handles_3d_input(monkeypatch: pytest.MonkeyPatch) -> None:
 
     # Act
     out = method.apply(
-        layer=layer, x=x_3d, topk_weights=topk_w,
-        topk_ids=topk_ids, shared_experts_input=None,
+        layer=layer,
+        x=x_3d,
+        topk_weights=topk_w,
+        topk_ids=topk_ids,
+        shared_experts_input=None,
     )
 
     # Assert：输出应保持 3D 且 shape 与输入一致
@@ -368,6 +400,7 @@ def test_apply_handles_3d_input(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 # ── 测试 5：TP=2 切分逻辑的代数正确性 ──────────────────────────────────────
+
 
 def test_weight_loader_tp2_shards_correctly(
     monkeypatch: pytest.MonkeyPatch,
@@ -386,18 +419,26 @@ def test_weight_loader_tp2_shards_correctly(
     layers: list[torch.nn.Module] = []
     for rank in range(2):
         method = _instantiate_method(
-            monkeypatch, tp_rank=rank, tp_size=2, group_size=g,
+            monkeypatch,
+            tp_rank=rank,
+            tp_size=2,
+            group_size=g,
         )
         layer = _FakeLayer()
         method.create_weights(
-            layer=layer, num_experts=num_experts, hidden_size=h,
-            intermediate_size_per_partition=full_f // 2,   # TP 切后
+            layer=layer,
+            num_experts=num_experts,
+            hidden_size=h,
+            intermediate_size_per_partition=full_f // 2,  # TP 切后
             params_dtype=torch.bfloat16,
         )
         # 只加载 gate_proj.qweight（沿 N 切的代表），验证切分
         layer.weight_loader(
-            layer.w13_qweight, full_expert.gate_qweight,
-            "experts.0.gate_proj.qweight", "w1", 0,
+            layer.w13_qweight,
+            full_expert.gate_qweight,
+            "experts.0.gate_proj.qweight",
+            "w1",
+            0,
         )
         layers.append(layer)
 
@@ -417,6 +458,7 @@ def test_weight_loader_tp2_shards_correctly(
 
 # ── 测试 6：w2 的 K 维（F）TP 切分 ──────────────────────────────────────────
 
+
 def test_weight_loader_tp2_w2_shards_along_k(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -429,17 +471,25 @@ def test_weight_loader_tp2_w2_shards_along_k(
     layers: list[torch.nn.Module] = []
     for rank in range(2):
         method = _instantiate_method(
-            monkeypatch, tp_rank=rank, tp_size=2, group_size=g,
+            monkeypatch,
+            tp_rank=rank,
+            tp_size=2,
+            group_size=g,
         )
         layer = _FakeLayer()
         method.create_weights(
-            layer=layer, num_experts=1, hidden_size=h,
+            layer=layer,
+            num_experts=1,
+            hidden_size=h,
             intermediate_size_per_partition=full_f // 2,
             params_dtype=torch.bfloat16,
         )
         layer.weight_loader(
-            layer.w2_qweight, full_expert.down_qweight,
-            "experts.0.down_proj.qweight", "w2", 0,
+            layer.w2_qweight,
+            full_expert.down_qweight,
+            "experts.0.down_proj.qweight",
+            "w2",
+            0,
         )
         layers.append(layer)
 
@@ -456,6 +506,7 @@ def test_weight_loader_tp2_w2_shards_along_k(
 
 
 # ── 测试 7（回归）：每个 Parameter 的 weight_loader 都被自定义 closure 覆盖 ─
+
 
 def test_param_weight_loader_is_custom_closure(
     monkeypatch: pytest.MonkeyPatch,
@@ -482,8 +533,11 @@ def test_param_weight_loader_is_custom_closure(
 
     # Act：模拟 FusedMoE 的典型调用方式——把默认 loader 塞进 extra_weight_attrs
     method.create_weights(
-        layer=layer, num_experts=num_experts, hidden_size=h,
-        intermediate_size_per_partition=f_dim, params_dtype=torch.bfloat16,
+        layer=layer,
+        num_experts=num_experts,
+        hidden_size=h,
+        intermediate_size_per_partition=f_dim,
+        params_dtype=torch.bfloat16,
         weight_loader=_sentinel_default_loader,
     )
 
@@ -493,25 +547,29 @@ def test_param_weight_loader_is_custom_closure(
     assert getattr(custom, "supports_moe_loading", False) is True
 
     for name in (
-        "w13_qweight", "w13_qzeros", "w13_scales",
-        "w2_qweight", "w2_qzeros", "w2_scales",
+        "w13_qweight",
+        "w13_qzeros",
+        "w13_scales",
+        "w2_qweight",
+        "w2_qzeros",
+        "w2_scales",
     ):
         param = getattr(layer, name)
         assert callable(param.weight_loader), f"{name}: weight_loader 不可调用"
-        assert param.weight_loader is custom, (
-            f"{name}: Parameter 上的 weight_loader 未被覆盖为自定义 closure"
-        )
+        assert param.weight_loader is custom, f"{name}: Parameter 上的 weight_loader 未被覆盖为自定义 closure"
 
     # 触发一次真实加载，sentinel 永远不应被调用
     expert = _make_expert(h, f_dim, g, torch.bfloat16, seed=0)
     layer.w13_qweight.weight_loader(
-        layer.w13_qweight, expert.gate_qweight,
-        "experts.0.gate_proj.qweight", "w1", 0,
+        layer.w13_qweight,
+        expert.gate_qweight,
+        "experts.0.gate_proj.qweight",
+        "w1",
+        0,
     )
-    assert not sentinel_default_loader_called, (
-        "默认 weight_loader 被误调用，覆盖逻辑失败"
-    )
+    assert not sentinel_default_loader_called, "默认 weight_loader 被误调用，覆盖逻辑失败"
     # 校验真实写入效果（w1 前半 qweight 应与 checkpoint 一致）
     assert torch.equal(
-        layer.w13_qweight[0, :, : f_dim // 8], expert.gate_qweight,
+        layer.w13_qweight[0, :, : f_dim // 8],
+        expert.gate_qweight,
     )

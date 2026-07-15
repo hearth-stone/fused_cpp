@@ -9,6 +9,7 @@ AWQ 布局权威参考：
 - https://github.com/casper-hansen/AutoAWQ/blob/main/awq/utils/packing_utils.py
 - https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/quantization/awq.py
 """
+
 from __future__ import annotations
 
 import pytest
@@ -32,6 +33,7 @@ _TOL_W4A8 = dict(rtol=5e-2, atol=5e-2, cos_sim_threshold=0.999)
 
 # ── 辅助函数 ──
 
+
 def _assert_tensor_close(
     actual: torch.Tensor,
     ref: torch.Tensor,
@@ -41,12 +43,8 @@ def _assert_tensor_close(
     cos_sim_threshold: float,
 ) -> None:
     """统一等价性断言：误差 + 余弦相似度 + NaN / Inf 鲁棒性。"""
-    assert actual.shape == ref.shape, (
-        f"shape mismatch: {actual.shape} vs {ref.shape}"
-    )
-    assert actual.dtype == ref.dtype, (
-        f"dtype mismatch: {actual.dtype} vs {ref.dtype}"
-    )
+    assert actual.shape == ref.shape, f"shape mismatch: {actual.shape} vs {ref.shape}"
+    assert actual.dtype == ref.dtype, f"dtype mismatch: {actual.dtype} vs {ref.dtype}"
 
     for name, t in (("actual", actual), ("ref", ref)):
         n_nan = torch.isnan(t).sum().item()
@@ -81,10 +79,12 @@ def _pack_awq_along_n(unpacked: torch.Tensor) -> torch.Tensor:
 
     # 依 AWQ_ORDER 从 N 方向取 8 个值，分别占据 nibble 0..7
     order_idx = torch.tensor(AWQ_ORDER, dtype=torch.long)
-    picked = reshaped.index_select(-1, order_idx)                 # [..., N//8, 8]
+    picked = reshaped.index_select(-1, order_idx)  # [..., N//8, 8]
 
     shifts = torch.arange(0, 32, 4, dtype=torch.int32).view(
-        *([1] * len(lead)), 1, 8,
+        *([1] * len(lead)),
+        1,
+        8,
     )
     return (picked << shifts).sum(dim=-1).to(torch.int32)
 
@@ -105,15 +105,13 @@ def _build_random_awq_weights(
     w_int4 = torch.randint(0, 16, (k, n), generator=gen, dtype=torch.int32)
     groups = k // group_size
     z_int4 = torch.randint(0, 16, (groups, n), generator=gen, dtype=torch.int32)
-    scales = (
-        torch.rand((groups, n), generator=gen, dtype=torch.float32) * 0.02 + 0.001
-    ).to(torch.float16)
+    scales = (torch.rand((groups, n), generator=gen, dtype=torch.float32) * 0.02 + 0.001).to(torch.float16)
 
-    qweight = _pack_awq_along_n(w_int4)                           # [K, N//8] int32
-    qzeros = _pack_awq_along_n(z_int4)                            # [G, N//8] int32
+    qweight = _pack_awq_along_n(w_int4)  # [K, N//8] int32
+    qzeros = _pack_awq_along_n(z_int4)  # [G, N//8] int32
 
     # 参考反量化权重：w_fp[k, n] = (w_int4[k, n] - z_int4[k//g, n]) * scales[k//g, n]
-    z_expanded = z_int4.repeat_interleave(group_size, dim=0)      # [K, N]
+    z_expanded = z_int4.repeat_interleave(group_size, dim=0)  # [K, N]
     s_expanded = scales.to(torch.float32).repeat_interleave(group_size, dim=0)
     w_fp = (w_int4.to(torch.float32) - z_expanded.to(torch.float32)) * s_expanded
 
@@ -132,11 +130,11 @@ def _reference_linear(
     k = qweight.shape[0]
     group_size = k // groups
 
-    w_q = unpack_awq_qweight(qweight).to(torch.float32)           # [K, N]
-    w_z = unpack_awq_qzeros(qzeros).to(torch.float32)             # [G, N]
-    w_z_expanded = w_z.repeat_interleave(group_size, dim=0)       # [K, N]
+    w_q = unpack_awq_qweight(qweight).to(torch.float32)  # [K, N]
+    w_z = unpack_awq_qzeros(qzeros).to(torch.float32)  # [G, N]
+    w_z_expanded = w_z.repeat_interleave(group_size, dim=0)  # [K, N]
     s_expanded = scales.to(torch.float32).repeat_interleave(group_size, dim=0)
-    w_fp = (w_q - w_z_expanded) * s_expanded                      # [K, N]
+    w_fp = (w_q - w_z_expanded) * s_expanded  # [K, N]
 
     out = torch.matmul(x.to(torch.float32), w_fp)
     if bias is not None:
@@ -145,6 +143,7 @@ def _reference_linear(
 
 
 # ── 解包单元测试 ──
+
 
 class TestUnpack:
     """qweight / qzeros 解包工具函数自洽性。"""
@@ -179,12 +178,14 @@ class TestUnpack:
         # [0, 4, 1, 5, 2, 6, 3, 7]（因为 AWQ_ORDER = 0,2,4,6,1,3,5,7）
         unpacked = unpack_awq_qweight(packed).to(torch.int32)
         expected = torch.tensor(
-            [[0, 4, 1, 5, 2, 6, 3, 7]], dtype=torch.int32,
+            [[0, 4, 1, 5, 2, 6, 3, 7]],
+            dtype=torch.int32,
         )
         assert torch.equal(unpacked, expected)
 
 
 # ── W4A8 linear 正确性 ──
+
 
 class TestW4A8LinearCorrectness:
     """w4a8_linear 与完整反量化参考实现的等价性。"""
@@ -208,7 +209,10 @@ class TestW4A8LinearCorrectness:
 
         torch.manual_seed(0)
         qweight, qzeros, scales, _ = _build_random_awq_weights(
-            k, n, group_size, seed=0,
+            k,
+            n,
+            group_size,
+            seed=0,
         )
         x = torch.randn(m, k, dtype=torch.bfloat16)
 
@@ -225,7 +229,10 @@ class TestW4A8LinearCorrectness:
         m, k, n, group_size = 8, 128, 64, 32
         torch.manual_seed(1)
         qweight, qzeros, scales, _ = _build_random_awq_weights(
-            k, n, group_size, seed=1,
+            k,
+            n,
+            group_size,
+            seed=1,
         )
         x = torch.randn(m, k, dtype=torch.bfloat16)
         bias = torch.randn(n, dtype=torch.bfloat16)
@@ -243,7 +250,10 @@ class TestW4A8LinearCorrectness:
         b, s, k, n, group_size = 2, 16, 128, 64, 32
         torch.manual_seed(2)
         qweight, qzeros, scales, _ = _build_random_awq_weights(
-            k, n, group_size, seed=2,
+            k,
+            n,
+            group_size,
+            seed=2,
         )
         x = torch.randn(b, s, k, dtype=torch.bfloat16)
 
@@ -259,7 +269,10 @@ class TestW4A8LinearCorrectness:
         """M=0 空输入应返回空张量，而非报错。"""
         k, n, group_size = 64, 32, 32
         qweight, qzeros, scales, _ = _build_random_awq_weights(
-            k, n, group_size, seed=3,
+            k,
+            n,
+            group_size,
+            seed=3,
         )
         x = torch.empty(0, k, dtype=torch.bfloat16)
         out = fused_cpp.w4a8_linear(x, qweight, qzeros, scales, bias=None)
@@ -269,11 +282,15 @@ class TestW4A8LinearCorrectness:
 
 # ── 输入校验 ──
 
+
 class TestW4A8LinearValidation:
     """非法输入应抛出清晰的 RuntimeError。"""
 
     def _dummy_weights(
-        self, k: int = 32, n: int = 16, group_size: int = 32,
+        self,
+        k: int = 32,
+        n: int = 16,
+        group_size: int = 32,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         return _build_random_awq_weights(k, n, group_size, seed=0)[:3]
 

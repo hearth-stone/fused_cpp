@@ -8,6 +8,7 @@ N-block as [g0 g1 g2 g3 | u0 u1 u2 u3], i.e.
 Verified by running the fp32 GEMM on the interleaved-packed weights and
 checking each interleaved column against the reference gate/up feature.
 """
+
 from __future__ import annotations
 
 import platform
@@ -55,12 +56,8 @@ def test_interleaved_prepack_permutation(h, f, m):
     up_ref = ref[:, f:]
 
     for feat in range(f):
-        torch.testing.assert_close(
-            c[:, _gate_col(feat)], gate_ref[:, feat], atol=8e-2, rtol=8e-2
-        )
-        torch.testing.assert_close(
-            c[:, _up_col(feat)], up_ref[:, feat], atol=8e-2, rtol=8e-2
-        )
+        torch.testing.assert_close(c[:, _gate_col(feat)], gate_ref[:, feat], atol=8e-2, rtol=8e-2)
+        torch.testing.assert_close(c[:, _up_col(feat)], up_ref[:, feat], atol=8e-2, rtol=8e-2)
 
     # Padded features [F, F_pad4) must be zero (weights zero-filled there).
     for feat in range(f, f_pad4):

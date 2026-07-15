@@ -9,6 +9,7 @@ Run pinned:
   OMP_NUM_THREADS=1 OMP_PROC_BIND=FALSE taskset -c 0-7 \
     python cpu_moe_schedule_optimization/benchmarks/bench_fused_silu.py
 """
+
 from __future__ import annotations
 
 import argparse
@@ -71,15 +72,18 @@ def main():
         )
         topk_weights = torch.softmax(torch.randn(tokens, top_k), dim=-1)
         for nt in thread_list:
+
             def _base():
-                return fused_moe_bf16_tiled(
-                    x, base_w, topk_weights, topk_ids, num_threads=nt
-                )
+                return fused_moe_bf16_tiled(x, base_w, topk_weights, topk_ids, num_threads=nt)
 
             def _fused(d):
                 return fused_moe_bf16_tiled(
-                    x, fused_w, topk_weights, topk_ids,
-                    num_threads=nt, silu_poly_degree=d,
+                    x,
+                    fused_w,
+                    topk_weights,
+                    topk_ids,
+                    num_threads=nt,
+                    silu_poly_degree=d,
                 )
 
             base_ms = _time(_base, args.warmup, args.runs)
@@ -90,8 +94,7 @@ def main():
             got = _fused(5).float()
             maxdiff = (ref - got).abs().max().item()
             print(
-                f"{tokens:6d} {nt:6d}  {base_ms:8.3f} {p5:6.3f} {p6:6.3f} "
-                f"{p4:6.3f}  {base_ms / p5:5.2f}  {maxdiff:.4f}"
+                f"{tokens:6d} {nt:6d}  {base_ms:8.3f} {p5:6.3f} {p6:6.3f} {p4:6.3f}  {base_ms / p5:5.2f}  {maxdiff:.4f}"
             )
 
 

@@ -8,6 +8,7 @@ Public API:
     packed = bf16_linear.prepare(weight_bf16)
     out = bf16_linear.linear(x_bf16, packed, out_dtype=torch.bfloat16)
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -49,13 +50,9 @@ def prepare(weight: torch.Tensor) -> PreparedBF16LinearWeight:
     """Prepack a bf16 ``[N, K]`` linear weight for repeated GEMMs."""
     _require_backend()
     if weight.dim() != 2:
-        raise RuntimeError(
-            f"bf16_linear.prepare: weight must be 2D [N, K], got {weight.dim()}D"
-        )
+        raise RuntimeError(f"bf16_linear.prepare: weight must be 2D [N, K], got {weight.dim()}D")
     if weight.dtype != torch.bfloat16:
-        raise RuntimeError(
-            f"bf16_linear.prepare: weight dtype must be torch.bfloat16, got {weight.dtype}"
-        )
+        raise RuntimeError(f"bf16_linear.prepare: weight dtype must be torch.bfloat16, got {weight.dtype}")
     packed, k, n, n_padded = _bf16_linear_prepare_weight(weight.contiguous())
     return PreparedBF16LinearWeight(
         packed_weight=packed,
@@ -77,17 +74,11 @@ def linear(
     if not isinstance(packed, PreparedBF16LinearWeight):
         raise RuntimeError("bf16_linear.linear: packed must come from bf16_linear.prepare")
     if x.shape[-1] != packed.k:
-        raise RuntimeError(
-            f"bf16_linear.linear: x last dim must be K={packed.k}, got {x.shape[-1]}"
-        )
+        raise RuntimeError(f"bf16_linear.linear: x last dim must be K={packed.k}, got {x.shape[-1]}")
     if x.dtype != torch.bfloat16:
-        raise RuntimeError(
-            f"bf16_linear.linear: x dtype must be torch.bfloat16, got {x.dtype}"
-        )
+        raise RuntimeError(f"bf16_linear.linear: x dtype must be torch.bfloat16, got {x.dtype}")
     if out_dtype not in (torch.float32, torch.bfloat16):
-        raise RuntimeError(
-            f"bf16_linear.linear: out_dtype must be float32/bfloat16, got {out_dtype}"
-        )
+        raise RuntimeError(f"bf16_linear.linear: out_dtype must be float32/bfloat16, got {out_dtype}")
 
     batch_shape = tuple(x.shape[:-1])
     if x.numel() == 0:
@@ -116,15 +107,11 @@ def linear_raw(
     """Run bf16 linear with a raw ``[N, K]`` weight, packing it per call."""
     _require_backend()
     if out_dtype not in (torch.float32, torch.bfloat16):
-        raise RuntimeError(
-            f"bf16_linear.linear_raw: out_dtype must be float32/bfloat16, got {out_dtype}"
-        )
+        raise RuntimeError(f"bf16_linear.linear_raw: out_dtype must be float32/bfloat16, got {out_dtype}")
     batch_shape = tuple(x.shape[:-1])
     if x.numel() == 0:
         if weight.dim() != 2:
-            raise RuntimeError(
-                f"bf16_linear.linear_raw: weight must be 2D [N, K], got {weight.dim()}D"
-            )
+            raise RuntimeError(f"bf16_linear.linear_raw: weight must be 2D [N, K], got {weight.dim()}D")
         return torch.empty((*batch_shape, weight.shape[0]), dtype=out_dtype, device=x.device)
     x_2d = x.contiguous().reshape(-1, x.shape[-1])
     out_2d = _bf16_linear_to_dtype(

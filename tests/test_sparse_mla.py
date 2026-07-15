@@ -29,9 +29,7 @@ def _vllm_cpu_sparse_attention_reference(
             start = int(valid_indices[0].item())
             return kv_2d.narrow(0, start, 1)
 
-        breaks = (
-            valid_indices[1:] != valid_indices[:-1] + 1
-        ).nonzero(as_tuple=False).flatten()
+        breaks = (valid_indices[1:] != valid_indices[:-1] + 1).nonzero(as_tuple=False).flatten()
         if breaks.numel() == 0:
             start = int(valid_indices[0].item())
             return kv_2d.narrow(0, start, valid_indices.numel())

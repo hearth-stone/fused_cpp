@@ -34,9 +34,7 @@ def _gather_paged_k(
     return gathered.reshape(num_blocks * block_size, head_dim)[:seq_len].float()
 
 
-def _topk_for_row(
-    q_w: torch.Tensor, k_rows: torch.Tensor, topk_tokens: int
-) -> torch.Tensor:
+def _topk_for_row(q_w: torch.Tensor, k_rows: torch.Tensor, topk_tokens: int) -> torch.Tensor:
     k_take = min(topk_tokens, k_rows.shape[0])
     _, indices = torch.topk(torch.mv(k_rows, q_w), k_take, dim=-1)
     return indices.to(torch.int32)

@@ -11,6 +11,7 @@ QKᵀ 还是 PV 哪一步在 microkernel 层就慢。
 
 依赖：仅 fused_cpp._C；不依赖 pytest。
 """
+
 from __future__ import annotations
 
 import argparse
@@ -30,37 +31,44 @@ from typing import Dict, Set, Tuple
 #   "pv_8x8"   — PV 主体 8×8
 TRAIT_OVERRIDES: Dict[str, Set[Tuple[str, str]]] = {
     "baseline": {
-        ("qkt_8x8", "bf16"), ("qkt_8x8", "fp32"),
-        ("qkt_8x4", "bf16"), ("qkt_8x4", "fp32"),
-        ("pv_8x8",  "bf16"), ("pv_8x8",  "fp32"),
+        ("qkt_8x8", "bf16"),
+        ("qkt_8x8", "fp32"),
+        ("qkt_8x4", "bf16"),
+        ("qkt_8x4", "fp32"),
+        ("pv_8x8", "bf16"),
+        ("pv_8x8", "fp32"),
     },
     "scalar": {
-        ("qkt_8x8", "bf16"), ("qkt_8x8", "fp32"),
-        ("qkt_8x4", "bf16"), ("qkt_8x4", "fp32"),
-        ("pv_8x8",  "bf16"), ("pv_8x8",  "fp32"),
+        ("qkt_8x8", "bf16"),
+        ("qkt_8x8", "fp32"),
+        ("qkt_8x4", "bf16"),
+        ("qkt_8x4", "fp32"),
+        ("pv_8x8", "bf16"),
+        ("pv_8x8", "fp32"),
     },
     "pquad": {
         ("pv_8x8", "fp32"),
         ("pv_8x8", "bf16"),
     },
     "qk_ublock4": {
-        ("qkt_8x8", "fp32"), ("qkt_8x4", "fp32"),
+        ("qkt_8x8", "fp32"),
+        ("qkt_8x4", "fp32"),
     },
-    "qk_packk_full":   {("qkt_8x8", "bf16")},
-    "qk_packk_inner":  {("qkt_8x8", "bf16")},
-    "qk_packk_seq":    {("qkt_8x8", "bf16")},
-    "qk_unroll2":      {("qkt_8x8", "bf16")},
-    "qk_packqk_seq":         {("qkt_8x8", "bf16")},
-    "qk_packqk_seq4":        {("qkt_8x8", "bf16")},
-    "qk_packqk_seq4_ptr":    {("qkt_8x8", "bf16")},
+    "qk_packk_full": {("qkt_8x8", "bf16")},
+    "qk_packk_inner": {("qkt_8x8", "bf16")},
+    "qk_packk_seq": {("qkt_8x8", "bf16")},
+    "qk_unroll2": {("qkt_8x8", "bf16")},
+    "qk_packqk_seq": {("qkt_8x8", "bf16")},
+    "qk_packqk_seq4": {("qkt_8x8", "bf16")},
+    "qk_packqk_seq4_ptr": {("qkt_8x8", "bf16")},
     "qk_packqk_seq4_bmajor": {("qkt_8x8", "bf16")},
     "qk_packqk_seq4_pipe_a": {("qkt_8x8", "bf16")},
     "qk_packqk_seq4_pipe_b": {("qkt_8x8", "bf16")},
     # 组合 trait：bf16 qkt 走 packqk_seq4_bmajor，bf16/fp32 pv 都走 pquad。
     "qk_packqk_seq4_bmajor_pv_pquad": {
         ("qkt_8x8", "bf16"),
-        ("pv_8x8",  "fp32"),
-        ("pv_8x8",  "bf16"),
+        ("pv_8x8", "fp32"),
+        ("pv_8x8", "bf16"),
     },
 }
 
@@ -82,8 +90,7 @@ def _fmt_gflops(value: float, owned: bool) -> str:
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--E", type=int, default=192, help="head_dim (QKᵀ reduction)")
-    p.add_argument("--Sk", type=int, default=128,
-                   help="kv length within micro-tile (PV reduction)")
+    p.add_argument("--Sk", type=int, default=128, help="kv length within micro-tile (PV reduction)")
     p.add_argument("--iters", type=int, default=20000)
     p.add_argument("--warmup", type=int, default=1000)
     p.add_argument(
@@ -113,28 +120,29 @@ def main() -> int:
     print(f"\nE={args.E}  Sk={args.Sk}  iters={args.iters}  warmup={args.warmup}")
     print(f"  qkt_8x8 reduction = E   = {args.E}")
     print(f"  pv_8x8  reduction = Sk  = {args.Sk}")
-    print(f"  fall-through 单元格 = '—'（即该 trait 在此 cell 直接调 baseline）")
+    print("  fall-through 单元格 = '—'（即该 trait 在此 cell 直接调 baseline）")
     print("=" * 78)
-    print(f"{'impl':<32} {'dtype':<6} "
-          f"{'qkt_8x8':>10} {'pv_8x8':>10} {'qkt_8x4':>10}    PV/QKT")
-    print(f"{'':<32} {'':<6} "
-          f"{'GFLOPS':>10} {'GFLOPS':>10} {'GFLOPS':>10}")
+    print(f"{'impl':<32} {'dtype':<6} {'qkt_8x8':>10} {'pv_8x8':>10} {'qkt_8x4':>10}    PV/QKT")
+    print(f"{'':<32} {'':<6} {'GFLOPS':>10} {'GFLOPS':>10} {'GFLOPS':>10}")
     print("-" * 78)
 
     for impl in impls:
         for dtype in ("fp32", "bf16"):
             r = _C.benchmark_microkernel(
-                impl=impl, dtype=dtype,
-                E=args.E, Sk=args.Sk,
-                iterations=args.iters, warmup=args.warmup,
+                impl=impl,
+                dtype=dtype,
+                E=args.E,
+                Sk=args.Sk,
+                iterations=args.iters,
+                warmup=args.warmup,
             )
             qkt8_v = r["qkt_8x8_gflops"]
             qkt4_v = r["qkt_8x4_gflops"]
-            pv_v   = r["pv_8x8_gflops"]
+            pv_v = r["pv_8x8_gflops"]
 
             qkt8_owned = args.show_fallthrough or _owns(impl, "qkt_8x8", dtype)
             qkt4_owned = args.show_fallthrough or _owns(impl, "qkt_8x4", dtype)
-            pv_owned   = args.show_fallthrough or _owns(impl, "pv_8x8",  dtype)
+            pv_owned = args.show_fallthrough or _owns(impl, "pv_8x8", dtype)
 
             # PV/QKT ratio：两端任一 fall through 时无意义，显示为 —
             if qkt8_owned and pv_owned and qkt8_v > 0:
@@ -142,10 +150,12 @@ def main() -> int:
             else:
                 ratio_s = f"{'—':>6}"
 
-            print(f"{impl:<32} {dtype:<6} "
-                  f"{_fmt_gflops(qkt8_v, qkt8_owned)} "
-                  f"{_fmt_gflops(pv_v, pv_owned)} "
-                  f"{_fmt_gflops(qkt4_v, qkt4_owned)}   {ratio_s}")
+            print(
+                f"{impl:<32} {dtype:<6} "
+                f"{_fmt_gflops(qkt8_v, qkt8_owned)} "
+                f"{_fmt_gflops(pv_v, pv_owned)} "
+                f"{_fmt_gflops(qkt4_v, qkt4_owned)}   {ratio_s}"
+            )
     print("=" * 78)
 
     print("""

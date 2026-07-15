@@ -10,6 +10,7 @@
   * 测试矩阵自动包含新注册版本（注册一个 dummy 后用 pytest_generate_tests
     钩子 sanity-check）
 """
+
 from __future__ import annotations
 
 from contextlib import contextmanager
@@ -75,6 +76,7 @@ def test_duplicate_registration_raises_unless_override():
     ):
         # 第二次注册同名 → ValueError
         with pytest.raises(ValueError, match="already registered"):
+
             @register_sdpa_version("_test_dummy_dup", source="python")
             def _dup(query, key, value, *, attn_mask, is_causal, scale):
                 return query
@@ -203,17 +205,14 @@ def test_cpp_kernel_falls_back_to_python_when_extension_unavailable(
         override=True,
     )(py_twin)
     try:
-        cpp_callable = sdpa_mod._make_cpp_callable(
-            "_test_cpp_kernel_with_py_twin"
-        )
+        cpp_callable = sdpa_mod._make_cpp_callable("_test_cpp_kernel_with_py_twin")
         q = torch.zeros(1, 1, 1, 4)
         out = cpp_callable(q, q, q, attn_mask=None, is_causal=False, scale=None)
-        assert py_called["hit"], (
-            "fallback to same-name Python version should have been called"
-        )
+        assert py_called["hit"], "fallback to same-name Python version should have been called"
         assert out.shape == q.shape
     finally:
         from fused_cpp import sdpa_registry as _reg
+
         _reg._REGISTRY.pop("_test_cpp_kernel_with_py_twin", None)
 
     # (b) 没有同名 python fallback → 应当降级到 naive_torch（因其总是注册）。
@@ -244,12 +243,15 @@ def test_pytest_generate_tests_picks_up_new_version(sdpa_version):
     assert isinstance(sdpa_version, VersionInfo)
     all_names = {vi.name for vi in available_sdpa_versions()}
     assert sdpa_version.name in all_names, (
-        f"sdpa_version={sdpa_version.name!r} not found in registry: "
-        f"{sorted(all_names)}"
+        f"sdpa_version={sdpa_version.name!r} not found in registry: {sorted(all_names)}"
     )
     # 默认 6 个版本必须始终存在
     expected_default = {
-        "naive", "flash1", "flash2",
-        "naive_torch", "pytorch_sdpa", "pytorch_sdpa_math",
+        "naive",
+        "flash1",
+        "flash2",
+        "naive_torch",
+        "pytorch_sdpa",
+        "pytorch_sdpa_math",
     }
     assert expected_default.issubset(all_names)

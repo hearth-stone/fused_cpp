@@ -49,13 +49,10 @@ struct MaskF16Layout {
 
 using MaskF32Layout = MaskF16Layout;
 
-inline int64_t clamp_i64(int64_t v, int64_t lo, int64_t hi) {
-  return std::max(lo, std::min(v, hi));
-}
+inline int64_t clamp_i64(int64_t v, int64_t lo, int64_t hi) { return std::max(lo, std::min(v, hi)); }
 
 inline void check_config(const Config& cfg) {
-  if (cfg.B <= 0 || cfg.N <= 0 || cfg.L <= 0 || cfg.S <= 0 ||
-      cfg.E <= 0 || cfg.Ev <= 0) {
+  if (cfg.B <= 0 || cfg.N <= 0 || cfg.L <= 0 || cfg.S <= 0 || cfg.E <= 0 || cfg.Ev <= 0) {
     throw std::invalid_argument("shape dimensions must be positive");
   }
   if (cfg.S % 8 != 0) {
@@ -65,47 +62,29 @@ inline void check_config(const Config& cfg) {
     throw std::invalid_argument("fp32 packqkv path requires Ev % 8 == 0");
   }
   if (cfg.s_tile < 0 || cfg.s_tile % 8 != 0) {
-    throw std::invalid_argument(
-        "fp32 packqkv path requires s_tile == 0 or s_tile % 8 == 0");
+    throw std::invalid_argument("fp32 packqkv path requires s_tile == 0 or s_tile % 8 == 0");
   }
 }
 
-void pack_k_fp32_to_sblock8_strided(
-    const float* k_src,
-    float* k_dst,
-    int64_t B,
-    int64_t N,
-    int64_t S,
-    int64_t E,
-    ElementStrides k_stride);
+void pack_k_fp32_to_sblock8_strided(const float* k_src, float* k_dst, int64_t B, int64_t N, int64_t S, int64_t E,
+                                    ElementStrides k_stride);
 
-void pack_k_fp32_to_sblock8_strided(
-    const float* k_src,
-    float* k_dst,
-    int64_t B,
-    int64_t N,
-    int64_t S,
-    int64_t E,
-    ElementStrides k_stride) {
-  TORCH_CHECK(S % 8 == 0,
-              "pack_k_fp32_to_sblock8 requires S % 8 == 0, got S=", S);
+void pack_k_fp32_to_sblock8_strided(const float* k_src, float* k_dst, int64_t B, int64_t N, int64_t S, int64_t E,
+                                    ElementStrides k_stride) {
+  TORCH_CHECK(S % 8 == 0, "pack_k_fp32_to_sblock8 requires S % 8 == 0, got S=", S);
   const int64_t S_blocks = S / 8;
   const int64_t dst_stride_b = N * S_blocks * E * 8;
   const int64_t dst_stride_n = S_blocks * E * 8;
   const int64_t dst_stride_sb = E * 8;
 
 #ifdef _OPENMP
-  #pragma omp parallel for collapse(3) schedule(static)
+#pragma omp parallel for collapse(3) schedule(static)
 #endif
   for (int64_t b = 0; b < B; ++b) {
     for (int64_t n = 0; n < N; ++n) {
       for (int64_t sb = 0; sb < S_blocks; ++sb) {
-        const float* src = k_src + b * k_stride.b
-                                 + n * k_stride.n
-                                 + sb * 8 * k_stride.t;
-        float* dst = k_dst + b * dst_stride_b
-                           + n * dst_stride_n
-                           + sb * dst_stride_sb;
+        const float* src = k_src + b * k_stride.b + n * k_stride.n + sb * 8 * k_stride.t;
+        float* dst = k_dst + b * dst_stride_b + n * dst_stride_n + sb * dst_stride_sb;
         for (int64_t e = 0; e < E; ++e) {
           float* d = dst + e * 8;
           const int64_t ed = e * k_stride.d;
@@ -123,32 +102,22 @@ void pack_k_fp32_to_sblock8_strided(
   }
 }
 
-void pack_v_to_evblock8_strided(
-    const float* v_src,
-    float* v_dst,
-    int64_t B,
-    int64_t N,
-    int64_t S,
-    int64_t Ev,
-    ElementStrides v_stride) {
+void pack_v_to_evblock8_strided(const float* v_src, float* v_dst, int64_t B, int64_t N, int64_t S, int64_t Ev,
+                                ElementStrides v_stride) {
   const int64_t Eb = Ev / 8;
   const int64_t dst_stride_b = N * Eb * S * 8;
   const int64_t dst_stride_n = Eb * S * 8;
   const int64_t evblock_stride_dst = S * 8;
 
 #ifdef _OPENMP
-  #pragma omp parallel for collapse(3) schedule(static)
+#pragma omp parallel for collapse(3) schedule(static)
 #endif
   for (int64_t b = 0; b < B; ++b) {
     for (int64_t n = 0; n < N; ++n) {
       for (int64_t eb = 0; eb < Eb; ++eb) {
         const int64_t ev = eb * 8;
-        const float* src = v_src + b * v_stride.b
-                                 + n * v_stride.n
-                                 + ev * v_stride.d;
-        float* dst = v_dst + b * dst_stride_b
-                           + n * dst_stride_n
-                           + eb * evblock_stride_dst;
+        const float* src = v_src + b * v_stride.b + n * v_stride.n + ev * v_stride.d;
+        float* dst = v_dst + b * dst_stride_b + n * dst_stride_n + eb * evblock_stride_dst;
         for (int64_t s = 0; s < S; ++s) {
           const float* row = src + s * v_stride.t;
           float* packed = dst + s * 8;
@@ -165,31 +134,17 @@ void pack_v_to_evblock8_strided(
   }
 }
 
-void check_mask_layout(
-    int64_t L,
-    int64_t S,
-    const MaskF16Layout& layout,
-    const char* dtype_name) {
+void check_mask_layout(int64_t L, int64_t S, const MaskF16Layout& layout, const char* dtype_name) {
   if (layout.ne0 < S || layout.ne1 < L || layout.ne2 <= 0 || layout.ne3 <= 0) {
-    throw std::invalid_argument(std::string("unsupported ") + dtype_name +
-                                " mask shape");
+    throw std::invalid_argument(std::string("unsupported ") + dtype_name + " mask shape");
   }
   if (layout.nb0 <= 0 || layout.nb1 <= 0 || layout.nb2 <= 0 || layout.nb3 <= 0) {
-    throw std::invalid_argument(std::string("unsupported ") + dtype_name +
-                                " mask strides");
+    throw std::invalid_argument(std::string("unsupported ") + dtype_name + " mask strides");
   }
 }
 
-inline void qkt_packk8_tail_scalar(
-    const float* Q,
-    int64_t q_row_stride,
-    const float* Kp,
-    int64_t E,
-    float scale,
-    float* scores_buf,
-    int64_t scores_row_stride,
-    int Lq,
-    int Sk) {
+inline void qkt_packk8_tail_scalar(const float* Q, int64_t q_row_stride, const float* Kp, int64_t E, float scale,
+                                   float* scores_buf, int64_t scores_row_stride, int Lq, int Sk) {
   for (int i = 0; i < Lq; ++i) {
     const float* q = Q + i * q_row_stride;
     float* out = scores_buf + i * scores_row_stride;
@@ -206,10 +161,8 @@ inline void qkt_packk8_tail_scalar(
 struct MK_Fp32PackK8PQuad {
   static constexpr const char* kName = "fp32_packk8_pquad";
 
-  static inline void qkt_8x8(
-      const float* Q, int64_t q_row_stride,
-      const float* Kp, int64_t,
-      int64_t E, float scale, float* scores_buf) {
+  static inline void qkt_8x8(const float* Q, int64_t q_row_stride, const float* Kp, int64_t, int64_t E, float scale,
+                             float* scores_buf) {
 #if FUSED_CPP_SDPA_CACHE_HAS_NEON
     const float32x4_t scale_v = vdupq_n_f32(scale);
     float32x4_t lo0 = vdupq_n_f32(0.0f), hi0 = vdupq_n_f32(0.0f);
@@ -250,17 +203,17 @@ struct MK_Fp32PackK8PQuad {
       const float32x4_t k3l = vld1q_f32(Kp + (e + 3) * 8 + 0);
       const float32x4_t k3h = vld1q_f32(Kp + (e + 3) * 8 + 4);
 
-#define FUSED_CPP_QKT_PACKK8_FMA_ROW(ID, QV)                       \
-      do {                                                         \
-        lo##ID = vfmaq_laneq_f32(lo##ID, k0l, QV, 0);              \
-        hi##ID = vfmaq_laneq_f32(hi##ID, k0h, QV, 0);              \
-        lo##ID = vfmaq_laneq_f32(lo##ID, k1l, QV, 1);              \
-        hi##ID = vfmaq_laneq_f32(hi##ID, k1h, QV, 1);              \
-        lo##ID = vfmaq_laneq_f32(lo##ID, k2l, QV, 2);              \
-        hi##ID = vfmaq_laneq_f32(hi##ID, k2h, QV, 2);              \
-        lo##ID = vfmaq_laneq_f32(lo##ID, k3l, QV, 3);              \
-        hi##ID = vfmaq_laneq_f32(hi##ID, k3h, QV, 3);              \
-      } while (0)
+#define FUSED_CPP_QKT_PACKK8_FMA_ROW(ID, QV)      \
+  do {                                            \
+    lo##ID = vfmaq_laneq_f32(lo##ID, k0l, QV, 0); \
+    hi##ID = vfmaq_laneq_f32(hi##ID, k0h, QV, 0); \
+    lo##ID = vfmaq_laneq_f32(lo##ID, k1l, QV, 1); \
+    hi##ID = vfmaq_laneq_f32(hi##ID, k1h, QV, 1); \
+    lo##ID = vfmaq_laneq_f32(lo##ID, k2l, QV, 2); \
+    hi##ID = vfmaq_laneq_f32(hi##ID, k2h, QV, 2); \
+    lo##ID = vfmaq_laneq_f32(lo##ID, k3l, QV, 3); \
+    hi##ID = vfmaq_laneq_f32(hi##ID, k3h, QV, 3); \
+  } while (0)
 
       FUSED_CPP_QKT_PACKK8_FMA_ROW(0, qv0);
       FUSED_CPP_QKT_PACKK8_FMA_ROW(1, qv1);
@@ -276,12 +229,12 @@ struct MK_Fp32PackK8PQuad {
     for (; e < E; ++e) {
       const float32x4_t kl = vld1q_f32(Kp + e * 8 + 0);
       const float32x4_t kh = vld1q_f32(Kp + e * 8 + 4);
-#define FUSED_CPP_QKT_PACKK8_FMA_TAIL(ID, QROW)                    \
-      do {                                                         \
-        const float q = QROW[e];                                   \
-        lo##ID = vfmaq_n_f32(lo##ID, kl, q);                       \
-        hi##ID = vfmaq_n_f32(hi##ID, kh, q);                       \
-      } while (0)
+#define FUSED_CPP_QKT_PACKK8_FMA_TAIL(ID, QROW) \
+  do {                                          \
+    const float q = QROW[e];                    \
+    lo##ID = vfmaq_n_f32(lo##ID, kl, q);        \
+    hi##ID = vfmaq_n_f32(hi##ID, kh, q);        \
+  } while (0)
       FUSED_CPP_QKT_PACKK8_FMA_TAIL(0, q0);
       FUSED_CPP_QKT_PACKK8_FMA_TAIL(1, q1);
       FUSED_CPP_QKT_PACKK8_FMA_TAIL(2, q2);
@@ -293,13 +246,11 @@ struct MK_Fp32PackK8PQuad {
 #undef FUSED_CPP_QKT_PACKK8_FMA_TAIL
     }
 
-#define FUSED_CPP_QKT_PACKK8_STORE_ROW(ID)                         \
-    do {                                                           \
-      vst1q_f32(scores_buf + (ID) * 8 + 0,                         \
-                vmulq_f32(lo##ID, scale_v));                       \
-      vst1q_f32(scores_buf + (ID) * 8 + 4,                         \
-                vmulq_f32(hi##ID, scale_v));                       \
-    } while (0)
+#define FUSED_CPP_QKT_PACKK8_STORE_ROW(ID)                            \
+  do {                                                                \
+    vst1q_f32(scores_buf + (ID) * 8 + 0, vmulq_f32(lo##ID, scale_v)); \
+    vst1q_f32(scores_buf + (ID) * 8 + 4, vmulq_f32(hi##ID, scale_v)); \
+  } while (0)
     FUSED_CPP_QKT_PACKK8_STORE_ROW(0);
     FUSED_CPP_QKT_PACKK8_STORE_ROW(1);
     FUSED_CPP_QKT_PACKK8_STORE_ROW(2);
@@ -310,16 +261,12 @@ struct MK_Fp32PackK8PQuad {
     FUSED_CPP_QKT_PACKK8_STORE_ROW(7);
 #undef FUSED_CPP_QKT_PACKK8_STORE_ROW
 #else
-    qkt_packk8_tail_scalar(
-        Q, q_row_stride, Kp, E, scale, scores_buf, 8, 8, 8);
+    qkt_packk8_tail_scalar(Q, q_row_stride, Kp, E, scale, scores_buf, 8, 8, 8);
 #endif
   }
 
-  static inline void qkt_8x4(
-      const float* Q, int64_t q_row_stride,
-      const float* Kp, int64_t,
-      int64_t E, float scale,
-      float* scores_buf, int64_t scores_row_stride) {
+  static inline void qkt_8x4(const float* Q, int64_t q_row_stride, const float* Kp, int64_t, int64_t E, float scale,
+                             float* scores_buf, int64_t scores_row_stride) {
 #if FUSED_CPP_SDPA_CACHE_HAS_NEON
     const float32x4_t scale_v = vdupq_n_f32(scale);
     float32x4_t acc0 = vdupq_n_f32(0.0f);
@@ -354,13 +301,13 @@ struct MK_Fp32PackK8PQuad {
       const float32x4_t k1 = vld1q_f32(Kp + (e + 1) * 8);
       const float32x4_t k2 = vld1q_f32(Kp + (e + 2) * 8);
       const float32x4_t k3 = vld1q_f32(Kp + (e + 3) * 8);
-#define FUSED_CPP_QKT_PACKK4_FMA_ROW(ID, QV)                       \
-      do {                                                         \
-        acc##ID = vfmaq_laneq_f32(acc##ID, k0, QV, 0);             \
-        acc##ID = vfmaq_laneq_f32(acc##ID, k1, QV, 1);             \
-        acc##ID = vfmaq_laneq_f32(acc##ID, k2, QV, 2);             \
-        acc##ID = vfmaq_laneq_f32(acc##ID, k3, QV, 3);             \
-      } while (0)
+#define FUSED_CPP_QKT_PACKK4_FMA_ROW(ID, QV)       \
+  do {                                             \
+    acc##ID = vfmaq_laneq_f32(acc##ID, k0, QV, 0); \
+    acc##ID = vfmaq_laneq_f32(acc##ID, k1, QV, 1); \
+    acc##ID = vfmaq_laneq_f32(acc##ID, k2, QV, 2); \
+    acc##ID = vfmaq_laneq_f32(acc##ID, k3, QV, 3); \
+  } while (0)
       FUSED_CPP_QKT_PACKK4_FMA_ROW(0, qv0);
       FUSED_CPP_QKT_PACKK4_FMA_ROW(1, qv1);
       FUSED_CPP_QKT_PACKK4_FMA_ROW(2, qv2);
@@ -373,8 +320,10 @@ struct MK_Fp32PackK8PQuad {
     }
     for (; e < E; ++e) {
       const float32x4_t k = vld1q_f32(Kp + e * 8);
-#define FUSED_CPP_QKT_PACKK4_FMA_TAIL(ID, QROW)                    \
-      do { acc##ID = vfmaq_n_f32(acc##ID, k, QROW[e]); } while (0)
+#define FUSED_CPP_QKT_PACKK4_FMA_TAIL(ID, QROW) \
+  do {                                          \
+    acc##ID = vfmaq_n_f32(acc##ID, k, QROW[e]); \
+  } while (0)
       FUSED_CPP_QKT_PACKK4_FMA_TAIL(0, q0);
       FUSED_CPP_QKT_PACKK4_FMA_TAIL(1, q1);
       FUSED_CPP_QKT_PACKK4_FMA_TAIL(2, q2);
@@ -385,9 +334,7 @@ struct MK_Fp32PackK8PQuad {
       FUSED_CPP_QKT_PACKK4_FMA_TAIL(7, q7);
 #undef FUSED_CPP_QKT_PACKK4_FMA_TAIL
     }
-#define FUSED_CPP_QKT_PACKK4_STORE_ROW(ID)                         \
-    vst1q_f32(scores_buf + (ID) * scores_row_stride,               \
-              vmulq_f32(acc##ID, scale_v))
+#define FUSED_CPP_QKT_PACKK4_STORE_ROW(ID) vst1q_f32(scores_buf + (ID) * scores_row_stride, vmulq_f32(acc##ID, scale_v))
     FUSED_CPP_QKT_PACKK4_STORE_ROW(0);
     FUSED_CPP_QKT_PACKK4_STORE_ROW(1);
     FUSED_CPP_QKT_PACKK4_STORE_ROW(2);
@@ -398,57 +345,35 @@ struct MK_Fp32PackK8PQuad {
     FUSED_CPP_QKT_PACKK4_STORE_ROW(7);
 #undef FUSED_CPP_QKT_PACKK4_STORE_ROW
 #else
-    qkt_packk8_tail_scalar(
-        Q, q_row_stride, Kp, E, scale, scores_buf, scores_row_stride, 8, 4);
+    qkt_packk8_tail_scalar(Q, q_row_stride, Kp, E, scale, scores_buf, scores_row_stride, 8, 4);
 #endif
   }
 
-  static inline void qkt_tail(
-      const float* Q, int64_t q_row_stride,
-      const float* Kp, int64_t,
-      int64_t E, float scale,
-      float* scores_buf, int64_t scores_row_stride,
-      int Lq, int Sk) {
-    qkt_packk8_tail_scalar(
-        Q, q_row_stride, Kp, E, scale, scores_buf, scores_row_stride, Lq, Sk);
+  static inline void qkt_tail(const float* Q, int64_t q_row_stride, const float* Kp, int64_t, int64_t E, float scale,
+                              float* scores_buf, int64_t scores_row_stride, int Lq, int Sk) {
+    qkt_packk8_tail_scalar(Q, q_row_stride, Kp, E, scale, scores_buf, scores_row_stride, Lq, Sk);
   }
 
-  static inline void pv_8x8(
-      const float* P_hat, int64_t P_row_stride,
-      const float* V, int64_t v_row_stride,
-      int64_t Sk,
-      float* O, int64_t o_row_stride) {
+  static inline void pv_8x8(const float* P_hat, int64_t P_row_stride, const float* V, int64_t v_row_stride, int64_t Sk,
+                            float* O, int64_t o_row_stride) {
 #if FUSED_CPP_SDPA_CACHE_HAS_NEON
-    ::fused_cpp::sdpa_microkernels::gemm_pv_microkernel_8x8_fp32_pquad(
-        P_hat, P_row_stride, V, v_row_stride, Sk, O, o_row_stride);
+    ::fused_cpp::sdpa_microkernels::gemm_pv_microkernel_8x8_fp32_pquad(P_hat, P_row_stride, V, v_row_stride, Sk, O,
+                                                                       o_row_stride);
 #else
-    ::fused_cpp::sdpa_microkernels::gemm_pv_8x8(
-        P_hat, P_row_stride, V, v_row_stride, Sk, O, o_row_stride);
+    ::fused_cpp::sdpa_microkernels::gemm_pv_8x8(P_hat, P_row_stride, V, v_row_stride, Sk, O, o_row_stride);
 #endif
   }
 
-  static inline void pv_tail(
-      const float* P_hat, int64_t P_row_stride,
-      const float* V, int64_t v_row_stride,
-      int64_t Sk,
-      float* O, int64_t o_row_stride,
-      int Lq, int Ev) {
-    ::fused_cpp::sdpa_microkernels::gemm_pv_tail(
-        P_hat, P_row_stride, V, v_row_stride, Sk, O, o_row_stride, Lq, Ev);
+  static inline void pv_tail(const float* P_hat, int64_t P_row_stride, const float* V, int64_t v_row_stride, int64_t Sk,
+                             float* O, int64_t o_row_stride, int Lq, int Ev) {
+    ::fused_cpp::sdpa_microkernels::gemm_pv_tail(P_hat, P_row_stride, V, v_row_stride, Sk, O, o_row_stride, Lq, Ev);
   }
 };
 
 template <bool kCausal, bool kHasMask>
-void run_fp32_packk_path(
-    const float* q_ptr,
-    const float* k_packed_ptr,
-    const float* v_packed_ptr,
-    const SdpaParams& p,
-    const TileSizes& ts,
-    bool path_a,
-    int total_threads,
-    ElementStrides q_stride,
-    ElementStrides out_stride) {
+void run_fp32_packk_path(const float* q_ptr, const float* k_packed_ptr, const float* v_packed_ptr, const SdpaParams& p,
+                         const TileSizes& ts, bool path_a, int total_threads, ElementStrides q_stride,
+                         ElementStrides out_stride) {
   const int64_t S_blocks = p.S / 8;
   const int64_t k_packed_stride_n = S_blocks * p.E * 8;
   const int64_t k_packed_stride_b = p.N * k_packed_stride_n;
@@ -467,23 +392,16 @@ void run_fp32_packk_path(
   FUSED_CPP_SDPA_PROFILE_SCOPE(::fused_cpp::sdpa_profile::Slot::kMain);
   if (path_a) {
     run_path_collapse3<MK_Fp32PackK8PQuad, float, true, kHasMask, kCausal>(
-        q_ptr, k_packed_ptr, v_packed_ptr, p, ts,
-        q_stride.b, q_stride.n, q_stride.t,
-        k_packed_stride_b, k_packed_stride_n, k_packed_stride_s,
-        v_packed_stride_b, v_packed_stride_n, v_packed_stride_s,
-        v_evblock_stride,
-        m_stride_b, m_stride_n, m_stride_l,
-        out_stride.b, out_stride.n, out_stride.t);
+        q_ptr, k_packed_ptr, v_packed_ptr, p, ts, q_stride.b, q_stride.n, q_stride.t, k_packed_stride_b,
+        k_packed_stride_n, k_packed_stride_s, v_packed_stride_b, v_packed_stride_n, v_packed_stride_s, v_evblock_stride,
+        m_stride_b, m_stride_n, m_stride_l, out_stride.b, out_stride.n, out_stride.t);
   } else {
     const int64_t num_groups = std::max<int64_t>(1, total_threads);
     run_path_taskloop<MK_Fp32PackK8PQuad, float, true, kHasMask, kCausal>(
-        q_ptr, k_packed_ptr, v_packed_ptr, p, ts, static_cast<int>(num_groups),
-        q_stride.b, q_stride.n, q_stride.t,
-        k_packed_stride_b, k_packed_stride_n, k_packed_stride_s,
-        v_packed_stride_b, v_packed_stride_n, v_packed_stride_s,
-        v_evblock_stride,
-        m_stride_b, m_stride_n, m_stride_l,
-        out_stride.b, out_stride.n, out_stride.t);
+        q_ptr, k_packed_ptr, v_packed_ptr, p, ts, static_cast<int>(num_groups), q_stride.b, q_stride.n, q_stride.t,
+        k_packed_stride_b, k_packed_stride_n, k_packed_stride_s, v_packed_stride_b, v_packed_stride_n,
+        v_packed_stride_s, v_evblock_stride, m_stride_b, m_stride_n, m_stride_l, out_stride.b, out_stride.n,
+        out_stride.t);
   }
 }
 
@@ -496,21 +414,11 @@ int64_t byte_stride_to_float_elems(int64_t byte_stride) {
 
 }  // namespace
 
-void sdpa_fp32_packqkv_pbf16pv_strided_impl(
-    const float* q,
-    const float* k,
-    const float* v,
-    float* out,
-    const Config& cfg_in,
-    ElementStrides q_stride,
-    ElementStrides k_stride,
-    ElementStrides v_stride,
-    ElementStrides out_stride,
-    const float* mask32,
-    const uint16_t* mask_f16,
-    const MaskF16Layout* mask_f16_layout,
-    const float* mask_f32,
-    const MaskF32Layout* mask_f32_layout) {
+void sdpa_fp32_packqkv_pbf16pv_strided_impl(const float* q, const float* k, const float* v, float* out,
+                                            const Config& cfg_in, ElementStrides q_stride, ElementStrides k_stride,
+                                            ElementStrides v_stride, ElementStrides out_stride, const float* mask32,
+                                            const uint16_t* mask_f16, const MaskF16Layout* mask_f16_layout,
+                                            const float* mask_f32, const MaskF32Layout* mask_f32_layout) {
   Config cfg = cfg_in;
   check_config(cfg);
   if (q == nullptr || k == nullptr || v == nullptr || out == nullptr) {
@@ -570,8 +478,7 @@ void sdpa_fp32_packqkv_pbf16pv_strided_impl(
   if (profile_on) {
     ::fused_cpp::sdpa_profile::reset();
   }
-  const uint64_t profile_total_t0 =
-      profile_on ? ::fused_cpp::sdpa_profile::now_ns() : 0;
+  const uint64_t profile_total_t0 = profile_on ? ::fused_cpp::sdpa_profile::now_ns() : 0;
 
   const int64_t eb = cfg.Ev / 8;
   AlignedVector<float> v_packed;
@@ -581,8 +488,7 @@ void sdpa_fp32_packqkv_pbf16pv_strided_impl(
   }
   {
     FUSED_CPP_SDPA_PROFILE_SCOPE(::fused_cpp::sdpa_profile::Slot::kVPack);
-    pack_v_to_evblock8_strided(
-        v, v_packed.data(), cfg.B, cfg.N, cfg.S, cfg.Ev, v_stride);
+    pack_v_to_evblock8_strided(v, v_packed.data(), cfg.B, cfg.N, cfg.S, cfg.Ev, v_stride);
   }
 
   AlignedVector<float> k_packed;
@@ -592,12 +498,10 @@ void sdpa_fp32_packqkv_pbf16pv_strided_impl(
   }
   {
     FUSED_CPP_SDPA_PROFILE_SCOPE(::fused_cpp::sdpa_profile::Slot::kKPack);
-    pack_k_fp32_to_sblock8_strided(
-        k, k_packed.data(), cfg.B, cfg.N, cfg.S, cfg.E, k_stride);
+    pack_k_fp32_to_sblock8_strided(k, k_packed.data(), cfg.B, cfg.N, cfg.S, cfg.E, k_stride);
   }
 
-  TileSizes ts = compute_tile_sizes_l3kv(
-      cfg.B, cfg.N, cfg.S, cfg.L, cfg.E, cfg.Ev, sizeof(float));
+  TileSizes ts = compute_tile_sizes_l3kv(cfg.B, cfg.N, cfg.S, cfg.L, cfg.E, cfg.Ev, sizeof(float));
   if (cfg.s_tile > 0) {
     ts.Sc_l2 = cfg.s_tile;
     ts.Sc_l3 = std::max<int64_t>(ts.Sc_l2, std::min<int64_t>(cfg.S, ts.Sc_l3));
@@ -610,11 +514,9 @@ void sdpa_fp32_packqkv_pbf16pv_strided_impl(
     }
   }
 
-  const int64_t kv_bytes_per_bn =
-      cfg.S * (cfg.E + cfg.Ev) * static_cast<int64_t>(sizeof(float));
+  const int64_t kv_bytes_per_bn = cfg.S * (cfg.E + cfg.Ev) * static_cast<int64_t>(sizeof(float));
   const auto& cache_bytes = effective_cache_bytes();
-  const int64_t l3_budget =
-      static_cast<int64_t>(cache_bytes[2] * FUSED_CPP_SDPA_L3_RATIO);
+  const int64_t l3_budget = static_cast<int64_t>(cache_bytes[2] * FUSED_CPP_SDPA_L3_RATIO);
   const bool kv_fits_l3 = kv_bytes_per_bn <= l3_budget;
   const int total_threads =
 #ifdef _OPENMP
@@ -624,72 +526,43 @@ void sdpa_fp32_packqkv_pbf16pv_strided_impl(
 #endif
   const bool path_a = kv_fits_l3 || total_threads <= 1;
 
-  const bool has_mask =
-      mask32 != nullptr || mask_f16 != nullptr || mask_f32 != nullptr;
+  const bool has_mask = mask32 != nullptr || mask_f16 != nullptr || mask_f32 != nullptr;
   if (cfg.causal) {
     if (has_mask) {
-      run_fp32_packk_path<true, true>(
-          q, k_packed.data(), v_packed.data(), p, ts, path_a, total_threads,
-          q_stride, out_stride);
+      run_fp32_packk_path<true, true>(q, k_packed.data(), v_packed.data(), p, ts, path_a, total_threads, q_stride,
+                                      out_stride);
     } else {
-      run_fp32_packk_path<true, false>(
-          q, k_packed.data(), v_packed.data(), p, ts, path_a, total_threads,
-          q_stride, out_stride);
+      run_fp32_packk_path<true, false>(q, k_packed.data(), v_packed.data(), p, ts, path_a, total_threads, q_stride,
+                                       out_stride);
     }
   } else {
     if (has_mask) {
-      run_fp32_packk_path<false, true>(
-          q, k_packed.data(), v_packed.data(), p, ts, path_a, total_threads,
-          q_stride, out_stride);
+      run_fp32_packk_path<false, true>(q, k_packed.data(), v_packed.data(), p, ts, path_a, total_threads, q_stride,
+                                       out_stride);
     } else {
-      run_fp32_packk_path<false, false>(
-          q, k_packed.data(), v_packed.data(), p, ts, path_a, total_threads,
-          q_stride, out_stride);
+      run_fp32_packk_path<false, false>(q, k_packed.data(), v_packed.data(), p, ts, path_a, total_threads, q_stride,
+                                        out_stride);
     }
   }
 
   if (profile_on) {
-    ::fused_cpp::sdpa_profile::add(
-        ::fused_cpp::sdpa_profile::Slot::kTotal,
-        ::fused_cpp::sdpa_profile::now_ns() - profile_total_t0);
-    ::fused_cpp::sdpa_profile::print_summary(
-        "fp32_packqkv_standalone",
-        MK_Fp32PackK8PQuad::kName,
-        p,
-        path_a ? "A" : "B");
+    ::fused_cpp::sdpa_profile::add(::fused_cpp::sdpa_profile::Slot::kTotal,
+                                   ::fused_cpp::sdpa_profile::now_ns() - profile_total_t0);
+    ::fused_cpp::sdpa_profile::print_summary("fp32_packqkv_standalone", MK_Fp32PackK8PQuad::kName, p,
+                                             path_a ? "A" : "B");
   }
 }
 
-void sdpa_fp32_packqkv_pbf16pv(
-    const float* q,
-    const float* k,
-    const float* v,
-    float* out,
-    const Config& cfg) {
+void sdpa_fp32_packqkv_pbf16pv(const float* q, const float* k, const float* v, float* out, const Config& cfg) {
   sdpa_fp32_packqkv_pbf16pv_strided_impl(
-      q,
-      k,
-      v,
-      out,
-      cfg,
-      ElementStrides{cfg.N * cfg.L * cfg.E, cfg.L * cfg.E, cfg.E, 1},
+      q, k, v, out, cfg, ElementStrides{cfg.N * cfg.L * cfg.E, cfg.L * cfg.E, cfg.E, 1},
       ElementStrides{cfg.N * cfg.S * cfg.E, cfg.S * cfg.E, cfg.E, 1},
       ElementStrides{cfg.N * cfg.S * cfg.Ev, cfg.S * cfg.Ev, cfg.Ev, 1},
-      ElementStrides{cfg.N * cfg.L * cfg.Ev, cfg.L * cfg.Ev, cfg.Ev, 1},
-      nullptr,
-      nullptr,
-      nullptr,
-      nullptr,
-      nullptr);
+      ElementStrides{cfg.N * cfg.L * cfg.Ev, cfg.L * cfg.Ev, cfg.Ev, 1}, nullptr, nullptr, nullptr, nullptr, nullptr);
 }
 
-void reference_sdpa_fp32_mask(
-    const float* q,
-    const float* k,
-    const float* v,
-    const float* mask32,
-    float* out,
-    const Config& cfg_in) {
+void reference_sdpa_fp32_mask(const float* q, const float* k, const float* v, const float* mask32, float* out,
+                              const Config& cfg_in) {
   Config cfg = cfg_in;
   check_config(cfg);
   if (cfg.scale == 0.0f) {
@@ -714,9 +587,7 @@ void reference_sdpa_fp32_mask(
         const float* v_bn = v + b * v_b_stride + n * v_n_stride;
         float* out_row = out + b * out_b_stride + n * out_n_stride + l * cfg.Ev;
 
-        const int64_t visible = cfg.causal
-            ? clamp_i64(l + cfg.causal_offset + 1, 0, cfg.S)
-            : cfg.S;
+        const int64_t visible = cfg.causal ? clamp_i64(l + cfg.causal_offset + 1, 0, cfg.S) : cfg.S;
 
         float m = kNegInf;
         for (int64_t s = 0; s < visible; ++s) {
@@ -727,8 +598,7 @@ void reference_sdpa_fp32_mask(
           }
           scores[static_cast<size_t>(s)] = acc * cfg.scale;
           if (mask32 != nullptr) {
-            scores[static_cast<size_t>(s)] +=
-                mask32[((b * cfg.N + n) * cfg.L + l) * cfg.S + s];
+            scores[static_cast<size_t>(s)] += mask32[((b * cfg.N + n) * cfg.L + l) * cfg.S + s];
           }
           m = std::max(m, scores[static_cast<size_t>(s)]);
         }
@@ -756,12 +626,7 @@ void reference_sdpa_fp32_mask(
   }
 }
 
-void reference_sdpa_fp32(
-    const float* q,
-    const float* k,
-    const float* v,
-    float* out,
-    const Config& cfg) {
+void reference_sdpa_fp32(const float* q, const float* k, const float* v, float* out, const Config& cfg) {
   reference_sdpa_fp32_mask(q, k, v, nullptr, out, cfg);
 }
 
@@ -774,12 +639,8 @@ double counted_gflops(const Config& cfg, double mean_ms) {
       active_per_head += clamp_i64(l + cfg.causal_offset + 1, 0, cfg.S);
     }
   }
-  const double active =
-      static_cast<double>(cfg.B) * static_cast<double>(cfg.N) *
-      static_cast<double>(active_per_head);
-  const double flops_per_score =
-      2.0 * static_cast<double>(cfg.E) +
-      2.0 * static_cast<double>(cfg.Ev) + 5.0;
+  const double active = static_cast<double>(cfg.B) * static_cast<double>(cfg.N) * static_cast<double>(active_per_head);
+  const double flops_per_score = 2.0 * static_cast<double>(cfg.E) + 2.0 * static_cast<double>(cfg.Ev) + 5.0;
   return active * flops_per_score / (mean_ms * 1.0e6);
 }
 
@@ -799,37 +660,12 @@ double max_abs_diff(const float* a, const float* b, int64_t size) {
   return m;
 }
 
-int run_llamacpp_strided_impl(
-    const float* q,
-    const float* k,
-    const float* v,
-    const uint16_t* mask_f16,
-    const float* mask_f32,
-    float* out,
-    int64_t B,
-    int64_t H,
-    int64_t L,
-    int64_t S,
-    int64_t D,
-    int64_t DV,
-    int64_t q_nb0,
-    int64_t q_nb1,
-    int64_t q_nb2,
-    int64_t q_nb3,
-    int64_t k_nb0,
-    int64_t k_nb1,
-    int64_t k_nb2,
-    int64_t k_nb3,
-    int64_t v_nb0,
-    int64_t v_nb1,
-    int64_t v_nb2,
-    int64_t v_nb3,
-    int64_t o_nb0,
-    int64_t o_nb1,
-    int64_t o_nb2,
-    int64_t o_nb3,
-    const MaskF16Layout& mask_layout,
-    float scale) {
+int run_llamacpp_strided_impl(const float* q, const float* k, const float* v, const uint16_t* mask_f16,
+                              const float* mask_f32, float* out, int64_t B, int64_t H, int64_t L, int64_t S, int64_t D,
+                              int64_t DV, int64_t q_nb0, int64_t q_nb1, int64_t q_nb2, int64_t q_nb3, int64_t k_nb0,
+                              int64_t k_nb1, int64_t k_nb2, int64_t k_nb3, int64_t v_nb0, int64_t v_nb1, int64_t v_nb2,
+                              int64_t v_nb3, int64_t o_nb0, int64_t o_nb1, int64_t o_nb2, int64_t o_nb3,
+                              const MaskF16Layout& mask_layout, float scale) {
   const bool use_f16_mask = mask_f16 != nullptr;
   const bool use_f32_mask = mask_f32 != nullptr;
   if (use_f16_mask && use_f32_mask) {
@@ -881,40 +717,18 @@ int run_llamacpp_strided_impl(
   cfg.scale = scale;
   cfg.causal_offset = S - L;
   sdpa_fp32_packqkv_pbf16pv_strided_impl(
-      q,
-      k,
-      v,
-      out,
-      cfg,
-      ElementStrides{q_b, q_h, q_l, q_e},
-      ElementStrides{k_b, k_h, k_s, k_e},
-      ElementStrides{v_b, v_h, v_s, v_e},
-      ElementStrides{o_b, o_h, o_l, o_e},
-      nullptr,
-      mask_f16,
-      use_f16_mask ? &mask_layout : nullptr,
-      mask_f32,
-      use_f32_mask ? &mask_layout : nullptr);
+      q, k, v, out, cfg, ElementStrides{q_b, q_h, q_l, q_e}, ElementStrides{k_b, k_h, k_s, k_e},
+      ElementStrides{v_b, v_h, v_s, v_e}, ElementStrides{o_b, o_h, o_l, o_e}, nullptr, mask_f16,
+      use_f16_mask ? &mask_layout : nullptr, mask_f32, use_f32_mask ? &mask_layout : nullptr);
 
   return 0;
 }
 
 }  // namespace fp32_packqkv_sdpa
 
-extern "C" FUSED_CPP_FP32_PACKQKV_API int
-fused_cpp_sdpa_flash2_neon_l3kv_packqkv_pbf16pv_fp32_contiguous(
-    const float* q,
-    const float* k,
-    const float* v,
-    float* out,
-    int64_t B,
-    int64_t N,
-    int64_t L,
-    int64_t S,
-    int64_t E,
-    int64_t Ev,
-    int causal,
-    float scale) {
+extern "C" FUSED_CPP_FP32_PACKQKV_API int fused_cpp_sdpa_flash2_neon_l3kv_packqkv_pbf16pv_fp32_contiguous(
+    const float* q, const float* k, const float* v, float* out, int64_t B, int64_t N, int64_t L, int64_t S, int64_t E,
+    int64_t Ev, int causal, float scale) {
   try {
     fp32_packqkv_sdpa::Config cfg;
     cfg.B = B;
@@ -937,66 +751,39 @@ fused_cpp_sdpa_flash2_neon_l3kv_packqkv_pbf16pv_fp32_contiguous(
   }
 }
 
-extern "C" FUSED_CPP_FP32_PACKQKV_API int
-fused_cpp_sdpa_flash2_neon_l3kv_packqkv_pbf16pv_fp32_llamacpp(
-    const float* q,
-    const float* k,
-    const float* v,
-    float* out,
-    int64_t B,
-    int64_t H,
-    int64_t L,
-    int64_t S,
-    int64_t D,
-    int64_t DV,
-    int64_t q_nb0,
-    int64_t q_nb1,
-    int64_t q_nb2,
-    int64_t q_nb3,
-    int64_t k_nb0,
-    int64_t k_nb1,
-    int64_t k_nb2,
-    int64_t k_nb3,
-    int64_t v_nb0,
-    int64_t v_nb1,
-    int64_t v_nb2,
-    int64_t v_nb3,
-    int64_t o_nb0,
-    int64_t o_nb1,
-    int64_t o_nb2,
-    int64_t o_nb3,
-    float scale) {
+extern "C" FUSED_CPP_FP32_PACKQKV_API int fused_cpp_sdpa_flash2_neon_l3kv_packqkv_pbf16pv_fp32_llamacpp(
+    const float* q, const float* k, const float* v, float* out, int64_t B, int64_t H, int64_t L, int64_t S, int64_t D,
+    int64_t DV, int64_t q_nb0, int64_t q_nb1, int64_t q_nb2, int64_t q_nb3, int64_t k_nb0, int64_t k_nb1, int64_t k_nb2,
+    int64_t k_nb3, int64_t v_nb0, int64_t v_nb1, int64_t v_nb2, int64_t v_nb3, int64_t o_nb0, int64_t o_nb1,
+    int64_t o_nb2, int64_t o_nb3, float scale) {
   try {
     return fp32_packqkv_sdpa::run_llamacpp_strided_impl(
-        q,
-        k,
-        v,
-        nullptr,
-        nullptr,
-        out,
-        B,
-        H,
-        L,
-        S,
-        D,
-        DV,
-        q_nb0,
-        q_nb1,
-        q_nb2,
-        q_nb3,
-        k_nb0,
-        k_nb1,
-        k_nb2,
-        k_nb3,
-        v_nb0,
-        v_nb1,
-        v_nb2,
-        v_nb3,
-        o_nb0,
-        o_nb1,
-        o_nb2,
-        o_nb3,
-        fp32_packqkv_sdpa::MaskF16Layout{},
+        q, k, v, nullptr, nullptr, out, B, H, L, S, D, DV, q_nb0, q_nb1, q_nb2, q_nb3, k_nb0, k_nb1, k_nb2, k_nb3,
+        v_nb0, v_nb1, v_nb2, v_nb3, o_nb0, o_nb1, o_nb2, o_nb3, fp32_packqkv_sdpa::MaskF16Layout{}, scale);
+  } catch (const std::invalid_argument&) {
+    return 2;
+  } catch (const std::exception&) {
+    return 100;
+  } catch (...) {
+    return 101;
+  }
+}
+
+extern "C" FUSED_CPP_FP32_PACKQKV_API int fused_cpp_sdpa_flash2_neon_l3kv_packqkv_pbf16pv_fp32_llamacpp_mask_f16(
+    const float* q, const float* k, const float* v, const uint16_t* mask, float* out, int64_t B, int64_t H, int64_t L,
+    int64_t S, int64_t D, int64_t DV, int64_t q_nb0, int64_t q_nb1, int64_t q_nb2, int64_t q_nb3, int64_t k_nb0,
+    int64_t k_nb1, int64_t k_nb2, int64_t k_nb3, int64_t v_nb0, int64_t v_nb1, int64_t v_nb2, int64_t v_nb3,
+    int64_t o_nb0, int64_t o_nb1, int64_t o_nb2, int64_t o_nb3, int64_t mask_ne0, int64_t mask_ne1, int64_t mask_ne2,
+    int64_t mask_ne3, int64_t mask_nb0, int64_t mask_nb1, int64_t mask_nb2, int64_t mask_nb3, float scale) {
+  try {
+    if (mask == nullptr) {
+      return 1;
+    }
+    return fp32_packqkv_sdpa::run_llamacpp_strided_impl(
+        q, k, v, mask, nullptr, out, B, H, L, S, D, DV, q_nb0, q_nb1, q_nb2, q_nb3, k_nb0, k_nb1, k_nb2, k_nb3, v_nb0,
+        v_nb1, v_nb2, v_nb3, o_nb0, o_nb1, o_nb2, o_nb3,
+        fp32_packqkv_sdpa::MaskF16Layout{mask_ne0, mask_ne1, mask_ne2, mask_ne3, mask_nb0, mask_nb1, mask_nb2,
+                                         mask_nb3},
         scale);
   } catch (const std::invalid_argument&) {
     return 2;
@@ -1007,176 +794,21 @@ fused_cpp_sdpa_flash2_neon_l3kv_packqkv_pbf16pv_fp32_llamacpp(
   }
 }
 
-extern "C" FUSED_CPP_FP32_PACKQKV_API int
-fused_cpp_sdpa_flash2_neon_l3kv_packqkv_pbf16pv_fp32_llamacpp_mask_f16(
-    const float* q,
-    const float* k,
-    const float* v,
-    const uint16_t* mask,
-    float* out,
-    int64_t B,
-    int64_t H,
-    int64_t L,
-    int64_t S,
-    int64_t D,
-    int64_t DV,
-    int64_t q_nb0,
-    int64_t q_nb1,
-    int64_t q_nb2,
-    int64_t q_nb3,
-    int64_t k_nb0,
-    int64_t k_nb1,
-    int64_t k_nb2,
-    int64_t k_nb3,
-    int64_t v_nb0,
-    int64_t v_nb1,
-    int64_t v_nb2,
-    int64_t v_nb3,
-    int64_t o_nb0,
-    int64_t o_nb1,
-    int64_t o_nb2,
-    int64_t o_nb3,
-    int64_t mask_ne0,
-    int64_t mask_ne1,
-    int64_t mask_ne2,
-    int64_t mask_ne3,
-    int64_t mask_nb0,
-    int64_t mask_nb1,
-    int64_t mask_nb2,
-    int64_t mask_nb3,
-    float scale) {
+extern "C" FUSED_CPP_FP32_PACKQKV_API int fused_cpp_sdpa_flash2_neon_l3kv_packqkv_pbf16pv_fp32_llamacpp_mask_f32(
+    const float* q, const float* k, const float* v, const float* mask, float* out, int64_t B, int64_t H, int64_t L,
+    int64_t S, int64_t D, int64_t DV, int64_t q_nb0, int64_t q_nb1, int64_t q_nb2, int64_t q_nb3, int64_t k_nb0,
+    int64_t k_nb1, int64_t k_nb2, int64_t k_nb3, int64_t v_nb0, int64_t v_nb1, int64_t v_nb2, int64_t v_nb3,
+    int64_t o_nb0, int64_t o_nb1, int64_t o_nb2, int64_t o_nb3, int64_t mask_ne0, int64_t mask_ne1, int64_t mask_ne2,
+    int64_t mask_ne3, int64_t mask_nb0, int64_t mask_nb1, int64_t mask_nb2, int64_t mask_nb3, float scale) {
   try {
     if (mask == nullptr) {
       return 1;
     }
     return fp32_packqkv_sdpa::run_llamacpp_strided_impl(
-        q,
-        k,
-        v,
-        mask,
-        nullptr,
-        out,
-        B,
-        H,
-        L,
-        S,
-        D,
-        DV,
-        q_nb0,
-        q_nb1,
-        q_nb2,
-        q_nb3,
-        k_nb0,
-        k_nb1,
-        k_nb2,
-        k_nb3,
-        v_nb0,
-        v_nb1,
-        v_nb2,
-        v_nb3,
-        o_nb0,
-        o_nb1,
-        o_nb2,
-        o_nb3,
-        fp32_packqkv_sdpa::MaskF16Layout{
-            mask_ne0,
-            mask_ne1,
-            mask_ne2,
-            mask_ne3,
-            mask_nb0,
-            mask_nb1,
-            mask_nb2,
-            mask_nb3},
-        scale);
-  } catch (const std::invalid_argument&) {
-    return 2;
-  } catch (const std::exception&) {
-    return 100;
-  } catch (...) {
-    return 101;
-  }
-}
-
-extern "C" FUSED_CPP_FP32_PACKQKV_API int
-fused_cpp_sdpa_flash2_neon_l3kv_packqkv_pbf16pv_fp32_llamacpp_mask_f32(
-    const float* q,
-    const float* k,
-    const float* v,
-    const float* mask,
-    float* out,
-    int64_t B,
-    int64_t H,
-    int64_t L,
-    int64_t S,
-    int64_t D,
-    int64_t DV,
-    int64_t q_nb0,
-    int64_t q_nb1,
-    int64_t q_nb2,
-    int64_t q_nb3,
-    int64_t k_nb0,
-    int64_t k_nb1,
-    int64_t k_nb2,
-    int64_t k_nb3,
-    int64_t v_nb0,
-    int64_t v_nb1,
-    int64_t v_nb2,
-    int64_t v_nb3,
-    int64_t o_nb0,
-    int64_t o_nb1,
-    int64_t o_nb2,
-    int64_t o_nb3,
-    int64_t mask_ne0,
-    int64_t mask_ne1,
-    int64_t mask_ne2,
-    int64_t mask_ne3,
-    int64_t mask_nb0,
-    int64_t mask_nb1,
-    int64_t mask_nb2,
-    int64_t mask_nb3,
-    float scale) {
-  try {
-    if (mask == nullptr) {
-      return 1;
-    }
-    return fp32_packqkv_sdpa::run_llamacpp_strided_impl(
-        q,
-        k,
-        v,
-        nullptr,
-        mask,
-        out,
-        B,
-        H,
-        L,
-        S,
-        D,
-        DV,
-        q_nb0,
-        q_nb1,
-        q_nb2,
-        q_nb3,
-        k_nb0,
-        k_nb1,
-        k_nb2,
-        k_nb3,
-        v_nb0,
-        v_nb1,
-        v_nb2,
-        v_nb3,
-        o_nb0,
-        o_nb1,
-        o_nb2,
-        o_nb3,
-        fp32_packqkv_sdpa::MaskF32Layout{
-            mask_ne0,
-            mask_ne1,
-            mask_ne2,
-            mask_ne3,
-            mask_nb0,
-            mask_nb1,
-            mask_nb2,
-            mask_nb3},
+        q, k, v, nullptr, mask, out, B, H, L, S, D, DV, q_nb0, q_nb1, q_nb2, q_nb3, k_nb0, k_nb1, k_nb2, k_nb3, v_nb0,
+        v_nb1, v_nb2, v_nb3, o_nb0, o_nb1, o_nb2, o_nb3,
+        fp32_packqkv_sdpa::MaskF32Layout{mask_ne0, mask_ne1, mask_ne2, mask_ne3, mask_nb0, mask_nb1, mask_nb2,
+                                         mask_nb3},
         scale);
   } catch (const std::invalid_argument&) {
     return 2;

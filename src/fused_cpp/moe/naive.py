@@ -6,6 +6,7 @@ This module mirrors the tensor semantics of vLLM's ``cpu_fused_moe_torch``:
 grouped by expert, each expert runs gate/up -> activation -> down, then top-k
 expert outputs are weighted and reduced back to one output per token.
 """
+
 from __future__ import annotations
 
 from typing import Any
@@ -60,9 +61,7 @@ def _activation_name(activation: Any) -> str:
     value = {"gelu_pytorch_tanh": "gelu_tanh"}.get(value, value)
     if value not in _ACTIVATION_FNS:
         supported = ", ".join(sorted(_ACTIVATION_FNS))
-        raise ValueError(
-            f"Unsupported MoE activation {value!r}; supported activations: {supported}"
-        )
+        raise ValueError(f"Unsupported MoE activation {value!r}; supported activations: {supported}")
     return value
 
 
@@ -80,15 +79,9 @@ def _check_inputs(
     if input.dim() != 2:
         raise ValueError(f"input must be 2-D [tokens, hidden], got {tuple(input.shape)}")
     if w13_weight.dim() != 3:
-        raise ValueError(
-            "w13_weight must be 3-D [experts, 2 * ffn_hidden, hidden], got "
-            f"{tuple(w13_weight.shape)}"
-        )
+        raise ValueError(f"w13_weight must be 3-D [experts, 2 * ffn_hidden, hidden], got {tuple(w13_weight.shape)}")
     if w2_weight.dim() != 3:
-        raise ValueError(
-            "w2_weight must be 3-D [experts, hidden, ffn_hidden], got "
-            f"{tuple(w2_weight.shape)}"
-        )
+        raise ValueError(f"w2_weight must be 3-D [experts, hidden, ffn_hidden], got {tuple(w2_weight.shape)}")
     if topk_ids.dim() != 2 or topk_weights.dim() != 2:
         raise ValueError(
             "topk_ids and topk_weights must both be 2-D [tokens, top_k], got "
@@ -96,22 +89,16 @@ def _check_inputs(
         )
     if topk_ids.shape != topk_weights.shape:
         raise ValueError(
-            "topk_ids and topk_weights shapes must match, got "
-            f"{tuple(topk_ids.shape)} and {tuple(topk_weights.shape)}"
+            f"topk_ids and topk_weights shapes must match, got {tuple(topk_ids.shape)} and {tuple(topk_weights.shape)}"
         )
     if topk_ids.shape[0] != input.shape[0]:
-        raise ValueError(
-            f"topk first dimension must equal token count {input.shape[0]}, got "
-            f"{topk_ids.shape[0]}"
-        )
+        raise ValueError(f"topk first dimension must equal token count {input.shape[0]}, got {topk_ids.shape[0]}")
     if topk_ids.shape[1] == 0:
         raise ValueError("top_k dimension must be non-zero")
     if topk_ids.dtype not in _INTEGER_DTYPES:
         raise TypeError(f"topk_ids must use an integer dtype, got {topk_ids.dtype}")
     if not topk_weights.dtype.is_floating_point:
-        raise TypeError(
-            f"topk_weights must use a floating dtype, got {topk_weights.dtype}"
-        )
+        raise TypeError(f"topk_weights must use a floating dtype, got {topk_weights.dtype}")
     if (
         input.device != w13_weight.device
         or input.device != w2_weight.device
@@ -122,33 +109,24 @@ def _check_inputs(
 
     num_weight_experts, gate_up_size, hidden_size = w13_weight.shape
     if input.shape[1] != hidden_size:
-        raise ValueError(
-            f"input hidden size {input.shape[1]} does not match w13 hidden size "
-            f"{hidden_size}"
-        )
+        raise ValueError(f"input hidden size {input.shape[1]} does not match w13 hidden size {hidden_size}")
     if gate_up_size % 2 != 0:
         raise ValueError(f"w13 output dimension must be even, got {gate_up_size}")
     ffn_hidden_size = gate_up_size // 2
     expected_w2 = (num_weight_experts, hidden_size, ffn_hidden_size)
     if tuple(w2_weight.shape) != expected_w2:
-        raise ValueError(
-            f"w2_weight must have shape {expected_w2}, got {tuple(w2_weight.shape)}"
-        )
+        raise ValueError(f"w2_weight must have shape {expected_w2}, got {tuple(w2_weight.shape)}")
 
     if w13_bias is not None:
         if tuple(w13_bias.shape) != (num_weight_experts, gate_up_size):
             raise ValueError(
-                "w13_bias must have shape "
-                f"{(num_weight_experts, gate_up_size)}, got {tuple(w13_bias.shape)}"
+                f"w13_bias must have shape {(num_weight_experts, gate_up_size)}, got {tuple(w13_bias.shape)}"
             )
         if w13_bias.device != input.device:
             raise ValueError("w13_bias must be on the same device as input")
     if w2_bias is not None:
         if tuple(w2_bias.shape) != (num_weight_experts, hidden_size):
-            raise ValueError(
-                "w2_bias must have shape "
-                f"{(num_weight_experts, hidden_size)}, got {tuple(w2_bias.shape)}"
-            )
+            raise ValueError(f"w2_bias must have shape {(num_weight_experts, hidden_size)}, got {tuple(w2_bias.shape)}")
         if w2_bias.device != input.device:
             raise ValueError("w2_bias must be on the same device as input")
 
@@ -160,18 +138,14 @@ def _check_inputs(
             raise ValueError(f"global_num_experts must be positive, got {num_experts}")
         if num_experts > num_weight_experts:
             raise ValueError(
-                "global_num_experts cannot exceed available expert weights: "
-                f"{num_experts} > {num_weight_experts}"
+                f"global_num_experts cannot exceed available expert weights: {num_experts} > {num_weight_experts}"
             )
 
     if topk_ids.numel() > 0:
         id_min = int(topk_ids.min().item())
         id_max = int(topk_ids.max().item())
         if id_min < 0 or id_max >= num_experts:
-            raise ValueError(
-                f"topk_ids out of range: min={id_min}, max={id_max}, "
-                f"valid range [0, {num_experts})"
-            )
+            raise ValueError(f"topk_ids out of range: min={id_min}, max={id_max}, valid range [0, {num_experts})")
 
     if out is not None:
         if tuple(out.shape) != tuple(input.shape):

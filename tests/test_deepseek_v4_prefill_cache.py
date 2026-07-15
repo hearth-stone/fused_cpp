@@ -357,9 +357,7 @@ def test_combine_topk_swa_indices_cpp_threaded_matches_torch_baseline() -> None:
     )
     num_tokens = sum(query_lens)
     topk_width = 16
-    topk_indices = torch.arange(
-        num_tokens * topk_width, dtype=torch.int32
-    ).reshape(num_tokens, topk_width)
+    topk_indices = torch.arange(num_tokens * topk_width, dtype=torch.int32).reshape(num_tokens, topk_width)
     seq_lens = torch.tensor([256, 159, 1024, 49], dtype=torch.int32)
     gather_lens = torch.tensor([180, 120, 384, 20], dtype=torch.int32)
 

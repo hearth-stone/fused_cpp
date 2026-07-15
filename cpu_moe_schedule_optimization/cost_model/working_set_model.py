@@ -48,12 +48,7 @@ class OwnerCacheModel:
     @property
     def owner_cache_budget_bytes(self) -> int:
         usable_ways = self.cache_ways - self.reserved_ways
-        return (
-            self.cores
-            * self.private_cache_bytes_per_core
-            * usable_ways
-            // self.cache_ways
-        )
+        return self.cores * self.private_cache_bytes_per_core * usable_ways // self.cache_ways
 
     def resident_bandwidth(self, active_streams: int) -> float:
         if active_streams <= 0:
@@ -64,10 +59,7 @@ class OwnerCacheModel:
     def minimum_streams(self) -> int:
         return max(
             1,
-            math.ceil(
-                -self.stream_saturation
-                * math.log(1.0 - self.target_bandwidth_utilization)
-            ),
+            math.ceil(-self.stream_saturation * math.log(1.0 - self.target_bandwidth_utilization)),
         )
 
     def maximum_streams(self, stream_bytes: int) -> int:
@@ -114,12 +106,7 @@ def fit_owner_cache_model(
         raise ValueError("reserved ways must be in [0, cache_ways)")
     if not 0.0 < target_bandwidth_utilization < 1.0:
         raise ValueError("target bandwidth utilization must be in (0, 1)")
-    owner_budget = (
-        cores
-        * private_cache_bytes_per_core
-        * (cache_ways - reserved_ways)
-        // cache_ways
-    )
+    owner_budget = cores * private_cache_bytes_per_core * (cache_ways - reserved_ways) // cache_ways
     stream_bytes = observations[0].stream_bytes
     maximum_streams = max(1, math.ceil(owner_budget / stream_bytes) - 1)
     resident = [row for row in observations if row.working_set_bytes < owner_budget]
@@ -134,9 +121,7 @@ def fit_owner_cache_model(
             private_cache_bytes_per_core=private_cache_bytes_per_core,
             cache_ways=cache_ways,
             reserved_ways=reserved_ways,
-            bandwidth_limit_bytes_per_second=(
-                first.bandwidth_bytes_per_second / utilization
-            ),
+            bandwidth_limit_bytes_per_second=(first.bandwidth_bytes_per_second / utilization),
             stream_saturation=saturation,
             target_bandwidth_utilization=target_bandwidth_utilization,
         )
@@ -149,17 +134,10 @@ def fit_owner_cache_model(
         log_limits = []
         for row in resident:
             utilization = 1.0 - math.exp(-row.active_streams / saturation)
-            log_limits.append(
-                math.log(row.bandwidth_bytes_per_second) - math.log(utilization)
-            )
+            log_limits.append(math.log(row.bandwidth_bytes_per_second) - math.log(utilization))
         limit = math.exp(statistics.fmean(log_limits))
         error = statistics.fmean(
-            math.log(
-                limit
-                * (1.0 - math.exp(-row.active_streams / saturation))
-                / row.bandwidth_bytes_per_second
-            )
-            ** 2
+            math.log(limit * (1.0 - math.exp(-row.active_streams / saturation)) / row.bandwidth_bytes_per_second) ** 2
             for row in resident
         )
         if best is None or error < best[0]:
@@ -176,24 +154,18 @@ def fit_owner_cache_model(
     )
 
 
-def scan_fit_report(
-    observations: list[ScanObservation], model: OwnerCacheModel
-) -> list[dict]:
+def scan_fit_report(observations: list[ScanObservation], model: OwnerCacheModel) -> list[dict]:
     rows = []
     for observation in observations:
         resident = observation.working_set_bytes < model.owner_cache_budget_bytes
-        predicted = (
-            model.resident_bandwidth(observation.active_streams) if resident else None
-        )
+        predicted = model.resident_bandwidth(observation.active_streams) if resident else None
         rows.append(
             {
                 **asdict(observation),
                 "inside_owner_cache_budget": resident,
                 "predicted_resident_bandwidth_bytes_per_second": predicted,
                 "relative_error": (
-                    predicted / observation.bandwidth_bytes_per_second - 1.0
-                    if predicted is not None
-                    else None
+                    predicted / observation.bandwidth_bytes_per_second - 1.0 if predicted is not None else None
                 ),
             }
         )
@@ -254,9 +226,7 @@ def profile_candidates(profile: dict, formula: IsoFormula) -> list[dict]:
                 "isolated_baseline_ns": float(
                     entry.get(
                         "iso_baseline_makespan_ns",
-                        isolated_baseline_ns(
-                            int(entry["routes"]), shape, measured_experts, formula
-                        ),
+                        isolated_baseline_ns(int(entry["routes"]), shape, measured_experts, formula),
                     )
                 ),
                 "measured_ns": float(entry["full_call_median_ns"]),
@@ -278,9 +248,7 @@ def search_candidates(search: dict, formula: IsoFormula) -> list[dict]:
                 "routes": int(entry["routes"]),
                 "shape": shape,
                 "active_experts": len(shape),
-                "isolated_baseline_ns": isolated_baseline_ns(
-                    int(entry["routes"]), shape, measured_experts, formula
-                ),
+                "isolated_baseline_ns": isolated_baseline_ns(int(entry["routes"]), shape, measured_experts, formula),
                 "measured_ns": float(entry["full_call_median_ns"]),
             }
         )
@@ -313,19 +281,11 @@ def recommend_working_sets(
     summaries = []
     for routes in sorted({row["routes"] for row in candidates}):
         rows = [row for row in candidates if row["routes"] == routes]
-        in_band = [
-            row
-            for row in rows
-            if minimum_streams <= row["active_experts"] <= maximum_streams
-        ]
+        in_band = [row for row in rows if minimum_streams <= row["active_experts"] <= maximum_streams]
         if not in_band:
             raise ValueError(f"route {routes} has no candidate in predicted band")
         best_iso = min(row["isolated_baseline_ns"] for row in in_band)
-        compute_near = [
-            row
-            for row in in_band
-            if row["isolated_baseline_ns"] <= best_iso * (1.0 + iso_headroom)
-        ]
+        compute_near = [row for row in in_band if row["isolated_baseline_ns"] <= best_iso * (1.0 + iso_headroom)]
         recommended = min(
             compute_near,
             key=lambda row: (row["active_experts"], row["isolated_baseline_ns"]),
@@ -343,19 +303,13 @@ def recommend_working_sets(
                 "predicted_max_working_set_bytes": maximum_streams * stage_bytes,
                 "recommended_shape": recommended["shape"],
                 "recommended_active_experts": recommended["active_experts"],
-                "recommended_working_set_bytes": (
-                    recommended["active_experts"] * stage_bytes
-                ),
+                "recommended_working_set_bytes": (recommended["active_experts"] * stage_bytes),
                 "recommended_iso_baseline_ns": recommended["isolated_baseline_ns"],
                 "best_in_band_iso_baseline_ns": best_iso,
                 "measured_best_shape": measured_best["shape"],
                 "measured_best_active_experts": measured_best["active_experts"],
-                "measured_best_working_set_bytes": (
-                    measured_best["active_experts"] * stage_bytes
-                ),
-                "measured_regret": (
-                    recommended["measured_ns"] / measured_best["measured_ns"] - 1.0
-                ),
+                "measured_best_working_set_bytes": (measured_best["active_experts"] * stage_bytes),
+                "measured_regret": (recommended["measured_ns"] / measured_best["measured_ns"] - 1.0),
             }
         )
     return summaries
@@ -384,10 +338,7 @@ def main() -> int:
     formula = IsoFormula.from_dict(profile["iso_formula"])
     observations = load_scan_observations(args.scan_csv)
     if observations[0].stream_bytes != stage_bytes:
-        raise ValueError(
-            f"scan stream is {observations[0].stream_bytes} bytes; "
-            f"split stage is {stage_bytes} bytes"
-        )
+        raise ValueError(f"scan stream is {observations[0].stream_bytes} bytes; split stage is {stage_bytes} bytes")
     cores = args.cores or int(profile["target"]["cores_per_rank"])
     model = fit_owner_cache_model(
         observations,
@@ -424,11 +375,7 @@ def main() -> int:
         else []
     )
 
-    resident_errors = [
-        abs(row["relative_error"])
-        for row in fit_rows
-        if row["relative_error"] is not None
-    ]
+    resident_errors = [abs(row["relative_error"]) for row in fit_rows if row["relative_error"] is not None]
     print(
         "owner-cache model: "
         f"budget={model.owner_cache_budget_bytes / 2**20:.1f} MiB, "
@@ -439,10 +386,7 @@ def main() -> int:
         f"({model.minimum_streams() * stage_bytes / 2**20:.1f}-"
         f"{model.maximum_streams(stage_bytes) * stage_bytes / 2**20:.1f} MiB)"
     )
-    print(
-        f"resident scan fit median={statistics.median(resident_errors):.1%} "
-        f"max={max(resident_errors):.1%}"
-    )
+    print(f"resident scan fit median={statistics.median(resident_errors):.1%} max={max(resident_errors):.1%}")
     for label, summaries in (("profile", base_summary), ("holdout", holdout_summary)):
         if not summaries:
             continue

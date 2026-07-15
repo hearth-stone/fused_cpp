@@ -29,10 +29,7 @@ WORKER = Path(__file__).with_name("profile_contention_async.py")
 DEFAULT_ISOLATED_ROUTES = "1,2,4,8,12,24,48,96,192,384,768,1536,2040"
 DEFAULT_CONTENTION_ROUTES = "1,2,4,8,12,24,48,192,768,2040"
 DEFAULT_THREADS = "1,2,4,8,16,32"
-DEFAULT_SHAPES = (
-    "32;16x2;16,8,8;16,8,4,4;16,4,4,4,4;8x4;"
-    "8,8,8,4,4;8,8,4,4,4,4;8,4,4,4,4,4,4;4x8;2x16;1x32"
-)
+DEFAULT_SHAPES = "32;16x2;16,8,8;16,8,4,4;16,4,4,4,4;8x4;8,8,8,4,4;8,8,4,4,4,4;8,4,4,4,4,4,4;4x8;2x16;1x32"
 
 
 def split_nonempty(text: str, separator: str = ",") -> list[str]:
@@ -132,10 +129,7 @@ def validate_profile(profile: dict) -> None:
         raise ValueError("concurrent rank count does not match CPU sets")
     if rank_count != len(target["numa_nodes"]):
         raise ValueError("concurrent rank count does not match NUMA nodes")
-    if any(
-        len(cpu_ids) != int(target["cores_per_rank"])
-        for cpu_ids in target["cpu_ids_by_rank"]
-    ):
+    if any(len(cpu_ids) != int(target["cores_per_rank"]) for cpu_ids in target["cpu_ids_by_rank"]):
         raise ValueError("rank CPU set does not match cores_per_rank")
     kernel = profile["kernel"]
     if not kernel.get("source_sha256") or not kernel.get("extension_sha256"):
@@ -145,24 +139,17 @@ def validate_profile(profile: dict) -> None:
     for entry in profile["isolated"]:
         if not entry["p10_ns"] <= entry["median_ns"] <= entry["p90_ns"]:
             raise ValueError(f"invalid isolated percentiles: {entry}")
-        iso_lookup[(int(entry["routes"]), int(entry["threads"]))] = int(
-            entry["median_ns"]
-        )
+        iso_lookup[(int(entry["routes"]), int(entry["threads"]))] = int(entry["median_ns"])
     for entry in profile["entries"]:
         if not entry["p10_ns"] <= entry["makespan_ns"] <= entry["p90_ns"]:
             raise ValueError(f"invalid contention percentiles: {entry}")
         route_count = int(entry["routes"])
-        iso_max = max(
-            iso_lookup[(route_count, int(threads))]
-            for threads in entry["shape"]
-        )
+        iso_max = max(iso_lookup[(route_count, int(threads))] for threads in entry["shape"])
         if int(entry["iso_max_ns"]) != iso_max:
             raise ValueError(f"invalid iso_max_ns: {entry}")
         iso_baseline = max(
             int(count) * iso_lookup[(route_count, int(threads))]
-            for count, threads in zip(
-                entry["lane_task_counts"], entry["shape"]
-            )
+            for count, threads in zip(entry["lane_task_counts"], entry["shape"])
         )
         if int(entry["iso_baseline_makespan_ns"]) != iso_baseline:
             raise ValueError(f"invalid iso_baseline_makespan_ns: {entry}")
@@ -190,16 +177,11 @@ def merge_profiles(paths: list[Path], output: Path) -> dict:
             raise ValueError(f"rank profiles differ in {key}")
 
     isolated = [
-        merge_isolated(copy.deepcopy(a), copy.deepcopy(b))
-        for a, b in zip(first["isolated"], second["isolated"])
+        merge_isolated(copy.deepcopy(a), copy.deepcopy(b)) for a, b in zip(first["isolated"], second["isolated"])
     ]
-    iso_lookup = {
-        (int(entry["routes"]), int(entry["threads"])): int(entry["median_ns"])
-        for entry in isolated
-    }
+    iso_lookup = {(int(entry["routes"]), int(entry["threads"])): int(entry["median_ns"]) for entry in isolated}
     entries = [
-        merge_contention(copy.deepcopy(a), copy.deepcopy(b))
-        for a, b in zip(first["entries"], second["entries"])
+        merge_contention(copy.deepcopy(a), copy.deepcopy(b)) for a, b in zip(first["entries"], second["entries"])
     ]
 
     def merged_lane_counts(entry: dict) -> list[int]:
@@ -210,8 +192,7 @@ def merge_profiles(paths: list[Path], output: Path) -> dict:
         for _ in range(int(entry["measurement_tasks"])):
             lane = min(
                 range(len(shape)),
-                key=lambda index: loads[index]
-                + iso_lookup[(routes, shape[index])],
+                key=lambda index: loads[index] + iso_lookup[(routes, shape[index])],
             )
             counts[lane] += 1
             loads[lane] += iso_lookup[(routes, shape[lane])]
@@ -219,17 +200,11 @@ def merge_profiles(paths: list[Path], output: Path) -> dict:
 
     for entry in entries:
         route_count = int(entry["routes"])
-        iso_max = max(
-            iso_lookup[(route_count, int(threads))]
-            for threads in entry["shape"]
-        )
+        iso_max = max(iso_lookup[(route_count, int(threads))] for threads in entry["shape"])
         entry["lane_task_counts"] = merged_lane_counts(entry)
         entry["measurement_groups"] = max(entry["lane_task_counts"])
         full_samples = entry.pop("_full_call_samples_ns")
-        group_samples = [
-            max(1, int(round(value / entry["measurement_groups"])))
-            for value in full_samples
-        ]
+        group_samples = [max(1, int(round(value / entry["measurement_groups"]))) for value in full_samples]
         group_summary = summarize(group_samples)
         entry["makespan_ns"] = group_summary["median_ns"]
         entry["p10_ns"] = group_summary["p10_ns"]
@@ -239,9 +214,7 @@ def merge_profiles(paths: list[Path], output: Path) -> dict:
         entry["num_iters"] = group_summary["num_iters"]
         iso_baseline = max(
             int(count) * iso_lookup[(route_count, int(threads))]
-            for count, threads in zip(
-                entry["lane_task_counts"], entry["shape"]
-            )
+            for count, threads in zip(entry["lane_task_counts"], entry["shape"])
         )
         entry["iso_max_ns"] = iso_max
         entry["iso_baseline_makespan_ns"] = iso_baseline
@@ -253,16 +226,12 @@ def merge_profiles(paths: list[Path], output: Path) -> dict:
         "machine": first["target"]["machine"],
         "cpu": first["target"]["cpu"],
         "host_logical_cores": first["target"]["host_logical_cores"],
-        "aggregate_profiled_cores": sum(
-            int(target["cores_per_rank"]) for target in rank_targets
-        ),
+        "aggregate_profiled_cores": sum(int(target["cores_per_rank"]) for target in rank_targets),
         "cores_per_rank": int(first["target"]["cores_per_rank"]),
         "concurrent_ranks": 2,
         "cpu_ids_by_rank": [target["cpu_ids"] for target in rank_targets],
         "numa_nodes": [target["numa_node"] for target in rank_targets],
-        "llc_bytes_by_rank": [
-            target["llc_bytes_per_rank"] for target in rank_targets
-        ],
+        "llc_bytes_by_rank": [target["llc_bytes_per_rank"] for target in rank_targets],
         "os": first["target"]["os"],
     }
     merged["measurement"]["rank_synchronization"] = "socket_barrier_per_call"
@@ -271,8 +240,7 @@ def merge_profiles(paths: list[Path], output: Path) -> dict:
     merged["measurement"]["generated_at_utc"] = datetime.now(timezone.utc).isoformat()
     merged["isolated"] = isolated
     merged["iso_formula"] = fit_from_measurements(
-        (entry["routes"], entry["threads"], entry["median_ns"])
-        for entry in isolated
+        (entry["routes"], entry["threads"], entry["median_ns"]) for entry in isolated
     ).to_dict()
     merged["entries"] = entries
     validate_profile(merged)
@@ -401,9 +369,7 @@ def main() -> int:
                 ]
                 if args.llc_bytes is not None:
                     command.extend(("--llc-bytes", str(args.llc_bytes)))
-                processes.append(
-                    subprocess.Popen(command, cwd=ROOT, env=env)
-                )
+                processes.append(subprocess.Popen(command, cwd=ROOT, env=env))
 
             accept_deadline = time.monotonic() + 600.0
             while len(connections) != 2:
@@ -416,9 +382,7 @@ def main() -> int:
                         if process.poll() is not None
                     ]
                     if failed:
-                        raise RuntimeError(
-                            f"rank profiler exited before synchronization: {failed}"
-                        )
+                        raise RuntimeError(f"rank profiler exited before synchronization: {failed}")
                     if time.monotonic() >= accept_deadline:
                         raise TimeoutError("rank profilers did not connect in 600 seconds")
                     continue
@@ -434,9 +398,7 @@ def main() -> int:
             contention_points = len(split_nonempty(args.contention_shapes, ";")) * len(
                 split_nonempty(args.contention_route_buckets)
             )
-            barriers = (isolated_points + contention_points) * (
-                args.warmup + args.runs
-            )
+            barriers = (isolated_points + contention_points) * (args.warmup + args.runs)
             for _ in range(barriers):
                 for rank in range(2):
                     if recv_exact(connections[rank], 1) != b"R":
@@ -450,15 +412,10 @@ def main() -> int:
 
             if args.keep_rank_profiles:
                 for rank, path in enumerate(rank_paths):
-                    destination = args.output.with_name(
-                        f"{args.output.stem}.rank{rank}{args.output.suffix}"
-                    )
+                    destination = args.output.with_name(f"{args.output.stem}.rank{rank}{args.output.suffix}")
                     shutil.copy2(path, destination)
             merged = merge_profiles(rank_paths, args.output)
-            print(
-                f"wrote {args.output} "
-                f"({len(merged['isolated'])} isolated, {len(merged['entries'])} contention)"
-            )
+            print(f"wrote {args.output} ({len(merged['isolated'])} isolated, {len(merged['entries'])} contention)")
         finally:
             server.close()
             for connection in connections.values():

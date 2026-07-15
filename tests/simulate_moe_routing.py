@@ -19,6 +19,7 @@
         --shards 1 2 4 5 8 10 20 40 \\
         --seed 0
 """
+
 import argparse
 import math
 import random
@@ -28,6 +29,7 @@ from typing import List, Tuple
 
 
 # ── 分布生成器 ──
+
 
 def _routing_uniform(
     num_tokens: int,
@@ -54,6 +56,7 @@ def _sample_dirichlet(
 
     通过 Gamma(alpha, 1) 采样后归一化实现，避免依赖 numpy。
     """
+
     # Marsaglia-Tsang 方法对 alpha >= 1 稳定；alpha < 1 时用 Johnk 方法。
     def _gamma(shape: float) -> float:
         if shape >= 1.0:
@@ -65,7 +68,7 @@ def _sample_dirichlet(
                 if v <= 0.0:
                     continue
                 u = rng.random()
-                if u < 1.0 - 0.0331 * (x ** 4):
+                if u < 1.0 - 0.0331 * (x**4):
                     return d * v
                 if math.log(u) < 0.5 * x * x + d * (1.0 - v + math.log(v)):
                     return d * v
@@ -93,7 +96,7 @@ def _weighted_top_k(
     scored: List[Tuple[float, int]] = []
     for i, w in enumerate(weights):
         if w <= 0.0:
-            score = -float('inf')
+            score = -float("inf")
         else:
             u = rng.random()
             # 避免 log(0)
@@ -141,7 +144,7 @@ def _routing_grouped(
     """
     if num_experts % num_groups != 0:
         raise ValueError(
-            f'num_experts={num_experts} 无法被 num_groups={num_groups} 整除',
+            f"num_experts={num_experts} 无法被 num_groups={num_groups} 整除",
         )
     per_group = num_experts // num_groups
     weights = _sample_dirichlet(alpha, num_experts, rng)
@@ -149,7 +152,7 @@ def _routing_grouped(
     # 预计算每组的 top-2 权重和（作为组分数）。
     group_scores: List[float] = []
     for g in range(num_groups):
-        seg = weights[g * per_group:(g + 1) * per_group]
+        seg = weights[g * per_group : (g + 1) * per_group]
         top2 = sorted(seg, reverse=True)[:2]
         group_scores.append(sum(top2))
 
@@ -171,6 +174,7 @@ def _routing_grouped(
 
 # ── 统计与报告 ──
 
+
 @dataclass
 class DistStats:
     """分布统计摘要。"""
@@ -184,15 +188,14 @@ class DistStats:
     m_median: float
     m_p90: int
     m_p99: int
-    cv: float         # 变异系数 std/mean
-    lbc: float        # load balance coefficient = max / mean
+    cv: float  # 变异系数 std/mean
+    lbc: float  # load balance coefficient = max / mean
 
 
 def _percentile(sorted_vals: List[int], p: float) -> int:
     if not sorted_vals:
         return 0
-    idx = max(0, min(len(sorted_vals) - 1,
-                     int(math.ceil(p * len(sorted_vals)) - 1)))
+    idx = max(0, min(len(sorted_vals) - 1, int(math.ceil(p * len(sorted_vals)) - 1)))
     return sorted_vals[idx]
 
 
@@ -220,17 +223,15 @@ def _stats(counts: List[int]) -> DistStats:
 
 
 def _print_stats(stats: DistStats, label: str) -> None:
-    print(f'\n[{label}]')
-    print(f'  total_tokens     : {stats.total_tokens}')
-    print(f'  num_experts      : {stats.num_experts}')
-    print(f'  active_experts   : {stats.active_experts} '
-          f'({100.0 * stats.active_experts / stats.num_experts:.1f}%)')
-    print(f'  M_max / M_mean   : {stats.m_max} / {stats.m_mean:.2f} '
-          f'(LBC={stats.lbc:.2f}x)')
-    print(f'  M_min            : {stats.m_min}')
-    print(f'  M_median         : {stats.m_median:.1f}')
-    print(f'  M_p90 / M_p99    : {stats.m_p90} / {stats.m_p99}')
-    print(f'  CV (std/mean)    : {stats.cv:.3f}')
+    print(f"\n[{label}]")
+    print(f"  total_tokens     : {stats.total_tokens}")
+    print(f"  num_experts      : {stats.num_experts}")
+    print(f"  active_experts   : {stats.active_experts} ({100.0 * stats.active_experts / stats.num_experts:.1f}%)")
+    print(f"  M_max / M_mean   : {stats.m_max} / {stats.m_mean:.2f} (LBC={stats.lbc:.2f}x)")
+    print(f"  M_min            : {stats.m_min}")
+    print(f"  M_median         : {stats.m_median:.1f}")
+    print(f"  M_p90 / M_p99    : {stats.m_p90} / {stats.m_p99}")
+    print(f"  CV (std/mean)    : {stats.cv:.3f}")
 
 
 def _print_histogram(counts: List[int], num_bins: int = 10) -> None:
@@ -238,7 +239,7 @@ def _print_histogram(counts: List[int], num_bins: int = 10) -> None:
         return
     hi = max(counts)
     if hi == 0:
-        print('  所有 expert M=0，跳过直方图')
+        print("  所有 expert M=0，跳过直方图")
         return
     bin_width = max(1, (hi + num_bins) // num_bins)
     bins = [0] * num_bins
@@ -246,16 +247,17 @@ def _print_histogram(counts: List[int], num_bins: int = 10) -> None:
         b = min(num_bins - 1, c // bin_width)
         bins[b] += 1
     max_bin = max(bins) if bins else 1
-    print('  直方图（per-expert M 分布）：')
+    print("  直方图（per-expert M 分布）：")
     for i, cnt in enumerate(bins):
         lo = i * bin_width
         hi_b = (i + 1) * bin_width - 1
         bar_len = int(40 * cnt / max_bin) if max_bin > 0 else 0
-        bar = '█' * bar_len
-        print(f'    M ∈ [{lo:>4}, {hi_b:>4}]: {cnt:>4}  {bar}')
+        bar = "█" * bar_len
+        print(f"    M ∈ [{lo:>4}, {hi_b:>4}]: {cnt:>4}  {bar}")
 
 
 # ── Shard 均衡性模拟 ──
+
 
 def _lpt_partition(
     counts: List[int],
@@ -302,100 +304,113 @@ def _report_partition(
     min_load = min(shard_load) if shard_load else 0
     mean_load = total / len(shard_load) if shard_load else 0.0
     # 关键：wall time 受 max_load 决定，speedup 上限 = total / max_load
-    upper_speedup = total / max_load if max_load > 0 else float('inf')
+    upper_speedup = total / max_load if max_load > 0 else float("inf")
     print(
-        f'  {label:<14} max={max_load:>5} min={min_load:>5} '
-        f'mean={mean_load:>7.1f}  '
-        f'imbalance(max/mean)={max_load / mean_load:.2f}x  '
-        f'speedup_upper={upper_speedup:.2f}x',
+        f"  {label:<14} max={max_load:>5} min={min_load:>5} "
+        f"mean={mean_load:>7.1f}  "
+        f"imbalance(max/mean)={max_load / mean_load:.2f}x  "
+        f"speedup_upper={upper_speedup:.2f}x",
     )
 
 
 def _shard_analysis(counts: List[int], shard_list: List[int]) -> None:
     total = sum(counts)
-    print('\n[Shard 均衡性分析]')
-    print(f'  total_M={total}   理论 speedup 上限 = total / max_shard_load')
-    print(f'  {"shards":<14}{"":<20}{"":<20}{"":<20}')
+    print("\n[Shard 均衡性分析]")
+    print(f"  total_M={total}   理论 speedup 上限 = total / max_shard_load")
+    print(f"  {'shards':<14}{'':<20}{'':<20}{'':<20}")
     for s in shard_list:
-        print(f'  -- shards={s} --')
+        print(f"  -- shards={s} --")
         _, rr_load = _roundrobin_partition(counts, s)
         _, lpt_load = _lpt_partition(counts, s)
-        _report_partition('round-robin', rr_load, total)
-        _report_partition('LPT', lpt_load, total)
+        _report_partition("round-robin", rr_load, total)
+        _report_partition("LPT", lpt_load, total)
 
 
 # ── 主入口 ──
 
+
 def build_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--num-tokens', type=int, default=2048,
-                        help='输入 token 数（prefill 长度），默认 2048')
-    parser.add_argument('--num-experts', type=int, default=256,
-                        help='总 expert 数，默认 256（DeepSeek-V3 风格）')
-    parser.add_argument('--top-k', type=int, default=8,
-                        help='每 token 激活的 expert 数，默认 8')
-    parser.add_argument('--mode', default='grouped',
-                        choices=['uniform', 'dirichlet', 'grouped', 'all'],
-                        help='路由模式，默认 grouped（最贴近真实）；'
-                             'all 表示三种都跑')
-    parser.add_argument('--alpha', type=float, default=0.5,
-                        help='Dirichlet 浓度参数；alpha 越小越偏斜；'
-                             '默认 0.5（中度偏斜）')
-    parser.add_argument('--num-groups', type=int, default=8,
-                        help='grouped 模式的组数，默认 8')
-    parser.add_argument('--top-m-groups', type=int, default=4,
-                        help='grouped 模式每 token 选的组数，默认 4')
-    parser.add_argument('--shards', nargs='+', type=int,
-                        default=[1, 2, 4, 5, 8, 10, 20, 40],
-                        help='用于 shard 均衡性分析的 shard 数列表')
-    parser.add_argument('--seed', type=int, default=0, help='随机种子')
-    parser.add_argument('--show-histogram', action='store_true',
-                        help='打印 M 分布直方图')
-    parser.add_argument('--show-topk-experts', type=int, default=10,
-                        help='打印 top-N 热门 expert 的 M 值；0 关闭')
+    parser.add_argument("--num-tokens", type=int, default=2048, help="输入 token 数（prefill 长度），默认 2048")
+    parser.add_argument("--num-experts", type=int, default=256, help="总 expert 数，默认 256（DeepSeek-V3 风格）")
+    parser.add_argument("--top-k", type=int, default=8, help="每 token 激活的 expert 数，默认 8")
+    parser.add_argument(
+        "--mode",
+        default="grouped",
+        choices=["uniform", "dirichlet", "grouped", "all"],
+        help="路由模式，默认 grouped（最贴近真实）；all 表示三种都跑",
+    )
+    parser.add_argument(
+        "--alpha", type=float, default=0.5, help="Dirichlet 浓度参数；alpha 越小越偏斜；默认 0.5（中度偏斜）"
+    )
+    parser.add_argument("--num-groups", type=int, default=8, help="grouped 模式的组数，默认 8")
+    parser.add_argument("--top-m-groups", type=int, default=4, help="grouped 模式每 token 选的组数，默认 4")
+    parser.add_argument(
+        "--shards",
+        nargs="+",
+        type=int,
+        default=[1, 2, 4, 5, 8, 10, 20, 40],
+        help="用于 shard 均衡性分析的 shard 数列表",
+    )
+    parser.add_argument("--seed", type=int, default=0, help="随机种子")
+    parser.add_argument("--show-histogram", action="store_true", help="打印 M 分布直方图")
+    parser.add_argument("--show-topk-experts", type=int, default=10, help="打印 top-N 热门 expert 的 M 值；0 关闭")
     return parser
 
 
 def _run_one_mode(mode: str, args: argparse.Namespace) -> List[int]:
     rng = random.Random(args.seed)
-    if mode == 'uniform':
+    if mode == "uniform":
         return _routing_uniform(
-            args.num_tokens, args.num_experts, args.top_k, rng,
+            args.num_tokens,
+            args.num_experts,
+            args.top_k,
+            rng,
         )
-    if mode == 'dirichlet':
+    if mode == "dirichlet":
         return _routing_dirichlet(
-            args.num_tokens, args.num_experts, args.top_k, args.alpha, rng,
+            args.num_tokens,
+            args.num_experts,
+            args.top_k,
+            args.alpha,
+            rng,
         )
-    if mode == 'grouped':
+    if mode == "grouped":
         return _routing_grouped(
-            args.num_tokens, args.num_experts,
-            args.num_groups, args.top_m_groups, args.top_k,
-            args.alpha, rng,
+            args.num_tokens,
+            args.num_experts,
+            args.num_groups,
+            args.top_m_groups,
+            args.top_k,
+            args.alpha,
+            rng,
         )
-    raise ValueError(f'unknown mode: {mode}')
+    raise ValueError(f"unknown mode: {mode}")
 
 
 def _run_and_report(mode: str, args: argparse.Namespace) -> List[int]:
-    print('\n' + '=' * 80)
-    print(f'路由模式: {mode}   (tokens={args.num_tokens}, '
-          f'experts={args.num_experts}, top_k={args.top_k}'
-          + (f', groups={args.num_groups}, top_m={args.top_m_groups}'
-             if mode == 'grouped' else '')
-          + (f', alpha={args.alpha}' if mode != 'uniform' else '')
-          + ')')
-    print('=' * 80)
+    print("\n" + "=" * 80)
+    print(
+        f"路由模式: {mode}   (tokens={args.num_tokens}, "
+        f"experts={args.num_experts}, top_k={args.top_k}"
+        + (f", groups={args.num_groups}, top_m={args.top_m_groups}" if mode == "grouped" else "")
+        + (f", alpha={args.alpha}" if mode != "uniform" else "")
+        + ")"
+    )
+    print("=" * 80)
 
     counts = _run_one_mode(mode, args)
     stats = _stats(counts)
-    _print_stats(stats, f'分布统计 ({mode})')
+    _print_stats(stats, f"分布统计 ({mode})")
 
     if args.show_topk_experts > 0:
         top_experts = sorted(
-            enumerate(counts), key=lambda ic: -ic[1],
-        )[:args.show_topk_experts]
-        print(f'  top-{args.show_topk_experts} 热门 expert (id, M):')
+            enumerate(counts),
+            key=lambda ic: -ic[1],
+        )[: args.show_topk_experts]
+        print(f"  top-{args.show_topk_experts} 热门 expert (id, M):")
         for eid, m in top_experts:
-            print(f'    expert {eid:>4}: M={m}')
+            print(f"    expert {eid:>4}: M={m}")
 
     if args.show_histogram:
         _print_histogram(counts)
@@ -406,11 +421,11 @@ def _run_and_report(mode: str, args: argparse.Namespace) -> List[int]:
 
 def main() -> int:
     args = build_argparser().parse_args()
-    modes = ['uniform', 'dirichlet', 'grouped'] if args.mode == 'all' else [args.mode]
+    modes = ["uniform", "dirichlet", "grouped"] if args.mode == "all" else [args.mode]
     for m in modes:
         _run_and_report(m, args)
     return 0
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     sys.exit(main())

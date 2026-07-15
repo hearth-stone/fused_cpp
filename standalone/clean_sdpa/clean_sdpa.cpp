@@ -14,22 +14,19 @@
 namespace clean_sdpa {
 namespace {
 
+using ::fused_cpp::sdpa_flash2_neon_l3kv_impl::run_path_collapse3_packqkv;
 using ::fused_cpp::sdpa_microkernels::pack_k_to_seq8;
 using ::fused_cpp::sdpa_pack_utils::pack_v_to_evblock8;
 using ::fused_cpp::sdpa_tile_sizes::compute_tile_sizes_l3kv;
 using ::fused_cpp::sdpa_tile_sizes::TileSizes;
-using ::fused_cpp::sdpa_flash2_neon_l3kv_impl::run_path_collapse3_packqkv;
 
 constexpr int64_t kEvBlock = 8;
 constexpr float kNegInf = -std::numeric_limits<float>::infinity();
 
-inline int64_t clamp_i64(int64_t v, int64_t lo, int64_t hi) {
-  return std::max(lo, std::min(v, hi));
-}
+inline int64_t clamp_i64(int64_t v, int64_t lo, int64_t hi) { return std::max(lo, std::min(v, hi)); }
 
 inline void check_config(const Config& cfg) {
-  if (cfg.B <= 0 || cfg.N <= 0 || cfg.L <= 0 || cfg.S <= 0 ||
-      cfg.E <= 0 || cfg.Ev <= 0) {
+  if (cfg.B <= 0 || cfg.N <= 0 || cfg.L <= 0 || cfg.S <= 0 || cfg.E <= 0 || cfg.Ev <= 0) {
     throw std::invalid_argument("shape dimensions must be positive");
   }
   if (cfg.S % 8 != 0) {
@@ -45,12 +42,8 @@ inline void check_config(const Config& cfg) {
 
 }  // namespace
 
-void sdpa_bf16_packqkv_pbf16pv(
-    const at::BFloat16* q,
-    const at::BFloat16* k,
-    const at::BFloat16* v,
-    float* out,
-    const Config& cfg_in) {
+void sdpa_bf16_packqkv_pbf16pv(const at::BFloat16* q, const at::BFloat16* k, const at::BFloat16* v, float* out,
+                               const Config& cfg_in) {
   Config cfg = cfg_in;
   check_config(cfg);
   if (cfg.scale == 0.0f) {
@@ -79,8 +72,7 @@ void sdpa_bf16_packqkv_pbf16pv(
   if (profile_on) {
     ::fused_cpp::sdpa_profile::reset();
   }
-  const uint64_t profile_total_t0 =
-      profile_on ? ::fused_cpp::sdpa_profile::now_ns() : 0;
+  const uint64_t profile_total_t0 = profile_on ? ::fused_cpp::sdpa_profile::now_ns() : 0;
 
   const int64_t eb = cfg.Ev / 8;
   const int64_t e_main = cfg.E & ~int64_t{3};
@@ -97,20 +89,17 @@ void sdpa_bf16_packqkv_pbf16pv(
   }
   {
     FUSED_CPP_SDPA_PROFILE_SCOPE(::fused_cpp::sdpa_profile::Slot::kVPack);
-    pack_v_to_evblock8<at::BFloat16>(
-        v, v_packed.data(), cfg.B, cfg.N, cfg.S, cfg.Ev);
+    pack_v_to_evblock8<at::BFloat16>(v, v_packed.data(), cfg.B, cfg.N, cfg.S, cfg.Ev);
   }
 
   AlignedVector<uint16_t> k_packed;
   {
     FUSED_CPP_SDPA_PROFILE_SCOPE(::fused_cpp::sdpa_profile::Slot::kKAlloc);
-    k_packed.resize(
-        static_cast<size_t>(cfg.B * cfg.N * s_blocks * kblock_u16));
+    k_packed.resize(static_cast<size_t>(cfg.B * cfg.N * s_blocks * kblock_u16));
   }
   {
     FUSED_CPP_SDPA_PROFILE_SCOPE(::fused_cpp::sdpa_profile::Slot::kKPack);
-    pack_k_to_seq8<at::BFloat16>(
-        k, k_packed.data(), cfg.B, cfg.N, cfg.S, cfg.E);
+    pack_k_to_seq8<at::BFloat16>(k, k_packed.data(), cfg.B, cfg.N, cfg.S, cfg.E);
   }
 
   const int64_t q_b_stride = cfg.N * cfg.L * cfg.E;
@@ -130,8 +119,7 @@ void sdpa_bf16_packqkv_pbf16pv(
   constexpr int64_t m_stride_n = 0;
   constexpr int64_t m_stride_l = 0;
 
-  TileSizes ts = compute_tile_sizes_l3kv(
-      cfg.B, cfg.N, cfg.S, cfg.L, cfg.E, cfg.Ev, sizeof(at::BFloat16));
+  TileSizes ts = compute_tile_sizes_l3kv(cfg.B, cfg.N, cfg.S, cfg.L, cfg.E, cfg.Ev, sizeof(at::BFloat16));
   if (cfg.s_tile > 0) {
     ts.Sc_l2 = cfg.s_tile;
     ts.Sc_l3 = std::max<int64_t>(ts.Sc_l2, std::min<int64_t>(cfg.S, ts.Sc_l3));
@@ -148,45 +136,28 @@ void sdpa_bf16_packqkv_pbf16pv(
     FUSED_CPP_SDPA_PROFILE_SCOPE(::fused_cpp::sdpa_profile::Slot::kMain);
     if (cfg.causal) {
       run_path_collapse3_packqkv<false, true, true>(
-          q, k_packed.data(), k, v_packed.data(), p, ts,
-          q_b_stride, q_n_stride, q_l_stride,
-          k_b_stride, k_n_stride, k_s_stride,
-          k_packed_b_stride, k_packed_n_stride, k_sblock_stride,
-          v_packed_b_stride, v_packed_n_stride, v_packed_s_stride,
-          v_packed_eb_stride,
-          m_stride_b, m_stride_n, m_stride_l,
-          out_b_stride, out_n_stride, out_l_stride);
+          q, k_packed.data(), k, v_packed.data(), p, ts, q_b_stride, q_n_stride, q_l_stride, k_b_stride, k_n_stride,
+          k_s_stride, k_packed_b_stride, k_packed_n_stride, k_sblock_stride, v_packed_b_stride, v_packed_n_stride,
+          v_packed_s_stride, v_packed_eb_stride, m_stride_b, m_stride_n, m_stride_l, out_b_stride, out_n_stride,
+          out_l_stride);
     } else {
       run_path_collapse3_packqkv<false, false, true>(
-          q, k_packed.data(), k, v_packed.data(), p, ts,
-          q_b_stride, q_n_stride, q_l_stride,
-          k_b_stride, k_n_stride, k_s_stride,
-          k_packed_b_stride, k_packed_n_stride, k_sblock_stride,
-          v_packed_b_stride, v_packed_n_stride, v_packed_s_stride,
-          v_packed_eb_stride,
-          m_stride_b, m_stride_n, m_stride_l,
-          out_b_stride, out_n_stride, out_l_stride);
+          q, k_packed.data(), k, v_packed.data(), p, ts, q_b_stride, q_n_stride, q_l_stride, k_b_stride, k_n_stride,
+          k_s_stride, k_packed_b_stride, k_packed_n_stride, k_sblock_stride, v_packed_b_stride, v_packed_n_stride,
+          v_packed_s_stride, v_packed_eb_stride, m_stride_b, m_stride_n, m_stride_l, out_b_stride, out_n_stride,
+          out_l_stride);
     }
   }
 
   if (profile_on) {
-    ::fused_cpp::sdpa_profile::add(
-        ::fused_cpp::sdpa_profile::Slot::kTotal,
-        ::fused_cpp::sdpa_profile::now_ns() - profile_total_t0);
-    ::fused_cpp::sdpa_profile::print_summary(
-        "clean_sdpa",
-        "qk_packqk_seq4_bmajor_pv_pbf16_prepacked",
-        p,
-        "A");
+    ::fused_cpp::sdpa_profile::add(::fused_cpp::sdpa_profile::Slot::kTotal,
+                                   ::fused_cpp::sdpa_profile::now_ns() - profile_total_t0);
+    ::fused_cpp::sdpa_profile::print_summary("clean_sdpa", "qk_packqk_seq4_bmajor_pv_pbf16_prepacked", p, "A");
   }
 }
 
-void reference_sdpa_bf16(
-    const at::BFloat16* q,
-    const at::BFloat16* k,
-    const at::BFloat16* v,
-    float* out,
-    const Config& cfg_in) {
+void reference_sdpa_bf16(const at::BFloat16* q, const at::BFloat16* k, const at::BFloat16* v, float* out,
+                         const Config& cfg_in) {
   Config cfg = cfg_in;
   check_config(cfg);
   if (cfg.scale == 0.0f) {
@@ -211,9 +182,7 @@ void reference_sdpa_bf16(
         const at::BFloat16* v_bn = v + b * v_b_stride + n * v_n_stride;
         float* out_row = out + b * out_b_stride + n * out_n_stride + l * cfg.Ev;
 
-        const int64_t visible = cfg.causal
-            ? clamp_i64(l + cfg.causal_offset + 1, 0, cfg.S)
-            : cfg.S;
+        const int64_t visible = cfg.causal ? clamp_i64(l + cfg.causal_offset + 1, 0, cfg.S) : cfg.S;
 
         float m = kNegInf;
         for (int64_t s = 0; s < visible; ++s) {
@@ -258,12 +227,8 @@ double counted_gflops(const Config& cfg, double mean_ms) {
       active_per_head += clamp_i64(l + cfg.causal_offset + 1, 0, cfg.S);
     }
   }
-  const double active =
-      static_cast<double>(cfg.B) * static_cast<double>(cfg.N) *
-      static_cast<double>(active_per_head);
-  const double flops_per_score =
-      2.0 * static_cast<double>(cfg.E) +
-      2.0 * static_cast<double>(cfg.Ev) + 5.0;
+  const double active = static_cast<double>(cfg.B) * static_cast<double>(cfg.N) * static_cast<double>(active_per_head);
+  const double flops_per_score = 2.0 * static_cast<double>(cfg.E) + 2.0 * static_cast<double>(cfg.Ev) + 5.0;
   return active * flops_per_score / (mean_ms * 1.0e6);
 }
 

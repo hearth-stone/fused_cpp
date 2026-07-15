@@ -140,10 +140,7 @@ def parse_trace(path: Path) -> List[Dict[str, object]]:
         phases = call["phase"]
         gemms = call["gemm"]
         if not phases:
-            raise RuntimeError(
-                "trace has no PHASE records; rebuild the extension with the "
-                "MoE phase-trace changes"
-            )
+            raise RuntimeError("trace has no PHASE records; rebuild the extension with the MoE phase-trace changes")
 
         def phase_max(*names: str) -> float:
             values: List[float] = []
@@ -215,12 +212,8 @@ def summarize_trace_rows(rows: Sequence[Dict[str, object]]) -> Dict[str, float]:
         raise ValueError("empty trace rows")
     summary = {"trace_e2e_ms": median([float(row["e2e_ms"]) for row in rows])}
     for stage in PIPELINE_STAGES:
-        summary[f"{stage}_ms"] = median(
-            [float(row["stage_ms"].get(stage, 0.0)) for row in rows]
-        )
-    summary["scheduled_compute_ms"] = median(
-        [float(row["stage_ms"].get("scheduled_compute", 0.0)) for row in rows]
-    )
+        summary[f"{stage}_ms"] = median([float(row["stage_ms"].get(stage, 0.0)) for row in rows])
+    summary["scheduled_compute_ms"] = median([float(row["stage_ms"].get("scheduled_compute", 0.0)) for row in rows])
     summary["merge_routes_worker_max_ms"] = median(
         [float(row["stage_ms"].get("merge_routes_worker_max", 0.0)) for row in rows]
     )
@@ -229,11 +222,7 @@ def summarize_trace_rows(rows: Sequence[Dict[str, object]]) -> Dict[str, float]:
     summary["non_gemm_ms"] = max(0.0, summary["trace_e2e_ms"] - gemm_ms)
     for stage in PIPELINE_STAGES + ["gemm", "non_gemm", "scheduled_compute"]:
         ms = summary.get(f"{stage}_ms", 0.0)
-        summary[f"{stage}_pct"] = (
-            100.0 * ms / summary["trace_e2e_ms"]
-            if summary["trace_e2e_ms"] > 0.0
-            else 0.0
-        )
+        summary[f"{stage}_pct"] = 100.0 * ms / summary["trace_e2e_ms"] if summary["trace_e2e_ms"] > 0.0 else 0.0
     return summary
 
 
@@ -371,9 +360,7 @@ def main() -> int:
             trace_rows = parse_trace(args.trace_file)
             summary = summarize_trace_rows(trace_rows)
             full_ms = median(full_times_ms)
-            split_w13 = choose_moe_gemm_split(
-                "w13", routes, 2 * args.ffn_hidden_size, threads
-            )
+            split_w13 = choose_moe_gemm_split("w13", routes, 2 * args.ffn_hidden_size, threads)
             split_w2 = choose_moe_gemm_split("w2", routes, args.hidden_size, threads)
             row = {
                 "routes": routes,
@@ -404,9 +391,7 @@ def main() -> int:
 
     split_requested = env_enabled("FUSED_CPP_MOE_W13_SPLIT_N")
     w13_n = int(packed.w13[2])
-    split_active = (
-        split_requested and w13_n % 2 == 0 and (w13_n // 2) % packed.backend_n_tile == 0
-    )
+    split_active = split_requested and w13_n % 2 == 0 and (w13_n // 2) % packed.backend_n_tile == 0
     payload = {
         "schema_version": 1,
         "kernel": {
@@ -439,15 +424,11 @@ def main() -> int:
     if args.output_csv is not None:
         args.output_csv.parent.mkdir(parents=True, exist_ok=True)
         with args.output_csv.open("w", encoding="utf-8", newline="") as f:
-            fieldnames = [
-                key for key in payload_rows[0].keys() if key != "full_call_times_ms"
-            ]
+            fieldnames = [key for key in payload_rows[0].keys() if key != "full_call_times_ms"]
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
             for row in payload_rows:
-                writer.writerow(
-                    {key: value for key, value in row.items() if key in fieldnames}
-                )
+                writer.writerow({key: value for key, value in row.items() if key in fieldnames})
         print(f"wrote_csv={args.output_csv}")
     return 0
 

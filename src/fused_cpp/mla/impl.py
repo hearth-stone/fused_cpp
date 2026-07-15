@@ -6,6 +6,7 @@ Fuses the complete MLA forward computation (projection, RoPE, KV cache write,
 attention, o_proj) into a single class. All computation uses PyTorch only —
 no external framework dependencies beyond torch.
 """
+
 from __future__ import annotations
 
 import concurrent.futures
@@ -25,6 +26,7 @@ if not logger.handlers:
 # ── C++ extension import (graceful fallback to PyTorch) ──────────────────────
 try:
     from fused_cpp import _C
+
     _HAS_CPP = True
 except ImportError:
     _C = None
@@ -75,6 +77,7 @@ if _DEBUG_USE_ORIG_ROPE:
 
 # ── Pure PyTorch kernel implementations ──────────────────────────────────────
 
+
 def _pytorch_rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     """RMSNorm: normalize in float32, cast back, multiply by weight.
 
@@ -124,8 +127,10 @@ def _pytorch_apply_rope(
 
 
 def _pytorch_write_kv_cache(
-    kv_c: torch.Tensor, k_pe: torch.Tensor,
-    kv_cache: torch.Tensor, slot_mapping: torch.Tensor,
+    kv_c: torch.Tensor,
+    k_pe: torch.Tensor,
+    kv_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
 ) -> None:
     """Write concatenated kv_c+k_pe to paged KV cache via slot_mapping.
 
@@ -145,8 +150,10 @@ def _pytorch_write_kv_cache(
 
 
 def _pytorch_gather_kv_cache(
-    kv_cache: torch.Tensor, block_table: torch.Tensor,
-    seq_len: int, block_size: int,
+    kv_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_len: int,
+    block_size: int,
 ) -> torch.Tensor:
     """Gather seq_len tokens from paged KV cache.
 
@@ -162,11 +169,11 @@ def _pytorch_gather_kv_cache(
     for block_idx in range(num_full_blocks):
         block_num = int(block_table[block_idx].item())
         start = block_idx * block_size
-        gathered[start:start + block_size] = kv_cache[block_num]
+        gathered[start : start + block_size] = kv_cache[block_num]
     if remainder > 0:
         block_num = int(block_table[num_full_blocks].item())
         start = num_full_blocks * block_size
-        gathered[start:start + remainder] = kv_cache[block_num, :remainder]
+        gathered[start : start + remainder] = kv_cache[block_num, :remainder]
     return gathered
 
 
@@ -183,8 +190,10 @@ def _pytorch_concat_k_nope_k_pe(k_nope: torch.Tensor, k_pe: torch.Tensor) -> tor
 
 
 def _pytorch_merge_attn_states(
-    prefix_output: torch.Tensor, prefix_lse: torch.Tensor,
-    suffix_output: torch.Tensor, suffix_lse: torch.Tensor,
+    prefix_output: torch.Tensor,
+    prefix_lse: torch.Tensor,
+    suffix_output: torch.Tensor,
+    suffix_lse: torch.Tensor,
 ) -> torch.Tensor:
     """LSE merge of two attention outputs, computed in float32.
 
@@ -207,6 +216,7 @@ def _pytorch_merge_attn_states(
 
 
 # ── C++ wrapper for apply_rope (normalizes is_neox_style=None) ───────────────
+
 
 def _cpp_apply_rope(x, cos_sin_cache, positions, is_neox_style=True):
     return _C.apply_rope(x, cos_sin_cache, positions, is_neox_style if is_neox_style is not None else True)
@@ -318,9 +328,10 @@ class CPUFusedMLAImpl:
             _env_val = 0
         self.num_threads: int = _env_val if _env_val > 0 else torch.get_num_threads()
         logger.debug(
-            "CPUFusedMLAImpl: num_threads=%d (FUSED_MLA_NUM_THREADS=%r, "
-            "torch.get_num_threads()=%d)",
-            self.num_threads, _env_threads, torch.get_num_threads(),
+            "CPUFusedMLAImpl: num_threads=%d (FUSED_MLA_NUM_THREADS=%r, torch.get_num_threads()=%d)",
+            self.num_threads,
+            _env_threads,
+            torch.get_num_threads(),
         )
 
     def set_attn_impl(self, attn_impl: Any) -> None:
@@ -380,25 +391,28 @@ class CPUFusedMLAImpl:
 
         if _HAS_CPP:
             self.W_UK_T, self.W_UV = _C.build_absorption_matrices(
-                self._kv_b_proj_weight, self.num_heads,
-                self.qk_nope_head_dim, self.v_head_dim,
-                self.kv_lora_rank, act_dtype,
+                self._kv_b_proj_weight,
+                self.num_heads,
+                self.qk_nope_head_dim,
+                self.v_head_dim,
+                self.kv_lora_rank,
+                act_dtype,
             )
         else:
             kv_b_proj_weight = kv_b_proj_weight.view(
-                self.kv_lora_rank, self.num_heads,
+                self.kv_lora_rank,
+                self.num_heads,
                 self.qk_nope_head_dim + self.v_head_dim,
             )
-            w_uk, w_uv = kv_b_proj_weight.split(
-                [self.qk_nope_head_dim, self.v_head_dim], dim=-1
-            )
+            w_uk, w_uv = kv_b_proj_weight.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
             self.W_UK_T = w_uk.permute(1, 2, 0).contiguous()
             self.W_UV = w_uv.transpose(0, 1).contiguous()
 
         assert self.W_UK_T is not None and self.W_UV is not None
         logger.debug(
             "CPUFusedMLAImpl.process_weights_after_loading: W_UK_T=%s, W_UV=%s",
-            tuple(self.W_UK_T.shape), tuple(self.W_UV.shape),
+            tuple(self.W_UK_T.shape),
+            tuple(self.W_UV.shape),
         )
 
     def forward_fused(
@@ -455,24 +469,25 @@ class CPUFusedMLAImpl:
             assert self.cos_sin_cache is not None
             cos_sin_cache = self.cos_sin_cache
             if _DEBUG_USE_ORIG_ROPE:
-                q[..., wrapper.qk_nope_head_dim:], k_pe = wrapper.rotary_emb(
-                    positions, q[..., wrapper.qk_nope_head_dim:], k_pe
+                q[..., wrapper.qk_nope_head_dim :], k_pe = wrapper.rotary_emb(
+                    positions, q[..., wrapper.qk_nope_head_dim :], k_pe
                 )  # q: [T, H, d_qk],  k_pe: [T, 1, d_rope]
             else:
-                q_rope = q[..., wrapper.qk_nope_head_dim:]  # [T, H, d_rope]
-                q[..., wrapper.qk_nope_head_dim:] = self._apply_rope(
+                q_rope = q[..., wrapper.qk_nope_head_dim :]  # [T, H, d_rope]
+                q[..., wrapper.qk_nope_head_dim :] = self._apply_rope(
                     q_rope, cos_sin_cache, positions, self.is_neox_style
                 )  # in-place update q[..., d_nope:]: [T, H, d_rope]
-                k_pe = self._apply_rope(
-                    k_pe, cos_sin_cache, positions, self.is_neox_style
-                )  # [T, 1, d_rope]
+                k_pe = self._apply_rope(k_pe, cos_sin_cache, positions, self.is_neox_style)  # [T, 1, d_rope]
 
         # ── 4. Write to KV cache ──────────────────────────────────────────────
         # kv_c_normed: [T, R_kv],  k_pe.squeeze(1): [T, d_rope]
         slot_mapping = getattr(attn_metadata, "slot_mapping", None)
         if kv_cache.numel() > 0 and slot_mapping is not None:
             self._write_kv_cache_cpu(
-                kv_c_normed, k_pe.squeeze(1), kv_cache, slot_mapping.flatten(),
+                kv_c_normed,
+                k_pe.squeeze(1),
+                kv_cache,
+                slot_mapping.flatten(),
             )
 
         # ── 5. Attention computation ──────────────────────────────────────────
@@ -481,15 +496,17 @@ class CPUFusedMLAImpl:
         has_prefill = (getattr(attn_metadata, "num_prefills", None) or 0) > 0
 
         attn_output = torch.zeros(
-            num_tokens, wrapper.num_heads * wrapper.v_head_dim,
-            dtype=hidden_states.dtype, device=hidden_states.device,
+            num_tokens,
+            wrapper.num_heads * wrapper.v_head_dim,
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
         )  # [T, H * d_v]
 
         if has_prefill:
             self._forward_prefill_torch(
-                q=q[num_decode_tokens:],          # [T_p, H, d_qk]
+                q=q[num_decode_tokens:],  # [T_p, H, d_qk]
                 kv_c_normed=kv_c_normed[num_decode_tokens:],  # [T_p, R_kv]
-                k_pe=k_pe[num_decode_tokens:],    # [T_p, 1, d_rope]
+                k_pe=k_pe[num_decode_tokens:],  # [T_p, 1, d_rope]
                 kv_cache=kv_cache,
                 attn_metadata=attn_metadata,
                 output=attn_output[num_decode_tokens:],  # [T_p, H * d_v]
@@ -503,18 +520,22 @@ class CPUFusedMLAImpl:
             assert self.W_UK_T is not None, "W_UK_T not initialized"
             # W_UK_T: [H, d_nope, R_kv];  bmm over H heads: [H, T_d, d_nope] x [H, d_nope, R_kv]
             mqa_ql_nope = torch.bmm(
-                mqa_q_nope.transpose(0, 1), self.W_UK_T,
+                mqa_q_nope.transpose(0, 1),
+                self.W_UK_T,
             ).transpose(0, 1)  # [T_d, H, R_kv]
 
             attn_out = self._forward_decode_torch(
-                q_nope_proj=mqa_ql_nope, q_pe=mqa_q_pe,
-                kv_cache=kv_cache, attn_metadata=attn_metadata,
+                q_nope_proj=mqa_ql_nope,
+                q_pe=mqa_q_pe,
+                kv_cache=kv_cache,
+                attn_metadata=attn_metadata,
             )  # [T_d, H, R_kv]
 
             assert self.W_UV is not None, "W_UV not initialized"
             # W_UV: [H, R_kv, d_v];  bmm over H heads: [H, T_d, R_kv] x [H, R_kv, d_v]
             decode_v = torch.bmm(
-                attn_out.transpose(0, 1), self.W_UV,
+                attn_out.transpose(0, 1),
+                self.W_UV,
             ).transpose(0, 1)  # [T_d, H, d_v]
             attn_output[:num_decode_tokens] = decode_v.reshape(
                 num_decode_tokens, wrapper.num_heads * wrapper.v_head_dim
@@ -533,6 +554,7 @@ class CPUFusedMLAImpl:
                 output = self.reduce_fn(output)
             else:
                 import torch.distributed as dist
+
                 dist.all_reduce(output)
 
         return output
@@ -556,11 +578,15 @@ class CPUFusedMLAImpl:
 
         cu_seqlens_q = prefill_metadata.query_start_loc
         output_prefill = self._varlen_attention(
-            q=q, k=k, v=v,
-            cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_q,
+            q=q,
+            k=k,
+            v=v,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_q,
             max_seqlen_q=prefill_metadata.max_query_len,
             max_seqlen_k=prefill_metadata.max_query_len,
-            causal=True, return_softmax_lse=has_context,
+            causal=True,
+            return_softmax_lse=has_context,
         )  # [T_p, H, d_v] or tuple([T_p, H, d_v], [H, T_p])
 
         if has_context:
@@ -568,19 +594,21 @@ class CPUFusedMLAImpl:
             suffix_output, suffix_lse = output_prefill
             # suffix_output: [T_p, H, d_qk],  suffix_lse: [H, T_p]
             assert suffix_lse is not None
-            suffix_output = suffix_output[..., :self.v_head_dim]  # [T_p, H, d_v]
+            suffix_output = suffix_output[..., : self.v_head_dim]  # [T_p, H, d_v]
 
             context_output, context_lse = self._compute_prefill_context(
                 q, kv_cache, attn_metadata
             )  # context_output: [T_p, H, d_v],  context_lse: [H, T_p]
             merged = self._merge_attn_states(
-                prefix_output=context_output, prefix_lse=context_lse,
-                suffix_output=suffix_output, suffix_lse=suffix_lse,
+                prefix_output=context_output,
+                prefix_lse=context_lse,
+                suffix_output=suffix_output,
+                suffix_lse=suffix_lse,
             )  # [T_p, H, d_v]
             output.copy_(merged.flatten(start_dim=-2))  # [T_p, H * d_v]
         else:
             assert isinstance(output_prefill, torch.Tensor)
-            output.copy_(output_prefill[..., :v.shape[-1]].flatten(start_dim=-2))  # [T_p, H * d_v]
+            output.copy_(output_prefill[..., : v.shape[-1]].flatten(start_dim=-2))  # [T_p, H * d_v]
 
     def _compute_prefill_context(self, q, kv_cache, attn_metadata):
         """Gather context tokens from KV cache, compute prefill context attention."""
@@ -605,36 +633,39 @@ class CPUFusedMLAImpl:
             )
 
         gathered_kv = torch.empty(
-            total_context_tokens, self.kv_lora_rank + self.qk_rope_head_dim,
-            dtype=kv_cache.dtype, device=q.device,
+            total_context_tokens,
+            self.kv_lora_rank + self.qk_rope_head_dim,
+            dtype=kv_cache.dtype,
+            device=q.device,
         )  # [T_ctx, R_kv + d_rope]
         for i in range(num_prefills):
             ctx_len = int(context_lens[i])
             if ctx_len == 0:
                 continue
             dst_start = int(cu_seqlens_k[i].item())
-            gathered_kv[dst_start:dst_start + ctx_len] = self._gather_kv_cache(
+            gathered_kv[dst_start : dst_start + ctx_len] = self._gather_kv_cache(
                 kv_cache, block_table[i], ctx_len, block_size
             )
 
-        kv_c_ctx = gathered_kv[:, :self.kv_lora_rank]  # [T_ctx, R_kv]
-        k_pe_ctx = gathered_kv[:, self.kv_lora_rank:].unsqueeze(1)  # [T_ctx, 1, d_rope]
+        kv_c_ctx = gathered_kv[:, : self.kv_lora_rank]  # [T_ctx, R_kv]
+        k_pe_ctx = gathered_kv[:, self.kv_lora_rank :].unsqueeze(1)  # [T_ctx, 1, d_rope]
 
         kv_nope = self._kv_b_proj_forward(kv_c_ctx).view(
             -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
         )  # [T_ctx, H, d_nope + d_v]
-        k_nope_ctx, v_ctx = kv_nope.split(
-            [self.qk_nope_head_dim, self.v_head_dim], dim=-1
-        )
+        k_nope_ctx, v_ctx = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
         k_ctx = self._concat_k_nope_k_pe(k_nope_ctx, k_pe_ctx)  # [T_ctx, H, d_qk]
 
         result = self._varlen_attention(
-            q=q, k=k_ctx, v=v_ctx,
+            q=q,
+            k=k_ctx,
+            v=v_ctx,
             cu_seqlens_q=prefill_metadata.query_start_loc,
             cu_seqlens_k=cu_seqlens_k,
             max_seqlen_q=prefill_metadata.max_query_len,
             max_seqlen_k=int(context_lens.max().item()),
-            causal=False, return_softmax_lse=True,
+            causal=False,
+            return_softmax_lse=True,
         )
         assert isinstance(result, tuple)
         context_output, context_lse = result
@@ -651,9 +682,14 @@ class CPUFusedMLAImpl:
 
         if _HAS_CPP:
             return _C.forward_decode(
-                q_nope_proj, q_pe, kv_cache,
-                decode_metadata.block_table, decode_metadata.seq_lens,
-                self.scale, self.kv_lora_rank, self.qk_rope_head_dim,
+                q_nope_proj,
+                q_pe,
+                kv_cache,
+                decode_metadata.block_table,
+                decode_metadata.seq_lens,
+                self.scale,
+                self.kv_lora_rank,
+                self.qk_rope_head_dim,
             )
 
         batch_size = q_nope_proj.shape[0]
@@ -664,8 +700,11 @@ class CPUFusedMLAImpl:
         block_size = kv_cache.shape[1]
 
         output = torch.zeros(
-            batch_size, num_heads, self.kv_lora_rank,
-            dtype=q_nope_proj.dtype, device=q_nope_proj.device,
+            batch_size,
+            num_heads,
+            self.kv_lora_rank,
+            dtype=q_nope_proj.dtype,
+            device=q_nope_proj.device,
         )  # [B, H, R_kv]
 
         for b in range(batch_size):
@@ -675,11 +714,10 @@ class CPUFusedMLAImpl:
             gathered_kv = self._gather_kv_cache(
                 kv_cache, block_table[b], seq_len, block_size
             )  # [seq_len, R_kv + d_rope]
-            kv_c = gathered_kv[:, :self.kv_lora_rank]   # [seq_len, R_kv]
-            k_pe_seq = gathered_kv[:, self.kv_lora_rank:]  # [seq_len, d_rope]
+            kv_c = gathered_kv[:, : self.kv_lora_rank]  # [seq_len, R_kv]
+            k_pe_seq = gathered_kv[:, self.kv_lora_rank :]  # [seq_len, d_rope]
             attn_scores = (
-                torch.matmul(q_nope_proj[b], kv_c.T)
-                + torch.matmul(q_pe[b], k_pe_seq.T)
+                torch.matmul(q_nope_proj[b], kv_c.T) + torch.matmul(q_pe[b], k_pe_seq.T)
             ) * self.scale  # [H, seq_len]
             attn_weights = F.softmax(attn_scores, dim=-1)  # [H, seq_len]
             output[b] = torch.matmul(attn_weights, kv_c)  # [H, R_kv]
@@ -688,9 +726,9 @@ class CPUFusedMLAImpl:
 
     # ── varlen_attention ──────────────────────────────────────────────────────
 
-    def _varlen_attention(self, q, k, v, cu_seqlens_q, cu_seqlens_k,
-                          max_seqlen_q, max_seqlen_k, causal=True,
-                          return_softmax_lse=False):
+    def _varlen_attention(
+        self, q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, causal=True, return_softmax_lse=False
+    ):
         """Variable-length multi-head attention.
 
         Shape:
@@ -703,9 +741,16 @@ class CPUFusedMLAImpl:
         """
         if _HAS_CPP:
             return _C.varlen_attention(
-                q, k, v, cu_seqlens_q, cu_seqlens_k,
-                max_seqlen_q, max_seqlen_k, self.scale,
-                causal, return_softmax_lse,
+                q,
+                k,
+                v,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_seqlen_q,
+                max_seqlen_k,
+                self.scale,
+                causal,
+                return_softmax_lse,
             )
 
         batch_size = cu_seqlens_q.shape[0] - 1
@@ -715,13 +760,16 @@ class CPUFusedMLAImpl:
         qk_head_dim = q.shape[2]
 
         output = torch.zeros(
-            total_q_tokens, num_heads, v_head_dim,
-            dtype=q.dtype, device=q.device,
+            total_q_tokens,
+            num_heads,
+            v_head_dim,
+            dtype=q.dtype,
+            device=q.device,
         )  # [T, H, d_v]
         lse = (
-            torch.full((num_heads, total_q_tokens), float("-inf"),
-                        dtype=torch.float32, device=q.device)
-            if return_softmax_lse else None
+            torch.full((num_heads, total_q_tokens), float("-inf"), dtype=torch.float32, device=q.device)
+            if return_softmax_lse
+            else None
         )  # [H, T] or None
 
         cu_seqlens_q_cpu = cu_seqlens_q.cpu().numpy()
@@ -750,9 +798,7 @@ class CPUFusedMLAImpl:
                     q_idx = torch.arange(seq_q, device=q.device).unsqueeze(1)
                     k_idx = torch.arange(seq_k, device=q.device).unsqueeze(0)
                     causal_mask = q_idx >= k_idx
-                    attn_scores = attn_scores.masked_fill(
-                        ~causal_mask.unsqueeze(0).unsqueeze(0), float("-inf")
-                    )
+                    attn_scores = attn_scores.masked_fill(~causal_mask.unsqueeze(0).unsqueeze(0), float("-inf"))
                 lse_i = torch.logsumexp(attn_scores, dim=-1)  # [1, H, T_qi]
                 assert lse is not None
                 lse[:, q_start:q_end] = lse_i.squeeze(0)
@@ -760,8 +806,13 @@ class CPUFusedMLAImpl:
                 output_i = torch.matmul(attn_weights, v_i)  # [1, H, T_qi, d_qk]
             else:
                 output_i = F.scaled_dot_product_attention(
-                    q_i, k_i, v_i, attn_mask=None, dropout_p=0.0,
-                    is_causal=causal, scale=self.scale,
+                    q_i,
+                    k_i,
+                    v_i,
+                    attn_mask=None,
+                    dropout_p=0.0,
+                    is_causal=causal,
+                    scale=self.scale,
                 )  # [1, H, T_qi, d_qk]
 
             output[q_start:q_end] = output_i[0, :, :, :v_head_dim].transpose(0, 1)  # [T_qi, H, d_v]
@@ -798,8 +849,7 @@ class CPUFusedMLAImpl:
         # 无 cpu_linear 时走原始 F.linear 路径
         if weight is None or weight.numel() == 0:
             raise RuntimeError(
-                f"Layer {type(layer).__name__} weight is empty or missing, "
-                f"cannot perform linear transform"
+                f"Layer {type(layer).__name__} weight is empty or missing, cannot perform linear transform"
             )
         return F.linear(x, weight, bias)
 
@@ -809,9 +859,9 @@ class CPUFusedMLAImpl:
         weight = getattr(layer, "weight", None)
         bias = getattr(layer, "bias", None)
         logger.debug(
-            "%s: type=%s, has_cpu_linear=%s, weight_shape=%s, "
-            "weight_numel=%s, has_bias=%s, skip_bias_add=%s",
-            name, type(layer).__name__,
+            "%s: type=%s, has_cpu_linear=%s, weight_shape=%s, weight_numel=%s, has_bias=%s, skip_bias_add=%s",
+            name,
+            type(layer).__name__,
             hasattr(layer, "cpu_linear"),
             None if weight is None else tuple(weight.shape),
             None if weight is None else weight.numel(),

@@ -5,6 +5,7 @@ Task 1: the cooperative N-split fused w13 dispatch (team_fused_w13_silu) must
 assemble an intermediate that is bit-for-bit identical to the whole-slice
 single-thread fused kernel (same kernel, disjoint column slices).
 """
+
 from __future__ import annotations
 
 import platform
@@ -72,9 +73,7 @@ def _nsplit_env(groups_per_partition=1, core_bases="0"):
     """Enable the hierarchical N-split path for the duration of the block."""
     saved = {k: os.environ.get(k) for k in _NSPLIT_ENV_KEYS}
     os.environ["FUSED_CPP_MOE_HIERARCHICAL_N_SPLIT"] = "1"
-    os.environ["FUSED_CPP_MOE_N_SPLIT_GROUPS_PER_PARTITION"] = str(
-        groups_per_partition
-    )
+    os.environ["FUSED_CPP_MOE_N_SPLIT_GROUPS_PER_PARTITION"] = str(groups_per_partition)
     os.environ["FUSED_CPP_MOE_N_SPLIT_CORE_BASES"] = core_bases
     try:
         yield
@@ -108,9 +107,7 @@ def _moe_case(num_tokens, hidden, ffn, num_experts, top_k, seed):
 def test_nsplit_fused_moe_matches_baseline(degree, num_tokens):
     # F % 8 == 0 required. A group of 4 threads teams over each expert.
     hidden, ffn, num_experts, top_k = 128, 64, 4, 2
-    x, w13, w2, tw, ti = _moe_case(
-        num_tokens, hidden, ffn, num_experts, top_k, seed=degree + num_tokens
-    )
+    x, w13, w2, tw, ti = _moe_case(num_tokens, hidden, ffn, num_experts, top_k, seed=degree + num_tokens)
 
     base_w = prepare_fused_moe_bf16_tiled_weights(w13, w2)
     fused_w = prepare_fused_moe_bf16_tiled_weights(w13, w2, fuse_silu=True)
@@ -133,4 +130,3 @@ def test_nsplit_fused_moe_matches_baseline(degree, num_tokens):
     assert out.shape == ref.shape
     assert out.dtype == torch.bfloat16
     torch.testing.assert_close(out.float(), ref.float(), atol=6e-2, rtol=6e-2)
-

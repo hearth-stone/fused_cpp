@@ -75,18 +75,10 @@ def predict_m12(
     overhead = formula.O(threads)
     if blocks == 0:
         return tail_lookup[(tail, threads)]
-    bulk = (
-        tail_lookup[(blocks * 12, threads)]
-        if blocks <= 2
-        else formula.T_iso(blocks * 12, threads)
-    )
+    bulk = tail_lookup[(blocks * 12, threads)] if blocks <= 2 else formula.T_iso(blocks * 12, threads)
     if tail == 0:
         return bulk
-    return (
-        overhead
-        + max(bulk - overhead, 0.0)
-        + max(tail_lookup[(tail, threads)] - overhead, 0.0)
-    )
+    return overhead + max(bulk - overhead, 0.0) + max(tail_lookup[(tail, threads)] - overhead, 0.0)
 
 
 def table_interpolate(curve: dict[int, float], routes: int) -> float:
@@ -129,44 +121,27 @@ def main() -> int:
     args = parse_args()
     profile = json.loads(args.profile.read_text(encoding="utf-8"))
     measured = [
-        (int(entry["routes"]), int(entry["threads"]), float(entry["median_ns"]))
-        for entry in profile["isolated"]
+        (int(entry["routes"]), int(entry["threads"]), float(entry["median_ns"])) for entry in profile["isolated"]
     ]
     measured_routes = sorted({route for route, _, _ in measured})
     measured_threads = sorted({threads for _, threads, _ in measured})
-    measured_lookup = {
-        (routes, threads): value for routes, threads, value in measured
-    }
-    calibration_routes = [
-        route
-        for route in parse_ints(args.calibration_routes)
-        if route in measured_routes
-    ]
+    measured_lookup = {(routes, threads): value for routes, threads, value in measured}
+    calibration_routes = [route for route in parse_ints(args.calibration_routes) if route in measured_routes]
     calibration_threads = (
         measured_threads
         if args.calibration_threads is None
-        else [
-            team
-            for team in parse_ints(args.calibration_threads)
-            if team in measured_threads
-        ]
+        else [team for team in parse_ints(args.calibration_threads) if team in measured_threads]
     )
     calibration_route_set = set(calibration_routes)
     calibration_thread_set = set(calibration_threads)
     fit_points = [
-        point
-        for point in measured
-        if point[0] in calibration_route_set and point[1] in calibration_thread_set
+        point for point in measured if point[0] in calibration_route_set and point[1] in calibration_thread_set
     ]
     formula = fit_from_measurements(fit_points, phi_route_min=args.phi_route_min)
 
     use_m12 = int(profile.get("schema_version", 1)) >= 2
     table_curves = {
-        team: {
-            route: value
-            for route, measured_team, value in fit_points
-            if measured_team == team
-        }
+        team: {route: value for route, measured_team, value in fit_points if measured_team == team}
         for team in calibration_threads
     }
     rows: list[dict] = []
@@ -174,33 +149,22 @@ def main() -> int:
         if threads < formula.min_threads or threads > formula.max_threads:
             continue
         predicted_ns = (
-            predict_m12(formula, routes, threads, measured_lookup)
-            if use_m12
-            else formula.T_iso(routes, threads)
+            predict_m12(formula, routes, threads, measured_lookup) if use_m12 else formula.T_iso(routes, threads)
         )
-        table_ns = (
-            table_interpolate(table_curves[threads], routes)
-            if threads in table_curves
-            else None
-        )
+        table_ns = table_interpolate(table_curves[threads], routes) if threads in table_curves else None
         rows.append(
             {
                 "routes": routes,
                 "threads": threads,
                 "kind": (
                     "calibration"
-                    if routes in calibration_route_set
-                    and threads in calibration_thread_set
+                    if routes in calibration_route_set and threads in calibration_thread_set
                     else "holdout"
                 ),
                 "measured_ns": measured_ns,
                 "predicted_ns": predicted_ns,
                 "error_pct": (predicted_ns / measured_ns - 1.0) * 100.0,
-                "sparse_table_error_pct": (
-                    None
-                    if table_ns is None
-                    else (table_ns / measured_ns - 1.0) * 100.0
-                ),
+                "sparse_table_error_pct": (None if table_ns is None else (table_ns / measured_ns - 1.0) * 100.0),
             }
         )
 
@@ -210,10 +174,7 @@ def main() -> int:
         "calibration": summarize(calibration_rows),
         "holdout": summarize(holdout_rows),
         "holdout_by_thread": {
-            str(team): summarize(
-                [row for row in holdout_rows if row["threads"] == team]
-            )
-            for team in measured_threads
+            str(team): summarize([row for row in holdout_rows if row["threads"] == team]) for team in measured_threads
         },
     }
     table_holdout = [
@@ -276,8 +237,7 @@ def main() -> int:
 
     if (
         args.fail_holdout_median_pct is not None
-        and summary["holdout"].get("median_abs_error_pct", 0.0)
-        > args.fail_holdout_median_pct
+        and summary["holdout"].get("median_abs_error_pct", 0.0) > args.fail_holdout_median_pct
     ):
         return 1
     return 0
