@@ -49,9 +49,7 @@ def test_owner_cache_fit_recovers_resident_stream_saturation() -> None:
             stream_bytes=stream,
             working_set_bytes=n * stream,
             bandwidth_bytes_per_second=(
-                limit * (1.0 - math.exp(-n / saturation))
-                if n <= 8
-                else 4e12
+                limit * (1.0 - math.exp(-n / saturation)) if n <= 8 else 4e12
             ),
         )
         for n in (1, 2, 3, 4, 6, 8, 12)

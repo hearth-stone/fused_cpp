@@ -150,11 +150,7 @@ def fused_expert_work(
     w13 = GemmWork(
         flops=4 * effective_rows * h * f,
         a_read_bytes=(
-            BF16_BYTES
-            * effective_rows
-            * h
-            * n_partitions
-            * int(w13_n_ranges)
+            BF16_BYTES * effective_rows * h * n_partitions * int(w13_n_ranges)
         ),
         b_read_bytes=BF16_BYTES * panel_count * h * (2 * f),
         c_write_bytes=BF16_BYTES * store_rows * f,
@@ -362,12 +358,8 @@ def build_report(profile: dict, profile_path: str, min_routes: int) -> dict:
             "w13_n_ranges": w13_n_ranges,
             "w13_flops": "4*m_compute*H*F",
             "w2_flops": "2*m_compute*H*F",
-            "w13_bytes_nsplit": (
-                "4*H*F + 2*c13*t*m_compute*H + 2*m_store*F"
-            ),
-            "w2_bytes_nsplit": (
-                "2*H*F + 2*t*m_compute*F + 4*m_store*H"
-            ),
+            "w13_bytes_nsplit": ("4*H*F + 2*c13*t*m_compute*H + 2*m_store*F"),
+            "w2_bytes_nsplit": ("2*H*F + 2*t*m_compute*F + 4*m_store*H"),
             "stage_time": "max(flops / P_stage(t), bytes / B_L3(t))",
             "total_time": "O(t) + T_aux + sum_panels(T_w13 + T_w2)",
         },

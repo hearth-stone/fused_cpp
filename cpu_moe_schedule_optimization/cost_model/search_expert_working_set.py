@@ -12,7 +12,6 @@ import argparse
 import json
 import os
 import platform
-import statistics
 from pathlib import Path
 
 import torch
@@ -62,9 +61,7 @@ def default_active_experts(total_cores: int, num_experts: int) -> list[int]:
     return sorted(value for value in values if value <= upper)
 
 
-def parse_active_experts(
-    text: str, total_cores: int, num_experts: int
-) -> list[int]:
+def parse_active_experts(text: str, total_cores: int, num_experts: int) -> list[int]:
     if text.strip().lower() == "auto":
         return default_active_experts(total_cores, num_experts)
     values: list[int] = []
@@ -108,9 +105,7 @@ def expert_flops(routes: int, hidden_size: int, intermediate_size: int) -> int:
     return 6 * routes * hidden_size * intermediate_size
 
 
-def summarize_search(
-    entries: list[dict], throughput_tolerance: float
-) -> list[dict]:
+def summarize_search(entries: list[dict], throughput_tolerance: float) -> list[dict]:
     summaries: list[dict] = []
     keys = sorted({(entry["allocation"], entry["routes"]) for entry in entries})
     for allocation, routes in keys:
@@ -150,7 +145,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ffn-hidden-size", type=int, default=2048)
     parser.add_argument("--num-experts", type=int, default=32)
     parser.add_argument("--global-experts", type=int, default=64)
-    parser.add_argument("--parallel-mode", choices=("standalone", "tp", "ep"), default="ep")
+    parser.add_argument(
+        "--parallel-mode", choices=("standalone", "tp", "ep"), default="ep"
+    )
     parser.add_argument("--parallel-degree", type=int, default=2)
     parser.add_argument("--route-buckets", default=DEFAULT_ROUTES)
     parser.add_argument(
@@ -187,9 +184,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     cpu_ids = (
-        parse_cpu_ids(args.cpu_ids)
-        if args.cpu_ids is not None
-        else available_cpu_ids()
+        parse_cpu_ids(args.cpu_ids) if args.cpu_ids is not None else available_cpu_ids()
     )
     total_cores = len(cpu_ids)
     active_values = parse_active_experts(
@@ -282,9 +277,7 @@ def main() -> int:
                     "working_set_bytes": active_experts * stage_bytes,
                     "working_set_mib": active_experts * stage_bytes / 2**20,
                     "working_set_to_llc": (
-                        active_experts * stage_bytes / llc_bytes
-                        if llc_bytes
-                        else None
+                        active_experts * stage_bytes / llc_bytes if llc_bytes else None
                     ),
                     "full_call_median_ns": median_ns,
                     "full_call_p10_ns": timing["p10_ns"],

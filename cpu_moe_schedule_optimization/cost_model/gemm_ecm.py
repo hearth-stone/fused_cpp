@@ -92,14 +92,10 @@ def allocate_n_tiles(
     total_tiles = n_columns // n_tile
     range_base, range_extra = divmod(total_tiles, n_ranges)
     if range_extra:
-        raise ValueError(
-            f"N tiles={total_tiles} cannot form {n_ranges} equal ranges"
-        )
+        raise ValueError(f"N tiles={total_tiles} cannot form {n_ranges} equal ranges")
     range_tiles = (range_base,) * n_ranges
     if not range_tiles or range_base <= 0:
-        raise ValueError(
-            f"n_ranges={n_ranges} exceeds available N tiles={total_tiles}"
-        )
+        raise ValueError(f"n_ranges={n_ranges} exceeds available N tiles={total_tiles}")
 
     per_thread = [0] * threads
     active_thread_range_scans = 0
@@ -137,16 +133,21 @@ class GemmStage:
             raise ValueError(f"name must be 'w13' or 'w2', got {self.name!r}")
         if self.routes < 0:
             raise ValueError(f"routes must be non-negative, got {self.routes}")
-        if min(
-            self.k,
-            self.n,
-            self.output_columns,
-            self.output_element_bytes,
-            self.threads,
-            self.n_tile,
-            self.n_ranges,
-        ) <= 0:
-            raise ValueError("all GEMM dimensions and execution parameters must be positive")
+        if (
+            min(
+                self.k,
+                self.n,
+                self.output_columns,
+                self.output_element_bytes,
+                self.threads,
+                self.n_tile,
+                self.n_ranges,
+            )
+            <= 0
+        ):
+            raise ValueError(
+                "all GEMM dimensions and execution parameters must be positive"
+            )
         if self.k % 8 != 0:
             raise ValueError(f"k must be padded to a multiple of eight, got {self.k}")
         if self.n % self.n_tile != 0:
@@ -245,11 +246,7 @@ class GemmEcmWork:
 
     @property
     def llc_bytes(self) -> int:
-        return (
-            self.llc_a_read_bytes
-            + self.llc_b_read_bytes
-            + self.llc_c_write_bytes
-        )
+        return self.llc_a_read_bytes + self.llc_b_read_bytes + self.llc_c_write_bytes
 
     @property
     def compute_efficiency(self) -> float:
@@ -390,26 +387,18 @@ class EcmPrediction:
 
 def predict_ecm(work: GemmEcmWork, caps: EcmCaps) -> EcmPrediction:
     """Evaluate ``fixed + max(overlap, non-overlap transfers) + epilogue``."""
-    matrix_flops = (
-        work.balanced_bfmmla_instructions * 2 * work.stage.vector_bytes
-    )
+    matrix_flops = work.balanced_bfmmla_instructions * 2 * work.stage.vector_bytes
     matrix_ns = matrix_flops / caps.bfmmla_flops_per_second * 1e9
     frontend_ns = 0.0
     if caps.key_instructions_per_second is not None:
         frontend_ns = (
-            work.balanced_key_instructions
-            / caps.key_instructions_per_second
-            * 1e9
+            work.balanced_key_instructions / caps.key_instructions_per_second * 1e9
         )
-    l1_load_ns = (
-        work.balanced_l1_load_bytes / caps.l1_load_bytes_per_second * 1e9
-    )
+    l1_load_ns = work.balanced_l1_load_bytes / caps.l1_load_bytes_per_second * 1e9
     private_refill_ns = 0.0
     if caps.private_refill_bytes_per_second is not None:
         private_refill_ns = (
-            work.private_refill_bytes
-            / caps.private_refill_bytes_per_second
-            * 1e9
+            work.private_refill_bytes / caps.private_refill_bytes_per_second * 1e9
         )
     llc_ns = work.llc_bytes / caps.llc_bytes_per_second * 1e9
     nonoverlap_ns = l1_load_ns + private_refill_ns + llc_ns
@@ -423,9 +412,7 @@ def predict_ecm(work: GemmEcmWork, caps: EcmCaps) -> EcmPrediction:
     epilogue_ns = 0.0
     if caps.epilogue_elements_per_second is not None:
         epilogue_ns = (
-            work.balanced_output_elements
-            / caps.epilogue_elements_per_second
-            * 1e9
+            work.balanced_output_elements / caps.epilogue_elements_per_second * 1e9
         )
     fixed_ns = caps.stage_fixed_ns + caps.range_fixed_ns * work.stage.n_ranges
     return EcmPrediction(
@@ -595,9 +582,7 @@ def build_stage_report(
             train_routes=train_routes,
             holdout_routes=holdout_routes,
         )
-        base_by_key = {
-            (row.stage, row.threads): row for row in observations
-        }
+        base_by_key = {(row.stage, row.threads): row for row in observations}
         identity_by_key = {
             (row.stage, row.threads): row for row in identity_observations
         }
@@ -622,12 +607,8 @@ def build_stage_report(
                     "threads": threads,
                     "silu_extra_panel_ns": delta_ns,
                     "silu_extra_fraction_of_w13": delta_ns / silu.panel_ns,
-                    "silu_extra_ns_per_output": (
-                        delta_ns / panel_work.output_elements
-                    ),
-                    "identity_w13_to_w2_panel_ratio": (
-                        identity.panel_ns / w2.panel_ns
-                    ),
+                    "silu_extra_ns_per_output": (delta_ns / panel_work.output_elements),
+                    "identity_w13_to_w2_panel_ratio": (identity.panel_ns / w2.panel_ns),
                 }
             )
 
@@ -667,18 +648,13 @@ def build_stage_report(
             "pure BFMMLA, load/cache, and epilogue rates are measured separately."
         ),
         "observations": [asdict(row) for row in observations],
-        "identity_observations": [
-            asdict(row) for row in identity_observations
-        ],
+        "identity_observations": [asdict(row) for row in identity_observations],
         "silu_deltas": silu_deltas,
     }
 
 
 def _print_report(report: dict) -> None:
-    print(
-        "stage T panel_us req_TF/s BFMMLA_GI/s L1_GB/s LLC_GB/s "
-        "hold_med% hold_max%"
-    )
+    print("stage T panel_us req_TF/s BFMMLA_GI/s L1_GB/s LLC_GB/s hold_med% hold_max%")
     for row in report["observations"]:
         print(
             f"{row['stage']:<4s} {row['threads']:>2d} "
@@ -705,7 +681,9 @@ def _print_report(report: dict) -> None:
 def _parse_routes(value: str) -> tuple[int, ...]:
     routes = tuple(int(item) for item in value.split(",") if item)
     if len(routes) < 2 or any(route <= 0 for route in routes):
-        raise argparse.ArgumentTypeError("route list needs at least two positive values")
+        raise argparse.ArgumentTypeError(
+            "route list needs at least two positive values"
+        )
     return routes
 
 
@@ -741,9 +719,7 @@ def main() -> int:
     profile = json.loads(args.profile.read_text(encoding="utf-8"))
     kernel = profile.get("kernel", {})
     n_tile = int(
-        args.n_tile
-        if args.n_tile is not None
-        else kernel.get("backend_n_tile", 8)
+        args.n_tile if args.n_tile is not None else kernel.get("backend_n_tile", 8)
     )
     w13_n_ranges = int(
         args.w13_n_ranges
@@ -752,9 +728,7 @@ def main() -> int:
     )
     identity_profile = None
     if args.identity_profile is not None:
-        identity_profile = json.loads(
-            args.identity_profile.read_text(encoding="utf-8")
-        )
+        identity_profile = json.loads(args.identity_profile.read_text(encoding="utf-8"))
     report = build_stage_report(
         profile,
         source_profile=str(args.profile),
@@ -762,9 +736,7 @@ def main() -> int:
         w13_n_ranges=w13_n_ranges,
         identity_profile=identity_profile,
         identity_source=(
-            str(args.identity_profile)
-            if args.identity_profile is not None
-            else None
+            str(args.identity_profile) if args.identity_profile is not None else None
         ),
         train_routes=args.train_routes,
         holdout_routes=args.holdout_routes,

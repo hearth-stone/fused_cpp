@@ -64,9 +64,7 @@ def test_m12_instruction_counts_match_assembly_k4_body() -> None:
     assert work.b_load_instructions == 4 * k4_blocks * n_tiles
     assert work.executed_flops == 4 * 12 * hidden_size * intermediate_size
     assert work.l1_a_read_bytes == work.a_load_instructions * 16
-    assert work.l1_b_read_bytes == (
-        work.b_load_instructions * stage.vector_bytes
-    )
+    assert work.l1_b_read_bytes == (work.b_load_instructions * stage.vector_bytes)
 
 
 def test_w13_range_split_changes_shared_a_scans_not_inner_loop_work() -> None:
@@ -100,9 +98,7 @@ def test_nsplit_imbalance_uses_busiest_thread_equivalent_work() -> None:
     work = gemm_ecm_work(w2_stage(12, 3, 64, 32, n_tile=8))
 
     assert work.allocation.per_thread_tiles == (3, 3, 2)
-    assert work.balanced_bfmmla_instructions * 8 == (
-        work.bfmmla_instructions * 9
-    )
+    assert work.balanced_bfmmla_instructions * 8 == (work.bfmmla_instructions * 9)
     assert work.balanced_output_elements * 8 == work.output_elements * 9
 
 
@@ -142,9 +138,7 @@ def test_ecm_prediction_uses_matrix_or_nonoverlap_critical_path() -> None:
 
     assert matrix_bound.bottleneck == "matrix"
     assert matrix_bound.total_ns == pytest.approx(
-        matrix_bound.fixed_ns
-        + matrix_bound.matrix_ns
-        + matrix_bound.epilogue_ns
+        matrix_bound.fixed_ns + matrix_bound.matrix_ns + matrix_bound.epilogue_ns
     )
     assert transfer_bound.bottleneck == "load_transfer"
     assert transfer_bound.body_ns == pytest.approx(
@@ -190,12 +184,9 @@ def test_stage_report_validates_panel_model_on_holdout_routes() -> None:
     )
 
     observations = {
-        (row["stage"], row["threads"]): row
-        for row in report["observations"]
+        (row["stage"], row["threads"]): row for row in report["observations"]
     }
     assert observations[("w13", 1)]["panel_ns"] == pytest.approx(620_000.0)
     assert observations[("w2", 1)]["panel_ns"] == pytest.approx(300_000.0)
     assert observations[("w13", 1)]["holdout_max_error"] == pytest.approx(0.0)
-    assert report["silu_deltas"][0]["silu_extra_panel_ns"] == pytest.approx(
-        30_000.0
-    )
+    assert report["silu_deltas"][0]["silu_extra_panel_ns"] == pytest.approx(30_000.0)

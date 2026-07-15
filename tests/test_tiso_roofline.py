@@ -59,9 +59,7 @@ def test_nsplit_fused_expert_work_matches_kernel_loops() -> None:
     assert work.w2.c_write_bytes == 4 * 12 * h
     assert work.gemm_flops == 72 * h * f
 
-    split_work = fused_expert_work(
-        12, threads, h, f, w13_n_ranges=2
-    )
+    split_work = fused_expert_work(12, threads, h, f, w13_n_ranges=2)
     assert split_work.w13.a_read_bytes == 2 * work.w13.a_read_bytes
     assert split_work.w13.b_read_bytes == work.w13.b_read_bytes
     assert split_work.w13.c_write_bytes == work.w13.c_write_bytes
@@ -93,10 +91,7 @@ def test_roofline_uses_active_compute_or_memory_ceiling() -> None:
     assert prediction.w13_ns == pytest.approx(prediction.w13_memory_ns)
     assert prediction.w2_ns == pytest.approx(prediction.w2_memory_ns)
     assert prediction.total_ns == pytest.approx(
-        prediction.fixed_ns
-        + prediction.w13_ns
-        + prediction.w2_ns
-        + prediction.aux_ns
+        prediction.fixed_ns + prediction.w13_ns + prediction.w2_ns + prediction.aux_ns
     )
 
 
@@ -107,9 +102,7 @@ def test_64core_profile_bulk_observations_have_physical_units() -> None:
         / "contention_async_amazon_c5_64c_tp2_sve_F1024_splitw13_v2_r1_20260713.json"
     )
     profile = json.loads(path.read_text(encoding="utf-8"))
-    observations = {
-        row.threads: row for row in fit_bulk_observations(profile)
-    }
+    observations = {row.threads: row for row in fit_bulk_observations(profile)}
 
     assert tuple(observations) == (1, 2, 4, 8, 16, 32)
     assert observations[1].required_tflops == pytest.approx(0.310, abs=0.002)

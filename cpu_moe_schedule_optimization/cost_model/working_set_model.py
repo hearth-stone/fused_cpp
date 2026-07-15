@@ -58,9 +58,7 @@ class OwnerCacheModel:
     def resident_bandwidth(self, active_streams: int) -> float:
         if active_streams <= 0:
             raise ValueError("active_streams must be positive")
-        utilization = 1.0 - math.exp(
-            -active_streams / self.stream_saturation
-        )
+        utilization = 1.0 - math.exp(-active_streams / self.stream_saturation)
         return self.bandwidth_limit_bytes_per_second * utilization
 
     def minimum_streams(self) -> int:
@@ -126,9 +124,7 @@ def fit_owner_cache_model(
     maximum_streams = max(1, math.ceil(owner_budget / stream_bytes) - 1)
     resident = [row for row in observations if row.working_set_bytes < owner_budget]
     if maximum_streams == 1:
-        first = next(
-            (row for row in observations if row.active_streams == 1), None
-        )
+        first = next((row for row in observations if row.active_streams == 1), None)
         if first is None:
             raise ValueError("single-stream owner budget requires a 1-stream point")
         saturation = -1.0 / math.log(1.0 - target_bandwidth_utilization)
@@ -187,9 +183,7 @@ def scan_fit_report(
     for observation in observations:
         resident = observation.working_set_bytes < model.owner_cache_budget_bytes
         predicted = (
-            model.resident_bandwidth(observation.active_streams)
-            if resident
-            else None
+            model.resident_bandwidth(observation.active_streams) if resident else None
         )
         rows.append(
             {
@@ -352,9 +346,7 @@ def recommend_working_sets(
                 "recommended_working_set_bytes": (
                     recommended["active_experts"] * stage_bytes
                 ),
-                "recommended_iso_baseline_ns": recommended[
-                    "isolated_baseline_ns"
-                ],
+                "recommended_iso_baseline_ns": recommended["isolated_baseline_ns"],
                 "best_in_band_iso_baseline_ns": best_iso,
                 "measured_best_shape": measured_best["shape"],
                 "measured_best_active_experts": measured_best["active_experts"],
@@ -471,7 +463,10 @@ def main() -> int:
         "scan_calibration": str(args.scan_csv),
         "holdout_searches": [str(path) for path in args.holdout_search],
         "stage_bytes_per_expert": stage_bytes,
-        "model": {**asdict(model), "owner_cache_budget_bytes": model.owner_cache_budget_bytes},
+        "model": {
+            **asdict(model),
+            "owner_cache_budget_bytes": model.owner_cache_budget_bytes,
+        },
         "scan_fit": fit_rows,
         "profile_summary": base_summary,
         "holdout_summary": holdout_summary,

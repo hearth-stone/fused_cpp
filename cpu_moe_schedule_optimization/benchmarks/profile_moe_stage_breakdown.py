@@ -374,9 +374,7 @@ def main() -> int:
             split_w13 = choose_moe_gemm_split(
                 "w13", routes, 2 * args.ffn_hidden_size, threads
             )
-            split_w2 = choose_moe_gemm_split(
-                "w2", routes, args.hidden_size, threads
-            )
+            split_w2 = choose_moe_gemm_split("w2", routes, args.hidden_size, threads)
             row = {
                 "routes": routes,
                 "threads": threads,
@@ -407,9 +405,7 @@ def main() -> int:
     split_requested = env_enabled("FUSED_CPP_MOE_W13_SPLIT_N")
     w13_n = int(packed.w13[2])
     split_active = (
-        split_requested
-        and w13_n % 2 == 0
-        and (w13_n // 2) % packed.backend_n_tile == 0
+        split_requested and w13_n % 2 == 0 and (w13_n // 2) % packed.backend_n_tile == 0
     )
     payload = {
         "schema_version": 1,
@@ -444,9 +440,7 @@ def main() -> int:
         args.output_csv.parent.mkdir(parents=True, exist_ok=True)
         with args.output_csv.open("w", encoding="utf-8", newline="") as f:
             fieldnames = [
-                key
-                for key in payload_rows[0].keys()
-                if key != "full_call_times_ms"
+                key for key in payload_rows[0].keys() if key != "full_call_times_ms"
             ]
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
