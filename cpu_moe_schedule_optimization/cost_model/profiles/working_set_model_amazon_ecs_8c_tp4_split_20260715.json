@@ -1,0 +1,164 @@
+{
+  "schema_version": 1,
+  "kind": "split_working_set_band_validation",
+  "source_profile": "cpu_moe_schedule_optimization/cost_model/profiles/tiso_formula_amazon_ecs_8c_sve_F512_splitw13_20260714.json",
+  "scan_calibration": "cpu_moe_schedule_optimization/cost_model/profiles/weight_scan_amazon_ecs_8c_tp4_split_20260715.csv",
+  "holdout_searches": [
+    "cpu_moe_schedule_optimization/cost_model/profiles/working_set_search_amazon_ecs_8c_tp4_split_R1020_2040_20260715.json"
+  ],
+  "stage_bytes_per_expert": 4194304,
+  "model": {
+    "cores": 8,
+    "private_cache_bytes_per_core": 1048576,
+    "cache_ways": 8,
+    "reserved_ways": 2,
+    "bandwidth_limit_bytes_per_second": 825380000000.0,
+    "stream_saturation": 0.3338082006953342,
+    "target_bandwidth_utilization": 0.95,
+    "owner_cache_budget_bytes": 6291456
+  },
+  "scan_fit": [
+    {
+      "active_streams": 1,
+      "stream_bytes": 4194304,
+      "working_set_bytes": 4194304,
+      "bandwidth_bytes_per_second": 784111000000.0,
+      "inside_owner_cache_budget": true,
+      "predicted_resident_bandwidth_bytes_per_second": 784111000000.0,
+      "relative_error": 0.0
+    },
+    {
+      "active_streams": 2,
+      "stream_bytes": 4194304,
+      "working_set_bytes": 8388608,
+      "bandwidth_bytes_per_second": 583990000000.0,
+      "inside_owner_cache_budget": false,
+      "predicted_resident_bandwidth_bytes_per_second": null,
+      "relative_error": null
+    },
+    {
+      "active_streams": 3,
+      "stream_bytes": 4194304,
+      "working_set_bytes": 12582912,
+      "bandwidth_bytes_per_second": 398917000000.0,
+      "inside_owner_cache_budget": false,
+      "predicted_resident_bandwidth_bytes_per_second": null,
+      "relative_error": null
+    },
+    {
+      "active_streams": 4,
+      "stream_bytes": 4194304,
+      "working_set_bytes": 16777216,
+      "bandwidth_bytes_per_second": 266420000000.00003,
+      "inside_owner_cache_budget": false,
+      "predicted_resident_bandwidth_bytes_per_second": null,
+      "relative_error": null
+    },
+    {
+      "active_streams": 5,
+      "stream_bytes": 4194304,
+      "working_set_bytes": 20971520,
+      "bandwidth_bytes_per_second": 262601999999.99997,
+      "inside_owner_cache_budget": false,
+      "predicted_resident_bandwidth_bytes_per_second": null,
+      "relative_error": null
+    },
+    {
+      "active_streams": 6,
+      "stream_bytes": 4194304,
+      "working_set_bytes": 25165824,
+      "bandwidth_bytes_per_second": 180066000000.0,
+      "inside_owner_cache_budget": false,
+      "predicted_resident_bandwidth_bytes_per_second": null,
+      "relative_error": null
+    },
+    {
+      "active_streams": 7,
+      "stream_bytes": 4194304,
+      "working_set_bytes": 29360128,
+      "bandwidth_bytes_per_second": 182365000000.0,
+      "inside_owner_cache_budget": false,
+      "predicted_resident_bandwidth_bytes_per_second": null,
+      "relative_error": null
+    },
+    {
+      "active_streams": 8,
+      "stream_bytes": 4194304,
+      "working_set_bytes": 33554432,
+      "bandwidth_bytes_per_second": 202500000000.0,
+      "inside_owner_cache_budget": false,
+      "predicted_resident_bandwidth_bytes_per_second": null,
+      "relative_error": null
+    }
+  ],
+  "profile_summary": [
+    {
+      "routes": 12,
+      "physical_panels": 1,
+      "applicable": false,
+      "predicted_min_active_experts": 1,
+      "predicted_max_active_experts": 1,
+      "predicted_min_working_set_bytes": 4194304,
+      "predicted_max_working_set_bytes": 4194304,
+      "recommended_shape": [
+        8
+      ],
+      "recommended_active_experts": 1,
+      "recommended_working_set_bytes": 4194304,
+      "recommended_iso_baseline_ns": 1660536.0,
+      "best_in_band_iso_baseline_ns": 1660536.0,
+      "measured_best_shape": [
+        8
+      ],
+      "measured_best_active_experts": 1,
+      "measured_best_working_set_bytes": 4194304,
+      "measured_regret": 0.0
+    }
+  ],
+  "holdout_summary": [
+    {
+      "routes": 1020,
+      "physical_panels": 85,
+      "applicable": true,
+      "predicted_min_active_experts": 1,
+      "predicted_max_active_experts": 1,
+      "predicted_min_working_set_bytes": 4194304,
+      "predicted_max_working_set_bytes": 4194304,
+      "recommended_shape": [
+        8
+      ],
+      "recommended_active_experts": 1,
+      "recommended_working_set_bytes": 4194304,
+      "recommended_iso_baseline_ns": 72057128.0,
+      "best_in_band_iso_baseline_ns": 72057128.0,
+      "measured_best_shape": [
+        8
+      ],
+      "measured_best_active_experts": 1,
+      "measured_best_working_set_bytes": 4194304,
+      "measured_regret": 0.0
+    },
+    {
+      "routes": 2040,
+      "physical_panels": 170,
+      "applicable": true,
+      "predicted_min_active_experts": 1,
+      "predicted_max_active_experts": 1,
+      "predicted_min_working_set_bytes": 4194304,
+      "predicted_max_working_set_bytes": 4194304,
+      "recommended_shape": [
+        8
+      ],
+      "recommended_active_experts": 1,
+      "recommended_working_set_bytes": 4194304,
+      "recommended_iso_baseline_ns": 142953183.6187431,
+      "best_in_band_iso_baseline_ns": 142953183.6187431,
+      "measured_best_shape": [
+        8
+      ],
+      "measured_best_active_experts": 1,
+      "measured_best_working_set_bytes": 4194304,
+      "measured_regret": 0.0
+    }
+  ]
+}

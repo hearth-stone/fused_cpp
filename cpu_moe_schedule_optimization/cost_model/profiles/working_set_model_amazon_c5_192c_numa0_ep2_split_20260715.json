@@ -1,0 +1,544 @@
+{
+  "schema_version": 1,
+  "kind": "split_working_set_band_validation",
+  "source_profile": "cpu_moe_schedule_optimization/cost_model/profiles/contention_async_amazon_c5_192c_numa0_ep2_sve_F2048_splitw13_v2_20260714.json",
+  "scan_calibration": "cpu_moe_schedule_optimization/cost_model/profiles/weight_scan_amazon_c5_192c_numa0_ep2_split_20260715.csv",
+  "holdout_searches": [
+    "cpu_moe_schedule_optimization/cost_model/profiles/working_set_search_amazon_c5_192c_numa0_ep2_split_R1020_2040_20260715.json",
+    "cpu_moe_schedule_optimization/cost_model/profiles/working_set_search_amazon_c5_192c_numa0_ep2_split_boundary_20260715.json"
+  ],
+  "stage_bytes_per_expert": 16777216,
+  "model": {
+    "cores": 96,
+    "private_cache_bytes_per_core": 2097152,
+    "cache_ways": 8,
+    "reserved_ways": 2,
+    "bandwidth_limit_bytes_per_second": 8990767702762.908,
+    "stream_saturation": 0.8500000000000001,
+    "target_bandwidth_utilization": 0.95,
+    "owner_cache_budget_bytes": 150994944
+  },
+  "scan_fit": [
+    {
+      "active_streams": 1,
+      "stream_bytes": 16777216,
+      "working_set_bytes": 16777216,
+      "bandwidth_bytes_per_second": 6458500000000.0,
+      "inside_owner_cache_budget": true,
+      "predicted_resident_bandwidth_bytes_per_second": 6218328110581.262,
+      "relative_error": -0.037186945795267934
+    },
+    {
+      "active_streams": 2,
+      "stream_bytes": 16777216,
+      "working_set_bytes": 33554432,
+      "bandwidth_bytes_per_second": 7575960000000.0,
+      "inside_owner_cache_budget": true,
+      "predicted_resident_bandwidth_bytes_per_second": 8135843902436.685,
+      "relative_error": 0.0739027004414865
+    },
+    {
+      "active_streams": 3,
+      "stream_bytes": 16777216,
+      "working_set_bytes": 50331648,
+      "bandwidth_bytes_per_second": 8638770000000.0,
+      "inside_owner_cache_budget": true,
+      "predicted_resident_bandwidth_bytes_per_second": 8727138981536.529,
+      "relative_error": 0.010229347642839226
+    },
+    {
+      "active_streams": 4,
+      "stream_bytes": 16777216,
+      "working_set_bytes": 67108864,
+      "bandwidth_bytes_per_second": 8842720000000.0,
+      "inside_owner_cache_budget": true,
+      "predicted_resident_bandwidth_bytes_per_second": 8909473787879.574,
+      "relative_error": 0.007549010698017611
+    },
+    {
+      "active_streams": 5,
+      "stream_bytes": 16777216,
+      "working_set_bytes": 83886080,
+      "bandwidth_bytes_per_second": 8977870000000.0,
+      "inside_owner_cache_budget": true,
+      "predicted_resident_bandwidth_bytes_per_second": 8965699491050.94,
+      "relative_error": -0.0013556120715783049
+    },
+    {
+      "active_streams": 6,
+      "stream_bytes": 16777216,
+      "working_set_bytes": 100663296,
+      "bandwidth_bytes_per_second": 9087960000000.0,
+      "inside_owner_cache_budget": true,
+      "predicted_resident_bandwidth_bytes_per_second": 8983037539449.48,
+      "relative_error": -0.011545215928604358
+    },
+    {
+      "active_streams": 7,
+      "stream_bytes": 16777216,
+      "working_set_bytes": 117440512,
+      "bandwidth_bytes_per_second": 8929550000000.0,
+      "inside_owner_cache_budget": true,
+      "predicted_resident_bandwidth_bytes_per_second": 8988383989654.895,
+      "relative_error": 0.006588684721502647
+    },
+    {
+      "active_streams": 8,
+      "stream_bytes": 16777216,
+      "working_set_bytes": 134217728,
+      "bandwidth_bytes_per_second": 9401000000000.0,
+      "inside_owner_cache_budget": true,
+      "predicted_resident_bandwidth_bytes_per_second": 8990032648670.139,
+      "relative_error": -0.04371528043079054
+    },
+    {
+      "active_streams": 9,
+      "stream_bytes": 16777216,
+      "working_set_bytes": 150994944,
+      "bandwidth_bytes_per_second": 9193610000000.0,
+      "inside_owner_cache_budget": false,
+      "predicted_resident_bandwidth_bytes_per_second": null,
+      "relative_error": null
+    },
+    {
+      "active_streams": 10,
+      "stream_bytes": 16777216,
+      "working_set_bytes": 167772160,
+      "bandwidth_bytes_per_second": 9118660000000.0,
+      "inside_owner_cache_budget": false,
+      "predicted_resident_bandwidth_bytes_per_second": null,
+      "relative_error": null
+    },
+    {
+      "active_streams": 11,
+      "stream_bytes": 16777216,
+      "working_set_bytes": 184549376,
+      "bandwidth_bytes_per_second": 8012610000000.0,
+      "inside_owner_cache_budget": false,
+      "predicted_resident_bandwidth_bytes_per_second": null,
+      "relative_error": null
+    },
+    {
+      "active_streams": 12,
+      "stream_bytes": 16777216,
+      "working_set_bytes": 201326592,
+      "bandwidth_bytes_per_second": 4386560000000.0005,
+      "inside_owner_cache_budget": false,
+      "predicted_resident_bandwidth_bytes_per_second": null,
+      "relative_error": null
+    },
+    {
+      "active_streams": 16,
+      "stream_bytes": 16777216,
+      "working_set_bytes": 268435456,
+      "bandwidth_bytes_per_second": 1484240000000.0,
+      "inside_owner_cache_budget": false,
+      "predicted_resident_bandwidth_bytes_per_second": null,
+      "relative_error": null
+    },
+    {
+      "active_streams": 24,
+      "stream_bytes": 16777216,
+      "working_set_bytes": 402653184,
+      "bandwidth_bytes_per_second": 846921000000.0,
+      "inside_owner_cache_budget": false,
+      "predicted_resident_bandwidth_bytes_per_second": null,
+      "relative_error": null
+    },
+    {
+      "active_streams": 32,
+      "stream_bytes": 16777216,
+      "working_set_bytes": 536870912,
+      "bandwidth_bytes_per_second": 737511000000.0,
+      "inside_owner_cache_budget": false,
+      "predicted_resident_bandwidth_bytes_per_second": null,
+      "relative_error": null
+    }
+  ],
+  "profile_summary": [
+    {
+      "routes": 1,
+      "physical_panels": 1,
+      "applicable": false,
+      "predicted_min_active_experts": 3,
+      "predicted_max_active_experts": 8,
+      "predicted_min_working_set_bytes": 50331648,
+      "predicted_max_working_set_bytes": 134217728,
+      "recommended_shape": [
+        16,
+        16,
+        16,
+        16,
+        16,
+        16
+      ],
+      "recommended_active_experts": 6,
+      "recommended_working_set_bytes": 100663296,
+      "recommended_iso_baseline_ns": 1136712.0,
+      "best_in_band_iso_baseline_ns": 1136712.0,
+      "measured_best_shape": [
+        8,
+        8,
+        8,
+        8,
+        8,
+        8,
+        8,
+        8,
+        8,
+        8,
+        8,
+        8
+      ],
+      "measured_best_active_experts": 12,
+      "measured_best_working_set_bytes": 201326592,
+      "measured_regret": 0.02040578054126252
+    },
+    {
+      "routes": 2,
+      "physical_panels": 1,
+      "applicable": false,
+      "predicted_min_active_experts": 3,
+      "predicted_max_active_experts": 8,
+      "predicted_min_working_set_bytes": 50331648,
+      "predicted_max_working_set_bytes": 134217728,
+      "recommended_shape": [
+        16,
+        16,
+        16,
+        16,
+        16,
+        16
+      ],
+      "recommended_active_experts": 6,
+      "recommended_working_set_bytes": 100663296,
+      "recommended_iso_baseline_ns": 1287090.0,
+      "best_in_band_iso_baseline_ns": 1287090.0,
+      "measured_best_shape": [
+        8,
+        8,
+        8,
+        8,
+        8,
+        8,
+        8,
+        8,
+        8,
+        8,
+        8,
+        8
+      ],
+      "measured_best_active_experts": 12,
+      "measured_best_working_set_bytes": 201326592,
+      "measured_regret": 0.007501309064185557
+    },
+    {
+      "routes": 4,
+      "physical_panels": 1,
+      "applicable": false,
+      "predicted_min_active_experts": 3,
+      "predicted_max_active_experts": 8,
+      "predicted_min_working_set_bytes": 50331648,
+      "predicted_max_working_set_bytes": 134217728,
+      "recommended_shape": [
+        16,
+        16,
+        16,
+        16,
+        16,
+        16
+      ],
+      "recommended_active_experts": 6,
+      "recommended_working_set_bytes": 100663296,
+      "recommended_iso_baseline_ns": 1300902.0,
+      "best_in_band_iso_baseline_ns": 1300902.0,
+      "measured_best_shape": [
+        8,
+        8,
+        8,
+        8,
+        8,
+        8,
+        8,
+        8,
+        8,
+        8,
+        8,
+        8
+      ],
+      "measured_best_active_experts": 12,
+      "measured_best_working_set_bytes": 201326592,
+      "measured_regret": 0.018154553963221076
+    },
+    {
+      "routes": 8,
+      "physical_panels": 1,
+      "applicable": false,
+      "predicted_min_active_experts": 3,
+      "predicted_max_active_experts": 8,
+      "predicted_min_working_set_bytes": 50331648,
+      "predicted_max_working_set_bytes": 134217728,
+      "recommended_shape": [
+        16,
+        16,
+        16,
+        16,
+        16,
+        16
+      ],
+      "recommended_active_experts": 6,
+      "recommended_working_set_bytes": 100663296,
+      "recommended_iso_baseline_ns": 1250328.0,
+      "best_in_band_iso_baseline_ns": 1250328.0,
+      "measured_best_shape": [
+        8,
+        8,
+        8,
+        8,
+        8,
+        8,
+        8,
+        8,
+        8,
+        8,
+        8,
+        8
+      ],
+      "measured_best_active_experts": 12,
+      "measured_best_working_set_bytes": 201326592,
+      "measured_regret": 0.008501645308123251
+    },
+    {
+      "routes": 12,
+      "physical_panels": 1,
+      "applicable": false,
+      "predicted_min_active_experts": 3,
+      "predicted_max_active_experts": 8,
+      "predicted_min_working_set_bytes": 50331648,
+      "predicted_max_working_set_bytes": 134217728,
+      "recommended_shape": [
+        16,
+        16,
+        16,
+        16,
+        16,
+        16
+      ],
+      "recommended_active_experts": 6,
+      "recommended_working_set_bytes": 100663296,
+      "recommended_iso_baseline_ns": 1329414.0,
+      "best_in_band_iso_baseline_ns": 1329414.0,
+      "measured_best_shape": [
+        8,
+        8,
+        8,
+        8,
+        8,
+        8,
+        8,
+        8,
+        8,
+        8,
+        8,
+        8
+      ],
+      "measured_best_active_experts": 12,
+      "measured_best_working_set_bytes": 201326592,
+      "measured_regret": 0.01895805936120709
+    },
+    {
+      "routes": 24,
+      "physical_panels": 2,
+      "applicable": false,
+      "predicted_min_active_experts": 3,
+      "predicted_max_active_experts": 8,
+      "predicted_min_working_set_bytes": 50331648,
+      "predicted_max_working_set_bytes": 134217728,
+      "recommended_shape": [
+        16,
+        16,
+        16,
+        16,
+        16,
+        16
+      ],
+      "recommended_active_experts": 6,
+      "recommended_working_set_bytes": 100663296,
+      "recommended_iso_baseline_ns": 2446020.0,
+      "best_in_band_iso_baseline_ns": 2446020.0,
+      "measured_best_shape": [
+        64,
+        32
+      ],
+      "measured_best_active_experts": 2,
+      "measured_best_working_set_bytes": 33554432,
+      "measured_regret": 0.049438676176748686
+    },
+    {
+      "routes": 48,
+      "physical_panels": 4,
+      "applicable": false,
+      "predicted_min_active_experts": 3,
+      "predicted_max_active_experts": 8,
+      "predicted_min_working_set_bytes": 50331648,
+      "predicted_max_working_set_bytes": 134217728,
+      "recommended_shape": [
+        32,
+        16,
+        16,
+        16,
+        16
+      ],
+      "recommended_active_experts": 5,
+      "recommended_working_set_bytes": 83886080,
+      "recommended_iso_baseline_ns": 4099920.0,
+      "best_in_band_iso_baseline_ns": 4099920.0,
+      "measured_best_shape": [
+        64,
+        32
+      ],
+      "measured_best_active_experts": 2,
+      "measured_best_working_set_bytes": 33554432,
+      "measured_regret": 0.1727101729452949
+    },
+    {
+      "routes": 192,
+      "physical_panels": 16,
+      "applicable": true,
+      "predicted_min_active_experts": 3,
+      "predicted_max_active_experts": 8,
+      "predicted_min_working_set_bytes": 50331648,
+      "predicted_max_working_set_bytes": 134217728,
+      "recommended_shape": [
+        32,
+        32,
+        16,
+        16
+      ],
+      "recommended_active_experts": 4,
+      "recommended_working_set_bytes": 67108864,
+      "recommended_iso_baseline_ns": 13534728.0,
+      "best_in_band_iso_baseline_ns": 13534728.0,
+      "measured_best_shape": [
+        32,
+        32,
+        16,
+        16
+      ],
+      "measured_best_active_experts": 4,
+      "measured_best_working_set_bytes": 67108864,
+      "measured_regret": 0.0
+    },
+    {
+      "routes": 768,
+      "physical_panels": 64,
+      "applicable": true,
+      "predicted_min_active_experts": 3,
+      "predicted_max_active_experts": 8,
+      "predicted_min_working_set_bytes": 50331648,
+      "predicted_max_working_set_bytes": 134217728,
+      "recommended_shape": [
+        32,
+        32,
+        32
+      ],
+      "recommended_active_experts": 3,
+      "recommended_working_set_bytes": 50331648,
+      "recommended_iso_baseline_ns": 46433211.0,
+      "best_in_band_iso_baseline_ns": 46433211.0,
+      "measured_best_shape": [
+        32,
+        32,
+        16,
+        16
+      ],
+      "measured_best_active_experts": 4,
+      "measured_best_working_set_bytes": 67108864,
+      "measured_regret": 0.007862552955319568
+    },
+    {
+      "routes": 2040,
+      "physical_panels": 170,
+      "applicable": true,
+      "predicted_min_active_experts": 3,
+      "predicted_max_active_experts": 8,
+      "predicted_min_working_set_bytes": 50331648,
+      "predicted_max_working_set_bytes": 134217728,
+      "recommended_shape": [
+        32,
+        32,
+        32
+      ],
+      "recommended_active_experts": 3,
+      "recommended_working_set_bytes": 50331648,
+      "recommended_iso_baseline_ns": 120977153.0,
+      "best_in_band_iso_baseline_ns": 120977153.0,
+      "measured_best_shape": [
+        32,
+        32,
+        16,
+        16
+      ],
+      "measured_best_active_experts": 4,
+      "measured_best_working_set_bytes": 67108864,
+      "measured_regret": 0.015658540477301308
+    }
+  ],
+  "holdout_summary": [
+    {
+      "routes": 1020,
+      "physical_panels": 85,
+      "applicable": true,
+      "predicted_min_active_experts": 3,
+      "predicted_max_active_experts": 8,
+      "predicted_min_working_set_bytes": 50331648,
+      "predicted_max_working_set_bytes": 134217728,
+      "recommended_shape": [
+        24,
+        24,
+        24,
+        24
+      ],
+      "recommended_active_experts": 4,
+      "recommended_working_set_bytes": 67108864,
+      "recommended_iso_baseline_ns": 58183115.78585179,
+      "best_in_band_iso_baseline_ns": 58123919.92505445,
+      "measured_best_shape": [
+        32,
+        32,
+        32
+      ],
+      "measured_best_active_experts": 3,
+      "measured_best_working_set_bytes": 50331648,
+      "measured_regret": 0.003299465692625514
+    },
+    {
+      "routes": 2040,
+      "physical_panels": 170,
+      "applicable": true,
+      "predicted_min_active_experts": 3,
+      "predicted_max_active_experts": 8,
+      "predicted_min_working_set_bytes": 50331648,
+      "predicted_max_working_set_bytes": 134217728,
+      "recommended_shape": [
+        24,
+        24,
+        24,
+        24
+      ],
+      "recommended_active_experts": 4,
+      "recommended_working_set_bytes": 67108864,
+      "recommended_iso_baseline_ns": 114441511.22303759,
+      "best_in_band_iso_baseline_ns": 114441511.22303759,
+      "measured_best_shape": [
+        24,
+        24,
+        24,
+        24
+      ],
+      "measured_best_active_experts": 4,
+      "measured_best_working_set_bytes": 67108864,
+      "measured_regret": 0.0
+    }
+  ]
+}
