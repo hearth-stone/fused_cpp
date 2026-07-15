@@ -19,6 +19,7 @@ refs/
 
 # Local tooling state
 .codebuddy/
+.claude/worktrees/
 
 # Lock files (not tracked for this project)
 uv.lock
