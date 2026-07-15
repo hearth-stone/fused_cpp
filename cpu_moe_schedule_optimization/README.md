@@ -111,6 +111,12 @@ T_plan(plan) + T_execute(plan)
   of truth；定义未剪枝问题、求解器编码、当前工程剪枝及同步规则。
 - [`cost_model/T_ISO_FORMULA_VALIDATION.md`](./cost_model/T_ISO_FORMULA_VALIDATION.md)：
   `T_iso=O(t)+C(R)phi_USL(t)k_phi(t)` 的公式、8 核 SVE/M12 留出验证和原始数据入口。
+- [`cost_model/TISO_ROOFLINE_VALIDATION.md`](./cost_model/TISO_ROOFLINE_VALIDATION.md)：
+  简化的可解释 `T_iso` roofline baseline；按 M12/tail kernel 计算 FLOP、
+  N-split shared-cache A/B/C 流量。
+- [`cost_model/GEMM_ECM_VALIDATION.md`](./cost_model/GEMM_ECM_VALIDATION.md)：
+  microkernel-aware GEMM ECM shadow；按 asm 统计 BFMMLA/A/B load，区分
+  L1/private/shared cache 与 epilogue，并记录 V3 长 route 留出验证。
 - [`DESIGN.md`](./DESIGN.md)：完整设计文档，定义 plan space、成本模型、严格最优求解方式、multi-plan runtime selector 和阶段性路线图。
 - [`TODO.md`](./TODO.md)：schema-v2 profiling 之后的 policy-aware cost model、planner 与 TP/EP evaluator 待办。
 - [`README.md`](./README.md)：当前入口说明。
@@ -118,6 +124,14 @@ T_plan(plan) + T_execute(plan)
 - [`cost_model/profile_expert_cost.py`](./cost_model/profile_expert_cost.py)：用真实 `fused_moe_bf16_tiled_scheduled` kernel 生成 `T_expert(routes, threads)` cost table。
 - [`planners/plan_schema.md`](./planners/plan_schema.md)：`Plan / Wave / Team` 的第一版输出 schema。
 - [`cost_model/phase_model.py`](./cost_model/phase_model.py)：`ContentionCostModel` —— 争用感知的事件驱动 makespan 模拟内核(`dag_makespan`)，AWS 实测 ~2% median。
+- [`cost_model/tiso_roofline.py`](./cost_model/tiso_roofline.py)：从 kernel panel
+  逻辑生成 `T_iso` FLOP/流量分解，并输出 steady-M12 的可辨识有效服务率；当前
+  仅 shadow validation，不改变 planner 默认打分。
+- [`cost_model/gemm_ecm.py`](./cost_model/gemm_ecm.py)：W13/W2 的分层 ECM
+  shadow model 和 stage-trace report CLI；当前不进入 planner active cost。
+- [`cost_model/working_set_model.py`](./cost_model/working_set_model.py)：仅针对
+  split-W13 的 owner-private cache 工作集 band；由独立 weight-scan 与
+  `T_iso` 计算稳健候选，当前只做 shadow validation。
 - [`planners/interval_planner.py`](./planners/interval_planner.py)：`IntervalPlanner` —— async interval-DAG 静态 planner（cost-model 驱动）。
 - [`planners/simulate_schedules.py`](./planners/simulate_schedules.py)：离线对比多种调度算法（coop / expert-parallel / greedy / planner / 各 core 切分）的 makespan。
 - [`planners/planned_moe.py`](./planners/planned_moe.py)：路由直方图 → 缓存 plan → `fused_moe_bf16_tiled_async` 桥。
@@ -151,6 +165,46 @@ planner 的执行时间模型是：
 ```text
 T_expert(routes, threads) -> ns
 ```
+
+### 搜索并发 expert 工作集
+
+`cost_model/search_expert_working_set.py` 用真实 async fused kernel 搜索一台
+机器能维持接近峰值吞吐的并发 packed-weight 工作集。每个测量点执行相同数量的
+连续不同 expert，只改变同时活跃的 expert lane 数；因此不会把反复读取一个热
+权重误当成 LLC 容量。工具支持每 expert 1 线程和把全部核心均分给 active
+experts 两种口径，结果写入独立诊断 JSON，不会直接修改 planner profile。
+
+例如在 96 个 NUMA-local 核心上搜索 EP2、split-W13 的工作集：
+
+```bash
+taskset -c 0-95 .venv/bin/python \
+  cpu_moe_schedule_optimization/cost_model/search_expert_working_set.py \
+  --output /tmp/ep2_working_set_search.json \
+  --cpu-ids 0-95 --numa-node 0 \
+  --parallel-mode ep --parallel-degree 2 \
+  --global-experts 64 --num-experts 32 \
+  --hidden-size 4096 --ffn-hidden-size 2048 \
+  --route-buckets 12,48,192,768,2040 \
+  --active-experts auto --allocation both \
+  --w13-split 1 --w13-split-chunks 2 \
+  --warmup 3 --runs 9 --throughput-tolerance 0.10
+```
+
+`auto` 在不超过 64 个 local experts 时逐点扫描，避免跳过容量拐点；更大的
+expert 数使用稀疏扫描，也可用 `--active-experts 1-32,40,48,64` 显式指定。
+汇总中的 near-peak 范围表示 aggregate TFLOP/s 距该 route 最佳点不超过给定
+阈值，工作集定义为
+`active_experts * max(W13_chunk_bytes, W2_bytes)`。
+
+split-W13 路径还可以用独立 owner-cache 指标预测优选工作集，而不直接拟合
+fused wall time。先编译并运行 `benchmarks/bench_weight_scan.cpp`，再用
+`cost_model/working_set_model.py` 将 private-L2 capacity、stream bandwidth
+saturation 与 `T_iso` 组合。当前 V3 EP2 验证得到 48--128 MiB 可行 band，
+稳健选择为 64 MiB；route 1020/2040 留出 regret 为 0.33%/0.00%。公式、PMU
+证据、命令和适用域见
+[`cost_model/WORKING_SET_MODEL_VALIDATION.md`](./cost_model/WORKING_SET_MODEL_VALIDATION.md)。
+8-core Neoverse-V1/TP4 的跨机器留出根据 6 MiB owner budget 预测 4 MiB，
+route 1020/2040 实测 regret 均为 0.00%。
 
 当前 C++ scheduled bridge 会在 team 内根据 GEMM 形状自动选择 M-split 或 N-split，因此修改 kernel 后需要重新 profile 这张表。可以用单 active expert 的真实 kernel 调用生成 JSON：
 

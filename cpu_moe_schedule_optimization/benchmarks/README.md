@@ -193,6 +193,29 @@ compute_gap merge_routes_total output_cast other
 activation/scatter. It is useful for spotting synchronization, dispatch, and
 unmeasured per-wave overhead.
 
+## Split-W13 Owner-Cache Bandwidth
+
+`bench_weight_scan.cpp` measures the N-split packed-B ownership pattern without
+GEMM instructions. Each team owns one expert stream and each worker scans a
+disjoint column slice. Repeated passes model successive M12 panels:
+
+```bash
+g++ -std=c++17 -O2 -pthread \
+  cpu_moe_schedule_optimization/benchmarks/bench_weight_scan.cpp \
+  -o /tmp/bench_weight_scan
+
+taskset -c 0-95 /tmp/bench_weight_scan \
+  --cpu-ids 0-95 \
+  --groups 1,2,3,4,5,6,7,8,9,10,11,12,16,24,32 \
+  --stream-mib 16 --passes 170 --warmup 2 --runs 9 \
+  --output-csv /tmp/weight_scan.csv
+```
+
+Feed the CSV and a split schema-v2 profile to
+`cost_model/working_set_model.py`. The model fits only resident scan bandwidth;
+the fused profile remains held-out validation. See
+`cost_model/WORKING_SET_MODEL_VALIDATION.md` for the formula and V3 results.
+
 ## Isolated MoE GEMM M/N Split
 
 Use `profile_w2_gemm_split.py` to isolate either MoE GEMM shape:

@@ -1,5 +1,12 @@
 # T_iso Formula Validation
 
+This document records the active compact empirical formula. The new
+kernel-work reconstruction is intentionally still a shadow model. The simple
+aggregate baseline is in
+[`TISO_ROOFLINE_VALIDATION.md`](./TISO_ROOFLINE_VALIDATION.md); the current
+microkernel-aware formulation and V3 held-out results are in
+[`GEMM_ECM_VALIDATION.md`](./GEMM_ECM_VALIDATION.md).
+
 ## 2026-07-14 AWS 8-core SVE/M12
 
 The schema-v2 isolated cost path now uses:

@@ -58,6 +58,11 @@ def parse_int_list(text: str) -> List[int]:
     return values
 
 
+def env_enabled(name: str) -> bool:
+    value = os.getenv(name)
+    return bool(value and value[0] != "0")
+
+
 def bf16_normal(
     shape: tuple[int, ...],
     *,
@@ -399,8 +404,23 @@ def main() -> int:
                 flush=True,
             )
 
+    split_requested = env_enabled("FUSED_CPP_MOE_W13_SPLIT_N")
+    w13_n = int(packed.w13[2])
+    split_active = (
+        split_requested
+        and w13_n % 2 == 0
+        and (w13_n // 2) % packed.backend_n_tile == 0
+    )
     payload = {
         "schema_version": 1,
+        "kernel": {
+            "backend_n_tile": packed.backend_n_tile,
+            "parallel_axis": "N",
+            "w13_workset_split_requested": split_requested,
+            "w13_workset_split": split_active,
+            "w13_n_ranges": 2 if split_active else 1,
+            "w13_skip_silu": env_enabled("FUSED_CPP_MOE_W13_SKIP_SILU"),
+        },
         "shape": {
             "hidden_size": args.hidden_size,
             "ffn_hidden_size": args.ffn_hidden_size,

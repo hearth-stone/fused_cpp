@@ -141,6 +141,62 @@ The complete `full_call_*` curve is the authoritative calibration for a uniform
 full-rank workload. `makespan_ns` remains a normalized diagnostic; it must not
 be multiplied by an arbitrary number of waves.
 
+### Explainable `T_iso` roofline shadow report
+
+`tiso_roofline.py` emits a separate schema-v1 diagnostic with kind
+`explainable_tiso_roofline_shadow`. It does not modify the active contention
+profile and is not yet consumed by `ContentionCostModel`.
+
+Each observation records the fitted steady-M12 panel time plus:
+
+- `required_tflops = panel_flops / panel_time`;
+- `required_l3_gbs = panel_kernel_bytes / panel_time`;
+- arithmetic intensity and linear bulk-fit residuals.
+
+The two required rates are equivalent interpretations of one latency sample,
+not independently measured ceilings. A future active profile must serialize
+pure W13/W2 compute ceilings, L3 bandwidth, copy bandwidth, and fixed/tail
+residuals separately before using the roofline prediction path.
+
+### Microkernel-aware GEMM ECM shadow report
+
+`gemm_ecm.py` emits a separate schema-v1 diagnostic with kind
+`sve_bf16_gemm_ecm_shadow`. It is not consumed by `ContentionCostModel`.
+
+The report records the actual SVE N tile and W13 range count, exact M12/M8/M4/M2
+BFMMLA and A/B load counts, logical/compute/packed/store tail rows, L1 traffic,
+and the current shared-cache traffic convention. Stage observations expose the
+following equivalent lower-bound views of one measured M12 panel slope:
+
+- required executed TFLOP/s and BFMMLA instruction/s;
+- required balanced L1 load GB/s;
+- required shared-cache GB/s;
+- held-out route error from a sparse panel-slope calibration.
+
+When a matching identity profile is supplied, it also records incremental SiLU
+time per panel/output and the identity-W13 to W2 ratio. These required rates are
+not independent ceilings. Active rollout requires separately measured BFMMLA,
+load/private/shared-cache, and epilogue service rates.
+
+### Split owner-cache working-set shadow
+
+`working_set_model.py` emits `split_working_set_band_validation`. Its independent
+calibration input is the CSV from `bench_weight_scan.cpp`; it is not a
+`contention_derate` profile and must not be loaded by `ContentionCostModel`.
+The serialized model records per-core private-cache bytes/ways, reserved ways,
+resident scan bandwidth saturation, the derived owner-cache budget, and the
+predicted expert/byte band. `profile_summary` and `holdout_summary` contain
+measured regret but are validation results, not active cost anchors. This path
+supports only two-range split-W13 and is currently gated to at least 16 physical
+M12/tail panels.
+
+New `profile_moe_stage_breakdown.py` output serializes a top-level `kernel`
+object with `backend_n_tile`, `parallel_axis`,
+`w13_workset_split_requested`, the shape-valid `w13_workset_split`,
+`w13_n_ranges`, and `w13_skip_silu`. The older per-row
+`split_w13`/`split_w2` fields are legacy heuristic labels and must not be used
+to infer the measured workset-split policy.
+
 TP2 and EP2 reproduction commands for the 64-core/two-NUMA target are:
 
 ```bash
