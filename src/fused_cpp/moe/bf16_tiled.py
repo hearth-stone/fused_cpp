@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from operator import index
 from typing import Any, Tuple
 
 import torch
@@ -89,6 +90,22 @@ def _check_integer_schedule_tensor(tensor: torch.Tensor, name: str) -> None:
         raise ValueError(f"{name} must be 1-D, got shape {tuple(tensor.shape)}")
 
 
+def _weight_window_argument(weight_window_bytes: int | None) -> int:
+    if weight_window_bytes is None:
+        return -1
+    if isinstance(weight_window_bytes, bool):
+        raise TypeError("weight_window_bytes must be an integer byte count, not bool")
+    try:
+        value = index(weight_window_bytes)
+    except TypeError as error:
+        raise TypeError("weight_window_bytes must be an integer byte count or None") from error
+    if value < 0:
+        raise ValueError(f"weight_window_bytes must be non-negative, got {value}")
+    if value > (1 << 63) - 1:
+        raise OverflowError(f"weight_window_bytes exceeds int64: {value}")
+    return value
+
+
 def prepare_fused_moe_bf16_tiled_weights(
     w13_weight: torch.Tensor,
     w2_weight: torch.Tensor,
@@ -139,6 +156,7 @@ def fused_moe_bf16_tiled(
     global_num_experts: int = -1,
     skip_weighted: bool = False,
     silu_poly_degree: int = 5,
+    weight_window_bytes: int | None = None,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run the C++ tiled fused MoE path using BF16 GEMMs.
@@ -146,6 +164,11 @@ def fused_moe_bf16_tiled(
     If ``weights`` were prepared with ``fuse_silu=True`` and ``activation`` is
     ``"silu"``, the w13 GEMM fuses SiLU-and-mul into its store epilogue
     (``silu_poly_degree`` selects the exp polynomial, 4/5/6).
+
+    A positive ``weight_window_bytes`` serializes each SVE GEMM into
+    tile-aligned packed-B windows no larger than that target, except when one
+    hardware N tile itself is larger. ``None`` reads
+    ``FUSED_CPP_MOE_WEIGHT_WINDOW_BYTES``; zero disables byte-based windows.
     """
     _require_backend()
     if input.dtype != torch.bfloat16:
@@ -193,6 +216,7 @@ def fused_moe_bf16_tiled(
         int(silu_poly_degree),
         int(weights.gemm_backend),
         int(weights.backend_n_tile),
+        _weight_window_argument(weight_window_bytes),
     )
     if out is not None:
         out.copy_(result)
@@ -217,6 +241,7 @@ def fused_moe_bf16_tiled_scheduled(
     global_num_experts: int = -1,
     skip_weighted: bool = False,
     silu_poly_degree: int = 5,
+    weight_window_bytes: int | None = None,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run the BF16 tiled MoE path using an externally supplied schedule.
@@ -290,6 +315,7 @@ def fused_moe_bf16_tiled_scheduled(
         int(silu_poly_degree),
         int(weights.gemm_backend),
         int(weights.backend_n_tile),
+        _weight_window_argument(weight_window_bytes),
     )
     if out is not None:
         out.copy_(result)
@@ -317,6 +343,7 @@ def fused_moe_bf16_tiled_async(
     skip_weighted: bool = False,
     silu_poly_degree: int = 5,
     w13_split: bool | None = None,
+    weight_window_bytes: int | None = None,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run BF16 tiled MoE with an async task-DAG schedule.
@@ -326,7 +353,9 @@ def fused_moe_bf16_tiled_async(
     list, allowing later tasks to start as soon as their own interval is free
     instead of waiting for a whole wave barrier. ``w13_split`` explicitly
     selects the two-panel SVE W13 policy; ``None`` preserves the legacy
-    ``FUSED_CPP_MOE_W13_SPLIT_N`` environment fallback.
+    ``FUSED_CPP_MOE_W13_SPLIT_N`` environment fallback. A positive
+    ``weight_window_bytes`` supersedes that two-panel granularity and applies
+    the same packed-B byte limit to both W13 and W2.
     """
     _require_backend()
     if _fused_moe_bf16_tiled_async_impl is None:
@@ -404,6 +433,7 @@ def fused_moe_bf16_tiled_async(
         int(weights.gemm_backend),
         int(weights.backend_n_tile),
         -1 if w13_split is None else int(bool(w13_split)),
+        _weight_window_argument(weight_window_bytes),
     )
     if out is not None:
         out.copy_(result)
