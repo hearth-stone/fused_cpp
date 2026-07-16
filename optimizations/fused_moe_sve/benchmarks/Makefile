@@ -8,24 +8,55 @@ CXXFLAGS += -std=c++20 -pthread -Wall -Wextra -Werror \
 	-march=armv8.6-a+sve+bf16+i8mm -I$(FEATURES) -I$(I8GEMM)
 LDFLAGS += -pthread
 
-TARGET := bench_elastic_nsplit
-SOURCES := bench_elastic_nsplit.cpp $(FEATURES)/elastic_nsplit.cpp \
+TARGETS := bench_elastic_nsplit bench_unfused_pipeline bench_single_core_weight_window \
+	bench_fragmented_route_pipeline bench_m12_llc_pollution
+ELASTIC_SOURCES := bench_elastic_nsplit.cpp $(FEATURES)/elastic_nsplit.cpp \
+	$(ROOT)/csrc/moe_sve_fused_asm.S
+UNFUSED_SOURCES := bench_unfused_pipeline.cpp $(FEATURES)/unfused_pipeline.cpp \
+	$(ROOT)/csrc/moe_sve_fused_asm.S
+SINGLE_CORE_WINDOW_SOURCES := bench_single_core_weight_window.cpp \
+	$(ROOT)/csrc/moe_sve_fused_asm.S
+M12_LLC_POLLUTION_SOURCES := bench_m12_llc_pollution.cpp \
+	$(ROOT)/csrc/moe_sve_fused_asm.S
+FRAGMENTED_ROUTE_SOURCES := bench_fragmented_route_pipeline.cpp $(FEATURES)/unfused_pipeline.cpp \
 	$(ROOT)/csrc/moe_sve_fused_asm.S
 
 .PHONY: all check clean
 
-all: $(TARGET)
+all: $(TARGETS)
 
-$(TARGET): $(SOURCES) $(FEATURES)/elastic_nsplit.h $(I8GEMM)/gemm_params.h
-	$(CXX) $(CXXFLAGS) $(SOURCES) $(LDFLAGS) -o $@
+bench_elastic_nsplit: $(ELASTIC_SOURCES) $(FEATURES)/elastic_nsplit.h $(I8GEMM)/gemm_params.h
+	$(CXX) $(CXXFLAGS) $(ELASTIC_SOURCES) $(LDFLAGS) -o $@
 
-check: $(TARGET)
-	./$(TARGET) --stage w13 --m 120 --k 64 --n 64 --threads 4 \
+bench_unfused_pipeline: $(UNFUSED_SOURCES) $(FEATURES)/unfused_pipeline.h $(I8GEMM)/gemm_params.h
+	$(CXX) $(CXXFLAGS) $(UNFUSED_SOURCES) $(LDFLAGS) -o $@
+
+bench_single_core_weight_window: $(SINGLE_CORE_WINDOW_SOURCES) $(I8GEMM)/gemm_params.h
+	$(CXX) $(CXXFLAGS) $(SINGLE_CORE_WINDOW_SOURCES) $(LDFLAGS) -o $@
+
+bench_m12_llc_pollution: $(M12_LLC_POLLUTION_SOURCES) $(I8GEMM)/gemm_params.h
+	$(CXX) $(CXXFLAGS) $(M12_LLC_POLLUTION_SOURCES) $(LDFLAGS) -o $@
+
+bench_fragmented_route_pipeline: $(FRAGMENTED_ROUTE_SOURCES) $(FEATURES)/unfused_pipeline.h \
+	$(I8GEMM)/gemm_params.h
+	$(CXX) $(CXXFLAGS) $(FRAGMENTED_ROUTE_SOURCES) $(LDFLAGS) -o $@
+
+check: $(TARGETS)
+	./bench_elastic_nsplit --stage w13 --m 120 --k 64 --n 64 --threads 4 \
 		--low-threads 2 --epoch-rows 24 --copies 1 --check
-	./$(TARGET) --stage w2 --m 120 --k 64 --n 64 --threads 4 \
+	./bench_elastic_nsplit --stage w2 --m 120 --k 64 --n 64 --threads 4 \
 		--low-threads 2 --epoch-rows 24 --copies 1 --check
-	./$(TARGET) --stage w2_bf16 --m 120 --k 64 --n 64 --threads 4 \
+	./bench_elastic_nsplit --stage w2_bf16 --m 120 --k 64 --n 64 --threads 4 \
 		--low-threads 2 --epoch-rows 24 --copies 1 --check
+	./bench_unfused_pipeline --experts 2 --m 24 --h 64 --f 64 \
+		--threads-per-expert 2 --w13-ranges 2 --copies 1 --check
+	./bench_single_core_weight_window --m 24 --k 64 --n 64 \
+		--warmup 1 --runs 2 --cold-tail-mib 1 --check
+	./bench_m12_llc_pollution --victim-mib 1 --polluter-experts 1 \
+		--polluter-panels 1 --trials 1 --evict-mib 1 --cpu 0
+	./bench_fragmented_route_pipeline --teams 2 --base-routes 24 \
+		--replaced-teams 1 --split-factor 2 --hidden 64 --intermediate 64 \
+		--threads-per-team 2 --schedule dynamic --w13-ranges 2 --copies 1 --check
 
 clean:
-	rm -f $(TARGET)
+	rm -f $(TARGETS)
