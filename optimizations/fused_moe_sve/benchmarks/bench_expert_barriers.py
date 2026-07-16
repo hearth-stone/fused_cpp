@@ -238,6 +238,7 @@ def main() -> int:
     os.environ["FUSED_CPP_MOE_SVE"] = "1"
     os.environ["FUSED_CPP_MOE_W13_SPLIT_N"] = "0" if args.no_split_w13 else "1"
     os.environ["FUSED_CPP_MOE_W2_BF16_ROUTE"] = "1" if args.weighted else "0"
+    os.environ["FUSED_CPP_MOE_SVE_W2_DIRECT_ROUTE"] = "0"
     torch.set_num_threads(1)
     torch.set_num_interop_threads(1)
     generator = torch.Generator().manual_seed(args.seed)

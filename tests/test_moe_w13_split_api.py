@@ -217,6 +217,7 @@ def test_multithread_weight_window_preserves_w2_owner_scatter(monkeypatch, bridg
     """Multi-window W2 scatter must follow each worker's discontiguous N ownership."""
     monkeypatch.setenv("FUSED_CPP_MOE_SVE_W2_N_OWNER_SCATTER", "1")
     monkeypatch.setenv("FUSED_CPP_MOE_W2_BF16_ROUTE", "0")
+    monkeypatch.setenv("FUSED_CPP_MOE_SVE_W2_DIRECT_ROUTE", "0")
     generator = torch.Generator().manual_seed(20260716)
     hidden_size, intermediate_size, routes, threads = 64, 32, 24, 5
     affinity = sorted(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else list(range(threads))

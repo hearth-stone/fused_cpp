@@ -63,6 +63,31 @@ features:
       optimizations/fused_moe_sve/benchmarks/bench_expert_barriers.py
       --warmup 4 --runs 17 --sample-ms 10
 
+  - id: store.w2_direct_route
+    part: store
+    status: enabled
+    implementation: >-
+      csrc/moe_sve_fused_asm.S and csrc/fused_moe_bf16_tiled.cpp
+    hypothesis: >-
+      Giving the SVE W2 epilogue the flat route-row table lets each N owner
+      store its disjoint FP32 columns directly into route_out. For long routes,
+      eliminating the contiguous down materialization and the following
+      scatter saves more time than the irregular row-address generation adds
+      to W2, while preserving the existing FP32 weighted-merge contract.
+    depends_on: []
+    conflicts_with:
+      - scatter.w2_n_owner
+    correctness: >-
+      PYTHONPATH=src .venv/bin/python -m pytest -q
+      tests/test_fused_moe_bf16_tiled.py
+      -k w2_direct_route_store_matches_scatter
+    benchmark: >-
+      numactl --cpunodebind=0 --membind=0 taskset -c 0-95
+      .venv/bin/python
+      optimizations/fused_moe_sve/benchmarks/bench_w2_direct_route.py
+      --path async --tokens 2048 --hidden 4096 --intermediate 512
+      --experts 8 --top-k 6 --threads 96 --warmup 5 --runs 31
+
   - id: dispatch.elastic_n_lanes
     part: dispatch
     status: experimental
@@ -311,6 +336,14 @@ variants:
       FUSED_CPP_MOE_SVE_ELIDE_INTERMEDIATE_ZERO=1
       FUSED_CPP_MOE_SVE_W2_N_OWNER_SCATTER=1
       fused_moe_bf16_tiled_{scheduled,async}
+    status: enabled
+
+  - id: sve_w2_fp32_direct_route
+    features:
+      - store.w2_direct_route
+    entrypoint: >-
+      FUSED_CPP_MOE_SVE_W2_BF16_ROUTE=0
+      fused_moe_bf16_tiled_{sync,scheduled,async}
     status: enabled
 
   - id: sve_fused_expert_serial_weight_windows

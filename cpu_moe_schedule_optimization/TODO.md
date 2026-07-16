@@ -168,11 +168,26 @@ bytes, not predicted DRAM traffic.
     retains the sequential compatibility path, while U2/U4 remain experimental.
     An ordered fixed-top-k policy, short-token 2-D partitioning, model-level
     precision validation, and the additional folded epilogues above remain open.
-- [ ] Prototype a precision-neutral W2 FP32 direct-route-store epilogue. Pass the
+- [x] Prototype a precision-neutral W2 FP32 direct-route-store epilogue. Pass the
   M12 row destination table to assembly and write each N owner's disjoint H
   columns directly to `route_out`, eliminating the per-team `down` buffer and
   scatter copy. Measure whether irregular row stores reduce W2 throughput enough
   to offset the removed traffic before changing dispatch.
+  - 2026-07-16 experiment: `FUSED_CPP_MOE_SVE_W2_DIRECT_ROUTE=1` wires M12 and
+    M8/M4/M2/M1 SVE epilogues through sync, scheduled, and async bridges. On
+    NUMA0 of the 192-core host, eight 12-thread experts improved by 15.82% at
+    1536 routes/expert and 16.44% at 2040 routes/expert. The traced W2 critical
+    worker regressed only 0.7-1.2%, while removing 1.33-1.95 ms of scatter and
+    halving logical post-W2 traffic. At 12 routes/expert the median regressed
+    0.95%, M=48 was neutral, and M=192 improved by only 2.18%. A later
+    1001-pair M=48 run showed that the sub-10 us difference is below E2E noise,
+    so direct route is now default-on; `FUSED_CPP_MOE_SVE_W2_DIRECT_ROUTE=0`
+    retains the contiguous-down plus owner-scatter fallback.
+  - [ ] Measure uniform, hotspot, and captured distributions across short and
+    medium routes, and regenerate iso/contention profiles under the default
+    direct-route path. Existing profiles predate this default and represent the
+    contiguous-down plus scatter implementation. Separate route-buffer
+    first-touch page faults from steady kernel time when evaluating tail latency.
 - [ ] Add a direct BF16 route-store variant after the FP32 prototype. Keep final
   top-k accumulation in FP32, validate real `top_k=6` model accuracy, and compare
   current FP32, current BF16-with-scatter, direct FP32, and direct BF16 paths.

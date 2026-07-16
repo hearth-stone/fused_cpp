@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import platform
+from pathlib import Path
 from typing import Optional
 
 import pytest
@@ -352,6 +353,143 @@ def test_sve_route_merge_matches_sequential(
         torch.testing.assert_close(legacy_alias, reference, atol=1.0e-5, rtol=2.0e-2)
 
 
+@pytest.mark.parametrize("bridge", ["normal", "scheduled", "async"])
+@pytest.mark.parametrize("split_2d", [False, True], ids=["nsplit", "2d-nsplit"])
+def test_sve_w2_direct_route_store_matches_scatter(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    bridge: str,
+    split_2d: bool,
+) -> None:
+    """Cover interleaved route IDs, every M tail, and multi-thread N ownership."""
+    monkeypatch.setenv("FUSED_CPP_MOE_SVE", "1")
+    monkeypatch.setenv("FUSED_CPP_MOE_W13_SPLIT_N", "1")
+    monkeypatch.setenv("FUSED_CPP_MOE_W2_BF16_ROUTE", "0")
+    monkeypatch.setenv("FUSED_CPP_MOE_SVE_ROUTE_MERGE_UNROLL", "0")
+    monkeypatch.setenv("FUSED_CPP_MOE_FUSED_2D_SPLIT", "1" if split_2d else "0")
+    generator = torch.Generator().manual_seed(20260716)
+    hidden_size = 64
+    ffn_hidden_size = 32
+    route_counts = list(range(1, 24))
+    num_experts = len(route_counts)
+    top_k = 6
+    num_routes = sum(route_counts)
+    assert num_routes % top_k == 0
+    num_tokens = num_routes // top_k
+    threads = 5
+    affinity = sorted(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else list(range(threads))
+    if len(affinity) < threads:
+        pytest.skip(f"requires {threads} available CPUs")
+    if bridge == "normal" and split_2d:
+        monkeypatch.setenv("FUSED_CPP_MOE_HIERARCHICAL_N_SPLIT", "1")
+        monkeypatch.setenv("FUSED_CPP_MOE_N_SPLIT_CORE_BASES", str(affinity[0]))
+        monkeypatch.setenv("FUSED_CPP_MOE_N_SPLIT_GROUPS_PER_PARTITION", "1")
+    else:
+        monkeypatch.setenv("FUSED_CPP_MOE_HIERARCHICAL_N_SPLIT", "0")
+
+    hidden_states = _bf16_normal((num_tokens, hidden_size), generator=generator, std=0.01)
+    w13_weight = _bf16_normal(
+        (num_experts, 2 * ffn_hidden_size, hidden_size),
+        generator=generator,
+        std=0.01,
+    )
+    w2_weight = _bf16_normal(
+        (num_experts, hidden_size, ffn_hidden_size),
+        generator=generator,
+        std=0.01,
+    )
+    remaining = route_counts.copy()
+    flat_ids: list[int] = []
+    while len(flat_ids) < num_routes:
+        for expert in range(num_experts):
+            if remaining[expert] > 0:
+                flat_ids.append(expert)
+                remaining[expert] -= 1
+    topk_ids = torch.tensor(flat_ids, dtype=torch.int32).reshape(num_tokens, top_k)
+    topk_weights = torch.softmax(torch.randn((num_tokens, top_k), generator=generator), dim=-1)
+    packed = prepare_fused_moe_bf16_tiled_weights(w13_weight, w2_weight, fuse_silu=True)
+    if packed.gemm_backend != 1:
+        pytest.skip("requires an SVE BF16 build/runtime")
+
+    expert_ids = torch.arange(num_experts, dtype=torch.int32)
+    team_threads = torch.full((num_experts,), threads, dtype=torch.int32)
+    thread_cpu_ids = torch.tensor(affinity[:threads], dtype=torch.int32)
+    if bridge == "normal":
+
+        def run() -> torch.Tensor:
+            return fused_moe_bf16_tiled(
+                hidden_states,
+                packed,
+                topk_weights,
+                topk_ids,
+                num_threads=threads,
+            )
+
+    elif bridge == "scheduled":
+        wave_offsets = torch.arange(num_experts + 1, dtype=torch.int32)
+
+        def run() -> torch.Tensor:
+            return fused_moe_bf16_tiled_scheduled(
+                hidden_states,
+                packed,
+                topk_weights,
+                topk_ids,
+                wave_offsets,
+                expert_ids,
+                team_threads,
+                thread_cpu_ids=thread_cpu_ids,
+                num_threads=threads,
+            )
+
+    else:
+        dep_offsets = torch.arange(num_experts + 1, dtype=torch.int32)
+        dep_offsets[1:] -= 1
+        deps = torch.arange(num_experts - 1, dtype=torch.int32)
+
+        def run() -> torch.Tensor:
+            return fused_moe_bf16_tiled_async(
+                hidden_states,
+                packed,
+                topk_weights,
+                topk_ids,
+                expert_ids,
+                torch.zeros(num_experts, dtype=torch.int32),
+                team_threads,
+                dep_offsets,
+                deps,
+                thread_cpu_ids=thread_cpu_ids,
+                num_threads=threads,
+            )
+
+    direct_flag = "FUSED_CPP_MOE_SVE_W2_DIRECT_ROUTE"
+    monkeypatch.setenv(direct_flag, "0")
+    reference = run()
+    monkeypatch.setenv(direct_flag, "1")
+    candidate: Optional[torch.Tensor] = None
+    for _ in range(3):
+        candidate = run()
+        torch.testing.assert_close(
+            candidate.float(),
+            reference.float(),
+            atol=0,
+            rtol=0,
+            msg=lambda message: f"{bridge}/split_2d={split_2d}: {message}",
+        )
+    assert candidate is not None
+    monkeypatch.delenv(direct_flag)
+    if bridge == "async" and not split_2d:
+        trace_path = tmp_path / "default_w2_direct_route.log"
+        monkeypatch.setenv("FUSED_CPP_MOE_TRACE", "1")
+        monkeypatch.setenv("FUSED_CPP_MOE_TRACE_FILE", str(trace_path))
+    default = run()
+    monkeypatch.setenv("FUSED_CPP_MOE_TRACE", "0")
+    torch.testing.assert_close(default.float(), candidate.float(), atol=0, rtol=0)
+    if bridge == "async" and not split_2d:
+        trace = trace_path.read_text()
+        assert "stage=w2_direct_route" in trace
+        assert "stage=scatter_route_out" not in trace
+
+
 @pytest.mark.parametrize("bridge", ["scheduled", "async"])
 @pytest.mark.parametrize("w2_bf16_route", [False, True])
 @pytest.mark.parametrize(
@@ -369,6 +507,7 @@ def test_sve_expert_barrier_elision_reuses_dirty_scratch(
     """Exercise all M tails while repeatedly reusing dirty team scratch."""
     monkeypatch.setenv("FUSED_CPP_MOE_SVE", "1")
     monkeypatch.setenv("FUSED_CPP_MOE_W2_BF16_ROUTE", "1" if w2_bf16_route else "0")
+    monkeypatch.setenv("FUSED_CPP_MOE_SVE_W2_DIRECT_ROUTE", "0")
     generator = torch.Generator().manual_seed(20260714)
     hidden_size = 64
     ffn_hidden_size = 32

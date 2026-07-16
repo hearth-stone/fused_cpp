@@ -54,6 +54,42 @@ numactl --cpunodebind=0 --membind=0 taskset -c 0-95 \
 The 192-core-host NUMA0 measurements are recorded in
 [`results/amazon_192c_route_merge_tree.md`](results/amazon_192c_route_merge_tree.md).
 
+## W2 FP32 direct route store
+
+The default SVE W2 epilogue consumes each expert's flat route-row table
+and stores its FP32 result directly into the token-major `route_out` tensor.
+M12/M8/M4/M2/M1 kernels retain the production BFMMLA body; only the store
+epilogue replaces the fixed contiguous row stride with a per-row destination.
+N-split workers still own disjoint `n_tile`-aligned H ranges, so no two workers
+write the same output element. The existing FP32 weighted route merge is
+unchanged.
+
+Disable the path and retain the contiguous `down` plus scatter fallback with:
+
+```bash
+FUSED_CPP_MOE_SVE_W2_DIRECT_ROUTE=0 \
+  <fused MoE command>
+```
+
+Dispatch requires the SVE fused-SiLU packed-A path, an unbiased W2, an FP32
+route buffer, `N_pad == H`, and route offsets representable by the SVE signed
+32-bit scatter offsets. Unsupported cases retain the existing contiguous W2
+store plus scatter. Direct route is default-on because it preserves bitwise
+FP32 output, removes the per-team `down` allocation, improves long-route E2E by
+roughly 14-16% on the 192-core host's first NUMA node, and is statistically
+neutral for short routes.
+
+```bash
+numactl --cpunodebind=0 --membind=0 taskset -c 0-95 \
+  .venv/bin/python \
+  optimizations/fused_moe_sve/benchmarks/bench_w2_direct_route.py \
+  --path async --tokens 2048 --hidden 4096 --intermediate 512 \
+  --experts 8 --top-k 6 --threads 96 --warmup 5 --runs 31
+```
+
+The implementation, traffic accounting, and measurements are recorded in
+[`results/amazon_192c_w2_direct_route.md`](results/amazon_192c_w2_direct_route.md).
+
 ## Explicit unfused pipeline reference
 
 `bench_unfused_pipeline` measures the full fusion boundary with the production
