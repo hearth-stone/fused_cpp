@@ -1,18 +1,65 @@
-# SVE BF16 GEMM ECM Shadow Model
+# Implementation-Weak GEMM Cost Model
 
 ## Status
 
-`gemm_ecm.py` is a microkernel-aware shadow model. It does not replace the
-active `T_iso` formula or planner scoring. Its purpose is to determine whether
-the fused W13/W2 stage time can be represented by reusable machine service
-rates instead of a two-dimensional route/thread latency table.
+The GEMM shadow model is split across three explicit layers:
+
+- `gemm_cost_model.py`: implementation-independent algorithm work, generic
+  `KernelDemand`, measured machine profiles, and the response formula;
+- `sve_bf16_kernel_model.py`: the current M12/M8/M4/M2 SVE BF16 lowering;
+- `gemm_ecm.py`: the backward-compatible report CLI and legacy helper facade.
+
+It does not replace the active `T_iso` formula or planner scoring. Its purpose
+is to determine whether fused W13/W2 time can be represented by reusable
+algorithm work plus a pluggable kernel mapping and sparse machine measurements,
+instead of a full route/thread latency table for every implementation.
 
 The first validation passes for steady M12 bulk on a clean 32-core slice of the
 192-core Neoverse V3 host. The 64-core target host was unreachable during this
 run, so the V3 results validate model structure only; they are not target
 calibration data.
 
-## Assembly-derived work
+## Layer contracts
+
+For problem instance $x$, schedule $\sigma_s$, implementation $\kappa$, and
+machine $\mu$, one stage is represented as:
+
+$$
+w_s=\mathcal A_s(x),
+\qquad
+d_s=\Phi_\kappa(w_s,\sigma_s),
+$$
+
+$$
+\widehat T_s
+=\Psi_{\mu,\kappa}(d_s,\sigma_s)
++O_{\mu,\kappa}(\sigma_s).
+$$
+
+`LogicalGemmWork` contains only logical dimensions, useful FLOPs, compulsory
+one-pass tensor bytes, output elements, and W13-to-W2 dependency. It has no
+thread, tile, panel, ISA, padding, or split fields. For BF16 weights/input,
+BF16 W13 output, and the current FP32 W2 store:
+
+$$
+F_{13}^{use}=4MHF,
+\qquad Q_{13}^{min}=2MH+4HF+2MF,
+$$
+
+$$
+F_2^{use}=2MHF,
+\qquad Q_2^{min}=2MF+2FH+4MH.
+$$
+
+These bytes are explanatory compulsory lower bounds, not predicted cache
+traffic. They can form an ideal
+$\max(F^{use}/P^{peak},Q^{min}/B^{peak})$ lower bound, but that lower bound is
+not used as a runtime prediction. Actual instruction counts, padding, repeated
+cache traffic, and load imbalance belong to the kernel mapper. Measured service
+rates and fixed costs belong to a profile identified by machine,
+implementation, and active thread width.
+
+## SVE implementation mapping
 
 Let the SVE vector length be $V$ bytes and the BF16 N tile be
 $\nu=V/2$. For a GEMM with padded dimensions $(M,K,N)$, let
@@ -85,7 +132,7 @@ convention doubles shared-cache A scans. A counter study may later show that A
 survives in private cache across the range boundary; that would change only
 the shared-A term, not the instruction counts.
 
-## ECM formula
+## Measured machine response
 
 For one stage, the model evaluates:
 
@@ -106,8 +153,8 @@ T_{\mathrm{stage}}
 +T_{\mathrm{epilogue}}.
 $$
 
-The corresponding service rates are aggregate rates at the stage's active
-thread width:
+The corresponding service rates are measurements for this implementation at
+the stage's active thread width:
 
 $$
 T_{\mathrm{BFMMLA}}=\frac{F_{\mathrm{balanced}}}{P_{\mathrm{BFMMLA}}(t)},
@@ -126,6 +173,10 @@ threads, so non-divisible N partitions retain their load-imbalance cost.
 Frontend counts currently include only BFMMLA and A/B load instructions, so
 that term is explicitly a lower bound until loop/address/epilogue instruction
 counts or PMU data are added.
+
+The implementation and thread identity is checked before evaluation. A profile
+measured for NEON, a different SVE kernel, or another active width cannot be
+silently applied to the current demand.
 
 ## V3 structural validation
 
@@ -172,8 +223,11 @@ FUSED_CPP_MOE_W13_SPLIT_N=1 taskset -c 0-31 \
 | W2 | 32 | 9.811 | 10.261 | 2137.6 | 955.2 | 0.92% | 1.01% |
 
 The panel-linear form is therefore a good description of steady M12 bulk on
-this host: all held-out stage errors are below 1.7%. This does not validate
-M1/M2/M4/M8 startup or cross-machine rates.
+this host: all held-out stage errors are below 1.7%. Because calibration and
+holdout share the same $H/F$, kernel, split policy, and machine, this validates
+only steady-panel linearity. It does not yet establish that the layered model
+predicts M1/M2/M4/M8 startup, unseen shapes, another implementation, or another
+machine with fewer measurements than a simple per-thread slope table.
 
 The three `required` columns are equivalent views of the same observed panel
 time, not three independently measured ceilings. In particular, the roughly
@@ -235,6 +289,11 @@ Before planner rollout, collect on the target 64-core host:
    convention;
 5. M1/M2/M4/M8 and one/two-panel startup residuals;
 6. held-out shapes, especially EP $F=2048$, before replacing active `T_iso`.
+
+The rollout comparison must include a simple per-thread panel-slope baseline,
+the existing route/thread table, and this layered model. Primary acceptance
+metrics are held-out schedule regret, ranking accuracy, and calibration sample
+count; same-shape stage MAPE alone is insufficient.
 
 Generate the report with:
 
