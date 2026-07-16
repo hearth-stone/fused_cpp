@@ -82,6 +82,138 @@ features:
       --stage w13 --m 2040 --k 4096 --n 4096 --threads 96
       --epoch-rows 204 --warmup 3 --iters 9 --copies 4
 
+  - id: dispatch.serial_weight_windows
+    part: dispatch
+    status: experimental
+    implementation: csrc/fused_moe_bf16_tiled.cpp
+    hypothesis: >-
+      Serializing both packed-B GEMMs into a configurable tile-aligned byte
+      window reduces the active reusable weight footprint on machines whose
+      robust cache budget is smaller than the existing W2-sized stage, without
+      changing GEMM FLOPs or numerical output; range dispatch overhead and the
+      reduced N-tile lane count remain measurable tradeoffs.
+    depends_on: []
+    conflicts_with: []
+    correctness: >-
+      pytest -q tests/test_moe_w13_split_api.py
+      -k weight_window
+    benchmark: >-
+      numactl --cpunodebind=0 --membind=0 taskset -c 0-95
+      .venv/bin/python
+      optimizations/fused_moe_sve/benchmarks/bench_weight_windows.py
+      --experts 24 --routes 2040 --hidden 4096 --intermediate 512
+      --threads-per-expert 4 --window-mib 0,4,2,1 --warmup 3 --runs 9
+
+  - id: pipeline.explicit_unfused_reference
+    part: pipeline
+    status: experimental
+    implementation: optimizations/fused_moe_sve/features/unfused_pipeline.cpp
+    hypothesis: >-
+      With preallocated buffers and the identical production M12 SVE GEMM
+      body, direct gather-pack plus fused W13 SiLU/multiply/packC has lower
+      expert wall time than explicitly materializing extract, both pack-A
+      operations, FP32 W1/SiLU/W3 tensors, and the BF16 gated product.
+    depends_on: []
+    conflicts_with: []
+    correctness: >-
+      make -C optimizations/fused_moe_sve/benchmarks
+      bench_unfused_pipeline &&
+      optimizations/fused_moe_sve/benchmarks/bench_unfused_pipeline
+      --experts 2 --m 24 --h 64 --f 64 --threads-per-expert 2
+      --w13-ranges 2 --copies 1 --check
+    benchmark: >-
+      numactl --cpunodebind=0 --membind=0 taskset -c 0-95
+      optimizations/fused_moe_sve/benchmarks/bench_unfused_pipeline
+      --experts 4 --m 2040 --h 4096 --f 2048
+      --threads-per-expert 24 --w13-ranges 2
+      --warmup 3 --iters 10 --copies 2
+
+  - id: measurement.single_core_unique_weight_window
+    part: measurement
+    status: diagnostic
+    implementation: >-
+      optimizations/fused_moe_sve/benchmarks/
+      bench_single_core_weight_window.cpp
+    hypothesis: >-
+      Holding M and K fixed while increasing N exposes private-L2 and
+      shared-LLC packed-weight residency boundaries, provided every GEMM call
+      uses a distinct cold packed-B buffer and allocation is excluded from
+      both timing and PMU counters.
+    depends_on: []
+    conflicts_with: []
+    correctness: >-
+      make -C optimizations/fused_moe_sve/benchmarks
+      bench_single_core_weight_window &&
+      optimizations/fused_moe_sve/benchmarks/
+      bench_single_core_weight_window
+      --m 24 --k 64 --n 64 --warmup 1 --runs 2
+      --cold-tail-mib 1 --check
+    benchmark: >-
+      python3 optimizations/fused_moe_sve/benchmarks/
+      run_single_core_weight_window.py
+      --m 120 --k 4096 --cpu 48 --numa-node 0
+      --warmup 2 --runs 7 --cold-tail-mib 192
+
+  - id: measurement.thread_weight_working_set
+    part: measurement
+    status: diagnostic
+    implementation: >-
+      optimizations/fused_moe_sve/benchmarks/
+      run_thread_weight_working_set.py
+    hypothesis: >-
+      Under split-W13, N-splitting one expert preserves its aggregate packed-B
+      stage while reducing each thread's stripe, whereas running one expert per
+      thread grows the aggregate packed-B stage linearly unless the per-expert
+      weight is reduced inversely with thread count. With a fixed total thread
+      budget, several multi-thread expert teams can trade lower replicated-A
+      demand for larger per-thread B stripes and a larger aggregate B stage.
+    depends_on: []
+    conflicts_with: []
+    correctness: >-
+      python -m pytest -q tests/test_thread_weight_working_set.py &&
+      make -C optimizations/fused_moe_sve/benchmarks check
+    benchmark: >-
+      numactl --cpunodebind=0 --membind=0 taskset -c 0-95
+      python optimizations/fused_moe_sve/benchmarks/
+      run_thread_weight_working_set.py
+      --output /tmp/split_w13_expert_team.json
+      --experiments team-fixed-route,team-fixed-work
+      --team-experts 1,2,3,4,6,8,12 --team-total-threads 96
+      --team-route 2040 --team-total-routes 2304 --team-stage-mib 16
+      --warmup 2 --runs 7
+
+  - id: measurement.fixed_active_b_route_fragmentation
+    part: measurement
+    status: diagnostic
+    implementation: >-
+      optimizations/fused_moe_sve/benchmarks/
+      bench_fragmented_route_pipeline.cpp and
+      optimizations/fused_moe_sve/benchmarks/
+      profile_fragmented_route_pipeline.py
+    hypothesis: >-
+      When total GEMM FLOPs, 96 workers, and a 96 MiB maximum active split-W13
+      packed-B stage are fixed, replacing some M=2040 experts with more
+      independent short-route experts has little effect until packed-weight
+      turnover and per-expert fixed costs become comparable to GEMM work.
+    depends_on: []
+    conflicts_with: []
+    correctness: >-
+      python -m pytest -q tests/test_fragmented_route_pipeline.py &&
+      make -C optimizations/fused_moe_sve/benchmarks
+      bench_fragmented_route_pipeline &&
+      optimizations/fused_moe_sve/benchmarks/
+      bench_fragmented_route_pipeline
+      --teams 2 --base-routes 24 --replaced-teams 1 --split-factor 2
+      --hidden 64 --intermediate 64 --threads-per-team 2
+      --schedule dynamic --w13-ranges 2 --copies 1 --check
+    benchmark: >-
+      python optimizations/fused_moe_sve/benchmarks/
+      profile_fragmented_route_pipeline.py
+      --output /tmp/fixed_active_b_fragmentation_perf.json
+      --teams 24 --base-routes 2040 --hidden 4096 --intermediate 512
+      --threads-per-team 4 --schedule dynamic --split-factors 1,2,5,10
+      --cpu-start 0 --numa-node 0 --warmup 2 --runs 7 --repeats 3
+
 variants:
   - id: sve_static_nsplit
     features: []
@@ -143,3 +275,36 @@ variants:
       FUSED_CPP_MOE_SVE_W2_N_OWNER_SCATTER=1
       fused_moe_bf16_tiled_{scheduled,async}
     status: enabled
+
+  - id: sve_fused_expert_serial_weight_windows
+    features:
+      - intermediate.overwrite_elision
+      - scatter.w2_n_owner
+      - dispatch.serial_weight_windows
+    entrypoint: >-
+      fused_moe_bf16_tiled_{scheduled,async}(
+      weight_window_bytes=<positive byte count>)
+    status: experimental
+
+  - id: sve_explicit_unfused_expert
+    features:
+      - pipeline.explicit_unfused_reference
+    entrypoint: unfused::Experiment::run(kExplicitUnfused)
+    status: benchmark_reference
+
+  - id: sve_fully_fused_expert_control
+    features: []
+    entrypoint: unfused::Experiment::run(kProductionFused)
+    status: benchmark_reference
+
+  - id: sve_single_core_unique_weight_window
+    features:
+      - measurement.single_core_unique_weight_window
+    entrypoint: moe_sve_w2_packed_bf16_m12
+    status: diagnostic
+
+  - id: sve_fixed_active_b_fragmented_routes
+    features:
+      - measurement.fixed_active_b_route_fragmentation
+    entrypoint: unfused::FragmentedExperiment::run
+    status: diagnostic

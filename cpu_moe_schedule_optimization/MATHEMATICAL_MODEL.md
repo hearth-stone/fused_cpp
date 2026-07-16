@@ -2,32 +2,67 @@
 
 > 状态：调度问题定义的 source of truth。
 >
-> 最后更新：2026-07-14。
+> 最后更新：2026-07-16。
 >
-> 修改 planner 的决策变量、目标函数、资源约束、线程宽度集合、调度语义、
+> 修改 planner 的决策变量、目标函数、硬约束、性能响应、线程宽度集合、调度语义、
 > rank 耦合方式或剪枝策略时，必须同步更新本文档及末尾变更记录。
 
 ## 1. 文档边界
 
 本文档将 MoE 调度分为四层：
 
-1. **原始数学问题**：定义完整可行域，不包含当前实现的经验剪枝。
-2. **实例参数**：kernel/cost model 提供执行时间和资源需求。
-3. **求解器编码**：CP-SAT、MILP 或启发式对同一个问题的不同表达。
+1. **原始数学问题**：由 expert route tasks、CPU 容量、真实 isolated time 和
+   contention slowdown 定义完整可行域与目标，不包含当前实现细节或经验剪枝。
+2. **性能近似**：cost model 估计原始问题中的真实 isolated time 和 contention
+   slowdown。
+3. **求解器编码**：CP-SAT、MILP、event simulation 或启发式对同一个问题的
+   不同近似与表达。
 4. **工程剪枝**：线程宽度、静态 shape、LPT、non-idling 等当前限制。
 
-M12、SVE、W13 split、具体权重布局等属于实例参数生成过程，不属于核心问题
-定义。核心问题只观察它们最终产生的执行时间和资源需求。
+M12、SVE、W13 split、具体权重布局和 cache 工作集公式不属于核心问题定义。
+它们只影响固定执行环境下观测到的 isolated time 和 contention slowdown。
 
 ## 2. 原始问题
 
-### 2.1 集合与参数
+### 2.1 Expert route tasks
 
-设一次 rank-local MoE 执行包含 expert job 集合：
+设一次完整 MoE layer 有 $E$ 个候选 expert：
 
 $$
-\mathcal J=\{1,\ldots,n\}.
+\mathcal X=\{1,\ldots,E\}.
 $$
+
+当前目标模型中 $E=256$。以下公式描述一个调度域：node-level 调度时该域可包含
+全部 256 个 expert；rank-local 调度时，$\mathcal X$ 替换为分配到该 rank 的
+expert 子集。复杂度分析将 $E$ 视为可变输入规模；固定的单个 256-expert 实例
+本身不构成渐近复杂度问题。
+
+路由完成后，expert $i$ 得到 route tensor：
+
+$$
+\mathbf X_i\in\mathbb R^{M_i\times H},
+$$
+
+其中 $M_i$ 是 route 数。需要执行的 job 集合为：
+
+$$
+\mathcal J=\{i\in\mathcal X\mid M_i>0\}.
+$$
+
+Job $i$ 表示在其独立权重上完成整个 expert 计算：
+
+$$
+\mathrm{W13}_i
+\rightarrow\mathrm{activation}_i
+\rightarrow\mathrm{W2}_i.
+$$
+
+不同 expert job 之间没有数据依赖。route tensor 的数值和 token index 不影响
+rank-local expert compute 调度；在 expert shape 固定时，调度只需要 expert
+identity 和 $M_i$。若 scatter/combine 也进入目标，token index 才需要进入外层
+系统模型。
+
+### 2.2 CPU 容量与真实执行响应
 
 可用的最大 CPU 核心/线程数为：
 
@@ -38,120 +73,130 @@ $$
 原始问题允许每个 job 使用任意整数线程宽度：
 
 $$
-\mathcal T_i^{(0)}=\{1,2,\ldots,T_{\max}\}.
+\mathcal T_i^{(0)}=\{1,2,\ldots,C\}.
 $$
 
-对 expert $i$ 和线程数 $t$，实例参数生成器提供：
+固定目标机器及其执行环境，但不展开 ISA、kernel、layout 或 cache 细节。定义
+真实 isolated time：
 
 $$
-p_i(t)>0,
+0<I_i(t)<\infty,
 $$
 
-其中 $p_i(t)$ 是 job 非抢占执行时的处理时间。它可以依赖 route 数和
-kernel 实现，但这些依赖不进入核心调度公式。
-
-设 $\mathcal R$ 为 CPU 之外的 cumulative resource 集合。对资源
-$r\in\mathcal R$：
+表示 job $i$ 使用 $t$ 个线程且没有其他 expert 干扰时，完成整个 expert 计算
+所需的时间。相同 expert shape 下可写成：
 
 $$
-d_{i,r}(t)\ge0
+I_i(t)=I(M_i,t).
 $$
 
-表示 expert $i$ 使用 $t$ 个线程时对资源 $r$ 的需求。这里 $d$ 是 demand，
-$i$ 和 $r$ 是两个独立下标，不是一个名为 `dir` 的变量。$B_r$ 表示资源 $r$
-的容量，并且必须与 $d_{i,r}(t)$ 使用相同单位。例如 LLC 需求与容量都使用
-bytes，保守预留的内存带宽与带宽容量都使用 bytes/s。总访问字节数不是瞬时
-cumulative demand；它必须先转换成带宽需求，或者吸收到 $p_i(t)$ 中。若某类
-性能影响已经包含在 $p_i(t)$ 中，则不应在 $d_{i,r}(t)$ 中重复计算。
-
-可选的 precedence 集合为：
+对时刻 $\tau$ 的活跃配置，定义：
 
 $$
-\mathcal E\subseteq\mathcal J\times\mathcal J.
+\mathcal Z(\tau)
+=\{(j,M_j,t_j)\mid j\text{ 在 }\tau\text{ 时刻活跃}\}.
 $$
 
-$\mathcal J\times\mathcal J$ 是所有有序 job 对的集合；$(i,j)\in\mathcal E$
-表示 job $i$ 必须完成后 job $j$ 才能开始。$\mathcal E$ 是问题输入中的强制
-数据依赖，必须构成有向无环图；它不是 planner 为共享 CPU 而选择的 lane 顺序。
-
-当前将完整 expert 抽象为一个 job 时，各 expert 相互独立，因此
-$\mathcal E=\varnothing$。若将 expert 展开成通用 phase DAG，则 job 集合中的
-节点改为 phase，并使用例如 $(\mathrm{W13},\mathrm{W2})\in\mathcal E$ 表示
-phase 依赖。
-
-### 2.2 决策变量
-
-每个 expert 选择一个整数线程宽度和开始时间：
+真实 contention slowdown factor 为：
 
 $$
-t_i\in\{1,\ldots,T_{\max}\},\qquad s_i\ge0.
+1\le D_i(\mathcal Z) = 1+\rho_i(\mathcal Z)<\infty,
+$$
+
+其中 $\rho_i$ 是相对 isolated time 的延长比例，并满足单独运行时：
+
+$$
+D_i(\{(i,M_i,t_i)\})=1.
+$$
+
+只按并发 expert 数建模是特例
+$D_i(\mathcal Z)=D(M_i,t_i,|\mathcal Z|)$。通用定义保留完整
+$(M_j,t_j)$ 活跃配置，因为相同并发数下，不同 route 和线程宽度可以产生不同
+争用。
+
+基础模型假设 $D_i$ 对 normalized progress 做乘性缩放，并且只依赖当前
+$\mathcal Z(\tau)$，即相同 active configuration 的瞬时速率与到达历史无关。
+若验证发现 W13/W2 phase、cache residency 或先前执行顺序仍会改变速率，应将
+这些状态加入 $\mathcal Z$，而不是修改调度目标。
+
+因此，在 expert shape 和固定执行环境已确定时，原始问题的最小充分输入为：
+
+$$
+\boxed{
+\mathcal I
+=\left(
+\{(i,\mathbf X_i,M_i)\}_{i=1}^{E},
+C,
+\{I_i(t)\},
+\{D_i(\mathcal Z)\}
+\right).
+}
+$$
+
+route tasks 与 $C$ 定义工作负载和硬可行域；$I$ 与 $D$ 定义目标机器上的真实
+执行时间。后续 cost model 只负责近似 $I,D$，planner 决定线程宽度和开始时间。
+
+### 2.3 决策变量与执行动态
+
+每个 expert 选择一个线程宽度和开始时间：
+
+$$
+t_i\in\{1,\ldots,C\},\qquad s_i\ge0.
 $$
 
 线程数在 job 开始前选择，执行过程中保持不变。因此 job 是 **moldable**，
-不是执行中可改变线程数的 malleable job。
+不是执行中可改变线程数的 malleable job。Job 一旦开始就连续执行至完成，不能
+抢占。
 
-完成时间为：
-
-$$
-f_i=s_i+p_i(t_i).
-$$
-
-定义非抢占式活跃指示函数：
+定义活跃指示函数：
 
 $$
 a_i(\tau)=\mathbf 1[s_i\le\tau<f_i].
 $$
 
-$a_i(\tau)$ 是由 $s_i$ 和 $f_i$ 推导出的辅助函数，不是独立决策变量。当
-job $i$ 在时刻 $\tau$ 正在执行并占用 CPU、LLC 等资源时取 1，否则取 0。
-非抢占语义保证其取 1 的区域是单个连续区间 $[s_i,f_i)$；若允许抢占，一个
-job 可能对应多个不连续活跃区间，不能再只用上述单一区间定义。
-
-该指示函数用于简洁表达“任意时刻所有活跃 job 的资源需求之和不能超过容量”。
-实际 CP-SAT 实现通常通过 interval variable 和 cumulative constraint 等价表示，
-不需要为连续时间轴上的每个 $\tau$ 显式创建一个 $a_i(\tau)$ 变量。
-
-### 2.3 资源约束
-
-任意时刻的 CPU 使用量不能超过 $T_{\max}$：
+令 $x_i(\tau)\in[0,1]$ 表示归一化完成进度。执行期间的真实速率为：
 
 $$
-\sum_{i\in\mathcal J}t_i a_i(\tau)\le T_{\max},
+\frac{dx_i(\tau)}{d\tau}
+=\frac{a_i(\tau)}{I_i(t_i)D_i(\mathcal Z(\tau))},
+\qquad x_i(s_i)=0.
+$$
+
+完成时间由下式隐式定义：
+
+$$
+f_i=\inf\{\tau\ge s_i\mid x_i(\tau)\ge1\},
+$$
+
+等价地：
+
+$$
+\int_{s_i}^{f_i}
+\frac{d\tau}{I_i(t_i)D_i(\mathcal Z(\tau))}=1.
+$$
+
+当某个 expert 完成时，$\mathcal Z(\tau)$ 立即变化，剩余 expert 使用新的
+slowdown 继续推进。若所有 $D_i\equiv1$，则退化为固定处理时间：
+
+$$
+f_i=s_i+I_i(t_i).
+$$
+
+### 2.4 硬约束与目标函数
+
+核心原始问题只把 CPU 线程容量作为硬件可行性约束：
+
+$$
+\sum_{i\in\mathcal J}t_i a_i(\tau)\le C,
 \qquad\forall\tau.
 $$
 
-其他 cumulative resource 满足：
+LLC 容量和内存带宽在当前目标机器上是性能资源，而不是可执行性资源。工作集
+超过某个 cache 比例时任务仍可运行，只是通过 $D_i(\mathcal Z)$ 变慢，因此不把
+LLC 或总访存字节数写成原始问题的硬 cumulative constraint。若未来存在真正
+不可违反的内存容量、affinity 或安全隔离限制，可额外扩展可行域。
 
-$$
-\sum_{i\in\mathcal J}d_{i,r}(t_i)a_i(\tau)\le B_r,
-\qquad\forall r\in\mathcal R,\ \forall\tau.
-$$
-
-这里 cumulative 表示同一时刻的资源需求可加，并不表示资源消耗随时间永久
-累积。对固定资源 $r$ 和时刻 $\tau$，只有 $a_i(\tau)=1$ 的活跃 job 贡献
-$d_{i,r}(t_i)$；它们的总需求不得超过容量 $B_r$。Job 完成后需求立即释放，
-容量可由后续 job 重新使用，因此这是 renewable cumulative resource。
-
-例如 $r=\mathrm{LLC}$、$B_r=32\ \mathrm{MiB}$，两个活跃 job 分别需要
-$8\ \mathrm{MiB}$ 和 $16\ \mathrm{MiB}$，则总需求为 $24\ \mathrm{MiB}$，
-满足约束。若第三个活跃 job 还需要 $12\ \mathrm{MiB}$，总需求变为
-$36\ \mathrm{MiB}$，在硬容量模型中不可行。
-
-LLC budget 可以直接使用上述硬约束。内存带宽等资源在真实硬件上通常表现为
-超过需求后逐渐降速，而不是不可执行；将其写成 cumulative constraint 是保守
-近似。若需要描述软争用，应使用速率分配或 active-set slowdown 模型，而不是
-把总访问字节数直接放入该约束。
-
-前驱约束为：
-
-$$
-s_j\ge f_i,
-\qquad\forall(i,j)\in\mathcal E.
-$$
-
-### 2.4 目标函数
-
-Rank-local compute makespan 为：
+调度域内的 expert compute makespan 为：
 
 $$
 C_{\max}=\max_{i\in\mathcal J}f_i.
@@ -165,13 +210,13 @@ $$
 \min_{\{s_i,t_i\}}\quad
 & C_{\max}\\
 \mathrm{s.t.}\quad
-& t_i\in\{1,\ldots,T_{\max}\}, &&\forall i,\\
-& f_i=s_i+p_i(t_i), &&\forall i,\\
-& \sum_i t_i a_i(\tau)\le T_{\max}, &&\forall\tau,\\
-& \sum_i d_{i,r}(t_i)a_i(\tau)\le B_r,
-&&\forall r,\tau,\\
-& s_j\ge f_i, &&\forall(i,j)\in\mathcal E,\\
-& s_i\ge0. &&
+& t_i\in\{1,\ldots,C\}, &&\forall i,\\
+& s_i\ge0, &&\forall i,\\
+& \sum_i t_i a_i(\tau)\le C, &&\forall\tau,\\
+& \int_{s_i}^{f_i}
+\frac{d\tau}{I_i(t_i)D_i(\mathcal Z(\tau))}=1,
+&&\forall i,\\
+& C_{\max}=\max_i f_i. &&
 \end{aligned}}
 $$
 
@@ -204,20 +249,23 @@ T_{\mathrm{layer}}
 +T_{\mathrm{combine}}.
 $$
 
-若 rank 共享内存带宽等资源，则应在所有 rank 的联合活跃集合上增加共享资源
-约束。一个 rank 完成后，联合活跃集合随之改变，剩余 rank 必须切换到新的资源
-容量，而不能将 dual-rank 速率应用到整个执行区间。
+若多个 rank 共享内存带宽、cache 或互连，则 contention response 必须观察所有
+rank 的联合活跃配置 $\mathcal Z_{\mathrm{global}}(\tau)$。一个 rank 完成后，
+联合活跃配置随之改变，剩余 rank 必须切换到新的 slowdown，而不能将 dual-rank
+速率应用到整个执行区间。
 
 ## 4. 问题类型与复杂度
 
-该问题可描述为：
+该问题是 **带 active-set interference 的非抢占 moldable-job makespan
+调度**。可以用非标准的描述性记号写成：
 
 $$
-P\mid\mathrm{moldable,\ nonpreemptive,\ cumulative\ resources,\ prec}
-\mid C_{\max}.
+P\mid\mathrm{moldable,\ nonpreemptive,\ interference}\mid C_{\max}.
 $$
 
-这只是描述性记号，不声称存在覆盖全部扩展项的单一标准 Graham notation。
+这里 `interference` 表示处理速率依赖同时活跃的 $(M_j,t_j)$ 配置，不是标准
+Graham 三字段记号中的既有选项。当所有 $D_i\equiv1$ 时，问题退化为固定处理
+时间的 moldable-job scheduling 特例。
 
 ### 4.1 混合离散-连续与非凸性
 
@@ -255,24 +303,137 @@ $$
 此时两个 job 在 $[1/2,3/2)$ 重叠并违反单核容量约束。因此两个可行点的凸
 组合可能不可行，可行域非凸。
 
-### 4.2 判定版本
+### 4.2 最优解存在性
 
-给定整数或经统一缩放后的有理数参数，以及 deadline $D$，定义判定问题：
+**命题 1（最优调度存在）**。设 $n=|\mathcal J|<\infty$、$C<\infty$，并且
+$I_i(t)$ 与 $D_i(\mathcal Z)$ 满足第 2.2 节的有限性和 memoryless 假设。那么
+存在一个可行调度 $S^*$，使：
 
 $$
-\textsc{Moldable-Cumulative-Schedule}(D):
+C_{\max}(S^*)
+=\min_{S\in\mathcal F}C_{\max}(S).
+$$
+
+这里 $\mathcal F$ 是第 2 节定义的完整原始可行域，包含连续开始时间、任意合法
+整数线程宽度和主动 idling。
+
+**证明。**
+
+首先构造一个有限的可行上界。令所有 expert 使用一个线程并任意串行执行。任意
+时刻只有一个 expert 活跃，所以 $D_i=1$，该调度的 makespan 为：
+
+$$
+B=\sum_{i\in\mathcal J}I_i(1)<\infty.
+$$
+
+因此 $\mathcal F$ 非空，且最优值的下确界满足：
+
+$$
+\inf_{S\in\mathcal F}C_{\max}(S)\le B.
+$$
+
+任何 $C_{\max}>B$ 的调度都不会优于上述串行调度，所以只需考虑所有开始与完成
+事件都位于 $[0,B]$ 的调度。
+
+接下来固定线程宽度向量：
+
+$$
+\mathbf t=(t_1,\ldots,t_n)
+\in\{1,\ldots,C\}^n.
+$$
+
+这种向量至多有 $C^n$ 个。每个 expert 有一个开始事件 $S_i$ 和一个完成事件
+$F_i$。固定一个满足 $S_i$ 位于 $F_i$ 之前的合法事件顺序：
+
+$$
+\pi=(\pi_1,\ldots,\pi_{2n}).
+$$
+
+合法事件顺序数量有限，且不超过 $(2n)!$。令对应事件时间为：
+
+$$
+0=e_0\le e_1\le\cdots\le e_{2n}\le B.
+$$
+
+使用非严格不等式允许多个事件同时发生；任意 tied events 都可以按任意顺序
+线性化，它们之间的零长度区间不产生执行进度。
+
+对 $k=0,\ldots,2n-1$，令 $\mathcal A_k$ 表示事件顺序中前 $k$ 个事件发生后
+仍然活跃的 expert 集合。区间 $[e_k,e_{k+1})$ 上的配置固定为：
+
+$$
+\mathcal Z_k
+=\{(i,M_i,t_i)\mid i\in\mathcal A_k\}.
+$$
+
+该区间的 CPU 约束为：
+
+$$
+\sum_{i\in\mathcal A_k}t_i\le C.
+$$
+
+expert $i$ 的完成约束为：
+
+$$
+\sum_{k:\,i\in\mathcal A_k}
+\frac{e_{k+1}-e_k}
+{I_i(t_i)D_i(\mathcal Z_k)}
+=1.
+$$
+
+固定 $\mathbf t$ 和 $\pi$ 后，$I_i(t_i)$、$D_i(\mathcal Z_k)$ 以及每个
+$\mathcal A_k$ 都是常数。因此上述完成约束关于事件时间
+$(e_1,\ldots,e_{2n})$ 是线性等式，事件顺序和时间范围是非严格线性不等式。
+对应可行域 $P_{\mathbf t,\pi}$ 是 $[0,B]^{2n}$ 中闭集，因而闭且有界。根据
+Heine--Borel 定理，$P_{\mathbf t,\pi}$ 是紧集。
+
+在任意非空 $P_{\mathbf t,\pi}$ 上，最后一个事件必为某个完成事件，因此：
+
+$$
+C_{\max}=e_{2n}.
+$$
+
+这是事件时间的连续线性函数。根据 Weierstrass 极值定理，它在每个非空紧集
+$P_{\mathbf t,\pi}$ 上都取得最小值。
+
+最后，线程宽度向量和合法事件顺序都只有有限种。每个原始可行调度在
+$C_{\max}\le B$ 时都对应至少一个 $(\mathbf t,\pi)$ 及其事件时间；同时发生的
+事件由相等的 $e_k$ 表示。因此只需在有限个已取得的子问题最小值中再次取最小，
+该最小值仍由某个具体调度 $S^*$ 取得。故：
+
+$$
+\exists S^*\in\mathcal F:\qquad
+C_{\max}(S^*)
+=\min_{S\in\mathcal F}C_{\max}(S).
+\qquad\square
+$$
+
+该命题不是独立的 MoE 调度定理，而是 Heine--Borel 定理与 Weierstrass 极值定理
+在当前有限事件模型上的推论。证明不要求 $I,D$ 具有解析公式；查表或 cost model
+输出同样适用，只要它们对所有候选配置都有确定的有限正值。最优解存在不表示
+能够在多项式时间内找到，也不表示 $(\widehat I,\widehat D)$ 上的最优解等于真实
+$(I,D)$ 上的最优解。
+
+### 4.3 固定 isolated-time 特例的判定版本
+
+为证明困难度，只需限制到 $D_i\equiv1$。给定整数或经统一缩放后的有理数
+$I_i(t)$ 以及 deadline $L$，定义：
+
+$$
+\textsc{Isolated-Moldable-Schedule}(L):
 \quad
-\text{是否存在可行 }\{s_i,t_i\}\text{ 使 }C_{\max}\le D\text{？}
+\text{是否存在可行 }\{s_i,t_i\}\text{ 使 }C_{\max}\le L\text{？}
 $$
 
-该离散判定版本属于 NP。证书可以包含每个 job 的线程宽度和开始时间。对整数
-duration，任意可行调度都可以在不增加 makespan 的条件下左移为 active
-schedule；每个开始时间为 0，或由某个 precedence/resource blocking job 的
-完成事件确定，因此具有多项式位数的表示。将所有开始、结束事件排序后，活跃
-集合只会在这些有限事件处发生变化，所以 CPU、cumulative resource、
-precedence 和 deadline 约束都能在多项式时间内验证。
+该判定版本属于 NP。证书包含每个 job 的线程宽度和开始时间。固定宽度后，
+duration 为 $I_i(t_i)$；将所有开始和结束事件排序即可在多项式时间内验证 CPU
+容量和 deadline。
 
-### 4.3 由 3-PARTITION 归约
+对一般 active-set slowdown，是否能声称其判定版本属于 NP 取决于
+$D_i(\mathcal Z)$ 的输入表示和求值复杂度。本文只用 $D_i\equiv1$ 的有限有理
+特例证明强 NP-hardness，不对任意黑盒 slowdown 做更强的复杂度类别声明。
+
+### 4.4 由 3-PARTITION 归约
 
 给定一个 `3-PARTITION` 实例：$3m$ 个正整数 $a_1,\ldots,a_{3m}$ 和整数 $B$，
 满足：
@@ -283,27 +444,20 @@ $$
 \sum_{i=1}^{3m}a_i=mB.
 $$
 
-构造如下调度实例：
+构造 $E=3m$ 个 expert task，并令：
 
 $$
-T_{\max}=m,\qquad
-\mathcal R=\varnothing,\qquad
-\mathcal E=\varnothing,
+C=m,\qquad D_i(\mathcal Z)\equiv1,
 $$
 
 $$
-p_i(1)=a_i,
+M_i=a_i,\qquad I(M_i,1)=M_i=a_i,
 \qquad
-p_i(t)=B+1\quad(2\le t\le m),
+I(M_i,t)=B+1\quad(2\le t\le m),
 $$
 
-并令 deadline 为：
-
-$$
-D=B.
-$$
-
-由于任意 $t\ge2$ 都有 $p_i(t)>D$，所有 deadline 内的可行调度都必须选择：
+deadline 为 $L=B$。由于任意 $t\ge2$ 都有 $I_i(t)>L$，所有 deadline 内的
+可行调度都必须选择：
 
 $$
 t_i=1.
@@ -323,19 +477,18 @@ $$
 
 该构造为多项式归约，而 `3-PARTITION` 是强 NP-complete。因此：
 
-- 离散判定版本是强 NP-complete；
-- 原始 makespan 优化版本是强 NP-hard；
-- 固定 processing-time 的最简特例已经具有该困难度；
-- 可变线程宽度、额外 cumulative resources、precedence 和 active-set
-  interference 形成的是更一般的问题，不会消除 NP-hardness。
+- 固定 isolated-time 特例的判定版本是强 NP-complete；
+- 原始 contention-aware makespan 优化问题是强 NP-hard；
+- active-set slowdown、可变线程宽度和更丰富的执行响应不会消除该困难度。
 
 ## 5. Kernel Implementation Variant
 
-Split/no-split 以及未来其他 kernel 版本不属于核心问题变量。一个全局
-implementation variant $v\in\mathcal V$ 只负责生成实例参数：
+Split/no-split 以及未来其他 kernel 版本不属于核心问题变量。固定执行环境中的
+一个全局 implementation variant $v\in\mathcal V$ 会诱导不同的真实响应：
 
 $$
-\Theta_v=\{p_i^{(v)}(t),d_{i,r}^{(v)}(t)\}.
+\Theta_v
+=\{I_i^{(v)}(t),D_i^{(v)}(\mathcal Z)\}.
 $$
 
 对每个 variant 求解同一个调度问题：
@@ -350,9 +503,17 @@ $$
 C^*=\min_{v\in\mathcal V}C^*(v).
 $$
 
-因此 variant 只改变问题实例，不改变问题类型。若两个 variant 在所有相关
-线程宽度上同时具有不更大的时间和资源需求，则被支配的 variant 可以在进入
-planner 前删除。
+因此 variant 只改变真实性能环境，不改变问题类型。若在所有相关线程宽度和
+活跃配置上，variant $v_1$ 都满足：
+
+$$
+I_i^{(v_1)}(t)D_i^{(v_1)}(\mathcal Z)
+\le
+I_i^{(v_2)}(t)D_i^{(v_2)}(\mathcal Z),
+$$
+
+则 $v_2$ 被 $v_1$ 支配，可以在进入 planner 前删除。当前 split/no-split 比较
+尚未证明这种全配置支配关系，因此仍保留为独立校准域。
 
 ## 6. 求解器编码
 
@@ -362,9 +523,18 @@ planner 前删除。
 
 ### 6.2 CP-SAT
 
-CP-SAT 可以为每个 $(i,t)$ 建立 optional interval，并要求每个 expert 恰好
-选择一个线程宽度。CPU 和 LLC 使用 cumulative constraints。CP-SAT 适合作为
-离线、未剪枝问题的 oracle，并返回可行上界和理论下界。
+当 $D_i\equiv1$ 时，CP-SAT 可以为每个 $(i,t)$ 建立 duration 为 $I_i(t)$ 的
+optional interval，并要求每个 expert 恰好选择一个线程宽度；CPU 使用
+cumulative constraint。此编码可作为 isolated fixed-duration 特例的离线
+oracle，并返回可行上界和理论下界。
+
+由于原始问题规定 $D_i(\mathcal Z)\ge1$，该 isolated 特例的最优 makespan
+不大于真实 contention-aware 最优值，因此可以作为有效下界。
+
+一般 $D_i(\mathcal Z)$ 会使 job duration 随执行中的 active set 改变，不能直接
+编码成一个固定 duration interval。要得到 contention-aware exact oracle，必须
+进一步枚举并发 group mode、离散化时间/状态，或使用专门的 event-based search；
+普通 CP-SAT interval 模型本身不是完整原始问题的等价编码。
 
 ### 6.3 MILP
 
@@ -375,57 +545,71 @@ y_{it}\in\{0,1\},\qquad
 \sum_{t=1}^{T_{\max}}y_{it}=1.
 $$
 
-然后线性表示：
+然后在线性 fixed-duration 特例中表示：
 
 $$
 t_i=\sum_t t\,y_{it},\qquad
-p_i=\sum_t p_i(t)y_{it}.
+I_i=\sum_t I_i(t)y_{it}.
 $$
 
-One-hot 是等价求解器编码，不是线程宽度剪枝。
+One-hot 是线程宽度的等价求解器编码，不是剪枝。一般 active-set slowdown 会
+引入状态相关的非线性处理速率，需要额外变量或分段/枚举近似。
 
 ## 7. 当前实现相对原始问题的剪枝
 
 | 层级 | 原始可行域 | 当前限制 | 性质 |
 | --- | --- | --- | --- |
 | 线程宽度 | $1,2,\ldots,T_{\max}$ | `1,2,4,8,16,32` | 离散宽度剪枝 |
-| 并发配置 | 活跃 job 可形成任意宽度组合 | 整次调用使用静态 core shape | static-partition 剪枝 |
-| Shape 集合 | 所有满足容量的整数组合 | profile 支持并经 active 工作集规则筛选的 shape；owner-cache band 当前仅 shadow | 候选剪枝 |
+| 并发配置 | 活跃 job 可形成任意满足 CPU 容量的 $(M_i,t_i)$ 组合 | 整次调用使用静态 core shape | static-partition 剪枝 |
+| Shape 集合 | 所有满足 CPU 容量的整数宽度组合 | profile 支持并经 active 工作集规则筛选的 shape；owner-cache band 当前仅 shadow | 候选剪枝 |
 | Assignment | 任意 expert-to-resource 调度 | 按 isolated cost 的 LPT | 启发式分配 |
 | Ordering | 任意可行开始时间和顺序 | 每个 lane 的 LPT 顺序 | 顺序剪枝 |
-| Idling | 允许主动等待以避开争用 | dependency ready 后立即启动 | non-idling 剪枝 |
-| Kernel variant | 任意未被支配的实现 | 当前 split/no-split profile pair | 实例候选限制 |
-| Processing time | 任意可测的 $p_i(t)$ | active 经验公式；ECM/roofline 仅 shadow | cost 近似，不剪枝可行域 |
+| Idling | 允许主动等待以避开争用 | lane 可启动下一个 expert 时立即启动 | non-idling 剪枝 |
+| Kernel variant | 任意未被支配的实现 | 当前 split/no-split profile pair；packed-B byte-window 仅显式实验，不进入 planner | 实例候选限制 |
+| Isolated time | 真实 $I_i(t)$ | active $T_{\mathrm{iso}}$ 经验公式；分层 GEMM model 仅 shadow | cost 近似，不剪枝可行域 |
+| Contention | 任意动态活跃配置上的真实 $D_i(\mathcal Z)$ | 实测 contention profile 与 stage-aware event simulator | cost 近似，不剪枝可行域 |
 
 当前 `IntervalPlanner` 搜索的是上述剪枝后 plan space 中的方案，不是原始问题
 的全局最优方案。
 
 Amazon 192-core NUMA0 的 schema-v2 profile 已将实测线程域扩展到
-`1,2,4,8,16,32,48,64,96`，但这只扩大 $p_i(t)$ 的校准域。当前 planner 的
+`1,2,4,8,16,32,48,64,96`，但这只扩大 $\widehat I_i(t)$ 的校准域。当前 planner 的
 线程宽度剪枝仍为表中所列的 `1,2,4,8,16,32`；在完成 48/64/96T 的 held-out
 regret 验证前，不自动扩大在线决策空间。
 
 ## 8. 当前 Cost Model 的位置
 
-原始问题使用固定的 $p_i(t)$ 和硬 cumulative resource 约束。当前工程实现还
-使用 stage-aware event simulator，让执行速率依赖并发 active set。令
-$x_i(\tau)\in[0,1]$ 表示 job 完成比例，则该扩展可以写成：
+原始问题中的 $I_i(t)$ 和 $D_i(\mathcal Z)$ 是目标机器上的真实但未知响应。
+Cost model 分别提供估计：
+
+$$
+\widehat I_i(t)\approx I_i(t),
+\qquad
+\widehat D_i(\mathcal Z)\approx D_i(\mathcal Z).
+$$
+
+当前 stage-aware event simulator 使用这两个估计推进 job：
 
 $$
 \frac{dx_i(\tau)}{d\tau}
 =
 \frac{a_i(\tau)}
-{p_i(t_i)D_i(\mathcal A(\tau))},
+{\widehat I_i(t_i)\widehat D_i(\mathcal Z(\tau))},
 \qquad
 x_i(s_i)=0,\quad x_i(f_i)=1.
 $$
+
+因此 cost model 只近似目标函数中的真实性能响应，不改变由 route tasks 和 CPU
+容量定义的原始可行域。
 
 ### 8.1 当前 active isolated model
 
 新生成且携带 `iso_formula` 的 schema-v2 profile 使用：
 
 $$
-p_i(t)=T_{\mathrm{iso}}(R_i,t)=O(t)+C(R_i)\phi_{\mathrm{USL}}(t)k_\phi(t),
+\widehat I_i(t)
+=T_{\mathrm{iso}}(M_i,t)
+=O(t)+C(M_i)\phi_{\mathrm{USL}}(t)k_\phi(t),
 $$
 
 $$
@@ -433,7 +617,7 @@ O(t)=o_0+\frac{o_1}{t},\qquad
 \phi_{\mathrm{USL}}(t)=\frac{1+\alpha(t-1)+\beta t(t-1)}{t}.
 $$
 
-$C(R)$ 是单线程 route-work 的一维实测校准曲线；$O(t)$ 和
+$C(M)$ 是单线程 route-work 的一维实测校准曲线；$O(t)$ 和
 $\phi_{\mathrm{USL}}(t)$ 分别表示固定开销与相对理想 $1/t$ 的线程效率基线，
 $k_\phi(t)$ 是与 route 无关的一维实测校正。M1/M2/M4/M8 与前两个
 M12 panel 的启动/线程效率不同于 steady-state M12 bulk，因此保留小 M 的
@@ -446,34 +630,112 @@ Amazon 192-core NUMA0 的 TP4/TP2/EP4/EP2 split/no-split profile 继续使用同
 公式，`thread_domain` 扩展到 `[1,96]`，并以 48/64/96T 实测点校正
 $k_\phi(t)$；公式形式及小 M residual 组合规则没有改变。
 
-### 8.2 可解释 GEMM ECM shadow model
+### 8.2 实现弱相关的分层 GEMM cost model
 
 简单的 $\max(F/P,Q/B)$ 无法表示当前 BF16 microkernel 的 L1 重复加载、
-BFMMLA 发射、不同 cache 层以及 fused epilogue。新的 `gemm_ecm.py` 因此先对
-W13 和 W2 分别建模，再由 `T_iso` 组合两个 stage 与 gather/scatter。
+矩阵指令发射、不同 cache 层、tail padding 和 fused epilogue；把 M12、BFMMLA
+等细节直接写入核心公式又会使 planner 绑定单个实现。因此 shadow model 使用
+算法工作量、kernel 映射和机器响应三层契约。
 
-令 $\mathcal P(R)$ 为 route 数 $R$ 对应的物理 panel 序列。每个 panel $p$
-分别记录逻辑行 $m_l(p)$、实际计算行 $m_c(p)$、packed-A 占用行 $m_p(p)$ 和
-实际 store 行 $m_s(p)$。例如逻辑 M1 复用 M2 主体：
+对 stage $s$，设问题实例为 $x$，调度决策为 $\sigma_s$，kernel implementation
+为 $\kappa$，目标机器为 $\mu$。完整分解为：
+
+$$
+w_s=\mathcal A_s(x),
+$$
+
+$$
+d_s=\Phi_\kappa(w_s,\sigma_s),
+$$
+
+$$
+\widehat T_s
+=\Psi_{\mu,\kappa}(d_s,\sigma_s)
++O_{\mu,\kappa}(\sigma_s).
+$$
+
+$\mathcal A_s$ 只产生逻辑工作 `LogicalGemmWork`；$\Phi_\kappa$ 是可替换的
+kernel mapper，产生统一 `KernelDemand`；$\Psi_{\mu,\kappa}$ 使用绑定
+`machine_id + implementation_id + active_threads` 的实测
+`MeasuredMachineProfile`。stage 预测组合成 $\widehat I_i(t)$，并可作为
+$\widehat D_i(\mathcal Z)$ 的实现特征；物理 demand 留在 cost-model/profile
+内部或用于候选剪枝。planner 的原始接口不需要知道 M12、SVE 或 BFMMLA。
+
+#### 8.2.1 算法工作量
+
+对 route 数 $M$、hidden size $H$ 和 intermediate size $F$，逻辑 GEMM 为：
+
+$$
+\mathrm{W13}:[M,H][H,2F],
+\qquad F_{13}^{\mathrm{use}}=4MHF,
+$$
+
+$$
+\mathrm{W2}:[M,F][F,H],
+\qquad F_2^{\mathrm{use}}=2MHF.
+$$
+
+当前 BF16 输入/权重、BF16 fused intermediate、FP32 down store 的 compulsory
+one-pass bytes 为：
+
+$$
+Q_{13}^{\min}=2MH+4HF+2MF,
+$$
+
+$$
+Q_2^{\min}=2MF+2FH+4MH.
+$$
+
+给定机器理论上界 $P_\mu^{\mathrm{peak}}$ 和
+$B_\mu^{\mathrm{peak}}$，算法层可以给出条件下界：
+
+$$
+T_s^{\mathrm{LB}}
+=\max\left(
+\frac{F_s^{\mathrm{use}}}{P_\mu^{\mathrm{peak}}},
+\frac{Q_s^{\min}}{B_\mu^{\mathrm{peak}}}
+\right).
+$$
+
+这些是算法可解释的有用 FLOPs 和至少读写一次所有逻辑 tensor 的下界，不是
+实际 cache 流量；$T_s^{\mathrm{LB}}$ 也只是理论下界，不直接作为运行时间预测。
+算法层不包含线程数、N tile、M panel、padding 或 split；因此不满足某个 kernel
+对齐要求的逻辑 shape 仍是合法问题实例，只可能在特定 mapper lowering 时被拒绝。
+
+#### 8.2.2 Kernel 执行映射
+
+统一的实现需求向量写作：
+
+$$
+d_s=\left(
+F_s^{\mathrm{exec}},I_s,
+Q_{L1,s},Q_{\mathrm{private},s},Q_{\mathrm{shared},s},
+E_s,W_s,N_{\mathrm{call},s},N_{\mathrm{range},s}
+\right).
+$$
+
+其中包含实际执行 FLOPs、关键指令、各层流量、epilogue 元素、瞬时工作集、
+调用/range 次数和 busiest-thread balanced work。M12 换成其他 tile、SVE 换成
+NEON 或改变 tail 规则时，只替换 $\Phi_\kappa$，不修改算法公式或 planner。
+
+当前 `SveBf16KernelProfile` 令 $\mathcal P(M)$ 为物理 panel 序列，每个 panel
+$p$ 分别记录逻辑行 $m_l(p)$、实际计算行 $m_c(p)$、packed-A 行 $m_p(p)$ 和
+store 行 $m_s(p)$。例如 M1 复用 M2 主体：
 
 $$
 (m_l,m_c,m_p,m_s)=(1,2,8,1).
 $$
 
-逻辑尾部 9--11 统一 pad 到 M12。设 SVE vector 为 $V$ bytes，BF16 N tile
-$\nu=V/2$，某 stage 的 N tile 数 $q=N/\nu$。由当前 asm 可直接得到每个 panel
-的关键指令数：
+逻辑尾部 9--11 pad 到 M12。设 SVE vector 为 $V$ bytes，BF16 N tile
+$\nu=V/2$，tile 数 $q=N/\nu$，则当前 asm mapper 产生：
 
 $$
 I_{\mathrm{BFMMLA}}(p)=\frac{m_c(p)Kq}{2},
 \qquad
 I_A(p)=\frac{m_c(p)Kq}{8},
 \qquad
-I_B(p)=Kq.
+I_B(p)=Kq,
 $$
-
-其中每条 BFMMLA 完成 $2V$ FLOPs，A load 每次读取 16 bytes，B load 每次
-读取 $V$ bytes。因此 L1 流量为：
 
 $$
 Q_{L1,A}=16\sum_p I_A(p),
@@ -481,72 +743,106 @@ Q_{L1,A}=16\sum_p I_A(p),
 Q_{L1,B}=V\sum_p I_B(p).
 $$
 
-设 W13/W2 顺序 N range 集合为 $\mathcal C$，第 $j$ 个 range 包含 $q_j$
-个 tile。当前保守的 shared-cache 口径为：
+若顺序 N range $j$ 有 $q_j$ 个 tile，当前实现的保守 shared-cache 映射为：
 
 $$
 Q_{\mathrm{shared},A}
-=2K\sum_p m_c(p)\sum_{j\in\mathcal C}\min(t,q_j),
+=2K\sum_p m_c(p)\sum_j\min(t,q_j),
 $$
 
 $$
 Q_{\mathrm{shared},B}=2KNP,
+\qquad P=|\mathcal P(M)|.
 $$
 
-其中 $P=|\mathcal P(R)|$。N owners 合起来仍只覆盖完整 B 一次，但每个活跃
-owner/range 至少从 shared cache 取得一次 A panel；后续 N tile 对同一 A 的
-访问只计入 L1 层。若 PMU 证明 A 跨 range 保留在 private cache，则只修正
-$Q_{\mathrm{shared},A}$，asm 指令计数不变。
+split/no-split 是传给 mapper 的通用 $\sigma_s$，不是算法语义或核心公式中的特殊
+分支。当前 SVE mapper 中，split 不改变 BFMMLA、L1 A/B、aggregate B 或 C，
+但改变 range 次数、瞬时 weight 工作集，并在保守口径下增加 shared-A scan。
 
-对每个 GEMM stage，ECM shadow 公式为：
+#### 8.2.3 实测机器响应
+
+当前 ECM response 使用：
 
 $$
 T_{\mathrm{body}}
 =\max\left(
-T_{\mathrm{BFMMLA}},
-T_{\mathrm{frontend}},
-T_{L1\text{-load}}+T_{\mathrm{private}}+T_{\mathrm{shared}}
+\frac{F_s^{\mathrm{bal}}}{P_{\mu,\kappa}(t)},
+\frac{I_s^{\mathrm{bal}}}{R_{\mu,\kappa}(t)},
+\frac{Q_{L1,s}^{\mathrm{bal}}}{B_{L1,\mu,\kappa}(t)}
++\frac{Q_{\mathrm{private},s}}{B_{\mathrm{private},\mu,\kappa}(t)}
++\frac{Q_{\mathrm{shared},s}}{B_{\mathrm{shared},\mu,\kappa}(t)}
 \right),
 $$
 
 $$
-T_{\mathrm{stage}}
-=T_{\mathrm{fixed}}+cT_{\mathrm{range}}
-+T_{\mathrm{body}}+T_{\mathrm{epilogue}}.
+\widehat T_s
+=O_{\mathrm{stage}}+N_{\mathrm{range},s}O_{\mathrm{range}}
++T_{\mathrm{body}}
++\frac{E_s^{\mathrm{bal}}}{R_{\mathrm{epi},\mu,\kappa}(t)}.
 $$
 
-各项分别由独立测得的 BFMMLA、frontend/load、private/shared cache 和
-epilogue service rate 提供。N tile 不能整除线程数时，模型使用 busiest
-thread work 乘 active thread 数形成 balanced-equivalent work，从而保留
-N-split load imbalance。
+所有 service rate 和固定开销必须由目标机器上该 implementation/thread width 的
+独立 microbenchmark、PMU 或明确的 stage pair 测量得到。只观察一个 stage
+latency 只能得到 $F/\Delta T$、$Q/\Delta T$ 等同一时间的等价 required rate，
+不能同时识别计算、L1 和 shared-cache ceiling。
 
-单独观察一个 stage latency 仍只能得到同一时间的等价 required rates：
-
-$$
-P_{\mathrm{req}}=F/\Delta T,
-\qquad
-B_{L1,\mathrm{req}}=Q_{L1}/\Delta T,
-\qquad
-B_{\mathrm{shared},\mathrm{req}}=Q_{\mathrm{shared}}/\Delta T.
-$$
-
-这些不是相互独立的硬件 ceiling。纯 BFMMLA、各 cache 层和 epilogue 必须由
-独立 microbench/PMU 校准。`tiso_roofline.py` 保留为简化 baseline，
-`gemm_ecm.py` 是新的分层 shadow；二者均不替换 planner active cost。
-
-W13 split 不改变 BFMMLA、L1 A/B、aggregate B 或 C；它改变瞬时 weight
-工作集、range-launch overhead，并在上述保守口径下增加 shared-A scan。
-split/no-split 因此仍是不同的校准域。完整公式和 V3 留出验证见
-`cost_model/GEMM_ECM_VALIDATION.md`。
+`gemm_cost_model.py` 实现通用契约和机器响应，`sve_bf16_kernel_model.py` 实现
+当前 SVE mapper，`gemm_ecm.py` 保留原 CLI/API facade 与诊断报告。该路径仍是
+shadow，不替换 active $T_{\mathrm{iso}}$。V3 steady-M12 留出误差低于 1.7%，
+但只验证同 shape 的 panel 线性，尚未证明跨 shape/kernel/machine 的可迁移性；
+完整限制见 `cost_model/GEMM_ECM_VALIDATION.md`。
 
 ### 8.3 Split-W13 owner-cache 工作集 band
 
-当前 SVE split 路径将 W13 分为两个相等 N range。对 BF16 的 $H,F$，每个
-W13 range 与 W2 的 packed weight stage 都是：
+当前 production 默认仍将 W13 分为两个相等 N range，而 W2 使用一个 range。
+对 BF16 的 $H,F$，三个顺序 packed-weight stage 都是：
 
 $$
-S=2HF\quad\text{bytes}.
+S_0=2HF\quad\text{bytes}.
 $$
+
+SVE fused expert 另提供显式 packed-B byte-window variant。设 stage $s$ 的 packed
+维度为 $(K_s,N_s)$，BF16 N tile 为 $\nu$，总 tile 数和单 tile 字节数为：
+
+$$
+q_s=\frac{N_s}{\nu},\qquad b_s=2K_s\nu.
+$$
+
+给定目标 $S_{\mathrm{target}}>0$，实现选择：
+
+$$
+u_s=\max\left(1,\left\lfloor\frac{S_{\mathrm{target}}}{b_s}\right\rfloor\right),
+\qquad
+r_s=\left\lceil\frac{q_s}{u_s}\right\rceil,
+$$
+
+再将完整 N tiles 均匀分配给 $r_s$ 个顺序 range。最大实际 range 为：
+
+$$
+\widehat S_s
+=2K_s\nu\left\lceil\frac{q_s}{r_s}\right\rceil.
+$$
+
+当 $S_{\mathrm{target}}\ge b_s$ 时有
+$\widehat S_s\le S_{\mathrm{target}}$；否则最小粒度是一个 N tile，实际 range
+会大于目标。W13 使用 $(K,N)=(H,2F)$，W2 使用 $(F,H)$。例如 TP4
+$H=4096,F=512,\nu=8$ 时，legacy 4 MiB stage 的 W13/W2 range 数为 $2/1$，
+2 MiB 为 $4/2$，1 MiB 为 $8/4$。
+
+每个 range 内仍对 N tiles 做现有线程切分，因此单 range 的有效线程上界为：
+
+$$
+t_{\mathrm{active},s}
+\le
+\min\left(t,\left\lceil\frac{q_s}{r_s}\right\rceil\right).
+$$
+
+更小窗口不改变 GEMM useful/executed FLOPs、aggregate BFMMLA 或 aggregate packed-B
+读取，只增加 range dispatch，并在 8.2 的保守模型中增加 shared-A range scan。
+相邻 range 之间没有 barrier；不同 worker 可以短暂处于相邻 range，因此
+$\widehat S_s$ 是 loop-order 的 nominal active window，不是同步保证的硬 cache
+residency 上界。W2 owner-scatter 必须按每个 range 复用相同的 discontiguous N
+ownership，才能继续消除 W2-to-scatter barrier。
 
 N-split 中每个 worker 持有互不重叠的 packed-B column slice，因此决定首次
 容量拐点的是 owner-private cache，而不是只看 shared LLC。设可用核心数为
@@ -577,12 +873,12 @@ n_{\min}=\left\lceil-n_s\ln(1-u)\right\rceil.
 $$
 
 因此可解释的工作集候选 band 是
-$n\in[n_{\min},n_{\max}]$。对 band 内 shape $sigma$，令完整 measurement
+$n\in[n_{\min},n_{\max}]$。对 band 内 shape $\sigma$，令完整 measurement
 window 中 lane $l$ 有 $k_l$ 个 expert，使用：
 
 $$
-T_{\mathrm{iso-call}}(R,\sigma)
-=\max_l k_lT_{\mathrm{iso}}(R,t_l).
+T_{\mathrm{iso-call}}(M,\sigma)
+=\max_l k_lT_{\mathrm{iso}}(M,t_l).
 $$
 
 先保留不超过 band 内最佳 isolated makespan $(1+\epsilon)$ 的 shape，再选
@@ -591,12 +887,20 @@ physical M12 panel 数不少于 16 的长 route 生效，并且仍是 shadow val
 尚未改变 production planner 的 shape 可行域。完整实验见
 `cost_model/WORKING_SET_MODEL_VALIDATION.md`。
 
-这是 **scheduling with interference** 扩展，经典固定 processing-time 的近似
-保证不再直接成立。推荐的求解分层是：
+owner-cache band 是对 $\widehat D_i(\mathcal Z)$ 和候选空间的实现相关近似，
+不是 LLC 硬可行性约束。推荐的求解分层是：
 
-1. 使用硬 CPU/LLC 约束的 CP-SAT 生成离线 oracle 或候选；
-2. 使用 event simulator 对少量候选重新评分；
-3. 在线 planner 使用经 oracle 验证过的剪枝和低开销启发式。
+1. 使用只有 CPU 容量、$D_i\equiv1$ 的 CP-SAT 生成 isolated lower bound 和候选；
+2. 使用 owner-cache band 等规则缩小需要评估的 active configurations；
+3. 使用 contention-aware event simulator 对候选重新评分；
+4. 在线 planner 使用经真实 runtime regret 验证过的低开销启发式。
+
+当前 active profile 与 planner policy identity 只覆盖 legacy split/no-split；显式
+`weight_window_bytes` 不进入 production candidate set。若未来自动选择 1/2 MiB 等
+窗口，必须把目标字节数、W13/W2 实际 range 数加入 profile identity，重新测量
+$I^{(v)}$ 与 $D^{(v)}$，并对 route/thread/active-expert holdout 做 runtime regret
+验证。特别是单个 M12 panel 不复用 B，额外 range 通常只有 dispatch 和 lane-width
+代价，不应仅按 cache 容量规则强制细分。
 
 ## 9. 剪枝验证
 
@@ -617,6 +921,11 @@ $$
 - 相对 oracle 的实际 regret；
 - oracle 未证明最优时，由 $LB$ 得到的保守 regret 上界；
 - 在真实 event simulator/runtime 上的 held-out regret。
+
+性能近似还必须分层验证：$\widehat I$ 报告未见 route/thread 的时间误差和排序
+误差；$\widehat D$ 报告未见同构及异构 active configuration 的 slowdown 误差；
+最终 planner 报告在真实 runtime 上的 schedule regret。单独证明 isolated table
+准确，不能证明 contention-aware planner 准确。
 
 ### 9.1 Amazon 192-core NUMA0 扩展校准
 
@@ -658,6 +967,21 @@ route 1020/2040 实测最优也均为 4 MiB，regret 都是 0.00%。独立 scan 
 N-split owner-private residency。该交叉验证只支持 split 路径；no-split 不在
 本公式和验证范围内。
 
+上述留出只验证 legacy 4/16 MiB-equivalent stage。新增 byte-window variant 的
+首轮 NUMA0 验证固定总线程为 96、TP4 shape、每专家 route 2040：`24x4T` 的
+4/2/1 MiB 时间为 30.55/32.14/36.73 ms，`48x2T` 为
+85.90/61.72/65.79 ms，`96x1T` 为 310.61/179.36/133.12 ms。逆序复测保持同一
+排序。三个 schedule 的最优点分别为 4/2/1 MiB，等价于约 1 MiB packed B / active
+worker，同时 nominal aggregate window 都约为 96 MiB；因此当前实验尚不能独立
+识别 private-L2 与 aggregate-cache 两种作用。
+
+该结果证明 byte window 必须作为 kernel/schedule 联合维度，而不能把 1 MiB 或
+2 MiB 设成全局默认值。production planner 仍不得用 legacy profile 按 nominal
+footprint 外推该 variant；需要把 window 加入 profile identity，并补齐相同
+`(shape, route, threads, concurrent experts)` 下的 isolated/contention 样本后才能
+进入 candidate set。原始数据见
+`optimizations/fused_moe_sve/results/amazon_192c_weight_windows.md`。
+
 ## 10. 同步规则
 
 发生以下任一变化时，必须同步更新本文档：
@@ -665,7 +989,8 @@ N-split owner-private residency。该交叉验证只支持 split 路径；no-spl
 - job 粒度从 expert 改为 phase，或反向合并；
 - 线程宽度定义、最大线程数或可行宽度集合变化；
 - 是否允许抢占、迁移、动态调整线程数或主动 idling；
-- CPU、LLC、L3/DRAM 带宽等资源约束变化；
+- CPU 核心硬约束、affinity 或其他真正可执行性约束变化；
+- $I_i(t)$、$D_i(\mathcal Z)$ 的定义或 active configuration 状态发生变化；
 - rank-local 与跨 rank 资源耦合方式变化；
 - 目标函数加入或移除 planning、dispatch、communication、scatter、combine；
 - kernel variant 从全局选择改为 per-expert 选择；
@@ -695,3 +1020,7 @@ N-split owner-private residency。该交叉验证只支持 split 路径；no-spl
 | 2026-07-14 | v0.10 | 将 GEMM shadow 扩展为 microkernel-aware ECM：区分逻辑/计算/packed/store 行，按 asm 统计 BFMMLA 与 A/B loads，分离 L1/private/shared-cache 和 epilogue，并记录 V3 长 route 留出验证。 |
 | 2026-07-14 | v0.11 | 在 192-core Neoverse-V3 NUMA0 上生成 TP4/TP2/EP4/EP2 split/no-split 的 96T schema-v2 校准；保持 active $T_{\mathrm{iso}}$ 公式和 production 线程剪枝不变，并记录 64-expert route-2040 full-call cliff。 |
 | 2026-07-15 | v0.12 | 增加 split-W13 owner-cache 工作集 shadow：由独立 stream 饱和度给出并发下界，由 N-split 每核 L2 way budget 给出容量上界，再用 $T_{\mathrm{iso}}$ headroom 选择最小稳健工作集；记录 V3 PMU、route 1020/2040 留出结果及短 route 失效边界。 |
+| 2026-07-15 | v0.13 | 将 GEMM shadow 重构为实现弱相关三层模型：算法层定义 useful work/compulsory traffic，kernel mapper 产生统一 physical demand，目标机器实测 profile 提供 service response；SVE M12 细节移出通用核心，active planner 与剪枝不变。 |
+| 2026-07-15 | v0.14 | 将原始问题改为 256-expert route-task 实例对应的问题族：CPU 核心数是基础硬约束，真实 isolated time $I_i(t)$ 与动态 contention slowdown $D_i(\mathcal Z)$ 定义执行速率；LLC/带宽从硬 cumulative constraint 降为 slowdown/candidate-pruning 因素，并同步复杂度、solver 边界、剪枝表和验证要求。 |
+| 2026-07-15 | v0.15 | 增加最优解存在性命题：由串行调度得到有限 horizon，将固定线程宽度与事件顺序的子问题表示为紧线性可行域，再由 Heine--Borel 和 Weierstrass 极值定理证明全局最小 makespan 必然取得；同时明确 $I,D$ 必须在所有候选配置上有限且为正。 |
+| 2026-07-16 | v0.16 | 增加显式 packed-B byte-window kernel variant：按 SVE N tile 推导 W13/W2 range 数、实际最大窗口和有效线程上界；明确 range 间无 barrier、owner-scatter ownership、M12 短 route 边界，以及该 variant 在重新校准前不进入 production planner。 |

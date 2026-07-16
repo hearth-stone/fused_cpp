@@ -1,7 +1,188 @@
-# Elastic SVE fused GEMM experiment
+# SVE fused MoE experiments
 
-This directory contains a standalone experiment. It does not change the fused
+This directory contains standalone experiments. They do not change the fused
 MoE API or default dispatch.
+
+## Explicit unfused pipeline reference
+
+`bench_unfused_pipeline` measures the full fusion boundary with the production
+M12 SVE assembly body held constant. Its explicit baseline executes:
+
+1. route extraction to a BF16 row-major tensor;
+2. M12 pack-A;
+3. W1 GEMM to FP32;
+4. standalone poly5 + exact-division SiLU to FP32;
+5. W3 GEMM to FP32;
+6. standalone multiply and BF16 materialization;
+7. a second M12 pack-A;
+8. W2 GEMM with BF16 output.
+
+The control directly gather-packs input, calls the production fused
+`moe_sve_w13_silu_poly5_packc_m12_rows_opt` entrypoint, then calls the same W2
+BF16 entrypoint as the baseline. W1, W3, fused W13, and W2 all use the same
+`M12_K4_BODY`; only the dataflow and epilogues differ. Buffers are preallocated,
+weights are distinct per expert and per rotating copy, and no allocator work is
+inside the measured region. The experiment covers expert compute through W2
+output and deliberately excludes route-weight accumulation/scatter.
+Warmups consume the first copies and timed iterations continue from that
+offset, so `copies >= warmup + iters` guarantees no copy reuse.
+
+The default shape models EP2 (`H=4096`, `F=2048`) with four concurrent experts,
+24 threads per expert, and the current two-range split-W13 policy:
+
+```bash
+numactl --cpunodebind=0 --membind=0 taskset -c 0-95 \
+  optimizations/fused_moe_sve/benchmarks/bench_unfused_pipeline \
+  --experts 4 --m 2040 --h 4096 --f 2048 \
+  --threads-per-expert 24 --w13-ranges 2 --copies 2
+```
+
+The default `--variant both` alternates execution order for direct timing
+comparisons. Use `--variant unfused` or `--variant fused` to isolate one path
+when collecting external profiler or PMU counters.
+
+## Single-core weight-window experiment
+
+`bench_single_core_weight_window` calls the production
+`moe_sve_w2_packed_bf16_m12` entrypoint directly on one pinned core. It keeps
+M and K fixed while increasing N, so one packed-B weight is exactly
+`K * N * sizeof(bf16)` bytes. Every warmup and measured invocation uses a
+different packed-B address and value. The used weights are followed by a
+configurable cold-tail allocation that is first-touched after them, preventing
+initialization from leaving the measured weights resident. Immediately before
+the profiler boundary, the benchmark reads one element from every cold-tail
+cache line; streaming stores therefore cannot bypass the intended eviction.
+
+The companion runner waits until all allocation and first-touch work is done,
+attaches `perf` to the stopped process, and then resumes only the GEMM region:
+
+```bash
+.venv/bin/python \
+  optimizations/fused_moe_sve/benchmarks/run_single_core_weight_window.py \
+  --m 120 --k 4096 --cpu 48 --numa-node 0 \
+  --warmup 2 --runs 7 --cold-tail-mib 192 \
+  --output-json /tmp/single_core_weight_window.json
+```
+
+Use `--extra-events` to append machine-specific PMU or software events without
+changing the default cache-counter set, for example:
+
+```bash
+--extra-events l1d_tlb,l1d_tlb_refill,l2d_tlb_refill,page-faults
+```
+
+Inter-invocation packed-B reuse is prohibited by construction. Reuse of the
+same B by the ten M12 panels inside one `M=120` GEMM is intentional: that is
+the behavior used to expose the private-L2 and shared-LLC residency windows.
+
+## M12 LLC-pollution experiment
+
+`bench_m12_llc_pollution` separates packed-B residency from simultaneous DRAM
+bandwidth contention. On one pinned core it promotes a configurable victim
+buffer with a randomized dependent cache-line traversal, executes distinct
+M12 polluter experts, and then immediately probes the victim again. Each
+polluter uses the production fused M12 W13 SiLU/multiply/packC kernel followed
+by the production M12 W2 kernel, with two 4 MiB W13 ranges and one 4 MiB W2
+matrix. Different trials use distinct victim and polluter addresses.
+
+`--polluter-panels 1` models a route-12 expert that reads each B line once.
+Larger values repeatedly use the same 12 MiB weight and model the cache
+promotion performed by a longer route. The victim is a latency-sensitive
+residency probe rather than a GEMM, so instruction throughput cannot hide LLC
+eviction.
+
+```bash
+numactl --cpunodebind=0 --membind=0 \
+  optimizations/fused_moe_sve/benchmarks/bench_m12_llc_pollution \
+  --victim-mib 64 --polluter-experts 8 --polluter-panels 1 \
+  --trials 9 --evict-mib 192 --cpu 48
+```
+
+## Threaded split-W13 working-set experiment
+
+`run_thread_weight_working_set.py` drives the production-fused path of
+`bench_unfused_pipeline` with several thread mappings:
+
+- `nsplit`: one active expert uses T threads, each owning an N stripe;
+- `expert-fixed` / `expert-total`: T one-thread experts execute concurrently,
+  with either fixed per-expert weight size or approximately fixed aggregate
+  active weight size;
+- `team-fixed-route`: a fixed total thread budget is divided among several
+  multi-thread expert teams while route count per expert remains fixed;
+- `team-fixed-work`: the same team shapes are used while total route count and
+  total GEMM FLOPs remain fixed.
+
+All modes use two W13 ranges. The instantaneous packed-B working set is
+`active_experts * max(W13_chunk_bytes, W2_bytes)`. The runner also records the
+largest per-thread N stripe, full wall time, aggregate TFLOP/s, and W13/W2 stage
+times. Each invocation uses a distinct weight copy.
+
+```bash
+numactl --cpunodebind=0 --membind=0 taskset -c 0-95 \
+  .venv/bin/python \
+  optimizations/fused_moe_sve/benchmarks/run_thread_weight_working_set.py \
+  --output /tmp/split_w13_thread_working_set.json \
+  --threads 1,2,4,8,16,32,64,96 --routes 192,2040 \
+  --experiments nsplit,expert-fixed,expert-total \
+  --nsplit-stage-mib 4,16,64 --expert-stage-mib 0.5,2 \
+  --total-stage-mib 32,64,96 --warmup 2 --runs 7
+```
+
+To compare one highly threaded expert with several multi-thread experts under
+the same 96-thread budget:
+
+```bash
+numactl --cpunodebind=0 --membind=0 taskset -c 0-95 \
+  .venv/bin/python \
+  optimizations/fused_moe_sve/benchmarks/run_thread_weight_working_set.py \
+  --output /tmp/split_w13_expert_team.json \
+  --experiments team-fixed-route,team-fixed-work \
+  --team-experts 1,2,3,4,6,8,12 --team-total-threads 96 \
+  --team-route 2040 --team-total-routes 2304 \
+  --team-stage-mib 16 --warmup 2 --runs 7
+```
+
+## Fixed-active-B route-fragmentation experiment
+
+`bench_fragmented_route_pipeline` tests whether route fragmentation matters
+when total FLOPs, worker count, and the maximum simultaneously active packed-B
+stage are fixed. Twenty-four four-thread teams each execute 2040 total routes.
+Replacing one long expert creates `Q` independent experts of `2040/Q` routes,
+so expert-task and unique-weight counts grow while at most 24 experts remain
+active. The default dynamic schedule starts long routes first and lets any free
+four-thread team claim the next task. `--schedule slot` keeps replacement tasks
+on their original team as a no-rebalancing control. Split factors must produce
+M12-aligned routes; the default factors `2,5,10` produce routes `1020,408,204`.
+
+```bash
+numactl --cpunodebind=0 --membind=0 taskset -c 0-95 \
+  .venv/bin/python \
+  optimizations/fused_moe_sve/benchmarks/run_fragmented_route_pipeline.py \
+  --output /tmp/split_w13_fixed_active_b_fragmentation.json \
+  --teams 24 --base-routes 2040 --hidden 4096 --intermediate 512 \
+  --threads-per-team 4 --schedule dynamic --split-factors 1,2,5,10 \
+  --replaced-teams 6,12,24 --warmup 2 --runs 7
+```
+
+The benchmark uses distinct packed weights for every logical expert task and a
+different complete data copy for every warmup and timed invocation. Its E2E
+region covers gather-pack, fused W13, and BF16 W2, including per-task team
+barriers, but excludes planner, scatter, and route-weight accumulation.
+
+To attach perf only after allocation, weight initialization, and worker-pool
+creation, use the profiler runner. It stops the initialized process, attaches
+to all pinned worker TIDs, and excludes the main thread:
+
+```bash
+.venv/bin/python \
+  optimizations/fused_moe_sve/benchmarks/profile_fragmented_route_pipeline.py \
+  --output /tmp/fixed_active_b_fragmentation_perf.json \
+  --teams 24 --base-routes 2040 --hidden 4096 --intermediate 512 \
+  --threads-per-team 4 --schedule dynamic --split-factors 1,2,5,10 \
+  --cpu-start 0 --numa-node 0 --warmup 2 --runs 7 --repeats 3
+```
+
+## Elastic N-split experiment
 
 The experiment invokes the production `moe_sve_*_m12` assembly symbols with
 three scheduling variants:
@@ -47,3 +228,66 @@ numactl --cpunodebind=0 --membind=0 taskset -c 0-95 \
 
 The measured 192-core-host NUMA0 results are recorded in
 [`results/amazon_192c_numa0.md`](results/amazon_192c_numa0.md).
+
+The controlled full-pipeline fusion comparison is recorded in
+[`results/amazon_192c_unfused_pipeline.md`](results/amazon_192c_unfused_pipeline.md).
+
+The unique-weight single-core cache-window measurements are recorded in
+[`results/amazon_192c_single_core_weight_window.md`](results/amazon_192c_single_core_weight_window.md).
+
+## Configurable packed-B windows
+
+The production fused SVE expert accepts `weight_window_bytes` on the normal,
+scheduled, and async entrypoints. `None` reads
+`FUSED_CPP_MOE_WEIGHT_WINDOW_BYTES`, zero keeps the existing policy (two W13
+ranges and one W2 range when split-W13 is enabled), and a positive value limits
+the nominal packed-B bytes in every sequential W13 and W2 N range.
+
+For a GEMM with packed dimensions `(K, N)` and SVE BF16 N tile `v`, one packed-B
+tile contains `2*K*v` bytes. The implementation computes
+
+```text
+max_tiles = max(1, floor(weight_window_bytes / (2*K*v)))
+ranges = ceil((N/v) / max_tiles)
+```
+
+and balances whole N tiles across those ranges. Therefore a target smaller than
+one packed-B tile rounds up to one tile. For TP4 `H=4096, F=512`, the current
+4 MiB stage corresponds to W13/W2 range counts `2/1`; 2 MiB gives `4/2`, and
+1 MiB gives `8/4`.
+
+Each range still uses the existing N-split team and the same assembly kernel.
+There is no barrier between adjacent ranges. W2 owner-scatter mirrors every
+window's potentially discontiguous column ownership, so the existing
+W2-to-scatter barrier remains elided. Consequently the byte target is a loop
+ordering and nominal active-range bound, not a strict synchronized cache
+residency limit. A smaller range also caps useful team width at its N-tile
+count; the planner must account for this before selecting very small windows.
+
+The current planner does not choose this experimental variant automatically.
+Old split/no-split profiles describe only the 4 MiB-equivalent policy and must
+not be reused to score 1/2 MiB windows. Compare explicit sizes with:
+
+```bash
+numactl --cpunodebind=0 --membind=0 taskset -c 0-95 \
+  .venv/bin/python \
+  optimizations/fused_moe_sve/benchmarks/bench_weight_windows.py \
+  --experts 24 --routes 2040 --hidden 4096 --intermediate 512 \
+  --threads-per-expert 4 --window-mib 0,4,2,1 --warmup 3 --runs 9
+```
+
+The 192-core NUMA0 measurements are recorded in
+[`results/amazon_192c_weight_windows.md`](results/amazon_192c_weight_windows.md).
+For the tested TP4 shape, the best windows were 4/2/1 MiB for 4/2/1 threads per
+expert respectively. This is consistent with about 1 MiB of packed B per
+active worker, but the private-L2 and aggregate-cache effects remain
+confounded; treat it as a measured selection rule, not a universal constant.
+
+The split-W13 thread/weight mapping measurements are recorded in
+[`results/amazon_192c_thread_weight_working_set.md`](results/amazon_192c_thread_weight_working_set.md).
+
+The fixed-active-B route-fragmentation measurements are recorded in
+[`results/amazon_192c_fixed_active_b_fragmentation.md`](results/amazon_192c_fixed_active_b_fragmentation.md).
+
+The M12 streaming-weight LLC-pollution measurements are recorded in
+[`results/amazon_192c_m12_llc_pollution.md`](results/amazon_192c_m12_llc_pollution.md).

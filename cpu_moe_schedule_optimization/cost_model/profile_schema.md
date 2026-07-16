@@ -7,6 +7,12 @@ is valid only for the exact kernel policy, sharded expert shape, and NUMA/rank
 execution context recorded in the file. In particular, split-W13 and non-split
 profiles are different calibration domains.
 
+The experimental `weight_window_bytes` operator option is not represented by
+the current schema and therefore must be zero/unset when generating or using a
+schema-v2 profile. Before profiles for configurable W13/W2 windows become
+planner candidates, the requested byte target and both actual range counts
+must be added to kernel identity rather than inferred from `w13_split_chunks`.
+
 ```json
 {
   "schema_version": 2,
@@ -158,15 +164,23 @@ not independently measured ceilings. A future active profile must serialize
 pure W13/W2 compute ceilings, L3 bandwidth, copy bandwidth, and fixed/tail
 residuals separately before using the roofline prediction path.
 
-### Microkernel-aware GEMM ECM shadow report
+### Layered GEMM cost shadow report
 
-`gemm_ecm.py` emits a separate schema-v1 diagnostic with kind
+`gemm_ecm.py` emits a separate schema-v2 diagnostic with kind
 `sve_bf16_gemm_ecm_shadow`. It is not consumed by `ContentionCostModel`.
 
-The report records the actual SVE N tile and W13 range count, exact M12/M8/M4/M2
-BFMMLA and A/B load counts, logical/compute/packed/store tail rows, L1 traffic,
-and the current shared-cache traffic convention. Stage observations expose the
-following equivalent lower-bound views of one measured M12 panel slope:
+`model_layers` serializes the three contracts used by the shadow path:
+
+- `algorithm`: `LogicalGemmWork`, useful FLOPs, compulsory one-pass bytes, and
+  the W13-to-W2 dependency;
+- `implementation`: the `KernelDemand` mapper identity and formula;
+- `machine_response`: the measured-profile identity and response formula.
+
+The legacy `kernel` section remains for report compatibility and records the
+actual SVE N tile and W13 range count, exact M12/M8/M4/M2 BFMMLA and A/B load
+counts, logical/compute/packed/store tail rows, L1 traffic, and the current
+shared-cache traffic convention. Stage observations expose the following
+equivalent lower-bound views of one measured M12 panel slope:
 
 - required executed TFLOP/s and BFMMLA instruction/s;
 - required balanced L1 load GB/s;

@@ -4,7 +4,7 @@
 
 本目录用于研究和实现 **CPU 上 MoE 推理的 cost-aware runtime scheduler**。
 
-目标不是先改 kernel，而是先把 MoE expert 执行抽象成一个可测、可搜索、可复现的调度问题：给定路由后的 expert token 负载、CPU 可用核心数和已有的 `T(length, threads)` 运行时间模型，生成一个使 **规划时间 + 执行时间** 最小的 plan。
+目标不是先改 kernel，而是先把 MoE expert 执行抽象成一个可测、可搜索、可复现的调度问题：给定路由后的 expert tasks、CPU 可用核心数、isolated time 和 active-set contention slowdown，生成一个使 **规划时间 + 执行时间** 最小的 plan。
 
 当前阶段仅建立研究文档和工程边界。
 
@@ -14,6 +14,11 @@ Schema v2 路径按完整策略选择表：`TP/EP degree + H/F + global/local
 experts + SVE tile + split-W13 + NUMA/CPU set + LLC + source/binary hash`。
 split/no-split 不再共用 derate，也不跨 F 或拓扑做隐式 nearest-profile
 fallback。
+
+`weight_window_bytes` 是 2026-07-16 加入的显式 SVE kernel experiment，可将
+W13 和 W2 都细分为更小的 packed-B N-range。当前 planner 不输出这个 option，
+也不会用旧 split-W13 profile 对 1/2 MiB 窗口评分；自动选择前需要把窗口大小
+加入 policy identity 并重新生成 isolated/contention 表。
 
 当前实现入口：
 
@@ -98,7 +103,7 @@ T_plan(plan) + T_execute(plan)
    runtime 可以同时评估多类 plan：uniform、load-proportional、greedy、heavy/light hybrid、exact DP/MILP、fallback global pool 等，再把规划成本也计入目标函数。
 
 4. **先做可测模型，再做调度策略**  
-   所有调度策略必须基于本机 profiling 得到的 `T(length, threads)` 或其离散表，不假设线性 scaling。
+   所有调度策略必须基于本机 profiling 得到的 isolated time 与 contention slowdown，不假设线性 scaling，也不把 LLC/带宽退化写成不可执行的硬约束。
 
 5. **先独立研究，再接入 vLLM/fused_cpp**  
    本目录先作为 research sandbox。确认 cost model、solver 和 benchmark 后，再决定是否接入 `fused_cpp.moe` 或 vLLM 的 CPU MoE path。
@@ -115,8 +120,8 @@ T_plan(plan) + T_execute(plan)
   简化的可解释 `T_iso` roofline baseline；按 M12/tail kernel 计算 FLOP、
   N-split shared-cache A/B/C 流量。
 - [`cost_model/GEMM_ECM_VALIDATION.md`](./cost_model/GEMM_ECM_VALIDATION.md)：
-  microkernel-aware GEMM ECM shadow；按 asm 统计 BFMMLA/A/B load，区分
-  L1/private/shared cache 与 epilogue，并记录 V3 长 route 留出验证。
+  实现弱相关三层 GEMM shadow；分离算法 work、SVE mapper 和实测机器响应，
+  并记录 V3 长 route 留出验证及当前可迁移性限制。
 - [`DESIGN.md`](./DESIGN.md)：完整设计文档，定义 plan space、成本模型、严格最优求解方式、multi-plan runtime selector 和阶段性路线图。
 - [`TODO.md`](./TODO.md)：schema-v2 profiling 之后的 policy-aware cost model、planner 与 TP/EP evaluator 待办。
 - [`README.md`](./README.md)：当前入口说明。
@@ -127,8 +132,13 @@ T_plan(plan) + T_execute(plan)
 - [`cost_model/tiso_roofline.py`](./cost_model/tiso_roofline.py)：从 kernel panel
   逻辑生成 `T_iso` FLOP/流量分解，并输出 steady-M12 的可辨识有效服务率；当前
   仅 shadow validation，不改变 planner 默认打分。
-- [`cost_model/gemm_ecm.py`](./cost_model/gemm_ecm.py)：W13/W2 的分层 ECM
-  shadow model 和 stage-trace report CLI；当前不进入 planner active cost。
+- [`cost_model/gemm_cost_model.py`](./cost_model/gemm_cost_model.py)：实现弱相关
+  GEMM 核心契约；分离逻辑算法工作、统一 kernel demand 和目标机器实测响应。
+- [`cost_model/sve_bf16_kernel_model.py`](./cost_model/sve_bf16_kernel_model.py)：
+  当前 SVE BF16 M12/M8/M4/M2 的实现 mapper；负责 tile、padding、N-split、
+  指令和 cache 流量，不进入通用算法公式。
+- [`cost_model/gemm_ecm.py`](./cost_model/gemm_ecm.py)：旧 API 兼容 facade 和
+  stage-trace report CLI；三层 GEMM model 当前不进入 planner active cost。
 - [`cost_model/working_set_model.py`](./cost_model/working_set_model.py)：仅针对
   split-W13 的 owner-private cache 工作集 band；由独立 weight-scan 与
   `T_iso` 计算稳健候选，当前只做 shadow validation。
