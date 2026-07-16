@@ -27,6 +27,8 @@
 #include <utility>
 #include <vector>
 
+#include "moe_route_merge_sve.h"
+
 #ifdef __linux__
 #include <pthread.h>
 #include <sched.h>
@@ -360,6 +362,60 @@ inline void accumulate_weighted_f32(float* acc, const float* src, float weight, 
 #endif
   for (; i < n; ++i) {
     acc[i] += src[i] * weight;
+  }
+}
+
+int resolve_route_merge_unroll(bool use_sve_backend) {
+  const char* variable = "FUSED_CPP_MOE_SVE_ROUTE_MERGE_UNROLL";
+  const char* value = std::getenv(variable);
+  if (value == nullptr || value[0] == '\0') {
+    variable = "FUSED_CPP_MOE_SVE_ROUTE_MERGE_TREE_UNROLL";
+    value = std::getenv(variable);
+  }
+  if (value == nullptr || value[0] == '\0') {
+    return use_sve_backend && ::fused_cpp::moe_route_merge::sve_available() ? 1 : 0;
+  }
+  if (value[0] == '0' && value[1] == '\0') {
+    return 0;
+  }
+  errno = 0;
+  char* end = nullptr;
+  const long parsed = std::strtol(value, &end, 10);
+  TORCH_CHECK(errno == 0 && end != value && *end == '\0' && (parsed == 1 || parsed == 2 || parsed == 4), variable,
+              " must be 0, 1, 2, or 4, got ", value);
+  TORCH_CHECK(use_sve_backend, variable, " requires the SVE MoE backend");
+  TORCH_CHECK(::fused_cpp::moe_route_merge::sve_available(), variable, " requires an SVE build/runtime");
+  return static_cast<int>(parsed);
+}
+
+void merge_route_range(const float* route_out, const uint16_t* route_out_bf16, const float* weights, uint16_t* output,
+                       int64_t token_begin, int64_t token_end, int64_t top_k, int64_t hidden_size, bool use_bf16_route,
+                       int sve_unroll) {
+  if (sve_unroll != 0) {
+    if (use_bf16_route) {
+      ::fused_cpp::moe_route_merge::merge_bf16_sve(route_out_bf16, weights, output, token_begin, token_end, top_k,
+                                                   hidden_size, sve_unroll);
+    } else {
+      ::fused_cpp::moe_route_merge::merge_f32_sve(route_out, weights, output, token_begin, token_end, top_k,
+                                                  hidden_size, sve_unroll);
+    }
+    return;
+  }
+
+  std::vector<float> acc(static_cast<size_t>(hidden_size));
+  for (int64_t token = token_begin; token < token_end; ++token) {
+    uint16_t* dst = output + token * hidden_size;
+    std::fill(acc.begin(), acc.end(), 0.0f);
+    for (int64_t slot = 0; slot < top_k; ++slot) {
+      const int64_t flat = token * top_k + slot;
+      const float weight = weights[flat];
+      if (use_bf16_route) {
+        accumulate_weighted_bf16(acc.data(), route_out_bf16 + flat * hidden_size, weight, hidden_size);
+      } else {
+        accumulate_weighted_f32(acc.data(), route_out + flat * hidden_size, weight, hidden_size);
+      }
+    }
+    convert_f32_to_bf16(acc.data(), dst, hidden_size);
   }
 }
 
@@ -5463,28 +5519,14 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input, at::Tensor w13_packed, int64_t
   // skip_weighted is set the scatter already wrote `output` directly, so the
   // merge is skipped entirely.
   const float* topk_w = weights_f32.data_ptr<float>();
+  const int route_merge_unroll = skip_weighted ? 0 : resolve_route_merge_unroll(use_sve_backend);
 
   auto merge_routes = [&](int64_t tid) {
     const int64_t rows_per_thread = ceil_div_int64(num_tokens, actual_threads);
     const int64_t token_begin = tid * rows_per_thread;
     const int64_t token_end = std::min<int64_t>(num_tokens, token_begin + rows_per_thread);
-    std::vector<float> acc(static_cast<size_t>(H));
-    for (int64_t token = token_begin; token < token_end; ++token) {
-      uint16_t* dst = out_bf16_ptr + token * H;
-      std::fill(acc.begin(), acc.end(), 0.0f);
-      for (int64_t slot = 0; slot < top_k; ++slot) {
-        const int64_t flat = token * top_k + slot;
-        const float weight = topk_w[flat];
-        if (use_w2_bf16_route) {
-          const uint16_t* src = route_out_bf16_ptr + flat * H;
-          accumulate_weighted_bf16(acc.data(), src, weight, H);
-        } else {
-          const float* src = route_out_ptr + flat * H;
-          accumulate_weighted_f32(acc.data(), src, weight, H);
-        }
-      }
-      convert_f32_to_bf16(acc.data(), dst, H);
-    }
+    merge_route_range(route_out_ptr, route_out_bf16_ptr, topk_w, out_bf16_ptr, token_begin, token_end, top_k, H,
+                      use_w2_bf16_route, route_merge_unroll);
   };
   const auto merge_t0 = ::fused_cpp::profile::now();
   if (!skip_weighted) {
@@ -5980,29 +6022,15 @@ at::Tensor fused_moe_bf16_tiled_scheduled(at::Tensor input, at::Tensor w13_packe
   // skip_weighted is set the scatter already filled `output`, so merge is
   // skipped.
   const float* topk_w = weights_f32.data_ptr<float>();
+  const int route_merge_unroll = skip_weighted ? 0 : resolve_route_merge_unroll(use_sve_backend);
 
   auto merge_routes = [&](int64_t tid) {
     auto worker_phase_begin = trace_phase_begin();
     const int64_t rows_per_thread = ceil_div_int64(num_tokens, num_threads);
     const int64_t token_begin = tid * rows_per_thread;
     const int64_t token_end = std::min<int64_t>(num_tokens, token_begin + rows_per_thread);
-    std::vector<float> acc(static_cast<size_t>(H));
-    for (int64_t token = token_begin; token < token_end; ++token) {
-      uint16_t* dst = out_bf16_ptr + token * H;
-      std::fill(acc.begin(), acc.end(), 0.0f);
-      for (int64_t slot = 0; slot < top_k; ++slot) {
-        const int64_t flat = token * top_k + slot;
-        const float weight = topk_w[flat];
-        if (use_w2_bf16_route) {
-          const uint16_t* src = route_out_bf16_ptr + flat * H;
-          accumulate_weighted_bf16(acc.data(), src, weight, H);
-        } else {
-          const float* src = route_out_ptr + flat * H;
-          accumulate_weighted_f32(acc.data(), src, weight, H);
-        }
-      }
-      convert_f32_to_bf16(acc.data(), dst, H);
-    }
+    merge_route_range(route_out_ptr, route_out_bf16_ptr, topk_w, out_bf16_ptr, token_begin, token_end, top_k, H,
+                      use_w2_bf16_route, route_merge_unroll);
     trace_phase_end(tid, -1, -1, -1, -1, std::max<int64_t>(0, token_end - token_begin), "merge_routes",
                     worker_phase_begin);
   };
@@ -6490,28 +6518,14 @@ at::Tensor fused_moe_bf16_tiled_async(at::Tensor input, at::Tensor w13_packed, i
   trace_phase_end(-1, -1, -1, -1, num_routes, "scheduled_compute", phase_begin);
 
   const float* topk_w = weights_f32.data_ptr<float>();
+  const int route_merge_unroll = skip_weighted ? 0 : resolve_route_merge_unroll(use_sve_backend);
   auto merge_routes = [&](int64_t tid) {
     auto worker_phase_begin = trace_phase_begin();
     const int64_t rows_per_thread = ceil_div_int64(num_tokens, num_threads);
     const int64_t token_begin = tid * rows_per_thread;
     const int64_t token_end = std::min<int64_t>(num_tokens, token_begin + rows_per_thread);
-    std::vector<float> acc(static_cast<size_t>(H));
-    for (int64_t token = token_begin; token < token_end; ++token) {
-      uint16_t* dst = out_bf16_ptr + token * H;
-      std::fill(acc.begin(), acc.end(), 0.0f);
-      for (int64_t slot = 0; slot < top_k; ++slot) {
-        const int64_t flat = token * top_k + slot;
-        const float weight = topk_w[flat];
-        if (use_w2_bf16_route) {
-          const uint16_t* src = route_out_bf16_ptr + flat * H;
-          accumulate_weighted_bf16(acc.data(), src, weight, H);
-        } else {
-          const float* src = route_out_ptr + flat * H;
-          accumulate_weighted_f32(acc.data(), src, weight, H);
-        }
-      }
-      convert_f32_to_bf16(acc.data(), dst, H);
-    }
+    merge_route_range(route_out_ptr, route_out_bf16_ptr, topk_w, out_bf16_ptr, token_begin, token_end, top_k, H,
+                      use_w2_bf16_route, route_merge_unroll);
     trace_phase_end(tid, -1, -1, -1, std::max<int64_t>(0, token_end - token_begin), "merge_routes", worker_phase_begin);
   };
   phase_begin = trace_phase_begin();

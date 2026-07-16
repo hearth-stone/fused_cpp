@@ -225,6 +225,133 @@ def test_sve_m12_silu_and_w2_bf16_route_match_legacy_for_unit_top1(
                 )
 
 
+@pytest.mark.parametrize("bridge", ["normal", "scheduled", "async"])
+@pytest.mark.parametrize("w2_bf16_route", [False, True])
+@pytest.mark.parametrize("top_k", [2, 4, 5, 6, 8], ids=["fixed2", "fixed4", "dynamic5", "fixed6", "fixed8"])
+def test_sve_route_merge_matches_sequential(
+    monkeypatch: pytest.MonkeyPatch,
+    bridge: str,
+    w2_bf16_route: bool,
+    top_k: int,
+) -> None:
+    """Cover fixed trees, dynamic fallback, H-unroll variants, and the U1 default."""
+    monkeypatch.setenv("FUSED_CPP_MOE_SVE", "1")
+    monkeypatch.setenv("FUSED_CPP_MOE_W2_BF16_ROUTE", "1" if w2_bf16_route else "0")
+    generator = torch.Generator().manual_seed(20260716)
+    num_tokens = 19
+    hidden_size = 64
+    ffn_hidden_size = 32
+    num_experts = 8
+    threads = 4
+    affinity = sorted(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else list(range(threads))
+    if len(affinity) < threads:
+        pytest.skip(f"requires {threads} available CPUs")
+    monkeypatch.setenv("FUSED_CPP_MOE_PIN_THREADS", "1")
+    monkeypatch.setenv("FUSED_CPP_MOE_PIN_THREAD_CPUS", ",".join(str(cpu) for cpu in affinity[:threads]))
+
+    hidden_states = _bf16_normal((num_tokens, hidden_size), generator=generator, std=0.05)
+    w13_weight = _bf16_normal(
+        (num_experts, 2 * ffn_hidden_size, hidden_size),
+        generator=generator,
+        std=0.05,
+    )
+    w2_weight = _bf16_normal(
+        (num_experts, hidden_size, ffn_hidden_size),
+        generator=generator,
+        std=0.05,
+    )
+    topk_ids = torch.arange(top_k, dtype=torch.int32).repeat(num_tokens, 1)
+    topk_weights = torch.softmax(torch.randn((num_tokens, top_k), generator=generator), dim=-1)
+    packed = prepare_fused_moe_bf16_tiled_weights(w13_weight, w2_weight, fuse_silu=True)
+    if packed.gemm_backend != 1:
+        pytest.skip("requires an SVE BF16 build/runtime")
+
+    expert_ids = torch.arange(top_k, dtype=torch.int32)
+    team_threads = torch.full((top_k,), threads, dtype=torch.int32)
+    thread_cpu_ids = torch.tensor(affinity[:threads], dtype=torch.int32)
+    if bridge == "normal":
+
+        def run() -> torch.Tensor:
+            return fused_moe_bf16_tiled(
+                hidden_states,
+                packed,
+                topk_weights,
+                topk_ids,
+                num_threads=threads,
+            )
+
+    elif bridge == "scheduled":
+        wave_offsets = torch.arange(top_k + 1, dtype=torch.int32)
+
+        def run() -> torch.Tensor:
+            return fused_moe_bf16_tiled_scheduled(
+                hidden_states,
+                packed,
+                topk_weights,
+                topk_ids,
+                wave_offsets,
+                expert_ids,
+                team_threads,
+                thread_cpu_ids=thread_cpu_ids,
+                num_threads=threads,
+            )
+
+    else:
+        dep_offsets = torch.arange(top_k + 1, dtype=torch.int32)
+        dep_offsets[1:] -= 1
+        deps = torch.arange(top_k - 1, dtype=torch.int32)
+
+        def run() -> torch.Tensor:
+            return fused_moe_bf16_tiled_async(
+                hidden_states,
+                packed,
+                topk_weights,
+                topk_ids,
+                expert_ids,
+                torch.zeros(top_k, dtype=torch.int32),
+                team_threads,
+                dep_offsets,
+                deps,
+                thread_cpu_ids=thread_cpu_ids,
+                num_threads=threads,
+            )
+
+    merge_flag = "FUSED_CPP_MOE_SVE_ROUTE_MERGE_UNROLL"
+    legacy_merge_flag = "FUSED_CPP_MOE_SVE_ROUTE_MERGE_TREE_UNROLL"
+    monkeypatch.setenv(merge_flag, "0")
+    reference = run().float()
+    candidates: dict[int, torch.Tensor] = {}
+    for unroll in (1, 2, 4):
+        monkeypatch.setenv(merge_flag, str(unroll))
+        candidate = run().float()
+        candidates[unroll] = candidate
+        atol = 1.0e-5 if top_k in (2, 4, 6, 8) else 0.0
+        rtol = 2.0e-2 if top_k in (2, 4, 6, 8) else 0.0
+        torch.testing.assert_close(
+            candidate,
+            reference,
+            atol=atol,
+            rtol=rtol,
+            msg=lambda message, unroll=unroll: (
+                f"{bridge}/top_k={top_k}/bf16_route={w2_bf16_route}/sve_u{unroll}: {message}"
+            ),
+        )
+    monkeypatch.delenv(merge_flag)
+    monkeypatch.delenv(legacy_merge_flag, raising=False)
+    default = run().float()
+    torch.testing.assert_close(
+        default,
+        candidates[1],
+        atol=0.0,
+        rtol=0.0,
+        msg=lambda message: f"{bridge}/top_k={top_k}/bf16_route={w2_bf16_route}/default_u1: {message}",
+    )
+    if bridge == "normal" and not w2_bf16_route and top_k == 6:
+        monkeypatch.setenv(legacy_merge_flag, "1")
+        legacy_alias = run().float()
+        torch.testing.assert_close(legacy_alias, reference, atol=1.0e-5, rtol=2.0e-2)
+
+
 @pytest.mark.parametrize("bridge", ["scheduled", "async"])
 @pytest.mark.parametrize("w2_bf16_route", [False, True])
 @pytest.mark.parametrize(
@@ -336,7 +463,7 @@ def test_sve_expert_barrier_elision_reuses_dirty_scratch(
         )
 
 
-def test_fused_moe_bf16_tiled_skip_weighted_matches_unit_weighted() -> None:
+def test_fused_moe_bf16_tiled_skip_weighted_matches_unit_weighted(monkeypatch: pytest.MonkeyPatch) -> None:
     # 2b: with top_k == 1 and unit weights, the skip_weighted fast path
     # (w2 result written straight to the bf16 output, no route_out / merge)
     # must bit-match the weighted path. Covers impl A (single + multi thread)
@@ -361,6 +488,9 @@ def test_fused_moe_bf16_tiled_skip_weighted_matches_unit_weighted() -> None:
         w2_bias=w2_bias,
         num_threads=1,
     )
+    # The top-k=1 direct-scatter path must bypass route-merge dispatch even
+    # when an experimental SVE merge variant is requested.
+    monkeypatch.setenv("FUSED_CPP_MOE_SVE_ROUTE_MERGE_UNROLL", "4")
 
     out_a = fused_moe_bf16_tiled(
         hidden_states,

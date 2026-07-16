@@ -1,7 +1,58 @@
 # SVE fused MoE experiments
 
-This directory contains standalone experiments. They do not change the fused
-MoE API or default dispatch.
+This directory contains SVE fused-MoE features and standalone experiments. The
+weighted route-merge U1 kernel is enabled by default for the SVE backend; other
+experimental variants do not change the fused-MoE API or default dispatch.
+
+## SVE weighted route merge
+
+`moe_route_merge_sve.cpp` provides the SVE weighted merge for the
+token-major `[tokens, top_k, hidden]` route buffer. Fixed `top_k=2/4/6/8`
+dispatches to compile-time templates. Template recursion first forms adjacent
+weighted pairs and then a power-of-two-prefix binary tree; for example,
+top-k=6 is `((0+1)+(2+3))+(4+5)`. Other positive values use a runtime slot
+loop that retains one token row's accumulator vectors in SVE registers and
+preserves slot order. U1, U2, and U4 process one, two, or four independent
+hidden-axis vectors per loop. The existing `top_k=1, skip_weighted=true` path
+still writes the W2 result directly during scatter and bypasses merge entirely.
+
+The SVE backend defaults to U1, which keeps the accumulator in SVE registers
+and writes BF16 directly without allocating a thread-local FP32 row. Select a
+different unroll, or restore the sequential accumulator explicitly, with:
+
+```bash
+FUSED_CPP_MOE_SVE_ROUTE_MERGE_UNROLL=0  # sequential compatibility path
+FUSED_CPP_MOE_SVE_ROUTE_MERGE_UNROLL=2  # or 1 / 4
+```
+
+`FUSED_CPP_MOE_SVE_ROUTE_MERGE_TREE_UNROLL` remains a compatibility alias when
+the new variable is unset. Fixed templates change FP32 association relative to
+the sequential baseline; the dynamic fallback does not. The standalone
+benchmark checks both policies against exact scalar references for FP32 and
+BF16 route buffers. The E2E benchmark uses a preplanned async schedule by
+default, avoiding planner time in the measured operator:
+
+```bash
+numactl --cpunodebind=0 --membind=0 taskset -c 0-95 \
+  optimizations/fused_moe_sve/benchmarks/bench_route_merge_tree \
+  --tokens 2048 --top-k 6 --hidden 4096 --threads 96 \
+  --source both --warmup 5 --runs 31 --check
+
+# Rotate a source/output ring larger than cache to measure single-pass traffic.
+numactl --cpunodebind=0 --membind=0 taskset -c 0-95 \
+  optimizations/fused_moe_sve/benchmarks/bench_route_merge_tree \
+  --tokens 2048 --top-k 6 --hidden 4096 --threads 96 --copies 8 \
+  --source both --warmup 8 --runs 31 --check
+
+numactl --cpunodebind=0 --membind=0 taskset -c 0-95 \
+  .venv/bin/python \
+  optimizations/fused_moe_sve/benchmarks/bench_route_merge_e2e.py \
+  --path async --tokens 2048 --hidden 4096 --intermediate 512 \
+  --experts 8 --top-k 6 --threads 96 --warmup 5 --runs 31
+```
+
+The 192-core-host NUMA0 measurements are recorded in
+[`results/amazon_192c_route_merge_tree.md`](results/amazon_192c_route_merge_tree.md).
 
 ## Explicit unfused pipeline reference
 

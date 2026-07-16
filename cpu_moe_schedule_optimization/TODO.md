@@ -134,6 +134,111 @@ Acceptance gates:
   path. Kernel/output tests are complete, but only elementwise and operator
   output error have been measured so far.
 
+## 7. End-to-end fusion and pipeline follow-up (2026-07-16)
+
+These are research candidates, not active planner decisions. The current fused
+boundary already covers gather-pack, W13, SiLU-and-multiply, packed-C production,
+and packed-A W2 consumption. New work should therefore target the W2 output
+path, task-tail overlap, and model-runtime boundaries before attempting deeper
+W13 epilogue changes.
+
+For the representative `tokens=2048`, `top_k=6`, `H=4096` case, the logical
+route result contains 192 MiB in FP32 or 96 MiB in BF16. The current FP32
+`W2 -> down -> route_out -> merge` path transfers about 768 MiB of logical
+payload before counting the merge accumulator. These are cache-level logical
+bytes, not predicted DRAM traffic.
+
+### P0: remove post-W2 materialization and merge overhead
+
+- [ ] Add a dedicated SVE weighted-route merge kernel. Iterate over H vectors
+  outside the top-k loop so the FP32 accumulator remains in registers across all
+  routes, then convert directly to BF16. Specialize `top_k=6`, retain a generic
+  fallback, preserve per-element route order, and add 2-D token/H partitioning
+  for short-token calls. The same epilogue should optionally fold routed scaling,
+  shared-output addition, and residual addition without changing FP32
+  accumulation semantics.
+  - 2026-07-16 experiment: `FUSED_CPP_MOE_SVE_ROUTE_MERGE_UNROLL` provides
+    U1/U2/U4 SVE variants. `top_k=2/4/6/8` uses compile-time adjacent binary
+    trees; other values use a one-token-row ordered runtime-loop fallback. The
+    legacy `FUSED_CPP_MOE_SVE_ROUTE_MERGE_TREE_UNROLL` name remains an alias.
+    On the 192-core host NUMA0, isolated BF16-route gains were 11-24% across
+    top-k 2-8, while FP32 route regressed for top-k 7-8. Preplanned async E2E
+    gains remained at or below 1.04%. U1 is now the SVE default to eliminate the
+    per-worker FP32 allocation and accumulator traffic; explicit value `0`
+    retains the sequential compatibility path, while U2/U4 remain experimental.
+    An ordered fixed-top-k policy, short-token 2-D partitioning, model-level
+    precision validation, and the additional folded epilogues above remain open.
+- [ ] Prototype a precision-neutral W2 FP32 direct-route-store epilogue. Pass the
+  M12 row destination table to assembly and write each N owner's disjoint H
+  columns directly to `route_out`, eliminating the per-team `down` buffer and
+  scatter copy. Measure whether irregular row stores reduce W2 throughput enough
+  to offset the removed traffic before changing dispatch.
+- [ ] Add a direct BF16 route-store variant after the FP32 prototype. Keep final
+  top-k accumulation in FP32, validate real `top_k=6` model accuracy, and compare
+  current FP32, current BF16-with-scatter, direct FP32, and direct BF16 paths.
+- [ ] Make the Python `out=` argument a true native output buffer instead of
+  allocating a native result and copying it afterward. Verify aliasing and
+  lifetime constraints before using the output as a collective buffer.
+
+P0 validation must report standalone W2, scatter, weighted merge, local operator
+E2E, logical traffic, and model-level numerical error. Use uniform, hotspot, and
+captured routing; routes must cover M12 bulk and M1/M2/M4/M8 tails. Performance
+claims must include both long-route throughput and short-route latency.
+
+### P1: overlap independent end-to-end stages
+
+- [ ] Add per-token route-completion accounting so idle lanes can merge tokens
+  whose complete top-k set is ready while a long expert tail is still running.
+  Keep expert work preferred over merge work and quantify the exposed merge time
+  removed for balanced and heavy-tail distributions.
+- [ ] Represent the shared expert as an independently schedulable job, run it
+  concurrently with routed experts when resource contention permits, and fold
+  shared-output/routed-scaling/residual addition into the final merge epilogue.
+- [ ] Pipeline merged token/H chunks into async all-reduce or reduce-scatter and
+  write directly into the communication buffer. Validate real TP/EP execution;
+  do not infer this gain from the analytical communication model alone.
+- [ ] Replace the duplicated Python `bincount` and C++ route scan with one
+  contiguous CSR route-metadata build (`counts`, `offsets`, flat routes, token
+  indices). Let a native interval planner consume the same metadata and avoid
+  Python schedule-tensor materialization, with special attention to decode and
+  many-layer control overhead.
+- [ ] Promote packed-B window size into the planner policy identity and profile
+  schema. Search W13 and W2 window sizes independently, rather than applying one
+  `weight_window_bytes` value to both stages, and regenerate isolated/contention
+  calibration before enabling automatic selection.
+- [ ] Replace general async task-list polling with a lane-chain executor for the
+  current disjoint interval plans, while retaining the general DAG path for plans
+  with genuinely overlapping intervals. Measure dispatch and barrier overhead on
+  route 1-48 before adopting it.
+
+### P2: model-boundary experiments
+
+- [ ] Prototype router-GEMM epilogue plus online top-k and route-histogram
+  generation for the actual DeepSeek routing semantics. Prioritize decode and
+  short-route latency; the prefill logits tensor is too small to assume a useful
+  gain without measurement.
+- [ ] After direct FP32 route store is validated, optionally multiply each W2 row
+  by its route weight in the W2 epilogue so the final merge becomes an ordered
+  sum. Do not combine weighting with BF16 store until the additional rounding
+  point has a separate model-level accuracy result.
+- [ ] Evaluate a coarse ready-chunk communication pipeline that continues shared
+  expert work and remaining route compute while earlier merged chunks are in
+  flight. Include rank synchronization and collective launch overhead.
+
+### Explicitly deprioritized fusion boundaries
+
+- Do not pursue full W13-to-W2 fusion by default. Avoiding the BF16 `[M,F]`
+  intermediate either recomputes W13 for W2 H tiles or repeatedly spills FP32 W2
+  partial outputs; require a concrete loop ordering and traffic proof before an
+  experiment.
+- Do not move gather into every W13 N owner by default. It duplicates route
+  address work and input reads by the team width; only a single-thread or very
+  short-route microbenchmark can justify a specialized path.
+- Do not prioritize further SiLU approximation work as an E2E optimization. Its
+  measured contribution is only 2.3-3.7% of W13+W2 time; retain polynomial and
+  reciprocal variants as accuracy/performance experiments, not the main fusion
+  program.
+
 The old AUTO selector, bucketized wave-DP, and wave-based Phase 4 items in
 `FINDINGS.md` remain historical only because wave scheduling is deprecated.
 They are not active TODOs for the async interval-DAG planner.

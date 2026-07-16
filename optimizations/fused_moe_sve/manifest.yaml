@@ -128,6 +128,43 @@ features:
       --threads-per-expert 24 --w13-ranges 2
       --warmup 3 --iters 10 --copies 2
 
+  - id: merge.sve_weighted_reduce
+    part: merge
+    status: enabled
+    implementation: csrc/moe_route_merge_sve.cpp
+    hypothesis: >-
+      Compile-time adjacent binary trees for top-k 2/4/6/8 and an ordered
+      runtime-loop fallback for other values remove the thread-local FP32
+      accumulator's repeated L1 load/store traffic without reducing
+      compulsory route reads or output writes. Keeping 1, 2, or 4
+      independent hidden-axis vectors exposes latency-hiding choices without
+      changing the token-major route layout or final BF16 output contract.
+    depends_on: []
+    conflicts_with: []
+    correctness: >-
+      make -C optimizations/fused_moe_sve/benchmarks
+      bench_route_merge_tree &&
+      for top_k in 1 2 3 4 5 6 7 8 9; do
+      optimizations/fused_moe_sve/benchmarks/bench_route_merge_tree
+      --tokens 5 --top-k $top_k --hidden 103 --threads 4
+      --source both --check || exit 1; done &&
+      pytest -q tests/test_fused_moe_bf16_tiled.py
+      -k sve_route_merge_matches_sequential
+    benchmark: >-
+      numactl --cpunodebind=0 --membind=0 taskset -c 0-95
+      optimizations/fused_moe_sve/benchmarks/bench_route_merge_tree
+      --tokens 2048 --top-k 6 --hidden 4096 --threads 96
+      --copies 1 --source both --warmup 3 --runs 11 &&
+      numactl --cpunodebind=0 --membind=0 taskset -c 0-95
+      optimizations/fused_moe_sve/benchmarks/bench_route_merge_tree
+      --tokens 2048 --top-k 6 --hidden 4096 --threads 96
+      --copies 8 --source both --warmup 8 --runs 11 &&
+      numactl --cpunodebind=0 --membind=0 taskset -c 0-95
+      .venv/bin/python
+      optimizations/fused_moe_sve/benchmarks/bench_route_merge_e2e.py
+      --path async --tokens 2048 --hidden 4096 --intermediate 512
+      --experts 8 --top-k 6 --threads 96 --warmup 5 --runs 31
+
   - id: measurement.single_core_unique_weight_window
     part: measurement
     status: diagnostic
@@ -284,6 +321,37 @@ variants:
     entrypoint: >-
       fused_moe_bf16_tiled_{scheduled,async}(
       weight_window_bytes=<positive byte count>)
+    status: experimental
+
+  - id: sve_route_merge_sequential
+    features: []
+    entrypoint: >-
+      FUSED_CPP_MOE_SVE_ROUTE_MERGE_UNROLL=0
+      fused_moe_bf16_tiled_{sync,scheduled,async}
+    status: reference
+
+  - id: sve_route_merge_u1
+    features:
+      - merge.sve_weighted_reduce
+    entrypoint: >-
+      fused_moe_bf16_tiled_{sync,scheduled,async}
+      (SVE default; FUSED_CPP_MOE_SVE_ROUTE_MERGE_UNROLL=1 is equivalent)
+    status: enabled
+
+  - id: sve_route_merge_u2
+    features:
+      - merge.sve_weighted_reduce
+    entrypoint: >-
+      FUSED_CPP_MOE_SVE_ROUTE_MERGE_UNROLL=2
+      fused_moe_bf16_tiled_{sync,scheduled,async}
+    status: experimental
+
+  - id: sve_route_merge_u4
+    features:
+      - merge.sve_weighted_reduce
+    entrypoint: >-
+      FUSED_CPP_MOE_SVE_ROUTE_MERGE_UNROLL=4
+      fused_moe_bf16_tiled_{sync,scheduled,async}
     status: experimental
 
   - id: sve_explicit_unfused_expert
