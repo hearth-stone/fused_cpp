@@ -494,3 +494,52 @@ is ready. With at least two independent long experts, `2x16` plus two-panel W13
 is the throughput choice; the gain is clear from roughly M=1536 onward and is
 effectively a tie at M=1024. Do not split W13 for `1x32`, and do not use `4x8`
 for uniform long routes on this 32-core partition.
+
+
+---
+
+# 完整非融合基线对比 (2026-07-15)
+
+新增独立的 `bench_unfused_pipeline`,在不改变生产 dispatch 的前提下对比完整
+数据流。非融合路径显式执行 extract、pack A1、W1 FP32 GEMM、poly5+`fdiv`
+SiLU、W3 FP32 GEMM、乘法并转 BF16、pack A2、W2 BF16 GEMM。融合对照执行
+direct gather-pack、当前 fused W13 epilogue/packC 和同一个 W2。
+
+W1/W3 使用 `moe_sve_w2_packed_m12`,fused W13 使用
+`moe_sve_w13_silu_poly5_packc_m12_rows_opt`,两边 W2 都使用
+`moe_sve_w2_packed_bf16_m12`;它们严格共享 `M12_K4_BODY`。所有 buffer 在
+计时区外预分配,每个 expert 和 rotating copy 使用不同权重。
+
+192-core 主机 NUMA0 前 96 核,EP2 形状 `H=4096,F=2048`,4 expert × 24T:
+
+| 每 expert routes | 完全非融合 | 当前融合 | 融合收益 |
+|---:|---:|---:|---:|
+| 1020 | 8.831 ms | 8.479 ms | 3.98% |
+| 2040 | 16.970 ms | 16.412 ms | 3.29% |
+
+2040 routes 时,非融合的 W1+SiLU+W3+multiply+pack A2 约 11.48 ms,融合 W13
+为 10.87 ms;extract+pack A1 约 0.45 ms,direct gather-pack 约 0.31 ms。W2
+分别约 5.16/5.21 ms,说明收益不是来自 W2 kernel 差异。
+
+最终 W2 BF16 输出 rel-L2 为 `4.96e-5`。差异来自非融合顺序先保存
+`gate/denom` 再乘 `up`,而 fused asm 在转 BF16 前计算 `gate*up/denom`。
+详细协议和 stage 表见
+`optimizations/fused_moe_sve/results/amazon_192c_unfused_pipeline.md`。
+
+扩展到 `M=3060/4080/6120/8160` 后,融合收益依次为
+`4.17%/4.40%/5.33%/5.63%`。从 `M=2040` 到 `8160`,unfused 的
+`extract+packA1` 单位 route 成本增加约 47%,direct gather-pack 只增加约
+4%;unfused 吞吐在 `M=4080` 后回落,而 fused 保持约 `25.6 TFLOP/s`。
+
+100 轮受控测试中,`M=2040/8160` 的 p99 收益分别为 `3.90%/5.75%`,CV
+从 `0.226%/0.223%` 降至 `0.127%/0.103%`。这证明物化路径随工作集增大时
+扩展性和受控尾延迟更差,并与 cache-capacity 转换一致。
+
+将 `perf_event_paranoid` 调整为 1 后,使用普通用户 `perf 7.0.6` 分路径采样。
+在 `M=2040` 时,fused 的 L2D refill、LLC read miss 和 backend memory-stall
+cycles 分别减少 `7.63%/54.34%/43.57%`;在 `M=8160` 时分别减少
+`9.78%/56.06%/57.91%`。两组的 instruction 仅减少约 `0.44%`,说明收益主要
+来自减少 cache hierarchy refill 和 memory stall,而不是改变共享的 GEMM 计算
+主体。该平台 `l3d_cache_refill` 恒为 0,所以这里使用 `ll_cache_rd` /
+`ll_cache_miss_rd` 作为末级缓存代理;这些事件不能换算成精确 DRAM 字节数。
+`M=8160` 的独立复测得到 `55.42%/55.98%/57.23%`,与首轮一致。
