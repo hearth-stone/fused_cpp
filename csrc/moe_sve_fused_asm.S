@@ -976,6 +976,77 @@
 	STORE_W2_PAIR_DIRECT 0, z16, z17, z18, z19
 	.endm
 
+	.macro BUILD_C_DIRECT_BF16_OFFSETS
+	index z9.s, #0, #1
+	mov z10.d, z9.d
+	and z10.s, z10.s, #3
+	mov z11.d, z9.d
+	lsr z11.s, z11.s, #2
+	lsl z11.s, z11.s, #4
+	mov z12.d, z10.d
+	and z12.s, z12.s, #1
+	lsl z12.s, z12.s, #1
+	add z9.s, z11.s, z12.s
+	lsr z10.s, z10.s, #1
+	and z10.s, z10.s, #1
+	cmpeq p4.s, p1/z, z10.s, #0
+	.endm
+
+	.macro STORE_PAIR_W2_OFFSETS_BF16 base, pred, offsets, a0, a1, a2, a3
+	add x3, \base, #4
+	add x4, \base, #8
+	add x5, \base, #12
+	bfcvt z13.h, p1/m, \a0\().s
+	st1h {z13.s}, \pred, [\base, \offsets\().s, sxtw]
+	bfcvt z13.h, p1/m, \a1\().s
+	st1h {z13.s}, \pred, [x3, \offsets\().s, sxtw]
+	bfcvt z13.h, p1/m, \a2\().s
+	st1h {z13.s}, \pred, [x4, \offsets\().s, sxtw]
+	bfcvt z13.h, p1/m, \a3\().s
+	st1h {z13.s}, \pred, [x5, \offsets\().s, sxtw]
+	.endm
+
+	.macro STORE_W2_PAIR_DIRECT_BF16 row, a0, a1, a2, a3
+	cmp w19, #\row
+	b.le 948\@f
+	cmp w19, #(\row + 1)
+	b.eq 949\@f
+	ldp x22, x7, [x29, #(\row * 8)]
+	madd x16, x22, x25, x12
+	sub x7, x7, x22
+	mul x7, x7, x25
+	mov z11.d, z9.d
+	dup z12.s, w7
+	mul z12.s, p1/m, z12.s, z10.s
+	add z11.s, z11.s, z12.s
+	STORE_PAIR_W2_OFFSETS_BF16 x16, p1, z11, \a0, \a1, \a2, \a3
+	b 948\@f
+949\@:
+	ldr x22, [x29, #(\row * 8)]
+	madd x16, x22, x25, x12
+	STORE_PAIR_W2_OFFSETS_BF16 x16, p4, z9, \a0, \a1, \a2, \a3
+948\@:
+	.endm
+
+	.macro STORE_W2_M8_DIRECT_BF16
+	BUILD_C_DIRECT_BF16_OFFSETS
+	STORE_W2_PAIR_DIRECT_BF16 0, z16, z17, z18, z19
+	STORE_W2_PAIR_DIRECT_BF16 2, z20, z21, z22, z23
+	STORE_W2_PAIR_DIRECT_BF16 4, z24, z25, z26, z27
+	STORE_W2_PAIR_DIRECT_BF16 6, z28, z29, z30, z31
+	.endm
+
+	.macro STORE_W2_M4_DIRECT_BF16
+	BUILD_C_DIRECT_BF16_OFFSETS
+	STORE_W2_PAIR_DIRECT_BF16 0, z16, z17, z18, z19
+	STORE_W2_PAIR_DIRECT_BF16 2, z20, z21, z22, z23
+	.endm
+
+	.macro STORE_W2_M2_DIRECT_BF16
+	BUILD_C_DIRECT_BF16_OFFSETS
+	STORE_W2_PAIR_DIRECT_BF16 0, z16, z17, z18, z19
+	.endm
+
 	.macro STORE_W2_M8_BF16
 	BUILD_C_BF16_OFFSETS
 	mov x16, x12
@@ -1107,6 +1178,68 @@
 	STORE_W2_PAIR_DIRECT_M12 6,  z20, z21, z22, z23
 	STORE_W2_PAIR_DIRECT_M12 8,  z24, z25, z26, z27
 	STORE_W2_PAIR_DIRECT_M12 10, z28, z29, z30, z31
+	.endm
+
+	.macro BUILD_C_DIRECT_BF16_OFFSETS_M12
+	index z0.s, #0, #1
+	mov z1.d, z0.d
+	and z1.s, z1.s, #3
+	mov z2.d, z0.d
+	lsr z2.s, z2.s, #2
+	lsl z2.s, z2.s, #4
+	mov z3.d, z1.d
+	and z3.s, z3.s, #1
+	lsl z3.s, z3.s, #1
+	add z0.s, z2.s, z3.s
+	lsr z1.s, z1.s, #1
+	and z1.s, z1.s, #1
+	cmpeq p4.s, p1/z, z1.s, #0
+	.endm
+
+	.macro STORE_PAIR_W2_M12_OFFSETS_BF16 base, pred, offsets, a0, a1, a2, a3
+	add x3, \base, #4
+	add x4, \base, #8
+	add x5, \base, #12
+	bfcvt z4.h, p1/m, \a0\().s
+	st1h {z4.s}, \pred, [\base, \offsets\().s, sxtw]
+	bfcvt z4.h, p1/m, \a1\().s
+	st1h {z4.s}, \pred, [x3, \offsets\().s, sxtw]
+	bfcvt z4.h, p1/m, \a2\().s
+	st1h {z4.s}, \pred, [x4, \offsets\().s, sxtw]
+	bfcvt z4.h, p1/m, \a3\().s
+	st1h {z4.s}, \pred, [x5, \offsets\().s, sxtw]
+	.endm
+
+	.macro STORE_W2_PAIR_DIRECT_BF16_M12 row, a0, a1, a2, a3
+	cmp w19, #\row
+	b.le 954\@f
+	cmp w19, #(\row + 1)
+	b.eq 955\@f
+	ldp x22, x7, [x29, #(\row * 8)]
+	madd x16, x22, x25, x12
+	sub x7, x7, x22
+	mul x7, x7, x25
+	mov z2.d, z0.d
+	dup z3.s, w7
+	mul z3.s, p1/m, z3.s, z1.s
+	add z2.s, z2.s, z3.s
+	STORE_PAIR_W2_M12_OFFSETS_BF16 x16, p1, z2, \a0, \a1, \a2, \a3
+	b 954\@f
+955\@:
+	ldr x22, [x29, #(\row * 8)]
+	madd x16, x22, x25, x12
+	STORE_PAIR_W2_M12_OFFSETS_BF16 x16, p4, z0, \a0, \a1, \a2, \a3
+954\@:
+	.endm
+
+	.macro STORE_W2_M12_DIRECT_BF16
+	BUILD_C_DIRECT_BF16_OFFSETS_M12
+	STORE_W2_PAIR_DIRECT_BF16_M12 0,  z8,  z9,  z10, z11
+	STORE_W2_PAIR_DIRECT_BF16_M12 2,  z12, z13, z14, z15
+	STORE_W2_PAIR_DIRECT_BF16_M12 4,  z16, z17, z18, z19
+	STORE_W2_PAIR_DIRECT_BF16_M12 6,  z20, z21, z22, z23
+	STORE_W2_PAIR_DIRECT_BF16_M12 8,  z24, z25, z26, z27
+	STORE_W2_PAIR_DIRECT_BF16_M12 10, z28, z29, z30, z31
 	.endm
 
 	.macro BUILD_C_BF16_OFFSETS_M12
@@ -1301,7 +1434,10 @@ moe_sve_kernel_m12:
 	ptrue p0.b
 	ptrue p1.s
 	cmp w6, #2
+	b.eq .L_m12_store_mode_bf16
+	cmp w6, #44
 	b.ne .L_m12_store_mode_ready
+.L_m12_store_mode_bf16:
 	lsl x25, x23, #1          // bf16 ldc bytes
 	mov x14, x27              // row-major bf16 C advance per N tile
 .L_m12_store_mode_ready:
@@ -1329,6 +1465,8 @@ moe_sve_kernel_m12:
 	b.eq .L_m12_store_w2_bf16
 	cmp w6, #3
 	b.eq .L_m12_store_w2_direct
+	cmp w6, #44
+	b.eq .L_m12_store_w2_direct_bf16
 	cmp w6, #1
 	b.eq .L_m12_store_identity
 	cmp w6, #14
@@ -1408,6 +1546,10 @@ moe_sve_kernel_m12:
 	STORE_W2_M12_DIRECT
 	add x12, x12, x14
 	b .L_m12_advance_common
+.L_m12_store_w2_direct_bf16:
+	STORE_W2_M12_DIRECT_BF16
+	add x12, x12, x14
+	b .L_m12_advance_common
 .L_m12_advance_packc:
 	add x12, x12, x24
 .L_m12_advance_common:
@@ -1436,7 +1578,10 @@ moe_sve_kernel_m8:
 	ptrue p0.b
 	ptrue p1.s
 	cmp w6, #2
+	b.eq .L_m8_store_mode_bf16
+	cmp w6, #44
 	b.ne .L_m8_store_mode_ready
+.L_m8_store_mode_bf16:
 	lsl x25, x23, #1
 	mov x14, x27
 .L_m8_store_mode_ready:
@@ -1480,6 +1625,8 @@ moe_sve_kernel_m8:
 	b.eq .L_m8_store_w2_bf16
 	cmp w6, #3
 	b.eq .L_m8_store_w2_direct
+	cmp w6, #44
+	b.eq .L_m8_store_w2_direct_bf16
 	cmp w6, #1
 	b.eq .L_m8_store_identity
 	cmp w6, #4
@@ -1507,6 +1654,10 @@ moe_sve_kernel_m8:
 	b .L_m8_advance_common
 .L_m8_store_w2_direct:
 	STORE_W2_M8_DIRECT
+	add x12, x12, x14
+	b .L_m8_advance_common
+.L_m8_store_w2_direct_bf16:
+	STORE_W2_M8_DIRECT_BF16
 	add x12, x12, x14
 	b .L_m8_advance_common
 .L_m8_advance_packc:
@@ -1537,7 +1688,10 @@ moe_sve_kernel_m4:
 	ptrue p0.b
 	ptrue p1.s
 	cmp w6, #2
+	b.eq .L_m4_store_mode_bf16
+	cmp w6, #44
 	b.ne .L_m4_store_mode_ready
+.L_m4_store_mode_bf16:
 	lsl x25, x23, #1
 	mov x14, x27
 .L_m4_store_mode_ready:
@@ -1581,6 +1735,8 @@ moe_sve_kernel_m4:
 	b.eq .L_m4_store_w2_bf16
 	cmp w6, #3
 	b.eq .L_m4_store_w2_direct
+	cmp w6, #44
+	b.eq .L_m4_store_w2_direct_bf16
 	cmp w6, #1
 	b.eq .L_m4_store_identity
 	cmp w6, #4
@@ -1608,6 +1764,10 @@ moe_sve_kernel_m4:
 	b .L_m4_advance_common
 .L_m4_store_w2_direct:
 	STORE_W2_M4_DIRECT
+	add x12, x12, x14
+	b .L_m4_advance_common
+.L_m4_store_w2_direct_bf16:
+	STORE_W2_M4_DIRECT_BF16
 	add x12, x12, x14
 	b .L_m4_advance_common
 .L_m4_advance_packc:
@@ -1638,7 +1798,10 @@ moe_sve_kernel_m2:
 	ptrue p0.b
 	ptrue p1.s
 	cmp w6, #2
+	b.eq .L_m2_store_mode_bf16
+	cmp w6, #44
 	b.ne .L_m2_store_mode_ready
+.L_m2_store_mode_bf16:
 	lsl x25, x23, #1
 	mov x14, x27
 .L_m2_store_mode_ready:
@@ -1682,6 +1845,8 @@ moe_sve_kernel_m2:
 	b.eq .L_m2_store_w2_bf16
 	cmp w6, #3
 	b.eq .L_m2_store_w2_direct
+	cmp w6, #44
+	b.eq .L_m2_store_w2_direct_bf16
 	cmp w6, #1
 	b.eq .L_m2_store_identity
 	cmp w6, #4
@@ -1709,6 +1874,10 @@ moe_sve_kernel_m2:
 	b .L_m2_advance_common
 .L_m2_store_w2_direct:
 	STORE_W2_M2_DIRECT
+	add x12, x12, x14
+	b .L_m2_advance_common
+.L_m2_store_w2_direct_bf16:
+	STORE_W2_M2_DIRECT_BF16
 	add x12, x12, x14
 	b .L_m2_advance_common
 .L_m2_advance_packc:
@@ -1772,6 +1941,16 @@ moe_sve_kernel_m2:
 	.size \name, .-\name
 	.endm
 
+	.macro ENTRY_W2_DIRECT_BF16 name, target
+	.global \name
+	.type \name, %function
+	.p2align 4
+\name:
+	mov w6, #44
+	b \target
+	.size \name, .-\name
+	.endm
+
 	ENTRY_W13 moe_sve_w13_silu_poly4_packc_m12, moe_sve_kernel_m12, 4
 	ENTRY_W13 moe_sve_w13_silu_poly5_packc_m12, moe_sve_kernel_m12, 5
 	ENTRY_W13 moe_sve_w13_silu_poly6_packc_m12, moe_sve_kernel_m12, 6
@@ -1827,6 +2006,11 @@ moe_sve_kernel_m2:
 	ENTRY_W2_DIRECT moe_sve_w2_packed_direct_m4,  moe_sve_kernel_m4
 	ENTRY_W2_DIRECT moe_sve_w2_packed_direct_m2,  moe_sve_kernel_m2
 	ENTRY_W2_DIRECT moe_sve_w2_packed_direct_m1,  moe_sve_kernel_m2
+	ENTRY_W2_DIRECT_BF16 moe_sve_w2_packed_direct_bf16_m12, moe_sve_kernel_m12
+	ENTRY_W2_DIRECT_BF16 moe_sve_w2_packed_direct_bf16,     moe_sve_kernel_m8
+	ENTRY_W2_DIRECT_BF16 moe_sve_w2_packed_direct_bf16_m4,  moe_sve_kernel_m4
+	ENTRY_W2_DIRECT_BF16 moe_sve_w2_packed_direct_bf16_m2,  moe_sve_kernel_m2
+	ENTRY_W2_DIRECT_BF16 moe_sve_w2_packed_direct_bf16_m1,  moe_sve_kernel_m2
 	ENTRY_W2_BF16 moe_sve_w2_packed_bf16_m12, moe_sve_kernel_m12
 	ENTRY_W2_BF16 moe_sve_w2_packed_bf16,     moe_sve_kernel_m8
 	ENTRY_W2_BF16 moe_sve_w2_packed_bf16_m4,  moe_sve_kernel_m4

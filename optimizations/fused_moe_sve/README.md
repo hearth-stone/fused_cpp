@@ -54,7 +54,7 @@ numactl --cpunodebind=0 --membind=0 taskset -c 0-95 \
 The 192-core-host NUMA0 measurements are recorded in
 [`results/amazon_192c_route_merge_tree.md`](results/amazon_192c_route_merge_tree.md).
 
-## W2 FP32 direct route store
+## W2 direct route store
 
 The default SVE W2 epilogue consumes each expert's flat route-row table
 and stores its FP32 result directly into the token-major `route_out` tensor.
@@ -64,6 +64,15 @@ N-split workers still own disjoint `n_tile`-aligned H ranges, so no two workers
 write the same output element. The existing FP32 weighted route merge is
 unchanged.
 
+An opt-in BF16 route-buffer variant uses matching assembly epilogues to convert
+and store each W2 result directly as BF16. It does not allocate either the
+contiguous `down` tensor or a separate FP32 route tensor. The weighted merge
+loads BF16 routes and still accumulates all top-k contributions in FP32:
+
+```bash
+FUSED_CPP_MOE_W2_BF16_ROUTE=1 <fused MoE command>
+```
+
 Disable the path and retain the contiguous `down` plus scatter fallback with:
 
 ```bash
@@ -71,13 +80,20 @@ FUSED_CPP_MOE_SVE_W2_DIRECT_ROUTE=0 \
   <fused MoE command>
 ```
 
-Dispatch requires the SVE fused-SiLU packed-A path, an unbiased W2, an FP32
-route buffer, `N_pad == H`, and route offsets representable by the SVE signed
-32-bit scatter offsets. Unsupported cases retain the existing contiguous W2
-store plus scatter. Direct route is default-on because it preserves bitwise
-FP32 output, removes the per-team `down` allocation, improves long-route E2E by
-roughly 14-16% on the 192-core host's first NUMA node, and is statistically
-neutral for short routes.
+Dispatch requires the SVE fused-SiLU packed-A path, an unbiased W2,
+`N_pad == H`, and route offsets representable by the SVE signed 32-bit scatter
+offsets for the selected FP32 or BF16 element size. Unsupported cases retain
+the existing contiguous W2 store plus scatter. FP32 direct route is default-on
+because it preserves bitwise FP32 output, removes the per-team `down`
+allocation, improves long-route E2E by roughly 14-16% on the 192-core host's
+first NUMA node, and is statistically neutral for short routes.
+
+BF16 route storage remains opt-in pending model-level accuracy validation. On
+the same host, the representative eight-expert, 12-thread/expert, M=1536 test
+improved from 8.087 ms for FP32 direct to 7.726 ms for BF16 direct (median of
+three process medians), or 4.68% higher throughput. The gain was neutral at
+M=12 and reached 1.31% at M=192. The four-way benchmark checks FP32 scatter,
+FP32 direct, BF16 scatter, and BF16 direct in one process.
 
 ```bash
 numactl --cpunodebind=0 --membind=0 taskset -c 0-95 \
@@ -88,7 +104,9 @@ numactl --cpunodebind=0 --membind=0 taskset -c 0-95 \
 ```
 
 The implementation, traffic accounting, and measurements are recorded in
-[`results/amazon_192c_w2_direct_route.md`](results/amazon_192c_w2_direct_route.md).
+[`results/amazon_192c_w2_direct_route.md`](results/amazon_192c_w2_direct_route.md)
+and
+[`results/amazon_192c_w2_direct_bf16_route.md`](results/amazon_192c_w2_direct_bf16_route.md).
 
 ## Async ready-token route merge
 
@@ -100,8 +118,9 @@ with:
 FUSED_CPP_MOE_ASYNC_READY_TOKEN_MERGE=0 <async fused MoE command>
 ```
 
-It is restricted to the SVE FP32 direct-route path. After every expert team's
-final W2 barrier, the leader release-publishes task completion, checks the TopK
+It is restricted to the SVE direct-route path and supports either FP32 or BF16
+route storage. After every expert team's final W2 barrier, the leader
+release-publishes task completion, checks the TopK
 expert state for its route tokens, claims each newly ready token once, and
 publishes claimed tokens to the worker queue in one batch. The async worker
 loop always selects eligible expert work first; only an otherwise idle lane

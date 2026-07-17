@@ -188,9 +188,24 @@ bytes, not predicted DRAM traffic.
     direct-route path. Existing profiles predate this default and represent the
     contiguous-down plus scatter implementation. Separate route-buffer
     first-touch page faults from steady kernel time when evaluating tail latency.
-- [ ] Add a direct BF16 route-store variant after the FP32 prototype. Keep final
-  top-k accumulation in FP32, validate real `top_k=6` model accuracy, and compare
-  current FP32, current BF16-with-scatter, direct FP32, and direct BF16 paths.
+- [x] Add a direct BF16 route-store variant after the FP32 prototype. The SVE
+  M12/M8/M4/M2/M1 W2 epilogues convert each result vector to BF16 and store it
+  directly at the route-row destination; final top-k accumulation remains FP32.
+  Sync, scheduled, and async bridges support all four FP32/BF16 and
+  scatter/direct combinations.
+  - 2026-07-16 experiment: on NUMA0 of the 192-core host, eight concurrent
+    12-thread experts with 1536 routes/expert measured 7.726 ms for BF16 direct
+    versus 8.087 ms for FP32 direct (median of three independent 31-run process
+    medians), a 4.68% throughput gain and 4.47% latency reduction. BF16 direct
+    was 6.25% lower latency than BF16-with-scatter and reduces modeled logical
+    post-W2 payload from 384 MiB to 192 MiB. M=12 was neutral, M=48 gained 0.55%,
+    and M=192 gained 1.31% in throughput. BF16 direct is bitwise identical to
+    BF16-with-scatter; versus FP32 direct, local operator output maximum absolute
+    error was `1.19e-7` on the long-route test.
+  - [ ] Validate real `top_k=6` model-level accuracy before enabling BF16 route
+    storage by default. `FUSED_CPP_MOE_W2_BF16_ROUTE=1` remains opt-in; when it
+    is enabled, direct route store is selected by the existing default-on
+    `FUSED_CPP_MOE_SVE_W2_DIRECT_ROUTE` policy.
 - [x] Make the Python `out=` argument a true native output buffer instead of
   allocating a native result and copying it afterward.
   - 2026-07-16 implementation: normal, scheduled, and async native entrypoints

@@ -355,16 +355,18 @@ def test_sve_route_merge_matches_sequential(
 
 @pytest.mark.parametrize("bridge", ["normal", "scheduled", "async"])
 @pytest.mark.parametrize("split_2d", [False, True], ids=["nsplit", "2d-nsplit"])
+@pytest.mark.parametrize("w2_bf16_route", [False, True], ids=["fp32-route", "bf16-route"])
 def test_sve_w2_direct_route_store_matches_scatter(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     bridge: str,
     split_2d: bool,
+    w2_bf16_route: bool,
 ) -> None:
     """Cover interleaved route IDs, every M tail, and multi-thread N ownership."""
     monkeypatch.setenv("FUSED_CPP_MOE_SVE", "1")
     monkeypatch.setenv("FUSED_CPP_MOE_W13_SPLIT_N", "1")
-    monkeypatch.setenv("FUSED_CPP_MOE_W2_BF16_ROUTE", "0")
+    monkeypatch.setenv("FUSED_CPP_MOE_W2_BF16_ROUTE", "1" if w2_bf16_route else "0")
     monkeypatch.setenv("FUSED_CPP_MOE_SVE_ROUTE_MERGE_UNROLL", "0")
     monkeypatch.setenv("FUSED_CPP_MOE_FUSED_2D_SPLIT", "1" if split_2d else "0")
     generator = torch.Generator().manual_seed(20260716)
@@ -473,7 +475,7 @@ def test_sve_w2_direct_route_store_matches_scatter(
             reference.float(),
             atol=0,
             rtol=0,
-            msg=lambda message: f"{bridge}/split_2d={split_2d}: {message}",
+            msg=lambda message: f"{bridge}/split_2d={split_2d}/bf16_route={w2_bf16_route}: {message}",
         )
     assert candidate is not None
     monkeypatch.delenv(direct_flag)
@@ -490,14 +492,16 @@ def test_sve_w2_direct_route_store_matches_scatter(
         assert "stage=scatter_route_out" not in trace
 
 
+@pytest.mark.parametrize("w2_bf16_route", [False, True], ids=["fp32-route", "bf16-route"])
 def test_async_ready_token_merge_overlaps_imbalanced_experts(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    w2_bf16_route: bool,
 ) -> None:
     """Merge short-group tokens while an independent long expert group runs."""
     monkeypatch.setenv("FUSED_CPP_MOE_SVE", "1")
     monkeypatch.setenv("FUSED_CPP_MOE_W13_SPLIT_N", "1")
-    monkeypatch.setenv("FUSED_CPP_MOE_W2_BF16_ROUTE", "0")
+    monkeypatch.setenv("FUSED_CPP_MOE_W2_BF16_ROUTE", "1" if w2_bf16_route else "0")
     monkeypatch.setenv("FUSED_CPP_MOE_SVE_W2_DIRECT_ROUTE", "1")
     monkeypatch.setenv("FUSED_CPP_MOE_SVE_ROUTE_MERGE_UNROLL", "1")
     monkeypatch.setenv("FUSED_CPP_MOE_FUSED_2D_SPLIT", "0")

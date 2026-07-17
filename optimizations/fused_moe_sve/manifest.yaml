@@ -88,6 +88,31 @@ features:
       --path async --tokens 2048 --hidden 4096 --intermediate 512
       --experts 8 --top-k 6 --threads 96 --warmup 5 --runs 31
 
+  - id: store.w2_direct_bf16_route
+    part: store
+    status: experimental
+    implementation: >-
+      csrc/moe_sve_fused_asm.S and csrc/fused_moe_bf16_tiled.cpp
+    hypothesis: >-
+      Converting W2 accumulators to BF16 in the direct-route assembly epilogue
+      halves route-buffer stores and weighted-merge source reads while retaining
+      FP32 top-k accumulation. Long routes should recover this traffic saving;
+      short routes may not amortize BF16 conversion and address setup.
+    depends_on:
+      - store.w2_direct_route
+    conflicts_with:
+      - scatter.w2_n_owner
+    correctness: >-
+      PYTHONPATH=src .venv/bin/python -m pytest -q
+      tests/test_fused_moe_bf16_tiled.py
+      -k w2_direct_route_store_matches_scatter
+    benchmark: >-
+      numactl --cpunodebind=0 --membind=0 taskset -c 0-95
+      .venv/bin/python
+      optimizations/fused_moe_sve/benchmarks/bench_w2_direct_route.py
+      --path async --tokens 2048 --hidden 4096 --intermediate 512
+      --experts 8 --top-k 6 --threads 96 --warmup 5 --runs 31
+
   - id: dispatch.elastic_n_lanes
     part: dispatch
     status: experimental
@@ -368,9 +393,18 @@ variants:
     features:
       - store.w2_direct_route
     entrypoint: >-
-      FUSED_CPP_MOE_SVE_W2_BF16_ROUTE=0
+      FUSED_CPP_MOE_W2_BF16_ROUTE=0
       fused_moe_bf16_tiled_{sync,scheduled,async}
     status: enabled
+
+  - id: sve_w2_bf16_direct_route
+    features:
+      - store.w2_direct_route
+      - store.w2_direct_bf16_route
+    entrypoint: >-
+      FUSED_CPP_MOE_W2_BF16_ROUTE=1
+      fused_moe_bf16_tiled_{sync,scheduled,async}
+    status: experimental
 
   - id: sve_fused_expert_serial_weight_windows
     features:

@@ -171,6 +171,16 @@ void moe_sve_w2_packed_direct_m12(const uint16_t*, const uint16_t*, float*, cons
 void moe_sve_w2_packed_direct_m4(const uint16_t*, const uint16_t*, float*, const int64_t*, const gemm_params_t*);
 void moe_sve_w2_packed_direct_m2(const uint16_t*, const uint16_t*, float*, const int64_t*, const gemm_params_t*);
 void moe_sve_w2_packed_direct_m1(const uint16_t*, const uint16_t*, float*, const int64_t*, const gemm_params_t*);
+void moe_sve_w2_packed_direct_bf16(const uint16_t*, const uint16_t*, uint16_t*, const int64_t*,
+                                   const gemm_params_t*);
+void moe_sve_w2_packed_direct_bf16_m12(const uint16_t*, const uint16_t*, uint16_t*, const int64_t*,
+                                       const gemm_params_t*);
+void moe_sve_w2_packed_direct_bf16_m4(const uint16_t*, const uint16_t*, uint16_t*, const int64_t*,
+                                      const gemm_params_t*);
+void moe_sve_w2_packed_direct_bf16_m2(const uint16_t*, const uint16_t*, uint16_t*, const int64_t*,
+                                      const gemm_params_t*);
+void moe_sve_w2_packed_direct_bf16_m1(const uint16_t*, const uint16_t*, uint16_t*, const int64_t*,
+                                      const gemm_params_t*);
 void moe_sve_w2_packed_bf16(const uint16_t*, const uint16_t*, uint16_t*, uint16_t*, const gemm_params_t*);
 void moe_sve_w2_packed_bf16_m12(const uint16_t*, const uint16_t*, uint16_t*, uint16_t*, const gemm_params_t*);
 void moe_sve_w2_packed_bf16_m4(const uint16_t*, const uint16_t*, uint16_t*, uint16_t*, const gemm_params_t*);
@@ -942,17 +952,18 @@ bool sve_w2_direct_route_enabled() {
   return value[0] != '0';
 }
 
-bool sve_w2_direct_route_offsets_fit(int64_t num_routes, int64_t route_stride, int64_t n_tile) {
-  constexpr int64_t kFloatBytes = static_cast<int64_t>(sizeof(float));
-  if (route_stride <= 0 || n_tile <= 0 || route_stride > std::numeric_limits<int32_t>::max() / kFloatBytes ||
-      n_tile - 1 > std::numeric_limits<int32_t>::max() / kFloatBytes) {
+bool sve_w2_direct_route_offsets_fit(int64_t num_routes, int64_t route_stride, int64_t n_tile,
+                                     int64_t element_bytes) {
+  if (route_stride <= 0 || n_tile <= 0 || element_bytes <= 0 ||
+      route_stride > std::numeric_limits<int32_t>::max() / element_bytes ||
+      n_tile - 1 > std::numeric_limits<int32_t>::max() / element_bytes) {
     return false;
   }
   if (num_routes <= 1) {
     return true;
   }
-  const int64_t row_bytes = route_stride * kFloatBytes;
-  const int64_t max_tile_offset = (n_tile - 1) * kFloatBytes;
+  const int64_t row_bytes = route_stride * element_bytes;
+  const int64_t max_tile_offset = (n_tile - 1) * element_bytes;
   const int64_t max_route_delta = std::numeric_limits<int32_t>::max() - max_tile_offset;
   return num_routes - 1 <= max_route_delta / row_bytes;
 }
@@ -1252,6 +1263,77 @@ void sve_asm_packed_w2_direct_route_hybrid_dispatch(const uint16_t* packed_A, co
   }
   sve_asm_packed_w2_direct_route_tail_dispatch(packed_A + static_cast<int64_t>(main_rows) * K, w2_packed, route_out,
                                                route_ids + main_rows, tail, K, N, route_stride);
+}
+
+using DirectRoutePackedBf16KernelFn = void (*)(const uint16_t*, const uint16_t*, uint16_t*, const int64_t*,
+                                               const gemm_params_t*);
+
+void sve_asm_packed_w2_direct_bf16_route_tail_dispatch(const uint16_t* packed_A, const uint16_t* w2_packed,
+                                                       uint16_t* route_out, const int64_t* route_ids, int rows, int K,
+                                                       int N, int route_stride) {
+  gemm_params_t p;
+  p.k = K;
+  p.n = N;
+  p.lda = K;
+  p.ldb = K;
+  p.ldc = route_stride;
+  const int nb_full = rows / 8;
+  for (int mb = 0; mb < nb_full; ++mb) {
+    p.m = 8;
+    moe_sve_w2_packed_direct_bf16(packed_A + static_cast<int64_t>(mb) * 8 * K, w2_packed, route_out,
+                                  route_ids + static_cast<int64_t>(mb) * 8, &p);
+  }
+  const int tail = rows - nb_full * 8;
+  if (tail == 0) {
+    return;
+  }
+  const uint16_t* At = packed_A + static_cast<int64_t>(nb_full) * 8 * K;
+  const int64_t* routes = route_ids + static_cast<int64_t>(nb_full) * 8;
+  auto run = [&](DirectRoutePackedBf16KernelFn fn) {
+    p.m = tail;
+    fn(At, w2_packed, route_out, routes, &p);
+  };
+  switch (tail) {
+    case 1:
+      run(moe_sve_w2_packed_direct_bf16_m1);
+      break;
+    case 2:
+      run(moe_sve_w2_packed_direct_bf16_m2);
+      break;
+    case 3:
+    case 4:
+      run(moe_sve_w2_packed_direct_bf16_m4);
+      break;
+    case 5:
+    case 6:
+    case 7:
+      run(moe_sve_w2_packed_direct_bf16);
+      break;
+  }
+}
+
+void sve_asm_packed_w2_direct_bf16_route_hybrid_dispatch(const uint16_t* packed_A, const uint16_t* w2_packed,
+                                                         uint16_t* route_out, const int64_t* route_ids, int rows, int K,
+                                                         int N, int route_stride) {
+  gemm_params_t p;
+  p.k = K;
+  p.n = N;
+  p.lda = K;
+  p.ldb = K;
+  p.ldc = route_stride;
+  const int main_rows = static_cast<int>(sve_m12_main_rows(rows));
+  for (int mb = 0; mb < main_rows; mb += 12) {
+    p.m = std::min(12, rows - mb);
+    moe_sve_w2_packed_direct_bf16_m12(packed_A + static_cast<int64_t>(mb) * K, w2_packed, route_out,
+                                      route_ids + mb, &p);
+  }
+  const int tail = rows - main_rows;
+  if (tail <= 0) {
+    return;
+  }
+  sve_asm_packed_w2_direct_bf16_route_tail_dispatch(
+      packed_A + static_cast<int64_t>(main_rows) * K, w2_packed, route_out, route_ids + main_rows, tail, K, N,
+      route_stride);
 }
 
 using PlainPackedBf16KernelFn = void (*)(const uint16_t*, const uint16_t*, uint16_t*, uint16_t*, const gemm_params_t*);
@@ -2783,6 +2865,78 @@ void team_w2_packed_sve_direct_route_2d(const TeamContext& team, const Gemm2DSpl
 #endif
 }
 
+void team_w2_packed_sve_direct_bf16_route(const TeamContext& team, const uint16_t* packed_A,
+                                          const uint16_t* w2_packed, uint16_t* route_out, const int64_t* route_ids,
+                                          int rows, int K, int N, int route_stride, int64_t n_tile,
+                                          int64_t weight_window_bytes = 0) {
+#if defined(__ARM_FEATURE_SVE) && defined(__ARM_FEATURE_BF16)
+  const WeightWindowPlan windows = make_weight_window_plan(K, N, n_tile, weight_window_bytes);
+  for_each_weight_window(windows, [&](const SplitRange& window) {
+    const SplitRange range = n_split_range_tile(static_cast<int>(window.size), team.group_size, team.local_tid, n_tile);
+    if (range.size <= 0) {
+      return;
+    }
+    const int64_t abs_begin = window.begin + range.begin;
+    const int64_t start_block = abs_begin / n_tile;
+    sve_asm_packed_w2_direct_bf16_route_hybrid_dispatch(
+        packed_A, w2_packed + start_block * static_cast<int64_t>(K) * n_tile, route_out + abs_begin, route_ids, rows, K,
+        static_cast<int>(range.size), route_stride);
+  });
+#else
+  (void)team;
+  (void)packed_A;
+  (void)w2_packed;
+  (void)route_out;
+  (void)route_ids;
+  (void)rows;
+  (void)K;
+  (void)N;
+  (void)route_stride;
+  (void)n_tile;
+  (void)weight_window_bytes;
+  TORCH_CHECK(false, "SVE MoE asm direct-BF16-route w2 kernel is unavailable in this build");
+#endif
+}
+
+void team_w2_packed_sve_direct_bf16_route_2d(const TeamContext& team, const Gemm2DSplitPlan& plan,
+                                             const uint16_t* packed_A, const uint16_t* w2_packed, uint16_t* route_out,
+                                             const int64_t* route_ids, int rows, int K, int N, int route_stride,
+                                             int64_t weight_window_bytes = 0) {
+#if defined(__ARM_FEATURE_SVE) && defined(__ARM_FEATURE_BF16)
+  const WeightWindowPlan windows = make_weight_window_plan(K, N, plan.n_tile, weight_window_bytes);
+  for_each_weight_window(windows, [&](const SplitRange& window) {
+    Gemm2DSplitPlan subplan = plan;
+    if (windows.ranges > 1) {
+      subplan.tn = plan.tm * plan.tn;
+      subplan.tm = 1;
+    }
+    const Gemm2DThreadRange range = gemm_2d_thread_range(subplan, rows, window.size, team.local_tid);
+    if (range.rows <= 0 || range.n_cols <= 0) {
+      return;
+    }
+    const int64_t abs_begin = window.begin + range.n_begin;
+    const int64_t start_block = abs_begin / plan.n_tile;
+    TORCH_CHECK(range.row_begin == 0, "SVE fused expert only supports N-split ranges");
+    sve_asm_packed_w2_direct_bf16_route_hybrid_dispatch(
+        packed_A, w2_packed + start_block * static_cast<int64_t>(K) * plan.n_tile, route_out + abs_begin, route_ids,
+        static_cast<int>(range.rows), K, static_cast<int>(range.n_cols), route_stride);
+  });
+#else
+  (void)team;
+  (void)plan;
+  (void)packed_A;
+  (void)w2_packed;
+  (void)route_out;
+  (void)route_ids;
+  (void)rows;
+  (void)K;
+  (void)N;
+  (void)route_stride;
+  (void)weight_window_bytes;
+  TORCH_CHECK(false, "SVE MoE asm direct-BF16-route w2 kernel is unavailable in this build");
+#endif
+}
+
 void team_w2_packed_bf16_sve(const TeamContext& team, const uint16_t* packed_A, const uint16_t* w2_packed,
                              uint16_t* down, int rows, int K, int N, int ldc, int64_t n_tile,
                              int64_t weight_window_bytes = 0) {
@@ -2947,6 +3101,19 @@ void team_w2_packed_sve_direct_route_backend(bool use_2d_split, const TeamContex
   } else {
     team_w2_packed_sve_direct_route(team, packed_A, w2_packed, route_out, route_ids, rows, K, N, route_stride, n_tile,
                                     weight_window_bytes);
+  }
+}
+
+void team_w2_packed_sve_direct_bf16_route_backend(
+    bool use_2d_split, const TeamContext& team, const Gemm2DSplitPlan& plan, const uint16_t* packed_A,
+    const uint16_t* w2_packed, uint16_t* route_out, const int64_t* route_ids, int rows, int K, int N, int route_stride,
+    int64_t n_tile, int64_t weight_window_bytes = 0) {
+  if (use_2d_split) {
+    team_w2_packed_sve_direct_bf16_route_2d(team, plan, packed_A, w2_packed, route_out, route_ids, rows, K, N,
+                                            route_stride, weight_window_bytes);
+  } else {
+    team_w2_packed_sve_direct_bf16_route(team, packed_A, w2_packed, route_out, route_ids, rows, K, N, route_stride,
+                                         n_tile, weight_window_bytes);
   }
 }
 
@@ -5080,8 +5247,10 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input, at::Tensor w13_packed, int64_t
 #endif
   bool use_w2_direct_route = false;
 #if defined(__ARM_FEATURE_SVE) && defined(__ARM_FEATURE_BF16)
-  use_w2_direct_route = !skip_weighted && !use_w2_bf16_route && use_sve_backend && fuse_silu && fused_packa_w2 &&
-                        w2.N_pad == H && sve_w2_direct_route_offsets_fit(num_routes, H, w2.n_tile) &&
+  const int64_t route_element_bytes =
+      use_w2_bf16_route ? static_cast<int64_t>(sizeof(uint16_t)) : static_cast<int64_t>(sizeof(float));
+  use_w2_direct_route = !skip_weighted && use_sve_backend && fuse_silu && fused_packa_w2 && w2.N_pad == H &&
+                        sve_w2_direct_route_offsets_fit(num_routes, H, w2.n_tile, route_element_bytes) &&
                         sve_w2_direct_route_enabled();
 #endif
   at::Tensor route_out;
@@ -5173,7 +5342,7 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input, at::Tensor w13_packed, int64_t
       const size_t down_elements =
           static_cast<size_t>((use_sve_backend ? max_fused_packa_rows : max_expert_rows) * w2.N_pad);
       scratch.down.resize(use_w2_bf16_route || use_w2_direct_route ? 0 : down_elements);
-      scratch.down_bf16.resize(use_w2_bf16_route ? down_elements : 0);
+      scratch.down_bf16.resize(use_w2_bf16_route && !use_w2_direct_route ? down_elements : 0);
     }
 
     const auto schedule_compute_begin = ::fused_cpp::profile::now();
@@ -5246,10 +5415,17 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input, at::Tensor w13_packed, int64_t
             team.barrier = nullptr;
             team.a_reorder = nullptr;
             if (use_w2_direct_route) {
-              team_w2_packed_sve_direct_route(
-                  team, scratch.intermediate.data(), w2_ptr + task.expert * w2.packed_stride, route_out_ptr,
-                  expert_routes.data() + task.route_begin, static_cast<int>(rows), static_cast<int>(w2.K_pad),
-                  static_cast<int>(w2.N_pad), static_cast<int>(H), w2.n_tile, weight_window_bytes);
+              if (use_w2_bf16_route) {
+                team_w2_packed_sve_direct_bf16_route(
+                    team, scratch.intermediate.data(), w2_ptr + task.expert * w2.packed_stride, route_out_bf16_ptr,
+                    expert_routes.data() + task.route_begin, static_cast<int>(rows), static_cast<int>(w2.K_pad),
+                    static_cast<int>(w2.N_pad), static_cast<int>(H), w2.n_tile, weight_window_bytes);
+              } else {
+                team_w2_packed_sve_direct_route(
+                    team, scratch.intermediate.data(), w2_ptr + task.expert * w2.packed_stride, route_out_ptr,
+                    expert_routes.data() + task.route_begin, static_cast<int>(rows), static_cast<int>(w2.K_pad),
+                    static_cast<int>(w2.N_pad), static_cast<int>(H), w2.n_tile, weight_window_bytes);
+              }
             } else if (use_w2_bf16_route) {
               team_w2_packed_bf16_sve(team, scratch.intermediate.data(), w2_ptr + task.expert * w2.packed_stride,
                                       scratch.down_bf16.data(), static_cast<int>(rows), static_cast<int>(w2.K_pad),
@@ -5407,9 +5583,12 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input, at::Tensor w13_packed, int64_t
       HierarchicalScratchPool::ensure(sc.gate_up,
                                       static_cast<size_t>(packa_skip_gate_up ? 0 : max_expert_rows * w13.N_pad));
       const size_t down_need = static_cast<size_t>(max_fused_packa_rows * w2.N_pad);
+      if (use_w2_direct_route) {
+        continue;
+      }
       if (use_w2_bf16_route) {
         HierarchicalScratchPool::ensure(sc.down_bf16, down_need);
-      } else if (!use_w2_direct_route) {
+      } else {
         HierarchicalScratchPool::ensure(sc.down, down_need);
       }
     }
@@ -5607,11 +5786,19 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input, at::Tensor w13_packed, int64_t
           const Gemm2DSplitPlan w2_2d_plan = plan_2d_gemm_split(rows, w2.K_pad, w2.N_pad, nsplit_group_size, w2.n_tile);
           time_phase(phase_w2_ms, [&] {
             if (use_w2_direct_route) {
-              team_w2_packed_sve_direct_route_backend(use_fused_2d_split, w2team, w2_2d_plan,
-                                                      scratch.intermediate.data(), w2_ptr + expert * w2.packed_stride,
-                                                      route_out_ptr, expert_routes.data(), static_cast<int>(rows),
-                                                      static_cast<int>(w2.K_pad), static_cast<int>(w2.N_pad),
-                                                      static_cast<int>(H), w2.n_tile, weight_window_bytes);
+              if (use_w2_bf16_route) {
+                team_w2_packed_sve_direct_bf16_route_backend(
+                    use_fused_2d_split, w2team, w2_2d_plan, scratch.intermediate.data(),
+                    w2_ptr + expert * w2.packed_stride, route_out_bf16_ptr, expert_routes.data(),
+                    static_cast<int>(rows), static_cast<int>(w2.K_pad), static_cast<int>(w2.N_pad),
+                    static_cast<int>(H), w2.n_tile, weight_window_bytes);
+              } else {
+                team_w2_packed_sve_direct_route_backend(
+                    use_fused_2d_split, w2team, w2_2d_plan, scratch.intermediate.data(),
+                    w2_ptr + expert * w2.packed_stride, route_out_ptr, expert_routes.data(), static_cast<int>(rows),
+                    static_cast<int>(w2.K_pad), static_cast<int>(w2.N_pad), static_cast<int>(H), w2.n_tile,
+                    weight_window_bytes);
+              }
             } else if (use_w2_bf16_route) {
               team_w2_packed_bf16_sve_backend(use_fused_2d_split, w2team, w2_2d_plan, scratch.intermediate.data(),
                                               w2_ptr + expert * w2.packed_stride, scratch.down_bf16.data(),
@@ -5953,8 +6140,11 @@ at::Tensor fused_moe_bf16_tiled_scheduled(at::Tensor input, at::Tensor w13_packe
   const int64_t num_routes = num_tokens * top_k;
   bool use_w2_direct_route = false;
 #if defined(__ARM_FEATURE_SVE) && defined(__ARM_FEATURE_BF16)
-  use_w2_direct_route = !skip_weighted && !use_w2_bf16_route && use_sve_backend && fuse_silu && w2.N_pad == H &&
-                        sve_w2_direct_route_offsets_fit(num_routes, H, w2.n_tile) && sve_w2_direct_route_enabled();
+  const int64_t route_element_bytes =
+      use_w2_bf16_route ? static_cast<int64_t>(sizeof(uint16_t)) : static_cast<int64_t>(sizeof(float));
+  use_w2_direct_route = !skip_weighted && use_sve_backend && fuse_silu && w2.N_pad == H &&
+                        sve_w2_direct_route_offsets_fit(num_routes, H, w2.n_tile, route_element_bytes) &&
+                        sve_w2_direct_route_enabled();
 #endif
 
   std::vector<std::vector<int64_t>> routes(static_cast<size_t>(num_experts));
@@ -6210,10 +6400,19 @@ at::Tensor fused_moe_bf16_tiled_scheduled(at::Tensor input, at::Tensor w13_packe
           w2team.a_reorder = nullptr;
           const Gemm2DSplitPlan w2_2d_plan = plan_2d_gemm_split(rows, w2.K_pad, w2.N_pad, group_size, w2.n_tile);
           if (use_w2_direct_route) {
-            team_w2_packed_sve_direct_route_backend(
-                use_fused_2d_split, w2team, w2_2d_plan, scratch.intermediate.data(), w2_ptr + expert * w2.packed_stride,
-                route_out_ptr, expert_routes.data(), static_cast<int>(rows), static_cast<int>(w2.K_pad),
-                static_cast<int>(w2.N_pad), static_cast<int>(H), w2.n_tile, weight_window_bytes);
+            if (use_w2_bf16_route) {
+              team_w2_packed_sve_direct_bf16_route_backend(
+                  use_fused_2d_split, w2team, w2_2d_plan, scratch.intermediate.data(),
+                  w2_ptr + expert * w2.packed_stride, route_out_bf16_ptr, expert_routes.data(), static_cast<int>(rows),
+                  static_cast<int>(w2.K_pad), static_cast<int>(w2.N_pad), static_cast<int>(H), w2.n_tile,
+                  weight_window_bytes);
+            } else {
+              team_w2_packed_sve_direct_route_backend(
+                  use_fused_2d_split, w2team, w2_2d_plan, scratch.intermediate.data(),
+                  w2_ptr + expert * w2.packed_stride, route_out_ptr, expert_routes.data(), static_cast<int>(rows),
+                  static_cast<int>(w2.K_pad), static_cast<int>(w2.N_pad), static_cast<int>(H), w2.n_tile,
+                  weight_window_bytes);
+            }
           } else if (use_w2_bf16_route) {
             team_w2_packed_bf16_sve_backend(
                 use_fused_2d_split, w2team, w2_2d_plan, scratch.intermediate.data(), w2_ptr + expert * w2.packed_stride,
@@ -6462,8 +6661,11 @@ at::Tensor fused_moe_bf16_tiled_async(at::Tensor input, at::Tensor w13_packed, i
   const int64_t num_routes = num_tokens * top_k;
   bool use_w2_direct_route = false;
 #if defined(__ARM_FEATURE_SVE) && defined(__ARM_FEATURE_BF16)
-  use_w2_direct_route = !skip_weighted && !use_w2_bf16_route && use_sve_backend && fuse_silu && w2.N_pad == H &&
-                        sve_w2_direct_route_offsets_fit(num_routes, H, w2.n_tile) && sve_w2_direct_route_enabled();
+  const int64_t route_element_bytes =
+      use_w2_bf16_route ? static_cast<int64_t>(sizeof(uint16_t)) : static_cast<int64_t>(sizeof(float));
+  use_w2_direct_route = !skip_weighted && use_sve_backend && fuse_silu && w2.N_pad == H &&
+                        sve_w2_direct_route_offsets_fit(num_routes, H, w2.n_tile, route_element_bytes) &&
+                        sve_w2_direct_route_enabled();
 #endif
   bool use_async_ready_token_merge =
       use_w2_direct_route && env_flag_enabled_by_default("FUSED_CPP_MOE_ASYNC_READY_TOKEN_MERGE");
@@ -6793,10 +6995,19 @@ at::Tensor fused_moe_bf16_tiled_async(at::Tensor input, at::Tensor w13_packed, i
       w2team.a_reorder = nullptr;
       const Gemm2DSplitPlan w2_2d_plan = plan_2d_gemm_split(rows, w2.K_pad, w2.N_pad, group_size, w2.n_tile);
       if (use_w2_direct_route) {
-        team_w2_packed_sve_direct_route_backend(
-            use_fused_2d_split, w2team, w2_2d_plan, scratch.intermediate.data(), w2_ptr + expert * w2.packed_stride,
-            route_out_ptr, expert_routes.data(), static_cast<int>(rows), static_cast<int>(w2.K_pad),
-            static_cast<int>(w2.N_pad), static_cast<int>(H), w2.n_tile, weight_window_bytes);
+        if (use_w2_bf16_route) {
+          team_w2_packed_sve_direct_bf16_route_backend(
+              use_fused_2d_split, w2team, w2_2d_plan, scratch.intermediate.data(),
+              w2_ptr + expert * w2.packed_stride, route_out_bf16_ptr, expert_routes.data(), static_cast<int>(rows),
+              static_cast<int>(w2.K_pad), static_cast<int>(w2.N_pad), static_cast<int>(H), w2.n_tile,
+              weight_window_bytes);
+        } else {
+          team_w2_packed_sve_direct_route_backend(
+              use_fused_2d_split, w2team, w2_2d_plan, scratch.intermediate.data(),
+              w2_ptr + expert * w2.packed_stride, route_out_ptr, expert_routes.data(), static_cast<int>(rows),
+              static_cast<int>(w2.K_pad), static_cast<int>(w2.N_pad), static_cast<int>(H), w2.n_tile,
+              weight_window_bytes);
+        }
       } else if (use_w2_bf16_route) {
         team_w2_packed_bf16_sve_backend(use_fused_2d_split, w2team, w2_2d_plan, scratch.intermediate.data(),
                                         w2_ptr + expert * w2.packed_stride, scratch.down_bf16.data(),

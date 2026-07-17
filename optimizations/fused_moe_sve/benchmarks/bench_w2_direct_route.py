@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare the default SVE W2 FP32 direct-route store with its scatter fallback."""
+"""Compare SVE W2 FP32/BF16 route storage with direct and scatter stores."""
 
 from __future__ import annotations
 
@@ -28,7 +28,13 @@ from fused_cpp.moe import (  # noqa: E402
 
 
 DIRECT_FLAG = "FUSED_CPP_MOE_SVE_W2_DIRECT_ROUTE"
-VARIANTS = (("baseline_scatter", "0"), ("direct_route", "1"))
+BF16_FLAG = "FUSED_CPP_MOE_W2_BF16_ROUTE"
+VARIANTS = (
+    ("fp32_scatter", "0", "0"),
+    ("fp32_direct", "0", "1"),
+    ("bf16_scatter", "1", "0"),
+    ("bf16_direct", "1", "1"),
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -40,7 +46,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-k", type=int, default=6)
     parser.add_argument("--threads", type=int, default=96)
     parser.add_argument("--path", choices=("normal", "scheduled", "async"), default="async")
-    parser.add_argument("--variant", choices=("both", "baseline_scatter", "direct_route"), default="both")
+    parser.add_argument("--variant", choices=("all", *(item[0] for item in VARIANTS)), default="all")
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--runs", type=int, default=31)
     parser.add_argument("--seed", type=int, default=20260716)
@@ -84,6 +90,19 @@ def parse_trace(path: Path) -> dict[str, object]:
     return {"e2e_ms": e2e_ms, "stages": stages}
 
 
+def error_metrics(candidate: torch.Tensor, reference: torch.Tensor) -> dict[str, float]:
+    candidate_f32 = candidate.float().flatten()
+    reference_f32 = reference.float().flatten()
+    delta = candidate_f32 - reference_f32
+    cosine = torch.nn.functional.cosine_similarity(candidate_f32, reference_f32, dim=0).item()
+    return {
+        "max_abs": delta.abs().max().item(),
+        "mean_abs": delta.abs().mean().item(),
+        "rmse": delta.square().mean().sqrt().item(),
+        "cosine": max(-1.0, min(1.0, cosine)),
+    }
+
+
 @torch.inference_mode()
 def main() -> int:
     args = parse_args()
@@ -94,7 +113,7 @@ def main() -> int:
         raise ValueError("experts must be at least top-k")
     if args.path != "normal" and args.threads % args.experts != 0:
         raise ValueError("scheduled and async paths require threads divisible by experts")
-    variants = VARIANTS if args.variant == "both" else tuple(item for item in VARIANTS if item[0] == args.variant)
+    variants = VARIANTS if args.variant == "all" else tuple(item for item in VARIANTS if item[0] == args.variant)
     affinity = sorted(os.sched_getaffinity(0))
     if args.threads > len(affinity):
         raise ValueError(f"threads={args.threads} exceeds affinity size {len(affinity)}")
@@ -115,7 +134,6 @@ def main() -> int:
 
     os.environ["FUSED_CPP_MOE_SVE"] = "1"
     os.environ["FUSED_CPP_MOE_W13_SPLIT_N"] = "1"
-    os.environ["FUSED_CPP_MOE_W2_BF16_ROUTE"] = "0"
     os.environ["FUSED_CPP_MOE_SVE_ROUTE_MERGE_UNROLL"] = "1"
     os.environ["FUSED_CPP_MOE_PIN_THREADS"] = "1"
     os.environ["FUSED_CPP_MOE_PIN_THREAD_CPUS"] = ",".join(str(cpu) for cpu in affinity[: args.threads])
@@ -182,38 +200,39 @@ def main() -> int:
             )
 
     outputs: dict[str, torch.Tensor] = {}
-    for name, flag in VARIANTS:
-        os.environ[DIRECT_FLAG] = flag
+    for name, bf16_flag, direct_flag in VARIANTS:
+        os.environ[BF16_FLAG] = bf16_flag
+        os.environ[DIRECT_FLAG] = direct_flag
         outputs[name] = run().clone()
-    for name, output in outputs.items():
-        torch.testing.assert_close(
-            output.float(),
-            outputs["baseline_scatter"].float(),
-            atol=0,
-            rtol=0,
-            msg=lambda message, name=name: f"{name}: {message}",
-        )
+    torch.testing.assert_close(outputs["fp32_direct"].float(), outputs["fp32_scatter"].float(), atol=0, rtol=0)
+    torch.testing.assert_close(outputs["bf16_direct"].float(), outputs["bf16_scatter"].float(), atol=0, rtol=0)
+    precision = {
+        name: error_metrics(output, outputs["fp32_direct"])
+        for name, output in outputs.items()
+    }
 
     for iteration in range(args.warmup):
         rotate = iteration % len(variants)
         ordered = variants[rotate:] + variants[:rotate]
-        for _, flag in ordered:
-            os.environ[DIRECT_FLAG] = flag
+        for _, bf16_flag, direct_flag in ordered:
+            os.environ[BF16_FLAG] = bf16_flag
+            os.environ[DIRECT_FLAG] = direct_flag
             run()
 
     if args.stop_before_runs:
         print(f"PROFILE_READY pid={os.getpid()}", flush=True)
         os.kill(os.getpid(), signal.SIGSTOP)
 
-    samples = {name: [] for name, _ in variants}
-    minor_faults = {name: [] for name, _ in variants}
-    major_faults = {name: [] for name, _ in variants}
+    samples = {name: [] for name, _, _ in variants}
+    minor_faults = {name: [] for name, _, _ in variants}
+    major_faults = {name: [] for name, _, _ in variants}
     sink = 0
     for iteration in range(args.runs):
         rotate = iteration % len(variants)
         ordered = variants[rotate:] + variants[:rotate]
-        for name, flag in ordered:
-            os.environ[DIRECT_FLAG] = flag
+        for name, bf16_flag, direct_flag in ordered:
+            os.environ[BF16_FLAG] = bf16_flag
+            os.environ[DIRECT_FLAG] = direct_flag
             usage_before = resource.getrusage(resource.RUSAGE_SELF)
             begin = time.perf_counter_ns()
             output = run()
@@ -226,35 +245,46 @@ def main() -> int:
     trace_results: dict[str, object] = {}
     if args.trace_dir is not None:
         args.trace_dir.mkdir(parents=True, exist_ok=True)
-        for name, flag in variants:
+        for name, bf16_flag, direct_flag in variants:
             trace_path = args.trace_dir / f"{name}.log"
             trace_path.unlink(missing_ok=True)
-            os.environ[DIRECT_FLAG] = flag
+            os.environ[BF16_FLAG] = bf16_flag
+            os.environ[DIRECT_FLAG] = direct_flag
             os.environ["FUSED_CPP_MOE_TRACE"] = "1"
             os.environ["FUSED_CPP_MOE_TRACE_FILE"] = str(trace_path)
             run()
             os.environ["FUSED_CPP_MOE_TRACE"] = "0"
             trace_results[name] = parse_trace(trace_path)
 
-    baseline_ms = statistics.median(samples["baseline_scatter"]) if "baseline_scatter" in samples else None
+    fp32_direct_ms = statistics.median(samples["fp32_direct"]) if "fp32_direct" in samples else None
+    scatter_names = {"fp32_direct": "fp32_scatter", "bf16_direct": "bf16_scatter"}
     records: list[dict[str, object]] = []
-    for name, flag in variants:
+    for name, bf16_flag, direct_flag in variants:
         median_ms = statistics.median(samples[name])
+        scatter_name = scatter_names.get(name)
+        scatter_ms = statistics.median(samples[scatter_name]) if scatter_name in samples else None
         records.append(
             {
                 "variant": name,
-                "direct_route": flag == "1",
+                "bf16_route": bf16_flag == "1",
+                "direct_route": direct_flag == "1",
                 "median_ms": median_ms,
                 "p10_ms": percentile(samples[name], 0.10),
                 "p90_ms": percentile(samples[name], 0.90),
-                "gain_pct": None if baseline_ms is None else 100.0 * (baseline_ms / median_ms - 1.0),
+                "gain_vs_fp32_direct_pct": (
+                    None if fp32_direct_ms is None else 100.0 * (fp32_direct_ms / median_ms - 1.0)
+                ),
+                "gain_vs_same_dtype_scatter_pct": (
+                    None if scatter_ms is None else 100.0 * (scatter_ms / median_ms - 1.0)
+                ),
                 "samples": samples[name],
                 "minor_faults": minor_faults[name],
                 "major_faults": major_faults[name],
             }
         )
 
-    route_bytes = args.tokens * args.top_k * args.hidden * 4
+    fp32_route_bytes = args.tokens * args.top_k * args.hidden * 4
+    bf16_route_bytes = fp32_route_bytes // 2
     result = {
         "shape": {
             "path": args.path,
@@ -268,22 +298,36 @@ def main() -> int:
             "w13_split": True,
         },
         "logical_post_w2_bytes": {
-            "baseline_scatter": 4 * route_bytes,
-            "direct_route": 2 * route_bytes,
-            "saved": 2 * route_bytes,
+            "fp32_scatter": 4 * fp32_route_bytes,
+            "fp32_direct": 2 * fp32_route_bytes,
+            "bf16_scatter": 4 * bf16_route_bytes,
+            "bf16_direct": 2 * bf16_route_bytes,
+            "bf16_direct_saved_vs_fp32_direct": fp32_route_bytes,
         },
+        "precision_vs_fp32_direct": precision,
         "records": records,
         "trace": trace_results,
         "sink": sink,
     }
-    print("variant             median_ms    gain_pct     p10_ms     p90_ms  max_minflt")
+    print("variant         median_ms  vs_fp32_direct  vs_scatter     p10_ms     p90_ms  max_minflt")
     for record in records:
-        gain = "n/a" if record["gain_pct"] is None else f"{record['gain_pct']:.2f}"
+        fp32_gain = (
+            "n/a"
+            if record["gain_vs_fp32_direct_pct"] is None
+            else f"{record['gain_vs_fp32_direct_pct']:.2f}"
+        )
+        scatter_gain = (
+            "n/a"
+            if record["gain_vs_same_dtype_scatter_pct"] is None
+            else f"{record['gain_vs_same_dtype_scatter_pct']:.2f}"
+        )
         print(
-            f"{record['variant']:<19} {record['median_ms']:>9.3f} "
-            f"{gain:>10} {record['p10_ms']:>10.3f} {record['p90_ms']:>10.3f} "
+            f"{record['variant']:<15} {record['median_ms']:>9.3f} "
+            f"{fp32_gain:>15} {scatter_gain:>11} {record['p10_ms']:>10.3f} {record['p90_ms']:>10.3f} "
             f"{max(record['minor_faults']):>11}"
         )
+    print("precision_vs_fp32_direct")
+    print(json.dumps(precision, indent=2))
     if trace_results:
         print(json.dumps(trace_results, indent=2))
     if args.output is not None:
