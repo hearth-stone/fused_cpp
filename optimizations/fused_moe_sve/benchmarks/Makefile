@@ -11,16 +11,16 @@ LDFLAGS += -pthread
 TARGETS := bench_elastic_nsplit bench_unfused_pipeline bench_single_core_weight_window \
 	bench_fragmented_route_pipeline bench_m12_llc_pollution bench_route_merge_tree
 ELASTIC_SOURCES := bench_elastic_nsplit.cpp $(FEATURES)/elastic_nsplit.cpp \
-	$(ROOT)/csrc/moe_sve_fused_asm.S
+	$(ROOT)/csrc/moe/arm/sve_bf16/kernels.S
 UNFUSED_SOURCES := bench_unfused_pipeline.cpp $(FEATURES)/unfused_pipeline.cpp \
-	$(ROOT)/csrc/moe_sve_fused_asm.S
+	$(ROOT)/csrc/moe/arm/sve_bf16/kernels.S
 SINGLE_CORE_WINDOW_SOURCES := bench_single_core_weight_window.cpp \
-	$(ROOT)/csrc/moe_sve_fused_asm.S
+	$(ROOT)/csrc/moe/arm/sve_bf16/kernels.S
 M12_LLC_POLLUTION_SOURCES := bench_m12_llc_pollution.cpp \
-	$(ROOT)/csrc/moe_sve_fused_asm.S
+	$(ROOT)/csrc/moe/arm/sve_bf16/kernels.S
 FRAGMENTED_ROUTE_SOURCES := bench_fragmented_route_pipeline.cpp $(FEATURES)/unfused_pipeline.cpp \
-	$(ROOT)/csrc/moe_sve_fused_asm.S
-ROUTE_MERGE_SOURCES := bench_route_merge_tree.cpp $(ROOT)/csrc/moe_route_merge_sve.cpp
+	$(ROOT)/csrc/moe/arm/sve_bf16/kernels.S
+ROUTE_MERGE_SOURCES := bench_route_merge_tree.cpp $(ROOT)/csrc/moe/arm/sve_bf16/route_merge.cpp
 
 .PHONY: all check clean
 
@@ -42,7 +42,7 @@ bench_fragmented_route_pipeline: $(FRAGMENTED_ROUTE_SOURCES) $(FEATURES)/unfused
 	$(I8GEMM)/gemm_params.h
 	$(CXX) $(CXXFLAGS) $(FRAGMENTED_ROUTE_SOURCES) $(LDFLAGS) -o $@
 
-bench_route_merge_tree: $(ROUTE_MERGE_SOURCES) $(ROOT)/csrc/moe_route_merge_sve.h
+bench_route_merge_tree: $(ROUTE_MERGE_SOURCES) $(ROOT)/csrc/moe/common/route_merge.h
 	$(CXX) $(CXXFLAGS) $(ROUTE_MERGE_SOURCES) $(LDFLAGS) -o $@
 
 check: $(TARGETS)

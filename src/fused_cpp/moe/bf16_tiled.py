@@ -22,39 +22,55 @@ class PreparedBF16TiledFusedMoEWeights:
     # 1=SVE fused kernel default when available; 0=NEON legacy fallback.
     gemm_backend: int = 0
     backend_n_tile: int = 8
+    backend_name: str = "arm_neon_bf16"
 
 
 try:
-    from fused_cpp._C import (  # type: ignore[import-untyped]
-        fused_moe_bf16_tiled as _fused_moe_bf16_tiled_impl,
-    )
-    from fused_cpp._C import (  # type: ignore[import-untyped]
-        fused_moe_bf16_tiled_prepare_weights as _prepare_bf16_tiled_impl,
-    )
+    from fused_cpp import _moe_C as _moe_native  # type: ignore[attr-defined, import-untyped]
 
+    _fused_moe_bf16_tiled_impl = _moe_native.fused_moe_bf16_tiled
+    _fused_moe_bf16_tiled_scheduled_impl = _moe_native.fused_moe_bf16_tiled_scheduled
+    _fused_moe_bf16_tiled_async_impl = _moe_native.fused_moe_bf16_tiled_async
+    _prepare_bf16_tiled_impl = _moe_native.fused_moe_bf16_tiled_prepare_weights
+    _available_backends_impl = _moe_native.fused_moe_bf16_tiled_available_backends
+    _HAS_BF16_TILED_FUSED_MOE = bool(_available_backends_impl())
+
+    # Keep direct fused_cpp._C.fused_moe_* users working while the native MoE
+    # code lives in its own fat-binary extension.
     try:
-        from fused_cpp._C import (  # type: ignore[import-untyped]
-            fused_moe_bf16_tiled_scheduled as _scheduled_impl,
-        )
+        from fused_cpp import _C as _legacy_native  # type: ignore[attr-defined, import-untyped]
+    except ImportError:
+        _legacy_native = None
 
-        _fused_moe_bf16_tiled_scheduled_impl = _scheduled_impl
-    except (ImportError, AttributeError):
-        _fused_moe_bf16_tiled_scheduled_impl = None
-    try:
-        from fused_cpp._C import (  # type: ignore[import-untyped]
-            fused_moe_bf16_tiled_async as _async_impl,
-        )
-
-        _fused_moe_bf16_tiled_async_impl = _async_impl
-    except (ImportError, AttributeError):
-        _fused_moe_bf16_tiled_async_impl = None
-
-    _HAS_BF16_TILED_FUSED_MOE = True
+    for _name in (
+        "fused_moe_bf16_tiled_available_backends",
+        "fused_moe_bf16_tiled_prepare_weights",
+        "fused_moe_bf16_tiled",
+        "fused_moe_bf16_tiled_scheduled",
+        "fused_moe_bf16_tiled_async",
+        "fused_moe_test_split_plan",
+        "fused_moe_test_single_thread_gemm",
+        "fused_moe_test_pack_interleaved_gemm",
+        "fused_moe_test_fused_w13_linear",
+        "fused_moe_test_fused_w13_silu",
+        "fused_moe_test_team_fused_w13_silu",
+        "fused_moe_test_pack_a_reorder_m8",
+        "fused_moe_test_gather_pack_a_reorder_m8",
+        "fused_moe_test_fused_w13_silu_packc",
+        "fused_moe_test_fused_w13_silu_packc_tail",
+        "fused_moe_test_team_gemm",
+        "fused_moe_bench_team_gemm",
+        "fused_moe_bench_fused_w13_silu_packc_tail",
+    ):
+        if _legacy_native is not None and hasattr(_moe_native, _name) and not hasattr(_legacy_native, _name):
+            setattr(_legacy_native, _name, getattr(_moe_native, _name))
 except (ImportError, AttributeError):
+    _moe_native = None
     _fused_moe_bf16_tiled_impl = None
     _fused_moe_bf16_tiled_scheduled_impl = None
     _fused_moe_bf16_tiled_async_impl = None
     _prepare_bf16_tiled_impl = None
+    _available_backends_impl = None
     _HAS_BF16_TILED_FUSED_MOE = False
 
 
@@ -68,7 +84,14 @@ _INTEGER_DTYPES = {
 
 def _require_backend() -> None:
     if not _HAS_BF16_TILED_FUSED_MOE:
-        raise RuntimeError("BF16 tiled fused MoE backend is unavailable (requires the C++ extension on AArch64)")
+        raise RuntimeError("No BF16 tiled fused MoE backend is supported by this build and CPU")
+
+
+def available_fused_moe_bf16_tiled_backends() -> tuple[str, ...]:
+    """Return native BF16 MoE backends usable by the current process."""
+    if _available_backends_impl is None:
+        return ()
+    return tuple(str(name) for name in _available_backends_impl())
 
 
 def _activation_name(activation: Any) -> str:
@@ -124,6 +147,7 @@ def prepare_fused_moe_bf16_tiled_weights(
     w2_weight: torch.Tensor,
     *,
     fuse_silu: bool = False,
+    backend: str = "auto",
 ) -> PreparedBF16TiledFusedMoEWeights:
     """Pack dense bf16 expert weights for :func:`fused_moe_bf16_tiled`.
 
@@ -141,18 +165,24 @@ def prepare_fused_moe_bf16_tiled_weights(
         raise TypeError("BF16 tiled fused MoE weights must be torch.bfloat16")
     if not w13_weight.device.type == w2_weight.device.type == "cpu":
         raise ValueError("BF16 tiled fused MoE weights must be CPU tensors")
+    if not isinstance(backend, str):
+        raise TypeError(f"backend must be a string, got {type(backend).__name__}")
 
     packed = _prepare_bf16_tiled_impl(
         w13_weight.contiguous(),
         w2_weight.contiguous(),
         bool(fuse_silu),
+        backend,
     )
+    backend_id = int(packed[6]) if len(packed) > 6 else 0
+    backend_names = {0: "arm_neon_bf16", 1: "arm_sve_bf16"}
     return PreparedBF16TiledFusedMoEWeights(
         w13=(packed[0], int(packed[1]), int(packed[2])),
         w2=(packed[3], int(packed[4]), int(packed[5])),
         fused_silu=bool(fuse_silu),
-        gemm_backend=int(packed[6]) if len(packed) > 6 else 0,
+        gemm_backend=backend_id,
         backend_n_tile=int(packed[7]) if len(packed) > 7 else 8,
+        backend_name=str(packed[8]) if len(packed) > 8 else backend_names.get(backend_id, f"backend_{backend_id}"),
     )
 
 
@@ -451,6 +481,7 @@ __all__ = [
     "PreparedBF16TiledFusedMoEWeights",
     "PreparedWeight",
     "_HAS_BF16_TILED_FUSED_MOE",
+    "available_fused_moe_bf16_tiled_backends",
     "fused_moe_bf16_tiled",
     "fused_moe_bf16_tiled_scheduled",
     "fused_moe_bf16_tiled_async",

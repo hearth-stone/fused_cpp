@@ -1,4 +1,4 @@
-// bf16gemm_silu_packc.S  (fused_cpp-owned; do NOT edit i8gemm)
+// ARM NEON/BFMMLA fused MoE kernels (fused_cpp-owned; do NOT edit i8gemm)
 // Self-contained copy of the ldp_silu kernel machinery from
 // refs/i8gemm/lib/bf16gemm_k.S, with a packed-C (reorder-m8) store so the
 // w13 fused SiLU epilogue writes intermediate directly in the layout w2

@@ -29,7 +29,8 @@
 #include <utility>
 #include <vector>
 
-#include "moe_route_merge_sve.h"
+#include "../../common/backend.h"
+#include "../../common/route_merge.h"
 
 #ifdef __linux__
 #include <pthread.h>
@@ -38,8 +39,8 @@
 
 #ifdef __aarch64__
 #include "gemm_params.h"
-#include "moe_sve_fused.h"
-#include "profile_utils.h"
+#include "../sve_bf16/packing.h"
+#include "../../../profile_utils.h"
 
 extern "C" {
 void bf16gemm_k_ld(const uint16_t* A, const uint16_t* B_reo, float* C, uint16_t* A_reorder,
@@ -97,7 +98,7 @@ void bf16gemm_k_ldp_silu_poly6_packc_m1(const uint16_t*, const uint16_t*, uint16
 void bf16gemm_k_ldp_m4(const uint16_t*, const uint16_t*, float*, uint16_t*, const gemm_params_t*);
 void bf16gemm_k_ldp_m2(const uint16_t*, const uint16_t*, float*, uint16_t*, const gemm_params_t*);
 void bf16gemm_k_ldp_m1(const uint16_t*, const uint16_t*, float*, uint16_t*, const gemm_params_t*);
-#if defined(__ARM_FEATURE_SVE) && defined(__ARM_FEATURE_BF16)
+#if defined(FUSED_CPP_MOE_HAS_ARM_SVE)
 void moe_sve_w13_silu_poly4_packc_m12(const uint16_t*, const uint16_t*, uint16_t*, uint16_t*, const gemm_params_t*);
 void moe_sve_w13_silu_poly5_packc_m12(const uint16_t*, const uint16_t*, uint16_t*, uint16_t*, const gemm_params_t*);
 void moe_sve_w13_silu_poly6_packc_m12(const uint16_t*, const uint16_t*, uint16_t*, uint16_t*, const gemm_params_t*);
@@ -204,12 +205,21 @@ namespace {
 
 constexpr int64_t kKernelTile = 8;
 
-int64_t sve_m12_main_rows(int64_t rows);
-int64_t sve_hybrid_packed_rows(int64_t rows);
-
 int64_t ceil_div_int64(int64_t x, int64_t y) { return (x + y - 1) / y; }
 
 int64_t ceil_to_multiple(int64_t x, int64_t multiple) { return ceil_div_int64(x, multiple) * multiple; }
+
+int64_t sve_m12_main_rows(int64_t rows) {
+  const int64_t full_rows = rows / 12 * 12;
+  const int64_t tail_rows = rows - full_rows;
+  // M8 plus M1/M2/M4 would stream B twice for a 9-11 row tail.
+  return tail_rows >= 9 ? full_rows + 12 : full_rows;
+}
+
+int64_t sve_hybrid_packed_rows(int64_t rows) {
+  const int64_t main = sve_m12_main_rows(rows);
+  return main >= rows ? main : main + ceil_to_multiple(rows - main, int64_t{8});
+}
 
 struct SplitRange {
   int64_t begin = 0;
@@ -636,8 +646,6 @@ GemmSplitPlan plan_team_gemm_split(MoeGemmStage stage, int64_t M, int64_t K, int
   return plan;
 }
 
-#ifdef __aarch64__
-
 void bf16_pack_b(const uint16_t* B, uint16_t* B_reo, int K, int N) {
   int64_t idx = 0;
   for (int cb = 0; cb < N / 8; ++cb) {
@@ -657,6 +665,8 @@ void bf16_pack_b(const uint16_t* B, uint16_t* B_reo, int K, int N) {
     }
   }
 }
+
+#ifdef __aarch64__
 
 // Bottom layer: single-thread bf16 GEMM over the whole [M, N] slice.
 // Dispatches the i8mm microkernels by M tile (8/4/2/1 rows), optional fused
@@ -910,7 +920,6 @@ void packed_w2_tail_dispatch(const uint16_t* packed_A, const uint16_t* w2_packed
   }
 }
 
-#if defined(__ARM_FEATURE_SVE) && defined(__ARM_FEATURE_BF16)
 bool sve_w13_split_n_workset_enabled() {
   const char* value = std::getenv("FUSED_CPP_MOE_W13_SPLIT_N");
   return value != nullptr && value[0] != '\0' && value[0] != '0';
@@ -996,6 +1005,7 @@ bool sve_w13_silu_minimax3_enabled() {
   return value != nullptr && value[0] != '\0' && value[0] != '0';
 }
 
+#if defined(FUSED_CPP_MOE_HAS_ARM_SVE)
 FusedSiluKernelSet sve_asm_fused_silu_packc_set_for_degree(int64_t degree) {
   if (sve_w13_skip_silu_enabled()) {
     return {moe_sve_w13_identity_packc,    moe_sve_w13_identity_packc_m4,  moe_sve_w13_identity_packc_m2,
@@ -2448,23 +2458,6 @@ void gather_pack_a_reorder_m8(const uint16_t* input, int64_t H, const int64_t* e
   }
 }
 
-int64_t sve_m12_main_rows(int64_t rows) {
-  const int64_t full_rows = rows / 12 * 12;
-  const int64_t tail_rows = rows - full_rows;
-  // M8 plus M1/M2/M4 would stream the entire B slice twice for a 9-11 row
-  // tail. Pad that final block to M12 so both W13 and W2 consume B once.
-  return tail_rows >= 9 ? full_rows + 12 : full_rows;
-}
-
-int64_t sve_hybrid_packed_rows(int64_t rows) {
-  const int64_t main = sve_m12_main_rows(rows);
-  if (main >= rows) {
-    return main;
-  }
-  const int64_t tail = rows - main;
-  return main + ceil_to_multiple(tail, int64_t{8});
-}
-
 void gather_pack_a_reorder_m12(const uint16_t* input, int64_t H, const int64_t* expert_routes, int64_t top_k,
                                uint16_t* packed, int total_rows, int K_pad, int block_begin, int block_end) {
   const int kb_count = K_pad / 4;
@@ -2600,7 +2593,7 @@ void team_fused_w13_silu_packed_packc_sve(const TeamContext& team, const uint16_
                                           uint16_t* intermediate, int rows, int K, int N13, int ldc, int64_t degree,
                                           int64_t n_tile, bool split_w13 = sve_w13_split_n_workset_enabled(),
                                           int64_t weight_window_bytes = 0) {
-#if defined(__ARM_FEATURE_SVE) && defined(__ARM_FEATURE_BF16)
+#if defined(FUSED_CPP_MOE_HAS_ARM_SVE)
   const FusedSiluKernelSet ks = sve_asm_fused_silu_packc_set_for_degree(degree);
   TORCH_CHECK(ks.m8 != nullptr, "unsupported fused silu exp degree ", degree);
   auto run_n_range = [&](int64_t n_begin, int64_t n_cols) {
@@ -2640,7 +2633,7 @@ void team_fused_w13_silu_packed_packc_sve_2d(const TeamContext& team, const Gemm
                                              uint16_t* intermediate, int rows, int K, int N13, int ldc, int64_t degree,
                                              bool split_w13 = sve_w13_split_n_workset_enabled(),
                                              int64_t weight_window_bytes = 0) {
-#if defined(__ARM_FEATURE_SVE) && defined(__ARM_FEATURE_BF16)
+#if defined(FUSED_CPP_MOE_HAS_ARM_SVE)
   const FusedSiluKernelSet ks = sve_asm_fused_silu_packc_set_for_degree(degree);
   TORCH_CHECK(ks.m8 != nullptr, "unsupported fused silu exp degree ", degree);
   auto run_n_range = [&](int64_t n_begin, int64_t n_cols) {
@@ -2731,7 +2724,7 @@ void team_w2_packed_2d(const TeamContext& team, const Gemm2DSplitPlan& plan, con
 
 void team_w2_packed_sve(const TeamContext& team, const uint16_t* packed_A, const uint16_t* w2_packed, float* down,
                         int rows, int K, int N, int ldc, int64_t n_tile, int64_t weight_window_bytes = 0) {
-#if defined(__ARM_FEATURE_SVE) && defined(__ARM_FEATURE_BF16)
+#if defined(FUSED_CPP_MOE_HAS_ARM_SVE)
   const WeightWindowPlan windows = make_weight_window_plan(K, N, n_tile, weight_window_bytes);
   for_each_weight_window(windows, [&](const SplitRange& window) {
     const SplitRange range = n_split_range_tile(static_cast<int>(window.size), team.group_size, team.local_tid, n_tile);
@@ -2761,7 +2754,7 @@ void team_w2_packed_sve(const TeamContext& team, const uint16_t* packed_A, const
 void team_w2_packed_sve_2d(const TeamContext& team, const Gemm2DSplitPlan& plan, const uint16_t* packed_A,
                            const uint16_t* w2_packed, float* down, int rows, int K, int N, int ldc,
                            int64_t weight_window_bytes = 0) {
-#if defined(__ARM_FEATURE_SVE) && defined(__ARM_FEATURE_BF16)
+#if defined(FUSED_CPP_MOE_HAS_ARM_SVE)
   const WeightWindowPlan windows = make_weight_window_plan(K, N, plan.n_tile, weight_window_bytes);
   for_each_weight_window(windows, [&](const SplitRange& window) {
     Gemm2DSplitPlan subplan = plan;
@@ -2798,7 +2791,7 @@ void team_w2_packed_sve_2d(const TeamContext& team, const Gemm2DSplitPlan& plan,
 void team_w2_packed_sve_direct_route(const TeamContext& team, const uint16_t* packed_A, const uint16_t* w2_packed,
                                      float* route_out, const int64_t* route_ids, int rows, int K, int N,
                                      int route_stride, int64_t n_tile, int64_t weight_window_bytes = 0) {
-#if defined(__ARM_FEATURE_SVE) && defined(__ARM_FEATURE_BF16)
+#if defined(FUSED_CPP_MOE_HAS_ARM_SVE)
   const WeightWindowPlan windows = make_weight_window_plan(K, N, n_tile, weight_window_bytes);
   for_each_weight_window(windows, [&](const SplitRange& window) {
     const SplitRange range = n_split_range_tile(static_cast<int>(window.size), team.group_size, team.local_tid, n_tile);
@@ -2830,7 +2823,7 @@ void team_w2_packed_sve_direct_route(const TeamContext& team, const uint16_t* pa
 void team_w2_packed_sve_direct_route_2d(const TeamContext& team, const Gemm2DSplitPlan& plan, const uint16_t* packed_A,
                                         const uint16_t* w2_packed, float* route_out, const int64_t* route_ids, int rows,
                                         int K, int N, int route_stride, int64_t weight_window_bytes = 0) {
-#if defined(__ARM_FEATURE_SVE) && defined(__ARM_FEATURE_BF16)
+#if defined(FUSED_CPP_MOE_HAS_ARM_SVE)
   const WeightWindowPlan windows = make_weight_window_plan(K, N, plan.n_tile, weight_window_bytes);
   for_each_weight_window(windows, [&](const SplitRange& window) {
     Gemm2DSplitPlan subplan = plan;
@@ -2869,7 +2862,7 @@ void team_w2_packed_sve_direct_bf16_route(const TeamContext& team, const uint16_
                                           const uint16_t* w2_packed, uint16_t* route_out, const int64_t* route_ids,
                                           int rows, int K, int N, int route_stride, int64_t n_tile,
                                           int64_t weight_window_bytes = 0) {
-#if defined(__ARM_FEATURE_SVE) && defined(__ARM_FEATURE_BF16)
+#if defined(FUSED_CPP_MOE_HAS_ARM_SVE)
   const WeightWindowPlan windows = make_weight_window_plan(K, N, n_tile, weight_window_bytes);
   for_each_weight_window(windows, [&](const SplitRange& window) {
     const SplitRange range = n_split_range_tile(static_cast<int>(window.size), team.group_size, team.local_tid, n_tile);
@@ -2902,7 +2895,7 @@ void team_w2_packed_sve_direct_bf16_route_2d(const TeamContext& team, const Gemm
                                              const uint16_t* packed_A, const uint16_t* w2_packed, uint16_t* route_out,
                                              const int64_t* route_ids, int rows, int K, int N, int route_stride,
                                              int64_t weight_window_bytes = 0) {
-#if defined(__ARM_FEATURE_SVE) && defined(__ARM_FEATURE_BF16)
+#if defined(FUSED_CPP_MOE_HAS_ARM_SVE)
   const WeightWindowPlan windows = make_weight_window_plan(K, N, plan.n_tile, weight_window_bytes);
   for_each_weight_window(windows, [&](const SplitRange& window) {
     Gemm2DSplitPlan subplan = plan;
@@ -2940,7 +2933,7 @@ void team_w2_packed_sve_direct_bf16_route_2d(const TeamContext& team, const Gemm
 void team_w2_packed_bf16_sve(const TeamContext& team, const uint16_t* packed_A, const uint16_t* w2_packed,
                              uint16_t* down, int rows, int K, int N, int ldc, int64_t n_tile,
                              int64_t weight_window_bytes = 0) {
-#if defined(__ARM_FEATURE_SVE) && defined(__ARM_FEATURE_BF16)
+#if defined(FUSED_CPP_MOE_HAS_ARM_SVE)
   const WeightWindowPlan windows = make_weight_window_plan(K, N, n_tile, weight_window_bytes);
   for_each_weight_window(windows, [&](const SplitRange& window) {
     const SplitRange range = n_split_range_tile(static_cast<int>(window.size), team.group_size, team.local_tid, n_tile);
@@ -2970,7 +2963,7 @@ void team_w2_packed_bf16_sve(const TeamContext& team, const uint16_t* packed_A, 
 void team_w2_packed_bf16_sve_2d(const TeamContext& team, const Gemm2DSplitPlan& plan, const uint16_t* packed_A,
                                 const uint16_t* w2_packed, uint16_t* down, int rows, int K, int N, int ldc,
                                 int64_t weight_window_bytes = 0) {
-#if defined(__ARM_FEATURE_SVE) && defined(__ARM_FEATURE_BF16)
+#if defined(FUSED_CPP_MOE_HAS_ARM_SVE)
   const WeightWindowPlan windows = make_weight_window_plan(K, N, plan.n_tile, weight_window_bytes);
   for_each_weight_window(windows, [&](const SplitRange& window) {
     Gemm2DSplitPlan subplan = plan;
@@ -3029,7 +3022,7 @@ void team_w2_rowmajor_sve(const TeamContext& team, const uint16_t* A, const uint
 void gather_pack_a_reorder_backend(bool use_sve_backend, const uint16_t* input, int64_t H, const int64_t* expert_routes,
                                    int64_t top_k, uint16_t* packed, int total_rows, int K_pad, int block_begin,
                                    int block_end) {
-#if defined(__ARM_FEATURE_SVE) && defined(__ARM_FEATURE_BF16)
+#if defined(FUSED_CPP_MOE_HAS_ARM_SVE)
   if (use_sve_backend) {
     ::fused_cpp::moe_sve::gather_pack_a(input, H, expert_routes, top_k, packed, total_rows, K_pad, block_begin,
                                         block_end);
@@ -3047,7 +3040,7 @@ void team_fused_w13_silu_packed_packc_backend(bool use_sve_backend, bool use_2d_
                                               int N13, int ldc, int64_t degree, int64_t n_tile,
                                               bool split_w13 = sve_w13_split_n_workset_enabled(),
                                               int64_t weight_window_bytes = 0) {
-#if defined(__ARM_FEATURE_SVE) && defined(__ARM_FEATURE_BF16)
+#if defined(FUSED_CPP_MOE_HAS_ARM_SVE)
   if (use_sve_backend) {
     if (use_2d_split) {
       team_fused_w13_silu_packed_packc_sve_2d(team, plan, packed_A, w13_packed, intermediate, rows, K, N13, ldc, degree,
@@ -3072,7 +3065,7 @@ void team_w2_packed_backend(bool use_sve_backend, bool use_2d_split, const TeamC
                             const Gemm2DSplitPlan& plan, const uint16_t* packed_A, const uint16_t* w2_packed,
                             float* down, int rows, int K, int N, int ldc, int64_t n_tile,
                             int64_t weight_window_bytes = 0) {
-#if defined(__ARM_FEATURE_SVE) && defined(__ARM_FEATURE_BF16)
+#if defined(FUSED_CPP_MOE_HAS_ARM_SVE)
   if (use_sve_backend) {
     if (use_2d_split) {
       team_w2_packed_sve_2d(team, plan, packed_A, w2_packed, down, rows, K, N, ldc, weight_window_bytes);
@@ -4327,7 +4320,7 @@ std::vector<int64_t> tensor_to_i64_vector(at::Tensor tensor, const char* name) {
 
 void pack_transposed_expert_weight(const uint16_t* weight, int64_t expert_offset, int64_t out_features,
                                    int64_t in_features, int64_t K_pad, int64_t N_pad, uint16_t* packed_dst,
-                                   bool use_sve = false) {
+                                   const ::fused_cpp::moe::MoeBackend* backend = nullptr) {
   std::vector<uint16_t> transposed(static_cast<size_t>(K_pad * N_pad), static_cast<uint16_t>(0));
   for (int64_t n = 0; n < out_features; ++n) {
     const uint16_t* src_row = weight + expert_offset + n * in_features;
@@ -4335,10 +4328,10 @@ void pack_transposed_expert_weight(const uint16_t* weight, int64_t expert_offset
       transposed[static_cast<size_t>(k * N_pad + n)] = src_row[k];
     }
   }
-  if (use_sve) {
-    ::fused_cpp::moe_sve::pack_b(transposed.data(), packed_dst, static_cast<int>(K_pad), static_cast<int>(N_pad));
-  } else {
+  if (backend == nullptr) {
     bf16_pack_b(transposed.data(), packed_dst, static_cast<int>(K_pad), static_cast<int>(N_pad));
+  } else {
+    backend->pack_b(transposed.data(), packed_dst, static_cast<int>(K_pad), static_cast<int>(N_pad));
   }
 }
 
@@ -4354,7 +4347,7 @@ void pack_transposed_expert_weight(const uint16_t* weight, int64_t expert_offset
 // [F, ceil(F,4)) stay zero, so they yield silu(0)*0 = 0 downstream.
 void pack_transposed_expert_weight_interleaved(const uint16_t* weight, int64_t expert_offset, int64_t F, int64_t H,
                                                int64_t K_pad, int64_t N_pad, uint16_t* packed_dst,
-                                               bool use_sve = false) {
+                                               const ::fused_cpp::moe::MoeBackend* backend = nullptr) {
   std::vector<uint16_t> transposed(static_cast<size_t>(K_pad * N_pad), static_cast<uint16_t>(0));
   for (int64_t f = 0; f < F; ++f) {
     const int64_t blk = f / 4;
@@ -4368,10 +4361,10 @@ void pack_transposed_expert_weight_interleaved(const uint16_t* weight, int64_t e
       transposed[static_cast<size_t>(k * N_pad + up_col)] = up_row[k];
     }
   }
-  if (use_sve) {
-    ::fused_cpp::moe_sve::pack_b(transposed.data(), packed_dst, static_cast<int>(K_pad), static_cast<int>(N_pad));
-  } else {
+  if (backend == nullptr) {
     bf16_pack_b(transposed.data(), packed_dst, static_cast<int>(K_pad), static_cast<int>(N_pad));
+  } else {
+    backend->pack_b(transposed.data(), packed_dst, static_cast<int>(K_pad), static_cast<int>(N_pad));
   }
 }
 
@@ -4994,9 +4987,12 @@ std::vector<double> fused_moe_bench_fused_w13_silu_packc_tail(at::Tensor A, at::
 }
 
 std::tuple<at::Tensor, int64_t, int64_t, at::Tensor, int64_t, int64_t, int64_t, int64_t>
-fused_moe_bf16_tiled_prepare_weights(at::Tensor w13_weight, at::Tensor w2_weight, bool fuse_silu) {
+fused_moe_bf16_tiled_prepare_weights(at::Tensor w13_weight, at::Tensor w2_weight, bool fuse_silu,
+                                     std::string backend_name) {
+  const ::fused_cpp::moe::MoeBackend& backend =
+      ::fused_cpp::moe::resolve_backend(backend_name, fuse_silu);
 #ifndef __aarch64__
-  TORCH_CHECK(false, "fused_moe_bf16_tiled_prepare_weights requires AArch64");
+  TORCH_CHECK(false, "fused_moe_bf16_tiled_prepare_weights has no implemented backend for this architecture");
 #else
   check_bf16_cpu(w13_weight, "w13_weight");
   check_bf16_cpu(w2_weight, "w2_weight");
@@ -5028,17 +5024,12 @@ fused_moe_bf16_tiled_prepare_weights(at::Tensor w13_weight, at::Tensor w2_weight
   const int64_t K13 = H;
   const int64_t K2 = F;
   const int64_t N2 = H;
-  // Default to the SVE fused kernel when fused SiLU is requested and the
-  // runtime supports it.  The NEON path is kept as a legacy/diagnostic
-  // fallback and can be forced with FUSED_CPP_MOE_SVE=0.
-  const bool use_sve_backend = fuse_silu && ::fused_cpp::moe_sve::enabled_by_env();
-  const int64_t backend_id = use_sve_backend ? static_cast<int64_t>(::fused_cpp::moe_sve::Backend::kSve)
-                                             : static_cast<int64_t>(::fused_cpp::moe_sve::Backend::kNeon);
-  const int64_t backend_n_tile = use_sve_backend ? ::fused_cpp::moe_sve::n_tile() : kKernelTile;
-  const int64_t K13_pad = ceil_to_multiple(K13, kKernelTile);
-  const int64_t N13_pad = ceil_to_multiple(N13, backend_n_tile);
-  const int64_t K2_pad = ceil_to_multiple(K2, kKernelTile);
-  const int64_t N2_pad = ceil_to_multiple(N2, backend_n_tile);
+  const int64_t backend_id = static_cast<int64_t>(backend.id);
+  const int64_t backend_n_tile = backend.n_tile();
+  const int64_t K13_pad = backend.round_k(static_cast<int>(K13));
+  const int64_t N13_pad = backend.round_n(static_cast<int>(N13));
+  const int64_t K2_pad = backend.round_k(static_cast<int>(K2));
+  const int64_t N2_pad = backend.round_n(static_cast<int>(N2));
 
   at::Tensor w13_packed = at::empty({E, K13_pad * N13_pad}, w13_weight.options());
   at::Tensor w2_packed = at::empty({E, K2_pad * N2_pad}, w2_weight.options());
@@ -5058,13 +5049,13 @@ fused_moe_bf16_tiled_prepare_weights(at::Tensor w13_weight, at::Tensor w2_weight
     for (int64_t e = tid; e < E; e += prepack_threads) {
       if (fuse_silu) {
         pack_transposed_expert_weight_interleaved(w13_ptr, e * w13_expert_stride, F, H, K13_pad, N13_pad,
-                                                  w13_packed_ptr + e * K13_pad * N13_pad, use_sve_backend);
+                                                  w13_packed_ptr + e * K13_pad * N13_pad, &backend);
       } else {
         pack_transposed_expert_weight(w13_ptr, e * w13_expert_stride, N13, H, K13_pad, N13_pad,
-                                      w13_packed_ptr + e * K13_pad * N13_pad, use_sve_backend);
+                                      w13_packed_ptr + e * K13_pad * N13_pad, &backend);
       }
       pack_transposed_expert_weight(w2_ptr, e * w2_expert_stride, H, F, K2_pad, N2_pad,
-                                    w2_packed_ptr + e * K2_pad * N2_pad, use_sve_backend);
+                                    w2_packed_ptr + e * K2_pad * N2_pad, &backend);
     }
   });
 
@@ -5100,22 +5091,16 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input, at::Tensor w13_packed, int64_t
   TORCH_CHECK(num_threads > 0, "num_threads must be positive, got ", num_threads);
   TORCH_CHECK(num_threads <= std::numeric_limits<int>::max(), "num_threads exceeds int32 limit: ", num_threads);
 
-  TORCH_CHECK(gemm_backend == 0 || gemm_backend == 1,
-              "gemm_backend must be 0 (NEON legacy fallback) or "
-              "1 (SVE fused default), got ",
-              gemm_backend);
-  const bool use_sve_backend = gemm_backend == 1;
+  const ::fused_cpp::moe::MoeBackend& backend = ::fused_cpp::moe::backend_from_id(gemm_backend);
+  const bool use_sve_backend = backend.id == ::fused_cpp::moe::BackendId::kArmSveBf16;
   TORCH_CHECK(weight_window_bytes >= -1, "weight_window_bytes must be -1 (environment) or non-negative, got ",
               weight_window_bytes);
   weight_window_bytes = use_sve_backend ? resolve_sve_weight_window_bytes(weight_window_bytes) : 0;
   if (use_sve_backend) {
-    TORCH_CHECK(::fused_cpp::moe_sve::available(), "SVE MoE weights require an SVE BF16 build/runtime");
     TORCH_CHECK(fuse_silu, "SVE MoE backend currently requires fuse_silu=True");
-    TORCH_CHECK(backend_n_tile == ::fused_cpp::moe_sve::n_tile(), "SVE MoE backend_n_tile mismatch: weights use ",
-                backend_n_tile, ", runtime uses ", ::fused_cpp::moe_sve::n_tile());
-  } else {
-    backend_n_tile = kKernelTile;
   }
+  TORCH_CHECK(backend_n_tile == backend.n_tile(), "MoE backend_n_tile mismatch for ", backend.name,
+              ": weights use ", backend_n_tile, ", runtime uses ", backend.n_tile());
 
   PackedExperts w13 = checked_packed_experts(w13_packed, w13_K, w13_N, "w13_packed", backend_n_tile);
   PackedExperts w2 = checked_packed_experts(w2_packed, w2_K, w2_N, "w2_packed", backend_n_tile);
@@ -5242,11 +5227,11 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input, at::Tensor w13_packed, int64_t
   // bias, only Part 1 applies and w2 falls back to the row-major repack path.
   const bool fused_packa_w2 = fused_packa && (w2_bias_base == nullptr);
   bool use_w2_bf16_route = false;
-#if defined(__ARM_FEATURE_SVE) && defined(__ARM_FEATURE_BF16)
+#if defined(FUSED_CPP_MOE_HAS_ARM_SVE)
   use_w2_bf16_route = !skip_weighted && use_sve_backend && fuse_silu && fused_packa_w2 && sve_w2_bf16_route_enabled();
 #endif
   bool use_w2_direct_route = false;
-#if defined(__ARM_FEATURE_SVE) && defined(__ARM_FEATURE_BF16)
+#if defined(FUSED_CPP_MOE_HAS_ARM_SVE)
   const int64_t route_element_bytes =
       use_w2_bf16_route ? static_cast<int64_t>(sizeof(uint16_t)) : static_cast<int64_t>(sizeof(float));
   use_w2_direct_route = !skip_weighted && use_sve_backend && fuse_silu && fused_packa_w2 && w2.N_pad == H &&
@@ -6027,25 +6012,18 @@ at::Tensor fused_moe_bf16_tiled_scheduled(at::Tensor input, at::Tensor w13_packe
   TORCH_CHECK(num_threads > 0, "num_threads must be positive, got ", num_threads);
   TORCH_CHECK(num_threads <= std::numeric_limits<int>::max(), "num_threads exceeds int32 limit: ", num_threads);
 
-  TORCH_CHECK(gemm_backend == 0 || gemm_backend == 1,
-              "gemm_backend must be 0 (NEON legacy fallback) or "
-              "1 (SVE fused default), got ",
-              gemm_backend);
-  const bool use_sve_backend = gemm_backend == 1;
+  const ::fused_cpp::moe::MoeBackend& backend = ::fused_cpp::moe::backend_from_id(gemm_backend);
+  const bool use_sve_backend = backend.id == ::fused_cpp::moe::BackendId::kArmSveBf16;
   TORCH_CHECK(weight_window_bytes >= -1, "weight_window_bytes must be -1 (environment) or non-negative, got ",
               weight_window_bytes);
   weight_window_bytes = use_sve_backend ? resolve_sve_weight_window_bytes(weight_window_bytes) : 0;
   if (use_sve_backend) {
-    TORCH_CHECK(::fused_cpp::moe_sve::available(), "SVE MoE weights require an SVE BF16 build/runtime");
     TORCH_CHECK(fuse_silu,
                 "SVE scheduled MoE backend currently requires "
                 "fuse_silu=True");
-    TORCH_CHECK(backend_n_tile == ::fused_cpp::moe_sve::n_tile(),
-                "SVE scheduled MoE backend_n_tile mismatch: weights use ", backend_n_tile, ", runtime uses ",
-                ::fused_cpp::moe_sve::n_tile());
-  } else {
-    backend_n_tile = kKernelTile;
   }
+  TORCH_CHECK(backend_n_tile == backend.n_tile(), "MoE backend_n_tile mismatch for ", backend.name,
+              ": weights use ", backend_n_tile, ", runtime uses ", backend.n_tile());
 
   PackedExperts w13 = checked_packed_experts(w13_packed, w13_K, w13_N, "w13_packed", backend_n_tile);
   PackedExperts w2 = checked_packed_experts(w2_packed, w2_K, w2_N, "w2_packed", backend_n_tile);
@@ -6090,7 +6068,7 @@ at::Tensor fused_moe_bf16_tiled_scheduled(at::Tensor input, at::Tensor w13_packe
     TORCH_CHECK(top_k == 1, "skip_weighted is only valid when top_k == 1");
   }
   bool use_w2_bf16_route = false;
-#if defined(__ARM_FEATURE_SVE) && defined(__ARM_FEATURE_BF16)
+#if defined(FUSED_CPP_MOE_HAS_ARM_SVE)
   use_w2_bf16_route =
       !skip_weighted && use_sve_backend && fuse_silu && w2_bias_base == nullptr && sve_w2_bf16_route_enabled();
 #endif
@@ -6139,7 +6117,7 @@ at::Tensor fused_moe_bf16_tiled_scheduled(at::Tensor input, at::Tensor w13_packe
   const int64_t* ids = ids_i64.data_ptr<int64_t>();
   const int64_t num_routes = num_tokens * top_k;
   bool use_w2_direct_route = false;
-#if defined(__ARM_FEATURE_SVE) && defined(__ARM_FEATURE_BF16)
+#if defined(FUSED_CPP_MOE_HAS_ARM_SVE)
   const int64_t route_element_bytes =
       use_w2_bf16_route ? static_cast<int64_t>(sizeof(uint16_t)) : static_cast<int64_t>(sizeof(float));
   use_w2_direct_route = !skip_weighted && use_sve_backend && fuse_silu && w2.N_pad == H &&
@@ -6548,24 +6526,18 @@ at::Tensor fused_moe_bf16_tiled_async(at::Tensor input, at::Tensor w13_packed, i
   TORCH_CHECK(num_threads > 0, "num_threads must be positive, got ", num_threads);
   TORCH_CHECK(num_threads <= std::numeric_limits<int>::max(), "num_threads exceeds int32 limit: ", num_threads);
 
-  TORCH_CHECK(gemm_backend == 0 || gemm_backend == 1,
-              "gemm_backend must be 0 (NEON legacy fallback) or "
-              "1 (SVE fused default), got ",
-              gemm_backend);
-  const bool use_sve_backend = gemm_backend == 1;
+  const ::fused_cpp::moe::MoeBackend& backend = ::fused_cpp::moe::backend_from_id(gemm_backend);
+  const bool use_sve_backend = backend.id == ::fused_cpp::moe::BackendId::kArmSveBf16;
   TORCH_CHECK(w13_split >= -1 && w13_split <= 1, "w13_split must be -1 (environment), 0, or 1, got ", w13_split);
   const bool use_w13_split = w13_split < 0 ? sve_w13_split_n_workset_enabled() : w13_split != 0;
   TORCH_CHECK(weight_window_bytes >= -1, "weight_window_bytes must be -1 (environment) or non-negative, got ",
               weight_window_bytes);
   weight_window_bytes = use_sve_backend ? resolve_sve_weight_window_bytes(weight_window_bytes) : 0;
   if (use_sve_backend) {
-    TORCH_CHECK(::fused_cpp::moe_sve::available(), "SVE MoE weights require an SVE BF16 build/runtime");
     TORCH_CHECK(fuse_silu, "SVE async MoE backend currently requires fuse_silu=True");
-    TORCH_CHECK(backend_n_tile == ::fused_cpp::moe_sve::n_tile(), "SVE async MoE backend_n_tile mismatch: weights use ",
-                backend_n_tile, ", runtime uses ", ::fused_cpp::moe_sve::n_tile());
-  } else {
-    backend_n_tile = kKernelTile;
   }
+  TORCH_CHECK(backend_n_tile == backend.n_tile(), "MoE backend_n_tile mismatch for ", backend.name,
+              ": weights use ", backend_n_tile, ", runtime uses ", backend.n_tile());
 
   PackedExperts w13 = checked_packed_experts(w13_packed, w13_K, w13_N, "w13_packed", backend_n_tile);
   PackedExperts w2 = checked_packed_experts(w2_packed, w2_K, w2_N, "w2_packed", backend_n_tile);
@@ -6604,7 +6576,7 @@ at::Tensor fused_moe_bf16_tiled_async(at::Tensor input, at::Tensor w13_packed, i
     TORCH_CHECK(top_k == 1, "skip_weighted is only valid when top_k == 1");
   }
   bool use_w2_bf16_route = false;
-#if defined(__ARM_FEATURE_SVE) && defined(__ARM_FEATURE_BF16)
+#if defined(FUSED_CPP_MOE_HAS_ARM_SVE)
   use_w2_bf16_route =
       !skip_weighted && use_sve_backend && fuse_silu && w2_bias_base == nullptr && sve_w2_bf16_route_enabled();
 #endif
@@ -6660,7 +6632,7 @@ at::Tensor fused_moe_bf16_tiled_async(at::Tensor input, at::Tensor w13_packed, i
   const int64_t* ids = ids_i64.data_ptr<int64_t>();
   const int64_t num_routes = num_tokens * top_k;
   bool use_w2_direct_route = false;
-#if defined(__ARM_FEATURE_SVE) && defined(__ARM_FEATURE_BF16)
+#if defined(FUSED_CPP_MOE_HAS_ARM_SVE)
   const int64_t route_element_bytes =
       use_w2_bf16_route ? static_cast<int64_t>(sizeof(uint16_t)) : static_cast<int64_t>(sizeof(float));
   use_w2_direct_route = !skip_weighted && use_sve_backend && fuse_silu && w2.N_pad == H &&

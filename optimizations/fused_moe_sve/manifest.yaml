@@ -2,7 +2,7 @@ operator: fused_moe_sve
 
 baseline:
   id: sve_static_nsplit
-  implementation: csrc/fused_moe_bf16_tiled.cpp
+  implementation: csrc/moe/arm/common/fused_moe_bf16_tiled.cpp
   entrypoint: team_fused_w13_silu_packed_packc_sve
   status: reference
 
@@ -27,7 +27,7 @@ features:
   - id: intermediate.overwrite_elision
     part: intermediate
     status: enabled
-    implementation: csrc/fused_moe_bf16_tiled.cpp
+    implementation: csrc/moe/arm/common/fused_moe_bf16_tiled.cpp
     hypothesis: >-
       The fused SVE W13 kernels overwrite every packed-intermediate element
       consumed by the matching W2 tail kernel, so removing the full-buffer zero
@@ -47,7 +47,7 @@ features:
   - id: scatter.w2_n_owner
     part: scatter
     status: enabled
-    implementation: csrc/fused_moe_bf16_tiled.cpp
+    implementation: csrc/moe/arm/common/fused_moe_bf16_tiled.cpp
     hypothesis: >-
       Assigning scatter the exact n_tile-aligned range produced by the same W2
       worker removes the W2-to-scatter team barrier without cross-thread reads
@@ -67,7 +67,7 @@ features:
     part: store
     status: enabled
     implementation: >-
-      csrc/moe_sve_fused_asm.S and csrc/fused_moe_bf16_tiled.cpp
+      csrc/moe/arm/sve_bf16/kernels.S and csrc/moe/arm/common/fused_moe_bf16_tiled.cpp
     hypothesis: >-
       Giving the SVE W2 epilogue the flat route-row table lets each N owner
       store its disjoint FP32 columns directly into route_out. For long routes,
@@ -92,7 +92,7 @@ features:
     part: store
     status: experimental
     implementation: >-
-      csrc/moe_sve_fused_asm.S and csrc/fused_moe_bf16_tiled.cpp
+      csrc/moe/arm/sve_bf16/kernels.S and csrc/moe/arm/common/fused_moe_bf16_tiled.cpp
     hypothesis: >-
       Converting W2 accumulators to BF16 in the direct-route assembly epilogue
       halves route-buffer stores and weighted-merge source reads while retaining
@@ -135,7 +135,7 @@ features:
   - id: dispatch.serial_weight_windows
     part: dispatch
     status: experimental
-    implementation: csrc/fused_moe_bf16_tiled.cpp
+    implementation: csrc/moe/arm/common/fused_moe_bf16_tiled.cpp
     hypothesis: >-
       Serializing both packed-B GEMMs into a configurable tile-aligned byte
       window reduces the active reusable weight footprint on machines whose
@@ -181,7 +181,7 @@ features:
   - id: merge.async_ready_tokens
     part: merge
     status: enabled
-    implementation: csrc/fused_moe_bf16_tiled.cpp
+    implementation: csrc/moe/arm/common/fused_moe_bf16_tiled.cpp
     hypothesis: >-
       Publishing expert completion and letting otherwise idle async workers
       merge tokens whose full TopK predecessor set is ready can hide route
@@ -207,7 +207,7 @@ features:
   - id: merge.sve_weighted_reduce
     part: merge
     status: enabled
-    implementation: csrc/moe_route_merge_sve.cpp
+    implementation: csrc/moe/arm/sve_bf16/route_merge.cpp
     hypothesis: >-
       Compile-time adjacent binary trees for top-k 2/4/6/8 and an ordered
       runtime-loop fallback for other values remove the thread-local FP32

@@ -6,7 +6,7 @@ default for their supported SVE paths; neither changes the fused-MoE API.
 
 ## SVE weighted route merge
 
-`moe_route_merge_sve.cpp` provides the SVE weighted merge for the
+`csrc/moe/arm/sve_bf16/route_merge.cpp` provides the SVE weighted merge for the
 token-major `[tokens, top_k, hidden]` route buffer. Fixed `top_k=2/4/6/8`
 dispatches to compile-time templates. Template recursion first forms adjacent
 weighted pairs and then a power-of-two-prefix binary tree; for example,

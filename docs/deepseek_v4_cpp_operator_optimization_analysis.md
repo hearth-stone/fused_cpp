@@ -24,7 +24,7 @@
 |--------|-----------|-------------|---------|
 | **融合注意力输入 GEMM** | `deepseek_v4_attn_gemm_fused.cpp` | 注意力层入口 | 多 GEMM 并行执行（fused_wqa_wkv、compressor_kv_score、indexer_*）+ RMSNorm 后处理 |
 | **Post Stage** | `deepseek_v4_post_gemm_parallel_stage.cpp` | 注意力 GEMM 之后 | Main Q 投影 + MLA Compressor + Indexer 分支 + Sparse Top-K |
-| **MoE 计算内核** | `fused_moe_bf16_tiled.cpp` | MoE 层核心 | Token 路由 + W13/W2 两段 GEMM + 激活函数 + 加权合并 |
+| **MoE 计算内核** | `csrc/moe/arm/common/fused_moe_bf16_tiled.cpp` | MoE 层核心 | Token 路由 + W13/W2 两段 GEMM + 激活函数 + 加权合并 |
 | **MoE 调度规划** | `moe_planner/*.cpp` | MoE 执行前 | 根据 token 分布规划 expert 分配、线程调度、wave 打包 |
 
 **推理流程顺序**：
@@ -566,7 +566,7 @@ Post Stage:
   mla_compressor.cpp                        : Compressor 逻辑
 
 MoE Kernel:
-  fused_moe_bf16_tiled.cpp          : MoE 主入口，三种调度策略
+  moe/arm/common/fused_moe_bf16_tiled.cpp : MoE 主入口，三种调度策略
   deepseek_v4_attn_gemm_fused.cpp   : bf16gemm microkernel 定义
 
 MoE Planner:

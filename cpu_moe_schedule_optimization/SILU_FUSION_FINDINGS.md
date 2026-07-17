@@ -143,7 +143,7 @@ pytest -q tests/test_moe_fused_silu_nsplit.py
   直接写成 reorder-m8 packed 布局,w13 用 `bf16gemm_k_ldp_silu_poly*`(读预打包
   A、跳过 kernel 内 repack)。消除行主序 `scratch.input` 中转 + 独立 pack。
 - **Part 2(w13 epilogue → w2 packA)**:新增 fused_cpp 自有 asm
-  `csrc/bf16gemm_silu_packc.S`(不改 i8gemm),`STORE_C_SILU_POLY*_PACKC_8`
+  `csrc/moe/arm/neon_bf16/kernels.S`(不改 i8gemm),`STORE_C_SILU_POLY*_PACKC_8`
   把融合 SiLU 的 8×4 输出直接按 reorder-m8 写成 64 连续字节;w2 用
   `bf16gemm_k_ldp`(packed-read fp32)直接读该 packed intermediate,不再 repack。
   仅当 w2 无 bias 时启用(packed-read w2 无 bias 变体),否则退化为 Part-1-only。
@@ -231,7 +231,7 @@ tail 5/6 改 pad8)。此外 packed 尾核 M=1,2(240us)比 repack(170us)略慢—
 ## 做法(Option X,gather 不变)
 - gather **完全不改**(仍 `gather_pack_a_reorder_m8`,尾块按 ceil8 补零)。
 - 满块:m8 packc(w13)/ m8 packed(w2)。
-- 尾块:新 packed-read reorder-m8 尾核(`csrc/bf16gemm_silu_packc.S`):新增 64B 步进
+- 尾块:新 packed-read reorder-m8 尾核(`csrc/moe/arm/neon_bf16/kernels.S`):新增 64B 步进
   cached 宏 `LOAD_A0_B0_P{2,4}` + `COMPUTE_*_P{2,4}`(读前 mr 行、A_ADDR 前进 64B 跳过
   padding 行),packc 尾 store `STORE_C_SILU_POLY*_PACKC_M{1,2,4}`(w13)、复用
   `STORE_C_{1,2,4}` fp32 rowmajor(w2);9 个 w13 尾核 + 3 个 w2 尾核,全 `a_mode=packed`。

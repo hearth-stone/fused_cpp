@@ -89,8 +89,12 @@ def sha256_file(path: Path) -> str | None:
 
 def kernel_metadata() -> dict:
     source_paths = (
-        ROOT / "csrc" / "fused_moe_bf16_tiled.cpp",
-        ROOT / "csrc" / "moe_sve_fused_asm.S",
+        ROOT / "csrc" / "moe" / "arm" / "common" / "fused_moe_bf16_tiled.cpp",
+        ROOT / "csrc" / "moe" / "common" / "backend.cpp",
+        ROOT / "csrc" / "moe" / "arm" / "neon_bf16" / "kernels.S",
+        ROOT / "csrc" / "moe" / "arm" / "sve_bf16" / "kernels.S",
+        ROOT / "csrc" / "moe" / "arm" / "sve_bf16" / "packing.cpp",
+        ROOT / "csrc" / "moe" / "arm" / "sve_bf16" / "route_merge.cpp",
         ROOT / "src" / "fused_cpp" / "moe" / "bf16_tiled.py",
     )
     source_digest = hashlib.sha256()
@@ -111,7 +115,7 @@ def kernel_metadata() -> dict:
 
     git_commit = git(["rev-parse", "HEAD"])
     git_status = git(["status", "--short"])
-    extension = sys.modules.get("fused_cpp._C")
+    extension = sys.modules.get("fused_cpp._moe_C")
     extension_path = Path(extension.__file__) if extension is not None else None
     return {
         "git_available": git_commit is not None,

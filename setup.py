@@ -19,8 +19,7 @@ class _BuildExtensionWithFixup(BuildExtension):
     """
 
     def build_extensions(self) -> None:
-        self._compile_bf16gemm_sources()
-        self._compile_i8gemm_sources()
+        self._compile_native_sources()
         super().build_extensions()
         if platform.system() != "Darwin":
             return
@@ -54,40 +53,24 @@ class _BuildExtensionWithFixup(BuildExtension):
                 check=True,
             )
 
-    def _compile_bf16gemm_sources(self) -> None:
-        if not (bf16gemm_c_sources or bf16gemm_asm_sources):
-            return
-        obj_dir = os.path.join(self.build_temp, "bf16gemm")
-        os.makedirs(obj_dir, exist_ok=True)
+    def _compile_native_sources(self) -> None:
         for ext in self.extensions:
+            native_sources = native_sources_by_extension.get(ext.name, [])
+            if not native_sources:
+                continue
+            obj_dir = os.path.join(self.build_temp, ext.name.replace(".", "_"), "native")
+            os.makedirs(obj_dir, exist_ok=True)
             extra_objects = list(getattr(ext, "extra_objects", []) or [])
-            for src in bf16gemm_c_sources:
-                obj = os.path.join(obj_dir, os.path.basename(src) + ".o")
-                self._compile_one_native_source(src, obj, ext)
-                if obj not in extra_objects:
-                    extra_objects.append(obj)
-            for src in bf16gemm_asm_sources:
-                obj = os.path.join(obj_dir, os.path.basename(src) + ".o")
-                self._compile_one_native_source(src, obj, ext)
+            for src, source_args in native_sources:
+                relative = os.path.relpath(os.path.abspath(src), os.path.abspath(os.curdir))
+                object_name = relative.replace("..", "up").replace(os.sep, "__") + ".o"
+                obj = os.path.join(obj_dir, object_name)
+                self._compile_one_native_source(src, obj, ext, source_args)
                 if obj not in extra_objects:
                     extra_objects.append(obj)
             ext.extra_objects = extra_objects
 
-    def _compile_i8gemm_sources(self) -> None:
-        if not (i8gemm_c_sources or i8gemm_asm_sources):
-            return
-        obj_dir = os.path.join(self.build_temp, "i8gemm")
-        os.makedirs(obj_dir, exist_ok=True)
-        for ext in self.extensions:
-            extra_objects = list(getattr(ext, "extra_objects", []) or [])
-            for src in [*i8gemm_c_sources, *i8gemm_asm_sources]:
-                obj = os.path.join(obj_dir, os.path.basename(src) + ".o")
-                self._compile_one_native_source(src, obj, ext)
-                if obj not in extra_objects:
-                    extra_objects.append(obj)
-            ext.extra_objects = extra_objects
-
-    def _compile_one_native_source(self, src: str, obj: str, ext) -> None:
+    def _compile_one_native_source(self, src: str, obj: str, ext, source_args: list[str]) -> None:
         compiler_cmd = getattr(self.compiler, "compiler", None)
         compiler = compiler_cmd[0] if isinstance(compiler_cmd, list) else compiler_cmd
         compiler = os.environ.get("CC") or compiler or "cc"
@@ -107,8 +90,12 @@ class _BuildExtensionWithFixup(BuildExtension):
                 native_args.append(arg)
                 keep_next = True
                 continue
-            if arg == "-fopenmp" or arg.startswith(("-march=", "-mcpu=", "-O", "-I")):
+            if arg == "-fopenmp" or arg.startswith(("-march=", "-mcpu=", "-O", "-I", "-std=")):
                 native_args.append(arg)
+
+        native_args.extend(source_args)
+        for name, value in getattr(ext, "define_macros", []) or []:
+            native_args.append(f"-D{name}" if value is None else f"-D{name}={value}")
 
         if platform.system() != "Windows" and "-fPIC" not in native_args:
             native_args.append("-fPIC")
@@ -388,14 +375,25 @@ def _profiling_enabled_for_build() -> bool:
     return not is_release
 
 
-sources = sorted(glob.glob("csrc/**/*.cpp", recursive=True))
+all_cpp_sources = sorted(glob.glob("csrc/**/*.cpp", recursive=True))
+moe_source_prefix = os.path.join("csrc", "moe") + os.sep
+sources = [source for source in all_cpp_sources if not source.startswith(moe_source_prefix)]
+moe_sources = [source for source in all_cpp_sources if source.startswith(moe_source_prefix)]
 bf16gemm_c_sources = []
 bf16gemm_asm_sources = []
 i8gemm_c_sources = []
 i8gemm_asm_sources = []
+moe_native_sources = []
 is_aarch64 = platform.machine() in ("aarch64", "arm64")
 acl_available, acl_include_dirs, acl_library_dirs = _detect_acl()
 use_acl = is_aarch64 and acl_available
+
+if is_aarch64:
+    moe_sources = [source for source in moe_sources if os.path.join("moe", "x86") not in source]
+    if platform.system() != "Linux":
+        moe_sources = [source for source in moe_sources if os.path.join("arm", "sve_bf16") not in source]
+else:
+    moe_sources = [source for source in moe_sources if os.path.join("moe", "arm") not in source]
 
 omp_available, omp_compile_args, omp_link_args = _detect_openmp()
 
@@ -412,6 +410,18 @@ extra_link_args = []
 include_dirs = ["csrc"]
 library_dirs = []
 define_macros = []
+
+bf16gemm_workspace = os.path.abspath("refs/i8gemm")
+bf16gemm_lib = os.path.join(bf16gemm_workspace, "lib")
+moe_include_dirs = ["csrc", bf16gemm_workspace, bf16gemm_lib]
+moe_compile_args = [*omp_compile_args, "-O2"]
+moe_link_args = list(omp_link_args)
+moe_define_macros = [
+    ("FUSED_CPP_ENABLE_PROFILING", "1" if _profiling_enabled_for_build() else "0"),
+    ("FUSED_CPP_STRICT_MODE", "1" if _env_truthy("FUSED_CPP_STRICT_MODE") else "0"),
+]
+if omp_available:
+    moe_define_macros.append(("FUSED_CPP_HAS_OMP", "1"))
 
 define_macros.append(("FUSED_CPP_ENABLE_PROFILING", "1" if _profiling_enabled_for_build() else "0"))
 define_macros.append(("FUSED_CPP_STRICT_MODE", "1" if _env_truthy("FUSED_CPP_STRICT_MODE") else "0"))
@@ -441,16 +451,26 @@ if omp_available:
 #   FUSED_CPP_TARGET_CPU="armv9-a+sve2+bf16+i8mm" → SVE2 平台
 # 取值若以 `apple-` 或 `cortex-` 开头则按 -mcpu= 处理，否则按 -march= 处理。
 if is_aarch64:
-    bf16gemm_workspace = os.path.abspath("refs/i8gemm")
-    bf16gemm_lib = os.path.join(bf16gemm_workspace, "lib")
     include_dirs.extend([bf16gemm_workspace, bf16gemm_lib])
+    moe_define_macros.append(("FUSED_CPP_HAS_BF16GEMM", "1"))
     if omp_available:
         bf16gemm_c_sources.append(os.path.join(bf16gemm_lib, "bf16gemm_mt.c"))
         define_macros.append(("FUSED_CPP_HAS_BF16GEMM", "1"))
     bf16gemm_asm_sources.append(os.path.join(bf16gemm_lib, "bf16gemm_k.S"))
     bf16gemm_asm_sources.append(os.path.join(bf16gemm_lib, "bf16gemm_k_bias.S"))
-    # fused_cpp-owned packed-C fused-silu kernels (Part 2 of packA fusion).
-    bf16gemm_asm_sources.append(os.path.abspath(os.path.join("csrc", "bf16gemm_silu_packc.S")))
+
+    moe_native_sources.extend(
+        [
+            (os.path.join(bf16gemm_lib, "bf16gemm_k.S"), []),
+            (os.path.join(bf16gemm_lib, "bf16gemm_k_bias.S"), []),
+            (os.path.abspath(os.path.join("csrc", "moe", "arm", "neon_bf16", "kernels.S")), []),
+        ]
+    )
+
+    if platform.system() == "Darwin":
+        moe_compile_args.append("-mcpu=apple-m2")
+    else:
+        moe_compile_args.append("-march=armv8.6-a+bf16+i8mm")
 
     target_cpu = os.environ.get("FUSED_CPP_TARGET_CPU", "").strip()
     if target_cpu:
@@ -470,11 +490,20 @@ if is_aarch64:
     target_has_sve = (
         "sve" in target_cpu.lower() if target_cpu else platform.system() != "Darwin" and _host_cpu_has_flag("sve")
     )
-    if target_has_sve:
-        # fused_cpp-owned SVE MoE asm kernels. Do not compile upstream
-        # bf16gemm_sve.S directly here; it exports bf16gemm_k_* symbols that
-        # collide with the NEON bf16gemm objects already linked above.
-        bf16gemm_asm_sources.append(os.path.abspath(os.path.join("csrc", "moe_sve_fused_asm.S")))
+    if platform.system() == "Linux":
+        moe_define_macros.append(("FUSED_CPP_MOE_HAS_ARM_SVE", "1"))
+        sve_args = ["-march=armv8.6-a+sve+bf16+i8mm", "-O2", "-std=c++17"]
+        sve_sources = [
+            os.path.join("csrc", "moe", "arm", "sve_bf16", "packing.cpp"),
+            os.path.join("csrc", "moe", "arm", "sve_bf16", "route_merge.cpp"),
+        ]
+        moe_sources = [source for source in moe_sources if source not in sve_sources]
+        moe_native_sources.extend(
+            [
+                (os.path.abspath(os.path.join("csrc", "moe", "arm", "sve_bf16", "kernels.S")), sve_args),
+                *[(source, sve_args) for source in sve_sources],
+            ]
+        )
     i8gemm_backend = "sve" if target_has_sve else "neon"
     i8gemm_required = [
         os.path.join(bf16gemm_lib, "i8gemm.h"),
@@ -567,6 +596,19 @@ else:
     # 编译其 stub 实现，避免 module.cpp 中的 KAI 绑定出现未解析符号。
     pass
 
+native_sources_by_extension = {
+    "fused_cpp._C": [
+        (source, [])
+        for source in [
+            *bf16gemm_c_sources,
+            *bf16gemm_asm_sources,
+            *i8gemm_c_sources,
+            *i8gemm_asm_sources,
+        ]
+    ],
+    "fused_cpp._moe_C": moe_native_sources,
+}
+
 setup(
     ext_modules=[
         CppExtension(
@@ -577,6 +619,14 @@ setup(
             extra_compile_args=extra_compile_args,
             extra_link_args=extra_link_args,
             define_macros=define_macros,
+        ),
+        CppExtension(
+            name="fused_cpp._moe_C",
+            sources=moe_sources,
+            include_dirs=moe_include_dirs,
+            extra_compile_args=moe_compile_args,
+            extra_link_args=moe_link_args,
+            define_macros=moe_define_macros,
         ),
     ],
     cmdclass={"build_ext": _BuildExtensionWithFixup},

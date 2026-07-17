@@ -14,6 +14,7 @@ The public Python API is in `src/fused_cpp/moe/bf16_tiled.py`:
 ```python
 from fused_cpp.moe import (
     _HAS_BF16_TILED_FUSED_MOE,
+    available_fused_moe_bf16_tiled_backends,
     fused_moe_bf16_tiled,
     prepare_fused_moe_bf16_tiled_weights,
 )
@@ -45,8 +46,11 @@ swigluoai
 
 ## Build Requirements
 
-The extension is built by `setup.py`. On AArch64, it uses `refs/i8gemm/lib` for
-the low-level BF16 GEMM kernel and packing headers.
+The MoE code is built as the independent `fused_cpp._moe_C` extension. On
+Linux AArch64, one binary contains a NEON/BFMMLA baseline and independently
+compiled SVE/SVEBF16 objects; runtime HWCAP selection does not change the ISA
+target used by the main `fused_cpp._C` extension. Both ARM backends use
+`refs/i8gemm/lib` packing contracts.
 
 Build:
 
@@ -66,6 +70,11 @@ The backend is available only when:
 _HAS_BF16_TILED_FUSED_MOE is True
 ```
 
+The exact runtime choices are queryable with
+`available_fused_moe_bf16_tiled_backends()`. The current names are
+`arm_neon_bf16` and `arm_sve_bf16`; NEON still requires BF16/BFMMLA. Setting
+`FUSED_CPP_MOE_SVE=0` removes SVE from automatic selection.
+
 vLLM should keep a fallback path for non-AArch64 hosts, missing extension builds,
 unsupported dtype/device combinations, and unsupported activations.
 
@@ -78,11 +87,14 @@ Do not pack inside every forward call.
 packed = prepare_fused_moe_bf16_tiled_weights(
     w13_weight.contiguous(),
     w2_weight.contiguous(),
+    backend="auto",
 )
 ```
 
 `packed` is a `PreparedBF16TiledFusedMoEWeights` object containing packed
-`w13` and `w2` tensors plus their original `K` and `N` dimensions.
+`w13` and `w2` tensors, their original dimensions, and the selected backend
+identity. Explicit backend names are useful for validation; production should
+normally use `auto`.
 
 Large expert sets can pack weights in parallel:
 
@@ -108,6 +120,9 @@ class CpuBF16TiledMoEState:
 Important:
 
 - Expert ids in `topk_ids` must match the packed weight expert index.
+- Packed tensors are ISA-specific and must not be moved between NEON and SVE
+  processes. SVE packing is also vector-length-specific; repack after moving
+  weights to a machine with a different SVE vector length.
 - Pass `global_num_experts=-1` for normal local packed weights.
 - Do not pass the model-wide expert count if it is larger than the packed local
   expert count. The C++ path checks that the requested expert count does not
