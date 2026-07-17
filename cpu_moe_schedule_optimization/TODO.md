@@ -191,9 +191,16 @@ bytes, not predicted DRAM traffic.
 - [ ] Add a direct BF16 route-store variant after the FP32 prototype. Keep final
   top-k accumulation in FP32, validate real `top_k=6` model accuracy, and compare
   current FP32, current BF16-with-scatter, direct FP32, and direct BF16 paths.
-- [ ] Make the Python `out=` argument a true native output buffer instead of
-  allocating a native result and copying it afterward. Verify aliasing and
-  lifetime constraints before using the output as a collective buffer.
+- [x] Make the Python `out=` argument a true native output buffer instead of
+  allocating a native result and copying it afterward.
+  - 2026-07-16 implementation: normal, scheduled, and async native entrypoints
+    accept an optional contiguous CPU BF16 output and bind all final stores to
+    that caller-owned storage. Python no longer performs a trailing `copy_`.
+    Native validation rejects gradients, internal overlap, and overlap with
+    input, packed weights, or routing tensors; successful writes increment the
+    caller tensor's version counter. This removes the temporary final output
+    but deliberately leaves the operator-owned TopK `route_out` workspace
+    unchanged; collective overlap still requires a separate chunk-ready API.
 
 P0 validation must report standalone W2, scatter, weighted merge, local operator
 E2E, logical traffic, and model-level numerical error. Use uniform, hotspot, and

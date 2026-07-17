@@ -146,6 +146,14 @@ out = fused_moe_bf16_tiled(
 )
 ```
 
+`out_buffer` must be a contiguous CPU BF16 tensor with the same shape as
+`hidden_states` and `requires_grad=False`. The native normal, scheduled, and
+async entrypoints write the final BF16 result directly into this storage,
+increment its version counter, and the Python wrapper returns the same tensor
+object; there is no temporary final-output tensor or trailing `copy_`. The
+buffer must not overlap the input, packed weights, `topk_weights`, or `topk_ids`.
+Internal per-route storage used for weighted TopK merge remains operator-owned.
+
 Recommended vLLM adapter shape:
 
 ```python

@@ -1013,37 +1013,93 @@ def test_fused_moe_bf16_tiled_hierarchical_core_skip_is_relative(
     torch.testing.assert_close(hierarchical.float(), serial.float(), atol=0, rtol=0)
 
 
-def test_fused_moe_bf16_tiled_out_buffer() -> None:
-    (
-        hidden_states,
-        w13_weight,
-        w2_weight,
-        _w13_bias,
-        _w2_bias,
-        topk_weights,
-        topk_ids,
-    ) = _case(seed=11)
-    packed = prepare_fused_moe_bf16_tiled_weights(w13_weight, w2_weight)
+@pytest.mark.parametrize("bridge", ["normal", "scheduled", "async"])
+def test_fused_moe_bf16_tiled_native_out_buffer(bridge: str) -> None:
+    generator = torch.Generator().manual_seed(11)
+    num_tokens, hidden_size, ffn_hidden_size = 24, 64, 32
+    num_experts, top_k = 8, 6
+    hidden_states = _bf16_normal((num_tokens, hidden_size), generator=generator, std=0.01)
+    w13_weight = _bf16_normal(
+        (num_experts, 2 * ffn_hidden_size, hidden_size),
+        generator=generator,
+        std=0.01,
+    )
+    w2_weight = _bf16_normal(
+        (num_experts, hidden_size, ffn_hidden_size),
+        generator=generator,
+        std=0.01,
+    )
+    topk_ids = torch.tensor(
+        [[(token + slot) % num_experts for slot in range(top_k)] for token in range(num_tokens)],
+        dtype=torch.int32,
+    )
+    topk_weights = torch.softmax(torch.randn((num_tokens, top_k), generator=generator), dim=-1)
+    packed = prepare_fused_moe_bf16_tiled_weights(w13_weight, w2_weight, fuse_silu=True)
+    if packed.gemm_backend != 1:
+        pytest.skip("requires the SVE fused MoE backend")
     out_buffer = torch.empty_like(hidden_states)
+    expert_ids = torch.arange(num_experts, dtype=torch.int32)
+    team_threads = torch.ones(num_experts, dtype=torch.int32)
 
-    ret = fused_moe_bf16_tiled(
-        hidden_states,
-        packed,
-        topk_weights,
-        topk_ids,
-        num_threads=2,
-        out=out_buffer,
-    )
+    def run(out: torch.Tensor | None = None) -> torch.Tensor:
+        if bridge == "normal":
+            return fused_moe_bf16_tiled(
+                hidden_states,
+                packed,
+                topk_weights,
+                topk_ids,
+                num_threads=1,
+                out=out,
+            )
+        if bridge == "scheduled":
+            return fused_moe_bf16_tiled_scheduled(
+                hidden_states,
+                packed,
+                topk_weights,
+                topk_ids,
+                torch.arange(num_experts + 1, dtype=torch.int32),
+                expert_ids,
+                team_threads,
+                num_threads=1,
+                out=out,
+            )
+        return fused_moe_bf16_tiled_async(
+            hidden_states,
+            packed,
+            topk_weights,
+            topk_ids,
+            expert_ids,
+            torch.zeros(num_experts, dtype=torch.int32),
+            team_threads,
+            torch.cat((torch.zeros(1, dtype=torch.int32), torch.arange(num_experts, dtype=torch.int32))),
+            torch.arange(num_experts - 1, dtype=torch.int32),
+            num_threads=1,
+            out=out,
+        )
 
+    out_buffer.fill_(float("nan"))
+    version_before = out_buffer._version
+    ret = run(out_buffer)
     assert ret is out_buffer
-    ref = fused_moe_bf16_tiled(
-        hidden_states,
-        packed,
-        topk_weights,
-        topk_ids,
-        num_threads=1,
-    )
+    assert ret.data_ptr() == out_buffer.data_ptr()
+    assert out_buffer._version == version_before + 1
+    ref = run()
     torch.testing.assert_close(out_buffer.float(), ref.float(), atol=0, rtol=0)
+
+
+def test_fused_moe_bf16_tiled_native_out_rejects_input_alias() -> None:
+    hidden_states, w13_weight, w2_weight, _, _, topk_weights, topk_ids = _case(seed=12)
+    packed = prepare_fused_moe_bf16_tiled_weights(w13_weight, w2_weight)
+
+    with pytest.raises(RuntimeError, match="out must not overlap input"):
+        fused_moe_bf16_tiled(
+            hidden_states,
+            packed,
+            topk_weights,
+            topk_ids,
+            num_threads=1,
+            out=hidden_states,
+        )
 
 
 @pytest.mark.slow

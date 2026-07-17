@@ -49,8 +49,9 @@ def test_async_w13_split_is_forwarded_as_tristate(monkeypatch) -> None:
             w13_split=value,
         )
         assert result is hidden
-        assert captured[-1][-2] == expected
-        assert captured[-1][-1] == -1
+        assert captured[-1][-3] == expected
+        assert captured[-1][-2] == -1
+        assert captured[-1][-1] is None
 
 
 def test_weight_window_is_forwarded_by_all_entrypoints(monkeypatch) -> None:
@@ -114,9 +115,120 @@ def test_weight_window_is_forwarded_by_all_entrypoints(monkeypatch) -> None:
         weight_window_bytes=target,
     )
 
-    assert captured["normal"][-1] == target
-    assert captured["scheduled"][-1] == target
-    assert captured["async"][-2:] == (-1, target)
+    assert captured["normal"][-2:] == (target, None)
+    assert captured["scheduled"][-2:] == (target, None)
+    assert captured["async"][-3:] == (-1, target, None)
+
+
+def test_native_out_is_forwarded_by_all_entrypoints(monkeypatch) -> None:
+    captured: dict[str, torch.Tensor] = {}
+
+    def fake(name: str):
+        def invoke(*args):
+            output = args[-1]
+            assert isinstance(output, torch.Tensor)
+            captured[name] = output
+            output.fill_(3.0)
+            return output
+
+        return invoke
+
+    monkeypatch.setattr(bf16_tiled, "_HAS_BF16_TILED_FUSED_MOE", True)
+    monkeypatch.setattr(bf16_tiled, "_fused_moe_bf16_tiled_impl", fake("normal"))
+    monkeypatch.setattr(bf16_tiled, "_fused_moe_bf16_tiled_scheduled_impl", fake("scheduled"))
+    monkeypatch.setattr(bf16_tiled, "_fused_moe_bf16_tiled_async_impl", fake("async"))
+    packed = torch.empty(1, dtype=torch.bfloat16)
+    weights = bf16_tiled.PreparedBF16TiledFusedMoEWeights(
+        w13=(packed, 1, 2),
+        w2=(packed, 1, 1),
+        fused_silu=True,
+        gemm_backend=1,
+        backend_n_tile=8,
+    )
+    hidden = torch.zeros((1, 1), dtype=torch.bfloat16)
+    topk_weights = torch.ones((1, 1), dtype=torch.float32)
+    topk_ids = torch.zeros((1, 1), dtype=torch.int32)
+    zero = torch.tensor([0], dtype=torch.int32)
+    one = torch.tensor([1], dtype=torch.int32)
+    dep_offsets = torch.tensor([0, 0], dtype=torch.int32)
+    deps = torch.empty(0, dtype=torch.int32)
+    outputs = {name: torch.empty_like(hidden) for name in ("normal", "scheduled", "async")}
+
+    returned = {
+        "normal": bf16_tiled.fused_moe_bf16_tiled(
+            hidden,
+            weights,
+            topk_weights,
+            topk_ids,
+            out=outputs["normal"],
+        ),
+        "scheduled": bf16_tiled.fused_moe_bf16_tiled_scheduled(
+            hidden,
+            weights,
+            topk_weights,
+            topk_ids,
+            torch.tensor([0, 1], dtype=torch.int32),
+            zero,
+            one,
+            out=outputs["scheduled"],
+        ),
+        "async": bf16_tiled.fused_moe_bf16_tiled_async(
+            hidden,
+            weights,
+            topk_weights,
+            topk_ids,
+            zero,
+            zero,
+            one,
+            dep_offsets,
+            deps,
+            out=outputs["async"],
+        ),
+    }
+
+    for name, output in outputs.items():
+        assert captured[name] is output
+        assert returned[name] is output
+        assert output.item() == 3.0
+
+
+def test_native_out_requires_contiguous_buffer(monkeypatch) -> None:
+    called = False
+
+    def fake(*args):
+        nonlocal called
+        called = True
+        return args[-1]
+
+    monkeypatch.setattr(bf16_tiled, "_HAS_BF16_TILED_FUSED_MOE", True)
+    monkeypatch.setattr(bf16_tiled, "_fused_moe_bf16_tiled_impl", fake)
+    packed = torch.empty(1, dtype=torch.bfloat16)
+    weights = bf16_tiled.PreparedBF16TiledFusedMoEWeights(
+        w13=(packed, 3, 2),
+        w2=(packed, 1, 3),
+    )
+    hidden = torch.zeros((2, 3), dtype=torch.bfloat16)
+    output = torch.empty((3, 2), dtype=torch.bfloat16).t()
+
+    with pytest.raises(ValueError, match="out must be contiguous"):
+        bf16_tiled.fused_moe_bf16_tiled(
+            hidden,
+            weights,
+            torch.ones((2, 1), dtype=torch.float32),
+            torch.zeros((2, 1), dtype=torch.int32),
+            out=output,
+        )
+    assert not called
+
+    with pytest.raises(ValueError, match="requires_grad=True"):
+        bf16_tiled.fused_moe_bf16_tiled(
+            hidden,
+            weights,
+            torch.ones((2, 1), dtype=torch.float32),
+            torch.zeros((2, 1), dtype=torch.int32),
+            out=torch.empty_like(hidden, requires_grad=True),
+        )
+    assert not called
 
 
 @pytest.mark.parametrize(

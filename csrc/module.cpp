@@ -114,7 +114,7 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input, at::Tensor w13_packed, int64_t
                                 c10::optional<at::Tensor> w2_bias, int64_t num_threads, std::string activation,
                                 int64_t global_num_experts, bool skip_weighted, bool fuse_silu,
                                 int64_t silu_poly_degree, int64_t gemm_backend, int64_t backend_n_tile,
-                                int64_t weight_window_bytes);
+                                int64_t weight_window_bytes, c10::optional<at::Tensor> out);
 at::Tensor fused_moe_bf16_tiled_scheduled(at::Tensor input, at::Tensor w13_packed, int64_t w13_K, int64_t w13_N,
                                           at::Tensor w2_packed, int64_t w2_K, int64_t w2_N, at::Tensor topk_weights,
                                           at::Tensor topk_ids, at::Tensor wave_offsets, at::Tensor team_expert_ids,
@@ -122,7 +122,8 @@ at::Tensor fused_moe_bf16_tiled_scheduled(at::Tensor input, at::Tensor w13_packe
                                           c10::optional<at::Tensor> w13_bias, c10::optional<at::Tensor> w2_bias,
                                           int64_t num_threads, std::string activation, int64_t global_num_experts,
                                           bool skip_weighted, bool fuse_silu, int64_t silu_poly_degree,
-                                          int64_t gemm_backend, int64_t backend_n_tile, int64_t weight_window_bytes);
+                                          int64_t gemm_backend, int64_t backend_n_tile, int64_t weight_window_bytes,
+                                          c10::optional<at::Tensor> out);
 at::Tensor fused_moe_bf16_tiled_async(at::Tensor input, at::Tensor w13_packed, int64_t w13_K, int64_t w13_N,
                                       at::Tensor w2_packed, int64_t w2_K, int64_t w2_N, at::Tensor topk_weights,
                                       at::Tensor topk_ids, at::Tensor task_expert_ids, at::Tensor task_core_begins,
@@ -131,7 +132,7 @@ at::Tensor fused_moe_bf16_tiled_async(at::Tensor input, at::Tensor w13_packed, i
                                       c10::optional<at::Tensor> w2_bias, int64_t num_threads, std::string activation,
                                       int64_t global_num_experts, bool skip_weighted, bool fuse_silu,
                                       int64_t silu_poly_degree, int64_t gemm_backend, int64_t backend_n_tile,
-                                      int64_t w13_split, int64_t weight_window_bytes);
+                                      int64_t w13_split, int64_t weight_window_bytes, c10::optional<at::Tensor> out);
 
 // DeepSeek V4 attn_gemm_parallel_execute fused GEMM declarations
 std::tuple<at::Tensor, int64_t, int64_t>
@@ -709,7 +710,8 @@ PYBIND11_MODULE(_C, m) {
         py::arg("w13_bias") = c10::nullopt, py::arg("w2_bias") = c10::nullopt, py::arg("num_threads") = 1,
         py::arg("activation") = "silu", py::arg("global_num_experts") = -1, py::arg("skip_weighted") = false,
         py::arg("fuse_silu") = false, py::arg("silu_poly_degree") = 5, py::arg("gemm_backend") = 0,
-        py::arg("backend_n_tile") = 8, py::arg("weight_window_bytes") = -1, py::call_guard<py::gil_scoped_release>());
+        py::arg("backend_n_tile") = 8, py::arg("weight_window_bytes") = -1, py::arg("out") = c10::nullopt,
+        py::call_guard<py::gil_scoped_release>());
 
   m.def("fused_moe_bf16_tiled_scheduled", &fused_moe_bf16_tiled_scheduled,
         "Run BF16 tiled fused MoE using an externally supplied wave/team "
@@ -722,7 +724,8 @@ PYBIND11_MODULE(_C, m) {
         py::arg("w13_bias") = c10::nullopt, py::arg("w2_bias") = c10::nullopt, py::arg("num_threads") = 1,
         py::arg("activation") = "silu", py::arg("global_num_experts") = -1, py::arg("skip_weighted") = false,
         py::arg("fuse_silu") = false, py::arg("silu_poly_degree") = 5, py::arg("gemm_backend") = 0,
-        py::arg("backend_n_tile") = 8, py::arg("weight_window_bytes") = -1, py::call_guard<py::gil_scoped_release>());
+        py::arg("backend_n_tile") = 8, py::arg("weight_window_bytes") = -1, py::arg("out") = c10::nullopt,
+        py::call_guard<py::gil_scoped_release>());
 
   m.def("fused_moe_bf16_tiled_async", &fused_moe_bf16_tiled_async,
         "Run BF16 tiled fused MoE using an externally supplied async task "
@@ -735,6 +738,7 @@ PYBIND11_MODULE(_C, m) {
         py::arg("num_threads") = 1, py::arg("activation") = "silu", py::arg("global_num_experts") = -1,
         py::arg("skip_weighted") = false, py::arg("fuse_silu") = false, py::arg("silu_poly_degree") = 5,
         py::arg("gemm_backend") = 0, py::arg("backend_n_tile") = 8, py::arg("w13_split") = -1,
-        py::arg("weight_window_bytes") = -1, py::call_guard<py::gil_scoped_release>());
+        py::arg("weight_window_bytes") = -1, py::arg("out") = c10::nullopt,
+        py::call_guard<py::gil_scoped_release>());
 #endif
 }

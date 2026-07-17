@@ -1,4 +1,6 @@
+#include <ATen/MemoryOverlap.h>
 #include <torch/extension.h>
+#include <torch/csrc/autograd/variable.h>
 
 #include <algorithm>
 #include <atomic>
@@ -1413,6 +1415,41 @@ void check_optional_bias(const c10::optional<at::Tensor>& bias, int64_t E, int64
   TORCH_CHECK(b.size(0) == E && b.size(1) == N, name, " shape mismatch: expected [", E, ", ", N, "], got [", b.size(0),
               ", ", b.size(1), "]");
   TORCH_CHECK(b.is_contiguous(), name, " must be contiguous");
+}
+
+void check_output_no_overlap(const at::Tensor& output, const at::Tensor& input, const char* name) {
+  TORCH_CHECK(at::get_overlap_status(output, input) == at::MemOverlapStatus::No, "out must not overlap ", name);
+}
+
+at::Tensor prepare_moe_output(const at::Tensor& input, const at::Tensor& w13_packed, const at::Tensor& w2_packed,
+                              const at::Tensor& topk_weights, const at::Tensor& topk_ids,
+                              const c10::optional<at::Tensor>& out) {
+  if (!out.has_value()) {
+    return at::empty(input.sizes(), at::TensorOptions().device(input.device()).dtype(at::kBFloat16));
+  }
+
+  const at::Tensor& output = out.value();
+  TORCH_CHECK(output.defined(), "out must be a defined tensor");
+  check_bf16_cpu(output, "out");
+  TORCH_CHECK(output.dim() == 2 && output.sizes() == input.sizes(), "out must have shape ", input.sizes(), ", got ",
+              output.sizes());
+  TORCH_CHECK(output.device() == input.device(), "out must be on the same device as input");
+  TORCH_CHECK(output.is_contiguous(), "out must be contiguous");
+  TORCH_CHECK(!output.requires_grad(), "out with requires_grad=True is not supported");
+  TORCH_CHECK(at::has_internal_overlap(output) == at::MemOverlap::No, "out must not have internal overlap");
+  check_output_no_overlap(output, input, "input");
+  check_output_no_overlap(output, w13_packed, "w13_packed");
+  check_output_no_overlap(output, w2_packed, "w2_packed");
+  check_output_no_overlap(output, topk_weights, "topk_weights");
+  check_output_no_overlap(output, topk_ids, "topk_ids");
+  return output;
+}
+
+at::Tensor finalize_moe_output(at::Tensor output, const c10::optional<at::Tensor>& out) {
+  if (out.has_value()) {
+    torch::autograd::impl::bump_version(output);
+  }
+  return output;
 }
 
 // Build a per-expert padded fp32 bias buffer [E, N_pad] from an optional
@@ -4874,7 +4911,7 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input, at::Tensor w13_packed, int64_t
                                 c10::optional<at::Tensor> w2_bias, int64_t num_threads, std::string activation,
                                 int64_t global_num_experts, bool skip_weighted, bool fuse_silu,
                                 int64_t silu_poly_degree, int64_t gemm_backend, int64_t backend_n_tile,
-                                int64_t weight_window_bytes) {
+                                int64_t weight_window_bytes, c10::optional<at::Tensor> out) {
 #ifndef __aarch64__
   TORCH_CHECK(false, "fused_moe_bf16_tiled requires AArch64");
 #else
@@ -4937,7 +4974,7 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input, at::Tensor w13_packed, int64_t
     TORCH_CHECK(top_k == 1, "skip_weighted is only valid when top_k == 1");
   }
   if (num_tokens == 0) {
-    return at::empty_like(input);
+    return finalize_moe_output(prepare_moe_output(input, w13_packed, w2_packed, topk_weights, topk_ids, out), out);
   }
 
   const int64_t num_experts = global_num_experts < 0 ? w13.E : global_num_experts;
@@ -4986,7 +5023,7 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input, at::Tensor w13_packed, int64_t
     }
   }
 
-  at::Tensor output = at::empty({num_tokens, H}, at::TensorOptions().device(input.device()).dtype(at::kBFloat16));
+  at::Tensor output = prepare_moe_output(input, w13_packed, w2_packed, topk_weights, topk_ids, out);
   uint16_t* out_bf16_ptr = bf16_data(output);
   const uint16_t* input_ptr = bf16_data_const(input);
   const uint16_t* w13_ptr = bf16_data_const(w13.tensor);
@@ -5756,7 +5793,7 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input, at::Tensor w13_packed, int64_t
     moe_trace.write_report(moe_trace_strategy, actual_threads, num_tokens, top_k, num_experts, num_routes, H, F,
                            tasks.size(), moe_trace_expert_tasks, nsplit_total_groups, nsplit_group_size, e2e_ms);
   }
-  return output;
+  return finalize_moe_output(output, out);
 #endif
 }
 
@@ -5767,7 +5804,8 @@ at::Tensor fused_moe_bf16_tiled_scheduled(at::Tensor input, at::Tensor w13_packe
                                           c10::optional<at::Tensor> w13_bias, c10::optional<at::Tensor> w2_bias,
                                           int64_t num_threads, std::string activation, int64_t global_num_experts,
                                           bool skip_weighted, bool fuse_silu, int64_t silu_poly_degree,
-                                          int64_t gemm_backend, int64_t backend_n_tile, int64_t weight_window_bytes) {
+                                          int64_t gemm_backend, int64_t backend_n_tile, int64_t weight_window_bytes,
+                                          c10::optional<at::Tensor> out) {
 #ifndef __aarch64__
   TORCH_CHECK(false, "fused_moe_bf16_tiled_scheduled requires AArch64");
 #else
@@ -5870,7 +5908,7 @@ at::Tensor fused_moe_bf16_tiled_scheduled(at::Tensor input, at::Tensor w13_packe
       !skip_weighted && use_sve_backend && fuse_silu && w2_bias_base == nullptr && sve_w2_bf16_route_enabled();
 #endif
   if (num_tokens == 0) {
-    return at::empty_like(input);
+    return finalize_moe_output(prepare_moe_output(input, w13_packed, w2_packed, topk_weights, topk_ids, out), out);
   }
 
   const int64_t num_experts = global_num_experts < 0 ? w13.E : global_num_experts;
@@ -6013,7 +6051,7 @@ at::Tensor fused_moe_bf16_tiled_scheduled(at::Tensor input, at::Tensor w13_packe
   }
   trace_phase_end(-1, -1, -1, -1, -1, num_teams, "plan_validate", phase_begin);
 
-  at::Tensor output = at::empty({num_tokens, H}, at::TensorOptions().device(input.device()).dtype(at::kBFloat16));
+  at::Tensor output = prepare_moe_output(input, w13_packed, w2_packed, topk_weights, topk_ids, out);
   uint16_t* out_bf16_ptr = bf16_data(output);
   at::Tensor route_out;
   float* route_out_ptr = nullptr;
@@ -6264,7 +6302,7 @@ at::Tensor fused_moe_bf16_tiled_scheduled(at::Tensor input, at::Tensor w13_packe
     moe_trace.write_report("external_plan_scheduled", num_threads, num_tokens, top_k, num_experts, num_routes, H, F,
                            static_cast<size_t>(active_experts), num_teams, num_teams, 0, e2e_ms);
   }
-  return output;
+  return finalize_moe_output(output, out);
 #endif
 }
 
@@ -6276,7 +6314,7 @@ at::Tensor fused_moe_bf16_tiled_async(at::Tensor input, at::Tensor w13_packed, i
                                       c10::optional<at::Tensor> w2_bias, int64_t num_threads, std::string activation,
                                       int64_t global_num_experts, bool skip_weighted, bool fuse_silu,
                                       int64_t silu_poly_degree, int64_t gemm_backend, int64_t backend_n_tile,
-                                      int64_t w13_split, int64_t weight_window_bytes) {
+                                      int64_t w13_split, int64_t weight_window_bytes, c10::optional<at::Tensor> out) {
 #ifndef __aarch64__
   TORCH_CHECK(false, "fused_moe_bf16_tiled_async requires AArch64");
 #else
@@ -6372,7 +6410,7 @@ at::Tensor fused_moe_bf16_tiled_async(at::Tensor input, at::Tensor w13_packed, i
       !skip_weighted && use_sve_backend && fuse_silu && w2_bias_base == nullptr && sve_w2_bf16_route_enabled();
 #endif
   if (num_tokens == 0) {
-    return at::empty_like(input);
+    return finalize_moe_output(prepare_moe_output(input, w13_packed, w2_packed, topk_weights, topk_ids, out), out);
   }
 
   const int64_t num_experts = global_num_experts < 0 ? w13.E : global_num_experts;
@@ -6537,7 +6575,7 @@ at::Tensor fused_moe_bf16_tiled_async(at::Tensor input, at::Tensor w13_packed, i
   }
   trace_phase_end(-1, -1, -1, -1, num_tasks, "plan_validate", phase_begin);
 
-  at::Tensor output = at::empty({num_tokens, H}, at::TensorOptions().device(input.device()).dtype(at::kBFloat16));
+  at::Tensor output = prepare_moe_output(input, w13_packed, w2_packed, topk_weights, topk_ids, out);
   uint16_t* out_bf16_ptr = bf16_data(output);
   at::Tensor route_out;
   float* route_out_ptr = nullptr;
@@ -6915,6 +6953,6 @@ at::Tensor fused_moe_bf16_tiled_async(at::Tensor input, at::Tensor w13_packed, i
     moe_trace.write_report("external_plan_async", num_threads, num_tokens, top_k, num_experts, num_routes, H, F,
                            static_cast<size_t>(active_experts), num_tasks, num_tasks, 0, e2e_ms);
   }
-  return output;
+  return finalize_moe_output(output, out);
 #endif
 }

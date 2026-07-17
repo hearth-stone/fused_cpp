@@ -90,6 +90,19 @@ def _check_integer_schedule_tensor(tensor: torch.Tensor, name: str) -> None:
         raise ValueError(f"{name} must be 1-D, got shape {tuple(tensor.shape)}")
 
 
+def _validate_output_buffer(input: torch.Tensor, out: torch.Tensor | None) -> None:
+    if out is None:
+        return
+    if tuple(out.shape) != tuple(input.shape):
+        raise ValueError(f"out must have shape {tuple(input.shape)}")
+    if out.dtype != input.dtype or out.device != input.device:
+        raise ValueError("out must match input dtype and device")
+    if not out.is_contiguous():
+        raise ValueError("out must be contiguous")
+    if out.requires_grad:
+        raise ValueError("out with requires_grad=True is not supported")
+
+
 def _weight_window_argument(weight_window_bytes: int | None) -> int:
     if weight_window_bytes is None:
         return -1
@@ -169,6 +182,9 @@ def fused_moe_bf16_tiled(
     tile-aligned packed-B windows no larger than that target, except when one
     hardware N tile itself is larger. ``None`` reads
     ``FUSED_CPP_MOE_WEIGHT_WINDOW_BYTES``; zero disables byte-based windows.
+    A supplied ``out`` must be a contiguous CPU BF16 tensor matching ``input``;
+    the native kernel writes it directly and returns it without an intermediate
+    output allocation or copy.
     """
     _require_backend()
     if input.dtype != torch.bfloat16:
@@ -181,11 +197,7 @@ def fused_moe_bf16_tiled(
         raise TypeError(f"topk_weights must use a floating dtype, got {topk_weights.dtype}")
     if int(num_threads) <= 0:
         raise ValueError(f"num_threads must be positive, got {num_threads}")
-    if out is not None:
-        if tuple(out.shape) != tuple(input.shape):
-            raise ValueError(f"out must have shape {tuple(input.shape)}")
-        if out.dtype != input.dtype or out.device != input.device:
-            raise ValueError("out must match input dtype and device")
+    _validate_output_buffer(input, out)
 
     def _contiguous_bias(bias: torch.Tensor | None) -> torch.Tensor | None:
         if bias is None:
@@ -217,11 +229,9 @@ def fused_moe_bf16_tiled(
         int(weights.gemm_backend),
         int(weights.backend_n_tile),
         _weight_window_argument(weight_window_bytes),
+        out,
     )
-    if out is not None:
-        out.copy_(result)
-        return out
-    return result
+    return out if out is not None else result
 
 
 def fused_moe_bf16_tiled_scheduled(
@@ -248,7 +258,8 @@ def fused_moe_bf16_tiled_scheduled(
 
     ``wave_offsets`` has shape ``[num_waves + 1]`` and indexes into
     ``team_expert_ids`` / ``team_threads``. Each team computes one active
-    expert using ``team_threads[i]`` cooperative threads.
+    expert using ``team_threads[i]`` cooperative threads. A supplied ``out`` is
+    written directly by the native kernel and must be contiguous.
     """
     _require_backend()
     if _fused_moe_bf16_tiled_scheduled_impl is None:
@@ -276,11 +287,7 @@ def fused_moe_bf16_tiled_scheduled(
                 "thread_cpu_ids must have exactly num_threads entries: "
                 f"got {int(thread_cpu_ids.numel())} vs {int(num_threads)}"
             )
-    if out is not None:
-        if tuple(out.shape) != tuple(input.shape):
-            raise ValueError(f"out must have shape {tuple(input.shape)}")
-        if out.dtype != input.dtype or out.device != input.device:
-            raise ValueError("out must match input dtype and device")
+    _validate_output_buffer(input, out)
 
     def _contiguous_bias(bias: torch.Tensor | None) -> torch.Tensor | None:
         if bias is None:
@@ -316,11 +323,9 @@ def fused_moe_bf16_tiled_scheduled(
         int(weights.gemm_backend),
         int(weights.backend_n_tile),
         _weight_window_argument(weight_window_bytes),
+        out,
     )
-    if out is not None:
-        out.copy_(result)
-        return out
-    return result
+    return out if out is not None else result
 
 
 def fused_moe_bf16_tiled_async(
@@ -355,7 +360,8 @@ def fused_moe_bf16_tiled_async(
     selects the two-panel SVE W13 policy; ``None`` preserves the legacy
     ``FUSED_CPP_MOE_W13_SPLIT_N`` environment fallback. A positive
     ``weight_window_bytes`` supersedes that two-panel granularity and applies
-    the same packed-B byte limit to both W13 and W2.
+    the same packed-B byte limit to both W13 and W2. A supplied ``out`` is
+    written directly by the native kernel and must be contiguous.
     """
     _require_backend()
     if _fused_moe_bf16_tiled_async_impl is None:
@@ -391,11 +397,7 @@ def fused_moe_bf16_tiled_async(
                 "thread_cpu_ids must have exactly num_threads entries: "
                 f"got {int(thread_cpu_ids.numel())} vs {int(num_threads)}"
             )
-    if out is not None:
-        if tuple(out.shape) != tuple(input.shape):
-            raise ValueError(f"out must have shape {tuple(input.shape)}")
-        if out.dtype != input.dtype or out.device != input.device:
-            raise ValueError("out must match input dtype and device")
+    _validate_output_buffer(input, out)
 
     def _contiguous_bias(bias: torch.Tensor | None) -> torch.Tensor | None:
         if bias is None:
@@ -434,11 +436,9 @@ def fused_moe_bf16_tiled_async(
         int(weights.backend_n_tile),
         -1 if w13_split is None else int(bool(w13_split)),
         _weight_window_argument(weight_window_bytes),
+        out,
     )
-    if out is not None:
-        out.copy_(result)
-        return out
-    return result
+    return out if out is not None else result
 
 
 bf16_tiled_fused_moe = fused_moe_bf16_tiled
