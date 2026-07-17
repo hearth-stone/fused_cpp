@@ -6427,6 +6427,8 @@ at::Tensor fused_moe_bf16_tiled_async(at::Tensor input, at::Tensor w13_packed, i
   use_w2_direct_route = !skip_weighted && !use_w2_bf16_route && use_sve_backend && fuse_silu && w2.N_pad == H &&
                         sve_w2_direct_route_offsets_fit(num_routes, H, w2.n_tile) && sve_w2_direct_route_enabled();
 #endif
+  bool use_async_ready_token_merge =
+      use_w2_direct_route && env_flag_enabled_by_default("FUSED_CPP_MOE_ASYNC_READY_TOKEN_MERGE");
 
   std::vector<std::vector<int64_t>> routes(static_cast<size_t>(num_experts));
   for (int64_t flat = 0; flat < num_routes; ++flat) {
@@ -6450,6 +6452,7 @@ at::Tensor fused_moe_bf16_tiled_async(at::Tensor input, at::Tensor w13_packed, i
               num_tasks, " active_experts=", active_experts);
 
   std::vector<int64_t> seen(static_cast<size_t>(num_experts), 0);
+  std::vector<int64_t> expert_task_ids(static_cast<size_t>(num_experts), -1);
   std::vector<AsyncTaskRuntime> tasks(static_cast<size_t>(num_tasks));
   std::vector<ScheduledScratchUnitConfig> scratch_unit_configs;
   int64_t trace_gemm_hint = 0;
@@ -6468,6 +6471,7 @@ at::Tensor fused_moe_bf16_tiled_async(at::Tensor input, at::Tensor w13_packed, i
     TORCH_CHECK(rows > 0, "async task contains inactive expert ", expert);
     check_positive_int(rows, "async task rows");
     seen[static_cast<size_t>(expert)] = 1;
+    expert_task_ids[static_cast<size_t>(expert)] = task;
 
     int64_t scratch_idx = -1;
     for (size_t idx = 0; idx < scratch_unit_configs.size(); ++idx) {
@@ -6497,6 +6501,18 @@ at::Tensor fused_moe_bf16_tiled_async(at::Tensor input, at::Tensor w13_packed, i
     if (!routes[static_cast<size_t>(expert)].empty()) {
       TORCH_CHECK(seen[static_cast<size_t>(expert)] == 1, "async task plan is missing active expert ", expert);
     }
+  }
+  if (use_async_ready_token_merge) {
+    double min_team_load = std::numeric_limits<double>::infinity();
+    double max_team_load = 0.0;
+    for (const AsyncTaskRuntime& task : tasks) {
+      const double team_load = static_cast<double>(ceil_div_int64(task.rows, kKernelTile)) / task.threads;
+      min_team_load = std::min(min_team_load, team_load);
+      max_team_load = std::max(max_team_load, team_load);
+    }
+    // Without a material team-load gap there is no useful interval in which
+    // idle lanes can hide merge work, so retain the contiguous post barrier.
+    use_async_ready_token_merge = max_team_load >= min_team_load * 1.25;
   }
 
   std::vector<std::vector<int64_t>> successors(static_cast<size_t>(num_tasks));
@@ -6545,12 +6561,106 @@ at::Tensor fused_moe_bf16_tiled_async(at::Tensor input, at::Tensor w13_packed, i
   const std::vector<ScheduledTeamScratch*>& scratches = scratch_lease.scratches();
   trace_phase_end(-1, -1, -1, -1, static_cast<int64_t>(scratch_unit_configs.size()), "scratch_alloc", phase_begin);
 
-  moe_trace.reserve(static_cast<size_t>(trace_gemm_hint));
+  const float* topk_w = weights_f32.data_ptr<float>();
+  const int route_merge_unroll = skip_weighted ? 0 : resolve_route_merge_unroll(use_sve_backend);
+  const size_t ready_token_count = static_cast<size_t>(use_async_ready_token_merge ? num_tokens : 0);
+  std::vector<std::atomic<int64_t>> token_enqueued(ready_token_count);
+  std::vector<std::atomic<int64_t>> ready_token_slots(ready_token_count);
+  std::vector<std::atomic<int64_t>> token_merged(ready_token_count);
+  for (size_t token = 0; token < ready_token_count; ++token) {
+    token_enqueued[token].store(0, std::memory_order_relaxed);
+    ready_token_slots[token].store(-1, std::memory_order_relaxed);
+    token_merged[token].store(0, std::memory_order_relaxed);
+  }
+  std::vector<std::vector<int64_t>> task_ready_tokens(
+      static_cast<size_t>(use_async_ready_token_merge ? num_tasks : 0));
+  if (use_async_ready_token_merge) {
+    for (int64_t task = 0; task < num_tasks; ++task) {
+      task_ready_tokens[static_cast<size_t>(task)].reserve(
+          static_cast<size_t>(tasks[static_cast<size_t>(task)].rows));
+    }
+  }
+  std::atomic<int64_t> ready_token_head{0};
+  std::atomic<int64_t> ready_token_tail{0};
+  std::atomic<int64_t> completed_ready_token_merges{0};
+  std::atomic<int64_t> expert_publication_epoch{0};
+
+  moe_trace.reserve(static_cast<size_t>(trace_gemm_hint) + ready_token_count);
   std::vector<std::atomic<int64_t>> task_states(static_cast<size_t>(num_tasks));
   for (int64_t task = 0; task < num_tasks; ++task) {
     task_states[static_cast<size_t>(task)].store(0);
   }
   std::atomic<int64_t> completed_tasks{0};
+
+  auto publish_ready_tokens = [&](int64_t task_id, const std::vector<int64_t>& expert_routes) {
+    std::vector<int64_t>& newly_ready = task_ready_tokens[static_cast<size_t>(task_id)];
+    newly_ready.clear();
+    for (const int64_t flat : expert_routes) {
+      const int64_t token = flat / top_k;
+      bool ready = true;
+      for (int64_t slot = 0; slot < top_k; ++slot) {
+        const int64_t route_expert = ids[token * top_k + slot];
+        const int64_t route_task = expert_task_ids[static_cast<size_t>(route_expert)];
+        TORCH_INTERNAL_ASSERT(route_task >= 0, "ready token references inactive expert ", route_expert);
+        if (task_states[static_cast<size_t>(route_task)].load(std::memory_order_acquire) != 2) {
+          ready = false;
+          break;
+        }
+      }
+      if (!ready) {
+        continue;
+      }
+      int64_t expected = 0;
+      if (token_enqueued[static_cast<size_t>(token)].compare_exchange_strong(
+              expected, 1, std::memory_order_relaxed, std::memory_order_relaxed)) {
+        newly_ready.push_back(token);
+      }
+    }
+    if (newly_ready.empty()) {
+      return;
+    }
+    const int64_t slot_begin =
+        ready_token_tail.fetch_add(static_cast<int64_t>(newly_ready.size()), std::memory_order_relaxed);
+    TORCH_INTERNAL_ASSERT(slot_begin >= 0 && slot_begin + static_cast<int64_t>(newly_ready.size()) <= num_tokens,
+                          "ready-token queue overflow: begin=", slot_begin, " count=", newly_ready.size(),
+                          " tokens=", num_tokens);
+    for (size_t idx = 0; idx < newly_ready.size(); ++idx) {
+      ready_token_slots[static_cast<size_t>(slot_begin) + idx].store(newly_ready[idx], std::memory_order_release);
+    }
+  };
+
+  auto try_claim_ready_token = [&]() -> int64_t {
+    int64_t head = ready_token_head.load(std::memory_order_relaxed);
+    while (true) {
+      const int64_t tail = ready_token_tail.load(std::memory_order_acquire);
+      if (head >= tail) {
+        return -1;
+      }
+      if (ready_token_head.compare_exchange_weak(head, head + 1, std::memory_order_relaxed,
+                                                 std::memory_order_relaxed)) {
+        break;
+      }
+    }
+
+    int64_t token = -1;
+    while ((token = ready_token_slots[static_cast<size_t>(head)].load(std::memory_order_acquire)) < 0) {
+#if defined(__aarch64__)
+      __asm__ __volatile__("yield" ::: "memory");
+#else
+      std::this_thread::yield();
+#endif
+    }
+    return token;
+  };
+
+  auto merge_ready_token = [&](int64_t tid, int64_t token) {
+    auto worker_phase_begin = trace_phase_begin();
+    merge_route_range(route_out_ptr, route_out_bf16_ptr, topk_w, out_bf16_ptr, token, token + 1, top_k, H,
+                      use_w2_bf16_route, route_merge_unroll);
+    token_merged[static_cast<size_t>(token)].store(1, std::memory_order_release);
+    completed_ready_token_merges.fetch_add(1, std::memory_order_relaxed);
+    trace_phase_end(tid, -1, -1, -1, 1, "merge_ready_token", worker_phase_begin);
+  };
 
   auto run_async_task = [&](int64_t tid, int64_t task_id) {
     const AsyncTaskRuntime& task = tasks[static_cast<size_t>(task_id)];
@@ -6708,6 +6818,14 @@ at::Tensor fused_moe_bf16_tiled_async(at::Tensor input, at::Tensor w13_packed, i
       for (const int64_t child : successors[static_cast<size_t>(task_id)]) {
         deps_remaining[static_cast<size_t>(child)].fetch_sub(1);
       }
+      if (use_async_ready_token_merge) {
+        // The preceding acquire/release team barrier makes every N owner's W2
+        // stores visible before this expert publishes ready tokens. The global
+        // RMW chain guarantees that the last TopK expert observes prior expert
+        // state stores before it checks token readiness.
+        expert_publication_epoch.fetch_add(1, std::memory_order_acq_rel);
+        publish_ready_tokens(task_id, expert_routes);
+      }
       completed_tasks.fetch_add(1);
     }
     barrier.wait();
@@ -6743,6 +6861,13 @@ at::Tensor fused_moe_bf16_tiled_async(at::Tensor input, at::Tensor w13_packed, i
       }
       if (selected_task >= 0) {
         run_async_task(tid, selected_task);
+      } else if (use_async_ready_token_merge) {
+        const int64_t token = try_claim_ready_token();
+        if (token >= 0) {
+          merge_ready_token(tid, token);
+        } else {
+          std::this_thread::yield();
+        }
       } else {
         std::this_thread::yield();
       }
@@ -6750,19 +6875,37 @@ at::Tensor fused_moe_bf16_tiled_async(at::Tensor input, at::Tensor w13_packed, i
   });
   trace_phase_end(-1, -1, -1, -1, num_routes, "scheduled_compute", phase_begin);
 
-  const float* topk_w = weights_f32.data_ptr<float>();
-  const int route_merge_unroll = skip_weighted ? 0 : resolve_route_merge_unroll(use_sve_backend);
   auto merge_routes = [&](int64_t tid) {
     auto worker_phase_begin = trace_phase_begin();
     const int64_t rows_per_thread = ceil_div_int64(num_tokens, num_threads);
     const int64_t token_begin = tid * rows_per_thread;
     const int64_t token_end = std::min<int64_t>(num_tokens, token_begin + rows_per_thread);
-    merge_route_range(route_out_ptr, route_out_bf16_ptr, topk_w, out_bf16_ptr, token_begin, token_end, top_k, H,
-                      use_w2_bf16_route, route_merge_unroll);
+    if (!use_async_ready_token_merge) {
+      merge_route_range(route_out_ptr, route_out_bf16_ptr, topk_w, out_bf16_ptr, token_begin, token_end, top_k, H,
+                        use_w2_bf16_route, route_merge_unroll);
+    } else {
+      int64_t token = token_begin;
+      while (token < token_end) {
+        while (token < token_end &&
+               token_merged[static_cast<size_t>(token)].load(std::memory_order_acquire) != 0) {
+          ++token;
+        }
+        const int64_t range_begin = token;
+        while (token < token_end &&
+               token_merged[static_cast<size_t>(token)].load(std::memory_order_acquire) == 0) {
+          ++token;
+        }
+        if (range_begin < token) {
+          merge_route_range(route_out_ptr, route_out_bf16_ptr, topk_w, out_bf16_ptr, range_begin, token, top_k, H,
+                            use_w2_bf16_route, route_merge_unroll);
+        }
+      }
+    }
     trace_phase_end(tid, -1, -1, -1, std::max<int64_t>(0, token_end - token_begin), "merge_routes", worker_phase_begin);
   };
   phase_begin = trace_phase_begin();
-  if (!skip_weighted) {
+  if (!skip_weighted &&
+      (!use_async_ready_token_merge || completed_ready_token_merges.load(std::memory_order_acquire) < num_tokens)) {
     run_fixed_threads(num_threads, merge_routes);
   }
   trace_phase_end(-1, -1, -1, -1, num_tokens, "merge_routes_total", phase_begin);

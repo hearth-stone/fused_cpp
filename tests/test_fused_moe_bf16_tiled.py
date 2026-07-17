@@ -490,6 +490,93 @@ def test_sve_w2_direct_route_store_matches_scatter(
         assert "stage=scatter_route_out" not in trace
 
 
+def test_async_ready_token_merge_overlaps_imbalanced_experts(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Merge short-group tokens while an independent long expert group runs."""
+    monkeypatch.setenv("FUSED_CPP_MOE_SVE", "1")
+    monkeypatch.setenv("FUSED_CPP_MOE_W13_SPLIT_N", "1")
+    monkeypatch.setenv("FUSED_CPP_MOE_W2_BF16_ROUTE", "0")
+    monkeypatch.setenv("FUSED_CPP_MOE_SVE_W2_DIRECT_ROUTE", "1")
+    monkeypatch.setenv("FUSED_CPP_MOE_SVE_ROUTE_MERGE_UNROLL", "1")
+    monkeypatch.setenv("FUSED_CPP_MOE_FUSED_2D_SPLIT", "0")
+
+    generator = torch.Generator().manual_seed(20260716)
+    hidden_size = 512
+    ffn_hidden_size = 256
+    num_experts = 4
+    top_k = 2
+    short_tokens = 8
+    long_tokens = 256
+    num_tokens = short_tokens + long_tokens
+    threads = num_experts
+    affinity = sorted(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else list(range(threads))
+    if len(affinity) < threads:
+        pytest.skip(f"requires {threads} available CPUs")
+
+    hidden_states = _bf16_normal((num_tokens, hidden_size), generator=generator, std=0.01)
+    w13_weight = _bf16_normal(
+        (num_experts, 2 * ffn_hidden_size, hidden_size),
+        generator=generator,
+        std=0.01,
+    )
+    w2_weight = _bf16_normal(
+        (num_experts, hidden_size, ffn_hidden_size),
+        generator=generator,
+        std=0.01,
+    )
+    topk_ids = torch.empty((num_tokens, top_k), dtype=torch.int32)
+    topk_ids[:short_tokens] = torch.tensor([0, 1], dtype=torch.int32)
+    topk_ids[short_tokens:] = torch.tensor([2, 3], dtype=torch.int32)
+    topk_weights = torch.softmax(torch.randn((num_tokens, top_k), generator=generator), dim=-1)
+    packed = prepare_fused_moe_bf16_tiled_weights(w13_weight, w2_weight, fuse_silu=True)
+    if packed.gemm_backend != 1:
+        pytest.skip("requires an SVE BF16 build/runtime")
+
+    expert_ids = torch.arange(num_experts, dtype=torch.int32)
+    task_core_begins = torch.arange(num_experts, dtype=torch.int32)
+    task_threads = torch.ones(num_experts, dtype=torch.int32)
+    dep_offsets = torch.zeros(num_experts + 1, dtype=torch.int32)
+    deps = torch.empty(0, dtype=torch.int32)
+    thread_cpu_ids = torch.tensor(affinity[:threads], dtype=torch.int32)
+
+    def run() -> torch.Tensor:
+        return fused_moe_bf16_tiled_async(
+            hidden_states,
+            packed,
+            topk_weights,
+            topk_ids,
+            expert_ids,
+            task_core_begins,
+            task_threads,
+            dep_offsets,
+            deps,
+            thread_cpu_ids=thread_cpu_ids,
+            num_threads=threads,
+        )
+
+    ready_flag = "FUSED_CPP_MOE_ASYNC_READY_TOKEN_MERGE"
+    monkeypatch.setenv(ready_flag, "0")
+    reference = run()
+    monkeypatch.setenv(ready_flag, "1")
+    for _ in range(5):
+        candidate = run()
+        torch.testing.assert_close(candidate.float(), reference.float(), atol=0, rtol=0)
+
+    monkeypatch.delenv(ready_flag)
+    default = run()
+    torch.testing.assert_close(default.float(), candidate.float(), atol=0, rtol=0)
+
+    trace_path = tmp_path / "async_ready_token_merge.log"
+    monkeypatch.setenv("FUSED_CPP_MOE_TRACE", "1")
+    monkeypatch.setenv("FUSED_CPP_MOE_TRACE_FILE", str(trace_path))
+    traced = run()
+    monkeypatch.setenv("FUSED_CPP_MOE_TRACE", "0")
+    torch.testing.assert_close(traced.float(), reference.float(), atol=0, rtol=0)
+    assert "stage=merge_ready_token" in trace_path.read_text()
+
+
 @pytest.mark.parametrize("bridge", ["scheduled", "async"])
 @pytest.mark.parametrize("w2_bf16_route", [False, True])
 @pytest.mark.parametrize(

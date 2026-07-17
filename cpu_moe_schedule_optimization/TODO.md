@@ -202,10 +202,23 @@ claims must include both long-route throughput and short-route latency.
 
 ### P1: overlap independent end-to-end stages
 
-- [ ] Add per-token route-completion accounting so idle lanes can merge tokens
-  whose complete top-k set is ready while a long expert tail is still running.
-  Keep expert work preferred over merge work and quantify the exposed merge time
-  removed for balanced and heavy-tail distributions.
+- [x] Prototype per-token route-completion accounting so idle lanes can merge
+  tokens whose complete top-k set is ready while a long expert tail is still
+  running. Keep expert work preferred over merge work.
+  - 2026-07-16 implementation: the default async SVE direct-route path uses
+    expert completion states,
+    one publication RMW per expert, one CAS per ready token, and batched queue
+    publication. Idle async workers merge one ready token at a time; the
+    existing contiguous merge handles all leftovers after expert completion.
+    A `ceil(M/12)/threads` max/min ratio below 1.25 keeps the old path. On the
+    192-core host NUMA0, balanced and 25%/75% two-group distributions changed
+    three-run medians by less than 0.4%; one trace of the latter merged 605/2048
+    tokens early. The rejected per-route atomic counter prototype regressed
+    23.35%. Set `FUSED_CPP_MOE_ASYNC_READY_TOKEN_MERGE=0` to retain the
+    post-expert merge fallback.
+  - [ ] Add captured and multi-wave heavy-tail distributions, model the
+    expert/merge contention term, and revisit the 1.25 load threshold if the
+    hidden merge time does not exceed queue/state overhead by the noise floor.
 - [ ] Represent the shared expert as an independently schedulable job, run it
   concurrently with routed experts when resource contention permits, and fold
   shared-output/routed-scaling/residual addition into the final merge epilogue.

@@ -229,6 +229,58 @@ $$
 Dispatch、communication、scatter 和 combine 在不受 plan 影响时作为外部成本；
 若其成本会随 plan 改变，则必须提升为目标函数的一部分。
 
+### 2.5 可选的 ready-token combine 外层
+
+当 combine 与 expert 尾部重叠时，token identity 会影响可行开始时间。令输入
+token 集合为 $\mathcal Q$，token $q$ 的 TopK expert 前驱为：
+
+$$
+\mathcal P_q=\{e_{q,1},\ldots,e_{q,K}\}.
+$$
+
+完整 expert job 在 $f_i$ 时一次性发布其所有 route row，因此 token merge job
+$q$ 的 release time 为：
+
+$$
+r_q=\max_{i\in\mathcal P_q}f_i.
+$$
+
+令 $u_q$、$g_q$ 分别为 merge 的开始和完成时间，$b_q(\tau)$ 为其一线程活跃
+指示函数，则：
+
+$$
+u_q\ge r_q,
+\qquad
+\sum_i t_i a_i(\tau)+\sum_q b_q(\tau)\le C.
+$$
+
+令 $G_q=G(K,H)>0$ 为 token merge 的单线程 isolated time，$y_q$ 为其归一化
+进度。对包含活跃 merge job 的扩展状态 $\mathcal Z^+(\tau)$，有：
+
+$$
+\frac{dy_q(\tau)}{d\tau}
+=\frac{b_q(\tau)}{G_qD_q^{\mathrm{merge}}(\mathcal Z^+(\tau))},
+\qquad
+y_q(u_q)=0,quad y_q(g_q)=1.
+$$
+
+若 merge 与剩余 expert 同时运行会改变 cache/带宽响应，还应把 expert slowdown
+扩为 $D_i^+(\mathcal Z^+)$；不能直接假定被重叠的 merge 时间全部免费。包含
+combine 的目标变为：
+
+$$
+C_{\max}^{+}=\max\left(\max_i f_i,\max_q g_q\right).
+$$
+
+当前 production planner 仍只优化 2.4 节的 expert-compute makespan。async
+ready-token executor 不扩大 planner 决策空间：它保持固定 expert core
+interval，优先执行可运行 expert，仅让无 expert 可执行的 lane 贪心领取一个已经
+release 的 token；所有 expert 结束后，未完成 token 仍由原连续区间 merge 收尾。
+该策略默认只在 SVE FP32 direct-route 路径且
+$\max_i\lceil M_i/12\rceil/t_i\ge1.25\min_i\lceil M_i/12\rceil/t_i$ 时生效；
+`FUSED_CPP_MOE_ASYNC_READY_TOKEN_MERGE=0` 显式恢复 post-expert merge。因此它是
+默认 executor heuristic，不是 cost model 已评分的 planner 调度动作。
+
 ## 3. 多 Rank 外层
 
 对 rank $k\in\mathcal K$，定义 rank-local 完成时间 $C_k$。不考虑跨 rank
@@ -564,7 +616,8 @@ One-hot 是线程宽度的等价求解器编码，不是剪枝。一般 active-s
 | Shape 集合 | 所有满足 CPU 容量的整数宽度组合 | profile 支持并经 active 工作集规则筛选的 shape；owner-cache band 当前仅 shadow | 候选剪枝 |
 | Assignment | 任意 expert-to-resource 调度 | 按 isolated cost 的 LPT | 启发式分配 |
 | Ordering | 任意可行开始时间和顺序 | 每个 lane 的 LPT 顺序 | 顺序剪枝 |
-| Idling | 允许主动等待以避开争用 | lane 可启动下一个 expert 时立即启动 | non-idling 剪枝 |
+| Idling | 允许主动等待以避开争用 | lane 可启动下一个 expert 时立即启动；ready-token 路径仅填充无可运行 expert 的空闲 lane | non-idling 剪枝 |
+| Route combine | 任意满足 TopK release 约束和 CPU 容量的 merge 排程 | planner 不搜索 combine；默认 executor 采用 expert-first 单 token 贪心和连续收尾 | 外层启发式限制 |
 | Kernel variant | 任意未被支配的实现 | 当前 split/no-split profile pair；packed-B byte-window 仅显式实验，不进入 planner | 实例候选限制 |
 | Isolated time | 真实 $I_i(t)$ | active $T_{\mathrm{iso}}$ 经验公式；分层 GEMM model 仅 shadow | cost 近似，不剪枝可行域 |
 | Contention | 任意动态活跃配置上的真实 $D_i(\mathcal Z)$ | 实测 contention profile 与 stage-aware event simulator | cost 近似，不剪枝可行域 |
@@ -601,6 +654,11 @@ $$
 
 因此 cost model 只近似目标函数中的真实性能响应，不改变由 route tasks 和 CPU
 容量定义的原始可行域。
+
+2.5 节的 ready-token merge 尚未进入 active cost model。当前 profile 的
+$\widehat I_i,\widehat D_i$ 仍只描述 expert compute，combine 继续作为独立实测
+外部项；在增加 merge service time、expert/merge 异构 contention 和真实分布
+留出验证前，planner 不得把实验重叠时间当作确定收益。
 
 ### 8.1 当前 active isolated model
 
@@ -982,6 +1040,21 @@ footprint 外推该 variant；需要把 window 加入 profile identity，并补�
 进入 candidate set。原始数据见
 `optimizations/fused_moe_sve/results/amazon_192c_weight_windows.md`。
 
+### 9.3 Ready-token combine 首轮验证
+
+2026-07-16 在 Neoverse-V3 NUMA0 CPU `0-95` 上验证默认 async 候选路径，固定
+`tokens=2048`、`top_k=6`、`H=4096`、`F=512`、12 experts、每专家 8T，并在每轮
+内随机化 control/candidate 顺序。均衡 route 下负载门槛关闭实验路径，三轮
+31-sample median 差异为 -0.14%、+0.10%、-0.29%。25%/75% 两组不相交 TopK
+分布下，trace 显示 605/2048 个 token 在 expert 阶段结束前完成 merge；三轮
+median 差异为 +0.23%、+0.33%、+0.29%，仍低于约 1% 噪声下界。
+
+首个 per-route 原子减计数原型在均衡分布上从 7.754 ms 退化到 10.116 ms，已被
+拒绝。当前实现改为每 expert 一次 completion publication、只读 TopK 状态检查、
+每 token 一次 CAS 和按 expert 批量入队。该结果只证明第一版在两个受控分布上
+没有可分辨的 median 回退；尚不能证明对 captured routing 有净收益，也不能作为
+planner 中 merge-overlap 的 cost 校准。
+
 ## 10. 同步规则
 
 发生以下任一变化时，必须同步更新本文档：
@@ -1024,3 +1097,5 @@ footprint 外推该 variant；需要把 window 加入 profile identity，并补�
 | 2026-07-15 | v0.14 | 将原始问题改为 256-expert route-task 实例对应的问题族：CPU 核心数是基础硬约束，真实 isolated time $I_i(t)$ 与动态 contention slowdown $D_i(\mathcal Z)$ 定义执行速率；LLC/带宽从硬 cumulative constraint 降为 slowdown/candidate-pruning 因素，并同步复杂度、solver 边界、剪枝表和验证要求。 |
 | 2026-07-15 | v0.15 | 增加最优解存在性命题：由串行调度得到有限 horizon，将固定线程宽度与事件顺序的子问题表示为紧线性可行域，再由 Heine--Borel 和 Weierstrass 极值定理证明全局最小 makespan 必然取得；同时明确 $I,D$ 必须在所有候选配置上有限且为正。 |
 | 2026-07-16 | v0.16 | 增加显式 packed-B byte-window kernel variant：按 SVE N tile 推导 W13/W2 range 数、实际最大窗口和有效线程上界；明确 range 间无 barrier、owner-scatter ownership、M12 短 route 边界，以及该 variant 在重新校准前不进入 production planner。 |
+| 2026-07-16 | v0.17 | 增加可选 ready-token combine 外层：定义 TopK release time、单线程 merge CPU 约束和含 combine 的 makespan；记录 expert-first async heuristic、25% team-load 生效门槛、planner/cost-model 边界及 192-core NUMA0 首轮验证。 |
+| 2026-07-16 | v0.18 | 将通过验证的 async ready-token executor 设为 SVE FP32 direct-route 默认；保留 1.25 team-load 门槛和环境变量值 0 的 post-expert fallback，不改变 planner 决策空间或现有 cost tables。 |

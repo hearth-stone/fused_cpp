@@ -1,8 +1,8 @@
 # SVE fused MoE experiments
 
 This directory contains SVE fused-MoE features and standalone experiments. The
-weighted route-merge U1 kernel is enabled by default for the SVE backend; other
-experimental variants do not change the fused-MoE API or default dispatch.
+weighted route-merge U1 kernel and async ready-token merge are enabled by
+default for their supported SVE paths; neither changes the fused-MoE API.
 
 ## SVE weighted route merge
 
@@ -89,6 +89,47 @@ numactl --cpunodebind=0 --membind=0 taskset -c 0-95 \
 
 The implementation, traffic accounting, and measurements are recorded in
 [`results/amazon_192c_w2_direct_route.md`](results/amazon_192c_w2_direct_route.md).
+
+## Async ready-token route merge
+
+The async bridge enables an executor that overlaps route merge with an
+imbalanced expert tail by default. Retain the post-expert merge explicitly
+with:
+
+```bash
+FUSED_CPP_MOE_ASYNC_READY_TOKEN_MERGE=0 <async fused MoE command>
+```
+
+It is restricted to the SVE FP32 direct-route path. After every expert team's
+final W2 barrier, the leader release-publishes task completion, checks the TopK
+expert state for its route tokens, claims each newly ready token once, and
+publishes claimed tokens to the worker queue in one batch. The async worker
+loop always selects eligible expert work first; only an otherwise idle lane
+claims one ready token. When expert compute ends, the existing static,
+contiguous merge skips completed tokens and handles every remaining range.
+
+The executor estimates each team's work as `ceil(M / 12) / threads`. If the
+maximum is less than 1.25 times the minimum, it retains the post-expert
+contiguous merge because a balanced schedule has no useful idle interval. The
+default does not change planner decisions or cost tables. Explicit value `1`
+is equivalent to leaving the variable unset.
+
+Run balanced and controlled heavy-tail A/B tests with:
+
+```bash
+for distribution in balanced two-group; do
+  numactl --cpunodebind=0 --membind=0 taskset -c 0-95 \
+    .venv/bin/python \
+    optimizations/fused_moe_sve/benchmarks/bench_async_ready_token_merge.py \
+    --tokens 2048 --hidden 4096 --intermediate 512 \
+    --experts 12 --top-k 6 --threads 96 --distribution "$distribution" \
+    --warmup 5 --runs 31
+done
+```
+
+The design, rejected per-route atomic prototype, and initial NUMA0 measurements
+are recorded in
+[`results/amazon_192c_async_ready_token_merge.md`](results/amazon_192c_async_ready_token_merge.md).
 
 ## Explicit unfused pipeline reference
 
