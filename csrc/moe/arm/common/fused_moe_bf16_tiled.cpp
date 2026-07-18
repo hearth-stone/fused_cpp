@@ -13,6 +13,7 @@
 #include <cstring>
 #ifdef __linux__
 #include <sys/mman.h>
+#include <unistd.h>
 #endif
 #ifdef __aarch64__
 #include <arm_neon.h>
@@ -2628,6 +2629,39 @@ void team_fused_w13_silu_packed_packc_sve(const TeamContext& team, const uint16_
 #endif
 }
 
+// Explicit contiguous-N task used by the vLLM-style staged baseline. Unlike
+// the cooperative team wrapper above, one caller owns the complete range and
+// does not iterate the split-W13 windows. This keeps the native GEMM body
+// identical while making the task boundary match vLLM's (expert, N-range)
+// work queue.
+void vllm_staged_w13_range_sve(const uint16_t* packed_A, const uint16_t* w13_packed, uint16_t* intermediate,
+                               int rows, int K, int ldc, int64_t degree, int64_t n_tile, int64_t n_begin,
+                               int64_t n_cols) {
+#if defined(FUSED_CPP_MOE_HAS_ARM_SVE)
+  TORCH_CHECK(n_begin >= 0 && n_cols > 0 && n_begin % n_tile == 0 && n_cols % n_tile == 0,
+              "vLLM-staged W13 range must be positive and N-tile aligned: begin=", n_begin, " size=", n_cols,
+              " tile=", n_tile);
+  const FusedSiluKernelSet kernels = sve_asm_fused_silu_packc_set_for_degree(degree);
+  TORCH_CHECK(kernels.m8 != nullptr, "unsupported fused silu exp degree ", degree);
+  const int64_t start_block = n_begin / n_tile;
+  sve_asm_packc_w13_hybrid_dispatch(
+      packed_A, w13_packed + start_block * static_cast<int64_t>(K) * n_tile, intermediate, rows, K,
+      static_cast<int>(n_cols), ldc, static_cast<int>(n_begin), kernels);
+#else
+  (void)packed_A;
+  (void)w13_packed;
+  (void)intermediate;
+  (void)rows;
+  (void)K;
+  (void)ldc;
+  (void)degree;
+  (void)n_tile;
+  (void)n_begin;
+  (void)n_cols;
+  TORCH_CHECK(false, "SVE MoE asm packC kernel is unavailable in this build");
+#endif
+}
+
 void team_fused_w13_silu_packed_packc_sve_2d(const TeamContext& team, const Gemm2DSplitPlan& plan,
                                              const uint16_t* packed_A, const uint16_t* w13_packed,
                                              uint16_t* intermediate, int rows, int K, int N13, int ldc, int64_t degree,
@@ -2887,6 +2921,58 @@ void team_w2_packed_sve_direct_bf16_route(const TeamContext& team, const uint16_
   (void)route_stride;
   (void)n_tile;
   (void)weight_window_bytes;
+  TORCH_CHECK(false, "SVE MoE asm direct-BF16-route w2 kernel is unavailable in this build");
+#endif
+}
+
+void vllm_staged_w2_direct_route_range_sve(const uint16_t* packed_A, const uint16_t* w2_packed, float* route_out,
+                                           const int64_t* route_ids, int rows, int K, int route_stride,
+                                           int64_t n_tile, int64_t n_begin, int64_t n_cols) {
+#if defined(FUSED_CPP_MOE_HAS_ARM_SVE)
+  TORCH_CHECK(n_begin >= 0 && n_cols > 0 && n_begin % n_tile == 0 && n_cols % n_tile == 0,
+              "vLLM-staged W2 range must be positive and N-tile aligned: begin=", n_begin, " size=", n_cols,
+              " tile=", n_tile);
+  const int64_t start_block = n_begin / n_tile;
+  sve_asm_packed_w2_direct_route_hybrid_dispatch(
+      packed_A, w2_packed + start_block * static_cast<int64_t>(K) * n_tile, route_out + n_begin, route_ids, rows, K,
+      static_cast<int>(n_cols), route_stride);
+#else
+  (void)packed_A;
+  (void)w2_packed;
+  (void)route_out;
+  (void)route_ids;
+  (void)rows;
+  (void)K;
+  (void)route_stride;
+  (void)n_tile;
+  (void)n_begin;
+  (void)n_cols;
+  TORCH_CHECK(false, "SVE MoE asm direct-route w2 kernel is unavailable in this build");
+#endif
+}
+
+void vllm_staged_w2_direct_bf16_route_range_sve(const uint16_t* packed_A, const uint16_t* w2_packed,
+                                                uint16_t* route_out, const int64_t* route_ids, int rows, int K,
+                                                int route_stride, int64_t n_tile, int64_t n_begin, int64_t n_cols) {
+#if defined(FUSED_CPP_MOE_HAS_ARM_SVE)
+  TORCH_CHECK(n_begin >= 0 && n_cols > 0 && n_begin % n_tile == 0 && n_cols % n_tile == 0,
+              "vLLM-staged W2 BF16 range must be positive and N-tile aligned: begin=", n_begin, " size=", n_cols,
+              " tile=", n_tile);
+  const int64_t start_block = n_begin / n_tile;
+  sve_asm_packed_w2_direct_bf16_route_hybrid_dispatch(
+      packed_A, w2_packed + start_block * static_cast<int64_t>(K) * n_tile, route_out + n_begin, route_ids, rows, K,
+      static_cast<int>(n_cols), route_stride);
+#else
+  (void)packed_A;
+  (void)w2_packed;
+  (void)route_out;
+  (void)route_ids;
+  (void)rows;
+  (void)K;
+  (void)route_stride;
+  (void)n_tile;
+  (void)n_begin;
+  (void)n_cols;
   TORCH_CHECK(false, "SVE MoE asm direct-BF16-route w2 kernel is unavailable in this build");
 #endif
 }
@@ -4143,6 +4229,82 @@ void prepare_moe_threads_for_operator(int64_t num_threads) {
   }
   const ThreadPinningConfig pinning = moe_thread_pinning_config(num_threads);
   moe_resident_thread_pool().prepare(num_threads, pinning);
+}
+
+struct VllmStagedNTask {
+  int64_t expert = 0;
+  int64_t n_begin = 0;
+  int64_t n_cols = 0;
+};
+
+struct VllmStagedThreadScratch {
+  std::vector<uint16_t> packed_a;
+};
+
+int64_t vllm_staged_available_l2_bytes() {
+  static const int64_t available_bytes = []() {
+    int64_t l2_bytes = 0;
+#if defined(__linux__)
+    const long detected = sysconf(_SC_LEVEL2_CACHE_SIZE);
+    if (detected > 0) {
+      l2_bytes = static_cast<int64_t>(detected);
+    }
+#endif
+    // Match vLLM's get_available_l2_size policy: reserve half of private L2
+    // for A, output, code, and unrelated live data. The fallback describes
+    // the 2 MiB private-L2 target used by the SVE experiment machines.
+    if (l2_bytes <= 0) {
+      l2_bytes = 2LL * 1024 * 1024;
+    }
+    return std::max<int64_t>(l2_bytes / 2, 64LL * 1024);
+  }();
+  return available_bytes;
+}
+
+int64_t vllm_staged_task_n(MoeGemmStage stage, int64_t K, int64_t N, int64_t n_tile, int64_t num_threads,
+                           int64_t top_k) {
+  TORCH_CHECK(K > 0 && N > 0 && n_tile > 0 && N % n_tile == 0,
+              "vLLM-staged task dimensions must be positive and N-tile aligned");
+  const int64_t m_tile = 12;
+  const int64_t available_l2 = vllm_staged_available_l2_bytes();
+  const int64_t lanes_per_expert = std::max<int64_t>(1, num_threads / top_k);
+  const int64_t thread_limit = std::max<int64_t>(n_tile, N / lanes_per_expert);
+
+  int64_t minimum_task_n = n_tile;
+  int64_t input_bytes = m_tile * K * static_cast<int64_t>(sizeof(uint16_t));
+  int64_t bytes_per_column = K * static_cast<int64_t>(sizeof(uint16_t));
+  if (stage == MoeGemmStage::kW13) {
+    minimum_task_n = 2 * n_tile;
+    bytes_per_column += m_tile * static_cast<int64_t>(sizeof(float));
+  }
+  input_bytes = ceil_to_multiple(input_bytes, int64_t{64});
+  const int64_t cache_budget = std::max<int64_t>(0, available_l2 - input_bytes);
+  const int64_t cache_limit = cache_budget / bytes_per_column;
+  const int64_t candidate = std::min(cache_limit, thread_limit);
+  const int64_t aligned = candidate / minimum_task_n * minimum_task_n;
+  return std::min<int64_t>(N, std::max<int64_t>(minimum_task_n, aligned));
+}
+
+std::vector<VllmStagedNTask> build_vllm_staged_tasks(int64_t num_experts, int64_t N, int64_t task_n,
+                                                     int64_t n_tile) {
+  TORCH_CHECK(num_experts > 0 && N > 0 && task_n > 0 && n_tile > 0, "invalid vLLM-staged task geometry");
+  TORCH_CHECK(N % n_tile == 0 && task_n % n_tile == 0,
+              "vLLM-staged N and task width must be N-tile aligned: N=", N, " task_n=", task_n,
+              " tile=", n_tile);
+  const int64_t tasks_per_expert = ceil_div_int64(N, task_n);
+  TORCH_CHECK(num_experts <= std::numeric_limits<int64_t>::max() / tasks_per_expert,
+              "vLLM-staged task count exceeds int64");
+  const int64_t total_tasks = num_experts * tasks_per_expert;
+  std::vector<VllmStagedNTask> tasks;
+  TORCH_CHECK(static_cast<uint64_t>(total_tasks) <= std::numeric_limits<size_t>::max(),
+              "vLLM-staged task count exceeds size_t");
+  tasks.reserve(static_cast<size_t>(total_tasks));
+  for (int64_t expert = 0; expert < num_experts; ++expert) {
+    for (int64_t n_begin = 0; n_begin < N; n_begin += task_n) {
+      tasks.push_back(VllmStagedNTask{expert, n_begin, std::min<int64_t>(task_n, N - n_begin)});
+    }
+  }
+  return tasks;
 }
 
 struct ThreadScratch {
@@ -7135,6 +7297,243 @@ at::Tensor fused_moe_bf16_tiled_async(at::Tensor input, at::Tensor w13_packed, i
     const double e2e_ms = ::fused_cpp::profile::elapsed_ms(moe_trace_begin);
     moe_trace.write_report("external_plan_async", num_threads, num_tokens, top_k, num_experts, num_routes, H, F,
                            static_cast<size_t>(active_experts), num_tasks, num_tasks, 0, e2e_ms);
+  }
+  return finalize_moe_output(output, out);
+#endif
+}
+
+at::Tensor fused_moe_bf16_tiled_vllm_staged(
+    at::Tensor input, at::Tensor w13_packed, int64_t w13_K, int64_t w13_N, at::Tensor w2_packed, int64_t w2_K,
+    int64_t w2_N, at::Tensor topk_weights, at::Tensor topk_ids, c10::optional<at::Tensor> thread_cpu_ids,
+    int64_t num_threads, int64_t global_num_experts, bool fuse_silu, int64_t silu_poly_degree, int64_t gemm_backend,
+    int64_t backend_n_tile, c10::optional<at::Tensor> out) {
+#ifndef __aarch64__
+  TORCH_CHECK(false, "fused_moe_bf16_tiled_vllm_staged requires AArch64");
+#else
+  const auto call_begin = ::fused_cpp::profile::now();
+  check_bf16_cpu(input, "input");
+  TORCH_CHECK(input.dim() == 2, "input must be 2-D [tokens, hidden]");
+  TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
+  TORCH_CHECK(topk_ids.device().is_cpu(), "topk_ids must be CPU");
+  TORCH_CHECK(topk_weights.device().is_cpu(), "topk_weights must be CPU");
+  TORCH_CHECK(is_integer_dtype(topk_ids.scalar_type()), "topk_ids must use an integer dtype");
+  TORCH_CHECK(is_floating_dtype(topk_weights.scalar_type()), "topk_weights must use a floating dtype");
+  TORCH_CHECK(topk_ids.dim() == 2 && topk_weights.dim() == 2,
+              "topk_ids and topk_weights must be 2-D [tokens, top_k]");
+  TORCH_CHECK(topk_ids.sizes() == topk_weights.sizes(), "topk_ids and topk_weights shapes must match");
+  TORCH_CHECK(topk_ids.size(0) == input.size(0), "topk first dimension must match input token count");
+  TORCH_CHECK(topk_ids.size(1) > 0, "top_k must be non-zero");
+  TORCH_CHECK(num_threads > 0 && num_threads <= std::numeric_limits<int>::max(),
+              "num_threads must be in [1, INT_MAX], got ", num_threads);
+
+  const ::fused_cpp::moe::MoeBackend& backend = ::fused_cpp::moe::backend_from_id(gemm_backend);
+  TORCH_CHECK(backend.id == ::fused_cpp::moe::BackendId::kArmSveBf16,
+              "vLLM-staged baseline requires the SVE BF16 backend, got ", backend.name);
+  TORCH_CHECK(backend_n_tile == backend.n_tile(), "MoE backend_n_tile mismatch for ", backend.name,
+              ": weights use ", backend_n_tile, ", runtime uses ", backend.n_tile());
+  TORCH_CHECK(fuse_silu, "vLLM-staged baseline requires weights prepared with fuse_silu=True");
+  TORCH_CHECK(silu_poly_degree == 4 || silu_poly_degree == 5 || silu_poly_degree == 6,
+              "silu_poly_degree must be 4, 5, or 6, got ", silu_poly_degree);
+
+  PackedExperts w13 = checked_packed_experts(w13_packed, w13_K, w13_N, "w13_packed", backend_n_tile);
+  PackedExperts w2 = checked_packed_experts(w2_packed, w2_K, w2_N, "w2_packed", backend_n_tile);
+  TORCH_CHECK(w13.E == w2.E, "w13 and w2 expert count mismatch");
+  TORCH_CHECK(w13.K == input.size(1), "input hidden size mismatch: input H=", input.size(1), ", w13 K=", w13.K);
+  TORCH_CHECK(w13.N % 2 == 0, "w13 N must be even, got ", w13.N);
+  const int64_t F = w13.N / 2;
+  const int64_t H = input.size(1);
+  TORCH_CHECK(F % kKernelTile == 0, "vLLM-staged fused SiLU requires F to be a multiple of ", kKernelTile,
+              ", got ", F);
+  TORCH_CHECK(w13.N_pad == 2 * F, "vLLM-staged baseline requires interleaved W13 with N_pad=2F, got ",
+              w13.N_pad, " vs ", 2 * F);
+  TORCH_CHECK(w2.K == F && w2.N == H, "w2 shape mismatch: expected K=", F, " N=", H, ", got K=", w2.K,
+              " N=", w2.N);
+  TORCH_CHECK(w2.K_pad == F, "vLLM-staged baseline requires unpadded W2 K, got K_pad=", w2.K_pad, " F=", F);
+  TORCH_CHECK(w2.N_pad == H, "vLLM-staged direct-route store requires H to be N-tile aligned: H=", H,
+              " N_pad=", w2.N_pad);
+
+  const int64_t num_tokens = input.size(0);
+  const int64_t top_k = topk_ids.size(1);
+  if (num_tokens == 0) {
+    return finalize_moe_output(prepare_moe_output(input, w13_packed, w2_packed, topk_weights, topk_ids, out), out);
+  }
+  const int64_t num_experts = global_num_experts < 0 ? w13.E : global_num_experts;
+  TORCH_CHECK(num_experts > 0 && num_experts <= w13.E,
+              "global_num_experts must be positive and no larger than packed experts: got ", num_experts,
+              " packed=", w13.E);
+
+  ThreadPinningConfig staged_thread_pinning;
+  bool has_thread_pinning = false;
+  if (thread_cpu_ids.has_value() && thread_cpu_ids->defined() && thread_cpu_ids->numel() > 0) {
+    staged_thread_pinning.cpus = tensor_to_i64_vector(*thread_cpu_ids, "thread_cpu_ids");
+    TORCH_CHECK(static_cast<int64_t>(staged_thread_pinning.cpus.size()) == num_threads,
+                "thread_cpu_ids must have exactly num_threads entries: got ", staged_thread_pinning.cpus.size(),
+                " vs ", num_threads);
+    for (size_t idx = 0; idx < staged_thread_pinning.cpus.size(); ++idx) {
+      TORCH_CHECK(staged_thread_pinning.cpus[idx] >= 0, "thread_cpu_ids[", idx, "] must be non-negative, got ",
+                  staged_thread_pinning.cpus[idx]);
+    }
+    staged_thread_pinning.enabled = true;
+    has_thread_pinning = true;
+  }
+  ThreadPinningScope staged_thread_pinning_scope(has_thread_pinning ? &staged_thread_pinning : nullptr);
+  prepare_moe_threads_for_operator(num_threads);
+
+  const auto route_build_begin = ::fused_cpp::profile::now();
+  at::Tensor ids_i64 = topk_ids.to(at::kLong).contiguous();
+  at::Tensor weights_f32 = topk_weights.to(at::kFloat).contiguous();
+  const int64_t* ids = ids_i64.data_ptr<int64_t>();
+  const int64_t num_routes = num_tokens * top_k;
+  std::vector<int64_t> route_counts(static_cast<size_t>(num_experts), 0);
+  for (int64_t flat = 0; flat < num_routes; ++flat) {
+    const int64_t expert = ids[flat];
+    TORCH_CHECK(expert >= 0 && expert < num_experts, "topk_ids out of range: id=", expert, ", valid range [0, ",
+                num_experts, ")");
+    ++route_counts[static_cast<size_t>(expert)];
+  }
+  std::vector<int64_t> route_offsets(static_cast<size_t>(num_experts + 1), 0);
+  for (int64_t expert = 0; expert < num_experts; ++expert) {
+    route_offsets[static_cast<size_t>(expert + 1)] =
+        route_offsets[static_cast<size_t>(expert)] + route_counts[static_cast<size_t>(expert)];
+  }
+  std::vector<int64_t> route_cursors = route_offsets;
+  route_cursors.pop_back();
+  std::vector<int64_t> expert_routes(static_cast<size_t>(num_routes));
+  for (int64_t flat = 0; flat < num_routes; ++flat) {
+    const int64_t expert = ids[flat];
+    const int64_t dst = route_cursors[static_cast<size_t>(expert)]++;
+    expert_routes[static_cast<size_t>(dst)] = flat;
+  }
+
+  std::vector<int64_t> intermediate_offsets(static_cast<size_t>(num_experts + 1), 0);
+  for (int64_t expert = 0; expert < num_experts; ++expert) {
+    const int64_t packed_rows = sve_hybrid_packed_rows(route_counts[static_cast<size_t>(expert)]);
+    TORCH_CHECK(packed_rows <= std::numeric_limits<int64_t>::max() / w2.K_pad,
+                "vLLM-staged intermediate size overflows int64");
+    const int64_t expert_elements = packed_rows * w2.K_pad;
+    TORCH_CHECK(intermediate_offsets[static_cast<size_t>(expert)] <=
+                    std::numeric_limits<int64_t>::max() - expert_elements,
+                "vLLM-staged cumulative intermediate size overflows int64");
+    intermediate_offsets[static_cast<size_t>(expert + 1)] =
+        intermediate_offsets[static_cast<size_t>(expert)] + expert_elements;
+  }
+  const double route_build_ms = ::fused_cpp::profile::elapsed_ms(route_build_begin);
+
+  at::Tensor output = prepare_moe_output(input, w13_packed, w2_packed, topk_weights, topk_ids, out);
+  const bool use_bf16_route = sve_w2_bf16_route_enabled();
+  const int64_t route_element_bytes =
+      use_bf16_route ? static_cast<int64_t>(sizeof(uint16_t)) : static_cast<int64_t>(sizeof(float));
+  TORCH_CHECK(sve_w2_direct_route_offsets_fit(num_routes, H, w2.n_tile, route_element_bytes),
+              "vLLM-staged direct-route offsets exceed the SVE kernel's int32 byte range");
+  at::Tensor route_out =
+      at::empty({num_routes, H}, input.options().dtype(use_bf16_route ? at::kBFloat16 : at::kFloat));
+  at::Tensor intermediate = at::empty({intermediate_offsets.back()}, input.options());
+
+  uint16_t* output_ptr = bf16_data(output);
+  uint16_t* intermediate_ptr = bf16_data(intermediate);
+  uint16_t* route_out_bf16_ptr = use_bf16_route ? bf16_data(route_out) : nullptr;
+  float* route_out_f32_ptr = use_bf16_route ? nullptr : route_out.data_ptr<float>();
+  const uint16_t* input_ptr = bf16_data_const(input);
+  const uint16_t* w13_ptr = bf16_data_const(w13.tensor);
+  const uint16_t* w2_ptr = bf16_data_const(w2.tensor);
+
+  const int64_t w13_task_n =
+      vllm_staged_task_n(MoeGemmStage::kW13, w13.K_pad, w13.N_pad, w13.n_tile, num_threads, top_k);
+  const int64_t w2_task_n =
+      vllm_staged_task_n(MoeGemmStage::kW2, w2.K_pad, w2.N_pad, w2.n_tile, num_threads, top_k);
+  const std::vector<VllmStagedNTask> w13_tasks =
+      build_vllm_staged_tasks(num_experts, w13.N_pad, w13_task_n, w13.n_tile);
+  const std::vector<VllmStagedNTask> w2_tasks =
+      build_vllm_staged_tasks(num_experts, w2.N_pad, w2_task_n, w2.n_tile);
+  std::vector<VllmStagedThreadScratch> scratches(static_cast<size_t>(num_threads));
+  for (VllmStagedThreadScratch& scratch : scratches) {
+    scratch.packed_a.resize(static_cast<size_t>(12 * w13.K_pad));
+  }
+
+  alignas(64) std::atomic<int64_t> next_w13_task{0};
+  const auto w13_begin = ::fused_cpp::profile::now();
+  run_fixed_threads(num_threads, [&](int64_t tid) {
+    VllmStagedThreadScratch& scratch = scratches[static_cast<size_t>(tid)];
+    while (true) {
+      const int64_t task_id = next_w13_task.fetch_add(1, std::memory_order_relaxed);
+      if (task_id >= static_cast<int64_t>(w13_tasks.size())) {
+        break;
+      }
+      const VllmStagedNTask& task = w13_tasks[static_cast<size_t>(task_id)];
+      const int64_t rows = route_counts[static_cast<size_t>(task.expert)];
+      if (rows == 0) {
+        continue;
+      }
+      const int64_t* routes = expert_routes.data() + route_offsets[static_cast<size_t>(task.expert)];
+      uint16_t* expert_intermediate =
+          intermediate_ptr + intermediate_offsets[static_cast<size_t>(task.expert)];
+      const uint16_t* expert_w13 = w13_ptr + task.expert * w13.packed_stride;
+      for (int64_t row_begin = 0; row_begin < rows; row_begin += 12) {
+        const int64_t panel_rows = std::min<int64_t>(12, rows - row_begin);
+        gather_pack_a_reorder_sve_hybrid(input_ptr, H, routes + row_begin, top_k, scratch.packed_a.data(),
+                                         static_cast<int>(panel_rows), static_cast<int>(w13.K_pad), int64_t{1},
+                                         int64_t{0});
+        vllm_staged_w13_range_sve(
+            scratch.packed_a.data(), expert_w13, expert_intermediate + row_begin * w2.K_pad,
+            static_cast<int>(panel_rows), static_cast<int>(w13.K_pad), static_cast<int>(w2.K_pad),
+            silu_poly_degree, w13.n_tile, task.n_begin, task.n_cols);
+      }
+    }
+  });
+  const double w13_ms = ::fused_cpp::profile::elapsed_ms(w13_begin);
+
+  alignas(64) std::atomic<int64_t> next_w2_task{0};
+  const auto w2_begin = ::fused_cpp::profile::now();
+  run_fixed_threads(num_threads, [&](int64_t) {
+    while (true) {
+      const int64_t task_id = next_w2_task.fetch_add(1, std::memory_order_relaxed);
+      if (task_id >= static_cast<int64_t>(w2_tasks.size())) {
+        break;
+      }
+      const VllmStagedNTask& task = w2_tasks[static_cast<size_t>(task_id)];
+      const int64_t rows = route_counts[static_cast<size_t>(task.expert)];
+      if (rows == 0) {
+        continue;
+      }
+      const int64_t* routes = expert_routes.data() + route_offsets[static_cast<size_t>(task.expert)];
+      const uint16_t* expert_intermediate =
+          intermediate_ptr + intermediate_offsets[static_cast<size_t>(task.expert)];
+      const uint16_t* expert_w2 = w2_ptr + task.expert * w2.packed_stride;
+      if (use_bf16_route) {
+        vllm_staged_w2_direct_bf16_route_range_sve(
+            expert_intermediate, expert_w2, route_out_bf16_ptr, routes, static_cast<int>(rows),
+            static_cast<int>(w2.K_pad), static_cast<int>(H), w2.n_tile, task.n_begin, task.n_cols);
+      } else {
+        vllm_staged_w2_direct_route_range_sve(
+            expert_intermediate, expert_w2, route_out_f32_ptr, routes, static_cast<int>(rows),
+            static_cast<int>(w2.K_pad), static_cast<int>(H), w2.n_tile, task.n_begin, task.n_cols);
+      }
+    }
+  });
+  const double w2_ms = ::fused_cpp::profile::elapsed_ms(w2_begin);
+
+  const float* topk_w = weights_f32.data_ptr<float>();
+  const int route_merge_unroll = resolve_route_merge_unroll(true);
+  const auto merge_begin = ::fused_cpp::profile::now();
+  run_fixed_threads(num_threads, [&](int64_t tid) {
+    const int64_t rows_per_thread = ceil_div_int64(num_tokens, num_threads);
+    const int64_t token_begin = tid * rows_per_thread;
+    const int64_t token_end = std::min<int64_t>(num_tokens, token_begin + rows_per_thread);
+    merge_route_range(route_out_f32_ptr, route_out_bf16_ptr, topk_w, output_ptr, token_begin, token_end, top_k, H,
+                      use_bf16_route, route_merge_unroll);
+  });
+  const double merge_ms = ::fused_cpp::profile::elapsed_ms(merge_begin);
+
+  if (env_flag_enabled("FUSED_CPP_MOE_STAGE_TIMING")) {
+    std::fprintf(stderr,
+                 "[fused_moe_bf16_tiled_vllm_staged][stage_timing] threads=%lld experts=%lld routes=%lld "
+                 "available_l2_bytes=%lld w13_task_n=%lld w13_tasks=%zu w2_task_n=%lld w2_tasks=%zu "
+                 "route_build_ms=%.3f w13_ms=%.3f w2_ms=%.3f merge_ms=%.3f e2e_ms=%.3f\n",
+                 static_cast<long long>(num_threads), static_cast<long long>(num_experts),
+                 static_cast<long long>(num_routes), static_cast<long long>(vllm_staged_available_l2_bytes()),
+                 static_cast<long long>(w13_task_n), w13_tasks.size(), static_cast<long long>(w2_task_n),
+                 w2_tasks.size(), route_build_ms, w13_ms, w2_ms, merge_ms,
+                 ::fused_cpp::profile::elapsed_ms(call_begin));
   }
   return finalize_moe_output(output, out);
 #endif

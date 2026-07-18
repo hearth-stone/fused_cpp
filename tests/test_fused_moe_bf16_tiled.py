@@ -14,6 +14,7 @@ from fused_cpp.moe import fused_moe_naive
 from fused_cpp.moe import fused_moe_bf16_tiled
 from fused_cpp.moe import fused_moe_bf16_tiled_async
 from fused_cpp.moe import fused_moe_bf16_tiled_scheduled
+from fused_cpp.moe import fused_moe_bf16_tiled_vllm_staged
 from fused_cpp.moe import prepare_fused_moe_bf16_tiled_weights
 
 pytestmark = pytest.mark.skipif(
@@ -95,6 +96,63 @@ def _case_top1(seed: int = 0) -> tuple[torch.Tensor, ...]:
         topk_weights,
         topk_ids,
     )
+
+
+@pytest.mark.parametrize("use_bf16_route", [False, True])
+def test_vllm_staged_matches_fused_sve_with_multiple_n_tasks(
+    monkeypatch: pytest.MonkeyPatch,
+    use_bf16_route: bool,
+) -> None:
+    """The global W13/W2 task pools must preserve the production SVE result."""
+    affinity = sorted(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else list(range(12))
+    if len(affinity) < 12:
+        pytest.skip("requires 12 available CPUs to exercise multiple N tasks per expert")
+
+    monkeypatch.setenv("FUSED_CPP_MOE_SVE", "1")
+    monkeypatch.setenv("FUSED_CPP_MOE_W13_SPLIT_N", "1")
+    monkeypatch.setenv("FUSED_CPP_MOE_SVE_W2_DIRECT_ROUTE", "1")
+    monkeypatch.setenv("FUSED_CPP_MOE_W2_BF16_ROUTE", "1" if use_bf16_route else "0")
+    monkeypatch.setenv("FUSED_CPP_MOE_SVE_ROUTE_MERGE_UNROLL", "1")
+    generator = torch.Generator().manual_seed(20260717)
+    num_tokens, hidden_size, intermediate_size = 29, 128, 64
+    num_experts, top_k, num_threads = 8, 6, 12
+    hidden = _bf16_normal((num_tokens, hidden_size), generator=generator, std=0.01)
+    w13 = _bf16_normal(
+        (num_experts, 2 * intermediate_size, hidden_size),
+        generator=generator,
+        std=0.01,
+    )
+    w2 = _bf16_normal(
+        (num_experts, hidden_size, intermediate_size),
+        generator=generator,
+        std=0.01,
+    )
+    topk_ids = torch.tensor(
+        [[(token + slot) % num_experts for slot in range(top_k)] for token in range(num_tokens)],
+        dtype=torch.int32,
+    )
+    topk_weights = torch.softmax(torch.randn((num_tokens, top_k), generator=generator), dim=-1)
+    packed = prepare_fused_moe_bf16_tiled_weights(w13, w2, fuse_silu=True)
+    if packed.gemm_backend != 1:
+        pytest.skip("requires an SVE BF16 build/runtime")
+
+    reference = fused_moe_bf16_tiled(
+        hidden,
+        packed,
+        topk_weights,
+        topk_ids,
+        num_threads=num_threads,
+    )
+    candidate = fused_moe_bf16_tiled_vllm_staged(
+        hidden,
+        packed,
+        topk_weights,
+        topk_ids,
+        thread_cpu_ids=torch.tensor(affinity[:num_threads], dtype=torch.int32),
+        num_threads=num_threads,
+    )
+
+    torch.testing.assert_close(candidate.float(), reference.float(), atol=0, rtol=0)
 
 
 def test_sve_m12_silu_and_w2_bf16_route_match_legacy_for_unit_top1(

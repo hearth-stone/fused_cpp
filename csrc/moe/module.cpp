@@ -79,4 +79,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("skip_weighted") = false, py::arg("fuse_silu") = false, py::arg("silu_poly_degree") = 5,
         py::arg("gemm_backend") = 0, py::arg("backend_n_tile") = 8, py::arg("w13_split") = -1,
         py::arg("weight_window_bytes") = -1, py::arg("out") = c10::nullopt, py::call_guard<py::gil_scoped_release>());
+
+  m.def("fused_moe_bf16_tiled_vllm_staged", &fused_moe_bf16_tiled_vllm_staged,
+        "Run the experimental vLLM-style global W13/W2 staged SVE baseline.", py::arg("input"),
+        py::arg("w13_packed"), py::arg("w13_K"), py::arg("w13_N"), py::arg("w2_packed"), py::arg("w2_K"),
+        py::arg("w2_N"), py::arg("topk_weights"), py::arg("topk_ids"), py::arg("thread_cpu_ids") = c10::nullopt,
+        py::arg("num_threads") = 1, py::arg("global_num_experts") = -1, py::arg("fuse_silu") = true,
+        py::arg("silu_poly_degree") = 5, py::arg("gemm_backend") = 1, py::arg("backend_n_tile") = 8,
+        py::arg("out") = c10::nullopt, py::call_guard<py::gil_scoped_release>());
 }

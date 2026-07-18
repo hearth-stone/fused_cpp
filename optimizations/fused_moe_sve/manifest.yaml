@@ -132,6 +132,37 @@ features:
       --stage w13 --m 2040 --k 4096 --n 4096 --threads 96
       --epoch-rows 204 --warmup 3 --iters 9 --copies 4
 
+  - id: dispatch.global_stage_task_pool
+    part: dispatch
+    status: experimental
+    implementation: >-
+      csrc/moe/arm/common/fused_moe_bf16_tiled.cpp and
+      src/fused_cpp/moe/bf16_tiled.py
+    hypothesis: >-
+      A global dynamic queue of contiguous (expert, N-range) tasks can reduce
+      fixed-team tail imbalance enough to offset its global W13/W2 barrier and
+      repeated per-range A gather-pack. Reusing the production packed weights,
+      M12 SVE GEMM bodies, direct route store, and merge isolates that scheduling
+      tradeoff from kernel differences.
+    depends_on:
+      - store.w2_direct_route
+    conflicts_with:
+      - dispatch.elastic_n_lanes
+      - merge.async_ready_tokens
+    correctness: >-
+      PYTHONPATH=src .venv/bin/python -m pytest -q
+      tests/test_moe_w13_split_api.py
+      tests/test_fused_moe_bf16_tiled.py
+      -k vllm_staged
+    benchmark: >-
+      numactl --cpunodebind=0 --membind=0 taskset -c 0-95
+      .venv/bin/python
+      optimizations/fused_moe_sve/benchmarks/bench_vllm_staged_schedule.py
+      --tokens 2048 --hidden 4096 --intermediate 512
+      --experts 256 --top-k 6 --threads 96
+      --distribution hot-topk --team-threads 16
+      --warmup 3 --runs 11
+
   - id: dispatch.serial_weight_windows
     part: dispatch
     status: experimental
@@ -414,6 +445,14 @@ variants:
     entrypoint: >-
       fused_moe_bf16_tiled_{scheduled,async}(
       weight_window_bytes=<positive byte count>)
+    status: experimental
+
+  - id: sve_vllm_staged_task_pool
+    features:
+      - dispatch.global_stage_task_pool
+      - store.w2_direct_route
+      - merge.sve_weighted_reduce
+    entrypoint: fused_moe_bf16_tiled_vllm_staged
     status: experimental
 
   - id: sve_route_merge_sequential

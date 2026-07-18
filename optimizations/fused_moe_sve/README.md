@@ -150,6 +150,47 @@ The design, rejected per-route atomic prototype, and initial NUMA0 measurements
 are recorded in
 [`results/amazon_192c_async_ready_token_merge.md`](results/amazon_192c_async_ready_token_merge.md).
 
+## vLLM-style staged scheduling baseline
+
+`fused_moe_bf16_tiled_vllm_staged` is an explicit experimental entrypoint for
+isolating scheduling from GEMM implementation. It uses the production SVE
+packed weights, M12/M8/M4/M2/M1 assembly kernels, fused SiLU/packC epilogue,
+direct route store, and weighted merge. Only the execution order changes:
+
+1. every contiguous `(expert, W13 N-range)` is claimed from one global atomic
+   task queue;
+2. all workers finish W13 before a global stage barrier;
+3. every `(expert, W2 N-range)` is claimed from a second global queue;
+4. route merge runs after the complete W2 stage.
+
+Each W13 N-range rescans the expert input and gather-packs one M12 panel at a
+time, matching the referenced vLLM CPU implementation rather than sharing one
+packed A inside a fixed expert team. W13 and W2 task widths use the same policy
+as that implementation: take the smaller of the private-L2 capacity limit and
+the `num_threads / top_k` parallelism limit, then align to the native N tile.
+The available-L2 budget is half of the detected private L2. The entrypoint
+requires fused-SiLU SVE weights and does not alter default dispatch.
+
+Compare it with a fixed-team async schedule while holding kernels and route
+epilogues constant:
+
+```bash
+numactl --cpunodebind=0 --membind=0 taskset -c 0-95 \
+  .venv/bin/python \
+  optimizations/fused_moe_sve/benchmarks/bench_vllm_staged_schedule.py \
+  --tokens 2048 --hidden 4096 --intermediate 512 \
+  --experts 256 --top-k 6 --threads 96 \
+  --distribution hot-topk --team-threads 16 \
+  --warmup 3 --runs 11 --stage-timing
+```
+
+On the 192-core host's first NUMA node, six balanced `M=2048` experts were
+13.1% slower with the staged queue than with fixed `6 x 16T` teams. For 256
+uniform `M=48` experts, staged scheduling was within 1% of the best swept fixed
+width (`8T/expert`) while greatly outperforming deliberately under-threaded
+fixed schedules. The commands, stage timing, and full sweep are recorded in
+[`results/amazon_192c_vllm_staged_schedule.md`](results/amazon_192c_vllm_staged_schedule.md).
+
 ## Explicit unfused pipeline reference
 
 `bench_unfused_pipeline` measures the full fusion boundary with the production

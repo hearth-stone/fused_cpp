@@ -56,3 +56,8 @@ at::Tensor fused_moe_bf16_tiled_async(at::Tensor input, at::Tensor w13_packed, i
                                       int64_t global_num_experts, bool skip_weighted, bool fuse_silu,
                                       int64_t silu_poly_degree, int64_t gemm_backend, int64_t backend_n_tile,
                                       int64_t w13_split, int64_t weight_window_bytes, c10::optional<at::Tensor> out);
+at::Tensor fused_moe_bf16_tiled_vllm_staged(
+    at::Tensor input, at::Tensor w13_packed, int64_t w13_K, int64_t w13_N, at::Tensor w2_packed, int64_t w2_K,
+    int64_t w2_N, at::Tensor topk_weights, at::Tensor topk_ids, c10::optional<at::Tensor> thread_cpu_ids,
+    int64_t num_threads, int64_t global_num_experts, bool fuse_silu, int64_t silu_poly_degree, int64_t gemm_backend,
+    int64_t backend_n_tile, c10::optional<at::Tensor> out);

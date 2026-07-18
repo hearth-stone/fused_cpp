@@ -9,6 +9,68 @@ import torch
 import fused_cpp.moe.bf16_tiled as bf16_tiled
 
 
+def test_vllm_staged_entrypoint_forwards_sve_kernel_metadata(monkeypatch) -> None:
+    captured: list[tuple] = []
+
+    def fake_staged(*args):
+        captured.append(args)
+        return args[-1] if args[-1] is not None else args[0]
+
+    monkeypatch.setattr(bf16_tiled, "_HAS_BF16_TILED_FUSED_MOE", True)
+    monkeypatch.setattr(bf16_tiled, "_fused_moe_bf16_tiled_vllm_staged_impl", fake_staged)
+    packed = torch.empty(1, dtype=torch.bfloat16)
+    weights = bf16_tiled.PreparedBF16TiledFusedMoEWeights(
+        w13=(packed, 64, 64),
+        w2=(packed, 32, 64),
+        fused_silu=True,
+        gemm_backend=1,
+        backend_n_tile=16,
+        backend_name="arm_sve_bf16",
+    )
+    hidden = torch.zeros((2, 64), dtype=torch.bfloat16)
+    topk_weights = torch.ones((2, 1), dtype=torch.float32)
+    topk_ids = torch.zeros((2, 1), dtype=torch.int32)
+    cpu_ids = torch.tensor([3, 5], dtype=torch.int32)
+    output = torch.empty_like(hidden)
+
+    returned = bf16_tiled.fused_moe_bf16_tiled_vllm_staged(
+        hidden,
+        weights,
+        topk_weights,
+        topk_ids,
+        thread_cpu_ids=cpu_ids,
+        num_threads=2,
+        global_num_experts=7,
+        silu_poly_degree=6,
+        out=output,
+    )
+
+    assert returned is output
+    assert captured[-1][9].tolist() == [3, 5]
+    assert captured[-1][10:16] == (2, 7, True, 6, 1, 16)
+    assert captured[-1][16] is output
+
+
+def test_vllm_staged_entrypoint_rejects_non_fused_weights(monkeypatch) -> None:
+    monkeypatch.setattr(bf16_tiled, "_HAS_BF16_TILED_FUSED_MOE", True)
+    monkeypatch.setattr(bf16_tiled, "_fused_moe_bf16_tiled_vllm_staged_impl", lambda *args: args[0])
+    packed = torch.empty(1, dtype=torch.bfloat16)
+    weights = bf16_tiled.PreparedBF16TiledFusedMoEWeights(
+        w13=(packed, 1, 2),
+        w2=(packed, 1, 1),
+        fused_silu=False,
+        gemm_backend=1,
+    )
+
+    with pytest.raises(ValueError, match="fuse_silu=True"):
+        bf16_tiled.fused_moe_bf16_tiled_vllm_staged(
+            torch.zeros((1, 1), dtype=torch.bfloat16),
+            weights,
+            torch.ones((1, 1), dtype=torch.float32),
+            torch.zeros((1, 1), dtype=torch.int32),
+        )
+
+
 def test_async_w13_split_is_forwarded_as_tristate(monkeypatch) -> None:
     captured: list[tuple] = []
 

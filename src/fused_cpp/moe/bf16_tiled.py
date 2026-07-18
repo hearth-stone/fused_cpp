@@ -31,6 +31,7 @@ try:
     _fused_moe_bf16_tiled_impl = _moe_native.fused_moe_bf16_tiled
     _fused_moe_bf16_tiled_scheduled_impl = _moe_native.fused_moe_bf16_tiled_scheduled
     _fused_moe_bf16_tiled_async_impl = _moe_native.fused_moe_bf16_tiled_async
+    _fused_moe_bf16_tiled_vllm_staged_impl = _moe_native.fused_moe_bf16_tiled_vllm_staged
     _prepare_bf16_tiled_impl = _moe_native.fused_moe_bf16_tiled_prepare_weights
     _available_backends_impl = _moe_native.fused_moe_bf16_tiled_available_backends
     _HAS_BF16_TILED_FUSED_MOE = bool(_available_backends_impl())
@@ -48,6 +49,7 @@ try:
         "fused_moe_bf16_tiled",
         "fused_moe_bf16_tiled_scheduled",
         "fused_moe_bf16_tiled_async",
+        "fused_moe_bf16_tiled_vllm_staged",
         "fused_moe_test_split_plan",
         "fused_moe_test_single_thread_gemm",
         "fused_moe_test_pack_interleaved_gemm",
@@ -69,6 +71,7 @@ except (ImportError, AttributeError):
     _fused_moe_bf16_tiled_impl = None
     _fused_moe_bf16_tiled_scheduled_impl = None
     _fused_moe_bf16_tiled_async_impl = None
+    _fused_moe_bf16_tiled_vllm_staged_impl = None
     _prepare_bf16_tiled_impl = None
     _available_backends_impl = None
     _HAS_BF16_TILED_FUSED_MOE = False
@@ -471,9 +474,87 @@ def fused_moe_bf16_tiled_async(
     return out if out is not None else result
 
 
+def fused_moe_bf16_tiled_vllm_staged(
+    input: torch.Tensor,
+    weights: PreparedBF16TiledFusedMoEWeights,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    *,
+    thread_cpu_ids: torch.Tensor | None = None,
+    num_threads: int = 1,
+    global_num_experts: int = -1,
+    silu_poly_degree: int = 5,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Run the experimental vLLM-style staged SVE scheduling baseline.
+
+    The compute kernels, packed weights, direct route store, and weighted
+    merge are the same as the production fused SVE path. Scheduling follows
+    the vLLM CPU implementation instead: all ``(expert, W13 N-range)`` tasks
+    share one dynamic queue, a global stage barrier separates W13 from W2,
+    and all ``(expert, W2 N-range)`` tasks then share a second queue. Each W13
+    range rescans and packs its expert input in M12 panels, matching vLLM's
+    per-N-task A scan. This entrypoint is experimental and does not change the
+    default fused MoE dispatch.
+    """
+    _require_backend()
+    if _fused_moe_bf16_tiled_vllm_staged_impl is None:
+        raise RuntimeError(
+            "BF16 tiled vLLM-staged MoE backend is unavailable; rebuild the "
+            "C++ extension with fused_moe_bf16_tiled_vllm_staged support."
+        )
+    if input.dtype != torch.bfloat16:
+        raise TypeError(f"input must be torch.bfloat16, got {input.dtype}")
+    if input.device.type != "cpu":
+        raise ValueError("input must be a CPU tensor")
+    if topk_ids.dtype not in _INTEGER_DTYPES:
+        raise TypeError(f"topk_ids must use an integer dtype, got {topk_ids.dtype}")
+    if not topk_weights.dtype.is_floating_point:
+        raise TypeError(f"topk_weights must use a floating dtype, got {topk_weights.dtype}")
+    if int(num_threads) <= 0:
+        raise ValueError(f"num_threads must be positive, got {num_threads}")
+    if not weights.fused_silu:
+        raise ValueError("vLLM-staged baseline requires weights prepared with fuse_silu=True")
+    if weights.gemm_backend != 1:
+        raise ValueError(
+            "vLLM-staged baseline requires the SVE BF16 backend; "
+            f"weights use {weights.backend_name}"
+        )
+    if thread_cpu_ids is not None:
+        _check_integer_schedule_tensor(thread_cpu_ids, "thread_cpu_ids")
+        if int(thread_cpu_ids.numel()) != int(num_threads):
+            raise ValueError(
+                "thread_cpu_ids must have exactly num_threads entries: "
+                f"got {int(thread_cpu_ids.numel())} vs {int(num_threads)}"
+            )
+    _validate_output_buffer(input, out)
+
+    result = _fused_moe_bf16_tiled_vllm_staged_impl(
+        input.contiguous(),
+        weights.w13[0],
+        weights.w13[1],
+        weights.w13[2],
+        weights.w2[0],
+        weights.w2[1],
+        weights.w2[2],
+        topk_weights.contiguous(),
+        topk_ids.contiguous(),
+        None if thread_cpu_ids is None else thread_cpu_ids.contiguous(),
+        int(num_threads),
+        int(global_num_experts),
+        bool(weights.fused_silu),
+        int(silu_poly_degree),
+        int(weights.gemm_backend),
+        int(weights.backend_n_tile),
+        out,
+    )
+    return out if out is not None else result
+
+
 bf16_tiled_fused_moe = fused_moe_bf16_tiled
 bf16_tiled_fused_moe_scheduled = fused_moe_bf16_tiled_scheduled
 bf16_tiled_fused_moe_async = fused_moe_bf16_tiled_async
+bf16_tiled_fused_moe_vllm_staged = fused_moe_bf16_tiled_vllm_staged
 prepare_bf16_tiled_fused_moe_weights = prepare_fused_moe_bf16_tiled_weights
 
 
@@ -485,9 +566,11 @@ __all__ = [
     "fused_moe_bf16_tiled",
     "fused_moe_bf16_tiled_scheduled",
     "fused_moe_bf16_tiled_async",
+    "fused_moe_bf16_tiled_vllm_staged",
     "bf16_tiled_fused_moe",
     "bf16_tiled_fused_moe_scheduled",
     "bf16_tiled_fused_moe_async",
+    "bf16_tiled_fused_moe_vllm_staged",
     "prepare_fused_moe_bf16_tiled_weights",
     "prepare_bf16_tiled_fused_moe_weights",
 ]
