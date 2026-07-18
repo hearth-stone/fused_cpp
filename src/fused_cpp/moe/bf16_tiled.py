@@ -19,7 +19,7 @@ class PreparedBF16TiledFusedMoEWeights:
     w13: PreparedWeight
     w2: PreparedWeight
     fused_silu: bool = False
-    # 1=SVE fused kernel default when available; 0=NEON legacy fallback.
+    # Stable native backend id: 0=NEON, 1=SVE, 101=AVX-512 BF16.
     gemm_backend: int = 0
     backend_n_tile: int = 8
     backend_name: str = "arm_neon_bf16"
@@ -170,9 +170,10 @@ def prepare_fused_moe_bf16_tiled_weights(
     Set ``FUSED_CPP_MOE_PREPACK_THREADS`` to parallelize packing by expert.
 
     ``fuse_silu=True`` packs w13 in the interleaved gate/up layout required by
-    the fused SiLU-and-mul GEMM epilogue (requires ``F % 8 == 0`` and
-    ``activation='silu'`` at call time). The returned object carries a
-    ``fused_silu`` flag that :func:`fused_moe_bf16_tiled` honours automatically.
+    the fused SiLU-and-mul GEMM epilogue. ARM currently requires ``F % 8 == 0``;
+    AVX-512 pads arbitrary positive ``F``. Both require ``activation='silu'``
+    at call time. The returned object carries a ``fused_silu`` flag that
+    :func:`fused_moe_bf16_tiled` honours automatically.
     """
     _require_backend()
     if w13_weight.dtype != torch.bfloat16 or w2_weight.dtype != torch.bfloat16:
@@ -189,7 +190,7 @@ def prepare_fused_moe_bf16_tiled_weights(
         backend,
     )
     backend_id = int(packed[6]) if len(packed) > 6 else 0
-    backend_names = {0: "arm_neon_bf16", 1: "arm_sve_bf16"}
+    backend_names = {0: "arm_neon_bf16", 1: "arm_sve_bf16", 101: "x86_avx512_bf16"}
     return PreparedBF16TiledFusedMoEWeights(
         w13=(packed[0], int(packed[1]), int(packed[2])),
         w2=(packed[3], int(packed[4]), int(packed[5])),
@@ -228,7 +229,8 @@ def fused_moe_bf16_tiled(
     ``FUSED_CPP_MOE_WEIGHT_WINDOW_BYTES``; zero disables byte-based windows.
     A supplied ``out`` must be a contiguous CPU BF16 tensor matching ``input``;
     the native kernel writes it directly and returns it without an intermediate
-    output allocation or copy.
+    output allocation or copy. The AVX-512 BF16 backend currently supports the
+    fused SiLU path without expert bias using one or two worker threads.
     """
     _require_backend()
     if input.dtype != torch.bfloat16:

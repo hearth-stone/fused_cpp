@@ -14,7 +14,7 @@ csrc/moe/
   arm/neon_bf16/             AArch64 NEON + BFMMLA kernels
   arm/sve_bf16/              AArch64 SVE + SVEBF16 kernels and helpers
   x86/avx2/                  reserved backend boundary; not implemented
-  x86/avx512_bf16/           reserved backend boundary; not implemented
+  x86/avx512_bf16/           AVX-512 BF16 fused-SiLU executor and kernels
   x86/amx_bf16/              reserved backend boundary; not implemented
 ```
 
@@ -130,7 +130,29 @@ pooled tasks are validated but replaced by interval-release eligibility; a
 non-pooled task may not depend on a pooled task. The setting is intended for
 executor and planner research and is not enabled by the production planner.
 
-## Adding an x86 backend
+## x86 AVX-512 BF16 build and dispatch
+
+Linux x86-64 builds the AVX-512 BF16 microkernel as a separate native object
+with `-mavx512bf16`; the remaining `_moe_C` translation units retain the
+baseline compiler target. Runtime CPUID and XCR0 checks prevent entry on CPUs
+without AVX-512F/BW/VL, AVX-512 BF16, or enabled ZMM state. The backend is
+available only for prepared fused-SiLU weights and can be disabled with
+`FUSED_CPP_MOE_AVX512_BF16=0`.
+
+Backend ID 101 is `x86_avx512_bf16`, with N tile 32. Its packed weights are not
+compatible with ARM backends. The first implementation supports synchronous
+execution with one or two worker threads, no bias, direct route output, and a
+weighted AVX-512 merge. Full route groups use M12 panels, with a generic final
+tail. Two-thread execution reuses OpenMP when available and has a standard
+thread fallback. Scheduled/async/vLLM-staged x86 entrypoints remain
+unimplemented. `FUSED_CPP_BUILD_MOE_ONLY=1` builds only `_moe_C`, which is
+useful when validating this independent extension on an x86 checkout whose
+main extension contains target-specific sources.
+
+Design, commands, and measurements live in
+`optimizations/fused_moe_avx512/`.
+
+## Adding another x86 backend
 
 Implement the ISA-owned pack and compute entries below the corresponding x86
 directory, then register an immutable descriptor in `common/backend.cpp` with

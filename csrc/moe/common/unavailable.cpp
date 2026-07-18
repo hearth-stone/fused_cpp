@@ -7,11 +7,12 @@
 namespace {
 
 [[noreturn]] void unavailable() {
-  throw std::runtime_error("no fused MoE compute backend is implemented for this architecture");
+  throw std::runtime_error("the requested fused MoE execution mode is not implemented for this architecture/backend");
 }
 
 }  // namespace
 
+#if !defined(__x86_64__)
 std::tuple<at::Tensor, int64_t, int64_t, at::Tensor, int64_t, int64_t, int64_t, int64_t>
 fused_moe_bf16_tiled_prepare_weights(at::Tensor, at::Tensor, bool, std::string) {
   unavailable();
@@ -22,6 +23,7 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor, at::Tensor, int64_t, int64_t, at::Te
                                 int64_t, bool, bool, int64_t, int64_t, int64_t, int64_t, c10::optional<at::Tensor>) {
   unavailable();
 }
+#endif
 
 at::Tensor fused_moe_bf16_tiled_scheduled(at::Tensor, at::Tensor, int64_t, int64_t, at::Tensor, int64_t, int64_t,
                                           at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,

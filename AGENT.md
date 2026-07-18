@@ -59,6 +59,11 @@ Example:
 ssh AmazonECS8Cores 'cd /home/ubuntu/zhangxu/fused_cpp && . .venv/bin/activate && python -c "import sys; print(sys.executable)"'
 ```
 
+### Amazon C8i 2 Cores
+
+- Host alias: `AmazonC8i2Cores`
+- Remote work root: `/home/ubuntu/zhangxu`
+
 ### Amazon C5 64 Cores
 
 - Host alias: `AmazonC564Cores`

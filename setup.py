@@ -397,6 +397,7 @@ i8gemm_c_sources = []
 i8gemm_asm_sources = []
 moe_native_sources = []
 is_aarch64 = platform.machine() in ("aarch64", "arm64")
+is_x86_64 = platform.machine() in ("x86_64", "AMD64")
 acl_available, acl_include_dirs, acl_library_dirs = _detect_acl()
 use_acl = is_aarch64 and acl_available
 
@@ -434,6 +435,25 @@ moe_define_macros = [
 ]
 if omp_available:
     moe_define_macros.append(("FUSED_CPP_HAS_OMP", "1"))
+
+if is_x86_64:
+    moe_define_macros.append(("FUSED_CPP_MOE_HAS_X86_AVX512_BF16", "1"))
+    avx512_bf16_source = os.path.join("csrc", "moe", "x86", "avx512_bf16", "kernels.cpp")
+    moe_sources = [source for source in moe_sources if source != avx512_bf16_source]
+    moe_native_sources.append(
+        (
+            avx512_bf16_source,
+            [
+                "-O3",
+                "-std=c++17",
+                "-mavx512f",
+                "-mavx512bw",
+                "-mavx512vl",
+                "-mavx512bf16",
+                "-mfma",
+            ],
+        )
+    )
 
 define_macros.append(("FUSED_CPP_ENABLE_PROFILING", "1" if _profiling_enabled_for_build() else "0"))
 define_macros.append(("FUSED_CPP_STRICT_MODE", "1" if _env_truthy("FUSED_CPP_STRICT_MODE") else "0"))
@@ -651,25 +671,26 @@ native_sources_by_extension = {
     "fused_cpp._moe_C": moe_native_sources,
 }
 
+main_extension = CppExtension(
+    name="fused_cpp._C",
+    sources=sources,
+    include_dirs=include_dirs,
+    library_dirs=library_dirs,
+    extra_compile_args=extra_compile_args,
+    extra_link_args=extra_link_args,
+    define_macros=define_macros,
+)
+moe_extension = CppExtension(
+    name="fused_cpp._moe_C",
+    sources=moe_sources,
+    include_dirs=moe_include_dirs,
+    extra_compile_args=moe_compile_args,
+    extra_link_args=moe_link_args,
+    define_macros=moe_define_macros,
+)
+extensions = [moe_extension] if _env_truthy("FUSED_CPP_BUILD_MOE_ONLY") else [main_extension, moe_extension]
+
 setup(
-    ext_modules=[
-        CppExtension(
-            name="fused_cpp._C",
-            sources=sources,
-            include_dirs=include_dirs,
-            library_dirs=library_dirs,
-            extra_compile_args=extra_compile_args,
-            extra_link_args=extra_link_args,
-            define_macros=define_macros,
-        ),
-        CppExtension(
-            name="fused_cpp._moe_C",
-            sources=moe_sources,
-            include_dirs=moe_include_dirs,
-            extra_compile_args=moe_compile_args,
-            extra_link_args=moe_link_args,
-            define_macros=moe_define_macros,
-        ),
-    ],
+    ext_modules=extensions,
     cmdclass={"build_ext": _BuildExtensionWithFixup},
 )

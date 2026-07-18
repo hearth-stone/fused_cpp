@@ -1,0 +1,154 @@
+operator: fused_moe_avx512
+
+baseline:
+  id: pytorch_onednn_staged_avx512
+  implementation: src/fused_cpp/moe/naive.py
+  entrypoint: fused_moe_naive
+  status: reference
+
+features:
+  - id: layout.vnni2_packed_weights
+    part: layout
+    status: experimental
+    implementation: csrc/moe/x86/avx512_bf16/backend.cpp
+    hypothesis: >-
+      Packing adjacent BF16 K pairs in VNNI2 order once at model load time lets
+      every runtime inner product use VDPBF16PS without oneDNN reorder or
+      transpose work inside the expert invocation.
+    depends_on: []
+    conflicts_with: []
+    correctness: >-
+      PYTHONPATH=src .venv/bin/python -m pytest -q
+      tests/test_moe_avx512_bf16.py
+    benchmark: >-
+      ONEDNN_MAX_CPU_ISA=AVX512_CORE_BF16 OMP_NUM_THREADS=1
+      taskset -c 0 env PYTHONPATH=src .venv/bin/python
+      tests/bench_moe_avx512_bf16.py --tokens 12 --hidden 4096
+      --intermediate 512 --experts 1 --top-k 1 --routing hot --threads 1
+
+  - id: compute.m12n32_vdpbf16ps
+    part: compute
+    status: experimental
+    implementation: csrc/moe/x86/avx512_bf16/kernels.cpp
+    hypothesis: >-
+      Twelve independent M rows and two 16-column halves provide enough
+      accumulator independence to hide VDPBF16PS latency for decode-sized
+      experts while retaining a 32-column packed-B tile.
+    depends_on:
+      - layout.vnni2_packed_weights
+    conflicts_with: []
+    correctness: >-
+      PYTHONPATH=src .venv/bin/python -m pytest -q
+      tests/test_moe_avx512_bf16.py
+    benchmark: >-
+      ONEDNN_MAX_CPU_ISA=AVX512_CORE_BF16 OMP_NUM_THREADS=1
+      taskset -c 0 env PYTHONPATH=src .venv/bin/python
+      tests/bench_moe_avx512_bf16.py --tokens 12 --hidden 4096
+      --intermediate 512 --experts 1 --top-k 1 --routing hot --threads 1
+
+  - id: epilogue.silu_mul_packa
+    part: intermediate
+    status: experimental
+    implementation: csrc/moe/x86/avx512_bf16/kernels.cpp
+    hypothesis: >-
+      Applying polynomial SiLU, multiplying the up projection, converting to
+      BF16, and writing W2's VNNI2 packed-A layout in the W13 epilogue avoids
+      materializing two FP32 projections and a separate pack operation.
+    depends_on:
+      - compute.m12n32_vdpbf16ps
+    conflicts_with: []
+    correctness: >-
+      PYTHONPATH=src .venv/bin/python -m pytest -q
+      tests/test_moe_avx512_bf16.py
+    benchmark: >-
+      ONEDNN_MAX_CPU_ISA=AVX512_CORE_BF16 OMP_NUM_THREADS=1
+      taskset -c 0 env PYTHONPATH=src .venv/bin/python
+      tests/bench_moe_avx512_bf16.py --tokens 12 --hidden 4096
+      --intermediate 512 --experts 1 --top-k 1 --routing hot --threads 1
+
+  - id: store.direct_route
+    part: store
+    status: experimental
+    implementation: >-
+      csrc/moe/x86/avx512_bf16/kernels.cpp and
+      csrc/moe/x86/avx512_bf16/executor.cpp
+    hypothesis: >-
+      Writing W2 accumulators directly to their flat route rows removes a
+      contiguous expert output and the following scatter pass. Top-1
+      skip-weighted calls can convert and store BF16 directly to user output.
+    depends_on:
+      - compute.m12n32_vdpbf16ps
+    conflicts_with: []
+    correctness: >-
+      PYTHONPATH=src .venv/bin/python -m pytest -q
+      tests/test_moe_avx512_bf16.py
+    benchmark: >-
+      ONEDNN_MAX_CPU_ISA=AVX512_CORE_BF16 OMP_NUM_THREADS=1
+      taskset -c 0 env PYTHONPATH=src .venv/bin/python
+      tests/bench_moe_avx512_bf16.py --tokens 16 --hidden 4096
+      --intermediate 512 --experts 8 --top-k 6 --routing balanced --threads 1
+
+  - id: merge.avx512_weighted_reduce
+    part: merge
+    status: experimental
+    implementation: csrc/moe/x86/avx512_bf16/kernels.cpp
+    hypothesis: >-
+      Keeping one 16-column weighted sum in ZMM registers across all top-k
+      routes avoids a temporary FP32 accumulation row and converts only the
+      final value to BF16.
+    depends_on:
+      - store.direct_route
+    conflicts_with: []
+    correctness: >-
+      PYTHONPATH=src .venv/bin/python -m pytest -q
+      tests/test_moe_avx512_bf16.py
+    benchmark: >-
+      ONEDNN_MAX_CPU_ISA=AVX512_CORE_BF16 OMP_NUM_THREADS=2
+      OMP_WAIT_POLICY=PASSIVE
+      taskset -c 0,1 env PYTHONPATH=src .venv/bin/python
+      tests/bench_moe_avx512_bf16.py --tokens 16 --hidden 4096
+      --intermediate 512 --experts 8 --top-k 6 --routing balanced --threads 2
+
+  - id: dispatch.two_core_expert_or_nsplit
+    part: dispatch
+    status: experimental
+    implementation: csrc/moe/x86/avx512_bf16/executor.cpp
+    hypothesis: >-
+      A global expert queue balances multiple active experts across two cores,
+      while splitting W13 and W2 N blocks lets a single hot expert use both
+      cores without duplicating its gathered packed-A panel. Reusing an
+      OpenMP team avoids repeated operating-system thread creation for short
+      experts while retaining a standard-thread fallback.
+    depends_on:
+      - compute.m12n32_vdpbf16ps
+      - epilogue.silu_mul_packa
+    conflicts_with: []
+    correctness: >-
+      PYTHONPATH=src .venv/bin/python -m pytest -q
+      tests/test_moe_avx512_bf16.py
+    benchmark: >-
+      ONEDNN_MAX_CPU_ISA=AVX512_CORE_BF16 OMP_NUM_THREADS=2
+      OMP_WAIT_POLICY=PASSIVE
+      taskset -c 0,1 env PYTHONPATH=src .venv/bin/python
+      tests/bench_moe_avx512_bf16.py --tokens 16 --hidden 4096
+      --intermediate 512 --experts 8 --top-k 6 --routing balanced --threads 2
+
+variants:
+  - id: pytorch_onednn_staged_avx512
+    features: []
+    entrypoint: >-
+      ONEDNN_MAX_CPU_ISA=AVX512_CORE_BF16 fused_moe_naive
+    status: reference
+
+  - id: avx512_bf16_fused_expert
+    features:
+      - layout.vnni2_packed_weights
+      - compute.m12n32_vdpbf16ps
+      - epilogue.silu_mul_packa
+      - store.direct_route
+      - merge.avx512_weighted_reduce
+      - dispatch.two_core_expert_or_nsplit
+    entrypoint: >-
+      prepare_fused_moe_bf16_tiled_weights(fuse_silu=True,
+      backend="x86_avx512_bf16") followed by fused_moe_bf16_tiled
+    status: experimental

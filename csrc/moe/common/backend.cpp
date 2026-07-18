@@ -16,6 +16,10 @@
 #include "../arm/sve_bf16/packing.h"
 #endif
 
+#if defined(FUSED_CPP_MOE_HAS_X86_AVX512_BF16)
+#include "../x86/avx512_bf16/backend.h"
+#endif
+
 namespace fused_cpp::moe {
 namespace {
 
@@ -117,12 +121,36 @@ const MoeBackend kArmSveBackend{
 #endif
 };
 
+const MoeBackend kX86Avx512Bf16Backend{
+    BackendId::kX86Avx512Bf16,
+    "x86_avx512_bf16",
+    "x86",
+    "avx512_bf16",
+    kFusedSiluPackC | kDirectRouteF32 | kRouteMerge,
+#if defined(FUSED_CPP_MOE_HAS_X86_AVX512_BF16)
+    ::fused_cpp::moe::x86::avx512_bf16::RuntimeSupported,
+    ::fused_cpp::moe::x86::avx512_bf16::NTile,
+    ::fused_cpp::moe::x86::avx512_bf16::RoundK,
+    ::fused_cpp::moe::x86::avx512_bf16::RoundN,
+    ::fused_cpp::moe::x86::avx512_bf16::PackB,
+#else
+    nullptr,
+    nullptr,
+    nullptr,
+    nullptr,
+    nullptr,
+#endif
+};
+
 const MoeBackend* known_backend(const std::string& name) {
   if (name == kArmNeonBackend.name || name == "neon") {
     return &kArmNeonBackend;
   }
   if (name == kArmSveBackend.name || name == "sve") {
     return &kArmSveBackend;
+  }
+  if (name == kX86Avx512Bf16Backend.name || name == "avx512_bf16") {
+    return &kX86Avx512Bf16Backend;
   }
   return nullptr;
 }
@@ -139,6 +167,9 @@ bool backend_runtime_supported(const MoeBackend& backend) {
 
 const MoeBackend& resolve_backend(const std::string& requested, bool fuse_silu) {
   if (requested.empty() || requested == "auto") {
+    if (fuse_silu && backend_runtime_supported(kX86Avx512Bf16Backend)) {
+      return kX86Avx512Bf16Backend;
+    }
     if (fuse_silu && backend_runtime_supported(kArmSveBackend)) {
       return kArmSveBackend;
     }
@@ -148,16 +179,16 @@ const MoeBackend& resolve_backend(const std::string& requested, bool fuse_silu) 
     throw std::runtime_error("no BF16 fused MoE backend is supported by this CPU/runtime");
   }
 
-  if (requested == "x86_avx2" || requested == "x86_avx512_bf16" || requested == "x86_amx_bf16") {
+  if (requested == "x86_avx2" || requested == "x86_amx_bf16") {
     throw std::runtime_error("MoE backend '" + requested + "' is known but not implemented");
   }
   const MoeBackend* backend = known_backend(requested);
   if (backend == nullptr) {
     throw std::invalid_argument("unknown MoE backend '" + requested +
-                                "'; expected auto, arm_neon_bf16, or arm_sve_bf16");
+                                "'; expected auto, arm_neon_bf16, arm_sve_bf16, or x86_avx512_bf16");
   }
-  if (backend->id == BackendId::kArmSveBf16 && !fuse_silu) {
-    throw std::invalid_argument("arm_sve_bf16 currently requires fuse_silu=True");
+  if ((backend->id == BackendId::kArmSveBf16 || backend->id == BackendId::kX86Avx512Bf16) && !fuse_silu) {
+    throw std::invalid_argument(std::string(backend->name) + " currently requires fuse_silu=True");
   }
   if (!backend_runtime_supported(*backend)) {
     throw std::runtime_error(unavailable_message(*backend));
@@ -171,6 +202,8 @@ const MoeBackend& backend_from_id(int64_t backend_id) {
     backend = &kArmNeonBackend;
   } else if (backend_id == static_cast<int64_t>(BackendId::kArmSveBf16)) {
     backend = &kArmSveBackend;
+  } else if (backend_id == static_cast<int64_t>(BackendId::kX86Avx512Bf16)) {
+    backend = &kX86Avx512Bf16Backend;
   } else {
     throw std::invalid_argument("unknown packed MoE backend id " + std::to_string(backend_id));
   }
@@ -187,6 +220,9 @@ std::vector<std::string> available_backend_names() {
   }
   if (backend_runtime_supported(kArmSveBackend)) {
     names.emplace_back(kArmSveBackend.name);
+  }
+  if (backend_runtime_supported(kX86Avx512Bf16Backend)) {
+    names.emplace_back(kX86Avx512Bf16Backend.name);
   }
   return names;
 }
