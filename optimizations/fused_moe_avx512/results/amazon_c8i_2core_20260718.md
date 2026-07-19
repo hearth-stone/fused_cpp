@@ -80,6 +80,60 @@ single-core prepacked oneDNN control while also doing routing, gather, direct
 route placement, and merge. The custom kernel's value is fusion and operator
 integration, rather than exceeding oneDNN's isolated prepacked GEMM control.
 
+## Single-GEMM control
+
+`benchmarks/bench_avx512_bf16_gemm.cpp` calls the custom W2
+BF16-by-BF16-to-FP32 kernel directly. Custom B packing and oneDNN's `any`
+weight reorder are both performed once outside timing. `kernel` also excludes
+custom A packing; `pack A + kernel` includes the M12-to-physical-M16 VNNI2
+packing on every iteration. Route ids are sequential, so both outputs are
+contiguous. Results below are medians of 51 hot-weight samples pinned to core
+0. oneDNN reported `brg_matmul:avx512_core_bf16` when capped to the same ISA.
+
+| M | K | N | Custom kernel | Custom pack A + kernel | oneDNN AVX-512 BF16 |
+|---:|---:|---:|---:|---:|---:|
+| 12 | 512 | 4096 | 0.4384 ms, 114.82 GFLOP/s | 0.4397 ms, 114.46 GFLOP/s | 0.4445 ms, 113.24 GFLOP/s |
+| 48 | 512 | 4096 | 1.7319 ms, 116.25 GFLOP/s | 1.7407 ms, 115.66 GFLOP/s | 1.7249 ms, 116.71 GFLOP/s |
+| 12 | 4096 | 1024 | 0.8583 ms, 117.28 GFLOP/s | 0.8721 ms, 115.42 GFLOP/s | 0.8659 ms, 116.25 GFLOP/s |
+| 48 | 4096 | 1024 | 3.4241 ms, 117.59 GFLOP/s | 3.4795 ms, 115.72 GFLOP/s | 3.4310 ms, 117.36 GFLOP/s |
+
+The first geometry matches W2 for H=4096/F=512. The second has W13's combined
+GEMM dimensions, but it still exercises `ComputeW2` and therefore excludes the
+actual fused gate/up SiLU epilogue. Maximum absolute error versus oneDNN was
+`4.47e-8`. The packed custom kernel is within -0.4% to +1.4% of prepacked
+oneDNN across these shapes; including A packing keeps it within -1.4% to
++1.1%. The AVX-512 single-GEMM kernel is therefore effectively at oneDNN's
+performance level on this core when M is an exact multiple of 12.
+
+The generic final-panel path always computes 16 physical rows, so useful
+performance is much lower when M is not divisible by 12:
+
+| M | K | N | Custom kernel | oneDNN AVX-512 BF16 | Custom/oneDNN |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 512 | 4096 | 0.6632 ms, 6.32 GFLOP/s | 0.1411 ms, 29.72 GFLOP/s | 0.21x |
+| 4 | 512 | 4096 | 0.6647 ms, 25.24 GFLOP/s | 0.1468 ms, 114.32 GFLOP/s | 0.22x |
+| 8 | 512 | 4096 | 0.6727 ms, 49.88 GFLOP/s | 0.2903 ms, 115.59 GFLOP/s | 0.43x |
+| 11 | 512 | 4096 | 0.6878 ms, 67.07 GFLOP/s | 0.4062 ms, 113.59 GFLOP/s | 0.59x |
+| 13 | 512 | 4096 | 1.1258 ms, 48.43 GFLOP/s | 0.4788 ms, 113.89 GFLOP/s | 0.43x |
+
+M=13 exposes the discontinuity particularly clearly: the executor runs one
+efficient M12 panel and then pays for a full physical-M16 fallback to compute
+the final row. Dedicated M8/M4/M2/M1 register kernels are required before the
+same-ISA oneDNN parity extends to arbitrary expert route counts.
+
+Without the ISA cap, oneDNN selected `brg_matmul:avx10_1_512_amx`:
+
+| M | K | N | Custom AVX-512 kernel | oneDNN AMX | AMX/custom |
+|---:|---:|---:|---:|---:|---:|
+| 12 | 512 | 4096 | 114.86 GFLOP/s | 276.98 GFLOP/s | 2.41x |
+| 48 | 512 | 4096 | 116.37 GFLOP/s | 335.47 GFLOP/s | 2.88x |
+| 12 | 4096 | 1024 | 117.33 GFLOP/s | 339.10 GFLOP/s | 2.89x |
+| 48 | 4096 | 1024 | 117.66 GFLOP/s | 510.53 GFLOP/s | 4.34x |
+
+This large isolated-GEMM AMX advantage is partly hidden in the staged full
+operator by routing, intermediate materialization, activation, and merge
+costs, which do not receive AMX's matrix-compute speedup.
+
 ## AMX context and remaining work
 
 With oneDNN's default AMX selection, the staged baseline remained about 10%

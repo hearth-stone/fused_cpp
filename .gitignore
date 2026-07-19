@@ -21,6 +21,9 @@ refs/
 .codebuddy/
 .claude/worktrees/
 
+# Local third-party source references
+/3rdparty/oneDNN/
+
 # Lock files (not tracked for this project)
 uv.lock
 

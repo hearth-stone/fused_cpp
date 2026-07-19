@@ -80,3 +80,11 @@ For a lower-overhead oneDNN control, `benchmarks/bench_moe_onednn_avx512.cpp`
 uses public oneDNN matmul primitives with `format_tag::any`, reorders both
 weights once, reports the selected implementations, and times only W13,
 poly5-SiLU/multiply, and W2.
+
+`benchmarks/bench_avx512_bf16_gemm.cpp` isolates `ComputeW2` as a single
+BF16-by-BF16-to-FP32 GEMM. It reports the already-packed kernel separately
+from A packing plus kernel execution, while oneDNN uses an `any` weight
+descriptor and performs its one-time reorder outside timing. Use
+`ONEDNN_MAX_CPU_ISA=AVX512_CORE_BF16`, `OMP_NUM_THREADS=1`, and `taskset` for
+the same-ISA single-core comparison. The result report also includes oneDNN's
+default AMX implementation as a separate hardware-ceiling comparison.
