@@ -287,6 +287,7 @@ def make_async_run(
         begin = expert_id * routes
         topk_ids[begin : begin + routes, 0] = expert_id
     topk_weights = torch.ones((total_tokens, 1), dtype=torch.float32)
+    output = torch.empty_like(x)
 
     begins: list[int] = []
     core = 0
@@ -336,6 +337,7 @@ def make_async_run(
             global_num_experts=num_profile_experts,
             skip_weighted=True,
             w13_split=w13_split,
+            out=output,
         )
 
     return run, num_groups, num_tasks, [len(lane) for lane in lane_experts]
@@ -649,6 +651,7 @@ def main() -> int:
         "measurement": {
             "path": "fused_moe_bf16_tiled_async",
             "pinning": "interval (thread_cpu_ids, disjoint per task)",
+            "output_buffer": "preallocated_reused_native_out",
             "rank_synchronization": "socket_barrier" if args.sync_port else "none",
             "omp_proc_bind": os.environ.get("OMP_PROC_BIND", ""),
             "runs": args.runs,

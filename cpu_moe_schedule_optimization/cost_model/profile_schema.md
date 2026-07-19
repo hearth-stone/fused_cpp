@@ -63,6 +63,7 @@ must be added to kernel identity rather than inferred from `w13_split_chunks`.
     "rank_synchronization": "socket_barrier_per_call",
     "rank_aggregation": "median_of_pairwise_max",
     "profile_scope": "concurrent_rank_pair",
+    "output_buffer": "preallocated_reused_native_out",
     "assignment": "earliest_finish_lpt_using_streaming_T_iso",
     "derate": "full_call_median / LPT_isolated_baseline_makespan"
   },
@@ -101,6 +102,13 @@ For concurrent ranks, every timed call starts behind a cross-rank barrier. The
 merged sample is `max(rank_sample_i)` for each iteration, and summary statistics
 are computed from those paired maxima. Taking the maximum of two independently
 computed medians is not schema-v2 compliant.
+
+The input, schedule tensors, and native BF16 `out` tensor are allocated once per
+measurement point. Warmup calls first-touch the output, and all timed calls reuse
+the same storage. Allocation and page-fault cost therefore remain outside
+`T_iso` and contention derates; model-runtime allocation is an end-to-end term,
+not expert-compute time. Profiles that omit `measurement.output_buffer` used the
+legacy allocate-per-call path and are not comparable at large total route counts.
 
 The active generator is `profile_contention_async_dual_rank.py`. The underlying
 single-rank worker is `profile_contention_async.py`; its schema-v2 output records
