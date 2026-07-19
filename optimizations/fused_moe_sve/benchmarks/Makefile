@@ -10,6 +10,7 @@ LDFLAGS += -pthread
 
 TARGETS := bench_elastic_nsplit bench_unfused_pipeline bench_single_core_weight_window \
 	bench_fragmented_route_pipeline bench_m12_llc_pollution bench_route_merge_tree
+EXPERIMENTAL_TARGETS := bench_m12_streaming_b bench_msmall_kblock
 ELASTIC_SOURCES := bench_elastic_nsplit.cpp $(FEATURES)/elastic_nsplit.cpp \
 	$(ROOT)/csrc/moe/arm/sve_bf16/kernels.S
 UNFUSED_SOURCES := bench_unfused_pipeline.cpp $(FEATURES)/unfused_pipeline.cpp \
@@ -21,8 +22,12 @@ M12_LLC_POLLUTION_SOURCES := bench_m12_llc_pollution.cpp \
 FRAGMENTED_ROUTE_SOURCES := bench_fragmented_route_pipeline.cpp $(FEATURES)/unfused_pipeline.cpp \
 	$(ROOT)/csrc/moe/arm/sve_bf16/kernels.S
 ROUTE_MERGE_SOURCES := bench_route_merge_tree.cpp $(ROOT)/csrc/moe/arm/sve_bf16/route_merge.cpp
+M12_STREAMING_B_SOURCES := bench_m12_streaming_b.cpp m12_streaming_b_kernels.S \
+	$(ROOT)/csrc/moe/arm/sve_bf16/kernels.S
+MSMALL_KBLOCK_SOURCES := bench_msmall_kblock.cpp msmall_kblock_kernels.S \
+	$(ROOT)/csrc/moe/arm/sve_bf16/kernels.S
 
-.PHONY: all check clean
+.PHONY: all check check-m12-streaming-b check-m12-kblock check-msmall-kblock clean
 
 all: $(TARGETS)
 
@@ -45,6 +50,12 @@ bench_fragmented_route_pipeline: $(FRAGMENTED_ROUTE_SOURCES) $(FEATURES)/unfused
 bench_route_merge_tree: $(ROUTE_MERGE_SOURCES) $(ROOT)/csrc/moe/common/route_merge.h
 	$(CXX) $(CXXFLAGS) $(ROUTE_MERGE_SOURCES) $(LDFLAGS) -o $@
 
+bench_m12_streaming_b: $(M12_STREAMING_B_SOURCES) $(I8GEMM)/gemm_params.h
+	$(CXX) $(CXXFLAGS) $(M12_STREAMING_B_SOURCES) $(LDFLAGS) -o $@
+
+bench_msmall_kblock: $(MSMALL_KBLOCK_SOURCES) $(I8GEMM)/gemm_params.h
+	$(CXX) $(CXXFLAGS) $(MSMALL_KBLOCK_SOURCES) $(LDFLAGS) -o $@
+
 check: $(TARGETS)
 	./bench_elastic_nsplit --stage w13 --m 120 --k 64 --n 64 --threads 4 \
 		--low-threads 2 --epoch-rows 24 --copies 1 --check
@@ -66,5 +77,21 @@ check: $(TARGETS)
 			--warmup 1 --runs 2 --source both --check || exit 1; \
 	done
 
+check-m12-streaming-b: bench_m12_streaming_b
+	./bench_m12_streaming_b --k 64 --n 64 --cpu 0 --check-only
+
+check-m12-kblock: bench_m12_streaming_b
+	./bench_m12_streaming_b --shape all --cpu 0 --check-only
+
+check-msmall-kblock: bench_msmall_kblock
+	for kc in 64 88 128 248 256; do \
+		./bench_msmall_kblock --m all --k 256 --n 64 --k-block $$kc \
+			--cpu 0 --check-only || exit 1; \
+	done
+	./bench_msmall_kblock --m all --k 512 --n 4096 --k-block 256 \
+		--cpu 0 --check-only
+	./bench_msmall_kblock --m all --k 512 --n 4096 --k-block 512 \
+		--cpu 0 --check-only
+
 clean:
-	rm -f $(TARGETS)
+	rm -f $(TARGETS) $(EXPERIMENTAL_TARGETS)

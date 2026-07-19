@@ -298,6 +298,112 @@ features:
       --m 120 --k 4096 --cpu 48 --numa-node 0
       --warmup 2 --runs 7 --cold-tail-mib 192
 
+  - id: load.m12_streaming_b
+    part: load
+    status: experimental
+    implementation: >-
+      optimizations/fused_moe_sve/benchmarks/
+      m12_streaming_b_kernels.S and bench_m12_streaming_b.cpp
+    hypothesis: >-
+      For a cold M12 packed-B stream whose packed-A panel is larger than L1,
+      one PLDL1STRM hint roughly 2 KiB ahead can overlap B latency with the
+      unchanged BFMMLA body. A small-K W2 shape keeps packed A in L1 and must
+      use an L2-only hint, if any, to avoid displacing A.
+    depends_on: []
+    conflicts_with: []
+    correctness: >-
+      make -C optimizations/fused_moe_sve/benchmarks
+      check-m12-streaming-b
+    benchmark: >-
+      python3 optimizations/fused_moe_sve/benchmarks/
+      run_m12_streaming_b.py
+      --shape all --cpu 48 --numa-node 0
+      --warmup 5 --runs 31 --cold-tail-mib 192
+
+  - id: compute.m12_kblock_a_reuse
+    part: compute
+    status: experimental
+    implementation: >-
+      optimizations/fused_moe_sve/benchmarks/
+      m12_streaming_b_kernels.S and bench_m12_streaming_b.cpp
+    hypothesis: >-
+      Interchanging the M12 loops to Kchunk, Ntile, K4 can retain one packed-A
+      K slice in private L1 while preserving FP32 accumulation across chunks.
+      The packed-B layout must also become Kchunk-major/Ntile-minor so the
+      compulsory cold-weight traffic remains a contiguous stream. The reusable
+      A+B window should target roughly half of private L1D, giving
+      Kc ~= L1D_bytes / (4 * (M + n_tile)), then be adjusted to avoid a tiny
+      final K chunk.
+    depends_on: []
+    conflicts_with: []
+    correctness: >-
+      make -C optimizations/fused_moe_sve/benchmarks
+      check-m12-kblock
+    benchmark: >-
+      python3 optimizations/fused_moe_sve/benchmarks/
+      run_m12_streaming_b.py
+      --shape w13
+      --variants kblock_packed_800
+      --cpu 48 --numa-node 0 --warmup 5 --runs 51 --repeat 7
+      --cold-tail-mib 192 --unique-scratch --prewarm-a
+
+  - id: compute.msmall_kblock_a_reuse
+    part: compute
+    status: experimental
+    implementation: >-
+      optimizations/fused_moe_sve/benchmarks/
+      msmall_kblock_kernels.S and bench_msmall_kblock.cpp
+    hypothesis: >-
+      The M12 half-L1 Kc rule must use the physical packed-A cache-line
+      footprint for M8/M4/M2/M1. Because every small-M K4 block has a 64-byte
+      A stride, their common half-L1 capacity ceiling is Kc ~= 1024 at SVE128.
+      This ceiling is an approximate optimum only while A residency remains a
+      material bottleneck; cold-B latency can create a broad lower-Kc plateau
+      for M4/M2/M1.
+    depends_on:
+      - compute.m12_kblock_a_reuse
+    conflicts_with: []
+    correctness: >-
+      make -C optimizations/fused_moe_sve/benchmarks
+      check-msmall-kblock
+    benchmark: >-
+      for m in 8 4 2 1; do python3
+      optimizations/fused_moe_sve/benchmarks/run_msmall_kblock.py
+      --m $m --variants baseline,kblock
+      --k-blocks 384,512,640,704,768,832,896,960,1024
+      --cpu 48 --numa-node 0 --warmup 5 --runs 51 --repeat 5
+      --cold-tail-mib 192 --unique-scratch --prewarm-a || exit 1; done
+
+  - id: compute.production_kblock_a_reuse
+    part: compute
+    status: enabled
+    implementation: >-
+      csrc/moe/arm/sve_bf16/kernels.S,
+      csrc/moe/arm/sve_bf16/packing.cpp, and
+      csrc/moe/arm/common/fused_moe_bf16_tiled.cpp
+    hypothesis: >-
+      Packing B as Kchunk-major/Ntile-minor and keeping one common Kc for
+      M12/M8/M4/M2 lets a reusable packed-A slice remain in private L1. The
+      cross-machine maximin selector reserves 49 percent of detected L1D for
+      one physical M12 A+B tile, giving Kc=800 at SVE128 and Kc=568 at SVE256.
+      This is an isolated-kernel optimization: a saturated cold-expert wave
+      can remain memory bound and lose to one K chunk because FP32 partial-C
+      traffic is then pure overhead.
+    depends_on:
+      - compute.m12_kblock_a_reuse
+      - compute.msmall_kblock_a_reuse
+    conflicts_with: []
+    correctness: >-
+      pytest -q tests/test_fused_moe_bf16_tiled.py
+      tests/test_moe_backend_dispatch.py
+      -k 'sve_kc_path or sve or backend'
+    benchmark: >-
+      env -u FUSED_CPP_MOE_SVE_KC PYTHONPATH=src python3
+      optimizations/fused_moe_sve/benchmarks/bench_weight_windows.py
+      --experts 24 --routes 2040 --hidden 4096 --intermediate 512
+      --threads-per-expert 4 --cpu-start 0 --window-mib 0
+      --warmup 5 --runs 15
+
   - id: measurement.thread_weight_working_set
     part: measurement
     status: diagnostic
@@ -362,6 +468,22 @@ variants:
   - id: sve_static_nsplit
     features: []
     entrypoint: elastic::Executor::run_static
+    status: reference
+
+  - id: sve_production_kc
+    features:
+      - compute.production_kblock_a_reuse
+    entrypoint: >-
+      fused_moe_bf16_tiled_{sync,scheduled,async,vllm_staged}
+      (49 percent L1D Kc selector)
+    status: enabled
+
+  - id: sve_production_one_kchunk
+    features:
+      - compute.production_kblock_a_reuse
+    entrypoint: >-
+      FUSED_CPP_MOE_SVE_KC=1048576
+      fused_moe_bf16_tiled_{sync,scheduled,async,vllm_staged}
     status: reference
 
   - id: sve_epoch_fixed_nsplit
@@ -513,6 +635,30 @@ variants:
       - measurement.single_core_unique_weight_window
     entrypoint: moe_sve_w2_packed_bf16_m12
     status: diagnostic
+
+  - id: sve_m12_streaming_b_probe
+    features:
+      - load.m12_streaming_b
+    entrypoint: >-
+      bench_m12_streaming_b
+      (standalone only; no production dispatch)
+    status: experimental
+
+  - id: sve_m12_kblock_probe
+    features:
+      - compute.m12_kblock_a_reuse
+    entrypoint: >-
+      bench_m12_streaming_b kblock_packed variants
+      (standalone only; no production dispatch)
+    status: experimental
+
+  - id: sve_msmall_kblock_probe
+    features:
+      - compute.msmall_kblock_a_reuse
+    entrypoint: >-
+      bench_msmall_kblock dynamic Kc entries
+      (standalone only; no production dispatch)
+    status: experimental
 
   - id: sve_fixed_active_b_fragmented_routes
     features:

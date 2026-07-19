@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from fused_cpp.moe import bf16_tiled
+from fused_cpp.moe import fused_moe_naive
 
 
 def test_available_backends_match_support_flag() -> None:
@@ -99,9 +100,23 @@ def test_sve_environment_override_forces_neon(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setenv("FUSED_CPP_MOE_SVE", "0")
     assert bf16_tiled.available_fused_moe_bf16_tiled_backends() == ("arm_neon_bf16",)
 
-    w13 = torch.randn((1, 32, 16), dtype=torch.bfloat16)
-    w2 = torch.randn((1, 16, 16), dtype=torch.bfloat16)
+    generator = torch.Generator().manual_seed(20260718)
+    hidden = torch.empty((3, 16), dtype=torch.bfloat16).normal_(0.0, 0.01, generator=generator)
+    w13 = torch.empty((1, 32, 16), dtype=torch.bfloat16).normal_(0.0, 0.01, generator=generator)
+    w2 = torch.empty((1, 16, 16), dtype=torch.bfloat16).normal_(0.0, 0.01, generator=generator)
     packed = bf16_tiled.prepare_fused_moe_bf16_tiled_weights(w13, w2, fuse_silu=True)
 
     assert packed.gemm_backend == 0
     assert packed.backend_name == "arm_neon_bf16"
+
+    topk_ids = torch.zeros((3, 1), dtype=torch.int32)
+    topk_weights = torch.ones((3, 1), dtype=torch.float32)
+    candidate = bf16_tiled.fused_moe_bf16_tiled(
+        hidden,
+        packed,
+        topk_weights,
+        topk_ids,
+        num_threads=1,
+    )
+    reference = fused_moe_naive(hidden.float(), w13.float(), w2.float(), topk_weights, topk_ids).to(torch.bfloat16)
+    torch.testing.assert_close(candidate.float(), reference.float(), atol=2.0e-3, rtol=2.0e-2)

@@ -7,6 +7,7 @@
 #include <cerrno>
 #include <cmath>
 #include <condition_variable>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
@@ -188,6 +189,12 @@ void moe_sve_w2_packed_bf16_m12(const uint16_t*, const uint16_t*, uint16_t*, uin
 void moe_sve_w2_packed_bf16_m4(const uint16_t*, const uint16_t*, uint16_t*, uint16_t*, const gemm_params_t*);
 void moe_sve_w2_packed_bf16_m2(const uint16_t*, const uint16_t*, uint16_t*, uint16_t*, const gemm_params_t*);
 void moe_sve_w2_packed_bf16_m1(const uint16_t*, const uint16_t*, uint16_t*, uint16_t*, const gemm_params_t*);
+// Production Kc kernels use an extended gemm_params_t payload and one
+// canonical pointer ABI for every final epilogue.
+void moe_sve_kc_kernel_m12(const uint16_t*, const uint16_t*, void*, const void*, const gemm_params_t*);
+void moe_sve_kc_kernel_m8(const uint16_t*, const uint16_t*, void*, const void*, const gemm_params_t*);
+void moe_sve_kc_kernel_m4(const uint16_t*, const uint16_t*, void*, const void*, const gemm_params_t*);
+void moe_sve_kc_kernel_m2(const uint16_t*, const uint16_t*, void*, const void*, const gemm_params_t*);
 #endif
 // M-tail (m=1/2/4) fused silu kernels.
 void bf16gemm_k_ld_silu_poly4_m1(const uint16_t*, const uint16_t*, uint16_t*, uint16_t*, const gemm_params_t*);
@@ -1007,76 +1014,95 @@ bool sve_w13_silu_minimax3_enabled() {
 }
 
 #if defined(FUSED_CPP_MOE_HAS_ARM_SVE)
-FusedSiluKernelSet sve_asm_fused_silu_packc_set_for_degree(int64_t degree) {
+using SveKcKernelFn = void (*)(const uint16_t*, const uint16_t*, void*, const void*, const gemm_params_t*);
+
+struct SveKcFusedSiluKernelSet {
+  SveKcKernelFn m8 = nullptr;
+  SveKcKernelFn m4 = nullptr;
+  SveKcKernelFn m2 = nullptr;
+  SveKcKernelFn m1 = nullptr;
+  SveKcKernelFn m12 = nullptr;
+  int mode = 0;
+  int m12_mode = 0;
+};
+
+struct alignas(8) SveKBlockParams {
+  gemm_params_t gemm;
+  int32_t kc = 0;
+  int32_t packed_n = 0;
+  int32_t n_begin = 0;
+  int32_t mode = 0;
+  float* partial_c = nullptr;
+};
+
+static_assert(sizeof(gemm_params_t) == 24, "unexpected gemm_params_t ABI");
+static_assert(offsetof(SveKBlockParams, kc) == 24, "unexpected SVE Kc params ABI");
+static_assert(offsetof(SveKBlockParams, packed_n) == 28, "unexpected SVE packed-N params ABI");
+static_assert(offsetof(SveKBlockParams, n_begin) == 32, "unexpected SVE N-begin params ABI");
+static_assert(offsetof(SveKBlockParams, mode) == 36, "unexpected SVE mode params ABI");
+static_assert(offsetof(SveKBlockParams, partial_c) == 40, "unexpected SVE partial-C params ABI");
+
+thread_local std::vector<float> sve_kblock_partial_c;
+
+SveKBlockParams make_sve_kblock_params(int m, int K, int N, int ldc, int packed_n, int n_begin, int mode) {
+  TORCH_CHECK(m > 0 && K > 0 && N > 0 && ldc > 0, "invalid SVE Kc GEMM dimensions");
+  TORCH_CHECK(packed_n >= N && n_begin >= 0 && n_begin + N <= packed_n,
+              "invalid SVE Kc packed-N slice: packed_n=", packed_n, " begin=", n_begin, " size=", N);
+  TORCH_CHECK(n_begin % ::fused_cpp::moe_sve::n_tile() == 0,
+              "SVE Kc N slice must start on an N tile: begin=", n_begin);
+  TORCH_CHECK(static_cast<uint64_t>(N) <= std::numeric_limits<size_t>::max() / 12,
+              "SVE Kc partial-C size overflow");
+  const size_t partial_elements = static_cast<size_t>(12) * static_cast<size_t>(N);
+  if (sve_kblock_partial_c.size() < partial_elements) {
+    sve_kblock_partial_c.resize(partial_elements);
+  }
+  SveKBlockParams params;
+  params.gemm.m = m;
+  params.gemm.k = K;
+  params.gemm.n = N;
+  params.gemm.lda = K;
+  params.gemm.ldb = K;
+  params.gemm.ldc = ldc;
+  params.kc = ::fused_cpp::moe_sve::k_block(K);
+  params.packed_n = packed_n;
+  params.n_begin = n_begin;
+  params.mode = mode;
+  params.partial_c = sve_kblock_partial_c.data();
+  return params;
+}
+
+SveKcFusedSiluKernelSet sve_asm_fused_silu_packc_set_for_degree(int64_t degree) {
+  const SveKcKernelFn m12 = moe_sve_kc_kernel_m12;
+  const SveKcKernelFn m8 = moe_sve_kc_kernel_m8;
+  const SveKcKernelFn m4 = moe_sve_kc_kernel_m4;
+  const SveKcKernelFn m2 = moe_sve_kc_kernel_m2;
   if (sve_w13_skip_silu_enabled()) {
-    return {moe_sve_w13_identity_packc,    moe_sve_w13_identity_packc_m4,  moe_sve_w13_identity_packc_m2,
-            moe_sve_w13_identity_packc_m1, moe_sve_w13_identity_packc_m12, moe_sve_w13_identity_packc_m12_rows};
+    return {m8, m4, m2, m2, m12, 1, 1};
   }
   const bool use_m12_opt = sve_w13_m12_epilogue_opt_enabled();
   const bool use_minimax3 = use_m12_opt && degree == 5 && sve_w13_silu_minimax3_enabled();
   const int recip_nr_steps = sve_w13_silu_recip_nr_steps();
-  const auto select_m12 = [use_m12_opt, recip_nr_steps](FusedSiluKernelFn legacy, FusedSiluKernelFn exact,
-                                                        FusedSiluKernelFn recip1, FusedSiluKernelFn recip2) {
-    if (!use_m12_opt) {
-      return legacy;
-    }
-    if (recip_nr_steps == 1) {
-      return recip1;
-    }
-    if (recip_nr_steps == 2) {
-      return recip2;
-    }
-    return exact;
-  };
-  switch (degree) {
-    case 4:
-      return {moe_sve_w13_silu_poly4_packc,
-              moe_sve_w13_silu_poly4_packc_m4,
-              moe_sve_w13_silu_poly4_packc_m2,
-              moe_sve_w13_silu_poly4_packc_m1,
-              select_m12(moe_sve_w13_silu_poly4_packc_m12, moe_sve_w13_silu_poly4_packc_m12_opt,
-                         moe_sve_w13_silu_poly4_packc_m12_recip1, moe_sve_w13_silu_poly4_packc_m12_recip2),
-              select_m12(moe_sve_w13_silu_poly4_packc_m12_rows, moe_sve_w13_silu_poly4_packc_m12_rows_opt,
-                         moe_sve_w13_silu_poly4_packc_m12_rows_recip1, moe_sve_w13_silu_poly4_packc_m12_rows_recip2)};
-    case 5:
-      return {
-          moe_sve_w13_silu_poly5_packc,
-          moe_sve_w13_silu_poly5_packc_m4,
-          moe_sve_w13_silu_poly5_packc_m2,
-          moe_sve_w13_silu_poly5_packc_m1,
-          use_minimax3 ? moe_sve_w13_silu_minimax3_packc_m12
-                       : select_m12(moe_sve_w13_silu_poly5_packc_m12, moe_sve_w13_silu_poly5_packc_m12_opt,
-                                    moe_sve_w13_silu_poly5_packc_m12_recip1, moe_sve_w13_silu_poly5_packc_m12_recip2),
-          use_minimax3
-              ? moe_sve_w13_silu_minimax3_packc_m12_rows
-              : select_m12(moe_sve_w13_silu_poly5_packc_m12_rows, moe_sve_w13_silu_poly5_packc_m12_rows_opt,
-                           moe_sve_w13_silu_poly5_packc_m12_rows_recip1, moe_sve_w13_silu_poly5_packc_m12_rows_recip2)};
-    case 6:
-      return {moe_sve_w13_silu_poly6_packc,
-              moe_sve_w13_silu_poly6_packc_m4,
-              moe_sve_w13_silu_poly6_packc_m2,
-              moe_sve_w13_silu_poly6_packc_m1,
-              select_m12(moe_sve_w13_silu_poly6_packc_m12, moe_sve_w13_silu_poly6_packc_m12_opt,
-                         moe_sve_w13_silu_poly6_packc_m12_recip1, moe_sve_w13_silu_poly6_packc_m12_recip2),
-              select_m12(moe_sve_w13_silu_poly6_packc_m12_rows, moe_sve_w13_silu_poly6_packc_m12_rows_opt,
-                         moe_sve_w13_silu_poly6_packc_m12_rows_recip1, moe_sve_w13_silu_poly6_packc_m12_rows_recip2)};
-    default:
-      return {};
+  if (degree < 4 || degree > 6) {
+    return {};
   }
+  int m12_mode = static_cast<int>(degree);
+  if (use_minimax3) {
+    m12_mode = 43;
+  } else if (use_m12_opt) {
+    m12_mode += recip_nr_steps == 1 ? 20 : (recip_nr_steps == 2 ? 30 : 10);
+  }
+  return {m8, m4, m2, m2, m12, static_cast<int>(degree), m12_mode};
 }
 
 void sve_asm_packc_w13_tail_dispatch(const uint16_t* packed_A, const uint16_t* w13_packed, uint16_t* C, int rows, int K,
-                                     int N, int ldc, const FusedSiluKernelSet& ks) {
-  gemm_params_t p;
-  p.k = K;
-  p.n = N;
-  p.lda = K;
-  p.ldb = K;
-  p.ldc = ldc;
+                                     int N, int ldc, int packed_N, int n_begin,
+                                     const SveKcFusedSiluKernelSet& ks) {
+  SveKBlockParams p = make_sve_kblock_params(8, K, N, ldc, packed_N, n_begin, ks.mode);
   const int nb_full = rows / 8;
   for (int mb = 0; mb < nb_full; ++mb) {
-    p.m = 8;
-    ks.m8(packed_A + static_cast<int64_t>(mb) * 8 * K, w13_packed, C + static_cast<int64_t>(mb) * 8 * ldc, nullptr, &p);
+    p.gemm.m = 8;
+    ks.m8(packed_A + static_cast<int64_t>(mb) * 8 * K, w13_packed,
+          C + static_cast<int64_t>(mb) * 8 * ldc, nullptr, &p.gemm);
   }
   const int tail = rows - nb_full * 8;
   if (tail == 0) {
@@ -1084,9 +1110,9 @@ void sve_asm_packc_w13_tail_dispatch(const uint16_t* packed_A, const uint16_t* w
   }
   const uint16_t* At = packed_A + static_cast<int64_t>(nb_full) * 8 * K;
   uint16_t* Ct = C + static_cast<int64_t>(nb_full) * 8 * ldc;
-  auto run = [&](FusedSiluKernelFn fn, int mr, int r0) {
-    p.m = mr;
-    fn(At + static_cast<int64_t>(r0) * 4, w13_packed, Ct + static_cast<int64_t>(r0) * 4, nullptr, &p);
+  auto run = [&](SveKcKernelFn fn, int mr, int r0) {
+    p.gemm.m = mr;
+    fn(At + static_cast<int64_t>(r0) * 4, w13_packed, Ct + static_cast<int64_t>(r0) * 4, nullptr, &p.gemm);
   };
   switch (tail) {
     case 1:
@@ -1110,26 +1136,15 @@ void sve_asm_packc_w13_tail_dispatch(const uint16_t* packed_A, const uint16_t* w
 }
 
 void sve_asm_packc_w13_hybrid_dispatch(const uint16_t* packed_A, const uint16_t* w13_packed, uint16_t* C, int rows,
-                                       int K, int N, int ldc, int n_begin, const FusedSiluKernelSet& ks) {
+                                       int K, int N, int ldc, int packed_N, int n_begin,
+                                       const SveKcFusedSiluKernelSet& ks) {
   TORCH_CHECK(ks.m12 != nullptr, "SVE M12 fused silu kernel is unavailable");
-  gemm_params_t p;
-  p.m = 12;
-  p.k = K;
-  p.n = N;
-  p.lda = K;
-  p.ldb = K;
-  p.ldc = ldc;
+  SveKBlockParams p = make_sve_kblock_params(12, K, N, ldc, packed_N, n_begin, ks.m12_mode);
   const int main_rows = static_cast<int>(sve_m12_main_rows(rows));
   if (main_rows > 0) {
-    if (ks.m12_rows != nullptr) {
-      p.m = main_rows;
-      ks.m12_rows(packed_A, w13_packed, C + static_cast<int64_t>(n_begin) * 6, nullptr, &p);
-    } else {
-      p.m = 12;
-      for (int mb = 0; mb < main_rows; mb += 12) {
-        ks.m12(packed_A + static_cast<int64_t>(mb) * K, w13_packed,
-               C + static_cast<int64_t>(mb) * ldc + static_cast<int64_t>(n_begin) * 6, nullptr, &p);
-      }
+    for (int mb = 0; mb < main_rows; mb += 12) {
+      ks.m12(packed_A + static_cast<int64_t>(mb) * K, w13_packed,
+             C + static_cast<int64_t>(mb) * ldc + static_cast<int64_t>(n_begin) * 6, nullptr, &p.gemm);
     }
   }
   const int tail = rows - main_rows;
@@ -1138,22 +1153,20 @@ void sve_asm_packc_w13_hybrid_dispatch(const uint16_t* packed_A, const uint16_t*
   }
   sve_asm_packc_w13_tail_dispatch(packed_A + static_cast<int64_t>(main_rows) * K, w13_packed,
                                   C + static_cast<int64_t>(main_rows) * ldc + static_cast<int64_t>(n_begin) * 4, tail,
-                                  K, N, ldc, ks);
+                                  K, N, ldc, packed_N, n_begin, ks);
 }
 
 void sve_asm_packed_w2_tail_dispatch(const uint16_t* packed_A, const uint16_t* w2_packed, float* down, int rows, int K,
-                                     int N, int ldc) {
-  gemm_params_t p;
-  p.k = K;
-  p.n = N;
-  p.lda = K;
-  p.ldb = K;
-  p.ldc = ldc;
+                                     int N, int ldc, int packed_N, int n_begin) {
+  SveKBlockParams p = make_sve_kblock_params(8, K, N, ldc, packed_N, n_begin, 0);
+  const SveKcKernelFn k8 = moe_sve_kc_kernel_m8;
+  const SveKcKernelFn k4 = moe_sve_kc_kernel_m4;
+  const SveKcKernelFn k2 = moe_sve_kc_kernel_m2;
   const int nb_full = rows / 8;
   for (int mb = 0; mb < nb_full; ++mb) {
-    p.m = 8;
-    moe_sve_w2_packed(packed_A + static_cast<int64_t>(mb) * 8 * K, w2_packed, down + static_cast<int64_t>(mb) * 8 * ldc,
-                      nullptr, &p);
+    p.gemm.m = 8;
+    k8(packed_A + static_cast<int64_t>(mb) * 8 * K, w2_packed, down + static_cast<int64_t>(mb) * 8 * ldc,
+       nullptr, &p.gemm);
   }
   const int tail = rows - nb_full * 8;
   if (tail == 0) {
@@ -1161,69 +1174,60 @@ void sve_asm_packed_w2_tail_dispatch(const uint16_t* packed_A, const uint16_t* w
   }
   const uint16_t* At = packed_A + static_cast<int64_t>(nb_full) * 8 * K;
   float* Dt = down + static_cast<int64_t>(nb_full) * 8 * ldc;
-  auto run = [&](PlainPackedKernelFn fn, int mr, int r0) {
-    p.m = mr;
-    fn(At + static_cast<int64_t>(r0) * 4, w2_packed, Dt + static_cast<int64_t>(r0) * ldc, nullptr, &p);
+  auto run = [&](SveKcKernelFn fn, int mr, int r0) {
+    p.gemm.m = mr;
+    fn(At + static_cast<int64_t>(r0) * 4, w2_packed, Dt + static_cast<int64_t>(r0) * ldc, nullptr, &p.gemm);
   };
   switch (tail) {
     case 1:
-      run(moe_sve_w2_packed_m1, 1, 0);
+      run(k2, 1, 0);
       break;
     case 2:
-      run(moe_sve_w2_packed_m2, 2, 0);
+      run(k2, 2, 0);
       break;
     case 3:
-      run(moe_sve_w2_packed_m4, 4, 0);
+      run(k4, 4, 0);
       break;
     case 4:
-      run(moe_sve_w2_packed_m4, 4, 0);
+      run(k4, 4, 0);
       break;
     case 5:
     case 6:
     case 7:
-      run(moe_sve_w2_packed, 8, 0);
+      run(k8, 8, 0);
       break;
   }
 }
 
 void sve_asm_packed_w2_hybrid_dispatch(const uint16_t* packed_A, const uint16_t* w2_packed, float* down, int rows,
-                                       int K, int N, int ldc) {
-  gemm_params_t p;
-  p.m = 12;
-  p.k = K;
-  p.n = N;
-  p.lda = K;
-  p.ldb = K;
-  p.ldc = ldc;
+                                       int K, int N, int ldc, int packed_N, int n_begin) {
+  SveKBlockParams p = make_sve_kblock_params(12, K, N, ldc, packed_N, n_begin, 0);
+  const SveKcKernelFn k12 = moe_sve_kc_kernel_m12;
   const int main_rows = static_cast<int>(sve_m12_main_rows(rows));
   for (int mb = 0; mb < main_rows; mb += 12) {
-    moe_sve_w2_packed_m12(packed_A + static_cast<int64_t>(mb) * K, w2_packed, down + static_cast<int64_t>(mb) * ldc,
-                          nullptr, &p);
+    k12(packed_A + static_cast<int64_t>(mb) * K, w2_packed, down + static_cast<int64_t>(mb) * ldc, nullptr,
+        &p.gemm);
   }
   const int tail = rows - main_rows;
   if (tail <= 0) {
     return;
   }
   sve_asm_packed_w2_tail_dispatch(packed_A + static_cast<int64_t>(main_rows) * K, w2_packed,
-                                  down + static_cast<int64_t>(main_rows) * ldc, tail, K, N, ldc);
+                                  down + static_cast<int64_t>(main_rows) * ldc, tail, K, N, ldc, packed_N, n_begin);
 }
 
-using DirectRoutePackedKernelFn = void (*)(const uint16_t*, const uint16_t*, float*, const int64_t*,
-                                           const gemm_params_t*);
-
 void sve_asm_packed_w2_direct_route_tail_dispatch(const uint16_t* packed_A, const uint16_t* w2_packed, float* route_out,
-                                                  const int64_t* route_ids, int rows, int K, int N, int route_stride) {
-  gemm_params_t p;
-  p.k = K;
-  p.n = N;
-  p.lda = K;
-  p.ldb = K;
-  p.ldc = route_stride;
+                                                  const int64_t* route_ids, int rows, int K, int N, int route_stride,
+                                                  int packed_N, int n_begin) {
+  SveKBlockParams p = make_sve_kblock_params(8, K, N, route_stride, packed_N, n_begin, 3);
+  const SveKcKernelFn k8 = moe_sve_kc_kernel_m8;
+  const SveKcKernelFn k4 = moe_sve_kc_kernel_m4;
+  const SveKcKernelFn k2 = moe_sve_kc_kernel_m2;
   const int nb_full = rows / 8;
   for (int mb = 0; mb < nb_full; ++mb) {
-    p.m = 8;
-    moe_sve_w2_packed_direct(packed_A + static_cast<int64_t>(mb) * 8 * K, w2_packed, route_out,
-                             route_ids + static_cast<int64_t>(mb) * 8, &p);
+    p.gemm.m = 8;
+    k8(packed_A + static_cast<int64_t>(mb) * 8 * K, w2_packed, route_out,
+       route_ids + static_cast<int64_t>(mb) * 8, &p.gemm);
   }
   const int tail = rows - nb_full * 8;
   if (tail == 0) {
@@ -1231,68 +1235,59 @@ void sve_asm_packed_w2_direct_route_tail_dispatch(const uint16_t* packed_A, cons
   }
   const uint16_t* At = packed_A + static_cast<int64_t>(nb_full) * 8 * K;
   const int64_t* routes = route_ids + static_cast<int64_t>(nb_full) * 8;
-  auto run = [&](DirectRoutePackedKernelFn fn) {
-    p.m = tail;
-    fn(At, w2_packed, route_out, routes, &p);
+  auto run = [&](SveKcKernelFn fn) {
+    p.gemm.m = tail;
+    fn(At, w2_packed, route_out, routes, &p.gemm);
   };
   switch (tail) {
     case 1:
-      run(moe_sve_w2_packed_direct_m1);
+      run(k2);
       break;
     case 2:
-      run(moe_sve_w2_packed_direct_m2);
+      run(k2);
       break;
     case 3:
     case 4:
-      run(moe_sve_w2_packed_direct_m4);
+      run(k4);
       break;
     case 5:
     case 6:
     case 7:
-      run(moe_sve_w2_packed_direct);
+      run(k8);
       break;
   }
 }
 
 void sve_asm_packed_w2_direct_route_hybrid_dispatch(const uint16_t* packed_A, const uint16_t* w2_packed,
                                                     float* route_out, const int64_t* route_ids, int rows, int K, int N,
-                                                    int route_stride) {
-  gemm_params_t p;
-  p.k = K;
-  p.n = N;
-  p.lda = K;
-  p.ldb = K;
-  p.ldc = route_stride;
+                                                    int route_stride, int packed_N, int n_begin) {
+  SveKBlockParams p = make_sve_kblock_params(12, K, N, route_stride, packed_N, n_begin, 3);
+  const SveKcKernelFn k12 = moe_sve_kc_kernel_m12;
   const int main_rows = static_cast<int>(sve_m12_main_rows(rows));
   for (int mb = 0; mb < main_rows; mb += 12) {
-    p.m = std::min(12, rows - mb);
-    moe_sve_w2_packed_direct_m12(packed_A + static_cast<int64_t>(mb) * K, w2_packed, route_out, route_ids + mb, &p);
+    p.gemm.m = std::min(12, rows - mb);
+    k12(packed_A + static_cast<int64_t>(mb) * K, w2_packed, route_out, route_ids + mb, &p.gemm);
   }
   const int tail = rows - main_rows;
   if (tail <= 0) {
     return;
   }
   sve_asm_packed_w2_direct_route_tail_dispatch(packed_A + static_cast<int64_t>(main_rows) * K, w2_packed, route_out,
-                                               route_ids + main_rows, tail, K, N, route_stride);
+                                               route_ids + main_rows, tail, K, N, route_stride, packed_N, n_begin);
 }
-
-using DirectRoutePackedBf16KernelFn = void (*)(const uint16_t*, const uint16_t*, uint16_t*, const int64_t*,
-                                               const gemm_params_t*);
 
 void sve_asm_packed_w2_direct_bf16_route_tail_dispatch(const uint16_t* packed_A, const uint16_t* w2_packed,
                                                        uint16_t* route_out, const int64_t* route_ids, int rows, int K,
-                                                       int N, int route_stride) {
-  gemm_params_t p;
-  p.k = K;
-  p.n = N;
-  p.lda = K;
-  p.ldb = K;
-  p.ldc = route_stride;
+                                                       int N, int route_stride, int packed_N, int n_begin) {
+  SveKBlockParams p = make_sve_kblock_params(8, K, N, route_stride, packed_N, n_begin, 44);
+  const SveKcKernelFn k8 = moe_sve_kc_kernel_m8;
+  const SveKcKernelFn k4 = moe_sve_kc_kernel_m4;
+  const SveKcKernelFn k2 = moe_sve_kc_kernel_m2;
   const int nb_full = rows / 8;
   for (int mb = 0; mb < nb_full; ++mb) {
-    p.m = 8;
-    moe_sve_w2_packed_direct_bf16(packed_A + static_cast<int64_t>(mb) * 8 * K, w2_packed, route_out,
-                                  route_ids + static_cast<int64_t>(mb) * 8, &p);
+    p.gemm.m = 8;
+    k8(packed_A + static_cast<int64_t>(mb) * 8 * K, w2_packed, route_out,
+       route_ids + static_cast<int64_t>(mb) * 8, &p.gemm);
   }
   const int tail = rows - nb_full * 8;
   if (tail == 0) {
@@ -1300,43 +1295,38 @@ void sve_asm_packed_w2_direct_bf16_route_tail_dispatch(const uint16_t* packed_A,
   }
   const uint16_t* At = packed_A + static_cast<int64_t>(nb_full) * 8 * K;
   const int64_t* routes = route_ids + static_cast<int64_t>(nb_full) * 8;
-  auto run = [&](DirectRoutePackedBf16KernelFn fn) {
-    p.m = tail;
-    fn(At, w2_packed, route_out, routes, &p);
+  auto run = [&](SveKcKernelFn fn) {
+    p.gemm.m = tail;
+    fn(At, w2_packed, route_out, routes, &p.gemm);
   };
   switch (tail) {
     case 1:
-      run(moe_sve_w2_packed_direct_bf16_m1);
+      run(k2);
       break;
     case 2:
-      run(moe_sve_w2_packed_direct_bf16_m2);
+      run(k2);
       break;
     case 3:
     case 4:
-      run(moe_sve_w2_packed_direct_bf16_m4);
+      run(k4);
       break;
     case 5:
     case 6:
     case 7:
-      run(moe_sve_w2_packed_direct_bf16);
+      run(k8);
       break;
   }
 }
 
 void sve_asm_packed_w2_direct_bf16_route_hybrid_dispatch(const uint16_t* packed_A, const uint16_t* w2_packed,
                                                          uint16_t* route_out, const int64_t* route_ids, int rows, int K,
-                                                         int N, int route_stride) {
-  gemm_params_t p;
-  p.k = K;
-  p.n = N;
-  p.lda = K;
-  p.ldb = K;
-  p.ldc = route_stride;
+                                                         int N, int route_stride, int packed_N, int n_begin) {
+  SveKBlockParams p = make_sve_kblock_params(12, K, N, route_stride, packed_N, n_begin, 44);
+  const SveKcKernelFn k12 = moe_sve_kc_kernel_m12;
   const int main_rows = static_cast<int>(sve_m12_main_rows(rows));
   for (int mb = 0; mb < main_rows; mb += 12) {
-    p.m = std::min(12, rows - mb);
-    moe_sve_w2_packed_direct_bf16_m12(packed_A + static_cast<int64_t>(mb) * K, w2_packed, route_out,
-                                      route_ids + mb, &p);
+    p.gemm.m = std::min(12, rows - mb);
+    k12(packed_A + static_cast<int64_t>(mb) * K, w2_packed, route_out, route_ids + mb, &p.gemm);
   }
   const int tail = rows - main_rows;
   if (tail <= 0) {
@@ -1344,24 +1334,20 @@ void sve_asm_packed_w2_direct_bf16_route_hybrid_dispatch(const uint16_t* packed_
   }
   sve_asm_packed_w2_direct_bf16_route_tail_dispatch(
       packed_A + static_cast<int64_t>(main_rows) * K, w2_packed, route_out, route_ids + main_rows, tail, K, N,
-      route_stride);
+      route_stride, packed_N, n_begin);
 }
 
-using PlainPackedBf16KernelFn = void (*)(const uint16_t*, const uint16_t*, uint16_t*, uint16_t*, const gemm_params_t*);
-
 void sve_asm_packed_w2_bf16_tail_dispatch(const uint16_t* packed_A, const uint16_t* w2_packed, uint16_t* down, int rows,
-                                          int K, int N, int ldc) {
-  gemm_params_t p;
-  p.k = K;
-  p.n = N;
-  p.lda = K;
-  p.ldb = K;
-  p.ldc = ldc;
+                                          int K, int N, int ldc, int packed_N, int n_begin) {
+  SveKBlockParams p = make_sve_kblock_params(8, K, N, ldc, packed_N, n_begin, 2);
+  const SveKcKernelFn k8 = moe_sve_kc_kernel_m8;
+  const SveKcKernelFn k4 = moe_sve_kc_kernel_m4;
+  const SveKcKernelFn k2 = moe_sve_kc_kernel_m2;
   const int nb_full = rows / 8;
   for (int mb = 0; mb < nb_full; ++mb) {
-    p.m = 8;
-    moe_sve_w2_packed_bf16(packed_A + static_cast<int64_t>(mb) * 8 * K, w2_packed,
-                           down + static_cast<int64_t>(mb) * 8 * ldc, nullptr, &p);
+    p.gemm.m = 8;
+    k8(packed_A + static_cast<int64_t>(mb) * 8 * K, w2_packed, down + static_cast<int64_t>(mb) * 8 * ldc,
+       nullptr, &p.gemm);
   }
   const int tail = rows - nb_full * 8;
   if (tail == 0) {
@@ -1369,51 +1355,47 @@ void sve_asm_packed_w2_bf16_tail_dispatch(const uint16_t* packed_A, const uint16
   }
   const uint16_t* At = packed_A + static_cast<int64_t>(nb_full) * 8 * K;
   uint16_t* Dt = down + static_cast<int64_t>(nb_full) * 8 * ldc;
-  auto run = [&](PlainPackedBf16KernelFn fn, int mr, int r0) {
-    p.m = mr;
-    fn(At + static_cast<int64_t>(r0) * 4, w2_packed, Dt + static_cast<int64_t>(r0) * ldc, nullptr, &p);
+  auto run = [&](SveKcKernelFn fn, int mr, int r0) {
+    p.gemm.m = mr;
+    fn(At + static_cast<int64_t>(r0) * 4, w2_packed, Dt + static_cast<int64_t>(r0) * ldc, nullptr, &p.gemm);
   };
   switch (tail) {
     case 1:
-      run(moe_sve_w2_packed_bf16_m1, 1, 0);
+      run(k2, 1, 0);
       break;
     case 2:
-      run(moe_sve_w2_packed_bf16_m2, 2, 0);
+      run(k2, 2, 0);
       break;
     case 3:
-      run(moe_sve_w2_packed_bf16_m4, 4, 0);
+      run(k4, 4, 0);
       break;
     case 4:
-      run(moe_sve_w2_packed_bf16_m4, 4, 0);
+      run(k4, 4, 0);
       break;
     case 5:
     case 6:
     case 7:
-      run(moe_sve_w2_packed_bf16, 8, 0);
+      run(k8, 8, 0);
       break;
   }
 }
 
 void sve_asm_packed_w2_bf16_hybrid_dispatch(const uint16_t* packed_A, const uint16_t* w2_packed, uint16_t* down,
-                                            int rows, int K, int N, int ldc) {
-  gemm_params_t p;
-  p.m = 12;
-  p.k = K;
-  p.n = N;
-  p.lda = K;
-  p.ldb = K;
-  p.ldc = ldc;
+                                            int rows, int K, int N, int ldc, int packed_N, int n_begin) {
+  SveKBlockParams p = make_sve_kblock_params(12, K, N, ldc, packed_N, n_begin, 2);
+  const SveKcKernelFn k12 = moe_sve_kc_kernel_m12;
   const int main_rows = static_cast<int>(sve_m12_main_rows(rows));
   for (int mb = 0; mb < main_rows; mb += 12) {
-    moe_sve_w2_packed_bf16_m12(packed_A + static_cast<int64_t>(mb) * K, w2_packed,
-                               down + static_cast<int64_t>(mb) * ldc, nullptr, &p);
+    k12(packed_A + static_cast<int64_t>(mb) * K, w2_packed, down + static_cast<int64_t>(mb) * ldc, nullptr,
+        &p.gemm);
   }
   const int tail = rows - main_rows;
   if (tail <= 0) {
     return;
   }
   sve_asm_packed_w2_bf16_tail_dispatch(packed_A + static_cast<int64_t>(main_rows) * K, w2_packed,
-                                       down + static_cast<int64_t>(main_rows) * ldc, tail, K, N, ldc);
+                                       down + static_cast<int64_t>(main_rows) * ldc, tail, K, N, ldc, packed_N,
+                                       n_begin);
 }
 #endif
 
@@ -2595,7 +2577,7 @@ void team_fused_w13_silu_packed_packc_sve(const TeamContext& team, const uint16_
                                           int64_t n_tile, bool split_w13 = sve_w13_split_n_workset_enabled(),
                                           int64_t weight_window_bytes = 0) {
 #if defined(FUSED_CPP_MOE_HAS_ARM_SVE)
-  const FusedSiluKernelSet ks = sve_asm_fused_silu_packc_set_for_degree(degree);
+  const SveKcFusedSiluKernelSet ks = sve_asm_fused_silu_packc_set_for_degree(degree);
   TORCH_CHECK(ks.m8 != nullptr, "unsupported fused silu exp degree ", degree);
   auto run_n_range = [&](int64_t n_begin, int64_t n_cols) {
     const SplitRange range = n_split_range_tile(n_cols, team.group_size, team.local_tid, n_tile);
@@ -2603,10 +2585,8 @@ void team_fused_w13_silu_packed_packc_sve(const TeamContext& team, const uint16_
       return;
     }
     const int64_t abs_begin = n_begin + range.begin;
-    const int64_t start_block = abs_begin / n_tile;
-    sve_asm_packc_w13_hybrid_dispatch(packed_A, w13_packed + start_block * static_cast<int64_t>(K) * n_tile,
-                                      intermediate, rows, K, static_cast<int>(range.size), ldc,
-                                      static_cast<int>(abs_begin), ks);
+    sve_asm_packc_w13_hybrid_dispatch(packed_A, w13_packed, intermediate, rows, K,
+                                      static_cast<int>(range.size), ldc, N13, static_cast<int>(abs_begin), ks);
   };
   const int64_t half_n = N13 / 2;
   const int64_t legacy_ranges = split_w13 && N13 % 2 == 0 && half_n > 0 && half_n % n_tile == 0 ? 2 : 1;
@@ -2641,12 +2621,10 @@ void vllm_staged_w13_range_sve(const uint16_t* packed_A, const uint16_t* w13_pac
   TORCH_CHECK(n_begin >= 0 && n_cols > 0 && n_begin % n_tile == 0 && n_cols % n_tile == 0,
               "vLLM-staged W13 range must be positive and N-tile aligned: begin=", n_begin, " size=", n_cols,
               " tile=", n_tile);
-  const FusedSiluKernelSet kernels = sve_asm_fused_silu_packc_set_for_degree(degree);
+  const SveKcFusedSiluKernelSet kernels = sve_asm_fused_silu_packc_set_for_degree(degree);
   TORCH_CHECK(kernels.m8 != nullptr, "unsupported fused silu exp degree ", degree);
-  const int64_t start_block = n_begin / n_tile;
-  sve_asm_packc_w13_hybrid_dispatch(
-      packed_A, w13_packed + start_block * static_cast<int64_t>(K) * n_tile, intermediate, rows, K,
-      static_cast<int>(n_cols), ldc, static_cast<int>(n_begin), kernels);
+  sve_asm_packc_w13_hybrid_dispatch(packed_A, w13_packed, intermediate, rows, K, static_cast<int>(n_cols), ldc,
+                                    2 * ldc, static_cast<int>(n_begin), kernels);
 #else
   (void)packed_A;
   (void)w13_packed;
@@ -2668,7 +2646,7 @@ void team_fused_w13_silu_packed_packc_sve_2d(const TeamContext& team, const Gemm
                                              bool split_w13 = sve_w13_split_n_workset_enabled(),
                                              int64_t weight_window_bytes = 0) {
 #if defined(FUSED_CPP_MOE_HAS_ARM_SVE)
-  const FusedSiluKernelSet ks = sve_asm_fused_silu_packc_set_for_degree(degree);
+  const SveKcFusedSiluKernelSet ks = sve_asm_fused_silu_packc_set_for_degree(degree);
   TORCH_CHECK(ks.m8 != nullptr, "unsupported fused silu exp degree ", degree);
   auto run_n_range = [&](int64_t n_begin, int64_t n_cols) {
     Gemm2DSplitPlan subplan = plan;
@@ -2679,11 +2657,9 @@ void team_fused_w13_silu_packed_packc_sve_2d(const TeamContext& team, const Gemm
       return;
     }
     const int64_t abs_begin = n_begin + range.n_begin;
-    const int64_t start_block = abs_begin / plan.n_tile;
     TORCH_CHECK(range.row_begin == 0, "SVE fused expert only supports N-split ranges");
-    sve_asm_packc_w13_hybrid_dispatch(packed_A, w13_packed + start_block * static_cast<int64_t>(K) * plan.n_tile,
-                                      intermediate, static_cast<int>(range.rows), K, static_cast<int>(range.n_cols),
-                                      ldc, static_cast<int>(abs_begin), ks);
+    sve_asm_packc_w13_hybrid_dispatch(packed_A, w13_packed, intermediate, static_cast<int>(range.rows), K,
+                                      static_cast<int>(range.n_cols), ldc, N13, static_cast<int>(abs_begin), ks);
   };
   const int64_t half_n = N13 / 2;
   const int64_t legacy_ranges = split_w13 && N13 % 2 == 0 && half_n > 0 && half_n % plan.n_tile == 0 ? 2 : 1;
@@ -2766,9 +2742,8 @@ void team_w2_packed_sve(const TeamContext& team, const uint16_t* packed_A, const
       return;
     }
     const int64_t abs_begin = window.begin + range.begin;
-    const int64_t start_block = abs_begin / n_tile;
-    sve_asm_packed_w2_hybrid_dispatch(packed_A, w2_packed + start_block * static_cast<int64_t>(K) * n_tile,
-                                      down + abs_begin, rows, K, static_cast<int>(range.size), ldc);
+    sve_asm_packed_w2_hybrid_dispatch(packed_A, w2_packed, down + abs_begin, rows, K,
+                                      static_cast<int>(range.size), ldc, N, static_cast<int>(abs_begin));
   });
 #else
   (void)team;
@@ -2801,11 +2776,9 @@ void team_w2_packed_sve_2d(const TeamContext& team, const Gemm2DSplitPlan& plan,
       return;
     }
     const int64_t abs_begin = window.begin + range.n_begin;
-    const int64_t start_block = abs_begin / plan.n_tile;
     TORCH_CHECK(range.row_begin == 0, "SVE fused expert only supports N-split ranges");
-    sve_asm_packed_w2_hybrid_dispatch(packed_A, w2_packed + start_block * static_cast<int64_t>(K) * plan.n_tile,
-                                      down + abs_begin, static_cast<int>(range.rows), K, static_cast<int>(range.n_cols),
-                                      ldc);
+    sve_asm_packed_w2_hybrid_dispatch(packed_A, w2_packed, down + abs_begin, static_cast<int>(range.rows), K,
+                                      static_cast<int>(range.n_cols), ldc, N, static_cast<int>(abs_begin));
   });
 #else
   (void)team;
@@ -2833,10 +2806,9 @@ void team_w2_packed_sve_direct_route(const TeamContext& team, const uint16_t* pa
       return;
     }
     const int64_t abs_begin = window.begin + range.begin;
-    const int64_t start_block = abs_begin / n_tile;
-    sve_asm_packed_w2_direct_route_hybrid_dispatch(packed_A, w2_packed + start_block * static_cast<int64_t>(K) * n_tile,
-                                                   route_out + abs_begin, route_ids, rows, K,
-                                                   static_cast<int>(range.size), route_stride);
+    sve_asm_packed_w2_direct_route_hybrid_dispatch(packed_A, w2_packed, route_out + abs_begin, route_ids, rows, K,
+                                                   static_cast<int>(range.size), route_stride, N,
+                                                   static_cast<int>(abs_begin));
   });
 #else
   (void)team;
@@ -2870,11 +2842,11 @@ void team_w2_packed_sve_direct_route_2d(const TeamContext& team, const Gemm2DSpl
       return;
     }
     const int64_t abs_begin = window.begin + range.n_begin;
-    const int64_t start_block = abs_begin / plan.n_tile;
     TORCH_CHECK(range.row_begin == 0, "SVE fused expert only supports N-split ranges");
-    sve_asm_packed_w2_direct_route_hybrid_dispatch(
-        packed_A, w2_packed + start_block * static_cast<int64_t>(K) * plan.n_tile, route_out + abs_begin, route_ids,
-        static_cast<int>(range.rows), K, static_cast<int>(range.n_cols), route_stride);
+    sve_asm_packed_w2_direct_route_hybrid_dispatch(packed_A, w2_packed, route_out + abs_begin, route_ids,
+                                                   static_cast<int>(range.rows), K,
+                                                   static_cast<int>(range.n_cols), route_stride, N,
+                                                   static_cast<int>(abs_begin));
   });
 #else
   (void)team;
@@ -2904,10 +2876,9 @@ void team_w2_packed_sve_direct_bf16_route(const TeamContext& team, const uint16_
       return;
     }
     const int64_t abs_begin = window.begin + range.begin;
-    const int64_t start_block = abs_begin / n_tile;
     sve_asm_packed_w2_direct_bf16_route_hybrid_dispatch(
-        packed_A, w2_packed + start_block * static_cast<int64_t>(K) * n_tile, route_out + abs_begin, route_ids, rows, K,
-        static_cast<int>(range.size), route_stride);
+        packed_A, w2_packed, route_out + abs_begin, route_ids, rows, K, static_cast<int>(range.size), route_stride, N,
+        static_cast<int>(abs_begin));
   });
 #else
   (void)team;
@@ -2932,10 +2903,9 @@ void vllm_staged_w2_direct_route_range_sve(const uint16_t* packed_A, const uint1
   TORCH_CHECK(n_begin >= 0 && n_cols > 0 && n_begin % n_tile == 0 && n_cols % n_tile == 0,
               "vLLM-staged W2 range must be positive and N-tile aligned: begin=", n_begin, " size=", n_cols,
               " tile=", n_tile);
-  const int64_t start_block = n_begin / n_tile;
-  sve_asm_packed_w2_direct_route_hybrid_dispatch(
-      packed_A, w2_packed + start_block * static_cast<int64_t>(K) * n_tile, route_out + n_begin, route_ids, rows, K,
-      static_cast<int>(n_cols), route_stride);
+  sve_asm_packed_w2_direct_route_hybrid_dispatch(packed_A, w2_packed, route_out + n_begin, route_ids, rows, K,
+                                                 static_cast<int>(n_cols), route_stride, route_stride,
+                                                 static_cast<int>(n_begin));
 #else
   (void)packed_A;
   (void)w2_packed;
@@ -2958,10 +2928,9 @@ void vllm_staged_w2_direct_bf16_route_range_sve(const uint16_t* packed_A, const 
   TORCH_CHECK(n_begin >= 0 && n_cols > 0 && n_begin % n_tile == 0 && n_cols % n_tile == 0,
               "vLLM-staged W2 BF16 range must be positive and N-tile aligned: begin=", n_begin, " size=", n_cols,
               " tile=", n_tile);
-  const int64_t start_block = n_begin / n_tile;
   sve_asm_packed_w2_direct_bf16_route_hybrid_dispatch(
-      packed_A, w2_packed + start_block * static_cast<int64_t>(K) * n_tile, route_out + n_begin, route_ids, rows, K,
-      static_cast<int>(n_cols), route_stride);
+      packed_A, w2_packed, route_out + n_begin, route_ids, rows, K, static_cast<int>(n_cols), route_stride,
+      route_stride, static_cast<int>(n_begin));
 #else
   (void)packed_A;
   (void)w2_packed;
@@ -2994,11 +2963,10 @@ void team_w2_packed_sve_direct_bf16_route_2d(const TeamContext& team, const Gemm
       return;
     }
     const int64_t abs_begin = window.begin + range.n_begin;
-    const int64_t start_block = abs_begin / plan.n_tile;
     TORCH_CHECK(range.row_begin == 0, "SVE fused expert only supports N-split ranges");
     sve_asm_packed_w2_direct_bf16_route_hybrid_dispatch(
-        packed_A, w2_packed + start_block * static_cast<int64_t>(K) * plan.n_tile, route_out + abs_begin, route_ids,
-        static_cast<int>(range.rows), K, static_cast<int>(range.n_cols), route_stride);
+        packed_A, w2_packed, route_out + abs_begin, route_ids, static_cast<int>(range.rows), K,
+        static_cast<int>(range.n_cols), route_stride, N, static_cast<int>(abs_begin));
   });
 #else
   (void)team;
@@ -3027,9 +2995,8 @@ void team_w2_packed_bf16_sve(const TeamContext& team, const uint16_t* packed_A, 
       return;
     }
     const int64_t abs_begin = window.begin + range.begin;
-    const int64_t start_block = abs_begin / n_tile;
-    sve_asm_packed_w2_bf16_hybrid_dispatch(packed_A, w2_packed + start_block * static_cast<int64_t>(K) * n_tile,
-                                           down + abs_begin, rows, K, static_cast<int>(range.size), ldc);
+    sve_asm_packed_w2_bf16_hybrid_dispatch(packed_A, w2_packed, down + abs_begin, rows, K,
+                                           static_cast<int>(range.size), ldc, N, static_cast<int>(abs_begin));
   });
 #else
   (void)team;
@@ -3062,11 +3029,10 @@ void team_w2_packed_bf16_sve_2d(const TeamContext& team, const Gemm2DSplitPlan& 
       return;
     }
     const int64_t abs_begin = window.begin + range.n_begin;
-    const int64_t start_block = abs_begin / plan.n_tile;
     TORCH_CHECK(range.row_begin == 0, "SVE fused expert only supports N-split ranges");
-    sve_asm_packed_w2_bf16_hybrid_dispatch(packed_A, w2_packed + start_block * static_cast<int64_t>(K) * plan.n_tile,
-                                           down + abs_begin, static_cast<int>(range.rows), K,
-                                           static_cast<int>(range.n_cols), ldc);
+    sve_asm_packed_w2_bf16_hybrid_dispatch(packed_A, w2_packed, down + abs_begin,
+                                           static_cast<int>(range.rows), K, static_cast<int>(range.n_cols), ldc, N,
+                                           static_cast<int>(abs_begin));
   });
 #else
   (void)team;

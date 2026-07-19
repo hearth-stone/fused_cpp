@@ -263,6 +263,185 @@ Inter-invocation packed-B reuse is prohibited by construction. Reuse of the
 same B by the ten M12 panels inside one `M=120` GEMM is intentional: that is
 the behavior used to expose the private-L2 and shared-LLC residency windows.
 
+## M12 streaming-B load experiment
+
+`bench_m12_streaming_b` isolates B-load policy without changing production
+dispatch. Its standalone assembly copies the production M12 BFMMLA body and
+BF16 store epilogue exactly, then provides normal `LD1H`, `LDNT1H`, and
+`PLDL1STRM`/`PLDL2STRM` variants. The production symbol is used only as the
+bit-exact correctness reference. Every timed call consumes a distinct cold
+4 MiB packed-B matrix, and a 4 KiB guard after every copy prevents the final
+software prefetch from touching the next invocation's weight.
+
+Run the complete candidate sweep with:
+
+```bash
+python3 optimizations/fused_moe_sve/benchmarks/run_m12_streaming_b.py \
+  --shape all --cpu 48 --numa-node 0 \
+  --warmup 5 --runs 31 --cold-tail-mib 192
+```
+
+Use `--variants` for an isolated paired comparison, for example:
+
+```bash
+python3 optimizations/fused_moe_sve/benchmarks/run_m12_streaming_b.py \
+  --shape w13 --variants baseline_ld1h,pldl1strm_2048_x1 \
+  --cpu 48 --numa-node 0 --warmup 5 --runs 51
+```
+
+On the 192-core host's first NUMA node, the W13-range shape
+`M=12,K=4096,N=512` improved by a median 9.99% across seven paired processes
+with one `PLDL1STRM` hint 2 KiB ahead. The W2 shape
+`M=12,K=512,N=4096` improved by only 0.73% with one `PLDL2STRM` hint 1 KiB
+ahead. Pulling W2's B stream into L1 was strongly
+negative; this is consistent with displacing its otherwise L1-resident 12 KiB
+packed-A panel. `LDNT1H` had no stable benefit. The result supports a
+W13-like large-K specialization, not a generic M12 load replacement; no
+production path is enabled by this experiment.
+
+Commands and complete measurements are recorded in
+[`results/amazon_192c_m12_streaming_b.md`](results/amazon_192c_m12_streaming_b.md).
+
+## M12 assembly K-block experiment
+
+The same standalone assembly also provides a dense set of fixed Kc variants
+that change the GEMM loop order from `Ntile -> full K` to
+`Kchunk -> Ntile -> K4`. Each N tile's 24 FP32 accumulator vectors are stored
+in an accumulator-native scratch layout between K chunks; the final chunk alone
+runs the production BF16 store epilogue. Storing and reloading FP32 partials is
+bit exact, so all variants match the production M12 result bit for bit.
+
+Two packed-B addressing modes isolate the layout dependency. `kblock_*` keeps
+the then-production Ntile-major layout and therefore starts one short, strided cold
+B stream per `(Kchunk,Ntile)`. `kblock_packed_*` uses a benchmark-only
+Kchunk-major/Ntile-minor pack, making each complete K chunk contiguous while a
+small packed-A K slice is reused across all N tiles. Timed weights are already
+in the selected layout; repacking is not included in GEMM time.
+
+For an isolated fixed Kc, use one variant per process:
+
+```bash
+python3 optimizations/fused_moe_sve/benchmarks/run_m12_streaming_b.py \
+  --shape w13 --variants kblock_packed_800 \
+  --cpu 48 --numa-node 0 --warmup 5 --runs 51 --repeat 7 \
+  --cold-tail-mib 192 --unique-scratch --prewarm-a
+```
+
+On the 192-core host's first NUMA node, the dense `Kc=704..896` sweep for
+W13 `M=12,K=4096,N=512` selected `Kc=800`: isolated throughput increased
+from about 283 to 315 GFLOP/s, or 11.5%. Its active packed-A plus one-N-tile B
+window is 31.25 KiB. This matches the measured first-order rule
+`Kc ~= L1D_bytes / (4 * (M + n_tile))`, which targets half of the 64 KiB L1D
+and predicts Kc near 819. A nearby aligned value must still avoid a tiny final
+K chunk; Kc=816 leaves a 16-deep tail and loses to Kc=800.
+
+That isolated cold-panel gain does not carry through to a long route. With
+`M=2040`, one timed call executes 170 consecutive M12 panels against the same
+4 MiB B range. Baseline and Kc=800 measured 25.5168 and 25.3171 ms respectively,
+only a 0.79% throughput gain. After the first panel, cached B makes the baseline
+fast enough that K-block partial-C traffic cancels most of the A-residency gain.
+
+PMU comparison held L2 refills at roughly 65.9K lines/call, matching the
+compulsory cold 4 MiB B stream, while Kc=800 cut L1 refills from 11.3K to
+5.35K and raised IPC from 4.10 to 4.63. Keeping the production B layout was
+negative, demonstrating that loop interchange and weight packing must be
+changed together. Run each Kc in a separate process for absolute timing:
+interleaving variants measurably changes cache/prefetch state. The result is
+the measurement basis for the production integration described below.
+
+Implementation details and the complete measurements are recorded in
+[`results/amazon_192c_m12_kblock.md`](results/amazon_192c_m12_kblock.md).
+
+## Small-M assembly K-block experiment
+
+`bench_msmall_kblock` extends the standalone Kchunk-major experiment to the
+production M8/M4/M2/M1 compute bodies. Kc is dynamic, while each height keeps
+its production BFMMLA pipeline and BF16 store. M1 follows production by using
+the M2 body with its second row predicated away. Multiple K-tail shapes match
+the corresponding production kernels bit for bit.
+
+The M12 footprint formula needs a physical-layout correction. Every small-M
+packed-A K4 block has a 64-byte stride. M4 and M2/M1 load only part of that
+line, but the complete line occupies L1, so all four heights have:
+
+```text
+W_tile(Kc) = (16 A bytes/K + 16 B bytes/K) * Kc
+Kc_half_L1 = (64 KiB / 2) / 32 = 1024
+```
+
+The measured result qualifies the original rule. M8 is capacity-sensitive:
+Kc=896-960 uses a 28-30 KiB A+B window and improves by about 11.7%, while
+Kc=1024 reaches 32 KiB and falls to about 8.0%. M4 has a broad Kc=384-768
+plateau at roughly +7.3%. M2/M1 are cold-B-latency dominated and remain near
++8.4% over Kc=16-704; capacity no longer identifies one optimum.
+
+PMU counts keep L2 refill fixed near 65.8K lines, matching the compulsory 4 MiB
+B stream. M8 gains by reducing L1 refills from 16.0K to 4.3K. M2/M1 retain
+near-B-sized L1 refill counts and much higher memory-stall exposure, so K
+splitting mainly changes request scheduling and uses otherwise idle issue
+slots. The half-L1 formula is therefore a physical capacity ceiling and an
+approximate optimum only for sufficiently compute-heavy kernels.
+
+```bash
+for m in 8 4 2 1; do
+  python3 optimizations/fused_moe_sve/benchmarks/run_msmall_kblock.py \
+    --m "$m" --variants baseline,kblock \
+    --k-blocks 384,512,640,704,768,832,896,960,1024 \
+    --warmup 5 --runs 51 --repeat 5 --cpu 48 --numa-node 0 \
+    --cold-tail-mib 192 --unique-scratch --prewarm-a
+done
+```
+
+Implementation details, dense sweeps, cache-color controls, and PMU results are
+recorded in
+[`results/amazon_192c_msmall_kblock.md`](results/amazon_192c_msmall_kblock.md).
+The benchmark entries remain standalone; production uses separate generic-Kc
+symbols for M12/M8/M4/M2, with M1 predicated through M2.
+
+## Production Kc path
+
+The production SVE backend now packs B as `Kchunk -> Ntile -> K4` and dispatches
+W13 and W2 through `moe_sve_kc_kernel_m12/m8/m4/m2`. This applies to normal,
+2D, scheduled, async, and vLLM-staged execution, including direct FP32/BF16
+route stores. The final K chunk alone runs SiLU or the selected W2 epilogue;
+earlier chunks preserve FP32 accumulators in thread-private scratch. NEON and
+the legacy SVE symbols remain compiled, but only NEON is the runtime fallback;
+the legacy SVE symbols are standalone controls and are not fed production Kc
+packed weights.
+
+One Kc is used by every Mr because a prepared weight has one physical layout:
+
+```text
+bytes_per_K = 2 * (12 + n_tile)
+Kc = align_down_8(min(K, 0.49 * L1D_bytes / bytes_per_K))
+```
+
+L1D is read with `_SC_LEVEL1_DCACHE_SIZE`, with a 64 KiB fallback. The 49%
+fraction was selected by maximizing the worst result across M1/M2/M4/M8/M12
+on both measured machines. It maps to Kc=800 on the SVE128 192-core host and
+Kc=568 on the SVE256 8-core host. `FUSED_CPP_MOE_SVE_KC_L1_PERMILLE` overrides
+the fraction at process start; `FUSED_CPP_MOE_SVE_KC` pins an 8-aligned Kc.
+Setting the latter above K creates a one-chunk control with the same generic
+dispatch.
+
+The isolated cold-B result is positive for every Mr on the 192-core host
+(roughly +6% to +13%). On the 8-core host, Kc=568 is the maximin compromise:
+M12/M4/M2/M1 improve by about 2.23%/2.35%/0.95%/0.58%, while M8 regresses by
+about 1.48%. Production split-W13 E2E improves by about 2.0% at route=12 and
+3.5% at route=2040 for two 4-thread experts on the 8-core host.
+
+The isolated result must not be extrapolated to a saturated expert wave. On
+NUMA0 of the 192-core host, 24 concurrent 4-thread experts changed from
+0.599 to 0.662 ms at route=12 and from 30.508 to 30.895 ms at route=2040.
+Sweeping Kc through 1024/1536/2048 reduced but did not reverse this loss. Cold
+B is then memory-bandwidth dominated, so A-side L1 residency has little value
+while partial-C instructions remain. Cost tables must therefore be regenerated
+with the production path, and a future traversal selector should use concurrent
+memory pressure rather than isolated Kc timing alone.
+
+Calibration, correctness, production commands, and repeated timings are in
+[`results/amazon_192c_8c_production_kc.md`](results/amazon_192c_8c_production_kc.md).
+
 ## M12 LLC-pollution experiment
 
 `bench_m12_llc_pollution` separates packed-B residency from simultaneous DRAM

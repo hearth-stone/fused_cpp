@@ -284,6 +284,41 @@ def test_sve_m12_silu_and_w2_bf16_route_match_legacy_for_unit_top1(
                 )
 
 
+@pytest.mark.parametrize("use_bf16_route", [False, True], ids=["fp32-route", "bf16-route"])
+@pytest.mark.parametrize("rows", [1, 2, 4, 8, 12, 13], ids=["m1", "m2", "m4", "m8", "m12", "m12-m1"])
+def test_sve_kc_path_matches_reference_and_threaded_output(
+    monkeypatch: pytest.MonkeyPatch,
+    use_bf16_route: bool,
+    rows: int,
+) -> None:
+    """Exercise every production Mr with multiple K chunks in W13 and W2."""
+    affinity = sorted(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else list(range(4))
+    if len(affinity) < 4:
+        pytest.skip("requires four available CPUs")
+
+    monkeypatch.setenv("FUSED_CPP_MOE_SVE", "1")
+    monkeypatch.setenv("FUSED_CPP_MOE_W2_BF16_ROUTE", "1" if use_bf16_route else "0")
+    monkeypatch.setenv("FUSED_CPP_MOE_SVE_W2_DIRECT_ROUTE", "1")
+    generator = torch.Generator().manual_seed(20260718)
+    hidden_size = 1024
+    ffn_hidden_size = 1024
+    hidden = _bf16_normal((rows, hidden_size), generator=generator, std=0.01)
+    w13 = _bf16_normal((1, 2 * ffn_hidden_size, hidden_size), generator=generator, std=0.01)
+    w2 = _bf16_normal((1, hidden_size, ffn_hidden_size), generator=generator, std=0.01)
+    topk_ids = torch.zeros((rows, 1), dtype=torch.int32)
+    topk_weights = torch.ones((rows, 1), dtype=torch.float32)
+    packed = prepare_fused_moe_bf16_tiled_weights(w13, w2, fuse_silu=True, backend="sve")
+    if packed.gemm_backend != 1:
+        pytest.skip("requires an SVE BF16 build/runtime")
+
+    serial = fused_moe_bf16_tiled(hidden, packed, topk_weights, topk_ids, num_threads=1)
+    threaded = fused_moe_bf16_tiled(hidden, packed, topk_weights, topk_ids, num_threads=4)
+    torch.testing.assert_close(threaded.float(), serial.float(), atol=0, rtol=0)
+
+    reference = fused_moe_naive(hidden.float(), w13.float(), w2.float(), topk_weights, topk_ids).to(torch.bfloat16)
+    torch.testing.assert_close(serial.float(), reference.float(), atol=2.0e-3, rtol=2.0e-2)
+
+
 @pytest.mark.parametrize("bridge", ["normal", "scheduled", "async"])
 @pytest.mark.parametrize("w2_bf16_route", [False, True])
 @pytest.mark.parametrize("top_k", [2, 4, 5, 6, 8], ids=["fixed2", "fixed4", "dynamic5", "fixed6", "fixed8"])
