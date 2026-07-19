@@ -7,6 +7,26 @@ baseline:
   status: reference
 
 features:
+  - id: layout.amx_k32_row_major_a
+    part: layout
+    status: experimental
+    implementation: >-
+      csrc/moe/x86/avx512_bf16/backend.cpp and
+      csrc/moe/x86/avx512_bf16/executor.cpp
+    hypothesis: >-
+      Reusing the VNNI2 K-pair/N32 packed-weight format while padding K to 32
+      lets AMX load B directly, and gathering A plus the W13 intermediate in
+      row-major M16 panels removes the AVX-512 packed-A transpose.
+    depends_on:
+      - layout.vnni2_packed_weights
+    conflicts_with: []
+    correctness: >-
+      PYTHONPATH=src .venv/bin/python -m pytest -q
+      tests/test_moe_avx512_bf16.py
+    benchmark: >-
+      OMP_NUM_THREADS=1 taskset -c 0 benchmarks/bench_amx_bf16_gemm
+      16 512 4096 10 51
+
   - id: layout.vnni2_packed_weights
     part: layout
     status: experimental
@@ -46,6 +66,67 @@ features:
       tests/bench_moe_avx512_bf16.py --tokens 12 --hidden 4096
       --intermediate 512 --experts 1 --top-k 1 --routing hot --threads 1
 
+  - id: compute.xbyak_amx_1m4n
+    part: compute
+    status: experimental
+    implementation: csrc/moe/x86/avx512_bf16/jit_kernels.cpp
+    hypothesis: >-
+      Keeping four accumulator tiles and reusing one A tile across two
+      adjacent N32 blocks reduces A tile loads while retaining K double
+      buffering for both W13 and W2. Odd N32 and W13 feature blocks fall back
+      to the established 1M-by-2N schedule.
+    depends_on:
+      - compute.xbyak_amx_m16n32
+    conflicts_with:
+      - compute.xbyak_amx_2m2n
+    correctness: >-
+      FUSED_CPP_MOE_AMX_PATTERN=m1n4 PYTHONPATH=src
+      .venv/bin/python -m pytest -q tests/test_moe_avx512_bf16.py
+    benchmark: >-
+      OMP_NUM_THREADS=2 OMP_DYNAMIC=FALSE OMP_WAIT_POLICY=PASSIVE
+      taskset -c 0,1 env PYTHONPATH=src .venv/bin/python
+      benchmarks/bench_amx_bf16_patterns.py --tokens 2048 --hidden 4096
+      --intermediate 512 --experts 8 --top-k 1 --routing hot --threads 2
+
+  - id: compute.xbyak_amx_2m2n
+    part: compute
+    status: experimental
+    implementation: csrc/moe/x86/avx512_bf16/jit_kernels.cpp
+    hypothesis: >-
+      Keeping two M panels and two N tiles reuses each packed B tile across
+      both panels, eliminating the M16-plus-tail B reload and reducing B-side
+      cache traffic for exact M17-32 and composed larger-M experts.
+    depends_on:
+      - compute.xbyak_amx_m16n32
+    conflicts_with:
+      - compute.xbyak_amx_1m4n
+    correctness: >-
+      FUSED_CPP_MOE_AMX_PATTERN=m2n2 PYTHONPATH=src
+      .venv/bin/python -m pytest -q tests/test_moe_avx512_bf16.py
+    benchmark: >-
+      OMP_NUM_THREADS=2 OMP_DYNAMIC=FALSE OMP_WAIT_POLICY=PASSIVE
+      taskset -c 0,1 env PYTHONPATH=src .venv/bin/python
+      benchmarks/bench_amx_bf16_patterns.py --tokens 2048 --hidden 4096
+      --intermediate 512 --experts 8 --top-k 1 --routing hot --threads 2
+
+  - id: compute.xbyak_amx_m16n32
+    part: compute
+    status: experimental
+    implementation: csrc/moe/x86/avx512_bf16/jit_kernels.cpp
+    hypothesis: >-
+      Exact-M1..16 AMX BF16 kernels with dynamic K32 loops, M16 panel
+      composition, and N32 output blocks raise fused-expert GEMM throughput
+      materially above AVX-512 while retaining arbitrary-M correctness.
+    depends_on:
+      - layout.amx_k32_row_major_a
+    conflicts_with: []
+    correctness: >-
+      PYTHONPATH=src .venv/bin/python -m pytest -q
+      tests/test_moe_avx512_bf16.py
+    benchmark: >-
+      OMP_NUM_THREADS=1 taskset -c 0 benchmarks/bench_amx_bf16_gemm
+      16 512 4096 10 51
+
   - id: compute.xbyak_exact_m
     part: compute
     status: experimental
@@ -69,6 +150,24 @@ features:
       ONEDNN_MAX_CPU_ISA=AVX512_CORE_BF16
       FUSED_CPP_MOE_AVX512_IMPL=jit OMP_NUM_THREADS=1
       taskset -c 0 benchmarks/bench_avx512_bf16_gemm 4 512 4096 10 51
+
+  - id: epilogue.amx_tilestore_silu
+    part: intermediate
+    status: experimental
+    implementation: csrc/moe/x86/avx512_bf16/jit_kernels.cpp
+    hypothesis: >-
+      Storing W13 AMX accumulators into a 2 KiB per-call L1 scratch and running
+      polynomial SiLU-times-up in ZMM registers preserves fusion while writing
+      the row-major BF16 intermediate consumed directly by AMX W2.
+    depends_on:
+      - compute.xbyak_amx_m16n32
+    conflicts_with: []
+    correctness: >-
+      PYTHONPATH=src .venv/bin/python -m pytest -q
+      tests/test_moe_avx512_bf16.py
+    benchmark: >-
+      OMP_NUM_THREADS=1 taskset -c 0 benchmarks/bench_amx_bf16_w13
+      16 4096 512 10 51 5
 
   - id: epilogue.silu_mul_packa
     part: intermediate
@@ -95,13 +194,13 @@ features:
     status: experimental
     implementation: >-
       csrc/moe/x86/avx512_bf16/kernels.cpp and
+      csrc/moe/x86/avx512_bf16/jit_kernels.cpp and
       csrc/moe/x86/avx512_bf16/executor.cpp
     hypothesis: >-
       Writing W2 accumulators directly to their flat route rows removes a
       contiguous expert output and the following scatter pass. Top-1
       skip-weighted calls can convert and store BF16 directly to user output.
-    depends_on:
-      - compute.m12n32_vdpbf16ps
+    depends_on: []
     conflicts_with: []
     correctness: >-
       PYTHONPATH=src .venv/bin/python -m pytest -q
@@ -144,8 +243,7 @@ features:
       OpenMP team avoids repeated operating-system thread creation for short
       experts while retaining a standard-thread fallback.
     depends_on:
-      - compute.m12n32_vdpbf16ps
-      - epilogue.silu_mul_packa
+      - store.direct_route
     conflicts_with: []
     correctness: >-
       PYTHONPATH=src .venv/bin/python -m pytest -q
@@ -190,4 +288,48 @@ variants:
     entrypoint: >-
       FUSED_CPP_MOE_AVX512_IMPL=intrinsic followed by the
       x86_avx512_bf16 fused_moe_bf16_tiled entrypoint
+    status: experimental
+
+  - id: amx_bf16_fused_expert
+    features:
+      - layout.vnni2_packed_weights
+      - layout.amx_k32_row_major_a
+      - compute.xbyak_amx_m16n32
+      - epilogue.amx_tilestore_silu
+      - store.direct_route
+      - merge.avx512_weighted_reduce
+      - dispatch.two_core_expert_or_nsplit
+    entrypoint: >-
+      prepare_fused_moe_bf16_tiled_weights(fuse_silu=True,
+      backend="x86_amx_bf16") followed by fused_moe_bf16_tiled
+    status: experimental
+
+  - id: amx_bf16_fused_expert_m1n4
+    features:
+      - layout.vnni2_packed_weights
+      - layout.amx_k32_row_major_a
+      - compute.xbyak_amx_m16n32
+      - compute.xbyak_amx_1m4n
+      - epilogue.amx_tilestore_silu
+      - store.direct_route
+      - merge.avx512_weighted_reduce
+      - dispatch.two_core_expert_or_nsplit
+    entrypoint: >-
+      FUSED_CPP_MOE_AMX_PATTERN=m1n4 followed by the
+      x86_amx_bf16 fused_moe_bf16_tiled entrypoint
+    status: experimental
+
+  - id: amx_bf16_fused_expert_m2n2
+    features:
+      - layout.vnni2_packed_weights
+      - layout.amx_k32_row_major_a
+      - compute.xbyak_amx_m16n32
+      - compute.xbyak_amx_2m2n
+      - epilogue.amx_tilestore_silu
+      - store.direct_route
+      - merge.avx512_weighted_reduce
+      - dispatch.two_core_expert_or_nsplit
+    entrypoint: >-
+      FUSED_CPP_MOE_AMX_PATTERN=m2n2 followed by the
+      x86_amx_bf16 fused_moe_bf16_tiled entrypoint
     status: experimental

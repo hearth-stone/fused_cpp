@@ -136,13 +136,14 @@ int64_t ResolvePrepackThreads(int64_t experts) {
   return std::min<int64_t>(experts, parsed);
 }
 
-PackedShape CheckPacked(const at::Tensor& tensor, int64_t k, int64_t n, const char* name) {
+PackedShape CheckPacked(const at::Tensor& tensor, int64_t k, int64_t n, const char* name,
+                        const ::fused_cpp::moe::MoeBackend& backend) {
   CheckBf16Cpu(tensor, name);
   TORCH_CHECK(tensor.dim() == 2, name, " must be 2-D [experts, packed_elements]");
   TORCH_CHECK(k > 0 && k <= std::numeric_limits<int>::max(), name, " logical K is invalid: ", k);
   TORCH_CHECK(n > 0 && n <= std::numeric_limits<int>::max(), name, " logical N is invalid: ", n);
-  const int k_pad = avx512_moe::RoundK(static_cast<int>(k));
-  const int n_pad = avx512_moe::RoundN(static_cast<int>(n));
+  const int k_pad = backend.round_k(static_cast<int>(k));
+  const int n_pad = backend.round_n(static_cast<int>(n));
   const int64_t expert_stride = static_cast<int64_t>(k_pad) * n_pad;
   TORCH_CHECK(tensor.size(1) == expert_stride, name, " packed size mismatch: expected ", expert_stride, ", got ",
               tensor.size(1));
@@ -188,20 +189,45 @@ void GatherInput(const uint16_t* input, int64_t hidden_size, int64_t top_k, cons
   }
 }
 
+void GatherInputAmx(const uint16_t* input, int64_t hidden_size, int64_t top_k, const std::vector<int64_t>& routes,
+                    uint16_t* gathered, int k_pad) {
+  std::fill(gathered, gathered + static_cast<int64_t>(routes.size()) * k_pad, static_cast<uint16_t>(0));
+  for (size_t row = 0; row < routes.size(); ++row) {
+    const int64_t token = routes[row] / top_k;
+    std::copy(input + token * hidden_size, input + (token + 1) * hidden_size,
+              gathered + static_cast<int64_t>(row) * k_pad);
+  }
+}
+
 void RunExpert(const ExpertTask& task, ThreadScratch& scratch, const uint16_t* input, int64_t hidden_size,
                int64_t top_k, const uint16_t* w13, const PackedShape& w13_shape, const uint16_t* w2,
                const PackedShape& w2_shape, int f_pad, float* route_output, uint16_t* output, bool skip_weighted,
-               int silu_poly_degree) {
+               int silu_poly_degree, bool use_amx) {
   const std::vector<int64_t>& routes = *task.routes;
   const int rows = static_cast<int>(routes.size());
-  GatherInput(input, hidden_size, top_k, routes, scratch.input.data(), w13_shape.k_pad);
+  if (use_amx) {
+    GatherInputAmx(input, hidden_size, top_k, routes, scratch.input.data(), w13_shape.k_pad);
+  } else {
+    GatherInput(input, hidden_size, top_k, routes, scratch.input.data(), w13_shape.k_pad);
+  }
   const uint16_t* expert_w13 = w13 + task.expert * w13_shape.expert_stride;
   const uint16_t* expert_w2 = w2 + task.expert * w2_shape.expert_stride;
-  avx512_moe::ComputeW13(scratch.input.data(), w13_shape.k_pad, expert_w13, scratch.intermediate.data(), f_pad, rows,
-                         w13_shape.k_pad, 0, f_pad / 16, silu_poly_degree);
-  avx512_moe::ComputeW2(scratch.intermediate.data(), f_pad, expert_w2, route_output, output, routes.data(),
-                        static_cast<int>(hidden_size), rows, w2_shape.k_pad, static_cast<int>(hidden_size), 0,
-                        w2_shape.n_pad / 32, skip_weighted);
+  // AMX W2 loads complete K32 tiles, so its A stride must include padding
+  // beyond W13's potentially smaller F16-padded feature range.
+  const int intermediate_stride = use_amx ? w2_shape.k_pad : f_pad;
+  if (use_amx) {
+    avx512_moe::ComputeW13Amx(scratch.input.data(), w13_shape.k_pad, expert_w13, scratch.intermediate.data(),
+                              intermediate_stride, rows, w13_shape.k_pad, 0, f_pad / 16, silu_poly_degree);
+    avx512_moe::ComputeW2Amx(scratch.intermediate.data(), intermediate_stride, expert_w2, route_output, output,
+                             routes.data(), static_cast<int>(hidden_size), rows, w2_shape.k_pad,
+                             static_cast<int>(hidden_size), 0, w2_shape.n_pad / 32, skip_weighted);
+  } else {
+    avx512_moe::ComputeW13(scratch.input.data(), w13_shape.k_pad, expert_w13, scratch.intermediate.data(), f_pad, rows,
+                           w13_shape.k_pad, 0, f_pad / 16, silu_poly_degree);
+    avx512_moe::ComputeW2(scratch.intermediate.data(), f_pad, expert_w2, route_output, output, routes.data(),
+                          static_cast<int>(hidden_size), rows, w2_shape.k_pad, static_cast<int>(hidden_size), 0,
+                          w2_shape.n_pad / 32, skip_weighted);
+  }
 }
 
 }  // namespace
@@ -210,9 +236,10 @@ std::tuple<at::Tensor, int64_t, int64_t, at::Tensor, int64_t, int64_t, int64_t, 
 fused_moe_bf16_tiled_prepare_weights(at::Tensor w13_weight, at::Tensor w2_weight, bool fuse_silu,
                                      std::string backend_name) {
   const ::fused_cpp::moe::MoeBackend& backend = ::fused_cpp::moe::resolve_backend(backend_name, fuse_silu);
-  TORCH_CHECK(backend.id == ::fused_cpp::moe::BackendId::kX86Avx512Bf16,
-              "x86 fused MoE prepare requires the x86_avx512_bf16 backend");
-  TORCH_CHECK(fuse_silu, "x86_avx512_bf16 requires fuse_silu=True");
+  TORCH_CHECK(backend.id == ::fused_cpp::moe::BackendId::kX86Avx512Bf16 ||
+                  backend.id == ::fused_cpp::moe::BackendId::kX86AmxBf16,
+              "x86 fused MoE prepare requires the x86_avx512_bf16 or x86_amx_bf16 backend");
+  TORCH_CHECK(fuse_silu, backend.name, " requires fuse_silu=True");
   CheckBf16Cpu(w13_weight, "w13_weight");
   CheckBf16Cpu(w2_weight, "w2_weight");
   TORCH_CHECK(w13_weight.dim() == 3, "w13_weight must be 3-D [experts, 2 * F, H]");
@@ -267,15 +294,16 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input, at::Tensor w13_packed, int64_t
                                 int64_t silu_poly_degree, int64_t gemm_backend, int64_t backend_n_tile,
                                 int64_t weight_window_bytes, c10::optional<at::Tensor> out) {
   const ::fused_cpp::moe::MoeBackend& backend = ::fused_cpp::moe::backend_from_id(gemm_backend);
-  TORCH_CHECK(backend.id == ::fused_cpp::moe::BackendId::kX86Avx512Bf16,
-              "x86 fused MoE execution requires x86_avx512_bf16 packed weights");
+  const bool use_amx = backend.id == ::fused_cpp::moe::BackendId::kX86AmxBf16;
+  TORCH_CHECK(backend.id == ::fused_cpp::moe::BackendId::kX86Avx512Bf16 || use_amx,
+              "x86 fused MoE execution requires x86 AVX-512 or AMX packed weights");
   TORCH_CHECK(backend_n_tile == backend.n_tile(), "backend_n_tile mismatch: weights use ", backend_n_tile,
               ", runtime uses ", backend.n_tile());
-  TORCH_CHECK(fuse_silu && activation == "silu", "x86_avx512_bf16 only supports fused activation='silu'");
-  TORCH_CHECK(!w13_bias.has_value() && !w2_bias.has_value(), "x86_avx512_bf16 does not support expert bias");
+  TORCH_CHECK(fuse_silu && activation == "silu", backend.name, " only supports fused activation='silu'");
+  TORCH_CHECK(!w13_bias.has_value() && !w2_bias.has_value(), backend.name, " does not support expert bias");
   TORCH_CHECK(silu_poly_degree == 4 || silu_poly_degree == 5 || silu_poly_degree == 6,
               "silu_poly_degree must be 4, 5, or 6, got ", silu_poly_degree);
-  TORCH_CHECK(num_threads == 1 || num_threads == 2, "x86_avx512_bf16 currently supports num_threads=1 or 2, got ",
+  TORCH_CHECK(num_threads == 1 || num_threads == 2, backend.name, " currently supports num_threads=1 or 2, got ",
               num_threads);
   TORCH_CHECK(weight_window_bytes >= -1, "weight_window_bytes must be -1 or non-negative");
 
@@ -285,8 +313,8 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input, at::Tensor w13_packed, int64_t
   TORCH_CHECK(w13_n > 0 && w13_n % 2 == 0, "w13 N must be positive and even");
   const int64_t f_size = w13_n / 2;
   TORCH_CHECK(w2_k == f_size && w2_n == input.size(1), "w2 logical shape mismatch");
-  PackedShape w13_shape = CheckPacked(w13_packed, w13_k, w13_n, "w13_packed");
-  PackedShape w2_shape = CheckPacked(w2_packed, w2_k, w2_n, "w2_packed");
+  PackedShape w13_shape = CheckPacked(w13_packed, w13_k, w13_n, "w13_packed", backend);
+  PackedShape w2_shape = CheckPacked(w2_packed, w2_k, w2_n, "w2_packed", backend);
   TORCH_CHECK(w13_shape.experts == w2_shape.experts, "packed weights must have the same expert count");
 
   TORCH_CHECK(topk_ids.device().is_cpu() && topk_weights.device().is_cpu(), "top-k tensors must be on CPU");
@@ -316,9 +344,11 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input, at::Tensor w13_packed, int64_t
   const int64_t top_k = topk_ids.size(1);
   TORCH_CHECK(num_tokens <= std::numeric_limits<int64_t>::max() / top_k, "tokens * top_k overflows the route count");
   const int64_t num_routes = num_tokens * top_k;
-  TORCH_CHECK(num_routes <= std::numeric_limits<int32_t>::max() / input.size(1),
-              "route output is too large for the AVX-512 scatter addressing: routes=", num_routes,
-              ", hidden=", input.size(1));
+  if (!use_amx) {
+    TORCH_CHECK(num_routes <= std::numeric_limits<int32_t>::max() / input.size(1),
+                "route output is too large for the AVX-512 scatter addressing: routes=", num_routes,
+                ", hidden=", input.size(1));
+  }
   std::vector<std::vector<int64_t>> routes(static_cast<size_t>(num_experts));
   for (int64_t flat = 0; flat < num_routes; ++flat) {
     const int64_t expert = ids[flat];
@@ -340,14 +370,19 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input, at::Tensor w13_packed, int64_t
   for (const ExpertTask& task : tasks) {
     jit_row_counts.push_back(static_cast<int>(task.routes->size()));
   }
-  avx512_moe::PrepareJitKernels(jit_row_counts, silu_poly_degree, static_cast<int>(input.size(1)), skip_weighted);
+  if (use_amx) {
+    avx512_moe::PrepareAmxJitKernels(jit_row_counts, silu_poly_degree, static_cast<int>(input.size(1)), skip_weighted);
+  } else {
+    avx512_moe::PrepareJitKernels(jit_row_counts, silu_poly_degree, static_cast<int>(input.size(1)), skip_weighted);
+  }
 
   const int f_pad = w13_shape.n_pad / 2;
-  const int64_t max_padded_rows = (max_rows + 11) / 12 * 16;
+  const int intermediate_stride = use_amx ? w2_shape.k_pad : f_pad;
+  const int64_t max_scratch_rows = use_amx ? max_rows : (max_rows + 11) / 12 * 16;
   std::vector<ThreadScratch> scratches(static_cast<size_t>(num_threads));
   for (ThreadScratch& scratch : scratches) {
-    scratch.input.resize(static_cast<size_t>(max_padded_rows * w13_shape.k_pad));
-    scratch.intermediate.resize(static_cast<size_t>(max_padded_rows * f_pad));
+    scratch.input.resize(static_cast<size_t>(max_scratch_rows * w13_shape.k_pad));
+    scratch.intermediate.resize(static_cast<size_t>(max_scratch_rows * intermediate_stride));
   }
   at::Tensor route_output;
   float* route_output_pointer = nullptr;
@@ -365,23 +400,38 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input, at::Tensor w13_packed, int64_t
     const ExpertTask& task = tasks[0];
     const std::vector<int64_t>& expert_routes = *task.routes;
     const int rows = static_cast<int>(expert_routes.size());
-    GatherInput(input_pointer, input.size(1), top_k, expert_routes, scratch.input.data(), w13_shape.k_pad);
+    if (use_amx) {
+      GatherInputAmx(input_pointer, input.size(1), top_k, expert_routes, scratch.input.data(), w13_shape.k_pad);
+    } else {
+      GatherInput(input_pointer, input.size(1), top_k, expert_routes, scratch.input.data(), w13_shape.k_pad);
+    }
     const uint16_t* expert_w13 = w13_pointer + task.expert * w13_shape.expert_stride;
     const uint16_t* expert_w2 = w2_pointer + task.expert * w2_shape.expert_stride;
     const int w13_blocks = f_pad / 16;
     RunThreads(2, [&](int64_t tid) {
       const int begin = static_cast<int>(w13_blocks * tid / 2);
       const int end = static_cast<int>(w13_blocks * (tid + 1) / 2);
-      avx512_moe::ComputeW13(scratch.input.data(), w13_shape.k_pad, expert_w13, scratch.intermediate.data(), f_pad,
-                             rows, w13_shape.k_pad, begin, end, silu_poly_degree);
+      if (use_amx) {
+        avx512_moe::ComputeW13Amx(scratch.input.data(), w13_shape.k_pad, expert_w13, scratch.intermediate.data(),
+                                  intermediate_stride, rows, w13_shape.k_pad, begin, end, silu_poly_degree);
+      } else {
+        avx512_moe::ComputeW13(scratch.input.data(), w13_shape.k_pad, expert_w13, scratch.intermediate.data(), f_pad,
+                               rows, w13_shape.k_pad, begin, end, silu_poly_degree);
+      }
     });
     const int w2_blocks = w2_shape.n_pad / 32;
     RunThreads(2, [&](int64_t tid) {
       const int begin = static_cast<int>(w2_blocks * tid / 2);
       const int end = static_cast<int>(w2_blocks * (tid + 1) / 2);
-      avx512_moe::ComputeW2(scratch.intermediate.data(), f_pad, expert_w2, route_output_pointer, output_pointer,
-                            expert_routes.data(), static_cast<int>(input.size(1)), rows, w2_shape.k_pad,
-                            static_cast<int>(input.size(1)), begin, end, skip_weighted);
+      if (use_amx) {
+        avx512_moe::ComputeW2Amx(scratch.intermediate.data(), intermediate_stride, expert_w2, route_output_pointer,
+                                 output_pointer, expert_routes.data(), static_cast<int>(input.size(1)), rows,
+                                 w2_shape.k_pad, static_cast<int>(input.size(1)), begin, end, skip_weighted);
+      } else {
+        avx512_moe::ComputeW2(scratch.intermediate.data(), f_pad, expert_w2, route_output_pointer, output_pointer,
+                              expert_routes.data(), static_cast<int>(input.size(1)), rows, w2_shape.k_pad,
+                              static_cast<int>(input.size(1)), begin, end, skip_weighted);
+      }
     });
   } else {
     std::atomic<size_t> next_task{0};
@@ -393,7 +443,7 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input, at::Tensor w13_packed, int64_t
         }
         RunExpert(tasks[index], scratches[static_cast<size_t>(tid)], input_pointer, input.size(1), top_k, w13_pointer,
                   w13_shape, w2_pointer, w2_shape, f_pad, route_output_pointer, output_pointer, skip_weighted,
-                  silu_poly_degree);
+                  silu_poly_degree, use_amx);
       }
     });
   }

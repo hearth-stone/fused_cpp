@@ -1,8 +1,9 @@
-# AVX-512 BF16 fused expert
+# x86 AVX-512 and AMX BF16 fused expert
 
 This optimization implements the synchronous BF16 fused-SiLU expert path for
-x86-64 CPUs with AVX-512 BF16. It mirrors the existing ARM/SVE dataflow while
-using `VDPBF16PS` and a decode-oriented M12/N32 microkernel.
+x86-64 CPUs with AVX-512 BF16 and an explicit experimental AMX backend. It
+mirrors the existing ARM/SVE dataflow while using `VDPBF16PS` and a
+decode-oriented M12/N32 microkernel.
 
 The fusion boundary and M12 panel loop follow
 `csrc/moe/arm/sve_bf16/kernels.S` and the ARM executor. The BF16-pair operand
@@ -69,10 +70,9 @@ register capacity permits and reduce them before the store epilogue.
 - `jit`: require JIT and report a missing submodule or generation failure;
 - `intrinsic`: bypass code generation and use the preserved implementation.
 
-The cache key and generator factory already reserve an AMX BF16 ISA value, but
-this change does not emit AMX instructions, change packed layouts, or enable
-backend ID 102. The first JIT implementation targets the System V x86-64 ABI;
-Windows builds retain the intrinsic path.
+The shared cache/factory also owns the explicit AMX backend described below.
+Both generated implementations target the System V x86-64 ABI; Windows builds
+retain the AVX-512 intrinsic path and do not expose AMX.
 
 Two-thread builds reuse the extension's OpenMP team and fall back to standard
 threads when OpenMP is unavailable, nested, or unable to provide the requested
@@ -128,3 +128,65 @@ default AMX implementation as a separate hardware-ceiling comparison.
 polynomial SiLU-multiply, BF16 conversion, and W2 packed-A epilogue. Run the
 same binary in separate `FUSED_CPP_MOE_AVX512_IMPL=jit` and `intrinsic`
 processes to compare generated and fallback kernels without routing or W2.
+
+## Experimental AMX backend
+
+`x86_amx_bf16` activates the reserved backend ID 102 without changing the
+default `auto` selection, which remains `x86_avx512_bf16`. It requires Linux,
+Xbyak, AVX-512 BF16 for the vector epilogues, AMX-TILE, and AMX-BF16. Set
+`FUSED_CPP_MOE_AMX_BF16=0` to hide it from runtime discovery. Linux grants
+XTILEDATA state per thread, so every worker requests `ARCH_REQ_XCOMP_PERM`
+before its first generated AMX call.
+
+AMX reuses the existing K-pair/N32 packed-weight format, but its backend rounds
+K to 32. Gathered input and the W13 intermediate are row-major M16 panels.
+The intermediate row stride is W2's K32-padded size, which can be wider than
+W13's F16-padded output (for example F=35 uses a 64-element stride); the extra
+columns remain zero so W2 never reads across row boundaries.
+The cache specializes exact M=1 through 16, operation, W13 polynomial degree,
+W2 N tail, and output type; K remains a dynamic K32 loop. Larger M values are
+M16 panels plus an exact tail.
+
+W13 uses two FP32 accumulator tiles for gate and up, with double-buffered A/B
+occupying all eight TMM registers. Since ZMM cannot read TMM state directly,
+both accumulators are `TILESTORED` to a 2 KiB stack scratch before the existing
+ZMM polynomial SiLU-times-up epilogue writes row-major BF16. W2 uses one or two
+accumulator tiles according to N and stores through the same scratch before
+route-aware FP32 or BF16 output.
+
+`FUSED_CPP_MOE_AMX_PATTERN` selects an experimental tile-register schedule:
+
+- `m1n2` (default) keeps one M panel and two N tiles, and double-buffers K;
+- `m2n2` keeps two M panels and two N tiles, reuses each B tile across both M
+  panels, and covers M32 plus exact M17-31 kernels. M1-16 tails use `m1n2`;
+- `m1n4` keeps one M panel and four accumulator tiles, reuses A across two
+  adjacent N32 blocks, and retains K double buffering. Odd N32/W13 blocks use
+  `m1n2`.
+
+The selector is intentionally opt-in: unset or empty remains `m1n2`, so these
+experiments do not change backend auto-selection or the established AMX
+schedule.
+
+Build and select the backend explicitly:
+
+```bash
+MAX_JOBS=2 FUSED_CPP_BUILD_MOE_ONLY=1 \
+  .venv/bin/python setup.py build_ext --inplace
+PYTHONPATH=src .venv/bin/python -m pytest -q \
+  tests/test_moe_backend_dispatch.py tests/test_moe_avx512_bf16.py
+OMP_NUM_THREADS=2 OMP_DYNAMIC=FALSE OMP_WAIT_POLICY=PASSIVE \
+  taskset -c 0,1 env PYTHONPATH=src .venv/bin/python \
+  tests/bench_moe_avx512_bf16.py --backend x86_amx_bf16 \
+  --tokens 16 --hidden 4096 --intermediate 512 \
+  --experts 8 --top-k 6 --routing balanced --threads 2
+```
+
+`benchmarks/bench_amx_bf16_gemm.cpp` compares the standalone W2 kernel with
+prepacked oneDNN, while `benchmarks/bench_amx_bf16_w13.cpp` measures fused W13
+through its SiLU/BF16 epilogue. Current C8i data and the M16+M1 discontinuity
+are recorded in
+[`results/amazon_c8i_2core_amx_20260719.md`](results/amazon_c8i_2core_amx_20260719.md).
+`benchmarks/bench_amx_bf16_patterns.py` rotates `m1n2`, `m2n2`, and `m1n4`
+inside one process with identical inputs and packed weights. Its hot-M sweep
+through M=2048 and balanced/skewed/hot routing results are in
+[`results/amazon_c8i_2core_amx_patterns_20260719.md`](results/amazon_c8i_2core_amx_patterns_20260719.md).

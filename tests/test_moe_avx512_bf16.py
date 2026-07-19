@@ -13,9 +13,13 @@ from fused_cpp.moe import prepare_fused_moe_bf16_tiled_weights
 
 
 pytestmark = pytest.mark.skipif(
-    platform.machine() not in ("x86_64", "AMD64")
-    or "x86_avx512_bf16" not in available_fused_moe_bf16_tiled_backends(),
+    platform.machine() not in ("x86_64", "AMD64") or "x86_avx512_bf16" not in available_fused_moe_bf16_tiled_backends(),
     reason="requires an AVX-512 BF16 CPU and x86 MoE build",
+)
+
+requires_amx = pytest.mark.skipif(
+    platform.machine() not in ("x86_64", "AMD64") or "x86_amx_bf16" not in available_fused_moe_bf16_tiled_backends(),
+    reason="requires an AMX BF16 CPU, Linux XTILEDATA permission, and Xbyak",
 )
 
 
@@ -52,9 +56,7 @@ def _assert_bf16_close(actual: torch.Tensor, expected: torch.Tensor) -> None:
     difference = (actual_f32 - expected_f32).abs()
     max_abs = float(difference.max()) if difference.numel() else 0.0
     max_rel = float((difference / (expected_f32.abs() + 1e-12)).max()) if difference.numel() else 0.0
-    cosine = float(
-        torch.nn.functional.cosine_similarity(actual_f32.flatten(), expected_f32.flatten(), dim=0)
-    )
+    cosine = float(torch.nn.functional.cosine_similarity(actual_f32.flatten(), expected_f32.flatten(), dim=0))
     message = f"max_abs={max_abs:.6e} max_rel={max_rel:.6e} cosine={cosine:.8f}"
     assert not torch.isnan(actual_f32).any(), message
     assert not torch.isinf(actual_f32).any(), message
@@ -257,4 +259,247 @@ def test_avx512_runtime_kill_switch(monkeypatch: pytest.MonkeyPatch) -> None:
             w2,
             fuse_silu=True,
             backend="x86_avx512_bf16",
+        )
+
+
+@requires_amx
+def test_amx_backend_is_explicit_and_preserves_avx512_auto() -> None:
+    """AMX uses backend 102 while automatic x86 preparation remains on AVX-512."""
+    _, w13, w2, _, _ = _case(
+        tokens=1,
+        hidden=33,
+        intermediate=17,
+        experts=1,
+        top_k=1,
+    )
+
+    automatic = prepare_fused_moe_bf16_tiled_weights(w13, w2, fuse_silu=True)
+    amx = prepare_fused_moe_bf16_tiled_weights(
+        w13,
+        w2,
+        fuse_silu=True,
+        backend="x86_amx_bf16",
+    )
+
+    assert automatic.gemm_backend == 101
+    assert automatic.backend_name == "x86_avx512_bf16"
+    assert amx.gemm_backend == 102
+    assert amx.backend_n_tile == 32
+    assert amx.backend_name == "x86_amx_bf16"
+    assert amx.w13[0].shape[1] % 32 == 0
+    assert amx.w2[0].shape[1] % 32 == 0
+
+
+@requires_amx
+@pytest.mark.parametrize("routes", range(1, 18), ids=lambda value: f"m{value}")
+def test_amx_exact_m_matches_avx512_jit(routes: int) -> None:
+    """AMX exact-M1..16 kernels and M16+tail composition retain the AVX result contract."""
+    inputs, w13, w2, topk_weights, topk_ids = _case(
+        tokens=routes,
+        hidden=33,
+        intermediate=17,
+        experts=1,
+        top_k=1,
+        seed=100 + routes,
+    )
+    avx = prepare_fused_moe_bf16_tiled_weights(
+        w13,
+        w2,
+        fuse_silu=True,
+        backend="x86_avx512_bf16",
+    )
+    amx = prepare_fused_moe_bf16_tiled_weights(
+        w13,
+        w2,
+        fuse_silu=True,
+        backend="x86_amx_bf16",
+    )
+
+    expected = fused_moe_bf16_tiled(inputs, avx, topk_weights, topk_ids, num_threads=1)
+    actual = fused_moe_bf16_tiled(inputs, amx, topk_weights, topk_ids, num_threads=1)
+
+    _assert_bf16_close(actual, expected)
+
+
+@requires_amx
+@pytest.mark.parametrize("pattern", ["m1n2", "m2n2", "m1n4"])
+@pytest.mark.parametrize("routes", [17, 32, 33, 64, 2048], ids=lambda value: f"m{value}")
+def test_amx_patterns_match_naive_through_large_m(
+    monkeypatch: pytest.MonkeyPatch,
+    pattern: str,
+    routes: int,
+) -> None:
+    """Each AMX pattern must preserve W13/W2 tails and routing through M=2048."""
+    monkeypatch.setenv("FUSED_CPP_MOE_AMX_PATTERN", pattern)
+    inputs, w13, w2, topk_weights, topk_ids = _case(
+        tokens=routes,
+        hidden=67,
+        intermediate=35,
+        experts=1,
+        top_k=1,
+        seed=400 + routes,
+    )
+    packed = prepare_fused_moe_bf16_tiled_weights(
+        w13,
+        w2,
+        fuse_silu=True,
+        backend="x86_amx_bf16",
+    )
+
+    actual = fused_moe_bf16_tiled(inputs, packed, topk_weights, topk_ids, num_threads=1)
+    expected = fused_moe_naive(inputs, w13, w2, topk_weights, topk_ids)
+
+    _assert_bf16_close(actual, expected)
+
+
+@requires_amx
+@pytest.mark.parametrize("pattern", ["m2n2", "m1n4"])
+def test_amx_patterns_hot_two_thread_direct_bf16(
+    monkeypatch: pytest.MonkeyPatch,
+    pattern: str,
+) -> None:
+    """New kernels must support hot-expert N-split and direct BF16 stores."""
+    monkeypatch.setenv("FUSED_CPP_MOE_AMX_PATTERN", pattern)
+    inputs, w13, w2, topk_weights, topk_ids = _case(
+        tokens=33,
+        hidden=67,
+        intermediate=35,
+        experts=1,
+        top_k=1,
+        seed=500,
+    )
+    topk_weights.fill_(1.0)
+    packed = prepare_fused_moe_bf16_tiled_weights(
+        w13,
+        w2,
+        fuse_silu=True,
+        backend="x86_amx_bf16",
+    )
+    output = torch.empty_like(inputs)
+
+    returned = fused_moe_bf16_tiled(
+        inputs,
+        packed,
+        topk_weights,
+        topk_ids,
+        num_threads=2,
+        skip_weighted=True,
+        out=output,
+    )
+    expected = fused_moe_naive(inputs, w13, w2, topk_weights, topk_ids, skip_weighted=True)
+
+    assert returned is output
+    _assert_bf16_close(output, expected)
+
+
+@requires_amx
+def test_amx_rejects_unknown_jit_pattern(monkeypatch: pytest.MonkeyPatch) -> None:
+    inputs, w13, w2, topk_weights, topk_ids = _case(
+        tokens=1,
+        hidden=32,
+        intermediate=16,
+        experts=1,
+        top_k=1,
+    )
+    packed = prepare_fused_moe_bf16_tiled_weights(
+        w13,
+        w2,
+        fuse_silu=True,
+        backend="x86_amx_bf16",
+    )
+    monkeypatch.setenv("FUSED_CPP_MOE_AMX_PATTERN", "unknown")
+
+    with pytest.raises(RuntimeError, match="must be m1n2, m2n2, or m1n4"):
+        fused_moe_bf16_tiled(inputs, packed, topk_weights, topk_ids, num_threads=1)
+
+
+@requires_amx
+@pytest.mark.parametrize("degree", [4, 5, 6])
+@pytest.mark.parametrize("num_threads", [1, 2])
+def test_amx_fused_expert_matches_naive_for_tails_and_threads(degree: int, num_threads: int) -> None:
+    """AMX W13, SiLU, W2, routing, and merge match the definition for shape tails and both workers."""
+    inputs, w13, w2, topk_weights, topk_ids = _case(
+        tokens=25,
+        hidden=35,
+        intermediate=19,
+        experts=4,
+        top_k=2,
+        seed=200 + degree,
+    )
+    packed = prepare_fused_moe_bf16_tiled_weights(
+        w13,
+        w2,
+        fuse_silu=True,
+        backend="x86_amx_bf16",
+    )
+
+    actual = fused_moe_bf16_tiled(
+        inputs,
+        packed,
+        topk_weights,
+        topk_ids,
+        num_threads=num_threads,
+        silu_poly_degree=degree,
+    )
+    expected = fused_moe_naive(inputs, w13, w2, topk_weights, topk_ids)
+
+    _assert_bf16_close(actual, expected)
+
+
+@requires_amx
+def test_amx_skip_weighted_direct_bf16_output() -> None:
+    """AMX W2 writes a tail-sized top-1 result directly into the supplied BF16 buffer."""
+    inputs, w13, w2, topk_weights, topk_ids = _case(
+        tokens=17,
+        hidden=47,
+        intermediate=23,
+        experts=2,
+        top_k=1,
+        seed=300,
+    )
+    topk_weights.fill_(1.0)
+    packed = prepare_fused_moe_bf16_tiled_weights(
+        w13,
+        w2,
+        fuse_silu=True,
+        backend="x86_amx_bf16",
+    )
+    output = torch.empty_like(inputs)
+
+    returned = fused_moe_bf16_tiled(
+        inputs,
+        packed,
+        topk_weights,
+        topk_ids,
+        num_threads=2,
+        skip_weighted=True,
+        out=output,
+    )
+    expected = fused_moe_naive(inputs, w13, w2, topk_weights, topk_ids, skip_weighted=True)
+
+    assert returned is output
+    _assert_bf16_close(output, expected)
+
+
+@requires_amx
+def test_amx_runtime_kill_switch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The AMX kill switch hides only backend 102 and rejects explicit preparation."""
+    _, w13, w2, _, _ = _case(
+        tokens=1,
+        hidden=32,
+        intermediate=16,
+        experts=1,
+        top_k=1,
+    )
+    monkeypatch.setenv("FUSED_CPP_MOE_AMX_BF16", "0")
+
+    backends = available_fused_moe_bf16_tiled_backends()
+    assert "x86_amx_bf16" not in backends
+    assert "x86_avx512_bf16" in backends
+    with pytest.raises(RuntimeError, match="not supported by this build/runtime"):
+        prepare_fused_moe_bf16_tiled_weights(
+            w13,
+            w2,
+            fuse_silu=True,
+            backend="x86_amx_bf16",
         )

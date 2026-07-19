@@ -171,8 +171,8 @@ def prepare_fused_moe_bf16_tiled_weights(
 
     ``fuse_silu=True`` packs w13 in the interleaved gate/up layout required by
     the fused SiLU-and-mul GEMM epilogue. ARM currently requires ``F % 8 == 0``;
-    AVX-512 pads arbitrary positive ``F``. Both require ``activation='silu'``
-    at call time. The returned object carries a ``fused_silu`` flag that
+    AVX-512 and AMX pad arbitrary positive ``F``. All fused backends require
+    ``activation='silu'`` at call time. The returned object carries a ``fused_silu`` flag that
     :func:`fused_moe_bf16_tiled` honours automatically.
     """
     _require_backend()
@@ -190,7 +190,12 @@ def prepare_fused_moe_bf16_tiled_weights(
         backend,
     )
     backend_id = int(packed[6]) if len(packed) > 6 else 0
-    backend_names = {0: "arm_neon_bf16", 1: "arm_sve_bf16", 101: "x86_avx512_bf16"}
+    backend_names = {
+        0: "arm_neon_bf16",
+        1: "arm_sve_bf16",
+        101: "x86_avx512_bf16",
+        102: "x86_amx_bf16",
+    }
     return PreparedBF16TiledFusedMoEWeights(
         w13=(packed[0], int(packed[1]), int(packed[2])),
         w2=(packed[3], int(packed[4]), int(packed[5])),

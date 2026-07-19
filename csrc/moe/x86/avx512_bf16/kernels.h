@@ -31,6 +31,18 @@ void ComputeW2Intrinsic(const uint16_t* a, int a_stride, const uint16_t* packed_
 // threads start. K is intentionally dynamic and is not part of the cache key.
 void PrepareJitKernels(const std::vector<int>& row_counts, int silu_poly_degree, int hidden_size, bool direct_bf16);
 
+// AMX consumes row-major M16 panels and the same K-pair/N32 packed weights as
+// AVX-512. K is padded to 32 BF16 elements by the AMX backend.
+void PrepareAmxJitKernels(const std::vector<int>& row_counts, int silu_poly_degree, int hidden_size,
+                          bool direct_bf16);
+
+void ComputeW13Amx(const uint16_t* a, int a_stride, const uint16_t* packed_b, uint16_t* c, int c_stride, int rows,
+                   int k_pad, int feature_block_begin, int feature_block_end, int silu_poly_degree);
+
+void ComputeW2Amx(const uint16_t* a, int a_stride, const uint16_t* packed_b, float* route_output,
+                  uint16_t* direct_output, const int64_t* route_ids, int route_stride, int rows, int k_pad,
+                  int hidden_size, int output_block_begin, int output_block_end, bool direct_bf16);
+
 struct JitStats {
   uint64_t kernel_count = 0;
   uint64_t code_bytes = 0;

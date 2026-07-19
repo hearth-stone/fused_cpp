@@ -12,12 +12,17 @@
 #include <immintrin.h>
 #endif
 
+#if defined(__x86_64__) && defined(__linux__)
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
+
 namespace fused_cpp::moe::x86::avx512_bf16 {
 namespace {
 
 int RoundUp(int value, int quantum) {
   if (value > std::numeric_limits<int>::max() - (quantum - 1)) {
-    throw std::overflow_error("AVX-512 BF16 packed dimension exceeds int32");
+    throw std::overflow_error("x86 BF16 packed dimension exceeds int32");
   }
   return ((value + quantum - 1) / quantum) * quantum;
 }
@@ -70,6 +75,19 @@ bool CpuSupportsAvx512Bf16() {
   constexpr unsigned int kAvx512Bf16 = 1u << 5;
   return (eax & kAvx512Bf16) != 0;
 }
+
+bool CpuSupportsAmxBf16() {
+  unsigned int eax = 0;
+  unsigned int ebx = 0;
+  unsigned int ecx = 0;
+  unsigned int edx = 0;
+  if (!CpuSupportsAvx512Bf16() || !__get_cpuid_count(7, 0, &eax, &ebx, &ecx, &edx)) {
+    return false;
+  }
+  constexpr unsigned int kAmxBf16 = 1u << 22;
+  constexpr unsigned int kAmxTile = 1u << 24;
+  return (edx & (kAmxBf16 | kAmxTile)) == (kAmxBf16 | kAmxTile);
+}
 #endif
 
 }  // namespace
@@ -83,9 +101,40 @@ bool RuntimeSupported() {
 #endif
 }
 
+bool EnsureAmxThreadPermission() {
+#if defined(__x86_64__) && defined(__linux__) && defined(FUSED_CPP_MOE_HAS_XBYAK) && FUSED_CPP_MOE_HAS_XBYAK
+  thread_local bool permission_granted = false;
+  if (permission_granted) {
+    return true;
+  }
+  constexpr long kArchReqXcompPerm = 0x1023;
+  constexpr unsigned long kXfeatureXtiledata = 18;
+  if (syscall(SYS_arch_prctl, kArchReqXcompPerm, kXfeatureXtiledata) != 0) {
+    return false;
+  }
+  constexpr uint64_t kXcr0AmxState = (uint64_t{1} << 17) | (uint64_t{1} << 18);
+  permission_granted = (ReadXcr0() & kXcr0AmxState) == kXcr0AmxState;
+  return permission_granted;
+#else
+  return false;
+#endif
+}
+
+bool AmxRuntimeSupported() {
+#if defined(__x86_64__) && defined(__linux__) && defined(FUSED_CPP_MOE_HAS_X86_AVX512_BF16) && \
+    defined(FUSED_CPP_MOE_HAS_XBYAK) && FUSED_CPP_MOE_HAS_XBYAK
+  static const bool cpu_supported = CpuSupportsAmxBf16();
+  return cpu_supported && !EnvFalse("FUSED_CPP_MOE_AMX_BF16") && EnsureAmxThreadPermission();
+#else
+  return false;
+#endif
+}
+
 int NTile() { return 32; }
 
 int RoundK(int value) { return RoundUp(std::max(value, 2), 2); }
+
+int AmxRoundK(int value) { return RoundUp(std::max(value, 32), 32); }
 
 int RoundN(int value) { return RoundUp(std::max(value, 32), 32); }
 
