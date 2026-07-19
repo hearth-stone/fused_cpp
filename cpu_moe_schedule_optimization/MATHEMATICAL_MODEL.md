@@ -994,10 +994,13 @@ warmup、20 次正式采样，并保留原始 samples。所有 profile 通过 sc
 identity、split-pair grid 和 `ContentionCostModel` 加载验证。
 
 测量证明 32T 以上的 isolated scaling 与 expert shape 相关：TP4 split 的短
-route 常在 32--64T 饱和，而 EP4 长 route 可继续受益到 96T。64-local-expert 的
-TP profile 在“每个 expert 都有 2040 routes”的 full-call anchor 上出现稳定的
-大容量 cliff；20 个样本的离散小于约 3%，因此保留原始值，但在真实 routing
-held-out 验证前不得据此单点扩大 planner 线程宽度集合。
+route 常在 32--64T 饱和，而 EP4 长 route 可继续受益到 96T。后来定位到
+64-local-expert TP profile 的“每个 expert 都有 2040 routes”full-call cliff
+包含每轮重新分配并首次写约 1 GiB BF16 output 的成本，不能解释为 GEMM
+contention。2026-07-16 起 profiler 为每个测量点预分配 native `out`，warmup
+完成 first-touch，正式样本只测稳态 expert compute。旧 profile 中缺少
+`measurement.output_buffer=preallocated_reused_native_out` 的大总 route 点不得
+用于校准 $D_i(\mathcal Z)$；allocation/page-fault 应作为独立 E2E 成本处理。
 
 使用 route 96/384/1536 作为 holdout 时，8 个 profile 的公式中位绝对误差为
 0.53%--2.10%；P90 在 split profile 上不超过约 7.3%，但 EP/no-split 可达到
@@ -1055,6 +1058,94 @@ median 差异为 +0.23%、+0.33%、+0.29%，仍低于约 1% 噪声下界。
 没有可分辨的 median 回退；尚不能证明对 captured routing 有净收益，也不能作为
 planner 中 merge-overlap 的 cost 校准。
 
+### 9.4 Amazon 192-core 双 NUMA 稳态校准
+
+2026-07-16 在 Neoverse-V3 的全部 192 核上以两个同步 rank 重测 TP4/F512
+split-W13 profile：rank 0 使用 CPU `0-95`/NUMA0，rank 1 使用 CPU
+`96-191`/NUMA1，每轮取两个 rank wall time 的最大值。每个 rank 流式使用 64 份
+不同 expert 权重；profile 包含 117 个 isolated 点和 120 个 contention 点，使用
+5 次 warmup、20 次正式采样，并复用预分配 native `out`。
+
+稳态结果消除了旧 allocate-per-call cliff。`64 experts x 2040 routes` 的 `[96]`
+shape 从旧口径约 5.53 s 降为 250.88 ms，derate 为 0.988；全表最优是每 rank
+`24x4T`，wall time 91.54 ms，双 rank 聚合吞吐 35.89 TFLOP/s。代表性最优点为：
+
+| routes/expert | 每 rank shape | 双 rank wall | 聚合吞吐 |
+| ---: | --- | ---: | ---: |
+| 1 | `12x8T` | 2.03 ms | 0.79 TFLOP/s |
+| 12 | `24x4T` | 2.12 ms | 9.10 TFLOP/s |
+| 48 | `6x16T` | 3.98 ms | 19.43 TFLOP/s |
+| 192 | `6x16T` | 9.34 ms | 33.12 TFLOP/s |
+| 768 | `6x16T` | 34.14 ms | 36.24 TFLOP/s |
+| 2040 | `24x4T` | 91.54 ms | 35.89 TFLOP/s |
+
+M=768 时 `12x8T` 与 `6x16T` 相差约 0.1%；M=2040 时更细的 `24x4T`
+重新占优，等价于每 rank 同时保持约 96 MiB split packed-B stage。两个 NUMA 的
+isolated median 在长 route 上接近：M=2040 的 32/64/96T 最大比值分别为
+1.056/1.017/1.034；短 route 的 64/96T 可出现更大不对称，因此 profile 必须保留
+pairwise-max 聚合，不能用两个 rank median 的平均值替代。
+
+### 9.5 256-expert TP4 双 NUMA 校准
+
+2026-07-17 按真实 256 routed-expert TP4 人口重测同一 F512
+split-W13 kernel。TP 不分割 expert 数量，因此每个 rank 都生成并轮换
+256 份不同权重；rank 0/1 仍分别绑定 CPU `0-95`/`96-191` 和
+NUMA0/1。profile 包含 117 个 isolated 点和 140 个 contention 点，
+每点 5 次 warmup、20 次正式采样，并按逐轮两 rank 的较慢者聚合。
+
+代表性最优点为：
+
+| routes/expert | 每 rank shape | 双 rank wall |
+| ---: | --- | ---: |
+| 1 | `48x2T` | 8.67 ms |
+| 12 | `24x4T` | 9.04 ms |
+| 48 | `6x16T` | 16.02 ms |
+| 192 | `6x16T` | 36.04 ms |
+| 768 | `12x8T` | 125.88 ms |
+| 2040 | `24x4T` | 329.79 ms |
+
+M=12 存在宽平台：`24x4T`/`48x2T`/`96x1T` 分别为
+9.042/9.049/9.094 ms，相对最优只相差 0.0%/0.1%/0.6%。因此
+96 个单线程 expert 并不差；旧 E64 profile 未包含该可行 shape，
+其 `24x4T` 结论只适用于 64-task full call，不得作为 256-expert
+TP4 planner 的总体调度结论。本轮只替换 profile identity 和验证数据；
+$I_i(t)$、$D_i(\mathcal Z)$ 定义及 production 剪枝不变。
+
+### 9.6 M12 冷 B 带宽扩展曲线
+
+2026-07-17 在 Neoverse-V3 NUMA0 CPU `0-95` 上固定 TP4/F512、M=12
+和每 expert 1T，扫描 1--96 个同时 active experts。每个样本只执行一个
+完整并发波，样本间在 256 份独立 packed weights 上循环移动窗口；
+因此不包含固定总任务数产生的 partial-wave tail。点顺序随机化，每点
+5 次 warmup、30 次正式采样。
+
+M=12 只有一个物理 M panel，每个 expert 的 W13+W2 packed B 合计
+12 MiB 且无 panel 间复用。定义冷 B 有效带宽为：
+
+$$
+B_{B,\mathrm{eff}}(n)
+=\frac{n\cdot 12\ \mathrm{MiB}}{T_{\mathrm{one\ wave}}(n)}.
+$$
+
+该值包含 GEMM 的 load issue、BFMMLA 与 dispatch 重叠，是 planner 可用的
+effective packed-B rate，不是 PMU memory-controller byte count。代表点为：
+
+| 1T experts / threads | wall | $B_{B,\mathrm{eff}}$ | 相对 96T |
+| ---: | ---: | ---: | ---: |
+| 1 | 0.559 ms | 22.5 GB/s | 6.4% |
+| 8 | 0.812 ms | 124.0 GB/s | 35.2% |
+| 12 | 0.831 ms | 181.7 GB/s | 51.6% |
+| 24 | 1.136 ms | 265.9 GB/s | 75.5% |
+| 48 | 2.021 ms | 298.8 GB/s | 84.8% |
+| 64 | 2.514 ms | 320.4 GB/s | 91.0% |
+| 86 | 3.219 ms | 336.2 GB/s | 95.5% |
+| 96 | 3.430 ms | 352.1 GB/s | 100.0% |
+
+按“从该线程数开始，后续所有实测点都不低于目标”的稳健口径，
+50%/75%/90%/95% 峰值带宽分别需要 12/24/64/86 个 1T experts。
+该曲线可作为未来 DRAM pressure shadow 的 NUMA-local service response，但当前
+planner 仍使用 empirical contention profile；公式、可行域和 production 剪枝未改变。
+
 ## 10. 同步规则
 
 发生以下任一变化时，必须同步更新本文档：
@@ -1099,3 +1190,7 @@ planner 中 merge-overlap 的 cost 校准。
 | 2026-07-16 | v0.16 | 增加显式 packed-B byte-window kernel variant：按 SVE N tile 推导 W13/W2 range 数、实际最大窗口和有效线程上界；明确 range 间无 barrier、owner-scatter ownership、M12 短 route 边界，以及该 variant 在重新校准前不进入 production planner。 |
 | 2026-07-16 | v0.17 | 增加可选 ready-token combine 外层：定义 TopK release time、单线程 merge CPU 约束和含 combine 的 makespan；记录 expert-first async heuristic、25% team-load 生效门槛、planner/cost-model 边界及 192-core NUMA0 首轮验证。 |
 | 2026-07-16 | v0.18 | 将通过验证的 async ready-token executor 设为 SVE FP32 direct-route 默认；保留 1.25 team-load 门槛和环境变量值 0 的 post-expert fallback，不改变 planner 决策空间或现有 cost tables。 |
+| 2026-07-16 | v0.19 | contention/working-set profiler 改为复用预分配 native `out`；将 allocation 与 first-touch 排除出 $I_i(t)$ 和 $D_i(\mathcal Z)$，并标记旧大 route allocate-per-call profile 不可用于 GEMM contention 校准。 |
+| 2026-07-16 | v0.20 | 在 192 核双 NUMA 上以两个 96-core 同步 rank 生成 TP4/F512 split-W13 稳态 profile；记录 route-dependent 最优 lane shape、35.89 TFLOP/s 长 route 聚合吞吐和跨 NUMA pairwise-max 必要性。 |
+| 2026-07-17 | v0.21 | 将双 NUMA TP4/F512 split-W13 校准扩展到真实 256 local experts，补齐 `96x1T` 等形状；记录 M=12 的 `24x4T`/`48x2T`/`96x1T` 宽平台，并禁止将 E64 full-call 排序外推到 256-expert TP4。 |
+| 2026-07-17 | v0.22 | 增加 NUMA0 M12 单满波冷 packed-B 带宽校准：256 份权重窗口轮换、1--96 个 1T experts、峰值 352.1 GB/s；记录 50%/75%/90%/95% 稳健带宽所需的 12/24/64/86 线程阈值，不改变 active planner 或剪枝。 |
