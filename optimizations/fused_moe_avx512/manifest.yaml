@@ -46,6 +46,30 @@ features:
       tests/bench_moe_avx512_bf16.py --tokens 12 --hidden 4096
       --intermediate 512 --experts 1 --top-k 1 --routing hot --threads 1
 
+  - id: compute.xbyak_exact_m
+    part: compute
+    status: experimental
+    implementation: >-
+      csrc/moe/x86/avx512_bf16/jit_kernels.cpp and setup.py
+    hypothesis: >-
+      Generating register-resident W13 and W2 kernels for exact logical M=1..12
+      removes the physical-M16 tail penalty, while a dynamic K loop and cached
+      M12 specialization keep exact-panel throughput within 3% of the intrinsic
+      implementation. Splitting K accumulation for small M supplies enough
+      independent VDPBF16PS chains to reach at least 85% of prepacked oneDNN
+      AVX-512 BF16 at M=4, M=8, and M=11.
+    depends_on:
+      - layout.vnni2_packed_weights
+      - compute.m12n32_vdpbf16ps
+    conflicts_with: []
+    correctness: >-
+      FUSED_CPP_MOE_AVX512_IMPL=jit PYTHONPATH=src
+      .venv/bin/python -m pytest -q tests/test_moe_avx512_bf16.py
+    benchmark: >-
+      ONEDNN_MAX_CPU_ISA=AVX512_CORE_BF16
+      FUSED_CPP_MOE_AVX512_IMPL=jit OMP_NUM_THREADS=1
+      taskset -c 0 benchmarks/bench_avx512_bf16_gemm 4 512 4096 10 51
+
   - id: epilogue.silu_mul_packa
     part: intermediate
     status: experimental
@@ -144,11 +168,26 @@ variants:
     features:
       - layout.vnni2_packed_weights
       - compute.m12n32_vdpbf16ps
+      - compute.xbyak_exact_m
       - epilogue.silu_mul_packa
       - store.direct_route
       - merge.avx512_weighted_reduce
       - dispatch.two_core_expert_or_nsplit
     entrypoint: >-
       prepare_fused_moe_bf16_tiled_weights(fuse_silu=True,
-      backend="x86_avx512_bf16") followed by fused_moe_bf16_tiled
+      backend="x86_avx512_bf16") followed by fused_moe_bf16_tiled with
+      FUSED_CPP_MOE_AVX512_IMPL=auto (the default)
+    status: experimental
+
+  - id: avx512_bf16_fused_expert_intrinsic
+    features:
+      - layout.vnni2_packed_weights
+      - compute.m12n32_vdpbf16ps
+      - epilogue.silu_mul_packa
+      - store.direct_route
+      - merge.avx512_weighted_reduce
+      - dispatch.two_core_expert_or_nsplit
+    entrypoint: >-
+      FUSED_CPP_MOE_AVX512_IMPL=intrinsic followed by the
+      x86_avx512_bf16 fused_moe_bf16_tiled entrypoint
     status: experimental

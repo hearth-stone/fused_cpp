@@ -8,8 +8,10 @@ The fusion boundary and M12 panel loop follow
 `csrc/moe/arm/sve_bf16/kernels.S` and the ARM executor. The BF16-pair operand
 layout and independent FP32 accumulators were cross-checked against oneDNN's
 `src/cpu/x64/gemm/bf16/jit_avx512_core_gemm_bf16bf16f32_kern.cpp` and its copy
-kernels under `3rdparty/oneDNN`; this code is an intrinsic implementation, not
-copied oneDNN JIT code.
+kernels under the ignored local `3rdparty/oneDNN` reference tree. The default
+compute path now generates its own kernels with the pinned Xbyak v7.37
+submodule; it does not copy oneDNN JIT code. The original intrinsic kernels
+remain the correctness and runtime fallback.
 
 ## Supported contract
 
@@ -39,10 +41,38 @@ unit contains two adjacent BF16 values consumed by one `VDPBF16PS`:
 - W2 writes FP32 directly to flat route rows, then an AVX-512 merge produces
   BF16 token output. Top-1 skip-weighted execution writes BF16 directly.
 
-Every full 12-row panel dispatches to the register-resident M12/N32 path, so
-M=48 executes four M12 panels. A final 1-11 row panel uses a correct M16-vector
-tail fallback. Dedicated M8/M4/M2/M1 tails and the broader scheduled/async API
-remain future work, so this backend is still experimental.
+Every full 12-row panel dispatches to an exact-M12 register kernel, so M=48
+executes four M12 panels. A final 1-11 row panel dispatches to its own exact-M
+kernel rather than computing 16 physical rows. The broader scheduled/async API
+remains future work, so this backend is still experimental.
+
+## Xbyak JIT dispatch
+
+The process-global, mutex-protected cache specializes these dimensions:
+
+- W13 or W2 operation and AVX-512 BF16 ISA;
+- exact logical M from 1 through 12;
+- W13 SiLU polynomial degree 4, 5, or 6;
+- W2 valid N lanes from 1 through 32 and FP32-route or direct-BF16 output.
+
+K remains a runtime loop so model dimensions do not multiply the cache. The
+executor resolves all kernels required by the current expert route counts
+before entering worker regions. Xbyak allocates writable code while generating
+and `readyRE()` publishes read/execute pages before a function pointer enters
+the cache. Small-M W2 kernels use two independent K accumulation sets when
+register capacity permits and reduce them before the store epilogue.
+
+`FUSED_CPP_MOE_AVX512_IMPL` controls the implementation:
+
+- `auto` (default): use JIT when Xbyak is built and a key generates
+  successfully, otherwise run the intrinsic implementation for that call;
+- `jit`: require JIT and report a missing submodule or generation failure;
+- `intrinsic`: bypass code generation and use the preserved implementation.
+
+The cache key and generator factory already reserve an AMX BF16 ISA value, but
+this change does not emit AMX instructions, change packed layouts, or enable
+backend ID 102. The first JIT implementation targets the System V x86-64 ABI;
+Windows builds retain the intrinsic path.
 
 Two-thread builds reuse the extension's OpenMP team and fall back to standard
 threads when OpenMP is unavailable, nested, or unable to provide the requested
@@ -54,18 +84,23 @@ On an x86 host, build only the independent MoE extension when unrelated
 architecture-specific sources in the main extension are unavailable:
 
 ```bash
+git submodule update --init 3rdparty/xbyak
 MAX_JOBS=2 FUSED_CPP_BUILD_MOE_ONLY=1 \
   .venv/bin/python setup.py build_ext --inplace
 PYTHONPATH=src .venv/bin/python -m pytest -q \
   tests/test_moe_backend_dispatch.py tests/test_moe_avx512_bf16.py
 ```
 
+If the Xbyak submodule is absent, the extension still builds with intrinsic
+dispatch. `FUSED_CPP_MOE_AVX512_IMPL=jit` then fails explicitly instead of
+silently claiming a JIT run.
+
 The end-to-end benchmark excludes custom weight prepack from timed execution.
 Pin the process and cap oneDNN to the same ISA for a fair AVX-512 comparison:
 
 ```bash
 ONEDNN_MAX_CPU_ISA=AVX512_CORE_BF16 OMP_NUM_THREADS=2 \
-  OMP_WAIT_POLICY=PASSIVE \
+  OMP_WAIT_POLICY=PASSIVE FUSED_CPP_MOE_AVX512_IMPL=jit \
   taskset -c 0,1 env PYTHONPATH=src .venv/bin/python \
   tests/bench_moe_avx512_bf16.py \
   --tokens 16 --hidden 4096 --intermediate 512 \
@@ -88,3 +123,8 @@ descriptor and performs its one-time reorder outside timing. Use
 `ONEDNN_MAX_CPU_ISA=AVX512_CORE_BF16`, `OMP_NUM_THREADS=1`, and `taskset` for
 the same-ISA single-core comparison. The result report also includes oneDNN's
 default AMX implementation as a separate hardware-ceiling comparison.
+
+`benchmarks/bench_avx512_bf16_w13.cpp` isolates the fused gate/up GEMM,
+polynomial SiLU-multiply, BF16 conversion, and W2 packed-A epilogue. Run the
+same binary in separate `FUSED_CPP_MOE_AVX512_IMPL=jit` and `intrinsic`
+processes to compare generated and fallback kernels without routing or W2.

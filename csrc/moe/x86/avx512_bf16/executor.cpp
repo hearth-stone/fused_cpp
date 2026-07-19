@@ -335,6 +335,13 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input, at::Tensor w13_packed, int64_t
     }
   }
 
+  std::vector<int> jit_row_counts;
+  jit_row_counts.reserve(tasks.size());
+  for (const ExpertTask& task : tasks) {
+    jit_row_counts.push_back(static_cast<int>(task.routes->size()));
+  }
+  avx512_moe::PrepareJitKernels(jit_row_counts, silu_poly_degree, static_cast<int>(input.size(1)), skip_weighted);
+
   const int f_pad = w13_shape.n_pad / 2;
   const int64_t max_padded_rows = (max_rows + 11) / 12 * 16;
   std::vector<ThreadScratch> scratches(static_cast<size_t>(num_threads));

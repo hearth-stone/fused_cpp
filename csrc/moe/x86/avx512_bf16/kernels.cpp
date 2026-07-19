@@ -254,8 +254,8 @@ void W2PackedBlock(const uint16_t* packed_a, const uint16_t* packed_b, float* ro
 
 }  // namespace
 
-void ComputeW13(const uint16_t* a, int a_stride, const uint16_t* packed_b, uint16_t* c, int c_stride, int rows,
-                int k_pad, int feature_block_begin, int feature_block_end, int silu_poly_degree) {
+void ComputeW13Intrinsic(const uint16_t* a, int a_stride, const uint16_t* packed_b, uint16_t* c, int c_stride, int rows,
+                         int k_pad, int feature_block_begin, int feature_block_end, int silu_poly_degree) {
   const int full_panels = rows / 12;
   const int tail_rows = rows % 12;
   for (int block = feature_block_begin; block < feature_block_end; ++block) {
@@ -274,9 +274,9 @@ void ComputeW13(const uint16_t* a, int a_stride, const uint16_t* packed_b, uint1
   }
 }
 
-void ComputeW2(const uint16_t* a, int a_stride, const uint16_t* packed_b, float* route_output, uint16_t* direct_output,
-               const int64_t* route_ids, int route_stride, int rows, int k_pad, int hidden_size, int output_block_begin,
-               int output_block_end, bool direct_bf16) {
+void ComputeW2Intrinsic(const uint16_t* a, int a_stride, const uint16_t* packed_b, float* route_output,
+                        uint16_t* direct_output, const int64_t* route_ids, int route_stride, int rows, int k_pad,
+                        int hidden_size, int output_block_begin, int output_block_end, bool direct_bf16) {
   const int full_panels = rows / 12;
   const int tail_rows = rows % 12;
   for (int block = output_block_begin; block < output_block_end; ++block) {

@@ -161,6 +161,7 @@ int main(int argc, char** argv) {
     };
 
     custom_kernel();
+    const avx512_moe::JitStats jit_stats = avx512_moe::GetJitStats();
     onednn_kernel();
     float max_abs = 0.0f;
     double checksum = 0.0;
@@ -174,9 +175,13 @@ int main(int argc, char** argv) {
     const auto [onednn_median, onednn_best] = Measure(onednn_kernel, warmup, runs);
     const double flops = 2.0 * m * k * n;
     const char* isa = std::getenv("ONEDNN_MAX_CPU_ISA");
+    const char* custom_impl = std::getenv("FUSED_CPP_MOE_AVX512_IMPL");
     std::cout << std::setprecision(10) << "{\"m\":" << m << ",\"k\":" << k << ",\"n\":" << n << ",\"warmup\":" << warmup
               << ",\"runs\":" << runs << ",\"onednn_max_cpu_isa\":\"" << (isa == nullptr ? "" : isa)
-              << "\",\"onednn_impl\":\"" << descriptor.impl_info_str() << "\",\"max_abs\":" << max_abs
+              << "\",\"custom_impl\":\"" << (custom_impl == nullptr ? "auto" : custom_impl)
+              << "\",\"jit\":{\"kernel_count\":" << jit_stats.kernel_count << ",\"code_bytes\":" << jit_stats.code_bytes
+              << ",\"generation_ms\":" << (static_cast<double>(jit_stats.generation_nanoseconds) / 1.0e6) << "}"
+              << ",\"onednn_impl\":\"" << descriptor.impl_info_str() << "\",\"max_abs\":" << max_abs
               << ",\"checksum\":" << checksum << ",\"custom_kernel\":{\"median_ms\":" << custom_median
               << ",\"best_ms\":" << custom_best << ",\"median_gflops\":" << Gflops(flops, custom_median)
               << ",\"best_gflops\":" << Gflops(flops, custom_best)

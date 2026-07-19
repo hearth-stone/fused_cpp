@@ -438,6 +438,14 @@ if omp_available:
 
 if is_x86_64:
     moe_define_macros.append(("FUSED_CPP_MOE_HAS_X86_AVX512_BF16", "1"))
+    # BuildExtension may invoke Ninja from its temporary directory, so this
+    # external header-only dependency must use an absolute include path.
+    xbyak_root = os.path.abspath(os.path.join("3rdparty", "xbyak"))
+    # The first generator uses the System V x86-64 ABI. Windows keeps the
+    # intrinsic path until its nonvolatile GPR/ZMM save contract is emitted.
+    if platform.system() != "Windows" and os.path.isfile(os.path.join(xbyak_root, "xbyak", "xbyak.h")):
+        moe_include_dirs.append(xbyak_root)
+        moe_define_macros.append(("FUSED_CPP_MOE_HAS_XBYAK", "1"))
     avx512_bf16_source = os.path.join("csrc", "moe", "x86", "avx512_bf16", "kernels.cpp")
     moe_sources = [source for source in moe_sources if source != avx512_bf16_source]
     moe_native_sources.append(

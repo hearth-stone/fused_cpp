@@ -109,6 +109,7 @@ def main() -> None:
                 "threads": args.threads,
                 "torch_baseline_threads": args.threads,
                 "backend": packed.backend_name,
+                "custom_impl": os.environ.get("FUSED_CPP_MOE_AVX512_IMPL", "auto"),
                 "onednn_max_cpu_isa": os.environ.get("ONEDNN_MAX_CPU_ISA"),
                 "omp_wait_policy": os.environ.get("OMP_WAIT_POLICY"),
                 "torch_mkldnn_available": torch.backends.mkldnn.is_available(),

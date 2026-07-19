@@ -111,7 +111,7 @@ def test_avx512_fused_expert_matches_naive(
 
 
 @pytest.mark.parametrize("degree", [4, 5, 6])
-def test_avx512_silu_degrees_are_thread_deterministic(degree: int) -> None:
+def test_avx512_silu_degrees_are_thread_deterministic(monkeypatch: pytest.MonkeyPatch, degree: int) -> None:
     """Single- and dual-thread schedules must produce identical BF16 values."""
     inputs, w13, w2, topk_weights, topk_ids = _case(
         tokens=29,
@@ -141,6 +141,52 @@ def test_avx512_silu_degrees_are_thread_deterministic(degree: int) -> None:
     )
 
     torch.testing.assert_close(threaded.float(), serial.float(), atol=0, rtol=0)
+    monkeypatch.setenv("FUSED_CPP_MOE_AVX512_IMPL", "intrinsic")
+    intrinsic = fused_moe_bf16_tiled(
+        inputs,
+        packed,
+        topk_weights,
+        topk_ids,
+        num_threads=1,
+        silu_poly_degree=degree,
+    )
+    _assert_bf16_close(serial, intrinsic)
+
+
+@pytest.mark.parametrize("routes", range(1, 14), ids=lambda value: f"m{value}")
+def test_avx512_exact_m_jit_matches_intrinsic(monkeypatch: pytest.MonkeyPatch, routes: int) -> None:
+    """Every exact-M specialization and the M12+tail composition retain the fallback contract."""
+    inputs, w13, w2, topk_weights, topk_ids = _case(
+        tokens=routes,
+        hidden=33,
+        intermediate=17,
+        experts=1,
+        top_k=1,
+        seed=routes,
+    )
+    packed = prepare_fused_moe_bf16_tiled_weights(w13, w2, fuse_silu=True)
+
+    monkeypatch.setenv("FUSED_CPP_MOE_AVX512_IMPL", "jit")
+    jit = fused_moe_bf16_tiled(inputs, packed, topk_weights, topk_ids, num_threads=1)
+    monkeypatch.setenv("FUSED_CPP_MOE_AVX512_IMPL", "intrinsic")
+    intrinsic = fused_moe_bf16_tiled(inputs, packed, topk_weights, topk_ids, num_threads=1)
+
+    _assert_bf16_close(jit, intrinsic)
+
+
+def test_avx512_rejects_unknown_implementation_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    inputs, w13, w2, topk_weights, topk_ids = _case(
+        tokens=1,
+        hidden=16,
+        intermediate=8,
+        experts=1,
+        top_k=1,
+    )
+    packed = prepare_fused_moe_bf16_tiled_weights(w13, w2, fuse_silu=True)
+    monkeypatch.setenv("FUSED_CPP_MOE_AVX512_IMPL", "unknown")
+
+    with pytest.raises(RuntimeError, match="must be auto, jit, or intrinsic"):
+        fused_moe_bf16_tiled(inputs, packed, topk_weights, topk_ids, num_threads=1)
 
 
 def test_avx512_skip_weighted_and_out_buffer() -> None:

@@ -116,10 +116,90 @@ performance is much lower when M is not divisible by 12:
 | 11 | 512 | 4096 | 0.6878 ms, 67.07 GFLOP/s | 0.4062 ms, 113.59 GFLOP/s | 0.59x |
 | 13 | 512 | 4096 | 1.1258 ms, 48.43 GFLOP/s | 0.4788 ms, 113.89 GFLOP/s | 0.43x |
 
-M=13 exposes the discontinuity particularly clearly: the executor runs one
-efficient M12 panel and then pays for a full physical-M16 fallback to compute
-the final row. Dedicated M8/M4/M2/M1 register kernels are required before the
-same-ISA oneDNN parity extends to arbitrary expert route counts.
+This intrinsic baseline exposes the M=13 discontinuity particularly clearly:
+the executor runs one efficient M12 panel and then pays for a full
+physical-M16 fallback to compute the final row. It motivated the exact-M JIT
+variant measured below.
+
+## Xbyak exact-M JIT
+
+The table above is retained as the intrinsic fallback baseline. The Xbyak
+variant generates exact logical M=1 through M=12 W13 and W2 kernels, composes
+larger row counts from M12 panels plus one exact tail, and leaves K as a
+runtime loop. Xbyak was pinned to v7.37 at commit
+`431abd865e70a46d56f5aa0e1f87572decb60169`. Generated code is cached for the
+process and published read/execute with `readyRE()` before worker threads use
+it. `FUSED_CPP_MOE_AVX512_IMPL=intrinsic` selects the table-above fallback;
+`jit` forces generation; `auto` is the default and falls back per call if a
+key cannot be generated.
+
+Correctness was rerun in both forced modes after the final loop scheduling
+change:
+
+```bash
+FUSED_CPP_MOE_AVX512_IMPL=jit PYTHONPATH=src .venv/bin/python -m pytest -q \
+  tests/test_moe_backend_dispatch.py tests/test_moe_avx512_bf16.py
+FUSED_CPP_MOE_AVX512_IMPL=intrinsic PYTHONPATH=src .venv/bin/python -m pytest -q \
+  tests/test_moe_avx512_bf16.py
+```
+
+Forced JIT plus dispatch passed 31 tests with four architecture skips; forced
+intrinsic passed all 28 x86 tests. The exact-M cases explicitly compare JIT
+and intrinsic at every M from 1 through 13. Degrees 4/5/6, FP32 route output,
+direct-BF16 output, one/two threads, N/H/F tails, and M12+tail composition are
+covered. The standalone W2 control's maximum absolute difference from oneDNN
+was `3.73e-9`.
+
+A temporary standalone build compiled `jit_kernels.cpp` without
+`FUSED_CPP_MOE_HAS_XBYAK`: `auto` ran the intrinsic kernel with zero generated
+kernels, while forced `jit` exited with the expected "requires a build with
+the Xbyak submodule available" error. This validates the dependency-absent
+build/runtime fallback separately from generation success.
+
+The final W2 single-GEMM command used 10 warmups and 51 samples on core 0:
+
+```bash
+ONEDNN_MAX_CPU_ISA=AVX512_CORE_BF16 \
+FUSED_CPP_MOE_AVX512_IMPL=jit OMP_NUM_THREADS=1 OMP_DYNAMIC=FALSE \
+taskset -c 0 benchmarks/bench_avx512_bf16_gemm M 512 4096 10 51
+```
+
+| M | Xbyak JIT | Intrinsic fallback | oneDNN AVX-512 | JIT/intrinsic | JIT/oneDNN | Generated code/time |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 30.25 GFLOP/s | 6.34 GFLOP/s | 29.68 GFLOP/s | 4.77x | 1.02x | 253 B / 0.018 ms |
+| 4 | 102.35 GFLOP/s | 25.28 GFLOP/s | 114.28 GFLOP/s | 4.05x | 0.90x | 663 B / 0.018 ms |
+| 8 | 113.56 GFLOP/s | 49.96 GFLOP/s | 115.74 GFLOP/s | 2.27x | 0.98x | 515 B / 0.021 ms |
+| 11 | 115.71 GFLOP/s | 67.17 GFLOP/s | 112.82 GFLOP/s | 1.72x | 1.03x | 711 B / 0.021 ms |
+| 12 | 113.53 GFLOP/s | 114.64 GFLOP/s | 113.21 GFLOP/s | 0.99x | 1.00x | 755 B / 0.023 ms |
+| 13 | 109.44 GFLOP/s | 48.40 GFLOP/s | 114.01 GFLOP/s | 2.26x | 0.96x | 1008 B / 0.034 ms |
+
+M4/M8/M11 reach 89.5%/98.1%/102.6% of prepacked oneDNN, above the planned
+85% small-M gate. M12 retains 99.0% of intrinsic throughput, above the 97%
+no-regression gate. M1 and composed M13 reach 101.9% and 96.0% of oneDNN,
+respectively. Small M uses two K accumulator sets when the ZMM budget allows;
+this raised M4 from 96.2 to about 102.3 GFLOP/s before A packing.
+
+`benchmarks/bench_avx512_bf16_w13.cpp` independently times the fused gate/up
+GEMM, degree-5 SiLU-multiply, BF16 conversion, and W2 packed-A epilogue. At
+M=12, K=4096, F=512, 101 samples produced 116.81 GFLOP/s for JIT and 116.88
+GFLOP/s for intrinsic (99.94%), with the same checksum. The generated W13
+kernel was 5736 bytes and took 0.079 ms to create. Aligning the dynamic K loop
+to 64 bytes and restoring the intrinsic kernel's eight-K-pair B prefetch was
+essential: before that change the JIT reached only 109.12 GFLOP/s, or 93.3%
+of intrinsic.
+
+One rejected epilogue experiment replaced explicit scalar broadcasts with
+EVEX memory-broadcast arithmetic. On the balanced full operator it reduced
+JIT throughput to roughly 75-77 GFLOP/s while contemporaneous intrinsic runs
+were 84-88 GFLOP/s, so it was reverted.
+
+Final full-operator controls used 31 samples. Hot M=12 was 1.4059 ms / 107.40
+GFLOP/s for JIT versus 1.4040 ms / 107.54 GFLOP/s for intrinsic (99.9%). Hot
+M=13 was 1.6129 ms / 101.42 GFLOP/s versus 3.4225 ms / 47.79 GFLOP/s, a 2.12x
+tail speedup. On the balanced 96-route workload, an interleaved one-core pair
+measured 88.87 versus 87.84 GFLOP/s; the pinned two-core comparison measured
+183.35 versus 182.48 GFLOP/s. Thus the final default JIT did not regress the
+full exact-panel workload and removed the arbitrary-M tail discontinuity.
 
 Without the ISA cap, oneDNN selected `brg_matmul:avx10_1_512_amx`:
 
@@ -145,7 +225,7 @@ ceilings.
 Larger experts now loop over full M12 panels: M=48 reaches 108.41 GFLOP/s on
 one core, within 6.5% of the isolated prepacked oneDNN AVX-512 control. The
 two-core full operator reaches 174.29 GFLOP/s, leaving more scheduling and
-integration overhead than the isolated 231.01 GFLOP/s control. The remaining
-kernel gap is concentrated in final 1-11 row tails, which still use the
-generic M-vector path; dedicated M8/M4/M2/M1 register kernels are the next
-compute optimization.
+integration overhead than the isolated 231.01 GFLOP/s control. The exact-M
+Xbyak results above close the former final-panel gap without changing backend
+metadata or packed layouts. The next x86 compute step is a separately tested
+AMX generator/packing strategy; backend ID 102 remains reserved and disabled.

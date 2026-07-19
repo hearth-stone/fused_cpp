@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
+#include <vector>
 
 namespace fused_cpp::moe::x86::avx512_bf16 {
 
@@ -15,6 +17,27 @@ void ComputeW13(const uint16_t* a, int a_stride, const uint16_t* packed_b, uint1
 void ComputeW2(const uint16_t* a, int a_stride, const uint16_t* packed_b, float* route_output, uint16_t* direct_output,
                const int64_t* route_ids, int route_stride, int rows, int k_pad, int hidden_size, int output_block_begin,
                int output_block_end, bool direct_bf16);
+
+// Intrinsic implementations are kept as the per-call fallback for JIT cache
+// misses/failures and for FUSED_CPP_MOE_AVX512_IMPL=intrinsic.
+void ComputeW13Intrinsic(const uint16_t* a, int a_stride, const uint16_t* packed_b, uint16_t* c, int c_stride, int rows,
+                         int k_pad, int feature_block_begin, int feature_block_end, int silu_poly_degree);
+
+void ComputeW2Intrinsic(const uint16_t* a, int a_stride, const uint16_t* packed_b, float* route_output,
+                        uint16_t* direct_output, const int64_t* route_ids, int route_stride, int rows, int k_pad,
+                        int hidden_size, int output_block_begin, int output_block_end, bool direct_bf16);
+
+// Resolve all exact-M kernels needed by the current routing plan before worker
+// threads start. K is intentionally dynamic and is not part of the cache key.
+void PrepareJitKernels(const std::vector<int>& row_counts, int silu_poly_degree, int hidden_size, bool direct_bf16);
+
+struct JitStats {
+  uint64_t kernel_count = 0;
+  uint64_t code_bytes = 0;
+  uint64_t generation_nanoseconds = 0;
+};
+
+JitStats GetJitStats();
 
 void MergeRoutes(const float* route_output, const float* weights, uint16_t* output, int64_t token_begin,
                  int64_t token_end, int64_t top_k, int64_t hidden_size);
