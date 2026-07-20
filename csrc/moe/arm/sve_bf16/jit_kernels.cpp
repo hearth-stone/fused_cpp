@@ -91,7 +91,7 @@ class SveFusedGenerator final : public CodeGenerator {
         rows_(rows),
         degree_(degree),
         row_pairs_((rows + 1) / 2),
-        accumulator_base_(rows <= 8 ? 32 - row_pairs_ * 4 : 8),
+        accumulator_base_(rows <= 8 ? 16 : 8),
         physical_rows_(rows <= 8 ? 8 : 12) {
     if (rows_ < 1 || rows_ > 12) {
       throw std::invalid_argument("SVE JIT rows must be in [1, 12]");
@@ -133,9 +133,6 @@ class SveFusedGenerator final : public CodeGenerator {
   }
 
   void save_callee_simd() {
-    if (operation_ != Operation::kW13 && accumulator_base_ >= 16) {
-      return;
-    }
     stp(d8, d9, pre_ptr(sp, -16));
     stp(d10, d11, pre_ptr(sp, -16));
     stp(d12, d13, pre_ptr(sp, -16));
@@ -143,47 +140,87 @@ class SveFusedGenerator final : public CodeGenerator {
   }
 
   void restore_callee_simd() {
-    if (operation_ != Operation::kW13 && accumulator_base_ >= 16) {
-      return;
-    }
     ldp(d14, d15, post_ptr(sp, 16));
     ldp(d12, d13, post_ptr(sp, 16));
     ldp(d10, d11, post_ptr(sp, 16));
     ldp(d8, d9, post_ptr(sp, 16));
   }
 
-  void load_b() {
-    ld1h(z4.h, p0 / T_z, ptr(x14));
-    ld1h(z5.h, p0 / T_z, ptr(x14, 1, MUL_VL));
-    ld1h(z6.h, p0 / T_z, ptr(x14, 2, MUL_VL));
-    ld1h(z7.h, p0 / T_z, ptr(x14, 3, MUL_VL));
+  void load_b(int register_base) {
+    ld1h(ZRegH(register_base), p0 / T_z, ptr(x14));
+    ld1h(ZRegH(register_base + 1), p0 / T_z, ptr(x14, 1, MUL_VL));
+    ld1h(ZRegH(register_base + 2), p0 / T_z, ptr(x14, 2, MUL_VL));
+    ld1h(ZRegH(register_base + 3), p0 / T_z, ptr(x14, 3, MUL_VL));
     add(x14, x14, x9, LSL, 2);
   }
 
-  void compute_pairs(int begin_pair, int end_pair, int a_register_base) {
+  void compute_pairs(int begin_pair, int end_pair, int a_register_base, int b_register_base) {
     for (int column = 0; column < 4; ++column) {
       for (int pair = begin_pair; pair < end_pair; ++pair) {
-        bfmmla(accumulator(pair, column), ZRegH(a_register_base + pair - begin_pair), ZRegH(4 + column));
+        bfmmla(accumulator(pair, column), ZRegH(a_register_base + pair - begin_pair), ZRegH(b_register_base + column));
       }
     }
   }
 
-  void emit_k4() {
-    load_b();
+  void load_ab_small(int a_register_base, int b_register_base) {
+    load_b(b_register_base);
+    for (int pair = 0; pair < row_pairs_; ++pair) {
+      ld1rqh(ZRegH(a_register_base + pair), p0 / T_z, ptr(x13, pair * 16));
+    }
+    add(x13, x13, physical_rows_ * 8);
+  }
+
+  // Match the static M2/M4/M8 state machine: compute the current K4 panel
+  // while the alternate A/B register bank is already resident.
+  void emit_small_double_buffered_k_loop() {
+    constexpr int kCurrentABase = 0;
+    constexpr int kCurrentBBase = 4;
+    constexpr int kNextABase = 8;
+    constexpr int kNextBBase = 12;
+    Label k_loop;
+    Label tail_current;
+    Label tail_next;
+    Label k_done;
+
+    load_ab_small(kCurrentABase, kCurrentBBase);
+    subs(w15, w15, 4);
+    b(EQ, tail_current);
+
+    L(k_loop);
+    load_ab_small(kNextABase, kNextBBase);
+    compute_pairs(0, row_pairs_, kCurrentABase, kCurrentBBase);
+    subs(w15, w15, 4);
+    b(EQ, tail_next);
+    load_ab_small(kCurrentABase, kCurrentBBase);
+    compute_pairs(0, row_pairs_, kNextABase, kNextBBase);
+    subs(w15, w15, 4);
+    b(GT, k_loop);
+
+    L(tail_current);
+    compute_pairs(0, row_pairs_, kCurrentABase, kCurrentBBase);
+    b(k_done);
+
+    L(tail_next);
+    compute_pairs(0, row_pairs_, kNextABase, kNextBBase);
+    L(k_done);
+  }
+
+  void emit_m12_k4() {
+    load_b(4);
     const int first_group = std::min(row_pairs_, 4);
     for (int pair = 0; pair < first_group; ++pair) {
       ld1rqh(ZRegH(pair), p0 / T_z, ptr(x13, pair * 16));
     }
     if (physical_rows_ == 12) {
       const int early_pairs = std::min(first_group, 2);
-      compute_pairs(0, early_pairs, 0);
+      compute_pairs(0, early_pairs, 0, 4);
       for (int pair = 4; pair < row_pairs_; ++pair) {
         ld1rqh(ZRegH(pair - 4), p0 / T_z, ptr(x13, pair * 16));
       }
-      compute_pairs(early_pairs, first_group, early_pairs);
-      compute_pairs(4, row_pairs_, 0);
+      compute_pairs(early_pairs, first_group, early_pairs, 4);
+      compute_pairs(4, row_pairs_, 0, 4);
     } else {
-      compute_pairs(0, first_group, 0);
+      compute_pairs(0, first_group, 0, 4);
     }
     add(x13, x13, physical_rows_ * 8);
   }
@@ -571,12 +608,16 @@ class SveFusedGenerator final : public CodeGenerator {
     mov(x13, x0);
     mov(x14, x6);
     mov(w15, w5);
-    Label k_loop;
-    L(k_loop);
-    emit_k4();
-    emit_k4();
-    subs(w15, w15, 8);
-    b(GT, k_loop);
+    if (physical_rows_ == 8) {
+      emit_small_double_buffered_k_loop();
+    } else {
+      Label k_loop;
+      L(k_loop);
+      emit_m12_k4();
+      emit_m12_k4();
+      subs(w15, w15, 8);
+      b(GT, k_loop);
+    }
 
     if (operation_ == Operation::kW13) {
       store_w13();

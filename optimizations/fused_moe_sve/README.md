@@ -8,10 +8,13 @@ default for their supported SVE paths; neither changes the fused-MoE API.
 
 The default one-chunk SVE path generates W13 fused-SiLU/packC, W2 FP32, and W2
 FP32 direct-route kernels with the pinned `xbyak_aarch64` submodule. The GEMM
-body retains the production static-assembly K8 granularity and accumulator
-mapping, but the first generator does not yet reproduce the static M8/M4/M2
-double-buffered load/compute software pipeline. The generated tail specializes
-every logical M=1..12: its compute height is
+body retains the production static-assembly K granularity and accumulator
+mapping. For M<=8 it also reproduces the static M2/M4/M8 K-loop state machine:
+one A/B register bank computes while the alternate bank already holds the next
+K4 panel, with the same current/next tail branches. M=9..12 retains the static
+M12 single-bank schedule because its 20-24 accumulators leave no registers for
+a second complete A/B bank. The generated tail specializes every logical
+M=1..12: its compute height is
 `2 * ceil(M / 2)`, while its packed-A height remains eight rows for M<=8 and
 twelve rows otherwise. This removes the static M4/M8/M12 bucket overcompute
 without changing packed weights, intermediate layout, or public APIs.
@@ -31,16 +34,16 @@ to the timed sample:
 numactl --cpunodebind=0 --membind=0 taskset -c 0-95 \
   .venv/bin/python \
   optimizations/fused_moe_sve/benchmarks/bench_xbyak_exact_m.py \
-  --routes 5,6,9,10,12,192,2040 --threads 1,4,8,16,32,64,96 \
-  --warmup 3 --runs 11 --switch-period 5
+  --routes 1,2,3,4,5,6,7,8,9,10,11,12 --threads 1,2,4,8 \
+  --warmup 8 --runs 40 --switch-period 4
 ```
 
 With H=4096, F=512, eight distinct experts, and split-W13, the 192-core host's
-NUMA0 gained 11.75% for M5/M6 and about 10% for M9/M10 at 1T. M12 was within
-0.54% of static assembly. Across M192/M2040 and 1-96T, every measured point was
-within 0.86%, with no long-route throughput regression. The 8-core host gained
-roughly 5-12% on those exact tails; M12 and long routes remained within about
-1.3%. Full commands and tables are in
+NUMA0 gained 13.6% for M5/M6 and about 10% for M9/M10 at 1T. M1-4, M7/8, and
+M11/12 are within 0.5% of static assembly at 1T. Reproducing the double-buffer
+state machine removed the earlier M7/8 regressions of 2-4% at 1T-4T. The
+8-core host retains roughly 4-12% on the exact tails, while equal-compute-height
+controls stay within about 1.2%. Full commands and tables are in
 [`results/amazon_8c_192c_xbyak_exact_m.md`](results/amazon_8c_192c_xbyak_exact_m.md).
 
 ## SVE weighted route merge

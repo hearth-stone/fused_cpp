@@ -47,6 +47,9 @@ specializing the final physical panel for every logical M from 1 through 12.
 M1-M8 use the existing eight-row packed-A panel, M9-M12 use the twelve-row
 panel, and only `2 * ceil(M / 2)` rows execute BFMMLA. Kernel generation is
 prewarmed during SVE weight preparation, outside the forward-call timing path.
+The M1-M8 generated K loop uses the static M2/M4/M8 two-bank load/compute state
+machine. M9-M12 use the static M12 register-reuse schedule because the larger
+accumulator set cannot coexist with two complete A/B banks.
 
 `FUSED_CPP_MOE_SVE_IMPL` controls compute dispatch:
 
