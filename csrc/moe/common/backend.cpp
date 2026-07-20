@@ -191,6 +191,9 @@ bool backend_runtime_supported(const MoeBackend& backend) {
 
 const MoeBackend& resolve_backend(const std::string& requested, bool fuse_silu) {
   if (requested.empty() || requested == "auto") {
+    if (fuse_silu && backend_runtime_supported(kX86AmxBf16Backend)) {
+      return kX86AmxBf16Backend;
+    }
     if (fuse_silu && backend_runtime_supported(kX86Avx512Bf16Backend)) {
       return kX86Avx512Bf16Backend;
     }

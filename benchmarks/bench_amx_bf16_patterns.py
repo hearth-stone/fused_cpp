@@ -14,7 +14,45 @@ from fused_cpp.moe import fused_moe_naive
 from fused_cpp.moe import prepare_fused_moe_bf16_tiled_weights
 
 
-_PATTERNS = ("m1n2", "m2n2", "m1n4")
+_PATTERNS = ("auto", "m1n2", "m2n2", "m1n4")
+_SILU_EPILOGUES = ("auto", "baseline", "resident", "pipelined", "rcp14")
+
+
+def _parse_patterns(raw: str) -> tuple[str, ...]:
+    patterns: list[str] = []
+    for pattern in raw.split(","):
+        if pattern not in _PATTERNS:
+            raise argparse.ArgumentTypeError(f"unknown AMX pattern {pattern!r}; expected one of {_PATTERNS}")
+        if pattern not in patterns:
+            patterns.append(pattern)
+    if not patterns:
+        raise argparse.ArgumentTypeError("at least one AMX pattern is required")
+    return tuple(patterns)
+
+
+def _parse_silu_epilogues(raw: str) -> tuple[str, ...]:
+    epilogues: list[str] = []
+    for epilogue in raw.split(","):
+        if epilogue not in _SILU_EPILOGUES:
+            raise argparse.ArgumentTypeError(
+                f"unknown AMX SiLU epilogue {epilogue!r}; expected one of {_SILU_EPILOGUES}",
+            )
+        if epilogue not in epilogues:
+            epilogues.append(epilogue)
+    if not epilogues:
+        raise argparse.ArgumentTypeError("at least one AMX SiLU epilogue is required")
+    return tuple(epilogues)
+
+
+def _select_variant(pattern: str, silu_epilogue: str) -> None:
+    if pattern == "auto":
+        os.environ.pop("FUSED_CPP_MOE_AMX_PATTERN", None)
+    else:
+        os.environ["FUSED_CPP_MOE_AMX_PATTERN"] = pattern
+    if silu_epilogue == "auto":
+        os.environ.pop("FUSED_CPP_MOE_AMX_SILU_EPILOGUE", None)
+    else:
+        os.environ["FUSED_CPP_MOE_AMX_SILU_EPILOGUE"] = silu_epilogue
 
 
 def _routing(tokens: int, experts: int, top_k: int, mode: str) -> torch.Tensor:
@@ -38,7 +76,7 @@ def _median_and_best(samples: list[float]) -> tuple[float, float]:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Compare AMX fused-expert JIT tile patterns.")
+    parser = argparse.ArgumentParser(description="Compare AMX fused-expert JIT tile patterns and SiLU epilogues.")
     parser.add_argument("--tokens", type=int, default=32)
     parser.add_argument("--hidden", type=int, default=4096)
     parser.add_argument("--intermediate", type=int, default=512)
@@ -46,6 +84,8 @@ def main() -> None:
     parser.add_argument("--top-k", type=int, default=1)
     parser.add_argument("--routing", choices=("balanced", "hot", "skewed"), default="hot")
     parser.add_argument("--threads", type=int, choices=(1, 2), default=1)
+    parser.add_argument("--patterns", type=_parse_patterns, default=_PATTERNS)
+    parser.add_argument("--silu-epilogues", type=_parse_silu_epilogues, default=("auto",))
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--runs", type=int, default=21)
     parser.add_argument("--baseline-runs", type=int, default=0)
@@ -90,35 +130,51 @@ def main() -> None:
     torch.set_num_threads(args.threads)
     reference = fused_moe_naive(inputs, w13, w2, topk_weights, topk_ids)
     torch.set_num_threads(1)
+    variants = tuple((pattern, epilogue) for pattern in args.patterns for epilogue in args.silu_epilogues)
+    labels = {
+        variant: variant[0] if args.silu_epilogues == ("auto",) else f"{variant[0]}:{variant[1]}"
+        for variant in variants
+    }
     max_abs: dict[str, float] = {}
-    for pattern in _PATTERNS:
-        os.environ["FUSED_CPP_MOE_AMX_PATTERN"] = pattern
+    outputs: dict[str, torch.Tensor] = {}
+    for pattern, epilogue in variants:
+        _select_variant(pattern, epilogue)
         output = custom()
-        max_abs[pattern] = float((output.float() - reference.float()).abs().max())
+        label = labels[(pattern, epilogue)]
+        outputs[label] = output
+        max_abs[label] = float((output.float() - reference.float()).abs().max())
         for _ in range(args.warmup):
             custom()
 
-    samples = {pattern: [] for pattern in _PATTERNS}
+    samples = {label: [] for label in labels.values()}
     for iteration in range(args.runs):
-        offset = iteration % len(_PATTERNS)
-        order = _PATTERNS[offset:] + _PATTERNS[:offset]
-        for pattern in order:
-            os.environ["FUSED_CPP_MOE_AMX_PATTERN"] = pattern
+        offset = iteration % len(variants)
+        order = variants[offset:] + variants[:offset]
+        for pattern, epilogue in order:
+            _select_variant(pattern, epilogue)
+            label = labels[(pattern, epilogue)]
             start = time.perf_counter_ns()
             custom()
-            samples[pattern].append((time.perf_counter_ns() - start) / 1e6)
+            samples[label].append((time.perf_counter_ns() - start) / 1e6)
 
     routes = args.tokens * args.top_k
     flops = float(routes * 6 * args.hidden * args.intermediate)
+    reference_label = next(
+        (labels[variant] for variant in variants if variant[1] == "baseline"),
+        labels[variants[0]],
+    )
     pattern_results = {}
-    for pattern in _PATTERNS:
-        median_ms, best_ms = _median_and_best(samples[pattern])
-        pattern_results[pattern] = {
+    for label in labels.values():
+        median_ms, best_ms = _median_and_best(samples[label])
+        difference = (outputs[label].float() - outputs[reference_label].float()).abs()
+        pattern_results[label] = {
             "median_ms": median_ms,
             "best_ms": best_ms,
             "median_gflops": flops / median_ms / 1e6,
             "best_gflops": flops / best_ms / 1e6,
-            "max_abs_vs_torch": max_abs[pattern],
+            "max_abs_vs_torch": max_abs[label],
+            "mismatches_vs_reference": int((outputs[label] != outputs[reference_label]).sum()),
+            "max_abs_vs_reference": float(difference.max()),
         }
 
     baseline = None
@@ -157,6 +213,8 @@ def main() -> None:
                 "warmup_per_pattern": args.warmup,
                 "runs_per_pattern": args.runs,
                 "prepack_ms": pack_ms,
+                "silu_epilogues": args.silu_epilogues,
+                "variant_reference": reference_label,
                 "patterns": pattern_results,
                 "torch_onednn_staged": baseline,
             },

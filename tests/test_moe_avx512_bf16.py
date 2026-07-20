@@ -123,7 +123,7 @@ def test_avx512_silu_degrees_are_thread_deterministic(monkeypatch: pytest.Monkey
         top_k=2,
         seed=degree,
     )
-    packed = prepare_fused_moe_bf16_tiled_weights(w13, w2, fuse_silu=True)
+    packed = prepare_fused_moe_bf16_tiled_weights(w13, w2, fuse_silu=True, backend="x86_avx512_bf16")
 
     serial = fused_moe_bf16_tiled(
         inputs,
@@ -166,7 +166,7 @@ def test_avx512_exact_m_jit_matches_intrinsic(monkeypatch: pytest.MonkeyPatch, r
         top_k=1,
         seed=routes,
     )
-    packed = prepare_fused_moe_bf16_tiled_weights(w13, w2, fuse_silu=True)
+    packed = prepare_fused_moe_bf16_tiled_weights(w13, w2, fuse_silu=True, backend="x86_avx512_bf16")
 
     monkeypatch.setenv("FUSED_CPP_MOE_AVX512_IMPL", "jit")
     jit = fused_moe_bf16_tiled(inputs, packed, topk_weights, topk_ids, num_threads=1)
@@ -184,10 +184,79 @@ def test_avx512_rejects_unknown_implementation_mode(monkeypatch: pytest.MonkeyPa
         experts=1,
         top_k=1,
     )
-    packed = prepare_fused_moe_bf16_tiled_weights(w13, w2, fuse_silu=True)
+    packed = prepare_fused_moe_bf16_tiled_weights(w13, w2, fuse_silu=True, backend="x86_avx512_bf16")
     monkeypatch.setenv("FUSED_CPP_MOE_AVX512_IMPL", "unknown")
 
     with pytest.raises(RuntimeError, match="must be auto, jit, or intrinsic"):
+        fused_moe_bf16_tiled(inputs, packed, topk_weights, topk_ids, num_threads=1)
+
+
+@pytest.mark.parametrize(
+    ("backend", "pattern"),
+    [
+        pytest.param("x86_avx512_bf16", None, id="avx512"),
+        pytest.param("x86_amx_bf16", "m1n2", marks=requires_amx, id="amx-m1n2"),
+        pytest.param("x86_amx_bf16", "m2n2", marks=requires_amx, id="amx-m2n2"),
+        pytest.param("x86_amx_bf16", "m1n4", marks=requires_amx, id="amx-m1n4"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("w13_blocks", "w2_blocks"),
+    [pytest.param(2, 3, id="even-odd"), pytest.param(5, 2, id="odd-even")],
+)
+@pytest.mark.parametrize("num_threads", [1, 2], ids=["single-core", "dual-core"])
+def test_x86_cache_block_windows_preserve_tails_and_threads(
+    monkeypatch: pytest.MonkeyPatch,
+    backend: str,
+    pattern: str | None,
+    w13_blocks: int,
+    w2_blocks: int,
+    num_threads: int,
+) -> None:
+    """N-window cache blocking must preserve odd block counts, tails, and two-worker N splitting."""
+    monkeypatch.setenv("FUSED_CPP_MOE_X86_W13_CACHE_BLOCKS", str(w13_blocks))
+    monkeypatch.setenv("FUSED_CPP_MOE_X86_W2_CACHE_BLOCKS", str(w2_blocks))
+    if pattern is not None:
+        monkeypatch.setenv("FUSED_CPP_MOE_AMX_PATTERN", pattern)
+    inputs, w13, w2, topk_weights, topk_ids = _case(
+        tokens=33,
+        hidden=131,
+        intermediate=83,
+        experts=1,
+        top_k=1,
+        seed=601 + w13_blocks + w2_blocks,
+    )
+    packed = prepare_fused_moe_bf16_tiled_weights(w13, w2, fuse_silu=True, backend=backend)
+
+    actual = fused_moe_bf16_tiled(inputs, packed, topk_weights, topk_ids, num_threads=num_threads)
+    expected = fused_moe_naive(inputs, w13, w2, topk_weights, topk_ids)
+
+    _assert_bf16_close(actual, expected)
+
+
+@pytest.mark.parametrize(
+    ("environment", "value"),
+    [
+        pytest.param("FUSED_CPP_MOE_X86_W13_CACHE_BLOCKS", "-1", id="negative-w13"),
+        pytest.param("FUSED_CPP_MOE_X86_W2_CACHE_BLOCKS", "abc", id="nonnumeric-w2"),
+    ],
+)
+def test_x86_rejects_invalid_cache_block_window(
+    monkeypatch: pytest.MonkeyPatch,
+    environment: str,
+    value: str,
+) -> None:
+    inputs, w13, w2, topk_weights, topk_ids = _case(
+        tokens=1,
+        hidden=32,
+        intermediate=16,
+        experts=1,
+        top_k=1,
+    )
+    packed = prepare_fused_moe_bf16_tiled_weights(w13, w2, fuse_silu=True, backend="x86_avx512_bf16")
+    monkeypatch.setenv(environment, value)
+
+    with pytest.raises(RuntimeError, match="must be auto or a non-negative integer"):
         fused_moe_bf16_tiled(inputs, packed, topk_weights, topk_ids, num_threads=1)
 
 
@@ -201,7 +270,7 @@ def test_avx512_skip_weighted_and_out_buffer() -> None:
         top_k=1,
     )
     topk_weights.fill_(1.0)
-    packed = prepare_fused_moe_bf16_tiled_weights(w13, w2, fuse_silu=True)
+    packed = prepare_fused_moe_bf16_tiled_weights(w13, w2, fuse_silu=True, backend="x86_avx512_bf16")
     output = torch.empty_like(inputs)
 
     returned = fused_moe_bf16_tiled(
@@ -227,7 +296,7 @@ def test_avx512_rejects_bias_and_more_than_two_threads() -> None:
         experts=1,
         top_k=1,
     )
-    packed = prepare_fused_moe_bf16_tiled_weights(w13, w2, fuse_silu=True)
+    packed = prepare_fused_moe_bf16_tiled_weights(w13, w2, fuse_silu=True, backend="x86_avx512_bf16")
 
     with pytest.raises(RuntimeError, match="does not support expert bias"):
         fused_moe_bf16_tiled(
@@ -263,8 +332,8 @@ def test_avx512_runtime_kill_switch(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @requires_amx
-def test_amx_backend_is_explicit_and_preserves_avx512_auto() -> None:
-    """AMX uses backend 102 while automatic x86 preparation remains on AVX-512."""
+def test_amx_backend_is_preferred_by_auto_with_explicit_avx512_fallback() -> None:
+    """Automatic x86 preparation prefers AMX while explicit AVX-512 remains available."""
     _, w13, w2, _, _ = _case(
         tokens=1,
         hidden=33,
@@ -280,14 +349,60 @@ def test_amx_backend_is_explicit_and_preserves_avx512_auto() -> None:
         fuse_silu=True,
         backend="x86_amx_bf16",
     )
+    avx512 = prepare_fused_moe_bf16_tiled_weights(
+        w13,
+        w2,
+        fuse_silu=True,
+        backend="x86_avx512_bf16",
+    )
 
-    assert automatic.gemm_backend == 101
-    assert automatic.backend_name == "x86_avx512_bf16"
+    assert automatic.gemm_backend == 102
+    assert automatic.backend_name == "x86_amx_bf16"
     assert amx.gemm_backend == 102
     assert amx.backend_n_tile == 32
     assert amx.backend_name == "x86_amx_bf16"
     assert amx.w13[0].shape[1] % 32 == 0
     assert amx.w2[0].shape[1] % 32 == 0
+    assert avx512.gemm_backend == 101
+    assert avx512.backend_name == "x86_avx512_bf16"
+
+
+@requires_amx
+@pytest.mark.parametrize("num_threads", [1, 2], ids=["single-core", "dual-core"])
+def test_amx_auto_pattern_and_cache_policy_support_mixed_expert_sizes(
+    monkeypatch: pytest.MonkeyPatch,
+    num_threads: int,
+) -> None:
+    """Auto policy may select m2n2 and m1n4 in one invocation without relying on environment overrides."""
+    inputs, w13, w2, topk_weights, _ = _case(
+        tokens=151,
+        hidden=641,
+        intermediate=545,
+        experts=2,
+        top_k=1,
+        seed=702,
+    )
+    topk_ids = torch.tensor([0] * 75 + [1] * 76, dtype=torch.int32).view(151, 1)
+    packed = prepare_fused_moe_bf16_tiled_weights(
+        w13,
+        w2,
+        fuse_silu=True,
+        backend="x86_amx_bf16",
+    )
+
+    monkeypatch.delenv("FUSED_CPP_MOE_AMX_PATTERN", raising=False)
+    monkeypatch.delenv("FUSED_CPP_MOE_X86_W13_CACHE_BLOCKS", raising=False)
+    monkeypatch.delenv("FUSED_CPP_MOE_X86_W2_CACHE_BLOCKS", raising=False)
+    automatic = fused_moe_bf16_tiled(inputs, packed, topk_weights, topk_ids, num_threads=num_threads)
+
+    monkeypatch.setenv("FUSED_CPP_MOE_AMX_PATTERN", "auto")
+    monkeypatch.setenv("FUSED_CPP_MOE_X86_W13_CACHE_BLOCKS", "auto")
+    monkeypatch.setenv("FUSED_CPP_MOE_X86_W2_CACHE_BLOCKS", "auto")
+    explicit_auto = fused_moe_bf16_tiled(inputs, packed, topk_weights, topk_ids, num_threads=num_threads)
+    expected = fused_moe_naive(inputs, w13, w2, topk_weights, topk_ids)
+
+    torch.testing.assert_close(explicit_auto.float(), automatic.float(), atol=0, rtol=0)
+    _assert_bf16_close(automatic, expected)
 
 
 @requires_amx
@@ -409,7 +524,73 @@ def test_amx_rejects_unknown_jit_pattern(monkeypatch: pytest.MonkeyPatch) -> Non
     )
     monkeypatch.setenv("FUSED_CPP_MOE_AMX_PATTERN", "unknown")
 
-    with pytest.raises(RuntimeError, match="must be m1n2, m2n2, or m1n4"):
+    with pytest.raises(RuntimeError, match="must be auto, m1n2, m2n2, or m1n4"):
+        fused_moe_bf16_tiled(inputs, packed, topk_weights, topk_ids, num_threads=1)
+
+
+@requires_amx
+@pytest.mark.parametrize("degree", [4, 5, 6])
+@pytest.mark.parametrize("pattern", ["m1n2", "m2n2", "m1n4"])
+@pytest.mark.parametrize("num_threads", [1, 2], ids=["single-core", "dual-core"])
+def test_amx_w13_silu_epilogues_match_baseline(
+    monkeypatch: pytest.MonkeyPatch,
+    degree: int,
+    pattern: str,
+    num_threads: int,
+) -> None:
+    """Resident constants and row pipelining are exact; RCP14 remains within the BF16 contract."""
+    monkeypatch.setenv("FUSED_CPP_MOE_AMX_PATTERN", pattern)
+    inputs, w13, w2, topk_weights, topk_ids = _case(
+        tokens=17,
+        hidden=67,
+        intermediate=35,
+        experts=1,
+        top_k=1,
+        seed=800 + degree,
+    )
+    packed = prepare_fused_moe_bf16_tiled_weights(
+        w13,
+        w2,
+        fuse_silu=True,
+        backend="x86_amx_bf16",
+    )
+
+    outputs: dict[str, torch.Tensor] = {}
+    for epilogue in ("baseline", "auto", "resident", "pipelined", "rcp14"):
+        monkeypatch.setenv("FUSED_CPP_MOE_AMX_SILU_EPILOGUE", epilogue)
+        outputs[epilogue] = fused_moe_bf16_tiled(
+            inputs,
+            packed,
+            topk_weights,
+            topk_ids,
+            num_threads=num_threads,
+            silu_poly_degree=degree,
+        )
+
+    torch.testing.assert_close(outputs["auto"].float(), outputs["resident"].float(), atol=0, rtol=0)
+    torch.testing.assert_close(outputs["resident"].float(), outputs["baseline"].float(), atol=0, rtol=0)
+    torch.testing.assert_close(outputs["pipelined"].float(), outputs["baseline"].float(), atol=0, rtol=0)
+    _assert_bf16_close(outputs["rcp14"], outputs["baseline"])
+
+
+@requires_amx
+def test_amx_rejects_unknown_silu_epilogue(monkeypatch: pytest.MonkeyPatch) -> None:
+    inputs, w13, w2, topk_weights, topk_ids = _case(
+        tokens=1,
+        hidden=32,
+        intermediate=16,
+        experts=1,
+        top_k=1,
+    )
+    packed = prepare_fused_moe_bf16_tiled_weights(
+        w13,
+        w2,
+        fuse_silu=True,
+        backend="x86_amx_bf16",
+    )
+    monkeypatch.setenv("FUSED_CPP_MOE_AMX_SILU_EPILOGUE", "unknown")
+
+    with pytest.raises(RuntimeError, match="must be auto, baseline, resident, pipelined, or rcp14"):
         fused_moe_bf16_tiled(inputs, packed, topk_weights, topk_ids, num_threads=1)
 
 
@@ -483,7 +664,7 @@ def test_amx_skip_weighted_direct_bf16_output() -> None:
 
 @requires_amx
 def test_amx_runtime_kill_switch(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The AMX kill switch hides only backend 102 and rejects explicit preparation."""
+    """The AMX kill switch hides backend 102, rejects it explicitly, and restores AVX-512 auto fallback."""
     _, w13, w2, _, _ = _case(
         tokens=1,
         hidden=32,
@@ -496,6 +677,9 @@ def test_amx_runtime_kill_switch(monkeypatch: pytest.MonkeyPatch) -> None:
     backends = available_fused_moe_bf16_tiled_backends()
     assert "x86_amx_bf16" not in backends
     assert "x86_avx512_bf16" in backends
+    automatic = prepare_fused_moe_bf16_tiled_weights(w13, w2, fuse_silu=True)
+    assert automatic.gemm_backend == 101
+    assert automatic.backend_name == "x86_avx512_bf16"
     with pytest.raises(RuntimeError, match="not supported by this build/runtime"):
         prepare_fused_moe_bf16_tiled_weights(
             w13,

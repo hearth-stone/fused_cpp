@@ -55,13 +55,13 @@ def main() -> None:
     parser.add_argument("--routing", choices=("balanced", "hot", "skewed"), default="balanced")
     parser.add_argument(
         "--backend",
-        choices=("x86_avx512_bf16", "x86_amx_bf16"),
-        default="x86_avx512_bf16",
+        choices=("auto", "x86_avx512_bf16", "x86_amx_bf16"),
+        default="auto",
     )
     parser.add_argument(
         "--amx-pattern",
-        choices=("m1n2", "m2n2", "m1n4"),
-        default=os.environ.get("FUSED_CPP_MOE_AMX_PATTERN", "m1n2"),
+        choices=("auto", "m1n2", "m2n2", "m1n4"),
+        default=os.environ.get("FUSED_CPP_MOE_AMX_PATTERN", "auto"),
     )
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--runs", type=int, default=21)
@@ -69,8 +69,11 @@ def main() -> None:
     parser.add_argument("--skip-baseline", action="store_true")
     args = parser.parse_args()
 
-    if args.backend == "x86_amx_bf16":
-        os.environ["FUSED_CPP_MOE_AMX_PATTERN"] = args.amx_pattern
+    if args.backend in ("auto", "x86_amx_bf16"):
+        if args.amx_pattern == "auto":
+            os.environ.pop("FUSED_CPP_MOE_AMX_PATTERN", None)
+        else:
+            os.environ["FUSED_CPP_MOE_AMX_PATTERN"] = args.amx_pattern
 
     torch.manual_seed(20260718)
     # The custom executor requests its own explicit parallel team. Keep the

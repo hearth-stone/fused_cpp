@@ -173,7 +173,9 @@ def prepare_fused_moe_bf16_tiled_weights(
     the fused SiLU-and-mul GEMM epilogue. ARM currently requires ``F % 8 == 0``;
     AVX-512 and AMX pad arbitrary positive ``F``. All fused backends require
     ``activation='silu'`` at call time. The returned object carries a ``fused_silu`` flag that
-    :func:`fused_moe_bf16_tiled` honours automatically.
+    :func:`fused_moe_bf16_tiled` honours automatically. On supported x86 Linux
+    systems, ``backend='auto'`` prefers AMX BF16 and falls back to AVX-512 BF16;
+    AMX pattern and cache-window selection are automatic per routed expert.
     """
     _require_backend()
     if w13_weight.dtype != torch.bfloat16 or w2_weight.dtype != torch.bfloat16:

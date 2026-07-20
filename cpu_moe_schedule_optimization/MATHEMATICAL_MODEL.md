@@ -588,6 +588,23 @@ N-split 和 M12 主体，但尾部映射不同，因此 profile identity 必须�
 split/no-split pair 为原子：先要求完整的 JIT pair，缺任意一半时才整体回退到
 完整 static pair，不能跨 variant 拼接 $\Theta_v$。
 
+实现也可以提供不暴露给 planner 的确定性 per-expert 子变体策略。令全局 backend
+$b$ 固定，而 expert $i$ 的微内核/loop-order 子变体由只依赖本次调用已知 shape 的
+映射决定：
+
+$$
+v_i=\pi_b(M_i,H,F,\mu),
+$$
+
+其中 $\mu$ 是机器能力与 build/runtime feature 集合。此时响应写为
+$I_i^{(b,v_i)}(t)$ 和 $D_i^{(b,v_i)}(\mathcal Z)$。只要 $\pi_b$ 是确定性的、不会
+改变线程宽度、依赖或资源可行性，它不扩展 planner 的决策空间，只把 backend
+$b$ 的响应函数改成分段函数；profile identity 和验证仍必须记录该 policy 版本。
+
+当前 x86 BF16 `auto` 是这种策略：runtime 支持时全局选择 AMX，否则回退
+AVX-512 BF16；AMX 内再按每个 expert 的 route 数选择 M pattern 和 cache window。
+环境变量只保留为强制实验/回归 override，不是 production 调用的必要输入。
+
 ## 6. 求解器编码
 
 ### 6.1 数学定义
@@ -640,7 +657,7 @@ One-hot 是线程宽度的等价求解器编码，不是剪枝。一般 active-s
 | Idling | 允许主动等待以避开争用 | lane 可启动下一个 expert 时立即启动；ready-token 路径仅填充无可运行 expert 的空闲 lane | non-idling 剪枝 |
 | Workload 输入 | 任意合法 global 或 rank-local route histogram | planner 接受任意 histogram；catalog preset 只扩展验证覆盖，不过滤运行时输入 | 不剪枝 |
 | Route combine | 任意满足 TopK release 约束和 CPU 容量的 merge 排程 | planner 不搜索 combine；默认 executor 采用 expert-first 单 token 贪心和连续收尾 | 外层启发式限制 |
-| Kernel variant | 任意未被支配的实现 | `auto` 先要求完整 `jit/xbyak_exact_m` legacy split/no-split pair，再加入同 identity 的实测 global packed-B byte-window variants；缺少完整 JIT legacy pair 时整体回退 static pair | 实例候选限制 |
+| Kernel variant | 任意未被支配的实现 | ARM `auto` 先要求完整 `jit/xbyak_exact_m` legacy split/no-split pair，再加入同 identity 的实测 global packed-B byte-window variants；缺少完整 JIT legacy pair 时整体回退 static pair；x86 AMX 使用不进入 planner 的确定性 per-expert pattern/cache policy | 实例候选限制与 runtime policy |
 | Isolated time | 真实 $I_i(t)$ | active $T_{\mathrm{iso}}$ 经验公式；分层 GEMM model 仅 shadow | cost 近似，不剪枝可行域 |
 | Contention | 任意动态活跃配置上的真实 $D_i(\mathcal Z)$ | 实测 contention profile 与 stage-aware event simulator | cost 近似，不剪枝可行域 |
 
@@ -1040,6 +1057,43 @@ $r_{13}$ 个 range 和 W2 的 $r_2$ 个 range 分别推进，不能把 windowed 
 单个 M12 panel 不复用 B，额外 range 通常只有 dispatch 和 lane-width 代价，
 不能仅按 cache 容量规则强制细分。
 
+### 8.4 x86 AMX per-expert pattern 与 cache policy
+
+x86 AMX backend 不把 pattern/cache choice 加入 CPU MoE planner。设 expert $i$ 的
+route 数为 $M_i$，当前 Amazon C8i 校准策略为：
+
+$$
+p_i=
+\begin{cases}
+\texttt{m2n2}, & M_i<76,\\
+\texttt{m1n4}, & M_i\ge76.
+\end{cases}
+$$
+
+`m2n2` 的 M1--16 tail 和 `m1n4` 的奇数末尾 N block 由 `m1n2` exact-tail kernel
+处理。准备 JIT cache 时 key 同时包含 pattern 与 exact M，因而同一次调用中不同
+route 数的 experts 可以安全选择不同 pattern。
+
+令 $K_{13}=\operatorname{round\_up}(H,32)$、
+$K_2=\operatorname{round\_up}(F,32)$。两级 loop-order 的单个 packed-B block
+都是 $64K_s$ bytes，自动窗口为：
+
+$$
+u_{13}=\max\left(1,\left\lfloor
+\frac{2^{20}}{64K_{13}}\right\rfloor\right),\qquad
+u_2=\max\left(1,\left\lfloor
+\frac{2^{19}}{64K_2}\right\rfloor\right).
+$$
+
+当 $p_i=\texttt{m1n4}$ 且 $u_s>1$ 时，再把 $u_s$ 向下对齐为偶数，以保持成对
+N block。H=4096、F=512 时得到 W13=4、W2=16。零值 override 明确恢复不分窗
+loop order，正整数 override 强制 block 数；AVX-512 的默认值仍为零。
+
+该 policy 只改变 $I_i$/$D_i$ 的 runtime 实现响应，不改变现有 planner 的 shape、
+assignment 或 ordering 候选。M=76 阈值和 1 MiB/512 KiB budget 目前只在 Amazon
+C8i、H=4096/F=512 上做过性能校准；跨 CPU 或显著不同 model dimension 时必须
+重新做 held-out route/thread 验证，不能把该阈值解释为体系结构常数。
+
 ## 9. 剪枝验证
 
 令未剪枝 oracle 的最优值为 $C^*$，求解器下界为 $LB$，剪枝 planner 的可行
@@ -1326,6 +1380,27 @@ $\eta_{\mathrm{issue}}$ 基本相同；odd M 的差异由
 $\eta_{\mathrm{lane}}$ 单独表达。40.04 GB/s ceiling 只作为后续解析模型的
 机器校准常数；本轮不修改 active planner、$I_i(t)$、$D_i(\mathcal Z)$、
 contention table 或 production 剪枝。
+### 9.10 x86 AMX 自动子变体验证
+
+2026-07-20 在 2-core Amazon C8i（Intel Xeon 6975P-C）上验证 8.4 的确定性
+runtime policy。H=4096/F=512 的 m2n2/m1n4 AB/BA 配对长采样显示 M=68/72
+位于约 ±2% 的尾部/频率噪声区；M=76 时 `m1n4` 单核为 1.207 vs 1.253 ms、
+双核为 1.522 vs 1.536 ms，并在 M=80 以后继续领先。因此当前保守阈值取 M=76。
+skewed route histogram `[384,19,19,18,18,18,18,18]` 下，per-expert auto
+混合策略单核为 9.036 ms，比最佳全局固定 pattern 的 9.427 ms 快 4.3%；双核
+为 10.595 vs 10.665 ms。
+
+自动 byte window 在 M=16 相对显式 0/0 不分窗无可分辨回退；M=48/80/256/2048
+的单核 speedup 为 1.35x/1.94x/2.31x/2.09x，双核为
+1.21x/1.53x/1.81x/1.65x。H=4096/F=512 的公式值 4/16 与无环境变量路径在
+单核扫描中相差不超过 0.4%。focused x86 correctness suite 为 95 passed、4 skipped，
+并覆盖同一次调用内 M=75/M=76 两种 pattern、H/F/K/N tails、双线程以及 AMX
+kill-switch 回退 AVX-512。完整命令、样本和热状态限制见
+`optimizations/fused_moe_avx512/results/amazon_c8i_2core_auto_dispatch_20260720.md`。
+
+该验证只校准 x86 runtime 的确定性响应 mapper，不改变 CPU MoE planner 的决策
+变量或 candidate space，因此本次不修改 planner/cost-model 公式测试。跨 CPU 或
+显著不同 H/F 的 policy 仍需单独 held-out 验证并更新 profile identity。
 
 ## 10. 同步规则
 
@@ -1379,3 +1454,4 @@ contention table 或 production 剪枝。
 | 2026-07-22 | v0.24 | 增加论文评测用 uniform、active-set sweep、tiered hotspot 和 long-short bimodal 全局 TopK workload；补充合法 histogram 约束和验证覆盖说明，不改变 planner 可行域、cost model 或 production 剪枝。 |
 | 2026-07-23 | v0.25 | 增加 V3 单核 packed-B service ceiling 40.04 GB/s；区分 exact-M lane、useful-compute、physical-issue 和 memory efficiency，并记录冷权重 M1--M12 验证；不改变 active planner、contention table 或剪枝。 |
 | 2026-07-26 | v0.26 | 将全局 packed-B byte-window 接入 schema-v2 与 production planner：variant identity 包含目标字节和 W13/W2 实际 range 数，stage model 分别推进两段 range，联合搜索 `(window, core shape)` 并透传 runtime option；旧 profile 映射为 window=0，未提供新实测表时决策不变。 |
+| 2026-07-26 | v0.27 | 将 x86 BF16 auto backend 改为优先 AMX 并回退 AVX-512；增加按 expert route 数选择 m2n2/m1n4 的确定性 M=76 policy，以及按 K-padded byte budget 自动推导 1 MiB/512 KiB cache window；同步 per-expert variant 公式、剪枝表、C8i 正确性/性能验证和 policy 可迁移性边界。 |

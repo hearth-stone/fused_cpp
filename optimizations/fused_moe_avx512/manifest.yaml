@@ -66,6 +66,24 @@ features:
       tests/bench_moe_avx512_bf16.py --tokens 12 --hidden 4096
       --intermediate 512 --experts 1 --top-k 1 --routing hot --threads 1
 
+  - id: compute.onednn_bf16_expert_matmuls
+    part: compute
+    status: experimental
+    implementation: benchmarks/bench_onednn_bf16_expert.cpp
+    hypothesis: >-
+      Public oneDNN BF16 matmul primitives with any-format weights and
+      one-time reorders provide a low-overhead single-expert compute control
+      for gate, up, and down projections on both AMX and AVX-512 BF16.
+    depends_on: []
+    conflicts_with: []
+    correctness: >-
+      OMP_NUM_THREADS=1 taskset -c 0
+      benchmarks/bench_onednn_bf16_expert 17 131 83 2 7
+    benchmark: >-
+      OMP_NUM_THREADS=2 OMP_DYNAMIC=FALSE OMP_PROC_BIND=close
+      OMP_WAIT_POLICY=PASSIVE taskset -c 0,1
+      benchmarks/bench_onednn_bf16_expert 256 4096 512 5 21
+
   - id: compute.xbyak_amx_1m4n
     part: compute
     status: experimental
@@ -77,8 +95,7 @@ features:
       to the established 1M-by-2N schedule.
     depends_on:
       - compute.xbyak_amx_m16n32
-    conflicts_with:
-      - compute.xbyak_amx_2m2n
+    conflicts_with: []
     correctness: >-
       FUSED_CPP_MOE_AMX_PATTERN=m1n4 PYTHONPATH=src
       .venv/bin/python -m pytest -q tests/test_moe_avx512_bf16.py
@@ -98,8 +115,7 @@ features:
       cache traffic for exact M17-32 and composed larger-M experts.
     depends_on:
       - compute.xbyak_amx_m16n32
-    conflicts_with:
-      - compute.xbyak_amx_1m4n
+    conflicts_with: []
     correctness: >-
       FUSED_CPP_MOE_AMX_PATTERN=m2n2 PYTHONPATH=src
       .venv/bin/python -m pytest -q tests/test_moe_avx512_bf16.py
@@ -151,6 +167,58 @@ features:
       FUSED_CPP_MOE_AVX512_IMPL=jit OMP_NUM_THREADS=1
       taskset -c 0 benchmarks/bench_avx512_bf16_gemm 4 512 4096 10 51
 
+  - id: schedule.n_window_cache_blocking
+    part: schedule
+    status: enabled
+    implementation: csrc/moe/x86/avx512_bf16/jit_kernels.cpp
+    hypothesis: >-
+      Deriving an AMX block count from approximately 1 MiB of packed W13 or
+      512 KiB of packed W2, then traversing M panels inside that N window,
+      keeps a dimension-aware packed-B working set in private L2 and reduces
+      shared-L3 traffic for large-M experts. Explicit zero and positive values
+      remain reproducibility and tuning overrides; AVX-512 remains unblocked
+      by default.
+    depends_on:
+      - layout.vnni2_packed_weights
+    conflicts_with: []
+    correctness: >-
+      PYTHONPATH=src .venv/bin/python -m pytest -q
+      tests/test_moe_avx512_bf16.py -k cache_block
+    benchmark: >-
+      OMP_NUM_THREADS=2 OMP_DYNAMIC=FALSE OMP_WAIT_POLICY=PASSIVE
+      taskset -c 0,1 env PYTHONPATH=src .venv/bin/python
+      benchmarks/bench_x86_bf16_cache_blocks.py --backend x86_amx_bf16
+      --amx-pattern m1n4 --configs auto:auto,0:0,2:0,4:0,6:0,0:8,0:16,4:16
+      --tokens 2048 --hidden 4096 --intermediate 512 --experts 1
+      --top-k 1 --routing hot --threads 2
+
+  - id: dispatch.amx_backend_pattern_cache_auto
+    part: dispatch
+    status: enabled
+    implementation: >-
+      csrc/moe/common/backend.cpp and
+      csrc/moe/x86/avx512_bf16/jit_kernels.cpp
+    hypothesis: >-
+      Preferring AMX when runtime support is available, selecting m2n2 below
+      M=76 and m1n4 at or above M=76 independently for each routed expert,
+      and deriving cache windows from K-padded bytes removes required
+      environment tuning while preserving explicit overrides and AVX-512
+      fallback.
+    depends_on:
+      - compute.xbyak_amx_1m4n
+      - compute.xbyak_amx_2m2n
+      - schedule.n_window_cache_blocking
+    conflicts_with: []
+    correctness: >-
+      PYTHONPATH=src .venv/bin/python -m pytest -q
+      tests/test_moe_backend_dispatch.py tests/test_moe_avx512_bf16.py
+      -k 'auto or mixed_expert_sizes or kill_switch'
+    benchmark: >-
+      OMP_NUM_THREADS=2 OMP_DYNAMIC=FALSE OMP_WAIT_POLICY=PASSIVE
+      taskset -c 0,1 env PYTHONPATH=src .venv/bin/python
+      benchmarks/bench_amx_bf16_patterns.py --tokens 2048 --hidden 4096
+      --intermediate 512 --experts 1 --top-k 1 --routing hot --threads 2
+
   - id: epilogue.amx_tilestore_silu
     part: intermediate
     status: experimental
@@ -168,6 +236,102 @@ features:
     benchmark: >-
       OMP_NUM_THREADS=1 taskset -c 0 benchmarks/bench_amx_bf16_w13
       16 4096 512 10 51 5
+
+  - id: epilogue.amx_resident_silu_constants
+    part: intermediate
+    status: enabled
+    implementation: csrc/moe/x86/avx512_bf16/jit_kernels.cpp
+    hypothesis: >-
+      Broadcasting polynomial, clamp, log, and exponent constants once in the
+      AMX W13 prologue removes repeated constant-memory uops from every output
+      row and reduces generated code without changing arithmetic order.
+    depends_on:
+      - epilogue.amx_tilestore_silu
+    conflicts_with: []
+    correctness: >-
+      PYTHONPATH=src .venv/bin/python -m pytest -q
+      tests/test_moe_avx512_bf16.py -k silu_epilogue
+    benchmark: >-
+      OMP_NUM_THREADS=1 taskset -c 0 benchmarks/bench_amx_bf16_w13
+      16 4096 512 20 101 5 baseline,resident
+
+  - id: epilogue.amx_two_row_silu_pipeline
+    part: intermediate
+    status: experimental
+    implementation: csrc/moe/x86/avx512_bf16/jit_kernels.cpp
+    hypothesis: >-
+      Interleaving the same SiLU arithmetic stages for two independent output
+      rows may cover vector dependency latency beyond constant residency.
+      C8i full-expert measurements did not show a stable advantage, so this
+      remains a validation override rather than the automatic path.
+    depends_on:
+      - epilogue.amx_resident_silu_constants
+    conflicts_with: []
+    correctness: >-
+      FUSED_CPP_MOE_AMX_SILU_EPILOGUE=pipelined PYTHONPATH=src
+      .venv/bin/python -m pytest -q tests/test_moe_avx512_bf16.py
+      -k silu_epilogue
+    benchmark: >-
+      OMP_NUM_THREADS=1 taskset -c 0 benchmarks/bench_amx_bf16_w13
+      16 4096 512 20 101 5 baseline,resident,pipelined
+
+  - id: epilogue.amx_rcp14_silu
+    part: intermediate
+    status: experimental
+    implementation: csrc/moe/x86/avx512_bf16/jit_kernels.cpp
+    hypothesis: >-
+      Replacing VDIVPS with VRCP14PS shortens the final SiLU dependency chain,
+      but changes BF16 values and showed no full-expert gain beyond measurement
+      noise; it must remain opt-in.
+    depends_on:
+      - epilogue.amx_two_row_silu_pipeline
+    conflicts_with: []
+    correctness: >-
+      FUSED_CPP_MOE_AMX_SILU_EPILOGUE=rcp14 PYTHONPATH=src
+      .venv/bin/python -m pytest -q tests/test_moe_avx512_bf16.py
+      -k silu_epilogue
+    benchmark: >-
+      OMP_NUM_THREADS=1 taskset -c 0 benchmarks/bench_amx_bf16_w13
+      16 4096 512 20 101 5 baseline,resident,pipelined,rcp14
+
+  - id: epilogue.onednn_primitive_silu_mul
+    part: intermediate
+    status: experimental
+    implementation: benchmarks/bench_onednn_bf16_expert.cpp
+    hypothesis: >-
+      Standalone oneDNN BF16 swish and binary-multiply primitives form a
+      portable basic-expert baseline with no custom activation code.
+    depends_on:
+      - compute.onednn_bf16_expert_matmuls
+    conflicts_with:
+      - epilogue.onednn_swish_binary_postops
+    correctness: >-
+      OMP_NUM_THREADS=1 taskset -c 0
+      benchmarks/bench_onednn_bf16_expert 17 131 83 2 7
+    benchmark: >-
+      OMP_NUM_THREADS=2 OMP_DYNAMIC=FALSE OMP_PROC_BIND=close
+      OMP_WAIT_POLICY=PASSIVE taskset -c 0,1
+      benchmarks/bench_onednn_bf16_expert 256 4096 512 5 21
+
+  - id: epilogue.onednn_swish_binary_postops
+    part: intermediate
+    status: experimental
+    implementation: benchmarks/bench_onednn_bf16_expert.cpp
+    hypothesis: >-
+      Appending swish and binary multiply to the gate matmul removes two
+      primitive launches and the materialized gate and activated tensors,
+      improving small-expert latency without changing the BF16 interface.
+    depends_on:
+      - compute.onednn_bf16_expert_matmuls
+    conflicts_with:
+      - epilogue.onednn_primitive_silu_mul
+    correctness: >-
+      OMP_NUM_THREADS=1 taskset -c 0
+      benchmarks/bench_onednn_bf16_expert 17 131 83 2 7
+    benchmark: >-
+      OMP_NUM_THREADS=2 OMP_DYNAMIC=FALSE OMP_PROC_BIND=close
+      OMP_WAIT_POLICY=PASSIVE taskset -c 0,1
+      benchmarks/bench_onednn_bf16_expert 256 4096 512 5 21
 
   - id: epilogue.silu_mul_packa
     part: intermediate
@@ -262,6 +426,47 @@ variants:
       ONEDNN_MAX_CPU_ISA=AVX512_CORE_BF16 fused_moe_naive
     status: reference
 
+  - id: onednn_bf16_expert_basic
+    features:
+      - compute.onednn_bf16_expert_matmuls
+      - epilogue.onednn_primitive_silu_mul
+    entrypoint: >-
+      The basic result from benchmarks/bench_onednn_bf16_expert with optional
+      ONEDNN_MAX_CPU_ISA selection
+    status: experimental
+
+  - id: onednn_bf16_expert_postop_fused
+    features:
+      - compute.onednn_bf16_expert_matmuls
+      - epilogue.onednn_swish_binary_postops
+    entrypoint: >-
+      The postop_fused result from benchmarks/bench_onednn_bf16_expert with
+      optional ONEDNN_MAX_CPU_ISA selection
+    status: experimental
+
+  - id: x86_bf16_fused_expert_auto
+    features:
+      - layout.vnni2_packed_weights
+      - layout.amx_k32_row_major_a
+      - compute.m12n32_vdpbf16ps
+      - compute.xbyak_exact_m
+      - compute.xbyak_amx_m16n32
+      - compute.xbyak_amx_1m4n
+      - compute.xbyak_amx_2m2n
+      - schedule.n_window_cache_blocking
+      - epilogue.silu_mul_packa
+      - epilogue.amx_tilestore_silu
+      - epilogue.amx_resident_silu_constants
+      - store.direct_route
+      - merge.avx512_weighted_reduce
+      - dispatch.amx_backend_pattern_cache_auto
+      - dispatch.two_core_expert_or_nsplit
+    entrypoint: >-
+      prepare_fused_moe_bf16_tiled_weights(fuse_silu=True, backend="auto")
+      followed by fused_moe_bf16_tiled, with no AMX pattern or cache-policy
+      environment variables required
+    status: enabled
+
   - id: avx512_bf16_fused_expert
     features:
       - layout.vnni2_packed_weights
@@ -295,13 +500,75 @@ variants:
       - layout.vnni2_packed_weights
       - layout.amx_k32_row_major_a
       - compute.xbyak_amx_m16n32
+      - compute.xbyak_amx_1m4n
+      - compute.xbyak_amx_2m2n
+      - schedule.n_window_cache_blocking
       - epilogue.amx_tilestore_silu
+      - epilogue.amx_resident_silu_constants
       - store.direct_route
       - merge.avx512_weighted_reduce
+      - dispatch.amx_backend_pattern_cache_auto
       - dispatch.two_core_expert_or_nsplit
     entrypoint: >-
       prepare_fused_moe_bf16_tiled_weights(fuse_silu=True,
-      backend="x86_amx_bf16") followed by fused_moe_bf16_tiled
+      backend="x86_amx_bf16") followed by fused_moe_bf16_tiled, with pattern
+      and cache policy left on auto
+    status: enabled
+
+  - id: amx_bf16_fused_expert_silu_baseline
+    features:
+      - layout.vnni2_packed_weights
+      - layout.amx_k32_row_major_a
+      - compute.xbyak_amx_m16n32
+      - compute.xbyak_amx_1m4n
+      - compute.xbyak_amx_2m2n
+      - schedule.n_window_cache_blocking
+      - epilogue.amx_tilestore_silu
+      - store.direct_route
+      - merge.avx512_weighted_reduce
+      - dispatch.amx_backend_pattern_cache_auto
+    entrypoint: >-
+      FUSED_CPP_MOE_AMX_SILU_EPILOGUE=baseline followed by the
+      x86_amx_bf16 fused_moe_bf16_tiled entrypoint
+    status: reference
+
+  - id: amx_bf16_fused_expert_silu_pipelined
+    features:
+      - layout.vnni2_packed_weights
+      - layout.amx_k32_row_major_a
+      - compute.xbyak_amx_m16n32
+      - compute.xbyak_amx_1m4n
+      - compute.xbyak_amx_2m2n
+      - schedule.n_window_cache_blocking
+      - epilogue.amx_tilestore_silu
+      - epilogue.amx_resident_silu_constants
+      - epilogue.amx_two_row_silu_pipeline
+      - store.direct_route
+      - merge.avx512_weighted_reduce
+      - dispatch.amx_backend_pattern_cache_auto
+    entrypoint: >-
+      FUSED_CPP_MOE_AMX_SILU_EPILOGUE=pipelined followed by the
+      x86_amx_bf16 fused_moe_bf16_tiled entrypoint
+    status: experimental
+
+  - id: amx_bf16_fused_expert_silu_rcp14
+    features:
+      - layout.vnni2_packed_weights
+      - layout.amx_k32_row_major_a
+      - compute.xbyak_amx_m16n32
+      - compute.xbyak_amx_1m4n
+      - compute.xbyak_amx_2m2n
+      - schedule.n_window_cache_blocking
+      - epilogue.amx_tilestore_silu
+      - epilogue.amx_resident_silu_constants
+      - epilogue.amx_two_row_silu_pipeline
+      - epilogue.amx_rcp14_silu
+      - store.direct_route
+      - merge.avx512_weighted_reduce
+      - dispatch.amx_backend_pattern_cache_auto
+    entrypoint: >-
+      FUSED_CPP_MOE_AMX_SILU_EPILOGUE=rcp14 followed by the
+      x86_amx_bf16 fused_moe_bf16_tiled entrypoint
     status: experimental
 
   - id: amx_bf16_fused_expert_m1n4
@@ -310,7 +577,9 @@ variants:
       - layout.amx_k32_row_major_a
       - compute.xbyak_amx_m16n32
       - compute.xbyak_amx_1m4n
+      - schedule.n_window_cache_blocking
       - epilogue.amx_tilestore_silu
+      - epilogue.amx_resident_silu_constants
       - store.direct_route
       - merge.avx512_weighted_reduce
       - dispatch.two_core_expert_or_nsplit
@@ -325,11 +594,86 @@ variants:
       - layout.amx_k32_row_major_a
       - compute.xbyak_amx_m16n32
       - compute.xbyak_amx_2m2n
+      - schedule.n_window_cache_blocking
       - epilogue.amx_tilestore_silu
+      - epilogue.amx_resident_silu_constants
       - store.direct_route
       - merge.avx512_weighted_reduce
       - dispatch.two_core_expert_or_nsplit
     entrypoint: >-
       FUSED_CPP_MOE_AMX_PATTERN=m2n2 followed by the
       x86_amx_bf16 fused_moe_bf16_tiled entrypoint
+    status: experimental
+
+  - id: avx512_bf16_fused_expert_cache_blocked
+    features:
+      - layout.vnni2_packed_weights
+      - compute.m12n32_vdpbf16ps
+      - compute.xbyak_exact_m
+      - schedule.n_window_cache_blocking
+      - epilogue.silu_mul_packa
+      - store.direct_route
+      - merge.avx512_weighted_reduce
+      - dispatch.two_core_expert_or_nsplit
+    entrypoint: >-
+      Positive FUSED_CPP_MOE_X86_W13_CACHE_BLOCKS and
+      FUSED_CPP_MOE_X86_W2_CACHE_BLOCKS followed by the x86_avx512_bf16
+      fused_moe_bf16_tiled entrypoint
+    status: experimental
+
+  - id: amx_bf16_fused_expert_cache_blocked
+    features:
+      - layout.vnni2_packed_weights
+      - layout.amx_k32_row_major_a
+      - compute.xbyak_amx_m16n32
+      - compute.xbyak_amx_1m4n
+      - compute.xbyak_amx_2m2n
+      - schedule.n_window_cache_blocking
+      - epilogue.amx_tilestore_silu
+      - epilogue.amx_resident_silu_constants
+      - store.direct_route
+      - merge.avx512_weighted_reduce
+      - dispatch.two_core_expert_or_nsplit
+    entrypoint: >-
+      Positive FUSED_CPP_MOE_X86_W13_CACHE_BLOCKS and
+      FUSED_CPP_MOE_X86_W2_CACHE_BLOCKS followed by the x86_amx_bf16
+      fused_moe_bf16_tiled entrypoint
+    status: experimental
+
+  - id: amx_bf16_fused_expert_m2n2_cache_blocked
+    features:
+      - layout.vnni2_packed_weights
+      - layout.amx_k32_row_major_a
+      - compute.xbyak_amx_m16n32
+      - compute.xbyak_amx_2m2n
+      - schedule.n_window_cache_blocking
+      - epilogue.amx_tilestore_silu
+      - epilogue.amx_resident_silu_constants
+      - store.direct_route
+      - merge.avx512_weighted_reduce
+      - dispatch.two_core_expert_or_nsplit
+    entrypoint: >-
+      FUSED_CPP_MOE_AMX_PATTERN=m2n2 with positive
+      FUSED_CPP_MOE_X86_W13_CACHE_BLOCKS and
+      FUSED_CPP_MOE_X86_W2_CACHE_BLOCKS followed by the x86_amx_bf16
+      fused_moe_bf16_tiled entrypoint
+    status: experimental
+
+  - id: amx_bf16_fused_expert_m1n4_cache_blocked
+    features:
+      - layout.vnni2_packed_weights
+      - layout.amx_k32_row_major_a
+      - compute.xbyak_amx_m16n32
+      - compute.xbyak_amx_1m4n
+      - schedule.n_window_cache_blocking
+      - epilogue.amx_tilestore_silu
+      - epilogue.amx_resident_silu_constants
+      - store.direct_route
+      - merge.avx512_weighted_reduce
+      - dispatch.two_core_expert_or_nsplit
+    entrypoint: >-
+      FUSED_CPP_MOE_AMX_PATTERN=m1n4 with positive
+      FUSED_CPP_MOE_X86_W13_CACHE_BLOCKS and
+      FUSED_CPP_MOE_X86_W2_CACHE_BLOCKS followed by the x86_amx_bf16
+      fused_moe_bf16_tiled entrypoint
     status: experimental
