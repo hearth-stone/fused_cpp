@@ -17,11 +17,11 @@ int n_tile();
 int round_k(int k);
 int round_n(int n);
 
-// K chunk selected from the private-L1 budget used by the production packed-B
-// layout. The default reserves 49% of L1D for one M12 A+B microkernel
-// window; FUSED_CPP_MOE_SVE_KC_L1_PERMILLE is a process-start experiment
-// override used by the calibration benchmark. FUSED_CPP_MOE_SVE_KC can pin a
-// positive, 8-aligned Kc; a value larger than K provides the no-split control.
+// K chunk used by the production packed-B layout. The default is one full K
+// chunk. FUSED_CPP_MOE_SVE_KC can pin a positive, 8-aligned Kc, while
+// FUSED_CPP_MOE_SVE_KC_L1_PERMILLE explicitly enables the private-L1 selector
+// used by calibration experiments. Configure Kc before packing weights and do
+// not change it while those packed weights remain in use.
 int l1d_cache_bytes();
 int k_block(int k);
 

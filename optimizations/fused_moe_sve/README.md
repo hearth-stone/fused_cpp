@@ -409,22 +409,24 @@ the legacy SVE symbols remain compiled, but only NEON is the runtime fallback;
 the legacy SVE symbols are standalone controls and are not fed production Kc
 packed weights.
 
-One Kc is used by every Mr because a prepared weight has one physical layout:
+One Kc is used by every Mr because a prepared weight has one physical layout.
+The production default is one full K chunk:
 
 ```text
-bytes_per_K = 2 * (12 + n_tile)
-Kc = align_down_8(min(K, 0.49 * L1D_bytes / bytes_per_K))
+Kc = K
 ```
 
-L1D is read with `_SC_LEVEL1_DCACHE_SIZE`, with a 64 KiB fallback. The 49%
-fraction was selected by maximizing the worst result across M1/M2/M4/M8/M12
-on both measured machines. It maps to Kc=800 on the SVE128 192-core host and
-Kc=568 on the SVE256 8-core host. `FUSED_CPP_MOE_SVE_KC_L1_PERMILLE` overrides
-the fraction at process start; `FUSED_CPP_MOE_SVE_KC` pins an 8-aligned Kc.
-Setting the latter above K creates a one-chunk control with the same generic
-dispatch.
+`FUSED_CPP_MOE_SVE_KC` explicitly pins an 8-aligned Kc. Setting
+`FUSED_CPP_MOE_SVE_KC_L1_PERMILLE` explicitly enables the calibrated L1
+selector, where `bytes_per_K = 2 * (12 + n_tile)` and the environment value is
+the permille of detected L1D available to the M12 A+B window. L1D is read with
+`_SC_LEVEL1_DCACHE_SIZE`, with a 64 KiB fallback. The historical 49% selector
+maps to Kc=800 on the SVE128 192-core host and Kc=568 on the SVE256 8-core
+host. Both controls are read once at process start; they must be set before
+packing weights and must remain unchanged while those weights are used.
 
-The isolated cold-B result is positive for every Mr on the 192-core host
+With an explicit calibrated Kc, the isolated cold-B result is positive for
+every Mr on the 192-core host
 (roughly +6% to +13%). On the 8-core host, Kc=568 is the maximin compromise:
 M12/M4/M2/M1 improve by about 2.23%/2.35%/0.95%/0.58%, while M8 regresses by
 about 1.48%. Production split-W13 E2E improves by about 2.0% at route=12 and
@@ -436,8 +438,10 @@ NUMA0 of the 192-core host, 24 concurrent 4-thread experts changed from
 Sweeping Kc through 1024/1536/2048 reduced but did not reverse this loss. Cold
 B is then memory-bandwidth dominated, so A-side L1 residency has little value
 while partial-C instructions remain. Cost tables must therefore be regenerated
-with the production path, and a future traversal selector should use concurrent
-memory pressure rather than isolated Kc timing alone.
+with the production path. On 2026-07-19 the default was restored to one K
+chunk; split-K remains an explicit process-level experiment for calibrated
+low-pressure deployments. A future selector would need concurrent memory
+pressure rather than isolated Kc timing alone.
 
 Calibration, correctness, production commands, and repeated timings are in
 [`results/amazon_192c_8c_production_kc.md`](results/amazon_192c_8c_production_kc.md).

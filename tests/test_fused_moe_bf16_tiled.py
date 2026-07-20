@@ -1,8 +1,11 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import json
 import os
 import platform
+import subprocess
+import sys
 from pathlib import Path
 from typing import Optional
 
@@ -10,6 +13,7 @@ import pytest
 import torch
 
 from fused_cpp.moe import _HAS_BF16_TILED_FUSED_MOE
+from fused_cpp.moe import available_fused_moe_bf16_tiled_backends
 from fused_cpp.moe import fused_moe_naive
 from fused_cpp.moe import fused_moe_bf16_tiled
 from fused_cpp.moe import fused_moe_bf16_tiled_async
@@ -43,6 +47,55 @@ def _first_affinity_cpu() -> int:
         if cpus:
             return min(cpus)
     return 0
+
+
+def _sve_packed_digest(kc: str | None) -> dict[str, str]:
+    script = """
+import hashlib
+import json
+
+import torch
+
+from fused_cpp.moe import prepare_fused_moe_bf16_tiled_weights
+
+
+def digest(tensor):
+    data = bytes(tensor.contiguous().view(torch.uint8).flatten().tolist())
+    return hashlib.sha256(data).hexdigest()
+
+
+w13 = (torch.arange(512 * 1024, dtype=torch.float32) % 251).reshape(1, 512, 1024).to(torch.bfloat16)
+w2 = (torch.arange(1024 * 256, dtype=torch.float32) % 241).reshape(1, 1024, 256).to(torch.bfloat16)
+packed = prepare_fused_moe_bf16_tiled_weights(w13, w2, fuse_silu=True, backend="sve")
+print("PACKED_DIGEST " + json.dumps({"w13": digest(packed.w13[0]), "w2": digest(packed.w2[0])}, sort_keys=True))
+"""
+    environment = os.environ.copy()
+    environment.pop("FUSED_CPP_MOE_SVE_KC", None)
+    environment.pop("FUSED_CPP_MOE_SVE_KC_L1_PERMILLE", None)
+    environment.update(
+        {
+            "OMP_NUM_THREADS": "1",
+            "MKL_NUM_THREADS": "1",
+            "OPENBLAS_NUM_THREADS": "1",
+        }
+    )
+    if kc is not None:
+        environment["FUSED_CPP_MOE_SVE_KC"] = kc
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path(__file__).resolve().parents[1],
+        env=environment,
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    if completed.returncode != 0:
+        raise AssertionError(f"packed digest child failed:\n{completed.stdout}")
+    for line in reversed(completed.stdout.splitlines()):
+        if line.startswith("PACKED_DIGEST "):
+            return json.loads(line.removeprefix("PACKED_DIGEST "))
+    raise AssertionError(f"packed digest is missing from child output:\n{completed.stdout}")
 
 
 def _case(seed: int = 0) -> tuple[torch.Tensor, ...]:
@@ -291,7 +344,7 @@ def test_sve_kc_path_matches_reference_and_threaded_output(
     use_bf16_route: bool,
     rows: int,
 ) -> None:
-    """Exercise every production Mr with multiple K chunks in W13 and W2."""
+    """Exercise every generic production Kc kernel and direct-route mode."""
     affinity = sorted(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else list(range(4))
     if len(affinity) < 4:
         pytest.skip("requires four available CPUs")
@@ -317,6 +370,20 @@ def test_sve_kc_path_matches_reference_and_threaded_output(
 
     reference = fused_moe_naive(hidden.float(), w13.float(), w2.float(), topk_weights, topk_ids).to(torch.bfloat16)
     torch.testing.assert_close(serial.float(), reference.float(), atol=2.0e-3, rtol=2.0e-2)
+
+
+def test_sve_default_packing_uses_one_k_chunk() -> None:
+    """Default SVE packing must match an explicit one-chunk process configuration."""
+    if "arm_sve_bf16" not in available_fused_moe_bf16_tiled_backends():
+        pytest.skip("requires an SVE BF16 build/runtime")
+
+    default = _sve_packed_digest(None)
+    one_chunk = _sve_packed_digest("4096")
+    split_k = _sve_packed_digest("256")
+
+    assert default == one_chunk
+    assert default["w13"] != split_k["w13"]
+    assert default["w2"] == split_k["w2"]
 
 
 @pytest.mark.parametrize("bridge", ["normal", "scheduled", "async"])

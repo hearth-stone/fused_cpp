@@ -10,7 +10,7 @@ Normal, 2D, scheduled, async, and vLLM-staged W13/W2 dispatches use the same
 layout. FP32 and BF16 direct-route W2 stores are covered. NEON and legacy SVE
 symbols were not changed.
 
-The production selector is:
+The split-K selector measured in this report was:
 
 ```text
 bytes_per_K = 2 * (12 + n_tile)
@@ -45,6 +45,11 @@ Kc=800 on SVE128. A 49% L1 budget lies in that overlap.
   passed: 92 tests passed and 4 were skipped. The focused production-Kc test
   passed all 12 combinations of M=1/2/4/8/12/13 and FP32/BF16 direct-route
   storage.
+- After restoring one chunk as the default on 2026-07-19, AmazonC5192Cores
+  passed 13 focused default-path cases, 12 explicit `Kc=256` multi-chunk
+  cases, and 6 backend-dispatch cases with 1 platform-conditional skip. The
+  default packed-B digest matched explicit one chunk and differed from
+  `Kc=256` for W13.
 - On AmazonECS8Cores, the same H=F=1024 M=1/2/4/8/12/13 matrix passed for FP32
   and BF16 direct-route storage. In all 12 combinations, 1T and 4T were bit
   exact and both matched the naive reference tolerance. The host's older
@@ -63,9 +68,9 @@ Kc=800 on SVE128. A 49% L1 budget lies in that overlap.
 Each value is the median of three independent process medians. Every process
 uses five warmups and 15 measured calls. `Kc=one` sets
 `FUSED_CPP_MOE_SVE_KC=1048576`, so K is one chunk while retaining the generic
-dispatch. The default column uses the 49% selector.
+dispatch. The split-K column uses the historical 49% selector.
 
-| Host/configuration | Route | One chunk | Default Kc | Throughput gain |
+| Host/configuration | Route | One chunk | Split Kc | Throughput gain |
 |---|---:|---:|---:|---:|
 | 8 cores, 2 experts x 4T | 12 | 0.402 ms | 0.394 ms | +2.03% |
 | 8 cores, 2 experts x 4T | 2040 | 37.216 ms | 35.952 ms | +3.52% |
@@ -92,6 +97,21 @@ throughput), while the 192-core-host NUMA0 24-expert x 4T wave changed from
 with the same five warmups and 15 measured calls, and are a post-refactor smoke
 check rather than replacements for the three-process table above.
 
+## Default decision
+
+On 2026-07-19 the production default was restored to one K chunk. The isolated
+Kc result does not represent the main high-concurrency path, where cold packed-B
+traffic approaches the NUMA memory-bandwidth ceiling and every non-final K
+chunk still writes and reloads FP32 partial C. The generic Kc assembly and pack
+layout remain available through explicit process-start configuration:
+
+- `FUSED_CPP_MOE_SVE_KC=<8-aligned Kc>` pins a fixed chunk size.
+- `FUSED_CPP_MOE_SVE_KC_L1_PERMILLE=<1..1000>` explicitly enables the L1
+  selector used by calibration.
+
+Both settings must be chosen before packing weights and remain unchanged while
+those packed weights are used. With neither setting present, `Kc=K`.
+
 ## Reproduction
 
 Isolated M12:
@@ -107,12 +127,14 @@ Production 192-core-host NUMA0 default:
 
 ```bash
 numactl --cpunodebind=0 --membind=0 taskset -c 0-95 \
-  env -u FUSED_CPP_MOE_SVE_KC OMP_NUM_THREADS=96 PYTHONPATH=src \
+  env -u FUSED_CPP_MOE_SVE_KC -u FUSED_CPP_MOE_SVE_KC_L1_PERMILLE \
+  OMP_NUM_THREADS=96 PYTHONPATH=src \
   .venv/bin/python optimizations/fused_moe_sve/benchmarks/bench_weight_windows.py \
   --experts 24 --routes 2040 --hidden 4096 --intermediate 512 \
   --threads-per-expert 4 --cpu-start 0 --window-mib 0 \
   --warmup 5 --runs 15 --seed 20260718
 ```
 
-Use `FUSED_CPP_MOE_SVE_KC=1048576` for the one-chunk control. Packed weights
-must be prepared in a process with the same Kc configuration used for compute.
+Use `FUSED_CPP_MOE_SVE_KC=800` to reproduce the SVE128 split-K column. Packed
+weights must be prepared in a process with the same Kc configuration used for
+compute.

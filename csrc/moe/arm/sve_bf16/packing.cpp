@@ -45,6 +45,7 @@ struct KBlockConfig {
   int ratio_numerator = 49;
   int ratio_denominator = 100;
   int fixed_kc = 0;
+  bool use_l1_selector = false;
 };
 
 const KBlockConfig& k_block_config() {
@@ -66,6 +67,7 @@ const KBlockConfig& k_block_config() {
       }
       result.ratio_numerator = static_cast<int>(parsed);
       result.ratio_denominator = 1000;
+      result.use_l1_selector = true;
     }
     value = std::getenv("FUSED_CPP_MOE_SVE_KC");
     if (value != nullptr && value[0] != '\0') {
@@ -336,12 +338,14 @@ int k_block(int k) {
   if (config.fixed_kc > 0) {
     return std::min(k, config.fixed_kc);
   }
+  if (!config.use_l1_selector) {
+    return k;
+  }
   // One M12 microkernel window contains Kc BF16 values for each of 12 A
   // rows and one runtime-width B N tile. Keep this common M12-derived Kc for
   // M8/M4/M2/M1 as well so a packed weight has one layout for every tail.
   const int bytes_per_k = static_cast<int>(sizeof(uint16_t)) * (12 + n_tile());
-  const int64_t budget =
-      static_cast<int64_t>(config.l1d_bytes) * config.ratio_numerator / config.ratio_denominator;
+  const int64_t budget = static_cast<int64_t>(config.l1d_bytes) * config.ratio_numerator / config.ratio_denominator;
   int selected = static_cast<int>(budget / bytes_per_k);
   selected = std::max(8, selected / 8 * 8);
   return std::min(k, selected);
