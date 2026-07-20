@@ -1,0 +1,3669 @@
+{
+  "schema_version": 2,
+  "kind": "contention_derate",
+  "target": {
+    "machine": "aarch64",
+    "cpu": "aarch64",
+    "host_logical_cores": 8,
+    "cores_per_rank": 8,
+    "cpu_ids": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7
+    ],
+    "numa_node": 0,
+    "llc_bytes_per_rank": 33554432,
+    "rank_id": 0,
+    "concurrent_ranks": 1,
+    "os": "Linux-6.17.0-1019-aws-aarch64-with-glibc2.39"
+  },
+  "kernel": {
+    "name": "fused_moe_bf16_tiled_async",
+    "backend": "sve",
+    "gemm_backend": 1,
+    "backend_n_tile": 16,
+    "parallel_axis": "N",
+    "sve_implementation": "jit",
+    "m_tail_policy": "xbyak_exact_m",
+    "w13_split": true,
+    "w13_split_chunks": 2,
+    "git_available": true,
+    "git_commit": "46228bbfffffa8641283364f1f030a4917d19fe2",
+    "git_worktree_dirty": true,
+    "xbyak_aarch64_commit": "3f8c682b9c6ff562dc008c7d1b8307a683f05d20",
+    "source_sha256": "26a145429256653510507fe1b33da231b909492a3107343cb4c3d9899dfeafa1",
+    "extension_path": "/home/ubuntu/zhangxu/fused_cpp/src/fused_cpp/_moe_C.cpython-312-aarch64-linux-gnu.so",
+    "extension_sha256": "22e280be551171403c106baf7f8c9e31cc480cc4bd8662b4b76a91753ab95a61"
+  },
+  "parallelism": {
+    "mode": "standalone",
+    "degree": 1,
+    "global_experts": 8,
+    "local_experts": 8
+  },
+  "expert_shape": {
+    "dtype": "bf16",
+    "hidden_size": 4096,
+    "intermediate_size": 512,
+    "kernel": "fused_moe_bf16_tiled_async",
+    "activation": "silu",
+    "num_experts": 8,
+    "global_experts": 8,
+    "measurement_experts": 8,
+    "isolated_measurement_experts": 8,
+    "expert_selection": "consecutive_window",
+    "weight_reuse": "streaming_distinct_experts",
+    "top_k": 1,
+    "skip_weighted": true
+  },
+  "working_set": {
+    "w13_dense_bytes_per_expert": 8388608,
+    "w2_dense_bytes_per_expert": 4194304,
+    "w13_packed_bytes_per_expert": 8388608,
+    "w2_packed_bytes_per_expert": 4194304,
+    "w13_chunk_bytes_per_expert": 4194304,
+    "max_weight_stage_bytes_per_expert": 4194304
+  },
+  "measurement": {
+    "path": "fused_moe_bf16_tiled_async",
+    "pinning": "interval (thread_cpu_ids, disjoint per task)",
+    "output_buffer": "preallocated_reused_native_out",
+    "rank_synchronization": "none",
+    "omp_proc_bind": "",
+    "runs": 20,
+    "warmup": 5,
+    "assignment": "earliest_finish_lpt_using_streaming_T_iso",
+    "derate": "full_call_median / LPT_isolated_baseline_makespan"
+  },
+  "routes": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    24,
+    48,
+    192,
+    768,
+    2040
+  ],
+  "isolated_routes": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    24,
+    48,
+    96,
+    192,
+    384,
+    768,
+    1536,
+    2040
+  ],
+  "contention_routes": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    24,
+    48,
+    192,
+    768,
+    2040
+  ],
+  "thread_buckets": [
+    1,
+    2,
+    4,
+    8
+  ],
+  "contention_shapes": [
+    [
+      8
+    ],
+    [
+      4,
+      4
+    ],
+    [
+      2,
+      2,
+      2,
+      2
+    ],
+    [
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1
+    ]
+  ],
+  "isolated": [
+    {
+      "routes": 1,
+      "threads": 1,
+      "median_ns": 433242,
+      "p10_ns": 428581,
+      "p90_ns": 436954,
+      "min_ns": 428293,
+      "mean_ns": 433886,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 3465936
+    },
+    {
+      "routes": 1,
+      "threads": 2,
+      "median_ns": 238771,
+      "p10_ns": 232999,
+      "p90_ns": 245480,
+      "min_ns": 231602,
+      "mean_ns": 239345,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 1910172
+    },
+    {
+      "routes": 1,
+      "threads": 4,
+      "median_ns": 152039,
+      "p10_ns": 149257,
+      "p90_ns": 157844,
+      "min_ns": 148403,
+      "mean_ns": 153442,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 1216312
+    },
+    {
+      "routes": 1,
+      "threads": 8,
+      "median_ns": 117762,
+      "p10_ns": 115913,
+      "p90_ns": 119518,
+      "min_ns": 113404,
+      "mean_ns": 118215,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 942098
+    },
+    {
+      "routes": 2,
+      "threads": 1,
+      "median_ns": 438373,
+      "p10_ns": 429936,
+      "p90_ns": 445066,
+      "min_ns": 427488,
+      "mean_ns": 438258,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 3506989
+    },
+    {
+      "routes": 2,
+      "threads": 2,
+      "median_ns": 250470,
+      "p10_ns": 244068,
+      "p90_ns": 254854,
+      "min_ns": 242928,
+      "mean_ns": 250905,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 2003762
+    },
+    {
+      "routes": 2,
+      "threads": 4,
+      "median_ns": 157165,
+      "p10_ns": 153819,
+      "p90_ns": 162270,
+      "min_ns": 152329,
+      "mean_ns": 157679,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 1257324
+    },
+    {
+      "routes": 2,
+      "threads": 8,
+      "median_ns": 120210,
+      "p10_ns": 117762,
+      "p90_ns": 122274,
+      "min_ns": 117029,
+      "mean_ns": 120719,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 961685
+    },
+    {
+      "routes": 3,
+      "threads": 1,
+      "median_ns": 475188,
+      "p10_ns": 467514,
+      "p90_ns": 483003,
+      "min_ns": 464643,
+      "mean_ns": 475216,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 3801508
+    },
+    {
+      "routes": 3,
+      "threads": 2,
+      "median_ns": 272107,
+      "p10_ns": 268772,
+      "p90_ns": 278769,
+      "min_ns": 266606,
+      "mean_ns": 273436,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 2176856
+    },
+    {
+      "routes": 3,
+      "threads": 4,
+      "median_ns": 168889,
+      "p10_ns": 163620,
+      "p90_ns": 174881,
+      "min_ns": 161211,
+      "mean_ns": 169573,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 1351113
+    },
+    {
+      "routes": 3,
+      "threads": 8,
+      "median_ns": 124246,
+      "p10_ns": 121071,
+      "p90_ns": 135771,
+      "min_ns": 119974,
+      "mean_ns": 125873,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 993974
+    },
+    {
+      "routes": 4,
+      "threads": 1,
+      "median_ns": 476064,
+      "p10_ns": 466883,
+      "p90_ns": 501594,
+      "min_ns": 463579,
+      "mean_ns": 479579,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 3808516
+    },
+    {
+      "routes": 4,
+      "threads": 2,
+      "median_ns": 273027,
+      "p10_ns": 269746,
+      "p90_ns": 277054,
+      "min_ns": 267827,
+      "mean_ns": 273505,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 2184214
+    },
+    {
+      "routes": 4,
+      "threads": 4,
+      "median_ns": 167997,
+      "p10_ns": 164910,
+      "p90_ns": 170726,
+      "min_ns": 163176,
+      "mean_ns": 168635,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 1343983
+    },
+    {
+      "routes": 4,
+      "threads": 8,
+      "median_ns": 123215,
+      "p10_ns": 120791,
+      "p90_ns": 137897,
+      "min_ns": 119799,
+      "mean_ns": 125315,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 985727
+    },
+    {
+      "routes": 5,
+      "threads": 1,
+      "median_ns": 500299,
+      "p10_ns": 497086,
+      "p90_ns": 505275,
+      "min_ns": 494447,
+      "mean_ns": 501212,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 4002391
+    },
+    {
+      "routes": 5,
+      "threads": 2,
+      "median_ns": 300697,
+      "p10_ns": 298818,
+      "p90_ns": 304553,
+      "min_ns": 298526,
+      "mean_ns": 301925,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 2405580
+    },
+    {
+      "routes": 5,
+      "threads": 4,
+      "median_ns": 185111,
+      "p10_ns": 183564,
+      "p90_ns": 188670,
+      "min_ns": 182026,
+      "mean_ns": 186078,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 1480886
+    },
+    {
+      "routes": 5,
+      "threads": 8,
+      "median_ns": 125947,
+      "p10_ns": 123434,
+      "p90_ns": 131092,
+      "min_ns": 123022,
+      "mean_ns": 127065,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 1007575
+    },
+    {
+      "routes": 6,
+      "threads": 1,
+      "median_ns": 504988,
+      "p10_ns": 500737,
+      "p90_ns": 512356,
+      "min_ns": 499897,
+      "mean_ns": 506590,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 4039901
+    },
+    {
+      "routes": 6,
+      "threads": 2,
+      "median_ns": 303382,
+      "p10_ns": 300775,
+      "p90_ns": 307451,
+      "min_ns": 298882,
+      "mean_ns": 303823,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 2427059
+    },
+    {
+      "routes": 6,
+      "threads": 4,
+      "median_ns": 184211,
+      "p10_ns": 180341,
+      "p90_ns": 192114,
+      "min_ns": 180067,
+      "mean_ns": 185736,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 1473693
+    },
+    {
+      "routes": 6,
+      "threads": 8,
+      "median_ns": 126531,
+      "p10_ns": 123561,
+      "p90_ns": 132628,
+      "min_ns": 123121,
+      "mean_ns": 128437,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 1012250
+    },
+    {
+      "routes": 7,
+      "threads": 1,
+      "median_ns": 553495,
+      "p10_ns": 552133,
+      "p90_ns": 559485,
+      "min_ns": 549046,
+      "mean_ns": 554610,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 4427962
+    },
+    {
+      "routes": 7,
+      "threads": 2,
+      "median_ns": 340664,
+      "p10_ns": 338957,
+      "p90_ns": 344470,
+      "min_ns": 337070,
+      "mean_ns": 341527,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 2725312
+    },
+    {
+      "routes": 7,
+      "threads": 4,
+      "median_ns": 207264,
+      "p10_ns": 204599,
+      "p90_ns": 210669,
+      "min_ns": 203238,
+      "mean_ns": 207766,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 1658115
+    },
+    {
+      "routes": 7,
+      "threads": 8,
+      "median_ns": 134171,
+      "p10_ns": 132741,
+      "p90_ns": 137521,
+      "min_ns": 130863,
+      "mean_ns": 135469,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 1073371
+    },
+    {
+      "routes": 8,
+      "threads": 1,
+      "median_ns": 550581,
+      "p10_ns": 543610,
+      "p90_ns": 554378,
+      "min_ns": 541031,
+      "mean_ns": 549948,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 4404649
+    },
+    {
+      "routes": 8,
+      "threads": 2,
+      "median_ns": 344020,
+      "p10_ns": 340391,
+      "p90_ns": 348462,
+      "min_ns": 339700,
+      "mean_ns": 345060,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 2752165
+    },
+    {
+      "routes": 8,
+      "threads": 4,
+      "median_ns": 209798,
+      "p10_ns": 207796,
+      "p90_ns": 215819,
+      "min_ns": 207169,
+      "mean_ns": 211096,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 1678389
+    },
+    {
+      "routes": 8,
+      "threads": 8,
+      "median_ns": 135600,
+      "p10_ns": 132867,
+      "p90_ns": 139631,
+      "min_ns": 130837,
+      "mean_ns": 136468,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 1084803
+    },
+    {
+      "routes": 9,
+      "threads": 1,
+      "median_ns": 601897,
+      "p10_ns": 594572,
+      "p90_ns": 610044,
+      "min_ns": 593479,
+      "mean_ns": 602585,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 4815175
+    },
+    {
+      "routes": 9,
+      "threads": 2,
+      "median_ns": 387363,
+      "p10_ns": 383461,
+      "p90_ns": 391242,
+      "min_ns": 381566,
+      "mean_ns": 387951,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 3098904
+    },
+    {
+      "routes": 9,
+      "threads": 4,
+      "median_ns": 243915,
+      "p10_ns": 240824,
+      "p90_ns": 246292,
+      "min_ns": 237586,
+      "mean_ns": 243964,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 1951319
+    },
+    {
+      "routes": 9,
+      "threads": 8,
+      "median_ns": 159452,
+      "p10_ns": 157848,
+      "p90_ns": 162127,
+      "min_ns": 157461,
+      "mean_ns": 160156,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 1275620
+    },
+    {
+      "routes": 10,
+      "threads": 1,
+      "median_ns": 598282,
+      "p10_ns": 593639,
+      "p90_ns": 605726,
+      "min_ns": 593000,
+      "mean_ns": 599500,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 4786255
+    },
+    {
+      "routes": 10,
+      "threads": 2,
+      "median_ns": 390390,
+      "p10_ns": 386198,
+      "p90_ns": 395451,
+      "min_ns": 384739,
+      "mean_ns": 391020,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 3123121
+    },
+    {
+      "routes": 10,
+      "threads": 4,
+      "median_ns": 247124,
+      "p10_ns": 242144,
+      "p90_ns": 258578,
+      "min_ns": 241797,
+      "mean_ns": 248870,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 1976996
+    },
+    {
+      "routes": 10,
+      "threads": 8,
+      "median_ns": 172436,
+      "p10_ns": 166082,
+      "p90_ns": 209310,
+      "min_ns": 162923,
+      "mean_ns": 184378,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 1379486
+    },
+    {
+      "routes": 11,
+      "threads": 1,
+      "median_ns": 678426,
+      "p10_ns": 673948,
+      "p90_ns": 689556,
+      "min_ns": 670160,
+      "mean_ns": 679652,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 5427411
+    },
+    {
+      "routes": 11,
+      "threads": 2,
+      "median_ns": 432505,
+      "p10_ns": 429594,
+      "p90_ns": 438205,
+      "min_ns": 428299,
+      "mean_ns": 433372,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 3460038
+    },
+    {
+      "routes": 11,
+      "threads": 4,
+      "median_ns": 269153,
+      "p10_ns": 264848,
+      "p90_ns": 271858,
+      "min_ns": 263075,
+      "mean_ns": 269395,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 2153230
+    },
+    {
+      "routes": 11,
+      "threads": 8,
+      "median_ns": 176609,
+      "p10_ns": 174316,
+      "p90_ns": 184704,
+      "min_ns": 173311,
+      "mean_ns": 180940,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 1412875
+    },
+    {
+      "routes": 12,
+      "threads": 1,
+      "median_ns": 675521,
+      "p10_ns": 673110,
+      "p90_ns": 679098,
+      "min_ns": 669422,
+      "mean_ns": 676030,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 5404171
+    },
+    {
+      "routes": 12,
+      "threads": 2,
+      "median_ns": 436317,
+      "p10_ns": 433264,
+      "p90_ns": 438114,
+      "min_ns": 431773,
+      "mean_ns": 436208,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 3490534
+    },
+    {
+      "routes": 12,
+      "threads": 4,
+      "median_ns": 272660,
+      "p10_ns": 269266,
+      "p90_ns": 279744,
+      "min_ns": 267268,
+      "mean_ns": 273405,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 2181285
+    },
+    {
+      "routes": 12,
+      "threads": 8,
+      "median_ns": 179350,
+      "p10_ns": 178285,
+      "p90_ns": 183248,
+      "min_ns": 176896,
+      "mean_ns": 180166,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 1434799
+    },
+    {
+      "routes": 24,
+      "threads": 1,
+      "median_ns": 1334474,
+      "p10_ns": 1329302,
+      "p90_ns": 1339858,
+      "min_ns": 1325944,
+      "mean_ns": 1334476,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 10675795
+    },
+    {
+      "routes": 24,
+      "threads": 2,
+      "median_ns": 825839,
+      "p10_ns": 823014,
+      "p90_ns": 835964,
+      "min_ns": 819583,
+      "mean_ns": 828307,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 6606715
+    },
+    {
+      "routes": 24,
+      "threads": 4,
+      "median_ns": 494862,
+      "p10_ns": 489054,
+      "p90_ns": 498247,
+      "min_ns": 487034,
+      "mean_ns": 494513,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 3958899
+    },
+    {
+      "routes": 24,
+      "threads": 8,
+      "median_ns": 297657,
+      "p10_ns": 295382,
+      "p90_ns": 302172,
+      "min_ns": 294534,
+      "mean_ns": 299886,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 2381262
+    },
+    {
+      "routes": 48,
+      "threads": 1,
+      "median_ns": 2799463,
+      "p10_ns": 2762110,
+      "p90_ns": 2816898,
+      "min_ns": 2754628,
+      "mean_ns": 2795026,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 22395701
+    },
+    {
+      "routes": 48,
+      "threads": 2,
+      "median_ns": 1608597,
+      "p10_ns": 1600451,
+      "p90_ns": 1619488,
+      "min_ns": 1595354,
+      "mean_ns": 1609472,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 12868776
+    },
+    {
+      "routes": 48,
+      "threads": 4,
+      "median_ns": 902212,
+      "p10_ns": 898786,
+      "p90_ns": 905189,
+      "min_ns": 896011,
+      "mean_ns": 902241,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 7217694
+    },
+    {
+      "routes": 48,
+      "threads": 8,
+      "median_ns": 502220,
+      "p10_ns": 500499,
+      "p90_ns": 523639,
+      "min_ns": 498665,
+      "mean_ns": 509514,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 4017762
+    },
+    {
+      "routes": 96,
+      "threads": 1,
+      "median_ns": 5318570,
+      "p10_ns": 5250443,
+      "p90_ns": 5420032,
+      "min_ns": 5227707,
+      "mean_ns": 5329418,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 42548559
+    },
+    {
+      "routes": 96,
+      "threads": 2,
+      "median_ns": 3103111,
+      "p10_ns": 3096656,
+      "p90_ns": 3111310,
+      "min_ns": 3093352,
+      "mean_ns": 3105834,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 24824884
+    },
+    {
+      "routes": 96,
+      "threads": 4,
+      "median_ns": 1724871,
+      "p10_ns": 1714618,
+      "p90_ns": 1730377,
+      "min_ns": 1712713,
+      "mean_ns": 1723461,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 13798972
+    },
+    {
+      "routes": 96,
+      "threads": 8,
+      "median_ns": 905308,
+      "p10_ns": 901445,
+      "p90_ns": 913826,
+      "min_ns": 898649,
+      "mean_ns": 908612,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 7242468
+    },
+    {
+      "routes": 192,
+      "threads": 1,
+      "median_ns": 10136741,
+      "p10_ns": 10046366,
+      "p90_ns": 10298434,
+      "min_ns": 9930264,
+      "mean_ns": 10156489,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 81093929
+    },
+    {
+      "routes": 192,
+      "threads": 2,
+      "median_ns": 5982786,
+      "p10_ns": 5951274,
+      "p90_ns": 6021810,
+      "min_ns": 5943880,
+      "mean_ns": 5984011,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 47862294
+    },
+    {
+      "routes": 192,
+      "threads": 4,
+      "median_ns": 3327930,
+      "p10_ns": 3318357,
+      "p90_ns": 3333715,
+      "min_ns": 3316172,
+      "mean_ns": 3326946,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 26623447
+    },
+    {
+      "routes": 192,
+      "threads": 8,
+      "median_ns": 1737957,
+      "p10_ns": 1729311,
+      "p90_ns": 1762238,
+      "min_ns": 1727990,
+      "mean_ns": 1743697,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 13903655
+    },
+    {
+      "routes": 384,
+      "threads": 1,
+      "median_ns": 20051919,
+      "p10_ns": 19815578,
+      "p90_ns": 20250964,
+      "min_ns": 19689862,
+      "mean_ns": 20042296,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 160415356
+    },
+    {
+      "routes": 384,
+      "threads": 2,
+      "median_ns": 11927152,
+      "p10_ns": 11865119,
+      "p90_ns": 11959016,
+      "min_ns": 11855209,
+      "mean_ns": 11920479,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 95417221
+    },
+    {
+      "routes": 384,
+      "threads": 4,
+      "median_ns": 6588240,
+      "p10_ns": 6567653,
+      "p90_ns": 6615890,
+      "min_ns": 6547256,
+      "mean_ns": 6590655,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 52705926
+    },
+    {
+      "routes": 384,
+      "threads": 8,
+      "median_ns": 3436293,
+      "p10_ns": 3414687,
+      "p90_ns": 3476232,
+      "min_ns": 3405045,
+      "mean_ns": 3444853,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 27490349
+    },
+    {
+      "routes": 768,
+      "threads": 1,
+      "median_ns": 38682740,
+      "p10_ns": 38580926,
+      "p90_ns": 38965476,
+      "min_ns": 38508437,
+      "mean_ns": 38720743,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 309461923
+    },
+    {
+      "routes": 768,
+      "threads": 2,
+      "median_ns": 23433598,
+      "p10_ns": 23407201,
+      "p90_ns": 23479237,
+      "min_ns": 23383965,
+      "mean_ns": 23439146,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 187468786
+    },
+    {
+      "routes": 768,
+      "threads": 4,
+      "median_ns": 13075722,
+      "p10_ns": 13051794,
+      "p90_ns": 13107686,
+      "min_ns": 13047549,
+      "mean_ns": 13077299,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 104605775
+    },
+    {
+      "routes": 768,
+      "threads": 8,
+      "median_ns": 6808669,
+      "p10_ns": 6792644,
+      "p90_ns": 6871809,
+      "min_ns": 6778294,
+      "mean_ns": 6824165,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 54469352
+    },
+    {
+      "routes": 1536,
+      "threads": 1,
+      "median_ns": 75688984,
+      "p10_ns": 75461398,
+      "p90_ns": 75971362,
+      "min_ns": 75330437,
+      "mean_ns": 75700211,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 605511871
+    },
+    {
+      "routes": 1536,
+      "threads": 2,
+      "median_ns": 46433210,
+      "p10_ns": 46345629,
+      "p90_ns": 46608686,
+      "min_ns": 46340325,
+      "mean_ns": 46451184,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 371465682
+    },
+    {
+      "routes": 1536,
+      "threads": 4,
+      "median_ns": 25899618,
+      "p10_ns": 25891557,
+      "p90_ns": 25926074,
+      "min_ns": 25887634,
+      "mean_ns": 25908285,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 207196941
+    },
+    {
+      "routes": 1536,
+      "threads": 8,
+      "median_ns": 13594744,
+      "p10_ns": 13537594,
+      "p90_ns": 13717205,
+      "min_ns": 13523221,
+      "mean_ns": 13637773,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 108757953
+    },
+    {
+      "routes": 2040,
+      "threads": 1,
+      "median_ns": 99955959,
+      "p10_ns": 99578067,
+      "p90_ns": 100186151,
+      "min_ns": 99454582,
+      "mean_ns": 99925078,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 799647668
+    },
+    {
+      "routes": 2040,
+      "threads": 2,
+      "median_ns": 61545615,
+      "p10_ns": 61492820,
+      "p90_ns": 61646843,
+      "min_ns": 61415695,
+      "mean_ns": 61551529,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 492364923
+    },
+    {
+      "routes": 2040,
+      "threads": 4,
+      "median_ns": 34379364,
+      "p10_ns": 34346056,
+      "p90_ns": 34404588,
+      "min_ns": 34335938,
+      "mean_ns": 34374509,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 275034916
+    },
+    {
+      "routes": 2040,
+      "threads": 8,
+      "median_ns": 18062298,
+      "p10_ns": 18022141,
+      "p90_ns": 18134043,
+      "min_ns": 17985568,
+      "mean_ns": 18069815,
+      "num_iters": 20,
+      "measurement_experts": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "full_call_median_ns": 144498381
+    }
+  ],
+  "iso_formula": {
+    "version": 3,
+    "kind": "separable_route_usl_calibrated",
+    "equation": "O(t) + C(R) * phi_usl(t) * k_phi(t)",
+    "o0": 66724.84525809159,
+    "o1": 145582.47850636346,
+    "alpha": 0.1983841070707868,
+    "beta": -0.01745649352507134,
+    "c_pts": [
+      [
+        1,
+        220934.67623554496
+      ],
+      [
+        2,
+        226065.67623554496
+      ],
+      [
+        3,
+        262880.67623554496
+      ],
+      [
+        4,
+        263756.67623554496
+      ],
+      [
+        5,
+        287991.67623554496
+      ],
+      [
+        6,
+        292680.67623554496
+      ],
+      [
+        7,
+        341187.67623554496
+      ],
+      [
+        8,
+        338273.67623554496
+      ],
+      [
+        9,
+        389589.67623554496
+      ],
+      [
+        10,
+        385974.67623554496
+      ],
+      [
+        11,
+        466118.67623554496
+      ],
+      [
+        12,
+        463213.67623554496
+      ],
+      [
+        24,
+        1122166.676235545
+      ],
+      [
+        48,
+        2587155.676235545
+      ],
+      [
+        96,
+        5106262.676235545
+      ],
+      [
+        192,
+        9924433.676235545
+      ],
+      [
+        384,
+        19839611.676235545
+      ],
+      [
+        768,
+        38470432.67623554
+      ],
+      [
+        1536,
+        75476676.67623554
+      ],
+      [
+        2040,
+        99743651.67623554
+      ]
+    ],
+    "phi_pts": [
+      [
+        1,
+        1.0
+      ],
+      [
+        2,
+        0.6094285454311059
+      ],
+      [
+        4,
+        0.3394953533726802
+      ],
+      [
+        8,
+        0.17688515660823884
+      ]
+    ],
+    "thread_domain": [
+      1,
+      8
+    ]
+  },
+  "entries": [
+    {
+      "shape": [
+        8
+      ],
+      "distinct_experts": 1,
+      "routes": 1,
+      "makespan_ns": 118776,
+      "full_call_median_ns": 950210,
+      "measurement_experts": 8,
+      "measurement_groups": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "iso_max_ns": 117762,
+      "iso_baseline_makespan_ns": 942096,
+      "derate": 1.0086127103819569,
+      "p10_ns": 114814,
+      "p90_ns": 125194,
+      "num_iters": 20
+    },
+    {
+      "shape": [
+        8
+      ],
+      "distinct_experts": 1,
+      "routes": 2,
+      "makespan_ns": 117294,
+      "full_call_median_ns": 938357,
+      "measurement_experts": 8,
+      "measurement_groups": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "iso_max_ns": 120210,
+      "iso_baseline_makespan_ns": 961680,
+      "derate": 0.975747649945928,
+      "p10_ns": 114710,
+      "p90_ns": 120995,
+      "num_iters": 20
+    },
+    {
+      "shape": [
+        8
+      ],
+      "distinct_experts": 1,
+      "routes": 3,
+      "makespan_ns": 120986,
+      "full_call_median_ns": 967888,
+      "measurement_experts": 8,
+      "measurement_groups": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "iso_max_ns": 124246,
+      "iso_baseline_makespan_ns": 993968,
+      "derate": 0.973761730759944,
+      "p10_ns": 119903,
+      "p90_ns": 138204,
+      "num_iters": 20
+    },
+    {
+      "shape": [
+        8
+      ],
+      "distinct_experts": 1,
+      "routes": 4,
+      "makespan_ns": 122698,
+      "full_call_median_ns": 981581,
+      "measurement_experts": 8,
+      "measurement_groups": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "iso_max_ns": 123215,
+      "iso_baseline_makespan_ns": 985720,
+      "derate": 0.9958010388345575,
+      "p10_ns": 119394,
+      "p90_ns": 125476,
+      "num_iters": 20
+    },
+    {
+      "shape": [
+        8
+      ],
+      "distinct_experts": 1,
+      "routes": 5,
+      "makespan_ns": 123357,
+      "full_call_median_ns": 986857,
+      "measurement_experts": 8,
+      "measurement_groups": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "iso_max_ns": 125947,
+      "iso_baseline_makespan_ns": 1007576,
+      "derate": 0.9794367869024272,
+      "p10_ns": 121636,
+      "p90_ns": 128211,
+      "num_iters": 20
+    },
+    {
+      "shape": [
+        8
+      ],
+      "distinct_experts": 1,
+      "routes": 6,
+      "makespan_ns": 124976,
+      "full_call_median_ns": 999806,
+      "measurement_experts": 8,
+      "measurement_groups": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "iso_max_ns": 126531,
+      "iso_baseline_makespan_ns": 1012248,
+      "derate": 0.9877085457318759,
+      "p10_ns": 123470,
+      "p90_ns": 127006,
+      "num_iters": 20
+    },
+    {
+      "shape": [
+        8
+      ],
+      "distinct_experts": 1,
+      "routes": 7,
+      "makespan_ns": 133704,
+      "full_call_median_ns": 1069639,
+      "measurement_experts": 8,
+      "measurement_groups": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "iso_max_ns": 134171,
+      "iso_baseline_makespan_ns": 1073368,
+      "derate": 0.99652588860484,
+      "p10_ns": 131889,
+      "p90_ns": 137583,
+      "num_iters": 20
+    },
+    {
+      "shape": [
+        8
+      ],
+      "distinct_experts": 1,
+      "routes": 8,
+      "makespan_ns": 135655,
+      "full_call_median_ns": 1085243,
+      "measurement_experts": 8,
+      "measurement_groups": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "iso_max_ns": 135600,
+      "iso_baseline_makespan_ns": 1084800,
+      "derate": 1.0004083702064896,
+      "p10_ns": 133547,
+      "p90_ns": 139260,
+      "num_iters": 20
+    },
+    {
+      "shape": [
+        8
+      ],
+      "distinct_experts": 1,
+      "routes": 9,
+      "makespan_ns": 157573,
+      "full_call_median_ns": 1260588,
+      "measurement_experts": 8,
+      "measurement_groups": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "iso_max_ns": 159452,
+      "iso_baseline_makespan_ns": 1275616,
+      "derate": 0.988219025161177,
+      "p10_ns": 156158,
+      "p90_ns": 162334,
+      "num_iters": 20
+    },
+    {
+      "shape": [
+        8
+      ],
+      "distinct_experts": 1,
+      "routes": 10,
+      "makespan_ns": 160617,
+      "full_call_median_ns": 1284935,
+      "measurement_experts": 8,
+      "measurement_groups": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "iso_max_ns": 172436,
+      "iso_baseline_makespan_ns": 1379488,
+      "derate": 0.931457903222065,
+      "p10_ns": 158601,
+      "p90_ns": 162502,
+      "num_iters": 20
+    },
+    {
+      "shape": [
+        8
+      ],
+      "distinct_experts": 1,
+      "routes": 11,
+      "makespan_ns": 178777,
+      "full_call_median_ns": 1430216,
+      "measurement_experts": 8,
+      "measurement_groups": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "iso_max_ns": 176609,
+      "iso_baseline_makespan_ns": 1412872,
+      "derate": 1.0122757050886422,
+      "p10_ns": 175107,
+      "p90_ns": 185160,
+      "num_iters": 20
+    },
+    {
+      "shape": [
+        8
+      ],
+      "distinct_experts": 1,
+      "routes": 12,
+      "makespan_ns": 178959,
+      "full_call_median_ns": 1431673,
+      "measurement_experts": 8,
+      "measurement_groups": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "iso_max_ns": 179350,
+      "iso_baseline_makespan_ns": 1434800,
+      "derate": 0.9978206021745191,
+      "p10_ns": 176690,
+      "p90_ns": 184342,
+      "num_iters": 20
+    },
+    {
+      "shape": [
+        8
+      ],
+      "distinct_experts": 1,
+      "routes": 24,
+      "makespan_ns": 302269,
+      "full_call_median_ns": 2418152,
+      "measurement_experts": 8,
+      "measurement_groups": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "iso_max_ns": 297657,
+      "iso_baseline_makespan_ns": 2381256,
+      "derate": 1.0154943441612325,
+      "p10_ns": 300320,
+      "p90_ns": 321860,
+      "num_iters": 20
+    },
+    {
+      "shape": [
+        8
+      ],
+      "distinct_experts": 1,
+      "routes": 48,
+      "makespan_ns": 511830,
+      "full_call_median_ns": 4094643,
+      "measurement_experts": 8,
+      "measurement_groups": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "iso_max_ns": 502220,
+      "iso_baseline_makespan_ns": 4017760,
+      "derate": 1.0191357871052527,
+      "p10_ns": 509190,
+      "p90_ns": 526836,
+      "num_iters": 20
+    },
+    {
+      "shape": [
+        8
+      ],
+      "distinct_experts": 1,
+      "routes": 192,
+      "makespan_ns": 1750645,
+      "full_call_median_ns": 14005162,
+      "measurement_experts": 8,
+      "measurement_groups": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "iso_max_ns": 1737957,
+      "iso_baseline_makespan_ns": 13903656,
+      "derate": 1.0073006696943596,
+      "p10_ns": 1740314,
+      "p90_ns": 1765554,
+      "num_iters": 20
+    },
+    {
+      "shape": [
+        8
+      ],
+      "distinct_experts": 1,
+      "routes": 768,
+      "makespan_ns": 6813251,
+      "full_call_median_ns": 54506007,
+      "measurement_experts": 8,
+      "measurement_groups": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "iso_max_ns": 6808669,
+      "iso_baseline_makespan_ns": 54469352,
+      "derate": 1.000672947238293,
+      "p10_ns": 6787940,
+      "p90_ns": 6862685,
+      "num_iters": 20
+    },
+    {
+      "shape": [
+        8
+      ],
+      "distinct_experts": 1,
+      "routes": 2040,
+      "makespan_ns": 18042877,
+      "full_call_median_ns": 144343019,
+      "measurement_experts": 8,
+      "measurement_groups": 8,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 8,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        8
+      ],
+      "iso_max_ns": 18062298,
+      "iso_baseline_makespan_ns": 144498384,
+      "derate": 0.9989247976641732,
+      "p10_ns": 17997023,
+      "p90_ns": 18147918,
+      "num_iters": 20
+    },
+    {
+      "shape": [
+        4,
+        4
+      ],
+      "distinct_experts": 2,
+      "routes": 1,
+      "makespan_ns": 213171,
+      "full_call_median_ns": 852684,
+      "measurement_experts": 8,
+      "measurement_groups": 4,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 4,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        4,
+        4
+      ],
+      "iso_max_ns": 152039,
+      "iso_baseline_makespan_ns": 608156,
+      "derate": 1.4020810449950343,
+      "p10_ns": 210697,
+      "p90_ns": 222092,
+      "num_iters": 20
+    },
+    {
+      "shape": [
+        4,
+        4
+      ],
+      "distinct_experts": 2,
+      "routes": 2,
+      "makespan_ns": 217750,
+      "full_call_median_ns": 871002,
+      "measurement_experts": 8,
+      "measurement_groups": 4,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 4,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        4,
+        4
+      ],
+      "iso_max_ns": 157165,
+      "iso_baseline_makespan_ns": 628660,
+      "derate": 1.3854897718957784,
+      "p10_ns": 213796,
+      "p90_ns": 223031,
+      "num_iters": 20
+    },
+    {
+      "shape": [
+        4,
+        4
+      ],
+      "distinct_experts": 2,
+      "routes": 3,
+      "makespan_ns": 222220,
+      "full_call_median_ns": 888880,
+      "measurement_experts": 8,
+      "measurement_groups": 4,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 4,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        4,
+        4
+      ],
+      "iso_max_ns": 168889,
+      "iso_baseline_makespan_ns": 675556,
+      "derate": 1.3157754501477301,
+      "p10_ns": 216962,
+      "p90_ns": 230089,
+      "num_iters": 20
+    },
+    {
+      "shape": [
+        4,
+        4
+      ],
+      "distinct_experts": 2,
+      "routes": 4,
+      "makespan_ns": 225595,
+      "full_call_median_ns": 902380,
+      "measurement_experts": 8,
+      "measurement_groups": 4,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 4,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        4,
+        4
+      ],
+      "iso_max_ns": 167997,
+      "iso_baseline_makespan_ns": 671988,
+      "derate": 1.3428513604409602,
+      "p10_ns": 220998,
+      "p90_ns": 234591,
+      "num_iters": 20
+    },
+    {
+      "shape": [
+        4,
+        4
+      ],
+      "distinct_experts": 2,
+      "routes": 5,
+      "makespan_ns": 233689,
+      "full_call_median_ns": 934757,
+      "measurement_experts": 8,
+      "measurement_groups": 4,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 4,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        4,
+        4
+      ],
+      "iso_max_ns": 185111,
+      "iso_baseline_makespan_ns": 740444,
+      "derate": 1.2624276785280184,
+      "p10_ns": 228599,
+      "p90_ns": 237134,
+      "num_iters": 20
+    },
+    {
+      "shape": [
+        4,
+        4
+      ],
+      "distinct_experts": 2,
+      "routes": 6,
+      "makespan_ns": 231526,
+      "full_call_median_ns": 926106,
+      "measurement_experts": 8,
+      "measurement_groups": 4,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 4,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        4,
+        4
+      ],
+      "iso_max_ns": 184211,
+      "iso_baseline_makespan_ns": 736844,
+      "derate": 1.2568549109445146,
+      "p10_ns": 229349,
+      "p90_ns": 236226,
+      "num_iters": 20
+    },
+    {
+      "shape": [
+        4,
+        4
+      ],
+      "distinct_experts": 2,
+      "routes": 7,
+      "makespan_ns": 252565,
+      "full_call_median_ns": 1010259,
+      "measurement_experts": 8,
+      "measurement_groups": 4,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 4,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        4,
+        4
+      ],
+      "iso_max_ns": 207264,
+      "iso_baseline_makespan_ns": 829056,
+      "derate": 1.2185654527559056,
+      "p10_ns": 247241,
+      "p90_ns": 271422,
+      "num_iters": 20
+    },
+    {
+      "shape": [
+        4,
+        4
+      ],
+      "distinct_experts": 2,
+      "routes": 8,
+      "makespan_ns": 252697,
+      "full_call_median_ns": 1010787,
+      "measurement_experts": 8,
+      "measurement_groups": 4,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 4,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        4,
+        4
+      ],
+      "iso_max_ns": 209798,
+      "iso_baseline_makespan_ns": 839192,
+      "derate": 1.2044764487745354,
+      "p10_ns": 246690,
+      "p90_ns": 262666,
+      "num_iters": 20
+    },
+    {
+      "shape": [
+        4,
+        4
+      ],
+      "distinct_experts": 2,
+      "routes": 9,
+      "makespan_ns": 292161,
+      "full_call_median_ns": 1168647,
+      "measurement_experts": 8,
+      "measurement_groups": 4,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 4,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        4,
+        4
+      ],
+      "iso_max_ns": 243915,
+      "iso_baseline_makespan_ns": 975660,
+      "derate": 1.1978014882233565,
+      "p10_ns": 285799,
+      "p90_ns": 298924,
+      "num_iters": 20
+    },
+    {
+      "shape": [
+        4,
+        4
+      ],
+      "distinct_experts": 2,
+      "routes": 10,
+      "makespan_ns": 294259,
+      "full_call_median_ns": 1177036,
+      "measurement_experts": 8,
+      "measurement_groups": 4,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 4,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        4,
+        4
+      ],
+      "iso_max_ns": 247124,
+      "iso_baseline_makespan_ns": 988496,
+      "derate": 1.190734206309383,
+      "p10_ns": 291552,
+      "p90_ns": 305658,
+      "num_iters": 20
+    },
+    {
+      "shape": [
+        4,
+        4
+      ],
+      "distinct_experts": 2,
+      "routes": 11,
+      "makespan_ns": 321205,
+      "full_call_median_ns": 1284820,
+      "measurement_experts": 8,
+      "measurement_groups": 4,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 4,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        4,
+        4
+      ],
+      "iso_max_ns": 269153,
+      "iso_baseline_makespan_ns": 1076612,
+      "derate": 1.1933918626208886,
+      "p10_ns": 315948,
+      "p90_ns": 331267,
+      "num_iters": 20
+    },
+    {
+      "shape": [
+        4,
+        4
+      ],
+      "distinct_experts": 2,
+      "routes": 12,
+      "makespan_ns": 324393,
+      "full_call_median_ns": 1297570,
+      "measurement_experts": 8,
+      "measurement_groups": 4,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 4,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        4,
+        4
+      ],
+      "iso_max_ns": 272660,
+      "iso_baseline_makespan_ns": 1090640,
+      "derate": 1.1897326340497323,
+      "p10_ns": 320026,
+      "p90_ns": 331338,
+      "num_iters": 20
+    },
+    {
+      "shape": [
+        4,
+        4
+      ],
+      "distinct_experts": 2,
+      "routes": 24,
+      "makespan_ns": 566525,
+      "full_call_median_ns": 2266100,
+      "measurement_experts": 8,
+      "measurement_groups": 4,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 4,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        4,
+        4
+      ],
+      "iso_max_ns": 494862,
+      "iso_baseline_makespan_ns": 1979448,
+      "derate": 1.1448141097922249,
+      "p10_ns": 563797,
+      "p90_ns": 575060,
+      "num_iters": 20
+    },
+    {
+      "shape": [
+        4,
+        4
+      ],
+      "distinct_experts": 2,
+      "routes": 48,
+      "makespan_ns": 1015849,
+      "full_call_median_ns": 4063396,
+      "measurement_experts": 8,
+      "measurement_groups": 4,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 4,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        4,
+        4
+      ],
+      "iso_max_ns": 902212,
+      "iso_baseline_makespan_ns": 3608848,
+      "derate": 1.1259537669638622,
+      "p10_ns": 1011282,
+      "p90_ns": 1048760,
+      "num_iters": 20
+    },
+    {
+      "shape": [
+        4,
+        4
+      ],
+      "distinct_experts": 2,
+      "routes": 192,
+      "makespan_ns": 3668518,
+      "full_call_median_ns": 14674074,
+      "measurement_experts": 8,
+      "measurement_groups": 4,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 4,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        4,
+        4
+      ],
+      "iso_max_ns": 3327930,
+      "iso_baseline_makespan_ns": 13311720,
+      "derate": 1.10234244710676,
+      "p10_ns": 3649924,
+      "p90_ns": 3702470,
+      "num_iters": 20
+    },
+    {
+      "shape": [
+        4,
+        4
+      ],
+      "distinct_experts": 2,
+      "routes": 768,
+      "makespan_ns": 14169022,
+      "full_call_median_ns": 56676091,
+      "measurement_experts": 8,
+      "measurement_groups": 4,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 4,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        4,
+        4
+      ],
+      "iso_max_ns": 13075722,
+      "iso_baseline_makespan_ns": 52302888,
+      "derate": 1.0836130310815724,
+      "p10_ns": 14116808,
+      "p90_ns": 14241838,
+      "num_iters": 20
+    },
+    {
+      "shape": [
+        4,
+        4
+      ],
+      "distinct_experts": 2,
+      "routes": 2040,
+      "makespan_ns": 37103396,
+      "full_call_median_ns": 148413587,
+      "measurement_experts": 8,
+      "measurement_groups": 4,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 4,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        4,
+        4
+      ],
+      "iso_max_ns": 34379364,
+      "iso_baseline_makespan_ns": 137517456,
+      "derate": 1.079234530051225,
+      "p10_ns": 37003840,
+      "p90_ns": 37507280,
+      "num_iters": 20
+    },
+    {
+      "shape": [
+        2,
+        2,
+        2,
+        2
+      ],
+      "distinct_experts": 4,
+      "routes": 1,
+      "makespan_ns": 410290,
+      "full_call_median_ns": 820581,
+      "measurement_experts": 8,
+      "measurement_groups": 2,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 2,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        2,
+        2,
+        2,
+        2
+      ],
+      "iso_max_ns": 238771,
+      "iso_baseline_makespan_ns": 477542,
+      "derate": 1.718343098617504,
+      "p10_ns": 397259,
+      "p90_ns": 424302,
+      "num_iters": 20
+    },
+    {
+      "shape": [
+        2,
+        2,
+        2,
+        2
+      ],
+      "distinct_experts": 4,
+      "routes": 2,
+      "makespan_ns": 419758,
+      "full_call_median_ns": 839516,
+      "measurement_experts": 8,
+      "measurement_groups": 2,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 2,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        2,
+        2,
+        2,
+        2
+      ],
+      "iso_max_ns": 250470,
+      "iso_baseline_makespan_ns": 500940,
+      "derate": 1.675881343075019,
+      "p10_ns": 401608,
+      "p90_ns": 432570,
+      "num_iters": 20
+    },
+    {
+      "shape": [
+        2,
+        2,
+        2,
+        2
+      ],
+      "distinct_experts": 4,
+      "routes": 3,
+      "makespan_ns": 428626,
+      "full_call_median_ns": 857252,
+      "measurement_experts": 8,
+      "measurement_groups": 2,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 2,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        2,
+        2,
+        2,
+        2
+      ],
+      "iso_max_ns": 272107,
+      "iso_baseline_makespan_ns": 544214,
+      "derate": 1.5752112220560295,
+      "p10_ns": 411481,
+      "p90_ns": 441970,
+      "num_iters": 20
+    },
+    {
+      "shape": [
+        2,
+        2,
+        2,
+        2
+      ],
+      "distinct_experts": 4,
+      "routes": 4,
+      "makespan_ns": 428363,
+      "full_call_median_ns": 856726,
+      "measurement_experts": 8,
+      "measurement_groups": 2,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 2,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        2,
+        2,
+        2,
+        2
+      ],
+      "iso_max_ns": 273027,
+      "iso_baseline_makespan_ns": 546054,
+      "derate": 1.5689400681983834,
+      "p10_ns": 421134,
+      "p90_ns": 452722,
+      "num_iters": 20
+    },
+    {
+      "shape": [
+        2,
+        2,
+        2,
+        2
+      ],
+      "distinct_experts": 4,
+      "routes": 5,
+      "makespan_ns": 439354,
+      "full_call_median_ns": 878709,
+      "measurement_experts": 8,
+      "measurement_groups": 2,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 2,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        2,
+        2,
+        2,
+        2
+      ],
+      "iso_max_ns": 300697,
+      "iso_baseline_makespan_ns": 601394,
+      "derate": 1.4611203304322957,
+      "p10_ns": 428558,
+      "p90_ns": 451976,
+      "num_iters": 20
+    },
+    {
+      "shape": [
+        2,
+        2,
+        2,
+        2
+      ],
+      "distinct_experts": 4,
+      "routes": 6,
+      "makespan_ns": 436149,
+      "full_call_median_ns": 872297,
+      "measurement_experts": 8,
+      "measurement_groups": 2,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 2,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        2,
+        2,
+        2,
+        2
+      ],
+      "iso_max_ns": 303382,
+      "iso_baseline_makespan_ns": 606764,
+      "derate": 1.4376215464332096,
+      "p10_ns": 424796,
+      "p90_ns": 446852,
+      "num_iters": 20
+    },
+    {
+      "shape": [
+        2,
+        2,
+        2,
+        2
+      ],
+      "distinct_experts": 4,
+      "routes": 7,
+      "makespan_ns": 471751,
+      "full_call_median_ns": 943501,
+      "measurement_experts": 8,
+      "measurement_groups": 2,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 2,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        2,
+        2,
+        2,
+        2
+      ],
+      "iso_max_ns": 340664,
+      "iso_baseline_makespan_ns": 681328,
+      "derate": 1.3847970434210835,
+      "p10_ns": 464113,
+      "p90_ns": 483156,
+      "num_iters": 20
+    },
+    {
+      "shape": [
+        2,
+        2,
+        2,
+        2
+      ],
+      "distinct_experts": 4,
+      "routes": 8,
+      "makespan_ns": 469104,
+      "full_call_median_ns": 938208,
+      "measurement_experts": 8,
+      "measurement_groups": 2,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 2,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        2,
+        2,
+        2,
+        2
+      ],
+      "iso_max_ns": 344020,
+      "iso_baseline_makespan_ns": 688040,
+      "derate": 1.3635951398174524,
+      "p10_ns": 458637,
+      "p90_ns": 484288,
+      "num_iters": 20
+    },
+    {
+      "shape": [
+        2,
+        2,
+        2,
+        2
+      ],
+      "distinct_experts": 4,
+      "routes": 9,
+      "makespan_ns": 542105,
+      "full_call_median_ns": 1084210,
+      "measurement_experts": 8,
+      "measurement_groups": 2,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 2,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        2,
+        2,
+        2,
+        2
+      ],
+      "iso_max_ns": 387363,
+      "iso_baseline_makespan_ns": 774726,
+      "derate": 1.3994754274414438,
+      "p10_ns": 532129,
+      "p90_ns": 554062,
+      "num_iters": 20
+    },
+    {
+      "shape": [
+        2,
+        2,
+        2,
+        2
+      ],
+      "distinct_experts": 4,
+      "routes": 10,
+      "makespan_ns": 545631,
+      "full_call_median_ns": 1091263,
+      "measurement_experts": 8,
+      "measurement_groups": 2,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 2,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        2,
+        2,
+        2,
+        2
+      ],
+      "iso_max_ns": 390390,
+      "iso_baseline_makespan_ns": 780780,
+      "derate": 1.3976574707343938,
+      "p10_ns": 538117,
+      "p90_ns": 567227,
+      "num_iters": 20
+    },
+    {
+      "shape": [
+        2,
+        2,
+        2,
+        2
+      ],
+      "distinct_experts": 4,
+      "routes": 11,
+      "makespan_ns": 597121,
+      "full_call_median_ns": 1194243,
+      "measurement_experts": 8,
+      "measurement_groups": 2,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 2,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        2,
+        2,
+        2,
+        2
+      ],
+      "iso_max_ns": 432505,
+      "iso_baseline_makespan_ns": 865010,
+      "derate": 1.3806117848348574,
+      "p10_ns": 585811,
+      "p90_ns": 604401,
+      "num_iters": 20
+    },
+    {
+      "shape": [
+        2,
+        2,
+        2,
+        2
+      ],
+      "distinct_experts": 4,
+      "routes": 12,
+      "makespan_ns": 601975,
+      "full_call_median_ns": 1203950,
+      "measurement_experts": 8,
+      "measurement_groups": 2,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 2,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        2,
+        2,
+        2,
+        2
+      ],
+      "iso_max_ns": 436317,
+      "iso_baseline_makespan_ns": 872634,
+      "derate": 1.3796734942713669,
+      "p10_ns": 594958,
+      "p90_ns": 664736,
+      "num_iters": 20
+    },
+    {
+      "shape": [
+        2,
+        2,
+        2,
+        2
+      ],
+      "distinct_experts": 4,
+      "routes": 24,
+      "makespan_ns": 1086879,
+      "full_call_median_ns": 2173759,
+      "measurement_experts": 8,
+      "measurement_groups": 2,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 2,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        2,
+        2,
+        2,
+        2
+      ],
+      "iso_max_ns": 825839,
+      "iso_baseline_makespan_ns": 1651678,
+      "derate": 1.3160912720275986,
+      "p10_ns": 1078108,
+      "p90_ns": 1138056,
+      "num_iters": 20
+    },
+    {
+      "shape": [
+        2,
+        2,
+        2,
+        2
+      ],
+      "distinct_experts": 4,
+      "routes": 48,
+      "makespan_ns": 2034725,
+      "full_call_median_ns": 4069450,
+      "measurement_experts": 8,
+      "measurement_groups": 2,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 2,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        2,
+        2,
+        2,
+        2
+      ],
+      "iso_max_ns": 1608597,
+      "iso_baseline_makespan_ns": 3217194,
+      "derate": 1.2649066235980795,
+      "p10_ns": 2017436,
+      "p90_ns": 2061375,
+      "num_iters": 20
+    },
+    {
+      "shape": [
+        2,
+        2,
+        2,
+        2
+      ],
+      "distinct_experts": 4,
+      "routes": 192,
+      "makespan_ns": 7532136,
+      "full_call_median_ns": 15064273,
+      "measurement_experts": 8,
+      "measurement_groups": 2,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 2,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        2,
+        2,
+        2,
+        2
+      ],
+      "iso_max_ns": 5982786,
+      "iso_baseline_makespan_ns": 11965572,
+      "derate": 1.2589680627052346,
+      "p10_ns": 7493453,
+      "p90_ns": 7613721,
+      "num_iters": 20
+    },
+    {
+      "shape": [
+        2,
+        2,
+        2,
+        2
+      ],
+      "distinct_experts": 4,
+      "routes": 768,
+      "makespan_ns": 28965443,
+      "full_call_median_ns": 57930885,
+      "measurement_experts": 8,
+      "measurement_groups": 2,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 2,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        2,
+        2,
+        2,
+        2
+      ],
+      "iso_max_ns": 23433598,
+      "iso_baseline_makespan_ns": 46867196,
+      "derate": 1.2360646666380468,
+      "p10_ns": 28901411,
+      "p90_ns": 29030514,
+      "num_iters": 20
+    },
+    {
+      "shape": [
+        2,
+        2,
+        2,
+        2
+      ],
+      "distinct_experts": 4,
+      "routes": 2040,
+      "makespan_ns": 75820624,
+      "full_call_median_ns": 151641247,
+      "measurement_experts": 8,
+      "measurement_groups": 2,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 2,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        2,
+        2,
+        2,
+        2
+      ],
+      "iso_max_ns": 61545615,
+      "iso_baseline_makespan_ns": 123091230,
+      "derate": 1.2319419263257017,
+      "p10_ns": 75516690,
+      "p90_ns": 96309428,
+      "num_iters": 20
+    },
+    {
+      "shape": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1
+      ],
+      "distinct_experts": 8,
+      "routes": 1,
+      "makespan_ns": 826197,
+      "full_call_median_ns": 826197,
+      "measurement_experts": 8,
+      "measurement_groups": 1,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 1,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1
+      ],
+      "iso_max_ns": 433242,
+      "iso_baseline_makespan_ns": 433242,
+      "derate": 1.9070104006536763,
+      "p10_ns": 779955,
+      "p90_ns": 904206,
+      "num_iters": 20
+    },
+    {
+      "shape": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1
+      ],
+      "distinct_experts": 8,
+      "routes": 2,
+      "makespan_ns": 817969,
+      "full_call_median_ns": 817969,
+      "measurement_experts": 8,
+      "measurement_groups": 1,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 1,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1
+      ],
+      "iso_max_ns": 438373,
+      "iso_baseline_makespan_ns": 438373,
+      "derate": 1.8659201182554583,
+      "p10_ns": 785110,
+      "p90_ns": 882849,
+      "num_iters": 20
+    },
+    {
+      "shape": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1
+      ],
+      "distinct_experts": 8,
+      "routes": 3,
+      "makespan_ns": 829790,
+      "full_call_median_ns": 829790,
+      "measurement_experts": 8,
+      "measurement_groups": 1,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 1,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1
+      ],
+      "iso_max_ns": 475188,
+      "iso_baseline_makespan_ns": 475188,
+      "derate": 1.746235174288913,
+      "p10_ns": 779739,
+      "p90_ns": 909195,
+      "num_iters": 20
+    },
+    {
+      "shape": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1
+      ],
+      "distinct_experts": 8,
+      "routes": 4,
+      "makespan_ns": 825083,
+      "full_call_median_ns": 825083,
+      "measurement_experts": 8,
+      "measurement_groups": 1,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 1,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1
+      ],
+      "iso_max_ns": 476064,
+      "iso_baseline_makespan_ns": 476064,
+      "derate": 1.7331346205552194,
+      "p10_ns": 790394,
+      "p90_ns": 855610,
+      "num_iters": 20
+    },
+    {
+      "shape": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1
+      ],
+      "distinct_experts": 8,
+      "routes": 5,
+      "makespan_ns": 847395,
+      "full_call_median_ns": 847395,
+      "measurement_experts": 8,
+      "measurement_groups": 1,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 1,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1
+      ],
+      "iso_max_ns": 500299,
+      "iso_baseline_makespan_ns": 500299,
+      "derate": 1.6937771212814736,
+      "p10_ns": 824136,
+      "p90_ns": 900004,
+      "num_iters": 20
+    },
+    {
+      "shape": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1
+      ],
+      "distinct_experts": 8,
+      "routes": 6,
+      "makespan_ns": 843093,
+      "full_call_median_ns": 843093,
+      "measurement_experts": 8,
+      "measurement_groups": 1,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 1,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1
+      ],
+      "iso_max_ns": 504988,
+      "iso_baseline_makespan_ns": 504988,
+      "derate": 1.6695307611269972,
+      "p10_ns": 827794,
+      "p90_ns": 871294,
+      "num_iters": 20
+    },
+    {
+      "shape": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1
+      ],
+      "distinct_experts": 8,
+      "routes": 7,
+      "makespan_ns": 913329,
+      "full_call_median_ns": 913329,
+      "measurement_experts": 8,
+      "measurement_groups": 1,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 1,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1
+      ],
+      "iso_max_ns": 553495,
+      "iso_baseline_makespan_ns": 553495,
+      "derate": 1.6501124671406247,
+      "p10_ns": 896706,
+      "p90_ns": 1108325,
+      "num_iters": 20
+    },
+    {
+      "shape": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1
+      ],
+      "distinct_experts": 8,
+      "routes": 8,
+      "makespan_ns": 1537294,
+      "full_call_median_ns": 1537294,
+      "measurement_experts": 8,
+      "measurement_groups": 1,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 1,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1
+      ],
+      "iso_max_ns": 550581,
+      "iso_baseline_makespan_ns": 550581,
+      "derate": 2.7921304948772296,
+      "p10_ns": 1018025,
+      "p90_ns": 4003941,
+      "num_iters": 20
+    },
+    {
+      "shape": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1
+      ],
+      "distinct_experts": 8,
+      "routes": 9,
+      "makespan_ns": 1015892,
+      "full_call_median_ns": 1015892,
+      "measurement_experts": 8,
+      "measurement_groups": 1,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 1,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1
+      ],
+      "iso_max_ns": 601897,
+      "iso_baseline_makespan_ns": 601897,
+      "derate": 1.6878170185264256,
+      "p10_ns": 1005594,
+      "p90_ns": 1046216,
+      "num_iters": 20
+    },
+    {
+      "shape": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1
+      ],
+      "distinct_experts": 8,
+      "routes": 10,
+      "makespan_ns": 1064729,
+      "full_call_median_ns": 1064729,
+      "measurement_experts": 8,
+      "measurement_groups": 1,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 1,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1
+      ],
+      "iso_max_ns": 598282,
+      "iso_baseline_makespan_ns": 598282,
+      "derate": 1.7796440474558821,
+      "p10_ns": 1033529,
+      "p90_ns": 3113884,
+      "num_iters": 20
+    },
+    {
+      "shape": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1
+      ],
+      "distinct_experts": 8,
+      "routes": 11,
+      "makespan_ns": 3945260,
+      "full_call_median_ns": 3945260,
+      "measurement_experts": 8,
+      "measurement_groups": 1,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 1,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1
+      ],
+      "iso_max_ns": 678426,
+      "iso_baseline_makespan_ns": 678426,
+      "derate": 5.81531368196384,
+      "p10_ns": 2963616,
+      "p90_ns": 5222493,
+      "num_iters": 20
+    },
+    {
+      "shape": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1
+      ],
+      "distinct_experts": 8,
+      "routes": 12,
+      "makespan_ns": 1447667,
+      "full_call_median_ns": 1447667,
+      "measurement_experts": 8,
+      "measurement_groups": 1,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 1,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1
+      ],
+      "iso_max_ns": 675521,
+      "iso_baseline_makespan_ns": 675521,
+      "derate": 2.1430377442004023,
+      "p10_ns": 1215993,
+      "p90_ns": 3305329,
+      "num_iters": 20
+    },
+    {
+      "shape": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1
+      ],
+      "distinct_experts": 8,
+      "routes": 24,
+      "makespan_ns": 2543568,
+      "full_call_median_ns": 2543568,
+      "measurement_experts": 8,
+      "measurement_groups": 1,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 1,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1
+      ],
+      "iso_max_ns": 1334474,
+      "iso_baseline_makespan_ns": 1334474,
+      "derate": 1.906045378178968,
+      "p10_ns": 2176538,
+      "p90_ns": 4427086,
+      "num_iters": 20
+    },
+    {
+      "shape": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1
+      ],
+      "distinct_experts": 8,
+      "routes": 48,
+      "makespan_ns": 4067498,
+      "full_call_median_ns": 4067498,
+      "measurement_experts": 8,
+      "measurement_groups": 1,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 1,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1
+      ],
+      "iso_max_ns": 2799463,
+      "iso_baseline_makespan_ns": 2799463,
+      "derate": 1.4529565134456144,
+      "p10_ns": 4030741,
+      "p90_ns": 4223296,
+      "num_iters": 20
+    },
+    {
+      "shape": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1
+      ],
+      "distinct_experts": 8,
+      "routes": 192,
+      "makespan_ns": 15465720,
+      "full_call_median_ns": 15465720,
+      "measurement_experts": 8,
+      "measurement_groups": 1,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 1,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1
+      ],
+      "iso_max_ns": 10136741,
+      "iso_baseline_makespan_ns": 10136741,
+      "derate": 1.5257092984816323,
+      "p10_ns": 15356111,
+      "p90_ns": 15871272,
+      "num_iters": 20
+    },
+    {
+      "shape": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1
+      ],
+      "distinct_experts": 8,
+      "routes": 768,
+      "makespan_ns": 59590829,
+      "full_call_median_ns": 59590829,
+      "measurement_experts": 8,
+      "measurement_groups": 1,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 1,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1
+      ],
+      "iso_max_ns": 38682740,
+      "iso_baseline_makespan_ns": 38682740,
+      "derate": 1.5405017586654928,
+      "p10_ns": 59278354,
+      "p90_ns": 59838915,
+      "num_iters": 20
+    },
+    {
+      "shape": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1
+      ],
+      "distinct_experts": 8,
+      "routes": 2040,
+      "makespan_ns": 156615920,
+      "full_call_median_ns": 156615920,
+      "measurement_experts": 8,
+      "measurement_groups": 1,
+      "measurement_tasks": 8,
+      "measurement_complete_groups": 1,
+      "measurement_partial_lanes": 0,
+      "lane_task_counts": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1
+      ],
+      "iso_max_ns": 99955959,
+      "iso_baseline_makespan_ns": 99955959,
+      "derate": 1.5668492560808707,
+      "p10_ns": 156146839,
+      "p90_ns": 157150934,
+      "num_iters": 20
+    }
+  ]
+}

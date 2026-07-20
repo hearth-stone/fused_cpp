@@ -12,7 +12,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "cpu_moe_schedule_optimization" / "cost_model"))
 from phase_model import ContentionCostModel  # noqa: E402
-from profile_catalog import ProfileCatalog, ProfileQuery  # noqa: E402
+from profile_catalog import (  # noqa: E402
+    ProfileCatalog,
+    ProfileCompatibilityError,
+    ProfileQuery,
+)
 from interval_planner import PolicyAwarePlanner  # noqa: E402
 
 
@@ -130,6 +134,8 @@ class ParallelLayerEvaluator:
         global_experts: int,
         cores_per_rank: int,
         dtype_bytes: int = 2,
+        sve_implementation: str = "auto",
+        m_tail_policy: str | None = None,
     ):
         self.catalog = catalog
         self.topology = topology
@@ -138,28 +144,54 @@ class ParallelLayerEvaluator:
         self.global_experts = int(global_experts)
         self.cores_per_rank = int(cores_per_rank)
         self.dtype_bytes = int(dtype_bytes)
+        self.sve_implementation = str(sve_implementation)
+        if self.sve_implementation not in {"auto", "jit", "asm"}:
+            raise ValueError("sve_implementation must be auto, jit, or asm")
+        if self.sve_implementation == "auto" and m_tail_policy is not None:
+            raise ValueError("m_tail_policy cannot override automatic SVE profile selection")
+        self.m_tail_policy = None if m_tail_policy is None else str(m_tail_policy)
 
     def _models(self, mode: str, intermediate_size: int, local_experts: int) -> list[ContentionCostModel]:
-        query = ProfileQuery(
-            mode=mode,
-            degree=self.topology.ranks,
-            hidden_size=self.hidden_size,
-            intermediate_size=intermediate_size,
-            global_experts=self.global_experts,
-            local_experts=local_experts,
-            backend="sve",
-            backend_n_tile=8,
-            activation="silu",
-            dtype="bf16",
-            measurement_experts=local_experts,
-            cores_per_rank=self.cores_per_rank,
-            concurrent_ranks=self.topology.ranks,
+        variants = (
+            (("jit", "xbyak_exact_m"), ("asm", "static_bucketed"))
+            if self.sve_implementation == "auto"
+            else (
+                (
+                    self.sve_implementation,
+                    self.m_tail_policy
+                    or ("xbyak_exact_m" if self.sve_implementation == "jit" else "static_bucketed"),
+                ),
+            )
         )
-        no_split, split = self.catalog.split_pair(query)
-        return [
-            ContentionCostModel(no_split.path, expected_policy=query),
-            ContentionCostModel(split.path, expected_policy=query),
-        ]
+        errors: list[str] = []
+        for implementation, tail_policy in variants:
+            query = ProfileQuery(
+                mode=mode,
+                degree=self.topology.ranks,
+                hidden_size=self.hidden_size,
+                intermediate_size=intermediate_size,
+                global_experts=self.global_experts,
+                local_experts=local_experts,
+                backend="sve",
+                backend_n_tile=8,
+                sve_implementation=implementation,
+                m_tail_policy=tail_policy,
+                activation="silu",
+                dtype="bf16",
+                measurement_experts=local_experts,
+                cores_per_rank=self.cores_per_rank,
+                concurrent_ranks=self.topology.ranks,
+            )
+            try:
+                no_split, split = self.catalog.split_pair(query)
+            except ProfileCompatibilityError as error:
+                errors.append(f"{implementation}/{tail_policy}: {error}")
+                continue
+            return [
+                ContentionCostModel(no_split.path, expected_policy=query),
+                ContentionCostModel(split.path, expected_policy=query),
+            ]
+        raise ProfileCompatibilityError("no complete SVE profile pair matched; " + "; ".join(errors))
 
     def _compute(
         self,
@@ -271,6 +303,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bw-inter", type=float, default=20.0)
     parser.add_argument("--latency-us", type=float, default=1.0)
     parser.add_argument("--dtype-bytes", type=int, default=2)
+    parser.add_argument("--sve-implementation", choices=("auto", "jit", "asm"), default="auto")
     parser.add_argument("--ep-routes", type=Path, default=None)
     parser.add_argument("--global-routes", type=Path, default=None)
     parser.add_argument("--json", action="store_true")
@@ -295,6 +328,7 @@ def main() -> int:
         global_experts=args.experts,
         cores_per_rank=args.cores_per_rank,
         dtype_bytes=args.dtype_bytes,
+        sve_implementation=args.sve_implementation,
     )
     ep_histograms = None
     global_histogram = None

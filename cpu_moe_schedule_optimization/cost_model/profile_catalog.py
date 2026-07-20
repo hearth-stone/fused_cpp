@@ -22,6 +22,8 @@ class ProfilePolicy:
     local_experts: int
     backend: str
     backend_n_tile: int
+    sve_implementation: str
+    m_tail_policy: str
     activation: str
     dtype: str
     w13_split: bool
@@ -69,6 +71,8 @@ class ProfilePolicy:
             local_experts=int(parallelism["local_experts"]),
             backend=str(kernel["backend"]),
             backend_n_tile=int(kernel["backend_n_tile"]),
+            sve_implementation=str(kernel.get("sve_implementation", "asm")),
+            m_tail_policy=str(kernel.get("m_tail_policy", "static_bucketed")),
             activation=str(expert["activation"]),
             dtype=str(expert["dtype"]),
             w13_split=bool(kernel["w13_split"]),
@@ -104,6 +108,8 @@ class ProfilePolicy:
             self.local_experts,
             self.backend,
             self.backend_n_tile,
+            self.sve_implementation,
+            self.m_tail_policy,
             self.activation,
             self.dtype,
             self.measurement_experts,
@@ -127,6 +133,8 @@ class ProfileQuery:
     local_experts: int | None = None
     backend: str | None = None
     backend_n_tile: int | None = None
+    sve_implementation: str | None = None
+    m_tail_policy: str | None = None
     activation: str | None = None
     dtype: str | None = None
     w13_split: bool | None = None

@@ -7,6 +7,31 @@ baseline:
   status: reference
 
 features:
+  - id: compute.xbyak_exact_m
+    part: compute
+    status: enabled
+    implementation: >-
+      csrc/moe/arm/sve_bf16/jit_kernels.cpp and
+      csrc/moe/arm/common/fused_moe_bf16_tiled.cpp
+    hypothesis: >-
+      Generating the existing packed-A SVE BFMMLA body for each logical M from
+      1 through 12 removes M4/M8/M12 tail overcompute while preserving the
+      static kernel ABI, weight layout, fused SiLU/packC epilogue, and direct
+      W2 route stores. Full M12 panels should remain throughput-neutral.
+    depends_on: []
+    conflicts_with: []
+    correctness: >-
+      PYTHONPATH=src FUSED_CPP_MOE_SVE=1 .venv/bin/python -m pytest -q
+      tests/test_fused_moe_bf16_tiled.py
+      -k 'sve_xbyak_exact_m_matches_static_asm or
+      sve_w2_direct_route_store_matches_scatter'
+    benchmark: >-
+      numactl --cpunodebind=0 --membind=0 taskset -c 0-95
+      .venv/bin/python
+      optimizations/fused_moe_sve/benchmarks/bench_xbyak_exact_m.py
+      --routes 5,6,9,10,12,192,2040 --threads 1,4,8,16,32,64,96
+      --warmup 3 --runs 11 --switch-period 5
+
   - id: compute.m_epoch
     part: compute
     status: experimental

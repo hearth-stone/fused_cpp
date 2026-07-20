@@ -11,9 +11,15 @@
 ## 当前 policy-aware 闭环
 
 Schema v2 路径按完整策略选择表：`TP/EP degree + H/F + global/local
-experts + SVE tile + split-W13 + NUMA/CPU set + LLC + source/binary hash`。
+experts + SVE implementation/tail policy + SVE tile + split-W13 + NUMA/CPU
+set + LLC + source/binary hash`。
 split/no-split 不再共用 derate，也不跨 F 或拓扑做隐式 nearest-profile
 fallback。
+
+`tp_vs_ep_model.py --sve-implementation auto` 先查找完整的
+`jit/xbyak_exact_m` split/no-split pair；只有该 pair 不完整时才整体回退到
+`asm/static_bucketed` pair。它不会把一个 JIT profile 和一个 asm profile
+拼成候选策略。需要可复现实验时可显式指定 `jit` 或 `asm`，此时缺表直接报错。
 
 `weight_window_bytes` 是 2026-07-16 加入的显式 SVE kernel experiment，可将
 W13 和 W2 都细分为更小的 packed-B N-range。当前 planner 不输出这个 option，

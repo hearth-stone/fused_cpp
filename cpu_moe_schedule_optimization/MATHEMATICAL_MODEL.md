@@ -2,7 +2,7 @@
 
 > 状态：调度问题定义的 source of truth。
 >
-> 最后更新：2026-07-16。
+> 最后更新：2026-07-20。
 >
 > 修改 planner 的决策变量、目标函数、硬约束、性能响应、线程宽度集合、调度语义、
 > rank 耦合方式或剪枝策略时，必须同步更新本文档及末尾变更记录。
@@ -567,6 +567,14 @@ $$
 则 $v_2$ 被 $v_1$ 支配，可以在进入 planner 前删除。当前 split/no-split 比较
 尚未证明这种全配置支配关系，因此仍保留为独立校准域。
 
+SVE 静态 asm 与 Xbyak exact-M 也属于不同的 $v$。两者虽然共享 packed weight、
+N-split 和 M12 主体，但尾部映射不同，因此 profile identity 必须同时包含
+`sve_implementation` 和 `m_tail_policy`。当前 production 默认是
+`jit/xbyak_exact_m`；`asm/static_bucketed` 只作为 fallback、A/B 对照和历史 profile
+解释，不允许用后者的 $\Theta_v$ 直接预测前者。planner 的 `auto` 选择以
+split/no-split pair 为原子：先要求完整的 JIT pair，缺任意一半时才整体回退到
+完整 static pair，不能跨 variant 拼接 $\Theta_v$。
+
 ## 6. 求解器编码
 
 ### 6.1 数学定义
@@ -618,7 +626,7 @@ One-hot 是线程宽度的等价求解器编码，不是剪枝。一般 active-s
 | Ordering | 任意可行开始时间和顺序 | 每个 lane 的 LPT 顺序 | 顺序剪枝 |
 | Idling | 允许主动等待以避开争用 | lane 可启动下一个 expert 时立即启动；ready-token 路径仅填充无可运行 expert 的空闲 lane | non-idling 剪枝 |
 | Route combine | 任意满足 TopK release 约束和 CPU 容量的 merge 排程 | planner 不搜索 combine；默认 executor 采用 expert-first 单 token 贪心和连续收尾 | 外层启发式限制 |
-| Kernel variant | 任意未被支配的实现 | 当前 split/no-split profile pair；packed-B byte-window 仅显式实验，不进入 planner | 实例候选限制 |
+| Kernel variant | 任意未被支配的实现 | `auto` 原子选择完整 `jit/xbyak_exact_m` split/no-split pair，缺表时整体回退完整 static pair；packed-B byte-window 仅显式实验 | 实例候选限制 |
 | Isolated time | 真实 $I_i(t)$ | active $T_{\mathrm{iso}}$ 经验公式；分层 GEMM model 仅 shadow | cost 近似，不剪枝可行域 |
 | Contention | 任意动态活跃配置上的真实 $D_i(\mathcal Z)$ | 实测 contention profile 与 stage-aware event simulator | cost 近似，不剪枝可行域 |
 
@@ -677,12 +685,13 @@ $$
 
 $C(M)$ 是单线程 route-work 的一维实测校准曲线；$O(t)$ 和
 $\phi_{\mathrm{USL}}(t)$ 分别表示固定开销与相对理想 $1/t$ 的线程效率基线，
-$k_\phi(t)$ 是与 route 无关的一维实测校正。M1/M2/M4/M8 与前两个
-M12 panel 的启动/线程效率不同于 steady-state M12 bulk，因此保留小 M 的
-`(tail, threads)` 实测 residual；更大的 M 使用公式，并按 kernel 组合规则
-追加 tail。公式仅在 profile 的已校准线程域内有效，不承担跨机器或更高线程数
-外推。没有序列化公式的历史 profile 继续使用旧二维 table，避免离线重拟合改变
-既有 planner 基准；可显式指定 `iso_mode="formula"` 做 shadow 对比。
+$k_\phi(t)$ 是与 route 无关的一维实测校正。Xbyak 路径的 exact M1--M12 与前两个
+完整 M12 panel 的启动/线程效率不同于 steady-state M12 bulk，因此保留每个
+`(tail, threads)` 的实测 residual；更大的 M 使用公式，并按 kernel 组合规则
+追加 exact remainder。历史 static-asm profile 继续按 M1/M2/M4/M8 bucket 解释，
+两种 residual 不可混用。公式仅在 profile 的已校准线程域内有效，不承担跨机器
+或更高线程数外推。没有序列化公式的历史 profile 继续使用旧二维 table，避免
+离线重拟合改变既有 planner 基准；可显式指定 `iso_mode="formula"` 做 shadow 对比。
 
 Amazon 192-core NUMA0 的 TP4/TP2/EP4/EP2 split/no-split profile 继续使用同一
 公式，`thread_domain` 扩展到 `[1,96]`，并以 48/64/96T 实测点校正
@@ -776,16 +785,22 @@ $$
 调用/range 次数和 busiest-thread balanced work。M12 换成其他 tile、SVE 换成
 NEON 或改变 tail 规则时，只替换 $\Phi_\kappa$，不修改算法公式或 planner。
 
-当前 `SveBf16KernelProfile` 令 $\mathcal P(M)$ 为物理 panel 序列，每个 panel
+当前 `SveBf16KernelProfile` 对应 implementation
+`sve_bf16_xbyak_exact_m1_m12_v2`。令 $\mathcal P(M)$ 为物理 panel 序列，每个 panel
 $p$ 分别记录逻辑行 $m_l(p)$、实际计算行 $m_c(p)$、packed-A 行 $m_p(p)$ 和
-store 行 $m_s(p)$。例如 M1 复用 M2 主体：
+store 行 $m_s(p)$。写 $M=12b+r,0\le r<12$，前 $b$ 个 panel 均为
+$(12,12,12,12)$；若 $r>0$，exact tail 为：
 
 $$
-(m_l,m_c,m_p,m_s)=(1,2,8,1).
+(m_l,m_c,m_p,m_s)
+=\left(r,2\left\lceil\frac r2\right\rceil,
+\begin{cases}8,&r\le8\\12,&r>8\end{cases},r\right).
 $$
 
-逻辑尾部 9--11 pad 到 M12。设 SVE vector 为 $V$ bytes，BF16 N tile
-$\nu=V/2$，tile 数 $q=N/\nu$，则当前 asm mapper 产生：
+例如 M1 为 $(1,2,8,1)$，M5 为 $(5,6,8,5)$，M9 为 $(9,10,12,9)$。
+static-asm control profile 则仍将 3--4、5--8、9--11 分别映射到
+M4、M8、M12 compute/store bucket。设 SVE vector 为 $V$ bytes，BF16 N tile
+$\nu=V/2$，tile 数 $q=N/\nu$，则当前 JIT mapper 产生：
 
 $$
 I_{\mathrm{BFMMLA}}(p)=\frac{m_c(p)Kq}{2},
@@ -816,6 +831,8 @@ $$
 split/no-split 是传给 mapper 的通用 $\sigma_s$，不是算法语义或核心公式中的特殊
 分支。当前 SVE mapper 中，split 不改变 BFMMLA、L1 A/B、aggregate B 或 C，
 但改变 range 次数、瞬时 weight 工作集，并在保守口径下增加 shared-A scan。
+Exact-M 相对 static bucket 不改变每个 panel 的 aggregate B load；它只减少被
+padding 的 row pair 对应的 BFMMLA、A broadcast 和无效 epilogue/store 工作。
 
 #### 8.2.3 实测机器响应
 
@@ -1146,6 +1163,32 @@ effective packed-B rate，不是 PMU memory-controller byte count。代表点为
 该曲线可作为未来 DRAM pressure shadow 的 NUMA-local service response，但当前
 planner 仍使用 empirical contention profile；公式、可行域和 production 剪枝未改变。
 
+### 9.7 Xbyak exact-M kernel 验证
+
+2026-07-20 在 Neoverse-V3 NUMA0 CPU `0-95` 和 8-core Neoverse-V1 CPU
+`0-7` 上，以 H4096/F512、8 份连续 expert、split-W13 对比
+`jit/xbyak_exact_m` 与 `asm/static_bucketed`。每次实现切换后先执行一次不计时
+调用，再连续测 5 次，避免把 instruction-cache 切换计入某一 variant；每点取
+11 次样本中位数。M1--M12、SiLU poly4/5/6、normal/scheduled/async 和 W2
+direct-route 均与 static asm bit exact。
+
+V3 单线程 M5/M6 分别提升 11.75%/11.75%，M9/M10 提升
+10.07%/10.44%；M12 回退 0.46%。M192/M2040 在 1--96T 的全部 control 点落在
+`[-0.86%, +0.79%]`。V1 的 M5/M6/M9/M10 在 1--8T 提升约 5%--12%，M12 与
+长 route control 最差回退 0.82%。因此 exact-M JIT 进入 production 默认，static
+asm 保留 fallback；但该结论只证明 kernel variant 本身，不允许继续复用旧
+bucketed-M 的 isolated/contention 表。新 profile 必须覆盖 route 1--12，并记录
+`sve_implementation=jit`、`m_tail_policy=xbyak_exact_m` 及 Xbyak commit。
+
+同日生成两组完整 split/no-split schema-v2 pair。8-core V1 standalone
+F512/E8 每个 policy 含 80 个 isolated 点和 68 个 contention 点；192-core V3
+双 NUMA TP4 F512/E256 每个 policy 含 180 个 isolated 点和 238 个 contention
+点，双 rank 样本按 pairwise maximum 合并。8-core 的 M192/M2040 上 split
+吞吐分别提升 5.34%/4.25%，但双 NUMA E256 的同两点分别回退 3.03%/2.72%；
+这直接否定跨机器或跨 workload 固定选择 split 的支配假设。两组 profile 的
+route grid 均直接覆盖 1--12，split pair 的 source/binary hash、Xbyak commit、
+线程和 shape 网格一致，并由 catalog 回归测试验证。
+
 ## 10. 同步规则
 
 发生以下任一变化时，必须同步更新本文档：
@@ -1194,3 +1237,4 @@ planner 仍使用 empirical contention profile；公式、可行域和 productio
 | 2026-07-16 | v0.20 | 在 192 核双 NUMA 上以两个 96-core 同步 rank 生成 TP4/F512 split-W13 稳态 profile；记录 route-dependent 最优 lane shape、35.89 TFLOP/s 长 route 聚合吞吐和跨 NUMA pairwise-max 必要性。 |
 | 2026-07-17 | v0.21 | 将双 NUMA TP4/F512 split-W13 校准扩展到真实 256 local experts，补齐 `96x1T` 等形状；记录 M=12 的 `24x4T`/`48x2T`/`96x1T` 宽平台，并禁止将 E64 full-call 排序外推到 256-expert TP4。 |
 | 2026-07-17 | v0.22 | 增加 NUMA0 M12 单满波冷 packed-B 带宽校准：256 份权重窗口轮换、1--96 个 1T experts、峰值 352.1 GB/s；记录 50%/75%/90%/95% 稳健带宽所需的 12/24/64/86 线程阈值，不改变 active planner 或剪枝。 |
+| 2026-07-20 | v0.23 | production SVE compute 改为 Xbyak exact-M1--M12：定义 $m_c=2\lceil M/2\rceil$ tail mapper，profile identity 增加 implementation/tail policy，route grid 补齐 1--12；记录 V1/V3 bit-exact 与稳态性能验证；planner `auto` 只原子选择完整 variant pair，禁止 JIT 和 static bucket profile 混用。 |

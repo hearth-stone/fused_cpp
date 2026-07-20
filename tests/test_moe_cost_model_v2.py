@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 import sys
 from pathlib import Path
@@ -27,10 +28,15 @@ from workload_catalog import load_routing_workload  # noqa: E402
 
 
 PROFILE_DIR = COST_MODEL / "profiles"
+XBYAK_AARCH64_COMMIT = "3f8c682b9c6ff562dc008c7d1b8307a683f05d20"
 
 
 def profile_paths() -> list[Path]:
     return sorted(PROFILE_DIR.glob("*_v2_r1_20260713.json"))
+
+
+def xbyak_profile_paths() -> list[Path]:
+    return sorted(PROFILE_DIR.glob("*xbyak_exactm*.json"))
 
 
 @pytest.fixture(scope="module")
@@ -150,6 +156,157 @@ def test_m12_tail_composition(catalog: ProfileCatalog) -> None:
     overhead = model._O[4]
     expected = overhead + (model.T_iso(12, 4) - overhead) + (model.T_iso(1, 4) - overhead)
     assert model.T_iso(13, 4) == pytest.approx(expected)
+
+
+def test_exact_m_profile_does_not_round_tail_routes(
+    catalog: ProfileCatalog,
+    tmp_path: Path,
+) -> None:
+    record = catalog.select(
+        ProfileQuery(
+            mode="tp",
+            degree=2,
+            hidden_size=4096,
+            intermediate_size=1024,
+            local_experts=64,
+            w13_split=True,
+        )
+    )
+    payload = json.loads(record.path.read_text(encoding="utf-8"))
+    payload["kernel"]["sve_implementation"] = "jit"
+    payload["kernel"]["m_tail_policy"] = "xbyak_exact_m"
+    path = tmp_path / "exact_m_profile.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    mixed_catalog = ProfileCatalog.from_paths([record.path, path])
+    with pytest.raises(ProfileCompatibilityError, match="ambiguous"):
+        mixed_catalog.select(
+            ProfileQuery(
+                mode="tp",
+                degree=2,
+                hidden_size=4096,
+                intermediate_size=1024,
+                local_experts=64,
+                w13_split=True,
+            )
+        )
+    selected = mixed_catalog.select(
+        ProfileQuery(
+            mode="tp",
+            degree=2,
+            hidden_size=4096,
+            intermediate_size=1024,
+            local_experts=64,
+            sve_implementation="jit",
+            m_tail_policy="xbyak_exact_m",
+            w13_split=True,
+        )
+    )
+    assert selected.path == path
+
+    model = ContentionCostModel(path, iso_mode="table")
+    assert model.m12_effective_rows(3) == 3
+    assert model.m12_effective_rows(7) == 7
+    assert model.m12_effective_rows(11) == 11
+    assert model.m12_effective_rows(23) == 23
+    assert model.T_iso(3, 4) != model.T_iso(4, 4)
+
+
+def test_checked_in_xbyak_profiles_are_complete_exact_m_pairs() -> None:
+    paths = xbyak_profile_paths()
+    assert len(paths) >= 4
+    exact_catalog = ProfileCatalog.from_paths(paths)
+
+    pairs: dict[tuple[object, ...], dict[bool, Path]] = {}
+    for record in exact_catalog.records:
+        payload = record.payload
+        policy = record.policy
+        assert policy.sve_implementation == "jit"
+        assert policy.m_tail_policy == "xbyak_exact_m"
+        assert payload["kernel"]["xbyak_aarch64_commit"] == XBYAK_AARCH64_COMMIT
+        assert set(range(1, 13)).issubset(map(int, payload["isolated_routes"]))
+        assert set(range(1, 13)).issubset(map(int, payload["contention_routes"]))
+        assert payload["kernel"]["source_sha256"]
+        assert payload["kernel"]["extension_sha256"]
+        split_variants = pairs.setdefault(policy.key_without_split(), {})
+        assert policy.w13_split not in split_variants
+        split_variants[policy.w13_split] = record.path
+
+        model = ContentionCostModel(
+            record.path,
+            expected_policy=ProfileQuery(
+                sve_implementation="jit",
+                m_tail_policy="xbyak_exact_m",
+                w13_split=policy.w13_split,
+            ),
+        )
+        assert [model.m12_effective_rows(routes) for routes in range(1, 13)] == list(range(1, 13))
+
+    assert len(pairs) >= 2
+    assert all(set(split_variants) == {False, True} for split_variants in pairs.values())
+    for split_variants in pairs.values():
+        pair_catalog = ProfileCatalog.from_paths(split_variants.values())
+        pair_catalog.split_pair(
+            ProfileQuery(
+                sve_implementation="jit",
+                m_tail_policy="xbyak_exact_m",
+            )
+        )
+
+
+def test_parallel_evaluator_auto_requires_a_complete_variant_pair(
+    catalog: ProfileCatalog,
+    tmp_path: Path,
+) -> None:
+    query = ProfileQuery(
+        mode="tp",
+        degree=2,
+        hidden_size=4096,
+        intermediate_size=1024,
+        global_experts=64,
+        local_experts=64,
+        backend="sve",
+        backend_n_tile=8,
+        activation="silu",
+        dtype="bf16",
+        measurement_experts=64,
+        cores_per_rank=32,
+        concurrent_ranks=2,
+    )
+    asm_no_split, asm_split = catalog.split_pair(query)
+
+    jit_paths: list[Path] = []
+    for record in (asm_no_split, asm_split):
+        payload = json.loads(record.path.read_text(encoding="utf-8"))
+        payload["kernel"]["sve_implementation"] = "jit"
+        payload["kernel"]["m_tail_policy"] = "xbyak_exact_m"
+        path = tmp_path / f"jit_{int(record.policy.w13_split)}.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        jit_paths.append(path)
+
+    topology = HierarchicalTopology(2, 1, 60e9, 20e9, 1e-6)
+
+    incomplete = ProfileCatalog.from_paths([asm_no_split.path, asm_split.path, jit_paths[1]])
+    fallback = ParallelLayerEvaluator(
+        incomplete,
+        topology,
+        hidden_size=4096,
+        full_intermediate_size=2048,
+        global_experts=64,
+        cores_per_rank=32,
+    )._models("tp", 1024, 64)
+    assert {model.policy.sve_implementation for model in fallback} == {"asm"}
+
+    complete = ProfileCatalog.from_paths([asm_no_split.path, asm_split.path, *jit_paths])
+    selected = ParallelLayerEvaluator(
+        complete,
+        topology,
+        hidden_size=4096,
+        full_intermediate_size=2048,
+        global_experts=64,
+        cores_per_rank=32,
+    )._models("tp", 1024, 64)
+    assert {model.policy.sve_implementation for model in selected} == {"jit"}
 
 
 def test_exact_shape_and_stage_working_sets(catalog: ProfileCatalog) -> None:

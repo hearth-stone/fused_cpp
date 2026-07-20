@@ -283,6 +283,7 @@ def test_sve_m12_silu_and_w2_bf16_route_match_legacy_for_unit_top1(
         ),
     }
     for bridge, call in calls.items():
+        monkeypatch.setenv("FUSED_CPP_MOE_SVE_IMPL", "auto")
         monkeypatch.setenv("FUSED_CPP_MOE_SILU_MINIMAX3", "0")
         monkeypatch.setenv("FUSED_CPP_MOE_W2_BF16_ROUTE", "0")
         reference = call()
@@ -296,6 +297,7 @@ def test_sve_m12_silu_and_w2_bf16_route_match_legacy_for_unit_top1(
             msg=lambda message: f"{bridge}: {message}",
         )
 
+        monkeypatch.setenv("FUSED_CPP_MOE_SVE_IMPL", "asm")
         for degree in (4, 5, 6):
             monkeypatch.setenv("FUSED_CPP_MOE_SILU_MINIMAX3", "0")
             monkeypatch.setenv("FUSED_CPP_MOE_SILU_RECIP_NR", "0")
@@ -337,6 +339,169 @@ def test_sve_m12_silu_and_w2_bf16_route_match_legacy_for_unit_top1(
                 )
 
 
+@pytest.mark.parametrize("degree", [4, 5, 6], ids=["poly4", "poly5", "poly6"])
+def test_sve_xbyak_exact_m_matches_static_asm(
+    monkeypatch: pytest.MonkeyPatch,
+    degree: int,
+) -> None:
+    """Execute every exact M=1..12 W13/W2 JIT kernel through all bridges."""
+    if "arm_sve_bf16" not in available_fused_moe_bf16_tiled_backends():
+        pytest.skip("requires an SVE BF16 build/runtime")
+    monkeypatch.setenv("FUSED_CPP_MOE_SVE", "1")
+    monkeypatch.setenv("FUSED_CPP_MOE_SVE_W2_DIRECT_ROUTE", "1")
+    monkeypatch.setenv("FUSED_CPP_MOE_W2_BF16_ROUTE", "0")
+    monkeypatch.setenv("FUSED_CPP_MOE_SILU_M12_OPT", "0")
+    monkeypatch.setenv("FUSED_CPP_MOE_SILU_RECIP_NR", "0")
+    monkeypatch.setenv("FUSED_CPP_MOE_SILU_MINIMAX3", "0")
+    monkeypatch.delenv("FUSED_CPP_MOE_SVE_KC", raising=False)
+    monkeypatch.delenv("FUSED_CPP_MOE_SVE_KC_L1_PERMILLE", raising=False)
+
+    generator = torch.Generator().manual_seed(20260720 + degree)
+    route_counts = list(range(1, 13))
+    num_experts = len(route_counts)
+    num_tokens = sum(route_counts)
+    hidden_size = 64
+    ffn_hidden_size = 32
+    hidden = _bf16_normal((num_tokens, hidden_size), generator=generator, std=0.01)
+    w13 = _bf16_normal(
+        (num_experts, 2 * ffn_hidden_size, hidden_size),
+        generator=generator,
+        std=0.01,
+    )
+    w2 = _bf16_normal(
+        (num_experts, hidden_size, ffn_hidden_size),
+        generator=generator,
+        std=0.01,
+    )
+    topk_ids = torch.cat(
+        [torch.full((count,), expert, dtype=torch.int32) for expert, count in enumerate(route_counts)]
+    ).reshape(num_tokens, 1)
+    topk_weights = torch.ones((num_tokens, 1), dtype=torch.float32)
+    packed = prepare_fused_moe_bf16_tiled_weights(w13, w2, fuse_silu=True, backend="sve")
+    if packed.gemm_backend != 1:
+        pytest.skip("requires an SVE BF16 build/runtime")
+
+    cpu = _first_affinity_cpu()
+    expert_ids = torch.arange(num_experts, dtype=torch.int32)
+    one_thread = torch.ones(num_experts, dtype=torch.int32)
+    wave_offsets = torch.arange(num_experts + 1, dtype=torch.int32)
+    dep_offsets = torch.arange(num_experts + 1, dtype=torch.int32)
+    dep_offsets[1:] -= 1
+    deps = torch.arange(num_experts - 1, dtype=torch.int32)
+    thread_cpu_ids = torch.tensor([cpu], dtype=torch.int32)
+
+    calls = {
+        "normal": lambda: fused_moe_bf16_tiled(
+            hidden,
+            packed,
+            topk_weights,
+            topk_ids,
+            num_threads=1,
+            silu_poly_degree=degree,
+        ),
+        "scheduled": lambda: fused_moe_bf16_tiled_scheduled(
+            hidden,
+            packed,
+            topk_weights,
+            topk_ids,
+            wave_offsets,
+            expert_ids,
+            one_thread,
+            thread_cpu_ids=thread_cpu_ids,
+            num_threads=1,
+            silu_poly_degree=degree,
+        ),
+        "async": lambda: fused_moe_bf16_tiled_async(
+            hidden,
+            packed,
+            topk_weights,
+            topk_ids,
+            expert_ids,
+            torch.zeros(num_experts, dtype=torch.int32),
+            one_thread,
+            dep_offsets,
+            deps,
+            thread_cpu_ids=thread_cpu_ids,
+            num_threads=1,
+            silu_poly_degree=degree,
+        ),
+    }
+    for bridge, call in calls.items():
+        monkeypatch.setenv("FUSED_CPP_MOE_SVE_IMPL", "asm")
+        reference = call()
+        monkeypatch.setenv("FUSED_CPP_MOE_SVE_IMPL", "jit")
+        candidate = call()
+        torch.testing.assert_close(
+            candidate.float(),
+            reference.float(),
+            atol=0,
+            rtol=0,
+            msg=lambda message, bridge=bridge: f"{bridge}/poly{degree}: {message}",
+        )
+
+
+def test_sve_xbyak_strict_mode_rejects_kc_fallback() -> None:
+    """Auto may use static Kc, while strict JIT must expose the unsupported mode."""
+    if "arm_sve_bf16" not in available_fused_moe_bf16_tiled_backends():
+        pytest.skip("requires an SVE BF16 build/runtime")
+    script = r"""
+import os
+
+import torch
+
+from fused_cpp.moe import fused_moe_bf16_tiled
+from fused_cpp.moe import prepare_fused_moe_bf16_tiled_weights
+
+generator = torch.Generator().manual_seed(20260720)
+rows, hidden_size, ffn_hidden_size = 5, 64, 32
+hidden = torch.empty((rows, hidden_size), dtype=torch.bfloat16).normal_(std=0.01, generator=generator)
+w13 = torch.empty((1, 2 * ffn_hidden_size, hidden_size), dtype=torch.bfloat16).normal_(
+    std=0.01, generator=generator
+)
+w2 = torch.empty((1, hidden_size, ffn_hidden_size), dtype=torch.bfloat16).normal_(
+    std=0.01, generator=generator
+)
+topk_ids = torch.zeros((rows, 1), dtype=torch.int32)
+topk_weights = torch.ones((rows, 1), dtype=torch.float32)
+packed = prepare_fused_moe_bf16_tiled_weights(w13, w2, fuse_silu=True, backend="sve")
+
+auto = fused_moe_bf16_tiled(hidden, packed, topk_weights, topk_ids, num_threads=1)
+os.environ["FUSED_CPP_MOE_SVE_IMPL"] = "asm"
+static = fused_moe_bf16_tiled(hidden, packed, topk_weights, topk_ids, num_threads=1)
+torch.testing.assert_close(auto.float(), static.float(), atol=0, rtol=0)
+
+os.environ["FUSED_CPP_MOE_SVE_IMPL"] = "jit"
+try:
+    fused_moe_bf16_tiled(hidden, packed, topk_weights, topk_ids, num_threads=1)
+except RuntimeError as error:
+    assert "split-K/Kc packing remains on the static asm fallback" in str(error)
+    print("STRICT_KC_OK")
+else:
+    raise AssertionError("strict JIT unexpectedly accepted split-K packing")
+"""
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "FUSED_CPP_MOE_SVE": "1",
+            "FUSED_CPP_MOE_SVE_KC": "32",
+            "FUSED_CPP_MOE_SVE_IMPL": "auto",
+            "OMP_NUM_THREADS": "1",
+        }
+    )
+    environment.pop("FUSED_CPP_MOE_SVE_KC_L1_PERMILLE", None)
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path(__file__).resolve().parents[1],
+        env=environment,
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stdout
+    assert "STRICT_KC_OK" in completed.stdout
+
+
 @pytest.mark.parametrize("use_bf16_route", [False, True], ids=["fp32-route", "bf16-route"])
 @pytest.mark.parametrize("rows", [1, 2, 4, 8, 12, 13], ids=["m1", "m2", "m4", "m8", "m12", "m12-m1"])
 def test_sve_kc_path_matches_reference_and_threaded_output(
@@ -345,6 +510,8 @@ def test_sve_kc_path_matches_reference_and_threaded_output(
     rows: int,
 ) -> None:
     """Exercise every generic production Kc kernel and direct-route mode."""
+    if "arm_sve_bf16" not in available_fused_moe_bf16_tiled_backends():
+        pytest.skip("requires an SVE BF16 build/runtime")
     affinity = sorted(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else list(range(4))
     if len(affinity) < 4:
         pytest.skip("requires four available CPUs")

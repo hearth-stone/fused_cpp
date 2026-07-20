@@ -31,11 +31,14 @@ must be added to kernel identity rather than inferred from `w13_split_chunks`.
     "backend": "sve",
     "backend_n_tile": 8,
     "parallel_axis": "N",
+    "sve_implementation": "jit",
+    "m_tail_policy": "xbyak_exact_m",
     "w13_split": true,
     "w13_split_chunks": 2,
     "git_available": true,
     "git_commit": "...",
     "git_worktree_dirty": true,
+    "xbyak_aarch64_commit": "...",
     "source_sha256": "...",
     "extension_sha256": "..."
   },
@@ -88,8 +91,8 @@ Required v2 identity fields are:
 
 - hardware: profiled CPU sets, NUMA nodes, LLC bytes, cores per rank, and
   concurrent rank count;
-- kernel: backend, N-split policy, W13 split policy, source hash, and extension
-  binary hash;
+- kernel: backend, SVE implementation, M-tail policy, N-split policy, W13 split
+  policy, source hash, and extension binary hash;
 - distributed shape: TP/EP mode and degree, global/local expert counts, H, and
   sharded F;
 - calibration scope: the full local expert count, activation, dtype, SVE N tile,
@@ -113,6 +116,22 @@ legacy allocate-per-call path and are not comparable at large total route counts
 The active generator is `profile_contention_async_dual_rank.py`. The underlying
 single-rank worker is `profile_contention_async.py`; its schema-v2 output records
 one rank and can also be used for single-rank targets.
+
+New SVE profiles use `sve_implementation=jit` and
+`m_tail_policy=xbyak_exact_m`. The isolated and contention route grids include
+every M from 1 through 12 so the exact generated tail is measured rather than
+interpolated through the former M1/M2/M4/M8 buckets. Profiles without these
+fields are interpreted as `asm/static_bucketed` for history compatibility.
+Catalog queries for the production JIT path must specify both fields; a mixed
+catalog intentionally rejects an implementation-unspecified ambiguous query.
+Static and JIT profiles are not a valid split/no-split pair even when all other
+shape fields match.
+
+The TP/EP evaluator's `--sve-implementation auto` lookup is pair-atomic: it
+first requests a complete `jit/xbyak_exact_m` split/no-split pair, then falls
+back to a complete `asm/static_bucketed` pair. It never fills a missing half
+from another implementation. Explicit `jit` or `asm` selection is strict and
+fails when that implementation's complete pair is unavailable.
 
 `git_commit` and `git_worktree_dirty` may be `null` on a deployment host without
 repository metadata. `source_sha256` and `extension_sha256` remain mandatory
@@ -142,10 +161,11 @@ phi_usl(t) = (1 + alpha(t-1) + beta*t(t-1)) / t
 `k_phi(t)=phi_measured(t)/phi_usl(t)`, which is interpolated only over threads
 and never over routes. The generalized-USL formula is valid only in
 `thread_domain`; it is not used to extrapolate to a larger machine.
-M1/M2/M4/M8 and the first two M12 panels retain
-their measured `(tail, threads)` correction because they do not share the
-steady-state M12 thread scaling; larger M uses the formula and composes any
-remainder from the measured tail cost. Profiles without a serialized
+Exact M1..M12 tails and the first two complete M12 panels retain their measured
+`(tail, threads)` correction because they do not share the steady-state M12
+thread scaling; larger M uses the formula and composes its exact remainder from
+the measured tail cost. Historical `asm/static_bucketed` profiles retain their
+M1/M2/M4/M8 bucket mapping. Profiles without a serialized
 `iso_formula` remain table-backed for compatibility, but can fit it at load time
 with `iso_mode="formula"`. Set `iso_mode="table"` or
 `FUSED_CPP_COST_MODEL_ISO_MODE=table` to run the previous two-dimensional table
@@ -228,7 +248,7 @@ PYTHONPATH=src .venv/bin/python \
   --hidden-size 4096 --ffn-hidden-size 1024 \
   --global-experts 64 --local-experts 64 --measurement-experts 0 \
   --isolated-measurement-experts 8 \
-  --w13-split 1 --warmup 5 --runs 20
+  --w13-split 1 --sve-implementation jit --warmup 5 --runs 20
 
 PYTHONPATH=src .venv/bin/python \
   cpu_moe_schedule_optimization/cost_model/profile_contention_async_dual_rank.py \
@@ -236,7 +256,7 @@ PYTHONPATH=src .venv/bin/python \
   --hidden-size 4096 --ffn-hidden-size 2048 \
   --global-experts 64 --local-experts 32 --measurement-experts 0 \
   --isolated-measurement-experts 8 \
-  --w13-split 1 --warmup 5 --runs 20
+  --w13-split 1 --sve-implementation jit --warmup 5 --runs 20
 ```
 
 Run each command again with `--w13-split 0` for the non-split policy. Defaults

@@ -26,8 +26,8 @@ except ImportError:  # pragma: no cover - package-style import
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKER = Path(__file__).with_name("profile_contention_async.py")
-DEFAULT_ISOLATED_ROUTES = "1,2,4,8,12,24,48,96,192,384,768,1536,2040"
-DEFAULT_CONTENTION_ROUTES = "1,2,4,8,12,24,48,192,768,2040"
+DEFAULT_ISOLATED_ROUTES = "1,2,3,4,5,6,7,8,9,10,11,12,24,48,96,192,384,768,1536,2040"
+DEFAULT_CONTENTION_ROUTES = "1,2,3,4,5,6,7,8,9,10,11,12,24,48,192,768,2040"
 DEFAULT_THREADS = "1,2,4,8,16,32"
 DEFAULT_SHAPES = "32;16x2;16,8,8;16,8,4,4;16,4,4,4,4;8x4;8,8,8,4,4;8,8,4,4,4,4;8,4,4,4,4,4,4;4x8;2x16;1x32"
 
@@ -267,6 +267,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--isolated-measurement-experts", type=int, default=8)
     parser.add_argument("--w13-split", type=int, choices=(0, 1), required=True)
     parser.add_argument("--w13-split-chunks", type=int, default=2)
+    parser.add_argument("--sve-implementation", choices=("jit", "asm"), default="jit")
     parser.add_argument("--cpu-groups", default="0-31;32-63")
     parser.add_argument("--numa-nodes", default="0,1")
     parser.add_argument("--llc-bytes", type=int, default=None)
@@ -341,6 +342,8 @@ def main() -> int:
                     str(args.w13_split),
                     "--w13-split-chunks",
                     str(args.w13_split_chunks),
+                    "--sve-implementation",
+                    args.sve_implementation,
                     "--cpu-ids",
                     cpu_groups[rank],
                     "--numa-node",

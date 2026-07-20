@@ -113,6 +113,8 @@ def select_models(profile_dir: Path, mode: str):
         local_experts=local_experts,
         backend="sve",
         backend_n_tile=8,
+        sve_implementation="asm",
+        m_tail_policy="static_bucketed",
         activation="silu",
         dtype="bf16",
         measurement_experts=local_experts,

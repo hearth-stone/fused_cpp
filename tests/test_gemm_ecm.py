@@ -119,11 +119,11 @@ def test_measured_profile_is_bound_to_implementation_and_thread_width() -> None:
 
 def test_kernel_panels_separate_logical_compute_pack_and_store_rows() -> None:
     tail_expectations = {
-        1: (1, 2, 8, 1, "M2-as-M1"),
-        2: (2, 2, 8, 2, "M2"),
-        3: (3, 4, 8, 4, "M4"),
-        5: (5, 8, 8, 8, "M8"),
-        9: (9, 12, 12, 12, "M12-padded"),
+        1: (1, 2, 8, 1, "M1-exact"),
+        2: (2, 2, 8, 2, "M2-exact"),
+        3: (3, 4, 8, 3, "M3-exact"),
+        5: (5, 6, 8, 5, "M5-exact"),
+        9: (9, 10, 12, 9, "M9-exact"),
     }
 
     for routes, expected in tail_expectations.items():
@@ -138,6 +138,11 @@ def test_kernel_panels_separate_logical_compute_pack_and_store_rows() -> None:
 
     panels = kernel_panels(25)
     assert [panel.compute_rows for panel in panels] == [12, 12, 2]
+
+    legacy = kernel_panels(9, exact_m=False)[0]
+    assert (legacy.compute_rows, legacy.store_rows, legacy.kernel) == (12, 12, "M12-padded")
+    legacy_profile = SveBf16KernelProfile(n_tile=8, exact_m=False)
+    assert legacy_profile.implementation_id.endswith("m12_m8_m4_m2_v1")
 
 
 def test_m12_instruction_counts_match_assembly_k4_body() -> None:

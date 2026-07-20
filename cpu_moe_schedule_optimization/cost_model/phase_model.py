@@ -47,6 +47,9 @@ class ContentionCostModel:
         prof = json.loads(self.profile_path.read_text(encoding="utf-8"))
         self.profile = prof
         self.schema_version = int(prof.get("schema_version", 1))
+        self.m_tail_policy = str(prof.get("kernel", {}).get("m_tail_policy", "static_bucketed"))
+        if self.m_tail_policy not in {"static_bucketed", "xbyak_exact_m"}:
+            raise ValueError(f"unsupported kernel.m_tail_policy={self.m_tail_policy!r}")
         formula_payload = prof.get("iso_formula")
         self.policy = ProfilePolicy.from_payload(prof) if self.schema_version >= 2 else None
         if expected_policy is not None:
@@ -205,10 +208,11 @@ class ContentionCostModel:
     def supports_shape(self, shape) -> bool:
         return self._shape_signature(shape) in self._derate_shape
 
-    @staticmethod
-    def m12_tail_capacity(remainder: int) -> int:
+    def m12_tail_capacity(self, remainder: int) -> int:
         if remainder <= 0:
             return 0
+        if self.m_tail_policy == "xbyak_exact_m":
+            return remainder
         if remainder <= 2:
             return remainder
         if remainder <= 4:
@@ -217,10 +221,9 @@ class ContentionCostModel:
             return 8
         return 12
 
-    @classmethod
-    def m12_effective_rows(cls, routes: int) -> int:
+    def m12_effective_rows(self, routes: int) -> int:
         blocks, remainder = divmod(max(int(routes), 0), 12)
-        return blocks * 12 + cls.m12_tail_capacity(remainder)
+        return blocks * 12 + self.m12_tail_capacity(remainder)
 
     @staticmethod
     def _interp_linear(curve: dict[int, float], x: int) -> float:
@@ -304,10 +307,10 @@ class ContentionCostModel:
         overhead = self.iso_formula.O(threads)
         if blocks == 0:
             return self._raw_iso_interp(tail, threads)
-        # M1/M2/M4/M8 and the first two M12 panels have materially different
-        # startup/thread efficiency from steady-state M12 bulk.  Keep this
-        # bounded measured tail residual and use the formula for the scalable
-        # bulk region.
+        # Exact-M JIT tails (or the legacy M1/M2/M4/M8 buckets) and the first
+        # two M12 panels have materially different startup/thread efficiency
+        # from steady-state M12 bulk. Keep this bounded measured residual and
+        # use the formula for the scalable bulk region.
         if blocks <= 2:
             bulk = self._raw_iso_interp(blocks * 12, threads)
         else:

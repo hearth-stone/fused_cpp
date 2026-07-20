@@ -12,7 +12,8 @@ else:
 
 M_PANEL = 12
 BF16_BYTES = 2
-SVE_BF16_IMPLEMENTATION_ID = "sve_bf16_packed_a_m12_m8_m4_m2_v1"
+SVE_BF16_IMPLEMENTATION_ID = "sve_bf16_xbyak_exact_m1_m12_v2"
+SVE_BF16_STATIC_ASM_IMPLEMENTATION_ID = "sve_bf16_packed_a_m12_m8_m4_m2_v1"
 
 
 @dataclass(frozen=True)
@@ -26,8 +27,8 @@ class KernelPanel:
     kernel: str
 
 
-def kernel_panels(routes: int) -> tuple[KernelPanel, ...]:
-    """Return the exact M12/M8/M4/M2 dispatch for ``routes`` rows."""
+def kernel_panels(routes: int, *, exact_m: bool = True) -> tuple[KernelPanel, ...]:
+    """Return the physical M-panel dispatch for ``routes`` rows."""
     if routes < 0:
         raise ValueError(f"routes must be non-negative, got {routes}")
 
@@ -35,7 +36,11 @@ def kernel_panels(routes: int) -> tuple[KernelPanel, ...]:
     panels = [KernelPanel(12, 12, 12, 12, "M12")] * full_panels
     if remainder == 0:
         return tuple(panels)
-    if remainder == 1:
+    if exact_m:
+        packed_rows = 8 if remainder <= 8 else 12
+        compute_rows = (remainder + 1) // 2 * 2
+        tail = KernelPanel(remainder, compute_rows, packed_rows, remainder, f"M{remainder}-exact")
+    elif remainder == 1:
         tail = KernelPanel(1, 2, 8, 1, "M2-as-M1")
     elif remainder == 2:
         tail = KernelPanel(2, 2, 8, 2, "M2")
@@ -152,16 +157,20 @@ class SveBf16KernelExecution:
 
 @dataclass(frozen=True)
 class SveBf16KernelProfile:
-    """Exact lowering rules for the current SVE BF16 packed-A assembly."""
+    """Lowering rules for the current SVE BF16 packed-A implementation."""
 
     n_tile: int
-    implementation_id: str = SVE_BF16_IMPLEMENTATION_ID
+    implementation_id: str = ""
+    exact_m: bool = True
 
     def __post_init__(self) -> None:
         if self.n_tile <= 0:
             raise ValueError("SVE BF16 n_tile must be positive")
         if not self.implementation_id:
-            raise ValueError("implementation_id must be non-empty")
+            implementation_id = (
+                SVE_BF16_IMPLEMENTATION_ID if self.exact_m else SVE_BF16_STATIC_ASM_IMPLEMENTATION_ID
+            )
+            object.__setattr__(self, "implementation_id", implementation_id)
 
     @property
     def vector_bytes(self) -> int:
@@ -186,7 +195,7 @@ class SveBf16KernelProfile:
         if (logical_work.output_columns * self.n_tile) % logical_work.n != 0:
             raise ValueError("each SVE N tile must map to an integer number of outputs")
 
-        panels = kernel_panels(logical_work.routes)
+        panels = kernel_panels(logical_work.routes, exact_m=self.exact_m)
         allocation = allocate_n_tiles(
             logical_work.n,
             self.n_tile,

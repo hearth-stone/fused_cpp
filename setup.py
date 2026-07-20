@@ -494,14 +494,37 @@ if is_aarch64:
         moe_define_macros.append(("FUSED_CPP_MOE_HAS_ARM_SVE", "1"))
         sve_args = ["-march=armv8.6-a+sve+bf16+i8mm", "-O2", "-std=c++17"]
         sve_sources = [
+            os.path.join("csrc", "moe", "arm", "sve_bf16", "jit_kernels.cpp"),
             os.path.join("csrc", "moe", "arm", "sve_bf16", "packing.cpp"),
             os.path.join("csrc", "moe", "arm", "sve_bf16", "route_merge.cpp"),
         ]
         moe_sources = [source for source in moe_sources if source not in sve_sources]
+        xbyak_aarch64_root = os.path.abspath(os.path.join("3rdparty", "xbyak_aarch64"))
+        xbyak_aarch64_sources = [
+            os.path.join(xbyak_aarch64_root, "src", "xbyak_aarch64_impl.cpp"),
+            os.path.join(xbyak_aarch64_root, "src", "util_impl.cpp"),
+        ]
+        xbyak_aarch64_available = all(os.path.isfile(source) for source in xbyak_aarch64_sources)
+        if xbyak_aarch64_available:
+            moe_include_dirs.extend(
+                [
+                    xbyak_aarch64_root,
+                    os.path.join(xbyak_aarch64_root, "src"),
+                    os.path.join(xbyak_aarch64_root, "xbyak_aarch64"),
+                ]
+            )
+            moe_define_macros.append(("FUSED_CPP_MOE_HAS_XBYAK_AARCH64", "1"))
+        else:
+            moe_define_macros.append(("FUSED_CPP_MOE_HAS_XBYAK_AARCH64", "0"))
         moe_native_sources.extend(
             [
                 (os.path.abspath(os.path.join("csrc", "moe", "arm", "sve_bf16", "kernels.S")), sve_args),
                 *[(source, sve_args) for source in sve_sources],
+                *(
+                    [(source, ["-O2", "-std=c++17"]) for source in xbyak_aarch64_sources]
+                    if xbyak_aarch64_available
+                    else []
+                ),
             ]
         )
     i8gemm_backend = "sve" if target_has_sve else "neon"

@@ -34,6 +34,35 @@ Linux AArch64 builds one fat `_moe_C` extension:
 The implementation intentionally requires BF16/BFMMLA for the NEON backend.
 There is no scalar or widening-only NEON fallback.
 
+The SVE backend uses the pinned `3rdparty/xbyak_aarch64` submodule to generate
+the production W13, W2 FP32, and W2 FP32 direct-route kernels. Initialize it
+before building from a fresh checkout:
+
+```bash
+git submodule update --init --recursive 3rdparty/xbyak_aarch64
+```
+
+Generated kernels preserve the static assembly ABI and packed-A layouts while
+specializing the final physical panel for every logical M from 1 through 12.
+M1-M8 use the existing eight-row packed-A panel, M9-M12 use the twelve-row
+panel, and only `2 * ceil(M / 2)` rows execute BFMMLA. Kernel generation is
+prewarmed during SVE weight preparation, outside the forward-call timing path.
+
+`FUSED_CPP_MOE_SVE_IMPL` controls compute dispatch:
+
+```text
+auto  default; use Xbyak when the requested configuration is supported
+jit   require Xbyak for the generated W13/FP32-W2 surfaces
+asm   force the static assembly compatibility path
+```
+
+The static assembly remains the fallback for builds without the initialized
+submodule, split-K/Kc, identity W13, reciprocal-refinement or minimax SiLU, and
+BF16 W2 route storage. Strict `jit` raises instead of falling back for a
+generated surface such as Kc W13/FP32 W2; an explicitly selected static-only
+surface such as BF16 route storage remains available. `FUSED_CPP_MOE_SVE=0`
+still disables the entire SVE backend and selects the NEON implementation.
+
 Backend IDs in packed metadata remain stable: `0` is `arm_neon_bf16` and `1`
 is `arm_sve_bf16`. Packed weights are backend-specific. SVE packed weights are
 also vector-length-specific, and execution validates the stored N tile against

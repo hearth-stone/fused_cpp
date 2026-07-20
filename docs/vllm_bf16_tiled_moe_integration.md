@@ -52,6 +52,14 @@ compiled SVE/SVEBF16 objects; runtime HWCAP selection does not change the ISA
 target used by the main `fused_cpp._C` extension. Both ARM backends use
 `refs/i8gemm/lib` packing contracts.
 
+The default SVE compute path additionally uses the pinned
+`3rdparty/xbyak_aarch64` submodule. From a fresh checkout, initialize it before
+building:
+
+```bash
+git submodule update --init --recursive 3rdparty/xbyak_aarch64
+```
+
 Build:
 
 ```bash
@@ -74,6 +82,18 @@ The exact runtime choices are queryable with
 `available_fused_moe_bf16_tiled_backends()`. The current names are
 `arm_neon_bf16` and `arm_sve_bf16`; NEON still requires BF16/BFMMLA. Setting
 `FUSED_CPP_MOE_SVE=0` removes SVE from automatic selection.
+
+Within the SVE backend, `FUSED_CPP_MOE_SVE_IMPL=auto` is the default. It uses
+Xbyak-generated W13, W2 FP32, and W2 FP32 direct-route kernels specialized for
+each logical M=1..12. Code generation is completed while weights are prepared,
+so the first forward call does not pay generation cost. Use
+`FUSED_CPP_MOE_SVE_IMPL=asm` to force the static assembly reference, or `jit`
+to require generation for the generated W13/FP32-W2 surfaces and raise if one
+of those requires fallback. `auto` falls back to static assembly for split-K/Kc,
+identity/reciprocal/minimax SiLU, or a build made without the initialized
+submodule. Explicitly selected static-only operators such as BF16 route storage
+remain on assembly in either mode. Packed weight objects and backend IDs are
+identical between the JIT and assembly paths.
 
 vLLM should keep a fallback path for non-AArch64 hosts, missing extension builds,
 unsupported dtype/device combinations, and unsupported activations.

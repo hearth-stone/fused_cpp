@@ -28,12 +28,12 @@ def test_m12_panel_mapping() -> None:
         2,
         4,
         4,
+        6,
+        6,
         8,
         8,
-        8,
-        8,
-        12,
-        12,
+        10,
+        10,
         12,
     ]
     assert panel_histogram(0) == {}

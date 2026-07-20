@@ -39,8 +39,8 @@ except ImportError:  # pragma: no cover - package-style import
     from .iso_formula import fit_from_measurements  # type: ignore[no-redef]
 
 
-DEFAULT_ISOLATED_ROUTES = "1,2,4,8,12,24,48,96,192,384,768,1536,2040"
-DEFAULT_CONTENTION_ROUTES = "1,2,4,8,12,24,48,192,768,2040"
+DEFAULT_ISOLATED_ROUTES = "1,2,3,4,5,6,7,8,9,10,11,12,24,48,96,192,384,768,1536,2040"
+DEFAULT_CONTENTION_ROUTES = "1,2,3,4,5,6,7,8,9,10,11,12,24,48,192,768,2040"
 DEFAULT_THREADS = "1,2,4,8,16,32"
 DEFAULT_NUM_PROFILE_EXPERTS = 64
 DEFAULT_MEASUREMENT_EXPERTS = 0
@@ -93,14 +93,18 @@ def kernel_metadata() -> dict:
         ROOT / "csrc" / "moe" / "common" / "backend.cpp",
         ROOT / "csrc" / "moe" / "arm" / "neon_bf16" / "kernels.S",
         ROOT / "csrc" / "moe" / "arm" / "sve_bf16" / "kernels.S",
+        ROOT / "csrc" / "moe" / "arm" / "sve_bf16" / "jit_kernels.cpp",
+        ROOT / "csrc" / "moe" / "arm" / "sve_bf16" / "jit_kernels.h",
         ROOT / "csrc" / "moe" / "arm" / "sve_bf16" / "packing.cpp",
         ROOT / "csrc" / "moe" / "arm" / "sve_bf16" / "route_merge.cpp",
+        ROOT / "3rdparty" / "xbyak_aarch64" / "xbyak_aarch64" / "xbyak_aarch64.h",
+        ROOT / "3rdparty" / "xbyak_aarch64" / "src" / "xbyak_aarch64_impl.cpp",
         ROOT / "src" / "fused_cpp" / "moe" / "bf16_tiled.py",
     )
     source_digest = hashlib.sha256()
     for path in source_paths:
         source_digest.update(str(path.relative_to(ROOT)).encode("utf-8"))
-        source_digest.update(path.read_bytes())
+        source_digest.update(path.read_bytes() if path.is_file() else b"<missing>")
 
     def git(args: list[str]) -> str | None:
         result = subprocess.run(
@@ -115,12 +119,14 @@ def kernel_metadata() -> dict:
 
     git_commit = git(["rev-parse", "HEAD"])
     git_status = git(["status", "--short"])
+    xbyak_commit = git(["-C", str(ROOT / "3rdparty" / "xbyak_aarch64"), "rev-parse", "HEAD"])
     extension = sys.modules.get("fused_cpp._moe_C")
     extension_path = Path(extension.__file__) if extension is not None else None
     return {
         "git_available": git_commit is not None,
         "git_commit": git_commit,
         "git_worktree_dirty": None if git_status is None else bool(git_status),
+        "xbyak_aarch64_commit": xbyak_commit,
         "source_sha256": source_digest.hexdigest(),
         "extension_path": str(extension_path) if extension_path else None,
         "extension_sha256": sha256_file(extension_path) if extension_path else None,
@@ -418,6 +424,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--global-experts", type=int, default=None)
     parser.add_argument("--w13-split", type=int, choices=(0, 1), default=0)
     parser.add_argument("--w13-split-chunks", type=int, default=2)
+    parser.add_argument(
+        "--sve-implementation",
+        choices=("jit", "asm"),
+        default="jit",
+        help="Select and bind the SVE kernel implementation recorded by this profile.",
+    )
     parser.add_argument("--llc-bytes", type=int, default=None)
     parser.add_argument(
         "--sync-port",
@@ -469,6 +481,7 @@ def main() -> int:
 
     torch.set_num_threads(1)
     os.environ["FUSED_CPP_MOE_W13_SPLIT_N"] = "1" if args.w13_split else "0"
+    os.environ["FUSED_CPP_MOE_SVE_IMPL"] = args.sve_implementation
     generator = torch.Generator().manual_seed(args.seed)
     w13 = bf16(
         (args.num_experts, 2 * args.ffn_hidden_size, args.hidden_size),
@@ -481,6 +494,11 @@ def main() -> int:
         args.std,
     )
     packed = prepare_fused_moe_bf16_tiled_weights(w13, w2, fuse_silu=True)
+    if int(packed.gemm_backend) != 1:
+        raise RuntimeError(
+            "SVE cost profiling requires the arm_sve_bf16 backend; "
+            f"the selected backend id is {packed.gemm_backend}"
+        )
     del w13, w2
     sync_client = SyncClient(args.sync_port, args.rank_id)
 
@@ -612,6 +630,8 @@ def main() -> int:
             "gemm_backend": int(packed.gemm_backend),
             "backend_n_tile": int(packed.backend_n_tile),
             "parallel_axis": "N",
+            "sve_implementation": args.sve_implementation,
+            "m_tail_policy": "xbyak_exact_m" if args.sve_implementation == "jit" else "static_bucketed",
             "w13_split": bool(args.w13_split),
             "w13_split_chunks": split_chunks,
             **kernel_metadata(),

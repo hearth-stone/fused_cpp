@@ -4,6 +4,45 @@ This directory contains SVE fused-MoE features and standalone experiments. The
 weighted route-merge U1 kernel and async ready-token merge are enabled by
 default for their supported SVE paths; neither changes the fused-MoE API.
 
+## Xbyak exact-M compute kernels
+
+The default one-chunk SVE path generates W13 fused-SiLU/packC, W2 FP32, and W2
+FP32 direct-route kernels with the pinned `xbyak_aarch64` submodule. The GEMM
+body retains the production static-assembly K8 granularity and accumulator
+mapping, but the first generator does not yet reproduce the static M8/M4/M2
+double-buffered load/compute software pipeline. The generated tail specializes
+every logical M=1..12: its compute height is
+`2 * ceil(M / 2)`, while its packed-A height remains eight rows for M<=8 and
+twelve rows otherwise. This removes the static M4/M8/M12 bucket overcompute
+without changing packed weights, intermediate layout, or public APIs.
+
+Use `FUSED_CPP_MOE_SVE_IMPL=asm` for the static reference and
+`FUSED_CPP_MOE_SVE_IMPL=jit` for strict validation of the generated W13 and
+FP32-W2 surfaces. The default `auto` selects generated code where supported and
+retains assembly for Kc and the non-default epilogues documented in
+`csrc/moe/README.md`.
+
+The A/B benchmark keeps both implementations in one process but measures
+steady blocks. After each implementation switch it executes one unmeasured
+transition call, preventing code-switch I-cache replacement from being charged
+to the timed sample:
+
+```bash
+numactl --cpunodebind=0 --membind=0 taskset -c 0-95 \
+  .venv/bin/python \
+  optimizations/fused_moe_sve/benchmarks/bench_xbyak_exact_m.py \
+  --routes 5,6,9,10,12,192,2040 --threads 1,4,8,16,32,64,96 \
+  --warmup 3 --runs 11 --switch-period 5
+```
+
+With H=4096, F=512, eight distinct experts, and split-W13, the 192-core host's
+NUMA0 gained 11.75% for M5/M6 and about 10% for M9/M10 at 1T. M12 was within
+0.54% of static assembly. Across M192/M2040 and 1-96T, every measured point was
+within 0.86%, with no long-route throughput regression. The 8-core host gained
+roughly 5-12% on those exact tails; M12 and long routes remained within about
+1.3%. Full commands and tables are in
+[`results/amazon_8c_192c_xbyak_exact_m.md`](results/amazon_8c_192c_xbyak_exact_m.md).
+
 ## SVE weighted route merge
 
 `csrc/moe/arm/sve_bf16/route_merge.cpp` provides the SVE weighted merge for the
