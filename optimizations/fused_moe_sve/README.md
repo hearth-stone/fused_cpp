@@ -662,3 +662,9 @@ The fixed-active-B route-fragmentation measurements are recorded in
 
 The M12 streaming-weight LLC-pollution measurements are recorded in
 [`results/amazon_192c_m12_llc_pollution.md`](results/amazon_192c_m12_llc_pollution.md).
+
+The four-core M12 refill-contention experiment is recorded in
+[`results/amazon_192c_short_refill_contention.md`](results/amazon_192c_short_refill_contention.md).
+It separates a chip-wide high-cache-data-activity effect from an additional
+topology-local L2-refill service penalty; neither is described adequately by
+aggregate NUMA DRAM bandwidth alone.
