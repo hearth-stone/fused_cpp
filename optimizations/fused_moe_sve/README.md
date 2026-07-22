@@ -25,6 +25,13 @@ FP32-W2 surfaces. The default `auto` selects generated code where supported and
 retains assembly for Kc and the non-default epilogues documented in
 `csrc/moe/README.md`.
 
+`FUSED_CPP_MOE_SVE_JIT_BULK_M=1` enables the experimental bulk-M variant for
+M>=24. One generated M12 call then walks every complete 12-row block internally;
+the existing exact-M kernel still handles the final 1-11 rows. W13 advances its
+packed-C row base, regular W2 advances its row-major output, and direct-route W2
+keeps the route-output base fixed while advancing only the route-id table. The
+flag is off by default.
+
 The A/B benchmark keeps both implementations in one process but measures
 steady blocks. After each implementation switch it executes one unmeasured
 transition call, preventing code-switch I-cache replacement from being charged
@@ -36,6 +43,14 @@ numactl --cpunodebind=0 --membind=0 taskset -c 0-95 \
   optimizations/fused_moe_sve/benchmarks/bench_xbyak_exact_m.py \
   --routes 1,2,3,4,5,6,7,8,9,10,11,12 --threads 1,2,4,8 \
   --warmup 8 --runs 40 --switch-period 4
+
+# Compare only the M-loop placement with identical generated arithmetic.
+numactl --cpunodebind=0 --membind=0 taskset -c 0-95 \
+  .venv/bin/python \
+  optimizations/fused_moe_sve/benchmarks/bench_xbyak_exact_m.py \
+  --variants jit-panel,jit-bulk --routes 24,48,192,768,2040 \
+  --threads 1,4,8,16,32,64,96 --warmup 5 --runs 31 \
+  --switch-period 5
 ```
 
 With H=4096, F=512, eight distinct experts, and split-W13, the 192-core host's
@@ -45,6 +60,11 @@ state machine removed the earlier M7/8 regressions of 2-4% at 1T-4T. The
 8-core host retains roughly 4-12% on the exact tails, while equal-compute-height
 controls stay within about 1.2%. Full commands and tables are in
 [`results/amazon_8c_192c_xbyak_exact_m.md`](results/amazon_8c_192c_xbyak_exact_m.md).
+
+The bulk-M experiment is bitwise correct but performance-neutral across the
+192-core host NUMA0 grid, so it remains opt-in. Corrected paired-window results
+are in
+[`results/amazon_192c_xbyak_bulk_m.md`](results/amazon_192c_xbyak_bulk_m.md).
 
 ## SVE weighted route merge
 

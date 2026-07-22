@@ -59,6 +59,10 @@ jit   require Xbyak for the generated W13/FP32-W2 surfaces
 asm   force the static assembly compatibility path
 ```
 
+`FUSED_CPP_MOE_SVE_JIT_BULK_M=1` is an experimental JIT-only execution
+variant. For M>=24 it moves the loop over complete M12 panels into generated
+code; exact tails and packed formats are unchanged. The flag defaults to off.
+
 The static assembly remains the fallback for builds without the initialized
 submodule, split-K/Kc, identity W13, reciprocal-refinement or minimax SiLU, and
 BF16 W2 route storage. Strict `jit` raises instead of falling back for a

@@ -29,6 +29,11 @@ const void* silu_constants();
 // Returned code remains executable until process shutdown. Generation and cache
 // lookup are thread-safe; `error` is populated when no JIT kernel is available.
 KernelFn get_kernel(Operation operation, int rows, int degree, std::string* error);
+// The bulk kernel consumes a positive multiple of 12 rows from params->m. It
+// preserves the exact-M kernel ABI but advances packed A and output state inside
+// generated code, amortizing the function prologue across all full M12 panels.
+KernelFn get_bulk_m12_kernel(Operation operation, int degree, std::string* error);
 void prewarm(Operation operation, int degree);
+void prewarm_bulk_m12(Operation operation, int degree);
 
 }  // namespace fused_cpp::moe_sve::jit

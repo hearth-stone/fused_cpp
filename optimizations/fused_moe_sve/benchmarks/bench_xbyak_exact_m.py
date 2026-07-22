@@ -23,7 +23,12 @@ from fused_cpp.moe import (  # noqa: E402
 )
 
 
-VARIANTS = ("asm", "jit")
+VARIANT_ENV = {
+    "asm": ("asm", "0"),
+    "jit": ("jit", "0"),
+    "jit-panel": ("jit", "0"),
+    "jit-bulk": ("jit", "1"),
+}
 
 
 def parse_int_list(value: str) -> list[int]:
@@ -31,6 +36,24 @@ def parse_int_list(value: str) -> list[int]:
     if not result or min(result) <= 0:
         raise ValueError(f"expected a non-empty positive integer list, got {value!r}")
     return result
+
+
+def parse_variant_list(value: str) -> tuple[str, ...]:
+    result = tuple(item for item in value.split(",") if item)
+    if not result:
+        raise ValueError("expected at least one benchmark variant")
+    unknown = [variant for variant in result if variant not in VARIANT_ENV]
+    if unknown:
+        raise ValueError(f"unknown variants {unknown}; expected one of {sorted(VARIANT_ENV)}")
+    if len(set(result)) != len(result):
+        raise ValueError(f"variants must be unique, got {result}")
+    return result
+
+
+def select_variant(variant: str) -> None:
+    implementation, bulk_m = VARIANT_ENV[variant]
+    os.environ["FUSED_CPP_MOE_SVE_IMPL"] = implementation
+    os.environ["FUSED_CPP_MOE_SVE_JIT_BULK_M"] = bulk_m
 
 
 def parse_args() -> argparse.Namespace:
@@ -43,6 +66,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--measurement-experts", type=int, default=8)
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--runs", type=int, default=15)
+    parser.add_argument(
+        "--variants",
+        default="asm,jit",
+        help="comma-separated subset of asm,jit,jit-panel,jit-bulk; first variant is the timing baseline",
+    )
     parser.add_argument(
         "--switch-period",
         type=int,
@@ -68,6 +96,7 @@ def main() -> int:
     args = parse_args()
     routes_values = parse_int_list(args.routes)
     thread_values = parse_int_list(args.threads)
+    variants = parse_variant_list(args.variants)
     affinity = sorted(os.sched_getaffinity(0))
     if min(
         args.hidden,
@@ -89,6 +118,10 @@ def main() -> int:
     os.environ["FUSED_CPP_MOE_SVE"] = "1"
     os.environ["FUSED_CPP_MOE_W13_SPLIT_N"] = "1"
     os.environ["FUSED_CPP_MOE_W2_BF16_ROUTE"] = "0"
+    prewarm_variant = "jit-bulk" if "jit-bulk" in variants else next(
+        (variant for variant in variants if variant != "asm"), "asm"
+    )
+    select_variant(prewarm_variant)
     generator = torch.Generator().manual_seed(args.seed)
     w13 = bf16_normal((args.experts, 2 * args.intermediate, args.hidden), generator)
     w2 = bf16_normal((args.experts, args.hidden, args.intermediate), generator)
@@ -137,30 +170,36 @@ def main() -> int:
 
                 calls.append(run)
 
-            os.environ["FUSED_CPP_MOE_SVE_IMPL"] = "asm"
+            select_variant("asm")
             reference = calls[0]()
-            os.environ["FUSED_CPP_MOE_SVE_IMPL"] = "jit"
-            candidate = calls[0]()
-            torch.testing.assert_close(candidate.float(), reference.float(), atol=0, rtol=0)
+            for variant in variants:
+                if variant == "asm":
+                    continue
+                select_variant(variant)
+                candidate = calls[0]()
+                torch.testing.assert_close(candidate.float(), reference.float(), atol=0, rtol=0)
 
-            for variant in VARIANTS:
-                os.environ["FUSED_CPP_MOE_SVE_IMPL"] = variant
+            for variant in variants:
+                select_variant(variant)
                 for iteration in range(args.warmup):
-                    calls[(iteration + VARIANTS.index(variant)) % len(calls)]()
+                    calls[iteration % len(calls)]()
 
-            samples: dict[str, list[int]] = {variant: [] for variant in VARIANTS}
+            samples: dict[str, list[int]] = {variant: [] for variant in variants}
             block = 0
             while min(len(values) for values in samples.values()) < args.runs:
-                order = VARIANTS if block % 2 == 0 else tuple(reversed(VARIANTS))
+                order = variants if block % 2 == 0 else tuple(reversed(variants))
                 for variant in order:
-                    os.environ["FUSED_CPP_MOE_SVE_IMPL"] = variant
+                    select_variant(variant)
                     # The production process does not swap implementations on
                     # every call. Keep the transition call out of the samples
                     # so instruction-cache replacement is not charged to JIT.
-                    calls[(block + VARIANTS.index(variant)) % len(calls)]()
+                    calls[block % len(calls)]()
                     remaining = args.runs - len(samples[variant])
                     for iteration in range(min(args.switch_period, remaining)):
-                        call = calls[(block + iteration + VARIANTS.index(variant)) % len(calls)]
+                        # Every variant sees the same weight-window sequence in
+                        # a block; otherwise odd sample counts bias a bimodal
+                        # pair of disjoint expert windows toward one variant.
+                        call = calls[(block * args.switch_period + iteration) % len(calls)]
                         begin = time.perf_counter_ns()
                         output = call()
                         elapsed = time.perf_counter_ns() - begin
@@ -169,28 +208,37 @@ def main() -> int:
                 block += 1
 
             medians = {variant: statistics.median(values) for variant, values in samples.items()}
-            gain = 100.0 * (medians["asm"] / medians["jit"] - 1.0)
+            baseline = variants[0]
+            gains = {variant: 100.0 * (medians[baseline] / median - 1.0) for variant, median in medians.items()}
             record = {
                 "routes": routes,
                 "threads": threads,
                 "measurement_experts": args.measurement_experts,
-                "asm_median_ns": int(medians["asm"]),
-                "jit_median_ns": int(medians["jit"]),
-                "jit_gain_pct": gain,
-                "asm_p10_ns": percentile(samples["asm"], 0.10),
-                "asm_p90_ns": percentile(samples["asm"], 0.90),
-                "jit_p10_ns": percentile(samples["jit"], 0.10),
-                "jit_p90_ns": percentile(samples["jit"], 0.90),
-                "asm_samples_ns": samples["asm"],
-                "jit_samples_ns": samples["jit"],
+                "baseline_variant": baseline,
+                "median_ns": {variant: int(value) for variant, value in medians.items()},
+                "gain_pct": gains,
+                "p10_ns": {variant: percentile(values, 0.10) for variant, values in samples.items()},
+                "p90_ns": {variant: percentile(values, 0.90) for variant, values in samples.items()},
+                "samples_ns": samples,
             }
+            if "asm" in medians and "jit" in medians:
+                record.update(
+                    {
+                        "asm_median_ns": int(medians["asm"]),
+                        "jit_median_ns": int(medians["jit"]),
+                        "jit_gain_pct": gains["jit"],
+                        "asm_p10_ns": percentile(samples["asm"], 0.10),
+                        "asm_p90_ns": percentile(samples["asm"], 0.90),
+                        "jit_p10_ns": percentile(samples["jit"], 0.10),
+                        "jit_p90_ns": percentile(samples["jit"], 0.90),
+                        "asm_samples_ns": samples["asm"],
+                        "jit_samples_ns": samples["jit"],
+                    }
+                )
             records.append(record)
-            print(
-                f"M={routes:<4} T={threads:<3} "
-                f"asm={medians['asm'] / 1e6:8.3f} ms "
-                f"jit={medians['jit'] / 1e6:8.3f} ms "
-                f"gain={gain:+6.2f}%"
-            )
+            timings = " ".join(f"{variant}={medians[variant] / 1e6:8.3f} ms" for variant in variants)
+            relative = " ".join(f"{variant}={gains[variant]:+6.2f}%" for variant in variants[1:])
+            print(f"M={routes:<4} T={threads:<3} {timings} gains[{baseline}] {relative}")
 
     payload = {
         "schema_version": 1,
@@ -205,6 +253,7 @@ def main() -> int:
         "warmup": args.warmup,
         "runs": args.runs,
         "switch_period": args.switch_period,
+        "variants": variants,
         "records": records,
         "sink": sink,
     }

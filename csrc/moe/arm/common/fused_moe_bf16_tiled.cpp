@@ -1087,6 +1087,11 @@ const char* sve_jit_operation_name(SveJitOperation operation) {
   return "unknown";
 }
 
+bool sve_jit_bulk_m_enabled() {
+  const char* value = std::getenv("FUSED_CPP_MOE_SVE_JIT_BULK_M");
+  return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
+
 bool sve_jit_configuration_supported(SveJitOperation operation, int K, int64_t degree, std::string* reason) {
   const auto mode = ::fused_cpp::moe_sve::jit::implementation_mode();
   if (mode == ::fused_cpp::moe_sve::jit::ImplementationMode::kAsm) {
@@ -1137,6 +1142,13 @@ void prewarm_sve_jit_exact_m_kernels(int w13_k, int w2_k) {
   }
   ::fused_cpp::moe_sve::jit::prewarm(SveJitOperation::kW2, 0);
   ::fused_cpp::moe_sve::jit::prewarm(SveJitOperation::kW2Direct, 0);
+  if (sve_jit_bulk_m_enabled()) {
+    for (int degree = 4; degree <= 6; ++degree) {
+      ::fused_cpp::moe_sve::jit::prewarm_bulk_m12(SveJitOperation::kW13, degree);
+    }
+    ::fused_cpp::moe_sve::jit::prewarm_bulk_m12(SveJitOperation::kW2, 0);
+    ::fused_cpp::moe_sve::jit::prewarm_bulk_m12(SveJitOperation::kW2Direct, 0);
+  }
 }
 
 struct SveJitExactMKernelSet {
@@ -1144,6 +1156,7 @@ struct SveJitExactMKernelSet {
   SveJitKernelFn tail = nullptr;
   int main_rows = 0;
   int tail_rows = 0;
+  bool bulk_m = false;
 };
 
 bool resolve_sve_jit_exact_m_kernels(SveJitOperation operation, int rows, int64_t degree,
@@ -1151,9 +1164,12 @@ bool resolve_sve_jit_exact_m_kernels(SveJitOperation operation, int rows, int64_
   TORCH_CHECK(rows > 0, "SVE JIT dispatch requires a positive row count");
   kernels->main_rows = rows / 12 * 12;
   kernels->tail_rows = rows - kernels->main_rows;
+  kernels->bulk_m = sve_jit_bulk_m_enabled() && kernels->main_rows >= 24;
   std::string error;
   if (kernels->main_rows > 0) {
-    kernels->m12 = ::fused_cpp::moe_sve::jit::get_kernel(operation, 12, static_cast<int>(degree), &error);
+    kernels->m12 = kernels->bulk_m
+                       ? ::fused_cpp::moe_sve::jit::get_bulk_m12_kernel(operation, static_cast<int>(degree), &error)
+                       : ::fused_cpp::moe_sve::jit::get_kernel(operation, 12, static_cast<int>(degree), &error);
   }
   if (kernels->tail_rows > 0 && kernels->m12 != nullptr) {
     kernels->tail = ::fused_cpp::moe_sve::jit::get_kernel(operation, kernels->tail_rows, static_cast<int>(degree),
@@ -1182,10 +1198,15 @@ bool sve_jit_packc_w13_exact_dispatch(const uint16_t* packed_A, const uint16_t* 
   }
   SveKBlockParams p = make_sve_kblock_params(12, K, N, ldc, packed_N, n_begin, static_cast<int>(degree));
   const void* constants = ::fused_cpp::moe_sve::jit::silu_constants();
-  for (int mb = 0; mb < kernels.main_rows; mb += 12) {
-    p.gemm.m = 12;
-    kernels.m12(packed_A + static_cast<int64_t>(mb) * K, w13_packed,
-                C + static_cast<int64_t>(mb) * ldc + static_cast<int64_t>(n_begin) * 6, constants, &p.gemm);
+  if (kernels.bulk_m) {
+    p.gemm.m = kernels.main_rows;
+    kernels.m12(packed_A, w13_packed, C + static_cast<int64_t>(n_begin) * 6, constants, &p.gemm);
+  } else {
+    for (int mb = 0; mb < kernels.main_rows; mb += 12) {
+      p.gemm.m = 12;
+      kernels.m12(packed_A + static_cast<int64_t>(mb) * K, w13_packed,
+                  C + static_cast<int64_t>(mb) * ldc + static_cast<int64_t>(n_begin) * 6, constants, &p.gemm);
+    }
   }
   if (kernels.tail_rows > 0) {
     const int physical_pairs = kernels.tail_rows <= 8 ? 4 : 6;
@@ -1208,10 +1229,15 @@ bool sve_jit_packed_w2_exact_dispatch(const uint16_t* packed_A, const uint16_t* 
     return false;
   }
   SveKBlockParams p = make_sve_kblock_params(12, K, N, ldc, packed_N, n_begin, 0);
-  for (int mb = 0; mb < kernels.main_rows; mb += 12) {
-    p.gemm.m = 12;
-    kernels.m12(packed_A + static_cast<int64_t>(mb) * K, w2_packed,
-                down + static_cast<int64_t>(mb) * ldc, nullptr, &p.gemm);
+  if (kernels.bulk_m) {
+    p.gemm.m = kernels.main_rows;
+    kernels.m12(packed_A, w2_packed, down, nullptr, &p.gemm);
+  } else {
+    for (int mb = 0; mb < kernels.main_rows; mb += 12) {
+      p.gemm.m = 12;
+      kernels.m12(packed_A + static_cast<int64_t>(mb) * K, w2_packed,
+                  down + static_cast<int64_t>(mb) * ldc, nullptr, &p.gemm);
+    }
   }
   if (kernels.tail_rows > 0) {
     p.gemm.m = kernels.tail_rows;
@@ -1232,9 +1258,14 @@ bool sve_jit_packed_w2_direct_route_exact_dispatch(const uint16_t* packed_A, con
     return false;
   }
   SveKBlockParams p = make_sve_kblock_params(12, K, N, route_stride, packed_N, n_begin, 3);
-  for (int mb = 0; mb < kernels.main_rows; mb += 12) {
-    p.gemm.m = 12;
-    kernels.m12(packed_A + static_cast<int64_t>(mb) * K, w2_packed, route_out, route_ids + mb, &p.gemm);
+  if (kernels.bulk_m) {
+    p.gemm.m = kernels.main_rows;
+    kernels.m12(packed_A, w2_packed, route_out, route_ids, &p.gemm);
+  } else {
+    for (int mb = 0; mb < kernels.main_rows; mb += 12) {
+      p.gemm.m = 12;
+      kernels.m12(packed_A + static_cast<int64_t>(mb) * K, w2_packed, route_out, route_ids + mb, &p.gemm);
+    }
   }
   if (kernels.tail_rows > 0) {
     p.gemm.m = kernels.tail_rows;

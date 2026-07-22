@@ -344,20 +344,20 @@ def test_sve_xbyak_exact_m_matches_static_asm(
     monkeypatch: pytest.MonkeyPatch,
     degree: int,
 ) -> None:
-    """Execute every exact M=1..12 W13/W2 JIT kernel through all bridges."""
+    """Cover exact tails and bulk-M W13/W2 JIT kernels through all bridges."""
     if "arm_sve_bf16" not in available_fused_moe_bf16_tiled_backends():
         pytest.skip("requires an SVE BF16 build/runtime")
     monkeypatch.setenv("FUSED_CPP_MOE_SVE", "1")
-    monkeypatch.setenv("FUSED_CPP_MOE_SVE_W2_DIRECT_ROUTE", "1")
     monkeypatch.setenv("FUSED_CPP_MOE_W2_BF16_ROUTE", "0")
     monkeypatch.setenv("FUSED_CPP_MOE_SILU_M12_OPT", "0")
     monkeypatch.setenv("FUSED_CPP_MOE_SILU_RECIP_NR", "0")
     monkeypatch.setenv("FUSED_CPP_MOE_SILU_MINIMAX3", "0")
+    monkeypatch.setenv("FUSED_CPP_MOE_SVE_JIT_BULK_M", "1")
     monkeypatch.delenv("FUSED_CPP_MOE_SVE_KC", raising=False)
     monkeypatch.delenv("FUSED_CPP_MOE_SVE_KC_L1_PERMILLE", raising=False)
 
     generator = torch.Generator().manual_seed(20260720 + degree)
-    route_counts = list(range(1, 13))
+    route_counts = [*range(1, 14), 23, 24, 25, 35, 36, 37, 48, 192]
     num_experts = len(route_counts)
     num_tokens = sum(route_counts)
     hidden_size = 64
@@ -426,18 +426,30 @@ def test_sve_xbyak_exact_m_matches_static_asm(
             silu_poly_degree=degree,
         ),
     }
-    for bridge, call in calls.items():
-        monkeypatch.setenv("FUSED_CPP_MOE_SVE_IMPL", "asm")
-        reference = call()
-        monkeypatch.setenv("FUSED_CPP_MOE_SVE_IMPL", "jit")
-        candidate = call()
-        torch.testing.assert_close(
-            candidate.float(),
-            reference.float(),
-            atol=0,
-            rtol=0,
-            msg=lambda message, bridge=bridge: f"{bridge}/poly{degree}: {message}",
-        )
+    for direct_route in ("0", "1"):
+        monkeypatch.setenv("FUSED_CPP_MOE_SVE_W2_DIRECT_ROUTE", direct_route)
+        for bridge, call in calls.items():
+            monkeypatch.setenv("FUSED_CPP_MOE_SVE_IMPL", "asm")
+            monkeypatch.setenv("FUSED_CPP_MOE_SVE_JIT_BULK_M", "0")
+            reference = call()
+            monkeypatch.setenv("FUSED_CPP_MOE_SVE_IMPL", "jit")
+            panel_candidate = call()
+            torch.testing.assert_close(
+                panel_candidate.float(),
+                reference.float(),
+                atol=0,
+                rtol=0,
+                msg=lambda message, bridge=bridge: f"{bridge}/panel/poly{degree}: {message}",
+            )
+            monkeypatch.setenv("FUSED_CPP_MOE_SVE_JIT_BULK_M", "1")
+            bulk_candidate = call()
+            torch.testing.assert_close(
+                bulk_candidate.float(),
+                reference.float(),
+                atol=0,
+                rtol=0,
+                msg=lambda message, bridge=bridge: f"{bridge}/bulk/poly{degree}: {message}",
+            )
 
 
 def test_sve_xbyak_strict_mode_rejects_kc_fallback() -> None:
