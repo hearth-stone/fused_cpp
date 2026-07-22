@@ -230,6 +230,95 @@ the baseline therefore reaches the memory hierarchy more efficiently. Cache
 still matters for producer-consumer residency and refill machinery, but there
 is no capacity reuse intrinsic to a single route-merge call.
 
+## PMU attribution of the streaming reversal
+
+The cold FP32 reversal was profiled on 2026-07-21 with Linux
+`7.0.0-1006-aws`, GCC 15.2.0, perf 7.0.12, and
+`kernel.perf_event_paranoid=1`. The benchmark used `tokens=2048`, `top_k=6`,
+`H=4096`, `copies=8`, 16 warmups, 128 timed invocations, and three fresh
+processes per point. Each process was bound to NUMA0 CPUs starting at CPU 0.
+
+The benchmark's `--stop-before-run` option stops after allocating and
+initializing all buffers and creating the pinned worker pool. Perf was then
+attached only to the worker TIDs before the process was resumed. The PMU
+counts therefore include warmups, measured calls, and worker barriers, but not
+allocation, input generation, thread creation, or the main thread.
+
+FP32 route input is exactly 192 MiB per invocation. Including BF16 output and
+weights, the logical payload is 208.05 MiB. The table uses V3 implementation
+events `L1D_CACHE_MISS` (`0x8144`), `L2D_CACHE_HWPRF` (`0x8155`),
+`STALL_BACKEND_MEMBOUND` (`0x8164`), and `STALL_BACKEND_L1D` (`0x8165`).
+Event semantics come from the
+[Arm Neoverse V3 Core Telemetry Specification](https://documentation-service.arm.com/static/66f71ac61669c0388dca6d9b).
+Stall categories can overlap and must not be added together.
+
+| T | Variant | Median ms | Demand-L1 miss rate | L2 HW prefetches/call | L2 refill GiB/call | L2 refill GB/s | Mem-resource stall | Pending-L1 stall |
+|---:|---|---:|---:|---:|---:|---:|---:|---:|
+| 14 | sequential | 0.756 | 3.03% | 4.680M | 0.18819 | 267.2 | 58.9% | 49.5% |
+| 14 | tree U1 | **0.738** | 8.73% | 3.559M | 0.18803 | **273.6** | 61.6% | 56.0% |
+| 16 | sequential | **0.716** | 3.59% | 4.687M | 0.18818 | **282.2** | 61.8% | 46.0% |
+| 16 | tree U1 | 0.753 | 8.66% | 3.463M | 0.18807 | 268.2 | 65.8% | 56.3% |
+| 20 | sequential | **0.697** | 5.04% | 4.671M | 0.18824 | **289.9** | 69.2% | 38.2% |
+| 20 | tree U1 | 0.839 | 8.47% | 3.457M | 0.18820 | 240.9 | 74.8% | 63.0% |
+
+Both kernels refill essentially the same 0.1882 GiB per call, close to the
+192 MiB compulsory route input. The reversal is therefore not caused by byte
+amplification or a larger LLC working set. The fixed tree issues TopK source
+streams at each hidden-axis vector, while the sequential kernel completes one
+contiguous route row before starting the next and keeps its 16 KiB accumulator
+in L1. The sequential pattern generates about 32-35% more L2 hardware-prefetch
+accesses and materially fewer demand L1 misses.
+
+`L2D_CACHE_REFILL` names the destination of the fill: the private L2 of the
+requesting core. It does not imply that private L2 arrays contend with each
+other. Both an L3 hit returned to L2 and an L3 miss serviced from memory end in
+an L2 refill, so the shared bottleneck can be in the L3, interconnect, memory
+controllers, or their request/response queues. At 20 workers `BUS_ACCESS_RD`
+was 7.08M beats/call for sequential and 7.16M for U1, again showing nearly
+equal downstream traffic; the observed delivery rate was 10.1 versus
+8.5 Gbeat/s.
+
+This host has a 96 MiB L3 shared by NUMA0 CPUs 0-95, while one FP32 route source
+is 192 MiB and the benchmark rotates eight copies. The workload therefore
+cannot remain L3-resident. The host exposes no uncore/CMN L3 PMU, its
+`L3D_CACHE_REFILL` core event reports zero, and the observed `LL_CACHE_*` counts
+cover too little traffic to serve as a total-LLC byte counter here. The current
+data can attribute the reversal to the shared downstream service path, but
+cannot separate L3-bank/interconnect contention from DRAM-controller pressure.
+
+At 14 workers, U1 still wins because it retires 71.36M instructions per call
+versus 78.99M for the sequential FP32 path and avoids accumulator traffic. At
+16 workers the memory penalty overtakes that saving. At 20 workers U1 has 27%
+more memory-resource stall cycles and 94% more pending-L1 stall cycles than the
+sequential path; TLB and store stalls are below 0.01% of cycles. Frontend stall
+is also negligible. Conversely, `STALL_BACKEND_BUSY` is higher for the
+sequential kernel (33.1% versus 9.2% at 20 workers), showing that the baseline
+retains more execution-side pressure while U1 has shifted to the memory side.
+
+A fixed-route-byte control kept FP32 route input at 192 MiB and 20 workers,
+then changed TopK while setting `tokens * top_k = 12288`. U1's demand-L1 miss
+rate rose from 1.96% at TopK=2 to 5.85%, 8.46%, and 12.57% at TopK=4/6/8.
+The sequential path stayed between 4.29% and 5.41%. Output traffic changes with
+the token count, so this is supporting rather than single-variable evidence,
+but the monotonic U1 miss trend directly tracks the number of interleaved
+source streams.
+
+Halving source width moves the transition later. In an unprofiled BF16 sweep,
+U1 was 3.8% faster at 20 workers (`0.3849` versus `0.3995` ms) but 13.9% slower
+in latency at 24 workers (`0.4270` versus `0.3748` ms). At 24 workers PMU still
+reported nearly equal refill volume (0.0942 versus 0.0948 GiB/call), while U1
+had a 3.20% demand-miss rate versus 0.65% and delivered 237.0 versus
+278.7 GB/s of L2 refills. This shift from the FP32 14-16 worker crossover to
+the BF16 20-24 worker crossover confirms that shared refill pressure is part
+of the mechanism.
+
+The PMU can localize the limit to demand-load tracking/refill resources between
+L1 and the shared downstream hierarchy, amplified when shared-service latency
+rises. It cannot identify one physical queue (for example, a load queue, miss
+status entry, or prefetch stream tracker) from these aggregate events alone.
+The defensible planner signal is therefore concurrent cold stream count plus
+measured refill pressure, not logical bytes or STREAM bandwidth alone.
+
 ## Non-temporal output store (rejected)
 
 An experimental output path packed the low BF16 halfwords with `UZP1` and used

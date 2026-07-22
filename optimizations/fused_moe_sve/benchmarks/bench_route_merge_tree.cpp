@@ -4,6 +4,7 @@
 #include <atomic>
 #include <barrier>
 #include <chrono>
+#include <csignal>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -24,6 +25,7 @@
 #if defined(__linux__)
 #include <pthread.h>
 #include <sched.h>
+#include <unistd.h>
 #endif
 
 namespace {
@@ -39,6 +41,8 @@ struct Config {
   int runs = 11;
   int copies = 1;
   std::string source = "f32";
+  std::string variant = "all";
+  bool stop_before_run = false;
   bool check = false;
 };
 
@@ -75,6 +79,10 @@ Config parse_args(int argc, char** argv) {
       config.copies = static_cast<int>(parse_i64(take("--copies"), "copies"));
     } else if (arg == "--source") {
       config.source = take("--source");
+    } else if (arg == "--variant") {
+      config.variant = take("--variant");
+    } else if (arg == "--stop-before-run") {
+      config.stop_before_run = true;
     } else if (arg == "--check") {
       config.check = true;
     } else {
@@ -88,6 +96,13 @@ Config parse_args(int argc, char** argv) {
   }
   if (config.source != "f32" && config.source != "bf16" && config.source != "both") {
     throw std::invalid_argument("source must be f32, bf16, or both");
+  }
+  if (config.variant != "all" && config.variant != "baseline" && config.variant != "u1" &&
+      config.variant != "u2" && config.variant != "u4") {
+    throw std::invalid_argument("variant must be all, baseline, u1, u2, or u4");
+  }
+  if (config.stop_before_run && config.source == "both") {
+    throw std::invalid_argument("--stop-before-run requires one source dtype");
   }
   return config;
 }
@@ -311,9 +326,32 @@ void run_source(const Config& config, const std::vector<Src>& route, const std::
       static_cast<double>(config.tokens) *
       (static_cast<double>(config.top_k * config.hidden) * sizeof(Src) +
        static_cast<double>(config.top_k) * sizeof(float) + static_cast<double>(config.hidden) * sizeof(uint16_t));
+  if (config.stop_before_run) {
+#if defined(__linux__)
+    std::cout << "profiler_ready pid=" << getpid() << " workers=" << config.threads << '\n' << std::flush;
+    if (std::raise(SIGSTOP) != 0) {
+      throw std::runtime_error("failed to stop before the measured region");
+    }
+#else
+    throw std::runtime_error("--stop-before-run requires Linux");
+#endif
+  }
+
+  std::vector<int> variants;
+  if (config.variant == "all") {
+    variants = {0, 1, 2, 4};
+  } else if (config.variant == "baseline") {
+    variants = {0};
+  } else if (config.variant == "u1") {
+    variants = {1};
+  } else if (config.variant == "u2") {
+    variants = {2};
+  } else {
+    variants = {4};
+  }
   double baseline_ms = 0.0;
   int64_t iteration = 0;
-  for (int variant : {0, 1, 2, 4}) {
+  for (int variant : variants) {
     int copy = 0;
     auto job = [&](int tid) {
       const int64_t rows_per_thread = (config.tokens + config.threads - 1) / config.threads;
@@ -352,7 +390,7 @@ void run_source(const Config& config, const std::vector<Src>& route, const std::
       }
     }
     const double gbps = payload_bytes / (elapsed_ms * 1.0e6);
-    const double speedup = variant == 0 ? 1.0 : baseline_ms / elapsed_ms;
+    const double speedup = variant == 0 || baseline_ms == 0.0 ? 1.0 : baseline_ms / elapsed_ms;
     std::cout << source_name << ',' << config.tokens << ',' << config.top_k << ',' << config.hidden << ','
               << config.threads << ',' << config.copies << ','
               << (variant == 0 ? "baseline" : "sve_u" + std::to_string(variant)) << ',' << elapsed_ms << ',' << gbps
