@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <exception>
 #include <functional>
+#include <limits>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -24,6 +25,10 @@
 
 #include "gemm_params.h"
 
+#if defined(FUSED_MOE_SVE_ELASTIC_USE_XBYAK) && FUSED_MOE_SVE_ELASTIC_USE_XBYAK
+#include "moe/arm/sve_bf16/jit_kernels.h"
+#endif
+
 extern "C" {
 void moe_sve_w13_silu_poly5_packc_m12_rows_opt(const uint16_t*, const uint16_t*, uint16_t*, uint16_t*,
                                                const gemm_params_t*);
@@ -38,6 +43,31 @@ struct Range {
   int begin = 0;
   int size = 0;
 };
+
+#if defined(FUSED_MOE_SVE_ELASTIC_USE_XBYAK) && FUSED_MOE_SVE_ELASTIC_USE_XBYAK
+struct alignas(8) JitParams {
+  gemm_params_t gemm;
+  int32_t kc = 0;
+  int32_t packed_n = 0;
+  int32_t n_begin = 0;
+  int32_t mode = 0;
+  float* partial_c = nullptr;
+};
+
+static_assert(offsetof(JitParams, n_begin) == 32, "unexpected Xbyak N-begin offset");
+
+fused_cpp::moe_sve::jit::KernelFn w13_jit_kernel() {
+  static const auto kernel = []() {
+    std::string error;
+    const auto fn = fused_cpp::moe_sve::jit::get_kernel(fused_cpp::moe_sve::jit::Operation::kW13, 12, 5, &error);
+    if (fn == nullptr) {
+      throw std::runtime_error("failed to resolve the Xbyak W13 M12 kernel: " + error);
+    }
+    return fn;
+  }();
+  return kernel;
+}
+#endif
 
 Range split_tiles(int tiles, int lanes, int lane) {
   if (tiles <= 0 || lanes <= 0 || lane < 0 || lane >= lanes) {
@@ -88,17 +118,35 @@ void run_range(const Problem& p, int row_begin, int rows, int n_begin, int n_col
   params.ldb = p.k;
   params.ldc = p.ldc;
 
-  const int64_t b_offset = static_cast<int64_t>(n_begin / p.n_tile) * p.k * p.n_tile;
   const uint16_t* a = p.packed_a + static_cast<int64_t>(row_begin) * p.k;
-  const uint16_t* b = p.packed_b + b_offset;
 
   if (p.stage == Stage::kW13) {
+#if defined(FUSED_MOE_SVE_ELASTIC_USE_XBYAK) && FUSED_MOE_SVE_ELASTIC_USE_XBYAK
+    JitParams jit_params;
+    jit_params.gemm = params;
+    jit_params.gemm.m = 12;
+    jit_params.packed_n = p.n;
+    jit_params.n_begin = n_begin;
+    const auto kernel = w13_jit_kernel();
+    const void* constants = fused_cpp::moe_sve::jit::silu_constants();
+    for (int row = 0; row < rows; row += 12) {
+      const uint16_t* a_block = a + static_cast<int64_t>(row) * p.k;
+      auto* c = static_cast<uint16_t*>(p.output) + static_cast<int64_t>(row_begin + row) * p.ldc +
+                static_cast<int64_t>(n_begin) * 6;
+      kernel(a_block, p.packed_b, c, constants, &jit_params.gemm);
+    }
+#else
+    const int64_t b_offset = static_cast<int64_t>(n_begin / p.n_tile) * p.k * p.n_tile;
+    const uint16_t* b = p.packed_b + b_offset;
     auto* c =
         static_cast<uint16_t*>(p.output) + static_cast<int64_t>(row_begin) * p.ldc + static_cast<int64_t>(n_begin) * 6;
     moe_sve_w13_silu_poly5_packc_m12_rows_opt(a, b, c, nullptr, &params);
+#endif
     return;
   }
 
+  const int64_t b_offset = static_cast<int64_t>(n_begin / p.n_tile) * p.k * p.n_tile;
+  const uint16_t* b = p.packed_b + b_offset;
   params.m = 12;
   for (int row = 0; row < rows; row += 12) {
     const uint16_t* a_block = a + static_cast<int64_t>(row) * p.k;
@@ -118,6 +166,47 @@ void run_lane(const Problem& p, int row_begin, int rows, int lanes, int lane) {
     return;
   }
   run_range(p, row_begin, rows, tile_range.begin * p.n_tile, tile_range.size * p.n_tile);
+}
+
+int check_2d_split(const Problem& problem, int m_lanes, int n_lanes, int n_ranges) {
+  check_problem(problem);
+  if (m_lanes <= 0 || n_lanes <= 0 || n_ranges <= 0) {
+    throw std::invalid_argument("2D lane counts and N ranges must be positive");
+  }
+  if (problem.stage != Stage::kW13 && n_ranges != 1) {
+    throw std::invalid_argument("multiple N ranges are only valid for W13");
+  }
+  const int n_tiles = problem.n / problem.n_tile;
+  if (n_tiles % n_ranges != 0) {
+    throw std::invalid_argument("N tiles must divide evenly across weight ranges");
+  }
+  const int64_t worker_count = static_cast<int64_t>(m_lanes) * n_lanes;
+  if (worker_count > std::numeric_limits<int>::max()) {
+    throw std::invalid_argument("2D lane count exceeds the supported worker count");
+  }
+  return static_cast<int>(worker_count);
+}
+
+void run_2d_worker(const Problem& problem, int m_lanes, int n_lanes, int n_ranges, int local_tid) {
+  const int m_lane = local_tid / n_lanes;
+  const int n_lane = local_tid % n_lanes;
+  const int m_panels = problem.m / 12;
+  const Range panel_range = split_tiles(m_panels, m_lanes, m_lane);
+  if (panel_range.size == 0) {
+    return;
+  }
+  const int n_tiles = problem.n / problem.n_tile;
+  const int tiles_per_range = n_tiles / n_ranges;
+  const int row_begin = panel_range.begin * 12;
+  const int rows = panel_range.size * 12;
+  for (int range = 0; range < n_ranges; ++range) {
+    const Range tile_range = split_tiles(tiles_per_range, n_lanes, n_lane);
+    if (tile_range.size == 0) {
+      continue;
+    }
+    const int n_begin = (range * tiles_per_range + tile_range.begin) * problem.n_tile;
+    run_range(problem, row_begin, rows, n_begin, tile_range.size * problem.n_tile);
+  }
 }
 
 void cpu_relax(int64_t& spins) {
@@ -289,6 +378,46 @@ RunResult Executor::run_static(const Problem& problem, int lanes) {
     }
   });
   return {seconds, lanes};
+}
+
+RunResult Executor::run_static_2d(const Problem& problem, int m_lanes, int n_lanes, int n_ranges) {
+  const int active_workers = check_2d_split(problem, m_lanes, n_lanes, n_ranges);
+  if (active_workers > impl_->workers()) {
+    throw std::invalid_argument("2D lane count exceeds resident workers");
+  }
+  const double seconds = impl_->run([&](int tid) {
+    if (tid >= active_workers) {
+      return;
+    }
+    run_2d_worker(problem, m_lanes, n_lanes, n_ranges, tid);
+  });
+  return {seconds, static_cast<int64_t>(active_workers) * n_ranges};
+}
+
+RunResult Executor::run_static_2d_batch(const std::vector<Problem>& problems, int m_lanes, int n_lanes, int n_ranges) {
+  if (problems.empty()) {
+    throw std::invalid_argument("2D problem batch must not be empty");
+  }
+  const int workers_per_problem = check_2d_split(problems.front(), m_lanes, n_lanes, n_ranges);
+  for (size_t index = 1; index < problems.size(); ++index) {
+    if (check_2d_split(problems[index], m_lanes, n_lanes, n_ranges) != workers_per_problem) {
+      throw std::invalid_argument("inconsistent 2D worker count in problem batch");
+    }
+  }
+  const int64_t active_worker_count = static_cast<int64_t>(workers_per_problem) * problems.size();
+  if (active_worker_count > impl_->workers()) {
+    throw std::invalid_argument("2D problem batch exceeds resident workers");
+  }
+  const int active_workers = static_cast<int>(active_worker_count);
+  const double seconds = impl_->run([&](int tid) {
+    if (tid >= active_workers) {
+      return;
+    }
+    const int problem_index = tid / workers_per_problem;
+    const int local_tid = tid % workers_per_problem;
+    run_2d_worker(problems[static_cast<size_t>(problem_index)], m_lanes, n_lanes, n_ranges, local_tid);
+  });
+  return {seconds, active_worker_count * n_ranges};
 }
 
 RunResult Executor::run_epoch_fixed(const Problem& problem, int lanes, int epoch_rows) {

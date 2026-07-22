@@ -44,6 +44,8 @@ class Executor {
   Executor& operator=(const Executor&) = delete;
 
   RunResult run_static(const Problem& problem, int lanes);
+  RunResult run_static_2d(const Problem& problem, int m_lanes, int n_lanes, int n_ranges = 1);
+  RunResult run_static_2d_batch(const std::vector<Problem>& problems, int m_lanes, int n_lanes, int n_ranges = 1);
   RunResult run_epoch_fixed(const Problem& problem, int lanes, int epoch_rows);
   RunResult run_phase_claim(const Problem& problem, const std::vector<EpochSpec>& epochs);
   RunResult run_epoch_claim(const Problem& problem, const std::vector<EpochSpec>& epochs);

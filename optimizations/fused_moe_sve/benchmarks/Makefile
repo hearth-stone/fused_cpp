@@ -1,6 +1,7 @@
 ROOT := ../../..
 FEATURES := ../features
 I8GEMM := $(ROOT)/refs/i8gemm/lib
+XBYAK := $(ROOT)/3rdparty/xbyak_aarch64
 
 CXX ?= g++
 CXXFLAGS ?= -O2
@@ -10,9 +11,12 @@ LDFLAGS += -pthread
 
 TARGETS := bench_elastic_nsplit bench_unfused_pipeline bench_single_core_weight_window \
 	bench_fragmented_route_pipeline bench_m12_llc_pollution bench_route_merge_tree
-EXPERIMENTAL_TARGETS := bench_m12_streaming_b bench_msmall_kblock
+EXPERIMENTAL_TARGETS := bench_mn_split bench_m12_streaming_b bench_msmall_kblock
 ELASTIC_SOURCES := bench_elastic_nsplit.cpp $(FEATURES)/elastic_nsplit.cpp \
 	$(ROOT)/csrc/moe/arm/sve_bf16/kernels.S
+MN_SPLIT_SOURCES := bench_mn_split.cpp $(FEATURES)/elastic_nsplit.cpp \
+	$(ROOT)/csrc/moe/arm/sve_bf16/jit_kernels.cpp $(XBYAK)/src/xbyak_aarch64_impl.cpp \
+	$(XBYAK)/src/util_impl.cpp $(ROOT)/csrc/moe/arm/sve_bf16/kernels.S
 UNFUSED_SOURCES := bench_unfused_pipeline.cpp $(FEATURES)/unfused_pipeline.cpp \
 	$(ROOT)/csrc/moe/arm/sve_bf16/kernels.S
 SINGLE_CORE_WINDOW_SOURCES := bench_single_core_weight_window.cpp \
@@ -27,12 +31,17 @@ M12_STREAMING_B_SOURCES := bench_m12_streaming_b.cpp m12_streaming_b_kernels.S \
 MSMALL_KBLOCK_SOURCES := bench_msmall_kblock.cpp msmall_kblock_kernels.S \
 	$(ROOT)/csrc/moe/arm/sve_bf16/kernels.S
 
-.PHONY: all check check-m12-streaming-b check-m12-kblock check-msmall-kblock clean
+.PHONY: all check check-mn-split check-m12-streaming-b check-m12-kblock check-msmall-kblock clean
 
 all: $(TARGETS)
 
 bench_elastic_nsplit: $(ELASTIC_SOURCES) $(FEATURES)/elastic_nsplit.h $(I8GEMM)/gemm_params.h
 	$(CXX) $(CXXFLAGS) $(ELASTIC_SOURCES) $(LDFLAGS) -o $@
+
+bench_mn_split: $(MN_SPLIT_SOURCES) $(FEATURES)/elastic_nsplit.h $(I8GEMM)/gemm_params.h
+	$(CXX) $(CXXFLAGS) -Wno-error=deprecated \
+		-DFUSED_MOE_SVE_ELASTIC_USE_XBYAK=1 -DFUSED_CPP_MOE_HAS_XBYAK_AARCH64=1 \
+		-I$(XBYAK) -I$(XBYAK)/src -I$(XBYAK)/xbyak_aarch64 $(MN_SPLIT_SOURCES) $(LDFLAGS) -o $@
 
 bench_unfused_pipeline: $(UNFUSED_SOURCES) $(FEATURES)/unfused_pipeline.h $(I8GEMM)/gemm_params.h
 	$(CXX) $(CXXFLAGS) $(UNFUSED_SOURCES) $(LDFLAGS) -o $@
@@ -76,6 +85,14 @@ check: $(TARGETS)
 		./bench_route_merge_tree --tokens 5 --top-k $$top_k --hidden 103 --threads 4 \
 			--warmup 1 --runs 2 --source both --check || exit 1; \
 	done
+
+check-mn-split: bench_mn_split
+	./bench_mn_split --stage w13 --m 120 --k 64 --n 64 --plans 1x4,2x2,4x1 \
+		--w13-ranges 2 --copies 1 --check
+	./bench_mn_split --stage w2_bf16 --m 120 --k 64 --n 64 --plans 1x4,2x2,4x1 \
+		--copies 1 --check
+	./bench_mn_split --stage w13 --m 120 --k 64 --n 64 --plans 2x2,1x2 \
+		--w13-ranges 2 --experts 2 --total-workers 4 --copies 1 --check
 
 check-m12-streaming-b: bench_m12_streaming_b
 	./bench_m12_streaming_b --k 64 --n 64 --cpu 0 --check-only
