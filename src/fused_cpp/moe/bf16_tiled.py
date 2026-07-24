@@ -66,7 +66,18 @@ try:
     ):
         if _legacy_native is not None and hasattr(_moe_native, _name) and not hasattr(_legacy_native, _name):
             setattr(_legacy_native, _name, getattr(_moe_native, _name))
-except (ImportError, AttributeError):
+except ImportError as error:
+    if "SVE vector length mismatch:" in str(error):
+        raise
+    _moe_native = None
+    _fused_moe_bf16_tiled_impl = None
+    _fused_moe_bf16_tiled_scheduled_impl = None
+    _fused_moe_bf16_tiled_async_impl = None
+    _fused_moe_bf16_tiled_vllm_staged_impl = None
+    _prepare_bf16_tiled_impl = None
+    _available_backends_impl = None
+    _HAS_BF16_TILED_FUSED_MOE = False
+except AttributeError:
     _moe_native = None
     _fused_moe_bf16_tiled_impl = None
     _fused_moe_bf16_tiled_scheduled_impl = None

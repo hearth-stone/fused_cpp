@@ -9,6 +9,18 @@ from setuptools import setup
 from torch.utils.cpp_extension import BuildExtension, CppExtension
 
 
+def _sve_vector_bits_for_build() -> int:
+    raw = os.environ.get("FUSED_CPP_SVE_VECTOR_BITS", "128").strip()
+    try:
+        bits = int(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"FUSED_CPP_SVE_VECTOR_BITS must be an integer, got {raw!r}") from exc
+    supported = (128, 256, 512, 1024, 2048)
+    if bits not in supported:
+        raise RuntimeError(f"FUSED_CPP_SVE_VECTOR_BITS must be one of {supported}")
+    return bits
+
+
 class _BuildExtensionWithFixup(BuildExtension):
     """macOS 上构建完成后自动修复 dylib install name。
 
@@ -491,8 +503,15 @@ if is_aarch64:
         "sve" in target_cpu.lower() if target_cpu else platform.system() != "Darwin" and _host_cpu_has_flag("sve")
     )
     if platform.system() == "Linux":
+        sve_vector_bits = _sve_vector_bits_for_build()
         moe_define_macros.append(("FUSED_CPP_MOE_HAS_ARM_SVE", "1"))
-        sve_args = ["-march=armv8.6-a+sve+bf16+i8mm", "-O2", "-std=c++17"]
+        moe_define_macros.append(("FUSED_CPP_MOE_SVE_VECTOR_BITS", str(sve_vector_bits)))
+        sve_args = [
+            "-march=armv8.6-a+sve+bf16+i8mm",
+            f"-msve-vector-bits={sve_vector_bits}",
+            "-O2",
+            "-std=c++17",
+        ]
         sve_sources = [
             os.path.join("csrc", "moe", "arm", "sve_bf16", "jit_kernels.cpp"),
             os.path.join("csrc", "moe", "arm", "sve_bf16", "packing.cpp"),

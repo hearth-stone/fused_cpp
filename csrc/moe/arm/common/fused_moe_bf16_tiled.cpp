@@ -1092,6 +1092,31 @@ bool sve_jit_bulk_m_enabled() {
   return value != nullptr && value[0] != '\0' && value[0] != '0';
 }
 
+bool sve_jit_w13_first_panel_prefetch_enabled() {
+  const char* value = std::getenv("FUSED_CPP_MOE_SVE_W13_FIRST_PANEL_PREFETCH");
+  return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
+
+bool sve_jit_all_first_panel_prefetch_enabled() {
+  const char* value = std::getenv("FUSED_CPP_MOE_SVE_FIRST_PANEL_PREFETCH");
+  return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
+
+bool sve_jit_first_panel_prefetch_enabled(SveJitOperation operation) {
+  return sve_jit_all_first_panel_prefetch_enabled() ||
+         (operation == SveJitOperation::kW13 && sve_jit_w13_first_panel_prefetch_enabled());
+}
+
+bool sve_jit_any_first_panel_prefetch_enabled() {
+  return sve_jit_all_first_panel_prefetch_enabled() || sve_jit_w13_first_panel_prefetch_enabled();
+}
+
+bool sve_jit_first_panel_prefetch_supported(SveJitOperation operation, int K) {
+  const int64_t prefetch_distance_bytes = operation == SveJitOperation::kW13 ? 2048 : 1024;
+  const int64_t b_tile_bytes = static_cast<int64_t>(K) * 2 * ::fused_cpp::moe_sve::n_tile();
+  return b_tile_bytes > prefetch_distance_bytes;
+}
+
 bool sve_jit_configuration_supported(SveJitOperation operation, int K, int64_t degree, std::string* reason) {
   const auto mode = ::fused_cpp::moe_sve::jit::implementation_mode();
   if (mode == ::fused_cpp::moe_sve::jit::ImplementationMode::kAsm) {
@@ -1099,8 +1124,7 @@ bool sve_jit_configuration_supported(SveJitOperation operation, int K, int64_t d
   }
   auto reject = [&](const std::string& message) {
     if (mode == ::fused_cpp::moe_sve::jit::ImplementationMode::kJit) {
-      TORCH_CHECK(false, "FUSED_CPP_MOE_SVE_IMPL=jit cannot run ", sve_jit_operation_name(operation), ": ",
-                  message);
+      TORCH_CHECK(false, "FUSED_CPP_MOE_SVE_IMPL=jit cannot run ", sve_jit_operation_name(operation), ": ", message);
     }
     if (reason != nullptr) {
       *reason = message;
@@ -1142,6 +1166,18 @@ void prewarm_sve_jit_exact_m_kernels(int w13_k, int w2_k) {
   }
   ::fused_cpp::moe_sve::jit::prewarm(SveJitOperation::kW2, 0);
   ::fused_cpp::moe_sve::jit::prewarm(SveJitOperation::kW2Direct, 0);
+  if (sve_jit_any_first_panel_prefetch_enabled()) {
+    TORCH_CHECK(!sve_jit_bulk_m_enabled(), "SVE first-panel prefetch conflicts with FUSED_CPP_MOE_SVE_JIT_BULK_M");
+  }
+  if (sve_jit_first_panel_prefetch_enabled(SveJitOperation::kW13)) {
+    for (int degree = 4; degree <= 6; ++degree) {
+      ::fused_cpp::moe_sve::jit::prewarm_first_panel_prefetch(SveJitOperation::kW13, degree);
+    }
+  }
+  if (sve_jit_first_panel_prefetch_enabled(SveJitOperation::kW2)) {
+    ::fused_cpp::moe_sve::jit::prewarm_first_panel_prefetch(SveJitOperation::kW2, 0);
+    ::fused_cpp::moe_sve::jit::prewarm_first_panel_prefetch(SveJitOperation::kW2Direct, 0);
+  }
   if (sve_jit_bulk_m_enabled()) {
     for (int degree = 4; degree <= 6; ++degree) {
       ::fused_cpp::moe_sve::jit::prewarm_bulk_m12(SveJitOperation::kW13, degree);
@@ -1159,12 +1195,12 @@ struct SveJitExactMKernelSet {
   bool bulk_m = false;
 };
 
-bool resolve_sve_jit_exact_m_kernels(SveJitOperation operation, int rows, int64_t degree,
+bool resolve_sve_jit_exact_m_kernels(SveJitOperation operation, int rows, int64_t degree, bool allow_bulk_m,
                                      SveJitExactMKernelSet* kernels) {
   TORCH_CHECK(rows > 0, "SVE JIT dispatch requires a positive row count");
   kernels->main_rows = rows / 12 * 12;
   kernels->tail_rows = rows - kernels->main_rows;
-  kernels->bulk_m = sve_jit_bulk_m_enabled() && kernels->main_rows >= 24;
+  kernels->bulk_m = allow_bulk_m && sve_jit_bulk_m_enabled() && kernels->main_rows >= 24;
   std::string error;
   if (kernels->main_rows > 0) {
     kernels->m12 = kernels->bulk_m
@@ -1172,19 +1208,35 @@ bool resolve_sve_jit_exact_m_kernels(SveJitOperation operation, int rows, int64_
                        : ::fused_cpp::moe_sve::jit::get_kernel(operation, 12, static_cast<int>(degree), &error);
   }
   if (kernels->tail_rows > 0 && kernels->m12 != nullptr) {
-    kernels->tail = ::fused_cpp::moe_sve::jit::get_kernel(operation, kernels->tail_rows, static_cast<int>(degree),
-                                                          &error);
+    kernels->tail =
+        ::fused_cpp::moe_sve::jit::get_kernel(operation, kernels->tail_rows, static_cast<int>(degree), &error);
   } else if (kernels->tail_rows > 0 && kernels->main_rows == 0) {
-    kernels->tail = ::fused_cpp::moe_sve::jit::get_kernel(operation, kernels->tail_rows, static_cast<int>(degree),
-                                                          &error);
+    kernels->tail =
+        ::fused_cpp::moe_sve::jit::get_kernel(operation, kernels->tail_rows, static_cast<int>(degree), &error);
   }
-  const bool resolved = (kernels->main_rows == 0 || kernels->m12 != nullptr) &&
-                        (kernels->tail_rows == 0 || kernels->tail != nullptr);
-  if (!resolved && ::fused_cpp::moe_sve::jit::implementation_mode() ==
-                       ::fused_cpp::moe_sve::jit::ImplementationMode::kJit) {
+  const bool resolved =
+      (kernels->main_rows == 0 || kernels->m12 != nullptr) && (kernels->tail_rows == 0 || kernels->tail != nullptr);
+  if (!resolved &&
+      ::fused_cpp::moe_sve::jit::implementation_mode() == ::fused_cpp::moe_sve::jit::ImplementationMode::kJit) {
     TORCH_CHECK(false, "failed to generate SVE Xbyak ", sve_jit_operation_name(operation), " kernel: ", error);
   }
   return resolved;
+}
+
+SveJitKernelFn resolve_sve_jit_first_panel_prefetch_kernel(SveJitOperation operation, int rows, int K, int64_t degree) {
+  if (!sve_jit_first_panel_prefetch_enabled(operation)) {
+    return nullptr;
+  }
+  TORCH_CHECK(!sve_jit_bulk_m_enabled(), "SVE first-panel prefetch conflicts with FUSED_CPP_MOE_SVE_JIT_BULK_M");
+  if (!sve_jit_first_panel_prefetch_supported(operation, K)) {
+    return nullptr;
+  }
+  std::string error;
+  const SveJitKernelFn kernel = ::fused_cpp::moe_sve::jit::get_first_panel_prefetch_kernel(
+      operation, std::min(rows, 12), static_cast<int>(degree), &error);
+  TORCH_CHECK(kernel != nullptr, "failed to generate SVE Xbyak ", sve_jit_operation_name(operation),
+              " first-panel prefetch kernel: ", error);
+  return kernel;
 }
 
 bool sve_jit_packc_w13_exact_dispatch(const uint16_t* packed_A, const uint16_t* w13_packed, uint16_t* C, int rows,
@@ -1192,8 +1244,10 @@ bool sve_jit_packc_w13_exact_dispatch(const uint16_t* packed_A, const uint16_t* 
   if (!sve_jit_configuration_supported(SveJitOperation::kW13, K, degree, nullptr)) {
     return false;
   }
+  const SveJitKernelFn first_panel_kernel =
+      resolve_sve_jit_first_panel_prefetch_kernel(SveJitOperation::kW13, rows, K, degree);
   SveJitExactMKernelSet kernels;
-  if (!resolve_sve_jit_exact_m_kernels(SveJitOperation::kW13, rows, degree, &kernels)) {
+  if (!resolve_sve_jit_exact_m_kernels(SveJitOperation::kW13, rows, degree, first_panel_kernel == nullptr, &kernels)) {
     return false;
   }
   SveKBlockParams p = make_sve_kblock_params(12, K, N, ldc, packed_N, n_begin, static_cast<int>(degree));
@@ -1204,28 +1258,32 @@ bool sve_jit_packc_w13_exact_dispatch(const uint16_t* packed_A, const uint16_t* 
   } else {
     for (int mb = 0; mb < kernels.main_rows; mb += 12) {
       p.gemm.m = 12;
-      kernels.m12(packed_A + static_cast<int64_t>(mb) * K, w13_packed,
-                  C + static_cast<int64_t>(mb) * ldc + static_cast<int64_t>(n_begin) * 6, constants, &p.gemm);
+      const SveJitKernelFn kernel = mb == 0 && first_panel_kernel != nullptr ? first_panel_kernel : kernels.m12;
+      kernel(packed_A + static_cast<int64_t>(mb) * K, w13_packed,
+             C + static_cast<int64_t>(mb) * ldc + static_cast<int64_t>(n_begin) * 6, constants, &p.gemm);
     }
   }
   if (kernels.tail_rows > 0) {
     const int physical_pairs = kernels.tail_rows <= 8 ? 4 : 6;
     p.gemm.m = kernels.tail_rows;
-    kernels.tail(packed_A + static_cast<int64_t>(kernels.main_rows) * K, w13_packed,
-                 C + static_cast<int64_t>(kernels.main_rows) * ldc +
-                     static_cast<int64_t>(n_begin) * physical_pairs,
-                 constants, &p.gemm);
+    const SveJitKernelFn kernel =
+        kernels.main_rows == 0 && first_panel_kernel != nullptr ? first_panel_kernel : kernels.tail;
+    kernel(packed_A + static_cast<int64_t>(kernels.main_rows) * K, w13_packed,
+           C + static_cast<int64_t>(kernels.main_rows) * ldc + static_cast<int64_t>(n_begin) * physical_pairs,
+           constants, &p.gemm);
   }
   return true;
 }
 
-bool sve_jit_packed_w2_exact_dispatch(const uint16_t* packed_A, const uint16_t* w2_packed, float* down, int rows,
-                                      int K, int N, int ldc, int packed_N, int n_begin) {
+bool sve_jit_packed_w2_exact_dispatch(const uint16_t* packed_A, const uint16_t* w2_packed, float* down, int rows, int K,
+                                      int N, int ldc, int packed_N, int n_begin) {
   if (!sve_jit_configuration_supported(SveJitOperation::kW2, K, 0, nullptr)) {
     return false;
   }
+  const SveJitKernelFn first_panel_kernel =
+      resolve_sve_jit_first_panel_prefetch_kernel(SveJitOperation::kW2, rows, K, 0);
   SveJitExactMKernelSet kernels;
-  if (!resolve_sve_jit_exact_m_kernels(SveJitOperation::kW2, rows, 0, &kernels)) {
+  if (!resolve_sve_jit_exact_m_kernels(SveJitOperation::kW2, rows, 0, first_panel_kernel == nullptr, &kernels)) {
     return false;
   }
   SveKBlockParams p = make_sve_kblock_params(12, K, N, ldc, packed_N, n_begin, 0);
@@ -1235,14 +1293,17 @@ bool sve_jit_packed_w2_exact_dispatch(const uint16_t* packed_A, const uint16_t* 
   } else {
     for (int mb = 0; mb < kernels.main_rows; mb += 12) {
       p.gemm.m = 12;
-      kernels.m12(packed_A + static_cast<int64_t>(mb) * K, w2_packed,
-                  down + static_cast<int64_t>(mb) * ldc, nullptr, &p.gemm);
+      const SveJitKernelFn kernel = mb == 0 && first_panel_kernel != nullptr ? first_panel_kernel : kernels.m12;
+      kernel(packed_A + static_cast<int64_t>(mb) * K, w2_packed, down + static_cast<int64_t>(mb) * ldc, nullptr,
+             &p.gemm);
     }
   }
   if (kernels.tail_rows > 0) {
     p.gemm.m = kernels.tail_rows;
-    kernels.tail(packed_A + static_cast<int64_t>(kernels.main_rows) * K, w2_packed,
-                 down + static_cast<int64_t>(kernels.main_rows) * ldc, nullptr, &p.gemm);
+    const SveJitKernelFn kernel =
+        kernels.main_rows == 0 && first_panel_kernel != nullptr ? first_panel_kernel : kernels.tail;
+    kernel(packed_A + static_cast<int64_t>(kernels.main_rows) * K, w2_packed,
+           down + static_cast<int64_t>(kernels.main_rows) * ldc, nullptr, &p.gemm);
   }
   return true;
 }
@@ -1253,8 +1314,10 @@ bool sve_jit_packed_w2_direct_route_exact_dispatch(const uint16_t* packed_A, con
   if (!sve_jit_configuration_supported(SveJitOperation::kW2Direct, K, 0, nullptr)) {
     return false;
   }
+  const SveJitKernelFn first_panel_kernel =
+      resolve_sve_jit_first_panel_prefetch_kernel(SveJitOperation::kW2Direct, rows, K, 0);
   SveJitExactMKernelSet kernels;
-  if (!resolve_sve_jit_exact_m_kernels(SveJitOperation::kW2Direct, rows, 0, &kernels)) {
+  if (!resolve_sve_jit_exact_m_kernels(SveJitOperation::kW2Direct, rows, 0, first_panel_kernel == nullptr, &kernels)) {
     return false;
   }
   SveKBlockParams p = make_sve_kblock_params(12, K, N, route_stride, packed_N, n_begin, 3);
@@ -1264,13 +1327,16 @@ bool sve_jit_packed_w2_direct_route_exact_dispatch(const uint16_t* packed_A, con
   } else {
     for (int mb = 0; mb < kernels.main_rows; mb += 12) {
       p.gemm.m = 12;
-      kernels.m12(packed_A + static_cast<int64_t>(mb) * K, w2_packed, route_out, route_ids + mb, &p.gemm);
+      const SveJitKernelFn kernel = mb == 0 && first_panel_kernel != nullptr ? first_panel_kernel : kernels.m12;
+      kernel(packed_A + static_cast<int64_t>(mb) * K, w2_packed, route_out, route_ids + mb, &p.gemm);
     }
   }
   if (kernels.tail_rows > 0) {
     p.gemm.m = kernels.tail_rows;
-    kernels.tail(packed_A + static_cast<int64_t>(kernels.main_rows) * K, w2_packed, route_out,
-                 route_ids + kernels.main_rows, &p.gemm);
+    const SveJitKernelFn kernel =
+        kernels.main_rows == 0 && first_panel_kernel != nullptr ? first_panel_kernel : kernels.tail;
+    kernel(packed_A + static_cast<int64_t>(kernels.main_rows) * K, w2_packed, route_out, route_ids + kernels.main_rows,
+           &p.gemm);
   }
   return true;
 }
@@ -5286,6 +5352,73 @@ std::vector<double> fused_moe_bench_team_gemm(at::Tensor A, at::Tensor B, int64_
 #endif
 }
 
+// Benchmark only the production exact-M SVE JIT GEMM for a W13-shaped packed
+// weight. Operation::kW2 is intentionally used for its plain fp32 store:
+// the packed-A/B loads and BFMMLA K-loop are identical to W13, while SiLU,
+// gate*up, BF16 conversion, and pack-C are absent. Packing and allocation are
+// outside the timed region; timed iterations rotate experts to keep B cold.
+std::vector<double> fused_moe_bench_sve_jit_w13_gemm(at::Tensor A, at::Tensor w13_packed, int64_t K, int64_t N,
+                                                     int64_t n_tile, int64_t n_ranges, int64_t warmup,
+                                                     int64_t runs) {
+#if !defined(__aarch64__) || !defined(FUSED_CPP_MOE_HAS_ARM_SVE)
+  TORCH_CHECK(false, "fused_moe_bench_sve_jit_w13_gemm requires AArch64 SVE");
+#else
+  check_bf16_cpu(A, "A");
+  TORCH_CHECK(A.dim() == 2, "A must be 2-D [M, K]");
+  TORCH_CHECK(A.size(1) == K, "A second dimension must equal K=", K);
+  check_positive_int(A.size(0), "M");
+  check_positive_int(K, "K");
+  check_positive_int(N, "N");
+  TORCH_CHECK(n_tile == ::fused_cpp::moe_sve::n_tile(), "n_tile mismatch: requested ", n_tile, ", runtime ",
+              ::fused_cpp::moe_sve::n_tile());
+  TORCH_CHECK(N % n_tile == 0, "N must be divisible by n_tile");
+  TORCH_CHECK(n_ranges > 0 && N % n_ranges == 0, "n_ranges must divide N");
+  TORCH_CHECK((N / n_ranges) % n_tile == 0, "each N range must contain whole SVE N tiles");
+  TORCH_CHECK(warmup >= 0, "warmup must be non-negative");
+  TORCH_CHECK(runs > 0, "runs must be positive");
+  A = A.contiguous();
+  const PackedExperts weights = checked_packed_experts(w13_packed, K, N, "w13_packed", n_tile);
+  TORCH_CHECK(weights.E > 0, "w13_packed must contain at least one expert");
+  TORCH_CHECK(sve_jit_configuration_supported(SveJitOperation::kW2, static_cast<int>(K), 0, nullptr),
+              "plain SVE JIT GEMM is unavailable for this configuration");
+
+  const int rows = static_cast<int>(A.size(0));
+  const int64_t packed_rows = sve_hybrid_packed_rows(rows);
+  std::vector<uint16_t> packed_a(static_cast<size_t>(packed_rows * K), static_cast<uint16_t>(0));
+  std::vector<int64_t> routes(static_cast<size_t>(rows));
+  std::iota(routes.begin(), routes.end(), int64_t{0});
+  gather_pack_a_reorder_sve_hybrid(bf16_data_const(A), K, routes.data(), 1, packed_a.data(), rows,
+                                   static_cast<int>(K), int64_t{1}, int64_t{0});
+  at::Tensor output = at::empty({packed_rows, N}, at::TensorOptions().dtype(at::kFloat).device(at::kCPU));
+  float* output_ptr = output.data_ptr<float>();
+  const uint16_t* weights_ptr = bf16_data_const(weights.tensor);
+  const int range_cols = static_cast<int>(N / n_ranges);
+
+  auto run_one = [&](int64_t iteration) {
+    const int64_t expert = iteration % weights.E;
+    const uint16_t* packed_b = weights_ptr + expert * weights.packed_stride;
+    for (int64_t range = 0; range < n_ranges; ++range) {
+      const int n_begin = static_cast<int>(range * range_cols);
+      const bool dispatched = sve_jit_packed_w2_exact_dispatch(
+          packed_a.data(), packed_b, output_ptr + n_begin, rows, static_cast<int>(K), range_cols,
+          static_cast<int>(N), static_cast<int>(N), n_begin);
+      TORCH_CHECK(dispatched, "failed to dispatch plain SVE JIT W13 GEMM");
+    }
+  };
+
+  for (int64_t iteration = 0; iteration < warmup; ++iteration) {
+    run_one(iteration);
+  }
+  std::vector<double> times_ms(static_cast<size_t>(runs), 0.0);
+  for (int64_t iteration = 0; iteration < runs; ++iteration) {
+    const auto begin = ::fused_cpp::profile::now();
+    run_one(iteration + warmup);
+    times_ms[static_cast<size_t>(iteration)] = ::fused_cpp::profile::elapsed_ms(begin);
+  }
+  return times_ms;
+#endif
+}
+
 // GEMM-only microbench for the w13 fused-silu packc path (single thread, weight
 // packed once outside the loop). mode 0 = per-tail dispatch over `rows`; mode 1
 // = always-pad-to-8 m8. Returns per-run milliseconds (length `runs`).
@@ -7005,6 +7138,18 @@ at::Tensor fused_moe_bf16_tiled_async(at::Tensor input, at::Tensor w13_packed, i
 #endif
   bool use_async_ready_token_merge =
       use_w2_direct_route && env_flag_enabled_by_default("FUSED_CPP_MOE_ASYNC_READY_TOKEN_MERGE");
+  const int64_t async_short_pool_threads = env_int_or_default("FUSED_CPP_MOE_ASYNC_SHORT_POOL_THREADS", 0);
+  const int64_t async_short_pool_max_rows = env_int_or_default("FUSED_CPP_MOE_ASYNC_SHORT_POOL_MAX_ROWS", 12);
+  const bool use_async_short_pool = async_short_pool_threads > 0;
+  if (use_async_short_pool) {
+    TORCH_CHECK(use_sve_backend && fuse_silu,
+                "async short-expert pool currently requires the fused SVE backend");
+    TORCH_CHECK(async_short_pool_max_rows > 0,
+                "FUSED_CPP_MOE_ASYNC_SHORT_POOL_MAX_ROWS must be positive, got ", async_short_pool_max_rows);
+    TORCH_CHECK(async_short_pool_threads <= num_threads && num_threads % async_short_pool_threads == 0,
+                "FUSED_CPP_MOE_ASYNC_SHORT_POOL_THREADS must divide num_threads: pool_threads=",
+                async_short_pool_threads, " num_threads=", num_threads);
+  }
 
   std::vector<std::vector<int64_t>> routes(static_cast<size_t>(num_experts));
   for (int64_t flat = 0; flat < num_routes; ++flat) {
@@ -7030,8 +7175,38 @@ at::Tensor fused_moe_bf16_tiled_async(at::Tensor input, at::Tensor w13_packed, i
   std::vector<int64_t> seen(static_cast<size_t>(num_experts), 0);
   std::vector<int64_t> expert_task_ids(static_cast<size_t>(num_experts), -1);
   std::vector<AsyncTaskRuntime> tasks(static_cast<size_t>(num_tasks));
+  std::vector<int8_t> is_short_pool_task(static_cast<size_t>(num_tasks), int8_t{0});
+  std::vector<int64_t> short_pool_task_ids;
   std::vector<ScheduledScratchUnitConfig> scratch_unit_configs;
+  std::vector<int64_t> short_pool_scratch_indices;
   int64_t trace_gemm_hint = 0;
+
+  auto ensure_scratch_config = [&](int64_t core_begin, int64_t threads, int64_t rows) {
+    int64_t scratch_idx = -1;
+    for (size_t idx = 0; idx < scratch_unit_configs.size(); ++idx) {
+      const ScheduledScratchUnitConfig& config = scratch_unit_configs[idx];
+      if (config.thread_begin == core_begin && config.threads == threads) {
+        scratch_idx = static_cast<int64_t>(idx);
+        break;
+      }
+    }
+    if (scratch_idx < 0) {
+      scratch_idx = static_cast<int64_t>(scratch_unit_configs.size());
+      scratch_unit_configs.push_back(
+          ScheduledScratchUnitConfig{core_begin, threads, 0, 0, fuse_silu, use_w2_bf16_route, use_w2_direct_route});
+    }
+    ScheduledScratchUnitConfig& scratch_config = scratch_unit_configs[static_cast<size_t>(scratch_idx)];
+    scratch_config.max_rows = std::max(scratch_config.max_rows, rows);
+    scratch_config.a_reorder_stride =
+        std::max(scratch_config.a_reorder_stride,
+                 fuse_silu ? int64_t{0} : scheduled_a_reorder_stride(rows, threads, w13, w2));
+    scratch_config.fused_packa = scratch_config.fused_packa || fuse_silu;
+    scratch_config.w2_bf16_route = scratch_config.w2_bf16_route || use_w2_bf16_route;
+    scratch_config.w2_direct_route = scratch_config.w2_direct_route || use_w2_direct_route;
+    return scratch_idx;
+  };
+
+  int64_t max_short_pool_rows = 0;
   for (int64_t task = 0; task < num_tasks; ++task) {
     const int64_t expert = task_expert_ids_v[static_cast<size_t>(task)];
     const int64_t core_begin = task_core_begins_v[static_cast<size_t>(task)];
@@ -7049,29 +7224,36 @@ at::Tensor fused_moe_bf16_tiled_async(at::Tensor input, at::Tensor w13_packed, i
     seen[static_cast<size_t>(expert)] = 1;
     expert_task_ids[static_cast<size_t>(expert)] = task;
 
-    int64_t scratch_idx = -1;
-    for (size_t idx = 0; idx < scratch_unit_configs.size(); ++idx) {
-      const ScheduledScratchUnitConfig& config = scratch_unit_configs[idx];
-      if (config.thread_begin == core_begin && config.threads == threads) {
-        scratch_idx = static_cast<int64_t>(idx);
-        break;
+    if (use_async_short_pool && rows <= async_short_pool_max_rows) {
+      is_short_pool_task[static_cast<size_t>(task)] = int8_t{1};
+      short_pool_task_ids.push_back(task);
+      max_short_pool_rows = std::max(max_short_pool_rows, rows);
+      tasks[static_cast<size_t>(task)] =
+          AsyncTaskRuntime{expert, rows, -1, async_short_pool_threads, -1};
+      trace_gemm_hint += async_short_pool_threads * 2;
+    } else {
+      const int64_t scratch_idx = ensure_scratch_config(core_begin, threads, rows);
+      tasks[static_cast<size_t>(task)] = AsyncTaskRuntime{expert, rows, core_begin, threads, scratch_idx};
+      trace_gemm_hint += threads * 2;
+    }
+  }
+  if (use_async_short_pool) {
+    TORCH_CHECK(!short_pool_task_ids.empty(),
+                "async short-expert pool found no task with rows <= ", async_short_pool_max_rows);
+    std::sort(short_pool_task_ids.begin(), short_pool_task_ids.end(), [&](int64_t lhs, int64_t rhs) {
+      const AsyncTaskRuntime& lhs_task = tasks[static_cast<size_t>(lhs)];
+      const AsyncTaskRuntime& rhs_task = tasks[static_cast<size_t>(rhs)];
+      if (lhs_task.rows != rhs_task.rows) {
+        return lhs_task.rows > rhs_task.rows;
       }
+      return lhs_task.expert < rhs_task.expert;
+    });
+    const int64_t short_pool_groups = num_threads / async_short_pool_threads;
+    short_pool_scratch_indices.resize(static_cast<size_t>(short_pool_groups));
+    for (int64_t group = 0; group < short_pool_groups; ++group) {
+      short_pool_scratch_indices[static_cast<size_t>(group)] =
+          ensure_scratch_config(group * async_short_pool_threads, async_short_pool_threads, max_short_pool_rows);
     }
-    if (scratch_idx < 0) {
-      scratch_idx = static_cast<int64_t>(scratch_unit_configs.size());
-      scratch_unit_configs.push_back(
-          ScheduledScratchUnitConfig{core_begin, threads, 0, 0, fuse_silu, use_w2_bf16_route, use_w2_direct_route});
-    }
-    ScheduledScratchUnitConfig& scratch_config = scratch_unit_configs[static_cast<size_t>(scratch_idx)];
-    scratch_config.max_rows = std::max(scratch_config.max_rows, rows);
-    scratch_config.a_reorder_stride = std::max(
-        scratch_config.a_reorder_stride, fuse_silu ? int64_t{0} : scheduled_a_reorder_stride(rows, threads, w13, w2));
-    scratch_config.fused_packa = scratch_config.fused_packa || fuse_silu;
-    scratch_config.w2_bf16_route = scratch_config.w2_bf16_route || use_w2_bf16_route;
-    scratch_config.w2_direct_route = scratch_config.w2_direct_route || use_w2_direct_route;
-
-    tasks[static_cast<size_t>(task)] = AsyncTaskRuntime{expert, rows, core_begin, threads, scratch_idx};
-    trace_gemm_hint += threads * 2;
   }
   for (int64_t expert = 0; expert < num_experts; ++expert) {
     if (!routes[static_cast<size_t>(expert)].empty()) {
@@ -7099,7 +7281,8 @@ at::Tensor fused_moe_bf16_tiled_async(at::Tensor input, at::Tensor w13_packed, i
     TORCH_CHECK(begin <= end, "task_dep_offsets must be nondecreasing at task ", task);
     TORCH_CHECK(begin >= 0 && end <= static_cast<int64_t>(task_deps_v.size()), "task ", task,
                 " dependency range is out of bounds");
-    deps_remaining[static_cast<size_t>(task)].store(end - begin);
+    const bool pooled_task = is_short_pool_task[static_cast<size_t>(task)] != 0;
+    deps_remaining[static_cast<size_t>(task)].store(pooled_task ? 0 : end - begin, std::memory_order_relaxed);
     for (int64_t idx = begin; idx < end; ++idx) {
       const int64_t dep = task_deps_v[static_cast<size_t>(idx)];
       TORCH_CHECK(dep >= 0 && dep < num_tasks, "task dependency out of range: task=", task, " dep=", dep);
@@ -7108,7 +7291,33 @@ at::Tensor fused_moe_bf16_tiled_async(at::Tensor input, at::Tensor w13_packed, i
                   "async task dependencies must refer to earlier tasks: "
                   "task=",
                   task, " dep=", dep);
-      successors[static_cast<size_t>(dep)].push_back(task);
+      if (!pooled_task) {
+        TORCH_CHECK(is_short_pool_task[static_cast<size_t>(dep)] == 0,
+                    "a non-pooled async task cannot depend on a short-pool task: task=", task, " dep=", dep);
+        successors[static_cast<size_t>(dep)].push_back(task);
+      }
+    }
+  }
+
+  std::vector<std::vector<int64_t>> short_pool_group_blockers;
+  if (use_async_short_pool) {
+    const int64_t short_pool_groups = num_threads / async_short_pool_threads;
+    short_pool_group_blockers.resize(static_cast<size_t>(short_pool_groups));
+    for (int64_t task_id = 0; task_id < num_tasks; ++task_id) {
+      if (is_short_pool_task[static_cast<size_t>(task_id)] != 0) {
+        continue;
+      }
+      const AsyncTaskRuntime& task = tasks[static_cast<size_t>(task_id)];
+      TORCH_CHECK(task.core_begin % async_short_pool_threads == 0 &&
+                      task.threads % async_short_pool_threads == 0,
+                  "async short-expert pool requires long-task intervals aligned to the pool width: task=", task_id,
+                  " core_begin=", task.core_begin, " threads=", task.threads,
+                  " pool_threads=", async_short_pool_threads);
+      const int64_t first_group = task.core_begin / async_short_pool_threads;
+      const int64_t group_count = task.threads / async_short_pool_threads;
+      for (int64_t group = first_group; group < first_group + group_count; ++group) {
+        short_pool_group_blockers[static_cast<size_t>(group)].push_back(task_id);
+      }
     }
   }
   trace_phase_end(-1, -1, -1, -1, num_tasks, "plan_validate", phase_begin);
@@ -7164,9 +7373,15 @@ at::Tensor fused_moe_bf16_tiled_async(at::Tensor input, at::Tensor w13_packed, i
   moe_trace.reserve(static_cast<size_t>(trace_gemm_hint) + ready_token_count);
   std::vector<std::atomic<int64_t>> task_states(static_cast<size_t>(num_tasks));
   for (int64_t task = 0; task < num_tasks; ++task) {
-    task_states[static_cast<size_t>(task)].store(0);
+    task_states[static_cast<size_t>(task)].store(0, std::memory_order_relaxed);
   }
   std::atomic<int64_t> completed_tasks{0};
+  std::atomic<int64_t> next_short_pool_task{0};
+  std::vector<std::atomic<int64_t>> short_pool_current_tasks(short_pool_scratch_indices.size());
+  std::vector<int64_t> short_pool_tasks_by_group(short_pool_scratch_indices.size(), 0);
+  for (std::atomic<int64_t>& current_task : short_pool_current_tasks) {
+    current_task.store(-1, std::memory_order_relaxed);
+  }
 
   auto publish_ready_tokens = [&](int64_t task_id, const std::vector<int64_t>& expert_routes) {
     std::vector<int64_t>& newly_ready = task_ready_tokens[static_cast<size_t>(task_id)];
@@ -7238,8 +7453,7 @@ at::Tensor fused_moe_bf16_tiled_async(at::Tensor input, at::Tensor w13_packed, i
     trace_phase_end(tid, -1, -1, -1, 1, "merge_ready_token", worker_phase_begin);
   };
 
-  auto run_async_task = [&](int64_t tid, int64_t task_id) {
-    const AsyncTaskRuntime& task = tasks[static_cast<size_t>(task_id)];
+  auto run_async_task = [&](int64_t tid, int64_t task_id, const AsyncTaskRuntime& task) {
     const int64_t local_tid = tid - task.core_begin;
     ScheduledTeamScratch& scratch = *scratches[static_cast<size_t>(task.scratch_index)];
     ThreadBarrier& barrier = scratch.barrier;
@@ -7417,48 +7631,164 @@ at::Tensor fused_moe_bf16_tiled_async(at::Tensor input, at::Tensor w13_packed, i
   };
 
   phase_begin = trace_phase_begin();
-  run_fixed_threads(num_threads, [&](int64_t tid) {
-    while (completed_tasks.load() < num_tasks) {
-      int64_t selected_task = -1;
-      for (int64_t task_id = 0; task_id < num_tasks; ++task_id) {
-        const AsyncTaskRuntime& task = tasks[static_cast<size_t>(task_id)];
-        if (tid < task.core_begin || tid >= task.core_begin + task.threads) {
-          continue;
-        }
-        int64_t state = task_states[static_cast<size_t>(task_id)].load();
-        if (state == 2) {
-          continue;
-        }
-        if (state == 0) {
-          if (deps_remaining[static_cast<size_t>(task_id)].load() != 0) {
+  if (!use_async_short_pool) {
+    run_fixed_threads(num_threads, [&](int64_t tid) {
+      while (completed_tasks.load() < num_tasks) {
+        int64_t selected_task = -1;
+        for (int64_t task_id = 0; task_id < num_tasks; ++task_id) {
+          const AsyncTaskRuntime& task = tasks[static_cast<size_t>(task_id)];
+          if (tid < task.core_begin || tid >= task.core_begin + task.threads) {
             continue;
           }
-          int64_t expected = 0;
-          if (!task_states[static_cast<size_t>(task_id)].compare_exchange_strong(expected, 1)) {
-            state = expected;
-            if (state != 1) {
+          int64_t state = task_states[static_cast<size_t>(task_id)].load();
+          if (state == 2) {
+            continue;
+          }
+          if (state == 0) {
+            if (deps_remaining[static_cast<size_t>(task_id)].load() != 0) {
               continue;
             }
+            int64_t expected = 0;
+            if (!task_states[static_cast<size_t>(task_id)].compare_exchange_strong(expected, 1)) {
+              state = expected;
+              if (state != 1) {
+                continue;
+              }
+            }
           }
+          selected_task = task_id;
+          break;
         }
-        selected_task = task_id;
-        break;
-      }
-      if (selected_task >= 0) {
-        run_async_task(tid, selected_task);
-      } else if (use_async_ready_token_merge) {
-        const int64_t token = try_claim_ready_token();
-        if (token >= 0) {
-          merge_ready_token(tid, token);
+        if (selected_task >= 0) {
+          run_async_task(tid, selected_task, tasks[static_cast<size_t>(selected_task)]);
+        } else if (use_async_ready_token_merge) {
+          const int64_t token = try_claim_ready_token();
+          if (token >= 0) {
+            merge_ready_token(tid, token);
+          } else {
+            std::this_thread::yield();
+          }
         } else {
           std::this_thread::yield();
         }
-      } else {
+      }
+    });
+  } else {
+    run_fixed_threads(num_threads, [&](int64_t tid) {
+      const int64_t short_pool_group = tid / async_short_pool_threads;
+      const int64_t short_pool_local_tid = tid % async_short_pool_threads;
+      const int64_t short_pool_core_begin = short_pool_group * async_short_pool_threads;
+      const int64_t short_pool_scratch_idx =
+          short_pool_scratch_indices[static_cast<size_t>(short_pool_group)];
+      ScheduledTeamScratch& short_pool_scratch = *scratches[static_cast<size_t>(short_pool_scratch_idx)];
+
+      // A group joins the short queue only after every wider task covering
+      // its cores is complete. Once joined, its workers remain in lockstep
+      // and repeatedly claim one whole short expert.
+      while (true) {
+        int64_t selected_task = -1;
+        for (int64_t task_id = 0; task_id < num_tasks; ++task_id) {
+          if (is_short_pool_task[static_cast<size_t>(task_id)] != 0) {
+            continue;
+          }
+          const AsyncTaskRuntime& task = tasks[static_cast<size_t>(task_id)];
+          if (tid < task.core_begin || tid >= task.core_begin + task.threads) {
+            continue;
+          }
+          int64_t state = task_states[static_cast<size_t>(task_id)].load(std::memory_order_acquire);
+          if (state == 2) {
+            continue;
+          }
+          if (state == 0) {
+            if (deps_remaining[static_cast<size_t>(task_id)].load(std::memory_order_acquire) != 0) {
+              continue;
+            }
+            int64_t expected = 0;
+            if (!task_states[static_cast<size_t>(task_id)].compare_exchange_strong(
+                    expected, 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
+              state = expected;
+              if (state != 1) {
+                continue;
+              }
+            }
+          }
+          selected_task = task_id;
+          break;
+        }
+        if (selected_task >= 0) {
+          run_async_task(tid, selected_task, tasks[static_cast<size_t>(selected_task)]);
+          continue;
+        }
+
+        bool group_released = true;
+        for (const int64_t blocker : short_pool_group_blockers[static_cast<size_t>(short_pool_group)]) {
+          if (task_states[static_cast<size_t>(blocker)].load(std::memory_order_acquire) != 2) {
+            group_released = false;
+            break;
+          }
+        }
+        if (group_released) {
+          break;
+        }
         std::this_thread::yield();
       }
-    }
-  });
+
+      while (true) {
+        if (short_pool_local_tid == 0) {
+          const int64_t queue_idx = next_short_pool_task.fetch_add(1, std::memory_order_relaxed);
+          const int64_t task_id =
+              queue_idx < static_cast<int64_t>(short_pool_task_ids.size())
+                  ? short_pool_task_ids[static_cast<size_t>(queue_idx)]
+                  : -1;
+          if (task_id >= 0) {
+            int64_t expected = 0;
+            const bool claimed = task_states[static_cast<size_t>(task_id)].compare_exchange_strong(
+                expected, 1, std::memory_order_acq_rel, std::memory_order_acquire);
+            TORCH_INTERNAL_ASSERT(claimed, "short-pool task was already claimed: task=", task_id,
+                                  " state=", expected);
+            ++short_pool_tasks_by_group[static_cast<size_t>(short_pool_group)];
+          }
+          short_pool_current_tasks[static_cast<size_t>(short_pool_group)].store(task_id,
+                                                                                std::memory_order_release);
+        }
+        short_pool_scratch.barrier.wait();
+
+        const int64_t task_id =
+            short_pool_current_tasks[static_cast<size_t>(short_pool_group)].load(std::memory_order_acquire);
+        if (task_id < 0) {
+          break;
+        }
+        const AsyncTaskRuntime& base_task = tasks[static_cast<size_t>(task_id)];
+        const AsyncTaskRuntime pooled_task{base_task.expert, base_task.rows, short_pool_core_begin,
+                                           async_short_pool_threads, short_pool_scratch_idx};
+        run_async_task(tid, task_id, pooled_task);
+      }
+
+      while (completed_tasks.load(std::memory_order_acquire) < num_tasks) {
+        if (use_async_ready_token_merge) {
+          const int64_t token = try_claim_ready_token();
+          if (token >= 0) {
+            merge_ready_token(tid, token);
+            continue;
+          }
+        }
+        std::this_thread::yield();
+      }
+    });
+  }
   trace_phase_end(-1, -1, -1, -1, num_routes, "scheduled_compute", phase_begin);
+  if (use_async_short_pool && env_flag_enabled("FUSED_CPP_MOE_STAGE_TIMING")) {
+    std::fprintf(stderr,
+                 "[fused_moe_bf16_tiled_async][short_pool] threads=%lld "
+                 "pool_threads=%lld groups=%zu short_tasks=%zu tasks_by_group=[",
+                 static_cast<long long>(num_threads), static_cast<long long>(async_short_pool_threads),
+                 short_pool_tasks_by_group.size(), short_pool_task_ids.size());
+    for (size_t group = 0; group < short_pool_tasks_by_group.size(); ++group) {
+      std::fprintf(stderr, "%s%lld", group == 0 ? "" : ",",
+                   static_cast<long long>(short_pool_tasks_by_group[group]));
+    }
+    std::fprintf(stderr, "]\n");
+  }
 
   auto merge_routes = [&](int64_t tid) {
     auto worker_phase_begin = trace_phase_begin();
@@ -7497,8 +7827,10 @@ at::Tensor fused_moe_bf16_tiled_async(at::Tensor input, at::Tensor w13_packed, i
 
   if (moe_trace.enabled()) {
     const double e2e_ms = ::fused_cpp::profile::elapsed_ms(moe_trace_begin);
-    moe_trace.write_report("external_plan_async", num_threads, num_tokens, top_k, num_experts, num_routes, H, F,
-                           static_cast<size_t>(active_experts), num_tasks, num_tasks, 0, e2e_ms);
+    moe_trace.write_report(use_async_short_pool ? "external_plan_async_short_pool" : "external_plan_async",
+                           num_threads, num_tokens, top_k, num_experts, num_routes, H, F,
+                           static_cast<size_t>(active_experts), num_tasks, num_tasks,
+                           use_async_short_pool ? async_short_pool_threads : 0, e2e_ms);
   }
   return finalize_moe_output(output, out);
 #endif

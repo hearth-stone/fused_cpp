@@ -1,4 +1,5 @@
 #include "packing.h"
+#include "vector_length.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -142,7 +143,7 @@ inline void pack_a_block_sve(const uint16_t* A, uint16_t* packed, int rows, int 
   }
 }
 
-inline int lane_count() { return static_cast<int>(svcntw()); }
+inline int lane_count() { return kF32Lanes; }
 
 inline void store_w13_rowpair_rowmajor(uint16_t* C, int ldc, int rows, int n_tile_base, int rp, svfloat32_t g0,
                                        svfloat32_t g1, svfloat32_t u0, svfloat32_t u1, int64_t degree) {
@@ -239,7 +240,7 @@ enum class StoreKind {
 void gemm_packed_block(const uint16_t* packed_A, const uint16_t* B_reo, void* C, int rows, int K, int N, int ldc,
                        StoreKind kind, int64_t degree) {
   const int nt = n_tile();
-  const int lanes_h = static_cast<int>(svcnth());
+  constexpr int lanes_h = kBf16Lanes;
   const svbool_t pg = svptrue_b16();
   for (int nb = 0; nb < N; nb += nt) {
     svfloat32_t c00 = svdup_f32(0.0f), c01 = svdup_f32(0.0f);
@@ -318,7 +319,7 @@ bool enabled_by_env() { return available() && !env_false("FUSED_CPP_MOE_SVE"); }
 
 int n_tile() {
 #if defined(__aarch64__) && defined(__ARM_FEATURE_SVE) && defined(__ARM_FEATURE_BF16)
-  return static_cast<int>(svcntb() / 2);
+  return kNTile;
 #else
   return 8;
 #endif
@@ -353,8 +354,8 @@ int k_block(int k) {
 
 void pack_b(const uint16_t* B, uint16_t* B_reo, int K, int N) {
 #if defined(__aarch64__) && defined(__ARM_FEATURE_SVE) && defined(__ARM_FEATURE_BF16)
-  const int segs = static_cast<int>(svcntb() / 16);
-  const int nt = segs * 8;
+  constexpr int segs = kSegments128;
+  constexpr int nt = kNTile;
   const int kc = k_block(K);
   if (K % 8 != 0 || N % nt != 0) {
     throw std::invalid_argument("SVE BF16 pack_b requires K%8==0 and N%n_tile==0");

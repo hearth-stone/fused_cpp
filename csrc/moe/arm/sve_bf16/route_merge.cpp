@@ -1,4 +1,5 @@
 #include "../../common/route_merge.h"
+#include "vector_length.h"
 
 #include <stdexcept>
 
@@ -133,7 +134,7 @@ FUSED_CPP_ALWAYS_INLINE void merge_dynamic_block(svbool_t pg, const Src* token_s
 template <typename Src, int TopK, int Unroll>
 void merge_fixed_range(const Src* route_output, const float* weights, uint16_t* output, int64_t token_begin,
                        int64_t token_end, int64_t hidden_size) {
-  const int64_t vl = static_cast<int64_t>(svcntw());
+  constexpr int64_t vl = fused_cpp::moe_sve::kF32Lanes;
   const int64_t step = Unroll * vl;
   const svbool_t all = svptrue_b32();
   for (int64_t token = token_begin; token < token_end; ++token) {
@@ -154,7 +155,7 @@ void merge_fixed_range(const Src* route_output, const float* weights, uint16_t* 
 template <typename Src, int Unroll>
 void merge_dynamic_range(const Src* route_output, const float* weights, uint16_t* output, int64_t token_begin,
                          int64_t token_end, int64_t top_k, int64_t hidden_size) {
-  const int64_t vl = static_cast<int64_t>(svcntw());
+  constexpr int64_t vl = fused_cpp::moe_sve::kF32Lanes;
   const int64_t step = Unroll * vl;
   const svbool_t all = svptrue_b32();
   for (int64_t token = token_begin; token < token_end; ++token) {

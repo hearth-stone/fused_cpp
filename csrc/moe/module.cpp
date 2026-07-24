@@ -6,6 +6,8 @@
 #include "common/backend.h"
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  fused_cpp::moe::validate_sve_vector_length_at_import();
+
   m.def("fused_moe_bf16_tiled_available_backends", &fused_cpp::moe::available_backend_names,
         "Return the BF16 fused MoE backends supported by this build and CPU.");
 
@@ -50,6 +52,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("fused_moe_bench_team_gemm", &fused_moe_bench_team_gemm, "Benchmark cooperative team GEMM.", py::arg("A"),
         py::arg("B"), py::arg("group_size"), py::arg("split") = "auto", py::arg("bias") = c10::nullopt,
         py::arg("warmup") = 3, py::arg("runs") = 20, py::call_guard<py::gil_scoped_release>());
+  m.def("fused_moe_bench_sve_jit_w13_gemm", &fused_moe_bench_sve_jit_w13_gemm,
+        "Benchmark only the exact-M SVE JIT GEMM body on packed W13 weights.", py::arg("A"),
+        py::arg("w13_packed"), py::arg("K"), py::arg("N"), py::arg("n_tile"), py::arg("n_ranges") = 2,
+        py::arg("warmup") = 64, py::arg("runs") = 192, py::call_guard<py::gil_scoped_release>());
 #endif
 
   m.def("fused_moe_bf16_tiled", &fused_moe_bf16_tiled, "Run BF16 tiled fused MoE.", py::arg("input"),

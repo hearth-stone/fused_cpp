@@ -63,6 +63,21 @@ asm   force the static assembly compatibility path
 variant. For M>=24 it moves the loop over complete M12 panels into generated
 code; exact tails and packed formats are unchanged. The flag defaults to off.
 
+`FUSED_CPP_MOE_SVE_W13_FIRST_PANEL_PREFETCH=1` enables an experimental
+JIT-only W13 load variant for every exact M from 1 through 12. For each
+thread-owned N range, only the first actual M panel issues one `PLDL1STRM` hint
+2 KiB ahead of each B cache-line load; later M panels call the ordinary
+generated kernel. M1-M8 preserve the two-bank K loop and disable hints on the
+final N tile. M9-M12 disable hints for the final 2 KiB of that tile. This keeps
+all hints inside the owned range.
+
+`FUSED_CPP_MOE_SVE_FIRST_PANEL_PREFETCH=1` extends the same experiment to the
+generated FP32 W2 and direct-route W2 kernels, using `PLDL2STRM` 1 KiB ahead.
+It does not affect the static BF16-route W2 path. Full-NUMA tests show that W2
+prefetch is harmful under contention, so both flags default to off and the
+all-GEMM flag is for controlled experiments only. Either flag conflicts with
+`FUSED_CPP_MOE_SVE_JIT_BULK_M=1`.
+
 The static assembly remains the fallback for builds without the initialized
 submodule, split-K/Kc, identity W13, reciprocal-refinement or minimax SiLU, and
 BF16 W2 route storage. Strict `jit` raises instead of falling back for a
@@ -72,8 +87,37 @@ still disables the entire SVE backend and selects the NEON implementation.
 
 Backend IDs in packed metadata remain stable: `0` is `arm_neon_bf16` and `1`
 is `arm_sve_bf16`. Packed weights are backend-specific. SVE packed weights are
-also vector-length-specific, and execution validates the stored N tile against
-the current runtime before entering a kernel.
+also vector-length-specific. The SVE vector length is fixed at build time by
+`FUSED_CPP_SVE_VECTOR_BITS` (default `128`) and passed to the compiler through
+`-msve-vector-bits`. The Xbyak kernels use that compile-time constant rather
+than emitting `CNTB`. Importing `fused_cpp._moe_C` queries the importing
+thread's actual VL with `PR_SVE_GET_VL` and fails immediately when it differs
+from the build. Do not change the process or worker-thread VL after import.
+
+## Experimental async short-expert pool
+
+`fused_moe_bf16_tiled_async` has a default-off executor experiment for
+transitioning cores from wide long-expert teams into narrow short-expert teams:
+
+```text
+FUSED_CPP_MOE_ASYNC_SHORT_POOL_THREADS=<narrow team width>
+FUSED_CPP_MOE_ASYNC_SHORT_POOL_MAX_ROWS=<short-expert threshold; default 12>
+```
+
+The external plan still defines every active expert and the long-expert DAG.
+Tasks at or below the row threshold are removed from their fixed intervals and
+sorted into one global queue. The resident threads are partitioned into fixed
+groups of the requested width. A group may claim whole short experts only
+after every non-pooled task whose interval covers that group has completed.
+Thus a 16-thread long team can release four 4-thread groups without creating
+threads or changing affinity. Groups that are not covered by a long task enter
+the pool immediately.
+
+The experiment requires fused SVE execution, an aligned long-task plan, and a
+pool width that divides the executor thread count. Dependencies attached to
+pooled tasks are validated but replaced by interval-release eligibility; a
+non-pooled task may not depend on a pooled task. The setting is intended for
+executor and planner research and is not enabled by the production planner.
 
 ## Adding an x86 backend
 

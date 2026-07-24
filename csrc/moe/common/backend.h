@@ -48,5 +48,6 @@ const MoeBackend& resolve_backend(const std::string& requested, bool fuse_silu);
 const MoeBackend& backend_from_id(int64_t backend_id);
 std::vector<std::string> available_backend_names();
 bool backend_runtime_supported(const MoeBackend& backend);
+void validate_sve_vector_length_at_import();
 
 }  // namespace fused_cpp::moe

@@ -1,4 +1,5 @@
 #include "jit_kernels.h"
+#include "vector_length.h"
 
 #include <algorithm>
 #include <array>
@@ -71,6 +72,13 @@ KernelFn get_kernel(Operation, int, int, std::string* error) {
   return nullptr;
 }
 
+KernelFn get_first_panel_prefetch_kernel(Operation, int, int, std::string* error) {
+  if (error != nullptr) {
+    *error = "xbyak_aarch64 is unavailable in this build";
+  }
+  return nullptr;
+}
+
 KernelFn get_bulk_m12_kernel(Operation, int, std::string* error) {
   if (error != nullptr) {
     *error = "xbyak_aarch64 is unavailable in this build";
@@ -79,6 +87,7 @@ KernelFn get_bulk_m12_kernel(Operation, int, std::string* error) {
 }
 
 void prewarm(Operation, int) {}
+void prewarm_first_panel_prefetch(Operation, int) {}
 void prewarm_bulk_m12(Operation, int) {}
 
 #else
@@ -90,11 +99,12 @@ struct KernelKey {
   uint8_t rows = 0;
   uint8_t degree = 0;
   bool bulk_m = false;
+  bool prefetch_b = false;
 };
 
 class SveFusedGenerator final : public CodeGenerator {
  public:
-  SveFusedGenerator(Operation operation, int rows, int degree, bool bulk_m)
+  SveFusedGenerator(Operation operation, int rows, int degree, bool bulk_m, bool prefetch_b)
       : CodeGenerator(64 * 1024, AutoGrow),
         operation_(operation),
         rows_(rows),
@@ -102,12 +112,18 @@ class SveFusedGenerator final : public CodeGenerator {
         row_pairs_((rows + 1) / 2),
         accumulator_base_(rows <= 8 ? 16 : 8),
         physical_rows_(rows <= 8 ? 8 : 12),
-        bulk_m_(bulk_m) {
+        bulk_m_(bulk_m),
+        prefetch_b_(prefetch_b),
+        prefetch_distance_bytes_(operation == Operation::kW13 ? 2048 : 1024),
+        prefetch_l1_(operation == Operation::kW13) {
     if (rows_ < 1 || rows_ > 12) {
       throw std::invalid_argument("SVE JIT rows must be in [1, 12]");
     }
     if (bulk_m_ && rows_ != 12) {
       throw std::invalid_argument("SVE JIT bulk-M is only valid for M12 kernels");
+    }
+    if (prefetch_b_ && bulk_m_) {
+      throw std::invalid_argument("SVE JIT B prefetch is not valid for bulk-M kernels");
     }
     if (operation_ == Operation::kW13 && (degree_ < 4 || degree_ > 6)) {
       throw std::invalid_argument("SVE JIT W13 degree must be 4, 5, or 6");
@@ -135,8 +151,9 @@ class SveFusedGenerator final : public CodeGenerator {
     }
     const char* operation = operation_ == Operation::kW13 ? "w13" : (operation_ == Operation::kW2 ? "w2" : "w2_direct");
     char path[512];
-    const int written = std::snprintf(path, sizeof(path), "%s/moe_sve_%s_m%d_d%d%s.bin", directory, operation,
-                                      rows_, degree_, bulk_m_ ? "_bulk" : "");
+    const int written =
+        std::snprintf(path, sizeof(path), "%s/moe_sve_%s_m%d_d%d%s%s.bin", directory, operation, rows_, degree_,
+                      bulk_m_ ? "_bulk" : "", prefetch_b_ ? "_prefetch_b" : "");
     if (written <= 0 || static_cast<size_t>(written) >= sizeof(path)) {
       return;
     }
@@ -172,7 +189,18 @@ class SveFusedGenerator final : public CodeGenerator {
     ldp(x19, x20, post_ptr(sp, 16));
   }
 
-  void load_b(int register_base) {
+  void emit_b_prefetch() {
+    if (prefetch_l1_) {
+      prfm(PLDL1STRM, ptr(x14, prefetch_distance_bytes_));
+    } else {
+      prfm(PLDL2STRM, ptr(x14, prefetch_distance_bytes_));
+    }
+  }
+
+  void load_b(int register_base, bool prefetch_b = false) {
+    if (prefetch_b) {
+      emit_b_prefetch();
+    }
     ld1h(ZRegH(register_base), p0 / T_z, ptr(x14));
     ld1h(ZRegH(register_base + 1), p0 / T_z, ptr(x14, 1, MUL_VL));
     ld1h(ZRegH(register_base + 2), p0 / T_z, ptr(x14, 2, MUL_VL));
@@ -188,8 +216,8 @@ class SveFusedGenerator final : public CodeGenerator {
     }
   }
 
-  void load_ab_small(int a_register_base, int b_register_base) {
-    load_b(b_register_base);
+  void load_ab_small(int a_register_base, int b_register_base, bool prefetch_b) {
+    load_b(b_register_base, prefetch_b);
     for (int pair = 0; pair < row_pairs_; ++pair) {
       ld1rqh(ZRegH(a_register_base + pair), p0 / T_z, ptr(x13, pair * 16));
     }
@@ -198,7 +226,7 @@ class SveFusedGenerator final : public CodeGenerator {
 
   // Match the static M2/M4/M8 state machine: compute the current K4 panel
   // while the alternate A/B register bank is already resident.
-  void emit_small_double_buffered_k_loop() {
+  void emit_small_double_buffered_k_loop(bool prefetch_b = false) {
     constexpr int kCurrentABase = 0;
     constexpr int kCurrentBBase = 4;
     constexpr int kNextABase = 8;
@@ -208,16 +236,16 @@ class SveFusedGenerator final : public CodeGenerator {
     Label tail_next;
     Label k_done;
 
-    load_ab_small(kCurrentABase, kCurrentBBase);
+    load_ab_small(kCurrentABase, kCurrentBBase, prefetch_b);
     subs(w15, w15, 4);
     b(EQ, tail_current);
 
     L(k_loop);
-    load_ab_small(kNextABase, kNextBBase);
+    load_ab_small(kNextABase, kNextBBase, prefetch_b);
     compute_pairs(0, row_pairs_, kCurrentABase, kCurrentBBase);
     subs(w15, w15, 4);
     b(EQ, tail_next);
-    load_ab_small(kCurrentABase, kCurrentBBase);
+    load_ab_small(kCurrentABase, kCurrentBBase, prefetch_b);
     compute_pairs(0, row_pairs_, kNextABase, kNextBBase);
     subs(w15, w15, 4);
     b(GT, k_loop);
@@ -231,8 +259,8 @@ class SveFusedGenerator final : public CodeGenerator {
     L(k_done);
   }
 
-  void emit_m12_k4() {
-    load_b(4);
+  void emit_m12_k4(bool prefetch_b = false) {
+    load_b(4, prefetch_b);
     const int first_group = std::min(row_pairs_, 4);
     for (int pair = 0; pair < first_group; ++pair) {
       ld1rqh(ZRegH(pair), p0 / T_z, ptr(x13, pair * 16));
@@ -249,6 +277,70 @@ class SveFusedGenerator final : public CodeGenerator {
       compute_pairs(0, first_group, 0, 4);
     }
     add(x13, x13, physical_rows_ * 8);
+  }
+
+  void emit_m12_k_loop() {
+    Label k_loop;
+    L(k_loop);
+    emit_m12_k4();
+    emit_m12_k4();
+    subs(w15, w15, 8);
+    b(GT, k_loop);
+  }
+
+  // A small-M kernel keeps its two-bank state machine intact. Non-final N tiles
+  // may prefetch into the following contiguous tile; the final tile uses the
+  // ordinary loop so a hint cannot cross the caller-owned N range.
+  void emit_small_first_panel_prefetch_k_loop() {
+    Label final_tile;
+    Label done;
+    cmp(w12, w10);
+    b(LE, final_tile);
+    emit_small_double_buffered_k_loop(true);
+    b(done);
+    L(final_tile);
+    emit_small_double_buffered_k_loop();
+    L(done);
+  }
+
+  // The final large-M N tile switches back to ordinary loads for its last
+  // prefetch distance so no hint crosses the caller-owned N range.
+  void emit_large_first_panel_prefetch_k_loop() {
+    const int distance = prefetch_distance_bytes_;
+    Label unbounded_loop;
+    Label bounded_loop;
+    Label tail_loop;
+    Label done;
+
+    cmp(w12, w10);
+    b(GT, unbounded_loop);
+
+    add(x18, x14, x11);
+    sub(x18, x18, distance);
+    cmp(x14, x18);
+    b(HS, tail_loop);
+
+    L(bounded_loop);
+    emit_m12_k4(true);
+    emit_m12_k4(true);
+    subs(w15, w15, 8);
+    cmp(x14, x18);
+    b(LO, bounded_loop);
+    b(tail_loop);
+
+    L(unbounded_loop);
+    emit_m12_k4(true);
+    emit_m12_k4(true);
+    subs(w15, w15, 8);
+    b(GT, unbounded_loop);
+    b(done);
+
+    L(tail_loop);
+    emit_m12_k4();
+    emit_m12_k4();
+    subs(w15, w15, 8);
+    b(GT, tail_loop);
+    L(done);
   }
 
   void build_row_offsets(bool direct) {
@@ -611,8 +703,8 @@ class SveFusedGenerator final : public CodeGenerator {
     mov(w16, w7);
     lsl(x16, x16, 2);
     mov(x7, x2);
-    cntb(x9);
-    lsr(x10, x9, 1);
+    mov(x9, kVectorBytes);
+    mov(x10, kNTile);
     mov(w11, w5);
     mul(x11, x11, x9);
     if (operation_ == Operation::kW13) {
@@ -662,15 +754,14 @@ class SveFusedGenerator final : public CodeGenerator {
     mov(x13, x0);
     mov(x14, x6);
     mov(w15, w5);
-    if (physical_rows_ == 8) {
+    if (physical_rows_ == 8 && prefetch_b_) {
+      emit_small_first_panel_prefetch_k_loop();
+    } else if (physical_rows_ == 8) {
       emit_small_double_buffered_k_loop();
+    } else if (prefetch_b_) {
+      emit_large_first_panel_prefetch_k_loop();
     } else {
-      Label k_loop;
-      L(k_loop);
-      emit_m12_k4();
-      emit_m12_k4();
-      subs(w15, w15, 8);
-      b(GT, k_loop);
+      emit_m12_k_loop();
     }
 
     if (operation_ == Operation::kW13) {
@@ -709,6 +800,9 @@ class SveFusedGenerator final : public CodeGenerator {
   int accumulator_base_;
   int physical_rows_;
   bool bulk_m_;
+  bool prefetch_b_;
+  int prefetch_distance_bytes_;
+  bool prefetch_l1_;
 };
 
 struct KernelHandle {
@@ -720,7 +814,8 @@ struct KernelHandle {
 KernelHandle create_kernel(const KernelKey& key) {
   KernelHandle handle;
   try {
-    handle.owner = std::make_shared<SveFusedGenerator>(key.operation, key.rows, key.degree, key.bulk_m);
+    handle.owner =
+        std::make_shared<SveFusedGenerator>(key.operation, key.rows, key.degree, key.bulk_m, key.prefetch_b);
     handle.function = handle.owner->function();
   } catch (const std::exception& exception) {
     handle.error = exception.what();
@@ -739,6 +834,7 @@ constexpr size_t kOperationCount = 3;
 constexpr size_t kRowCount = 12;
 constexpr size_t kDegreeCount = 3;
 constexpr size_t kBulkMCount = 2;
+constexpr size_t kPrefetchBCount = 2;
 
 size_t operation_index(Operation operation) { return static_cast<size_t>(operation); }
 
@@ -748,10 +844,12 @@ size_t degree_index(Operation operation, int degree) {
 
 KernelHandle& cached_kernel(const KernelKey& key) {
   static std::array<
-      std::array<std::array<std::array<KernelCacheSlot, kBulkMCount>, kDegreeCount>, kRowCount>, kOperationCount>
+      std::array<std::array<std::array<std::array<KernelCacheSlot, kPrefetchBCount>, kBulkMCount>, kDegreeCount>,
+                 kRowCount>,
+      kOperationCount>
       cache;
   KernelCacheSlot& slot = cache[operation_index(key.operation)][static_cast<size_t>(key.rows - 1)]
-                                [degree_index(key.operation, key.degree)][key.bulk_m ? 1 : 0];
+                               [degree_index(key.operation, key.degree)][key.bulk_m ? 1 : 0][key.prefetch_b ? 1 : 0];
   std::call_once(slot.once, [&slot, &key]() { slot.handle = create_kernel(key); });
   return slot.handle;
 }
@@ -773,7 +871,28 @@ KernelFn get_kernel(Operation operation, int rows, int degree, std::string* erro
     }
     return nullptr;
   }
-  const KernelKey key{operation, static_cast<uint8_t>(rows), static_cast<uint8_t>(degree), false};
+  const KernelKey key{operation, static_cast<uint8_t>(rows), static_cast<uint8_t>(degree), false, false};
+  KernelHandle& handle = cached_kernel(key);
+  if (error != nullptr) {
+    *error = handle.error;
+  }
+  return handle.function;
+}
+
+KernelFn get_first_panel_prefetch_kernel(Operation operation, int rows, int degree, std::string* error) {
+  if (rows < 1 || rows > 12) {
+    if (error != nullptr) {
+      *error = "SVE Xbyak first-panel prefetch rows must be in [1, 12]";
+    }
+    return nullptr;
+  }
+  if (operation == Operation::kW13 && (degree < 4 || degree > 6)) {
+    if (error != nullptr) {
+      *error = "SVE Xbyak W13 degree must be 4, 5, or 6";
+    }
+    return nullptr;
+  }
+  const KernelKey key{operation, static_cast<uint8_t>(rows), static_cast<uint8_t>(degree), false, true};
   KernelHandle& handle = cached_kernel(key);
   if (error != nullptr) {
     *error = handle.error;
@@ -788,7 +907,7 @@ KernelFn get_bulk_m12_kernel(Operation operation, int degree, std::string* error
     }
     return nullptr;
   }
-  const KernelKey key{operation, 12, static_cast<uint8_t>(degree), true};
+  const KernelKey key{operation, 12, static_cast<uint8_t>(degree), true, false};
   KernelHandle& handle = cached_kernel(key);
   if (error != nullptr) {
     *error = handle.error;
@@ -802,6 +921,16 @@ void prewarm(Operation operation, int degree) {
     const KernelFn function = get_kernel(operation, rows, degree, &error);
     if (function == nullptr && implementation_mode() == ImplementationMode::kJit) {
       throw std::runtime_error("failed to generate SVE Xbyak kernel: " + error);
+    }
+  }
+}
+
+void prewarm_first_panel_prefetch(Operation operation, int degree) {
+  for (int rows = 1; rows <= 12; ++rows) {
+    std::string error;
+    const KernelFn function = get_first_panel_prefetch_kernel(operation, rows, degree, &error);
+    if (function == nullptr && implementation_mode() == ImplementationMode::kJit) {
+      throw std::runtime_error("failed to generate SVE Xbyak first-panel prefetch kernel: " + error);
     }
   }
 }

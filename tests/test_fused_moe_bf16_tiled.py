@@ -452,6 +452,89 @@ def test_sve_xbyak_exact_m_matches_static_asm(
             )
 
 
+@pytest.mark.parametrize("degree", [4, 5, 6], ids=["poly4", "poly5", "poly6"])
+@pytest.mark.parametrize("direct_route", [False, True], ids=["w2", "w2_direct"])
+def test_sve_first_panel_prefetch_matches_panel_jit(
+    monkeypatch: pytest.MonkeyPatch,
+    degree: int,
+    direct_route: bool,
+) -> None:
+    """Cover each prefetch Mr and verify that later panels remain bitwise exact."""
+    if "arm_sve_bf16" not in available_fused_moe_bf16_tiled_backends():
+        pytest.skip("requires an SVE BF16 build/runtime")
+    monkeypatch.setenv("FUSED_CPP_MOE_SVE", "1")
+    monkeypatch.setenv("FUSED_CPP_MOE_SVE_IMPL", "jit")
+    monkeypatch.setenv("FUSED_CPP_MOE_W13_SPLIT_N", "1")
+    monkeypatch.setenv("FUSED_CPP_MOE_SVE_JIT_BULK_M", "0")
+    monkeypatch.setenv("FUSED_CPP_MOE_W2_BF16_ROUTE", "0")
+    monkeypatch.setenv("FUSED_CPP_MOE_SVE_W2_DIRECT_ROUTE", "1" if direct_route else "0")
+    monkeypatch.setenv("FUSED_CPP_MOE_SILU_RECIP_NR", "0")
+    monkeypatch.setenv("FUSED_CPP_MOE_SILU_MINIMAX3", "0")
+    monkeypatch.delenv("FUSED_CPP_MOE_SVE_KC", raising=False)
+    monkeypatch.delenv("FUSED_CPP_MOE_SVE_KC_L1_PERMILLE", raising=False)
+
+    generator = torch.Generator().manual_seed(20260722 + degree)
+    route_counts = [*range(1, 14), 24, 25]
+    num_experts = len(route_counts)
+    num_tokens = sum(route_counts)
+    hidden_size = 256
+    ffn_hidden_size = 128
+    hidden = _bf16_normal((num_tokens, hidden_size), generator=generator, std=0.01)
+    w13 = _bf16_normal(
+        (num_experts, 2 * ffn_hidden_size, hidden_size),
+        generator=generator,
+        std=0.01,
+    )
+    w2 = _bf16_normal(
+        (num_experts, hidden_size, ffn_hidden_size),
+        generator=generator,
+        std=0.01,
+    )
+    topk_ids = torch.cat(
+        [torch.full((count,), expert, dtype=torch.int32) for expert, count in enumerate(route_counts)]
+    ).reshape(num_tokens, 1)
+    topk_weights = torch.ones((num_tokens, 1), dtype=torch.float32)
+    packed = prepare_fused_moe_bf16_tiled_weights(w13, w2, fuse_silu=True, backend="sve")
+    if packed.gemm_backend != 1:
+        pytest.skip("requires an SVE BF16 build/runtime")
+
+    monkeypatch.setenv("FUSED_CPP_MOE_SVE_W13_FIRST_PANEL_PREFETCH", "0")
+    monkeypatch.setenv("FUSED_CPP_MOE_SVE_FIRST_PANEL_PREFETCH", "0")
+    reference = fused_moe_bf16_tiled(
+        hidden,
+        packed,
+        topk_weights,
+        topk_ids,
+        num_threads=1,
+        silu_poly_degree=degree,
+    )
+    monkeypatch.setenv("FUSED_CPP_MOE_SVE_FIRST_PANEL_PREFETCH", "1")
+    candidate = fused_moe_bf16_tiled(
+        hidden,
+        packed,
+        topk_weights,
+        topk_ids,
+        num_threads=1,
+        silu_poly_degree=degree,
+    )
+    torch.testing.assert_close(candidate.float(), reference.float(), atol=0, rtol=0)
+
+
+def test_sve_first_panel_prefetch_rejects_bulk_m(monkeypatch: pytest.MonkeyPatch) -> None:
+    if "arm_sve_bf16" not in available_fused_moe_bf16_tiled_backends():
+        pytest.skip("requires an SVE BF16 build/runtime")
+    monkeypatch.setenv("FUSED_CPP_MOE_SVE", "1")
+    monkeypatch.setenv("FUSED_CPP_MOE_SVE_IMPL", "jit")
+    monkeypatch.setenv("FUSED_CPP_MOE_SVE_FIRST_PANEL_PREFETCH", "1")
+    monkeypatch.setenv("FUSED_CPP_MOE_SVE_JIT_BULK_M", "1")
+
+    generator = torch.Generator().manual_seed(20260722)
+    w13 = _bf16_normal((1, 64, 64), generator=generator, std=0.01)
+    w2 = _bf16_normal((1, 64, 32), generator=generator, std=0.01)
+    with pytest.raises(RuntimeError, match="first-panel prefetch conflicts"):
+        prepare_fused_moe_bf16_tiled_weights(w13, w2, fuse_silu=True, backend="sve")
+
+
 def test_sve_xbyak_strict_mode_rejects_kc_fallback() -> None:
     """Auto may use static Kc, while strict JIT must expose the unsupported mode."""
     if "arm_sve_bf16" not in available_fused_moe_bf16_tiled_backends():
@@ -829,6 +912,93 @@ def test_sve_w2_direct_route_store_matches_scatter(
         trace = trace_path.read_text()
         assert "stage=w2_direct_route" in trace
         assert "stage=scatter_route_out" not in trace
+
+
+def test_async_short_pool_matches_fixed_dag(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Release 4T long intervals as 2T dynamic short-expert groups."""
+    monkeypatch.setenv("FUSED_CPP_MOE_SVE", "1")
+    monkeypatch.setenv("FUSED_CPP_MOE_W13_SPLIT_N", "1")
+    monkeypatch.setenv("FUSED_CPP_MOE_W2_BF16_ROUTE", "1")
+    monkeypatch.setenv("FUSED_CPP_MOE_SVE_W2_DIRECT_ROUTE", "1")
+    monkeypatch.setenv("FUSED_CPP_MOE_ASYNC_READY_TOKEN_MERGE", "0")
+
+    threads = 8
+    affinity = sorted(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else list(range(threads))
+    if len(affinity) < threads:
+        pytest.skip(f"requires {threads} available CPUs")
+
+    generator = torch.Generator().manual_seed(20260722)
+    route_counts = [24, 24, *([2] * 8)]
+    num_experts = len(route_counts)
+    num_tokens = sum(route_counts)
+    hidden_size = 64
+    ffn_hidden_size = 32
+    hidden_states = _bf16_normal((num_tokens, hidden_size), generator=generator, std=0.01)
+    w13_weight = _bf16_normal(
+        (num_experts, 2 * ffn_hidden_size, hidden_size),
+        generator=generator,
+        std=0.01,
+    )
+    w2_weight = _bf16_normal(
+        (num_experts, hidden_size, ffn_hidden_size),
+        generator=generator,
+        std=0.01,
+    )
+    topk_ids = torch.cat(
+        [torch.full((count,), expert, dtype=torch.int32) for expert, count in enumerate(route_counts)]
+    ).reshape(num_tokens, 1)
+    topk_weights = torch.ones((num_tokens, 1), dtype=torch.float32)
+    packed = prepare_fused_moe_bf16_tiled_weights(w13_weight, w2_weight, fuse_silu=True)
+    if packed.gemm_backend != 1:
+        pytest.skip("requires an SVE BF16 build/runtime")
+
+    expert_ids = torch.arange(num_experts, dtype=torch.int32)
+    task_core_begins = torch.tensor([0, 4, *([0, 4] * 4)], dtype=torch.int32)
+    task_threads = torch.full((num_experts,), 4, dtype=torch.int32)
+    dep_offsets = [0]
+    deps: list[int] = []
+    previous_by_lane = [0, 1]
+    for task_id in range(num_experts):
+        if task_id >= 2:
+            lane = (task_id - 2) % 2
+            deps.append(previous_by_lane[lane])
+            previous_by_lane[lane] = task_id
+        dep_offsets.append(len(deps))
+    thread_cpu_ids = torch.tensor(affinity[:threads], dtype=torch.int32)
+
+    def run() -> torch.Tensor:
+        return fused_moe_bf16_tiled_async(
+            hidden_states,
+            packed,
+            topk_weights,
+            topk_ids,
+            expert_ids,
+            task_core_begins,
+            task_threads,
+            torch.tensor(dep_offsets, dtype=torch.int32),
+            torch.tensor(deps, dtype=torch.int32),
+            thread_cpu_ids=thread_cpu_ids,
+            num_threads=threads,
+        )
+
+    monkeypatch.setenv("FUSED_CPP_MOE_ASYNC_SHORT_POOL_THREADS", "0")
+    reference = run()
+    monkeypatch.setenv("FUSED_CPP_MOE_ASYNC_SHORT_POOL_THREADS", "2")
+    monkeypatch.setenv("FUSED_CPP_MOE_ASYNC_SHORT_POOL_MAX_ROWS", "2")
+    for _ in range(3):
+        candidate = run()
+        torch.testing.assert_close(candidate.float(), reference.float(), atol=0, rtol=0)
+
+    trace_path = tmp_path / "async_short_pool.log"
+    monkeypatch.setenv("FUSED_CPP_MOE_TRACE", "1")
+    monkeypatch.setenv("FUSED_CPP_MOE_TRACE_FILE", str(trace_path))
+    traced = run()
+    monkeypatch.setenv("FUSED_CPP_MOE_TRACE", "0")
+    torch.testing.assert_close(traced.float(), reference.float(), atol=0, rtol=0)
+    assert "strategy=external_plan_async_short_pool" in trace_path.read_text()
 
 
 @pytest.mark.parametrize("w2_bf16_route", [False, True], ids=["fp32-route", "bf16-route"])

@@ -7,6 +7,8 @@
 
 #if defined(__aarch64__) && defined(__linux__)
 #include <asm/hwcap.h>
+#include <linux/prctl.h>
+#include <sys/prctl.h>
 #include <sys/auxv.h>
 #endif
 
@@ -187,6 +189,33 @@ std::vector<std::string> available_backend_names() {
     names.emplace_back(kArmSveBackend.name);
   }
   return names;
+}
+
+void validate_sve_vector_length_at_import() {
+#if defined(FUSED_CPP_MOE_HAS_ARM_SVE) && defined(__aarch64__) && defined(__linux__)
+  if ((getauxval(AT_HWCAP) & HWCAP_SVE) == 0) {
+    return;
+  }
+#ifndef PR_SVE_GET_VL
+#define PR_SVE_GET_VL 51
+#endif
+#ifndef PR_SVE_VL_LEN_MASK
+#define PR_SVE_VL_LEN_MASK 0xffff
+#endif
+  const int runtime_vl = prctl(PR_SVE_GET_VL);
+  if (runtime_vl < 0) {
+    throw std::runtime_error("failed to query the runtime SVE vector length with PR_SVE_GET_VL");
+  }
+  const int runtime_bytes = runtime_vl & PR_SVE_VL_LEN_MASK;
+  constexpr int compiled_bytes = FUSED_CPP_MOE_SVE_VECTOR_BITS / 8;
+  if (runtime_bytes != compiled_bytes) {
+    throw std::runtime_error("SVE vector length mismatch: fused_cpp._moe_C was built for " +
+                             std::to_string(FUSED_CPP_MOE_SVE_VECTOR_BITS) + " bits, but the importing thread uses " +
+                             std::to_string(runtime_bytes * 8) +
+                             " bits; rebuild with FUSED_CPP_SVE_VECTOR_BITS=" +
+                             std::to_string(runtime_bytes * 8));
+  }
+#endif
 }
 
 }  // namespace fused_cpp::moe
