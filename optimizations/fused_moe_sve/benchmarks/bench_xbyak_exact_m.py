@@ -24,10 +24,12 @@ from fused_cpp.moe import (  # noqa: E402
 
 
 VARIANT_ENV = {
-    "asm": ("asm", "0"),
-    "jit": ("jit", "0"),
-    "jit-panel": ("jit", "0"),
-    "jit-bulk": ("jit", "1"),
+    "asm": ("asm", "0", "0", "0"),
+    "jit": ("jit", "0", "0", "0"),
+    "jit-panel": ("jit", "0", "0", "0"),
+    "jit-prefetch": ("jit", "0", "1", "0"),
+    "jit-prefetch-all": ("jit", "0", "0", "1"),
+    "jit-bulk": ("jit", "1", "0", "0"),
 }
 
 
@@ -51,9 +53,11 @@ def parse_variant_list(value: str) -> tuple[str, ...]:
 
 
 def select_variant(variant: str) -> None:
-    implementation, bulk_m = VARIANT_ENV[variant]
+    implementation, bulk_m, w13_prefetch, all_gemm_prefetch = VARIANT_ENV[variant]
     os.environ["FUSED_CPP_MOE_SVE_IMPL"] = implementation
     os.environ["FUSED_CPP_MOE_SVE_JIT_BULK_M"] = bulk_m
+    os.environ["FUSED_CPP_MOE_SVE_W13_FIRST_PANEL_PREFETCH"] = w13_prefetch
+    os.environ["FUSED_CPP_MOE_SVE_FIRST_PANEL_PREFETCH"] = all_gemm_prefetch
 
 
 def parse_args() -> argparse.Namespace:
@@ -64,12 +68,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--intermediate", type=int, default=512)
     parser.add_argument("--experts", type=int, default=64)
     parser.add_argument("--measurement-experts", type=int, default=8)
+    parser.add_argument(
+        "--experts-per-wave",
+        type=int,
+        default=1,
+        help="experts run concurrently; --threads remains the thread count per expert",
+    )
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--runs", type=int, default=15)
     parser.add_argument(
         "--variants",
         default="asm,jit",
-        help="comma-separated subset of asm,jit,jit-panel,jit-bulk; first variant is the timing baseline",
+        help=(
+            "comma-separated subset of asm,jit,jit-panel,jit-prefetch,jit-prefetch-all,jit-bulk; "
+            "first variant is the timing baseline"
+        ),
     )
     parser.add_argument(
         "--switch-period",
@@ -103,6 +116,7 @@ def main() -> int:
         args.intermediate,
         args.experts,
         args.measurement_experts,
+        args.experts_per_wave,
         args.runs,
         args.switch_period,
     ) <= 0:
@@ -111,8 +125,11 @@ def main() -> int:
         raise ValueError("warmup must be non-negative")
     if args.experts < 2 * args.measurement_experts:
         raise ValueError("experts must provide at least two disjoint measurement windows")
-    if max(thread_values) > len(affinity):
-        raise ValueError(f"threads exceed available affinity: {max(thread_values)} > {len(affinity)}")
+    if args.measurement_experts % args.experts_per_wave != 0:
+        raise ValueError("measurement-experts must be divisible by experts-per-wave")
+    max_total_threads = max(thread_values) * args.experts_per_wave
+    if max_total_threads > len(affinity):
+        raise ValueError(f"total threads exceed available affinity: {max_total_threads} > {len(affinity)}")
 
     torch.set_num_threads(1)
     os.environ["FUSED_CPP_MOE_SVE"] = "1"
@@ -135,10 +152,16 @@ def main() -> int:
     for routes in routes_values:
         hidden = bf16_normal((routes * args.measurement_experts, args.hidden), generator)
         weights = torch.ones((routes * args.measurement_experts, 1), dtype=torch.float32)
-        wave_offsets = torch.arange(args.measurement_experts + 1, dtype=torch.int32)
+        wave_offsets = torch.arange(
+            0,
+            args.measurement_experts + 1,
+            args.experts_per_wave,
+            dtype=torch.int32,
+        )
 
         for threads in thread_values:
-            thread_cpu_ids = torch.tensor(affinity[:threads], dtype=torch.int32)
+            total_threads = threads * args.experts_per_wave
+            thread_cpu_ids = torch.tensor(affinity[:total_threads], dtype=torch.int32)
             team_threads = torch.full((args.measurement_experts,), threads, dtype=torch.int32)
             calls = []
             for window in range(2):
@@ -163,7 +186,7 @@ def main() -> int:
                         expert_ids,
                         team_threads,
                         thread_cpu_ids=thread_cpu_ids,
-                        num_threads=threads,
+                        num_threads=total_threads,
                         global_num_experts=args.experts,
                         skip_weighted=True,
                     )
@@ -213,6 +236,8 @@ def main() -> int:
             record = {
                 "routes": routes,
                 "threads": threads,
+                "total_threads": total_threads,
+                "experts_per_wave": args.experts_per_wave,
                 "measurement_experts": args.measurement_experts,
                 "baseline_variant": baseline,
                 "median_ns": {variant: int(value) for variant, value in medians.items()},
@@ -238,7 +263,11 @@ def main() -> int:
             records.append(record)
             timings = " ".join(f"{variant}={medians[variant] / 1e6:8.3f} ms" for variant in variants)
             relative = " ".join(f"{variant}={gains[variant]:+6.2f}%" for variant in variants[1:])
-            print(f"M={routes:<4} T={threads:<3} {timings} gains[{baseline}] {relative}")
+            print(
+                f"M={routes:<4} E/wave={args.experts_per_wave:<3} "
+                f"T/expert={threads:<3} total_T={total_threads:<3} "
+                f"{timings} gains[{baseline}] {relative}"
+            )
 
     payload = {
         "schema_version": 1,
@@ -248,6 +277,7 @@ def main() -> int:
             "intermediate": args.intermediate,
             "experts": args.experts,
             "measurement_experts": args.measurement_experts,
+            "experts_per_wave": args.experts_per_wave,
         },
         "affinity": affinity,
         "warmup": args.warmup,

@@ -11,7 +11,8 @@ LDFLAGS += -pthread
 
 TARGETS := bench_elastic_nsplit bench_unfused_pipeline bench_single_core_weight_window \
 	bench_fragmented_route_pipeline bench_m12_llc_pollution bench_route_merge_tree
-EXPERIMENTAL_TARGETS := bench_mn_split bench_m12_streaming_b bench_msmall_kblock
+EXPERIMENTAL_TARGETS := bench_mn_split bench_m12_streaming_b bench_msmall_kblock \
+	bench_single_core_sve_read
 ELASTIC_SOURCES := bench_elastic_nsplit.cpp $(FEATURES)/elastic_nsplit.cpp \
 	$(ROOT)/csrc/moe/arm/sve_bf16/kernels.S
 MN_SPLIT_SOURCES := bench_mn_split.cpp $(FEATURES)/elastic_nsplit.cpp \
@@ -30,6 +31,7 @@ M12_STREAMING_B_SOURCES := bench_m12_streaming_b.cpp m12_streaming_b_kernels.S \
 	$(ROOT)/csrc/moe/arm/sve_bf16/kernels.S
 MSMALL_KBLOCK_SOURCES := bench_msmall_kblock.cpp msmall_kblock_kernels.S \
 	$(ROOT)/csrc/moe/arm/sve_bf16/kernels.S
+SINGLE_CORE_SVE_READ_SOURCES := bench_single_core_sve_read.cpp
 
 .PHONY: all check check-mn-split check-m12-streaming-b check-m12-kblock check-msmall-kblock clean
 
@@ -64,6 +66,9 @@ bench_m12_streaming_b: $(M12_STREAMING_B_SOURCES) $(I8GEMM)/gemm_params.h
 
 bench_msmall_kblock: $(MSMALL_KBLOCK_SOURCES) $(I8GEMM)/gemm_params.h
 	$(CXX) $(CXXFLAGS) $(MSMALL_KBLOCK_SOURCES) $(LDFLAGS) -o $@
+
+bench_single_core_sve_read: $(SINGLE_CORE_SVE_READ_SOURCES)
+	$(CXX) $(CXXFLAGS) $(SINGLE_CORE_SVE_READ_SOURCES) $(LDFLAGS) -o $@
 
 check: $(TARGETS)
 	./bench_elastic_nsplit --stage w13 --m 120 --k 64 --n 64 --threads 4 \

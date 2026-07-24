@@ -2,7 +2,7 @@
 
 > 状态：调度问题定义的 source of truth。
 >
-> 最后更新：2026-07-22。
+> 最后更新：2026-07-23。
 >
 > 修改 planner 的决策变量、目标函数、硬约束、性能响应、线程宽度集合、调度语义、
 > rank 耦合方式或剪枝策略时，必须同步更新本文档及末尾变更记录。
@@ -1221,6 +1221,61 @@ planner/cost-model 的受控比较；真实有效性仍由 captured routing trac
 不得把 synthetic preset 当作真实 router 概率模型。此次扩展不改变
 $I_i(t)$、$D_i(\mathcal Z)$、目标函数、线程宽度集合或 production 剪枝。
 
+### 9.9 单核 packed-B service ceiling 与 exact-M 效率
+
+2026-07-23 在 Neoverse-V3 NUMA0 CPU 48 上补充 H4096/F512、单 expert、
+单线程的冷权重校准。standalone reader 只执行 8-way-unrolled SVE `LD1H`，
+不执行 BFMMLA、epilogue 或输出写回；768 MiB 连续读取的两轮中位数为
+41.250/41.223 GB/s，64 份 12 MiB chunk 乱序轮换为 40.051/40.035 GB/s。
+后者与每个 expert 的 W13 8 MiB + W2 4 MiB packed-B 粒度一致，因此定义本机
+单核 production-like service ceiling：
+
+$$
+\beta_{B,1}^{\mathrm{V3}}=40.04\ \mathrm{GB/s}.
+$$
+
+该值是 CPU 侧 effective packed-B read ceiling，不是 uncore PMU 的 DRAM
+controller byte rate。单核 kernel 的访存效率统一定义为
+
+$$
+\eta_{\mathrm{mem}}(M)
+=\frac{6HF/T_{\mathrm{W13+W2}}(M)}
+       {\beta_{B,1}^{\mathrm{V3}}},
+$$
+
+其中分子按每个 expert 12 MiB packed weights 只扫描一次计算。计算侧同时保留
+三个不可互换的量：
+
+$$
+m_c=2\left\lceil\frac M2\right\rceil,\qquad
+\eta_{\mathrm{lane}}=\frac M{m_c},
+$$
+
+$$
+\eta_{\mathrm{compute,useful}}
+=\frac{6MHF/T_{\mathrm{W13+W2}}}{403.8\ \mathrm{GFLOP/s}},\qquad
+\eta_{\mathrm{issue}}
+=\frac{6m_cHF/T_{\mathrm{W13+W2}}}{403.8\ \mathrm{GFLOP/s}}.
+$$
+
+64 份不同 expert 权重轮换、每 M 192 个样本的代表点为：
+
+| M | GEMM stage | $\eta_{\mathrm{lane}}$ | useful GFLOP/s | $\eta_{\mathrm{compute,useful}}$ | $\eta_{\mathrm{issue}}$ | packed-B GB/s | $\eta_{\mathrm{mem}}$ |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 0.3472 ms | 50.0% | 36.24 | 8.97% | 17.95% | 36.239 | 90.51% |
+| 2 | 0.3447 ms | 100% | 73.00 | 18.08% | 18.08% | 36.500 | 91.16% |
+| 4 | 0.3580 ms | 100% | 140.58 | 34.81% | 34.81% | 35.144 | 87.77% |
+| 8 | 0.4336 ms | 100% | 232.16 | 57.49% | 57.49% | 29.020 | 72.48% |
+| 12 | 0.5245 ms | 100% | 287.90 | 71.30% | 71.30% | 23.992 | 59.92% |
+
+完整 M1--M12 表与复现命令位于
+`optimizations/fused_moe_sve/results/amazon_192c_single_core_m1_m12_efficiency.md`。
+相邻 odd/even M 具有相同物理 row-pair 数，因此 stage time 与
+$\eta_{\mathrm{issue}}$ 基本相同；odd M 的差异由
+$\eta_{\mathrm{lane}}$ 单独表达。40.04 GB/s ceiling 只作为后续解析模型的
+机器校准常数；本轮不修改 active planner、$I_i(t)$、$D_i(\mathcal Z)$、
+contention table 或 production 剪枝。
+
 ## 10. 同步规则
 
 发生以下任一变化时，必须同步更新本文档：
@@ -1271,3 +1326,4 @@ $I_i(t)$、$D_i(\mathcal Z)$、目标函数、线程宽度集合或 production �
 | 2026-07-17 | v0.22 | 增加 NUMA0 M12 单满波冷 packed-B 带宽校准：256 份权重窗口轮换、1--96 个 1T experts、峰值 352.1 GB/s；记录 50%/75%/90%/95% 稳健带宽所需的 12/24/64/86 线程阈值，不改变 active planner 或剪枝。 |
 | 2026-07-20 | v0.23 | production SVE compute 改为 Xbyak exact-M1--M12：定义 $m_c=2\lceil M/2\rceil$ tail mapper，profile identity 增加 implementation/tail policy，route grid 补齐 1--12；记录 V1/V3 bit-exact 与稳态性能验证；planner `auto` 只原子选择完整 variant pair，禁止 JIT 和 static bucket profile 混用。 |
 | 2026-07-22 | v0.24 | 增加论文评测用 uniform、active-set sweep、tiered hotspot 和 long-short bimodal 全局 TopK workload；补充合法 histogram 约束和验证覆盖说明，不改变 planner 可行域、cost model 或 production 剪枝。 |
+| 2026-07-23 | v0.25 | 增加 V3 单核 packed-B service ceiling 40.04 GB/s；区分 exact-M lane、useful-compute、physical-issue 和 memory efficiency，并记录冷权重 M1--M12 验证；不改变 active planner、contention table 或剪枝。 |

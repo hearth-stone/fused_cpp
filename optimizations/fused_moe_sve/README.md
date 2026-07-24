@@ -32,6 +32,20 @@ packed-C row base, regular W2 advances its row-major output, and direct-route W2
 keeps the route-output base fixed while advancing only the route-id table. The
 flag is off by default.
 
+`FUSED_CPP_MOE_SVE_W13_FIRST_PANEL_PREFETCH=1` enables the production-wiring
+experiment derived from the standalone streaming-B result below. The JIT cache
+contains prefetch and ordinary kernels for every exact M from 1 through 12.
+Within each thread-owned W13 N range, its first actual M panel uses one
+`PLDL1STRM` hint 2 KiB ahead; all subsequent panels use ordinary kernels.
+M1-M8 keep their two-bank K loop and disable hints on the final N tile. M9-M12
+disable only the final 2 KiB of hints on that tile.
+
+`FUSED_CPP_MOE_SVE_FIRST_PANEL_PREFETCH=1` applies this selection to all
+generated GEMMs. W13 keeps its L1/2 KiB policy; FP32 W2 and direct-route W2 use
+the standalone experiment's L2/1 KiB policy. The static BF16-route W2 path is
+unchanged. Both JIT-only flags are off by default and conflict with bulk-M
+because bulk-M owns the M loop inside one generated call.
+
 The A/B benchmark keeps both implementations in one process but measures
 steady blocks. After each implementation switch it executes one unmeasured
 transition call, preventing code-switch I-cache replacement from being charged
@@ -51,6 +65,28 @@ numactl --cpunodebind=0 --membind=0 taskset -c 0-95 \
   --variants jit-panel,jit-bulk --routes 24,48,192,768,2040 \
   --threads 1,4,8,16,32,64,96 --warmup 5 --runs 31 \
   --switch-period 5
+
+# Isolate first-cold-panel prefetch, then repeat at 24 concurrent 4T experts.
+numactl --cpunodebind=0 --membind=0 taskset -c 0-95 \
+  .venv/bin/python \
+  optimizations/fused_moe_sve/benchmarks/bench_xbyak_exact_m.py \
+  --variants jit-panel,jit-prefetch --routes 12,24,48,192,768,2040 \
+  --threads 1,4 --warmup 5 --runs 31 --switch-period 5
+
+numactl --cpunodebind=0 --membind=0 taskset -c 0-95 \
+  .venv/bin/python \
+  optimizations/fused_moe_sve/benchmarks/bench_xbyak_exact_m.py \
+  --variants jit-panel,jit-prefetch --routes 12,192,2040 \
+  --experts 48 --measurement-experts 24 --experts-per-wave 24 \
+  --threads 4 --warmup 5 --runs 31 --switch-period 5
+
+# Compare exact-M W13-only and all-GEMM prefetch policies.
+numactl --cpunodebind=0 --membind=0 taskset -c 0-95 \
+  .venv/bin/python \
+  optimizations/fused_moe_sve/benchmarks/bench_xbyak_exact_m.py \
+  --variants jit-panel,jit-prefetch,jit-prefetch-all \
+  --routes 1,2,3,4,5,6,7,8,9,10,11,12 --threads 1,4 \
+  --warmup 5 --runs 31 --switch-period 5
 ```
 
 With H=4096, F=512, eight distinct experts, and split-W13, the 192-core host's
@@ -65,6 +101,31 @@ The bulk-M experiment is bitwise correct but performance-neutral across the
 192-core host NUMA0 grid, so it remains opt-in. Corrected paired-window results
 are in
 [`results/amazon_192c_xbyak_bulk_m.md`](results/amazon_192c_xbyak_bulk_m.md).
+
+The exact-M extension gives the W13-only candidate median gains of about 1.93%
+at 1T and 2.10% at 4T over M1-M12 in five-process tests. Prefetching W2 adds no
+stable isolated benefit and regresses by about 7.36% relative to W13-only at
+24 concurrent 4T experts. Reusable W13 B panels also regress, reaching about
+-4.35% e2e at M48/4T. The variants therefore remain off by default. Full
+generated-code, phase, exact-M, and concurrency results are in
+[`results/amazon_192c_w13_first_panel_prefetch.md`](results/amazon_192c_w13_first_panel_prefetch.md).
+
+The NUMA0 single-core cold-weight calibration uses 64 rotating H4096/F512
+experts and a standalone SVE `LD1H` reader. The production-like 12 MiB chunk
+read ceiling is 40.04 GB/s; the M2 fused W13+W2 stages reach 36.50 GB/s
+(91.2%), while M12 reaches 23.99 GB/s as its physical BFMMLA issue efficiency
+rises to 71.3%. Exact definitions, M1-M12 tables, and reproduction commands are
+in
+[`results/amazon_192c_single_core_m1_m12_efficiency.md`](results/amazon_192c_single_core_m1_m12_efficiency.md).
+
+`bench_pure_w13_gemm_m1_m2.py` removes the fused W13 epilogue by running the
+same exact-M packed-A/B JIT K-loop with the plain FP32 GEMM store. With the
+production two-range W13 split, cold-weight M1/M2 sustain about 36.1-36.6 GB/s,
+or 90-91% of the calibrated read ceiling. This is essentially the same as the
+complete M2 W13+W2 stage, locating the remaining bandwidth gap in the GEMM
+load/compute loop rather than SiLU or pack-C. Results and the reproduction
+command are in
+[`results/amazon_192c_pure_w13_gemm_m1_m2.md`](results/amazon_192c_pure_w13_gemm_m1_m2.md).
 
 ## SVE weighted route merge
 
@@ -245,6 +306,66 @@ numactl --cpunodebind=0 --membind=0 taskset -c 0-95 \
   --distribution hot-topk --team-threads 16 \
   --warmup 3 --runs 11 --stage-timing
 ```
+
+The same benchmark accepts the paper workload catalog and a schema-v2 profile
+to compare the vLLM-style queue against the actual production planner:
+
+```bash
+P=cpu_moe_schedule_optimization/cost_model/profiles/\
+contention_async_amazon_c5_192c_dual_numa_tp4_sve_F512_E256_\
+splitw13_schema_v2_xbyak_exactm_20260720.json
+PYTHONPATH=src numactl --cpunodebind=0 --membind=0 taskset -c 0-95 \
+  .venv/bin/python \
+  optimizations/fused_moe_sve/benchmarks/bench_vllm_staged_schedule.py \
+  --preset moe256-tiered-hotspot --production-profile "$P" \
+  --route-dtype bf16 --warmup 5 --runs 21
+```
+
+For the long/short bimodal preset, `--static-16-to-4` adds a benchmark-only
+external DAG between those controls. Each `M=2040` expert keeps one 16-thread
+team; when it completes, that exact interval becomes four independent
+4-thread lanes for `M=12` experts. A free 16-thread interval starts as four
+4-thread lanes immediately. Short experts are assigned statically by the
+profile's isolated-time estimate, so this tests kernel width and team
+transition overhead without adding work stealing or changing production
+planner decisions:
+
+```bash
+PYTHONPATH=src numactl --cpunodebind=0 --membind=0 taskset -c 0-95 \
+  .venv/bin/python \
+  optimizations/fused_moe_sve/benchmarks/bench_vllm_staged_schedule.py \
+  --preset moe256-long-short-bimodal --production-profile "$P" \
+  --static-16-to-4 --route-dtype bf16 --warmup 5 --runs 21
+```
+
+On AmazonC5192Cores NUMA0, the static transition reduced the median from
+`12.390 ms` for production `6 x 16T` to `11.017 ms` and was also faster than
+the `11.631 ms` staged queue. With ready-token merge disabled, the corresponding
+medians were `12.560 ms` and `11.089 ms`, confirming that the gain comes from
+the expert DAG rather than merge overlap. This remains an experimental
+benchmark variant; the production planner still uses one static shape per
+call.
+
+`--dynamic-short-pool` keeps the production long-expert tasks but lets every
+released 4-thread group claim the next whole `M<=12` expert from one native
+global queue. It removes the static short-lane assignment while retaining
+resident pinned threads and the existing fused expert kernel:
+
+```bash
+PYTHONPATH=src numactl --cpunodebind=0 --membind=0 taskset -c 0-95 \
+  .venv/bin/python \
+  optimizations/fused_moe_sve/benchmarks/bench_vllm_staged_schedule.py \
+  --preset moe256-long-short-bimodal --production-profile "$P" \
+  --static-16-to-4 --dynamic-short-pool --route-dtype bf16 \
+  --warmup 5 --runs 21
+```
+
+On the same NUMA node, the dynamic pool measured `10.697 ms` and
+`14.455 TFLOP/s`, 16.29% faster than production, 3.12% faster than the static
+transition, and 8.95% faster than vLLM staged. With ready-token merge disabled,
+it measured `10.803 ms`, retaining a 16.07% speedup over production. This is
+still a benchmark-only, default-off executor action; the production planner
+does not yet select a long-team-to-short-pool transition.
 
 On the 192-core host's first NUMA node, six balanced `M=2048` experts were
 13.1% slower with the staged queue than with fixed `6 x 16T` teams. For 256
