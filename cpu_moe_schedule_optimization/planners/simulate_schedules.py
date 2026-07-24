@@ -15,7 +15,7 @@ Usage:
   python simulate_schedules.py PROFILE.json --experts 512,512,512,512
   python simulate_schedules.py PROFILE.json --preset hotspot
   python simulate_schedules.py PROFILE.json --preset dsv4-real-2048-seq70
-  python simulate_schedules.py PROFILE.json --preset decode --cores 8 --shapes
+  python simulate_schedules.py PROFILE.json --preset decode-many-small --cores 8 --shapes
 """
 
 from __future__ import annotations
@@ -38,7 +38,6 @@ PRESETS: Dict[str, Experts] = {
     "hotspot": [(0, 1536), (1, 256), (2, 128), (3, 64), (4, 64)],
     "one-dominant": [(0, 2048), (1, 64), (2, 64)],
     "decode-many-small": [(i, 8) for i in range(16)],
-    "moe256-uniform": [(i, 48) for i in range(256)],
 }
 PRESETS.update({name: workload.experts for name, workload in default_offline_workloads().items()})
 

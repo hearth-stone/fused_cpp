@@ -11,6 +11,10 @@ from typing import Any
 
 WORKLOAD_DIR = Path(__file__).with_name("workloads")
 DSV4_REAL_2048_PATH = WORKLOAD_DIR / "deepseek_v4_flash_2048_seq70.json"
+PAPER_TOKENS = 2048
+PAPER_TOP_K = 6
+PAPER_NUM_EXPERTS = 256
+PAPER_ACTIVE_SET_SIZES = (8, 16, 32, 64, 128)
 
 
 @dataclass(frozen=True)
@@ -32,6 +36,107 @@ class RoutingWorkload:
     @property
     def routes(self) -> int:
         return sum(self.histogram)
+
+
+def _synthetic_workload(
+    name: str,
+    family: str,
+    histogram: list[int],
+    parameters: dict[str, Any],
+) -> RoutingWorkload:
+    if len(histogram) != PAPER_NUM_EXPERTS:
+        raise ValueError(f"{name} must contain {PAPER_NUM_EXPERTS} experts")
+    if any(not isinstance(routes, int) or routes < 0 for routes in histogram):
+        raise ValueError(f"{name} contains an invalid route count")
+
+    expected_routes = PAPER_TOKENS * PAPER_TOP_K
+    if sum(histogram) != expected_routes:
+        raise ValueError(f"{name} routes must equal tokens * top_k")
+
+    active = [routes for routes in histogram if routes > 0]
+    if len(active) < PAPER_TOP_K:
+        raise ValueError(f"{name} must activate at least top_k experts")
+    if max(active) > PAPER_TOKENS:
+        raise ValueError(f"{name} routes per expert cannot exceed tokens")
+
+    mean = sum(active) / len(active)
+    population_std = math.sqrt(sum((routes - mean) ** 2 for routes in active) / len(active))
+    return RoutingWorkload(
+        name=name,
+        source={
+            "kind": "synthetic",
+            "family": family,
+            "parameters": parameters,
+        },
+        tokens=PAPER_TOKENS,
+        top_k=PAPER_TOP_K,
+        num_experts=PAPER_NUM_EXPERTS,
+        observed_active_experts=len(active),
+        observed_routes_std=population_std,
+        histogram=tuple(histogram),
+        tail_reconstructed=False,
+    )
+
+
+def _uniform_active_set(active_experts: int) -> list[int]:
+    total_routes = PAPER_TOKENS * PAPER_TOP_K
+    if not PAPER_TOP_K <= active_experts <= PAPER_NUM_EXPERTS:
+        raise ValueError("active_experts must be in [top_k, num_experts]")
+    if total_routes % active_experts:
+        raise ValueError("uniform active set must divide the total route count")
+    routes_per_expert = total_routes // active_experts
+    if routes_per_expert > PAPER_TOKENS:
+        raise ValueError("uniform active set exceeds the per-expert route bound")
+    return [routes_per_expert] * active_experts + [0] * (PAPER_NUM_EXPERTS - active_experts)
+
+
+def synthetic_offline_workloads() -> dict[str, RoutingWorkload]:
+    """Return deterministic paper workloads at 2048 tokens, TopK=6, E=256."""
+    workloads: dict[str, RoutingWorkload] = {}
+
+    uniform = _synthetic_workload(
+        "moe256-uniform",
+        "uniform",
+        _uniform_active_set(PAPER_NUM_EXPERTS),
+        {"active_experts": PAPER_NUM_EXPERTS},
+    )
+    workloads[uniform.name] = uniform
+
+    for active_experts in PAPER_ACTIVE_SET_SIZES:
+        workload = _synthetic_workload(
+            f"moe256-active-set-{active_experts}",
+            "active_set_uniform",
+            _uniform_active_set(active_experts),
+            {"active_experts": active_experts},
+        )
+        workloads[workload.name] = workload
+
+    tiered_hotspot = _synthetic_workload(
+        "moe256-tiered-hotspot",
+        "tiered_hotspot",
+        [768] * 4 + [384] * 12 + [96] * 48 + [0] * 192,
+        {
+            "tiers": [
+                {"experts": 4, "routes": 768},
+                {"experts": 12, "routes": 384},
+                {"experts": 48, "routes": 96},
+            ],
+        },
+    )
+    workloads[tiered_hotspot.name] = tiered_hotspot
+
+    long_short_bimodal = _synthetic_workload(
+        "moe256-long-short-bimodal",
+        "long_short_bimodal",
+        [2040] * 5 + [12] * 174 + [0] * 77,
+        {
+            "long": {"experts": 5, "routes": 2040},
+            "short": {"experts": 174, "routes": 12},
+        },
+    )
+    workloads[long_short_bimodal.name] = long_short_bimodal
+
+    return workloads
 
 
 def _reconstruct_tail(
@@ -162,5 +267,9 @@ def load_routing_workload(path: Path = DSV4_REAL_2048_PATH) -> RoutingWorkload:
 
 
 def default_offline_workloads() -> dict[str, RoutingWorkload]:
+    workloads = synthetic_offline_workloads()
     real_routing = load_routing_workload()
-    return {real_routing.name: real_routing}
+    if real_routing.name in workloads:
+        raise ValueError(f"duplicate routing workload: {real_routing.name}")
+    workloads[real_routing.name] = real_routing
+    return workloads

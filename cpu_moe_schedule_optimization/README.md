@@ -165,6 +165,27 @@ python cpu_moe_schedule_optimization/planners/simulate_schedules.py $P --preset 
 python cpu_moe_schedule_optimization/planners/simulate_schedules.py $P --experts 512,512,512,512 --shapes
 ```
 
+面向调度评测的固定全局 TopK workload 使用 `2048 tokens / topk=6 /
+256 experts`，因此每个 workload 都有 12288 routes：
+
+| Preset | Route histogram |
+| --- | --- |
+| `moe256-uniform` | `256x48`；全 expert 均匀基线，也是 active-set sweep 的 256 endpoint。 |
+| `moe256-active-set-{8,16,32,64,128}` | 固定总 routes，分别为 `8x1536`、`16x768`、`32x384`、`64x192`、`128x96`。 |
+| `moe256-tiered-hotspot` | `4x768 + 12x384 + 48x96`；分层 hot/warm/cold workload。 |
+| `moe256-long-short-bimodal` | `5x2040 + 174x12`；长 route 与 M12 短 route 共存。 |
+
+active-set sweep 可以直接运行：
+
+```bash
+for A in 8 16 32 64 128; do
+  python cpu_moe_schedule_optimization/planners/simulate_schedules.py \
+    "$P" --preset "moe256-active-set-$A"
+done
+python cpu_moe_schedule_optimization/planners/simulate_schedules.py \
+  "$P" --preset moe256-uniform
+```
+
 打分使用验证过的 `ContentionCostModel.dag_makespan`（事件驱动 + 争用 derate + overhead-split）。
 `dsv4-real-2048-seq70` 固化了 DeepSeek V4 Flash profiler 的
 `rank0/seq70/layer27` 路由摘要。捕获文件只保留 top-16 的精确计数，因此

@@ -2,7 +2,7 @@
 
 > 状态：调度问题定义的 source of truth。
 >
-> 最后更新：2026-07-20。
+> 最后更新：2026-07-22。
 >
 > 修改 planner 的决策变量、目标函数、硬约束、性能响应、线程宽度集合、调度语义、
 > rank 耦合方式或剪枝策略时，必须同步更新本文档及末尾变更记录。
@@ -36,6 +36,19 @@ $$
 全部 256 个 expert；rank-local 调度时，$\mathcal X$ 替换为分配到该 rank 的
 expert 子集。复杂度分析将 $E$ 视为可变输入规模；固定的单个 256-expert 实例
 本身不构成渐近复杂度问题。
+
+若输入是由 $T$ 个 token、无重复 expert 的 TopK router 产生的全局 histogram，
+则还满足：
+
+$$
+\sum_{i=1}^{E}M_i=T K,\qquad
+0\le M_i\le T,\qquad
+|\{i\mid M_i>0\}|\ge K.
+$$
+
+rank-local histogram 只包含 dispatch 到该 rank 的 routes，因此其 route 总和
+不必等于 $TK$；但每个 local expert 仍满足 $M_i\le T$。下文核心调度问题同时
+允许全局和 rank-local 输入，不把 $TK$ 等式作为 planner API 的额外硬约束。
 
 路由完成后，expert $i$ 得到 route tensor：
 
@@ -625,6 +638,7 @@ One-hot 是线程宽度的等价求解器编码，不是剪枝。一般 active-s
 | Assignment | 任意 expert-to-resource 调度 | 按 isolated cost 的 LPT | 启发式分配 |
 | Ordering | 任意可行开始时间和顺序 | 每个 lane 的 LPT 顺序 | 顺序剪枝 |
 | Idling | 允许主动等待以避开争用 | lane 可启动下一个 expert 时立即启动；ready-token 路径仅填充无可运行 expert 的空闲 lane | non-idling 剪枝 |
+| Workload 输入 | 任意合法 global 或 rank-local route histogram | planner 接受任意 histogram；catalog preset 只扩展验证覆盖，不过滤运行时输入 | 不剪枝 |
 | Route combine | 任意满足 TopK release 约束和 CPU 容量的 merge 排程 | planner 不搜索 combine；默认 executor 采用 expert-first 单 token 贪心和连续收尾 | 外层启发式限制 |
 | Kernel variant | 任意未被支配的实现 | `auto` 原子选择完整 `jit/xbyak_exact_m` split/no-split pair，缺表时整体回退完整 static pair；packed-B byte-window 仅显式实验 | 实例候选限制 |
 | Isolated time | 真实 $I_i(t)$ | active $T_{\mathrm{iso}}$ 经验公式；分层 GEMM model 仅 shadow | cost 近似，不剪枝可行域 |
@@ -1189,6 +1203,24 @@ F512/E8 每个 policy 含 80 个 isolated 点和 68 个 contention 点；192-cor
 route grid 均直接覆盖 1--12，split pair 的 source/binary hash、Xbyak commit、
 线程和 shape 网格一致，并由 catalog 回归测试验证。
 
+### 9.8 调度论文输入分布
+
+固定的 synthetic validation catalog 使用 $T=2048$、$K=6$、$E=256$，因此
+$\sum_iM_i=12288$。它覆盖四类互补输入：
+
+| Family | Histogram | 控制变量 |
+| --- | --- | --- |
+| uniform | `256x48` | 理论均匀基线 |
+| active-set sweep | `8x1536`、`16x768`、`32x384`、`64x192`、`128x96`、`256x48` | 固定 routes，改变活跃权重工作集和单 expert route |
+| tiered hotspot | `4x768 + 12x384 + 48x96` | hot/warm/cold 三层负载 |
+| long-short bimodal | `5x2040 + 174x12` | 长 route compute 与 M12 冷权重流量并存 |
+
+所有 synthetic histogram 都满足 2.1 节的全局 TopK 约束。active-set 的 256
+endpoint 与 uniform 共用 `moe256-uniform`，避免重复 workload。它们只用于
+planner/cost-model 的受控比较；真实有效性仍由 captured routing trace 验证，
+不得把 synthetic preset 当作真实 router 概率模型。此次扩展不改变
+$I_i(t)$、$D_i(\mathcal Z)$、目标函数、线程宽度集合或 production 剪枝。
+
 ## 10. 同步规则
 
 发生以下任一变化时，必须同步更新本文档：
@@ -1238,3 +1270,4 @@ route grid 均直接覆盖 1--12，split pair 的 source/binary hash、Xbyak com
 | 2026-07-17 | v0.21 | 将双 NUMA TP4/F512 split-W13 校准扩展到真实 256 local experts，补齐 `96x1T` 等形状；记录 M=12 的 `24x4T`/`48x2T`/`96x1T` 宽平台，并禁止将 E64 full-call 排序外推到 256-expert TP4。 |
 | 2026-07-17 | v0.22 | 增加 NUMA0 M12 单满波冷 packed-B 带宽校准：256 份权重窗口轮换、1--96 个 1T experts、峰值 352.1 GB/s；记录 50%/75%/90%/95% 稳健带宽所需的 12/24/64/86 线程阈值，不改变 active planner 或剪枝。 |
 | 2026-07-20 | v0.23 | production SVE compute 改为 Xbyak exact-M1--M12：定义 $m_c=2\lceil M/2\rceil$ tail mapper，profile identity 增加 implementation/tail policy，route grid 补齐 1--12；记录 V1/V3 bit-exact 与稳态性能验证；planner `auto` 只原子选择完整 variant pair，禁止 JIT 和 static bucket profile 混用。 |
+| 2026-07-22 | v0.24 | 增加论文评测用 uniform、active-set sweep、tiered hotspot 和 long-short bimodal 全局 TopK workload；补充合法 histogram 约束和验证覆盖说明，不改变 planner 可行域、cost model 或 production 剪枝。 |
