@@ -10,6 +10,14 @@ M8/M12 schedules. The upstream ILV comparison did not change production
 dispatch, so it does not by itself require a cost-table refresh. The active
 priority order is:
 
+Overall conclusion: the ARM main path is now substantially complete. SVE JIT
+exact-M kernels, the double-buffered K-loop, direct FP32 route stores, weighted
+merge, the dynamic short-expert pool, the native cold planner, and stage-window
+cost modeling have all landed. The next phase should not accumulate isolated
+micro-optimizations. It should close the remaining high-value variables first,
+then refresh the calibration data and cost model once and validate them as a
+coherent system.
+
 1. Produce independent thin analytical calibrations on AmazonECS8Cores and one
    NUMA rank of AmazonC5192Cores.
 2. Validate unseen routes, widths, mixed distributions, split policy, and
