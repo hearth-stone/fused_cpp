@@ -170,11 +170,21 @@ results on `AmazonC8i2Cores` for isolated microkernel changes.
   14.6%/9.6%, while eight-worker teams fall back to the old kernel after
   forced controls exposed bandwidth-saturated regressions. See
   [`results/amazon_c8i_8core_avx512_small_m_multi_n_20260726.md`](results/amazon_c8i_8core_avx512_small_m_multi_n_20260726.md).
-- [ ] **Bulk-M generated loop:** move adjacent full M12 panels inside one JIT
+- [x] **Bulk-M generated loop:** move adjacent full M12 panels inside one JIT
   body/cache window so they share the call frame, invariant setup, and address
   generation. Preserve the current exact-M1--11 tail specializations and
   compare separately at small K and the production H/F dimensions, where call
-  overhead may have very different importance.
+  overhead may have very different importance. **2026-07-26:** W13 and W2 now
+  generate an N-block outer loop plus an M12-panel inner loop, with one
+  prologue/epilogue per cache window; exact M1--11 and N tails still use the
+  established kernels. Forced W13/W2/combined modes passed all 269 AVX-512
+  tests. On C8i8, conventional H4096/F512 was within -0.2% to +0.2% through
+  M256 and improved 0.1% at M2048. Short-K H64/F2048 improved about 0.2%--0.5%
+  at useful M, entirely from W13; W2 remained neutral. Automatic mode is
+  therefore restricted to C8i W13 with H<=64, F>=1024, M>=48, and at most
+  four cooperative workers. Explicit `baseline/w13/w2/bulk_mn` controls keep
+  the broader experiment reproducible. See
+  [`results/amazon_c8i_8core_avx512_bulk_mn_20260726.md`](results/amazon_c8i_8core_avx512_bulk_mn_20260726.md).
 - [ ] **K-loop scheduling and prefetch:** test deeper K unrolling, independent
   accumulation chains where register pressure permits, and explicit packed-B
   prefetch distance. Use instruction/cache counters to distinguish useful

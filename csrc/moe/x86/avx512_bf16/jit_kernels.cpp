@@ -29,6 +29,7 @@ namespace {
 
 enum class ImplementationMode { kAuto, kJit, kIntrinsic };
 enum class SmallMMultiNMode { kAuto, kBaseline, kW13, kW2, kMultiN };
+enum class BulkMNMode { kAuto, kBaseline, kW13, kW2, kBulkMN };
 
 ImplementationMode GetImplementationMode() {
   const char* raw = std::getenv("FUSED_CPP_MOE_AVX512_IMPL");
@@ -65,6 +66,28 @@ SmallMMultiNMode GetSmallMMultiNMode() {
   }
   throw std::runtime_error("FUSED_CPP_MOE_AVX512_SMALL_M_MULTI_N must be auto, baseline, w13, w2, or multi_n; got '" +
                            value + "'");
+}
+
+BulkMNMode GetBulkMNMode() {
+  const char* raw = std::getenv("FUSED_CPP_MOE_AVX512_BULK_MN");
+  const std::string value = raw == nullptr ? "auto" : raw;
+  if (value.empty() || value == "auto") {
+    return BulkMNMode::kAuto;
+  }
+  if (value == "baseline") {
+    return BulkMNMode::kBaseline;
+  }
+  if (value == "w13") {
+    return BulkMNMode::kW13;
+  }
+  if (value == "w2") {
+    return BulkMNMode::kW2;
+  }
+  if (value == "bulk_mn") {
+    return BulkMNMode::kBulkMN;
+  }
+  throw std::runtime_error("FUSED_CPP_MOE_AVX512_BULK_MN must be auto, baseline, w13, w2, or bulk_mn; got '" + value +
+                           "'");
 }
 
 #if defined(FUSED_CPP_MOE_HAS_XBYAK) && FUSED_CPP_MOE_HAS_XBYAK
@@ -296,13 +319,14 @@ struct KernelKey {
   AmxPackedBLayout amx_b_layout = AmxPackedBLayout::kN32;
   AmxBLoadHint amx_b_load_hint = AmxBLoadHint::kTileLoadD;
   AmxKLoadPipeline amx_k_load_pipeline = AmxKLoadPipeline::kBaseline;
+  bool avx512_bulk_mn = false;
 
   bool operator<(const KernelKey& other) const {
     return std::tie(isa, operation, rows, n_valid, silu_degree, output, amx_pattern, amx_silu_epilogue, amx_w2_epilogue,
-                    amx_tile_state_mode, amx_b_layout, amx_b_load_hint, amx_k_load_pipeline) <
+                    amx_tile_state_mode, amx_b_layout, amx_b_load_hint, amx_k_load_pipeline, avx512_bulk_mn) <
            std::tie(other.isa, other.operation, other.rows, other.n_valid, other.silu_degree, other.output,
                     other.amx_pattern, other.amx_silu_epilogue, other.amx_w2_epilogue, other.amx_tile_state_mode,
-                    other.amx_b_layout, other.amx_b_load_hint, other.amx_k_load_pipeline);
+                    other.amx_b_layout, other.amx_b_load_hint, other.amx_k_load_pipeline, other.avx512_bulk_mn);
   }
 };
 
@@ -329,6 +353,9 @@ struct W13Call {
   int64_t k_pairs;
   int64_t b_block_stride_bytes;
   const SiluConstants* constants;
+  int64_t c_panel_stride_bytes;
+  int64_t m_panel_count;
+  int64_t block_count;
 };
 
 struct W2Call {
@@ -340,6 +367,9 @@ struct W2Call {
   int64_t k_pairs;
   int64_t b_block_stride_bytes;
   int64_t route_stride_bytes;
+  int64_t a_panel_stride_bytes;
+  int64_t m_panel_count;
+  int64_t block_count;
 };
 
 struct AmxW13Call {
@@ -384,12 +414,13 @@ struct KernelHandle {
 
 class W13Generator final : public Xbyak::CodeGenerator {
  public:
-  W13Generator(int rows, int degree, int feature_blocks)
+  W13Generator(int rows, int degree, int feature_blocks, bool bulk_mn)
       : Xbyak::CodeGenerator(16 * 1024, Xbyak::AutoGrow),
         rows_(rows),
         degree_(degree),
         feature_blocks_(feature_blocks),
-        accumulator_count_(rows * feature_blocks * 2) {
+        accumulator_count_(rows * feature_blocks * 2),
+        bulk_mn_(bulk_mn) {
     Generate();
     readyRE();
   }
@@ -504,28 +535,7 @@ class W13Generator final : public Xbyak::CodeGenerator {
     vdivps(gate, gate, polynomial);
   }
 
-  void Generate() {
-    const bool baseline = feature_blocks_ == 1 && rows_ >= 1 && rows_ <= 12;
-    const bool small_m_multi_n = rows_ >= 1 && rows_ <= 4 && (feature_blocks_ == 2 || feature_blocks_ == 4) &&
-                                 accumulator_count_ <= 24 && accumulator_count_ + rows_ < 32;
-    if ((!baseline && !small_m_multi_n) || (degree_ != 4 && degree_ != 5 && degree_ != 6)) {
-      throw std::invalid_argument("invalid AVX-512 W13 JIT specialization");
-    }
-
-    const int stack_bytes = (rows_ * feature_blocks_ * 32 + 63) & ~63;
-    mov(r8, ptr[rdi + static_cast<int>(offsetof(W13Call, a))]);
-    mov(r9, ptr[rdi + static_cast<int>(offsetof(W13Call, b))]);
-    mov(r10, ptr[rdi + static_cast<int>(offsetof(W13Call, c))]);
-    mov(rcx, ptr[rdi + static_cast<int>(offsetof(W13Call, k_pairs))]);
-    mov(rsi, ptr[rdi + static_cast<int>(offsetof(W13Call, constants))]);
-    if (feature_blocks_ > 1) {
-      mov(r11, ptr[rdi + static_cast<int>(offsetof(W13Call, b_block_stride_bytes))]);
-      if (feature_blocks_ == 4) {
-        lea(rdx, ptr[r11 + r11 * 2]);
-      }
-    }
-    sub(rsp, stack_bytes);
-
+  void EmitPanel() {
     for (int block = 0; block < feature_blocks_; ++block) {
       for (int row = 0; row < rows_; ++row) {
         vxorps(Accumulator(block, row, 0), Accumulator(block, row, 0), Accumulator(block, row, 0));
@@ -591,6 +601,89 @@ class W13Generator final : public Xbyak::CodeGenerator {
         }
       }
     }
+  }
+
+  void GenerateBulkMN() {
+    const int stack_bytes = (rows_ * feature_blocks_ * 32 + 63) & ~63;
+    push(rbx);
+    push(rbp);
+    push(r12);
+    push(r13);
+    push(r14);
+    push(r15);
+    mov(r12, ptr[rdi + static_cast<int>(offsetof(W13Call, a))]);
+    mov(r13, ptr[rdi + static_cast<int>(offsetof(W13Call, b))]);
+    mov(r14, ptr[rdi + static_cast<int>(offsetof(W13Call, c))]);
+    mov(r15, ptr[rdi + static_cast<int>(offsetof(W13Call, k_pairs))]);
+    mov(r11, ptr[rdi + static_cast<int>(offsetof(W13Call, b_block_stride_bytes))]);
+    mov(rsi, ptr[rdi + static_cast<int>(offsetof(W13Call, constants))]);
+    mov(rdx, ptr[rdi + static_cast<int>(offsetof(W13Call, c_panel_stride_bytes))]);
+    mov(rbp, ptr[rdi + static_cast<int>(offsetof(W13Call, m_panel_count))]);
+    mov(rbx, ptr[rdi + static_cast<int>(offsetof(W13Call, block_count))]);
+    sub(rsp, stack_bytes);
+
+    Xbyak::Label block_loop;
+    Xbyak::Label panel_loop;
+    Xbyak::Label done;
+    test(rbx, rbx);
+    jz(done, T_NEAR);
+    test(rbp, rbp);
+    jz(done, T_NEAR);
+    L(block_loop);
+    mov(r8, r12);
+    mov(r10, r14);
+    mov(rdi, rbp);
+    L(panel_loop);
+    mov(r9, r13);
+    mov(rcx, r15);
+    EmitPanel();
+    add(r10, rdx);
+    dec(rdi);
+    jnz(panel_loop, T_NEAR);
+    add(r13, r11);
+    add(r14, 8 * 64);
+    dec(rbx);
+    jnz(block_loop, T_NEAR);
+    L(done);
+
+    add(rsp, stack_bytes);
+    vzeroupper();
+    pop(r15);
+    pop(r14);
+    pop(r13);
+    pop(r12);
+    pop(rbp);
+    pop(rbx);
+    ret();
+  }
+
+  void Generate() {
+    const bool baseline = feature_blocks_ == 1 && rows_ >= 1 && rows_ <= 12;
+    const bool small_m_multi_n = rows_ >= 1 && rows_ <= 4 && (feature_blocks_ == 2 || feature_blocks_ == 4) &&
+                                 accumulator_count_ <= 24 && accumulator_count_ + rows_ < 32;
+    const bool bulk_mn = bulk_mn_ && rows_ == 12 && feature_blocks_ == 1;
+    if ((!baseline && !small_m_multi_n) || (degree_ != 4 && degree_ != 5 && degree_ != 6) || (bulk_mn_ && !bulk_mn)) {
+      throw std::invalid_argument("invalid AVX-512 W13 JIT specialization");
+    }
+    if (bulk_mn_) {
+      GenerateBulkMN();
+      return;
+    }
+
+    const int stack_bytes = (rows_ * feature_blocks_ * 32 + 63) & ~63;
+    mov(r8, ptr[rdi + static_cast<int>(offsetof(W13Call, a))]);
+    mov(r9, ptr[rdi + static_cast<int>(offsetof(W13Call, b))]);
+    mov(r10, ptr[rdi + static_cast<int>(offsetof(W13Call, c))]);
+    mov(rcx, ptr[rdi + static_cast<int>(offsetof(W13Call, k_pairs))]);
+    mov(rsi, ptr[rdi + static_cast<int>(offsetof(W13Call, constants))]);
+    if (feature_blocks_ > 1) {
+      mov(r11, ptr[rdi + static_cast<int>(offsetof(W13Call, b_block_stride_bytes))]);
+      if (feature_blocks_ == 4) {
+        lea(rdx, ptr[r11 + r11 * 2]);
+      }
+    }
+    sub(rsp, stack_bytes);
+    EmitPanel();
 
     add(rsp, stack_bytes);
     vzeroupper();
@@ -601,11 +694,12 @@ class W13Generator final : public Xbyak::CodeGenerator {
   int degree_;
   int feature_blocks_;
   int accumulator_count_;
+  bool bulk_mn_;
 };
 
 class W2Generator final : public Xbyak::CodeGenerator {
  public:
-  W2Generator(int rows, int n_valid, bool direct_bf16, bool weighted_direct_bf16)
+  W2Generator(int rows, int n_valid, bool direct_bf16, bool weighted_direct_bf16, bool bulk_mn)
       : Xbyak::CodeGenerator(16 * 1024, Xbyak::AutoGrow),
         rows_(rows),
         n_valid_(n_valid),
@@ -616,7 +710,8 @@ class W2Generator final : public Xbyak::CodeGenerator {
         accumulator_registers_(base_accumulators_ * accumulator_sets_),
         multi_n_(n_valid > 32),
         direct_bf16_(direct_bf16),
-        weighted_direct_bf16_(weighted_direct_bf16) {
+        weighted_direct_bf16_(weighted_direct_bf16),
+        bulk_mn_(bulk_mn) {
     Generate();
     readyRE();
   }
@@ -707,36 +802,7 @@ class W2Generator final : public Xbyak::CodeGenerator {
     }
   }
 
-  void Generate() {
-    const bool baseline = rows_ >= 1 && rows_ <= 12 && n_valid_ >= 1 && n_valid_ <= 32;
-    const bool small_m_multi_n = rows_ >= 1 && rows_ <= 4 && (n_valid_ == 64 || n_valid_ == 128) &&
-                                 accumulator_registers_ <= 24 && accumulator_registers_ + rows_ < 29;
-    if (!baseline && !small_m_multi_n) {
-      throw std::invalid_argument("invalid AVX-512 W2 JIT specialization");
-    }
-
-    if (multi_n_) {
-      push(r12);
-      if (n_valid_ == 128) {
-        push(r13);
-      }
-    }
-    mov(r8, ptr[rdi + static_cast<int>(offsetof(W2Call, a))]);
-    mov(r9, ptr[rdi + static_cast<int>(offsetof(W2Call, b))]);
-    mov(r10, ptr[rdi + static_cast<int>(offsetof(W2Call, output))]);
-    mov(r11, ptr[rdi + static_cast<int>(offsetof(W2Call, route_ids))]);
-    mov(rcx, ptr[rdi + static_cast<int>(offsetof(W2Call, k_pairs))]);
-    mov(rsi, ptr[rdi + static_cast<int>(offsetof(W2Call, route_stride_bytes))]);
-    if (multi_n_) {
-      mov(r12, ptr[rdi + static_cast<int>(offsetof(W2Call, b_block_stride_bytes))]);
-      if (n_valid_ == 128) {
-        lea(r13, ptr[r12 + r12 * 2]);
-      }
-    }
-    if (weighted_direct_bf16_) {
-      mov(rdi, ptr[rdi + static_cast<int>(offsetof(W2Call, route_weights))]);
-    }
-
+  void EmitPanel() {
     for (int set = 0; set < accumulator_sets_; ++set) {
       for (int row = 0; row < rows_; ++row) {
         for (int half = 0; half < halves_; ++half) {
@@ -806,6 +872,107 @@ class W2Generator final : public Xbyak::CodeGenerator {
         }
       }
     }
+  }
+
+  void GenerateBulkMN() {
+    constexpr int kLocalBytes = 32;
+    const int output_block_bytes = direct_bf16_ ? 32 * 2 : 32 * 4;
+    push(rbx);
+    push(rbp);
+    push(r12);
+    push(r13);
+    push(r14);
+    push(r15);
+    mov(r12, ptr[rdi + static_cast<int>(offsetof(W2Call, a))]);
+    mov(r13, ptr[rdi + static_cast<int>(offsetof(W2Call, b))]);
+    mov(r10, ptr[rdi + static_cast<int>(offsetof(W2Call, output))]);
+    mov(r14, ptr[rdi + static_cast<int>(offsetof(W2Call, route_ids))]);
+    mov(r15, ptr[rdi + static_cast<int>(offsetof(W2Call, k_pairs))]);
+    mov(rsi, ptr[rdi + static_cast<int>(offsetof(W2Call, route_stride_bytes))]);
+    mov(rbp, ptr[rdi + static_cast<int>(offsetof(W2Call, m_panel_count))]);
+    mov(rbx, ptr[rdi + static_cast<int>(offsetof(W2Call, block_count))]);
+    mov(rax, ptr[rdi + static_cast<int>(offsetof(W2Call, b_block_stride_bytes))]);
+    mov(rdx, ptr[rdi + static_cast<int>(offsetof(W2Call, a_panel_stride_bytes))]);
+    if (weighted_direct_bf16_) {
+      mov(rdi, ptr[rdi + static_cast<int>(offsetof(W2Call, route_weights))]);
+    }
+    sub(rsp, kLocalBytes);
+    mov(qword[rsp + 8], rax);
+    mov(qword[rsp + 16], r12);
+    mov(qword[rsp + 24], rdx);
+
+    Xbyak::Label block_loop;
+    Xbyak::Label panel_loop;
+    Xbyak::Label done;
+    test(rbx, rbx);
+    jz(done, T_NEAR);
+    test(rbp, rbp);
+    jz(done, T_NEAR);
+    L(block_loop);
+    mov(r11, r14);
+    mov(r12, qword[rsp + 16]);
+    mov(qword[rsp], rbp);
+    L(panel_loop);
+    mov(r8, r12);
+    mov(r9, r13);
+    mov(rcx, r15);
+    EmitPanel();
+    add(r12, qword[rsp + 24]);
+    add(r11, rows_ * static_cast<int>(sizeof(int64_t)));
+    dec(qword[rsp]);
+    jnz(panel_loop, T_NEAR);
+    add(r13, qword[rsp + 8]);
+    add(r10, output_block_bytes);
+    dec(rbx);
+    jnz(block_loop, T_NEAR);
+    L(done);
+
+    add(rsp, kLocalBytes);
+    vzeroupper();
+    pop(r15);
+    pop(r14);
+    pop(r13);
+    pop(r12);
+    pop(rbp);
+    pop(rbx);
+    ret();
+  }
+
+  void Generate() {
+    const bool baseline = rows_ >= 1 && rows_ <= 12 && n_valid_ >= 1 && n_valid_ <= 32;
+    const bool small_m_multi_n = rows_ >= 1 && rows_ <= 4 && (n_valid_ == 64 || n_valid_ == 128) &&
+                                 accumulator_registers_ <= 24 && accumulator_registers_ + rows_ < 29;
+    const bool bulk_mn = bulk_mn_ && rows_ == 12 && n_valid_ == 32;
+    if ((!baseline && !small_m_multi_n) || (bulk_mn_ && !bulk_mn)) {
+      throw std::invalid_argument("invalid AVX-512 W2 JIT specialization");
+    }
+    if (bulk_mn_) {
+      GenerateBulkMN();
+      return;
+    }
+
+    if (multi_n_) {
+      push(r12);
+      if (n_valid_ == 128) {
+        push(r13);
+      }
+    }
+    mov(r8, ptr[rdi + static_cast<int>(offsetof(W2Call, a))]);
+    mov(r9, ptr[rdi + static_cast<int>(offsetof(W2Call, b))]);
+    mov(r10, ptr[rdi + static_cast<int>(offsetof(W2Call, output))]);
+    mov(r11, ptr[rdi + static_cast<int>(offsetof(W2Call, route_ids))]);
+    mov(rcx, ptr[rdi + static_cast<int>(offsetof(W2Call, k_pairs))]);
+    mov(rsi, ptr[rdi + static_cast<int>(offsetof(W2Call, route_stride_bytes))]);
+    if (multi_n_) {
+      mov(r12, ptr[rdi + static_cast<int>(offsetof(W2Call, b_block_stride_bytes))]);
+      if (n_valid_ == 128) {
+        lea(r13, ptr[r12 + r12 * 2]);
+      }
+    }
+    if (weighted_direct_bf16_) {
+      mov(rdi, ptr[rdi + static_cast<int>(offsetof(W2Call, route_weights))]);
+    }
+    EmitPanel();
 
     vzeroupper();
     if (multi_n_) {
@@ -827,6 +994,7 @@ class W2Generator final : public Xbyak::CodeGenerator {
   bool multi_n_;
   bool direct_bf16_;
   bool weighted_direct_bf16_;
+  bool bulk_mn_;
 };
 
 #pragma pack(push, 1)
@@ -2285,12 +2453,13 @@ KernelHandle GenerateKernel(const KernelKey& key) {
     return KernelHandle{owner, owner->getCode<JitFunction>(), owner->getSize(), {}};
   }
   if (key.operation == JitOperation::kW13) {
-    auto owner = std::make_shared<W13Generator>(key.rows, key.silu_degree, key.n_valid / 16);
+    auto owner = std::make_shared<W13Generator>(key.rows, key.silu_degree, key.n_valid / 16, key.avx512_bulk_mn);
     return KernelHandle{owner, owner->getCode<JitFunction>(), owner->getSize(), {}};
   }
   const bool weighted_direct_bf16 = key.output == JitOutput::kWeightedDirectBf16;
   const bool direct_bf16 = key.output == JitOutput::kDirectBf16 || weighted_direct_bf16;
-  auto owner = std::make_shared<W2Generator>(key.rows, key.n_valid, direct_bf16, weighted_direct_bf16);
+  auto owner =
+      std::make_shared<W2Generator>(key.rows, key.n_valid, direct_bf16, weighted_direct_bf16, key.avx512_bulk_mn);
   return KernelHandle{owner, owner->getCode<JitFunction>(), owner->getSize(), {}};
 }
 
@@ -2326,17 +2495,21 @@ KernelHandle ResolveKernel(const KernelKey& key, ImplementationMode mode) {
   return handle;
 }
 
-KernelKey W13Key(int rows, int degree, int feature_blocks = 1) {
-  return KernelKey{X86JitIsa::kAvx512Bf16,       JitOperation::kW13,
-                   static_cast<uint8_t>(rows),   static_cast<uint8_t>(feature_blocks * 16),
-                   static_cast<uint8_t>(degree), JitOutput::kPackedBf16};
+KernelKey W13Key(int rows, int degree, int feature_blocks = 1, bool bulk_mn = false) {
+  KernelKey key{X86JitIsa::kAvx512Bf16,       JitOperation::kW13,
+                static_cast<uint8_t>(rows),   static_cast<uint8_t>(feature_blocks * 16),
+                static_cast<uint8_t>(degree), JitOutput::kPackedBf16};
+  key.avx512_bulk_mn = bulk_mn;
+  return key;
 }
 
-KernelKey W2Key(int rows, int n_valid, bool direct_bf16, bool weighted_direct_bf16) {
+KernelKey W2Key(int rows, int n_valid, bool direct_bf16, bool weighted_direct_bf16, bool bulk_mn = false) {
   const JitOutput output = weighted_direct_bf16 ? JitOutput::kWeightedDirectBf16
                                                 : (direct_bf16 ? JitOutput::kDirectBf16 : JitOutput::kRouteF32);
-  return KernelKey{
+  KernelKey key{
       X86JitIsa::kAvx512Bf16, JitOperation::kW2, static_cast<uint8_t>(rows), static_cast<uint8_t>(n_valid), 0, output};
+  key.avx512_bulk_mn = bulk_mn;
+  return key;
 }
 
 bool SmallMMultiNMayUseW13(SmallMMultiNMode mode) {
@@ -2345,6 +2518,14 @@ bool SmallMMultiNMayUseW13(SmallMMultiNMode mode) {
 
 bool SmallMMultiNMayUseW2(SmallMMultiNMode mode) {
   return mode == SmallMMultiNMode::kAuto || mode == SmallMMultiNMode::kW2 || mode == SmallMMultiNMode::kMultiN;
+}
+
+bool BulkMNMayUseW13(BulkMNMode mode) {
+  return mode == BulkMNMode::kAuto || mode == BulkMNMode::kW13 || mode == BulkMNMode::kBulkMN;
+}
+
+bool BulkMNMayUseW2(BulkMNMode mode) {
+  return mode == BulkMNMode::kAuto || mode == BulkMNMode::kW2 || mode == BulkMNMode::kBulkMN;
 }
 
 bool UseAutomaticW13SmallMMultiN(int rows, int reduction, int output, int cooperative_threads) {
@@ -2367,6 +2548,22 @@ bool UseW2SmallMMultiN(int rows, int reduction, int output, int cooperative_thre
     return false;
   }
   return mode != SmallMMultiNMode::kAuto || UseAutomaticW2SmallMMultiN(rows, reduction, output, cooperative_threads);
+}
+
+bool UseW13BulkMN(int rows, int reduction, int output, int cooperative_threads, BulkMNMode mode) {
+  if (!BulkMNMayUseW13(mode) || rows < 12) {
+    return false;
+  }
+  return mode != BulkMNMode::kAuto ||
+         UseAutomaticAvx512BulkMN(Avx512BulkMNStage::kW13, rows, reduction, output, cooperative_threads);
+}
+
+bool UseW2BulkMN(int rows, int reduction, int output, int cooperative_threads, BulkMNMode mode) {
+  if (!BulkMNMayUseW2(mode) || rows < 12) {
+    return false;
+  }
+  return mode != BulkMNMode::kAuto ||
+         UseAutomaticAvx512BulkMN(Avx512BulkMNStage::kW2, rows, reduction, output, cooperative_threads);
 }
 
 int W13SmallMMultiNBlocks(int rows, int remaining_blocks) {
@@ -2465,6 +2662,21 @@ bool ResolveSmallMMultiNKernels(int rows, int degree, int hidden_size, bool dire
   return true;
 }
 
+bool ResolveBulkMNKernels(int degree, bool direct_bf16, bool weighted_direct_bf16, ImplementationMode mode,
+                          BulkMNMode bulk_mn_mode) {
+  if (bulk_mn_mode == BulkMNMode::kBaseline) {
+    return true;
+  }
+  if (BulkMNMayUseW13(bulk_mn_mode) && !ResolveKernel(W13Key(12, degree, 1, true), mode)) {
+    return false;
+  }
+  if (bulk_mn_mode != BulkMNMode::kAuto && BulkMNMayUseW2(bulk_mn_mode) &&
+      !ResolveKernel(W2Key(12, 32, direct_bf16, weighted_direct_bf16, true), mode)) {
+    return false;
+  }
+  return true;
+}
+
 void ResolveAmxRowKernels(int rows, int degree, int hidden_size, bool direct_bf16, bool weighted_direct_bf16,
                           AmxJitPattern pattern, AmxSiluEpilogue silu_epilogue, AmxW2Epilogue w2_epilogue,
                           AmxTileStateMode tile_state_mode, AmxPackedBLayout b_layout, AmxBLoadHint b_load_hint,
@@ -2520,8 +2732,10 @@ void PrepareJitKernels(const std::vector<int>& row_counts, int silu_poly_degree,
   }
 #if defined(FUSED_CPP_MOE_HAS_XBYAK) && FUSED_CPP_MOE_HAS_XBYAK
   const SmallMMultiNMode multi_n_mode = GetSmallMMultiNMode();
+  const BulkMNMode bulk_mn_mode = GetBulkMNMode();
   std::array<bool, 13> prepared{};
   std::array<bool, 5> prepared_small_m_multi_n{};
+  bool prepared_bulk_mn = false;
   for (int rows : row_counts) {
     if (rows <= 0) {
       continue;
@@ -2539,6 +2753,10 @@ void PrepareJitKernels(const std::vector<int>& row_counts, int silu_poly_degree,
       ResolveSmallMMultiNKernels(rows, silu_poly_degree, hidden_size, direct_bf16, weighted_direct_bf16, mode,
                                  multi_n_mode);
       prepared_small_m_multi_n[rows] = true;
+    }
+    if (rows >= 12 && !prepared_bulk_mn) {
+      ResolveBulkMNKernels(silu_poly_degree, direct_bf16, weighted_direct_bf16, mode, bulk_mn_mode);
+      prepared_bulk_mn = true;
     }
   }
 #else
@@ -2629,6 +2847,7 @@ void ComputeW13(const uint16_t* a, int a_stride, const uint16_t* packed_b, uint1
   }
 #if defined(FUSED_CPP_MOE_HAS_XBYAK) && FUSED_CPP_MOE_HAS_XBYAK
   const SmallMMultiNMode multi_n_mode = GetSmallMMultiNMode();
+  const BulkMNMode bulk_mn_mode = GetBulkMNMode();
   const int cache_blocks = GetCacheBlockWindow("FUSED_CPP_MOE_X86_W13_CACHE_BLOCKS");
   if (UseW13SmallMMultiN(rows, k_pad, c_stride, cooperative_threads, multi_n_mode)) {
     bool jit_available = true;
@@ -2668,10 +2887,11 @@ void ComputeW13(const uint16_t* a, int a_stride, const uint16_t* packed_b, uint1
 
   const int full_panels = rows / 12;
   const int tail_rows = rows % 12;
+  const bool use_bulk_mn = UseW13BulkMN(rows, k_pad, c_stride, cooperative_threads, bulk_mn_mode);
   KernelHandle full_kernel;
   KernelHandle tail_kernel;
   if (full_panels > 0) {
-    full_kernel = ResolveKernel(W13Key(12, silu_poly_degree), mode);
+    full_kernel = ResolveKernel(W13Key(12, silu_poly_degree, 1, use_bulk_mn), mode);
   }
   if (tail_rows > 0) {
     tail_kernel = ResolveKernel(W13Key(tail_rows, silu_poly_degree), mode);
@@ -2679,6 +2899,44 @@ void ComputeW13(const uint16_t* a, int a_stride, const uint16_t* packed_b, uint1
   if ((full_panels > 0 && !full_kernel) || (tail_rows > 0 && !tail_kernel)) {
     ComputeW13Intrinsic(a, a_stride, packed_b, c, c_stride, rows, k_pad, feature_block_begin, feature_block_end,
                         silu_poly_degree);
+    return;
+  }
+
+  if (use_bulk_mn) {
+    auto run_bulk_range = [&](int block_begin, int block_end) {
+      if (block_begin >= block_end) {
+        return;
+      }
+      W13Call call{a,
+                   packed_b + static_cast<int64_t>(block_begin) * k_pad * 32,
+                   c + static_cast<int64_t>(block_begin) * 8 * 32,
+                   k_pad / 2,
+                   static_cast<int64_t>(k_pad) * 64,
+                   &kSiluConstants,
+                   static_cast<int64_t>(c_stride) * 16 * static_cast<int>(sizeof(uint16_t)),
+                   full_panels,
+                   block_end - block_begin};
+      full_kernel.function(&call);
+      if (tail_rows == 0) {
+        return;
+      }
+      const uint16_t* tail_a = a + static_cast<int64_t>(full_panels) * a_stride * 16;
+      uint16_t* tail_c = c + static_cast<int64_t>(full_panels) * c_stride * 16;
+      for (int block = block_begin; block < block_end; ++block) {
+        W13Call tail_call{tail_a,
+                          packed_b + static_cast<int64_t>(block) * k_pad * 32,
+                          tail_c + static_cast<int64_t>(block) * 8 * 32,
+                          k_pad / 2,
+                          static_cast<int64_t>(k_pad) * 64,
+                          &kSiluConstants};
+        tail_kernel.function(&tail_call);
+      }
+    };
+    if (cache_blocks == 0) {
+      run_bulk_range(feature_block_begin, feature_block_end);
+    } else {
+      ForEachCacheBlockWindow(feature_block_begin, feature_block_end, cache_blocks, run_bulk_range);
+    }
     return;
   }
 
@@ -2754,6 +3012,7 @@ void ComputeW2(const uint16_t* a, int a_stride, const uint16_t* packed_b, float*
   }
 #if defined(FUSED_CPP_MOE_HAS_XBYAK) && FUSED_CPP_MOE_HAS_XBYAK
   const SmallMMultiNMode multi_n_mode = GetSmallMMultiNMode();
+  const BulkMNMode bulk_mn_mode = GetBulkMNMode();
   const int element_bytes = direct_bf16 ? 2 : 4;
   const int cache_blocks = GetCacheBlockWindow("FUSED_CPP_MOE_X86_W2_CACHE_BLOCKS");
   if (UseW2SmallMMultiN(rows, k_pad, hidden_size, cooperative_threads, multi_n_mode)) {
@@ -2812,6 +3071,7 @@ void ComputeW2(const uint16_t* a, int a_stride, const uint16_t* packed_b, float*
 
   const int full_panels = rows / 12;
   const int tail_rows = rows % 12;
+  const bool use_bulk_mn = UseW2BulkMN(rows, k_pad, hidden_size, cooperative_threads, bulk_mn_mode);
   KernelHandle full_main_kernel;
   KernelHandle full_tail_kernel;
   KernelHandle tail_main_kernel;
@@ -2830,7 +3090,7 @@ void ComputeW2(const uint16_t* a, int a_stride, const uint16_t* packed_b, float*
     }
   }
   if (full_panels > 0 && needs_main_kernel) {
-    full_main_kernel = ResolveKernel(W2Key(12, 32, direct_bf16, weighted_direct_bf16), mode);
+    full_main_kernel = ResolveKernel(W2Key(12, 32, direct_bf16, weighted_direct_bf16, use_bulk_mn), mode);
   }
   if (full_panels > 0 && needs_tail_kernel) {
     full_tail_kernel = ResolveKernel(W2Key(12, hidden_size % 32, direct_bf16, weighted_direct_bf16), mode);
@@ -2847,6 +3107,80 @@ void ComputeW2(const uint16_t* a, int a_stride, const uint16_t* packed_b, float*
       (tail_rows > 0 && needs_tail_kernel && !tail_tail_kernel)) {
     ComputeW2Intrinsic(a, a_stride, packed_b, route_output, direct_output, route_ids, route_stride, rows, k_pad,
                        hidden_size, output_block_begin, output_block_end, direct_bf16, route_weights);
+    return;
+  }
+
+  if (use_bulk_mn) {
+    auto run_bulk_range = [&](int block_begin, int block_end) {
+      const int full_block_end = std::min(block_end, hidden_size / 32);
+      if (block_begin < full_block_end) {
+        const int column = block_begin * 32;
+        void* output_block =
+            direct_bf16 ? static_cast<void*>(direct_output + column) : static_cast<void*>(route_output + column);
+        W2Call call{a,
+                    packed_b + static_cast<int64_t>(block_begin) * k_pad * 32,
+                    output_block,
+                    route_ids,
+                    route_weights,
+                    k_pad / 2,
+                    static_cast<int64_t>(k_pad) * 64,
+                    static_cast<int64_t>(route_stride) * element_bytes,
+                    static_cast<int64_t>(a_stride) * 16 * static_cast<int>(sizeof(uint16_t)),
+                    full_panels,
+                    full_block_end - block_begin};
+        full_main_kernel.function(&call);
+      }
+      for (int block = std::max(block_begin, full_block_end); block < block_end; ++block) {
+        const int column = block * 32;
+        const int n_valid = std::min(32, hidden_size - column);
+        if (n_valid <= 0) {
+          continue;
+        }
+        const uint16_t* b_block = packed_b + static_cast<int64_t>(block) * k_pad * 32;
+        void* output_block =
+            direct_bf16 ? static_cast<void*>(direct_output + column) : static_cast<void*>(route_output + column);
+        for (int panel = 0; panel < full_panels; ++panel) {
+          W2Call call{a + static_cast<int64_t>(panel) * a_stride * 16,
+                      b_block,
+                      output_block,
+                      route_ids + panel * 12,
+                      route_weights,
+                      k_pad / 2,
+                      static_cast<int64_t>(k_pad) * 64,
+                      static_cast<int64_t>(route_stride) * element_bytes};
+          full_tail_kernel.function(&call);
+        }
+      }
+      if (tail_rows == 0) {
+        return;
+      }
+      const uint16_t* tail_a = a + static_cast<int64_t>(full_panels) * a_stride * 16;
+      const int64_t* tail_routes = route_ids + full_panels * 12;
+      for (int block = block_begin; block < block_end; ++block) {
+        const int column = block * 32;
+        const int n_valid = std::min(32, hidden_size - column);
+        if (n_valid <= 0) {
+          continue;
+        }
+        void* output_block =
+            direct_bf16 ? static_cast<void*>(direct_output + column) : static_cast<void*>(route_output + column);
+        W2Call call{tail_a,
+                    packed_b + static_cast<int64_t>(block) * k_pad * 32,
+                    output_block,
+                    tail_routes,
+                    route_weights,
+                    k_pad / 2,
+                    static_cast<int64_t>(k_pad) * 64,
+                    static_cast<int64_t>(route_stride) * element_bytes};
+        KernelHandle& kernel = n_valid == 32 ? tail_main_kernel : tail_tail_kernel;
+        kernel.function(&call);
+      }
+    };
+    if (cache_blocks == 0) {
+      run_bulk_range(output_block_begin, output_block_end);
+    } else {
+      ForEachCacheBlockWindow(output_block_begin, output_block_end, cache_blocks, run_bulk_range);
+    }
     return;
   }
 

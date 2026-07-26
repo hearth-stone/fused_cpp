@@ -436,6 +436,31 @@ why they fall back. Reproduce with
 measurements are in
 [`results/amazon_c8i_8core_avx512_small_m_multi_n_20260726.md`](results/amazon_c8i_8core_avx512_small_m_multi_n_20260726.md).
 
+For M>=12, the AVX-512 JIT can also put the full-panel traversal inside the
+generated body. Each call covers one cache window with an N-block outer loop
+and an M12-panel inner loop, so the panels share the callee-save frame,
+invariant loads, stack scratch, and `vzeroupper`. W13 advances packed A through
+its K loop and uses an explicit intermediate-panel stride; W2 resets packed B
+for each panel and advances packed A by its explicit physical row stride.
+Exact M1--11 tails and partial W13 F16/W2 N32 tails retain their existing JIT
+specializations.
+
+`FUSED_CPP_MOE_AVX512_BULK_MN` is the same-process validation override:
+
+- unset, empty, or `auto` applies the calibrated policy;
+- `baseline` keeps one JIT call per M12/N block;
+- `w13` or `w2` moves only that stage's full-panel loops into JIT;
+- `bulk_mn` forces both stages wherever a full M12 panel exists.
+
+C8i8 measurements found that call-frame removal is too small to matter at
+H4096/F512: M12--256 stayed within about +/-0.2%, and M2048 improved about
+0.1%. At H64/F2048, where W13 has many short reductions, W13 improved roughly
+0.2%--0.5%; W2 remained neutral. Automatic mode is consequently limited to
+C8i W13 when H<=64, F>=1024, M>=48, and the cooperative team has at most four
+workers. The benchmark and complete measurements are
+`benchmarks/bench_avx512_bulk_mn.py` and
+[`results/amazon_c8i_8core_avx512_bulk_mn_20260726.md`](results/amazon_c8i_8core_avx512_bulk_mn_20260726.md).
+
 The generic fallback preserves the previous AMX M=76 crossover, 64-row wave
 target, and cache-byte formulas. Every profile retains the exact-tail rules:
 the final M1-16 part of `m2n2`, plus an odd final N32/W13 block of `m1n4`,

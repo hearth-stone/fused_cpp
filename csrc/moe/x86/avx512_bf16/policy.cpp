@@ -191,6 +191,18 @@ bool UseAutomaticAvx512SmallMMultiN(Avx512SmallMMultiNStage stage, int rows, int
   return false;
 }
 
+bool UseAutomaticAvx512BulkMN(Avx512BulkMNStage stage, int rows, int reduction_size, int output_size,
+                              int cooperative_threads) {
+  if (!UseC8iProfile() || stage != Avx512BulkMNStage::kW13) {
+    return false;
+  }
+  // C8i calibration: moving both panel loops into the JIT body only pays for
+  // many short W13 reductions.  W2 and conventional hidden sizes were neutral
+  // within noise, while enabling them broadly could regress by roughly 0.2%.
+  return rows >= 48 && reduction_size > 0 && reduction_size <= 64 && output_size >= 1024 && cooperative_threads > 0 &&
+         cooperative_threads <= 4;
+}
+
 AmxKernelPattern ResolveAutomaticAmxKernelPattern(int rows, int hidden_size, int intermediate_size) {
   if (!UseC8iProfile() || hidden_size <= 0 || intermediate_size <= 0) {
     return rows >= kGenericM1N4MinRows ? AmxKernelPattern::kM1N4 : AmxKernelPattern::kM2N2;

@@ -301,6 +301,34 @@ features:
       --threads 1 --variants baseline,w13,w2,multi_n,auto
       --warmup 20 --runs 101
 
+  - id: compute.avx512_bulk_mn
+    part: compute
+    status: enabled
+    implementation: >-
+      csrc/moe/x86/avx512_bf16/jit_kernels.cpp and
+      csrc/moe/x86/avx512_bf16/policy.cpp
+    hypothesis: >-
+      For full M12 panels, generating the N-block and M-panel loops inside one
+      Xbyak body removes repeated call frames, invariant setup, scratch
+      allocation, vzeroupper, and address generation. Calibration retains the
+      generated W13 loop only for C8i short-K/wide-F shapes where that overhead
+      is measurable; W2 and conventional hidden sizes keep the per-panel
+      baseline automatically.
+    depends_on:
+      - layout.vnni2_packed_weights
+      - compute.xbyak_exact_m
+      - dispatch.expert_team_nsplit_waves
+    conflicts_with: []
+    correctness: >-
+      FUSED_CPP_MOE_AVX512_BULK_MN=bulk_mn PYTHONPATH=src
+      .venv/bin/python -m pytest -q tests/test_moe_avx512_bf16.py
+    benchmark: >-
+      taskset -c 0 env PYTHONPATH=src .venv/bin/python
+      benchmarks/bench_avx512_bulk_mn.py
+      --hidden 64 --intermediate 2048 --routes 48,96,256,2048
+      --threads 1 --variants baseline,w13,w2,bulk_mn,auto
+      --warmup 16 --runs 201
+
   - id: schedule.n_window_cache_blocking
     part: schedule
     status: enabled
@@ -790,6 +818,7 @@ variants:
       - compute.m12n32_vdpbf16ps
       - compute.xbyak_exact_m
       - compute.avx512_small_m_multi_n
+      - compute.avx512_bulk_mn
       - compute.xbyak_amx_m16n32
       - compute.xbyak_amx_1m4n
       - compute.xbyak_amx_2m2n
@@ -817,6 +846,7 @@ variants:
       - compute.m12n32_vdpbf16ps
       - compute.xbyak_exact_m
       - compute.avx512_small_m_multi_n
+      - compute.avx512_bulk_mn
       - epilogue.silu_mul_packa
       - store.direct_route
       - epilogue.weighted_top1_direct

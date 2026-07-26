@@ -26,6 +26,11 @@ enum class Avx512SmallMMultiNStage : uint8_t {
   kW2,
 };
 
+enum class Avx512BulkMNStage : uint8_t {
+  kW13,
+  kW2,
+};
+
 struct X86CpuIdentity {
   bool is_intel = false;
   int family = 0;
@@ -60,6 +65,8 @@ X86PolicyDecision ResolveX86Policy(const X86PolicyInput& input);
 
 bool UseAutomaticAvx512SmallMMultiN(Avx512SmallMMultiNStage stage, int rows, int reduction_size, int output_size,
                                     int cooperative_threads = 1);
+bool UseAutomaticAvx512BulkMN(Avx512BulkMNStage stage, int rows, int reduction_size, int output_size,
+                              int cooperative_threads = 1);
 AmxKernelPattern ResolveAutomaticAmxKernelPattern(int rows, int hidden_size, int intermediate_size);
 int ResolveAutomaticAmxCacheBlocks(AmxCacheStage stage, int k_pad, int rows, int hidden_size, int intermediate_size,
                                    AmxKernelPattern pattern);

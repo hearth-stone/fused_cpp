@@ -49,6 +49,29 @@ accepts `auto`, `baseline`, `w13`, `w2`, and `multi_n`; the benchmark manages
 it per variant. C8i8 results and the rejected multi-core controls are in
 `optimizations/fused_moe_avx512/results/amazon_c8i_8core_avx512_small_m_multi_n_20260726.md`.
 
+## x86 AVX-512 JIT-internal Bulk-MN loops
+
+`bench_avx512_bulk_mn.py` rotates the original per-M12/per-N-block calls,
+W13-only and W2-only generated loops, the combined loop, and automatic policy
+on identical packed weights and tensors. Packing, allocation, correctness
+reference, and JIT warm-up are excluded. In addition to latency distribution
+and GFLOP/s, it reports ratios of medians, ratios of means, and the median of
+same-iteration paired ratios so scheduler bimodality is visible rather than
+being mistaken for call-overhead improvement.
+
+```bash
+taskset -c 0 env PYTHONPATH=src \
+  .venv/bin/python benchmarks/bench_avx512_bulk_mn.py \
+  --hidden 64 --intermediate 2048 --routes 48,96,256,2048 \
+  --threads 1 --variants baseline,w13,w2,bulk_mn,auto \
+  --warmup 16 --runs 201
+```
+
+Use CPU sets `0-1`, `0-3`, or `0-7` with the corresponding thread count for
+cooperative N-split measurements. The script manages
+`FUSED_CPP_MOE_AVX512_BULK_MN=auto|baseline|w13|w2|bulk_mn`; ordinary
+production runs do not need the variable.
+
 ## x86 AMX MoE packed-B layout A/B
 
 `bench_amx_bf16_layouts.py` compares the production N32 packed weights with
