@@ -7,6 +7,11 @@ from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Iterable
 
+try:
+    from weight_window import fused_moe_weight_windows
+except ImportError:  # pragma: no cover - package-style import
+    from .weight_window import fused_moe_weight_windows
+
 
 class ProfileCompatibilityError(ValueError):
     """Raised when no exact calibration profile matches a requested policy."""
@@ -28,6 +33,9 @@ class ProfilePolicy:
     dtype: str
     w13_split: bool
     w13_split_chunks: int
+    weight_window_bytes: int
+    w13_window_ranges: int
+    w2_window_ranges: int
     measurement_experts: int
     cores_per_rank: int
     concurrent_ranks: int
@@ -62,6 +70,32 @@ class ProfilePolicy:
         extension_sha = kernel.get("extension_sha256")
         if not source_sha or not extension_sha:
             raise ProfileCompatibilityError("schema-v2 profile requires source and extension hashes")
+        weight_window_bytes = int(kernel.get("weight_window_bytes", 0))
+        w13_split = bool(kernel["w13_split"])
+        w13_split_chunks = int(kernel["w13_split_chunks"])
+        if weight_window_bytes < 0:
+            raise ProfileCompatibilityError("kernel.weight_window_bytes must be non-negative")
+        if weight_window_bytes > 0 and w13_split:
+            raise ProfileCompatibilityError(
+                "positive kernel.weight_window_bytes must use the canonical w13_split=false policy"
+            )
+        expected_w13, expected_w2 = fused_moe_weight_windows(
+            hidden_size=int(expert["hidden_size"]),
+            intermediate_size=int(expert["intermediate_size"]),
+            n_tile=int(kernel["backend_n_tile"]),
+            target_bytes=weight_window_bytes,
+            w13_fallback_ranges=w13_split_chunks,
+        )
+        w13_window_ranges = int(kernel.get("w13_window_ranges", expected_w13.ranges))
+        w2_window_ranges = int(kernel.get("w2_window_ranges", expected_w2.ranges))
+        if min(w13_split_chunks, w13_window_ranges, w2_window_ranges) <= 0:
+            raise ProfileCompatibilityError("kernel split/window range counts must be positive")
+        if not w13_split and w13_split_chunks != 1:
+            raise ProfileCompatibilityError("kernel.w13_split_chunks must be 1 when w13_split=false")
+        if (w13_window_ranges, w2_window_ranges) != (expected_w13.ranges, expected_w2.ranges):
+            raise ProfileCompatibilityError(
+                "kernel window range counts do not match the recorded shape, tile, and target bytes"
+            )
         return cls(
             mode=str(parallelism["mode"]),
             degree=int(parallelism["degree"]),
@@ -75,8 +109,11 @@ class ProfilePolicy:
             m_tail_policy=str(kernel.get("m_tail_policy", "static_bucketed")),
             activation=str(expert["activation"]),
             dtype=str(expert["dtype"]),
-            w13_split=bool(kernel["w13_split"]),
-            w13_split_chunks=int(kernel["w13_split_chunks"]),
+            w13_split=w13_split,
+            w13_split_chunks=w13_split_chunks,
+            weight_window_bytes=weight_window_bytes,
+            w13_window_ranges=w13_window_ranges,
+            w2_window_ranges=w2_window_ranges,
             measurement_experts=int(expert["measurement_experts"]),
             cores_per_rank=int(target["cores_per_rank"]),
             concurrent_ranks=int(target["concurrent_ranks"]),
@@ -98,7 +135,7 @@ class ProfilePolicy:
                 mismatches[field.name] = (actual, expected)
         return mismatches
 
-    def key_without_split(self) -> tuple[object, ...]:
+    def key_without_kernel_policy(self) -> tuple[object, ...]:
         return (
             self.mode,
             self.degree,
@@ -122,6 +159,20 @@ class ProfilePolicy:
             self.extension_sha256,
         )
 
+    def key_without_split(self) -> tuple[object, ...]:
+        """Compatibility alias for legacy split-pair callers."""
+        return self.key_without_kernel_policy()
+
+    def kernel_policy_key(self) -> tuple[object, ...]:
+        if self.weight_window_bytes > 0:
+            return (
+                "weight_window",
+                self.weight_window_bytes,
+                self.w13_window_ranges,
+                self.w2_window_ranges,
+            )
+        return ("legacy_split", self.w13_split, self.w13_split_chunks)
+
 
 @dataclass(frozen=True)
 class ProfileQuery:
@@ -139,6 +190,9 @@ class ProfileQuery:
     dtype: str | None = None
     w13_split: bool | None = None
     w13_split_chunks: int | None = None
+    weight_window_bytes: int | None = None
+    w13_window_ranges: int | None = None
+    w2_window_ranges: int | None = None
     measurement_experts: int | None = None
     cores_per_rank: int | None = None
     concurrent_ranks: int | None = None
@@ -189,13 +243,51 @@ class ProfileCatalog:
     def split_pair(self, query: ProfileQuery) -> tuple[ProfileRecord, ProfileRecord]:
         if query.w13_split is not None:
             raise ValueError("split_pair query must leave w13_split unspecified")
-        no_split = self.select(ProfileQuery(**{**query.__dict__, "w13_split": False}))
-        split = self.select(ProfileQuery(**{**query.__dict__, "w13_split": True}))
-        if no_split.policy.key_without_split() != split.policy.key_without_split():
+        if query.weight_window_bytes not in (None, 0):
+            raise ValueError("split_pair only selects legacy weight_window_bytes=0 profiles")
+        base_query = {**query.__dict__, "weight_window_bytes": 0}
+        no_split = self.select(ProfileQuery(**{**base_query, "w13_split": False}))
+        split = self.select(ProfileQuery(**{**base_query, "w13_split": True}))
+        if no_split.policy.key_without_kernel_policy() != split.policy.key_without_kernel_policy():
             raise ProfileCompatibilityError("split/no-split profiles are not a pair")
         if self._grid_signature(no_split.payload) != self._grid_signature(split.payload):
             raise ProfileCompatibilityError("split/no-split profiles use different route/thread/shape grids")
         return no_split, split
+
+    def policy_variants(self, query: ProfileQuery) -> tuple[ProfileRecord, ...]:
+        """Return a complete legacy pair plus compatible measured window variants."""
+        if query.w13_split is not None or query.weight_window_bytes is not None:
+            raise ValueError("policy_variants query must leave split and weight window unspecified")
+        no_split, split = self.split_pair(query)
+        base_key = no_split.policy.key_without_kernel_policy()
+        baseline_grid = self._grid_signature(no_split.payload)
+        variants = [no_split, split]
+        seen = {no_split.policy.kernel_policy_key(), split.policy.kernel_policy_key()}
+        for record in self.records:
+            policy = record.policy
+            if policy.weight_window_bytes <= 0 or policy.key_without_kernel_policy() != base_key:
+                continue
+            if policy.mismatch(query):
+                continue
+            variant_key = policy.kernel_policy_key()
+            if variant_key in seen:
+                raise ProfileCompatibilityError(f"duplicate kernel policy profile: {variant_key}")
+            if self._grid_signature(record.payload) != baseline_grid:
+                raise ProfileCompatibilityError(
+                    f"weight-window profile {record.path.name} uses a different route/thread/shape grid"
+                )
+            seen.add(variant_key)
+            variants.append(record)
+        return tuple(
+            sorted(
+                variants,
+                key=lambda record: (
+                    record.policy.weight_window_bytes > 0,
+                    record.policy.weight_window_bytes,
+                    record.policy.w13_split,
+                ),
+            )
+        )
 
     @staticmethod
     def _grid_signature(payload: dict) -> tuple[object, ...]:

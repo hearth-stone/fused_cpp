@@ -11,9 +11,9 @@
 ## 当前 policy-aware 闭环
 
 Schema v2 路径按完整策略选择表：`TP/EP degree + H/F + global/local
-experts + SVE implementation/tail policy + SVE tile + split-W13 + NUMA/CPU
-set + LLC + source/binary hash`。
-split/no-split 不再共用 derate，也不跨 F 或拓扑做隐式 nearest-profile
+experts + SVE implementation/tail policy + SVE tile + split-W13/packed-B
+window + NUMA/CPU set + LLC + source/binary hash`。split/no-split 和每个
+global byte-window 不共用 derate，也不跨 F 或拓扑做隐式 nearest-profile
 fallback。
 
 `tp_vs_ep_model.py --sve-implementation auto` 先查找完整的
@@ -21,23 +21,24 @@ fallback。
 `asm/static_bucketed` pair。它不会把一个 JIT profile 和一个 asm profile
 拼成候选策略。需要可复现实验时可显式指定 `jit` 或 `asm`，此时缺表直接报错。
 
-`weight_window_bytes` 是 2026-07-16 加入的显式 SVE kernel experiment，可将
-W13 和 W2 都细分为更小的 packed-B N-range。当前 planner 不输出这个 option，
-也不会用旧 split-W13 profile 对 1/2 MiB 窗口评分；自动选择前需要把窗口大小
-加入 policy identity 并重新生成 isolated/contention 表。
+`weight_window_bytes` 可将 W13 和 W2 都细分为更小的 packed-B N-range。
+planner 已联合搜索有独立 schema-v2 profile 的 `(window, core_shape)`，并将
+选中值通过 operator options 传入 async kernel；不会用旧 split-W13 profile
+对 1/2 MiB 窗口评分。默认 catalog 未加入重新校准的 window 表时，候选仍只有
+legacy split/no-split。
 
 当前实现入口：
 
 - `cost_model/profile_contention_async_dual_rank.py`：两个 NUMA-local rank
   同步采样；isolated 使用 8 个连续冷权重，contention 使用全部本地专家，
   mixed-width shape 使用与 planner 相同的 LPT assignment。
-- `cost_model/profile_catalog.py`：严格 profile identity、split pair 与 grid
-  校验。
+- `cost_model/profile_catalog.py`：严格 profile identity、legacy split pair、
+  measured window variants 与 grid 校验。
 - `cost_model/phase_model.py`：M12 bulk/tail、精确 full-call anchor，以及按
   W13 chunk/W2 瞬时 packed working set 驱动的 stage-aware fallback。
 - `planners/interval_planner.py` / `planned_moe.py`：联合搜索
-  `(w13_split, core_shape)`，返回显式 CPU 集与 operator option，并按完整
-  routing bucket histogram 缓存。
+  `(w13_split/window, core_shape)`，返回显式 CPU 集与 operator option，并按
+  完整 routing bucket histogram 和 kernel policy identity 缓存。
 - `planners/tp_vs_ep_model.py`：当前按 rank-local histogram 独立预测并取全局
   最大 compute，再加上通用分层 all-reduce/all-to-all 模型；尚未建模短 rank
   完成后长 rank 的争用释放。

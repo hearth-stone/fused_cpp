@@ -24,6 +24,7 @@ from profile_catalog import (  # noqa: E402
 )
 from simulate_schedules import PRESETS  # noqa: E402
 from tp_vs_ep_model import HierarchicalTopology, ParallelLayerEvaluator  # noqa: E402
+from weight_window import fused_moe_weight_windows  # noqa: E402
 from workload_catalog import load_routing_workload  # noqa: E402
 
 
@@ -132,6 +133,9 @@ def test_catalog_requires_exact_policy(catalog: ProfileCatalog) -> None:
     record = catalog.select(query)
     assert record.policy.w13_split
     assert record.policy.llc_bytes_per_rank == 48 * 1024 * 1024
+    assert record.policy.weight_window_bytes == 0
+    assert record.policy.w13_window_ranges == record.policy.w13_split_chunks
+    assert record.policy.w2_window_ranges == 1
 
     with pytest.raises(ProfileCompatibilityError, match="no exact profile"):
         catalog.select(
@@ -142,6 +146,145 @@ def test_catalog_requires_exact_policy(catalog: ProfileCatalog) -> None:
                 intermediate_size=512,
             )
         )
+
+
+def test_weight_window_geometry_matches_native_tile_partition() -> None:
+    w13, w2 = fused_moe_weight_windows(
+        hidden_size=4096,
+        intermediate_size=512,
+        n_tile=8,
+        target_bytes=1024 * 1024,
+        w13_fallback_ranges=1,
+    )
+
+    assert (w13.ranges, w2.ranges) == (8, 4)
+    assert (w13.max_range_bytes, w2.max_range_bytes) == (1024 * 1024, 1024 * 1024)
+    assert w13.bytes_per_worker(1) == 1024 * 1024
+    assert w13.bytes_per_worker(32) == 64 * 1024
+    assert w13.active_threads(32) == 16
+
+
+def test_positive_window_profile_rejects_legacy_split_flag(
+    catalog: ProfileCatalog,
+    tmp_path: Path,
+) -> None:
+    record = catalog.select(
+        ProfileQuery(
+            mode="tp",
+            degree=2,
+            hidden_size=4096,
+            intermediate_size=1024,
+            local_experts=64,
+            w13_split=True,
+        )
+    )
+    payload = json.loads(record.path.read_text(encoding="utf-8"))
+    payload["kernel"]["weight_window_bytes"] = 1024 * 1024
+    path = tmp_path / "invalid_window_split.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ProfileCompatibilityError, match="canonical w13_split=false"):
+        ProfileCatalog.from_paths([path])
+
+
+def test_window_policy_and_thread_shape_are_selected_jointly(
+    catalog: ProfileCatalog,
+    tmp_path: Path,
+) -> None:
+    query = ProfileQuery(
+        mode="tp",
+        degree=2,
+        hidden_size=4096,
+        intermediate_size=1024,
+        global_experts=64,
+        local_experts=64,
+        backend="sve",
+        backend_n_tile=8,
+        activation="silu",
+        dtype="bf16",
+        measurement_experts=64,
+        cores_per_rank=32,
+        concurrent_ranks=2,
+    )
+    no_split, split = catalog.split_pair(query)
+    window_paths: list[Path] = []
+    preferred = {
+        1024 * 1024: (tuple([1] * 32), 2_000_000),
+        2 * 1024 * 1024: (tuple([2] * 16), 1_000_000),
+    }
+    for window_bytes, (preferred_shape, preferred_ns) in preferred.items():
+        payload = json.loads(no_split.path.read_text(encoding="utf-8"))
+        w13, w2 = fused_moe_weight_windows(
+            hidden_size=4096,
+            intermediate_size=1024,
+            n_tile=8,
+            target_bytes=window_bytes,
+            w13_fallback_ranges=1,
+        )
+        payload["kernel"].update(
+            {
+                "w13_split": False,
+                "w13_split_chunks": 1,
+                "weight_window_bytes": window_bytes,
+                "w13_window_ranges": w13.ranges,
+                "w2_window_ranges": w2.ranges,
+            }
+        )
+        payload["working_set"].update(
+            {
+                "weight_window_target_bytes": window_bytes,
+                "w13_chunk_bytes_per_expert": w13.max_range_bytes,
+                "w2_chunk_bytes_per_expert": w2.max_range_bytes,
+                "w13_window_bytes_per_expert": w13.max_range_bytes,
+                "w2_window_bytes_per_expert": w2.max_range_bytes,
+                "max_weight_stage_bytes_per_expert": max(w13.max_range_bytes, w2.max_range_bytes),
+            }
+        )
+        for entry in payload["entries"]:
+            value = preferred_ns if tuple(entry["shape"]) == preferred_shape else 1_000_000_000
+            entry["makespan_ns"] = value
+            entry["p10_ns"] = value
+            entry["p90_ns"] = value
+            entry["full_call_median_ns"] = value
+            entry["full_call_p10_ns"] = value
+            entry["full_call_p90_ns"] = value
+        path = tmp_path / f"window_{window_bytes}.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        window_paths.append(path)
+
+    policy_catalog = ProfileCatalog.from_paths([no_split.path, split.path, *window_paths])
+    records = policy_catalog.policy_variants(query)
+    policy_models = [ContentionCostModel(record.path) for record in records]
+    result = PolicyAwarePlanner(policy_models, 32).plan([(expert, 192) for expert in range(64)])
+
+    assert len(records) == 4
+    assert result["weight_window_bytes"] == 2 * 1024 * 1024
+    assert result["shape"] == tuple([2] * 16)
+    assert result["active_working_set_bytes"] == 32 * 1024 * 1024
+    assert result["window_bytes_per_worker"] == tuple([1024 * 1024] * 16)
+    selected_model = next(model for model in policy_models if model.weight_window_bytes == 2 * 1024 * 1024)
+    selected_worksets = [workset for _, workset in selected_model._task_phases(192, 2) if workset]
+    assert selected_worksets == [2 * 1024 * 1024] * 12
+
+    runtime = PlannedMoE(policy_models, 32)
+    spec = runtime.plan_spec_for([(expert, 192) for expert in range(64)])
+    assert spec["operator_options"] == {
+        "w13_split": False,
+        "weight_window_bytes": 2 * 1024 * 1024,
+    }
+    cached_spec = runtime.plan_spec_for([(expert, 192) for expert in range(64)])
+    assert cached_spec["operator_options"] == spec["operator_options"]
+    assert runtime.last["cache_hit"] is True
+    evaluator = ParallelLayerEvaluator(
+        policy_catalog,
+        HierarchicalTopology(2, 1, 60e9, 20e9, 1e-6),
+        hidden_size=4096,
+        full_intermediate_size=2048,
+        global_experts=64,
+        cores_per_rank=32,
+    )
+    tp = evaluator.evaluate_tp(2048, 6)
+    assert {rank.weight_window_bytes for rank in tp.rank_compute} == {2 * 1024 * 1024}
 
 
 def test_m12_tail_composition(catalog: ProfileCatalog) -> None:
@@ -228,9 +371,10 @@ def test_checked_in_xbyak_profiles_are_complete_exact_m_pairs() -> None:
         assert set(range(1, 13)).issubset(map(int, payload["contention_routes"]))
         assert payload["kernel"]["source_sha256"]
         assert payload["kernel"]["extension_sha256"]
-        split_variants = pairs.setdefault(policy.key_without_split(), {})
-        assert policy.w13_split not in split_variants
-        split_variants[policy.w13_split] = record.path
+        if policy.weight_window_bytes == 0:
+            split_variants = pairs.setdefault(policy.key_without_kernel_policy(), {})
+            assert policy.w13_split not in split_variants
+            split_variants[policy.w13_split] = record.path
 
         model = ContentionCostModel(
             record.path,
@@ -359,7 +503,10 @@ def test_policy_aware_cache_and_richer_signature(catalog: ProfileCatalog) -> Non
     planner = PlannedMoE(models(catalog, "tp", 1024, 64), 32)
     counts = [(expert, 192) for expert in range(64)]
     spec = planner.plan_spec_for(counts)
-    assert spec["operator_options"] == {"w13_split": True}
+    assert spec["operator_options"] == {
+        "w13_split": True,
+        "weight_window_bytes": 0,
+    }
     assert planner.last["cache_hit"] is False
     cached = planner.plan_spec_for(counts)
     assert cached["shape"] == spec["shape"]

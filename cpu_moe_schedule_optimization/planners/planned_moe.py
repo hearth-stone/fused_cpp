@@ -76,8 +76,8 @@ class PlannedMoE:
         )
         self.policy_identity = tuple(
             (
-                model.policy.key_without_split(),
-                model.policy.w13_split,
+                model.policy.key_without_kernel_policy(),
+                model.policy.kernel_policy_key(),
             )
             if model.policy is not None
             else (str(model.profile_path),)
@@ -89,11 +89,12 @@ class PlannedMoE:
     def _planner_index(self, result: dict) -> int:
         if len(self.models) == 1:
             return 0
-        split = bool(result["w13_split"])
+        selected_policy = result.get("policy")
+        selected_profile = selected_policy.get("profile") if selected_policy is not None else None
         for index, model in enumerate(self.models):
-            if model.policy is not None and model.policy.w13_split == split:
+            if str(model.profile_path) == selected_profile:
                 return index
-        raise RuntimeError(f"no planner model for split policy {split}")
+        raise RuntimeError(f"no planner model for selected profile {selected_profile!r}")
 
     def _build_cached(self, counts, planner_index: int, shape: Tuple[int, ...]):
         planner = self.interval_planners[planner_index]
@@ -103,11 +104,15 @@ class PlannedMoE:
         return {
             "shape": shape,
             "w13_split": (model.policy.w13_split if model.policy is not None else None),
+            "weight_window_bytes": (model.policy.weight_window_bytes if model.policy is not None else None),
             "policy": (
                 {
                     "profile": str(model.profile_path),
                     "w13_split": model.policy.w13_split,
                     "w13_split_chunks": model.policy.w13_split_chunks,
+                    "weight_window_bytes": model.policy.weight_window_bytes,
+                    "w13_window_ranges": model.policy.w13_window_ranges,
+                    "w2_window_ranges": model.policy.w2_window_ranges,
                 }
                 if model.policy is not None
                 else None
@@ -144,13 +149,18 @@ class PlannedMoE:
             "planner_overhead_ns": after_assign - begin,
             "shape": tuple(result["shape"]),
             "w13_split": result.get("w13_split"),
+            "weight_window_bytes": result.get("weight_window_bytes"),
             "policy": result.get("policy"),
         }
         return {
             "bridge": bridge,
             "shape": tuple(result["shape"]),
             "w13_split": result.get("w13_split"),
-            "operator_options": {"w13_split": result.get("w13_split")},
+            "weight_window_bytes": result.get("weight_window_bytes"),
+            "operator_options": {
+                "w13_split": result.get("w13_split"),
+                "weight_window_bytes": result.get("weight_window_bytes"),
+            },
             "policy": result.get("policy"),
         }
 

@@ -2,7 +2,7 @@
 
 > 状态：调度问题定义的 source of truth。
 >
-> 最后更新：2026-07-23。
+> 最后更新：2026-07-26。
 >
 > 修改 planner 的决策变量、目标函数、硬约束、性能响应、线程宽度集合、调度语义、
 > rank 耦合方式或剪枝策略时，必须同步更新本文档及末尾变更记录。
@@ -640,7 +640,7 @@ One-hot 是线程宽度的等价求解器编码，不是剪枝。一般 active-s
 | Idling | 允许主动等待以避开争用 | lane 可启动下一个 expert 时立即启动；ready-token 路径仅填充无可运行 expert 的空闲 lane | non-idling 剪枝 |
 | Workload 输入 | 任意合法 global 或 rank-local route histogram | planner 接受任意 histogram；catalog preset 只扩展验证覆盖，不过滤运行时输入 | 不剪枝 |
 | Route combine | 任意满足 TopK release 约束和 CPU 容量的 merge 排程 | planner 不搜索 combine；默认 executor 采用 expert-first 单 token 贪心和连续收尾 | 外层启发式限制 |
-| Kernel variant | 任意未被支配的实现 | `auto` 原子选择完整 `jit/xbyak_exact_m` split/no-split pair，缺表时整体回退完整 static pair；packed-B byte-window 仅显式实验 | 实例候选限制 |
+| Kernel variant | 任意未被支配的实现 | `auto` 先要求完整 `jit/xbyak_exact_m` legacy split/no-split pair，再加入同 identity 的实测 global packed-B byte-window variants；缺少完整 JIT legacy pair 时整体回退 static pair | 实例候选限制 |
 | Isolated time | 真实 $I_i(t)$ | active $T_{\mathrm{iso}}$ 经验公式；分层 GEMM model 仅 shadow | cost 近似，不剪枝可行域 |
 | Contention | 任意动态活跃配置上的真实 $D_i(\mathcal Z)$ | 实测 contention profile 与 stage-aware event simulator | cost 近似，不剪枝可行域 |
 
@@ -984,12 +984,61 @@ owner-cache band 是对 $\widehat D_i(\mathcal Z)$ 和候选空间的实现相�
 3. 使用 contention-aware event simulator 对候选重新评分；
 4. 在线 planner 使用经真实 runtime regret 验证过的低开销启发式。
 
-当前 active profile 与 planner policy identity 只覆盖 legacy split/no-split；显式
-`weight_window_bytes` 不进入 production candidate set。若未来自动选择 1/2 MiB 等
-窗口，必须把目标字节数、W13/W2 实际 range 数加入 profile identity，重新测量
-$I^{(v)}$ 与 $D^{(v)}$，并对 route/thread/active-expert holdout 做 runtime regret
-验证。特别是单个 M12 panel 不复用 B，额外 range 通常只有 dispatch 和 lane-width
-代价，不应仅按 cache 容量规则强制细分。
+当前 active policy 将 legacy split 和 global byte-window 统一记为 kernel variant
+$v$：
+
+$$
+v=(w13\_split,\ S_{\mathrm{target}},\ r_{13},\ r_2).
+$$
+
+$S_{\mathrm{target}}=0$ 时保留 legacy split/no-split 两个候选；
+$S_{\mathrm{target}}>0$ 时使用 canonical `w13_split=false`，因为显式窗口已经覆盖
+W13 和 W2，不能再与 split flag 形成重复候选。每个 profile 分别校准：
+
+$$
+\widehat I_i^{(v)}(t),\qquad
+\widehat D_i^{(v)}(\mathcal Z).
+$$
+
+因此在线决策是联合选择：
+
+$$
+(v^*,\sigma^*)
+=\arg\min_{v\in\mathcal V_{\mathrm{profiled}},\,
+           \sigma\in\Sigma_v}
+\widehat C(v,\sigma).
+$$
+
+其中 $\mathcal V_{\mathrm{profiled}}$ 只包含实际加载的 profile；禁止从 legacy
+footprint 或相邻窗口外推时间。对 shape
+$\sigma=(t_1,\ldots,t_L)$，若当前有 $L_a$ 个非空 lane，planner 的 nominal active
+packed-B 诊断为：
+
+$$
+S_{\mathrm{active}}(v,\sigma)
+=L_a\max(\widehat S_{13}^{(v)},\widehat S_2^{(v)}),
+$$
+
+每个 lane 的 tile-aligned owner-private stripe 诊断为：
+
+$$
+S_{\mathrm{owner},s}(v,t_l)
+=b_s\left\lceil
+\frac{\left\lceil q_s/r_s\right\rceil}{t_l}
+\right\rceil.
+$$
+
+$S_{\mathrm{active}}$ 进入现有 LLC 候选剪枝和置信区间重叠时的 working-set
+tie-break；owner stripe 当前作为结果诊断输出，在跨机器
+$S_{\mathrm{worker,target}}$ 校准完成前不做新的硬剪枝。最终排序仍使用该
+variant 自己的 isolated/contention 实测表。stage simulator 将 W13 的
+$r_{13}$ 个 range 和 W2 的 $r_2$ 个 range 分别推进，不能把 windowed W2
+当成 legacy 单阶段。
+
+第一版一次 operator 调用只选择一个全局 $S_{\mathrm{target}}$。混合宽度 shape
+中的所有 lane 共用该值；per-task 或 W13/W2 独立窗口尚不在决策空间。特别是
+单个 M12 panel 不复用 B，额外 range 通常只有 dispatch 和 lane-width 代价，
+不能仅按 cache 容量规则强制细分。
 
 ## 9. 剪枝验证
 
@@ -1068,10 +1117,12 @@ worker，同时 nominal aggregate window 都约为 96 MiB；因此当前实验�
 识别 private-L2 与 aggregate-cache 两种作用。
 
 该结果证明 byte window 必须作为 kernel/schedule 联合维度，而不能把 1 MiB 或
-2 MiB 设成全局默认值。production planner 仍不得用 legacy profile 按 nominal
-footprint 外推该 variant；需要把 window 加入 profile identity，并补齐相同
-`(shape, route, threads, concurrent experts)` 下的 isolated/contention 样本后才能
-进入 candidate set。原始数据见
+2 MiB 设成全局默认值。planner/profile schema 已接入
+`(weight_window_bytes, w13_window_ranges, w2_window_ranges)` identity，并联合搜索
+`(window, shape)`；但 variant 只有在提供相同
+`(shape, route, threads, concurrent experts)` 网格的独立 isolated/contention
+profile 时才进入候选。默认 catalog 尚未加入这些重新校准的表，因此默认行为仍
+是 legacy split/no-split。原始数据见
 `optimizations/fused_moe_sve/results/amazon_192c_weight_windows.md`。
 
 ### 9.3 Ready-token combine 首轮验证
@@ -1327,3 +1378,4 @@ contention table 或 production 剪枝。
 | 2026-07-20 | v0.23 | production SVE compute 改为 Xbyak exact-M1--M12：定义 $m_c=2\lceil M/2\rceil$ tail mapper，profile identity 增加 implementation/tail policy，route grid 补齐 1--12；记录 V1/V3 bit-exact 与稳态性能验证；planner `auto` 只原子选择完整 variant pair，禁止 JIT 和 static bucket profile 混用。 |
 | 2026-07-22 | v0.24 | 增加论文评测用 uniform、active-set sweep、tiered hotspot 和 long-short bimodal 全局 TopK workload；补充合法 histogram 约束和验证覆盖说明，不改变 planner 可行域、cost model 或 production 剪枝。 |
 | 2026-07-23 | v0.25 | 增加 V3 单核 packed-B service ceiling 40.04 GB/s；区分 exact-M lane、useful-compute、physical-issue 和 memory efficiency，并记录冷权重 M1--M12 验证；不改变 active planner、contention table 或剪枝。 |
+| 2026-07-26 | v0.26 | 将全局 packed-B byte-window 接入 schema-v2 与 production planner：variant identity 包含目标字节和 W13/W2 实际 range 数，stage model 分别推进两段 range，联合搜索 `(window, core shape)` 并透传 runtime option；旧 profile 映射为 window=0，未提供新实测表时决策不变。 |

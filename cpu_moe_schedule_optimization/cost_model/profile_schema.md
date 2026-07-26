@@ -4,14 +4,13 @@
 
 Schema v2 is the active format for SVE fused-MoE scheduling profiles. A profile
 is valid only for the exact kernel policy, sharded expert shape, and NUMA/rank
-execution context recorded in the file. In particular, split-W13 and non-split
-profiles are different calibration domains.
+execution context recorded in the file. Split-W13, non-split, and each global
+packed-B byte window are different calibration domains.
 
-The experimental `weight_window_bytes` operator option is not represented by
-the current schema and therefore must be zero/unset when generating or using a
-schema-v2 profile. Before profiles for configurable W13/W2 windows become
-planner candidates, the requested byte target and both actual range counts
-must be added to kernel identity rather than inferred from `w13_split_chunks`.
+Schema v2 represents `weight_window_bytes` additively. Historical profiles
+without the field are interpreted as `0`, preserving legacy split behavior.
+A positive value is canonicalized with `w13_split=false` because the explicit
+window supersedes legacy W13 splitting and applies to both W13 and W2.
 
 ```json
 {
@@ -35,6 +34,9 @@ must be added to kernel identity rather than inferred from `w13_split_chunks`.
     "m_tail_policy": "xbyak_exact_m",
     "w13_split": true,
     "w13_split_chunks": 2,
+    "weight_window_bytes": 0,
+    "w13_window_ranges": 2,
+    "w2_window_ranges": 1,
     "git_available": true,
     "git_commit": "...",
     "git_worktree_dirty": true,
@@ -60,6 +62,9 @@ must be added to kernel identity rather than inferred from `w13_split_chunks`.
     "w13_packed_bytes_per_expert": 16777216,
     "w2_packed_bytes_per_expert": 8388608,
     "w13_chunk_bytes_per_expert": 8388608,
+    "w2_chunk_bytes_per_expert": 8388608,
+    "w13_window_bytes_per_expert": 8388608,
+    "w2_window_bytes_per_expert": 8388608,
     "max_weight_stage_bytes_per_expert": 8388608
   },
   "measurement": {
@@ -92,12 +97,14 @@ Required v2 identity fields are:
 - hardware: profiled CPU sets, NUMA nodes, LLC bytes, cores per rank, and
   concurrent rank count;
 - kernel: backend, SVE implementation, M-tail policy, N-split policy, W13 split
-  policy, source hash, and extension binary hash;
+  policy, requested global byte window, actual W13/W2 range counts, source hash,
+  and extension binary hash;
 - distributed shape: TP/EP mode and degree, global/local expert counts, H, and
   sharded F;
 - calibration scope: the full local expert count, activation, dtype, SVE N tile,
   NUMA nodes, and exact physical CPU sets;
-- working set: actual packed W13/W2 bytes per expert and W13 chunk size;
+- working set: actual packed W13/W2 bytes per expert and both maximum range
+  sizes;
 - measurement: whether ranks were synchronized and how per-rank samples were
   reduced to global wall time.
 
@@ -127,11 +134,20 @@ catalog intentionally rejects an implementation-unspecified ambiguous query.
 Static and JIT profiles are not a valid split/no-split pair even when all other
 shape fields match.
 
-The TP/EP evaluator's `--sve-implementation auto` lookup is pair-atomic: it
-first requests a complete `jit/xbyak_exact_m` split/no-split pair, then falls
-back to a complete `asm/static_bucketed` pair. It never fills a missing half
-from another implementation. Explicit `jit` or `asm` selection is strict and
-fails when that implementation's complete pair is unavailable.
+`ProfileCatalog.policy_variants()` first requires a complete legacy
+split/no-split pair for one implementation. It then adds compatible positive
+window profiles with the same route/thread/shape grid. This preserves an exact
+legacy fallback and prevents comparing one measured window against an
+interpolated or differently sampled policy. Duplicate positive-window
+identities and positive-window profiles carrying `w13_split=true` are rejected.
+
+The TP/EP evaluator's `--sve-implementation auto` lookup remains pair-atomic:
+it first requests a complete `jit/xbyak_exact_m` legacy split/no-split pair,
+then adds matching JIT window profiles. If the legacy pair is incomplete, it
+falls back to a complete `asm/static_bucketed` pair and its matching windows.
+It never fills a missing half from another implementation. Explicit `jit` or
+`asm` selection is strict and fails when that implementation's legacy pair is
+unavailable.
 
 `git_commit` and `git_worktree_dirty` may be `null` on a deployment host without
 repository metadata. `source_sha256` and `extension_sha256` remain mandatory
@@ -173,7 +189,9 @@ as a validation baseline.
 
 The complete `full_call_*` curve is the authoritative calibration for a uniform
 full-rank workload. `makespan_ns` remains a normalized diagnostic; it must not
-be multiplied by an arbitrary number of waves.
+be multiplied by an arbitrary number of waves. For a positive window, the
+stage-aware simulator emits `w13_window_ranges` W13 phases and
+`w2_window_ranges` W2 phases using their actual maximum range bytes.
 
 ### Explainable `T_iso` roofline shadow report
 
@@ -261,6 +279,12 @@ PYTHONPATH=src .venv/bin/python \
 
 Run each command again with `--w13-split 0` for the non-split policy. Defaults
 bind rank 0 to CPUs 0-31/NUMA0 and rank 1 to CPUs 32-63/NUMA1.
+
+To generate a canonical global-window profile, use `--w13-split 0` plus, for
+example, `--weight-window-bytes 2097152`. Generate one file per candidate
+window. The profiler mirrors native tile partitioning and records the actual
+W13/W2 range counts and maximum range bytes; the planner will not synthesize
+unmeasured byte values.
 
 ## Legacy schema v1
 

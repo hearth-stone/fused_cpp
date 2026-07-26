@@ -243,10 +243,20 @@ Rules:
   `[task_core_begins[i], task_core_begins[i] + task_threads[i])`.
 - The first async bridge supports exactly one task per active expert.
 - Offline simulator JSON includes this representation under `async_bridge`.
-- The operator also accepts an experimental `weight_window_bytes` option that
-  serializes both SVE GEMMs into tile-aligned packed-B ranges. The current
-  planner intentionally does not emit it because existing profiles calibrate
-  only the legacy split/no-split policies.
+- Kernel policy remains operator-wide rather than per task. A policy-aware plan
+  emits adjacent `operator_options`:
+
+  ```json
+  {
+    "w13_split": false,
+    "weight_window_bytes": 2097152
+  }
+  ```
+
+  A positive window serializes both SVE GEMMs into tile-aligned packed-B
+  ranges. It is selected only from an exact schema-v2 profile carrying that
+  target and the actual W13/W2 range counts. All tasks in one plan share the
+  selected value; per-task and independent W13/W2 windows are not represented.
 
 ## Planner Kinds
 

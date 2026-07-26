@@ -117,8 +117,24 @@ class IntervalPlanner:
         waves = max(1, math.ceil(len(experts) / len(shape)))
         return makespan * relative / math.sqrt(waves * self.model.profile_runs)
 
-    def active_working_set_bytes(self, shape) -> int:
-        return len(shape) * self.model.max_stage_bytes
+    def active_working_set_bytes(self, shape, tasks=None) -> int:
+        if tasks is None:
+            active_lanes = len(shape)
+        else:
+            active_lanes = len({(core, threads) for _, _, core, threads, _ in tasks})
+        return active_lanes * self.model.max_stage_bytes
+
+    def window_bytes_per_worker(self, shape, tasks=None) -> tuple[int, ...]:
+        if tasks is None:
+            active_widths = tuple(int(width) for width in shape)
+        else:
+            active_widths = tuple(
+                threads
+                for _, threads in sorted(
+                    {(core, threads) for _, _, core, threads, _ in tasks},
+                )
+            )
+        return tuple(self.model.window_bytes_per_worker(width) for width in active_widths)
 
     def _uses_full_workload_anchor(self, experts) -> bool:
         return (
@@ -147,7 +163,8 @@ class IntervalPlanner:
             "uncertainty_ns": uncertainty,
             "pessimistic_ns": makespan + uncertainty,
             "tasks": tasks,
-            "active_working_set_bytes": self.active_working_set_bytes(shape),
+            "active_working_set_bytes": self.active_working_set_bytes(shape, tasks),
+            "window_bytes_per_worker": self.window_bytes_per_worker(shape, tasks),
         }
 
     @staticmethod
@@ -184,6 +201,9 @@ class IntervalPlanner:
                 "profile": str(self.model.profile_path),
                 "w13_split": self.model.policy.w13_split,
                 "w13_split_chunks": self.model.policy.w13_split_chunks,
+                "weight_window_bytes": self.model.policy.weight_window_bytes,
+                "w13_window_ranges": self.model.policy.w13_window_ranges,
+                "w2_window_ranges": self.model.policy.w2_window_ranges,
                 "intermediate_size": self.model.policy.intermediate_size,
                 "mode": self.model.policy.mode,
                 "degree": self.model.policy.degree,
@@ -194,6 +214,10 @@ class IntervalPlanner:
             "uncertainty_ns": selected["uncertainty_ns"],
             "active_working_set_bytes": selected["active_working_set_bytes"],
             "w13_split": (self.model.policy.w13_split if self.model.policy is not None else None),
+            "weight_window_bytes": (self.model.policy.weight_window_bytes if self.model.policy is not None else None),
+            "w13_window_ranges": (self.model.policy.w13_window_ranges if self.model.policy is not None else None),
+            "w2_window_ranges": (self.model.policy.w2_window_ranges if self.model.policy is not None else None),
+            "window_bytes_per_worker": selected["window_bytes_per_worker"],
             "policy": policy,
             "tasks": selected["tasks"],
             "bridge": self.to_async_bridge(selected["tasks"]),
@@ -203,6 +227,7 @@ class IntervalPlanner:
                     "makespan_ms": round(candidate["makespan_ns"] / 1e6, 6),
                     "pessimistic_ms": round(candidate["pessimistic_ns"] / 1e6, 6),
                     "active_working_set_bytes": candidate["active_working_set_bytes"],
+                    "window_bytes_per_worker": candidate["window_bytes_per_worker"],
                 }
                 for candidate in sorted(candidates, key=lambda candidate: candidate["makespan_ns"])
             ],
@@ -225,7 +250,7 @@ class IntervalPlanner:
 
 
 class PolicyAwarePlanner:
-    """Search split-W13 policy and an exact profiled core shape together."""
+    """Search packed-B window policy and an exact profiled core shape together."""
 
     def __init__(
         self,
@@ -240,9 +265,12 @@ class PolicyAwarePlanner:
         policies = [model.policy for model in models]
         if any(policy is None for policy in policies):
             raise ProfileCompatibilityError("joint policy search requires schema-v2 profiles")
-        base_key = policies[0].key_without_split()
-        if any(policy.key_without_split() != base_key for policy in policies[1:]):
-            raise ProfileCompatibilityError("joint planner profiles differ in more than W13 split policy")
+        base_key = policies[0].key_without_kernel_policy()
+        if any(policy.key_without_kernel_policy() != base_key for policy in policies[1:]):
+            raise ProfileCompatibilityError("joint planner profiles differ outside the packed-B window policy")
+        variant_keys = [policy.kernel_policy_key() for policy in policies]
+        if len(variant_keys) != len(set(variant_keys)):
+            raise ProfileCompatibilityError("joint planner received duplicate packed-B window policies")
         self.models = tuple(models)
         self.num_cores = int(num_cores)
         self.cpu_ids = cpu_ids
@@ -292,10 +320,14 @@ class PolicyAwarePlanner:
         selected["policy_ranking"] = [
             {
                 "w13_split": result["w13_split"],
+                "weight_window_bytes": result["weight_window_bytes"],
+                "w13_window_ranges": result["w13_window_ranges"],
+                "w2_window_ranges": result["w2_window_ranges"],
                 "shape": result["shape"],
                 "makespan_ms": result["makespan_ns"] / 1e6,
                 "uncertainty_ms": result["uncertainty_ns"] / 1e6,
                 "active_working_set_bytes": result["active_working_set_bytes"],
+                "window_bytes_per_worker": result["window_bytes_per_worker"],
             }
             for result in sorted(policy_results, key=lambda result: result["makespan_ns"])
         ]

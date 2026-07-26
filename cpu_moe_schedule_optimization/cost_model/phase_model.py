@@ -1,8 +1,8 @@
 """Policy-bound, exact-shape and stage-aware MoE contention model.
 
-Schema-v2 profiles bind measurements to a sharded expert shape, split-W13
+Schema-v2 profiles bind measurements to a sharded expert shape, packed-B window
 policy, kernel binary, NUMA topology, and concurrent-rank count.  The model
-keeps the validated event-driven DAG mechanics, but models W13 chunks and W2 as
+keeps the validated event-driven DAG mechanics, but models W13 and W2 ranges as
 separate working-set phases.  Legacy schema-v1 profiles retain the old flat-task
 behavior for reproducibility.
 """
@@ -173,9 +173,25 @@ class ContentionCostModel:
         self.profile_runs = max(int(measurement.get("runs", 1)), 1)
         working_set = prof.get("working_set", {})
         self.w13_chunk_bytes = int(working_set.get("w13_chunk_bytes_per_expert", 0))
-        self.w2_bytes = int(working_set.get("w2_packed_bytes_per_expert", 0))
+        self.w2_chunk_bytes = int(
+            working_set.get(
+                "w2_chunk_bytes_per_expert",
+                working_set.get("w2_packed_bytes_per_expert", 0),
+            )
+        )
+        self.w2_bytes = self.w2_chunk_bytes
         self.max_stage_bytes = int(working_set.get("max_weight_stage_bytes_per_expert", 0))
         self.w13_split_chunks = int(self.policy.w13_split_chunks) if self.policy is not None else 1
+        self.weight_window_bytes = int(self.policy.weight_window_bytes) if self.policy is not None else 0
+        self.w13_window_ranges = int(self.policy.w13_window_ranges) if self.policy is not None else 1
+        self.w2_window_ranges = int(self.policy.w2_window_ranges) if self.policy is not None else 1
+        if self.policy is not None:
+            n_tile = self.policy.backend_n_tile
+            self.w13_tile_bytes = self.policy.hidden_size * n_tile * 2
+            self.w2_tile_bytes = self.policy.intermediate_size * n_tile * 2
+        else:
+            self.w13_tile_bytes = 0
+            self.w2_tile_bytes = 0
         expert_shape = prof.get("expert_shape", {})
         self.measurement_experts = int(expert_shape.get("measurement_experts", 0))
         self.local_experts = int(self.policy.local_experts) if self.policy is not None else 0
@@ -200,6 +216,23 @@ class ContentionCostModel:
     @staticmethod
     def _shape_signature(threads) -> tuple[int, ...]:
         return tuple(sorted((int(value) for value in threads if int(value) > 0), reverse=True))
+
+    @staticmethod
+    def _owner_range_bytes(range_bytes: int, tile_bytes: int, threads: int) -> int:
+        if threads <= 0:
+            raise ValueError(f"threads must be positive, got {threads}")
+        if range_bytes <= 0 or tile_bytes <= 0:
+            return 0
+        range_tiles = math.ceil(range_bytes / tile_bytes)
+        owner_tiles = math.ceil(range_tiles / threads)
+        return owner_tiles * tile_bytes
+
+    def window_bytes_per_worker(self, threads: int) -> int:
+        """Maximum tile-aligned packed-B owner stripe across W13 and W2."""
+        return max(
+            self._owner_range_bytes(self.w13_chunk_bytes, self.w13_tile_bytes, threads),
+            self._owner_range_bytes(self.w2_chunk_bytes, self.w2_tile_bytes, threads),
+        )
 
     @property
     def supported_shapes(self) -> tuple[tuple[int, ...], ...]:
@@ -514,11 +547,14 @@ class ContentionCostModel:
         phases: list[tuple[float, int]] = []
         if overhead > 0:
             phases.append((overhead, 0))
-        chunks = max(self.w13_split_chunks, 1)
-        w13_phase = compute * (2.0 / 3.0) / chunks
-        for _ in range(chunks):
+        w13_ranges = max(self.w13_window_ranges, 1)
+        w13_phase = compute * (2.0 / 3.0) / w13_ranges
+        for _ in range(w13_ranges):
             phases.append((w13_phase, self.w13_chunk_bytes))
-        phases.append((compute / 3.0, self.w2_bytes))
+        w2_ranges = max(self.w2_window_ranges, 1)
+        w2_phase = compute / 3.0 / w2_ranges
+        for _ in range(w2_ranges):
+            phases.append((w2_phase, self.w2_chunk_bytes))
         return [(duration, workset) for duration, workset in phases if duration > 0]
 
     def _working_set_derate(

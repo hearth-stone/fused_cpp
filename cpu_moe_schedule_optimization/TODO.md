@@ -252,10 +252,13 @@ claims must include both long-route throughput and short-route latency.
   indices). Let a native interval planner consume the same metadata and avoid
   Python schedule-tensor materialization, with special attention to decode and
   many-layer control overhead.
-- [ ] Promote packed-B window size into the planner policy identity and profile
-  schema. Search W13 and W2 window sizes independently, rather than applying one
-  `weight_window_bytes` value to both stages, and regenerate isolated/contention
-  calibration before enabling automatic selection.
+- [x] Promote the operator-wide packed-B window into planner policy identity and
+  schema-v2. Jointly search measured `(weight_window_bytes, core_shape)` variants,
+  model the actual W13/W2 range counts, and forward the selected option to the
+  async kernel. Historical profiles map to window 0.
+- [ ] Extend the first global-window policy to independently selectable W13 and
+  W2 windows. Add per-stage runtime options and regenerate isolated/contention
+  calibration before admitting those combinations.
 - [ ] Replace general async task-list polling with a lane-chain executor for the
   current disjoint interval plans, while retaining the general DAG path for plans
   with genuinely overlapping intervals. Measure dispatch and barrier overhead on

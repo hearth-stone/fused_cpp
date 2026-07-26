@@ -35,8 +35,10 @@ from fused_cpp.moe import (  # noqa: E402
 
 try:
     from iso_formula import fit_from_measurements  # noqa: E402
+    from weight_window import fused_moe_weight_windows  # noqa: E402
 except ImportError:  # pragma: no cover - package-style import
     from .iso_formula import fit_from_measurements  # type: ignore[no-redef]
+    from .weight_window import fused_moe_weight_windows  # type: ignore[no-redef]
 
 
 DEFAULT_ISOLATED_ROUTES = "1,2,3,4,5,6,7,8,9,10,11,12,24,48,96,192,384,768,1536,2040"
@@ -272,6 +274,7 @@ def make_async_run(
     num_profile_experts: int,
     cpu_ids: list[int],
     w13_split: bool | None,
+    weight_window_bytes: int,
     generator: torch.Generator,
     std: float,
     lane_experts: list[list[int]] | None = None,
@@ -343,6 +346,7 @@ def make_async_run(
             global_num_experts=num_profile_experts,
             skip_weighted=True,
             w13_split=w13_split,
+            weight_window_bytes=weight_window_bytes,
             out=output,
         )
 
@@ -425,6 +429,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--w13-split", type=int, choices=(0, 1), default=0)
     parser.add_argument("--w13-split-chunks", type=int, default=2)
     parser.add_argument(
+        "--weight-window-bytes",
+        type=int,
+        default=0,
+        help="Global packed-B byte window applied to both W13 and W2; 0 uses the legacy split policy.",
+    )
+    parser.add_argument(
         "--sve-implementation",
         choices=("jit", "asm"),
         default="jit",
@@ -465,6 +475,10 @@ def main() -> int:
         raise ValueError("--parallel-degree must be positive")
     if args.w13_split and args.w13_split_chunks <= 1:
         raise ValueError("split W13 requires at least two chunks")
+    if args.weight_window_bytes < 0:
+        raise ValueError("--weight-window-bytes must be non-negative")
+    if args.weight_window_bytes > 0 and args.w13_split:
+        raise ValueError("positive --weight-window-bytes requires canonical --w13-split 0")
     global_experts = args.global_experts or args.num_experts
     if global_experts < args.num_experts:
         raise ValueError("--global-experts cannot be smaller than --num-experts")
@@ -496,8 +510,7 @@ def main() -> int:
     packed = prepare_fused_moe_bf16_tiled_weights(w13, w2, fuse_silu=True)
     if int(packed.gemm_backend) != 1:
         raise RuntimeError(
-            "SVE cost profiling requires the arm_sve_bf16 backend; "
-            f"the selected backend id is {packed.gemm_backend}"
+            f"SVE cost profiling requires the arm_sve_bf16 backend; the selected backend id is {packed.gemm_backend}"
         )
     del w13, w2
     sync_client = SyncClient(args.sync_port, args.rank_id)
@@ -515,6 +528,7 @@ def main() -> int:
                 num_profile_experts=args.num_experts,
                 cpu_ids=cpu_ids,
                 w13_split=bool(args.w13_split),
+                weight_window_bytes=args.weight_window_bytes,
                 generator=generator,
                 std=args.std,
             )
@@ -557,6 +571,7 @@ def main() -> int:
                 num_profile_experts=args.num_experts,
                 cpu_ids=cpu_ids,
                 w13_split=bool(args.w13_split),
+                weight_window_bytes=args.weight_window_bytes,
                 generator=generator,
                 std=args.std,
                 lane_experts=lane_experts,
@@ -607,6 +622,13 @@ def main() -> int:
     w13_packed_bytes = packed.w13[0].numel() * packed.w13[0].element_size()
     w2_packed_bytes = packed.w2[0].numel() * packed.w2[0].element_size()
     split_chunks = args.w13_split_chunks if args.w13_split else 1
+    w13_window, w2_window = fused_moe_weight_windows(
+        hidden_size=args.hidden_size,
+        intermediate_size=args.ffn_hidden_size,
+        n_tile=int(packed.backend_n_tile),
+        target_bytes=args.weight_window_bytes,
+        w13_fallback_ranges=split_chunks,
+    )
     llc_bytes = args.llc_bytes or detect_llc_bytes(cpu_ids[0])
     iso_formula = fit_from_measurements((entry["routes"], entry["threads"], entry["median_ns"]) for entry in isolated)
     payload = {
@@ -634,6 +656,9 @@ def main() -> int:
             "m_tail_policy": "xbyak_exact_m" if args.sve_implementation == "jit" else "static_bucketed",
             "w13_split": bool(args.w13_split),
             "w13_split_chunks": split_chunks,
+            "weight_window_bytes": args.weight_window_bytes,
+            "w13_window_ranges": w13_window.ranges,
+            "w2_window_ranges": w2_window.ranges,
             **kernel_metadata(),
         },
         "parallelism": {
@@ -662,11 +687,12 @@ def main() -> int:
             "w2_dense_bytes_per_expert": (args.hidden_size * args.ffn_hidden_size * 2),
             "w13_packed_bytes_per_expert": w13_packed_bytes // args.num_experts,
             "w2_packed_bytes_per_expert": w2_packed_bytes // args.num_experts,
-            "w13_chunk_bytes_per_expert": (w13_packed_bytes // args.num_experts // split_chunks),
-            "max_weight_stage_bytes_per_expert": max(
-                w13_packed_bytes // args.num_experts // split_chunks,
-                w2_packed_bytes // args.num_experts,
-            ),
+            "weight_window_target_bytes": args.weight_window_bytes,
+            "w13_chunk_bytes_per_expert": w13_window.max_range_bytes,
+            "w2_chunk_bytes_per_expert": w2_window.max_range_bytes,
+            "w13_window_bytes_per_expert": w13_window.max_range_bytes,
+            "w2_window_bytes_per_expert": w2_window.max_range_bytes,
+            "max_weight_stage_bytes_per_expert": max(w13_window.max_range_bytes, w2_window.max_range_bytes),
         },
         "measurement": {
             "path": "fused_moe_bf16_tiled_async",

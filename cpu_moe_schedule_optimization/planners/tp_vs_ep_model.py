@@ -76,6 +76,7 @@ class RankCompute:
     w13_split: bool
     shape: tuple[int, ...]
     predicted_ms: float
+    weight_window_bytes: int = 0
 
 
 @dataclass
@@ -158,8 +159,7 @@ class ParallelLayerEvaluator:
             else (
                 (
                     self.sve_implementation,
-                    self.m_tail_policy
-                    or ("xbyak_exact_m" if self.sve_implementation == "jit" else "static_bucketed"),
+                    self.m_tail_policy or ("xbyak_exact_m" if self.sve_implementation == "jit" else "static_bucketed"),
                 ),
             )
         )
@@ -183,14 +183,11 @@ class ParallelLayerEvaluator:
                 concurrent_ranks=self.topology.ranks,
             )
             try:
-                no_split, split = self.catalog.split_pair(query)
+                records = self.catalog.policy_variants(query)
             except ProfileCompatibilityError as error:
                 errors.append(f"{implementation}/{tail_policy}: {error}")
                 continue
-            return [
-                ContentionCostModel(no_split.path, expected_policy=query),
-                ContentionCostModel(split.path, expected_policy=query),
-            ]
+            return [ContentionCostModel(record.path, expected_policy=query) for record in records]
         raise ProfileCompatibilityError("no complete SVE profile pair matched; " + "; ".join(errors))
 
     def _compute(
@@ -231,6 +228,7 @@ class ParallelLayerEvaluator:
                     w13_split=bool(plan["w13_split"]),
                     shape=tuple(plan["shape"]),
                     predicted_ms=float(plan["makespan_ns"]) / 1e6,
+                    weight_window_bytes=int(plan["weight_window_bytes"]),
                 )
             )
         return max(result.predicted_ms for result in rank_results), rank_results
