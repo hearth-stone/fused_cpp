@@ -32,9 +32,10 @@ packed-C row base, regular W2 advances its row-major output, and direct-route W2
 keeps the route-output base fixed while advancing only the route-id table. The
 flag is off by default.
 
-`FUSED_CPP_MOE_SVE_W13_FIRST_PANEL_PREFETCH=1` enables the production-wiring
-experiment derived from the standalone streaming-B result below. The JIT cache
-contains prefetch and ordinary kernels for every exact M from 1 through 12.
+`FUSED_CPP_MOE_SVE_W13_FIRST_PANEL_PREFETCH=1` enables the retired,
+benchmark-only production-wiring experiment derived from the standalone
+streaming-B result below. The JIT cache contains prefetch and ordinary kernels
+for every exact M from 1 through 12.
 Within each thread-owned W13 N range, its first actual M panel uses one
 `PLDL1STRM` hint 2 KiB ahead; all subsequent panels use ordinary kernels.
 M1-M8 keep their two-bank K loop and disable hints on the final N tile. M9-M12
@@ -114,8 +115,10 @@ The exact-M extension gives the W13-only candidate median gains of about 1.93%
 at 1T and 2.10% at 4T over M1-M12 in five-process tests. Prefetching W2 adds no
 stable isolated benefit and regresses by about 7.36% relative to W13-only at
 24 concurrent 4T experts. Reusable W13 B panels also regress, reaching about
--4.35% e2e at M48/4T. The variants therefore remain off by default. Full
-generated-code, phase, exact-M, and concurrency results are in
+-4.35% e2e at M48/4T. W13-only prefetch is therefore retired as a production
+candidate: its flag remains for controlled reproduction, but it is not part of
+default dispatch or planner policy. Full generated-code, phase, exact-M, and
+concurrency results are in
 [`results/amazon_192c_w13_first_panel_prefetch.md`](results/amazon_192c_w13_first_panel_prefetch.md).
 
 The NUMA0 single-core cold-weight calibration uses 64 rotating H4096/F512

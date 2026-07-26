@@ -641,7 +641,7 @@ features:
 
   - id: load.w13_first_panel_prefetch
     part: load
-    status: experimental
+    status: retired
     implementation: >-
       csrc/moe/arm/sve_bf16/jit_kernels.cpp and
       csrc/moe/arm/common/fused_moe_bf16_tiled.cpp
@@ -667,6 +667,12 @@ features:
       optimizations/fused_moe_sve/benchmarks/bench_xbyak_exact_m.py
       --variants jit-panel,jit-prefetch --routes 1,2,3,4,5,6,7,8,9,10,11,12
       --threads 1,4 --warmup 5 --runs 31 --switch-period 5
+    result: >-
+      Retired as a production candidate on 2026-07-26. It improves exposed
+      cold-B latency below the aggregate request-bandwidth crossover, but the
+      benefit is not stable for reusable-B long routes or saturated
+      concurrency. The opt-in flag remains only for controlled reproduction;
+      production dispatch and the planner remain unchanged.
 
   - id: load.w2_first_panel_prefetch
     part: load
@@ -889,7 +895,7 @@ variants:
       FUSED_CPP_MOE_SVE_IMPL=jit
       FUSED_CPP_MOE_SVE_W13_FIRST_PANEL_PREFETCH=1
       fused_moe_bf16_tiled_{sync,scheduled,async,vllm_staged}
-    status: experimental
+    status: retired
 
   - id: sve_all_first_panel_prefetch
     features:

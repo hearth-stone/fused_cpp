@@ -229,6 +229,12 @@ must include aggregate cold-B pressure, not just an `M <= 12` condition.
 Do not enable first-panel `PLDL1STRM` for general W13 dispatch. The production
 wiring remains an explicit experimental flag and conflicts with bulk-M.
 
+This production decision was closed on 2026-07-26. Keep the implementation and
+flag only for controlled benchmark reproduction; do not add this variable to
+the planner or production dispatch. Reopen it only for new hardware evidence
+or a cache-retaining policy that removes the long-route and saturated-stream
+regressions.
+
 The useful domain is a single-panel `M=12` expert under low or moderate
 contention: W13 improves by roughly 5-6% and the complete one-expert operation
 by roughly 2-3%. Applying the same policy before reusable B panels is incorrect

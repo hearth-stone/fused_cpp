@@ -175,6 +175,12 @@ Acceptance gates:
   so neither schedule is adopted. Keep non-ILV as the fused JIT baseline.
   Full five-run W13/W2 results are in
   `../optimizations/fused_moe_sve/results/amazon_8c_192c_upstream_m8_m12_ilv.md`.
+- [x] Close W13-only first-panel software prefetch as a production candidate.
+  It hides cold-B latency under low or moderate concurrency, but crosses over
+  near 18-20 concurrent streams on AmazonC5192Cores and can regress reusable-B
+  long routes. Keep the explicit environment flag and benchmark as regression
+  evidence, but leave production dispatch off and do not add a planner gate.
+  Reopen only with a new hardware result or a cache-retaining prefetch policy.
 - [ ] Measure lane-tail weighted idle loss on a larger routing corpus. Current
   TP cases have a perfect-rebalance upper bound of only 0.7-2.4%; prototype
   same-width-lane work stealing only if representative cases repeatedly exceed
