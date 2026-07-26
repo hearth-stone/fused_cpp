@@ -129,6 +129,10 @@ T_plan(plan) + T_execute(plan)
 - [`cost_model/GEMM_ECM_VALIDATION.md`](./cost_model/GEMM_ECM_VALIDATION.md)：
   实现弱相关三层 GEMM shadow；分离算法 work、SVE mapper 和实测机器响应，
   并记录 V3 长 route 留出验证及当前可迁移性限制。
+- [`cost_model/ANALYTIC_MODEL.md`](./cost_model/ANALYTIC_MODEL.md)：
+  planner-compatible 解析 backend；由 exact kernel demand、cache capacity、
+  route-independent machine service curves 和共享资源 event simulator 预测
+  isolated/contention 时间，并定义薄校准 schema 与 holdout 验收门槛。
 - [`DESIGN.md`](./DESIGN.md)：完整设计文档，定义 plan space、成本模型、严格最优求解方式、multi-plan runtime selector 和阶段性路线图。
 - [`TODO.md`](./TODO.md)：schema-v2 profiling 之后的 policy-aware cost model、planner 与 TP/EP evaluator 待办。
 - [`README.md`](./README.md)：当前入口说明。
@@ -142,8 +146,12 @@ T_plan(plan) + T_execute(plan)
 - [`cost_model/gemm_cost_model.py`](./cost_model/gemm_cost_model.py)：实现弱相关
   GEMM 核心契约；分离逻辑算法工作、统一 kernel demand 和目标机器实测响应。
 - [`cost_model/sve_bf16_kernel_model.py`](./cost_model/sve_bf16_kernel_model.py)：
-  当前 SVE BF16 M12/M8/M4/M2 的实现 mapper；负责 tile、padding、N-split、
+  当前 SVE BF16 exact-M1--M12/static bucket 的实现 mapper；负责 tile、padding、N-split、
   指令和 cache 流量，不进入通用算法公式。
+- [`cost_model/analytic_model.py`](./cost_model/analytic_model.py) /
+  [`cost_model/validate_analytic_model.py`](./cost_model/validate_analytic_model.py)：
+  解析 cost model、机器校准加载和 empirical holdout 验证；完成跨机器门槛前
+  保持 opt-in。
 - [`cost_model/gemm_ecm.py`](./cost_model/gemm_ecm.py)：旧 API 兼容 facade 和
   stage-trace report CLI；三层 GEMM model 当前不进入 planner active cost。
 - [`cost_model/working_set_model.py`](./cost_model/working_set_model.py)：仅针对

@@ -5,7 +5,8 @@ from __future__ import annotations
 import math
 import os
 import sys
-from typing import Dict, List, Sequence, Tuple
+from pathlib import Path
+from typing import Dict, List, Protocol, Sequence, Tuple
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "cost_model"))
 from phase_model import ContentionCostModel  # noqa: E402
@@ -20,6 +21,48 @@ _ASYNC_PLACEMENT_TAIL_POOL = 1
 _ASYNC_STAGE_EXPERT = 0
 _ASYNC_RESIZE_NONE = 0
 _ASYNC_FULL_EXPERT_RANGE = 0
+
+
+class PlannerPolicy(Protocol):
+    w13_split: bool
+    w13_split_chunks: int
+    weight_window_bytes: int
+    w13_window_ranges: int
+    w2_window_ranges: int
+    intermediate_size: int
+    mode: str
+    degree: int
+    llc_bytes_per_rank: int
+
+    def key_without_kernel_policy(self) -> tuple[object, ...]: ...
+
+    def kernel_policy_key(self) -> tuple[object, ...]: ...
+
+
+class PlannerCostModel(Protocol):
+    schema_version: int
+    supported_shapes: Sequence[Sequence[int]]
+    supported_widths: Sequence[int]
+    profile_path: Path
+    policy: PlannerPolicy | None
+    max_stage_bytes: int
+    has_full_workload_anchors: bool
+    local_experts: int
+    profile_runs: int
+
+    def T_iso(self, routes: int, threads: int) -> float: ...
+
+    def dag_makespan(self, tasks) -> float: ...
+
+    def supports_shape(self, shape) -> bool: ...
+
+    def relative_uncertainty(self, routes: int, shape) -> float: ...
+
+    def relative_full_call_uncertainty(self, routes: int, shape) -> float: ...
+
+    def profiled_full_call_time(self, routes: int, shape) -> float: ...
+
+    def window_bytes_per_worker(self, threads: int) -> int: ...
 
 
 def _partitions(n: int, parts: Sequence[int]) -> List[Tuple[int, ...]]:
@@ -47,10 +90,22 @@ def _default_widths(num_cores: int) -> tuple[int, ...]:
     return tuple(widths)
 
 
+def _model_candidate_shapes(
+    model: PlannerCostModel,
+    num_cores: int,
+) -> tuple[tuple[int, ...], ...]:
+    candidate_shapes = getattr(model, "candidate_shapes", None)
+    if callable(candidate_shapes):
+        return tuple(tuple(int(value) for value in shape) for shape in candidate_shapes(num_cores))
+    if model.schema_version >= 2:
+        return tuple(tuple(int(value) for value in shape) for shape in model.supported_shapes)
+    return ()
+
+
 class IntervalPlanner:
     def __init__(
         self,
-        model: ContentionCostModel,
+        model: PlannerCostModel,
         num_cores: int = 8,
         widths: Sequence[int] | None = None,
         *,
@@ -59,7 +114,8 @@ class IntervalPlanner:
     ):
         self.model = model
         self.num_cores = int(num_cores)
-        self.widths = tuple(widths or _default_widths(self.num_cores))
+        model_widths = getattr(model, "supported_widths", None)
+        self.widths = tuple(widths or model_widths or _default_widths(self.num_cores))
         self.cpu_ids = tuple(int(cpu) for cpu in (cpu_ids if cpu_ids is not None else range(num_cores)))
         if len(self.cpu_ids) != self.num_cores or len(set(self.cpu_ids)) != num_cores:
             raise ValueError("cpu_ids must contain num_cores unique physical CPUs")
@@ -67,7 +123,7 @@ class IntervalPlanner:
         if shapes is not None:
             candidates = [tuple(int(value) for value in shape) for shape in shapes]
         elif model.schema_version >= 2:
-            candidates = list(model.supported_shapes)
+            candidates = list(_model_candidate_shapes(model, self.num_cores))
         else:
             candidates = _partitions(self.num_cores, self.widths)
         self.shapes = tuple(
@@ -77,7 +133,7 @@ class IntervalPlanner:
         )
         if not self.shapes:
             raise ProfileCompatibilityError(
-                f"no measured shape covers {self.num_cores} cores with widths {self.widths}"
+                f"no supported shape covers {self.num_cores} cores with widths {self.widths}"
             )
 
     def _lanes(self, shape: Tuple[int, ...]):
@@ -157,7 +213,7 @@ class IntervalPlanner:
     def score_shape(self, experts, shape):
         signature = tuple(int(value) for value in shape)
         if self.model.schema_version >= 2 and not self.model.supports_shape(signature):
-            raise ProfileCompatibilityError(f"shape {signature} is not present in {self.model.profile_path.name}")
+            raise ProfileCompatibilityError(f"shape {signature} is not supported by {self.model.profile_path.name}")
         lanes = self._lanes(signature)
         tasks = self._build_tasks(experts, lanes, self._assign(experts, lanes))
         if self._uses_full_workload_anchor(experts):
@@ -364,7 +420,7 @@ class PolicyAwarePlanner:
 
     def __init__(
         self,
-        models: Sequence[ContentionCostModel],
+        models: Sequence[PlannerCostModel],
         num_cores: int,
         *,
         cpu_ids: Sequence[int] | None = None,
@@ -395,11 +451,11 @@ class PolicyAwarePlanner:
             for model in self.models
         )
 
-    def _pruned_shapes(self, model: ContentionCostModel):
+    def _pruned_shapes(self, model: PlannerCostModel):
         policy = model.policy
         assert policy is not None
         target = policy.llc_bytes_per_rank * self.working_set_target_fraction
-        shapes = [shape for shape in model.supported_shapes if sum(shape) == self.num_cores]
+        shapes = [shape for shape in _model_candidate_shapes(model, self.num_cores) if sum(shape) == self.num_cores]
         by_distance = sorted(
             shapes,
             key=lambda shape: abs(len(shape) * model.max_stage_bytes - target),

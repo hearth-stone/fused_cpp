@@ -676,9 +676,9 @@ One-hot 是线程宽度的等价求解器编码，不是剪枝。一般 active-s
 
 | 层级 | 原始可行域 | 当前限制 | 性质 |
 | --- | --- | --- | --- |
-| 线程宽度 | $1,2,\ldots,T_{\max}$ | `1,2,4,8,16,32` | 离散宽度剪枝 |
+| 线程宽度 | $1,2,\ldots,T_{\max}$ | empirical backend 为 `1,2,4,8,16,32`；analytic backend 使用 machine calibration 中显式允许的宽度 | 离散宽度剪枝 |
 | 并发配置 | 活跃 job 可形成任意满足 CPU 容量的 $(M_i,t_i)$ 组合 | 默认使用静态 core shape；显式 tail-pool 只允许对齐 group 在全部覆盖 fixed tasks 完成后领取 whole-expert pooled task | static-partition + boundary regroup 剪枝 |
-| Shape 集合 | 所有满足 CPU 容量的整数宽度组合 | profile 支持并经 active 工作集规则筛选的 shape；owner-cache band 当前仅 shadow | 候选剪枝 |
+| Shape 集合 | 所有满足 CPU 容量的整数宽度组合 | empirical backend 只用 profile shape；analytic backend 生成 homogeneous 和至多两种宽度的 shape，再应用 active 工作集规则 | 候选剪枝 |
 | Assignment | 任意 expert-to-resource 调度 | 按 isolated cost 的 LPT | 启发式分配 |
 | Runtime plan contract | task 可携带离散宽度集合、stage/range、resize 边界和动态 placement | Plan V2 native strict/tail_pool；默认 singleton fixed，强制实验模式可生成 whole-expert pooled placement；运行中宽度固定 | 表示支持 boundary regroup，仍无 in-task resize |
 | x86 synchronous executor team mapping | expert 可取任意合法整数宽度并形成任意 wave | API 接受 1--256 workers；均衡 route 用 atomic expert queue，active expert 不足时按 route/当前宽度贪心组 team，强偏斜时按 64-row target 形成有序 wave | planner 外的确定性 runtime mapper |
@@ -687,16 +687,17 @@ One-hot 是线程宽度的等价求解器编码，不是剪枝。一般 active-s
 | Workload 输入 | 任意合法 global 或 rank-local route histogram | planner 接受任意 histogram；catalog preset 只扩展验证覆盖，不过滤运行时输入 | 不剪枝 |
 | Route combine | 任意满足 TopK release 约束和 CPU 容量的 merge 排程 | planner 不搜索 combine；默认 executor 采用 expert-first 单 token 贪心和连续收尾 | 外层启发式限制 |
 | Kernel variant | 任意未被支配的实现 | ARM `auto` 先要求完整 `jit/xbyak_exact_m` legacy split/no-split pair，再加入同 identity 的实测 global packed-B byte-window variants；缺少完整 JIT legacy pair 时整体回退 static pair；x86 AMX 使用不进入 planner 的确定性 per-expert pattern/cache policy，AVX-512/AMX 共用确定性 team-N/wave policy | 实例候选限制与 runtime policy |
-| Isolated time | 真实 $I_i(t)$ | active $T_{\mathrm{iso}}$ 经验公式；分层 GEMM model 仅 shadow | cost 近似，不剪枝可行域 |
-| Contention | 任意动态活跃配置上的真实 $D_i(\mathcal Z)$ | 实测 contention profile 与 stage-aware event simulator | cost 近似，不剪枝可行域 |
+| Isolated time | 真实 $I_i(t)$ | production 默认仍为经验公式；可选 analytic backend 由 kernel demand、cache traffic 和机器 service curves 计算 | cost 近似，不剪枝可行域 |
+| Contention | 任意动态活跃配置上的真实 $D_i(\mathcal Z)$ | production 默认为实测 profile；analytic backend 按 matrix/L1/L2/LLC/DRAM/epilogue 共享容量推进事件 | cost 近似，不剪枝可行域 |
 
 当前 `IntervalPlanner` 搜索的是上述剪枝后 plan space 中的方案，不是原始问题
 的全局最优方案。
 
-Amazon 192-core NUMA0 的 schema-v2 profile 已将实测线程域扩展到
+Amazon 192-core NUMA0 的 schema-v2 empirical profile 已将实测线程域扩展到
 `1,2,4,8,16,32,48,64,96`，但这只扩大 $\widehat I_i(t)$ 的校准域。当前 planner 的
-线程宽度剪枝仍为表中所列的 `1,2,4,8,16,32`；在完成 48/64/96T 的 held-out
-regret 验证前，不自动扩大在线决策空间。
+empirical 线程宽度剪枝仍为 `1,2,4,8,16,32`；在完成 48/64/96T 的 held-out
+regret 验证前，不自动扩大该 backend 的在线决策空间。analytic backend 不继承
+此实测表限制，但 machine calibration 必须显式列出可执行宽度。
 
 ## 8. 当前 Cost Model 的位置
 
@@ -802,16 +803,19 @@ $$
 \qquad F_2^{\mathrm{use}}=2MHF.
 $$
 
-当前 BF16 输入/权重、BF16 fused intermediate、FP32 down store 的 compulsory
-one-pass bytes 为：
+当前 BF16 输入/权重、BF16 fused intermediate、每元素 $b_{\mathrm{down}}$ bytes
+的 down route store，其 compulsory one-pass bytes 为：
 
 $$
 Q_{13}^{\min}=2MH+4HF+2MF,
 $$
 
 $$
-Q_2^{\min}=2MF+2FH+4MH.
+Q_2^{\min}=2MF+2FH+b_{\mathrm{down}}MH.
 $$
+
+production direct-route 默认 $b_{\mathrm{down}}=2$；历史 FP32 down buffer 为
+$b_{\mathrm{down}}=4$。该值是 kernel/output policy，不改变 useful FLOPs。
 
 给定机器理论上界 $P_\mu^{\mathrm{peak}}$ 和
 $B_\mu^{\mathrm{peak}}$，算法层可以给出条件下界：
@@ -926,6 +930,126 @@ latency 只能得到 $F/\Delta T$、$Q/\Delta T$ 等同一时间的等价 requir
 shadow，不替换 active $T_{\mathrm{iso}}$。V3 steady-M12 留出误差低于 1.7%，
 但只验证同 shape 的 panel 线性，尚未证明跨 shape/kernel/machine 的可迁移性；
 完整限制见 `cost_model/GEMM_ECM_VALIDATION.md`。
+
+#### 8.2.4 解析机器响应与共享资源模型
+
+`analytic_model.py` 将 8.2 的 demand 契约提升为可被 `IntervalPlanner` 直接使用
+的可选 backend。它不加载 route/thread latency table 或 contention shape。对
+每类资源 $r$，机器校准只保存单核速率 $R_{r,1}$、饱和聚合速率
+$R_{r,\mathrm{sat}}$ 和饱和线程数 $t_{r,\mathrm{sat}}$。matrix/frequency
+derate 可选 `power`：
+
+$$
+\alpha_r
+=\frac{\log(R_{r,\mathrm{sat}}/R_{r,1})}
+{\log t_{r,\mathrm{sat}}},
+\qquad
+R_r(t)
+=\min\left(R_{r,\mathrm{sat}},R_{r,1}t^{\alpha_r}\right).
+$$
+
+初段近线性、之后撞到共享 fabric ceiling 的 cache/DRAM 可选
+`shared_bottleneck`：
+
+$$
+\beta_r
+=\frac{R_{r,1}t_{r,\mathrm{sat}}/R_{r,\mathrm{sat}}-1}
+{t_{r,\mathrm{sat}}-1},
+\qquad
+R_r(t)
+=\min\left(
+R_{r,\mathrm{sat}},
+\frac{R_{r,1}t}{1+\beta_r(t-1)}
+\right).
+$$
+
+两种曲线使用相同三个硬件锚点；curve family 表达资源拓扑，不增加
+route-dependent 参数。
+
+必需资源为 matrix FLOP/s、L1/L2/LLC/DRAM byte/s；frontend instruction/s 和
+epilogue element/s 可选。校准还包含 cache 容量/有效容量比例、固定
+call/expert/stage/range 开销、每 route 非 GEMM 开销，以及最多两个接近 1 的
+W13/W2 residual scale。以上参数均与 route histogram 和 planner shape 无关。
+
+设某 stage 有 $P$ 个物理 M panel；第 $j$ 个顺序 N range 的 packed-B 字节为
+$B_j$、每个 owner 的 B 窗口为 $U_j$、active owner 数为 $t_j$；全部物理
+packed-A 字节为 $A$，最大单 panel packed-A 字节为 $A_p$。range 按 tile 数
+非递增分配，因此后续 active owners 是首个 range 的子集。令
+$h_2(W)$ 为 effective L2 到 physical L2 容量不确定带内的 smoothstep miss
+比例，则：
+
+$$
+Q_{B,L2}
+=\sum_j B_j\left[1+(P-1)h_2(U_j+A_p)\right],
+$$
+
+$$
+Q_{A,L2}
+=A\left[t_1+\sum_{j>1}t_jh_2(U_j+A)\right].
+$$
+
+这直接表达当前 kernel loop：首次 B scan 是冷权重，后续 M panel 是否从 L2
+复用由 owner stripe 决定；每个 N owner 至少扫描一次 A，后续顺序 range 若 A
+仍驻留 L2 则不产生新 refill。对 production 的 distinct-expert 流式访问，
+compulsory DRAM 只有首次 packed-B：
+
+$$
+Q_{\mathrm{DRAM}}^{\mathrm{comp}}=\sum_j B_j.
+$$
+
+packed-A 和 W13 intermediate 由同一 operator 刚刚生成，默认从 cache hierarchy
+供给；A refill、重复 B refill 和 C writeback 都记为 spillable。若同时活跃 phase
+的工作集为 $\sum_i W_i$，使用 effective/physical LLC 间的 $h_3(\sum_iW_i)$
+决定这些 spillable bytes 中进入 DRAM 的比例。
+
+$W_i$ 中只有 $P>1$ 时才包含 active B window。$P=1$ 的 M<=12 B 仍计入
+compulsory DRAM 和 stream bandwidth，但没有后续 panel reuse，不占
+`reusable_B_capacity`；A 和 C 因其他 owner/下一 stage 仍会消费而继续进入
+工作集。这与 9.6 的 M12 冷 B 扩展和 one-pass LLC pollution 结论一致。
+
+isolated stage 使用：
+
+$$
+T_{\mathrm{xfer}}
+=\frac{Q_{L1}}{B_{L1}(t)}
++\frac{Q_{L2}}{B_{L2}(t)}
++\frac{Q_{LLC}}{B_{LLC}(t)}
++\frac{Q_{\mathrm{DRAM}}}{B_{\mathrm{DRAM}}(t)},
+$$
+
+$$
+T_{\mathrm{body}}
+=\max\left(
+\frac{F^{\mathrm{bal}}}{P_{\mathrm{matrix}}(t)},
+\frac{I^{\mathrm{bal}}}{R_{\mathrm{frontend}}(t)},
+T_{\mathrm{xfer}}
+\right),
+$$
+
+再加 stage/range fixed cost 和 epilogue service。第 $j$ 个 range 的 balanced
+N-tile demand 为
+$\lceil n_j/t\rceil\min(n_j,t)$；因此 N tile 不能整除、尾 range 少于 team
+width、非 2 次幂宽度和 active-thread 截断都不需要额外 route table。
+
+并发事件中，当前 phase $i$ 对资源 $r$ 的请求速率为
+$q_{i,r}/T_i$。总 active width 为 $c$ 时：
+
+$$
+\lambda_r=\sum_i\frac{q_{i,r}}{T_i},
+\qquad
+d_r=\max\left(1,\frac{\lambda_r}{R_r(c)}\right).
+$$
+
+$d_r$ 只放大对应 matrix、frontend、L1、L2、LLC、DRAM 或 epilogue 分量，
+固定开销不作为内存流量 derate。event simulator 在 W13/W2 range completion
+处重算 active set 和所有 $d_r$。因此 isolated time 相近但 resource vector
+不同的两个 kernel 可以得到不同 contention 响应。
+
+解析 backend 与 empirical backend 共用 planner protocol。前者根据机器允许
+宽度生成 homogeneous/至多两种宽度的 shape，后者继续严格使用 profile shape。
+在 9.14 的真实机器验收门槛通过前，production 默认仍为 empirical backend；
+解析 backend 先用于显式 shadow/what-if 规划。完整 schema、假设和运行命令见
+`cost_model/ANALYTIC_MODEL.md`。
 
 ### 8.3 Split-W13 owner-cache 工作集 band
 
@@ -1558,6 +1682,30 @@ H4096/F512、256 experts、2048 tokens、TopK=6 的 long-short bimodal
 11.733 ms。运行扩展 hash 与旧校准表不一致，因此该结果只验证 executor action
 和 ABI 开销，不用于证明当前 cost-model 的绝对时间或 regret 准确性。
 
+### 9.14 解析 backend 的实现与验收状态
+
+2026-07-26 增加 `AnalyticMoeCostModel`、machine calibration schema 和
+`validate_analytic_model.py`。纯逻辑测试覆盖：
+
+- 两锚点 service curve 的单核、插值和饱和值；
+- exact-M1 按物理 M2 FLOPs 收费；
+- 冷 weight 是 compulsory DRAM，而 packed-A refill 是 cache/spillable traffic；
+- M<=12 的 one-pass B 不占 reusable LLC budget，但仍占 DRAM service；
+- 非整除 N range 不丢 tile，并按尾 range 的实际 active owners 收费；
+- split-W13 不改变 GEMM executed work，只增加 range cost；
+- 多个 phase 对同一资源的 aggregate request 超过 ceiling 时产生 derate；
+- 无 measured shape table 的 analytic model 可直接进入
+  `IntervalPlanner`/`PlannedMoE`；
+- holdout 报告同时给出 isolated/full-call 绝对误差和真实 shape regret。
+
+这些测试只验证公式不变量和 planner contract，不证明目标机器精度。真实校准表
+不得从现有 route/thread cost table 反推；它必须来自独立 matrix、L1、L2、
+LLC、DRAM、frontend/epilogue probe 和固定开销测量。旧 schema-v2 表仅作为
+holdout oracle。production 切换门槛暂定为 isolated MAPE 不超过 10%、
+contention P90 绝对误差不超过 15%、所有验证 route 的最大 measured shape
+regret 不超过 5%。在完成 8-core 与 192-core 至少各一份 unseen
+route/thread/mixed-distribution 验证前，解析 backend 保持 opt-in。
+
 ## 10. 同步规则
 
 发生以下任一变化时，必须同步更新本文档：
@@ -1614,3 +1762,4 @@ H4096/F512、256 experts、2048 tokens、TopK=6 的 long-short bimodal
 | 2026-07-26 | v0.28 | 将 SVE 的 team-N ownership 引入同步 x86 AVX-512/AMX executor：active expert 不足时按 route/width 贪心组 team，2x 且至少 64-row 的强偏斜 route 使用有序 waves，均衡 route 保留 expert queue；定义精确 N-range、team-width 与 wave 公式，记录 8-core C8i 1/2/4/8T 验证，并明确该 mapper 尚不进入 planner candidate space。 |
 | 2026-07-26 | v0.29 | 引入向后兼容的 async Plan V2：增加 strict execution mode、离散 allowed-width CSR、preferred/min/max、NUMA/stage/range/resize 字段及强校验；production planner 仍生成 singleton width 并严格降级到现有 fixed-interval native DAG，因此 moldable 语义、公式、剪枝和 cost model 保持不变。 |
 | 2026-07-26 | v0.30 | Plan V2 接入 ARM native strict entrypoint，并增加显式 whole-expert tail_pool placement：对齐线程组只在覆盖 fixed tasks 全部完成后重组，运行中宽度仍固定；planner 默认 strict，tail pool 仅作为不参与 cost-model 排序的强制实验 bridge。同步 placement/依赖/对齐约束、剪枝表和验证要求，并记录 192-core 主机 NUMA0 的 bit-exact 与 long-short bimodal 性能验证。 |
+| 2026-07-26 | v0.33 | 增加 planner-compatible 解析 SVE MoE backend：由 exact kernel demand、L2/LLC 容量模型、分层 service curves 和共享资源 event simulator 计算 isolated/contention 时间；machine calibration 不包含 route/thread 或 shape 表。analytic backend 生成 homogeneous/双宽度 shape 并保持 opt-in，旧 empirical backend 继续作为 production 默认和 holdout oracle。 |

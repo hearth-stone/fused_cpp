@@ -77,10 +77,8 @@ def allocate_n_tiles(
 
     total_tiles = n_columns // n_tile
     range_base, range_extra = divmod(total_tiles, n_ranges)
-    if range_extra:
-        raise ValueError(f"N tiles={total_tiles} cannot form {n_ranges} equal ranges")
-    range_tiles = (range_base,) * n_ranges
-    if not range_tiles or range_base <= 0:
+    range_tiles = tuple(range_base + (range_id < range_extra) for range_id in range(n_ranges))
+    if not range_tiles or range_tiles[-1] <= 0:
         raise ValueError(f"n_ranges={n_ranges} exceeds available N tiles={total_tiles}")
 
     per_thread = [0] * threads
@@ -167,9 +165,7 @@ class SveBf16KernelProfile:
         if self.n_tile <= 0:
             raise ValueError("SVE BF16 n_tile must be positive")
         if not self.implementation_id:
-            implementation_id = (
-                SVE_BF16_IMPLEMENTATION_ID if self.exact_m else SVE_BF16_STATIC_ASM_IMPLEMENTATION_ID
-            )
+            implementation_id = SVE_BF16_IMPLEMENTATION_ID if self.exact_m else SVE_BF16_STATIC_ASM_IMPLEMENTATION_ID
             object.__setattr__(self, "implementation_id", implementation_id)
 
     @property

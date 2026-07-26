@@ -52,6 +52,27 @@ out-of-profile measurements across F, parallel degree, and machine topology.
 - [x] Add exhaustive dual-rank uniform/hotspot regret validation and an input for
   real routing histograms.
 
+## 5.1 Analytical backend migration (2026-07-26)
+
+- [x] Separate logical GEMM work, exact SVE kernel demand, and machine response.
+- [x] Replace route/thread latency lookup with cache-capacity formulas and
+  route-independent matrix/L1/L2/LLC/DRAM service curves.
+- [x] Derive contention from per-resource aggregate requested rate inside the
+  W13/W2 range event simulator.
+- [x] Let the analytical backend generate homogeneous and two-width shapes while
+  preserving empirical profile behavior.
+- [x] Add an empirical-holdout validator for isolated error, contention error,
+  and measured planner regret.
+- [ ] Produce independent thin calibrations on AmazonECS8Cores and one NUMA rank
+  of AmazonC5192Cores. Do not infer service ceilings from the route/thread table.
+- [ ] Validate unseen routes, widths, mixed distributions, split/no-split, and
+  byte-window policies against the acceptance gates in
+  `cost_model/ANALYTIC_MODEL.md`.
+- [ ] Switch the production default only after both machines pass; retain the
+  empirical backend as an explicit fallback and regression oracle.
+- [ ] Add dedicated physical demand for gather/pack, route scatter/merge,
+  communication, and cross-rank lifetime changes before claiming full E2E time.
+
 ## Deferred external validation
 
 - [ ] Cross-profile interpolation stays disabled. A target-model routing dump

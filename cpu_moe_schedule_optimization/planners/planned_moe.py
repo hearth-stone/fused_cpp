@@ -2,14 +2,10 @@
 
 from __future__ import annotations
 
-import os
-import sys
 import time
 from typing import Dict, List, Sequence, Tuple
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "cost_model"))
-from phase_model import ContentionCostModel  # noqa: E402
-from interval_planner import IntervalPlanner, PolicyAwarePlanner  # noqa: E402
+from interval_planner import IntervalPlanner, PlannerCostModel, PolicyAwarePlanner  # noqa: E402
 
 
 _BUCKETS = [1, 2, 4, 8, 12, 24, 48, 96, 192, 384, 768, 1536, 2040, 4096, 8192]
@@ -57,12 +53,12 @@ def signature(counts: List[Tuple[int, int]], policy_identity: tuple[object, ...]
 class PlannedMoE:
     def __init__(
         self,
-        models: ContentionCostModel | Sequence[ContentionCostModel],
+        models: PlannerCostModel | Sequence[PlannerCostModel],
         num_cores: int = 8,
         *,
         cpu_ids: Sequence[int] | None = None,
     ):
-        if isinstance(models, ContentionCostModel):
+        if callable(getattr(models, "T_iso", None)) and callable(getattr(models, "dag_makespan", None)):
             self.models = (models,)
         else:
             self.models = tuple(models)
@@ -92,7 +88,25 @@ class PlannedMoE:
         selected_policy = result.get("policy")
         selected_profile = selected_policy.get("profile") if selected_policy is not None else None
         for index, model in enumerate(self.models):
-            if str(model.profile_path) == selected_profile:
+            if str(model.profile_path) != selected_profile:
+                continue
+            if selected_policy is None or model.policy is None:
+                return index
+            selected_kernel_policy = (
+                selected_policy["weight_window_bytes"],
+                selected_policy["w13_window_ranges"],
+                selected_policy["w2_window_ranges"],
+                selected_policy["w13_split"],
+                selected_policy["w13_split_chunks"],
+            )
+            model_kernel_policy = (
+                model.policy.weight_window_bytes,
+                model.policy.w13_window_ranges,
+                model.policy.w2_window_ranges,
+                model.policy.w13_split,
+                model.policy.w13_split_chunks,
+            )
+            if model_kernel_policy == selected_kernel_policy:
                 return index
         raise RuntimeError(f"no planner model for selected profile {selected_profile!r}")
 
