@@ -33,6 +33,7 @@ def test_make_async_run_reuses_native_output(monkeypatch) -> None:
         num_profile_experts=2,
         cpu_ids=[0],
         w13_split=True,
+        weight_window_bytes=0,
         generator=torch.Generator().manual_seed(0),
         std=0.01,
     )
