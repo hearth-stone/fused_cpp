@@ -12,6 +12,16 @@ from phase_model import ContentionCostModel  # noqa: E402
 from profile_catalog import ProfileCompatibilityError  # noqa: E402
 
 
+_ASYNC_PLAN_VERSION = 2
+_ASYNC_EXECUTION_STRICT = "strict"
+_ASYNC_EXECUTION_TAIL_POOL = "tail_pool"
+_ASYNC_PLACEMENT_FIXED = 0
+_ASYNC_PLACEMENT_TAIL_POOL = 1
+_ASYNC_STAGE_EXPERT = 0
+_ASYNC_RESIZE_NONE = 0
+_ASYNC_FULL_EXPERT_RANGE = 0
+
+
 def _partitions(n: int, parts: Sequence[int]) -> List[Tuple[int, ...]]:
     parts = sorted(parts, reverse=True)
     output: List[Tuple[int, ...]] = []
@@ -209,6 +219,7 @@ class IntervalPlanner:
                 "degree": self.model.policy.degree,
             }
         return {
+            "plan_version": _ASYNC_PLAN_VERSION,
             "shape": selected["shape"],
             "makespan_ns": selected["makespan_ns"],
             "uncertainty_ns": selected["uncertainty_ns"],
@@ -238,14 +249,113 @@ class IntervalPlanner:
         for _, _, _, _, dependencies in tasks:
             flat_dependencies.extend(dependencies)
             dependency_offsets.append(len(flat_dependencies))
+        task_threads = [threads for _, _, _, threads, _ in tasks]
+        num_tasks = len(tasks)
         return {
+            "plan_version": _ASYNC_PLAN_VERSION,
+            "execution_mode": _ASYNC_EXECUTION_STRICT,
             "num_threads": self.num_cores,
             "thread_cpu_ids": list(self.cpu_ids),
             "task_expert_ids": [expert for expert, _, _, _, _ in tasks],
             "task_core_begins": [core for _, _, core, _, _ in tasks],
-            "task_threads": [threads for _, _, _, threads, _ in tasks],
+            "task_threads": task_threads,
             "task_dep_offsets": dependency_offsets,
             "task_deps": flat_dependencies,
+            "task_preferred_threads": list(task_threads),
+            "task_min_threads": list(task_threads),
+            "task_max_threads": list(task_threads),
+            "task_allowed_thread_offsets": list(range(num_tasks + 1)),
+            "task_allowed_threads": list(task_threads),
+            "task_placement_modes": [_ASYNC_PLACEMENT_FIXED] * num_tasks,
+            "task_numa_nodes": [-1] * num_tasks,
+            "task_stage_ids": [_ASYNC_STAGE_EXPERT] * num_tasks,
+            "task_resize_points": [_ASYNC_RESIZE_NONE] * num_tasks,
+            "task_range_granularities": [_ASYNC_FULL_EXPERT_RANGE] * num_tasks,
+        }
+
+    def to_tail_pool_bridge(
+        self,
+        tasks,
+        *,
+        pool_threads: int,
+        max_pooled_routes: int = 12,
+    ) -> Dict[str, object]:
+        """Build an explicit whole-expert tail-pool Plan V2.
+
+        This is a forced experimental bridge. The current cost model still
+        scores the original fixed-lane DAG and does not predict the dynamic
+        tail-pool makespan.
+        """
+        pool_threads = int(pool_threads)
+        max_pooled_routes = int(max_pooled_routes)
+        if pool_threads <= 0 or pool_threads > self.num_cores:
+            raise ValueError(f"pool_threads must be in [1, {self.num_cores}], got {pool_threads}")
+        if self.num_cores % pool_threads != 0:
+            raise ValueError(
+                f"pool_threads must divide num_cores: pool_threads={pool_threads}, num_cores={self.num_cores}"
+            )
+        if max_pooled_routes <= 0:
+            raise ValueError(f"max_pooled_routes must be positive, got {max_pooled_routes}")
+
+        pooled = [routes <= max_pooled_routes for _, routes, _, _, _ in tasks]
+        if not any(pooled):
+            raise ValueError(f"tail_pool found no task with routes <= {max_pooled_routes}")
+
+        resolved_dependencies: list[list[int]] = []
+        for task_id, (_, _, core_begin, threads, dependencies) in enumerate(tasks):
+            if pooled[task_id]:
+                resolved_dependencies.append([])
+                continue
+            if core_begin % pool_threads != 0 or threads % pool_threads != 0:
+                raise ValueError(
+                    "fixed task intervals must align to pool_threads: "
+                    f"task={task_id}, core_begin={core_begin}, "
+                    f"threads={threads}, pool_threads={pool_threads}"
+                )
+            frontier = list(dependencies)
+            fixed_dependencies: set[int] = set()
+            while frontier:
+                dependency = frontier.pop()
+                if dependency < 0 or dependency >= task_id:
+                    raise ValueError(
+                        f"task dependencies must refer to earlier task ids: task={task_id}, dependency={dependency}"
+                    )
+                if pooled[dependency]:
+                    frontier.extend(tasks[dependency][4])
+                else:
+                    fixed_dependencies.add(dependency)
+            resolved_dependencies.append(sorted(fixed_dependencies))
+
+        dependency_offsets = [0]
+        flat_dependencies: list[int] = []
+        for dependencies in resolved_dependencies:
+            flat_dependencies.extend(dependencies)
+            dependency_offsets.append(len(flat_dependencies))
+
+        task_threads = [pool_threads if pooled[task] else int(values[3]) for task, values in enumerate(tasks)]
+        num_tasks = len(tasks)
+        return {
+            "plan_version": _ASYNC_PLAN_VERSION,
+            "execution_mode": _ASYNC_EXECUTION_TAIL_POOL,
+            "num_threads": self.num_cores,
+            "thread_cpu_ids": list(self.cpu_ids),
+            "task_expert_ids": [expert for expert, _, _, _, _ in tasks],
+            "task_core_begins": [-1 if pooled[task] else int(values[2]) for task, values in enumerate(tasks)],
+            "task_threads": task_threads,
+            "task_dep_offsets": dependency_offsets,
+            "task_deps": flat_dependencies,
+            "task_preferred_threads": list(task_threads),
+            "task_min_threads": list(task_threads),
+            "task_max_threads": list(task_threads),
+            "task_allowed_thread_offsets": list(range(num_tasks + 1)),
+            "task_allowed_threads": list(task_threads),
+            "task_placement_modes": [
+                _ASYNC_PLACEMENT_TAIL_POOL if is_pooled else _ASYNC_PLACEMENT_FIXED for is_pooled in pooled
+            ],
+            "task_numa_nodes": [-1] * num_tasks,
+            "task_stage_ids": [_ASYNC_STAGE_EXPERT] * num_tasks,
+            "task_resize_points": [_ASYNC_RESIZE_NONE] * num_tasks,
+            "task_range_granularities": [_ASYNC_FULL_EXPERT_RANGE] * num_tasks,
         }
 
 

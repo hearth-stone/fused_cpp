@@ -1,6 +1,11 @@
 # Plan Schema
 
-This file defines the first offline representation for CPU MoE scheduler output.
+This file defines the versioned representation for CPU MoE scheduler output.
+
+The production async bridge is now **Plan V2**. Strict execution remains the
+default. The ARM native executor also accepts an explicit whole-expert
+`tail_pool` placement: aligned thread groups may claim pooled experts only
+after their fixed work completes. Neither mode resizes a running task.
 
 > **⚠ DEPRECATED — wave 调度后续不考虑。** 见 [../DEPRECATED_WAVE.md](../DEPRECATED_WAVE.md)。
 > 本文件中的 `Wave` 层、`wave_offsets` scheduled bridge、以及除 `ASYNC_INTERVAL_DAG` 外的
@@ -216,33 +221,89 @@ CPU dtype and reconstructs the same wave/team structure natively.
 `ASYNC_INTERVAL_DAG` uses a separate async task-DAG bridge instead of this wave
 bridge.
 
-## Async C++ Bridge
+## Async C++ Bridge: Plan V2
 
 `ASYNC_INTERVAL_DAG` is translated to compact task arrays accepted by
-`fused_moe_bf16_tiled_async`:
+`AsyncMoEPlanV2`. The runtime validates the full plan and passes it to the
+native `fused_moe_bf16_tiled_async_plan_v2` entrypoint:
 
 ```json
 {
+  "plan_version": 2,
+  "execution_mode": "strict",
   "num_threads": 8,
   "thread_cpu_ids": [0, 1, 2, 3, 4, 5, 6, 7],
   "task_expert_ids": [0, 3, 5],
   "task_core_begins": [0, 4, 6],
   "task_threads": [4, 2, 2],
   "task_dep_offsets": [0, 0, 1, 2],
-  "task_deps": [0, 1]
+  "task_deps": [0, 1],
+  "task_preferred_threads": [4, 2, 2],
+  "task_min_threads": [4, 2, 2],
+  "task_max_threads": [4, 2, 2],
+  "task_allowed_thread_offsets": [0, 1, 2, 3],
+  "task_allowed_threads": [4, 2, 2],
+  "task_placement_modes": [0, 0, 0],
+  "task_numa_nodes": [-1, -1, -1],
+  "task_stage_ids": [0, 0, 0],
+  "task_resize_points": [0, 0, 0],
+  "task_range_granularities": [0, 0, 0]
 }
 ```
 
 Rules:
 
+- `plan_version` must be `2`; `execution_mode` is `strict` or `tail_pool`.
 - `task_expert_ids`, `task_core_begins`, and `task_threads` have one entry per
   task.
 - `task_dep_offsets` / `task_deps` are a CSR dependency list. Dependencies must
   refer to earlier task ids.
-- Each task uses the logical-thread interval
-  `[task_core_begins[i], task_core_begins[i] + task_threads[i])`.
+- Placement `0` is fixed and uses the logical-thread interval
+  `[task_core_begins[i], task_core_begins[i] + task_threads[i])`. Placement
+  `1` is a tail-pool task and requires `task_core_begins[i] = -1`.
+- `task_allowed_thread_offsets` / `task_allowed_threads` are a second CSR list
+  containing the legal discrete widths for every task. The entries for one task
+  must be positive, unique, and strictly increasing.
+- `task_preferred_threads[i]` and the selected `task_threads[i]` must both be in
+  the task's allowed-width list. `task_min_threads` and `task_max_threads` must
+  equal the first and last entries of that list.
+- `task_numa_nodes=-1` means no additional NUMA constraint. It is the only value
+  currently accepted.
+- Stage id `0` means a whole expert, resize mask `0` means no legal resize
+  point, and range granularity `0` means the full expert task. These are the only
+  values currently executed.
 - The first async bridge supports exactly one task per active expert.
+- Strict mode requires every placement to be fixed and ignores the legacy
+  short-pool environment variables.
+- Tail-pool mode requires at least one pooled task. All pooled tasks use one
+  selected width that divides `num_threads`; every fixed interval is aligned
+  to that width. Pooled tasks have no dependencies, and fixed tasks cannot
+  depend on pooled tasks. A released group claims one whole pooled expert at a
+  time from the shared queue.
 - Offline simulator JSON includes this representation under `async_bridge`.
+- The production planner currently emits a singleton allowed-width list for
+  every task:
+
+  ```text
+  allowed_threads[i] = {task_threads[i]}
+  preferred_threads[i] = min_threads[i] = max_threads[i] = task_threads[i]
+  ```
+
+  `AsyncMoEPlanV2` accepts a wider envelope so cached/offline plans can be
+  forward-compatible, but both execution modes still use `task_threads`
+  exactly after a task starts.
+- `upgrade_legacy_async_plan()` converts the previous fixed-width dictionary to
+  this singleton-width, all-fixed representation.
+- `fused_moe_bf16_tiled_async_plan()` is the public adapter. Callers
+  should materialize and cache `AsyncMoEPlanV2` outside the timed operator path.
+  A pre-V2 native extension can execute strict plans through the legacy entry,
+  but tail-pool plans require the V2 symbol.
+- `IntervalPlanner` and `PlannedMoE` remain strict by default.
+  `PlannedMoE.plan_spec_for(..., tail_pool_threads=T,
+  tail_pool_max_routes=12)` explicitly rewrites eligible whole experts into
+  pooled placement. This is a forced experimental bridge: the current cost
+  model still scores the original fixed-lane DAG and does not choose or predict
+  tail-pool execution automatically.
 - Kernel policy remains operator-wide rather than per task. A policy-aware plan
   emits adjacent `operator_options`:
 

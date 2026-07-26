@@ -5,9 +5,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from operator import index
-from typing import Any, Tuple
+from typing import Any, Mapping, Tuple
 
 import torch
+
+from fused_cpp.moe.plan import ASYNC_MOE_EXECUTION_STRICT, AsyncMoEPlanV2
 
 PreparedWeight = Tuple[torch.Tensor, int, int]
 
@@ -31,6 +33,7 @@ try:
     _fused_moe_bf16_tiled_impl = _moe_native.fused_moe_bf16_tiled
     _fused_moe_bf16_tiled_scheduled_impl = _moe_native.fused_moe_bf16_tiled_scheduled
     _fused_moe_bf16_tiled_async_impl = _moe_native.fused_moe_bf16_tiled_async
+    _fused_moe_bf16_tiled_async_plan_v2_impl = getattr(_moe_native, "fused_moe_bf16_tiled_async_plan_v2", None)
     _fused_moe_bf16_tiled_vllm_staged_impl = _moe_native.fused_moe_bf16_tiled_vllm_staged
     _prepare_bf16_tiled_impl = _moe_native.fused_moe_bf16_tiled_prepare_weights
     _available_backends_impl = _moe_native.fused_moe_bf16_tiled_available_backends
@@ -49,6 +52,7 @@ try:
         "fused_moe_bf16_tiled",
         "fused_moe_bf16_tiled_scheduled",
         "fused_moe_bf16_tiled_async",
+        "fused_moe_bf16_tiled_async_plan_v2",
         "fused_moe_bf16_tiled_vllm_staged",
         "fused_moe_test_split_plan",
         "fused_moe_test_single_thread_gemm",
@@ -73,6 +77,7 @@ except ImportError as error:
     _fused_moe_bf16_tiled_impl = None
     _fused_moe_bf16_tiled_scheduled_impl = None
     _fused_moe_bf16_tiled_async_impl = None
+    _fused_moe_bf16_tiled_async_plan_v2_impl = None
     _fused_moe_bf16_tiled_vllm_staged_impl = None
     _prepare_bf16_tiled_impl = None
     _available_backends_impl = None
@@ -82,6 +87,7 @@ except AttributeError:
     _fused_moe_bf16_tiled_impl = None
     _fused_moe_bf16_tiled_scheduled_impl = None
     _fused_moe_bf16_tiled_async_impl = None
+    _fused_moe_bf16_tiled_async_plan_v2_impl = None
     _fused_moe_bf16_tiled_vllm_staged_impl = None
     _prepare_bf16_tiled_impl = None
     _available_backends_impl = None
@@ -138,6 +144,16 @@ def _validate_output_buffer(input: torch.Tensor, out: torch.Tensor | None) -> No
         raise ValueError("out must be contiguous")
     if out.requires_grad:
         raise ValueError("out with requires_grad=True is not supported")
+
+
+def _contiguous_moe_bias(bias: torch.Tensor | None) -> torch.Tensor | None:
+    if bias is None:
+        return None
+    if bias.dtype not in (torch.float32, torch.bfloat16):
+        raise TypeError("MoE bias must be torch.float32 or torch.bfloat16")
+    if bias.device.type != "cpu":
+        raise ValueError("MoE bias must be a CPU tensor")
+    return bias.contiguous()
 
 
 def _weight_window_argument(weight_window_bytes: int | None) -> int:
@@ -254,15 +270,6 @@ def fused_moe_bf16_tiled(
         raise ValueError(f"num_threads must be positive, got {num_threads}")
     _validate_output_buffer(input, out)
 
-    def _contiguous_bias(bias: torch.Tensor | None) -> torch.Tensor | None:
-        if bias is None:
-            return None
-        if bias.dtype not in (torch.float32, torch.bfloat16):
-            raise TypeError("MoE bias must be torch.float32 or torch.bfloat16")
-        if bias.device.type != "cpu":
-            raise ValueError("MoE bias must be a CPU tensor")
-        return bias.contiguous()
-
     result = _fused_moe_bf16_tiled_impl(
         input.contiguous(),
         weights.w13[0],
@@ -273,8 +280,8 @@ def fused_moe_bf16_tiled(
         weights.w2[2],
         topk_weights.contiguous(),
         topk_ids.contiguous(),
-        _contiguous_bias(w13_bias),
-        _contiguous_bias(w2_bias),
+        _contiguous_moe_bias(w13_bias),
+        _contiguous_moe_bias(w2_bias),
         int(num_threads),
         _activation_name(activation),
         int(global_num_experts),
@@ -344,15 +351,6 @@ def fused_moe_bf16_tiled_scheduled(
             )
     _validate_output_buffer(input, out)
 
-    def _contiguous_bias(bias: torch.Tensor | None) -> torch.Tensor | None:
-        if bias is None:
-            return None
-        if bias.dtype not in (torch.float32, torch.bfloat16):
-            raise TypeError("MoE bias must be torch.float32 or torch.bfloat16")
-        if bias.device.type != "cpu":
-            raise ValueError("MoE bias must be a CPU tensor")
-        return bias.contiguous()
-
     result = _fused_moe_bf16_tiled_scheduled_impl(
         input.contiguous(),
         weights.w13[0],
@@ -367,8 +365,8 @@ def fused_moe_bf16_tiled_scheduled(
         team_expert_ids.contiguous(),
         team_threads.contiguous(),
         None if thread_cpu_ids is None else thread_cpu_ids.contiguous(),
-        _contiguous_bias(w13_bias),
-        _contiguous_bias(w2_bias),
+        _contiguous_moe_bias(w13_bias),
+        _contiguous_moe_bias(w2_bias),
         int(num_threads),
         _activation_name(activation),
         int(global_num_experts),
@@ -454,15 +452,6 @@ def fused_moe_bf16_tiled_async(
             )
     _validate_output_buffer(input, out)
 
-    def _contiguous_bias(bias: torch.Tensor | None) -> torch.Tensor | None:
-        if bias is None:
-            return None
-        if bias.dtype not in (torch.float32, torch.bfloat16):
-            raise TypeError("MoE bias must be torch.float32 or torch.bfloat16")
-        if bias.device.type != "cpu":
-            raise ValueError("MoE bias must be a CPU tensor")
-        return bias.contiguous()
-
     result = _fused_moe_bf16_tiled_async_impl(
         input.contiguous(),
         weights.w13[0],
@@ -479,9 +468,111 @@ def fused_moe_bf16_tiled_async(
         task_dep_offsets.contiguous(),
         task_deps.contiguous(),
         None if thread_cpu_ids is None else thread_cpu_ids.contiguous(),
-        _contiguous_bias(w13_bias),
-        _contiguous_bias(w2_bias),
+        _contiguous_moe_bias(w13_bias),
+        _contiguous_moe_bias(w2_bias),
         int(num_threads),
+        _activation_name(activation),
+        int(global_num_experts),
+        bool(skip_weighted),
+        bool(weights.fused_silu),
+        int(silu_poly_degree),
+        int(weights.gemm_backend),
+        int(weights.backend_n_tile),
+        -1 if w13_split is None else int(bool(w13_split)),
+        _weight_window_argument(weight_window_bytes),
+        out,
+    )
+    return out if out is not None else result
+
+
+def fused_moe_bf16_tiled_async_plan(
+    input: torch.Tensor,
+    weights: PreparedBF16TiledFusedMoEWeights,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    plan: AsyncMoEPlanV2 | Mapping[str, object],
+    *,
+    w13_bias: torch.Tensor | None = None,
+    w2_bias: torch.Tensor | None = None,
+    activation: Any = "silu",
+    global_num_experts: int = -1,
+    skip_weighted: bool = False,
+    silu_poly_degree: int = 5,
+    w13_split: bool | None = None,
+    weight_window_bytes: int | None = None,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Execute a validated Plan V2 through the native async DAG.
+
+    ``strict`` preserves every fixed logical-thread interval. ``tail_pool``
+    releases aligned thread groups after their fixed experts finish and lets
+    each group claim whole pooled experts. Task widths remain fixed after
+    startup in both modes.
+    """
+    materialized = plan if isinstance(plan, AsyncMoEPlanV2) else AsyncMoEPlanV2.from_dict(plan)
+    if _fused_moe_bf16_tiled_async_plan_v2_impl is None:
+        if materialized.execution_mode == ASYNC_MOE_EXECUTION_STRICT:
+            return fused_moe_bf16_tiled_async(
+                input,
+                weights,
+                topk_weights,
+                topk_ids,
+                *materialized.legacy_schedule(),
+                thread_cpu_ids=materialized.thread_cpu_ids,
+                w13_bias=w13_bias,
+                w2_bias=w2_bias,
+                num_threads=materialized.num_threads,
+                activation=activation,
+                global_num_experts=global_num_experts,
+                skip_weighted=skip_weighted,
+                silu_poly_degree=silu_poly_degree,
+                w13_split=w13_split,
+                weight_window_bytes=weight_window_bytes,
+                out=out,
+            )
+        raise RuntimeError("Plan V2 tail_pool requires native fused_moe_bf16_tiled_async_plan_v2 support")
+    _require_backend()
+    if input.dtype != torch.bfloat16:
+        raise TypeError(f"input must be torch.bfloat16, got {input.dtype}")
+    if input.device.type != "cpu":
+        raise ValueError("input must be a CPU tensor")
+    if topk_ids.dtype not in _INTEGER_DTYPES:
+        raise TypeError(f"topk_ids must use an integer dtype, got {topk_ids.dtype}")
+    if not topk_weights.dtype.is_floating_point:
+        raise TypeError(f"topk_weights must use a floating dtype, got {topk_weights.dtype}")
+    _validate_output_buffer(input, out)
+
+    result = _fused_moe_bf16_tiled_async_plan_v2_impl(
+        input.contiguous(),
+        weights.w13[0],
+        weights.w13[1],
+        weights.w13[2],
+        weights.w2[0],
+        weights.w2[1],
+        weights.w2[2],
+        topk_weights.contiguous(),
+        topk_ids.contiguous(),
+        materialized.task_expert_ids.contiguous(),
+        materialized.task_core_begins.contiguous(),
+        materialized.task_threads.contiguous(),
+        materialized.task_dep_offsets.contiguous(),
+        materialized.task_deps.contiguous(),
+        materialized.plan_version,
+        materialized.native_execution_mode,
+        materialized.task_preferred_threads.contiguous(),
+        materialized.task_min_threads.contiguous(),
+        materialized.task_max_threads.contiguous(),
+        materialized.task_allowed_thread_offsets.contiguous(),
+        materialized.task_allowed_threads.contiguous(),
+        materialized.task_placement_modes.contiguous(),
+        materialized.task_numa_nodes.contiguous(),
+        materialized.task_stage_ids.contiguous(),
+        materialized.task_resize_points.contiguous(),
+        materialized.task_range_granularities.contiguous(),
+        materialized.thread_cpu_ids.contiguous(),
+        _contiguous_moe_bias(w13_bias),
+        _contiguous_moe_bias(w2_bias),
+        materialized.num_threads,
         _activation_name(activation),
         int(global_num_experts),
         bool(skip_weighted),
@@ -538,10 +629,7 @@ def fused_moe_bf16_tiled_vllm_staged(
     if not weights.fused_silu:
         raise ValueError("vLLM-staged baseline requires weights prepared with fuse_silu=True")
     if weights.gemm_backend != 1:
-        raise ValueError(
-            "vLLM-staged baseline requires the SVE BF16 backend; "
-            f"weights use {weights.backend_name}"
-        )
+        raise ValueError(f"vLLM-staged baseline requires the SVE BF16 backend; weights use {weights.backend_name}")
     if thread_cpu_ids is not None:
         _check_integer_schedule_tensor(thread_cpu_ids, "thread_cpu_ids")
         if int(thread_cpu_ids.numel()) != int(num_threads):
@@ -576,6 +664,7 @@ def fused_moe_bf16_tiled_vllm_staged(
 bf16_tiled_fused_moe = fused_moe_bf16_tiled
 bf16_tiled_fused_moe_scheduled = fused_moe_bf16_tiled_scheduled
 bf16_tiled_fused_moe_async = fused_moe_bf16_tiled_async
+bf16_tiled_fused_moe_async_plan = fused_moe_bf16_tiled_async_plan
 bf16_tiled_fused_moe_vllm_staged = fused_moe_bf16_tiled_vllm_staged
 prepare_bf16_tiled_fused_moe_weights = prepare_fused_moe_bf16_tiled_weights
 
@@ -588,10 +677,12 @@ __all__ = [
     "fused_moe_bf16_tiled",
     "fused_moe_bf16_tiled_scheduled",
     "fused_moe_bf16_tiled_async",
+    "fused_moe_bf16_tiled_async_plan",
     "fused_moe_bf16_tiled_vllm_staged",
     "bf16_tiled_fused_moe",
     "bf16_tiled_fused_moe_scheduled",
     "bf16_tiled_fused_moe_async",
+    "bf16_tiled_fused_moe_async_plan",
     "bf16_tiled_fused_moe_vllm_staged",
     "prepare_fused_moe_bf16_tiled_weights",
     "prepare_bf16_tiled_fused_moe_weights",

@@ -26,7 +26,9 @@ PLANNER_DIR = REPO_ROOT / "cpu_moe_schedule_optimization" / "planners"
 sys.path[:0] = [str(REPO_ROOT / "src"), str(COST_MODEL_DIR), str(PLANNER_DIR)]
 
 from fused_cpp.moe import (  # noqa: E402
+    AsyncMoEPlanV2,
     fused_moe_bf16_tiled_async,
+    fused_moe_bf16_tiled_async_plan,
     fused_moe_bf16_tiled_vllm_staged,
     prepare_fused_moe_bf16_tiled_weights,
 )
@@ -329,7 +331,15 @@ def make_production_schedule(
     hidden: int,
     intermediate: int,
     experts: int,
-) -> tuple[tuple[torch.Tensor, ...], dict[str, object], Callable[[int, int], float]]:
+    tail_pool_threads: int | None = None,
+    tail_pool_max_routes: int = 12,
+) -> tuple[
+    tuple[torch.Tensor, ...],
+    AsyncMoEPlanV2,
+    AsyncMoEPlanV2 | None,
+    dict[str, object],
+    Callable[[int, int], float],
+]:
     from phase_model import ContentionCostModel
     from planned_moe import PlannedMoE
 
@@ -363,23 +373,32 @@ def make_production_schedule(
     spec = planner.plan_spec_for(counts)
     warm_plan_ns = time.perf_counter_ns() - begin
     bridge = spec["bridge"]
-    schedule = (
-        torch.tensor(bridge["task_expert_ids"], dtype=torch.int32),
-        torch.tensor(bridge["task_core_begins"], dtype=torch.int32),
-        torch.tensor(bridge["task_threads"], dtype=torch.int32),
-        torch.tensor(bridge["task_dep_offsets"], dtype=torch.int32),
-        torch.tensor(bridge["task_deps"], dtype=torch.int32),
+    strict_plan = AsyncMoEPlanV2.from_dict(bridge)
+    tail_pool_plan = None
+    if tail_pool_threads is not None:
+        tail_pool_spec = planner.plan_spec_for(
+            counts,
+            tail_pool_threads=tail_pool_threads,
+            tail_pool_max_routes=tail_pool_max_routes,
+        )
+        tail_pool_plan = AsyncMoEPlanV2.from_dict(tail_pool_spec["bridge"])
+    schedule = strict_plan.legacy_schedule()
+    return (
+        schedule,
+        strict_plan,
+        tail_pool_plan,
+        {
+            "profile": str(profile),
+            "profile_extension_sha256": policy.extension_sha256,
+            "runtime_extension_sha256": runtime_extension_sha256,
+            "extension_hash_match": runtime_extension_sha256 == policy.extension_sha256,
+            "shape": list(spec["shape"]),
+            "w13_split": bool(spec["w13_split"]),
+            "cold_plan_ms": cold_plan_ns / 1.0e6,
+            "warm_plan_ms": warm_plan_ns / 1.0e6,
+        },
+        model.T_iso,
     )
-    return schedule, {
-        "profile": str(profile),
-        "profile_extension_sha256": policy.extension_sha256,
-        "runtime_extension_sha256": runtime_extension_sha256,
-        "extension_hash_match": runtime_extension_sha256 == policy.extension_sha256,
-        "shape": list(spec["shape"]),
-        "w13_split": bool(spec["w13_split"]),
-        "cold_plan_ms": cold_plan_ns / 1.0e6,
-        "warm_plan_ms": warm_plan_ns / 1.0e6,
-    }, model.T_iso
 
 
 @torch.inference_mode()
@@ -421,6 +440,8 @@ def main() -> int:
     active_experts = torch.nonzero(route_counts, as_tuple=False).flatten()
     planner_metadata: dict[str, object] | None = None
     iso_time_ns: Callable[[int, int], float] | None = None
+    production_plan: AsyncMoEPlanV2 | None = None
+    tail_pool_plan: AsyncMoEPlanV2 | None = None
     if args.production_profile is None:
         baseline_variant = "fixed_team_async"
         schedule = make_fixed_team_schedule(
@@ -432,7 +453,7 @@ def main() -> int:
         w13_split = True
     else:
         baseline_variant = "production_async"
-        schedule, planner_metadata, iso_time_ns = make_production_schedule(
+        schedule, production_plan, tail_pool_plan, planner_metadata, iso_time_ns = make_production_schedule(
             route_counts,
             profile=args.production_profile,
             threads=args.threads,
@@ -440,6 +461,8 @@ def main() -> int:
             hidden=args.hidden,
             intermediate=args.intermediate,
             experts=args.experts,
+            tail_pool_threads=4 if args.dynamic_short_pool else None,
+            tail_pool_max_routes=args.static_long_route_threshold,
         )
         team_threads = None
         w13_split = bool(planner_metadata["w13_split"])
@@ -489,7 +512,29 @@ def main() -> int:
     outputs = {name: torch.empty_like(hidden) for name in variants}
 
     def run(name: str) -> torch.Tensor:
-        os.environ["FUSED_CPP_MOE_ASYNC_SHORT_POOL_THREADS"] = "4" if name == DYNAMIC_POOL_VARIANT else "0"
+        if name == DYNAMIC_POOL_VARIANT:
+            assert tail_pool_plan is not None
+            return fused_moe_bf16_tiled_async_plan(
+                hidden,
+                packed,
+                topk_weights,
+                topk_ids,
+                tail_pool_plan,
+                global_num_experts=args.experts,
+                w13_split=w13_split,
+                out=outputs[name],
+            )
+        if name == baseline_variant and production_plan is not None:
+            return fused_moe_bf16_tiled_async_plan(
+                hidden,
+                packed,
+                topk_weights,
+                topk_ids,
+                production_plan,
+                global_num_experts=args.experts,
+                w13_split=w13_split,
+                out=outputs[name],
+            )
         if name != VLLM_VARIANT:
             selected_schedule = schedule
             if name == STATIC_SPLIT_VARIANT:
@@ -590,6 +635,8 @@ def main() -> int:
             "planner": planner_metadata,
             "static_16_to_4": static_metadata,
             "dynamic_short_pool": {
+                "plan_version": 2,
+                "execution_mode": "tail_pool",
                 "pool_threads": 4,
                 "max_rows": args.static_long_route_threshold,
             }

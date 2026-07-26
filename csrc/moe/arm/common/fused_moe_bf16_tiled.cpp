@@ -4625,6 +4625,34 @@ struct AsyncTaskRuntime {
   int64_t scratch_index = -1;
 };
 
+constexpr int64_t kAsyncPlanV2 = 2;
+constexpr int64_t kAsyncExecutionStrict = 0;
+constexpr int64_t kAsyncExecutionTailPool = 1;
+constexpr int64_t kAsyncPlacementFixed = 0;
+constexpr int64_t kAsyncPlacementTailPool = 1;
+constexpr int64_t kAsyncStageExpert = 0;
+constexpr int64_t kAsyncResizeNone = 0;
+constexpr int64_t kAsyncFullExpertRange = 0;
+
+// Plan V2 metadata is call-owned and read only while the Python extension
+// call is active. The executor still fixes a team's width once an expert
+// starts; tail-pool placement only changes ownership at whole-expert
+// boundaries.
+struct AsyncPlanV2NativeArgs {
+  int64_t plan_version = 0;
+  int64_t execution_mode = kAsyncExecutionStrict;
+  at::Tensor task_preferred_threads;
+  at::Tensor task_min_threads;
+  at::Tensor task_max_threads;
+  at::Tensor task_allowed_thread_offsets;
+  at::Tensor task_allowed_threads;
+  at::Tensor task_placement_modes;
+  at::Tensor task_numa_nodes;
+  at::Tensor task_stage_ids;
+  at::Tensor task_resize_points;
+  at::Tensor task_range_granularities;
+};
+
 struct ScheduledScratchUnitConfig {
   int64_t thread_begin = 0;
   int64_t threads = 0;
@@ -7083,15 +7111,17 @@ at::Tensor fused_moe_bf16_tiled_scheduled(at::Tensor input, at::Tensor w13_packe
 #endif
 }
 
-at::Tensor fused_moe_bf16_tiled_async(at::Tensor input, at::Tensor w13_packed, int64_t w13_K, int64_t w13_N,
-                                      at::Tensor w2_packed, int64_t w2_K, int64_t w2_N, at::Tensor topk_weights,
-                                      at::Tensor topk_ids, at::Tensor task_expert_ids, at::Tensor task_core_begins,
-                                      at::Tensor task_threads, at::Tensor task_dep_offsets, at::Tensor task_deps,
-                                      c10::optional<at::Tensor> thread_cpu_ids, c10::optional<at::Tensor> w13_bias,
-                                      c10::optional<at::Tensor> w2_bias, int64_t num_threads, std::string activation,
-                                      int64_t global_num_experts, bool skip_weighted, bool fuse_silu,
-                                      int64_t silu_poly_degree, int64_t gemm_backend, int64_t backend_n_tile,
-                                      int64_t w13_split, int64_t weight_window_bytes, c10::optional<at::Tensor> out) {
+namespace {
+
+at::Tensor run_fused_moe_bf16_tiled_async(
+    at::Tensor input, at::Tensor w13_packed, int64_t w13_K, int64_t w13_N, at::Tensor w2_packed, int64_t w2_K,
+    int64_t w2_N, at::Tensor topk_weights, at::Tensor topk_ids, at::Tensor task_expert_ids,
+    at::Tensor task_core_begins, at::Tensor task_threads, at::Tensor task_dep_offsets, at::Tensor task_deps,
+    c10::optional<at::Tensor> thread_cpu_ids, c10::optional<at::Tensor> w13_bias,
+    c10::optional<at::Tensor> w2_bias, int64_t num_threads, std::string activation, int64_t global_num_experts,
+    bool skip_weighted, bool fuse_silu, int64_t silu_poly_degree, int64_t gemm_backend, int64_t backend_n_tile,
+    int64_t w13_split, int64_t weight_window_bytes, c10::optional<at::Tensor> out,
+    const AsyncPlanV2NativeArgs* plan_v2) {
 #ifndef __aarch64__
   TORCH_CHECK(false, "fused_moe_bf16_tiled_async requires AArch64");
 #else
@@ -7199,10 +7229,19 @@ at::Tensor fused_moe_bf16_tiled_async(at::Tensor input, at::Tensor w13_packed, i
     for (size_t idx = 0; idx < async_thread_pinning.cpus.size(); ++idx) {
       TORCH_CHECK(async_thread_pinning.cpus[idx] >= 0, "thread_cpu_ids[", idx, "] must be non-negative, got ",
                   async_thread_pinning.cpus[idx]);
+      if (plan_v2 != nullptr) {
+        for (size_t prior = 0; prior < idx; ++prior) {
+          TORCH_CHECK(async_thread_pinning.cpus[prior] != async_thread_pinning.cpus[idx],
+                      "Plan V2 thread_cpu_ids must not contain duplicates: index=", idx,
+                      " cpu=", async_thread_pinning.cpus[idx]);
+        }
+      }
     }
     async_thread_pinning.enabled = true;
     has_async_thread_pinning = true;
   }
+  TORCH_CHECK(plan_v2 == nullptr || has_async_thread_pinning,
+              "Plan V2 requires thread_cpu_ids with exactly num_threads entries");
   ThreadPinningScope async_thread_pinning_scope(has_async_thread_pinning ? &async_thread_pinning : nullptr);
   prepare_moe_threads_for_operator(num_threads);
 
@@ -7212,6 +7251,38 @@ at::Tensor fused_moe_bf16_tiled_async(at::Tensor input, at::Tensor w13_packed, i
   const std::vector<int64_t> task_threads_v = tensor_to_i64_vector(task_threads, "task_threads");
   const std::vector<int64_t> task_dep_offsets_v = tensor_to_i64_vector(task_dep_offsets, "task_dep_offsets");
   const std::vector<int64_t> task_deps_v = tensor_to_i64_vector(task_deps, "task_deps");
+  const bool has_plan_v2 = plan_v2 != nullptr;
+  std::vector<int64_t> task_preferred_threads_v;
+  std::vector<int64_t> task_min_threads_v;
+  std::vector<int64_t> task_max_threads_v;
+  std::vector<int64_t> task_allowed_thread_offsets_v;
+  std::vector<int64_t> task_allowed_threads_v;
+  std::vector<int64_t> task_placement_modes_v;
+  std::vector<int64_t> task_numa_nodes_v;
+  std::vector<int64_t> task_stage_ids_v;
+  std::vector<int64_t> task_resize_points_v;
+  std::vector<int64_t> task_range_granularities_v;
+  if (has_plan_v2) {
+    TORCH_CHECK(plan_v2->plan_version == kAsyncPlanV2, "plan_version must be ", kAsyncPlanV2, ", got ",
+                plan_v2->plan_version);
+    TORCH_CHECK(plan_v2->execution_mode == kAsyncExecutionStrict ||
+                    plan_v2->execution_mode == kAsyncExecutionTailPool,
+                "Plan V2 execution_mode must be strict (", kAsyncExecutionStrict, ") or tail_pool (",
+                kAsyncExecutionTailPool, "), got ", plan_v2->execution_mode);
+    task_preferred_threads_v =
+        tensor_to_i64_vector(plan_v2->task_preferred_threads, "task_preferred_threads");
+    task_min_threads_v = tensor_to_i64_vector(plan_v2->task_min_threads, "task_min_threads");
+    task_max_threads_v = tensor_to_i64_vector(plan_v2->task_max_threads, "task_max_threads");
+    task_allowed_thread_offsets_v =
+        tensor_to_i64_vector(plan_v2->task_allowed_thread_offsets, "task_allowed_thread_offsets");
+    task_allowed_threads_v = tensor_to_i64_vector(plan_v2->task_allowed_threads, "task_allowed_threads");
+    task_placement_modes_v = tensor_to_i64_vector(plan_v2->task_placement_modes, "task_placement_modes");
+    task_numa_nodes_v = tensor_to_i64_vector(plan_v2->task_numa_nodes, "task_numa_nodes");
+    task_stage_ids_v = tensor_to_i64_vector(plan_v2->task_stage_ids, "task_stage_ids");
+    task_resize_points_v = tensor_to_i64_vector(plan_v2->task_resize_points, "task_resize_points");
+    task_range_granularities_v =
+        tensor_to_i64_vector(plan_v2->task_range_granularities, "task_range_granularities");
+  }
   trace_phase_end(-1, -1, -1, -1, 0, "plan_materialize", phase_begin);
 
   const int64_t num_tasks = static_cast<int64_t>(task_expert_ids_v.size());
@@ -7225,6 +7296,64 @@ at::Tensor fused_moe_bf16_tiled_async(at::Tensor input, at::Tensor w13_packed, i
   TORCH_CHECK(task_dep_offsets_v.front() == 0, "task_dep_offsets[0] must be 0");
   TORCH_CHECK(task_dep_offsets_v.back() == static_cast<int64_t>(task_deps_v.size()),
               "last task_dep_offsets entry must equal task_deps length");
+  if (has_plan_v2) {
+    auto check_per_task_size = [&](const std::vector<int64_t>& values, const char* name) {
+      TORCH_CHECK(static_cast<int64_t>(values.size()) == num_tasks, name, " must have one entry per task: got ",
+                  values.size(), " vs ", num_tasks);
+    };
+    check_per_task_size(task_preferred_threads_v, "task_preferred_threads");
+    check_per_task_size(task_min_threads_v, "task_min_threads");
+    check_per_task_size(task_max_threads_v, "task_max_threads");
+    check_per_task_size(task_placement_modes_v, "task_placement_modes");
+    check_per_task_size(task_numa_nodes_v, "task_numa_nodes");
+    check_per_task_size(task_stage_ids_v, "task_stage_ids");
+    check_per_task_size(task_resize_points_v, "task_resize_points");
+    check_per_task_size(task_range_granularities_v, "task_range_granularities");
+    TORCH_CHECK(static_cast<int64_t>(task_allowed_thread_offsets_v.size()) == num_tasks + 1,
+                "task_allowed_thread_offsets must have num_tasks + 1 entries");
+    TORCH_CHECK(task_allowed_thread_offsets_v.front() == 0, "task_allowed_thread_offsets[0] must be 0");
+    TORCH_CHECK(task_allowed_thread_offsets_v.back() == static_cast<int64_t>(task_allowed_threads_v.size()),
+                "last task_allowed_thread_offsets entry must equal task_allowed_threads length");
+    for (int64_t task = 0; task < num_tasks; ++task) {
+      TORCH_CHECK(task_numa_nodes_v[static_cast<size_t>(task)] == -1,
+                  "Plan V2 currently only supports task_numa_nodes=-1: task=", task);
+      TORCH_CHECK(task_stage_ids_v[static_cast<size_t>(task)] == kAsyncStageExpert,
+                  "Plan V2 currently only supports whole-expert tasks: task=", task);
+      TORCH_CHECK(task_resize_points_v[static_cast<size_t>(task)] == kAsyncResizeNone,
+                  "Plan V2 currently does not support resize points: task=", task);
+      TORCH_CHECK(task_range_granularities_v[static_cast<size_t>(task)] == kAsyncFullExpertRange,
+                  "Plan V2 currently only supports full-expert ranges: task=", task);
+      const int64_t placement = task_placement_modes_v[static_cast<size_t>(task)];
+      TORCH_CHECK(placement == kAsyncPlacementFixed || placement == kAsyncPlacementTailPool,
+                  "task_placement_modes[", task, "] has unsupported value ", placement);
+      TORCH_CHECK(plan_v2->execution_mode != kAsyncExecutionStrict || placement == kAsyncPlacementFixed,
+                  "strict Plan V2 requires every task placement to be fixed: task=", task);
+
+      const int64_t begin = task_allowed_thread_offsets_v[static_cast<size_t>(task)];
+      const int64_t end = task_allowed_thread_offsets_v[static_cast<size_t>(task + 1)];
+      TORCH_CHECK(begin >= 0 && begin < end && end <= static_cast<int64_t>(task_allowed_threads_v.size()),
+                  "task ", task, " allowed-width range is invalid");
+      int64_t previous_width = 0;
+      bool selected_allowed = false;
+      bool preferred_allowed = false;
+      for (int64_t idx = begin; idx < end; ++idx) {
+        const int64_t width = task_allowed_threads_v[static_cast<size_t>(idx)];
+        TORCH_CHECK(width > previous_width && width <= num_threads, "task ", task,
+                    " allowed widths must be strictly increasing and at most num_threads");
+        previous_width = width;
+        selected_allowed = selected_allowed || width == task_threads_v[static_cast<size_t>(task)];
+        preferred_allowed = preferred_allowed || width == task_preferred_threads_v[static_cast<size_t>(task)];
+      }
+      TORCH_CHECK(selected_allowed, "task_threads[", task, "] is not present in its allowed widths");
+      TORCH_CHECK(preferred_allowed, "task_preferred_threads[", task, "] is not present in its allowed widths");
+      TORCH_CHECK(task_min_threads_v[static_cast<size_t>(task)] ==
+                      task_allowed_threads_v[static_cast<size_t>(begin)],
+                  "task_min_threads[", task, "] does not match its allowed widths");
+      TORCH_CHECK(task_max_threads_v[static_cast<size_t>(task)] ==
+                      task_allowed_threads_v[static_cast<size_t>(end - 1)],
+                  "task_max_threads[", task, "] does not match its allowed widths");
+    }
+  }
 
   phase_begin = trace_phase_begin();
   at::Tensor ids_i64 = topk_ids.to(at::kLong).contiguous();
@@ -7241,17 +7370,36 @@ at::Tensor fused_moe_bf16_tiled_async(at::Tensor input, at::Tensor w13_packed, i
 #endif
   bool use_async_ready_token_merge =
       use_w2_direct_route && env_flag_enabled_by_default("FUSED_CPP_MOE_ASYNC_READY_TOKEN_MERGE");
-  const int64_t async_short_pool_threads = env_int_or_default("FUSED_CPP_MOE_ASYNC_SHORT_POOL_THREADS", 0);
-  const int64_t async_short_pool_max_rows = env_int_or_default("FUSED_CPP_MOE_ASYNC_SHORT_POOL_MAX_ROWS", 12);
+  const bool plan_v2_tail_pool = has_plan_v2 && plan_v2->execution_mode == kAsyncExecutionTailPool;
+  int64_t async_short_pool_threads = 0;
+  int64_t async_short_pool_max_rows = 12;
+  if (plan_v2_tail_pool) {
+    for (int64_t task = 0; task < num_tasks; ++task) {
+      if (task_placement_modes_v[static_cast<size_t>(task)] != kAsyncPlacementTailPool) {
+        continue;
+      }
+      const int64_t width = task_threads_v[static_cast<size_t>(task)];
+      TORCH_CHECK(async_short_pool_threads == 0 || async_short_pool_threads == width,
+                  "all tail-pool tasks must use the same selected width: task=", task, " width=", width,
+                  " expected=", async_short_pool_threads);
+      async_short_pool_threads = width;
+    }
+    TORCH_CHECK(async_short_pool_threads > 0, "tail_pool execution requires at least one pooled task");
+  } else if (!has_plan_v2) {
+    async_short_pool_threads = env_int_or_default("FUSED_CPP_MOE_ASYNC_SHORT_POOL_THREADS", 0);
+    async_short_pool_max_rows = env_int_or_default("FUSED_CPP_MOE_ASYNC_SHORT_POOL_MAX_ROWS", 12);
+  }
   const bool use_async_short_pool = async_short_pool_threads > 0;
   if (use_async_short_pool) {
     TORCH_CHECK(use_sve_backend && fuse_silu,
                 "async short-expert pool currently requires the fused SVE backend");
-    TORCH_CHECK(async_short_pool_max_rows > 0,
-                "FUSED_CPP_MOE_ASYNC_SHORT_POOL_MAX_ROWS must be positive, got ", async_short_pool_max_rows);
+    if (!plan_v2_tail_pool) {
+      TORCH_CHECK(async_short_pool_max_rows > 0,
+                  "FUSED_CPP_MOE_ASYNC_SHORT_POOL_MAX_ROWS must be positive, got ", async_short_pool_max_rows);
+    }
     TORCH_CHECK(async_short_pool_threads <= num_threads && num_threads % async_short_pool_threads == 0,
-                "FUSED_CPP_MOE_ASYNC_SHORT_POOL_THREADS must divide num_threads: pool_threads=",
-                async_short_pool_threads, " num_threads=", num_threads);
+                "async tail-pool width must divide num_threads: pool_threads=", async_short_pool_threads,
+                " num_threads=", num_threads);
   }
 
   std::vector<std::vector<int64_t>> routes(static_cast<size_t>(num_experts));
@@ -7316,9 +7464,21 @@ at::Tensor fused_moe_bf16_tiled_async(at::Tensor input, at::Tensor w13_packed, i
     const int64_t threads = task_threads_v[static_cast<size_t>(task)];
     TORCH_CHECK(expert >= 0 && expert < num_experts, "task_expert_ids[", task, "] out of range: ", expert);
     TORCH_CHECK(threads > 0, "task_threads[", task, "] must be positive, got ", threads);
-    TORCH_CHECK(core_begin >= 0, "task_core_begins[", task, "] must be non-negative, got ", core_begin);
-    TORCH_CHECK(core_begin + threads <= num_threads, "task ", task, " interval [", core_begin, ", ",
-                core_begin + threads, ") exceeds num_threads=", num_threads);
+    const bool pooled_by_plan =
+        plan_v2_tail_pool && task_placement_modes_v[static_cast<size_t>(task)] == kAsyncPlacementTailPool;
+    if (pooled_by_plan) {
+      TORCH_CHECK(core_begin == -1, "tail-pool task_core_begins[", task, "] must be -1, got ", core_begin);
+      TORCH_CHECK(threads == async_short_pool_threads, "tail-pool task ", task, " width mismatch: got ", threads,
+                  " expected ", async_short_pool_threads);
+    } else {
+      TORCH_CHECK(core_begin >= 0, "fixed task_core_begins[", task, "] must be non-negative, got ", core_begin);
+      TORCH_CHECK(core_begin + threads <= num_threads, "task ", task, " interval [", core_begin, ", ",
+                  core_begin + threads, ") exceeds num_threads=", num_threads);
+      if (has_plan_v2) {
+        TORCH_CHECK(core_begin + task_max_threads_v[static_cast<size_t>(task)] <= num_threads,
+                    "task ", task, " allowed widths exceed its fixed logical-core placement");
+      }
+    }
     TORCH_CHECK(seen[static_cast<size_t>(expert)] == 0, "async bridge currently does not support duplicate expert ",
                 expert);
     const int64_t rows = static_cast<int64_t>(routes[static_cast<size_t>(expert)].size());
@@ -7326,8 +7486,10 @@ at::Tensor fused_moe_bf16_tiled_async(at::Tensor input, at::Tensor w13_packed, i
     check_positive_int(rows, "async task rows");
     seen[static_cast<size_t>(expert)] = 1;
     expert_task_ids[static_cast<size_t>(expert)] = task;
+    const bool pooled_by_legacy = !has_plan_v2 && use_async_short_pool && rows <= async_short_pool_max_rows;
+    const bool pooled_task = pooled_by_plan || pooled_by_legacy;
 
-    if (use_async_short_pool && rows <= async_short_pool_max_rows) {
+    if (pooled_task) {
       is_short_pool_task[static_cast<size_t>(task)] = int8_t{1};
       short_pool_task_ids.push_back(task);
       max_short_pool_rows = std::max(max_short_pool_rows, rows);
@@ -7341,8 +7503,12 @@ at::Tensor fused_moe_bf16_tiled_async(at::Tensor input, at::Tensor w13_packed, i
     }
   }
   if (use_async_short_pool) {
-    TORCH_CHECK(!short_pool_task_ids.empty(),
-                "async short-expert pool found no task with rows <= ", async_short_pool_max_rows);
+    if (plan_v2_tail_pool) {
+      TORCH_CHECK(!short_pool_task_ids.empty(), "tail_pool execution requires at least one pooled task");
+    } else {
+      TORCH_CHECK(!short_pool_task_ids.empty(),
+                  "async short-expert pool found no task with rows <= ", async_short_pool_max_rows);
+    }
     std::sort(short_pool_task_ids.begin(), short_pool_task_ids.end(), [&](int64_t lhs, int64_t rhs) {
       const AsyncTaskRuntime& lhs_task = tasks[static_cast<size_t>(lhs)];
       const AsyncTaskRuntime& rhs_task = tasks[static_cast<size_t>(rhs)];
@@ -7385,6 +7551,8 @@ at::Tensor fused_moe_bf16_tiled_async(at::Tensor input, at::Tensor w13_packed, i
     TORCH_CHECK(begin >= 0 && end <= static_cast<int64_t>(task_deps_v.size()), "task ", task,
                 " dependency range is out of bounds");
     const bool pooled_task = is_short_pool_task[static_cast<size_t>(task)] != 0;
+    TORCH_CHECK(!has_plan_v2 || !pooled_task || begin == end,
+                "tail-pool task must not have dependencies: task=", task);
     deps_remaining[static_cast<size_t>(task)].store(pooled_task ? 0 : end - begin, std::memory_order_relaxed);
     for (int64_t idx = begin; idx < end; ++idx) {
       const int64_t dep = task_deps_v[static_cast<size_t>(idx)];
@@ -7937,6 +8105,61 @@ at::Tensor fused_moe_bf16_tiled_async(at::Tensor input, at::Tensor w13_packed, i
   }
   return finalize_moe_output(output, out);
 #endif
+}
+
+}  // namespace
+
+at::Tensor fused_moe_bf16_tiled_async(at::Tensor input, at::Tensor w13_packed, int64_t w13_K, int64_t w13_N,
+                                      at::Tensor w2_packed, int64_t w2_K, int64_t w2_N, at::Tensor topk_weights,
+                                      at::Tensor topk_ids, at::Tensor task_expert_ids, at::Tensor task_core_begins,
+                                      at::Tensor task_threads, at::Tensor task_dep_offsets, at::Tensor task_deps,
+                                      c10::optional<at::Tensor> thread_cpu_ids, c10::optional<at::Tensor> w13_bias,
+                                      c10::optional<at::Tensor> w2_bias, int64_t num_threads, std::string activation,
+                                      int64_t global_num_experts, bool skip_weighted, bool fuse_silu,
+                                      int64_t silu_poly_degree, int64_t gemm_backend, int64_t backend_n_tile,
+                                      int64_t w13_split, int64_t weight_window_bytes, c10::optional<at::Tensor> out) {
+  return run_fused_moe_bf16_tiled_async(
+      std::move(input), std::move(w13_packed), w13_K, w13_N, std::move(w2_packed), w2_K, w2_N,
+      std::move(topk_weights), std::move(topk_ids), std::move(task_expert_ids), std::move(task_core_begins),
+      std::move(task_threads), std::move(task_dep_offsets), std::move(task_deps), std::move(thread_cpu_ids),
+      std::move(w13_bias), std::move(w2_bias), num_threads, std::move(activation), global_num_experts, skip_weighted,
+      fuse_silu, silu_poly_degree, gemm_backend, backend_n_tile, w13_split, weight_window_bytes, std::move(out),
+      nullptr);
+}
+
+at::Tensor fused_moe_bf16_tiled_async_plan_v2(
+    at::Tensor input, at::Tensor w13_packed, int64_t w13_K, int64_t w13_N, at::Tensor w2_packed, int64_t w2_K,
+    int64_t w2_N, at::Tensor topk_weights, at::Tensor topk_ids, at::Tensor task_expert_ids,
+    at::Tensor task_core_begins, at::Tensor task_threads, at::Tensor task_dep_offsets, at::Tensor task_deps,
+    int64_t plan_version, int64_t execution_mode, at::Tensor task_preferred_threads, at::Tensor task_min_threads,
+    at::Tensor task_max_threads, at::Tensor task_allowed_thread_offsets, at::Tensor task_allowed_threads,
+    at::Tensor task_placement_modes, at::Tensor task_numa_nodes, at::Tensor task_stage_ids,
+    at::Tensor task_resize_points, at::Tensor task_range_granularities, c10::optional<at::Tensor> thread_cpu_ids,
+    c10::optional<at::Tensor> w13_bias, c10::optional<at::Tensor> w2_bias, int64_t num_threads,
+    std::string activation, int64_t global_num_experts, bool skip_weighted, bool fuse_silu,
+    int64_t silu_poly_degree, int64_t gemm_backend, int64_t backend_n_tile, int64_t w13_split,
+    int64_t weight_window_bytes, c10::optional<at::Tensor> out) {
+  const AsyncPlanV2NativeArgs plan_v2{
+      plan_version,
+      execution_mode,
+      std::move(task_preferred_threads),
+      std::move(task_min_threads),
+      std::move(task_max_threads),
+      std::move(task_allowed_thread_offsets),
+      std::move(task_allowed_threads),
+      std::move(task_placement_modes),
+      std::move(task_numa_nodes),
+      std::move(task_stage_ids),
+      std::move(task_resize_points),
+      std::move(task_range_granularities),
+  };
+  return run_fused_moe_bf16_tiled_async(
+      std::move(input), std::move(w13_packed), w13_K, w13_N, std::move(w2_packed), w2_K, w2_N,
+      std::move(topk_weights), std::move(topk_ids), std::move(task_expert_ids), std::move(task_core_begins),
+      std::move(task_threads), std::move(task_dep_offsets), std::move(task_deps), std::move(thread_cpu_ids),
+      std::move(w13_bias), std::move(w2_bias), num_threads, std::move(activation), global_num_experts, skip_weighted,
+      fuse_silu, silu_poly_degree, gemm_backend, backend_n_tile, w13_split, weight_window_bytes, std::move(out),
+      &plan_v2);
 }
 
 at::Tensor fused_moe_bf16_tiled_vllm_staged(

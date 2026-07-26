@@ -105,7 +105,32 @@ than emitting `CNTB`. Importing `fused_cpp._moe_C` queries the importing
 thread's actual VL with `PR_SVE_GET_VL` and fails immediately when it differs
 from the build. Do not change the process or worker-thread VL after import.
 
-## Experimental async short-expert pool
+## Async Plan V2
+
+The policy-aware planner emits a versioned async Plan V2 bridge. It retains the
+fixed task/core/thread/dependency arrays used by the native async executor and
+adds a discrete allowed-width envelope plus reserved NUMA, stage, range, and
+resize metadata.
+
+Strict execution remains the default. The planner emits one allowed width per
+task, whole-expert stages, full-expert ranges, no resize points, and fixed
+placement. `AsyncMoEPlanV2` validates the complete bridge, and
+`fused_moe_bf16_tiled_async_plan` calls the native Plan V2 executor. It does
+not change a running task's thread count. Legacy fixed-width dictionaries can
+be upgraded with `upgrade_legacy_async_plan`.
+
+The ARM executor also supports explicit `tail_pool` placement. Aligned groups
+finish every fixed task covering their cores, then claim whole pooled experts
+from a shared queue. `PlannedMoE.plan_spec_for(..., tail_pool_threads=T,
+tail_pool_max_routes=12)` forces this bridge for experiments; the cost model
+does not select it automatically yet. Plan V2 execution ignores the legacy
+short-pool environment override.
+
+The schema and mathematical execution semantics are documented in
+`cpu_moe_schedule_optimization/planners/plan_schema.md` and
+`cpu_moe_schedule_optimization/MATHEMATICAL_MODEL.md`.
+
+## Legacy async short-expert pool
 
 `fused_moe_bf16_tiled_async` has a default-off executor experiment for
 transitioning cores from wide long-expert teams into narrow short-expert teams:
@@ -124,11 +149,13 @@ Thus a 16-thread long team can release four 4-thread groups without creating
 threads or changing affinity. Groups that are not covered by a long task enter
 the pool immediately.
 
-The experiment requires fused SVE execution, an aligned long-task plan, and a
+The legacy experiment requires fused SVE execution, an aligned long-task plan, and a
 pool width that divides the executor thread count. Dependencies attached to
 pooled tasks are validated but replaced by interval-release eligibility; a
 non-pooled task may not depend on a pooled task. The setting is intended for
-executor and planner research and is not enabled by the production planner.
+backward-compatible experiments. New code should encode pooled placement in
+Plan V2 instead; the V2 native entrypoint never reads these two environment
+variables.
 
 ## x86 AVX-512 BF16 build and dispatch
 

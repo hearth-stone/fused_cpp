@@ -117,10 +117,17 @@ class PlannedMoE:
                 if model.policy is not None
                 else None
             ),
+            "tasks": tasks,
             "bridge": planner.to_async_bridge(tasks),
         }
 
-    def plan_spec_for(self, counts) -> Dict[str, object]:
+    def plan_spec_for(
+        self,
+        counts,
+        *,
+        tail_pool_threads: int | None = None,
+        tail_pool_max_routes: int = 12,
+    ) -> Dict[str, object]:
         begin = time.perf_counter_ns()
         cache_key = signature(counts, self.policy_identity)
         after_signature = time.perf_counter_ns()
@@ -138,6 +145,12 @@ class PlannedMoE:
             shape = tuple(result["shape"])
             self.shape_cache[cache_key] = (planner_index, shape)
             after_search = time.perf_counter_ns()
+        if tail_pool_threads is not None:
+            result["bridge"] = self.interval_planners[planner_index].to_tail_pool_bridge(
+                result["tasks"],
+                pool_threads=tail_pool_threads,
+                max_pooled_routes=tail_pool_max_routes,
+            )
         bridge = result["bridge"]
         after_assign = time.perf_counter_ns()
         self.last = {
@@ -147,12 +160,16 @@ class PlannedMoE:
             "assign_ns": after_assign - after_search,
             "cache_hit": hit,
             "planner_overhead_ns": after_assign - begin,
+            "plan_version": bridge["plan_version"],
+            "execution_mode": bridge["execution_mode"],
             "shape": tuple(result["shape"]),
             "w13_split": result.get("w13_split"),
             "weight_window_bytes": result.get("weight_window_bytes"),
             "policy": result.get("policy"),
         }
         return {
+            "plan_version": bridge["plan_version"],
+            "execution_mode": bridge["execution_mode"],
             "bridge": bridge,
             "shape": tuple(result["shape"]),
             "w13_split": result.get("w13_split"),
@@ -164,6 +181,16 @@ class PlannedMoE:
             "policy": result.get("policy"),
         }
 
-    def plan_for(self, counts) -> Dict[str, object]:
-        """Legacy bridge-only API; policy metadata remains available in `last`."""
-        return self.plan_spec_for(counts)["bridge"]
+    def plan_for(
+        self,
+        counts,
+        *,
+        tail_pool_threads: int | None = None,
+        tail_pool_max_routes: int = 12,
+    ) -> Dict[str, object]:
+        """Bridge-only API; returns Plan V2 with legacy fixed arrays retained."""
+        return self.plan_spec_for(
+            counts,
+            tail_pool_threads=tail_pool_threads,
+            tail_pool_max_routes=tail_pool_max_routes,
+        )["bridge"]

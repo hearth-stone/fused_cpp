@@ -348,8 +348,10 @@ call.
 
 `--dynamic-short-pool` keeps the production long-expert tasks but lets every
 released 4-thread group claim the next whole `M<=12` expert from one native
-global queue. It removes the static short-lane assignment while retaining
-resident pinned threads and the existing fused expert kernel:
+global queue. The benchmark now emits an explicit Plan V2 `tail_pool` bridge;
+it does not use the legacy `FUSED_CPP_MOE_ASYNC_SHORT_POOL_*` environment
+switches. It removes the static short-lane assignment while retaining resident
+pinned threads and the existing fused expert kernel:
 
 ```bash
 PYTHONPATH=src numactl --cpunodebind=0 --membind=0 taskset -c 0-95 \
@@ -360,12 +362,13 @@ PYTHONPATH=src numactl --cpunodebind=0 --membind=0 taskset -c 0-95 \
   --warmup 5 --runs 21
 ```
 
-On the same NUMA node, the dynamic pool measured `10.697 ms` and
-`14.455 TFLOP/s`, 16.29% faster than production, 3.12% faster than the static
-transition, and 8.95% faster than vLLM staged. With ready-token merge disabled,
-it measured `10.803 ms`, retaining a 16.07% speedup over production. This is
-still a benchmark-only, default-off executor action; the production planner
-does not yet select a long-team-to-short-pool transition.
+On the same NUMA node, the Plan V2 rerun measured `10.836 ms` and
+`14.269 TFLOP/s`, 15.47% faster than Plan V2 strict and 8.28% faster than vLLM
+staged. The earlier legacy-switch and static-transition comparisons are kept
+in the linked result document. This is still a default-off planner action.
+`PlannedMoE.plan_spec_for` can force the transition with
+`tail_pool_threads=4`, but the cost model does not yet rank `tail_pool` against
+strict candidates automatically.
 
 On the 192-core host's first NUMA node, six balanced `M=2048` experts were
 13.1% slower with the staged queue than with fixed `6 x 16T` teams. For 256

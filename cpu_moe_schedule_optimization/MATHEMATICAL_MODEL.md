@@ -161,6 +161,33 @@ $$
 不是执行中可改变线程数的 malleable job。Job 一旦开始就连续执行至完成，不能
 抢占。
 
+Plan V2 在表示层为每个 task 增加离散允许宽度集合 $\mathcal A_i$、首选宽度
+$p_i$、已选执行宽度 $\bar t_i$ 和 placement $q_i$：
+
+$$
+\bar t_i=\texttt{task\_threads}[i],\qquad
+p_i\in\mathcal A_i,\qquad
+\bar t_i\in\mathcal A_i,\qquad
+q_i\in\{\mathrm{fixed},\mathrm{tail\_pool}\}.
+$$
+
+默认 production planner 只生成：
+
+$$
+\mathcal A_i=\{p_i\}=\{\bar t_i\},
+\qquad \mathcal R_i=\varnothing,\qquad q_i=\mathrm{fixed},
+$$
+
+其中 $\mathcal R_i$ 是合法 resize point 集合。strict runtime 校验 V2 后仍按
+$\bar t_i$ 执行 fixed-interval async DAG。显式 `tail_pool` 模式允许
+$q_i=\mathrm{tail\_pool}$ 的完整 expert 在运行时由任一已释放、宽度为
+$\bar t_i$ 的对齐线程组领取；线程组只有在覆盖它的全部 fixed tasks 完成后才
+释放。pooled task 无前驱，fixed task 也不能依赖 pooled task。即使外部 V2
+携带更宽的 $\mathcal A_i$，当前 executor 也不会在 task 执行中选择其他宽度。
+因此 tail pool 只扩大 **expert 边界处** 的 resource assignment/start-time
+可行域，不把 job 从 moldable 改成 malleable，也不改变本节后续公式中的
+$t_i$。
+
 定义活跃指示函数：
 
 $$
@@ -650,12 +677,13 @@ One-hot 是线程宽度的等价求解器编码，不是剪枝。一般 active-s
 | 层级 | 原始可行域 | 当前限制 | 性质 |
 | --- | --- | --- | --- |
 | 线程宽度 | $1,2,\ldots,T_{\max}$ | `1,2,4,8,16,32` | 离散宽度剪枝 |
-| 并发配置 | 活跃 job 可形成任意满足 CPU 容量的 $(M_i,t_i)$ 组合 | 整次调用使用静态 core shape | static-partition 剪枝 |
+| 并发配置 | 活跃 job 可形成任意满足 CPU 容量的 $(M_i,t_i)$ 组合 | 默认使用静态 core shape；显式 tail-pool 只允许对齐 group 在全部覆盖 fixed tasks 完成后领取 whole-expert pooled task | static-partition + boundary regroup 剪枝 |
 | Shape 集合 | 所有满足 CPU 容量的整数宽度组合 | profile 支持并经 active 工作集规则筛选的 shape；owner-cache band 当前仅 shadow | 候选剪枝 |
 | Assignment | 任意 expert-to-resource 调度 | 按 isolated cost 的 LPT | 启发式分配 |
+| Runtime plan contract | task 可携带离散宽度集合、stage/range、resize 边界和动态 placement | Plan V2 native strict/tail_pool；默认 singleton fixed，强制实验模式可生成 whole-expert pooled placement；运行中宽度固定 | 表示支持 boundary regroup，仍无 in-task resize |
 | x86 synchronous executor team mapping | expert 可取任意合法整数宽度并形成任意 wave | API 接受 1--256 workers；均衡 route 用 atomic expert queue，active expert 不足时按 route/当前宽度贪心组 team，强偏斜时按 64-row target 形成有序 wave | planner 外的确定性 runtime mapper |
 | Ordering | 任意可行开始时间和顺序 | 每个 lane 的 LPT 顺序 | 顺序剪枝 |
-| Idling | 允许主动等待以避开争用 | lane 可启动下一个 expert 时立即启动；ready-token 路径仅填充无可运行 expert 的空闲 lane | non-idling 剪枝 |
+| Idling | 允许主动等待以避开争用 | fixed lane 可启动下一个 expert 时立即启动；tail group 等待其全部 fixed blockers 完成后 non-idling 地领取 pooled expert；ready-token 路径仅填充无可运行 expert 的空闲 lane | 受限 non-idling 剪枝 |
 | Workload 输入 | 任意合法 global 或 rank-local route histogram | planner 接受任意 histogram；catalog preset 只扩展验证覆盖，不过滤运行时输入 | 不剪枝 |
 | Route combine | 任意满足 TopK release 约束和 CPU 容量的 merge 排程 | planner 不搜索 combine；默认 executor 采用 expert-first 单 token 贪心和连续收尾 | 外层启发式限制 |
 | Kernel variant | 任意未被支配的实现 | ARM `auto` 先要求完整 `jit/xbyak_exact_m` legacy split/no-split pair，再加入同 identity 的实测 global packed-B byte-window variants；缺少完整 JIT legacy pair 时整体回退 static pair；x86 AMX 使用不进入 planner 的确定性 per-expert pattern/cache policy，AVX-512/AMX 共用确定性 team-N/wave policy | 实例候选限制与 runtime policy |
@@ -1495,6 +1523,41 @@ planner/cost-model 公式测试。若将该 team/wave mapper 提升为 planner �
 必须先为不同 $t_i$/wave active set 重建 $I_i(t)$、$D_i(\mathcal Z)$ profile 并做
 held-out regret 验证。
 
+### 9.12 Plan V2 native strict/tail-pool bridge 验证
+
+`IntervalPlanner` 默认对每个已选 task 生成 singleton allowed-width CSR、
+whole-expert stage、空 resize mask、fixed placement 和 logical-core interval；
+cache hit 重建路径生成相同 bridge。`AsyncMoEPlanV2` 和 ARM native entrypoint
+独立检查版本、CPU 映射、task 数组长度、依赖 DAG、允许宽度 CSR、
+selected/preferred/min/max、placement，以及当前 stage/range/resize 子集。
+strict V2 直接进入同一个 native async executor，不读取 legacy short-pool
+环境变量；旧扩展只可通过 Python adapter 执行 strict 降级。
+
+显式 tail-pool bridge 将 `routes <= max_pooled_routes` 的 whole-expert task 标为
+pooled，使用 `core_begin=-1` 和统一 pool width。它删除 pooled task 的前驱，并
+把后续 fixed task 的依赖穿过连续 pooled 链重连到最近 fixed ancestors。Python
+与 native 同时验证 pool width 整除总线程、fixed interval 对齐、pooled task
+无依赖、fixed task 不依赖 pooled task。运行时每个对齐 group 等覆盖它的全部
+fixed blockers 完成后，从全局队列领取完整 pooled task。
+
+回归覆盖位于 `tests/test_moe_plan_v2.py` 和
+`tests/test_moe_cost_model_v2.py`，包括 legacy bridge 升级、strict/tail
+placement、较宽但不执行的 width envelope、非法 resize/width/placement/
+dependency/alignment 拒绝、native V2 参数传递、strict 旧扩展 fallback，以及
+首次/缓存 planner 输出。tail pool 当前只能通过
+`tail_pool_threads` 显式强制；cost model 仍按原 fixed DAG 评分，所以它不能用于
+自动候选排序或声称 regret 收敛。提升为自动策略前必须重测相应 active set 的
+$I_i(t)$、$D_i(\mathcal Z)$、E2E makespan 和 held-out regret。
+
+2026-07-26 在 AmazonC5192Cores NUMA0 `0-95` 上使用 split-W13、
+H4096/F512、256 experts、2048 tokens、TopK=6 的 long-short bimodal
+分布验证 native V2。聚焦 correctness 为 28 passed；legacy async、V2 strict
+和 V2 tail-pool 输出 BF16 bit-exact；扩大 MoE/planner 回归为 149 passed、
+1 skipped。21 次交错测量中，V2 strict median 为
+12.513 ms，显式 4T tail pool 为 10.836 ms，提升 15.47%；vLLM staged 为
+11.733 ms。运行扩展 hash 与旧校准表不一致，因此该结果只验证 executor action
+和 ABI 开销，不用于证明当前 cost-model 的绝对时间或 regret 准确性。
+
 ## 10. 同步规则
 
 发生以下任一变化时，必须同步更新本文档：
@@ -1549,3 +1612,5 @@ held-out regret 验证。
 | 2026-07-26 | v0.26 | 将全局 packed-B byte-window 接入 schema-v2 与 production planner：variant identity 包含目标字节和 W13/W2 实际 range 数，stage model 分别推进两段 range，联合搜索 `(window, core shape)` 并透传 runtime option；旧 profile 映射为 window=0，未提供新实测表时决策不变。 |
 | 2026-07-26 | v0.27 | 将 x86 BF16 auto backend 改为优先 AMX 并回退 AVX-512；增加按 expert route 数选择 m2n2/m1n4 的确定性 M=76 policy，以及按 K-padded byte budget 自动推导 1 MiB/512 KiB cache window；同步 per-expert variant 公式、剪枝表、C8i 正确性/性能验证和 policy 可迁移性边界。 |
 | 2026-07-26 | v0.28 | 将 SVE 的 team-N ownership 引入同步 x86 AVX-512/AMX executor：active expert 不足时按 route/width 贪心组 team，2x 且至少 64-row 的强偏斜 route 使用有序 waves，均衡 route 保留 expert queue；定义精确 N-range、team-width 与 wave 公式，记录 8-core C8i 1/2/4/8T 验证，并明确该 mapper 尚不进入 planner candidate space。 |
+| 2026-07-26 | v0.29 | 引入向后兼容的 async Plan V2：增加 strict execution mode、离散 allowed-width CSR、preferred/min/max、NUMA/stage/range/resize 字段及强校验；production planner 仍生成 singleton width 并严格降级到现有 fixed-interval native DAG，因此 moldable 语义、公式、剪枝和 cost model 保持不变。 |
+| 2026-07-26 | v0.30 | Plan V2 接入 ARM native strict entrypoint，并增加显式 whole-expert tail_pool placement：对齐线程组只在覆盖 fixed tasks 全部完成后重组，运行中宽度仍固定；planner 默认 strict，tail pool 仅作为不参与 cost-model 排序的强制实验 bridge。同步 placement/依赖/对齐约束、剪枝表和验证要求，并记录 192-core 主机 NUMA0 的 bit-exact 与 long-short bimodal 性能验证。 |

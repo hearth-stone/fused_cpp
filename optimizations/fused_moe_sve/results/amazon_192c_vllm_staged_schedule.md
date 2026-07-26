@@ -253,6 +253,28 @@ than vLLM staged. It keeps the long expert's shared packed-A and has no global
 W13/W2 stage barrier, while the queue removes dependence on isolated-time
 predictions and preassigned short-lane lengths.
 
+### Plan V2 native rerun
+
+Date: 2026-07-26
+
+The dynamic variant was migrated from the legacy
+`FUSED_CPP_MOE_ASYNC_SHORT_POOL_*` switches to an explicit Plan V2
+`tail_pool` bridge. The production control now enters the same native executor
+through Plan V2 `strict`. On NUMA0 CPUs `0-95`, with split-W13, BF16 route
+storage, five warmups, and 21 interleaved samples, the result was:
+
+| Variant | Median ms | P10 ms | P90 ms | Aggregate TFLOP/s | Speedup vs strict |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Plan V2 strict `6x16T` | 12.513 | 12.446 | 12.652 | 12.357 | baseline |
+| Plan V2 `4T tail_pool` | **10.836** | **10.763** | **10.909** | **14.269** | **+15.47%** |
+| vLLM staged | 11.733 | 11.356 | 11.851 | 13.178 | +6.64% |
+
+Before timing, strict, tail-pool, and vLLM outputs were bitwise equal. The
+runtime extension SHA256 was
+`e652d9aad3025a4836d0406110bcbdf3fdc1356aaba2bf789595359a58a92559`,
+which does not match the profile hash below. This rerun validates the native
+Plan V2 action and direct ABI overhead, not cost-model calibration accuracy.
+
 With `--no-production-ready-token-merge`, the result remained:
 
 | Variant | Median ms | P10 ms | P90 ms | Aggregate TFLOP/s | Speedup vs production |

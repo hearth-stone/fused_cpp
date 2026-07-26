@@ -268,12 +268,26 @@ def test_window_policy_and_thread_shape_are_selected_jointly(
 
     runtime = PlannedMoE(policy_models, 32)
     spec = runtime.plan_spec_for([(expert, 192) for expert in range(64)])
+    assert spec["plan_version"] == 2
     assert spec["operator_options"] == {
         "w13_split": False,
         "weight_window_bytes": 2 * 1024 * 1024,
     }
+    bridge = spec["bridge"]
+    assert bridge["plan_version"] == 2
+    assert bridge["execution_mode"] == "strict"
+    assert bridge["task_preferred_threads"] == bridge["task_threads"]
+    assert bridge["task_min_threads"] == bridge["task_threads"]
+    assert bridge["task_max_threads"] == bridge["task_threads"]
+    assert bridge["task_allowed_thread_offsets"] == list(range(len(bridge["task_threads"]) + 1))
+    assert bridge["task_allowed_threads"] == bridge["task_threads"]
+    assert bridge["task_placement_modes"] == [0] * len(bridge["task_threads"])
+    assert bridge["task_stage_ids"] == [0] * len(bridge["task_threads"])
+    assert bridge["task_resize_points"] == [0] * len(bridge["task_threads"])
+    assert bridge["task_range_granularities"] == [0] * len(bridge["task_threads"])
     cached_spec = runtime.plan_spec_for([(expert, 192) for expert in range(64)])
     assert cached_spec["operator_options"] == spec["operator_options"]
+    assert cached_spec["bridge"] == bridge
     assert runtime.last["cache_hit"] is True
     evaluator = ParallelLayerEvaluator(
         policy_catalog,
@@ -285,6 +299,42 @@ def test_window_policy_and_thread_shape_are_selected_jointly(
     )
     tp = evaluator.evaluate_tp(2048, 6)
     assert {rank.weight_window_bytes for rank in tp.rank_compute} == {2 * 1024 * 1024}
+
+
+def test_tail_pool_bridge_relinks_fixed_lane_dependencies(
+    catalog: ProfileCatalog,
+) -> None:
+    _, model = models(catalog, "tp", 1024, 64)
+    runtime = PlannedMoE(model, 32)
+    planner = runtime.interval_planners[0]
+    tasks = [
+        (0, 2040, 0, 4, []),
+        (1, 12, 0, 4, [0]),
+        (2, 8, 0, 4, [1]),
+        (3, 2040, 0, 4, [2]),
+    ]
+
+    bridge = planner.to_tail_pool_bridge(
+        tasks,
+        pool_threads=2,
+        max_pooled_routes=12,
+    )
+
+    assert bridge["execution_mode"] == "tail_pool"
+    assert bridge["task_core_begins"] == [0, -1, -1, 0]
+    assert bridge["task_threads"] == [4, 2, 2, 4]
+    assert bridge["task_placement_modes"] == [0, 1, 1, 0]
+    assert bridge["task_dep_offsets"] == [0, 0, 0, 0, 1]
+    assert bridge["task_deps"] == [0]
+
+    spec = runtime.plan_spec_for(
+        [(0, 2040), (1, 12), (2, 8), (3, 2040)],
+        tail_pool_threads=1,
+        tail_pool_max_routes=12,
+    )
+    assert spec["execution_mode"] == "tail_pool"
+    assert spec["bridge"]["task_placement_modes"].count(1) == 2
+    assert runtime.last["execution_mode"] == "tail_pool"
 
 
 def test_m12_tail_composition(catalog: ProfileCatalog) -> None:

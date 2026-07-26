@@ -13,13 +13,19 @@ import pytest
 import torch
 
 from fused_cpp.moe import _HAS_BF16_TILED_FUSED_MOE
+from fused_cpp.moe import ASYNC_MOE_EXECUTION_TAIL_POOL
+from fused_cpp.moe import ASYNC_MOE_PLACEMENT_FIXED
+from fused_cpp.moe import ASYNC_MOE_PLACEMENT_TAIL_POOL
+from fused_cpp.moe import AsyncMoEPlanV2
 from fused_cpp.moe import available_fused_moe_bf16_tiled_backends
 from fused_cpp.moe import fused_moe_naive
 from fused_cpp.moe import fused_moe_bf16_tiled
 from fused_cpp.moe import fused_moe_bf16_tiled_async
+from fused_cpp.moe import fused_moe_bf16_tiled_async_plan
 from fused_cpp.moe import fused_moe_bf16_tiled_scheduled
 from fused_cpp.moe import fused_moe_bf16_tiled_vllm_staged
 from fused_cpp.moe import prepare_fused_moe_bf16_tiled_weights
+from fused_cpp.moe import upgrade_legacy_async_plan
 
 pytestmark = pytest.mark.skipif(
     platform.machine() not in ("aarch64", "arm64") or not _HAS_BF16_TILED_FUSED_MOE,
@@ -339,6 +345,123 @@ def test_sve_m12_silu_and_w2_bf16_route_match_legacy_for_unit_top1(
                 )
 
 
+def test_sve_plan_v2_strict_and_tail_pool_match_legacy_async(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Native Plan V2 must preserve results across fixed and pooled placement."""
+    if "arm_sve_bf16" not in available_fused_moe_bf16_tiled_backends():
+        pytest.skip("requires an SVE BF16 build/runtime")
+    monkeypatch.setenv("FUSED_CPP_MOE_SVE", "1")
+    generator = torch.Generator().manual_seed(20260726)
+    hidden_size = 64
+    ffn_hidden_size = 32
+    route_counts = [48, 12, 36, 8]
+    num_experts = len(route_counts)
+    num_tokens = sum(route_counts)
+    hidden_states = _bf16_normal(
+        (num_tokens, hidden_size),
+        generator=generator,
+        std=0.01,
+    )
+    w13_weight = _bf16_normal(
+        (num_experts, 2 * ffn_hidden_size, hidden_size),
+        generator=generator,
+        std=0.01,
+    )
+    w2_weight = _bf16_normal(
+        (num_experts, hidden_size, ffn_hidden_size),
+        generator=generator,
+        std=0.01,
+    )
+    topk_ids = torch.cat(
+        [torch.full((count,), expert, dtype=torch.int32) for expert, count in enumerate(route_counts)]
+    ).reshape(num_tokens, 1)
+    topk_weights = torch.ones((num_tokens, 1), dtype=torch.float32)
+    packed = prepare_fused_moe_bf16_tiled_weights(
+        w13_weight,
+        w2_weight,
+        fuse_silu=True,
+        backend="sve",
+    )
+    if hasattr(os, "sched_getaffinity"):
+        cpu_ids = sorted(os.sched_getaffinity(0))[:4]
+    else:
+        cpu_ids = list(range(4))
+    if len(cpu_ids) < 4:
+        pytest.skip("requires four available CPUs")
+
+    strict_bridge = {
+        "num_threads": 4,
+        "thread_cpu_ids": cpu_ids,
+        "task_expert_ids": [0, 1, 2, 3],
+        "task_core_begins": [0, 0, 2, 2],
+        "task_threads": [2, 2, 2, 2],
+        "task_dep_offsets": [0, 0, 1, 1, 2],
+        "task_deps": [0, 2],
+    }
+    strict_plan = AsyncMoEPlanV2.from_dict(upgrade_legacy_async_plan(strict_bridge))
+    reference = fused_moe_bf16_tiled_async(
+        hidden_states,
+        packed,
+        topk_weights,
+        topk_ids,
+        *strict_plan.legacy_schedule(),
+        thread_cpu_ids=strict_plan.thread_cpu_ids,
+        num_threads=4,
+        w13_split=True,
+    )
+
+    monkeypatch.setenv("FUSED_CPP_MOE_ASYNC_SHORT_POOL_THREADS", "invalid")
+    strict = fused_moe_bf16_tiled_async_plan(
+        hidden_states,
+        packed,
+        topk_weights,
+        topk_ids,
+        strict_plan,
+        w13_split=True,
+    )
+
+    tail_bridge = upgrade_legacy_async_plan(strict_bridge)
+    tail_bridge.update(
+        {
+            "execution_mode": ASYNC_MOE_EXECUTION_TAIL_POOL,
+            "task_core_begins": [0, -1, 2, -1],
+            "task_dep_offsets": [0, 0, 0, 0, 0],
+            "task_deps": [],
+            "task_placement_modes": [
+                ASYNC_MOE_PLACEMENT_FIXED,
+                ASYNC_MOE_PLACEMENT_TAIL_POOL,
+                ASYNC_MOE_PLACEMENT_FIXED,
+                ASYNC_MOE_PLACEMENT_TAIL_POOL,
+            ],
+        }
+    )
+    tail = fused_moe_bf16_tiled_async_plan(
+        hidden_states,
+        packed,
+        topk_weights,
+        topk_ids,
+        AsyncMoEPlanV2.from_dict(tail_bridge),
+        w13_split=True,
+    )
+
+    torch.testing.assert_close(strict.float(), reference.float(), atol=0, rtol=0)
+    torch.testing.assert_close(tail.float(), strict.float(), atol=0, rtol=0)
+
+    # The materialized plan owns mutable tensors, so native must validate the
+    # metadata again instead of trusting the Python construction check.
+    strict_plan.task_resize_points[0] = 1
+    with pytest.raises(RuntimeError, match="does not support resize points"):
+        fused_moe_bf16_tiled_async_plan(
+            hidden_states,
+            packed,
+            topk_weights,
+            topk_ids,
+            strict_plan,
+            w13_split=True,
+        )
+
+
 @pytest.mark.parametrize("degree", [4, 5, 6], ids=["poly4", "poly5", "poly6"])
 def test_sve_xbyak_exact_m_matches_static_asm(
     monkeypatch: pytest.MonkeyPatch,
@@ -477,12 +600,8 @@ def test_sve_xbyak_pure_gemm_matches_static_asm(monkeypatch: pytest.MonkeyPatch)
         monkeypatch.setenv("FUSED_CPP_MOE_SVE_JIT_BULK_M", bulk_m)
         for rows in [*range(1, 14), 23, 24, 25]:
             A = _bf16_normal((rows, K), generator=generator, std=0.05)
-            reference = _moe_C.fused_moe_test_sve_packed_gemm(
-                A, packed.w13[0], K, N, packed.backend_n_tile, False
-            )
-            candidate = _moe_C.fused_moe_test_sve_packed_gemm(
-                A, packed.w13[0], K, N, packed.backend_n_tile, True
-            )
+            reference = _moe_C.fused_moe_test_sve_packed_gemm(A, packed.w13[0], K, N, packed.backend_n_tile, False)
+            candidate = _moe_C.fused_moe_test_sve_packed_gemm(A, packed.w13[0], K, N, packed.backend_n_tile, True)
             torch.testing.assert_close(
                 candidate,
                 reference,

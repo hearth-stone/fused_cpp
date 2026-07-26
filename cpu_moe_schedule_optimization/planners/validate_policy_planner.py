@@ -128,10 +128,6 @@ def select_models(profile_dir: Path, mode: str):
     )
 
 
-def tensor_i32(torch, values):
-    return torch.tensor(values, dtype=torch.int32)
-
-
 def parse_shape(value: str | None) -> tuple[int, ...] | None:
     if value is None:
         return None
@@ -142,7 +138,6 @@ def parse_shape(value: str | None) -> tuple[int, ...] | None:
 
 
 def build_call(
-    torch,
     packed,
     hidden,
     ids,
@@ -151,26 +146,17 @@ def build_call(
     split_w13: bool,
     skip_weighted: bool,
 ):
-    from fused_cpp.moe import fused_moe_bf16_tiled_async
+    from fused_cpp.moe import AsyncMoEPlanV2, fused_moe_bf16_tiled_async_plan
 
-    schedule = (
-        tensor_i32(torch, bridge["task_expert_ids"]),
-        tensor_i32(torch, bridge["task_core_begins"]),
-        tensor_i32(torch, bridge["task_threads"]),
-        tensor_i32(torch, bridge["task_dep_offsets"]),
-        tensor_i32(torch, bridge["task_deps"]),
-    )
-    cpus = tensor_i32(torch, bridge["thread_cpu_ids"])
+    plan = AsyncMoEPlanV2.from_dict(bridge)
 
     def run():
-        return fused_moe_bf16_tiled_async(
+        return fused_moe_bf16_tiled_async_plan(
             hidden,
             packed,
             weights,
             ids,
-            *schedule,
-            thread_cpu_ids=cpus,
-            num_threads=int(bridge["num_threads"]),
+            plan,
             activation="silu",
             skip_weighted=skip_weighted,
             w13_split=split_w13,
@@ -267,7 +253,6 @@ def worker(args: argparse.Namespace) -> int:
         weights = torch.full((tokens, args.top_k), 1.0 / args.top_k, dtype=torch.float32)
         calls = {
             candidate["key"]: build_call(
-                torch,
                 packed,
                 hidden,
                 ids,
