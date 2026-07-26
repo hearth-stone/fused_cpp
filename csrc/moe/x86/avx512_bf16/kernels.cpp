@@ -116,7 +116,7 @@ void W13SmallM12(const uint16_t* packed_a, const uint16_t* packed_b, uint16_t* p
 
 void W2SmallM12(const uint16_t* packed_a, const uint16_t* packed_b, float* route_output, uint16_t* direct_output,
                 const int64_t* route_ids, int route_stride, int k_pad, int hidden_size, int output_block,
-                bool direct_bf16) {
+                bool direct_bf16, const float* route_weights) {
   __m512 output0[12];
   __m512 output1[12];
 #pragma GCC unroll 12
@@ -153,6 +153,11 @@ void W2SmallM12(const uint16_t* packed_a, const uint16_t* packed_b, float* route
     const int64_t route = route_ids[row];
     if (direct_bf16) {
       uint16_t* destination = direct_output + route * route_stride + column;
+      if (route_weights != nullptr) {
+        const __m512 weight = _mm512_set1_ps(route_weights[route]);
+        output0[row] = _mm512_mul_ps(output0[row], weight);
+        output1[row] = _mm512_mul_ps(output1[row], weight);
+      }
       StoreBf16(output0[row], destination, mask0);
       if (remaining1 > 0) {
         StoreBf16(output1[row], destination + 16, mask1);
@@ -207,7 +212,7 @@ void W13PackedBlock(const uint16_t* packed_a, const uint16_t* packed_b, uint16_t
 
 void W2PackedBlock(const uint16_t* packed_a, const uint16_t* packed_b, float* route_output, uint16_t* direct_output,
                    const int64_t* route_ids, int route_stride, int rows, int k_pad, int hidden_size, int output_block,
-                   int output_offset, bool direct_bf16) {
+                   int output_offset, bool direct_bf16, const float* route_weights) {
   __m512 output[8];
 #pragma GCC unroll 8
   for (int column = 0; column < 8; ++column) {
@@ -239,10 +244,18 @@ void W2PackedBlock(const uint16_t* packed_a, const uint16_t* packed_b, float* ro
     route_offsets[row] = static_cast<int32_t>(route_ids[row] * route_stride + column_base);
   }
   const __m512i offsets = _mm512_load_si512(route_offsets);
+  alignas(64) float row_weights[16] = {};
+  if (route_weights != nullptr) {
+    for (int row = 0; row < valid_rows; ++row) {
+      row_weights[row] = route_weights[route_ids[row]];
+    }
+  }
+  const __m512 weights = route_weights == nullptr ? _mm512_set1_ps(1.0f) : _mm512_load_ps(row_weights);
   for (int column = 0; column < valid_columns; ++column) {
     if (direct_bf16) {
       alignas(32) uint16_t values[16];
-      _mm256_store_si256(reinterpret_cast<__m256i*>(values), Bf16Bits(output[column]));
+      const __m512 value = route_weights == nullptr ? output[column] : _mm512_mul_ps(output[column], weights);
+      _mm256_store_si256(reinterpret_cast<__m256i*>(values), Bf16Bits(value));
       for (int row = 0; row < valid_rows; ++row) {
         direct_output[static_cast<int64_t>(route_ids[row]) * route_stride + column_base + column] = values[row];
       }
@@ -276,13 +289,14 @@ void ComputeW13Intrinsic(const uint16_t* a, int a_stride, const uint16_t* packed
 
 void ComputeW2Intrinsic(const uint16_t* a, int a_stride, const uint16_t* packed_b, float* route_output,
                         uint16_t* direct_output, const int64_t* route_ids, int route_stride, int rows, int k_pad,
-                        int hidden_size, int output_block_begin, int output_block_end, bool direct_bf16) {
+                        int hidden_size, int output_block_begin, int output_block_end, bool direct_bf16,
+                        const float* route_weights) {
   const int full_panels = rows / 12;
   const int tail_rows = rows % 12;
   for (int block = output_block_begin; block < output_block_end; ++block) {
     for (int panel = 0; panel < full_panels; ++panel) {
       W2SmallM12(a + static_cast<int64_t>(panel) * a_stride * 16, packed_b, route_output, direct_output,
-                 route_ids + panel * 12, route_stride, k_pad, hidden_size, block, direct_bf16);
+                 route_ids + panel * 12, route_stride, k_pad, hidden_size, block, direct_bf16, route_weights);
     }
     if (tail_rows == 0) {
       continue;
@@ -294,7 +308,7 @@ void ComputeW2Intrinsic(const uint16_t* a, int a_stride, const uint16_t* packed_
         break;
       }
       W2PackedBlock(tail_a, packed_b, route_output, direct_output, tail_routes, route_stride, tail_rows, k_pad,
-                    hidden_size, block, output_offset, direct_bf16);
+                    hidden_size, block, output_offset, direct_bf16, route_weights);
     }
   }
 }

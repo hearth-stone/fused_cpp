@@ -155,6 +155,82 @@ def test_avx512_silu_degrees_are_thread_deterministic(monkeypatch: pytest.Monkey
     _assert_bf16_close(serial, intrinsic)
 
 
+def test_avx512_persistent_intermediate_matches_transient(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The grow-only intermediate pool must preserve the AVX-512 exact-M and routing contract."""
+    inputs, w13, w2, topk_weights, topk_ids = _case(
+        tokens=29,
+        hidden=65,
+        intermediate=33,
+        experts=3,
+        top_k=2,
+        seed=501,
+    )
+    packed = prepare_fused_moe_bf16_tiled_weights(w13, w2, fuse_silu=True, backend="x86_avx512_bf16")
+
+    monkeypatch.setenv("FUSED_CPP_MOE_X86_PERSISTENT_INTERMEDIATE", "0")
+    transient = fused_moe_bf16_tiled(inputs, packed, topk_weights, topk_ids, num_threads=2)
+    monkeypatch.setenv("FUSED_CPP_MOE_X86_PERSISTENT_INTERMEDIATE", "1")
+    persistent = fused_moe_bf16_tiled(inputs, packed, topk_weights, topk_ids, num_threads=2)
+    reused = fused_moe_bf16_tiled(inputs, packed, topk_weights, topk_ids, num_threads=2)
+
+    torch.testing.assert_close(persistent.float(), transient.float(), atol=0, rtol=0)
+    torch.testing.assert_close(reused.float(), transient.float(), atol=0, rtol=0)
+
+
+def test_avx512_persistent_input_matches_transient(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The gathered-input pool must preserve AVX-512 physical-M16 packing and route order."""
+    inputs, w13, w2, topk_weights, topk_ids = _case(
+        tokens=29,
+        hidden=65,
+        intermediate=33,
+        experts=3,
+        top_k=2,
+        seed=505,
+    )
+    packed = prepare_fused_moe_bf16_tiled_weights(w13, w2, fuse_silu=True, backend="x86_avx512_bf16")
+
+    monkeypatch.setenv("FUSED_CPP_MOE_X86_PERSISTENT_INPUT", "0")
+    transient = fused_moe_bf16_tiled(inputs, packed, topk_weights, topk_ids, num_threads=2)
+    monkeypatch.setenv("FUSED_CPP_MOE_X86_PERSISTENT_INPUT", "1")
+    persistent = fused_moe_bf16_tiled(inputs, packed, topk_weights, topk_ids, num_threads=2)
+    reused = fused_moe_bf16_tiled(inputs, packed, topk_weights, topk_ids, num_threads=2)
+
+    torch.testing.assert_close(persistent.float(), transient.float(), atol=0, rtol=0)
+    torch.testing.assert_close(reused.float(), transient.float(), atol=0, rtol=0)
+
+
+def test_x86_rejects_unknown_persistent_intermediate_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    inputs, w13, w2, topk_weights, topk_ids = _case(
+        tokens=1,
+        hidden=32,
+        intermediate=16,
+        experts=1,
+        top_k=1,
+        seed=504,
+    )
+    packed = prepare_fused_moe_bf16_tiled_weights(w13, w2, fuse_silu=True, backend="x86_avx512_bf16")
+    monkeypatch.setenv("FUSED_CPP_MOE_X86_PERSISTENT_INTERMEDIATE", "unknown")
+
+    with pytest.raises(RuntimeError, match="must be auto, 0, or 1"):
+        fused_moe_bf16_tiled(inputs, packed, topk_weights, topk_ids, num_threads=1)
+
+
+def test_x86_rejects_unknown_persistent_input_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    inputs, w13, w2, topk_weights, topk_ids = _case(
+        tokens=1,
+        hidden=32,
+        intermediate=16,
+        experts=1,
+        top_k=1,
+        seed=506,
+    )
+    packed = prepare_fused_moe_bf16_tiled_weights(w13, w2, fuse_silu=True, backend="x86_avx512_bf16")
+    monkeypatch.setenv("FUSED_CPP_MOE_X86_PERSISTENT_INPUT", "unknown")
+
+    with pytest.raises(RuntimeError, match="must be auto, 0, or 1"):
+        fused_moe_bf16_tiled(inputs, packed, topk_weights, topk_ids, num_threads=1)
+
+
 @pytest.mark.parametrize("routes", range(1, 14), ids=lambda value: f"m{value}")
 def test_avx512_exact_m_jit_matches_intrinsic(monkeypatch: pytest.MonkeyPatch, routes: int) -> None:
     """Every exact-M specialization and the M12+tail composition retain the fallback contract."""
@@ -344,6 +420,79 @@ def test_avx512_skip_weighted_and_out_buffer() -> None:
     _assert_bf16_close(output, expected)
 
 
+@pytest.mark.parametrize("implementation", ["jit", "intrinsic"])
+@pytest.mark.parametrize("num_threads", [1, 8], ids=["one-thread", "eight-threads"])
+def test_avx512_weighted_top1_direct_matches_route_workspace(
+    monkeypatch: pytest.MonkeyPatch,
+    implementation: str,
+    num_threads: int,
+) -> None:
+    """Weighted top-1 direct output must match the FP32 route-workspace reduction exactly."""
+    monkeypatch.setenv("FUSED_CPP_MOE_AVX512_IMPL", implementation)
+    inputs, w13, w2, topk_weights, topk_ids = _case(
+        tokens=29,
+        hidden=47,
+        intermediate=23,
+        experts=3,
+        top_k=1,
+        seed=351,
+    )
+    topk_weights.copy_(torch.linspace(0.125, 1.125, inputs.size(0)).view(-1, 1))
+    packed = prepare_fused_moe_bf16_tiled_weights(w13, w2, fuse_silu=True, backend="x86_avx512_bf16")
+
+    monkeypatch.setenv("FUSED_CPP_MOE_X86_WEIGHTED_TOP1_DIRECT", "0")
+    workspace = fused_moe_bf16_tiled(inputs, packed, topk_weights, topk_ids, num_threads=num_threads)
+    output = torch.empty_like(inputs)
+    monkeypatch.setenv("FUSED_CPP_MOE_X86_WEIGHTED_TOP1_DIRECT", "1")
+    returned = fused_moe_bf16_tiled(
+        inputs,
+        packed,
+        topk_weights,
+        topk_ids,
+        num_threads=num_threads,
+        out=output,
+    )
+
+    assert returned is output
+    torch.testing.assert_close(output.float(), workspace.float(), atol=0, rtol=0)
+    _assert_bf16_close(output, fused_moe_naive(inputs, w13, w2, topk_weights, topk_ids))
+
+
+def test_x86_weighted_top1_direct_keeps_topk2_route_workspace(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The opt-in direct epilogue is top-1-only and must not change top-k reduction order."""
+    inputs, w13, w2, topk_weights, topk_ids = _case(
+        tokens=13,
+        hidden=35,
+        intermediate=19,
+        experts=3,
+        top_k=2,
+        seed=352,
+    )
+    packed = prepare_fused_moe_bf16_tiled_weights(w13, w2, fuse_silu=True, backend="x86_avx512_bf16")
+    monkeypatch.setenv("FUSED_CPP_MOE_X86_WEIGHTED_TOP1_DIRECT", "0")
+    disabled = fused_moe_bf16_tiled(inputs, packed, topk_weights, topk_ids, num_threads=2)
+    monkeypatch.setenv("FUSED_CPP_MOE_X86_WEIGHTED_TOP1_DIRECT", "1")
+    enabled = fused_moe_bf16_tiled(inputs, packed, topk_weights, topk_ids, num_threads=2)
+
+    torch.testing.assert_close(enabled.float(), disabled.float(), atol=0, rtol=0)
+
+
+def test_x86_rejects_unknown_weighted_top1_direct_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    inputs, w13, w2, topk_weights, topk_ids = _case(
+        tokens=1,
+        hidden=32,
+        intermediate=16,
+        experts=1,
+        top_k=1,
+        seed=353,
+    )
+    packed = prepare_fused_moe_bf16_tiled_weights(w13, w2, fuse_silu=True, backend="x86_avx512_bf16")
+    monkeypatch.setenv("FUSED_CPP_MOE_X86_WEIGHTED_TOP1_DIRECT", "unknown")
+
+    with pytest.raises(RuntimeError, match="must be auto, 0, or 1"):
+        fused_moe_bf16_tiled(inputs, packed, topk_weights, topk_ids, num_threads=1)
+
+
 def test_avx512_rejects_bias_and_excessive_threads() -> None:
     inputs, w13, w2, topk_weights, topk_ids = _case(
         tokens=2,
@@ -493,6 +642,54 @@ def test_amx_exact_m_matches_avx512_jit(routes: int) -> None:
 
 
 @requires_amx
+@pytest.mark.parametrize("skip_weighted", [False, True], ids=["weighted", "direct-bf16"])
+@pytest.mark.parametrize("num_threads", [1, 8], ids=["one-thread", "eight-threads"])
+def test_amx_aligned_single_active_expert_matches_naive_without_gather(
+    skip_weighted: bool,
+    num_threads: int,
+) -> None:
+    """An aligned top-1 hot expert may read the original input without changing results."""
+    inputs, w13, w2, topk_weights, topk_ids = _case(
+        tokens=33,
+        hidden=64,
+        intermediate=37,
+        experts=3,
+        top_k=1,
+        seed=460,
+    )
+    topk_ids.fill_(2)
+    topk_weights.fill_(1.0)
+    packed = prepare_fused_moe_bf16_tiled_weights(
+        w13,
+        w2,
+        fuse_silu=True,
+        backend="x86_amx_bf16",
+    )
+    output = torch.empty_like(inputs)
+
+    returned = fused_moe_bf16_tiled(
+        inputs,
+        packed,
+        topk_weights,
+        topk_ids,
+        num_threads=num_threads,
+        skip_weighted=skip_weighted,
+        out=output,
+    )
+    expected = fused_moe_naive(
+        inputs,
+        w13,
+        w2,
+        topk_weights,
+        topk_ids,
+        skip_weighted=skip_weighted,
+    )
+
+    assert returned is output
+    _assert_bf16_close(output, expected)
+
+
+@requires_amx
 @pytest.mark.parametrize("pattern", ["m1n2", "m2n2", "m1n4"])
 @pytest.mark.parametrize("routes", [17, 32, 33, 64, 2048], ids=lambda value: f"m{value}")
 def test_amx_patterns_match_naive_through_large_m(
@@ -532,7 +729,11 @@ def test_amx_patterns_match_naive_through_large_m(
         pytest.param("m1n4", 77, id="m1n4-full-panels-and-tail"),
     ],
 )
-@pytest.mark.parametrize("num_threads", [1, 8], ids=["one-thread", "eight-threads"])
+@pytest.mark.parametrize(
+    "num_threads",
+    [1, 2, 4, 8],
+    ids=["one-thread", "two-threads", "four-threads", "eight-threads"],
+)
 def test_amx_macro_m_tile_state_matches_per_call(
     monkeypatch: pytest.MonkeyPatch,
     pattern: str,
@@ -921,6 +1122,129 @@ def test_amx_fused_expert_matches_naive_for_tails_and_threads(degree: int, num_t
 
 
 @requires_amx
+@pytest.mark.parametrize("num_threads", [1, 8], ids=["one-thread", "eight-threads"])
+def test_amx_persistent_intermediate_clears_reused_k32_tail(
+    monkeypatch: pytest.MonkeyPatch,
+    num_threads: int,
+) -> None:
+    """A smaller F must not consume stale non-finite values from a previously wider persistent buffer."""
+    monkeypatch.setenv("FUSED_CPP_MOE_X86_PERSISTENT_INTERMEDIATE", "1")
+    wide_inputs, wide_w13, wide_w2, wide_topk_weights, wide_topk_ids = _case(
+        tokens=33,
+        hidden=64,
+        intermediate=64,
+        experts=1,
+        top_k=1,
+        seed=502,
+    )
+    wide_w13[:, 64:, :].fill_(float("nan"))
+    wide_topk_weights.fill_(1.0)
+    wide_packed = prepare_fused_moe_bf16_tiled_weights(
+        wide_w13,
+        wide_w2,
+        fuse_silu=True,
+        backend="x86_amx_bf16",
+    )
+    fused_moe_bf16_tiled(
+        wide_inputs,
+        wide_packed,
+        wide_topk_weights,
+        wide_topk_ids,
+        num_threads=num_threads,
+        skip_weighted=True,
+    )
+
+    inputs, w13, w2, topk_weights, topk_ids = _case(
+        tokens=33,
+        hidden=64,
+        intermediate=33,
+        experts=1,
+        top_k=1,
+        seed=503,
+    )
+    topk_weights.fill_(1.0)
+    packed = prepare_fused_moe_bf16_tiled_weights(
+        w13,
+        w2,
+        fuse_silu=True,
+        backend="x86_amx_bf16",
+    )
+
+    actual = fused_moe_bf16_tiled(
+        inputs,
+        packed,
+        topk_weights,
+        topk_ids,
+        num_threads=num_threads,
+        skip_weighted=True,
+    )
+    expected = fused_moe_naive(inputs, w13, w2, topk_weights, topk_ids, skip_weighted=True)
+
+    _assert_bf16_close(actual, expected)
+
+
+@requires_amx
+@pytest.mark.parametrize("num_threads", [1, 8], ids=["one-thread", "eight-threads"])
+def test_amx_persistent_input_clears_reused_k32_tail(
+    monkeypatch: pytest.MonkeyPatch,
+    num_threads: int,
+) -> None:
+    """Gathering a narrower H must overwrite stale pooled values through AMX's observable K32 tail."""
+    monkeypatch.setenv("FUSED_CPP_MOE_X86_PERSISTENT_INPUT", "1")
+    wide_inputs, wide_w13, wide_w2, wide_topk_weights, wide_topk_ids = _case(
+        tokens=34,
+        hidden=64,
+        intermediate=32,
+        experts=2,
+        top_k=1,
+        seed=507,
+    )
+    wide_inputs[:, 33:].fill_(float("nan"))
+    wide_topk_weights.fill_(1.0)
+    wide_packed = prepare_fused_moe_bf16_tiled_weights(
+        wide_w13,
+        wide_w2,
+        fuse_silu=True,
+        backend="x86_amx_bf16",
+    )
+    fused_moe_bf16_tiled(
+        wide_inputs,
+        wide_packed,
+        wide_topk_weights,
+        wide_topk_ids,
+        num_threads=num_threads,
+        skip_weighted=True,
+    )
+
+    inputs, w13, w2, topk_weights, topk_ids = _case(
+        tokens=34,
+        hidden=33,
+        intermediate=32,
+        experts=2,
+        top_k=1,
+        seed=508,
+    )
+    topk_weights.fill_(1.0)
+    packed = prepare_fused_moe_bf16_tiled_weights(
+        w13,
+        w2,
+        fuse_silu=True,
+        backend="x86_amx_bf16",
+    )
+    actual = fused_moe_bf16_tiled(
+        inputs,
+        packed,
+        topk_weights,
+        topk_ids,
+        num_threads=num_threads,
+        skip_weighted=True,
+    )
+    expected = fused_moe_naive(inputs, w13, w2, topk_weights, topk_ids, skip_weighted=True)
+
+    _assert_bf16_close(actual, expected)
+
+
+@requires_amx
 def test_amx_skip_weighted_direct_bf16_output() -> None:
     """AMX W2 writes a tail-sized top-1 result directly into the supplied BF16 buffer."""
     inputs, w13, w2, topk_weights, topk_ids = _case(
@@ -953,6 +1277,54 @@ def test_amx_skip_weighted_direct_bf16_output() -> None:
 
     assert returned is output
     _assert_bf16_close(output, expected)
+
+
+@requires_amx
+@pytest.mark.parametrize("pattern", ["m1n2", "m2n2", "m1n4"])
+@pytest.mark.parametrize("num_threads", [1, 8], ids=["one-thread", "eight-threads"])
+def test_amx_weighted_top1_direct_matches_route_workspace(
+    monkeypatch: pytest.MonkeyPatch,
+    pattern: str,
+    num_threads: int,
+) -> None:
+    """Every AMX M/N pattern scales TILESTORED rows before the direct BF16 conversion."""
+    monkeypatch.setenv("FUSED_CPP_MOE_AMX_PATTERN", pattern)
+    if pattern == "m1n4":
+        # Weighted direct output must override the incompatible final
+        # TILESTORED mode while retaining identical values.
+        monkeypatch.setenv("FUSED_CPP_MOE_AMX_W2_EPILOGUE", "tile_store")
+    inputs, w13, w2, topk_weights, topk_ids = _case(
+        tokens=33,
+        hidden=67,
+        intermediate=35,
+        experts=1,
+        top_k=1,
+        seed=354,
+    )
+    topk_weights.copy_(torch.linspace(0.0625, 1.0625, inputs.size(0)).view(-1, 1))
+    packed = prepare_fused_moe_bf16_tiled_weights(
+        w13,
+        w2,
+        fuse_silu=True,
+        backend="x86_amx_bf16",
+    )
+
+    monkeypatch.setenv("FUSED_CPP_MOE_X86_WEIGHTED_TOP1_DIRECT", "0")
+    workspace = fused_moe_bf16_tiled(inputs, packed, topk_weights, topk_ids, num_threads=num_threads)
+    output = torch.empty_like(inputs)
+    monkeypatch.setenv("FUSED_CPP_MOE_X86_WEIGHTED_TOP1_DIRECT", "1")
+    returned = fused_moe_bf16_tiled(
+        inputs,
+        packed,
+        topk_weights,
+        topk_ids,
+        num_threads=num_threads,
+        out=output,
+    )
+
+    assert returned is output
+    torch.testing.assert_close(output.float(), workspace.float(), atol=0, rtol=0)
+    _assert_bf16_close(output, fused_moe_naive(inputs, w13, w2, topk_weights, topk_ids))
 
 
 @requires_amx

@@ -12,6 +12,7 @@
 #include <exception>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <utility>
@@ -42,11 +43,16 @@ struct ExpertTask {
 };
 
 struct ThreadScratch {
-  std::vector<uint16_t> input;
-  std::vector<uint16_t> intermediate;
+  std::vector<uint16_t> transient_input;
+  uint16_t* input = nullptr;
+  std::vector<uint16_t> transient_intermediate;
+  uint16_t* intermediate = nullptr;
 };
 
 constexpr int64_t kMaxExecutorThreads = 256;
+constexpr int64_t kPersistentInputMinBytes = 256 * 1024;
+constexpr int64_t kPersistentIntermediateMinBytes = 256 * 1024;
+constexpr int64_t kWeightedTop1DirectMinWorkspaceBytes = 256 * 1024;
 // Empirical runtime-mapper target for deciding how many experts share a wave.
 // It changes only scheduling; N-range ownership keeps correctness independent
 // of this value.
@@ -140,6 +146,131 @@ const uint16_t* Bf16Data(const at::Tensor& tensor) {
 }
 
 uint16_t* MutableBf16Data(at::Tensor& tensor) { return reinterpret_cast<uint16_t*>(tensor.data_ptr<at::BFloat16>()); }
+
+struct PersistentBf16ScratchRecord {
+  bool in_use = false;
+  std::vector<at::Tensor> buffers;
+};
+
+class PersistentBf16ScratchPool {
+ public:
+  PersistentBf16ScratchRecord* Acquire(size_t buffer_count) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (const std::unique_ptr<PersistentBf16ScratchRecord>& record : records_) {
+      if (!record->in_use) {
+        record->in_use = true;
+        if (record->buffers.size() < buffer_count) {
+          record->buffers.resize(buffer_count);
+        }
+        return record.get();
+      }
+    }
+    auto record = std::make_unique<PersistentBf16ScratchRecord>();
+    record->in_use = true;
+    record->buffers.resize(buffer_count);
+    PersistentBf16ScratchRecord* result = record.get();
+    records_.push_back(std::move(record));
+    return result;
+  }
+
+  void Release(PersistentBf16ScratchRecord* record) noexcept {
+    if (record == nullptr) {
+      return;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    record->in_use = false;
+  }
+
+ private:
+  std::mutex mutex_;
+  std::vector<std::unique_ptr<PersistentBf16ScratchRecord>> records_;
+};
+
+PersistentBf16ScratchPool& GetPersistentInputScratchPool() {
+  static PersistentBf16ScratchPool pool;
+  return pool;
+}
+
+PersistentBf16ScratchPool& GetPersistentIntermediateScratchPool() {
+  static PersistentBf16ScratchPool pool;
+  return pool;
+}
+
+class PersistentBf16ScratchLease {
+ public:
+  PersistentBf16ScratchLease(PersistentBf16ScratchPool* pool, size_t buffer_count) : pool_(pool) {
+    if (pool_ != nullptr) {
+      record_ = pool_->Acquire(buffer_count);
+    }
+  }
+
+  PersistentBf16ScratchLease(const PersistentBf16ScratchLease&) = delete;
+  PersistentBf16ScratchLease& operator=(const PersistentBf16ScratchLease&) = delete;
+
+  ~PersistentBf16ScratchLease() {
+    if (pool_ != nullptr) {
+      pool_->Release(record_);
+    }
+  }
+
+  at::Tensor& buffer(size_t index) { return record_->buffers[index]; }
+
+ private:
+  PersistentBf16ScratchPool* pool_ = nullptr;
+  PersistentBf16ScratchRecord* record_ = nullptr;
+};
+
+enum class PersistentScratchMode { kAuto, kDisabled, kEnabled };
+
+PersistentScratchMode ResolvePersistentScratchMode(const char* environment) {
+  const char* raw = std::getenv(environment);
+  if (raw == nullptr || raw[0] == '\0') {
+    return PersistentScratchMode::kAuto;
+  }
+  const std::string value(raw);
+  if (value == "auto") {
+    return PersistentScratchMode::kAuto;
+  }
+  if (value == "1" || value == "true" || value == "TRUE") {
+    return PersistentScratchMode::kEnabled;
+  }
+  if (value == "0" || value == "false" || value == "FALSE") {
+    return PersistentScratchMode::kDisabled;
+  }
+  TORCH_CHECK(false, environment, " must be auto, 0, or 1; got '", value, "'");
+  return PersistentScratchMode::kDisabled;
+}
+
+enum class WeightedTop1DirectMode { kAuto, kDisabled, kEnabled };
+
+WeightedTop1DirectMode ResolveWeightedTop1DirectMode() {
+  const char* raw = std::getenv("FUSED_CPP_MOE_X86_WEIGHTED_TOP1_DIRECT");
+  if (raw == nullptr || raw[0] == '\0') {
+    return WeightedTop1DirectMode::kAuto;
+  }
+  const std::string value(raw);
+  if (value == "auto") {
+    return WeightedTop1DirectMode::kAuto;
+  }
+  if (value == "1" || value == "true" || value == "TRUE") {
+    return WeightedTop1DirectMode::kEnabled;
+  }
+  if (value == "0" || value == "false" || value == "FALSE") {
+    return WeightedTop1DirectMode::kDisabled;
+  }
+  TORCH_CHECK(false, "FUSED_CPP_MOE_X86_WEIGHTED_TOP1_DIRECT must be auto, 0, or 1; got '", value, "'");
+  return WeightedTop1DirectMode::kDisabled;
+}
+
+void ClearIntermediatePadding(uint16_t* intermediate, int64_t rows, int f_pad, int intermediate_stride) {
+  if (f_pad >= intermediate_stride) {
+    return;
+  }
+  for (int64_t row = 0; row < rows; ++row) {
+    uint16_t* row_data = intermediate + row * intermediate_stride;
+    std::fill(row_data + f_pad, row_data + intermediate_stride, static_cast<uint16_t>(0));
+  }
+}
 
 template <typename Function>
 void RunThreads(int64_t threads, Function&& function) {
@@ -345,31 +476,30 @@ void GatherExpertInput(const ExpertTask& task, ThreadScratch& scratch, const uin
                        int64_t top_k, int k_pad, bool use_amx, int64_t group_size = 1, int64_t local_tid = 0) {
   const std::vector<int64_t>& routes = *task.routes;
   if (use_amx) {
-    GatherInputAmx(input, hidden_size, top_k, routes, scratch.input.data(), k_pad, group_size, local_tid);
+    GatherInputAmx(input, hidden_size, top_k, routes, scratch.input, k_pad, group_size, local_tid);
   } else {
-    GatherInput(input, hidden_size, top_k, routes, scratch.input.data(), k_pad, group_size, local_tid);
+    GatherInput(input, hidden_size, top_k, routes, scratch.input, k_pad, group_size, local_tid);
   }
 }
 
-void RunExpertW13Range(const ExpertTask& task, ThreadScratch& scratch, const uint16_t* w13,
-                       const PackedShape& w13_shape, int f_pad, int intermediate_stride, int silu_poly_degree,
-                       bool use_amx, int feature_block_begin, int feature_block_end) {
+void RunExpertW13Range(const ExpertTask& task, ThreadScratch& scratch, const uint16_t* expert_input,
+                       const uint16_t* w13, const PackedShape& w13_shape, int f_pad, int intermediate_stride,
+                       int silu_poly_degree, bool use_amx, int feature_block_begin, int feature_block_end) {
   const int rows = static_cast<int>(task.routes->size());
   const uint16_t* expert_w13 = w13 + task.expert * w13_shape.expert_stride;
   if (use_amx) {
-    avx512_moe::ComputeW13Amx(scratch.input.data(), w13_shape.k_pad, expert_w13, scratch.intermediate.data(),
-                              intermediate_stride, rows, w13_shape.k_pad, feature_block_begin, feature_block_end,
-                              silu_poly_degree);
+    avx512_moe::ComputeW13Amx(expert_input, w13_shape.k_pad, expert_w13, scratch.intermediate, intermediate_stride,
+                              rows, w13_shape.k_pad, feature_block_begin, feature_block_end, silu_poly_degree);
   } else {
-    avx512_moe::ComputeW13(scratch.input.data(), w13_shape.k_pad, expert_w13, scratch.intermediate.data(), f_pad, rows,
+    avx512_moe::ComputeW13(expert_input, w13_shape.k_pad, expert_w13, scratch.intermediate, f_pad, rows,
                            w13_shape.k_pad, feature_block_begin, feature_block_end, silu_poly_degree);
   }
 }
 
 void RunExpertW2Range(const ExpertTask& task, ThreadScratch& scratch, const uint16_t* w2, const PackedShape& w2_shape,
-                      int f_pad, int intermediate_stride, float* route_output, uint16_t* output, int64_t hidden_size,
-                      bool skip_weighted, bool use_amx, bool contiguous_route_output, int output_block_begin,
-                      int output_block_end) {
+                      int f_pad, int intermediate_stride, float* route_output, uint16_t* output,
+                      const float* route_weights, int64_t hidden_size, bool direct_bf16, bool use_amx,
+                      bool contiguous_route_output, int output_block_begin, int output_block_end) {
   const std::vector<int64_t>& routes = *task.routes;
   const int rows = static_cast<int>(routes.size());
   const uint16_t* expert_w2 = w2 + task.expert * w2_shape.expert_stride;
@@ -380,28 +510,34 @@ void RunExpertW2Range(const ExpertTask& task, ThreadScratch& scratch, const uint
       expert_route_output += task.output_row_begin * hidden_size;
       output_route_ids = nullptr;
     }
-    avx512_moe::ComputeW2Amx(scratch.intermediate.data(), intermediate_stride, expert_w2, expert_route_output, output,
+    avx512_moe::ComputeW2Amx(scratch.intermediate, intermediate_stride, expert_w2, expert_route_output, output,
                              output_route_ids, static_cast<int>(hidden_size), rows, w2_shape.k_pad,
-                             static_cast<int>(hidden_size), output_block_begin, output_block_end, skip_weighted);
+                             static_cast<int>(hidden_size), output_block_begin, output_block_end, direct_bf16,
+                             route_weights);
   } else {
-    avx512_moe::ComputeW2(scratch.intermediate.data(), f_pad, expert_w2, route_output, output, routes.data(),
+    avx512_moe::ComputeW2(scratch.intermediate, f_pad, expert_w2, route_output, output, routes.data(),
                           static_cast<int>(hidden_size), rows, w2_shape.k_pad, static_cast<int>(hidden_size),
-                          output_block_begin, output_block_end, skip_weighted);
+                          output_block_begin, output_block_end, direct_bf16, route_weights);
   }
 }
 
 void RunExpert(const ExpertTask& task, ThreadScratch& scratch, const uint16_t* input, int64_t hidden_size,
                int64_t top_k, const uint16_t* w13, const PackedShape& w13_shape, const uint16_t* w2,
-               const PackedShape& w2_shape, int f_pad, float* route_output, uint16_t* output, bool skip_weighted,
-               int silu_poly_degree, bool use_amx, bool contiguous_route_output) {
-  GatherExpertInput(task, scratch, input, hidden_size, top_k, w13_shape.k_pad, use_amx);
+               const PackedShape& w2_shape, int f_pad, float* route_output, uint16_t* output,
+               const float* route_weights, bool direct_bf16, int silu_poly_degree, bool use_amx,
+               bool contiguous_route_output, bool use_direct_input) {
+  const uint16_t* expert_input = input;
+  if (!use_direct_input) {
+    GatherExpertInput(task, scratch, input, hidden_size, top_k, w13_shape.k_pad, use_amx);
+    expert_input = scratch.input;
+  }
   // AMX W2 loads complete K32 tiles, so its A stride must include padding
   // beyond W13's potentially smaller F16-padded feature range.
   const int intermediate_stride = use_amx ? w2_shape.k_pad : f_pad;
-  RunExpertW13Range(task, scratch, w13, w13_shape, f_pad, intermediate_stride, silu_poly_degree, use_amx, 0,
-                    f_pad / 16);
-  RunExpertW2Range(task, scratch, w2, w2_shape, f_pad, intermediate_stride, route_output, output, hidden_size,
-                   skip_weighted, use_amx, contiguous_route_output, 0, w2_shape.n_pad / 32);
+  RunExpertW13Range(task, scratch, expert_input, w13, w13_shape, f_pad, intermediate_stride, silu_poly_degree, use_amx,
+                    0, f_pad / 16);
+  RunExpertW2Range(task, scratch, w2, w2_shape, f_pad, intermediate_stride, route_output, output, route_weights,
+                   hidden_size, direct_bf16, use_amx, contiguous_route_output, 0, w2_shape.n_pad / 32);
 }
 
 }  // namespace
@@ -518,6 +654,15 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input, at::Tensor w13_packed, int64_t
   const int64_t top_k = topk_ids.size(1);
   TORCH_CHECK(num_tokens <= std::numeric_limits<int64_t>::max() / top_k, "tokens * top_k overflows the route count");
   const int64_t num_routes = num_tokens * top_k;
+  const WeightedTop1DirectMode weighted_top1_mode = ResolveWeightedTop1DirectMode();
+  const int64_t route_row_bytes = input.size(1) * static_cast<int64_t>(sizeof(float));
+  const int64_t automatic_min_routes = (kWeightedTop1DirectMinWorkspaceBytes + route_row_bytes - 1) / route_row_bytes;
+  const bool use_weighted_top1_direct =
+      !skip_weighted && top_k == 1 &&
+      (weighted_top1_mode == WeightedTop1DirectMode::kEnabled ||
+       (weighted_top1_mode == WeightedTop1DirectMode::kAuto && num_routes >= automatic_min_routes));
+  const bool direct_bf16 = skip_weighted || use_weighted_top1_direct;
+  const float* direct_route_weights = use_weighted_top1_direct ? weights_f32.data_ptr<float>() : nullptr;
   if (!use_amx) {
     TORCH_CHECK(num_routes <= std::numeric_limits<int32_t>::max() / input.size(1),
                 "route output is too large for the AVX-512 scatter addressing: routes=", num_routes,
@@ -530,7 +675,7 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input, at::Tensor w13_packed, int64_t
                 ")");
     routes[static_cast<size_t>(expert)].push_back(flat);
   }
-  const bool contiguous_route_output = use_amx && !skip_weighted && avx512_moe::AmxW2UsesContiguousRouteOutput();
+  const bool contiguous_route_output = use_amx && !direct_bf16 && avx512_moe::AmxW2UsesContiguousRouteOutput();
   std::vector<int64_t> route_output_rows;
   if (contiguous_route_output) {
     route_output_rows.resize(static_cast<size_t>(num_routes));
@@ -553,6 +698,13 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input, at::Tensor w13_packed, int64_t
   }
   TORCH_CHECK(max_rows <= std::numeric_limits<int>::max(),
               "one expert has too many routed rows for the x86 kernel: ", max_rows);
+  // With top-k=1 and only one active expert, routes were appended in flat
+  // token order. If H already satisfies AMX's K32 alignment, that gathered
+  // matrix is byte-for-byte the original contiguous input, so avoid copying
+  // the full MxH tensor into scratch.
+  const bool use_direct_input = use_amx && top_k == 1 && tasks.size() == 1 &&
+                                static_cast<int64_t>(tasks.front().routes->size()) == num_tokens &&
+                                w13_shape.k_pad == input.size(1);
 
   std::vector<int> jit_row_counts;
   jit_row_counts.reserve(tasks.size());
@@ -560,9 +712,11 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input, at::Tensor w13_packed, int64_t
     jit_row_counts.push_back(static_cast<int>(task.routes->size()));
   }
   if (use_amx) {
-    avx512_moe::PrepareAmxJitKernels(jit_row_counts, silu_poly_degree, static_cast<int>(input.size(1)), skip_weighted);
+    avx512_moe::PrepareAmxJitKernels(jit_row_counts, silu_poly_degree, static_cast<int>(input.size(1)), direct_bf16,
+                                     use_weighted_top1_direct);
   } else {
-    avx512_moe::PrepareJitKernels(jit_row_counts, silu_poly_degree, static_cast<int>(input.size(1)), skip_weighted);
+    avx512_moe::PrepareJitKernels(jit_row_counts, silu_poly_degree, static_cast<int>(input.size(1)), direct_bf16,
+                                  use_weighted_top1_direct);
   }
 
   const int f_pad = w13_shape.n_pad / 2;
@@ -616,14 +770,73 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input, at::Tensor w13_packed, int64_t
       }
     }
   }
-  for (size_t index = 0; index < scratches.size(); ++index) {
+  std::vector<int64_t> scratch_rows_by_slot(scratch_count);
+  int64_t total_input_elements = 0;
+  int64_t total_intermediate_elements = 0;
+  for (size_t index = 0; index < scratch_count; ++index) {
     const int64_t scratch_rows = use_amx ? scratch_logical_rows[index] : (scratch_logical_rows[index] + 11) / 12 * 16;
-    scratches[index].input.resize(static_cast<size_t>(scratch_rows * w13_shape.k_pad));
-    scratches[index].intermediate.resize(static_cast<size_t>(scratch_rows * intermediate_stride));
+    TORCH_CHECK(scratch_rows <= std::numeric_limits<int64_t>::max() / w13_shape.k_pad,
+                "x86 fused MoE input scratch size overflow");
+    TORCH_CHECK(scratch_rows <= std::numeric_limits<int64_t>::max() / intermediate_stride,
+                "x86 fused MoE intermediate scratch size overflow");
+    const int64_t input_elements = scratch_rows * w13_shape.k_pad;
+    const int64_t intermediate_elements = scratch_rows * intermediate_stride;
+    TORCH_CHECK(total_input_elements <= std::numeric_limits<int64_t>::max() - input_elements,
+                "x86 fused MoE total input scratch size overflow");
+    TORCH_CHECK(total_intermediate_elements <= std::numeric_limits<int64_t>::max() - intermediate_elements,
+                "x86 fused MoE total intermediate scratch size overflow");
+    scratch_rows_by_slot[index] = scratch_rows;
+    total_input_elements += input_elements;
+    total_intermediate_elements += intermediate_elements;
+  }
+  const PersistentScratchMode persistent_input_mode =
+      ResolvePersistentScratchMode("FUSED_CPP_MOE_X86_PERSISTENT_INPUT");
+  const PersistentScratchMode persistent_intermediate_mode =
+      ResolvePersistentScratchMode("FUSED_CPP_MOE_X86_PERSISTENT_INTERMEDIATE");
+  const bool use_persistent_input =
+      !use_direct_input &&
+      (persistent_input_mode == PersistentScratchMode::kEnabled ||
+       (persistent_input_mode == PersistentScratchMode::kAuto && use_amx &&
+        total_input_elements >= kPersistentInputMinBytes / static_cast<int64_t>(sizeof(uint16_t))));
+  const bool use_persistent_intermediate =
+      persistent_intermediate_mode == PersistentScratchMode::kEnabled ||
+      (persistent_intermediate_mode == PersistentScratchMode::kAuto && use_amx &&
+       total_intermediate_elements >= kPersistentIntermediateMinBytes / static_cast<int64_t>(sizeof(uint16_t)));
+  PersistentBf16ScratchLease input_lease(use_persistent_input ? &GetPersistentInputScratchPool() : nullptr,
+                                         scratch_count);
+  PersistentBf16ScratchLease intermediate_lease(
+      use_persistent_intermediate ? &GetPersistentIntermediateScratchPool() : nullptr, scratch_count);
+  for (size_t index = 0; index < scratches.size(); ++index) {
+    const int64_t scratch_rows = scratch_rows_by_slot[index];
+    if (!use_direct_input) {
+      const int64_t input_elements = scratch_rows * w13_shape.k_pad;
+      if (use_persistent_input) {
+        at::Tensor& buffer = input_lease.buffer(index);
+        if (!buffer.defined() || buffer.numel() < input_elements) {
+          buffer = at::empty({input_elements}, input.options());
+        }
+        scratches[index].input = MutableBf16Data(buffer);
+      } else {
+        scratches[index].transient_input.resize(static_cast<size_t>(input_elements));
+        scratches[index].input = scratches[index].transient_input.data();
+      }
+    }
+    const int64_t intermediate_elements = scratch_rows * intermediate_stride;
+    if (use_persistent_intermediate) {
+      at::Tensor& buffer = intermediate_lease.buffer(index);
+      if (!buffer.defined() || buffer.numel() < intermediate_elements) {
+        buffer = at::empty({intermediate_elements}, input.options());
+      }
+      scratches[index].intermediate = MutableBf16Data(buffer);
+    } else {
+      scratches[index].transient_intermediate.resize(static_cast<size_t>(intermediate_elements));
+      scratches[index].intermediate = scratches[index].transient_intermediate.data();
+    }
+    ClearIntermediatePadding(scratches[index].intermediate, scratch_rows, f_pad, intermediate_stride);
   }
   at::Tensor route_output;
   float* route_output_pointer = nullptr;
-  if (!skip_weighted) {
+  if (!direct_bf16) {
     route_output = at::empty({num_routes, input.size(1)}, input.options().dtype(at::kFloat));
     route_output_pointer = route_output.data_ptr<float>();
   }
@@ -648,23 +861,27 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input, at::Tensor w13_packed, int64_t
         ThreadScratch& scratch = scratches[assignment.team_index];
         ThreadBarrier& barrier = *team.barrier;
         try {
-          GatherExpertInput(task, scratch, input_pointer, input.size(1), top_k, w13_shape.k_pad, use_amx, team.threads,
-                            assignment.local_tid);
+          if (!use_direct_input) {
+            GatherExpertInput(task, scratch, input_pointer, input.size(1), top_k, w13_shape.k_pad, use_amx,
+                              team.threads, assignment.local_tid);
+          }
           if (!barrier.Wait()) {
             return;
           }
 
           const BlockRange w13_range = SplitEvenly(w13_blocks, team.threads, assignment.local_tid);
-          RunExpertW13Range(task, scratch, w13_pointer, w13_shape, f_pad, intermediate_stride, silu_poly_degree,
-                            use_amx, static_cast<int>(w13_range.begin), static_cast<int>(w13_range.end));
+          const uint16_t* expert_input = use_direct_input ? input_pointer : scratch.input;
+          RunExpertW13Range(task, scratch, expert_input, w13_pointer, w13_shape, f_pad, intermediate_stride,
+                            silu_poly_degree, use_amx, static_cast<int>(w13_range.begin),
+                            static_cast<int>(w13_range.end));
           if (!barrier.Wait()) {
             return;
           }
 
           const BlockRange w2_range = SplitEvenly(w2_blocks, team.threads, assignment.local_tid);
           RunExpertW2Range(task, scratch, w2_pointer, w2_shape, f_pad, intermediate_stride, route_output_pointer,
-                           output_pointer, input.size(1), skip_weighted, use_amx, contiguous_route_output,
-                           static_cast<int>(w2_range.begin), static_cast<int>(w2_range.end));
+                           output_pointer, direct_route_weights, input.size(1), direct_bf16, use_amx,
+                           contiguous_route_output, static_cast<int>(w2_range.begin), static_cast<int>(w2_range.end));
         } catch (...) {
           barrier.Cancel();
           throw;
@@ -680,13 +897,13 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input, at::Tensor w13_packed, int64_t
           return;
         }
         RunExpert(tasks[index], scratches[static_cast<size_t>(tid)], input_pointer, input.size(1), top_k, w13_pointer,
-                  w13_shape, w2_pointer, w2_shape, f_pad, route_output_pointer, output_pointer, skip_weighted,
-                  silu_poly_degree, use_amx, contiguous_route_output);
+                  w13_shape, w2_pointer, w2_shape, f_pad, route_output_pointer, output_pointer, direct_route_weights,
+                  direct_bf16, silu_poly_degree, use_amx, contiguous_route_output, use_direct_input);
       }
     });
   }
 
-  if (!skip_weighted) {
+  if (!direct_bf16) {
     const float* weights = weights_f32.data_ptr<float>();
     const int64_t merge_threads = std::min(num_threads, num_tokens);
     RunThreads(merge_threads, [&](int64_t tid) {

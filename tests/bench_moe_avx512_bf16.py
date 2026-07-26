@@ -67,9 +67,13 @@ def main() -> None:
     parser.add_argument("--runs", type=int, default=21)
     parser.add_argument("--baseline-runs", type=int, default=7)
     parser.add_argument("--skip-baseline", action="store_true")
+    parser.add_argument("--reuse-out", action="store_true")
+    parser.add_argument("--skip-weighted", action="store_true")
     args = parser.parse_args()
     if not 1 <= args.threads <= 256:
         parser.error("--threads must be in [1, 256]")
+    if args.skip_weighted and args.top_k != 1:
+        parser.error("--skip-weighted requires --top-k 1")
 
     if args.backend in ("auto", "x86_amx_bf16"):
         if args.amx_pattern == "auto":
@@ -104,6 +108,7 @@ def main() -> None:
         backend=args.backend,
     )
     pack_ms = (time.perf_counter_ns() - pack_start) / 1e6
+    output = torch.empty_like(inputs) if args.reuse_out else None
 
     def custom() -> torch.Tensor:
         return fused_moe_bf16_tiled(
@@ -112,10 +117,19 @@ def main() -> None:
             topk_weights,
             topk_ids,
             num_threads=args.threads,
+            skip_weighted=args.skip_weighted,
+            out=output,
         )
 
     def torch_onednn() -> torch.Tensor:
-        return fused_moe_naive(inputs, w13, w2, topk_weights, topk_ids)
+        return fused_moe_naive(
+            inputs,
+            w13,
+            w2,
+            topk_weights,
+            topk_ids,
+            skip_weighted=args.skip_weighted,
+        )
 
     custom_output = custom()
     torch.set_num_threads(args.threads)
@@ -157,6 +171,8 @@ def main() -> None:
                 "custom_impl": os.environ.get("FUSED_CPP_MOE_AVX512_IMPL", "auto"),
                 "onednn_max_cpu_isa": os.environ.get("ONEDNN_MAX_CPU_ISA"),
                 "omp_wait_policy": os.environ.get("OMP_WAIT_POLICY"),
+                "reuse_out": args.reuse_out,
+                "skip_weighted": args.skip_weighted,
                 "torch_mkldnn_available": torch.backends.mkldnn.is_available(),
                 "torch_mkldnn_enabled": torch.backends.mkldnn.enabled,
                 "prepack_ms": pack_ms,

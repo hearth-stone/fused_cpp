@@ -387,6 +387,26 @@ wide-stride `TILESTORED` 的 raw store path 比 scratch→ZMM store 更慢。当
 
 ---
 
+### x86 MoE P1 workspace lifecycle 迭代记录
+
+> 完整命令、逐线程 median/best/p90 和小 shape 对照见
+> `optimizations/fused_moe_avx512/results/amazon_c8i_8core_p1_workspace_20260726.md`。
+
+| variant | 实现 | 数值 | Amazon C8i 结果 | 结论 |
+|---|---|---|---|---|
+| `weighted_workspace` | W2 写 flat-route FP32，随后 weighted merge 为 BF16 | 参考 | M2048 AMX hot 1T/8T 29.44/9.56 ms | 小 shape 与 top-k>1 保留 |
+| `weighted_direct` | top-k=1 在 ZMM 中乘 route weight，直接转换并写 BF16；AMX 先把 TMM 写入 pattern scratch | 与 workspace BF16 bit-exact | M2048 AMX hot 1T/8T 18.36/2.76 ms；E8 balanced 23.43/3.39 ms；AVX-512 234.76/30.90 ms | **workspace≥256 KiB 时默认 auto** |
+| `transient_input` | 每次调用创建并初始化 gathered-input vector | 参考 | M2048/E2 AMX 1T/8T 21.13/4.02 ms | 小 AMX 与 AVX-512 auto 保留 |
+| `persistent_input` | concurrency-safe grow-only BF16 pool；完整覆盖 H，只清 K32 tail | 与 transient BF16 bit-exact | M2048/E2 AMX 1T/8T 20.14/3.16 ms；AVX-512 227.99/28.94 ms | **AMX aggregate≥256 KiB 时默认 auto** |
+
+结论：这批 P1 优化没有改变 GEMM、pack layout 或路由规约顺序，而是去掉矩阵
+指令周围的重复 allocation、初始化和 route workspace 流量。两个新路径都有独立
+环境变量和 JIT cache key，top-k>1、精确权重一的 `skip_weighted` 路径以及小
+working set 都保持原语义。AMX JIT 的 stack scratch 仍按实际 pattern 选择
+0/2/4 KiB，不为未选中的 epilogue 预留第二块 buffer。
+
+---
+
 ## 选型矩阵
 
 | 场景 | 推荐版本 | 备注 |
@@ -409,6 +429,7 @@ wide-stride `TILESTORED` 的 raw store path 比 scratch→ZMM store 更慢。当
 
 | 日期 | 改动概述 | 受影响文件 |
 |---|---|---|
+| 2026-07-26 | **x86 MoE 完成 P1 weighted top-1 direct output 与 scratch 生命周期**：AVX-512 intrinsic/JIT 及 AMX `m1n2/m2n2/m1n4` 在 ZMM 中应用 top-1 route weight 并直接写 BF16，省掉 FP32 route workspace/merge；AMX `tile_store` 请求在 weighted-direct 下安全回退到 `combined`。新增 concurrency-safe grow-only gathered-input pool，AMX aggregate scratch≥256 KiB 自动启用，AVX-512 auto 保持 transient；与已有 direct-input bypass、persistent intermediate 和 pattern-specific 0/2/4 KiB JIT scratch 共同完成 P1。路径间 BF16 bit-exact；C8i8 H4096/F512/M2048 AMX hot weighted 1T/8T 29.44→18.36/9.56→2.76 ms，persistent input E2 21.13→20.14/4.02→3.16 ms。 | 改 `csrc/moe/x86/avx512_bf16/{executor.cpp,jit_kernels.cpp,kernels.cpp,kernels.h}`、`tests/test_moe_avx512_bf16.py`；新建 `benchmarks/bench_x86_bf16_{weighted_top1,input_scratch}.py`；改 `optimizations/fused_moe_avx512/{README.md,TODO.md,manifest.yaml}`、新增 `results/amazon_c8i_8core_p1_workspace_20260726.md`、改 `csrc/SDPA_VERSIONS.md` |
 | 2026-07-22 | **x86 MoE 参考 SVE 引入多线程切 N 与 skew-aware wave 调度**：AVX-512/AMX executor 从只支持 1/2T 扩展为 1--256 requested workers；active expert 不足时建立 route-weighted teams，并行 gather 后经 barrier 分别切分 W13 F16 与 W2 N32 blocks；最大 route 至少 64 且为次大 2x 时按 route 降序组成 waves，均衡且 active expert 足够时保留 atomic expert queue。barrier 支持异常取消，scratch 按 wave slot 最大 route 复用，merge threads capped by token count。C8i8 H4096/F512/M2048：AMX hot 26.45→5.76 ms（1T→8T，4.60x），`[1536,256,256]` 39.22→11.89 ms（3.30x）；完整 x86 suite 163 passed。 | 改 `csrc/moe/x86/avx512_bf16/executor.cpp`、`src/fused_cpp/moe/bf16_tiled.py`、`tests/{test_moe_avx512_bf16.py,bench_moe_avx512_bf16.py}`、`optimizations/fused_moe_avx512/{README.md,TODO.md,manifest.yaml,results/amazon_c8i_8core_nsplit_20260722.md}`、`cpu_moe_schedule_optimization/MATHEMATICAL_MODEL.md`、`csrc/SDPA_VERSIONS.md` |
 | 2026-07-20 | **x86 AMX MoE W2 store/merge epilogue 实验与负结果保留**：新增 cache-key 隔离的 `baseline/combined/tile_store`。`combined` 在 M1N4/N64 只生成一次 row route address；`tile_store` 让 TMM 直接写 expert-contiguous FP32 workspace，并由预建 route-row map 做 AVX-512 weighted merge。三条路径跨 pattern/tail/单双线程 bit-exact，top-k=1 direct BF16 保持 vector conversion。C8i K512 rotated W2-only `tile_store` 为 +1.0%~+14.5%，但 K32 store-dominated latency +12.8%~+22.8%，end-to-end 为 -4.5%~+1.7%，所以 auto 仍为 baseline；完整 x86 suite 122 passed/4 skipped。 | 改 `csrc/moe/x86/avx512_bf16/{jit_kernels.cpp,kernels.cpp,kernels.h,executor.cpp}`、`tests/test_moe_avx512_bf16.py`、`benchmarks/bench_amx_bf16_{patterns.py,w2_epilogues.cpp,merge.cpp}`、`optimizations/fused_moe_avx512/{README.md,TODO.md,manifest.yaml,results/amazon_c8i_2core_amx_w2_epilogue_20260720.md}`、`csrc/SDPA_VERSIONS.md` |
 | 2026-07-20 | **x86 AMX MoE W13 SiLU epilogue 优化与负结果保留**：新增 `baseline/resident/pipelined/rcp14` 四种 cache-key 隔离的 Xbyak 路径。`resident` 把多项式/exp 常量一次广播后驻留 ZMM，保持逐行算术顺序和 BF16 bit-exact，M16/degree5 JIT 3972→2836 B，K256 standalone +8.4%，设为 auto；两行 stage pipeline 未稳定胜过 resident，`VRCP14PS` 非 bit-exact 且端到端收益处于噪声范围，均仅保留实验开关。C8i 完整 x86 suite 114 passed/4 skipped。 | 改 `csrc/moe/x86/avx512_bf16/jit_kernels.cpp`、`tests/test_moe_avx512_bf16.py`、`benchmarks/bench_amx_bf16_w13.cpp`、`benchmarks/bench_amx_bf16_patterns.py`、`optimizations/fused_moe_avx512/{README.md,TODO.md,manifest.yaml,results/amazon_c8i_2core_amx_silu_20260720.md}`、`csrc/SDPA_VERSIONS.md` |

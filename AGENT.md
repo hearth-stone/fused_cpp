@@ -8,9 +8,12 @@ optimization governance live in on-demand docs listed below.
 Remote development and benchmark runs primarily use the `Arm-codex` SSH alias.
 When the user says `aws机器`, use the `AmazonECS8Cores` SSH alias.
 
-If a requested remote instance cannot be reached, stop the task immediately
-and report the connection failure. Do not switch to another machine, continue
-with local implementation or analysis, or perform unrelated fallback work.
+If a requested remote instance cannot be reached, retry the same requested
+instance until there have been three consecutive failed connection attempts.
+Any successful connection resets the consecutive-failure count. After the third
+consecutive failure, stop the task and report the failures. Do not switch to
+another machine, continue with local implementation or analysis, or perform
+unrelated fallback work while retrying or after stopping.
 
 ### Arm-codex
 

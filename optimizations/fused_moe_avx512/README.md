@@ -197,9 +197,9 @@ processes to compare generated and fallback kernels without routing or W2.
 ## AMX backend and automatic policy
 
 The prioritized AMX optimization backlog, acceptance checks, and rejected or
-deferred design space are tracked in [`TODO.md`](TODO.md). The current active
-item is scratch/workspace lifecycle cleanup after the completed W13 and W2
-epilogue experiments.
+deferred design space are tracked in [`TODO.md`](TODO.md). The P1 epilogue and
+workspace-lifecycle items are complete; the remaining work starts with the P2
+AMX B-side layout and K-load pipeline experiments.
 
 `auto` selects the reserved backend ID 102 (`x86_amx_bf16`) before backend ID
 101 (`x86_avx512_bf16`) when AMX is available. AMX requires Linux, Xbyak,
@@ -211,9 +211,52 @@ requests `ARCH_REQ_XCOMP_PERM` before its first generated AMX call.
 
 AMX reuses the existing K-pair/N32 packed-weight format, but its backend rounds
 K to 32. Gathered input and the W13 intermediate are row-major M16 panels.
+For top-k=1 with exactly one active expert, the route list is the original
+token order. When H is already K32-aligned, the executor now passes the
+contiguous input directly to W13 and omits both the M-by-H gather copy and its
+input scratch allocation. Other routing and H-tail cases retain the gathered
+path.
 The intermediate row stride is W2's K32-padded size, which can be wider than
 W13's F16-padded output (for example F=35 uses a 64-element stride); the extra
 columns remain zero so W2 never reads across row boundaries.
+
+The executor also leases grow-only BF16 intermediate buffers from a
+concurrency-safe process pool instead of allocating and value-initializing the
+complete W13-to-W2 matrix on every call. Automatic mode uses the pool for AMX
+when the aggregate intermediate is at least 256 KiB; smaller AMX calls and
+AVX-512 retain transient storage because their measured benefit was neutral.
+Only the per-row F16-to-K32 padding gap is cleared before reuse.
+`FUSED_CPP_MOE_X86_PERSISTENT_INTERMEDIATE=1` or `0` forces either path for
+validation. On the 8-core C8i, rotated H=4096/F=512/M=2048 comparisons improved
+median latency by 1.0%-4.9% across 1/2/4/8 threads. Methodology and the small-M
+and AVX-512 controls are recorded in
+[`results/amazon_c8i_8core_persistent_intermediate_20260726.md`](results/amazon_c8i_8core_persistent_intermediate_20260726.md).
+
+Gathered input uses the same concurrency-safe, grow-only BF16 pool. Automatic
+mode enables it only for AMX when the aggregate gathered-input storage is at
+least 256 KiB; aligned single-active-expert calls still bypass the gather
+entirely, and AVX-512 remains transient by default.
+`FUSED_CPP_MOE_X86_PERSISTENT_INPUT=1` or `0` forces the pool or transient
+allocation. AMX overwrites every logical H element and clears only the K32 row
+tail before W13 can observe it. In a balanced E2 H=4096/F=512/M=2048 sweep,
+persistent input was 1.049x/1.101x/1.128x/1.274x as fast at 1/2/4/8 threads.
+The forced AVX-512 control was only 1.001x/1.037x at 1/8 threads, which is why
+its automatic policy stays transient.
+
+Weighted top-k=1 now has a separate direct-output epilogue for both AVX-512
+and AMX. It multiplies each FP32 W2 row by its route weight in ZMM, converts
+once to BF16, and writes caller output without allocating the FP32 route
+workspace or running the merge. The existing exact-one `skip_weighted=True`
+path is unchanged, and top-k>1 still uses the established workspace/merge
+path. Automatic mode uses weighted-direct only when the removed workspace is
+at least 256 KiB; `FUSED_CPP_MOE_X86_WEIGHTED_TOP1_DIRECT=1` or `0` forces
+either cache-key-isolated path. For H=4096/F=512/M=2048, hot E1 AMX improved
+from 29.44 to 18.36 ms at 1 thread and from 9.56 to 2.76 ms at 8 threads;
+balanced E8 improved from 37.57 to 23.43 ms and from 7.32 to 3.39 ms.
+AVX-512 improved from 246.68 to 234.76 ms and from 37.13 to 30.90 ms.
+Correctness, full commands, best/p90 values, and small-shape controls are in
+[`results/amazon_c8i_8core_p1_workspace_20260726.md`](results/amazon_c8i_8core_p1_workspace_20260726.md).
+
 The cache specializes exact M=1 through 16, operation, W13 polynomial degree,
 W2 N tail, and output type; K remains a dynamic K32 loop. Larger M values are
 M16 panels plus an exact tail.
@@ -255,7 +298,9 @@ negative/approximate alternatives are recorded in
   precomputed route-row map in the AVX-512 weighted merge.
 
 The modes are separate JIT cache keys and are BF16 bit-exact. `tile_store`
-falls back to the converting vector epilogue for top-k=1 direct BF16 output.
+falls back to the converting vector epilogue for exact-one top-k=1 direct BF16
+output. Weighted-direct uses the `combined` scratch-to-ZMM epilogue when
+`tile_store` is requested, because its route scale must be applied in ZMM.
 On C8i, K=512 isolated W2 improved by 1.0-14.5%, but a K=32
 store-dominated sweep showed that direct wide-stride `TILESTORED` was
 12.8-22.8% slower; `combined` instead improved effective output bandwidth by
@@ -279,8 +324,12 @@ tile configuration:
 The two lifetimes use separate JIT cache keys. `macro_m` preserves the current
 N-window loop order: packed B and the N-block count reset at each M unit, while
 the gathered-A, W13-intermediate, route-id, or expert-contiguous-output pointer
-advances by the pattern's 16- or 32-row M unit. It is experimental until the
-C8i shape/thread sweep justifies changing `auto`.
+advances by the pattern's 16- or 32-row M unit. It remains an explicit
+experimental override after validation: on C8i H4096/F512/M2048 it was
+0.954x/0.985x/1.005x/0.997x as fast as `per_call` at 1/2/4/8 threads. The 1T
+regression reproduced with reversed candidate order, while 8T was tied and
+changed sign within 0.4%. Consequently `auto` remains `per_call`. See
+[`results/amazon_c8i_8core_amx_macro_m_tile_state_20260726.md`](results/amazon_c8i_8core_amx_macro_m_tile_state_20260726.md).
 
 The default policy resolves a tile-register schedule independently for each
 expert's routed row count:
@@ -340,6 +389,13 @@ p90, p99, mean, standard deviation, and best latency.
 `benchmarks/bench_amx_bf16_w2_epilogues.cpp` rotates the three store kernels
 without W13/routing, while `benchmarks/bench_amx_bf16_merge.cpp` separately
 compares flat-route and mapped expert-contiguous weighted merge.
+`benchmarks/bench_x86_bf16_weighted_top1.py` rotates the FP32
+workspace/merge and weighted-direct BF16 paths with non-unit sigmoid route
+weights. `benchmarks/bench_x86_bf16_input_scratch.py` rotates transient and
+persistent gathered-input storage while forcing E>=2 so the aligned-input
+bypass cannot hide the measured work. Both scripts reuse output and packed
+weights, alternate execution order, assert exact A/B output, and report
+median, p90, best, and speedup.
 
 ## Automatic N-window cache blocking
 
@@ -395,3 +451,7 @@ variables remain useful for reproducing the old unblocked AMX schedule
 (`0`/`0`) and forced-policy experiments. Full methodology, dimension scaling,
 routing results, and thermal caveats are in
 [`results/amazon_c8i_2core_cache_blocking_20260719.md`](results/amazon_c8i_2core_cache_blocking_20260719.md).
+
+The aligned single-active-expert input bypass and its pinned one-core
+KTransformers comparison are recorded in
+[`results/amazon_c8i_8core_single_expert_1t_20260726.md`](results/amazon_c8i_8core_single_expert_1t_20260726.md).
