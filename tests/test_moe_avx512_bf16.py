@@ -824,6 +824,57 @@ def test_amx_n32_b_load_hints_match_tileloadd_with_cache_isolation(
 
 @requires_amx
 @pytest.mark.parametrize(
+    ("hidden", "intermediate"),
+    [
+        pytest.param(31, 31, id="single-k-block"),
+        pytest.param(33, 65, id="w13-even-w2-odd"),
+        pytest.param(65, 97, id="w13-odd-w2-even"),
+    ],
+)
+@pytest.mark.parametrize("num_threads", [1, 2], ids=["single-core", "dual-core"])
+def test_amx_m1n2_k_load_pipeline_matches_baseline_with_cache_isolation(
+    monkeypatch: pytest.MonkeyPatch,
+    hidden: int,
+    intermediate: int,
+    num_threads: int,
+) -> None:
+    """The m1n2 ping-pong K schedule must preserve K tails, N tails, and exact accumulation order."""
+    monkeypatch.setenv("FUSED_CPP_MOE_AMX_PATTERN", "m1n2")
+    inputs, w13, w2, topk_weights, topk_ids = _case(
+        tokens=17,
+        hidden=hidden,
+        intermediate=intermediate,
+        experts=1,
+        top_k=1,
+        seed=1100 + hidden + intermediate,
+    )
+    packed = prepare_fused_moe_bf16_tiled_weights(
+        w13,
+        w2,
+        fuse_silu=True,
+        backend="x86_amx_bf16",
+    )
+    expected = fused_moe_naive(inputs, w13, w2, topk_weights, topk_ids)
+
+    outputs = []
+    for pipeline in ("baseline", "pipelined", "baseline"):
+        monkeypatch.setenv("FUSED_CPP_MOE_AMX_K_LOAD_PIPELINE", pipeline)
+        output = fused_moe_bf16_tiled(
+            inputs,
+            packed,
+            topk_weights,
+            topk_ids,
+            num_threads=num_threads,
+        )
+        _assert_bf16_close(output, expected)
+        outputs.append(output)
+
+    torch.testing.assert_close(outputs[1].float(), outputs[0].float(), atol=0, rtol=0)
+    torch.testing.assert_close(outputs[2].float(), outputs[0].float(), atol=0, rtol=0)
+
+
+@requires_amx
+@pytest.mark.parametrize(
     ("pattern", "routes"),
     [
         pytest.param("m1n2", 37, id="m1n2-full-panels-and-tail"),
@@ -1046,6 +1097,27 @@ def test_amx_rejects_unknown_b_load_hint(monkeypatch: pytest.MonkeyPatch) -> Non
         RuntimeError,
         match="must be auto, tileloadd, tileloaddt1, prefetch_t0, or prefetch_t1",
     ):
+        fused_moe_bf16_tiled(inputs, packed, topk_weights, topk_ids, num_threads=1)
+
+
+@requires_amx
+def test_amx_rejects_unknown_k_load_pipeline(monkeypatch: pytest.MonkeyPatch) -> None:
+    inputs, w13, w2, topk_weights, topk_ids = _case(
+        tokens=1,
+        hidden=32,
+        intermediate=16,
+        experts=1,
+        top_k=1,
+    )
+    packed = prepare_fused_moe_bf16_tiled_weights(
+        w13,
+        w2,
+        fuse_silu=True,
+        backend="x86_amx_bf16",
+    )
+    monkeypatch.setenv("FUSED_CPP_MOE_AMX_K_LOAD_PIPELINE", "unknown")
+
+    with pytest.raises(RuntimeError, match="must be auto, baseline, or pipelined"):
         fused_moe_bf16_tiled(inputs, packed, topk_weights, topk_ids, num_threads=1)
 
 

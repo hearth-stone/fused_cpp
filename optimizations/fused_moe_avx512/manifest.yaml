@@ -52,6 +52,34 @@ features:
       --routes 64,128,512,2048 --patterns m1n2,m2n2,m1n4
       --threads 8 --warmup 7 --runs 31
 
+  - id: schedule.amx_m1n2_k_load_pipeline
+    part: schedule
+    status: experimental
+    implementation: csrc/moe/x86/avx512_bf16/jit_kernels.cpp
+    hypothesis: >-
+      Preloading one m1n2 A/B operand bank and then alternating TILELOAD of
+      the other bank before TDPBF16PS on the current bank exposes independent
+      load and matrix-compute work to the out-of-order core while preserving
+      the exact K accumulation order. The experiment applies only to m1n2;
+      m2n2 and m1n4 already consume all eight TMM registers without a second
+      complete operand bank.
+    depends_on:
+      - layout.amx_k32_row_major_a
+      - compute.xbyak_amx_m16n32
+    conflicts_with: []
+    correctness: >-
+      FUSED_CPP_MOE_AMX_PATTERN=m1n2
+      FUSED_CPP_MOE_AMX_K_LOAD_PIPELINE=pipelined
+      PYTHONPATH=src .venv/bin/python -m pytest -q
+      tests/test_moe_avx512_bf16.py -k k_load_pipeline
+    benchmark: >-
+      taskset -c 0 env PYTHONPATH=src .venv/bin/python
+      benchmarks/bench_amx_bf16_patterns.py
+      --tokens 512 --hidden 4096 --intermediate 512
+      --experts 1 --top-k 1 --routing hot --threads 1
+      --patterns m1n2 --k-load-pipelines baseline,pipelined
+      --warmup 10 --runs 41
+
   - id: schedule.amx_n32_b_load_hint
     part: schedule
     status: enabled
@@ -798,6 +826,29 @@ variants:
       prepare_fused_moe_bf16_tiled_weights(fuse_silu=True,
       backend="x86_amx_bf16_n64") followed by fused_moe_bf16_tiled; this
       explicit experiment is never selected by auto
+    status: experimental
+
+  - id: amx_bf16_fused_expert_m1n2_k_load_pipeline
+    features:
+      - layout.vnni2_packed_weights
+      - layout.amx_k32_row_major_a
+      - layout.amx_direct_aligned_input
+      - compute.xbyak_amx_m16n32
+      - schedule.n_window_cache_blocking
+      - schedule.amx_m1n2_k_load_pipeline
+      - schedule.amx_n32_b_load_hint
+      - epilogue.amx_tilestore_silu
+      - epilogue.amx_resident_silu_constants
+      - intermediate.persistent_scratch
+      - input.persistent_scratch
+      - store.direct_route
+      - epilogue.weighted_top1_direct
+      - merge.avx512_weighted_reduce
+      - dispatch.expert_team_nsplit_waves
+    entrypoint: >-
+      FUSED_CPP_MOE_AMX_PATTERN=m1n2 and
+      FUSED_CPP_MOE_AMX_K_LOAD_PIPELINE=pipelined followed by the
+      x86_amx_bf16 fused_moe_bf16_tiled entrypoint
     status: experimental
 
   - id: amx_bf16_fused_expert_silu_baseline

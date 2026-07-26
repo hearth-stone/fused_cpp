@@ -128,10 +128,18 @@ results on `AmazonC8i2Cores` for isolated microkernel changes.
   routes and `TILELOADDT1` at or above 128; explicit modes remain validation
   overrides. See
   [`results/amazon_c8i_8core_amx_b_load_hints_20260726.md`](results/amazon_c8i_8core_amx_b_load_hints_20260726.md).
-- [ ] **True K-load software pipeline:** schedule the next A/B tile loads far
-  enough ahead of `TDPBF16PS` to cover load latency; verify with counters that
-  it improves load/compute overlap rather than only increasing instruction
-  count.
+- [x] **True K-load software pipeline:** the explicit m1n2-only
+  `FUSED_CPP_MOE_AMX_K_LOAD_PIPELINE=pipelined` path ping-pongs two complete
+  A/B operand banks, issuing the alternate bank's tile loads before consuming
+  the current bank. **2026-07-26:** C8i8 H4096/F512 five-process repeats gave
+  +0.75%/+0.66%/+0.77% median paired speedup at M64/512/2048. M2048 counters
+  showed cycles -1.01%, L1D pending-miss cycles -0.90%, and top-down
+  memory-bound slots -1.92% despite instructions +0.48%, confirming real
+  load/compute overlap. The gain is limited to `m1n2`; automatic `m2n2`/`m1n4`
+  remained 14%-17% faster end to end on the representative shapes, and exact
+  H4096/F512 has no m1n2 N tail. Therefore `auto` remains `baseline` and the
+  pipelined path remains an explicit experiment. See
+  [`results/amazon_c8i_8core_amx_k_load_pipeline_20260726.md`](results/amazon_c8i_8core_amx_k_load_pipeline_20260726.md).
 - [ ] **Dimension-aware policy calibration:** make ISA, AMX pattern,
   cache-window, and thread decisions depend on M/H/F, route skew, and CPU
   model. Include a rotated AVX-512-versus-AMX tiny-M comparison before assuming

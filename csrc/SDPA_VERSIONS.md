@@ -407,6 +407,24 @@ working set 都保持原语义。AMX JIT 的 stack scratch 仍按实际 pattern 
 
 ---
 
+### x86 AMX MoE m1n2 True K-load pipeline 迭代记录
+
+> 完整命令、逐 shape timing、跨进程重复和 PMU 数据见
+> `optimizations/fused_moe_avx512/results/amazon_c8i_8core_amx_k_load_pipeline_20260726.md`。
+
+| variant | 实现 | 数值 | Amazon C8i 结果 | 结论 |
+|---|---|---|---|---|
+| `baseline` | 每个 K32 bank 执行 A/B `TILELOAD*` 后立即发射对应 `TDPBF16PS` | 参考 | forced-m1n2 M2048 约 19.77 ms | **默认 auto** |
+| `pipelined` | 预载 bank0，随后交替在当前 bank 计算前先加载另一个完整 A/B bank | 与 baseline BF16 bit-exact | 五进程 M64/512/2048 paired median +0.75%/+0.66%/+0.77%；M2048 cycles -1.01%、pending-miss cycles -0.90%、memory-bound slots -1.92% | 保留显式实验，不默认 |
+
+结论：两个 A/B operand bank 确实给 `m1n2` 创造了小幅 load/compute overlap，
+并非单纯增加指令；但 `m2n2`/`m1n4` 的四个累加 tile 已占满第二组 operand bank
+所需寄存器。代表形状的自动 pattern 比流水化 m1n2 仍快 14%--17%，且
+H4096/F512 没有 m1n2 N tail，所以不应为约 0.7% 的 forced-kernel 收益改变默认
+pattern 或 K-load policy。
+
+---
+
 ## 选型矩阵
 
 | 场景 | 推荐版本 | 备注 |
@@ -429,6 +447,7 @@ working set 都保持原语义。AMX JIT 的 stack scratch 仍按实际 pattern 
 
 | 日期 | 改动概述 | 受影响文件 |
 |---|---|---|
+| 2026-07-26 | **x86 AMX MoE 完成 m1n2 True K-load software pipeline 实验**：W13/W2 新增 cache-key 隔离的 `baseline/pipelined` K32 loop；流水版用 `(TMM2,TMM4,TMM5)` 与 `(TMM3,TMM6,TMM7)` 两组 A/B operand bank，在当前 bank 的 `TDPBF16PS` 前加载下一 bank，并保持原 K 累加顺序与奇偶 tail。C8i8 H4096/F512 五进程重复在 forced-m1n2 M64/512/2048 得到 +0.75%/+0.66%/+0.77% paired median；M2048 PMU 显示 cycles -1.01%、L1D pending-miss cycles -0.90%、memory-bound slots -1.92%，instructions +0.48%。自动 `m2n2/m1n4` 仍快 14%--17%，因此 auto 保持 baseline，流水版仅作显式实验；完整 x86 test file 219 passed。 | 改 `csrc/moe/x86/avx512_bf16/jit_kernels.cpp`、`tests/test_moe_avx512_bf16.py`、`benchmarks/{bench_amx_bf16_patterns.py,README.md}`、`optimizations/fused_moe_avx512/{README.md,TODO.md,manifest.yaml}`、新增 `results/amazon_c8i_8core_amx_k_load_pipeline_20260726.md`、改 `csrc/SDPA_VERSIONS.md` |
 | 2026-07-26 | **x86 AMX MoE 完成 N32 B-side load-hint 优化**：W13/W2 的 A tile 保持 `TILELOADD`，B tile 新增 cache-key 隔离的 `TILELOADD/TILELOADDT1/PREFETCHT0/PREFETCHT1` 路径；在已否决 N64 生产布局后只对 N32 校准自动策略。C8i8 H4096/F512 的 M128-2048 在 1/2/4/8T 上由 `TILELOADDT1` 提升 5.3%~9.7%，M512 counters 显示 L1D pending-miss cycles -5.3%、L1D replacement -80.1%、memory-bound slots -7.9%，且指令数不变；完整 next-panel 软件预取增加 13.7% 指令并使 M512 退化 14.7%~22.9%。因此 auto 以每专家 M=128 为 crossover，小 M 保留 `TILELOADD`，中大 M 使用 `TILELOADDT1`；完整 x86 suite 215 passed/4 skipped。 | 改 `csrc/moe/x86/avx512_bf16/jit_kernels.cpp`、`tests/test_moe_avx512_bf16.py`、`benchmarks/{bench_amx_bf16_patterns.py,README.md}`、`optimizations/fused_moe_avx512/{README.md,TODO.md,manifest.yaml}`、新增 `results/amazon_c8i_8core_amx_b_load_hints_20260726.md`、改 `csrc/SDPA_VERSIONS.md` |
 | 2026-07-26 | **x86 AMX MoE 完成 N64/K32 packed-B 负向实验**：新增显式 backend ID 103 `x86_amx_bf16_n64`，把相邻 N32 block 组成 N64 superblock，并按 K32 存放连续的左右 2 KiB tile；`m1n2/m2n2/m1n4` JIT cache key、奇数 N32 起点、H/F/N tail 与 1/4-thread N-split 均单独覆盖，`auto` 仍固定选择 ID 102 N32。C8i8 H4096/F512 单线程自动 pattern 变化仅 -0.3%~+0.9%，8 线程 M64-2048 反而慢 3.4%~9.3%，因此不维护生产 N64 权重副本，只保留显式实验入口。 | 改 `csrc/moe/{common,x86/avx512_bf16}`、`src/fused_cpp/moe/bf16_tiled.py`、`tests/test_moe_{avx512_bf16,backend_dispatch}.py`；新建 `benchmarks/bench_amx_bf16_layouts.py`；改 `benchmarks/README.md`、`optimizations/fused_moe_avx512/{README.md,TODO.md,manifest.yaml}`、新增 `results/amazon_c8i_8core_amx_n64_layout_20260726.md`、改 `csrc/SDPA_VERSIONS.md` |
 | 2026-07-26 | **x86 MoE 完成 P1 weighted top-1 direct output 与 scratch 生命周期**：AVX-512 intrinsic/JIT 及 AMX `m1n2/m2n2/m1n4` 在 ZMM 中应用 top-1 route weight 并直接写 BF16，省掉 FP32 route workspace/merge；AMX `tile_store` 请求在 weighted-direct 下安全回退到 `combined`。新增 concurrency-safe grow-only gathered-input pool，AMX aggregate scratch≥256 KiB 自动启用，AVX-512 auto 保持 transient；与已有 direct-input bypass、persistent intermediate 和 pattern-specific 0/2/4 KiB JIT scratch 共同完成 P1。路径间 BF16 bit-exact；C8i8 H4096/F512/M2048 AMX hot weighted 1T/8T 29.44→18.36/9.56→2.76 ms，persistent input E2 21.13→20.14/4.02→3.16 ms。 | 改 `csrc/moe/x86/avx512_bf16/{executor.cpp,jit_kernels.cpp,kernels.cpp,kernels.h}`、`tests/test_moe_avx512_bf16.py`；新建 `benchmarks/bench_x86_bf16_{weighted_top1,input_scratch}.py`；改 `optimizations/fused_moe_avx512/{README.md,TODO.md,manifest.yaml}`、新增 `results/amazon_c8i_8core_p1_workspace_20260726.md`、改 `csrc/SDPA_VERSIONS.md` |

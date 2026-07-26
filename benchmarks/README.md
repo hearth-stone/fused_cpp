@@ -45,6 +45,26 @@ Use one explicit `--b-load-hints` value and enough measured iterations under
 counter command are recorded in
 `optimizations/fused_moe_avx512/results/amazon_c8i_8core_amx_b_load_hints_20260726.md`.
 
+## x86 AMX m1n2 K-load pipeline A/B
+
+The same pattern benchmark rotates cache-key-isolated baseline and ping-pong
+K-loop schedules. Force `m1n2`: the other AMX patterns do not have a second
+complete operand register bank.
+
+```bash
+taskset -c 0 env PYTHONPATH=src \
+  .venv/bin/python benchmarks/bench_amx_bf16_patterns.py \
+  --tokens 512 --hidden 4096 --intermediate 512 \
+  --experts 1 --top-k 1 --routing hot --threads 1 \
+  --patterns m1n2 --k-load-pipelines baseline,pipelined \
+  --warmup 10 --runs 41
+```
+
+Compare against a separate `--patterns auto --k-load-pipelines baseline` run
+before treating an m1n2-only speedup as an end-to-end policy improvement.
+The C8i8 result, repeated-process methodology, and PMU command are recorded in
+`optimizations/fused_moe_avx512/results/amazon_c8i_8core_amx_k_load_pipeline_20260726.md`.
+
 | 入口 | 何时用 |
 |---|---|
 | `bench_microkernel_l1.py` | 日常 sweep，复用已编译好的 `_C` 扩展，输出友好 |

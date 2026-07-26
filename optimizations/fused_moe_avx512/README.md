@@ -198,8 +198,9 @@ processes to compare generated and fallback kernels without routing or W2.
 
 The prioritized AMX optimization backlog, acceptance checks, and rejected or
 deferred design space are tracked in [`TODO.md`](TODO.md). The P1 epilogue and
-workspace-lifecycle items plus the N32 B-side load-hint policy are complete;
-the remaining P2 work starts with the true K-load pipeline.
+workspace-lifecycle items, N32 B-side load-hint policy, and m1n2 true K-load
+pipeline experiment are complete; the remaining P2 work is dimension-aware
+policy calibration.
 
 `auto` selects the reserved backend ID 102 (`x86_amx_bf16`) before backend ID
 101 (`x86_avx512_bf16`) when AMX is available. AMX requires Linux, Xbyak,
@@ -253,6 +254,27 @@ Explicit non-default hints require N32. Full timing, counters, commands, and
 the automatic crossover are recorded in
 [`results/amazon_c8i_8core_amx_b_load_hints_20260726.md`](results/amazon_c8i_8core_amx_b_load_hints_20260726.md).
 
+`FUSED_CPP_MOE_AMX_K_LOAD_PIPELINE` selects an m1n2-only K-loop scheduling
+experiment:
+
+- unset, empty, `auto`, or `baseline` preserves the established load-then-dot
+  order;
+- `pipelined` preloads one A/B operand bank, loads the alternate bank before
+  consuming the current bank, and ping-pongs the two banks across K32 blocks.
+
+Both variants keep the same sequence of `TDPBF16PS` updates, including odd
+K-block tails, and occupy separate JIT cache keys. The experiment is limited to
+`m1n2`, where two accumulators leave room for two complete A/B operand banks.
+`m2n2` and `m1n4` use four accumulators and have no equivalent spare TMM bank.
+On C8i8, five-process H4096/F512 repeats improved forced-m1n2 latency by about
+0.7% at M64/512/2048. M2048 counters showed cycles -1.01%, L1D pending-miss
+cycles -0.90%, and memory-bound slots -1.92%, despite instructions +0.48%.
+This verifies genuine overlap, but the automatic `m2n2`/`m1n4` patterns were
+still 14%-17% faster end to end and the representative exact shape had no
+m1n2 N tail. Automatic mode therefore remains `baseline`; `pipelined` is an
+explicit microkernel experiment. Full timing, counters, and commands are in
+[`results/amazon_c8i_8core_amx_k_load_pipeline_20260726.md`](results/amazon_c8i_8core_amx_k_load_pipeline_20260726.md).
+
 The executor also leases grow-only BF16 intermediate buffers from a
 concurrency-safe process pool instead of allocating and value-initializing the
 complete W13-to-W2 matrix on every call. Automatic mode uses the pool for AMX
@@ -294,8 +316,11 @@ The cache specializes exact M=1 through 16, operation, W13 polynomial degree,
 W2 N tail, output type, packed-B layout, and AMX B-load hint; K remains a
 dynamic K32 loop. Larger M values are M16 panels plus an exact tail.
 
-W13 uses two FP32 accumulator tiles for gate and up, with double-buffered A/B
-occupying all eight TMM registers. Since ZMM cannot read TMM state directly,
+W13 m1n2 uses two FP32 accumulator tiles for gate and up, with two A/B operand
+banks occupying all eight TMM registers. The baseline consumes each bank
+immediately after loading it; the explicit K-load pipeline instead ping-pongs
+the banks so the alternate load precedes the current dot product. Since ZMM
+cannot read TMM state directly,
 both accumulators are `TILESTORED` to a 2 KiB stack scratch before the existing
 ZMM polynomial SiLU-times-up epilogue writes row-major BF16. W2 uses one or two
 accumulator tiles according to N. Its default route-aware path stores through a
