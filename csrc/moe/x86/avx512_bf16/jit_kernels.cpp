@@ -28,6 +28,7 @@ namespace fused_cpp::moe::x86::avx512_bf16 {
 namespace {
 
 enum class ImplementationMode { kAuto, kJit, kIntrinsic };
+enum class SmallMMultiNMode { kAuto, kBaseline, kW13, kW2, kMultiN };
 
 ImplementationMode GetImplementationMode() {
   const char* raw = std::getenv("FUSED_CPP_MOE_AVX512_IMPL");
@@ -42,6 +43,28 @@ ImplementationMode GetImplementationMode() {
     return ImplementationMode::kIntrinsic;
   }
   throw std::runtime_error("FUSED_CPP_MOE_AVX512_IMPL must be auto, jit, or intrinsic; got '" + value + "'");
+}
+
+SmallMMultiNMode GetSmallMMultiNMode() {
+  const char* raw = std::getenv("FUSED_CPP_MOE_AVX512_SMALL_M_MULTI_N");
+  const std::string value = raw == nullptr ? "auto" : raw;
+  if (value.empty() || value == "auto") {
+    return SmallMMultiNMode::kAuto;
+  }
+  if (value == "baseline") {
+    return SmallMMultiNMode::kBaseline;
+  }
+  if (value == "w13") {
+    return SmallMMultiNMode::kW13;
+  }
+  if (value == "w2") {
+    return SmallMMultiNMode::kW2;
+  }
+  if (value == "multi_n") {
+    return SmallMMultiNMode::kMultiN;
+  }
+  throw std::runtime_error("FUSED_CPP_MOE_AVX512_SMALL_M_MULTI_N must be auto, baseline, w13, w2, or multi_n; got '" +
+                           value + "'");
 }
 
 #if defined(FUSED_CPP_MOE_HAS_XBYAK) && FUSED_CPP_MOE_HAS_XBYAK
@@ -304,6 +327,7 @@ struct W13Call {
   const uint16_t* b;
   uint16_t* c;
   int64_t k_pairs;
+  int64_t b_block_stride_bytes;
   const SiluConstants* constants;
 };
 
@@ -314,6 +338,7 @@ struct W2Call {
   const int64_t* route_ids;
   const float* route_weights;
   int64_t k_pairs;
+  int64_t b_block_stride_bytes;
   int64_t route_stride_bytes;
 };
 
@@ -359,7 +384,12 @@ struct KernelHandle {
 
 class W13Generator final : public Xbyak::CodeGenerator {
  public:
-  W13Generator(int rows, int degree) : Xbyak::CodeGenerator(16 * 1024, Xbyak::AutoGrow), rows_(rows), degree_(degree) {
+  W13Generator(int rows, int degree, int feature_blocks)
+      : Xbyak::CodeGenerator(16 * 1024, Xbyak::AutoGrow),
+        rows_(rows),
+        degree_(degree),
+        feature_blocks_(feature_blocks),
+        accumulator_count_(rows * feature_blocks * 2) {
     Generate();
     readyRE();
   }
@@ -368,15 +398,58 @@ class W13Generator final : public Xbyak::CodeGenerator {
   static constexpr int kABytesPerPair = 64;
   static constexpr int kBBytesPerPair = 128;
 
-  Xbyak::Zmm Accumulator(int row, int half) const { return Xbyak::Zmm(row * 2 + half); }
+  Xbyak::Zmm Accumulator(int block, int row, int half) const { return Xbyak::Zmm((block * rows_ + row) * 2 + half); }
+
+  Xbyak::Zmm AValue(int row) const { return Xbyak::Zmm(accumulator_count_ + row); }
+
+  Xbyak::Zmm BValue() const { return Xbyak::Zmm(accumulator_count_ + rows_); }
+
+  void LoadB(const Xbyak::Zmm& destination, int block, int byte_offset) {
+    switch (block) {
+      case 0:
+        vmovdqu16(destination, ptr[r9 + byte_offset]);
+        return;
+      case 1:
+        vmovdqu16(destination, ptr[r9 + r11 + byte_offset]);
+        return;
+      case 2:
+        vmovdqu16(destination, ptr[r9 + r11 * 2 + byte_offset]);
+        return;
+      case 3:
+        vmovdqu16(destination, ptr[r9 + rdx + byte_offset]);
+        return;
+      default:
+        throw std::invalid_argument("invalid AVX-512 W13 multi-N B block");
+    }
+  }
+
+  void PrefetchB(int block) {
+    constexpr int kPrefetchDistance = 8 * kBBytesPerPair;
+    switch (block) {
+      case 0:
+        prefetcht0(ptr[r9 + kPrefetchDistance]);
+        return;
+      case 1:
+        prefetcht0(ptr[r9 + r11 + kPrefetchDistance]);
+        return;
+      case 2:
+        prefetcht0(ptr[r9 + r11 * 2 + kPrefetchDistance]);
+        return;
+      case 3:
+        prefetcht0(ptr[r9 + rdx + kPrefetchDistance]);
+        return;
+      default:
+        throw std::invalid_argument("invalid AVX-512 W13 multi-N prefetch block");
+    }
+  }
 
   void BroadcastFloat(const Xbyak::Zmm& destination, size_t offset) {
     vbroadcastss(destination, dword[rsi + static_cast<int>(offset)]);
   }
 
-  void EmitSilu(int row) {
-    const Xbyak::Zmm gate = Accumulator(row, 0);
-    const Xbyak::Zmm up = Accumulator(row, 1);
+  void EmitSilu(int block, int row) {
+    const Xbyak::Zmm gate = Accumulator(block, row, 0);
+    const Xbyak::Zmm up = Accumulator(block, row, 1);
     const Xbyak::Zmm zero(24);
     const Xbyak::Zmm x(25);
     const Xbyak::Zmm constant(26);
@@ -432,21 +505,32 @@ class W13Generator final : public Xbyak::CodeGenerator {
   }
 
   void Generate() {
-    if (rows_ < 1 || rows_ > 12 || (degree_ != 4 && degree_ != 5 && degree_ != 6)) {
+    const bool baseline = feature_blocks_ == 1 && rows_ >= 1 && rows_ <= 12;
+    const bool small_m_multi_n = rows_ >= 1 && rows_ <= 4 && (feature_blocks_ == 2 || feature_blocks_ == 4) &&
+                                 accumulator_count_ <= 24 && accumulator_count_ + rows_ < 32;
+    if ((!baseline && !small_m_multi_n) || (degree_ != 4 && degree_ != 5 && degree_ != 6)) {
       throw std::invalid_argument("invalid AVX-512 W13 JIT specialization");
     }
 
-    const int stack_bytes = (rows_ * 32 + 63) & ~63;
+    const int stack_bytes = (rows_ * feature_blocks_ * 32 + 63) & ~63;
     mov(r8, ptr[rdi + static_cast<int>(offsetof(W13Call, a))]);
     mov(r9, ptr[rdi + static_cast<int>(offsetof(W13Call, b))]);
     mov(r10, ptr[rdi + static_cast<int>(offsetof(W13Call, c))]);
     mov(rcx, ptr[rdi + static_cast<int>(offsetof(W13Call, k_pairs))]);
     mov(rsi, ptr[rdi + static_cast<int>(offsetof(W13Call, constants))]);
+    if (feature_blocks_ > 1) {
+      mov(r11, ptr[rdi + static_cast<int>(offsetof(W13Call, b_block_stride_bytes))]);
+      if (feature_blocks_ == 4) {
+        lea(rdx, ptr[r11 + r11 * 2]);
+      }
+    }
     sub(rsp, stack_bytes);
 
-    for (int row = 0; row < rows_; ++row) {
-      vxorps(Accumulator(row, 0), Accumulator(row, 0), Accumulator(row, 0));
-      vxorps(Accumulator(row, 1), Accumulator(row, 1), Accumulator(row, 1));
+    for (int block = 0; block < feature_blocks_; ++block) {
+      for (int row = 0; row < rows_; ++row) {
+        vxorps(Accumulator(block, row, 0), Accumulator(block, row, 0), Accumulator(block, row, 0));
+        vxorps(Accumulator(block, row, 1), Accumulator(block, row, 1), Accumulator(block, row, 1));
+      }
     }
 
     Xbyak::Label k_loop;
@@ -455,13 +539,30 @@ class W13Generator final : public Xbyak::CodeGenerator {
     jz(k_done, T_NEAR);
     align(64);
     L(k_loop);
-    vmovdqu16(Xbyak::Zmm(24), ptr[r9]);
-    vmovdqu16(Xbyak::Zmm(25), ptr[r9 + 64]);
-    prefetcht0(ptr[r9 + 8 * kBBytesPerPair]);
-    for (int row = 0; row < rows_; ++row) {
-      vpbroadcastd(Xbyak::Zmm(26), dword[r8 + row * 4]);
-      vdpbf16ps(Accumulator(row, 0), Xbyak::Zmm(24), Xbyak::Zmm(26));
-      vdpbf16ps(Accumulator(row, 1), Xbyak::Zmm(25), Xbyak::Zmm(26));
+    if (feature_blocks_ == 1) {
+      vmovdqu16(Xbyak::Zmm(24), ptr[r9]);
+      vmovdqu16(Xbyak::Zmm(25), ptr[r9 + 64]);
+      prefetcht0(ptr[r9 + 8 * kBBytesPerPair]);
+      for (int row = 0; row < rows_; ++row) {
+        vpbroadcastd(Xbyak::Zmm(26), dword[r8 + row * 4]);
+        vdpbf16ps(Accumulator(0, row, 0), Xbyak::Zmm(24), Xbyak::Zmm(26));
+        vdpbf16ps(Accumulator(0, row, 1), Xbyak::Zmm(25), Xbyak::Zmm(26));
+      }
+    } else {
+      for (int row = 0; row < rows_; ++row) {
+        vpbroadcastd(AValue(row), dword[r8 + row * 4]);
+      }
+      for (int block = 0; block < feature_blocks_; ++block) {
+        LoadB(BValue(), block, 0);
+        for (int row = 0; row < rows_; ++row) {
+          vdpbf16ps(Accumulator(block, row, 0), BValue(), AValue(row));
+        }
+        LoadB(BValue(), block, 64);
+        for (int row = 0; row < rows_; ++row) {
+          vdpbf16ps(Accumulator(block, row, 1), BValue(), AValue(row));
+        }
+        PrefetchB(block);
+      }
     }
     add(r8, kABytesPerPair);
     add(r9, kBBytesPerPair);
@@ -469,21 +570,25 @@ class W13Generator final : public Xbyak::CodeGenerator {
     jnz(k_loop, T_NEAR);
     L(k_done);
 
-    for (int row = 0; row < rows_; ++row) {
-      EmitSilu(row);
-      vcvtneps2bf16(Xbyak::Ymm(31), Accumulator(row, 0));
-      vmovdqu16(ptr[rsp + row * 32], Xbyak::Ymm(31));
+    for (int block = 0; block < feature_blocks_; ++block) {
+      for (int row = 0; row < rows_; ++row) {
+        EmitSilu(block, row);
+        vcvtneps2bf16(Xbyak::Ymm(31), Accumulator(block, row, 0));
+        vmovdqu16(ptr[rsp + (block * rows_ + row) * 32], Xbyak::Ymm(31));
+      }
     }
 
     // Transpose Mx16 row-major BF16 values into the existing VNNI2 packed-A
     // layout consumed by W2. Exact-M kernels intentionally leave physical
     // padding rows untouched because W2 only broadcasts the logical rows.
-    for (int feature = 0; feature < 16; ++feature) {
-      for (int row = 0; row < rows_; ++row) {
-        const int source_offset = row * 32 + feature * 2;
-        const int destination_offset = (feature / 2) * 64 + row * 4 + (feature & 1) * 2;
-        movzx(eax, word[rsp + source_offset]);
-        mov(word[r10 + destination_offset], ax);
+    for (int block = 0; block < feature_blocks_; ++block) {
+      for (int feature = 0; feature < 16; ++feature) {
+        for (int row = 0; row < rows_; ++row) {
+          const int source_offset = (block * rows_ + row) * 32 + feature * 2;
+          const int destination_offset = block * 8 * 64 + (feature / 2) * 64 + row * 4 + (feature & 1) * 2;
+          movzx(eax, word[rsp + source_offset]);
+          mov(word[r10 + destination_offset], ax);
+        }
       }
     }
 
@@ -494,6 +599,8 @@ class W13Generator final : public Xbyak::CodeGenerator {
 
   int rows_;
   int degree_;
+  int feature_blocks_;
+  int accumulator_count_;
 };
 
 class W2Generator final : public Xbyak::CodeGenerator {
@@ -502,9 +609,12 @@ class W2Generator final : public Xbyak::CodeGenerator {
       : Xbyak::CodeGenerator(16 * 1024, Xbyak::AutoGrow),
         rows_(rows),
         n_valid_(n_valid),
-        halves_(n_valid > 16 ? 2 : 1),
+        halves_((n_valid + 15) / 16),
         base_accumulators_(rows * halves_),
         split_accumulators_(base_accumulators_ <= 12),
+        accumulator_sets_(split_accumulators_ ? 2 : 1),
+        accumulator_registers_(base_accumulators_ * accumulator_sets_),
+        multi_n_(n_valid > 32),
         direct_bf16_(direct_bf16),
         weighted_direct_bf16_(weighted_direct_bf16) {
     Generate();
@@ -519,16 +629,53 @@ class W2Generator final : public Xbyak::CodeGenerator {
     return Xbyak::Zmm(set * base_accumulators_ + row * halves_ + half);
   }
 
-  void EmitKPair(int accumulator_set) {
-    vmovdqu16(Xbyak::Zmm(24), ptr[r9]);
-    if (halves_ == 2) {
-      vmovdqu16(Xbyak::Zmm(25), ptr[r9 + 64]);
+  Xbyak::Zmm AValue(int row) const { return Xbyak::Zmm(accumulator_registers_ + row); }
+
+  Xbyak::Zmm BValue() const { return Xbyak::Zmm(accumulator_registers_ + rows_); }
+
+  void LoadMultiNB(int half) {
+    const int block = half / 2;
+    const int byte_offset = (half % 2) * 64;
+    switch (block) {
+      case 0:
+        vmovdqu16(BValue(), ptr[r9 + byte_offset]);
+        return;
+      case 1:
+        vmovdqu16(BValue(), ptr[r9 + r12 + byte_offset]);
+        return;
+      case 2:
+        vmovdqu16(BValue(), ptr[r9 + r12 * 2 + byte_offset]);
+        return;
+      case 3:
+        vmovdqu16(BValue(), ptr[r9 + r13 + byte_offset]);
+        return;
+      default:
+        throw std::invalid_argument("invalid AVX-512 W2 multi-N B block");
     }
-    for (int row = 0; row < rows_; ++row) {
-      vpbroadcastd(Xbyak::Zmm(26), dword[r8 + row * 4]);
-      vdpbf16ps(Accumulator(row, 0, accumulator_set), Xbyak::Zmm(24), Xbyak::Zmm(26));
+  }
+
+  void EmitKPair(int accumulator_set) {
+    if (!multi_n_) {
+      vmovdqu16(Xbyak::Zmm(24), ptr[r9]);
       if (halves_ == 2) {
-        vdpbf16ps(Accumulator(row, 1, accumulator_set), Xbyak::Zmm(25), Xbyak::Zmm(26));
+        vmovdqu16(Xbyak::Zmm(25), ptr[r9 + 64]);
+      }
+      for (int row = 0; row < rows_; ++row) {
+        vpbroadcastd(Xbyak::Zmm(26), dword[r8 + row * 4]);
+        vdpbf16ps(Accumulator(row, 0, accumulator_set), Xbyak::Zmm(24), Xbyak::Zmm(26));
+        if (halves_ == 2) {
+          vdpbf16ps(Accumulator(row, 1, accumulator_set), Xbyak::Zmm(25), Xbyak::Zmm(26));
+        }
+      }
+    } else {
+      for (int row = 0; row < rows_; ++row) {
+        vpbroadcastd(AValue(row), dword[r8 + row * 4]);
+      }
+      for (int half = 0; half < halves_; ++half) {
+        LoadMultiNB(half);
+        for (int row = 0; row < rows_; ++row) {
+          vdpbf16ps(Accumulator(row, half, accumulator_set), BValue(), AValue(row));
+        }
       }
     }
     add(r8, kABytesPerPair);
@@ -561,22 +708,36 @@ class W2Generator final : public Xbyak::CodeGenerator {
   }
 
   void Generate() {
-    if (rows_ < 1 || rows_ > 12 || n_valid_ < 1 || n_valid_ > 32) {
+    const bool baseline = rows_ >= 1 && rows_ <= 12 && n_valid_ >= 1 && n_valid_ <= 32;
+    const bool small_m_multi_n = rows_ >= 1 && rows_ <= 4 && (n_valid_ == 64 || n_valid_ == 128) &&
+                                 accumulator_registers_ <= 24 && accumulator_registers_ + rows_ < 29;
+    if (!baseline && !small_m_multi_n) {
       throw std::invalid_argument("invalid AVX-512 W2 JIT specialization");
     }
 
+    if (multi_n_) {
+      push(r12);
+      if (n_valid_ == 128) {
+        push(r13);
+      }
+    }
     mov(r8, ptr[rdi + static_cast<int>(offsetof(W2Call, a))]);
     mov(r9, ptr[rdi + static_cast<int>(offsetof(W2Call, b))]);
     mov(r10, ptr[rdi + static_cast<int>(offsetof(W2Call, output))]);
     mov(r11, ptr[rdi + static_cast<int>(offsetof(W2Call, route_ids))]);
     mov(rcx, ptr[rdi + static_cast<int>(offsetof(W2Call, k_pairs))]);
     mov(rsi, ptr[rdi + static_cast<int>(offsetof(W2Call, route_stride_bytes))]);
+    if (multi_n_) {
+      mov(r12, ptr[rdi + static_cast<int>(offsetof(W2Call, b_block_stride_bytes))]);
+      if (n_valid_ == 128) {
+        lea(r13, ptr[r12 + r12 * 2]);
+      }
+    }
     if (weighted_direct_bf16_) {
       mov(rdi, ptr[rdi + static_cast<int>(offsetof(W2Call, route_weights))]);
     }
 
-    const int accumulator_sets = split_accumulators_ ? 2 : 1;
-    for (int set = 0; set < accumulator_sets; ++set) {
+    for (int set = 0; set < accumulator_sets_; ++set) {
       for (int row = 0; row < rows_; ++row) {
         for (int half = 0; half < halves_; ++half) {
           vxorps(Accumulator(row, half, set), Accumulator(row, half, set), Accumulator(row, half, set));
@@ -620,42 +781,39 @@ class W2Generator final : public Xbyak::CodeGenerator {
       L(k_done);
     }
 
-    const int valid0 = std::min(n_valid_, 16);
-    const int valid1 = std::max(n_valid_ - 16, 0);
-    if (valid0 != 16) {
-      mov(eax, MaskFor(valid0));
+    const int tail_valid = n_valid_ % 16;
+    if (tail_valid != 0) {
+      mov(eax, MaskFor(tail_valid));
       kmovw(k1, eax);
-    }
-    if (valid1 > 0 && valid1 != 16) {
-      mov(eax, MaskFor(valid1));
-      kmovw(k2, eax);
     }
 
     for (int row = 0; row < rows_; ++row) {
       mov(rax, ptr[r11 + row * 8]);
       if (weighted_direct_bf16_) {
         vbroadcastss(Xbyak::Zmm(29), dword[rdi + rax * 4]);
-        vmulps(Accumulator(row, 0), Accumulator(row, 0), Xbyak::Zmm(29));
-        if (valid1 > 0) {
-          vmulps(Accumulator(row, 1), Accumulator(row, 1), Xbyak::Zmm(29));
+        for (int half = 0; half < halves_; ++half) {
+          vmulps(Accumulator(row, half), Accumulator(row, half), Xbyak::Zmm(29));
         }
       }
       imul(rax, rsi);
       lea(rdx, ptr[r10 + rax]);
-      if (direct_bf16_) {
-        EmitBf16Store(ptr[rdx], Accumulator(row, 0), valid0, k1);
-        if (valid1 > 0) {
-          EmitBf16Store(ptr[rdx + 32], Accumulator(row, 1), valid1, k2);
-        }
-      } else {
-        EmitFloatStore(ptr[rdx], Accumulator(row, 0), valid0, k1);
-        if (valid1 > 0) {
-          EmitFloatStore(ptr[rdx + 64], Accumulator(row, 1), valid1, k2);
+      for (int half = 0; half < halves_; ++half) {
+        const int valid = std::min(16, n_valid_ - half * 16);
+        if (direct_bf16_) {
+          EmitBf16Store(ptr[rdx + half * 32], Accumulator(row, half), valid, k1);
+        } else {
+          EmitFloatStore(ptr[rdx + half * 64], Accumulator(row, half), valid, k1);
         }
       }
     }
 
     vzeroupper();
+    if (multi_n_) {
+      if (n_valid_ == 128) {
+        pop(r13);
+      }
+      pop(r12);
+    }
     ret();
   }
 
@@ -664,6 +822,9 @@ class W2Generator final : public Xbyak::CodeGenerator {
   int halves_;
   int base_accumulators_;
   bool split_accumulators_;
+  int accumulator_sets_;
+  int accumulator_registers_;
+  bool multi_n_;
   bool direct_bf16_;
   bool weighted_direct_bf16_;
 };
@@ -2124,7 +2285,7 @@ KernelHandle GenerateKernel(const KernelKey& key) {
     return KernelHandle{owner, owner->getCode<JitFunction>(), owner->getSize(), {}};
   }
   if (key.operation == JitOperation::kW13) {
-    auto owner = std::make_shared<W13Generator>(key.rows, key.silu_degree);
+    auto owner = std::make_shared<W13Generator>(key.rows, key.silu_degree, key.n_valid / 16);
     return KernelHandle{owner, owner->getCode<JitFunction>(), owner->getSize(), {}};
   }
   const bool weighted_direct_bf16 = key.output == JitOutput::kWeightedDirectBf16;
@@ -2165,8 +2326,9 @@ KernelHandle ResolveKernel(const KernelKey& key, ImplementationMode mode) {
   return handle;
 }
 
-KernelKey W13Key(int rows, int degree) {
-  return KernelKey{X86JitIsa::kAvx512Bf16,       JitOperation::kW13,    static_cast<uint8_t>(rows), 16,
+KernelKey W13Key(int rows, int degree, int feature_blocks = 1) {
+  return KernelKey{X86JitIsa::kAvx512Bf16,       JitOperation::kW13,
+                   static_cast<uint8_t>(rows),   static_cast<uint8_t>(feature_blocks * 16),
                    static_cast<uint8_t>(degree), JitOutput::kPackedBf16};
 }
 
@@ -2175,6 +2337,52 @@ KernelKey W2Key(int rows, int n_valid, bool direct_bf16, bool weighted_direct_bf
                                                 : (direct_bf16 ? JitOutput::kDirectBf16 : JitOutput::kRouteF32);
   return KernelKey{
       X86JitIsa::kAvx512Bf16, JitOperation::kW2, static_cast<uint8_t>(rows), static_cast<uint8_t>(n_valid), 0, output};
+}
+
+bool SmallMMultiNMayUseW13(SmallMMultiNMode mode) {
+  return mode == SmallMMultiNMode::kAuto || mode == SmallMMultiNMode::kW13 || mode == SmallMMultiNMode::kMultiN;
+}
+
+bool SmallMMultiNMayUseW2(SmallMMultiNMode mode) {
+  return mode == SmallMMultiNMode::kAuto || mode == SmallMMultiNMode::kW2 || mode == SmallMMultiNMode::kMultiN;
+}
+
+bool UseAutomaticW13SmallMMultiN(int rows, int reduction, int output, int cooperative_threads) {
+  return UseAutomaticAvx512SmallMMultiN(Avx512SmallMMultiNStage::kW13, rows, reduction, output, cooperative_threads);
+}
+
+bool UseAutomaticW2SmallMMultiN(int rows, int reduction, int output, int cooperative_threads) {
+  return UseAutomaticAvx512SmallMMultiN(Avx512SmallMMultiNStage::kW2, rows, reduction, output, cooperative_threads);
+}
+
+bool UseW13SmallMMultiN(int rows, int reduction, int output, int cooperative_threads, SmallMMultiNMode mode) {
+  if (!SmallMMultiNMayUseW13(mode) || rows < 1 || rows > 4) {
+    return false;
+  }
+  return mode != SmallMMultiNMode::kAuto || UseAutomaticW13SmallMMultiN(rows, reduction, output, cooperative_threads);
+}
+
+bool UseW2SmallMMultiN(int rows, int reduction, int output, int cooperative_threads, SmallMMultiNMode mode) {
+  if (!SmallMMultiNMayUseW2(mode) || rows < 1 || rows > 4) {
+    return false;
+  }
+  return mode != SmallMMultiNMode::kAuto || UseAutomaticW2SmallMMultiN(rows, reduction, output, cooperative_threads);
+}
+
+int W13SmallMMultiNBlocks(int rows, int remaining_blocks) {
+  if (rows < 1 || rows > 4 || remaining_blocks < 2) {
+    return 1;
+  }
+  const int widest = rows <= 3 ? 4 : 2;
+  return remaining_blocks >= widest ? widest : 2;
+}
+
+int W2SmallMMultiNBlocks(int rows, int remaining_blocks) {
+  if (rows < 1 || rows > 4 || remaining_blocks < 2) {
+    return 1;
+  }
+  const int widest = rows <= 2 ? 4 : 2;
+  return remaining_blocks >= widest ? widest : 2;
 }
 
 KernelKey AmxW13Key(int rows, int degree, AmxJitPattern pattern, AmxSiluEpilogue silu_epilogue,
@@ -2233,6 +2441,30 @@ bool ResolveRowKernels(int rows, int degree, int hidden_size, bool direct_bf16, 
   return true;
 }
 
+bool ResolveSmallMMultiNKernels(int rows, int degree, int hidden_size, bool direct_bf16, bool weighted_direct_bf16,
+                                ImplementationMode mode, SmallMMultiNMode multi_n_mode) {
+  if (multi_n_mode == SmallMMultiNMode::kBaseline || rows < 1 || rows > 4) {
+    return true;
+  }
+  if (SmallMMultiNMayUseW13(multi_n_mode)) {
+    if (!ResolveKernel(W13Key(rows, degree, 2), mode)) {
+      return false;
+    }
+    if (rows <= 3 && !ResolveKernel(W13Key(rows, degree, 4), mode)) {
+      return false;
+    }
+  }
+  if (SmallMMultiNMayUseW2(multi_n_mode)) {
+    if (hidden_size >= 64 && !ResolveKernel(W2Key(rows, 64, direct_bf16, weighted_direct_bf16), mode)) {
+      return false;
+    }
+    if (rows <= 2 && hidden_size >= 128 && !ResolveKernel(W2Key(rows, 128, direct_bf16, weighted_direct_bf16), mode)) {
+      return false;
+    }
+  }
+  return true;
+}
+
 void ResolveAmxRowKernels(int rows, int degree, int hidden_size, bool direct_bf16, bool weighted_direct_bf16,
                           AmxJitPattern pattern, AmxSiluEpilogue silu_epilogue, AmxW2Epilogue w2_epilogue,
                           AmxTileStateMode tile_state_mode, AmxPackedBLayout b_layout, AmxBLoadHint b_load_hint,
@@ -2287,7 +2519,9 @@ void PrepareJitKernels(const std::vector<int>& row_counts, int silu_poly_degree,
     return;
   }
 #if defined(FUSED_CPP_MOE_HAS_XBYAK) && FUSED_CPP_MOE_HAS_XBYAK
+  const SmallMMultiNMode multi_n_mode = GetSmallMMultiNMode();
   std::array<bool, 13> prepared{};
+  std::array<bool, 5> prepared_small_m_multi_n{};
   for (int rows : row_counts) {
     if (rows <= 0) {
       continue;
@@ -2300,6 +2534,11 @@ void PrepareJitKernels(const std::vector<int>& row_counts, int silu_poly_degree,
     if (tail != 0 && !prepared[tail]) {
       ResolveRowKernels(tail, silu_poly_degree, hidden_size, direct_bf16, weighted_direct_bf16, mode);
       prepared[tail] = true;
+    }
+    if (rows <= 4 && !prepared_small_m_multi_n[rows]) {
+      ResolveSmallMMultiNKernels(rows, silu_poly_degree, hidden_size, direct_bf16, weighted_direct_bf16, mode,
+                                 multi_n_mode);
+      prepared_small_m_multi_n[rows] = true;
     }
   }
 #else
@@ -2380,7 +2619,8 @@ bool AmxW2UsesContiguousRouteOutput() {
 }
 
 void ComputeW13(const uint16_t* a, int a_stride, const uint16_t* packed_b, uint16_t* c, int c_stride, int rows,
-                int k_pad, int feature_block_begin, int feature_block_end, int silu_poly_degree) {
+                int k_pad, int feature_block_begin, int feature_block_end, int silu_poly_degree,
+                int cooperative_threads) {
   const ImplementationMode mode = GetImplementationMode();
   if (mode == ImplementationMode::kIntrinsic) {
     ComputeW13Intrinsic(a, a_stride, packed_b, c, c_stride, rows, k_pad, feature_block_begin, feature_block_end,
@@ -2388,6 +2628,44 @@ void ComputeW13(const uint16_t* a, int a_stride, const uint16_t* packed_b, uint1
     return;
   }
 #if defined(FUSED_CPP_MOE_HAS_XBYAK) && FUSED_CPP_MOE_HAS_XBYAK
+  const SmallMMultiNMode multi_n_mode = GetSmallMMultiNMode();
+  const int cache_blocks = GetCacheBlockWindow("FUSED_CPP_MOE_X86_W13_CACHE_BLOCKS");
+  if (UseW13SmallMMultiN(rows, k_pad, c_stride, cooperative_threads, multi_n_mode)) {
+    bool jit_available = true;
+    auto run_small_m_range = [&](int block_begin, int block_end) {
+      if (!jit_available) {
+        return;
+      }
+      for (int block = block_begin; block < block_end;) {
+        const int feature_blocks = W13SmallMMultiNBlocks(rows, block_end - block);
+        KernelHandle kernel = ResolveKernel(W13Key(rows, silu_poly_degree, feature_blocks), mode);
+        if (!kernel) {
+          jit_available = false;
+          return;
+        }
+        W13Call call{a,
+                     packed_b + static_cast<int64_t>(block) * k_pad * 32,
+                     c + static_cast<int64_t>(block) * 8 * 32,
+                     k_pad / 2,
+                     static_cast<int64_t>(k_pad) * 64,
+                     &kSiluConstants};
+        kernel.function(&call);
+        block += feature_blocks;
+      }
+    };
+    if (cache_blocks == 0) {
+      run_small_m_range(feature_block_begin, feature_block_end);
+    } else {
+      ForEachCacheBlockWindow(feature_block_begin, feature_block_end, cache_blocks, run_small_m_range);
+    }
+    if (jit_available) {
+      return;
+    }
+    ComputeW13Intrinsic(a, a_stride, packed_b, c, c_stride, rows, k_pad, feature_block_begin, feature_block_end,
+                        silu_poly_degree);
+    return;
+  }
+
   const int full_panels = rows / 12;
   const int tail_rows = rows % 12;
   KernelHandle full_kernel;
@@ -2404,20 +2682,25 @@ void ComputeW13(const uint16_t* a, int a_stride, const uint16_t* packed_b, uint1
     return;
   }
 
-  const int cache_blocks = GetCacheBlockWindow("FUSED_CPP_MOE_X86_W13_CACHE_BLOCKS");
   if (cache_blocks == 0) {
     for (int block = feature_block_begin; block < feature_block_end; ++block) {
       const uint16_t* b_block = packed_b + static_cast<int64_t>(block) * k_pad * 32;
       for (int panel = 0; panel < full_panels; ++panel) {
-        W13Call call{a + static_cast<int64_t>(panel) * a_stride * 16, b_block,
-                     c + static_cast<int64_t>(panel) * c_stride * 16 + static_cast<int64_t>(block) * 8 * 32, k_pad / 2,
+        W13Call call{a + static_cast<int64_t>(panel) * a_stride * 16,
+                     b_block,
+                     c + static_cast<int64_t>(panel) * c_stride * 16 + static_cast<int64_t>(block) * 8 * 32,
+                     k_pad / 2,
+                     static_cast<int64_t>(k_pad) * 64,
                      &kSiluConstants};
         full_kernel.function(&call);
       }
       if (tail_rows > 0) {
-        W13Call call{a + static_cast<int64_t>(full_panels) * a_stride * 16, b_block,
+        W13Call call{a + static_cast<int64_t>(full_panels) * a_stride * 16,
+                     b_block,
                      c + static_cast<int64_t>(full_panels) * c_stride * 16 + static_cast<int64_t>(block) * 8 * 32,
-                     k_pad / 2, &kSiluConstants};
+                     k_pad / 2,
+                     static_cast<int64_t>(k_pad) * 64,
+                     &kSiluConstants};
         tail_kernel.function(&call);
       }
     }
@@ -2428,8 +2711,11 @@ void ComputeW13(const uint16_t* a, int a_stride, const uint16_t* packed_b, uint1
     for (int panel = 0; panel < full_panels; ++panel) {
       for (int block = window_begin; block < window_end; ++block) {
         const uint16_t* b_block = packed_b + static_cast<int64_t>(block) * k_pad * 32;
-        W13Call call{a + static_cast<int64_t>(panel) * a_stride * 16, b_block,
-                     c + static_cast<int64_t>(panel) * c_stride * 16 + static_cast<int64_t>(block) * 8 * 32, k_pad / 2,
+        W13Call call{a + static_cast<int64_t>(panel) * a_stride * 16,
+                     b_block,
+                     c + static_cast<int64_t>(panel) * c_stride * 16 + static_cast<int64_t>(block) * 8 * 32,
+                     k_pad / 2,
+                     static_cast<int64_t>(k_pad) * 64,
                      &kSiluConstants};
         full_kernel.function(&call);
       }
@@ -2437,9 +2723,12 @@ void ComputeW13(const uint16_t* a, int a_stride, const uint16_t* packed_b, uint1
     if (tail_rows > 0) {
       for (int block = window_begin; block < window_end; ++block) {
         const uint16_t* b_block = packed_b + static_cast<int64_t>(block) * k_pad * 32;
-        W13Call call{a + static_cast<int64_t>(full_panels) * a_stride * 16, b_block,
+        W13Call call{a + static_cast<int64_t>(full_panels) * a_stride * 16,
+                     b_block,
                      c + static_cast<int64_t>(full_panels) * c_stride * 16 + static_cast<int64_t>(block) * 8 * 32,
-                     k_pad / 2, &kSiluConstants};
+                     k_pad / 2,
+                     static_cast<int64_t>(k_pad) * 64,
+                     &kSiluConstants};
         tail_kernel.function(&call);
       }
     }
@@ -2455,7 +2744,7 @@ void ComputeW13(const uint16_t* a, int a_stride, const uint16_t* packed_b, uint1
 
 void ComputeW2(const uint16_t* a, int a_stride, const uint16_t* packed_b, float* route_output, uint16_t* direct_output,
                const int64_t* route_ids, int route_stride, int rows, int k_pad, int hidden_size, int output_block_begin,
-               int output_block_end, bool direct_bf16, const float* route_weights) {
+               int output_block_end, bool direct_bf16, const float* route_weights, int cooperative_threads) {
   const bool weighted_direct_bf16 = route_weights != nullptr;
   const ImplementationMode mode = GetImplementationMode();
   if (mode == ImplementationMode::kIntrinsic) {
@@ -2464,6 +2753,63 @@ void ComputeW2(const uint16_t* a, int a_stride, const uint16_t* packed_b, float*
     return;
   }
 #if defined(FUSED_CPP_MOE_HAS_XBYAK) && FUSED_CPP_MOE_HAS_XBYAK
+  const SmallMMultiNMode multi_n_mode = GetSmallMMultiNMode();
+  const int element_bytes = direct_bf16 ? 2 : 4;
+  const int cache_blocks = GetCacheBlockWindow("FUSED_CPP_MOE_X86_W2_CACHE_BLOCKS");
+  if (UseW2SmallMMultiN(rows, k_pad, hidden_size, cooperative_threads, multi_n_mode)) {
+    bool jit_available = true;
+    auto run_small_m_range = [&](int block_begin, int block_end) {
+      if (!jit_available) {
+        return;
+      }
+      for (int block = block_begin; block < block_end;) {
+        const int column = block * 32;
+        const int first_valid = std::min(32, hidden_size - column);
+        if (first_valid <= 0) {
+          return;
+        }
+        int block_count = 1;
+        int n_valid = first_valid;
+        if (first_valid == 32) {
+          int full_blocks = 1;
+          while (block + full_blocks < block_end && hidden_size - (block + full_blocks) * 32 >= 32) {
+            ++full_blocks;
+          }
+          block_count = W2SmallMMultiNBlocks(rows, full_blocks);
+          n_valid = block_count * 32;
+        }
+        KernelHandle kernel = ResolveKernel(W2Key(rows, n_valid, direct_bf16, weighted_direct_bf16), mode);
+        if (!kernel) {
+          jit_available = false;
+          return;
+        }
+        void* output_block =
+            direct_bf16 ? static_cast<void*>(direct_output + column) : static_cast<void*>(route_output + column);
+        W2Call call{a,
+                    packed_b + static_cast<int64_t>(block) * k_pad * 32,
+                    output_block,
+                    route_ids,
+                    route_weights,
+                    k_pad / 2,
+                    static_cast<int64_t>(k_pad) * 64,
+                    static_cast<int64_t>(route_stride) * element_bytes};
+        kernel.function(&call);
+        block += block_count;
+      }
+    };
+    if (cache_blocks == 0) {
+      run_small_m_range(output_block_begin, output_block_end);
+    } else {
+      ForEachCacheBlockWindow(output_block_begin, output_block_end, cache_blocks, run_small_m_range);
+    }
+    if (jit_available) {
+      return;
+    }
+    ComputeW2Intrinsic(a, a_stride, packed_b, route_output, direct_output, route_ids, route_stride, rows, k_pad,
+                       hidden_size, output_block_begin, output_block_end, direct_bf16, route_weights);
+    return;
+  }
+
   const int full_panels = rows / 12;
   const int tail_rows = rows % 12;
   KernelHandle full_main_kernel;
@@ -2504,8 +2850,6 @@ void ComputeW2(const uint16_t* a, int a_stride, const uint16_t* packed_b, float*
     return;
   }
 
-  const int element_bytes = direct_bf16 ? 2 : 4;
-  const int cache_blocks = GetCacheBlockWindow("FUSED_CPP_MOE_X86_W2_CACHE_BLOCKS");
   auto run_block = [&](int block, int panel, bool tail_panel) {
     const int column = block * 32;
     const int n_valid = std::min(32, hidden_size - column);
@@ -2526,6 +2870,7 @@ void ComputeW2(const uint16_t* a, int a_stride, const uint16_t* packed_b, float*
                 route_ids + route_offset,
                 route_weights,
                 k_pad / 2,
+                static_cast<int64_t>(k_pad) * 64,
                 static_cast<int64_t>(route_stride) * element_bytes};
     kernel.function(&call);
   };

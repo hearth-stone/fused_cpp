@@ -411,6 +411,31 @@ For the C8i profile:
 - the skew-wave target is
   `clamp(ceil(64*4096*512/(H*F)), 16, 256)` rows per worker.
 
+The AVX-512 JIT also has small-M multi-N kernels. At exact M=1--3, W13 keeps
+four adjacent F16 gate/up blocks resident; M4 uses two. W2 uses N128 for
+M1--2 and N64 for M3--4. Each K-pair broadcasts A once and streams adjacent
+B blocks from the existing VNNI2/N32 packed weights, so enabling the feature
+does not create another weight copy. Odd block counts and H/F/N tails compose
+the two-block or established one-block kernels.
+
+`FUSED_CPP_MOE_AVX512_SMALL_M_MULTI_N` is a validation override:
+
+- unset, empty, or `auto` applies the C8i dimension-, stage-, and actual
+  expert-team-width policy; unknown CPU profiles retain the single-N kernel;
+- `baseline` always uses the previous exact-M kernel;
+- `w13` or `w2` widens only that stage;
+- `multi_n` forces both stages where their M specialization exists.
+
+The automatic policy disables wider kernels for eight-worker expert teams and
+uses stricter W2 thresholds for two/four-worker N split. On one C8i core,
+H4096/F512 M1--4 improved 6.3%--16.1%, and H4096/F2048 improved
+7.0%--15.9%. Retained two-/four-worker cases improved by as much as
+14.6%/9.6%; rejected eight-worker controls regressed by up to 13.8%, which is
+why they fall back. Reproduce with
+`benchmarks/bench_avx512_small_m_multi_n.py`; full thresholds, commands, and
+measurements are in
+[`results/amazon_c8i_8core_avx512_small_m_multi_n_20260726.md`](results/amazon_c8i_8core_avx512_small_m_multi_n_20260726.md).
+
 The generic fallback preserves the previous AMX M=76 crossover, 64-row wave
 target, and cache-byte formulas. Every profile retains the exact-tail rules:
 the final M1-16 part of `m2n2`, plus an odd final N32/W13 block of `m1n4`,

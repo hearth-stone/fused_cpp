@@ -33,6 +33,10 @@ bool ProductAtMost(int64_t a, int64_t b, int64_t c, int64_t limit) {
   return a <= limit / b && a * b <= limit / c;
 }
 
+bool ProductAtLeast(int a, int b, int64_t threshold) {
+  return a > 0 && b > 0 && static_cast<int64_t>(a) * b >= threshold;
+}
+
 bool IsC8iHardware(const X86CpuIdentity& identity) {
   return identity.is_intel && identity.family == kIntelFamily && identity.model == kC8iModel;
 }
@@ -147,6 +151,44 @@ X86PolicyDecision ResolveX86Policy(const X86PolicyInput& input) {
   decision.route_skewed = input.second_max_routes > 0 && input.max_routes >= decision.nsplit_target_rows &&
                           input.second_max_routes <= input.max_routes / 2;
   return decision;
+}
+
+bool UseAutomaticAvx512SmallMMultiN(Avx512SmallMMultiNStage stage, int rows, int reduction_size, int output_size,
+                                    int cooperative_threads) {
+  if (!UseC8iProfile() || rows < 1 || rows > 4 || cooperative_threads <= 0 || cooperative_threads >= 8) {
+    return false;
+  }
+  if (stage == Avx512SmallMMultiNStage::kW13) {
+    if (cooperative_threads >= 4 && rows == 4 && output_size < 1024) {
+      return false;
+    }
+    switch (rows) {
+      case 1:
+        return ProductAtLeast(reduction_size, output_size, 32 * 1024);
+      case 2:
+        return reduction_size >= 256 && ProductAtLeast(reduction_size, output_size, 64 * 1024);
+      case 3:
+        return ProductAtLeast(reduction_size, output_size, 64 * 1024);
+      case 4:
+        return reduction_size >= 512 && ProductAtLeast(reduction_size, output_size, 256 * 1024);
+    }
+  }
+  if (cooperative_threads >= 4 && (reduction_size < 1024 || rows == 4)) {
+    return false;
+  }
+  if (cooperative_threads >= 2 && ((rows == 3 && reduction_size < 1024) || (rows == 4 && reduction_size < 2048))) {
+    return false;
+  }
+  switch (rows) {
+    case 1:
+    case 2:
+      return reduction_size >= 256 && ProductAtLeast(reduction_size, output_size, 256 * 1024);
+    case 3:
+      return reduction_size >= 512 && ProductAtLeast(reduction_size, output_size, 2 * 1024 * 1024);
+    case 4:
+      return reduction_size >= 1024 && ProductAtLeast(reduction_size, output_size, 8 * 1024 * 1024);
+  }
+  return false;
 }
 
 AmxKernelPattern ResolveAutomaticAmxKernelPattern(int rows, int hidden_size, int intermediate_size) {

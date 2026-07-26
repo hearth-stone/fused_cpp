@@ -27,6 +27,28 @@ through the same ID-104 K32/N32 packed weights. Use
 `FUSED_CPP_MOE_X86_POLICY_PROFILE=generic_v1|intel_06_ad_c8i_v1` for a
 policy-profile A/B; neither variable is required in production.
 
+## x86 AVX-512 small-M multi-N A/B
+
+`bench_avx512_small_m_multi_n.py` rotates the original exact-M/single-N JIT,
+W13-only, W2-only, combined wide-N, and automatic policies on identical
+packed weights and tensors. It covers M=1--4, reuses output, excludes packing
+and JIT warm-up, checks every result against PyTorch, and reports median,
+p90, p99, mean, standard deviation, best, GFLOP/s, and speedup.
+
+```bash
+taskset -c 0 env PYTHONPATH=src \
+  .venv/bin/python benchmarks/bench_avx512_small_m_multi_n.py \
+  --hidden 4096 --intermediate 512 --routes 1,2,3,4 \
+  --threads 1 --variants baseline,w13,w2,multi_n,auto \
+  --warmup 20 --runs 101
+```
+
+Use CPU sets `0-1`, `0-3`, or `0-7` with `--threads 2`, `4`, or `8` to
+validate the cooperative-width guard. `FUSED_CPP_MOE_AVX512_SMALL_M_MULTI_N`
+accepts `auto`, `baseline`, `w13`, `w2`, and `multi_n`; the benchmark manages
+it per variant. C8i8 results and the rejected multi-core controls are in
+`optimizations/fused_moe_avx512/results/amazon_c8i_8core_avx512_small_m_multi_n_20260726.md`.
+
 ## x86 AMX MoE packed-B layout A/B
 
 `bench_amx_bf16_layouts.py` compares the production N32 packed weights with

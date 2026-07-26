@@ -156,11 +156,20 @@ results on `AmazonC8i2Cores` for isolated microkernel changes.
 
 ## P3: improve AVX-512 register and cache schedules
 
-- [ ] **Small-M multi-N kernels:** use the spare ZMM capacity at small exact M
+- [x] **Small-M multi-N kernels:** use the spare ZMM capacity at small exact M
   to compute multiple adjacent N blocks per A traversal. Start with W13
   multi-F16 and W2 N64/N128 candidates for M=1--4, retain current exact-M
   kernels as the baseline, and select wider kernels only where their additional
-  accumulators improve end-to-end latency.
+  accumulators improve end-to-end latency. **2026-07-26:** W13 now computes
+  four adjacent F16 blocks for M1--3 or two for M4; W2 computes N128 for
+  M1--2 or N64 for M3--4. Both reuse the existing VNNI2/N32 weights and exact
+  tails. The C8i dimension- and team-width-aware policy selects W13/W2
+  independently and keeps explicit `baseline/w13/w2/multi_n` controls.
+  H4096/F512 one-core M1--4 improved 6.3%--16.1%; H4096/F2048 improved
+  7.0%--15.9%. At two/four workers the retained cases improve up to
+  14.6%/9.6%, while eight-worker teams fall back to the old kernel after
+  forced controls exposed bandwidth-saturated regressions. See
+  [`results/amazon_c8i_8core_avx512_small_m_multi_n_20260726.md`](results/amazon_c8i_8core_avx512_small_m_multi_n_20260726.md).
 - [ ] **Bulk-M generated loop:** move adjacent full M12 panels inside one JIT
   body/cache window so they share the call frame, invariant setup, and address
   generation. Preserve the current exact-M1--11 tail specializations and

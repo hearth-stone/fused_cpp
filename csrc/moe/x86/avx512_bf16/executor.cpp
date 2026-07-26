@@ -496,7 +496,8 @@ void GatherExpertInput(const ExpertTask& task, ThreadScratch& scratch, const uin
 void RunExpertW13Range(const ExpertTask& task, ThreadScratch& scratch, const uint16_t* expert_input,
                        const uint16_t* w13, const PackedShape& w13_shape, int f_pad, int intermediate_stride,
                        int silu_poly_degree, bool use_amx, avx512_moe::AmxPackedBLayout amx_b_layout, int hidden_size,
-                       int intermediate_size, int feature_block_begin, int feature_block_end) {
+                       int intermediate_size, int feature_block_begin, int feature_block_end,
+                       int cooperative_threads = 1) {
   const int rows = static_cast<int>(task.routes->size());
   const uint16_t* expert_w13 = w13 + task.expert * w13_shape.expert_stride;
   if (use_amx) {
@@ -505,7 +506,8 @@ void RunExpertW13Range(const ExpertTask& task, ThreadScratch& scratch, const uin
                               amx_b_layout, hidden_size, intermediate_size);
   } else {
     avx512_moe::ComputeW13(expert_input, w13_shape.k_pad, expert_w13, scratch.intermediate, f_pad, rows,
-                           w13_shape.k_pad, feature_block_begin, feature_block_end, silu_poly_degree);
+                           w13_shape.k_pad, feature_block_begin, feature_block_end, silu_poly_degree,
+                           cooperative_threads);
   }
 }
 
@@ -513,7 +515,7 @@ void RunExpertW2Range(const ExpertTask& task, ThreadScratch& scratch, const uint
                       int f_pad, int intermediate_stride, float* route_output, uint16_t* output,
                       const float* route_weights, int64_t hidden_size, bool direct_bf16, bool use_amx,
                       avx512_moe::AmxPackedBLayout amx_b_layout, bool contiguous_route_output, int output_block_begin,
-                      int output_block_end, int intermediate_size) {
+                      int output_block_end, int intermediate_size, int cooperative_threads = 1) {
   const std::vector<int64_t>& routes = *task.routes;
   const int rows = static_cast<int>(routes.size());
   const uint16_t* expert_w2 = w2 + task.expert * w2_shape.expert_stride;
@@ -531,7 +533,7 @@ void RunExpertW2Range(const ExpertTask& task, ThreadScratch& scratch, const uint
   } else {
     avx512_moe::ComputeW2(scratch.intermediate, f_pad, expert_w2, route_output, output, routes.data(),
                           static_cast<int>(hidden_size), rows, w2_shape.k_pad, static_cast<int>(hidden_size),
-                          output_block_begin, output_block_end, direct_bf16, route_weights);
+                          output_block_begin, output_block_end, direct_bf16, route_weights, cooperative_threads);
   }
 }
 
@@ -916,7 +918,7 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input, at::Tensor w13_packed, int64_t
           RunExpertW13Range(task, scratch, expert_input, w13_pointer, w13_shape, f_pad, intermediate_stride,
                             silu_poly_degree, use_amx, amx_b_layout, static_cast<int>(input.size(1)),
                             static_cast<int>(f_size), static_cast<int>(w13_range.begin),
-                            static_cast<int>(w13_range.end));
+                            static_cast<int>(w13_range.end), static_cast<int>(team.threads));
           if (!barrier.Wait()) {
             return;
           }
@@ -925,7 +927,7 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input, at::Tensor w13_packed, int64_t
           RunExpertW2Range(task, scratch, w2_pointer, w2_shape, f_pad, intermediate_stride, route_output_pointer,
                            output_pointer, direct_route_weights, input.size(1), direct_bf16, use_amx, amx_b_layout,
                            contiguous_route_output, static_cast<int>(w2_range.begin), static_cast<int>(w2_range.end),
-                           static_cast<int>(f_size));
+                           static_cast<int>(f_size), static_cast<int>(team.threads));
         } catch (...) {
           barrier.Cancel();
           throw;

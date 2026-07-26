@@ -258,6 +258,155 @@ def test_avx512_exact_m_jit_matches_intrinsic(monkeypatch: pytest.MonkeyPatch, r
     _assert_bf16_close(jit, intrinsic)
 
 
+@pytest.mark.parametrize("routes", range(1, 5), ids=lambda value: f"m{value}")
+@pytest.mark.parametrize(
+    "output_mode",
+    ["direct", "route-f32", "weighted-direct"],
+    ids=["direct-bf16", "route-f32", "weighted-direct-bf16"],
+)
+def test_avx512_small_m_multi_n_matches_exact_m_baseline(
+    monkeypatch: pytest.MonkeyPatch,
+    routes: int,
+    output_mode: str,
+) -> None:
+    """M1--4 multi-F16/N64/N128 kernels must retain every W2 output contract and block tail."""
+    inputs, w13, w2, topk_weights, topk_ids = _case(
+        tokens=routes,
+        hidden=129,
+        intermediate=81,
+        experts=1,
+        top_k=1,
+        seed=700 + routes,
+    )
+    topk_weights = torch.linspace(0.25, 0.75, routes, dtype=torch.float32).view(routes, 1)
+    packed = prepare_fused_moe_bf16_tiled_weights(w13, w2, fuse_silu=True, backend="x86_avx512_bf16")
+    skip_weighted = output_mode == "direct"
+    monkeypatch.setenv("FUSED_CPP_MOE_AVX512_IMPL", "jit")
+    monkeypatch.setenv(
+        "FUSED_CPP_MOE_X86_WEIGHTED_TOP1_DIRECT",
+        "1" if output_mode == "weighted-direct" else "0",
+    )
+
+    monkeypatch.setenv("FUSED_CPP_MOE_AVX512_SMALL_M_MULTI_N", "baseline")
+    baseline = fused_moe_bf16_tiled(
+        inputs,
+        packed,
+        topk_weights,
+        topk_ids,
+        num_threads=1,
+        skip_weighted=skip_weighted,
+    )
+    monkeypatch.setenv("FUSED_CPP_MOE_AVX512_SMALL_M_MULTI_N", "multi_n")
+    multi_n = fused_moe_bf16_tiled(
+        inputs,
+        packed,
+        topk_weights,
+        topk_ids,
+        num_threads=1,
+        skip_weighted=skip_weighted,
+    )
+    reference_weights = torch.ones_like(topk_weights) if skip_weighted else topk_weights
+    expected = fused_moe_naive(inputs, w13, w2, reference_weights, topk_ids)
+
+    _assert_bf16_close(multi_n, baseline)
+    _assert_bf16_close(multi_n, expected)
+
+
+@pytest.mark.parametrize("routes", [1, 4], ids=["m1", "m4"])
+@pytest.mark.parametrize("stage", ["w13", "w2"])
+def test_avx512_small_m_multi_n_stage_controls(
+    monkeypatch: pytest.MonkeyPatch,
+    routes: int,
+    stage: str,
+) -> None:
+    """The W13-only and W2-only controls must isolate either multi-N stage without changing output."""
+    inputs, w13, w2, topk_weights, topk_ids = _case(
+        tokens=routes,
+        hidden=256,
+        intermediate=64,
+        experts=1,
+        top_k=1,
+        seed=720 + routes,
+    )
+    packed = prepare_fused_moe_bf16_tiled_weights(w13, w2, fuse_silu=True, backend="x86_avx512_bf16")
+    monkeypatch.setenv("FUSED_CPP_MOE_AVX512_IMPL", "jit")
+
+    monkeypatch.setenv("FUSED_CPP_MOE_AVX512_SMALL_M_MULTI_N", "baseline")
+    baseline = fused_moe_bf16_tiled(
+        inputs,
+        packed,
+        topk_weights,
+        topk_ids,
+        num_threads=1,
+        skip_weighted=True,
+    )
+    monkeypatch.setenv("FUSED_CPP_MOE_AVX512_SMALL_M_MULTI_N", stage)
+    stage_output = fused_moe_bf16_tiled(
+        inputs,
+        packed,
+        topk_weights,
+        topk_ids,
+        num_threads=1,
+        skip_weighted=True,
+    )
+
+    _assert_bf16_close(stage_output, baseline)
+
+
+def test_avx512_small_m_multi_n_preserves_cache_windows_and_n_split(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A cooperative M4 call must preserve odd cache windows while N ranges use multi-N kernels."""
+    inputs, w13, w2, topk_weights, topk_ids = _case(
+        tokens=4,
+        hidden=1025,
+        intermediate=257,
+        experts=1,
+        top_k=1,
+        seed=711,
+    )
+    packed = prepare_fused_moe_bf16_tiled_weights(w13, w2, fuse_silu=True, backend="x86_avx512_bf16")
+    monkeypatch.setenv("FUSED_CPP_MOE_AVX512_IMPL", "jit")
+    monkeypatch.setenv("FUSED_CPP_MOE_X86_W13_CACHE_BLOCKS", "3")
+    monkeypatch.setenv("FUSED_CPP_MOE_X86_W2_CACHE_BLOCKS", "3")
+
+    monkeypatch.setenv("FUSED_CPP_MOE_AVX512_SMALL_M_MULTI_N", "baseline")
+    baseline = fused_moe_bf16_tiled(
+        inputs,
+        packed,
+        topk_weights,
+        topk_ids,
+        num_threads=4,
+        skip_weighted=True,
+    )
+    monkeypatch.setenv("FUSED_CPP_MOE_AVX512_SMALL_M_MULTI_N", "multi_n")
+    multi_n = fused_moe_bf16_tiled(
+        inputs,
+        packed,
+        topk_weights,
+        topk_ids,
+        num_threads=4,
+        skip_weighted=True,
+    )
+
+    _assert_bf16_close(multi_n, baseline)
+
+
+def test_avx512_rejects_unknown_small_m_multi_n_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    inputs, w13, w2, topk_weights, topk_ids = _case(
+        tokens=1,
+        hidden=32,
+        intermediate=16,
+        experts=1,
+        top_k=1,
+        seed=712,
+    )
+    packed = prepare_fused_moe_bf16_tiled_weights(w13, w2, fuse_silu=True, backend="x86_avx512_bf16")
+    monkeypatch.setenv("FUSED_CPP_MOE_AVX512_IMPL", "jit")
+    monkeypatch.setenv("FUSED_CPP_MOE_AVX512_SMALL_M_MULTI_N", "unknown")
+
+    with pytest.raises(RuntimeError, match="must be auto, baseline, w13, w2, or multi_n"):
+        fused_moe_bf16_tiled(inputs, packed, topk_weights, topk_ids, num_threads=1)
+
+
 def test_avx512_rejects_unknown_implementation_mode(monkeypatch: pytest.MonkeyPatch) -> None:
     inputs, w13, w2, topk_weights, topk_ids = _case(
         tokens=1,
@@ -596,6 +745,8 @@ def test_dimension_aware_policy_profile_and_boundaries(monkeypatch: pytest.Monke
     assert tiny["experts"][0] == {
         "rows": 1,
         "amx_pattern": "m2n2",
+        "avx512_w13_small_m_multi_n": False,
+        "avx512_w2_small_m_multi_n": False,
         "w13_cache_blocks": 0,
         "w2_cache_blocks": 0,
     }
@@ -628,6 +779,83 @@ def test_dimension_aware_policy_profile_and_boundaries(monkeypatch: pytest.Monke
     assert wide_f_96["nsplit_target_rows"] == 16
     assert wide_f_96["experts"][0]["amx_pattern"] == "m2n2"
     assert wide_f_128["experts"][0]["amx_pattern"] == "m1n4"
+
+
+@requires_amx
+@pytest.mark.parametrize(
+    ("hidden", "intermediate", "expected"),
+    [
+        (4096, 32, [(True, False), (True, False), (True, False), (False, False)]),
+        (4096, 64, [(True, False)] * 4),
+        (128, 1024, [(True, False), (False, False), (True, False), (False, False)]),
+        (256, 512, [(True, False), (True, False), (True, False), (False, False)]),
+        (1024, 256, [(True, True), (True, True), (True, False), (True, False)]),
+        (4096, 512, [(True, True), (True, True), (True, True), (True, False)]),
+        (4096, 2048, [(True, True)] * 4),
+    ],
+)
+def test_avx512_small_m_multi_n_dimension_policy(
+    monkeypatch: pytest.MonkeyPatch,
+    hidden: int,
+    intermediate: int,
+    expected: list[tuple[bool, bool]],
+) -> None:
+    """The calibrated C8i policy enables each stage only where its isolated kernel won."""
+    from fused_cpp import _moe_C
+
+    monkeypatch.setenv("FUSED_CPP_MOE_X86_POLICY_PROFILE", "c8i")
+    result = _moe_C.fused_moe_test_x86_policy(hidden, intermediate, [1, 2, 3, 4], 1)
+    actual = [
+        (
+            expert["avx512_w13_small_m_multi_n"],
+            expert["avx512_w2_small_m_multi_n"],
+        )
+        for expert in result["experts"]
+    ]
+    assert actual == expected
+
+    monkeypatch.setenv("FUSED_CPP_MOE_X86_POLICY_PROFILE", "generic_v1")
+    generic = _moe_C.fused_moe_test_x86_policy(hidden, intermediate, [1, 2, 3, 4], 1)
+    assert all(
+        not expert["avx512_w13_small_m_multi_n"] and not expert["avx512_w2_small_m_multi_n"]
+        for expert in generic["experts"]
+    )
+
+
+@requires_amx
+@pytest.mark.parametrize(
+    ("hidden", "intermediate", "threads", "expected"),
+    [
+        (4096, 512, 2, [(True, True), (True, True), (True, False), (True, False)]),
+        (4096, 512, 4, [(True, False), (True, False), (True, False), (False, False)]),
+        (4096, 512, 8, [(False, False)] * 4),
+        (4096, 2048, 2, [(True, True)] * 4),
+        (4096, 2048, 4, [(True, True), (True, True), (True, True), (True, False)]),
+        (4096, 2048, 8, [(False, False)] * 4),
+    ],
+)
+def test_avx512_small_m_multi_n_cooperative_width_policy(
+    monkeypatch: pytest.MonkeyPatch,
+    hidden: int,
+    intermediate: int,
+    threads: int,
+    expected: list[tuple[bool, bool]],
+) -> None:
+    """Cooperative N-split widths avoid multi-core regimes that regressed in calibration."""
+    from fused_cpp import _moe_C
+
+    monkeypatch.setenv("FUSED_CPP_MOE_X86_POLICY_PROFILE", "c8i")
+    actual: list[tuple[bool, bool]] = []
+    for rows in range(1, 5):
+        result = _moe_C.fused_moe_test_x86_policy(hidden, intermediate, [rows], threads)
+        expert = result["experts"][0]
+        actual.append(
+            (
+                expert["avx512_w13_small_m_multi_n"],
+                expert["avx512_w2_small_m_multi_n"],
+            )
+        )
+    assert actual == expected
 
 
 @requires_amx

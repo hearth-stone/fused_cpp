@@ -56,6 +56,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             intermediate_size > std::numeric_limits<int>::max() - 31 || max_routes > std::numeric_limits<int>::max()) {
           throw std::invalid_argument("test x86 policy dimensions must fit int32");
         }
+        if (requested_threads > std::numeric_limits<int>::max()) {
+          throw std::invalid_argument("test x86 policy thread count must fit int32");
+        }
         x86_policy::X86PolicyInput input;
         input.hidden_size = hidden_size;
         input.intermediate_size = intermediate_size;
@@ -84,6 +87,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::dict expert;
           expert["rows"] = rows;
           expert["amx_pattern"] = x86_policy::AmxKernelPatternName(pattern);
+          expert["avx512_w13_small_m_multi_n"] = x86_policy::UseAutomaticAvx512SmallMMultiN(
+              x86_policy::Avx512SmallMMultiNStage::kW13, static_cast<int>(rows), h_pad, f_pad,
+              static_cast<int>(requested_threads));
+          expert["avx512_w2_small_m_multi_n"] = x86_policy::UseAutomaticAvx512SmallMMultiN(
+              x86_policy::Avx512SmallMMultiNStage::kW2, static_cast<int>(rows), f_pad, static_cast<int>(hidden_size),
+              static_cast<int>(requested_threads));
           expert["w13_cache_blocks"] = x86_policy::ResolveAutomaticAmxCacheBlocks(
               x86_policy::AmxCacheStage::kW13, h_pad, static_cast<int>(rows), static_cast<int>(hidden_size),
               static_cast<int>(intermediate_size), pattern);
