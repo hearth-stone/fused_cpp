@@ -20,8 +20,9 @@ remain the correctness and runtime fallback.
 - dense BF16 `w13=[E, 2F, H]` and `w2=[E, H, F]` weights;
 - `activation="silu"`, `fuse_silu=True`, polynomial degree 4, 5, or 6;
 - arbitrary positive H/F through zero padding;
-- one or two worker threads, top-k routing, weighted merge, output buffers,
-  and top-1 `skip_weighted` direct BF16 output;
+- 1--256 requested worker threads, automatic expert-parallel/team-N dispatch,
+  top-k routing, weighted merge, output buffers, and top-1 `skip_weighted`
+  direct BF16 output;
 - no expert bias and no scheduled, async, or vLLM-staged x86 executor yet.
 
 Backend ID 101 and N tile 32 are stored in the prepared-weight metadata.
@@ -40,8 +41,10 @@ unit contains two adjacent BF16 values consumed by one `VDPBF16PS`:
 - gathered input is grouped into logical M12 panels stored in 16-lane
   VNNI2 packed-A blocks;
 - the W13 epilogue writes `SiLU(gate) * up` directly in W2's packed-A layout;
-- W2 writes FP32 directly to flat route rows, then an AVX-512 merge produces
-  BF16 token output. Top-1 skip-weighted execution writes BF16 directly.
+- W2 normally writes FP32 to flat route rows, then an AVX-512 merge produces
+  BF16 token output. Experimental AMX epilogues can combine M1N4 stores or
+  write expert-contiguous rows directly from TMM and use a mapped merge.
+  Top-1 skip-weighted execution always keeps its direct BF16 conversion/store.
 
 Every full 12-row panel dispatches to an exact-M12 register kernel, so M=48
 executes four M12 panels. A final 1-11 row panel dispatches to its own exact-M
@@ -76,9 +79,37 @@ pattern selection described below. Both generated implementations target the
 System V x86-64 ABI; Windows builds retain the AVX-512 intrinsic path and do
 not expose AMX.
 
-Two-thread builds reuse the extension's OpenMP team and fall back to standard
-threads when OpenMP is unavailable, nested, or unable to provide the requested
-team size. The caller participates as thread zero in the fallback path.
+## Threading and cooperative N-split dispatch
+
+The x86 executor follows the SVE executor's ownership rule: a worker owns a
+disjoint N-block range, so no W13 intermediate or W2 output block needs an
+atomic update. It supports 1--256 requested workers and selects one of three
+runtime mappings without an environment-variable policy:
+
+- when the active-expert count is at least the worker count and routes are not
+  strongly skewed, a global atomic queue preserves one-worker-per-expert
+  parallelism;
+- when there are fewer active experts than workers, workers form per-expert
+  teams. Extra workers are assigned greedily to the largest current
+  `routes/team_width` value;
+- when the largest route is at least 64 rows and at least twice the
+  second-largest route, experts are sorted into waves. A hot expert can occupy
+  a wider team before colder experts run in later waves, avoiding a long tail.
+
+Within a team, AVX-512 gather is split by M12 panel and AMX gather by logical
+row. A cancellable barrier precedes the W13 phase, W13 F16 blocks are divided
+evenly over the team, a second barrier publishes the complete intermediate,
+and W2 N32 blocks are divided the same way. Weighted merge is finally split by
+token. Scratch is shared inside a team and right-sized per reusable wave slot.
+
+The extension uses an OpenMP team when the runtime supplies the exact requested
+width. It falls back to standard threads when OpenMP is unavailable, nested,
+or returns a smaller team; the caller participates as worker zero. The
+requested width should therefore match the pinned physical cores even though
+the API accepts up to 256.
+
+Correctness and 8-core Amazon C8i measurements are recorded in
+[`results/amazon_c8i_8core_nsplit_20260722.md`](results/amazon_c8i_8core_nsplit_20260722.md).
 
 ## Build, test, and benchmark
 
@@ -167,7 +198,8 @@ processes to compare generated and fallback kernels without routing or W2.
 
 The prioritized AMX optimization backlog, acceptance checks, and rejected or
 deferred design space are tracked in [`TODO.md`](TODO.md). The current active
-item is the W13 vector SiLU epilogue that follows `TILESTORED`.
+item is scratch/workspace lifecycle cleanup after the completed W13 and W2
+epilogue experiments.
 
 `auto` selects the reserved backend ID 102 (`x86_amx_bf16`) before backend ID
 101 (`x86_avx512_bf16`) when AMX is available. AMX requires Linux, Xbyak,
@@ -190,8 +222,11 @@ W13 uses two FP32 accumulator tiles for gate and up, with double-buffered A/B
 occupying all eight TMM registers. Since ZMM cannot read TMM state directly,
 both accumulators are `TILESTORED` to a 2 KiB stack scratch before the existing
 ZMM polynomial SiLU-times-up epilogue writes row-major BF16. W2 uses one or two
-accumulator tiles according to N and stores through the same scratch before
-route-aware FP32 or BF16 output.
+accumulator tiles according to N. Its default route-aware path stores through a
+2 KiB scratch before FP32 or BF16 output; the M1N4 `combined` experiment uses a
+4 KiB scratch to store four accumulators and generates each route address once.
+The `tile_store` experiment instead writes FP32 accumulators directly to an
+expert-contiguous route workspace and translates flat routes during merge.
 
 The W13 vector epilogue keeps its polynomial and exponent constants resident
 in ZMM registers by default. `FUSED_CPP_MOE_AMX_SILU_EPILOGUE` is a validation
@@ -209,6 +244,43 @@ and improved a K=256 W13 microkernel by 8.4%; H=4096 full-expert latency was
 neutral to 1.7% faster across the measured cases. Methodology and all retained
 negative/approximate alternatives are recorded in
 [`results/amazon_c8i_2core_amx_silu_20260720.md`](results/amazon_c8i_2core_amx_silu_20260720.md).
+
+`FUSED_CPP_MOE_AMX_W2_EPILOGUE` selects the W2 store/merge experiment:
+
+- unset, empty, `auto`, or `baseline` uses the stable route-aware scratch-to-ZMM
+  store and flat-route merge;
+- `combined` keeps flat-route layout but, for M1N4/N64, stores all four TMM
+  accumulators before a single address calculation per row;
+- `tile_store` uses direct `TILESTORED` into expert-contiguous FP32 rows and a
+  precomputed route-row map in the AVX-512 weighted merge.
+
+The modes are separate JIT cache keys and are BF16 bit-exact. `tile_store`
+falls back to the converting vector epilogue for top-k=1 direct BF16 output.
+On C8i, K=512 isolated W2 improved by 1.0-14.5%, but a K=32
+store-dominated sweep showed that direct wide-stride `TILESTORED` was
+12.8-22.8% slower; `combined` instead improved effective output bandwidth by
+up to 17.8%. Mapped-merge and end-to-end effects were also shape dependent:
+the measured full-expert range was +1.7% to -4.5%. Consequently `baseline`
+remains automatic until the runtime policy can use M/H/F and routing shape. See
+[`results/amazon_c8i_2core_amx_w2_epilogue_20260720.md`](results/amazon_c8i_2core_amx_w2_epilogue_20260720.md).
+
+`FUSED_CPP_MOE_AMX_TILE_STATE` controls the lifetime of each generated AMX
+tile configuration:
+
+- unset, empty, `auto`, or `per_call` keeps the stable one-M-unit-per-JIT-call
+  implementation;
+- `macro_m` moves the loop over adjacent full M units into the generated W13
+  and W2 body. One cache window then shares `LDTILECFG`, the callee-save/frame
+  prologue, resident W13 SiLU constants, W2 masks, and `TILERELEASE` across all
+  of its full M units;
+- an exact M tail always uses the established `per_call` specialization, so no
+  padding or masked rows are introduced.
+
+The two lifetimes use separate JIT cache keys. `macro_m` preserves the current
+N-window loop order: packed B and the N-block count reset at each M unit, while
+the gathered-A, W13-intermediate, route-id, or expert-contiguous-output pointer
+advances by the pattern's 16- or 32-row M unit. It is experimental until the
+C8i shape/thread sweep justifies changing `auto`.
 
 The default policy resolves a tile-register schedule independently for each
 expert's routed row count:
@@ -260,6 +332,14 @@ sweep through M=2048 and balanced/skewed/hot routing results are in
 Pass `--patterns auto --silu-epilogues baseline,resident,pipelined,rcp14` to
 use the same rotation method for W13 epilogue A/B testing. The standalone W13
 binary accepts the same comma-separated epilogue list as its seventh argument.
+For W2, pass `--patterns auto --w2-epilogues baseline,combined,tile_store`.
+For tile-state lifetime, pass
+`--patterns auto --tile-states per_call,macro_m`; the benchmark rotates the two
+paths in one process after correctness and JIT warm-up, and reports median,
+p90, p99, mean, standard deviation, and best latency.
+`benchmarks/bench_amx_bf16_w2_epilogues.cpp` rotates the three store kernels
+without W13/routing, while `benchmarks/bench_amx_bf16_merge.cpp` separately
+compares flat-route and mapped expert-contiguous weighted merge.
 
 ## Automatic N-window cache blocking
 

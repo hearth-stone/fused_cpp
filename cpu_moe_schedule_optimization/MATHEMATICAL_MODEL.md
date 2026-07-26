@@ -653,11 +653,12 @@ One-hot 是线程宽度的等价求解器编码，不是剪枝。一般 active-s
 | 并发配置 | 活跃 job 可形成任意满足 CPU 容量的 $(M_i,t_i)$ 组合 | 整次调用使用静态 core shape | static-partition 剪枝 |
 | Shape 集合 | 所有满足 CPU 容量的整数宽度组合 | profile 支持并经 active 工作集规则筛选的 shape；owner-cache band 当前仅 shadow | 候选剪枝 |
 | Assignment | 任意 expert-to-resource 调度 | 按 isolated cost 的 LPT | 启发式分配 |
+| x86 synchronous executor team mapping | expert 可取任意合法整数宽度并形成任意 wave | API 接受 1--256 workers；均衡 route 用 atomic expert queue，active expert 不足时按 route/当前宽度贪心组 team，强偏斜时按 64-row target 形成有序 wave | planner 外的确定性 runtime mapper |
 | Ordering | 任意可行开始时间和顺序 | 每个 lane 的 LPT 顺序 | 顺序剪枝 |
 | Idling | 允许主动等待以避开争用 | lane 可启动下一个 expert 时立即启动；ready-token 路径仅填充无可运行 expert 的空闲 lane | non-idling 剪枝 |
 | Workload 输入 | 任意合法 global 或 rank-local route histogram | planner 接受任意 histogram；catalog preset 只扩展验证覆盖，不过滤运行时输入 | 不剪枝 |
 | Route combine | 任意满足 TopK release 约束和 CPU 容量的 merge 排程 | planner 不搜索 combine；默认 executor 采用 expert-first 单 token 贪心和连续收尾 | 外层启发式限制 |
-| Kernel variant | 任意未被支配的实现 | ARM `auto` 先要求完整 `jit/xbyak_exact_m` legacy split/no-split pair，再加入同 identity 的实测 global packed-B byte-window variants；缺少完整 JIT legacy pair 时整体回退 static pair；x86 AMX 使用不进入 planner 的确定性 per-expert pattern/cache policy | 实例候选限制与 runtime policy |
+| Kernel variant | 任意未被支配的实现 | ARM `auto` 先要求完整 `jit/xbyak_exact_m` legacy split/no-split pair，再加入同 identity 的实测 global packed-B byte-window variants；缺少完整 JIT legacy pair 时整体回退 static pair；x86 AMX 使用不进入 planner 的确定性 per-expert pattern/cache policy，AVX-512/AMX 共用确定性 team-N/wave policy | 实例候选限制与 runtime policy |
 | Isolated time | 真实 $I_i(t)$ | active $T_{\mathrm{iso}}$ 经验公式；分层 GEMM model 仅 shadow | cost 近似，不剪枝可行域 |
 | Contention | 任意动态活跃配置上的真实 $D_i(\mathcal Z)$ | 实测 contention profile 与 stage-aware event simulator | cost 近似，不剪枝可行域 |
 
@@ -1057,7 +1058,7 @@ $r_{13}$ 个 range 和 W2 的 $r_2$ 个 range 分别推进，不能把 windowed 
 单个 M12 panel 不复用 B，额外 range 通常只有 dispatch 和 lane-width 代价，
 不能仅按 cache 容量规则强制细分。
 
-### 8.4 x86 AMX per-expert pattern 与 cache policy
+### 8.4 x86 per-expert pattern/cache 与 team-N/wave policy
 
 x86 AMX backend 不把 pattern/cache choice 加入 CPU MoE planner。设 expert $i$ 的
 route 数为 $M_i$，当前 Amazon C8i 校准策略为：
@@ -1089,10 +1090,59 @@ $$
 N block。H=4096、F=512 时得到 W13=4、W2=16。零值 override 明确恢复不分窗
 loop order，正整数 override 强制 block 数；AVX-512 的默认值仍为零。
 
+AVX-512 与 AMX executor 还共享一个不进入 planner 的确定性 team-N mapper。令
+$T\in[1,256]$ 为请求 worker 数，$A$ 为 active expert 数，按 route 数降序记为
+$M_{(1)}\ge M_{(2)}\ge\cdots$。W13/W2 可独立拥有的 N 单元数为：
+
+$$
+q_{13}=\frac{\operatorname{round\_up}(F,16)}{16},\qquad
+q_2=\frac{\operatorname{round\_up}(H,32)}{32},\qquad
+q=\max(q_{13},q_2).
+$$
+
+一个包含 $t_i$ 个 worker 的 expert team 最多取 $t_i\le q$；第 $\ell$ 个 worker
+对任一 stage 的 $q_s$ 个 block 拥有区间：
+
+$$
+b_{s,\ell}=\ell\left\lfloor\frac{q_s}{t_i}\right\rfloor
+ +\min(\ell,q_s\bmod t_i),\qquad
+e_{s,\ell}=b_{s,\ell}+\left\lfloor\frac{q_s}{t_i}\right\rfloor
+ +\mathbf 1[\ell<q_s\bmod t_i].
+$$
+
+这些区间两两不交并覆盖 $[0,q_s)$。team 内先并行 gather（AVX-512 按 M12
+panel，AMX 按 logical row），barrier 后计算 W13 区间，再经第二个 barrier 计算
+W2 区间。故 W13 intermediate 和 W2 output 都是 single-writer，最终 token merge
+仍保持原来的 TopK 顺序。
+
+对一个 wave 中的 expert 集合，先令所有 $t_i=1$。在
+$\sum_i t_i<T$ 且仍有 $t_i<q$ 时，重复选择：
+
+$$
+i^*=\arg\max_i\frac{M_i}{t_i},\qquad t_{i^*}\leftarrow t_{i^*}+1.
+$$
+
+runtime mapping 的分支顺序为：
+
+1. 若 $M_{(2)}>0$、$M_{(1)}\ge64$ 且
+   $M_{(1)}\ge2M_{(2)}$，按 $M_i$ 降序生成 waves。当前 wave 的最大 route 为
+   $M_{\max,w}$、剩余 expert 数为 $R_w$ 时，放入的 expert 数为
+   $a_w=\min(R_w,\max(1,\min(T,\lfloor64T/M_{\max,w}\rfloor)))$，再按上式
+   分配 team width；
+2. 否则若 $A<T$，所有 active experts 放入同一个 cooperative wave，再按上式
+   分配剩余 workers；
+3. 否则保留 atomic expert queue，每个被领取的 expert 使用一个 worker。
+
+64-row 与 2x skew 门槛是 Amazon C8i 的 executor heuristic，不是体系结构常数。
+team scratch 按同一 slot 跨 waves 的最大 $M_i$ 分配；merge worker 数取
+$\min(T,\text{tokens})$。这一 mapper 改变实际 $I_i(t)$ 和 active configuration
+$\mathcal Z$，但不扩大 `IntervalPlanner` 的 width/shape/ordering candidate set。
+
 该 policy 只改变 $I_i$/$D_i$ 的 runtime 实现响应，不改变现有 planner 的 shape、
 assignment 或 ordering 候选。M=76 阈值和 1 MiB/512 KiB budget 目前只在 Amazon
-C8i、H=4096/F=512 上做过性能校准；跨 CPU 或显著不同 model dimension 时必须
-重新做 held-out route/thread 验证，不能把该阈值解释为体系结构常数。
+C8i、H=4096/F=512 上做过性能校准；team/wave 门槛只在 8-core C8i 上验证。
+跨 CPU 或显著不同 model dimension 时必须重新做 held-out route/thread 验证，
+不能把这些阈值解释为体系结构常数。
 
 ## 9. 剪枝验证
 
@@ -1380,6 +1430,7 @@ $\eta_{\mathrm{issue}}$ 基本相同；odd M 的差异由
 $\eta_{\mathrm{lane}}$ 单独表达。40.04 GB/s ceiling 只作为后续解析模型的
 机器校准常数；本轮不修改 active planner、$I_i(t)$、$D_i(\mathcal Z)$、
 contention table 或 production 剪枝。
+
 ### 9.10 x86 AMX 自动子变体验证
 
 2026-07-20 在 2-core Amazon C8i（Intel Xeon 6975P-C）上验证 8.4 的确定性
@@ -1401,6 +1452,48 @@ kill-switch 回退 AVX-512。完整命令、样本和热状态限制见
 该验证只校准 x86 runtime 的确定性响应 mapper，不改变 CPU MoE planner 的决策
 变量或 candidate space，因此本次不修改 planner/cost-model 公式测试。跨 CPU 或
 显著不同 H/F 的 policy 仍需单独 held-out 验证并更新 profile identity。
+
+### 9.11 x86 cooperative N-split 与 skew-wave 验证
+
+2026-07-22 在 8-core Amazon C8i（Intel Xeon 6975P-C，8 physical cores、1 thread
+per core）上验证 8.4 的 team-N mapper。固定 H=4096、F=512、BF16、top-k=1，
+使用 CPU `0-7`、`OMP_DYNAMIC=FALSE`、`OMP_PROC_BIND=close`、
+`OMP_PLACES=cores`、`OMP_WAIT_POLICY=PASSIVE`、8 次 warmup 和 31 次正式采样；
+权重 prepack/JIT warmup 不计入运行时间。AMX auto pattern 的 median 如下（ms）：
+
+| route histogram | 1T | 2T | 4T | 8T | 1T/8T speedup |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `[2048]` | 26.446 | 14.209 | 7.917 | 5.755 | 4.60x |
+| `[1536,256,256]` | 39.225 | 23.311 | 14.587 | 11.893 | 3.30x |
+
+同一进程配置下，PyTorch/oneDNN staged baseline 的 8T median 分别为 19.611 ms
+与 23.640 ms，因此 fused executor 分别快 3.41x 与 1.99x。M=256 单热 expert
+从 1T 3.574 ms 降到 8T 0.855 ms（4.18x）。AVX-512 BF16 单热 M=2048 也从
+262.063 ms 降到 39.461 ms（6.64x），证明 N ownership 对两种 x86 backend 都
+生效；但该 AVX-512 kernel 仍慢于同线程数 oneDNN，不能把 scaling 误写为绝对
+kernel 优势。
+
+另一个 12-warmup/51-sample 小 M sweep 中，单热 M=1/4/16/48/64 的 8T 相对 1T
+分别为 7.49x/2.76x/4.89x/3.69x/3.99x；在该 H/F 与机器上没有观察到需要按 M
+进一步压低 team width 的性能边界。
+
+为避免 cooperative barrier 在本来已有足够 expert parallelism 时造成回退，最终
+policy 不对均衡 route 强制 wave。E2 `[1024,1024]` 与 E8 `[256,...,256]` 的 8T
+median 分别为 9.183 ms 和 8.709 ms，仍走原 expert queue；对应 oneDNN 为
+21.747 ms 和 23.882 ms。仅在 2x/64-row 强偏斜门槛命中时才使用有序 waves。
+
+x86 correctness suite 为 163 passed；测试覆盖 AVX-512 和 AMX
+`m1n2/m2n2/m1n4`、1/2/4/8 threads、H/F/K/N tails、单 expert、active expert
+不足、均衡 8 expert、active expert 数等于线程数的强偏斜 wave，以及 worker
+异常时 barrier cancellation。1T 与 8T 输出要求 BF16 bit-exact，并同时对 naive
+reference 做容差比较。完整命令和原始 median/best 数据见
+`optimizations/fused_moe_avx512/results/amazon_c8i_8core_nsplit_20260722.md`。
+
+本次变化是 synchronous x86 executor 的确定性 response mapper；没有修改
+planner candidate space、profile schema 或 cost-model 参数，所以不新增
+planner/cost-model 公式测试。若将该 team/wave mapper 提升为 planner 可选动作，
+必须先为不同 $t_i$/wave active set 重建 $I_i(t)$、$D_i(\mathcal Z)$ profile 并做
+held-out regret 验证。
 
 ## 10. 同步规则
 
@@ -1455,3 +1548,4 @@ kill-switch 回退 AVX-512。完整命令、样本和热状态限制见
 | 2026-07-23 | v0.25 | 增加 V3 单核 packed-B service ceiling 40.04 GB/s；区分 exact-M lane、useful-compute、physical-issue 和 memory efficiency，并记录冷权重 M1--M12 验证；不改变 active planner、contention table 或剪枝。 |
 | 2026-07-26 | v0.26 | 将全局 packed-B byte-window 接入 schema-v2 与 production planner：variant identity 包含目标字节和 W13/W2 实际 range 数，stage model 分别推进两段 range，联合搜索 `(window, core shape)` 并透传 runtime option；旧 profile 映射为 window=0，未提供新实测表时决策不变。 |
 | 2026-07-26 | v0.27 | 将 x86 BF16 auto backend 改为优先 AMX 并回退 AVX-512；增加按 expert route 数选择 m2n2/m1n4 的确定性 M=76 policy，以及按 K-padded byte budget 自动推导 1 MiB/512 KiB cache window；同步 per-expert variant 公式、剪枝表、C8i 正确性/性能验证和 policy 可迁移性边界。 |
+| 2026-07-26 | v0.28 | 将 SVE 的 team-N ownership 引入同步 x86 AVX-512/AMX executor：active expert 不足时按 route/width 贪心组 team，2x 且至少 64-row 的强偏斜 route 使用有序 waves，均衡 route 保留 expert queue；定义精确 N-range、team-width 与 wave 公式，记录 8-core C8i 1/2/4/8T 验证，并明确该 mapper 尚不进入 planner candidate space。 |

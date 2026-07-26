@@ -33,8 +33,11 @@ void PrepareJitKernels(const std::vector<int>& row_counts, int silu_poly_degree,
 
 // AMX consumes row-major M16 panels and the same K-pair/N32 packed weights as
 // AVX-512. K is padded to 32 BF16 elements by the AMX backend.
-void PrepareAmxJitKernels(const std::vector<int>& row_counts, int silu_poly_degree, int hidden_size,
-                          bool direct_bf16);
+void PrepareAmxJitKernels(const std::vector<int>& row_counts, int silu_poly_degree, int hidden_size, bool direct_bf16);
+
+// True when weighted AMX W2 output is stored in expert-contiguous row order
+// and the merge must translate flat route ids through a row map.
+bool AmxW2UsesContiguousRouteOutput();
 
 void ComputeW13Amx(const uint16_t* a, int a_stride, const uint16_t* packed_b, uint16_t* c, int c_stride, int rows,
                    int k_pad, int feature_block_begin, int feature_block_end, int silu_poly_degree);
@@ -53,5 +56,8 @@ JitStats GetJitStats();
 
 void MergeRoutes(const float* route_output, const float* weights, uint16_t* output, int64_t token_begin,
                  int64_t token_end, int64_t top_k, int64_t hidden_size);
+
+void MergeRoutesMapped(const float* route_output, const int64_t* route_rows, const float* weights, uint16_t* output,
+                       int64_t token_begin, int64_t token_end, int64_t top_k, int64_t hidden_size);
 
 }  // namespace fused_cpp::moe::x86::avx512_bf16

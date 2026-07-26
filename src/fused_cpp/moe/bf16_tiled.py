@@ -236,8 +236,10 @@ def fused_moe_bf16_tiled(
     ``FUSED_CPP_MOE_WEIGHT_WINDOW_BYTES``; zero disables byte-based windows.
     A supplied ``out`` must be a contiguous CPU BF16 tensor matching ``input``;
     the native kernel writes it directly and returns it without an intermediate
-    output allocation or copy. The AVX-512 BF16 backend currently supports the
-    fused SiLU path without expert bias using one or two worker threads.
+    output allocation or copy. The x86 BF16 backends support up to 256 requested
+    workers: balanced active experts run independently when there are enough
+    experts; underfilled or strongly skewed routes form per-expert teams/waves
+    and split W13/W2 over N blocks.
     """
     _require_backend()
     if input.dtype != torch.bfloat16:

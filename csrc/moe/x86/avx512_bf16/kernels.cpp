@@ -299,15 +299,22 @@ void ComputeW2Intrinsic(const uint16_t* a, int a_stride, const uint16_t* packed_
   }
 }
 
-void MergeRoutes(const float* route_output, const float* weights, uint16_t* output, int64_t token_begin,
-                 int64_t token_end, int64_t top_k, int64_t hidden_size) {
+namespace {
+
+template <bool kMapped>
+void MergeRoutesImpl(const float* route_output, const int64_t* route_rows, const float* weights, uint16_t* output,
+                     int64_t token_begin, int64_t token_end, int64_t top_k, int64_t hidden_size) {
   for (int64_t token = token_begin; token < token_end; ++token) {
     int64_t hidden = 0;
     for (; hidden + 16 <= hidden_size; hidden += 16) {
       __m512 sum = _mm512_setzero_ps();
       for (int64_t route = 0; route < top_k; ++route) {
         const int64_t flat = token * top_k + route;
-        const __m512 value = _mm512_loadu_ps(route_output + flat * hidden_size + hidden);
+        int64_t row = flat;
+        if constexpr (kMapped) {
+          row = route_rows[flat];
+        }
+        const __m512 value = _mm512_loadu_ps(route_output + row * hidden_size + hidden);
         sum = _mm512_fmadd_ps(value, _mm512_set1_ps(weights[flat]), sum);
       }
       StoreBf16(sum, output + token * hidden_size + hidden);
@@ -317,12 +324,28 @@ void MergeRoutes(const float* route_output, const float* weights, uint16_t* outp
       __m512 sum = _mm512_setzero_ps();
       for (int64_t route = 0; route < top_k; ++route) {
         const int64_t flat = token * top_k + route;
-        const __m512 value = _mm512_maskz_loadu_ps(mask, route_output + flat * hidden_size + hidden);
+        int64_t row = flat;
+        if constexpr (kMapped) {
+          row = route_rows[flat];
+        }
+        const __m512 value = _mm512_maskz_loadu_ps(mask, route_output + row * hidden_size + hidden);
         sum = _mm512_fmadd_ps(value, _mm512_set1_ps(weights[flat]), sum);
       }
       StoreBf16(sum, output + token * hidden_size + hidden, mask);
     }
   }
+}
+
+}  // namespace
+
+void MergeRoutes(const float* route_output, const float* weights, uint16_t* output, int64_t token_begin,
+                 int64_t token_end, int64_t top_k, int64_t hidden_size) {
+  MergeRoutesImpl<false>(route_output, nullptr, weights, output, token_begin, token_end, top_k, hidden_size);
+}
+
+void MergeRoutesMapped(const float* route_output, const int64_t* route_rows, const float* weights, uint16_t* output,
+                       int64_t token_begin, int64_t token_end, int64_t top_k, int64_t hidden_size) {
+  MergeRoutesImpl<true>(route_output, route_rows, weights, output, token_begin, token_end, top_k, hidden_size);
 }
 
 }  // namespace fused_cpp::moe::x86::avx512_bf16

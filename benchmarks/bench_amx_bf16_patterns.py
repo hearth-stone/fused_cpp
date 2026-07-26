@@ -16,6 +16,8 @@ from fused_cpp.moe import prepare_fused_moe_bf16_tiled_weights
 
 _PATTERNS = ("auto", "m1n2", "m2n2", "m1n4")
 _SILU_EPILOGUES = ("auto", "baseline", "resident", "pipelined", "rcp14")
+_W2_EPILOGUES = ("auto", "baseline", "combined", "tile_store")
+_TILE_STATES = ("auto", "per_call", "macro_m")
 
 
 def _parse_patterns(raw: str) -> tuple[str, ...]:
@@ -44,7 +46,35 @@ def _parse_silu_epilogues(raw: str) -> tuple[str, ...]:
     return tuple(epilogues)
 
 
-def _select_variant(pattern: str, silu_epilogue: str) -> None:
+def _parse_w2_epilogues(raw: str) -> tuple[str, ...]:
+    epilogues: list[str] = []
+    for epilogue in raw.split(","):
+        if epilogue not in _W2_EPILOGUES:
+            raise argparse.ArgumentTypeError(
+                f"unknown AMX W2 epilogue {epilogue!r}; expected one of {_W2_EPILOGUES}",
+            )
+        if epilogue not in epilogues:
+            epilogues.append(epilogue)
+    if not epilogues:
+        raise argparse.ArgumentTypeError("at least one AMX W2 epilogue is required")
+    return tuple(epilogues)
+
+
+def _parse_tile_states(raw: str) -> tuple[str, ...]:
+    tile_states: list[str] = []
+    for tile_state in raw.split(","):
+        if tile_state not in _TILE_STATES:
+            raise argparse.ArgumentTypeError(
+                f"unknown AMX tile state {tile_state!r}; expected one of {_TILE_STATES}",
+            )
+        if tile_state not in tile_states:
+            tile_states.append(tile_state)
+    if not tile_states:
+        raise argparse.ArgumentTypeError("at least one AMX tile state is required")
+    return tuple(tile_states)
+
+
+def _select_variant(pattern: str, silu_epilogue: str, w2_epilogue: str, tile_state: str) -> None:
     if pattern == "auto":
         os.environ.pop("FUSED_CPP_MOE_AMX_PATTERN", None)
     else:
@@ -53,6 +83,14 @@ def _select_variant(pattern: str, silu_epilogue: str) -> None:
         os.environ.pop("FUSED_CPP_MOE_AMX_SILU_EPILOGUE", None)
     else:
         os.environ["FUSED_CPP_MOE_AMX_SILU_EPILOGUE"] = silu_epilogue
+    if w2_epilogue == "auto":
+        os.environ.pop("FUSED_CPP_MOE_AMX_W2_EPILOGUE", None)
+    else:
+        os.environ["FUSED_CPP_MOE_AMX_W2_EPILOGUE"] = w2_epilogue
+    if tile_state == "auto":
+        os.environ.pop("FUSED_CPP_MOE_AMX_TILE_STATE", None)
+    else:
+        os.environ["FUSED_CPP_MOE_AMX_TILE_STATE"] = tile_state
 
 
 def _routing(tokens: int, experts: int, top_k: int, mode: str) -> torch.Tensor:
@@ -75,17 +113,42 @@ def _median_and_best(samples: list[float]) -> tuple[float, float]:
     return statistics.median(samples), min(samples)
 
 
+def _percentile(samples: list[float], quantile: float) -> float:
+    ordered = sorted(samples)
+    position = (len(ordered) - 1) * quantile
+    lower = int(position)
+    upper = min(lower + 1, len(ordered) - 1)
+    fraction = position - lower
+    return ordered[lower] * (1.0 - fraction) + ordered[upper] * fraction
+
+
+def _latency_summary(samples: list[float]) -> dict[str, float]:
+    median_ms, best_ms = _median_and_best(samples)
+    return {
+        "median_ms": median_ms,
+        "best_ms": best_ms,
+        "p90_ms": _percentile(samples, 0.90),
+        "p99_ms": _percentile(samples, 0.99),
+        "mean_ms": statistics.mean(samples),
+        "stdev_ms": statistics.stdev(samples) if len(samples) > 1 else 0.0,
+    }
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Compare AMX fused-expert JIT tile patterns and SiLU epilogues.")
+    parser = argparse.ArgumentParser(
+        description="Compare AMX fused-expert JIT tile patterns, epilogues, and tile-state lifetimes.",
+    )
     parser.add_argument("--tokens", type=int, default=32)
     parser.add_argument("--hidden", type=int, default=4096)
     parser.add_argument("--intermediate", type=int, default=512)
     parser.add_argument("--experts", type=int, default=1)
     parser.add_argument("--top-k", type=int, default=1)
     parser.add_argument("--routing", choices=("balanced", "hot", "skewed"), default="hot")
-    parser.add_argument("--threads", type=int, choices=(1, 2), default=1)
+    parser.add_argument("--threads", type=int, choices=(1, 2, 4, 8), default=1)
     parser.add_argument("--patterns", type=_parse_patterns, default=_PATTERNS)
     parser.add_argument("--silu-epilogues", type=_parse_silu_epilogues, default=("auto",))
+    parser.add_argument("--w2-epilogues", type=_parse_w2_epilogues, default=("auto",))
+    parser.add_argument("--tile-states", type=_parse_tile_states, default=("auto",))
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--runs", type=int, default=21)
     parser.add_argument("--baseline-runs", type=int, default=0)
@@ -130,17 +193,29 @@ def main() -> None:
     torch.set_num_threads(args.threads)
     reference = fused_moe_naive(inputs, w13, w2, topk_weights, topk_ids)
     torch.set_num_threads(1)
-    variants = tuple((pattern, epilogue) for pattern in args.patterns for epilogue in args.silu_epilogues)
+    variants = tuple(
+        (pattern, silu_epilogue, w2_epilogue, tile_state)
+        for pattern in args.patterns
+        for silu_epilogue in args.silu_epilogues
+        for w2_epilogue in args.w2_epilogues
+        for tile_state in args.tile_states
+    )
     labels = {
-        variant: variant[0] if args.silu_epilogues == ("auto",) else f"{variant[0]}:{variant[1]}"
+        variant: (
+            variant[0]
+            if args.silu_epilogues == ("auto",)
+            and args.w2_epilogues == ("auto",)
+            and args.tile_states == ("auto",)
+            else f"{variant[0]}:silu={variant[1]}:w2={variant[2]}:tile={variant[3]}"
+        )
         for variant in variants
     }
     max_abs: dict[str, float] = {}
     outputs: dict[str, torch.Tensor] = {}
-    for pattern, epilogue in variants:
-        _select_variant(pattern, epilogue)
+    for pattern, silu_epilogue, w2_epilogue, tile_state in variants:
+        _select_variant(pattern, silu_epilogue, w2_epilogue, tile_state)
         output = custom()
-        label = labels[(pattern, epilogue)]
+        label = labels[(pattern, silu_epilogue, w2_epilogue, tile_state)]
         outputs[label] = output
         max_abs[label] = float((output.float() - reference.float()).abs().max())
         for _ in range(args.warmup):
@@ -150,26 +225,31 @@ def main() -> None:
     for iteration in range(args.runs):
         offset = iteration % len(variants)
         order = variants[offset:] + variants[:offset]
-        for pattern, epilogue in order:
-            _select_variant(pattern, epilogue)
-            label = labels[(pattern, epilogue)]
+        for pattern, silu_epilogue, w2_epilogue, tile_state in order:
+            _select_variant(pattern, silu_epilogue, w2_epilogue, tile_state)
+            label = labels[(pattern, silu_epilogue, w2_epilogue, tile_state)]
             start = time.perf_counter_ns()
             custom()
             samples[label].append((time.perf_counter_ns() - start) / 1e6)
 
     routes = args.tokens * args.top_k
     flops = float(routes * 6 * args.hidden * args.intermediate)
+    reference_silu = "baseline" if "baseline" in args.silu_epilogues else args.silu_epilogues[0]
+    reference_w2 = "baseline" if "baseline" in args.w2_epilogues else args.w2_epilogues[0]
+    reference_tile_state = "per_call" if "per_call" in args.tile_states else args.tile_states[0]
     reference_label = next(
-        (labels[variant] for variant in variants if variant[1] == "baseline"),
-        labels[variants[0]],
+        labels[variant]
+        for variant in variants
+        if variant[1] == reference_silu and variant[2] == reference_w2 and variant[3] == reference_tile_state
     )
     pattern_results = {}
     for label in labels.values():
-        median_ms, best_ms = _median_and_best(samples[label])
+        latency = _latency_summary(samples[label])
+        median_ms = latency["median_ms"]
+        best_ms = latency["best_ms"]
         difference = (outputs[label].float() - outputs[reference_label].float()).abs()
         pattern_results[label] = {
-            "median_ms": median_ms,
-            "best_ms": best_ms,
+            **latency,
             "median_gflops": flops / median_ms / 1e6,
             "best_gflops": flops / best_ms / 1e6,
             "max_abs_vs_torch": max_abs[label],
@@ -187,10 +267,11 @@ def main() -> None:
             start = time.perf_counter_ns()
             fused_moe_naive(inputs, w13, w2, topk_weights, topk_ids)
             baseline_samples.append((time.perf_counter_ns() - start) / 1e6)
-        median_ms, best_ms = _median_and_best(baseline_samples)
+        latency = _latency_summary(baseline_samples)
+        median_ms = latency["median_ms"]
+        best_ms = latency["best_ms"]
         baseline = {
-            "median_ms": median_ms,
-            "best_ms": best_ms,
+            **latency,
             "median_gflops": flops / median_ms / 1e6,
             "best_gflops": flops / best_ms / 1e6,
         }
@@ -214,6 +295,8 @@ def main() -> None:
                 "runs_per_pattern": args.runs,
                 "prepack_ms": pack_ms,
                 "silu_epilogues": args.silu_epilogues,
+                "w2_epilogues": args.w2_epilogues,
+                "tile_states": args.tile_states,
                 "variant_reference": reference_label,
                 "patterns": pattern_results,
                 "torch_onednn_staged": baseline,

@@ -51,7 +51,7 @@ def main() -> None:
     parser.add_argument("--intermediate", type=int, default=512)
     parser.add_argument("--experts", type=int, default=8)
     parser.add_argument("--top-k", type=int, default=6)
-    parser.add_argument("--threads", type=int, choices=(1, 2), default=1)
+    parser.add_argument("--threads", type=int, default=1)
     parser.add_argument("--routing", choices=("balanced", "hot", "skewed"), default="balanced")
     parser.add_argument(
         "--backend",
@@ -68,6 +68,8 @@ def main() -> None:
     parser.add_argument("--baseline-runs", type=int, default=7)
     parser.add_argument("--skip-baseline", action="store_true")
     args = parser.parse_args()
+    if not 1 <= args.threads <= 256:
+        parser.error("--threads must be in [1, 256]")
 
     if args.backend in ("auto", "x86_amx_bf16"):
         if args.amx_pattern == "auto":

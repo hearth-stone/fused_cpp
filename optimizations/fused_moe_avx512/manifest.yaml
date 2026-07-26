@@ -192,6 +192,35 @@ features:
       --tokens 2048 --hidden 4096 --intermediate 512 --experts 1
       --top-k 1 --routing hot --threads 2
 
+  - id: schedule.amx_macro_m_tile_state
+    part: schedule
+    status: experimental
+    implementation: csrc/moe/x86/avx512_bf16/jit_kernels.cpp
+    hypothesis: >-
+      Moving adjacent full M16 or M32 units into one generated W13/W2 call
+      amortizes LDTILECFG, TILERELEASE, the callee-save frame, resident SiLU
+      constants, and W2 masks without changing the cache-window loop order.
+      Exact M tails remain isolated per-call specializations.
+    depends_on:
+      - compute.xbyak_amx_m16n32
+      - compute.xbyak_amx_1m4n
+      - compute.xbyak_amx_2m2n
+      - schedule.n_window_cache_blocking
+    conflicts_with: []
+    correctness: >-
+      FUSED_CPP_MOE_AMX_TILE_STATE=macro_m PYTHONPATH=src
+      .venv/bin/python -m pytest -q tests/test_moe_avx512_bf16.py
+      -k macro_m_tile_state
+    benchmark: >-
+      OMP_NUM_THREADS=8 OMP_DYNAMIC=FALSE OMP_PROC_BIND=close
+      OMP_PLACES=cores FUSED_CPP_MOE_W13_SPLIT_N=1 taskset -c 0-7
+      env PYTHONPATH=src .venv/bin/python
+      benchmarks/bench_amx_bf16_patterns.py --patterns auto
+      --silu-epilogues auto --w2-epilogues auto
+      --tile-states per_call,macro_m --tokens 2048 --hidden 4096
+      --intermediate 512 --experts 1 --top-k 1 --routing hot
+      --threads 8 --warmup 8 --runs 31
+
   - id: dispatch.amx_backend_pattern_cache_auto
     part: dispatch
     status: enabled
@@ -353,6 +382,71 @@ features:
       tests/bench_moe_avx512_bf16.py --tokens 12 --hidden 4096
       --intermediate 512 --experts 1 --top-k 1 --routing hot --threads 1
 
+  - id: store.amx_m1n4_combined
+    part: store
+    status: experimental
+    implementation: csrc/moe/x86/avx512_bf16/jit_kernels.cpp
+    hypothesis: >-
+      Storing all four M1N4 accumulators into a 4 KiB scratch before the row
+      loop computes each flat-route destination once for N64. It improved the
+      isolated M256 W2 kernel but regressed large-M end-to-end cases, so it is
+      retained as an explicit validation mode rather than automatic.
+    depends_on:
+      - compute.xbyak_amx_1m4n
+    conflicts_with:
+      - store.amx_expert_contiguous_tilestore
+    correctness: >-
+      PYTHONPATH=src .venv/bin/python -m pytest -q
+      tests/test_moe_avx512_bf16.py -k w2_store_merge_epilogues
+    benchmark: >-
+      OMP_NUM_THREADS=1 taskset -c 0
+      benchmarks/bench_amx_bf16_w2_epilogues
+      256 512 4096 15 81 baseline,combined,tile_store
+
+  - id: store.amx_expert_contiguous_tilestore
+    part: store
+    status: experimental
+    implementation: >-
+      csrc/moe/x86/avx512_bf16/jit_kernels.cpp and
+      csrc/moe/x86/avx512_bf16/executor.cpp
+    hypothesis: >-
+      Assigning each expert a contiguous FP32 route-row range lets W2 write TMM
+      accumulators directly with TILESTORED, removing the stack round trip and
+      row-wise ZMM stores. K=512 W2 improved, but K=32 exposed poor wide-stride
+      tile-store bandwidth and end-to-end behavior remained shape-dependent,
+      so baseline stays automatic.
+    depends_on:
+      - compute.xbyak_amx_m16n32
+    conflicts_with:
+      - store.amx_m1n4_combined
+    correctness: >-
+      PYTHONPATH=src .venv/bin/python -m pytest -q
+      tests/test_moe_avx512_bf16.py -k 'w2_store_merge_epilogues or w2_tile_store_keeps'
+    benchmark: >-
+      OMP_NUM_THREADS=1 taskset -c 0
+      benchmarks/bench_amx_bf16_w2_epilogues
+      16 512 4096 20 101 baseline,combined,tile_store
+
+  - id: merge.avx512_mapped_expert_rows
+    part: merge
+    status: experimental
+    implementation: >-
+      csrc/moe/x86/avx512_bf16/kernels.cpp and
+      csrc/moe/x86/avx512_bf16/executor.cpp
+    hypothesis: >-
+      A one-time flat-route-to-expert-row map preserves token/top-k reduction
+      order while allowing expert-contiguous W2 stores. The extra row lookup
+      is negligible at medium/large workspaces but measurable for small routes.
+    depends_on:
+      - store.amx_expert_contiguous_tilestore
+    conflicts_with: []
+    correctness: >-
+      PYTHONPATH=src .venv/bin/python -m pytest -q
+      tests/test_moe_avx512_bf16.py -k w2_store_merge_epilogues
+    benchmark: >-
+      OMP_NUM_THREADS=1 taskset -c 0
+      benchmarks/bench_amx_bf16_merge 256 4096 8 2 20 101
+
   - id: store.direct_route
     part: store
     status: experimental
@@ -396,28 +490,33 @@ features:
       tests/bench_moe_avx512_bf16.py --tokens 16 --hidden 4096
       --intermediate 512 --experts 8 --top-k 6 --routing balanced --threads 2
 
-  - id: dispatch.two_core_expert_or_nsplit
+  - id: dispatch.expert_team_nsplit_waves
     part: dispatch
-    status: experimental
+    status: enabled
     implementation: csrc/moe/x86/avx512_bf16/executor.cpp
     hypothesis: >-
-      A global expert queue balances multiple active experts across two cores,
-      while splitting W13 and W2 N blocks lets a single hot expert use both
-      cores without duplicating its gathered packed-A panel. Reusing an
-      OpenMP team avoids repeated operating-system thread creation for short
-      experts while retaining a standard-thread fallback.
+      A global expert queue is cheapest when balanced routes expose at least
+      one expert per worker. When active experts underfill the machine,
+      route-weighted teams can share gathered A and split disjoint W13 F16 and
+      W2 N32 ranges. For a route at least 64 rows and twice the next largest,
+      sorted waves give the hot expert a wider team and reduce the serial tail.
+      Cancellable phase barriers preserve dependency order and release peers
+      if one generated kernel fails.
     depends_on:
       - store.direct_route
     conflicts_with: []
     correctness: >-
       PYTHONPATH=src .venv/bin/python -m pytest -q
-      tests/test_moe_avx512_bf16.py
+      tests/test_moe_avx512_bf16.py -k
+      'expert_or_nsplit or cache_block or hot_multithread'
     benchmark: >-
-      ONEDNN_MAX_CPU_ISA=AVX512_CORE_BF16 OMP_NUM_THREADS=2
-      OMP_WAIT_POLICY=PASSIVE
-      taskset -c 0,1 env PYTHONPATH=src .venv/bin/python
-      tests/bench_moe_avx512_bf16.py --tokens 16 --hidden 4096
-      --intermediate 512 --experts 8 --top-k 6 --routing balanced --threads 2
+      OMP_NUM_THREADS=8 OMP_DYNAMIC=FALSE OMP_PROC_BIND=close
+      OMP_PLACES=cores OMP_WAIT_POLICY=PASSIVE
+      FUSED_CPP_MOE_W13_SPLIT_N=1 taskset -c 0-7 env PYTHONPATH=src
+      .venv/bin/python tests/bench_moe_avx512_bf16.py --backend
+      x86_amx_bf16 --tokens 2048 --hidden 4096 --intermediate 512
+      --experts 3 --top-k 1 --routing skewed --threads 8 --warmup 8
+      --runs 31 --baseline-runs 11
 
 variants:
   - id: pytorch_onednn_staged_avx512
@@ -460,7 +559,7 @@ variants:
       - store.direct_route
       - merge.avx512_weighted_reduce
       - dispatch.amx_backend_pattern_cache_auto
-      - dispatch.two_core_expert_or_nsplit
+      - dispatch.expert_team_nsplit_waves
     entrypoint: >-
       prepare_fused_moe_bf16_tiled_weights(fuse_silu=True, backend="auto")
       followed by fused_moe_bf16_tiled, with no AMX pattern or cache-policy
@@ -475,7 +574,7 @@ variants:
       - epilogue.silu_mul_packa
       - store.direct_route
       - merge.avx512_weighted_reduce
-      - dispatch.two_core_expert_or_nsplit
+      - dispatch.expert_team_nsplit_waves
     entrypoint: >-
       prepare_fused_moe_bf16_tiled_weights(fuse_silu=True,
       backend="x86_avx512_bf16") followed by fused_moe_bf16_tiled with
@@ -489,7 +588,7 @@ variants:
       - epilogue.silu_mul_packa
       - store.direct_route
       - merge.avx512_weighted_reduce
-      - dispatch.two_core_expert_or_nsplit
+      - dispatch.expert_team_nsplit_waves
     entrypoint: >-
       FUSED_CPP_MOE_AVX512_IMPL=intrinsic followed by the
       x86_avx512_bf16 fused_moe_bf16_tiled entrypoint
@@ -508,7 +607,7 @@ variants:
       - store.direct_route
       - merge.avx512_weighted_reduce
       - dispatch.amx_backend_pattern_cache_auto
-      - dispatch.two_core_expert_or_nsplit
+      - dispatch.expert_team_nsplit_waves
     entrypoint: >-
       prepare_fused_moe_bf16_tiled_weights(fuse_silu=True,
       backend="x86_amx_bf16") followed by fused_moe_bf16_tiled, with pattern
@@ -582,7 +681,7 @@ variants:
       - epilogue.amx_resident_silu_constants
       - store.direct_route
       - merge.avx512_weighted_reduce
-      - dispatch.two_core_expert_or_nsplit
+      - dispatch.expert_team_nsplit_waves
     entrypoint: >-
       FUSED_CPP_MOE_AMX_PATTERN=m1n4 followed by the
       x86_amx_bf16 fused_moe_bf16_tiled entrypoint
@@ -599,10 +698,29 @@ variants:
       - epilogue.amx_resident_silu_constants
       - store.direct_route
       - merge.avx512_weighted_reduce
-      - dispatch.two_core_expert_or_nsplit
+      - dispatch.expert_team_nsplit_waves
     entrypoint: >-
       FUSED_CPP_MOE_AMX_PATTERN=m2n2 followed by the
       x86_amx_bf16 fused_moe_bf16_tiled entrypoint
+    status: experimental
+
+  - id: amx_bf16_fused_expert_macro_m
+    features:
+      - layout.vnni2_packed_weights
+      - layout.amx_k32_row_major_a
+      - compute.xbyak_amx_m16n32
+      - compute.xbyak_amx_1m4n
+      - compute.xbyak_amx_2m2n
+      - schedule.n_window_cache_blocking
+      - schedule.amx_macro_m_tile_state
+      - epilogue.amx_tilestore_silu
+      - epilogue.amx_resident_silu_constants
+      - store.direct_route
+      - merge.avx512_weighted_reduce
+      - dispatch.expert_team_nsplit_waves
+    entrypoint: >-
+      FUSED_CPP_MOE_AMX_TILE_STATE=macro_m followed by the x86_amx_bf16
+      fused_moe_bf16_tiled entrypoint
     status: experimental
 
   - id: avx512_bf16_fused_expert_cache_blocked
@@ -614,7 +732,7 @@ variants:
       - epilogue.silu_mul_packa
       - store.direct_route
       - merge.avx512_weighted_reduce
-      - dispatch.two_core_expert_or_nsplit
+      - dispatch.expert_team_nsplit_waves
     entrypoint: >-
       Positive FUSED_CPP_MOE_X86_W13_CACHE_BLOCKS and
       FUSED_CPP_MOE_X86_W2_CACHE_BLOCKS followed by the x86_avx512_bf16
@@ -633,7 +751,7 @@ variants:
       - epilogue.amx_resident_silu_constants
       - store.direct_route
       - merge.avx512_weighted_reduce
-      - dispatch.two_core_expert_or_nsplit
+      - dispatch.expert_team_nsplit_waves
     entrypoint: >-
       Positive FUSED_CPP_MOE_X86_W13_CACHE_BLOCKS and
       FUSED_CPP_MOE_X86_W2_CACHE_BLOCKS followed by the x86_amx_bf16
@@ -651,7 +769,7 @@ variants:
       - epilogue.amx_resident_silu_constants
       - store.direct_route
       - merge.avx512_weighted_reduce
-      - dispatch.two_core_expert_or_nsplit
+      - dispatch.expert_team_nsplit_waves
     entrypoint: >-
       FUSED_CPP_MOE_AMX_PATTERN=m2n2 with positive
       FUSED_CPP_MOE_X86_W13_CACHE_BLOCKS and
@@ -670,7 +788,7 @@ variants:
       - epilogue.amx_resident_silu_constants
       - store.direct_route
       - merge.avx512_weighted_reduce
-      - dispatch.two_core_expert_or_nsplit
+      - dispatch.expert_team_nsplit_waves
     entrypoint: >-
       FUSED_CPP_MOE_AMX_PATTERN=m1n4 with positive
       FUSED_CPP_MOE_X86_W13_CACHE_BLOCKS and

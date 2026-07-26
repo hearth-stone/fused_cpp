@@ -6,10 +6,12 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <exception>
 #include <limits>
+#include <memory>
 #include <string>
 #include <thread>
 #include <utility>
@@ -36,11 +38,86 @@ struct PackedShape {
 struct ExpertTask {
   int64_t expert = 0;
   const std::vector<int64_t>* routes = nullptr;
+  int64_t output_row_begin = 0;
 };
 
 struct ThreadScratch {
   std::vector<uint16_t> input;
   std::vector<uint16_t> intermediate;
+};
+
+constexpr int64_t kMaxExecutorThreads = 256;
+// Empirical runtime-mapper target for deciding how many experts share a wave.
+// It changes only scheduling; N-range ownership keeps correctness independent
+// of this value.
+constexpr int64_t kNsplitTargetRowsPerThread = 64;
+
+struct BlockRange {
+  int64_t begin = 0;
+  int64_t end = 0;
+};
+
+BlockRange SplitEvenly(int64_t units, int64_t group_size, int64_t local_tid) {
+  if (units <= 0 || group_size <= 0 || local_tid < 0 || local_tid >= group_size) {
+    return {};
+  }
+  const int64_t units_per_thread = units / group_size;
+  const int64_t extra_units = units % group_size;
+  const int64_t begin = local_tid * units_per_thread + std::min(local_tid, extra_units);
+  const int64_t size = units_per_thread + (local_tid < extra_units ? 1 : 0);
+  return BlockRange{begin, begin + size};
+}
+
+class ThreadBarrier {
+ public:
+  explicit ThreadBarrier(int64_t threads) : threads_(threads) {}
+
+  bool Wait() {
+    if (threads_ <= 1) {
+      return !cancelled_.load(std::memory_order_acquire);
+    }
+    if (cancelled_.load(std::memory_order_acquire)) {
+      return false;
+    }
+    const uint64_t generation = generation_.load(std::memory_order_acquire);
+    if (arrivals_.fetch_add(1, std::memory_order_acq_rel) + 1 == threads_) {
+      arrivals_.store(0, std::memory_order_relaxed);
+      generation_.fetch_add(1, std::memory_order_release);
+      return !cancelled_.load(std::memory_order_acquire);
+    }
+    while (generation_.load(std::memory_order_acquire) == generation && !cancelled_.load(std::memory_order_acquire)) {
+      std::this_thread::yield();
+    }
+    return !cancelled_.load(std::memory_order_acquire);
+  }
+
+  void Cancel() {
+    cancelled_.store(true, std::memory_order_release);
+    generation_.fetch_add(1, std::memory_order_release);
+  }
+
+ private:
+  const int64_t threads_;
+  alignas(64) std::atomic<int64_t> arrivals_{0};
+  alignas(64) std::atomic<uint64_t> generation_{0};
+  alignas(64) std::atomic<bool> cancelled_{false};
+};
+
+struct CooperativeTeam {
+  size_t task_index = 0;
+  int64_t thread_begin = 0;
+  int64_t threads = 1;
+  std::unique_ptr<ThreadBarrier> barrier;
+};
+
+struct CooperativeWave {
+  std::vector<CooperativeTeam> teams;
+  int64_t threads = 0;
+};
+
+struct ThreadAssignment {
+  size_t team_index = 0;
+  int64_t local_tid = 0;
 };
 
 bool IsIntegerType(at::ScalarType type) {
@@ -162,14 +239,14 @@ at::Tensor PrepareOutput(const at::Tensor& input, const c10::optional<at::Tensor
 }
 
 void GatherInput(const uint16_t* input, int64_t hidden_size, int64_t top_k, const std::vector<int64_t>& routes,
-                 uint16_t* gathered, int k_pad) {
+                 uint16_t* gathered, int k_pad, int64_t group_size = 1, int64_t local_tid = 0) {
   constexpr int64_t kRowsPerPanel = 12;
   constexpr int64_t kPackedRowsPerPanel = 16;
   const int64_t panels = (static_cast<int64_t>(routes.size()) + kRowsPerPanel - 1) / kRowsPerPanel;
-  const int64_t padded_rows = panels * kPackedRowsPerPanel;
-  std::fill(gathered, gathered + padded_rows * k_pad, static_cast<uint16_t>(0));
-  for (int64_t panel = 0; panel < panels; ++panel) {
+  const BlockRange panel_range = SplitEvenly(panels, group_size, local_tid);
+  for (int64_t panel = panel_range.begin; panel < panel_range.end; ++panel) {
     uint16_t* block = gathered + panel * k_pad * kPackedRowsPerPanel;
+    std::fill(block, block + static_cast<int64_t>(k_pad) * kPackedRowsPerPanel, static_cast<uint16_t>(0));
     for (int kp = 0; kp < k_pad / 2; ++kp) {
       uint16_t* pair_block = block + static_cast<int64_t>(kp) * 32;
       for (int lane = 0; lane < kRowsPerPanel; ++lane) {
@@ -190,44 +267,141 @@ void GatherInput(const uint16_t* input, int64_t hidden_size, int64_t top_k, cons
 }
 
 void GatherInputAmx(const uint16_t* input, int64_t hidden_size, int64_t top_k, const std::vector<int64_t>& routes,
-                    uint16_t* gathered, int k_pad) {
-  std::fill(gathered, gathered + static_cast<int64_t>(routes.size()) * k_pad, static_cast<uint16_t>(0));
-  for (size_t row = 0; row < routes.size(); ++row) {
-    const int64_t token = routes[row] / top_k;
-    std::copy(input + token * hidden_size, input + (token + 1) * hidden_size,
-              gathered + static_cast<int64_t>(row) * k_pad);
+                    uint16_t* gathered, int k_pad, int64_t group_size = 1, int64_t local_tid = 0) {
+  const BlockRange row_range = SplitEvenly(static_cast<int64_t>(routes.size()), group_size, local_tid);
+  for (int64_t row = row_range.begin; row < row_range.end; ++row) {
+    const int64_t token = routes[static_cast<size_t>(row)] / top_k;
+    uint16_t* destination = gathered + row * k_pad;
+    std::copy(input + token * hidden_size, input + (token + 1) * hidden_size, destination);
+    std::fill(destination + hidden_size, destination + k_pad, static_cast<uint16_t>(0));
+  }
+}
+
+CooperativeWave BuildCooperativeWave(const std::vector<ExpertTask>& tasks, const std::vector<size_t>& task_indices,
+                                     int64_t num_threads, int64_t max_n_parallelism) {
+  std::vector<int64_t> team_widths(task_indices.size(), 1);
+  int64_t remaining_threads = num_threads - static_cast<int64_t>(task_indices.size());
+  // Give each additional worker to the team with the largest current route
+  // rows per worker. N-block count caps useful parallelism.
+  while (remaining_threads > 0) {
+    size_t best = task_indices.size();
+    long double best_rows_per_thread = -1.0;
+    for (size_t index = 0; index < task_indices.size(); ++index) {
+      if (team_widths[index] >= max_n_parallelism) {
+        continue;
+      }
+      const ExpertTask& task = tasks[task_indices[index]];
+      const long double rows_per_thread =
+          static_cast<long double>(task.routes->size()) / static_cast<long double>(team_widths[index]);
+      if (best == task_indices.size() || rows_per_thread > best_rows_per_thread) {
+        best = index;
+        best_rows_per_thread = rows_per_thread;
+      }
+    }
+    if (best == task_indices.size()) {
+      break;
+    }
+    ++team_widths[best];
+    --remaining_threads;
+  }
+
+  CooperativeWave wave;
+  wave.teams.reserve(task_indices.size());
+  int64_t thread_begin = 0;
+  for (size_t index = 0; index < task_indices.size(); ++index) {
+    const int64_t team_threads = team_widths[index];
+    wave.teams.push_back(CooperativeTeam{task_indices[index], thread_begin, team_threads,
+                                         std::make_unique<ThreadBarrier>(team_threads)});
+    thread_begin += team_threads;
+  }
+  wave.threads = thread_begin;
+  return wave;
+}
+
+std::vector<CooperativeWave> BuildCooperativeSchedule(const std::vector<ExpertTask>& tasks, int64_t num_threads,
+                                                      int64_t max_n_parallelism) {
+  std::vector<size_t> ordered_tasks(tasks.size());
+  for (size_t index = 0; index < tasks.size(); ++index) {
+    ordered_tasks[index] = index;
+  }
+  std::stable_sort(ordered_tasks.begin(), ordered_tasks.end(),
+                   [&](size_t lhs, size_t rhs) { return tasks[lhs].routes->size() > tasks[rhs].routes->size(); });
+
+  std::vector<CooperativeWave> waves;
+  for (size_t begin = 0; begin < ordered_tasks.size();) {
+    const int64_t largest_rows = static_cast<int64_t>(tasks[ordered_tasks[begin]].routes->size());
+    const int64_t target_active_experts =
+        std::max<int64_t>(1, std::min<int64_t>(num_threads, num_threads * kNsplitTargetRowsPerThread / largest_rows));
+    const size_t wave_tasks = std::min(ordered_tasks.size() - begin, static_cast<size_t>(target_active_experts));
+    std::vector<size_t> task_indices(ordered_tasks.begin() + static_cast<std::ptrdiff_t>(begin),
+                                     ordered_tasks.begin() + static_cast<std::ptrdiff_t>(begin + wave_tasks));
+    waves.push_back(BuildCooperativeWave(tasks, task_indices, num_threads, max_n_parallelism));
+    begin += wave_tasks;
+  }
+  return waves;
+}
+
+void GatherExpertInput(const ExpertTask& task, ThreadScratch& scratch, const uint16_t* input, int64_t hidden_size,
+                       int64_t top_k, int k_pad, bool use_amx, int64_t group_size = 1, int64_t local_tid = 0) {
+  const std::vector<int64_t>& routes = *task.routes;
+  if (use_amx) {
+    GatherInputAmx(input, hidden_size, top_k, routes, scratch.input.data(), k_pad, group_size, local_tid);
+  } else {
+    GatherInput(input, hidden_size, top_k, routes, scratch.input.data(), k_pad, group_size, local_tid);
+  }
+}
+
+void RunExpertW13Range(const ExpertTask& task, ThreadScratch& scratch, const uint16_t* w13,
+                       const PackedShape& w13_shape, int f_pad, int intermediate_stride, int silu_poly_degree,
+                       bool use_amx, int feature_block_begin, int feature_block_end) {
+  const int rows = static_cast<int>(task.routes->size());
+  const uint16_t* expert_w13 = w13 + task.expert * w13_shape.expert_stride;
+  if (use_amx) {
+    avx512_moe::ComputeW13Amx(scratch.input.data(), w13_shape.k_pad, expert_w13, scratch.intermediate.data(),
+                              intermediate_stride, rows, w13_shape.k_pad, feature_block_begin, feature_block_end,
+                              silu_poly_degree);
+  } else {
+    avx512_moe::ComputeW13(scratch.input.data(), w13_shape.k_pad, expert_w13, scratch.intermediate.data(), f_pad, rows,
+                           w13_shape.k_pad, feature_block_begin, feature_block_end, silu_poly_degree);
+  }
+}
+
+void RunExpertW2Range(const ExpertTask& task, ThreadScratch& scratch, const uint16_t* w2, const PackedShape& w2_shape,
+                      int f_pad, int intermediate_stride, float* route_output, uint16_t* output, int64_t hidden_size,
+                      bool skip_weighted, bool use_amx, bool contiguous_route_output, int output_block_begin,
+                      int output_block_end) {
+  const std::vector<int64_t>& routes = *task.routes;
+  const int rows = static_cast<int>(routes.size());
+  const uint16_t* expert_w2 = w2 + task.expert * w2_shape.expert_stride;
+  if (use_amx) {
+    float* expert_route_output = route_output;
+    const int64_t* output_route_ids = routes.data();
+    if (contiguous_route_output) {
+      expert_route_output += task.output_row_begin * hidden_size;
+      output_route_ids = nullptr;
+    }
+    avx512_moe::ComputeW2Amx(scratch.intermediate.data(), intermediate_stride, expert_w2, expert_route_output, output,
+                             output_route_ids, static_cast<int>(hidden_size), rows, w2_shape.k_pad,
+                             static_cast<int>(hidden_size), output_block_begin, output_block_end, skip_weighted);
+  } else {
+    avx512_moe::ComputeW2(scratch.intermediate.data(), f_pad, expert_w2, route_output, output, routes.data(),
+                          static_cast<int>(hidden_size), rows, w2_shape.k_pad, static_cast<int>(hidden_size),
+                          output_block_begin, output_block_end, skip_weighted);
   }
 }
 
 void RunExpert(const ExpertTask& task, ThreadScratch& scratch, const uint16_t* input, int64_t hidden_size,
                int64_t top_k, const uint16_t* w13, const PackedShape& w13_shape, const uint16_t* w2,
                const PackedShape& w2_shape, int f_pad, float* route_output, uint16_t* output, bool skip_weighted,
-               int silu_poly_degree, bool use_amx) {
-  const std::vector<int64_t>& routes = *task.routes;
-  const int rows = static_cast<int>(routes.size());
-  if (use_amx) {
-    GatherInputAmx(input, hidden_size, top_k, routes, scratch.input.data(), w13_shape.k_pad);
-  } else {
-    GatherInput(input, hidden_size, top_k, routes, scratch.input.data(), w13_shape.k_pad);
-  }
-  const uint16_t* expert_w13 = w13 + task.expert * w13_shape.expert_stride;
-  const uint16_t* expert_w2 = w2 + task.expert * w2_shape.expert_stride;
+               int silu_poly_degree, bool use_amx, bool contiguous_route_output) {
+  GatherExpertInput(task, scratch, input, hidden_size, top_k, w13_shape.k_pad, use_amx);
   // AMX W2 loads complete K32 tiles, so its A stride must include padding
   // beyond W13's potentially smaller F16-padded feature range.
   const int intermediate_stride = use_amx ? w2_shape.k_pad : f_pad;
-  if (use_amx) {
-    avx512_moe::ComputeW13Amx(scratch.input.data(), w13_shape.k_pad, expert_w13, scratch.intermediate.data(),
-                              intermediate_stride, rows, w13_shape.k_pad, 0, f_pad / 16, silu_poly_degree);
-    avx512_moe::ComputeW2Amx(scratch.intermediate.data(), intermediate_stride, expert_w2, route_output, output,
-                             routes.data(), static_cast<int>(hidden_size), rows, w2_shape.k_pad,
-                             static_cast<int>(hidden_size), 0, w2_shape.n_pad / 32, skip_weighted);
-  } else {
-    avx512_moe::ComputeW13(scratch.input.data(), w13_shape.k_pad, expert_w13, scratch.intermediate.data(), f_pad, rows,
-                           w13_shape.k_pad, 0, f_pad / 16, silu_poly_degree);
-    avx512_moe::ComputeW2(scratch.intermediate.data(), f_pad, expert_w2, route_output, output, routes.data(),
-                          static_cast<int>(hidden_size), rows, w2_shape.k_pad, static_cast<int>(hidden_size), 0,
-                          w2_shape.n_pad / 32, skip_weighted);
-  }
+  RunExpertW13Range(task, scratch, w13, w13_shape, f_pad, intermediate_stride, silu_poly_degree, use_amx, 0,
+                    f_pad / 16);
+  RunExpertW2Range(task, scratch, w2, w2_shape, f_pad, intermediate_stride, route_output, output, hidden_size,
+                   skip_weighted, use_amx, contiguous_route_output, 0, w2_shape.n_pad / 32);
 }
 
 }  // namespace
@@ -303,8 +477,8 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input, at::Tensor w13_packed, int64_t
   TORCH_CHECK(!w13_bias.has_value() && !w2_bias.has_value(), backend.name, " does not support expert bias");
   TORCH_CHECK(silu_poly_degree == 4 || silu_poly_degree == 5 || silu_poly_degree == 6,
               "silu_poly_degree must be 4, 5, or 6, got ", silu_poly_degree);
-  TORCH_CHECK(num_threads == 1 || num_threads == 2, backend.name, " currently supports num_threads=1 or 2, got ",
-              num_threads);
+  TORCH_CHECK(num_threads > 0 && num_threads <= kMaxExecutorThreads, backend.name, " requires num_threads in [1, ",
+              kMaxExecutorThreads, "], got ", num_threads);
   TORCH_CHECK(weight_window_bytes >= -1, "weight_window_bytes must be -1 or non-negative");
 
   CheckBf16Cpu(input, "input");
@@ -356,14 +530,29 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input, at::Tensor w13_packed, int64_t
                 ")");
     routes[static_cast<size_t>(expert)].push_back(flat);
   }
+  const bool contiguous_route_output = use_amx && !skip_weighted && avx512_moe::AmxW2UsesContiguousRouteOutput();
+  std::vector<int64_t> route_output_rows;
+  if (contiguous_route_output) {
+    route_output_rows.resize(static_cast<size_t>(num_routes));
+  }
   std::vector<ExpertTask> tasks;
   int64_t max_rows = 0;
+  int64_t output_row_begin = 0;
   for (int64_t expert = 0; expert < num_experts; ++expert) {
-    if (!routes[static_cast<size_t>(expert)].empty()) {
-      tasks.push_back(ExpertTask{expert, &routes[static_cast<size_t>(expert)]});
-      max_rows = std::max<int64_t>(max_rows, routes[static_cast<size_t>(expert)].size());
+    const std::vector<int64_t>& expert_routes = routes[static_cast<size_t>(expert)];
+    if (!expert_routes.empty()) {
+      tasks.push_back(ExpertTask{expert, &expert_routes, output_row_begin});
+      max_rows = std::max<int64_t>(max_rows, expert_routes.size());
+      if (contiguous_route_output) {
+        for (size_t row = 0; row < expert_routes.size(); ++row) {
+          route_output_rows[static_cast<size_t>(expert_routes[row])] = output_row_begin + static_cast<int64_t>(row);
+        }
+      }
+      output_row_begin += static_cast<int64_t>(expert_routes.size());
     }
   }
+  TORCH_CHECK(max_rows <= std::numeric_limits<int>::max(),
+              "one expert has too many routed rows for the x86 kernel: ", max_rows);
 
   std::vector<int> jit_row_counts;
   jit_row_counts.reserve(tasks.size());
@@ -378,11 +567,59 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input, at::Tensor w13_packed, int64_t
 
   const int f_pad = w13_shape.n_pad / 2;
   const int intermediate_stride = use_amx ? w2_shape.k_pad : f_pad;
-  const int64_t max_scratch_rows = use_amx ? max_rows : (max_rows + 11) / 12 * 16;
-  std::vector<ThreadScratch> scratches(static_cast<size_t>(num_threads));
-  for (ThreadScratch& scratch : scratches) {
-    scratch.input.resize(static_cast<size_t>(max_scratch_rows * w13_shape.k_pad));
-    scratch.intermediate.resize(static_cast<size_t>(max_scratch_rows * intermediate_stride));
+  const int w13_blocks = f_pad / 16;
+  const int w2_blocks = w2_shape.n_pad / 32;
+  int64_t largest_rows = 0;
+  int64_t second_largest_rows = 0;
+  for (const ExpertTask& task : tasks) {
+    const int64_t rows = static_cast<int64_t>(task.routes->size());
+    if (rows > largest_rows) {
+      second_largest_rows = largest_rows;
+      largest_rows = rows;
+    } else if (rows > second_largest_rows) {
+      second_largest_rows = rows;
+    }
+  }
+  const bool route_skewed =
+      second_largest_rows > 0 && largest_rows >= kNsplitTargetRowsPerThread && largest_rows >= 2 * second_largest_rows;
+  // Underfilled calls use one cooperative wave. Strongly skewed calls use
+  // sorted waves even when every worker could claim a cold expert; balanced
+  // calls retain the lower-overhead atomic expert queue.
+  const bool use_cooperative_schedule =
+      num_threads > 1 && (static_cast<int64_t>(tasks.size()) < num_threads || route_skewed);
+  std::vector<CooperativeWave> cooperative_waves;
+  size_t cooperative_scratch_count = 0;
+  if (use_cooperative_schedule) {
+    const int64_t max_n_parallelism = std::max(w13_blocks, w2_blocks);
+    if (route_skewed) {
+      cooperative_waves = BuildCooperativeSchedule(tasks, num_threads, max_n_parallelism);
+    } else {
+      std::vector<size_t> task_indices(tasks.size());
+      for (size_t index = 0; index < tasks.size(); ++index) {
+        task_indices[index] = index;
+      }
+      cooperative_waves.push_back(BuildCooperativeWave(tasks, task_indices, num_threads, max_n_parallelism));
+    }
+    for (const CooperativeWave& wave : cooperative_waves) {
+      cooperative_scratch_count = std::max(cooperative_scratch_count, wave.teams.size());
+    }
+  }
+  const size_t scratch_count = use_cooperative_schedule ? cooperative_scratch_count : static_cast<size_t>(num_threads);
+  std::vector<ThreadScratch> scratches(scratch_count);
+  std::vector<int64_t> scratch_logical_rows(scratch_count, max_rows);
+  if (use_cooperative_schedule) {
+    std::fill(scratch_logical_rows.begin(), scratch_logical_rows.end(), int64_t{0});
+    for (const CooperativeWave& wave : cooperative_waves) {
+      for (size_t team_index = 0; team_index < wave.teams.size(); ++team_index) {
+        const int64_t rows = static_cast<int64_t>(tasks[wave.teams[team_index].task_index].routes->size());
+        scratch_logical_rows[team_index] = std::max(scratch_logical_rows[team_index], rows);
+      }
+    }
+  }
+  for (size_t index = 0; index < scratches.size(); ++index) {
+    const int64_t scratch_rows = use_amx ? scratch_logical_rows[index] : (scratch_logical_rows[index] + 11) / 12 * 16;
+    scratches[index].input.resize(static_cast<size_t>(scratch_rows * w13_shape.k_pad));
+    scratches[index].intermediate.resize(static_cast<size_t>(scratch_rows * intermediate_stride));
   }
   at::Tensor route_output;
   float* route_output_pointer = nullptr;
@@ -395,44 +632,45 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input, at::Tensor w13_packed, int64_t
   const uint16_t* w2_pointer = Bf16Data(w2_shape.tensor);
   uint16_t* output_pointer = MutableBf16Data(output);
 
-  if (num_threads == 2 && tasks.size() == 1) {
-    ThreadScratch& scratch = scratches[0];
-    const ExpertTask& task = tasks[0];
-    const std::vector<int64_t>& expert_routes = *task.routes;
-    const int rows = static_cast<int>(expert_routes.size());
-    if (use_amx) {
-      GatherInputAmx(input_pointer, input.size(1), top_k, expert_routes, scratch.input.data(), w13_shape.k_pad);
-    } else {
-      GatherInput(input_pointer, input.size(1), top_k, expert_routes, scratch.input.data(), w13_shape.k_pad);
+  if (use_cooperative_schedule) {
+    for (CooperativeWave& wave : cooperative_waves) {
+      std::vector<ThreadAssignment> assignments(static_cast<size_t>(wave.threads));
+      for (size_t team_index = 0; team_index < wave.teams.size(); ++team_index) {
+        const CooperativeTeam& team = wave.teams[team_index];
+        for (int64_t local_tid = 0; local_tid < team.threads; ++local_tid) {
+          assignments[static_cast<size_t>(team.thread_begin + local_tid)] = ThreadAssignment{team_index, local_tid};
+        }
+      }
+      RunThreads(wave.threads, [&](int64_t tid) {
+        const ThreadAssignment assignment = assignments[static_cast<size_t>(tid)];
+        CooperativeTeam& team = wave.teams[assignment.team_index];
+        const ExpertTask& task = tasks[team.task_index];
+        ThreadScratch& scratch = scratches[assignment.team_index];
+        ThreadBarrier& barrier = *team.barrier;
+        try {
+          GatherExpertInput(task, scratch, input_pointer, input.size(1), top_k, w13_shape.k_pad, use_amx, team.threads,
+                            assignment.local_tid);
+          if (!barrier.Wait()) {
+            return;
+          }
+
+          const BlockRange w13_range = SplitEvenly(w13_blocks, team.threads, assignment.local_tid);
+          RunExpertW13Range(task, scratch, w13_pointer, w13_shape, f_pad, intermediate_stride, silu_poly_degree,
+                            use_amx, static_cast<int>(w13_range.begin), static_cast<int>(w13_range.end));
+          if (!barrier.Wait()) {
+            return;
+          }
+
+          const BlockRange w2_range = SplitEvenly(w2_blocks, team.threads, assignment.local_tid);
+          RunExpertW2Range(task, scratch, w2_pointer, w2_shape, f_pad, intermediate_stride, route_output_pointer,
+                           output_pointer, input.size(1), skip_weighted, use_amx, contiguous_route_output,
+                           static_cast<int>(w2_range.begin), static_cast<int>(w2_range.end));
+        } catch (...) {
+          barrier.Cancel();
+          throw;
+        }
+      });
     }
-    const uint16_t* expert_w13 = w13_pointer + task.expert * w13_shape.expert_stride;
-    const uint16_t* expert_w2 = w2_pointer + task.expert * w2_shape.expert_stride;
-    const int w13_blocks = f_pad / 16;
-    RunThreads(2, [&](int64_t tid) {
-      const int begin = static_cast<int>(w13_blocks * tid / 2);
-      const int end = static_cast<int>(w13_blocks * (tid + 1) / 2);
-      if (use_amx) {
-        avx512_moe::ComputeW13Amx(scratch.input.data(), w13_shape.k_pad, expert_w13, scratch.intermediate.data(),
-                                  intermediate_stride, rows, w13_shape.k_pad, begin, end, silu_poly_degree);
-      } else {
-        avx512_moe::ComputeW13(scratch.input.data(), w13_shape.k_pad, expert_w13, scratch.intermediate.data(), f_pad,
-                               rows, w13_shape.k_pad, begin, end, silu_poly_degree);
-      }
-    });
-    const int w2_blocks = w2_shape.n_pad / 32;
-    RunThreads(2, [&](int64_t tid) {
-      const int begin = static_cast<int>(w2_blocks * tid / 2);
-      const int end = static_cast<int>(w2_blocks * (tid + 1) / 2);
-      if (use_amx) {
-        avx512_moe::ComputeW2Amx(scratch.intermediate.data(), intermediate_stride, expert_w2, route_output_pointer,
-                                 output_pointer, expert_routes.data(), static_cast<int>(input.size(1)), rows,
-                                 w2_shape.k_pad, static_cast<int>(input.size(1)), begin, end, skip_weighted);
-      } else {
-        avx512_moe::ComputeW2(scratch.intermediate.data(), f_pad, expert_w2, route_output_pointer, output_pointer,
-                              expert_routes.data(), static_cast<int>(input.size(1)), rows, w2_shape.k_pad,
-                              static_cast<int>(input.size(1)), begin, end, skip_weighted);
-      }
-    });
   } else {
     std::atomic<size_t> next_task{0};
     RunThreads(num_threads, [&](int64_t tid) {
@@ -443,17 +681,23 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input, at::Tensor w13_packed, int64_t
         }
         RunExpert(tasks[index], scratches[static_cast<size_t>(tid)], input_pointer, input.size(1), top_k, w13_pointer,
                   w13_shape, w2_pointer, w2_shape, f_pad, route_output_pointer, output_pointer, skip_weighted,
-                  silu_poly_degree, use_amx);
+                  silu_poly_degree, use_amx, contiguous_route_output);
       }
     });
   }
 
   if (!skip_weighted) {
     const float* weights = weights_f32.data_ptr<float>();
-    RunThreads(num_threads, [&](int64_t tid) {
-      const int64_t begin = num_tokens * tid / num_threads;
-      const int64_t end = num_tokens * (tid + 1) / num_threads;
-      avx512_moe::MergeRoutes(route_output_pointer, weights, output_pointer, begin, end, top_k, input.size(1));
+    const int64_t merge_threads = std::min(num_threads, num_tokens);
+    RunThreads(merge_threads, [&](int64_t tid) {
+      const int64_t begin = num_tokens * tid / merge_threads;
+      const int64_t end = num_tokens * (tid + 1) / merge_threads;
+      if (contiguous_route_output) {
+        avx512_moe::MergeRoutesMapped(route_output_pointer, route_output_rows.data(), weights, output_pointer, begin,
+                                      end, top_k, input.size(1));
+      } else {
+        avx512_moe::MergeRoutes(route_output_pointer, weights, output_pointer, begin, end, top_k, input.size(1));
+      }
     });
   }
   return output;

@@ -3,7 +3,9 @@
 This list records the remaining AMX work in dependency order. Every item must
 be measured against the current automatic pattern/cache policy with identical
 packed weights and inputs. Correctness is required before timing; performance
-claims must include pinned one- and two-core results on `AmazonC8i2Cores`.
+claims must include pinned 1/2/4/8-core results on `AmazonC8i8Cores` when they
+change thread scheduling, and pinned one-/two-core results on
+`AmazonC8i2Cores` for isolated microkernel changes.
 
 ## P1: remove work around the matrix instructions
 
@@ -20,22 +22,49 @@ claims must include pinned one- and two-core results on `AmazonC8i2Cores`.
   reliably beat resident; `rcp14` was slightly approximate and neither is the
   default. See
   [`results/amazon_c8i_2core_amx_silu_20260720.md`](results/amazon_c8i_2core_amx_silu_20260720.md).
-- [ ] **W2 store/merge epilogue:** remove repeated per-row address generation
+- [x] **W2 store/merge epilogue:** remove repeated per-row address generation
   in `m1n4`; evaluate an expert-contiguous FP32 route buffer that accepts
   `TILESTORED` directly; retain direct weighted BF16 output for top-k=1. Measure
-  store bandwidth and the later route-merge cost separately.
+  store bandwidth and the later route-merge cost separately. **2026-07-20:**
+  added cache-key-isolated `baseline`, `combined`, and `tile_store` modes.
+  `combined` performs one route-address calculation for each M1N4/N64 row;
+  `tile_store` writes TMM accumulators directly to expert-contiguous FP32 rows
+  and merges through a precomputed flat-route-to-row map. Both are bit-exact,
+  including M/N/K tails and one/two threads; top-k=1 direct BF16 keeps the ZMM
+  conversion path. At K=512, rotated standalone `tile_store` improved W2 by
+  1.0-14.5%; mapped merge was 0-11.8% slower and end-to-end results ranged
+  from +1.7% to -4.5%.
+  The stable automatic policy therefore remains `baseline`; both alternatives
+  are retained for future dimension-aware dispatch. A K=32 store-dominated
+  sweep explains the instability: `combined` raised effective output bandwidth
+  by up to 17.8%, but wide-stride direct `TILESTORED` increased latency by
+  12.8-22.8%. See
+  [`results/amazon_c8i_2core_amx_w2_epilogue_20260720.md`](results/amazon_c8i_2core_amx_w2_epilogue_20260720.md).
 - [ ] **Scratch/workspace lifecycle:** allocate persistent, uninitialized
   per-worker scratch, zero only K-tail bytes that W2 can observe, and avoid a
   second scratch buffer when a selected pattern cannot consume it.
-- [ ] **Two-core scheduling:** keep a persistent worker team and split a hot
-  expert across cores when route skew leaves one worker idle. Compare balanced,
-  skewed, and single-hot-expert routing without changing numerical order in the
-  final token reduction.
+- [x] **Cooperative N-split scheduling:** support 1--256 requested workers,
+  retain the global expert queue for balanced/high-concurrency routes, form
+  per-expert teams when active experts underfill the machine, and use sorted
+  waves when one route is at least 64 rows and twice the next-largest route.
+  Team workers split gather, W13 F16 blocks, and W2 N32 blocks with barriers
+  between dependent phases; final token reduction order is unchanged.
+  **2026-07-22:** exact 1-vs-8-thread output passed on AVX-512 and all AMX
+  patterns, including H/F tails and a skewed-wave case. On an 8-core C8i,
+  AMX H4096/F512/M2048 improved 26.45→5.76 ms for one hot expert and
+  39.22→11.89 ms for `[1536,256,256]` routes. Balanced E2/E8 retain the
+  non-wave path. See
+  [`results/amazon_c8i_8core_nsplit_20260722.md`](results/amazon_c8i_8core_nsplit_20260722.md).
 
 ## P2: improve tile and cache pipelines
 
 - [ ] **Persistent tile state and macro-M loop:** avoid repeated tile-config and
   call-frame setup across adjacent M panels while preserving exact M tails.
+  An explicit `FUSED_CPP_MOE_AMX_TILE_STATE=macro_m` path now keeps one tile
+  configuration across the full M16/M32 units in each cache window and leaves
+  tails on the original `per_call` path. Keep this item open, and keep `auto`
+  on `per_call`, until the C8i correctness and rotated 1/2/4/8-thread sweep is
+  complete.
 - [ ] **B-side streaming layout:** test `TILELOADDT1`/prefetch and an N64,
   K-major packed-B superblock that feeds two adjacent N32 tiles with less
   address arithmetic and better L2 locality.
@@ -64,7 +93,7 @@ claims must include pinned one- and two-core results on `AmazonC8i2Cores`.
 - Record every attempted kernel variant, including regressions, in
   `csrc/SDPA_VERSIONS.md` and this optimization's result reports.
 - Keep the old path selectable until the replacement passes exact/tolerance,
-  tail, pattern, routing, and one-/two-thread tests.
+  tail, pattern, routing, and 1/2/4/8-thread tests.
 - Use rotated same-process measurements when variants can share one binary;
   report median, best, run count, affinity, CPU frequency/thermal caveats, and
   whether packing/JIT warm-up is excluded.

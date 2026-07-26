@@ -367,6 +367,26 @@ flash2_neon_l3kv_packqkv_pbf16pv    ← softmax 直接产出 bf16 P scratch，PV
 
 ---
 
+### x86 AMX MoE W2 store/merge epilogue 迭代记录
+
+> 完整命令、W2-only、merge-only 和端到端逐 shape 数据见
+> `optimizations/fused_moe_avx512/results/amazon_c8i_2core_amx_w2_epilogue_20260720.md`。
+
+| variant | 实现 | 数值 | Amazon C8i 结果 | 结论 |
+|---|---|---|---|---|
+| `baseline` | TMM→2 KiB scratch→逐行 ZMM→flat-route FP32 | 参考 | 全 shape 稳定 | **默认 auto** |
+| `combined` | M1N4 四个 TMM→4 KiB scratch；每个 N64 row 只算一次 route address | 与 baseline BF16 bit-exact | K512 W2-only M256 +2.1%，M2048 -2.6%；K32 effective output BW +15.8%~+17.8%；端到端 -1.0%~+0.6% | 保留实验，不默认 |
+| `tile_store` | TMM 直接写 expert-contiguous FP32 rows；merge 经 flat-route→row map | 与 baseline BF16 bit-exact | K512 W2-only +1.0%~+14.5%；K32 latency +12.8%~+22.8%；mapped merge 0%~+11.8% latency；端到端 -4.5%~+1.7% | 保留实验，等待 dimension-aware policy |
+
+结论：去掉 TMM→L1 scratch→ZMM 的回读能稳定提升独立 W2，但完整 expert 的
+收益取决于 M/K、route 布局、merge cache state 和线程调度；K32 sweep 还确认
+wide-stride `TILESTORED` 的 raw store path 比 scratch→ZMM store 更慢。当前没有一个静态策略
+覆盖所有 case，因此 `auto` 继续使用 baseline；top-k=1 direct BF16 无论选择哪个
+实验模式都保留 ZMM FP32→BF16 转换。下一优先级是 scratch/workspace 生命周期，
+不是把 shape-dependent 的 tile-store 路径提前设为默认。
+
+---
+
 ## 选型矩阵
 
 | 场景 | 推荐版本 | 备注 |
@@ -389,6 +409,8 @@ flash2_neon_l3kv_packqkv_pbf16pv    ← softmax 直接产出 bf16 P scratch，PV
 
 | 日期 | 改动概述 | 受影响文件 |
 |---|---|---|
+| 2026-07-22 | **x86 MoE 参考 SVE 引入多线程切 N 与 skew-aware wave 调度**：AVX-512/AMX executor 从只支持 1/2T 扩展为 1--256 requested workers；active expert 不足时建立 route-weighted teams，并行 gather 后经 barrier 分别切分 W13 F16 与 W2 N32 blocks；最大 route 至少 64 且为次大 2x 时按 route 降序组成 waves，均衡且 active expert 足够时保留 atomic expert queue。barrier 支持异常取消，scratch 按 wave slot 最大 route 复用，merge threads capped by token count。C8i8 H4096/F512/M2048：AMX hot 26.45→5.76 ms（1T→8T，4.60x），`[1536,256,256]` 39.22→11.89 ms（3.30x）；完整 x86 suite 163 passed。 | 改 `csrc/moe/x86/avx512_bf16/executor.cpp`、`src/fused_cpp/moe/bf16_tiled.py`、`tests/{test_moe_avx512_bf16.py,bench_moe_avx512_bf16.py}`、`optimizations/fused_moe_avx512/{README.md,TODO.md,manifest.yaml,results/amazon_c8i_8core_nsplit_20260722.md}`、`cpu_moe_schedule_optimization/MATHEMATICAL_MODEL.md`、`csrc/SDPA_VERSIONS.md` |
+| 2026-07-20 | **x86 AMX MoE W2 store/merge epilogue 实验与负结果保留**：新增 cache-key 隔离的 `baseline/combined/tile_store`。`combined` 在 M1N4/N64 只生成一次 row route address；`tile_store` 让 TMM 直接写 expert-contiguous FP32 workspace，并由预建 route-row map 做 AVX-512 weighted merge。三条路径跨 pattern/tail/单双线程 bit-exact，top-k=1 direct BF16 保持 vector conversion。C8i K512 rotated W2-only `tile_store` 为 +1.0%~+14.5%，但 K32 store-dominated latency +12.8%~+22.8%，end-to-end 为 -4.5%~+1.7%，所以 auto 仍为 baseline；完整 x86 suite 122 passed/4 skipped。 | 改 `csrc/moe/x86/avx512_bf16/{jit_kernels.cpp,kernels.cpp,kernels.h,executor.cpp}`、`tests/test_moe_avx512_bf16.py`、`benchmarks/bench_amx_bf16_{patterns.py,w2_epilogues.cpp,merge.cpp}`、`optimizations/fused_moe_avx512/{README.md,TODO.md,manifest.yaml,results/amazon_c8i_2core_amx_w2_epilogue_20260720.md}`、`csrc/SDPA_VERSIONS.md` |
 | 2026-07-20 | **x86 AMX MoE W13 SiLU epilogue 优化与负结果保留**：新增 `baseline/resident/pipelined/rcp14` 四种 cache-key 隔离的 Xbyak 路径。`resident` 把多项式/exp 常量一次广播后驻留 ZMM，保持逐行算术顺序和 BF16 bit-exact，M16/degree5 JIT 3972→2836 B，K256 standalone +8.4%，设为 auto；两行 stage pipeline 未稳定胜过 resident，`VRCP14PS` 非 bit-exact 且端到端收益处于噪声范围，均仅保留实验开关。C8i 完整 x86 suite 114 passed/4 skipped。 | 改 `csrc/moe/x86/avx512_bf16/jit_kernels.cpp`、`tests/test_moe_avx512_bf16.py`、`benchmarks/bench_amx_bf16_w13.cpp`、`benchmarks/bench_amx_bf16_patterns.py`、`optimizations/fused_moe_avx512/{README.md,TODO.md,manifest.yaml,results/amazon_c8i_2core_amx_silu_20260720.md}`、`csrc/SDPA_VERSIONS.md` |
 | 2026-06-10 | **`flash2_neon_l3kv_packqkv*` fp32 路径改为全量 pack K + packed-K lane-FMLA QKᵀ**：fp32 输入不再 delegate 到 `flash2_neon_l3kv_packv_pquad`。入口新增 K pack layout `[B,N,S/8,E,8]`，Q 保持 row-major；QKᵀ 8×8 用 `MK_Fp32PackK8PQuad` 按 4 个 E lane 加载 Q、按 K lane 向量累加，消掉旧 fp32 QKᵀ 的 per-score horizontal reduction；PV 继续使用 fp32 pquad。fp32 数值不再与旧 delegate bit-exact，改按 fp32 SDPA 容差验证。 | 改 `csrc/sdpa_flash2_neon_l3kv_packqkv.cpp`（fp32 packK helper、packed-K QKᵀ trait、fp32 entry 路由）；改 `tests/test_sdpa_l3kv_packqkv.py`（fp32 delegate 断言改为 baseline 容差比较）；改 `src/fused_cpp/sdpa.py` 与 `csrc/SDPA_VERSIONS.md`（metadata/文档） |
 | 2026-06-01 | **新增 SDPA 版本 `flash2_neon_l3kv_packqkv_pbf16pv`**：在 packqkv 的 Q/K/V pre-pack 路径上增加 `kPbf16PV` 模板开关，softmax 计算 fp32 sum 但把 full 8-row block 的 `P_hat` 直接写成 bf16 scratch，PV 改调 `pv_8x8_pbf16`，旧 `flash2_neon_l3kv_packqkv` 保持不变。SVE `FCVT/FCVTNT` 压缩 store 实测 softmax 过慢，最终 bf16-store helper 使用 NEON `vcvt_bf16_f32`。Arm-codex core80 单线程：BGE-small-zh 形状 bf16 non-causal 10.776→9.989 ms（+7.3%）、causal 12.389→11.317 ms（+9.5%）；`B1-N32-L2048-S2048-E192-Ev128` bf16 non-causal 1422.704→1276.547 ms（+11.5%）、causal 952.715→867.951 ms（+9.8%）。 | 改 `csrc/sdpa_flash2_neon_l3kv_impl.h`（新增 `vectorized_exp_minus_bf16_impl`、`process_q_tile_lc_packqkv` / run path 的 `kPbf16PV` 分支与 bf16 P scratch）；改 `csrc/sdpa_flash2_neon_l3kv_packqkv.cpp`（新增版本入口和注册）；改 `src/fused_cpp/sdpa.py`（metadata）；改 `tests/test_sdpa_versions_equiv.py`（packqkv 约束覆盖新版本）；改 `csrc/SDPA_VERSIONS.md` |

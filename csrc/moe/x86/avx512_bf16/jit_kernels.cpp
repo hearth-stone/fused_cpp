@@ -49,9 +49,11 @@ ImplementationMode GetImplementationMode() {
 // kernels cannot alias even when every other specialization field matches.
 enum class X86JitIsa : uint8_t { kAvx512Bf16, kAmxBf16 };
 enum class JitOperation : uint8_t { kW13, kW2 };
-enum class JitOutput : uint8_t { kPackedBf16, kRouteF32, kDirectBf16 };
+enum class JitOutput : uint8_t { kPackedBf16, kRouteF32, kContiguousF32, kDirectBf16 };
 enum class AmxJitPattern : uint8_t { kM1N2, kM2N2, kM1N4 };
 enum class AmxSiluEpilogue : uint8_t { kBaseline, kResident, kPipelined, kRcp14 };
+enum class AmxW2Epilogue : uint8_t { kBaseline, kCombined, kTileStore };
+enum class AmxTileStateMode : uint8_t { kPerCall, kMacroM };
 
 // Conservative H=4096/F=512 crossover on Amazon C8i; forced patterns remain
 // available for machine-specific validation.
@@ -60,6 +62,8 @@ constexpr int64_t kAmxW13CacheTargetBytes = int64_t{1} << 20;
 constexpr int64_t kAmxW2CacheTargetBytes = int64_t{512} << 10;
 
 size_t AmxPatternIndex(AmxJitPattern pattern) { return static_cast<size_t>(pattern); }
+
+size_t AmxTileStateModeIndex(AmxTileStateMode mode) { return static_cast<size_t>(mode); }
 
 AmxJitPattern ResolveAmxJitPattern(int rows) {
   const char* raw = std::getenv("FUSED_CPP_MOE_AMX_PATTERN");
@@ -99,6 +103,48 @@ AmxSiluEpilogue ResolveAmxSiluEpilogue() {
   }
   throw std::runtime_error(
       "FUSED_CPP_MOE_AMX_SILU_EPILOGUE must be auto, baseline, resident, pipelined, or rcp14; got '" + value + "'");
+}
+
+AmxW2Epilogue ResolveAmxW2Epilogue() {
+  const char* raw = std::getenv("FUSED_CPP_MOE_AMX_W2_EPILOGUE");
+  const std::string value = raw == nullptr ? "auto" : raw;
+  if (value.empty() || value == "auto") {
+    return AmxW2Epilogue::kBaseline;
+  }
+  if (value == "baseline") {
+    return AmxW2Epilogue::kBaseline;
+  }
+  if (value == "combined") {
+    return AmxW2Epilogue::kCombined;
+  }
+  if (value == "tile_store") {
+    return AmxW2Epilogue::kTileStore;
+  }
+  throw std::runtime_error("FUSED_CPP_MOE_AMX_W2_EPILOGUE must be auto, baseline, combined, or tile_store; got '" +
+                           value + "'");
+}
+
+AmxW2Epilogue EffectiveAmxW2Epilogue(AmxW2Epilogue epilogue, bool direct_bf16) {
+  // TMM accumulators contain FP32. Direct top-k=1 output still needs a ZMM
+  // conversion to BF16, so it cannot use TILESTORED as its final store.
+  return direct_bf16 && epilogue == AmxW2Epilogue::kTileStore ? AmxW2Epilogue::kCombined : epilogue;
+}
+
+AmxTileStateMode ResolveAmxTileStateMode() {
+  const char* raw = std::getenv("FUSED_CPP_MOE_AMX_TILE_STATE");
+  const std::string value = raw == nullptr ? "auto" : raw;
+  if (value.empty() || value == "auto" || value == "per_call") {
+    return AmxTileStateMode::kPerCall;
+  }
+  if (value == "macro_m") {
+    return AmxTileStateMode::kMacroM;
+  }
+  throw std::runtime_error("FUSED_CPP_MOE_AMX_TILE_STATE must be auto, per_call, or macro_m; got '" + value + "'");
+}
+
+AmxTileStateMode EffectiveAmxTileStateMode(AmxTileStateMode requested, int panel_count) {
+  return requested == AmxTileStateMode::kMacroM && panel_count > 1 ? AmxTileStateMode::kMacroM
+                                                                   : AmxTileStateMode::kPerCall;
 }
 
 int GetCacheBlockWindow(const char* environment, int automatic_blocks = 0) {
@@ -148,11 +194,14 @@ struct KernelKey {
   JitOutput output = JitOutput::kPackedBf16;
   AmxJitPattern amx_pattern = AmxJitPattern::kM1N2;
   AmxSiluEpilogue amx_silu_epilogue = AmxSiluEpilogue::kBaseline;
+  AmxW2Epilogue amx_w2_epilogue = AmxW2Epilogue::kBaseline;
+  AmxTileStateMode amx_tile_state_mode = AmxTileStateMode::kPerCall;
 
   bool operator<(const KernelKey& other) const {
-    return std::tie(isa, operation, rows, n_valid, silu_degree, output, amx_pattern, amx_silu_epilogue) <
+    return std::tie(isa, operation, rows, n_valid, silu_degree, output, amx_pattern, amx_silu_epilogue, amx_w2_epilogue,
+                    amx_tile_state_mode) <
            std::tie(other.isa, other.operation, other.rows, other.n_valid, other.silu_degree, other.output,
-                    other.amx_pattern, other.amx_silu_epilogue);
+                    other.amx_pattern, other.amx_silu_epilogue, other.amx_w2_epilogue, other.amx_tile_state_mode);
   }
 };
 
@@ -199,6 +248,7 @@ struct AmxW13Call {
   int64_t c_stride_bytes;
   int64_t block_count;
   const SiluConstants* constants;
+  int64_t m_panel_count;
 };
 
 struct AmxW2Call {
@@ -211,6 +261,7 @@ struct AmxW2Call {
   int64_t b_block_stride_bytes;
   int64_t route_stride_bytes;
   int64_t block_count;
+  int64_t m_panel_count;
 };
 
 using JitFunction = void (*)(const void*);
@@ -619,12 +670,14 @@ TileConfig MakeAmxW2Config(int rows, int n_valid, AmxJitPattern pattern) {
 
 class AmxW13Generator final : public Xbyak::CodeGenerator {
  public:
-  AmxW13Generator(int rows, int degree, AmxJitPattern pattern, AmxSiluEpilogue silu_epilogue)
+  AmxW13Generator(int rows, int degree, AmxJitPattern pattern, AmxSiluEpilogue silu_epilogue,
+                  AmxTileStateMode tile_state_mode)
       : Xbyak::CodeGenerator(16 * 1024, Xbyak::AutoGrow),
         rows_(rows),
         degree_(degree),
         pattern_(pattern),
         silu_epilogue_(silu_epilogue),
+        tile_state_mode_(tile_state_mode),
         config_(MakeAmxW13Config(rows, pattern)) {
     Generate();
     readyRE();
@@ -632,7 +685,16 @@ class AmxW13Generator final : public Xbyak::CodeGenerator {
 
  private:
   static constexpr int kTileScratchBytes = 2048;
+  static constexpr int kMacroMStateBytes = 16;
   static constexpr int kBBytesPerKBlock = 2048;
+
+  bool UsesMacroM() const { return tile_state_mode_ == AmxTileStateMode::kMacroM; }
+
+  int FrameBytes() const { return kTileScratchBytes + (UsesMacroM() ? kMacroMStateBytes : 0); }
+
+  int CPanelStateOffset() const { return kTileScratchBytes; }
+
+  int MPanelCountStateOffset() const { return kTileScratchBytes + 8; }
 
   void BroadcastFloat(const Xbyak::Zmm& destination, size_t offset) {
     vbroadcastss(destination, dword[rbx + static_cast<int>(offset)]);
@@ -859,7 +921,11 @@ class AmxW13Generator final : public Xbyak::CodeGenerator {
     push(r13);
     push(r14);
     push(r15);
-    sub(rsp, kTileScratchBytes);
+    if (UsesMacroM()) {
+      push(rbp);
+      mov(rbp, rdi);
+    }
+    sub(rsp, FrameBytes());
 
     mov(r8, ptr[rdi + static_cast<int>(offsetof(AmxW13Call, a))]);
     mov(r9, ptr[rdi + static_cast<int>(offsetof(AmxW13Call, b))]);
@@ -870,14 +936,52 @@ class AmxW13Generator final : public Xbyak::CodeGenerator {
     mov(r14, ptr[rdi + static_cast<int>(offsetof(AmxW13Call, c_stride_bytes))]);
     mov(r15, ptr[rdi + static_cast<int>(offsetof(AmxW13Call, block_count))]);
     mov(rbx, ptr[rdi + static_cast<int>(offsetof(AmxW13Call, constants))]);
+    if (UsesMacroM()) {
+      mov(ptr[rsp + CPanelStateOffset()], r10);
+      mov(rax, ptr[rbp + static_cast<int>(offsetof(AmxW13Call, m_panel_count))]);
+      mov(ptr[rsp + MPanelCountStateOffset()], rax);
+    }
     if (silu_epilogue_ != AmxSiluEpilogue::kBaseline) {
       EmitResidentSiluConstants();
     }
   }
 
+  void EmitMPanelBegin(Xbyak::Label& panel_loop, Xbyak::Label& all_done) {
+    if (!UsesMacroM()) {
+      test(r15, r15);
+      jz(all_done, T_NEAR);
+      return;
+    }
+    cmp(qword[rsp + MPanelCountStateOffset()], 0);
+    jz(all_done, T_NEAR);
+    L(panel_loop);
+    mov(r9, ptr[rbp + static_cast<int>(offsetof(AmxW13Call, b))]);
+    mov(r10, ptr[rsp + CPanelStateOffset()]);
+    mov(r15, ptr[rbp + static_cast<int>(offsetof(AmxW13Call, block_count))]);
+    test(r15, r15);
+    jz(all_done, T_NEAR);
+  }
+
+  void EmitMPanelAdvance(Xbyak::Label& panel_loop) {
+    if (!UsesMacroM()) {
+      return;
+    }
+    imul(rax, r12, rows_);
+    add(r8, rax);
+    mov(r10, ptr[rsp + CPanelStateOffset()]);
+    imul(rax, r14, rows_);
+    add(r10, rax);
+    mov(ptr[rsp + CPanelStateOffset()], r10);
+    sub(qword[rsp + MPanelCountStateOffset()], 1);
+    jnz(panel_loop, T_NEAR);
+  }
+
   void EmitAmxReturn() {
     tilerelease();
-    add(rsp, kTileScratchBytes);
+    add(rsp, FrameBytes());
+    if (UsesMacroM()) {
+      pop(rbp);
+    }
     pop(r15);
     pop(r14);
     pop(r13);
@@ -894,12 +998,12 @@ class AmxW13Generator final : public Xbyak::CodeGenerator {
     const int second_rows = rows_ - 16;
     EmitAmxPrologue();
 
+    Xbyak::Label panel_loop;
     Xbyak::Label block_loop;
     Xbyak::Label k_loop;
     Xbyak::Label k_done;
     Xbyak::Label all_done;
-    test(r15, r15);
-    jz(all_done, T_NEAR);
+    EmitMPanelBegin(panel_loop, all_done);
     L(block_loop);
     tilezero(tmm0);
     tilezero(tmm1);
@@ -938,6 +1042,7 @@ class AmxW13Generator final : public Xbyak::CodeGenerator {
     add(r10, 32);
     dec(r15);
     jnz(block_loop, T_NEAR);
+    EmitMPanelAdvance(panel_loop);
 
     L(all_done);
     EmitAmxReturn();
@@ -949,13 +1054,13 @@ class AmxW13Generator final : public Xbyak::CodeGenerator {
     }
     EmitAmxPrologue();
 
+    Xbyak::Label panel_loop;
     Xbyak::Label block_loop;
     Xbyak::Label k_loop;
     Xbyak::Label k_tail;
     Xbyak::Label k_done;
     Xbyak::Label all_done;
-    test(r15, r15);
-    jz(all_done, T_NEAR);
+    EmitMPanelBegin(panel_loop, all_done);
     L(block_loop);
     tilezero(tmm0);
     tilezero(tmm1);
@@ -992,6 +1097,7 @@ class AmxW13Generator final : public Xbyak::CodeGenerator {
     add(r10, 64);
     dec(r15);
     jnz(block_loop, T_NEAR);
+    EmitMPanelAdvance(panel_loop);
 
     L(all_done);
     EmitAmxReturn();
@@ -1018,13 +1124,13 @@ class AmxW13Generator final : public Xbyak::CodeGenerator {
     }
     EmitAmxPrologue();
 
+    Xbyak::Label panel_loop;
     Xbyak::Label block_loop;
     Xbyak::Label k_loop;
     Xbyak::Label k_tail;
     Xbyak::Label k_done;
     Xbyak::Label all_done;
-    test(r15, r15);
-    jz(all_done, T_NEAR);
+    EmitMPanelBegin(panel_loop, all_done);
     L(block_loop);
     tilezero(tmm0);
     tilezero(tmm1);
@@ -1055,6 +1161,7 @@ class AmxW13Generator final : public Xbyak::CodeGenerator {
     add(r10, 32);
     dec(r15);
     jnz(block_loop, T_NEAR);
+    EmitMPanelAdvance(panel_loop);
 
     L(all_done);
     EmitAmxReturn();
@@ -1064,26 +1171,50 @@ class AmxW13Generator final : public Xbyak::CodeGenerator {
   int degree_;
   AmxJitPattern pattern_;
   AmxSiluEpilogue silu_epilogue_;
+  AmxTileStateMode tile_state_mode_;
   alignas(64) TileConfig config_;
 };
 
 class AmxW2Generator final : public Xbyak::CodeGenerator {
  public:
-  AmxW2Generator(int rows, int n_valid, bool direct_bf16, AmxJitPattern pattern)
+  AmxW2Generator(int rows, int n_valid, bool direct_bf16, AmxJitPattern pattern, AmxW2Epilogue w2_epilogue,
+                 AmxTileStateMode tile_state_mode)
       : Xbyak::CodeGenerator(16 * 1024, Xbyak::AutoGrow),
         rows_(rows),
         n_valid_(n_valid),
         halves_(n_valid > 16 ? 2 : 1),
         direct_bf16_(direct_bf16),
         pattern_(pattern),
+        w2_epilogue_(w2_epilogue),
+        tile_state_mode_(tile_state_mode),
         config_(MakeAmxW2Config(rows, n_valid, pattern)) {
     Generate();
     readyRE();
   }
 
  private:
-  static constexpr int kTileScratchBytes = 2048;
+  static constexpr int kOutputPanelScratchBytes = 2048;
+  static constexpr int kM1N4ScratchBytes = 4096;
+  static constexpr int kMacroMStateBytes = 24;
   static constexpr int kBBytesPerKBlock = 2048;
+
+  bool UsesMacroM() const { return tile_state_mode_ == AmxTileStateMode::kMacroM; }
+
+  int ScratchBytes() const {
+    if (w2_epilogue_ == AmxW2Epilogue::kTileStore) {
+      return 0;
+    }
+    return w2_epilogue_ == AmxW2Epilogue::kCombined && pattern_ == AmxJitPattern::kM1N4 ? kM1N4ScratchBytes
+                                                                                        : kOutputPanelScratchBytes;
+  }
+
+  int FrameBytes() const { return ScratchBytes() + (UsesMacroM() ? kMacroMStateBytes : 0); }
+
+  int OutputPanelStateOffset() const { return ScratchBytes(); }
+
+  int RouteIdsStateOffset() const { return ScratchBytes() + 8; }
+
+  int MPanelCountStateOffset() const { return ScratchBytes() + 16; }
 
   static uint16_t MaskFor(int valid) {
     if (valid >= 16) {
@@ -1134,6 +1265,25 @@ class AmxW2Generator final : public Xbyak::CodeGenerator {
 
   void EmitOutputPanel(const Xbyak::Tmm& c0, const Xbyak::Tmm& c1, int rows, int route_row_offset, int column_offset,
                        int valid0, int valid1) {
+    if (w2_epilogue_ == AmxW2Epilogue::kTileStore) {
+      mov(rax, r10);
+      if (route_row_offset != 0) {
+        // The only current secondary panel begins 16 rows later.
+        if (route_row_offset != 16) {
+          throw std::invalid_argument("unsupported AMX W2 contiguous row offset");
+        }
+        mov(rdx, r15);
+        shl(rdx, 4);
+        add(rax, rdx);
+      }
+      mov(rdx, r15);
+      tilestored(ptr[rax + rdx + column_offset * 4], c0);
+      if (valid1 > 0) {
+        tilestored(ptr[rax + rdx + (column_offset + 16) * 4], c1);
+      }
+      return;
+    }
+
     mov(edx, 64);
     tilestored(ptr[rsp + rdx], c0);
     if (valid1 > 0) {
@@ -1161,6 +1311,40 @@ class AmxW2Generator final : public Xbyak::CodeGenerator {
     }
   }
 
+  void EmitM1N4Output() {
+    if (w2_epilogue_ != AmxW2Epilogue::kCombined) {
+      EmitOutputPanel(tmm0, tmm1, rows_, 0, 0, 16, 16);
+      EmitOutputPanel(tmm2, tmm3, rows_, 0, 32, 16, 16);
+      return;
+    }
+
+    mov(edx, 64);
+    tilestored(ptr[rsp + rdx], tmm0);
+    tilestored(ptr[rsp + rdx + 1024], tmm1);
+    tilestored(ptr[rsp + rdx + 2048], tmm2);
+    tilestored(ptr[rsp + rdx + 3072], tmm3);
+    for (int row = 0; row < rows_; ++row) {
+      mov(rax, ptr[r11 + row * 8]);
+      imul(rax, r15);
+      lea(rdx, ptr[r10 + rax]);
+      vmovups(Xbyak::Zmm(0), ptr[rsp + row * 64]);
+      vmovups(Xbyak::Zmm(1), ptr[rsp + 1024 + row * 64]);
+      vmovups(Xbyak::Zmm(2), ptr[rsp + 2048 + row * 64]);
+      vmovups(Xbyak::Zmm(3), ptr[rsp + 3072 + row * 64]);
+      if (direct_bf16_) {
+        EmitBf16Store(ptr[rdx], Xbyak::Zmm(0), 16, k1);
+        EmitBf16Store(ptr[rdx + 32], Xbyak::Zmm(1), 16, k1);
+        EmitBf16Store(ptr[rdx + 64], Xbyak::Zmm(2), 16, k1);
+        EmitBf16Store(ptr[rdx + 96], Xbyak::Zmm(3), 16, k1);
+      } else {
+        EmitFloatStore(ptr[rdx], Xbyak::Zmm(0), 16, k1);
+        EmitFloatStore(ptr[rdx + 64], Xbyak::Zmm(1), 16, k1);
+        EmitFloatStore(ptr[rdx + 128], Xbyak::Zmm(2), 16, k1);
+        EmitFloatStore(ptr[rdx + 192], Xbyak::Zmm(3), 16, k1);
+      }
+    }
+  }
+
   void EmitAmxPrologue() {
     // KernelHandle retains this generator, so the embedded absolute address
     // remains valid for the entire lifetime of the published JIT function.
@@ -1171,7 +1355,13 @@ class AmxW2Generator final : public Xbyak::CodeGenerator {
     push(r13);
     push(r14);
     push(r15);
-    sub(rsp, kTileScratchBytes);
+    if (UsesMacroM()) {
+      push(rbp);
+      mov(rbp, rdi);
+    }
+    if (FrameBytes() != 0) {
+      sub(rsp, FrameBytes());
+    }
 
     mov(r8, ptr[rdi + static_cast<int>(offsetof(AmxW2Call, a))]);
     mov(r9, ptr[rdi + static_cast<int>(offsetof(AmxW2Call, b))]);
@@ -1182,11 +1372,59 @@ class AmxW2Generator final : public Xbyak::CodeGenerator {
     mov(r14, ptr[rdi + static_cast<int>(offsetof(AmxW2Call, b_block_stride_bytes))]);
     mov(r15, ptr[rdi + static_cast<int>(offsetof(AmxW2Call, route_stride_bytes))]);
     mov(rbx, ptr[rdi + static_cast<int>(offsetof(AmxW2Call, block_count))]);
+    if (UsesMacroM()) {
+      mov(ptr[rsp + OutputPanelStateOffset()], r10);
+      mov(ptr[rsp + RouteIdsStateOffset()], r11);
+      mov(rax, ptr[rbp + static_cast<int>(offsetof(AmxW2Call, m_panel_count))]);
+      mov(ptr[rsp + MPanelCountStateOffset()], rax);
+    }
+  }
+
+  void EmitMPanelBegin(Xbyak::Label& panel_loop, Xbyak::Label& all_done) {
+    if (!UsesMacroM()) {
+      test(rbx, rbx);
+      jz(all_done, T_NEAR);
+      return;
+    }
+    cmp(qword[rsp + MPanelCountStateOffset()], 0);
+    jz(all_done, T_NEAR);
+    L(panel_loop);
+    mov(r9, ptr[rbp + static_cast<int>(offsetof(AmxW2Call, b))]);
+    mov(r10, ptr[rsp + OutputPanelStateOffset()]);
+    mov(r11, ptr[rsp + RouteIdsStateOffset()]);
+    mov(rbx, ptr[rbp + static_cast<int>(offsetof(AmxW2Call, block_count))]);
+    test(rbx, rbx);
+    jz(all_done, T_NEAR);
+  }
+
+  void EmitMPanelAdvance(Xbyak::Label& panel_loop) {
+    if (!UsesMacroM()) {
+      return;
+    }
+    imul(rax, r13, rows_);
+    add(r8, rax);
+    if (w2_epilogue_ == AmxW2Epilogue::kTileStore) {
+      mov(r10, ptr[rsp + OutputPanelStateOffset()]);
+      imul(rax, r15, rows_);
+      add(r10, rax);
+      mov(ptr[rsp + OutputPanelStateOffset()], r10);
+    } else {
+      mov(r11, ptr[rsp + RouteIdsStateOffset()]);
+      add(r11, rows_ * 8);
+      mov(ptr[rsp + RouteIdsStateOffset()], r11);
+    }
+    sub(qword[rsp + MPanelCountStateOffset()], 1);
+    jnz(panel_loop, T_NEAR);
   }
 
   void EmitAmxReturn() {
     tilerelease();
-    add(rsp, kTileScratchBytes);
+    if (FrameBytes() != 0) {
+      add(rsp, FrameBytes());
+    }
+    if (UsesMacroM()) {
+      pop(rbp);
+    }
     pop(r15);
     pop(r14);
     pop(r13);
@@ -1217,12 +1455,12 @@ class AmxW2Generator final : public Xbyak::CodeGenerator {
     EmitAmxPrologue();
     EmitMasks(valid0, valid1);
 
+    Xbyak::Label panel_loop;
     Xbyak::Label block_loop;
     Xbyak::Label k_loop;
     Xbyak::Label k_done;
     Xbyak::Label all_done;
-    test(rbx, rbx);
-    jz(all_done, T_NEAR);
+    EmitMPanelBegin(panel_loop, all_done);
     L(block_loop);
     tilezero(tmm0);
     tilezero(tmm2);
@@ -1264,6 +1502,7 @@ class AmxW2Generator final : public Xbyak::CodeGenerator {
     add(r10, direct_bf16_ ? 64 : 128);
     dec(rbx);
     jnz(block_loop, T_NEAR);
+    EmitMPanelAdvance(panel_loop);
 
     L(all_done);
     EmitAmxReturn();
@@ -1275,13 +1514,13 @@ class AmxW2Generator final : public Xbyak::CodeGenerator {
     }
     EmitAmxPrologue();
 
+    Xbyak::Label panel_loop;
     Xbyak::Label block_loop;
     Xbyak::Label k_loop;
     Xbyak::Label k_tail;
     Xbyak::Label k_done;
     Xbyak::Label all_done;
-    test(rbx, rbx);
-    jz(all_done, T_NEAR);
+    EmitMPanelBegin(panel_loop, all_done);
     L(block_loop);
     tilezero(tmm0);
     tilezero(tmm1);
@@ -1310,12 +1549,12 @@ class AmxW2Generator final : public Xbyak::CodeGenerator {
     EmitM1N4KBlock(tmm4, 0);
     L(k_done);
 
-    EmitOutputPanel(tmm0, tmm1, rows_, 0, 0, 16, 16);
-    EmitOutputPanel(tmm2, tmm3, rows_, 0, 32, 16, 16);
+    EmitM1N4Output();
     lea(r9, ptr[r9 + r14 * 2]);
     add(r10, direct_bf16_ ? 128 : 256);
     dec(rbx);
     jnz(block_loop, T_NEAR);
+    EmitMPanelAdvance(panel_loop);
 
     L(all_done);
     EmitAmxReturn();
@@ -1338,45 +1577,18 @@ class AmxW2Generator final : public Xbyak::CodeGenerator {
       throw std::invalid_argument("invalid AMX W2 JIT specialization");
     }
 
-    // KernelHandle retains this generator, so the embedded absolute address
-    // remains valid for the entire lifetime of the published JIT function.
-    mov(rax, reinterpret_cast<uint64_t>(&config_));
-    ldtilecfg(ptr[rax]);
-    push(rbx);
-    push(r12);
-    push(r13);
-    push(r14);
-    push(r15);
-    sub(rsp, kTileScratchBytes);
-
-    mov(r8, ptr[rdi + static_cast<int>(offsetof(AmxW2Call, a))]);
-    mov(r9, ptr[rdi + static_cast<int>(offsetof(AmxW2Call, b))]);
-    mov(r10, ptr[rdi + static_cast<int>(offsetof(AmxW2Call, output))]);
-    mov(r11, ptr[rdi + static_cast<int>(offsetof(AmxW2Call, route_ids))]);
-    mov(r12, ptr[rdi + static_cast<int>(offsetof(AmxW2Call, k_blocks))]);
-    mov(r13, ptr[rdi + static_cast<int>(offsetof(AmxW2Call, a_stride_bytes))]);
-    mov(r14, ptr[rdi + static_cast<int>(offsetof(AmxW2Call, b_block_stride_bytes))]);
-    mov(r15, ptr[rdi + static_cast<int>(offsetof(AmxW2Call, route_stride_bytes))]);
-    mov(rbx, ptr[rdi + static_cast<int>(offsetof(AmxW2Call, block_count))]);
-
     const int valid0 = std::min(n_valid_, 16);
     const int valid1 = std::max(n_valid_ - 16, 0);
-    if (valid0 != 16) {
-      mov(eax, MaskFor(valid0));
-      kmovw(k1, eax);
-    }
-    if (valid1 > 0 && valid1 != 16) {
-      mov(eax, MaskFor(valid1));
-      kmovw(k2, eax);
-    }
+    EmitAmxPrologue();
+    EmitMasks(valid0, valid1);
 
+    Xbyak::Label panel_loop;
     Xbyak::Label block_loop;
     Xbyak::Label k_loop;
     Xbyak::Label k_tail;
     Xbyak::Label k_done;
     Xbyak::Label all_done;
-    test(rbx, rbx);
-    jz(all_done, T_NEAR);
+    EmitMPanelBegin(panel_loop, all_done);
     L(block_loop);
     tilezero(tmm0);
     if (halves_ == 2) {
@@ -1403,45 +1615,15 @@ class AmxW2Generator final : public Xbyak::CodeGenerator {
     EmitKBlock(tmm2, tmm4, tmm5, 0);
     L(k_done);
 
-    mov(edx, 64);
-    tilestored(ptr[rsp + rdx], tmm0);
-    if (halves_ == 2) {
-      tilestored(ptr[rsp + rdx + 1024], tmm1);
-    }
-    for (int row = 0; row < rows_; ++row) {
-      mov(rax, ptr[r11 + row * 8]);
-      imul(rax, r15);
-      lea(rdx, ptr[r10 + rax]);
-      vmovups(Xbyak::Zmm(0), ptr[rsp + row * 64]);
-      if (direct_bf16_) {
-        EmitBf16Store(ptr[rdx], Xbyak::Zmm(0), valid0, k1);
-      } else {
-        EmitFloatStore(ptr[rdx], Xbyak::Zmm(0), valid0, k1);
-      }
-      if (halves_ == 2) {
-        vmovups(Xbyak::Zmm(1), ptr[rsp + 1024 + row * 64]);
-        if (direct_bf16_) {
-          EmitBf16Store(ptr[rdx + 32], Xbyak::Zmm(1), valid1, k2);
-        } else {
-          EmitFloatStore(ptr[rdx + 64], Xbyak::Zmm(1), valid1, k2);
-        }
-      }
-    }
+    EmitOutputPanel(tmm0, tmm1, rows_, 0, 0, valid0, valid1);
     add(r9, r14);
     add(r10, direct_bf16_ ? 64 : 128);
     dec(rbx);
     jnz(block_loop, T_NEAR);
+    EmitMPanelAdvance(panel_loop);
 
     L(all_done);
-    tilerelease();
-    add(rsp, kTileScratchBytes);
-    pop(r15);
-    pop(r14);
-    pop(r13);
-    pop(r12);
-    pop(rbx);
-    vzeroupper();
-    ret();
+    EmitAmxReturn();
   }
 
   int rows_;
@@ -1449,6 +1631,8 @@ class AmxW2Generator final : public Xbyak::CodeGenerator {
   int halves_;
   bool direct_bf16_;
   AmxJitPattern pattern_;
+  AmxW2Epilogue w2_epilogue_;
+  AmxTileStateMode tile_state_mode_;
   alignas(64) TileConfig config_;
 };
 
@@ -1466,11 +1650,13 @@ KernelCache& GetKernelCache() {
 KernelHandle GenerateKernel(const KernelKey& key) {
   if (key.isa == X86JitIsa::kAmxBf16) {
     if (key.operation == JitOperation::kW13) {
-      auto owner = std::make_shared<AmxW13Generator>(key.rows, key.silu_degree, key.amx_pattern, key.amx_silu_epilogue);
+      auto owner = std::make_shared<AmxW13Generator>(key.rows, key.silu_degree, key.amx_pattern, key.amx_silu_epilogue,
+                                                     key.amx_tile_state_mode);
       return KernelHandle{owner, owner->getCode<JitFunction>(), owner->getSize(), {}};
     }
     const bool direct_bf16 = key.output == JitOutput::kDirectBf16;
-    auto owner = std::make_shared<AmxW2Generator>(key.rows, key.n_valid, direct_bf16, key.amx_pattern);
+    auto owner = std::make_shared<AmxW2Generator>(key.rows, key.n_valid, direct_bf16, key.amx_pattern,
+                                                  key.amx_w2_epilogue, key.amx_tile_state_mode);
     return KernelHandle{owner, owner->getCode<JitFunction>(), owner->getSize(), {}};
   }
   if (key.operation == JitOperation::kW13) {
@@ -1528,7 +1714,8 @@ KernelKey W2Key(int rows, int n_valid, bool direct_bf16) {
                    direct_bf16 ? JitOutput::kDirectBf16 : JitOutput::kRouteF32};
 }
 
-KernelKey AmxW13Key(int rows, int degree, AmxJitPattern pattern, AmxSiluEpilogue silu_epilogue) {
+KernelKey AmxW13Key(int rows, int degree, AmxJitPattern pattern, AmxSiluEpilogue silu_epilogue,
+                    AmxTileStateMode tile_state_mode) {
   return KernelKey{X86JitIsa::kAmxBf16,
                    JitOperation::kW13,
                    static_cast<uint8_t>(rows),
@@ -1536,17 +1723,26 @@ KernelKey AmxW13Key(int rows, int degree, AmxJitPattern pattern, AmxSiluEpilogue
                    static_cast<uint8_t>(degree),
                    JitOutput::kPackedBf16,
                    pattern,
-                   silu_epilogue};
+                   silu_epilogue,
+                   AmxW2Epilogue::kBaseline,
+                   tile_state_mode};
 }
 
-KernelKey AmxW2Key(int rows, int n_valid, bool direct_bf16, AmxJitPattern pattern = AmxJitPattern::kM1N2) {
+KernelKey AmxW2Key(int rows, int n_valid, bool direct_bf16, AmxJitPattern pattern, AmxW2Epilogue w2_epilogue,
+                   AmxTileStateMode tile_state_mode) {
+  const JitOutput output =
+      direct_bf16 ? JitOutput::kDirectBf16
+                  : (w2_epilogue == AmxW2Epilogue::kTileStore ? JitOutput::kContiguousF32 : JitOutput::kRouteF32);
   return KernelKey{X86JitIsa::kAmxBf16,
                    JitOperation::kW2,
                    static_cast<uint8_t>(rows),
                    static_cast<uint8_t>(n_valid),
                    0,
-                   direct_bf16 ? JitOutput::kDirectBf16 : JitOutput::kRouteF32,
-                   pattern};
+                   output,
+                   pattern,
+                   AmxSiluEpilogue::kBaseline,
+                   w2_epilogue,
+                   tile_state_mode};
 }
 
 bool ResolveRowKernels(int rows, int degree, int hidden_size, bool direct_bf16, ImplementationMode mode) {
@@ -1564,29 +1760,32 @@ bool ResolveRowKernels(int rows, int degree, int hidden_size, bool direct_bf16, 
 }
 
 void ResolveAmxRowKernels(int rows, int degree, int hidden_size, bool direct_bf16, AmxJitPattern pattern,
-                          AmxSiluEpilogue silu_epilogue) {
-  ResolveKernel(AmxW13Key(rows, degree, pattern, silu_epilogue), ImplementationMode::kJit);
+                          AmxSiluEpilogue silu_epilogue, AmxW2Epilogue w2_epilogue, AmxTileStateMode tile_state_mode) {
+  ResolveKernel(AmxW13Key(rows, degree, pattern, silu_epilogue, tile_state_mode), ImplementationMode::kJit);
   if (pattern == AmxJitPattern::kM1N4) {
     // W13 may have an odd F16 block and W2 may have an odd N32 block.
-    ResolveKernel(AmxW13Key(rows, degree, AmxJitPattern::kM1N2, silu_epilogue), ImplementationMode::kJit);
+    ResolveKernel(AmxW13Key(rows, degree, AmxJitPattern::kM1N2, silu_epilogue, tile_state_mode),
+                  ImplementationMode::kJit);
     if (hidden_size >= 64) {
-      ResolveKernel(AmxW2Key(rows, 64, direct_bf16, pattern), ImplementationMode::kJit);
+      ResolveKernel(AmxW2Key(rows, 64, direct_bf16, pattern, w2_epilogue, tile_state_mode), ImplementationMode::kJit);
     }
     if ((hidden_size / 32) % 2 != 0) {
-      ResolveKernel(AmxW2Key(rows, 32, direct_bf16), ImplementationMode::kJit);
+      ResolveKernel(AmxW2Key(rows, 32, direct_bf16, AmxJitPattern::kM1N2, w2_epilogue, tile_state_mode),
+                    ImplementationMode::kJit);
     }
     const int tail = hidden_size % 32;
     if (tail != 0) {
-      ResolveKernel(AmxW2Key(rows, tail, direct_bf16), ImplementationMode::kJit);
+      ResolveKernel(AmxW2Key(rows, tail, direct_bf16, AmxJitPattern::kM1N2, w2_epilogue, tile_state_mode),
+                    ImplementationMode::kJit);
     }
     return;
   }
   if (hidden_size >= 32) {
-    ResolveKernel(AmxW2Key(rows, 32, direct_bf16, pattern), ImplementationMode::kJit);
+    ResolveKernel(AmxW2Key(rows, 32, direct_bf16, pattern, w2_epilogue, tile_state_mode), ImplementationMode::kJit);
   }
   const int tail = hidden_size % 32;
   if (tail != 0) {
-    ResolveKernel(AmxW2Key(rows, tail, direct_bf16, pattern), ImplementationMode::kJit);
+    ResolveKernel(AmxW2Key(rows, tail, direct_bf16, pattern, w2_epilogue, tile_state_mode), ImplementationMode::kJit);
   }
 }
 
@@ -1629,11 +1828,14 @@ void PrepareJitKernels(const std::vector<int>& row_counts, int silu_poly_degree,
 void PrepareAmxJitKernels(const std::vector<int>& row_counts, int silu_poly_degree, int hidden_size, bool direct_bf16) {
 #if defined(FUSED_CPP_MOE_HAS_XBYAK) && FUSED_CPP_MOE_HAS_XBYAK
   const AmxSiluEpilogue silu_epilogue = ResolveAmxSiluEpilogue();
-  std::array<std::array<bool, 33>, 3> prepared{};
-  auto prepare_rows = [&](int kernel_rows, AmxJitPattern kernel_pattern) {
-    bool& is_prepared = prepared[AmxPatternIndex(kernel_pattern)][kernel_rows];
+  const AmxW2Epilogue w2_epilogue = EffectiveAmxW2Epilogue(ResolveAmxW2Epilogue(), direct_bf16);
+  const AmxTileStateMode requested_tile_state_mode = ResolveAmxTileStateMode();
+  std::array<std::array<std::array<bool, 2>, 33>, 3> prepared{};
+  auto prepare_rows = [&](int kernel_rows, AmxJitPattern kernel_pattern, AmxTileStateMode tile_state_mode) {
+    bool& is_prepared = prepared[AmxPatternIndex(kernel_pattern)][kernel_rows][AmxTileStateModeIndex(tile_state_mode)];
     if (!is_prepared) {
-      ResolveAmxRowKernels(kernel_rows, silu_poly_degree, hidden_size, direct_bf16, kernel_pattern, silu_epilogue);
+      ResolveAmxRowKernels(kernel_rows, silu_poly_degree, hidden_size, direct_bf16, kernel_pattern, silu_epilogue,
+                           w2_epilogue, tile_state_mode);
       is_prepared = true;
     }
   };
@@ -1644,22 +1846,22 @@ void PrepareAmxJitKernels(const std::vector<int>& row_counts, int silu_poly_degr
     const AmxJitPattern pattern = ResolveAmxJitPattern(rows);
     if (pattern == AmxJitPattern::kM2N2) {
       if (rows >= 32) {
-        prepare_rows(32, pattern);
+        prepare_rows(32, pattern, EffectiveAmxTileStateMode(requested_tile_state_mode, rows / 32));
       }
       const int remainder = rows % 32;
       if (remainder > 16) {
-        prepare_rows(remainder, pattern);
+        prepare_rows(remainder, pattern, AmxTileStateMode::kPerCall);
       } else if (remainder > 0) {
-        prepare_rows(remainder, AmxJitPattern::kM1N2);
+        prepare_rows(remainder, AmxJitPattern::kM1N2, AmxTileStateMode::kPerCall);
       }
       continue;
     }
     if (rows >= 16) {
-      prepare_rows(16, pattern);
+      prepare_rows(16, pattern, EffectiveAmxTileStateMode(requested_tile_state_mode, rows / 16));
     }
     const int tail = rows % 16;
     if (tail != 0) {
-      prepare_rows(tail, pattern);
+      prepare_rows(tail, pattern, AmxTileStateMode::kPerCall);
     }
   }
 #else
@@ -1668,6 +1870,14 @@ void PrepareAmxJitKernels(const std::vector<int>& row_counts, int silu_poly_degr
   (void)hidden_size;
   (void)direct_bf16;
   throw std::runtime_error("x86_amx_bf16 requires a build with the Xbyak submodule available");
+#endif
+}
+
+bool AmxW2UsesContiguousRouteOutput() {
+#if defined(FUSED_CPP_MOE_HAS_XBYAK) && FUSED_CPP_MOE_HAS_XBYAK
+  return ResolveAmxW2Epilogue() == AmxW2Epilogue::kTileStore;
+#else
+  return false;
 #endif
 }
 
@@ -1866,24 +2076,27 @@ void ComputeW13Amx(const uint16_t* a, int a_stride, const uint16_t* packed_b, ui
 
   const AmxJitPattern pattern = ResolveAmxJitPattern(rows);
   const AmxSiluEpilogue silu_epilogue = ResolveAmxSiluEpilogue();
+  const AmxTileStateMode requested_tile_state_mode = ResolveAmxTileStateMode();
   auto run_single_m = [&](AmxJitPattern kernel_pattern, int kernel_block_count, int block_begin) {
     if (kernel_block_count <= 0) {
       return;
     }
     const int full_panels = rows / 16;
     const int tail_rows = rows % 16;
+    const AmxTileStateMode full_tile_state_mode = EffectiveAmxTileStateMode(requested_tile_state_mode, full_panels);
     KernelHandle full_kernel;
     KernelHandle tail_kernel;
     if (full_panels > 0) {
-      full_kernel =
-          ResolveKernel(AmxW13Key(16, silu_poly_degree, kernel_pattern, silu_epilogue), ImplementationMode::kJit);
-    }
-    if (tail_rows > 0) {
-      tail_kernel = ResolveKernel(AmxW13Key(tail_rows, silu_poly_degree, kernel_pattern, silu_epilogue),
+      full_kernel = ResolveKernel(AmxW13Key(16, silu_poly_degree, kernel_pattern, silu_epilogue, full_tile_state_mode),
                                   ImplementationMode::kJit);
     }
+    if (tail_rows > 0) {
+      tail_kernel = ResolveKernel(
+          AmxW13Key(tail_rows, silu_poly_degree, kernel_pattern, silu_epilogue, AmxTileStateMode::kPerCall),
+          ImplementationMode::kJit);
+    }
     const uint16_t* b_begin = packed_b + static_cast<int64_t>(block_begin) * k_pad * 32;
-    for (int panel = 0; panel < full_panels; ++panel) {
+    auto run_full_panels = [&](int panel, int panel_count) {
       AmxW13Call call{a + static_cast<int64_t>(panel) * 16 * a_stride,
                       b_begin,
                       c + static_cast<int64_t>(panel) * 16 * c_stride + block_begin * 16,
@@ -1892,8 +2105,16 @@ void ComputeW13Amx(const uint16_t* a, int a_stride, const uint16_t* packed_b, ui
                       static_cast<int64_t>(k_pad) * 64,
                       static_cast<int64_t>(c_stride) * 2,
                       kernel_block_count,
-                      &kSiluConstants};
+                      &kSiluConstants,
+                      panel_count};
       full_kernel.function(&call);
+    };
+    if (full_tile_state_mode == AmxTileStateMode::kMacroM) {
+      run_full_panels(0, full_panels);
+    } else {
+      for (int panel = 0; panel < full_panels; ++panel) {
+        run_full_panels(panel, 1);
+      }
     }
     if (tail_rows > 0) {
       AmxW13Call call{a + static_cast<int64_t>(full_panels) * 16 * a_stride,
@@ -1904,7 +2125,8 @@ void ComputeW13Amx(const uint16_t* a, int a_stride, const uint16_t* packed_b, ui
                       static_cast<int64_t>(k_pad) * 64,
                       static_cast<int64_t>(c_stride) * 2,
                       kernel_block_count,
-                      &kSiluConstants};
+                      &kSiluConstants,
+                      1};
       tail_kernel.function(&call);
     }
   };
@@ -1913,11 +2135,13 @@ void ComputeW13Amx(const uint16_t* a, int a_stride, const uint16_t* packed_b, ui
     const uint16_t* b_begin = packed_b + static_cast<int64_t>(block_begin) * k_pad * 32;
     const int full_pairs = rows / 32;
     const int remainder = rows % 32;
+    const AmxTileStateMode full_tile_state_mode = EffectiveAmxTileStateMode(requested_tile_state_mode, full_pairs);
     KernelHandle full_kernel;
     if (full_pairs > 0) {
-      full_kernel = ResolveKernel(AmxW13Key(32, silu_poly_degree, pattern, silu_epilogue), ImplementationMode::kJit);
+      full_kernel = ResolveKernel(AmxW13Key(32, silu_poly_degree, pattern, silu_epilogue, full_tile_state_mode),
+                                  ImplementationMode::kJit);
     }
-    for (int pair = 0; pair < full_pairs; ++pair) {
+    auto run_full_pairs = [&](int pair, int pair_count) {
       AmxW13Call call{a + static_cast<int64_t>(pair) * 32 * a_stride,
                       b_begin,
                       c + static_cast<int64_t>(pair) * 32 * c_stride + block_begin * 16,
@@ -1926,13 +2150,22 @@ void ComputeW13Amx(const uint16_t* a, int a_stride, const uint16_t* packed_b, ui
                       static_cast<int64_t>(k_pad) * 64,
                       static_cast<int64_t>(c_stride) * 2,
                       kernel_block_count,
-                      &kSiluConstants};
+                      &kSiluConstants,
+                      pair_count};
       full_kernel.function(&call);
+    };
+    if (full_tile_state_mode == AmxTileStateMode::kMacroM) {
+      run_full_pairs(0, full_pairs);
+    } else {
+      for (int pair = 0; pair < full_pairs; ++pair) {
+        run_full_pairs(pair, 1);
+      }
     }
     if (remainder > 0) {
       const AmxJitPattern remainder_pattern = remainder > 16 ? AmxJitPattern::kM2N2 : AmxJitPattern::kM1N2;
       KernelHandle remainder_kernel = ResolveKernel(
-          AmxW13Key(remainder, silu_poly_degree, remainder_pattern, silu_epilogue), ImplementationMode::kJit);
+          AmxW13Key(remainder, silu_poly_degree, remainder_pattern, silu_epilogue, AmxTileStateMode::kPerCall),
+          ImplementationMode::kJit);
       AmxW13Call call{a + static_cast<int64_t>(full_pairs) * 32 * a_stride,
                       b_begin,
                       c + static_cast<int64_t>(full_pairs) * 32 * c_stride + block_begin * 16,
@@ -1941,7 +2174,8 @@ void ComputeW13Amx(const uint16_t* a, int a_stride, const uint16_t* packed_b, ui
                       static_cast<int64_t>(k_pad) * 64,
                       static_cast<int64_t>(c_stride) * 2,
                       kernel_block_count,
-                      &kSiluConstants};
+                      &kSiluConstants,
+                      1};
       remainder_kernel.function(&call);
     }
   };
@@ -1997,11 +2231,27 @@ void ComputeW2Amx(const uint16_t* a, int a_stride, const uint16_t* packed_b, flo
   }
 
   const AmxJitPattern pattern = ResolveAmxJitPattern(rows);
+  const AmxW2Epilogue w2_epilogue = EffectiveAmxW2Epilogue(ResolveAmxW2Epilogue(), direct_bf16);
+  const AmxTileStateMode requested_tile_state_mode = ResolveAmxTileStateMode();
+  const bool contiguous_output = w2_epilogue == AmxW2Epilogue::kTileStore;
+  if (!contiguous_output && route_ids == nullptr) {
+    throw std::invalid_argument("AMX W2 route ids are required for a route-aware store epilogue");
+  }
   const int full_blocks = hidden_size / 32;
   const int main_begin = std::min(output_block_begin, full_blocks);
   const int main_end = std::min(output_block_end, full_blocks);
   const int tail_columns = hidden_size % 32;
   const int element_bytes = direct_bf16 ? 2 : 4;
+  auto output_for_row_offset = [&](void* output_begin, int row_offset) -> void* {
+    if (!contiguous_output || row_offset == 0) {
+      return output_begin;
+    }
+    return static_cast<void*>(static_cast<uint8_t*>(output_begin) +
+                              static_cast<int64_t>(row_offset) * route_stride * element_bytes);
+  };
+  auto routes_for_row_offset = [&](int row_offset) -> const int64_t* {
+    return contiguous_output ? nullptr : route_ids + row_offset;
+  };
 
   auto run_single_m_range = [&](int block_begin, int kernel_block_count, int n_valid, AmxJitPattern kernel_pattern) {
     if (kernel_block_count <= 0) {
@@ -2009,39 +2259,52 @@ void ComputeW2Amx(const uint16_t* a, int a_stride, const uint16_t* packed_b, flo
     }
     const int full_panels = rows / 16;
     const int tail_rows = rows % 16;
+    const AmxTileStateMode full_tile_state_mode = EffectiveAmxTileStateMode(requested_tile_state_mode, full_panels);
     KernelHandle full_kernel;
     KernelHandle tail_kernel;
     if (full_panels > 0) {
-      full_kernel = ResolveKernel(AmxW2Key(16, n_valid, direct_bf16, kernel_pattern), ImplementationMode::kJit);
+      full_kernel = ResolveKernel(AmxW2Key(16, n_valid, direct_bf16, kernel_pattern, w2_epilogue, full_tile_state_mode),
+                                  ImplementationMode::kJit);
     }
     if (tail_rows > 0) {
-      tail_kernel = ResolveKernel(AmxW2Key(tail_rows, n_valid, direct_bf16, kernel_pattern), ImplementationMode::kJit);
+      tail_kernel = ResolveKernel(
+          AmxW2Key(tail_rows, n_valid, direct_bf16, kernel_pattern, w2_epilogue, AmxTileStateMode::kPerCall),
+          ImplementationMode::kJit);
     }
     const uint16_t* b_begin = packed_b + static_cast<int64_t>(block_begin) * k_pad * 32;
     void* output_begin = direct_bf16 ? static_cast<void*>(direct_output + block_begin * 32)
                                      : static_cast<void*>(route_output + block_begin * 32);
-    for (int panel = 0; panel < full_panels; ++panel) {
+    auto run_full_panels = [&](int panel, int panel_count) {
       AmxW2Call call{a + static_cast<int64_t>(panel) * 16 * a_stride,
                      b_begin,
-                     output_begin,
-                     route_ids + panel * 16,
+                     output_for_row_offset(output_begin, panel * 16),
+                     routes_for_row_offset(panel * 16),
                      k_pad / 32,
                      static_cast<int64_t>(a_stride) * 2,
                      static_cast<int64_t>(k_pad) * 64,
                      static_cast<int64_t>(route_stride) * element_bytes,
-                     kernel_block_count};
+                     kernel_block_count,
+                     panel_count};
       full_kernel.function(&call);
+    };
+    if (full_tile_state_mode == AmxTileStateMode::kMacroM) {
+      run_full_panels(0, full_panels);
+    } else {
+      for (int panel = 0; panel < full_panels; ++panel) {
+        run_full_panels(panel, 1);
+      }
     }
     if (tail_rows > 0) {
       AmxW2Call call{a + static_cast<int64_t>(full_panels) * 16 * a_stride,
                      b_begin,
-                     output_begin,
-                     route_ids + full_panels * 16,
+                     output_for_row_offset(output_begin, full_panels * 16),
+                     routes_for_row_offset(full_panels * 16),
                      k_pad / 32,
                      static_cast<int64_t>(a_stride) * 2,
                      static_cast<int64_t>(k_pad) * 64,
                      static_cast<int64_t>(route_stride) * element_bytes,
-                     kernel_block_count};
+                     kernel_block_count,
+                     1};
       tail_kernel.function(&call);
     }
   };
@@ -2052,38 +2315,51 @@ void ComputeW2Amx(const uint16_t* a, int a_stride, const uint16_t* packed_b, flo
     }
     const int full_pairs = rows / 32;
     const int remainder = rows % 32;
+    const AmxTileStateMode full_tile_state_mode = EffectiveAmxTileStateMode(requested_tile_state_mode, full_pairs);
     const uint16_t* b_begin = packed_b + static_cast<int64_t>(block_begin) * k_pad * 32;
     void* output_begin = direct_bf16 ? static_cast<void*>(direct_output + block_begin * 32)
                                      : static_cast<void*>(route_output + block_begin * 32);
     KernelHandle full_kernel;
     if (full_pairs > 0) {
-      full_kernel = ResolveKernel(AmxW2Key(32, n_valid, direct_bf16, AmxJitPattern::kM2N2), ImplementationMode::kJit);
+      full_kernel =
+          ResolveKernel(AmxW2Key(32, n_valid, direct_bf16, AmxJitPattern::kM2N2, w2_epilogue, full_tile_state_mode),
+                        ImplementationMode::kJit);
     }
-    for (int pair = 0; pair < full_pairs; ++pair) {
+    auto run_full_pairs = [&](int pair, int pair_count) {
       AmxW2Call call{a + static_cast<int64_t>(pair) * 32 * a_stride,
                      b_begin,
-                     output_begin,
-                     route_ids + pair * 32,
+                     output_for_row_offset(output_begin, pair * 32),
+                     routes_for_row_offset(pair * 32),
                      k_pad / 32,
                      static_cast<int64_t>(a_stride) * 2,
                      static_cast<int64_t>(k_pad) * 64,
                      static_cast<int64_t>(route_stride) * element_bytes,
-                     kernel_block_count};
+                     kernel_block_count,
+                     pair_count};
       full_kernel.function(&call);
+    };
+    if (full_tile_state_mode == AmxTileStateMode::kMacroM) {
+      run_full_pairs(0, full_pairs);
+    } else {
+      for (int pair = 0; pair < full_pairs; ++pair) {
+        run_full_pairs(pair, 1);
+      }
     }
     if (remainder > 0) {
       const AmxJitPattern remainder_pattern = remainder > 16 ? AmxJitPattern::kM2N2 : AmxJitPattern::kM1N2;
-      KernelHandle remainder_kernel =
-          ResolveKernel(AmxW2Key(remainder, n_valid, direct_bf16, remainder_pattern), ImplementationMode::kJit);
+      KernelHandle remainder_kernel = ResolveKernel(
+          AmxW2Key(remainder, n_valid, direct_bf16, remainder_pattern, w2_epilogue, AmxTileStateMode::kPerCall),
+          ImplementationMode::kJit);
       AmxW2Call call{a + static_cast<int64_t>(full_pairs) * 32 * a_stride,
                      b_begin,
-                     output_begin,
-                     route_ids + full_pairs * 32,
+                     output_for_row_offset(output_begin, full_pairs * 32),
+                     routes_for_row_offset(full_pairs * 32),
                      k_pad / 32,
                      static_cast<int64_t>(a_stride) * 2,
                      static_cast<int64_t>(k_pad) * 64,
                      static_cast<int64_t>(route_stride) * element_bytes,
-                     kernel_block_count};
+                     kernel_block_count,
+                     1};
       remainder_kernel.function(&call);
     }
   };
