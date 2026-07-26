@@ -23,6 +23,7 @@ refs/
 
 # Local third-party source references
 /3rdparty/oneDNN/
+/3rdparty/ktransformers/
 
 # Lock files (not tracked for this project)
 uv.lock

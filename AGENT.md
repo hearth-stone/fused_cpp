@@ -8,6 +8,10 @@ optimization governance live in on-demand docs listed below.
 Remote development and benchmark runs primarily use the `Arm-codex` SSH alias.
 When the user says `aws机器`, use the `AmazonECS8Cores` SSH alias.
 
+If a requested remote instance cannot be reached, stop the task immediately
+and report the connection failure. Do not switch to another machine, continue
+with local implementation or analysis, or perform unrelated fallback work.
+
 ### Arm-codex
 
 - Host alias: `Arm-codex`
