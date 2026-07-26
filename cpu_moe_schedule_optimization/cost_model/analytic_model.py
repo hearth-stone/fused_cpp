@@ -16,6 +16,7 @@ epilogue service ceilings.
 
 from __future__ import annotations
 
+import copy
 import json
 import math
 from dataclasses import asdict, dataclass
@@ -26,11 +27,19 @@ from typing import Iterable, Mapping, Sequence
 try:
     from gemm_cost_model import ExecutionSchedule, fused_expert_work
     from sve_bf16_kernel_model import SveBf16KernelExecution, SveBf16KernelProfile
-    from weight_window import WeightWindowGeometry, fused_moe_weight_windows
+    from weight_window import (
+        WeightWindowGeometry,
+        fused_moe_task_weight_windows,
+        fused_moe_weight_windows,
+    )
 except ImportError:  # pragma: no cover - package-style import
     from .gemm_cost_model import ExecutionSchedule, fused_expert_work
     from .sve_bf16_kernel_model import SveBf16KernelExecution, SveBf16KernelProfile
-    from .weight_window import WeightWindowGeometry, fused_moe_weight_windows
+    from .weight_window import (
+        WeightWindowGeometry,
+        fused_moe_task_weight_windows,
+        fused_moe_weight_windows,
+    )
 
 
 ANALYTIC_MACHINE_SCHEMA_VERSION = 1
@@ -638,6 +647,7 @@ class AnalyticMoeCostModel:
             concurrent_ranks=int(concurrent_ranks),
             llc_bytes_per_rank=self.calibration.caches.llc_bytes_per_rank,
         )
+        self.task_stage_window_policy = None
 
     @property
     def supported_shapes(self) -> tuple[tuple[int, ...], ...]:
@@ -676,10 +686,50 @@ class AnalyticMoeCostModel:
         blocks, remainder = divmod(max(int(routes), 0), 12)
         return blocks * 12 + self.m12_tail_capacity(remainder)
 
-    def window_bytes_per_worker(self, threads: int) -> int:
+    def with_task_stage_window_policy(self, policy):
+        """Return a clone that analytically lowers the policy-selected windows."""
+        if not callable(getattr(policy, "select", None)):
+            raise TypeError("task stage-window policy must provide select(routes, threads)")
+        bound = copy.copy(self)
+        bound.task_stage_window_policy = policy
+        return bound
+
+    @lru_cache(maxsize=4096)
+    def _task_weight_geometries(
+        self,
+        routes: int,
+        threads: int,
+    ) -> tuple[WeightWindowGeometry, WeightWindowGeometry]:
+        if self.task_stage_window_policy is None:
+            return self._w13_geometry, self._w2_geometry
+        w13_target, w2_target = self.task_stage_window_policy.select(int(routes), int(threads))
+        if min(w13_target, w2_target) < -1:
+            raise ValueError("task stage-window policy must return -1 or non-negative byte counts")
+        if w13_target == -1 and w2_target == -1:
+            return self._w13_geometry, self._w2_geometry
+        return fused_moe_task_weight_windows(
+            hidden_size=self.hidden_size,
+            intermediate_size=self.intermediate_size,
+            n_tile=self.policy.backend_n_tile,
+            inherited_target_bytes=self.weight_window_bytes,
+            w13_target_bytes=int(w13_target),
+            w2_target_bytes=int(w2_target),
+            w13_fallback_ranges=self.w13_split_chunks,
+        )
+
+    def task_max_stage_bytes(self, routes: int, threads: int) -> int:
+        w13, w2 = self._task_weight_geometries(int(routes), int(threads))
+        return max(w13.max_range_bytes, w2.max_range_bytes)
+
+    def window_bytes_per_worker(self, threads: int, routes: int | None = None) -> int:
+        w13, w2 = (
+            (self._w13_geometry, self._w2_geometry)
+            if routes is None
+            else self._task_weight_geometries(int(routes), int(threads))
+        )
         return max(
-            self._w13_geometry.bytes_per_worker(threads),
-            self._w2_geometry.bytes_per_worker(threads),
+            w13.bytes_per_worker(threads),
+            w2.bytes_per_worker(threads),
         )
 
     def _l2_miss_fraction(self, working_set_bytes: float) -> float:
@@ -891,16 +941,17 @@ class AnalyticMoeCostModel:
             self.intermediate_size,
             down_output_element_bytes=self.down_output_element_bytes,
         )
+        w13_geometry, w2_geometry = self._task_weight_geometries(routes, threads)
         w13_mapping = self._mapper.lower(
             work.w13,
-            ExecutionSchedule(threads=threads, sequential_n_ranges=self.w13_window_ranges),
+            ExecutionSchedule(threads=threads, sequential_n_ranges=w13_geometry.ranges),
         )
         w2_mapping = self._mapper.lower(
             work.w2,
-            ExecutionSchedule(threads=threads, sequential_n_ranges=self.w2_window_ranges),
+            ExecutionSchedule(threads=threads, sequential_n_ranges=w2_geometry.ranges),
         )
-        w13_demand = self._stage_demand("w13", w13_mapping, self._w13_geometry)
-        w2_demand = self._stage_demand("w2", w2_mapping, self._w2_geometry)
+        w13_demand = self._stage_demand("w13", w13_mapping, w13_geometry)
+        w2_demand = self._stage_demand("w2", w2_mapping, w2_geometry)
         overhead_ns = self.calibration.overheads.expert_fixed_ns + routes * self.calibration.overheads.route_ns
         phases: list[AnalyticPhase] = []
         if overhead_ns > 0.0:

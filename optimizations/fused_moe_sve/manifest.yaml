@@ -345,6 +345,9 @@ features:
     status: enabled
     implementation: >-
       cpu_moe_schedule_optimization/planners/stage_window_policy.py;
+      cpu_moe_schedule_optimization/cost_model/phase_model.py;
+      cpu_moe_schedule_optimization/cost_model/analytic_model.py;
+      csrc/moe_planner/interval_planner.cpp;
       src/fused_cpp/moe/plan.py;
       csrc/moe/arm/common/fused_moe_bf16_tiled.cpp
     hypothesis: >-
@@ -359,6 +362,8 @@ features:
       PYTHONPATH=src .venv/bin/python -m pytest -q
       tests/test_moe_plan_v2.py
       tests/test_moe_cost_model_v2.py
+      tests/test_moe_analytic_model.py
+      tests/test_moe_native_interval_planner.py
       tests/test_fused_moe_bf16_tiled.py
       -k plan_v2_strict_and_tail_pool
     benchmark: >-

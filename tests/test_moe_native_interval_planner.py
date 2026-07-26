@@ -14,6 +14,7 @@ sys.path[:0] = [str(COST_MODEL), str(PLANNERS)]
 
 from interval_planner import IntervalPlanner  # noqa: E402
 from phase_model import ContentionCostModel  # noqa: E402
+from stage_window_policy import AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V1  # noqa: E402
 
 
 PROFILE = (
@@ -139,6 +140,41 @@ def test_native_parallel_cold_search_matches_python(iso_mode: str) -> None:
             _assert_plan_equivalent(expected, actual)
             assert actual["planner_backend"] == "cpp"
             assert actual["planner_workers"] == workers
+
+
+def test_native_stage_window_execution_model_matches_python() -> None:
+    _native_extension()
+    model = ContentionCostModel(PROFILE)
+    reference = IntervalPlanner(
+        model,
+        num_cores=8,
+        native_cold_planner=False,
+        task_stage_window_policy=AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V1,
+    )
+    native = IntervalPlanner(
+        model,
+        num_cores=8,
+        native_cold_planner=True,
+        planner_threads=2,
+        task_stage_window_policy=AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V1,
+    )
+    experts = [
+        (0, 384),
+        (1, 192),
+        (2, 144),
+        (3, 120),
+        (4, 96),
+        (5, 48),
+        (6, 12),
+        (7, 4),
+    ]
+
+    expected = reference.plan(experts)
+    actual = native.plan(experts)
+
+    _assert_plan_equivalent(expected, actual)
+    assert actual["strict_candidates"] == len(reference.shapes)
+    assert reference.model.dag_makespan([(192, 4, []), (192, 4, [])]) < model.dag_makespan([(192, 4, []), (192, 4, [])])
 
 
 def test_explicit_native_request_rejects_unsupported_model() -> None:

@@ -786,7 +786,7 @@ cold search。
 | Idling | 允许主动等待以避开争用 | planner 可选择 strict 以禁止 pool；一旦选择 tail-pool，fixed lane 可运行时立即启动，released group non-idling 地领取 pooled expert；ready-token 路径仅填充无可运行 expert 的空闲 lane | 受限 non-idling 剪枝 |
 | Workload 输入 | 任意合法 global 或 rank-local route histogram | planner 接受任意 histogram；catalog preset 只扩展验证覆盖，不过滤运行时输入 | 不剪枝 |
 | Route combine | 任意满足 TopK release 约束和 CPU 容量的 merge 排程 | planner 不搜索 combine；默认 executor 采用 expert-first 单 token 贪心和连续收尾 | 外层启发式限制 |
-| Kernel variant | 任意未被支配的实现 | ARM `auto` 先要求完整 `jit/xbyak_exact_m` legacy split/no-split pair，再加入同 identity 的实测 global packed-B byte-window variants；Plan V2 在精确匹配的 AmazonC5192Cores TP4/F512 split profile 上默认按确定函数 $g(M,t)$ 覆盖单 task 的 W13/W2 window，其余 profile 继承 global policy，该覆盖不参与 cost-model 排序；缺少完整 JIT legacy pair 时整体回退 static pair；x86 AMX 使用不进入 planner 的确定性 per-expert pattern/cache policy，AVX-512/AMX 共用确定性 team-N/wave policy | 实例候选限制与 runtime policy |
+| Kernel variant | 任意未被支配的实现 | ARM `auto` 先要求完整 `jit/xbyak_exact_m` legacy split/no-split pair，再加入同 identity 的实测 global packed-B byte-window variants；Plan V2 在精确匹配的 AmazonC5192Cores TP4/F512 split profile 上默认按确定函数 $g(M,t)$ 覆盖单 task 的 W13/W2 window，其余 profile 继承 global policy；$g$ 在每个 shape/tail-pool 候选中确定性解析并进入执行成本，但 window 不成为自由搜索变量；缺少完整 JIT legacy pair 时整体回退 static pair；x86 AMX 使用不进入 planner 的确定性 per-expert pattern/cache policy，AVX-512/AMX 共用确定性 team-N/wave policy | 实例候选限制与 runtime policy |
 | Isolated time | 真实 $I_i(t)$ | production 默认仍为经验公式；可选 analytic backend 由 kernel demand、cache traffic 和机器 service curves 计算 | cost 近似，不剪枝可行域 |
 | Contention | 任意动态活跃配置上的真实 $D_i(\mathcal Z)$ | production 默认为实测 profile；analytic backend 按 matrix/L1/L2/LLC/DRAM/epilogue 共享容量推进事件 | cost 近似，不剪枝可行域 |
 
@@ -1334,20 +1334,44 @@ $$
 operator-wide policy，`0` 表示该 stage 使用 legacy range 规则，正值表示
 tile-aligned byte target。tail-pool task 使用 pool 的实际宽度，而不是原 strict
 head 宽度。$g_\theta$ 是按机器、NUMA、shape 和 kernel identity 命名的确定性
-策略，在 $(v,\sigma)$ 已选定后应用，因此不扩大
-$\mathcal V_{\mathrm{profiled}}\times\Sigma_v$ 的搜索空间，也不改变候选 makespan
-评分。plan cache 和结果 metadata 必须包含策略名称，避免不同规则共享计划。
+策略。对每个已有候选 $(v,\sigma)$，planner 先由候选确定各 task 的 $t_i$，再
+唯一解析 $g_\theta(M_i,t_i)$，之后才计算：
 
-由于现有 empirical table 校准的是继承 global policy 的时间，post-plan
-override 的收益不是 cost model 的预测结果，不能计入 predicted regret 或绝对
-时间准确性声明。当前只有同时精确匹配双 NUMA AmazonC5192Cores 的 TP4
+$$
+\widehat C_\theta(v,\sigma)
+=\widehat C\left(v,\sigma;
+\{g_\theta(M_i,t_i)\}_{i\in\mathcal J}\right).
+$$
+
+因此候选集合仍是原来的
+$\mathcal V_{\mathrm{profiled}}\times\Sigma_v$ 加已有 tail-pool 候选，没有增加
+$S_{13}$ 或 $S_2$ 的枚举维度。plan cache 和结果 metadata 必须包含策略名称，
+避免不同规则共享计划。
+
+对 empirical phase model，现有 isolated table 仍校准于 global policy；在没有
+独立 window-isolated residual 前，$\widehat I(M,t)$ 保持原表值，不凭空外推
+range dispatch 的单独修正。但该总时间会按实际
+$(r_{13,i},\widehat S_{13,i},r_{2,i},\widehat S_{2,i})$ 拆成 W13/W2 range
+phase，contention simulator 使用每个时刻真实 active phase 的
+$\sum_i\widehat S_{s,i}$ 计算 equivalent working set。因而策略带来的并发
+cache-pressure 变化进入 makespan；单 task 的绝对时间仍受原 isolated
+calibration 限制。解析 backend 则直接用实际 geometry 重算 range overhead、
+owner L2/LLC miss、DRAM demand 和 $\widehat I(M,t)$。
+
+profile 的 homogeneous full-call anchor 只有在该 route 和 shape 的所有 lane
+都返回 `-1/-1` 时继续使用；任一 lane 命中 override 时必须走 stage event
+simulation，不能拿 global-policy full-call 时间覆盖新执行语义。候选的
+`active_working_set_bytes` 与 per-worker owner-window 诊断也按每个 lane 实际
+task window 计算。
+
+当前只有同时精确匹配双 NUMA AmazonC5192Cores 的 TP4
 `H=4096,F=512,E=256`、96-core rank、SVE JIT exact-M、split-W13 profile
 identity 和 rank CPU 集合时，已在两个 NUMA rank 上验证的
 `amazon_c5_192c_tp4_f512_v1` 作为默认 runtime policy；任一字段不匹配或显式
 设置 `use_default_stage_window_policy=False` 时都继承 global policy。该默认是
-受限的确定性 runtime 规则，不代表窗口已成为 cost-model 搜索变量。特别是单个
-M12 panel 不复用 B，额外 range 通常只有 dispatch 和 lane-width 代价，不能仅按
-cache 容量规则强制细分。
+受限的确定性 execution policy，不代表窗口已成为 cost-model 搜索变量。特别是
+单个 M12 panel 不复用 B，额外 range 通常只有 dispatch 和 lane-width 代价，
+不能仅按 cache 容量规则强制细分。
 
 ### 8.4 x86 per-expert pattern/cache 与 team-N/wave policy
 
@@ -2010,3 +2034,4 @@ route/thread/mixed-distribution 验证前，解析 backend 保持 opt-in。
 | 2026-07-26 | v0.35 | 将 schema-v2 empirical cold planner 等价迁移到 C++，并以 OpenMP 在 strict 和 dynamic 两阶段分别并行评分候选；固定 candidate index 保证跨线程数确定性，GIL 在搜索期间释放，Python/analytic fallback 与 cache-hit 路径保留。192-core 主机前 96 核上，默认 8T 将 bimodal/captured cold search 从 Python 59.784/274.342 ms 降至 1.421/3.488 ms；该变更不修改公式、候选空间、剪枝或 runtime 调度语义。 |
 | 2026-07-26 | v0.36 | Plan V2 增加 per-task W13/W2 packed-B byte-window override；planner 可在选定 task/DAG 后应用命名的确定性 $g(M,t)$，不扩大或重新评分搜索空间。记录 AmazonC5192Cores NUMA0 TP4/F512 静态策略及 7 个 E2E workload：active-set-128/64/32 分别提升 28.14%/10.38%/1.66%，未覆盖 case 最大观测回退 0.32%；该机器专用策略保持 opt-in，待独立窗口 calibration 后才可进入 scored production policy。 |
 | 2026-07-26 | v0.37 | 将 `amazon_c5_192c_tp4_f512_v1` 设为精确 profile-bound 默认：只匹配双 NUMA AmazonC5192Cores TP4/F512、96-core rank、SVE JIT exact-M split-W13 identity，并按 selected model 分别解析，no-split 和其他 profile 不受影响；增加 `use_default_stage_window_policy=False` opt-out。NUMA1 active-set-64/128 独立复测分别提升 10.58%/29.71%，与 NUMA0 一致；该 runtime policy 仍不进入 cost-model 评分或跨机器外推。 |
+| 2026-07-26 | v0.38 | 将确定性 $g(M,t)$ 前移到候选执行建模：empirical backend 按实际 W13/W2 range 和瞬时 working set 进行 contention event simulation，analytic backend 同时重算 range/cache/DRAM demand 与 isolated time；命中 override 的 workload 禁用 global-policy full-call anchor，Python/native cold planner 共用同一组已解析 geometry。shape、tail-pool 和 kernel variant 候选均未增加，window 仍不是自由搜索变量。 |

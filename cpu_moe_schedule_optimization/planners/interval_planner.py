@@ -68,7 +68,7 @@ class PlannerCostModel(Protocol):
 
     def profiled_full_call_time(self, routes: int, shape) -> float: ...
 
-    def window_bytes_per_worker(self, threads: int) -> int: ...
+    def window_bytes_per_worker(self, threads: int, routes: int | None = None) -> int: ...
 
 
 def _partitions(n: int, parts: Sequence[int]) -> List[Tuple[int, ...]]:
@@ -121,9 +121,18 @@ class IntervalPlanner:
         planner_threads: int | None = None,
         task_stage_window_policy: TaskStageWindowPolicy | None = None,
     ):
-        self.model = model
+        self.task_stage_window_policy = task_stage_window_policy
+        if task_stage_window_policy is None:
+            self.model = model
+        else:
+            binder = getattr(model, "with_task_stage_window_policy", None)
+            if not callable(binder):
+                raise ProfileCompatibilityError(
+                    "task stage-window policy requires a cost model that can bind execution windows"
+                )
+            self.model = binder(task_stage_window_policy)
         self.num_cores = int(num_cores)
-        model_widths = getattr(model, "supported_widths", None)
+        model_widths = getattr(self.model, "supported_widths", None)
         self.widths = tuple(widths or model_widths or _default_widths(self.num_cores))
         self.cpu_ids = tuple(int(cpu) for cpu in (cpu_ids if cpu_ids is not None else range(num_cores)))
         if len(self.cpu_ids) != self.num_cores or len(set(self.cpu_ids)) != num_cores:
@@ -131,8 +140,8 @@ class IntervalPlanner:
 
         if shapes is not None:
             candidates = [tuple(int(value) for value in shape) for shape in shapes]
-        elif model.schema_version >= 2:
-            candidates = list(_model_candidate_shapes(model, self.num_cores))
+        elif self.model.schema_version >= 2:
+            candidates = list(_model_candidate_shapes(self.model, self.num_cores))
         else:
             candidates = _partitions(self.num_cores, self.widths)
         self.shapes = tuple(
@@ -144,7 +153,6 @@ class IntervalPlanner:
             raise ProfileCompatibilityError(
                 f"no supported shape covers {self.num_cores} cores with widths {self.widths}"
             )
-        self.task_stage_window_policy = task_stage_window_policy
         self._native_planner = self._create_native_planner(
             native_cold_planner=native_cold_planner,
             planner_threads=planner_threads,
@@ -176,8 +184,7 @@ class IntervalPlanner:
         if not callable(exporter):
             if explicitly_requested:
                 raise RuntimeError(
-                    "native cold planner was requested but the cost model "
-                    "does not support native calibration export"
+                    "native cold planner was requested but the cost model does not support native calibration export"
                 )
             return None
         if planner_threads is None:
@@ -248,39 +255,61 @@ class IntervalPlanner:
     ) -> float:
         if self.model.schema_version < 2:
             return 0.0
-        if use_full_workload_anchor and self._uses_full_workload_anchor(experts):
+        if use_full_workload_anchor and self._uses_full_workload_anchor(experts, shape):
             relative = self.model.relative_full_call_uncertainty(experts[0][1], shape)
             return makespan * relative / math.sqrt(self.model.profile_runs)
         relative = max(self.model.relative_uncertainty(routes, shape) for _, routes in experts)
         waves = max(1, math.ceil(len(experts) / len(shape)))
         return makespan * relative / math.sqrt(waves * self.model.profile_runs)
 
+    def _task_max_stage_bytes(self, routes: int, threads: int) -> int:
+        resolver = getattr(self.model, "task_max_stage_bytes", None)
+        if callable(resolver):
+            return int(resolver(routes, threads))
+        return int(self.model.max_stage_bytes)
+
+    def _task_window_bytes_per_worker(self, routes: int, threads: int) -> int:
+        resolver = self.model.window_bytes_per_worker
+        if self.task_stage_window_policy is not None:
+            return int(resolver(threads, routes))
+        return int(resolver(threads))
+
     def active_working_set_bytes(self, shape, tasks=None) -> int:
         if tasks is None:
             active_lanes = len(shape)
-        else:
-            active_lanes = len({(core, threads) for _, _, core, threads, _ in tasks})
-        return active_lanes * self.model.max_stage_bytes
+            return active_lanes * self.model.max_stage_bytes
+        lane_bytes: dict[tuple[int, int], int] = {}
+        for _, routes, core, threads, _ in tasks:
+            resource = (core, threads)
+            lane_bytes[resource] = max(
+                lane_bytes.get(resource, 0),
+                self._task_max_stage_bytes(routes, threads),
+            )
+        return sum(lane_bytes.values())
 
     def window_bytes_per_worker(self, shape, tasks=None) -> tuple[int, ...]:
         if tasks is None:
-            active_widths = tuple(int(width) for width in shape)
-        else:
-            active_widths = tuple(
-                threads
-                for _, threads in sorted(
-                    {(core, threads) for _, _, core, threads, _ in tasks},
-                )
+            return tuple(self.model.window_bytes_per_worker(int(width)) for width in shape)
+        lane_windows: dict[tuple[int, int], int] = {}
+        for _, routes, core, threads, _ in tasks:
+            resource = (core, threads)
+            lane_windows[resource] = max(
+                lane_windows.get(resource, 0),
+                self._task_window_bytes_per_worker(routes, threads),
             )
-        return tuple(self.model.window_bytes_per_worker(width) for width in active_widths)
+        return tuple(lane_windows[resource] for resource in sorted(lane_windows))
 
-    def _uses_full_workload_anchor(self, experts) -> bool:
-        return (
+    def _uses_full_workload_anchor(self, experts, shape) -> bool:
+        eligible = (
             self.model.has_full_workload_anchors
             and len(experts) == self.model.local_experts
             and bool(experts)
             and all(routes == experts[0][1] for _, routes in experts)
         )
+        if not eligible:
+            return False
+        resolver = getattr(self.model, "can_use_full_workload_anchor", None)
+        return not callable(resolver) or bool(resolver(experts[0][1], shape))
 
     def score_shape(self, experts, shape):
         signature = tuple(int(value) for value in shape)
@@ -288,7 +317,7 @@ class IntervalPlanner:
             raise ProfileCompatibilityError(f"shape {signature} is not supported by {self.model.profile_path.name}")
         lanes = self._lanes(signature)
         tasks = self._build_tasks(experts, lanes, self._assign(experts, lanes))
-        if self._uses_full_workload_anchor(experts):
+        if self._uses_full_workload_anchor(experts, signature):
             return self.model.profiled_full_call_time(experts[0][1], signature), tasks
         return self._score(tasks), tasks
 
@@ -460,15 +489,22 @@ class IntervalPlanner:
             heappush(availability, (finish, group))
 
         peak_active = self._peak_active_tasks(intervals)
-        fixed_widths = tuple(
-            threads
-            for _, threads in sorted(
-                {(core_begin, threads) for task_id, (_, _, core_begin, threads, _) in enumerate(tasks) if not pooled[task_id]}
+        fixed_windows: dict[tuple[int, int], int] = {}
+        for task_id in fixed_task_ids:
+            _, routes, core_begin, threads, _ = tasks[task_id]
+            resource = (core_begin, threads)
+            fixed_windows[resource] = max(
+                fixed_windows.get(resource, 0),
+                self._task_window_bytes_per_worker(routes, threads),
             )
-        )
         active_pool_groups = min(len(pooled_task_ids), group_count)
-        active_widths = fixed_widths + (pool_threads,) * active_pool_groups
-        return simulation_tasks, peak_active, active_widths
+        pooled_window = max(
+            (self._task_window_bytes_per_worker(tasks[task_id][1], pool_threads) for task_id in pooled_task_ids),
+            default=0,
+        )
+        active_windows = tuple(fixed_windows[resource] for resource in sorted(fixed_windows))
+        active_windows += (pooled_window,) * active_pool_groups
+        return simulation_tasks, peak_active, active_windows
 
     def _tail_pool_candidate(
         self,
@@ -478,7 +514,7 @@ class IntervalPlanner:
         pool_threads: int,
         max_pooled_routes: int,
     ) -> dict:
-        simulation_tasks, peak_active, active_widths = self._tail_pool_simulation(
+        simulation_tasks, peak_active, active_windows = self._tail_pool_simulation(
             strict_candidate["tasks"],
             pool_threads=pool_threads,
             max_pooled_routes=max_pooled_routes,
@@ -492,6 +528,10 @@ class IntervalPlanner:
             use_full_workload_anchor=False,
         )
         pooled_tasks = sum(routes <= max_pooled_routes for _, routes in experts)
+        task_working_sets = sorted(
+            (self._task_max_stage_bytes(routes, threads) for routes, threads, _ in simulation_tasks),
+            reverse=True,
+        )
         return {
             "shape": shape,
             "execution_mode": _ASYNC_EXECUTION_TAIL_POOL,
@@ -502,10 +542,8 @@ class IntervalPlanner:
             "uncertainty_ns": uncertainty,
             "pessimistic_ns": makespan + uncertainty,
             "tasks": strict_candidate["tasks"],
-            "active_working_set_bytes": peak_active * self.model.max_stage_bytes,
-            "window_bytes_per_worker": tuple(
-                self.model.window_bytes_per_worker(width) for width in active_widths
-            ),
+            "active_working_set_bytes": sum(task_working_sets[:peak_active]),
+            "window_bytes_per_worker": active_windows,
             "resource_groups": peak_active,
         }
 

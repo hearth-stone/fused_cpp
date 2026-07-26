@@ -192,6 +192,13 @@ struct NativeIntervalPlanner::Impl {
     int64_t working_set_bytes = 0;
   };
 
+  struct StageGeometry {
+    int w13_ranges = 1;
+    int w2_ranges = 1;
+    int64_t w13_chunk_bytes = 0;
+    int64_t w2_chunk_bytes = 0;
+  };
+
   struct SimulationTask {
     int routes = 0;
     int threads = 0;
@@ -201,7 +208,8 @@ struct NativeIntervalPlanner::Impl {
   struct TailPoolSimulation {
     std::vector<SimulationTask> tasks;
     int peak_active = 0;
-    std::vector<int> active_widths;
+    int64_t active_working_set_bytes = 0;
+    std::vector<int64_t> window_bytes_per_worker;
   };
 
   explicit Impl(IntervalCostModelConfig model_config) : config(std::move(model_config)) {
@@ -210,6 +218,21 @@ struct NativeIntervalPlanner::Impl {
     }
     if (config.profile_runs <= 0) {
       throw std::invalid_argument("profile_runs must be positive");
+    }
+    for (size_t index = 0; index < config.task_stage_windows.size(); ++index) {
+      const IntervalStageWindowEntry& entry = config.task_stage_windows[index];
+      if (entry.min_routes <= 0 || entry.max_routes < entry.min_routes || entry.threads <= 0 || entry.w13_ranges <= 0 ||
+          entry.w2_ranges <= 0 || entry.w13_chunk_bytes <= 0 || entry.w2_chunk_bytes <= 0) {
+        throw std::invalid_argument("task stage-window entries must have positive geometry and route ranges");
+      }
+      for (size_t previous = 0; previous < index; ++previous) {
+        const IntervalStageWindowEntry& other = config.task_stage_windows[previous];
+        const bool overlaps = entry.threads == other.threads && entry.min_routes <= other.max_routes &&
+                              other.min_routes <= entry.max_routes;
+        if (overlaps) {
+          throw std::invalid_argument("task stage-window entries must not overlap for one thread width");
+        }
+      }
     }
 
     std::map<int, std::map<int, double>> iso_by_threads;
@@ -413,9 +436,42 @@ struct NativeIntervalPlanner::Impl {
     return owner_tiles * tile_bytes;
   }
 
-  int64_t WindowBytesPerWorker(int threads) const {
-    return std::max(OwnerRangeBytes(config.w13_chunk_bytes, config.w13_tile_bytes, threads),
-                    OwnerRangeBytes(config.w2_chunk_bytes, config.w2_tile_bytes, threads));
+  const IntervalStageWindowEntry* FindStageWindow(int routes, int threads) const {
+    for (const IntervalStageWindowEntry& entry : config.task_stage_windows) {
+      if (entry.threads == threads && entry.min_routes <= routes && routes <= entry.max_routes) {
+        return &entry;
+      }
+    }
+    return nullptr;
+  }
+
+  StageGeometry TaskStageGeometry(int routes, int threads) const {
+    const IntervalStageWindowEntry* entry = FindStageWindow(routes, threads);
+    if (entry == nullptr) {
+      return {
+          config.w13_window_ranges,
+          config.w2_window_ranges,
+          config.w13_chunk_bytes,
+          config.w2_chunk_bytes,
+      };
+    }
+    return {
+        entry->w13_ranges,
+        entry->w2_ranges,
+        entry->w13_chunk_bytes,
+        entry->w2_chunk_bytes,
+    };
+  }
+
+  int64_t TaskMaxStageBytes(int routes, int threads) const {
+    const StageGeometry geometry = TaskStageGeometry(routes, threads);
+    return std::max(geometry.w13_chunk_bytes, geometry.w2_chunk_bytes);
+  }
+
+  int64_t WindowBytesPerWorker(int routes, int threads) const {
+    const StageGeometry geometry = TaskStageGeometry(routes, threads);
+    return std::max(OwnerRangeBytes(geometry.w13_chunk_bytes, config.w13_tile_bytes, threads),
+                    OwnerRangeBytes(geometry.w2_chunk_bytes, config.w2_tile_bytes, threads));
   }
 
   std::vector<Phase> TaskPhases(int routes, int threads) const {
@@ -428,18 +484,19 @@ struct NativeIntervalPlanner::Impl {
     if (overhead > 0.0) {
       phases.push_back({overhead, 0});
     }
-    const int w13_ranges = std::max(config.w13_window_ranges, 1);
+    const StageGeometry geometry = TaskStageGeometry(routes, threads);
+    const int w13_ranges = std::max(geometry.w13_ranges, 1);
     const double w13_phase = compute * (2.0 / 3.0) / w13_ranges;
     for (int range = 0; range < w13_ranges; ++range) {
       if (w13_phase > 0.0) {
-        phases.push_back({w13_phase, config.w13_chunk_bytes});
+        phases.push_back({w13_phase, geometry.w13_chunk_bytes});
       }
     }
-    const int w2_ranges = std::max(config.w2_window_ranges, 1);
+    const int w2_ranges = std::max(geometry.w2_ranges, 1);
     const double w2_phase = compute / 3.0 / w2_ranges;
     for (int range = 0; range < w2_ranges; ++range) {
       if (w2_phase > 0.0) {
-        phases.push_back({w2_phase, config.w2_chunk_bytes});
+        phases.push_back({w2_phase, geometry.w2_chunk_bytes});
       }
     }
     return phases;
@@ -773,13 +830,17 @@ struct NativeIntervalPlanner::Impl {
     return median <= 0.0 ? 0.0 : std::max({median - p10, p90 - median, 0.0}) / median;
   }
 
-  bool UsesFullWorkloadAnchor(const std::vector<Expert>& experts) const {
+  bool UsesFullWorkloadAnchor(const std::vector<Expert>& experts, const std::vector<int>& shape) const {
     if (!config.has_full_workload_anchors || static_cast<int>(experts.size()) != config.local_experts ||
         experts.empty()) {
       return false;
     }
-    return std::all_of(experts.begin(), experts.end(),
-                       [&](const Expert& expert) { return expert.routes == experts.front().routes; });
+    if (!std::all_of(experts.begin(), experts.end(),
+                     [&](const Expert& expert) { return expert.routes == experts.front().routes; })) {
+      return false;
+    }
+    return std::none_of(shape.begin(), shape.end(),
+                        [&](int threads) { return FindStageWindow(experts.front().routes, threads) != nullptr; });
   }
 
   double Uncertainty(const std::vector<Expert>& experts, const std::vector<int>& shape, double makespan,
@@ -787,7 +848,7 @@ struct NativeIntervalPlanner::Impl {
     if (config.schema_version < 2) {
       return 0.0;
     }
-    if (use_full_workload_anchor && UsesFullWorkloadAnchor(experts)) {
+    if (use_full_workload_anchor && UsesFullWorkloadAnchor(experts, shape)) {
       const double relative = RelativeFullCallUncertainty(experts.front().routes, shape);
       return makespan * relative / std::sqrt(config.profile_runs);
     }
@@ -896,37 +957,35 @@ std::vector<NativeIntervalPlanner::Impl::SimulationTask> ToSimulationTasks(const
   return result;
 }
 
-std::vector<int> ActiveWidths(const std::vector<IntervalTask>& tasks) {
-  std::set<std::pair<int, int>> resources;
-  for (const IntervalTask& task : tasks) {
-    resources.insert({task.core_begin, task.threads});
-  }
-  std::vector<int> widths;
-  widths.reserve(resources.size());
-  for (const auto& [core_begin, threads] : resources) {
-    (void)core_begin;
-    widths.push_back(threads);
-  }
-  return widths;
-}
-
 IntervalCandidate BuildStrictCandidate(const NativeIntervalPlanner::Impl& model, const std::vector<Expert>& experts,
                                        const std::vector<int>& shape) {
   IntervalCandidate candidate;
   candidate.shape = shape;
   candidate.tasks = BuildStrictTasks(model, experts, shape);
-  if (model.UsesFullWorkloadAnchor(experts)) {
+  if (model.UsesFullWorkloadAnchor(experts, shape)) {
     candidate.makespan_ns = model.ProfiledCurve(model.full_call_curves, experts.front().routes, shape);
   } else {
     candidate.makespan_ns = model.DagMakespan(ToSimulationTasks(candidate.tasks));
   }
   candidate.uncertainty_ns = model.Uncertainty(experts, shape, candidate.makespan_ns, true);
   candidate.pessimistic_ns = candidate.makespan_ns + candidate.uncertainty_ns;
-  const std::vector<int> active_widths = ActiveWidths(candidate.tasks);
-  candidate.resource_groups = static_cast<int>(active_widths.size());
-  candidate.active_working_set_bytes = static_cast<int64_t>(candidate.resource_groups) * model.config.max_stage_bytes;
-  for (int width : active_widths) {
-    candidate.window_bytes_per_worker.push_back(model.WindowBytesPerWorker(width));
+  std::map<std::pair<int, int>, int64_t> resource_working_sets;
+  std::map<std::pair<int, int>, int64_t> resource_owner_windows;
+  for (const IntervalTask& task : candidate.tasks) {
+    const std::pair<int, int> resource = {task.core_begin, task.threads};
+    resource_working_sets[resource] =
+        std::max(resource_working_sets[resource], model.TaskMaxStageBytes(task.routes, task.threads));
+    resource_owner_windows[resource] =
+        std::max(resource_owner_windows[resource], model.WindowBytesPerWorker(task.routes, task.threads));
+  }
+  candidate.resource_groups = static_cast<int>(resource_working_sets.size());
+  for (const auto& [resource, bytes] : resource_working_sets) {
+    (void)resource;
+    candidate.active_working_set_bytes += bytes;
+  }
+  for (const auto& [resource, bytes] : resource_owner_windows) {
+    (void)resource;
+    candidate.window_bytes_per_worker.push_back(bytes);
   }
   return candidate;
 }
@@ -1061,16 +1120,33 @@ std::optional<NativeIntervalPlanner::Impl::TailPoolSimulation> BuildTailPoolSimu
   }
 
   simulation.peak_active = PeakActiveTasks(intervals);
-  std::set<std::pair<int, int>> fixed_resources;
-  for (int task_id : fixed_task_ids) {
-    fixed_resources.insert({tasks[task_id].core_begin, tasks[task_id].threads});
+  std::vector<int64_t> task_working_sets;
+  task_working_sets.reserve(simulation.tasks.size());
+  for (const NativeIntervalPlanner::Impl::SimulationTask& task : simulation.tasks) {
+    task_working_sets.push_back(model.TaskMaxStageBytes(task.routes, task.threads));
   }
-  for (const auto& [core_begin, threads] : fixed_resources) {
-    (void)core_begin;
-    simulation.active_widths.push_back(threads);
+  std::sort(task_working_sets.begin(), task_working_sets.end(), std::greater<int64_t>());
+  for (int index = 0; index < std::min<int>(simulation.peak_active, task_working_sets.size()); ++index) {
+    simulation.active_working_set_bytes += task_working_sets[index];
+  }
+
+  std::map<std::pair<int, int>, int64_t> fixed_windows;
+  for (int task_id : fixed_task_ids) {
+    const IntervalTask& task = tasks[task_id];
+    const std::pair<int, int> resource = {task.core_begin, task.threads};
+    fixed_windows[resource] = std::max(fixed_windows[resource], model.WindowBytesPerWorker(task.routes, task.threads));
+  }
+  for (const auto& [resource, bytes] : fixed_windows) {
+    (void)resource;
+    simulation.window_bytes_per_worker.push_back(bytes);
   }
   const int active_pool_groups = std::min<int>(pooled_task_ids.size(), group_count);
-  simulation.active_widths.insert(simulation.active_widths.end(), active_pool_groups, pool_threads);
+  int64_t pooled_window = 0;
+  for (int task_id : pooled_task_ids) {
+    pooled_window = std::max(pooled_window, model.WindowBytesPerWorker(tasks[task_id].routes, pool_threads));
+  }
+  simulation.window_bytes_per_worker.insert(simulation.window_bytes_per_worker.end(), active_pool_groups,
+                                            pooled_window);
   return simulation;
 }
 
@@ -1094,10 +1170,8 @@ std::optional<IntervalCandidate> BuildTailPoolCandidate(const NativeIntervalPlan
   candidate.uncertainty_ns = model.Uncertainty(experts, candidate.shape, candidate.makespan_ns, false);
   candidate.pessimistic_ns = candidate.makespan_ns + candidate.uncertainty_ns;
   candidate.tasks = strict_candidate.tasks;
-  candidate.active_working_set_bytes = static_cast<int64_t>(simulation->peak_active) * model.config.max_stage_bytes;
-  for (int width : simulation->active_widths) {
-    candidate.window_bytes_per_worker.push_back(model.WindowBytesPerWorker(width));
-  }
+  candidate.active_working_set_bytes = simulation->active_working_set_bytes;
+  candidate.window_bytes_per_worker = simulation->window_bytes_per_worker;
   candidate.resource_groups = simulation->peak_active;
   return candidate;
 }

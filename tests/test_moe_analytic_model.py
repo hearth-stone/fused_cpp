@@ -22,6 +22,7 @@ from analytic_model import (  # noqa: E402
 )
 from interval_planner import IntervalPlanner  # noqa: E402
 from planned_moe import PlannedMoE  # noqa: E402
+from stage_window_policy import StageWindowBand, StaticStageWindowPolicy  # noqa: E402
 from sve_bf16_kernel_model import allocate_n_tiles  # noqa: E402
 from validate_analytic_model import build_validation_report  # noqa: E402
 
@@ -231,6 +232,38 @@ def test_split_w13_keeps_gemm_work_but_adds_range_overhead() -> None:
     assert unsplit_prediction.w13_demand.ranges == 1
     assert split_prediction.w13_demand.mapping.executed_flops == unsplit_prediction.w13_demand.mapping.executed_flops
     assert split_prediction.w13_ns > unsplit_prediction.w13_ns
+
+
+def test_stage_window_policy_changes_analytic_execution_without_expanding_search() -> None:
+    model = _model()
+    policy = StaticStageWindowPolicy(
+        name="synthetic-stage-windows",
+        bands=(
+            StageWindowBand(
+                min_routes=24,
+                max_routes=24,
+                thread_windows=((2, 2048, 1024),),
+            ),
+        ),
+    )
+    baseline = IntervalPlanner(model, num_cores=8, native_cold_planner=False)
+    planner = IntervalPlanner(
+        model,
+        num_cores=8,
+        native_cold_planner=False,
+        task_stage_window_policy=policy,
+    )
+
+    prediction = planner.model.predict_expert(routes=24, threads=2)
+
+    assert planner.shapes == baseline.shapes
+    assert prediction.w13_demand.ranges == 4
+    assert prediction.w2_demand.ranges == 4
+    assert prediction.w13_demand.window_bytes == 2048
+    assert prediction.w2_demand.window_bytes == 1024
+    assert planner.model.T_iso(24, 2) != model.T_iso(24, 2)
+    assert planner.model.task_max_stage_bytes(24, 2) == 2048
+    assert planner.model.task_max_stage_bytes(12, 2) == model.max_stage_bytes
 
 
 def test_shared_resource_capacity_derates_parallel_experts() -> None:

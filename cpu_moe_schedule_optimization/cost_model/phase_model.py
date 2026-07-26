@@ -9,11 +9,13 @@ behavior for reproducibility.
 
 from __future__ import annotations
 
+import copy
 import json
 import math
 import os
 import statistics
 from bisect import bisect_left
+from functools import lru_cache
 from pathlib import Path
 
 try:
@@ -23,6 +25,7 @@ try:
         ProfilePolicy,
         ProfileQuery,
     )
+    from weight_window import fused_moe_task_weight_windows
 except ImportError:  # pragma: no cover - package-style import
     from .iso_formula import IsoFormula, fit_from_measurements
     from .profile_catalog import (
@@ -30,6 +33,7 @@ except ImportError:  # pragma: no cover - package-style import
         ProfilePolicy,
         ProfileQuery,
     )
+    from .weight_window import fused_moe_task_weight_windows
 
 
 class ContentionCostModel:
@@ -198,6 +202,7 @@ class ContentionCostModel:
         self.has_full_workload_anchors = (
             self.schema_version >= 2 and self.local_experts > 0 and self.measurement_experts == self.local_experts
         )
+        self.task_stage_window_policy = None
 
     @staticmethod
     def _linear_intercept(points: list[tuple[int, float]]) -> float:
@@ -227,12 +232,89 @@ class ContentionCostModel:
         owner_tiles = math.ceil(range_tiles / threads)
         return owner_tiles * tile_bytes
 
-    def window_bytes_per_worker(self, threads: int) -> int:
-        """Maximum tile-aligned packed-B owner stripe across W13 and W2."""
-        return max(
-            self._owner_range_bytes(self.w13_chunk_bytes, self.w13_tile_bytes, threads),
-            self._owner_range_bytes(self.w2_chunk_bytes, self.w2_tile_bytes, threads),
+    def with_task_stage_window_policy(self, policy):
+        """Return an immutable-view clone whose execution model applies ``policy``."""
+        if self.schema_version < 2 or self.policy is None:
+            raise ProfileCompatibilityError("per-task stage windows require a schema-v2 profile")
+        if not callable(getattr(policy, "select", None)):
+            raise TypeError("task stage-window policy must provide select(routes, threads)")
+        if not callable(getattr(policy, "cost_model_entries", None)):
+            raise TypeError("task stage-window policy must provide finite cost_model_entries()")
+        bound = copy.copy(self)
+        bound.task_stage_window_policy = policy
+        return bound
+
+    @lru_cache(maxsize=4096)
+    def _task_stage_geometry(self, routes: int, threads: int) -> tuple[int, int, int, int]:
+        baseline = (
+            self.w13_window_ranges,
+            self.w13_chunk_bytes,
+            self.w2_window_ranges,
+            self.w2_chunk_bytes,
         )
+        if self.task_stage_window_policy is None:
+            return baseline
+        w13_target, w2_target = self.task_stage_window_policy.select(int(routes), int(threads))
+        if min(w13_target, w2_target) < -1:
+            raise ValueError("task stage-window policy must return -1 or non-negative byte counts")
+        if w13_target == -1 and w2_target == -1:
+            return baseline
+        assert self.policy is not None
+        w13, w2 = fused_moe_task_weight_windows(
+            hidden_size=self.policy.hidden_size,
+            intermediate_size=self.policy.intermediate_size,
+            n_tile=self.policy.backend_n_tile,
+            inherited_target_bytes=self.weight_window_bytes,
+            w13_target_bytes=int(w13_target),
+            w2_target_bytes=int(w2_target),
+            w13_fallback_ranges=self.w13_split_chunks,
+        )
+        return w13.ranges, w13.max_range_bytes, w2.ranges, w2.max_range_bytes
+
+    def task_max_stage_bytes(self, routes: int, threads: int) -> int:
+        _, w13_bytes, _, w2_bytes = self._task_stage_geometry(int(routes), int(threads))
+        return max(w13_bytes, w2_bytes)
+
+    def window_bytes_per_worker(self, threads: int, routes: int | None = None) -> int:
+        """Maximum tile-aligned packed-B owner stripe across W13 and W2."""
+        if routes is None:
+            w13_bytes = self.w13_chunk_bytes
+            w2_bytes = self.w2_chunk_bytes
+        else:
+            _, w13_bytes, _, w2_bytes = self._task_stage_geometry(int(routes), int(threads))
+        return max(
+            self._owner_range_bytes(w13_bytes, self.w13_tile_bytes, threads),
+            self._owner_range_bytes(w2_bytes, self.w2_tile_bytes, threads),
+        )
+
+    def can_use_full_workload_anchor(self, routes: int, shape) -> bool:
+        if not self.has_full_workload_anchors:
+            return False
+        if self.task_stage_window_policy is None:
+            return True
+        return all(self.task_stage_window_policy.select(int(routes), int(threads)) == (-1, -1) for threads in shape)
+
+    def _native_stage_window_rows(self) -> list[tuple[int, int, int, int, int, int, int]]:
+        if self.task_stage_window_policy is None:
+            return []
+        rows = []
+        for entry in self.task_stage_window_policy.cost_model_entries():
+            w13_ranges, w13_bytes, w2_ranges, w2_bytes = self._task_stage_geometry(
+                int(entry.min_routes),
+                int(entry.threads),
+            )
+            rows.append(
+                (
+                    int(entry.min_routes),
+                    int(entry.max_routes),
+                    int(entry.threads),
+                    w13_ranges,
+                    w2_ranges,
+                    w13_bytes,
+                    w2_bytes,
+                )
+            )
+        return rows
 
     @staticmethod
     def _native_shape_curve_rows(curves) -> list[tuple[list[int], int, float]]:
@@ -264,11 +346,9 @@ class ContentionCostModel:
             "max_stage_bytes": self.max_stage_bytes,
             "w13_tile_bytes": self.w13_tile_bytes,
             "w2_tile_bytes": self.w2_tile_bytes,
+            "task_stage_windows": self._native_stage_window_rows(),
             "call_setup_ns": self.call_setup_ns,
-            "isolated": [
-                (routes, threads, value)
-                for (routes, threads), value in sorted(self._iso.items())
-            ],
+            "isolated": [(routes, threads, value) for (routes, threads), value in sorted(self._iso.items())],
             "overheads": sorted(self._O.items()),
             "iso_formula": self.iso_formula.to_dict() if self.iso_formula is not None else None,
             "derate_2d": [
@@ -604,14 +684,15 @@ class ContentionCostModel:
         phases: list[tuple[float, int]] = []
         if overhead > 0:
             phases.append((overhead, 0))
-        w13_ranges = max(self.w13_window_ranges, 1)
+        w13_ranges, w13_bytes, w2_ranges, w2_bytes = self._task_stage_geometry(routes, threads)
+        w13_ranges = max(w13_ranges, 1)
         w13_phase = compute * (2.0 / 3.0) / w13_ranges
         for _ in range(w13_ranges):
-            phases.append((w13_phase, self.w13_chunk_bytes))
-        w2_ranges = max(self.w2_window_ranges, 1)
+            phases.append((w13_phase, w13_bytes))
+        w2_ranges = max(w2_ranges, 1)
         w2_phase = compute / 3.0 / w2_ranges
         for _ in range(w2_ranges):
-            phases.append((w2_phase, self.w2_chunk_bytes))
+            phases.append((w2_phase, w2_bytes))
         return [(duration, workset) for duration, workset in phases if duration > 0]
 
     def _working_set_derate(

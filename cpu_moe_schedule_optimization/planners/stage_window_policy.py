@@ -15,6 +15,8 @@ class TaskStageWindowPolicy(Protocol):
 
     def select(self, routes: int, threads: int) -> tuple[int, int]: ...
 
+    def cost_model_entries(self) -> tuple["StageWindowPolicyEntry", ...]: ...
+
 
 class StageWindowProfilePolicy(Protocol):
     mode: str
@@ -54,8 +56,8 @@ class StageWindowBand:
         widths = [threads for threads, _, _ in self.thread_windows]
         if any(threads <= 0 for threads in widths) or len(widths) != len(set(widths)):
             raise ValueError("thread widths must be positive and unique within a route band")
-        if any(min(w13_bytes, w2_bytes) <= 0 for _, w13_bytes, w2_bytes in self.thread_windows):
-            raise ValueError("explicit stage windows must be positive")
+        if any(min(w13_bytes, w2_bytes) < 0 for _, w13_bytes, w2_bytes in self.thread_windows):
+            raise ValueError("explicit stage windows must be non-negative")
 
     def select(self, routes: int, threads: int) -> tuple[int, int] | None:
         if not self.min_routes <= routes <= self.max_routes:
@@ -64,6 +66,23 @@ class StageWindowBand:
             if candidate_threads == threads:
                 return w13_bytes, w2_bytes
         return None
+
+
+@dataclass(frozen=True)
+class StageWindowPolicyEntry:
+    min_routes: int
+    max_routes: int
+    threads: int
+    w13_window_bytes: int
+    w2_window_bytes: int
+
+    def __post_init__(self) -> None:
+        if self.min_routes <= 0 or self.max_routes < self.min_routes:
+            raise ValueError("route band must be positive and non-empty")
+        if self.threads <= 0:
+            raise ValueError("threads must be positive")
+        if min(self.w13_window_bytes, self.w2_window_bytes) < 0:
+            raise ValueError("cost-model stage windows must be non-negative")
 
 
 @dataclass(frozen=True)
@@ -90,6 +109,20 @@ class StaticStageWindowPolicy:
             if selected is not None:
                 return selected
         return INHERIT_STAGE_WINDOW, INHERIT_STAGE_WINDOW
+
+    def cost_model_entries(self) -> tuple[StageWindowPolicyEntry, ...]:
+        """Return the finite deterministic mapping consumed by native planning."""
+        return tuple(
+            StageWindowPolicyEntry(
+                min_routes=band.min_routes,
+                max_routes=band.max_routes,
+                threads=threads,
+                w13_window_bytes=w13_bytes,
+                w2_window_bytes=w2_bytes,
+            )
+            for band in self.bands
+            for threads, w13_bytes, w2_bytes in band.thread_windows
+        )
 
 
 # Calibrated on both 96-core NUMA ranks of AmazonC5192Cores for the TP4
@@ -186,6 +219,7 @@ __all__ = [
     "AMAZON_C5_192C_NUMA0_TP4_F512_STAGE_WINDOWS_V1",
     "INHERIT_STAGE_WINDOW",
     "StageWindowBand",
+    "StageWindowPolicyEntry",
     "StageWindowProfilePolicy",
     "StaticStageWindowPolicy",
     "TaskStageWindowPolicy",

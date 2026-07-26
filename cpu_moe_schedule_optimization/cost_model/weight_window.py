@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 
 MIN_SVE_N_TILE = 8
+INHERIT_WEIGHT_WINDOW = -1
 
 
 def _ceil_div(value: int, divisor: int) -> int:
@@ -78,17 +79,45 @@ def fused_moe_weight_windows(
     w13_fallback_ranges: int,
 ) -> tuple[WeightWindowGeometry, WeightWindowGeometry]:
     """Return W13 and W2 window geometry for one fused expert."""
+    return fused_moe_task_weight_windows(
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        n_tile=n_tile,
+        inherited_target_bytes=target_bytes,
+        w13_target_bytes=INHERIT_WEIGHT_WINDOW,
+        w2_target_bytes=INHERIT_WEIGHT_WINDOW,
+        w13_fallback_ranges=w13_fallback_ranges,
+    )
+
+
+def fused_moe_task_weight_windows(
+    *,
+    hidden_size: int,
+    intermediate_size: int,
+    n_tile: int,
+    inherited_target_bytes: int,
+    w13_target_bytes: int,
+    w2_target_bytes: int,
+    w13_fallback_ranges: int,
+) -> tuple[WeightWindowGeometry, WeightWindowGeometry]:
+    """Resolve independent per-task stage targets against the global policy."""
+    if inherited_target_bytes < 0:
+        raise ValueError(f"inherited_target_bytes must be non-negative, got {inherited_target_bytes}")
+    if w13_target_bytes < INHERIT_WEIGHT_WINDOW or w2_target_bytes < INHERIT_WEIGHT_WINDOW:
+        raise ValueError("stage targets must be -1 or non-negative")
+    resolved_w13 = inherited_target_bytes if w13_target_bytes == INHERIT_WEIGHT_WINDOW else w13_target_bytes
+    resolved_w2 = inherited_target_bytes if w2_target_bytes == INHERIT_WEIGHT_WINDOW else w2_target_bytes
     w13 = stage_weight_window_geometry(
         k=hidden_size,
         n=2 * intermediate_size,
         n_tile=n_tile,
-        target_bytes=target_bytes,
+        target_bytes=resolved_w13,
         fallback_ranges=w13_fallback_ranges,
     )
     w2 = stage_weight_window_geometry(
         k=intermediate_size,
         n=hidden_size,
         n_tile=n_tile,
-        target_bytes=target_bytes,
+        target_bytes=resolved_w2,
     )
     return w13, w2

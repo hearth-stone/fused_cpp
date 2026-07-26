@@ -157,6 +157,26 @@ std::vector<IntervalShapeCurveEntry> parse_shape_curve_entries(const py::handle&
   return result;
 }
 
+std::vector<IntervalStageWindowEntry> parse_stage_window_entries(const py::handle& values) {
+  std::vector<IntervalStageWindowEntry> result;
+  for (const py::handle row_handle : py::reinterpret_borrow<py::iterable>(values)) {
+    const py::sequence row = py::reinterpret_borrow<py::sequence>(row_handle);
+    if (py::len(row) != 7) {
+      throw std::invalid_argument("native planner stage-window rows must have seven fields");
+    }
+    result.push_back({
+        py::cast<int>(row[0]),
+        py::cast<int>(row[1]),
+        py::cast<int>(row[2]),
+        py::cast<int>(row[3]),
+        py::cast<int>(row[4]),
+        py::cast<int64_t>(row[5]),
+        py::cast<int64_t>(row[6]),
+    });
+  }
+  return result;
+}
+
 IntervalIsoFormulaConfig parse_iso_formula(const py::handle& value) {
   IntervalIsoFormulaConfig result;
   if (value.is_none()) {
@@ -192,6 +212,9 @@ IntervalCostModelConfig parse_interval_cost_model(const py::dict& payload) {
   result.max_stage_bytes = required_value<int64_t>(payload, "max_stage_bytes");
   result.w13_tile_bytes = required_value<int64_t>(payload, "w13_tile_bytes");
   result.w2_tile_bytes = required_value<int64_t>(payload, "w2_tile_bytes");
+  if (payload.contains("task_stage_windows")) {
+    result.task_stage_windows = parse_stage_window_entries(payload["task_stage_windows"]);
+  }
   result.call_setup_ns = required_value<double>(payload, "call_setup_ns");
   result.isolated = parse_iso_entries(payload["isolated"]);
   result.overheads = parse_pairs(payload["overheads"]);

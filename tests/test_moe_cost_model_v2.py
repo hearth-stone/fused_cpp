@@ -459,9 +459,11 @@ def test_static_stage_window_policy_is_lowered_per_task(
     catalog: ProfileCatalog,
 ) -> None:
     _, model = models(catalog, "tp", 1024, 64)
+    baseline = IntervalPlanner(model, 32, native_cold_planner=False)
     planner = IntervalPlanner(
         model,
         32,
+        native_cold_planner=False,
         task_stage_window_policy=AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V1,
     )
     tasks = [
@@ -484,6 +486,20 @@ def test_static_stage_window_policy_is_lowered_per_task(
     assert pooled_bridge["task_threads"] == [2, 2, 8, 8]
     assert pooled_bridge["task_w13_window_bytes"] == [-1, 128 * 1024, 1024 * 1024, 4 * 1024 * 1024]
     assert pooled_bridge["task_w2_window_bytes"] == [-1, 256 * 1024, 512 * 1024, 1024 * 1024]
+    assert planner.shapes == baseline.shapes
+    assert planner.model is not model
+    assert planner.model.T_iso(192, 8) == model.T_iso(192, 8)
+    assert planner.model._task_stage_geometry(192, 8) == (
+        16,
+        1024 * 1024,
+        16,
+        512 * 1024,
+    )
+    concurrent = [(192, 8, []), (192, 8, [])]
+    assert planner.model.dag_makespan(concurrent) < model.dag_makespan(concurrent)
+    assert planner.model.can_use_full_workload_anchor(48, (16, 16))
+    assert not planner.model.can_use_full_workload_anchor(96, (8,) * 4)
+    assert len(planner.model.native_interval_planner_payload()["task_stage_windows"]) == 13
 
 
 def test_default_stage_window_policy_requires_exact_profile(

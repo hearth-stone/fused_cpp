@@ -158,6 +158,13 @@ Expert fixed and per-route runtime costs cover gather/dispatch/scatter work not
 yet represented by a dedicated physical mapper. They are deliberately separate
 from GEMM demand.
 
+When a deterministic Plan V2 stage-window policy is bound, each candidate
+resolves its task's W13/W2 targets from `(routes, actual_threads)` before
+calling this mapper. The resulting tile-aligned range geometry replaces the
+global geometry in both isolated and concurrent calculations. Window targets
+are therefore execution parameters of an existing shape candidate, not an
+additional search dimension.
+
 ## Concurrent Time
 
 The DAG simulator advances W13/W2 range phases. For every active phase \(i\),

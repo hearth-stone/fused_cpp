@@ -2,7 +2,7 @@
 
 Date: 2026-07-26
 
-Status: enabled by default for the exact measured profile identity
+Status: enabled by default and cost-model-aware for the exact measured profile identity
 
 ## Question
 
@@ -28,9 +28,10 @@ window arrays differs. Native correctness testing also forces small independent
 W13/W2 windows and verifies bit-exact output against the legacy async bridge.
 
 The runtime extension hash differs from the profile hash because the Plan V2
-ABI gained the two optional arrays. Therefore these measurements validate the
-post-plan runtime policy, not profile absolute-time accuracy or predicted
-regret.
+ABI gained the two optional arrays. Therefore these historical measurements
+validate the runtime policy, not profile absolute-time accuracy. The subsequent
+cost-model integration uses the same deterministic mapping but still requires
+held-out runtime validation before making absolute-error claims.
 
 ## Static policy
 
@@ -98,6 +99,19 @@ explicitly disabled `production_auto` control and the default
 The default resolver therefore reproduces the measured policy on both rank CPU
 sets and preserves the inherited path when no task matches a policy band.
 
+## Cost-model integration
+
+The policy is resolved for every existing shape/tail-pool candidate after its
+actual task width is known and before scoring. The empirical phase model keeps
+the profile's isolated time as its conservative baseline, then advances the
+actual W13/W2 range count and active working-set bytes through the contention
+simulator. The analytical model also recomputes range overhead and cache/DRAM
+demand. Python and native cold planners consume the same finite policy table.
+
+No stage-window value is enumerated: strict shapes, tail-pool thresholds, pool
+widths, and kernel variants are unchanged. A full-call anchor is retained only
+when every lane inherits the global window.
+
 ## Conclusions
 
 1. Per-task stage windows are useful when many 8T experts have 96-192 routes.
@@ -110,10 +124,11 @@ sets and preserves the inherited path when no task matches a policy band.
 4. A small number of overridden tasks is insufficient to move whole-call time.
    The captured distribution overrides 25 tasks but remains within noise.
 5. The policy is default-on only for the exact dual-NUMA machine/profile
-   identity and either validated 96-core rank CPU set. It remains a post-plan
-   runtime rule, not a scored cost-model candidate, and must not be extrapolated
-   to another machine, shape, kernel identity, or no-split profile. The
-   controlled baseline passes `use_default_stage_window_policy=False`.
+   identity and either validated 96-core rank CPU set. It is now part of each
+   candidate's execution cost, but remains a deterministic mapping rather than
+   a searched window dimension. It must not be extrapolated to another machine,
+   shape, kernel identity, or no-split profile. The controlled baseline passes
+   `use_default_stage_window_policy=False`.
 
 ## Command
 
