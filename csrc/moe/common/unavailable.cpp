@@ -46,7 +46,8 @@ at::Tensor fused_moe_bf16_tiled_async_plan_v2(
     at::Tensor, at::Tensor, at::Tensor, at::Tensor, int64_t, int64_t, at::Tensor, at::Tensor, at::Tensor,
     at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
     c10::optional<at::Tensor>, c10::optional<at::Tensor>, c10::optional<at::Tensor>, int64_t, std::string, int64_t,
-    bool, bool, int64_t, int64_t, int64_t, int64_t, int64_t, c10::optional<at::Tensor>) {
+    bool, bool, int64_t, int64_t, int64_t, int64_t, int64_t, c10::optional<at::Tensor>,
+    c10::optional<at::Tensor>, c10::optional<at::Tensor>) {
   unavailable();
 }
 

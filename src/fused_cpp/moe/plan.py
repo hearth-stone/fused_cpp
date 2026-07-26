@@ -43,6 +43,11 @@ _V2_SEQUENCE_FIELDS = (
     "task_range_granularities",
 )
 
+_V2_OPTIONAL_PER_TASK_FIELDS = (
+    "task_w13_window_bytes",
+    "task_w2_window_bytes",
+)
+
 
 def _integer_tensor(value: object, name: str) -> torch.Tensor:
     if isinstance(value, torch.Tensor):
@@ -92,6 +97,8 @@ class AsyncMoEPlanV2:
     task_stage_ids: torch.Tensor
     task_resize_points: torch.Tensor
     task_range_granularities: torch.Tensor
+    task_w13_window_bytes: torch.Tensor | None = None
+    task_w2_window_bytes: torch.Tensor | None = None
 
     @property
     def plan_version(self) -> int:
@@ -105,6 +112,10 @@ class AsyncMoEPlanV2:
         }[self.execution_mode]
 
     def __post_init__(self) -> None:
+        num_tasks = int(self.task_expert_ids.numel())
+        for name in _V2_OPTIONAL_PER_TASK_FIELDS:
+            if getattr(self, name) is None:
+                object.__setattr__(self, name, torch.full((num_tasks,), -1, dtype=torch.int64))
         self.validate()
 
     @classmethod
@@ -118,6 +129,13 @@ class AsyncMoEPlanV2:
         if missing:
             raise ValueError(f"Plan V2 is missing required fields: {', '.join(missing)}")
         tensors = {name: _integer_tensor(plan[name], name) for name in _V2_SEQUENCE_FIELDS}
+        num_tasks = int(tensors["task_expert_ids"].numel())
+        tensors.update(
+            {
+                name: _integer_tensor(plan.get(name, [-1] * num_tasks), name)
+                for name in _V2_OPTIONAL_PER_TASK_FIELDS
+            }
+        )
         return cls(
             num_threads=int(plan["num_threads"]),
             execution_mode=str(plan["execution_mode"]),
@@ -132,8 +150,9 @@ class AsyncMoEPlanV2:
             raise ValueError(f"execution_mode must be 'strict' or 'tail_pool', got {self.execution_mode!r}")
         if self.num_threads <= 0:
             raise ValueError(f"num_threads must be positive, got {self.num_threads}")
-        for name in _V2_SEQUENCE_FIELDS:
+        for name in (*_V2_SEQUENCE_FIELDS, *_V2_OPTIONAL_PER_TASK_FIELDS):
             tensor = getattr(self, name)
+            assert tensor is not None
             if not isinstance(tensor, torch.Tensor):
                 raise TypeError(f"{name} must be a tensor in a materialized plan")
             if tensor.device.type != "cpu":
@@ -173,6 +192,8 @@ class AsyncMoEPlanV2:
             "task_stage_ids": self.task_stage_ids,
             "task_resize_points": self.task_resize_points,
             "task_range_granularities": self.task_range_granularities,
+            "task_w13_window_bytes": self.task_w13_window_bytes,
+            "task_w2_window_bytes": self.task_w2_window_bytes,
         }
         for name, tensor in per_task.items():
             if tensor.numel() != num_tasks:
@@ -188,6 +209,12 @@ class AsyncMoEPlanV2:
         stages = _values(self.task_stage_ids)
         resize_points = _values(self.task_resize_points)
         range_granularities = _values(self.task_range_granularities)
+        assert self.task_w13_window_bytes is not None
+        assert self.task_w2_window_bytes is not None
+        w13_window_bytes = _values(self.task_w13_window_bytes)
+        w2_window_bytes = _values(self.task_w2_window_bytes)
+        if any(value < -1 for value in (*w13_window_bytes, *w2_window_bytes)):
+            raise ValueError("per-task stage windows must be -1 (inherit) or non-negative")
         for task, (core_begin, width) in enumerate(zip(core_begins, selected_widths)):
             if width <= 0:
                 raise ValueError(f"task_threads[{task}] must be positive")
@@ -335,6 +362,8 @@ def upgrade_legacy_async_plan(plan: Mapping[str, object]) -> dict[str, object]:
         "task_stage_ids": [ASYNC_MOE_STAGE_EXPERT] * num_tasks,
         "task_resize_points": [ASYNC_MOE_RESIZE_NONE] * num_tasks,
         "task_range_granularities": [ASYNC_MOE_FULL_EXPERT_RANGE] * num_tasks,
+        "task_w13_window_bytes": [-1] * num_tasks,
+        "task_w2_window_bytes": [-1] * num_tasks,
     }
 
 

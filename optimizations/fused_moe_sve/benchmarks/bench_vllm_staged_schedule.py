@@ -32,10 +32,15 @@ from fused_cpp.moe import (  # noqa: E402
     fused_moe_bf16_tiled_vllm_staged,
     prepare_fused_moe_bf16_tiled_weights,
 )
-from workload_catalog import synthetic_offline_workloads  # noqa: E402
+from stage_window_policy import (  # noqa: E402
+    AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V1,
+)
+from workload_catalog import default_offline_workloads  # noqa: E402
 
 
-PAPER_WORKLOADS = synthetic_offline_workloads()
+PAPER_WORKLOADS = default_offline_workloads()
+AUTO_VARIANT = "production_auto"
+STATIC_STAGE_WINDOW_VARIANT = "production_auto_stage_windows"
 DYNAMIC_POOL_VARIANT = "dynamic_16t_to_4t_pool"
 STATIC_SPLIT_VARIANT = "static_16t_to_4x4t"
 VLLM_VARIANT = "vllm_staged"
@@ -72,7 +77,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dynamic-short-pool",
         action="store_true",
-        help="send each released 4T group to one global short-expert task pool",
+        help="add a forced-4T tail-pool comparator alongside the default planner-selected variant",
+    )
+    parser.add_argument(
+        "--static-stage-windows",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "compare the default per-task W13/W2 window policy with an explicitly "
+            "disabled production-auto plan (default: enabled with --production-profile)"
+        ),
     )
     parser.add_argument(
         "--static-long-route-threshold",
@@ -333,9 +347,12 @@ def make_production_schedule(
     experts: int,
     tail_pool_threads: int | None = None,
     tail_pool_max_routes: int = 12,
+    static_stage_windows: bool = False,
 ) -> tuple[
     tuple[torch.Tensor, ...],
     AsyncMoEPlanV2,
+    AsyncMoEPlanV2,
+    AsyncMoEPlanV2 | None,
     AsyncMoEPlanV2 | None,
     dict[str, object],
     Callable[[int, int], float],
@@ -365,15 +382,53 @@ def make_production_schedule(
     runtime_extension_path = Path(native_module.__file__)
     runtime_extension_sha256 = hashlib.sha256(runtime_extension_path.read_bytes()).hexdigest()
     counts = [(expert, int(routes)) for expert, routes in enumerate(route_counts.tolist()) if routes > 0]
-    planner = PlannedMoE(model, threads, cpu_ids=cpu_ids)
+    # Keep the historical no-stage-window plan as the controlled comparator.
+    # PlannedMoE itself enables the matching static policy by default.
+    planner = PlannedMoE(
+        model,
+        threads,
+        cpu_ids=cpu_ids,
+        use_default_stage_window_policy=False,
+    )
     begin = time.perf_counter_ns()
     planner.plan_spec_for(counts)
     cold_plan_ns = time.perf_counter_ns() - begin
     begin = time.perf_counter_ns()
-    spec = planner.plan_spec_for(counts)
+    auto_spec = planner.plan_spec_for(counts)
     warm_plan_ns = time.perf_counter_ns() - begin
-    bridge = spec["bridge"]
-    strict_plan = AsyncMoEPlanV2.from_dict(bridge)
+    strict_spec = planner.plan_spec_for(counts, dynamic_tail_pool=False)
+    strict_plan = AsyncMoEPlanV2.from_dict(strict_spec["bridge"])
+    auto_plan = AsyncMoEPlanV2.from_dict(auto_spec["bridge"])
+    static_stage_window_plan = None
+    static_stage_window_metadata = None
+    if static_stage_windows:
+        static_planner = PlannedMoE(
+            model,
+            threads,
+            cpu_ids=cpu_ids,
+        )
+        static_spec = static_planner.plan_spec_for(counts)
+        baseline_bridge = auto_spec["bridge"]
+        static_bridge = static_spec["bridge"]
+        stage_fields = {"task_w13_window_bytes", "task_w2_window_bytes"}
+        if {
+            key: value for key, value in baseline_bridge.items() if key not in stage_fields
+        } != {
+            key: value for key, value in static_bridge.items() if key not in stage_fields
+        }:
+            raise RuntimeError("static stage-window policy changed the selected production-auto task plan")
+        static_stage_window_plan = AsyncMoEPlanV2.from_dict(static_bridge)
+        window_pairs = list(
+            zip(
+                static_bridge["task_w13_window_bytes"],
+                static_bridge["task_w2_window_bytes"],
+            )
+        )
+        static_stage_window_metadata = {
+            "name": AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V1.name,
+            "overridden_tasks": sum(w13 >= 0 or w2 >= 0 for w13, w2 in window_pairs),
+            "window_pairs": sorted({f"{w13}:{w2}" for w13, w2 in window_pairs if w13 >= 0 or w2 >= 0}),
+        }
     tail_pool_plan = None
     if tail_pool_threads is not None:
         tail_pool_spec = planner.plan_spec_for(
@@ -386,16 +441,24 @@ def make_production_schedule(
     return (
         schedule,
         strict_plan,
+        auto_plan,
+        static_stage_window_plan,
         tail_pool_plan,
         {
             "profile": str(profile),
             "profile_extension_sha256": policy.extension_sha256,
             "runtime_extension_sha256": runtime_extension_sha256,
             "extension_hash_match": runtime_extension_sha256 == policy.extension_sha256,
-            "shape": list(spec["shape"]),
-            "w13_split": bool(spec["w13_split"]),
+            "shape": list(auto_spec["shape"]),
+            "strict_shape": list(strict_spec["shape"]),
+            "execution_mode": auto_spec["execution_mode"],
+            "tail_pool_threads": auto_spec["tail_pool_threads"],
+            "tail_pool_max_routes": auto_spec["tail_pool_max_routes"],
+            "tail_pool_tasks": auto_spec["tail_pool_tasks"],
+            "w13_split": bool(auto_spec["w13_split"]),
             "cold_plan_ms": cold_plan_ns / 1.0e6,
             "warm_plan_ms": warm_plan_ns / 1.0e6,
+            "static_stage_windows": static_stage_window_metadata,
         },
         model.T_iso,
     )
@@ -425,6 +488,10 @@ def main() -> int:
         raise ValueError("--static-16-to-4 requires --production-profile for isolated-time lane assignment")
     if args.dynamic_short_pool and args.production_profile is None:
         raise ValueError("--dynamic-short-pool requires --production-profile")
+    if args.static_stage_windows is None:
+        args.static_stage_windows = args.production_profile is not None
+    elif args.static_stage_windows and args.production_profile is None:
+        raise ValueError("--static-stage-windows requires --production-profile")
     if args.dynamic_short_pool and (args.static_long_route_threshold <= 0 or args.threads % 4 != 0):
         raise ValueError("--dynamic-short-pool requires a positive route threshold and threads divisible by 4")
 
@@ -441,6 +508,8 @@ def main() -> int:
     planner_metadata: dict[str, object] | None = None
     iso_time_ns: Callable[[int, int], float] | None = None
     production_plan: AsyncMoEPlanV2 | None = None
+    auto_plan: AsyncMoEPlanV2 | None = None
+    static_stage_window_plan: AsyncMoEPlanV2 | None = None
     tail_pool_plan: AsyncMoEPlanV2 | None = None
     if args.production_profile is None:
         baseline_variant = "fixed_team_async"
@@ -452,8 +521,16 @@ def main() -> int:
         team_threads = int(schedule[2][0])
         w13_split = True
     else:
-        baseline_variant = "production_async"
-        schedule, production_plan, tail_pool_plan, planner_metadata, iso_time_ns = make_production_schedule(
+        baseline_variant = "production_strict"
+        (
+            schedule,
+            production_plan,
+            auto_plan,
+            static_stage_window_plan,
+            tail_pool_plan,
+            planner_metadata,
+            iso_time_ns,
+        ) = make_production_schedule(
             route_counts,
             profile=args.production_profile,
             threads=args.threads,
@@ -463,12 +540,17 @@ def main() -> int:
             experts=args.experts,
             tail_pool_threads=4 if args.dynamic_short_pool else None,
             tail_pool_max_routes=args.static_long_route_threshold,
+            static_stage_windows=args.static_stage_windows,
         )
         team_threads = None
         w13_split = bool(planner_metadata["w13_split"])
     static_schedule: tuple[torch.Tensor, ...] | None = None
     static_metadata: dict[str, object] | None = None
     variant_names = [baseline_variant]
+    if auto_plan is not None:
+        variant_names.append(AUTO_VARIANT)
+    if static_stage_window_plan is not None:
+        variant_names.append(STATIC_STAGE_WINDOW_VARIANT)
     if args.static_16_to_4:
         assert iso_time_ns is not None
         static_schedule, static_metadata = make_static_16t_to_4x4t_schedule(
@@ -520,6 +602,30 @@ def main() -> int:
                 topk_weights,
                 topk_ids,
                 tail_pool_plan,
+                global_num_experts=args.experts,
+                w13_split=w13_split,
+                out=outputs[name],
+            )
+        if name == AUTO_VARIANT:
+            assert auto_plan is not None
+            return fused_moe_bf16_tiled_async_plan(
+                hidden,
+                packed,
+                topk_weights,
+                topk_ids,
+                auto_plan,
+                global_num_experts=args.experts,
+                w13_split=w13_split,
+                out=outputs[name],
+            )
+        if name == STATIC_STAGE_WINDOW_VARIANT:
+            assert static_stage_window_plan is not None
+            return fused_moe_bf16_tiled_async_plan(
+                hidden,
+                packed,
+                topk_weights,
+                topk_ids,
+                static_stage_window_plan,
                 global_num_experts=args.experts,
                 w13_split=w13_split,
                 out=outputs[name],
@@ -597,6 +703,7 @@ def main() -> int:
 
     total_flops = 6 * args.tokens * args.top_k * args.hidden * args.intermediate
     baseline_ms = statistics.median(samples[baseline_variant])
+    auto_ms = statistics.median(samples[AUTO_VARIANT]) if AUTO_VARIANT in samples else baseline_ms
     records: list[dict[str, object]] = []
     for name in variants:
         median_ms = statistics.median(samples[name])
@@ -608,6 +715,7 @@ def main() -> int:
                 "p90_ms": percentile(samples[name], 0.90),
                 "aggregate_tflops": total_flops / median_ms / 1.0e9,
                 "gain_pct": 100.0 * (baseline_ms / median_ms - 1.0),
+                "gain_vs_auto_pct": 100.0 * (auto_ms / median_ms - 1.0),
                 "samples_ms": samples[name],
             }
         )
@@ -656,8 +764,16 @@ def main() -> int:
                 f"{planner_metadata['runtime_extension_sha256']} != "
                 f"{planner_metadata['profile_extension_sha256']}"
             )
+        pool_description = "none"
+        if planner_metadata["tail_pool_threads"] is not None:
+            pool_description = (
+                f"{planner_metadata['tail_pool_threads']}T/"
+                f"M<={planner_metadata['tail_pool_max_routes']}"
+            )
         print(
             f"production shape={tuple(planner_metadata['shape'])} "
+            f"mode={planner_metadata['execution_mode']} "
+            f"pool={pool_description} "
             f"plan_ms(cold/warm)={planner_metadata['cold_plan_ms']:.3f}/{planner_metadata['warm_plan_ms']:.3f}"
         )
     print("variant                  median_ms   TFLOP/s   gain_pct     p10_ms     p90_ms")
@@ -667,6 +783,9 @@ def main() -> int:
             f"{record['aggregate_tflops']:>9.3f} {record['gain_pct']:>10.2f} "
             f"{record['p10_ms']:>10.3f} {record['p90_ms']:>10.3f}"
         )
+    if static_stage_window_plan is not None:
+        static_record = next(record for record in records if record["variant"] == STATIC_STAGE_WINDOW_VARIANT)
+        print(f"static-stage-window gain vs production_auto: {static_record['gain_vs_auto_pct']:.2f}%")
     if args.output is not None:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps(result, indent=2) + "\n")

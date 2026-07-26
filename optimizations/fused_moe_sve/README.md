@@ -313,7 +313,7 @@ to compare the vLLM-style queue against the actual production planner:
 ```bash
 P=cpu_moe_schedule_optimization/cost_model/profiles/\
 contention_async_amazon_c5_192c_dual_numa_tp4_sve_F512_E256_\
-splitw13_schema_v2_xbyak_exactm_20260720.json
+splitw13_schema_v2_xbyak_exactm_20260726.json
 PYTHONPATH=src numactl --cpunodebind=0 --membind=0 taskset -c 0-95 \
   .venv/bin/python \
   optimizations/fused_moe_sve/benchmarks/bench_vllm_staged_schedule.py \
@@ -343,32 +343,45 @@ On AmazonC5192Cores NUMA0, the static transition reduced the median from
 the `11.631 ms` staged queue. With ready-token merge disabled, the corresponding
 medians were `12.560 ms` and `11.089 ms`, confirming that the gain comes from
 the expert DAG rather than merge overlap. This remains an experimental
-benchmark variant; the production planner still uses one static shape per
-call.
+benchmark variant; the production planner does not emit this external static
+team-fission DAG.
 
-`--dynamic-short-pool` keeps the production long-expert tasks but lets every
-released 4-thread group claim the next whole `M<=12` expert from one native
-global queue. The benchmark now emits an explicit Plan V2 `tail_pool` bridge;
-it does not use the legacy `FUSED_CPP_MOE_ASYNC_SHORT_POOL_*` environment
-switches. It removes the static short-lane assignment while retaining resident
-pinned threads and the existing fused expert kernel:
+The native Plan V2 executor always supports a whole-expert `tail_pool`, but
+`PlannedMoE` now decides whether to use it. The default planner compares strict
+execution with route thresholds `1/2/4/8/12` and aligned pool widths `1/2/4T`;
+the selected threshold determines which experts enter the pool, and the
+selected width determines how many resident workers claim each pooled expert.
+Fixed head tasks retain their planner-selected teams. `dynamic_tail_pool=False`
+requests the strict control, while `tail_pool_threads=T` forces a particular
+pool width for experiments.
+
+The benchmark emits strict and planner-selected variants by default. Adding
+`--dynamic-short-pool` also emits the historical forced-4T comparator. All
+variants use the native Plan V2 bridge rather than the legacy
+`FUSED_CPP_MOE_ASYNC_SHORT_POOL_*` environment switches:
 
 ```bash
 PYTHONPATH=src numactl --cpunodebind=0 --membind=0 taskset -c 0-95 \
   .venv/bin/python \
   optimizations/fused_moe_sve/benchmarks/bench_vllm_staged_schedule.py \
   --preset moe256-long-short-bimodal --production-profile "$P" \
-  --static-16-to-4 --dynamic-short-pool --route-dtype bf16 \
+  --dynamic-short-pool --route-dtype bf16 \
   --warmup 5 --runs 21
 ```
 
-On the same NUMA node, the Plan V2 rerun measured `10.836 ms` and
-`14.269 TFLOP/s`, 15.47% faster than Plan V2 strict and 8.28% faster than vLLM
-staged. The earlier legacy-switch and static-transition comparisons are kept
-in the linked result document. This is still a default-off planner action.
-`PlannedMoE.plan_spec_for` can force the transition with
-`tail_pool_threads=4`, but the cost model does not yet rank `tail_pool` against
-strict candidates automatically.
+On AmazonC5192Cores NUMA0, the planner selected a `6x16T` fixed head plus a
+`1T`, `M<=12` tail pool for the long/short bimodal workload. Median operator
+time fell from `12.529 ms` strict to `10.408 ms` (`+20.39%`,
+`14.856 TFLOP/s`), versus `10.801 ms` for forced 4T and `11.728 ms` for vLLM
+staged. Across uniform, active-set 8/16/32/64/128, tiered-hotspot, and the
+captured DSV4 routing workload, the planner retained strict execution; paired
+strict/auto medians differed by at most 0.38%, which is timing noise because
+the generated native plan is identical. Those experiments measured the Python
+cold planner at `60.581 ms` for bimodal and `272.151 ms` for captured routing;
+cache hits were `0.944 ms` and `2.396 ms`. The current C++ cold planner keeps
+the same plan/ranking and, with the default 8 candidate workers, measures
+`1.421 ms` and `3.488 ms` on the same host. Caching remains useful, but the
+first search no longer carries the old Python latency.
 
 On the 192-core host's first NUMA node, six balanced `M=2048` experts were
 13.1% slower with the staged queue than with fixed `6 x 16T` teams. For 256
@@ -821,9 +834,10 @@ ordering and nominal active-range bound, not a strict synchronized cache
 residency limit. A smaller range also caps useful team width at its N-tile
 count; the planner must account for this before selecting very small windows.
 
-The current planner does not choose this experimental variant automatically.
-Old split/no-split profiles describe only the 4 MiB-equivalent policy and must
-not be reused to score 1/2 MiB windows. Compare explicit sizes with:
+The planner chooses a global window only when an exact schema-v2 profile
+contains that window and its W13/W2 range counts. Old split/no-split profiles
+describe only the 4 MiB-equivalent policy and must not be reused to score
+1/2 MiB windows. Compare explicit sizes with:
 
 ```bash
 numactl --cpunodebind=0 --membind=0 taskset -c 0-95 \
@@ -839,6 +853,47 @@ For the tested TP4 shape, the best windows were 4/2/1 MiB for 4/2/1 threads per
 expert respectively. This is consistent with about 1 MiB of packed B per
 active worker, but the private-L2 and aggregate-cache effects remain
 confounded; treat it as a measured selection rule, not a universal constant.
+
+The async benchmark also accepts independent experimental pairs such as
+`--window-pairs-mib 4:4,4:2`. The route sweep in
+[`results/amazon_192c_stage_weight_windows.md`](results/amazon_192c_stage_weight_windows.md)
+shows that the two stages can prefer different windows at medium routes, while
+long routes still prefer about 1 MiB per worker for both stages.
+
+Plan V2 additionally carries optional `task_w13_window_bytes` and
+`task_w2_window_bytes` arrays. `-1` inherits the operator-wide policy, `0`
+uses the stage's legacy range rule, and a positive value selects an independent
+tile-aligned target. `PlannedMoE` can apply a named deterministic
+`TaskStageWindowPolicy` after it has selected the task DAG and widths; the
+policy is not a search dimension and does not alter cost-model scores.
+
+The first policy is default-on only for the exact dual-NUMA
+AmazonC5192Cores TP4 `H=4096,F=512,E=256`, 96-core/rank, SVE JIT exact-M
+split-W13 profile identity. `PlannedMoE` resolves it independently for each
+candidate profile, so no-split and nonmatching profiles retain their
+operator-wide windows. Pass `use_default_stage_window_policy=False` to build a
+controlled baseline. The benchmark below compares that disabled baseline with
+the default policy; `--no-static-stage-windows` suppresses the comparison:
+
+```bash
+numactl --cpunodebind=0 --membind=0 taskset -c 0-95 \
+  .venv/bin/python \
+  optimizations/fused_moe_sve/benchmarks/bench_vllm_staged_schedule.py \
+  --preset moe256-active-set-128 --production-profile <schema-v2-profile> \
+  --route-dtype bf16 --warmup 5 --runs 21
+```
+
+On the unchanged production-auto plan, static stage windows improved the
+active-set-128/64/32 cases by 28.14%/10.38%/1.66% and tiered-hotspot by 7.23%.
+Uniform and long/short cases were not overridden and differed by -0.32%/-0.08%.
+The captured DSV4 distribution changed by -0.22%. NUMA1 independently measured
++10.58%/+29.71% for active-set-64/128, so the policy is enabled for both exact
+rank CPU sets but is not generalized to other machines or shapes. Full results
+and applicability limits are recorded in
+[`results/amazon_192c_static_stage_window_policy.md`](results/amazon_192c_static_stage_window_policy.md).
+The default-on integration rerun, with no enable flag, measured +30.58%/+30.34%
+for active-set-128 on NUMA0/NUMA1 and +0.01% for the non-overridden uniform
+control.
 
 The split-W13 thread/weight mapping measurements are recorded in
 [`results/amazon_192c_thread_weight_working_set.md`](results/amazon_192c_thread_weight_working_set.md).

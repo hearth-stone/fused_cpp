@@ -171,7 +171,7 @@ p_i\in\mathcal A_i,\qquad
 q_i\in\{\mathrm{fixed},\mathrm{tail\_pool}\}.
 $$
 
-默认 production planner 只生成：
+strict 候选生成：
 
 $$
 \mathcal A_i=\{p_i\}=\{\bar t_i\},
@@ -179,7 +179,8 @@ $$
 $$
 
 其中 $\mathcal R_i$ 是合法 resize point 集合。strict runtime 校验 V2 后仍按
-$\bar t_i$ 执行 fixed-interval async DAG。显式 `tail_pool` 模式允许
+$\bar t_i$ 执行 fixed-interval async DAG。production planner 还会搜索
+whole-expert `tail_pool` 候选；该模式允许
 $q_i=\mathrm{tail\_pool}$ 的完整 expert 在运行时由任一已释放、宽度为
 $\bar t_i$ 的对齐线程组领取；线程组只有在覆盖它的全部 fixed tasks 完成后才
 释放。pooled task 无前驱，fixed task 也不能依赖 pooled task。即使外部 V2
@@ -187,6 +188,65 @@ $\bar t_i$ 的对齐线程组领取；线程组只有在覆盖它的全部 fixed
 因此 tail pool 只扩大 **expert 边界处** 的 resource assignment/start-time
 可行域，不把 job 从 moldable 改成 malleable，也不改变本节后续公式中的
 $t_i$。
+
+当前自动候选仍是受剪枝的 threshold policy。给定上界
+$R_{\max}=12$，候选 threshold 来自与 route signature 相同的稳定 bucket：
+
+$$
+\mathcal R_{\mathrm{pool}}
+=\{r\in\{1,2,4,8,12\}\mid r\le R_{\max},
+\ \exists i:M_i\le r\}.
+$$
+
+产生相同 pooled expert 集合的 threshold 只保留最小者。候选 threshold 使用
+固定 bucket；shape/strategy cache 除原 route signature 外，还记录每个候选
+threshold 下的 eligible expert 数。因此 expert ID 或不跨 threshold 的 routing
+抖动仍可复用计划，而任一 pooling boundary 的参与数量变化都会重新搜索。
+
+对 $R\in\mathcal R_{\mathrm{pool}}$，pooled expert 集合和 fixed 集合分别为：
+
+$$
+\mathcal P(R)=\{i\mid M_i\le R\},\qquad
+\mathcal F(R)=\mathcal X\setminus\mathcal P(R).
+$$
+
+自动 pool width $g$ 从当前 cost model 可计算的 $\{1,2,4\}$、能整除 $C$，且与
+全部 fixed interval 对齐的离散宽度中选择；显式 forced override 仍允许其他已
+校准宽度。dynamic 候选只在 strict 最优 uncertainty band 内的 head shape 与
+strict point estimate 最快的两个 head shape 上展开。planner 不预先决定真实
+领取时刻，而是构造确定性的 list-scheduling surrogate 来评分。令
+$\mathcal B_h$ 为覆盖第 $h$ 个 $g$-thread group 的 fixed task 集合；使用
+isolated time 推导 provisional release：
+
+$$
+\widehat r_h=\max_{i\in\mathcal B_h}\widehat f_i^{\mathrm{iso}},
+$$
+
+空 blocker 集合取 $\widehat r_h=0$。pooled tasks 按
+$(-M_i,i)$ 排序，与 native runtime 的长任务优先队列一致。若 $A_h$ 是 group
+$h$ 的 provisional available time，则依次执行：
+
+$$
+h_i=\arg\min_h(A_h,h),\qquad
+\widehat s_i=A_{h_i},\qquad
+A_{h_i}\leftarrow \widehat s_i+\widehat I_i(g).
+$$
+
+该 assignment 被降成一个可执行 DAG：每组的首个 pooled task 依赖
+$\mathcal B_h$，后续 pooled task 依赖同组前一个 task。最后不是直接使用上述
+isolated 和，而是把 DAG 交给现有 contention-aware event simulator：
+
+$$
+\widehat C_{\mathrm{tail}}(R,g)
+=\operatorname{DAGCost}_{\widehat I,\widehat D}
+  \left(\widehat{\mathcal G}_{R,g}\right).
+$$
+
+planner 在 strict 与全部合法 $(R,g)$ 候选间按相同 uncertainty band 和工作集
+tie-break 选择。native runtime 只执行在线 group release 和原子领取；因此
+planner 管 eligibility/width，runtime 管实际完成事件。surrogate assignment
+可能因真实 contention 改变 group 完成顺序，仍需用 held-out E2E 数据校验，
+不能把其预测值当作 exact dynamic makespan。
 
 定义活跃指示函数：
 
@@ -672,21 +732,61 @@ $$
 One-hot 是线程宽度的等价求解器编码，不是剪枝。一般 active-set slowdown 会
 引入状态相关的非线性处理速率，需要额外变量或分段/枚举近似。
 
+### 6.4 Production cold search 的 native 并行编码
+
+schema-v2 empirical backend 的 cold miss 路径将剪枝后的 `IntervalPlanner`
+搜索原样编码到 C++。Python 只负责解析 profile、生成合法 width/shape 集合并
+导出不可变 calibration payload；C++ 负责 LPT assignment、task DAG 构造、
+$T_{\mathrm{iso}}$、stage-aware event simulation、uncertainty band、tail-pool
+surrogate 以及最终 tie-break。该迁移不改变 2.4 的目标函数、7 节的候选域或
+候选排序键。
+
+令 strict shape 数为 $S$，进入 dynamic 搜索的 head shape 数为 $H$，
+workload 中去重后的短 route threshold 数为 $R$，pool width 数为 $G$，则待
+评分候选数为：
+
+$$
+N_{\mathrm{cand}}=S+HRG.
+$$
+
+strict 候选彼此独立，先以固定 candidate index 并行评分。dynamic head 集合依赖
+全部 strict makespan 和 uncertainty interval，因此 strict 阶段结束后存在一个
+求解器级 join；之后 $(h,r,g)$ 候选再次独立并行。单个候选内部的 event
+simulation 保持单线程，避免与候选级并行嵌套。若各候选计算量为 $W_j$、planner
+worker 数为 $P$，则理想求值部分满足：
+
+$$
+T_{\mathrm{cold,eval}}
+\gtrsim
+\max\left(
+\frac{\sum_j W_j}{P},
+\max_j W_j
+\right),
+$$
+
+另加 payload 构造、两阶段 join 和 Python bridge 生成成本。默认
+$P=\min(8,C,P_{\mathrm{hw}})$，可由 `FUSED_CPP_MOE_PLANNER_THREADS` 或构造参数
+覆盖；native 调用期间释放 Python GIL。worker 只写自己预分配的 candidate slot，
+并按固定 index 收集结果，异常也按最小 candidate index 回到调用线程，因此
+线程数不影响 plan、ranking 或 tie-break。schema-v1、analytic backend、旧扩展
+和显式关闭 native 的情况继续使用 Python solver；cache hit 路径不重新执行
+cold search。
+
 ## 7. 当前实现相对原始问题的剪枝
 
 | 层级 | 原始可行域 | 当前限制 | 性质 |
 | --- | --- | --- | --- |
-| 线程宽度 | $1,2,\ldots,T_{\max}$ | empirical backend 为 `1,2,4,8,16,32`；analytic backend 使用 machine calibration 中显式允许的宽度 | 离散宽度剪枝 |
-| 并发配置 | 活跃 job 可形成任意满足 CPU 容量的 $(M_i,t_i)$ 组合 | 默认使用静态 core shape；显式 tail-pool 只允许对齐 group 在全部覆盖 fixed tasks 完成后领取 whole-expert pooled task | static-partition + boundary regroup 剪枝 |
-| Shape 集合 | 所有满足 CPU 容量的整数宽度组合 | empirical backend 只用 profile shape；analytic backend 生成 homogeneous 和至多两种宽度的 shape，再应用 active 工作集规则 | 候选剪枝 |
+| 线程宽度 | $1,2,\ldots,T_{\max}$ | empirical strict backend 为 `1,2,4,8,16,32`；analytic strict backend 使用 machine calibration 中显式允许的宽度；自动短 expert pool 只搜索 `1,2,4`，forced override 可用其他已校准宽度 | 离散宽度剪枝 |
+| 并发配置 | 活跃 job 可形成任意满足 CPU 容量的 $(M_i,t_i)$ 组合 | 搜索静态 core shape，并自动比较 strict 与 threshold/统一宽度 tail-pool；对齐 group 只在全部覆盖 fixed tasks 完成后领取 whole-expert pooled task | static-partition + boundary regroup 剪枝 |
+| Shape 集合 | 所有满足 CPU 容量的整数宽度组合 | empirical backend 只用 profile shape；analytic backend 生成 homogeneous 和至多两种宽度的 shape，再应用 active 工作集规则；dynamic 只从 strict uncertainty band 和最快两个 head shape 派生 | 候选剪枝 |
 | Assignment | 任意 expert-to-resource 调度 | 按 isolated cost 的 LPT | 启发式分配 |
-| Runtime plan contract | task 可携带离散宽度集合、stage/range、resize 边界和动态 placement | Plan V2 native strict/tail_pool；默认 singleton fixed，强制实验模式可生成 whole-expert pooled placement；运行中宽度固定 | 表示支持 boundary regroup，仍无 in-task resize |
+| Runtime plan contract | task 可携带离散宽度集合、stage/range、resize 边界和动态 placement | Plan V2 native strict/tail_pool；planner 选择 whole-expert placement 和统一 pool width；运行中宽度固定 | 表示支持 boundary regroup，仍无 in-task resize |
 | x86 synchronous executor team mapping | expert 可取任意合法整数宽度并形成任意 wave | API 接受 1--256 workers；均衡 route 用 atomic expert queue，active expert 不足时按 route/当前宽度贪心组 team，强偏斜时按 64-row target 形成有序 wave | planner 外的确定性 runtime mapper |
 | Ordering | 任意可行开始时间和顺序 | 每个 lane 的 LPT 顺序 | 顺序剪枝 |
-| Idling | 允许主动等待以避开争用 | fixed lane 可启动下一个 expert 时立即启动；tail group 等待其全部 fixed blockers 完成后 non-idling 地领取 pooled expert；ready-token 路径仅填充无可运行 expert 的空闲 lane | 受限 non-idling 剪枝 |
+| Idling | 允许主动等待以避开争用 | planner 可选择 strict 以禁止 pool；一旦选择 tail-pool，fixed lane 可运行时立即启动，released group non-idling 地领取 pooled expert；ready-token 路径仅填充无可运行 expert 的空闲 lane | 受限 non-idling 剪枝 |
 | Workload 输入 | 任意合法 global 或 rank-local route histogram | planner 接受任意 histogram；catalog preset 只扩展验证覆盖，不过滤运行时输入 | 不剪枝 |
 | Route combine | 任意满足 TopK release 约束和 CPU 容量的 merge 排程 | planner 不搜索 combine；默认 executor 采用 expert-first 单 token 贪心和连续收尾 | 外层启发式限制 |
-| Kernel variant | 任意未被支配的实现 | ARM `auto` 先要求完整 `jit/xbyak_exact_m` legacy split/no-split pair，再加入同 identity 的实测 global packed-B byte-window variants；缺少完整 JIT legacy pair 时整体回退 static pair；x86 AMX 使用不进入 planner 的确定性 per-expert pattern/cache policy，AVX-512/AMX 共用确定性 team-N/wave policy | 实例候选限制与 runtime policy |
+| Kernel variant | 任意未被支配的实现 | ARM `auto` 先要求完整 `jit/xbyak_exact_m` legacy split/no-split pair，再加入同 identity 的实测 global packed-B byte-window variants；Plan V2 在精确匹配的 AmazonC5192Cores TP4/F512 split profile 上默认按确定函数 $g(M,t)$ 覆盖单 task 的 W13/W2 window，其余 profile 继承 global policy，该覆盖不参与 cost-model 排序；缺少完整 JIT legacy pair 时整体回退 static pair；x86 AMX 使用不进入 planner 的确定性 per-expert pattern/cache policy，AVX-512/AMX 共用确定性 team-N/wave policy | 实例候选限制与 runtime policy |
 | Isolated time | 真实 $I_i(t)$ | production 默认仍为经验公式；可选 analytic backend 由 kernel demand、cache traffic 和机器 service curves 计算 | cost 近似，不剪枝可行域 |
 | Contention | 任意动态活跃配置上的真实 $D_i(\mathcal Z)$ | production 默认为实测 profile；analytic backend 按 matrix/L1/L2/LLC/DRAM/epilogue 共享容量推进事件 | cost 近似，不剪枝可行域 |
 
@@ -698,6 +798,11 @@ Amazon 192-core NUMA0 的 schema-v2 empirical profile 已将实测线程域扩�
 empirical 线程宽度剪枝仍为 `1,2,4,8,16,32`；在完成 48/64/96T 的 held-out
 regret 验证前，不自动扩大该 backend 的在线决策空间。analytic backend 不继承
 此实测表限制，但 machine calibration 必须显式列出可执行宽度。
+
+2026-07-26 的双 NUMA TP4/F512 配对刷新同样不扩大该在线决策空间。当前二进制
+下 96T isolated 的 split/no-split 中位时间相对旧表分别增加 73.25%/78.74%，
+且两个 NUMA 的中位 max/min 差为 24.62%/31.25%；这些点继续作为测量边界和
+不确定性输入，不能据此解除线程宽度剪枝。
 
 ## 8. 当前 Cost Model 的位置
 
@@ -757,6 +862,13 @@ $k_\phi(t)$ 是与 route 无关的一维实测校正。Xbyak 路径的 exact M1-
 Amazon 192-core NUMA0 的 TP4/TP2/EP4/EP2 split/no-split profile 继续使用同一
 公式，`thread_domain` 扩展到 `[1,96]`，并以 48/64/96T 实测点校正
 $k_\phi(t)$；公式形式及小 M residual 组合规则没有改变。
+
+2026-07-26 的双 NUMA TP4/F512 资源刷新只重新拟合参数和一维
+`C(M)`/`k_phi(t)` 校正，不改变上述方程。对新表 M>=48 的实测点，split/no-split
+公式绝对误差中位数为 1.91%/1.00%，P90 为 9.66%/9.11%；36.17%/42.66% 的最大
+误差集中在宽 team。no-split 基础 USL 拟合得到负 $\alpha$，但序列化
+`phi_pts` 仍直接校正已测线程域；因此 $\alpha,\beta$ 只作为分离拟合参数，
+不得解释为跨机器物理常数或外推到 96T 之外。
 
 ### 8.2 实现弱相关的分层 GEMM cost model
 
@@ -1205,10 +1317,37 @@ variant 自己的 isolated/contention 实测表。stage simulator 将 W13 的
 $r_{13}$ 个 range 和 W2 的 $r_2$ 个 range 分别推进，不能把 windowed W2
 当成 legacy 单阶段。
 
-第一版一次 operator 调用只选择一个全局 $S_{\mathrm{target}}$。混合宽度 shape
-中的所有 lane 共用该值；per-task 或 W13/W2 独立窗口尚不在决策空间。特别是
-单个 M12 panel 不复用 B，额外 range 通常只有 dispatch 和 lane-width 代价，
-不能仅按 cache 容量规则强制细分。
+profiled kernel variant 仍只选择一个 operator-wide $S_{\mathrm{target}}$。在此
+基础上，Plan V2 可选携带每个 whole-expert task 的两个 stage override：
+
+$$
+(S_{13,i},S_{2,i})=
+g_\theta(M_i,t_i),\qquad
+S^{\mathrm{eff}}_{s,i}=
+\begin{cases}
+S_{s,i}, & S_{s,i}\ge0,\\
+S_{\mathrm{target}}, & S_{s,i}=-1.
+\end{cases}
+$$
+
+其中 $M_i$ 是 route 数，$t_i$ 是 task 实际执行宽度；`-1` 表示继承
+operator-wide policy，`0` 表示该 stage 使用 legacy range 规则，正值表示
+tile-aligned byte target。tail-pool task 使用 pool 的实际宽度，而不是原 strict
+head 宽度。$g_\theta$ 是按机器、NUMA、shape 和 kernel identity 命名的确定性
+策略，在 $(v,\sigma)$ 已选定后应用，因此不扩大
+$\mathcal V_{\mathrm{profiled}}\times\Sigma_v$ 的搜索空间，也不改变候选 makespan
+评分。plan cache 和结果 metadata 必须包含策略名称，避免不同规则共享计划。
+
+由于现有 empirical table 校准的是继承 global policy 的时间，post-plan
+override 的收益不是 cost model 的预测结果，不能计入 predicted regret 或绝对
+时间准确性声明。当前只有同时精确匹配双 NUMA AmazonC5192Cores 的 TP4
+`H=4096,F=512,E=256`、96-core rank、SVE JIT exact-M、split-W13 profile
+identity 和 rank CPU 集合时，已在两个 NUMA rank 上验证的
+`amazon_c5_192c_tp4_f512_v1` 作为默认 runtime policy；任一字段不匹配或显式
+设置 `use_default_stage_window_policy=False` 时都继承 global policy。该默认是
+受限的确定性 runtime 规则，不代表窗口已成为 cost-model 搜索变量。特别是单个
+M12 panel 不复用 B，额外 range 通常只有 dispatch 和 lane-width 代价，不能仅按
+cache 容量规则强制细分。
 
 ### 8.4 x86 per-expert pattern/cache 与 team-N/wave policy
 
@@ -1380,6 +1519,50 @@ worker，同时 nominal aggregate window 都约为 96 MiB；因此当前实验�
 profile 时才进入候选。默认 catalog 尚未加入这些重新校准的表，因此默认行为仍
 是 legacy split/no-split。原始数据见
 `optimizations/fused_moe_sve/results/amazon_192c_weight_windows.md`。
+
+2026-07-26 先增加了 async benchmark 的 W13/W2 独立窗口覆盖，以检验另一台
+机器上观察到的每 worker `W13=1 MiB, W2=0.5 MiB` 是否可迁移。V3 NUMA0
+`24x4T` 下，该组合相对两段均为 1 MiB/worker，在 route 192/384 分别快
+6.0%/2.2%，route 768 无可分辨差异，但 route 1536/2040 分别慢 2.1%/2.6%；
+NUMA1 复现 route 2040 的 2.4% 回退。route 384 的二维扫描得到 W13 约
+2 MiB/range、W2 约 0.5--1 MiB/range，而 route 2040 仍以两者 4 MiB/range
+最好。因此 stage 最优窗口可以不同，但同时依赖 route 和 team width，不能从
+单机常数或固定 W13:W2 比例外推。完整 microbenchmark 数据见
+`optimizations/fused_moe_sve/results/amazon_192c_stage_weight_windows.md`。
+route 384 的 300-call PMU 对照还显示，`4:4 -> 2:0.5 MiB` 时指令数仅变
+-0.06%、L2D refill 反而增加 20.7%，但 LL-cache read miss 减少 6.9%、
+memory-stall cycles 减少 39.9%。因此中等 route 的收益不是减少 B load 指令，
+而是缩短 reuse distance、降低高延迟 refill 比例；不能只用 L2 refill 数解释。
+
+随后将该覆盖提升为 Plan V2 的可选 per-task 字段，并实现只依赖 $(M_i,t_i)$ 的
+机器专用 post-plan policy。192-core 主机 NUMA0 `0-95`、TP4
+`H=4096,F=512,E=256,topk=6` 的 21-run 中位数对照保持 expert assignment、
+task width、DAG 和 merge 策略完全一致，只改变 stage windows：
+
+| workload | 主要 route / width | auto ms | static ms | gain |
+| --- | ---: | ---: | ---: | ---: |
+| uniform | 48 / 16T，未覆盖 | 16.518 | 16.572 | -0.32% |
+| active-set-32 | 384 / 8T | 8.697 | 8.555 | +1.66% |
+| active-set-64 | 192 / 8T | 10.007 | 9.066 | +10.38% |
+| active-set-128 | 96 / 8T | 11.932 | 9.312 | +28.14% |
+| tiered-hotspot | mixed / 8T | 8.771 | 8.179 | +7.23% |
+| long-short-bimodal | 16T + 1T，未覆盖 | 10.411 | 10.419 | -0.08% |
+| captured DSV4 | mixed；25 tasks 覆盖 | 14.698 | 14.730 | -0.22% |
+
+未覆盖 case 的最大观测回退为 0.32%，属于本机噪声量级；收益集中在大量
+96--384 route、8T expert 同时活跃的情况。captured 分布中只有少数 task 被
+覆盖，whole-call 没有可分辨收益，所以该 policy 不能外推为跨机器或跨 shape
+默认值。NUMA1 CPU `96-191` 的独立复测得到 active-set-64
+`9.955 -> 9.002 ms`（+10.58%）、active-set-128
+`11.932 -> 9.199 ms`（+29.71%），与 NUMA0 的收益一致。因此它只在上述精确
+profile identity 和两个已验证 rank CPU 集合上默认开启；显式 opt-out 和所有
+不匹配 profile 均保持继承行为。测试 extension hash 因新增 Plan V2 ABI 与
+profile 不同，但 benchmark 逐字段断言两种 variant 的 plan 除两个 window
+数组外完全一致；结果只证明 runtime policy 收益，不构成新 profile 的绝对时间
+校准。默认开启后的无 enable-flag 集成复测在 NUMA0/NUMA1 的
+active-set-128 分别提升 30.58%/30.34%，NUMA0 未覆盖 uniform 仅变化 0.01%。
+完整记录见
+`optimizations/fused_moe_sve/results/amazon_192c_static_stage_window_policy.md`。
 
 ### 9.3 Ready-token combine 首轮验证
 
@@ -1657,7 +1840,7 @@ selected/preferred/min/max、placement，以及当前 stage/range/resize 子集�
 strict V2 直接进入同一个 native async executor，不读取 legacy short-pool
 环境变量；旧扩展只可通过 Python adapter 执行 strict 降级。
 
-显式 tail-pool bridge 将 `routes <= max_pooled_routes` 的 whole-expert task 标为
+tail-pool bridge 将 `routes <= max_pooled_routes` 的 whole-expert task 标为
 pooled，使用 `core_begin=-1` 和统一 pool width。它删除 pooled task 的前驱，并
 把后续 fixed task 的依赖穿过连续 pooled 链重连到最近 fixed ancestors。Python
 与 native 同时验证 pool width 整除总线程、fixed interval 对齐、pooled task
@@ -1668,19 +1851,77 @@ fixed blockers 完成后，从全局队列领取完整 pooled task。
 `tests/test_moe_cost_model_v2.py`，包括 legacy bridge 升级、strict/tail
 placement、较宽但不执行的 width envelope、非法 resize/width/placement/
 dependency/alignment 拒绝、native V2 参数传递、strict 旧扩展 fallback，以及
-首次/缓存 planner 输出。tail pool 当前只能通过
-`tail_pool_threads` 显式强制；cost model 仍按原 fixed DAG 评分，所以它不能用于
-自动候选排序或声称 regret 收敛。提升为自动策略前必须重测相应 active set 的
-$I_i(t)$、$D_i(\mathcal Z)$、E2E makespan 和 held-out regret。
+首次/缓存 planner 输出。production planner 默认比较 strict 与自动 tail-pool
+候选；`dynamic_tail_pool=False` 保留严格基线，`tail_pool_threads` 保留显式强制
+路径。自动候选按 2.3 的 list-scheduled surrogate DAG 使用同一个
+contention-aware cost model 评分；缓存 identity 同时包含 auto/strict/forced
+模式、forced width、threshold 上限，以及每个候选 threshold 下的 eligible
+expert 数。route bucket histogram 仍用于近似相似 workload，但跨越 pooled
+eligibility 边界时必须重新规划，不能复用旧 dynamic shape。
+
+`tests/test_moe_native_interval_planner.py` 另外逐项比较 Python 与 C++ 的
+table/formula $T_{\mathrm{iso}}$、混合依赖 DAG makespan、strict/auto/forced
+候选、bridge 和完整 ranking，并验证 1T/4T cold solver 输出相同。native
+planner 是求解器实现替换，不是新的 runtime execution mode。
+
+自动策略扩大了 planner candidate space，但没有证明 regret 收敛；它仍需用新的
+机器、shape 和路由分布继续做 held-out 验证。当前自动搜索只扩展 strict 最快
+uncertainty band 与至少两个最快 head shape，并对 workload 内实际出现的
+`1/2/4/8/12` route threshold 去重，以控制冷搜索成本。
 
 2026-07-26 在 AmazonC5192Cores NUMA0 `0-95` 上使用 split-W13、
-H4096/F512、256 experts、2048 tokens、TopK=6 的 long-short bimodal
-分布验证 native V2。聚焦 correctness 为 28 passed；legacy async、V2 strict
-和 V2 tail-pool 输出 BF16 bit-exact；扩大 MoE/planner 回归为 149 passed、
-1 skipped。21 次交错测量中，V2 strict median 为
-12.513 ms，显式 4T tail pool 为 10.836 ms，提升 15.47%；vLLM staged 为
-11.733 ms。运行扩展 hash 与旧校准表不一致，因此该结果只验证 executor action
-和 ABI 开销，不用于证明当前 cost-model 的绝对时间或 regret 准确性。
+H4096/F512、256 experts、2048 tokens、TopK=6 验证默认自动策略。远端 Plan V2/
+planner 聚焦回归为 50 passed，native tail-pool 专项为 1 passed；本地全部 MoE
+回归为 1097 passed、176 skipped。所有进入计时的
+strict/auto/forced-4T/vLLM 输出均 BF16 bit-exact。
+
+在 `5xM2040 + 174xM12` long-short bimodal 上，planner 自动选择
+`6x16T` fixed head、`M<=12`、1T tail pool；21 次交错测量中 strict/auto/
+forced-4T/vLLM median 分别为 12.529/10.408/10.801/11.728 ms。auto 相对
+strict 提升 20.39%，相对 forced-4T 提升 3.78%。uniform、active-set
+8/16/32/64/128、tiered-hotspot 和捕获的 DSV4 路由均保留 strict；相同 native
+plan 的 strict/auto 中位数最大差异为 0.38%。这既验证 planner 能启用有收益的
+dynamic action，也验证它不会默认把其施加到其余八个 workload。
+
+同一主机 `0-95` 核上的 native cold-search 验证使用
+`bench_native_cold_planner.py`，对象构造一次、每次重新执行完整候选搜索和 bridge
+生成，5 次 warmup、21 次正式采样。长短双峰的 Python/C++-1T/C++-8T 中位数为
+59.784/2.610/1.421 ms，即 22.90x/42.07x；captured routing 为
+274.342/11.627/3.488 ms，即 23.60x/78.65x。两者 16T 均比 8T 略慢，因此默认
+worker 上限为 8；显式参数仍可覆盖。全部后端选择相同 mode、shape、task、
+bridge 和 ranking，makespan 只存在小于 $10^{-12}$ 相对误差的浮点求和差异。
+
+此前相同路径的 cache hit 为 bimodal 0.944 ms、真实路由 2.396 ms；cache 仍可
+避免 cold search，但 native 后首次搜索已不再是几十到几百毫秒的 Python 瓶颈。
+运行扩展 hash 与校准表仍不一致，所以这些结果只验证求解器等价性和 planning
+latency，不用于证明 cost model 的绝对时间或 runtime regret 准确性。
+
+### 9.13 192-core 双 NUMA 当前二进制校准刷新
+
+2026-07-26 在 AmazonC5192Cores 上按 9.5 的 256-expert TP4/F512 口径重测
+split-W13 和 no-split-W13 完整配对表。两个同步 rank 分别绑定
+CPU `0-95`/`96-191` 和 NUMA0/1；每张表包含 180 个 isolated 点和 238 个
+contention 点，每点 5 次 warmup、20 次正式采样。route/thread/shape grid
+保持不变，source SHA 更新为
+`a62e0d9425381750fdc859ed97e2a4d1cc33727ffe36dbb75c453f061a924dfb`，
+extension SHA 更新为
+`e652d9aad3025a4836d0406110bcbdf3fdc1356aaba2bf789595359a58a92559`。
+
+相对 2026-07-20 表，isolated 全点中位变化为 split +1.67%、no-split +2.99%；
+homogeneous full-call 全点中位变化为 +12.51%/+12.40%。后一个统计由超宽
+shape 明显拉高：M=2040 split `24x4T` 仅从 332.45 ms 变为 334.60 ms，
+no-split `12x8T` 从 323.43 ms 变为 329.60 ms，而单个 96T team 分别增加
+20.33%/33.27%。新 split 表的 30-run 缩减复测在 18 个重叠 contention 点上
+相对完整表中位差 +0.47%，范围 -4.13% 到 +1.92%，确认长 route 趋势可重复。
+
+在全部 17 个 homogeneous route 上继续使用旧跨 policy 最优点，新表 regret
+中位为 3.01%、最大为 7.63%。当前 `PolicyAwarePlanner` 的九个默认论文/真实
+workload 中，只有 active-set-32 和 tiered-hotspot 改变 policy/shape，旧选择在
+新表上的预测 regret 分别为 4.24% 和 2.04%，其余为 0%。因此本次只原子替换
+完整 JIT exact-M split/no-split profile pair，不改变 $\widehat I_i(t)$、
+$\widehat D_i(\mathcal Z)$ 定义、公式形式、candidate space 或 production
+剪枝。完整命令、逐项差异和噪声分析见
+`optimizations/fused_moe_sve/results/amazon_192c_cost_profile_refresh_20260726.md`。
 
 ### 9.14 解析 backend 的实现与验收状态
 
@@ -1762,4 +2003,10 @@ route/thread/mixed-distribution 验证前，解析 backend 保持 opt-in。
 | 2026-07-26 | v0.28 | 将 SVE 的 team-N ownership 引入同步 x86 AVX-512/AMX executor：active expert 不足时按 route/width 贪心组 team，2x 且至少 64-row 的强偏斜 route 使用有序 waves，均衡 route 保留 expert queue；定义精确 N-range、team-width 与 wave 公式，记录 8-core C8i 1/2/4/8T 验证，并明确该 mapper 尚不进入 planner candidate space。 |
 | 2026-07-26 | v0.29 | 引入向后兼容的 async Plan V2：增加 strict execution mode、离散 allowed-width CSR、preferred/min/max、NUMA/stage/range/resize 字段及强校验；production planner 仍生成 singleton width 并严格降级到现有 fixed-interval native DAG，因此 moldable 语义、公式、剪枝和 cost model 保持不变。 |
 | 2026-07-26 | v0.30 | Plan V2 接入 ARM native strict entrypoint，并增加显式 whole-expert tail_pool placement：对齐线程组只在覆盖 fixed tasks 全部完成后重组，运行中宽度仍固定；planner 默认 strict，tail pool 仅作为不参与 cost-model 排序的强制实验 bridge。同步 placement/依赖/对齐约束、剪枝表和验证要求，并记录 192-core 主机 NUMA0 的 bit-exact 与 long-short bimodal 性能验证。 |
+| 2026-07-26 | v0.31 | 用当前 ARM source/extension hash 原子刷新 192-core 双 NUMA TP4/F512 JIT exact-M split/no-split 配对表；记录绝对时间漂移、96T 不稳定性、公式拟合误差、旧选择 regret 和默认 workload planner 变化；公式形式、candidate space 与 production 剪枝不变。 |
+| 2026-07-26 | v0.32 | 增加 async benchmark-only W13/W2 独立 packed-B 窗口覆盖；在 V3 双 NUMA 上验证另一机器的 1/0.5 MiB-per-worker 规则只对中等 route 有利、长 route 回退，并用二维扫描确认 stage 最优值同时依赖 route/team width；公开 API、profile identity、公式、planner 候选和剪枝均不变。 |
 | 2026-07-26 | v0.33 | 增加 planner-compatible 解析 SVE MoE backend：由 exact kernel demand、L2/LLC 容量模型、分层 service curves 和共享资源 event simulator 计算 isolated/contention 时间；machine calibration 不包含 route/thread 或 shape 表。analytic backend 生成 homogeneous/双宽度 shape 并保持 opt-in，旧 empirical backend 继续作为 production 默认和 holdout oracle。 |
+| 2026-07-26 | v0.34 | 将 whole-expert dynamic tail-pool 纳入 production planner 默认候选：在 workload 内搜索短-route threshold、`1/2/4T` 自动 pool width 和 strict 竞争 head shape，用 fixed-group release + LPT list scheduling 构造 surrogate DAG，再由现有 contention model 评分；runtime 保留在线领取，新增 strict opt-out、全宽度 forced override、threshold-eligibility 隔离缓存和 strict/auto benchmark 对比。 |
+| 2026-07-26 | v0.35 | 将 schema-v2 empirical cold planner 等价迁移到 C++，并以 OpenMP 在 strict 和 dynamic 两阶段分别并行评分候选；固定 candidate index 保证跨线程数确定性，GIL 在搜索期间释放，Python/analytic fallback 与 cache-hit 路径保留。192-core 主机前 96 核上，默认 8T 将 bimodal/captured cold search 从 Python 59.784/274.342 ms 降至 1.421/3.488 ms；该变更不修改公式、候选空间、剪枝或 runtime 调度语义。 |
+| 2026-07-26 | v0.36 | Plan V2 增加 per-task W13/W2 packed-B byte-window override；planner 可在选定 task/DAG 后应用命名的确定性 $g(M,t)$，不扩大或重新评分搜索空间。记录 AmazonC5192Cores NUMA0 TP4/F512 静态策略及 7 个 E2E workload：active-set-128/64/32 分别提升 28.14%/10.38%/1.66%，未覆盖 case 最大观测回退 0.32%；该机器专用策略保持 opt-in，待独立窗口 calibration 后才可进入 scored production policy。 |
+| 2026-07-26 | v0.37 | 将 `amazon_c5_192c_tp4_f512_v1` 设为精确 profile-bound 默认：只匹配双 NUMA AmazonC5192Cores TP4/F512、96-core rank、SVE JIT exact-M split-W13 identity，并按 selected model 分别解析，no-split 和其他 profile 不受影响；增加 `use_default_stage_window_policy=False` opt-out。NUMA1 active-set-64/128 独立复测分别提升 10.58%/29.71%，与 NUMA0 一致；该 runtime policy 仍不进入 cost-model 评分或跨机器外推。 |

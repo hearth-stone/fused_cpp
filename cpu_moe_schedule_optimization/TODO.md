@@ -277,9 +277,15 @@ claims must include both long-route throughput and short-route latency.
   schema-v2. Jointly search measured `(weight_window_bytes, core_shape)` variants,
   model the actual W13/W2 range counts, and forward the selected option to the
   async kernel. Historical profiles map to window 0.
-- [ ] Extend the first global-window policy to independently selectable W13 and
-  W2 windows. Add per-stage runtime options and regenerate isolated/contention
-  calibration before admitting those combinations.
+- [x] Extend Plan V2 with independent per-task W13 and W2 window overrides and
+  add a named deterministic post-plan policy hook. Unsupported route/width
+  combinations inherit the selected operator-wide policy, so this does not
+  enlarge the planner search space.
+- [ ] Regenerate isolated/contention calibration for independently selected
+  W13/W2 windows before admitting those combinations to cost-model scoring or
+  expanding the default beyond the exact dual-NUMA AmazonC5192Cores
+  TP4/F512 split profile. The measured profile-bound rule is a deterministic
+  runtime exception, not a scored candidate.
 - [ ] Replace general async task-list polling with a lane-chain executor for the
   current disjoint interval plans, while retaining the general DAG path for plans
   with genuinely overlapping intervals. Measure dispatch and barrier overhead on

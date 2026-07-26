@@ -511,6 +511,12 @@ def fused_moe_bf16_tiled_async_plan(
     """
     materialized = plan if isinstance(plan, AsyncMoEPlanV2) else AsyncMoEPlanV2.from_dict(plan)
     if _fused_moe_bf16_tiled_async_plan_v2_impl is None:
+        assert materialized.task_w13_window_bytes is not None
+        assert materialized.task_w2_window_bytes is not None
+        if bool((materialized.task_w13_window_bytes >= 0).any()) or bool(
+            (materialized.task_w2_window_bytes >= 0).any()
+        ):
+            raise RuntimeError("per-task W13/W2 windows require native fused_moe_bf16_tiled_async_plan_v2 support")
         if materialized.execution_mode == ASYNC_MOE_EXECUTION_STRICT:
             return fused_moe_bf16_tiled_async(
                 input,
@@ -541,6 +547,8 @@ def fused_moe_bf16_tiled_async_plan(
     if not topk_weights.dtype.is_floating_point:
         raise TypeError(f"topk_weights must use a floating dtype, got {topk_weights.dtype}")
     _validate_output_buffer(input, out)
+    assert materialized.task_w13_window_bytes is not None
+    assert materialized.task_w2_window_bytes is not None
 
     result = _fused_moe_bf16_tiled_async_plan_v2_impl(
         input.contiguous(),
@@ -583,6 +591,8 @@ def fused_moe_bf16_tiled_async_plan(
         -1 if w13_split is None else int(bool(w13_split)),
         _weight_window_argument(weight_window_bytes),
         out,
+        materialized.task_w13_window_bytes.contiguous(),
+        materialized.task_w2_window_bytes.contiguous(),
     )
     return out if out is not None else result
 

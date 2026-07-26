@@ -421,6 +421,22 @@ def test_sve_plan_v2_strict_and_tail_pool_match_legacy_async(
         w13_split=True,
     )
 
+    window_bridge = upgrade_legacy_async_plan(strict_bridge)
+    window_bridge.update(
+        {
+            "task_w13_window_bytes": [64, 128, 192, 256],
+            "task_w2_window_bytes": [128, 64, 256, 192],
+        }
+    )
+    windowed = fused_moe_bf16_tiled_async_plan(
+        hidden_states,
+        packed,
+        topk_weights,
+        topk_ids,
+        AsyncMoEPlanV2.from_dict(window_bridge),
+        w13_split=True,
+    )
+
     tail_bridge = upgrade_legacy_async_plan(strict_bridge)
     tail_bridge.update(
         {
@@ -446,6 +462,7 @@ def test_sve_plan_v2_strict_and_tail_pool_match_legacy_async(
     )
 
     torch.testing.assert_close(strict.float(), reference.float(), atol=0, rtol=0)
+    torch.testing.assert_close(windowed.float(), strict.float(), atol=0, rtol=0)
     torch.testing.assert_close(tail.float(), strict.float(), atol=0, rtol=0)
 
     # The materialized plan owns mutable tensors, so native must validate the

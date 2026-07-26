@@ -96,9 +96,9 @@ for name, tokens, E, hot in CONFIGS:
     ids, wt = routing(tokens, E, hot)
     counts = route_counts(ids, E)
     pm = PlannedMoE(model, 8)
-    pm.plan_for(counts)
+    pm.plan_for(counts, dynamic_tail_pool=False)
     cold = pm.last["planner_overhead_ns"] / 1e3
-    b_warm = pm.plan_for(counts)
+    b_warm = pm.plan_for(counts, dynamic_tail_pool=False)
     warm = pm.last["planner_overhead_ns"] / 1e3
     shape = pm.last["shape"]
     kern = measure_kernel(b_warm, ids, wt)
@@ -120,10 +120,10 @@ for name, tokens, E, hot in [
     for step in range(100):
         ids, wt = routing(tokens, E, hot)
         counts = route_counts(ids, E)
-        pm.plan_for(counts)
+        pm.plan_for(counts, dynamic_tail_pool=False)
         hits += 1 if pm.last["cache_hit"] else 0
         ov.append(pm.last["planner_overhead_ns"] / 1e3)
-        full = pl.plan(counts)["shape"]  # what a per-call full search would pick
+        full = pl.plan(counts, dynamic_tail_pool=False)["shape"]  # legacy executor baseline
         agree += 1 if pm.last["shape"] == full else 0
     print(
         "%-16s hit_rate=%3.0f%%  mean_overhead=%7.1fus  cache_shape_matches_full=%3.0f%%"

@@ -340,6 +340,35 @@ features:
       --experts 24 --routes 2040 --hidden 4096 --intermediate 512
       --threads-per-expert 4 --window-mib 0,4,2,1 --warmup 3 --runs 9
 
+  - id: dispatch.per_task_stage_windows
+    part: dispatch
+    status: enabled
+    implementation: >-
+      cpu_moe_schedule_optimization/planners/stage_window_policy.py;
+      src/fused_cpp/moe/plan.py;
+      csrc/moe/arm/common/fused_moe_bf16_tiled.cpp
+    hypothesis: >-
+      Selecting independent W13/W2 packed-B windows from each task's route
+      count and final team width captures the medium-route cache-residency gain
+      without adding window values to the planner search space. Unsupported
+      combinations inherit the profiled operator-wide policy.
+    depends_on:
+      - dispatch.serial_weight_windows
+    conflicts_with: []
+    correctness: >-
+      PYTHONPATH=src .venv/bin/python -m pytest -q
+      tests/test_moe_plan_v2.py
+      tests/test_moe_cost_model_v2.py
+      tests/test_fused_moe_bf16_tiled.py
+      -k plan_v2_strict_and_tail_pool
+    benchmark: >-
+      numactl --cpunodebind=0 --membind=0 taskset -c 0-95
+      .venv/bin/python
+      optimizations/fused_moe_sve/benchmarks/bench_vllm_staged_schedule.py
+      --preset moe256-active-set-128 --production-profile
+      cpu_moe_schedule_optimization/cost_model/profiles/contention_async_amazon_c5_192c_dual_numa_tp4_sve_F512_E256_splitw13_schema_v2_xbyak_exactm_20260726.json
+      --route-dtype bf16 --warmup 5 --runs 21
+
   - id: dispatch.static_team_fission
     part: dispatch
     status: experimental
@@ -364,25 +393,31 @@ features:
       optimizations/fused_moe_sve/benchmarks/bench_vllm_staged_schedule.py
       --preset moe256-long-short-bimodal
       --production-profile
-      cpu_moe_schedule_optimization/cost_model/profiles/contention_async_amazon_c5_192c_dual_numa_tp4_sve_F512_E256_splitw13_schema_v2_xbyak_exactm_20260720.json
+      cpu_moe_schedule_optimization/cost_model/profiles/contention_async_amazon_c5_192c_dual_numa_tp4_sve_F512_E256_splitw13_schema_v2_xbyak_exactm_20260726.json
       --static-16-to-4 --route-dtype bf16 --warmup 5 --runs 21
 
   - id: dispatch.dynamic_short_expert_pool
     part: dispatch
-    status: experimental
+    status: enabled
     implementation: >-
-      csrc/moe/arm/common/fused_moe_bf16_tiled.cpp and
+      cpu_moe_schedule_optimization/planners/interval_planner.py,
+      cpu_moe_schedule_optimization/planners/planned_moe.py,
+      csrc/moe/arm/common/fused_moe_bf16_tiled.cpp, and
       optimizations/fused_moe_sve/benchmarks/bench_vllm_staged_schedule.py
     hypothesis: >-
-      Retaining each long expert's production-width team, then releasing its
-      cores as fixed narrow groups that claim whole short experts from one
-      global queue, preserves packed-A sharing while removing static short-lane
-      imbalance and the staged baseline's global W13/W2 barrier.
+      Keeping tail-pool support resident in the native executor while letting
+      the planner choose strict versus dynamic execution, the pooled route
+      threshold, and the aligned 1/2/4T worker width preserves fixed-head
+      packed-A sharing without imposing dynamic scheduling on workloads whose
+      cost model favors strict placement.
     depends_on:
       - store.w2_direct_route
     conflicts_with:
       - dispatch.global_stage_task_pool
     correctness: >-
+      PYTHONPATH=src .venv/bin/python -m pytest -q
+      tests/test_moe_plan_v2.py tests/test_moe_analytic_model.py
+      tests/test_moe_cost_model_v2.py &&
       PYTHONPATH=src .venv/bin/python -m pytest -q
       tests/test_fused_moe_bf16_tiled.py
       -k async_short_pool_matches_fixed_dag
@@ -392,9 +427,38 @@ features:
       optimizations/fused_moe_sve/benchmarks/bench_vllm_staged_schedule.py
       --preset moe256-long-short-bimodal
       --production-profile
-      cpu_moe_schedule_optimization/cost_model/profiles/contention_async_amazon_c5_192c_dual_numa_tp4_sve_F512_E256_splitw13_schema_v2_xbyak_exactm_20260720.json
-      --static-16-to-4 --dynamic-short-pool --route-dtype bf16
-      --warmup 5 --runs 21
+      cpu_moe_schedule_optimization/cost_model/profiles/contention_async_amazon_c5_192c_dual_numa_tp4_sve_F512_E256_splitw13_schema_v2_xbyak_exactm_20260726.json
+      --route-dtype bf16 --warmup 5 --runs 21
+
+  - id: planner.native_cold_search
+    part: dispatch
+    status: enabled
+    implementation: >-
+      csrc/moe_planner/interval_planner.cpp,
+      csrc/moe_planner/interval_planner.h,
+      csrc/moe_planner/bindings.cpp,
+      cpu_moe_schedule_optimization/planners/interval_planner.py, and
+      cpu_moe_schedule_optimization/cost_model/phase_model.py
+    hypothesis: >-
+      Porting the schema-v2 empirical cost evaluation and pruned cold search
+      to C++, then evaluating independent strict and tail-pool candidates with
+      a bounded OpenMP team, removes Python event-simulation overhead without
+      changing the candidate space, plan, or uncertainty tie-break.
+    depends_on:
+      - dispatch.dynamic_short_expert_pool
+    conflicts_with: []
+    correctness: >-
+      PYTHONPATH=src .venv/bin/python -m pytest -q
+      tests/test_moe_native_interval_planner.py
+      tests/test_moe_cost_model_v2.py tests/test_moe_plan_v2.py
+      tests/test_moe_analytic_model.py
+    benchmark: >-
+      PYTHONPATH=src OMP_DYNAMIC=FALSE OMP_PROC_BIND=spread OMP_PLACES=cores
+      taskset -c 0-95 .venv/bin/python
+      cpu_moe_schedule_optimization/planners/bench_native_cold_planner.py
+      --profile
+      cpu_moe_schedule_optimization/cost_model/profiles/contention_async_amazon_c5_192c_dual_numa_tp4_sve_F512_E256_splitw13_schema_v2_xbyak_exactm_20260726.json
+      --cores 96 --workers 1,2,4,8,16 --warmup 5 --runs 21
 
   - id: pipeline.explicit_unfused_reference
     part: pipeline
@@ -878,6 +942,19 @@ variants:
       weight_window_bytes=<positive byte count>)
     status: experimental
 
+  - id: sve_plan_v2_per_task_stage_windows
+    features:
+      - intermediate.overwrite_elision
+      - scatter.w2_n_owner
+      - dispatch.serial_weight_windows
+      - dispatch.per_task_stage_windows
+    entrypoint: >-
+      PlannedMoE(default profile-bound policy;
+      use_default_stage_window_policy=False to disable) ->
+      fused_moe_bf16_tiled_async_plan(AsyncMoEPlanV2(
+      task_w13_window_bytes=..., task_w2_window_bytes=...))
+    status: enabled
+
   - id: sve_vllm_staged_task_pool
     features:
       - dispatch.global_stage_task_pool
@@ -905,8 +982,20 @@ variants:
       - merge.sve_weighted_reduce
     entrypoint: >-
       bench_vllm_staged_schedule.py --dynamic-short-pool
-      (benchmark-only native async executor)
+      (forced-4T benchmark comparator using the native async executor)
     status: experimental
+
+  - id: sve_planner_selected_tail_pool
+    features:
+      - dispatch.dynamic_short_expert_pool
+      - planner.native_cold_search
+      - store.w2_direct_route
+      - store.w2_direct_bf16_route
+      - merge.sve_weighted_reduce
+    entrypoint: >-
+      PlannedMoE.plan_spec_for (default dynamic_tail_pool=True)
+      fused_moe_bf16_tiled_async_plan
+    status: enabled
 
   - id: sve_route_merge_sequential
     features: []

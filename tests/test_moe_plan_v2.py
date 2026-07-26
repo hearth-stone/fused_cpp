@@ -72,6 +72,8 @@ def test_upgrade_legacy_plan_produces_strict_singleton_widths() -> None:
     assert plan.num_threads == 4
     assert plan.thread_cpu_ids.tolist() == [8, 9, 10, 11]
     assert plan.task_threads.tolist() == [2, 2]
+    assert plan.task_w13_window_bytes.tolist() == [-1, -1]
+    assert plan.task_w2_window_bytes.tolist() == [-1, -1]
     assert plan.legacy_schedule()[0].tolist() == [3, 7]
 
 
@@ -116,6 +118,25 @@ def test_plan_v2_rejects_inconsistent_allowed_widths() -> None:
         assert "task_threads[0] is not present" in str(error)
     else:
         raise AssertionError("an inconsistent selected width was accepted")
+
+
+def test_plan_v2_accepts_optional_per_task_stage_windows() -> None:
+    upgraded = upgrade_legacy_async_plan(_legacy_bridge())
+    upgraded["task_w13_window_bytes"] = [1048576, -1]
+    upgraded["task_w2_window_bytes"] = [524288, 0]
+
+    plan = AsyncMoEPlanV2.from_dict(upgraded)
+
+    assert plan.task_w13_window_bytes.tolist() == [1048576, -1]
+    assert plan.task_w2_window_bytes.tolist() == [524288, 0]
+
+
+def test_plan_v2_rejects_invalid_per_task_stage_windows() -> None:
+    upgraded = upgrade_legacy_async_plan(_legacy_bridge())
+    upgraded["task_w13_window_bytes"] = [-2, -1]
+
+    with pytest.raises(ValueError, match="must be -1"):
+        AsyncMoEPlanV2.from_dict(upgraded)
 
 
 def test_tail_pool_plan_accepts_explicit_whole_expert_placement() -> None:
@@ -202,6 +223,8 @@ def test_async_plan_wrapper_calls_native_plan_v2(monkeypatch) -> None:
     assert args[29] == 4
     assert args[32] is True
     assert args[37] == 1
+    assert args[40].tolist() == [-1, -1]
+    assert args[41].tolist() == [-1, -1]
 
 
 def test_async_plan_wrapper_falls_back_for_strict_plan(monkeypatch) -> None:
@@ -234,6 +257,22 @@ def test_async_plan_wrapper_requires_native_tail_pool(monkeypatch) -> None:
     monkeypatch.setattr(bf16_tiled, "_fused_moe_bf16_tiled_async_plan_v2_impl", None)
 
     with pytest.raises(RuntimeError, match="tail_pool requires native"):
+        bf16_tiled.fused_moe_bf16_tiled_async_plan(
+            torch.empty((1, 1), dtype=torch.bfloat16),
+            object(),
+            torch.ones((1, 1)),
+            torch.zeros((1, 1), dtype=torch.int32),
+            plan,
+        )
+
+
+def test_async_plan_wrapper_requires_native_per_task_windows(monkeypatch) -> None:
+    bridge = upgrade_legacy_async_plan(_legacy_bridge())
+    bridge["task_w13_window_bytes"] = [1048576, -1]
+    plan = AsyncMoEPlanV2.from_dict(bridge)
+    monkeypatch.setattr(bf16_tiled, "_fused_moe_bf16_tiled_async_plan_v2_impl", None)
+
+    with pytest.raises(RuntimeError, match="per-task W13/W2 windows require native"):
         bf16_tiled.fused_moe_bf16_tiled_async_plan(
             torch.empty((1, 1), dtype=torch.bfloat16),
             object(),

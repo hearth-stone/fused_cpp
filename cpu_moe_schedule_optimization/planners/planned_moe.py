@@ -6,9 +6,14 @@ import time
 from typing import Dict, List, Sequence, Tuple
 
 from interval_planner import IntervalPlanner, PlannerCostModel, PolicyAwarePlanner  # noqa: E402
+from stage_window_policy import (  # noqa: E402
+    TaskStageWindowPolicy,
+    default_task_stage_window_policy,
+)
 
 
 _BUCKETS = [1, 2, 4, 8, 12, 24, 48, 96, 192, 384, 768, 1536, 2040, 4096, 8192]
+_TAIL_POOL_THRESHOLDS = (1, 2, 4, 8, 12)
 
 
 def route_counts(topk_ids, num_experts: int) -> List[Tuple[int, int]]:
@@ -50,6 +55,20 @@ def signature(counts: List[Tuple[int, int]], policy_identity: tuple[object, ...]
     )
 
 
+def _tail_pool_signature(counts: List[Tuple[int, int]], max_routes: int) -> tuple[tuple[int, int], ...]:
+    thresholds = sorted(
+        {
+            threshold
+            for threshold in (*_TAIL_POOL_THRESHOLDS, int(max_routes))
+            if 0 < threshold <= max_routes
+        }
+    )
+    return tuple(
+        (threshold, sum(routes <= threshold for _, routes in counts))
+        for threshold in thresholds
+    )
+
+
 class PlannedMoE:
     def __init__(
         self,
@@ -57,6 +76,8 @@ class PlannedMoE:
         num_cores: int = 8,
         *,
         cpu_ids: Sequence[int] | None = None,
+        task_stage_window_policy: TaskStageWindowPolicy | None = None,
+        use_default_stage_window_policy: bool = True,
     ):
         if callable(getattr(models, "T_iso", None)) and callable(getattr(models, "dag_makespan", None)):
             self.models = (models,)
@@ -66,9 +87,38 @@ class PlannedMoE:
             raise ValueError("at least one cost model is required")
         self.num_cores = int(num_cores)
         self.cpu_ids = tuple(cpu_ids) if cpu_ids is not None else tuple(range(num_cores))
-        self.interval_planners = tuple(IntervalPlanner(model, num_cores, cpu_ids=self.cpu_ids) for model in self.models)
+        self.use_default_stage_window_policy = bool(use_default_stage_window_policy)
+        if task_stage_window_policy is not None:
+            self.task_stage_window_policies = (task_stage_window_policy,) * len(self.models)
+        elif self.use_default_stage_window_policy:
+            self.task_stage_window_policies = tuple(
+                default_task_stage_window_policy(
+                    model.policy,
+                    num_cores=self.num_cores,
+                    cpu_ids=self.cpu_ids,
+                )
+                for model in self.models
+            )
+        else:
+            self.task_stage_window_policies = (None,) * len(self.models)
+        self.interval_planners = tuple(
+            IntervalPlanner(
+                model,
+                num_cores,
+                cpu_ids=self.cpu_ids,
+                task_stage_window_policy=stage_window_policy,
+            )
+            for model, stage_window_policy in zip(self.models, self.task_stage_window_policies)
+        )
         self.policy_planner = (
-            PolicyAwarePlanner(self.models, num_cores, cpu_ids=self.cpu_ids) if len(self.models) > 1 else None
+            PolicyAwarePlanner(
+                self.models,
+                num_cores,
+                cpu_ids=self.cpu_ids,
+                task_stage_window_policies=self.task_stage_window_policies,
+            )
+            if len(self.models) > 1
+            else None
         )
         self.policy_identity = tuple(
             (
@@ -78,8 +128,16 @@ class PlannedMoE:
             if model.policy is not None
             else (str(model.profile_path),)
             for model in self.models
+        ) + (
+            (
+                "task_stage_window_policies",
+                tuple(policy.name if policy is not None else None for policy in self.task_stage_window_policies),
+            ),
         )
-        self.shape_cache: Dict[Tuple[object, ...], Tuple[int, Tuple[int, ...]]] = {}
+        self.shape_cache: Dict[
+            Tuple[object, ...],
+            Tuple[int, Tuple[int, ...], str, int | None, int | None],
+        ] = {}
         self.last: dict[str, object] = {}
 
     def _planner_index(self, result: dict) -> int:
@@ -110,15 +168,45 @@ class PlannedMoE:
                 return index
         raise RuntimeError(f"no planner model for selected profile {selected_profile!r}")
 
-    def _build_cached(self, counts, planner_index: int, shape: Tuple[int, ...]):
+    def _build_cached(
+        self,
+        counts,
+        planner_index: int,
+        shape: Tuple[int, ...],
+        execution_mode: str,
+        tail_pool_threads: int | None,
+        tail_pool_max_routes: int | None,
+    ):
         planner = self.interval_planners[planner_index]
         lanes = planner._lanes(shape)
         tasks = planner._build_tasks(counts, lanes, planner._assign(counts, lanes))
         model = self.models[planner_index]
+        stage_window_policy = self.task_stage_window_policies[planner_index]
+        if execution_mode == "tail_pool":
+            assert tail_pool_threads is not None
+            assert tail_pool_max_routes is not None
+            bridge = planner.to_tail_pool_bridge(
+                tasks,
+                pool_threads=tail_pool_threads,
+                max_pooled_routes=tail_pool_max_routes,
+            )
+        else:
+            bridge = planner.to_async_bridge(tasks)
         return {
             "shape": shape,
+            "execution_mode": bridge["execution_mode"],
+            "tail_pool_threads": tail_pool_threads if execution_mode == "tail_pool" else None,
+            "tail_pool_max_routes": tail_pool_max_routes if execution_mode == "tail_pool" else None,
+            "tail_pool_tasks": (
+                sum(routes <= tail_pool_max_routes for _, routes in counts)
+                if execution_mode == "tail_pool" and tail_pool_max_routes is not None
+                else 0
+            ),
             "w13_split": (model.policy.w13_split if model.policy is not None else None),
             "weight_window_bytes": (model.policy.weight_window_bytes if model.policy is not None else None),
+            "task_stage_window_policy": (
+                stage_window_policy.name if stage_window_policy is not None else None
+            ),
             "policy": (
                 {
                     "profile": str(model.profile_path),
@@ -132,39 +220,72 @@ class PlannedMoE:
                 else None
             ),
             "tasks": tasks,
-            "bridge": planner.to_async_bridge(tasks),
+            "bridge": bridge,
         }
 
     def plan_spec_for(
         self,
         counts,
         *,
+        dynamic_tail_pool: bool = True,
         tail_pool_threads: int | None = None,
         tail_pool_max_routes: int = 12,
     ) -> Dict[str, object]:
         begin = time.perf_counter_ns()
-        cache_key = signature(counts, self.policy_identity)
+        counts = [(int(expert), int(routes)) for expert, routes in counts if int(routes) > 0]
+        requested_mode = "forced" if tail_pool_threads is not None else ("auto" if dynamic_tail_pool else "strict")
+        tail_pool_cache_signature = (
+            _tail_pool_signature(counts, tail_pool_max_routes)
+            if requested_mode != "strict"
+            else ()
+        )
+        cache_key = (
+            *signature(counts, self.policy_identity),
+            requested_mode,
+            tail_pool_threads,
+            tail_pool_max_routes if requested_mode != "strict" else None,
+            tail_pool_cache_signature,
+        )
         after_signature = time.perf_counter_ns()
-        hit = cache_key in self.shape_cache
+        cached = self.shape_cache.get(cache_key)
+        hit = cached is not None
         if hit:
-            planner_index, shape = self.shape_cache[cache_key]
+            assert cached is not None
+            planner_index, shape, execution_mode, selected_pool_threads, selected_max_routes = cached
             after_search = time.perf_counter_ns()
-            result = self._build_cached(counts, planner_index, shape)
+            result = self._build_cached(
+                counts,
+                planner_index,
+                shape,
+                execution_mode,
+                selected_pool_threads,
+                selected_max_routes,
+            )
         else:
             if self.policy_planner is not None:
-                result = self.policy_planner.plan(counts)
+                result = self.policy_planner.plan(
+                    counts,
+                    dynamic_tail_pool=dynamic_tail_pool,
+                    tail_pool_max_routes=tail_pool_max_routes,
+                    forced_tail_pool_threads=tail_pool_threads,
+                )
             else:
-                result = self.interval_planners[0].plan(counts)
+                result = self.interval_planners[0].plan(
+                    counts,
+                    dynamic_tail_pool=dynamic_tail_pool,
+                    tail_pool_max_routes=tail_pool_max_routes,
+                    forced_tail_pool_threads=tail_pool_threads,
+                )
             planner_index = self._planner_index(result)
             shape = tuple(result["shape"])
-            self.shape_cache[cache_key] = (planner_index, shape)
-            after_search = time.perf_counter_ns()
-        if tail_pool_threads is not None:
-            result["bridge"] = self.interval_planners[planner_index].to_tail_pool_bridge(
-                result["tasks"],
-                pool_threads=tail_pool_threads,
-                max_pooled_routes=tail_pool_max_routes,
+            self.shape_cache[cache_key] = (
+                planner_index,
+                shape,
+                str(result["execution_mode"]),
+                result["tail_pool_threads"],
+                result["tail_pool_max_routes"],
             )
+            after_search = time.perf_counter_ns()
         bridge = result["bridge"]
         after_assign = time.perf_counter_ns()
         self.last = {
@@ -176,18 +297,30 @@ class PlannedMoE:
             "planner_overhead_ns": after_assign - begin,
             "plan_version": bridge["plan_version"],
             "execution_mode": bridge["execution_mode"],
+            "tail_pool_threads": result.get("tail_pool_threads"),
+            "tail_pool_max_routes": result.get("tail_pool_max_routes"),
+            "tail_pool_tasks": result.get("tail_pool_tasks", 0),
             "shape": tuple(result["shape"]),
             "w13_split": result.get("w13_split"),
             "weight_window_bytes": result.get("weight_window_bytes"),
+            "task_stage_window_policy": result.get("task_stage_window_policy"),
             "policy": result.get("policy"),
+            "planner_backend": result.get("planner_backend", "cache"),
+            "planner_workers": result.get("planner_workers", 1),
+            "strict_candidates": result.get("strict_candidates", 0),
+            "dynamic_candidates": result.get("dynamic_candidates", 0),
         }
         return {
             "plan_version": bridge["plan_version"],
             "execution_mode": bridge["execution_mode"],
             "bridge": bridge,
             "shape": tuple(result["shape"]),
+            "tail_pool_threads": result.get("tail_pool_threads"),
+            "tail_pool_max_routes": result.get("tail_pool_max_routes"),
+            "tail_pool_tasks": result.get("tail_pool_tasks", 0),
             "w13_split": result.get("w13_split"),
             "weight_window_bytes": result.get("weight_window_bytes"),
+            "task_stage_window_policy": result.get("task_stage_window_policy"),
             "operator_options": {
                 "w13_split": result.get("w13_split"),
                 "weight_window_bytes": result.get("weight_window_bytes"),
@@ -199,12 +332,14 @@ class PlannedMoE:
         self,
         counts,
         *,
+        dynamic_tail_pool: bool = True,
         tail_pool_threads: int | None = None,
         tail_pool_max_routes: int = 12,
     ) -> Dict[str, object]:
         """Bridge-only API; returns Plan V2 with legacy fixed arrays retained."""
         return self.plan_spec_for(
             counts,
+            dynamic_tail_pool=dynamic_tail_pool,
             tail_pool_threads=tail_pool_threads,
             tail_pool_max_routes=tail_pool_max_routes,
         )["bridge"]

@@ -20,7 +20,8 @@ BF16_BYTES = 2
 
 @dataclass(frozen=True)
 class WindowResult:
-    requested_bytes: int
+    w13_requested_bytes: int
+    w2_requested_bytes: int
     w13_ranges: int
     w13_max_bytes: int
     w2_ranges: int
@@ -40,6 +41,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--threads-per-expert", type=int, default=4)
     parser.add_argument("--cpu-start", type=int, default=0)
     parser.add_argument("--window-mib", default="0,2,1")
+    parser.add_argument(
+        "--window-pairs-mib",
+        help="comma-separated W13:W2 window pairs; for example 4:4,4:2",
+    )
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--runs", type=int, default=9)
     parser.add_argument("--seed", type=int, default=20260716)
@@ -49,6 +54,21 @@ def parse_args() -> argparse.Namespace:
 def quantile(samples: list[float], fraction: float) -> float:
     ordered = sorted(samples)
     return ordered[round((len(ordered) - 1) * fraction)]
+
+
+def parse_window_pairs(args: argparse.Namespace) -> list[tuple[int, int]]:
+    if args.window_pairs_mib:
+        pairs = []
+        for item in args.window_pairs_mib.split(","):
+            fields = item.split(":")
+            if len(fields) != 2:
+                raise ValueError(f"invalid W13:W2 window pair: {item!r}")
+            pairs.append(tuple(round(float(value) * (1 << 20)) for value in fields))
+        return pairs
+    return [
+        (window_bytes, window_bytes)
+        for window_bytes in (round(float(value) * (1 << 20)) for value in args.window_mib.split(","))
+    ]
 
 
 def window_shape(k: int, n: int, n_tile: int, requested_bytes: int, legacy_ranges: int) -> tuple[int, int]:
@@ -69,10 +89,10 @@ def bf16_normal(shape: tuple[int, ...], generator: torch.Generator) -> torch.Ten
 
 def main() -> None:
     args = parse_args()
-    windows = [round(float(value) * (1 << 20)) for value in args.window_mib.split(",")]
+    windows = parse_window_pairs(args)
     if min(args.experts, args.routes, args.hidden, args.intermediate, args.threads_per_expert, args.runs) <= 0:
         raise ValueError("shape, thread, expert, and run arguments must be positive")
-    if min(windows) < 0:
+    if min(value for pair in windows for value in pair) < 0:
         raise ValueError("--window-mib values must be non-negative")
 
     total_threads = args.experts * args.threads_per_expert
@@ -100,7 +120,9 @@ def main() -> None:
     deps = torch.empty(0, dtype=torch.int32)
     cpu_ids = torch.arange(args.cpu_start, args.cpu_start + total_threads, dtype=torch.int32)
 
-    def invoke(window_bytes: int) -> torch.Tensor:
+    def invoke(w13_window_bytes: int, w2_window_bytes: int) -> torch.Tensor:
+        os.environ["FUSED_CPP_MOE_EXPERIMENT_W13_WEIGHT_WINDOW_BYTES"] = str(w13_window_bytes)
+        os.environ["FUSED_CPP_MOE_EXPERIMENT_W2_WEIGHT_WINDOW_BYTES"] = str(w2_window_bytes)
         return fused_moe_bf16_tiled_async(
             hidden,
             packed,
@@ -115,41 +137,42 @@ def main() -> None:
             num_threads=total_threads,
             skip_weighted=True,
             w13_split=True,
-            weight_window_bytes=window_bytes,
+            weight_window_bytes=0,
         )
 
-    reference = invoke(windows[0])
-    for window_bytes in windows[1:]:
-        torch.testing.assert_close(invoke(window_bytes).float(), reference.float(), atol=0, rtol=0)
+    reference = invoke(*windows[0])
+    for window_pair in windows[1:]:
+        torch.testing.assert_close(invoke(*window_pair).float(), reference.float(), atol=0, rtol=0)
 
     useful_flops = 6 * args.experts * args.routes * args.hidden * args.intermediate
     results: list[WindowResult] = []
-    for window_bytes in windows:
+    for w13_window_bytes, w2_window_bytes in windows:
         for _ in range(args.warmup):
-            invoke(window_bytes)
+            invoke(w13_window_bytes, w2_window_bytes)
         samples = []
         for _ in range(args.runs):
             begin = time.perf_counter_ns()
-            invoke(window_bytes)
+            invoke(w13_window_bytes, w2_window_bytes)
             samples.append((time.perf_counter_ns() - begin) / 1.0e6)
         median_ms = statistics.median(samples)
         w13_ranges, w13_max_bytes = window_shape(
             args.hidden,
             2 * args.intermediate,
             packed.backend_n_tile,
-            window_bytes,
+            w13_window_bytes,
             legacy_ranges=2,
         )
         w2_ranges, w2_max_bytes = window_shape(
             args.intermediate,
             args.hidden,
             packed.backend_n_tile,
-            window_bytes,
+            w2_window_bytes,
             legacy_ranges=1,
         )
         results.append(
             WindowResult(
-                requested_bytes=window_bytes,
+                w13_requested_bytes=w13_window_bytes,
+                w2_requested_bytes=w2_window_bytes,
                 w13_ranges=w13_ranges,
                 w13_max_bytes=w13_max_bytes,
                 w2_ranges=w2_ranges,
@@ -165,10 +188,10 @@ def main() -> None:
         f"experts={args.experts} routes={args.routes} H={args.hidden} F={args.intermediate} "
         f"threads_per_expert={args.threads_per_expert} total_threads={total_threads}"
     )
-    print("window_MiB  W13_ranges/max_MiB  W2_ranges/max_MiB  p50_ms  p10_ms  p90_ms  TFLOP/s")
+    print("W13/W2_MiB  W13_ranges/max_MiB  W2_ranges/max_MiB  p50_ms  p10_ms  p90_ms  TFLOP/s")
     for result in results:
         print(
-            f"{result.requested_bytes / (1 << 20):10.3f}  "
+            f"{result.w13_requested_bytes / (1 << 20):5.3f}/{result.w2_requested_bytes / (1 << 20):5.3f}  "
             f"{result.w13_ranges:4d}/{result.w13_max_bytes / (1 << 20):7.3f}  "
             f"{result.w2_ranges:4d}/{result.w2_max_bytes / (1 << 20):7.3f}  "
             f"{result.median_ms:7.3f}  {result.p10_ms:7.3f}  {result.p90_ms:7.3f}  "

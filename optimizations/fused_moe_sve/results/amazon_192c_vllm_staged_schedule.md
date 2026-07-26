@@ -75,6 +75,11 @@ Date: 2026-07-22
 The follow-up comparison replaced the hand-written fixed-team control with the
 actual `PlannedMoE` interval-DAG generated from
 `contention_async_amazon_c5_192c_dual_numa_tp4_sve_F512_E256_splitw13_schema_v2_xbyak_exactm_20260720.json`.
+This section is a historical result tied to that profile's source and extension
+hashes. The 2026-07-20 profile was removed from the active catalog by the
+2026-07-26 calibration refresh and remains available in Git history; substituting
+the current profile changes the planner decision and does not reproduce these
+numbers.
 All workloads used 2048 tokens, TopK=6, 256 experts, H4096/F512, and exactly
 12288 routes. The benchmark remained on NUMA0 CPUs `0-95` and used split-W13,
 Xbyak exact-M kernels, BF16 direct route store, SVE U1 merge, and the production
@@ -308,3 +313,131 @@ Neither runtime identity matches the profile. The tables are therefore direct
 operator comparisons using the schedule selected by the latest available
 profile, not a validation of current cost-model accuracy. Refresh the profile
 before using these numbers as production planner-regret evidence.
+
+## Current profile rerun
+
+Date: 2026-07-26
+
+The eight paper workloads were rerun on NUMA0 CPUs `0-95` using the refreshed
+`20260726` split-W13 profile and the current Plan V2 strict executor. Both
+variants used BF16 direct route storage, ready-token merge, the same current
+extension, and five warmups plus 21 interleaved samples. Every production and
+vLLM output was bitwise equal before timing.
+
+```bash
+P=cpu_moe_schedule_optimization/cost_model/profiles/\
+contention_async_amazon_c5_192c_dual_numa_tp4_sve_F512_E256_\
+splitw13_schema_v2_xbyak_exactm_20260726.json
+
+OMP_NUM_THREADS=1 OMP_DYNAMIC=FALSE MKL_NUM_THREADS=1 \
+OPENBLAS_NUM_THREADS=1 PYTHONPATH=src \
+numactl --cpunodebind=0 --membind=0 taskset -c 0-95 \
+  .venv/bin/python \
+  optimizations/fused_moe_sve/benchmarks/bench_vllm_staged_schedule.py \
+  --preset moe256-active-set-32 --production-profile "$P" \
+  --route-dtype bf16 --warmup 5 --runs 21
+```
+
+`Production speedup` is `vLLM median / production median - 1`; a negative
+value means vLLM is faster.
+
+| Workload | Production shape | Production ms | Production P10/P90 | vLLM ms | vLLM P10/P90 | Production TFLOP/s | vLLM TFLOP/s | Production speedup |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Uniform | `6x16T` | 16.545 | 16.392 / 16.686 | 17.287 | 16.793 / 17.672 | 9.345 | 8.944 | +4.49% |
+| Active set 8 | `12x8T` | 9.950 | 9.891 / 9.992 | 13.695 | 13.582 / 13.896 | 15.539 | 11.290 | +37.63% |
+| Active set 16 | `32,16,16,16,16` | 9.218 | 9.149 / 9.283 | 11.016 | 10.621 / 11.400 | 16.774 | 14.036 | +19.51% |
+| Active set 32 | `12x8T` | 8.745 | 8.693 / 8.906 | 11.097 | 10.808 / 11.431 | 17.681 | 13.933 | +26.90% |
+| Active set 64 | `12x8T` | 9.971 | 9.851 / 10.018 | 11.230 | 11.059 / 14.188 | 15.507 | 13.769 | +12.63% |
+| Active set 128 | `12x8T` | 12.003 | 11.832 / 12.215 | 12.938 | 12.461 / 13.189 | 12.882 | 11.950 | +7.79% |
+| Tiered hotspot | `12x8T` | 8.856 | 8.658 / 8.966 | 11.205 | 10.944 / 11.521 | 17.460 | 13.799 | +26.53% |
+| Long/short bimodal | `6x16T` | 12.441 | 12.396 / 12.589 | 11.714 | 11.440 / 11.894 | 12.428 | 13.200 | -5.84% |
+
+The refreshed profile changes several shapes relative to the historical table.
+The largest effect is active-set 8, where `12x8T` reduces production latency
+from the previous 11.015 ms to 9.950 ms. The qualitative conclusion remains:
+strict production wins seven workloads, while vLLM is 6.21% faster than strict
+production on the long/short bimodal workload.
+
+The bimodal Plan V2 tail-pool rerun used the same configuration and interleaved
+all four variants:
+
+| Variant | Median ms | P10/P90 | Aggregate TFLOP/s | Gain vs strict |
+| --- | ---: | ---: | ---: | ---: |
+| Plan V2 strict `6x16T` | 12.582 | 12.514 / 13.965 | 12.289 | baseline |
+| Static `16T -> 4x4T` | 11.084 | 11.025 / 11.218 | 13.950 | +13.51% |
+| Plan V2 `4T tail_pool` | **10.791** | **10.744 / 10.944** | **14.329** | **+16.60%** |
+| vLLM staged | 11.709 | 11.421 / 11.852 | 13.205 | +7.46% |
+
+The tail pool is 8.51% faster than vLLM staged. At the time of this historical
+measurement it remained an explicit benchmark action; the planner-selected
+rerun below supersedes that default-state conclusion.
+
+Operator timing excludes Python planning. Cold/warm `plan_spec_for` latency
+ranged from 2.91-51.74 ms and 0.14-2.11 ms, respectively. Naively adding warm
+planning preserves the production lead for active-set 8/16/32/64 and tiered
+hotspot, but makes vLLM faster for uniform, active-set 128, and bimodal. This is
+not a symmetric Python E2E comparison because route-histogram construction and
+vLLM task setup are not separately measured.
+
+The current source and extension SHA256 values were
+`aad3ca0300ae9d5a75ecfae268bdbfd5591eb377d3fbc92696104ff4e3a2fc4b` and
+`9beea69658a49dc90ab0d518b7c3e8de65e66681027aeede307072fdc0c19fe2`.
+The profile records
+`a62e0d9425381750fdc859ed97e2a4d1cc33727ffe36dbb75c453f061a924dfb` and
+`e652d9aad3025a4836d0406110bcbdf3fdc1356aaba2bf789595359a58a92559`.
+The post-profile source change only adds stage-specific experimental
+weight-window environment overrides, which were unset in this benchmark, so
+the direct operator comparison uses the same default execution behavior. The
+identity mismatch still means this table is not a calibrated planner-regret
+validation.
+
+## Planner-selected dynamic execution
+
+Date: 2026-07-26
+
+Plan V2 tail-pool support is now always available to the native executor, while
+`PlannedMoE` compares strict and dynamic candidates by default. The planner
+chooses the fixed-head shape, pooled route threshold, and aligned `1/2/4T`
+pool width. `dynamic_tail_pool=False` supplies the strict control, and
+`tail_pool_threads=4` supplies the forced-width control.
+
+The same NUMA0 `0-95`, split-W13, H4096/F512/E256, 2048-token, TopK=6 setup was
+used with BF16 direct route storage, five warmups, and 21 interleaved samples.
+Every strict, automatic, forced-4T, and vLLM output compared before timing was
+bitwise equal.
+
+| Workload | Planner choice | Strict ms | Auto ms | Auto gain | vLLM ms | Auto vs vLLM |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| Uniform | strict `6x16T` | 16.585 | 16.529 | +0.34% | 17.159 | +3.81% |
+| Active set 8 | strict `12x8T` | 9.938 | 9.943 | -0.05% | 13.698 | +37.77% |
+| Active set 16 | strict `32,16,16,16,16` | 9.202 | 9.211 | -0.09% | 10.789 | +17.14% |
+| Active set 32 | strict `12x8T` | 8.759 | 8.763 | -0.04% | 11.063 | +26.25% |
+| Active set 64 | strict `12x8T` | 10.010 | 9.993 | +0.17% | 10.925 | +9.32% |
+| Active set 128 | strict `12x8T` | 11.817 | 11.856 | -0.33% | 12.971 | +9.40% |
+| Tiered hotspot | strict `12x8T` | 8.806 | 8.839 | -0.38% | 11.248 | +27.25% |
+| Long/short bimodal | `6x16T` head + `1T`, `M<=12` pool | **12.529** | **10.408** | **+20.39%** | 11.728 | **+12.68%** |
+| Captured DSV4 routing | strict `12x8T` | 14.691 | 14.694 | -0.02% | 15.788 | +7.45% |
+
+For the eight workloads where the planner chose strict, `production_auto` and
+`production_strict` execute the same native plan; their maximum 0.38%
+difference is run-to-run timing noise. For the bimodal workload, forcing 4T
+measured `10.801 ms`, so the planner-selected 1T pool was 3.78% faster and
+confirmed that runtime support should not imply a fixed dynamic width.
+
+Search pruning limits automatic dynamic expansion to strict candidates in the
+fastest uncertainty band plus the two fastest strict head shapes. Cold/warm
+planning measured `60.581/0.944 ms` for bimodal and `272.151/2.396 ms` for the
+captured routing workload with the Python cold solver. A follow-up equivalent
+C++ implementation on the same `0-95` cores reduced cold-search medians to
+`1.421 ms` and `3.488 ms` with 8 candidate workers; 1T C++ measured
+`2.610 ms` and `11.627 ms`. All structural plan fields and rounded rankings
+matched Python, with only sub-`1e-12` relative floating-point summation
+differences. Operator latency still excludes planning, and cache hits remain
+the lowest-overhead online path.
+
+The runtime extension SHA256 remained
+`9beea69658a49dc90ab0d518b7c3e8de65e66681027aeede307072fdc0c19fe2`, while
+the profile records
+`e652d9aad3025a4836d0406110bcbdf3fdc1356aaba2bf789595359a58a92559`.
+Consequently, these measurements validate plan selection behavior and relative
+executor performance, but not calibrated absolute-time accuracy or regret.

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -13,9 +14,10 @@ COST_MODEL = ROOT / "cpu_moe_schedule_optimization" / "cost_model"
 PLANNERS = ROOT / "cpu_moe_schedule_optimization" / "planners"
 sys.path[:0] = [str(COST_MODEL), str(PLANNERS)]
 
-from interval_planner import PolicyAwarePlanner  # noqa: E402
+from interval_planner import IntervalPlanner, PolicyAwarePlanner  # noqa: E402
 from iso_formula import IsoFormula, fit_from_measurements  # noqa: E402
 from phase_model import ContentionCostModel  # noqa: E402
+import planned_moe as planned_moe_module  # noqa: E402
 from planned_moe import PlannedMoE, signature  # noqa: E402
 from profile_catalog import (  # noqa: E402
     ProfileCatalog,
@@ -23,6 +25,10 @@ from profile_catalog import (  # noqa: E402
     ProfileQuery,
 )
 from simulate_schedules import PRESETS  # noqa: E402
+from stage_window_policy import (  # noqa: E402
+    AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V1,
+    default_task_stage_window_policy,
+)
 from tp_vs_ep_model import HierarchicalTopology, ParallelLayerEvaluator  # noqa: E402
 from weight_window import fused_moe_weight_windows  # noqa: E402
 from workload_catalog import load_routing_workload  # noqa: E402
@@ -63,6 +69,116 @@ def models(catalog: ProfileCatalog, mode: str, ffn: int, local_experts: int):
     )
     no_split, split = catalog.split_pair(query)
     return ContentionCostModel(no_split.path), ContentionCostModel(split.path)
+
+
+class _DeterministicTailPoolModel:
+    schema_version = 1
+    supported_shapes: tuple[tuple[int, ...], ...] = ()
+    supported_widths = (1, 2, 4)
+    profile_path = Path("deterministic-tail-pool.json")
+    policy = None
+    max_stage_bytes = 1
+    has_full_workload_anchors = False
+    local_experts = 0
+    profile_runs = 1
+
+    def T_iso(self, routes: int, threads: int) -> float:
+        if routes >= 100:
+            return {1: 400.0, 2: 220.0, 4: 100.0}[threads]
+        return {1: 10.0, 2: 8.0, 4: 7.0}[threads]
+
+    def dag_makespan(self, tasks) -> float:
+        finish: list[float] = []
+        for routes, threads, dependencies in tasks:
+            start = max((finish[dependency] for dependency in dependencies), default=0.0)
+            finish.append(start + self.T_iso(routes, threads))
+        return max(finish, default=0.0)
+
+    def supports_shape(self, shape) -> bool:
+        return tuple(shape) == (4,)
+
+    def relative_uncertainty(self, routes: int, shape) -> float:
+        del routes, shape
+        return 0.0
+
+    def relative_full_call_uncertainty(self, routes: int, shape) -> float:
+        del routes, shape
+        return 0.0
+
+    def profiled_full_call_time(self, routes: int, shape) -> float:
+        del routes, shape
+        raise AssertionError("schema-v1 test model has no full-call anchors")
+
+    def window_bytes_per_worker(self, threads: int) -> int:
+        return threads
+
+
+def test_planner_selects_tail_pool_width_and_can_disable_dynamic() -> None:
+    planner = IntervalPlanner(
+        _DeterministicTailPoolModel(),
+        num_cores=4,
+        widths=(1, 2, 4),
+        shapes=((4,),),
+    )
+    experts = [(0, 100), (1, 100), *((expert, 1) for expert in range(2, 10))]
+
+    selected = planner.plan(experts)
+    strict = planner.plan(experts, dynamic_tail_pool=False, tail_pool_max_routes=0)
+    forced = planner.plan(experts, forced_tail_pool_threads=2)
+
+    assert selected["execution_mode"] == "tail_pool"
+    assert selected["tail_pool_threads"] == 1
+    assert selected["tail_pool_max_routes"] == 1
+    assert selected["tail_pool_tasks"] == 8
+    assert selected["makespan_ns"] < strict["makespan_ns"]
+    assert strict["execution_mode"] == "strict"
+    assert forced["execution_mode"] == "tail_pool"
+    assert forced["tail_pool_threads"] == 2
+
+
+def test_planner_keeps_strict_when_tail_pool_does_not_improve_makespan() -> None:
+    planner = IntervalPlanner(
+        _DeterministicTailPoolModel(),
+        num_cores=4,
+        widths=(1, 2, 4),
+        shapes=((4,),),
+    )
+
+    selected = planner.plan([(0, 100), (1, 100), (2, 1)])
+
+    assert selected["execution_mode"] == "strict"
+    assert selected["tail_pool_threads"] is None
+
+
+def test_planned_moe_defaults_to_auto_and_isolates_strict_cache_entries() -> None:
+    runtime = PlannedMoE(_DeterministicTailPoolModel(), num_cores=4)
+    experts = [(0, 100), (1, 100), *((expert, 1) for expert in range(2, 10))]
+
+    automatic = runtime.plan_spec_for(experts)
+    cached = runtime.plan_spec_for(experts)
+    assert runtime.last["cache_hit"] is True
+    strict = runtime.plan_spec_for(experts, dynamic_tail_pool=False)
+
+    assert automatic["execution_mode"] == "tail_pool"
+    assert automatic["tail_pool_threads"] == 1
+    assert cached["bridge"] == automatic["bridge"]
+    assert strict["execution_mode"] == "strict"
+    assert strict["bridge"] != automatic["bridge"]
+    assert runtime.last["cache_hit"] is False
+
+
+def test_planned_moe_tail_pool_cache_tracks_threshold_eligibility() -> None:
+    runtime = PlannedMoE(_DeterministicTailPoolModel(), num_cores=4)
+    first = [(0, 100), (1, 100), (2, 11), (3, 11), *((expert, 13) for expert in range(4, 10))]
+    second = [(0, 100), (1, 100), (2, 11), *((expert, 13) for expert in range(3, 10))]
+    assert signature(first) == signature(second)
+
+    first_plan = runtime.plan_spec_for(first)
+    second_plan = runtime.plan_spec_for(second)
+
+    assert first_plan["execution_mode"] == "tail_pool"
+    assert second_plan["execution_mode"] == "strict"
+    assert runtime.last["cache_hit"] is False
 
 
 def test_iso_formula_recovers_separable_measurements() -> None:
@@ -285,6 +401,8 @@ def test_window_policy_and_thread_shape_are_selected_jointly(
     assert bridge["task_stage_ids"] == [0] * len(bridge["task_threads"])
     assert bridge["task_resize_points"] == [0] * len(bridge["task_threads"])
     assert bridge["task_range_granularities"] == [0] * len(bridge["task_threads"])
+    assert bridge["task_w13_window_bytes"] == [-1] * len(bridge["task_threads"])
+    assert bridge["task_w2_window_bytes"] == [-1] * len(bridge["task_threads"])
     cached_spec = runtime.plan_spec_for([(expert, 192) for expert in range(64)])
     assert cached_spec["operator_options"] == spec["operator_options"]
     assert cached_spec["bridge"] == bridge
@@ -335,6 +453,136 @@ def test_tail_pool_bridge_relinks_fixed_lane_dependencies(
     assert spec["execution_mode"] == "tail_pool"
     assert spec["bridge"]["task_placement_modes"].count(1) == 2
     assert runtime.last["execution_mode"] == "tail_pool"
+
+
+def test_static_stage_window_policy_is_lowered_per_task(
+    catalog: ProfileCatalog,
+) -> None:
+    _, model = models(catalog, "tp", 1024, 64)
+    planner = IntervalPlanner(
+        model,
+        32,
+        task_stage_window_policy=AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V1,
+    )
+    tasks = [
+        (0, 48, 0, 8, []),
+        (1, 96, 8, 8, []),
+        (2, 192, 16, 8, []),
+        (3, 384, 24, 8, []),
+    ]
+
+    bridge = planner.to_async_bridge(tasks)
+
+    assert bridge["task_w13_window_bytes"] == [-1, 1024 * 1024, 1024 * 1024, 4 * 1024 * 1024]
+    assert bridge["task_w2_window_bytes"] == [-1, 512 * 1024, 512 * 1024, 1024 * 1024]
+
+    pooled_bridge = planner.to_tail_pool_bridge(
+        tasks,
+        pool_threads=2,
+        max_pooled_routes=96,
+    )
+    assert pooled_bridge["task_threads"] == [2, 2, 8, 8]
+    assert pooled_bridge["task_w13_window_bytes"] == [-1, 128 * 1024, 1024 * 1024, 4 * 1024 * 1024]
+    assert pooled_bridge["task_w2_window_bytes"] == [-1, 256 * 1024, 512 * 1024, 1024 * 1024]
+
+
+def test_default_stage_window_policy_requires_exact_profile(
+    catalog: ProfileCatalog,
+) -> None:
+    _, model = models(catalog, "tp", 1024, 64)
+    assert model.policy is not None
+    cpu_ids_by_rank = (tuple(range(96)), tuple(range(96, 192)))
+    matching = replace(
+        model.policy,
+        mode="tp",
+        degree=4,
+        hidden_size=4096,
+        intermediate_size=512,
+        global_experts=256,
+        local_experts=256,
+        backend="sve",
+        backend_n_tile=8,
+        sve_implementation="jit",
+        m_tail_policy="xbyak_exact_m",
+        activation="silu",
+        dtype="bf16",
+        w13_split=True,
+        w13_split_chunks=2,
+        weight_window_bytes=0,
+        w13_window_ranges=2,
+        w2_window_ranges=1,
+        measurement_experts=256,
+        cores_per_rank=96,
+        concurrent_ranks=2,
+        llc_bytes_per_rank=96 * 1024 * 1024,
+        numa_nodes=(0, 1),
+        cpu_ids_by_rank=cpu_ids_by_rank,
+    )
+
+    assert (
+        default_task_stage_window_policy(
+            matching,
+            num_cores=96,
+            cpu_ids=cpu_ids_by_rank[0],
+        )
+        is AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V1
+    )
+    assert (
+        default_task_stage_window_policy(
+            matching,
+            num_cores=96,
+            cpu_ids=cpu_ids_by_rank[1],
+        )
+        is AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V1
+    )
+    assert (
+        default_task_stage_window_policy(
+            replace(matching, w13_split=False),
+            num_cores=96,
+            cpu_ids=cpu_ids_by_rank[0],
+        )
+        is None
+    )
+    assert (
+        default_task_stage_window_policy(
+            matching,
+            num_cores=96,
+            cpu_ids=tuple(range(1, 97)),
+        )
+        is None
+    )
+
+
+def test_planned_moe_applies_default_stage_windows_per_profile(
+    monkeypatch: pytest.MonkeyPatch,
+    catalog: ProfileCatalog,
+) -> None:
+    no_split, split = models(catalog, "tp", 1024, 64)
+
+    def select_default(profile, *, num_cores, cpu_ids):
+        del num_cores, cpu_ids
+        if profile is not None and profile.w13_split:
+            return AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V1
+        return None
+
+    monkeypatch.setattr(planned_moe_module, "default_task_stage_window_policy", select_default)
+    runtime = PlannedMoE((no_split, split), 32, cpu_ids=tuple(range(32)))
+
+    assert runtime.task_stage_window_policies == (
+        None,
+        AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V1,
+    )
+    tasks = [(0, 96, 0, 8, [])]
+    assert runtime.interval_planners[0].to_async_bridge(tasks)["task_w13_window_bytes"] == [-1]
+    assert runtime.interval_planners[1].to_async_bridge(tasks)["task_w13_window_bytes"] == [1024 * 1024]
+
+    disabled = PlannedMoE(
+        (no_split, split),
+        32,
+        cpu_ids=tuple(range(32)),
+        use_default_stage_window_policy=False,
+    )
+    assert disabled.task_stage_window_policies == (None, None)
 
 
 def test_m12_tail_composition(catalog: ProfileCatalog) -> None:
@@ -589,8 +837,10 @@ def test_real_routing_summary_offline_plan_and_cost_model(
         32,
     )
     result = policy_planner.plan(workload.experts)
+    strict_result = policy_planner.plan(workload.experts, dynamic_tail_pool=False)
     assert math.isfinite(result["makespan_ns"])
     assert result["makespan_ns"] > 0
+    assert result["makespan_ns"] <= strict_result["makespan_ns"]
     assert len(result["tasks"]) == workload.observed_active_experts
     assert sum(task[1] for task in result["tasks"]) == workload.routes
     assert len(result["bridge"]["task_expert_ids"]) == len(result["tasks"])
@@ -599,14 +849,14 @@ def test_real_routing_summary_offline_plan_and_cost_model(
     selected = next(
         planner
         for planner in policy_planner.planners
-        if planner.model.policy is not None and planner.model.policy.w13_split == result["w13_split"]
+        if planner.model.policy is not None and planner.model.policy.w13_split == strict_result["w13_split"]
     )
     rescored_ns, rescored_tasks = selected.score_shape(
         workload.experts,
-        result["shape"],
+        strict_result["shape"],
     )
-    assert rescored_ns == pytest.approx(result["makespan_ns"])
-    assert rescored_tasks == result["tasks"]
+    assert rescored_ns == pytest.approx(strict_result["makespan_ns"])
+    assert rescored_tasks == strict_result["tasks"]
 
 
 def test_tp_ep_evaluator_and_generic_p2_collectives(

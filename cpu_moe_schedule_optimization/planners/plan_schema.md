@@ -247,7 +247,9 @@ native `fused_moe_bf16_tiled_async_plan_v2` entrypoint:
   "task_numa_nodes": [-1, -1, -1],
   "task_stage_ids": [0, 0, 0],
   "task_resize_points": [0, 0, 0],
-  "task_range_granularities": [0, 0, 0]
+  "task_range_granularities": [0, 0, 0],
+  "task_w13_window_bytes": [-1, 1048576, 4194304],
+  "task_w2_window_bytes": [-1, 524288, 1048576]
 }
 ```
 
@@ -272,6 +274,13 @@ Rules:
 - Stage id `0` means a whole expert, resize mask `0` means no legal resize
   point, and range granularity `0` means the full expert task. These are the only
   values currently executed.
+- `task_w13_window_bytes` and `task_w2_window_bytes` are optional per-task SVE
+  stage overrides. Missing arrays are materialized as `-1`; each present array
+  must have one entry per task. `-1` inherits the operator-wide
+  `weight_window_bytes`, `0` selects the stage's legacy range rule, and a
+  positive value selects a tile-aligned nominal packed-B byte window. Non-SVE
+  backends ignore the override. A pre-V2 native extension rejects a plan with
+  any non-negative override instead of silently changing its execution.
 - The first async bridge supports exactly one task per active expert.
 - Strict mode requires every placement to be fixed and ignores the legacy
   short-pool environment variables.
@@ -298,14 +307,33 @@ Rules:
   should materialize and cache `AsyncMoEPlanV2` outside the timed operator path.
   A pre-V2 native extension can execute strict plans through the legacy entry,
   but tail-pool plans require the V2 symbol.
-- `IntervalPlanner` and `PlannedMoE` remain strict by default.
-  `PlannedMoE.plan_spec_for(..., tail_pool_threads=T,
-  tail_pool_max_routes=12)` explicitly rewrites eligible whole experts into
-  pooled placement. This is a forced experimental bridge: the current cost
-  model still scores the original fixed-lane DAG and does not choose or predict
-  tail-pool execution automatically.
-- Kernel policy remains operator-wide rather than per task. A policy-aware plan
-  emits adjacent `operator_options`:
+- `IntervalPlanner` and `PlannedMoE` compare strict execution with eligible
+  whole-expert tail-pool candidates by default. The planner searches route
+  buckets `1/2/4/8/12` at or below `tail_pool_max_routes=12`, aligned `1/2/4T`
+  pool widths, and strict-competitive head shapes. Duplicate pooled sets are
+  removed before it lowers each online list schedule to a surrogate DAG and
+  scores it with the current contention model.
+- `dynamic_tail_pool=False` requests the strict baseline.
+  `tail_pool_threads=T` remains a forced override, but shape selection is still
+  performed against that tail-pool policy instead of rewriting an already
+  selected strict shape.
+- The plan cache separates strict, automatic, and forced policies and records
+  the eligible-expert count at every searched route threshold. A routing
+  update that crosses a pooling boundary therefore triggers replanning even
+  when its coarse route histogram is unchanged.
+- The runtime, rather than the planner, observes actual fixed-task completion
+  and assigns the next pooled task. The surrogate is therefore a selection
+  model, not an exact prediction of runtime claim order.
+- For schema-v2 empirical profiles, an available current extension runs cold
+  candidate search in C++ and parallelizes independent candidates. Planner
+  output records `planner_backend`, `planner_workers`, `strict_candidates`, and
+  `dynamic_candidates`; these are diagnostics and are not part of the runtime
+  bridge identity. `FUSED_CPP_MOE_NATIVE_COLD_PLANNER=0` selects the Python
+  reference implementation, while `FUSED_CPP_MOE_PLANNER_THREADS` controls
+  native candidate workers. Cache hits rebuild the same bridge without rerunning
+  either cold solver.
+- Profiled kernel selection remains operator-wide. A policy-aware plan emits
+  adjacent `operator_options`:
 
   ```json
   {
@@ -316,8 +344,20 @@ Rules:
 
   A positive window serializes both SVE GEMMs into tile-aligned packed-B
   ranges. It is selected only from an exact schema-v2 profile carrying that
-  target and the actual W13/W2 range counts. All tasks in one plan share the
-  selected value; per-task and independent W13/W2 windows are not represented.
+  target and the actual W13/W2 range counts.
+
+  An optional named `TaskStageWindowPolicy` may populate the two per-task
+  arrays after task widths and placements have been selected. The current
+  static policy is a deterministic lookup on `(routes, actual_task_threads)`;
+  unsupported combinations emit `-1`. It does not add candidates or change
+  cost-model scores, and tail-pool tasks use the selected pool width. The
+  policy name is part of `PlannedMoE` cache identity and result metadata.
+  `PlannedMoE` resolves the policy independently for every candidate model.
+  The measured `amazon_c5_192c_tp4_f512_v1` policy is default-on only when the
+  complete dual-NUMA AmazonC5192Cores TP4/F512 SVE JIT exact-M split profile
+  identity and one of its 96-core rank CPU sets match. No-split and all other
+  profiles inherit their operator-wide policy. Pass
+  `use_default_stage_window_policy=False` for a controlled baseline.
 
 ## Planner Kinds
 

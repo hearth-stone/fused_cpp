@@ -13,12 +13,16 @@
 
 #include <algorithm>
 #include <chrono>
+#include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
-#include "planner_dispatch.h"
 #include "exact_solver.h"
+#include "interval_planner.h"
+#include "planner_dispatch.h"
 
 namespace py = pybind11;
 
@@ -81,6 +85,179 @@ int64_t percentile_ns(std::vector<int64_t> values, double percentile) {
       std::min<double>(values.size() - 1, std::max<double>(0.0, percentile * (values.size() - 1) + 0.5)));
   std::nth_element(values.begin(), values.begin() + idx, values.end());
   return values[idx];
+}
+
+template <typename T>
+T required_value(const py::dict& payload, const char* key) {
+  if (!payload.contains(key)) {
+    throw std::invalid_argument(std::string("native planner payload is missing ") + key);
+  }
+  return py::cast<T>(payload[key]);
+}
+
+std::vector<std::pair<int, double>> parse_pairs(const py::handle& values) {
+  std::vector<std::pair<int, double>> result;
+  for (const py::handle row_handle : py::reinterpret_borrow<py::iterable>(values)) {
+    const py::sequence row = py::reinterpret_borrow<py::sequence>(row_handle);
+    if (py::len(row) != 2) {
+      throw std::invalid_argument("native planner pair rows must have two fields");
+    }
+    result.emplace_back(py::cast<int>(row[0]), py::cast<double>(row[1]));
+  }
+  return result;
+}
+
+std::vector<IntervalIsoEntry> parse_iso_entries(const py::handle& values) {
+  std::vector<IntervalIsoEntry> result;
+  for (const py::handle row_handle : py::reinterpret_borrow<py::iterable>(values)) {
+    const py::sequence row = py::reinterpret_borrow<py::sequence>(row_handle);
+    if (py::len(row) != 3) {
+      throw std::invalid_argument("native planner isolated rows must have three fields");
+    }
+    result.push_back({
+        py::cast<int>(row[0]),
+        py::cast<int>(row[1]),
+        py::cast<double>(row[2]),
+    });
+  }
+  return result;
+}
+
+std::vector<IntervalDerateEntry> parse_derate_entries(const py::handle& values, bool has_team) {
+  std::vector<IntervalDerateEntry> result;
+  for (const py::handle row_handle : py::reinterpret_borrow<py::iterable>(values)) {
+    const py::sequence row = py::reinterpret_borrow<py::sequence>(row_handle);
+    const size_t expected = has_team ? 4 : 3;
+    if (py::len(row) != expected) {
+      throw std::invalid_argument("native planner derate row has an invalid field count");
+    }
+    result.push_back({
+        py::cast<int>(row[0]),
+        py::cast<int>(row[1]),
+        has_team ? py::cast<int>(row[2]) : 0,
+        py::cast<double>(row[expected - 1]),
+    });
+  }
+  return result;
+}
+
+std::vector<IntervalShapeCurveEntry> parse_shape_curve_entries(const py::handle& values) {
+  std::vector<IntervalShapeCurveEntry> result;
+  for (const py::handle row_handle : py::reinterpret_borrow<py::iterable>(values)) {
+    const py::sequence row = py::reinterpret_borrow<py::sequence>(row_handle);
+    if (py::len(row) != 3) {
+      throw std::invalid_argument("native planner shape-curve rows must have three fields");
+    }
+    result.push_back({
+        py::cast<std::vector<int>>(row[0]),
+        py::cast<int>(row[1]),
+        py::cast<double>(row[2]),
+    });
+  }
+  return result;
+}
+
+IntervalIsoFormulaConfig parse_iso_formula(const py::handle& value) {
+  IntervalIsoFormulaConfig result;
+  if (value.is_none()) {
+    return result;
+  }
+  const py::dict payload = py::reinterpret_borrow<py::dict>(value);
+  result.enabled = true;
+  result.o0 = required_value<double>(payload, "o0");
+  result.o1 = required_value<double>(payload, "o1");
+  result.alpha = required_value<double>(payload, "alpha");
+  result.beta = required_value<double>(payload, "beta");
+  result.route_work = parse_pairs(payload["c_pts"]);
+  result.measured_phi = parse_pairs(payload["phi_pts"]);
+  return result;
+}
+
+IntervalCostModelConfig parse_interval_cost_model(const py::dict& payload) {
+  IntervalCostModelConfig result;
+  result.schema_version = required_value<int>(payload, "schema_version");
+  result.exact_m = required_value<bool>(payload, "exact_m");
+  result.use_formula_iso = required_value<bool>(payload, "use_formula_iso");
+  result.use_max_team_derate = required_value<bool>(payload, "use_max_team_derate");
+  result.use_shape_derate = required_value<bool>(payload, "use_shape_derate");
+  result.use_stage_model = required_value<bool>(payload, "use_stage_model");
+  result.has_full_workload_anchors = required_value<bool>(payload, "has_full_workload_anchors");
+  result.local_experts = required_value<int>(payload, "local_experts");
+  result.profile_runs = required_value<int>(payload, "profile_runs");
+  result.measurement_experts = required_value<int>(payload, "measurement_experts");
+  result.w13_window_ranges = required_value<int>(payload, "w13_window_ranges");
+  result.w2_window_ranges = required_value<int>(payload, "w2_window_ranges");
+  result.w13_chunk_bytes = required_value<int64_t>(payload, "w13_chunk_bytes");
+  result.w2_chunk_bytes = required_value<int64_t>(payload, "w2_chunk_bytes");
+  result.max_stage_bytes = required_value<int64_t>(payload, "max_stage_bytes");
+  result.w13_tile_bytes = required_value<int64_t>(payload, "w13_tile_bytes");
+  result.w2_tile_bytes = required_value<int64_t>(payload, "w2_tile_bytes");
+  result.call_setup_ns = required_value<double>(payload, "call_setup_ns");
+  result.isolated = parse_iso_entries(payload["isolated"]);
+  result.overheads = parse_pairs(payload["overheads"]);
+  result.iso_formula = parse_iso_formula(payload["iso_formula"]);
+  result.derate_2d = parse_derate_entries(payload["derate_2d"], false);
+  result.derate_3d = parse_derate_entries(payload["derate_3d"], true);
+  result.shape_derate = parse_shape_curve_entries(payload["shape_derate"]);
+  result.group_curves = parse_shape_curve_entries(payload["group_curves"]);
+  result.full_call_curves = parse_shape_curve_entries(payload["full_call_curves"]);
+  result.p10_curves = parse_shape_curve_entries(payload["p10_curves"]);
+  result.p90_curves = parse_shape_curve_entries(payload["p90_curves"]);
+  result.full_call_p10_curves = parse_shape_curve_entries(payload["full_call_p10_curves"]);
+  result.full_call_p90_curves = parse_shape_curve_entries(payload["full_call_p90_curves"]);
+  return result;
+}
+
+const char* interval_execution_mode_name(IntervalExecutionMode mode) {
+  return mode == IntervalExecutionMode::kStrict ? "strict" : "tail_pool";
+}
+
+py::list interval_tasks_to_python(const std::vector<IntervalTask>& tasks) {
+  py::list result;
+  for (const IntervalTask& task : tasks) {
+    result.append(py::make_tuple(task.expert_id, task.routes, task.core_begin, task.threads, task.dependencies));
+  }
+  return result;
+}
+
+py::dict interval_candidate_to_python(const IntervalCandidate& candidate) {
+  py::dict result;
+  result["shape"] = candidate.shape;
+  result["execution_mode"] = interval_execution_mode_name(candidate.execution_mode);
+  result["tail_pool_threads"] =
+      candidate.tail_pool_threads.has_value() ? py::cast(*candidate.tail_pool_threads) : py::none();
+  result["tail_pool_max_routes"] =
+      candidate.tail_pool_max_routes.has_value() ? py::cast(*candidate.tail_pool_max_routes) : py::none();
+  result["tail_pool_tasks"] = candidate.tail_pool_tasks;
+  result["makespan_ns"] = candidate.makespan_ns;
+  result["uncertainty_ns"] = candidate.uncertainty_ns;
+  result["pessimistic_ns"] = candidate.pessimistic_ns;
+  result["tasks"] = interval_tasks_to_python(candidate.tasks);
+  result["active_working_set_bytes"] = candidate.active_working_set_bytes;
+  result["window_bytes_per_worker"] = candidate.window_bytes_per_worker;
+  result["resource_groups"] = candidate.resource_groups;
+  return result;
+}
+
+py::dict native_interval_plan(const NativeIntervalPlanner& planner, const std::vector<int>& expert_ids,
+                              const std::vector<int>& routes, bool dynamic_tail_pool, int tail_pool_max_routes,
+                              std::optional<int> forced_tail_pool_threads) {
+  IntervalPlanResult native_result;
+  {
+    py::gil_scoped_release release;
+    native_result = planner.Plan(expert_ids, routes, dynamic_tail_pool, tail_pool_max_routes, forced_tail_pool_threads);
+  }
+  py::dict result;
+  result["selected"] = interval_candidate_to_python(native_result.selected);
+  py::list candidates;
+  for (const IntervalCandidate& candidate : native_result.candidates) {
+    candidates.append(interval_candidate_to_python(candidate));
+  }
+  result["candidates"] = std::move(candidates);
+  result["configured_workers"] = native_result.configured_workers;
+  result["strict_candidates"] = native_result.strict_candidates;
+  result["dynamic_candidates"] = native_result.dynamic_candidates;
+  return result;
 }
 
 // routes_hist: 1-D histogram (length num_experts). Returns a dict mirroring
@@ -227,6 +404,21 @@ static py::dict moe_exact_optimum(std::vector<int64_t> routes_hist, int64_t num_
 }
 
 void register_moe_planner(py::module_& m) {
+  py::class_<moe_planner::NativeIntervalPlanner>(m, "NativeIntervalPlanner")
+      .def(py::init([](int num_cores, std::vector<int> widths, std::vector<std::vector<int>> shapes,
+                       const py::dict& model_payload, int planner_threads) {
+             return std::make_unique<moe_planner::NativeIntervalPlanner>(
+                 num_cores, std::move(widths), std::move(shapes), parse_interval_cost_model(model_payload),
+                 planner_threads);
+           }),
+           py::arg("num_cores"), py::arg("widths"), py::arg("shapes"), py::arg("model_payload"),
+           py::arg("planner_threads") = 0)
+      .def("plan", &native_interval_plan, py::arg("expert_ids"), py::arg("routes"), py::arg("dynamic_tail_pool") = true,
+           py::arg("tail_pool_max_routes") = 12, py::arg("forced_tail_pool_threads") = std::nullopt)
+      .def("_estimate_isolated", &moe_planner::NativeIntervalPlanner::EstimateIsolated)
+      .def("_score_dag", &moe_planner::NativeIntervalPlanner::ScoreDag)
+      .def_property_readonly("configured_workers", &moe_planner::NativeIntervalPlanner::configured_workers);
+
   m.def("moe_schedule_plan", &moe_schedule_plan,
         "CPU MoE schedule planner (FIXED / SORTED_TOKEN_BALANCED_1T / "
         "UNIFORM_WAVES / GREEDY_MARGINAL_GAIN / ENUMERATE_CORE_GROUPS). "

@@ -234,6 +234,63 @@ class ContentionCostModel:
             self._owner_range_bytes(self.w2_chunk_bytes, self.w2_tile_bytes, threads),
         )
 
+    @staticmethod
+    def _native_shape_curve_rows(curves) -> list[tuple[list[int], int, float]]:
+        return [
+            (list(shape), int(routes), float(value))
+            for shape, curve in sorted(curves.items())
+            for routes, value in sorted(curve.items())
+        ]
+
+    def native_interval_planner_payload(self) -> dict[str, object]:
+        """Export immutable schema-v2 calibration for the native cold planner."""
+        if self.schema_version < 2:
+            raise ValueError("native interval planner requires a schema-v2 profile")
+        return {
+            "schema_version": self.schema_version,
+            "exact_m": self.m_tail_policy == "xbyak_exact_m",
+            "use_formula_iso": self.iso_formula is not None,
+            "use_max_team_derate": self.use_max_team_derate,
+            "use_shape_derate": self.use_shape_derate,
+            "use_stage_model": self.use_stage_model,
+            "has_full_workload_anchors": self.has_full_workload_anchors,
+            "local_experts": self.local_experts,
+            "profile_runs": self.profile_runs,
+            "measurement_experts": self.measurement_experts,
+            "w13_window_ranges": self.w13_window_ranges,
+            "w2_window_ranges": self.w2_window_ranges,
+            "w13_chunk_bytes": self.w13_chunk_bytes,
+            "w2_chunk_bytes": self.w2_chunk_bytes,
+            "max_stage_bytes": self.max_stage_bytes,
+            "w13_tile_bytes": self.w13_tile_bytes,
+            "w2_tile_bytes": self.w2_tile_bytes,
+            "call_setup_ns": self.call_setup_ns,
+            "isolated": [
+                (routes, threads, value)
+                for (routes, threads), value in sorted(self._iso.items())
+            ],
+            "overheads": sorted(self._O.items()),
+            "iso_formula": self.iso_formula.to_dict() if self.iso_formula is not None else None,
+            "derate_2d": [
+                (experts, routes, value)
+                for experts, curve in sorted(self._derate2d.items())
+                for routes, value in sorted(curve.items())
+            ],
+            "derate_3d": [
+                (experts, routes, threads, value)
+                for experts, route_curves in sorted(self._derate3d.items())
+                for routes, thread_curve in sorted(route_curves.items())
+                for threads, value in sorted(thread_curve.items())
+            ],
+            "shape_derate": self._native_shape_curve_rows(self._derate_shape),
+            "group_curves": self._native_shape_curve_rows(self._group_curves),
+            "full_call_curves": self._native_shape_curve_rows(self._full_call_curves),
+            "p10_curves": self._native_shape_curve_rows(self._p10_curves),
+            "p90_curves": self._native_shape_curve_rows(self._p90_curves),
+            "full_call_p10_curves": self._native_shape_curve_rows(self._full_call_p10_curves),
+            "full_call_p90_curves": self._native_shape_curve_rows(self._full_call_p90_curves),
+        }
+
     @property
     def supported_shapes(self) -> tuple[tuple[int, ...], ...]:
         return self._shape_keys

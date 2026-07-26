@@ -935,22 +935,32 @@ bool sve_w13_split_n_workset_enabled() {
   return value != nullptr && value[0] != '\0' && value[0] != '0';
 }
 
-int64_t sve_weight_window_bytes_from_env() {
-  const char* value = std::getenv("FUSED_CPP_MOE_WEIGHT_WINDOW_BYTES");
+int64_t nonnegative_byte_count_from_env(const char* name, int64_t fallback) {
+  const char* value = std::getenv(name);
   if (value == nullptr || value[0] == '\0') {
-    return 0;
+    return fallback;
   }
   errno = 0;
   char* end = nullptr;
   const long long parsed = std::strtoll(value, &end, 10);
-  TORCH_CHECK(errno == 0 && end != value && *end == '\0' && parsed >= 0,
-              "FUSED_CPP_MOE_WEIGHT_WINDOW_BYTES must be a non-negative integer, got ", value);
+  TORCH_CHECK(errno == 0 && end != value && *end == '\0' && parsed >= 0, name,
+              " must be a non-negative integer, got ", value);
   return static_cast<int64_t>(parsed);
+}
+
+int64_t sve_weight_window_bytes_from_env() {
+  return nonnegative_byte_count_from_env("FUSED_CPP_MOE_WEIGHT_WINDOW_BYTES", 0);
 }
 
 int64_t resolve_sve_weight_window_bytes(int64_t requested) {
   TORCH_CHECK(requested >= -1, "weight_window_bytes must be -1 (environment) or non-negative, got ", requested);
   return requested < 0 ? sve_weight_window_bytes_from_env() : requested;
+}
+
+int64_t resolve_sve_stage_weight_window_bytes(MoeGemmStage stage, int64_t fallback) {
+  const char* name = stage == MoeGemmStage::kW13 ? "FUSED_CPP_MOE_EXPERIMENT_W13_WEIGHT_WINDOW_BYTES"
+                                                 : "FUSED_CPP_MOE_EXPERIMENT_W2_WEIGHT_WINDOW_BYTES";
+  return nonnegative_byte_count_from_env(name, fallback);
 }
 
 bool sve_w13_skip_silu_enabled() {
@@ -4623,6 +4633,8 @@ struct AsyncTaskRuntime {
   int64_t core_begin = 0;
   int64_t threads = 0;
   int64_t scratch_index = -1;
+  int64_t w13_window_bytes = -1;
+  int64_t w2_window_bytes = -1;
 };
 
 constexpr int64_t kAsyncPlanV2 = 2;
@@ -4651,6 +4663,8 @@ struct AsyncPlanV2NativeArgs {
   at::Tensor task_stage_ids;
   at::Tensor task_resize_points;
   at::Tensor task_range_granularities;
+  c10::optional<at::Tensor> task_w13_window_bytes;
+  c10::optional<at::Tensor> task_w2_window_bytes;
 };
 
 struct ScheduledScratchUnitConfig {
@@ -7163,6 +7177,10 @@ at::Tensor run_fused_moe_bf16_tiled_async(
   TORCH_CHECK(weight_window_bytes >= -1, "weight_window_bytes must be -1 (environment) or non-negative, got ",
               weight_window_bytes);
   weight_window_bytes = use_sve_backend ? resolve_sve_weight_window_bytes(weight_window_bytes) : 0;
+  const int64_t w13_weight_window_bytes =
+      use_sve_backend ? resolve_sve_stage_weight_window_bytes(MoeGemmStage::kW13, weight_window_bytes) : 0;
+  const int64_t w2_weight_window_bytes =
+      use_sve_backend ? resolve_sve_stage_weight_window_bytes(MoeGemmStage::kW2, weight_window_bytes) : 0;
   if (use_sve_backend) {
     TORCH_CHECK(fuse_silu, "SVE async MoE backend currently requires fuse_silu=True");
   }
@@ -7262,6 +7280,10 @@ at::Tensor run_fused_moe_bf16_tiled_async(
   std::vector<int64_t> task_stage_ids_v;
   std::vector<int64_t> task_resize_points_v;
   std::vector<int64_t> task_range_granularities_v;
+  std::vector<int64_t> task_w13_window_bytes_v;
+  std::vector<int64_t> task_w2_window_bytes_v;
+  bool has_task_w13_window_bytes = false;
+  bool has_task_w2_window_bytes = false;
   if (has_plan_v2) {
     TORCH_CHECK(plan_v2->plan_version == kAsyncPlanV2, "plan_version must be ", kAsyncPlanV2, ", got ",
                 plan_v2->plan_version);
@@ -7282,6 +7304,18 @@ at::Tensor run_fused_moe_bf16_tiled_async(
     task_resize_points_v = tensor_to_i64_vector(plan_v2->task_resize_points, "task_resize_points");
     task_range_granularities_v =
         tensor_to_i64_vector(plan_v2->task_range_granularities, "task_range_granularities");
+    has_task_w13_window_bytes =
+        plan_v2->task_w13_window_bytes.has_value() && plan_v2->task_w13_window_bytes->defined();
+    has_task_w2_window_bytes =
+        plan_v2->task_w2_window_bytes.has_value() && plan_v2->task_w2_window_bytes->defined();
+    if (has_task_w13_window_bytes) {
+      task_w13_window_bytes_v =
+          tensor_to_i64_vector(*plan_v2->task_w13_window_bytes, "task_w13_window_bytes");
+    }
+    if (has_task_w2_window_bytes) {
+      task_w2_window_bytes_v =
+          tensor_to_i64_vector(*plan_v2->task_w2_window_bytes, "task_w2_window_bytes");
+    }
   }
   trace_phase_end(-1, -1, -1, -1, 0, "plan_materialize", phase_begin);
 
@@ -7309,6 +7343,16 @@ at::Tensor run_fused_moe_bf16_tiled_async(
     check_per_task_size(task_stage_ids_v, "task_stage_ids");
     check_per_task_size(task_resize_points_v, "task_resize_points");
     check_per_task_size(task_range_granularities_v, "task_range_granularities");
+    if (has_task_w13_window_bytes) {
+      check_per_task_size(task_w13_window_bytes_v, "task_w13_window_bytes");
+    } else {
+      task_w13_window_bytes_v.assign(static_cast<size_t>(num_tasks), -1);
+    }
+    if (has_task_w2_window_bytes) {
+      check_per_task_size(task_w2_window_bytes_v, "task_w2_window_bytes");
+    } else {
+      task_w2_window_bytes_v.assign(static_cast<size_t>(num_tasks), -1);
+    }
     TORCH_CHECK(static_cast<int64_t>(task_allowed_thread_offsets_v.size()) == num_tasks + 1,
                 "task_allowed_thread_offsets must have num_tasks + 1 entries");
     TORCH_CHECK(task_allowed_thread_offsets_v.front() == 0, "task_allowed_thread_offsets[0] must be 0");
@@ -7323,6 +7367,10 @@ at::Tensor run_fused_moe_bf16_tiled_async(
                   "Plan V2 currently does not support resize points: task=", task);
       TORCH_CHECK(task_range_granularities_v[static_cast<size_t>(task)] == kAsyncFullExpertRange,
                   "Plan V2 currently only supports full-expert ranges: task=", task);
+      TORCH_CHECK(task_w13_window_bytes_v[static_cast<size_t>(task)] >= -1,
+                  "task_w13_window_bytes must be -1 (inherit) or non-negative: task=", task);
+      TORCH_CHECK(task_w2_window_bytes_v[static_cast<size_t>(task)] >= -1,
+                  "task_w2_window_bytes must be -1 (inherit) or non-negative: task=", task);
       const int64_t placement = task_placement_modes_v[static_cast<size_t>(task)];
       TORCH_CHECK(placement == kAsyncPlacementFixed || placement == kAsyncPlacementTailPool,
                   "task_placement_modes[", task, "] has unsupported value ", placement);
@@ -7488,17 +7536,22 @@ at::Tensor run_fused_moe_bf16_tiled_async(
     expert_task_ids[static_cast<size_t>(expert)] = task;
     const bool pooled_by_legacy = !has_plan_v2 && use_async_short_pool && rows <= async_short_pool_max_rows;
     const bool pooled_task = pooled_by_plan || pooled_by_legacy;
+    const int64_t task_w13_window_bytes =
+        has_plan_v2 ? task_w13_window_bytes_v[static_cast<size_t>(task)] : -1;
+    const int64_t task_w2_window_bytes =
+        has_plan_v2 ? task_w2_window_bytes_v[static_cast<size_t>(task)] : -1;
 
     if (pooled_task) {
       is_short_pool_task[static_cast<size_t>(task)] = int8_t{1};
       short_pool_task_ids.push_back(task);
       max_short_pool_rows = std::max(max_short_pool_rows, rows);
-      tasks[static_cast<size_t>(task)] =
-          AsyncTaskRuntime{expert, rows, -1, async_short_pool_threads, -1};
+      tasks[static_cast<size_t>(task)] = AsyncTaskRuntime{
+          expert, rows, -1, async_short_pool_threads, -1, task_w13_window_bytes, task_w2_window_bytes};
       trace_gemm_hint += async_short_pool_threads * 2;
     } else {
       const int64_t scratch_idx = ensure_scratch_config(core_begin, threads, rows);
-      tasks[static_cast<size_t>(task)] = AsyncTaskRuntime{expert, rows, core_begin, threads, scratch_idx};
+      tasks[static_cast<size_t>(task)] = AsyncTaskRuntime{
+          expert, rows, core_begin, threads, scratch_idx, task_w13_window_bytes, task_w2_window_bytes};
       trace_gemm_hint += threads * 2;
     }
   }
@@ -7731,6 +7784,10 @@ at::Tensor run_fused_moe_bf16_tiled_async(
     const int64_t expert = task.expert;
     const int64_t rows = task.rows;
     const int64_t group_size = task.threads;
+    const int64_t task_w13_weight_window_bytes =
+        use_sve_backend && task.w13_window_bytes >= 0 ? task.w13_window_bytes : w13_weight_window_bytes;
+    const int64_t task_w2_weight_window_bytes =
+        use_sve_backend && task.w2_window_bytes >= 0 ? task.w2_window_bytes : w2_weight_window_bytes;
     const auto& expert_routes = routes[static_cast<size_t>(expert)];
     uint16_t* a_reorder =
         scratch.a_reorder.empty() ? nullptr : scratch.a_reorder.data() + local_tid * scratch.a_reorder_stride;
@@ -7787,7 +7844,7 @@ at::Tensor run_fused_moe_bf16_tiled_async(
           use_sve_backend, use_fused_2d_split, team, w13_2d_plan, scratch.packed_a.data(),
           w13_ptr + expert * w13.packed_stride, scratch.intermediate.data(), static_cast<int>(rows),
           static_cast<int>(w13.K_pad), static_cast<int>(w13.N_pad), static_cast<int>(w2.K_pad), silu_poly_degree,
-          w13.n_tile, use_w13_split, weight_window_bytes);
+          w13.n_tile, use_w13_split, task_w13_weight_window_bytes);
       trace_phase_end(tid, task_id, local_tid, expert, rows, "w13_fused_silu_packc", worker_phase_begin);
     } else {
       trace_dispatch_fp32_gemm_stage_split(
@@ -7821,24 +7878,24 @@ at::Tensor run_fused_moe_bf16_tiled_async(
               use_fused_2d_split, w2team, w2_2d_plan, scratch.intermediate.data(),
               w2_ptr + expert * w2.packed_stride, route_out_bf16_ptr, expert_routes.data(), static_cast<int>(rows),
               static_cast<int>(w2.K_pad), static_cast<int>(w2.N_pad), static_cast<int>(H), w2.n_tile,
-              weight_window_bytes);
+              task_w2_weight_window_bytes);
         } else {
           team_w2_packed_sve_direct_route_backend(
               use_fused_2d_split, w2team, w2_2d_plan, scratch.intermediate.data(),
               w2_ptr + expert * w2.packed_stride, route_out_ptr, expert_routes.data(), static_cast<int>(rows),
               static_cast<int>(w2.K_pad), static_cast<int>(w2.N_pad), static_cast<int>(H), w2.n_tile,
-              weight_window_bytes);
+              task_w2_weight_window_bytes);
         }
       } else if (use_w2_bf16_route) {
         team_w2_packed_bf16_sve_backend(use_fused_2d_split, w2team, w2_2d_plan, scratch.intermediate.data(),
                                         w2_ptr + expert * w2.packed_stride, scratch.down_bf16.data(),
                                         static_cast<int>(rows), static_cast<int>(w2.K_pad), static_cast<int>(w2.N_pad),
-                                        static_cast<int>(w2.N_pad), w2.n_tile, weight_window_bytes);
+                                        static_cast<int>(w2.N_pad), w2.n_tile, task_w2_weight_window_bytes);
       } else {
         team_w2_packed_backend(use_sve_backend, use_fused_2d_split, w2team, w2_2d_plan, scratch.intermediate.data(),
                                w2_ptr + expert * w2.packed_stride, scratch.down.data(), static_cast<int>(rows),
                                static_cast<int>(w2.K_pad), static_cast<int>(w2.N_pad), static_cast<int>(w2.N_pad),
-                               w2.n_tile, weight_window_bytes);
+                               w2.n_tile, task_w2_weight_window_bytes);
       }
       trace_phase_end(tid, task_id, local_tid, expert, rows, use_w2_direct_route ? "w2_direct_route" : "w2_packed",
                       worker_phase_begin);
@@ -7856,7 +7913,7 @@ at::Tensor run_fused_moe_bf16_tiled_async(
     if (!use_w2_direct_route) {
       worker_phase_begin = trace_phase_begin();
       for_each_w2_scatter_range(static_cast<int>(w2.N_pad), group_size, local_tid, w2.K_pad, w2.n_tile,
-                                weight_window_bytes, use_w2_n_owner_scatter, [&](const SplitRange& h_range) {
+                                task_w2_weight_window_bytes, use_w2_n_owner_scatter, [&](const SplitRange& h_range) {
                                   const int64_t h_begin = h_range.begin;
                                   const int64_t h_end = std::min<int64_t>(H, h_begin + h_range.size);
                                   if (h_begin >= h_end) {
@@ -8031,7 +8088,8 @@ at::Tensor run_fused_moe_bf16_tiled_async(
         }
         const AsyncTaskRuntime& base_task = tasks[static_cast<size_t>(task_id)];
         const AsyncTaskRuntime pooled_task{base_task.expert, base_task.rows, short_pool_core_begin,
-                                           async_short_pool_threads, short_pool_scratch_idx};
+                                           async_short_pool_threads, short_pool_scratch_idx,
+                                           base_task.w13_window_bytes, base_task.w2_window_bytes};
         run_async_task(tid, task_id, pooled_task);
       }
 
@@ -8138,7 +8196,8 @@ at::Tensor fused_moe_bf16_tiled_async_plan_v2(
     c10::optional<at::Tensor> w13_bias, c10::optional<at::Tensor> w2_bias, int64_t num_threads,
     std::string activation, int64_t global_num_experts, bool skip_weighted, bool fuse_silu,
     int64_t silu_poly_degree, int64_t gemm_backend, int64_t backend_n_tile, int64_t w13_split,
-    int64_t weight_window_bytes, c10::optional<at::Tensor> out) {
+    int64_t weight_window_bytes, c10::optional<at::Tensor> out,
+    c10::optional<at::Tensor> task_w13_window_bytes, c10::optional<at::Tensor> task_w2_window_bytes) {
   const AsyncPlanV2NativeArgs plan_v2{
       plan_version,
       execution_mode,
@@ -8152,6 +8211,8 @@ at::Tensor fused_moe_bf16_tiled_async_plan_v2(
       std::move(task_stage_ids),
       std::move(task_resize_points),
       std::move(task_range_granularities),
+      std::move(task_w13_window_bytes),
+      std::move(task_w2_window_bytes),
   };
   return run_fused_moe_bf16_tiled_async(
       std::move(input), std::move(w13_packed), w13_K, w13_N, std::move(w2_packed), w2_K, w2_N,

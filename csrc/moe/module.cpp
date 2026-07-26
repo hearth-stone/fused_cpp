@@ -106,6 +106,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       py::arg("global_num_experts") = -1, py::arg("skip_weighted") = false, py::arg("fuse_silu") = false,
       py::arg("silu_poly_degree") = 5, py::arg("gemm_backend") = 0, py::arg("backend_n_tile") = 8,
       py::arg("w13_split") = -1, py::arg("weight_window_bytes") = -1, py::arg("out") = c10::nullopt,
+      py::arg("task_w13_window_bytes") = c10::nullopt, py::arg("task_w2_window_bytes") = c10::nullopt,
       py::call_guard<py::gil_scoped_release>());
 
   m.def("fused_moe_bf16_tiled_vllm_staged", &fused_moe_bf16_tiled_vllm_staged,

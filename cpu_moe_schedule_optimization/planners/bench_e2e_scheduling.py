@@ -82,8 +82,8 @@ for name, tokens, E, tk, hot in CFG:
     ids, tw = routing(tokens, E, tk, hot)
     x = bf16(tokens, H)
     counts = route_counts(ids, E)
-    pm.plan_for(counts)
-    b = pm.plan_for(counts)  # warm
+    pm.plan_for(counts, dynamic_tail_pool=False)
+    b = pm.plan_for(counts, dynamic_tail_pool=False)  # warm
     plan_us = pm.last["planner_overhead_ns"] / 1e3
     from interval_planner import IntervalPlanner
 

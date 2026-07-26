@@ -72,7 +72,8 @@ at::Tensor fused_moe_bf16_tiled_async_plan_v2(
     c10::optional<at::Tensor> w13_bias, c10::optional<at::Tensor> w2_bias, int64_t num_threads,
     std::string activation, int64_t global_num_experts, bool skip_weighted, bool fuse_silu,
     int64_t silu_poly_degree, int64_t gemm_backend, int64_t backend_n_tile, int64_t w13_split,
-    int64_t weight_window_bytes, c10::optional<at::Tensor> out);
+    int64_t weight_window_bytes, c10::optional<at::Tensor> out,
+    c10::optional<at::Tensor> task_w13_window_bytes, c10::optional<at::Tensor> task_w2_window_bytes);
 at::Tensor fused_moe_bf16_tiled_vllm_staged(
     at::Tensor input, at::Tensor w13_packed, int64_t w13_K, int64_t w13_N, at::Tensor w2_packed, int64_t w2_K,
     int64_t w2_N, at::Tensor topk_weights, at::Tensor topk_ids, c10::optional<at::Tensor> thread_cpu_ids,
