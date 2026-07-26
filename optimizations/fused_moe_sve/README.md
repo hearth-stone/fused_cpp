@@ -97,6 +97,14 @@ state machine removed the earlier M7/8 regressions of 2-4% at 1T-4T. The
 controls stay within about 1.2%. Full commands and tables are in
 [`results/amazon_8c_192c_xbyak_exact_m.md`](results/amazon_8c_192c_xbyak_exact_m.md).
 
+The upstream M8/M12 ILV schedules were compared directly with the matching
+non-ILV assembly and pure-GEMM JIT on both SVE256 Neoverse-V1 and SVE128
+Neoverse-V3. M8 ILV regresses V3 by 5.40% warm and 2.66% rotating-cold for
+W13. M12 ILV gains only 0.27-1.09% on the stable V3 cases and is mixed on V1.
+Neither schedule is adopted; the current non-ILV fused JIT remains the
+default. Method, five-run ranges, and W13/W2 tables are in
+[`results/amazon_8c_192c_upstream_m8_m12_ilv.md`](results/amazon_8c_192c_upstream_m8_m12_ilv.md).
+
 The bulk-M experiment is bitwise correct but performance-neutral across the
 192-core host NUMA0 grid, so it remains opt-in. Corrected paired-window results
 are in

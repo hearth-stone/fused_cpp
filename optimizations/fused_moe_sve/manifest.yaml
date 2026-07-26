@@ -82,6 +82,45 @@ features:
       --rows 1,2,4,8,12 --k 4096 --n 1024 --experts 1
       --warmup 32 --runs 201
 
+  - id: compute.upstream_m8_m12_ilv
+    part: compute
+    status: retired
+    implementation: >-
+      refs/i8gemm/lib/bf16gemm_sve.S and
+      optimizations/fused_moe_sve/benchmarks/
+      bench_jit_vs_i8mm_pure_gemm.cpp
+    hypothesis: >-
+      Interleaving packed-A loads with BFMMLA instructions in the upstream M8
+      and M12 schedules may hide load latency better than the matching
+      non-ILV schedules. Adoption requires a stable gain above 2 percent for
+      both warm and rotating-cold W13/W2 shapes on SVE128 and SVE256, without
+      a material regression in either M kernel.
+    depends_on:
+      - compute.xbyak_pure_gemm
+    conflicts_with: []
+    correctness: >-
+      taskset -c 0
+      optimizations/fused_moe_sve/benchmarks/
+      run_jit_vs_i8mm_pure_gemm.sh
+      --rows 8,12 --k 64 --n 64 --experts 1
+      --warmup 1 --runs 6 --include-ilv
+    benchmark: >-
+      taskset -c 0
+      optimizations/fused_moe_sve/benchmarks/
+      run_jit_vs_i8mm_pure_gemm.sh
+      --rows 8,12 --k 4096 --n 1024 --experts 64
+      --warmup 64 --runs 300 --include-ilv &&
+      taskset -c 0
+      optimizations/fused_moe_sve/benchmarks/
+      run_jit_vs_i8mm_pure_gemm.sh
+      --rows 8,12 --k 512 --n 4096 --experts 64
+      --warmup 64 --runs 300 --include-ilv
+    result: >-
+      Rejected on 2026-07-26. M8 regressed by up to 5.40 percent on
+      Neoverse-V3, while M12 gains were generally below 1.1 percent and did
+      not clear the cross-machine adoption threshold. Full measurements are
+      in results/amazon_8c_192c_upstream_m8_m12_ilv.md.
+
   - id: compute.xbyak_m2_dual_n
     part: compute
     status: experimental

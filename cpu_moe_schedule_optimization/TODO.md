@@ -5,6 +5,19 @@ Cross-profile interpolation deliberately remains disabled. A captured routing
 summary now passes exact-profile validation, but interpolation still requires
 out-of-profile measurements across F, parallel degree, and machine topology.
 
+The current ARM SVE compute baseline is now closed on the non-ILV exact-M
+M8/M12 schedules. The upstream ILV comparison did not change production
+dispatch, so it does not by itself require a cost-table refresh. The active
+priority order is:
+
+1. Produce independent thin analytical calibrations on AmazonECS8Cores and one
+   NUMA rank of AmazonC5192Cores.
+2. Validate unseen routes, widths, mixed distributions, split policy, and
+   per-stage weight windows against the analytical acceptance gates.
+3. Fix cross-rank lifetime switching for the remaining EP absolute-time error.
+4. Add measured gather/pack, route merge, communication, and distributed TP/EP
+   terms after the compute model passes its gates.
+
 ## 1. Schema-v2 profiling
 
 - [x] Synchronize two NUMA-local ranks and aggregate pairwise wall maxima.
@@ -147,6 +160,13 @@ Acceptance gates:
 
 ### P2: scheduling and kernel follow-ups
 
+- [x] Compare upstream M8/M12 ILV schedules with the matching non-ILV
+  pure-GEMM kernels on SVE256 Neoverse-V1 and SVE128 Neoverse-V3.
+  M8 ILV regressed V3 W13 by 5.40% warm and 2.66% rotating-cold. M12 ILV
+  delivered only 0.27-1.09% on the stable V3 cases and mixed results on V1,
+  so neither schedule is adopted. Keep non-ILV as the fused JIT baseline.
+  Full five-run W13/W2 results are in
+  `../optimizations/fused_moe_sve/results/amazon_8c_192c_upstream_m8_m12_ilv.md`.
 - [ ] Measure lane-tail weighted idle loss on a larger routing corpus. Current
   TP cases have a perfect-rebalance upper bound of only 0.7-2.4%; prototype
   same-width-lane work stealing only if representative cases repeatedly exceed

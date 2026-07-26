@@ -7,6 +7,7 @@
 #include "vector_length.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
@@ -27,6 +28,8 @@ void bf16gemm_k_nld2_f(const uint16_t*, const uint16_t*, float*, uint16_t*, cons
 void bf16gemm_k_nld4_f(const uint16_t*, const uint16_t*, float*, uint16_t*, const gemm_params_t*);
 void bf16gemm_k_nld_f(const uint16_t*, const uint16_t*, float*, uint16_t*, const gemm_params_t*);
 void bf16gemm_k_nld_f_m12(const uint16_t*, const uint16_t*, float*, uint16_t*, const gemm_params_t*);
+void bf16gemm_k_nld_f_m8_ilv(const uint16_t*, const uint16_t*, float*, uint16_t*, const gemm_params_t*);
+void bf16gemm_k_nld_f_m12_ilv(const uint16_t*, const uint16_t*, float*, uint16_t*, const gemm_params_t*);
 }
 
 namespace {
@@ -54,6 +57,7 @@ struct Options {
   int warmup = 32;
   int runs = 201;
   int inner = 1;
+  bool include_ilv = false;
 };
 
 uint16_t to_bf16(float value) {
@@ -102,9 +106,11 @@ Options parse_options(int argc, char** argv) {
       options.runs = std::stoi(value());
     } else if (argument == "--inner") {
       options.inner = std::stoi(value());
+    } else if (argument == "--include-ilv") {
+      options.include_ilv = true;
     } else if (argument == "--help") {
       std::cout << "usage: bench_jit_vs_i8mm_pure_gemm [--rows 1,2,4,8,12] [--k K] [--n N]"
-                   " [--experts E] [--warmup W] [--runs R] [--inner I]\n";
+                   " [--experts E] [--warmup W] [--runs R] [--inner I] [--include-ilv]\n";
       std::exit(0);
     } else {
       throw std::invalid_argument("unknown argument: " + argument);
@@ -120,6 +126,9 @@ Options parse_options(int argc, char** argv) {
   for (const int rows : options.rows) {
     if (rows != 1 && rows != 2 && rows != 4 && rows != 8 && rows != 12) {
       throw std::invalid_argument("direct i8mm comparison supports M=1,2,4,8,12");
+    }
+    if (options.include_ilv && rows != 8 && rows != 12) {
+      throw std::invalid_argument("upstream ILV comparison supports only M=8,12");
     }
   }
   return options;
@@ -199,6 +208,17 @@ I8mmKernelFn i8mm_kernel(int rows) {
   }
 }
 
+I8mmKernelFn i8mm_ilv_kernel(int rows) {
+  switch (rows) {
+    case 8:
+      return bf16gemm_k_nld_f_m8_ilv;
+    case 12:
+      return bf16gemm_k_nld_f_m12_ilv;
+    default:
+      throw std::invalid_argument("unsupported i8mm ILV M");
+  }
+}
+
 double median(std::vector<double> samples) {
   const size_t middle = samples.size() / 2;
   std::nth_element(samples.begin(), samples.begin() + middle, samples.end());
@@ -238,10 +258,15 @@ bool run_case(const Options& options, int rows) {
     throw std::runtime_error("JIT generation failed: " + error);
   }
   const I8mmKernelFn reference_kernel = i8mm_kernel(rows);
+  const I8mmKernelFn ilv_kernel = options.include_ilv ? i8mm_ilv_kernel(rows) : nullptr;
   std::vector<float> jit_output(static_cast<size_t>(physical_rows) * options.n,
                                 std::numeric_limits<float>::quiet_NaN());
   std::vector<float> i8mm_output(static_cast<size_t>(physical_rows) * options.n,
                                  std::numeric_limits<float>::quiet_NaN());
+  std::vector<float> ilv_output;
+  if (options.include_ilv) {
+    ilv_output.assign(static_cast<size_t>(physical_rows) * options.n, std::numeric_limits<float>::quiet_NaN());
+  }
 
   auto call_jit = [&](int64_t iteration) {
     const size_t expert = static_cast<size_t>(iteration % options.experts);
@@ -253,20 +278,35 @@ bool run_case(const Options& options, int rows) {
     const uint16_t* weight = packed_b.data() + expert * one_packed_b.size();
     reference_kernel(a.data(), weight, i8mm_output.data(), const_cast<uint16_t*>(packed_a.data()), &params.gemm);
   };
+  auto call_ilv = [&](int64_t iteration) {
+    const size_t expert = static_cast<size_t>(iteration % options.experts);
+    const uint16_t* weight = packed_b.data() + expert * one_packed_b.size();
+    ilv_kernel(a.data(), weight, ilv_output.data(), const_cast<uint16_t*>(packed_a.data()), &params.gemm);
+  };
 
   call_jit(0);
   call_i8mm(0);
+  if (options.include_ilv) {
+    call_ilv(0);
+  }
   const size_t compared_bytes = static_cast<size_t>(rows) * options.n * sizeof(float);
   const bool bitwise_equal = std::memcmp(jit_output.data(), i8mm_output.data(), compared_bytes) == 0;
+  const bool ilv_bitwise_equal =
+      !options.include_ilv || std::memcmp(i8mm_output.data(), ilv_output.data(), compared_bytes) == 0;
   bool finite_output = true;
   double max_abs_diff = 0.0;
+  double ilv_max_abs_diff = 0.0;
   for (size_t i = 0; i < static_cast<size_t>(rows) * options.n; ++i) {
     finite_output = finite_output && std::isfinite(jit_output[i]) && std::isfinite(i8mm_output[i]);
     max_abs_diff = std::max(max_abs_diff, std::abs(static_cast<double>(jit_output[i] - i8mm_output[i])));
+    if (options.include_ilv) {
+      finite_output = finite_output && std::isfinite(ilv_output[i]);
+      ilv_max_abs_diff = std::max(ilv_max_abs_diff, std::abs(static_cast<double>(ilv_output[i] - i8mm_output[i])));
+    }
   }
-  if (!bitwise_equal || !finite_output) {
+  if (!bitwise_equal || !ilv_bitwise_equal || !finite_output) {
     std::cerr << "correctness mismatch for M=" << rows << ", finite=" << finite_output
-              << ", max_abs_diff=" << max_abs_diff << '\n';
+              << ", max_abs_diff=" << max_abs_diff << ", ilv_max_abs_diff=" << ilv_max_abs_diff << '\n';
     return false;
   }
 
@@ -274,30 +314,69 @@ bool run_case(const Options& options, int rows) {
   for (int iteration = 0; iteration < options.warmup; ++iteration) {
     call_jit(cursor++);
     call_i8mm(cursor++);
+    if (options.include_ilv) {
+      call_ilv(cursor++);
+    }
   }
   std::vector<double> jit_samples;
   std::vector<double> i8mm_samples;
+  std::vector<double> ilv_samples;
   jit_samples.reserve(options.runs);
   i8mm_samples.reserve(options.runs);
-  for (int sample = 0; sample < options.runs; ++sample) {
-    if ((sample & 1) == 0) {
-      jit_samples.push_back(time_call([&](int inner) { call_jit(cursor + inner); }, options.inner));
+  ilv_samples.reserve(options.runs);
+  if (options.include_ilv) {
+    constexpr std::array<std::array<int, 3>, 6> kOrders{{
+        {{0, 1, 2}},
+        {{0, 2, 1}},
+        {{1, 0, 2}},
+        {{1, 2, 0}},
+        {{2, 0, 1}},
+        {{2, 1, 0}},
+    }};
+    auto measure_variant = [&](int variant) {
+      switch (variant) {
+        case 0:
+          jit_samples.push_back(time_call([&](int inner) { call_jit(cursor + inner); }, options.inner));
+          break;
+        case 1:
+          i8mm_samples.push_back(time_call([&](int inner) { call_i8mm(cursor + inner); }, options.inner));
+          break;
+        case 2:
+          ilv_samples.push_back(time_call([&](int inner) { call_ilv(cursor + inner); }, options.inner));
+          break;
+        default:
+          throw std::logic_error("invalid benchmark variant");
+      }
       cursor += options.inner;
-      i8mm_samples.push_back(time_call([&](int inner) { call_i8mm(cursor + inner); }, options.inner));
-      cursor += options.inner;
-    } else {
-      i8mm_samples.push_back(time_call([&](int inner) { call_i8mm(cursor + inner); }, options.inner));
-      cursor += options.inner;
-      jit_samples.push_back(time_call([&](int inner) { call_jit(cursor + inner); }, options.inner));
-      cursor += options.inner;
+    };
+    for (int sample = 0; sample < options.runs; ++sample) {
+      for (const int variant : kOrders[static_cast<size_t>(sample) % kOrders.size()]) {
+        measure_variant(variant);
+      }
+    }
+  } else {
+    for (int sample = 0; sample < options.runs; ++sample) {
+      if ((sample & 1) == 0) {
+        jit_samples.push_back(time_call([&](int inner) { call_jit(cursor + inner); }, options.inner));
+        cursor += options.inner;
+        i8mm_samples.push_back(time_call([&](int inner) { call_i8mm(cursor + inner); }, options.inner));
+        cursor += options.inner;
+      } else {
+        i8mm_samples.push_back(time_call([&](int inner) { call_i8mm(cursor + inner); }, options.inner));
+        cursor += options.inner;
+        jit_samples.push_back(time_call([&](int inner) { call_jit(cursor + inner); }, options.inner));
+        cursor += options.inner;
+      }
     }
   }
 
   const double jit_us = median(jit_samples);
   const double i8mm_us = median(i8mm_samples);
+  const double ilv_us = options.include_ilv ? median(ilv_samples) : 0.0;
   const double work = 2.0 * rows * options.k * options.n;
   const double jit_gflops = work / (jit_us * 1.0e3);
   const double i8mm_gflops = work / (i8mm_us * 1.0e3);
+  const double ilv_gflops = options.include_ilv ? work / (ilv_us * 1.0e3) : 0.0;
   const double regression_percent = (jit_us / i8mm_us - 1.0) * 100.0;
 
   std::cout << std::fixed << std::setprecision(6) << "{\"m\":" << rows << ",\"k\":" << options.k
@@ -306,7 +385,15 @@ bool run_case(const Options& options, int rows) {
             << ",\"i8mm_median_us\":" << i8mm_us << ",\"jit_gflops\":" << jit_gflops
             << ",\"i8mm_gflops\":" << i8mm_gflops << ",\"jit_time_over_i8mm\":" << (jit_us / i8mm_us)
             << ",\"regression_percent\":" << regression_percent << ",\"max_abs_diff\":" << max_abs_diff
-            << ",\"bitwise_equal\":" << (bitwise_equal ? "true" : "false") << "}\n";
+            << ",\"bitwise_equal\":" << (bitwise_equal ? "true" : "false");
+  if (options.include_ilv) {
+    std::cout << ",\"ilv_median_us\":" << ilv_us << ",\"ilv_gflops\":" << ilv_gflops
+              << ",\"ilv_time_over_non_ilv\":" << (ilv_us / i8mm_us)
+              << ",\"ilv_speedup_percent\":" << (i8mm_us / ilv_us - 1.0) * 100.0
+              << ",\"ilv_max_abs_diff\":" << ilv_max_abs_diff
+              << ",\"ilv_bitwise_equal\":" << (ilv_bitwise_equal ? "true" : "false");
+  }
+  std::cout << "}\n";
   return true;
 }
 
