@@ -601,9 +601,11 @@ $I_i^{(b,v_i)}(t)$ 和 $D_i^{(b,v_i)}(\mathcal Z)$。只要 $\pi_b$ 是确定性
 改变线程宽度、依赖或资源可行性，它不扩展 planner 的决策空间，只把 backend
 $b$ 的响应函数改成分段函数；profile identity 和验证仍必须记录该 policy 版本。
 
-当前 x86 BF16 `auto` 是这种策略：runtime 支持时全局选择 AMX，否则回退
-AVX-512 BF16；AMX 内再按每个 expert 的 route 数选择 M pattern 和 cache window。
-环境变量只保留为强制实验/回归 override，不是 production 调用的必要输入。
+当前 x86 BF16 `auto` 是这种策略，但映射已扩展为 dimension-aware policy。调用级
+ISA 与有效线程数由 $(H,F,\{M_i\},\mu)$ 决定，AMX 内每个 expert 的 M pattern
+与 cache window 再由 $(M_i,H,F,\mu)$ 决定；team-N/skew-wave 的 target row 也按
+$HF$ 缩放。环境变量只保留为强制实验/回归 override，不是 production 调用的
+必要输入。
 
 ## 6. 求解器编码
 
@@ -653,12 +655,12 @@ One-hot 是线程宽度的等价求解器编码，不是剪枝。一般 active-s
 | 并发配置 | 活跃 job 可形成任意满足 CPU 容量的 $(M_i,t_i)$ 组合 | 整次调用使用静态 core shape | static-partition 剪枝 |
 | Shape 集合 | 所有满足 CPU 容量的整数宽度组合 | profile 支持并经 active 工作集规则筛选的 shape；owner-cache band 当前仅 shadow | 候选剪枝 |
 | Assignment | 任意 expert-to-resource 调度 | 按 isolated cost 的 LPT | 启发式分配 |
-| x86 synchronous executor team mapping | expert 可取任意合法整数宽度并形成任意 wave | API 接受 1--256 workers；均衡 route 用 atomic expert queue，active expert 不足时按 route/当前宽度贪心组 team，强偏斜时按 64-row target 形成有序 wave | planner 外的确定性 runtime mapper |
+| x86 synchronous executor team mapping | expert 可取任意合法整数宽度并形成任意 wave | API 接受 1--256 workers；`x86_bf16_auto` 对很小 aggregate work 可收缩为 1 worker；均衡 route 用 atomic expert queue，active expert 不足时按 route/当前宽度贪心组 team，强偏斜时按 dimension-scaled row target 形成有序 wave | planner 外的确定性 runtime mapper |
 | Ordering | 任意可行开始时间和顺序 | 每个 lane 的 LPT 顺序 | 顺序剪枝 |
 | Idling | 允许主动等待以避开争用 | lane 可启动下一个 expert 时立即启动；ready-token 路径仅填充无可运行 expert 的空闲 lane | non-idling 剪枝 |
 | Workload 输入 | 任意合法 global 或 rank-local route histogram | planner 接受任意 histogram；catalog preset 只扩展验证覆盖，不过滤运行时输入 | 不剪枝 |
 | Route combine | 任意满足 TopK release 约束和 CPU 容量的 merge 排程 | planner 不搜索 combine；默认 executor 采用 expert-first 单 token 贪心和连续收尾 | 外层启发式限制 |
-| Kernel variant | 任意未被支配的实现 | ARM `auto` 先要求完整 `jit/xbyak_exact_m` legacy split/no-split pair，再加入同 identity 的实测 global packed-B byte-window variants；缺少完整 JIT legacy pair 时整体回退 static pair；x86 AMX 使用不进入 planner 的确定性 per-expert pattern/cache policy，AVX-512/AMX 共用确定性 team-N/wave policy | 实例候选限制与 runtime policy |
+| Kernel variant | 任意未被支配的实现 | ARM `auto` 先要求完整 `jit/xbyak_exact_m` legacy split/no-split pair，再加入同 identity 的实测 global packed-B byte-window variants；缺少完整 JIT legacy pair 时整体回退 static pair；x86 `auto` 使用不进入 planner 的确定性 ISA/thread 与 per-expert AMX pattern/cache policy，AVX-512/AMX 共用 dimension-aware team-N/wave policy | 实例候选限制与 runtime policy |
 | Isolated time | 真实 $I_i(t)$ | active $T_{\mathrm{iso}}$ 经验公式；分层 GEMM model 仅 shadow | cost 近似，不剪枝可行域 |
 | Contention | 任意动态活跃配置上的真实 $D_i(\mathcal Z)$ | 实测 contention profile 与 stage-aware event simulator | cost 近似，不剪枝可行域 |
 
@@ -1058,41 +1060,94 @@ $r_{13}$ 个 range 和 W2 的 $r_2$ 个 range 分别推进，不能把 windowed 
 单个 M12 panel 不复用 B，额外 range 通常只有 dispatch 和 lane-width 代价，
 不能仅按 cache 容量规则强制细分。
 
-### 8.4 x86 per-expert pattern/cache 与 team-N/wave policy
+### 8.4 x86 dimension-aware ISA/thread、AMX pattern/cache 与 team-N policy
 
-x86 AMX backend 不把 pattern/cache choice 加入 CPU MoE planner。设 expert $i$ 的
-route 数为 $M_i$，当前 Amazon C8i 校准策略为：
+x86 runtime 不把下述 choice 加入 CPU MoE planner，而是使用带版本的确定性映射。
+设 expert $i$ 的 route 数为 $M_i$，并定义：
 
 $$
-p_i=
+M_\Sigma=\sum_i M_i,\qquad M_{\max}=\max_i M_i,\qquad
+W_\Sigma=M_\Sigma HF,\qquad W_{\max}=M_{\max}HF.
+$$
+
+当前 CPUID family 6、model 173 的 Amazon C8i 使用
+`intel_06_ad_c8i_v1`；其他 x86 CPU 使用 `generic_v1`。`auto` 在 AMX 可用时
+prepack backend ID 104 `x86_bf16_auto` 的 K32/N32 权重，同一份权重可由
+AVX-512 或 AMX kernel 消费，不因调用级 ISA 决策维护第二份权重。C8i 的调用级
+决策为：
+
+$$
+\operatorname{isa}=
 \begin{cases}
-\texttt{m2n2}, & M_i<76,\\
-\texttt{m1n4}, & M_i\ge76.
+\text{AVX-512 BF16}, & W_{\max}\le8192,\\
+\text{AMX BF16}, & W_{\max}>8192,
+\end{cases}
+\qquad
+T_{\mathrm{eff}}=
+\begin{cases}
+1, & W_\Sigma\le131072,\\
+T_{\mathrm{request}}, & W_\Sigma>131072.
 \end{cases}
 $$
 
-`m2n2` 的 M1--16 tail 和 `m1n4` 的奇数末尾 N block 由 `m1n2` exact-tail kernel
-处理。准备 JIT cache 时 key 同时包含 pattern 与 exact M，因而同一次调用中不同
-route 数的 experts 可以安全选择不同 pattern。
+若首选 ISA 不可用则退到另一条可用路径。显式
+`x86_avx512_bf16`/`x86_amx_bf16` backend 不应用上述 ISA 或线程收缩，保持
+请求的实现和线程数；这使 benchmark/control 可重复。
+
+AMX 的 per-expert pattern 继续由 exact $M_i$ JIT key 隔离，但 C8i 阈值按
+model dimension 分段：
+
+$$
+\rho(H,F)=
+\begin{cases}
++\infty, & H<4096,\\
+128, & H\ge4096\ \land\ 2F\ge H,\\
+96, & H\ge4096\ \land\ 2F<H,
+\end{cases}
+\qquad
+p_i=
+\begin{cases}
+\texttt{m1n4}, & M_i\ge\rho(H,F),\\
+\texttt{m2n2}, & M_i<\rho(H,F).
+\end{cases}
+$$
+
+`m2n2` 的 M1--16 tail 和 `m1n4` 的奇数末尾 N block 由 `m1n2` exact-tail
+kernel 处理。`generic_v1` 保留旧规则 $M_i\ge76$ 时选 `m1n4`，作为未知 CPU
+上的保守兼容策略，而不是 C8i 的 production 阈值。
 
 令 $K_{13}=\operatorname{round\_up}(H,32)$、
 $K_2=\operatorname{round\_up}(F,32)$。两级 loop-order 的单个 packed-B block
-都是 $64K_s$ bytes，自动窗口为：
+都是 $64K_s$ bytes。C8i 对 $M_i\le16$ 保持不分窗；其余情况为：
 
 $$
-u_{13}=\max\left(1,\left\lfloor
-\frac{2^{20}}{64K_{13}}\right\rfloor\right),\qquad
-u_2=\max\left(1,\left\lfloor
-\frac{2^{19}}{64K_2}\right\rfloor\right).
+(u_{13},u_2)=
+\begin{cases}
+(0,0), & M_i\le16,\\
+\left(
+\max\left(1,\left\lfloor\frac{2^{20}}{64K_{13}}\right\rfloor\right),
+\max\left(1,\left\lfloor\frac{2^{19}}{64K_2}\right\rfloor\right)
+\right), & M_i>16.
+\end{cases}
 $$
 
 当 $p_i=\texttt{m1n4}$ 且 $u_s>1$ 时，再把 $u_s$ 向下对齐为偶数，以保持成对
-N block。H=4096、F=512 时得到 W13=4、W2=16。零值 override 明确恢复不分窗
-loop order，正整数 override 强制 block 数；AVX-512 的默认值仍为零。
+N block。H=4096、F=512 时非小 M 得到 W13=4、W2=16。`generic_v1` 保留旧的
+全 M byte-budget 公式；零值 override 明确恢复不分窗 loop order，正整数
+override 强制 block 数。AVX-512 默认仍不应用 AMX cache window。
 
-AVX-512 与 AMX executor 还共享一个不进入 planner 的确定性 team-N mapper。令
-$T\in[1,256]$ 为请求 worker 数，$A$ 为 active expert 数，按 route 数降序记为
-$M_{(1)}\ge M_{(2)}\ge\cdots$。W13/W2 可独立拥有的 N 单元数为：
+AVX-512 与 AMX executor 共享 dimension-aware team-N mapper。C8i 的目标 route
+行数为：
+
+$$
+r(H,F)=\operatorname{clamp}\left(
+\left\lceil\frac{64\cdot4096\cdot512}{HF}\right\rceil,\ 16,\ 256
+\right),
+$$
+
+`generic_v1` 则保留 $r=64$。令 $T=T_{\mathrm{eff}}$、$A$ 为 active expert 数，
+按 route 数降序记为 $M_{(1)}\ge M_{(2)}\ge\cdots$。W13/W2 可独立拥有的 N
+单元数为：
 
 $$
 q_{13}=\frac{\operatorname{round\_up}(F,16)}{16},\qquad
@@ -1124,25 +1179,20 @@ $$
 
 runtime mapping 的分支顺序为：
 
-1. 若 $M_{(2)}>0$、$M_{(1)}\ge64$ 且
+1. 若 $M_{(2)}>0$、$M_{(1)}\ge r(H,F)$ 且
    $M_{(1)}\ge2M_{(2)}$，按 $M_i$ 降序生成 waves。当前 wave 的最大 route 为
    $M_{\max,w}$、剩余 expert 数为 $R_w$ 时，放入的 expert 数为
-   $a_w=\min(R_w,\max(1,\min(T,\lfloor64T/M_{\max,w}\rfloor)))$，再按上式
-   分配 team width；
+   $a_w=\min(R_w,\max(1,\min(T,\lfloor r(H,F)T/M_{\max,w}\rfloor)))$，
+   再按上式分配 team width；
 2. 否则若 $A<T$，所有 active experts 放入同一个 cooperative wave，再按上式
    分配剩余 workers；
 3. 否则保留 atomic expert queue，每个被领取的 expert 使用一个 worker。
 
-64-row 与 2x skew 门槛是 Amazon C8i 的 executor heuristic，不是体系结构常数。
 team scratch 按同一 slot 跨 waves 的最大 $M_i$ 分配；merge worker 数取
-$\min(T,\text{tokens})$。这一 mapper 改变实际 $I_i(t)$ 和 active configuration
-$\mathcal Z$，但不扩大 `IntervalPlanner` 的 width/shape/ordering candidate set。
-
-该 policy 只改变 $I_i$/$D_i$ 的 runtime 实现响应，不改变现有 planner 的 shape、
-assignment 或 ordering 候选。M=76 阈值和 1 MiB/512 KiB budget 目前只在 Amazon
-C8i、H=4096/F=512 上做过性能校准；team/wave 门槛只在 8-core C8i 上验证。
-跨 CPU 或显著不同 model dimension 时必须重新做 held-out route/thread 验证，
-不能把这些阈值解释为体系结构常数。
+$\min(T_{\mathrm{eff}},\text{tokens})$。这一 mapper 改变实际 $I_i(t)$ 和 active
+configuration $\mathcal Z$，但不扩大 `IntervalPlanner` 的
+width/shape/ordering candidate set。profile identity 必须记录 policy 名称与版本；
+跨 CPU 的阈值变更应新增 profile，而不是静默修改 `generic_v1`。
 
 ## 9. 剪枝验证
 
@@ -1434,7 +1484,9 @@ contention table 或 production 剪枝。
 ### 9.10 x86 AMX 自动子变体验证
 
 2026-07-20 在 2-core Amazon C8i（Intel Xeon 6975P-C）上验证 8.4 的确定性
-runtime policy。H=4096/F=512 的 m2n2/m1n4 AB/BA 配对长采样显示 M=68/72
+runtime policy。该节记录的固定 M=76 与 64-row policy 现作为 `generic_v1`
+历史基线；C8i production 已由 9.12 的 dimension-aware profile 取代。
+H=4096/F=512 的 m2n2/m1n4 AB/BA 配对长采样显示 M=68/72
 位于约 ±2% 的尾部/频率噪声区；M=76 时 `m1n4` 单核为 1.207 vs 1.253 ms、
 双核为 1.522 vs 1.536 ms，并在 M=80 以后继续领先。因此当前保守阈值取 M=76。
 skewed route histogram `[384,19,19,18,18,18,18,18]` 下，per-expert auto
@@ -1456,7 +1508,9 @@ kill-switch 回退 AVX-512。完整命令、样本和热状态限制见
 ### 9.11 x86 cooperative N-split 与 skew-wave 验证
 
 2026-07-22 在 8-core Amazon C8i（Intel Xeon 6975P-C，8 physical cores、1 thread
-per core）上验证 8.4 的 team-N mapper。固定 H=4096、F=512、BF16、top-k=1，
+per core）上验证固定 64-row 的初版 team-N mapper；该 target 现作为
+`generic_v1` 历史基线，C8i production 已由 9.12 的 dimension-aware target
+取代。固定 H=4096、F=512、BF16、top-k=1，
 使用 CPU `0-7`、`OMP_DYNAMIC=FALSE`、`OMP_PROC_BIND=close`、
 `OMP_PLACES=cores`、`OMP_WAIT_POLICY=PASSIVE`、8 次 warmup 和 31 次正式采样；
 权重 prepack/JIT warmup 不计入运行时间。AMX auto pattern 的 median 如下（ms）：
@@ -1494,6 +1548,63 @@ planner candidate space、profile schema 或 cost-model 参数，所以不新增
 planner/cost-model 公式测试。若将该 team/wave mapper 提升为 planner 可选动作，
 必须先为不同 $t_i$/wave active set 重建 $I_i(t)$、$D_i(\mathcal Z)$ profile 并做
 held-out regret 验证。
+
+### 9.12 x86 dimension-aware 自动策略校准
+
+2026-07-26 在 8-core Amazon C8i（Intel Xeon 6975P-C，CPUID family 6、
+model 173、stepping 1）上校准 8.4 的 `intel_06_ad_c8i_v1`。CPU 固定为
+`0-7`，设置 `OMP_DYNAMIC=FALSE`、`OMP_PROC_BIND=close`、
+`OMP_PLACES=cores`、`OMP_WAIT_POLICY=PASSIVE`；权重 prepack、JIT warmup 和
+output allocation 不计入样本。主要比较在同一进程内轮换 auto、forced AVX-512
+和 forced AMX，以降低频率与热状态偏差。
+
+调用级 ISA 扫描表明 H64/F16 的 M1/M2/M4 上 AVX-512 分别约快
+51.5%/49.8%/32.8%，到 M8 差距缩小到约 10%--19%，M16 已由 AMX 领先约 9%；
+H128/F32 在 M1/M2 仍由 AVX-512 领先约 37%/28%--32%，M4 接近持平，M8 由
+AMX 领先约 17.5%。因此 C8i 取 $M_{\max}HF\le8192$ 作为 AVX-512 小调用域。
+H64/F16/M1、请求 8 workers 时，完整 auto 为 5.921 us，forced AVX-512/AMX
+分别为 12.525/19.023 us；固定单线程复核 auto 5.168 us、forced AVX-512
+5.115 us，auto regret 1.04%。
+
+线程校准使用 aggregate work。H256/F64、8 个 M1 experts 恰好满足
+$M_\Sigma HF=131072$，auto 收缩为 1 worker 后为 17.930 us，而 forced
+AVX-512/AMX 的 8-worker control 为 34.435/29.661 us。更大
+H512/F128、8 个 M1 experts 的 AMX control 则从 1T 122.643 us 降到
+8T 40.582 us，因此阈值上方保留请求线程数。
+
+AMX pattern 在 H1024/F256 的 M48--2048 基本由 `m2n2` 领先；H4096/F512 的
+crossover 位于 M96 附近，H4096/F2048 则从 M128 起 `m1n4` 更稳定。8T
+H4096/F512/M96 的同进程轮换 median 为 auto 0.210900 ms、forced `m1n4`
+0.209775 ms、forced `m2n2` 0.216928 ms，auto 相对最佳 regret 0.54%。
+H4096/F512/M64 的 1T auto/forced AMX 为 0.920052/0.919424 ms，regret 0.068%。
+
+cache window 的 1T auto 相对不分窗 control 在 H4096/F512 的
+M64/M128 为 1.20x/2.53x，在 H4096/F2048 为 1.24x/2.47x；M<=16 没有稳定
+收益，因此 C8i profile 只对更大 M 启用 1 MiB/512 KiB byte-budget 公式。
+
+dimension-scaled N target 另以 forced AMX/m2n2、8T 做 profile A/B：
+
+| H/F | route histogram | C8i target | `generic_v1` target | C8i | generic | speedup |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| 1024/256 | `[768,128,128]` | 256 | 64 | 0.389054 ms | 0.398581 ms | 1.02x |
+| 4096/2048 | `[144,24,24]` | 16 | 64 | 1.736484 ms | 2.451086 ms | 1.41x |
+
+这两组 target A/B 是独立进程的 31-sample median，不具有同进程轮换对微小差异的
+控制强度；第一行 2.45% 应视为方向性证据，第二行 41.15% 足以拒绝固定 64-row
+target。production H4096/F512/M64 的 auto 保持 AMX，1T 相对 forced AMX
+regret 低于 0.1%，说明小维度收益没有以代表性大 shape 回退为代价。
+
+focused x86 correctness suite 为 226 passed、3 skipped，覆盖 policy boundary、
+CPUID/profile 输出、同一 backend ID 104 packed weights 强制走 AVX-512/AMX 的
+bit-exact 输出、线程 crossover、pattern/cache 与 H/F/K/N tail。完整命令、逐项
+结果和解释边界见
+`optimizations/fused_moe_avx512/results/amazon_c8i_8core_dimension_aware_policy_20260726.md`。
+
+该 policy 只改变同步 x86 executor 的确定性 runtime response mapper，不改变
+planner candidate space、profile schema 或 cost-model 参数，因此没有新增
+planner/cost-model 公式测试。若未来让 planner 显式选择 ISA、有效线程数或
+pattern/cache，必须把它们提升为 variant identity，重新测量对应的
+$I_i(t)$/$D_i(\mathcal Z)$ 并做 held-out schedule regret 验证。
 
 ## 10. 同步规则
 
@@ -1549,3 +1660,4 @@ held-out regret 验证。
 | 2026-07-26 | v0.26 | 将全局 packed-B byte-window 接入 schema-v2 与 production planner：variant identity 包含目标字节和 W13/W2 实际 range 数，stage model 分别推进两段 range，联合搜索 `(window, core shape)` 并透传 runtime option；旧 profile 映射为 window=0，未提供新实测表时决策不变。 |
 | 2026-07-26 | v0.27 | 将 x86 BF16 auto backend 改为优先 AMX 并回退 AVX-512；增加按 expert route 数选择 m2n2/m1n4 的确定性 M=76 policy，以及按 K-padded byte budget 自动推导 1 MiB/512 KiB cache window；同步 per-expert variant 公式、剪枝表、C8i 正确性/性能验证和 policy 可迁移性边界。 |
 | 2026-07-26 | v0.28 | 将 SVE 的 team-N ownership 引入同步 x86 AVX-512/AMX executor：active expert 不足时按 route/width 贪心组 team，2x 且至少 64-row 的强偏斜 route 使用有序 waves，均衡 route 保留 expert queue；定义精确 N-range、team-width 与 wave 公式，记录 8-core C8i 1/2/4/8T 验证，并明确该 mapper 尚不进入 planner candidate space。 |
+| 2026-07-26 | v0.29 | x86 BF16 `auto` 升级为 CPUID/profile 驱动的 dimension-aware runtime mapper：按 $M_{\max}HF$ 选择 AVX-512/AMX，按 $M_\Sigma HF$ 收缩小调用线程，按 H/F 选择 AMX pattern/cache，并以 $\operatorname{clamp}(\lceil64\cdot4096\cdot512/(HF)\rceil,16,256)$ 缩放 skew-wave target；保留 `generic_v1` 与显式 override，记录 C8i8 correctness、同进程轮换和 held-out target 验证。 |

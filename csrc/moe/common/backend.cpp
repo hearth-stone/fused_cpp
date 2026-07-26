@@ -96,6 +96,13 @@ bool sve_runtime_supported() {
 #endif
 }
 
+#if defined(FUSED_CPP_MOE_HAS_X86_AVX512_BF16)
+bool x86_auto_runtime_supported() {
+  return ::fused_cpp::moe::x86::avx512_bf16::RuntimeSupported() ||
+         ::fused_cpp::moe::x86::avx512_bf16::AmxRuntimeSupported();
+}
+#endif
+
 const MoeBackend kArmNeonBackend{
     BackendId::kArmNeonBf16, "arm_neon_bf16", "arm",        "neon_bf16",  kFusedSiluPackC | kWeightWindows,
     neon_runtime_supported,  neon_n_tile,     neon_round_k, neon_round_n, neon_pack_b,
@@ -163,6 +170,29 @@ const MoeBackend kX86AmxBf16Backend{
 #endif
 };
 
+const MoeBackend kX86AutoBf16Backend{
+    BackendId::kX86AutoBf16,
+    "x86_bf16_auto",
+    "x86",
+    "avx512_bf16+amx_bf16",
+    kFusedSiluPackC | kDirectRouteF32 | kDirectRouteBf16 | kRouteMerge,
+#if defined(FUSED_CPP_MOE_HAS_X86_AVX512_BF16)
+    // The automatic packed format uses K32 so one weight copy can feed both
+    // ISAs. Resolve auto to the legacy AVX descriptor when AMX is unavailable.
+    x86_auto_runtime_supported,
+    ::fused_cpp::moe::x86::avx512_bf16::NTile,
+    ::fused_cpp::moe::x86::avx512_bf16::AmxRoundK,
+    ::fused_cpp::moe::x86::avx512_bf16::RoundN,
+    ::fused_cpp::moe::x86::avx512_bf16::PackB,
+#else
+    nullptr,
+    nullptr,
+    nullptr,
+    nullptr,
+    nullptr,
+#endif
+};
+
 const MoeBackend kX86AmxBf16N64Backend{
     BackendId::kX86AmxBf16N64,
     "x86_amx_bf16_n64",
@@ -200,6 +230,9 @@ const MoeBackend* known_backend(const std::string& name) {
   if (name == kX86AmxBf16N64Backend.name || name == "amx_bf16_n64") {
     return &kX86AmxBf16N64Backend;
   }
+  if (name == kX86AutoBf16Backend.name) {
+    return &kX86AutoBf16Backend;
+  }
   return nullptr;
 }
 
@@ -216,7 +249,7 @@ bool backend_runtime_supported(const MoeBackend& backend) {
 const MoeBackend& resolve_backend(const std::string& requested, bool fuse_silu) {
   if (requested.empty() || requested == "auto") {
     if (fuse_silu && backend_runtime_supported(kX86AmxBf16Backend)) {
-      return kX86AmxBf16Backend;
+      return kX86AutoBf16Backend;
     }
     if (fuse_silu && backend_runtime_supported(kX86Avx512Bf16Backend)) {
       return kX86Avx512Bf16Backend;
@@ -237,10 +270,12 @@ const MoeBackend& resolve_backend(const std::string& requested, bool fuse_silu) 
   if (backend == nullptr) {
     throw std::invalid_argument("unknown MoE backend '" + requested +
                                 "'; expected auto, arm_neon_bf16, arm_sve_bf16, x86_avx512_bf16, or "
-                                "x86_amx_bf16 (experimental N64 layout: x86_amx_bf16_n64)");
+                                "x86_amx_bf16 (automatic x86 descriptor: x86_bf16_auto; experimental N64 layout: "
+                                "x86_amx_bf16_n64)");
   }
   if ((backend->id == BackendId::kArmSveBf16 || backend->id == BackendId::kX86Avx512Bf16 ||
-       backend->id == BackendId::kX86AmxBf16 || backend->id == BackendId::kX86AmxBf16N64) &&
+       backend->id == BackendId::kX86AmxBf16 || backend->id == BackendId::kX86AmxBf16N64 ||
+       backend->id == BackendId::kX86AutoBf16) &&
       !fuse_silu) {
     throw std::invalid_argument(std::string(backend->name) + " currently requires fuse_silu=True");
   }
@@ -262,6 +297,8 @@ const MoeBackend& backend_from_id(int64_t backend_id) {
     backend = &kX86AmxBf16Backend;
   } else if (backend_id == static_cast<int64_t>(BackendId::kX86AmxBf16N64)) {
     backend = &kX86AmxBf16N64Backend;
+  } else if (backend_id == static_cast<int64_t>(BackendId::kX86AutoBf16)) {
+    backend = &kX86AutoBf16Backend;
   } else {
     throw std::invalid_argument("unknown packed MoE backend id " + std::to_string(backend_id));
   }

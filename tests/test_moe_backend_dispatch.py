@@ -68,8 +68,9 @@ def test_moe_symbols_are_aliased_on_legacy_extension() -> None:
         "fused_moe_bf16_tiled",
         "fused_moe_bf16_tiled_scheduled",
         "fused_moe_bf16_tiled_async",
-        "fused_moe_test_team_gemm",
     )
+    if hasattr(_moe_C, "fused_moe_test_team_gemm"):
+        names += ("fused_moe_test_team_gemm",)
     for name in names:
         assert getattr(_C, name) is getattr(_moe_C, name)
 

@@ -4,6 +4,29 @@
 L1d」吞吐量。第二次迭代起所有 Q/K/V/P̂/O 都驻留 L1，反映指令级吞吐而非
 访存瓶颈。
 
+## x86 dimension-aware fused-MoE policy
+
+`bench_x86_bf16_policy.py` rotates the shared automatic backend and the two
+forced ISA backends on identical logical inputs. Weight preparation is
+reported separately, output is reused, and the timed order rotates each
+iteration. JSON output includes the detected CPU family/model, policy profile,
+chosen ISA, effective thread count, N-split target, route-skew decision, and
+per-expert AMX pattern/cache windows.
+
+```bash
+taskset -c 0-7 env PYTHONPATH=src OMP_NUM_THREADS=8 \
+  OMP_DYNAMIC=FALSE OMP_WAIT_POLICY=PASSIVE \
+  .venv/bin/python benchmarks/bench_x86_bf16_policy.py \
+  --tokens 64 --hidden 4096 --intermediate 512 \
+  --experts 1 --top-k 1 --routing hot --threads 8 \
+  --variants auto,avx512,amx --warmup 8 --runs 31
+```
+
+Use `FUSED_CPP_MOE_X86_ISA=avx512|amx` only to validate both execution paths
+through the same ID-104 K32/N32 packed weights. Use
+`FUSED_CPP_MOE_X86_POLICY_PROFILE=generic_v1|intel_06_ad_c8i_v1` for a
+policy-profile A/B; neither variable is required in production.
+
 ## x86 AMX MoE packed-B layout A/B
 
 `bench_amx_bf16_layouts.py` compares the production N32 packed weights with

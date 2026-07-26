@@ -140,11 +140,19 @@ results on `AmazonC8i2Cores` for isolated microkernel changes.
   H4096/F512 has no m1n2 N tail. Therefore `auto` remains `baseline` and the
   pipelined path remains an explicit experiment. See
   [`results/amazon_c8i_8core_amx_k_load_pipeline_20260726.md`](results/amazon_c8i_8core_amx_k_load_pipeline_20260726.md).
-- [ ] **Dimension-aware policy calibration:** make ISA, AMX pattern,
-  cache-window, and thread decisions depend on M/H/F, route skew, and CPU
-  model. Include a rotated AVX-512-versus-AMX tiny-M comparison before assuming
-  AMX should win every shape. Environment variables remain validation
-  overrides, not normal runtime requirements.
+- [x] **Dimension-aware policy calibration:** backend ID 104
+  `x86_bf16_auto` now keeps one AMX-compatible K32/N32 weight copy and selects
+  AVX-512/AMX, effective thread count, AMX pattern, cache window, and skew-wave
+  target from M/H/F, the route histogram, and a versioned CPU profile.
+  **2026-07-26:** C8i8 calibration selected AVX-512 for
+  `M*H*F <= 8192`, one worker for aggregate `sum(M)*H*F <= 131072`,
+  H/F-specific `m2n2`/`m1n4` thresholds, and a
+  `clamp(ceil(64*4096*512/(H*F)),16,256)` wave target. Tiny
+  H64/F16/M1 with 8 requested workers fell from 12.5/19.0 us for forced
+  AVX-512/AMX to 5.9 us auto; production H4096/F512/M64 stayed within 0.1%
+  of forced AMX at 1T. Explicit ISA/pattern/cache/profile environment
+  overrides remain available for validation. See
+  [`results/amazon_c8i_8core_dimension_aware_policy_20260726.md`](results/amazon_c8i_8core_dimension_aware_policy_20260726.md).
 
 ## P3: improve AVX-512 register and cache schedules
 

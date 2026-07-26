@@ -280,9 +280,10 @@ features:
       Deriving an AMX block count from approximately 1 MiB of packed W13 or
       512 KiB of packed W2, then traversing M panels inside that N window,
       keeps a dimension-aware packed-B working set in private L2 and reduces
-      shared-L3 traffic for large-M experts. Explicit zero and positive values
-      remain reproducibility and tuning overrides; AVX-512 remains unblocked
-      by default.
+      shared-L3 traffic for large-M experts. The C8i policy retains the
+      original traversal for M<=16, where there is no second M panel to reuse.
+      Explicit zero and positive values remain reproducibility and tuning
+      overrides; AVX-512 remains unblocked by default.
     depends_on:
       - layout.vnni2_packed_weights
     conflicts_with: []
@@ -333,11 +334,11 @@ features:
       csrc/moe/common/backend.cpp and
       csrc/moe/x86/avx512_bf16/jit_kernels.cpp
     hypothesis: >-
-      Preferring AMX when runtime support is available, selecting m2n2 below
-      M=76 and m1n4 at or above M=76 independently for each routed expert,
-      selecting TILELOADDT1 for N32 packed B at M>=128, and deriving cache
-      windows from K-padded bytes removes required environment tuning while
-      preserving explicit overrides and AVX-512 fallback.
+      The generic fallback selects m2n2 below M=76 and m1n4 at or above M=76
+      independently for each routed expert, selects TILELOADDT1 for N32
+      packed B at M>=128, and derives cache windows from K-padded bytes. A
+      CPU-specific dimension-aware policy may refine these choices while
+      preserving the explicit validation overrides.
     depends_on:
       - compute.xbyak_amx_1m4n
       - compute.xbyak_amx_2m2n
@@ -353,6 +354,36 @@ features:
       taskset -c 0,1 env PYTHONPATH=src .venv/bin/python
       benchmarks/bench_amx_bf16_patterns.py --tokens 2048 --hidden 4096
       --intermediate 512 --experts 1 --top-k 1 --routing hot --threads 2
+
+  - id: dispatch.dimension_aware_x86_policy
+    part: dispatch
+    status: enabled
+    implementation: >-
+      csrc/moe/x86/avx512_bf16/policy.cpp,
+      csrc/moe/x86/avx512_bf16/executor.cpp, and
+      csrc/moe/x86/avx512_bf16/jit_kernels.cpp
+    hypothesis: >-
+      A versioned CPU profile can use M/H/F and the complete route histogram
+      to choose the execution ISA, effective worker count, AMX register
+      pattern, private-L2 N window, and skew-wave granularity without a second
+      packed-weight copy. On Intel family 6/model 0xad, tiny experts favor
+      AVX-512, tiny aggregate calls favor one worker, and the m2n2/m1n4 and
+      wave crossovers scale with H/F.
+    depends_on:
+      - dispatch.amx_backend_pattern_cache_auto
+      - dispatch.expert_team_nsplit_waves
+      - layout.amx_k32_row_major_a
+    conflicts_with:
+      - layout.amx_n64_k32_streaming_b
+    correctness: >-
+      PYTHONPATH=src .venv/bin/python -m pytest -q
+      tests/test_moe_backend_dispatch.py tests/test_moe_avx512_bf16.py
+    benchmark: >-
+      OMP_NUM_THREADS=8 OMP_DYNAMIC=FALSE OMP_WAIT_POLICY=PASSIVE
+      taskset -c 0-7 env PYTHONPATH=src .venv/bin/python
+      benchmarks/bench_x86_bf16_policy.py --tokens 64 --hidden 4096
+      --intermediate 512 --experts 1 --top-k 1 --routing hot
+      --threads 8 --variants auto,avx512,amx --warmup 8 --runs 31
 
   - id: epilogue.amx_tilestore_silu
     part: intermediate
@@ -676,8 +707,9 @@ features:
       A global expert queue is cheapest when balanced routes expose at least
       one expert per worker. When active experts underfill the machine,
       route-weighted teams can share gathered A and split disjoint W13 F16 and
-      W2 N32 ranges. For a route at least 64 rows and twice the next largest,
-      sorted waves give the hot expert a wider team and reduce the serial tail.
+      W2 N32 ranges. For a route at least the dimension-aware target and twice
+      the next largest, sorted waves give the hot expert a wider team and
+      reduce the serial tail.
       Cancellable phase barriers preserve dependency order and release peers
       if one generated kernel fails.
     depends_on:
@@ -742,6 +774,7 @@ variants:
       - merge.avx512_weighted_reduce
       - dispatch.amx_backend_pattern_cache_auto
       - dispatch.expert_team_nsplit_waves
+      - dispatch.dimension_aware_x86_policy
     entrypoint: >-
       prepare_fused_moe_bf16_tiled_weights(fuse_silu=True, backend="auto")
       followed by fused_moe_bf16_tiled, with no AMX pattern or cache-policy

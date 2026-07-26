@@ -2,8 +2,17 @@
 #include <torch/extension.h>
 #include <pybind11/stl.h>
 
+#include <limits>
+#include <stdexcept>
+#include <utility>
+#include <vector>
+
 #include "common/api.h"
 #include "common/backend.h"
+
+#if defined(FUSED_CPP_MOE_HAS_X86_AVX512_BF16)
+#include "x86/avx512_bf16/policy.h"
+#endif
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   fused_cpp::moe::validate_sve_vector_length_at_import();
@@ -14,6 +23,92 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("fused_moe_bf16_tiled_prepare_weights", &fused_moe_bf16_tiled_prepare_weights,
         "Pack BF16 MoE expert weights for the selected ISA backend.", py::arg("w13_weight"), py::arg("w2_weight"),
         py::arg("fuse_silu") = false, py::arg("backend") = "auto", py::call_guard<py::gil_scoped_release>());
+
+#if defined(FUSED_CPP_MOE_HAS_X86_AVX512_BF16)
+  m.def(
+      "fused_moe_test_x86_policy",
+      [](int64_t hidden_size, int64_t intermediate_size, const std::vector<int64_t>& routes_per_expert,
+         int64_t requested_threads, bool auto_isa, bool avx512_available, bool amx_available) {
+        namespace x86_policy = ::fused_cpp::moe::x86::avx512_bf16;
+        int64_t total_routes = 0;
+        int64_t max_routes = 0;
+        int64_t second_max_routes = 0;
+        int64_t active_experts = 0;
+        for (int64_t rows : routes_per_expert) {
+          if (rows < 0) {
+            throw std::invalid_argument("routes_per_expert entries must be non-negative");
+          }
+          if (rows > std::numeric_limits<int64_t>::max() - total_routes) {
+            throw std::overflow_error("routes_per_expert total overflows int64");
+          }
+          total_routes += rows;
+          if (rows > 0) {
+            ++active_experts;
+          }
+          if (rows > max_routes) {
+            second_max_routes = max_routes;
+            max_routes = rows;
+          } else if (rows > second_max_routes) {
+            second_max_routes = rows;
+          }
+        }
+        if (hidden_size > std::numeric_limits<int>::max() - 31 ||
+            intermediate_size > std::numeric_limits<int>::max() - 31 || max_routes > std::numeric_limits<int>::max()) {
+          throw std::invalid_argument("test x86 policy dimensions must fit int32");
+        }
+        x86_policy::X86PolicyInput input;
+        input.hidden_size = hidden_size;
+        input.intermediate_size = intermediate_size;
+        input.total_routes = total_routes;
+        input.max_routes = max_routes;
+        input.second_max_routes = second_max_routes;
+        input.active_experts = active_experts;
+        input.requested_threads = requested_threads;
+        input.allow_isa_selection = auto_isa;
+        input.avx512_available = avx512_available;
+        input.amx_available = amx_available;
+        input.requested_isa =
+            amx_available ? x86_policy::X86ExecutionIsa::kAmxBf16 : x86_policy::X86ExecutionIsa::kAvx512Bf16;
+        const x86_policy::X86PolicyDecision decision = x86_policy::ResolveX86Policy(input);
+        const x86_policy::X86CpuIdentity cpu = x86_policy::GetX86CpuIdentity();
+
+        py::list expert_policies;
+        const int h_pad = static_cast<int>((hidden_size + 31) / 32 * 32);
+        const int f_pad = static_cast<int>((intermediate_size + 31) / 32 * 32);
+        for (int64_t rows : routes_per_expert) {
+          if (rows <= 0) {
+            continue;
+          }
+          const x86_policy::AmxKernelPattern pattern = x86_policy::ResolveAutomaticAmxKernelPattern(
+              static_cast<int>(rows), static_cast<int>(hidden_size), static_cast<int>(intermediate_size));
+          py::dict expert;
+          expert["rows"] = rows;
+          expert["amx_pattern"] = x86_policy::AmxKernelPatternName(pattern);
+          expert["w13_cache_blocks"] = x86_policy::ResolveAutomaticAmxCacheBlocks(
+              x86_policy::AmxCacheStage::kW13, h_pad, static_cast<int>(rows), static_cast<int>(hidden_size),
+              static_cast<int>(intermediate_size), pattern);
+          expert["w2_cache_blocks"] = x86_policy::ResolveAutomaticAmxCacheBlocks(
+              x86_policy::AmxCacheStage::kW2, f_pad, static_cast<int>(rows), static_cast<int>(hidden_size),
+              static_cast<int>(intermediate_size), pattern);
+          expert_policies.append(std::move(expert));
+        }
+
+        py::dict result;
+        result["profile"] = decision.profile;
+        result["isa"] = x86_policy::X86ExecutionIsaName(decision.isa);
+        result["execution_threads"] = decision.execution_threads;
+        result["nsplit_target_rows"] = decision.nsplit_target_rows;
+        result["route_skewed"] = decision.route_skewed;
+        result["experts"] = std::move(expert_policies);
+        result["cpu_family"] = cpu.family;
+        result["cpu_model"] = cpu.model;
+        result["cpu_stepping"] = cpu.stepping;
+        return result;
+      },
+      "Test-only: inspect the dimension-aware x86 fused-MoE policy.", py::arg("hidden_size"),
+      py::arg("intermediate_size"), py::arg("routes_per_expert"), py::arg("requested_threads"),
+      py::arg("auto_isa") = true, py::arg("avx512_available") = true, py::arg("amx_available") = true);
+#endif
 
 #if defined(__aarch64__)
   m.def("fused_moe_test_split_plan", &fused_moe_test_split_plan, "Test-only: return the cooperative GEMM split plan.",

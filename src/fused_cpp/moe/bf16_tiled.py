@@ -174,8 +174,9 @@ def prepare_fused_moe_bf16_tiled_weights(
     AVX-512 and AMX pad arbitrary positive ``F``. All fused backends require
     ``activation='silu'`` at call time. The returned object carries a ``fused_silu`` flag that
     :func:`fused_moe_bf16_tiled` honours automatically. On supported x86 Linux
-    systems, ``backend='auto'`` prefers AMX BF16 and falls back to AVX-512 BF16;
-    AMX pattern and cache-window selection are automatic per routed expert.
+    systems, ``backend='auto'`` uses one AMX-compatible packed-weight copy and
+    selects AVX-512 BF16 or AMX BF16 per call from the routed M/H/F shape and
+    CPU profile. AMX pattern, cache-window, and thread selection are automatic.
     """
     _require_backend()
     if w13_weight.dtype != torch.bfloat16 or w2_weight.dtype != torch.bfloat16:
@@ -198,6 +199,7 @@ def prepare_fused_moe_bf16_tiled_weights(
         101: "x86_avx512_bf16",
         102: "x86_amx_bf16",
         103: "x86_amx_bf16_n64",
+        104: "x86_bf16_auto",
     }
     return PreparedBF16TiledFusedMoEWeights(
         w13=(packed[0], int(packed[1]), int(packed[2])),

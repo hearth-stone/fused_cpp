@@ -14,6 +14,8 @@ enum class BackendId : int64_t {
   kX86Avx512Bf16 = 101,
   kX86AmxBf16 = 102,
   kX86AmxBf16N64 = 103,
+  // AMX-compatible N32/K32 packing with per-call AVX-512/AMX dispatch.
+  kX86AutoBf16 = 104,
 };
 
 enum BackendCapability : uint64_t {

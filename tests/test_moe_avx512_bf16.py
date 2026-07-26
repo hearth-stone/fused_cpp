@@ -543,8 +543,8 @@ def test_avx512_runtime_kill_switch(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @requires_amx
-def test_amx_backend_is_preferred_by_auto_with_explicit_avx512_fallback() -> None:
-    """Automatic x86 preparation prefers AMX while explicit AVX-512 remains available."""
+def test_auto_backend_uses_shared_k32_weights_with_explicit_isa_backends_available() -> None:
+    """Automatic x86 preparation records its shared K32 dispatch identity."""
     _, w13, w2, _, _ = _case(
         tokens=1,
         hidden=33,
@@ -567,8 +567,10 @@ def test_amx_backend_is_preferred_by_auto_with_explicit_avx512_fallback() -> Non
         backend="x86_avx512_bf16",
     )
 
-    assert automatic.gemm_backend == 102
-    assert automatic.backend_name == "x86_amx_bf16"
+    assert automatic.gemm_backend == 104
+    assert automatic.backend_name == "x86_bf16_auto"
+    assert automatic.w13[0].shape == amx.w13[0].shape
+    assert automatic.w2[0].shape == amx.w2[0].shape
     assert amx.gemm_backend == 102
     assert amx.backend_n_tile == 32
     assert amx.backend_name == "x86_amx_bf16"
@@ -579,12 +581,101 @@ def test_amx_backend_is_preferred_by_auto_with_explicit_avx512_fallback() -> Non
 
 
 @requires_amx
+def test_dimension_aware_policy_profile_and_boundaries(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The C8i calibration selects ISA, threads, pattern, cache, and skew from dimensions."""
+    from fused_cpp import _moe_C
+
+    monkeypatch.setenv("FUSED_CPP_MOE_X86_POLICY_PROFILE", "intel_06_ad_c8i_v1")
+    monkeypatch.delenv("FUSED_CPP_MOE_X86_ISA", raising=False)
+
+    tiny = _moe_C.fused_moe_test_x86_policy(64, 16, [1], 8)
+    assert tiny["profile"] == "intel_06_ad_c8i_v1"
+    assert tiny["isa"] == "avx512_bf16"
+    assert tiny["execution_threads"] == 1
+    assert tiny["nsplit_target_rows"] == 256
+    assert tiny["experts"][0] == {
+        "rows": 1,
+        "amx_pattern": "m2n2",
+        "w13_cache_blocks": 0,
+        "w2_cache_blocks": 0,
+    }
+
+    isa_boundary = _moe_C.fused_moe_test_x86_policy(128, 64, [1], 8)
+    isa_above_boundary = _moe_C.fused_moe_test_x86_policy(128, 64, [2], 8)
+    assert isa_boundary["isa"] == "avx512_bf16"
+    assert isa_above_boundary["isa"] == "amx_bf16"
+
+    small_multi_expert = _moe_C.fused_moe_test_x86_policy(256, 64, [1] * 8, 8)
+    medium_multi_expert = _moe_C.fused_moe_test_x86_policy(512, 128, [1] * 8, 8)
+    assert small_multi_expert["execution_threads"] == 1
+    assert medium_multi_expert["execution_threads"] == 8
+
+    production = _moe_C.fused_moe_test_x86_policy(4096, 512, [1536, 256, 256], 8)
+    assert production["isa"] == "amx_bf16"
+    assert production["execution_threads"] == 8
+    assert production["nsplit_target_rows"] == 64
+    assert production["route_skewed"] is True
+    assert production["experts"][0]["amx_pattern"] == "m1n4"
+    assert production["experts"][0]["w13_cache_blocks"] == 4
+    assert production["experts"][0]["w2_cache_blocks"] == 16
+
+    narrow = _moe_C.fused_moe_test_x86_policy(1024, 256, [2048], 8)
+    assert narrow["nsplit_target_rows"] == 256
+    assert narrow["experts"][0]["amx_pattern"] == "m2n2"
+
+    wide_f_96 = _moe_C.fused_moe_test_x86_policy(4096, 2048, [96], 1)
+    wide_f_128 = _moe_C.fused_moe_test_x86_policy(4096, 2048, [128], 1)
+    assert wide_f_96["nsplit_target_rows"] == 16
+    assert wide_f_96["experts"][0]["amx_pattern"] == "m2n2"
+    assert wide_f_128["experts"][0]["amx_pattern"] == "m1n4"
+
+
+@requires_amx
+def test_dimension_aware_policy_rejects_unknown_profile(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A misspelled profile must not silently select a different policy."""
+    from fused_cpp import _moe_C
+
+    monkeypatch.setenv("FUSED_CPP_MOE_X86_POLICY_PROFILE", "not-a-profile")
+    with pytest.raises(RuntimeError, match="FUSED_CPP_MOE_X86_POLICY_PROFILE"):
+        _moe_C.fused_moe_test_x86_policy(4096, 512, [64], 8)
+
+
+@requires_amx
+def test_auto_k32_weights_execute_with_both_isa_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
+    """One automatic packed-weight copy is correct through AVX-512 and AMX."""
+    inputs, w13, w2, topk_weights, topk_ids = _case(
+        tokens=3,
+        hidden=65,
+        intermediate=17,
+        experts=1,
+        top_k=1,
+        seed=909,
+    )
+    packed = prepare_fused_moe_bf16_tiled_weights(w13, w2, fuse_silu=True)
+    assert packed.gemm_backend == 104
+
+    monkeypatch.setenv("FUSED_CPP_MOE_X86_POLICY_PROFILE", "intel_06_ad_c8i_v1")
+    monkeypatch.setenv("FUSED_CPP_MOE_X86_ISA", "avx512")
+    avx = fused_moe_bf16_tiled(inputs, packed, topk_weights, topk_ids, num_threads=4)
+    monkeypatch.setenv("FUSED_CPP_MOE_X86_ISA", "amx")
+    amx = fused_moe_bf16_tiled(inputs, packed, topk_weights, topk_ids, num_threads=4)
+
+    torch.testing.assert_close(avx.float(), amx.float(), atol=0, rtol=0)
+    _assert_bf16_close(avx, fused_moe_naive(inputs, w13, w2, topk_weights, topk_ids))
+
+    monkeypatch.delenv("FUSED_CPP_MOE_X86_ISA")
+    monkeypatch.setenv("FUSED_CPP_MOE_AMX_BF16", "0")
+    avx_fallback = fused_moe_bf16_tiled(inputs, packed, topk_weights, topk_ids, num_threads=4)
+    torch.testing.assert_close(avx_fallback.float(), avx.float(), atol=0, rtol=0)
+
+
+@requires_amx
 @pytest.mark.parametrize("num_threads", [1, 2], ids=["single-core", "dual-core"])
 def test_amx_auto_pattern_and_cache_policy_support_mixed_expert_sizes(
     monkeypatch: pytest.MonkeyPatch,
     num_threads: int,
 ) -> None:
-    """Auto policy may select m2n2 and m1n4 in one invocation without relying on environment overrides."""
+    """The generic fallback may select m2n2 and m1n4 in one invocation."""
     inputs, w13, w2, topk_weights, _ = _case(
         tokens=151,
         hidden=641,
@@ -601,6 +692,7 @@ def test_amx_auto_pattern_and_cache_policy_support_mixed_expert_sizes(
         backend="x86_amx_bf16",
     )
 
+    monkeypatch.setenv("FUSED_CPP_MOE_X86_POLICY_PROFILE", "generic_v1")
     monkeypatch.delenv("FUSED_CPP_MOE_AMX_PATTERN", raising=False)
     monkeypatch.delenv("FUSED_CPP_MOE_X86_W13_CACHE_BLOCKS", raising=False)
     monkeypatch.delenv("FUSED_CPP_MOE_X86_W2_CACHE_BLOCKS", raising=False)

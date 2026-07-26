@@ -43,7 +43,8 @@ void PrepareJitKernels(const std::vector<int>& row_counts, int silu_poly_degree,
 // AMX consumes row-major M16 panels and the same K-pair/N32 packed weights as
 // AVX-512. K is padded to 32 BF16 elements by the AMX backend.
 void PrepareAmxJitKernels(const std::vector<int>& row_counts, int silu_poly_degree, int hidden_size, bool direct_bf16,
-                          bool weighted_direct_bf16 = false, AmxPackedBLayout b_layout = AmxPackedBLayout::kN32);
+                          bool weighted_direct_bf16 = false, AmxPackedBLayout b_layout = AmxPackedBLayout::kN32,
+                          int intermediate_size = 0);
 
 // True when weighted AMX W2 output is stored in expert-contiguous row order
 // and the merge must translate flat route ids through a row map.
@@ -51,12 +52,13 @@ bool AmxW2UsesContiguousRouteOutput();
 
 void ComputeW13Amx(const uint16_t* a, int a_stride, const uint16_t* packed_b, uint16_t* c, int c_stride, int rows,
                    int k_pad, int feature_block_begin, int feature_block_end, int silu_poly_degree,
-                   AmxPackedBLayout b_layout = AmxPackedBLayout::kN32);
+                   AmxPackedBLayout b_layout = AmxPackedBLayout::kN32, int hidden_size = 0, int intermediate_size = 0);
 
 void ComputeW2Amx(const uint16_t* a, int a_stride, const uint16_t* packed_b, float* route_output,
                   uint16_t* direct_output, const int64_t* route_ids, int route_stride, int rows, int k_pad,
                   int hidden_size, int output_block_begin, int output_block_end, bool direct_bf16,
-                  const float* route_weights = nullptr, AmxPackedBLayout b_layout = AmxPackedBLayout::kN32);
+                  const float* route_weights = nullptr, AmxPackedBLayout b_layout = AmxPackedBLayout::kN32,
+                  int intermediate_size = 0);
 
 struct JitStats {
   uint64_t kernel_count = 0;

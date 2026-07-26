@@ -199,16 +199,20 @@ processes to compare generated and fallback kernels without routing or W2.
 The prioritized AMX optimization backlog, acceptance checks, and rejected or
 deferred design space are tracked in [`TODO.md`](TODO.md). The P1 epilogue and
 workspace-lifecycle items, N32 B-side load-hint policy, and m1n2 true K-load
-pipeline experiment are complete; the remaining P2 work is dimension-aware
-policy calibration.
+pipeline experiment are complete. Dimension-aware ISA, pattern, cache, and
+thread-policy calibration is also complete for the C8i family/model profile.
 
-`auto` selects the reserved backend ID 102 (`x86_amx_bf16`) before backend ID
-101 (`x86_avx512_bf16`) when AMX is available. AMX requires Linux, Xbyak,
-AVX-512 BF16 for the vector epilogues, AMX-TILE, and AMX-BF16. Explicitly
-requesting `x86_avx512_bf16` still forces the AVX-512 path. Setting
-`FUSED_CPP_MOE_AMX_BF16=0` hides AMX from runtime discovery, so `auto` falls
-back to AVX-512 BF16. Linux grants XTILEDATA state per thread, so every worker
-requests `ARCH_REQ_XCOMP_PERM` before its first generated AMX call.
+When AMX is available, `auto` prepares backend ID 104 (`x86_bf16_auto`).
+It uses the production N32 layout with K rounded to 32, so one packed-weight
+copy can feed either the AVX-512 or AMX JIT path. The execution ISA is selected
+per call after the route histogram is known. Explicit
+`x86_avx512_bf16`/`x86_amx_bf16` requests still force IDs 101/102 and preserve
+their K2/K32 packing contracts. Setting `FUSED_CPP_MOE_AMX_BF16=0` before a
+new `backend="auto"` preparation restores the legacy AVX-512 descriptor;
+an already prepared ID-104 weight object remains valid and dispatches to its
+AVX-512 path. AMX requires Linux, Xbyak, AVX-512 BF16 for vector epilogues,
+AMX-TILE, and AMX-BF16. Linux grants XTILEDATA state per thread, so every
+worker requests `ARCH_REQ_XCOMP_PERM` before its first generated AMX call.
 
 AMX reuses the existing K-pair/N32 packed-weight format, but its backend rounds
 K to 32. Gathered input and the W13 intermediate are row-major M16 panels.
@@ -389,13 +393,29 @@ regression reproduced with reversed candidate order, while 8T was tied and
 changed sign within 0.4%. Consequently `auto` remains `per_call`. See
 [`results/amazon_c8i_8core_amx_macro_m_tile_state_20260726.md`](results/amazon_c8i_8core_amx_macro_m_tile_state_20260726.md).
 
-The default policy resolves a tile-register schedule independently for each
-expert's routed row count:
+The default policy first identifies the CPU. Intel family 6/model `0xad`
+(Amazon C8i Xeon 6975P-C) uses profile `intel_06_ad_c8i_v1`; other machines
+retain `generic_v1` until they have their own held-out calibration.
 
-- M < 76 uses `m2n2`; its final M1-16 tail naturally uses `m1n2`;
-- M >= 76 uses `m1n4`; an odd final N32/W13 block uses `m1n2`.
-- M < 128 loads N32 packed B with `TILELOADD`; M >= 128 uses
-  `TILELOADDT1`. A tiles always use `TILELOADD`.
+For the C8i profile:
+
+- auto uses AVX-512 when the largest expert satisfies `M*H*F <= 8192`,
+  otherwise it uses AMX;
+- auto reduces the call to one worker when
+  `sum(M)*H*F <= 131072`; explicit ISA backends retain the requested count;
+- H < 4096 always uses `m2n2`;
+- H >= 4096 uses `m1n4` from M=96 when `2*F < H`, or from M=128 when
+  `2*F >= H`; smaller M uses `m2n2`;
+- M <= 16 keeps the original unwindowed N traversal. Larger M derives W13/W2
+  windows from one-half/one-quarter of the 2 MiB private L2;
+- the skew-wave target is
+  `clamp(ceil(64*4096*512/(H*F)), 16, 256)` rows per worker.
+
+The generic fallback preserves the previous AMX M=76 crossover, 64-row wave
+target, and cache-byte formulas. Every profile retains the exact-tail rules:
+the final M1-16 part of `m2n2`, plus an odd final N32/W13 block of `m1n4`,
+uses `m1n2`. N32 packed B still switches from `TILELOADD` to
+`TILELOADDT1` at M=128; A tiles always use `TILELOADD`.
 
 `FUSED_CPP_MOE_AMX_PATTERN` is a validation and tuning override:
 
@@ -407,11 +427,14 @@ expert's routed row count:
   adjacent N32 blocks, and retains K double buffering. Odd N32/W13 blocks use
   `m1n2`.
 
-The M=76 crossover is currently calibrated from Amazon C8i measurements at
-H=4096/F=512. Correctness is shape-independent, but performance portability
-of that threshold must be revalidated for materially different x86 CPUs or
-model dimensions. Automatic-policy correctness, crossover, mixed-routing, and
-cache-window measurements are recorded in
+`FUSED_CPP_MOE_X86_ISA=avx512|amx` and
+`FUSED_CPP_MOE_X86_POLICY_PROFILE=generic_v1|intel_06_ad_c8i_v1` are
+validation overrides for the shared auto backend. Pattern and cache overrides
+remain independent. Correctness is shape-independent, but a new CPU model
+must earn a new profile through rotated and held-out measurements. The current
+calibration is recorded in
+[`results/amazon_c8i_8core_dimension_aware_policy_20260726.md`](results/amazon_c8i_8core_dimension_aware_policy_20260726.md);
+the superseded fixed-M baseline remains in
 [`results/amazon_c8i_2core_auto_dispatch_20260720.md`](results/amazon_c8i_2core_auto_dispatch_20260720.md).
 
 Build and exercise the default automatic policy without dispatch environment
@@ -474,7 +497,9 @@ The JIT wrappers change loop order without changing kernels or packed layouts:
 - `FUSED_CPP_MOE_X86_W2_CACHE_BLOCKS` is the number of adjacent W2 N32 blocks
   in one window;
 - on AMX, unset, empty, or `auto` derives the block counts from approximately
-  1 MiB of packed W13 and 512 KiB of packed W2 per worker;
+  1 MiB of packed W13 and 512 KiB of packed W2 per worker; the C8i profile
+  disables the loop reorder for M<=16 because there is only one M panel to
+  reuse;
 - on AVX-512, unset, empty, or `auto` preserves the established loop order;
 - zero explicitly disables blocking, while a positive integer forces that
   many blocks on either backend.
@@ -508,7 +533,7 @@ W2  blocks ~= 512 KiB / (64 * round_up(F, 32))
 
 The implementation rounds down to a positive integral block count; for
 `m1n4`, counts greater than one are rounded down to an even number. For
-H=4096/F=512 this gives W13=4 and W2=16. With those values, `m1n4`
+H=4096/F=512 and M>16 this gives W13=4 and W2=16. With those values, `m1n4`
 improved the M=2048 fused expert by 1.88x-2.00x over its unblocked schedule on
 one core and 1.40x-1.52x on two cores across repeat scans. It also became
 faster than cache-blocked `m2n2`
@@ -519,6 +544,19 @@ variables remain useful for reproducing the old unblocked AMX schedule
 (`0`/`0`) and forced-policy experiments. Full methodology, dimension scaling,
 routing results, and thermal caveats are in
 [`results/amazon_c8i_2core_cache_blocking_20260719.md`](results/amazon_c8i_2core_cache_blocking_20260719.md).
+
+`benchmarks/bench_x86_bf16_policy.py` rotates auto, forced AVX-512, and forced
+AMX on identical logical inputs, excludes prepack, reuses output, and emits
+the resolved CPU/ISA/thread/pattern/cache policy beside latency statistics:
+
+```bash
+OMP_NUM_THREADS=8 OMP_DYNAMIC=FALSE OMP_WAIT_POLICY=PASSIVE \
+  taskset -c 0-7 env PYTHONPATH=src .venv/bin/python \
+  benchmarks/bench_x86_bf16_policy.py \
+  --tokens 64 --hidden 4096 --intermediate 512 \
+  --experts 1 --top-k 1 --routing hot --threads 8 \
+  --variants auto,avx512,amx --warmup 8 --runs 31
+```
 
 The aligned single-active-expert input bypass and its pinned one-core
 KTransformers comparison are recorded in

@@ -2,6 +2,7 @@
 #include "kernels.h"
 
 #include "backend.h"
+#include "policy.h"
 
 #include <algorithm>
 #include <array>
@@ -57,12 +58,7 @@ enum class AmxTileStateMode : uint8_t { kPerCall, kMacroM };
 enum class AmxBLoadHint : uint8_t { kTileLoadD, kTileLoadDT1, kPrefetchT0, kPrefetchT1 };
 enum class AmxKLoadPipeline : uint8_t { kBaseline, kPipelined };
 
-// H=4096/F=512 crossovers calibrated on Amazon C8i. Explicit environment
-// modes remain available for machine-specific validation.
-constexpr int kAmxM1N4MinRows = 76;
 constexpr int kAmxBLoadDT1MinRows = 128;
-constexpr int64_t kAmxW13CacheTargetBytes = int64_t{1} << 20;
-constexpr int64_t kAmxW2CacheTargetBytes = int64_t{512} << 10;
 
 size_t AmxPatternIndex(AmxJitPattern pattern) { return static_cast<size_t>(pattern); }
 
@@ -70,11 +66,35 @@ size_t AmxTileStateModeIndex(AmxTileStateMode mode) { return static_cast<size_t>
 
 size_t AmxBLoadHintIndex(AmxBLoadHint hint) { return static_cast<size_t>(hint); }
 
-AmxJitPattern ResolveAmxJitPattern(int rows) {
+AmxJitPattern ToJitPattern(AmxKernelPattern pattern) {
+  switch (pattern) {
+    case AmxKernelPattern::kM1N2:
+      return AmxJitPattern::kM1N2;
+    case AmxKernelPattern::kM2N2:
+      return AmxJitPattern::kM2N2;
+    case AmxKernelPattern::kM1N4:
+      return AmxJitPattern::kM1N4;
+  }
+  return AmxJitPattern::kM2N2;
+}
+
+AmxKernelPattern ToPolicyPattern(AmxJitPattern pattern) {
+  switch (pattern) {
+    case AmxJitPattern::kM1N2:
+      return AmxKernelPattern::kM1N2;
+    case AmxJitPattern::kM2N2:
+      return AmxKernelPattern::kM2N2;
+    case AmxJitPattern::kM1N4:
+      return AmxKernelPattern::kM1N4;
+  }
+  return AmxKernelPattern::kM2N2;
+}
+
+AmxJitPattern ResolveAmxJitPattern(int rows, int hidden_size, int intermediate_size) {
   const char* raw = std::getenv("FUSED_CPP_MOE_AMX_PATTERN");
   const std::string value = raw == nullptr ? "auto" : raw;
   if (value.empty() || value == "auto") {
-    return rows >= kAmxM1N4MinRows ? AmxJitPattern::kM1N4 : AmxJitPattern::kM2N2;
+    return ToJitPattern(ResolveAutomaticAmxKernelPattern(rows, hidden_size, intermediate_size));
   }
   if (value == "m1n2") {
     return AmxJitPattern::kM1N2;
@@ -209,15 +229,6 @@ int GetCacheBlockWindow(const char* environment, int automatic_blocks = 0) {
     throw std::runtime_error(std::string(environment) + " must be auto or a non-negative integer, got '" + raw + "'");
   }
   return static_cast<int>(parsed);
-}
-
-int AutomaticAmxCacheBlocks(int k_pad, int64_t target_bytes, AmxJitPattern pattern) {
-  const int64_t bytes_per_block = static_cast<int64_t>(k_pad) * 64;
-  int blocks = static_cast<int>(std::max<int64_t>(1, target_bytes / bytes_per_block));
-  if (pattern == AmxJitPattern::kM1N4 && blocks > 1) {
-    blocks -= blocks % 2;
-  }
-  return blocks;
 }
 
 const uint16_t* AmxBBlockPointer(const uint16_t* packed_b, int block, int k_pad, AmxPackedBLayout b_layout) {
@@ -2304,7 +2315,7 @@ void PrepareJitKernels(const std::vector<int>& row_counts, int silu_poly_degree,
 }
 
 void PrepareAmxJitKernels(const std::vector<int>& row_counts, int silu_poly_degree, int hidden_size, bool direct_bf16,
-                          bool weighted_direct_bf16, AmxPackedBLayout b_layout) {
+                          bool weighted_direct_bf16, AmxPackedBLayout b_layout, int intermediate_size) {
 #if defined(FUSED_CPP_MOE_HAS_XBYAK) && FUSED_CPP_MOE_HAS_XBYAK
   const AmxSiluEpilogue silu_epilogue = ResolveAmxSiluEpilogue();
   const AmxW2Epilogue w2_epilogue = EffectiveAmxW2Epilogue(ResolveAmxW2Epilogue(), direct_bf16);
@@ -2326,7 +2337,7 @@ void PrepareAmxJitKernels(const std::vector<int>& row_counts, int silu_poly_degr
     if (rows <= 0) {
       continue;
     }
-    const AmxJitPattern pattern = ResolveAmxJitPattern(rows);
+    const AmxJitPattern pattern = ResolveAmxJitPattern(rows, hidden_size, intermediate_size);
     const AmxBLoadHint b_load_hint = ResolveAmxBLoadHint(b_layout, rows);
     if (pattern == AmxJitPattern::kM2N2) {
       if (rows >= 32) {
@@ -2355,6 +2366,7 @@ void PrepareAmxJitKernels(const std::vector<int>& row_counts, int silu_poly_degr
   (void)direct_bf16;
   (void)weighted_direct_bf16;
   (void)b_layout;
+  (void)intermediate_size;
   throw std::runtime_error("x86_amx_bf16 requires a build with the Xbyak submodule available");
 #endif
 }
@@ -2553,7 +2565,7 @@ void ComputeW2(const uint16_t* a, int a_stride, const uint16_t* packed_b, float*
 
 void ComputeW13Amx(const uint16_t* a, int a_stride, const uint16_t* packed_b, uint16_t* c, int c_stride, int rows,
                    int k_pad, int feature_block_begin, int feature_block_end, int silu_poly_degree,
-                   AmxPackedBLayout b_layout) {
+                   AmxPackedBLayout b_layout, int hidden_size, int intermediate_size) {
 #if defined(FUSED_CPP_MOE_HAS_XBYAK) && FUSED_CPP_MOE_HAS_XBYAK
   if (!EnsureAmxThreadPermission()) {
     throw std::runtime_error("x86_amx_bf16 could not enable XTILEDATA for the current worker thread");
@@ -2566,7 +2578,7 @@ void ComputeW13Amx(const uint16_t* a, int a_stride, const uint16_t* packed_b, ui
     throw std::invalid_argument("AMX W13 K padding must be a multiple of 32");
   }
 
-  const AmxJitPattern pattern = ResolveAmxJitPattern(rows);
+  const AmxJitPattern pattern = ResolveAmxJitPattern(rows, hidden_size, intermediate_size);
   const AmxSiluEpilogue silu_epilogue = ResolveAmxSiluEpilogue();
   const AmxBLoadHint b_load_hint = ResolveAmxBLoadHint(b_layout, rows);
   const AmxTileStateMode requested_tile_state_mode = ResolveAmxTileStateMode();
@@ -2706,8 +2718,10 @@ void ComputeW13Amx(const uint16_t* a, int a_stride, const uint16_t* packed_b, ui
     run_double_m(range_block_count, block_begin);
   };
 
-  const int cache_blocks = GetCacheBlockWindow("FUSED_CPP_MOE_X86_W13_CACHE_BLOCKS",
-                                               AutomaticAmxCacheBlocks(k_pad, kAmxW13CacheTargetBytes, pattern));
+  const int cache_blocks =
+      GetCacheBlockWindow("FUSED_CPP_MOE_X86_W13_CACHE_BLOCKS",
+                          ResolveAutomaticAmxCacheBlocks(AmxCacheStage::kW13, k_pad, rows, hidden_size,
+                                                         intermediate_size, ToPolicyPattern(pattern)));
   ForEachCacheBlockWindow(feature_block_begin, feature_block_end, cache_blocks, [&](int window_begin, int window_end) {
     run_range(window_begin, window_end - window_begin);
   });
@@ -2723,6 +2737,8 @@ void ComputeW13Amx(const uint16_t* a, int a_stride, const uint16_t* packed_b, ui
   (void)feature_block_end;
   (void)silu_poly_degree;
   (void)b_layout;
+  (void)hidden_size;
+  (void)intermediate_size;
   throw std::runtime_error("x86_amx_bf16 requires a build with the Xbyak submodule available");
 #endif
 }
@@ -2730,7 +2746,7 @@ void ComputeW13Amx(const uint16_t* a, int a_stride, const uint16_t* packed_b, ui
 void ComputeW2Amx(const uint16_t* a, int a_stride, const uint16_t* packed_b, float* route_output,
                   uint16_t* direct_output, const int64_t* route_ids, int route_stride, int rows, int k_pad,
                   int hidden_size, int output_block_begin, int output_block_end, bool direct_bf16,
-                  const float* route_weights, AmxPackedBLayout b_layout) {
+                  const float* route_weights, AmxPackedBLayout b_layout, int intermediate_size) {
 #if defined(FUSED_CPP_MOE_HAS_XBYAK) && FUSED_CPP_MOE_HAS_XBYAK
   const bool weighted_direct_bf16 = route_weights != nullptr;
   if (!EnsureAmxThreadPermission()) {
@@ -2743,7 +2759,7 @@ void ComputeW2Amx(const uint16_t* a, int a_stride, const uint16_t* packed_b, flo
     throw std::invalid_argument("AMX W2 K padding must be a multiple of 32");
   }
 
-  const AmxJitPattern pattern = ResolveAmxJitPattern(rows);
+  const AmxJitPattern pattern = ResolveAmxJitPattern(rows, hidden_size, intermediate_size);
   const AmxBLoadHint b_load_hint = ResolveAmxBLoadHint(b_layout, rows);
   const AmxW2Epilogue w2_epilogue = EffectiveAmxW2Epilogue(ResolveAmxW2Epilogue(), direct_bf16);
   const AmxTileStateMode requested_tile_state_mode = ResolveAmxTileStateMode();
@@ -2915,8 +2931,9 @@ void ComputeW2Amx(const uint16_t* a, int a_stride, const uint16_t* packed_b, flo
     run_single_m_range(block_begin, range_block_count, n_valid, AmxJitPattern::kM1N2);
   };
 
-  const int cache_blocks = GetCacheBlockWindow("FUSED_CPP_MOE_X86_W2_CACHE_BLOCKS",
-                                               AutomaticAmxCacheBlocks(k_pad, kAmxW2CacheTargetBytes, pattern));
+  const int cache_blocks = GetCacheBlockWindow(
+      "FUSED_CPP_MOE_X86_W2_CACHE_BLOCKS", ResolveAutomaticAmxCacheBlocks(AmxCacheStage::kW2, k_pad, rows, hidden_size,
+                                                                          intermediate_size, ToPolicyPattern(pattern)));
   ForEachCacheBlockWindow(main_begin, main_end, cache_blocks, [&](int window_begin, int window_end) {
     run_range(window_begin, window_end - window_begin, 32);
   });
@@ -2940,6 +2957,7 @@ void ComputeW2Amx(const uint16_t* a, int a_stride, const uint16_t* packed_b, flo
   (void)direct_bf16;
   (void)route_weights;
   (void)b_layout;
+  (void)intermediate_size;
   throw std::runtime_error("x86_amx_bf16 requires a build with the Xbyak submodule available");
 #endif
 }

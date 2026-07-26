@@ -3,6 +3,7 @@
 #include "../../common/backend.h"
 #include "backend.h"
 #include "kernels.h"
+#include "policy.h"
 
 #include <algorithm>
 #include <atomic>
@@ -29,6 +30,10 @@ namespace avx512_moe = ::fused_cpp::moe::x86::avx512_bf16;
 bool IsAmxBackend(const ::fused_cpp::moe::MoeBackend& backend) {
   return backend.id == ::fused_cpp::moe::BackendId::kX86AmxBf16 ||
          backend.id == ::fused_cpp::moe::BackendId::kX86AmxBf16N64;
+}
+
+bool IsAutoX86Backend(const ::fused_cpp::moe::MoeBackend& backend) {
+  return backend.id == ::fused_cpp::moe::BackendId::kX86AutoBf16;
 }
 
 avx512_moe::AmxPackedBLayout AmxBLayoutForBackend(const ::fused_cpp::moe::MoeBackend& backend) {
@@ -63,10 +68,6 @@ constexpr int64_t kMaxExecutorThreads = 256;
 constexpr int64_t kPersistentInputMinBytes = 256 * 1024;
 constexpr int64_t kPersistentIntermediateMinBytes = 256 * 1024;
 constexpr int64_t kWeightedTop1DirectMinWorkspaceBytes = 256 * 1024;
-// Empirical runtime-mapper target for deciding how many experts share a wave.
-// It changes only scheduling; N-range ownership keeps correctness independent
-// of this value.
-constexpr int64_t kNsplitTargetRowsPerThread = 64;
 
 struct BlockRange {
   int64_t begin = 0;
@@ -460,7 +461,7 @@ CooperativeWave BuildCooperativeWave(const std::vector<ExpertTask>& tasks, const
 }
 
 std::vector<CooperativeWave> BuildCooperativeSchedule(const std::vector<ExpertTask>& tasks, int64_t num_threads,
-                                                      int64_t max_n_parallelism) {
+                                                      int64_t max_n_parallelism, int64_t target_rows_per_thread) {
   std::vector<size_t> ordered_tasks(tasks.size());
   for (size_t index = 0; index < tasks.size(); ++index) {
     ordered_tasks[index] = index;
@@ -472,7 +473,7 @@ std::vector<CooperativeWave> BuildCooperativeSchedule(const std::vector<ExpertTa
   for (size_t begin = 0; begin < ordered_tasks.size();) {
     const int64_t largest_rows = static_cast<int64_t>(tasks[ordered_tasks[begin]].routes->size());
     const int64_t target_active_experts =
-        std::max<int64_t>(1, std::min<int64_t>(num_threads, num_threads * kNsplitTargetRowsPerThread / largest_rows));
+        std::max<int64_t>(1, std::min<int64_t>(num_threads, num_threads * target_rows_per_thread / largest_rows));
     const size_t wave_tasks = std::min(ordered_tasks.size() - begin, static_cast<size_t>(target_active_experts));
     std::vector<size_t> task_indices(ordered_tasks.begin() + static_cast<std::ptrdiff_t>(begin),
                                      ordered_tasks.begin() + static_cast<std::ptrdiff_t>(begin + wave_tasks));
@@ -494,14 +495,14 @@ void GatherExpertInput(const ExpertTask& task, ThreadScratch& scratch, const uin
 
 void RunExpertW13Range(const ExpertTask& task, ThreadScratch& scratch, const uint16_t* expert_input,
                        const uint16_t* w13, const PackedShape& w13_shape, int f_pad, int intermediate_stride,
-                       int silu_poly_degree, bool use_amx, avx512_moe::AmxPackedBLayout amx_b_layout,
-                       int feature_block_begin, int feature_block_end) {
+                       int silu_poly_degree, bool use_amx, avx512_moe::AmxPackedBLayout amx_b_layout, int hidden_size,
+                       int intermediate_size, int feature_block_begin, int feature_block_end) {
   const int rows = static_cast<int>(task.routes->size());
   const uint16_t* expert_w13 = w13 + task.expert * w13_shape.expert_stride;
   if (use_amx) {
     avx512_moe::ComputeW13Amx(expert_input, w13_shape.k_pad, expert_w13, scratch.intermediate, intermediate_stride,
                               rows, w13_shape.k_pad, feature_block_begin, feature_block_end, silu_poly_degree,
-                              amx_b_layout);
+                              amx_b_layout, hidden_size, intermediate_size);
   } else {
     avx512_moe::ComputeW13(expert_input, w13_shape.k_pad, expert_w13, scratch.intermediate, f_pad, rows,
                            w13_shape.k_pad, feature_block_begin, feature_block_end, silu_poly_degree);
@@ -512,7 +513,7 @@ void RunExpertW2Range(const ExpertTask& task, ThreadScratch& scratch, const uint
                       int f_pad, int intermediate_stride, float* route_output, uint16_t* output,
                       const float* route_weights, int64_t hidden_size, bool direct_bf16, bool use_amx,
                       avx512_moe::AmxPackedBLayout amx_b_layout, bool contiguous_route_output, int output_block_begin,
-                      int output_block_end) {
+                      int output_block_end, int intermediate_size) {
   const std::vector<int64_t>& routes = *task.routes;
   const int rows = static_cast<int>(routes.size());
   const uint16_t* expert_w2 = w2 + task.expert * w2_shape.expert_stride;
@@ -526,7 +527,7 @@ void RunExpertW2Range(const ExpertTask& task, ThreadScratch& scratch, const uint
     avx512_moe::ComputeW2Amx(scratch.intermediate, intermediate_stride, expert_w2, expert_route_output, output,
                              output_route_ids, static_cast<int>(hidden_size), rows, w2_shape.k_pad,
                              static_cast<int>(hidden_size), output_block_begin, output_block_end, direct_bf16,
-                             route_weights, amx_b_layout);
+                             route_weights, amx_b_layout, intermediate_size);
   } else {
     avx512_moe::ComputeW2(scratch.intermediate, f_pad, expert_w2, route_output, output, routes.data(),
                           static_cast<int>(hidden_size), rows, w2_shape.k_pad, static_cast<int>(hidden_size),
@@ -538,7 +539,8 @@ void RunExpert(const ExpertTask& task, ThreadScratch& scratch, const uint16_t* i
                int64_t top_k, const uint16_t* w13, const PackedShape& w13_shape, const uint16_t* w2,
                const PackedShape& w2_shape, int f_pad, float* route_output, uint16_t* output,
                const float* route_weights, bool direct_bf16, int silu_poly_degree, bool use_amx,
-               avx512_moe::AmxPackedBLayout amx_b_layout, bool contiguous_route_output, bool use_direct_input) {
+               avx512_moe::AmxPackedBLayout amx_b_layout, bool contiguous_route_output, bool use_direct_input,
+               int intermediate_size) {
   const uint16_t* expert_input = input;
   if (!use_direct_input) {
     GatherExpertInput(task, scratch, input, hidden_size, top_k, w13_shape.k_pad, use_amx);
@@ -548,9 +550,10 @@ void RunExpert(const ExpertTask& task, ThreadScratch& scratch, const uint16_t* i
   // beyond W13's potentially smaller F16-padded feature range.
   const int intermediate_stride = use_amx ? w2_shape.k_pad : f_pad;
   RunExpertW13Range(task, scratch, expert_input, w13, w13_shape, f_pad, intermediate_stride, silu_poly_degree, use_amx,
-                    amx_b_layout, 0, f_pad / 16);
+                    amx_b_layout, static_cast<int>(hidden_size), intermediate_size, 0, f_pad / 16);
   RunExpertW2Range(task, scratch, w2, w2_shape, f_pad, intermediate_stride, route_output, output, route_weights,
-                   hidden_size, direct_bf16, use_amx, amx_b_layout, contiguous_route_output, 0, w2_shape.n_pad / 32);
+                   hidden_size, direct_bf16, use_amx, amx_b_layout, contiguous_route_output, 0, w2_shape.n_pad / 32,
+                   intermediate_size);
 }
 
 }  // namespace
@@ -559,7 +562,7 @@ std::tuple<at::Tensor, int64_t, int64_t, at::Tensor, int64_t, int64_t, int64_t, 
 fused_moe_bf16_tiled_prepare_weights(at::Tensor w13_weight, at::Tensor w2_weight, bool fuse_silu,
                                      std::string backend_name) {
   const ::fused_cpp::moe::MoeBackend& backend = ::fused_cpp::moe::resolve_backend(backend_name, fuse_silu);
-  const bool use_amx = IsAmxBackend(backend);
+  const bool use_amx = IsAmxBackend(backend) || IsAutoX86Backend(backend);
   const avx512_moe::AmxPackedBLayout amx_b_layout = AmxBLayoutForBackend(backend);
   TORCH_CHECK(backend.id == ::fused_cpp::moe::BackendId::kX86Avx512Bf16 || use_amx,
               "x86 fused MoE prepare requires the x86_avx512_bf16 or x86_amx_bf16 backend");
@@ -624,9 +627,10 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input, at::Tensor w13_packed, int64_t
                                 int64_t silu_poly_degree, int64_t gemm_backend, int64_t backend_n_tile,
                                 int64_t weight_window_bytes, c10::optional<at::Tensor> out) {
   const ::fused_cpp::moe::MoeBackend& backend = ::fused_cpp::moe::backend_from_id(gemm_backend);
-  const bool use_amx = IsAmxBackend(backend);
+  const bool auto_x86_backend = IsAutoX86Backend(backend);
+  bool use_amx = IsAmxBackend(backend);
   const avx512_moe::AmxPackedBLayout amx_b_layout = AmxBLayoutForBackend(backend);
-  TORCH_CHECK(backend.id == ::fused_cpp::moe::BackendId::kX86Avx512Bf16 || use_amx,
+  TORCH_CHECK(backend.id == ::fused_cpp::moe::BackendId::kX86Avx512Bf16 || use_amx || auto_x86_backend,
               "x86 fused MoE execution requires x86 AVX-512 or AMX packed weights");
   TORCH_CHECK(backend_n_tile == backend.n_tile(), "backend_n_tile mismatch: weights use ", backend_n_tile,
               ", runtime uses ", backend.n_tile());
@@ -684,11 +688,6 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input, at::Tensor w13_packed, int64_t
        (weighted_top1_mode == WeightedTop1DirectMode::kAuto && num_routes >= automatic_min_routes));
   const bool direct_bf16 = skip_weighted || use_weighted_top1_direct;
   const float* direct_route_weights = use_weighted_top1_direct ? weights_f32.data_ptr<float>() : nullptr;
-  if (!use_amx) {
-    TORCH_CHECK(num_routes <= std::numeric_limits<int32_t>::max() / input.size(1),
-                "route output is too large for the AVX-512 scatter addressing: routes=", num_routes,
-                ", hidden=", input.size(1));
-  }
   std::vector<std::vector<int64_t>> routes(static_cast<size_t>(num_experts));
   for (int64_t flat = 0; flat < num_routes; ++flat) {
     const int64_t expert = ids[flat];
@@ -696,29 +695,61 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input, at::Tensor w13_packed, int64_t
                 ")");
     routes[static_cast<size_t>(expert)].push_back(flat);
   }
-  const bool contiguous_route_output = use_amx && !direct_bf16 && avx512_moe::AmxW2UsesContiguousRouteOutput();
-  std::vector<int64_t> route_output_rows;
-  if (contiguous_route_output) {
-    route_output_rows.resize(static_cast<size_t>(num_routes));
-  }
   std::vector<ExpertTask> tasks;
   int64_t max_rows = 0;
+  int64_t second_max_rows = 0;
   int64_t output_row_begin = 0;
   for (int64_t expert = 0; expert < num_experts; ++expert) {
     const std::vector<int64_t>& expert_routes = routes[static_cast<size_t>(expert)];
     if (!expert_routes.empty()) {
       tasks.push_back(ExpertTask{expert, &expert_routes, output_row_begin});
-      max_rows = std::max<int64_t>(max_rows, expert_routes.size());
-      if (contiguous_route_output) {
-        for (size_t row = 0; row < expert_routes.size(); ++row) {
-          route_output_rows[static_cast<size_t>(expert_routes[row])] = output_row_begin + static_cast<int64_t>(row);
-        }
+      const int64_t task_rows = static_cast<int64_t>(expert_routes.size());
+      if (task_rows > max_rows) {
+        second_max_rows = max_rows;
+        max_rows = task_rows;
+      } else if (task_rows > second_max_rows) {
+        second_max_rows = task_rows;
       }
-      output_row_begin += static_cast<int64_t>(expert_routes.size());
+      output_row_begin += task_rows;
     }
   }
   TORCH_CHECK(max_rows <= std::numeric_limits<int>::max(),
               "one expert has too many routed rows for the x86 kernel: ", max_rows);
+
+  avx512_moe::X86PolicyInput policy_input;
+  policy_input.hidden_size = input.size(1);
+  policy_input.intermediate_size = f_size;
+  policy_input.total_routes = num_routes;
+  policy_input.max_routes = max_rows;
+  policy_input.second_max_routes = second_max_rows;
+  policy_input.active_experts = static_cast<int64_t>(tasks.size());
+  policy_input.requested_threads = num_threads;
+  policy_input.allow_isa_selection = auto_x86_backend;
+  policy_input.avx512_available = avx512_moe::RuntimeSupported();
+  policy_input.amx_available = avx512_moe::AmxRuntimeSupported();
+  policy_input.requested_isa =
+      use_amx ? avx512_moe::X86ExecutionIsa::kAmxBf16 : avx512_moe::X86ExecutionIsa::kAvx512Bf16;
+  const avx512_moe::X86PolicyDecision policy = avx512_moe::ResolveX86Policy(policy_input);
+  use_amx = policy.isa == avx512_moe::X86ExecutionIsa::kAmxBf16;
+  const int64_t execution_threads = policy.execution_threads;
+
+  if (!use_amx) {
+    TORCH_CHECK(num_routes <= std::numeric_limits<int32_t>::max() / input.size(1),
+                "route output is too large for the AVX-512 scatter addressing: routes=", num_routes,
+                ", hidden=", input.size(1));
+  }
+  const bool contiguous_route_output = use_amx && !direct_bf16 && avx512_moe::AmxW2UsesContiguousRouteOutput();
+  std::vector<int64_t> route_output_rows;
+  if (contiguous_route_output) {
+    route_output_rows.resize(static_cast<size_t>(num_routes));
+    for (const ExpertTask& task : tasks) {
+      const std::vector<int64_t>& expert_routes = *task.routes;
+      for (size_t row = 0; row < expert_routes.size(); ++row) {
+        route_output_rows[static_cast<size_t>(expert_routes[row])] = task.output_row_begin + static_cast<int64_t>(row);
+      }
+    }
+  }
+
   // With top-k=1 and only one active expert, routes were appended in flat
   // token order. If H already satisfies AMX's K32 alignment, that gathered
   // matrix is byte-for-byte the original contiguous input, so avoid copying
@@ -734,7 +765,7 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input, at::Tensor w13_packed, int64_t
   }
   if (use_amx) {
     avx512_moe::PrepareAmxJitKernels(jit_row_counts, silu_poly_degree, static_cast<int>(input.size(1)), direct_bf16,
-                                     use_weighted_top1_direct, amx_b_layout);
+                                     use_weighted_top1_direct, amx_b_layout, static_cast<int>(f_size));
   } else {
     avx512_moe::PrepareJitKernels(jit_row_counts, silu_poly_degree, static_cast<int>(input.size(1)), direct_bf16,
                                   use_weighted_top1_direct);
@@ -744,42 +775,32 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input, at::Tensor w13_packed, int64_t
   const int intermediate_stride = use_amx ? w2_shape.k_pad : f_pad;
   const int w13_blocks = f_pad / 16;
   const int w2_blocks = w2_shape.n_pad / 32;
-  int64_t largest_rows = 0;
-  int64_t second_largest_rows = 0;
-  for (const ExpertTask& task : tasks) {
-    const int64_t rows = static_cast<int64_t>(task.routes->size());
-    if (rows > largest_rows) {
-      second_largest_rows = largest_rows;
-      largest_rows = rows;
-    } else if (rows > second_largest_rows) {
-      second_largest_rows = rows;
-    }
-  }
-  const bool route_skewed =
-      second_largest_rows > 0 && largest_rows >= kNsplitTargetRowsPerThread && largest_rows >= 2 * second_largest_rows;
+  const bool route_skewed = policy.route_skewed;
   // Underfilled calls use one cooperative wave. Strongly skewed calls use
   // sorted waves even when every worker could claim a cold expert; balanced
   // calls retain the lower-overhead atomic expert queue.
   const bool use_cooperative_schedule =
-      num_threads > 1 && (static_cast<int64_t>(tasks.size()) < num_threads || route_skewed);
+      execution_threads > 1 && (static_cast<int64_t>(tasks.size()) < execution_threads || route_skewed);
   std::vector<CooperativeWave> cooperative_waves;
   size_t cooperative_scratch_count = 0;
   if (use_cooperative_schedule) {
     const int64_t max_n_parallelism = std::max(w13_blocks, w2_blocks);
     if (route_skewed) {
-      cooperative_waves = BuildCooperativeSchedule(tasks, num_threads, max_n_parallelism);
+      cooperative_waves =
+          BuildCooperativeSchedule(tasks, execution_threads, max_n_parallelism, policy.nsplit_target_rows);
     } else {
       std::vector<size_t> task_indices(tasks.size());
       for (size_t index = 0; index < tasks.size(); ++index) {
         task_indices[index] = index;
       }
-      cooperative_waves.push_back(BuildCooperativeWave(tasks, task_indices, num_threads, max_n_parallelism));
+      cooperative_waves.push_back(BuildCooperativeWave(tasks, task_indices, execution_threads, max_n_parallelism));
     }
     for (const CooperativeWave& wave : cooperative_waves) {
       cooperative_scratch_count = std::max(cooperative_scratch_count, wave.teams.size());
     }
   }
-  const size_t scratch_count = use_cooperative_schedule ? cooperative_scratch_count : static_cast<size_t>(num_threads);
+  const size_t scratch_count =
+      use_cooperative_schedule ? cooperative_scratch_count : static_cast<size_t>(execution_threads);
   std::vector<ThreadScratch> scratches(scratch_count);
   std::vector<int64_t> scratch_logical_rows(scratch_count, max_rows);
   if (use_cooperative_schedule) {
@@ -893,7 +914,8 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input, at::Tensor w13_packed, int64_t
           const BlockRange w13_range = SplitEvenly(w13_blocks, team.threads, assignment.local_tid);
           const uint16_t* expert_input = use_direct_input ? input_pointer : scratch.input;
           RunExpertW13Range(task, scratch, expert_input, w13_pointer, w13_shape, f_pad, intermediate_stride,
-                            silu_poly_degree, use_amx, amx_b_layout, static_cast<int>(w13_range.begin),
+                            silu_poly_degree, use_amx, amx_b_layout, static_cast<int>(input.size(1)),
+                            static_cast<int>(f_size), static_cast<int>(w13_range.begin),
                             static_cast<int>(w13_range.end));
           if (!barrier.Wait()) {
             return;
@@ -902,7 +924,8 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input, at::Tensor w13_packed, int64_t
           const BlockRange w2_range = SplitEvenly(w2_blocks, team.threads, assignment.local_tid);
           RunExpertW2Range(task, scratch, w2_pointer, w2_shape, f_pad, intermediate_stride, route_output_pointer,
                            output_pointer, direct_route_weights, input.size(1), direct_bf16, use_amx, amx_b_layout,
-                           contiguous_route_output, static_cast<int>(w2_range.begin), static_cast<int>(w2_range.end));
+                           contiguous_route_output, static_cast<int>(w2_range.begin), static_cast<int>(w2_range.end),
+                           static_cast<int>(f_size));
         } catch (...) {
           barrier.Cancel();
           throw;
@@ -911,7 +934,7 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input, at::Tensor w13_packed, int64_t
     }
   } else {
     std::atomic<size_t> next_task{0};
-    RunThreads(num_threads, [&](int64_t tid) {
+    RunThreads(execution_threads, [&](int64_t tid) {
       while (true) {
         const size_t index = next_task.fetch_add(1, std::memory_order_relaxed);
         if (index >= tasks.size()) {
@@ -919,14 +942,15 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input, at::Tensor w13_packed, int64_t
         }
         RunExpert(tasks[index], scratches[static_cast<size_t>(tid)], input_pointer, input.size(1), top_k, w13_pointer,
                   w13_shape, w2_pointer, w2_shape, f_pad, route_output_pointer, output_pointer, direct_route_weights,
-                  direct_bf16, silu_poly_degree, use_amx, amx_b_layout, contiguous_route_output, use_direct_input);
+                  direct_bf16, silu_poly_degree, use_amx, amx_b_layout, contiguous_route_output, use_direct_input,
+                  static_cast<int>(f_size));
       }
     });
   }
 
   if (!direct_bf16) {
     const float* weights = weights_f32.data_ptr<float>();
-    const int64_t merge_threads = std::min(num_threads, num_tokens);
+    const int64_t merge_threads = std::min(execution_threads, num_tokens);
     RunThreads(merge_threads, [&](int64_t tid) {
       const int64_t begin = num_tokens * tid / merge_threads;
       const int64_t end = num_tokens * (tid + 1) / merge_threads;
