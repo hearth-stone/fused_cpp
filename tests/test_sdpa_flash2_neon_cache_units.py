@@ -16,8 +16,7 @@
 依赖：
 
 * ``fused_cpp._C`` 必须可用（用 :func:`pytest.importorskip` 守卫）；
-* 平台不要求是 AArch64：``__aarch64__`` 未定义时本测试验证的是 fallback
-  标量路径，**仍应通过等价性断言**（与 NEON 路径在容差内一致）。
+* cache-aware 微内核只在 AArch64 构建；其它架构在模块级跳过本文件。
 """
 
 from __future__ import annotations
@@ -33,6 +32,7 @@ pytest.importorskip("fused_cpp._C")
 
 import torch  # noqa: E402  在 importorskip 之后导入
 
+from fused_cpp import _C  # noqa: E402
 from fused_cpp.sdpa_registry import get_sdpa_version  # noqa: E402
 
 from tests.conftest import (  # noqa: E402
@@ -42,6 +42,9 @@ from tests.conftest import (  # noqa: E402
 
 
 VERSION_NAME = "flash2_neon_cache"
+
+if VERSION_NAME not in _C.list_sdpa_versions():
+    pytest.skip("ARM cache-aware SDPA is not built on this architecture", allow_module_level=True)
 
 
 # ── 工具 ─────────────────────────────────────────────────────────────

@@ -202,6 +202,10 @@
 
 ## 已完成（参 SDPA_VERSIONS.md 的 Changelog）
 
+- ✅ **x86 构建短路 ARM-only SDPA 源与绑定** —— 2026-07-26
+  - 非 AArch64 构建不再实例化 cache/L3KV NEON microkernel 与 llama.cpp bridge、C++ MQA 或 sparse MLA
+  - Python registry 只登记 `_C` 实际报告的版本；MQA / sparse MLA 自动走 PyTorch fallback
+  - 增加 x86 扩展 surface 测试，ARM 专项测试按 capability 在模块级跳过
 - ✅ **P0: QKᵀ-fp32 重写为 4×4 双向分块（`MK_QkUblock4` trait）** —— 2026-05-23
   - 新增 `gemm_qkt_microkernel_8x8_fp32_ublock4`：8×8 输出切 4 个 4×4 子块，每块 16 个独立 fp32 累加器外积扇出 + vpaddq 树 reduce，把 ILP 从 1 条链拉到 16 条独立 fma 链
   - 不需要 K 转置或 pre-pack；Q/K 仍按行连续 vld1q_f32 加载

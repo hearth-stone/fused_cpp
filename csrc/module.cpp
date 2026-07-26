@@ -7,6 +7,14 @@
 
 #include "deepseek_v4_q_norm_rope_sve.h"
 
+#ifndef FUSED_CPP_HAS_ARM_SDPA
+#if defined(__aarch64__)
+#define FUSED_CPP_HAS_ARM_SDPA 1
+#else
+#define FUSED_CPP_HAS_ARM_SDPA 0
+#endif
+#endif
+
 // Forward declarations — implementations in separate .cpp files
 at::Tensor rms_norm(at::Tensor x, at::Tensor weight, double eps);
 at::Tensor apply_rope(at::Tensor x, at::Tensor cos_sin_cache, at::Tensor positions, bool is_neox_style);
@@ -31,19 +39,15 @@ at::Tensor scaled_dot_product_attention(at::Tensor query, at::Tensor key, at::Te
 at::Tensor scaled_dot_product_attention_versioned(at::Tensor query, at::Tensor key, at::Tensor value,
                                                   c10::optional<at::Tensor> attn_mask, double dropout_p, bool is_causal,
                                                   c10::optional<double> scale, bool enable_gqa, std::string version);
+std::vector<std::string> list_sdpa_versions();
+
+#if FUSED_CPP_HAS_ARM_SDPA
 at::Tensor multi_query_attention(at::Tensor query, at::Tensor key, at::Tensor value,
                                  c10::optional<at::Tensor> attn_mask, double dropout_p, bool is_causal,
                                  c10::optional<double> scale);
-std::vector<std::string> list_sdpa_versions();
 std::map<std::string, double> validate_sdpa_flash2_neon_cache_microkernels(std::string dtype, int64_t E, int64_t Sk);
 std::map<std::string, double> benchmark_sdpa_flash2_neon_cache_microkernels(std::string dtype, int64_t E, int64_t Sk,
                                                                             int64_t iterations, int64_t warmup);
-
-// 微内核管理框架 — 见 csrc/sdpa_microkernels/mk_registry.cpp
-std::vector<std::string> list_microkernel_impls();
-std::map<std::string, double> validate_microkernel(std::string impl, std::string dtype, int64_t E, int64_t Sk);
-std::map<std::string, double> benchmark_microkernel(std::string impl, std::string dtype, int64_t E, int64_t Sk,
-                                                    int64_t iterations, int64_t warmup);
 
 // 微内核管理框架 — 见 csrc/sdpa_microkernels/mk_registry.cpp
 std::vector<std::string> list_microkernel_impls();
@@ -54,6 +58,7 @@ py::object flash_mla_sparse_fwd(at::Tensor q, at::Tensor kv, at::Tensor indices,
                                 c10::optional<int64_t> d_v, c10::optional<at::Tensor> attn_sink,
                                 c10::optional<at::Tensor> topk_length, c10::optional<at::Tensor> out,
                                 bool return_stats);
+#endif
 at::Tensor sparse_attn_indexer_prefill_cpp_v0(at::Tensor q_quant, at::Tensor weights, at::Tensor kv_cache,
                                               at::Tensor topk_indices_buffer, int64_t topk_tokens,
                                               py::object attn_metadata);
@@ -263,12 +268,13 @@ PYBIND11_MODULE(_C, m) {
         py::arg("attn_mask") = c10::nullopt, py::arg("dropout_p") = 0.0, py::arg("is_causal") = false,
         py::arg("scale") = c10::nullopt, py::arg("enable_gqa") = false, py::arg("version"));
 
+  m.def("list_sdpa_versions", &list_sdpa_versions, "Return the list of registered SDPA version names");
+
+#if FUSED_CPP_HAS_ARM_SDPA
   m.def("multi_query_attention", &multi_query_attention, "Dense MQA attention with shared single-head K/V",
         py::arg("query"), py::arg("key"), py::arg("value"), py::arg("attn_mask") = c10::nullopt,
         py::arg("dropout_p") = 0.0, py::arg("is_causal") = false, py::arg("scale") = c10::nullopt,
         py::call_guard<py::gil_scoped_release>());
-
-  m.def("list_sdpa_versions", &list_sdpa_versions, "Return the list of registered SDPA version names");
 
   m.def("validate_sdpa_flash2_neon_cache_microkernels", &validate_sdpa_flash2_neon_cache_microkernels,
         "Validate flash2_neon_cache QKT/PV micro-kernels against scalar references.", py::arg("dtype") = "bf16",
@@ -302,6 +308,7 @@ PYBIND11_MODULE(_C, m) {
         py::arg("q"), py::arg("kv"), py::arg("indices"), py::arg("sm_scale"), py::arg("d_v") = c10::nullopt,
         py::arg("attn_sink") = c10::nullopt, py::arg("topk_length") = c10::nullopt, py::arg("out") = c10::nullopt,
         py::arg("return_stats") = false, py::call_guard<py::gil_scoped_release>());
+#endif
 
   m.def("sparse_attn_indexer_prefill_cpp_v0", &sparse_attn_indexer_prefill_cpp_v0,
         "Deprecated DeepSeek V4 sparse attention indexer prefill implementation. "

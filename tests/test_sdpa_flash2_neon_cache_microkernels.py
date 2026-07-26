@@ -11,6 +11,9 @@ pytest.importorskip("fused_cpp._C")
 
 from fused_cpp import _C  # noqa: E402
 
+if not hasattr(_C, "validate_sdpa_flash2_neon_cache_microkernels"):
+    pytest.skip("ARM SDPA microkernels are not built on this architecture", allow_module_level=True)
+
 
 @pytest.mark.equiv
 @pytest.mark.parametrize("dtype", ["fp32", "bf16"], ids=["fp32", "bf16"])

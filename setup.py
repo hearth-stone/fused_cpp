@@ -391,6 +391,20 @@ all_cpp_sources = sorted(glob.glob("csrc/**/*.cpp", recursive=True))
 moe_source_prefix = os.path.join("csrc", "moe") + os.sep
 sources = [source for source in all_cpp_sources if not source.startswith(moe_source_prefix)]
 moe_sources = [source for source in all_cpp_sources if source.startswith(moe_source_prefix)]
+arm_sdpa_only_sources = {
+    os.path.normpath(source)
+    for source in (
+        "csrc/llamacpp_sdpa_api.cpp",
+        "csrc/mqa_attention.cpp",
+        "csrc/sdpa_flash2_neon_cache.cpp",
+        "csrc/sdpa_flash2_neon_l3kv.cpp",
+        "csrc/sdpa_flash2_neon_l3kv_packqkv.cpp",
+        "csrc/sdpa_flash2_neon_l3kv_packv.cpp",
+        "csrc/sdpa_microkernels/mk_registry.cpp",
+        "csrc/sdpa_microkernels/neon_cache_benchmark.cpp",
+        "csrc/sparse_mla.cpp",
+    )
+}
 bf16gemm_c_sources = []
 bf16gemm_asm_sources = []
 i8gemm_c_sources = []
@@ -407,6 +421,11 @@ if is_aarch64:
         moe_sources = [source for source in moe_sources if os.path.join("arm", "sve_bf16") not in source]
 else:
     moe_sources = [source for source in moe_sources if os.path.join("moe", "arm") not in source]
+    # These translation units instantiate ARM NEON/BF16 microkernel traits.
+    # Omitting them is preferable to compiling partial scalar stubs on x86:
+    # Python MQA/sparse-MLA wrappers already fall back when their bindings are
+    # absent, while portable SDPA versions remain available in the main module.
+    sources = [source for source in sources if os.path.normpath(source) not in arm_sdpa_only_sources]
 
 omp_available, omp_compile_args, omp_link_args = _detect_openmp()
 
@@ -423,6 +442,7 @@ extra_link_args = []
 include_dirs = ["csrc"]
 library_dirs = []
 define_macros = []
+define_macros.append(("FUSED_CPP_HAS_ARM_SDPA", "1" if is_aarch64 else "0"))
 
 bf16gemm_workspace = os.path.abspath("refs/i8gemm")
 bf16gemm_lib = os.path.join(bf16gemm_workspace, "lib")

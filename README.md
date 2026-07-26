@@ -274,6 +274,13 @@ the absolute install-name `/opt/llvm-openmp/lib/libomp.dylib`, which keeps
 the extension and PyTorch sharing a single OpenMP runtime and avoids
 `OMP: Error #15` at import time.
 
+On non-AArch64 hosts, `setup.py` omits the ARM-only cache/L3KV SDPA
+microkernels and llama.cpp bridge, C++ MQA, and sparse-MLA translation units.
+Their `_C` bindings are intentionally absent, so the Python MQA and sparse-MLA
+wrappers use their PyTorch fallbacks. Portable SDPA versions (`naive`,
+`flash1`, `flash2`, and the scalar fallback of `flash2_neon`) remain
+registered.
+
 ## License
 
 See the project root for license details.

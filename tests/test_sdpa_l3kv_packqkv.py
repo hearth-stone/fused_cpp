@@ -29,6 +29,9 @@ from tests.conftest import (  # noqa: E402
 
 VERSION_NAME = "flash2_neon_l3kv_packqkv"
 
+if VERSION_NAME not in _C.list_sdpa_versions():
+    pytest.skip("ARM L3KV SDPA is not built on this architecture", allow_module_level=True)
+
 
 def _registered_or_skip():
     if VERSION_NAME not in _C.list_sdpa_versions():

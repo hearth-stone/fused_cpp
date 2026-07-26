@@ -351,7 +351,7 @@ _CPP_VERSION_META: dict = {
             "micro-kernels, double-buffered software prefetch and "
             "OpenMP (b, n, q_tile) collapse(3). Two-stage GEMM precision "
             "split: bf16 BFMMLA for Q*K^T, fp32 FMLA + V widen for P_hat*V. "
-            "Falls back to scalar C++ on non-AArch64 platforms."
+            "Built only on AArch64 platforms."
         ),
         tags=(
             "flash",
@@ -596,9 +596,10 @@ def _register_cpp_versions() -> None:
 
     在模块导入时调用。注册项标记 ``source="cpp"``，能力位按
     :data:`_CPP_DEFAULT_CAPS` + :data:`_CPP_VERSION_META` 合并填充。
-    若 C++ 扩展不可用，仍然按 :data:`_CPP_VERSION_META` 中的 **预声明** 名单
-    占位注册（callable 在实际调用时降级到 Python fallback），以便 macOS 本地
-    无构建产物时也能枚举到 ``naive`` / ``flash1`` / ``flash2`` 这三个名字。
+    若 C++ 扩展可用，只注册 ``_C.list_sdpa_versions()`` 实际报告的名字，
+    从而让架构相关的 source filtering 同步反映到 Python registry。扩展完全
+    不可用时，仍按 :data:`_CPP_VERSION_META` 的预声明名单占位注册，callable
+    在实际调用时降级到 Python fallback。
     """
     if _HAS_CPP_SDPA:
         try:
@@ -609,11 +610,9 @@ def _register_cpp_versions() -> None:
     else:
         cpp_names = []
 
-    # 预声明的 C++ 版本（即使扩展不可用也保留占位）
-    expected = list(_CPP_VERSION_META.keys())
-    union = list(dict.fromkeys(cpp_names + expected))  # 去重保序
+    names = cpp_names if _HAS_CPP_SDPA else list(_CPP_VERSION_META.keys())
 
-    for name in union:
+    for name in names:
         meta = _CPP_VERSION_META.get(name, {})
         register_sdpa_version(
             name,

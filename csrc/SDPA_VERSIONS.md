@@ -67,6 +67,12 @@ flash2_neon_l3kv_packqkv_pbf16pv    ← softmax 直接产出 bf16 P scratch，PV
 
 新增 MK trait 或 SDPA 变体时，注册数量会按笛卡尔积扩张；具体注册位置见每个变体的 `csrc/sdpa_flash2_neon_*.cpp` 末尾。
 
+上述完整列表适用于 AArch64 构建。非 AArch64 构建会在 `setup.py` 中直接
+排除 cache/L3KV microkernel 与 llama.cpp bridge、C++ MQA 和 sparse MLA 的
+ARM-only translation unit，并在 `module.cpp` 中省略对应 Python 绑定；此时
+仍注册可移植的 `naive`、`flash1`、`flash2` 与 `flash2_neon`（后者使用标量
+fallback）。
+
 ---
 
 ## SDPA 顶层变体
@@ -429,7 +435,7 @@ pattern 或 K-load policy。
 
 | 场景 | 推荐版本 | 备注 |
 |---|---|---|
-| 正确性参考 / 跨平台 | `naive` 或 `flash2_neon_cache_scalar` | 性能差，仅做正确性 |
+| 正确性参考 / 跨平台 | `naive` / `flash1` / `flash2` | 性能差，仅做正确性；`flash2_neon_cache_scalar` 仅 AArch64 构建提供 |
 | 短 S（≤ 512） + bf16 | `flash2_neon_l3kv_packv` | bf16 packv +9% 提升 |
 | 短 S + fp32 | `flash2_neon_l3kv_qk_ublock4` | QKᵀ-fp32 重写后预期 ~10× 单核 GFLOPS |
 | Long-context bf16（MLA prefill 等） | `flash2_neon_l3kv_packv` | +4–9%，pack 开销摊薄 |
@@ -447,6 +453,7 @@ pattern 或 K-load policy。
 
 | 日期 | 改动概述 | 受影响文件 |
 |---|---|---|
+| 2026-07-26 | **x86 构建直接短路 ARM-only SDPA**：非 AArch64 的 `setup.py` 排除 cache/L3KV NEON microkernel 与 llama.cpp bridge、C++ MQA 和 sparse MLA translation unit，`module.cpp` 同步省略对应 `_C` 绑定，避免 x86 编译器实例化 ARM BF16/NEON 符号；Python registry 只登记 `_C.list_sdpa_versions()` 实际报告的 C++ 版本，MQA/sparse MLA 自动回退，`naive/flash1/flash2/flash2_neon` 仍可用。ARM 专项测试按 capability 跳过，并新增 x86 extension surface 合约测试。 | 改 `setup.py`、`csrc/module.cpp`、`src/fused_cpp/sdpa.py`、`tests/test_x86_arm_sdpa_build.py`、ARM SDPA 专项测试、`README.md`、`csrc/{SDPA_TODO.md,SDPA_VERSIONS.md}` |
 | 2026-07-26 | **x86 AMX MoE 完成 m1n2 True K-load software pipeline 实验**：W13/W2 新增 cache-key 隔离的 `baseline/pipelined` K32 loop；流水版用 `(TMM2,TMM4,TMM5)` 与 `(TMM3,TMM6,TMM7)` 两组 A/B operand bank，在当前 bank 的 `TDPBF16PS` 前加载下一 bank，并保持原 K 累加顺序与奇偶 tail。C8i8 H4096/F512 五进程重复在 forced-m1n2 M64/512/2048 得到 +0.75%/+0.66%/+0.77% paired median；M2048 PMU 显示 cycles -1.01%、L1D pending-miss cycles -0.90%、memory-bound slots -1.92%，instructions +0.48%。自动 `m2n2/m1n4` 仍快 14%--17%，因此 auto 保持 baseline，流水版仅作显式实验；完整 x86 test file 219 passed。 | 改 `csrc/moe/x86/avx512_bf16/jit_kernels.cpp`、`tests/test_moe_avx512_bf16.py`、`benchmarks/{bench_amx_bf16_patterns.py,README.md}`、`optimizations/fused_moe_avx512/{README.md,TODO.md,manifest.yaml}`、新增 `results/amazon_c8i_8core_amx_k_load_pipeline_20260726.md`、改 `csrc/SDPA_VERSIONS.md` |
 | 2026-07-26 | **x86 AMX MoE 完成 N32 B-side load-hint 优化**：W13/W2 的 A tile 保持 `TILELOADD`，B tile 新增 cache-key 隔离的 `TILELOADD/TILELOADDT1/PREFETCHT0/PREFETCHT1` 路径；在已否决 N64 生产布局后只对 N32 校准自动策略。C8i8 H4096/F512 的 M128-2048 在 1/2/4/8T 上由 `TILELOADDT1` 提升 5.3%~9.7%，M512 counters 显示 L1D pending-miss cycles -5.3%、L1D replacement -80.1%、memory-bound slots -7.9%，且指令数不变；完整 next-panel 软件预取增加 13.7% 指令并使 M512 退化 14.7%~22.9%。因此 auto 以每专家 M=128 为 crossover，小 M 保留 `TILELOADD`，中大 M 使用 `TILELOADDT1`；完整 x86 suite 215 passed/4 skipped。 | 改 `csrc/moe/x86/avx512_bf16/jit_kernels.cpp`、`tests/test_moe_avx512_bf16.py`、`benchmarks/{bench_amx_bf16_patterns.py,README.md}`、`optimizations/fused_moe_avx512/{README.md,TODO.md,manifest.yaml}`、新增 `results/amazon_c8i_8core_amx_b_load_hints_20260726.md`、改 `csrc/SDPA_VERSIONS.md` |
 | 2026-07-26 | **x86 AMX MoE 完成 N64/K32 packed-B 负向实验**：新增显式 backend ID 103 `x86_amx_bf16_n64`，把相邻 N32 block 组成 N64 superblock，并按 K32 存放连续的左右 2 KiB tile；`m1n2/m2n2/m1n4` JIT cache key、奇数 N32 起点、H/F/N tail 与 1/4-thread N-split 均单独覆盖，`auto` 仍固定选择 ID 102 N32。C8i8 H4096/F512 单线程自动 pattern 变化仅 -0.3%~+0.9%，8 线程 M64-2048 反而慢 3.4%~9.3%，因此不维护生产 N64 权重副本，只保留显式实验入口。 | 改 `csrc/moe/{common,x86/avx512_bf16}`、`src/fused_cpp/moe/bf16_tiled.py`、`tests/test_moe_{avx512_bf16,backend_dispatch}.py`；新建 `benchmarks/bench_amx_bf16_layouts.py`；改 `benchmarks/README.md`、`optimizations/fused_moe_avx512/{README.md,TODO.md,manifest.yaml}`、新增 `results/amazon_c8i_8core_amx_n64_layout_20260726.md`、改 `csrc/SDPA_VERSIONS.md` |

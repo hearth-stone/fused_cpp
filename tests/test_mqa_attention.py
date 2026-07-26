@@ -76,5 +76,5 @@ def test_multi_query_attention_rejects_multi_kv_heads() -> None:
     k = torch.randn(1, 2, 5, 8)
     v = torch.randn(1, 2, 5, 4)
 
-    with pytest.raises(RuntimeError, match=r"\[B, S, E\].*\[B, 1, S, E\]"):
+    with pytest.raises((RuntimeError, ValueError), match=r"\[B, S, [DE]\].*\[B, 1, S, [DE]\]"):
         multi_query_attention(q, k, v)

@@ -27,6 +27,9 @@ pytest.importorskip("fused_cpp._C")
 
 from fused_cpp import _C  # noqa: E402
 
+if not hasattr(_C, "list_microkernel_impls"):
+    pytest.skip("ARM SDPA microkernel framework is not built on this architecture", allow_module_level=True)
+
 VALIDATE_OPS = (
     "qkt_8x8_max_abs",
     "qkt_8x4_max_abs",
