@@ -55,7 +55,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("fused_moe_bench_sve_jit_w13_gemm", &fused_moe_bench_sve_jit_w13_gemm,
         "Benchmark only the exact-M SVE JIT GEMM body on packed W13 weights.", py::arg("A"),
         py::arg("w13_packed"), py::arg("K"), py::arg("N"), py::arg("n_tile"), py::arg("n_ranges") = 2,
-        py::arg("warmup") = 64, py::arg("runs") = 192, py::call_guard<py::gil_scoped_release>());
+        py::arg("warmup") = 64, py::arg("runs") = 192, py::arg("probe_mode") = 0,
+        py::call_guard<py::gil_scoped_release>());
 #endif
 
   m.def("fused_moe_bf16_tiled", &fused_moe_bf16_tiled, "Run BF16 tiled fused MoE.", py::arg("input"),

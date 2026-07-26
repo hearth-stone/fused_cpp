@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <csignal>
 #include <cmath>
 #include <condition_variable>
 #include <cstddef>
@@ -5359,7 +5360,7 @@ std::vector<double> fused_moe_bench_team_gemm(at::Tensor A, at::Tensor B, int64_
 // outside the timed region; timed iterations rotate experts to keep B cold.
 std::vector<double> fused_moe_bench_sve_jit_w13_gemm(at::Tensor A, at::Tensor w13_packed, int64_t K, int64_t N,
                                                      int64_t n_tile, int64_t n_ranges, int64_t warmup,
-                                                     int64_t runs) {
+                                                     int64_t runs, int64_t probe_mode) {
 #if !defined(__aarch64__) || !defined(FUSED_CPP_MOE_HAS_ARM_SVE)
   TORCH_CHECK(false, "fused_moe_bench_sve_jit_w13_gemm requires AArch64 SVE");
 #else
@@ -5376,6 +5377,7 @@ std::vector<double> fused_moe_bench_sve_jit_w13_gemm(at::Tensor A, at::Tensor w1
   TORCH_CHECK((N / n_ranges) % n_tile == 0, "each N range must contain whole SVE N tiles");
   TORCH_CHECK(warmup >= 0, "warmup must be non-negative");
   TORCH_CHECK(runs > 0, "runs must be positive");
+  TORCH_CHECK(probe_mode >= 0 && probe_mode <= 9, "probe_mode must be in [0, 9]");
   A = A.contiguous();
   const PackedExperts weights = checked_packed_experts(w13_packed, K, N, "w13_packed", n_tile);
   TORCH_CHECK(weights.E > 0, "w13_packed must contain at least one expert");
@@ -5393,19 +5395,43 @@ std::vector<double> fused_moe_bench_sve_jit_w13_gemm(at::Tensor A, at::Tensor w1
   float* output_ptr = output.data_ptr<float>();
   const uint16_t* weights_ptr = bf16_data_const(weights.tensor);
   const int range_cols = static_cast<int>(N / n_ranges);
+  ::fused_cpp::moe_sve::jit::KernelFn probe_kernel = nullptr;
+  if (probe_mode != 0) {
+    std::string error;
+    probe_kernel = ::fused_cpp::moe_sve::jit::get_probe_kernel(
+        rows, static_cast<::fused_cpp::moe_sve::jit::ProbeMode>(probe_mode), &error);
+    TORCH_CHECK(probe_kernel != nullptr, "failed to generate SVE JIT probe kernel: ", error);
+  }
 
   auto run_one = [&](int64_t iteration) {
     const int64_t expert = iteration % weights.E;
     const uint16_t* packed_b = weights_ptr + expert * weights.packed_stride;
     for (int64_t range = 0; range < n_ranges; ++range) {
       const int n_begin = static_cast<int>(range * range_cols);
-      const bool dispatched = sve_jit_packed_w2_exact_dispatch(
-          packed_a.data(), packed_b, output_ptr + n_begin, rows, static_cast<int>(K), range_cols,
-          static_cast<int>(N), static_cast<int>(N), n_begin);
-      TORCH_CHECK(dispatched, "failed to dispatch plain SVE JIT W13 GEMM");
+      if (probe_kernel != nullptr) {
+        SveKBlockParams p = make_sve_kblock_params(12, static_cast<int>(K), range_cols, static_cast<int>(N),
+                                                   static_cast<int>(N), n_begin, 0);
+        p.gemm.m = rows;
+        probe_kernel(packed_a.data(), packed_b, output_ptr + n_begin, nullptr, &p.gemm);
+      } else {
+        const bool dispatched = sve_jit_packed_w2_exact_dispatch(
+            packed_a.data(), packed_b, output_ptr + n_begin, rows, static_cast<int>(K), range_cols,
+            static_cast<int>(N), static_cast<int>(N), n_begin);
+        TORCH_CHECK(dispatched, "failed to dispatch plain SVE JIT W13 GEMM");
+      }
     }
   };
 
+#if defined(__linux__)
+  const char* stop_after_setup = std::getenv("FUSED_CPP_MOE_BENCH_STOP_AFTER_SETUP");
+  const char* profile_window = std::getenv("FUSED_CPP_MOE_BENCH_PROFILE_WINDOW");
+  const bool stop_before_kernels =
+      (stop_after_setup != nullptr && stop_after_setup[0] != '\0' && stop_after_setup[0] != '0') ||
+      (profile_window != nullptr && profile_window[0] != '\0' && profile_window[0] != '0');
+  if (stop_before_kernels) {
+    std::raise(SIGSTOP);
+  }
+#endif
   for (int64_t iteration = 0; iteration < warmup; ++iteration) {
     run_one(iteration);
   }
@@ -5415,6 +5441,11 @@ std::vector<double> fused_moe_bench_sve_jit_w13_gemm(at::Tensor A, at::Tensor w1
     run_one(iteration + warmup);
     times_ms[static_cast<size_t>(iteration)] = ::fused_cpp::profile::elapsed_ms(begin);
   }
+#if defined(__linux__)
+  if (profile_window != nullptr && profile_window[0] != '\0' && profile_window[0] != '0') {
+    std::raise(SIGSTOP);
+  }
+#endif
   return times_ms;
 #endif
 }

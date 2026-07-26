@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
 import statistics
 import sys
 import time
@@ -24,12 +25,13 @@ from fused_cpp.moe import (  # noqa: E402
 
 
 VARIANT_ENV = {
-    "asm": ("asm", "0", "0", "0"),
-    "jit": ("jit", "0", "0", "0"),
-    "jit-panel": ("jit", "0", "0", "0"),
-    "jit-prefetch": ("jit", "0", "1", "0"),
-    "jit-prefetch-all": ("jit", "0", "0", "1"),
-    "jit-bulk": ("jit", "1", "0", "0"),
+    "asm": ("asm", "0", "0", "0", "0"),
+    "jit": ("jit", "0", "0", "0", "0"),
+    "jit-panel": ("jit", "0", "0", "0", "0"),
+    "jit-prefetch": ("jit", "0", "1", "0", "0"),
+    "jit-prefetch-all": ("jit", "0", "0", "1", "0"),
+    "jit-bulk": ("jit", "1", "0", "0", "0"),
+    "jit-dual-n": ("jit", "0", "0", "0", "1"),
 }
 
 
@@ -53,11 +55,12 @@ def parse_variant_list(value: str) -> tuple[str, ...]:
 
 
 def select_variant(variant: str) -> None:
-    implementation, bulk_m, w13_prefetch, all_gemm_prefetch = VARIANT_ENV[variant]
+    implementation, bulk_m, w13_prefetch, all_gemm_prefetch, dual_n = VARIANT_ENV[variant]
     os.environ["FUSED_CPP_MOE_SVE_IMPL"] = implementation
     os.environ["FUSED_CPP_MOE_SVE_JIT_BULK_M"] = bulk_m
     os.environ["FUSED_CPP_MOE_SVE_W13_FIRST_PANEL_PREFETCH"] = w13_prefetch
     os.environ["FUSED_CPP_MOE_SVE_FIRST_PANEL_PREFETCH"] = all_gemm_prefetch
+    os.environ["FUSED_CPP_MOE_SVE_JIT_M2_DUAL_N"] = dual_n
 
 
 def parse_args() -> argparse.Namespace:
@@ -80,7 +83,7 @@ def parse_args() -> argparse.Namespace:
         "--variants",
         default="asm,jit",
         help=(
-            "comma-separated subset of asm,jit,jit-panel,jit-prefetch,jit-prefetch-all,jit-bulk; "
+            "comma-separated subset of asm,jit,jit-panel,jit-prefetch,jit-prefetch-all,jit-bulk,jit-dual-n; "
             "first variant is the timing baseline"
         ),
     )
@@ -92,6 +95,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--seed", type=int, default=20260720)
     parser.add_argument("--output", type=Path)
+    parser.add_argument(
+        "--profile-calls",
+        type=int,
+        default=0,
+        help="after timing, stop the process and run this many calls for an externally attached profiler",
+    )
+    parser.add_argument(
+        "--profile-variant",
+        choices=tuple(VARIANT_ENV),
+        default="jit",
+        help="variant used by --profile-calls",
+    )
     return parser.parse_args()
 
 
@@ -123,6 +138,8 @@ def main() -> int:
         raise ValueError("shape, expert, and run counts must be positive")
     if args.warmup < 0:
         raise ValueError("warmup must be non-negative")
+    if args.profile_calls < 0:
+        raise ValueError("profile-calls must be non-negative")
     if args.experts < 2 * args.measurement_experts:
         raise ValueError("experts must provide at least two disjoint measurement windows")
     if args.measurement_experts % args.experts_per_wave != 0:
@@ -268,6 +285,19 @@ def main() -> int:
                 f"T/expert={threads:<3} total_T={total_threads:<3} "
                 f"{timings} gains[{baseline}] {relative}"
             )
+
+            if args.profile_calls:
+                if len(routes_values) != 1 or len(thread_values) != 1:
+                    raise ValueError("profile-calls requires exactly one route and thread point")
+                select_variant(args.profile_variant)
+                print(
+                    f"profile_ready variant={args.profile_variant} calls={args.profile_calls}",
+                    flush=True,
+                )
+                os.kill(os.getpid(), signal.SIGSTOP)
+                for iteration in range(args.profile_calls):
+                    output = calls[iteration % len(calls)]()
+                    sink ^= int(output.view(torch.int16)[0, 0])
 
     payload = {
         "schema_version": 1,

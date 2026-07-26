@@ -19,6 +19,19 @@ enum class Operation : uint8_t {
   kW2Direct,
 };
 
+enum class ProbeMode : uint8_t {
+  kNone,
+  kBOnly,
+  kBAOnly,
+  kBFMMLAOnly,
+  kFullNoStore,
+  kFullWithStore,
+  kAOnly,
+  kControlOnly,
+  kBAFixedA,
+  kFullNoStoreFixedA,
+};
+
 using KernelFn = void (*)(const uint16_t*, const uint16_t*, void*, const void*, const gemm_params_t*);
 
 bool built();
@@ -29,6 +42,9 @@ const void* silu_constants();
 // Returned code remains executable until process shutdown. Generation and cache
 // lookup are thread-safe; `error` is populated when no JIT kernel is available.
 KernelFn get_kernel(Operation operation, int rows, int degree, std::string* error);
+// Benchmark-only variants of the M1/M2 W2 kernel. They retain the production
+// loop structure while selectively executing A/B loads, BFMMLA, and stores.
+KernelFn get_probe_kernel(int rows, ProbeMode mode, std::string* error);
 // Exact-M kernel with an operation-specific streaming hint ahead of each cold
 // B cache-line load. The caller is responsible for using it only on the first
 // M panel of a weight range; later panels should use get_kernel().

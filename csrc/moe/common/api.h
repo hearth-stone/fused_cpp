@@ -25,7 +25,8 @@ at::Tensor fused_moe_test_team_gemm(at::Tensor A, at::Tensor B, int64_t group_si
 std::vector<double> fused_moe_bench_team_gemm(at::Tensor A, at::Tensor B, int64_t group_size, std::string split,
                                               c10::optional<at::Tensor> bias, int64_t warmup, int64_t runs);
 std::vector<double> fused_moe_bench_sve_jit_w13_gemm(at::Tensor A, at::Tensor w13_packed, int64_t K, int64_t N,
-                                                     int64_t n_tile, int64_t n_ranges, int64_t warmup, int64_t runs);
+                                                     int64_t n_tile, int64_t n_ranges, int64_t warmup, int64_t runs,
+                                                     int64_t probe_mode);
 std::vector<double> fused_moe_bench_fused_w13_silu_packc_tail(at::Tensor A, at::Tensor w13, int64_t degree,
                                                               int64_t mode, int64_t warmup, int64_t runs);
 #endif
