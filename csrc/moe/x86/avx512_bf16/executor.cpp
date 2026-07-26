@@ -26,6 +26,16 @@ namespace {
 
 namespace avx512_moe = ::fused_cpp::moe::x86::avx512_bf16;
 
+bool IsAmxBackend(const ::fused_cpp::moe::MoeBackend& backend) {
+  return backend.id == ::fused_cpp::moe::BackendId::kX86AmxBf16 ||
+         backend.id == ::fused_cpp::moe::BackendId::kX86AmxBf16N64;
+}
+
+avx512_moe::AmxPackedBLayout AmxBLayoutForBackend(const ::fused_cpp::moe::MoeBackend& backend) {
+  return backend.id == ::fused_cpp::moe::BackendId::kX86AmxBf16N64 ? avx512_moe::AmxPackedBLayout::kN64K32
+                                                                   : avx512_moe::AmxPackedBLayout::kN32;
+}
+
 struct PackedShape {
   at::Tensor tensor;
   int64_t experts = 0;
@@ -484,12 +494,14 @@ void GatherExpertInput(const ExpertTask& task, ThreadScratch& scratch, const uin
 
 void RunExpertW13Range(const ExpertTask& task, ThreadScratch& scratch, const uint16_t* expert_input,
                        const uint16_t* w13, const PackedShape& w13_shape, int f_pad, int intermediate_stride,
-                       int silu_poly_degree, bool use_amx, int feature_block_begin, int feature_block_end) {
+                       int silu_poly_degree, bool use_amx, avx512_moe::AmxPackedBLayout amx_b_layout,
+                       int feature_block_begin, int feature_block_end) {
   const int rows = static_cast<int>(task.routes->size());
   const uint16_t* expert_w13 = w13 + task.expert * w13_shape.expert_stride;
   if (use_amx) {
     avx512_moe::ComputeW13Amx(expert_input, w13_shape.k_pad, expert_w13, scratch.intermediate, intermediate_stride,
-                              rows, w13_shape.k_pad, feature_block_begin, feature_block_end, silu_poly_degree);
+                              rows, w13_shape.k_pad, feature_block_begin, feature_block_end, silu_poly_degree,
+                              amx_b_layout);
   } else {
     avx512_moe::ComputeW13(expert_input, w13_shape.k_pad, expert_w13, scratch.intermediate, f_pad, rows,
                            w13_shape.k_pad, feature_block_begin, feature_block_end, silu_poly_degree);
@@ -499,7 +511,8 @@ void RunExpertW13Range(const ExpertTask& task, ThreadScratch& scratch, const uin
 void RunExpertW2Range(const ExpertTask& task, ThreadScratch& scratch, const uint16_t* w2, const PackedShape& w2_shape,
                       int f_pad, int intermediate_stride, float* route_output, uint16_t* output,
                       const float* route_weights, int64_t hidden_size, bool direct_bf16, bool use_amx,
-                      bool contiguous_route_output, int output_block_begin, int output_block_end) {
+                      avx512_moe::AmxPackedBLayout amx_b_layout, bool contiguous_route_output, int output_block_begin,
+                      int output_block_end) {
   const std::vector<int64_t>& routes = *task.routes;
   const int rows = static_cast<int>(routes.size());
   const uint16_t* expert_w2 = w2 + task.expert * w2_shape.expert_stride;
@@ -513,7 +526,7 @@ void RunExpertW2Range(const ExpertTask& task, ThreadScratch& scratch, const uint
     avx512_moe::ComputeW2Amx(scratch.intermediate, intermediate_stride, expert_w2, expert_route_output, output,
                              output_route_ids, static_cast<int>(hidden_size), rows, w2_shape.k_pad,
                              static_cast<int>(hidden_size), output_block_begin, output_block_end, direct_bf16,
-                             route_weights);
+                             route_weights, amx_b_layout);
   } else {
     avx512_moe::ComputeW2(scratch.intermediate, f_pad, expert_w2, route_output, output, routes.data(),
                           static_cast<int>(hidden_size), rows, w2_shape.k_pad, static_cast<int>(hidden_size),
@@ -525,7 +538,7 @@ void RunExpert(const ExpertTask& task, ThreadScratch& scratch, const uint16_t* i
                int64_t top_k, const uint16_t* w13, const PackedShape& w13_shape, const uint16_t* w2,
                const PackedShape& w2_shape, int f_pad, float* route_output, uint16_t* output,
                const float* route_weights, bool direct_bf16, int silu_poly_degree, bool use_amx,
-               bool contiguous_route_output, bool use_direct_input) {
+               avx512_moe::AmxPackedBLayout amx_b_layout, bool contiguous_route_output, bool use_direct_input) {
   const uint16_t* expert_input = input;
   if (!use_direct_input) {
     GatherExpertInput(task, scratch, input, hidden_size, top_k, w13_shape.k_pad, use_amx);
@@ -535,9 +548,9 @@ void RunExpert(const ExpertTask& task, ThreadScratch& scratch, const uint16_t* i
   // beyond W13's potentially smaller F16-padded feature range.
   const int intermediate_stride = use_amx ? w2_shape.k_pad : f_pad;
   RunExpertW13Range(task, scratch, expert_input, w13, w13_shape, f_pad, intermediate_stride, silu_poly_degree, use_amx,
-                    0, f_pad / 16);
+                    amx_b_layout, 0, f_pad / 16);
   RunExpertW2Range(task, scratch, w2, w2_shape, f_pad, intermediate_stride, route_output, output, route_weights,
-                   hidden_size, direct_bf16, use_amx, contiguous_route_output, 0, w2_shape.n_pad / 32);
+                   hidden_size, direct_bf16, use_amx, amx_b_layout, contiguous_route_output, 0, w2_shape.n_pad / 32);
 }
 
 }  // namespace
@@ -546,8 +559,9 @@ std::tuple<at::Tensor, int64_t, int64_t, at::Tensor, int64_t, int64_t, int64_t, 
 fused_moe_bf16_tiled_prepare_weights(at::Tensor w13_weight, at::Tensor w2_weight, bool fuse_silu,
                                      std::string backend_name) {
   const ::fused_cpp::moe::MoeBackend& backend = ::fused_cpp::moe::resolve_backend(backend_name, fuse_silu);
-  TORCH_CHECK(backend.id == ::fused_cpp::moe::BackendId::kX86Avx512Bf16 ||
-                  backend.id == ::fused_cpp::moe::BackendId::kX86AmxBf16,
+  const bool use_amx = IsAmxBackend(backend);
+  const avx512_moe::AmxPackedBLayout amx_b_layout = AmxBLayoutForBackend(backend);
+  TORCH_CHECK(backend.id == ::fused_cpp::moe::BackendId::kX86Avx512Bf16 || use_amx,
               "x86 fused MoE prepare requires the x86_avx512_bf16 or x86_amx_bf16 backend");
   TORCH_CHECK(fuse_silu, backend.name, " requires fuse_silu=True");
   CheckBf16Cpu(w13_weight, "w13_weight");
@@ -583,12 +597,18 @@ fused_moe_bf16_tiled_prepare_weights(at::Tensor w13_weight, at::Tensor w2_weight
   const int64_t prepack_threads = ResolvePrepackThreads(experts);
   RunThreads(prepack_threads, [&](int64_t tid) {
     for (int64_t expert = tid; expert < experts; expert += prepack_threads) {
-      avx512_moe::PackW13(w13_source + expert * 2 * f_size * hidden_size,
-                          w13_destination + expert * static_cast<int64_t>(k13_pad) * n13_pad, f_size, hidden_size,
-                          k13_pad, f_pad);
-      avx512_moe::PackW2(w2_source + expert * hidden_size * f_size,
-                         w2_destination + expert * static_cast<int64_t>(k2_pad) * n2_pad, hidden_size, f_size, k2_pad,
-                         n2_pad);
+      uint16_t* packed_w13 = w13_destination + expert * static_cast<int64_t>(k13_pad) * n13_pad;
+      uint16_t* packed_w2 = w2_destination + expert * static_cast<int64_t>(k2_pad) * n2_pad;
+      if (amx_b_layout == avx512_moe::AmxPackedBLayout::kN64K32) {
+        avx512_moe::PackW13N64(w13_source + expert * 2 * f_size * hidden_size, packed_w13, f_size, hidden_size, k13_pad,
+                               f_pad);
+        avx512_moe::PackW2N64(w2_source + expert * hidden_size * f_size, packed_w2, hidden_size, f_size, k2_pad,
+                              n2_pad);
+      } else {
+        avx512_moe::PackW13(w13_source + expert * 2 * f_size * hidden_size, packed_w13, f_size, hidden_size, k13_pad,
+                            f_pad);
+        avx512_moe::PackW2(w2_source + expert * hidden_size * f_size, packed_w2, hidden_size, f_size, k2_pad, n2_pad);
+      }
     }
   });
 
@@ -604,7 +624,8 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input, at::Tensor w13_packed, int64_t
                                 int64_t silu_poly_degree, int64_t gemm_backend, int64_t backend_n_tile,
                                 int64_t weight_window_bytes, c10::optional<at::Tensor> out) {
   const ::fused_cpp::moe::MoeBackend& backend = ::fused_cpp::moe::backend_from_id(gemm_backend);
-  const bool use_amx = backend.id == ::fused_cpp::moe::BackendId::kX86AmxBf16;
+  const bool use_amx = IsAmxBackend(backend);
+  const avx512_moe::AmxPackedBLayout amx_b_layout = AmxBLayoutForBackend(backend);
   TORCH_CHECK(backend.id == ::fused_cpp::moe::BackendId::kX86Avx512Bf16 || use_amx,
               "x86 fused MoE execution requires x86 AVX-512 or AMX packed weights");
   TORCH_CHECK(backend_n_tile == backend.n_tile(), "backend_n_tile mismatch: weights use ", backend_n_tile,
@@ -713,7 +734,7 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input, at::Tensor w13_packed, int64_t
   }
   if (use_amx) {
     avx512_moe::PrepareAmxJitKernels(jit_row_counts, silu_poly_degree, static_cast<int>(input.size(1)), direct_bf16,
-                                     use_weighted_top1_direct);
+                                     use_weighted_top1_direct, amx_b_layout);
   } else {
     avx512_moe::PrepareJitKernels(jit_row_counts, silu_poly_degree, static_cast<int>(input.size(1)), direct_bf16,
                                   use_weighted_top1_direct);
@@ -872,7 +893,7 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input, at::Tensor w13_packed, int64_t
           const BlockRange w13_range = SplitEvenly(w13_blocks, team.threads, assignment.local_tid);
           const uint16_t* expert_input = use_direct_input ? input_pointer : scratch.input;
           RunExpertW13Range(task, scratch, expert_input, w13_pointer, w13_shape, f_pad, intermediate_stride,
-                            silu_poly_degree, use_amx, static_cast<int>(w13_range.begin),
+                            silu_poly_degree, use_amx, amx_b_layout, static_cast<int>(w13_range.begin),
                             static_cast<int>(w13_range.end));
           if (!barrier.Wait()) {
             return;
@@ -880,7 +901,7 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input, at::Tensor w13_packed, int64_t
 
           const BlockRange w2_range = SplitEvenly(w2_blocks, team.threads, assignment.local_tid);
           RunExpertW2Range(task, scratch, w2_pointer, w2_shape, f_pad, intermediate_stride, route_output_pointer,
-                           output_pointer, direct_route_weights, input.size(1), direct_bf16, use_amx,
+                           output_pointer, direct_route_weights, input.size(1), direct_bf16, use_amx, amx_b_layout,
                            contiguous_route_output, static_cast<int>(w2_range.begin), static_cast<int>(w2_range.end));
         } catch (...) {
           barrier.Cancel();
@@ -898,7 +919,7 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input, at::Tensor w13_packed, int64_t
         }
         RunExpert(tasks[index], scratches[static_cast<size_t>(tid)], input_pointer, input.size(1), top_k, w13_pointer,
                   w13_shape, w2_pointer, w2_shape, f_pad, route_output_pointer, output_pointer, direct_route_weights,
-                  direct_bf16, silu_poly_degree, use_amx, contiguous_route_output, use_direct_input);
+                  direct_bf16, silu_poly_degree, use_amx, amx_b_layout, contiguous_route_output, use_direct_input);
       }
     });
   }

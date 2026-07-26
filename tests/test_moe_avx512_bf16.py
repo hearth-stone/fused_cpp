@@ -22,6 +22,12 @@ requires_amx = pytest.mark.skipif(
     reason="requires an AMX BF16 CPU, Linux XTILEDATA permission, and Xbyak",
 )
 
+requires_amx_n64 = pytest.mark.skipif(
+    platform.machine() not in ("x86_64", "AMD64")
+    or "x86_amx_bf16_n64" not in available_fused_moe_bf16_tiled_backends(),
+    reason="requires the experimental AMX BF16 N64 packed layout",
+)
+
 
 def _case(
     *,
@@ -720,6 +726,102 @@ def test_amx_patterns_match_naive_through_large_m(
     _assert_bf16_close(actual, expected)
 
 
+@requires_amx_n64
+@pytest.mark.parametrize(
+    ("pattern", "routes"),
+    [
+        pytest.param("m1n2", 17, id="m1n2"),
+        pytest.param("m2n2", 33, id="m2n2"),
+        pytest.param("m1n4", 77, id="m1n4"),
+    ],
+)
+@pytest.mark.parametrize("num_threads", [1, 4], ids=["one-thread", "four-threads"])
+def test_amx_n64_layout_matches_n32_and_naive_with_cache_isolation(
+    monkeypatch: pytest.MonkeyPatch,
+    pattern: str,
+    routes: int,
+    num_threads: int,
+) -> None:
+    """N32/N64 packed objects may alternate while every AMX pattern preserves tails and N-split ranges."""
+    monkeypatch.setenv("FUSED_CPP_MOE_AMX_PATTERN", pattern)
+    inputs, w13, w2, topk_weights, topk_ids = _case(
+        tokens=routes,
+        hidden=67,
+        intermediate=35,
+        experts=1,
+        top_k=1,
+        seed=900 + routes,
+    )
+    packed_n32 = prepare_fused_moe_bf16_tiled_weights(
+        w13,
+        w2,
+        fuse_silu=True,
+        backend="x86_amx_bf16",
+    )
+    packed_n64 = prepare_fused_moe_bf16_tiled_weights(
+        w13,
+        w2,
+        fuse_silu=True,
+        backend="x86_amx_bf16_n64",
+    )
+    assert packed_n64.gemm_backend == 103
+    assert packed_n64.backend_name == "x86_amx_bf16_n64"
+    expected = fused_moe_naive(inputs, w13, w2, topk_weights, topk_ids)
+
+    for packed in (packed_n32, packed_n64, packed_n32, packed_n64):
+        actual = fused_moe_bf16_tiled(
+            inputs,
+            packed,
+            topk_weights,
+            topk_ids,
+            num_threads=num_threads,
+        )
+        _assert_bf16_close(actual, expected)
+
+
+@requires_amx
+@pytest.mark.parametrize(
+    ("pattern", "routes"),
+    [
+        pytest.param("m1n2", 17, id="m1n2"),
+        pytest.param("m2n2", 33, id="m2n2"),
+        pytest.param("m1n4", 77, id="m1n4"),
+    ],
+)
+def test_amx_n32_b_load_hints_match_tileloadd_with_cache_isolation(
+    monkeypatch: pytest.MonkeyPatch,
+    pattern: str,
+    routes: int,
+) -> None:
+    """Every N32 B-load hint must preserve exact output while occupying a distinct JIT cache entry."""
+    monkeypatch.setenv("FUSED_CPP_MOE_AMX_PATTERN", pattern)
+    inputs, w13, w2, topk_weights, topk_ids = _case(
+        tokens=routes,
+        hidden=129,
+        intermediate=65,
+        experts=1,
+        top_k=1,
+        seed=925 + routes,
+    )
+    packed = prepare_fused_moe_bf16_tiled_weights(
+        w13,
+        w2,
+        fuse_silu=True,
+        backend="x86_amx_bf16",
+    )
+    expected = fused_moe_naive(inputs, w13, w2, topk_weights, topk_ids)
+
+    outputs = {}
+    for hint in ("tileloadd", "tileloaddt1", "prefetch_t0", "prefetch_t1", "tileloadd"):
+        monkeypatch.setenv("FUSED_CPP_MOE_AMX_B_LOAD_HINT", hint)
+        outputs[hint] = fused_moe_bf16_tiled(inputs, packed, topk_weights, topk_ids, num_threads=1)
+        _assert_bf16_close(outputs[hint], expected)
+
+    baseline = outputs["tileloadd"]
+    for hint in ("tileloaddt1", "prefetch_t0", "prefetch_t1"):
+        torch.testing.assert_close(outputs[hint].float(), baseline.float(), atol=0, rtol=0)
+
+
 @requires_amx
 @pytest.mark.parametrize(
     ("pattern", "routes"),
@@ -920,6 +1022,30 @@ def test_amx_rejects_unknown_tile_state_mode(monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setenv("FUSED_CPP_MOE_AMX_TILE_STATE", "unknown")
 
     with pytest.raises(RuntimeError, match="must be auto, per_call, or macro_m"):
+        fused_moe_bf16_tiled(inputs, packed, topk_weights, topk_ids, num_threads=1)
+
+
+@requires_amx
+def test_amx_rejects_unknown_b_load_hint(monkeypatch: pytest.MonkeyPatch) -> None:
+    inputs, w13, w2, topk_weights, topk_ids = _case(
+        tokens=1,
+        hidden=32,
+        intermediate=16,
+        experts=1,
+        top_k=1,
+    )
+    packed = prepare_fused_moe_bf16_tiled_weights(
+        w13,
+        w2,
+        fuse_silu=True,
+        backend="x86_amx_bf16",
+    )
+    monkeypatch.setenv("FUSED_CPP_MOE_AMX_B_LOAD_HINT", "unknown")
+
+    with pytest.raises(
+        RuntimeError,
+        match="must be auto, tileloadd, tileloaddt1, prefetch_t0, or prefetch_t1",
+    ):
         fused_moe_bf16_tiled(inputs, packed, topk_weights, topk_ids, num_threads=1)
 
 
@@ -1329,7 +1455,7 @@ def test_amx_weighted_top1_direct_matches_route_workspace(
 
 @requires_amx
 def test_amx_runtime_kill_switch(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The AMX kill switch hides backend 102, rejects it explicitly, and restores AVX-512 auto fallback."""
+    """The AMX kill switch hides both layouts, rejects them explicitly, and restores AVX-512 auto fallback."""
     _, w13, w2, _, _ = _case(
         tokens=1,
         hidden=32,
@@ -1341,14 +1467,16 @@ def test_amx_runtime_kill_switch(monkeypatch: pytest.MonkeyPatch) -> None:
 
     backends = available_fused_moe_bf16_tiled_backends()
     assert "x86_amx_bf16" not in backends
+    assert "x86_amx_bf16_n64" not in backends
     assert "x86_avx512_bf16" in backends
     automatic = prepare_fused_moe_bf16_tiled_weights(w13, w2, fuse_silu=True)
     assert automatic.gemm_backend == 101
     assert automatic.backend_name == "x86_avx512_bf16"
-    with pytest.raises(RuntimeError, match="not supported by this build/runtime"):
-        prepare_fused_moe_bf16_tiled_weights(
-            w13,
-            w2,
-            fuse_silu=True,
-            backend="x86_amx_bf16",
-        )
+    for backend in ("x86_amx_bf16", "x86_amx_bf16_n64"):
+        with pytest.raises(RuntimeError, match="not supported by this build/runtime"):
+            prepare_fused_moe_bf16_tiled_weights(
+                w13,
+                w2,
+                fuse_silu=True,
+                backend=backend,
+            )

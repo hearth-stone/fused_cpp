@@ -13,6 +13,7 @@ enum class BackendId : int64_t {
   kX86Avx2 = 100,
   kX86Avx512Bf16 = 101,
   kX86AmxBf16 = 102,
+  kX86AmxBf16N64 = 103,
 };
 
 enum BackendCapability : uint64_t {

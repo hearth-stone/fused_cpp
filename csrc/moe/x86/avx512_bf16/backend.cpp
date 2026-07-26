@@ -138,6 +138,8 @@ int AmxRoundK(int value) { return RoundUp(std::max(value, 32), 32); }
 
 int RoundN(int value) { return RoundUp(std::max(value, 32), 32); }
 
+int RoundN64(int value) { return RoundUp(std::max(value, 64), 64); }
+
 void PackB(const uint16_t* source, uint16_t* packed, int k_size, int n_size) {
   for (int nb = 0; nb < n_size; nb += 32) {
     uint16_t* block = packed + static_cast<int64_t>(nb / 32) * k_size * 32;
@@ -145,6 +147,28 @@ void PackB(const uint16_t* source, uint16_t* packed, int k_size, int n_size) {
       for (int n = 0; n < 32; ++n) {
         block[static_cast<int64_t>(kp) * 64 + n * 2] = source[static_cast<int64_t>(kp * 2) * n_size + nb + n];
         block[static_cast<int64_t>(kp) * 64 + n * 2 + 1] = source[static_cast<int64_t>(kp * 2 + 1) * n_size + nb + n];
+      }
+    }
+  }
+}
+
+void PackBN64(const uint16_t* source, uint16_t* packed, int k_size, int n_size) {
+  constexpr int kN32K32Elements = 32 * 32;
+  constexpr int kN64K32Elements = 32 * 64;
+  for (int nb = 0; nb < n_size; nb += 64) {
+    uint16_t* superblock = packed + static_cast<int64_t>(nb / 64) * k_size * 64;
+    for (int kb = 0; kb < k_size; kb += 32) {
+      uint16_t* chunk = superblock + static_cast<int64_t>(kb / 32) * kN64K32Elements;
+      for (int side = 0; side < 2; ++side) {
+        uint16_t* block = chunk + side * kN32K32Elements;
+        for (int kp = 0; kp < 16; ++kp) {
+          for (int n = 0; n < 32; ++n) {
+            block[static_cast<int64_t>(kp) * 64 + n * 2] =
+                source[static_cast<int64_t>(kb + kp * 2) * n_size + nb + side * 32 + n];
+            block[static_cast<int64_t>(kp) * 64 + n * 2 + 1] =
+                source[static_cast<int64_t>(kb + kp * 2 + 1) * n_size + nb + side * 32 + n];
+          }
+        }
       }
     }
   }
@@ -171,6 +195,35 @@ void PackW13(const uint16_t* weight, uint16_t* packed, int64_t f_size, int64_t h
   }
 }
 
+void PackW13N64(const uint16_t* weight, uint16_t* packed, int64_t f_size, int64_t h_size, int k_pad, int f_pad) {
+  constexpr int kN32K32Elements = 32 * 32;
+  constexpr int kN64K32Elements = 32 * 64;
+  std::fill(packed, packed + static_cast<int64_t>(k_pad) * f_pad * 2, static_cast<uint16_t>(0));
+  for (int fb = 0; fb < f_pad; fb += 32) {
+    uint16_t* superblock = packed + static_cast<int64_t>(fb / 32) * k_pad * 64;
+    for (int kb = 0; kb < k_pad; kb += 32) {
+      uint16_t* chunk = superblock + static_cast<int64_t>(kb / 32) * kN64K32Elements;
+      for (int side = 0; side < 2; ++side) {
+        uint16_t* block = chunk + side * kN32K32Elements;
+        for (int kp = 0; kp < 16; ++kp) {
+          uint16_t* gate_dst = block + static_cast<int64_t>(kp) * 64;
+          uint16_t* up_dst = gate_dst + 32;
+          for (int lane = 0; lane < 16; ++lane) {
+            const int64_t feature = fb + side * 16 + lane;
+            for (int half = 0; half < 2; ++half) {
+              const int64_t k = kb + kp * 2 + half;
+              if (feature < f_size && k < h_size) {
+                gate_dst[lane * 2 + half] = weight[feature * h_size + k];
+                up_dst[lane * 2 + half] = weight[(f_size + feature) * h_size + k];
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
 void PackW2(const uint16_t* weight, uint16_t* packed, int64_t h_size, int64_t f_size, int k_pad, int n_pad) {
   std::fill(packed, packed + static_cast<int64_t>(k_pad) * n_pad, static_cast<uint16_t>(0));
   for (int nb = 0; nb < n_pad; nb += 32) {
@@ -183,6 +236,33 @@ void PackW2(const uint16_t* weight, uint16_t* packed, int64_t h_size, int64_t f_
           const int64_t k = kp * 2 + half;
           if (output < h_size && k < f_size) {
             dst[lane * 2 + half] = weight[output * f_size + k];
+          }
+        }
+      }
+    }
+  }
+}
+
+void PackW2N64(const uint16_t* weight, uint16_t* packed, int64_t h_size, int64_t f_size, int k_pad, int n_pad) {
+  constexpr int kN32K32Elements = 32 * 32;
+  constexpr int kN64K32Elements = 32 * 64;
+  std::fill(packed, packed + static_cast<int64_t>(k_pad) * n_pad, static_cast<uint16_t>(0));
+  for (int nb = 0; nb < n_pad; nb += 64) {
+    uint16_t* superblock = packed + static_cast<int64_t>(nb / 64) * k_pad * 64;
+    for (int kb = 0; kb < k_pad; kb += 32) {
+      uint16_t* chunk = superblock + static_cast<int64_t>(kb / 32) * kN64K32Elements;
+      for (int side = 0; side < 2; ++side) {
+        uint16_t* block = chunk + side * kN32K32Elements;
+        for (int kp = 0; kp < 16; ++kp) {
+          uint16_t* dst = block + static_cast<int64_t>(kp) * 64;
+          for (int lane = 0; lane < 32; ++lane) {
+            const int64_t output = nb + side * 32 + lane;
+            for (int half = 0; half < 2; ++half) {
+              const int64_t k = kb + kp * 2 + half;
+              if (output < h_size && k < f_size) {
+                dst[lane * 2 + half] = weight[output * f_size + k];
+              }
+            }
           }
         }
       }

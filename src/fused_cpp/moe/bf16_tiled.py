@@ -197,6 +197,7 @@ def prepare_fused_moe_bf16_tiled_weights(
         1: "arm_sve_bf16",
         101: "x86_avx512_bf16",
         102: "x86_amx_bf16",
+        103: "x86_amx_bf16_n64",
     }
     return PreparedBF16TiledFusedMoEWeights(
         w13=(packed[0], int(packed[1]), int(packed[2])),

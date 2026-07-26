@@ -15,6 +15,7 @@ def test_available_backends_match_support_flag() -> None:
         "arm_sve_bf16",
         "x86_avx512_bf16",
         "x86_amx_bf16",
+        "x86_amx_bf16_n64",
     }
     assert bf16_tiled._HAS_BF16_TILED_FUSED_MOE is bool(backends)
 

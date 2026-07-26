@@ -13,10 +13,14 @@ bool EnsureAmxThreadPermission();
 int NTile();
 int RoundK(int value);
 int RoundN(int value);
+int RoundN64(int value);
 int AmxRoundK(int value);
 void PackB(const uint16_t* source, uint16_t* packed, int k_size, int n_size);
+void PackBN64(const uint16_t* source, uint16_t* packed, int k_size, int n_size);
 
 void PackW13(const uint16_t* weight, uint16_t* packed, int64_t f_size, int64_t h_size, int k_pad, int f_pad);
 void PackW2(const uint16_t* weight, uint16_t* packed, int64_t h_size, int64_t f_size, int k_pad, int n_pad);
+void PackW13N64(const uint16_t* weight, uint16_t* packed, int64_t f_size, int64_t h_size, int k_pad, int f_pad);
+void PackW2N64(const uint16_t* weight, uint16_t* packed, int64_t h_size, int64_t f_size, int k_pad, int n_pad);
 
 }  // namespace fused_cpp::moe::x86::avx512_bf16

@@ -18,6 +18,7 @@ _PATTERNS = ("auto", "m1n2", "m2n2", "m1n4")
 _SILU_EPILOGUES = ("auto", "baseline", "resident", "pipelined", "rcp14")
 _W2_EPILOGUES = ("auto", "baseline", "combined", "tile_store")
 _TILE_STATES = ("auto", "per_call", "macro_m")
+_B_LOAD_HINTS = ("auto", "tileloadd", "tileloaddt1", "prefetch_t0", "prefetch_t1")
 
 
 def _parse_patterns(raw: str) -> tuple[str, ...]:
@@ -74,7 +75,27 @@ def _parse_tile_states(raw: str) -> tuple[str, ...]:
     return tuple(tile_states)
 
 
-def _select_variant(pattern: str, silu_epilogue: str, w2_epilogue: str, tile_state: str) -> None:
+def _parse_b_load_hints(raw: str) -> tuple[str, ...]:
+    hints: list[str] = []
+    for hint in raw.split(","):
+        if hint not in _B_LOAD_HINTS:
+            raise argparse.ArgumentTypeError(
+                f"unknown AMX B-load hint {hint!r}; expected one of {_B_LOAD_HINTS}",
+            )
+        if hint not in hints:
+            hints.append(hint)
+    if not hints:
+        raise argparse.ArgumentTypeError("at least one AMX B-load hint is required")
+    return tuple(hints)
+
+
+def _select_variant(
+    pattern: str,
+    silu_epilogue: str,
+    w2_epilogue: str,
+    tile_state: str,
+    b_load_hint: str,
+) -> None:
     if pattern == "auto":
         os.environ.pop("FUSED_CPP_MOE_AMX_PATTERN", None)
     else:
@@ -91,6 +112,10 @@ def _select_variant(pattern: str, silu_epilogue: str, w2_epilogue: str, tile_sta
         os.environ.pop("FUSED_CPP_MOE_AMX_TILE_STATE", None)
     else:
         os.environ["FUSED_CPP_MOE_AMX_TILE_STATE"] = tile_state
+    if b_load_hint == "auto":
+        os.environ.pop("FUSED_CPP_MOE_AMX_B_LOAD_HINT", None)
+    else:
+        os.environ["FUSED_CPP_MOE_AMX_B_LOAD_HINT"] = b_load_hint
 
 
 def _routing(tokens: int, experts: int, top_k: int, mode: str) -> torch.Tensor:
@@ -136,7 +161,7 @@ def _latency_summary(samples: list[float]) -> dict[str, float]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Compare AMX fused-expert JIT tile patterns, epilogues, and tile-state lifetimes.",
+        description="Compare AMX fused-expert JIT patterns, epilogues, tile-state lifetimes, and B-load hints.",
     )
     parser.add_argument("--tokens", type=int, default=32)
     parser.add_argument("--hidden", type=int, default=4096)
@@ -149,6 +174,7 @@ def main() -> None:
     parser.add_argument("--silu-epilogues", type=_parse_silu_epilogues, default=("auto",))
     parser.add_argument("--w2-epilogues", type=_parse_w2_epilogues, default=("auto",))
     parser.add_argument("--tile-states", type=_parse_tile_states, default=("auto",))
+    parser.add_argument("--b-load-hints", type=_parse_b_load_hints, default=("auto",))
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--runs", type=int, default=21)
     parser.add_argument("--baseline-runs", type=int, default=0)
@@ -194,11 +220,12 @@ def main() -> None:
     reference = fused_moe_naive(inputs, w13, w2, topk_weights, topk_ids)
     torch.set_num_threads(1)
     variants = tuple(
-        (pattern, silu_epilogue, w2_epilogue, tile_state)
+        (pattern, silu_epilogue, w2_epilogue, tile_state, b_load_hint)
         for pattern in args.patterns
         for silu_epilogue in args.silu_epilogues
         for w2_epilogue in args.w2_epilogues
         for tile_state in args.tile_states
+        for b_load_hint in args.b_load_hints
     )
     labels = {
         variant: (
@@ -206,16 +233,17 @@ def main() -> None:
             if args.silu_epilogues == ("auto",)
             and args.w2_epilogues == ("auto",)
             and args.tile_states == ("auto",)
-            else f"{variant[0]}:silu={variant[1]}:w2={variant[2]}:tile={variant[3]}"
+            and args.b_load_hints == ("auto",)
+            else f"{variant[0]}:silu={variant[1]}:w2={variant[2]}:tile={variant[3]}:b={variant[4]}"
         )
         for variant in variants
     }
     max_abs: dict[str, float] = {}
     outputs: dict[str, torch.Tensor] = {}
-    for pattern, silu_epilogue, w2_epilogue, tile_state in variants:
-        _select_variant(pattern, silu_epilogue, w2_epilogue, tile_state)
+    for pattern, silu_epilogue, w2_epilogue, tile_state, b_load_hint in variants:
+        _select_variant(pattern, silu_epilogue, w2_epilogue, tile_state, b_load_hint)
         output = custom()
-        label = labels[(pattern, silu_epilogue, w2_epilogue, tile_state)]
+        label = labels[(pattern, silu_epilogue, w2_epilogue, tile_state, b_load_hint)]
         outputs[label] = output
         max_abs[label] = float((output.float() - reference.float()).abs().max())
         for _ in range(args.warmup):
@@ -225,9 +253,9 @@ def main() -> None:
     for iteration in range(args.runs):
         offset = iteration % len(variants)
         order = variants[offset:] + variants[:offset]
-        for pattern, silu_epilogue, w2_epilogue, tile_state in order:
-            _select_variant(pattern, silu_epilogue, w2_epilogue, tile_state)
-            label = labels[(pattern, silu_epilogue, w2_epilogue, tile_state)]
+        for pattern, silu_epilogue, w2_epilogue, tile_state, b_load_hint in order:
+            _select_variant(pattern, silu_epilogue, w2_epilogue, tile_state, b_load_hint)
+            label = labels[(pattern, silu_epilogue, w2_epilogue, tile_state, b_load_hint)]
             start = time.perf_counter_ns()
             custom()
             samples[label].append((time.perf_counter_ns() - start) / 1e6)
@@ -237,10 +265,14 @@ def main() -> None:
     reference_silu = "baseline" if "baseline" in args.silu_epilogues else args.silu_epilogues[0]
     reference_w2 = "baseline" if "baseline" in args.w2_epilogues else args.w2_epilogues[0]
     reference_tile_state = "per_call" if "per_call" in args.tile_states else args.tile_states[0]
+    reference_b_load_hint = "tileloadd" if "tileloadd" in args.b_load_hints else args.b_load_hints[0]
     reference_label = next(
         labels[variant]
         for variant in variants
-        if variant[1] == reference_silu and variant[2] == reference_w2 and variant[3] == reference_tile_state
+        if variant[1] == reference_silu
+        and variant[2] == reference_w2
+        and variant[3] == reference_tile_state
+        and variant[4] == reference_b_load_hint
     )
     pattern_results = {}
     for label in labels.values():
@@ -297,6 +329,7 @@ def main() -> None:
                 "silu_epilogues": args.silu_epilogues,
                 "w2_epilogues": args.w2_epilogues,
                 "tile_states": args.tile_states,
+                "b_load_hints": args.b_load_hints,
                 "variant_reference": reference_label,
                 "patterns": pattern_results,
                 "torch_onednn_staged": baseline,

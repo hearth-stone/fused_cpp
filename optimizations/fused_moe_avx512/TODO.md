@@ -106,9 +106,28 @@ results on `AmazonC8i2Cores` for isolated microkernel changes.
   regression and left 8T tied. Therefore `auto` remains `per_call` and
   `macro_m` remains an explicit experimental variant. See
   [`results/amazon_c8i_8core_amx_macro_m_tile_state_20260726.md`](results/amazon_c8i_8core_amx_macro_m_tile_state_20260726.md).
-- [ ] **B-side streaming layout:** test `TILELOADDT1`/prefetch and an N64,
-  K-major packed-B superblock that feeds two adjacent N32 tiles with less
-  address arithmetic and better L2 locality.
+- [x] **N64/K32 B-side streaming layout:** the explicit
+  `x86_amx_bf16_n64` backend groups two adjacent N32 blocks into one N64
+  superblock and stores each K32 left/right pair contiguously. All three AMX
+  patterns and N-split tails passed correctness, but C8i8 single-thread
+  end-to-end changes were within about +/-1% for the automatic pattern while
+  8-thread latency regressed 3.4%-9.3% at M64-2048. `m1n2` regressed by up to
+  10.5%. Therefore N32 remains the automatic/default packed layout and N64 is
+  retained only as an explicit experiment. See
+  [`results/amazon_c8i_8core_amx_n64_layout_20260726.md`](results/amazon_c8i_8core_amx_n64_layout_20260726.md).
+- [x] **B-side load hints:** after rejecting N64 as a production layout, test
+  only the retained N32 B stream with cache-key-isolated `TILELOADD`,
+  `TILELOADDT1`, `PREFETCHT0`, and `PREFETCHT1` variants. **2026-07-26:**
+  C8i8 H4096/F512 showed a stable `TILELOADDT1` crossover at M=128:
+  median latency improved 5.3%-9.7% for M128-2048 across 1/2/4/8 threads,
+  while M32-64 was neutral or slower. M512 counters showed 5.3% fewer L1D
+  pending-miss cycles, 80.1% fewer L1D replacements, and 7.9% fewer top-down
+  memory-bound slots with unchanged instruction count. Full next-panel
+  software prefetch instead added 13.7% instructions and regressed M512 by
+  14.7%-22.9%. Automatic N32 policy now uses `TILELOADD` below 128 per-expert
+  routes and `TILELOADDT1` at or above 128; explicit modes remain validation
+  overrides. See
+  [`results/amazon_c8i_8core_amx_b_load_hints_20260726.md`](results/amazon_c8i_8core_amx_b_load_hints_20260726.md).
 - [ ] **True K-load software pipeline:** schedule the next A/B tile loads far
   enough ahead of `TDPBF16PS` to cover load latency; verify with counters that
   it improves load/compute overlap rather than only increasing instruction

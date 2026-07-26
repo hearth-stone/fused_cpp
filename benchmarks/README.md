@@ -4,6 +4,47 @@
 L1d」吞吐量。第二次迭代起所有 Q/K/V/P̂/O 都驻留 L1，反映指令级吞吐而非
 访存瓶颈。
 
+## x86 AMX MoE packed-B layout A/B
+
+`bench_amx_bf16_layouts.py` compares the production N32 packed weights with
+the explicit `x86_amx_bf16_n64` K32-streaming experiment. It prepares both
+layouts once, alternates their timed order in one process, checks both against
+the PyTorch expert reference, and reports prepack separately from inference.
+
+```bash
+taskset -c 0 env PYTHONPATH=src \
+  .venv/bin/python benchmarks/bench_amx_bf16_layouts.py \
+  --routes 16,32,64,128,512,2048 \
+  --patterns m1n2,m2n2,m1n4 --threads 1 --warmup 5 --runs 21
+```
+
+The result is JSON with median, p90, p99, best, mean, standard deviation,
+GFLOP/s, and N64 speedup. Pin `0-7` and pass `--threads 8` for the cooperative
+N-split comparison.
+
+## x86 AMX N32 B-load-hint A/B
+
+`bench_amx_bf16_patterns.py` also rotates the N32 `TILELOADD`,
+`TILELOADDT1`, `PREFETCHT0`, and `PREFETCHT1` variants. The explicit modes
+occupy separate JIT cache keys, reuse identical packed weights, and report
+bit-exact differences against `tileloadd`.
+
+```bash
+taskset -c 0 env PYTHONPATH=src \
+  .venv/bin/python benchmarks/bench_amx_bf16_patterns.py \
+  --tokens 512 --hidden 4096 --intermediate 512 \
+  --experts 1 --top-k 1 --routing hot --threads 1 \
+  --patterns auto \
+  --b-load-hints tileloadd,tileloaddt1,prefetch_t0,prefetch_t1 \
+  --warmup 5 --runs 31
+```
+
+Use one explicit `--b-load-hints` value and enough measured iterations under
+`sudo perf stat` to compare `l1d_pend_miss.pending_cycles`,
+`l1d.replacement`, and `topdown.memory_bound_slots`. The C8i8 result and exact
+counter command are recorded in
+`optimizations/fused_moe_avx512/results/amazon_c8i_8core_amx_b_load_hints_20260726.md`.
+
 | 入口 | 何时用 |
 |---|---|
 | `bench_microkernel_l1.py` | 日常 sweep，复用已编译好的 `_C` 扩展，输出友好 |

@@ -198,8 +198,8 @@ processes to compare generated and fallback kernels without routing or W2.
 
 The prioritized AMX optimization backlog, acceptance checks, and rejected or
 deferred design space are tracked in [`TODO.md`](TODO.md). The P1 epilogue and
-workspace-lifecycle items are complete; the remaining work starts with the P2
-AMX B-side layout and K-load pipeline experiments.
+workspace-lifecycle items plus the N32 B-side load-hint policy are complete;
+the remaining P2 work starts with the true K-load pipeline.
 
 `auto` selects the reserved backend ID 102 (`x86_amx_bf16`) before backend ID
 101 (`x86_avx512_bf16`) when AMX is available. AMX requires Linux, Xbyak,
@@ -219,6 +219,39 @@ path.
 The intermediate row stride is W2's K32-padded size, which can be wider than
 W13's F16-padded output (for example F=35 uses a 64-element stride); the extra
 columns remain zero so W2 never reads across row boundaries.
+
+Backend ID 103 (`x86_amx_bf16_n64`) is an explicit layout experiment and is
+never selected by `auto`. It groups two adjacent logical N32 blocks into an
+N64 superblock; within each K32 chunk it stores the left and right 2 KiB tiles
+next to each other. This gives `m1n4` one contiguous 4 KiB B-side stream, but
+`m1n2` and `m2n2` still consume one half at a time. On C8i8, the automatic
+pattern changed by only -0.3% to +0.9% at one thread, while 8-thread N-split
+regressed 3.4%-9.3% at M64-2048. N32 therefore remains the only production
+layout; maintaining a second N64 weight copy is not recommended. Correctness,
+all-pattern measurements, commands, and methodology are in
+[`results/amazon_c8i_8core_amx_n64_layout_20260726.md`](results/amazon_c8i_8core_amx_n64_layout_20260726.md).
+
+The production N32 layout uses a per-expert B-load policy. Below 128 routed
+rows, both A and B use `TILELOADD`. At M>=128, A remains temporal while every
+packed-B tile uses `TILELOADDT1`, which helps preserve the active A and
+epilogue state in the nearest cache. The crossover was the first point with a
+repeatable benefit across 1/2/4/8 C8i cores: H=4096/F=512 M128-2048 improved
+5.3%-9.7%. At M512, counters showed 5.3% fewer L1D pending-miss cycles, 80.1%
+fewer L1D replacements, and 7.9% fewer top-down memory-bound slots without
+adding instructions.
+
+`FUSED_CPP_MOE_AMX_B_LOAD_HINT` is the cache-key-isolated validation override:
+
+- unset, empty, or `auto` uses `TILELOADD` below M=128 and `TILELOADDT1` at or
+  above M=128 for N32;
+- `tileloadd` and `tileloaddt1` force the corresponding packed-B load;
+- `prefetch_t0` and `prefetch_t1` keep `TILELOADD` and prefetch every cache
+  line of the next N32 panel to L1 or L2. Both were rejected as defaults after
+  regressing M512 by 14.7%-22.9%.
+
+Explicit non-default hints require N32. Full timing, counters, commands, and
+the automatic crossover are recorded in
+[`results/amazon_c8i_8core_amx_b_load_hints_20260726.md`](results/amazon_c8i_8core_amx_b_load_hints_20260726.md).
 
 The executor also leases grow-only BF16 intermediate buffers from a
 concurrency-safe process pool instead of allocating and value-initializing the
@@ -258,8 +291,8 @@ Correctness, full commands, best/p90 values, and small-shape controls are in
 [`results/amazon_c8i_8core_p1_workspace_20260726.md`](results/amazon_c8i_8core_p1_workspace_20260726.md).
 
 The cache specializes exact M=1 through 16, operation, W13 polynomial degree,
-W2 N tail, and output type; K remains a dynamic K32 loop. Larger M values are
-M16 panels plus an exact tail.
+W2 N tail, output type, packed-B layout, and AMX B-load hint; K remains a
+dynamic K32 loop. Larger M values are M16 panels plus an exact tail.
 
 W13 uses two FP32 accumulator tiles for gate and up, with double-buffered A/B
 occupying all eight TMM registers. Since ZMM cannot read TMM state directly,
@@ -336,6 +369,8 @@ expert's routed row count:
 
 - M < 76 uses `m2n2`; its final M1-16 tail naturally uses `m1n2`;
 - M >= 76 uses `m1n4`; an odd final N32/W13 block uses `m1n2`.
+- M < 128 loads N32 packed B with `TILELOADD`; M >= 128 uses
+  `TILELOADDT1`. A tiles always use `TILELOADD`.
 
 `FUSED_CPP_MOE_AMX_PATTERN` is a validation and tuning override:
 
@@ -386,6 +421,14 @@ For tile-state lifetime, pass
 `--patterns auto --tile-states per_call,macro_m`; the benchmark rotates the two
 paths in one process after correctness and JIT warm-up, and reports median,
 p90, p99, mean, standard deviation, and best latency.
+For the N32 load-policy experiment, pass
+`--patterns auto --b-load-hints tileloadd,tileloaddt1,prefetch_t0,prefetch_t1`.
+The same benchmark rotates the four cache-key-isolated paths and reports
+bit-exact mismatches against `tileloadd`.
+`benchmarks/bench_amx_bf16_layouts.py` similarly rotates the N32 backend and
+the explicit N64/K32 backend for each forced AMX pattern. It excludes prepack
+from timed inference, reports prepack separately, and is the reproducible
+layout-policy gate.
 `benchmarks/bench_amx_bf16_w2_epilogues.cpp` rotates the three store kernels
 without W13/routing, while `benchmarks/bench_amx_bf16_merge.cpp` separately
 compares flat-route and mapped expert-contiguous weighted merge.
