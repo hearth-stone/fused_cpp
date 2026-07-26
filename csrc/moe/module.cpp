@@ -52,6 +52,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("fused_moe_bench_team_gemm", &fused_moe_bench_team_gemm, "Benchmark cooperative team GEMM.", py::arg("A"),
         py::arg("B"), py::arg("group_size"), py::arg("split") = "auto", py::arg("bias") = c10::nullopt,
         py::arg("warmup") = 3, py::arg("runs") = 20, py::call_guard<py::gil_scoped_release>());
+  m.def("fused_moe_test_sve_packed_gemm", &fused_moe_test_sve_packed_gemm,
+        "Test-only: run standalone packed-A/B SVE GEMM with JIT or static asm.", py::arg("A"), py::arg("packed_B"),
+        py::arg("K"), py::arg("N"), py::arg("n_tile"), py::arg("use_jit") = true,
+        py::call_guard<py::gil_scoped_release>());
   m.def("fused_moe_bench_sve_jit_w13_gemm", &fused_moe_bench_sve_jit_w13_gemm,
         "Benchmark only the exact-M SVE JIT GEMM body on packed W13 weights.", py::arg("A"),
         py::arg("w13_packed"), py::arg("K"), py::arg("N"), py::arg("n_tile"), py::arg("n_ranges") = 2,

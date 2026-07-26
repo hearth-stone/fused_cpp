@@ -452,6 +452,56 @@ def test_sve_xbyak_exact_m_matches_static_asm(
             )
 
 
+def test_sve_xbyak_pure_gemm_matches_static_asm(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Validate the standalone FP32 GEMM operation for every exact-M shape."""
+    if "arm_sve_bf16" not in available_fused_moe_bf16_tiled_backends():
+        pytest.skip("requires an SVE BF16 build/runtime")
+    from fused_cpp import _moe_C
+
+    monkeypatch.delenv("FUSED_CPP_MOE_SVE_KC", raising=False)
+    monkeypatch.delenv("FUSED_CPP_MOE_SVE_KC_L1_PERMILLE", raising=False)
+    # The pure operation must remain a one-N-tile kernel even when the fused
+    # M1/M2 dual-N experiment is enabled.
+    monkeypatch.setenv("FUSED_CPP_MOE_SVE_JIT_M2_DUAL_N", "1")
+
+    generator = torch.Generator().manual_seed(20260725)
+    K = 64
+    N = 64
+    w13 = _bf16_normal((1, N, K), generator=generator, std=0.05)
+    w2 = _bf16_normal((1, K, N // 2), generator=generator, std=0.05)
+    packed = prepare_fused_moe_bf16_tiled_weights(w13, w2, fuse_silu=True, backend="sve")
+    if packed.gemm_backend != 1:
+        pytest.skip("requires an SVE BF16 build/runtime")
+
+    for bulk_m in ("0", "1"):
+        monkeypatch.setenv("FUSED_CPP_MOE_SVE_JIT_BULK_M", bulk_m)
+        for rows in [*range(1, 14), 23, 24, 25]:
+            A = _bf16_normal((rows, K), generator=generator, std=0.05)
+            reference = _moe_C.fused_moe_test_sve_packed_gemm(
+                A, packed.w13[0], K, N, packed.backend_n_tile, False
+            )
+            candidate = _moe_C.fused_moe_test_sve_packed_gemm(
+                A, packed.w13[0], K, N, packed.backend_n_tile, True
+            )
+            torch.testing.assert_close(
+                candidate,
+                reference,
+                atol=0,
+                rtol=0,
+                msg=lambda message, rows=rows, bulk_m=bulk_m: f"M={rows}/bulk={bulk_m}: {message}",
+            )
+
+    with pytest.raises(RuntimeError, match="K must be divisible by 8"):
+        _moe_C.fused_moe_test_sve_packed_gemm(
+            torch.empty((1, K - 1), dtype=torch.bfloat16),
+            packed.w13[0],
+            K - 1,
+            N,
+            packed.backend_n_tile,
+            True,
+        )
+
+
 @pytest.mark.parametrize("degree", [4, 5, 6], ids=["poly4", "poly5", "poly6"])
 @pytest.mark.parametrize("direct_route", [False, True], ids=["w2", "w2_direct"])
 def test_sve_first_panel_prefetch_matches_panel_jit(

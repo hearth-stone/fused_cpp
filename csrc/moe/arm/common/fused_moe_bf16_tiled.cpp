@@ -1084,6 +1084,8 @@ const char* sve_jit_operation_name(SveJitOperation operation) {
       return "W2";
     case SveJitOperation::kW2Direct:
       return "W2 direct-route";
+    case SveJitOperation::kGemmF32:
+      return "plain GEMM FP32";
   }
   return "unknown";
 }
@@ -1305,6 +1307,34 @@ bool sve_jit_packed_w2_exact_dispatch(const uint16_t* packed_A, const uint16_t* 
         kernels.main_rows == 0 && first_panel_kernel != nullptr ? first_panel_kernel : kernels.tail;
     kernel(packed_A + static_cast<int64_t>(kernels.main_rows) * K, w2_packed,
            down + static_cast<int64_t>(kernels.main_rows) * ldc, nullptr, &p.gemm);
+  }
+  return true;
+}
+
+bool sve_jit_packed_gemm_f32_exact_dispatch(const uint16_t* packed_A, const uint16_t* packed_B, float* output,
+                                            int rows, int K, int N, int ldc, int packed_N, int n_begin) {
+  if (!sve_jit_configuration_supported(SveJitOperation::kGemmF32, K, 0, nullptr)) {
+    return false;
+  }
+  SveJitExactMKernelSet kernels;
+  if (!resolve_sve_jit_exact_m_kernels(SveJitOperation::kGemmF32, rows, 0, true, &kernels)) {
+    return false;
+  }
+  SveKBlockParams p = make_sve_kblock_params(12, K, N, ldc, packed_N, n_begin, 0);
+  if (kernels.bulk_m) {
+    p.gemm.m = kernels.main_rows;
+    kernels.m12(packed_A, packed_B, output, nullptr, &p.gemm);
+  } else {
+    for (int mb = 0; mb < kernels.main_rows; mb += 12) {
+      p.gemm.m = 12;
+      kernels.m12(packed_A + static_cast<int64_t>(mb) * K, packed_B,
+                  output + static_cast<int64_t>(mb) * ldc, nullptr, &p.gemm);
+    }
+  }
+  if (kernels.tail_rows > 0) {
+    p.gemm.m = kernels.tail_rows;
+    kernels.tail(packed_A + static_cast<int64_t>(kernels.main_rows) * K, packed_B,
+                 output + static_cast<int64_t>(kernels.main_rows) * ldc, nullptr, &p.gemm);
   }
   return true;
 }
@@ -5353,11 +5383,53 @@ std::vector<double> fused_moe_bench_team_gemm(at::Tensor A, at::Tensor B, int64_
 #endif
 }
 
-// Benchmark only the production exact-M SVE JIT GEMM for a W13-shaped packed
-// weight. Operation::kW2 is intentionally used for its plain fp32 store:
-// the packed-A/B loads and BFMMLA K-loop are identical to W13, while SiLU,
-// gate*up, BF16 conversion, and pack-C are absent. Packing and allocation are
-// outside the timed region; timed iterations rotate experts to keep B cold.
+at::Tensor fused_moe_test_sve_packed_gemm(at::Tensor A, at::Tensor packed_B, int64_t K, int64_t N,
+                                          int64_t n_tile, bool use_jit) {
+#if !defined(__aarch64__) || !defined(FUSED_CPP_MOE_HAS_ARM_SVE)
+  TORCH_CHECK(false, "fused_moe_test_sve_packed_gemm requires AArch64 SVE");
+#else
+  check_bf16_cpu(A, "A");
+  TORCH_CHECK(A.dim() == 2, "A must be 2-D [M, K]");
+  TORCH_CHECK(A.size(1) == K, "A second dimension must equal K=", K);
+  check_positive_int(A.size(0), "M");
+  check_positive_int(K, "K");
+  check_positive_int(N, "N");
+  TORCH_CHECK(K % 8 == 0, "K must be divisible by 8");
+  TORCH_CHECK(n_tile == ::fused_cpp::moe_sve::n_tile(), "n_tile mismatch: requested ", n_tile, ", runtime ",
+              ::fused_cpp::moe_sve::n_tile());
+  TORCH_CHECK(N % n_tile == 0, "N must be divisible by n_tile");
+  TORCH_CHECK(::fused_cpp::moe_sve::k_block(static_cast<int>(K)) == K,
+              "pure SVE JIT GEMM test requires one-chunk K packing");
+  A = A.contiguous();
+  const PackedExperts weights = checked_packed_experts(packed_B, K, N, "packed_B", n_tile);
+
+  const int rows = static_cast<int>(A.size(0));
+  const int64_t packed_rows = sve_hybrid_packed_rows(rows);
+  std::vector<uint16_t> packed_a(static_cast<size_t>(packed_rows * K), static_cast<uint16_t>(0));
+  std::vector<int64_t> routes(static_cast<size_t>(rows));
+  std::iota(routes.begin(), routes.end(), int64_t{0});
+  gather_pack_a_reorder_sve_hybrid(bf16_data_const(A), K, routes.data(), 1, packed_a.data(), rows,
+                                   static_cast<int>(K), int64_t{1}, int64_t{0});
+
+  at::Tensor output = at::zeros({packed_rows, N}, at::TensorOptions().dtype(at::kFloat).device(at::kCPU));
+  const uint16_t* packed_b = bf16_data_const(weights.tensor);
+  if (use_jit) {
+    const bool dispatched = sve_jit_packed_gemm_f32_exact_dispatch(
+        packed_a.data(), packed_b, output.data_ptr<float>(), rows, static_cast<int>(K), static_cast<int>(N),
+        static_cast<int>(N), static_cast<int>(N), 0);
+    TORCH_CHECK(dispatched, "failed to dispatch standalone SVE JIT GEMM");
+  } else {
+    sve_asm_packed_w2_hybrid_dispatch(packed_a.data(), packed_b, output.data_ptr<float>(), rows,
+                                      static_cast<int>(K), static_cast<int>(N), static_cast<int>(N),
+                                      static_cast<int>(N), 0);
+  }
+  return output.narrow(0, 0, rows).clone();
+#endif
+}
+
+// Benchmark only the standalone exact-M SVE JIT GEMM for a W13-shaped packed
+// weight. Packing and allocation are outside the timed region; timed
+// iterations rotate experts to keep B cold.
 std::vector<double> fused_moe_bench_sve_jit_w13_gemm(at::Tensor A, at::Tensor w13_packed, int64_t K, int64_t N,
                                                      int64_t n_tile, int64_t n_ranges, int64_t warmup,
                                                      int64_t runs, int64_t probe_mode) {
@@ -5381,7 +5453,7 @@ std::vector<double> fused_moe_bench_sve_jit_w13_gemm(at::Tensor A, at::Tensor w1
   A = A.contiguous();
   const PackedExperts weights = checked_packed_experts(w13_packed, K, N, "w13_packed", n_tile);
   TORCH_CHECK(weights.E > 0, "w13_packed must contain at least one expert");
-  TORCH_CHECK(sve_jit_configuration_supported(SveJitOperation::kW2, static_cast<int>(K), 0, nullptr),
+  TORCH_CHECK(sve_jit_configuration_supported(SveJitOperation::kGemmF32, static_cast<int>(K), 0, nullptr),
               "plain SVE JIT GEMM is unavailable for this configuration");
 
   const int rows = static_cast<int>(A.size(0));
@@ -5414,7 +5486,7 @@ std::vector<double> fused_moe_bench_sve_jit_w13_gemm(at::Tensor A, at::Tensor w1
         p.gemm.m = rows;
         probe_kernel(packed_a.data(), packed_b, output_ptr + n_begin, nullptr, &p.gemm);
       } else {
-        const bool dispatched = sve_jit_packed_w2_exact_dispatch(
+        const bool dispatched = sve_jit_packed_gemm_f32_exact_dispatch(
             packed_a.data(), packed_b, output_ptr + n_begin, rows, static_cast<int>(K), range_cols,
             static_cast<int>(N), static_cast<int>(N), n_begin);
         TORCH_CHECK(dispatched, "failed to dispatch plain SVE JIT W13 GEMM");

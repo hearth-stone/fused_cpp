@@ -17,6 +17,7 @@ enum class Operation : uint8_t {
   kW13,
   kW2,
   kW2Direct,
+  kGemmF32,
 };
 
 enum class ProbeMode : uint8_t {
@@ -42,7 +43,10 @@ const void* silu_constants();
 // Returned code remains executable until process shutdown. Generation and cache
 // lookup are thread-safe; `error` is populated when no JIT kernel is available.
 KernelFn get_kernel(Operation operation, int rows, int degree, std::string* error);
-// Benchmark-only variants of the M1/M2 W2 kernel. They retain the production
+// Standalone packed-A/packed-B BF16 GEMM with row-major FP32 output.
+KernelFn get_gemm_f32_kernel(int rows, std::string* error);
+KernelFn get_bulk_m12_gemm_f32_kernel(std::string* error);
+// Benchmark-only variants of the M1/M2 pure GEMM kernel. They retain the production
 // loop structure while selectively executing A/B loads, BFMMLA, and stores.
 KernelFn get_probe_kernel(int rows, ProbeMode mode, std::string* error);
 // Exact-M kernel with an operation-specific streaming hint ahead of each cold

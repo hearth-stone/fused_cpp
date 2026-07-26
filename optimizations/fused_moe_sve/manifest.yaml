@@ -56,6 +56,32 @@ features:
       --routes 1,2,3,4,5,6,7,8,9,10,11,12 --threads 1,2,4,8
       --warmup 8 --runs 40 --switch-period 4
 
+  - id: compute.xbyak_pure_gemm
+    part: compute
+    status: experimental
+    implementation: >-
+      csrc/moe/arm/sve_bf16/jit_kernels.cpp,
+      csrc/moe/arm/common/fused_moe_bf16_tiled.cpp, and
+      optimizations/fused_moe_sve/benchmarks/bench_jit_vs_i8mm_pure_gemm.cpp
+    hypothesis: >-
+      A standalone packed-A/packed-B BF16 GEMM operation with row-major FP32
+      output makes the generated compute body independently reusable and
+      measurable. Keeping its M1/M2/M4/M8 double-buffered and M12 non-ILV
+      instruction schedules identical to the corresponding i8mm assembly
+      kernels should keep median single-core time within 5 percent.
+    depends_on:
+      - compute.xbyak_exact_m
+      - compute.xbyak_double_buffer_kloop
+    conflicts_with: []
+    correctness: >-
+      PYTHONPATH=src FUSED_CPP_MOE_SVE=1 .venv/bin/python -m pytest -q
+      tests/test_fused_moe_bf16_tiled.py::test_sve_xbyak_pure_gemm_matches_static_asm
+    benchmark: >-
+      taskset -c 0
+      optimizations/fused_moe_sve/benchmarks/run_jit_vs_i8mm_pure_gemm.sh
+      --rows 1,2,4,8,12 --k 4096 --n 1024 --experts 1
+      --warmup 32 --runs 201
+
   - id: compute.xbyak_m2_dual_n
     part: compute
     status: experimental

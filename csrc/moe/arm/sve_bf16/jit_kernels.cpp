@@ -149,11 +149,14 @@ class SveFusedGenerator final : public CodeGenerator {
       throw std::invalid_argument("SVE JIT dual-N cannot be combined with other experimental load paths");
     }
     if (probe_mode_ != ProbeMode::kNone &&
-        (operation_ != Operation::kW2 || rows_ > 2 || bulk_m_ || prefetch_b_ || dual_n_)) {
-      throw std::invalid_argument("SVE JIT probes require a plain M1/M2 W2 kernel");
+        (operation_ != Operation::kGemmF32 || rows_ > 2 || bulk_m_ || prefetch_b_ || dual_n_)) {
+      throw std::invalid_argument("SVE JIT probes require a plain M1/M2 GEMM kernel");
     }
     if (operation_ == Operation::kW13 && (degree_ < 4 || degree_ > 6)) {
       throw std::invalid_argument("SVE JIT W13 degree must be 4, 5, or 6");
+    }
+    if (operation_ != Operation::kW13 && degree_ != 0) {
+      throw std::invalid_argument("SVE JIT plain GEMM operations require degree 0");
     }
     generate();
     readyRE();
@@ -177,7 +180,20 @@ class SveFusedGenerator final : public CodeGenerator {
     if (directory == nullptr || directory[0] == '\0') {
       return;
     }
-    const char* operation = operation_ == Operation::kW13 ? "w13" : (operation_ == Operation::kW2 ? "w2" : "w2_direct");
+    const char* operation = "gemm_f32";
+    switch (operation_) {
+      case Operation::kW13:
+        operation = "w13";
+        break;
+      case Operation::kW2:
+        operation = "w2";
+        break;
+      case Operation::kW2Direct:
+        operation = "w2_direct";
+        break;
+      case Operation::kGemmF32:
+        break;
+    }
     const char* probe = "";
     switch (probe_mode_) {
       case ProbeMode::kNone:
@@ -875,7 +891,7 @@ class SveFusedGenerator final : public CodeGenerator {
       if (operation_ == Operation::kW13) {
         mov(x24, 6);
         mul(x24, x24, x16);
-      } else if (operation_ == Operation::kW2) {
+      } else if (operation_ == Operation::kW2 || operation_ == Operation::kGemmF32) {
         mov(x24, 12);
         mul(x24, x24, x16);
       } else {
@@ -1013,7 +1029,7 @@ struct KernelCacheSlot {
   KernelHandle handle;
 };
 
-constexpr size_t kOperationCount = 3;
+constexpr size_t kOperationCount = 4;
 constexpr size_t kRowCount = 12;
 constexpr size_t kDegreeCount = 3;
 constexpr size_t kBulkMCount = 2;
@@ -1065,7 +1081,7 @@ KernelFn get_kernel(Operation operation, int rows, int degree, std::string* erro
                       static_cast<uint8_t>(degree),
                       false,
                       false,
-                      rows <= 2 && m2_dual_n_enabled(),
+                      operation != Operation::kGemmF32 && rows <= 2 && m2_dual_n_enabled(),
                       ProbeMode::kNone};
   KernelHandle& handle = cached_kernel(key);
   if (error != nullptr) {
@@ -1081,7 +1097,7 @@ KernelFn get_probe_kernel(int rows, ProbeMode mode, std::string* error) {
     }
     return nullptr;
   }
-  const KernelKey key{Operation::kW2, static_cast<uint8_t>(rows), 0, false, false, false, mode};
+  const KernelKey key{Operation::kGemmF32, static_cast<uint8_t>(rows), 0, false, false, false, mode};
   KernelHandle& handle = cached_kernel(key);
   if (error != nullptr) {
     *error = handle.error;
@@ -1155,5 +1171,13 @@ void prewarm_bulk_m12(Operation operation, int degree) {
 }
 
 #endif
+
+KernelFn get_gemm_f32_kernel(int rows, std::string* error) {
+  return get_kernel(Operation::kGemmF32, rows, 0, error);
+}
+
+KernelFn get_bulk_m12_gemm_f32_kernel(std::string* error) {
+  return get_bulk_m12_kernel(Operation::kGemmF32, 0, error);
+}
 
 }  // namespace fused_cpp::moe_sve::jit
