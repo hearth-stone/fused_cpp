@@ -461,6 +461,33 @@ workers. The benchmark and complete measurements are
 `benchmarks/bench_avx512_bulk_mn.py` and
 [`results/amazon_c8i_8core_avx512_bulk_mn_20260726.md`](results/amazon_c8i_8core_avx512_bulk_mn_20260726.md).
 
+The AVX-512 JIT also schedules two adjacent BF16 K-pairs per loop and can
+prefetch the packed-B stream. The two-pair body loads both B operands before
+finishing the current pair, halves loop-control frequency, and uses a second
+accumulation bank when the exact-M register budget permits. Odd K-pair counts
+retain a generated one-pair tail. This does not change the VNNI2/N32 weight
+layout.
+
+`FUSED_CPP_MOE_AVX512_K_LOOP` is the validation override:
+
+- unset, empty, or `auto` applies the C8i stage- and dimension-aware policy;
+  unknown CPU profiles retain the old schedule;
+- `baseline` preserves the previous loop and its established W13 T0 prefetch;
+- `no_prefetch` removes software prefetch without changing the one-pair loop;
+- `unroll2` uses the two-pair schedule without explicit prefetch;
+- `unroll2_t0` and `unroll2_t1` prefetch packed B by 8 or 16 K-pairs.
+
+The C8i policy keeps W13 on baseline below M96/H256/F256, uses T0 through
+M511, and drops explicit prefetch at M>=512 after repeated M panels make B
+hot. W2 uses T0 at M>=12/F128/H256. W2 M12/K512/N4096 counters showed
+4.2% fewer cycles, 31.1% fewer branches, and 46.3% fewer L1D misses. In the
+full H4096/F512 expert, auto improved M256 by 0.74% at 1T and 1.50%--1.81% at
+2--8T; M2048 improved 2.78%/3.56% at 1T/8T. `no_prefetch`, small-M W13
+unrolling, and T1 were rejected as defaults. Reproduce with
+`benchmarks/bench_avx512_k_loop.py`; standalone W13/W2 binaries isolate the
+two stages. Full commands, counters, and held-out shapes are in
+[`results/amazon_c8i_8core_avx512_k_loop_20260726.md`](results/amazon_c8i_8core_avx512_k_loop_20260726.md).
+
 The generic fallback preserves the previous AMX M=76 crossover, 64-row wave
 target, and cache-byte formulas. Every profile retains the exact-tail rules:
 the final M1-16 part of `m2n2`, plus an odd final N32/W13 block of `m1n4`,

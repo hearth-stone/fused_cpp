@@ -203,6 +203,33 @@ bool UseAutomaticAvx512BulkMN(Avx512BulkMNStage stage, int rows, int reduction_s
          cooperative_threads <= 4;
 }
 
+Avx512KLoopPolicy ResolveAutomaticAvx512KLoop(Avx512KLoopStage stage, int rows, int reduction_size, int output_size,
+                                              int cooperative_threads) {
+  if (!UseC8iProfile() || rows <= 0 || reduction_size <= 0 || output_size <= 0 || cooperative_threads <= 0 ||
+      cooperative_threads > 8) {
+    return Avx512KLoopPolicy::kBaseline;
+  }
+  if (stage == Avx512KLoopStage::kW13) {
+    // The legacy T0 prefetch remains important for an isolated long-K W13
+    // panel.  Two-pair scheduling starts paying once enough M panels reuse the
+    // B panel; for very large M it no longer needs an explicit software
+    // prefetch because the repeated panels keep B hot.
+    if (rows < 96 || reduction_size < 256 || output_size < 256) {
+      return Avx512KLoopPolicy::kBaseline;
+    }
+    return rows >= 512 ? Avx512KLoopPolicy::kUnroll2 : Avx512KLoopPolicy::kUnroll2T0;
+  }
+
+  // W2 has a shorter reduction and many output blocks.  C8i counters show
+  // that two-pair scheduling plus T0 prefetch removes roughly one third of
+  // loop branches and nearly half of the measured L1D misses for the common
+  // M12/F512/H4096 microkernel.
+  if (rows < 12 || reduction_size < 128 || output_size < 256) {
+    return Avx512KLoopPolicy::kBaseline;
+  }
+  return Avx512KLoopPolicy::kUnroll2T0;
+}
+
 AmxKernelPattern ResolveAutomaticAmxKernelPattern(int rows, int hidden_size, int intermediate_size) {
   if (!UseC8iProfile() || hidden_size <= 0 || intermediate_size <= 0) {
     return rows >= kGenericM1N4MinRows ? AmxKernelPattern::kM1N4 : AmxKernelPattern::kM2N2;

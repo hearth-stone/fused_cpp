@@ -551,6 +551,156 @@ def test_avx512_rejects_unknown_bulk_mn_mode(monkeypatch: pytest.MonkeyPatch) ->
         fused_moe_bf16_tiled(inputs, packed, topk_weights, topk_ids, num_threads=1)
 
 
+@pytest.mark.parametrize("k_loop_mode", ["no_prefetch", "unroll2", "unroll2_t0", "unroll2_t1"])
+@pytest.mark.parametrize(
+    "output_mode",
+    ["direct", "route-f32", "weighted-direct"],
+    ids=["direct-bf16", "route-f32", "weighted-direct-bf16"],
+)
+def test_avx512_k_loop_variants_match_baseline(
+    monkeypatch: pytest.MonkeyPatch,
+    k_loop_mode: str,
+    output_mode: str,
+) -> None:
+    """K scheduling and B-prefetch variants preserve odd W13/W2 reductions and M tails."""
+    inputs, w13, w2, topk_weights, topk_ids = _case(
+        tokens=13,
+        hidden=129,
+        intermediate=81,
+        experts=1,
+        top_k=1,
+        seed=820,
+    )
+    topk_weights = torch.linspace(0.25, 0.75, inputs.size(0), dtype=torch.float32).view(-1, 1)
+    packed = prepare_fused_moe_bf16_tiled_weights(w13, w2, fuse_silu=True, backend="x86_avx512_bf16")
+    skip_weighted = output_mode == "direct"
+    monkeypatch.setenv("FUSED_CPP_MOE_AVX512_IMPL", "jit")
+    monkeypatch.setenv("FUSED_CPP_MOE_AVX512_BULK_MN", "bulk_mn")
+    monkeypatch.setenv(
+        "FUSED_CPP_MOE_X86_WEIGHTED_TOP1_DIRECT",
+        "1" if output_mode == "weighted-direct" else "0",
+    )
+
+    monkeypatch.setenv("FUSED_CPP_MOE_AVX512_K_LOOP", "baseline")
+    baseline = fused_moe_bf16_tiled(
+        inputs,
+        packed,
+        topk_weights,
+        topk_ids,
+        num_threads=1,
+        skip_weighted=skip_weighted,
+    )
+    monkeypatch.setenv("FUSED_CPP_MOE_AVX512_K_LOOP", k_loop_mode)
+    candidate = fused_moe_bf16_tiled(
+        inputs,
+        packed,
+        topk_weights,
+        topk_ids,
+        num_threads=1,
+        skip_weighted=skip_weighted,
+    )
+    reference_weights = torch.ones_like(topk_weights) if skip_weighted else topk_weights
+    expected = fused_moe_naive(inputs, w13, w2, reference_weights, topk_ids)
+
+    _assert_bf16_close(candidate, baseline)
+    _assert_bf16_close(candidate, expected)
+
+
+def test_avx512_k_loop_preserves_cache_windows_and_n_split(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Two-pair scheduling must remain deterministic through cache windows and cooperative N split."""
+    inputs, w13, w2, topk_weights, topk_ids = _case(
+        tokens=37,
+        hidden=257,
+        intermediate=129,
+        experts=1,
+        top_k=1,
+        seed=821,
+    )
+    packed = prepare_fused_moe_bf16_tiled_weights(w13, w2, fuse_silu=True, backend="x86_avx512_bf16")
+    monkeypatch.setenv("FUSED_CPP_MOE_AVX512_IMPL", "jit")
+    monkeypatch.setenv("FUSED_CPP_MOE_AVX512_BULK_MN", "bulk_mn")
+    monkeypatch.setenv("FUSED_CPP_MOE_X86_W13_CACHE_BLOCKS", "3")
+    monkeypatch.setenv("FUSED_CPP_MOE_X86_W2_CACHE_BLOCKS", "5")
+
+    monkeypatch.setenv("FUSED_CPP_MOE_AVX512_K_LOOP", "baseline")
+    baseline = fused_moe_bf16_tiled(
+        inputs,
+        packed,
+        topk_weights,
+        topk_ids,
+        num_threads=4,
+        skip_weighted=True,
+    )
+    monkeypatch.setenv("FUSED_CPP_MOE_AVX512_K_LOOP", "unroll2_t0")
+    candidate = fused_moe_bf16_tiled(
+        inputs,
+        packed,
+        topk_weights,
+        topk_ids,
+        num_threads=4,
+        skip_weighted=True,
+    )
+
+    _assert_bf16_close(candidate, baseline)
+
+
+@pytest.mark.parametrize("tokens", [96, 513])
+def test_avx512_automatic_k_loop_policy_matches_baseline(monkeypatch: pytest.MonkeyPatch, tokens: int) -> None:
+    """C8i auto covers both T0-prefetched and large-M no-prefetch W13 schedules."""
+    inputs, w13, w2, topk_weights, topk_ids = _case(
+        tokens=tokens,
+        hidden=257,
+        intermediate=257,
+        experts=1,
+        top_k=1,
+        seed=823 + tokens,
+    )
+    packed = prepare_fused_moe_bf16_tiled_weights(w13, w2, fuse_silu=True, backend="x86_avx512_bf16")
+    monkeypatch.setenv("FUSED_CPP_MOE_AVX512_IMPL", "jit")
+    monkeypatch.setenv("FUSED_CPP_MOE_X86_POLICY_PROFILE", "c8i")
+
+    monkeypatch.setenv("FUSED_CPP_MOE_AVX512_K_LOOP", "baseline")
+    baseline = fused_moe_bf16_tiled(
+        inputs,
+        packed,
+        topk_weights,
+        topk_ids,
+        num_threads=4,
+        skip_weighted=True,
+    )
+    monkeypatch.setenv("FUSED_CPP_MOE_AVX512_K_LOOP", "auto")
+    candidate = fused_moe_bf16_tiled(
+        inputs,
+        packed,
+        topk_weights,
+        topk_ids,
+        num_threads=4,
+        skip_weighted=True,
+    )
+
+    _assert_bf16_close(candidate, baseline)
+
+
+def test_avx512_rejects_unknown_k_loop_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    inputs, w13, w2, topk_weights, topk_ids = _case(
+        tokens=1,
+        hidden=32,
+        intermediate=16,
+        experts=1,
+        top_k=1,
+        seed=822,
+    )
+    packed = prepare_fused_moe_bf16_tiled_weights(w13, w2, fuse_silu=True, backend="x86_avx512_bf16")
+    monkeypatch.setenv("FUSED_CPP_MOE_AVX512_IMPL", "jit")
+    monkeypatch.setenv("FUSED_CPP_MOE_AVX512_K_LOOP", "unknown")
+
+    with pytest.raises(
+        RuntimeError,
+        match="must be auto, baseline, no_prefetch, unroll2, unroll2_t0, or unroll2_t1",
+    ):
+        fused_moe_bf16_tiled(inputs, packed, topk_weights, topk_ids, num_threads=1)
+
+
 def test_avx512_rejects_unknown_implementation_mode(monkeypatch: pytest.MonkeyPatch) -> None:
     inputs, w13, w2, topk_weights, topk_ids = _case(
         tokens=1,

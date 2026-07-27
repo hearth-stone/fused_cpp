@@ -31,6 +31,17 @@ enum class Avx512BulkMNStage : uint8_t {
   kW2,
 };
 
+enum class Avx512KLoopStage : uint8_t {
+  kW13,
+  kW2,
+};
+
+enum class Avx512KLoopPolicy : uint8_t {
+  kBaseline,
+  kUnroll2,
+  kUnroll2T0,
+};
+
 struct X86CpuIdentity {
   bool is_intel = false;
   int family = 0;
@@ -67,6 +78,8 @@ bool UseAutomaticAvx512SmallMMultiN(Avx512SmallMMultiNStage stage, int rows, int
                                     int cooperative_threads = 1);
 bool UseAutomaticAvx512BulkMN(Avx512BulkMNStage stage, int rows, int reduction_size, int output_size,
                               int cooperative_threads = 1);
+Avx512KLoopPolicy ResolveAutomaticAvx512KLoop(Avx512KLoopStage stage, int rows, int reduction_size, int output_size,
+                                              int cooperative_threads = 1);
 AmxKernelPattern ResolveAutomaticAmxKernelPattern(int rows, int hidden_size, int intermediate_size);
 int ResolveAutomaticAmxCacheBlocks(AmxCacheStage stage, int k_pad, int rows, int hidden_size, int intermediate_size,
                                    AmxKernelPattern pattern);

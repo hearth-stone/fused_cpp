@@ -72,6 +72,31 @@ cooperative N-split measurements. The script manages
 `FUSED_CPP_MOE_AVX512_BULK_MN=auto|baseline|w13|w2|bulk_mn`; ordinary
 production runs do not need the variable.
 
+## x86 AVX-512 K-loop scheduling and packed-B prefetch
+
+`bench_avx512_k_loop.py` rotates the legacy single-pair loop, no-prefetch
+control, two-pair schedules with no/T0/T1 prefetch, and automatic policy on
+identical packed weights, inputs, and reused outputs. It checks every result
+against PyTorch and excludes packing, allocation, and JIT warm-up.
+
+```bash
+taskset -c 0-7 env PYTHONPATH=src \
+  FUSED_CPP_MOE_X86_ISA=avx512 \
+  FUSED_CPP_MOE_AVX512_IMPL=jit \
+  .venv/bin/python benchmarks/bench_avx512_k_loop.py \
+  --hidden 4096 --intermediate 512 --routes 12,48,96,256,2048 \
+  --threads 8 \
+  --variants baseline,no_prefetch,unroll2,unroll2_t0,unroll2_t1,auto \
+  --warmup 12 --runs 51
+```
+
+`bench_avx512_bf16_w13.cpp` isolates fused W13 GEMM and SiLU/multiply, while
+`bench_avx512_bf16_w2.cpp` isolates W2 without requiring oneDNN.
+`bench_avx512_bf16_gemm.cpp` retains the prepacked oneDNN W2 comparison. All
+three report the selected `FUSED_CPP_MOE_AVX512_K_LOOP` mode in JSON. The C8i8
+automatic thresholds, counter commands, and rejected variants are recorded in
+`optimizations/fused_moe_avx512/results/amazon_c8i_8core_avx512_k_loop_20260726.md`.
+
 ## x86 AMX MoE packed-B layout A/B
 
 `bench_amx_bf16_layouts.py` compares the production N32 packed weights with

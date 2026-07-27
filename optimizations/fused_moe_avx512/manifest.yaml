@@ -329,6 +329,39 @@ features:
       --threads 1 --variants baseline,w13,w2,bulk_mn,auto
       --warmup 16 --runs 201
 
+  - id: compute.avx512_k_loop
+    part: compute
+    status: enabled
+    implementation: >-
+      csrc/moe/x86/avx512_bf16/jit_kernels.cpp,
+      csrc/moe/x86/avx512_bf16/policy.cpp,
+      csrc/moe/x86/avx512_bf16/kernels.h, and
+      csrc/moe/x86/avx512_bf16/executor.cpp
+    hypothesis: >-
+      Consuming two adjacent BF16 K-pairs per generated loop reduces branch and
+      address-generation overhead, exposes packed-B load/VDPBF16PS overlap,
+      and permits independent accumulation chains at small exact M. A
+      stage-specific C8i policy retains W13's required T0 coverage until
+      repeated M panels keep B hot, while W2 prefetches its streaming B panel.
+    depends_on:
+      - layout.vnni2_packed_weights
+      - compute.xbyak_exact_m
+      - compute.avx512_bulk_mn
+      - dispatch.expert_team_nsplit_waves
+    conflicts_with: []
+    correctness: >-
+      PYTHONPATH=src FUSED_CPP_MOE_X86_ISA=avx512
+      .venv/bin/python -m pytest -q
+      tests/test_moe_backend_dispatch.py tests/test_moe_avx512_bf16.py
+    benchmark: >-
+      taskset -c 0-7 env PYTHONPATH=src FUSED_CPP_MOE_X86_ISA=avx512
+      FUSED_CPP_MOE_AVX512_IMPL=jit
+      .venv/bin/python benchmarks/bench_avx512_k_loop.py
+      --hidden 4096 --intermediate 512 --routes 12,48,96,256,2048
+      --threads 8
+      --variants baseline,no_prefetch,unroll2,unroll2_t0,unroll2_t1,auto
+      --warmup 12 --runs 51
+
   - id: schedule.n_window_cache_blocking
     part: schedule
     status: enabled
@@ -819,6 +852,7 @@ variants:
       - compute.xbyak_exact_m
       - compute.avx512_small_m_multi_n
       - compute.avx512_bulk_mn
+      - compute.avx512_k_loop
       - compute.xbyak_amx_m16n32
       - compute.xbyak_amx_1m4n
       - compute.xbyak_amx_2m2n
@@ -847,6 +881,7 @@ variants:
       - compute.xbyak_exact_m
       - compute.avx512_small_m_multi_n
       - compute.avx512_bulk_mn
+      - compute.avx512_k_loop
       - epilogue.silu_mul_packa
       - store.direct_route
       - epilogue.weighted_top1_direct

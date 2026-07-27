@@ -82,23 +82,19 @@ double Gflops(double flops, double milliseconds) { return flops / milliseconds /
 int main(int argc, char** argv) {
   try {
     const int m = argc > 1 ? ParsePositive(argv, 1, 12, "M") : 12;
-    const int k = argc > 2 ? ParsePositive(argv, 2, 4096, "K") : 4096;
-    const int features = argc > 3 ? ParsePositive(argv, 3, 512, "F") : 512;
+    const int k = argc > 2 ? ParsePositive(argv, 2, 512, "K") : 512;
+    const int n = argc > 3 ? ParsePositive(argv, 3, 4096, "N") : 4096;
     const int warmup = argc > 4 ? ParsePositive(argv, 4, 10, "warmup") : 10;
     const int runs = argc > 5 ? ParsePositive(argv, 5, 51, "runs") : 51;
-    const int degree = argc > 6 ? ParsePositive(argv, 6, 5, "degree") : 5;
-    if (degree != 4 && degree != 5 && degree != 6) {
-      throw std::invalid_argument("degree must be 4, 5, or 6");
-    }
     if (!avx512_moe::RuntimeSupported()) {
       std::cerr << "AVX-512 BF16 is not available at runtime\n";
       return 2;
     }
 
-    std::mt19937 generator(20260718);
+    std::mt19937 generator(20260726);
     std::normal_distribution<float> distribution(0.0f, 0.01f);
     std::vector<uint16_t> input(static_cast<size_t>(m) * k);
-    std::vector<uint16_t> weight(static_cast<size_t>(2) * features * k);
+    std::vector<uint16_t> weight(static_cast<size_t>(n) * k);
     for (uint16_t& value : input) {
       value = Bf16Bits(distribution(generator));
     }
@@ -107,34 +103,37 @@ int main(int argc, char** argv) {
     }
 
     const int k_pad = avx512_moe::RoundK(k);
-    const int feature_pad = ((features + 15) / 16) * 16;
+    const int n_pad = avx512_moe::RoundN(n);
     const int panels = (m + 11) / 12;
     std::vector<uint16_t> packed_a(static_cast<size_t>(panels) * 16 * k_pad);
-    std::vector<uint16_t> packed_b(static_cast<size_t>(2) * feature_pad * k_pad);
-    std::vector<uint16_t> output(static_cast<size_t>(panels) * 16 * feature_pad);
+    std::vector<uint16_t> packed_b(static_cast<size_t>(k_pad) * n_pad);
+    std::vector<float> output(static_cast<size_t>(m) * n);
+    std::vector<int64_t> route_ids(static_cast<size_t>(m));
+    for (int row = 0; row < m; ++row) {
+      route_ids[static_cast<size_t>(row)] = row;
+    }
     PackA(input.data(), packed_a.data(), m, k, k_pad);
-    avx512_moe::PackW13(weight.data(), packed_b.data(), features, k, k_pad, feature_pad);
+    avx512_moe::PackW2(weight.data(), packed_b.data(), n, k, k_pad, n_pad);
 
     auto kernel = [&]() {
-      avx512_moe::ComputeW13(packed_a.data(), k_pad, packed_b.data(), output.data(), feature_pad, m, k_pad, 0,
-                             feature_pad / 16, degree);
+      avx512_moe::ComputeW2(packed_a.data(), k_pad, packed_b.data(), output.data(), nullptr, route_ids.data(), n, m,
+                            k_pad, n, 0, n_pad / 32, false);
     };
     kernel();
     const avx512_moe::JitStats jit_stats = avx512_moe::GetJitStats();
     const auto [median_ms, best_ms] = Measure(kernel, warmup, runs);
-    uint64_t checksum = 0;
-    for (uint16_t value : output) {
+    double checksum = 0.0;
+    for (float value : output) {
       checksum += value;
     }
 
-    const double flops = 4.0 * m * k * features;
+    const double flops = 2.0 * m * k * n;
     const char* implementation = std::getenv("FUSED_CPP_MOE_AVX512_IMPL");
     const char* k_loop = std::getenv("FUSED_CPP_MOE_AVX512_K_LOOP");
-    std::cout << std::setprecision(10) << "{\"m\":" << m << ",\"k\":" << k << ",\"features\":" << features
-              << ",\"degree\":" << degree << ",\"warmup\":" << warmup << ",\"runs\":" << runs << ",\"custom_impl\":\""
-              << (implementation == nullptr ? "auto" : implementation) << "\",\"k_loop\":\""
-              << (k_loop == nullptr ? "auto" : k_loop) << "\",\"jit\":{\"kernel_count\":" << jit_stats.kernel_count
-              << ",\"code_bytes\":" << jit_stats.code_bytes
+    std::cout << std::setprecision(10) << "{\"m\":" << m << ",\"k\":" << k << ",\"n\":" << n << ",\"warmup\":" << warmup
+              << ",\"runs\":" << runs << ",\"custom_impl\":\"" << (implementation == nullptr ? "auto" : implementation)
+              << "\",\"k_loop\":\"" << (k_loop == nullptr ? "auto" : k_loop)
+              << "\",\"jit\":{\"kernel_count\":" << jit_stats.kernel_count << ",\"code_bytes\":" << jit_stats.code_bytes
               << ",\"generation_ms\":" << (static_cast<double>(jit_stats.generation_nanoseconds) / 1.0e6)
               << "},\"checksum\":" << checksum << ",\"kernel\":{\"median_ms\":" << median_ms
               << ",\"best_ms\":" << best_ms << ",\"median_gflops\":" << Gflops(flops, median_ms)

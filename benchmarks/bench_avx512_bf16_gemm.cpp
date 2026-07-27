@@ -176,10 +176,12 @@ int main(int argc, char** argv) {
     const double flops = 2.0 * m * k * n;
     const char* isa = std::getenv("ONEDNN_MAX_CPU_ISA");
     const char* custom_impl = std::getenv("FUSED_CPP_MOE_AVX512_IMPL");
+    const char* k_loop = std::getenv("FUSED_CPP_MOE_AVX512_K_LOOP");
     std::cout << std::setprecision(10) << "{\"m\":" << m << ",\"k\":" << k << ",\"n\":" << n << ",\"warmup\":" << warmup
               << ",\"runs\":" << runs << ",\"onednn_max_cpu_isa\":\"" << (isa == nullptr ? "" : isa)
-              << "\",\"custom_impl\":\"" << (custom_impl == nullptr ? "auto" : custom_impl)
-              << "\",\"jit\":{\"kernel_count\":" << jit_stats.kernel_count << ",\"code_bytes\":" << jit_stats.code_bytes
+              << "\",\"custom_impl\":\"" << (custom_impl == nullptr ? "auto" : custom_impl) << "\",\"k_loop\":\""
+              << (k_loop == nullptr ? "auto" : k_loop) << "\",\"jit\":{\"kernel_count\":" << jit_stats.kernel_count
+              << ",\"code_bytes\":" << jit_stats.code_bytes
               << ",\"generation_ms\":" << (static_cast<double>(jit_stats.generation_nanoseconds) / 1.0e6) << "}"
               << ",\"onednn_impl\":\"" << descriptor.impl_info_str() << "\",\"max_abs\":" << max_abs
               << ",\"checksum\":" << checksum << ",\"custom_kernel\":{\"median_ms\":" << custom_median

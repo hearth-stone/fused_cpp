@@ -38,9 +38,10 @@ void ComputeW2Intrinsic(const uint16_t* a, int a_stride, const uint16_t* packed_
                         const float* route_weights = nullptr);
 
 // Resolve all exact-M kernels needed by the current routing plan before worker
-// threads start. K is intentionally dynamic and is not part of the cache key.
+// threads start. K is intentionally dynamic and is not part of the cache key;
+// logical H/F and team width select dimension-aware generated schedules.
 void PrepareJitKernels(const std::vector<int>& row_counts, int silu_poly_degree, int hidden_size, bool direct_bf16,
-                       bool weighted_direct_bf16 = false);
+                       bool weighted_direct_bf16 = false, int intermediate_size = 0, int cooperative_threads = 1);
 
 // AMX consumes row-major M16 panels and the same K-pair/N32 packed weights as
 // AVX-512. K is padded to 32 BF16 elements by the AMX backend.

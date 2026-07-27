@@ -770,7 +770,8 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input, at::Tensor w13_packed, int64_t
                                      use_weighted_top1_direct, amx_b_layout, static_cast<int>(f_size));
   } else {
     avx512_moe::PrepareJitKernels(jit_row_counts, silu_poly_degree, static_cast<int>(input.size(1)), direct_bf16,
-                                  use_weighted_top1_direct);
+                                  use_weighted_top1_direct, static_cast<int>(f_size),
+                                  static_cast<int>(execution_threads));
   }
 
   const int f_pad = w13_shape.n_pad / 2;

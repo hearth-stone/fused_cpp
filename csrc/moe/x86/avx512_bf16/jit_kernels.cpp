@@ -97,6 +97,7 @@ BulkMNMode GetBulkMNMode() {
 enum class X86JitIsa : uint8_t { kAvx512Bf16, kAmxBf16 };
 enum class JitOperation : uint8_t { kW13, kW2 };
 enum class JitOutput : uint8_t { kPackedBf16, kRouteF32, kContiguousF32, kDirectBf16, kWeightedDirectBf16 };
+enum class Avx512KLoopMode : uint8_t { kAuto, kBaseline, kNoPrefetch, kUnroll2, kUnroll2T0, kUnroll2T1 };
 enum class AmxJitPattern : uint8_t { kM1N2, kM2N2, kM1N4 };
 enum class AmxSiluEpilogue : uint8_t { kBaseline, kResident, kPipelined, kRcp14 };
 enum class AmxW2Epilogue : uint8_t { kBaseline, kCombined, kTileStore };
@@ -105,6 +106,58 @@ enum class AmxBLoadHint : uint8_t { kTileLoadD, kTileLoadDT1, kPrefetchT0, kPref
 enum class AmxKLoadPipeline : uint8_t { kBaseline, kPipelined };
 
 constexpr int kAmxBLoadDT1MinRows = 128;
+
+Avx512KLoopMode ResolveAvx512KLoopMode() {
+  const char* raw = std::getenv("FUSED_CPP_MOE_AVX512_K_LOOP");
+  const std::string value = raw == nullptr ? "auto" : raw;
+  if (value.empty() || value == "auto") {
+    return Avx512KLoopMode::kAuto;
+  }
+  if (value == "baseline") {
+    return Avx512KLoopMode::kBaseline;
+  }
+  if (value == "no_prefetch") {
+    return Avx512KLoopMode::kNoPrefetch;
+  }
+  if (value == "unroll2") {
+    return Avx512KLoopMode::kUnroll2;
+  }
+  if (value == "unroll2_t0") {
+    return Avx512KLoopMode::kUnroll2T0;
+  }
+  if (value == "unroll2_t1") {
+    return Avx512KLoopMode::kUnroll2T1;
+  }
+  throw std::runtime_error(
+      "FUSED_CPP_MOE_AVX512_K_LOOP must be auto, baseline, no_prefetch, unroll2, unroll2_t0, or unroll2_t1; got '" +
+      value + "'");
+}
+
+Avx512KLoopMode ResolveAutomaticKLoopMode(Avx512KLoopStage stage, int rows, int reduction_size, int output_size,
+                                          int cooperative_threads, Avx512KLoopMode requested) {
+  if (requested != Avx512KLoopMode::kAuto) {
+    return requested;
+  }
+  switch (ResolveAutomaticAvx512KLoop(stage, rows, reduction_size, output_size, cooperative_threads)) {
+    case Avx512KLoopPolicy::kBaseline:
+      return Avx512KLoopMode::kBaseline;
+    case Avx512KLoopPolicy::kUnroll2:
+      return Avx512KLoopMode::kUnroll2;
+    case Avx512KLoopPolicy::kUnroll2T0:
+      return Avx512KLoopMode::kUnroll2T0;
+  }
+  return Avx512KLoopMode::kBaseline;
+}
+
+bool UsesAvx512KUnroll2(Avx512KLoopMode mode) {
+  return mode == Avx512KLoopMode::kUnroll2 || mode == Avx512KLoopMode::kUnroll2T0 ||
+         mode == Avx512KLoopMode::kUnroll2T1;
+}
+
+bool UsesAvx512KPrefetch(Avx512KLoopMode mode) {
+  return mode == Avx512KLoopMode::kBaseline || mode == Avx512KLoopMode::kUnroll2T0 ||
+         mode == Avx512KLoopMode::kUnroll2T1;
+}
 
 size_t AmxPatternIndex(AmxJitPattern pattern) { return static_cast<size_t>(pattern); }
 
@@ -320,13 +373,16 @@ struct KernelKey {
   AmxBLoadHint amx_b_load_hint = AmxBLoadHint::kTileLoadD;
   AmxKLoadPipeline amx_k_load_pipeline = AmxKLoadPipeline::kBaseline;
   bool avx512_bulk_mn = false;
+  Avx512KLoopMode avx512_k_loop = Avx512KLoopMode::kBaseline;
 
   bool operator<(const KernelKey& other) const {
     return std::tie(isa, operation, rows, n_valid, silu_degree, output, amx_pattern, amx_silu_epilogue, amx_w2_epilogue,
-                    amx_tile_state_mode, amx_b_layout, amx_b_load_hint, amx_k_load_pipeline, avx512_bulk_mn) <
-           std::tie(other.isa, other.operation, other.rows, other.n_valid, other.silu_degree, other.output,
-                    other.amx_pattern, other.amx_silu_epilogue, other.amx_w2_epilogue, other.amx_tile_state_mode,
-                    other.amx_b_layout, other.amx_b_load_hint, other.amx_k_load_pipeline, other.avx512_bulk_mn);
+                    amx_tile_state_mode, amx_b_layout, amx_b_load_hint, amx_k_load_pipeline, avx512_bulk_mn,
+                    avx512_k_loop) < std::tie(other.isa, other.operation, other.rows, other.n_valid, other.silu_degree,
+                                              other.output, other.amx_pattern, other.amx_silu_epilogue,
+                                              other.amx_w2_epilogue, other.amx_tile_state_mode, other.amx_b_layout,
+                                              other.amx_b_load_hint, other.amx_k_load_pipeline, other.avx512_bulk_mn,
+                                              other.avx512_k_loop);
   }
 };
 
@@ -414,12 +470,16 @@ struct KernelHandle {
 
 class W13Generator final : public Xbyak::CodeGenerator {
  public:
-  W13Generator(int rows, int degree, int feature_blocks, bool bulk_mn)
+  W13Generator(int rows, int degree, int feature_blocks, bool bulk_mn, Avx512KLoopMode k_loop_mode)
       : Xbyak::CodeGenerator(16 * 1024, Xbyak::AutoGrow),
         rows_(rows),
         degree_(degree),
         feature_blocks_(feature_blocks),
-        accumulator_count_(rows * feature_blocks * 2),
+        k_loop_mode_(k_loop_mode),
+        base_accumulator_count_(rows * feature_blocks * 2),
+        split_accumulators_(UsesAvx512KUnroll2(k_loop_mode) && base_accumulator_count_ <= 12),
+        accumulator_sets_(split_accumulators_ ? 2 : 1),
+        accumulator_count_(base_accumulator_count_ * accumulator_sets_),
         bulk_mn_(bulk_mn) {
     Generate();
     readyRE();
@@ -429,7 +489,9 @@ class W13Generator final : public Xbyak::CodeGenerator {
   static constexpr int kABytesPerPair = 64;
   static constexpr int kBBytesPerPair = 128;
 
-  Xbyak::Zmm Accumulator(int block, int row, int half) const { return Xbyak::Zmm((block * rows_ + row) * 2 + half); }
+  Xbyak::Zmm Accumulator(int block, int row, int half, int set = 0) const {
+    return Xbyak::Zmm(set * base_accumulator_count_ + (block * rows_ + row) * 2 + half);
+  }
 
   Xbyak::Zmm AValue(int row) const { return Xbyak::Zmm(accumulator_count_ + row); }
 
@@ -454,24 +516,90 @@ class W13Generator final : public Xbyak::CodeGenerator {
     }
   }
 
-  void PrefetchB(int block) {
-    constexpr int kPrefetchDistance = 8 * kBBytesPerPair;
+  int PrefetchDistance() const { return (k_loop_mode_ == Avx512KLoopMode::kUnroll2T1 ? 16 : 8) * kBBytesPerPair; }
+
+  void EmitBPrefetch(const Xbyak::Address& address) {
+    if (k_loop_mode_ == Avx512KLoopMode::kUnroll2T1) {
+      prefetcht1(address);
+    } else {
+      prefetcht0(address);
+    }
+  }
+
+  void PrefetchB(int block, int pair_byte_offset = 0) {
+    if (!UsesAvx512KPrefetch(k_loop_mode_)) {
+      return;
+    }
+    const int byte_offset = PrefetchDistance() + pair_byte_offset;
     switch (block) {
       case 0:
-        prefetcht0(ptr[r9 + kPrefetchDistance]);
+        EmitBPrefetch(ptr[r9 + byte_offset]);
         return;
       case 1:
-        prefetcht0(ptr[r9 + r11 + kPrefetchDistance]);
+        EmitBPrefetch(ptr[r9 + r11 + byte_offset]);
         return;
       case 2:
-        prefetcht0(ptr[r9 + r11 * 2 + kPrefetchDistance]);
+        EmitBPrefetch(ptr[r9 + r11 * 2 + byte_offset]);
         return;
       case 3:
-        prefetcht0(ptr[r9 + rdx + kPrefetchDistance]);
+        EmitBPrefetch(ptr[r9 + rdx + byte_offset]);
         return;
       default:
         throw std::invalid_argument("invalid AVX-512 W13 multi-N prefetch block");
     }
+  }
+
+  void EmitSingleBlockCompute(int accumulator_set, int a_byte_offset, const Xbyak::Zmm& gate, const Xbyak::Zmm& up) {
+    for (int row = 0; row < rows_; ++row) {
+      vpbroadcastd(Xbyak::Zmm(26), dword[r8 + a_byte_offset + row * 4]);
+      vdpbf16ps(Accumulator(0, row, 0, accumulator_set), gate, Xbyak::Zmm(26));
+      vdpbf16ps(Accumulator(0, row, 1, accumulator_set), up, Xbyak::Zmm(26));
+    }
+  }
+
+  void EmitKPair(int accumulator_set, int a_byte_offset, int b_byte_offset) {
+    if (feature_blocks_ == 1) {
+      vmovdqu16(Xbyak::Zmm(24), ptr[r9 + b_byte_offset]);
+      vmovdqu16(Xbyak::Zmm(25), ptr[r9 + b_byte_offset + 64]);
+      PrefetchB(0, b_byte_offset);
+      EmitSingleBlockCompute(accumulator_set, a_byte_offset, Xbyak::Zmm(24), Xbyak::Zmm(25));
+      return;
+    }
+
+    for (int row = 0; row < rows_; ++row) {
+      vpbroadcastd(AValue(row), dword[r8 + a_byte_offset + row * 4]);
+    }
+    for (int block = 0; block < feature_blocks_; ++block) {
+      LoadB(BValue(), block, b_byte_offset);
+      for (int row = 0; row < rows_; ++row) {
+        vdpbf16ps(Accumulator(block, row, 0, accumulator_set), BValue(), AValue(row));
+      }
+      LoadB(BValue(), block, b_byte_offset + 64);
+      for (int row = 0; row < rows_; ++row) {
+        vdpbf16ps(Accumulator(block, row, 1, accumulator_set), BValue(), AValue(row));
+      }
+      PrefetchB(block, b_byte_offset);
+    }
+  }
+
+  void EmitUnrolledKPairGroup() {
+    const int second_set = split_accumulators_ ? 1 : 0;
+    if (feature_blocks_ == 1) {
+      // Load the next pair before starting the current pair's arithmetic. The
+      // independent B registers let the out-of-order core overlap both cache
+      // line loads with the 24-way M12 accumulator schedule.
+      vmovdqu16(Xbyak::Zmm(24), ptr[r9]);
+      vmovdqu16(Xbyak::Zmm(25), ptr[r9 + 64]);
+      vmovdqu16(Xbyak::Zmm(27), ptr[r9 + kBBytesPerPair]);
+      vmovdqu16(Xbyak::Zmm(28), ptr[r9 + kBBytesPerPair + 64]);
+      PrefetchB(0);
+      PrefetchB(0, kBBytesPerPair);
+      EmitSingleBlockCompute(0, 0, Xbyak::Zmm(24), Xbyak::Zmm(25));
+      EmitSingleBlockCompute(second_set, kABytesPerPair, Xbyak::Zmm(27), Xbyak::Zmm(28));
+      return;
+    }
+    EmitKPair(0, 0, 0);
+    EmitKPair(second_set, kABytesPerPair, kBBytesPerPair);
   }
 
   void BroadcastFloat(const Xbyak::Zmm& destination, size_t offset) {
@@ -536,49 +664,58 @@ class W13Generator final : public Xbyak::CodeGenerator {
   }
 
   void EmitPanel() {
-    for (int block = 0; block < feature_blocks_; ++block) {
-      for (int row = 0; row < rows_; ++row) {
-        vxorps(Accumulator(block, row, 0), Accumulator(block, row, 0), Accumulator(block, row, 0));
-        vxorps(Accumulator(block, row, 1), Accumulator(block, row, 1), Accumulator(block, row, 1));
+    for (int set = 0; set < accumulator_sets_; ++set) {
+      for (int block = 0; block < feature_blocks_; ++block) {
+        for (int row = 0; row < rows_; ++row) {
+          vxorps(Accumulator(block, row, 0, set), Accumulator(block, row, 0, set), Accumulator(block, row, 0, set));
+          vxorps(Accumulator(block, row, 1, set), Accumulator(block, row, 1, set), Accumulator(block, row, 1, set));
+        }
       }
     }
 
-    Xbyak::Label k_loop;
-    Xbyak::Label k_done;
-    test(rcx, rcx);
-    jz(k_done, T_NEAR);
-    align(64);
-    L(k_loop);
-    if (feature_blocks_ == 1) {
-      vmovdqu16(Xbyak::Zmm(24), ptr[r9]);
-      vmovdqu16(Xbyak::Zmm(25), ptr[r9 + 64]);
-      prefetcht0(ptr[r9 + 8 * kBBytesPerPair]);
-      for (int row = 0; row < rows_; ++row) {
-        vpbroadcastd(Xbyak::Zmm(26), dword[r8 + row * 4]);
-        vdpbf16ps(Accumulator(0, row, 0), Xbyak::Zmm(24), Xbyak::Zmm(26));
-        vdpbf16ps(Accumulator(0, row, 1), Xbyak::Zmm(25), Xbyak::Zmm(26));
+    if (UsesAvx512KUnroll2(k_loop_mode_)) {
+      Xbyak::Label k_loop;
+      Xbyak::Label k_tail;
+      Xbyak::Label k_reduce;
+      cmp(rcx, 2);
+      jb(k_tail, T_NEAR);
+      align(64);
+      L(k_loop);
+      EmitUnrolledKPairGroup();
+      add(r8, 2 * kABytesPerPair);
+      add(r9, 2 * kBBytesPerPair);
+      sub(rcx, 2);
+      cmp(rcx, 2);
+      jae(k_loop, T_NEAR);
+      L(k_tail);
+      test(rcx, rcx);
+      jz(k_reduce, T_NEAR);
+      EmitKPair(0, 0, 0);
+      add(r8, kABytesPerPair);
+      add(r9, kBBytesPerPair);
+      L(k_reduce);
+      if (split_accumulators_) {
+        for (int block = 0; block < feature_blocks_; ++block) {
+          for (int row = 0; row < rows_; ++row) {
+            vaddps(Accumulator(block, row, 0), Accumulator(block, row, 0), Accumulator(block, row, 0, 1));
+            vaddps(Accumulator(block, row, 1), Accumulator(block, row, 1), Accumulator(block, row, 1, 1));
+          }
+        }
       }
     } else {
-      for (int row = 0; row < rows_; ++row) {
-        vpbroadcastd(AValue(row), dword[r8 + row * 4]);
-      }
-      for (int block = 0; block < feature_blocks_; ++block) {
-        LoadB(BValue(), block, 0);
-        for (int row = 0; row < rows_; ++row) {
-          vdpbf16ps(Accumulator(block, row, 0), BValue(), AValue(row));
-        }
-        LoadB(BValue(), block, 64);
-        for (int row = 0; row < rows_; ++row) {
-          vdpbf16ps(Accumulator(block, row, 1), BValue(), AValue(row));
-        }
-        PrefetchB(block);
-      }
+      Xbyak::Label k_loop;
+      Xbyak::Label k_done;
+      test(rcx, rcx);
+      jz(k_done, T_NEAR);
+      align(64);
+      L(k_loop);
+      EmitKPair(0, 0, 0);
+      add(r8, kABytesPerPair);
+      add(r9, kBBytesPerPair);
+      dec(rcx);
+      jnz(k_loop, T_NEAR);
+      L(k_done);
     }
-    add(r8, kABytesPerPair);
-    add(r9, kBBytesPerPair);
-    dec(rcx);
-    jnz(k_loop, T_NEAR);
-    L(k_done);
 
     for (int block = 0; block < feature_blocks_; ++block) {
       for (int row = 0; row < rows_; ++row) {
@@ -693,13 +830,18 @@ class W13Generator final : public Xbyak::CodeGenerator {
   int rows_;
   int degree_;
   int feature_blocks_;
+  Avx512KLoopMode k_loop_mode_;
+  int base_accumulator_count_;
+  bool split_accumulators_;
+  int accumulator_sets_;
   int accumulator_count_;
   bool bulk_mn_;
 };
 
 class W2Generator final : public Xbyak::CodeGenerator {
  public:
-  W2Generator(int rows, int n_valid, bool direct_bf16, bool weighted_direct_bf16, bool bulk_mn)
+  W2Generator(int rows, int n_valid, bool direct_bf16, bool weighted_direct_bf16, bool bulk_mn,
+              Avx512KLoopMode k_loop_mode)
       : Xbyak::CodeGenerator(16 * 1024, Xbyak::AutoGrow),
         rows_(rows),
         n_valid_(n_valid),
@@ -711,7 +853,8 @@ class W2Generator final : public Xbyak::CodeGenerator {
         multi_n_(n_valid > 32),
         direct_bf16_(direct_bf16),
         weighted_direct_bf16_(weighted_direct_bf16),
-        bulk_mn_(bulk_mn) {
+        bulk_mn_(bulk_mn),
+        k_loop_mode_(k_loop_mode) {
     Generate();
     readyRE();
   }
@@ -728,9 +871,9 @@ class W2Generator final : public Xbyak::CodeGenerator {
 
   Xbyak::Zmm BValue() const { return Xbyak::Zmm(accumulator_registers_ + rows_); }
 
-  void LoadMultiNB(int half) {
+  void LoadMultiNB(int half, int pair_byte_offset) {
     const int block = half / 2;
-    const int byte_offset = (half % 2) * 64;
+    const int byte_offset = pair_byte_offset + (half % 2) * 64;
     switch (block) {
       case 0:
         vmovdqu16(BValue(), ptr[r9 + byte_offset]);
@@ -749,32 +892,97 @@ class W2Generator final : public Xbyak::CodeGenerator {
     }
   }
 
-  void EmitKPair(int accumulator_set) {
+  int PrefetchDistance() const { return (k_loop_mode_ == Avx512KLoopMode::kUnroll2T1 ? 16 : 8) * kBBytesPerPair; }
+
+  void EmitBPrefetch(const Xbyak::Address& address) {
+    if (k_loop_mode_ == Avx512KLoopMode::kUnroll2T1) {
+      prefetcht1(address);
+    } else {
+      prefetcht0(address);
+    }
+  }
+
+  void PrefetchB(int block, int pair_byte_offset) {
+    if (k_loop_mode_ != Avx512KLoopMode::kUnroll2T0 && k_loop_mode_ != Avx512KLoopMode::kUnroll2T1) {
+      return;
+    }
+    const int byte_offset = PrefetchDistance() + pair_byte_offset;
+    switch (block) {
+      case 0:
+        EmitBPrefetch(ptr[r9 + byte_offset]);
+        return;
+      case 1:
+        EmitBPrefetch(ptr[r9 + r12 + byte_offset]);
+        return;
+      case 2:
+        EmitBPrefetch(ptr[r9 + r12 * 2 + byte_offset]);
+        return;
+      case 3:
+        EmitBPrefetch(ptr[r9 + r13 + byte_offset]);
+        return;
+      default:
+        throw std::invalid_argument("invalid AVX-512 W2 multi-N prefetch block");
+    }
+  }
+
+  void EmitNonMultiNCompute(int accumulator_set, int a_byte_offset, const Xbyak::Zmm& first, const Xbyak::Zmm& second) {
+    for (int row = 0; row < rows_; ++row) {
+      vpbroadcastd(Xbyak::Zmm(26), dword[r8 + a_byte_offset + row * 4]);
+      vdpbf16ps(Accumulator(row, 0, accumulator_set), first, Xbyak::Zmm(26));
+      if (halves_ == 2) {
+        vdpbf16ps(Accumulator(row, 1, accumulator_set), second, Xbyak::Zmm(26));
+      }
+    }
+  }
+
+  void EmitKPair(int accumulator_set, int a_byte_offset, int b_byte_offset) {
+    if (!multi_n_) {
+      vmovdqu16(Xbyak::Zmm(24), ptr[r9 + b_byte_offset]);
+      if (halves_ == 2) {
+        vmovdqu16(Xbyak::Zmm(25), ptr[r9 + b_byte_offset + 64]);
+      }
+      PrefetchB(0, b_byte_offset);
+      EmitNonMultiNCompute(accumulator_set, a_byte_offset, Xbyak::Zmm(24), Xbyak::Zmm(25));
+    } else {
+      for (int row = 0; row < rows_; ++row) {
+        vpbroadcastd(AValue(row), dword[r8 + a_byte_offset + row * 4]);
+      }
+      for (int half = 0; half < halves_; ++half) {
+        LoadMultiNB(half, b_byte_offset);
+        for (int row = 0; row < rows_; ++row) {
+          vdpbf16ps(Accumulator(row, half, accumulator_set), BValue(), AValue(row));
+        }
+        if ((half & 1) != 0 || half + 1 == halves_) {
+          PrefetchB(half / 2, b_byte_offset);
+        }
+      }
+    }
+  }
+
+  void EmitKPairAndAdvance(int accumulator_set) {
+    EmitKPair(accumulator_set, 0, 0);
+    add(r8, kABytesPerPair);
+    add(r9, kBBytesPerPair);
+  }
+
+  void EmitUnrolledKPairGroup(int second_accumulator_set) {
     if (!multi_n_) {
       vmovdqu16(Xbyak::Zmm(24), ptr[r9]);
       if (halves_ == 2) {
         vmovdqu16(Xbyak::Zmm(25), ptr[r9 + 64]);
       }
-      for (int row = 0; row < rows_; ++row) {
-        vpbroadcastd(Xbyak::Zmm(26), dword[r8 + row * 4]);
-        vdpbf16ps(Accumulator(row, 0, accumulator_set), Xbyak::Zmm(24), Xbyak::Zmm(26));
-        if (halves_ == 2) {
-          vdpbf16ps(Accumulator(row, 1, accumulator_set), Xbyak::Zmm(25), Xbyak::Zmm(26));
-        }
+      vmovdqu16(Xbyak::Zmm(27), ptr[r9 + kBBytesPerPair]);
+      if (halves_ == 2) {
+        vmovdqu16(Xbyak::Zmm(28), ptr[r9 + kBBytesPerPair + 64]);
       }
-    } else {
-      for (int row = 0; row < rows_; ++row) {
-        vpbroadcastd(AValue(row), dword[r8 + row * 4]);
-      }
-      for (int half = 0; half < halves_; ++half) {
-        LoadMultiNB(half);
-        for (int row = 0; row < rows_; ++row) {
-          vdpbf16ps(Accumulator(row, half, accumulator_set), BValue(), AValue(row));
-        }
-      }
+      PrefetchB(0, 0);
+      PrefetchB(0, kBBytesPerPair);
+      EmitNonMultiNCompute(0, 0, Xbyak::Zmm(24), Xbyak::Zmm(25));
+      EmitNonMultiNCompute(second_accumulator_set, kABytesPerPair, Xbyak::Zmm(27), Xbyak::Zmm(28));
+      return;
     }
-    add(r8, kABytesPerPair);
-    add(r9, kBBytesPerPair);
+    EmitKPair(0, 0, 0);
+    EmitKPair(second_accumulator_set, kABytesPerPair, kBBytesPerPair);
   }
 
   static uint16_t MaskFor(int valid) {
@@ -819,21 +1027,46 @@ class W2Generator final : public Xbyak::CodeGenerator {
       jb(k_tail, T_NEAR);
       align(64);
       L(k_loop);
-      EmitKPair(0);
-      EmitKPair(1);
+      if (UsesAvx512KUnroll2(k_loop_mode_)) {
+        EmitUnrolledKPairGroup(1);
+        add(r8, 2 * kABytesPerPair);
+        add(r9, 2 * kBBytesPerPair);
+      } else {
+        EmitKPairAndAdvance(0);
+        EmitKPairAndAdvance(1);
+      }
       sub(rcx, 2);
       cmp(rcx, 2);
       jae(k_loop, T_NEAR);
       L(k_tail);
       test(rcx, rcx);
       jz(k_reduce, T_NEAR);
-      EmitKPair(0);
+      EmitKPairAndAdvance(0);
       L(k_reduce);
       for (int row = 0; row < rows_; ++row) {
         for (int half = 0; half < halves_; ++half) {
           vaddps(Accumulator(row, half), Accumulator(row, half), Accumulator(row, half, 1));
         }
       }
+    } else if (UsesAvx512KUnroll2(k_loop_mode_)) {
+      Xbyak::Label k_loop;
+      Xbyak::Label k_tail;
+      Xbyak::Label k_done;
+      cmp(rcx, 2);
+      jb(k_tail, T_NEAR);
+      align(64);
+      L(k_loop);
+      EmitUnrolledKPairGroup(0);
+      add(r8, 2 * kABytesPerPair);
+      add(r9, 2 * kBBytesPerPair);
+      sub(rcx, 2);
+      cmp(rcx, 2);
+      jae(k_loop, T_NEAR);
+      L(k_tail);
+      test(rcx, rcx);
+      jz(k_done, T_NEAR);
+      EmitKPairAndAdvance(0);
+      L(k_done);
     } else {
       Xbyak::Label k_loop;
       Xbyak::Label k_done;
@@ -841,7 +1074,7 @@ class W2Generator final : public Xbyak::CodeGenerator {
       jz(k_done, T_NEAR);
       align(64);
       L(k_loop);
-      EmitKPair(0);
+      EmitKPairAndAdvance(0);
       dec(rcx);
       jnz(k_loop, T_NEAR);
       L(k_done);
@@ -995,6 +1228,7 @@ class W2Generator final : public Xbyak::CodeGenerator {
   bool direct_bf16_;
   bool weighted_direct_bf16_;
   bool bulk_mn_;
+  Avx512KLoopMode k_loop_mode_;
 };
 
 #pragma pack(push, 1)
@@ -2453,13 +2687,14 @@ KernelHandle GenerateKernel(const KernelKey& key) {
     return KernelHandle{owner, owner->getCode<JitFunction>(), owner->getSize(), {}};
   }
   if (key.operation == JitOperation::kW13) {
-    auto owner = std::make_shared<W13Generator>(key.rows, key.silu_degree, key.n_valid / 16, key.avx512_bulk_mn);
+    auto owner = std::make_shared<W13Generator>(key.rows, key.silu_degree, key.n_valid / 16, key.avx512_bulk_mn,
+                                                key.avx512_k_loop);
     return KernelHandle{owner, owner->getCode<JitFunction>(), owner->getSize(), {}};
   }
   const bool weighted_direct_bf16 = key.output == JitOutput::kWeightedDirectBf16;
   const bool direct_bf16 = key.output == JitOutput::kDirectBf16 || weighted_direct_bf16;
-  auto owner =
-      std::make_shared<W2Generator>(key.rows, key.n_valid, direct_bf16, weighted_direct_bf16, key.avx512_bulk_mn);
+  auto owner = std::make_shared<W2Generator>(key.rows, key.n_valid, direct_bf16, weighted_direct_bf16,
+                                             key.avx512_bulk_mn, key.avx512_k_loop);
   return KernelHandle{owner, owner->getCode<JitFunction>(), owner->getSize(), {}};
 }
 
@@ -2495,20 +2730,24 @@ KernelHandle ResolveKernel(const KernelKey& key, ImplementationMode mode) {
   return handle;
 }
 
-KernelKey W13Key(int rows, int degree, int feature_blocks = 1, bool bulk_mn = false) {
+KernelKey W13Key(int rows, int degree, int feature_blocks = 1, bool bulk_mn = false,
+                 Avx512KLoopMode k_loop_mode = Avx512KLoopMode::kBaseline) {
   KernelKey key{X86JitIsa::kAvx512Bf16,       JitOperation::kW13,
                 static_cast<uint8_t>(rows),   static_cast<uint8_t>(feature_blocks * 16),
                 static_cast<uint8_t>(degree), JitOutput::kPackedBf16};
   key.avx512_bulk_mn = bulk_mn;
+  key.avx512_k_loop = k_loop_mode;
   return key;
 }
 
-KernelKey W2Key(int rows, int n_valid, bool direct_bf16, bool weighted_direct_bf16, bool bulk_mn = false) {
+KernelKey W2Key(int rows, int n_valid, bool direct_bf16, bool weighted_direct_bf16, bool bulk_mn = false,
+                Avx512KLoopMode k_loop_mode = Avx512KLoopMode::kBaseline) {
   const JitOutput output = weighted_direct_bf16 ? JitOutput::kWeightedDirectBf16
                                                 : (direct_bf16 ? JitOutput::kDirectBf16 : JitOutput::kRouteF32);
   KernelKey key{
       X86JitIsa::kAvx512Bf16, JitOperation::kW2, static_cast<uint8_t>(rows), static_cast<uint8_t>(n_valid), 0, output};
   key.avx512_bulk_mn = bulk_mn;
+  key.avx512_k_loop = k_loop_mode;
   return key;
 }
 
@@ -2624,38 +2863,41 @@ KernelKey AmxW2Key(int rows, int n_valid, bool direct_bf16, bool weighted_direct
 }
 
 bool ResolveRowKernels(int rows, int degree, int hidden_size, bool direct_bf16, bool weighted_direct_bf16,
-                       ImplementationMode mode) {
-  if (!ResolveKernel(W13Key(rows, degree), mode)) {
+                       ImplementationMode mode, Avx512KLoopMode k_loop_mode) {
+  if (!ResolveKernel(W13Key(rows, degree, 1, false, k_loop_mode), mode)) {
     return false;
   }
-  if (hidden_size >= 32 && !ResolveKernel(W2Key(rows, 32, direct_bf16, weighted_direct_bf16), mode)) {
+  if (hidden_size >= 32 &&
+      !ResolveKernel(W2Key(rows, 32, direct_bf16, weighted_direct_bf16, false, k_loop_mode), mode)) {
     return false;
   }
   const int tail = hidden_size % 32;
-  if (tail != 0 && !ResolveKernel(W2Key(rows, tail, direct_bf16, weighted_direct_bf16), mode)) {
+  if (tail != 0 && !ResolveKernel(W2Key(rows, tail, direct_bf16, weighted_direct_bf16, false, k_loop_mode), mode)) {
     return false;
   }
   return true;
 }
 
 bool ResolveSmallMMultiNKernels(int rows, int degree, int hidden_size, bool direct_bf16, bool weighted_direct_bf16,
-                                ImplementationMode mode, SmallMMultiNMode multi_n_mode) {
+                                ImplementationMode mode, SmallMMultiNMode multi_n_mode, Avx512KLoopMode k_loop_mode) {
   if (multi_n_mode == SmallMMultiNMode::kBaseline || rows < 1 || rows > 4) {
     return true;
   }
   if (SmallMMultiNMayUseW13(multi_n_mode)) {
-    if (!ResolveKernel(W13Key(rows, degree, 2), mode)) {
+    if (!ResolveKernel(W13Key(rows, degree, 2, false, k_loop_mode), mode)) {
       return false;
     }
-    if (rows <= 3 && !ResolveKernel(W13Key(rows, degree, 4), mode)) {
+    if (rows <= 3 && !ResolveKernel(W13Key(rows, degree, 4, false, k_loop_mode), mode)) {
       return false;
     }
   }
   if (SmallMMultiNMayUseW2(multi_n_mode)) {
-    if (hidden_size >= 64 && !ResolveKernel(W2Key(rows, 64, direct_bf16, weighted_direct_bf16), mode)) {
+    if (hidden_size >= 64 &&
+        !ResolveKernel(W2Key(rows, 64, direct_bf16, weighted_direct_bf16, false, k_loop_mode), mode)) {
       return false;
     }
-    if (rows <= 2 && hidden_size >= 128 && !ResolveKernel(W2Key(rows, 128, direct_bf16, weighted_direct_bf16), mode)) {
+    if (rows <= 2 && hidden_size >= 128 &&
+        !ResolveKernel(W2Key(rows, 128, direct_bf16, weighted_direct_bf16, false, k_loop_mode), mode)) {
       return false;
     }
   }
@@ -2663,15 +2905,15 @@ bool ResolveSmallMMultiNKernels(int rows, int degree, int hidden_size, bool dire
 }
 
 bool ResolveBulkMNKernels(int degree, bool direct_bf16, bool weighted_direct_bf16, ImplementationMode mode,
-                          BulkMNMode bulk_mn_mode) {
+                          BulkMNMode bulk_mn_mode, Avx512KLoopMode k_loop_mode) {
   if (bulk_mn_mode == BulkMNMode::kBaseline) {
     return true;
   }
-  if (BulkMNMayUseW13(bulk_mn_mode) && !ResolveKernel(W13Key(12, degree, 1, true), mode)) {
+  if (BulkMNMayUseW13(bulk_mn_mode) && !ResolveKernel(W13Key(12, degree, 1, true, k_loop_mode), mode)) {
     return false;
   }
   if (bulk_mn_mode != BulkMNMode::kAuto && BulkMNMayUseW2(bulk_mn_mode) &&
-      !ResolveKernel(W2Key(12, 32, direct_bf16, weighted_direct_bf16, true), mode)) {
+      !ResolveKernel(W2Key(12, 32, direct_bf16, weighted_direct_bf16, true, k_loop_mode), mode)) {
     return false;
   }
   return true;
@@ -2725,7 +2967,7 @@ void ResolveAmxRowKernels(int rows, int degree, int hidden_size, bool direct_bf1
 }  // namespace
 
 void PrepareJitKernels(const std::vector<int>& row_counts, int silu_poly_degree, int hidden_size, bool direct_bf16,
-                       bool weighted_direct_bf16) {
+                       bool weighted_direct_bf16, int intermediate_size, int cooperative_threads) {
   const ImplementationMode mode = GetImplementationMode();
   if (mode == ImplementationMode::kIntrinsic) {
     return;
@@ -2733,30 +2975,43 @@ void PrepareJitKernels(const std::vector<int>& row_counts, int silu_poly_degree,
 #if defined(FUSED_CPP_MOE_HAS_XBYAK) && FUSED_CPP_MOE_HAS_XBYAK
   const SmallMMultiNMode multi_n_mode = GetSmallMMultiNMode();
   const BulkMNMode bulk_mn_mode = GetBulkMNMode();
-  std::array<bool, 13> prepared{};
-  std::array<bool, 5> prepared_small_m_multi_n{};
-  bool prepared_bulk_mn = false;
+  const Avx512KLoopMode requested_k_loop_mode = ResolveAvx512KLoopMode();
+  constexpr size_t kKLoopModeCount = 6;
+  std::array<std::array<bool, 13>, kKLoopModeCount> prepared{};
+  std::array<std::array<bool, 5>, kKLoopModeCount> prepared_small_m_multi_n{};
+  std::array<bool, kKLoopModeCount> prepared_bulk_mn{};
   for (int rows : row_counts) {
     if (rows <= 0) {
       continue;
     }
-    if (rows >= 12 && !prepared[12]) {
-      ResolveRowKernels(12, silu_poly_degree, hidden_size, direct_bf16, weighted_direct_bf16, mode);
-      prepared[12] = true;
-    }
-    const int tail = rows % 12;
-    if (tail != 0 && !prepared[tail]) {
-      ResolveRowKernels(tail, silu_poly_degree, hidden_size, direct_bf16, weighted_direct_bf16, mode);
-      prepared[tail] = true;
-    }
-    if (rows <= 4 && !prepared_small_m_multi_n[rows]) {
-      ResolveSmallMMultiNKernels(rows, silu_poly_degree, hidden_size, direct_bf16, weighted_direct_bf16, mode,
-                                 multi_n_mode);
-      prepared_small_m_multi_n[rows] = true;
-    }
-    if (rows >= 12 && !prepared_bulk_mn) {
-      ResolveBulkMNKernels(silu_poly_degree, direct_bf16, weighted_direct_bf16, mode, bulk_mn_mode);
-      prepared_bulk_mn = true;
+    const Avx512KLoopMode w13_k_loop_mode = ResolveAutomaticKLoopMode(
+        Avx512KLoopStage::kW13, rows, hidden_size, intermediate_size, cooperative_threads, requested_k_loop_mode);
+    const Avx512KLoopMode w2_k_loop_mode = ResolveAutomaticKLoopMode(
+        Avx512KLoopStage::kW2, rows, intermediate_size, hidden_size, cooperative_threads, requested_k_loop_mode);
+    auto prepare_mode = [&](Avx512KLoopMode k_loop_mode, bool prepare_bulk) {
+      const size_t mode_index = static_cast<size_t>(k_loop_mode);
+      if (rows >= 12 && !prepared[mode_index][12]) {
+        ResolveRowKernels(12, silu_poly_degree, hidden_size, direct_bf16, weighted_direct_bf16, mode, k_loop_mode);
+        prepared[mode_index][12] = true;
+      }
+      const int tail = rows % 12;
+      if (tail != 0 && !prepared[mode_index][tail]) {
+        ResolveRowKernels(tail, silu_poly_degree, hidden_size, direct_bf16, weighted_direct_bf16, mode, k_loop_mode);
+        prepared[mode_index][tail] = true;
+      }
+      if (rows <= 4 && !prepared_small_m_multi_n[mode_index][rows]) {
+        ResolveSmallMMultiNKernels(rows, silu_poly_degree, hidden_size, direct_bf16, weighted_direct_bf16, mode,
+                                   multi_n_mode, k_loop_mode);
+        prepared_small_m_multi_n[mode_index][rows] = true;
+      }
+      if (prepare_bulk && rows >= 12 && !prepared_bulk_mn[mode_index]) {
+        ResolveBulkMNKernels(silu_poly_degree, direct_bf16, weighted_direct_bf16, mode, bulk_mn_mode, k_loop_mode);
+        prepared_bulk_mn[mode_index] = true;
+      }
+    };
+    prepare_mode(w13_k_loop_mode, true);
+    if (w2_k_loop_mode != w13_k_loop_mode) {
+      prepare_mode(w2_k_loop_mode, requested_k_loop_mode != Avx512KLoopMode::kAuto);
     }
   }
 #else
@@ -2768,6 +3023,8 @@ void PrepareJitKernels(const std::vector<int>& row_counts, int silu_poly_degree,
   (void)hidden_size;
   (void)direct_bf16;
   (void)weighted_direct_bf16;
+  (void)intermediate_size;
+  (void)cooperative_threads;
 #endif
 }
 
@@ -2848,6 +3105,8 @@ void ComputeW13(const uint16_t* a, int a_stride, const uint16_t* packed_b, uint1
 #if defined(FUSED_CPP_MOE_HAS_XBYAK) && FUSED_CPP_MOE_HAS_XBYAK
   const SmallMMultiNMode multi_n_mode = GetSmallMMultiNMode();
   const BulkMNMode bulk_mn_mode = GetBulkMNMode();
+  const Avx512KLoopMode k_loop_mode = ResolveAutomaticKLoopMode(Avx512KLoopStage::kW13, rows, k_pad, c_stride,
+                                                                cooperative_threads, ResolveAvx512KLoopMode());
   const int cache_blocks = GetCacheBlockWindow("FUSED_CPP_MOE_X86_W13_CACHE_BLOCKS");
   if (UseW13SmallMMultiN(rows, k_pad, c_stride, cooperative_threads, multi_n_mode)) {
     bool jit_available = true;
@@ -2857,7 +3116,7 @@ void ComputeW13(const uint16_t* a, int a_stride, const uint16_t* packed_b, uint1
       }
       for (int block = block_begin; block < block_end;) {
         const int feature_blocks = W13SmallMMultiNBlocks(rows, block_end - block);
-        KernelHandle kernel = ResolveKernel(W13Key(rows, silu_poly_degree, feature_blocks), mode);
+        KernelHandle kernel = ResolveKernel(W13Key(rows, silu_poly_degree, feature_blocks, false, k_loop_mode), mode);
         if (!kernel) {
           jit_available = false;
           return;
@@ -2891,10 +3150,10 @@ void ComputeW13(const uint16_t* a, int a_stride, const uint16_t* packed_b, uint1
   KernelHandle full_kernel;
   KernelHandle tail_kernel;
   if (full_panels > 0) {
-    full_kernel = ResolveKernel(W13Key(12, silu_poly_degree, 1, use_bulk_mn), mode);
+    full_kernel = ResolveKernel(W13Key(12, silu_poly_degree, 1, use_bulk_mn, k_loop_mode), mode);
   }
   if (tail_rows > 0) {
-    tail_kernel = ResolveKernel(W13Key(tail_rows, silu_poly_degree), mode);
+    tail_kernel = ResolveKernel(W13Key(tail_rows, silu_poly_degree, 1, false, k_loop_mode), mode);
   }
   if ((full_panels > 0 && !full_kernel) || (tail_rows > 0 && !tail_kernel)) {
     ComputeW13Intrinsic(a, a_stride, packed_b, c, c_stride, rows, k_pad, feature_block_begin, feature_block_end,
@@ -3013,6 +3272,8 @@ void ComputeW2(const uint16_t* a, int a_stride, const uint16_t* packed_b, float*
 #if defined(FUSED_CPP_MOE_HAS_XBYAK) && FUSED_CPP_MOE_HAS_XBYAK
   const SmallMMultiNMode multi_n_mode = GetSmallMMultiNMode();
   const BulkMNMode bulk_mn_mode = GetBulkMNMode();
+  const Avx512KLoopMode k_loop_mode = ResolveAutomaticKLoopMode(Avx512KLoopStage::kW2, rows, k_pad, hidden_size,
+                                                                cooperative_threads, ResolveAvx512KLoopMode());
   const int element_bytes = direct_bf16 ? 2 : 4;
   const int cache_blocks = GetCacheBlockWindow("FUSED_CPP_MOE_X86_W2_CACHE_BLOCKS");
   if (UseW2SmallMMultiN(rows, k_pad, hidden_size, cooperative_threads, multi_n_mode)) {
@@ -3037,7 +3298,8 @@ void ComputeW2(const uint16_t* a, int a_stride, const uint16_t* packed_b, float*
           block_count = W2SmallMMultiNBlocks(rows, full_blocks);
           n_valid = block_count * 32;
         }
-        KernelHandle kernel = ResolveKernel(W2Key(rows, n_valid, direct_bf16, weighted_direct_bf16), mode);
+        KernelHandle kernel =
+            ResolveKernel(W2Key(rows, n_valid, direct_bf16, weighted_direct_bf16, false, k_loop_mode), mode);
         if (!kernel) {
           jit_available = false;
           return;
@@ -3090,16 +3352,18 @@ void ComputeW2(const uint16_t* a, int a_stride, const uint16_t* packed_b, float*
     }
   }
   if (full_panels > 0 && needs_main_kernel) {
-    full_main_kernel = ResolveKernel(W2Key(12, 32, direct_bf16, weighted_direct_bf16, use_bulk_mn), mode);
+    full_main_kernel = ResolveKernel(W2Key(12, 32, direct_bf16, weighted_direct_bf16, use_bulk_mn, k_loop_mode), mode);
   }
   if (full_panels > 0 && needs_tail_kernel) {
-    full_tail_kernel = ResolveKernel(W2Key(12, hidden_size % 32, direct_bf16, weighted_direct_bf16), mode);
+    full_tail_kernel =
+        ResolveKernel(W2Key(12, hidden_size % 32, direct_bf16, weighted_direct_bf16, false, k_loop_mode), mode);
   }
   if (tail_rows > 0 && needs_main_kernel) {
-    tail_main_kernel = ResolveKernel(W2Key(tail_rows, 32, direct_bf16, weighted_direct_bf16), mode);
+    tail_main_kernel = ResolveKernel(W2Key(tail_rows, 32, direct_bf16, weighted_direct_bf16, false, k_loop_mode), mode);
   }
   if (tail_rows > 0 && needs_tail_kernel) {
-    tail_tail_kernel = ResolveKernel(W2Key(tail_rows, hidden_size % 32, direct_bf16, weighted_direct_bf16), mode);
+    tail_tail_kernel =
+        ResolveKernel(W2Key(tail_rows, hidden_size % 32, direct_bf16, weighted_direct_bf16, false, k_loop_mode), mode);
   }
   if ((full_panels > 0 && needs_main_kernel && !full_main_kernel) ||
       (full_panels > 0 && needs_tail_kernel && !full_tail_kernel) ||

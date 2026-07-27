@@ -185,10 +185,22 @@ results on `AmazonC8i2Cores` for isolated microkernel changes.
   four cooperative workers. Explicit `baseline/w13/w2/bulk_mn` controls keep
   the broader experiment reproducible. See
   [`results/amazon_c8i_8core_avx512_bulk_mn_20260726.md`](results/amazon_c8i_8core_avx512_bulk_mn_20260726.md).
-- [ ] **K-loop scheduling and prefetch:** test deeper K unrolling, independent
+- [x] **K-loop scheduling and prefetch:** test deeper K unrolling, independent
   accumulation chains where register pressure permits, and explicit packed-B
   prefetch distance. Use instruction/cache counters to distinguish useful
-  load/compute overlap from extra front-end work.
+  load/compute overlap from extra front-end work. **2026-07-26:** the AVX-512
+  JIT now has cache-key-isolated `baseline`, `no_prefetch`, `unroll2`,
+  `unroll2_t0`, and `unroll2_t1` schedules. Two-pair loops halve branch
+  frequency, preload two B pairs, and use independent accumulator banks where
+  exact-M ZMM pressure permits; T0/T1 look ahead 8/16 K-pairs. W2
+  M12/K512/N4096 T0 reduced cycles 4.2%, branches 31.1%, and L1D misses 46.3%,
+  reaching 123.24 versus 118.17 GFLOP/s. W13 long-K needs its T0 coverage:
+  removing prefetch regressed K4096 by 4.4%, and T1 did not beat T0. The C8i
+  stage-aware policy keeps small W13 and unknown CPUs on baseline, selects W13
+  T0 at M96--511/no-prefetch unroll at M>=512, and selects W2 T0 at M>=12 for
+  normal H/F. H4096/F512 M2048 improved 2.78%/3.56% at 1T/8T; full tails and
+  automatic-policy tests pass. See
+  [`results/amazon_c8i_8core_avx512_k_loop_20260726.md`](results/amazon_c8i_8core_avx512_k_loop_20260726.md).
 - [ ] **Shape-selective AVX-512 cache blocking:** keep the current unblocked
   default while calibrating W2 N-window blocking by M/H/F and CPU model. Prior
   C8i measurements found only 2.5%-3.3% W2 gains and neutral or harmful W13
