@@ -826,6 +826,7 @@ cold search。
 | Kernel variant | 任意未被支配的实现 | ARM `auto` 先要求完整 `jit/xbyak_exact_m` legacy split/no-split pair，再加入同 identity 的实测 global packed-B byte-window variants；Plan V2 在精确匹配的 AmazonC5192Cores TP4/F512 split profile 上默认按确定函数 $g(M,t)$ 覆盖单 task 的 W13/W2 window，其余 profile 继承 global policy；$g$ 在每个 shape/tail-pool 候选中确定性解析并进入执行成本，但 window 不成为自由搜索变量；缺少完整 JIT legacy pair 时整体回退 static pair；x86 AMX 使用不进入 planner 的确定性 per-expert pattern/cache policy，AVX-512/AMX 共用确定性 team-N/wave policy | 实例候选限制与 runtime policy |
 | Isolated time | 真实 $I_i(t)$ | production 默认仍为经验公式；可选 analytic backend 由 kernel demand、cache traffic 和机器 service curves 计算 | cost 近似，不剪枝可行域 |
 | Contention | 任意动态活跃配置上的真实 $D_i(\mathcal Z)$ | production 默认为实测 profile；analytic backend 按 matrix/L1/L2/LLC/DRAM/epilogue 共享容量推进事件 | cost 近似，不剪枝可行域 |
+| 跨 rank lifetime | 每个 rank 的资源状态随其他 rank 完成而变化 | 有 matching single-rank companion 时，多 rank 活跃阶段使用 concurrent-rank profile，最后一个 rank 的剩余 phase 切换到 single-rank profile；缺表时保守保持 concurrent-rank rate | cost 状态近似，不剪枝可行域 |
 
 当前 `IntervalPlanner` 搜索的是上述剪枝后 plan space 中的方案，不是原始问题
 的全局最优方案。
@@ -2015,6 +2016,48 @@ contention P90 绝对误差不超过 15%、所有验证 route 的最大 measured
 regret 不超过 5%。在完成 8-core 与 192-core 至少各一份 unseen
 route/thread/mixed-distribution 验证前，解析 backend 保持 opt-in。
 
+### 9.15 跨 rank lifetime 状态转换
+
+此前 TP/EP evaluator 分别规划各 rank，并以
+
+$$
+\widehat C_{\mathrm{old}}=\max_q \widehat C_q^{(P)}
+$$
+
+作为 compute wall time，其中 $\widehat C_q^{(P)}$ 全程使用
+`concurrent_ranks=P` profile。对于负载不均衡的 EP，这会在短 rank 已完成后
+继续向长 rank 收取跨 rank contention，因而系统性高估尾部。
+
+当前实现保留每个 rank 已选定的 task DAG 和 kernel policy。设按
+concurrent-rank 模型预测的倒数第二个完成时刻为 $\tau_s$。在
+$0\leq\tau<\tau_s$ 时，各 rank 仍按 $\widehat D^{(P)}$ 推进；在
+$\tau_s$ 以后只剩一个 rank 时，长 rank 改用同一 machine/kernel/grid identity
+的 `concurrent_ranks=1` companion：
+
+$$
+\widehat D_q(\tau)=
+\begin{cases}
+\widehat D_q^{(P)}(\mathcal Z(\tau)), & \tau<\tau_s,\\
+\widehat D_q^{(1)}(\mathcal Z_q(\tau)), & \tau\geq\tau_s.
+\end{cases}
+$$
+
+转换发生在 phase event simulator 内。若 task $i$ 正在 phase $h$，切换前
+剩余基准工作为 $r_{ih}^{(P)}$，该 phase 的总基准时间为
+$I_{ih}^{(P)}$，则 single-rank 状态初始化为
+
+$$
+r_{ih}^{(1)}
+=
+\frac{r_{ih}^{(P)}}{I_{ih}^{(P)}}I_{ih}^{(1)}.
+$$
+
+已完成 phase、DAG dependency 和当前 phase index 均保持不变，因此不会重放
+已完成工作，也不会在切换点重复收取 call setup。companion 必须拥有相同的
+route/thread grid、kernel policy 和 phase geometry；planner candidate、LPT
+assignment、shape pruning 与 runtime plan 均不改变。缺少 companion 时继续
+使用旧的全程 concurrent-rank 上界，避免跨 profile 外推。
+
 ## 10. 同步规则
 
 发生以下任一变化时，必须同步更新本文档：
@@ -2081,3 +2124,4 @@ route/thread/mixed-distribution 验证前，解析 backend 保持 opt-in。
 | 2026-07-26 | v0.38 | 将确定性 $g(M,t)$ 前移到候选执行建模：empirical backend 按实际 W13/W2 range 和瞬时 working set 进行 contention event simulation，analytic backend 同时重算 range/cache/DRAM demand 与 isolated time；命中 override 的 workload 禁用 global-policy full-call anchor，Python/native cold planner 共用同一组已解析 geometry。shape、tail-pool 和 kernel variant 候选均未增加，window 仍不是自由搜索变量。 |
 | 2026-07-26 | v0.39 | 实现离线 isolated CP-SAT oracle v1：对每个 expert 选择一个非抢占固定线程宽度，以 `T_iso` optional interval 和 CPU cumulative constraint 求最小 makespan；增加 mode dominance、整数时间量化、可行 incumbent/best-bound regret 区间、strict planner 同口径评估和独立 CLI。该工具为可选 OR-Tools 依赖，不改变 production planner、runtime 或 contention 模型。 |
 | 2026-07-26 | v0.40 | 在 AmazonC5192Cores 的 TP4/F512 96-core rank 上用 9 个默认 workload 验证 isolated CP-SAT oracle，并与双 NUMA 当前 runtime 配对最大值比较。active-set-8 与 long/short bimodal 分别证明 `7.9300/6.1316 ms` 最优；当前 bimodal tail-pool 的 isolated regret 为 0%，但 wall time 仍高 78.3%，确认 v1 只能界定 isolated scheduling gap，不能充当无资源容量约束的硬件性能证书。 |
+| 2026-07-27 | v0.41 | TP/EP evaluator 增加跨 rank lifetime phase 转换：多 rank 活跃时使用 concurrent-rank profile，倒数第二个 rank 完成后按当前 phase 剩余比例切换至 matching single-rank companion；不重放 setup/dependency，不扩大 planner 候选或改变剪枝，缺少 companion 时保守回退旧上界。 |

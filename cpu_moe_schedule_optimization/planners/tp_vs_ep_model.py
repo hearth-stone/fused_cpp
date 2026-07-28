@@ -152,7 +152,16 @@ class ParallelLayerEvaluator:
             raise ValueError("m_tail_policy cannot override automatic SVE profile selection")
         self.m_tail_policy = None if m_tail_policy is None else str(m_tail_policy)
 
-    def _models(self, mode: str, intermediate_size: int, local_experts: int) -> list[ContentionCostModel]:
+    def _models(
+        self,
+        mode: str,
+        intermediate_size: int,
+        local_experts: int,
+        *,
+        concurrent_ranks: int | None = None,
+    ) -> list[ContentionCostModel]:
+        if concurrent_ranks is None:
+            concurrent_ranks = self.topology.ranks
         variants = (
             (("jit", "xbyak_exact_m"), ("asm", "static_bucketed"))
             if self.sve_implementation == "auto"
@@ -180,7 +189,7 @@ class ParallelLayerEvaluator:
                 dtype="bf16",
                 measurement_experts=local_experts,
                 cores_per_rank=self.cores_per_rank,
-                concurrent_ranks=self.topology.ranks,
+                concurrent_ranks=concurrent_ranks,
             )
             try:
                 records = self.catalog.policy_variants(query)
@@ -189,6 +198,63 @@ class ParallelLayerEvaluator:
                 continue
             return [ContentionCostModel(record.path, expected_policy=query) for record in records]
         raise ProfileCompatibilityError("no complete SVE profile pair matched; " + "; ".join(errors))
+
+    @staticmethod
+    def _selected_model(models: list[ContentionCostModel], plan: dict[str, object]) -> ContentionCostModel:
+        selected = (
+            bool(plan["w13_split"]),
+            int(plan["weight_window_bytes"]),
+            int(plan["w13_window_ranges"]),
+            int(plan["w2_window_ranges"]),
+        )
+        for model in models:
+            policy = model.policy
+            if policy is None:
+                continue
+            candidate = (
+                policy.w13_split,
+                policy.weight_window_bytes,
+                policy.w13_window_ranges,
+                policy.w2_window_ranges,
+            )
+            if candidate == selected:
+                return model
+        raise ProfileCompatibilityError(f"selected planner policy has no matching model: {selected}")
+
+    @staticmethod
+    def _model_tasks(plan: dict[str, object]) -> list[tuple[int, int, list[int]]]:
+        return [
+            (int(routes), int(threads), list(dependencies))
+            for _, routes, _, threads, dependencies in plan["tasks"]
+        ]
+
+    @staticmethod
+    def _matching_companion_grids(
+        concurrent_models: list[ContentionCostModel],
+        single_rank_models: list[ContentionCostModel],
+    ) -> bool:
+        if len(concurrent_models) != len(single_rank_models):
+            return False
+        singles = {
+            model.policy.kernel_policy_key(): model
+            for model in single_rank_models
+            if model.policy is not None
+        }
+        for model in concurrent_models:
+            policy = model.policy
+            if policy is None:
+                return False
+            companion = singles.get(policy.kernel_policy_key())
+            if companion is None or companion.policy is None:
+                return False
+            if (
+                companion.policy.source_sha256 != policy.source_sha256
+                or companion.policy.extension_sha256 != policy.extension_sha256
+                or companion._iso.keys() != model._iso.keys()
+                or companion.supported_shapes != model.supported_shapes
+            ):
+                return False
+        return True
 
     def _compute(
         self,
@@ -205,21 +271,78 @@ class ParallelLayerEvaluator:
         policy = models[0].policy
         if policy is None or len(policy.cpu_ids_by_rank) != self.topology.ranks:
             raise ValueError("profile does not contain one physical CPU set per rank")
-        rank_results: list[RankCompute] = []
+        single_rank_models: list[ContentionCostModel] | None = None
+        if self.topology.ranks > 1:
+            try:
+                single_rank_models = self._models(
+                    mode,
+                    intermediate_size,
+                    local_experts,
+                    concurrent_ranks=1,
+                )
+            except ProfileCompatibilityError:
+                # Old profile sets remain usable, but retain the conservative
+                # all-ranks-active estimate until companion profiles exist.
+                single_rank_models = None
+            if single_rank_models is not None and not self._matching_companion_grids(models, single_rank_models):
+                single_rank_models = None
+
+        active_rank_count = sum(any(histogram) for histogram in rank_histograms)
+        rank_plans: list[tuple[int, list[tuple[int, int]], dict[str, object], ContentionCostModel]] = []
+        empty_ranks: list[int] = []
         for rank, histogram in enumerate(rank_histograms):
             experts = [(expert, routes) for expert, routes in enumerate(histogram) if routes > 0]
             if not experts:
-                rank_results.append(RankCompute(rank, 0, 0, False, (), 0.0))
+                empty_ranks.append(rank)
                 continue
             cpu_ids = policy.cpu_ids_by_rank[rank]
             if len(cpu_ids) != self.cores_per_rank:
                 raise ValueError("profile CPU set does not match cores_per_rank")
+            planning_models = single_rank_models if single_rank_models is not None and active_rank_count == 1 else models
             planner = PolicyAwarePlanner(
-                models,
+                planning_models,
                 self.cores_per_rank,
                 cpu_ids=cpu_ids,
             )
             plan = planner.plan(experts)
+            rank_plans.append(
+                (
+                    rank,
+                    experts,
+                    plan,
+                    self._selected_model(planning_models, plan),
+                )
+            )
+
+        use_lifetime_switch = single_rank_models is not None and len(rank_plans) > 1
+        completion_ns: dict[int, float] = {
+            rank: (
+                model.dag_makespan(self._model_tasks(plan))
+                if use_lifetime_switch
+                else float(plan["makespan_ns"])
+            )
+            for rank, _, plan, model in rank_plans
+        }
+        if use_lifetime_switch:
+            assert single_rank_models is not None
+            ordered = sorted(rank_plans, key=lambda item: completion_ns[item[0]])
+            last_rank, _, last_plan, last_model = ordered[-1]
+            switch_ns = completion_ns[ordered[-2][0]]
+            if completion_ns[last_rank] > switch_ns:
+                standalone_model = self._selected_model(single_rank_models, last_plan)
+                completion_ns[last_rank] = last_model.dag_makespan_with_model_switch(
+                    self._model_tasks(last_plan),
+                    switch_ns,
+                    standalone_model,
+                )
+
+        plans_by_rank = {rank: (experts, plan) for rank, experts, plan, _ in rank_plans}
+        rank_results: list[RankCompute] = []
+        for rank, histogram in enumerate(rank_histograms):
+            if rank in empty_ranks:
+                rank_results.append(RankCompute(rank, 0, 0, False, (), 0.0))
+                continue
+            experts, plan = plans_by_rank[rank]
             rank_results.append(
                 RankCompute(
                     rank=rank,
@@ -227,11 +350,11 @@ class ParallelLayerEvaluator:
                     active_experts=len(experts),
                     w13_split=bool(plan["w13_split"]),
                     shape=tuple(plan["shape"]),
-                    predicted_ms=float(plan["makespan_ns"]) / 1e6,
+                    predicted_ms=completion_ns[rank] / 1e6,
                     weight_window_bytes=int(plan["weight_window_bytes"]),
                 )
             )
-        return max(result.predicted_ms for result in rank_results), rank_results
+        return max((result.predicted_ms for result in rank_results), default=0.0), rank_results
 
     def evaluate_tp(
         self,

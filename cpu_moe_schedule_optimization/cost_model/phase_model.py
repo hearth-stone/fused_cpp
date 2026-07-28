@@ -760,6 +760,94 @@ class ContentionCostModel:
                         started[successor] = True
         return wall
 
+    def dag_makespan_with_model_switch(self, tasks, switch_ns: float, next_model: "ContentionCostModel") -> float:
+        """Continue an in-flight DAG with another rank-contention model.
+
+        Completed work and dependencies are preserved. The remaining fraction
+        of each current phase is mapped to the matching phase in ``next_model``.
+        """
+        tasks = list(tasks)
+        if not tasks:
+            return 0.0
+        current_total = self.dag_makespan(tasks)
+        if switch_ns >= current_total:
+            return current_total
+        if switch_ns <= self.call_setup_ns:
+            return next_model.dag_makespan(tasks)
+        if not (self.use_stage_model and next_model.use_stage_model):
+            next_total = next_model.dag_makespan(tasks)
+            return switch_ns + (current_total - switch_ns) * next_total / current_total
+
+        count = len(tasks)
+        routes = [int(value) for value, _, _ in tasks]
+        threads = [int(value) for _, value, _ in tasks]
+        phases = [self._task_phases(route_count, team) for route_count, team, _ in tasks]
+        next_phases = [next_model._task_phases(route_count, team) for route_count, team, _ in tasks]
+        if any(len(current) != len(future) for current, future in zip(phases, next_phases)):
+            raise ValueError("rank-lifetime model switch requires matching task phase geometry")
+
+        phase_index = [0] * count
+        remaining = [task_phases[0][0] for task_phases in phases]
+        dependency_count, successors, started = self._dag_state(tasks)
+        finished = [False] * count
+        wall = self.call_setup_ns
+        active_model = self
+        switched = False
+        guard = 0
+        max_events = 2 * sum(len(task_phases) for task_phases in phases) + count + 4
+
+        def switch_model() -> None:
+            nonlocal phases, active_model, switched
+            for index in range(count):
+                if finished[index]:
+                    continue
+                current_duration = phases[index][phase_index[index]][0]
+                future_duration = next_phases[index][phase_index[index]][0]
+                remaining[index] = future_duration * max(remaining[index] / current_duration, 0.0)
+            phases = next_phases
+            active_model = next_model
+            switched = True
+
+        while not all(finished):
+            guard += 1
+            if guard > 2 * max_events:
+                raise RuntimeError("rank-lifetime DAG simulation did not converge")
+            active = [index for index in range(count) if started[index] and not finished[index]]
+            if not active:
+                raise ValueError("DAG deadlock (cycle or unreachable task)")
+            worksets = [0] * count
+            for index in active:
+                worksets[index] = phases[index][phase_index[index]][1]
+            slowdown = active_model._working_set_derate(active, routes, threads, worksets)
+            effective = {index: (1.0 if worksets[index] == 0 else slowdown) for index in active}
+            elapsed = min(remaining[index] * effective[index] for index in active)
+
+            if not switched and wall + elapsed > switch_ns:
+                partial = switch_ns - wall
+                for index in active:
+                    remaining[index] -= partial / effective[index]
+                wall = switch_ns
+                switch_model()
+                continue
+
+            wall += elapsed
+            for index in active:
+                remaining[index] -= elapsed / effective[index]
+            completed_phases = [index for index in active if remaining[index] <= 1e-6]
+            for index in completed_phases:
+                phase_index[index] += 1
+                if phase_index[index] < len(phases[index]):
+                    remaining[index] = phases[index][phase_index[index]][0]
+                    continue
+                finished[index] = True
+                for successor in successors[index]:
+                    dependency_count[successor] -= 1
+                    if dependency_count[successor] == 0:
+                        started[successor] = True
+            if not switched and wall >= switch_ns:
+                switch_model()
+        return wall
+
     def flat_dag_makespan(self, tasks) -> float:
         return self._sim_flat(tasks)
 

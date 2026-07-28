@@ -922,3 +922,66 @@ def test_tp_ep_evaluator_and_generic_p2_collectives(
     )
     assert p4.allreduce_ms(message) == pytest.approx((message / 60e9 + message / 20e9 + 4e-6) * 1e3)
     assert p4.alltoall_ms(outgoing) == pytest.approx(2 * (outgoing / 20e9 + 3e-6) * 1e3)
+
+
+def test_ep_rank_lifetime_switches_to_single_rank_profile(
+    catalog: ProfileCatalog,
+    tmp_path: Path,
+) -> None:
+    query = ProfileQuery(
+        mode="ep",
+        degree=2,
+        hidden_size=4096,
+        intermediate_size=2048,
+        global_experts=64,
+        local_experts=32,
+        backend="sve",
+        backend_n_tile=8,
+        activation="silu",
+        dtype="bf16",
+        measurement_experts=32,
+        cores_per_rank=32,
+        concurrent_ranks=2,
+    )
+    dual_records = catalog.split_pair(query)
+    paths = [record.path for record in dual_records]
+    for record in dual_records:
+        payload = json.loads(record.path.read_text(encoding="utf-8"))
+        target = payload["target"]
+        target["concurrent_ranks"] = 1
+        target["cpu_ids_by_rank"] = [target["cpu_ids_by_rank"][0]]
+        target["numa_nodes"] = [target["numa_nodes"][0]]
+        target["llc_bytes_by_rank"] = [target["llc_bytes_by_rank"][0]]
+        for section in ("isolated", "entries"):
+            for entry in payload[section]:
+                for key, value in list(entry.items()):
+                    if key.endswith("_ns") and isinstance(value, (int, float)):
+                        entry[key] = value * 0.5
+        single_path = tmp_path / f"single_{record.path.name}"
+        single_path.write_text(json.dumps(payload), encoding="utf-8")
+        paths.append(single_path)
+
+    topology = HierarchicalTopology(2, 1, 60e9, 20e9, 1e-6)
+    conservative = ParallelLayerEvaluator(
+        catalog,
+        topology,
+        hidden_size=4096,
+        full_intermediate_size=2048,
+        global_experts=64,
+        cores_per_rank=32,
+    )
+    switched = ParallelLayerEvaluator(
+        ProfileCatalog.from_paths(paths),
+        topology,
+        hidden_size=4096,
+        full_intermediate_size=2048,
+        global_experts=64,
+        cores_per_rank=32,
+    )
+    hotspot = [768] * 4 + [384] * 12 + [96] * 48
+    conservative_result = conservative.evaluate_ep(2048, 6, global_histogram=hotspot)
+    switched_result = switched.evaluate_ep(2048, 6, global_histogram=hotspot)
+
+    assert switched_result.compute_ms < conservative_result.compute_ms
+    assert switched_result.compute_ms > min(rank.predicted_ms for rank in switched_result.rank_compute)
+    assert switched_result.compute_ms == max(rank.predicted_ms for rank in switched_result.rank_compute)
