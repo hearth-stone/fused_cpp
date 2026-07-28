@@ -1,0 +1,1222 @@
+{
+  "surface": "report",
+  "manifest": {
+    "version": 1,
+    "surface": "report",
+    "title": "fused_cpp 本周技术周报（2026-07-19—2026-07-26）",
+    "description": "围绕 ARM SVE MoE 小 M 内核、CPU MoE 调度器和 x86 AMX 路径的实现、数据与默认策略决策。",
+    "sources": [
+      {
+        "id": "weekly_evidence",
+        "label": "本仓库 2026-07-19—2026-07-26 Git 历史、工作树与基准报告",
+        "query": {
+          "id": "fused-cpp-weekly-20260719-20260726",
+          "engine": "git-and-reviewed-markdown",
+          "language": "manual-review",
+          "description": "审阅 main 与 claude-wip 的分支差异、当前未提交工作树，以及各优化目录中的原始 benchmark/PMU/correctness 报告；表格中的数值不跨机器聚合。",
+          "tables_used": [
+            "git: main@7b9452e, claude-wip@d598016, merge-base@36b585c",
+            "optimizations/fused_moe_sve/results/amazon_192c_8c_production_kc.md",
+            "optimizations/fused_moe_sve/results/amazon_8c_192c_xbyak_exact_m.md",
+            "optimizations/fused_moe_sve/results/amazon_192c_single_core_m1_m12_efficiency.md",
+            "optimizations/fused_moe_sve/results/amazon_192c_small_m_gemm_bandwidth.md",
+            "optimizations/fused_moe_sve/results/amazon_192c_xbyak_pure_gemm.md",
+            "optimizations/fused_moe_sve/results/amazon_192c_xbyak_bulk_m.md",
+            "optimizations/fused_moe_sve/results/amazon_192c_w13_first_panel_prefetch.md",
+            "optimizations/fused_moe_sve/results/amazon_192c_xbyak_m2_dual_n.md",
+            "optimizations/fused_moe_sve/results/amazon_192c_route_merge_tree.md",
+            "optimizations/fused_moe_sve/results/amazon_192c_vllm_staged_schedule.md",
+            "cpu_moe_schedule_optimization/MATHEMATICAL_MODEL.md",
+            "cpu_moe_schedule_optimization/ANALYTIC_MODEL.md",
+            "optimizations/fused_moe_sve/results/amazon_192c_cost_profile_refresh_20260726.md",
+            "optimizations/fused_moe_sve/results/amazon_192c_stage_weight_windows.md",
+            "optimizations/fused_moe_sve/results/amazon_192c_static_stage_window_policy.md",
+            "optimizations/fused_moe_avx512/results/amazon_c8i_2core_amx_cache_blocking_20260720.md",
+            "optimizations/fused_moe_avx512/results/amazon_c8i_2core_amx_auto_dispatch_20260720.md",
+            "optimizations/fused_moe_avx512/results/amazon_c8i_2core_amx_silu_20260720.md",
+            "optimizations/fused_moe_avx512/results/amazon_c8i_2core_amx_w2_epilogue_20260720.md",
+            "optimizations/fused_moe_avx512/results/amazon_c8i_8core_nsplit_20260722.md",
+            "claude-wip: optimizations/fused_moe_avx512/results/amazon_c8i_8core_persistent_intermediate_20260726.md",
+            "claude-wip: optimizations/fused_moe_avx512/results/amazon_c8i_8core_p1_workspace_20260726.md",
+            "claude-wip: optimizations/fused_moe_avx512/results/amazon_c8i_8core_amx_n64_layout_20260726.md",
+            "claude-wip: optimizations/fused_moe_avx512/results/amazon_c8i_8core_amx_b_load_hints_20260726.md",
+            "claude-wip: optimizations/fused_moe_avx512/results/amazon_c8i_8core_amx_k_load_pipeline_20260726.md",
+            "claude-wip: optimizations/fused_moe_avx512/results/amazon_c8i_8core_amx_macro_m_tile_state_20260726.md"
+          ],
+          "filters": [
+            "时间范围：2026-07-19 00:00 至 2026-07-26 报告生成时",
+            "作者与工作树范围：Xu Zhang 的 main、claude-wip 及当前 main 工作树",
+            "性能数字仅使用仓库中已有的中位数、配对速度比或报告明确给出的 PMU 变化"
+          ],
+          "metric_definitions": [
+            "收益率 = baseline_time / optimized_time - 1；表中以百分数表示，正数为优化更快。",
+            "useful_compute_efficiency_pct = useful_GFLOP/s / 422.4 GFLOP/s × 100。",
+            "physical_issue_efficiency_pct = useful_compute_efficiency_pct / BF16 行利用率。",
+            "memory_efficiency_pct = packed_B_GB/s / 39.3 GB/s × 100；39.3 GB/s 是用户指定的归一化参考，不是所有访问模式的统一物理上限。",
+            "默认启用表示代码路径在其明确支持的机器/shape/profile 条件内自动选择；WIP 默认仅指当前未提交工作树，不代表 main 已发布。"
+          ]
+        }
+      }
+    ],
+    "charts": [
+      {
+        "id": "small_m_efficiency_chart",
+        "title": "Small-M compute and packed-B efficiency",
+        "description": "单核 SVE W13 GEMM；计算峰值按 422.4 GFLOP/s、packed-B 访存参考按 39.3 GB/s 重新归一化。",
+        "type": "line",
+        "dataset": "small_m_efficiency",
+        "sourceId": "weekly_evidence",
+        "source": {
+          "id": "small_m_efficiency_query",
+          "label": "Reviewed small-M efficiency snapshot",
+          "path": "docs/weekly_report_2026-07-19_2026-07-26/weekly_report.artifact.json",
+          "query": {
+            "engine": "DuckDB",
+            "language": "sql",
+            "description": "读取已按 422.4 GFLOP/s 与 39.3 GB/s 重算并人工核对的 12 个 small-M 样本。",
+            "sql": "SELECT row.*\nFROM read_json_auto('docs/weekly_report_2026-07-19_2026-07-26/weekly_report.artifact.json') AS artifact,\nUNNEST(artifact.snapshot.datasets.small_m_efficiency) AS rows(row)\nORDER BY row.m;",
+            "tables_used": [
+              "weekly_report.artifact.json:snapshot.datasets.small_m_efficiency",
+              "optimizations/fused_moe_sve/results/amazon_192c_single_core_m1_m12_efficiency.md"
+            ]
+          }
+        },
+        "intent": "trend",
+        "question": "M 从 1 增加到 12 时，有效计算效率和 packed-B 访存效率如何变化？",
+        "rationale": "两条同单位百分比曲线直接显示 small-M 从访存服务受限向计算占比上升的转变。",
+        "encodings": {
+          "x": {
+            "field": "m",
+            "type": "quantitative",
+            "label": "M"
+          },
+          "y": {
+            "fields": [
+              "useful_compute_efficiency_pct",
+              "memory_efficiency_pct"
+            ],
+            "type": "quantitative",
+            "label": "效率",
+            "format": "number",
+            "unit": "%"
+          },
+          "tooltip": [
+            {
+              "field": "gemm_ms",
+              "label": "GEMM",
+              "format": "number",
+              "unit": "ms"
+            },
+            {
+              "field": "useful_gflops",
+              "label": "Useful GFLOP/s",
+              "format": "number"
+            },
+            {
+              "field": "packed_b_gbps",
+              "label": "Packed-B",
+              "format": "number",
+              "unit": "GB/s"
+            },
+            {
+              "field": "lane_efficiency_pct",
+              "label": "BF16 行利用率",
+              "format": "number",
+              "unit": "%"
+            }
+          ]
+        }
+      },
+      {
+        "id": "stage_window_gain_chart",
+        "title": "Per-task stage-window policy gain by workload",
+        "description": "NUMA0、同一 plan，仅替换 task 级 W13/W2 window；5 次 warmup、21 次正式样本。",
+        "type": "bar",
+        "dataset": "stage_window_gain",
+        "sourceId": "weekly_evidence",
+        "source": {
+          "id": "stage_window_gain_query",
+          "label": "Reviewed per-task stage-window snapshot",
+          "path": "docs/weekly_report_2026-07-19_2026-07-26/weekly_report.artifact.json",
+          "query": {
+            "engine": "DuckDB",
+            "language": "sql",
+            "description": "读取 NUMA0 同 plan、5 warmup、21 samples 的 task 级 stage-window 配对结果。",
+            "sql": "SELECT row.*\nFROM read_json_auto('docs/weekly_report_2026-07-19_2026-07-26/weekly_report.artifact.json') AS artifact,\nUNNEST(artifact.snapshot.datasets.stage_window_gain) AS rows(row)\nORDER BY row.gain_pct DESC;",
+            "tables_used": [
+              "weekly_report.artifact.json:snapshot.datasets.stage_window_gain",
+              "optimizations/fused_moe_sve/results/amazon_192c_static_stage_window_policy.md"
+            ]
+          }
+        },
+        "intent": "comparison",
+        "question": "精确 profile 绑定的 task 级 stage-window 策略在哪些 workload 上有稳定收益？",
+        "rationale": "按 workload 展示配对收益，避免用总体均值掩盖 active64/128 的大收益和其它 workload 的中性结果。",
+        "options": {
+          "orientation": "horizontal",
+          "grouping": "single"
+        },
+        "encodings": {
+          "x": {
+            "field": "workload",
+            "type": "nominal",
+            "label": "Workload"
+          },
+          "y": {
+            "field": "gain_pct",
+            "type": "quantitative",
+            "label": "收益",
+            "format": "number",
+            "unit": "%"
+          },
+          "tooltip": [
+            {
+              "field": "baseline_ms",
+              "label": "Baseline",
+              "format": "number",
+              "unit": "ms"
+            },
+            {
+              "field": "policy_ms",
+              "label": "Policy",
+              "format": "number",
+              "unit": "ms"
+            },
+            {
+              "field": "override_applied",
+              "label": "是否应用 override"
+            }
+          ]
+        }
+      }
+    ],
+    "tables": [
+      {
+        "id": "branch_scope_table",
+        "title": "分支与交付状态",
+        "description": "本周工作既包括公共历史、main/claude-wip 的独有提交，也包括当前 main 未提交 WIP。",
+        "dataset": "branch_scope",
+        "sourceId": "weekly_evidence",
+        "source": {
+          "id": "branch_scope_query",
+          "label": "Reviewed branch scope snapshot",
+          "path": "docs/weekly_report_2026-07-19_2026-07-26/weekly_report.artifact.json",
+          "query": {
+            "engine": "DuckDB",
+            "language": "sql",
+            "description": "读取 main、claude-wip、共同历史和当前工作树的审阅后范围表。",
+            "sql": "SELECT row.*\nFROM read_json_auto('docs/weekly_report_2026-07-19_2026-07-26/weekly_report.artifact.json') AS artifact,\nUNNEST(artifact.snapshot.datasets.branch_scope) AS rows(row)\nORDER BY row.scope;",
+            "tables_used": [
+              "weekly_report.artifact.json:snapshot.datasets.branch_scope",
+              "git:main",
+              "git:claude-wip"
+            ]
+          }
+        },
+        "columns": [
+          {
+            "field": "scope",
+            "label": "范围"
+          },
+          {
+            "field": "revision",
+            "label": "版本"
+          },
+          {
+            "field": "count",
+            "label": "独有提交数",
+            "format": "number"
+          },
+          {
+            "field": "work",
+            "label": "本周主要内容"
+          }
+        ],
+        "defaultSort": {
+          "field": "scope",
+          "direction": "asc"
+        }
+      },
+      {
+        "id": "small_m_efficiency_table",
+        "title": "Small-M kernel 效率标定明细",
+        "description": "原始延迟与吞吐不变；仅按 422.4 GFLOP/s 和 39.3 GB/s 重算效率。",
+        "dataset": "small_m_efficiency",
+        "sourceId": "weekly_evidence",
+        "source": {
+          "id": "small_m_efficiency_table_query",
+          "label": "Reviewed small-M efficiency snapshot",
+          "path": "docs/weekly_report_2026-07-19_2026-07-26/weekly_report.artifact.json",
+          "query": {
+            "engine": "DuckDB",
+            "language": "sql",
+            "description": "读取已按指定峰值重算并人工核对的 small-M 效率明细。",
+            "sql": "SELECT row.*\nFROM read_json_auto('docs/weekly_report_2026-07-19_2026-07-26/weekly_report.artifact.json') AS artifact,\nUNNEST(artifact.snapshot.datasets.small_m_efficiency) AS rows(row)\nORDER BY row.m;",
+            "tables_used": [
+              "weekly_report.artifact.json:snapshot.datasets.small_m_efficiency",
+              "optimizations/fused_moe_sve/results/amazon_192c_single_core_m1_m12_efficiency.md"
+            ]
+          }
+        },
+        "columns": [
+          {
+            "field": "m",
+            "label": "M",
+            "format": "number"
+          },
+          {
+            "field": "gemm_ms",
+            "label": "GEMM",
+            "format": "number",
+            "unit": "ms"
+          },
+          {
+            "field": "lane_efficiency_pct",
+            "label": "BF16 行利用率",
+            "format": "number",
+            "unit": "%"
+          },
+          {
+            "field": "useful_gflops",
+            "label": "Useful GFLOP/s",
+            "format": "number"
+          },
+          {
+            "field": "useful_compute_efficiency_pct",
+            "label": "有效计算效率",
+            "format": "number",
+            "unit": "%"
+          },
+          {
+            "field": "physical_issue_efficiency_pct",
+            "label": "物理发射效率",
+            "format": "number",
+            "unit": "%"
+          },
+          {
+            "field": "packed_b_gbps",
+            "label": "Packed-B",
+            "format": "number",
+            "unit": "GB/s"
+          },
+          {
+            "field": "memory_efficiency_pct",
+            "label": "访存效率",
+            "format": "number",
+            "unit": "%"
+          }
+        ],
+        "defaultSort": {
+          "field": "m",
+          "direction": "asc"
+        }
+      },
+      {
+        "id": "exact_m_gain_table",
+        "title": "SVE exact-M JIT 的有效收益区间",
+        "description": "Amazon C5 192 核机器上的完整 8-expert call；只有 M=5/6/9/10 越过静态 M8/M12 bucket，收益明显。",
+        "dataset": "exact_m_gain",
+        "sourceId": "weekly_evidence",
+        "source": {
+          "id": "exact_m_gain_query",
+          "label": "Reviewed SVE exact-M gain snapshot",
+          "path": "docs/weekly_report_2026-07-19_2026-07-26/weekly_report.artifact.json",
+          "query": {
+            "engine": "DuckDB",
+            "language": "sql",
+            "description": "读取完整 8-expert call 中 M5/6/9/10 的 exact-M 配对收益。",
+            "sql": "SELECT row.*\nFROM read_json_auto('docs/weekly_report_2026-07-19_2026-07-26/weekly_report.artifact.json') AS artifact,\nUNNEST(artifact.snapshot.datasets.exact_m_gain) AS rows(row)\nORDER BY row.m;",
+            "tables_used": [
+              "weekly_report.artifact.json:snapshot.datasets.exact_m_gain",
+              "optimizations/fused_moe_sve/results/amazon_8c_192c_xbyak_exact_m.md"
+            ]
+          }
+        },
+        "columns": [
+          {
+            "field": "m",
+            "label": "M",
+            "format": "number"
+          },
+          {
+            "field": "bucket",
+            "label": "旧静态 bucket"
+          },
+          {
+            "field": "gain_1t_pct",
+            "label": "1T 收益",
+            "format": "number",
+            "unit": "%"
+          },
+          {
+            "field": "gain_2t_pct",
+            "label": "2T 收益",
+            "format": "number",
+            "unit": "%"
+          },
+          {
+            "field": "gain_4t_pct",
+            "label": "4T 收益",
+            "format": "number",
+            "unit": "%"
+          },
+          {
+            "field": "gain_8t_pct",
+            "label": "8T 收益",
+            "format": "number",
+            "unit": "%"
+          }
+        ],
+        "defaultSort": {
+          "field": "m",
+          "direction": "asc"
+        }
+      },
+      {
+        "id": "sve_decision_table",
+        "title": "ARM SVE 实现与决策账本",
+        "description": "“默认”均限定在报告写明的 SVE one-chunk/机器/shape 条件；没有数据的实现不进入默认策略。",
+        "dataset": "sve_decisions",
+        "sourceId": "weekly_evidence",
+        "source": {
+          "id": "sve_decisions_query",
+          "label": "Reviewed SVE decision ledger",
+          "path": "docs/weekly_report_2026-07-19_2026-07-26/weekly_report.artifact.json",
+          "query": {
+            "engine": "DuckDB",
+            "language": "sql",
+            "description": "读取逐项核对 benchmark、PMU、correctness 后形成的 SVE 决策账本。",
+            "sql": "SELECT row.*\nFROM read_json_auto('docs/weekly_report_2026-07-19_2026-07-26/weekly_report.artifact.json') AS artifact,\nUNNEST(artifact.snapshot.datasets.sve_decisions) AS rows(row)\nORDER BY row.order;",
+            "tables_used": [
+              "weekly_report.artifact.json:snapshot.datasets.sve_decisions",
+              "optimizations/fused_moe_sve/results"
+            ]
+          }
+        },
+        "columns": [
+          {
+            "field": "order",
+            "label": "#",
+            "format": "number"
+          },
+          {
+            "field": "implementation",
+            "label": "实现/实验"
+          },
+          {
+            "field": "evidence",
+            "label": "本周数据"
+          },
+          {
+            "field": "decision",
+            "label": "结论"
+          },
+          {
+            "field": "status",
+            "label": "状态"
+          }
+        ],
+        "defaultSort": {
+          "field": "order",
+          "direction": "asc"
+        }
+      },
+      {
+        "id": "stage_window_table",
+        "title": "精确 profile 绑定的 task 级 stage-window 结果",
+        "description": "NUMA0 主表；同 plan、同任务，仅运行时替换 W13/W2 window。无正收益的 workload 不应用 override。",
+        "dataset": "stage_window_gain",
+        "sourceId": "weekly_evidence",
+        "source": {
+          "id": "stage_window_table_query",
+          "label": "Reviewed per-task stage-window snapshot",
+          "path": "docs/weekly_report_2026-07-19_2026-07-26/weekly_report.artifact.json",
+          "query": {
+            "engine": "DuckDB",
+            "language": "sql",
+            "description": "读取 NUMA0 同 plan 的 task 级 stage-window 配对结果并按收益排序。",
+            "sql": "SELECT row.*\nFROM read_json_auto('docs/weekly_report_2026-07-19_2026-07-26/weekly_report.artifact.json') AS artifact,\nUNNEST(artifact.snapshot.datasets.stage_window_gain) AS rows(row)\nORDER BY row.gain_pct DESC;",
+            "tables_used": [
+              "weekly_report.artifact.json:snapshot.datasets.stage_window_gain",
+              "optimizations/fused_moe_sve/results/amazon_192c_static_stage_window_policy.md"
+            ]
+          }
+        },
+        "columns": [
+          {
+            "field": "workload",
+            "label": "Workload"
+          },
+          {
+            "field": "baseline_ms",
+            "label": "Baseline",
+            "format": "number",
+            "unit": "ms"
+          },
+          {
+            "field": "policy_ms",
+            "label": "Policy",
+            "format": "number",
+            "unit": "ms"
+          },
+          {
+            "field": "gain_pct",
+            "label": "收益",
+            "format": "number",
+            "unit": "%"
+          },
+          {
+            "field": "override_applied",
+            "label": "应用 override"
+          }
+        ],
+        "defaultSort": {
+          "field": "gain_pct",
+          "direction": "desc"
+        }
+      },
+      {
+        "id": "planner_decision_table",
+        "title": "CPU MoE 调度器实现与决策账本",
+        "description": "区分已提交 Plan V2、主分支分析模型，以及当前未提交的 native planner/profile/window WIP。",
+        "dataset": "planner_decisions",
+        "sourceId": "weekly_evidence",
+        "source": {
+          "id": "planner_decisions_query",
+          "label": "Reviewed CPU MoE planner decision ledger",
+          "path": "docs/weekly_report_2026-07-19_2026-07-26/weekly_report.artifact.json",
+          "query": {
+            "engine": "DuckDB",
+            "language": "sql",
+            "description": "读取逐项核对实现、benchmark 和模型验证后形成的调度器决策账本。",
+            "sql": "SELECT row.*\nFROM read_json_auto('docs/weekly_report_2026-07-19_2026-07-26/weekly_report.artifact.json') AS artifact,\nUNNEST(artifact.snapshot.datasets.planner_decisions) AS rows(row)\nORDER BY row.order;",
+            "tables_used": [
+              "weekly_report.artifact.json:snapshot.datasets.planner_decisions",
+              "cpu_moe_schedule_optimization",
+              "optimizations/fused_moe_sve/results/amazon_192c_vllm_staged_schedule.md"
+            ]
+          }
+        },
+        "columns": [
+          {
+            "field": "order",
+            "label": "#",
+            "format": "number"
+          },
+          {
+            "field": "implementation",
+            "label": "实现/实验"
+          },
+          {
+            "field": "evidence",
+            "label": "本周数据"
+          },
+          {
+            "field": "decision",
+            "label": "结论"
+          },
+          {
+            "field": "status",
+            "label": "状态"
+          }
+        ],
+        "defaultSort": {
+          "field": "order",
+          "direction": "asc"
+        }
+      },
+      {
+        "id": "x86_decision_table",
+        "title": "x86 AMX/AVX512 实现与决策账本",
+        "description": "阈值来自 Amazon c8i 数据，是 CPU/shape 校准结果，不作为通用 ISA 常数。",
+        "dataset": "x86_decisions",
+        "sourceId": "weekly_evidence",
+        "source": {
+          "id": "x86_decisions_query",
+          "label": "Reviewed x86 AMX/AVX512 decision ledger",
+          "path": "docs/weekly_report_2026-07-19_2026-07-26/weekly_report.artifact.json",
+          "query": {
+            "engine": "DuckDB",
+            "language": "sql",
+            "description": "读取 main/shared history 与 claude-wip 的 x86 benchmark、PMU 和 correctness 决策账本。",
+            "sql": "SELECT row.*\nFROM read_json_auto('docs/weekly_report_2026-07-19_2026-07-26/weekly_report.artifact.json') AS artifact,\nUNNEST(artifact.snapshot.datasets.x86_decisions) AS rows(row)\nORDER BY row.order;",
+            "tables_used": [
+              "weekly_report.artifact.json:snapshot.datasets.x86_decisions",
+              "optimizations/fused_moe_avx512/results",
+              "claude-wip:optimizations/fused_moe_avx512/results"
+            ]
+          }
+        },
+        "columns": [
+          {
+            "field": "order",
+            "label": "#",
+            "format": "number"
+          },
+          {
+            "field": "implementation",
+            "label": "实现/实验"
+          },
+          {
+            "field": "evidence",
+            "label": "本周数据"
+          },
+          {
+            "field": "decision",
+            "label": "结论"
+          },
+          {
+            "field": "branch",
+            "label": "位置"
+          }
+        ],
+        "defaultSort": {
+          "field": "order",
+          "direction": "asc"
+        }
+      }
+    ],
+    "blocks": [
+      {
+        "id": "title",
+        "type": "markdown",
+        "body": "# fused_cpp 本周技术周报（2026-07-19—2026-07-26）"
+      },
+      {
+        "id": "executive_summary",
+        "type": "markdown",
+        "sourceId": "weekly_evidence",
+        "body": "## Executive Summary｜技术摘要\n\n本周可落地的结论集中在三条线上：\n\n- **SVE 小 M：** exact-M JIT 对 M=5/6/9/10 的完整 8-expert call 在 1T 下提升 10.13%–13.69%，4T 下仍有 5.90%–8.61%；M=1–4、7/8、11/12 和长 route 基本在 ±1% 内。因此仅对会消除 M8/M12 bucket 过算的 shape 默认使用 exact-M，不把它宣传成长序列优化。生产 Kc 恢复为 K：8 核 route12/2040 分别 +2.03%/+3.52%，但 192 核分别 -9.52%/-1.25%，说明 split-K 不能作为跨并发默认。\n- **调度器：** 已提交的显式 4T tail pool 在 long-short bimodal 上相对 strict +15.47%。当前 WIP 自动策略选出 6×16T head + 1T 小 M tail，strict 12.529 ms 降到 10.408 ms（+20.39%），且其余 8/9 workload 保持 strict、同 plan 差异不超过 0.38%。native C++ cold planner 与 Python 输出完全一致，耗时加速 22.90×–78.65×，但尚未提交。\n- **x86：** AMX cache/pattern auto、cooperative N-split、TILELOADDT1 和 workspace 复用都有明确适用边界；同时 N64 layout、通用软件预取、m1n2 K-load pipeline、macro-M tile state 和 W2 tile-store 不进入默认路径，因为它们分别出现最高 10.5%、23%、17%、4.8% 和 18.5% 的回退或始终输给现有 auto。\n- **默认策略原则：** 只有“正确性通过 + 在目标 workload 上有重复性能收益 + 无已知高并发/大 M 回退 + profile/CPU identity 可匹配”的实现才默认启用。数据中性、只在单点有效或没有 benchmark 结果的实现，保留为实验或明确不启用。"
+      },
+      {
+        "id": "scope_heading",
+        "type": "markdown",
+        "body": "## 本周范围与交付边界\n\n统计窗口为 2026-07-19 至 2026-07-26。main 和 claude-wip 的 merge-base 为 `36b585c`；main 有 2 个独有提交，claude-wip 有 4 个独有提交。报告同时列出当前 main 工作树的未提交 WIP，避免把已经测完但尚未入库的 native planner、profile 刷新和 stage-window policy 混成已发布功能。"
+      },
+      {
+        "id": "branch_scope_block",
+        "type": "table",
+        "tableId": "branch_scope_table"
+      },
+      {
+        "id": "sve_exact_heading",
+        "type": "markdown",
+        "sourceId": "weekly_evidence",
+        "body": "## SVE exact-M JIT：默认用于消除 bucket 过算，不用于长 route\n\n实现上，Xbyak 生成器为 M=1–12 生成精确行数内核，并保留静态汇编作为不支持 shape、严格 split-K 等路径的 fallback；K-loop 双缓冲修正了早期 exact-M 在 M7/8 的调度回退。完整 8-expert call 中，M5/6 相对旧 M8 bucket、M9/10 相对旧 M12 bucket 有稳定收益；控制点和 M192/M2040 没有等量收益。16 项 normal/scheduled/async 正确性测试通过，JIT 与静态内核在 degree 4/5/6 上 bit-exact。\n\n线程数增加后收益变小的原因是：exact-M 只减少单个 expert 的多余行计算，而多线程路径还包含权重流量、调度、同步和屏障；这些固定或共享成本不会随减少行数同比下降，8T 时还会受屏障到达方差影响。因此 M5/6 的收益从 1T 约 13.6% 收缩到 8T 约 0%，并不代表 JIT 本身退化。"
+      },
+      {
+        "id": "exact_m_gain_block",
+        "type": "table",
+        "tableId": "exact_m_gain_table"
+      },
+      {
+        "id": "small_m_heading",
+        "type": "markdown",
+        "sourceId": "weekly_evidence",
+        "body": "## Small-M kernel 效率标定：M1–4 主要受 packed-B 服务能力限制\n\n按用户指定峰值重新计算后，M1 的有效计算效率只有 8.58%，但 packed-B 已达到 36.239 GB/s，即 39.3 GB/s 参考值的 92.21%；M2–4 的访存效率仍为 89.32%–92.88%。M 增至 12 时，有效计算效率升至 68.16%，packed-B 速率降到 23.992 GB/s。奇数 M 与下一个偶数 M 共享物理 BF16 行数，例如 M5/M6 延迟均约 0.386 ms，因此 M5 的有效效率低于 M6，但物理发射效率接近。\n\n后续同遍历实验给出更具体的机理：W13 B-only 40.63 GB/s、full GEMM 35.80 GB/s（88.1%）；其中约 16.5 µs 来自 A 地址流、10.5 µs 来自 BFMMLA、0.9 µs 来自 store，L2 refill 基本不变。该结果用于解释瓶颈，不直接改变运行时策略。"
+      },
+      {
+        "id": "small_m_efficiency_chart_block",
+        "type": "chart",
+        "chartId": "small_m_efficiency_chart"
+      },
+      {
+        "id": "small_m_efficiency_table_block",
+        "type": "table",
+        "tableId": "small_m_efficiency_table"
+      },
+      {
+        "id": "sve_decisions_heading",
+        "type": "markdown",
+        "body": "## SVE 其它实验：只保留能解释边界或有稳定收益的路径\n\n本周没有把单核最佳点直接外推为多核默认。W13 first-panel prefetch 在顺序 M12 上可快约 5%–6%，但 24×4T/饱和场景出现回退；M1/M2 dual-N 在 8 active experts 有约 2.3% 收益，却在 24 experts 回退约 5.5%；bulk-M JIT 的 35 点几何平均为 -0.066%。这些路径都维持实验状态或默认关闭。"
+      },
+      {
+        "id": "sve_decision_block",
+        "type": "table",
+        "tableId": "sve_decision_table"
+      },
+      {
+        "id": "planner_heading",
+        "type": "markdown",
+        "sourceId": "weekly_evidence",
+        "body": "## CPU MoE 调度器：tail pool 有真实收益，native cold planner 解决规划开销\n\n已提交的 Plan V2 支持显式 tail pool；当前 WIP 在相同模型下增加自动 tail pool、原生 C++ interval planner、2026-07-26 成本表刷新，以及 W13/W2 独立窗口。long-short bimodal 中，自动策略从 strict 的 12.529 ms 降到 10.408 ms，比固定 4T tail 的 10.801 ms 再快 3.78%；其它 8 个 workload 不强行分 tail。\n\n规划器冷启动方面，long-short bimodal 从 Python 59.784 ms 降到 C++ 8T 的 1.421 ms（42.07×）；captured DSV4 从 274.342 ms 降到 3.488 ms（78.65×）。mode、shape、task、bridge、ranking 全部一致，makespan 相对差异低于 1e-12。16T 没有继续加速，所以默认 worker cap 设为 8；热路径仍优先命中 cache。"
+      },
+      {
+        "id": "stage_window_heading",
+        "type": "markdown",
+        "sourceId": "weekly_evidence",
+        "body": "## Task 级 stage-window：仅对精确 profile identity 默认，禁止跨机器泛化\n\n全局固定的 W13:W2 窗口比例不成立：4:2 相对 4:4 在 route12 为 +0.3%，route192 为 -6.0%，route384 为 -2.2%，route1536/2040 才有 +2.1%/+2.6%。因此当前 WIP 改为 plan 生成后、按 workload/task 覆盖窗口，并将启用条件绑定到 AmazonC5192Cores、TP4、H4096/F512、E256、SVE JIT exact-M、split-W13 和验证过的 96-core rank CPU set。\n\nNUMA0 上 active64/128 分别提升 10.38%/28.14%，NUMA1 复验为 10.58%/29.71%；uniform、bimodal、DSV4 没有正收益，因此不应用 override。该规则当前只在工作树中，尚未提交。"
+      },
+      {
+        "id": "stage_window_chart_block",
+        "type": "chart",
+        "chartId": "stage_window_gain_chart"
+      },
+      {
+        "id": "stage_window_table_block",
+        "type": "table",
+        "tableId": "stage_window_table"
+      },
+      {
+        "id": "planner_decisions_heading",
+        "type": "markdown",
+        "body": "## 调度器决策账本\n\n分析模型与实测模型采用不同上线标准：实测 schema-v2 已经有目标机数据；分析模型虽然实现了完整公式和验证器，但尚无真实未见机器 holdout。没有通过预先定义的误差门限之前，分析模型只能 shadow/optional，不能替换 production profile。"
+      },
+      {
+        "id": "planner_decision_block",
+        "type": "table",
+        "tableId": "planner_decision_table"
+      },
+      {
+        "id": "x86_heading",
+        "type": "markdown",
+        "sourceId": "weekly_evidence",
+        "body": "## x86 AMX/AVX512：围绕 cache、并行切分和 workspace 的条件化默认\n\n主线实现将 AMX packed-B cache window 设为约 W13 1 MiB/W2 512 KiB，并按 M<76 选 m2n2、M≥76 选 m1n4；单核 M2048 相对未 blocking 路径约 2.09×，2T 约 1.65×，skew workload 的逐 expert auto 比最佳全局强制策略快 4.3%（1T）和 0.7%（2T）。cooperative N-split 解决 expert 数不足时的线程闲置：AMX M2048 由 26.446 ms 降到 5.755 ms（4.60×），skew [1536,256,256] 为 3.30×。\n\nclaude-wip 进一步优化 workspace 生命周期和 load hint：weighted top1 direct 在 M2048 上按 1/2/4/8T 提升 1.603×/1.856×/2.188×/3.462×，persistent input buffer 提升 1.049×–1.274×；TILELOADDT1 对 M≥128 的收益为 5.27%–9.67%。相反，N64 layout 在 8T 回退 3.4%–10.5%，软件预取最高回退约 23%，因此不默认。"
+      },
+      {
+        "id": "x86_decision_block",
+        "type": "table",
+        "tableId": "x86_decision_table"
+      },
+      {
+        "id": "methodology_heading",
+        "type": "markdown",
+        "sourceId": "weekly_evidence",
+        "body": "## 数据口径与验证方法\n\n- 性能结论优先使用报告中的中位数或配对 ratio；不同机器、线程拓扑和 workload 不合并成一个“总平均”。\n- ARM 主要来自 Amazon C5 192-core/8-core 子集；x86 主要来自 Amazon c8i。表中阈值只在对应 CPU、shape、packed layout 下成立。\n- small-M 计算效率按 422.4 GFLOP/s，访存效率按 39.3 GB/s 重算；这两个值只改变归一化比例，不改变原始延迟、GFLOP/s 或 GB/s。\n- 正确性包括 bit-exact/容差测试、normal/scheduled/async 调用，以及 plan 字段逐项一致性。性能收益不能替代正确性门限。\n- “废弃/默认关闭”的判据不是单点没赢，而是出现可重复回退、整体几何平均中性或输给现有 auto；“无数据”则明确标为未决，不从实现存在推断性能。"
+      },
+      {
+        "id": "limitations_heading",
+        "type": "markdown",
+        "sourceId": "weekly_evidence",
+        "body": "## 限制与风险\n\n- 当前自动 tail pool 的运行时与成本 profile hash 尚未完全匹配，所以已验证的是 executor 相对行为，不能把模型预测 regret 当成最终绝对精度。\n- task 级 stage-window policy、native C++ planner、2026-07-26 profile 刷新均是未提交 WIP；报告中的“默认”只描述当前工作树在精确 profile 命中后的行为。\n- x86 cloud 实例频率和邻居噪声不可完全锁定；因此采用独立重复和中位数，但仍需在另一台同 SKU 或裸机复验后再把阈值泛化。\n- 静态 MN split comparison 本周只提交了 benchmark/harness，没有仓库内结果表；因此不做使用或废弃判断。\n- route merge U1 是之前已采用的默认；本周 PMU 只补充其高并发边界，不应算成本周新上线功能。"
+      },
+      {
+        "id": "next_steps_heading",
+        "type": "markdown",
+        "sourceId": "weekly_evidence",
+        "body": "## 下一步（按数据缺口排序）\n\n1. **先闭环调度器 WIP，再提交。** 用同一 runtime/profile hash 重跑 9 workload，要求自动策略在 8 个 strict workload 上仍不劣于 1%，并保持 long-short bimodal 相对 strict 至少 15% 的收益；同时复核 C++/Python plan 全字段一致。\n2. **只扩展可证明的 stage-window profile。** 当前仅 active64/128 有 10%–30% 级复验收益；其它机器、H/F/E 或 CPU set 在没有配对数据前保持 inherit，不加入默认表。\n3. **分析模型继续 shadow。** 收集至少一个未见 8-core 和一个未见 192-core profile；通过 isolated MAPE≤10%、contention P90≤15%、最大 measured-shape regret≤5% 后再讨论替换 schema-v2。\n4. **x86 阈值做跨实例复验。** 优先验证 M=76 pattern 切换、M=128 TILELOADDT1 和 256 KiB workspace 阈值；任一阈值若在第二台机器回退超过 3%，改为 profile 字段而不是硬编码 CPU-family 默认。\n5. **停止继续投入已否定路径。** bulk-M JIT、通用 W2 prefetch、N64 layout、macro-M tile state 和 W2 tile-store 在没有新的 PMU 机理或不同硬件信号前不再扩展。"
+      },
+      {
+        "id": "questions_heading",
+        "type": "markdown",
+        "body": "## Further questions｜后续需要回答的问题\n\n- task 级 W13/W2 window 是否应进入 cost model 联合搜索，而不是作为 post-plan rule？前提是补齐多 profile 的测量表，避免当前规则过拟合单一机器。\n- tail pool 的收益中有多少来自 1T 小 M kernel、有多少来自减少大 team 的 barrier 方差？需要加入 per-task wait/compute 分解。\n- x86 workspace 和 TILELOADDT1 阈值在 Granite Rapids、裸机或不同 L2/LLC 容量下是否仍成立？如果不成立，应按 CPUID/cache 容量建立 profile key。\n- small-M W13 中 A 地址流的 16.5 µs 是否可以通过 layout/地址生成改写降低，而不增加寄存器压力或破坏 exact-M JIT 的代码尺寸？"
+      }
+    ]
+  },
+  "snapshot": {
+    "version": 1,
+    "generatedAt": "2026-07-26T10:36:43-07:00",
+    "status": "ready",
+    "datasets": {
+      "branch_scope": [
+        {
+          "scope": "claude-wip 独有",
+          "revision": "d598016",
+          "count": 4,
+          "work": "x86 workspace 生命周期、AMX layout/load hint/K-load pipeline、x86 跳过 ARM SDPA 构建"
+        },
+        {
+          "scope": "main 独有",
+          "revision": "7b9452e",
+          "count": 2,
+          "work": "Plan V2 native tail pool；分析式调度成本模型"
+        },
+        {
+          "scope": "共同历史与本周共享提交",
+          "revision": "merge-base 36b585c",
+          "count": 0,
+          "work": "SVE exact-M/small-M/预取实验、workload catalog、staged scheduling、x86 AMX auto/cooperative N-split"
+        },
+        {
+          "scope": "当前 main 工作树 WIP",
+          "revision": "未提交",
+          "count": 0,
+          "work": "自动 tail pool、C++ cold planner、成本表刷新、独立 stage window、精确 profile 绑定 policy"
+        }
+      ],
+      "small_m_efficiency": [
+        {
+          "m": 1,
+          "gemm_ms": 0.3472,
+          "lane_efficiency_pct": 50.0,
+          "useful_gflops": 36.24,
+          "useful_compute_efficiency_pct": 8.58,
+          "physical_issue_efficiency_pct": 17.16,
+          "packed_b_gbps": 36.239,
+          "memory_efficiency_pct": 92.21
+        },
+        {
+          "m": 2,
+          "gemm_ms": 0.3447,
+          "lane_efficiency_pct": 100.0,
+          "useful_gflops": 73.0,
+          "useful_compute_efficiency_pct": 17.28,
+          "physical_issue_efficiency_pct": 17.28,
+          "packed_b_gbps": 36.5,
+          "memory_efficiency_pct": 92.88
+        },
+        {
+          "m": 3,
+          "gemm_ms": 0.3585,
+          "lane_efficiency_pct": 75.0,
+          "useful_gflops": 105.31,
+          "useful_compute_efficiency_pct": 24.93,
+          "physical_issue_efficiency_pct": 33.24,
+          "packed_b_gbps": 35.102,
+          "memory_efficiency_pct": 89.32
+        },
+        {
+          "m": 4,
+          "gemm_ms": 0.358,
+          "lane_efficiency_pct": 100.0,
+          "useful_gflops": 140.58,
+          "useful_compute_efficiency_pct": 33.28,
+          "physical_issue_efficiency_pct": 33.28,
+          "packed_b_gbps": 35.144,
+          "memory_efficiency_pct": 89.42
+        },
+        {
+          "m": 5,
+          "gemm_ms": 0.3861,
+          "lane_efficiency_pct": 83.33,
+          "useful_gflops": 162.93,
+          "useful_compute_efficiency_pct": 38.57,
+          "physical_issue_efficiency_pct": 46.29,
+          "packed_b_gbps": 32.586,
+          "memory_efficiency_pct": 82.92
+        },
+        {
+          "m": 6,
+          "gemm_ms": 0.3855,
+          "lane_efficiency_pct": 100.0,
+          "useful_gflops": 195.86,
+          "useful_compute_efficiency_pct": 46.37,
+          "physical_issue_efficiency_pct": 46.37,
+          "packed_b_gbps": 32.643,
+          "memory_efficiency_pct": 83.06
+        },
+        {
+          "m": 7,
+          "gemm_ms": 0.4336,
+          "lane_efficiency_pct": 87.5,
+          "useful_gflops": 203.12,
+          "useful_compute_efficiency_pct": 48.09,
+          "physical_issue_efficiency_pct": 54.96,
+          "packed_b_gbps": 29.018,
+          "memory_efficiency_pct": 73.84
+        },
+        {
+          "m": 8,
+          "gemm_ms": 0.4336,
+          "lane_efficiency_pct": 100.0,
+          "useful_gflops": 232.16,
+          "useful_compute_efficiency_pct": 54.96,
+          "physical_issue_efficiency_pct": 54.96,
+          "packed_b_gbps": 29.02,
+          "memory_efficiency_pct": 73.84
+        },
+        {
+          "m": 9,
+          "gemm_ms": 0.4723,
+          "lane_efficiency_pct": 90.0,
+          "useful_gflops": 239.79,
+          "useful_compute_efficiency_pct": 56.77,
+          "physical_issue_efficiency_pct": 63.08,
+          "packed_b_gbps": 26.643,
+          "memory_efficiency_pct": 67.79
+        },
+        {
+          "m": 10,
+          "gemm_ms": 0.4723,
+          "lane_efficiency_pct": 100.0,
+          "useful_gflops": 266.42,
+          "useful_compute_efficiency_pct": 63.07,
+          "physical_issue_efficiency_pct": 63.07,
+          "packed_b_gbps": 26.642,
+          "memory_efficiency_pct": 67.79
+        },
+        {
+          "m": 11,
+          "gemm_ms": 0.5245,
+          "lane_efficiency_pct": 91.67,
+          "useful_gflops": 263.88,
+          "useful_compute_efficiency_pct": 62.47,
+          "physical_issue_efficiency_pct": 68.15,
+          "packed_b_gbps": 23.989,
+          "memory_efficiency_pct": 61.04
+        },
+        {
+          "m": 12,
+          "gemm_ms": 0.5245,
+          "lane_efficiency_pct": 100.0,
+          "useful_gflops": 287.9,
+          "useful_compute_efficiency_pct": 68.16,
+          "physical_issue_efficiency_pct": 68.16,
+          "packed_b_gbps": 23.992,
+          "memory_efficiency_pct": 61.05
+        }
+      ],
+      "exact_m_gain": [
+        {
+          "m": 5,
+          "bucket": "M8 → exact M5",
+          "gain_1t_pct": 13.61,
+          "gain_2t_pct": 7.01,
+          "gain_4t_pct": 5.9,
+          "gain_8t_pct": 0.1
+        },
+        {
+          "m": 6,
+          "bucket": "M8 → exact M6",
+          "gain_1t_pct": 13.69,
+          "gain_2t_pct": 6.97,
+          "gain_4t_pct": 5.94,
+          "gain_8t_pct": 0.0
+        },
+        {
+          "m": 9,
+          "bucket": "M12 → exact M9",
+          "gain_1t_pct": 10.22,
+          "gain_2t_pct": 9.43,
+          "gain_4t_pct": 8.61,
+          "gain_8t_pct": 2.59
+        },
+        {
+          "m": 10,
+          "bucket": "M12 → exact M10",
+          "gain_1t_pct": 10.13,
+          "gain_2t_pct": 9.45,
+          "gain_4t_pct": 8.52,
+          "gain_8t_pct": 1.98
+        }
+      ],
+      "sve_decisions": [
+        {
+          "order": 1,
+          "implementation": "Kc=K / one-chunk production default",
+          "evidence": "8-core E2E route12 +2.03%、route2040 +3.52%；192-core route12 -9.52%、route2040 -1.25%；正确性 13+12+6 项通过（1 skip）",
+          "decision": "默认 one-chunk；split-K 仅显式开关",
+          "status": "已采用"
+        },
+        {
+          "order": 2,
+          "implementation": "Xbyak exact-M JIT",
+          "evidence": "M5/6/9/10：1T +10.13%–13.69%，4T +5.90%–8.61%；长 route 全在 ±0.86%；16 项正确性通过",
+          "decision": "支持 shape 默认 JIT，静态 asm fallback",
+          "status": "已采用"
+        },
+        {
+          "order": 3,
+          "implementation": "JIT K-loop 双缓冲",
+          "evidence": "修正早期 M7/8 回退；V3 与静态差异≤0.26%，V1 ≤1.2%",
+          "decision": "作为 exact-M 实现的一部分保留",
+          "status": "已采用"
+        },
+        {
+          "order": 4,
+          "implementation": "standalone JIT 对比 i8mm",
+          "evidence": "warm W13 差异≤0.31%，rotating-cold ≤1.49%，warm W2 快 0.07%–1.45%；bitwise equal",
+          "decision": "用于验证代码生成等价，不作为独立优化宣传",
+          "status": "验证项"
+        },
+        {
+          "order": 5,
+          "implementation": "bulk-M JIT",
+          "evidence": "35 点中位收益 -0.011%，几何平均 -0.066%；14 点提升、21 点回退；M48 假阳性修正后 +1.09%/另测 -0.16%",
+          "decision": "不默认",
+          "status": "实验/否定"
+        },
+        {
+          "order": 6,
+          "implementation": "W13 first-panel prefetch",
+          "evidence": "顺序 M12 +5%–6%，但 M48 4T -11.88%；24×4T route48 -1.82%、route192 -1.64%",
+          "decision": "通用默认关闭，仅保留 opt-in",
+          "status": "实验"
+        },
+        {
+          "order": 7,
+          "implementation": "W2 prefetch / 全 GEMM prefetch",
+          "evidence": "饱和场景 W13-only +1.72%，all-GEMM -5.99%，W2 增量 -7.36%",
+          "decision": "拒绝默认启用",
+          "status": "废弃默认"
+        },
+        {
+          "order": 8,
+          "implementation": "M1/M2 dual-N",
+          "evidence": "8 active experts +2.30%/+2.23%，24 experts -5.72%/-5.40%；24 路 instructions +13.55%、cycles +5.23%",
+          "decision": "默认关闭，需并发/屏障拓扑选择器才可能重开",
+          "status": "实验/否定"
+        },
+        {
+          "order": 9,
+          "implementation": "route merge U1 与 STNT1H",
+          "evidence": "U1 E2E FP32 +0.38%、BF16 +0.69%，但 20 workers memory-resource stalls +27%；STNT1H E2E FP32 -0.3%、BF16 -0.2%",
+          "decision": "保留 U1；U2/U4 实验；STNT1H 删除",
+          "status": "保留/废弃"
+        },
+        {
+          "order": 10,
+          "implementation": "static MN split comparison harness",
+          "evidence": "本周仅增加 bench_mn_split.cpp 与 run_static_2d；仓库无结果表",
+          "decision": "不做默认或废弃判断",
+          "status": "实现完成、待测"
+        }
+      ],
+      "stage_window_gain": [
+        {
+          "workload": "uniform",
+          "baseline_ms": 16.518,
+          "policy_ms": 16.572,
+          "gain_pct": -0.32,
+          "override_applied": "否"
+        },
+        {
+          "workload": "active32",
+          "baseline_ms": 8.697,
+          "policy_ms": 8.555,
+          "gain_pct": 1.66,
+          "override_applied": "是"
+        },
+        {
+          "workload": "active64",
+          "baseline_ms": 10.007,
+          "policy_ms": 9.066,
+          "gain_pct": 10.38,
+          "override_applied": "是"
+        },
+        {
+          "workload": "active128",
+          "baseline_ms": 11.932,
+          "policy_ms": 9.312,
+          "gain_pct": 28.14,
+          "override_applied": "是"
+        },
+        {
+          "workload": "tiered hotspot",
+          "baseline_ms": 8.771,
+          "policy_ms": 8.179,
+          "gain_pct": 7.23,
+          "override_applied": "是"
+        },
+        {
+          "workload": "long-short bimodal",
+          "baseline_ms": 10.411,
+          "policy_ms": 10.419,
+          "gain_pct": -0.08,
+          "override_applied": "否"
+        },
+        {
+          "workload": "captured DSV4",
+          "baseline_ms": 14.698,
+          "policy_ms": 14.73,
+          "gain_pct": -0.22,
+          "override_applied": "否"
+        }
+      ],
+      "planner_decisions": [
+        {
+          "order": 1,
+          "implementation": "workload catalog",
+          "evidence": "覆盖 uniform、active-set 8/16/32/64/128、tiered hotspot、long-short bimodal、captured DSV4 共 9 类",
+          "decision": "作为回归与 planner 验证集；本身不声明性能收益",
+          "status": "已提交"
+        },
+        {
+          "order": 2,
+          "implementation": "Plan V2 显式 4T tail pool",
+          "evidence": "long-short bimodal strict 12.513 ms、tail 10.836 ms（+15.47%）、vLLM 11.733 ms；bit-exact",
+          "decision": "保留 runtime 能力，由 planner/profile 显式选择",
+          "status": "main 已提交"
+        },
+        {
+          "order": 3,
+          "implementation": "自动 tail pool",
+          "evidence": "9 workload 中 8 个选 strict、同 plan 最大差异 0.38%；bimodal 12.529→10.408 ms（+20.39%），比 forced-4T 再快 3.78%",
+          "decision": "候选默认，但需 hash 对齐后重跑",
+          "status": "当前 WIP"
+        },
+        {
+          "order": 4,
+          "implementation": "native C++ cold planner",
+          "evidence": "bimodal 42.07×、DSV4 78.65×（C++ 8T vs Python）；plan 字段一致，makespan 误差<1e-12；16T 不优于 8T",
+          "decision": "默认 worker cap=8；cache 仍优先；完成回归后替换冷 solver",
+          "status": "当前 WIP"
+        },
+        {
+          "order": 5,
+          "implementation": "分析式 scheduling cost model",
+          "evidence": "实现约 1134 行、validator 252 行、测试约 379 行；真实未见机器 holdout=0",
+          "decision": "仅 optional/shadow；不替换实测 schema-v2",
+          "status": "main 已提交"
+        },
+        {
+          "order": 6,
+          "implementation": "2026-07-26 成本 profile 刷新",
+          "evidence": "每策略 180 isolated+238 contention；旧选择在新表 median regret 3.01%、max 7.63%；9 workload 仅 active32/tiered 改选",
+          "decision": "只替换活动 catalog 数据，不改公式/候选/剪枝",
+          "status": "当前 WIP"
+        },
+        {
+          "order": 7,
+          "implementation": "全局独立 W13/W2 window",
+          "evidence": "4:2 vs 4:4：route12 +0.3%、192 -6.0%、384 -2.2%、1536 +2.1%、2040 +2.6%",
+          "decision": "不存在 route-independent 固定比例；不做通用默认",
+          "status": "实验"
+        },
+        {
+          "order": 8,
+          "implementation": "精确 profile 绑定的 task window policy",
+          "evidence": "NUMA0 active64 +10.38%、active128 +28.14%；NUMA1 +10.58%/+29.71%；无收益 workload 不 override",
+          "decision": "仅精确 identity 自动启用，unsupported 继承原值并可 opt-out",
+          "status": "当前 WIP"
+        },
+        {
+          "order": 9,
+          "implementation": "global packed-B window + thread-shape planner",
+          "evidence": "支持严格 profile identity 与联合搜索；默认 catalog 中可用 window profile 数=0；此前目标形态测得 +28.2%/+57.3%/中性三种结果",
+          "decision": "只有实测 profile 命中才进入候选，不外推 legacy profile",
+          "status": "已提交框架"
+        }
+      ],
+      "x86_decisions": [
+        {
+          "order": 1,
+          "implementation": "AMX cache blocking + m2n2/m1n4 auto",
+          "evidence": "M2048 1T 2.09×、2T 1.65×；M<76 用 m2n2、M≥76 用 m1n4；skew per-expert auto 比全局 forced 快 4.3%/0.7%；95 pass/4 skip",
+          "decision": "在 c8i 校准条件内默认",
+          "branch": "共享历史"
+        },
+        {
+          "order": 2,
+          "implementation": "AMX SiLU resident constants",
+          "evidence": "代码尺寸 -28.6%；full expert 0.995×–1.016×；K256 W13 +8.4%；19 focused、114 pass/4 skip",
+          "decision": "默认 resident；pipelined/rcp14 不默认",
+          "branch": "共享历史"
+        },
+        {
+          "order": 3,
+          "implementation": "AMX W2 tile-store/combined epilogue",
+          "evidence": "isolated M16 +14.5%，但 store-dominated K32 -11.4%/-15.3%/-18.5%；E2E 从 +1.7% 到 -4.5%；122 pass/4 skip",
+          "decision": "baseline auto 保持默认；变体实验",
+          "branch": "共享历史"
+        },
+        {
+          "order": 4,
+          "implementation": "cooperative N-split",
+          "evidence": "AMX M2048 26.446→5.755 ms（4.60×）；skew [1536,256,256] 3.30×；AVX512 6.64×但仍仅 oneDNN 0.402×；163 pass",
+          "decision": "underfilled/skew 启用，balanced 保持 atomic queue",
+          "branch": "共享历史"
+        },
+        {
+          "order": 5,
+          "implementation": "persistent intermediate workspace",
+          "evidence": "AMX M2048 单核 19.506→18.593 ms（+4.9%）；多线程 1.010×–1.049×；AVX512 0.999×",
+          "decision": "AMX 且≥256 KiB 自动；AVX512 不启用",
+          "branch": "claude-wip"
+        },
+        {
+          "order": 6,
+          "implementation": "weighted top1 direct + persistent input",
+          "evidence": "M2048 direct：1.603×/1.856×/2.188×/3.462×（1/2/4/8T）；input pool 1.049×–1.274×；12 targeted pass",
+          "decision": "top1/AMX/≥256 KiB 条件默认；topk>1 fallback",
+          "branch": "claude-wip"
+        },
+        {
+          "order": 7,
+          "implementation": "AMX N64 packed-B layout",
+          "evidence": "1T -0.3% 到 +0.9%；8T M64–2048 回退 3.4%–10.5%；211 pass/4 skip",
+          "decision": "拒绝自动选择，N32 保持默认",
+          "branch": "claude-wip"
+        },
+        {
+          "order": 8,
+          "implementation": "TILELOADDT1 load hint",
+          "evidence": "M≥128、1/2/4/8T 提升 5.27%–9.67%；L1 replacement -80.12%、pending-miss cycles -5.31%；215 pass/4 skip",
+          "decision": "c8i 对 M≥128 的 expert 自动启用",
+          "branch": "claude-wip"
+        },
+        {
+          "order": 9,
+          "implementation": "AMX 软件预取",
+          "evidence": "M512 t0/t1 回退约 15%–23%",
+          "decision": "拒绝默认启用",
+          "branch": "claude-wip"
+        },
+        {
+          "order": 10,
+          "implementation": "m1n2 K-load pipeline",
+          "evidence": "独立重复仅 +0.66%–0.77%；现有 auto m2n2/m1n4 仍快 14%–17%",
+          "decision": "只保留实验，不进入 auto",
+          "branch": "claude-wip"
+        },
+        {
+          "order": 11,
+          "implementation": "macro-M tile-state reuse",
+          "evidence": "M2048：1T -4.8%、2T -1.5%、4/8T 持平；14 focused、186 total/189 combined",
+          "decision": "per-call 保持默认；macro-M 实验",
+          "branch": "claude-wip"
+        },
+        {
+          "order": 12,
+          "implementation": "x86 构建跳过 ARM SDPA",
+          "evidence": "增加 x86 ARM-SDPA build regression test；提交中无性能数据",
+          "decision": "作为构建正确性修复，不声明性能收益",
+          "branch": "claude-wip"
+        }
+      ]
+    }
+  },
+  "sources": [
+    {
+      "id": "weekly_evidence",
+      "label": "本仓库 2026-07-19—2026-07-26 Git 历史、工作树与基准报告",
+      "query": {
+        "id": "fused-cpp-weekly-20260719-20260726",
+        "engine": "git-and-reviewed-markdown",
+        "language": "manual-review",
+        "description": "审阅 main 与 claude-wip 的分支差异、当前未提交工作树，以及各优化目录中的原始 benchmark/PMU/correctness 报告；表格中的数值不跨机器聚合。",
+        "tables_used": [
+          "git: main@7b9452e, claude-wip@d598016, merge-base@36b585c",
+          "optimizations/fused_moe_sve/results/amazon_192c_8c_production_kc.md",
+          "optimizations/fused_moe_sve/results/amazon_8c_192c_xbyak_exact_m.md",
+          "optimizations/fused_moe_sve/results/amazon_192c_single_core_m1_m12_efficiency.md",
+          "optimizations/fused_moe_sve/results/amazon_192c_small_m_gemm_bandwidth.md",
+          "optimizations/fused_moe_sve/results/amazon_192c_xbyak_pure_gemm.md",
+          "optimizations/fused_moe_sve/results/amazon_192c_xbyak_bulk_m.md",
+          "optimizations/fused_moe_sve/results/amazon_192c_w13_first_panel_prefetch.md",
+          "optimizations/fused_moe_sve/results/amazon_192c_xbyak_m2_dual_n.md",
+          "optimizations/fused_moe_sve/results/amazon_192c_route_merge_tree.md",
+          "optimizations/fused_moe_sve/results/amazon_192c_vllm_staged_schedule.md",
+          "cpu_moe_schedule_optimization/MATHEMATICAL_MODEL.md",
+          "cpu_moe_schedule_optimization/ANALYTIC_MODEL.md",
+          "optimizations/fused_moe_sve/results/amazon_192c_cost_profile_refresh_20260726.md",
+          "optimizations/fused_moe_sve/results/amazon_192c_stage_weight_windows.md",
+          "optimizations/fused_moe_sve/results/amazon_192c_static_stage_window_policy.md",
+          "optimizations/fused_moe_avx512/results/amazon_c8i_2core_amx_cache_blocking_20260720.md",
+          "optimizations/fused_moe_avx512/results/amazon_c8i_2core_amx_auto_dispatch_20260720.md",
+          "optimizations/fused_moe_avx512/results/amazon_c8i_2core_amx_silu_20260720.md",
+          "optimizations/fused_moe_avx512/results/amazon_c8i_2core_amx_w2_epilogue_20260720.md",
+          "optimizations/fused_moe_avx512/results/amazon_c8i_8core_nsplit_20260722.md",
+          "claude-wip: optimizations/fused_moe_avx512/results/amazon_c8i_8core_persistent_intermediate_20260726.md",
+          "claude-wip: optimizations/fused_moe_avx512/results/amazon_c8i_8core_p1_workspace_20260726.md",
+          "claude-wip: optimizations/fused_moe_avx512/results/amazon_c8i_8core_amx_n64_layout_20260726.md",
+          "claude-wip: optimizations/fused_moe_avx512/results/amazon_c8i_8core_amx_b_load_hints_20260726.md",
+          "claude-wip: optimizations/fused_moe_avx512/results/amazon_c8i_8core_amx_k_load_pipeline_20260726.md",
+          "claude-wip: optimizations/fused_moe_avx512/results/amazon_c8i_8core_amx_macro_m_tile_state_20260726.md"
+        ],
+        "filters": [
+          "时间范围：2026-07-19 00:00 至 2026-07-26 报告生成时",
+          "作者与工作树范围：Xu Zhang 的 main、claude-wip 及当前 main 工作树",
+          "性能数字仅使用仓库中已有的中位数、配对速度比或报告明确给出的 PMU 变化"
+        ],
+        "metric_definitions": [
+          "收益率 = baseline_time / optimized_time - 1；表中以百分数表示，正数为优化更快。",
+          "useful_compute_efficiency_pct = useful_GFLOP/s / 422.4 GFLOP/s × 100。",
+          "physical_issue_efficiency_pct = useful_compute_efficiency_pct / BF16 行利用率。",
+          "memory_efficiency_pct = packed_B_GB/s / 39.3 GB/s × 100；39.3 GB/s 是用户指定的归一化参考，不是所有访问模式的统一物理上限。",
+          "默认启用表示代码路径在其明确支持的机器/shape/profile 条件内自动选择；WIP 默认仅指当前未提交工作树，不代表 main 已发布。"
+        ]
+      }
+    }
+  ]
+}
