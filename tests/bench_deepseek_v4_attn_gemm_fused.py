@@ -75,6 +75,18 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="OpenMP affinity list, e.g. '80-159' or '80,81,82'.",
     )
+    parser.add_argument(
+        "--schedule",
+        choices=("legacy", "m8", "pool", "mn"),
+        default="mn",
+        help="Multithreaded GEMM scheduling strategy.",
+    )
+    parser.add_argument(
+        "--n-groups",
+        type=int,
+        default=0,
+        help="Total N-group budget used by mn; 0 selects the thread-based policy.",
+    )
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument(
         "--peak-gflops",
@@ -87,6 +99,11 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    os.environ["FUSED_CPP_ATTN_GEMM_SCHEDULE"] = args.schedule
+    if args.n_groups > 0:
+        os.environ["FUSED_CPP_ATTN_GEMM_N_GROUPS"] = str(args.n_groups)
+    else:
+        os.environ.pop("FUSED_CPP_ATTN_GEMM_N_GROUPS", None)
     core_ids = _parse_cores(args.cores)
     if args.backend == "torch-mm":
         _set_process_affinity(core_ids)
@@ -162,6 +179,8 @@ def main() -> None:
 
     print(f"hidden_states=[{args.m},{args.k}]")
     print(f"backend={args.backend}")
+    print(f"schedule={args.schedule}")
+    print(f"n_groups={args.n_groups if args.n_groups > 0 else 'auto'}")
     print(f"torch_num_threads={torch.get_num_threads()}")
     print(f"core_ids={core_ids if core_ids else 'serial'}")
     if args.backend == "fused":

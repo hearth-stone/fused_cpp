@@ -122,7 +122,12 @@ def test_deepseek_v4_attn_gemm_fused_matches_torch(
 
 @pytest.mark.skipif(not _HAS_OPENMP, reason="OpenMP is unavailable")
 @pytest.mark.parametrize("variant", ["dense", "c128a", "c4a"])
-def test_deepseek_v4_attn_gemm_fused_mt_matches_serial(variant: str) -> None:
+@pytest.mark.parametrize("schedule", [None, "legacy", "m8", "pool", "mn"])
+def test_deepseek_v4_attn_gemm_fused_mt_matches_serial(
+    variant: str,
+    schedule: str | None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     torch.manual_seed(1)
     M = 17
     K = 13
@@ -144,6 +149,11 @@ def test_deepseek_v4_attn_gemm_fused_mt_matches_serial(variant: str) -> None:
     if len(core_ids) < 2:
         pytest.skip("need at least two available CPU cores")
 
+    if schedule is None:
+        monkeypatch.delenv("FUSED_CPP_ATTN_GEMM_SCHEDULE", raising=False)
+    else:
+        monkeypatch.setenv("FUSED_CPP_ATTN_GEMM_SCHEDULE", schedule)
+    monkeypatch.setenv("FUSED_CPP_ATTN_GEMM_N_GROUPS", "7")
     serial_outputs = deepseek_v4_attn_gemm_fused_prepacked(
         hidden_states,
         packed,

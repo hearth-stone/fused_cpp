@@ -1,11 +1,13 @@
 #include <torch/extension.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <tuple>
 #include <vector>
 
@@ -59,6 +61,13 @@ enum class AttnGemmBackend {
   kSve,
 };
 
+enum class AttnGemmSchedule {
+  kLegacy,
+  kM8Aligned,
+  kSharedPool,
+  kMnPool,
+};
+
 int64_t ceil_div_int64(int64_t x, int64_t y) { return (x + y - 1) / y; }
 
 int64_t ceil_to_multiple(int64_t x, int64_t multiple) { return ceil_div_int64(x, multiple) * multiple; }
@@ -70,6 +79,39 @@ bool env_false_local(const char* name) {
   }
   return value[0] == '\0' || value[0] == '0' || std::strcmp(value, "false") == 0 || std::strcmp(value, "False") == 0 ||
          std::strcmp(value, "off") == 0 || std::strcmp(value, "OFF") == 0;
+}
+
+AttnGemmSchedule selected_attn_gemm_schedule() {
+  const char* value = std::getenv("FUSED_CPP_ATTN_GEMM_SCHEDULE");
+  if (value == nullptr || value[0] == '\0') {
+    return AttnGemmSchedule::kMnPool;
+  }
+  if (std::strcmp(value, "legacy") == 0) {
+    return AttnGemmSchedule::kLegacy;
+  }
+  if (std::strcmp(value, "m8") == 0 || std::strcmp(value, "m8_aligned") == 0) {
+    return AttnGemmSchedule::kM8Aligned;
+  }
+  if (std::strcmp(value, "pool") == 0 || std::strcmp(value, "shared_pool") == 0) {
+    return AttnGemmSchedule::kSharedPool;
+  }
+  if (std::strcmp(value, "mn") == 0 || std::strcmp(value, "mn_pool") == 0) {
+    return AttnGemmSchedule::kMnPool;
+  }
+  TORCH_CHECK(false, "FUSED_CPP_ATTN_GEMM_SCHEDULE must be one of legacy/m8/pool/mn, got ", value);
+  return AttnGemmSchedule::kMnPool;
+}
+
+int requested_attn_gemm_n_groups(int num_threads) {
+  const char* value = std::getenv("FUSED_CPP_ATTN_GEMM_N_GROUPS");
+  if (value == nullptr || value[0] == '\0') {
+    return num_threads <= 48 ? num_threads : std::max(1, num_threads / 2);
+  }
+  char* end = nullptr;
+  const long parsed = std::strtol(value, &end, 10);
+  TORCH_CHECK(end != value && *end == '\0' && parsed > 0 && parsed <= std::numeric_limits<int>::max(),
+              "FUSED_CPP_ATTN_GEMM_N_GROUPS must be a positive integer, got ", value);
+  return static_cast<int>(parsed);
 }
 
 AttnGemmBackend selected_attn_gemm_backend() {
@@ -115,6 +157,13 @@ int64_t attn_gemm_round_n(int64_t N, AttnGemmBackend backend) {
     return ::fused_cpp::deepseek_v4::attn_sve::round_n(static_cast<int>(N));
   }
   return ceil_to_multiple(N, kTile);
+}
+
+int64_t attn_gemm_n_tile(AttnGemmBackend backend) {
+  if (backend == AttnGemmBackend::kSve) {
+    return ::fused_cpp::deepseek_v4::attn_sve::n_tile();
+  }
+  return kTile;
 }
 
 void check_bf16_cpu_2d(const at::Tensor& tensor, const char* name) {
@@ -378,8 +427,9 @@ at::Tensor run_bf16_gemm(const at::Tensor& a_storage, const PackedWeight& weight
 #endif
 }
 
-void dispatch_fp32_gemm_to_output(const at::Tensor& a_storage, const PackedWeight& weight, at::Tensor& output,
-                                  at::Tensor& scratch, int64_t row_start, int64_t row_count, int64_t scratch_offset) {
+[[maybe_unused]] void dispatch_fp32_gemm_to_output(const at::Tensor& a_storage, const PackedWeight& weight,
+                                                   at::Tensor& output, at::Tensor& scratch, int64_t row_start,
+                                                   int64_t row_count, int64_t scratch_offset) {
   if (row_count == 0) {
     return;
   }
@@ -405,12 +455,115 @@ void dispatch_fp32_gemm_to_output(const at::Tensor& a_storage, const PackedWeigh
 #endif
 }
 
+void dispatch_fp32_gemm_range_to_output(const at::Tensor& a_storage, const PackedWeight& weight, at::Tensor& output,
+                                        at::Tensor& scratch, int64_t row_start, int64_t row_count, int64_t n_begin,
+                                        int64_t n_cols, int64_t scratch_offset) {
+  if (row_count == 0 || n_cols == 0) {
+    return;
+  }
+  dispatch_fp32_gemm(
+      bf16_data_const(a_storage) + row_start * weight.K_pad,
+      bf16_data_const(weight.tensor) + n_begin * weight.K_pad,
+      output.data_ptr<float>() + row_start * weight.N_pad + n_begin, bf16_data(scratch) + scratch_offset,
+      static_cast<int>(row_count), static_cast<int>(weight.K_pad), static_cast<int>(n_cols),
+      static_cast<int>(weight.N_pad));
+}
+
+[[maybe_unused]] void dispatch_bf16_gemm_range_to_output(
+    const at::Tensor& a_storage, const PackedWeight& weight, at::Tensor& output, at::Tensor& scratch, int64_t row_start,
+    int64_t row_count, int64_t n_begin, int64_t n_cols, int64_t scratch_offset) {
+  if (row_count == 0 || n_cols == 0) {
+    return;
+  }
+#if defined(__linux__)
+  dispatch_bf16_nld_gemm(
+      bf16_data_const(a_storage) + row_start * weight.K_pad,
+      bf16_data_const(weight.tensor) + n_begin * weight.K_pad,
+      bf16_data(output) + row_start * weight.N_pad + n_begin, bf16_data(scratch) + scratch_offset,
+      static_cast<int>(row_count), static_cast<int>(weight.K_pad), static_cast<int>(n_cols),
+      static_cast<int>(weight.N_pad));
+#else
+  TORCH_CHECK(false, "direct bf16-output GEMM range dispatch is only enabled on Linux");
+#endif
+}
+
 struct AttnGemmSelectedOutputs {
   at::Tensor qr_kv;
   at::Tensor kv_score;
   at::Tensor indexer_kv_score;
   at::Tensor indexer_weights;
 };
+
+struct AttnGemmWork {
+  const PackedWeight* weight;
+  at::Tensor* output;
+  bool bf16_output;
+};
+
+struct AttnGemmTaskGroup {
+  int work_index;
+  int64_t n_begin;
+  int64_t n_cols;
+};
+
+struct alignas(64) AttnGemmTaskCursor {
+  std::atomic<int64_t> next_panel{0};
+};
+
+std::vector<int> allocate_attn_gemm_n_groups(const std::vector<AttnGemmWork>& work, int requested_groups,
+                                             int64_t n_tile) {
+  std::vector<int> groups(work.size(), 1);
+  int total_tiles = 0;
+  for (const AttnGemmWork& item : work) {
+    total_tiles += static_cast<int>(item.weight->N_pad / n_tile);
+  }
+  const int target = std::min(total_tiles, std::max(requested_groups, static_cast<int>(work.size())));
+  for (int assigned = static_cast<int>(work.size()); assigned < target; ++assigned) {
+    int best = -1;
+    for (int i = 0; i < static_cast<int>(work.size()); ++i) {
+      const int tiles = static_cast<int>(work[static_cast<size_t>(i)].weight->N_pad / n_tile);
+      if (groups[static_cast<size_t>(i)] >= tiles) {
+        continue;
+      }
+      if (best < 0) {
+        best = i;
+        continue;
+      }
+      const int best_tiles = static_cast<int>(work[static_cast<size_t>(best)].weight->N_pad / n_tile);
+      if (static_cast<int64_t>(tiles) * groups[static_cast<size_t>(best)] >
+          static_cast<int64_t>(best_tiles) * groups[static_cast<size_t>(i)]) {
+        best = i;
+      }
+    }
+    if (best < 0) {
+      break;
+    }
+    ++groups[static_cast<size_t>(best)];
+  }
+  return groups;
+}
+
+std::vector<AttnGemmTaskGroup> make_attn_gemm_task_groups(const std::vector<AttnGemmWork>& work,
+                                                         AttnGemmSchedule schedule, int requested_groups,
+                                                         int64_t n_tile) {
+  std::vector<int> groups_per_work(work.size(), 1);
+  if (schedule == AttnGemmSchedule::kMnPool) {
+    groups_per_work = allocate_attn_gemm_n_groups(work, requested_groups, n_tile);
+  }
+
+  std::vector<AttnGemmTaskGroup> groups;
+  for (int work_index = 0; work_index < static_cast<int>(work.size()); ++work_index) {
+    const int64_t n_tiles = work[static_cast<size_t>(work_index)].weight->N_pad / n_tile;
+    const int splits = groups_per_work[static_cast<size_t>(work_index)];
+    for (int split = 0; split < splits; ++split) {
+      const int64_t tile_begin = static_cast<int64_t>(split) * n_tiles / splits;
+      const int64_t tile_end = static_cast<int64_t>(split + 1) * n_tiles / splits;
+      groups.push_back(
+          AttnGemmTaskGroup{work_index, tile_begin * n_tile, (tile_end - tile_begin) * n_tile});
+    }
+  }
+  return groups;
+}
 
 struct AttnGemmNormedOutputs {
   at::Tensor qr;
@@ -656,11 +809,19 @@ AttnGemmSelectedOutputs run_attn_gemm_selected_mt(const at::Tensor& hidden_state
   at::Tensor a_storage = make_padded_hidden_states(hidden_states, M, K, K_pad);
 
   const int64_t num_threads = static_cast<int64_t>(core_ids.size());
-  const int64_t rows_per_thread = ceil_div_int64(std::max<int64_t>(M, 1), num_threads);
   const AttnGemmBackend backend = selected_attn_gemm_backend();
+  const AttnGemmSchedule schedule = selected_attn_gemm_schedule();
+  const int64_t rows_per_thread = ceil_div_int64(std::max<int64_t>(M, 1), num_threads);
+  const int64_t m_panels = ceil_div_int64(M, kTile);
+  int64_t scratch_rows = rows_per_thread;
+  if (schedule == AttnGemmSchedule::kM8Aligned) {
+    scratch_rows = std::max<int64_t>(1, ceil_div_int64(m_panels, num_threads) * kTile);
+  } else if (schedule == AttnGemmSchedule::kSharedPool || schedule == AttnGemmSchedule::kMnPool) {
+    scratch_rows = kTile;
+  }
   const int64_t scratch_stride = backend == AttnGemmBackend::kSve
-                                     ? ::fused_cpp::deepseek_v4::attn_sve::a_scratch_elems(rows_per_thread, K_pad)
-                                     : std::max<int64_t>(1, rows_per_thread * K_pad * 2);
+                                     ? ::fused_cpp::deepseek_v4::attn_sve::a_scratch_elems(scratch_rows, K_pad)
+                                     : std::max<int64_t>(1, scratch_rows * K_pad * 2);
   auto workspace_lease = ::fused_cpp::workspace::acquire();
   at::Tensor scratch = workspace_lease.empty({num_threads * scratch_stride}, hidden_states.options());
 
@@ -689,6 +850,44 @@ AttnGemmSelectedOutputs run_attn_gemm_selected_mt(const at::Tensor& hidden_state
 #endif
   }
 
+  std::vector<AttnGemmWork> work;
+#if defined(__APPLE__)
+  work.push_back(AttnGemmWork{&fused_wqa_wkv, &qr_kv_acc, false});
+#else
+  work.push_back(AttnGemmWork{&fused_wqa_wkv, &qr_kv_acc, true});
+#endif
+  if constexpr (kRunCompressor) {
+    work.push_back(AttnGemmWork{compressor_kv_score, &kv_score_acc, false});
+  }
+  if constexpr (kRunIndexer) {
+    work.push_back(AttnGemmWork{indexer_compressor_kv_score, &indexer_kv_score_acc, false});
+#if defined(__APPLE__)
+    work.push_back(AttnGemmWork{indexer_weights_proj, &indexer_weights_acc, false});
+#else
+    work.push_back(AttnGemmWork{indexer_weights_proj, &indexer_weights_acc, true});
+#endif
+  }
+
+  const int64_t n_tile = attn_gemm_n_tile(backend);
+  std::vector<AttnGemmTaskGroup> task_groups;
+  std::unique_ptr<AttnGemmTaskCursor[]> task_cursors;
+  if (schedule == AttnGemmSchedule::kSharedPool || schedule == AttnGemmSchedule::kMnPool) {
+    task_groups =
+        make_attn_gemm_task_groups(work, schedule, requested_attn_gemm_n_groups(static_cast<int>(num_threads)), n_tile);
+    task_cursors = std::make_unique<AttnGemmTaskCursor[]>(task_groups.size());
+  }
+
+  auto dispatch_work_range = [&](const AttnGemmWork& item, int64_t row_start, int64_t row_count, int64_t n_begin,
+                                 int64_t n_cols, int64_t scratch_offset) {
+    if (item.bf16_output) {
+      dispatch_bf16_gemm_range_to_output(a_storage, *item.weight, *item.output, scratch, row_start, row_count, n_begin,
+                                         n_cols, scratch_offset);
+    } else {
+      dispatch_fp32_gemm_range_to_output(a_storage, *item.weight, *item.output, scratch, row_start, row_count, n_begin,
+                                         n_cols, scratch_offset);
+    }
+  };
+
   std::vector<int> bind_failed(static_cast<size_t>(num_threads), 0);
   const int old_dynamic = omp_get_dynamic();
 #if defined(__linux__)
@@ -704,29 +903,48 @@ AttnGemmSelectedOutputs run_attn_gemm_selected_mt(const at::Tensor& hidden_state
       bind_failed[static_cast<size_t>(tid)] = 1;
     }
 
-    const int64_t row_start = static_cast<int64_t>(tid) * rows_per_thread;
-    const int64_t row_count = row_start >= M ? 0 : std::min<int64_t>(rows_per_thread, M - row_start);
     const int64_t scratch_offset = static_cast<int64_t>(tid) * scratch_stride;
 
-#if defined(__APPLE__)
-    dispatch_fp32_gemm_to_output(a_storage, fused_wqa_wkv, qr_kv_acc, scratch, row_start, row_count, scratch_offset);
-#else
-    dispatch_bf16_gemm_to_output(a_storage, fused_wqa_wkv, qr_kv_acc, scratch, row_start, row_count, scratch_offset);
-#endif
-    if constexpr (kRunCompressor) {
-      dispatch_fp32_gemm_to_output(a_storage, *compressor_kv_score, kv_score_acc, scratch, row_start, row_count,
-                                   scratch_offset);
-    }
-    if constexpr (kRunIndexer) {
-      dispatch_fp32_gemm_to_output(a_storage, *indexer_compressor_kv_score, indexer_kv_score_acc, scratch, row_start,
-                                   row_count, scratch_offset);
-#if defined(__APPLE__)
-      dispatch_fp32_gemm_to_output(a_storage, *indexer_weights_proj, indexer_weights_acc, scratch, row_start, row_count,
-                                   scratch_offset);
-#else
-      dispatch_bf16_gemm_to_output(a_storage, *indexer_weights_proj, indexer_weights_acc, scratch, row_start, row_count,
-                                   scratch_offset);
-#endif
+    if (schedule == AttnGemmSchedule::kLegacy || schedule == AttnGemmSchedule::kM8Aligned) {
+      int64_t row_start = static_cast<int64_t>(tid) * rows_per_thread;
+      int64_t row_count = row_start >= M ? 0 : std::min<int64_t>(rows_per_thread, M - row_start);
+      if (schedule == AttnGemmSchedule::kM8Aligned) {
+        const int64_t panel_begin = static_cast<int64_t>(tid) * m_panels / num_threads;
+        const int64_t panel_end = static_cast<int64_t>(tid + 1) * m_panels / num_threads;
+        row_start = panel_begin * kTile;
+        row_count = row_start >= M ? 0 : std::min<int64_t>((panel_end - panel_begin) * kTile, M - row_start);
+      }
+      for (const AttnGemmWork& item : work) {
+        dispatch_work_range(item, row_start, row_count, 0, item.weight->N_pad, scratch_offset);
+      }
+    } else {
+      const int group_count = static_cast<int>(task_groups.size());
+      int preferred_group = tid % group_count;
+      while (true) {
+        bool executed = false;
+        for (int offset = 0; offset < group_count; ++offset) {
+          const int group_index = (preferred_group + offset) % group_count;
+          AttnGemmTaskCursor& cursor = task_cursors[static_cast<size_t>(group_index)];
+          if (cursor.next_panel.load(std::memory_order_relaxed) >= m_panels) {
+            continue;
+          }
+          const int64_t panel = cursor.next_panel.fetch_add(1, std::memory_order_relaxed);
+          if (panel >= m_panels) {
+            continue;
+          }
+          const AttnGemmTaskGroup& group = task_groups[static_cast<size_t>(group_index)];
+          const AttnGemmWork& item = work[static_cast<size_t>(group.work_index)];
+          const int64_t row_start = panel * kTile;
+          const int64_t row_count = std::min<int64_t>(kTile, M - row_start);
+          dispatch_work_range(item, row_start, row_count, group.n_begin, group.n_cols, scratch_offset);
+          preferred_group = group_index;
+          executed = true;
+          break;
+        }
+        if (!executed) {
+          break;
+        }
+      }
     }
   }
 

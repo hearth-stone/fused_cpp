@@ -1,4 +1,5 @@
 __pycache__/
+.ccache/
 *.pyc
 *.pyo
 *.egg-info/

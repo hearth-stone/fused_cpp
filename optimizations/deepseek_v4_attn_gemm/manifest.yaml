@@ -1,0 +1,82 @@
+operator: deepseek_v4_attn_gemm
+
+baseline:
+  id: legacy_row_split
+  implementation: csrc/deepseek_v4_attn_gemm_fused.cpp
+  entrypoint: deepseek_v4_attn_gemm_fused_prepacked
+  status: reference
+
+features:
+  - id: schedule.m8_aligned
+    part: schedule
+    status: enabled
+    implementation: csrc/deepseek_v4_attn_gemm_fused.cpp
+    hypothesis: >-
+      Partitioning M in complete M8 panels removes per-thread tail
+      overcomputation while preserving the existing GEMM kernels, packed
+      weights, output layouts, and one OpenMP region.
+    depends_on: []
+    conflicts_with: []
+    correctness: >-
+      PYTHONPATH=src .venv/bin/python -m pytest -q
+      tests/test_deepseek_v4_attn_gemm_fused.py
+    benchmark: >-
+      PYTHONPATH=src FUSED_CPP_ATTN_GEMM_BACKEND=neon
+      numactl --physcpubind=0-95 --membind=0 .venv/bin/python
+      tests/bench_deepseek_v4_attn_gemm_fused.py
+      --cores 0-95 --warmup 3 --runs 15 --schedule m8
+
+  - id: runtime.shared_task_pool
+    part: runtime
+    status: enabled
+    implementation: csrc/deepseek_v4_attn_gemm_fused.cpp
+    hypothesis: >-
+      Publishing all M8 panels from the four attention GEMMs to one worker
+      pool removes stage barriers and lets workers immediately take work from
+      the next GEMM when a narrow GEMM no longer has enough parallel panels.
+    depends_on:
+      - schedule.m8_aligned
+    conflicts_with: []
+    correctness: >-
+      PYTHONPATH=src .venv/bin/python -m pytest -q
+      tests/test_deepseek_v4_attn_gemm_fused.py
+    benchmark: >-
+      PYTHONPATH=src FUSED_CPP_ATTN_GEMM_BACKEND=neon
+      numactl --physcpubind=0-95 --membind=0 .venv/bin/python
+      tests/bench_deepseek_v4_attn_gemm_fused.py
+      --cores 0-95 --warmup 3 --runs 15 --schedule pool
+
+  - id: schedule.mn_groups
+    part: schedule
+    status: enabled
+    implementation: csrc/deepseek_v4_attn_gemm_fused.cpp
+    hypothesis: >-
+      Splitting each packed-B N range into tile-aligned groups exposes enough
+      parallelism for one large GEMM to use the NUMA worker set. Owner-first
+      M8-panel queues retain locality while allowing work stealing across all
+      four GEMMs.
+    depends_on:
+      - runtime.shared_task_pool
+    conflicts_with: []
+    correctness: >-
+      PYTHONPATH=src .venv/bin/python -m pytest -q
+      tests/test_deepseek_v4_attn_gemm_fused.py
+    benchmark: >-
+      PYTHONPATH=src FUSED_CPP_ATTN_GEMM_BACKEND=neon
+      numactl --physcpubind=0-95 --membind=0 .venv/bin/python
+      tests/bench_deepseek_v4_attn_gemm_fused.py
+      --cores 0-95 --warmup 3 --runs 15 --schedule mn
+
+variants:
+  - id: attn_gemm_m8
+    features:
+      - schedule.m8_aligned
+  - id: attn_gemm_pool
+    features:
+      - schedule.m8_aligned
+      - runtime.shared_task_pool
+  - id: attn_gemm_mn
+    features:
+      - schedule.m8_aligned
+      - runtime.shared_task_pool
+      - schedule.mn_groups
