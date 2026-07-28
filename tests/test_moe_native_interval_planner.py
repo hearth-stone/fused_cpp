@@ -20,7 +20,7 @@ from stage_window_policy import AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V1  # noqa
 PROFILE = (
     COST_MODEL
     / "profiles"
-    / "contention_async_amazon_ecs_8c_standalone_sve_F512_E8_splitw13_xbyak_exactm_v2_20260720.json"
+    / "contention_async_amazon_ecs_8c_standalone_sve_F512_E8_splitw13_xbyak_exactm_v2_20260727.json"
 )
 
 
