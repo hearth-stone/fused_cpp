@@ -19,11 +19,15 @@ bench = [
     "pytest-benchmark",
     "openpyxl",
 ]
+oracle = [
+    "ortools>=9.10",
+]
 dev = [
     "pytest",
     "hypothesis",
     "pytest-benchmark",
     "openpyxl",
+    "ortools>=9.10",
 ]
 
 # ── uv 专用：强制 Linux / Windows 上从 PyTorch 官方 CPU 索引拉取 torch ──

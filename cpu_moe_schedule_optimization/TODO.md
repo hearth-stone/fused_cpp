@@ -181,6 +181,14 @@ Acceptance gates:
   long routes. Keep the explicit environment flag and benchmark as regression
   evidence, but leave production dispatch off and do not add a planner gate.
   Reopen only with a new hardware result or a cache-retaining prefetch policy.
+- [x] Add an offline no-contention CP-SAT oracle for the unrestricted supplied
+  width set. It selects one fixed thread width per expert, removes dominated
+  modes, returns incumbent and best-bound regret intervals, and compares the
+  current strict plan with the same quantized `T_iso`. Keep OR-Tools optional
+  and outside the production planner.
+- [ ] Add conservative per-mode hardware lower-bound durations and aggregate
+  matrix/LLC/DRAM capacity bounds before interpreting the CP-SAT result as a
+  physical performance certificate rather than a `T_iso` model oracle.
 - [ ] Measure lane-tail weighted idle loss on a larger routing corpus. Current
   TP cases have a perfect-rebalance upper bound of only 0.7-2.4%; prototype
   same-width-lane work stealing only if representative cases repeatedly exceed

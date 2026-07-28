@@ -705,6 +705,43 @@ optional interval，并要求每个 expert 恰好选择一个线程宽度；CPU 
 cumulative constraint。此编码可作为 isolated fixed-duration 特例的离线
 oracle，并返回可行上界和理论下界。
 
+第一版离线 oracle 已实现于
+`planners/isolated_cp_sat_oracle.py`。它接受显式线程宽度集合，删除满足
+$t_1\le t_2$ 且 $I_i(t_1)\le I_i(t_2)$ 的被支配 mode，并以整数时间 tick
+求解 whole-expert、固定宽度、非抢占 cumulative schedule。生产 planner 与
+runtime 不依赖 OR-Tools；CLI 额外用相同量化后的 $I_i(t)$ 评估当前 strict
+interval-DAG，输出同口径 regret。v1 不包含 dynamic tail pool、连续 core
+interval placement、stage 内重划线程或 communication。
+
+令 CP-SAT incumbent 为 $UB_s$，best objective bound 为 $LB_s$，则：
+
+$$
+LB_s\le C_{\mathrm{iso}}^*\le UB_s.
+$$
+
+对任意同一 mode 域中的可行 planner schedule $C_p$，即使求解超时仍有：
+
+$$
+\max\left(0,\frac{C_p}{UB_s}-1\right)
+\le
+\frac{C_p-C_{\mathrm{iso}}^*}{C_{\mathrm{iso}}^*}
+\le
+\frac{C_p}{LB_s}-1.
+$$
+
+当 $LB_s=UB_s$ 时得到 exact isolated regret。CLI 默认 1000 ns tick，以
+$nq/2$ 报告 nearest-tick 的保守 critical-path 量化误差上界；需要最高模型精度
+时可改为 1 ns。
+
+在 `AmazonC5192Cores` TP4/F512 的 96-core rank 上，9 个默认 workload 的
+第一轮验证表明该下界必须解释为 scheduling surrogate，而不是可达 wall time：
+双 NUMA 当前实测相对 isolated optimum 区间高 50.4%-253.0%。其中
+`5xM2040 + 174xM12` 的当前 `16T head + 1T tail_pool` 以 100 ns tick
+达到 exact isolated optimum `6.1316 ms`，但双 rank wall time 为
+`10.930 ms`；剩余差距因此不属于 isolated 线程宽度/开始时间选择。
+完整数据、哈希和测量限制见
+`optimizations/fused_moe_sve/results/amazon_192c_isolated_cp_sat_oracle_20260726.md`。
+
 由于原始问题规定 $D_i(\mathcal Z)\ge1$，该 isolated 特例的最优 makespan
 不大于真实 contention-aware 最优值，因此可以作为有效下界。
 
@@ -1471,6 +1508,13 @@ $$
 \frac{C_{\mathrm{pruned}}-LB}{LB}.
 $$
 
+对未证明最优的 CP-SAT 运行，还应同时报告 incumbent $UB$。此时实际 regret
+位于
+$[\max(0,C_{\mathrm{pruned}}/UB-1),\,C_{\mathrm{pruned}}/LB-1]$；
+不能把 `FEASIBLE` incumbent 当成 exact optimum。若 duration 来自实测中位数或
+拟合 $\widehat I$，该区间只对性能近似模型成立；只有每个 duration 都是保守的
+物理时间下界时，$LB$ 才能解释为硬件级绝对下界。
+
 每一层剪枝都应分别报告：
 
 - plan-space 缩减量；
@@ -2035,3 +2079,5 @@ route/thread/mixed-distribution 验证前，解析 backend 保持 opt-in。
 | 2026-07-26 | v0.36 | Plan V2 增加 per-task W13/W2 packed-B byte-window override；planner 可在选定 task/DAG 后应用命名的确定性 $g(M,t)$，不扩大或重新评分搜索空间。记录 AmazonC5192Cores NUMA0 TP4/F512 静态策略及 7 个 E2E workload：active-set-128/64/32 分别提升 28.14%/10.38%/1.66%，未覆盖 case 最大观测回退 0.32%；该机器专用策略保持 opt-in，待独立窗口 calibration 后才可进入 scored production policy。 |
 | 2026-07-26 | v0.37 | 将 `amazon_c5_192c_tp4_f512_v1` 设为精确 profile-bound 默认：只匹配双 NUMA AmazonC5192Cores TP4/F512、96-core rank、SVE JIT exact-M split-W13 identity，并按 selected model 分别解析，no-split 和其他 profile 不受影响；增加 `use_default_stage_window_policy=False` opt-out。NUMA1 active-set-64/128 独立复测分别提升 10.58%/29.71%，与 NUMA0 一致；该 runtime policy 仍不进入 cost-model 评分或跨机器外推。 |
 | 2026-07-26 | v0.38 | 将确定性 $g(M,t)$ 前移到候选执行建模：empirical backend 按实际 W13/W2 range 和瞬时 working set 进行 contention event simulation，analytic backend 同时重算 range/cache/DRAM demand 与 isolated time；命中 override 的 workload 禁用 global-policy full-call anchor，Python/native cold planner 共用同一组已解析 geometry。shape、tail-pool 和 kernel variant 候选均未增加，window 仍不是自由搜索变量。 |
+| 2026-07-26 | v0.39 | 实现离线 isolated CP-SAT oracle v1：对每个 expert 选择一个非抢占固定线程宽度，以 `T_iso` optional interval 和 CPU cumulative constraint 求最小 makespan；增加 mode dominance、整数时间量化、可行 incumbent/best-bound regret 区间、strict planner 同口径评估和独立 CLI。该工具为可选 OR-Tools 依赖，不改变 production planner、runtime 或 contention 模型。 |
+| 2026-07-26 | v0.40 | 在 AmazonC5192Cores 的 TP4/F512 96-core rank 上用 9 个默认 workload 验证 isolated CP-SAT oracle，并与双 NUMA 当前 runtime 配对最大值比较。active-set-8 与 long/short bimodal 分别证明 `7.9300/6.1316 ms` 最优；当前 bimodal tail-pool 的 isolated regret 为 0%，但 wall time 仍高 78.3%，确认 v1 只能界定 isolated scheduling gap，不能充当无资源容量约束的硬件性能证书。 |
