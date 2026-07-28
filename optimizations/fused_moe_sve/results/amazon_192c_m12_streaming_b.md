@@ -100,3 +100,80 @@ This remains a standalone experiment. Before production integration, the W13
 prefetch body must be applied to the fused SiLU/packC entrypoint and measured
 inside the complete split-W13 expert; dispatch should be gated by a large-K or
 packed-A-footprint condition rather than by `M=12` alone.
+
+## PLDL3STRM follow-up (2026-07-27)
+
+The same standalone M12 body was extended with one `PLDL3STRM` hint per
+consumed 64-byte B cache line at 512, 1024, 2048, and 4096-byte distances.
+Disassembly confirmed the requested L3 streaming hint, and all 48 benchmark
+variants remained bit exact.
+
+The benchmark also gained a `--workers` mode for contention measurements.
+Every worker is pinned to a distinct core and owns distinct A, B, output, and
+scratch storage. A barrier surrounds every GEMM invocation, and the barrier
+completion records the synchronized wave wall time. Every worker consumes a
+new 4 MiB B matrix on every invocation. This is materially different from
+synchronizing only process startup: independently running processes drift
+after the first call, and the maximum of their individual medians is not a
+wave latency.
+
+As a harness control, the synchronized mode reproduced the known
+`PLDL1STRM` crossover. At eight workers, the 2 KiB L1 hint improved W13 by
+17.7-18.4%; at 24 workers it regressed by 2.6-3.3%. The exact percentages
+differ from the earlier temporary crossover harness, but the positive
+low-pressure result and negative saturated result agree.
+
+### Isolated results
+
+Single-core tests used 101 samples in each of 11 independent processes.
+Synchronized tests used 31 samples per process; the table reports the median
+of per-process paired gains.
+
+| Shape | Workers | L3 hint | Baseline logical B GB/s | L3-hint logical B GB/s | Paired gain |
+|---|---:|---:|---:|---:|---:|
+| W13 `K=4096,N=512` | 1 | 1024 B | 23.49 | 23.50 | +0.24% |
+| W13 `K=4096,N=512` | 8 | 1024 B | 156.74 | 157.12 | +0.25% |
+| W13 `K=4096,N=512` | 24 | 1024 B | 315.91 | 316.11 | +0.23% |
+| W13 `K=4096,N=512` | 48 | 1024 B | 324.87 | 322.85 | -0.24% |
+| W2 `K=512,N=4096` | 1 | 4096 B | 23.94 | 24.70 | +2.37% |
+| W2 `K=512,N=4096` | 8 | 2048 B | 174.51 | 176.61 | +0.98% |
+| W2 `K=512,N=4096` | 24 | 2048 B | 312.63 | 310.06 | +0.22%* |
+| W2 `K=512,N=4096` | 48 | 2048 B | 325.30 | 327.18 | +1.11% |
+| W2 `K=512,N=4096` | 96 | 2048 B | 368.15 | 350.28 | -4.92% |
+
+`*` The five 24-worker paired gains ranged from -1.05% to +1.60%; this point
+is not a stable positive result. Logical B GB/s is compulsory B bytes divided
+by synchronized wave wall time, not an uncore DRAM counter.
+
+The 24-worker distance sweep also exposed a lead-distance cliff. The 4096-byte
+hint regressed W13 by a median 7.48% and W2 by 5.01%. Shorter distances were
+near noise for W13 and did not produce a stable W2 gain once tested in an
+isolated pair.
+
+Representative commands:
+
+```bash
+# Single-core distance sweep.
+python3 optimizations/fused_moe_sve/benchmarks/run_m12_streaming_b.py \
+  --shape w13 \
+  --variants baseline_ld1h,pldl3strm_512_x1,pldl3strm_1024_x1,pldl3strm_2048_x1,pldl3strm_4096_x1 \
+  --cpu 48 --numa-node 0 --warmup 5 --runs 51 --repeat 7 \
+  --cold-tail-mib 192
+
+# Strictly synchronized cold-B wave.
+numactl --cpunodebind=0 --membind=0 \
+  optimizations/fused_moe_sve/benchmarks/bench_m12_streaming_b \
+  --shape w2 --variants baseline_ld1h,pldl3strm_2048_x1 \
+  --workers 96 --cpu 0 --warmup 5 --runs 31 --cold-tail-mib 192
+```
+
+### PLDL3STRM decision
+
+Do not add `PLDL3STRM` to production dispatch on this host. It does not provide
+a measurable W13 benefit, its W2 benefit is at most about 1-2% under low or
+moderate pressure, and W2 regresses by about 5% at full-NUMA concurrency.
+`PLDL3STRM` is an implementation-defined hint, not a non-allocating request:
+it can still consume cache/memory request capacity, and an excessive lead can
+fetch data too early. The timing results do not identify the exact allocation
+level, but they reject this candidate as the required "early request without
+high-concurrency regression" mechanism.

@@ -478,10 +478,12 @@ the behavior used to expose the private-L2 and shared-LLC residency windows.
 `bench_m12_streaming_b` isolates B-load policy without changing production
 dispatch. Its standalone assembly copies the production M12 BFMMLA body and
 BF16 store epilogue exactly, then provides normal `LD1H`, `LDNT1H`, and
-`PLDL1STRM`/`PLDL2STRM` variants. The production symbol is used only as the
-bit-exact correctness reference. Every timed call consumes a distinct cold
-4 MiB packed-B matrix, and a 4 KiB guard after every copy prevents the final
-software prefetch from touching the next invocation's weight.
+`PLDL1STRM`/`PLDL2STRM`/`PLDL3STRM` variants. The production symbol is used
+only as the bit-exact correctness reference. Every timed call consumes a
+distinct cold 4 MiB packed-B matrix, and a 4 KiB guard after every copy
+prevents the final software prefetch from touching the next invocation's
+weight. `--workers N` runs strictly synchronized one-core-per-B waves and
+reports aggregate wall time rather than independent worker medians.
 
 Run the complete candidate sweep with:
 
@@ -508,6 +510,13 @@ negative; this is consistent with displacing its otherwise L1-resident 12 KiB
 packed-A panel. `LDNT1H` had no stable benefit. The result supports a
 W13-like large-K specialization, not a generic M12 load replacement; no
 production path is enabled by this experiment.
+
+A 2026-07-27 follow-up tested one-hint `PLDL3STRM` distances from 512 to
+4096 bytes. W13 changed by less than 0.3% at 1, 8, and 24 workers and was
+slightly negative at 48 workers. W2 gained about 1-2% at low/moderate
+contention but regressed by 4.9% at 96 workers; a 4 KiB lead also regressed at
+24 workers. L3 streaming prefetch therefore remains benchmark-only and is not
+the cache-safe high-concurrency replacement for the retired L1 policy.
 
 Commands and complete measurements are recorded in
 [`results/amazon_192c_m12_streaming_b.md`](results/amazon_192c_m12_streaming_b.md).

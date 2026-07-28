@@ -84,8 +84,9 @@
 
 	// mode 0: LD1H, mode 1: two PLDL1STRM hints, mode 2: two
 	// PLDL2STRM hints, mode 3: LDNT1H, mode 4: one PLDL1STRM hint,
-	// mode 5: one PLDL2STRM hint. The target consumes one 64-byte B cache line
-	// per K4 body at its 128-bit runtime VL; modes 4/5 isolate one hint per line.
+	// mode 5: one PLDL2STRM hint, mode 6: one PLDL3STRM hint. The target
+	// consumes one 64-byte B cache line per K4 body at its 128-bit runtime VL;
+	// modes 4/5/6 isolate one hint per line.
 	.macro M12_K4_BODY mode, ahead0=0, ahead1=0
 	.if \mode == 1
 	prfm pldl1strm, [x17, #\ahead0]
@@ -97,6 +98,8 @@
 	prfm pldl1strm, [x17, #\ahead0]
 	.elseif \mode == 5
 	prfm pldl2strm, [x17, #\ahead0]
+	.elseif \mode == 6
+	prfm pldl3strm, [x17, #\ahead0]
 	.endif
 	.if \mode == 3
 	ldnt1h {z4.h}, p0/z, [x17]
@@ -287,6 +290,10 @@
 	DEFINE_M12_STREAM_KERNEL moe_sve_m12_bf16_ldnt1h,          3
 	DEFINE_M12_STREAM_KERNEL moe_sve_m12_bf16_pldl1strm_2048_x1, 4, 2048
 	DEFINE_M12_STREAM_KERNEL moe_sve_m12_bf16_pldl2strm_1024_x1, 5, 1024
+	DEFINE_M12_STREAM_KERNEL moe_sve_m12_bf16_pldl3strm_512_x1,  6, 512
+	DEFINE_M12_STREAM_KERNEL moe_sve_m12_bf16_pldl3strm_1024_x1, 6, 1024
+	DEFINE_M12_STREAM_KERNEL moe_sve_m12_bf16_pldl3strm_2048_x1, 6, 2048
+	DEFINE_M12_STREAM_KERNEL moe_sve_m12_bf16_pldl3strm_4096_x1, 6, 4096
 
 	// Serial K-block experiment. x3 is a 12*N FP32 scratch buffer in
 	// accumulator-native layout; w6 is the fixed wrapper's K chunk size.

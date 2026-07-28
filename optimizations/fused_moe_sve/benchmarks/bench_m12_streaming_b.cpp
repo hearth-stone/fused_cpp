@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <arm_sve.h>
 #include <array>
+#include <barrier>
 #include <chrono>
 #include <csignal>
 #include <cmath>
@@ -16,6 +17,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include <pthread.h>
@@ -41,6 +43,14 @@ void moe_sve_m12_bf16_pldl2strm_2048(const uint16_t*, const uint16_t*, uint16_t*
 void moe_sve_m12_bf16_ldnt1h(const uint16_t*, const uint16_t*, uint16_t*, uint16_t*, const gemm_params_t*);
 void moe_sve_m12_bf16_pldl1strm_2048_x1(const uint16_t*, const uint16_t*, uint16_t*, uint16_t*, const gemm_params_t*);
 void moe_sve_m12_bf16_pldl2strm_1024_x1(const uint16_t*, const uint16_t*, uint16_t*, uint16_t*, const gemm_params_t*);
+void moe_sve_m12_bf16_pldl3strm_512_x1(const uint16_t*, const uint16_t*, uint16_t*, uint16_t*,
+                                       const gemm_params_t*);
+void moe_sve_m12_bf16_pldl3strm_1024_x1(const uint16_t*, const uint16_t*, uint16_t*, uint16_t*,
+                                        const gemm_params_t*);
+void moe_sve_m12_bf16_pldl3strm_2048_x1(const uint16_t*, const uint16_t*, uint16_t*, uint16_t*,
+                                        const gemm_params_t*);
+void moe_sve_m12_bf16_pldl3strm_4096_x1(const uint16_t*, const uint16_t*, uint16_t*, uint16_t*,
+                                        const gemm_params_t*);
 void moe_sve_m12_bf16_kblock_256(const uint16_t*, const uint16_t*, uint16_t*, uint16_t*, const gemm_params_t*);
 void moe_sve_m12_bf16_kblock_512(const uint16_t*, const uint16_t*, uint16_t*, uint16_t*, const gemm_params_t*);
 void moe_sve_m12_bf16_kblock_768(const uint16_t*, const uint16_t*, uint16_t*, uint16_t*, const gemm_params_t*);
@@ -97,7 +107,7 @@ struct Variant {
   bool kblocked_b = false;
 };
 
-constexpr std::array<Variant, 44> kVariants{{
+constexpr std::array<Variant, 48> kVariants{{
     {"baseline_ld1h", moe_sve_m12_bf16_ld1h},
     {"pldl1strm_256", moe_sve_m12_bf16_pldl1strm_256},
     {"pldl1strm_512", moe_sve_m12_bf16_pldl1strm_512},
@@ -109,6 +119,10 @@ constexpr std::array<Variant, 44> kVariants{{
     {"ldnt1h", moe_sve_m12_bf16_ldnt1h},
     {"pldl1strm_2048_x1", moe_sve_m12_bf16_pldl1strm_2048_x1},
     {"pldl2strm_1024_x1", moe_sve_m12_bf16_pldl2strm_1024_x1},
+    {"pldl3strm_512_x1", moe_sve_m12_bf16_pldl3strm_512_x1},
+    {"pldl3strm_1024_x1", moe_sve_m12_bf16_pldl3strm_1024_x1},
+    {"pldl3strm_2048_x1", moe_sve_m12_bf16_pldl3strm_2048_x1},
+    {"pldl3strm_4096_x1", moe_sve_m12_bf16_pldl3strm_4096_x1},
     {"kblock_256", moe_sve_m12_bf16_kblock_256, true},
     {"kblock_512", moe_sve_m12_bf16_kblock_512, true},
     {"kblock_768", moe_sve_m12_bf16_kblock_768, true},
@@ -159,6 +173,7 @@ struct Options {
   int warmup = 5;
   int runs = 31;
   int cpu = 48;
+  int workers = 1;
   int cold_tail_mib = 192;
   int weight_color = -1;
   bool check_only = false;
@@ -204,6 +219,8 @@ Options ParseOptions(int argc, char** argv) {
       options.runs = ParseInt(value("--runs"), "runs");
     } else if (argument == "--cpu") {
       options.cpu = ParseInt(value("--cpu"), "CPU", true);
+    } else if (argument == "--workers") {
+      options.workers = ParseInt(value("--workers"), "workers");
     } else if (argument == "--cold-tail-mib") {
       options.cold_tail_mib = ParseInt(value("--cold-tail-mib"), "cold tail MiB", true);
     } else if (argument == "--weight-color") {
@@ -225,7 +242,7 @@ Options ParseOptions(int argc, char** argv) {
                 << "  --variants all|baseline_ld1h,name...\n"
                 << "  --m M                     execute M/12 consecutive M12 panels\n"
                 << "  --k K --n N             use one custom shape\n"
-                << "  --warmup N --runs N --cpu CPU --cold-tail-mib MiB\n"
+                << "  --warmup N --runs N --cpu CPU --workers N --cold-tail-mib MiB\n"
                 << "  --weight-color 0..3     hold every cold B at one L1 set phase\n"
                 << "  --check-only --prewarm-a --stop-before-run --unique-scratch\n";
       std::exit(0);
@@ -576,6 +593,195 @@ void RunShape(const Shape& shape, const Options& options, const std::vector<size
   std::cout << "output_checksum=" << output_checksum << " a_checksum=" << a_checksum << "\n";
 }
 
+struct WaveWorkItem {
+  size_t active_index = 0;
+  size_t copy = 0;
+  bool measured = false;
+};
+
+void RunShapeWave(const Shape& shape, const Options& options, const std::vector<size_t>& active_variants) {
+  for (size_t variant_index : active_variants) {
+    if (kVariants[variant_index].kblocked_b) {
+      throw std::invalid_argument("--workers does not support K-blocked B variants");
+    }
+  }
+
+  const size_t workers = static_cast<size_t>(options.workers);
+  const size_t a_elements = CheckedMultiply(options.m, static_cast<size_t>(shape.k), "packed A");
+  const size_t weight_elements = CheckedMultiply(static_cast<size_t>(shape.k), shape.n, "packed B");
+  const size_t output_elements = CheckedMultiply(options.m, static_cast<size_t>(shape.n), "output");
+  const size_t panel_output_elements = CheckedMultiply(kM, static_cast<size_t>(shape.n), "panel output");
+  const size_t scratch_elements = CheckedMultiply(panel_output_elements, size_t{2}, "FP32 partial C");
+  const size_t rounds = static_cast<size_t>(options.warmup) + options.runs;
+  const size_t used_copies = CheckedMultiply(rounds, active_variants.size(), "weight copies");
+  const size_t weight_guard_bytes = options.weight_color >= 0 ? kFixedColorStrideBytes : kWeightGuardBytes;
+  const size_t weight_base_offset_bytes =
+      options.weight_color >= 0 ? static_cast<size_t>(options.weight_color) * 4 * kKiB : 0;
+  const size_t weight_base_offset_elements = weight_base_offset_bytes / sizeof(uint16_t);
+  const size_t weight_stride_elements = weight_elements + weight_guard_bytes / sizeof(uint16_t);
+  const size_t worker_weight_elements =
+      weight_base_offset_elements + CheckedMultiply(used_copies, weight_stride_elements, "worker timed weights");
+  const size_t all_worker_weight_elements =
+      CheckedMultiply(workers, worker_weight_elements, "all worker timed weights");
+  const size_t cold_tail_elements =
+      CheckedMultiply(static_cast<size_t>(options.cold_tail_mib), kMiB, "cold tail") / sizeof(uint16_t);
+  const size_t all_weight_elements = all_worker_weight_elements + cold_tail_elements;
+
+  AlignedBf16 packed_a = AllocateBf16(CheckedMultiply(workers, a_elements, "all packed A"));
+  AlignedBf16 weights = AllocateBf16(all_weight_elements);
+  AlignedBf16 outputs = AllocateBf16(CheckedMultiply(workers, output_elements, "all outputs"));
+  AlignedBf16 scratches = AllocateBf16(CheckedMultiply(workers, scratch_elements, "all scratches"));
+  for (size_t worker = 0; worker < workers; ++worker) {
+    FillPattern(packed_a.get() + worker * a_elements, a_elements, 17 + static_cast<uint32_t>(worker % 7),
+                1.0f / 256.0f);
+    uint16_t* const worker_weights = weights.get() + worker * worker_weight_elements;
+    for (size_t copy = 0; copy < used_copies; ++copy) {
+      const uint16_t value = static_cast<uint16_t>(0x3a40u + (copy + worker) % 32);
+      uint16_t* const weight =
+          worker_weights + weight_base_offset_elements + copy * weight_stride_elements;
+      std::fill_n(weight, weight_elements, value);
+      std::fill_n(weight + weight_elements, weight_guard_bytes / sizeof(uint16_t), uint16_t{0});
+    }
+  }
+  std::fill_n(weights.get() + all_worker_weight_elements, cold_tail_elements, uint16_t{0x3b00});
+  std::fill_n(outputs.get(), workers * output_elements, kOutputSentinel);
+  std::fill_n(scratches.get(), workers * scratch_elements, uint16_t{0});
+
+  const uint64_t cold_checksum =
+      ScanCacheLines(weights.get() + all_worker_weight_elements, cold_tail_elements);
+  if (cold_tail_elements != 0 && cold_checksum == 0) {
+    throw std::runtime_error("cold-tail scan produced a zero checksum");
+  }
+
+  std::vector<WaveWorkItem> work;
+  work.reserve(used_copies);
+  size_t copy = 0;
+  for (size_t round = 0; round < rounds; ++round) {
+    for (size_t slot = 0; slot < active_variants.size(); ++slot, ++copy) {
+      work.push_back(
+          {VariantAtSlot(static_cast<int>(round), slot, active_variants.size()), copy,
+           round >= static_cast<size_t>(options.warmup)});
+    }
+  }
+
+  const size_t weight_bytes = CheckedMultiply(weight_elements, sizeof(uint16_t), "weight bytes");
+  const double allocated_gib =
+      CheckedMultiply(all_weight_elements, sizeof(uint16_t), "all weight bytes") /
+      static_cast<double>(size_t{1} << 30);
+  std::cout << std::fixed << std::setprecision(4) << "wave_config shape=" << shape.name << " M=" << options.m
+            << " K=" << shape.k << " N=" << shape.n << " n_tile=" << svcnth() << " cpu_start=" << options.cpu
+            << " workers=" << options.workers << " weight_mib=" << weight_bytes / static_cast<double>(kMiB)
+            << " variants=" << active_variants.size() << " warmup=" << options.warmup << " runs=" << options.runs
+            << " cold_tail_mib=" << options.cold_tail_mib << " allocated_gib=" << allocated_gib << '\n';
+
+  if (options.stop_before_run) {
+    std::cout << "profiler_ready pid=" << getpid() << '\n' << std::flush;
+    if (std::raise(SIGSTOP) != 0) {
+      throw std::runtime_error("failed to stop for profiler attach");
+    }
+  }
+
+  const gemm_params_t params = MakeParams(shape);
+  std::vector<double> wave_seconds(work.size(), 0.0);
+  std::vector<uint64_t> a_checksums(workers, 0);
+  Clock::time_point wave_start;
+  size_t completed = 0;
+  std::barrier start_barrier(options.workers, [&]() noexcept { wave_start = Clock::now(); });
+  std::barrier finish_barrier(options.workers, [&]() noexcept {
+    wave_seconds[completed++] = std::chrono::duration<double>(Clock::now() - wave_start).count();
+  });
+  std::barrier launch_barrier(options.workers + 1);
+  bool abort_workers = false;
+  int affinity_error = 0;
+  std::vector<std::thread> threads;
+  threads.reserve(workers);
+  for (size_t worker = 0; worker < workers; ++worker) {
+    threads.emplace_back([&, worker]() {
+      launch_barrier.arrive_and_wait();
+      if (abort_workers) {
+        return;
+      }
+      const uint16_t* const worker_a = packed_a.get() + worker * a_elements;
+      const uint16_t* const worker_weights = weights.get() + worker * worker_weight_elements;
+      uint16_t* const worker_output = outputs.get() + worker * output_elements;
+      uint16_t* const worker_scratch = scratches.get() + worker * scratch_elements;
+      uint64_t a_checksum = 0;
+      for (const WaveWorkItem& item : work) {
+        if (options.prewarm_a) {
+          a_checksum += ScanCacheLines(worker_a, a_elements);
+        }
+        start_barrier.arrive_and_wait();
+        const size_t variant_index = active_variants[item.active_index];
+        InvokeRows(kVariants[variant_index], worker_a,
+                   worker_weights + weight_base_offset_elements + item.copy * weight_stride_elements,
+                   worker_output, worker_scratch, params, options.m);
+        finish_barrier.arrive_and_wait();
+      }
+      a_checksums[worker] = a_checksum;
+    });
+
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(options.cpu + static_cast<int>(worker), &set);
+    const int error = pthread_setaffinity_np(threads.back().native_handle(), sizeof(set), &set);
+    if (error != 0 && affinity_error == 0) {
+      affinity_error = error;
+    }
+  }
+  abort_workers = affinity_error != 0;
+  launch_barrier.arrive_and_wait();
+  for (std::thread& thread : threads) {
+    thread.join();
+  }
+  if (affinity_error != 0) {
+    throw std::runtime_error("worker pthread_setaffinity_np failed: " + std::to_string(affinity_error));
+  }
+  if (completed != work.size()) {
+    throw std::logic_error("wave timing accounting mismatch");
+  }
+
+  std::vector<std::vector<double>> samples(active_variants.size());
+  for (size_t item_index = 0; item_index < work.size(); ++item_index) {
+    if (work[item_index].measured) {
+      samples[work[item_index].active_index].push_back(wave_seconds[item_index]);
+    }
+  }
+  const Stats baseline = Summarize(samples.front());
+  const double flops =
+      2.0 * options.m * shape.k * static_cast<double>(shape.n) * options.workers;
+  const double streamed_weight_bytes =
+      static_cast<double>(weight_bytes) * options.m / kM * options.workers;
+  std::cout << "variant              median_ms    p10_ms    p90_ms   GFLOP/s   B_GB/s  median_gain%  paired_gain%\n";
+  for (size_t active_index = 0; active_index < active_variants.size(); ++active_index) {
+    const size_t variant_index = active_variants[active_index];
+    const Stats stats = Summarize(samples[active_index]);
+    std::vector<double> paired_gains;
+    paired_gains.reserve(static_cast<size_t>(options.runs));
+    for (int run = 0; run < options.runs; ++run) {
+      paired_gains.push_back(
+          samples.front()[static_cast<size_t>(run)] / samples[active_index][static_cast<size_t>(run)] - 1.0);
+    }
+    const double median_gain = baseline.median / stats.median - 1.0;
+    const double paired_gain = Summarize(std::move(paired_gains)).median;
+    const double gflops = flops / stats.median / 1.0e9;
+    const double b_gbs = streamed_weight_bytes / stats.median / 1.0e9;
+    std::cout << std::left << std::setw(20) << kVariants[variant_index].name << std::right << std::setw(10)
+              << stats.median * 1.0e3 << std::setw(10) << stats.p10 * 1.0e3 << std::setw(10)
+              << stats.p90 * 1.0e3 << std::setw(10) << gflops << std::setw(10) << b_gbs << std::setw(14)
+              << median_gain * 100.0 << std::setw(14) << paired_gain * 100.0 << '\n';
+    std::cout << "WAVE_RESULT_JSON {\"shape\":\"" << shape.name << "\",\"variant\":\""
+              << kVariants[variant_index].name << "\",\"workers\":" << options.workers
+              << ",\"median_ms\":" << stats.median * 1.0e3 << ",\"p10_ms\":" << stats.p10 * 1.0e3
+              << ",\"p90_ms\":" << stats.p90 * 1.0e3 << ",\"gflops\":" << gflops << ",\"b_gbs\":" << b_gbs
+              << ",\"median_gain_pct\":" << median_gain * 100.0 << ",\"paired_gain_pct\":"
+              << paired_gain * 100.0 << "}\n";
+  }
+
+  uint64_t output_checksum = ScanCacheLines(outputs.get(), workers * output_elements);
+  const uint64_t a_checksum = std::accumulate(a_checksums.begin(), a_checksums.end(), uint64_t{0});
+  std::cout << "output_checksum=" << output_checksum << " a_checksum=" << a_checksum << "\n";
+}
+
 std::vector<Shape> SelectShapes(const Options& options) {
   if ((options.custom_k == 0) != (options.custom_n == 0)) {
     throw std::invalid_argument("--k and --n must be provided together");
@@ -647,9 +853,16 @@ int main(int argc, char** argv) {
       if (shape.k % 8 != 0 || shape.n % n_tile != 0) {
         throw std::invalid_argument("K must align to 8 and N to the runtime SVE n_tile");
       }
+      if (options.cpu + options.workers > CPU_SETSIZE) {
+        throw std::invalid_argument("worker CPU range exceeds CPU_SETSIZE");
+      }
       CheckCorrectness(shape);
       if (!options.check_only) {
-        RunShape(shape, options, active_variants);
+        if (options.workers == 1) {
+          RunShape(shape, options, active_variants);
+        } else {
+          RunShapeWave(shape, options, active_variants);
+        }
       }
     }
     return 0;
