@@ -408,15 +408,7 @@ def make_production_schedule(
             cpu_ids=cpu_ids,
         )
         static_spec = static_planner.plan_spec_for(counts)
-        baseline_bridge = auto_spec["bridge"]
         static_bridge = static_spec["bridge"]
-        stage_fields = {"task_w13_window_bytes", "task_w2_window_bytes"}
-        if {
-            key: value for key, value in baseline_bridge.items() if key not in stage_fields
-        } != {
-            key: value for key, value in static_bridge.items() if key not in stage_fields
-        }:
-            raise RuntimeError("static stage-window policy changed the selected production-auto task plan")
         static_stage_window_plan = AsyncMoEPlanV2.from_dict(static_bridge)
         window_pairs = list(
             zip(
@@ -426,6 +418,10 @@ def make_production_schedule(
         )
         static_stage_window_metadata = {
             "name": AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V1.name,
+            "shape": list(static_spec["shape"]),
+            "execution_mode": static_spec["execution_mode"],
+            "tail_pool_threads": static_spec["tail_pool_threads"],
+            "tail_pool_max_routes": static_spec["tail_pool_max_routes"],
             "overridden_tasks": sum(w13 >= 0 or w2 >= 0 for w13, w2 in window_pairs),
             "window_pairs": sorted({f"{w13}:{w2}" for w13, w2 in window_pairs if w13 >= 0 or w2 >= 0}),
         }
@@ -766,10 +762,7 @@ def main() -> int:
             )
         pool_description = "none"
         if planner_metadata["tail_pool_threads"] is not None:
-            pool_description = (
-                f"{planner_metadata['tail_pool_threads']}T/"
-                f"M<={planner_metadata['tail_pool_max_routes']}"
-            )
+            pool_description = f"{planner_metadata['tail_pool_threads']}T/M<={planner_metadata['tail_pool_max_routes']}"
         print(
             f"production shape={tuple(planner_metadata['shape'])} "
             f"mode={planner_metadata['execution_mode']} "
