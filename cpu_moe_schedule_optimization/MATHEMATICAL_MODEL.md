@@ -2058,6 +2058,14 @@ route/thread grid、kernel policy 和 phase geometry；planner candidate、LPT
 assignment、shape pruning 与 runtime plan 均不改变。缺少 companion 时继续
 使用旧的全程 concurrent-rank 上界，避免跨 profile 外推。
 
+2026-07-27 在 AmazonC5192Cores 上以 CPU `0-31`/`96-127` 生成当前 JIT
+exact-M EP2 H4096/F2048/E32 split/no-split single/dual 配对表。tiered-hotspot
+的两个 rank 分别选择 `(32,)` 与 `(16,16)`；旧全程 dual-rank 估计为
+55.605 ms，phase lifetime 转换后为 54.770 ms，减少 0.835 ms（1.50%）。
+同日 TP4/F512/E256 companion 的 route-48/route-192 构造检查减少
+1.939 ms（4.99%）。两组 profile 均通过 source/extension hash、isolated
+grid、shape grid 和 phase geometry 一致性检查。
+
 ## 10. 同步规则
 
 发生以下任一变化时，必须同步更新本文档：
@@ -2125,3 +2133,4 @@ assignment、shape pruning 与 runtime plan 均不改变。缺少 companion 时�
 | 2026-07-26 | v0.39 | 实现离线 isolated CP-SAT oracle v1：对每个 expert 选择一个非抢占固定线程宽度，以 `T_iso` optional interval 和 CPU cumulative constraint 求最小 makespan；增加 mode dominance、整数时间量化、可行 incumbent/best-bound regret 区间、strict planner 同口径评估和独立 CLI。该工具为可选 OR-Tools 依赖，不改变 production planner、runtime 或 contention 模型。 |
 | 2026-07-26 | v0.40 | 在 AmazonC5192Cores 的 TP4/F512 96-core rank 上用 9 个默认 workload 验证 isolated CP-SAT oracle，并与双 NUMA 当前 runtime 配对最大值比较。active-set-8 与 long/short bimodal 分别证明 `7.9300/6.1316 ms` 最优；当前 bimodal tail-pool 的 isolated regret 为 0%，但 wall time 仍高 78.3%，确认 v1 只能界定 isolated scheduling gap，不能充当无资源容量约束的硬件性能证书。 |
 | 2026-07-27 | v0.41 | TP/EP evaluator 增加跨 rank lifetime phase 转换：多 rank 活跃时使用 concurrent-rank profile，倒数第二个 rank 完成后按当前 phase 剩余比例切换至 matching single-rank companion；不重放 setup/dependency，不扩大 planner 候选或改变剪枝，缺少 companion 时保守回退旧上界。 |
+| 2026-07-27 | v0.42 | 用当前 JIT exact-M kernel 生成 32-core/rank EP2 H4096/F2048/E32 single/dual 配对表，并在 tiered-hotspot 上验证 lifetime 转换将 55.605 ms 修正为 54.770 ms（-1.50%）；同步刷新 8-core standalone 与 192-core TP4/F512 single/dual empirical profiles。 |

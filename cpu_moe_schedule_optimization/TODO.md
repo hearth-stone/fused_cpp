@@ -129,11 +129,14 @@ accurate: W13 accounts for 67.3-67.8% of W13+W2 time.
   error comes from applying the `concurrent_ranks=2` derate for the long rank's
   whole DAG after the short rank has completed, not from `T_iso`, intra-rank
   expert contention, or the 2/3 W13 + 1/3 W2 stage split.
-- [ ] Generate matching single-rank companion profiles and jointly simulate all
+- [x] Generate matching single-rank companion profiles and jointly simulate all
   rank DAGs. Advance tasks with dual-rank rates while both ranks are active,
   then switch the remaining rank to the single-rank rate at the rank-completion
   event. Do not estimate EP wall time as the maximum of independently predicted
-  all-dual-rank makespans.
+  all-dual-rank makespans. Current exact-M EP2 single/dual pairs on two 32-core
+  ranks reduce the tiered-hotspot estimate from 55.605 ms to 54.770 ms
+  (-0.835 ms, -1.50%); incompatible or missing companions retain the old
+  conservative upper bound.
 - [ ] Treat the uniform 96-route full-call residual separately. Route 96 is an
   exact isolated point but not a contention-route anchor, so the current full
   call estimate interpolates between 48 and 192. Add targeted full-call anchors
