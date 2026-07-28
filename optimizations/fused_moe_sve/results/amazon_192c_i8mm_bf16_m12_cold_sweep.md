@@ -174,10 +174,135 @@ sequence is:
 pass, then stops. `M>=48` includes later passes after the cache state has
 converged and amortizes the transition.
 
-## Implication
+## Fixed-Nr/full-M validation
 
-The trough is specific to the fixed-Mr/full-N order that completes all N tiles
-for one M12 A panel before starting the next panel. A fixed-Nr/full-M order is
-the relevant follow-up: hold one 32 KiB B tile and process all M12 A panels
-before advancing N. That alternative is not claimed faster in this report
-until it is measured with the same cold-B protocol.
+The follow-up compared the original fixed-Mr/full-N order with upstream
+`bf16gemm_k_nld_f_nr_fullm`. Fixed-Nr holds one eight-column, 32 KiB B tile
+and processes every M12 A panel before advancing N. Both paths use distinct
+cold B copies, alternate measurement order, and produce bit-exact FP32 output.
+
+```bash
+taskset -c 48 /tmp/bench_i8mm_bf16_m12_cold \
+  compare 24 2048 128 51 48
+```
+
+Each entry below is the median of five independent process medians.
+
+### M=24
+
+| N | Fixed-Mr us | Fixed-Nr us | Fixed-Nr gain | Fixed-Nr GFLOP/s |
+| ---: | ---: | ---: | ---: | ---: |
+| 64 | 22.891 | 28.024 | -18.3% | 224.5 |
+| 128 | 65.394 | 57.250 | +14.2% | 219.8 |
+| 192 | 95.050 | 86.563 | +9.8% | 218.0 |
+| 256 | 112.795 | 116.478 | -3.2% | 216.1 |
+| 320 | 132.376 | 143.427 | -7.7% | 219.3 |
+| 384 | 157.795 | 171.020 | -7.7% | 220.7 |
+| 448 | 179.400 | 198.849 | -9.8% | 221.5 |
+| 512 | 199.161 | 226.482 | -12.1% | 222.2 |
+
+### M=48
+
+| N | Fixed-Mr us | Fixed-Nr us | Fixed-Nr gain | Fixed-Nr GFLOP/s |
+| ---: | ---: | ---: | ---: | ---: |
+| 64 | 41.501 | 46.722 | -11.2% | 269.3 |
+| 128 | 107.506 | 93.677 | +14.8% | 268.6 |
+| 192 | 152.477 | 141.625 | +7.7% | 266.5 |
+| 256 | 186.213 | 189.040 | -1.5% | 266.3 |
+| 320 | 231.122 | 234.267 | -1.3% | 268.6 |
+| 384 | 279.684 | 279.921 | -0.1% | 269.7 |
+| 448 | 322.512 | 326.070 | -1.1% | 270.1 |
+| 512 | 348.625 | 372.592 | -6.4% | 270.2 |
+
+Fixed-Nr removes the pathological complete-B second traversal and recovers
+9.8-14.8% at `N=128/192`. It does not eliminate the M=24 throughput trough:
+its M=24 throughput remains approximately 216-224 GFLOP/s. The upstream
+full-M body is invoked once per eight-column N tile, so M=24 amortizes its
+entry, pointer setup, and store control over only two M12 blocks. M=48
+amortizes the same work over four blocks and sustains approximately
+266-270 GFLOP/s.
+
+At `N>=256`, the original fixed-Mr path has already amortized the one-time
+mixed-cache transition over a longer N traversal and eventually reaches
+approximately 240-256 GFLOP/s for M=24. Fixed-Nr remains near its
+approximately 220 GFLOP/s M=24 control ceiling and therefore loses. At
+`N=64`, the 256 KiB B matrix is fully reusable after the first panel, so
+fixed-Mr is already the correct order.
+
+## 16/32-column N-group hybrid
+
+The hybrid keeps the upstream M12 computation body unchanged. Its outer loop
+selects a 16- or 32-column B group, then runs every M12 A panel against that
+group before advancing N. This differs from fixed-Nr/full-M because each M12
+call amortizes its entry over two or four N tiles rather than one.
+
+The benchmark rotates the four strategies' execution order, assigns each
+timed invocation a distinct cold B copy, and verifies all outputs bit-exactly:
+
+```bash
+taskset -c 48 /tmp/bench_i8mm_bf16_m12_cold \
+  groups 24 2048 128 51 48
+```
+
+Each entry is the median of five independent process medians.
+
+### M=24 hybrid results
+
+| N | Fixed-Mr GFLOP/s | Fixed-Nr GFLOP/s | Group16 GFLOP/s | Group32 GFLOP/s | Group32 vs fixed-Mr |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 64 | 274.8 | 223.7 | 249.5 | 266.6 | -3.0% |
+| 128 | 193.2 | 214.8 | 244.8 | 264.9 | +37.1% |
+| 192 | 197.9 | 217.6 | 240.4 | 261.5 | +32.1% |
+| 256 | 228.8 | 216.0 | 241.7 | 260.2 | +13.7% |
+| 320 | 241.6 | 221.7 | 245.5 | 261.4 | +8.2% |
+| 384 | 249.4 | 222.5 | 246.2 | 259.1 | +3.9% |
+| 448 | 250.0 | 222.1 | 246.2 | 261.9 | +4.8% |
+| 512 | 254.5 | 220.4 | 242.8 | 258.9 | +1.7% |
+
+Group32 removes the N-dependent M=24 trough: its throughput remains within
+approximately 259-267 GFLOP/s over the entire sweep. In particular, the
+`N=128` rate is only 0.7% below its `N=64` rate, whereas fixed-Mr falls by
+29.7%. Group16 also avoids the severe transition but sustains only
+approximately 240-250 GFLOP/s because it enters the M12 body twice as often.
+
+### M=48 control results
+
+| N | Fixed-Mr GFLOP/s | Group16 GFLOP/s | Group32 GFLOP/s | Group32 vs fixed-Mr |
+| ---: | ---: | ---: | ---: | ---: |
+| 64 | 301.1 | 283.5 | 296.4 | -1.5% |
+| 128 | 232.2 | 278.8 | 292.5 | +26.0% |
+| 192 | 247.3 | 281.1 | 292.4 | +18.2% |
+| 256 | 269.2 | 280.3 | 291.2 | +8.2% |
+| 320 | 270.0 | 285.3 | 294.1 | +8.9% |
+| 384 | 277.6 | 285.4 | 295.6 | +6.5% |
+| 448 | 286.8 | 285.6 | 293.1 | +2.2% |
+| 512 | 293.7 | 284.6 | 292.9 | -0.3% |
+
+The M48 control shows the same cache-transition removal. Group32 remains near
+291-296 GFLOP/s, while fixed-Mr catches up only after its one-time transition
+has been amortized across a larger N traversal.
+
+### Eight-core cross-platform check
+
+The same `M=24, K=2048, N=128` comparison was repeated on
+`AmazonECS8Cores`, pinned to CPU0. The median of five independent 51-sample
+processes was 53.947 us for fixed-Mr and 57.060 us for group32, so group32
+regressed by 5.5%. All outputs remained bit-exact.
+
+The 32-column optimum is therefore machine-specific rather than a universal
+kernel ordering rule. It must be selected through machine calibration or an
+architecture-specific policy.
+
+## Decision
+
+The 32-column N-group is the best measured traversal for the cold-B
+transition region and eliminates the M=24 low point without changing the
+microkernel or packed layout. The original fixed-Mr remains slightly better
+when the complete B matrix is already small enough to reuse (`N=64`) and is
+effectively tied at `N=512`. Group16 is not a preferred operating point.
+
+This is an experimental traversal result, not yet a production-path change.
+Before integrating it into the fused W13/W2 driver, expose N-group as a
+calibrated machine policy and verify that its additional outer-loop
+boundaries do not interfere with split-W13 staging or expert-level N
+splitting.
