@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import platform
+
 import pytest
 import torch
 
@@ -60,9 +62,8 @@ def _make_compressor_state(
     )
 
 
-def _make_inputs(seed: int = 0) -> PostGemmStageInputs:
+def _make_inputs(seed: int = 0, num_tokens: int = 6) -> PostGemmStageInputs:
     torch.manual_seed(seed)
-    num_tokens = 6
     q_lora_rank = 8
     main_num_heads = 2
     main_head_dim = 6
@@ -70,7 +71,7 @@ def _make_inputs(seed: int = 0) -> PostGemmStageInputs:
     indexer_head_dim = 6
     rope_dim = 2
     block_size = 4
-    num_blocks = 3
+    num_blocks = (num_tokens + block_size - 1) // block_size
     topk_tokens = 2
 
     return PostGemmStageInputs(
@@ -90,8 +91,8 @@ def _make_inputs(seed: int = 0) -> PostGemmStageInputs:
             indexer_num_heads * indexer_head_dim,
             q_lora_rank,
         ),
-        main_cos_sin_cache=_cos_sin_cache(16, rope_dim),
-        indexer_cos_sin_cache=_cos_sin_cache(16, rope_dim),
+        main_cos_sin_cache=_cos_sin_cache(max(16, num_tokens + 1), rope_dim),
+        indexer_cos_sin_cache=_cos_sin_cache(max(16, num_tokens + 1), rope_dim),
         swa=SWACacheState(
             kv_cache=torch.zeros(
                 num_blocks,
@@ -362,6 +363,43 @@ def test_post_gemm_cpp_prepacked_matches_raw_cpp() -> None:
         prepacked_inputs.indexer_compressor.kv_cache,
         raw_inputs.indexer_compressor.kv_cache,
         "indexer kv_cache",
+    )
+
+
+@pytest.mark.skipif(
+    platform.machine() not in ("aarch64", "arm64") or not _HAS_DEEPSEEK_V4_POST_GEMM_STAGE_PREPACKED,
+    reason="M8-aligned post-GEMM scheduling requires the AArch64 prepacked C++ stage",
+)
+def test_post_gemm_m8_aligned_matches_legacy_row_split(monkeypatch) -> None:
+    """M8-panel scheduling must preserve C4A outputs for a partial final panel."""
+    legacy_inputs = _make_inputs(seed=17, num_tokens=25)
+    aligned_inputs = _make_inputs(seed=17, num_tokens=25)
+    weights = prepare_deepseek_v4_post_gemm_weights(
+        aligned_inputs.main_wq_b_weight,
+        aligned_inputs.indexer_wq_b_weight,
+    )
+    previous_threads = torch.get_num_threads()
+    torch.set_num_threads(7)
+    try:
+        monkeypatch.setenv("FUSED_CPP_POST_GEMM_M8_ALIGNED", "0")
+        legacy_q, legacy_topk = post_gemm_parallel_stage_cpp_prepacked(legacy_inputs, weights)
+        monkeypatch.setenv("FUSED_CPP_POST_GEMM_M8_ALIGNED", "1")
+        aligned_q, aligned_topk = post_gemm_parallel_stage_cpp_prepacked(aligned_inputs, weights)
+    finally:
+        torch.set_num_threads(previous_threads)
+
+    _assert_close(aligned_q, legacy_q, "M8-aligned q")
+    assert torch.equal(aligned_topk, legacy_topk)
+    _assert_close(aligned_inputs.swa.kv_cache, legacy_inputs.swa.kv_cache, "M8-aligned swa kv_cache")
+    _assert_close(
+        aligned_inputs.mla_compressor.state_cache,
+        legacy_inputs.mla_compressor.state_cache,
+        "M8-aligned mla state_cache",
+    )
+    _assert_close(
+        aligned_inputs.indexer_compressor.state_cache,
+        legacy_inputs.indexer_compressor.state_cache,
+        "M8-aligned indexer state_cache",
     )
 
 

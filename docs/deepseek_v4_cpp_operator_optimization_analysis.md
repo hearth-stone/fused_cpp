@@ -178,9 +178,33 @@
 ### 2.4 总结
 
 Post Stage 已有多处 SVE 融合 kernel，优化重点在：
-1. GEMM 与后处理的深度融合（减少内存往返）
-2. Sparse Indexer Long Path 的内存优化
-3. Compressor 并行化
+1. 两次 Q GEMM 的 MN 调度、权重窗口和 packed-QR 复用
+2. 独立分支的统一 DAG 调度
+3. SVE 与 NEON 调度能力对齐
+4. Sparse Indexer Long Path 和 compressor 的局部优化
+
+### 2.5 第二个 parallel 实测驱动 TODO
+
+基线为 `AmazonC5192Cores` 192 核 AArch64 机器的 NUMA0 `0-95`，TP4/C4A、`M=2048`、默认
+NEON backend、预打包权重。当前 96T 中位数为 `13.880 ms`；88T 为
+`11.012 ms`，其中 Main Q 与 Indexer Q GEMM 合计 `10.079 ms`，占
+`91.5%`。下面的优先级不包含单独记录的 sparse short-path 提前消除项。
+
+| 优先级 | Feature | TODO | 机制与验收重点 |
+|---|---|---|---|
+| P0 | `benchmark.post_gemm_stage` | 已增加 C4A 基准；继续覆盖 dense/C128A、M、prefix 长度和 backend | `tests/bench_deepseek_v4_post_gemm_stage.py` 已支持线程数、legacy/M8、阶段 profile；后续继续扩展形状 |
+| 完成 | `schedule.m8_aligned` | 按完整 M8 panel 静态分配，保留 legacy row-split 开关 | 192 核 NUMA0 NEON 96T：`13.942 -> 10.187 ms`；SVE：`11.082 -> 10.318 ms`；`FUSED_CPP_POST_GEMM_M8_ALIGNED=0` 回退 |
+| P0 | `runtime.shared_q_gemm_pool` | 两次 Q GEMM 共用一个 OpenMP region 和动态 M8-panel worker pool | 依赖 M8 alignment；消除两个独立 region，并让完成一个 GEMM 的线程继续领取另一个 GEMM 的 panel |
+| P0 | `schedule.q_gemm_mn_groups` | 复用第一个 parallel 的 owner-first MN task groups，将每份 16 MiB packed-B 拆成 L2 可驻留的 N stripe | 扫描 N-group 数量并记录每核 packed-B window；避免每个 M8 panel 流式扫描完整 N |
+| P0 | `compute.shared_prepacked_qr` | `qr` 只 pack 一次，由 Main Q 和 Indexer Q 的全部 N groups 共享 | 依赖 MN pool；必须避免按 N group 重复 pack A，并保持现有 bf16 输出布局 |
+| P1 | `runtime.post_stage_dag` | 将 Main Q、MLA compressor、Indexer compressor、KV cache insert 和 sparse indexer 表达为依赖任务，完成 GEMM 的线程继续领取 ready task | 先复用同一 worker region，避免用嵌套 OpenMP sections；目标是隐藏当前约 `0.5-0.9 ms` 的独立后处理 |
+| P1 | `backend.sve_mn_parity` | 为 SVE attention GEMM 暴露 packed-A 和 N-range dispatch，再接入同一 MN pool | 当前 SVE dispatch 在调用内 pack A；直接 N-split 会放大 pack 流量，不能只复用调度层 |
+| P1 | `compute.indexer_coff1_contiguous` | 为连续 prefill 的 coff=1 indexer compressor 增加当前 chunk 快路径，合并 save/compress 并减少 state-cache 回读 | 保留跨 chunk、负 position 和非连续 slot fallback；重点优化当前 `0.53-0.64 ms` 阶段 |
+| P1 | `sparse.long_path_blocked_topk` | Long path 使用分块 KV gather/matmul 和在线 Top-K，避免完整 `k_gathered`/logits 临时量 | 覆盖 prefix 后有效 KV 超过 Top-K 的情况；短路径结果必须保持不变 |
+| P2 | `pipeline.qr_panel_handoff` | 第一段 parallel 产出 QR M8 panel 后，直接发布给第二段 Q GEMM，而不是等待第一段全部完成 | 高复杂度跨算子流水线；评估 QR panel 的 cache 复用和额外同步是否净收益 |
+| P2 | `fusion.compressor_state_store` | 第一段 kv-score GEMM epilogue 直接写 compressor state layout 并加 APE | 消除 kv-score 中间张量往返；需要保持 state cache 的持久化语义和边界窗口 |
+| P2 | `epilogue.indexer_rope` | 在 Indexer Q GEMM store 中融合 head-aligned RoPE | 当前独立阶段仅约 `0.14 ms`，必须在 MN pool 落地后重新测量才决定是否实现 |
+| P2 | `epilogue.main_q_norm_rope` | 研究 Main Q per-head RMSNorm/RoPE 的两遍式融合 epilogue | RMSNorm 需要完整 512 维 head reduction，无法直接做简单单遍 store fusion；当前约 `0.11-0.13 ms`，低 ROI |
 
 
 ---
@@ -430,14 +454,16 @@ Input [T, H] → 路由分组 routes[E] → TileTask 列表
 | **路由表外部化与缓存** | MoE Kernel | 减少 5-10% CPU 时间 | 低（移到 Python 层） | 低 |
 | **激活函数向量化** | MoE Kernel | 整体 5-10% 加速 | 中（SIMD 实现） | 中（精度问题） |
 | **Gather/Scatter 向量化** | MoE Kernel | 10-15% 带宽改善 | 中 | 中 |
+| **Post Stage 两次 Q GEMM 共用 MN pool/packed QR** | Post Stage | 消除 full-N M-split 的 L2 工作集问题，并复用 QR pack | 中（复用第一段 runtime） | 中 |
 
 ### 6.2 中优先级（P1）— 中等成本
 
 | 优化点 | 涉及算子 | 预期收益 | 实现成本 | 风险 |
 |--------|---------|---------|---------|------|
 | **Cost Model 在线校准** | MoE Planner | 误差从 30-50% 降至 10-15% | 中（加校准逻辑） | 中（启动开销） |
-| **GEMM + Norm/RoPE 融合** | 融合 GEMM, Post Stage | 减少 1-2 次内存往返 | 高（改 microkernel） | 高 |
 | **Sparse Indexer Long Path 分块 + 在线 Top-K** | Post Stage | 减少临时内存，降低带宽 | 高 | 高 |
+| **Post Stage 统一 DAG 调度** | Post Stage | 隐藏独立 compressor/cache 阶段并减少 OpenMP region | 中 | 中 |
+| **Post Stage SVE MN parity** | Post Stage | 让 SVE 获得 packed-A 复用和 L2-sized N window | 中到高 | 中 |
 | **动态负载均衡改进** | 全局 | 不均衡场景 10-30% 改善 | 中 | 中 |
 | **Buffer 尺寸优化** | MoE Kernel | 减少 30-50% scratch 内存 | 中 | 中 |
 | **权重布局优化（L2 分块）** | 全局 GEMM | cache 命中率 10-30% | 中（改打包格式） | 中 |
@@ -451,7 +477,24 @@ Input [T, H] → 路由分组 routes[E] → TileTask 列表
 | **减少同步点（流水线化）** | MoE Kernel | 低延迟场景收益 | 高 | 高 |
 | **Historical smoothing** | MoE Planner | 减少 decode 规划调用 | 中 | 高（收益不确定） |
 | **Short Path 批量化** | Post Stage | 10-20% 循环开销减少 | 中 | 中 |
+| **Post Stage GEMM + Norm/RoPE epilogue** | Post Stage | 减少输出往返，但当前独立阶段仅约 0.25 ms | 高 | 高 |
+| **两段 attention parallel 的 QR panel 流水线** | Attention GEMM + Post Stage | 降低全局 barrier 并提高 QR cache 复用 | 高 | 高 |
+| **Sparse short path 提前消除 Indexer Q** | Post Stage | 条件命中时跳过 Indexer Q GEMM、RoPE/quant 和 weights scaling；2K C4A profile 扣除估算约 -48% | 低到中 | 低，但仅适用于 `max_valid_len <= topk_tokens` |
 
+#### P2 TODO：Sparse short path 提前消除 Indexer Q
+
+- 在进入 Indexer Q GEMM 前，根据 `cu_seqlen_ks` / `cu_seqlen_ke` 判断
+  `max_valid_len <= topk_tokens`。
+- 条件命中时不计算 `indexer_wq_b(qr)`、Indexer Q RoPE/quant 和
+  `indexer_weights` scaling，直接生成全部有效压缩 KV 的索引。
+- Indexer compressor、Indexer KV cache 写入以及 Top-K 输出填充仍必须执行。
+- 如果 short-path 条件可以在第一个 parallel 前确定，可进一步跳过上游较小的
+  `indexer_weights_proj` GEMM。
+- 192 核机器 NUMA0、88T、`M=2048` C4A profile 中，当前总时间为
+  `11.012 ms`，Indexer Q GEMM 与 RoPE/weights 合计 `5.305 ms`；仅按阶段扣除
+  估算为 `5.707 ms`。该数字不是优化实现后的实测结果。
+- 优先级保持 P2：收益虽大，但只覆盖无长前缀且压缩 KV 数不超过 Top-K 的输入；
+  应先完成对所有上下文长度都有效的 Post Stage GEMM MN 调度优化。
 
 ---
 
@@ -580,6 +623,6 @@ MoE Planner:
 
 ---
 
-**文档版本**：2026-06-30
-**分析方法**：纯理论/静态代码分析，未实测
+**文档版本**：2026-07-29
+**分析方法**：以理论/静态代码分析为主；部分后续 TODO 使用已测 baseline profile 做阶段扣除估算
 **目标平台**：aarch64 NEON/SVE + BF16 + OpenMP

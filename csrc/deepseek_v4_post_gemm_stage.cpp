@@ -142,6 +142,8 @@ enum class PostGemmBackend {
   kSve,
 };
 
+constexpr int64_t kPostGemmMPanelRows = 8;
+
 bool EnvFalseLocal(const char* name) {
   const char* value = std::getenv(name);
   if (value == nullptr) {
@@ -149,6 +151,11 @@ bool EnvFalseLocal(const char* name) {
   }
   return value[0] == '\0' || value[0] == '0' || std::strcmp(value, "false") == 0 || std::strcmp(value, "False") == 0 ||
          std::strcmp(value, "off") == 0 || std::strcmp(value, "OFF") == 0;
+}
+
+bool PostGemmM8AlignedEnabled() {
+  const char* value = std::getenv("FUSED_CPP_POST_GEMM_M8_ALIGNED");
+  return value == nullptr || !EnvFalseLocal("FUSED_CPP_POST_GEMM_M8_ALIGNED");
 }
 
 PostGemmBackend SelectedPostGemmBackend() {
@@ -585,7 +592,10 @@ at::Tensor PostLinearPrepackedToDtypeWorkspace(const at::Tensor& input, const at
     num_threads = 1;
   }
 #endif
-  const int64_t rows_per_thread = (M + num_threads - 1) / num_threads;
+  const bool m8_aligned = PostGemmM8AlignedEnabled();
+  const int64_t m_panels = (M + kPostGemmMPanelRows - 1) / kPostGemmMPanelRows;
+  const int64_t rows_per_thread = m8_aligned ? ((m_panels + num_threads - 1) / num_threads) * kPostGemmMPanelRows
+                                             : (M + num_threads - 1) / num_threads;
   const int64_t scratch_stride = backend == PostGemmBackend::kSve
                                      ? ::fused_cpp::deepseek_v4::attn_sve::a_scratch_elems(rows_per_thread, K)
                                      : std::max<int64_t>(1, rows_per_thread * K);
@@ -605,8 +615,18 @@ at::Tensor PostLinearPrepackedToDtypeWorkspace(const at::Tensor& input, const at
 #else
     const int64_t tid = 0;
 #endif
-    const int64_t row_start = tid * rows_per_thread;
-    const int64_t row_count = row_start >= M ? 0 : std::min<int64_t>(rows_per_thread, M - row_start);
+    int64_t row_start;
+    int64_t row_count;
+    if (m8_aligned) {
+      const int64_t panel_begin = tid * m_panels / num_threads;
+      const int64_t panel_end = (tid + 1) * m_panels / num_threads;
+      row_start = panel_begin * kPostGemmMPanelRows;
+      row_count =
+          row_start >= M ? 0 : std::min<int64_t>((panel_end - panel_begin) * kPostGemmMPanelRows, M - row_start);
+    } else {
+      row_start = tid * rows_per_thread;
+      row_count = row_start >= M ? 0 : std::min<int64_t>(rows_per_thread, M - row_start);
+    }
     if (row_count > 0) {
       uint16_t* thread_scratch = scratch_ptr + tid * scratch_stride;
       const uint16_t* a_row = a_ptr + row_start * K;

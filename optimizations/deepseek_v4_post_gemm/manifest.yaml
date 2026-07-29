@@ -1,0 +1,42 @@
+operator: deepseek_v4_post_gemm
+
+baseline:
+  id: legacy_row_split
+  implementation: csrc/deepseek_v4_post_gemm_stage.cpp
+  entrypoint: deepseek_v4_post_gemm_parallel_stage_prepacked
+  status: reference
+  selection: FUSED_CPP_POST_GEMM_M8_ALIGNED=0
+
+features:
+  - id: schedule.m8_aligned
+    part: schedule
+    status: enabled
+    implementation: csrc/deepseek_v4_post_gemm_stage.cpp
+    hypothesis: >-
+      Partitioning M as complete M8 panels removes the M4/M2 per-thread tails
+      produced by ceil(M / threads) while retaining the existing packed
+      weights, GEMM kernels, output layouts, and one OpenMP region per GEMM.
+    depends_on: []
+    conflicts_with: []
+    selection: >-
+      Enabled by default on AArch64. FUSED_CPP_POST_GEMM_M8_ALIGNED=0 restores
+      the legacy row split for correctness and performance comparisons.
+    correctness: >-
+      PYTHONPATH=src .venv/bin/python -m pytest -q
+      tests/test_deepseek_v4_post_gemm_stage.py
+      -k m8_aligned_matches_legacy
+    benchmark: >-
+      PYTHONPATH=src FUSED_CPP_ATTN_GEMM_BACKEND=neon
+      OMP_NUM_THREADS=96 OMP_DYNAMIC=FALSE OMP_PROC_BIND=close
+      OMP_PLACES=cores numactl --physcpubind=0-95 --membind=0
+      .venv/bin/python tests/bench_deepseek_v4_post_gemm_stage.py
+      --m 2048 --threads 96 --warmup 3 --runs 15 --schedule m8
+    result: >-
+      optimizations/deepseek_v4_post_gemm/results/amazon_192c_m8_aligned_20260729.md
+
+variants:
+  - id: post_gemm_m8_aligned
+    entrypoint: deepseek_v4_post_gemm_parallel_stage_prepacked
+    status: enabled
+    features:
+      - schedule.m8_aligned
