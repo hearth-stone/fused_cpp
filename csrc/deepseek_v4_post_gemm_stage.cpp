@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -70,6 +71,7 @@ using torch::indexing::Slice;
 
 struct PostGemmStageProfile {
   double input_check_ms = 0.0;
+  double shared_q_gemm_ms = 0.0;
   double main_q_gemm_ms = 0.0;
   double main_q_norm_rope_swa_insert_ms = 0.0;
   double indexer_q_gemm_ms = 0.0;
@@ -89,18 +91,20 @@ struct PostGemmStageProfile {
 bool PostGemmProfileEnabled() { return ::fused_cpp::profile::env_enabled("FUSED_CPP_DEEPSEEK_V4_POST_GEMM_PROFILE"); }
 
 void PrintPostGemmProfile(const PostGemmStageProfile& profile, double total_ms) {
-  const double known_ms = profile.input_check_ms + profile.main_q_gemm_ms + profile.main_q_norm_rope_swa_insert_ms +
-                          profile.indexer_q_gemm_ms + profile.indexer_q_rope_weights_ms +
-                          profile.mla_save_partial_states_ms + profile.mla_compress_norm_rope_insert_ms +
-                          profile.indexer_save_partial_states_ms + profile.indexer_compress_norm_rope_insert_ms +
-                          profile.sparse_indexer_short_path_ms + profile.sparse_indexer_gather_ms +
-                          profile.sparse_indexer_fold_q_ms + profile.sparse_indexer_score_topk_ms;
+  const double known_ms = profile.input_check_ms + profile.shared_q_gemm_ms + profile.main_q_gemm_ms +
+                          profile.main_q_norm_rope_swa_insert_ms + profile.indexer_q_gemm_ms +
+                          profile.indexer_q_rope_weights_ms + profile.mla_save_partial_states_ms +
+                          profile.mla_compress_norm_rope_insert_ms + profile.indexer_save_partial_states_ms +
+                          profile.indexer_compress_norm_rope_insert_ms + profile.sparse_indexer_short_path_ms +
+                          profile.sparse_indexer_gather_ms + profile.sparse_indexer_fold_q_ms +
+                          profile.sparse_indexer_score_topk_ms;
   const double other_ms = std::max(0.0, total_ms - known_ms);
   const auto pct = [total_ms](double ms) -> double { return total_ms > 0.0 ? (100.0 * ms / total_ms) : 0.0; };
 
   std::cerr << std::fixed << std::setprecision(3) << "deepseek_v4_post_gemm_stage_profile"
             << " total_ms=" << total_ms << " input_check_ms=" << profile.input_check_ms << "("
             << pct(profile.input_check_ms) << "%)"
+            << " shared_q_gemm_ms=" << profile.shared_q_gemm_ms << "(" << pct(profile.shared_q_gemm_ms) << "%)"
             << " main_q_gemm_ms=" << profile.main_q_gemm_ms << "(" << pct(profile.main_q_gemm_ms) << "%)"
             << " main_q_norm_rope_swa_insert_ms=" << profile.main_q_norm_rope_swa_insert_ms << "("
             << pct(profile.main_q_norm_rope_swa_insert_ms) << "%)"
@@ -143,6 +147,7 @@ enum class PostGemmBackend {
 };
 
 constexpr int64_t kPostGemmMPanelRows = 8;
+constexpr int kPostGemmSharedQPoolMinThreads = 32;
 
 bool EnvFalseLocal(const char* name) {
   const char* value = std::getenv(name);
@@ -156,6 +161,24 @@ bool EnvFalseLocal(const char* name) {
 bool PostGemmM8AlignedEnabled() {
   const char* value = std::getenv("FUSED_CPP_POST_GEMM_M8_ALIGNED");
   return value == nullptr || !EnvFalseLocal("FUSED_CPP_POST_GEMM_M8_ALIGNED");
+}
+
+bool PostGemmSharedQPoolEnabled(int64_t M) {
+#if defined(__aarch64__) && defined(_OPENMP)
+  const char* value = std::getenv("FUSED_CPP_POST_GEMM_SHARED_Q_POOL");
+  if (!PostGemmM8AlignedEnabled() || (value != nullptr && EnvFalseLocal("FUSED_CPP_POST_GEMM_SHARED_Q_POOL"))) {
+    return false;
+  }
+  if (value != nullptr) {
+    return true;
+  }
+  const int num_threads = omp_get_max_threads();
+  const int64_t m_panels = (M + kPostGemmMPanelRows - 1) / kPostGemmMPanelRows;
+  return num_threads >= kPostGemmSharedQPoolMinThreads && m_panels >= num_threads;
+#else
+  (void)M;
+  return false;
+#endif
 }
 
 PostGemmBackend SelectedPostGemmBackend() {
@@ -545,28 +568,60 @@ void DispatchPostGemmBf16Neon(const uint16_t* A, const uint16_t* B_reo, uint16_t
   }
 #endif
 }
+
+void DispatchPostGemmRange(const uint16_t* a_ptr, const uint16_t* b_ptr, at::Tensor& output, uint16_t* thread_scratch,
+                           PostGemmBackend backend, at::ScalarType dtype, int64_t row_start, int64_t row_count,
+                           int64_t K, int64_t Np) {
+  if (row_count <= 0) {
+    return;
+  }
+  const uint16_t* a_row = a_ptr + row_start * K;
+  if (dtype == at::kBFloat16) {
+    uint16_t* c_row = Bf16Data(output) + row_start * Np;
+    if (backend == PostGemmBackend::kSve) {
+      ::fused_cpp::deepseek_v4::attn_sve::dispatch_bf16(a_row, b_ptr, c_row, thread_scratch,
+                                                        static_cast<int>(row_count), static_cast<int>(K),
+                                                        static_cast<int>(Np), static_cast<int>(Np));
+    } else {
+      DispatchPostGemmBf16Neon(a_row, b_ptr, c_row, thread_scratch, static_cast<int>(row_count), static_cast<int>(K),
+                               static_cast<int>(Np), static_cast<int>(Np));
+    }
+    return;
+  }
+
+  float* c_row = output.data_ptr<float>() + row_start * Np;
+  if (backend == PostGemmBackend::kSve) {
+    ::fused_cpp::deepseek_v4::attn_sve::dispatch_f32(a_row, b_ptr, c_row, thread_scratch, static_cast<int>(row_count),
+                                                     static_cast<int>(K), static_cast<int>(Np), static_cast<int>(Np));
+  } else {
+    DispatchPostGemmF32Neon(a_row, b_ptr, c_row, thread_scratch, static_cast<int>(row_count), static_cast<int>(K),
+                            static_cast<int>(Np), static_cast<int>(Np));
+  }
+}
 #endif
+
+void CheckPostLinearPrepackedArgs(const at::Tensor& input, const at::Tensor& packed_weight, int64_t K, int64_t N,
+                                  int64_t Np, at::ScalarType dtype, const char* name) {
+  TORCH_CHECK(dtype == at::kBFloat16 || dtype == at::kFloat, name, " only supports bf16/fp32 output, got ", dtype);
+  CheckCpuTensor(input, "post GEMM input");
+  CheckCpuTensor(packed_weight, name);
+  CheckDim(input, "post GEMM input", 2);
+  TORCH_CHECK(input.scalar_type() == at::kBFloat16, "post GEMM input must be torch.bfloat16, got ",
+              input.scalar_type());
+  TORCH_CHECK(packed_weight.scalar_type() == at::kBFloat16 && packed_weight.is_contiguous(), name,
+              " must be contiguous torch.bfloat16");
+  TORCH_CHECK(input.size(1) == K, name, " K mismatch: input K=", input.size(1), " packed K=", K);
+  TORCH_CHECK(K > 0 && N > 0 && Np >= N, name, " invalid metadata K=", K, " N=", N, " Np=", Np);
+  TORCH_CHECK(K % 8 == 0 && Np % 8 == 0, name, " requires K multiple of 8 and Np multiple of 8, got K=", K, " Np=", Np);
+  TORCH_CHECK(packed_weight.numel() == K * Np, name, " numel mismatch: expected ", K * Np, ", got ",
+              packed_weight.numel());
+}
 
 at::Tensor PostLinearPrepackedToDtypeWorkspace(const at::Tensor& input, const at::Tensor& packed_weight, int64_t K,
                                                int64_t N, int64_t Np, at::ScalarType dtype,
                                                ::fused_cpp::workspace::WorkspaceLease& workspace) {
-  TORCH_CHECK(dtype == at::kBFloat16 || dtype == at::kFloat,
-              "PostLinearPrepackedToDtypeWorkspace only supports bf16/fp32 "
-              "output, got ",
-              dtype);
-  CheckCpuTensor(input, "post GEMM input");
-  CheckCpuTensor(packed_weight, "post GEMM packed_weight");
-  CheckDim(input, "post GEMM input", 2);
-  TORCH_CHECK(input.scalar_type() == at::kBFloat16, "post GEMM input must be torch.bfloat16, got ",
-              input.scalar_type());
-  TORCH_CHECK(packed_weight.scalar_type() == at::kBFloat16 && packed_weight.is_contiguous(),
-              "post GEMM packed_weight must be contiguous torch.bfloat16");
-  TORCH_CHECK(input.size(1) == K, "post GEMM K mismatch: input K=", input.size(1), " packed K=", K);
-  TORCH_CHECK(K > 0 && N > 0 && Np >= N, "post GEMM invalid metadata K=", K, " N=", N, " Np=", Np);
-  TORCH_CHECK(K % 8 == 0 && Np % 8 == 0, "post GEMM requires K multiple of 8 and Np multiple of 8, got K=", K,
-              " Np=", Np);
-  TORCH_CHECK(packed_weight.numel() == K * Np, "post GEMM packed_weight numel mismatch: expected ", K * Np, ", got ",
-              packed_weight.numel());
+  CheckPostLinearPrepackedArgs(input, packed_weight, K, N, Np, dtype,
+                               "PostLinearPrepackedToDtypeWorkspace packed_weight");
 
   const int64_t M = input.size(0);
   at::Tensor output = at::empty({M, Np}, input.options().dtype(dtype));
@@ -629,31 +684,122 @@ at::Tensor PostLinearPrepackedToDtypeWorkspace(const at::Tensor& input, const at
     }
     if (row_count > 0) {
       uint16_t* thread_scratch = scratch_ptr + tid * scratch_stride;
-      const uint16_t* a_row = a_ptr + row_start * K;
-      if (dtype == at::kBFloat16) {
-        uint16_t* c_row = Bf16Data(output) + row_start * Np;
-        if (backend == PostGemmBackend::kSve) {
-          ::fused_cpp::deepseek_v4::attn_sve::dispatch_bf16(a_row, b_ptr, c_row, thread_scratch,
-                                                            static_cast<int>(row_count), static_cast<int>(K),
-                                                            static_cast<int>(Np), static_cast<int>(Np));
-        } else {
-          DispatchPostGemmBf16Neon(a_row, b_ptr, c_row, thread_scratch, static_cast<int>(row_count),
-                                   static_cast<int>(K), static_cast<int>(Np), static_cast<int>(Np));
-        }
-      } else {
-        float* c_row = output.data_ptr<float>() + row_start * Np;
-        if (backend == PostGemmBackend::kSve) {
-          ::fused_cpp::deepseek_v4::attn_sve::dispatch_f32(a_row, b_ptr, c_row, thread_scratch,
-                                                           static_cast<int>(row_count), static_cast<int>(K),
-                                                           static_cast<int>(Np), static_cast<int>(Np));
-        } else {
-          DispatchPostGemmF32Neon(a_row, b_ptr, c_row, thread_scratch, static_cast<int>(row_count), static_cast<int>(K),
-                                  static_cast<int>(Np), static_cast<int>(Np));
-        }
-      }
+      DispatchPostGemmRange(a_ptr, b_ptr, output, thread_scratch, backend, dtype, row_start, row_count, K, Np);
     }
   }
   return N == Np ? output : output.narrow(1, 0, N).contiguous();
+#endif
+}
+
+std::pair<at::Tensor, at::Tensor> PostLinearPrepackedPairToDtypeWorkspace(
+    const at::Tensor& input, const at::Tensor& first_weight, int64_t first_K, int64_t first_N, int64_t first_Np,
+    const at::Tensor& second_weight, int64_t second_K, int64_t second_N, int64_t second_Np, at::ScalarType dtype,
+    ::fused_cpp::workspace::WorkspaceLease& workspace) {
+#if !defined(__aarch64__) || !defined(_OPENMP)
+  at::Tensor first =
+      PostLinearPrepackedToDtypeWorkspace(input, first_weight, first_K, first_N, first_Np, dtype, workspace);
+  at::Tensor second =
+      PostLinearPrepackedToDtypeWorkspace(input, second_weight, second_K, second_N, second_Np, dtype, workspace);
+  return std::make_pair(first, second);
+#else
+  CheckPostLinearPrepackedArgs(input, first_weight, first_K, first_N, first_Np, dtype,
+                               "shared main Q GEMM packed_weight");
+  CheckPostLinearPrepackedArgs(input, second_weight, second_K, second_N, second_Np, dtype,
+                               "shared indexer Q GEMM packed_weight");
+
+  const int64_t M = input.size(0);
+  at::Tensor first_output = at::empty({M, first_Np}, input.options().dtype(dtype));
+  at::Tensor second_output = at::empty({M, second_Np}, input.options().dtype(dtype));
+  if (M == 0) {
+    if (first_N != first_Np) {
+      first_output = first_output.narrow(1, 0, first_N).contiguous();
+    }
+    if (second_N != second_Np) {
+      second_output = second_output.narrow(1, 0, second_N).contiguous();
+    }
+    return std::make_pair(first_output, second_output);
+  }
+
+  const PostGemmBackend backend = SelectedPostGemmBackend();
+  if (backend == PostGemmBackend::kSve) {
+    const int64_t n_tile = ::fused_cpp::deepseek_v4::attn_sve::n_tile();
+    TORCH_CHECK(first_Np % n_tile == 0 && second_Np % n_tile == 0,
+                "shared Q GEMM SVE packed Np values must be multiples of SVE n_tile=", n_tile, ", got ", first_Np,
+                " and ", second_Np);
+  }
+
+  int64_t num_threads = omp_get_max_threads();
+  if (num_threads <= 0) {
+    num_threads = 1;
+  }
+  const int64_t m_panels = (M + kPostGemmMPanelRows - 1) / kPostGemmMPanelRows;
+  const int64_t scratch_stride =
+      backend == PostGemmBackend::kSve
+          ? std::max<int64_t>(
+                1,
+                std::max<int64_t>(::fused_cpp::deepseek_v4::attn_sve::a_scratch_elems(kPostGemmMPanelRows, first_K),
+                                  ::fused_cpp::deepseek_v4::attn_sve::a_scratch_elems(kPostGemmMPanelRows, second_K)))
+          : std::max<int64_t>(1, kPostGemmMPanelRows * std::max(first_K, second_K));
+  at::Tensor scratch = workspace.empty({num_threads * scratch_stride}, input.options());
+  at::Tensor input_contig = input.contiguous();
+
+  struct PostGemmPairWork {
+    const uint16_t* b_ptr;
+    at::Tensor* output;
+    int64_t K;
+    int64_t Np;
+  };
+  struct alignas(64) PostGemmPanelCursor {
+    std::atomic<int64_t> next_panel{0};
+  };
+
+  const uint16_t* a_ptr = Bf16ConstData(input_contig);
+  uint16_t* scratch_ptr = Bf16Data(scratch);
+  std::array<PostGemmPairWork, 2> work = {
+      PostGemmPairWork{Bf16ConstData(first_weight), &first_output, first_K, first_Np},
+      PostGemmPairWork{Bf16ConstData(second_weight), &second_output, second_K, second_Np},
+  };
+  std::array<PostGemmPanelCursor, 2> cursors;
+
+#pragma omp parallel num_threads(num_threads)
+  {
+    const int64_t tid = omp_get_thread_num();
+    uint16_t* thread_scratch = scratch_ptr + tid * scratch_stride;
+    int preferred_work = static_cast<int>(tid & 1);
+    while (true) {
+      bool executed = false;
+      for (int offset = 0; offset < 2; ++offset) {
+        const int work_index = (preferred_work + offset) & 1;
+        PostGemmPanelCursor& cursor = cursors[static_cast<size_t>(work_index)];
+        if (cursor.next_panel.load(std::memory_order_relaxed) >= m_panels) {
+          continue;
+        }
+        const int64_t panel = cursor.next_panel.fetch_add(1, std::memory_order_relaxed);
+        if (panel >= m_panels) {
+          continue;
+        }
+        const PostGemmPairWork& item = work[static_cast<size_t>(work_index)];
+        const int64_t row_start = panel * kPostGemmMPanelRows;
+        const int64_t row_count = std::min<int64_t>(kPostGemmMPanelRows, M - row_start);
+        DispatchPostGemmRange(a_ptr, item.b_ptr, *item.output, thread_scratch, backend, dtype, row_start, row_count,
+                              item.K, item.Np);
+        preferred_work = work_index;
+        executed = true;
+        break;
+      }
+      if (!executed) {
+        break;
+      }
+    }
+  }
+
+  if (first_N != first_Np) {
+    first_output = first_output.narrow(1, 0, first_N).contiguous();
+  }
+  if (second_N != second_Np) {
+    second_output = second_output.narrow(1, 0, second_N).contiguous();
+  }
+  return std::make_pair(first_output, second_output);
 #endif
 }
 
@@ -2243,6 +2389,17 @@ void RunCompressor(const at::Tensor& kv_score, const at::Tensor& positions, cons
   FUSED_CPP_PROFILE_ADD_IF_PTR(compress_norm_rope_insert_ms, phase_start);
 }
 
+void RunMainQAndSwaPostprocess(const at::Tensor& q, const at::Tensor& kv, const at::Tensor& positions,
+                               const at::Tensor& main_cos_sin_cache, const at::Tensor& swa_kv_cache,
+                               const at::Tensor& swa_slot_mapping, double q_eps, PostGemmStageProfile* profile_ptr) {
+  FUSED_CPP_PROFILE_START(phase_start);
+  CheckMainQKvShape(q, kv);
+  QNormRopeFused(q, positions, main_cos_sin_cache, q_eps);
+  KvRopeCacheInsertFused(kv, swa_kv_cache, swa_slot_mapping, positions, main_cos_sin_cache);
+  FUSED_CPP_PROFILE_ADD_IF_PTR(profile_ptr == nullptr ? nullptr : &profile_ptr->main_q_norm_rope_swa_insert_ms,
+                               phase_start);
+}
+
 at::Tensor RunMainQAndSwaPrepacked(const at::Tensor& qr, const at::Tensor& kv, const at::Tensor& positions,
                                    const at::Tensor& main_wq_b_packed, int64_t main_wq_b_K, int64_t main_wq_b_N,
                                    int64_t main_wq_b_Np, const at::Tensor& main_cos_sin_cache,
@@ -2259,12 +2416,7 @@ at::Tensor RunMainQAndSwaPrepacked(const at::Tensor& qr, const at::Tensor& kv, c
                      .reshape({qr.size(0), main_num_heads, main_head_dim});
   FUSED_CPP_PROFILE_ADD_IF_PTR(profile_ptr == nullptr ? nullptr : &profile_ptr->main_q_gemm_ms, phase_start);
 
-  FUSED_CPP_PROFILE_RESTART(phase_start);
-  CheckMainQKvShape(q, kv);
-  QNormRopeFused(q, positions, main_cos_sin_cache, q_eps);
-  KvRopeCacheInsertFused(kv, swa_kv_cache, swa_slot_mapping, positions, main_cos_sin_cache);
-  FUSED_CPP_PROFILE_ADD_IF_PTR(profile_ptr == nullptr ? nullptr : &profile_ptr->main_q_norm_rope_swa_insert_ms,
-                               phase_start);
+  RunMainQAndSwaPostprocess(q, kv, positions, main_cos_sin_cache, swa_kv_cache, swa_slot_mapping, q_eps, profile_ptr);
   return q;
 }
 
@@ -2458,22 +2610,37 @@ std::tuple<at::Tensor, at::Tensor> deepseek_v4_post_gemm_parallel_stage_prepacke
   CheckCpuTensor(kv, "kv");
   CheckDim(qr, "qr", 2);
   CheckDim(kv, "kv", 2);
+  TORCH_CHECK(main_head_dim > 0, "main_head_dim must be positive");
+  TORCH_CHECK(main_wq_b_N % main_head_dim == 0, "main_wq_b_N must be divisible by main_head_dim");
   TORCH_CHECK(indexer_wq_b_N % indexer_norm_weight.size(0) == 0,
               "indexer_wq_b_N must be divisible by indexer head_dim");
   FUSED_CPP_PROFILE_ADD_IF_PTR(profile_ptr == nullptr ? nullptr : &profile_ptr->input_check_ms, phase_start);
 
-  at::Tensor q =
-      RunMainQAndSwaPrepacked(qr, kv, positions, main_wq_b_packed, main_wq_b_K, main_wq_b_N, main_wq_b_Np,
-                              main_cos_sin_cache, swa_kv_cache, swa_slot_mapping, main_head_dim, q_eps, profile_ptr);
-
-  auto workspace_lease = ::fused_cpp::workspace::acquire();
+  const int64_t main_num_heads = main_wq_b_N / main_head_dim;
   const int64_t indexer_head_dim = indexer_norm_weight.size(0);
-  FUSED_CPP_PROFILE_RESTART(phase_start);
-  at::Tensor indexer_q_linear = LinearPrepackedToDtypeWorkspace(qr, indexer_wq_b_packed, indexer_wq_b_K, indexer_wq_b_N,
-                                                                indexer_wq_b_Np, qr.scalar_type(), workspace_lease);
+  at::Tensor q;
+  at::Tensor indexer_q_linear;
+  if (PostGemmSharedQPoolEnabled(qr.size(0))) {
+    FUSED_CPP_PROFILE_RESTART(phase_start);
+    auto workspace_lease = ::fused_cpp::workspace::acquire();
+    auto q_pair = PostLinearPrepackedPairToDtypeWorkspace(qr, main_wq_b_packed, main_wq_b_K, main_wq_b_N, main_wq_b_Np,
+                                                          indexer_wq_b_packed, indexer_wq_b_K, indexer_wq_b_N,
+                                                          indexer_wq_b_Np, qr.scalar_type(), workspace_lease);
+    q = std::get<0>(q_pair).reshape({qr.size(0), main_num_heads, main_head_dim});
+    indexer_q_linear = std::get<1>(q_pair);
+    FUSED_CPP_PROFILE_ADD_IF_PTR(profile_ptr == nullptr ? nullptr : &profile_ptr->shared_q_gemm_ms, phase_start);
+    RunMainQAndSwaPostprocess(q, kv, positions, main_cos_sin_cache, swa_kv_cache, swa_slot_mapping, q_eps, profile_ptr);
+  } else {
+    q = RunMainQAndSwaPrepacked(qr, kv, positions, main_wq_b_packed, main_wq_b_K, main_wq_b_N, main_wq_b_Np,
+                                main_cos_sin_cache, swa_kv_cache, swa_slot_mapping, main_head_dim, q_eps, profile_ptr);
+    auto workspace_lease = ::fused_cpp::workspace::acquire();
+    FUSED_CPP_PROFILE_RESTART(phase_start);
+    indexer_q_linear = LinearPrepackedToDtypeWorkspace(qr, indexer_wq_b_packed, indexer_wq_b_K, indexer_wq_b_N,
+                                                       indexer_wq_b_Np, qr.scalar_type(), workspace_lease);
+    FUSED_CPP_PROFILE_ADD_IF_PTR(profile_ptr == nullptr ? nullptr : &profile_ptr->indexer_q_gemm_ms, phase_start);
+  }
   TORCH_CHECK(indexer_q_linear.size(1) % indexer_head_dim == 0,
               "indexer q linear out features must be divisible by indexer head_dim");
-  FUSED_CPP_PROFILE_ADD_IF_PTR(profile_ptr == nullptr ? nullptr : &profile_ptr->indexer_q_gemm_ms, phase_start);
 
   const int64_t indexer_num_heads = indexer_q_linear.size(1) / indexer_head_dim;
   at::Tensor indexer_q = indexer_q_linear.reshape({indexer_q_linear.size(0), indexer_num_heads, indexer_head_dim});

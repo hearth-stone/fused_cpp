@@ -155,6 +155,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--runs", type=int, default=15)
     parser.add_argument("--schedule", choices=("legacy", "m8"), default="m8")
+    parser.add_argument("--q-pool", choices=("auto", "legacy", "shared"), default="auto")
     parser.add_argument("--profile", action="store_true")
     return parser.parse_args()
 
@@ -162,6 +163,10 @@ def _parse_args() -> argparse.Namespace:
 def main() -> None:
     args = _parse_args()
     os.environ["FUSED_CPP_POST_GEMM_M8_ALIGNED"] = "1" if args.schedule == "m8" else "0"
+    if args.q_pool == "auto":
+        os.environ.pop("FUSED_CPP_POST_GEMM_SHARED_Q_POOL", None)
+    else:
+        os.environ["FUSED_CPP_POST_GEMM_SHARED_Q_POOL"] = "1" if args.q_pool == "shared" else "0"
     torch.set_num_threads(args.threads)
     torch.set_num_interop_threads(1)
     inputs, weights = _make_inputs(args.m)
@@ -186,6 +191,7 @@ def main() -> None:
         "m": args.m,
         "threads": args.threads,
         "schedule": args.schedule,
+        "q_pool": args.q_pool,
         "warmup": args.warmup,
         "runs": args.runs,
         "median_ms": median_ms,

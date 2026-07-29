@@ -185,16 +185,16 @@ Post Stage 已有多处 SVE 融合 kernel，优化重点在：
 
 ### 2.5 第二个 parallel 实测驱动 TODO
 
-基线为 `AmazonC5192Cores` 192 核 AArch64 机器的 NUMA0 `0-95`，TP4/C4A、`M=2048`、默认
-NEON backend、预打包权重。当前 96T 中位数为 `13.880 ms`；88T 为
-`11.012 ms`，其中 Main Q 与 Indexer Q GEMM 合计 `10.079 ms`，占
-`91.5%`。下面的优先级不包含单独记录的 sparse short-path 提前消除项。
+基线为 `AmazonC5192Cores` 192 核 AArch64 机器的 NUMA0 `0-95`，TP4/C4A、
+`M=2048`、默认 NEON backend、预打包权重。M8 对齐后的双 GEMM 顺序路径
+为 `10.309 ms`；共享 Q worker pool 为 `9.415 ms`。下面的优先级不包含
+单独记录的 sparse short-path 提前消除项。
 
 | 优先级 | Feature | TODO | 机制与验收重点 |
 |---|---|---|---|
-| P0 | `benchmark.post_gemm_stage` | 已增加 C4A 基准；继续覆盖 dense/C128A、M、prefix 长度和 backend | `tests/bench_deepseek_v4_post_gemm_stage.py` 已支持线程数、legacy/M8、阶段 profile；后续继续扩展形状 |
+| P0 | `benchmark.post_gemm_stage` | 已增加 C4A 基准；继续覆盖 dense/C128A、M、prefix 长度和 backend | `tests/bench_deepseek_v4_post_gemm_stage.py` 已支持线程数、legacy/M8、shared/legacy/auto Q pool 和阶段 profile；后续继续扩展形状 |
 | 完成 | `schedule.m8_aligned` | 按完整 M8 panel 静态分配，保留 legacy row-split 开关 | 192 核 NUMA0 NEON 96T：`13.942 -> 10.187 ms`；SVE：`11.082 -> 10.318 ms`；`FUSED_CPP_POST_GEMM_M8_ALIGNED=0` 回退 |
-| P0 | `runtime.shared_q_gemm_pool` | 两次 Q GEMM 共用一个 OpenMP region 和动态 M8-panel worker pool | 依赖 M8 alignment；消除两个独立 region，并让完成一个 GEMM 的线程继续领取另一个 GEMM 的 panel |
+| 完成 | `runtime.shared_q_gemm_pool` | 两次 Q GEMM 共用一个 OpenMP region 和动态 M8-panel worker pool | NEON 96T、M=2048：`10.309 -> 9.415 ms`；默认仅在 `T>=32 && ceil(M/8)>=T` 时启用，避免 M=192 强制共享时的 14.9% 退化 |
 | P0 | `schedule.q_gemm_mn_groups` | 复用第一个 parallel 的 owner-first MN task groups，将每份 16 MiB packed-B 拆成 L2 可驻留的 N stripe | 扫描 N-group 数量并记录每核 packed-B window；避免每个 M8 panel 流式扫描完整 N |
 | P0 | `compute.shared_prepacked_qr` | `qr` 只 pack 一次，由 Main Q 和 Indexer Q 的全部 N groups 共享 | 依赖 MN pool；必须避免按 N group 重复 pack A，并保持现有 bf16 输出布局 |
 | P1 | `runtime.post_stage_dag` | 将 Main Q、MLA compressor、Indexer compressor、KV cache insert 和 sparse indexer 表达为依赖任务，完成 GEMM 的线程继续领取 ready task | 先复用同一 worker region，避免用嵌套 OpenMP sections；目标是隐藏当前约 `0.5-0.9 ms` 的独立后处理 |

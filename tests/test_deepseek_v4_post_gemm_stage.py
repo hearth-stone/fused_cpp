@@ -381,6 +381,7 @@ def test_post_gemm_m8_aligned_matches_legacy_row_split(monkeypatch) -> None:
     previous_threads = torch.get_num_threads()
     torch.set_num_threads(7)
     try:
+        monkeypatch.setenv("FUSED_CPP_POST_GEMM_SHARED_Q_POOL", "0")
         monkeypatch.setenv("FUSED_CPP_POST_GEMM_M8_ALIGNED", "0")
         legacy_q, legacy_topk = post_gemm_parallel_stage_cpp_prepacked(legacy_inputs, weights)
         monkeypatch.setenv("FUSED_CPP_POST_GEMM_M8_ALIGNED", "1")
@@ -400,6 +401,44 @@ def test_post_gemm_m8_aligned_matches_legacy_row_split(monkeypatch) -> None:
         aligned_inputs.indexer_compressor.state_cache,
         legacy_inputs.indexer_compressor.state_cache,
         "M8-aligned indexer state_cache",
+    )
+
+
+@pytest.mark.skipif(
+    platform.machine() not in ("aarch64", "arm64") or not _HAS_DEEPSEEK_V4_POST_GEMM_STAGE_PREPACKED,
+    reason="shared post-GEMM Q worker pool requires the AArch64 prepacked C++ stage",
+)
+def test_post_gemm_shared_q_pool_matches_sequential(monkeypatch) -> None:
+    """The shared Main/Indexer Q pool must preserve all C4A outputs."""
+    sequential_inputs = _make_inputs(seed=23, num_tokens=25)
+    shared_inputs = _make_inputs(seed=23, num_tokens=25)
+    weights = prepare_deepseek_v4_post_gemm_weights(
+        shared_inputs.main_wq_b_weight,
+        shared_inputs.indexer_wq_b_weight,
+    )
+    previous_threads = torch.get_num_threads()
+    torch.set_num_threads(7)
+    try:
+        monkeypatch.setenv("FUSED_CPP_POST_GEMM_M8_ALIGNED", "1")
+        monkeypatch.setenv("FUSED_CPP_POST_GEMM_SHARED_Q_POOL", "0")
+        sequential_q, sequential_topk = post_gemm_parallel_stage_cpp_prepacked(sequential_inputs, weights)
+        monkeypatch.setenv("FUSED_CPP_POST_GEMM_SHARED_Q_POOL", "1")
+        shared_q, shared_topk = post_gemm_parallel_stage_cpp_prepacked(shared_inputs, weights)
+    finally:
+        torch.set_num_threads(previous_threads)
+
+    _assert_close(shared_q, sequential_q, "shared Q pool q")
+    assert torch.equal(shared_topk, sequential_topk)
+    _assert_close(shared_inputs.swa.kv_cache, sequential_inputs.swa.kv_cache, "shared Q pool swa kv_cache")
+    _assert_close(
+        shared_inputs.mla_compressor.state_cache,
+        sequential_inputs.mla_compressor.state_cache,
+        "shared Q pool mla state_cache",
+    )
+    _assert_close(
+        shared_inputs.indexer_compressor.state_cache,
+        sequential_inputs.indexer_compressor.state_cache,
+        "shared Q pool indexer state_cache",
     )
 
 
