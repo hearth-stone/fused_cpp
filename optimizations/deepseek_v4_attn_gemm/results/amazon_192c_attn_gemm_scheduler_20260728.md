@@ -4,18 +4,21 @@
 
 This change affects only the non-normed
 `deepseek_v4_attn_gemm_fused_prepacked` execution path used by
-`attn_gemm_parallel_execute`. The GEMM microkernels, packed-weight layout,
-and Python API are unchanged. The default schedule is now `mn`; `legacy`
-remains available as an explicit fallback.
+`attn_gemm_parallel_execute`. The packed-weight layout and Python API are
+unchanged. The default schedule is `mn`; `legacy` remains available as an
+explicit fallback.
 
 The three cumulative variants are:
 
 1. `m8`: split M only at M8 panel boundaries.
 2. `pool`: put the M8 panels of all four GEMMs in one OpenMP worker pool.
 3. `mn`: additionally split packed B into tile-aligned N groups.
+4. `mn + prepack-A`: cooperatively reorder A once and let all MN groups and
+   all four GEMMs consume the same packed-A buffer.
 
 Selection can be overridden by `FUSED_CPP_ATTN_GEMM_SCHEDULE`. The optional
 `FUSED_CPP_ATTN_GEMM_N_GROUPS` override sets the total N-group budget.
+`FUSED_CPP_ATTN_GEMM_PREPACK_A=on|off` forces shared A packing on or off.
 
 ## Machine and method
 
@@ -108,20 +111,72 @@ threads, and becomes necessary once arbitrary legacy row slices create
 inefficient M tails and cannot maintain cache-local packed-B windows across
 the four unequal GEMMs.
 
+## Pack A once
+
+The MN row-major kernels previously repacked one M8 A panel for every
+`(GEMM, N-group, M8-panel)` task. The new Linux NEON path:
+
+1. partitions the input M8 panels across the OpenMP team;
+2. writes one reorder-M8 packed-A buffer, zero-padding the final M tail;
+3. executes one barrier to publish the complete buffer;
+4. runs attention-prefixed packed-A M8 kernels for BF16 or FP32 row-major
+   output; and
+5. narrows padded output rows back to the logical M.
+
+SVE and non-MN schedules retain their existing paths. The default policy
+enables shared prepack only for MN with at least 24 requested N groups.
+Explicit `on` remains available for experiments.
+
+Forced `off` versus forced `on`, with 3 warmups and 11 measured runs:
+
+| Threads | Repack A ms | Pack once ms | Pack-on speedup |
+|---:|---:|---:|---:|
+| 1 | 244.124 | 243.265 | 1.004x |
+| 2 | 123.990 | 124.769 | 0.994x |
+| 4 | 62.886 | 64.417 | 0.976x |
+| 8 | 34.808 | 36.511 | 0.953x |
+| 16 | 17.855 | 18.384 | 0.971x |
+| 24 | 11.426 | 11.008 | 1.038x |
+| 32 | 8.392 | 8.160 | 1.028x |
+| 48 | 5.789 | 5.529 | 1.047x |
+| 64 | 4.499 | 4.410 | 1.020x |
+| 80 | 3.726 | 3.667 | 1.016x |
+| 96 | 3.162 | 3.071 | 1.030x |
+
+At low group counts the packed-A-only kernel plus publish barrier costs more
+than the integrated row-major load/pack sequence. The crossover is 24 groups
+on this machine. A 21-run 96-thread check measured `3.154 -> 3.059 ms`
+(`20.764 -> 21.411 TFLOP/s`, 1.031x).
+
+The automatic gate was checked at its boundary:
+
+| Threads | Forced off ms | Auto ms | Forced on ms |
+|---:|---:|---:|---:|
+| 16 | 17.888 | 17.959 | 18.383 |
+| 24 | 11.424 | 11.090 | 11.158 |
+| 96 | 3.166 | 3.062 | 3.070 |
+
+The small `off`/`auto` or `auto`/`on` differences are run-to-run noise; the
+results confirm that auto selects repack below the threshold and shared
+prepack at and above it. Shared prepack is not enabled by default for
+`pool`: at 96 threads it changed `7.821 -> 8.084 ms` (0.967x).
+
 ## Correctness
 
 - Local build: successful
-- Local test suite: 25 passed
-- Remote NEON: 25 passed
-- Remote SVE: 25 passed
+- Local test suite: 31 passed
+- Remote NEON: 31 passed
+- Remote SVE: 31 passed
 
 The tests cover `legacy`, `m8`, `pool`, and `mn`, all three exposed output
-variants, M=17 global tails, and a non-power-of-two seven-group override.
+variants, M=17 global tails, a non-power-of-two seven-group override, and
+packed-A M tails 1/3/5/7/8/13 against the original repack path.
 
 ## Decision and remaining work
 
-Use `mn` with the automatic N-group policy by default and preserve `legacy`
-as an explicit fallback. The current policy still needs broader performance
-validation across M, K, N, thread count, and both SVE and NEON. The normed
-execution path continues to use the legacy row split and needs separate
-integration and validation.
+Use `mn` with the automatic N-group and shared-prepack policies by default,
+and preserve `legacy` plus `FUSED_CPP_ATTN_GEMM_PREPACK_A=off` as explicit
+fallbacks. The current policies still need broader performance validation
+across M, K, N, thread count, and both SVE and NEON. The normed execution
+path continues to use the legacy row split and needs separate integration
+and validation.

@@ -39,6 +39,10 @@ void bf16gemm_k_ld2(const uint16_t* A, const uint16_t* B_reo, float* C, uint16_t
                     const gemm_params_t* params);
 void bf16gemm_k_ld4(const uint16_t* A, const uint16_t* B_reo, float* C, uint16_t* A_reorder,
                     const gemm_params_t* params);
+void deepseek_v4_attn_gemm_packed_f32(const uint16_t* A, const uint16_t* B_reo, float* C, uint16_t* A_reorder,
+                                      const gemm_params_t* params);
+void deepseek_v4_attn_gemm_packed_bf16(const uint16_t* A, const uint16_t* B_reo, uint16_t* C, uint16_t* A_reorder,
+                                       const gemm_params_t* params);
 #ifdef __linux__
 void bf16gemm_k_nld_b(const uint16_t* A, const uint16_t* B_reo, uint16_t* C, uint16_t* A_reorder,
                       const gemm_params_t* params);
@@ -55,6 +59,7 @@ void bf16gemm_k_nld4_b(const uint16_t* A, const uint16_t* B_reo, uint16_t* C, ui
 namespace {
 
 constexpr int64_t kTile = 8;
+constexpr int kAttnGemmPrepackMinNGroups = 24;
 
 enum class AttnGemmBackend {
   kNeon,
@@ -79,6 +84,14 @@ bool env_false_local(const char* name) {
   }
   return value[0] == '\0' || value[0] == '0' || std::strcmp(value, "false") == 0 || std::strcmp(value, "False") == 0 ||
          std::strcmp(value, "off") == 0 || std::strcmp(value, "OFF") == 0;
+}
+
+[[maybe_unused]] bool attn_gemm_prepack_a_enabled(AttnGemmSchedule schedule, int requested_n_groups) {
+  const char* value = std::getenv("FUSED_CPP_ATTN_GEMM_PREPACK_A");
+  if (value != nullptr) {
+    return !env_false_local("FUSED_CPP_ATTN_GEMM_PREPACK_A");
+  }
+  return schedule == AttnGemmSchedule::kMnPool && requested_n_groups >= kAttnGemmPrepackMinNGroups;
 }
 
 AttnGemmSchedule selected_attn_gemm_schedule() {
@@ -221,6 +234,26 @@ bool set_current_thread_affinity(const cpu_set_t* mask) {
 #endif
 
 uint16_t* bf16_data(at::Tensor& tensor) { return reinterpret_cast<uint16_t*>(tensor.data_ptr<at::BFloat16>()); }
+
+void pack_a_reorder_m8_range(const uint16_t* A, uint16_t* packed, int rows, int K, int panel_begin, int panel_end) {
+  const int k_blocks = K / 4;
+  for (int panel = panel_begin; panel < panel_end; ++panel) {
+    uint16_t* packed_panel = packed + static_cast<int64_t>(panel) * kTile * K;
+    for (int k_block = 0; k_block < k_blocks; ++k_block) {
+      uint16_t* dst = packed_panel + static_cast<int64_t>(k_block) * kTile * 4;
+      for (int row = 0; row < kTile; ++row) {
+        const int source_row = panel * kTile + row;
+        uint16_t* dst_row = dst + row * 4;
+        if (source_row < rows) {
+          const uint16_t* src = A + static_cast<int64_t>(source_row) * K + k_block * 4;
+          std::memcpy(dst_row, src, 4 * sizeof(uint16_t));
+        } else {
+          std::memset(dst_row, 0, 4 * sizeof(uint16_t));
+        }
+      }
+    }
+  }
+}
 
 void bf16_pack_b(const uint16_t* B, uint16_t* B_reo, int K, int N) {
   int64_t idx = 0;
@@ -485,6 +518,29 @@ void dispatch_fp32_gemm_range_to_output(const at::Tensor& a_storage, const Packe
 #else
   TORCH_CHECK(false, "direct bf16-output GEMM range dispatch is only enabled on Linux");
 #endif
+}
+
+void dispatch_packed_gemm_range_to_output(const uint16_t* packed_a, const PackedWeight& weight, at::Tensor& output,
+                                          bool bf16_output, int64_t row_start, int64_t n_begin, int64_t n_cols) {
+  if (n_cols == 0) {
+    return;
+  }
+  gemm_params_t params;
+  params.m = kTile;
+  params.k = static_cast<int>(weight.K_pad);
+  params.n = static_cast<int>(n_cols);
+  params.lda = static_cast<int>(weight.K_pad);
+  params.ldb = static_cast<int>(weight.K_pad);
+  params.ldc = static_cast<int>(weight.N_pad);
+  const uint16_t* panel_a = packed_a + row_start * weight.K_pad;
+  const uint16_t* panel_b = bf16_data_const(weight.tensor) + n_begin * weight.K_pad;
+  if (bf16_output) {
+    deepseek_v4_attn_gemm_packed_bf16(
+        panel_a, panel_b, bf16_data(output) + row_start * weight.N_pad + n_begin, nullptr, &params);
+  } else {
+    deepseek_v4_attn_gemm_packed_f32(
+        panel_a, panel_b, output.data_ptr<float>() + row_start * weight.N_pad + n_begin, nullptr, &params);
+  }
 }
 
 struct AttnGemmSelectedOutputs {
@@ -811,42 +867,62 @@ AttnGemmSelectedOutputs run_attn_gemm_selected_mt(const at::Tensor& hidden_state
   const int64_t num_threads = static_cast<int64_t>(core_ids.size());
   const AttnGemmBackend backend = selected_attn_gemm_backend();
   const AttnGemmSchedule schedule = selected_attn_gemm_schedule();
+  const bool uses_task_pool =
+      schedule == AttnGemmSchedule::kSharedPool || schedule == AttnGemmSchedule::kMnPool;
+  const int requested_n_groups =
+      uses_task_pool ? requested_attn_gemm_n_groups(static_cast<int>(num_threads)) : 1;
   const int64_t rows_per_thread = ceil_div_int64(std::max<int64_t>(M, 1), num_threads);
   const int64_t m_panels = ceil_div_int64(M, kTile);
+#if defined(__linux__)
+  const bool use_prepacked_a =
+      backend == AttnGemmBackend::kNeon && uses_task_pool &&
+      attn_gemm_prepack_a_enabled(schedule, requested_n_groups);
+#else
+  const bool use_prepacked_a = false;
+#endif
+  const int64_t output_rows = use_prepacked_a ? m_panels * kTile : M;
   int64_t scratch_rows = rows_per_thread;
   if (schedule == AttnGemmSchedule::kM8Aligned) {
     scratch_rows = std::max<int64_t>(1, ceil_div_int64(m_panels, num_threads) * kTile);
   } else if (schedule == AttnGemmSchedule::kSharedPool || schedule == AttnGemmSchedule::kMnPool) {
     scratch_rows = kTile;
   }
-  const int64_t scratch_stride = backend == AttnGemmBackend::kSve
-                                     ? ::fused_cpp::deepseek_v4::attn_sve::a_scratch_elems(scratch_rows, K_pad)
-                                     : std::max<int64_t>(1, scratch_rows * K_pad * 2);
+  const int64_t scratch_stride =
+      use_prepacked_a
+          ? 1
+          : (backend == AttnGemmBackend::kSve
+                 ? ::fused_cpp::deepseek_v4::attn_sve::a_scratch_elems(scratch_rows, K_pad)
+                 : std::max<int64_t>(1, scratch_rows * K_pad * 2));
   auto workspace_lease = ::fused_cpp::workspace::acquire();
   at::Tensor scratch = workspace_lease.empty({num_threads * scratch_stride}, hidden_states.options());
+  at::Tensor packed_a;
+  if (use_prepacked_a) {
+    packed_a = workspace_lease.empty({output_rows * K_pad}, hidden_states.options());
+  }
 
   AttnGemmSelectedOutputs outputs;
 #if defined(__APPLE__)
   at::Tensor qr_kv_acc =
-      at::zeros({M, fused_wqa_wkv.N_pad}, at::TensorOptions().device(hidden_states.device()).dtype(at::kFloat));
+      at::zeros({output_rows, fused_wqa_wkv.N_pad},
+                at::TensorOptions().device(hidden_states.device()).dtype(at::kFloat));
 #else
-  at::Tensor qr_kv_acc = at::empty({M, fused_wqa_wkv.N_pad}, hidden_states.options());
+  at::Tensor qr_kv_acc = at::empty({output_rows, fused_wqa_wkv.N_pad}, hidden_states.options());
 #endif
   at::Tensor kv_score_acc;
   at::Tensor indexer_kv_score_acc;
   at::Tensor indexer_weights_acc;
   if constexpr (kRunCompressor) {
-    kv_score_acc = at::zeros({M, compressor_kv_score->N_pad},
+    kv_score_acc = at::zeros({output_rows, compressor_kv_score->N_pad},
                              at::TensorOptions().device(hidden_states.device()).dtype(at::kFloat));
   }
   if constexpr (kRunIndexer) {
-    indexer_kv_score_acc = at::zeros({M, indexer_compressor_kv_score->N_pad},
+    indexer_kv_score_acc = at::zeros({output_rows, indexer_compressor_kv_score->N_pad},
                                      at::TensorOptions().device(hidden_states.device()).dtype(at::kFloat));
 #if defined(__APPLE__)
-    indexer_weights_acc = at::zeros({M, indexer_weights_proj->N_pad},
+    indexer_weights_acc = at::zeros({output_rows, indexer_weights_proj->N_pad},
                                     at::TensorOptions().device(hidden_states.device()).dtype(at::kFloat));
 #else
-    indexer_weights_acc = at::empty({M, indexer_weights_proj->N_pad}, hidden_states.options());
+    indexer_weights_acc = at::empty({output_rows, indexer_weights_proj->N_pad}, hidden_states.options());
 #endif
   }
 
@@ -871,14 +947,18 @@ AttnGemmSelectedOutputs run_attn_gemm_selected_mt(const at::Tensor& hidden_state
   const int64_t n_tile = attn_gemm_n_tile(backend);
   std::vector<AttnGemmTaskGroup> task_groups;
   std::unique_ptr<AttnGemmTaskCursor[]> task_cursors;
-  if (schedule == AttnGemmSchedule::kSharedPool || schedule == AttnGemmSchedule::kMnPool) {
-    task_groups =
-        make_attn_gemm_task_groups(work, schedule, requested_attn_gemm_n_groups(static_cast<int>(num_threads)), n_tile);
+  if (uses_task_pool) {
+    task_groups = make_attn_gemm_task_groups(work, schedule, requested_n_groups, n_tile);
     task_cursors = std::make_unique<AttnGemmTaskCursor[]>(task_groups.size());
   }
 
   auto dispatch_work_range = [&](const AttnGemmWork& item, int64_t row_start, int64_t row_count, int64_t n_begin,
                                  int64_t n_cols, int64_t scratch_offset) {
+    if (use_prepacked_a) {
+      dispatch_packed_gemm_range_to_output(bf16_data_const(packed_a), *item.weight, *item.output, item.bf16_output,
+                                           row_start, n_begin, n_cols);
+      return;
+    }
     if (item.bf16_output) {
       dispatch_bf16_gemm_range_to_output(a_storage, *item.weight, *item.output, scratch, row_start, row_count, n_begin,
                                          n_cols, scratch_offset);
@@ -904,6 +984,14 @@ AttnGemmSelectedOutputs run_attn_gemm_selected_mt(const at::Tensor& hidden_state
     }
 
     const int64_t scratch_offset = static_cast<int64_t>(tid) * scratch_stride;
+
+    if (use_prepacked_a) {
+      const int panel_begin = static_cast<int>(static_cast<int64_t>(tid) * m_panels / num_threads);
+      const int panel_end = static_cast<int>(static_cast<int64_t>(tid + 1) * m_panels / num_threads);
+      pack_a_reorder_m8_range(bf16_data_const(a_storage), bf16_data(packed_a), static_cast<int>(M),
+                              static_cast<int>(K_pad), panel_begin, panel_end);
+#pragma omp barrier
+    }
 
     if (schedule == AttnGemmSchedule::kLegacy || schedule == AttnGemmSchedule::kM8Aligned) {
       int64_t row_start = static_cast<int64_t>(tid) * rows_per_thread;
@@ -961,23 +1049,33 @@ AttnGemmSelectedOutputs run_attn_gemm_selected_mt(const at::Tensor& hidden_state
   }
 
 #if defined(__APPLE__)
-  outputs.qr_kv = narrow_output_if_needed(qr_kv_acc, fused_wqa_wkv.N, fused_wqa_wkv.N_pad).to(at::kBFloat16);
+  at::Tensor qr_kv_rows = output_rows == M ? qr_kv_acc : qr_kv_acc.narrow(0, 0, M);
+  outputs.qr_kv = narrow_output_if_needed(qr_kv_rows, fused_wqa_wkv.N, fused_wqa_wkv.N_pad).to(at::kBFloat16);
 #else
-  outputs.qr_kv = narrow_output_if_needed(qr_kv_acc, fused_wqa_wkv.N, fused_wqa_wkv.N_pad);
+  at::Tensor qr_kv_rows = output_rows == M ? qr_kv_acc : qr_kv_acc.narrow(0, 0, M);
+  outputs.qr_kv = narrow_output_if_needed(qr_kv_rows, fused_wqa_wkv.N, fused_wqa_wkv.N_pad);
 #endif
   if constexpr (kRunCompressor) {
-    outputs.kv_score = narrow_output_if_needed(kv_score_acc, compressor_kv_score->N, compressor_kv_score->N_pad);
+    at::Tensor kv_score_rows = output_rows == M ? kv_score_acc : kv_score_acc.narrow(0, 0, M);
+    outputs.kv_score =
+        narrow_output_if_needed(kv_score_rows, compressor_kv_score->N, compressor_kv_score->N_pad);
   }
   if constexpr (kRunIndexer) {
-    outputs.indexer_kv_score = narrow_output_if_needed(indexer_kv_score_acc, indexer_compressor_kv_score->N,
+    at::Tensor indexer_kv_score_rows =
+        output_rows == M ? indexer_kv_score_acc : indexer_kv_score_acc.narrow(0, 0, M);
+    outputs.indexer_kv_score = narrow_output_if_needed(indexer_kv_score_rows, indexer_compressor_kv_score->N,
                                                        indexer_compressor_kv_score->N_pad);
 #if defined(__APPLE__)
+    at::Tensor indexer_weights_rows =
+        output_rows == M ? indexer_weights_acc : indexer_weights_acc.narrow(0, 0, M);
     outputs.indexer_weights =
-        narrow_output_if_needed(indexer_weights_acc, indexer_weights_proj->N, indexer_weights_proj->N_pad)
+        narrow_output_if_needed(indexer_weights_rows, indexer_weights_proj->N, indexer_weights_proj->N_pad)
             .to(at::kBFloat16);
 #else
-    outputs.indexer_weights =
-        narrow_output_if_needed(indexer_weights_acc, indexer_weights_proj->N, indexer_weights_proj->N_pad);
+    at::Tensor indexer_weights_rows =
+        output_rows == M ? indexer_weights_acc : indexer_weights_acc.narrow(0, 0, M);
+    outputs.indexer_weights = narrow_output_if_needed(indexer_weights_rows, indexer_weights_proj->N,
+                                                      indexer_weights_proj->N_pad);
 #endif
   }
   return outputs;

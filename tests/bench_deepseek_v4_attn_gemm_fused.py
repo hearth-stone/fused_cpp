@@ -87,6 +87,12 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Total N-group budget used by mn; 0 selects the thread-based policy.",
     )
+    parser.add_argument(
+        "--prepack-a",
+        choices=("auto", "on", "off"),
+        default="auto",
+        help="Pack A once before pool/mn NEON GEMMs.",
+    )
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument(
         "--peak-gflops",
@@ -104,6 +110,10 @@ def main() -> None:
         os.environ["FUSED_CPP_ATTN_GEMM_N_GROUPS"] = str(args.n_groups)
     else:
         os.environ.pop("FUSED_CPP_ATTN_GEMM_N_GROUPS", None)
+    if args.prepack_a == "auto":
+        os.environ.pop("FUSED_CPP_ATTN_GEMM_PREPACK_A", None)
+    else:
+        os.environ["FUSED_CPP_ATTN_GEMM_PREPACK_A"] = "1" if args.prepack_a == "on" else "0"
     core_ids = _parse_cores(args.cores)
     if args.backend == "torch-mm":
         _set_process_affinity(core_ids)
@@ -181,6 +191,7 @@ def main() -> None:
     print(f"backend={args.backend}")
     print(f"schedule={args.schedule}")
     print(f"n_groups={args.n_groups if args.n_groups > 0 else 'auto'}")
+    print(f"prepack_a={args.prepack_a}")
     print(f"torch_num_threads={torch.get_num_threads()}")
     print(f"core_ids={core_ids if core_ids else 'serial'}")
     if args.backend == "fused":

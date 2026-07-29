@@ -1644,3 +1644,8 @@ GEMM_BODY bf16gemm_k_ldp, 8, 8, LOAD_ZERO_MAIN_8, STORE_C_ROWMAJOR, 2, 32, packe
 GEMM_BODY bf16gemm_k_ldp_m4, 4, P4, LOAD_ZERO_4, STORE_C_4, 2, 32, packed
 GEMM_BODY bf16gemm_k_ldp_m2, 2, P2, LOAD_ZERO_2, STORE_C_2, 2, 32, packed
 GEMM_BODY bf16gemm_k_ldp_m1, 1, P2, LOAD_ZERO_1, STORE_C_1, 2, 32, packed
+
+// DeepSeek V4 attention GEMM packed-A entrypoints. These keep the existing
+// i8gemm packed-B layout and consume one shared reorder-m8 A buffer.
+GEMM_BODY deepseek_v4_attn_gemm_packed_f32, 8, 8, LOAD_ZERO_MAIN_8, STORE_C_ROWMAJOR, 2, 32, packed
+GEMM_BODY deepseek_v4_attn_gemm_packed_bf16, 8, 8, LOAD_ZERO_MAIN_8, STORE_C_ROWMAJOR_B, 1, 16, packed

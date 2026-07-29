@@ -177,6 +177,50 @@ def test_deepseek_v4_attn_gemm_fused_mt_matches_serial(
         )
 
 
+@pytest.mark.skipif(not _HAS_OPENMP, reason="OpenMP is unavailable")
+@pytest.mark.parametrize("M", [1, 3, 5, 7, 8, 13])
+def test_deepseek_v4_attn_gemm_prepacked_a_matches_repack(
+    M: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    torch.manual_seed(11 + M)
+    K = 13
+    Ns = (19, 23, 11, 7)
+    hidden_states = _bf16_randn(M, K)
+    weights = tuple(_bf16_randn(K, N) for N in Ns)
+    packed = prepare_deepseek_v4_attn_gemm_weights(*weights)
+    core_ids = _test_core_ids(3)
+    if len(core_ids) < 2:
+        pytest.skip("need at least two available CPU cores")
+
+    monkeypatch.setenv("FUSED_CPP_ATTN_GEMM_SCHEDULE", "mn")
+    monkeypatch.setenv("FUSED_CPP_ATTN_GEMM_N_GROUPS", "7")
+    monkeypatch.setenv("FUSED_CPP_ATTN_GEMM_PREPACK_A", "0")
+    repacked_outputs = deepseek_v4_attn_gemm_fused_prepacked(
+        hidden_states,
+        packed,
+        cores=core_ids,
+    )
+    monkeypatch.setenv("FUSED_CPP_ATTN_GEMM_PREPACK_A", "1")
+    prepacked_outputs = deepseek_v4_attn_gemm_fused_prepacked(
+        hidden_states,
+        packed,
+        cores=core_ids,
+    )
+
+    for repacked, prepacked in zip(repacked_outputs, prepacked_outputs):
+        assert repacked is not None
+        assert prepacked is not None
+        assert prepacked.shape == repacked.shape
+        assert prepacked.dtype == repacked.dtype
+        torch.testing.assert_close(
+            prepacked.float(),
+            repacked.float(),
+            atol=5e-2,
+            rtol=5e-2,
+        )
+
+
 @pytest.mark.parametrize("variant", ["dense", "c128a", "c4a"])
 def test_deepseek_v4_attn_gemm_fused_normed_matches_torch(
     variant: str,
