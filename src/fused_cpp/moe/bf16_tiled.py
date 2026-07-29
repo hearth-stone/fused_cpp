@@ -34,6 +34,9 @@ try:
     _fused_moe_bf16_tiled_scheduled_impl = _moe_native.fused_moe_bf16_tiled_scheduled
     _fused_moe_bf16_tiled_async_impl = _moe_native.fused_moe_bf16_tiled_async
     _fused_moe_bf16_tiled_async_plan_v2_impl = getattr(_moe_native, "fused_moe_bf16_tiled_async_plan_v2", None)
+    _fused_moe_bf16_tiled_planned_staged_impl = getattr(
+        _moe_native, "fused_moe_bf16_tiled_planned_staged", None
+    )
     _fused_moe_bf16_tiled_vllm_staged_impl = _moe_native.fused_moe_bf16_tiled_vllm_staged
     _prepare_bf16_tiled_impl = _moe_native.fused_moe_bf16_tiled_prepare_weights
     _available_backends_impl = _moe_native.fused_moe_bf16_tiled_available_backends
@@ -53,6 +56,7 @@ try:
         "fused_moe_bf16_tiled_scheduled",
         "fused_moe_bf16_tiled_async",
         "fused_moe_bf16_tiled_async_plan_v2",
+        "fused_moe_bf16_tiled_planned_staged",
         "fused_moe_bf16_tiled_vllm_staged",
         "fused_moe_test_split_plan",
         "fused_moe_test_single_thread_gemm",
@@ -78,6 +82,7 @@ except ImportError as error:
     _fused_moe_bf16_tiled_scheduled_impl = None
     _fused_moe_bf16_tiled_async_impl = None
     _fused_moe_bf16_tiled_async_plan_v2_impl = None
+    _fused_moe_bf16_tiled_planned_staged_impl = None
     _fused_moe_bf16_tiled_vllm_staged_impl = None
     _prepare_bf16_tiled_impl = None
     _available_backends_impl = None
@@ -88,6 +93,7 @@ except AttributeError:
     _fused_moe_bf16_tiled_scheduled_impl = None
     _fused_moe_bf16_tiled_async_impl = None
     _fused_moe_bf16_tiled_async_plan_v2_impl = None
+    _fused_moe_bf16_tiled_planned_staged_impl = None
     _fused_moe_bf16_tiled_vllm_staged_impl = None
     _prepare_bf16_tiled_impl = None
     _available_backends_impl = None
@@ -597,6 +603,103 @@ def fused_moe_bf16_tiled_async_plan(
     return out if out is not None else result
 
 
+def fused_moe_bf16_tiled_planned_staged(
+    input: torch.Tensor,
+    weights: PreparedBF16TiledFusedMoEWeights,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    w13_plan: AsyncMoEPlanV2 | Mapping[str, object],
+    w2_plan: AsyncMoEPlanV2 | Mapping[str, object],
+    *,
+    global_num_experts: int = -1,
+    silu_poly_degree: int = 5,
+    w13_split: bool | None = None,
+    weight_window_bytes: int | None = None,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Run independent expert-level W13 and W2 plans with a global barrier.
+
+    This is an experimental comparison path. Both inputs use the validated
+    Plan V2 schema, but each plan controls only its named GEMM stage. W13
+    gathers and packs each expert input once, writes one global packed-C
+    intermediate, and completes globally before the independently planned W2
+    stage starts. The default production dispatcher is unchanged.
+    """
+    _require_backend()
+    if _fused_moe_bf16_tiled_planned_staged_impl is None:
+        raise RuntimeError(
+            "BF16 tiled planned-staged MoE backend is unavailable; rebuild the "
+            "C++ extension with fused_moe_bf16_tiled_planned_staged support."
+        )
+    materialized_w13 = (
+        w13_plan if isinstance(w13_plan, AsyncMoEPlanV2) else AsyncMoEPlanV2.from_dict(w13_plan)
+    )
+    materialized_w2 = w2_plan if isinstance(w2_plan, AsyncMoEPlanV2) else AsyncMoEPlanV2.from_dict(w2_plan)
+    if materialized_w13.num_threads != materialized_w2.num_threads:
+        raise ValueError(
+            "W13 and W2 plans must use the same num_threads: "
+            f"{materialized_w13.num_threads} vs {materialized_w2.num_threads}"
+        )
+    w13_cpu_ids = materialized_w13.thread_cpu_ids.to(dtype=torch.int64)
+    w2_cpu_ids = materialized_w2.thread_cpu_ids.to(dtype=torch.int64)
+    if not torch.equal(w13_cpu_ids, w2_cpu_ids):
+        raise ValueError("W13 and W2 plans must use identical thread_cpu_ids")
+    if input.dtype != torch.bfloat16:
+        raise TypeError(f"input must be torch.bfloat16, got {input.dtype}")
+    if input.device.type != "cpu":
+        raise ValueError("input must be a CPU tensor")
+    if topk_ids.dtype not in _INTEGER_DTYPES:
+        raise TypeError(f"topk_ids must use an integer dtype, got {topk_ids.dtype}")
+    if not topk_weights.dtype.is_floating_point:
+        raise TypeError(f"topk_weights must use a floating dtype, got {topk_weights.dtype}")
+    if not weights.fused_silu:
+        raise ValueError("planned-staged MoE requires weights prepared with fuse_silu=True")
+    if weights.gemm_backend != 1:
+        raise ValueError(f"planned-staged MoE requires the SVE BF16 backend; weights use {weights.backend_name}")
+    _validate_output_buffer(input, out)
+    assert materialized_w13.task_w13_window_bytes is not None
+    assert materialized_w2.task_w2_window_bytes is not None
+
+    result = _fused_moe_bf16_tiled_planned_staged_impl(
+        input.contiguous(),
+        weights.w13[0],
+        weights.w13[1],
+        weights.w13[2],
+        weights.w2[0],
+        weights.w2[1],
+        weights.w2[2],
+        topk_weights.contiguous(),
+        topk_ids.contiguous(),
+        materialized_w13.task_expert_ids.contiguous(),
+        materialized_w13.task_core_begins.contiguous(),
+        materialized_w13.task_threads.contiguous(),
+        materialized_w13.task_dep_offsets.contiguous(),
+        materialized_w13.task_deps.contiguous(),
+        materialized_w13.native_execution_mode,
+        materialized_w13.task_placement_modes.contiguous(),
+        materialized_w13.task_w13_window_bytes.contiguous(),
+        materialized_w2.task_expert_ids.contiguous(),
+        materialized_w2.task_core_begins.contiguous(),
+        materialized_w2.task_threads.contiguous(),
+        materialized_w2.task_dep_offsets.contiguous(),
+        materialized_w2.task_deps.contiguous(),
+        materialized_w2.native_execution_mode,
+        materialized_w2.task_placement_modes.contiguous(),
+        materialized_w2.task_w2_window_bytes.contiguous(),
+        materialized_w13.thread_cpu_ids.contiguous(),
+        materialized_w13.num_threads,
+        int(global_num_experts),
+        bool(weights.fused_silu),
+        int(silu_poly_degree),
+        int(weights.gemm_backend),
+        int(weights.backend_n_tile),
+        -1 if w13_split is None else int(bool(w13_split)),
+        _weight_window_argument(weight_window_bytes),
+        out,
+    )
+    return out if out is not None else result
+
+
 def fused_moe_bf16_tiled_vllm_staged(
     input: torch.Tensor,
     weights: PreparedBF16TiledFusedMoEWeights,
@@ -675,6 +778,7 @@ bf16_tiled_fused_moe = fused_moe_bf16_tiled
 bf16_tiled_fused_moe_scheduled = fused_moe_bf16_tiled_scheduled
 bf16_tiled_fused_moe_async = fused_moe_bf16_tiled_async
 bf16_tiled_fused_moe_async_plan = fused_moe_bf16_tiled_async_plan
+bf16_tiled_fused_moe_planned_staged = fused_moe_bf16_tiled_planned_staged
 bf16_tiled_fused_moe_vllm_staged = fused_moe_bf16_tiled_vllm_staged
 prepare_bf16_tiled_fused_moe_weights = prepare_fused_moe_bf16_tiled_weights
 
@@ -688,11 +792,13 @@ __all__ = [
     "fused_moe_bf16_tiled_scheduled",
     "fused_moe_bf16_tiled_async",
     "fused_moe_bf16_tiled_async_plan",
+    "fused_moe_bf16_tiled_planned_staged",
     "fused_moe_bf16_tiled_vllm_staged",
     "bf16_tiled_fused_moe",
     "bf16_tiled_fused_moe_scheduled",
     "bf16_tiled_fused_moe_async",
     "bf16_tiled_fused_moe_async_plan",
+    "bf16_tiled_fused_moe_planned_staged",
     "bf16_tiled_fused_moe_vllm_staged",
     "prepare_fused_moe_bf16_tiled_weights",
     "prepare_bf16_tiled_fused_moe_weights",

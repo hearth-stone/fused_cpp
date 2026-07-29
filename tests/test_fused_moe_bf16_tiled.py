@@ -22,6 +22,7 @@ from fused_cpp.moe import fused_moe_naive
 from fused_cpp.moe import fused_moe_bf16_tiled
 from fused_cpp.moe import fused_moe_bf16_tiled_async
 from fused_cpp.moe import fused_moe_bf16_tiled_async_plan
+from fused_cpp.moe import fused_moe_bf16_tiled_planned_staged
 from fused_cpp.moe import fused_moe_bf16_tiled_scheduled
 from fused_cpp.moe import fused_moe_bf16_tiled_vllm_staged
 from fused_cpp.moe import prepare_fused_moe_bf16_tiled_weights
@@ -460,10 +461,68 @@ def test_sve_plan_v2_strict_and_tail_pool_match_legacy_async(
         AsyncMoEPlanV2.from_dict(tail_bridge),
         w13_split=True,
     )
+    w2_bridge = {
+        "num_threads": 4,
+        "thread_cpu_ids": cpu_ids,
+        "task_expert_ids": [0, 1, 2, 3],
+        "task_core_begins": [0, 1, 2, 3],
+        "task_threads": [1, 1, 1, 1],
+        "task_dep_offsets": [0, 0, 0, 0, 0],
+        "task_deps": [],
+    }
+    independently_planned = fused_moe_bf16_tiled_planned_staged(
+        hidden_states,
+        packed,
+        topk_weights,
+        topk_ids,
+        strict_plan,
+        AsyncMoEPlanV2.from_dict(upgrade_legacy_async_plan(w2_bridge)),
+        w13_split=True,
+    )
+    staged_tail = fused_moe_bf16_tiled_planned_staged(
+        hidden_states,
+        packed,
+        topk_weights,
+        topk_ids,
+        AsyncMoEPlanV2.from_dict(tail_bridge),
+        AsyncMoEPlanV2.from_dict(tail_bridge),
+        w13_split=True,
+    )
+    staged_mixed = fused_moe_bf16_tiled_planned_staged(
+        hidden_states,
+        packed,
+        topk_weights,
+        topk_ids,
+        strict_plan,
+        AsyncMoEPlanV2.from_dict(tail_bridge),
+        w13_split=True,
+    )
 
     torch.testing.assert_close(strict.float(), reference.float(), atol=0, rtol=0)
     torch.testing.assert_close(windowed.float(), strict.float(), atol=0, rtol=0)
     torch.testing.assert_close(tail.float(), strict.float(), atol=0, rtol=0)
+    torch.testing.assert_close(independently_planned.float(), strict.float(), atol=0, rtol=0)
+    torch.testing.assert_close(staged_tail.float(), strict.float(), atol=0, rtol=0)
+    torch.testing.assert_close(staged_mixed.float(), strict.float(), atol=0, rtol=0)
+
+    unordered_overlap_bridge = upgrade_legacy_async_plan(
+        {
+            **strict_bridge,
+            "task_core_begins": [0, 1, 2, 2],
+            "task_dep_offsets": [0, 0, 0, 0, 0],
+            "task_deps": [],
+        }
+    )
+    with pytest.raises(RuntimeError, match="overlapping fixed intervals require dependency ordering"):
+        fused_moe_bf16_tiled_planned_staged(
+            hidden_states,
+            packed,
+            topk_weights,
+            topk_ids,
+            AsyncMoEPlanV2.from_dict(unordered_overlap_bridge),
+            strict_plan,
+            w13_split=True,
+        )
 
     # The materialized plan owns mutable tensors, so native must validate the
     # metadata again instead of trusting the Python construction check.

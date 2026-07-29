@@ -4675,6 +4675,8 @@ struct ScheduledScratchUnitConfig {
   bool fused_packa = false;
   bool w2_bf16_route = false;
   bool w2_direct_route = false;
+  bool external_intermediate = false;
+  bool barrier_only = false;
 };
 
 struct ScheduledTeamScratch {
@@ -4699,11 +4701,16 @@ void ensure_scheduled_scratch_capacity(ScheduledTeamScratch& scratch, const Sche
               " config=", config.threads);
   scratch.max_rows = std::max(scratch.max_rows, config.max_rows);
   scratch.a_reorder_stride = std::max(scratch.a_reorder_stride, config.a_reorder_stride);
+  if (config.barrier_only) {
+    return;
+  }
   const int64_t rows = scratch.max_rows;
   const int64_t rows_padded =
       config.fused_packa ? sve_hybrid_packed_rows(rows) : ceil_to_multiple(rows, int64_t{kKernelTile});
   scratch.input.resize(static_cast<size_t>(config.fused_packa ? 0 : rows * w13.K_pad));
-  scratch.intermediate.resize(static_cast<size_t>((config.fused_packa ? rows_padded : rows) * w2.K_pad));
+  if (!config.external_intermediate) {
+    scratch.intermediate.resize(static_cast<size_t>((config.fused_packa ? rows_padded : rows) * w2.K_pad));
+  }
   scratch.a_reorder.resize(static_cast<size_t>(scratch.threads * scratch.a_reorder_stride));
   scratch.packed_a.resize(static_cast<size_t>(config.fused_packa ? rows_padded * w13.K_pad : 0));
   scratch.gate_up.resize(static_cast<size_t>(config.fused_packa ? 0 : rows * w13.N_pad));
@@ -8221,6 +8228,649 @@ at::Tensor fused_moe_bf16_tiled_async_plan_v2(
       std::move(w13_bias), std::move(w2_bias), num_threads, std::move(activation), global_num_experts, skip_weighted,
       fuse_silu, silu_poly_degree, gemm_backend, backend_n_tile, w13_split, weight_window_bytes, std::move(out),
       &plan_v2);
+}
+
+namespace {
+
+struct PlannedStageRuntime {
+  bool is_w13 = false;
+  int64_t execution_mode = kAsyncExecutionStrict;
+  int64_t pool_threads = 0;
+  std::vector<AsyncTaskRuntime> tasks;
+  std::vector<int8_t> is_pool_task;
+  std::vector<std::vector<int64_t>> successors;
+  std::vector<int64_t> initial_dependencies;
+  std::vector<int64_t> pool_task_ids;
+  std::vector<int64_t> pool_scratch_indices;
+  std::vector<std::vector<int64_t>> pool_group_blockers;
+};
+
+template <typename EnsureScratch>
+PlannedStageRuntime build_planned_stage_runtime(
+    const char* stage_name, bool is_w13, int64_t execution_mode, const std::vector<int64_t>& task_expert_ids,
+    const std::vector<int64_t>& task_core_begins, const std::vector<int64_t>& task_threads,
+    const std::vector<int64_t>& task_dep_offsets, const std::vector<int64_t>& task_deps,
+    const std::vector<int64_t>& task_placement_modes, const std::vector<int64_t>& task_window_bytes,
+    const std::vector<std::vector<int64_t>>& routes, int64_t active_experts, int64_t num_threads,
+    EnsureScratch&& ensure_scratch) {
+  TORCH_CHECK(execution_mode == kAsyncExecutionStrict || execution_mode == kAsyncExecutionTailPool, stage_name,
+              " execution_mode must be strict (", kAsyncExecutionStrict, ") or tail_pool (",
+              kAsyncExecutionTailPool, "), got ", execution_mode);
+  const int64_t num_tasks = static_cast<int64_t>(task_expert_ids.size());
+  TORCH_CHECK(num_tasks > 0, stage_name, " plan must not be empty");
+  TORCH_CHECK(num_tasks == active_experts, stage_name, " plan requires exactly one task per active expert: tasks=",
+              num_tasks, " active_experts=", active_experts);
+  auto check_per_task_size = [&](const std::vector<int64_t>& values, const char* name) {
+    TORCH_CHECK(static_cast<int64_t>(values.size()) == num_tasks, stage_name, " ", name,
+                " must have one entry per task: got ", values.size(), " vs ", num_tasks);
+  };
+  check_per_task_size(task_core_begins, "task_core_begins");
+  check_per_task_size(task_threads, "task_threads");
+  check_per_task_size(task_placement_modes, "task_placement_modes");
+  check_per_task_size(task_window_bytes, "task_window_bytes");
+  TORCH_CHECK(static_cast<int64_t>(task_dep_offsets.size()) == num_tasks + 1, stage_name,
+              " task_dep_offsets must have num_tasks + 1 entries");
+  TORCH_CHECK(task_dep_offsets.front() == 0, stage_name, " task_dep_offsets[0] must be 0");
+  TORCH_CHECK(task_dep_offsets.back() == static_cast<int64_t>(task_deps.size()), stage_name,
+              " last task_dep_offsets entry must equal task_deps length");
+
+  PlannedStageRuntime runtime;
+  runtime.is_w13 = is_w13;
+  runtime.execution_mode = execution_mode;
+  runtime.tasks.resize(static_cast<size_t>(num_tasks));
+  runtime.is_pool_task.assign(static_cast<size_t>(num_tasks), int8_t{0});
+  runtime.successors.resize(static_cast<size_t>(num_tasks));
+  runtime.initial_dependencies.resize(static_cast<size_t>(num_tasks), 0);
+
+  if (execution_mode == kAsyncExecutionTailPool) {
+    for (int64_t task = 0; task < num_tasks; ++task) {
+      if (task_placement_modes[static_cast<size_t>(task)] != kAsyncPlacementTailPool) {
+        continue;
+      }
+      const int64_t width = task_threads[static_cast<size_t>(task)];
+      TORCH_CHECK(runtime.pool_threads == 0 || runtime.pool_threads == width, stage_name,
+                  " all tail-pool tasks must use the same width: task=", task, " width=", width,
+                  " expected=", runtime.pool_threads);
+      runtime.pool_threads = width;
+    }
+    TORCH_CHECK(runtime.pool_threads > 0, stage_name, " tail_pool execution requires at least one pooled task");
+    TORCH_CHECK(runtime.pool_threads <= num_threads && num_threads % runtime.pool_threads == 0, stage_name,
+                " tail-pool width must divide num_threads: pool_threads=", runtime.pool_threads,
+                " num_threads=", num_threads);
+  }
+
+  std::vector<int8_t> seen(routes.size(), int8_t{0});
+  int64_t max_pool_rows = 0;
+  for (int64_t task = 0; task < num_tasks; ++task) {
+    const int64_t expert = task_expert_ids[static_cast<size_t>(task)];
+    const int64_t core_begin = task_core_begins[static_cast<size_t>(task)];
+    const int64_t threads = task_threads[static_cast<size_t>(task)];
+    const int64_t placement = task_placement_modes[static_cast<size_t>(task)];
+    const int64_t window_bytes = task_window_bytes[static_cast<size_t>(task)];
+    TORCH_CHECK(expert >= 0 && expert < static_cast<int64_t>(routes.size()), stage_name,
+                " task_expert_ids[", task, "] out of range: ", expert);
+    TORCH_CHECK(seen[static_cast<size_t>(expert)] == 0, stage_name, " plan contains duplicate expert ", expert);
+    TORCH_CHECK(!routes[static_cast<size_t>(expert)].empty(), stage_name, " task contains inactive expert ", expert);
+    TORCH_CHECK(threads > 0, stage_name, " task_threads[", task, "] must be positive, got ", threads);
+    TORCH_CHECK(window_bytes >= -1, stage_name,
+                " task window must be -1 (inherit) or non-negative: task=", task, " value=", window_bytes);
+    TORCH_CHECK(placement == kAsyncPlacementFixed || placement == kAsyncPlacementTailPool, stage_name,
+                " task_placement_modes[", task, "] has unsupported value ", placement);
+    TORCH_CHECK(execution_mode != kAsyncExecutionStrict || placement == kAsyncPlacementFixed, stage_name,
+                " strict execution requires every task placement to be fixed: task=", task);
+
+    const int64_t rows = static_cast<int64_t>(routes[static_cast<size_t>(expert)].size());
+    check_positive_int(rows, "planned-stage task rows");
+    seen[static_cast<size_t>(expert)] = int8_t{1};
+    if (placement == kAsyncPlacementTailPool) {
+      TORCH_CHECK(execution_mode == kAsyncExecutionTailPool, stage_name,
+                  " pooled placement requires tail_pool execution: task=", task);
+      TORCH_CHECK(core_begin == -1, stage_name, " tail-pool task_core_begins[", task, "] must be -1, got ",
+                  core_begin);
+      TORCH_CHECK(threads == runtime.pool_threads, stage_name, " tail-pool task width mismatch: task=", task,
+                  " width=", threads, " expected=", runtime.pool_threads);
+      runtime.is_pool_task[static_cast<size_t>(task)] = int8_t{1};
+      runtime.pool_task_ids.push_back(task);
+      max_pool_rows = std::max(max_pool_rows, rows);
+      runtime.tasks[static_cast<size_t>(task)] =
+          AsyncTaskRuntime{expert, rows, -1, runtime.pool_threads, -1, is_w13 ? window_bytes : -1,
+                           is_w13 ? -1 : window_bytes};
+      continue;
+    }
+
+    TORCH_CHECK(core_begin >= 0, stage_name, " fixed task_core_begins[", task,
+                "] must be non-negative, got ", core_begin);
+    TORCH_CHECK(core_begin < num_threads && threads <= num_threads - core_begin, stage_name, " task ", task,
+                " interval exceeds num_threads: core_begin=", core_begin, " threads=", threads,
+                " num_threads=", num_threads);
+    const int64_t scratch_index = ensure_scratch(core_begin, threads, rows, is_w13);
+    runtime.tasks[static_cast<size_t>(task)] =
+        AsyncTaskRuntime{expert, rows, core_begin, threads, scratch_index, is_w13 ? window_bytes : -1,
+                         is_w13 ? -1 : window_bytes};
+  }
+  for (size_t expert = 0; expert < routes.size(); ++expert) {
+    if (!routes[expert].empty()) {
+      TORCH_CHECK(seen[expert] != 0, stage_name, " plan is missing active expert ", expert);
+    }
+  }
+
+  std::vector<std::vector<int8_t>> ancestors(
+      static_cast<size_t>(num_tasks), std::vector<int8_t>(static_cast<size_t>(num_tasks), int8_t{0}));
+  for (int64_t task = 0; task < num_tasks; ++task) {
+    const int64_t begin = task_dep_offsets[static_cast<size_t>(task)];
+    const int64_t end = task_dep_offsets[static_cast<size_t>(task + 1)];
+    TORCH_CHECK(begin >= 0 && begin <= end && end <= static_cast<int64_t>(task_deps.size()), stage_name,
+                " task ", task, " dependency range is invalid");
+    const bool pooled = runtime.is_pool_task[static_cast<size_t>(task)] != 0;
+    TORCH_CHECK(!pooled || begin == end, stage_name, " tail-pool task must not have dependencies: task=", task);
+    runtime.initial_dependencies[static_cast<size_t>(task)] = pooled ? 0 : end - begin;
+    for (int64_t index = begin; index < end; ++index) {
+      const int64_t dependency = task_deps[static_cast<size_t>(index)];
+      TORCH_CHECK(dependency >= 0 && dependency < task, stage_name,
+                  " task dependencies must refer to earlier task ids: task=", task, " dependency=", dependency);
+      if (!pooled) {
+        TORCH_CHECK(runtime.is_pool_task[static_cast<size_t>(dependency)] == 0, stage_name,
+                    " fixed task must not depend on a tail-pool task: task=", task,
+                    " dependency=", dependency);
+        ancestors[static_cast<size_t>(task)][static_cast<size_t>(dependency)] = int8_t{1};
+        for (int64_t ancestor = 0; ancestor < dependency; ++ancestor) {
+          ancestors[static_cast<size_t>(task)][static_cast<size_t>(ancestor)] |=
+              ancestors[static_cast<size_t>(dependency)][static_cast<size_t>(ancestor)];
+        }
+        runtime.successors[static_cast<size_t>(dependency)].push_back(task);
+      }
+    }
+  }
+  for (int64_t task = 0; task < num_tasks; ++task) {
+    if (runtime.is_pool_task[static_cast<size_t>(task)] != 0) {
+      continue;
+    }
+    const AsyncTaskRuntime& current = runtime.tasks[static_cast<size_t>(task)];
+    for (int64_t prior = 0; prior < task; ++prior) {
+      if (runtime.is_pool_task[static_cast<size_t>(prior)] != 0) {
+        continue;
+      }
+      const AsyncTaskRuntime& previous = runtime.tasks[static_cast<size_t>(prior)];
+      const bool overlaps =
+          std::max(current.core_begin, previous.core_begin) <
+          std::min(current.core_begin + current.threads, previous.core_begin + previous.threads);
+      TORCH_CHECK(!overlaps || ancestors[static_cast<size_t>(task)][static_cast<size_t>(prior)] != 0,
+                  stage_name, " overlapping fixed intervals require dependency ordering: prior=", prior,
+                  " current=", task);
+    }
+  }
+
+  if (execution_mode == kAsyncExecutionTailPool) {
+    std::sort(runtime.pool_task_ids.begin(), runtime.pool_task_ids.end(), [&](int64_t lhs, int64_t rhs) {
+      const AsyncTaskRuntime& lhs_task = runtime.tasks[static_cast<size_t>(lhs)];
+      const AsyncTaskRuntime& rhs_task = runtime.tasks[static_cast<size_t>(rhs)];
+      if (lhs_task.rows != rhs_task.rows) {
+        return lhs_task.rows > rhs_task.rows;
+      }
+      return lhs_task.expert < rhs_task.expert;
+    });
+    const int64_t group_count = num_threads / runtime.pool_threads;
+    runtime.pool_scratch_indices.resize(static_cast<size_t>(group_count));
+    runtime.pool_group_blockers.resize(static_cast<size_t>(group_count));
+    for (int64_t group = 0; group < group_count; ++group) {
+      runtime.pool_scratch_indices[static_cast<size_t>(group)] =
+          ensure_scratch(group * runtime.pool_threads, runtime.pool_threads, max_pool_rows, is_w13);
+    }
+    for (int64_t task = 0; task < num_tasks; ++task) {
+      if (runtime.is_pool_task[static_cast<size_t>(task)] != 0) {
+        continue;
+      }
+      const AsyncTaskRuntime& fixed = runtime.tasks[static_cast<size_t>(task)];
+      TORCH_CHECK(fixed.core_begin % runtime.pool_threads == 0 && fixed.threads % runtime.pool_threads == 0,
+                  stage_name, " fixed intervals must align to tail-pool width: task=", task,
+                  " core_begin=", fixed.core_begin, " threads=", fixed.threads,
+                  " pool_threads=", runtime.pool_threads);
+      const int64_t first_group = fixed.core_begin / runtime.pool_threads;
+      const int64_t group_count_for_task = fixed.threads / runtime.pool_threads;
+      for (int64_t group = first_group; group < first_group + group_count_for_task; ++group) {
+        runtime.pool_group_blockers[static_cast<size_t>(group)].push_back(task);
+      }
+    }
+  }
+  return runtime;
+}
+
+template <typename RunTask>
+void execute_planned_stage(int64_t num_threads, const PlannedStageRuntime& runtime,
+                           const std::vector<ScheduledTeamScratch*>& scratches, RunTask&& run_task) {
+  const int64_t num_tasks = static_cast<int64_t>(runtime.tasks.size());
+  std::vector<std::atomic<int64_t>> task_states(static_cast<size_t>(num_tasks));
+  std::vector<std::atomic<int64_t>> dependencies(static_cast<size_t>(num_tasks));
+  for (int64_t task = 0; task < num_tasks; ++task) {
+    task_states[static_cast<size_t>(task)].store(0, std::memory_order_relaxed);
+    dependencies[static_cast<size_t>(task)].store(
+        runtime.initial_dependencies[static_cast<size_t>(task)], std::memory_order_relaxed);
+  }
+  std::atomic<int64_t> completed_tasks{0};
+
+  auto run_and_complete = [&](int64_t tid, int64_t task_id, const AsyncTaskRuntime& task) {
+    ScheduledTeamScratch& scratch = *scratches[static_cast<size_t>(task.scratch_index)];
+    const int64_t local_tid = tid - task.core_begin;
+    run_task(tid, task_id, task, scratch);
+    scratch.barrier.wait();
+    if (local_tid == 0) {
+      task_states[static_cast<size_t>(task_id)].store(2, std::memory_order_release);
+      for (const int64_t successor : runtime.successors[static_cast<size_t>(task_id)]) {
+        dependencies[static_cast<size_t>(successor)].fetch_sub(1, std::memory_order_acq_rel);
+      }
+      completed_tasks.fetch_add(1, std::memory_order_release);
+    }
+    scratch.barrier.wait();
+  };
+
+  auto run_fixed_until_released = [&](int64_t tid, int64_t group) {
+    while (true) {
+      int64_t selected_task = -1;
+      for (int64_t task_id = 0; task_id < num_tasks; ++task_id) {
+        if (runtime.is_pool_task[static_cast<size_t>(task_id)] != 0) {
+          continue;
+        }
+        const AsyncTaskRuntime& task = runtime.tasks[static_cast<size_t>(task_id)];
+        if (tid < task.core_begin || tid >= task.core_begin + task.threads) {
+          continue;
+        }
+        int64_t state = task_states[static_cast<size_t>(task_id)].load(std::memory_order_acquire);
+        if (state == 2) {
+          continue;
+        }
+        if (state == 0) {
+          if (dependencies[static_cast<size_t>(task_id)].load(std::memory_order_acquire) != 0) {
+            continue;
+          }
+          int64_t expected = 0;
+          if (!task_states[static_cast<size_t>(task_id)].compare_exchange_strong(
+                  expected, 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
+            state = expected;
+            if (state != 1) {
+              continue;
+            }
+          }
+        }
+        selected_task = task_id;
+        break;
+      }
+      if (selected_task >= 0) {
+        run_and_complete(tid, selected_task, runtime.tasks[static_cast<size_t>(selected_task)]);
+        continue;
+      }
+      if (group < 0) {
+        if (completed_tasks.load(std::memory_order_acquire) == num_tasks) {
+          return;
+        }
+      } else {
+        bool released = true;
+        for (const int64_t blocker : runtime.pool_group_blockers[static_cast<size_t>(group)]) {
+          if (task_states[static_cast<size_t>(blocker)].load(std::memory_order_acquire) != 2) {
+            released = false;
+            break;
+          }
+        }
+        if (released) {
+          return;
+        }
+      }
+      std::this_thread::yield();
+    }
+  };
+
+  if (runtime.execution_mode == kAsyncExecutionStrict) {
+    run_fixed_threads(num_threads, [&](int64_t tid) { run_fixed_until_released(tid, -1); });
+    return;
+  }
+
+  std::atomic<int64_t> next_pool_task{0};
+  std::vector<std::atomic<int64_t>> current_pool_tasks(runtime.pool_scratch_indices.size());
+  for (std::atomic<int64_t>& task : current_pool_tasks) {
+    task.store(-1, std::memory_order_relaxed);
+  }
+  run_fixed_threads(num_threads, [&](int64_t tid) {
+    const int64_t group = tid / runtime.pool_threads;
+    const int64_t local_tid = tid % runtime.pool_threads;
+    const int64_t core_begin = group * runtime.pool_threads;
+    const int64_t scratch_index = runtime.pool_scratch_indices[static_cast<size_t>(group)];
+    ScheduledTeamScratch& pool_scratch = *scratches[static_cast<size_t>(scratch_index)];
+    run_fixed_until_released(tid, group);
+
+    while (true) {
+      if (local_tid == 0) {
+        const int64_t queue_index = next_pool_task.fetch_add(1, std::memory_order_relaxed);
+        const int64_t task_id =
+            queue_index < static_cast<int64_t>(runtime.pool_task_ids.size())
+                ? runtime.pool_task_ids[static_cast<size_t>(queue_index)]
+                : -1;
+        if (task_id >= 0) {
+          int64_t expected = 0;
+          const bool claimed = task_states[static_cast<size_t>(task_id)].compare_exchange_strong(
+              expected, 1, std::memory_order_acq_rel, std::memory_order_acquire);
+          TORCH_INTERNAL_ASSERT(claimed, "planned-stage pool task was already claimed: task=", task_id,
+                                " state=", expected);
+        }
+        current_pool_tasks[static_cast<size_t>(group)].store(task_id, std::memory_order_release);
+      }
+      pool_scratch.barrier.wait();
+      const int64_t task_id = current_pool_tasks[static_cast<size_t>(group)].load(std::memory_order_acquire);
+      if (task_id < 0) {
+        break;
+      }
+      const AsyncTaskRuntime& base = runtime.tasks[static_cast<size_t>(task_id)];
+      const AsyncTaskRuntime pooled{base.expert, base.rows, core_begin, runtime.pool_threads, scratch_index,
+                                    base.w13_window_bytes, base.w2_window_bytes};
+      run_and_complete(tid, task_id, pooled);
+    }
+    while (completed_tasks.load(std::memory_order_acquire) < num_tasks) {
+      std::this_thread::yield();
+    }
+  });
+}
+
+}  // namespace
+
+at::Tensor fused_moe_bf16_tiled_planned_staged(
+    at::Tensor input, at::Tensor w13_packed, int64_t w13_K, int64_t w13_N, at::Tensor w2_packed, int64_t w2_K,
+    int64_t w2_N, at::Tensor topk_weights, at::Tensor topk_ids, at::Tensor w13_task_expert_ids,
+    at::Tensor w13_task_core_begins, at::Tensor w13_task_threads, at::Tensor w13_task_dep_offsets,
+    at::Tensor w13_task_deps, int64_t w13_execution_mode, at::Tensor w13_task_placement_modes,
+    at::Tensor w13_task_window_bytes, at::Tensor w2_task_expert_ids, at::Tensor w2_task_core_begins,
+    at::Tensor w2_task_threads, at::Tensor w2_task_dep_offsets, at::Tensor w2_task_deps, int64_t w2_execution_mode,
+    at::Tensor w2_task_placement_modes, at::Tensor w2_task_window_bytes,
+    c10::optional<at::Tensor> thread_cpu_ids, int64_t num_threads, int64_t global_num_experts, bool fuse_silu,
+    int64_t silu_poly_degree, int64_t gemm_backend, int64_t backend_n_tile, int64_t w13_split,
+    int64_t weight_window_bytes, c10::optional<at::Tensor> out) {
+#ifndef __aarch64__
+  TORCH_CHECK(false, "fused_moe_bf16_tiled_planned_staged requires AArch64");
+#else
+  const auto call_begin = ::fused_cpp::profile::now();
+  check_bf16_cpu(input, "input");
+  TORCH_CHECK(input.dim() == 2, "input must be 2-D [tokens, hidden]");
+  TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
+  TORCH_CHECK(topk_ids.device().is_cpu() && topk_weights.device().is_cpu(),
+              "topk_ids and topk_weights must be CPU tensors");
+  TORCH_CHECK(is_integer_dtype(topk_ids.scalar_type()), "topk_ids must use an integer dtype");
+  TORCH_CHECK(is_floating_dtype(topk_weights.scalar_type()), "topk_weights must use a floating dtype");
+  TORCH_CHECK(topk_ids.dim() == 2 && topk_weights.dim() == 2,
+              "topk_ids and topk_weights must be 2-D [tokens, top_k]");
+  TORCH_CHECK(topk_ids.sizes() == topk_weights.sizes(), "topk_ids and topk_weights shapes must match");
+  TORCH_CHECK(topk_ids.size(0) == input.size(0), "topk first dimension must match input token count");
+  TORCH_CHECK(topk_ids.size(1) > 0, "top_k must be non-zero");
+  TORCH_CHECK(num_threads > 0 && num_threads <= std::numeric_limits<int>::max(),
+              "num_threads must be in [1, INT_MAX], got ", num_threads);
+
+  const ::fused_cpp::moe::MoeBackend& backend = ::fused_cpp::moe::backend_from_id(gemm_backend);
+  TORCH_CHECK(backend.id == ::fused_cpp::moe::BackendId::kArmSveBf16,
+              "planned staged MoE requires the SVE BF16 backend, got ", backend.name);
+  TORCH_CHECK(backend_n_tile == backend.n_tile(), "MoE backend_n_tile mismatch for ", backend.name,
+              ": weights use ", backend_n_tile, ", runtime uses ", backend.n_tile());
+  TORCH_CHECK(fuse_silu, "planned staged MoE requires weights prepared with fuse_silu=True");
+  TORCH_CHECK(silu_poly_degree == 4 || silu_poly_degree == 5 || silu_poly_degree == 6,
+              "silu_poly_degree must be 4, 5, or 6, got ", silu_poly_degree);
+  TORCH_CHECK(w13_split >= -1 && w13_split <= 1, "w13_split must be -1, 0, or 1, got ", w13_split);
+  TORCH_CHECK(weight_window_bytes >= -1, "weight_window_bytes must be -1 or non-negative, got ",
+              weight_window_bytes);
+  const bool use_w13_split = w13_split < 0 ? sve_w13_split_n_workset_enabled() : w13_split != 0;
+  weight_window_bytes = resolve_sve_weight_window_bytes(weight_window_bytes);
+  const int64_t inherited_w13_window =
+      resolve_sve_stage_weight_window_bytes(MoeGemmStage::kW13, weight_window_bytes);
+  const int64_t inherited_w2_window =
+      resolve_sve_stage_weight_window_bytes(MoeGemmStage::kW2, weight_window_bytes);
+
+  PackedExperts w13 = checked_packed_experts(w13_packed, w13_K, w13_N, "w13_packed", backend_n_tile);
+  PackedExperts w2 = checked_packed_experts(w2_packed, w2_K, w2_N, "w2_packed", backend_n_tile);
+  TORCH_CHECK(w13.E == w2.E, "w13 and w2 expert count mismatch");
+  TORCH_CHECK(w13.K == input.size(1), "input hidden size mismatch: input H=", input.size(1), ", w13 K=", w13.K);
+  TORCH_CHECK(w13.N % 2 == 0, "w13 N must be even, got ", w13.N);
+  const int64_t F = w13.N / 2;
+  const int64_t H = input.size(1);
+  TORCH_CHECK(F % kKernelTile == 0, "planned staged fused SiLU requires F to be a multiple of ", kKernelTile,
+              ", got ", F);
+  TORCH_CHECK(w13.N_pad == 2 * F, "planned staged MoE requires interleaved W13 with N_pad=2F, got ",
+              w13.N_pad, " vs ", 2 * F);
+  TORCH_CHECK(w2.K == F && w2.N == H, "w2 shape mismatch: expected K=", F, " N=", H, ", got K=", w2.K,
+              " N=", w2.N);
+  TORCH_CHECK(w2.K_pad == F && w2.N_pad == H,
+              "planned staged direct-route path requires unpadded W2 K/N: K_pad=", w2.K_pad,
+              " N_pad=", w2.N_pad, " expected K=", F, " N=", H);
+
+  const int64_t num_tokens = input.size(0);
+  const int64_t top_k = topk_ids.size(1);
+  if (num_tokens == 0) {
+    return finalize_moe_output(prepare_moe_output(input, w13_packed, w2_packed, topk_weights, topk_ids, out), out);
+  }
+  const int64_t num_experts = global_num_experts < 0 ? w13.E : global_num_experts;
+  TORCH_CHECK(num_experts > 0 && num_experts <= w13.E,
+              "global_num_experts must be positive and no larger than packed experts: got ", num_experts,
+              " packed=", w13.E);
+
+  TORCH_CHECK(thread_cpu_ids.has_value() && thread_cpu_ids->defined(), "planned staged MoE requires thread_cpu_ids");
+  ThreadPinningConfig pinning;
+  pinning.cpus = tensor_to_i64_vector(*thread_cpu_ids, "thread_cpu_ids");
+  TORCH_CHECK(static_cast<int64_t>(pinning.cpus.size()) == num_threads,
+              "thread_cpu_ids must have exactly num_threads entries: got ", pinning.cpus.size(), " vs ",
+              num_threads);
+  for (size_t index = 0; index < pinning.cpus.size(); ++index) {
+    TORCH_CHECK(pinning.cpus[index] >= 0, "thread_cpu_ids[", index, "] must be non-negative");
+    for (size_t prior = 0; prior < index; ++prior) {
+      TORCH_CHECK(pinning.cpus[prior] != pinning.cpus[index],
+                  "thread_cpu_ids must not contain duplicates: index=", index, " cpu=", pinning.cpus[index]);
+    }
+  }
+  pinning.enabled = true;
+  ThreadPinningScope pinning_scope(&pinning);
+  prepare_moe_threads_for_operator(num_threads);
+
+  const auto route_build_begin = ::fused_cpp::profile::now();
+  at::Tensor ids_i64 = topk_ids.to(at::kLong).contiguous();
+  at::Tensor weights_f32 = topk_weights.to(at::kFloat).contiguous();
+  const int64_t* ids = ids_i64.data_ptr<int64_t>();
+  const int64_t num_routes = num_tokens * top_k;
+  std::vector<std::vector<int64_t>> routes(static_cast<size_t>(num_experts));
+  for (int64_t flat = 0; flat < num_routes; ++flat) {
+    const int64_t expert = ids[flat];
+    TORCH_CHECK(expert >= 0 && expert < num_experts, "topk_ids out of range: id=", expert,
+                ", valid range [0, ", num_experts, ")");
+    routes[static_cast<size_t>(expert)].push_back(flat);
+  }
+  int64_t active_experts = 0;
+  std::vector<int64_t> intermediate_offsets(static_cast<size_t>(num_experts + 1), 0);
+  for (int64_t expert = 0; expert < num_experts; ++expert) {
+    const int64_t rows = static_cast<int64_t>(routes[static_cast<size_t>(expert)].size());
+    active_experts += rows > 0 ? 1 : 0;
+    const int64_t packed_rows = sve_hybrid_packed_rows(rows);
+    TORCH_CHECK(packed_rows <= std::numeric_limits<int64_t>::max() / w2.K_pad,
+                "planned staged intermediate size overflows int64");
+    const int64_t elements = packed_rows * w2.K_pad;
+    TORCH_CHECK(intermediate_offsets[static_cast<size_t>(expert)] <=
+                    std::numeric_limits<int64_t>::max() - elements,
+                "planned staged cumulative intermediate size overflows int64");
+    intermediate_offsets[static_cast<size_t>(expert + 1)] =
+        intermediate_offsets[static_cast<size_t>(expert)] + elements;
+  }
+  const double route_build_ms = ::fused_cpp::profile::elapsed_ms(route_build_begin);
+
+  const auto plan_begin = ::fused_cpp::profile::now();
+  std::vector<ScheduledScratchUnitConfig> scratch_configs;
+  auto ensure_scratch = [&](int64_t core_begin, int64_t threads, int64_t rows, bool stage_is_w13) {
+    int64_t index = -1;
+    for (size_t candidate = 0; candidate < scratch_configs.size(); ++candidate) {
+      if (scratch_configs[candidate].thread_begin == core_begin && scratch_configs[candidate].threads == threads) {
+        index = static_cast<int64_t>(candidate);
+        break;
+      }
+    }
+    if (index < 0) {
+      index = static_cast<int64_t>(scratch_configs.size());
+      ScheduledScratchUnitConfig config;
+      config.thread_begin = core_begin;
+      config.threads = threads;
+      config.external_intermediate = true;
+      config.w2_direct_route = true;
+      config.barrier_only = !stage_is_w13;
+      scratch_configs.push_back(config);
+    }
+    ScheduledScratchUnitConfig& config = scratch_configs[static_cast<size_t>(index)];
+    if (stage_is_w13) {
+      config.max_rows = std::max(config.max_rows, rows);
+      config.fused_packa = true;
+      config.external_intermediate = true;
+      config.w2_direct_route = true;
+      config.barrier_only = false;
+    }
+    return index;
+  };
+
+  const PlannedStageRuntime w13_runtime = build_planned_stage_runtime(
+      "W13", true, w13_execution_mode, tensor_to_i64_vector(w13_task_expert_ids, "w13_task_expert_ids"),
+      tensor_to_i64_vector(w13_task_core_begins, "w13_task_core_begins"),
+      tensor_to_i64_vector(w13_task_threads, "w13_task_threads"),
+      tensor_to_i64_vector(w13_task_dep_offsets, "w13_task_dep_offsets"),
+      tensor_to_i64_vector(w13_task_deps, "w13_task_deps"),
+      tensor_to_i64_vector(w13_task_placement_modes, "w13_task_placement_modes"),
+      tensor_to_i64_vector(w13_task_window_bytes, "w13_task_window_bytes"), routes, active_experts, num_threads,
+      ensure_scratch);
+  const PlannedStageRuntime w2_runtime = build_planned_stage_runtime(
+      "W2", false, w2_execution_mode, tensor_to_i64_vector(w2_task_expert_ids, "w2_task_expert_ids"),
+      tensor_to_i64_vector(w2_task_core_begins, "w2_task_core_begins"),
+      tensor_to_i64_vector(w2_task_threads, "w2_task_threads"),
+      tensor_to_i64_vector(w2_task_dep_offsets, "w2_task_dep_offsets"),
+      tensor_to_i64_vector(w2_task_deps, "w2_task_deps"),
+      tensor_to_i64_vector(w2_task_placement_modes, "w2_task_placement_modes"),
+      tensor_to_i64_vector(w2_task_window_bytes, "w2_task_window_bytes"), routes, active_experts, num_threads,
+      ensure_scratch);
+  const double plan_validate_ms = ::fused_cpp::profile::elapsed_ms(plan_begin);
+
+  at::Tensor output = prepare_moe_output(input, w13_packed, w2_packed, topk_weights, topk_ids, out);
+  const bool use_bf16_route = sve_w2_bf16_route_enabled();
+  const int64_t route_element_bytes =
+      use_bf16_route ? static_cast<int64_t>(sizeof(uint16_t)) : static_cast<int64_t>(sizeof(float));
+  TORCH_CHECK(sve_w2_direct_route_offsets_fit(num_routes, H, w2.n_tile, route_element_bytes),
+              "planned staged direct-route offsets exceed the SVE kernel's int32 byte range");
+  at::Tensor route_out =
+      at::empty({num_routes, H}, input.options().dtype(use_bf16_route ? at::kBFloat16 : at::kFloat));
+  at::Tensor intermediate = at::empty({intermediate_offsets.back()}, input.options());
+
+  uint16_t* output_ptr = bf16_data(output);
+  uint16_t* route_out_bf16_ptr = use_bf16_route ? bf16_data(route_out) : nullptr;
+  float* route_out_f32_ptr = use_bf16_route ? nullptr : route_out.data_ptr<float>();
+  uint16_t* intermediate_ptr = bf16_data(intermediate);
+  const uint16_t* input_ptr = bf16_data_const(input);
+  const uint16_t* w13_ptr = bf16_data_const(w13.tensor);
+  const uint16_t* w2_ptr = bf16_data_const(w2.tensor);
+
+  const auto scratch_begin = ::fused_cpp::profile::now();
+  ScheduledScratchLease scratch_lease = resident_scheduled_scratch_pool().lease(scratch_configs, w13, w2);
+  const std::vector<ScheduledTeamScratch*>& scratches = scratch_lease.scratches();
+  const double scratch_ms = ::fused_cpp::profile::elapsed_ms(scratch_begin);
+
+  const bool use_fused_2d_split = env_flag_enabled("FUSED_CPP_MOE_FUSED_2D_SPLIT");
+  const bool elide_intermediate_zero =
+      env_flag_enabled_by_default("FUSED_CPP_MOE_SVE_ELIDE_INTERMEDIATE_ZERO");
+  const auto w13_begin = ::fused_cpp::profile::now();
+  execute_planned_stage(num_threads, w13_runtime, scratches,
+                        [&](int64_t tid, int64_t, const AsyncTaskRuntime& task,
+                            ScheduledTeamScratch& scratch) {
+                          const int64_t local_tid = tid - task.core_begin;
+                          const int64_t expert = task.expert;
+                          const int64_t rows = task.rows;
+                          const auto& expert_routes = routes[static_cast<size_t>(expert)];
+                          gather_pack_a_reorder_sve_hybrid(
+                              input_ptr, H, expert_routes.data(), top_k, scratch.packed_a.data(),
+                              static_cast<int>(rows), static_cast<int>(w13.K_pad), task.threads, local_tid);
+                          scratch.barrier.wait();
+
+                          uint16_t* expert_intermediate =
+                              intermediate_ptr + intermediate_offsets[static_cast<size_t>(expert)];
+                          if (!elide_intermediate_zero && local_tid == 0) {
+                            std::fill(expert_intermediate,
+                                      expert_intermediate +
+                                          (intermediate_offsets[static_cast<size_t>(expert + 1)] -
+                                           intermediate_offsets[static_cast<size_t>(expert)]),
+                                      static_cast<uint16_t>(0));
+                          }
+                          if (!elide_intermediate_zero) {
+                            scratch.barrier.wait();
+                          }
+                          TeamContext team;
+                          team.group_size = task.threads;
+                          team.local_tid = local_tid;
+                          team.barrier = task.threads > 1 ? &scratch.barrier : nullptr;
+                          const Gemm2DSplitPlan split =
+                              plan_2d_gemm_split(rows, w13.K_pad, w13.N_pad, task.threads, w13.n_tile);
+                          const int64_t window =
+                              task.w13_window_bytes >= 0 ? task.w13_window_bytes : inherited_w13_window;
+                          team_fused_w13_silu_packed_packc_backend(
+                              true, use_fused_2d_split, team, split, scratch.packed_a.data(),
+                              w13_ptr + expert * w13.packed_stride, expert_intermediate, static_cast<int>(rows),
+                              static_cast<int>(w13.K_pad), static_cast<int>(w13.N_pad),
+                              static_cast<int>(w2.K_pad), silu_poly_degree, w13.n_tile, use_w13_split, window);
+                        });
+  const double w13_ms = ::fused_cpp::profile::elapsed_ms(w13_begin);
+
+  const auto w2_begin = ::fused_cpp::profile::now();
+  execute_planned_stage(num_threads, w2_runtime, scratches,
+                        [&](int64_t tid, int64_t, const AsyncTaskRuntime& task,
+                            ScheduledTeamScratch&) {
+                          const int64_t local_tid = tid - task.core_begin;
+                          const int64_t expert = task.expert;
+                          const int64_t rows = task.rows;
+                          TeamContext team;
+                          team.group_size = task.threads;
+                          team.local_tid = local_tid;
+                          team.barrier = nullptr;
+                          const Gemm2DSplitPlan split =
+                              plan_2d_gemm_split(rows, w2.K_pad, w2.N_pad, task.threads, w2.n_tile);
+                          const int64_t window =
+                              task.w2_window_bytes >= 0 ? task.w2_window_bytes : inherited_w2_window;
+                          const uint16_t* expert_intermediate =
+                              intermediate_ptr + intermediate_offsets[static_cast<size_t>(expert)];
+                          const auto& expert_routes = routes[static_cast<size_t>(expert)];
+                          if (use_bf16_route) {
+                            team_w2_packed_sve_direct_bf16_route_backend(
+                                use_fused_2d_split, team, split, expert_intermediate,
+                                w2_ptr + expert * w2.packed_stride, route_out_bf16_ptr, expert_routes.data(),
+                                static_cast<int>(rows), static_cast<int>(w2.K_pad), static_cast<int>(w2.N_pad),
+                                static_cast<int>(H), w2.n_tile, window);
+                          } else {
+                            team_w2_packed_sve_direct_route_backend(
+                                use_fused_2d_split, team, split, expert_intermediate,
+                                w2_ptr + expert * w2.packed_stride, route_out_f32_ptr, expert_routes.data(),
+                                static_cast<int>(rows), static_cast<int>(w2.K_pad), static_cast<int>(w2.N_pad),
+                                static_cast<int>(H), w2.n_tile, window);
+                          }
+                        });
+  const double w2_ms = ::fused_cpp::profile::elapsed_ms(w2_begin);
+
+  const float* topk_w = weights_f32.data_ptr<float>();
+  const int route_merge_unroll = resolve_route_merge_unroll(true);
+  const auto merge_begin = ::fused_cpp::profile::now();
+  run_fixed_threads(num_threads, [&](int64_t tid) {
+    const int64_t rows_per_thread = ceil_div_int64(num_tokens, num_threads);
+    const int64_t token_begin = tid * rows_per_thread;
+    const int64_t token_end = std::min<int64_t>(num_tokens, token_begin + rows_per_thread);
+    merge_route_range(route_out_f32_ptr, route_out_bf16_ptr, topk_w, output_ptr, token_begin, token_end, top_k, H,
+                      use_bf16_route, route_merge_unroll);
+  });
+  const double merge_ms = ::fused_cpp::profile::elapsed_ms(merge_begin);
+
+  if (env_flag_enabled("FUSED_CPP_MOE_STAGE_TIMING")) {
+    std::fprintf(
+        stderr,
+        "[fused_moe_bf16_tiled_planned_staged][stage_timing] threads=%lld experts=%lld active=%lld routes=%lld "
+        "w13_mode=%lld w13_tasks=%zu w13_pool_threads=%lld w2_mode=%lld w2_tasks=%zu w2_pool_threads=%lld "
+        "route_build_ms=%.3f plan_validate_ms=%.3f scratch_ms=%.3f w13_ms=%.3f w2_ms=%.3f merge_ms=%.3f "
+        "e2e_ms=%.3f\n",
+        static_cast<long long>(num_threads), static_cast<long long>(num_experts),
+        static_cast<long long>(active_experts), static_cast<long long>(num_routes),
+        static_cast<long long>(w13_runtime.execution_mode), w13_runtime.tasks.size(),
+        static_cast<long long>(w13_runtime.pool_threads), static_cast<long long>(w2_runtime.execution_mode),
+        w2_runtime.tasks.size(), static_cast<long long>(w2_runtime.pool_threads), route_build_ms, plan_validate_ms,
+        scratch_ms, w13_ms, w2_ms, merge_ms, ::fused_cpp::profile::elapsed_ms(call_begin));
+  }
+  return finalize_moe_output(output, out);
+#endif
 }
 
 at::Tensor fused_moe_bf16_tiled_vllm_staged(

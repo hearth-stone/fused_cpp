@@ -248,6 +248,56 @@ planner 管 eligibility/width，runtime 管实际完成事件。surrogate assign
 可能因真实 contention 改变 group 完成顺序，仍需用 held-out E2E 数据校验，
 不能把其预测值当作 exact dynamic makespan。
 
+#### 2.3.1 实验性全局两阶段计划
+
+production Plan V2 的一个 task 始终是完整 expert，W13 完成后可立即进入该
+expert 的 W2。为隔离这种 pipeline 与 vLLM 风格全局两阶段执行的差异，实验
+entrypoint 也允许把每个 expert $i$ 表示为两个不可抢占 job：
+
+$$
+j_{i,13}=(i,\mathrm{W13}),\qquad
+j_{i,2}=(i,\mathrm{W2}).
+$$
+
+W13 和 W2 分别生成完整 Plan V2，因而可以独立选择线程宽度、fixed interval、
+strict/tail-pool placement 和确定性的 stage window：
+
+$$
+t_{i,13},q_{i,13},g_{13}(M_i,t_{i,13}),
+\qquad
+t_{i,2},q_{i,2},g_2(M_i,t_{i,2}).
+$$
+
+两阶段之间存在全局 barrier。令
+
+$$
+B_{13}=\max_i f_{i,13},
+$$
+
+则
+
+$$
+s_{i,2}\ge B_{13}\quad\forall i.
+$$
+
+因此实验 makespan 为
+
+$$
+C_{\mathrm{2stage}}
+=T_{\mathrm{route/setup}}
++C_{13}
++T_{\mathrm{barrier}}
++C_2
++T_{\mathrm{merge}},
+$$
+
+其中 $C_{13}$ 和 $C_2$ 分别由各自 stage DAG 的 contention event simulator
+计算。`matched` 对照额外约束两个 stage 使用相同 plan；`independent` 候选
+解除该约束。native executor 在进入 W2 前完整结束 W13 worker region，并为
+每个 active expert 只 gather/pack 一次 A；它不采用旧 global N-range queue
+的重复 A pack。该入口只用于 benchmark，不进入 production whole-expert
+candidate space，也不改变默认 runtime。
+
 定义活跃指示函数：
 
 $$
@@ -818,6 +868,7 @@ cold search。
 | Shape 集合 | 所有满足 CPU 容量的整数宽度组合 | empirical backend 只用 profile shape；analytic backend 生成 homogeneous 和至多两种宽度的 shape，再应用 active 工作集规则；dynamic 只从 strict uncertainty band 和最快两个 head shape 派生 | 候选剪枝 |
 | Assignment | 任意 expert-to-resource 调度 | 按 isolated cost 的 LPT | 启发式分配 |
 | Runtime plan contract | task 可携带离散宽度集合、stage/range、resize 边界和动态 placement | Plan V2 native strict/tail_pool；planner 选择 whole-expert placement 和统一 pool width；运行中宽度固定 | 表示支持 boundary regroup，仍无 in-task resize |
+| Stage coupling | W13/W2 可形成任意满足依赖和容量的 stage DAG | production 使用 whole-expert pipeline；独立 W13/W2 Plan V2 加全局 barrier 仅作为实验 entrypoint，matched/independent 两种计划都不进入默认搜索 | production 粒度剪枝与实验对照 |
 | x86 synchronous executor team mapping | expert 可取任意合法整数宽度并形成任意 wave | API 接受 1--256 workers；均衡 route 用 atomic expert queue，active expert 不足时按 route/当前宽度贪心组 team，强偏斜时按 64-row target 形成有序 wave | planner 外的确定性 runtime mapper |
 | Ordering | 任意可行开始时间和顺序 | 每个 lane 的 LPT 顺序 | 顺序剪枝 |
 | Idling | 允许主动等待以避开争用 | planner 可选择 strict 以禁止 pool；一旦选择 tail-pool，fixed lane 可运行时立即启动，released group non-idling 地领取 pooled expert；ready-token 路径仅填充无可运行 expert 的空闲 lane | 受限 non-idling 剪枝 |
@@ -907,6 +958,39 @@ $k_\phi(t)$；公式形式及小 M residual 组合规则没有改变。
 误差集中在宽 team。no-split 基础 USL 拟合得到负 $\alpha$，但序列化
 `phi_pts` 仍直接校正已测线程域；因此 $\alpha,\beta$ 只作为分离拟合参数，
 不得解释为跨机器物理常数或外推到 96T 之外。
+
+#### 8.1.1 全局两阶段的首版 isolated 分解
+
+现有 empirical profile 只直接校准完整 fused expert 的
+$\widehat I_i(t)$，尚无同网格的独立 W13/W2 isolated 表。实验
+`PlannedTwoStagePlanner` 首版先将
+
+$$
+\widehat I_i(t)=O_i(t)+C_i(t)
+$$
+
+分解为：
+
+$$
+\widehat I_{i,13}(t)
+=O_i(t)+\frac{2}{3}C_i(t),
+\qquad
+\widehat I_{i,2}(t)
+=\frac{1}{3}C_i(t).
+$$
+
+$2/3$ 与 $1/3$ 来自 TP4/F512 形状下 W13:W2 的 useful GEMM FLOP 比；
+route/setup、gather 和 pack-A 固定项全部计入 W13，使 combined stage plan
+只收取一次 expert 启动开销。每个 stage 再按其实际 packed-B range 数和
+working-set geometry 拆分 phase，并用原 contention model 推进。operator
+call setup 只在两个 stage 合计时收取一次。
+
+该分解是为了给独立 stage shape 搜索提供可执行的 first-order surrogate，
+不是绝对时间结论。它忽略 SiLU/packC 与 direct-route store 的不同比例，也
+未从完整 expert 样本中辨识 stage-specific residual。要把 global two-stage
+候选加入 production，必须先采集同一 kernel、route、thread、window 网格下的
+独立 W13/W2 timing，并在未参与拟合的 mixed distribution 上验证 stage
+ranking 和 E2E regret。
 
 ### 8.2 实现弱相关的分层 GEMM cost model
 
@@ -2066,6 +2150,36 @@ exact-M EP2 H4096/F2048/E32 split/no-split single/dual 配对表。tiered-hotspo
 1.939 ms（4.99%）。两组 profile 均通过 source/extension hash、isolated
 grid、shape grid 和 phase geometry 一致性检查。
 
+### 9.16 独立 W13/W2 Plan V2 对照
+
+实验验证必须固定 packed weights、SVE GEMM kernel、per-task stage-window
+policy、direct route store 和 merge，只改变 stage coupling。至少比较：
+
+1. production whole-expert Plan V2 auto；
+2. 全局两阶段且 W13/W2 强制使用同一 plan；
+3. 全局两阶段且 W13/W2 独立搜索 strict/tail-pool；
+4. 旧 vLLM global N-range task pool。
+
+正确性覆盖 strict/strict、tail-pool/tail-pool 和两个 stage 使用不同线程宽度
+的组合，并要求与 production 输出逐元素一致到现有 BF16 容差。性能验证使用
+AmazonC5192Cores NUMA0 CPU `0-95`、256 local experts、TopK=6 和默认论文输入
+集；同时记录 route/setup、W13、global barrier、W2、merge、E2E、cold planning
+time、预测值及实测值。只有 independent staged 在多个未参与校准的 workload
+上稳定优于 matched staged，才说明 stage-specific planning 有效；只有它再
+稳定优于 whole-expert production，才有证据解除 production stage-coupling
+剪枝。第一版 empirical stage 分解尚未通过这些测试前，实验入口保持非默认。
+
+2026-07-29 在该口径下完成 NUMA0 CPU `0-95` 的 9 个 workload 验证。关闭
+ready-token merge 后，matched global staging 在 9/9 case 慢于 whole-expert，
+中位差 5.23%，范围 2.08%--11.77%；independent staging 也在 9/9 case
+落后，中位差 4.23%，范围 2.29%--6.26%。但在 W13/W2 实际选择不同计划的
+active-set-128、long/short bimodal 和 uniform 中，independent 相对 matched
+分别提升 4.24%、3.28% 和 7.52%。因此 stage-specific planning 的收益成立，
+但不足以补偿全局 barrier 和 expert pipeline/cache lifetime 损失。首版 stage
+surrogate 对 independent E2E 的绝对时间 MAPE 为 12.8%、最大误差 34.1%，
+不能进入 production。完整方法、stage timing 和复测数据见
+`optimizations/fused_moe_sve/results/amazon_192c_planned_two_stage.md`。
+
 ## 10. 同步规则
 
 发生以下任一变化时，必须同步更新本文档：
@@ -2134,3 +2248,4 @@ grid、shape grid 和 phase geometry 一致性检查。
 | 2026-07-26 | v0.40 | 在 AmazonC5192Cores 的 TP4/F512 96-core rank 上用 9 个默认 workload 验证 isolated CP-SAT oracle，并与双 NUMA 当前 runtime 配对最大值比较。active-set-8 与 long/short bimodal 分别证明 `7.9300/6.1316 ms` 最优；当前 bimodal tail-pool 的 isolated regret 为 0%，但 wall time 仍高 78.3%，确认 v1 只能界定 isolated scheduling gap，不能充当无资源容量约束的硬件性能证书。 |
 | 2026-07-27 | v0.41 | TP/EP evaluator 增加跨 rank lifetime phase 转换：多 rank 活跃时使用 concurrent-rank profile，倒数第二个 rank 完成后按当前 phase 剩余比例切换至 matching single-rank companion；不重放 setup/dependency，不扩大 planner 候选或改变剪枝，缺少 companion 时保守回退旧上界。 |
 | 2026-07-27 | v0.42 | 用当前 JIT exact-M kernel 生成 32-core/rank EP2 H4096/F2048/E32 single/dual 配对表，并在 tiered-hotspot 上验证 lifetime 转换将 55.605 ms 修正为 54.770 ms（-1.50%）；同步刷新 8-core standalone 与 192-core TP4/F512 single/dual empirical profiles。 |
+| 2026-07-29 | v0.43 | 增加 benchmark-only 全局两阶段 Plan V2：W13/W2 可独立搜索 strict/tail-pool shape 和确定性 stage window，以显式全局 barrier 连接；增加 matched 对照和首版 `setup+2/3 compute` 与 `1/3 compute` stage surrogate。192-core NUMA0 的 9-case 验证中 independent 相对 matched 在三个异构 stage-plan case 提升 3.28%--7.52%，但仍在 9/9 case 落后 whole-expert 2.29%--6.26%，因此保持实验入口且默认 runtime 不变。 |

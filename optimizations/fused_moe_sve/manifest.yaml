@@ -357,6 +357,40 @@ features:
       --distribution hot-topk --team-threads 16
       --warmup 3 --runs 11
 
+  - id: dispatch.planned_global_stages
+    part: dispatch
+    status: experimental
+    implementation: >-
+      cpu_moe_schedule_optimization/planners/interval_planner.py,
+      cpu_moe_schedule_optimization/cost_model/phase_model.py,
+      csrc/moe/arm/common/fused_moe_bf16_tiled.cpp, and
+      src/fused_cpp/moe/bf16_tiled.py
+    hypothesis: >-
+      Planning W13 and W2 as independent whole-expert Plan V2 stages can use
+      different strict/tail-pool shapes and stage windows to reduce each
+      stage's tail and contention. Packing A once per expert and retaining the
+      production GEMM/store/merge kernels isolates that benefit from the
+      repeated A-pack overhead of the global N-range task-pool baseline, while
+      the mandatory global barrier measures the lost whole-expert pipelining.
+    depends_on:
+      - dispatch.per_task_stage_windows
+      - store.w2_direct_route
+    conflicts_with:
+      - dispatch.global_stage_task_pool
+      - merge.async_ready_tokens
+    correctness: >-
+      PYTHONPATH=src .venv/bin/python -m pytest -q
+      tests/test_moe_cost_model_v2.py
+      tests/test_fused_moe_bf16_tiled.py
+      -k 'planned_two_stage_planner or plan_v2_strict_and_tail_pool'
+    benchmark: >-
+      numactl --cpunodebind=0 --membind=0 taskset -c 0-95
+      .venv/bin/python
+      optimizations/fused_moe_sve/benchmarks/bench_vllm_staged_schedule.py
+      --preset moe256-long-short-bimodal --production-profile
+      cpu_moe_schedule_optimization/cost_model/profiles/contention_async_amazon_c5_192c_dual_numa_tp4_sve_F512_E256_splitw13_schema_v2_xbyak_exactm_20260726.json
+      --route-dtype bf16 --warmup 3 --runs 11
+
   - id: dispatch.serial_weight_windows
     part: dispatch
     status: experimental
@@ -1011,6 +1045,17 @@ variants:
       - store.w2_direct_route
       - merge.sve_weighted_reduce
     entrypoint: fused_moe_bf16_tiled_vllm_staged
+    status: experimental
+
+  - id: sve_planned_global_two_stage
+    features:
+      - dispatch.planned_global_stages
+      - dispatch.per_task_stage_windows
+      - store.w2_direct_route
+      - merge.sve_weighted_reduce
+    entrypoint: >-
+      fused_moe_bf16_tiled_planned_staged(
+      w13_plan=AsyncMoEPlanV2(...), w2_plan=AsyncMoEPlanV2(...))
     status: experimental
 
   - id: sve_static_16t_to_4x4t

@@ -60,6 +60,14 @@ class PlannerCostModel(Protocol):
 
     def dag_makespan(self, tasks) -> float: ...
 
+    def stage_T_iso(self, stage: str, routes: int, threads: int) -> float: ...
+
+    def stage_dag_makespan(self, stage: str, tasks) -> float: ...
+
+    def task_stage_bytes(self, stage: str, routes: int, threads: int) -> int: ...
+
+    def stage_window_bytes_per_worker(self, stage: str, threads: int, routes: int | None = None) -> int: ...
+
     def supports_shape(self, shape) -> bool: ...
 
     def relative_uncertainty(self, routes: int, shape) -> float: ...
@@ -120,7 +128,11 @@ class IntervalPlanner:
         native_cold_planner: bool | None = None,
         planner_threads: int | None = None,
         task_stage_window_policy: TaskStageWindowPolicy | None = None,
+        stage: str | None = None,
     ):
+        if stage not in {None, "w13", "w2"}:
+            raise ValueError(f"stage must be None, 'w13', or 'w2', got {stage!r}")
+        self.stage = stage
         self.task_stage_window_policy = task_stage_window_policy
         if task_stage_window_policy is None:
             self.model = model
@@ -153,10 +165,15 @@ class IntervalPlanner:
             raise ProfileCompatibilityError(
                 f"no supported shape covers {self.num_cores} cores with widths {self.widths}"
             )
-        self._native_planner = self._create_native_planner(
-            native_cold_planner=native_cold_planner,
-            planner_threads=planner_threads,
-        )
+        if self.stage is None:
+            self._native_planner = self._create_native_planner(
+                native_cold_planner=native_cold_planner,
+                planner_threads=planner_threads,
+            )
+        else:
+            if native_cold_planner is True:
+                raise ValueError("native cold planner does not yet support stage-specific scoring")
+            self._native_planner = None
 
     def _create_native_planner(
         self,
@@ -224,10 +241,10 @@ class IntervalPlanner:
             _, routes = experts[index]
             lane = min(
                 range(lane_count),
-                key=lambda candidate: load[candidate] + self.model.T_iso(routes, lanes[candidate][1]),
+                key=lambda candidate: load[candidate] + self._task_time(routes, lanes[candidate][1]),
             )
             lane_experts[lane].append(index)
-            load[lane] += self.model.T_iso(routes, lanes[lane][1])
+            load[lane] += self._task_time(routes, lanes[lane][1])
         return lane_experts
 
     def _build_tasks(self, experts, lanes, lane_experts):
@@ -243,7 +260,17 @@ class IntervalPlanner:
         return tasks
 
     def _score(self, tasks) -> float:
-        return self.model.dag_makespan([(routes, threads, deps) for _, routes, _, threads, deps in tasks])
+        return self._dag_makespan([(routes, threads, deps) for _, routes, _, threads, deps in tasks])
+
+    def _task_time(self, routes: int, threads: int) -> float:
+        if self.stage is None:
+            return self.model.T_iso(routes, threads)
+        return self.model.stage_T_iso(self.stage, routes, threads)
+
+    def _dag_makespan(self, tasks) -> float:
+        if self.stage is None:
+            return self.model.dag_makespan(tasks)
+        return self.model.stage_dag_makespan(self.stage, tasks)
 
     def _uncertainty(
         self,
@@ -263,12 +290,20 @@ class IntervalPlanner:
         return makespan * relative / math.sqrt(waves * self.model.profile_runs)
 
     def _task_max_stage_bytes(self, routes: int, threads: int) -> int:
+        if self.stage is not None:
+            resolver = getattr(self.model, "task_stage_bytes", None)
+            if callable(resolver):
+                return int(resolver(self.stage, routes, threads))
         resolver = getattr(self.model, "task_max_stage_bytes", None)
         if callable(resolver):
             return int(resolver(routes, threads))
         return int(self.model.max_stage_bytes)
 
     def _task_window_bytes_per_worker(self, routes: int, threads: int) -> int:
+        if self.stage is not None:
+            resolver = getattr(self.model, "stage_window_bytes_per_worker", None)
+            if callable(resolver):
+                return int(resolver(self.stage, threads, routes))
         resolver = self.model.window_bytes_per_worker
         if self.task_stage_window_policy is not None:
             return int(resolver(threads, routes))
@@ -277,7 +312,10 @@ class IntervalPlanner:
     def active_working_set_bytes(self, shape, tasks=None) -> int:
         if tasks is None:
             active_lanes = len(shape)
-            return active_lanes * self.model.max_stage_bytes
+            if self.stage is None:
+                return active_lanes * self.model.max_stage_bytes
+            stage_bytes = self._task_max_stage_bytes(1, max(int(width) for width in shape))
+            return active_lanes * stage_bytes
         lane_bytes: dict[tuple[int, int], int] = {}
         for _, routes, core, threads, _ in tasks:
             resource = (core, threads)
@@ -289,6 +327,10 @@ class IntervalPlanner:
 
     def window_bytes_per_worker(self, shape, tasks=None) -> tuple[int, ...]:
         if tasks is None:
+            if self.stage is not None:
+                return tuple(
+                    self.model.stage_window_bytes_per_worker(self.stage, int(width)) for width in shape
+                )
             return tuple(self.model.window_bytes_per_worker(int(width)) for width in shape)
         lane_windows: dict[tuple[int, int], int] = {}
         for _, routes, core, threads, _ in tasks:
@@ -300,6 +342,8 @@ class IntervalPlanner:
         return tuple(lane_windows[resource] for resource in sorted(lane_windows))
 
     def _uses_full_workload_anchor(self, experts, shape) -> bool:
+        if self.stage is not None:
+            return False
         eligible = (
             self.model.has_full_workload_anchors
             and len(experts) == self.model.local_experts
@@ -445,7 +489,7 @@ class IntervalPlanner:
             _, routes, _, threads, _ = tasks[task_id]
             dependencies = resolved_dependencies[task_id]
             start = max((isolated_finish[dependency] for dependency in dependencies), default=0.0)
-            finish = start + self.model.T_iso(routes, threads)
+            finish = start + self._task_time(routes, threads)
             sim_dependencies = [fixed_sim_ids[dependency] for dependency in dependencies]
             fixed_sim_ids[task_id] = len(simulation_tasks)
             isolated_finish[task_id] = finish
@@ -482,7 +526,7 @@ class IntervalPlanner:
             else:
                 dependencies = [previous]
             sim_id = len(simulation_tasks)
-            finish = available_ns + self.model.T_iso(routes, pool_threads)
+            finish = available_ns + self._task_time(routes, pool_threads)
             simulation_tasks.append((routes, pool_threads, dependencies))
             intervals.append((available_ns, finish))
             previous_pool_task[group] = sim_id
@@ -519,7 +563,7 @@ class IntervalPlanner:
             pool_threads=pool_threads,
             max_pooled_routes=max_pooled_routes,
         )
-        makespan = self.model.dag_makespan(simulation_tasks)
+        makespan = self._dag_makespan(simulation_tasks)
         shape = strict_candidate["shape"]
         uncertainty = self._uncertainty(
             experts,
@@ -652,6 +696,7 @@ class IntervalPlanner:
         )
         return {
             "plan_version": _ASYNC_PLAN_VERSION,
+            "stage": self.stage,
             "shape": tuple(selected["shape"]),
             "execution_mode": selected["execution_mode"],
             "tail_pool_threads": selected["tail_pool_threads"],
@@ -849,6 +894,63 @@ class IntervalPlanner:
             "task_range_granularities": [_ASYNC_FULL_EXPERT_RANGE] * num_tasks,
             "task_w13_window_bytes": task_w13_window_bytes,
             "task_w2_window_bytes": task_w2_window_bytes,
+        }
+
+
+class PlannedTwoStagePlanner:
+    """Independently search W13 and W2 expert-team plans.
+
+    The returned plans retain the Plan V2 bridge format, but their task
+    lifetimes are stage-local and a global W13-to-W2 barrier is explicit.
+    """
+
+    def __init__(
+        self,
+        model: PlannerCostModel,
+        num_cores: int,
+        widths: Sequence[int] | None = None,
+        *,
+        cpu_ids: Sequence[int] | None = None,
+        shapes: Sequence[Sequence[int]] | None = None,
+        task_stage_window_policy: TaskStageWindowPolicy | None = None,
+    ):
+        common = {
+            "widths": widths,
+            "cpu_ids": cpu_ids,
+            "shapes": shapes,
+            "native_cold_planner": False,
+            "task_stage_window_policy": task_stage_window_policy,
+        }
+        self.model = model
+        self.w13_planner = IntervalPlanner(model, num_cores, stage="w13", **common)
+        self.w2_planner = IntervalPlanner(model, num_cores, stage="w2", **common)
+
+    def plan(
+        self,
+        experts: List[Tuple[int, int]],
+        *,
+        dynamic_tail_pool: bool = True,
+        tail_pool_max_routes: int = 12,
+        forced_tail_pool_threads: int | None = None,
+    ) -> Dict[str, object]:
+        options = {
+            "dynamic_tail_pool": dynamic_tail_pool,
+            "tail_pool_max_routes": tail_pool_max_routes,
+            "forced_tail_pool_threads": forced_tail_pool_threads,
+        }
+        w13 = self.w13_planner.plan(experts, **options)
+        w2 = self.w2_planner.plan(experts, **options)
+        call_setup_ns = float(getattr(self.model, "call_setup_ns", 0.0))
+        stage_barrier_ns = 0.0
+        return {
+            "plan_version": _ASYNC_PLAN_VERSION,
+            "execution_mode": "planned_staged",
+            "w13": w13,
+            "w2": w2,
+            "call_setup_ns": call_setup_ns,
+            "stage_barrier_ns": stage_barrier_ns,
+            "makespan_ns": call_setup_ns + w13["makespan_ns"] + stage_barrier_ns + w2["makespan_ns"],
+            "uncertainty_ns": w13["uncertainty_ns"] + w2["uncertainty_ns"],
         }
 
 

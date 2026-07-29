@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare production, team-transition, and vLLM-style MoE schedules."""
+"""Compare production, independently planned stages, and vLLM-style MoE schedules."""
 
 from __future__ import annotations
 
@@ -29,6 +29,7 @@ from fused_cpp.moe import (  # noqa: E402
     AsyncMoEPlanV2,
     fused_moe_bf16_tiled_async,
     fused_moe_bf16_tiled_async_plan,
+    fused_moe_bf16_tiled_planned_staged,
     fused_moe_bf16_tiled_vllm_staged,
     prepare_fused_moe_bf16_tiled_weights,
 )
@@ -44,6 +45,8 @@ STATIC_STAGE_WINDOW_VARIANT = "production_auto_stage_windows"
 DYNAMIC_POOL_VARIANT = "dynamic_16t_to_4t_pool"
 STATIC_SPLIT_VARIANT = "static_16t_to_4x4t"
 VLLM_VARIANT = "vllm_staged"
+MATCHED_STAGED_VARIANT = "planned_staged_matched"
+FINE_STAGED_VARIANT = "planned_staged_independent"
 
 
 def parse_args() -> argparse.Namespace:
@@ -354,10 +357,13 @@ def make_production_schedule(
     AsyncMoEPlanV2,
     AsyncMoEPlanV2 | None,
     AsyncMoEPlanV2 | None,
+    tuple[AsyncMoEPlanV2, AsyncMoEPlanV2],
+    tuple[AsyncMoEPlanV2, AsyncMoEPlanV2],
     dict[str, object],
     Callable[[int, int], float],
 ]:
     from phase_model import ContentionCostModel
+    from interval_planner import PlannedTwoStagePlanner
     from planned_moe import PlannedMoE
 
     model = ContentionCostModel(profile)
@@ -433,6 +439,24 @@ def make_production_schedule(
             tail_pool_max_routes=tail_pool_max_routes,
         )
         tail_pool_plan = AsyncMoEPlanV2.from_dict(tail_pool_spec["bridge"])
+    matched_staged_plan = static_stage_window_plan or auto_plan
+    matched_staged_plans = (matched_staged_plan, matched_staged_plan)
+    stage_window_policy = (
+        AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V1 if static_stage_windows else None
+    )
+    staged_planner = PlannedTwoStagePlanner(
+        model,
+        threads,
+        cpu_ids=cpu_ids,
+        task_stage_window_policy=stage_window_policy,
+    )
+    begin = time.perf_counter_ns()
+    staged_spec = staged_planner.plan(counts)
+    staged_plan_ns = time.perf_counter_ns() - begin
+    fine_staged_plans = (
+        AsyncMoEPlanV2.from_dict(staged_spec["w13"]["bridge"]),
+        AsyncMoEPlanV2.from_dict(staged_spec["w2"]["bridge"]),
+    )
     schedule = strict_plan.legacy_schedule()
     return (
         schedule,
@@ -440,6 +464,8 @@ def make_production_schedule(
         auto_plan,
         static_stage_window_plan,
         tail_pool_plan,
+        matched_staged_plans,
+        fine_staged_plans,
         {
             "profile": str(profile),
             "profile_extension_sha256": policy.extension_sha256,
@@ -455,6 +481,19 @@ def make_production_schedule(
             "cold_plan_ms": cold_plan_ns / 1.0e6,
             "warm_plan_ms": warm_plan_ns / 1.0e6,
             "static_stage_windows": static_stage_window_metadata,
+            "planned_staged": {
+                "matched_source": (
+                    STATIC_STAGE_WINDOW_VARIANT if static_stage_window_plan is not None else AUTO_VARIANT
+                ),
+                "plan_ms": staged_plan_ns / 1.0e6,
+                "predicted_ms": staged_spec["makespan_ns"] / 1.0e6,
+                "w13_shape": list(staged_spec["w13"]["shape"]),
+                "w13_execution_mode": staged_spec["w13"]["execution_mode"],
+                "w13_tail_pool_threads": staged_spec["w13"]["tail_pool_threads"],
+                "w2_shape": list(staged_spec["w2"]["shape"]),
+                "w2_execution_mode": staged_spec["w2"]["execution_mode"],
+                "w2_tail_pool_threads": staged_spec["w2"]["tail_pool_threads"],
+            },
         },
         model.T_iso,
     )
@@ -507,6 +546,8 @@ def main() -> int:
     auto_plan: AsyncMoEPlanV2 | None = None
     static_stage_window_plan: AsyncMoEPlanV2 | None = None
     tail_pool_plan: AsyncMoEPlanV2 | None = None
+    matched_staged_plans: tuple[AsyncMoEPlanV2, AsyncMoEPlanV2] | None = None
+    fine_staged_plans: tuple[AsyncMoEPlanV2, AsyncMoEPlanV2] | None = None
     if args.production_profile is None:
         baseline_variant = "fixed_team_async"
         schedule = make_fixed_team_schedule(
@@ -524,6 +565,8 @@ def main() -> int:
             auto_plan,
             static_stage_window_plan,
             tail_pool_plan,
+            matched_staged_plans,
+            fine_staged_plans,
             planner_metadata,
             iso_time_ns,
         ) = make_production_schedule(
@@ -558,6 +601,8 @@ def main() -> int:
         variant_names.append(STATIC_SPLIT_VARIANT)
     if args.dynamic_short_pool:
         variant_names.append(DYNAMIC_POOL_VARIANT)
+    if matched_staged_plans is not None:
+        variant_names.extend((MATCHED_STAGED_VARIANT, FINE_STAGED_VARIANT))
     variant_names.append(VLLM_VARIANT)
     variants = tuple(variant_names)
     ready_token_merge = args.production_ready_token_merge
@@ -590,6 +635,20 @@ def main() -> int:
     outputs = {name: torch.empty_like(hidden) for name in variants}
 
     def run(name: str) -> torch.Tensor:
+        if name in {MATCHED_STAGED_VARIANT, FINE_STAGED_VARIANT}:
+            selected = matched_staged_plans if name == MATCHED_STAGED_VARIANT else fine_staged_plans
+            assert selected is not None
+            return fused_moe_bf16_tiled_planned_staged(
+                hidden,
+                packed,
+                topk_weights,
+                topk_ids,
+                selected[0],
+                selected[1],
+                global_num_experts=args.experts,
+                w13_split=w13_split,
+                out=outputs[name],
+            )
         if name == DYNAMIC_POOL_VARIANT:
             assert tail_pool_plan is not None
             return fused_moe_bf16_tiled_async_plan(

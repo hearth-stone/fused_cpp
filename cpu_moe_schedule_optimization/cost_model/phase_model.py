@@ -275,6 +275,15 @@ class ContentionCostModel:
         _, w13_bytes, _, w2_bytes = self._task_stage_geometry(int(routes), int(threads))
         return max(w13_bytes, w2_bytes)
 
+    def task_stage_bytes(self, stage: str, routes: int, threads: int) -> int:
+        w13_ranges, w13_bytes, w2_ranges, w2_bytes = self._task_stage_geometry(int(routes), int(threads))
+        del w13_ranges, w2_ranges
+        if stage == "w13":
+            return w13_bytes
+        if stage == "w2":
+            return w2_bytes
+        raise ValueError(f"stage must be 'w13' or 'w2', got {stage!r}")
+
     def window_bytes_per_worker(self, threads: int, routes: int | None = None) -> int:
         """Maximum tile-aligned packed-B owner stripe across W13 and W2."""
         if routes is None:
@@ -286,6 +295,26 @@ class ContentionCostModel:
             self._owner_range_bytes(w13_bytes, self.w13_tile_bytes, threads),
             self._owner_range_bytes(w2_bytes, self.w2_tile_bytes, threads),
         )
+
+    def stage_window_bytes_per_worker(self, stage: str, threads: int, routes: int | None = None) -> int:
+        """Tile-aligned packed-B owner stripe for one named GEMM stage."""
+        if stage == "w13":
+            range_bytes = (
+                self.w13_chunk_bytes
+                if routes is None
+                else self._task_stage_geometry(int(routes), int(threads))[1]
+            )
+            tile_bytes = self.w13_tile_bytes
+        elif stage == "w2":
+            range_bytes = (
+                self.w2_chunk_bytes
+                if routes is None
+                else self._task_stage_geometry(int(routes), int(threads))[3]
+            )
+            tile_bytes = self.w2_tile_bytes
+        else:
+            raise ValueError(f"stage must be 'w13' or 'w2', got {stage!r}")
+        return self._owner_range_bytes(range_bytes, tile_bytes, threads)
 
     def can_use_full_workload_anchor(self, routes: int, shape) -> bool:
         if not self.has_full_workload_anchors:
@@ -695,6 +724,30 @@ class ContentionCostModel:
             phases.append((w2_phase, w2_bytes))
         return [(duration, workset) for duration, workset in phases if duration > 0]
 
+    def _task_stage_phases(self, stage: str, routes: int, threads: int) -> list[tuple[float, int]]:
+        isolated = self.T_iso(routes, threads)
+        overhead = min(self._O.get(threads, 0.0), isolated * 0.9)
+        compute = max(isolated - overhead, 0.0)
+        w13_ranges, w13_bytes, w2_ranges, w2_bytes = self._task_stage_geometry(routes, threads)
+        phases: list[tuple[float, int]] = []
+        if stage == "w13":
+            if overhead > 0:
+                phases.append((overhead, 0))
+            w13_ranges = max(w13_ranges, 1)
+            duration = compute * (2.0 / 3.0) / w13_ranges
+            phases.extend((duration, w13_bytes) for _ in range(w13_ranges))
+        elif stage == "w2":
+            w2_ranges = max(w2_ranges, 1)
+            duration = compute / 3.0 / w2_ranges
+            phases.extend((duration, w2_bytes) for _ in range(w2_ranges))
+        else:
+            raise ValueError(f"stage must be 'w13' or 'w2', got {stage!r}")
+        return [(duration, workset) for duration, workset in phases if duration > 0]
+
+    def stage_T_iso(self, stage: str, routes: int, threads: int) -> float:
+        """Isolated duration assigned to one global GEMM stage."""
+        return sum(duration for duration, _ in self._task_stage_phases(stage, routes, threads))
+
     def _working_set_derate(
         self,
         active: list[int],
@@ -719,16 +772,16 @@ class ContentionCostModel:
             max(threads[index] for index in compute_active),
         )
 
-    def _sim_staged(self, tasks) -> float:
+    def _sim_phases(self, tasks, phase_builder, *, setup_ns: float) -> float:
         count = len(tasks)
         routes = [int(value) for value, _, _ in tasks]
         threads = [int(value) for _, value, _ in tasks]
-        phases = [self._task_phases(route_count, team) for route_count, team, _ in tasks]
+        phases = [phase_builder(route_count, team) for route_count, team, _ in tasks]
         phase_index = [0] * count
         remaining = [task_phases[0][0] for task_phases in phases]
         dependency_count, successors, started = self._dag_state(tasks)
         finished = [False] * count
-        wall = self.call_setup_ns
+        wall = setup_ns
         guard = 0
         max_events = sum(len(task_phases) for task_phases in phases) + count + 2
         while not all(finished):
@@ -759,6 +812,17 @@ class ContentionCostModel:
                     if dependency_count[successor] == 0:
                         started[successor] = True
         return wall
+
+    def _sim_staged(self, tasks) -> float:
+        return self._sim_phases(tasks, self._task_phases, setup_ns=self.call_setup_ns)
+
+    def stage_dag_makespan(self, stage: str, tasks) -> float:
+        """Model one independently scheduled stage inside an already active call."""
+        return self._sim_phases(
+            tasks,
+            lambda routes, threads: self._task_stage_phases(stage, routes, threads),
+            setup_ns=0.0,
+        )
 
     def dag_makespan_with_model_switch(self, tasks, switch_ns: float, next_model: "ContentionCostModel") -> float:
         """Continue an in-flight DAG with another rank-contention model.

@@ -74,6 +74,17 @@ at::Tensor fused_moe_bf16_tiled_async_plan_v2(
     int64_t silu_poly_degree, int64_t gemm_backend, int64_t backend_n_tile, int64_t w13_split,
     int64_t weight_window_bytes, c10::optional<at::Tensor> out,
     c10::optional<at::Tensor> task_w13_window_bytes, c10::optional<at::Tensor> task_w2_window_bytes);
+at::Tensor fused_moe_bf16_tiled_planned_staged(
+    at::Tensor input, at::Tensor w13_packed, int64_t w13_K, int64_t w13_N, at::Tensor w2_packed, int64_t w2_K,
+    int64_t w2_N, at::Tensor topk_weights, at::Tensor topk_ids, at::Tensor w13_task_expert_ids,
+    at::Tensor w13_task_core_begins, at::Tensor w13_task_threads, at::Tensor w13_task_dep_offsets,
+    at::Tensor w13_task_deps, int64_t w13_execution_mode, at::Tensor w13_task_placement_modes,
+    at::Tensor w13_task_window_bytes, at::Tensor w2_task_expert_ids, at::Tensor w2_task_core_begins,
+    at::Tensor w2_task_threads, at::Tensor w2_task_dep_offsets, at::Tensor w2_task_deps, int64_t w2_execution_mode,
+    at::Tensor w2_task_placement_modes, at::Tensor w2_task_window_bytes,
+    c10::optional<at::Tensor> thread_cpu_ids, int64_t num_threads, int64_t global_num_experts, bool fuse_silu,
+    int64_t silu_poly_degree, int64_t gemm_backend, int64_t backend_n_tile, int64_t w13_split,
+    int64_t weight_window_bytes, c10::optional<at::Tensor> out);
 at::Tensor fused_moe_bf16_tiled_vllm_staged(
     at::Tensor input, at::Tensor w13_packed, int64_t w13_K, int64_t w13_N, at::Tensor w2_packed, int64_t w2_K,
     int64_t w2_N, at::Tensor topk_weights, at::Tensor topk_ids, c10::optional<at::Tensor> thread_cpu_ids,

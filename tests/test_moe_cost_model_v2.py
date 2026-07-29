@@ -14,7 +14,7 @@ COST_MODEL = ROOT / "cpu_moe_schedule_optimization" / "cost_model"
 PLANNERS = ROOT / "cpu_moe_schedule_optimization" / "planners"
 sys.path[:0] = [str(COST_MODEL), str(PLANNERS)]
 
-from interval_planner import IntervalPlanner, PolicyAwarePlanner  # noqa: E402
+from interval_planner import IntervalPlanner, PlannedTwoStagePlanner, PolicyAwarePlanner  # noqa: E402
 from iso_formula import IsoFormula, fit_from_measurements  # noqa: E402
 from phase_model import ContentionCostModel  # noqa: E402
 import planned_moe as planned_moe_module  # noqa: E402
@@ -111,6 +111,59 @@ class _DeterministicTailPoolModel:
 
     def window_bytes_per_worker(self, threads: int) -> int:
         return threads
+
+
+class _DeterministicStageModel(_DeterministicTailPoolModel):
+    call_setup_ns = 3.0
+
+    def stage_T_iso(self, stage: str, routes: int, threads: int) -> float:
+        del routes
+        if stage == "w13":
+            return {1: 200.0, 2: 55.0, 4: 30.0}[threads]
+        if stage == "w2":
+            return {1: 20.0, 2: 30.0, 4: 50.0}[threads]
+        raise ValueError(stage)
+
+    def stage_dag_makespan(self, stage: str, tasks) -> float:
+        finish: list[float] = []
+        for routes, threads, dependencies in tasks:
+            start = max((finish[dependency] for dependency in dependencies), default=0.0)
+            finish.append(start + self.stage_T_iso(stage, routes, threads))
+        return max(finish, default=0.0)
+
+    def task_stage_bytes(self, stage: str, routes: int, threads: int) -> int:
+        del routes
+        return threads * (2 if stage == "w13" else 1)
+
+    def stage_window_bytes_per_worker(
+        self,
+        stage: str,
+        threads: int,
+        routes: int | None = None,
+    ) -> int:
+        del routes
+        return threads * (2 if stage == "w13" else 1)
+
+
+def test_planned_two_stage_planner_can_choose_different_stage_shapes() -> None:
+    planner = PlannedTwoStagePlanner(
+        _DeterministicStageModel(),
+        num_cores=4,
+        widths=(1, 2, 4),
+        shapes=((4,), (2, 2), (1, 1, 1, 1)),
+    )
+
+    selected = planner.plan([(expert, 100) for expert in range(4)], dynamic_tail_pool=False)
+
+    assert selected["w13"]["shape"] == (2, 2)
+    assert selected["w2"]["shape"] == (1, 1, 1, 1)
+    assert selected["w13"]["bridge"]["num_threads"] == 4
+    assert selected["w2"]["bridge"]["num_threads"] == 4
+    assert selected["makespan_ns"] == pytest.approx(
+        selected["call_setup_ns"]
+        + selected["w13"]["makespan_ns"]
+        + selected["w2"]["makespan_ns"]
+    )
 
 
 def test_planner_selects_tail_pool_width_and_can_disable_dynamic() -> None:
