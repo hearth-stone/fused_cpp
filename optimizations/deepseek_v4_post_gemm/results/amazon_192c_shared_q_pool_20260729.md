@@ -1,5 +1,10 @@
 # DeepSeek V4 Post-GEMM Shared Q Worker Pool
 
+> Historical two-cursor result. The later opt-in MN-group candidate supersedes
+> the small-M analysis in this document; see
+> `amazon_192c_q_gemm_mn_groups_20260729.md`. The production default remains
+> the two-cursor policy recorded here.
+
 ## Configuration
 
 - Date: 2026-07-29

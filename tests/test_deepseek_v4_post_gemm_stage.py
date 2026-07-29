@@ -62,13 +62,17 @@ def _make_compressor_state(
     )
 
 
-def _make_inputs(seed: int = 0, num_tokens: int = 6) -> PostGemmStageInputs:
+def _make_inputs(
+    seed: int = 0,
+    num_tokens: int = 6,
+    *,
+    q_lora_rank: int = 8,
+    main_num_heads: int = 2,
+    main_head_dim: int = 6,
+    indexer_num_heads: int = 4,
+    indexer_head_dim: int = 6,
+) -> PostGemmStageInputs:
     torch.manual_seed(seed)
-    q_lora_rank = 8
-    main_num_heads = 2
-    main_head_dim = 6
-    indexer_num_heads = 4
-    indexer_head_dim = 6
     rope_dim = 2
     block_size = 4
     num_blocks = (num_tokens + block_size - 1) // block_size
@@ -440,6 +444,71 @@ def test_post_gemm_shared_q_pool_matches_sequential(monkeypatch) -> None:
         sequential_inputs.indexer_compressor.state_cache,
         "shared Q pool indexer state_cache",
     )
+
+
+@pytest.mark.skipif(
+    platform.machine() not in ("aarch64", "arm64") or not _HAS_DEEPSEEK_V4_POST_GEMM_STAGE_PREPACKED,
+    reason="post-GEMM Q MN groups require the AArch64 prepacked C++ stage",
+)
+def test_post_gemm_q_mn_groups_match_single_n_group_per_gemm(monkeypatch) -> None:
+    """N-striped Q GEMMs must preserve outputs, including a partial M8 panel."""
+    shape = {
+        "num_tokens": 25,
+        "q_lora_rank": 16,
+        "main_num_heads": 8,
+        "main_head_dim": 16,
+        "indexer_num_heads": 8,
+        "indexer_head_dim": 16,
+    }
+    single_group_inputs = _make_inputs(seed=29, **shape)
+    mn_group_inputs = _make_inputs(seed=29, **shape)
+    weights = prepare_deepseek_v4_post_gemm_weights(
+        mn_group_inputs.main_wq_b_weight,
+        mn_group_inputs.indexer_wq_b_weight,
+    )
+    previous_threads = torch.get_num_threads()
+    torch.set_num_threads(7)
+    try:
+        monkeypatch.setenv("FUSED_CPP_POST_GEMM_M8_ALIGNED", "1")
+        monkeypatch.setenv("FUSED_CPP_POST_GEMM_SHARED_Q_POOL", "1")
+        monkeypatch.setenv("FUSED_CPP_POST_GEMM_N_GROUPS", "2")
+        single_q, single_topk = post_gemm_parallel_stage_cpp_prepacked(single_group_inputs, weights)
+        monkeypatch.setenv("FUSED_CPP_POST_GEMM_N_GROUPS", "8")
+        mn_q, mn_topk = post_gemm_parallel_stage_cpp_prepacked(mn_group_inputs, weights)
+    finally:
+        torch.set_num_threads(previous_threads)
+
+    _assert_close(mn_q, single_q, "Q MN groups q")
+    assert torch.equal(mn_topk, single_topk)
+    _assert_close(mn_group_inputs.swa.kv_cache, single_group_inputs.swa.kv_cache, "Q MN groups swa kv_cache")
+    _assert_close(
+        mn_group_inputs.mla_compressor.state_cache,
+        single_group_inputs.mla_compressor.state_cache,
+        "Q MN groups mla state_cache",
+    )
+    _assert_close(
+        mn_group_inputs.indexer_compressor.state_cache,
+        single_group_inputs.indexer_compressor.state_cache,
+        "Q MN groups indexer state_cache",
+    )
+
+
+@pytest.mark.skipif(
+    platform.machine() not in ("aarch64", "arm64") or not _HAS_DEEPSEEK_V4_POST_GEMM_STAGE_PREPACKED,
+    reason="post-GEMM Q MN groups require the AArch64 prepacked C++ stage",
+)
+@pytest.mark.parametrize("n_groups", ["1", "invalid"])
+def test_post_gemm_q_mn_groups_reject_invalid_group_count(monkeypatch, n_groups: str) -> None:
+    inputs = _make_inputs(seed=31, num_tokens=9)
+    weights = prepare_deepseek_v4_post_gemm_weights(
+        inputs.main_wq_b_weight,
+        inputs.indexer_wq_b_weight,
+    )
+    monkeypatch.setenv("FUSED_CPP_POST_GEMM_M8_ALIGNED", "1")
+    monkeypatch.setenv("FUSED_CPP_POST_GEMM_SHARED_Q_POOL", "1")
+    monkeypatch.setenv("FUSED_CPP_POST_GEMM_N_GROUPS", n_groups)
+    with pytest.raises(RuntimeError, match="FUSED_CPP_POST_GEMM_N_GROUPS must be an integer"):
+        post_gemm_parallel_stage_cpp_prepacked(inputs, weights)
 
 
 @pytest.mark.skipif(

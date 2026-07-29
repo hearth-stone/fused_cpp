@@ -187,18 +187,19 @@ Post Stage 已有多处 SVE 融合 kernel，优化重点在：
 
 基线为 `AmazonC5192Cores` 192 核 AArch64 机器的 NUMA0 `0-95`，TP4/C4A、
 `M=2048`、默认 NEON backend、预打包权重。M8 对齐后的双 GEMM 顺序路径
-为 `10.309 ms`；共享 Q worker pool 为 `9.415 ms`。下面的优先级不包含
-单独记录的 sparse short-path 提前消除项。
+为 `10.172 ms`；共享 Q worker pool 的两 cursor 基线为 `9.840 ms`；
+显式 32 个 MN groups 为 `3.861 ms`。下面的优先级不包含单独记录的
+sparse short-path 提前消除项。
 
 | 优先级 | Feature | TODO | 机制与验收重点 |
 |---|---|---|---|
 | P0 | `benchmark.post_gemm_stage` | 已增加 C4A 基准；继续覆盖 dense/C128A、M、prefix 长度和 backend | `tests/bench_deepseek_v4_post_gemm_stage.py` 已支持线程数、legacy/M8、shared/legacy/auto Q pool 和阶段 profile；后续继续扩展形状 |
 | 完成 | `schedule.m8_aligned` | 按完整 M8 panel 静态分配，保留 legacy row-split 开关 | 192 核 NUMA0 NEON 96T：`13.942 -> 10.187 ms`；SVE：`11.082 -> 10.318 ms`；`FUSED_CPP_POST_GEMM_M8_ALIGNED=0` 回退 |
 | 完成 | `runtime.shared_q_gemm_pool` | 两次 Q GEMM 共用一个 OpenMP region 和动态 M8-panel worker pool | NEON 96T、M=2048：`10.309 -> 9.415 ms`；默认仅在 `T>=32 && ceil(M/8)>=T` 时启用，避免 M=192 强制共享时的 14.9% 退化 |
-| P0 | `schedule.q_gemm_mn_groups` | 复用第一个 parallel 的 owner-first MN task groups，将每份 16 MiB packed-B 拆成 L2 可驻留的 N stripe | 扫描 N-group 数量并记录每核 packed-B window；避免每个 M8 panel 流式扫描完整 N |
+| 候选 | `schedule.q_gemm_mn_groups` | 已复用 owner-first MN task groups，将每份 16 MiB packed-B 拆成 N stripe；当前保持显式选择 | NEON 96T、M=2048：2 groups `9.840 ms`，32 groups `3.861 ms`；SVE：2 groups `10.044 ms`，24 groups `4.609 ms`；有效 B window 约 1.0-1.33 MiB，默认尚未切换 |
 | P0 | `compute.shared_prepacked_qr` | `qr` 只 pack 一次，由 Main Q 和 Indexer Q 的全部 N groups 共享 | 依赖 MN pool；必须避免按 N group 重复 pack A，并保持现有 bf16 输出布局 |
 | P1 | `runtime.post_stage_dag` | 将 Main Q、MLA compressor、Indexer compressor、KV cache insert 和 sparse indexer 表达为依赖任务，完成 GEMM 的线程继续领取 ready task | 先复用同一 worker region，避免用嵌套 OpenMP sections；目标是隐藏当前约 `0.5-0.9 ms` 的独立后处理 |
-| P1 | `backend.sve_mn_parity` | 为 SVE attention GEMM 暴露 packed-A 和 N-range dispatch，再接入同一 MN pool | 当前 SVE dispatch 在调用内 pack A；直接 N-split 会放大 pack 流量，不能只复用调度层 |
+| P1 | `backend.sve_mn_parity` | SVE N-range 已接入同一 MN pool；继续补 packed-A dispatch | 当前 SVE 每个 N group 仍在调用内重复 pack A；与 `compute.shared_prepacked_qr` 一起关闭该差距 |
 | P1 | `compute.indexer_coff1_contiguous` | 为连续 prefill 的 coff=1 indexer compressor 增加当前 chunk 快路径，合并 save/compress 并减少 state-cache 回读 | 保留跨 chunk、负 position 和非连续 slot fallback；重点优化当前 `0.53-0.64 ms` 阶段 |
 | P1 | `sparse.long_path_blocked_topk` | Long path 使用分块 KV gather/matmul 和在线 Top-K，避免完整 `k_gathered`/logits 临时量 | 覆盖 prefix 后有效 KV 超过 Top-K 的情况；短路径结果必须保持不变 |
 | P2 | `pipeline.qr_panel_handoff` | 第一段 parallel 产出 QR M8 panel 后，直接发布给第二段 Q GEMM，而不是等待第一段全部完成 | 高复杂度跨算子流水线；评估 QR panel 的 cache 复用和额外同步是否净收益 |

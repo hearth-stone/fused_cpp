@@ -156,6 +156,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--runs", type=int, default=15)
     parser.add_argument("--schedule", choices=("legacy", "m8"), default="m8")
     parser.add_argument("--q-pool", choices=("auto", "legacy", "shared"), default="auto")
+    parser.add_argument(
+        "--n-groups",
+        type=int,
+        default=0,
+        help="Total Main/Indexer Q GEMM N groups; 0 keeps the runtime default.",
+    )
     parser.add_argument("--profile", action="store_true")
     return parser.parse_args()
 
@@ -167,6 +173,12 @@ def main() -> None:
         os.environ.pop("FUSED_CPP_POST_GEMM_SHARED_Q_POOL", None)
     else:
         os.environ["FUSED_CPP_POST_GEMM_SHARED_Q_POOL"] = "1" if args.q_pool == "shared" else "0"
+    if args.n_groups == 0:
+        os.environ.pop("FUSED_CPP_POST_GEMM_N_GROUPS", None)
+    else:
+        if args.n_groups < 2:
+            raise ValueError("--n-groups must be 0 or at least 2")
+        os.environ["FUSED_CPP_POST_GEMM_N_GROUPS"] = str(args.n_groups)
     torch.set_num_threads(args.threads)
     torch.set_num_interop_threads(1)
     inputs, weights = _make_inputs(args.m)
@@ -192,6 +204,7 @@ def main() -> None:
         "threads": args.threads,
         "schedule": args.schedule,
         "q_pool": args.q_pool,
+        "n_groups": args.n_groups,
         "warmup": args.warmup,
         "runs": args.runs,
         "median_ms": median_ms,

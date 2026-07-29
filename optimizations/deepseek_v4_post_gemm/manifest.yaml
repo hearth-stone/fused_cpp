@@ -63,6 +63,37 @@ features:
     result: >-
       optimizations/deepseek_v4_post_gemm/results/amazon_192c_shared_q_pool_20260729.md
 
+  - id: schedule.q_gemm_mn_groups
+    part: schedule
+    status: candidate
+    implementation: csrc/deepseek_v4_post_gemm_stage.cpp
+    hypothesis: >-
+      Splitting each Q GEMM packed-B matrix into owner-first N stripes keeps a
+      worker's active B window near private-L2 capacity and multiplies the
+      available M8-panel tasks, while preserving the packed-weight format,
+      microkernels, output layout and postprocessing order.
+    depends_on:
+      - schedule.m8_aligned
+      - runtime.shared_q_gemm_pool
+    conflicts_with: []
+    selection: >-
+      Experimental opt-in through FUSED_CPP_POST_GEMM_N_GROUPS=<total groups>,
+      where the value must be at least two. The default remains two groups.
+      FUSED_CPP_POST_GEMM_SHARED_Q_POOL=1 forces the required shared pool.
+    correctness: >-
+      PYTHONPATH=src .venv/bin/python -m pytest -q
+      tests/test_deepseek_v4_post_gemm_stage.py
+      -k q_mn_groups
+    benchmark: >-
+      PYTHONPATH=src FUSED_CPP_POST_GEMM_BACKEND=neon
+      OMP_NUM_THREADS=96 OMP_DYNAMIC=FALSE OMP_PROC_BIND=close
+      OMP_PLACES=cores numactl --physcpubind=0-95 --membind=0
+      .venv/bin/python tests/bench_deepseek_v4_post_gemm_stage.py
+      --m 2048 --threads 96 --warmup 5 --runs 31
+      --schedule m8 --q-pool shared --n-groups 32
+    result: >-
+      optimizations/deepseek_v4_post_gemm/results/amazon_192c_q_gemm_mn_groups_20260729.md
+
 variants:
   - id: post_gemm_m8_aligned
     entrypoint: deepseek_v4_post_gemm_parallel_stage_prepacked
@@ -76,3 +107,11 @@ variants:
     features:
       - schedule.m8_aligned
       - runtime.shared_q_gemm_pool
+
+  - id: post_gemm_q_gemm_mn_groups
+    entrypoint: deepseek_v4_post_gemm_parallel_stage_prepacked
+    status: candidate
+    features:
+      - schedule.m8_aligned
+      - runtime.shared_q_gemm_pool
+      - schedule.q_gemm_mn_groups
