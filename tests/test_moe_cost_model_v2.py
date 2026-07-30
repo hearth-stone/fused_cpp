@@ -555,6 +555,66 @@ def test_static_stage_window_policy_is_lowered_per_task(
     assert len(planner.model.native_interval_planner_payload()["task_stage_windows"]) == 13
 
 
+def test_elastic_w2_bridge_lowers_local_cohorts_and_stage_widths(
+    catalog: ProfileCatalog,
+) -> None:
+    _, model = models(catalog, "tp", 1024, 64)
+    planner = IntervalPlanner(
+        model,
+        32,
+        native_cold_planner=False,
+        task_stage_window_policy=AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V1,
+    )
+    tasks_8t = [
+        (0, 192, 0, 8, []),
+        (1, 192, 8, 8, []),
+        (2, 192, 16, 8, []),
+        (3, 192, 24, 8, []),
+    ]
+
+    bridge_8t = planner.to_elastic_w2_bridge(
+        tasks_8t,
+        width_transitions={8: 16},
+        numa_node=0,
+        resize_timeout_ns=5000,
+    )
+
+    assert bridge_8t["execution_mode"] == "elastic"
+    assert bridge_8t["task_threads"] == [8, 8, 8, 8]
+    assert bridge_8t["task_preferred_threads"] == [16, 16, 16, 16]
+    assert bridge_8t["task_allowed_thread_offsets"] == [0, 2, 4, 6, 8]
+    assert bridge_8t["task_allowed_threads"] == [8, 16] * 4
+    assert bridge_8t["task_resize_points"] == [1] * 4
+    assert bridge_8t["task_resize_timeout_ns"] == [5000] * 4
+    assert bridge_8t["task_numa_nodes"] == [0] * 4
+    assert bridge_8t["task_preferred_core_begins"] == [0, 0, 16, 16]
+    assert bridge_8t["task_w13_window_bytes"] == [1024 * 1024] * 4
+    assert bridge_8t["task_w2_window_bytes"] == [-1] * 4
+
+    migrated_bridge = planner.to_elastic_w2_bridge(
+        tasks_8t,
+        width_transitions={8: 16},
+        numa_node=0,
+        resize_timeout_ns=100_000,
+        resizable_task_ids=[0, 1],
+        task_preferred_core_begins={0: 0, 1: 16},
+    )
+    assert migrated_bridge["task_preferred_threads"] == [16, 16, 8, 8]
+    assert migrated_bridge["task_resize_points"] == [1, 1, 0, 0]
+    assert migrated_bridge["task_preferred_core_begins"] == [0, 16, -1, -1]
+    assert migrated_bridge["task_resize_timeout_ns"] == [100_000, 100_000, 0, 0]
+
+    tasks_2t = [(expert, 48, expert * 2, 2, []) for expert in range(4)]
+    bridge_2t = planner.to_elastic_w2_bridge(
+        tasks_2t,
+        width_transitions={2: 8},
+        numa_node=0,
+    )
+    assert bridge_2t["task_preferred_threads"] == [8] * 4
+    assert bridge_2t["task_resize_points"] == [1] * 4
+    assert bridge_2t["task_resize_timeout_ns"] == [0] * 4
+
+
 def test_default_stage_window_policy_requires_exact_profile(
     catalog: ProfileCatalog,
 ) -> None:

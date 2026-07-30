@@ -27,10 +27,12 @@ sys.path[:0] = [str(REPO_ROOT / "src"), str(COST_MODEL_DIR), str(PLANNER_DIR)]
 
 from fused_cpp.moe import (  # noqa: E402
     AsyncMoEPlanV2,
+    decode_async_moe_elastic_stats,
     fused_moe_bf16_tiled_async,
     fused_moe_bf16_tiled_async_plan,
     fused_moe_bf16_tiled_planned_staged,
     fused_moe_bf16_tiled_vllm_staged,
+    make_async_moe_elastic_stats,
     prepare_fused_moe_bf16_tiled_weights,
 )
 from stage_window_policy import (  # noqa: E402
@@ -47,6 +49,7 @@ STATIC_SPLIT_VARIANT = "static_16t_to_4x4t"
 VLLM_VARIANT = "vllm_staged"
 MATCHED_STAGED_VARIANT = "planned_staged_matched"
 FINE_STAGED_VARIANT = "planned_staged_independent"
+ELASTIC_VARIANT_PREFIX = "elastic_w2"
 
 
 def parse_args() -> argparse.Namespace:
@@ -97,6 +100,24 @@ def parse_args() -> argparse.Namespace:
         default=12,
         help="experts above this route count use the 16T head of the static split DAG",
     )
+    parser.add_argument(
+        "--elastic-w2-transitions",
+        help="comma-separated planner W2 width transitions, for example 8:16,2:8",
+    )
+    parser.add_argument(
+        "--elastic-timeout-us",
+        type=float,
+        action="append",
+        help="elastic cohort timeout in microseconds; repeat to compare values (default: 0)",
+    )
+    parser.add_argument(
+        "--elastic-task-ids",
+        help="comma-separated task ids eligible for W2 resizing; default: every task matching a transition",
+    )
+    parser.add_argument(
+        "--elastic-w2-core-begins",
+        help="comma-separated task_id:logical_core_begin targets; allows disjoint W2 migration",
+    )
     parser.add_argument("--route-dtype", choices=("fp32", "bf16"), default="fp32")
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--runs", type=int, default=11)
@@ -109,6 +130,114 @@ def parse_args() -> argparse.Namespace:
 def percentile(samples: list[float], fraction: float) -> float:
     ordered = sorted(samples)
     return ordered[round((len(ordered) - 1) * fraction)]
+
+
+def parse_width_transitions(value: str) -> dict[int, int]:
+    transitions: dict[int, int] = {}
+    for item in value.split(","):
+        try:
+            selected_text, preferred_text = item.split(":", maxsplit=1)
+            selected = int(selected_text)
+            preferred = int(preferred_text)
+        except ValueError as error:
+            raise ValueError(f"invalid elastic W2 transition {item!r}; expected selected:preferred") from error
+        if selected <= 0 or preferred <= selected or preferred % selected != 0:
+            raise ValueError(
+                f"elastic W2 transition must expand to a larger multiple, got {selected}:{preferred}"
+            )
+        transitions[selected] = preferred
+    if not transitions:
+        raise ValueError("at least one elastic W2 transition is required")
+    return transitions
+
+
+def parse_integer_list(value: str) -> list[int]:
+    values = [int(item) for item in value.split(",") if item]
+    if not values:
+        raise ValueError("at least one integer is required")
+    return values
+
+
+def parse_task_core_begins(value: str) -> dict[int, int]:
+    targets: dict[int, int] = {}
+    for item in value.split(","):
+        try:
+            task_text, core_text = item.split(":", maxsplit=1)
+            task = int(task_text)
+            core_begin = int(core_text)
+        except ValueError as error:
+            raise ValueError(
+                f"invalid elastic W2 target {item!r}; expected task_id:logical_core_begin"
+            ) from error
+        if task < 0 or core_begin < 0:
+            raise ValueError(f"elastic W2 target values must be non-negative, got {item!r}")
+        targets[task] = core_begin
+    if not targets:
+        raise ValueError("at least one elastic W2 target is required")
+    return targets
+
+
+def cpu_numa_node(cpu: int) -> int:
+    nodes = sorted(Path(f"/sys/devices/system/cpu/cpu{cpu}").glob("node[0-9]*"))
+    if len(nodes) != 1:
+        raise RuntimeError(f"cannot determine a unique NUMA node for CPU {cpu}")
+    return int(nodes[0].name.removeprefix("node"))
+
+
+def make_elastic_w2_plan(
+    base_plan: AsyncMoEPlanV2,
+    route_counts: torch.Tensor,
+    *,
+    profile: Path,
+    transitions: dict[int, int],
+    timeout_ns: int,
+    static_stage_windows: bool,
+    resizable_task_ids: list[int] | None = None,
+    task_preferred_core_begins: dict[int, int] | None = None,
+) -> AsyncMoEPlanV2:
+    from interval_planner import IntervalPlanner
+    from phase_model import ContentionCostModel
+
+    dependency_offsets = base_plan.task_dep_offsets.tolist()
+    dependencies = base_plan.task_deps.tolist()
+    tasks = []
+    for task, expert in enumerate(base_plan.task_expert_ids.tolist()):
+        begin = dependency_offsets[task]
+        end = dependency_offsets[task + 1]
+        tasks.append(
+            (
+                int(expert),
+                int(route_counts[expert]),
+                int(base_plan.task_core_begins[task]),
+                int(base_plan.task_threads[task]),
+                [int(dep) for dep in dependencies[begin:end]],
+            )
+        )
+    cpu_ids = [int(cpu) for cpu in base_plan.thread_cpu_ids.tolist()]
+    numa_nodes = {cpu_numa_node(cpu) for cpu in cpu_ids}
+    if len(numa_nodes) != 1:
+        raise ValueError(f"elastic W2 benchmark cannot regroup across NUMA nodes: {sorted(numa_nodes)}")
+    planner = IntervalPlanner(
+        ContentionCostModel(profile),
+        base_plan.num_threads,
+        cpu_ids=cpu_ids,
+        task_stage_window_policy=(
+            AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V1 if static_stage_windows else None
+        ),
+    )
+    bridge = planner.to_elastic_w2_bridge(
+        tasks,
+        width_transitions=transitions,
+        numa_node=next(iter(numa_nodes)),
+        resize_timeout_ns=timeout_ns,
+        resizable_task_ids=resizable_task_ids,
+        task_preferred_core_begins=task_preferred_core_begins,
+    )
+    if not any(int(point) != 0 for point in bridge["task_resize_points"]):
+        raise ValueError(
+            f"selected strict plan has no task matching elastic transitions {sorted(transitions.items())}"
+        )
+    return AsyncMoEPlanV2.from_dict(bridge)
 
 
 def materialize_topk_ids(
@@ -519,6 +648,28 @@ def main() -> int:
         raise ValueError("hidden and intermediate must be multiples of 8")
     if args.production_profile is not None and not args.production_profile.is_file():
         raise ValueError(f"production profile does not exist: {args.production_profile}")
+    elastic_transitions = (
+        parse_width_transitions(args.elastic_w2_transitions)
+        if args.elastic_w2_transitions is not None
+        else None
+    )
+    elastic_timeouts_us = args.elastic_timeout_us or [0.0]
+    elastic_task_ids = (
+        parse_integer_list(args.elastic_task_ids)
+        if args.elastic_task_ids is not None
+        else None
+    )
+    elastic_w2_core_begins = (
+        parse_task_core_begins(args.elastic_w2_core_begins)
+        if args.elastic_w2_core_begins is not None
+        else None
+    )
+    if any(timeout < 0 for timeout in elastic_timeouts_us):
+        raise ValueError("--elastic-timeout-us must be non-negative")
+    if elastic_transitions is not None and args.production_profile is None:
+        raise ValueError("--elastic-w2-transitions requires --production-profile")
+    if (elastic_task_ids is not None or elastic_w2_core_begins is not None) and elastic_transitions is None:
+        raise ValueError("--elastic-task-ids/--elastic-w2-core-begins require --elastic-w2-transitions")
     if args.static_16_to_4 and args.production_profile is None:
         raise ValueError("--static-16-to-4 requires --production-profile for isolated-time lane assignment")
     if args.dynamic_short_pool and args.production_profile is None:
@@ -548,6 +699,7 @@ def main() -> int:
     tail_pool_plan: AsyncMoEPlanV2 | None = None
     matched_staged_plans: tuple[AsyncMoEPlanV2, AsyncMoEPlanV2] | None = None
     fine_staged_plans: tuple[AsyncMoEPlanV2, AsyncMoEPlanV2] | None = None
+    elastic_plans: dict[str, AsyncMoEPlanV2] = {}
     if args.production_profile is None:
         baseline_variant = "fixed_team_async"
         schedule = make_fixed_team_schedule(
@@ -583,6 +735,25 @@ def main() -> int:
         )
         team_threads = None
         w13_split = bool(planner_metadata["w13_split"])
+        if elastic_transitions is not None:
+            assert production_plan is not None
+            for timeout_us in elastic_timeouts_us:
+                timeout_ns = round(timeout_us * 1000.0)
+                variant = (
+                    f"{ELASTIC_VARIANT_PREFIX}_"
+                    f"{'_'.join(f'{selected}to{preferred}' for selected, preferred in sorted(elastic_transitions.items()))}"
+                    f"_{timeout_ns}ns"
+                )
+                elastic_plans[variant] = make_elastic_w2_plan(
+                    production_plan,
+                    route_counts,
+                    profile=args.production_profile,
+                    transitions=elastic_transitions,
+                    timeout_ns=timeout_ns,
+                    static_stage_windows=args.static_stage_windows,
+                    resizable_task_ids=elastic_task_ids,
+                    task_preferred_core_begins=elastic_w2_core_begins,
+                )
     static_schedule: tuple[torch.Tensor, ...] | None = None
     static_metadata: dict[str, object] | None = None
     variant_names = [baseline_variant]
@@ -601,6 +772,7 @@ def main() -> int:
         variant_names.append(STATIC_SPLIT_VARIANT)
     if args.dynamic_short_pool:
         variant_names.append(DYNAMIC_POOL_VARIANT)
+    variant_names.extend(elastic_plans)
     if matched_staged_plans is not None:
         variant_names.extend((MATCHED_STAGED_VARIANT, FINE_STAGED_VARIANT))
     variant_names.append(VLLM_VARIANT)
@@ -608,6 +780,8 @@ def main() -> int:
     ready_token_merge = args.production_ready_token_merge
     if ready_token_merge is None:
         ready_token_merge = args.production_profile is not None
+    if elastic_plans:
+        ready_token_merge = False
 
     generator = torch.Generator().manual_seed(args.seed)
     hidden = torch.empty((args.tokens, args.hidden), dtype=torch.bfloat16)
@@ -633,8 +807,21 @@ def main() -> int:
     del w13, w2
 
     outputs = {name: torch.empty_like(hidden) for name in variants}
+    elastic_stats = {name: make_async_moe_elastic_stats() for name in elastic_plans}
 
     def run(name: str) -> torch.Tensor:
+        if name in elastic_plans:
+            return fused_moe_bf16_tiled_async_plan(
+                hidden,
+                packed,
+                topk_weights,
+                topk_ids,
+                elastic_plans[name],
+                global_num_experts=args.experts,
+                w13_split=w13_split,
+                out=outputs[name],
+                elastic_stats_out=elastic_stats[name],
+            )
         if name in {MATCHED_STAGED_VARIANT, FINE_STAGED_VARIANT}:
             selected = matched_staged_plans if name == MATCHED_STAGED_VARIANT else fine_staged_plans
             assert selected is not None
@@ -739,6 +926,7 @@ def main() -> int:
             run(name)
 
     samples = {name: [] for name in variants}
+    elastic_stats_samples: dict[str, list[dict[str, int]]] = {name: [] for name in elastic_plans}
     timed_order = random.Random(args.seed ^ 0x5A5A)
     sink = 0
     for _ in range(args.runs):
@@ -748,6 +936,8 @@ def main() -> int:
             begin = time.perf_counter_ns()
             result = run(name)
             samples[name].append((time.perf_counter_ns() - begin) / 1.0e6)
+            if name in elastic_stats:
+                elastic_stats_samples[name].append(decode_async_moe_elastic_stats(elastic_stats[name]))
             sink ^= int(result.view(torch.int16)[0, 0])
 
     if args.stage_timing:
@@ -762,18 +952,32 @@ def main() -> int:
     records: list[dict[str, object]] = []
     for name in variants:
         median_ms = statistics.median(samples[name])
-        records.append(
-            {
-                "variant": name,
-                "median_ms": median_ms,
-                "p10_ms": percentile(samples[name], 0.10),
-                "p90_ms": percentile(samples[name], 0.90),
-                "aggregate_tflops": total_flops / median_ms / 1.0e9,
-                "gain_pct": 100.0 * (baseline_ms / median_ms - 1.0),
-                "gain_vs_auto_pct": 100.0 * (auto_ms / median_ms - 1.0),
-                "samples_ms": samples[name],
+        record: dict[str, object] = {
+            "variant": name,
+            "median_ms": median_ms,
+            "p10_ms": percentile(samples[name], 0.10),
+            "p90_ms": percentile(samples[name], 0.90),
+            "aggregate_tflops": total_flops / median_ms / 1.0e9,
+            "gain_pct": 100.0 * (baseline_ms / median_ms - 1.0),
+            "gain_vs_auto_pct": 100.0 * (auto_ms / median_ms - 1.0),
+            "samples_ms": samples[name],
+        }
+        if name in elastic_stats_samples:
+            stat_samples = elastic_stats_samples[name]
+            totals = {
+                field: sum(sample[field] for sample in stat_samples)
+                for field in stat_samples[0]
             }
-        )
+            eligible = totals["eligible_tasks"]
+            totals["natural_opportunity_pct"] = (
+                100.0 * totals["natural_opportunities"] / eligible if eligible else 0.0
+            )
+            totals["preferred_assignment_pct"] = (
+                100.0 * totals["preferred_assignments"] / eligible if eligible else 0.0
+            )
+            record["elastic_stats"] = totals
+            record["elastic_stats_samples"] = stat_samples
+        records.append(record)
 
     result = {
         "shape": {
@@ -804,6 +1008,16 @@ def main() -> int:
                 "max_rows": args.static_long_route_threshold,
             }
             if args.dynamic_short_pool
+            else None,
+            "elastic_w2": {
+                "transitions": elastic_transitions,
+                "timeouts_us": elastic_timeouts_us,
+                "task_ids": elastic_task_ids,
+                "task_preferred_core_begins": elastic_w2_core_begins,
+                "cross_numa": False,
+                "ready_token_merge_forced_off": bool(elastic_plans),
+            }
+            if elastic_plans
             else None,
             "warmup": args.warmup,
             "runs": args.runs,
@@ -838,6 +1052,17 @@ def main() -> int:
     if static_stage_window_plan is not None:
         static_record = next(record for record in records if record["variant"] == STATIC_STAGE_WINDOW_VARIANT)
         print(f"static-stage-window gain vs production_auto: {static_record['gain_vs_auto_pct']:.2f}%")
+    for record in records:
+        if "elastic_stats" not in record:
+            continue
+        stats = record["elastic_stats"]
+        assert isinstance(stats, dict)
+        print(
+            f"{record['variant']} opportunities: natural={stats['natural_opportunity_pct']:.2f}% "
+            f"preferred={stats['preferred_assignment_pct']:.2f}% "
+            f"timeout_fallbacks={stats['timeout_fallbacks']} "
+            f"max_wait_us={stats['max_wait_ns'] / 1000.0:.3f}"
+        )
     if args.output is not None:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps(result, indent=2) + "\n")

@@ -13,9 +13,11 @@ import pytest
 import torch
 
 from fused_cpp.moe import _HAS_BF16_TILED_FUSED_MOE
+from fused_cpp.moe import ASYNC_MOE_EXECUTION_ELASTIC
 from fused_cpp.moe import ASYNC_MOE_EXECUTION_TAIL_POOL
 from fused_cpp.moe import ASYNC_MOE_PLACEMENT_FIXED
 from fused_cpp.moe import ASYNC_MOE_PLACEMENT_TAIL_POOL
+from fused_cpp.moe import ASYNC_MOE_RESIZE_BEFORE_W2
 from fused_cpp.moe import AsyncMoEPlanV2
 from fused_cpp.moe import available_fused_moe_bf16_tiled_backends
 from fused_cpp.moe import fused_moe_naive
@@ -25,6 +27,7 @@ from fused_cpp.moe import fused_moe_bf16_tiled_async_plan
 from fused_cpp.moe import fused_moe_bf16_tiled_planned_staged
 from fused_cpp.moe import fused_moe_bf16_tiled_scheduled
 from fused_cpp.moe import fused_moe_bf16_tiled_vllm_staged
+from fused_cpp.moe import make_async_moe_elastic_stats
 from fused_cpp.moe import prepare_fused_moe_bf16_tiled_weights
 from fused_cpp.moe import upgrade_legacy_async_plan
 
@@ -461,6 +464,49 @@ def test_sve_plan_v2_strict_and_tail_pool_match_legacy_async(
         AsyncMoEPlanV2.from_dict(tail_bridge),
         w13_split=True,
     )
+    numa_nodes = {
+        int(path.name.removeprefix("node"))
+        for cpu in cpu_ids
+        for path in Path(f"/sys/devices/system/cpu/cpu{cpu}").glob("node[0-9]*")
+    }
+    if len(numa_nodes) != 1:
+        pytest.skip("elastic Plan V2 test requires four CPUs from one NUMA node")
+    elastic_bridge = upgrade_legacy_async_plan(strict_bridge)
+    elastic_bridge.update(
+        {
+            "execution_mode": ASYNC_MOE_EXECUTION_ELASTIC,
+            "task_preferred_threads": [4] * 4,
+            "task_min_threads": [2] * 4,
+            "task_max_threads": [4] * 4,
+            "task_allowed_thread_offsets": [0, 2, 4, 6, 8],
+            "task_allowed_threads": [2, 4] * 4,
+            "task_numa_nodes": [next(iter(numa_nodes))] * 4,
+            "task_resize_points": [ASYNC_MOE_RESIZE_BEFORE_W2] * 4,
+            "task_resize_timeout_ns": [100_000] * 4,
+        }
+    )
+    elastic_stats = make_async_moe_elastic_stats()
+    elastic = fused_moe_bf16_tiled_async_plan(
+        hidden_states,
+        packed,
+        topk_weights,
+        topk_ids,
+        AsyncMoEPlanV2.from_dict(elastic_bridge),
+        w13_split=True,
+        elastic_stats_out=elastic_stats,
+    )
+    nonblocking_bridge = dict(elastic_bridge)
+    nonblocking_bridge["task_resize_timeout_ns"] = [0] * 4
+    nonblocking_stats = make_async_moe_elastic_stats()
+    nonblocking = fused_moe_bf16_tiled_async_plan(
+        hidden_states,
+        packed,
+        topk_weights,
+        topk_ids,
+        AsyncMoEPlanV2.from_dict(nonblocking_bridge),
+        w13_split=True,
+        elastic_stats_out=nonblocking_stats,
+    )
     w2_bridge = {
         "num_threads": 4,
         "thread_cpu_ids": cpu_ids,
@@ -501,9 +547,116 @@ def test_sve_plan_v2_strict_and_tail_pool_match_legacy_async(
     torch.testing.assert_close(strict.float(), reference.float(), atol=0, rtol=0)
     torch.testing.assert_close(windowed.float(), strict.float(), atol=0, rtol=0)
     torch.testing.assert_close(tail.float(), strict.float(), atol=0, rtol=0)
+    torch.testing.assert_close(elastic.float(), strict.float(), atol=0, rtol=0)
+    torch.testing.assert_close(nonblocking.float(), strict.float(), atol=0, rtol=0)
+    assert elastic_stats[0].item() == 4
+    assert elastic_stats[1].item() + elastic_stats[2].item() == 4
+    assert nonblocking_stats[0].item() == 4
+    assert nonblocking_stats[1].item() + nonblocking_stats[2].item() == 4
     torch.testing.assert_close(independently_planned.float(), strict.float(), atol=0, rtol=0)
     torch.testing.assert_close(staged_tail.float(), strict.float(), atol=0, rtol=0)
     torch.testing.assert_close(staged_mixed.float(), strict.float(), atol=0, rtol=0)
+
+    single_expert_ids = torch.zeros_like(topk_ids)
+    single_strict_bridge = upgrade_legacy_async_plan(
+        {
+            "num_threads": 4,
+            "thread_cpu_ids": cpu_ids,
+            "task_expert_ids": [0],
+            "task_core_begins": [0],
+            "task_threads": [2],
+            "task_dep_offsets": [0, 0],
+            "task_deps": [],
+        }
+    )
+    single_strict_plan = AsyncMoEPlanV2.from_dict(single_strict_bridge)
+    single_strict = fused_moe_bf16_tiled_async_plan(
+        hidden_states,
+        packed,
+        topk_weights,
+        single_expert_ids,
+        single_strict_plan,
+        w13_split=True,
+    )
+    single_elastic_bridge = dict(single_strict_bridge)
+    single_elastic_bridge.update(
+        {
+            "execution_mode": ASYNC_MOE_EXECUTION_ELASTIC,
+            "task_preferred_threads": [4],
+            "task_min_threads": [2],
+            "task_max_threads": [4],
+            "task_allowed_thread_offsets": [0, 2],
+            "task_allowed_threads": [2, 4],
+            "task_numa_nodes": [next(iter(numa_nodes))],
+            "task_resize_points": [ASYNC_MOE_RESIZE_BEFORE_W2],
+            "task_resize_timeout_ns": [0],
+        }
+    )
+    single_elastic_stats = make_async_moe_elastic_stats()
+    single_elastic = fused_moe_bf16_tiled_async_plan(
+        hidden_states,
+        packed,
+        topk_weights,
+        single_expert_ids,
+        AsyncMoEPlanV2.from_dict(single_elastic_bridge),
+        w13_split=True,
+        elastic_stats_out=single_elastic_stats,
+    )
+    torch.testing.assert_close(single_elastic.float(), single_strict.float(), atol=0, rtol=0)
+    assert single_elastic_stats[1].item() == 1
+    assert single_elastic_stats[3].item() == 1
+
+    migration_ids = (torch.arange(num_tokens, dtype=torch.int32) % 2).reshape(num_tokens, 1)
+    migration_strict_bridge = upgrade_legacy_async_plan(
+        {
+            "num_threads": 4,
+            "thread_cpu_ids": cpu_ids,
+            "task_expert_ids": [0, 1],
+            "task_core_begins": [0, 1],
+            "task_threads": [1, 1],
+            "task_dep_offsets": [0, 0, 0],
+            "task_deps": [],
+        }
+    )
+    migration_strict = fused_moe_bf16_tiled_async_plan(
+        hidden_states,
+        packed,
+        topk_weights,
+        migration_ids,
+        AsyncMoEPlanV2.from_dict(migration_strict_bridge),
+        w13_split=True,
+    )
+    migration_bridge = dict(migration_strict_bridge)
+    migration_bridge.update(
+        {
+            "execution_mode": ASYNC_MOE_EXECUTION_ELASTIC,
+            "task_preferred_threads": [2, 2],
+            "task_min_threads": [1, 1],
+            "task_max_threads": [2, 2],
+            "task_allowed_thread_offsets": [0, 2, 4],
+            "task_allowed_threads": [1, 2, 1, 2],
+            "task_numa_nodes": [next(iter(numa_nodes))] * 2,
+            "task_resize_points": [ASYNC_MOE_RESIZE_BEFORE_W2] * 2,
+            "task_resize_timeout_ns": [10_000_000] * 2,
+            "task_preferred_core_begins": [0, 2],
+        }
+    )
+    migration_stats = make_async_moe_elastic_stats()
+    migrated = fused_moe_bf16_tiled_async_plan(
+        hidden_states,
+        packed,
+        topk_weights,
+        migration_ids,
+        AsyncMoEPlanV2.from_dict(migration_bridge),
+        w13_split=True,
+        elastic_stats_out=migration_stats,
+    )
+    torch.testing.assert_close(migrated.float(), migration_strict.float(), atol=0, rtol=0)
+    assert migration_stats[0].item() == 2
+    assert migration_stats[1].item() == 2
+    assert migration_stats[2].item() == 0
+    assert migration_stats[6].item() == 2
+    assert migration_stats[7].item() == 2
 
     unordered_overlap_bridge = upgrade_legacy_async_plan(
         {
@@ -527,7 +680,7 @@ def test_sve_plan_v2_strict_and_tail_pool_match_legacy_async(
     # The materialized plan owns mutable tensors, so native must validate the
     # metadata again instead of trusting the Python construction check.
     strict_plan.task_resize_points[0] = 1
-    with pytest.raises(RuntimeError, match="does not support resize points"):
+    with pytest.raises(RuntimeError, match="do not support resize points"):
         fused_moe_bf16_tiled_async_plan(
             hidden_states,
             packed,

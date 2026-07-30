@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <csignal>
 #include <cmath>
 #include <condition_variable>
@@ -3557,6 +3558,8 @@ struct MoePhaseTraceRecord {
   int64_t expert = -1;
   int64_t rows = 0;
   const char* stage = "";
+  double start_ms = 0.0;
+  double end_ms = 0.0;
   double ms = 0.0;
 };
 
@@ -3837,7 +3840,8 @@ class MoeTraceCollector {
  public:
   explicit MoeTraceCollector(MoeTraceConfig config)
       : config_(std::move(config)),
-        call_id_(config_.enabled ? g_moe_trace_call_id.fetch_add(uint64_t{1}, std::memory_order_relaxed) : 0) {}
+        call_id_(config_.enabled ? g_moe_trace_call_id.fetch_add(uint64_t{1}, std::memory_order_relaxed) : 0),
+        origin_(::fused_cpp::profile::now()) {}
 
   bool enabled() const { return config_.enabled; }
 
@@ -3883,10 +3887,11 @@ class MoeTraceCollector {
   }
 
   void record_phase(int64_t tid, int64_t wave, int64_t group, int64_t local_tid, int64_t expert, int64_t rows,
-                    const char* stage, double ms) {
+                    const char* stage, ::fused_cpp::profile::TimePoint begin) {
     if (!enabled()) {
       return;
     }
+    const ::fused_cpp::profile::TimePoint end = ::fused_cpp::profile::now();
     MoePhaseTraceRecord record;
     record.seq = next_seq_.fetch_add(uint64_t{1}, std::memory_order_relaxed);
     record.tid = tid;
@@ -3902,7 +3907,9 @@ class MoeTraceCollector {
     record.expert = expert;
     record.rows = rows;
     record.stage = stage;
-    record.ms = ms;
+    record.start_ms = std::chrono::duration<double, std::milli>(begin - origin_).count();
+    record.end_ms = std::chrono::duration<double, std::milli>(end - origin_).count();
+    record.ms = std::chrono::duration<double, std::milli>(end - begin).count();
     std::lock_guard<std::mutex> lock(mutex_);
     phase_records_.push_back(record);
   }
@@ -3965,19 +3972,20 @@ class MoeTraceCollector {
     }
     std::fprintf(file,
                  "PHASE_FIELDS call_id seq tid cpu affinity_first_cpu "
-                 "affinity_cpu_count wave group local_tid expert rows stage ms\n");
+                 "affinity_cpu_count wave group local_tid expert rows stage "
+                 "start_ms end_ms ms\n");
     for (const MoePhaseTraceRecord& record : phase_records) {
       std::fprintf(file,
                    "PHASE call_id=%llu seq=%llu tid=%lld cpu=%lld "
                    "affinity_first_cpu=%lld affinity_cpu_count=%lld wave=%lld "
                    "group=%lld local_tid=%lld expert=%lld rows=%lld stage=%s "
-                   "ms=%.6f\n",
+                   "start_ms=%.6f end_ms=%.6f ms=%.6f\n",
                    static_cast<unsigned long long>(call_id_), static_cast<unsigned long long>(record.seq),
                    static_cast<long long>(record.tid), static_cast<long long>(record.cpu),
                    static_cast<long long>(record.affinity_first_cpu), static_cast<long long>(record.affinity_cpu_count),
                    static_cast<long long>(record.wave), static_cast<long long>(record.group),
                    static_cast<long long>(record.local_tid), static_cast<long long>(record.expert),
-                   static_cast<long long>(record.rows), record.stage, record.ms);
+                   static_cast<long long>(record.rows), record.stage, record.start_ms, record.end_ms, record.ms);
     }
     std::fprintf(file, "MOE_CALL_END call_id=%llu\n", static_cast<unsigned long long>(call_id_));
     std::fclose(file);
@@ -3986,6 +3994,7 @@ class MoeTraceCollector {
  private:
   MoeTraceConfig config_;
   uint64_t call_id_ = 0;
+  ::fused_cpp::profile::TimePoint origin_;
   std::atomic<uint64_t> next_seq_{0};
   std::mutex mutex_;
   std::vector<MoeGemmTraceRecord> records_;
@@ -4640,16 +4649,46 @@ struct AsyncTaskRuntime {
 constexpr int64_t kAsyncPlanV2 = 2;
 constexpr int64_t kAsyncExecutionStrict = 0;
 constexpr int64_t kAsyncExecutionTailPool = 1;
+constexpr int64_t kAsyncExecutionElastic = 2;
 constexpr int64_t kAsyncPlacementFixed = 0;
 constexpr int64_t kAsyncPlacementTailPool = 1;
 constexpr int64_t kAsyncStageExpert = 0;
 constexpr int64_t kAsyncResizeNone = 0;
+constexpr int64_t kAsyncResizeBeforeW2 = 1;
 constexpr int64_t kAsyncFullExpertRange = 0;
+constexpr int64_t kAsyncElasticStatsCount = 10;
+enum AsyncElasticStat : int64_t {
+  kElasticEligibleTasks = 0,
+  kElasticPreferredAssignments = 1,
+  kElasticFallbackAssignments = 2,
+  kElasticNaturalOpportunities = 3,
+  kElasticWaitedPreferredAssignments = 4,
+  kElasticTimeoutFallbacks = 5,
+  kElasticCohortJobs = 6,
+  kElasticBorrowedThreads = 7,
+  kElasticTotalWaitNs = 8,
+  kElasticMaxWaitNs = 9,
+};
+
+int64_t cpu_numa_node(int64_t cpu) {
+#ifdef __linux__
+  char path[128];
+  for (int64_t node = 0; node < 1024; ++node) {
+    std::snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%lld/node%lld",
+                  static_cast<long long>(cpu), static_cast<long long>(node));
+    if (::access(path, F_OK) == 0) {
+      return node;
+    }
+  }
+#else
+  (void)cpu;
+#endif
+  return -1;
+}
 
 // Plan V2 metadata is call-owned and read only while the Python extension
-// call is active. The executor still fixes a team's width once an expert
-// starts; tail-pool placement only changes ownership at whole-expert
-// boundaries.
+// call is active. Elastic mode may expand or migrate a fixed team only at the
+// W13-to-W2 boundary; strict and tail-pool retain fixed in-task widths.
 struct AsyncPlanV2NativeArgs {
   int64_t plan_version = 0;
   int64_t execution_mode = kAsyncExecutionStrict;
@@ -4665,6 +4704,9 @@ struct AsyncPlanV2NativeArgs {
   at::Tensor task_range_granularities;
   c10::optional<at::Tensor> task_w13_window_bytes;
   c10::optional<at::Tensor> task_w2_window_bytes;
+  c10::optional<at::Tensor> task_resize_timeout_ns;
+  c10::optional<at::Tensor> task_preferred_core_begins;
+  c10::optional<at::Tensor> elastic_stats_out;
 };
 
 struct ScheduledScratchUnitConfig {
@@ -6643,7 +6685,7 @@ at::Tensor fused_moe_bf16_tiled_scheduled(at::Tensor input, at::Tensor w13_packe
     if (!moe_trace.enabled()) {
       return;
     }
-    moe_trace.record_phase(tid, wave, group, local_tid, expert, rows, stage, ::fused_cpp::profile::elapsed_ms(begin));
+    moe_trace.record_phase(tid, wave, group, local_tid, expert, rows, stage, begin);
   };
 
   check_bf16_cpu(input, "input");
@@ -7159,7 +7201,7 @@ at::Tensor run_fused_moe_bf16_tiled_async(
     if (!moe_trace.enabled()) {
       return;
     }
-    moe_trace.record_phase(tid, -1, task, local_tid, expert, rows, stage, ::fused_cpp::profile::elapsed_ms(begin));
+    moe_trace.record_phase(tid, -1, task, local_tid, expert, rows, stage, begin);
   };
 
   check_bf16_cpu(input, "input");
@@ -7289,15 +7331,22 @@ at::Tensor run_fused_moe_bf16_tiled_async(
   std::vector<int64_t> task_range_granularities_v;
   std::vector<int64_t> task_w13_window_bytes_v;
   std::vector<int64_t> task_w2_window_bytes_v;
+  std::vector<int64_t> task_resize_timeout_ns_v;
+  std::vector<int64_t> task_preferred_core_begins_v;
   bool has_task_w13_window_bytes = false;
   bool has_task_w2_window_bytes = false;
+  bool has_task_resize_timeout_ns = false;
+  bool has_task_preferred_core_begins = false;
+  int64_t* elastic_stats_ptr = nullptr;
   if (has_plan_v2) {
     TORCH_CHECK(plan_v2->plan_version == kAsyncPlanV2, "plan_version must be ", kAsyncPlanV2, ", got ",
                 plan_v2->plan_version);
     TORCH_CHECK(plan_v2->execution_mode == kAsyncExecutionStrict ||
-                    plan_v2->execution_mode == kAsyncExecutionTailPool,
-                "Plan V2 execution_mode must be strict (", kAsyncExecutionStrict, ") or tail_pool (",
-                kAsyncExecutionTailPool, "), got ", plan_v2->execution_mode);
+                    plan_v2->execution_mode == kAsyncExecutionTailPool ||
+                    plan_v2->execution_mode == kAsyncExecutionElastic,
+                "Plan V2 execution_mode must be strict (", kAsyncExecutionStrict, "), tail_pool (",
+                kAsyncExecutionTailPool, "), or elastic (", kAsyncExecutionElastic, "), got ",
+                plan_v2->execution_mode);
     task_preferred_threads_v =
         tensor_to_i64_vector(plan_v2->task_preferred_threads, "task_preferred_threads");
     task_min_threads_v = tensor_to_i64_vector(plan_v2->task_min_threads, "task_min_threads");
@@ -7315,6 +7364,10 @@ at::Tensor run_fused_moe_bf16_tiled_async(
         plan_v2->task_w13_window_bytes.has_value() && plan_v2->task_w13_window_bytes->defined();
     has_task_w2_window_bytes =
         plan_v2->task_w2_window_bytes.has_value() && plan_v2->task_w2_window_bytes->defined();
+    has_task_resize_timeout_ns =
+        plan_v2->task_resize_timeout_ns.has_value() && plan_v2->task_resize_timeout_ns->defined();
+    has_task_preferred_core_begins =
+        plan_v2->task_preferred_core_begins.has_value() && plan_v2->task_preferred_core_begins->defined();
     if (has_task_w13_window_bytes) {
       task_w13_window_bytes_v =
           tensor_to_i64_vector(*plan_v2->task_w13_window_bytes, "task_w13_window_bytes");
@@ -7322,6 +7375,24 @@ at::Tensor run_fused_moe_bf16_tiled_async(
     if (has_task_w2_window_bytes) {
       task_w2_window_bytes_v =
           tensor_to_i64_vector(*plan_v2->task_w2_window_bytes, "task_w2_window_bytes");
+    }
+    if (has_task_resize_timeout_ns) {
+      task_resize_timeout_ns_v =
+          tensor_to_i64_vector(*plan_v2->task_resize_timeout_ns, "task_resize_timeout_ns");
+    }
+    if (has_task_preferred_core_begins) {
+      task_preferred_core_begins_v =
+          tensor_to_i64_vector(*plan_v2->task_preferred_core_begins, "task_preferred_core_begins");
+    }
+    if (plan_v2->elastic_stats_out.has_value() && plan_v2->elastic_stats_out->defined()) {
+      at::Tensor stats = *plan_v2->elastic_stats_out;
+      TORCH_CHECK(stats.device().is_cpu(), "elastic_stats_out must be a CPU tensor");
+      TORCH_CHECK(stats.scalar_type() == at::kLong, "elastic_stats_out must use torch.int64");
+      TORCH_CHECK(stats.is_contiguous(), "elastic_stats_out must be contiguous");
+      TORCH_CHECK(stats.numel() >= kAsyncElasticStatsCount, "elastic_stats_out must contain at least ",
+                  kAsyncElasticStatsCount, " elements, got ", stats.numel());
+      stats.zero_();
+      elastic_stats_ptr = stats.data_ptr<int64_t>();
     }
   }
   trace_phase_end(-1, -1, -1, -1, 0, "plan_materialize", phase_begin);
@@ -7360,29 +7431,56 @@ at::Tensor run_fused_moe_bf16_tiled_async(
     } else {
       task_w2_window_bytes_v.assign(static_cast<size_t>(num_tasks), -1);
     }
+    if (has_task_resize_timeout_ns) {
+      check_per_task_size(task_resize_timeout_ns_v, "task_resize_timeout_ns");
+    } else {
+      task_resize_timeout_ns_v.assign(static_cast<size_t>(num_tasks), 0);
+    }
+    if (has_task_preferred_core_begins) {
+      check_per_task_size(task_preferred_core_begins_v, "task_preferred_core_begins");
+    } else {
+      task_preferred_core_begins_v.assign(static_cast<size_t>(num_tasks), -1);
+    }
     TORCH_CHECK(static_cast<int64_t>(task_allowed_thread_offsets_v.size()) == num_tasks + 1,
                 "task_allowed_thread_offsets must have num_tasks + 1 entries");
     TORCH_CHECK(task_allowed_thread_offsets_v.front() == 0, "task_allowed_thread_offsets[0] must be 0");
     TORCH_CHECK(task_allowed_thread_offsets_v.back() == static_cast<int64_t>(task_allowed_threads_v.size()),
                 "last task_allowed_thread_offsets entry must equal task_allowed_threads length");
     for (int64_t task = 0; task < num_tasks; ++task) {
-      TORCH_CHECK(task_numa_nodes_v[static_cast<size_t>(task)] == -1,
-                  "Plan V2 currently only supports task_numa_nodes=-1: task=", task);
       TORCH_CHECK(task_stage_ids_v[static_cast<size_t>(task)] == kAsyncStageExpert,
                   "Plan V2 currently only supports whole-expert tasks: task=", task);
-      TORCH_CHECK(task_resize_points_v[static_cast<size_t>(task)] == kAsyncResizeNone,
-                  "Plan V2 currently does not support resize points: task=", task);
       TORCH_CHECK(task_range_granularities_v[static_cast<size_t>(task)] == kAsyncFullExpertRange,
                   "Plan V2 currently only supports full-expert ranges: task=", task);
       TORCH_CHECK(task_w13_window_bytes_v[static_cast<size_t>(task)] >= -1,
                   "task_w13_window_bytes must be -1 (inherit) or non-negative: task=", task);
       TORCH_CHECK(task_w2_window_bytes_v[static_cast<size_t>(task)] >= -1,
                   "task_w2_window_bytes must be -1 (inherit) or non-negative: task=", task);
+      TORCH_CHECK(task_resize_timeout_ns_v[static_cast<size_t>(task)] >= 0,
+                  "task_resize_timeout_ns must be non-negative: task=", task);
+      TORCH_CHECK(task_preferred_core_begins_v[static_cast<size_t>(task)] >= -1,
+                  "task_preferred_core_begins must be -1 (derive) or non-negative: task=", task);
       const int64_t placement = task_placement_modes_v[static_cast<size_t>(task)];
       TORCH_CHECK(placement == kAsyncPlacementFixed || placement == kAsyncPlacementTailPool,
                   "task_placement_modes[", task, "] has unsupported value ", placement);
       TORCH_CHECK(plan_v2->execution_mode != kAsyncExecutionStrict || placement == kAsyncPlacementFixed,
                   "strict Plan V2 requires every task placement to be fixed: task=", task);
+      TORCH_CHECK(plan_v2->execution_mode != kAsyncExecutionElastic || placement == kAsyncPlacementFixed,
+                  "elastic Plan V2 requires every task placement to be fixed: task=", task);
+      if (plan_v2->execution_mode == kAsyncExecutionElastic) {
+        const int64_t resize_point = task_resize_points_v[static_cast<size_t>(task)];
+        TORCH_CHECK(resize_point == kAsyncResizeNone || resize_point == kAsyncResizeBeforeW2,
+                    "elastic Plan V2 only supports W13-to-W2 resizing: task=", task,
+                    " resize_point=", resize_point);
+      } else {
+        TORCH_CHECK(task_numa_nodes_v[static_cast<size_t>(task)] == -1,
+                    "strict and tail_pool Plan V2 require task_numa_nodes=-1: task=", task);
+        TORCH_CHECK(task_resize_points_v[static_cast<size_t>(task)] == kAsyncResizeNone,
+                    "strict and tail_pool Plan V2 do not support resize points: task=", task);
+        TORCH_CHECK(task_resize_timeout_ns_v[static_cast<size_t>(task)] == 0,
+                    "strict and tail_pool Plan V2 require zero resize timeout: task=", task);
+        TORCH_CHECK(task_preferred_core_begins_v[static_cast<size_t>(task)] == -1,
+                    "strict and tail_pool Plan V2 require task_preferred_core_begins=-1: task=", task);
+      }
 
       const int64_t begin = task_allowed_thread_offsets_v[static_cast<size_t>(task)];
       const int64_t end = task_allowed_thread_offsets_v[static_cast<size_t>(task + 1)];
@@ -7407,6 +7505,65 @@ at::Tensor run_fused_moe_bf16_tiled_async(
       TORCH_CHECK(task_max_threads_v[static_cast<size_t>(task)] ==
                       task_allowed_threads_v[static_cast<size_t>(end - 1)],
                   "task_max_threads[", task, "] does not match its allowed widths");
+      if (plan_v2->execution_mode == kAsyncExecutionElastic) {
+        const int64_t selected = task_threads_v[static_cast<size_t>(task)];
+        const int64_t preferred = task_preferred_threads_v[static_cast<size_t>(task)];
+        const int64_t resize_point = task_resize_points_v[static_cast<size_t>(task)];
+        if (resize_point == kAsyncResizeNone) {
+          TORCH_CHECK(preferred == selected, "non-resizable elastic task must keep its selected width: task=", task);
+          TORCH_CHECK(task_resize_timeout_ns_v[static_cast<size_t>(task)] == 0,
+                      "non-resizable elastic task must use zero timeout: task=", task);
+          TORCH_CHECK(task_preferred_core_begins_v[static_cast<size_t>(task)] == -1,
+                      "non-resizable elastic task must not select a preferred core begin: task=", task);
+          continue;
+        }
+        TORCH_CHECK(preferred > selected && preferred % selected == 0,
+                    "elastic task preferred width must be a larger multiple of its selected width: task=", task,
+                    " selected=", selected, " preferred=", preferred);
+        const int64_t core_begin = task_core_begins_v[static_cast<size_t>(task)];
+        const int64_t requested_core_begin =
+            task_preferred_core_begins_v[static_cast<size_t>(task)];
+        const int64_t preferred_core_begin =
+            requested_core_begin >= 0 ? requested_core_begin : core_begin / preferred * preferred;
+        TORCH_CHECK(preferred_core_begin >= 0 && preferred_core_begin + preferred <= num_threads,
+                    "elastic task preferred cohort exceeds num_threads: task=", task,
+                    " cohort=[", preferred_core_begin, ", ", preferred_core_begin + preferred,
+                    ") num_threads=", num_threads);
+        TORCH_CHECK(preferred_core_begin % preferred == 0,
+                    "elastic task preferred cohort must align to its preferred width: task=", task,
+                    " core_begin=", preferred_core_begin, " preferred=", preferred);
+        const int64_t core_end = core_begin + selected;
+        const int64_t preferred_core_end = preferred_core_begin + preferred;
+        const bool source_is_contained =
+            preferred_core_begin <= core_begin && core_end <= preferred_core_end;
+        const bool source_is_disjoint =
+            core_end <= preferred_core_begin || preferred_core_end <= core_begin;
+        TORCH_CHECK(source_is_contained || source_is_disjoint,
+                    "elastic task preferred cohort must contain or be disjoint from its selected team: task=", task,
+                    " selected=[", core_begin, ", ", core_end, ") preferred=[", preferred_core_begin, ", ",
+                    preferred_core_end, ")");
+        const int64_t expected_node = task_numa_nodes_v[static_cast<size_t>(task)];
+        TORCH_CHECK(expected_node >= 0, "elastic resize requires an explicit NUMA node: task=", task);
+        for (int64_t logical_core = core_begin; logical_core < core_end; ++logical_core) {
+          const int64_t cpu = async_thread_pinning.cpus[static_cast<size_t>(logical_core)];
+          const int64_t actual_node = cpu_numa_node(cpu);
+          TORCH_CHECK(actual_node >= 0, "cannot determine NUMA node for CPU ", cpu,
+                      " while validating elastic task ", task);
+          TORCH_CHECK(actual_node == expected_node, "elastic selected team crosses NUMA nodes: task=", task,
+                      " logical_core=", logical_core, " cpu=", cpu, " expected_node=", expected_node,
+                      " actual_node=", actual_node);
+        }
+        for (int64_t logical_core = preferred_core_begin; logical_core < preferred_core_begin + preferred;
+             ++logical_core) {
+          const int64_t cpu = async_thread_pinning.cpus[static_cast<size_t>(logical_core)];
+          const int64_t actual_node = cpu_numa_node(cpu);
+          TORCH_CHECK(actual_node >= 0, "cannot determine NUMA node for CPU ", cpu,
+                      " while validating elastic task ", task);
+          TORCH_CHECK(actual_node == expected_node, "elastic cohort crosses NUMA nodes: task=", task,
+                      " logical_core=", logical_core, " cpu=", cpu, " expected_node=", expected_node,
+                      " actual_node=", actual_node);
+        }
+      }
     }
   }
 
@@ -7426,6 +7583,18 @@ at::Tensor run_fused_moe_bf16_tiled_async(
   bool use_async_ready_token_merge =
       use_w2_direct_route && env_flag_enabled_by_default("FUSED_CPP_MOE_ASYNC_READY_TOKEN_MERGE");
   const bool plan_v2_tail_pool = has_plan_v2 && plan_v2->execution_mode == kAsyncExecutionTailPool;
+  const bool plan_v2_elastic = has_plan_v2 && plan_v2->execution_mode == kAsyncExecutionElastic;
+  if (plan_v2_elastic) {
+    TORCH_CHECK(use_sve_backend && fuse_silu,
+                "elastic Plan V2 currently requires the fused SVE backend");
+    TORCH_CHECK(!plan_v2->elastic_stats_out.has_value() || elastic_stats_ptr != nullptr,
+                "elastic_stats_out must be a defined int64 CPU tensor");
+    // Ready-token merging consumes otherwise idle workers and would make the
+    // first elastic experiment's availability measurement ambiguous.
+    use_async_ready_token_merge = false;
+  } else {
+    TORCH_CHECK(elastic_stats_ptr == nullptr, "elastic_stats_out is only valid in elastic execution mode");
+  }
   int64_t async_short_pool_threads = 0;
   int64_t async_short_pool_max_rows = 12;
   if (plan_v2_tail_pool) {
@@ -7485,6 +7654,9 @@ at::Tensor run_fused_moe_bf16_tiled_async(
   std::vector<int64_t> short_pool_task_ids;
   std::vector<ScheduledScratchUnitConfig> scratch_unit_configs;
   std::vector<int64_t> short_pool_scratch_indices;
+  std::vector<int64_t> elastic_preferred_core_begins(static_cast<size_t>(num_tasks), -1);
+  std::vector<int64_t> elastic_preferred_threads(static_cast<size_t>(num_tasks), 0);
+  std::vector<int64_t> elastic_w2_barrier_indices(static_cast<size_t>(num_tasks), -1);
   int64_t trace_gemm_hint = 0;
 
   auto ensure_scratch_config = [&](int64_t core_begin, int64_t threads, int64_t rows) {
@@ -7512,6 +7684,22 @@ at::Tensor run_fused_moe_bf16_tiled_async(
     return scratch_idx;
   };
 
+  auto ensure_barrier_config = [&](int64_t core_begin, int64_t threads) {
+    for (size_t idx = 0; idx < scratch_unit_configs.size(); ++idx) {
+      const ScheduledScratchUnitConfig& config = scratch_unit_configs[idx];
+      if (config.thread_begin == core_begin && config.threads == threads) {
+        return static_cast<int64_t>(idx);
+      }
+    }
+    const int64_t scratch_idx = static_cast<int64_t>(scratch_unit_configs.size());
+    ScheduledScratchUnitConfig config;
+    config.thread_begin = core_begin;
+    config.threads = threads;
+    config.barrier_only = true;
+    scratch_unit_configs.push_back(config);
+    return scratch_idx;
+  };
+
   int64_t max_short_pool_rows = 0;
   for (int64_t task = 0; task < num_tasks; ++task) {
     const int64_t expert = task_expert_ids_v[static_cast<size_t>(task)];
@@ -7529,7 +7717,7 @@ at::Tensor run_fused_moe_bf16_tiled_async(
       TORCH_CHECK(core_begin >= 0, "fixed task_core_begins[", task, "] must be non-negative, got ", core_begin);
       TORCH_CHECK(core_begin + threads <= num_threads, "task ", task, " interval [", core_begin, ", ",
                   core_begin + threads, ") exceeds num_threads=", num_threads);
-      if (has_plan_v2) {
+      if (has_plan_v2 && !plan_v2_elastic) {
         TORCH_CHECK(core_begin + task_max_threads_v[static_cast<size_t>(task)] <= num_threads,
                     "task ", task, " allowed widths exceed its fixed logical-core placement");
       }
@@ -7560,6 +7748,28 @@ at::Tensor run_fused_moe_bf16_tiled_async(
       tasks[static_cast<size_t>(task)] = AsyncTaskRuntime{
           expert, rows, core_begin, threads, scratch_idx, task_w13_window_bytes, task_w2_window_bytes};
       trace_gemm_hint += threads * 2;
+    }
+  }
+  if (plan_v2_elastic) {
+    for (int64_t task = 0; task < num_tasks; ++task) {
+      const int64_t selected = task_threads_v[static_cast<size_t>(task)];
+      const bool resizable =
+          task_resize_points_v[static_cast<size_t>(task)] == kAsyncResizeBeforeW2;
+      const int64_t preferred =
+          resizable ? task_preferred_threads_v[static_cast<size_t>(task)] : selected;
+      const int64_t requested_core_begin =
+          resizable ? task_preferred_core_begins_v[static_cast<size_t>(task)] : -1;
+      const int64_t preferred_core_begin =
+          resizable ? (requested_core_begin >= 0
+                           ? requested_core_begin
+                           : task_core_begins_v[static_cast<size_t>(task)] / preferred * preferred)
+                    : task_core_begins_v[static_cast<size_t>(task)];
+      elastic_preferred_core_begins[static_cast<size_t>(task)] = preferred_core_begin;
+      elastic_preferred_threads[static_cast<size_t>(task)] = preferred;
+      elastic_w2_barrier_indices[static_cast<size_t>(task)] =
+          preferred == selected
+              ? tasks[static_cast<size_t>(task)].scratch_index
+              : ensure_barrier_config(preferred_core_begin, preferred);
     }
   }
   if (use_async_short_pool) {
@@ -7965,8 +8175,724 @@ at::Tensor run_fused_moe_bf16_tiled_async(
     barrier.wait();
   };
 
+  auto run_elastic_w13 = [&](int64_t tid, int64_t task_id, const AsyncTaskRuntime& task) {
+    const int64_t local_tid = tid - task.core_begin;
+    ScheduledTeamScratch& scratch = *scratches[static_cast<size_t>(task.scratch_index)];
+    ThreadBarrier& barrier = scratch.barrier;
+    const int64_t expert = task.expert;
+    const int64_t rows = task.rows;
+    const int64_t group_size = task.threads;
+    const int64_t task_w13_weight_window_bytes =
+        task.w13_window_bytes >= 0 ? task.w13_window_bytes : w13_weight_window_bytes;
+    const auto& expert_routes = routes[static_cast<size_t>(expert)];
+
+    auto worker_phase_begin = trace_phase_begin();
+    gather_pack_a_reorder_sve_hybrid(input_ptr, H, expert_routes.data(), top_k, scratch.packed_a.data(),
+                                     static_cast<int>(rows), static_cast<int>(w13.K_pad), group_size, local_tid);
+    trace_phase_end(tid, task_id, local_tid, expert, rows, "gather_pack_a", worker_phase_begin);
+    barrier.wait();
+
+    worker_phase_begin = trace_phase_begin();
+    if (!elide_intermediate_zero && local_tid == 0) {
+      const int64_t rows_padded = sve_hybrid_packed_rows(rows);
+      std::fill(scratch.intermediate.begin(), scratch.intermediate.begin() + rows_padded * w2.K_pad,
+                static_cast<uint16_t>(0));
+    }
+    if (!elide_intermediate_zero) {
+      barrier.wait();
+    }
+    TeamContext team;
+    team.group_size = group_size;
+    team.local_tid = local_tid;
+    team.barrier = group_size > 1 ? &barrier : nullptr;
+    team.a_reorder = nullptr;
+    const Gemm2DSplitPlan w13_2d_plan =
+        plan_2d_gemm_split(rows, w13.K_pad, w13.N_pad, group_size, w13.n_tile);
+    team_fused_w13_silu_packed_packc_backend(
+        true, use_fused_2d_split, team, w13_2d_plan, scratch.packed_a.data(),
+        w13_ptr + expert * w13.packed_stride, scratch.intermediate.data(), static_cast<int>(rows),
+        static_cast<int>(w13.K_pad), static_cast<int>(w13.N_pad), static_cast<int>(w2.K_pad), silu_poly_degree,
+        w13.n_tile, use_w13_split, task_w13_weight_window_bytes);
+    trace_phase_end(tid, task_id, local_tid, expert, rows, "w13_fused_silu_packc", worker_phase_begin);
+    barrier.wait();
+  };
+
+  auto run_elastic_w2 = [&](int64_t tid, int64_t task_id, const AsyncTaskRuntime& task, int64_t core_begin,
+                            int64_t group_size, ThreadBarrier& barrier) {
+    const int64_t local_tid = tid - core_begin;
+    ScheduledTeamScratch& scratch = *scratches[static_cast<size_t>(task.scratch_index)];
+    const int64_t expert = task.expert;
+    const int64_t rows = task.rows;
+    const int64_t task_w2_weight_window_bytes =
+        task.w2_window_bytes >= 0 ? task.w2_window_bytes : w2_weight_window_bytes;
+    const auto& expert_routes = routes[static_cast<size_t>(expert)];
+
+    auto worker_phase_begin = trace_phase_begin();
+    TeamContext w2team;
+    w2team.group_size = group_size;
+    w2team.local_tid = local_tid;
+    w2team.barrier = nullptr;
+    w2team.a_reorder = nullptr;
+    const Gemm2DSplitPlan w2_2d_plan =
+        plan_2d_gemm_split(rows, w2.K_pad, w2.N_pad, group_size, w2.n_tile);
+    if (use_w2_direct_route) {
+      if (use_w2_bf16_route) {
+        team_w2_packed_sve_direct_bf16_route_backend(
+            use_fused_2d_split, w2team, w2_2d_plan, scratch.intermediate.data(),
+            w2_ptr + expert * w2.packed_stride, route_out_bf16_ptr, expert_routes.data(), static_cast<int>(rows),
+            static_cast<int>(w2.K_pad), static_cast<int>(w2.N_pad), static_cast<int>(H), w2.n_tile,
+            task_w2_weight_window_bytes);
+      } else {
+        team_w2_packed_sve_direct_route_backend(
+            use_fused_2d_split, w2team, w2_2d_plan, scratch.intermediate.data(),
+            w2_ptr + expert * w2.packed_stride, route_out_ptr, expert_routes.data(), static_cast<int>(rows),
+            static_cast<int>(w2.K_pad), static_cast<int>(w2.N_pad), static_cast<int>(H), w2.n_tile,
+            task_w2_weight_window_bytes);
+      }
+    } else if (use_w2_bf16_route) {
+      team_w2_packed_bf16_sve_backend(
+          use_fused_2d_split, w2team, w2_2d_plan, scratch.intermediate.data(),
+          w2_ptr + expert * w2.packed_stride, scratch.down_bf16.data(), static_cast<int>(rows),
+          static_cast<int>(w2.K_pad), static_cast<int>(w2.N_pad), static_cast<int>(w2.N_pad), w2.n_tile,
+          task_w2_weight_window_bytes);
+    } else {
+      team_w2_packed_backend(
+          true, use_fused_2d_split, w2team, w2_2d_plan, scratch.intermediate.data(),
+          w2_ptr + expert * w2.packed_stride, scratch.down.data(), static_cast<int>(rows),
+          static_cast<int>(w2.K_pad), static_cast<int>(w2.N_pad), static_cast<int>(w2.N_pad), w2.n_tile,
+          task_w2_weight_window_bytes);
+    }
+    trace_phase_end(tid, task_id, local_tid, expert, rows, use_w2_direct_route ? "w2_direct_route" : "w2_packed",
+                    worker_phase_begin);
+    if (!use_w2_direct_route && !use_w2_n_owner_scatter) {
+      barrier.wait();
+    }
+
+    if (!use_w2_direct_route) {
+      worker_phase_begin = trace_phase_begin();
+      for_each_w2_scatter_range(static_cast<int>(w2.N_pad), group_size, local_tid, w2.K_pad, w2.n_tile,
+                                task_w2_weight_window_bytes, use_w2_n_owner_scatter,
+                                [&](const SplitRange& h_range) {
+                                  const int64_t h_begin = h_range.begin;
+                                  const int64_t h_end = std::min<int64_t>(H, h_begin + h_range.size);
+                                  if (h_begin >= h_end) {
+                                    return;
+                                  }
+                                  for (int64_t m = 0; m < rows; ++m) {
+                                    const int64_t flat = expert_routes[static_cast<size_t>(m)];
+                                    if (use_w2_bf16_route) {
+                                      const uint16_t* src = scratch.down_bf16.data() + m * w2.N_pad;
+                                      uint16_t* dst = route_out_bf16_ptr + flat * H;
+                                      std::copy(src + h_begin, src + h_end, dst + h_begin);
+                                    } else if (skip_weighted) {
+                                      const float* src = scratch.down.data() + m * w2.N_pad;
+                                      uint16_t* dst = out_bf16_ptr + flat * H;
+                                      convert_f32_to_bf16(src + h_begin, dst + h_begin, h_end - h_begin);
+                                    } else {
+                                      const float* src = scratch.down.data() + m * w2.N_pad;
+                                      float* dst = route_out_ptr + flat * H;
+                                      std::copy(src + h_begin, src + h_end, dst + h_begin);
+                                    }
+                                  }
+                                });
+      trace_phase_end(tid, task_id, local_tid, expert, rows, "scatter_route_out", worker_phase_begin);
+    }
+    barrier.wait();
+  };
+
+  const bool plan_v2_nonblocking_elastic =
+      plan_v2_elastic &&
+      std::all_of(task_resize_timeout_ns_v.begin(), task_resize_timeout_ns_v.end(),
+                  [](int64_t timeout_ns) { return timeout_ns == 0; });
+
   phase_begin = trace_phase_begin();
-  if (!use_async_short_pool) {
+  if (plan_v2_nonblocking_elastic) {
+    constexpr int64_t kElasticPending = 0;
+    constexpr int64_t kElasticW13Running = 1;
+    constexpr int64_t kElasticW2Ready = 2;
+    constexpr int64_t kElasticW2Running = 3;
+    constexpr int64_t kElasticComplete = 4;
+
+    std::vector<std::atomic<int64_t>> core_owners(static_cast<size_t>(num_threads));
+    std::vector<std::atomic<int64_t>> core_jobs(static_cast<size_t>(num_threads));
+    std::vector<std::vector<int64_t>> w13_tasks_by_leader(static_cast<size_t>(num_threads));
+    std::vector<int64_t> w2_core_begins(static_cast<size_t>(num_tasks), -1);
+    std::vector<int64_t> w2_threads(static_cast<size_t>(num_tasks), 0);
+    std::vector<int64_t> w2_barrier_indices(static_cast<size_t>(num_tasks), -1);
+    std::vector<int64_t> w2_wait_ns(static_cast<size_t>(num_tasks), 0);
+    std::vector<int8_t> w2_preferred(static_cast<size_t>(num_tasks), int8_t{0});
+    for (int64_t core = 0; core < num_threads; ++core) {
+      core_owners[static_cast<size_t>(core)].store(-1, std::memory_order_relaxed);
+      core_jobs[static_cast<size_t>(core)].store(-1, std::memory_order_relaxed);
+    }
+    for (int64_t task_id = 0; task_id < num_tasks; ++task_id) {
+      const AsyncTaskRuntime& task = tasks[static_cast<size_t>(task_id)];
+      w13_tasks_by_leader[static_cast<size_t>(task.core_begin)].push_back(task_id);
+    }
+
+    auto steady_now_ns = []() {
+      return std::chrono::duration_cast<std::chrono::nanoseconds>(
+                 std::chrono::steady_clock::now().time_since_epoch())
+          .count();
+    };
+
+    auto release_claimed_cores = [&](int64_t task_id, int64_t core_begin, int64_t threads,
+                                     const AsyncTaskRuntime& task) {
+      for (int64_t core = core_begin; core < core_begin + threads; ++core) {
+        if (core >= task.core_begin && core < task.core_begin + task.threads) {
+          continue;
+        }
+        int64_t expected = task_id;
+        const bool released = core_owners[static_cast<size_t>(core)].compare_exchange_strong(
+            expected, -1, std::memory_order_acq_rel, std::memory_order_relaxed);
+        TORCH_INTERNAL_ASSERT(released, "nonblocking elastic core ownership rollback failed");
+      }
+    };
+
+    auto try_claim_team = [&](int64_t task_id, int64_t core_begin, int64_t threads,
+                              const AsyncTaskRuntime& task) {
+      for (int64_t core = task.core_begin; core < task.core_begin + task.threads; ++core) {
+        if (core_owners[static_cast<size_t>(core)].load(std::memory_order_acquire) != task_id ||
+            core_jobs[static_cast<size_t>(core)].load(std::memory_order_acquire) != task_id) {
+          return false;
+        }
+      }
+      int64_t claimed_until = core_begin;
+      for (int64_t core = core_begin; core < core_begin + threads; ++core) {
+        const bool selected_core = core >= task.core_begin && core < task.core_begin + task.threads;
+        if (selected_core) {
+          if (core_owners[static_cast<size_t>(core)].load(std::memory_order_acquire) != task_id ||
+              core_jobs[static_cast<size_t>(core)].load(std::memory_order_acquire) != task_id) {
+            release_claimed_cores(task_id, core_begin, claimed_until - core_begin, task);
+            return false;
+          }
+        } else {
+          if (core_jobs[static_cast<size_t>(core)].load(std::memory_order_acquire) >= 0) {
+            release_claimed_cores(task_id, core_begin, claimed_until - core_begin, task);
+            return false;
+          }
+          int64_t expected = -1;
+          if (!core_owners[static_cast<size_t>(core)].compare_exchange_strong(
+                  expected, task_id, std::memory_order_acq_rel, std::memory_order_relaxed)) {
+            release_claimed_cores(task_id, core_begin, claimed_until - core_begin, task);
+            return false;
+          }
+        }
+        claimed_until = core + 1;
+      }
+      return true;
+    };
+
+    auto assign_w2 = [&](int64_t task_id, int64_t core_begin, int64_t threads, int64_t barrier_index,
+                         bool preferred, int64_t ready_ns) {
+      const AsyncTaskRuntime& task = tasks[static_cast<size_t>(task_id)];
+      w2_core_begins[static_cast<size_t>(task_id)] = core_begin;
+      w2_threads[static_cast<size_t>(task_id)] = threads;
+      w2_barrier_indices[static_cast<size_t>(task_id)] = barrier_index;
+      w2_wait_ns[static_cast<size_t>(task_id)] = std::max<int64_t>(0, steady_now_ns() - ready_ns);
+      w2_preferred[static_cast<size_t>(task_id)] = preferred ? int8_t{1} : int8_t{0};
+      for (int64_t core = core_begin; core < core_begin + threads; ++core) {
+        if (core_jobs[static_cast<size_t>(core)].load(std::memory_order_relaxed) != task_id) {
+          core_jobs[static_cast<size_t>(core)].store(task_id, std::memory_order_release);
+        }
+      }
+      const int64_t core_end = core_begin + threads;
+      for (int64_t core = task.core_begin; core < task.core_begin + task.threads; ++core) {
+        if (core >= core_begin && core < core_end) {
+          continue;
+        }
+        int64_t expected_job = task_id;
+        const bool job_released = core_jobs[static_cast<size_t>(core)].compare_exchange_strong(
+            expected_job, -1, std::memory_order_acq_rel, std::memory_order_relaxed);
+        TORCH_INTERNAL_ASSERT(job_released, "nonblocking elastic W2 source job ownership mismatch");
+        int64_t expected_owner = task_id;
+        const bool owner_released = core_owners[static_cast<size_t>(core)].compare_exchange_strong(
+            expected_owner, -1, std::memory_order_acq_rel, std::memory_order_relaxed);
+        TORCH_INTERNAL_ASSERT(owner_released, "nonblocking elastic W2 source ownership mismatch");
+      }
+      task_states[static_cast<size_t>(task_id)].store(kElasticW2Running, std::memory_order_release);
+    };
+
+    auto schedule_nonblocking_w2 = [&](int64_t task_id, int64_t ready_ns) {
+      const AsyncTaskRuntime& task = tasks[static_cast<size_t>(task_id)];
+      const bool resizable =
+          task_resize_points_v[static_cast<size_t>(task_id)] == kAsyncResizeBeforeW2;
+      if (resizable) {
+        const int64_t preferred_core_begin =
+            elastic_preferred_core_begins[static_cast<size_t>(task_id)];
+        const int64_t preferred_threads = elastic_preferred_threads[static_cast<size_t>(task_id)];
+        if (try_claim_team(task_id, preferred_core_begin, preferred_threads, task)) {
+          assign_w2(task_id, preferred_core_begin, preferred_threads,
+                    elastic_w2_barrier_indices[static_cast<size_t>(task_id)], true, ready_ns);
+          return;
+        }
+      }
+      assign_w2(task_id, task.core_begin, task.threads, task.scratch_index, false, ready_ns);
+    };
+
+    auto try_claim_w13 = [&](int64_t tid) {
+      for (const int64_t task_id : w13_tasks_by_leader[static_cast<size_t>(tid)]) {
+        const AsyncTaskRuntime& task = tasks[static_cast<size_t>(task_id)];
+        if (task_states[static_cast<size_t>(task_id)].load(std::memory_order_acquire) != kElasticPending ||
+            deps_remaining[static_cast<size_t>(task_id)].load(std::memory_order_acquire) != 0) {
+          continue;
+        }
+        int64_t claimed = 0;
+        for (; claimed < task.threads; ++claimed) {
+          int64_t expected = -1;
+          if (!core_owners[static_cast<size_t>(task.core_begin + claimed)].compare_exchange_strong(
+                  expected, task_id, std::memory_order_acq_rel, std::memory_order_relaxed)) {
+            break;
+          }
+        }
+        if (claimed != task.threads) {
+          for (int64_t offset = 0; offset < claimed; ++offset) {
+            int64_t expected = task_id;
+            const bool released =
+                core_owners[static_cast<size_t>(task.core_begin + offset)].compare_exchange_strong(
+                    expected, -1, std::memory_order_acq_rel, std::memory_order_relaxed);
+            TORCH_INTERNAL_ASSERT(released, "nonblocking elastic W13 ownership rollback failed");
+          }
+          continue;
+        }
+        task_states[static_cast<size_t>(task_id)].store(kElasticW13Running, std::memory_order_release);
+        for (int64_t core = task.core_begin; core < task.core_begin + task.threads; ++core) {
+          core_jobs[static_cast<size_t>(core)].store(task_id, std::memory_order_release);
+        }
+        return task_id;
+      }
+      return int64_t{-1};
+    };
+
+    run_fixed_threads(num_threads, [&](int64_t tid) {
+      while (completed_tasks.load(std::memory_order_acquire) < num_tasks) {
+        int64_t selected_task = core_jobs[static_cast<size_t>(tid)].load(std::memory_order_acquire);
+        if (selected_task < 0 && !w13_tasks_by_leader[static_cast<size_t>(tid)].empty()) {
+          selected_task = try_claim_w13(tid);
+        }
+        if (selected_task < 0) {
+          std::this_thread::yield();
+          continue;
+        }
+
+        const AsyncTaskRuntime& task = tasks[static_cast<size_t>(selected_task)];
+        int64_t selected_state =
+            task_states[static_cast<size_t>(selected_task)].load(std::memory_order_acquire);
+        if (selected_state == kElasticW13Running) {
+          run_elastic_w13(tid, selected_task, task);
+          if (tid == task.core_begin) {
+            const int64_t ready_ns = steady_now_ns();
+            task_states[static_cast<size_t>(selected_task)].store(kElasticW2Ready, std::memory_order_release);
+            schedule_nonblocking_w2(selected_task, ready_ns);
+          } else {
+            while (task_states[static_cast<size_t>(selected_task)].load(std::memory_order_acquire) ==
+                   kElasticW13Running) {
+#if defined(__aarch64__)
+              __asm__ __volatile__("yield" ::: "memory");
+#else
+              std::this_thread::yield();
+#endif
+            }
+          }
+          selected_state =
+              task_states[static_cast<size_t>(selected_task)].load(std::memory_order_acquire);
+        }
+        if (selected_state != kElasticW2Running) {
+          std::this_thread::yield();
+          continue;
+        }
+
+        const int64_t w2_core_begin = w2_core_begins[static_cast<size_t>(selected_task)];
+        const int64_t w2_group_size = w2_threads[static_cast<size_t>(selected_task)];
+        const int64_t barrier_index = w2_barrier_indices[static_cast<size_t>(selected_task)];
+        if (tid < w2_core_begin || tid >= w2_core_begin + w2_group_size) {
+          continue;
+        }
+        TORCH_INTERNAL_ASSERT(barrier_index >= 0, "nonblocking elastic W2 task has no barrier scratch");
+        ThreadBarrier& barrier = scratches[static_cast<size_t>(barrier_index)]->barrier;
+        run_elastic_w2(tid, selected_task, task, w2_core_begin, w2_group_size, barrier);
+        if (tid == w2_core_begin) {
+          for (int64_t core = w2_core_begin; core < w2_core_begin + w2_group_size; ++core) {
+            TORCH_INTERNAL_ASSERT(
+                core_jobs[static_cast<size_t>(core)].load(std::memory_order_relaxed) == selected_task,
+                "nonblocking elastic W2 core job ownership mismatch");
+            core_jobs[static_cast<size_t>(core)].store(-1, std::memory_order_release);
+            int64_t expected = selected_task;
+            const bool released = core_owners[static_cast<size_t>(core)].compare_exchange_strong(
+                expected, -1, std::memory_order_acq_rel, std::memory_order_relaxed);
+            TORCH_INTERNAL_ASSERT(released, "nonblocking elastic W2 core ownership mismatch");
+          }
+          for (const int64_t child : successors[static_cast<size_t>(selected_task)]) {
+            deps_remaining[static_cast<size_t>(child)].fetch_sub(1, std::memory_order_acq_rel);
+          }
+          task_states[static_cast<size_t>(selected_task)].store(kElasticComplete, std::memory_order_release);
+          completed_tasks.fetch_add(1, std::memory_order_acq_rel);
+        }
+        barrier.wait();
+      }
+    });
+
+    std::vector<int64_t> elastic_stats(static_cast<size_t>(kAsyncElasticStatsCount), 0);
+    for (int64_t task_id = 0; task_id < num_tasks; ++task_id) {
+      if (task_resize_points_v[static_cast<size_t>(task_id)] != kAsyncResizeBeforeW2) {
+        continue;
+      }
+      ++elastic_stats[static_cast<size_t>(kElasticEligibleTasks)];
+      const int64_t wait_ns = w2_wait_ns[static_cast<size_t>(task_id)];
+      elastic_stats[static_cast<size_t>(kElasticTotalWaitNs)] += wait_ns;
+      elastic_stats[static_cast<size_t>(kElasticMaxWaitNs)] =
+          std::max(elastic_stats[static_cast<size_t>(kElasticMaxWaitNs)], wait_ns);
+      if (w2_preferred[static_cast<size_t>(task_id)] != 0) {
+        ++elastic_stats[static_cast<size_t>(kElasticPreferredAssignments)];
+        ++elastic_stats[static_cast<size_t>(kElasticNaturalOpportunities)];
+        ++elastic_stats[static_cast<size_t>(kElasticCohortJobs)];
+        elastic_stats[static_cast<size_t>(kElasticBorrowedThreads)] +=
+            w2_threads[static_cast<size_t>(task_id)] - tasks[static_cast<size_t>(task_id)].threads;
+      } else {
+        ++elastic_stats[static_cast<size_t>(kElasticFallbackAssignments)];
+      }
+    }
+    if (elastic_stats_ptr != nullptr) {
+      std::copy(elastic_stats.begin(), elastic_stats.end(), elastic_stats_ptr);
+    }
+    if (env_flag_enabled("FUSED_CPP_MOE_STAGE_TIMING")) {
+      std::fprintf(
+          stderr,
+          "[fused_moe_bf16_tiled_async][elastic] eligible=%lld preferred=%lld fallback=%lld natural=%lld "
+          "waited=0 timeout=0 cohort_jobs=%lld borrowed_threads=%lld total_wait_us=%.3f max_wait_us=%.3f\n",
+          static_cast<long long>(elastic_stats[static_cast<size_t>(kElasticEligibleTasks)]),
+          static_cast<long long>(elastic_stats[static_cast<size_t>(kElasticPreferredAssignments)]),
+          static_cast<long long>(elastic_stats[static_cast<size_t>(kElasticFallbackAssignments)]),
+          static_cast<long long>(elastic_stats[static_cast<size_t>(kElasticNaturalOpportunities)]),
+          static_cast<long long>(elastic_stats[static_cast<size_t>(kElasticCohortJobs)]),
+          static_cast<long long>(elastic_stats[static_cast<size_t>(kElasticBorrowedThreads)]),
+          static_cast<double>(elastic_stats[static_cast<size_t>(kElasticTotalWaitNs)]) / 1000.0,
+          static_cast<double>(elastic_stats[static_cast<size_t>(kElasticMaxWaitNs)]) / 1000.0);
+    }
+  } else if (plan_v2_elastic) {
+    constexpr int64_t kElasticPending = 0;
+    constexpr int64_t kElasticW13Running = 1;
+    constexpr int64_t kElasticW2Ready = 2;
+    constexpr int64_t kElasticW2Running = 3;
+    constexpr int64_t kElasticComplete = 4;
+
+    std::mutex scheduler_mutex;
+    std::vector<int64_t> core_owners(static_cast<size_t>(num_threads), -1);
+    std::vector<int64_t> core_w2_jobs(static_cast<size_t>(num_threads), -1);
+    std::vector<std::atomic<int64_t>> core_active_jobs(static_cast<size_t>(num_threads));
+    std::vector<std::vector<int64_t>> w13_tasks_by_leader(static_cast<size_t>(num_threads));
+    std::vector<int64_t> w2_core_begins(static_cast<size_t>(num_tasks), -1);
+    std::vector<int64_t> w2_threads(static_cast<size_t>(num_tasks), 0);
+    std::vector<int64_t> w2_barrier_indices(static_cast<size_t>(num_tasks), -1);
+    std::vector<int64_t> w2_ready_since_ns(static_cast<size_t>(num_tasks), 0);
+    std::vector<int8_t> resize_attempted(static_cast<size_t>(num_tasks), int8_t{0});
+    std::vector<int64_t> elastic_stats(static_cast<size_t>(kAsyncElasticStatsCount), 0);
+    for (std::atomic<int64_t>& active_job : core_active_jobs) {
+      active_job.store(-1, std::memory_order_relaxed);
+    }
+    for (int64_t task = 0; task < num_tasks; ++task) {
+      const AsyncTaskRuntime& runtime = tasks[static_cast<size_t>(task)];
+      w13_tasks_by_leader[static_cast<size_t>(runtime.core_begin)].push_back(task);
+      if (task_resize_points_v[static_cast<size_t>(task)] == kAsyncResizeBeforeW2) {
+        ++elastic_stats[static_cast<size_t>(kElasticEligibleTasks)];
+      }
+    }
+
+    auto steady_now_ns = []() {
+      return std::chrono::duration_cast<std::chrono::nanoseconds>(
+                 std::chrono::steady_clock::now().time_since_epoch())
+          .count();
+    };
+
+    auto assign_w2_locked = [&](int64_t task_id, int64_t core_begin, int64_t threads, int64_t barrier_index,
+                                bool preferred, bool first_attempt, int64_t now_ns) {
+      const AsyncTaskRuntime& task = tasks[static_cast<size_t>(task_id)];
+      for (int64_t core = core_begin; core < core_begin + threads; ++core) {
+        TORCH_INTERNAL_ASSERT(core_w2_jobs[static_cast<size_t>(core)] < 0,
+                              "elastic W2 assignment overlaps an active W2 job");
+        core_w2_jobs[static_cast<size_t>(core)] = task_id;
+        if (core_owners[static_cast<size_t>(core)] < 0) {
+          core_owners[static_cast<size_t>(core)] = task_id;
+        }
+      }
+      const int64_t core_end = core_begin + threads;
+      for (int64_t core = task.core_begin; core < task.core_begin + task.threads; ++core) {
+        if (core >= core_begin && core < core_end) {
+          continue;
+        }
+        TORCH_INTERNAL_ASSERT(core_w2_jobs[static_cast<size_t>(core)] < 0,
+                              "elastic W2 migration releases a source core with an active W2 job");
+        TORCH_INTERNAL_ASSERT(core_owners[static_cast<size_t>(core)] == task_id,
+                              "elastic W2 migration source ownership mismatch");
+        TORCH_INTERNAL_ASSERT(
+            core_active_jobs[static_cast<size_t>(core)].load(std::memory_order_relaxed) < 0,
+            "elastic W2 migration releases a source core with an active worker job");
+        core_owners[static_cast<size_t>(core)] = -1;
+      }
+      w2_core_begins[static_cast<size_t>(task_id)] = core_begin;
+      w2_threads[static_cast<size_t>(task_id)] = threads;
+      w2_barrier_indices[static_cast<size_t>(task_id)] = barrier_index;
+      if (task_resize_points_v[static_cast<size_t>(task_id)] == kAsyncResizeBeforeW2) {
+        const int64_t wait_ns = std::max<int64_t>(0, now_ns - w2_ready_since_ns[static_cast<size_t>(task_id)]);
+        elastic_stats[static_cast<size_t>(kElasticTotalWaitNs)] += wait_ns;
+        elastic_stats[static_cast<size_t>(kElasticMaxWaitNs)] =
+            std::max(elastic_stats[static_cast<size_t>(kElasticMaxWaitNs)], wait_ns);
+      }
+      if (preferred) {
+        ++elastic_stats[static_cast<size_t>(kElasticPreferredAssignments)];
+        ++elastic_stats[static_cast<size_t>(kElasticCohortJobs)];
+        elastic_stats[static_cast<size_t>(kElasticBorrowedThreads)] += threads - task.threads;
+        if (first_attempt) {
+          ++elastic_stats[static_cast<size_t>(kElasticNaturalOpportunities)];
+        } else {
+          ++elastic_stats[static_cast<size_t>(kElasticWaitedPreferredAssignments)];
+        }
+      } else if (task_resize_points_v[static_cast<size_t>(task_id)] == kAsyncResizeBeforeW2) {
+        ++elastic_stats[static_cast<size_t>(kElasticFallbackAssignments)];
+        const int64_t timeout_ns = task_resize_timeout_ns_v[static_cast<size_t>(task_id)];
+        if (timeout_ns > 0) {
+          ++elastic_stats[static_cast<size_t>(kElasticTimeoutFallbacks)];
+        }
+      }
+      task_states[static_cast<size_t>(task_id)].store(kElasticW2Running, std::memory_order_release);
+      for (int64_t core = core_begin; core < core_begin + threads; ++core) {
+        core_active_jobs[static_cast<size_t>(core)].store(task_id, std::memory_order_release);
+      }
+    };
+
+    auto preferred_team_available_locked = [&](int64_t task_id, int64_t now_ns) {
+      const AsyncTaskRuntime& task = tasks[static_cast<size_t>(task_id)];
+      for (int64_t core = task.core_begin; core < task.core_begin + task.threads; ++core) {
+        if (core_owners[static_cast<size_t>(core)] != task_id ||
+            core_w2_jobs[static_cast<size_t>(core)] >= 0) {
+          return false;
+        }
+      }
+      const int64_t core_begin = elastic_preferred_core_begins[static_cast<size_t>(task_id)];
+      const int64_t threads = elastic_preferred_threads[static_cast<size_t>(task_id)];
+      const int64_t candidate_timeout_ns = task_resize_timeout_ns_v[static_cast<size_t>(task_id)];
+      for (int64_t core = core_begin; core < core_begin + threads; ++core) {
+        if (core_w2_jobs[static_cast<size_t>(core)] >= 0) {
+          return false;
+        }
+        const int64_t owner = core_owners[static_cast<size_t>(core)];
+        if (owner < 0) {
+          continue;
+        }
+        if (owner != task_id && candidate_timeout_ns == 0) {
+          return false;
+        }
+        if (task_states[static_cast<size_t>(owner)].load(std::memory_order_acquire) != kElasticW2Ready ||
+            task_resize_points_v[static_cast<size_t>(owner)] != kAsyncResizeBeforeW2 ||
+            elastic_preferred_core_begins[static_cast<size_t>(owner)] != core_begin ||
+            elastic_preferred_threads[static_cast<size_t>(owner)] != threads) {
+          return false;
+        }
+        if (owner != task_id) {
+          const int64_t owner_timeout_ns = task_resize_timeout_ns_v[static_cast<size_t>(owner)];
+          const int64_t owner_elapsed_ns =
+              std::max<int64_t>(0, now_ns - w2_ready_since_ns[static_cast<size_t>(owner)]);
+          if (owner_timeout_ns == 0 || owner_elapsed_ns >= owner_timeout_ns) {
+            return false;
+          }
+        }
+      }
+      return true;
+    };
+
+    auto fallback_team_available_locked = [&](int64_t task_id) {
+      const AsyncTaskRuntime& task = tasks[static_cast<size_t>(task_id)];
+      for (int64_t core = task.core_begin; core < task.core_begin + task.threads; ++core) {
+        if (core_w2_jobs[static_cast<size_t>(core)] >= 0 ||
+            core_owners[static_cast<size_t>(core)] != task_id) {
+          return false;
+        }
+      }
+      return true;
+    };
+
+    auto schedule_ready_w2_locked = [&](int64_t now_ns) {
+      bool made_progress = false;
+      do {
+        made_progress = false;
+        for (int64_t task_id = 0; task_id < num_tasks; ++task_id) {
+          if (task_states[static_cast<size_t>(task_id)].load(std::memory_order_acquire) != kElasticW2Ready) {
+            continue;
+          }
+          const bool resizable =
+              task_resize_points_v[static_cast<size_t>(task_id)] == kAsyncResizeBeforeW2;
+          const bool first_attempt = resize_attempted[static_cast<size_t>(task_id)] == 0;
+          if (resizable && first_attempt) {
+            resize_attempted[static_cast<size_t>(task_id)] = int8_t{1};
+          }
+          if (resizable && preferred_team_available_locked(task_id, now_ns)) {
+            assign_w2_locked(task_id, elastic_preferred_core_begins[static_cast<size_t>(task_id)],
+                             elastic_preferred_threads[static_cast<size_t>(task_id)],
+                             elastic_w2_barrier_indices[static_cast<size_t>(task_id)], true, first_attempt, now_ns);
+            made_progress = true;
+            continue;
+          }
+          const int64_t timeout_ns =
+              resizable ? task_resize_timeout_ns_v[static_cast<size_t>(task_id)] : int64_t{0};
+          const int64_t elapsed_ns =
+              resizable ? std::max<int64_t>(0, now_ns - w2_ready_since_ns[static_cast<size_t>(task_id)])
+                        : int64_t{0};
+          if ((!resizable || timeout_ns == 0 || elapsed_ns >= timeout_ns) &&
+              fallback_team_available_locked(task_id)) {
+            const AsyncTaskRuntime& task = tasks[static_cast<size_t>(task_id)];
+            assign_w2_locked(task_id, task.core_begin, task.threads, task.scratch_index, false, first_attempt,
+                             now_ns);
+            made_progress = true;
+          }
+        }
+      } while (made_progress);
+    };
+
+    auto try_claim_w13_locked = [&](int64_t tid) {
+      for (const int64_t task_id : w13_tasks_by_leader[static_cast<size_t>(tid)]) {
+        const AsyncTaskRuntime& task = tasks[static_cast<size_t>(task_id)];
+        if (task_states[static_cast<size_t>(task_id)].load(std::memory_order_acquire) != kElasticPending ||
+            deps_remaining[static_cast<size_t>(task_id)].load(std::memory_order_acquire) != 0) {
+          continue;
+        }
+        bool available = true;
+        for (int64_t core = task.core_begin; core < task.core_begin + task.threads; ++core) {
+          if (core_owners[static_cast<size_t>(core)] >= 0 || core_w2_jobs[static_cast<size_t>(core)] >= 0) {
+            available = false;
+            break;
+          }
+        }
+        if (!available) {
+          continue;
+        }
+        for (int64_t core = task.core_begin; core < task.core_begin + task.threads; ++core) {
+          core_owners[static_cast<size_t>(core)] = task_id;
+        }
+        task_states[static_cast<size_t>(task_id)].store(kElasticW13Running, std::memory_order_release);
+        for (int64_t core = task.core_begin; core < task.core_begin + task.threads; ++core) {
+          core_active_jobs[static_cast<size_t>(core)].store(task_id, std::memory_order_release);
+        }
+        return task_id;
+      }
+      return int64_t{-1};
+    };
+
+    auto leader_needs_scheduler = [&](int64_t tid) {
+      for (const int64_t task_id : w13_tasks_by_leader[static_cast<size_t>(tid)]) {
+        const int64_t state = task_states[static_cast<size_t>(task_id)].load(std::memory_order_acquire);
+        if (state == kElasticPending &&
+            deps_remaining[static_cast<size_t>(task_id)].load(std::memory_order_acquire) == 0) {
+          return true;
+        }
+        if (state == kElasticW2Ready &&
+            task_resize_timeout_ns_v[static_cast<size_t>(task_id)] > 0) {
+          return true;
+        }
+      }
+      return false;
+    };
+
+    run_fixed_threads(num_threads, [&](int64_t tid) {
+      while (completed_tasks.load(std::memory_order_acquire) < num_tasks) {
+        int64_t selected_task = core_active_jobs[static_cast<size_t>(tid)].load(std::memory_order_acquire);
+        if (selected_task < 0) {
+          if (leader_needs_scheduler(tid)) {
+            std::unique_lock<std::mutex> lock(scheduler_mutex, std::try_to_lock);
+            if (lock.owns_lock()) {
+              schedule_ready_w2_locked(steady_now_ns());
+              selected_task = try_claim_w13_locked(tid);
+            }
+          }
+          if (selected_task < 0) {
+            std::this_thread::yield();
+            continue;
+          }
+        }
+
+        const AsyncTaskRuntime& task = tasks[static_cast<size_t>(selected_task)];
+        const int64_t selected_state =
+            task_states[static_cast<size_t>(selected_task)].load(std::memory_order_acquire);
+        if (selected_state == kElasticW13Running) {
+          run_elastic_w13(tid, selected_task, task);
+          if (tid == task.core_begin) {
+            std::lock_guard<std::mutex> lock(scheduler_mutex);
+            for (int64_t core = task.core_begin; core < task.core_begin + task.threads; ++core) {
+              TORCH_INTERNAL_ASSERT(
+                  core_active_jobs[static_cast<size_t>(core)].load(std::memory_order_relaxed) == selected_task,
+                  "elastic W13 core job ownership mismatch");
+              core_active_jobs[static_cast<size_t>(core)].store(-1, std::memory_order_release);
+            }
+            w2_ready_since_ns[static_cast<size_t>(selected_task)] = steady_now_ns();
+            task_states[static_cast<size_t>(selected_task)].store(kElasticW2Ready, std::memory_order_release);
+            schedule_ready_w2_locked(steady_now_ns());
+          } else {
+            while (task_states[static_cast<size_t>(selected_task)].load(std::memory_order_acquire) ==
+                   kElasticW13Running) {
+#if defined(__aarch64__)
+              __asm__ __volatile__("yield" ::: "memory");
+#else
+              std::this_thread::yield();
+#endif
+            }
+          }
+          continue;
+        }
+        if (selected_state != kElasticW2Running) {
+          std::this_thread::yield();
+          continue;
+        }
+
+        const int64_t w2_core_begin = w2_core_begins[static_cast<size_t>(selected_task)];
+        const int64_t w2_group_size = w2_threads[static_cast<size_t>(selected_task)];
+        const int64_t barrier_index = w2_barrier_indices[static_cast<size_t>(selected_task)];
+        if (tid < w2_core_begin || tid >= w2_core_begin + w2_group_size) {
+          continue;
+        }
+        TORCH_INTERNAL_ASSERT(barrier_index >= 0, "elastic W2 task has no barrier scratch");
+        ThreadBarrier& barrier = scratches[static_cast<size_t>(barrier_index)]->barrier;
+        run_elastic_w2(tid, selected_task, task, w2_core_begin, w2_group_size, barrier);
+        if (tid == w2_core_begin) {
+          std::lock_guard<std::mutex> lock(scheduler_mutex);
+          for (int64_t core = w2_core_begin; core < w2_core_begin + w2_group_size; ++core) {
+            TORCH_INTERNAL_ASSERT(core_w2_jobs[static_cast<size_t>(core)] == selected_task,
+                                  "elastic W2 core job ownership mismatch");
+            core_w2_jobs[static_cast<size_t>(core)] = -1;
+            core_active_jobs[static_cast<size_t>(core)].store(-1, std::memory_order_release);
+            if (core_owners[static_cast<size_t>(core)] == selected_task) {
+              core_owners[static_cast<size_t>(core)] = -1;
+            }
+          }
+          for (const int64_t child : successors[static_cast<size_t>(selected_task)]) {
+            deps_remaining[static_cast<size_t>(child)].fetch_sub(1, std::memory_order_acq_rel);
+          }
+          task_states[static_cast<size_t>(selected_task)].store(kElasticComplete, std::memory_order_release);
+          completed_tasks.fetch_add(1, std::memory_order_acq_rel);
+          schedule_ready_w2_locked(steady_now_ns());
+        }
+        barrier.wait();
+      }
+    });
+
+    if (elastic_stats_ptr != nullptr) {
+      std::copy(elastic_stats.begin(), elastic_stats.end(), elastic_stats_ptr);
+    }
+    if (env_flag_enabled("FUSED_CPP_MOE_STAGE_TIMING")) {
+      std::fprintf(
+          stderr,
+          "[fused_moe_bf16_tiled_async][elastic] eligible=%lld preferred=%lld fallback=%lld natural=%lld "
+          "waited=%lld timeout=%lld cohort_jobs=%lld borrowed_threads=%lld total_wait_us=%.3f max_wait_us=%.3f\n",
+          static_cast<long long>(elastic_stats[static_cast<size_t>(kElasticEligibleTasks)]),
+          static_cast<long long>(elastic_stats[static_cast<size_t>(kElasticPreferredAssignments)]),
+          static_cast<long long>(elastic_stats[static_cast<size_t>(kElasticFallbackAssignments)]),
+          static_cast<long long>(elastic_stats[static_cast<size_t>(kElasticNaturalOpportunities)]),
+          static_cast<long long>(elastic_stats[static_cast<size_t>(kElasticWaitedPreferredAssignments)]),
+          static_cast<long long>(elastic_stats[static_cast<size_t>(kElasticTimeoutFallbacks)]),
+          static_cast<long long>(elastic_stats[static_cast<size_t>(kElasticCohortJobs)]),
+          static_cast<long long>(elastic_stats[static_cast<size_t>(kElasticBorrowedThreads)]),
+          static_cast<double>(elastic_stats[static_cast<size_t>(kElasticTotalWaitNs)]) / 1000.0,
+          static_cast<double>(elastic_stats[static_cast<size_t>(kElasticMaxWaitNs)]) / 1000.0);
+    }
+  } else if (!use_async_short_pool) {
     run_fixed_threads(num_threads, [&](int64_t tid) {
       while (completed_tasks.load() < num_tasks) {
         int64_t selected_task = -1;
@@ -8205,6 +9131,8 @@ at::Tensor fused_moe_bf16_tiled_async_plan_v2(
     int64_t silu_poly_degree, int64_t gemm_backend, int64_t backend_n_tile, int64_t w13_split,
     int64_t weight_window_bytes, c10::optional<at::Tensor> out,
     c10::optional<at::Tensor> task_w13_window_bytes, c10::optional<at::Tensor> task_w2_window_bytes) {
+  TORCH_CHECK(execution_mode != kAsyncExecutionElastic,
+              "elastic Plan V2 requires fused_moe_bf16_tiled_async_plan_v2_elastic");
   const AsyncPlanV2NativeArgs plan_v2{
       plan_version,
       execution_mode,
@@ -8220,6 +9148,55 @@ at::Tensor fused_moe_bf16_tiled_async_plan_v2(
       std::move(task_range_granularities),
       std::move(task_w13_window_bytes),
       std::move(task_w2_window_bytes),
+      c10::nullopt,
+      c10::nullopt,
+      c10::nullopt,
+  };
+  return run_fused_moe_bf16_tiled_async(
+      std::move(input), std::move(w13_packed), w13_K, w13_N, std::move(w2_packed), w2_K, w2_N,
+      std::move(topk_weights), std::move(topk_ids), std::move(task_expert_ids), std::move(task_core_begins),
+      std::move(task_threads), std::move(task_dep_offsets), std::move(task_deps), std::move(thread_cpu_ids),
+      std::move(w13_bias), std::move(w2_bias), num_threads, std::move(activation), global_num_experts, skip_weighted,
+      fuse_silu, silu_poly_degree, gemm_backend, backend_n_tile, w13_split, weight_window_bytes, std::move(out),
+      &plan_v2);
+}
+
+at::Tensor fused_moe_bf16_tiled_async_plan_v2_elastic(
+    at::Tensor input, at::Tensor w13_packed, int64_t w13_K, int64_t w13_N, at::Tensor w2_packed, int64_t w2_K,
+    int64_t w2_N, at::Tensor topk_weights, at::Tensor topk_ids, at::Tensor task_expert_ids,
+    at::Tensor task_core_begins, at::Tensor task_threads, at::Tensor task_dep_offsets, at::Tensor task_deps,
+    int64_t plan_version, int64_t execution_mode, at::Tensor task_preferred_threads, at::Tensor task_min_threads,
+    at::Tensor task_max_threads, at::Tensor task_allowed_thread_offsets, at::Tensor task_allowed_threads,
+    at::Tensor task_placement_modes, at::Tensor task_numa_nodes, at::Tensor task_stage_ids,
+    at::Tensor task_resize_points, at::Tensor task_range_granularities, c10::optional<at::Tensor> thread_cpu_ids,
+    c10::optional<at::Tensor> w13_bias, c10::optional<at::Tensor> w2_bias, int64_t num_threads,
+    std::string activation, int64_t global_num_experts, bool skip_weighted, bool fuse_silu,
+    int64_t silu_poly_degree, int64_t gemm_backend, int64_t backend_n_tile, int64_t w13_split,
+    int64_t weight_window_bytes, c10::optional<at::Tensor> out,
+    c10::optional<at::Tensor> task_w13_window_bytes, c10::optional<at::Tensor> task_w2_window_bytes,
+    c10::optional<at::Tensor> task_resize_timeout_ns,
+    c10::optional<at::Tensor> elastic_stats_out,
+    c10::optional<at::Tensor> task_preferred_core_begins) {
+  TORCH_CHECK(execution_mode == kAsyncExecutionElastic, "elastic Plan V2 entry point requires execution_mode=",
+              kAsyncExecutionElastic, ", got ", execution_mode);
+  const AsyncPlanV2NativeArgs plan_v2{
+      plan_version,
+      execution_mode,
+      std::move(task_preferred_threads),
+      std::move(task_min_threads),
+      std::move(task_max_threads),
+      std::move(task_allowed_thread_offsets),
+      std::move(task_allowed_threads),
+      std::move(task_placement_modes),
+      std::move(task_numa_nodes),
+      std::move(task_stage_ids),
+      std::move(task_resize_points),
+      std::move(task_range_granularities),
+      std::move(task_w13_window_bytes),
+      std::move(task_w2_window_bytes),
+      std::move(task_resize_timeout_ns),
+      std::move(task_preferred_core_begins),
+      std::move(elastic_stats_out),
   };
   return run_fused_moe_bf16_tiled_async(
       std::move(input), std::move(w13_packed), w13_K, w13_N, std::move(w2_packed), w2_K, w2_N,

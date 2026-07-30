@@ -157,9 +157,10 @@ $$
 t_i\in\{1,\ldots,C\},\qquad s_i\ge0.
 $$
 
-线程数在 job 开始前选择，执行过程中保持不变。因此 job 是 **moldable**，
-不是执行中可改变线程数的 malleable job。Job 一旦开始就连续执行至完成，不能
-抢占。
+基础 production 问题在线程开始前选择宽度，执行过程中保持不变。因此
+strict/tail-pool job 是 **moldable**，不是执行中可改变线程数的 malleable
+job。Job 一旦开始就连续执行至完成，不能抢占。下文 2.3.1 单独定义一个仅在
+W13/W2 边界改变一次宽度的实验性扩展；它不改变 strict/tail-pool 的可行域。
 
 Plan V2 在表示层为每个 task 增加离散允许宽度集合 $\mathcal A_i$、首选宽度
 $p_i$、已选执行宽度 $\bar t_i$ 和 placement $q_i$：
@@ -248,7 +249,90 @@ planner 管 eligibility/width，runtime 管实际完成事件。surrogate assign
 可能因真实 contention 改变 group 完成顺序，仍需用 held-out E2E 数据校验，
 不能把其预测值当作 exact dynamic makespan。
 
-#### 2.3.1 实验性全局两阶段计划
+#### 2.3.1 实验性 W2 边界伸缩
+
+elastic Plan V2 将完整 expert job 保持为同一个依赖节点，但在内部写成两个连续、
+不可抢占的 stage：
+
+$$
+j_{i,13}=(i,\mathrm{W13},\bar t_i),\qquad
+j_{i,2}=(i,\mathrm{W2},u_i),
+\qquad u_i\in\{\bar t_i,p_i\}.
+$$
+
+第一版只允许 W2 宽度扩展：
+
+$$
+p_i>\bar t_i,\qquad p_i\bmod\bar t_i=0.
+$$
+
+记原 fixed interval 为
+
+$$
+S_i=[b_i,b_i+\bar t_i).
+$$
+
+planner 可令目标起点 $d_i=-1$，此时沿用包含原 team 的局部 cohort：
+
+$$
+B_i=
+\left[
+\left\lfloor\frac{b_i}{p_i}\right\rfloor p_i,\,
+\left(\left\lfloor\frac{b_i}{p_i}\right\rfloor+1\right)p_i
+\right).
+$$
+
+也可显式给出按 $p_i$ 对齐的 $d_i\ge0$：
+
+$$
+B_i=[d_i,d_i+p_i).
+$$
+
+合法目标满足
+
+$$
+S_i\subseteq B_i
+\quad\lor\quad
+S_i\cap B_i=\varnothing.
+$$
+
+因此只允许包含式扩容或完全不相交的 W2 team 迁移，禁止部分重叠。$S_i$ 和
+$B_i$ 的全部 physical CPU 必须属于 task 声明的同一 NUMA node，禁止跨 NUMA
+cohort。
+
+令 $a_i=f_{i,13}$ 为 W13 完成事件，$\delta_i\ge0$ 为 planner 给定的有限
+等待预算。runtime 在仍持有 $S_i$ 时，于 $a_i$ 尝试原子取得完整 $B_i$：
+
+- $\delta_i=0$ 时，只把真正 idle 的额外线程视为可用；取得失败立即令
+  $u_i=\bar t_i$；
+- $\delta_i>0$ 时，同一 $B_i$ 内已经到达 W2-ready 的 base teams 可以组成
+  cohort，按完整 W2 job 顺序使用 $p_i$ 个线程；
+- 到达 $a_i+\delta_i$ 后，task 不再被新的 cohort 借用，并在已启动、不可抢占
+  的有限 W2 job 释放原 team 后回退到 $\bar t_i$。
+
+成功取得 $B_i$ 后，runtime 才释放 $S_i\setminus B_i$。这个
+acquire-destination-before-release-source 顺序保证迁移不会产生无 owner
+窗口；释放出的 source team 可在同一次 scheduler pass 中组成另一个 task 的
+目标 cohort。
+
+因此 timeout 约束的是“等待新 cohort 形成”的时间，不抢占已经开始的 W2。
+若 task 在 deadline 前已把原 team 借给 cohort 中另一个 job，则其
+W2-ready-to-assignment 延迟上界为
+
+$$
+W_i \le \delta_i + \max_{j\in B_i} T_{\mathrm{W2}}(M_j,p_i),
+$$
+
+且 deadline 后禁止再次借出，所以不会形成无限等待链。
+
+该机制不抢占 GEMM，也不迁移或复制 packed-C intermediate；intermediate 位于
+task-owned scratch，W2 的目标 team 通过 release/acquire 状态发布直接读取。
+实际 $u_i$ 由真实完成事件决定，不是 cost model 的连续变量。第一版 planner
+bridge 只显式生成 `2x8T->16T`、`4x2T->8T` 一类局部 cohort，或为指定 task
+给出离散 W2 target；不把任意 stage width 或任意 cohort partition 加入
+production 搜索空间。
+
+#### 2.3.2 实验性全局两阶段计划
 
 production Plan V2 的一个 task 始终是完整 expert，W13 完成后可立即进入该
 expert 的 W2。为隔离这种 pipeline 与 vLLM 风格全局两阶段执行的差异，实验
@@ -864,14 +948,14 @@ cold search。
 | 层级 | 原始可行域 | 当前限制 | 性质 |
 | --- | --- | --- | --- |
 | 线程宽度 | $1,2,\ldots,T_{\max}$ | empirical strict backend 为 `1,2,4,8,16,32`；analytic strict backend 使用 machine calibration 中显式允许的宽度；自动短 expert pool 只搜索 `1,2,4`，forced override 可用其他已校准宽度 | 离散宽度剪枝 |
-| 并发配置 | 活跃 job 可形成任意满足 CPU 容量的 $(M_i,t_i)$ 组合 | 搜索静态 core shape，并自动比较 strict 与 threshold/统一宽度 tail-pool；对齐 group 只在全部覆盖 fixed tasks 完成后领取 whole-expert pooled task | static-partition + boundary regroup 剪枝 |
+| 并发配置 | 活跃 job 可形成任意满足 CPU 容量的 $(M_i,t_i)$ 组合 | 搜索静态 core shape，并自动比较 strict 与 threshold/统一宽度 tail-pool；实验 elastic 只接受 planner 显式给出的同 NUMA 对齐 W2 cohort，target 必须包含 source 或与其不相交 | static-partition + boundary regroup 剪枝 |
 | Shape 集合 | 所有满足 CPU 容量的整数宽度组合 | empirical backend 只用 profile shape；analytic backend 生成 homogeneous 和至多两种宽度的 shape，再应用 active 工作集规则；dynamic 只从 strict uncertainty band 和最快两个 head shape 派生 | 候选剪枝 |
 | Assignment | 任意 expert-to-resource 调度 | 按 isolated cost 的 LPT | 启发式分配 |
-| Runtime plan contract | task 可携带离散宽度集合、stage/range、resize 边界和动态 placement | Plan V2 native strict/tail_pool；planner 选择 whole-expert placement 和统一 pool width；运行中宽度固定 | 表示支持 boundary regroup，仍无 in-task resize |
+| Runtime plan contract | task 可携带离散宽度集合、stage/range、resize 边界和动态 placement | Plan V2 native strict/tail_pool 保持固定宽度；实验 elastic 仅在 W13/W2 边界从 selected width 扩到 planner 指定的 preferred cohort，可迁移到完全不相交的同 NUMA target，失败或超时回退原 team | 单边界、非抢占伸缩/迁移剪枝 |
 | Stage coupling | W13/W2 可形成任意满足依赖和容量的 stage DAG | production 使用 whole-expert pipeline；独立 W13/W2 Plan V2 加全局 barrier 仅作为实验 entrypoint，matched/independent 两种计划都不进入默认搜索 | production 粒度剪枝与实验对照 |
 | x86 synchronous executor team mapping | expert 可取任意合法整数宽度并形成任意 wave | API 接受 1--256 workers；均衡 route 用 atomic expert queue，active expert 不足时按 route/当前宽度贪心组 team，强偏斜时按 64-row target 形成有序 wave | planner 外的确定性 runtime mapper |
 | Ordering | 任意可行开始时间和顺序 | 每个 lane 的 LPT 顺序 | 顺序剪枝 |
-| Idling | 允许主动等待以避开争用 | planner 可选择 strict 以禁止 pool；一旦选择 tail-pool，fixed lane 可运行时立即启动，released group non-idling 地领取 pooled expert；ready-token 路径仅填充无可运行 expert 的空闲 lane | 受限 non-idling 剪枝 |
+| Idling | 允许主动等待以避开争用 | planner 可选择 strict 以禁止 pool；tail-pool 保持 non-idling；elastic timeout=0 不主动等待，正 timeout 只允许在 W13/W2 边界等待有限 $\delta_i$；ready-token 路径仅填充无可运行 expert 的空闲 lane | 受限 boundary idling 剪枝 |
 | Workload 输入 | 任意合法 global 或 rank-local route histogram | planner 接受任意 histogram；catalog preset 只扩展验证覆盖，不过滤运行时输入 | 不剪枝 |
 | Route combine | 任意满足 TopK release 约束和 CPU 容量的 merge 排程 | planner 不搜索 combine；默认 executor 采用 expert-first 单 token 贪心和连续收尾 | 外层启发式限制 |
 | Kernel variant | 任意未被支配的实现 | ARM `auto` 先要求完整 `jit/xbyak_exact_m` legacy split/no-split pair，再加入同 identity 的实测 global packed-B byte-window variants；Plan V2 在精确匹配的 AmazonC5192Cores TP4/F512 split profile 上默认按确定函数 $g(M,t)$ 覆盖单 task 的 W13/W2 window，其余 profile 继承 global policy；$g$ 在每个 shape/tail-pool 候选中确定性解析并进入执行成本，但 window 不成为自由搜索变量；缺少完整 JIT legacy pair 时整体回退 static pair；x86 AMX 使用不进入 planner 的确定性 per-expert pattern/cache policy，AVX-512/AMX 共用确定性 team-N/wave policy | 实例候选限制与 runtime policy |
@@ -2180,6 +2264,62 @@ surrogate 对 independent E2E 的绝对时间 MAPE 为 12.8%、最大误差 34.1
 不能进入 production。完整方法、stage timing 和复测数据见
 `optimizations/fused_moe_sve/results/amazon_192c_planned_two_stage.md`。
 
+### 9.17 W13/W2 边界非阻塞伸缩
+
+实验入口固定使用 whole-expert SVE fused kernel、direct route store、相同 packed
+weights 和相同 merge，只改变 W2 的 team width。验证分四层：
+
+1. `timeout=0` 对每个 resizable task 记录首次尝试、自然取得 preferred cohort、
+   原 team 回退和 borrowed thread 数，得到
+   $P_{\mathrm{natural}}=N_{\mathrm{natural}}/N_{\mathrm{eligible}}$；
+2. 对同一 workload 加入有限 timeout，分别验证 `2x8T->16T` 和
+   `4x2T->8T`，记录 waited preferred、timeout fallback、总/最大等待时间；
+3. 所有 variant 与 strict Plan V2 做逐元素 BF16 输出比较，并报告 E2E median、
+   P10/P90 和 aggregate FLOP/s；
+4. affinity 横跨 NUMA 时必须在 plan materialization/native validation 阶段拒绝，
+   不允许运行时静默缩小或跨节点借线程。
+
+`elastic_stats_out` 的固定字段为 eligible、preferred、fallback、natural、
+waited-preferred、timeout-fallback、cohort jobs、borrowed threads、total wait ns
+和 max wait ns。ready-token merge 在该实验入口中关闭，避免它消费同一批 idle
+workers 并污染“自然重组机会”的定义。
+
+192-core 主机 NUMA0 的实测结论如下：
+
+- `2x8T->16T` 的 `timeout=0` 自然机会率在 active-set-8、tiered hotspot 和
+  DSV4 captured 2K/TopK6 上分别为 `0.00% / 0.67% / 6.53%`；
+- tiered hotspot 的 `5 us / 20 us` 等待把 preferred assignment 提高到
+  `23.44% / 63.84%`，但 E2E 仍比 strict 慢 `9.21% / 9.67%`；
+- `4x2T->8T` 的 256 个 `M=1` case 自然机会率为 `0.21%`，E2E 慢
+  `23.30%`；
+- 零等待路径在 8 个长 expert 上只慢 `2.53%`，但在 64/223/256 个 task
+  上的 boundary handoff 开销已不可忽略。
+
+因此第一版 elastic 已完成正确性和机会率验证，但不进入 cost-model 评分或
+production 默认候选。完整命令、P10/P90 和原始 JSON 见
+`optimizations/fused_moe_sve/results/amazon_192c_w2_boundary_elastic.md`。
+
+2026-07-29 增加 planner 显式 W2 target 后，验证口径扩展为 paired tail：
+两个 `16T` source task 可分别指定 `0-31` 和 `32-63` 的 `32T` target。正确性
+测试必须强制覆盖一个包含式扩容和一个不相交迁移，并要求两个 preferred
+assignment 都发生；性能测试固定比较 strict、零等待和有限等待，统计迁移后
+释放 source 所形成的第二次同-pass cohort assignment。
+
+AmazonC5192Cores NUMA0 active-set-8、每 expert `M=1536` 的 strict plan 为六条
+`16T` lane，其中 task 1/3 是 `0-15` 和 `16-31` 上的第二轮尾 task。显式指定
+task 1 `0-15 -> 0-31`、task 3 `16-31 -> 32-63` 后：
+
+- target-machine SVE 测试中，一个包含式扩容和一个不相交迁移均实际发生，输出与
+  strict 逐元素一致；
+- 31-run 零等待测试从 `11.103 ms` 降至 `10.710 ms`，E2E 提升 `3.66%`，
+  preferred/natural assignment 为 `61/62=98.39%`；
+- 独立 11-run sweep 中，`0/200/500 us` 分别为
+  `10.687/10.713/10.748 ms`，有限等待没有额外收益。
+
+这证明“尾 expert 在 W13 完成后迁移并扩容 W2”在 planner 已知空闲目标时可实现
+稳定局部收益；它不推翻任意 task 自动 regroup 的负结果。该路径仍是实验 bridge，
+不进入 production cost-model 搜索。
+
 ## 10. 同步规则
 
 发生以下任一变化时，必须同步更新本文档：
@@ -2249,3 +2389,6 @@ surrogate 对 independent E2E 的绝对时间 MAPE 为 12.8%、最大误差 34.1
 | 2026-07-27 | v0.41 | TP/EP evaluator 增加跨 rank lifetime phase 转换：多 rank 活跃时使用 concurrent-rank profile，倒数第二个 rank 完成后按当前 phase 剩余比例切换至 matching single-rank companion；不重放 setup/dependency，不扩大 planner 候选或改变剪枝，缺少 companion 时保守回退旧上界。 |
 | 2026-07-27 | v0.42 | 用当前 JIT exact-M kernel 生成 32-core/rank EP2 H4096/F2048/E32 single/dual 配对表，并在 tiered-hotspot 上验证 lifetime 转换将 55.605 ms 修正为 54.770 ms（-1.50%）；同步刷新 8-core standalone 与 192-core TP4/F512 single/dual empirical profiles。 |
 | 2026-07-29 | v0.43 | 增加 benchmark-only 全局两阶段 Plan V2：W13/W2 可独立搜索 strict/tail-pool shape 和确定性 stage window，以显式全局 barrier 连接；增加 matched 对照和首版 `setup+2/3 compute` 与 `1/3 compute` stage surrogate。192-core NUMA0 的 9-case 验证中 independent 相对 matched 在三个异构 stage-plan case 提升 3.28%--7.52%，但仍在 9/9 case 落后 whole-expert 2.29%--6.26%，因此保持实验入口且默认 runtime 不变。 |
+| 2026-07-29 | v0.44 | 增加实验性 W13/W2 单边界 elastic Plan V2：W13 保持 planner selected fixed team，W2 可非阻塞或在有限 timeout 内取得同 NUMA aligned preferred cohort；失败保留原 team，不抢占、不复制 intermediate。增加显式 `8T->16T`/`2T->8T` planner bridge、自然机会/等待/回退统计和 benchmark 入口；production 搜索空间与默认 strict/tail-pool 不变。 |
+| 2026-07-29 | v0.45 | 为 `timeout=0` 增加无中央锁的原子 ownership 快路径，并在 192-core NUMA0 完成 `2x8T->16T`、`4x2T->8T` 验证。自然机会率仅 `0--6.53%`，有限等待虽提高 preferred assignment 仍无 E2E 收益，且 boundary handoff 在多短任务上显著；因此 elastic 继续保持显式实验模式，不进入 cost-model 或 production 候选。 |
+| 2026-07-29 | v0.46 | 为实验 elastic Plan V2 增加显式 `task_preferred_core_begins`：W2 target 可包含 source 或与其完全不相交，必须按 preferred width 对齐且保持同 NUMA；runtime 先完整取得 destination，再释放 source-only workers，并允许同一次 scheduler pass 用释放的 source 组成另一个 cohort。planner bridge/benchmark 可只选择尾部 task 并指定离散 target，strict/tail-pool 和默认 `-1` 派生行为不变。 |

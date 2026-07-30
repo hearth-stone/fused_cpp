@@ -196,6 +196,29 @@ Acceptance gates:
   TP cases have a perfect-rebalance upper bound of only 0.7-2.4%; prototype
   same-width-lane work stealing only if representative cases repeatedly exceed
   5%.
+- [x] Add an experimental non-preemptive W13-to-W2 elastic boundary. A zero
+  timeout uses only immediately idle same-NUMA workers; explicit local
+  `2x8T->16T` and `4x2T->8T` cohorts may wait for a bounded interval and always
+  retain the original-team fallback. Export natural-opportunity, preferred,
+  timeout, and wait counters without changing production strict/tail-pool.
+- [x] Measure elastic natural-opportunity rate and E2E gain on the 192-core
+  host's NUMA0 paper workloads. Natural opportunity is `0-6.53%` for measured
+  `8T->16T` workloads and `0.21%` for the `2T->8T` short-task workload; every
+  measured elastic variant is slower than strict. Keep it outside production
+  cost-model ranking. See
+  `optimizations/fused_moe_sve/results/amazon_192c_w2_boundary_elastic.md`.
+- [ ] If W2 boundary elasticity is revisited, preserve the strict hot path for
+  fallback tasks and charge boundary handoff plus non-preemptible cohort
+  queueing in the admission rule before adding it to planner search.
+- [x] Allow the experimental elastic bridge to assign a disjoint same-NUMA W2
+  target cohort. The runtime acquires the destination before releasing the
+  source, so paired tail tasks can realize mappings such as
+  `0-15 -> 0-31` and `16-31 -> 32-63` without copying packed-C.
+- [x] Measure the explicit migration path on the 192-core host's NUMA0
+  active-set-8 tail case. The 31-run zero-timeout median improves from
+  `11.103 ms` to `10.710 ms` (`+3.66%`) with `61/62` natural preferred
+  assignments. A separate 11-run sweep shows no benefit from 200/500 us
+  waiting. Keep the action planner-selected rather than globally enabled.
 - [ ] Run model-level accuracy evaluation for the optional Taylor-poly4 SiLU
   path. Kernel/output tests are complete, but only elementwise and operator
   output error have been measured so far.

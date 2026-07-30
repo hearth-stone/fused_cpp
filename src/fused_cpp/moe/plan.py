@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Mapping, Sequence
 
 import torch
@@ -11,11 +13,25 @@ import torch
 ASYNC_MOE_PLAN_VERSION = 2
 ASYNC_MOE_EXECUTION_STRICT = "strict"
 ASYNC_MOE_EXECUTION_TAIL_POOL = "tail_pool"
+ASYNC_MOE_EXECUTION_ELASTIC = "elastic"
 ASYNC_MOE_PLACEMENT_FIXED = 0
 ASYNC_MOE_PLACEMENT_TAIL_POOL = 1
 ASYNC_MOE_STAGE_EXPERT = 0
 ASYNC_MOE_RESIZE_NONE = 0
+ASYNC_MOE_RESIZE_BEFORE_W2 = 1
 ASYNC_MOE_FULL_EXPERT_RANGE = 0
+ASYNC_MOE_ELASTIC_STATS_FIELDS = (
+    "eligible_tasks",
+    "preferred_assignments",
+    "fallback_assignments",
+    "natural_opportunities",
+    "waited_preferred_assignments",
+    "timeout_fallbacks",
+    "cohort_jobs",
+    "borrowed_threads",
+    "total_wait_ns",
+    "max_wait_ns",
+)
 
 _INTEGER_DTYPES = {
     torch.int8,
@@ -46,7 +62,16 @@ _V2_SEQUENCE_FIELDS = (
 _V2_OPTIONAL_PER_TASK_FIELDS = (
     "task_w13_window_bytes",
     "task_w2_window_bytes",
+    "task_resize_timeout_ns",
+    "task_preferred_core_begins",
 )
+
+_V2_OPTIONAL_PER_TASK_DEFAULTS = {
+    "task_w13_window_bytes": -1,
+    "task_w2_window_bytes": -1,
+    "task_resize_timeout_ns": 0,
+    "task_preferred_core_begins": -1,
+}
 
 
 def _integer_tensor(value: object, name: str) -> torch.Tensor:
@@ -70,13 +95,32 @@ def _values(tensor: torch.Tensor) -> tuple[int, ...]:
     return tuple(int(value) for value in tensor.tolist())
 
 
+def _linux_cpu_numa_node(cpu: int) -> int | None:
+    if not sys.platform.startswith("linux"):
+        return None
+    cpu_dir = Path(f"/sys/devices/system/cpu/cpu{cpu}")
+    try:
+        entries = cpu_dir.iterdir()
+    except OSError:
+        return None
+    for entry in entries:
+        name = entry.name
+        if name.startswith("node") and name[4:].isdigit():
+            return int(name[4:])
+    return None
+
+
 @dataclass(frozen=True)
 class AsyncMoEPlanV2:
     """Materialized Plan V2 accepted by the native async runtime.
 
-    The runtime executes ``task_threads`` exactly after a task starts. In
-    ``tail_pool`` mode, threads may be regrouped only between whole-expert
-    tasks; in-task width changes and stage/range resizing remain disabled.
+    ``strict`` and ``tail_pool`` execute ``task_threads`` for the whole expert.
+    ``elastic`` may switch from ``task_threads`` to
+    ``task_preferred_threads`` only at the W13-to-W2 boundary. The fallback is
+    nonblocking when ``task_resize_timeout_ns`` is zero. A non-negative
+    ``task_preferred_core_begins`` entry may move W2 to a disjoint same-NUMA
+    cohort after W13 completes; ``-1`` retains the aligned containing-cohort
+    behavior.
     """
 
     num_threads: int
@@ -99,6 +143,8 @@ class AsyncMoEPlanV2:
     task_range_granularities: torch.Tensor
     task_w13_window_bytes: torch.Tensor | None = None
     task_w2_window_bytes: torch.Tensor | None = None
+    task_resize_timeout_ns: torch.Tensor | None = None
+    task_preferred_core_begins: torch.Tensor | None = None
 
     @property
     def plan_version(self) -> int:
@@ -109,13 +155,18 @@ class AsyncMoEPlanV2:
         return {
             ASYNC_MOE_EXECUTION_STRICT: 0,
             ASYNC_MOE_EXECUTION_TAIL_POOL: 1,
+            ASYNC_MOE_EXECUTION_ELASTIC: 2,
         }[self.execution_mode]
 
     def __post_init__(self) -> None:
         num_tasks = int(self.task_expert_ids.numel())
         for name in _V2_OPTIONAL_PER_TASK_FIELDS:
             if getattr(self, name) is None:
-                object.__setattr__(self, name, torch.full((num_tasks,), -1, dtype=torch.int64))
+                object.__setattr__(
+                    self,
+                    name,
+                    torch.full((num_tasks,), _V2_OPTIONAL_PER_TASK_DEFAULTS[name], dtype=torch.int64),
+                )
         self.validate()
 
     @classmethod
@@ -132,7 +183,10 @@ class AsyncMoEPlanV2:
         num_tasks = int(tensors["task_expert_ids"].numel())
         tensors.update(
             {
-                name: _integer_tensor(plan.get(name, [-1] * num_tasks), name)
+                name: _integer_tensor(
+                    plan.get(name, [_V2_OPTIONAL_PER_TASK_DEFAULTS[name]] * num_tasks),
+                    name,
+                )
                 for name in _V2_OPTIONAL_PER_TASK_FIELDS
             }
         )
@@ -146,8 +200,12 @@ class AsyncMoEPlanV2:
         if self.execution_mode not in {
             ASYNC_MOE_EXECUTION_STRICT,
             ASYNC_MOE_EXECUTION_TAIL_POOL,
+            ASYNC_MOE_EXECUTION_ELASTIC,
         }:
-            raise ValueError(f"execution_mode must be 'strict' or 'tail_pool', got {self.execution_mode!r}")
+            raise ValueError(
+                "execution_mode must be 'strict', 'tail_pool', or 'elastic', "
+                f"got {self.execution_mode!r}"
+            )
         if self.num_threads <= 0:
             raise ValueError(f"num_threads must be positive, got {self.num_threads}")
         for name in (*_V2_SEQUENCE_FIELDS, *_V2_OPTIONAL_PER_TASK_FIELDS):
@@ -194,6 +252,8 @@ class AsyncMoEPlanV2:
             "task_range_granularities": self.task_range_granularities,
             "task_w13_window_bytes": self.task_w13_window_bytes,
             "task_w2_window_bytes": self.task_w2_window_bytes,
+            "task_resize_timeout_ns": self.task_resize_timeout_ns,
+            "task_preferred_core_begins": self.task_preferred_core_begins,
         }
         for name, tensor in per_task.items():
             if tensor.numel() != num_tasks:
@@ -211,10 +271,18 @@ class AsyncMoEPlanV2:
         range_granularities = _values(self.task_range_granularities)
         assert self.task_w13_window_bytes is not None
         assert self.task_w2_window_bytes is not None
+        assert self.task_resize_timeout_ns is not None
+        assert self.task_preferred_core_begins is not None
         w13_window_bytes = _values(self.task_w13_window_bytes)
         w2_window_bytes = _values(self.task_w2_window_bytes)
+        resize_timeout_ns = _values(self.task_resize_timeout_ns)
+        preferred_core_begins = _values(self.task_preferred_core_begins)
         if any(value < -1 for value in (*w13_window_bytes, *w2_window_bytes)):
             raise ValueError("per-task stage windows must be -1 (inherit) or non-negative")
+        if any(value < 0 for value in resize_timeout_ns):
+            raise ValueError("task_resize_timeout_ns must be non-negative")
+        if any(value < -1 for value in preferred_core_begins):
+            raise ValueError("task_preferred_core_begins must be -1 (derive) or non-negative")
         for task, (core_begin, width) in enumerate(zip(core_begins, selected_widths)):
             if width <= 0:
                 raise ValueError(f"task_threads[{task}] must be positive")
@@ -235,12 +303,27 @@ class AsyncMoEPlanV2:
             placement != ASYNC_MOE_PLACEMENT_FIXED for placement in placements
         ):
             raise ValueError("strict Plan V2 requires every task placement to be fixed")
-        if any(node != -1 for node in numa_nodes):
-            raise ValueError("Plan V2 currently only supports task_numa_nodes=-1")
+        if self.execution_mode == ASYNC_MOE_EXECUTION_ELASTIC and any(
+            placement != ASYNC_MOE_PLACEMENT_FIXED for placement in placements
+        ):
+            raise ValueError("elastic Plan V2 requires every task placement to be fixed")
+        if self.execution_mode != ASYNC_MOE_EXECUTION_ELASTIC and any(node != -1 for node in numa_nodes):
+            raise ValueError("strict and tail_pool Plan V2 require task_numa_nodes=-1")
+        if self.execution_mode != ASYNC_MOE_EXECUTION_ELASTIC and any(
+            core_begin != -1 for core_begin in preferred_core_begins
+        ):
+            raise ValueError("strict and tail_pool Plan V2 require task_preferred_core_begins=-1")
         if any(stage != ASYNC_MOE_STAGE_EXPERT for stage in stages):
             raise ValueError("Plan V2 currently only supports whole-expert tasks")
-        if any(point != ASYNC_MOE_RESIZE_NONE for point in resize_points):
-            raise ValueError("Plan V2 currently does not support resize points")
+        if self.execution_mode != ASYNC_MOE_EXECUTION_ELASTIC and any(
+            point != ASYNC_MOE_RESIZE_NONE for point in resize_points
+        ):
+            raise ValueError("strict and tail_pool Plan V2 do not support resize points")
+        if self.execution_mode == ASYNC_MOE_EXECUTION_ELASTIC and any(
+            point not in {ASYNC_MOE_RESIZE_NONE, ASYNC_MOE_RESIZE_BEFORE_W2}
+            for point in resize_points
+        ):
+            raise ValueError("elastic Plan V2 only supports the W13-to-W2 resize point")
         if any(granularity != ASYNC_MOE_FULL_EXPERT_RANGE for granularity in range_granularities):
             raise ValueError("Plan V2 currently only supports full-expert task ranges")
 
@@ -295,8 +378,70 @@ class AsyncMoEPlanV2:
             if (
                 placements[task] == ASYNC_MOE_PLACEMENT_FIXED
                 and core_begins[task] + task_allowed[-1] > self.num_threads
+                and self.execution_mode != ASYNC_MOE_EXECUTION_ELASTIC
             ):
                 raise ValueError(f"task {task} allowed widths exceed its fixed logical-core placement")
+
+        if self.execution_mode == ASYNC_MOE_EXECUTION_ELASTIC:
+            cpu_nodes = tuple(_linux_cpu_numa_node(cpu) for cpu in cpu_ids)
+            if any(node is None for node in cpu_nodes):
+                raise ValueError("elastic Plan V2 requires Linux CPU-to-NUMA topology information")
+            for task, point in enumerate(resize_points):
+                selected = selected_widths[task]
+                preferred = preferred_widths[task]
+                if point == ASYNC_MOE_RESIZE_NONE:
+                    if (
+                        preferred != selected
+                        or resize_timeout_ns[task] != 0
+                        or preferred_core_begins[task] != -1
+                    ):
+                        raise ValueError(
+                            f"non-resizable elastic task {task} must keep its selected width, zero timeout, "
+                            "and no preferred core begin"
+                        )
+                    continue
+                if preferred == selected:
+                    raise ValueError(f"resizable elastic task {task} must change width")
+                if numa_nodes[task] < 0:
+                    raise ValueError(f"resizable elastic task {task} requires an explicit NUMA node")
+                if preferred < selected:
+                    raise ValueError(f"elastic Plan V2 currently supports expansion only: task={task}")
+                if preferred % selected != 0:
+                    raise ValueError(
+                        f"elastic expansion for task {task} requires preferred width to be a multiple "
+                        "of the selected width"
+                    )
+                requested_core_begin = preferred_core_begins[task]
+                preferred_core_begin = (
+                    (core_begins[task] // preferred) * preferred
+                    if requested_core_begin == -1
+                    else requested_core_begin
+                )
+                preferred_core_end = preferred_core_begin + preferred
+                if preferred_core_begin < 0 or preferred_core_end > self.num_threads:
+                    raise ValueError(f"task {task} preferred cohort exceeds num_threads")
+                if preferred_core_begin % preferred != 0:
+                    raise ValueError(f"task {task} preferred cohort must align to its preferred width")
+                source_core_end = core_begins[task] + selected
+                source_is_contained = (
+                    preferred_core_begin <= core_begins[task]
+                    and source_core_end <= preferred_core_end
+                )
+                source_is_disjoint = (
+                    source_core_end <= preferred_core_begin
+                    or preferred_core_end <= core_begins[task]
+                )
+                if not source_is_contained and not source_is_disjoint:
+                    raise ValueError(
+                        f"task {task} preferred cohort must contain or be disjoint from its selected team"
+                    )
+                selected_nodes = cpu_nodes[core_begins[task]:source_core_end]
+                preferred_nodes = cpu_nodes[preferred_core_begin:preferred_core_end]
+                expected_node = numa_nodes[task]
+                if any(node != expected_node for node in (*selected_nodes, *preferred_nodes)):
+                    raise ValueError(
+                        f"task {task} elastic cohort crosses NUMA nodes or mismatches task_numa_nodes"
+                    )
 
         if self.execution_mode == ASYNC_MOE_EXECUTION_TAIL_POOL:
             pooled_tasks = [
@@ -364,16 +509,21 @@ def upgrade_legacy_async_plan(plan: Mapping[str, object]) -> dict[str, object]:
         "task_range_granularities": [ASYNC_MOE_FULL_EXPERT_RANGE] * num_tasks,
         "task_w13_window_bytes": [-1] * num_tasks,
         "task_w2_window_bytes": [-1] * num_tasks,
+        "task_resize_timeout_ns": [0] * num_tasks,
+        "task_preferred_core_begins": [-1] * num_tasks,
     }
 
 
 __all__ = [
+    "ASYNC_MOE_ELASTIC_STATS_FIELDS",
+    "ASYNC_MOE_EXECUTION_ELASTIC",
     "ASYNC_MOE_EXECUTION_STRICT",
     "ASYNC_MOE_EXECUTION_TAIL_POOL",
     "ASYNC_MOE_FULL_EXPERT_RANGE",
     "ASYNC_MOE_PLACEMENT_FIXED",
     "ASYNC_MOE_PLACEMENT_TAIL_POOL",
     "ASYNC_MOE_PLAN_VERSION",
+    "ASYNC_MOE_RESIZE_BEFORE_W2",
     "ASYNC_MOE_RESIZE_NONE",
     "ASYNC_MOE_STAGE_EXPERT",
     "AsyncMoEPlanV2",

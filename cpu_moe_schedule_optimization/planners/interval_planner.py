@@ -8,7 +8,7 @@ import os
 import sys
 from heapq import heapify, heappop, heappush
 from pathlib import Path
-from typing import Dict, List, Protocol, Sequence, Tuple
+from typing import Dict, List, Mapping, Protocol, Sequence, Tuple
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "cost_model"))
 from phase_model import ContentionCostModel  # noqa: E402
@@ -19,10 +19,12 @@ from stage_window_policy import TaskStageWindowPolicy  # noqa: E402
 _ASYNC_PLAN_VERSION = 2
 _ASYNC_EXECUTION_STRICT = "strict"
 _ASYNC_EXECUTION_TAIL_POOL = "tail_pool"
+_ASYNC_EXECUTION_ELASTIC = "elastic"
 _ASYNC_PLACEMENT_FIXED = 0
 _ASYNC_PLACEMENT_TAIL_POOL = 1
 _ASYNC_STAGE_EXPERT = 0
 _ASYNC_RESIZE_NONE = 0
+_ASYNC_RESIZE_BEFORE_W2 = 1
 _ASYNC_FULL_EXPERT_RANGE = 0
 _AUTO_TAIL_POOL_WIDTHS = frozenset((1, 2, 4))
 _AUTO_TAIL_POOL_THRESHOLDS = (1, 2, 4, 8, 12)
@@ -800,15 +802,23 @@ class IntervalPlanner:
             dynamic_candidates=len(tail_pool_candidates),
         )
 
-    def _task_stage_windows(self, tasks, task_threads: Sequence[int]) -> tuple[list[int], list[int]]:
+    def _task_stage_windows(
+        self,
+        tasks,
+        w13_threads: Sequence[int],
+        w2_threads: Sequence[int] | None = None,
+    ) -> tuple[list[int], list[int]]:
         if self.task_stage_window_policy is None:
             inherited = [-1] * len(tasks)
             return inherited, list(inherited)
+        if w2_threads is None:
+            w2_threads = w13_threads
         w13_windows: list[int] = []
         w2_windows: list[int] = []
-        for values, threads in zip(tasks, task_threads):
+        for values, w13_width, w2_width in zip(tasks, w13_threads, w2_threads, strict=True):
             _, routes, _, _, _ = values
-            w13_bytes, w2_bytes = self.task_stage_window_policy.select(int(routes), int(threads))
+            w13_bytes, _ = self.task_stage_window_policy.select(int(routes), int(w13_width))
+            _, w2_bytes = self.task_stage_window_policy.select(int(routes), int(w2_width))
             if min(w13_bytes, w2_bytes) < -1:
                 raise ValueError("task stage-window policy must return -1 or non-negative byte counts")
             w13_windows.append(int(w13_bytes))
@@ -845,7 +855,132 @@ class IntervalPlanner:
             "task_range_granularities": [_ASYNC_FULL_EXPERT_RANGE] * num_tasks,
             "task_w13_window_bytes": task_w13_window_bytes,
             "task_w2_window_bytes": task_w2_window_bytes,
+            "task_resize_timeout_ns": [0] * num_tasks,
+            "task_preferred_core_begins": [-1] * num_tasks,
         }
+
+    def to_elastic_w2_bridge(
+        self,
+        tasks,
+        *,
+        width_transitions: Mapping[int, int],
+        numa_node: int,
+        resize_timeout_ns: int = 0,
+        resizable_task_ids: Sequence[int] | None = None,
+        task_preferred_core_begins: Mapping[int, int] | None = None,
+    ) -> Dict[str, object]:
+        """Build a fixed-W13 plan with planner-selected local W2 cohorts.
+
+        ``task_preferred_core_begins`` is keyed by task id. An explicit target
+        may be disjoint from the selected W13 interval, in which case the
+        runtime migrates W2 after acquiring the complete destination team.
+        """
+        if numa_node < 0:
+            raise ValueError(f"numa_node must be non-negative, got {numa_node}")
+        if resize_timeout_ns < 0:
+            raise ValueError(f"resize_timeout_ns must be non-negative, got {resize_timeout_ns}")
+        transitions = {int(width): int(preferred) for width, preferred in width_transitions.items()}
+        for width, preferred in transitions.items():
+            if width <= 0 or preferred <= width or preferred % width != 0:
+                raise ValueError(
+                    "elastic W2 transitions must map a positive width to a larger multiple: "
+                    f"{width}->{preferred}"
+                )
+
+        bridge = self.to_async_bridge(tasks)
+        selected = [int(width) for width in bridge["task_threads"]]
+        num_tasks = len(selected)
+        eligible_tasks = (
+            set(range(num_tasks))
+            if resizable_task_ids is None
+            else {int(task) for task in resizable_task_ids}
+        )
+        if any(task < 0 or task >= num_tasks for task in eligible_tasks):
+            raise ValueError("resizable_task_ids contains an out-of-range task id")
+        explicit_core_begins = {
+            int(task): int(core_begin)
+            for task, core_begin in (task_preferred_core_begins or {}).items()
+        }
+        if any(task < 0 or task >= num_tasks for task in explicit_core_begins):
+            raise ValueError("task_preferred_core_begins contains an out-of-range task id")
+        if any(task not in eligible_tasks for task in explicit_core_begins):
+            raise ValueError("task_preferred_core_begins may only target resizable tasks")
+        preferred = [
+            transitions.get(width, width) if task in eligible_tasks else width
+            for task, width in enumerate(selected)
+        ]
+        if any(preferred[task] == selected[task] for task in explicit_core_begins):
+            raise ValueError(
+                "task_preferred_core_begins may only target tasks whose selected width has an elastic transition"
+            )
+        allowed_offsets = [0]
+        allowed_widths: list[int] = []
+        min_widths: list[int] = []
+        max_widths: list[int] = []
+        resize_points: list[int] = []
+        task_numa_nodes: list[int] = []
+        timeouts: list[int] = []
+        preferred_core_begins: list[int] = []
+        for task, (core_begin, width, target) in enumerate(
+            zip(bridge["task_core_begins"], selected, preferred, strict=True)
+        ):
+            widths = [width] if target == width else [width, target]
+            allowed_widths.extend(widths)
+            allowed_offsets.append(len(allowed_widths))
+            min_widths.append(widths[0])
+            max_widths.append(widths[-1])
+            if target == width:
+                resize_points.append(_ASYNC_RESIZE_NONE)
+                task_numa_nodes.append(-1)
+                timeouts.append(0)
+                preferred_core_begins.append(-1)
+                continue
+            cohort_begin = explicit_core_begins.get(
+                task,
+                int(core_begin) // target * target,
+            )
+            if cohort_begin < 0 or cohort_begin + target > self.num_cores:
+                raise ValueError(
+                    f"task {task} preferred cohort [{cohort_begin}, {cohort_begin + target}) "
+                    f"exceeds num_cores={self.num_cores}"
+                )
+            if cohort_begin % target != 0:
+                raise ValueError(
+                    f"task {task} preferred cohort must align to width {target}: "
+                    f"core_begin={cohort_begin}"
+                )
+            source_end = int(core_begin) + width
+            target_end = cohort_begin + target
+            contains_source = cohort_begin <= int(core_begin) and source_end <= target_end
+            disjoint_source = source_end <= cohort_begin or target_end <= int(core_begin)
+            if not contains_source and not disjoint_source:
+                raise ValueError(
+                    f"task {task} preferred cohort must contain or be disjoint from "
+                    f"the selected interval [{core_begin}, {source_end})"
+                )
+            resize_points.append(_ASYNC_RESIZE_BEFORE_W2)
+            task_numa_nodes.append(int(numa_node))
+            timeouts.append(int(resize_timeout_ns))
+            preferred_core_begins.append(int(cohort_begin))
+
+        w13_windows, w2_windows = self._task_stage_windows(tasks, selected, preferred)
+        bridge.update(
+            {
+                "execution_mode": _ASYNC_EXECUTION_ELASTIC,
+                "task_preferred_threads": preferred,
+                "task_min_threads": min_widths,
+                "task_max_threads": max_widths,
+                "task_allowed_thread_offsets": allowed_offsets,
+                "task_allowed_threads": allowed_widths,
+                "task_numa_nodes": task_numa_nodes,
+                "task_resize_points": resize_points,
+                "task_w13_window_bytes": w13_windows,
+                "task_w2_window_bytes": w2_windows,
+                "task_resize_timeout_ns": timeouts,
+                "task_preferred_core_begins": preferred_core_begins,
+            }
+        )
+        return bridge
 
     def to_tail_pool_bridge(
         self,
@@ -894,6 +1029,8 @@ class IntervalPlanner:
             "task_range_granularities": [_ASYNC_FULL_EXPERT_RANGE] * num_tasks,
             "task_w13_window_bytes": task_w13_window_bytes,
             "task_w2_window_bytes": task_w2_window_bytes,
+            "task_resize_timeout_ns": [0] * num_tasks,
+            "task_preferred_core_begins": [-1] * num_tasks,
         }
 
 
