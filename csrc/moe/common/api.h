@@ -73,7 +73,8 @@ at::Tensor fused_moe_bf16_tiled_async_plan_v2(
     std::string activation, int64_t global_num_experts, bool skip_weighted, bool fuse_silu,
     int64_t silu_poly_degree, int64_t gemm_backend, int64_t backend_n_tile, int64_t w13_split,
     int64_t weight_window_bytes, c10::optional<at::Tensor> out,
-    c10::optional<at::Tensor> task_w13_window_bytes, c10::optional<at::Tensor> task_w2_window_bytes);
+    c10::optional<at::Tensor> task_w13_window_bytes, c10::optional<at::Tensor> task_w2_window_bytes,
+    int64_t early_merge);
 at::Tensor fused_moe_bf16_tiled_async_plan_v2_elastic(
     at::Tensor input, at::Tensor w13_packed, int64_t w13_K, int64_t w13_N, at::Tensor w2_packed, int64_t w2_K,
     int64_t w2_N, at::Tensor topk_weights, at::Tensor topk_ids, at::Tensor task_expert_ids,
@@ -89,7 +90,8 @@ at::Tensor fused_moe_bf16_tiled_async_plan_v2_elastic(
     c10::optional<at::Tensor> task_w13_window_bytes, c10::optional<at::Tensor> task_w2_window_bytes,
     c10::optional<at::Tensor> task_resize_timeout_ns,
     c10::optional<at::Tensor> elastic_stats_out,
-    c10::optional<at::Tensor> task_preferred_core_begins);
+    c10::optional<at::Tensor> task_preferred_core_begins,
+    int64_t early_merge);
 at::Tensor fused_moe_bf16_tiled_planned_staged(
     at::Tensor input, at::Tensor w13_packed, int64_t w13_K, int64_t w13_N, at::Tensor w2_packed, int64_t w2_K,
     int64_t w2_N, at::Tensor topk_weights, at::Tensor topk_ids, at::Tensor w13_task_expert_ids,

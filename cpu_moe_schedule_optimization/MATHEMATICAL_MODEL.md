@@ -159,8 +159,9 @@ $$
 
 基础 production 问题在线程开始前选择宽度，执行过程中保持不变。因此
 strict/tail-pool job 是 **moldable**，不是执行中可改变线程数的 malleable
-job。Job 一旦开始就连续执行至完成，不能抢占。下文 2.3.1 单独定义一个仅在
-W13/W2 边界改变一次宽度的实验性扩展；它不改变 strict/tail-pool 的可行域。
+job。Job 一旦开始就连续执行至完成，不能抢占。下文 2.3.1 定义 production
+planner 在尾 task 启动前做一次宽度选择的 bounded moldable 扩展；2.3.2
+单独定义一个仅在 W13/W2 边界改变一次宽度的实验性扩展。
 
 Plan V2 在表示层为每个 task 增加离散允许宽度集合 $\mathcal A_i$、首选宽度
 $p_i$、已选执行宽度 $\bar t_i$ 和 placement $q_i$：
@@ -249,7 +250,140 @@ planner 管 eligibility/width，runtime 管实际完成事件。surrogate assign
 可能因真实 contention 改变 group 完成顺序，仍需用 held-out E2E 数据校验，
 不能把其预测值当作 exact dynamic makespan。
 
-#### 2.3.1 实验性 W2 边界伸缩
+#### 2.3.1 单次 bounded tail repartition
+
+production planner 可从一个 strict head DAG 派生受限尾部候选。令
+$\operatorname{pred}(i)$ 和 $\operatorname{succ}(i)$ 分别为 task 的前驱和
+后继，第二波 terminal 集合为
+
+$$
+\mathcal T=
+\{i\mid \operatorname{pred}(i)\ne\varnothing,
+          \operatorname{succ}(i)=\varnothing\}.
+$$
+
+当前实现仅在以下条件全部成立时扩展候选：
+
+$$
+|\mathcal T|=2,\qquad
+\forall i\notin\mathcal T:\operatorname{pred}(i)=\varnothing.
+$$
+
+因此原 strict DAG 必须恰好由一个首波和两个第二波 terminal expert 构成，不允许
+第三波，不允许改写仍有后继的任务。当前经过静态验证的默认域为 NUMA-local
+96 cores，其有限宽度集合为
+
+$$
+\mathcal W_{\mathrm{tail}}(96)=\{24,32,48\}.
+$$
+
+其他 core domain 默认集合为空；只有调用方显式提供经过该域验证、满足
+$w\mid C$ 且 $2w\le C$ 的有限集合时才扩展。候选宽度必须严格大于两个 tail
+task 的原宽度。若经验表没有宽度 $w$，只允许在 serialized isolated formula
+的线程域内，且 $M\ge36,\ M\bmod12=0$ 时插值；短 route、前两个 M12 panel 和
+exact-M tail 仍要求真实 width calibration，缺失时直接剪掉该候选。
+
+不切 M 时，两个新 fixed interval 为
+
+$$
+B_0=[0,w),\qquad B_1=[C/2,C/2+w),
+$$
+
+且 $2w\le C$。设首波 task $r$ 的原 interval 为 $S_r$，tail $j$ 的新前驱为
+
+$$
+\operatorname{pred}'(j)=\{r\mid S_r\cap B_j\ne\varnothing\}.
+$$
+
+profile 还可显式声明 route/M 切分数 $s>1$。当前 production 只考虑
+$s\in\{1,2\}$；$s=2$ 必须同时满足
+
+$$
+M\bmod2=0,\qquad 4w=C,
+$$
+
+并且存在 exact-layout full-call anchor。两个 terminal expert 分别生成两个
+连续 route slice：
+
+$$
+\mathcal R_{j,\ell}
+=\left[\ell M/2,\;(\ell+1)M/2\right),\qquad
+j\in\{0,1\},\ \ell\in\{0,1\}.
+$$
+
+采用 grouped placement：
+
+$$
+B_{j,\ell}=[(2j+\ell)w,\;(2j+\ell+1)w).
+$$
+
+因此 `M=1536,w=24,C=96` 时四个 task 分别是
+`expert0[M0,M1]`、`expert1[M0,M1]`，占用
+`[0,24),[24,48),[48,72),[72,96)`。每个 slice 的前驱仍由 interval overlap
+确定：
+
+$$
+\operatorname{pred}'(j,\ell)
+=\{r\mid S_r\cap B_{j,\ell}\ne\varnothing\}.
+$$
+
+planner 将首波 task 按 core 起点排在前面，再附加两个 tail task，因此所有新
+前驱都指向更早 task。新 interval 互不重叠；每个 tail 只有在覆盖其新 interval
+的全部首波 task 完成后才 ready。tail 在此之前尚未启动，所以这不是迁移、
+抢占或运行中 resize，而是在 expert 边界预先选择另一 moldable width。runtime
+继续执行普通 `strict` Plan V2，不做在线领取、不等待 preferred cohort。
+每个 slice 独立 gather/pack、W13、W2，并写入互不相交的 route rows；只有同一
+expert 的全部 slice 完成后才发布 expert completion，所以 ready-token merge
+不会读取半完成的 expert。
+
+候选只从 strict uncertainty band 和 point-estimate 最快的两个 head shape
+派生，并由同一个 contention-aware DAG simulator 评分。working-set tie-break
+使用首波与尾波瞬时工作集的较大者：
+
+$$
+S_{\mathrm{active}}
+=\max\left(\sum_{r\notin\mathcal T}S_r^{\max},
+           \sum_{j\in\mathcal T}\sum_{\ell=0}^{s-1}
+             S_{j,\ell}^{\max}(w)\right).
+$$
+
+宽度相同但物理 interval 不同的 tail 不能共用 homogeneous shape derate。定义
+placement-aware 校准签名
+
+$$
+q=(M,\ (t_r,b_r)_{r\notin\mathcal T},\
+       (s,w,b_{j,\ell},\mathcal R_{j,\ell})_{j,\ell},\
+       \text{kernel identity}),
+$$
+
+其中 $b$ 是 NUMA-local 物理 core 起点。若 profile 存在与 $q$ 完全一致的
+bounded-tail full-call anchor $A(q)$，候选时间取
+
+$$
+\widehat T_{\mathrm{tail}}(q)=A_{\mathrm{median}}(q),\qquad
+U(q)=\frac{\max(A_{\mathrm{median}}-A_{p10},
+                A_{p90}-A_{\mathrm{median}})}
+             {\sqrt{n_q}}.
+$$
+
+该 anchor 仅对 uniform route、相同 root shape/顺序、相同 tail 起点、宽度与
+route-slice 数、相同 kernel/stage-window policy 生效，并且只做 exact-route
+lookup，不插值或外推。$s=1$ 签名不匹配时回退 stage-aware DAG simulator；
+$s>1$ 因包含同一 packed-B 被多个 team 同时扫描的额外 contention 状态，签名
+不匹配时直接剪枝。因此 anchor 校准的是 interval placement 与 task-boundary
+上下文，不修改 $I(M,t)$，也不会把一个 active-set 的 E2E winner 写入通用
+isolated 曲线。
+
+结果记录 `tail_repartition_width`、`tail_repartition_tasks`、
+`tail_repartition_route_slices` 和候选数。默认 auto
+同时比较 tail-pool 与 bounded tail；`dynamic_tail_pool=False` 且未显式指定
+bounded 开关时保留旧 strict baseline。显式关闭 `bounded_tail_repartition`
+时不生成候选；forced tail-pool 同样禁止同时派生该候选。cache key 额外绑定
+bounded-policy identity；命中后重新运行轻量 LPT assignment 并校验 terminal
+拓扑及 tail width 对新 route 的 isolated-model 支撑；任一不再合法时丢弃该
+entry 并重新 cold search。
+
+#### 2.3.2 实验性 W2 边界伸缩
 
 elastic Plan V2 将完整 expert job 保持为同一个依赖节点，但在内部写成两个连续、
 不可抢占的 stage：
@@ -506,14 +640,41 @@ $$
 C_{\max}^{+}=\max\left(\max_i f_i,\max_q g_q\right).
 $$
 
-当前 production planner 仍只优化 2.4 节的 expert-compute makespan。async
-ready-token executor 不扩大 planner 决策空间：它保持固定 expert core
-interval，优先执行可运行 expert，仅让无 expert 可执行的 lane 贪心领取一个已经
-release 的 token；所有 expert 结束后，未完成 token 仍由原连续区间 merge 收尾。
-该策略默认只在 SVE FP32 direct-route 路径且
-$\max_i\lceil M_i/12\rceil/t_i\ge1.25\min_i\lceil M_i/12\rceil/t_i$ 时生效；
-`FUSED_CPP_MOE_ASYNC_READY_TOKEN_MERGE=0` 显式恢复 post-expert merge。因此它是
-默认 executor heuristic，不是 cost model 已评分的 planner 调度动作。
+当前 production planner 仍只优化 2.4 节的 expert-compute makespan，但 active
+DAG simulator 同时返回每个 task 的预测完成时刻 $\widehat f_j$。route-sliced
+expert 的预测完成时刻取其全部 slice 的最大值：
+
+$$
+\widehat f_e=\max_{j:e(j)=e}\widehat f_j,\qquad
+\Delta_f=\max_e\widehat f_e-\min_e\widehat f_e.
+$$
+
+对 strict plan，若
+
+$$
+\Delta_f\le
+\max\left(1\ \mathrm{ns},10^{-6}\max_e|\widehat f_e|\right),
+$$
+
+planner 写入 `early_merge=false`。此时模型预测所有 active expert 同时完成，没有
+可供 combine 隐藏的 expert-compute 区间；executor 在 compute 后由全部 worker
+按连续 token range 均匀分配 merge。若预测存在完成时间差、模型不能返回逐 task
+时刻、使用 stage-only/tail-pool plan，planner 写入 `null`，保留 runtime
+heuristic。由于 $G_q$ 和 expert/merge contention 尚未进入目标，planner 不会仅凭
+$\Delta_f>0$ 强制 `early_merge=true`。
+
+Plan V2 的 `early_merge` 是三态手动控制：`null` 为上述 auto，`true` 强制
+ready-token 路径并跳过 team-load gate，`false` 强制统一 post-expert merge；
+elastic 拒绝 `true`。async ready-token executor 保持固定 expert core interval，
+优先执行可运行 expert。expert compute 尚未全部完成时，无 expert 可执行的 lane
+每次只领取一个已经 release 的 token；compute 全部完成后，同一轮 resident
+worker 继续排空 ready queue。尾部每次原子领取至多
+$B_{\mathrm{merge}}=2$ 个 queue slot，并预取同批下一个 token。auto 默认只在
+SVE direct-route 路径且
+$\max_i\lceil M_i/8\rceil/t_i\ge1.25\min_i\lceil M_i/8\rceil/t_i$ 时生效。
+`FUSED_CPP_MOE_ASYNC_READY_TOKEN_DRAIN=0` 恢复 early-ready 加连续 final merge；
+`FUSED_CPP_MOE_ASYNC_READY_TOKEN_MERGE=0` 是覆盖 plan 的全局 kill switch；
+batch/prefetch 环境变量继续控制尾部实现。
 
 ## 3. 多 Rank 外层
 
@@ -947,20 +1108,20 @@ cold search。
 
 | 层级 | 原始可行域 | 当前限制 | 性质 |
 | --- | --- | --- | --- |
-| 线程宽度 | $1,2,\ldots,T_{\max}$ | empirical strict backend 为 `1,2,4,8,16,32`；analytic strict backend 使用 machine calibration 中显式允许的宽度；自动短 expert pool 只搜索 `1,2,4`，forced override 可用其他已校准宽度 | 离散宽度剪枝 |
-| 并发配置 | 活跃 job 可形成任意满足 CPU 容量的 $(M_i,t_i)$ 组合 | 搜索静态 core shape，并自动比较 strict 与 threshold/统一宽度 tail-pool；实验 elastic 只接受 planner 显式给出的同 NUMA 对齐 W2 cohort，target 必须包含 source 或与其不相交 | static-partition + boundary regroup 剪枝 |
-| Shape 集合 | 所有满足 CPU 容量的整数宽度组合 | empirical backend 只用 profile shape；analytic backend 生成 homogeneous 和至多两种宽度的 shape，再应用 active 工作集规则；dynamic 只从 strict uncertainty band 和最快两个 head shape 派生 | 候选剪枝 |
+| 线程宽度 | $1,2,\ldots,T_{\max}$ | empirical strict backend 为 `1,2,4,8,16,32`；analytic strict backend 使用 machine calibration 中显式允许的宽度；自动短 expert pool 只搜索 `1,2,4`；96-core bounded tail whole-expert 候选只搜索 `24,32,48`，其中缺表宽度仅允许长整 M12 formula 插值；route-sliced tail 只允许 exact-layout anchor 中显式校准的宽度，当前为 `24T`；forced override 可用其他已校准宽度 | 离散宽度剪枝 |
+| 并发配置 | 活跃 job 可形成任意满足 CPU 容量的 $(M_i,t_i)$ 组合 | 搜索静态 core shape，并自动比较 strict、threshold/统一宽度 tail-pool 与恰好两个 terminal expert 的一次 bounded repartition；后者可在 exact anchor 命中时把每个 terminal expert 切成两个连续 M slice，使四个 fixed task 覆盖全部核心；实验 elastic 只接受 planner 显式给出的同 NUMA 对齐 W2 cohort，target 必须包含 source 或与其不相交 | static-partition + boundary regroup 剪枝 |
+| Shape 集合 | 所有满足 CPU 容量的整数宽度组合 | empirical backend 只用 profile shape；analytic backend 生成 homogeneous 和至多两种宽度的 shape，再应用 active 工作集规则；tail-pool 和 bounded tail 只从 strict uncertainty band 和最快两个 head shape 派生 | 候选剪枝 |
 | Assignment | 任意 expert-to-resource 调度 | 按 isolated cost 的 LPT | 启发式分配 |
-| Runtime plan contract | task 可携带离散宽度集合、stage/range、resize 边界和动态 placement | Plan V2 native strict/tail_pool 保持固定宽度；实验 elastic 仅在 W13/W2 边界从 selected width 扩到 planner 指定的 preferred cohort，可迁移到完全不相交的同 NUMA target，失败或超时回退原 team | 单边界、非抢占伸缩/迁移剪枝 |
+| Runtime plan contract | task 可携带离散宽度集合、stage/range、resize 边界和动态 placement | bounded tail 在 terminal expert 启动前生成新的 singleton fixed width 和 blocker DAG；exact-anchor route fission 将同一 expert 的连续 M slice 作为多个 strict task，只有全部 slice 完成后才发布 expert completion；tail_pool 保持 whole-expert 动态 placement；实验 elastic 才在 W13/W2 边界扩到 preferred cohort | 单次 expert-boundary 重分区与实验 stage resize 剪枝 |
 | Stage coupling | W13/W2 可形成任意满足依赖和容量的 stage DAG | production 使用 whole-expert pipeline；独立 W13/W2 Plan V2 加全局 barrier 仅作为实验 entrypoint，matched/independent 两种计划都不进入默认搜索 | production 粒度剪枝与实验对照 |
 | x86 synchronous executor team mapping | expert 可取任意合法整数宽度并形成任意 wave | API 接受 1--256 workers；均衡 route 用 atomic expert queue，active expert 不足时按 route/当前宽度贪心组 team，强偏斜时按 64-row target 形成有序 wave | planner 外的确定性 runtime mapper |
 | Ordering | 任意可行开始时间和顺序 | 每个 lane 的 LPT 顺序 | 顺序剪枝 |
-| Idling | 允许主动等待以避开争用 | planner 可选择 strict 以禁止 pool；tail-pool 保持 non-idling；elastic timeout=0 不主动等待，正 timeout 只允许在 W13/W2 边界等待有限 $\delta_i$；ready-token 路径仅填充无可运行 expert 的空闲 lane | 受限 boundary idling 剪枝 |
+| Idling | 允许主动等待以避开争用 | planner 可关闭 tail-pool 和 bounded tail 保留原 strict；bounded tail 只依赖 blocker 完成、不增加主动等待；tail-pool 保持 non-idling；elastic timeout=0 不主动等待，正 timeout 只允许在 W13/W2 边界等待有限 $\delta_i$；ready-token 路径仅填充无可运行 expert 的空闲 lane | 受限 boundary idling 剪枝 |
 | Workload 输入 | 任意合法 global 或 rank-local route histogram | planner 接受任意 histogram；catalog preset 只扩展验证覆盖，不过滤运行时输入 | 不剪枝 |
-| Route combine | 任意满足 TopK release 约束和 CPU 容量的 merge 排程 | planner 不搜索 combine；默认 executor 采用 expert-first 单 token 贪心和连续收尾 | 外层启发式限制 |
+| Route combine | 任意满足 TopK release 约束和 CPU 容量的 merge 排程 | planner 不搜索 combine service time；strict plan 在预测 expert 同时完成时强制统一连续 post-expert merge，其余情况保留 auto，runtime 在 expert 阶段采用 expert-first 单 token 贪心并在同一 resident worker job 排空；Plan V2 允许显式 on/off，elastic 不允许 on | 外层启发式限制与支配条件剪枝 |
 | Kernel variant | 任意未被支配的实现 | ARM `auto` 先要求完整 `jit/xbyak_exact_m` legacy split/no-split pair，再加入同 identity 的实测 global packed-B byte-window variants；Plan V2 在精确匹配的 AmazonC5192Cores TP4/F512 split profile 上默认按确定函数 $g(M,t)$ 覆盖单 task 的 W13/W2 window，其余 profile 继承 global policy；$g$ 在每个 shape/tail-pool 候选中确定性解析并进入执行成本，但 window 不成为自由搜索变量；缺少完整 JIT legacy pair 时整体回退 static pair；x86 AMX 使用不进入 planner 的确定性 per-expert pattern/cache policy，AVX-512/AMX 共用确定性 team-N/wave policy | 实例候选限制与 runtime policy |
 | Isolated time | 真实 $I_i(t)$ | production 默认仍为经验公式；可选 analytic backend 由 kernel demand、cache traffic 和机器 service curves 计算 | cost 近似，不剪枝可行域 |
-| Contention | 任意动态活跃配置上的真实 $D_i(\mathcal Z)$ | production 默认为实测 profile；analytic backend 按 matrix/L1/L2/LLC/DRAM/epilogue 共享容量推进事件 | cost 近似，不剪枝可行域 |
+| Contention | 任意动态活跃配置上的真实 $D_i(\mathcal Z)$ | production 默认为实测 profile；bounded tail 仅在 uniform route、root/tail width 与物理 interval 完全匹配时使用 exact-layout full-call anchor，且禁止 route 插值；未命中仍走 stage-aware simulator；analytic backend 按 matrix/L1/L2/LLC/DRAM/epilogue 共享容量推进事件 | cost 近似，不剪枝可行域 |
 | 跨 rank lifetime | 每个 rank 的资源状态随其他 rank 完成而变化 | 有 matching single-rank companion 时，多 rank 活跃阶段使用 concurrent-rank profile，最后一个 rank 的剩余 phase 切换到 single-rank profile；缺表时保守保持 concurrent-rank rate | cost 状态近似，不剪枝可行域 |
 
 当前 `IntervalPlanner` 搜索的是上述剪枝后 plan space 中的方案，不是原始问题
@@ -1002,10 +1163,11 @@ $$
 因此 cost model 只近似目标函数中的真实性能响应，不改变由 route tasks 和 CPU
 容量定义的原始可行域。
 
-2.5 节的 ready-token merge 尚未进入 active cost model。当前 profile 的
-$\widehat I_i,\widehat D_i$ 仍只描述 expert compute，combine 继续作为独立实测
-外部项；在增加 merge service time、expert/merge 异构 contention 和真实分布
-留出验证前，planner 不得把实验重叠时间当作确定收益。
+2.5 节的 ready-token merge service time 尚未进入 active cost model。当前
+profile 的 $\widehat I_i,\widehat D_i$ 仍只描述 expert compute；新增逐 task
+$\widehat f_j$ 与 `early_merge=false` 只识别“预测无重叠窗口”的情况，不估计
+combine 收益。在增加 merge service time、expert/merge 异构 contention 和真实
+分布留出验证前，planner 不得把实验重叠时间当作确定收益。
 
 ### 8.1 当前 active isolated model
 
@@ -1816,6 +1978,30 @@ median 差异为 +0.23%、+0.33%、+0.29%，仍低于约 1% 噪声下界。
 没有可分辨的 median 回退；尚不能证明对 captured routing 有净收益，也不能作为
 planner 中 merge-overlap 的 cost 校准。
 
+2026-07-30 在同一机器 NUMA0 CPU `0-95` 上重新验证同轮 queue drain。输入为
+`tokens=2048`、`top_k=6`、`H=4096`、`F=512`、256 local experts 的
+active-set-8，使用当前 `6x16T -> 4x24T` route-sliced production plan、BF16
+direct-route store、同一份 packed weights，并在 101 轮内随机化 variant 顺序。
+旧 early-ready 加连续 final merge 的中位时间为 8.691 ms；同轮 drain 的
+batch `1/2/4/8` 分别为 `8.659/8.637/8.619/8.648 ms`。默认 batch 2 相对旧路径
+提升 0.63%，P90 从 8.963 ms 降到 8.706 ms（2.95%）。轻量 stage counter
+显示旧路径在 resident worker job 内只完成 `584/2048` 个 token，余下 1464 个
+进入第二轮 merge；新路径为 `2048/2048`，没有 final worker dispatch。
+
+受控 25%/75% two-group 的 101 轮中，旧/新中位数为
+`10.266/10.181 ms`（新路径 +0.83%）；均衡输入触发 team-load gate，三种配置
+差异不超过 0.15%。batch 1--8 的 spread 只有 0.040 ms，因此当前证据支持
+“同轮 drain 消除收尾和重调度”，但不能单独证明软件预取带来可分辨收益；
+$B_{\mathrm{merge}}=2$ 是保留一次 lookahead 且避免大 batch 尾部失衡的保守值。
+
+Plan V2 三态控制的 contract 验证要求为：`null/false/true` 必须分别下沉为
+`-1/0/1`；经验和解析 DAG simulator 返回的最大 task finish 必须等于原
+makespan；相同 expert finish 的 strict bridge 必须输出 `false`，存在 finish
+差时必须保持 `null`；显式控制连接旧 native extension 时必须报错，elastic
+必须拒绝 `true`。AArch64 集成验证还需对 auto/off/on 做 bit-exact 对比，并用
+stage timing 确认 off 路径没有 ready-token publication/claim 且启动统一连续
+merge。
+
 ### 9.4 Amazon 192-core 双 NUMA 稳态校准
 
 2026-07-16 在 Neoverse-V3 的全部 192 核上以两个同步 rank 重测 TP4/F512
@@ -2320,6 +2506,105 @@ task 1 `0-15 -> 0-31`、task 3 `16-31 -> 32-63` 后：
 稳定局部收益；它不推翻任意 task 自动 regroup 的负结果。该路径仍是实验 bridge，
 不进入 production cost-model 搜索。
 
+### 9.18 单次 bounded tail repartition 验证
+
+2026-07-30 在 AmazonC5192Cores NUMA0 CPU `0-95` 上先做静态可行性验证。固定
+TP4 H4096/F512、8 个 active expert、每 expert `M=1536`、split-W13 SVE JIT
+kernel；首波保持 `6x16T`，两个第二波 expert 同时改为 `24/32/48T`。每轮以两
+个 tail 中较慢者决定 wall time，结果为：
+
+| tail 方案 | E2E median | aggregate GFLOP/s | 相对 strict |
+| --- | ---: | ---: | ---: |
+| strict `2x16T` | 11.143 ms | baseline | - |
+| `2x24T` | 9.809 ms | 15.76 TFLOP/s | +13.60% |
+| `2x32T` | 10.057 ms | - | +10.78% |
+| `2x48T` | 9.902 ms | - | +12.54% |
+
+native stage trace 中，strict 两个 tail 的 W13 为 `3.32/3.38 ms`、W2 为
+`1.37/1.35 ms`；24T 降为 W13 `2.358/2.400 ms`、W2 `0.946/0.930 ms`。
+48T 的 W2 更快但 W13 回升，因此 24T 在该 workload 最优。完整原始结果见
+`optimizations/fused_moe_sve/results/amazon_192c_static_tail_repartition.md`。
+
+production 第一版据此只加入有限候选和结构判定，不硬编码 24T。旧 serialized
+isolated formula 对同一 case 预测 strict/24/32/48T 为
+`10.996/10.016/9.585/9.633 ms`，能判断 repartition 有收益，但把 32T 排在
+24T 前。2026-07-30 的定向采样进一步证明这不只是缺少 24T isolated 点：
+`M=1536` isolated 的 24/32/48T 分别为 `3.424/3.261/3.746 ms`，普通双任务
+contention 为 `4.508/3.918/3.784 ms`，仍不产生真实 tail 的 24T 排序。原因是
+普通 `[t,t]` profile 将 lane 连续放置并只保存宽度 signature，而 bounded tail
+固定放在两个 48-core half 的起点；物理 interval 信息在旧模型中丢失。
+
+结构回归覆盖候选开关、恰好一个 terminal wave、blocker overlap、Plan V2 fixed
+bridge 和 cache rebuild；Python/native cold planner 在 96-core profile 上逐字段
+等价。
+
+随后在同一 NUMA0 上用 production planner 做 51-run 交错 E2E 复测，同时保留
+原 strict 和三个显式宽度。auto 选择 `2x32T`，cold/warm planning 分别为
+`0.617/0.144 ms`（均在执行计时区间外），执行结果为：
+
+| production 方案 | E2E median | p10--p90 | 相对 strict |
+| --- | ---: | ---: | ---: |
+| strict `2x16T` | 11.617 ms | 11.457--11.854 ms | - |
+| auto `2x32T` | 10.352 ms | 10.118--11.095 ms | +12.22% |
+| 显式 `2x24T` | 10.257 ms | 10.148--10.461 ms | +13.26% |
+| 显式 `2x32T` | 10.441 ms | 10.217--15.373 ms | +11.26% |
+| 显式 `2x48T` | 10.279 ms | 10.182--10.467 ms | +13.01% |
+
+因此 production 候选确实消除了原 fixed-lane 尾部，auto 离本轮最优 24T 仅
+`0.93%`。auto 与同构显式 32T 的 median 差 `0.86%`，且显式 32T 存在系统
+长尾样本，说明宽度间约 1% 的差异已接近当前 whole-call 噪声；24T
+width-local calibration 仍是排序精化项，不影响 bounded repartition 是否有收益
+的主结论。
+
+随后使用当前 extension hash
+`54a8824324af7e2c017ce4c6d00feade3bc4854a63f2e0db34413dd765ff5b00`
+对三个对齐 layout 各采样 101 次：
+
+| tail 方案 | median | p10--p90 | 相对 strict |
+| --- | ---: | ---: | ---: |
+| strict | 11.137 ms | 11.011--11.469 ms | - |
+| `2x24T` | **9.797 ms** | 9.684--9.910 ms | **+13.68%** |
+| `2x32T` | 9.997 ms | 9.769--10.667 ms | +11.39% |
+| `2x48T` | 9.866 ms | 9.769--9.994 ms | +12.88% |
+
+profile 因而增加 exact-layout bounded-tail anchor。它只命中
+`M=1536, root=6x16T, tail_starts=(0,48)` 的三个 measured width；校准后
+Python/native planner 均选择 24T。其他 route、异构 route、不同 root shape 或
+stage-window override 保持原 simulator 路径。
+
+校准后的 production auto 在同一 NUMA0、当前 extension 上复测 51 次，确认
+实际选择 `2x24T`：median `9.842 ms`、p10--p90
+`9.719--9.992 ms`，相对 strict `11.103 ms` 提升 `12.81%`。anchor 预测
+`9.797 ms`，相对实测 median 的绝对误差为 `0.045 ms`、相对误差为
+`0.46%`。未采样的 `M=1548` 不命中 anchor，并回退到 stage-aware simulator。
+
+同一 workload 的下一步实验把两个 terminal expert 各沿 M 切成两个
+`M=768` slice。每个 slice 使用 24T，四个 strict task 按 grouped 顺序占用
+`[0,24)`、`[24,48)`、`[48,72)`、`[72,96)`，因此 tail wave 不再留下空闲核心。
+51-run 结果为：
+
+| tail 方案 | E2E median | p10--p90 | aggregate GFLOP/s |
+| --- | ---: | ---: | ---: |
+| strict `2x16T` whole expert | 11.122 ms | 10.948--11.382 ms | 13.902 TFLOP/s |
+| `2x24T` whole expert | 9.804 ms | - | 15.77 TFLOP/s |
+| grouped `4x24T`, `M=768` | **8.710 ms** | 8.647--8.830 ms | **17.751 TFLOP/s** |
+| interleaved `4x24T`, `M=768` | 8.755 ms | - | 17.66 TFLOP/s |
+
+grouped M split 相对 whole-expert `2x24T` 的 throughput 提升 `12.56%`，
+相对 strict 提升 `27.68%`；输出在正式计时前通过 bitwise equality 检查。
+grouped 比 interleaved 快 `0.51%`，因此 exact anchor 同时绑定 route-slice 数
+和物理 task 顺序。当前 profile 只增加
+`root=6x16T, M=1536, width=24T, route_slices=2` 的 exact anchor；未命中的
+route、layout、kernel identity 或 stage-window policy 不生成 route-sliced
+候选，而不是把该结果外推到其他 terminal tail。
+
+接入 Python/native production planner 后再次交错运行 51 次，auto 实际返回
+`tail_repartition_width=24`、`tail_repartition_route_slices=2` 和 10 个 strict
+task。production auto 为 `8.753 ms`（p10--p90
+`8.684--8.919 ms`，`17.665 TFLOP/s`），显式 grouped 对照为
+`8.746 ms`，两者只差 `0.08%`；相对同轮 strict `11.180 ms` 的 throughput
+提升 `27.73%`。anchor `8.710 ms` 对 production median 的误差为 `0.49%`。
+
 ## 10. 同步规则
 
 发生以下任一变化时，必须同步更新本文档：
@@ -2392,3 +2677,8 @@ task 1 `0-15 -> 0-31`、task 3 `16-31 -> 32-63` 后：
 | 2026-07-29 | v0.44 | 增加实验性 W13/W2 单边界 elastic Plan V2：W13 保持 planner selected fixed team，W2 可非阻塞或在有限 timeout 内取得同 NUMA aligned preferred cohort；失败保留原 team，不抢占、不复制 intermediate。增加显式 `8T->16T`/`2T->8T` planner bridge、自然机会/等待/回退统计和 benchmark 入口；production 搜索空间与默认 strict/tail-pool 不变。 |
 | 2026-07-29 | v0.45 | 为 `timeout=0` 增加无中央锁的原子 ownership 快路径，并在 192-core NUMA0 完成 `2x8T->16T`、`4x2T->8T` 验证。自然机会率仅 `0--6.53%`，有限等待虽提高 preferred assignment 仍无 E2E 收益，且 boundary handoff 在多短任务上显著；因此 elastic 继续保持显式实验模式，不进入 cost-model 或 production 候选。 |
 | 2026-07-29 | v0.46 | 为实验 elastic Plan V2 增加显式 `task_preferred_core_begins`：W2 target 可包含 source 或与其完全不相交，必须按 preferred width 对齐且保持同 NUMA；runtime 先完整取得 destination，再释放 source-only workers，并允许同一次 scheduler pass 用释放的 source 组成另一个 cohort。planner bridge/benchmark 可只选择尾部 task 并指定离散 target，strict/tail-pool 和默认 `-1` 派生行为不变。 |
+| 2026-07-30 | v0.47 | production planner 增加一次性 bounded tail repartition：只改写恰好两个、无后继的第二波 whole-expert task，在 96-core 域搜索 `24/32/48T` fixed interval，并用覆盖 interval 的首波 blocker 重建 strict DAG；无合法候选或显式关闭时回退原 strict。Python/native cold planner、cache 和 ranking 同步携带 tail metadata；无 width 表时只允许长整 M12 isolated formula 插值。记录 `6x16T -> 2x{24,32,48}T` 静态验证和 51-run production E2E：auto 选择 32T，相对 strict 提升 12.22%，离实测最优 24T 为 0.93%。 |
+| 2026-07-30 | v0.48 | 为 bounded tail 增加 exact-layout full-call anchor：签名绑定 uniform route、root lane 顺序/物理起点、tail 起点/宽度、kernel hash 和 stage-window policy，只做 exact-route lookup；未命中继续走 stage-aware DAG simulator。当前 extension 的 101-run 校准给出 24/32/48T 为 9.797/9.997/9.866 ms，Python/native planner 由错误的 32T 修正为 24T；校准后 51-run production auto 实测 9.842 ms，与 anchor 相差 0.46%；$I(M,t)$、普通 shape derate 和其他 workload 不变。 |
+| 2026-07-30 | v0.49 | Plan V2 strict task 增加连续 route-slice 语义，允许同一 terminal expert 在 M 维拆成两个 disjoint task；native runtime 对每个 slice 独立 gather/W13/W2/direct route store，并在全部 slice 完成后才发布 expert completion。bounded-tail planner 只在 exact-layout anchor 命中时生成 `2 expert x 2 slice x 24T` grouped 候选，使 active-set-8 的尾波占满 96 核；显式 51-run 实验从 whole-expert 24T 的 9.804 ms 降至 8.710 ms，production auto 复测为 8.753 ms、相对同轮 strict throughput 提升 27.73%，未校准形状保持原候选域。 |
+| 2026-07-30 | v0.50 | async ready-token executor 改为同一 resident worker job 排空 queue：expert 阶段保持单 token 领取，compute 完成后默认以两 token batch 和一 token lookahead 预取收尾，不再启动连续 final merge；保留 drain/merge/batch/prefetch 环境变量 fallback。AmazonC5192Cores NUMA0 active-set-8 的 101-run 中位数从旧路径 8.691 ms 降到 8.637 ms，P90 从 8.963 ms 降到 8.706 ms；batch sweep 未证明预取有独立显著收益，planner/cost-model 决策空间保持不变。 |
+| 2026-07-30 | v0.51 | Plan V2 增加 plan-level `early_merge` 三态控制并下沉为 native `-1/0/1`；strict planner 复用 active expert DAG simulator 的逐 task 完成时刻，在聚合 expert finish 于 1 ns/1 ppm 内相同时写入 `false`，统一使用全 worker 连续 post-expert merge，其余候选保持 auto，planner 不强制 on。环境变量仍是全局 kill switch，elastic 拒绝 on；同步更新 API、模型公式、剪枝表、验证要求和 contract tests，combine service time 仍未进入评分。 |

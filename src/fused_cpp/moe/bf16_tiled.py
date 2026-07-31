@@ -557,6 +557,8 @@ def fused_moe_bf16_tiled_async_plan(
     if _fused_moe_bf16_tiled_async_plan_v2_impl is None:
         assert materialized.task_w13_window_bytes is not None
         assert materialized.task_w2_window_bytes is not None
+        if materialized.early_merge is not None:
+            raise RuntimeError("early_merge control requires native fused_moe_bf16_tiled_async_plan_v2 support")
         if bool((materialized.task_w13_window_bytes >= 0).any()) or bool(
             (materialized.task_w2_window_bytes >= 0).any()
         ):
@@ -657,10 +659,14 @@ def fused_moe_bf16_tiled_async_plan(
             materialized.task_resize_timeout_ns.contiguous(),
             elastic_stats_out,
             materialized.task_preferred_core_begins.contiguous(),
+            materialized.native_early_merge,
         )
     else:
         assert _fused_moe_bf16_tiled_async_plan_v2_impl is not None
-        result = _fused_moe_bf16_tiled_async_plan_v2_impl(*common_args)
+        result = _fused_moe_bf16_tiled_async_plan_v2_impl(
+            *common_args,
+            materialized.native_early_merge,
+        )
     return out if out is not None else result
 
 

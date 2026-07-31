@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare forced post-expert merge with the default async ready-token merge."""
+"""Compare post-expert, legacy ready-token, and batched same-job merge."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ import random
 import statistics
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import torch
@@ -25,7 +26,18 @@ from fused_cpp.moe import (  # noqa: E402
 
 
 READY_FLAG = "FUSED_CPP_MOE_ASYNC_READY_TOKEN_MERGE"
-VARIANTS = (("post_barrier", "0"), ("ready_token_default", None))
+DRAIN_FLAG = "FUSED_CPP_MOE_ASYNC_READY_TOKEN_DRAIN"
+BATCH_FLAG = "FUSED_CPP_MOE_ASYNC_READY_TOKEN_BATCH"
+PREFETCH_FLAG = "FUSED_CPP_MOE_ASYNC_READY_TOKEN_PREFETCH"
+
+
+@dataclass(frozen=True)
+class Variant:
+    name: str
+    ready: bool
+    drain: bool
+    batch: int
+    prefetch: bool
 
 
 def parse_args() -> argparse.Namespace:
@@ -40,6 +52,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--short-fraction", type=float, default=0.25)
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--runs", type=int, default=31)
+    parser.add_argument("--batch", type=int, default=2)
     parser.add_argument("--seed", type=int, default=20260716)
     parser.add_argument("--trace-dir", type=Path)
     parser.add_argument("--output", type=Path)
@@ -51,11 +64,11 @@ def percentile(samples: list[float], fraction: float) -> float:
     return ordered[round((len(ordered) - 1) * fraction)]
 
 
-def select_variant(flag: str | None) -> None:
-    if flag is None:
-        os.environ.pop(READY_FLAG, None)
-    else:
-        os.environ[READY_FLAG] = flag
+def select_variant(variant: Variant) -> None:
+    os.environ[READY_FLAG] = "1" if variant.ready else "0"
+    os.environ[DRAIN_FLAG] = "1" if variant.drain else "0"
+    os.environ[BATCH_FLAG] = str(variant.batch)
+    os.environ[PREFETCH_FLAG] = "1" if variant.prefetch else "0"
 
 
 def make_topk_ids(args: argparse.Namespace) -> torch.Tensor:
@@ -82,18 +95,35 @@ def make_topk_ids(args: argparse.Namespace) -> torch.Tensor:
 def parse_trace(path: Path) -> dict[str, float | int]:
     ready_records = 0
     ready_worker_ms = 0.0
+    final_merge_records = 0
+    final_merge_worker_ms = 0.0
+    final_merge_total_ms = 0.0
+    scheduled_compute_ms = 0.0
     e2e_ms = 0.0
     for line in path.read_text().splitlines():
         fields = {part.split("=", 1)[0]: part.split("=", 1)[1] for part in line.split() if "=" in part}
         if line.startswith("MOE_CALL "):
             e2e_ms = float(fields["e2e_ms"])
-        elif line.startswith("PHASE ") and fields.get("stage") == "merge_ready_token":
-            ready_records += 1
-            ready_worker_ms += float(fields["ms"])
+        elif line.startswith("PHASE "):
+            stage = fields.get("stage")
+            if stage == "merge_ready_token":
+                ready_records += 1
+                ready_worker_ms += float(fields["ms"])
+            elif stage == "merge_routes":
+                final_merge_records += 1
+                final_merge_worker_ms += float(fields["ms"])
+            elif stage == "merge_routes_total":
+                final_merge_total_ms = float(fields["ms"])
+            elif stage == "scheduled_compute":
+                scheduled_compute_ms = float(fields["ms"])
     return {
         "e2e_ms": e2e_ms,
         "ready_tokens": ready_records,
         "ready_worker_ms_sum": ready_worker_ms,
+        "final_merge_records": final_merge_records,
+        "final_merge_worker_ms_sum": final_merge_worker_ms,
+        "final_merge_total_ms": final_merge_total_ms,
+        "scheduled_compute_ms": scheduled_compute_ms,
     }
 
 
@@ -105,6 +135,14 @@ def main() -> int:
         raise ValueError("shapes, threads, and runs must be positive; warmup must be non-negative")
     if args.experts < args.top_k:
         raise ValueError("experts must be at least top-k")
+    if not 1 <= args.batch <= 64:
+        raise ValueError("batch must be in [1, 64]")
+
+    variants = (
+        Variant("post_barrier", ready=False, drain=False, batch=1, prefetch=False),
+        Variant("ready_token_legacy", ready=True, drain=False, batch=1, prefetch=False),
+        Variant("ready_token_unified", ready=True, drain=True, batch=args.batch, prefetch=True),
+    )
 
     affinity = sorted(os.sched_getaffinity(0))
     if args.threads > len(affinity):
@@ -162,60 +200,69 @@ def main() -> int:
         )
 
     outputs: dict[str, torch.Tensor] = {}
-    for name, flag in VARIANTS:
-        select_variant(flag)
-        outputs[name] = run().clone()
-    torch.testing.assert_close(
-        outputs["ready_token_default"].float(), outputs["post_barrier"].float(), atol=0, rtol=0
-    )
+    for variant in variants:
+        select_variant(variant)
+        outputs[variant.name] = run().clone()
+    for variant in variants[1:]:
+        torch.testing.assert_close(
+            outputs[variant.name].float(),
+            outputs["post_barrier"].float(),
+            atol=0,
+            rtol=0,
+        )
 
     warmup_order = random.Random(args.seed ^ 0xA5A5)
     for _ in range(args.warmup):
-        ordered = list(VARIANTS)
+        ordered = list(variants)
         warmup_order.shuffle(ordered)
-        for _, flag in ordered:
-            select_variant(flag)
+        for variant in ordered:
+            select_variant(variant)
             run()
 
-    samples = {name: [] for name, _ in VARIANTS}
+    samples = {variant.name: [] for variant in variants}
     sink = 0
     timed_order = random.Random(args.seed ^ 0x5A5A)
     for _ in range(args.runs):
-        ordered = list(VARIANTS)
+        ordered = list(variants)
         timed_order.shuffle(ordered)
-        for name, flag in ordered:
-            select_variant(flag)
+        for variant in ordered:
+            select_variant(variant)
             begin = time.perf_counter_ns()
             output = run()
-            samples[name].append((time.perf_counter_ns() - begin) / 1.0e6)
+            samples[variant.name].append((time.perf_counter_ns() - begin) / 1.0e6)
             sink ^= int(output.view(torch.int16)[0, 0])
 
     traces: dict[str, object] = {}
     if args.trace_dir is not None:
         args.trace_dir.mkdir(parents=True, exist_ok=True)
-        for name, flag in VARIANTS:
-            trace_path = args.trace_dir / f"{args.distribution}_{name}.log"
+        for variant in variants:
+            trace_path = args.trace_dir / f"{args.distribution}_{variant.name}.log"
             trace_path.unlink(missing_ok=True)
-            select_variant(flag)
+            select_variant(variant)
             os.environ["FUSED_CPP_MOE_TRACE"] = "1"
             os.environ["FUSED_CPP_MOE_TRACE_FILE"] = str(trace_path)
             run()
             os.environ["FUSED_CPP_MOE_TRACE"] = "0"
-            traces[name] = parse_trace(trace_path)
+            traces[variant.name] = parse_trace(trace_path)
 
     baseline_ms = statistics.median(samples["post_barrier"])
+    legacy_ms = statistics.median(samples["ready_token_legacy"])
     records: list[dict[str, object]] = []
-    for name, flag in VARIANTS:
-        median_ms = statistics.median(samples[name])
+    for variant in variants:
+        median_ms = statistics.median(samples[variant.name])
         records.append(
             {
-                "variant": name,
-                "ready_token_merge": flag is None,
+                "variant": variant.name,
+                "ready_token_merge": variant.ready,
+                "same_job_drain": variant.drain,
+                "batch": variant.batch,
+                "prefetch": variant.prefetch,
                 "median_ms": median_ms,
-                "p10_ms": percentile(samples[name], 0.10),
-                "p90_ms": percentile(samples[name], 0.90),
-                "gain_pct": 100.0 * (baseline_ms / median_ms - 1.0),
-                "samples": samples[name],
+                "p10_ms": percentile(samples[variant.name], 0.10),
+                "p90_ms": percentile(samples[variant.name], 0.90),
+                "gain_vs_post_pct": 100.0 * (baseline_ms / median_ms - 1.0),
+                "gain_vs_legacy_pct": 100.0 * (legacy_ms / median_ms - 1.0),
+                "samples": samples[variant.name],
             }
         )
 
@@ -237,11 +284,12 @@ def main() -> int:
         "trace": traces,
         "sink": sink,
     }
-    print("variant                 median_ms    gain_pct     p10_ms     p90_ms")
+    print("variant                 median_ms   vs_post%  vs_legacy%     p10_ms     p90_ms")
     for record in records:
         print(
             f"{record['variant']:<23} {record['median_ms']:>9.3f} "
-            f"{record['gain_pct']:>10.2f} {record['p10_ms']:>10.3f} {record['p90_ms']:>10.3f}"
+            f"{record['gain_vs_post_pct']:>10.2f} {record['gain_vs_legacy_pct']:>11.2f} "
+            f"{record['p10_ms']:>10.3f} {record['p90_ms']:>10.3f}"
         )
     if traces:
         print(json.dumps(traces, indent=2))

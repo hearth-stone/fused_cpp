@@ -120,7 +120,11 @@ class AsyncMoEPlanV2:
     nonblocking when ``task_resize_timeout_ns`` is zero. A non-negative
     ``task_preferred_core_begins`` entry may move W2 to a disjoint same-NUMA
     cohort after W13 completes; ``-1`` retains the aligned containing-cohort
-    behavior.
+    behavior. A positive ``task_range_granularities`` value assigns one
+    contiguous route slice of that size to each repeated task for an expert;
+    zero retains the full-expert task. ``early_merge`` is a plan-level
+    tri-state: ``None`` retains the runtime heuristic, ``True`` forces the
+    ready-token path, and ``False`` uses the uniform post-expert merge.
     """
 
     num_threads: int
@@ -145,6 +149,7 @@ class AsyncMoEPlanV2:
     task_w2_window_bytes: torch.Tensor | None = None
     task_resize_timeout_ns: torch.Tensor | None = None
     task_preferred_core_begins: torch.Tensor | None = None
+    early_merge: bool | None = None
 
     @property
     def plan_version(self) -> int:
@@ -157,6 +162,12 @@ class AsyncMoEPlanV2:
             ASYNC_MOE_EXECUTION_TAIL_POOL: 1,
             ASYNC_MOE_EXECUTION_ELASTIC: 2,
         }[self.execution_mode]
+
+    @property
+    def native_early_merge(self) -> int:
+        if self.early_merge is None:
+            return -1
+        return int(self.early_merge)
 
     def __post_init__(self) -> None:
         num_tasks = int(self.task_expert_ids.numel())
@@ -190,9 +201,13 @@ class AsyncMoEPlanV2:
                 for name in _V2_OPTIONAL_PER_TASK_FIELDS
             }
         )
+        early_merge = plan.get("early_merge")
+        if early_merge is not None and type(early_merge) is not bool:
+            raise TypeError("early_merge must be a bool or None")
         return cls(
             num_threads=int(plan["num_threads"]),
             execution_mode=str(plan["execution_mode"]),
+            early_merge=early_merge,
             **tensors,
         )
 
@@ -208,6 +223,10 @@ class AsyncMoEPlanV2:
             )
         if self.num_threads <= 0:
             raise ValueError(f"num_threads must be positive, got {self.num_threads}")
+        if self.early_merge is not None and type(self.early_merge) is not bool:
+            raise TypeError("early_merge must be a bool or None")
+        if self.execution_mode == ASYNC_MOE_EXECUTION_ELASTIC and self.early_merge is True:
+            raise ValueError("elastic Plan V2 does not support early_merge=True")
         for name in (*_V2_SEQUENCE_FIELDS, *_V2_OPTIONAL_PER_TASK_FIELDS):
             tensor = getattr(self, name)
             assert tensor is not None
@@ -236,8 +255,6 @@ class AsyncMoEPlanV2:
             raise ValueError("Plan V2 must contain at least one task")
         if any(expert < 0 for expert in experts):
             raise ValueError("task_expert_ids must be non-negative")
-        if len(set(experts)) != num_tasks:
-            raise ValueError("Plan V2 currently requires one task per expert")
 
         per_task = {
             "task_core_begins": self.task_core_begins,
@@ -269,6 +286,25 @@ class AsyncMoEPlanV2:
         stages = _values(self.task_stage_ids)
         resize_points = _values(self.task_resize_points)
         range_granularities = _values(self.task_range_granularities)
+        if any(granularity < 0 for granularity in range_granularities):
+            raise ValueError("task_range_granularities must be non-negative")
+        tasks_by_expert: dict[int, list[int]] = {}
+        for task, expert in enumerate(experts):
+            tasks_by_expert.setdefault(expert, []).append(task)
+        for expert, task_ids in tasks_by_expert.items():
+            granularities = {range_granularities[task] for task in task_ids}
+            if len(task_ids) == 1:
+                if granularities != {ASYNC_MOE_FULL_EXPERT_RANGE}:
+                    raise ValueError(
+                        f"single-task expert {expert} must use the full-expert range"
+                    )
+                continue
+            if self.execution_mode != ASYNC_MOE_EXECUTION_STRICT:
+                raise ValueError("route-sliced experts currently require strict execution")
+            if len(granularities) != 1 or ASYNC_MOE_FULL_EXPERT_RANGE in granularities:
+                raise ValueError(
+                    f"route-sliced expert {expert} must use one shared positive granularity"
+                )
         assert self.task_w13_window_bytes is not None
         assert self.task_w2_window_bytes is not None
         assert self.task_resize_timeout_ns is not None
@@ -324,8 +360,11 @@ class AsyncMoEPlanV2:
             for point in resize_points
         ):
             raise ValueError("elastic Plan V2 only supports the W13-to-W2 resize point")
-        if any(granularity != ASYNC_MOE_FULL_EXPERT_RANGE for granularity in range_granularities):
-            raise ValueError("Plan V2 currently only supports full-expert task ranges")
+        if self.execution_mode != ASYNC_MOE_EXECUTION_STRICT and any(
+            granularity != ASYNC_MOE_FULL_EXPERT_RANGE
+            for granularity in range_granularities
+        ):
+            raise ValueError("tail-pool and elastic Plan V2 require full-expert task ranges")
 
         dep_offsets = _values(self.task_dep_offsets)
         dependencies = _values(self.task_deps)
@@ -511,6 +550,7 @@ def upgrade_legacy_async_plan(plan: Mapping[str, object]) -> dict[str, object]:
         "task_w2_window_bytes": [-1] * num_tasks,
         "task_resize_timeout_ns": [0] * num_tasks,
         "task_preferred_core_begins": [-1] * num_tasks,
+        "early_merge": None,
     }
 
 

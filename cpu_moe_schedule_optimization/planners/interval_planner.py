@@ -29,6 +29,10 @@ _ASYNC_FULL_EXPERT_RANGE = 0
 _AUTO_TAIL_POOL_WIDTHS = frozenset((1, 2, 4))
 _AUTO_TAIL_POOL_THRESHOLDS = (1, 2, 4, 8, 12)
 _AUTO_TAIL_POOL_MIN_HEAD_SHAPES = 2
+_BOUNDED_TAIL_TASKS = 2
+_BOUNDED_TAIL_DEFAULT_CORES = 96
+_EARLY_MERGE_EQUAL_FINISH_REL_TOL = 1e-6
+_EARLY_MERGE_EQUAL_FINISH_ABS_NS = 1.0
 
 
 class PlannerPolicy(Protocol):
@@ -62,6 +66,8 @@ class PlannerCostModel(Protocol):
 
     def dag_makespan(self, tasks) -> float: ...
 
+    def dag_task_finish_times(self, tasks) -> Sequence[float]: ...
+
     def stage_T_iso(self, stage: str, routes: int, threads: int) -> float: ...
 
     def stage_dag_makespan(self, stage: str, tasks) -> float: ...
@@ -79,6 +85,22 @@ class PlannerCostModel(Protocol):
     def profiled_full_call_time(self, routes: int, shape) -> float: ...
 
     def window_bytes_per_worker(self, threads: int, routes: int | None = None) -> int: ...
+
+    def can_use_bounded_tail_repartition_anchor(
+        self,
+        routes: int,
+        root_shape,
+        tail_width: int,
+        route_slices: int = 1,
+    ) -> bool: ...
+
+    def profiled_bounded_tail_repartition(
+        self,
+        routes: int,
+        root_shape,
+        tail_width: int,
+        route_slices: int = 1,
+    ) -> tuple[float, float]: ...
 
 
 def _partitions(n: int, parts: Sequence[int]) -> List[Tuple[int, ...]]:
@@ -106,6 +128,13 @@ def _default_widths(num_cores: int) -> tuple[int, ...]:
     return tuple(widths)
 
 
+def _default_tail_repartition_widths(num_cores: int) -> tuple[int, ...]:
+    """Widths calibrated by the NUMA-local 96-core static tail experiment."""
+    if num_cores != _BOUNDED_TAIL_DEFAULT_CORES:
+        return ()
+    return (num_cores // 4, num_cores // 3, num_cores // 2)
+
+
 def _model_candidate_shapes(
     model: PlannerCostModel,
     num_cores: int,
@@ -130,6 +159,7 @@ class IntervalPlanner:
         native_cold_planner: bool | None = None,
         planner_threads: int | None = None,
         task_stage_window_policy: TaskStageWindowPolicy | None = None,
+        tail_repartition_widths: Sequence[int] | None = None,
         stage: str | None = None,
     ):
         if stage not in {None, "w13", "w2"}:
@@ -148,6 +178,22 @@ class IntervalPlanner:
         self.num_cores = int(num_cores)
         model_widths = getattr(self.model, "supported_widths", None)
         self.widths = tuple(widths or model_widths or _default_widths(self.num_cores))
+        configured_tail_widths = (
+            _default_tail_repartition_widths(self.num_cores)
+            if tail_repartition_widths is None
+            else tuple(int(width) for width in tail_repartition_widths)
+        )
+        if any(
+            width <= 0
+            or width > self.num_cores // _BOUNDED_TAIL_TASKS
+            or self.num_cores % width != 0
+            for width in configured_tail_widths
+        ):
+            raise ValueError(
+                "tail_repartition_widths must be positive divisors no wider than "
+                f"num_cores/{_BOUNDED_TAIL_TASKS}"
+            )
+        self.tail_repartition_widths = tuple(sorted(set(configured_tail_widths)))
         self.cpu_ids = tuple(int(cpu) for cpu in (cpu_ids if cpu_ids is not None else range(num_cores)))
         if len(self.cpu_ids) != self.num_cores or len(set(self.cpu_ids)) != num_cores:
             raise ValueError("cpu_ids must contain num_cores unique physical CPUs")
@@ -225,6 +271,7 @@ class IntervalPlanner:
             [list(shape) for shape in self.shapes],
             exporter(),
             planner_threads,
+            list(self.tail_repartition_widths),
         )
 
     def _lanes(self, shape: Tuple[int, ...]):
@@ -377,6 +424,9 @@ class IntervalPlanner:
             "tail_pool_threads": None,
             "tail_pool_max_routes": None,
             "tail_pool_tasks": 0,
+            "tail_repartition_width": None,
+            "tail_repartition_tasks": 0,
+            "tail_repartition_route_slices": 1,
             "makespan_ns": makespan,
             "uncertainty_ns": uncertainty,
             "pessimistic_ns": makespan + uncertainty,
@@ -408,6 +458,182 @@ class IntervalPlanner:
                 candidate["makespan_ns"],
             ),
         )
+
+    def _bounded_tail_repartition_tasks(
+        self,
+        tasks,
+        tail_width: int,
+        route_slices: int = 1,
+    ):
+        """Rewrite two terminal experts onto wider fixed route-slice intervals."""
+        tail_width = int(tail_width)
+        route_slices = int(route_slices)
+        physical_tail_tasks = _BOUNDED_TAIL_TASKS * route_slices
+        if (
+            self.stage is not None
+            or tail_width <= 0
+            or route_slices <= 0
+            or self.num_cores % _BOUNDED_TAIL_TASKS != 0
+            or self.num_cores % tail_width != 0
+            or 2 * tail_width > self.num_cores
+            or (route_slices > 1 and physical_tail_tasks * tail_width != self.num_cores)
+        ):
+            raise ValueError("bounded tail width is not feasible for this planner domain")
+
+        successors = [0] * len(tasks)
+        for task_id, (_, _, _, _, dependencies) in enumerate(tasks):
+            for dependency in dependencies:
+                if dependency < 0 or dependency >= task_id:
+                    raise ValueError(
+                        f"task dependencies must refer to earlier task ids: task={task_id}, dependency={dependency}"
+                    )
+                successors[dependency] += 1
+
+        roots = [(task_id, task) for task_id, task in enumerate(tasks) if not task[4]]
+        tails = [(task_id, task) for task_id, task in enumerate(tasks) if task[4]]
+        if (
+            len(tails) != _BOUNDED_TAIL_TASKS
+            or len(roots) + len(tails) != len(tasks)
+            or any(successors[task_id] != 0 for task_id, _ in tails)
+            or any(tail_width <= int(task[3]) for _, task in tails)
+            or any(int(task[1]) % route_slices != 0 for _, task in tails)
+        ):
+            raise ValueError("bounded tail repartition requires exactly two terminal second-wave tasks")
+
+        ordered_roots = sorted(roots, key=lambda item: (int(item[1][2]), item[0]))
+        ordered_tails = sorted(tails, key=lambda item: (int(item[1][2]), item[0]))
+        rewritten = [
+            (int(expert), int(routes), int(core_begin), int(threads), [])
+            for _, (expert, routes, core_begin, threads, _) in ordered_roots
+        ]
+        half = self.num_cores // _BOUNDED_TAIL_TASKS
+        for tail_index, (_, tail) in enumerate(ordered_tails):
+            for route_slice in range(route_slices):
+                core_begin = (
+                    tail_index * half
+                    if route_slices == 1
+                    else (tail_index * route_slices + route_slice) * tail_width
+                )
+                core_end = core_begin + tail_width
+                if core_end > self.num_cores:
+                    raise ValueError("bounded tail intervals exceed the planner domain")
+                blockers = [
+                    root_id
+                    for root_id, (_, (_, _, root_begin, root_threads, _)) in enumerate(ordered_roots)
+                    if int(root_begin) < core_end and core_begin < int(root_begin) + int(root_threads)
+                ]
+                if not blockers:
+                    raise ValueError(f"tail interval [{core_begin}, {core_end}) has no first-wave blockers")
+                rewritten.append(
+                    (
+                        int(tail[0]),
+                        int(tail[1]) // route_slices,
+                        core_begin,
+                        tail_width,
+                        blockers,
+                    )
+                )
+        return rewritten
+
+    def _bounded_tail_repartition_candidate(
+        self,
+        experts,
+        strict_candidate: dict,
+        *,
+        tail_width: int,
+        route_slices: int = 1,
+    ) -> dict:
+        tasks = self._bounded_tail_repartition_tasks(
+            strict_candidate["tasks"],
+            tail_width,
+            route_slices,
+        )
+        shape = strict_candidate["shape"]
+        uniform_routes = {int(routes) for _, routes in experts}
+        anchor_supported = getattr(self.model, "can_use_bounded_tail_repartition_anchor", None)
+        anchor_lookup = getattr(self.model, "profiled_bounded_tail_repartition", None)
+        anchor = None
+        if (
+            len(uniform_routes) == 1
+            and callable(anchor_supported)
+            and callable(anchor_lookup)
+            and anchor_supported(
+                next(iter(uniform_routes)),
+                shape,
+                tail_width,
+                route_slices,
+            )
+        ):
+            anchor = anchor_lookup(
+                next(iter(uniform_routes)),
+                shape,
+                tail_width,
+                route_slices,
+            )
+        if route_slices > 1 and anchor is None:
+            raise ValueError("route-sliced bounded-tail candidates require an exact layout anchor")
+        if anchor is None:
+            makespan = self._score(tasks)
+            uncertainty = self._uncertainty(
+                experts,
+                shape,
+                makespan,
+                use_full_workload_anchor=False,
+            )
+        else:
+            makespan, uncertainty = anchor
+        physical_tail_tasks = _BOUNDED_TAIL_TASKS * route_slices
+        root_tasks = tasks[:-physical_tail_tasks]
+        tail_tasks = tasks[-physical_tail_tasks:]
+        root_bytes = [self._task_max_stage_bytes(routes, threads) for _, routes, _, threads, _ in root_tasks]
+        tail_bytes = [self._task_max_stage_bytes(routes, threads) for _, routes, _, threads, _ in tail_tasks]
+        root_windows = [
+            self._task_window_bytes_per_worker(routes, threads) for _, routes, _, threads, _ in root_tasks
+        ]
+        tail_windows = [
+            self._task_window_bytes_per_worker(routes, threads) for _, routes, _, threads, _ in tail_tasks
+        ]
+        root_working_set = sum(root_bytes)
+        tail_working_set = sum(tail_bytes)
+        active_windows = root_windows if root_working_set >= tail_working_set else tail_windows
+        return {
+            "shape": shape,
+            "execution_mode": _ASYNC_EXECUTION_STRICT,
+            "tail_pool_threads": None,
+            "tail_pool_max_routes": None,
+            "tail_pool_tasks": 0,
+            "tail_repartition_width": int(tail_width),
+            "tail_repartition_tasks": _BOUNDED_TAIL_TASKS,
+            "tail_repartition_route_slices": int(route_slices),
+            "makespan_ns": makespan,
+            "uncertainty_ns": uncertainty,
+            "pessimistic_ns": makespan + uncertainty,
+            "tasks": tasks,
+            "active_working_set_bytes": max(root_working_set, tail_working_set),
+            "window_bytes_per_worker": tuple(active_windows),
+            "resource_groups": max(len(root_tasks), len(tail_tasks)),
+        }
+
+    def _bounded_tail_repartition_candidates(self, experts, strict_candidates) -> list[dict]:
+        candidates: list[dict] = []
+        if self.stage is not None:
+            return candidates
+        for strict_candidate in strict_candidates:
+            for tail_width in self.tail_repartition_widths:
+                route_slice_options = (1, 2) if 4 * tail_width == self.num_cores else (1,)
+                for route_slices in route_slice_options:
+                    try:
+                        candidates.append(
+                            self._bounded_tail_repartition_candidate(
+                                experts,
+                                strict_candidate,
+                                tail_width=tail_width,
+                                route_slices=route_slices,
+                            )
+                        )
+                    except (KeyError, ValueError):
+                        continue
+        return candidates
 
     @staticmethod
     def _peak_active_tasks(intervals: Sequence[tuple[float, float]]) -> int:
@@ -584,6 +810,9 @@ class IntervalPlanner:
             "tail_pool_threads": pool_threads,
             "tail_pool_max_routes": max_pooled_routes,
             "tail_pool_tasks": pooled_tasks,
+            "tail_repartition_width": None,
+            "tail_repartition_tasks": 0,
+            "tail_repartition_route_slices": 1,
             "makespan_ns": makespan,
             "uncertainty_ns": uncertainty,
             "pessimistic_ns": makespan + uncertainty,
@@ -673,6 +902,7 @@ class IntervalPlanner:
         planner_workers: int,
         strict_candidates: int,
         dynamic_candidates: int,
+        tail_repartition_candidates: int,
     ) -> Dict[str, object]:
         policy = None
         if self.model.policy is not None:
@@ -704,6 +934,9 @@ class IntervalPlanner:
             "tail_pool_threads": selected["tail_pool_threads"],
             "tail_pool_max_routes": selected["tail_pool_max_routes"],
             "tail_pool_tasks": selected["tail_pool_tasks"],
+            "tail_repartition_width": selected["tail_repartition_width"],
+            "tail_repartition_tasks": selected["tail_repartition_tasks"],
+            "tail_repartition_route_slices": selected["tail_repartition_route_slices"],
             "makespan_ns": selected["makespan_ns"],
             "uncertainty_ns": selected["uncertainty_ns"],
             "active_working_set_bytes": selected["active_working_set_bytes"],
@@ -716,6 +949,7 @@ class IntervalPlanner:
             "task_stage_window_policy": (
                 self.task_stage_window_policy.name if self.task_stage_window_policy is not None else None
             ),
+            "early_merge": bridge["early_merge"],
             "policy": policy,
             "tasks": selected["tasks"],
             "bridge": bridge,
@@ -723,6 +957,7 @@ class IntervalPlanner:
             "planner_workers": planner_workers,
             "strict_candidates": strict_candidates,
             "dynamic_candidates": dynamic_candidates,
+            "tail_repartition_candidates": tail_repartition_candidates,
             "ranking": [
                 {
                     "shape": tuple(candidate["shape"]),
@@ -730,6 +965,9 @@ class IntervalPlanner:
                     "tail_pool_threads": candidate["tail_pool_threads"],
                     "tail_pool_max_routes": candidate["tail_pool_max_routes"],
                     "tail_pool_tasks": candidate["tail_pool_tasks"],
+                    "tail_repartition_width": candidate["tail_repartition_width"],
+                    "tail_repartition_tasks": candidate["tail_repartition_tasks"],
+                    "tail_repartition_route_slices": candidate["tail_repartition_route_slices"],
                     "makespan_ms": round(candidate["makespan_ns"] / 1e6, 6),
                     "pessimistic_ms": round(candidate["pessimistic_ns"] / 1e6, 6),
                     "active_working_set_bytes": candidate["active_working_set_bytes"],
@@ -747,10 +985,13 @@ class IntervalPlanner:
         dynamic_tail_pool: bool = True,
         tail_pool_max_routes: int = 12,
         forced_tail_pool_threads: int | None = None,
+        bounded_tail_repartition: bool | None = None,
     ) -> Dict[str, object]:
         experts = [(expert, routes) for expert, routes in experts if routes > 0]
         if not experts:
             raise ValueError("at least one active expert is required")
+        if bounded_tail_repartition is None:
+            bounded_tail_repartition = dynamic_tail_pool and forced_tail_pool_threads is None
         if self._native_planner is not None:
             native = self._native_planner.plan(
                 [expert for expert, _ in experts],
@@ -758,6 +999,7 @@ class IntervalPlanner:
                 dynamic_tail_pool,
                 tail_pool_max_routes,
                 forced_tail_pool_threads,
+                bounded_tail_repartition,
             )
             return self._finalize_plan(
                 native["selected"],
@@ -766,8 +1008,15 @@ class IntervalPlanner:
                 planner_workers=int(native["configured_workers"]),
                 strict_candidates=int(native["strict_candidates"]),
                 dynamic_candidates=int(native["dynamic_candidates"]),
+                tail_repartition_candidates=int(native["tail_repartition_candidates"]),
             )
         strict_candidates = [self._candidate(experts, shape) for shape in self.shapes]
+        tail_repartition_candidates: list[dict] = []
+        if bounded_tail_repartition and forced_tail_pool_threads is None:
+            tail_repartition_candidates = self._bounded_tail_repartition_candidates(
+                experts,
+                self._tail_pool_head_candidates(strict_candidates),
+            )
         tail_pool_candidates: list[dict] = []
         if dynamic_tail_pool or forced_tail_pool_threads is not None:
             tail_pool_heads = (
@@ -790,6 +1039,8 @@ class IntervalPlanner:
             candidates = tail_pool_candidates
         else:
             candidates = list(strict_candidates)
+            if bounded_tail_repartition:
+                candidates.extend(tail_repartition_candidates)
             if dynamic_tail_pool:
                 candidates.extend(tail_pool_candidates)
         selected = self._select(candidates)
@@ -800,6 +1051,7 @@ class IntervalPlanner:
             planner_workers=1,
             strict_candidates=len(strict_candidates),
             dynamic_candidates=len(tail_pool_candidates),
+            tail_repartition_candidates=len(tail_repartition_candidates),
         )
 
     def _task_stage_windows(
@@ -825,6 +1077,43 @@ class IntervalPlanner:
             w2_windows.append(int(w2_bytes))
         return w13_windows, w2_windows
 
+    def _early_merge_policy(self, tasks) -> bool | None:
+        """Disable early merge only when the model predicts no overlap window."""
+        if self.stage is not None:
+            return None
+        finish_time_fn = getattr(self.model, "dag_task_finish_times", None)
+        if not callable(finish_time_fn):
+            return None
+        model_tasks = [
+            (int(routes), int(threads), list(dependencies))
+            for _, routes, _, threads, dependencies in tasks
+        ]
+        try:
+            task_finish_times = tuple(float(value) for value in finish_time_fn(model_tasks))
+        except (KeyError, ValueError):
+            return None
+        if len(task_finish_times) != len(tasks) or not task_finish_times:
+            return None
+        expert_finish_times: dict[int, float] = {}
+        for values, finish_time in zip(tasks, task_finish_times, strict=True):
+            expert = int(values[0])
+            expert_finish_times[expert] = max(
+                finish_time,
+                expert_finish_times.get(expert, -math.inf),
+            )
+        earliest = min(expert_finish_times.values())
+        latest = max(expert_finish_times.values())
+        if math.isclose(
+            earliest,
+            latest,
+            rel_tol=_EARLY_MERGE_EQUAL_FINISH_REL_TOL,
+            abs_tol=_EARLY_MERGE_EQUAL_FINISH_ABS_NS,
+        ):
+            return False
+        # The current objective does not model merge/computation contention,
+        # so a predicted gap is insufficient evidence to force early merge on.
+        return None
+
     def to_async_bridge(self, tasks) -> Dict[str, object]:
         dependency_offsets, flat_dependencies = [0], []
         for _, _, _, _, dependencies in tasks:
@@ -833,6 +1122,21 @@ class IntervalPlanner:
         task_threads = [threads for _, _, _, threads, _ in tasks]
         task_w13_window_bytes, task_w2_window_bytes = self._task_stage_windows(tasks, task_threads)
         num_tasks = len(tasks)
+        expert_task_counts: dict[int, int] = {}
+        expert_slice_rows: dict[int, int] = {}
+        for expert, routes, _, _, _ in tasks:
+            expert = int(expert)
+            routes = int(routes)
+            expert_task_counts[expert] = expert_task_counts.get(expert, 0) + 1
+            previous_rows = expert_slice_rows.setdefault(expert, routes)
+            if previous_rows != routes:
+                raise ValueError(
+                    f"route-sliced expert {expert} requires equal-sized task ranges"
+                )
+        task_range_granularities = [
+            int(routes) if expert_task_counts[int(expert)] > 1 else _ASYNC_FULL_EXPERT_RANGE
+            for expert, routes, _, _, _ in tasks
+        ]
         return {
             "plan_version": _ASYNC_PLAN_VERSION,
             "execution_mode": _ASYNC_EXECUTION_STRICT,
@@ -852,11 +1156,12 @@ class IntervalPlanner:
             "task_numa_nodes": [-1] * num_tasks,
             "task_stage_ids": [_ASYNC_STAGE_EXPERT] * num_tasks,
             "task_resize_points": [_ASYNC_RESIZE_NONE] * num_tasks,
-            "task_range_granularities": [_ASYNC_FULL_EXPERT_RANGE] * num_tasks,
+            "task_range_granularities": task_range_granularities,
             "task_w13_window_bytes": task_w13_window_bytes,
             "task_w2_window_bytes": task_w2_window_bytes,
             "task_resize_timeout_ns": [0] * num_tasks,
             "task_preferred_core_begins": [-1] * num_tasks,
+            "early_merge": self._early_merge_policy(tasks),
         }
 
     def to_elastic_w2_bridge(
@@ -1031,6 +1336,7 @@ class IntervalPlanner:
             "task_w2_window_bytes": task_w2_window_bytes,
             "task_resize_timeout_ns": [0] * num_tasks,
             "task_preferred_core_begins": [-1] * num_tasks,
+            "early_merge": None,
         }
 
 
@@ -1069,11 +1375,13 @@ class PlannedTwoStagePlanner:
         dynamic_tail_pool: bool = True,
         tail_pool_max_routes: int = 12,
         forced_tail_pool_threads: int | None = None,
+        bounded_tail_repartition: bool | None = None,
     ) -> Dict[str, object]:
         options = {
             "dynamic_tail_pool": dynamic_tail_pool,
             "tail_pool_max_routes": tail_pool_max_routes,
             "forced_tail_pool_threads": forced_tail_pool_threads,
+            "bounded_tail_repartition": bounded_tail_repartition,
         }
         w13 = self.w13_planner.plan(experts, **options)
         w2 = self.w2_planner.plan(experts, **options)
@@ -1103,6 +1411,7 @@ class PolicyAwarePlanner:
         working_set_target_fraction: float = 2.0 / 3.0,
         task_stage_window_policy: TaskStageWindowPolicy | None = None,
         task_stage_window_policies: Sequence[TaskStageWindowPolicy | None] | None = None,
+        tail_repartition_widths: Sequence[int] | None = None,
     ):
         if not models:
             raise ValueError("at least one policy model is required")
@@ -1134,6 +1443,7 @@ class PolicyAwarePlanner:
                 cpu_ids=cpu_ids,
                 shapes=self._pruned_shapes(model),
                 task_stage_window_policy=stage_window_policy,
+                tail_repartition_widths=tail_repartition_widths,
             )
             for model, stage_window_policy in zip(self.models, task_stage_window_policies)
         )
@@ -1162,6 +1472,7 @@ class PolicyAwarePlanner:
         dynamic_tail_pool: bool = True,
         tail_pool_max_routes: int = 12,
         forced_tail_pool_threads: int | None = None,
+        bounded_tail_repartition: bool | None = None,
     ) -> Dict[str, object]:
         policy_results = [
             planner.plan(
@@ -1169,6 +1480,7 @@ class PolicyAwarePlanner:
                 dynamic_tail_pool=dynamic_tail_pool,
                 tail_pool_max_routes=tail_pool_max_routes,
                 forced_tail_pool_threads=forced_tail_pool_threads,
+                bounded_tail_repartition=bounded_tail_repartition,
             )
             for planner in self.planners
         ]
@@ -1198,6 +1510,9 @@ class PolicyAwarePlanner:
                 "tail_pool_threads": result["tail_pool_threads"],
                 "tail_pool_max_routes": result["tail_pool_max_routes"],
                 "tail_pool_tasks": result["tail_pool_tasks"],
+                "tail_repartition_width": result["tail_repartition_width"],
+                "tail_repartition_tasks": result["tail_repartition_tasks"],
+                "tail_repartition_route_slices": result["tail_repartition_route_slices"],
                 "makespan_ms": result["makespan_ns"] / 1e6,
                 "uncertainty_ms": result["uncertainty_ns"] / 1e6,
                 "active_working_set_bytes": result["active_working_set_bytes"],

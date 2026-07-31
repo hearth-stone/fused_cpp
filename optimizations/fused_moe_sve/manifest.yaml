@@ -513,6 +513,52 @@ features:
       cpu_moe_schedule_optimization/cost_model/profiles/contention_async_amazon_c5_192c_dual_numa_tp4_sve_F512_E256_splitw13_schema_v2_xbyak_exactm_20260726.json
       --static-16-to-4 --route-dtype bf16 --warmup 5 --runs 21
 
+  - id: dispatch.bounded_tail_route_fission
+    part: dispatch
+    status: enabled
+    implementation: >-
+      src/fused_cpp/moe/plan.py,
+      cpu_moe_schedule_optimization/planners/interval_planner.py,
+      cpu_moe_schedule_optimization/planners/planned_moe.py,
+      cpu_moe_schedule_optimization/cost_model/phase_model.py,
+      csrc/moe_planner/interval_planner.cpp,
+      csrc/moe_planner/bindings.cpp, and
+      csrc/moe/arm/common/fused_moe_bf16_tiled.cpp
+    hypothesis: >-
+      When exactly two long terminal experts remain after a 6x16T head wave,
+      splitting each route range into two disjoint M slices lets four 24T
+      fixed tasks occupy all 96 NUMA-local cores. Restricting the candidate to
+      an exact root-shape, route, placement, stage-window, and kernel anchor
+      captures the measured tail gain without extrapolating M-split
+      contention to unmeasured workloads.
+    depends_on:
+      - dispatch.per_task_stage_windows
+      - store.w2_direct_route
+    conflicts_with:
+      - dispatch.global_stage_task_pool
+    correctness: >-
+      PYTHONPATH=src .venv/bin/python -m pytest -q
+      tests/test_moe_plan_v2.py tests/test_moe_cost_model_v2.py
+      tests/test_moe_native_interval_planner.py
+      tests/test_fused_moe_bf16_tiled.py
+      -k 'route_slice or bounded_tail'
+    benchmark: >-
+      numactl --cpunodebind=0 --membind=0 taskset -c 0-95
+      .venv/bin/python
+      optimizations/fused_moe_sve/benchmarks/bench_vllm_staged_schedule.py
+      --preset moe256-active-set-8 --production-profile
+      cpu_moe_schedule_optimization/cost_model/profiles/contention_async_amazon_c5_192c_numa0_tp4_sve_F512_E256_splitw13_schema_v2_xbyak_exactm_20260727.json
+      --static-tail-widths 24 --static-tail-m-split
+      --route-dtype bf16 --warmup 7 --runs 51
+    result: >-
+      On AmazonC5192Cores NUMA0, grouped 4x24T M=768 slices measured
+      8.710 ms and 17.751 TFLOP/s, versus 9.804 ms for the same two terminal
+      experts at whole-expert 24T. After integration, production auto selected
+      the same route-sliced plan and measured 8.753 ms, within 0.08 percent of
+      the explicit comparator and 27.73 percent faster than same-run strict
+      throughput. Full results are in
+      results/amazon_192c_static_tail_repartition.md.
+
   - id: dispatch.dynamic_short_expert_pool
     part: dispatch
     status: enabled
@@ -608,9 +654,11 @@ features:
     hypothesis: >-
       Publishing expert completion and letting otherwise idle async workers
       merge tokens whose full TopK predecessor set is ready can hide route
-      combine under an imbalanced expert tail. Expert-first selection, batched
-      publication, and a team-load imbalance gate should bound queue overhead
-      without changing numerical association or the default executor.
+      combine under an imbalanced expert tail. Keeping the resident worker job
+      alive until every token is merged removes the final pool rendezvous and
+      redispatch. Single-token claims preserve load balance while expert work
+      remains; after compute completes, two-token claims permit one-token
+      lookahead prefetch without changing numerical association.
     depends_on:
       - store.w2_direct_route
       - merge.sve_weighted_reduce
@@ -625,7 +673,8 @@ features:
       optimizations/fused_moe_sve/benchmarks/bench_async_ready_token_merge.py
       --tokens 2048 --hidden 4096 --intermediate 512
       --experts 12 --top-k 6 --threads 96
-      --distribution two-group --warmup 5 --runs 31
+      --distribution two-group --batch 2 --warmup 7 --runs 101
+      --trace-dir /tmp/fused_cpp_ready_token_trace
 
   - id: merge.sve_weighted_reduce
     part: merge
@@ -1129,6 +1178,19 @@ variants:
       (forced-4T benchmark comparator using the native async executor)
     status: experimental
 
+  - id: sve_bounded_tail_route_fission
+    features:
+      - dispatch.bounded_tail_route_fission
+      - dispatch.per_task_stage_windows
+      - planner.native_cold_search
+      - store.w2_direct_route
+      - store.w2_direct_bf16_route
+      - merge.sve_weighted_reduce
+    entrypoint: >-
+      PlannedMoE.plan_spec_for (exact anchored bounded-tail route slices) ->
+      fused_moe_bf16_tiled_async_plan
+    status: enabled
+
   - id: sve_planner_selected_tail_pool
     features:
       - dispatch.dynamic_short_expert_pool
@@ -1164,7 +1226,10 @@ variants:
     entrypoint: >-
       fused_moe_bf16_tiled_async
       (default; FUSED_CPP_MOE_ASYNC_READY_TOKEN_MERGE=1 is equivalent,
-      value 0 selects the post-expert fallback)
+      FUSED_CPP_MOE_ASYNC_READY_TOKEN_DRAIN=0 selects legacy early+final,
+      FUSED_CPP_MOE_ASYNC_READY_TOKEN_BATCH=2 and
+      FUSED_CPP_MOE_ASYNC_READY_TOKEN_PREFETCH=1 are the default drain policy,
+      merge value 0 selects the post-expert fallback)
     status: enabled
 
   - id: sve_route_merge_u2

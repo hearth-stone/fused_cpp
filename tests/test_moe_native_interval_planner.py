@@ -22,6 +22,11 @@ PROFILE = (
     / "profiles"
     / "contention_async_amazon_ecs_8c_standalone_sve_F512_E8_splitw13_xbyak_exactm_v2_20260727.json"
 )
+TP4_96C_PROFILE = (
+    COST_MODEL
+    / "profiles"
+    / "contention_async_amazon_c5_192c_numa0_tp4_sve_F512_E256_splitw13_schema_v2_xbyak_exactm_20260727.json"
+)
 
 
 def _native_extension():
@@ -41,6 +46,9 @@ def _assert_plan_equivalent(reference: dict, actual: dict) -> None:
         "tail_pool_threads",
         "tail_pool_max_routes",
         "tail_pool_tasks",
+        "tail_repartition_width",
+        "tail_repartition_tasks",
+        "tail_repartition_route_slices",
         "active_working_set_bytes",
         "resource_groups",
         "window_bytes_per_worker",
@@ -48,6 +56,7 @@ def _assert_plan_equivalent(reference: dict, actual: dict) -> None:
         "bridge",
         "strict_candidates",
         "dynamic_candidates",
+        "tail_repartition_candidates",
         "ranking",
     )
     for field in exact_fields:
@@ -175,6 +184,64 @@ def test_native_stage_window_execution_model_matches_python() -> None:
     _assert_plan_equivalent(expected, actual)
     assert actual["strict_candidates"] == len(reference.shapes)
     assert reference.model.dag_makespan([(192, 4, []), (192, 4, [])]) < model.dag_makespan([(192, 4, []), (192, 4, [])])
+
+
+def test_native_bounded_tail_repartition_matches_python() -> None:
+    extension = _native_extension()
+    model = ContentionCostModel(TP4_96C_PROFILE)
+    reference = IntervalPlanner(
+        model,
+        num_cores=96,
+        native_cold_planner=False,
+    )
+    native = IntervalPlanner(
+        model,
+        num_cores=96,
+        native_cold_planner=True,
+        planner_threads=4,
+    )
+    experts = [(expert, 1536) for expert in range(8)]
+
+    assert model.T_iso(1536, 24) > 0
+    with pytest.raises(KeyError, match="threads=24"):
+        model.T_iso(24, 24)
+
+    expected = reference.plan(
+        experts,
+        dynamic_tail_pool=False,
+        bounded_tail_repartition=True,
+    )
+    actual = native.plan(
+        experts,
+        dynamic_tail_pool=False,
+        bounded_tail_repartition=True,
+    )
+
+    _assert_plan_equivalent(expected, actual)
+    assert actual["shape"] == (16, 16, 16, 16, 16, 16)
+    assert actual["tail_repartition_width"] == 24
+    assert actual["tail_repartition_tasks"] == 2
+    assert actual["tail_repartition_route_slices"] == 2
+    assert actual["tail_repartition_candidates"] == 4
+    assert actual["bridge"]["task_range_granularities"][-4:] == [768, 768, 768, 768]
+
+    direct = extension.NativeIntervalPlanner(
+        96,
+        list(reference.widths),
+        [list(shape) for shape in reference.shapes],
+        model.native_interval_planner_payload(),
+        4,
+        list(reference.tail_repartition_widths),
+    )
+    expert_ids = [expert_id for expert_id, _ in experts]
+    routes = [route_count for _, route_count in experts]
+    auto = direct.plan(expert_ids, routes)
+    strict = direct.plan(expert_ids, routes, dynamic_tail_pool=False)
+    assert auto["tail_repartition_candidates"] == 4
+    assert auto["selected"]["tail_repartition_width"] == 24
+    assert auto["selected"]["tail_repartition_route_slices"] == 2
+    assert strict["tail_repartition_candidates"] == 0
+    assert strict["selected"]["tail_repartition_width"] is None
 
 
 def test_explicit_native_request_rejects_unsupported_model() -> None:

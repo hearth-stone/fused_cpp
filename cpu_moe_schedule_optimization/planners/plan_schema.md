@@ -180,9 +180,10 @@ scale, and wave packing operations.
 diagnostics. It is useful for understanding prototype overhead, but it should not
 be interpreted as native runtime planner cost.
 
-`T_dispatch` and `T_combine` are intentionally not included in the first offline
-schema. If future experiments show they depend strongly on the plan shape, add
-them as explicit plan-dependent fields instead of hiding them in metadata.
+`T_dispatch` and the duration/contention response of `T_combine` are not
+included in the planner objective. Plan V2 does expose a conservative
+`early_merge` execution choice, but it may only disable overlap when predicted
+expert completion times coincide; it does not score an unmodeled combine gain.
 
 ## Scheduled C++ Bridge
 
@@ -251,7 +252,8 @@ native `fused_moe_bf16_tiled_async_plan_v2` entrypoint:
   "task_w13_window_bytes": [-1, 1048576, 4194304],
   "task_w2_window_bytes": [-1, 524288, 1048576],
   "task_resize_timeout_ns": [0, 0, 0],
-  "task_preferred_core_begins": [-1, -1, -1]
+  "task_preferred_core_begins": [-1, -1, -1],
+  "early_merge": null
 }
 ```
 
@@ -276,9 +278,13 @@ Rules:
   by strict/tail-pool execution. An elastic task with a resize point must carry
   an explicit NUMA node, and every physical CPU in its preferred cohort must
   resolve to that node.
-- Stage id `0` means a whole expert, resize mask `0` means no legal resize
-  point, resize mask `1` means W13-to-W2 only, and range granularity `0` means
-  the full expert task. Mask `1` is accepted only in elastic mode.
+- Stage id `0` means an expert pipeline task, resize mask `0` means no legal
+  resize point, resize mask `1` means W13-to-W2 only, and range granularity
+  `0` means the full expert task. A positive range granularity assigns the
+  next contiguous route slice of that many rows to this occurrence of the
+  expert id. Repeated occurrences are consumed in task-array order; the final
+  slice may be shorter, but the slices must cover the expert exactly. Mask `1`
+  is accepted only in elastic mode.
 - `task_resize_timeout_ns` is optional and defaults to zero. A zero timeout is a
   nonblocking acquisition: the W2 stage expands only when all extra cohort
   workers are already idle, otherwise its original team continues immediately.
@@ -303,7 +309,21 @@ Rules:
   positive value selects a tile-aligned nominal packed-B byte window. Non-SVE
   backends ignore the override. A pre-V2 native extension rejects a plan with
   any non-negative override instead of silently changing its execution.
-- The first async bridge supports exactly one task per active expert.
+- `early_merge` is an optional plan-level tri-state. Missing or `null` retains
+  the runtime team-load heuristic, `true` forces the ready-token path, and
+  `false` waits for expert compute to finish before all workers merge uniform
+  contiguous token ranges. `true` requires SVE direct-route W2 and is rejected
+  for elastic execution. `FUSED_CPP_MOE_ASYNC_READY_TOKEN_MERGE=0` remains a
+  global kill switch. A Python wrapper connected to a native extension without
+  this argument rejects explicit `true`/`false` instead of ignoring it.
+- Strict execution permits either one full-range task per active expert or
+  multiple route-slice tasks. All repeated tasks for one expert must carry the
+  same positive granularity. Mixing full-range and sliced tasks, leaving a
+  route gap, or extending past the available task count is rejected natively.
+  Tail-pool and elastic execution still require one full-range task per expert.
+  An expert becomes ready for token merge only after all of its slices finish;
+  each slice owns disjoint route rows and an independent fixed team/scratch
+  interval.
 - Strict mode requires every placement to be fixed and ignores the legacy
   short-pool environment variables.
 - Tail-pool mode requires at least one pooled task. All pooled tasks use one
@@ -345,28 +365,41 @@ Rules:
   selected task, enabling planner-specified disjoint cohorts such as
   `16-31 -> 32-63`. This is currently a benchmark/validation bridge, not an
   automatically searched production candidate.
-- `IntervalPlanner` and `PlannedMoE` compare strict execution with eligible
-  whole-expert tail-pool candidates by default. The planner searches route
-  buckets `1/2/4/8/12` at or below `tail_pool_max_routes=12`, aligned `1/2/4T`
-  pool widths, and strict-competitive head shapes. Duplicate pooled sets are
-  removed before it lowers each online list schedule to a surrogate DAG and
-  scores it with the current contention model.
-- `dynamic_tail_pool=False` requests the strict baseline.
+- `IntervalPlanner` and `PlannedMoE` compare the original strict execution with
+  eligible whole-expert tail-pool and bounded terminal-repartition candidates
+  by default. The tail pool searches route buckets `1/2/4/8/12` at or below
+  `tail_pool_max_routes=12`, aligned `1/2/4T` pool widths, and
+  strict-competitive head shapes. Duplicate pooled sets are removed before it
+  lowers each online list schedule to a surrogate DAG and scores it with the
+  current contention model.
+- A bounded terminal repartition is still a strict bridge. It is legal only
+  when the selected head has exactly two second-wave tasks and both have no
+  successor. On a 96-worker planner domain it searches `24/32/48T`, places the
+  two tasks in disjoint half-domain intervals, and replaces their dependencies
+  with every first-wave task overlapping the new interval. Metadata records
+  `tail_repartition_width`, `tail_repartition_tasks`, and
+  `tail_repartition_candidates`; the executor needs no new mode or handoff.
+- `dynamic_tail_pool=False` with an omitted bounded-tail option requests the
+  original strict baseline. Passing `bounded_tail_repartition=True` explicitly
+  evaluates the bounded candidate without enabling the dynamic tail pool.
   `tail_pool_threads=T` remains a forced override, but shape selection is still
   performed against that tail-pool policy instead of rewriting an already
   selected strict shape.
-- The plan cache separates strict, automatic, and forced policies and records
-  the eligible-expert count at every searched route threshold. A routing
-  update that crosses a pooling boundary therefore triggers replanning even
-  when its coarse route histogram is unchanged.
+- The plan cache separates strict, automatic, forced, and bounded-tail
+  policies. It records the eligible-expert count at every searched route
+  threshold. A bounded-tail hit reruns the cheap LPT assignment and validates
+  that the cached width still applies to exactly two terminal second-wave
+  tasks and remains supported by the isolated model at the new route counts;
+  a topology or calibration mismatch evicts the entry and reruns cold search.
 - The runtime, rather than the planner, observes actual fixed-task completion
   and assigns the next pooled task. The surrogate is therefore a selection
   model, not an exact prediction of runtime claim order.
 - For schema-v2 empirical profiles, an available current extension runs cold
   candidate search in C++ and parallelizes independent candidates. Planner
-  output records `planner_backend`, `planner_workers`, `strict_candidates`, and
-  `dynamic_candidates`; these are diagnostics and are not part of the runtime
-  bridge identity. `FUSED_CPP_MOE_NATIVE_COLD_PLANNER=0` selects the Python
+  output records `planner_backend`, `planner_workers`, `strict_candidates`,
+  `dynamic_candidates`, and `tail_repartition_candidates`; these are
+  diagnostics and are not part of the runtime bridge identity.
+  `FUSED_CPP_MOE_NATIVE_COLD_PLANNER=0` selects the Python
   reference implementation, while `FUSED_CPP_MOE_PLANNER_THREADS` controls
   native candidate workers. Cache hits rebuild the same bridge without rerunning
   either cold solver.

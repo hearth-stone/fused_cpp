@@ -50,6 +50,7 @@ VLLM_VARIANT = "vllm_staged"
 MATCHED_STAGED_VARIANT = "planned_staged_matched"
 FINE_STAGED_VARIANT = "planned_staged_independent"
 ELASTIC_VARIANT_PREFIX = "elastic_w2"
+STATIC_TAIL_VARIANT_PREFIX = "static_tail"
 
 
 def parse_args() -> argparse.Namespace:
@@ -74,6 +75,13 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=None,
         help="enable production ready-token merge (default: enabled with --production-profile)",
+    )
+    parser.add_argument(
+        "--ready-token-drain-batches",
+        help=(
+            "comma-separated same-job ready-token batch sizes; adds an interleaved "
+            "legacy-final comparator and requires a production auto plan"
+        ),
     )
     parser.add_argument(
         "--static-16-to-4",
@@ -117,6 +125,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--elastic-w2-core-begins",
         help="comma-separated task_id:logical_core_begin targets; allows disjoint W2 migration",
+    )
+    parser.add_argument(
+        "--static-tail-widths",
+        help=(
+            "comma-separated widths for a 6x16T-to-2xWT static tail experiment; "
+            "requires an eight-expert strict production plan"
+        ),
+    )
+    parser.add_argument(
+        "--static-tail-m-split",
+        action="store_true",
+        help=(
+            "compare grouped and interleaved 6x16T-to-4x24T tails by splitting "
+            "each of the two terminal experts into two equal route ranges"
+        ),
     )
     parser.add_argument("--route-dtype", choices=("fp32", "bf16"), default="fp32")
     parser.add_argument("--warmup", type=int, default=3)
@@ -238,6 +261,157 @@ def make_elastic_w2_plan(
             f"selected strict plan has no task matching elastic transitions {sorted(transitions.items())}"
         )
     return AsyncMoEPlanV2.from_dict(bridge)
+
+
+def make_static_tail_repartition_plan(
+    base_plan: AsyncMoEPlanV2,
+    route_counts: torch.Tensor,
+    *,
+    profile: Path,
+    tail_width: int,
+    static_stage_windows: bool,
+) -> AsyncMoEPlanV2:
+    from interval_planner import IntervalPlanner
+    from phase_model import ContentionCostModel
+
+    if base_plan.execution_mode != "strict":
+        raise ValueError("static tail repartition requires a strict base plan")
+    if tail_width <= 0 or base_plan.num_threads % tail_width != 0:
+        raise ValueError(
+            f"tail width must be a positive divisor of num_threads={base_plan.num_threads}, got {tail_width}"
+        )
+
+    dependency_offsets = base_plan.task_dep_offsets.tolist()
+    dependencies = base_plan.task_deps.tolist()
+    base_tasks: list[tuple[int, int, int, int, list[int]]] = []
+    for task, expert in enumerate(base_plan.task_expert_ids.tolist()):
+        begin = dependency_offsets[task]
+        end = dependency_offsets[task + 1]
+        base_tasks.append(
+            (
+                int(expert),
+                int(route_counts[expert]),
+                int(base_plan.task_core_begins[task]),
+                int(base_plan.task_threads[task]),
+                [int(dep) for dep in dependencies[begin:end]],
+            )
+        )
+
+    roots = sorted((task for task in base_tasks if not task[4]), key=lambda task: task[2])
+    tails = sorted((task for task in base_tasks if task[4]), key=lambda task: task[2])
+    if len(roots) != 6 or len(tails) != 2:
+        raise ValueError(
+            "static tail repartition requires exactly six first-wave and two tail tasks, "
+            f"got {len(roots)} and {len(tails)}"
+        )
+    if any(task[3] != 16 for task in roots):
+        raise ValueError("static tail repartition requires six 16-thread first-wave tasks")
+    if 2 * tail_width > base_plan.num_threads:
+        raise ValueError(f"two {tail_width}-thread tail tasks exceed {base_plan.num_threads} threads")
+
+    half_threads = base_plan.num_threads // len(tails)
+    tail_core_begins = [index * half_threads for index in range(len(tails))]
+    if tail_core_begins[-1] + tail_width > base_plan.num_threads:
+        raise ValueError(f"cannot place two {tail_width}-thread tail tasks")
+
+    tasks: list[tuple[int, int, int, int, list[int]]] = [
+        (expert, routes, core_begin, threads, [])
+        for expert, routes, core_begin, threads, _ in roots
+    ]
+    for tail, core_begin in zip(tails, tail_core_begins, strict=True):
+        core_end = core_begin + tail_width
+        blockers = [
+            root_id
+            for root_id, (_, _, root_begin, root_threads, _) in enumerate(roots)
+            if root_begin < core_end and core_begin < root_begin + root_threads
+        ]
+        if not blockers:
+            raise ValueError(f"tail interval [{core_begin}, {core_end}) has no first-wave blockers")
+        tasks.append((tail[0], tail[1], core_begin, tail_width, blockers))
+
+    cpu_ids = [int(cpu) for cpu in base_plan.thread_cpu_ids.tolist()]
+    planner = IntervalPlanner(
+        ContentionCostModel(profile),
+        base_plan.num_threads,
+        cpu_ids=cpu_ids,
+        task_stage_window_policy=(
+            AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V1 if static_stage_windows else None
+        ),
+    )
+    return AsyncMoEPlanV2.from_dict(planner.to_async_bridge(tasks))
+
+
+def make_static_tail_m_split_plan(
+    base_plan: AsyncMoEPlanV2,
+    route_counts: torch.Tensor,
+    *,
+    profile: Path,
+    layout: str,
+    static_stage_windows: bool,
+) -> AsyncMoEPlanV2:
+    from interval_planner import IntervalPlanner
+    from phase_model import ContentionCostModel
+
+    if layout not in {"grouped", "interleaved"}:
+        raise ValueError(f"unsupported static tail M-split layout: {layout}")
+    if base_plan.execution_mode != "strict" or base_plan.num_threads != 96:
+        raise ValueError("static tail M-split requires a strict 96-thread base plan")
+
+    dependency_offsets = base_plan.task_dep_offsets.tolist()
+    dependencies = base_plan.task_deps.tolist()
+    base_tasks: list[tuple[int, int, int, int, list[int]]] = []
+    for task, expert in enumerate(base_plan.task_expert_ids.tolist()):
+        begin = dependency_offsets[task]
+        end = dependency_offsets[task + 1]
+        base_tasks.append(
+            (
+                int(expert),
+                int(route_counts[expert]),
+                int(base_plan.task_core_begins[task]),
+                int(base_plan.task_threads[task]),
+                [int(dep) for dep in dependencies[begin:end]],
+            )
+        )
+
+    roots = sorted((task for task in base_tasks if not task[4]), key=lambda task: task[2])
+    tails = sorted((task for task in base_tasks if task[4]), key=lambda task: task[2])
+    if len(roots) != 6 or len(tails) != 2 or any(task[3] != 16 for task in roots):
+        raise ValueError("static tail M-split requires a 6x16T head and exactly two terminal experts")
+    if any(tail[1] % 2 != 0 or tail[1] // 2 < 120 for tail in tails):
+        raise ValueError("each tail expert must split into two equal route ranges of at least 120 rows")
+
+    tail_width = base_plan.num_threads // 4
+    starts = [index * tail_width for index in range(4)]
+    if layout == "grouped":
+        assignments = ((tails[0], 0), (tails[0], 1), (tails[1], 0), (tails[1], 1))
+    else:
+        assignments = ((tails[0], 0), (tails[1], 0), (tails[0], 1), (tails[1], 1))
+
+    tasks: list[tuple[int, int, int, int, list[int]]] = [
+        (expert, routes, core_begin, threads, [])
+        for expert, routes, core_begin, threads, _ in roots
+    ]
+    for core_begin, (tail, _slice) in zip(starts, assignments, strict=True):
+        core_end = core_begin + tail_width
+        blockers = [
+            root_id
+            for root_id, (_, _, root_begin, root_threads, _) in enumerate(roots)
+            if root_begin < core_end and core_begin < root_begin + root_threads
+        ]
+        if not blockers:
+            raise ValueError(f"tail interval [{core_begin}, {core_end}) has no first-wave blockers")
+        tasks.append((tail[0], tail[1] // 2, core_begin, tail_width, blockers))
+
+    cpu_ids = [int(cpu) for cpu in base_plan.thread_cpu_ids.tolist()]
+    planner = IntervalPlanner(
+        ContentionCostModel(profile),
+        base_plan.num_threads,
+        cpu_ids=cpu_ids,
+        task_stage_window_policy=(
+            AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V1 if static_stage_windows else None
+        ),
+    )
+    return AsyncMoEPlanV2.from_dict(planner.to_async_bridge(tasks))
 
 
 def materialize_topk_ids(
@@ -528,6 +702,7 @@ def make_production_schedule(
     begin = time.perf_counter_ns()
     planner.plan_spec_for(counts)
     cold_plan_ns = time.perf_counter_ns() - begin
+    cold_auto_metadata = dict(planner.last)
     begin = time.perf_counter_ns()
     auto_spec = planner.plan_spec_for(counts)
     warm_plan_ns = time.perf_counter_ns() - begin
@@ -557,6 +732,9 @@ def make_production_schedule(
             "execution_mode": static_spec["execution_mode"],
             "tail_pool_threads": static_spec["tail_pool_threads"],
             "tail_pool_max_routes": static_spec["tail_pool_max_routes"],
+            "tail_repartition_width": static_spec["tail_repartition_width"],
+            "tail_repartition_tasks": static_spec["tail_repartition_tasks"],
+            "tail_repartition_route_slices": static_spec["tail_repartition_route_slices"],
             "overridden_tasks": sum(w13 >= 0 or w2 >= 0 for w13, w2 in window_pairs),
             "window_pairs": sorted({f"{w13}:{w2}" for w13, w2 in window_pairs if w13 >= 0 or w2 >= 0}),
         }
@@ -569,6 +747,14 @@ def make_production_schedule(
         )
         tail_pool_plan = AsyncMoEPlanV2.from_dict(tail_pool_spec["bridge"])
     matched_staged_plan = static_stage_window_plan or auto_plan
+    matched_staged_source = (
+        STATIC_STAGE_WINDOW_VARIANT if static_stage_window_plan is not None else AUTO_VARIANT
+    )
+    if matched_staged_plan.task_expert_ids.numel() != len(counts):
+        # The benchmark-only two-stage runtime still requires one task per
+        # expert. Keep that comparator valid when production selects M slices.
+        matched_staged_plan = strict_plan
+        matched_staged_source = "production_strict"
     matched_staged_plans = (matched_staged_plan, matched_staged_plan)
     stage_window_policy = (
         AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V1 if static_stage_windows else None
@@ -606,14 +792,16 @@ def make_production_schedule(
             "tail_pool_threads": auto_spec["tail_pool_threads"],
             "tail_pool_max_routes": auto_spec["tail_pool_max_routes"],
             "tail_pool_tasks": auto_spec["tail_pool_tasks"],
+            "tail_repartition_width": auto_spec["tail_repartition_width"],
+            "tail_repartition_tasks": auto_spec["tail_repartition_tasks"],
+            "tail_repartition_route_slices": auto_spec["tail_repartition_route_slices"],
+            "tail_repartition_candidates": cold_auto_metadata["tail_repartition_candidates"],
             "w13_split": bool(auto_spec["w13_split"]),
             "cold_plan_ms": cold_plan_ns / 1.0e6,
             "warm_plan_ms": warm_plan_ns / 1.0e6,
             "static_stage_windows": static_stage_window_metadata,
             "planned_staged": {
-                "matched_source": (
-                    STATIC_STAGE_WINDOW_VARIANT if static_stage_window_plan is not None else AUTO_VARIANT
-                ),
+                "matched_source": matched_staged_source,
                 "plan_ms": staged_plan_ns / 1.0e6,
                 "predicted_ms": staged_spec["makespan_ns"] / 1.0e6,
                 "w13_shape": list(staged_spec["w13"]["shape"]),
@@ -664,12 +852,21 @@ def main() -> int:
         if args.elastic_w2_core_begins is not None
         else None
     )
+    static_tail_widths = (
+        parse_integer_list(args.static_tail_widths)
+        if args.static_tail_widths is not None
+        else []
+    )
     if any(timeout < 0 for timeout in elastic_timeouts_us):
         raise ValueError("--elastic-timeout-us must be non-negative")
     if elastic_transitions is not None and args.production_profile is None:
         raise ValueError("--elastic-w2-transitions requires --production-profile")
     if (elastic_task_ids is not None or elastic_w2_core_begins is not None) and elastic_transitions is None:
         raise ValueError("--elastic-task-ids/--elastic-w2-core-begins require --elastic-w2-transitions")
+    if static_tail_widths and args.production_profile is None:
+        raise ValueError("--static-tail-widths requires --production-profile")
+    if args.static_tail_m_split and args.production_profile is None:
+        raise ValueError("--static-tail-m-split requires --production-profile")
     if args.static_16_to_4 and args.production_profile is None:
         raise ValueError("--static-16-to-4 requires --production-profile for isolated-time lane assignment")
     if args.dynamic_short_pool and args.production_profile is None:
@@ -700,6 +897,7 @@ def main() -> int:
     matched_staged_plans: tuple[AsyncMoEPlanV2, AsyncMoEPlanV2] | None = None
     fine_staged_plans: tuple[AsyncMoEPlanV2, AsyncMoEPlanV2] | None = None
     elastic_plans: dict[str, AsyncMoEPlanV2] = {}
+    static_tail_plans: dict[str, AsyncMoEPlanV2] = {}
     if args.production_profile is None:
         baseline_variant = "fixed_team_async"
         schedule = make_fixed_team_schedule(
@@ -754,11 +952,48 @@ def main() -> int:
                     resizable_task_ids=elastic_task_ids,
                     task_preferred_core_begins=elastic_w2_core_begins,
                 )
+        if static_tail_widths:
+            assert production_plan is not None
+            for tail_width in static_tail_widths:
+                variant = f"{STATIC_TAIL_VARIANT_PREFIX}_2x{tail_width}t"
+                static_tail_plans[variant] = make_static_tail_repartition_plan(
+                    production_plan,
+                    route_counts,
+                    profile=args.production_profile,
+                    tail_width=tail_width,
+                    static_stage_windows=args.static_stage_windows,
+                )
+        if args.static_tail_m_split:
+            assert production_plan is not None
+            for layout in ("grouped", "interleaved"):
+                variant = f"{STATIC_TAIL_VARIANT_PREFIX}_m2_{layout}_4x24t"
+                static_tail_plans[variant] = make_static_tail_m_split_plan(
+                    production_plan,
+                    route_counts,
+                    profile=args.production_profile,
+                    layout=layout,
+                    static_stage_windows=args.static_stage_windows,
+                )
     static_schedule: tuple[torch.Tensor, ...] | None = None
     static_metadata: dict[str, object] | None = None
+    ready_token_policy_variants: dict[str, tuple[bool, int, bool]] = {}
+    if args.ready_token_drain_batches:
+        if auto_plan is None:
+            raise ValueError("--ready-token-drain-batches requires --production-profile")
+        drain_batches = list(dict.fromkeys(parse_integer_list(args.ready_token_drain_batches)))
+        if any(batch < 1 or batch > 64 for batch in drain_batches):
+            raise ValueError("ready-token drain batch sizes must be in [1, 64]")
+        ready_token_policy_variants[f"{AUTO_VARIANT}_ready_legacy"] = (False, 1, False)
+        for batch in drain_batches:
+            ready_token_policy_variants[f"{AUTO_VARIANT}_ready_drain_b{batch}"] = (
+                True,
+                batch,
+                batch > 1,
+            )
     variant_names = [baseline_variant]
     if auto_plan is not None:
         variant_names.append(AUTO_VARIANT)
+        variant_names.extend(ready_token_policy_variants)
     if static_stage_window_plan is not None:
         variant_names.append(STATIC_STAGE_WINDOW_VARIANT)
     if args.static_16_to_4:
@@ -772,6 +1007,7 @@ def main() -> int:
         variant_names.append(STATIC_SPLIT_VARIANT)
     if args.dynamic_short_pool:
         variant_names.append(DYNAMIC_POOL_VARIANT)
+    variant_names.extend(static_tail_plans)
     variant_names.extend(elastic_plans)
     if matched_staged_plans is not None:
         variant_names.extend((MATCHED_STAGED_VARIANT, FINE_STAGED_VARIANT))
@@ -782,6 +1018,10 @@ def main() -> int:
         ready_token_merge = args.production_profile is not None
     if elastic_plans:
         ready_token_merge = False
+    if ready_token_policy_variants and not ready_token_merge:
+        raise ValueError(
+            "--ready-token-drain-batches requires production ready-token merge"
+        )
 
     generator = torch.Generator().manual_seed(args.seed)
     hidden = torch.empty((args.tokens, args.hidden), dtype=torch.bfloat16)
@@ -801,6 +1041,11 @@ def main() -> int:
     os.environ["FUSED_CPP_MOE_ASYNC_SHORT_POOL_THREADS"] = "0"
     os.environ["FUSED_CPP_MOE_ASYNC_SHORT_POOL_MAX_ROWS"] = str(args.static_long_route_threshold)
     os.environ["FUSED_CPP_MOE_STAGE_TIMING"] = "0"
+    default_ready_token_policy = (
+        os.environ.get("FUSED_CPP_MOE_ASYNC_READY_TOKEN_DRAIN", "1") != "0",
+        int(os.environ.get("FUSED_CPP_MOE_ASYNC_READY_TOKEN_BATCH", "2")),
+        os.environ.get("FUSED_CPP_MOE_ASYNC_READY_TOKEN_PREFETCH", "1") != "0",
+    )
     packed = prepare_fused_moe_bf16_tiled_weights(w13, w2, fuse_silu=True, backend="arm_sve_bf16")
     if packed.gemm_backend != 1:
         raise RuntimeError("benchmark requires the SVE BF16 fused MoE backend")
@@ -810,6 +1055,23 @@ def main() -> int:
     elastic_stats = {name: make_async_moe_elastic_stats() for name in elastic_plans}
 
     def run(name: str) -> torch.Tensor:
+        drain, batch, prefetch = ready_token_policy_variants.get(
+            name, default_ready_token_policy
+        )
+        os.environ["FUSED_CPP_MOE_ASYNC_READY_TOKEN_DRAIN"] = "1" if drain else "0"
+        os.environ["FUSED_CPP_MOE_ASYNC_READY_TOKEN_BATCH"] = str(batch)
+        os.environ["FUSED_CPP_MOE_ASYNC_READY_TOKEN_PREFETCH"] = "1" if prefetch else "0"
+        if name in static_tail_plans:
+            return fused_moe_bf16_tiled_async_plan(
+                hidden,
+                packed,
+                topk_weights,
+                topk_ids,
+                static_tail_plans[name],
+                global_num_experts=args.experts,
+                w13_split=w13_split,
+                out=outputs[name],
+            )
         if name in elastic_plans:
             return fused_moe_bf16_tiled_async_plan(
                 hidden,
@@ -848,7 +1110,7 @@ def main() -> int:
                 w13_split=w13_split,
                 out=outputs[name],
             )
-        if name == AUTO_VARIANT:
+        if name == AUTO_VARIANT or name in ready_token_policy_variants:
             assert auto_plan is not None
             return fused_moe_bf16_tiled_async_plan(
                 hidden,
@@ -962,6 +1224,13 @@ def main() -> int:
             "gain_vs_auto_pct": 100.0 * (auto_ms / median_ms - 1.0),
             "samples_ms": samples[name],
         }
+        if name in ready_token_policy_variants:
+            drain, batch, prefetch = ready_token_policy_variants[name]
+            record["ready_token_policy"] = {
+                "same_job_drain": drain,
+                "batch": batch,
+                "prefetch": prefetch,
+            }
         if name in elastic_stats_samples:
             stat_samples = elastic_stats_samples[name]
             totals = {
@@ -997,6 +1266,16 @@ def main() -> int:
             "baseline_variant": baseline_variant,
             "w13_split": w13_split,
             "async_ready_token_merge": ready_token_merge,
+            "ready_token_policy_sweep": {
+                name: {
+                    "same_job_drain": policy[0],
+                    "batch": policy[1],
+                    "prefetch": policy[2],
+                }
+                for name, policy in ready_token_policy_variants.items()
+            }
+            if ready_token_policy_variants
+            else None,
             "direct_route_store": True,
             "route_merge_unroll": 1,
             "planner": planner_metadata,
@@ -1018,6 +1297,19 @@ def main() -> int:
                 "ready_token_merge_forced_off": bool(elastic_plans),
             }
             if elastic_plans
+            else None,
+            "static_tail_repartition": {
+                name: {
+                    "task_expert_ids": plan.task_expert_ids.tolist(),
+                    "task_core_begins": plan.task_core_begins.tolist(),
+                    "task_threads": plan.task_threads.tolist(),
+                    "task_dep_offsets": plan.task_dep_offsets.tolist(),
+                    "task_deps": plan.task_deps.tolist(),
+                    "task_range_granularities": plan.task_range_granularities.tolist(),
+                }
+                for name, plan in static_tail_plans.items()
+            }
+            if static_tail_plans
             else None,
             "warmup": args.warmup,
             "runs": args.runs,

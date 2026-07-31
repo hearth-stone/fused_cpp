@@ -22,6 +22,7 @@ sys.path[:0] = [str(REPO_ROOT / "src"), str(COST_MODEL_DIR), str(PLANNER_DIR)]
 
 from bench_vllm_staged_schedule import (  # noqa: E402
     make_elastic_w2_plan,
+    make_static_tail_repartition_plan,
     materialize_topk_ids,
 )
 from fused_cpp.moe import (  # noqa: E402
@@ -80,6 +81,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--elastic-timeout-us", type=float, default=0.0)
     parser.add_argument(
+        "--static-tail-width",
+        type=int,
+        help="capture a 6x16T-to-2xWT static tail plan instead of the strict baseline",
+    )
+    parser.add_argument(
         "--plan-only",
         action="store_true",
         help="write the predicted timeline without allocating weights or running the native kernel",
@@ -116,6 +122,58 @@ def task_dependencies(bridge: dict[str, Any], task: int) -> list[int]:
     offsets = bridge["task_dep_offsets"]
     dependencies = bridge["task_deps"]
     return [int(value) for value in dependencies[offsets[task] : offsets[task + 1]]]
+
+
+def materialized_plan_tasks(plan: AsyncMoEPlanV2, histogram: list[int] | tuple[int, ...]) -> list[dict[str, Any]]:
+    offsets = plan.task_dep_offsets.tolist()
+    dependencies = plan.task_deps.tolist()
+    experts = plan.task_expert_ids.tolist()
+    core_begins = plan.task_core_begins.tolist()
+    threads = plan.task_threads.tolist()
+    placement_modes = plan.task_placement_modes.tolist()
+    range_granularities = plan.task_range_granularities.tolist()
+    w13_windows = plan.task_w13_window_bytes.tolist()
+    w2_windows = plan.task_w2_window_bytes.tolist()
+    covered_rows = [0] * len(histogram)
+    tasks: list[dict[str, Any]] = []
+    for task, expert in enumerate(experts):
+        total_routes = int(histogram[expert])
+        granularity = int(range_granularities[task])
+        if granularity == 0:
+            if covered_rows[expert] != 0:
+                raise ValueError(f"expert {expert} mixes full-range and sliced timeline tasks")
+            route_begin = 0
+            routes = total_routes
+        else:
+            route_begin = covered_rows[expert]
+            routes = min(granularity, total_routes - route_begin)
+            if routes <= 0:
+                raise ValueError(f"expert {expert} has a route slice beyond its histogram")
+        covered_rows[expert] += routes
+        tasks.append(
+            {
+                "task": task,
+                "expert": int(expert),
+                "route_begin": route_begin,
+                "route_end": route_begin + routes,
+                "routes": routes,
+                "range_granularity": granularity,
+                "core_begin": int(core_begins[task]),
+                "threads": int(threads[task]),
+                "placement_mode": int(placement_modes[task]),
+                "dependencies": [
+                    int(value) for value in dependencies[offsets[task] : offsets[task + 1]]
+                ],
+                "w13_window_bytes": int(w13_windows[task]),
+                "w2_window_bytes": int(w2_windows[task]),
+            }
+        )
+    for expert, total_routes in enumerate(histogram):
+        if int(total_routes) > 0 and covered_rows[expert] != int(total_routes):
+            raise ValueError(
+                f"timeline tasks cover {covered_rows[expert]} of {int(total_routes)} routes for expert {expert}"
+            )
+    return tasks
 
 
 def phase_descriptions(model: ContentionCostModel, routes: int, threads: int) -> list[dict[str, Any]]:
@@ -311,41 +369,73 @@ def build_plan(args: argparse.Namespace) -> tuple[dict[str, Any], ContentionCost
     model = ContentionCostModel(args.profile)
     planner = PlannedMoE(model, args.threads, cpu_ids=cpu_ids)
     spec = planner.plan_spec_for(workload.experts)
-    if spec["execution_mode"] != "strict":
-        raise ValueError("timeline capture currently requires a strict fixed-team plan")
     bridge = spec["bridge"]
+    plan = AsyncMoEPlanV2.from_dict(bridge)
     bound_model = planner.interval_planners[0].model
-    tasks: list[dict[str, Any]] = []
-    model_tasks: list[tuple[int, int, list[int]]] = []
-    for task, expert in enumerate(bridge["task_expert_ids"]):
-        routes = int(workload.histogram[expert])
-        threads = int(bridge["task_threads"][task])
-        dependencies = task_dependencies(bridge, task)
-        tasks.append(
-            {
-                "task": task,
-                "expert": int(expert),
-                "routes": routes,
-                "core_begin": int(bridge["task_core_begins"][task]),
-                "threads": threads,
-                "dependencies": dependencies,
-                "w13_window_bytes": int(bridge["task_w13_window_bytes"][task]),
-                "w2_window_bytes": int(bridge["task_w2_window_bytes"][task]),
-            }
-        )
-        model_tasks.append((routes, threads, dependencies))
-    predicted_ms, task_segments = predict_timeline(bound_model, model_tasks)
+    tasks = materialized_plan_tasks(plan, workload.histogram)
     predicted_cores: dict[str, list[dict[str, Any]]] = {str(core): [] for core in range(args.threads)}
-    for task, segments in zip(tasks, task_segments):
-        for core in range(task["core_begin"], task["core_begin"] + task["threads"]):
-            predicted_cores[str(core)].extend(
-                {
-                    **segment,
-                    "expert": task["expert"],
-                    "routes": task["routes"],
-                }
-                for segment in segments
+    if spec["execution_mode"] == "strict":
+        model_tasks = [
+            (int(task["routes"]), int(task["threads"]), list(task["dependencies"]))
+            for task in tasks
+        ]
+        predicted_ms, task_segments = predict_timeline(bound_model, model_tasks)
+        planner_makespan_ms = predicted_ms
+        uniform_routes = {
+            int(routes)
+            for routes in workload.histogram
+            if int(routes) > 0
+        }
+        tail_width = spec["tail_repartition_width"]
+        route_slices = int(spec["tail_repartition_route_slices"])
+        if (
+            tail_width is not None
+            and len(uniform_routes) == 1
+            and bound_model.can_use_bounded_tail_repartition_anchor(
+                next(iter(uniform_routes)),
+                spec["shape"],
+                int(tail_width),
+                route_slices,
             )
+        ):
+            planner_makespan_ns, _ = bound_model.profiled_bounded_tail_repartition(
+                next(iter(uniform_routes)),
+                spec["shape"],
+                int(tail_width),
+                route_slices,
+            )
+            planner_makespan_ms = float(planner_makespan_ns) / 1.0e6
+        for task, segments in zip(tasks, task_segments, strict=True):
+            for core in range(task["core_begin"], task["core_begin"] + task["threads"]):
+                predicted_cores[str(core)].extend(
+                    {
+                        **segment,
+                        "expert": task["expert"],
+                        "route_begin": task["route_begin"],
+                        "route_end": task["route_end"],
+                        "routes": task["routes"],
+                    }
+                    for segment in segments
+                )
+        predicted_scope = "phase-model decomposition; planner score may use an exact full-call anchor"
+        predicted_per_core = True
+    else:
+        interval_planner = planner.interval_planners[0]
+        lanes = interval_planner._lanes(tuple(spec["shape"]))
+        raw_tasks = interval_planner._build_tasks(
+            workload.experts,
+            lanes,
+            interval_planner._assign(workload.experts, lanes),
+        )
+        simulation_tasks, _, _ = interval_planner._tail_pool_simulation(
+            raw_tasks,
+            pool_threads=int(spec["tail_pool_threads"]),
+            max_pooled_routes=int(spec["tail_pool_max_routes"]),
+        )
+        predicted_ms = float(bound_model.dag_makespan(simulation_tasks)) / 1.0e6
+        planner_makespan_ms = predicted_ms
+        predicted_scope = "aggregate tail-pool simulation; dynamic per-core assignment is runtime-only"
+        predicted_per_core = False
 
     payload: dict[str, Any] = {
         "schema_version": 1,
@@ -369,11 +459,20 @@ def build_plan(args: argparse.Namespace) -> tuple[dict[str, Any], ContentionCost
             "task_stage_window_policy": spec["task_stage_window_policy"],
             "w13_split": bool(spec["w13_split"]),
             "weight_window_bytes": int(spec["weight_window_bytes"]),
+            "tail_repartition_width": spec["tail_repartition_width"],
+            "tail_repartition_tasks": int(spec["tail_repartition_tasks"]),
+            "tail_repartition_route_slices": int(spec["tail_repartition_route_slices"]),
+            "tail_pool_threads": spec["tail_pool_threads"],
+            "tail_pool_max_routes": spec["tail_pool_max_routes"],
+            "tail_pool_tasks": int(spec["tail_pool_tasks"]),
+            "early_merge": bridge.get("early_merge"),
             "tasks": tasks,
         },
         "predicted": {
-            "scope": "strict fixed-team cost-model baseline",
+            "scope": predicted_scope,
+            "per_core_available": predicted_per_core,
             "makespan_ms": predicted_ms,
+            "planner_makespan_ms": planner_makespan_ms,
             "host_segments": (
                 [
                     {
@@ -398,7 +497,6 @@ def capture_actual(
     payload: dict[str, Any],
     workload: Any,
 ) -> dict[str, Any]:
-    bridge = payload["plan"]["tasks"]
     plan_payload = PlannedMoE(
         ContentionCostModel(args.profile),
         args.threads,
@@ -409,6 +507,8 @@ def capture_actual(
         args.elastic_w2_transitions,
         description="elastic W2 transition",
     )
+    if transitions and args.static_tail_width is not None:
+        raise ValueError("--elastic-w2-transitions and --static-tail-width are mutually exclusive")
     if transitions:
         task_ids = parse_task_ids(args.elastic_task_ids)
         target_core_begins = parse_int_mapping(
@@ -442,6 +542,18 @@ def capture_actual(
             task["preferred_threads"] = int(preferred_threads[task_id])
             task["preferred_core_begin"] = int(preferred_core_begins[task_id])
             task["resize_point"] = int(resize_points[task_id])
+    elif args.static_tail_width is not None:
+        plan = make_static_tail_repartition_plan(
+            plan,
+            torch.tensor(workload.histogram, dtype=torch.int64),
+            profile=args.profile,
+            tail_width=args.static_tail_width,
+            static_stage_windows=payload["plan"]["task_stage_window_policy"] is not None,
+        )
+        payload["plan"]["tasks"] = materialized_plan_tasks(plan, workload.histogram)
+        payload["plan"]["static_tail_width"] = args.static_tail_width
+        payload["plan"]["shape"] = [16, 16, 16, 16, 16, 16, args.static_tail_width, args.static_tail_width]
+    bridge = payload["plan"]["tasks"]
     policy = ContentionCostModel(args.profile).policy
     assert policy is not None
 

@@ -177,6 +177,27 @@ std::vector<IntervalStageWindowEntry> parse_stage_window_entries(const py::handl
   return result;
 }
 
+std::vector<IntervalTailRepartitionEntry> parse_tail_repartition_entries(const py::handle& values) {
+  std::vector<IntervalTailRepartitionEntry> result;
+  for (const py::handle row_handle : py::reinterpret_borrow<py::iterable>(values)) {
+    const py::sequence row = py::reinterpret_borrow<py::sequence>(row_handle);
+    if (py::len(row) != 8) {
+      throw std::invalid_argument("native planner bounded-tail anchor rows must have eight fields");
+    }
+    result.push_back({
+        py::cast<std::vector<int>>(row[0]),
+        py::cast<int>(row[1]),
+        py::cast<int>(row[2]),
+        py::cast<int>(row[3]),
+        py::cast<double>(row[4]),
+        py::cast<double>(row[5]),
+        py::cast<double>(row[6]),
+        py::cast<int>(row[7]),
+    });
+  }
+  return result;
+}
+
 IntervalIsoFormulaConfig parse_iso_formula(const py::handle& value) {
   IntervalIsoFormulaConfig result;
   if (value.is_none()) {
@@ -228,6 +249,9 @@ IntervalCostModelConfig parse_interval_cost_model(const py::dict& payload) {
   result.p90_curves = parse_shape_curve_entries(payload["p90_curves"]);
   result.full_call_p10_curves = parse_shape_curve_entries(payload["full_call_p10_curves"]);
   result.full_call_p90_curves = parse_shape_curve_entries(payload["full_call_p90_curves"]);
+  if (payload.contains("tail_repartition_anchors")) {
+    result.tail_repartition_anchors = parse_tail_repartition_entries(payload["tail_repartition_anchors"]);
+  }
   return result;
 }
 
@@ -252,6 +276,10 @@ py::dict interval_candidate_to_python(const IntervalCandidate& candidate) {
   result["tail_pool_max_routes"] =
       candidate.tail_pool_max_routes.has_value() ? py::cast(*candidate.tail_pool_max_routes) : py::none();
   result["tail_pool_tasks"] = candidate.tail_pool_tasks;
+  result["tail_repartition_width"] =
+      candidate.tail_repartition_width.has_value() ? py::cast(*candidate.tail_repartition_width) : py::none();
+  result["tail_repartition_tasks"] = candidate.tail_repartition_tasks;
+  result["tail_repartition_route_slices"] = candidate.tail_repartition_route_slices;
   result["makespan_ns"] = candidate.makespan_ns;
   result["uncertainty_ns"] = candidate.uncertainty_ns;
   result["pessimistic_ns"] = candidate.pessimistic_ns;
@@ -264,11 +292,15 @@ py::dict interval_candidate_to_python(const IntervalCandidate& candidate) {
 
 py::dict native_interval_plan(const NativeIntervalPlanner& planner, const std::vector<int>& expert_ids,
                               const std::vector<int>& routes, bool dynamic_tail_pool, int tail_pool_max_routes,
-                              std::optional<int> forced_tail_pool_threads) {
+                              std::optional<int> forced_tail_pool_threads,
+                              std::optional<bool> bounded_tail_repartition) {
+  const bool enable_bounded_tail_repartition =
+      bounded_tail_repartition.value_or(dynamic_tail_pool && !forced_tail_pool_threads.has_value());
   IntervalPlanResult native_result;
   {
     py::gil_scoped_release release;
-    native_result = planner.Plan(expert_ids, routes, dynamic_tail_pool, tail_pool_max_routes, forced_tail_pool_threads);
+    native_result = planner.Plan(expert_ids, routes, dynamic_tail_pool, tail_pool_max_routes, forced_tail_pool_threads,
+                                 enable_bounded_tail_repartition);
   }
   py::dict result;
   result["selected"] = interval_candidate_to_python(native_result.selected);
@@ -280,6 +312,7 @@ py::dict native_interval_plan(const NativeIntervalPlanner& planner, const std::v
   result["configured_workers"] = native_result.configured_workers;
   result["strict_candidates"] = native_result.strict_candidates;
   result["dynamic_candidates"] = native_result.dynamic_candidates;
+  result["tail_repartition_candidates"] = native_result.tail_repartition_candidates;
   return result;
 }
 
@@ -429,15 +462,16 @@ static py::dict moe_exact_optimum(std::vector<int64_t> routes_hist, int64_t num_
 void register_moe_planner(py::module_& m) {
   py::class_<moe_planner::NativeIntervalPlanner>(m, "NativeIntervalPlanner")
       .def(py::init([](int num_cores, std::vector<int> widths, std::vector<std::vector<int>> shapes,
-                       const py::dict& model_payload, int planner_threads) {
+                       const py::dict& model_payload, int planner_threads, std::vector<int> tail_repartition_widths) {
              return std::make_unique<moe_planner::NativeIntervalPlanner>(
                  num_cores, std::move(widths), std::move(shapes), parse_interval_cost_model(model_payload),
-                 planner_threads);
+                 planner_threads, std::move(tail_repartition_widths));
            }),
            py::arg("num_cores"), py::arg("widths"), py::arg("shapes"), py::arg("model_payload"),
-           py::arg("planner_threads") = 0)
+           py::arg("planner_threads") = 0, py::arg("tail_repartition_widths") = std::vector<int>{})
       .def("plan", &native_interval_plan, py::arg("expert_ids"), py::arg("routes"), py::arg("dynamic_tail_pool") = true,
-           py::arg("tail_pool_max_routes") = 12, py::arg("forced_tail_pool_threads") = std::nullopt)
+           py::arg("tail_pool_max_routes") = 12, py::arg("forced_tail_pool_threads") = std::nullopt,
+           py::arg("bounded_tail_repartition") = std::nullopt)
       .def("_estimate_isolated", &moe_planner::NativeIntervalPlanner::EstimateIsolated)
       .def("_score_dag", &moe_planner::NativeIntervalPlanner::ScoreDag)
       .def_property_readonly("configured_workers", &moe_planner::NativeIntervalPlanner::configured_workers);

@@ -145,6 +145,30 @@ class _DeterministicStageModel(_DeterministicTailPoolModel):
         return threads * (2 if stage == "w13" else 1)
 
 
+class _FinishAwareModel(_DeterministicTailPoolModel):
+    def dag_task_finish_times(self, tasks) -> tuple[float, ...]:
+        finish: list[float] = []
+        for routes, threads, dependencies in tasks:
+            start = max((finish[dependency] for dependency in dependencies), default=0.0)
+            finish.append(start + self.T_iso(routes, threads))
+        return tuple(finish)
+
+
+class _DeterministicTailRepartitionModel(_DeterministicTailPoolModel):
+    schema_version = 2
+    supported_shapes = ((2, 2, 2, 2, 2, 2),)
+    supported_widths = (2, 3, 4, 6)
+    profile_runs = 1
+
+    def T_iso(self, routes: int, threads: int) -> float:
+        if threads == 3 and routes % 100:
+            raise KeyError("3T is only calibrated for the synthetic 100-route point")
+        return {2: 100.0, 3: 65.0, 4: 72.0, 6: 85.0}[threads]
+
+    def supports_shape(self, shape) -> bool:
+        return tuple(shape) == self.supported_shapes[0]
+
+
 def test_planned_two_stage_planner_can_choose_different_stage_shapes() -> None:
     planner = PlannedTwoStagePlanner(
         _DeterministicStageModel(),
@@ -164,6 +188,28 @@ def test_planned_two_stage_planner_can_choose_different_stage_shapes() -> None:
         + selected["w13"]["makespan_ns"]
         + selected["w2"]["makespan_ns"]
     )
+
+
+def test_strict_bridge_disables_early_merge_for_equal_predicted_finishes() -> None:
+    planner = IntervalPlanner(
+        _FinishAwareModel(),
+        num_cores=4,
+        widths=(2,),
+        shapes=((2, 2),),
+        native_cold_planner=False,
+        tail_repartition_widths=(),
+    )
+    balanced = [
+        (0, 100, 0, 2, []),
+        (1, 100, 2, 2, []),
+    ]
+    staggered = [
+        (0, 100, 0, 2, []),
+        (1, 100, 2, 2, [0]),
+    ]
+
+    assert planner.to_async_bridge(balanced)["early_merge"] is False
+    assert planner.to_async_bridge(staggered)["early_merge"] is None
 
 
 def test_planner_selects_tail_pool_width_and_can_disable_dynamic() -> None:
@@ -232,6 +278,148 @@ def test_planned_moe_tail_pool_cache_tracks_threshold_eligibility() -> None:
     assert first_plan["execution_mode"] == "tail_pool"
     assert second_plan["execution_mode"] == "strict"
     assert runtime.last["cache_hit"] is False
+
+
+def test_planner_selects_one_bounded_terminal_repartition() -> None:
+    planner = IntervalPlanner(
+        _DeterministicTailRepartitionModel(),
+        num_cores=12,
+        widths=(2, 3, 4, 6),
+        shapes=((2, 2, 2, 2, 2, 2),),
+        tail_repartition_widths=(3, 4, 6),
+    )
+    experts = [(expert, 100) for expert in range(8)]
+
+    selected = planner.plan(
+        experts,
+        dynamic_tail_pool=False,
+        bounded_tail_repartition=True,
+    )
+    strict = planner.plan(
+        experts,
+        dynamic_tail_pool=False,
+        bounded_tail_repartition=False,
+    )
+
+    assert selected["execution_mode"] == "strict"
+    assert selected["tail_repartition_width"] == 3
+    assert selected["tail_repartition_tasks"] == 2
+    assert selected["tail_repartition_route_slices"] == 1
+    assert selected["tail_repartition_candidates"] == 3
+    assert selected["makespan_ns"] == pytest.approx(165.0)
+    assert selected["makespan_ns"] < strict["makespan_ns"]
+    assert selected["tasks"] == [
+        (0, 100, 0, 2, []),
+        (1, 100, 2, 2, []),
+        (2, 100, 4, 2, []),
+        (3, 100, 6, 2, []),
+        (4, 100, 8, 2, []),
+        (5, 100, 10, 2, []),
+        (6, 100, 0, 3, [0, 1]),
+        (7, 100, 6, 3, [3, 4]),
+    ]
+    assert selected["bridge"]["task_threads"][-2:] == [3, 3]
+    assert strict["tail_repartition_width"] is None
+    assert strict["tail_repartition_candidates"] == 0
+
+
+def test_bounded_tail_repartition_requires_exactly_one_terminal_wave() -> None:
+    planner = IntervalPlanner(
+        _DeterministicTailRepartitionModel(),
+        num_cores=12,
+        widths=(2, 3, 4, 6),
+        shapes=((2, 2, 2, 2, 2, 2),),
+        tail_repartition_widths=(3, 4, 6),
+    )
+
+    selected = planner.plan(
+        [(expert, 100) for expert in range(9)],
+        dynamic_tail_pool=False,
+        bounded_tail_repartition=True,
+    )
+
+    assert selected["tail_repartition_width"] is None
+    assert selected["tail_repartition_candidates"] == 0
+
+
+def test_bounded_tail_repartition_uses_exact_layout_anchor() -> None:
+    profile = (
+        PROFILE_DIR
+        / "contention_async_amazon_c5_192c_numa0_tp4_sve_F512_E256_splitw13_schema_v2_xbyak_exactm_20260727.json"
+    )
+    model = ContentionCostModel(profile)
+    root_shape = (16, 16, 16, 16, 16, 16)
+
+    assert model.can_use_bounded_tail_repartition_anchor(1536, root_shape, 24)
+    assert model.can_use_bounded_tail_repartition_anchor(1536, root_shape, 24, 2)
+    assert not model.can_use_bounded_tail_repartition_anchor(1548, root_shape, 24)
+    assert not model.can_use_bounded_tail_repartition_anchor(1536, root_shape, 16)
+    unsliced_median, unsliced_uncertainty = model.profiled_bounded_tail_repartition(
+        1536,
+        root_shape,
+        24,
+    )
+    sliced_median, sliced_uncertainty = model.profiled_bounded_tail_repartition(
+        1536,
+        root_shape,
+        24,
+        2,
+    )
+    assert unsliced_median == pytest.approx(9_796_654.0)
+    assert sliced_median == pytest.approx(8_710_369.0)
+    assert min(unsliced_uncertainty, sliced_uncertainty) > 0.0
+
+    planner = IntervalPlanner(model, num_cores=96, native_cold_planner=False)
+    selected = planner.plan(
+        [(expert, 1536) for expert in range(8)],
+        dynamic_tail_pool=False,
+        bounded_tail_repartition=True,
+    )
+    assert selected["tail_repartition_width"] == 24
+    assert selected["tail_repartition_route_slices"] == 2
+    assert selected["tail_repartition_candidates"] == 4
+    assert selected["makespan_ns"] == pytest.approx(sliced_median)
+    assert selected["tasks"][-4:] == [
+        (6, 768, 0, 24, [0, 1]),
+        (6, 768, 24, 24, [1, 2]),
+        (7, 768, 48, 24, [3, 4]),
+        (7, 768, 72, 24, [4, 5]),
+    ]
+    assert selected["bridge"]["task_range_granularities"][-4:] == [768, 768, 768, 768]
+
+
+def test_planned_moe_cache_rebuilds_bounded_tail_tasks() -> None:
+    runtime = PlannedMoE(
+        _DeterministicTailRepartitionModel(),
+        num_cores=12,
+        tail_repartition_widths=(3, 4, 6),
+    )
+    experts = [(expert, 100) for expert in range(8)]
+
+    first = runtime.plan_spec_for(
+        experts,
+        dynamic_tail_pool=False,
+        bounded_tail_repartition=True,
+    )
+    second = runtime.plan_spec_for(
+        experts,
+        dynamic_tail_pool=False,
+        bounded_tail_repartition=True,
+    )
+
+    assert runtime.last["cache_hit"] is True
+    assert first["tail_repartition_width"] == 3
+    assert first["tail_repartition_route_slices"] == 1
+    assert second["tail_repartition_width"] == 3
+    assert second["bridge"] == first["bridge"]
+
+    changed = runtime.plan_spec_for(
+        [(expert, 101) for expert in range(8)],
+        dynamic_tail_pool=False,
+        bounded_tail_repartition=True,
+    )
+    assert runtime.last["cache_hit"] is False
+    assert changed["tail_repartition_width"] == 4
 
 
 def test_iso_formula_recovers_separable_measurements() -> None:
@@ -530,6 +718,16 @@ def test_static_stage_window_policy_is_lowered_per_task(
 
     assert bridge["task_w13_window_bytes"] == [-1, 1024 * 1024, 1024 * 1024, 4 * 1024 * 1024]
     assert bridge["task_w2_window_bytes"] == [-1, 512 * 1024, 512 * 1024, 1024 * 1024]
+    assert bridge["task_range_granularities"] == [0, 0, 0, 0]
+
+    sliced_bridge = planner.to_async_bridge(
+        [
+            (0, 96, 0, 8, []),
+            (0, 96, 8, 8, []),
+            (1, 192, 16, 8, []),
+        ]
+    )
+    assert sliced_bridge["task_range_granularities"] == [96, 96, 0]
 
     pooled_bridge = planner.to_tail_pool_bridge(
         tasks,
@@ -900,6 +1098,9 @@ def test_exact_shape_and_stage_working_sets(catalog: ProfileCatalog) -> None:
     ]
     tasks = [(192, 16, []), (192, 16, [])]
     assert no_split.dag_makespan(tasks) != pytest.approx(no_split.flat_dag_makespan(tasks))
+    finish_times = no_split.dag_task_finish_times(tasks)
+    assert finish_times[0] == pytest.approx(finish_times[1])
+    assert max(finish_times) == pytest.approx(no_split.dag_makespan(tasks))
 
 
 def test_joint_planner_and_physical_cpu_mapping(catalog: ProfileCatalog) -> None:

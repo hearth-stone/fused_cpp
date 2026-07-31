@@ -276,10 +276,13 @@ def test_shared_resource_capacity_derates_parallel_experts() -> None:
 
     parallel = model.phase_makespan([(12, 1), (12, 1)])
     sequential = model.dag_makespan([(12, 1, []), (12, 1, [0])])
+    finish_times = model.dag_task_finish_times([(12, 1, []), (12, 1, [0])])
 
     assert parallel > isolated + calibration.overheads.call_setup_ns
     assert parallel < sequential
     assert sequential == pytest.approx(2 * isolated + calibration.overheads.call_setup_ns)
+    assert finish_times[0] < finish_times[1]
+    assert max(finish_times) == pytest.approx(sequential)
 
 
 def test_isolated_llc_spill_matches_single_task_dag() -> None:

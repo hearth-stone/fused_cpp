@@ -47,6 +47,17 @@ struct IntervalStageWindowEntry {
   int64_t w2_chunk_bytes = 0;
 };
 
+struct IntervalTailRepartitionEntry {
+  std::vector<int> root_shape;
+  int tail_width = 0;
+  int route_slices = 1;
+  int routes = 0;
+  double median_ns = 0.0;
+  double p10_ns = 0.0;
+  double p90_ns = 0.0;
+  int num_iters = 1;
+};
+
 struct IntervalCostModelConfig {
   int schema_version = 0;
   bool exact_m = false;
@@ -79,6 +90,7 @@ struct IntervalCostModelConfig {
   std::vector<IntervalShapeCurveEntry> p90_curves;
   std::vector<IntervalShapeCurveEntry> full_call_p10_curves;
   std::vector<IntervalShapeCurveEntry> full_call_p90_curves;
+  std::vector<IntervalTailRepartitionEntry> tail_repartition_anchors;
 };
 
 struct IntervalTask {
@@ -100,6 +112,9 @@ struct IntervalCandidate {
   std::optional<int> tail_pool_threads;
   std::optional<int> tail_pool_max_routes;
   int tail_pool_tasks = 0;
+  std::optional<int> tail_repartition_width;
+  int tail_repartition_tasks = 0;
+  int tail_repartition_route_slices = 1;
   double makespan_ns = 0.0;
   double uncertainty_ns = 0.0;
   double pessimistic_ns = 0.0;
@@ -115,6 +130,7 @@ struct IntervalPlanResult {
   int configured_workers = 1;
   int strict_candidates = 0;
   int dynamic_candidates = 0;
+  int tail_repartition_candidates = 0;
 };
 
 // Native implementation of the Python IntervalPlanner cold search. The object
@@ -126,13 +142,15 @@ class NativeIntervalPlanner {
   struct Impl;
 
   NativeIntervalPlanner(int num_cores, std::vector<int> widths, std::vector<std::vector<int>> shapes,
-                        IntervalCostModelConfig model, int planner_threads);
+                        IntervalCostModelConfig model, int planner_threads,
+                        std::vector<int> tail_repartition_widths = {});
 
   NativeIntervalPlanner(const NativeIntervalPlanner&) = delete;
   NativeIntervalPlanner& operator=(const NativeIntervalPlanner&) = delete;
 
   IntervalPlanResult Plan(const std::vector<int>& expert_ids, const std::vector<int>& routes, bool dynamic_tail_pool,
-                          int tail_pool_max_routes, std::optional<int> forced_tail_pool_threads) const;
+                          int tail_pool_max_routes, std::optional<int> forced_tail_pool_threads,
+                          bool bounded_tail_repartition) const;
 
   double EstimateIsolated(int routes, int threads) const;
   double ScoreDag(const std::vector<int>& routes, const std::vector<int>& threads,
@@ -143,6 +161,7 @@ class NativeIntervalPlanner {
  private:
   int num_cores_ = 0;
   std::vector<int> widths_;
+  std::vector<int> tail_repartition_widths_;
   std::vector<std::vector<int>> shapes_;
   int configured_workers_ = 1;
   std::unique_ptr<Impl> impl_;

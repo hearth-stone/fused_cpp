@@ -77,7 +77,76 @@ def test_upgrade_legacy_plan_produces_strict_singleton_widths() -> None:
     assert plan.task_w13_window_bytes.tolist() == [-1, -1]
     assert plan.task_w2_window_bytes.tolist() == [-1, -1]
     assert plan.task_preferred_core_begins.tolist() == [-1, -1]
+    assert plan.early_merge is None
+    assert plan.native_early_merge == -1
     assert plan.legacy_schedule()[0].tolist() == [3, 7]
+
+
+@pytest.mark.parametrize(("early_merge", "native"), [(False, 0), (True, 1)])
+def test_plan_v2_materializes_early_merge_control(early_merge: bool, native: int) -> None:
+    bridge = upgrade_legacy_async_plan(_legacy_bridge())
+    bridge["early_merge"] = early_merge
+
+    plan = AsyncMoEPlanV2.from_dict(bridge)
+
+    assert plan.early_merge is early_merge
+    assert plan.native_early_merge == native
+
+
+def test_plan_v2_rejects_invalid_early_merge_control() -> None:
+    bridge = upgrade_legacy_async_plan(_legacy_bridge())
+    bridge["early_merge"] = 1
+
+    with pytest.raises(TypeError, match="bool or None"):
+        AsyncMoEPlanV2.from_dict(bridge)
+
+
+def test_elastic_plan_rejects_forced_early_merge() -> None:
+    bridge = upgrade_legacy_async_plan(_legacy_bridge())
+    bridge["execution_mode"] = ASYNC_MOE_EXECUTION_ELASTIC
+    bridge["early_merge"] = True
+
+    with pytest.raises(ValueError, match="does not support"):
+        AsyncMoEPlanV2.from_dict(bridge)
+
+
+def test_strict_plan_accepts_equal_contiguous_route_slices() -> None:
+    bridge = upgrade_legacy_async_plan(
+        {
+            "num_threads": 4,
+            "thread_cpu_ids": [8, 9, 10, 11],
+            "task_expert_ids": [3, 3, 7],
+            "task_core_begins": [0, 2, 0],
+            "task_threads": [2, 2, 4],
+            "task_dep_offsets": [0, 0, 0, 2],
+            "task_deps": [0, 1],
+        }
+    )
+    bridge["task_range_granularities"] = [64, 64, 0]
+
+    plan = AsyncMoEPlanV2.from_dict(bridge)
+
+    assert plan.task_expert_ids.tolist() == [3, 3, 7]
+    assert plan.task_range_granularities.tolist() == [64, 64, 0]
+
+
+@pytest.mark.parametrize("granularities", ([0, 0, 0], [64, 32, 0]))
+def test_strict_plan_rejects_invalid_duplicate_expert_ranges(granularities) -> None:
+    bridge = upgrade_legacy_async_plan(
+        {
+            "num_threads": 4,
+            "thread_cpu_ids": [8, 9, 10, 11],
+            "task_expert_ids": [3, 3, 7],
+            "task_core_begins": [0, 2, 0],
+            "task_threads": [2, 2, 4],
+            "task_dep_offsets": [0, 0, 0, 2],
+            "task_deps": [0, 1],
+        }
+    )
+    bridge["task_range_granularities"] = granularities
+
+    with pytest.raises(ValueError, match="route-sliced expert"):
+        AsyncMoEPlanV2.from_dict(bridge)
 
 
 def test_strict_plan_accepts_a_wider_future_width_envelope() -> None:
@@ -340,6 +409,7 @@ def test_async_plan_wrapper_calls_native_plan_v2(monkeypatch) -> None:
     assert args[37] == 1
     assert args[40].tolist() == [-1, -1]
     assert args[41].tolist() == [-1, -1]
+    assert args[42] == -1
 
 
 def test_async_plan_wrapper_calls_elastic_native_and_collects_stats(monkeypatch) -> None:
@@ -392,6 +462,7 @@ def test_async_plan_wrapper_calls_elastic_native_and_collects_stats(monkeypatch)
     assert args[42].tolist() == [0, 1000]
     assert args[43] is stats
     assert args[44].tolist() == [-1, -1]
+    assert args[45] == -1
     assert bf16_tiled.decode_async_moe_elastic_stats(stats)["eligible_tasks"] == 0
 
 
@@ -441,6 +512,22 @@ def test_async_plan_wrapper_requires_native_per_task_windows(monkeypatch) -> Non
     monkeypatch.setattr(bf16_tiled, "_fused_moe_bf16_tiled_async_plan_v2_impl", None)
 
     with pytest.raises(RuntimeError, match="per-task W13/W2 windows require native"):
+        bf16_tiled.fused_moe_bf16_tiled_async_plan(
+            torch.empty((1, 1), dtype=torch.bfloat16),
+            object(),
+            torch.ones((1, 1)),
+            torch.zeros((1, 1), dtype=torch.int32),
+            plan,
+        )
+
+
+def test_async_plan_wrapper_requires_native_early_merge_control(monkeypatch) -> None:
+    bridge = upgrade_legacy_async_plan(_legacy_bridge())
+    bridge["early_merge"] = False
+    plan = AsyncMoEPlanV2.from_dict(bridge)
+    monkeypatch.setattr(bf16_tiled, "_fused_moe_bf16_tiled_async_plan_v2_impl", None)
+
+    with pytest.raises(RuntimeError, match="early_merge control requires native"):
         bf16_tiled.fused_moe_bf16_tiled_async_plan(
             torch.empty((1, 1), dtype=torch.bfloat16),
             object(),

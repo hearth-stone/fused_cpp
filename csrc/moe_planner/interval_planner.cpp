@@ -212,6 +212,13 @@ struct NativeIntervalPlanner::Impl {
     std::vector<int64_t> window_bytes_per_worker;
   };
 
+  struct TailRepartitionAnchor {
+    double median_ns = 0.0;
+    double p10_ns = 0.0;
+    double p90_ns = 0.0;
+    int num_iters = 1;
+  };
+
   explicit Impl(IntervalCostModelConfig model_config) : config(std::move(model_config)) {
     if (config.schema_version < 2) {
       throw std::invalid_argument("native interval planner requires a schema-v2 cost model");
@@ -279,6 +286,23 @@ struct NativeIntervalPlanner::Impl {
     p90_curves = BuildShapeCurves(config.p90_curves);
     full_call_p10_curves = BuildShapeCurves(config.full_call_p10_curves);
     full_call_p90_curves = BuildShapeCurves(config.full_call_p90_curves);
+    for (const IntervalTailRepartitionEntry& entry : config.tail_repartition_anchors) {
+      if (entry.root_shape.empty() ||
+          std::any_of(entry.root_shape.begin(), entry.root_shape.end(), [](int width) { return width <= 0; }) ||
+          entry.tail_width <= 0 || entry.route_slices <= 0 || entry.routes <= 0 || entry.num_iters <= 0 ||
+          entry.p10_ns < 0.0 ||
+          entry.p10_ns > entry.median_ns || entry.median_ns > entry.p90_ns) {
+        throw std::invalid_argument("bounded-tail calibration entry is invalid");
+      }
+      const auto key = std::make_tuple(entry.root_shape, entry.tail_width, entry.route_slices, entry.routes);
+      const bool inserted =
+          tail_repartition_anchors
+              .emplace(key, TailRepartitionAnchor{entry.median_ns, entry.p10_ns, entry.p90_ns, entry.num_iters})
+              .second;
+      if (!inserted) {
+        throw std::invalid_argument("duplicate bounded-tail calibration entry");
+      }
+    }
 
     if (config.use_formula_iso) {
       if (!config.iso_formula.enabled) {
@@ -375,6 +399,20 @@ struct NativeIntervalPlanner::Impl {
     return FormulaOverhead(threads) + formula_route_work.InterpolateLinear(routes) * FormulaPhi(threads);
   }
 
+  bool SupportsFormulaOnlyWidth(int routes, int threads) const {
+    return config.use_formula_iso && !formula_phi_correction.empty() &&
+           threads >= formula_phi_correction.points.front() && threads <= formula_phi_correction.points.back() &&
+           routes >= 36 && routes % 12 == 0;
+  }
+
+  double Overhead(int threads) const {
+    if (config.use_formula_iso) {
+      return FormulaOverhead(threads);
+    }
+    const auto overhead = overheads.find(threads);
+    return overhead == overheads.end() ? 0.0 : overhead->second;
+  }
+
   double RawIso(int routes, int threads) const {
     const auto exact = iso_exact.find({routes, threads});
     if (exact != iso_exact.end()) {
@@ -391,7 +429,7 @@ struct NativeIntervalPlanner::Impl {
     if (routes <= 0) {
       return 0.0;
     }
-    if (iso_curves.find(threads) == iso_curves.end()) {
+    if (iso_curves.find(threads) == iso_curves.end() && !SupportsFormulaOnlyWidth(routes, threads)) {
       throw std::out_of_range("no isolated calibration for requested thread width");
     }
 
@@ -404,7 +442,7 @@ struct NativeIntervalPlanner::Impl {
 
     const int blocks = routes / 12;
     const int tail = M12TailCapacity(routes % 12);
-    const double overhead = config.use_formula_iso ? FormulaOverhead(threads) : overheads.at(threads);
+    const double overhead = Overhead(threads);
     if (blocks == 0) {
       return RawIso(tail, threads);
     }
@@ -476,9 +514,7 @@ struct NativeIntervalPlanner::Impl {
 
   std::vector<Phase> TaskPhases(int routes, int threads) const {
     const double isolated = Tiso(routes, threads);
-    const auto overhead_entry = overheads.find(threads);
-    const double raw_overhead = overhead_entry == overheads.end() ? 0.0 : overhead_entry->second;
-    const double overhead = std::min(raw_overhead, isolated * 0.9);
+    const double overhead = std::min(Overhead(threads), isolated * 0.9);
     const double compute = std::max(isolated - overhead, 0.0);
     std::vector<Phase> phases;
     if (overhead > 0.0) {
@@ -633,8 +669,7 @@ struct NativeIntervalPlanner::Impl {
     if (isolated <= 0.0) {
       return 0.0;
     }
-    const auto overhead = overheads.find(threads);
-    return std::min((overhead == overheads.end() ? 0.0 : overhead->second) / isolated, 0.9);
+    return std::min(Overhead(threads) / isolated, 0.9);
   }
 
   static void BuildDagState(const std::vector<SimulationTask>& tasks, std::vector<int>* dependency_count,
@@ -843,6 +878,31 @@ struct NativeIntervalPlanner::Impl {
                         [&](int threads) { return FindStageWindow(experts.front().routes, threads) != nullptr; });
   }
 
+  std::optional<std::pair<double, double>> BoundedTailAnchor(
+      const std::vector<Expert>& experts, const std::vector<int>& root_shape, int tail_width,
+      int route_slices) const {
+    if (experts.size() != root_shape.size() + 2 || experts.empty() ||
+        route_slices <= 0 ||
+        !std::all_of(experts.begin(), experts.end(),
+                     [&](const Expert& expert) { return expert.routes == experts.front().routes; })) {
+      return std::nullopt;
+    }
+    const int routes = M12EffectiveRows(experts.front().routes);
+    if (routes % route_slices != 0 || FindStageWindow(routes / route_slices, tail_width) != nullptr ||
+        std::any_of(root_shape.begin(), root_shape.end(),
+                    [&](int threads) { return FindStageWindow(routes, threads) != nullptr; })) {
+      return std::nullopt;
+    }
+    const auto anchor =
+        tail_repartition_anchors.find(std::make_tuple(root_shape, tail_width, route_slices, routes));
+    if (anchor == tail_repartition_anchors.end()) {
+      return std::nullopt;
+    }
+    const TailRepartitionAnchor& value = anchor->second;
+    const double spread = std::max({value.median_ns - value.p10_ns, value.p90_ns - value.median_ns, 0.0});
+    return std::make_pair(value.median_ns, spread / std::sqrt(static_cast<double>(value.num_iters)));
+  }
+
   double Uncertainty(const std::vector<Expert>& experts, const std::vector<int>& shape, double makespan,
                      bool use_full_workload_anchor) const {
     if (config.schema_version < 2) {
@@ -877,6 +937,7 @@ struct NativeIntervalPlanner::Impl {
   std::map<std::vector<int>, Curve> p90_curves;
   std::map<std::vector<int>, Curve> full_call_p10_curves;
   std::map<std::vector<int>, Curve> full_call_p90_curves;
+  std::map<std::tuple<std::vector<int>, int, int, int>, TailRepartitionAnchor> tail_repartition_anchors;
   Curve formula_route_work;
   Curve formula_measured_phi;
   Curve formula_phi_correction;
@@ -988,6 +1049,149 @@ IntervalCandidate BuildStrictCandidate(const NativeIntervalPlanner::Impl& model,
     candidate.window_bytes_per_worker.push_back(bytes);
   }
   return candidate;
+}
+
+std::optional<std::vector<IntervalTask>> BuildBoundedTailTasks(const std::vector<IntervalTask>& tasks, int num_cores,
+                                                               int tail_width, int route_slices) {
+  constexpr int kTailExperts = 2;
+  if (num_cores <= 0 || num_cores % kTailExperts != 0 || tail_width <= 0 || route_slices <= 0 ||
+      num_cores % tail_width != 0 || kTailExperts * tail_width > num_cores) {
+    return std::nullopt;
+  }
+  const int physical_tail_tasks = kTailExperts * route_slices;
+  if (route_slices > 1 && physical_tail_tasks * tail_width != num_cores) {
+    return std::nullopt;
+  }
+
+  std::vector<int> successors(tasks.size(), 0);
+  for (size_t task_id = 0; task_id < tasks.size(); ++task_id) {
+    for (int dependency : tasks[task_id].dependencies) {
+      if (dependency < 0 || dependency >= static_cast<int>(task_id)) {
+        return std::nullopt;
+      }
+      ++successors[static_cast<size_t>(dependency)];
+    }
+  }
+
+  std::vector<int> roots;
+  std::vector<int> tails;
+  for (size_t task_id = 0; task_id < tasks.size(); ++task_id) {
+    (tasks[task_id].dependencies.empty() ? roots : tails).push_back(static_cast<int>(task_id));
+  }
+  if (tails.size() != kTailExperts || roots.size() + tails.size() != tasks.size()) {
+    return std::nullopt;
+  }
+  for (int task_id : tails) {
+    const IntervalTask& tail = tasks[static_cast<size_t>(task_id)];
+    if (successors[static_cast<size_t>(task_id)] != 0 || tail_width <= tail.threads ||
+        tail.routes % route_slices != 0) {
+      return std::nullopt;
+    }
+  }
+
+  const auto by_core = [&](int left, int right) {
+    return std::tie(tasks[static_cast<size_t>(left)].core_begin, left) <
+           std::tie(tasks[static_cast<size_t>(right)].core_begin, right);
+  };
+  std::stable_sort(roots.begin(), roots.end(), by_core);
+  std::stable_sort(tails.begin(), tails.end(), by_core);
+
+  std::vector<IntervalTask> rewritten;
+  rewritten.reserve(roots.size() + static_cast<size_t>(physical_tail_tasks));
+  for (int task_id : roots) {
+    IntervalTask root = tasks[static_cast<size_t>(task_id)];
+    root.dependencies.clear();
+    rewritten.push_back(std::move(root));
+  }
+  const int partition_width = num_cores / kTailExperts;
+  for (int tail_index = 0; tail_index < kTailExperts; ++tail_index) {
+    for (int route_slice = 0; route_slice < route_slices; ++route_slice) {
+      const int core_begin =
+          route_slices == 1 ? tail_index * partition_width
+                            : (tail_index * route_slices + route_slice) * tail_width;
+      const int core_end = core_begin + tail_width;
+      if (core_end > num_cores) {
+        return std::nullopt;
+      }
+      IntervalTask tail = tasks[static_cast<size_t>(tails[static_cast<size_t>(tail_index)])];
+      tail.routes /= route_slices;
+      tail.core_begin = core_begin;
+      tail.threads = tail_width;
+      tail.dependencies.clear();
+      for (size_t root_id = 0; root_id < roots.size(); ++root_id) {
+        const IntervalTask& root = tasks[static_cast<size_t>(roots[root_id])];
+        if (root.core_begin < core_end && core_begin < root.core_begin + root.threads) {
+          tail.dependencies.push_back(static_cast<int>(root_id));
+        }
+      }
+      if (tail.dependencies.empty()) {
+        return std::nullopt;
+      }
+      rewritten.push_back(std::move(tail));
+    }
+  }
+  return rewritten;
+}
+
+std::optional<IntervalCandidate> BuildBoundedTailCandidate(const NativeIntervalPlanner::Impl& model,
+                                                           const std::vector<Expert>& experts,
+                                                           const IntervalCandidate& strict_candidate, int num_cores,
+                                                           int tail_width, int route_slices) {
+  std::optional<std::vector<IntervalTask>> tasks =
+      BuildBoundedTailTasks(strict_candidate.tasks, num_cores, tail_width, route_slices);
+  if (!tasks.has_value()) {
+    return std::nullopt;
+  }
+  try {
+    constexpr int kTailExperts = 2;
+    const int physical_tail_tasks = kTailExperts * route_slices;
+    IntervalCandidate candidate;
+    candidate.shape = strict_candidate.shape;
+    candidate.tail_repartition_width = tail_width;
+    candidate.tail_repartition_tasks = kTailExperts;
+    candidate.tail_repartition_route_slices = route_slices;
+    candidate.tasks = std::move(*tasks);
+    const std::optional<std::pair<double, double>> anchor =
+        model.BoundedTailAnchor(experts, candidate.shape, tail_width, route_slices);
+    if (route_slices > 1 && !anchor.has_value()) {
+      return std::nullopt;
+    }
+    if (anchor.has_value()) {
+      candidate.makespan_ns = anchor->first;
+      candidate.uncertainty_ns = anchor->second;
+    } else {
+      candidate.makespan_ns = model.DagMakespan(ToSimulationTasks(candidate.tasks));
+      candidate.uncertainty_ns = model.Uncertainty(experts, candidate.shape, candidate.makespan_ns, false);
+    }
+    candidate.pessimistic_ns = candidate.makespan_ns + candidate.uncertainty_ns;
+
+    int64_t root_working_set = 0;
+    int64_t tail_working_set = 0;
+    std::vector<int64_t> root_windows;
+    std::vector<int64_t> tail_windows;
+    const size_t first_tail = candidate.tasks.size() - physical_tail_tasks;
+    for (size_t task_id = 0; task_id < candidate.tasks.size(); ++task_id) {
+      const IntervalTask& task = candidate.tasks[task_id];
+      const int64_t bytes = model.TaskMaxStageBytes(task.routes, task.threads);
+      const int64_t window = model.WindowBytesPerWorker(task.routes, task.threads);
+      if (task_id < first_tail) {
+        root_working_set += bytes;
+        root_windows.push_back(window);
+      } else {
+        tail_working_set += bytes;
+        tail_windows.push_back(window);
+      }
+    }
+    candidate.active_working_set_bytes = std::max(root_working_set, tail_working_set);
+    candidate.window_bytes_per_worker =
+        root_working_set >= tail_working_set ? std::move(root_windows) : std::move(tail_windows);
+    candidate.resource_groups = std::max<int>(static_cast<int>(first_tail), physical_tail_tasks);
+    return candidate;
+  } catch (const std::out_of_range&) {
+    return std::nullopt;
+  } catch (const std::invalid_argument&) {
+    return std::nullopt;
+  }
 }
 
 bool TailPoolLayout(const std::vector<IntervalTask>& tasks, int num_cores, int pool_threads, int max_pooled_routes,
@@ -1234,9 +1438,10 @@ std::vector<IntervalCandidate> TailPoolHeadCandidates(std::vector<IntervalCandid
 
 NativeIntervalPlanner::NativeIntervalPlanner(int num_cores, std::vector<int> widths,
                                              std::vector<std::vector<int>> shapes, IntervalCostModelConfig model,
-                                             int planner_threads)
+                                             int planner_threads, std::vector<int> tail_repartition_widths)
     : num_cores_(num_cores),
       widths_(std::move(widths)),
+      tail_repartition_widths_(std::move(tail_repartition_widths)),
       shapes_(std::move(shapes)),
       configured_workers_(planner_threads > 0 ? planner_threads : DefaultPlannerWorkers(num_cores)),
       impl_(std::make_unique<Impl>(std::move(model))) {
@@ -1257,6 +1462,14 @@ NativeIntervalPlanner::NativeIntervalPlanner(int num_cores, std::vector<int> wid
     }
     if (total != num_cores_) {
       throw std::invalid_argument("candidate shape does not cover num_cores");
+    }
+  }
+  std::sort(tail_repartition_widths_.begin(), tail_repartition_widths_.end());
+  tail_repartition_widths_.erase(std::unique(tail_repartition_widths_.begin(), tail_repartition_widths_.end()),
+                                 tail_repartition_widths_.end());
+  for (int width : tail_repartition_widths_) {
+    if (width <= 0 || width > num_cores_ / 2 || num_cores_ % width != 0) {
+      throw std::invalid_argument("tail repartition widths must be divisors no wider than half the planner domain");
     }
   }
 }
@@ -1280,11 +1493,42 @@ double NativeIntervalPlanner::ScoreDag(const std::vector<int>& routes, const std
 
 IntervalPlanResult NativeIntervalPlanner::Plan(const std::vector<int>& expert_ids, const std::vector<int>& routes,
                                                bool dynamic_tail_pool, int tail_pool_max_routes,
-                                               std::optional<int> forced_tail_pool_threads) const {
+                                               std::optional<int> forced_tail_pool_threads,
+                                               bool bounded_tail_repartition) const {
   const std::vector<Expert> experts = BuildExperts(expert_ids, routes);
   std::vector<IntervalCandidate> strict_candidates(shapes_.size());
   ParallelFor(shapes_.size(), configured_workers_,
               [&](size_t index) { strict_candidates[index] = BuildStrictCandidate(*impl_, experts, shapes_[index]); });
+
+  std::vector<IntervalCandidate> tail_repartition_candidates;
+  if (bounded_tail_repartition && !forced_tail_pool_threads.has_value() && !tail_repartition_widths_.empty()) {
+    const std::vector<IntervalCandidate> heads = TailPoolHeadCandidates(strict_candidates);
+    struct TailSpec {
+      size_t head = 0;
+      int width = 0;
+      int route_slices = 1;
+    };
+    std::vector<TailSpec> specs;
+    for (size_t head = 0; head < heads.size(); ++head) {
+      for (int width : tail_repartition_widths_) {
+        specs.push_back({head, width, 1});
+        if (4 * width == num_cores_) {
+          specs.push_back({head, width, 2});
+        }
+      }
+    }
+    std::vector<std::optional<IntervalCandidate>> evaluated(specs.size());
+    ParallelFor(specs.size(), configured_workers_, [&](size_t index) {
+      const TailSpec& spec = specs[index];
+      evaluated[index] = BuildBoundedTailCandidate(
+          *impl_, experts, heads[spec.head], num_cores_, spec.width, spec.route_slices);
+    });
+    for (std::optional<IntervalCandidate>& candidate : evaluated) {
+      if (candidate.has_value()) {
+        tail_repartition_candidates.push_back(std::move(*candidate));
+      }
+    }
+  }
 
   std::vector<IntervalCandidate> dynamic_candidates;
   if (dynamic_tail_pool || forced_tail_pool_threads.has_value()) {
@@ -1337,6 +1581,9 @@ IntervalPlanResult NativeIntervalPlanner::Plan(const std::vector<int>& expert_id
     candidates = dynamic_candidates;
   } else {
     candidates = strict_candidates;
+    if (bounded_tail_repartition) {
+      candidates.insert(candidates.end(), tail_repartition_candidates.begin(), tail_repartition_candidates.end());
+    }
     if (dynamic_tail_pool) {
       candidates.insert(candidates.end(), dynamic_candidates.begin(), dynamic_candidates.end());
     }
@@ -1345,6 +1592,7 @@ IntervalPlanResult NativeIntervalPlanner::Plan(const std::vector<int>& expert_id
   IntervalPlanResult result;
   result.strict_candidates = static_cast<int>(strict_candidates.size());
   result.dynamic_candidates = static_cast<int>(dynamic_candidates.size());
+  result.tail_repartition_candidates = static_cast<int>(tail_repartition_candidates.size());
   result.configured_workers = configured_workers_;
   result.selected = SelectCandidate(&candidates);
   result.candidates = std::move(candidates);

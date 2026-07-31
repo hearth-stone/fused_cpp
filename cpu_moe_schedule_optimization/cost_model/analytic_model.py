@@ -1023,10 +1023,10 @@ class AnalyticMoeCostModel:
                 successors[dependency].append(task_id)
         return dependency_count, successors, [count == 0 or value == 0 for value in dependency_count]
 
-    def dag_makespan(self, tasks) -> float:
+    def _dag_result(self, tasks) -> tuple[float, tuple[float, ...]]:
         tasks = [(int(routes), int(threads), list(dependencies)) for routes, threads, dependencies in tasks]
         if not tasks:
-            return 0.0
+            return 0.0, ()
         phases = [self.predict_expert(routes, threads).phases for routes, threads, _ in tasks]
         if any(not task_phases for task_phases in phases):
             raise ValueError("analytical DAG tasks must have positive route counts")
@@ -1034,6 +1034,7 @@ class AnalyticMoeCostModel:
         remaining = [task_phases[0].base_ns for task_phases in phases]
         dependency_count, successors, started = self._dag_state(tasks)
         finished = [False] * len(tasks)
+        finish_times = [0.0] * len(tasks)
         wall_ns = self.call_setup_ns
         max_events = sum(len(task_phases) for task_phases in phases) + len(tasks) + 2
         guard = 0
@@ -1084,11 +1085,19 @@ class AnalyticMoeCostModel:
                     remaining[index] = phases[index][phase_index[index]].base_ns
                     continue
                 finished[index] = True
+                finish_times[index] = wall_ns
                 for successor in successors[index]:
                     dependency_count[successor] -= 1
                     if dependency_count[successor] == 0:
                         started[successor] = True
-        return wall_ns
+        return wall_ns, tuple(finish_times)
+
+    def dag_makespan(self, tasks) -> float:
+        return self._dag_result(tasks)[0]
+
+    def dag_task_finish_times(self, tasks) -> tuple[float, ...]:
+        """Return task completion timestamps from the analytical simulator."""
+        return self._dag_result(tasks)[1]
 
     def phase_makespan(self, tasks) -> float:
         return self.dag_makespan((routes, threads, []) for routes, threads in tasks)

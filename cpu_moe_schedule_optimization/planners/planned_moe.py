@@ -78,6 +78,7 @@ class PlannedMoE:
         cpu_ids: Sequence[int] | None = None,
         task_stage_window_policy: TaskStageWindowPolicy | None = None,
         use_default_stage_window_policy: bool = True,
+        tail_repartition_widths: Sequence[int] | None = None,
     ):
         if callable(getattr(models, "T_iso", None)) and callable(getattr(models, "dag_makespan", None)):
             self.models = (models,)
@@ -107,6 +108,7 @@ class PlannedMoE:
                 num_cores,
                 cpu_ids=self.cpu_ids,
                 task_stage_window_policy=stage_window_policy,
+                tail_repartition_widths=tail_repartition_widths,
             )
             for model, stage_window_policy in zip(self.models, self.task_stage_window_policies)
         )
@@ -116,6 +118,7 @@ class PlannedMoE:
                 num_cores,
                 cpu_ids=self.cpu_ids,
                 task_stage_window_policies=self.task_stage_window_policies,
+                tail_repartition_widths=tail_repartition_widths,
             )
             if len(self.models) > 1
             else None
@@ -136,7 +139,7 @@ class PlannedMoE:
         )
         self.shape_cache: Dict[
             Tuple[object, ...],
-            Tuple[int, Tuple[int, ...], str, int | None, int | None],
+            Tuple[int, Tuple[int, ...], str, int | None, int | None, int | None, int],
         ] = {}
         self.last: dict[str, object] = {}
 
@@ -176,10 +179,28 @@ class PlannedMoE:
         execution_mode: str,
         tail_pool_threads: int | None,
         tail_pool_max_routes: int | None,
+        tail_repartition_width: int | None,
+        tail_repartition_tasks: int,
+        tail_repartition_route_slices: int,
     ):
         planner = self.interval_planners[planner_index]
         lanes = planner._lanes(shape)
         tasks = planner._build_tasks(counts, lanes, planner._assign(counts, lanes))
+        if tail_repartition_width is not None:
+            if (
+                execution_mode != "strict"
+                or tail_repartition_tasks != 2
+                or tail_repartition_route_slices <= 0
+            ):
+                raise RuntimeError("cached bounded tail metadata is inconsistent")
+            tasks = planner._bounded_tail_repartition_tasks(
+                tasks,
+                tail_repartition_width,
+                tail_repartition_route_slices,
+            )
+            physical_tail_tasks = tail_repartition_tasks * tail_repartition_route_slices
+            for _, routes, _, threads, _ in tasks[-physical_tail_tasks:]:
+                planner._task_time(routes, threads)
         model = self.models[planner_index]
         stage_window_policy = self.task_stage_window_policies[planner_index]
         if execution_mode == "tail_pool":
@@ -202,6 +223,9 @@ class PlannedMoE:
                 if execution_mode == "tail_pool" and tail_pool_max_routes is not None
                 else 0
             ),
+            "tail_repartition_width": tail_repartition_width,
+            "tail_repartition_tasks": tail_repartition_tasks,
+            "tail_repartition_route_slices": tail_repartition_route_slices,
             "w13_split": (model.policy.w13_split if model.policy is not None else None),
             "weight_window_bytes": (model.policy.weight_window_bytes if model.policy is not None else None),
             "task_stage_window_policy": (
@@ -230,9 +254,12 @@ class PlannedMoE:
         dynamic_tail_pool: bool = True,
         tail_pool_threads: int | None = None,
         tail_pool_max_routes: int = 12,
+        bounded_tail_repartition: bool | None = None,
     ) -> Dict[str, object]:
         begin = time.perf_counter_ns()
         counts = [(int(expert), int(routes)) for expert, routes in counts if int(routes) > 0]
+        if bounded_tail_repartition is None:
+            bounded_tail_repartition = dynamic_tail_pool and tail_pool_threads is None
         requested_mode = "forced" if tail_pool_threads is not None else ("auto" if dynamic_tail_pool else "strict")
         tail_pool_cache_signature = (
             _tail_pool_signature(counts, tail_pool_max_routes)
@@ -245,29 +272,47 @@ class PlannedMoE:
             tail_pool_threads,
             tail_pool_max_routes if requested_mode != "strict" else None,
             tail_pool_cache_signature,
+            bounded_tail_repartition,
         )
         after_signature = time.perf_counter_ns()
         cached = self.shape_cache.get(cache_key)
         hit = cached is not None
         if hit:
             assert cached is not None
-            planner_index, shape, execution_mode, selected_pool_threads, selected_max_routes = cached
-            after_search = time.perf_counter_ns()
-            result = self._build_cached(
-                counts,
+            (
                 planner_index,
                 shape,
                 execution_mode,
                 selected_pool_threads,
                 selected_max_routes,
-            )
-        else:
+                selected_tail_width,
+                selected_tail_tasks,
+                selected_tail_route_slices,
+            ) = cached
+            try:
+                result = self._build_cached(
+                    counts,
+                    planner_index,
+                    shape,
+                    execution_mode,
+                    selected_pool_threads,
+                    selected_max_routes,
+                    selected_tail_width,
+                    selected_tail_tasks,
+                    selected_tail_route_slices,
+                )
+                after_search = time.perf_counter_ns()
+            except (KeyError, ValueError):
+                self.shape_cache.pop(cache_key, None)
+                hit = False
+        if not hit:
             if self.policy_planner is not None:
                 result = self.policy_planner.plan(
                     counts,
                     dynamic_tail_pool=dynamic_tail_pool,
                     tail_pool_max_routes=tail_pool_max_routes,
                     forced_tail_pool_threads=tail_pool_threads,
+                    bounded_tail_repartition=bounded_tail_repartition,
                 )
             else:
                 result = self.interval_planners[0].plan(
@@ -275,6 +320,7 @@ class PlannedMoE:
                     dynamic_tail_pool=dynamic_tail_pool,
                     tail_pool_max_routes=tail_pool_max_routes,
                     forced_tail_pool_threads=tail_pool_threads,
+                    bounded_tail_repartition=bounded_tail_repartition,
                 )
             planner_index = self._planner_index(result)
             shape = tuple(result["shape"])
@@ -284,6 +330,9 @@ class PlannedMoE:
                 str(result["execution_mode"]),
                 result["tail_pool_threads"],
                 result["tail_pool_max_routes"],
+                result["tail_repartition_width"],
+                result["tail_repartition_tasks"],
+                result["tail_repartition_route_slices"],
             )
             after_search = time.perf_counter_ns()
         bridge = result["bridge"]
@@ -300,6 +349,9 @@ class PlannedMoE:
             "tail_pool_threads": result.get("tail_pool_threads"),
             "tail_pool_max_routes": result.get("tail_pool_max_routes"),
             "tail_pool_tasks": result.get("tail_pool_tasks", 0),
+            "tail_repartition_width": result.get("tail_repartition_width"),
+            "tail_repartition_tasks": result.get("tail_repartition_tasks", 0),
+            "tail_repartition_route_slices": result.get("tail_repartition_route_slices", 1),
             "shape": tuple(result["shape"]),
             "w13_split": result.get("w13_split"),
             "weight_window_bytes": result.get("weight_window_bytes"),
@@ -309,6 +361,7 @@ class PlannedMoE:
             "planner_workers": result.get("planner_workers", 1),
             "strict_candidates": result.get("strict_candidates", 0),
             "dynamic_candidates": result.get("dynamic_candidates", 0),
+            "tail_repartition_candidates": result.get("tail_repartition_candidates", 0),
         }
         return {
             "plan_version": bridge["plan_version"],
@@ -318,6 +371,9 @@ class PlannedMoE:
             "tail_pool_threads": result.get("tail_pool_threads"),
             "tail_pool_max_routes": result.get("tail_pool_max_routes"),
             "tail_pool_tasks": result.get("tail_pool_tasks", 0),
+            "tail_repartition_width": result.get("tail_repartition_width"),
+            "tail_repartition_tasks": result.get("tail_repartition_tasks", 0),
+            "tail_repartition_route_slices": result.get("tail_repartition_route_slices", 1),
             "w13_split": result.get("w13_split"),
             "weight_window_bytes": result.get("weight_window_bytes"),
             "task_stage_window_policy": result.get("task_stage_window_policy"),
@@ -335,6 +391,7 @@ class PlannedMoE:
         dynamic_tail_pool: bool = True,
         tail_pool_threads: int | None = None,
         tail_pool_max_routes: int = 12,
+        bounded_tail_repartition: bool | None = None,
     ) -> Dict[str, object]:
         """Bridge-only API; returns Plan V2 with legacy fixed arrays retained."""
         return self.plan_spec_for(
@@ -342,4 +399,5 @@ class PlannedMoE:
             dynamic_tail_pool=dynamic_tail_pool,
             tail_pool_threads=tail_pool_threads,
             tail_pool_max_routes=tail_pool_max_routes,
+            bounded_tail_repartition=bounded_tail_repartition,
         )["bridge"]

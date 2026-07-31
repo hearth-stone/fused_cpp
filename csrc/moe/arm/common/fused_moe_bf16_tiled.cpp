@@ -3,6 +3,7 @@
 #include <torch/csrc/autograd/variable.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -4738,6 +4739,7 @@ struct ScheduledWaveRuntime {
 
 struct AsyncTaskRuntime {
   int64_t expert = 0;
+  int64_t route_begin = 0;
   int64_t rows = 0;
   int64_t core_begin = 0;
   int64_t threads = 0;
@@ -4756,6 +4758,9 @@ constexpr int64_t kAsyncStageExpert = 0;
 constexpr int64_t kAsyncResizeNone = 0;
 constexpr int64_t kAsyncResizeBeforeW2 = 1;
 constexpr int64_t kAsyncFullExpertRange = 0;
+constexpr int64_t kAsyncEarlyMergeAuto = -1;
+constexpr int64_t kAsyncEarlyMergeOff = 0;
+constexpr int64_t kAsyncEarlyMergeOn = 1;
 constexpr int64_t kAsyncElasticStatsCount = 10;
 enum AsyncElasticStat : int64_t {
   kElasticEligibleTasks = 0,
@@ -4807,6 +4812,7 @@ struct AsyncPlanV2NativeArgs {
   c10::optional<at::Tensor> task_resize_timeout_ns;
   c10::optional<at::Tensor> task_preferred_core_begins;
   c10::optional<at::Tensor> elastic_stats_out;
+  int64_t early_merge = kAsyncEarlyMergeAuto;
 };
 
 struct ScheduledScratchUnitConfig {
@@ -7450,6 +7456,10 @@ at::Tensor run_fused_moe_bf16_tiled_async(
                 "Plan V2 execution_mode must be strict (", kAsyncExecutionStrict, "), tail_pool (",
                 kAsyncExecutionTailPool, "), or elastic (", kAsyncExecutionElastic, "), got ",
                 plan_v2->execution_mode);
+    TORCH_CHECK(plan_v2->early_merge >= kAsyncEarlyMergeAuto &&
+                    plan_v2->early_merge <= kAsyncEarlyMergeOn,
+                "Plan V2 early_merge must be -1 (auto), 0 (off), or 1 (on), got ",
+                plan_v2->early_merge);
     task_preferred_threads_v =
         tensor_to_i64_vector(plan_v2->task_preferred_threads, "task_preferred_threads");
     task_min_threads_v = tensor_to_i64_vector(plan_v2->task_min_threads, "task_min_threads");
@@ -7552,8 +7562,13 @@ at::Tensor run_fused_moe_bf16_tiled_async(
     for (int64_t task = 0; task < num_tasks; ++task) {
       TORCH_CHECK(task_stage_ids_v[static_cast<size_t>(task)] == kAsyncStageExpert,
                   "Plan V2 currently only supports whole-expert tasks: task=", task);
-      TORCH_CHECK(task_range_granularities_v[static_cast<size_t>(task)] == kAsyncFullExpertRange,
-                  "Plan V2 currently only supports full-expert ranges: task=", task);
+      const int64_t route_granularity = task_range_granularities_v[static_cast<size_t>(task)];
+      TORCH_CHECK(route_granularity >= kAsyncFullExpertRange,
+                  "task_range_granularities must be non-negative: task=", task,
+                  " granularity=", route_granularity);
+      TORCH_CHECK(route_granularity == kAsyncFullExpertRange ||
+                      plan_v2->execution_mode == kAsyncExecutionStrict,
+                  "route-sliced tasks currently require strict execution: task=", task);
       TORCH_CHECK(task_w13_window_bytes_v[static_cast<size_t>(task)] >= -1,
                   "task_w13_window_bytes must be -1 (inherit) or non-negative: task=", task);
       TORCH_CHECK(task_w2_window_bytes_v[static_cast<size_t>(task)] >= -1,
@@ -7683,11 +7698,22 @@ at::Tensor run_fused_moe_bf16_tiled_async(
                         sve_w2_direct_route_offsets_fit(num_routes, H, w2.n_tile, route_element_bytes) &&
                         sve_w2_direct_route_enabled();
 #endif
+  const int64_t early_merge_policy =
+      has_plan_v2 ? plan_v2->early_merge : kAsyncEarlyMergeAuto;
+  const bool ready_token_merge_enabled =
+      env_flag_enabled_by_default("FUSED_CPP_MOE_ASYNC_READY_TOKEN_MERGE");
+  if (early_merge_policy == kAsyncEarlyMergeOn) {
+    TORCH_CHECK(use_w2_direct_route,
+                "early_merge=True requires the SVE direct-route W2 path");
+  }
   bool use_async_ready_token_merge =
-      use_w2_direct_route && env_flag_enabled_by_default("FUSED_CPP_MOE_ASYNC_READY_TOKEN_MERGE");
+      use_w2_direct_route && ready_token_merge_enabled &&
+      early_merge_policy != kAsyncEarlyMergeOff;
   const bool plan_v2_tail_pool = has_plan_v2 && plan_v2->execution_mode == kAsyncExecutionTailPool;
   const bool plan_v2_elastic = has_plan_v2 && plan_v2->execution_mode == kAsyncExecutionElastic;
   if (plan_v2_elastic) {
+    TORCH_CHECK(early_merge_policy != kAsyncEarlyMergeOn,
+                "elastic Plan V2 does not support early_merge=True");
     TORCH_CHECK(use_sve_backend && fuse_silu,
                 "elastic Plan V2 currently requires the fused SVE backend");
     TORCH_CHECK(!plan_v2->elastic_stats_out.has_value() || elastic_stats_ptr != nullptr,
@@ -7745,13 +7771,13 @@ at::Tensor run_fused_moe_bf16_tiled_async(
       ++active_experts;
     }
   }
-  TORCH_CHECK(num_tasks == active_experts,
-              "async bridge currently requires exactly one task per active "
-              "expert: tasks=",
+  TORCH_CHECK(num_tasks >= active_experts,
+              "async bridge requires at least one task per active expert: tasks=",
               num_tasks, " active_experts=", active_experts);
 
   std::vector<int64_t> seen(static_cast<size_t>(num_experts), 0);
-  std::vector<int64_t> expert_task_ids(static_cast<size_t>(num_experts), -1);
+  std::vector<int64_t> expert_covered_rows(static_cast<size_t>(num_experts), 0);
+  std::vector<int64_t> expert_route_granularities(static_cast<size_t>(num_experts), -1);
   std::vector<AsyncTaskRuntime> tasks(static_cast<size_t>(num_tasks));
   std::vector<int8_t> is_short_pool_task(static_cast<size_t>(num_tasks), int8_t{0});
   std::vector<int64_t> short_pool_task_ids;
@@ -7808,6 +7834,8 @@ at::Tensor run_fused_moe_bf16_tiled_async(
     const int64_t expert = task_expert_ids_v[static_cast<size_t>(task)];
     const int64_t core_begin = task_core_begins_v[static_cast<size_t>(task)];
     const int64_t threads = task_threads_v[static_cast<size_t>(task)];
+    const int64_t route_granularity =
+        has_plan_v2 ? task_range_granularities_v[static_cast<size_t>(task)] : kAsyncFullExpertRange;
     TORCH_CHECK(expert >= 0 && expert < num_experts, "task_expert_ids[", task, "] out of range: ", expert);
     TORCH_CHECK(threads > 0, "task_threads[", task, "] must be positive, got ", threads);
     const bool pooled_by_plan =
@@ -7825,13 +7853,31 @@ at::Tensor run_fused_moe_bf16_tiled_async(
                     "task ", task, " allowed widths exceed its fixed logical-core placement");
       }
     }
-    TORCH_CHECK(seen[static_cast<size_t>(expert)] == 0, "async bridge currently does not support duplicate expert ",
-                expert);
-    const int64_t rows = static_cast<int64_t>(routes[static_cast<size_t>(expert)].size());
+    const int64_t expert_rows = static_cast<int64_t>(routes[static_cast<size_t>(expert)].size());
+    int64_t route_begin = 0;
+    int64_t rows = expert_rows;
+    if (route_granularity == kAsyncFullExpertRange) {
+      TORCH_CHECK(seen[static_cast<size_t>(expert)] == 0,
+                  "duplicate expert tasks require a positive route granularity: expert=", expert);
+      expert_covered_rows[static_cast<size_t>(expert)] = expert_rows;
+    } else {
+      TORCH_CHECK(has_plan_v2 && plan_v2->execution_mode == kAsyncExecutionStrict,
+                  "route-sliced tasks require strict Plan V2 execution");
+      TORCH_CHECK(!pooled_by_plan, "route-sliced tasks cannot use tail-pool placement");
+      int64_t& expected_granularity = expert_route_granularities[static_cast<size_t>(expert)];
+      TORCH_CHECK(expected_granularity < 0 || expected_granularity == route_granularity,
+                  "all route slices for expert ", expert, " must use one granularity: got ",
+                  route_granularity, " expected ", expected_granularity);
+      expected_granularity = route_granularity;
+      route_begin = expert_covered_rows[static_cast<size_t>(expert)];
+      TORCH_CHECK(route_begin < expert_rows, "route slice starts beyond expert rows: expert=", expert,
+                  " route_begin=", route_begin, " rows=", expert_rows);
+      rows = std::min(route_granularity, expert_rows - route_begin);
+      expert_covered_rows[static_cast<size_t>(expert)] += rows;
+    }
     TORCH_CHECK(rows > 0, "async task contains inactive expert ", expert);
     check_positive_int(rows, "async task rows");
-    seen[static_cast<size_t>(expert)] = 1;
-    expert_task_ids[static_cast<size_t>(expert)] = task;
+    ++seen[static_cast<size_t>(expert)];
     const bool pooled_by_legacy = !has_plan_v2 && use_async_short_pool && rows <= async_short_pool_max_rows;
     const bool pooled_task = pooled_by_plan || pooled_by_legacy;
     const int64_t task_w13_window_bytes =
@@ -7844,12 +7890,14 @@ at::Tensor run_fused_moe_bf16_tiled_async(
       short_pool_task_ids.push_back(task);
       max_short_pool_rows = std::max(max_short_pool_rows, rows);
       tasks[static_cast<size_t>(task)] = AsyncTaskRuntime{
-          expert, rows, -1, async_short_pool_threads, -1, task_w13_window_bytes, task_w2_window_bytes};
+          expert, route_begin, rows, -1, async_short_pool_threads, -1, task_w13_window_bytes,
+          task_w2_window_bytes};
       trace_gemm_hint += async_short_pool_threads * 2;
     } else {
       const int64_t scratch_idx = ensure_scratch_config(core_begin, threads, rows);
       tasks[static_cast<size_t>(task)] = AsyncTaskRuntime{
-          expert, rows, core_begin, threads, scratch_idx, task_w13_window_bytes, task_w2_window_bytes};
+          expert, route_begin, rows, core_begin, threads, scratch_idx, task_w13_window_bytes,
+          task_w2_window_bytes};
       trace_gemm_hint += threads * 2;
     }
   }
@@ -7899,10 +7947,21 @@ at::Tensor run_fused_moe_bf16_tiled_async(
   }
   for (int64_t expert = 0; expert < num_experts; ++expert) {
     if (!routes[static_cast<size_t>(expert)].empty()) {
-      TORCH_CHECK(seen[static_cast<size_t>(expert)] == 1, "async task plan is missing active expert ", expert);
+      TORCH_CHECK(seen[static_cast<size_t>(expert)] > 0, "async task plan is missing active expert ", expert);
+      TORCH_CHECK(
+          (seen[static_cast<size_t>(expert)] == 1) ==
+              (expert_route_granularities[static_cast<size_t>(expert)] < 0),
+          "an expert must use either one full-range task or multiple positive-granularity slices: expert=", expert,
+          " tasks=", seen[static_cast<size_t>(expert)], " granularity=",
+          expert_route_granularities[static_cast<size_t>(expert)]);
+      TORCH_CHECK(expert_covered_rows[static_cast<size_t>(expert)] ==
+                      static_cast<int64_t>(routes[static_cast<size_t>(expert)].size()),
+                  "route slices do not cover expert ", expert, ": covered=",
+                  expert_covered_rows[static_cast<size_t>(expert)], " expected=",
+                  routes[static_cast<size_t>(expert)].size());
     }
   }
-  if (use_async_ready_token_merge) {
+  if (use_async_ready_token_merge && early_merge_policy != kAsyncEarlyMergeOn) {
     double min_team_load = std::numeric_limits<double>::infinity();
     double max_team_load = 0.0;
     for (const AsyncTaskRuntime& task : tasks) {
@@ -7914,6 +7973,21 @@ at::Tensor run_fused_moe_bf16_tiled_async(
     // idle lanes can hide merge work, so retain the contiguous post barrier.
     use_async_ready_token_merge = max_team_load >= min_team_load * 1.25;
   }
+  if (env_flag_enabled("FUSED_CPP_MOE_STAGE_TIMING")) {
+    std::fprintf(stderr,
+                 "[fused_moe_bf16_tiled_async][ready_token_policy] requested=%lld "
+                 "environment=%d direct_route=%d effective=%d\n",
+                 static_cast<long long>(early_merge_policy), ready_token_merge_enabled ? 1 : 0,
+                 use_w2_direct_route ? 1 : 0, use_async_ready_token_merge ? 1 : 0);
+  }
+  const bool use_async_ready_token_drain =
+      use_async_ready_token_merge && env_flag_enabled_by_default("FUSED_CPP_MOE_ASYNC_READY_TOKEN_DRAIN");
+  const int64_t async_ready_token_batch =
+      use_async_ready_token_merge
+          ? std::clamp<int64_t>(env_int_or_default("FUSED_CPP_MOE_ASYNC_READY_TOKEN_BATCH", 2), 1, 64)
+          : 1;
+  const bool use_async_ready_token_prefetch = use_async_ready_token_merge && async_ready_token_batch > 1 &&
+                                              env_flag_enabled_by_default("FUSED_CPP_MOE_ASYNC_READY_TOKEN_PREFETCH");
 
   std::vector<std::vector<int64_t>> successors(static_cast<size_t>(num_tasks));
   std::vector<std::atomic<int64_t>> deps_remaining(static_cast<size_t>(num_tasks));
@@ -7924,8 +7998,7 @@ at::Tensor run_fused_moe_bf16_tiled_async(
     TORCH_CHECK(begin >= 0 && end <= static_cast<int64_t>(task_deps_v.size()), "task ", task,
                 " dependency range is out of bounds");
     const bool pooled_task = is_short_pool_task[static_cast<size_t>(task)] != 0;
-    TORCH_CHECK(!has_plan_v2 || !pooled_task || begin == end,
-                "tail-pool task must not have dependencies: task=", task);
+    TORCH_CHECK(!has_plan_v2 || !pooled_task || begin == end, "tail-pool task must not have dependencies: task=", task);
     deps_remaining[static_cast<size_t>(task)].store(pooled_task ? 0 : end - begin, std::memory_order_relaxed);
     for (int64_t idx = begin; idx < end; ++idx) {
       const int64_t dep = task_deps_v[static_cast<size_t>(idx)];
@@ -7952,8 +8025,7 @@ at::Tensor run_fused_moe_bf16_tiled_async(
         continue;
       }
       const AsyncTaskRuntime& task = tasks[static_cast<size_t>(task_id)];
-      TORCH_CHECK(task.core_begin % async_short_pool_threads == 0 &&
-                      task.threads % async_short_pool_threads == 0,
+      TORCH_CHECK(task.core_begin % async_short_pool_threads == 0 && task.threads % async_short_pool_threads == 0,
                   "async short-expert pool requires long-task intervals aligned to the pool width: task=", task_id,
                   " core_begin=", task.core_begin, " threads=", task.threads,
                   " pool_threads=", async_short_pool_threads);
@@ -8001,12 +8073,10 @@ at::Tensor run_fused_moe_bf16_tiled_async(
     ready_token_slots[token].store(-1, std::memory_order_relaxed);
     token_merged[token].store(0, std::memory_order_relaxed);
   }
-  std::vector<std::vector<int64_t>> task_ready_tokens(
-      static_cast<size_t>(use_async_ready_token_merge ? num_tasks : 0));
+  std::vector<std::vector<int64_t>> task_ready_tokens(static_cast<size_t>(use_async_ready_token_merge ? num_tasks : 0));
   if (use_async_ready_token_merge) {
     for (int64_t task = 0; task < num_tasks; ++task) {
-      task_ready_tokens[static_cast<size_t>(task)].reserve(
-          static_cast<size_t>(tasks[static_cast<size_t>(task)].rows));
+      task_ready_tokens[static_cast<size_t>(task)].reserve(static_cast<size_t>(tasks[static_cast<size_t>(task)].rows));
     }
   }
   std::atomic<int64_t> ready_token_head{0};
@@ -8020,6 +8090,13 @@ at::Tensor run_fused_moe_bf16_tiled_async(
   std::vector<std::atomic<int64_t>> task_states(static_cast<size_t>(num_tasks));
   for (int64_t task = 0; task < num_tasks; ++task) {
     task_states[static_cast<size_t>(task)].store(0, std::memory_order_relaxed);
+  }
+  std::vector<std::atomic<int64_t>> expert_slices_remaining(static_cast<size_t>(num_experts));
+  std::vector<std::atomic<int64_t>> expert_completed(static_cast<size_t>(num_experts));
+  for (int64_t expert = 0; expert < num_experts; ++expert) {
+    expert_slices_remaining[static_cast<size_t>(expert)].store(seen[static_cast<size_t>(expert)],
+                                                               std::memory_order_relaxed);
+    expert_completed[static_cast<size_t>(expert)].store(0, std::memory_order_relaxed);
   }
   std::atomic<int64_t> completed_tasks{0};
   std::atomic<int64_t> next_short_pool_task{0};
@@ -8037,9 +8114,9 @@ at::Tensor run_fused_moe_bf16_tiled_async(
       bool ready = true;
       for (int64_t slot = 0; slot < top_k; ++slot) {
         const int64_t route_expert = ids[token * top_k + slot];
-        const int64_t route_task = expert_task_ids[static_cast<size_t>(route_expert)];
-        TORCH_INTERNAL_ASSERT(route_task >= 0, "ready token references inactive expert ", route_expert);
-        if (task_states[static_cast<size_t>(route_task)].load(std::memory_order_acquire) != 2) {
+        TORCH_INTERNAL_ASSERT(seen[static_cast<size_t>(route_expert)] > 0, "ready token references inactive expert ",
+                              route_expert);
+        if (expert_completed[static_cast<size_t>(route_expert)].load(std::memory_order_acquire) == 0) {
           ready = false;
           break;
         }
@@ -8048,8 +8125,8 @@ at::Tensor run_fused_moe_bf16_tiled_async(
         continue;
       }
       int64_t expected = 0;
-      if (token_enqueued[static_cast<size_t>(token)].compare_exchange_strong(
-              expected, 1, std::memory_order_relaxed, std::memory_order_relaxed)) {
+      if (token_enqueued[static_cast<size_t>(token)].compare_exchange_strong(expected, 1, std::memory_order_relaxed,
+                                                                             std::memory_order_relaxed)) {
         newly_ready.push_back(token);
       }
     }
@@ -8066,21 +8143,23 @@ at::Tensor run_fused_moe_bf16_tiled_async(
     }
   };
 
-  auto try_claim_ready_token = [&]() -> int64_t {
+  auto try_claim_ready_token_batch = [&](int64_t claim_limit) -> SplitRange {
     int64_t head = ready_token_head.load(std::memory_order_relaxed);
     while (true) {
       const int64_t tail = ready_token_tail.load(std::memory_order_acquire);
       if (head >= tail) {
-        return -1;
+        return SplitRange{};
       }
-      if (ready_token_head.compare_exchange_weak(head, head + 1, std::memory_order_relaxed,
-                                                 std::memory_order_relaxed)) {
-        break;
+      const int64_t end = std::min<int64_t>(tail, head + std::min(async_ready_token_batch, claim_limit));
+      if (ready_token_head.compare_exchange_weak(head, end, std::memory_order_relaxed, std::memory_order_relaxed)) {
+        return SplitRange{head, end - head};
       }
     }
+  };
 
+  auto load_ready_token = [&](int64_t slot) {
     int64_t token = -1;
-    while ((token = ready_token_slots[static_cast<size_t>(head)].load(std::memory_order_acquire)) < 0) {
+    while ((token = ready_token_slots[static_cast<size_t>(slot)].load(std::memory_order_acquire)) < 0) {
 #if defined(__aarch64__)
       __asm__ __volatile__("yield" ::: "memory");
 #else
@@ -8090,6 +8169,24 @@ at::Tensor run_fused_moe_bf16_tiled_async(
     return token;
   };
 
+  auto prefetch_ready_token = [&](int64_t token) {
+    if (!use_async_ready_token_prefetch) {
+      return;
+    }
+    const int64_t flat_begin = token * top_k;
+    if (use_w2_bf16_route) {
+      for (int64_t slot = 0; slot < top_k; ++slot) {
+        __builtin_prefetch(route_out_bf16_ptr + (flat_begin + slot) * H, 0, 1);
+      }
+    } else {
+      for (int64_t slot = 0; slot < top_k; ++slot) {
+        __builtin_prefetch(route_out_ptr + (flat_begin + slot) * H, 0, 1);
+      }
+    }
+    __builtin_prefetch(topk_w + flat_begin, 0, 1);
+    __builtin_prefetch(out_bf16_ptr + token * H, 1, 1);
+  };
+
   auto merge_ready_token = [&](int64_t tid, int64_t token) {
     auto worker_phase_begin = trace_phase_begin();
     merge_route_range(route_out_ptr, route_out_bf16_ptr, topk_w, out_bf16_ptr, token, token + 1, top_k, H,
@@ -8097,6 +8194,24 @@ at::Tensor run_fused_moe_bf16_tiled_async(
     token_merged[static_cast<size_t>(token)].store(1, std::memory_order_release);
     completed_ready_token_merges.fetch_add(1, std::memory_order_relaxed);
     trace_phase_end(tid, -1, -1, -1, 1, "merge_ready_token", worker_phase_begin);
+  };
+
+  auto try_merge_ready_token_batch = [&](int64_t tid, int64_t claim_limit) {
+    const SplitRange claimed = try_claim_ready_token_batch(claim_limit);
+    if (claimed.size <= 0) {
+      return false;
+    }
+    std::array<int64_t, 64> tokens{};
+    for (int64_t idx = 0; idx < claimed.size; ++idx) {
+      tokens[static_cast<size_t>(idx)] = load_ready_token(claimed.begin + idx);
+    }
+    for (int64_t idx = 0; idx < claimed.size; ++idx) {
+      if (idx + 1 < claimed.size) {
+        prefetch_ready_token(tokens[static_cast<size_t>(idx + 1)]);
+      }
+      merge_ready_token(tid, tokens[static_cast<size_t>(idx)]);
+    }
+    return true;
   };
 
   auto run_async_task = [&](int64_t tid, int64_t task_id, const AsyncTaskRuntime& task) {
@@ -8111,6 +8226,7 @@ at::Tensor run_fused_moe_bf16_tiled_async(
     const int64_t task_w2_weight_window_bytes =
         use_sve_backend && task.w2_window_bytes >= 0 ? task.w2_window_bytes : w2_weight_window_bytes;
     const auto& expert_routes = routes[static_cast<size_t>(expert)];
+    const int64_t* task_routes = expert_routes.data() + task.route_begin;
     uint16_t* a_reorder =
         scratch.a_reorder.empty() ? nullptr : scratch.a_reorder.data() + local_tid * scratch.a_reorder_stride;
 
@@ -8120,10 +8236,10 @@ at::Tensor run_fused_moe_bf16_tiled_async(
         const int64_t nb = ceil_div_int64(rows, kKernelTile);
         const SplitRange brange = split_evenly(nb, group_size, local_tid);
         if (use_sve_backend) {
-          gather_pack_a_reorder_sve_hybrid(input_ptr, H, expert_routes.data(), top_k, scratch.packed_a.data(),
+          gather_pack_a_reorder_sve_hybrid(input_ptr, H, task_routes, top_k, scratch.packed_a.data(),
                                            static_cast<int>(rows), static_cast<int>(w13.K_pad), group_size, local_tid);
         } else {
-          gather_pack_a_reorder_backend(false, input_ptr, H, expert_routes.data(), top_k, scratch.packed_a.data(),
+          gather_pack_a_reorder_backend(false, input_ptr, H, task_routes, top_k, scratch.packed_a.data(),
                                         static_cast<int>(rows), static_cast<int>(w13.K_pad),
                                         static_cast<int>(brange.begin), static_cast<int>(brange.begin + brange.size));
         }
@@ -8134,7 +8250,7 @@ at::Tensor run_fused_moe_bf16_tiled_async(
         // (was serial on local_tid==0 with the rest idle).
         const SplitRange grange = split_evenly(rows, group_size, local_tid);
         for (int64_t m = grange.begin; m < grange.begin + grange.size; ++m) {
-          const int64_t flat = expert_routes[static_cast<size_t>(m)];
+          const int64_t flat = task_routes[m];
           const int64_t token = flat / top_k;
           uint16_t* dst = scratch.input.data() + m * w13.K_pad;
           std::fill(dst, dst + w13.K_pad, static_cast<uint16_t>(0));
@@ -8170,9 +8286,10 @@ at::Tensor run_fused_moe_bf16_tiled_async(
       trace_phase_end(tid, task_id, local_tid, expert, rows, "w13_fused_silu_packc", worker_phase_begin);
     } else {
       trace_dispatch_fp32_gemm_stage_split(
-          moe_trace, "w13", MoeGemmStage::kW13, tid, -1, task_id, local_tid, expert, 0, rows, scratch.input.data(),
-          w13_ptr + expert * w13.packed_stride, scratch.gate_up.data(), a_reorder, static_cast<int>(rows),
-          static_cast<int>(w13.K_pad), static_cast<int>(w13.N_pad), static_cast<int>(w13.N_pad), group_size,
+          moe_trace, "w13", MoeGemmStage::kW13, tid, -1, task_id, local_tid, expert, task.route_begin, rows,
+          scratch.input.data(), w13_ptr + expert * w13.packed_stride, scratch.gate_up.data(), a_reorder,
+          static_cast<int>(rows), static_cast<int>(w13.K_pad), static_cast<int>(w13.N_pad),
+          static_cast<int>(w13.N_pad), group_size,
           w13_bias_base != nullptr ? w13_bias_base + expert * w13.N_pad : nullptr);
     }
     barrier.wait();
@@ -8198,13 +8315,13 @@ at::Tensor run_fused_moe_bf16_tiled_async(
         if (use_w2_bf16_route) {
           team_w2_packed_sve_direct_bf16_route_backend(
               use_fused_2d_split, w2team, w2_2d_plan, scratch.intermediate.data(),
-              w2_ptr + expert * w2.packed_stride, route_out_bf16_ptr, expert_routes.data(), static_cast<int>(rows),
+              w2_ptr + expert * w2.packed_stride, route_out_bf16_ptr, task_routes, static_cast<int>(rows),
               static_cast<int>(w2.K_pad), static_cast<int>(w2.N_pad), static_cast<int>(H), w2.n_tile,
               task_w2_weight_window_bytes);
         } else {
           team_w2_packed_sve_direct_route_backend(
               use_fused_2d_split, w2team, w2_2d_plan, scratch.intermediate.data(),
-              w2_ptr + expert * w2.packed_stride, route_out_ptr, expert_routes.data(), static_cast<int>(rows),
+              w2_ptr + expert * w2.packed_stride, route_out_ptr, task_routes, static_cast<int>(rows),
               static_cast<int>(w2.K_pad), static_cast<int>(w2.N_pad), static_cast<int>(H), w2.n_tile,
               task_w2_weight_window_bytes);
         }
@@ -8223,9 +8340,10 @@ at::Tensor run_fused_moe_bf16_tiled_async(
                       worker_phase_begin);
     } else {
       trace_dispatch_fp32_gemm_stage_split(
-          moe_trace, "w2", MoeGemmStage::kW2, tid, -1, task_id, local_tid, expert, 0, rows, scratch.intermediate.data(),
-          w2_ptr + expert * w2.packed_stride, scratch.down.data(), a_reorder, static_cast<int>(rows),
-          static_cast<int>(w2.K_pad), static_cast<int>(w2.N_pad), static_cast<int>(w2.N_pad), group_size,
+          moe_trace, "w2", MoeGemmStage::kW2, tid, -1, task_id, local_tid, expert, task.route_begin, rows,
+          scratch.intermediate.data(), w2_ptr + expert * w2.packed_stride, scratch.down.data(), a_reorder,
+          static_cast<int>(rows), static_cast<int>(w2.K_pad), static_cast<int>(w2.N_pad),
+          static_cast<int>(w2.N_pad), group_size,
           w2_bias_base != nullptr ? w2_bias_base + expert * w2.N_pad : nullptr);
     }
     if (!use_w2_direct_route && !use_w2_n_owner_scatter) {
@@ -8242,7 +8360,7 @@ at::Tensor run_fused_moe_bf16_tiled_async(
                                     return;
                                   }
                                   for (int64_t m = 0; m < rows; ++m) {
-                                    const int64_t flat = expert_routes[static_cast<size_t>(m)];
+                                    const int64_t flat = task_routes[m];
                                     if (use_w2_bf16_route) {
                                       const uint16_t* src = scratch.down_bf16.data() + m * w2.N_pad;
                                       uint16_t* dst = route_out_bf16_ptr + flat * H;
@@ -8267,11 +8385,16 @@ at::Tensor run_fused_moe_bf16_tiled_async(
       for (const int64_t child : successors[static_cast<size_t>(task_id)]) {
         deps_remaining[static_cast<size_t>(child)].fetch_sub(1);
       }
-      if (use_async_ready_token_merge) {
+      const bool expert_finished =
+          expert_slices_remaining[static_cast<size_t>(expert)].fetch_sub(1, std::memory_order_acq_rel) == 1;
+      if (expert_finished) {
+        expert_completed[static_cast<size_t>(expert)].store(1, std::memory_order_release);
+      }
+      if (use_async_ready_token_merge && expert_finished) {
         // The preceding acquire/release team barrier makes every N owner's W2
-        // stores visible before this expert publishes ready tokens. The global
-        // RMW chain guarantees that the last TopK expert observes prior expert
-        // state stores before it checks token readiness.
+        // stores visible before the last route slice publishes this expert.
+        // The slice counter and global RMW chain make prior slice/expert stores
+        // visible before token readiness is checked.
         expert_publication_epoch.fetch_add(1, std::memory_order_acq_rel);
         publish_ready_tokens(task_id, expert_routes);
       }
@@ -8999,44 +9122,56 @@ at::Tensor run_fused_moe_bf16_tiled_async(
     }
   } else if (!use_async_short_pool) {
     run_fixed_threads(num_threads, [&](int64_t tid) {
-      while (completed_tasks.load() < num_tasks) {
+      while (true) {
+        const bool compute_complete = completed_tasks.load(std::memory_order_acquire) >= num_tasks;
         int64_t selected_task = -1;
-        for (int64_t task_id = 0; task_id < num_tasks; ++task_id) {
-          const AsyncTaskRuntime& task = tasks[static_cast<size_t>(task_id)];
-          if (tid < task.core_begin || tid >= task.core_begin + task.threads) {
-            continue;
-          }
-          int64_t state = task_states[static_cast<size_t>(task_id)].load();
-          if (state == 2) {
-            continue;
-          }
-          if (state == 0) {
-            if (deps_remaining[static_cast<size_t>(task_id)].load() != 0) {
+        if (!compute_complete) {
+          for (int64_t task_id = 0; task_id < num_tasks; ++task_id) {
+            const AsyncTaskRuntime& task = tasks[static_cast<size_t>(task_id)];
+            if (tid < task.core_begin || tid >= task.core_begin + task.threads) {
               continue;
             }
-            int64_t expected = 0;
-            if (!task_states[static_cast<size_t>(task_id)].compare_exchange_strong(expected, 1)) {
-              state = expected;
-              if (state != 1) {
+            int64_t state = task_states[static_cast<size_t>(task_id)].load();
+            if (state == 2) {
+              continue;
+            }
+            if (state == 0) {
+              if (deps_remaining[static_cast<size_t>(task_id)].load() != 0) {
                 continue;
               }
+              int64_t expected = 0;
+              if (!task_states[static_cast<size_t>(task_id)].compare_exchange_strong(expected, 1)) {
+                state = expected;
+                if (state != 1) {
+                  continue;
+                }
+              }
             }
+            selected_task = task_id;
+            break;
           }
-          selected_task = task_id;
-          break;
         }
         if (selected_task >= 0) {
           run_async_task(tid, selected_task, tasks[static_cast<size_t>(selected_task)]);
-        } else if (use_async_ready_token_merge) {
-          const int64_t token = try_claim_ready_token();
-          if (token >= 0) {
-            merge_ready_token(tid, token);
-          } else {
-            std::this_thread::yield();
-          }
-        } else {
-          std::this_thread::yield();
+          continue;
         }
+        if (compute_complete && !use_async_ready_token_drain) {
+          break;
+        }
+        if (use_async_ready_token_merge &&
+            try_merge_ready_token_batch(tid, compute_complete ? async_ready_token_batch : 1)) {
+          continue;
+        }
+        if (compute_complete && use_async_ready_token_drain) {
+          TORCH_INTERNAL_ASSERT(ready_token_tail.load(std::memory_order_acquire) == num_tokens,
+                                "unified ready-token merge is missing published tokens: published=",
+                                ready_token_tail.load(std::memory_order_relaxed), " expected=", num_tokens);
+        }
+        if (compute_complete && (!use_async_ready_token_drain ||
+                                 completed_ready_token_merges.load(std::memory_order_acquire) >= num_tokens)) {
+          break;
+        }
+        std::this_thread::yield();
       }
     });
   } else {
@@ -9044,8 +9179,7 @@ at::Tensor run_fused_moe_bf16_tiled_async(
       const int64_t short_pool_group = tid / async_short_pool_threads;
       const int64_t short_pool_local_tid = tid % async_short_pool_threads;
       const int64_t short_pool_core_begin = short_pool_group * async_short_pool_threads;
-      const int64_t short_pool_scratch_idx =
-          short_pool_scratch_indices[static_cast<size_t>(short_pool_group)];
+      const int64_t short_pool_scratch_idx = short_pool_scratch_indices[static_cast<size_t>(short_pool_group)];
       ScheduledTeamScratch& short_pool_scratch = *scratches[static_cast<size_t>(short_pool_scratch_idx)];
 
       // A group joins the short queue only after every wider task covering
@@ -9102,20 +9236,17 @@ at::Tensor run_fused_moe_bf16_tiled_async(
       while (true) {
         if (short_pool_local_tid == 0) {
           const int64_t queue_idx = next_short_pool_task.fetch_add(1, std::memory_order_relaxed);
-          const int64_t task_id =
-              queue_idx < static_cast<int64_t>(short_pool_task_ids.size())
-                  ? short_pool_task_ids[static_cast<size_t>(queue_idx)]
-                  : -1;
+          const int64_t task_id = queue_idx < static_cast<int64_t>(short_pool_task_ids.size())
+                                      ? short_pool_task_ids[static_cast<size_t>(queue_idx)]
+                                      : -1;
           if (task_id >= 0) {
             int64_t expected = 0;
             const bool claimed = task_states[static_cast<size_t>(task_id)].compare_exchange_strong(
                 expected, 1, std::memory_order_acq_rel, std::memory_order_acquire);
-            TORCH_INTERNAL_ASSERT(claimed, "short-pool task was already claimed: task=", task_id,
-                                  " state=", expected);
+            TORCH_INTERNAL_ASSERT(claimed, "short-pool task was already claimed: task=", task_id, " state=", expected);
             ++short_pool_tasks_by_group[static_cast<size_t>(short_pool_group)];
           }
-          short_pool_current_tasks[static_cast<size_t>(short_pool_group)].store(task_id,
-                                                                                std::memory_order_release);
+          short_pool_current_tasks[static_cast<size_t>(short_pool_group)].store(task_id, std::memory_order_release);
         }
         short_pool_scratch.barrier.wait();
 
@@ -9125,25 +9256,47 @@ at::Tensor run_fused_moe_bf16_tiled_async(
           break;
         }
         const AsyncTaskRuntime& base_task = tasks[static_cast<size_t>(task_id)];
-        const AsyncTaskRuntime pooled_task{base_task.expert, base_task.rows, short_pool_core_begin,
-                                           async_short_pool_threads, short_pool_scratch_idx,
+        const AsyncTaskRuntime pooled_task{base_task.expert,           base_task.route_begin,    base_task.rows,
+                                           short_pool_core_begin,      async_short_pool_threads, short_pool_scratch_idx,
                                            base_task.w13_window_bytes, base_task.w2_window_bytes};
         run_async_task(tid, task_id, pooled_task);
       }
 
-      while (completed_tasks.load(std::memory_order_acquire) < num_tasks) {
-        if (use_async_ready_token_merge) {
-          const int64_t token = try_claim_ready_token();
-          if (token >= 0) {
-            merge_ready_token(tid, token);
-            continue;
-          }
+      while (true) {
+        const bool compute_complete = completed_tasks.load(std::memory_order_acquire) >= num_tasks;
+        if (compute_complete && !use_async_ready_token_drain) {
+          break;
+        }
+        if (use_async_ready_token_merge &&
+            try_merge_ready_token_batch(tid, compute_complete ? async_ready_token_batch : 1)) {
+          continue;
+        }
+        if (compute_complete && use_async_ready_token_drain) {
+          TORCH_INTERNAL_ASSERT(ready_token_tail.load(std::memory_order_acquire) == num_tokens,
+                                "unified ready-token merge is missing published tokens: published=",
+                                ready_token_tail.load(std::memory_order_relaxed), " expected=", num_tokens);
+        }
+        if (compute_complete && (!use_async_ready_token_drain ||
+                                 completed_ready_token_merges.load(std::memory_order_acquire) >= num_tokens)) {
+          break;
         }
         std::this_thread::yield();
       }
     });
   }
+  TORCH_INTERNAL_ASSERT(
+      !use_async_ready_token_drain || completed_ready_token_merges.load(std::memory_order_acquire) == num_tokens,
+      "unified ready-token merge exited before draining every token");
   trace_phase_end(-1, -1, -1, -1, num_routes, "scheduled_compute", phase_begin);
+  if (use_async_ready_token_merge && env_flag_enabled("FUSED_CPP_MOE_STAGE_TIMING")) {
+    const int64_t merged_in_worker_job = completed_ready_token_merges.load(std::memory_order_acquire);
+    std::fprintf(stderr,
+                 "[fused_moe_bf16_tiled_async][ready_token] same_job_drain=%d batch=%lld "
+                 "prefetch=%d merged_in_worker_job=%lld remaining_for_final=%lld\n",
+                 use_async_ready_token_drain ? 1 : 0, static_cast<long long>(async_ready_token_batch),
+                 use_async_ready_token_prefetch ? 1 : 0, static_cast<long long>(merged_in_worker_job),
+                 static_cast<long long>(num_tokens - merged_in_worker_job));
+  }
   if (use_async_short_pool && env_flag_enabled("FUSED_CPP_MOE_STAGE_TIMING")) {
     std::fprintf(stderr,
                  "[fused_moe_bf16_tiled_async][short_pool] threads=%lld "
@@ -9235,7 +9388,8 @@ at::Tensor fused_moe_bf16_tiled_async_plan_v2(
     std::string activation, int64_t global_num_experts, bool skip_weighted, bool fuse_silu,
     int64_t silu_poly_degree, int64_t gemm_backend, int64_t backend_n_tile, int64_t w13_split,
     int64_t weight_window_bytes, c10::optional<at::Tensor> out,
-    c10::optional<at::Tensor> task_w13_window_bytes, c10::optional<at::Tensor> task_w2_window_bytes) {
+    c10::optional<at::Tensor> task_w13_window_bytes, c10::optional<at::Tensor> task_w2_window_bytes,
+    int64_t early_merge) {
   TORCH_CHECK(execution_mode != kAsyncExecutionElastic,
               "elastic Plan V2 requires fused_moe_bf16_tiled_async_plan_v2_elastic");
   const AsyncPlanV2NativeArgs plan_v2{
@@ -9256,6 +9410,7 @@ at::Tensor fused_moe_bf16_tiled_async_plan_v2(
       c10::nullopt,
       c10::nullopt,
       c10::nullopt,
+      early_merge,
   };
   return run_fused_moe_bf16_tiled_async(
       std::move(input), std::move(w13_packed), w13_K, w13_N, std::move(w2_packed), w2_K, w2_N,
@@ -9281,7 +9436,8 @@ at::Tensor fused_moe_bf16_tiled_async_plan_v2_elastic(
     c10::optional<at::Tensor> task_w13_window_bytes, c10::optional<at::Tensor> task_w2_window_bytes,
     c10::optional<at::Tensor> task_resize_timeout_ns,
     c10::optional<at::Tensor> elastic_stats_out,
-    c10::optional<at::Tensor> task_preferred_core_begins) {
+    c10::optional<at::Tensor> task_preferred_core_begins,
+    int64_t early_merge) {
   TORCH_CHECK(execution_mode == kAsyncExecutionElastic, "elastic Plan V2 entry point requires execution_mode=",
               kAsyncExecutionElastic, ", got ", execution_mode);
   const AsyncPlanV2NativeArgs plan_v2{
@@ -9302,6 +9458,7 @@ at::Tensor fused_moe_bf16_tiled_async_plan_v2_elastic(
       std::move(task_resize_timeout_ns),
       std::move(task_preferred_core_begins),
       std::move(elastic_stats_out),
+      early_merge,
   };
   return run_fused_moe_bf16_tiled_async(
       std::move(input), std::move(w13_packed), w13_K, w13_N, std::move(w2_packed), w2_K, w2_N,
@@ -9415,7 +9572,7 @@ PlannedStageRuntime build_planned_stage_runtime(
       runtime.pool_task_ids.push_back(task);
       max_pool_rows = std::max(max_pool_rows, rows);
       runtime.tasks[static_cast<size_t>(task)] =
-          AsyncTaskRuntime{expert, rows, -1, runtime.pool_threads, -1, is_w13 ? window_bytes : -1,
+          AsyncTaskRuntime{expert, 0, rows, -1, runtime.pool_threads, -1, is_w13 ? window_bytes : -1,
                            is_w13 ? -1 : window_bytes};
       continue;
     }
@@ -9427,7 +9584,7 @@ PlannedStageRuntime build_planned_stage_runtime(
                 " num_threads=", num_threads);
     const int64_t scratch_index = ensure_scratch(core_begin, threads, rows, is_w13);
     runtime.tasks[static_cast<size_t>(task)] =
-        AsyncTaskRuntime{expert, rows, core_begin, threads, scratch_index, is_w13 ? window_bytes : -1,
+        AsyncTaskRuntime{expert, 0, rows, core_begin, threads, scratch_index, is_w13 ? window_bytes : -1,
                          is_w13 ? -1 : window_bytes};
   }
   for (size_t expert = 0; expert < routes.size(); ++expert) {
@@ -9640,8 +9797,9 @@ void execute_planned_stage(int64_t num_threads, const PlannedStageRuntime& runti
         break;
       }
       const AsyncTaskRuntime& base = runtime.tasks[static_cast<size_t>(task_id)];
-      const AsyncTaskRuntime pooled{base.expert, base.rows, core_begin, runtime.pool_threads, scratch_index,
-                                    base.w13_window_bytes, base.w2_window_bytes};
+      const AsyncTaskRuntime pooled{base.expert, base.route_begin, base.rows, core_begin,
+                                    runtime.pool_threads, scratch_index, base.w13_window_bytes,
+                                    base.w2_window_bytes};
       run_and_complete(tid, task_id, pooled);
     }
     while (completed_tasks.load(std::memory_order_acquire) < num_tasks) {

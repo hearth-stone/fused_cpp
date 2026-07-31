@@ -349,6 +349,95 @@ def test_sve_m12_silu_and_w2_bf16_route_match_legacy_for_unit_top1(
                 )
 
 
+def test_sve_plan_v2_route_slices_match_full_experts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Concurrent route slices must preserve full-expert output and completion."""
+    if "arm_sve_bf16" not in available_fused_moe_bf16_tiled_backends():
+        pytest.skip("requires an SVE BF16 build/runtime")
+    monkeypatch.setenv("FUSED_CPP_MOE_SVE", "1")
+    monkeypatch.setenv("FUSED_CPP_MOE_ASYNC_READY_TOKEN_MERGE", "1")
+    generator = torch.Generator().manual_seed(20260730)
+    hidden_size = 64
+    ffn_hidden_size = 32
+    route_counts = [48, 24]
+    num_tokens = sum(route_counts)
+    hidden_states = _bf16_normal(
+        (num_tokens, hidden_size),
+        generator=generator,
+        std=0.01,
+    )
+    w13_weight = _bf16_normal(
+        (len(route_counts), 2 * ffn_hidden_size, hidden_size),
+        generator=generator,
+        std=0.01,
+    )
+    w2_weight = _bf16_normal(
+        (len(route_counts), hidden_size, ffn_hidden_size),
+        generator=generator,
+        std=0.01,
+    )
+    topk_ids = torch.cat(
+        [torch.full((count,), expert, dtype=torch.int32) for expert, count in enumerate(route_counts)]
+    ).reshape(num_tokens, 1)
+    topk_weights = torch.ones((num_tokens, 1), dtype=torch.float32)
+    packed = prepare_fused_moe_bf16_tiled_weights(
+        w13_weight,
+        w2_weight,
+        fuse_silu=True,
+        backend="sve",
+    )
+    if hasattr(os, "sched_getaffinity"):
+        cpu_ids = sorted(os.sched_getaffinity(0))[:4]
+    else:
+        cpu_ids = list(range(4))
+    if len(cpu_ids) < 4:
+        pytest.skip("requires four available CPUs")
+
+    full_bridge = upgrade_legacy_async_plan(
+        {
+            "num_threads": 4,
+            "thread_cpu_ids": cpu_ids,
+            "task_expert_ids": [0, 1],
+            "task_core_begins": [0, 2],
+            "task_threads": [2, 2],
+            "task_dep_offsets": [0, 0, 0],
+            "task_deps": [],
+        }
+    )
+    sliced_bridge = upgrade_legacy_async_plan(
+        {
+            "num_threads": 4,
+            "thread_cpu_ids": cpu_ids,
+            "task_expert_ids": [0, 0, 1, 1],
+            "task_core_begins": [0, 1, 2, 3],
+            "task_threads": [1, 1, 1, 1],
+            "task_dep_offsets": [0, 0, 0, 0, 0],
+            "task_deps": [],
+        }
+    )
+    sliced_bridge["task_range_granularities"] = [24, 24, 12, 12]
+
+    full = fused_moe_bf16_tiled_async_plan(
+        hidden_states,
+        packed,
+        topk_weights,
+        topk_ids,
+        AsyncMoEPlanV2.from_dict(full_bridge),
+        w13_split=True,
+    )
+    sliced = fused_moe_bf16_tiled_async_plan(
+        hidden_states,
+        packed,
+        topk_weights,
+        topk_ids,
+        AsyncMoEPlanV2.from_dict(sliced_bridge),
+        w13_split=True,
+    )
+
+    torch.testing.assert_close(sliced.float(), full.float(), atol=0, rtol=0)
+
+
 def test_sve_plan_v2_strict_and_tail_pool_match_legacy_async(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1468,24 +1557,62 @@ def test_async_ready_token_merge_overlaps_imbalanced_experts(
         )
 
     ready_flag = "FUSED_CPP_MOE_ASYNC_READY_TOKEN_MERGE"
+    drain_flag = "FUSED_CPP_MOE_ASYNC_READY_TOKEN_DRAIN"
+    batch_flag = "FUSED_CPP_MOE_ASYNC_READY_TOKEN_BATCH"
+    prefetch_flag = "FUSED_CPP_MOE_ASYNC_READY_TOKEN_PREFETCH"
     monkeypatch.setenv(ready_flag, "0")
     reference = run()
     monkeypatch.setenv(ready_flag, "1")
+    monkeypatch.setenv(drain_flag, "0")
+    monkeypatch.setenv(batch_flag, "1")
+    monkeypatch.setenv(prefetch_flag, "0")
+    legacy = run()
+    torch.testing.assert_close(legacy.float(), reference.float(), atol=0, rtol=0)
+
+    def trace_stages(path: Path) -> list[str]:
+        return [
+            field.split("=", 1)[1]
+            for line in path.read_text().splitlines()
+            if line.startswith("PHASE ")
+            for field in line.split()
+            if field.startswith("stage=")
+        ]
+
+    legacy_trace_path = tmp_path / "async_ready_token_merge_legacy.log"
+    monkeypatch.setenv("FUSED_CPP_MOE_TRACE", "1")
+    monkeypatch.setenv("FUSED_CPP_MOE_TRACE_FILE", str(legacy_trace_path))
+    traced_legacy = run()
+    monkeypatch.setenv("FUSED_CPP_MOE_TRACE", "0")
+    torch.testing.assert_close(traced_legacy.float(), reference.float(), atol=0, rtol=0)
+    assert "merge_routes" in trace_stages(legacy_trace_path)
+
+    monkeypatch.setenv(drain_flag, "1")
+    monkeypatch.setenv(batch_flag, "7")
+    monkeypatch.setenv(prefetch_flag, "1")
     for _ in range(5):
         candidate = run()
         torch.testing.assert_close(candidate.float(), reference.float(), atol=0, rtol=0)
 
     monkeypatch.delenv(ready_flag)
+    monkeypatch.delenv(drain_flag)
+    monkeypatch.delenv(batch_flag)
+    monkeypatch.delenv(prefetch_flag)
     default = run()
     torch.testing.assert_close(default.float(), candidate.float(), atol=0, rtol=0)
 
     trace_path = tmp_path / "async_ready_token_merge.log"
+    monkeypatch.setenv(ready_flag, "1")
+    monkeypatch.setenv(drain_flag, "1")
+    monkeypatch.setenv(batch_flag, "7")
+    monkeypatch.setenv(prefetch_flag, "1")
     monkeypatch.setenv("FUSED_CPP_MOE_TRACE", "1")
     monkeypatch.setenv("FUSED_CPP_MOE_TRACE_FILE", str(trace_path))
     traced = run()
     monkeypatch.setenv("FUSED_CPP_MOE_TRACE", "0")
     torch.testing.assert_close(traced.float(), reference.float(), atol=0, rtol=0)
-    assert "stage=merge_ready_token" in trace_path.read_text()
+    phase_stages = trace_stages(trace_path)
+    assert phase_stages.count("merge_ready_token") == num_tokens
+    assert "merge_routes" not in phase_stages
 
 
 @pytest.mark.parametrize("bridge", ["scheduled", "async"])

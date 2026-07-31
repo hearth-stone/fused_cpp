@@ -109,6 +109,10 @@ class ContentionCostModel:
         p90_curves: dict[tuple[int, ...], dict[int, float]] = {}
         full_call_p10_curves: dict[tuple[int, ...], dict[int, float]] = {}
         full_call_p90_curves: dict[tuple[int, ...], dict[int, float]] = {}
+        tail_repartition_median: dict[tuple[tuple[int, ...], int, int], dict[int, float]] = {}
+        tail_repartition_p10: dict[tuple[tuple[int, ...], int, int], dict[int, float]] = {}
+        tail_repartition_p90: dict[tuple[tuple[int, ...], int, int], dict[int, float]] = {}
+        tail_repartition_runs: dict[tuple[tuple[int, ...], int, int], dict[int, int]] = {}
         for entry in prof["entries"]:
             n = int(entry["distinct_experts"])
             routes = int(entry["routes"])
@@ -138,6 +142,30 @@ class ContentionCostModel:
                         entry.get("full_call_median_ns", entry["makespan_ns"]),
                     )
                 )
+        tail_calibration = prof.get("bounded_tail_repartition", {})
+        for entry in tail_calibration.get("entries", []):
+            root_shape = tuple(int(value) for value in entry["root_shape"])
+            tail_width = int(entry["tail_width"])
+            route_slices = int(entry.get("route_slices", 1))
+            routes = int(entry["routes"])
+            median = float(entry["median_ns"])
+            p10 = float(entry.get("p10_ns", median))
+            p90 = float(entry.get("p90_ns", median))
+            runs = int(entry.get("num_iters", 1))
+            if not root_shape or min(root_shape) <= 0 or min(tail_width, route_slices, routes, runs) <= 0:
+                raise ValueError("bounded-tail calibration dimensions must be positive")
+            if not 0.0 <= p10 <= median <= p90:
+                raise ValueError("bounded-tail calibration requires p10 <= median <= p90")
+            key = (root_shape, tail_width, route_slices)
+            if routes in tail_repartition_median.get(key, {}):
+                raise ValueError(
+                    f"duplicate bounded-tail calibration for root_shape={root_shape}, "
+                    f"tail_width={tail_width}, route_slices={route_slices}, routes={routes}"
+                )
+            tail_repartition_median.setdefault(key, {})[routes] = median
+            tail_repartition_p10.setdefault(key, {})[routes] = p10
+            tail_repartition_p90.setdefault(key, {})[routes] = p90
+            tail_repartition_runs.setdefault(key, {})[routes] = runs
         self._derate2d = {
             n: {routes: statistics.median(values) for routes, values in curve.items()} for n, curve in d2.items()
         }
@@ -158,6 +186,10 @@ class ContentionCostModel:
         self._p90_curves = p90_curves
         self._full_call_p10_curves = full_call_p10_curves
         self._full_call_p90_curves = full_call_p90_curves
+        self._tail_repartition_median = tail_repartition_median
+        self._tail_repartition_p10 = tail_repartition_p10
+        self._tail_repartition_p90 = tail_repartition_p90
+        self._tail_repartition_runs = tail_repartition_runs
         self._dn = sorted(self._derate2d)
         self._dr = sorted({routes for curve in self._derate2d.values() for routes in curve})
         self._shape_keys = tuple(sorted(self._derate_shape))
@@ -398,6 +430,22 @@ class ContentionCostModel:
             "p90_curves": self._native_shape_curve_rows(self._p90_curves),
             "full_call_p10_curves": self._native_shape_curve_rows(self._full_call_p10_curves),
             "full_call_p90_curves": self._native_shape_curve_rows(self._full_call_p90_curves),
+            "tail_repartition_anchors": [
+                (
+                    list(root_shape),
+                    tail_width,
+                    route_slices,
+                    routes,
+                    self._tail_repartition_median[(root_shape, tail_width, route_slices)][routes],
+                    self._tail_repartition_p10[(root_shape, tail_width, route_slices)][routes],
+                    self._tail_repartition_p90[(root_shape, tail_width, route_slices)][routes],
+                    self._tail_repartition_runs[(root_shape, tail_width, route_slices)][routes],
+                )
+                for root_shape, tail_width, route_slices in sorted(self._tail_repartition_median)
+                for routes in sorted(
+                    self._tail_repartition_median[(root_shape, tail_width, route_slices)]
+                )
+            ],
         }
 
     @property
@@ -471,12 +519,25 @@ class ContentionCostModel:
             return self._raw_iso_interp(routes, threads)
         return self._interp_linear(bulk_curve, routes)
 
+    def _supports_formula_only_width(self, routes: int, threads: int) -> bool:
+        return (
+            self.iso_formula is not None
+            and self.iso_formula.min_threads <= threads <= self.iso_formula.max_threads
+            and routes >= 36
+            and routes % 12 == 0
+        )
+
+    def _overhead(self, threads: int) -> float:
+        if self.iso_formula is not None:
+            return self.iso_formula.O(threads)
+        return self._O.get(threads, 0.0)
+
     def T_iso(self, routes: int, threads: int) -> float:
         routes = int(routes)
         threads = int(threads)
         if routes <= 0:
             return 0.0
-        if threads not in self._iso_routes:
+        if threads not in self._iso_routes and not self._supports_formula_only_width(routes, threads):
             raise KeyError(f"no isolated calibration for threads={threads}")
         if self.iso_formula is not None:
             return self._formula_iso(routes, threads)
@@ -487,7 +548,7 @@ class ContentionCostModel:
 
         blocks, remainder = divmod(routes, 12)
         tail = self.m12_tail_capacity(remainder)
-        overhead = self._O.get(threads, 0.0)
+        overhead = self._overhead(threads)
         if blocks == 0:
             return self._raw_iso_interp(tail, threads)
         base = self._bulk_iso(blocks * 12, threads)
@@ -534,6 +595,68 @@ class ContentionCostModel:
             raise ProfileCompatibilityError(f"shape {signature} was not measured in {self.profile_path.name}")
         effective = self.m12_effective_rows(routes)
         return self._interp_linear(curve, effective)
+
+    def can_use_bounded_tail_repartition_anchor(
+        self,
+        routes: int,
+        root_shape,
+        tail_width: int,
+        route_slices: int = 1,
+    ) -> bool:
+        """Return whether an exact placement-aware bounded-tail anchor exists."""
+        root_shape = tuple(int(value) for value in root_shape)
+        tail_width = int(tail_width)
+        route_slices = int(route_slices)
+        if route_slices <= 0:
+            return False
+        effective = self.m12_effective_rows(routes)
+        curve = self._tail_repartition_median.get((root_shape, tail_width, route_slices))
+        if curve is None or effective not in curve:
+            return False
+        if self.task_stage_window_policy is None:
+            return True
+        if effective % route_slices != 0:
+            return False
+        tail_routes = effective // route_slices
+        return (
+            all(
+                self.task_stage_window_policy.select(effective, threads) == (-1, -1)
+                for threads in root_shape
+            )
+            and self.task_stage_window_policy.select(tail_routes, tail_width) == (-1, -1)
+        )
+
+    def profiled_bounded_tail_repartition(
+        self,
+        routes: int,
+        root_shape,
+        tail_width: int,
+        route_slices: int = 1,
+    ) -> tuple[float, float]:
+        """Return an exact bounded-tail median and calibration uncertainty."""
+        root_shape = tuple(int(value) for value in root_shape)
+        tail_width = int(tail_width)
+        route_slices = int(route_slices)
+        effective = self.m12_effective_rows(routes)
+        if not self.can_use_bounded_tail_repartition_anchor(
+            effective,
+            root_shape,
+            tail_width,
+            route_slices,
+        ):
+            raise ProfileCompatibilityError(
+                "bounded-tail layout was not measured for "
+                f"root_shape={root_shape}, tail_width={tail_width}, "
+                f"route_slices={route_slices}, routes={effective} "
+                f"in {self.profile_path.name}"
+            )
+        key = (root_shape, tail_width, route_slices)
+        median = self._tail_repartition_median[key][effective]
+        p10 = self._tail_repartition_p10[key][effective]
+        p90 = self._tail_repartition_p90[key][effective]
+        runs = self._tail_repartition_runs[key][effective]
+        uncertainty = max(median - p10, p90 - median, 0.0) / math.sqrt(runs)
+        return median, uncertainty
 
     def profiled_group_interval(self, routes: int, shape) -> tuple[float, float]:
         signature = self._shape_signature(shape)
@@ -641,7 +764,7 @@ class ContentionCostModel:
         isolated = self.T_iso(routes, threads)
         if isolated <= 0:
             return 0.0
-        return min(self._O.get(threads, 0.0) / isolated, 0.9)
+        return min(self._overhead(threads) / isolated, 0.9)
 
     def scalar_makespan(self, tasks) -> float:
         derate = self.derate(
@@ -666,13 +789,14 @@ class ContentionCostModel:
         started = [dependency_count[index] == 0 for index in range(count)]
         return dependency_count, successors, started
 
-    def _sim_flat(self, tasks) -> float:
+    def _sim_flat_result(self, tasks) -> tuple[float, tuple[float, ...]]:
         count = len(tasks)
         routes = [value for value, _, _ in tasks]
         threads = [value for _, value, _ in tasks]
         remaining = [self.T_iso(route_count, team) for route_count, team, _ in tasks]
         dependency_count, successors, started = self._dag_state(tasks)
         finished = [False] * count
+        finish_times = [0.0] * count
         wall = self.call_setup_ns
         guard = 0
         while not all(finished):
@@ -700,15 +824,19 @@ class ContentionCostModel:
             for index in active:
                 if remaining[index] <= 1e-6:
                     finished[index] = True
+                    finish_times[index] = wall
                     for successor in successors[index]:
                         dependency_count[successor] -= 1
                         if dependency_count[successor] == 0:
                             started[successor] = True
-        return wall
+        return wall, tuple(finish_times)
+
+    def _sim_flat(self, tasks) -> float:
+        return self._sim_flat_result(tasks)[0]
 
     def _task_phases(self, routes: int, threads: int) -> list[tuple[float, int]]:
         isolated = self.T_iso(routes, threads)
-        overhead = min(self._O.get(threads, 0.0), isolated * 0.9)
+        overhead = min(self._overhead(threads), isolated * 0.9)
         compute = max(isolated - overhead, 0.0)
         phases: list[tuple[float, int]] = []
         if overhead > 0:
@@ -726,7 +854,7 @@ class ContentionCostModel:
 
     def _task_stage_phases(self, stage: str, routes: int, threads: int) -> list[tuple[float, int]]:
         isolated = self.T_iso(routes, threads)
-        overhead = min(self._O.get(threads, 0.0), isolated * 0.9)
+        overhead = min(self._overhead(threads), isolated * 0.9)
         compute = max(isolated - overhead, 0.0)
         w13_ranges, w13_bytes, w2_ranges, w2_bytes = self._task_stage_geometry(routes, threads)
         phases: list[tuple[float, int]] = []
@@ -772,7 +900,7 @@ class ContentionCostModel:
             max(threads[index] for index in compute_active),
         )
 
-    def _sim_phases(self, tasks, phase_builder, *, setup_ns: float) -> float:
+    def _sim_phases_result(self, tasks, phase_builder, *, setup_ns: float) -> tuple[float, tuple[float, ...]]:
         count = len(tasks)
         routes = [int(value) for value, _, _ in tasks]
         threads = [int(value) for _, value, _ in tasks]
@@ -781,6 +909,7 @@ class ContentionCostModel:
         remaining = [task_phases[0][0] for task_phases in phases]
         dependency_count, successors, started = self._dag_state(tasks)
         finished = [False] * count
+        finish_times = [0.0] * count
         wall = setup_ns
         guard = 0
         max_events = sum(len(task_phases) for task_phases in phases) + count + 2
@@ -807,11 +936,15 @@ class ContentionCostModel:
                     remaining[index] = phases[index][phase_index[index]][0]
                     continue
                 finished[index] = True
+                finish_times[index] = wall
                 for successor in successors[index]:
                     dependency_count[successor] -= 1
                     if dependency_count[successor] == 0:
                         started[successor] = True
-        return wall
+        return wall, tuple(finish_times)
+
+    def _sim_phases(self, tasks, phase_builder, *, setup_ns: float) -> float:
+        return self._sim_phases_result(tasks, phase_builder, setup_ns=setup_ns)[0]
 
     def _sim_staged(self, tasks) -> float:
         return self._sim_phases(tasks, self._task_phases, setup_ns=self.call_setup_ns)
@@ -923,6 +1056,16 @@ class ContentionCostModel:
         if self.use_stage_model and self.max_stage_bytes > 0:
             return self._sim_staged(tasks)
         return self._sim_flat(tasks)
+
+    def dag_task_finish_times(self, tasks) -> tuple[float, ...]:
+        """Return task completion timestamps from the active DAG simulator."""
+        if self.use_stage_model and self.max_stage_bytes > 0:
+            return self._sim_phases_result(
+                tasks,
+                self._task_phases,
+                setup_ns=self.call_setup_ns,
+            )[1]
+        return self._sim_flat_result(tasks)[1]
 
 
 if __name__ == "__main__":

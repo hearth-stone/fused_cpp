@@ -87,6 +87,23 @@ window supersedes legacy W13 splitting and applies to both W13 and W2.
     "phi_pts": [[1, 1.0], [2, 0.51], [4, 0.26], [8, 0.13]],
     "thread_domain": [1, 32]
   },
+  "bounded_tail_repartition": {
+    "kind": "exact_layout_full_call_anchor",
+    "objective": "fused_moe_full_call_ns",
+    "extension_sha256": "...",
+    "root_core_begins": [0, 16, 32, 48, 64, 80],
+    "tail_core_begins": [0, 48],
+    "entries": [{
+      "root_shape": [16, 16, 16, 16, 16, 16],
+      "tail_width": 24,
+      "route_slices": 1,
+      "routes": 1536,
+      "median_ns": 9796654,
+      "p10_ns": 9683675,
+      "p90_ns": 9909612,
+      "num_iters": 101
+    }]
+  },
   "isolated": [],
   "entries": []
 }
@@ -192,6 +209,27 @@ full-rank workload. `makespan_ns` remains a normalized diagnostic; it must not
 be multiplied by an arbitrary number of waves. For a positive window, the
 stage-aware simulator emits `w13_window_ranges` W13 phases and
 `w2_window_ranges` W2 phases using their actual maximum range bytes.
+
+`bounded_tail_repartition` is an optional, placement-aware full-call anchor for
+the terminal repartitions supported by the production planner. Unlike a
+contention `shape`, its `root_shape` preserves lane order; `root_core_begins`
+and `tail_core_begins` bind the physical interval layout. `route_slices`
+defaults to `1`. A value greater than one means each of the two terminal
+experts is divided into that many contiguous M/route slices, placed in grouped
+expert order; such candidates require an exact anchor and are never estimated
+by the generic DAG model. The model consumes an entry only when all active
+experts have exactly the recorded route count, the strict root shape, tail
+width, route-slice count, and stage-window policy match the measured geometry.
+Route interpolation and extrapolation are intentionally forbidden. Unmatched
+unsliced workloads continue through the analytical stage/DAG simulator;
+unmatched sliced candidates are pruned.
+
+The anchor is separate from `T_iso`: it corrects effects that a width-only
+contention signature cannot identify, such as equal-width tail teams placed on
+specific core intervals or two teams simultaneously scanning one expert's
+packed weights. `p10_ns`, `p90_ns`, and `num_iters` provide the candidate
+uncertainty; the source result and extension hash must identify the exact
+binary and measurement run that produced it.
 
 ### Explainable `T_iso` roofline shadow report
 
