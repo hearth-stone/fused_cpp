@@ -3526,6 +3526,8 @@ struct MoeTraceConfig {
 
 struct MoeGemmTraceRecord {
   uint64_t seq = 0;
+  ::fused_cpp::profile::TimePoint begin_time;
+  ::fused_cpp::profile::TimePoint end_time;
   int64_t tid = -1;
   int64_t cpu = -1;
   int64_t affinity_first_cpu = -1;
@@ -3548,6 +3550,8 @@ struct MoeGemmTraceRecord {
 
 struct MoePhaseTraceRecord {
   uint64_t seq = 0;
+  ::fused_cpp::profile::TimePoint begin_time;
+  ::fused_cpp::profile::TimePoint end_time;
   int64_t tid = -1;
   int64_t cpu = -1;
   int64_t affinity_first_cpu = -1;
@@ -3561,6 +3565,18 @@ struct MoePhaseTraceRecord {
   double start_ms = 0.0;
   double end_ms = 0.0;
   double ms = 0.0;
+};
+
+// Each logical worker has exactly one resident-thread writer. Keeping the
+// vector control words on separate cache lines removes both locking and false
+// sharing from the trace hot path; records are merged only after workers join.
+struct alignas(128) MoeThreadTraceBuffer {
+  std::vector<MoeGemmTraceRecord> gemm_records;
+  std::vector<MoePhaseTraceRecord> phase_records;
+  int64_t affinity_first_cpu = -1;
+  int64_t affinity_cpu_count = 0;
+  int64_t fixed_cpu = -1;
+  bool metadata_initialized = false;
 };
 
 // Backend for scratch-buffer memory, selected once from the environment:
@@ -3845,29 +3861,37 @@ class MoeTraceCollector {
 
   bool enabled() const { return config_.enabled; }
 
-  void reserve(size_t count) {
-    if (!enabled()) {
+  void prepare_thread_buffers(int64_t num_threads, size_t gemm_count_hint, size_t phase_count_hint) {
+    if (!enabled() || num_threads <= 0) {
       return;
     }
-    std::lock_guard<std::mutex> lock(mutex_);
-    records_.reserve(count);
+    thread_buffers_.resize(static_cast<size_t>(num_threads));
+    const size_t thread_count = static_cast<size_t>(num_threads);
+    const size_t gemm_per_thread = (gemm_count_hint + thread_count - 1) / thread_count + 4;
+    const size_t phase_per_thread = (phase_count_hint + thread_count - 1) / thread_count + 8;
+    for (MoeThreadTraceBuffer& buffer : thread_buffers_) {
+      buffer.gemm_records.reserve(gemm_per_thread);
+      buffer.phase_records.reserve(phase_per_thread);
+    }
+    host_buffer_.gemm_records.reserve(16);
+    host_buffer_.phase_records.reserve(16);
   }
 
   void record_gemm(int64_t tid, int64_t wave, int64_t group, int64_t local_tid, int64_t expert, int64_t route_begin,
                    int64_t rows, const char* stage, int64_t M, int64_t K, int64_t N, int64_t ldc, int64_t n_begin,
-                   int64_t n_cols, double ms) {
+                   int64_t n_cols, ::fused_cpp::profile::TimePoint begin,
+                   ::fused_cpp::profile::TimePoint end) {
     if (!enabled()) {
       return;
     }
-    MoeGemmTraceRecord record;
-    record.seq = next_seq_.fetch_add(uint64_t{1}, std::memory_order_relaxed);
+    MoeThreadTraceBuffer& buffer = buffer_for_tid(tid);
+    MoeGemmTraceRecord& record = buffer.gemm_records.emplace_back();
+    record.begin_time = begin;
+    record.end_time = end;
     record.tid = tid;
-#ifdef __linux__
-    record.cpu = sched_getcpu();
-#endif
-    const std::vector<int64_t> affinity_cpus = current_affinity_cpus(1);
-    record.affinity_first_cpu = affinity_cpus.front();
-    record.affinity_cpu_count = static_cast<int64_t>(affinity_cpus.size());
+    record.cpu = record_cpu(buffer);
+    record.affinity_first_cpu = buffer.affinity_first_cpu;
+    record.affinity_cpu_count = buffer.affinity_cpu_count;
     record.wave = wave;
     record.group = group;
     record.local_tid = local_tid;
@@ -3881,9 +3905,6 @@ class MoeTraceCollector {
     record.ldc = ldc;
     record.n_begin = n_begin;
     record.n_cols = n_cols;
-    record.ms = ms;
-    std::lock_guard<std::mutex> lock(mutex_);
-    records_.push_back(record);
   }
 
   void record_phase(int64_t tid, int64_t wave, int64_t group, int64_t local_tid, int64_t expert, int64_t rows,
@@ -3892,26 +3913,20 @@ class MoeTraceCollector {
       return;
     }
     const ::fused_cpp::profile::TimePoint end = ::fused_cpp::profile::now();
-    MoePhaseTraceRecord record;
-    record.seq = next_seq_.fetch_add(uint64_t{1}, std::memory_order_relaxed);
+    MoeThreadTraceBuffer& buffer = buffer_for_tid(tid);
+    MoePhaseTraceRecord& record = buffer.phase_records.emplace_back();
+    record.begin_time = begin;
+    record.end_time = end;
     record.tid = tid;
-#ifdef __linux__
-    record.cpu = sched_getcpu();
-#endif
-    const std::vector<int64_t> affinity_cpus = current_affinity_cpus(1);
-    record.affinity_first_cpu = affinity_cpus.front();
-    record.affinity_cpu_count = static_cast<int64_t>(affinity_cpus.size());
+    record.cpu = record_cpu(buffer);
+    record.affinity_first_cpu = buffer.affinity_first_cpu;
+    record.affinity_cpu_count = buffer.affinity_cpu_count;
     record.wave = wave;
     record.group = group;
     record.local_tid = local_tid;
     record.expert = expert;
     record.rows = rows;
     record.stage = stage;
-    record.start_ms = std::chrono::duration<double, std::milli>(begin - origin_).count();
-    record.end_ms = std::chrono::duration<double, std::milli>(end - origin_).count();
-    record.ms = std::chrono::duration<double, std::milli>(end - begin).count();
-    std::lock_guard<std::mutex> lock(mutex_);
-    phase_records_.push_back(record);
   }
 
   void write_report(const char* strategy, int64_t num_threads, int64_t num_tokens, int64_t top_k, int64_t num_experts,
@@ -3923,15 +3938,46 @@ class MoeTraceCollector {
 
     std::vector<MoeGemmTraceRecord> records;
     std::vector<MoePhaseTraceRecord> phase_records;
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      records = records_;
-      phase_records = phase_records_;
+    size_t gemm_count = host_buffer_.gemm_records.size();
+    size_t phase_count = host_buffer_.phase_records.size();
+    for (const MoeThreadTraceBuffer& buffer : thread_buffers_) {
+      gemm_count += buffer.gemm_records.size();
+      phase_count += buffer.phase_records.size();
+    }
+    records.reserve(gemm_count);
+    phase_records.reserve(phase_count);
+    append_buffer(host_buffer_, records, phase_records);
+    for (const MoeThreadTraceBuffer& buffer : thread_buffers_) {
+      append_buffer(buffer, records, phase_records);
+    }
+    for (MoeGemmTraceRecord& record : records) {
+      record.ms = std::chrono::duration<double, std::milli>(record.end_time - record.begin_time).count();
+    }
+    for (MoePhaseTraceRecord& record : phase_records) {
+      record.start_ms = std::chrono::duration<double, std::milli>(record.begin_time - origin_).count();
+      record.end_ms = std::chrono::duration<double, std::milli>(record.end_time - origin_).count();
+      record.ms = std::chrono::duration<double, std::milli>(record.end_time - record.begin_time).count();
     }
     std::sort(records.begin(), records.end(),
-              [](const MoeGemmTraceRecord& lhs, const MoeGemmTraceRecord& rhs) { return lhs.seq < rhs.seq; });
+              [](const MoeGemmTraceRecord& lhs, const MoeGemmTraceRecord& rhs) {
+                return std::tie(lhs.end_time, lhs.tid) < std::tie(rhs.end_time, rhs.tid);
+              });
     std::sort(phase_records.begin(), phase_records.end(),
-              [](const MoePhaseTraceRecord& lhs, const MoePhaseTraceRecord& rhs) { return lhs.seq < rhs.seq; });
+              [](const MoePhaseTraceRecord& lhs, const MoePhaseTraceRecord& rhs) {
+                return std::tie(lhs.end_time, lhs.tid) < std::tie(rhs.end_time, rhs.tid);
+              });
+    size_t gemm_index = 0;
+    size_t phase_index = 0;
+    uint64_t seq = 0;
+    while (gemm_index < records.size() || phase_index < phase_records.size()) {
+      if (phase_index >= phase_records.size() ||
+          (gemm_index < records.size() &&
+           records[gemm_index].end_time <= phase_records[phase_index].end_time)) {
+        records[gemm_index++].seq = seq++;
+      } else {
+        phase_records[phase_index++].seq = seq++;
+      }
+    }
 
     std::FILE* file = std::fopen(config_.path.c_str(), "a");
     if (file == nullptr) {
@@ -3992,13 +4038,67 @@ class MoeTraceCollector {
   }
 
  private:
+  static void append_buffer(const MoeThreadTraceBuffer& buffer, std::vector<MoeGemmTraceRecord>& records,
+                            std::vector<MoePhaseTraceRecord>& phase_records) {
+    records.insert(records.end(), buffer.gemm_records.begin(), buffer.gemm_records.end());
+    phase_records.insert(phase_records.end(), buffer.phase_records.begin(), buffer.phase_records.end());
+  }
+
+  MoeThreadTraceBuffer& buffer_for_tid(int64_t tid) {
+    if (tid < 0) {
+      return host_buffer_;
+    }
+    TORCH_INTERNAL_ASSERT(static_cast<size_t>(tid) < thread_buffers_.size(), "trace tid is outside prepared buffers");
+    return thread_buffers_[static_cast<size_t>(tid)];
+  }
+
+  static void initialize_thread_metadata(MoeThreadTraceBuffer& buffer) {
+    if (buffer.metadata_initialized) {
+      return;
+    }
+#ifdef __linux__
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    if (pthread_getaffinity_np(pthread_self(), sizeof(cpuset), &cpuset) == 0) {
+      for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+        if (!CPU_ISSET(cpu, &cpuset)) {
+          continue;
+        }
+        if (buffer.affinity_first_cpu < 0) {
+          buffer.affinity_first_cpu = static_cast<int64_t>(cpu);
+        }
+        ++buffer.affinity_cpu_count;
+      }
+      if (buffer.affinity_cpu_count == 1) {
+        buffer.fixed_cpu = buffer.affinity_first_cpu;
+      }
+    }
+    if (buffer.affinity_cpu_count == 0) {
+      buffer.affinity_first_cpu = static_cast<int64_t>(sched_getcpu());
+      buffer.affinity_cpu_count = 1;
+    }
+#else
+    buffer.affinity_first_cpu = 0;
+    buffer.affinity_cpu_count = 1;
+    buffer.fixed_cpu = 0;
+#endif
+    buffer.metadata_initialized = true;
+  }
+
+  static int64_t record_cpu(MoeThreadTraceBuffer& buffer) {
+    initialize_thread_metadata(buffer);
+#ifdef __linux__
+    return buffer.fixed_cpu >= 0 ? buffer.fixed_cpu : static_cast<int64_t>(sched_getcpu());
+#else
+    return buffer.fixed_cpu;
+#endif
+  }
+
   MoeTraceConfig config_;
   uint64_t call_id_ = 0;
   ::fused_cpp::profile::TimePoint origin_;
-  std::atomic<uint64_t> next_seq_{0};
-  std::mutex mutex_;
-  std::vector<MoeGemmTraceRecord> records_;
-  std::vector<MoePhaseTraceRecord> phase_records_;
+  MoeThreadTraceBuffer host_buffer_;
+  std::vector<MoeThreadTraceBuffer> thread_buffers_;
 };
 
 #ifdef __aarch64__
@@ -4021,8 +4121,8 @@ void trace_dispatch_fp32_gemm(MoeTraceCollector& trace, const char* stage, int64
   }
   const auto begin = ::fused_cpp::profile::now();
   team_gemm(team, plan, A, B_reo, C, M, K, N, ldc, bias);
-  const double ms = ::fused_cpp::profile::elapsed_ms(begin);
-  trace.record_gemm(tid, wave, group, local_tid, expert, route_begin, rows, stage, M, K, N, ldc, 0, N, ms);
+  const auto end = ::fused_cpp::profile::now();
+  trace.record_gemm(tid, wave, group, local_tid, expert, route_begin, rows, stage, M, K, N, ldc, 0, N, begin, end);
 }
 
 void trace_dispatch_fp32_gemm_stage_split(MoeTraceCollector& trace, const char* stage_name, MoeGemmStage stage,
@@ -4049,7 +4149,7 @@ void trace_dispatch_fp32_gemm_stage_split(MoeTraceCollector& trace, const char* 
   }
   const auto begin = ::fused_cpp::profile::now();
   team_gemm(team, plan, A, B_reo, C, M, K, N, ldc, bias);
-  const double ms = ::fused_cpp::profile::elapsed_ms(begin);
+  const auto end = ::fused_cpp::profile::now();
   int64_t trace_route_begin = route_begin;
   int64_t trace_rows = rows;
   int64_t trace_n_begin = 0;
@@ -4062,7 +4162,7 @@ void trace_dispatch_fp32_gemm_stage_split(MoeTraceCollector& trace, const char* 
     trace_n_cols = range.size;
   }
   trace.record_gemm(tid, wave, group, local_tid, expert, trace_route_begin, trace_rows, stage_name, M, K, N, ldc,
-                    trace_n_begin, trace_n_cols, ms);
+                    trace_n_begin, trace_n_cols, begin, end);
 }
 
 #endif
@@ -5988,7 +6088,7 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input, at::Tensor w13_packed, int64_t
   }
 
   if (!use_hierarchical_nsplit) {
-    moe_trace.reserve(tasks.size() * 2);
+    moe_trace.prepare_thread_buffers(actual_threads, tasks.size() * 2, 0);
     const ExpertScheduleWorkloadConfig workload_config{
         w13.K_pad, w13.N_pad, w2.K_pad, w2.N_pad, moe_activation_kind(activation), skip_weighted};
     float estimated_schedule_cost = 0.0f;
@@ -6206,7 +6306,8 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input, at::Tensor w13_packed, int64_t
       return lhs < rhs;
     });
     moe_trace_expert_tasks = static_cast<int64_t>(expert_order.size());
-    moe_trace.reserve(expert_order.size() * static_cast<size_t>(nsplit_group_size) * 2);
+    moe_trace.prepare_thread_buffers(
+        actual_threads, expert_order.size() * static_cast<size_t>(nsplit_group_size) * 2, 0);
     std::atomic<size_t> next_expert_idx{0};
     std::vector<ThreadScheduleDebug> schedule_debug(static_cast<size_t>(nsplit_total_groups));
 
@@ -6944,7 +7045,9 @@ at::Tensor fused_moe_bf16_tiled_scheduled(at::Tensor input, at::Tensor w13_packe
                  static_cast<long long>(num_teams));
   }
 
-  moe_trace.reserve(static_cast<size_t>(trace_gemm_hint));
+  moe_trace.prepare_thread_buffers(
+      num_threads, static_cast<size_t>(trace_gemm_hint),
+      static_cast<size_t>(trace_gemm_hint) * 2 + static_cast<size_t>(num_threads) + 16);
   ThreadBarrier wave_barrier(num_threads);
   phase_begin = trace_phase_begin();
   run_fixed_threads(num_threads, [&](int64_t tid) {
@@ -7911,7 +8014,9 @@ at::Tensor run_fused_moe_bf16_tiled_async(
   std::atomic<int64_t> completed_ready_token_merges{0};
   std::atomic<int64_t> expert_publication_epoch{0};
 
-  moe_trace.reserve(static_cast<size_t>(trace_gemm_hint) + ready_token_count);
+  moe_trace.prepare_thread_buffers(
+      num_threads, static_cast<size_t>(trace_gemm_hint),
+      static_cast<size_t>(trace_gemm_hint) * 2 + ready_token_count + static_cast<size_t>(num_threads) + 16);
   std::vector<std::atomic<int64_t>> task_states(static_cast<size_t>(num_tasks));
   for (int64_t task = 0; task < num_tasks; ++task) {
     task_states[static_cast<size_t>(task)].store(0, std::memory_order_relaxed);
