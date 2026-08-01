@@ -27,7 +27,7 @@ PROFILE = (
     / "cpu_moe_schedule_optimization"
     / "cost_model"
     / "profiles"
-    / "contention_async_amazon_ecs_8c_standalone_sve_F512_E8_splitw13_xbyak_exactm_v2_20260720.json"
+    / "contention_async_amazon_ecs_8c_standalone_sve_F512_E8_splitw13_xbyak_exactm_v2_20260727.json"
 )
 
 

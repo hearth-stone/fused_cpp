@@ -872,9 +872,19 @@ class ContentionCostModel:
             raise ValueError(f"stage must be 'w13' or 'w2', got {stage!r}")
         return [(duration, workset) for duration, workset in phases if duration > 0]
 
+    def task_stage_phases(
+        self,
+        stage: str,
+        routes: int,
+        threads: int,
+    ) -> tuple[tuple[float, int], ...]:
+        """Return the isolated duration and packed-B window for each stage phase."""
+
+        return tuple(self._task_stage_phases(stage, int(routes), int(threads)))
+
     def stage_T_iso(self, stage: str, routes: int, threads: int) -> float:
         """Isolated duration assigned to one global GEMM stage."""
-        return sum(duration for duration, _ in self._task_stage_phases(stage, routes, threads))
+        return sum(duration for duration, _ in self.task_stage_phases(stage, routes, threads))
 
     def _working_set_derate(
         self,

@@ -161,6 +161,10 @@ T_plan(plan) + T_execute(plan)
 - [`planners/ISOLATED_CP_SAT_ORACLE.md`](./planners/ISOLATED_CP_SAT_ORACLE.md)：
   可选 OR-Tools 离线 oracle；在无争用 fixed-duration 模型中搜索全线程宽度组合，
   返回可行上界、理论下界及当前 strict planner 的 isolated regret 区间。
+- [`planners/cold_phase_cp_sat_oracle.py`](./planners/cold_phase_cp_sat_oracle.py)：
+  在 fixed-duration oracle 上增加 cold packed-B/steady phase 和单 NUMA DRAM
+  cumulative constraint；同一 surrogate 内比较固定 lane DAG 与 mixed-width
+  schedule，不接入 production planner。
 - [`planners/simulate_schedules.py`](./planners/simulate_schedules.py)：离线对比多种调度算法（coop / expert-parallel / greedy / planner / 各 core 切分）的 makespan。
 - [`planners/planned_moe.py`](./planners/planned_moe.py)：路由直方图 → 缓存 plan → `fused_moe_bf16_tiled_async` 桥。
 - [`planners/bench_planner_overhead.py`](./planners/bench_planner_overhead.py) / [`planners/bench_e2e_scheduling.py`](./planners/bench_e2e_scheduling.py)：plan 开销 / 缓存命中率 + e2e 对比。

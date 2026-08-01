@@ -2,7 +2,7 @@
 
 > 状态：调度问题定义的 source of truth。
 >
-> 最后更新：2026-07-26。
+> 最后更新：2026-07-31。
 >
 > 修改 planner 的决策变量、目标函数、硬约束、性能响应、线程宽度集合、调度语义、
 > rank 耦合方式或剪枝策略时，必须同步更新本文档及末尾变更记录。
@@ -1040,6 +1040,86 @@ $nq/2$ 报告 nearest-tick 的保守 critical-path 量化误差上界；需要�
 由于原始问题规定 $D_i(\mathcal Z)\ge1$，该 isolated 特例的最优 makespan
 不大于真实 contention-aware 最优值，因此可以作为有效下界。
 
+#### 6.2.1 Cold packed-B phase oracle
+
+固定时长 oracle 允许任意数量的 cold-weight expert 同时保持 isolated rate，因而
+对混合长短 expert 过于乐观。第二层离线 oracle 实现于
+`planners/cold_phase_cp_sat_oracle.py`。对 expert $i$ 和 width $t$，令
+$I_i(t)$ 为同一 empirical profile 的 isolated time，首个 SVE panel 行数为
+$M_R=12$，则 cold reference duration 为
+
+$$
+c_i(t)=\min\left(I_i(t),I_{\min(M_i,M_R)}(t)\right),
+$$
+
+steady duration 为 $h_i(t)=I_i(t)-c_i(t)$。令 $W_i$ 为该 expert 的 W13/W2
+packed-B 总字节数；默认 `expert` 粒度把全部 weight range 流体聚合成按顺序执行的
+两个 phase：
+
+$$
+P_{it}=\left[(c_i(t),W_i),(h_i(t),0)\right],
+\qquad
+b_i(t)=\frac{W_i}{c_i(t)}.
+$$
+
+第二个 phase 在 $h_i(t)=0$ 时省略。诊断用 `range` 粒度按现有 stage-window
+policy 展开每个 W13/W2 range；cold time 按 range 字节比例分配，steady time 按
+原 stage phase duration 比例分配，因此两种粒度都保持
+
+$$
+\sum_p d_{itp}=I_i(t),
+\qquad
+\sum_p W_{itp}=W_i.
+$$
+
+对每个 mode 建立 master interval $[s_{it},e_{it})$，其整个 lifetime（包括 phase
+之间等待共享资源的时间）持续占用 $t$ 个 core。内部 phase 按序且不可抢占：
+
+$$
+s_{it,p+1}\ge e_{itp},
+\qquad
+e_{it}-s_{it}\ge\sum_p d_{itp}.
+$$
+
+令 cold phase 的平均 packed-B DRAM rate 为
+$b_{itp}=W_{itp}/d_{itp}$，单 NUMA 可持续带宽为 $B_D$。首版增加两个
+cumulative constraint：
+
+$$
+\sum_{i,t}t\,a_{it}(\tau)\le C,
+\qquad
+\sum_{i,t,p\in\mathrm{cold}}b_{itp}\,a_{itp}(\tau)\le B_D.
+$$
+
+CP-SAT 以整数时间和 bandwidth quantum 编码；若单个 cold phase 的量化 rate
+超过 $B_D$，先把该 phase duration 下限提高到 $W_{itp}/B_D$。可选
+`cold_phase_slots` 再限制同时 cold phase 数，但默认关闭。每个 expert 恰好选择
+一个 width，master interval 不释放 team；因此 solver 可以错开 cold phase，不能
+在等待时把其 core 借给另一个 expert。
+
+同一模型同时求解两个域：fixed baseline 保留当前 lane DAG 且只允许 `8T`，但允许
+solver 在 lane 内插入最优 cold-resource wait；mixed 域删除纯资源 lane edge，并允许
+显式 width 集合。fixed incumbent 作为 mixed 的完整可行 warm start 和 objective
+upper bound。若两者最优值分别满足
+
+$$
+F^*\in[F_L,F_U],\qquad O^*\in[O_L,O_U],
+$$
+
+则同一 surrogate 内 mixed 相对 fixed 的收益满足
+
+$$
+\max\left(0,\frac{F_L}{O_U}-1\right)
+\le\frac{F^*}{O^*}-1\le
+\max\left(0,\frac{F_U}{O_L}-1\right).
+$$
+
+该结果不是 contention-aware wall-time optimum 的严格证明：首版只限制 cold
+packed-B，尚未限制 packed-A、store、LLC-to-L2 refill、频率/计算争用、merge 和
+通信；`expert` 流体聚合还会把后续 W13/W2 cold range 前移。它的用途是回答
+“允许混合 width 和主动 cold-phase 错峰时还有多少调度 headroom”，并为后续可执行
+候选提供 surrogate 内的离线上限，不进入 production planner 或 plan cache identity。
+
 一般 $D_i(\mathcal Z)$ 会使 job duration 随执行中的 active set 改变，不能直接
 编码成一个固定 duration interval。要得到 contention-aware exact oracle，必须
 进一步枚举并发 group mode、离散化时间/状态，或使用专门的 event-based search；
@@ -1108,7 +1188,7 @@ cold search。
 
 | 层级 | 原始可行域 | 当前限制 | 性质 |
 | --- | --- | --- | --- |
-| 线程宽度 | $1,2,\ldots,T_{\max}$ | empirical strict backend 为 `1,2,4,8,16,32`；analytic strict backend 使用 machine calibration 中显式允许的宽度；自动短 expert pool 只搜索 `1,2,4`；96-core bounded tail whole-expert 候选只搜索 `24,32,48`，其中缺表宽度仅允许长整 M12 formula 插值；route-sliced tail 只允许 exact-layout anchor 中显式校准的宽度，当前为 `24T`；forced override 可用其他已校准宽度 | 离散宽度剪枝 |
+| 线程宽度 | $1,2,\ldots,T_{\max}$ | empirical strict backend 为 `1,2,4,8,16,32`；analytic strict backend 使用 machine calibration 中显式允许的宽度；自动短 expert pool 只搜索 `1,2,4`；96-core bounded tail whole-expert 候选只搜索 `24,32,48`，其中缺表宽度仅允许长整 M12 formula 插值；route-sliced tail 只允许 exact-layout anchor 中显式校准的宽度，当前为 `24T`；forced override 可用其他已校准宽度；离线 cold-phase oracle 默认比较 `1,2,4,8,16`，不扩大 production 域 | 离散宽度剪枝 |
 | 并发配置 | 活跃 job 可形成任意满足 CPU 容量的 $(M_i,t_i)$ 组合 | 搜索静态 core shape，并自动比较 strict、threshold/统一宽度 tail-pool 与恰好两个 terminal expert 的一次 bounded repartition；后者可在 exact anchor 命中时把每个 terminal expert 切成两个连续 M slice，使四个 fixed task 覆盖全部核心；实验 elastic 只接受 planner 显式给出的同 NUMA 对齐 W2 cohort，target 必须包含 source 或与其不相交 | static-partition + boundary regroup 剪枝 |
 | Shape 集合 | 所有满足 CPU 容量的整数宽度组合 | empirical backend 只用 profile shape；analytic backend 生成 homogeneous 和至多两种宽度的 shape，再应用 active 工作集规则；tail-pool 和 bounded tail 只从 strict uncertainty band 和最快两个 head shape 派生 | 候选剪枝 |
 | Assignment | 任意 expert-to-resource 调度 | 按 isolated cost 的 LPT | 启发式分配 |
@@ -2605,6 +2685,46 @@ task。production auto 为 `8.753 ms`（p10--p90
 `8.746 ms`，两者只差 `0.08%`；相对同轮 strict `11.180 ms` 的 throughput
 提升 `27.73%`。anchor `8.710 ms` 对 production median 的误差为 `0.49%`。
 
+### 9.19 Cold-phase CP-SAT mixed-width oracle
+
+2026-07-31 使用 AmazonC5192Cores 双 NUMA TP4/F512 exact-M split-W13 profile，
+对单 rank 的 96 cores 离线求解 6.2.1。默认 stage-window policy 为
+`amazon_c5_192c_tp4_f512_v1`，width 域为 `1,2,4,8,16`，fixed baseline 为
+当前 DSV4 strict `12x8T` lane DAG。packed-B 带宽 ceiling 取该机单 NUMA
+STREAM Triad 的 `336.4 GB/s`，时间/bandwidth quantum 分别为
+`1000 ns/0.25 GB/s`；没有设置 cold stream 数硬上限。该实验不执行 kernel，
+只消费已提交 profile 和 workload histogram。
+
+`expert` 流体聚合结果如下。区间为 CP-SAT 的 best bound 到 incumbent；收益区间
+按 6.2.1 的交叉上下界计算。DSV4 合并同一模型 15 s 与 60 s 两轮中更强的 bound
+和 incumbent，其余 case 为 15 s、8 solver workers。
+
+| workload | fixed `12x8T` LB--UB | mixed LB--UB | mixed 相对 fixed 收益区间 | incumbent 对比 |
+| --- | ---: | ---: | ---: | ---: |
+| `dsv4-real-2048-seq70` | `11.214--12.500 ms` | `8.345--8.782 ms` | `27.7%--49.8%` | `42.3%` |
+| `moe256-long-short-bimodal` | `11.368 ms` exact | `6.699--6.992 ms` | `62.6%--69.7%` | `62.6%` |
+| `moe256-tiered-hotspot` | `6.510 ms` exact | `5.409--6.266 ms` | `3.9%--20.4%` | `3.9%` |
+
+DSV4 最好 mixed incumbent 的 width histogram 为
+`173x1T + 7x2T + 7x4T + 34x8T + 2x16T`。这说明模型利用的主要自由度不是把
+所有 expert 统一缩窄，而是让大量短/中 expert 以窄 team 填入长 expert 的
+steady 区间，同时只为少数长或尾部 task 使用宽 team。
+
+同一 DSV4 case 的 `range` 粒度在 15 s 内只找到 `13.152 -> 12.971 ms`
+（`1.4%`）的 incumbent 改善，但 mixed solver gap 仍为 `35.7%`，收益上界仍为
+`57.6%`，因此该点不能反证 fluid headroom；它只说明完整 range-level optional
+interval 模型尚未在当前时限收敛。`300/336.4/375.9 GB/s` 的 10--15 s
+敏感性 sweep 中，DSV4 mixed incumbent 分别为 `9.974/8.782/8.396 ms`，表明
+绝对上限依赖选用的 DRAM ceiling；solver gap 不同，不能把三点的收益百分比拟合成
+硬件规律。
+
+结论是：在 cold packed-B 流体 surrogate 内，captured mixed distribution 相对
+固定 `12x8T` 至少仍有约 `27.7%` 的已证明调度 headroom；但这不是可直接宣称的
+E2E 收益。下一步应把 mixed incumbent 转成受限可执行候选，先验证实际 cold
+错峰和 width 组合，再决定是否把 DRAM phase 资源加入 online planner。
+完整命令、模型边界和结果解释见
+`optimizations/fused_moe_sve/results/amazon_192c_cold_phase_cp_sat_oracle_20260731.md`。
+
 ## 10. 同步规则
 
 发生以下任一变化时，必须同步更新本文档：
@@ -2682,3 +2802,4 @@ task。production auto 为 `8.753 ms`（p10--p90
 | 2026-07-30 | v0.49 | Plan V2 strict task 增加连续 route-slice 语义，允许同一 terminal expert 在 M 维拆成两个 disjoint task；native runtime 对每个 slice 独立 gather/W13/W2/direct route store，并在全部 slice 完成后才发布 expert completion。bounded-tail planner 只在 exact-layout anchor 命中时生成 `2 expert x 2 slice x 24T` grouped 候选，使 active-set-8 的尾波占满 96 核；显式 51-run 实验从 whole-expert 24T 的 9.804 ms 降至 8.710 ms，production auto 复测为 8.753 ms、相对同轮 strict throughput 提升 27.73%，未校准形状保持原候选域。 |
 | 2026-07-30 | v0.50 | async ready-token executor 改为同一 resident worker job 排空 queue：expert 阶段保持单 token 领取，compute 完成后默认以两 token batch 和一 token lookahead 预取收尾，不再启动连续 final merge；保留 drain/merge/batch/prefetch 环境变量 fallback。AmazonC5192Cores NUMA0 active-set-8 的 101-run 中位数从旧路径 8.691 ms 降到 8.637 ms，P90 从 8.963 ms 降到 8.706 ms；batch sweep 未证明预取有独立显著收益，planner/cost-model 决策空间保持不变。 |
 | 2026-07-30 | v0.51 | Plan V2 增加 plan-level `early_merge` 三态控制并下沉为 native `-1/0/1`；strict planner 复用 active expert DAG simulator 的逐 task 完成时刻，在聚合 expert finish 于 1 ns/1 ppm 内相同时写入 `false`，统一使用全 worker 连续 post-expert merge，其余候选保持 auto，planner 不强制 on。环境变量仍是全局 kill switch，elastic 拒绝 on；同步更新 API、模型公式、剪枝表、验证要求和 contract tests，combine service time 仍未进入评分。 |
+| 2026-07-31 | v0.52 | 新增独立 cold-phase CP-SAT oracle：以 M12 isolated reference 将 expert 分成 cold packed-B/steady phase，master interval 在共享资源等待期间继续占用原 team，并对 cold phase 增加单 NUMA DRAM cumulative constraint；同模型比较固定 `12x8T` lane DAG 与 `1/2/4/8/16T` mixed-width 域。192-core TP4 profile 的 DSV4 fluid-aggregate 求解给出 `27.7%--49.8%` surrogate headroom；range-level 模型尚未收敛。该工具不接入 production planner。 |
