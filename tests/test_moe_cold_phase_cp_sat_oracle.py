@@ -13,11 +13,14 @@ sys.path.insert(0, str(PLANNERS))
 
 from cold_phase_cp_sat_oracle import (  # noqa: E402
     ColdPhase,
+    ColdPhaseAssignment,
     ColdPhaseJob,
     ColdPhaseMode,
     build_cold_phase_jobs,
+    cold_phase_runtime_bridge,
     compare_cold_phase_oracles,
     main,
+    materialize_cold_phase_runtime_placement,
     solve_cold_phase_cp_sat,
 )
 
@@ -212,6 +215,59 @@ def test_cold_phase_oracle_applies_single_phase_bandwidth_floor() -> None:
 
     assert result.objective_ns == 4
     assert result.bandwidth_floor_added_ns == 3
+
+
+def test_cold_phase_runtime_placement_uses_contiguous_teams_and_resource_edges() -> None:
+    pytest.importorskip("ortools")
+    assignments = (
+        ColdPhaseAssignment(0, 120, 2, 0, 10, 0, 10, ()),
+        ColdPhaseAssignment(1, 120, 2, 0, 5, 0, 5, ()),
+        ColdPhaseAssignment(2, 12, 1, 5, 5, 0, 10, ()),
+        ColdPhaseAssignment(3, 240, 4, 10, 5, 0, 15, ()),
+    )
+
+    placement = materialize_cold_phase_runtime_placement(
+        assignments,
+        num_cores=4,
+        max_time_s=5.0,
+    )
+
+    assert placement.status == "OPTIMAL"
+    assert len(placement.tasks) == len(assignments)
+    for left_id, left in enumerate(placement.tasks):
+        assert 0 <= left.core_begin < left.core_begin + left.threads <= 4
+        for right in placement.tasks[left_id + 1 :]:
+            time_overlaps = left.release_ns < right.modeled_end_ns and right.release_ns < left.modeled_end_ns
+            core_overlaps = (
+                left.core_begin < right.core_begin + right.threads
+                and right.core_begin < left.core_begin + left.threads
+            )
+            assert not (time_overlaps and core_overlaps)
+    for task_id, task in enumerate(placement.tasks):
+        assert all(dependency < task_id for dependency in task.dependencies)
+    assert placement.tasks[-1].release_ns == 10
+    assert placement.tasks[-1].threads == 4
+    assert placement.tasks[-1].dependencies
+
+    class _Planner:
+        num_cores = 4
+
+        @staticmethod
+        def to_async_bridge(tasks):
+            return {"tasks": tasks}
+
+    timed = cold_phase_runtime_bridge(placement, _Planner(), timed=True)
+    eager = cold_phase_runtime_bridge(placement, _Planner(), timed=False)
+    assert timed["task_release_ns"] == [task.release_ns for task in placement.tasks]
+    assert eager["task_release_ns"] == [0] * len(placement.tasks)
+    assert timed["early_merge"] is False
+
+
+def test_cold_phase_runtime_placement_rejects_internal_waits() -> None:
+    assignment = ColdPhaseAssignment(0, 12, 1, 0, 5, 1, 6, ())
+
+    with pytest.raises(ValueError, match="no internal waits"):
+        materialize_cold_phase_runtime_placement((assignment,), num_cores=1)
 
 
 def test_cli_compares_fixed_and_mixed_oracles_with_profile(tmp_path: Path) -> None:

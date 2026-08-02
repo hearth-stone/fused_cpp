@@ -9,6 +9,7 @@ import os
 import statistics
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +33,10 @@ from fused_cpp.moe import (  # noqa: E402
 )
 from phase_model import ContentionCostModel  # noqa: E402
 from planned_moe import PlannedMoE  # noqa: E402
+from schedule_timeline_metrics import (  # noqa: E402
+    DEFAULT_GFLOPS_COLOR_MAX,
+    enrich_actual_timeline,
+)
 from workload_catalog import default_offline_workloads  # noqa: E402
 
 
@@ -62,6 +67,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--runs", type=int, default=5)
     parser.add_argument("--seed", type=int, default=20260729)
     parser.add_argument("--route-dtype", choices=("fp32", "bf16"), default="bf16")
+    parser.add_argument(
+        "--gflops-color-max",
+        type=float,
+        default=DEFAULT_GFLOPS_COLOR_MAX,
+        help="fixed per-core GEMM GFLOP/s represented by the darkest timeline color",
+    )
+    parser.add_argument(
+        "--early-merge",
+        choices=("auto", "off", "on"),
+        default="auto",
+        help="override Plan V2 early merge without changing the planned task graph",
+    )
     parser.add_argument("--trace-file", type=Path, default=DEFAULT_TRACE)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument(
@@ -86,11 +103,27 @@ def parse_args() -> argparse.Namespace:
         help="capture a 6x16T-to-2xWT static tail plan instead of the strict baseline",
     )
     parser.add_argument(
+        "--strict-tail-steal",
+        action="store_true",
+        help="enable equal-width strict tail task stealing for the captured run",
+    )
+    parser.add_argument(
+        "--compare-strict-tail-steal",
+        action="store_true",
+        help="interleave strict and strict-tail-steal timing on the same packed weights",
+    )
+    parser.add_argument(
         "--plan-only",
         action="store_true",
         help="write the predicted timeline without allocating weights or running the native kernel",
     )
     return parser.parse_args()
+
+
+def override_early_merge(plan: AsyncMoEPlanV2, policy: str) -> AsyncMoEPlanV2:
+    if policy == "auto":
+        return plan
+    return replace(plan, early_merge=policy == "on")
 
 
 def parse_int_mapping(value: str, *, description: str) -> dict[int, int]:
@@ -370,7 +403,7 @@ def build_plan(args: argparse.Namespace) -> tuple[dict[str, Any], ContentionCost
     planner = PlannedMoE(model, args.threads, cpu_ids=cpu_ids)
     spec = planner.plan_spec_for(workload.experts)
     bridge = spec["bridge"]
-    plan = AsyncMoEPlanV2.from_dict(bridge)
+    plan = override_early_merge(AsyncMoEPlanV2.from_dict(bridge), args.early_merge)
     bound_model = planner.interval_planners[0].model
     tasks = materialized_plan_tasks(plan, workload.histogram)
     predicted_cores: dict[str, list[dict[str, Any]]] = {str(core): [] for core in range(args.threads)}
@@ -438,7 +471,7 @@ def build_plan(args: argparse.Namespace) -> tuple[dict[str, Any], ContentionCost
         predicted_per_core = False
 
     payload: dict[str, Any] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "case": {
             "machine": "AmazonC5192Cores",
             "numa_node": 0,
@@ -450,8 +483,15 @@ def build_plan(args: argparse.Namespace) -> tuple[dict[str, Any], ContentionCost
             "active_experts": workload.observed_active_experts,
             "hidden_size": int(model.policy.hidden_size),
             "intermediate_size": int(model.policy.intermediate_size),
+            "backend_n_tile": int(model.policy.backend_n_tile),
             "route_dtype": args.route_dtype,
             "profile": str(args.profile),
+            "capture": {
+                "seed": args.seed,
+                "warmup": args.warmup,
+                "runs": args.runs,
+                "gflops_color_max": args.gflops_color_max,
+            },
         },
         "plan": {
             "execution_mode": spec["execution_mode"],
@@ -465,7 +505,8 @@ def build_plan(args: argparse.Namespace) -> tuple[dict[str, Any], ContentionCost
             "tail_pool_threads": spec["tail_pool_threads"],
             "tail_pool_max_routes": spec["tail_pool_max_routes"],
             "tail_pool_tasks": int(spec["tail_pool_tasks"]),
-            "early_merge": bridge.get("early_merge"),
+            "early_merge": plan.early_merge,
+            "strict_tail_steal": bool(args.strict_tail_steal),
             "tasks": tasks,
         },
         "predicted": {
@@ -553,6 +594,8 @@ def capture_actual(
         payload["plan"]["tasks"] = materialized_plan_tasks(plan, workload.histogram)
         payload["plan"]["static_tail_width"] = args.static_tail_width
         payload["plan"]["shape"] = [16, 16, 16, 16, 16, 16, args.static_tail_width, args.static_tail_width]
+    plan = override_early_merge(plan, args.early_merge)
+    payload["plan"]["early_merge"] = plan.early_merge
     bridge = payload["plan"]["tasks"]
     policy = ContentionCostModel(args.profile).policy
     assert policy is not None
@@ -590,6 +633,7 @@ def capture_actual(
     os.environ["FUSED_CPP_MOE_STAGE_TIMING"] = "0"
     os.environ["FUSED_CPP_MOE_TRACE_FILE"] = str(args.trace_file)
     os.environ["FUSED_CPP_MOE_TRACE"] = "0"
+    os.environ["FUSED_CPP_MOE_STRICT_TAIL_STEAL"] = "1" if args.strict_tail_steal else "0"
 
     packed = prepare_fused_moe_bf16_tiled_weights(
         w13,
@@ -613,16 +657,44 @@ def capture_actual(
             out=output,
         )
 
-    for _ in range(args.warmup):
-        run()
-    untraced_samples_ms: list[float] = []
-    for _ in range(args.runs):
-        begin = time.perf_counter_ns()
-        run()
-        untraced_samples_ms.append((time.perf_counter_ns() - begin) / 1.0e6)
+    comparison: dict[str, Any] | None = None
+    if args.compare_strict_tail_steal:
+        comparison_samples = {"strict": [], "strict_tail_steal": []}
+        for iteration in range(args.warmup):
+            for enabled in ((False, True) if iteration % 2 == 0 else (True, False)):
+                os.environ["FUSED_CPP_MOE_STRICT_TAIL_STEAL"] = "1" if enabled else "0"
+                run()
+        for iteration in range(args.runs):
+            for enabled in ((False, True) if iteration % 2 == 0 else (True, False)):
+                os.environ["FUSED_CPP_MOE_STRICT_TAIL_STEAL"] = "1" if enabled else "0"
+                begin = time.perf_counter_ns()
+                run()
+                name = "strict_tail_steal" if enabled else "strict"
+                comparison_samples[name].append((time.perf_counter_ns() - begin) / 1.0e6)
+        comparison = {
+            name: {
+                "samples_ms": samples,
+                "median_ms": statistics.median(samples),
+            }
+            for name, samples in comparison_samples.items()
+        }
+        strict_median = comparison["strict"]["median_ms"]
+        steal_median = comparison["strict_tail_steal"]["median_ms"]
+        comparison["speedup_pct"] = 100.0 * (strict_median / steal_median - 1.0)
+        selected_name = "strict_tail_steal" if args.strict_tail_steal else "strict"
+        untraced_samples_ms = comparison_samples[selected_name]
+    else:
+        for _ in range(args.warmup):
+            run()
+        untraced_samples_ms = []
+        for _ in range(args.runs):
+            begin = time.perf_counter_ns()
+            run()
+            untraced_samples_ms.append((time.perf_counter_ns() - begin) / 1.0e6)
 
     args.trace_file.parent.mkdir(parents=True, exist_ok=True)
     args.trace_file.unlink(missing_ok=True)
+    os.environ["FUSED_CPP_MOE_STRICT_TAIL_STEAL"] = "1" if args.strict_tail_steal else "0"
     os.environ["FUSED_CPP_MOE_TRACE"] = "1"
     run()
     os.environ["FUSED_CPP_MOE_TRACE"] = "0"
@@ -666,6 +738,9 @@ def capture_actual(
         "host_segments": compact_actual_segments(host_phases),
         "cores": core_phases,
         "trace_file": str(args.trace_file),
+        "early_merge": plan.early_merge,
+        "strict_tail_steal": args.strict_tail_steal,
+        "strict_tail_steal_comparison": comparison,
     }
 
 
@@ -673,9 +748,12 @@ def main() -> int:
     args = parse_args()
     if args.warmup < 0 or args.runs <= 0:
         raise ValueError("--warmup must be non-negative and --runs must be positive")
+    if args.gflops_color_max <= 0:
+        raise ValueError("--gflops-color-max must be positive")
     payload, _, workload = build_plan(args)
     if not args.plan_only:
         payload["actual"] = capture_actual(args, payload, workload)
+        enrich_actual_timeline(payload, gflops_color_max=args.gflops_color_max)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     actual = payload["actual"]
@@ -689,6 +767,13 @@ def main() -> int:
                 "untraced_median_ms": actual["untraced_median_ms"] if actual is not None else None,
                 "traced_e2e_ms": actual["traced_e2e_ms"] if actual is not None else None,
                 "scheduled_compute_ms": actual["scheduled_compute_ms"] if actual is not None else None,
+                "internal_idle_core_ms": (
+                    actual["idle_metrics"]["internal_idle_core_ms"] if actual is not None else None
+                ),
+                "tail_idle_core_ms": (actual["idle_metrics"]["tail_idle_core_ms"] if actual is not None else None),
+                "strict_tail_steal_comparison": (
+                    actual["strict_tail_steal_comparison"] if actual is not None else None
+                ),
             },
             indent=2,
         )

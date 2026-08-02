@@ -128,6 +128,37 @@ class ColdPhaseOracleResult:
 
 
 @dataclass(frozen=True)
+class ColdPhaseRuntimeTask:
+    expert_id: int
+    routes: int
+    threads: int
+    core_begin: int
+    release_ns: int
+    modeled_end_ns: int
+    dependencies: tuple[int, ...]
+
+    def planner_tuple(self) -> tuple[int, int, int, int, list[int]]:
+        return (
+            self.expert_id,
+            self.routes,
+            self.core_begin,
+            self.threads,
+            list(self.dependencies),
+        )
+
+
+@dataclass(frozen=True)
+class ColdPhaseRuntimePlacement:
+    status: str
+    wall_time_s: float
+    num_cores: int
+    tasks: tuple[ColdPhaseRuntimeTask, ...]
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
 class ColdPhaseOracleComparison:
     fixed_objective_ns: int | None
     fixed_best_bound_ns: float | None
@@ -801,6 +832,152 @@ def compare_cold_phase_oracles(
         gain_lower_bound=gain_lower_bound,
         gain_upper_bound=gain_upper_bound,
     )
+
+
+def materialize_cold_phase_runtime_placement(
+    assignments: Sequence[ColdPhaseAssignment],
+    *,
+    num_cores: int,
+    max_time_s: float = 30.0,
+    workers: int = 1,
+    random_seed: int = 0,
+) -> ColdPhaseRuntimePlacement:
+    """Map a fluid CPU-capacity schedule to contiguous runtime core teams.
+
+    The cold-phase oracle constrains only aggregate CPU capacity. The native
+    runtime needs one contiguous logical-core interval per task, so this second
+    CP-SAT model keeps every oracle time interval fixed and solves only the
+    spatial placement. Dependencies serialize consecutive users of each core;
+    release times preserve deliberate oracle idling when predecessors finish
+    early on hardware.
+    """
+
+    if num_cores <= 0:
+        raise ValueError(f"num_cores must be positive, got {num_cores}")
+    if max_time_s <= 0.0 or not math.isfinite(max_time_s):
+        raise ValueError(f"max_time_s must be finite and positive, got {max_time_s!r}")
+    if workers <= 0:
+        raise ValueError(f"workers must be positive, got {workers}")
+    if not assignments:
+        raise ValueError("at least one cold-phase assignment is required")
+
+    ordered = tuple(sorted(assignments, key=lambda item: (item.start_ns, item.end_ns, item.expert_id)))
+    if len({assignment.expert_id for assignment in ordered}) != len(ordered):
+        raise ValueError("runtime materialization requires one whole task per expert")
+    for assignment in ordered:
+        if assignment.threads <= 0 or assignment.threads > num_cores:
+            raise ValueError(
+                f"assignment width must be within [1, {num_cores}], got {assignment.threads}"
+            )
+        if assignment.start_ns < 0 or assignment.end_ns <= assignment.start_ns:
+            raise ValueError(f"assignment has an invalid time interval: {assignment}")
+        if assignment.wait_ns != 0 or assignment.end_ns - assignment.start_ns != assignment.service_ns:
+            raise ValueError(
+                "runtime materialization currently requires contiguous phase service with no internal waits: "
+                f"expert_id={assignment.expert_id}, wait_ns={assignment.wait_ns}"
+            )
+
+    cp_model = _cp_model_module()
+    model = cp_model.CpModel()
+    time_intervals = []
+    core_intervals = []
+    core_begins = []
+    for task_id, assignment in enumerate(ordered):
+        core_begin = model.new_int_var(
+            0,
+            num_cores - assignment.threads,
+            f"core_begin_t{task_id}_e{assignment.expert_id}",
+        )
+        time_intervals.append(
+            model.new_fixed_size_interval_var(
+                assignment.start_ns,
+                assignment.end_ns - assignment.start_ns,
+                f"time_t{task_id}_e{assignment.expert_id}",
+            )
+        )
+        core_intervals.append(
+            model.new_fixed_size_interval_var(
+                core_begin,
+                assignment.threads,
+                f"cores_t{task_id}_e{assignment.expert_id}",
+            )
+        )
+        core_begins.append(core_begin)
+    model.add_no_overlap_2d(time_intervals, core_intervals)
+    model.add_decision_strategy(
+        core_begins,
+        cp_model.CHOOSE_FIRST,
+        cp_model.SELECT_MIN_VALUE,
+    )
+
+    solver = cp_model.CpSolver()
+    solver.parameters.max_time_in_seconds = float(max_time_s)
+    solver.parameters.num_search_workers = int(workers)
+    solver.parameters.random_seed = int(random_seed)
+    status_code = solver.solve(model)
+    status_names = {
+        cp_model.UNKNOWN: "UNKNOWN",
+        cp_model.MODEL_INVALID: "MODEL_INVALID",
+        cp_model.FEASIBLE: "FEASIBLE",
+        cp_model.INFEASIBLE: "INFEASIBLE",
+        cp_model.OPTIMAL: "OPTIMAL",
+    }
+    status = status_names.get(status_code, f"STATUS_{status_code}")
+    if status_code not in (cp_model.FEASIBLE, cp_model.OPTIMAL):
+        return ColdPhaseRuntimePlacement(
+            status=status,
+            wall_time_s=float(solver.wall_time),
+            num_cores=num_cores,
+            tasks=(),
+        )
+
+    solved_core_begins = [int(solver.value(core_begin)) for core_begin in core_begins]
+    previous_by_core = [-1] * num_cores
+    runtime_tasks = []
+    schedule_origin_ns = min(assignment.start_ns for assignment in ordered)
+    for task_id, (assignment, core_begin) in enumerate(zip(ordered, solved_core_begins, strict=True)):
+        core_end = core_begin + assignment.threads
+        dependencies = tuple(sorted({task for task in previous_by_core[core_begin:core_end] if task >= 0}))
+        runtime_tasks.append(
+            ColdPhaseRuntimeTask(
+                expert_id=assignment.expert_id,
+                routes=assignment.routes,
+                threads=assignment.threads,
+                core_begin=core_begin,
+                release_ns=assignment.start_ns - schedule_origin_ns,
+                modeled_end_ns=assignment.end_ns - schedule_origin_ns,
+                dependencies=dependencies,
+            )
+        )
+        previous_by_core[core_begin:core_end] = [task_id] * assignment.threads
+
+    return ColdPhaseRuntimePlacement(
+        status=status,
+        wall_time_s=float(solver.wall_time),
+        num_cores=num_cores,
+        tasks=tuple(runtime_tasks),
+    )
+
+
+def cold_phase_runtime_bridge(
+    placement: ColdPhaseRuntimePlacement,
+    planner,
+    *,
+    timed: bool,
+    early_merge: bool | None = False,
+) -> dict[str, object]:
+    """Lower a feasible physical placement to the native Plan V2 bridge."""
+
+    if not placement.tasks or placement.status not in {"FEASIBLE", "OPTIMAL"}:
+        raise ValueError(f"runtime placement is not feasible: status={placement.status}")
+    if int(planner.num_cores) != placement.num_cores:
+        raise ValueError(
+            f"planner and runtime placement core counts differ: {planner.num_cores} vs {placement.num_cores}"
+        )
+    bridge = planner.to_async_bridge([task.planner_tuple() for task in placement.tasks])
+    bridge["task_release_ns"] = [task.release_ns if timed else 0 for task in placement.tasks]
+    bridge["early_merge"] = early_merge
+    return bridge
 
 
 def _parse_int_list(value: str, *, name: str) -> tuple[int, ...]:

@@ -7,6 +7,8 @@ import argparse
 import json
 from pathlib import Path
 
+from schedule_timeline_metrics import enrich_actual_timeline
+
 
 HTML_TEMPLATE = """<!doctype html>
 <html lang="en">
@@ -27,6 +29,8 @@ HTML_TEMPLATE = """<!doctype html>
   --merge: #cf66a3;
   --cleanup: #8f3d72;
   --overhead: #8793a5;
+  --internal-idle: #edf1f5;
+  --tail-idle: #f7ddda;
 }
 * { box-sizing: border-box; letter-spacing: 0; }
 html, body {
@@ -75,6 +79,9 @@ h1 { margin: 0 0 5px; font-size: 24px; line-height: 1.2; font-weight: 650; }
 .legend { display: flex; flex-wrap: wrap; gap: 14px; color: #354052; font-size: 12px; }
 .legend-item { display: inline-flex; align-items: center; gap: 6px; }
 .swatch { width: 14px; height: 14px; border: 1px solid rgba(0,0,0,.08); }
+.swatch-rate { width: 38px; height: 14px; border: 1px solid rgba(0,0,0,.08); }
+.w13-rate { background: linear-gradient(90deg, rgb(219,234,254), rgb(20,73,135)); }
+.w2-rate { background: linear-gradient(90deg, rgb(254,240,189), rgb(156,89,0)); }
 .chart { overflow: auto; border-top: 1px solid var(--line); }
 svg { display: block; width: 1900px; max-width: none; height: auto; background: #fff; }
 .axis { font-size: 11px; fill: var(--muted); }
@@ -101,10 +108,13 @@ svg { display: block; width: 1900px; max-width: none; height: auto; background: 
     </div>
     <div class="legend">
       <span class="legend-item"><span class="swatch" style="background:var(--gather)"></span>Gather / Pack A</span>
-      <span class="legend-item"><span class="swatch" style="background:var(--w13)"></span>W13 + SiLU</span>
-      <span class="legend-item"><span class="swatch" style="background:var(--w2)"></span>W2</span>
+      <span class="legend-item"><span class="swatch-rate w13-rate"></span>W13 + SiLU</span>
+      <span class="legend-item"><span class="swatch-rate w2-rate"></span>W2</span>
+      <span id="rate-scale" class="legend-item"></span>
       <span class="legend-item"><span class="swatch" style="background:var(--merge)"></span>Early merge</span>
       <span class="legend-item"><span class="swatch" style="background:var(--cleanup)"></span>Final merge</span>
+      <span class="legend-item"><span class="swatch" style="background:var(--internal-idle)"></span>Internal idle</span>
+      <span class="legend-item"><span class="swatch" style="background:var(--tail-idle)"></span>Tail idle</span>
     </div>
   </div>
   <div class="chart"><svg id="timeline" role="img" aria-label="Per-core CPU expert execution timeline"></svg></div>
@@ -118,6 +128,8 @@ const cores = data.case.cpu_ids.length;
 const tailTasks = data.plan.tasks.filter(task => Number(task.range_granularity) > 0);
 const poolTasks = data.plan.tasks.filter(task => Number(task.placement_mode) === 1);
 const predictedAvailable = data.predicted.per_core_available !== false;
+const idleMetrics = data.actual.idle_metrics || null;
+const gemmThroughput = data.actual.gemm_throughput || null;
 
 function el(name, attrs = {}, text = null) {
   const node = document.createElementNS(NS, name);
@@ -126,9 +138,10 @@ function el(name, attrs = {}, text = null) {
   return node;
 }
 
-function metric(label, value) {
+function metric(label, value, description = null) {
   const item = document.createElement("div");
   item.className = "metric";
+  if (description !== null) item.title = description;
   const key = document.createElement("div");
   key.className = "metric-label";
   key.textContent = label;
@@ -160,8 +173,27 @@ function stageLabel(stage) {
   }[kind];
 }
 
-function stageColor(stage) {
-  return `var(--${stageKind(stage)})`;
+const RATE_COLORS = {
+  w13: [[219, 234, 254], [20, 73, 135]],
+  w2: [[254, 240, 189], [156, 89, 0]],
+};
+
+function mixColor(low, high, ratio) {
+  const clamped = Math.max(0, Math.min(1, ratio));
+  const channels = low.map((value, index) => Math.round(value + (high[index] - value) * clamped));
+  return `rgb(${channels.join(",")})`;
+}
+
+function stageColor(segment, mode) {
+  const kind = stageKind(segment.stage);
+  const rate = Number(segment.gflops);
+  if (mode === "actual" && RATE_COLORS[kind] && Number.isFinite(rate) && gemmThroughput) {
+    const low = Number(gemmThroughput.color_min_gflops);
+    const high = Number(gemmThroughput.color_max_gflops);
+    const ratio = high > low ? (rate - low) / (high - low) : 1;
+    return mixColor(RATE_COLORS[kind][0], RATE_COLORS[kind][1], ratio);
+  }
+  return `var(--${kind})`;
 }
 
 function formatTask(task) {
@@ -183,6 +215,10 @@ function formatShape(shape) {
 
 function formatMetric(value) {
   return Number.isFinite(Number(value)) ? `${Number(value).toFixed(3)} ms` : "n/a";
+}
+
+function formatIdle(coreMs, percent) {
+  return `${Number(coreMs).toFixed(2)} core-ms · ${Number(percent).toFixed(2)}%`;
 }
 
 function populateHeader() {
@@ -215,6 +251,24 @@ function populateHeader() {
     metric("Planner model", formatMetric(data.predicted.planner_makespan_ms)),
     metric("Phase timeline", predictedAvailable ? formatMetric(data.predicted.makespan_ms) : "aggregate only"),
   );
+  if (idleMetrics) {
+    metrics.append(
+      metric(
+        "Internal idle",
+        formatIdle(idleMetrics.internal_idle_core_ms, idleMetrics.internal_idle_pct),
+        idleMetrics.definition.internal,
+      ),
+      metric(
+        "Tail idle",
+        formatIdle(idleMetrics.tail_idle_core_ms, idleMetrics.tail_idle_pct),
+        idleMetrics.definition.tail,
+      ),
+    );
+  }
+  const scale = document.getElementById("rate-scale");
+  scale.textContent = gemmThroughput
+    ? `light → dark: ${gemmThroughput.color_min_gflops.toFixed(0)}–${gemmThroughput.color_max_gflops.toFixed(0)} GFLOP/s`
+    : "";
   if (!predictedAvailable) {
     const button = document.getElementById("predicted-button");
     button.disabled = true;
@@ -258,22 +312,52 @@ function render(mode) {
       el("text", {x: left - 9, y: y + 11, "text-anchor": "end", class: "core"}, `C${String(core).padStart(2, "0")}`),
       el("line", {x1: left, y1: y + rowHeight, x2: right, y2: y + rowHeight, class: "row"}),
     );
+    if (mode === "actual" && idleMetrics) {
+      const coreIdle = idleMetrics.per_core[String(core)];
+      for (const [kind, gaps] of [
+        ["internal", coreIdle.internal_gaps],
+        ["tail", coreIdle.tail_gaps],
+      ]) {
+        for (const gap of gaps) {
+          const gapX = left + Number(gap.start_ms) * scale;
+          const gapWidth = Math.max(0.5, Number(gap.duration_ms) * scale);
+          const idleRect = el("rect", {
+            x: gapX,
+            y: y + 1,
+            width: gapWidth,
+            height: rowHeight - 2,
+            fill: `var(--${kind}-idle)`,
+          });
+          idleRect.append(el(
+            "title",
+            {},
+            `C${String(core).padStart(2, "0")} · ${kind === "internal" ? "Internal" : "Tail"} idle · ` +
+            `${Number(gap.start_ms).toFixed(3)}-${Number(gap.end_ms).toFixed(3)} ms · ` +
+            `${Number(gap.duration_ms).toFixed(3)} ms`,
+          ));
+          svg.append(idleRect);
+        }
+      }
+    }
     const segments = view.cores[String(core)] || [];
     for (const segment of segments) {
       const x = left + Number(segment.start_ms) * scale;
       const width = Math.max(0.8, (Number(segment.end_ms) - Number(segment.start_ms)) * scale);
       const rect = el("rect", {
         x, y: y + 1, width, height: rowHeight - 2,
-        fill: stageColor(segment.stage),
-        opacity: stageKind(segment.stage) === "cleanup" ? 0.55 : 0.9,
+        fill: stageColor(segment, mode),
+        opacity: stageKind(segment.stage) === "cleanup" ? 0.55 : 0.95,
       });
       const task = tasks.get(Number(segment.task));
       const taskText = task ? ` · ${formatTask(task)} · ${task.threads}T` : "";
+      const rateText = Number.isFinite(Number(segment.gflops))
+        ? ` · ${Number(segment.gflops).toFixed(1)} GFLOP/s · N=${segment.n_columns}`
+        : "";
       rect.append(el(
         "title",
         {},
         `C${String(core).padStart(2, "0")} · ${stageLabel(segment.stage)}${taskText} · ` +
-        `${Number(segment.start_ms).toFixed(3)}-${Number(segment.end_ms).toFixed(3)} ms`,
+        `${Number(segment.start_ms).toFixed(3)}-${Number(segment.end_ms).toFixed(3)} ms${rateText}`,
       ));
       svg.append(rect);
     }
@@ -329,6 +413,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("input", type=Path)
     parser.add_argument("--output", type=Path)
+    parser.add_argument(
+        "--gflops-color-max",
+        type=float,
+        help="override the fixed per-core GFLOP/s represented by the darkest color",
+    )
     return parser.parse_args()
 
 
@@ -337,6 +426,9 @@ def main() -> int:
     payload = json.loads(args.input.read_text(encoding="utf-8"))
     if payload.get("actual") is None:
         raise ValueError("timeline capture has no actual execution data")
+    if args.gflops_color_max is not None and args.gflops_color_max <= 0:
+        raise ValueError("--gflops-color-max must be positive")
+    enrich_actual_timeline(payload, gflops_color_max=args.gflops_color_max)
     output = args.output or args.input.with_suffix(".html")
     encoded = json.dumps(payload, separators=(",", ":")).replace("</", "<\\/")
     output.parent.mkdir(parents=True, exist_ok=True)
