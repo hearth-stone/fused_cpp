@@ -80,6 +80,13 @@ ssh AmazonECS8Cores 'cd /home/ubuntu/zhangxu/fused_cpp && . .venv/bin/activate &
 - Remote work root: `/home/ubuntu/zhangxu`
 - Remote project root: `/home/ubuntu/zhangxu/fused_cpp`
 - CPU topology: 192 CPUs across two NUMA nodes, `0-95` and `96-191`
+- Explicit HugeTLB benchmark pool: 320 x 32 MiB pages (10 GiB total),
+  distributed as 160 pages per NUMA node and mounted at
+  `/dev/hugepages-32M`.
+- Fused MoE benchmarks on this host default to
+  `FUSED_CPP_MOE_HUGETLBFS_PATH=/dev/hugepages-32M`; report explicit 32 MiB
+  HugeTLB backing with the result. Unset the variable only for a named 4 KiB
+  baseline comparison.
 - Keep benchmark processes NUMA-local unless the test explicitly covers both
   nodes.
 
