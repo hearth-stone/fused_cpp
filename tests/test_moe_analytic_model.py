@@ -20,6 +20,16 @@ from analytic_model import (  # noqa: E402
     SaturatingServiceCurve,
     analytic_candidate_shapes,
 )
+from analytic_probe_geometry import (  # noqa: E402
+    b_only_geometry,
+    m12_gemm_geometry,
+    read_cache_info,
+)
+from build_analytic_calibration import (  # noqa: E402
+    build_calibration,
+    fit_nonnegative_residuals,
+    select_curve,
+)
 from interval_planner import IntervalPlanner  # noqa: E402
 from planned_moe import PlannedMoE  # noqa: E402
 from stage_window_policy import StageWindowBand, StaticStageWindowPolicy  # noqa: E402
@@ -57,6 +67,7 @@ def _calibration(
             llc_bytes_per_rank=2 * 1024 * 1024,
         ),
         matrix_flops=_curve(100e9, 100e9 * cores, cores),
+        gemm_core_flops=_curve(60e9, 60e9 * cores, cores),
         frontend_instructions=_curve(20e9, 20e9 * cores, cores),
         l1_bytes=_curve(100e9, 100e9 * cores, cores, curve="shared_bottleneck"),
         l2_bytes=_curve(50e9, 50e9 * cores, cores, curve="shared_bottleneck"),
@@ -110,12 +121,160 @@ def test_shared_bottleneck_curve_preserves_linear_low_thread_scaling() -> None:
     assert curve.rate(128) == pytest.approx(360.0)
 
 
+def test_cache_probe_geometry_uses_detected_hardware_capacity() -> None:
+    l1_gemm = m12_gemm_geometry(64 * 1024, 16, cache_fraction=0.625)
+    l2_gemm = m12_gemm_geometry(2 * 1024 * 1024, 16, cache_fraction=0.5)
+    l1_load = b_only_geometry(64 * 1024, 16, cache_fraction=0.5)
+    l2_load = b_only_geometry(2 * 1024 * 1024, 16, cache_fraction=0.5)
+
+    assert (l1_gemm.k, l1_gemm.n, l1_gemm.working_set_bytes) == (728, 16, 40_768)
+    assert l2_gemm.k == 18_720
+    assert l2_gemm.working_set_bytes <= 1024 * 1024
+    assert (l1_load.k, l1_load.n, l1_load.working_set_bytes) == (1024, 16, 32 * 1024)
+    assert (l2_load.k, l2_load.n, l2_load.working_set_bytes) == (4096, 128, 1024 * 1024)
+
+
+def test_cache_info_reads_linux_sysfs_hierarchy(tmp_path: Path) -> None:
+    cache_root = tmp_path / "cpu3" / "cache"
+    entries = (
+        ("index0", "1", "Data", "64K", "64"),
+        ("index1", "1", "Instruction", "64K", "64"),
+        ("index2", "2", "Unified", "2M", "64"),
+        ("index3", "3", "Unified", "96M", "64"),
+    )
+    for name, level, cache_type, size, line_size in entries:
+        index = cache_root / name
+        index.mkdir(parents=True)
+        (index / "level").write_text(level, encoding="utf-8")
+        (index / "type").write_text(cache_type, encoding="utf-8")
+        (index / "size").write_text(size, encoding="utf-8")
+        (index / "coherency_line_size").write_text(line_size, encoding="utf-8")
+
+    assert read_cache_info(3, sysfs_cpu_root=tmp_path) == {
+        "l1d_bytes_per_core": 64 * 1024,
+        "l2_bytes_per_core": 2 * 1024 * 1024,
+        "llc_bytes_per_rank": 96 * 1024 * 1024,
+        "cache_line_bytes": 64,
+    }
+
+
+def _service_probe() -> dict:
+    widths = (1, 2, 4, 8)
+
+    def service(rates: tuple[float, ...]) -> dict:
+        return {"rows": [{"threads": threads, "aggregate_rate": rate} for threads, rate in zip(widths, rates)]}
+
+    return {
+        "kind": "moe_analytic_service_probe",
+        "machine": {"id": "probe-host", "cores_per_rank": 8},
+        "kernel": {
+            "bfmmla_flops_per_instruction": 32,
+            "bfmmla_instructions_per_cycle": 4,
+            "frontend_instructions_per_cycle": 5,
+        },
+        "caches": {
+            "l1d_bytes_per_core": 64 * 1024,
+            "l2_bytes_per_core": 2 * 1024 * 1024,
+            "llc_bytes_per_rank": 8 * 1024 * 1024,
+        },
+        "services": {
+            "gemm_core_flops": service((60.0, 115.0, 210.0, 360.0)),
+            "gemm_l2_flops": service((45.0, 85.0, 150.0, 250.0)),
+            "matrix_flops": service((100.0, 190.0, 350.0, 600.0)),
+            "l1_bytes": service((80.0, 155.0, 290.0, 500.0)),
+            "l2_bytes": service((50.0, 98.0, 185.0, 320.0)),
+            "llc_bytes": service((20.0, 38.0, 68.0, 70.0)),
+            "dram_bytes": service((10.0, 19.0, 35.0, 34.0)),
+        },
+    }
+
+
+def test_thin_calibration_extracts_private_and_shared_service_curves() -> None:
+    probe = _service_probe()
+
+    private, private_fit = select_curve(probe, "matrix_flops")
+    shared, shared_fit = select_curve(probe, "dram_bytes")
+    calibration, report = build_calibration(
+        probe,
+        machine_id="test-thin",
+        l2_effective_fraction=0.75,
+        llc_effective_fraction=0.625,
+        l2_b_reuse_miss_floor=0.18,
+        l2_b_reuse_miss_at_capacity=0.62,
+        l2_b_reuse_miss_ceiling=0.87,
+        relative_uncertainty=0.15,
+    )
+
+    assert private == {
+        "single_thread_rate": 100.0,
+        "saturated_rate": 600.0,
+        "saturation_threads": 8,
+        "curve": "power",
+    }
+    assert shared["curve"] == "shared_bottleneck"
+    assert shared["saturation_threads"] == 4
+    assert private_fit["rows"][-1]["relative_error"] == pytest.approx(0.0)
+    assert shared_fit["rows"][-1]["predicted_rate"] == pytest.approx(shared["saturated_rate"])
+    assert calibration["services"]["dram_bytes"] == shared
+    assert calibration["services"]["gemm_core_flops"]["single_thread_rate"] == pytest.approx(60.0)
+    assert calibration["services"]["frontend_instructions"]["single_thread_rate"] == pytest.approx(3.90625)
+    assert calibration["caches"]["l2_b_reuse_miss_floor"] == pytest.approx(0.18)
+    assert calibration["caches"]["l2_b_reuse_miss_at_capacity"] == pytest.approx(0.62)
+    assert calibration["caches"]["l2_b_reuse_miss_ceiling"] == pytest.approx(0.87)
+    assert calibration["planner"]["supported_widths"] == [1, 2, 4, 8]
+    assert calibration["provenance"]["contention_measurements_used"] is False
+    assert calibration["provenance"]["gemm_core_service"] == "m12_l1_hot_full_no_store"
+    assert calibration["provenance"]["l2_b_retention_calibration"]["kind"].startswith("independent_")
+    assert report["dram_bytes"] == shared_fit
+    assert report["gemm_l2_flops"]["curve"]["single_thread_rate"] == pytest.approx(45.0)
+
+
+def test_thin_residual_fit_recovers_nonnegative_operator_terms() -> None:
+    expected = [250.0, 3.0, 1.2]
+    features = [
+        [1.0, 12.0, 1_000.0],
+        [1.0, 192.0, 5_000.0],
+        [1.0, 2040.0, 40_000.0],
+        [1.0, 768.0, 16_000.0],
+    ]
+    targets = [sum(coefficient * value for coefficient, value in zip(expected, row)) for row in features]
+
+    actual, sse = fit_nonnegative_residuals(features, targets)
+
+    assert actual == pytest.approx(expected)
+    assert sse == pytest.approx(0.0, abs=1e-12)
+
+
 def test_machine_calibration_json_round_trip() -> None:
     calibration = _calibration()
 
     restored = AnalyticMachineCalibration.from_dict(calibration.to_dict())
 
     assert restored == calibration
+
+
+def test_hot_gemm_core_service_subsumes_frontend_and_l1_resources() -> None:
+    model = _model()
+    phase = next(item for item in model.predict_expert(12, 1).phases if item.kind == "cold_b")
+
+    assert phase.gemm_core_ns > 0.0
+    assert phase.resource_demand("gemm_core_flops", phase.isolated_spill_fraction) == phase.matrix_flops
+    assert phase.resource_demand("matrix_flops", phase.isolated_spill_fraction) == 0.0
+    assert phase.resource_demand("frontend_instructions", phase.isolated_spill_fraction) == 0.0
+    assert phase.resource_demand("l1_bytes", phase.isolated_spill_fraction) == 0.0
+    pressures = model.active_resource_pressure((phase,))
+    assert pressures["gemm_core_flops"].offered_rate > 0.0
+    assert pressures["matrix_flops"].offered_rate == 0.0
+    assert pressures["frontend_instructions"].offered_rate == 0.0
+    assert pressures["l1_bytes"].offered_rate == 0.0
+
+
+def test_machine_without_l1_hot_gemm_peak_is_rejected() -> None:
+    payload = _calibration().to_dict()
+    del payload["services"]["gemm_core_flops"]
+
+    with pytest.raises(ValueError, match="L1-hot gemm_core_flops"):
+        AnalyticMachineCalibration.from_dict(payload)
 
 
 @pytest.mark.parametrize(
@@ -179,13 +338,16 @@ def test_uneven_weight_ranges_use_per_range_traffic() -> None:
     prediction = model.predict_expert(routes=24, threads=3)
     demand = prediction.w13_demand
     phases = [phase for phase in prediction.phases if phase.name.startswith("w13")]
+    cold_phases = [phase for phase in phases if phase.kind == "cold_b"]
+    steady_phases = [phase for phase in phases if phase.kind == "steady_b"]
 
     assert [item.n_tiles for item in demand.range_demands] == [3, 3, 2]
     assert sum(item.balanced_work_fraction for item in demand.range_demands) == pytest.approx(8 / 9)
     assert sum(item.compulsory_dram_bytes for item in demand.range_demands) == 2 * 64 * 32 * 2
-    assert len(phases) == 3
-    assert [phase.active_threads for phase in phases] == [3, 3, 2]
-    assert phases[-1].working_set_bytes < phases[0].working_set_bytes
+    assert len(cold_phases) == 3
+    assert len(steady_phases) == 3
+    assert [phase.active_threads for phase in cold_phases] == [3, 3, 2]
+    assert cold_phases[-1].working_set_bytes < cold_phases[0].working_set_bytes
     explained = model.explain(routes=24, threads=3)["w13"]
     assert explained["executed_flops"] == sum(phase.matrix_flops for phase in phases)
     assert explained["executed_flops"] < explained["mapping_balanced_executed_flops_upper_bound"]
@@ -219,6 +381,82 @@ def test_single_panel_weight_does_not_consume_reusable_llc_budget() -> None:
     assert single_panel.reusable_b_bytes == 0
     assert two_panels.reusable_b_bytes == two_panels.window_bytes
     assert two_panels.llc_working_set_bytes > single_panel.llc_working_set_bytes
+
+
+def test_packed_b_l2_retention_uses_calibrated_miss_anchors() -> None:
+    calibration = _calibration()
+    cache = replace(
+        calibration.caches,
+        l2_b_reuse_miss_floor=0.18,
+        l2_b_reuse_miss_at_capacity=0.62,
+        l2_b_reuse_miss_ceiling=0.87,
+    )
+    model = _model(replace(calibration, caches=cache))
+
+    assert model._l2_b_reuse_miss_fraction(cache.effective_l2_bytes_per_core) == pytest.approx(0.18)
+    assert model._l2_b_reuse_miss_fraction(cache.l2_bytes_per_core) == pytest.approx(0.62)
+    assert model._l2_b_reuse_miss_fraction(2 * cache.l2_bytes_per_core) == pytest.approx(0.87)
+
+
+def test_single_panel_stage_is_entirely_cold_b() -> None:
+    prediction = _model().predict_expert(routes=12, threads=2)
+
+    for stage, demand in (("w13", prediction.w13_demand), ("w2", prediction.w2_demand)):
+        phases = [phase for phase in prediction.phases if phase.name.startswith(stage)]
+        gemm_phases = [phase for phase in phases if phase.kind in {"cold_b", "steady_b"}]
+
+        assert gemm_phases
+        assert all(phase.kind == "cold_b" for phase in gemm_phases)
+        assert sum(phase.compulsory_dram_bytes for phase in gemm_phases) == demand.compulsory_dram_bytes
+        assert sum(phase.panel_count for phase in gemm_phases) == demand.ranges
+
+
+def test_long_stage_splits_cold_and_steady_demand_without_changing_work() -> None:
+    prediction = _model().predict_expert(routes=24, threads=2)
+
+    for stage, demand in (("w13", prediction.w13_demand), ("w2", prediction.w2_demand)):
+        phases = [
+            phase
+            for phase in prediction.phases
+            if phase.name.startswith(stage) and phase.kind in {"cold_b", "steady_b"}
+        ]
+        cold = [phase for phase in phases if phase.kind == "cold_b"]
+        steady = [phase for phase in phases if phase.kind == "steady_b"]
+
+        assert len(cold) == demand.ranges
+        assert len(steady) == demand.ranges
+        assert all(phase.compulsory_dram_bytes > 0 for phase in cold)
+        assert all(phase.compulsory_dram_bytes == 0 for phase in steady)
+        assert sum(phase.matrix_flops for phase in phases) == demand.mapping.demand.balanced_executed_flops
+        assert sum(phase.l2_bytes for phase in phases) == pytest.approx(demand.l2_bytes)
+        assert sum(phase.llc_bytes for phase in phases) == pytest.approx(demand.llc_bytes)
+        assert sum(phase.compulsory_dram_bytes for phase in phases) == demand.compulsory_dram_bytes
+        assert sum(phase.spillable_dram_bytes for phase in phases) == pytest.approx(demand.spillable_dram_bytes)
+
+
+@pytest.mark.parametrize("routes", [1, 2, 8, 12, 13, 25, 192, 2040])
+@pytest.mark.parametrize("threads", [1, 2, 4, 8])
+def test_phase_lowering_conserves_kernel_demand_across_routes_and_widths(routes: int, threads: int) -> None:
+    prediction = _model().predict_expert(routes=routes, threads=threads)
+
+    for stage, demand in (("w13", prediction.w13_demand), ("w2", prediction.w2_demand)):
+        phases = [
+            phase
+            for phase in prediction.phases
+            if phase.name.startswith(stage) and phase.kind in {"cold_b", "steady_b"}
+        ]
+
+        assert sum(phase.panel_count for phase in phases) == len(demand.mapping.panels) * demand.ranges
+        assert sum(phase.matrix_flops for phase in phases) == demand.mapping.demand.balanced_executed_flops
+        assert (
+            sum(phase.frontend_instructions for phase in phases) == demand.mapping.demand.balanced_key_body_instructions
+        )
+        assert sum(phase.l1_bytes for phase in phases) == demand.mapping.demand.balanced_l1_load_bytes
+        assert sum(phase.epilogue_elements for phase in phases) == demand.mapping.demand.balanced_epilogue_elements
+        assert sum(phase.l2_bytes for phase in phases) == pytest.approx(demand.l2_bytes)
+        assert sum(phase.llc_bytes for phase in phases) == pytest.approx(demand.llc_bytes)
+        assert sum(phase.compulsory_dram_bytes for phase in phases) == pytest.approx(demand.compulsory_dram_bytes)
+        assert sum(phase.spillable_dram_bytes for phase in phases) == pytest.approx(demand.spillable_dram_bytes)
 
 
 def test_split_w13_keeps_gemm_work_but_adds_range_overhead() -> None:
@@ -270,6 +508,7 @@ def test_shared_resource_capacity_derates_parallel_experts() -> None:
     calibration = replace(
         _calibration(dram_saturated_rate=10e9),
         matrix_flops=_curve(1e9, 1e9, 8),
+        gemm_core_flops=_curve(1e9, 1e9, 8),
     )
     model = _model(calibration)
     isolated = model.T_iso(12, 1)
@@ -285,8 +524,67 @@ def test_shared_resource_capacity_derates_parallel_experts() -> None:
     assert max(finish_times) == pytest.approx(sequential)
 
 
+def test_resource_pressure_uses_requesting_threads_and_named_capacity() -> None:
+    model = _model()
+    prediction = model.predict_expert(routes=24, threads=2)
+    setup = next(phase for phase in prediction.phases if phase.kind == "range_setup")
+    cold = next(phase for phase in prediction.phases if phase.kind == "cold_b")
+
+    pressures = model.active_resource_pressure((setup, cold))
+    dram = pressures["dram_bytes"]
+
+    assert dram.active_threads == cold.active_threads
+    assert dram.capacity == model.calibration.dram_bytes.rate(cold.active_threads)
+    assert dram.offered_rate > 0.0
+    assert dram.utilization == pytest.approx(dram.offered_rate / dram.capacity)
+    assert dram.dilation == pytest.approx(max(1.0, dram.utilization))
+    assert dram.allocated_rate <= dram.capacity * (1.0 + 1e-12)
+    assert dram.allocated_utilization <= 1.0 + 1e-12
+
+    explained_cold = next(phase for phase in model.explain(routes=24, threads=2)["phases"] if phase["kind"] == "cold_b")
+    assert explained_cold["resource_pressure"]["llc_bytes"]["path"] == "shared_llc_to_private_l2_refill"
+    assert explained_cold["resource_pressure"]["dram_bytes"]["offered_rate"] > 0.0
+
+
+def test_dag_explanation_exposes_phase_local_resource_contention() -> None:
+    fast = _curve(1e15, 8e15, 8)
+    calibration = replace(
+        _calibration(),
+        gemm_core_flops=fast,
+        matrix_flops=fast,
+        frontend_instructions=fast,
+        l1_bytes=fast,
+        l2_bytes=fast,
+        llc_bytes=fast,
+        dram_bytes=_curve(1e9, 1e9, 8),
+        epilogue_elements=fast,
+    )
+    model = _model(calibration)
+    tasks = [(12, 1, []), (12, 1, [])]
+
+    explanation = model.explain_dag(tasks)
+    contended = [
+        event for event in explanation["events"] if event["resources"].get("dram_bytes", {}).get("dilation", 1.0) > 1.0
+    ]
+
+    assert explanation["makespan_ns"] == pytest.approx(model.dag_makespan(tasks))
+    assert max(explanation["task_finish_ns"]) == pytest.approx(explanation["makespan_ns"])
+    assert contended
+    assert any("cold_b" in event["phase_kinds"].values() for event in contended)
+    assert all(event["resources"]["dram_bytes"]["path"] == "dram_to_llc_compulsory_and_spill" for event in contended)
+    assert all(
+        pressure["allocated_rate"] <= pressure["capacity"] * (1.0 + 1e-12)
+        for event in explanation["events"]
+        for pressure in event["resources"].values()
+        if pressure["capacity"] is not None
+    )
+
+
 def test_isolated_llc_spill_matches_single_task_dag() -> None:
-    calibration = _calibration()
+    calibration = replace(
+        _calibration(),
+        gemm_core_flops=_curve(1e15, 8e15, 8),
+    )
     tiny_llc = replace(
         calibration,
         caches=replace(
@@ -379,14 +677,18 @@ def test_holdout_validator_reports_absolute_error_and_shape_regret() -> None:
         ],
     }
 
-    report = build_validation_report(calibration, profile)
+    report = build_validation_report(calibration, profile, isolated_training_points={(12, 1)})
 
+    assert report["analytic_model_schema_version"] == 5
+    assert report["analytic_model"] == "phase_ecm_shared_resource_v3"
     assert report["isolated"]["coverage"] == {
         "profile_points": 2,
         "evaluated_points": 2,
         "skipped_points": 0,
     }
     assert report["isolated"]["summary"]["mape"] == pytest.approx(0.0)
+    assert report["isolated"]["holdout_summary"]["points"] == 1
+    assert report["isolated"]["training_points"] == [{"routes": 12, "threads": 1}]
     assert report["contention"]["summary"]["mape"] == pytest.approx(0.0)
     assert report["contention"]["ranking"]["max_regret"] == pytest.approx(0.0)
 

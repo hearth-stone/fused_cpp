@@ -13,9 +13,9 @@ import statistics
 from pathlib import Path
 
 try:
-    from analytic_model import AnalyticMachineCalibration, AnalyticMoeCostModel
+    from analytic_model import ANALYTIC_MODEL_NAME, AnalyticMachineCalibration, AnalyticMoeCostModel
 except ImportError:  # pragma: no cover - package-style import
-    from .analytic_model import AnalyticMachineCalibration, AnalyticMoeCostModel
+    from .analytic_model import ANALYTIC_MODEL_NAME, AnalyticMachineCalibration, AnalyticMoeCostModel
 
 
 def _percentile(values: list[float], fraction: float) -> float:
@@ -155,6 +155,7 @@ def build_validation_report(
     profile: dict,
     *,
     down_output_element_bytes: int = 2,
+    isolated_training_points: set[tuple[int, int]] | None = None,
 ) -> dict:
     if int(profile.get("schema_version", 0)) < 2:
         raise ValueError("analytical validation requires an empirical schema-v2 profile")
@@ -169,9 +170,15 @@ def build_validation_report(
         down_output_element_bytes=down_output_element_bytes,
     )
     isolated = _isolated_rows(model, profile)
+    training_points = isolated_training_points or set()
+    isolated_holdout = [
+        row for row in isolated if (int(row["routes"]), int(row["threads"])) not in training_points
+    ]
     contention = _contention_rows(model, profile)
     return {
         "kind": "moe_analytic_validation",
+        "analytic_model_schema_version": model.schema_version,
+        "analytic_model": ANALYTIC_MODEL_NAME,
         "machine_id": calibration.machine_id,
         "holdout_profile": profile.get("measurement", {}).get("profile_id"),
         "model_policy": {
@@ -188,6 +195,10 @@ def build_validation_report(
                 "skipped_points": len(profile["isolated"]) - len(isolated),
             },
             "summary": _error_summary(isolated),
+            "holdout_summary": _error_summary(isolated_holdout),
+            "training_points": [
+                {"routes": routes, "threads": threads} for routes, threads in sorted(training_points)
+            ],
             "rows": isolated,
         },
         "contention": {
@@ -220,12 +231,20 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    calibration = AnalyticMachineCalibration.from_path(args.calibration)
+    calibration_payload = json.loads(args.calibration.read_text(encoding="utf-8"))
+    calibration = AnalyticMachineCalibration.from_dict(calibration_payload)
     profile = json.loads(args.profile.read_text(encoding="utf-8"))
+    residual_training = calibration_payload.get("provenance", {}).get("isolated_residual_training", {})
+    isolated_training_points = {
+        (int(routes), int(threads))
+        for routes in residual_training.get("routes", ())
+        for threads in residual_training.get("threads", ())
+    }
     report = build_validation_report(
         calibration,
         profile,
         down_output_element_bytes=args.down_output_element_bytes,
+        isolated_training_points=isolated_training_points,
     )
     output = json.dumps(report, indent=2, sort_keys=True)
     if args.output is None:

@@ -18,10 +18,13 @@ micro-optimizations. It should close the remaining high-value variables first,
 then refresh the calibration data and cost model once and validate them as a
 coherent system.
 
-1. Produce independent thin analytical calibrations on AmazonECS8Cores and one
-   NUMA rank of AmazonC5192Cores.
-2. Validate unseen routes, widths, mixed distributions, split policy, and
-   per-stage weight windows against the analytical acceptance gates.
+1. Produce the remaining independent thin analytical calibration on
+   AmazonECS8Cores. The AmazonC5192Cores NUMA0 calibration now uses a
+   hardware-capacity-derived L1-hot M12 GEMM core ceiling, but still does not
+   pass the holdout gates.
+2. Add an independent multi-team packed-B retention/refill probe and
+   topology-aware LLC service, then repeat unseen routes, widths, mixed
+   distributions, split policy, and per-stage weight-window validation.
 3. Fix cross-rank lifetime switching for the remaining EP absolute-time error.
 4. Add measured gather/pack, route merge, communication, and distributed TP/EP
    terms after the compute model passes its gates.
@@ -78,14 +81,34 @@ coherent system.
 - [x] Separate logical GEMM work, exact SVE kernel demand, and machine response.
 - [x] Replace route/thread latency lookup with cache-capacity formulas and
   route-independent matrix/L1/L2/LLC/DRAM service curves.
-- [x] Derive contention from per-resource aggregate requested rate inside the
-  W13/W2 range event simulator.
+- [x] Split each W13/W2 range into zero-demand setup, first-panel cold-B, and
+  remaining-panel steady-B phases; preserve physical demand exactly.
+- [x] Derive contention from per-resource offered load and calibrated service
+  capacity using only threads that actually request that resource.
+- [x] Expose event-level working set, spill fraction, offered rate, capacity,
+  utilization, and dilation without a pairwise slowdown matrix.
 - [x] Let the analytical backend generate homogeneous and two-width shapes while
   preserving empirical profile behavior.
 - [x] Add an empirical-holdout validator for isolated error, contention error,
   and measured planner regret.
-- [ ] Produce independent thin calibrations on AmazonECS8Cores and one NUMA rank
-  of AmazonC5192Cores. Do not infer service ceilings from the route/thread table.
+- [x] Produce an independent thin calibration on one NUMA rank of
+  AmazonC5192Cores without inferring service ceilings from the route/thread
+  table. The 2026-08-01 result reduced maximum shape regret from 32.31% to
+  8.17%, but true isolated MAPE/contention P90 remained 10.22%/47.79% and failed
+  the production gates.
+- [x] Replace the register-only BFMMLA compute ceiling with an M12
+  full-no-store GEMM service whose L1/L2 geometries are derived from Linux sysfs
+  cache capacities. On AmazonC5192Cores the L1 probe is M12/K728/N16
+  (40,768 B); the 4096-run 2026-08-02 refresh measured 0.340/30.377 TFLOP/s at
+  1/96T, while holdout MAPE/contention P90/max regret were
+  9.18%/49.57%/8.17%. Only the isolated gate now passes.
+- [ ] Measure independent exact-M M1-M11 core-efficiency ratios relative to the
+  M12 L1-hot service. Admit them only if they improve unseen tail routes without
+  becoming another route/thread latency table.
+- [ ] Produce the corresponding independent thin calibration on
+  AmazonECS8Cores.
+- [ ] Calibrate multi-team packed-B retention/refill and below-NUMA LLC topology
+  from independent probes; do not add a task-pair slowdown table.
 - [ ] Validate unseen routes, widths, mixed distributions, split/no-split, and
   byte-window policies against the acceptance gates in
   `cost_model/ANALYTIC_MODEL.md`.
@@ -178,6 +201,13 @@ Acceptance gates:
   so neither schedule is adopted. Keep non-ILV as the fused JIT baseline.
   Full five-run W13/W2 results are in
   `../optimizations/fused_moe_sve/results/amazon_8c_192c_upstream_m8_m12_ilv.md`.
+- [x] Test an M12 two-B-register column pipeline against the L1-hot full loop
+  on all 96 Neoverse-V3 cores. The 21-repeat median rose from 30.420 to 30.617
+  TFLOP/s (+0.648%), and linear efficiency rose by 0.592 percentage points,
+  but `DISPATCH_STALL_IQ_VX` increased about 37.5%. This is below the 2%
+  adoption threshold, so keep it benchmark-only and retain the existing M12
+  production schedule. Full results are in
+  `../optimizations/fused_moe_sve/results/amazon_192c_m12_column_pipeline_20260802.md`.
 - [x] Close W13-only first-panel software prefetch as a production candidate.
   It hides cold-B latency under low or moderate concurrency, but crosses over
   near 18-20 concurrent streams on AmazonC5192Cores and can regress reusable-B

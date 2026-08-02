@@ -1,0 +1,212 @@
+{
+  "schema_version": 1,
+  "kind": "moe_analytic_machine",
+  "machine": {
+    "id": "AmazonC5192Cores-numa0-sve-jit-thin-20260801",
+    "cores_per_rank": 96
+  },
+  "caches": {
+    "l1d_bytes_per_core": 65536,
+    "l2_bytes_per_core": 2097152,
+    "llc_bytes_per_rank": 100663296,
+    "l2_effective_fraction": 0.75,
+    "llc_effective_fraction": 0.6666666666666666,
+    "l2_b_reuse_miss_floor": 0.18,
+    "l2_b_reuse_miss_at_capacity": 0.623,
+    "l2_b_reuse_miss_ceiling": 0.869
+  },
+  "services": {
+    "dram_bytes": {
+      "single_thread_rate": 42642835583.700775,
+      "saturated_rate": 395903523798.63794,
+      "saturation_threads": 48,
+      "curve": "shared_bottleneck"
+    },
+    "l1_bytes": {
+      "single_thread_rate": 128572864937.77205,
+      "saturated_rate": 9437110272575.994,
+      "saturation_threads": 96,
+      "curve": "power"
+    },
+    "l2_bytes": {
+      "single_thread_rate": 99517329076.35353,
+      "saturated_rate": 9334396253752.621,
+      "saturation_threads": 96,
+      "curve": "power"
+    },
+    "llc_bytes": {
+      "single_thread_rate": 67773824763.73738,
+      "saturated_rate": 1188694028029.1873,
+      "saturation_threads": 96,
+      "curve": "power"
+    },
+    "matrix_flops": {
+      "single_thread_rate": 412902984460.5014,
+      "saturated_rate": 39006884193804.29,
+      "saturation_threads": 96,
+      "curve": "power"
+    },
+    "frontend_instructions": {
+      "single_thread_rate": 16129022830.488337,
+      "saturated_rate": 1523706413820.48,
+      "saturation_threads": 96,
+      "curve": "power"
+    }
+  },
+  "overheads": {
+    "call_setup_ns": 0.0,
+    "expert_fixed_ns": 51911.947414169495,
+    "route_ns": 479.1012798357974,
+    "stage_fixed_ns": 0.0,
+    "range_fixed_ns": 0.0
+  },
+  "planner": {
+    "supported_widths": [
+      1,
+      2,
+      4,
+      8,
+      16,
+      24,
+      32,
+      48,
+      64,
+      96
+    ]
+  },
+  "uncertainty": {
+    "relative": 0.15
+  },
+  "stage_scales": {
+    "w13": 1.185461301083136,
+    "w2": 1.185461301083136
+  },
+  "provenance": {
+    "service_probe_kind": "moe_analytic_service_probe",
+    "service_probe_machine": {
+      "id": "ip-172-31-87-203",
+      "architecture": "aarch64",
+      "logical_cpus": 192,
+      "cpu_ids": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27,
+        28,
+        29,
+        30,
+        31,
+        32,
+        33,
+        34,
+        35,
+        36,
+        37,
+        38,
+        39,
+        40,
+        41,
+        42,
+        43,
+        44,
+        45,
+        46,
+        47,
+        48,
+        49,
+        50,
+        51,
+        52,
+        53,
+        54,
+        55,
+        56,
+        57,
+        58,
+        59,
+        60,
+        61,
+        62,
+        63,
+        64,
+        65,
+        66,
+        67,
+        68,
+        69,
+        70,
+        71,
+        72,
+        73,
+        74,
+        75,
+        76,
+        77,
+        78,
+        79,
+        80,
+        81,
+        82,
+        83,
+        84,
+        85,
+        86,
+        87,
+        88,
+        89,
+        90,
+        91,
+        92,
+        93,
+        94,
+        95
+      ],
+      "cores_per_rank": 96
+    },
+    "contention_measurements_used": false,
+    "l2_b_retention_calibration": {
+      "kind": "independent_packed_b_repeated_scan_probe",
+      "miss_floor": 0.18,
+      "miss_at_nominal_capacity": 0.623,
+      "miss_at_twice_nominal_capacity": 0.869
+    },
+    "isolated_residual_training": {
+      "routes": [
+        12,
+        192,
+        2040
+      ],
+      "threads": [
+        1,
+        4,
+        16,
+        48
+      ],
+      "points": 12
+    }
+  }
+}

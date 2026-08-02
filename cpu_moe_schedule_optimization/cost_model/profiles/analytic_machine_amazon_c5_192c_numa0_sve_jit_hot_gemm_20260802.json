@@ -1,0 +1,220 @@
+{
+  "schema_version": 1,
+  "kind": "moe_analytic_machine",
+  "machine": {
+    "id": "AmazonC5192Cores-numa0-sve-jit-hot-gemm-20260802",
+    "cores_per_rank": 96
+  },
+  "caches": {
+    "l1d_bytes_per_core": 65536,
+    "l2_bytes_per_core": 2097152,
+    "llc_bytes_per_rank": 100663296,
+    "l2_effective_fraction": 0.75,
+    "llc_effective_fraction": 0.6666666666666666,
+    "l2_b_reuse_miss_floor": 0.18,
+    "l2_b_reuse_miss_at_capacity": 0.623,
+    "l2_b_reuse_miss_ceiling": 0.869
+  },
+  "services": {
+    "dram_bytes": {
+      "single_thread_rate": 43361503172.53143,
+      "saturated_rate": 391081510596.96094,
+      "saturation_threads": 64,
+      "curve": "shared_bottleneck"
+    },
+    "gemm_core_flops": {
+      "single_thread_rate": 340397566357.08057,
+      "saturated_rate": 30376793183397.105,
+      "saturation_threads": 96,
+      "curve": "power"
+    },
+    "l1_bytes": {
+      "single_thread_rate": 128486214924.64159,
+      "saturated_rate": 8871944122507.436,
+      "saturation_threads": 96,
+      "curve": "power"
+    },
+    "l2_bytes": {
+      "single_thread_rate": 100093463909.96059,
+      "saturated_rate": 9421542766890.904,
+      "saturation_threads": 96,
+      "curve": "power"
+    },
+    "llc_bytes": {
+      "single_thread_rate": 67641083065.614876,
+      "saturated_rate": 1178015194923.2004,
+      "saturation_threads": 96,
+      "curve": "power"
+    },
+    "matrix_flops": {
+      "single_thread_rate": 412402376172.72314,
+      "saturated_rate": 39308504362814.516,
+      "saturation_threads": 96,
+      "curve": "power"
+    },
+    "frontend_instructions": {
+      "single_thread_rate": 16109467819.246998,
+      "saturated_rate": 1535488451672.442,
+      "saturation_threads": 96,
+      "curve": "power"
+    }
+  },
+  "overheads": {
+    "call_setup_ns": 0.0,
+    "expert_fixed_ns": 51406.537086644385,
+    "route_ns": 418.7552029551573,
+    "stage_fixed_ns": 0.0,
+    "range_fixed_ns": 0.0
+  },
+  "planner": {
+    "supported_widths": [
+      1,
+      2,
+      4,
+      8,
+      16,
+      24,
+      32,
+      48,
+      64,
+      96
+    ]
+  },
+  "uncertainty": {
+    "relative": 0.05
+  },
+  "stage_scales": {
+    "w13": 1.1084196760088287,
+    "w2": 1.1084196760088287
+  },
+  "provenance": {
+    "service_probe_kind": "moe_analytic_service_probe",
+    "service_probe_machine": {
+      "id": "ip-172-31-87-203",
+      "architecture": "aarch64",
+      "logical_cpus": 192,
+      "cpu_ids": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27,
+        28,
+        29,
+        30,
+        31,
+        32,
+        33,
+        34,
+        35,
+        36,
+        37,
+        38,
+        39,
+        40,
+        41,
+        42,
+        43,
+        44,
+        45,
+        46,
+        47,
+        48,
+        49,
+        50,
+        51,
+        52,
+        53,
+        54,
+        55,
+        56,
+        57,
+        58,
+        59,
+        60,
+        61,
+        62,
+        63,
+        64,
+        65,
+        66,
+        67,
+        68,
+        69,
+        70,
+        71,
+        72,
+        73,
+        74,
+        75,
+        76,
+        77,
+        78,
+        79,
+        80,
+        81,
+        82,
+        83,
+        84,
+        85,
+        86,
+        87,
+        88,
+        89,
+        90,
+        91,
+        92,
+        93,
+        94,
+        95
+      ],
+      "cores_per_rank": 96
+    },
+    "gemm_core_service": "m12_l1_hot_full_no_store",
+    "matrix_service": "register_only_bfmmla_diagnostic",
+    "contention_measurements_used": false,
+    "l2_b_retention_calibration": {
+      "kind": "independent_packed_b_repeated_scan_probe",
+      "miss_floor": 0.18,
+      "miss_at_nominal_capacity": 0.623,
+      "miss_at_twice_nominal_capacity": 0.869
+    },
+    "isolated_residual_training": {
+      "routes": [
+        12,
+        192,
+        2040
+      ],
+      "threads": [
+        1,
+        4,
+        16,
+        48
+      ],
+      "points": 12
+    }
+  }
+}

@@ -9,9 +9,9 @@ calibration:
   saturating service curves, and fixed runtime costs.
 
 Unlike ``ContentionCostModel``, no route/thread latency table or measured
-contention shape is required.  Concurrent tasks are simulated as W13/W2 range
-phases which consume calibrated aggregate matrix, frontend, cache, DRAM, and
-epilogue service ceilings.
+contention shape is required. Concurrent tasks are simulated as W13/W2
+setup/cold-B/steady-B phases which consume calibrated aggregate matrix,
+frontend, cache, DRAM, and epilogue service ceilings.
 """
 
 from __future__ import annotations
@@ -43,8 +43,10 @@ except ImportError:  # pragma: no cover - package-style import
 
 
 ANALYTIC_MACHINE_SCHEMA_VERSION = 1
-ANALYTIC_MODEL_SCHEMA_VERSION = 3
+ANALYTIC_MODEL_SCHEMA_VERSION = 5
+ANALYTIC_MODEL_NAME = "phase_ecm_shared_resource_v3"
 _SHARED_RESOURCES = (
+    "gemm_core_flops",
     "matrix_flops",
     "frontend_instructions",
     "l1_bytes",
@@ -53,15 +55,24 @@ _SHARED_RESOURCES = (
     "dram_bytes",
     "epilogue_elements",
 )
+_RESOURCE_PATHS = {
+    "gemm_core_flops": "m12_l1_hot_gemm_core",
+    "matrix_flops": "bfmmla_execution",
+    "frontend_instructions": "frontend_and_issue",
+    "l1_bytes": "core_load_delivery",
+    "l2_bytes": "private_l2_transfer",
+    "llc_bytes": "shared_llc_to_private_l2_refill",
+    "dram_bytes": "dram_to_llc_compulsory_and_spill",
+    "epilogue_elements": "fused_epilogue_execution",
+}
 
 
 @dataclass(frozen=True)
 class SaturatingServiceCurve:
     """Monotone service curve fixed by one-core and saturation measurements.
 
-    Between the two anchors the curve is a power law.  This captures linear
-    private-resource scaling (exponent one) and sublinear shared-fabric or
-    memory scaling without storing a value for every active width.
+    The selected curve family interpolates between one-core service and the
+    sustainable aggregate knee without storing a value for every active width.
     """
 
     single_thread_rate: float
@@ -127,6 +138,9 @@ class CacheCalibration:
     llc_bytes_per_rank: int
     l2_effective_fraction: float = 0.75
     llc_effective_fraction: float = 0.75
+    l2_b_reuse_miss_floor: float = 0.0
+    l2_b_reuse_miss_at_capacity: float = 1.0
+    l2_b_reuse_miss_ceiling: float = 1.0
 
     def __post_init__(self) -> None:
         if min(self.l1d_bytes_per_core, self.l2_bytes_per_core, self.llc_bytes_per_rank) <= 0:
@@ -135,6 +149,10 @@ class CacheCalibration:
             raise ValueError("l2_effective_fraction must be in (0, 1]")
         if not 0.0 < self.llc_effective_fraction <= 1.0:
             raise ValueError("llc_effective_fraction must be in (0, 1]")
+        if not 0.0 <= self.l2_b_reuse_miss_floor < 1.0:
+            raise ValueError("l2_b_reuse_miss_floor must be in [0, 1)")
+        if not (self.l2_b_reuse_miss_floor <= self.l2_b_reuse_miss_at_capacity <= self.l2_b_reuse_miss_ceiling <= 1.0):
+            raise ValueError("packed-B L2 miss anchors must be monotone and no larger than one")
 
     @property
     def effective_l2_bytes_per_core(self) -> float:
@@ -152,6 +170,9 @@ class CacheCalibration:
             llc_bytes_per_rank=int(payload["llc_bytes_per_rank"]),
             l2_effective_fraction=float(payload.get("l2_effective_fraction", 0.75)),
             llc_effective_fraction=float(payload.get("llc_effective_fraction", 0.75)),
+            l2_b_reuse_miss_floor=float(payload.get("l2_b_reuse_miss_floor", 0.0)),
+            l2_b_reuse_miss_at_capacity=float(payload.get("l2_b_reuse_miss_at_capacity", 1.0)),
+            l2_b_reuse_miss_ceiling=float(payload.get("l2_b_reuse_miss_ceiling", 1.0)),
         )
 
 
@@ -195,6 +216,7 @@ class AnalyticMachineCalibration:
     cores_per_rank: int
     caches: CacheCalibration
     matrix_flops: SaturatingServiceCurve
+    gemm_core_flops: SaturatingServiceCurve
     l1_bytes: SaturatingServiceCurve
     l2_bytes: SaturatingServiceCurve
     llc_bytes: SaturatingServiceCurve
@@ -212,6 +234,8 @@ class AnalyticMachineCalibration:
             raise ValueError("machine_id must be non-empty")
         if self.cores_per_rank <= 0:
             raise ValueError("cores_per_rank must be positive")
+        if self.gemm_core_flops is None:
+            raise ValueError("gemm_core_flops must provide the L1-hot GEMM compute peak")
         widths = tuple(sorted(set(int(width) for width in self.supported_widths)))
         if not widths or widths[0] <= 0 or widths[-1] > self.cores_per_rank:
             raise ValueError("supported_widths must be positive and no larger than cores_per_rank")
@@ -241,11 +265,14 @@ class AnalyticMachineCalibration:
         stage_scales = payload.get("stage_scales", {})
         optional_frontend = services.get("frontend_instructions")
         optional_epilogue = services.get("epilogue_elements")
+        if "gemm_core_flops" not in services:
+            raise ValueError("analytic calibration must contain the L1-hot gemm_core_flops service")
         return cls(
             machine_id=str(machine["id"]),
             cores_per_rank=int(machine["cores_per_rank"]),
             caches=CacheCalibration.from_dict(payload["caches"]),
             matrix_flops=SaturatingServiceCurve.from_dict(services["matrix_flops"]),
+            gemm_core_flops=SaturatingServiceCurve.from_dict(services["gemm_core_flops"]),
             l1_bytes=SaturatingServiceCurve.from_dict(services["l1_bytes"]),
             l2_bytes=SaturatingServiceCurve.from_dict(services["l2_bytes"]),
             llc_bytes=SaturatingServiceCurve.from_dict(services["llc_bytes"]),
@@ -273,6 +300,7 @@ class AnalyticMachineCalibration:
 
         services = {
             "matrix_flops": service(self.matrix_flops),
+            "gemm_core_flops": service(self.gemm_core_flops),
             "l1_bytes": service(self.l1_bytes),
             "l2_bytes": service(self.l2_bytes),
             "llc_bytes": service(self.llc_bytes),
@@ -445,8 +473,11 @@ class AnalyticStageDemand:
 @dataclass(frozen=True)
 class AnalyticPhase:
     name: str
+    kind: str
+    panel_count: int
     active_threads: int
     fixed_ns: float
+    gemm_core_ns: float
     matrix_ns: float
     frontend_ns: float
     l1_ns: float
@@ -466,13 +497,41 @@ class AnalyticPhase:
     isolated_spill_fraction: float
     residual_scale: float = 1.0
 
+    def __post_init__(self) -> None:
+        if self.kind not in {"operator", "range_setup", "cold_b", "steady_b"}:
+            raise ValueError(f"unsupported analytical phase kind {self.kind!r}")
+        if self.panel_count < 0:
+            raise ValueError("panel_count must be non-negative")
+        if self.kind in {"operator", "range_setup"} and self.panel_count != 0:
+            raise ValueError("non-GEMM phases cannot contain GEMM panels")
+        if self.kind in {"cold_b", "steady_b"} and self.panel_count == 0:
+            raise ValueError("GEMM phases must contain at least one panel")
+
     def dram_bytes(self, spill_fraction: float) -> float:
         return self.compulsory_dram_bytes + spill_fraction * self.spillable_dram_bytes
 
     def resource_demand(self, resource: str, spill_fraction: float) -> float:
+        if resource == "gemm_core_flops":
+            return self.matrix_flops
+        if resource in {"matrix_flops", "frontend_instructions", "l1_bytes"}:
+            return 0.0
         if resource == "dram_bytes":
             return self.dram_bytes(spill_fraction)
         return float(getattr(self, resource))
+
+    def resource_times_ns(self, spill_fraction: float | None = None) -> dict[str, float]:
+        if spill_fraction is None:
+            spill_fraction = self.isolated_spill_fraction
+        return {
+            "gemm_core_flops": self.gemm_core_ns,
+            "matrix_flops": self.matrix_ns,
+            "frontend_instructions": self.frontend_ns,
+            "l1_bytes": self.l1_ns,
+            "l2_bytes": self.l2_ns,
+            "llc_bytes": self.llc_ns,
+            "dram_bytes": self.dram_bytes(spill_fraction) / self.dram_rate * 1e9,
+            "epilogue_elements": self.epilogue_ns,
+        }
 
     def duration_ns(
         self,
@@ -483,17 +542,20 @@ class AnalyticPhase:
         if spill_fraction is None:
             spill_fraction = self.isolated_spill_fraction
         scales = resource_scales or {}
-        matrix_ns = self.matrix_ns * scales.get("matrix_flops", 1.0)
-        frontend_ns = self.frontend_ns * scales.get("frontend_instructions", 1.0)
-        dram_ns = self.dram_bytes(spill_fraction) / self.dram_rate * 1e9 * scales.get("dram_bytes", 1.0)
-        transfer_ns = (
-            self.l1_ns * scales.get("l1_bytes", 1.0)
-            + self.l2_ns * scales.get("l2_bytes", 1.0)
-            + self.llc_ns * scales.get("llc_bytes", 1.0)
-            + dram_ns
+        times = self.resource_times_ns(spill_fraction)
+        gemm_core_ns = times["gemm_core_flops"] * scales.get("gemm_core_flops", 1.0)
+        # The calibrated load probes measure endpoint-to-register service:
+        # LLC already includes LLC->L2->L1 and DRAM includes the whole path.
+        # Their lower bounds overlap and therefore compose with max, not sum.
+        # The L1-hot M12 GEMM peak already includes BFMMLA, frontend, and L1
+        # load delivery. Only lower hierarchy endpoint bounds remain.
+        transfer_ns = max(
+            times["l2_bytes"] * scales.get("l2_bytes", 1.0),
+            times["llc_bytes"] * scales.get("llc_bytes", 1.0),
+            times["dram_bytes"] * scales.get("dram_bytes", 1.0),
         )
-        body_ns = max(matrix_ns, frontend_ns, transfer_ns)
-        epilogue_ns = self.epilogue_ns * scales.get("epilogue_elements", 1.0)
+        body_ns = max(gemm_core_ns, transfer_ns)
+        epilogue_ns = times["epilogue_elements"] * scales.get("epilogue_elements", 1.0)
         return self.residual_scale * (self.fixed_ns + body_ns + epilogue_ns)
 
     @property
@@ -520,6 +582,19 @@ class ExpertPrediction:
     @property
     def w2_ns(self) -> float:
         return sum(phase.base_ns for phase in self.phases if phase.name.startswith("w2"))
+
+
+@dataclass(frozen=True)
+class AnalyticResourcePressure:
+    """Requested and allocated service for one active shared resource."""
+
+    active_threads: int
+    offered_rate: float
+    capacity: float
+    utilization: float
+    dilation: float
+    allocated_rate: float
+    allocated_utilization: float
 
 
 class AnalyticMoeCostModel:
@@ -740,6 +815,25 @@ class AnalyticMoeCostModel:
             cache.l2_bytes_per_core,
         )
 
+    def _l2_b_reuse_miss_fraction(self, working_set_bytes: float) -> float:
+        cache = self.calibration.caches
+        floor = cache.l2_b_reuse_miss_floor
+        at_capacity = cache.l2_b_reuse_miss_at_capacity
+        ceiling = cache.l2_b_reuse_miss_ceiling
+        if working_set_bytes <= cache.l2_bytes_per_core:
+            transition = _smooth_capacity_miss(
+                working_set_bytes,
+                cache.effective_l2_bytes_per_core,
+                cache.l2_bytes_per_core,
+            )
+            return floor + (at_capacity - floor) * transition
+        transition = _smooth_capacity_miss(
+            working_set_bytes,
+            cache.l2_bytes_per_core,
+            2.0 * cache.l2_bytes_per_core,
+        )
+        return at_capacity + (ceiling - at_capacity) * transition
+
     def _llc_miss_fraction(self, working_set_bytes: float) -> float:
         cache = self.calibration.caches
         return _smooth_capacity_miss(
@@ -802,7 +896,7 @@ class AnalyticMoeCostModel:
             weight_bytes = range_tiles * tile_bytes
             c_write_bytes = mapping.llc_c_write_bytes * range_tiles / total_tiles
 
-            b_l2_miss = self._l2_miss_fraction(owner_window_bytes + a_panel_bytes)
+            b_l2_miss = self._l2_b_reuse_miss_fraction(owner_window_bytes + a_panel_bytes)
             b_l2_refill = weight_bytes * (1.0 + (panels - 1) * b_l2_miss)
             a_l2_miss = self._l2_miss_fraction(owner_window_bytes + a_bytes)
             new_threads = max(active_threads - seen_active_threads, 0)
@@ -874,57 +968,150 @@ class AnalyticMoeCostModel:
     def _stage_phases(self, demand: AnalyticStageDemand) -> tuple[AnalyticPhase, ...]:
         mapping = demand.mapping
         machine = self.calibration
-        matrix_flops = mapping.demand.balanced_executed_flops
-        frontend_instructions = mapping.demand.balanced_key_body_instructions
-        l1_bytes = mapping.demand.balanced_l1_load_bytes
-        epilogue_elements = mapping.demand.balanced_epilogue_elements
         residual_scale = machine.w13_scale if demand.stage == "w13" else machine.w2_scale
-        phases = []
-        for index, range_demand in enumerate(demand.range_demands):
-            work_fraction = range_demand.balanced_work_fraction
-            stage_fraction = range_demand.n_tiles / mapping.allocation.total_tiles
-            active_threads = min(range_demand.n_tiles, mapping.schedule.threads)
-            range_matrix_flops = matrix_flops * work_fraction
-            range_frontend_instructions = frontend_instructions * work_fraction
-            range_l1_bytes = l1_bytes * work_fraction
-            range_epilogue_elements = epilogue_elements * work_fraction
-            matrix_ns = range_matrix_flops / machine.service_rate("matrix_flops", active_threads) * 1e9
+        logical = mapping.logical_work
+        vector_bytes = mapping.vector_bytes
+        output_columns_per_tile = logical.output_columns * mapping.n_tile // logical.n
+        total_compute_rows = sum(panel.compute_rows for panel in mapping.panels)
+        total_store_rows = sum(panel.store_rows for panel in mapping.panels)
+        phases: list[AnalyticPhase] = []
+
+        def append_phase(
+            *,
+            range_index: int,
+            phase_kind: str,
+            panels,
+            active_threads: int,
+            balanced_tiles: int,
+            a_l2_bytes: float,
+            b_l2_bytes: float,
+            c_write_bytes: float,
+            compulsory_dram_bytes: float,
+            spillable_dram_bytes: float,
+            working_set_bytes: float,
+        ) -> None:
+            compute_rows = sum(panel.compute_rows for panel in panels)
+            store_rows = sum(panel.store_rows for panel in panels)
+            panel_count = len(panels)
+            bfmmla_instructions = compute_rows * logical.k // 2 * balanced_tiles
+            a_load_instructions = compute_rows * logical.k // 8 * balanced_tiles
+            b_load_instructions = panel_count * logical.k * balanced_tiles
+            matrix_flops = bfmmla_instructions * (2 * vector_bytes)
+            frontend_instructions = bfmmla_instructions + a_load_instructions + b_load_instructions
+            l1_bytes = a_load_instructions * 16 + b_load_instructions * vector_bytes
+            epilogue_elements = store_rows * output_columns_per_tile * balanced_tiles
+            refill_bytes = a_l2_bytes + b_l2_bytes
+            transfer_bytes = refill_bytes + c_write_bytes
+            gemm_core_ns = matrix_flops / machine.service_rate("gemm_core_flops", active_threads) * 1e9
+            matrix_ns = matrix_flops / machine.service_rate("matrix_flops", active_threads) * 1e9
             frontend_ns = 0.0
             if machine.frontend_instructions is not None:
                 frontend_ns = (
-                    range_frontend_instructions / machine.service_rate("frontend_instructions", active_threads) * 1e9
+                    frontend_instructions / machine.service_rate("frontend_instructions", active_threads) * 1e9
                 )
-            l1_ns = range_l1_bytes / machine.service_rate("l1_bytes", active_threads) * 1e9
-            l2_ns = range_demand.l2_bytes / machine.service_rate("l2_bytes", active_threads) * 1e9
-            llc_ns = range_demand.llc_bytes / machine.service_rate("llc_bytes", active_threads) * 1e9
+            l1_ns = l1_bytes / machine.service_rate("l1_bytes", active_threads) * 1e9
+            l2_ns = transfer_bytes / machine.service_rate("l2_bytes", active_threads) * 1e9
+            llc_ns = transfer_bytes / machine.service_rate("llc_bytes", active_threads) * 1e9
             epilogue_ns = 0.0
             if machine.epilogue_elements is not None:
-                epilogue_ns = range_epilogue_elements / machine.service_rate("epilogue_elements", active_threads) * 1e9
+                epilogue_ns = epilogue_elements / machine.service_rate("epilogue_elements", active_threads) * 1e9
             phases.append(
                 AnalyticPhase(
-                    name=f"{demand.stage}:{index}",
+                    name=f"{demand.stage}:r{range_index}:{phase_kind}",
+                    kind=phase_kind,
+                    panel_count=panel_count,
                     active_threads=active_threads,
-                    fixed_ns=machine.overheads.stage_fixed_ns * stage_fraction + machine.overheads.range_fixed_ns,
+                    fixed_ns=0.0,
+                    gemm_core_ns=gemm_core_ns,
                     matrix_ns=matrix_ns,
                     frontend_ns=frontend_ns,
                     l1_ns=l1_ns,
                     l2_ns=l2_ns,
                     llc_ns=llc_ns,
                     epilogue_ns=epilogue_ns,
-                    matrix_flops=range_matrix_flops,
-                    frontend_instructions=range_frontend_instructions,
-                    l1_bytes=range_l1_bytes,
-                    l2_bytes=range_demand.l2_bytes,
-                    llc_bytes=range_demand.llc_bytes,
-                    epilogue_elements=range_epilogue_elements,
-                    compulsory_dram_bytes=range_demand.compulsory_dram_bytes,
-                    spillable_dram_bytes=range_demand.spillable_dram_bytes,
+                    matrix_flops=matrix_flops,
+                    frontend_instructions=frontend_instructions,
+                    l1_bytes=l1_bytes,
+                    l2_bytes=transfer_bytes,
+                    llc_bytes=transfer_bytes,
+                    epilogue_elements=epilogue_elements,
+                    compulsory_dram_bytes=compulsory_dram_bytes,
+                    spillable_dram_bytes=spillable_dram_bytes,
                     dram_rate=machine.service_rate("dram_bytes", active_threads),
-                    working_set_bytes=range_demand.llc_working_set_bytes,
-                    isolated_spill_fraction=self._llc_miss_fraction(range_demand.llc_working_set_bytes),
+                    working_set_bytes=working_set_bytes,
+                    isolated_spill_fraction=self._llc_miss_fraction(working_set_bytes),
                     residual_scale=residual_scale,
                 )
             )
+
+        for index, range_demand in enumerate(demand.range_demands):
+            stage_fraction = range_demand.n_tiles / mapping.allocation.total_tiles
+            active_threads = min(range_demand.n_tiles, mapping.schedule.threads)
+            balanced_tiles = math.ceil(range_demand.n_tiles / mapping.schedule.threads) * active_threads
+            setup_ns = machine.overheads.stage_fixed_ns * stage_fraction + machine.overheads.range_fixed_ns
+            if setup_ns > 0.0:
+                phases.append(
+                    AnalyticPhase(
+                        name=f"{demand.stage}:r{index}:setup",
+                        kind="range_setup",
+                        panel_count=0,
+                        active_threads=active_threads,
+                        fixed_ns=setup_ns,
+                        gemm_core_ns=0.0,
+                        matrix_ns=0.0,
+                        frontend_ns=0.0,
+                        l1_ns=0.0,
+                        l2_ns=0.0,
+                        llc_ns=0.0,
+                        epilogue_ns=0.0,
+                        matrix_flops=0.0,
+                        frontend_instructions=0.0,
+                        l1_bytes=0.0,
+                        l2_bytes=0.0,
+                        llc_bytes=0.0,
+                        epilogue_elements=0.0,
+                        compulsory_dram_bytes=0.0,
+                        spillable_dram_bytes=0.0,
+                        dram_rate=machine.service_rate("dram_bytes", active_threads),
+                        working_set_bytes=0.0,
+                        isolated_spill_fraction=0.0,
+                        residual_scale=residual_scale,
+                    )
+                )
+            cold_panels = mapping.panels[:1]
+            steady_panels = mapping.panels[1:]
+            cold_compute_fraction = cold_panels[0].compute_rows / total_compute_rows
+            cold_store_fraction = cold_panels[0].store_rows / total_store_rows
+            cold_a_l2_bytes = range_demand.a_l2_refill_bytes * cold_compute_fraction
+            cold_c_write_bytes = range_demand.c_write_bytes * cold_store_fraction
+            cold_b_l2_bytes = range_demand.compulsory_dram_bytes
+            append_phase(
+                range_index=index,
+                phase_kind="cold_b",
+                panels=cold_panels,
+                active_threads=active_threads,
+                balanced_tiles=balanced_tiles,
+                a_l2_bytes=cold_a_l2_bytes,
+                b_l2_bytes=cold_b_l2_bytes,
+                c_write_bytes=cold_c_write_bytes,
+                compulsory_dram_bytes=range_demand.compulsory_dram_bytes,
+                spillable_dram_bytes=cold_a_l2_bytes + cold_c_write_bytes,
+                working_set_bytes=range_demand.llc_working_set_bytes,
+            )
+            if steady_panels:
+                append_phase(
+                    range_index=index,
+                    phase_kind="steady_b",
+                    panels=steady_panels,
+                    active_threads=active_threads,
+                    balanced_tiles=balanced_tiles,
+                    a_l2_bytes=range_demand.a_l2_refill_bytes - cold_a_l2_bytes,
+                    b_l2_bytes=range_demand.b_l2_refill_bytes - cold_b_l2_bytes,
+                    c_write_bytes=range_demand.c_write_bytes - cold_c_write_bytes,
+                    compulsory_dram_bytes=0.0,
+                    spillable_dram_bytes=range_demand.spillable_dram_bytes - cold_a_l2_bytes - cold_c_write_bytes,
+                    working_set_bytes=range_demand.llc_working_set_bytes,
+                )
         return tuple(phases)
 
     @lru_cache(maxsize=4096)
@@ -958,8 +1145,11 @@ class AnalyticMoeCostModel:
             phases.append(
                 AnalyticPhase(
                     name="operator",
+                    kind="operator",
+                    panel_count=0,
                     active_threads=threads,
                     fixed_ns=overhead_ns,
+                    gemm_core_ns=0.0,
                     matrix_ns=0.0,
                     frontend_ns=0.0,
                     l1_ns=0.0,
@@ -1023,7 +1213,99 @@ class AnalyticMoeCostModel:
                 successors[dependency].append(task_id)
         return dependency_count, successors, [count == 0 or value == 0 for value in dependency_count]
 
-    def _dag_result(self, tasks) -> tuple[float, tuple[float, ...]]:
+    def _active_phase_state(
+        self,
+        current: Mapping[int, AnalyticPhase],
+    ) -> tuple[
+        float,
+        dict[int, float],
+        dict[str, AnalyticResourcePressure],
+        dict[int, float],
+    ]:
+        total_working_set = sum(phase.working_set_bytes for phase in current.values())
+        spill_fraction = self._llc_miss_fraction(total_working_set)
+        provisional = {index: phase.duration_ns(spill_fraction=spill_fraction) for index, phase in current.items()}
+        pressures: dict[str, AnalyticResourcePressure] = {}
+        resource_scales: dict[str, float] = {}
+        for resource in _SHARED_RESOURCES:
+            demands = {index: phase.resource_demand(resource, spill_fraction) for index, phase in current.items()}
+            active_threads = min(
+                sum(current[index].active_threads for index, demand in demands.items() if demand > 0.0),
+                self.calibration.cores_per_rank,
+            )
+            capacity = self.calibration.service_rate(resource, active_threads) if active_threads > 0 else math.inf
+            # Request rate is measured over the interval in which this resource
+            # is active, not averaged over the whole ECM phase.  Averaging over
+            # compute time and then scaling only the resource term can violate
+            # the calibrated aggregate capacity.  Dividing by the resource's
+            # own service time gives the independently requested service; the
+            # ECM max/sum composition below decides whether that service is
+            # hidden by another component.
+            if math.isfinite(capacity):
+                offered_rate = sum(
+                    demand
+                    / max(
+                        current[index].residual_scale
+                        * current[index].resource_times_ns(spill_fraction)[resource]
+                        * 1e-9,
+                        1e-30,
+                    )
+                    for index, demand in demands.items()
+                    if demand > 0.0
+                )
+            else:
+                offered_rate = sum(demand / max(provisional[index] * 1e-9, 1e-30) for index, demand in demands.items())
+            utilization = offered_rate / capacity if math.isfinite(capacity) else 0.0
+            dilation = max(1.0, utilization)
+            allocated_rate = offered_rate / dilation
+            allocated_utilization = allocated_rate / capacity if math.isfinite(capacity) else 0.0
+            pressures[resource] = AnalyticResourcePressure(
+                active_threads=active_threads,
+                offered_rate=offered_rate,
+                capacity=capacity,
+                utilization=utilization,
+                dilation=dilation,
+                allocated_rate=allocated_rate,
+                allocated_utilization=allocated_utilization,
+            )
+            resource_scales[resource] = dilation
+        multipliers = {
+            index: (
+                phase.duration_ns(
+                    spill_fraction=spill_fraction,
+                    resource_scales=resource_scales,
+                )
+                / phase.base_ns
+            )
+            for index, phase in current.items()
+        }
+        return spill_fraction, provisional, pressures, multipliers
+
+    def active_resource_pressure(self, phases: Sequence[AnalyticPhase]) -> dict[str, AnalyticResourcePressure]:
+        """Return physically named offered-load pressure for one concurrent phase set."""
+        current = {index: phase for index, phase in enumerate(phases)}
+        if not current:
+            return {}
+        return self._active_phase_state(current)[2]
+
+    @staticmethod
+    def _pressure_dict(pressure: AnalyticResourcePressure) -> dict[str, float | int | None]:
+        return {
+            "active_threads": pressure.active_threads,
+            "offered_rate": pressure.offered_rate,
+            "capacity": pressure.capacity if math.isfinite(pressure.capacity) else None,
+            "utilization": pressure.utilization,
+            "dilation": pressure.dilation,
+            "allocated_rate": pressure.allocated_rate,
+            "allocated_utilization": pressure.allocated_utilization,
+        }
+
+    def _dag_result(
+        self,
+        tasks,
+        *,
+        event_log: list[dict] | None = None,
+    ) -> tuple[float, tuple[float, ...]]:
         tasks = [(int(routes), int(threads), list(dependencies)) for routes, threads, dependencies in tasks]
         if not tasks:
             return 0.0, ()
@@ -1047,33 +1329,29 @@ class AnalyticMoeCostModel:
             if not active:
                 raise ValueError("DAG deadlock (cycle or unreachable task)")
             current = {index: phases[index][phase_index[index]] for index in active}
-            total_threads = min(
-                sum(phase.active_threads for phase in current.values()),
-                self.calibration.cores_per_rank,
-            )
-            total_working_set = sum(phase.working_set_bytes for phase in current.values())
-            spill_fraction = self._llc_miss_fraction(total_working_set)
-
-            provisional = {index: phase.duration_ns(spill_fraction=spill_fraction) for index, phase in current.items()}
-            resource_scales: dict[str, float] = {}
-            for resource in _SHARED_RESOURCES:
-                requested = sum(
-                    phase.resource_demand(resource, spill_fraction) / max(provisional[index] * 1e-9, 1e-30)
-                    for index, phase in current.items()
-                )
-                capacity = self.calibration.service_rate(resource, max(total_threads, 1))
-                resource_scales[resource] = max(1.0, requested / capacity)
-            multipliers = {
-                index: (
-                    phase.duration_ns(
-                        spill_fraction=spill_fraction,
-                        resource_scales=resource_scales,
-                    )
-                    / phase.base_ns
-                )
-                for index, phase in current.items()
-            }
+            spill_fraction, _, pressures, multipliers = self._active_phase_state(current)
             elapsed = min(remaining[index] * multipliers[index] for index in active)
+            if event_log is not None:
+                event_log.append(
+                    {
+                        "start_ns": wall_ns,
+                        "duration_ns": elapsed,
+                        "active_tasks": list(active),
+                        "phases": {str(index): current[index].name for index in active},
+                        "phase_kinds": {str(index): current[index].kind for index in active},
+                        "phase_dilation": {str(index): multipliers[index] for index in active},
+                        "working_set_bytes": sum(phase.working_set_bytes for phase in current.values()),
+                        "llc_spill_fraction": spill_fraction,
+                        "resources": {
+                            resource: {
+                                "path": _RESOURCE_PATHS[resource],
+                                **self._pressure_dict(pressure),
+                            }
+                            for resource, pressure in pressures.items()
+                            if pressure.offered_rate > 0.0
+                        },
+                    }
+                )
             wall_ns += elapsed
             for index in active:
                 remaining[index] -= elapsed / multipliers[index]
@@ -1098,6 +1376,19 @@ class AnalyticMoeCostModel:
     def dag_task_finish_times(self, tasks) -> tuple[float, ...]:
         """Return task completion timestamps from the analytical simulator."""
         return self._dag_result(tasks)[1]
+
+    def explain_dag(self, tasks) -> dict:
+        """Run the analytical DAG and expose each resource-allocation event."""
+        normalized = [(int(routes), int(threads), list(dependencies)) for routes, threads, dependencies in tasks]
+        events: list[dict] = []
+        makespan_ns, finish_times = self._dag_result(normalized, event_log=events)
+        return {
+            "model": ANALYTIC_MODEL_NAME,
+            "machine_id": self.calibration.machine_id,
+            "makespan_ns": makespan_ns,
+            "task_finish_ns": list(finish_times),
+            "events": events,
+        }
 
     def phase_makespan(self, tasks) -> float:
         return self.dag_makespan((routes, threads, []) for routes, threads in tasks)
@@ -1164,8 +1455,57 @@ class AnalyticMoeCostModel:
                 ],
             }
 
+        def phase_detail(phase: AnalyticPhase) -> dict:
+            pressures = self.active_resource_pressure((phase,))
+            resource_times = phase.resource_times_ns()
+            if phase.gemm_core_ns > 0.0:
+                transfer_ns = max(resource_times[name] for name in ("l2_bytes", "llc_bytes", "dram_bytes"))
+                body_components = {
+                    "gemm_core": resource_times["gemm_core_flops"],
+                    "transfer": transfer_ns,
+                }
+            else:
+                transfer_ns = max(resource_times[name] for name in ("l1_bytes", "l2_bytes", "llc_bytes", "dram_bytes"))
+                body_components = {
+                    "matrix": resource_times["matrix_flops"],
+                    "frontend": resource_times["frontend_instructions"],
+                    "transfer": transfer_ns,
+                }
+            bottleneck = max(body_components, key=body_components.get)
+            return {
+                "name": phase.name,
+                "kind": phase.kind,
+                "panel_count": phase.panel_count,
+                "base_ns": phase.base_ns,
+                "fixed_ns": phase.fixed_ns,
+                "gemm_core_ns": phase.gemm_core_ns,
+                "matrix_ns": phase.matrix_ns,
+                "frontend_ns": phase.frontend_ns,
+                "l1_ns": phase.l1_ns,
+                "l2_ns": phase.l2_ns,
+                "llc_ns": phase.llc_ns,
+                "dram_ns": resource_times["dram_bytes"],
+                "epilogue_ns": phase.epilogue_ns,
+                "ecm_body_bottleneck": bottleneck,
+                "working_set_bytes": phase.working_set_bytes,
+                "matrix_flops": phase.matrix_flops,
+                "l1_bytes": phase.l1_bytes,
+                "l2_bytes": phase.l2_bytes,
+                "llc_bytes": phase.llc_bytes,
+                "compulsory_dram_bytes": phase.compulsory_dram_bytes,
+                "spillable_dram_bytes": phase.spillable_dram_bytes,
+                "resource_pressure": {
+                    resource: {
+                        "path": _RESOURCE_PATHS[resource],
+                        **self._pressure_dict(pressure),
+                    }
+                    for resource, pressure in pressures.items()
+                    if pressure.offered_rate > 0.0
+                },
+            }
+
         return {
-            "model": "analytic_hardware_v1",
+            "model": ANALYTIC_MODEL_NAME,
             "machine_id": self.calibration.machine_id,
             "routes": routes,
             "threads": threads,
@@ -1174,21 +1514,5 @@ class AnalyticMoeCostModel:
             "w2_ns": prediction.w2_ns,
             "w13": demand(prediction.w13_demand),
             "w2": demand(prediction.w2_demand),
-            "phases": [
-                {
-                    "name": phase.name,
-                    "base_ns": phase.base_ns,
-                    "matrix_ns": phase.matrix_ns,
-                    "frontend_ns": phase.frontend_ns,
-                    "l1_ns": phase.l1_ns,
-                    "l2_ns": phase.l2_ns,
-                    "llc_ns": phase.llc_ns,
-                    "epilogue_ns": phase.epilogue_ns,
-                    "working_set_bytes": phase.working_set_bytes,
-                    "llc_bytes": phase.llc_bytes,
-                    "compulsory_dram_bytes": phase.compulsory_dram_bytes,
-                    "spillable_dram_bytes": phase.spillable_dram_bytes,
-                }
-                for phase in prediction.phases
-            ],
+            "phases": [phase_detail(phase) for phase in prediction.phases],
         }

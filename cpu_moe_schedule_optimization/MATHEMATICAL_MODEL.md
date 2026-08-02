@@ -161,6 +161,7 @@ $$
 strict/tail-pool job 是 **moldable**，不是执行中可改变线程数的 malleable
 job。Job 一旦开始就连续执行至完成，不能抢占。下文 2.3.1 定义 production
 planner 在尾 task 启动前做一次宽度选择的 bounded moldable 扩展；2.3.2
+定义保持宽度不变、仅迁移未启动完整 expert 的实验性尾部领取；2.3.3
 单独定义一个仅在 W13/W2 边界改变一次宽度的实验性扩展。
 
 Plan V2 在表示层为每个 task 增加离散允许宽度集合 $\mathcal A_i$、首选宽度
@@ -383,7 +384,77 @@ bounded-policy identity；命中后重新运行轻量 LPT assignment 并校验 t
 拓扑及 tail width 对新 route 的 isolated-model 支撑；任一不再合法时丢弃该
 entry 并重新 cold search。
 
-#### 2.3.2 实验性 W2 边界伸缩
+#### 2.3.2 实验性 strict 尾部任务领取
+
+strict plan 的 lane dependency 是资源排序，不是 expert 间数据依赖。对于同宽
+lane，记 planner 给出的有序任务队列为
+
+$$
+Q_g=(i_{g,1},\ldots,i_{g,n_g}),\qquad
+B_g=[gt,(g+1)t),\qquad g=0,\ldots,C/t-1.
+$$
+
+给定很小的尾部深度 $d$，runtime 将每条 lane 分为 planner-owned 前缀和可迁移
+后缀：
+
+$$
+d_g=\min(d,n_g-1),\qquad
+P_g=(i_{g,1},\ldots,i_{g,n_g-d_g}),\qquad
+U_g=(i_{g,n_g-d_g+1},\ldots,i_{g,n_g}).
+$$
+
+至少保留一个 task 在 $P_g$，因此前半程严格执行 planner 给出的 placement 和
+lane 顺序；只有 $P_g$ 全部完成后，team 才进入后缀执行。自己的 $U_g$ 仍按原
+team 顺序优先执行。令 task 状态
+$x_i\in\{\mathrm{pending},\mathrm{running}(g),\mathrm{complete}\}$；
+`running(g)` 在原子状态中编码实际 owner team，防止 donor worker 错误加入已被
+迁移的 task。
+
+当 team $g$ 的后缀已完成或已被其他 team 领取时，只有 leader 扫描 peer
+后缀。对 donor $h$ 定义
+
+$$
+c_h=\left|\{i\in U_h\mid x_i=\mathrm{pending}\}\right|,\qquad
+R_h=\sum_{i\in U_h,\ x_i=\mathrm{pending}}M_i,
+$$
+
+并选择
+
+$$
+h^*=\arg\max_{h\ne g,\ c_h\ge r_{\min}}R_h.
+$$
+
+leader 对 $U_{h^*}$ 中最早的 pending task 做一次
+`pending -> running` CAS。CAS 成功后，整个 $t$-thread team 在自己的
+$B_g$ 和 scratch 上执行该完整 expert。原 predecessor edge 只表示 donor
+interval 的串行占用；迁移后实际 interval 与正在执行的 donor task 不相交，
+所以不等待该资源边。expert 间真实数据依赖为空，TopK merge 仍由
+expert-completion release 控制。CAS 失败立即重新扫描，不等待 donor，也不建立
+跨 team barrier。leader 通过 per-team assignment epoch 唤醒其余 worker；
+没有可领取 task 时立即释放 compute team，因为 pending 集合只会缩小，未来不会
+产生新候选。若 ready-token drain 已启用，释放的 worker 继续扫描并执行自己的
+固定 token owner 区间，直到所有 expert 和 token 发布完成。
+
+当前 runtime 仅在以下条件全部成立时允许该动作：
+
+1. strict Plan V2、fused SVE、fixed placement；
+2. 单 NUMA，全部 team 同宽且恰好分区覆盖 logical workers；
+3. 每个 task 是唯一的 whole-expert task，不含 route slice；
+4. dependency 为空或仅指向同 lane 的直接前驱，因此可证明是资源排序链；
+5. thief scratch 的 `max_rows` 不小于被领取 task 的 route 数。
+
+该动作不改变 $t_i$，因此 task 仍是非抢占 moldable job；变化的是未启动 task
+的实际 placement 和 start time。它也不同于 `tail_pool`：planner 没有预先把
+expert 标成 pooled，runtime 只在 planner 前缀结束后借用另一个 strict lane
+的受限后缀。环境变量 `FUSED_CPP_MOE_STRICT_TAIL_STEAL=1` 显式启用；
+`FUSED_CPP_MOE_STRICT_TAIL_STEAL_DEPTH` 默认 $d=2$，
+`FUSED_CPP_MOE_STRICT_TAIL_STEAL_MIN_DONOR_TASKS` 默认
+$r_{\min}=2$。功能默认关闭，planner candidate、cache identity 和 cost-model
+评分均不变。现有 strict DAG simulator 不解除 lane resource edge，因此不能
+预测该实验路径；进入 production 前必须增加相同 suffix policy 的事件模拟和
+held-out E2E 验证。
+
+#### 2.3.3 实验性 W2 边界伸缩
 
 elastic Plan V2 将完整 expert job 保持为同一个依赖节点，但在内部写成两个连续、
 不可抢占的 stage：
@@ -466,7 +537,7 @@ bridge 只显式生成 `2x8T->16T`、`4x2T->8T` 一类局部 cohort，或为指�
 给出离散 W2 target；不把任意 stage width 或任意 cohort partition 加入
 production 搜索空间。
 
-#### 2.3.2 实验性全局两阶段计划
+#### 2.3.4 实验性全局两阶段计划
 
 production Plan V2 的一个 task 始终是完整 expert，W13 完成后可立即进入该
 expert 的 W2。为隔离这种 pipeline 与 vLLM 风格全局两阶段执行的差异，实验
@@ -622,6 +693,19 @@ u_q\ge r_q,
 \sum_i t_i a_i(\tau)+\sum_q b_q(\tau)\le C.
 $$
 
+runtime 将 token 连续静态映射到 logical worker。令
+$L=\lceil|\mathcal Q|/C\rceil$，worker $c$ 的 owner 区间为
+
+$$
+\mathcal Q_c=[cL,\min(|\mathcal Q|,(c+1)L)),\qquad
+o(q)=\left\lfloor q/L\right\rfloor.
+$$
+
+merge job $q$ 只能由 $o(q)$ 执行。owner 在 expert task 边界以及没有可运行
+expert 时扫描自己的区间，仅执行满足 $r_q\le\tau$ 且尚未完成的 token。这一限制
+保留 final merge 的连续 token locality，并消除全局 ready queue 的 claim 竞争，
+代价是 owner 之间不做 merge work stealing。
+
 令 $G_q=G(K,H)>0$ 为 token merge 的单线程 isolated time，$y_q$ 为其归一化
 进度。对包含活跃 merge job 的扩展状态 $\mathcal Z^+(\tau)$，有：
 
@@ -629,7 +713,7 @@ $$
 \frac{dy_q(\tau)}{d\tau}
 =\frac{b_q(\tau)}{G_qD_q^{\mathrm{merge}}(\mathcal Z^+(\tau))},
 \qquad
-y_q(u_q)=0,quad y_q(g_q)=1.
+y_q(u_q)=0,\quad y_q(g_q)=1.
 $$
 
 若 merge 与剩余 expert 同时运行会改变 cache/带宽响应，还应把 expert slowdown
@@ -666,10 +750,10 @@ $\Delta_f>0$ 强制 `early_merge=true`。
 Plan V2 的 `early_merge` 是三态手动控制：`null` 为上述 auto，`true` 强制
 ready-token 路径并跳过 team-load gate，`false` 强制统一 post-expert merge；
 elastic 拒绝 `true`。async ready-token executor 保持固定 expert core interval，
-优先执行可运行 expert。expert compute 尚未全部完成时，无 expert 可执行的 lane
-每次只领取一个已经 release 的 token；compute 全部完成后，同一轮 resident
-worker 继续排空 ready queue。尾部每次原子领取至多
-$B_{\mathrm{merge}}=2$ 个 queue slot，并预取同批下一个 token。auto 默认只在
+并在每个 expert task 完成的安全边界让各 worker 至多执行一个本 owner 区间内已经
+release 的 token；没有可运行 expert 时使用同一规则继续扫描。compute 全部完成
+后，同一轮 resident worker 分别排空自己的 owner 区间。尾部每轮至多处理
+$B_{\mathrm{merge}}=2$ 个 token，并预取同批下一个 token。auto 默认只在
 SVE direct-route 路径且
 $\max_i\lceil M_i/8\rceil/t_i\ge1.25\min_i\lceil M_i/8\rceil/t_i$ 时生效。
 `FUSED_CPP_MOE_ASYNC_READY_TOKEN_DRAIN=0` 恢复 early-ready 加连续 final merge；
@@ -1120,10 +1204,76 @@ packed-B，尚未限制 packed-A、store、LLC-to-L2 refill、频率/计算争�
 “允许混合 width 和主动 cold-phase 错峰时还有多少调度 headroom”，并为后续可执行
 候选提供 surrogate 内的离线上限，不进入 production planner 或 plan cache identity。
 
+runtime 反证进一步说明，不能把 $h_i(t)$ 的 lower-cache demand 直接置零。对 stage
+$s$ 的一个实际 packed-B window，令 $\omega_{is}(t)$ 为 team 同时活跃的 packed-B
+字节数，$p_i=\lceil M_i/M_R\rceil$ 为 A panel 数。若 team 按 N 切分，则每个 worker
+需要保留的 B stripe 近似为 $\omega_{is}(t)/t$。用目标机器校准的私有 L2 retention
+$r_2(x)\in[0,1]$ 表示大小为 $x$ 的 stripe 在相邻 A panel 间仍驻留 L2 的比例，则
+完整 stage 的 lower-cache-to-L2 B 流量下界应写成
+
+$$
+Q^{B,L2}_{is}(t)=\omega_{is}(t)
+\left[1+(p_i-1)\left(1-r_2\left(\frac{\omega_{is}(t)}{t}\right)\right)\right],
+$$
+
+而不是仅在首个 M12 phase 计一次 $\omega_{is}(t)$。再令时刻 $\tau$ 的共享 LLC
+活跃窗口为
+
+$$
+S_s(\tau)=\sum_{i,t}\omega_{is}(t)a_{ist}(\tau),
+$$
+
+目标机器的 LLC retention 为 $r_3(S_s/C_{LLC})$，则 $Q^{B,L2}$ 中未由 LLC
+保留的 replay 才继续形成额外 DRAM refill。$r_2,r_3$ 是较薄的硬件 service-curve
+校准，不应由 route/thread 表逐点拟合。packed-A、gather、store 和 compute demand
+仍作为独立资源推进。LLC 容量继续是 slowdown/candidate-pruning 因素，不把
+$S_s\le C_{LLC}$ 错当成执行可行性的硬约束。
+
+此外，静态 release $r_i$ 只是 task start 的 lower bound。若真实 duration
+$\widehat I_i(t)>I_i(t)$，原先不重叠的区间会在 runtime 重叠，因此 oracle 时间轴上的
+cumulative constraint 不再约束真实 active set。需要保持 cold stream 或 active
+window 上界时，runtime 必须使用由 task completion 返还 token 的反馈 gate；单纯按
+绝对时间 sleep/delay 不能维护该不变量。
+
 一般 $D_i(\mathcal Z)$ 会使 job duration 随执行中的 active set 改变，不能直接
 编码成一个固定 duration interval。要得到 contention-aware exact oracle，必须
 进一步枚举并发 group mode、离散化时间/状态，或使用专门的 event-based search；
 普通 CP-SAT interval 模型本身不是完整原始问题的等价编码。
+
+#### 6.2.2 Cold-phase incumbent 的可执行 lowering
+
+为验证 6.2.1 的 surrogate incumbent，实验 lowering 保持 oracle 给出的时间区间
+$[s_i,e_i)$ 和线程宽度 $t_i$ 不变，再求每个 task 的连续逻辑 core 起点 $q_i$：
+
+$$
+0\le q_i\le C-t_i.
+$$
+
+时间重叠的两个 task 必须使用不相交的 core interval：
+
+$$
+[s_i,e_i)\cap[s_j,e_j)\ne\varnothing
+\Longrightarrow
+[q_i,q_i+t_i)\cap[q_j,q_j+t_j)=\varnothing.
+$$
+
+实现使用二维 no-overlap CP-SAT；求解后，每个物理 core 上相邻 task 形成 strict
+Plan V2 dependency。为保留 oracle 的主动 idling，每个 task 另携带相对 schedule
+epoch 的 release lower bound $r_i=s_i-\min_j s_j$，native executor 只有在
+
+$$
+\tau_{\mathrm{runtime}}\ge r_i
+$$
+
+时才允许 claim ready task。零 release 的 production 路径不读取时钟。非零 release
+目前只允许 strict、whole-expert、固定宽度 task，并关闭 strict tail stealing；
+`tail_pool`/`elastic` 不接受该字段。首版 lowering 也拒绝 phase 间存在内部 wait 的
+assignment，因为当前 runtime 只能在 task 起点执行一次 release gate，不能在 W13/W2
+内部暂停并保持 team。
+
+这个 lowering 只证明候选可在连续 core team 上执行并复现 task-level 开始时间下界，
+不把 surrogate duration 变成硬件真实性保证，也不进入 production planner 或 cache
+identity。
 
 ### 6.3 MILP
 
@@ -1191,17 +1341,17 @@ cold search。
 | 线程宽度 | $1,2,\ldots,T_{\max}$ | empirical strict backend 为 `1,2,4,8,16,32`；analytic strict backend 使用 machine calibration 中显式允许的宽度；自动短 expert pool 只搜索 `1,2,4`；96-core bounded tail whole-expert 候选只搜索 `24,32,48`，其中缺表宽度仅允许长整 M12 formula 插值；route-sliced tail 只允许 exact-layout anchor 中显式校准的宽度，当前为 `24T`；forced override 可用其他已校准宽度；离线 cold-phase oracle 默认比较 `1,2,4,8,16`，不扩大 production 域 | 离散宽度剪枝 |
 | 并发配置 | 活跃 job 可形成任意满足 CPU 容量的 $(M_i,t_i)$ 组合 | 搜索静态 core shape，并自动比较 strict、threshold/统一宽度 tail-pool 与恰好两个 terminal expert 的一次 bounded repartition；后者可在 exact anchor 命中时把每个 terminal expert 切成两个连续 M slice，使四个 fixed task 覆盖全部核心；实验 elastic 只接受 planner 显式给出的同 NUMA 对齐 W2 cohort，target 必须包含 source 或与其不相交 | static-partition + boundary regroup 剪枝 |
 | Shape 集合 | 所有满足 CPU 容量的整数宽度组合 | empirical backend 只用 profile shape；analytic backend 生成 homogeneous 和至多两种宽度的 shape，再应用 active 工作集规则；tail-pool 和 bounded tail 只从 strict uncertainty band 和最快两个 head shape 派生 | 候选剪枝 |
-| Assignment | 任意 expert-to-resource 调度 | 按 isolated cost 的 LPT | 启发式分配 |
-| Runtime plan contract | task 可携带离散宽度集合、stage/range、resize 边界和动态 placement | bounded tail 在 terminal expert 启动前生成新的 singleton fixed width 和 blocker DAG；exact-anchor route fission 将同一 expert 的连续 M slice 作为多个 strict task，只有全部 slice 完成后才发布 expert completion；tail_pool 保持 whole-expert 动态 placement；实验 elastic 才在 W13/W2 边界扩到 preferred cohort | 单次 expert-boundary 重分区与实验 stage resize 剪枝 |
+| Assignment | 任意 expert-to-resource 调度 | 按 isolated cost 的 LPT；实验 strict tail-steal 保留每条 lane 的 planner 前缀，只从 peer lane 的受限 pending 后缀迁移 whole expert 到同宽空闲 team | 启发式分配与 suffix-steal 剪枝 |
+| Runtime plan contract | task 可携带离散宽度集合、stage/range、resize 边界和动态 placement | bounded tail 在 terminal expert 启动前生成新的 singleton fixed width 和 blocker DAG；exact-anchor route fission 将同一 expert 的连续 M slice 作为多个 strict task，只有全部 slice 完成后才发布 expert completion；tail_pool 保持 whole-expert 动态 placement；实验 strict tail-steal 只接受单 NUMA、同宽、fixed、whole-expert 资源链，并保留 ready-token drain；实验 elastic 才在 W13/W2 边界扩到 preferred cohort；离线 cold-phase lowering 可为 strict fixed task 添加非负 release lower bound，非零时关闭 tail-steal | 单次 expert-boundary 重分区、受限未启动 task 迁移、实验 stage resize 与实验 task release 剪枝 |
 | Stage coupling | W13/W2 可形成任意满足依赖和容量的 stage DAG | production 使用 whole-expert pipeline；独立 W13/W2 Plan V2 加全局 barrier 仅作为实验 entrypoint，matched/independent 两种计划都不进入默认搜索 | production 粒度剪枝与实验对照 |
 | x86 synchronous executor team mapping | expert 可取任意合法整数宽度并形成任意 wave | API 接受 1--256 workers；均衡 route 用 atomic expert queue，active expert 不足时按 route/当前宽度贪心组 team，强偏斜时按 64-row target 形成有序 wave | planner 外的确定性 runtime mapper |
-| Ordering | 任意可行开始时间和顺序 | 每个 lane 的 LPT 顺序 | 顺序剪枝 |
-| Idling | 允许主动等待以避开争用 | planner 可关闭 tail-pool 和 bounded tail 保留原 strict；bounded tail 只依赖 blocker 完成、不增加主动等待；tail-pool 保持 non-idling；elastic timeout=0 不主动等待，正 timeout 只允许在 W13/W2 边界等待有限 $\delta_i$；ready-token 路径仅填充无可运行 expert 的空闲 lane | 受限 boundary idling 剪枝 |
+| Ordering | 任意可行开始时间和顺序 | 每个 lane 的 LPT 顺序；实验 strict tail-steal 保留 planner 前缀和本地后缀优先，只允许领取 peer lane 的 pending suffix frontier | 顺序剪枝 |
+| Idling | 允许主动等待以避开争用 | planner 可关闭 tail-pool 和 bounded tail 保留原 strict；bounded tail 只依赖 blocker 完成、不增加主动等待；tail-pool 保持 non-idling；strict tail-steal 找不到满足 $c_h\ge r_{\min}$ 的后缀后立即释放 compute team，并在启用时转入 ready-token drain；elastic timeout=0 不主动等待，正 timeout 只允许在 W13/W2 边界等待有限 $\delta_i$；ready-token 路径仅填充无可运行 expert 的空闲 lane；cold-phase runtime benchmark 可按 oracle task release 主动等待，但 production planner 不生成非零 release | 受限 boundary idling 剪枝；oracle release 仅作可执行性诊断 |
 | Workload 输入 | 任意合法 global 或 rank-local route histogram | planner 接受任意 histogram；catalog preset 只扩展验证覆盖，不过滤运行时输入 | 不剪枝 |
-| Route combine | 任意满足 TopK release 约束和 CPU 容量的 merge 排程 | planner 不搜索 combine service time；strict plan 在预测 expert 同时完成时强制统一连续 post-expert merge，其余情况保留 auto，runtime 在 expert 阶段采用 expert-first 单 token 贪心并在同一 resident worker job 排空；Plan V2 允许显式 on/off，elastic 不允许 on | 外层启发式限制与支配条件剪枝 |
+| Route combine | 任意满足 TopK release 约束和 CPU 容量的 merge 排程 | planner 不搜索 combine service time；strict plan 在预测 expert 同时完成时强制统一连续 post-expert merge，其余情况保留 auto；runtime 将连续 token range 固定映射给 logical worker，在 expert 边界和空闲期处理本 owner 已 release token，并在同一 resident worker job 排空；owner 间不偷取 merge；Plan V2 允许显式 on/off，elastic 不允许 on | 外层启发式限制与支配条件剪枝 |
 | Kernel variant | 任意未被支配的实现 | ARM `auto` 先要求完整 `jit/xbyak_exact_m` legacy split/no-split pair，再加入同 identity 的实测 global packed-B byte-window variants；Plan V2 在精确匹配的 AmazonC5192Cores TP4/F512 split profile 上默认按确定函数 $g(M,t)$ 覆盖单 task 的 W13/W2 window，其余 profile 继承 global policy；$g$ 在每个 shape/tail-pool 候选中确定性解析并进入执行成本，但 window 不成为自由搜索变量；缺少完整 JIT legacy pair 时整体回退 static pair；x86 AMX 使用不进入 planner 的确定性 per-expert pattern/cache policy，AVX-512/AMX 共用确定性 team-N/wave policy | 实例候选限制与 runtime policy |
 | Isolated time | 真实 $I_i(t)$ | production 默认仍为经验公式；可选 analytic backend 由 kernel demand、cache traffic 和机器 service curves 计算 | cost 近似，不剪枝可行域 |
-| Contention | 任意动态活跃配置上的真实 $D_i(\mathcal Z)$ | production 默认为实测 profile；bounded tail 仅在 uniform route、root/tail width 与物理 interval 完全匹配时使用 exact-layout full-call anchor，且禁止 route 插值；未命中仍走 stage-aware simulator；analytic backend 按 matrix/L1/L2/LLC/DRAM/epilogue 共享容量推进事件 | cost 近似，不剪枝可行域 |
+| Contention | 任意动态活跃配置上的真实 $D_i(\mathcal Z)$ | production 默认为实测 profile；bounded tail 仅在 uniform route、root/tail width 与物理 interval 完全匹配时使用 exact-layout full-call anchor，且禁止 route 插值；未命中仍走 stage-aware simulator；实验 strict tail-steal 暂不进入 cost model；analytic backend 按 L1-hot M12 GEMM core、L2/LLC/DRAM/epilogue 共享容量推进事件，register-only matrix/frontend/L1 只保留诊断；cold-phase oracle 只约束首个 M12 packed-B DRAM phase，运行时验证已证明它不能替代 per-worker L2 retention、完整 active stage window、LLC-to-L2 service、容量和 active-set slowdown | cost 近似，不剪枝可行域 |
 | 跨 rank lifetime | 每个 rank 的资源状态随其他 rank 完成而变化 | 有 matching single-rank companion 时，多 rank 活跃阶段使用 concurrent-rank profile，最后一个 rank 的剩余 phase 切换到 single-rank profile；缺表时保守保持 concurrent-rank rate | cost 状态近似，不剪枝可行域 |
 
 当前 `IntervalPlanner` 搜索的是上述剪枝后 plan space 中的方案，不是原始问题
@@ -1526,21 +1676,49 @@ $$
 两种曲线使用相同三个硬件锚点；curve family 表达资源拓扑，不增加
 route-dependent 参数。
 
-必需资源为 matrix FLOP/s、L1/L2/LLC/DRAM byte/s；frontend instruction/s 和
-epilogue element/s 可选。校准还包含 cache 容量/有效容量比例、固定
+主计算资源为 `gemm_core_flops`：M12、packed-A/packed-B、完整 A/B load 与
+BFMMLA K-loop、无 store/epilogue 的 L1-hot GEMM。它已经联合包含 matrix issue、
+frontend 和 L1-to-register 供给，不能再与这些分量分别收费。register-only
+`matrix_flops`、推导出的 frontend instruction/s 和 B-only L1 byte/s 继续写入
+profile 作为诊断，但不作为独立 planner 资源，也不能替代 L1-hot peak。缺少
+`gemm_core_flops` 的 calibration 直接拒绝加载，不再回退到 register-only 数值。
+L2/LLC/DRAM 仍由 B-only endpoint-to-register probe 测量，并分别使用
+`l2_bytes/llc_bytes/dram_bytes`；深层 endpoint 已包含下游路径，因此这些时间下界
+取最大值而不是相加。epilogue element/s 可选。校准还包含 cache 容量/有效容量比例、固定
 call/expert/stage/range 开销、每 route 非 GEMM 开销，以及最多两个接近 1 的
 W13/W2 residual scale。以上参数均与 route histogram 和 planner shape 无关。
+DRAM/LLC-refill 的单核锚点必须使用与 kernel MLP 一致的 cold stream；饱和值取
+持续排队开始前的 service knee，而不是 STREAM 或单次峰值。
+
+L1/L2 热探针几何不硬编码机器容量。对 Linux sysfs 检测到的 cache 容量
+$C_L$、SVE N tile $\nu$、物理 W13 最小宽度 $N_p=2\nu$ 和保留比例 $f_L$，选择：
+
+$$
+K_L=8\left\lfloor\frac{f_LC_L}{16(12+N_p)}\right\rfloor,
+\qquad
+Q_L=2K_L(12+N_p)\le f_LC_L.
+$$
+
+`profile_analytic_services.py` 从
+`/sys/devices/system/cpu/cpuX/cache/index*` 读取 L1D/L2/LLC 容量和 cache-line
+大小，再由上式生成探针。AmazonC5192Cores 上 $C_{L1}=64$ KiB、
+$C_{L2}=2$ MiB、$\nu=8$；默认 $f_{L1}=0.625,f_{L2}=0.5$，得到
+`M12/K728/N16` 的 `40,768 B` L1 工作集和 `M12/K18720/N16` 的
+`1,048,320 B` L2 诊断工作集。比例是探针保留空间的机器无关策略参数，容量本身
+必须来自硬件；CLI 可显式改变比例，但不能把某台机器的 KiB 数写入模型公式。
 
 设某 stage 有 $P$ 个物理 M panel；第 $j$ 个顺序 N range 的 packed-B 字节为
 $B_j$、每个 owner 的 B 窗口为 $U_j$、active owner 数为 $t_j$；全部物理
 packed-A 字节为 $A$，最大单 panel packed-A 字节为 $A_p$。range 按 tile 数
 非递增分配，因此后续 active owners 是首个 range 的子集。令
-$h_2(W)$ 为 effective L2 到 physical L2 容量不确定带内的 smoothstep miss
-比例，则：
+$h_2(W)$ 为 effective L2 到 physical L2 容量不确定带内的 packed-A
+smoothstep miss 比例。packed-B 使用独立 repeated-scan probe 的三点保留率校准
+$g_2(W)$：低于拐点的 miss floor、名义 L2 容量处 miss、两倍容量处 miss，并在
+两段之间 smoothstep 插值。于是：
 
 $$
 Q_{B,L2}
-=\sum_j B_j\left[1+(P-1)h_2(U_j+A_p)\right],
+=\sum_j B_j\left[1+(P-1)g_2(U_j+A_p)\right],
 $$
 
 $$
@@ -1567,43 +1745,89 @@ compulsory DRAM 和 stream bandwidth，但没有后续 panel reuse，不占
 `reusable_B_capacity`；A 和 C 因其他 owner/下一 stage 仍会消费而继续进入
 工作集。这与 9.6 的 M12 冷 B 扩展和 one-pass LLC pollution 结论一致。
 
-isolated stage 使用：
+每个顺序 N range $j$ 进一步按物理执行拆为：零资源流量的
+`range_setup`、只执行第一个 M panel 的 `cold_b`，以及在 $P>1$ 时执行其余
+$P-1$ 个 panel 的 `steady_b`。设首 panel 的 compute/store rows 占比分别为
+$f_{c,j},f_{s,j}$，则：
+
+$$
+Q^{cold}_{B,\mathrm{DRAM}}=B_j,\qquad
+Q^{steady}_{B,\mathrm{DRAM}}=0,
+$$
+
+$$
+Q^{cold}_{A,L2}=f_{c,j}Q_{A,L2,j},\qquad
+Q^{cold}_{C}=f_{s,j}Q_{C,j},
+$$
+
+其余 A/C 与 $Q_{B,L2,j}-B_j$ 全部进入 `steady_b`。matrix FLOPs、frontend
+instructions、L1 load 和 epilogue elements 则直接按首 panel 与剩余 panel 的
+真实 Mr/K/N tile 指令数生成，而不是按 wall time 比例拆分。每个 range 的两类
+phase demand 求和严格等于原 kernel demand；$M\le12$ 没有 steady phase。
+
+每个有效校准都必须存在 `gemm_core_flops`，cold/steady phase 使用：
+
+$$
+T_{\mathrm{core}}
+=\frac{F^{\mathrm{bal}}}{P_{\mathrm{gemm\_core}}(t)},
+$$
 
 $$
 T_{\mathrm{xfer}}
-=\frac{Q_{L1}}{B_{L1}(t)}
-+\frac{Q_{L2}}{B_{L2}(t)}
-+\frac{Q_{LLC}}{B_{LLC}(t)}
-+\frac{Q_{\mathrm{DRAM}}}{B_{\mathrm{DRAM}}(t)},
+=\max\left(
+\frac{Q_{L2}}{B_{L2}(t)},
+\frac{Q_{LLC}}{B_{LLC}(t)},
+\frac{Q_{\mathrm{DRAM}}}{B_{\mathrm{DRAM}}(t)}
+\right),
 $$
 
 $$
 T_{\mathrm{body}}
 =\max\left(
-\frac{F^{\mathrm{bal}}}{P_{\mathrm{matrix}}(t)},
-\frac{I^{\mathrm{bal}}}{R_{\mathrm{frontend}}(t)},
+T_{\mathrm{core}},
 T_{\mathrm{xfer}}
 \right),
 $$
 
-再加 stage/range fixed cost 和 epilogue service。第 $j$ 个 range 的 balanced
+stage/range fixed cost 单独作为 setup phase，epilogue service 仍串行加在对应
+cold/steady phase 后。isolated stage 为：
+
+$$
+T_s=\sum_j\left(T_{setup,j}+T_{cold,j}+T_{steady,j}\right),
+$$
+
+其中单 panel range 的 $T_{steady,j}=0$。缺少 `gemm_core_flops` 的旧 calibration
+不再兼容，因为 register-only BFMMLA 不是 kernel 可达到的 peak。先分 phase 再取
+ECM maximum 很重要：cold panel 可以由
+DRAM/refill 主导，而同一 range 的 steady 部分可以由 GEMM core 或 private-cache
+主导。第 $j$ 个 range 的 balanced
 N-tile demand 为
 $\lceil n_j/t\rceil\min(n_j,t)$；因此 N tile 不能整除、尾 range 少于 team
 width、非 2 次幂宽度和 active-thread 截断都不需要额外 route table。
 
-并发事件中，当前 phase $i$ 对资源 $r$ 的请求速率为
-$q_{i,r}/T_i$。总 active width 为 $c$ 时：
+并发事件中先按当前 active working set 的 $h_3(\sum_iW_i)$ 计算 spill。令
+$\tau_{i,r}$ 为 phase $i$ 对资源 $r$ 的独立 service occupancy（包含 stage
+residual），只统计对该资源有非零请求的线程：
 
 $$
-\lambda_r=\sum_i\frac{q_{i,r}}{T_i},
+\lambda_r=\sum_i\frac{q_{i,r}}{\tau_{i,r}},
 \qquad
-d_r=\max\left(1,\frac{\lambda_r}{R_r(c)}\right).
+c_r=\min\left(C,\sum_i t_i\mathbf 1[q_{i,r}>0]\right),
+\qquad
+\rho_r=\frac{\lambda_r}{R_r(c_r)},
+\qquad
+d_r=\max(1,\rho_r).
 $$
 
-$d_r$ 只放大对应 matrix、frontend、L1、L2、LLC、DRAM 或 epilogue 分量，
-固定开销不作为内存流量 derate。event simulator 在 W13/W2 range completion
-处重算 active set 和所有 $d_r$。因此 isolated time 相近但 resource vector
-不同的两个 kernel 可以得到不同 contention 响应。
+$d_r$ 只放大对应 GEMM core、L2、LLC、DRAM 或 epilogue 分量；分配后
+速率 $\lambda_r/d_r$ 不超过容量。固定开销不作为内存流量 derate，
+event simulator 在 setup/cold/steady completion 处重算 active set 和所有 $d_r$。
+因此不需要 task-pair slowdown matrix：短 expert
+几乎全部位于 cold phase，共享 refill 服务降低会直接减慢整体；长 expert 大部分
+位于 steady compute/cache phase，同一争用只影响部分 lifetime，于是自然得到有
+方向性的交叉减速。`explain_dag()` 输出每个事件的工作集、spill fraction、
+offered/allocated rate、capacity、utilization 和 dilation，且与 planner 评分使用
+同一推进器。
 
 解析 backend 与 empirical backend 共用 planner protocol。前者根据机器允许
 宽度生成 homogeneous/至多两种宽度的 shape，后者继续严格使用 profile shape。
@@ -2053,7 +2277,7 @@ active-set-128 分别提升 30.58%/30.34%，NUMA0 未覆盖 uniform 仅变化 0.
 median 差异为 +0.23%、+0.33%、+0.29%，仍低于约 1% 噪声下界。
 
 首个 per-route 原子减计数原型在均衡分布上从 7.754 ms 退化到 10.116 ms，已被
-拒绝。当前实现改为每 expert 一次 completion publication、只读 TopK 状态检查、
+拒绝。当时实现改为每 expert 一次 completion publication、只读 TopK 状态检查、
 每 token 一次 CAS 和按 expert 批量入队。该结果只证明第一版在两个受控分布上
 没有可分辨的 median 回退；尚不能证明对 captured routing 有净收益，也不能作为
 planner 中 merge-overlap 的 cost 校准。
@@ -2079,8 +2303,20 @@ Plan V2 三态控制的 contract 验证要求为：`null/false/true` 必须分�
 makespan；相同 expert finish 的 strict bridge 必须输出 `false`，存在 finish
 差时必须保持 `null`；显式控制连接旧 native extension 时必须报错，elastic
 必须拒绝 `true`。AArch64 集成验证还需对 auto/off/on 做 bit-exact 对比，并用
-stage timing 确认 off 路径没有 ready-token publication/claim 且启动统一连续
-merge。
+stage timing 确认 off 路径没有 ready-token publication/owner scan 且启动统一连续
+merge。fixed-owner 路径的 trace 还必须逐 token 验证
+$q\in\mathcal Q_{\mathrm{tid}(q)}$，并确认 drain 模式恰好产生 $|\mathcal Q|$
+次 merge、没有 final merge fallback。
+
+2026-07-31 在 AmazonC5192Cores NUMA0 `0--95` 上完成 fixed-owner 首轮验证。
+`tokens=2048, top_k=6, H=4096, F=512, E=12` 的 25%/75% two-group 分布、
+96T、split-W13、7 次 warmup 和 31 次交错采样中，post-barrier、fixed-owner
+early+final、fixed-owner same-job drain 的中位数分别为
+`10.339/10.279/10.216 ms`；drain 相对 post-barrier 提升 `1.20%`，P10/P90 为
+`10.177/10.537 ms`。该组只验证新 owner policy 相对同轮 fallback 没有性能回退，
+不作为与旧 global queue 的跨版本对比。AArch64 完整 MoE 测试为
+`102 passed, 3 skipped`，trace 对每个 merge record 验证 token 落在执行 tid 的
+静态连续 owner 区间内。
 
 ### 9.4 Amazon 192-core 双 NUMA 稳态校准
 
@@ -2442,6 +2678,15 @@ $\widehat D_i(\mathcal Z)$ 定义、公式形式、candidate space 或 productio
   `IntervalPlanner`/`PlannedMoE`；
 - holdout 报告同时给出 isolated/full-call 绝对误差和真实 shape regret。
 
+2026-08-01 将解析 backend 升级为 phase-aware shared-resource v3。每个 N range 从单一平均 phase
+改为 `range_setup -> cold_b -> steady_b`，M<=12 只生成 cold phase；测试逐项验证
+cold/steady 的 FLOPs、L1、L2、LLC、compulsory/spillable DRAM 求和保持完整 kernel
+demand。并发容量改为按资源的实际 requester threads 计算，setup 不再虚增可用
+带宽；新增 `active_resource_pressure()` 与 `explain_dag()`，可直接审计每个事件的
+物理路径、offered/allocated rate、capacity、utilization 和 dilation。endpoint
+load probe 按最大时间下界组合；packed-B L2 reuse 使用独立 repeated-scan 的三点
+miss 校准。59 个 focused tests 通过，但仍只证明公式、守恒关系和 planner contract。
+
 这些测试只验证公式不变量和 planner contract，不证明目标机器精度。真实校准表
 不得从现有 route/thread cost table 反推；它必须来自独立 matrix、L1、L2、
 LLC、DRAM、frontend/epilogue probe 和固定开销测量。旧 schema-v2 表仅作为
@@ -2449,6 +2694,22 @@ holdout oracle。production 切换门槛暂定为 isolated MAPE 不超过 10%、
 contention P90 绝对误差不超过 15%、所有验证 route 的最大 measured shape
 regret 不超过 5%。在完成 8-core 与 192-core 至少各一份 unseen
 route/thread/mixed-distribution 验证前，解析 backend 保持 opt-in。
+
+同日在 AmazonC5192Cores NUMA0 `0-95` 上完成首份独立薄校准。matrix/L1/L2/LLC/
+DRAM probe 不读取 routed-expert 表；DRAM sustainable ceiling 为 `395.9 GB/s`，matrix
+register-only ceiling 为 `0.413/39.007 TFLOP/s`（1T/96T）。另用既有 packed-B
+repeated-scan PMU 数据给出低窗口/2 MiB/4 MiB miss 锚点 `18.0/62.3/86.9%`。
+只用 12 个 isolated 点拟合 `51.912 us` expert fixed、`479.10 ns/route` 和共同
+stage scale `1.18546`，所有 54 个 contention 点均留出。
+
+108 个 true isolated holdout 的 MAPE 为 `10.22%`；contention P90 绝对误差为
+`47.79%`；六个 uniform route 的平均/最大 measured shape regret 为
+`3.33/8.17%`。相对 service-only first pass，最大 regret 从 `32.31%` 明显下降，
+但三项仍未同时通过 `10/15/5%` gate。主要残差是长 route `1T/2T` 的 spill 过估，
+以及中等 route 对 `8T` 相对 `16T` 的 active-window 代价低估；NUMA-wide LLC
+power curve 本身还有 `22.9%` MAPE、`59.5%` 最大误差。因此 production 继续使用
+empirical backend。完整数据见
+`optimizations/fused_moe_sve/results/amazon_192c_analytic_thin_calibration_20260801.md`。
 
 ### 9.15 跨 rank lifetime 状态转换
 
@@ -2685,7 +2946,44 @@ task。production auto 为 `8.753 ms`（p10--p90
 `8.746 ms`，两者只差 `0.08%`；相对同轮 strict `11.180 ms` 的 throughput
 提升 `27.73%`。anchor `8.710 ms` 对 production median 的误差为 `0.49%`。
 
-### 9.19 Cold-phase CP-SAT mixed-width oracle
+### 9.19 Strict 尾部任务领取验证
+
+在 AmazonC5192Cores 的 NUMA0 `0--95` 上，以 TP4
+`H=4096, F=512, E=256`、2048 tokens、TopK=6、SVE JIT exact-M 和
+split-W13 路径验证 2.3.2。每组复用同一份 packed weights，strict 与
+tail-steal 交错执行；使用 8--10 次 warmup 和每种模式 101 次正式采样，uniform
+额外使用 201 次采样。实验参数为 $d=2,r_{\min}=2$。
+
+| workload | Plan V2 shape | strict median | tail-steal median | throughput 收益 | 单次 trace 迁移 |
+| --- | --- | ---: | ---: | ---: | ---: |
+| `moe256-uniform` | `6x16T` | 16.451 ms | 16.376 ms | +0.46% | 1 |
+| `moe256-active-set-128` | `6x16T` | 12.140 ms | 11.897 ms | +2.04% | 0 |
+| `moe256-tiered-hotspot` | `12x8T` | 8.861 ms | 8.862 ms | -0.02% | 0 |
+| `dsv4-real-2048-seq70` | `12x8T` | 14.791 ms | 14.757 ms | +0.23% | 6 |
+
+`active-set-128` 的单次 trace 没有发生迁移，因此其收益不能归因于 work
+stealing；实验分支同时把 fixed executor 的全 task 扫描收窄为 per-team queue，
+该 dispatch 差异也包含在 E2E 数字中。captured route 则明确观察到 6 个未启动
+whole experts 改在其他 8T team 上执行，说明 suffix migration 在真实不均匀
+路由上可达。tiered hotspot 的 planner lane 已平衡，没有可领取后缀，性能保持
+中性。
+
+ready-token auto policy 为不均匀 route 启用 drain 时，释放的 team 继续消费原
+merge queue；测试同时覆盖 `early_merge=False/True`，输出均与原 strict path
+bit-exact。完整 ARM MoE 测试为 `104 passed, 1 skipped`。
+
+初版每次调用重新读取 96 个 CPU 的 sysfs NUMA topology，使
+`plan_validate` 从约 `0.026 ms` 增至 `0.240 ms`，掩盖了迁移收益。缓存
+CPU-to-NUMA 映射后，代表 trace 的验证阶段为 `0.017 ms`。`d=4` 在 captured
+route 中增加了迁移数，但未增加中位收益；$r_{\min}=1$ 同样只增加领取次数，
+未改善 uniform E2E，因此实验默认采用更保守的 $d=2,r_{\min}=2$。
+
+当前数据只证明该机制在既有上层计划后的 residual tail 上无显著回退并可获得
+小幅收益；它还不是 cost-model 可见的 production 决策。功能保持默认关闭，
+后续需先把相同 suffix state machine 加入事件模拟，再决定是否由 planner
+显式启用。
+
+### 9.20 Cold-phase CP-SAT mixed-width oracle
 
 2026-07-31 使用 AmazonC5192Cores 双 NUMA TP4/F512 exact-M split-W13 profile，
 对单 rank 的 96 cores 离线求解 6.2.1。默认 stage-window policy 为
@@ -2720,10 +3018,166 @@ interval 模型尚未在当前时限收敛。`300/336.4/375.9 GB/s` 的 10--15 s
 
 结论是：在 cold packed-B 流体 surrogate 内，captured mixed distribution 相对
 固定 `12x8T` 至少仍有约 `27.7%` 的已证明调度 headroom；但这不是可直接宣称的
-E2E 收益。下一步应把 mixed incumbent 转成受限可执行候选，先验证实际 cold
-错峰和 width 组合，再决定是否把 DRAM phase 资源加入 online planner。
-完整命令、模型边界和结果解释见
+E2E 收益。离线命令、模型边界和结果解释见
 `optimizations/fused_moe_sve/results/amazon_192c_cold_phase_cp_sat_oracle_20260731.md`。
+
+#### 9.20.1 Mixed incumbent 的 runtime 反证
+
+同日将 DSV4 mixed incumbent 按 6.2.2 降为连续 core strict Plan V2。物理 placement
+在 `0.06587 s` 内证明 `OPTIMAL`，223 个 task 的 width histogram 保持
+`173x1T + 7x2T + 7x4T + 34x8T + 2x16T`；所有 variant 先通过 bit-exact
+输出对比。AmazonC5192Cores NUMA0 `0-95` 上随机交错测量 7 次 warmup、51 次 run：
+
+| runtime plan | median | p10--p90 | aggregate | 相对 fixed throughput |
+| --- | ---: | ---: | ---: | ---: |
+| fixed `12x8T` | `14.854 ms` | `14.803--14.924 ms` | `10.409 TFLOP/s` | baseline |
+| mixed eager | `20.643 ms` | `20.528--21.609 ms` | `7.490 TFLOP/s` | `-28.05%` |
+| mixed release `0.25x` | `20.649 ms` | `20.549--21.444 ms` | `7.488 TFLOP/s` | `-28.07%` |
+| mixed release `0.50x` | `20.765 ms` | `20.676--20.915 ms` | `7.446 TFLOP/s` | `-28.47%` |
+| mixed release `0.75x` | `20.780 ms` | `20.711--20.961 ms` | `7.441 TFLOP/s` | `-28.52%` |
+| mixed release `1.00x` | `20.869 ms` | `20.793--20.994 ms` | `7.409 TFLOP/s` | `-28.82%` |
+| mixed release `1.25x` | `21.008 ms` | `20.905--21.615 ms` | `7.360 TFLOP/s` | `-29.30%` |
+
+oracle incumbent 预测 fixed/mixed 为 `12.500/8.782 ms`；实测误差分别为
+`+18.83%/+137.63%`。mixed 没有得到预测的 `42.34%` throughput headroom，反而
+增加 `40.50%` latency。`0.25x` release 相对 eager 只增加 `0.03%`，因此回退不由
+release gate 或读时钟开销导致；继续增加 delay 只会单调变慢。
+
+这组反证关闭了首版 cold-only surrogate 作为可执行候选生成器的结论。大量 1T
+expert 并发时，首个 M12 phase 之后不能维持 isolated cache 状态；当前 oracle 没有
+计入整个 active window 上的 LLC-to-L2 service、容量淘汰、active-set compute/frequency
+slowdown、dispatch、scratch/gather、store 和 merge。非零 release 保持实验诊断能力，
+但不进入 production planner。下一版 oracle 必须在完整 active lifetime 上建模 lower
+cache service，并先通过 production contention model 过滤候选。
+
+2026-08-01 的 trace、width sweep 和 PMU follow-up 将退化进一步定位如下：
+
+1. `scheduled_compute` 从 fixed 的 `14.110 ms` 增至 mixed eager 的 `19.848 ms`，
+   已解释总回退中的约 `5.74 ms`；route build、merge 和其他外层阶段合计没有形成
+   可见差异。
+2. fixed 的实际平均 active cores 为 `93.51/96`，mixed eager 只有 `57.18/96`。
+   mixed 虽然可见 W13/W2/gather core-time 从 `1228.7` 降至 `1108.3 core-ms`，但
+   固定 core rectangle 无法在 duration 失配后回填空洞，wall time 因低占用反而增加。
+3. mixed 的 W13/W2 实际活跃窗口峰值为 `201.5/161.5 MiB`，fixed 仅为
+   `44.0/36.0 MiB`；目标 NUMA 的共享 L3 为 `96 MiB`。对应 PMU 每次调用的
+   L2 refill 从 `5.208` 增至 `6.203 GiB`（`+19.1%`），last-level read miss 从
+   `0.251` 增至 `0.305 GiB`（`+21.5%`）。
+4. 受限 width oracle 中，`min-width=2/4/8` 分别实测 `17.114/15.087/15.833 ms`；
+   `4T` 最接近 fixed（throughput `-2.00%`），其 W13/W2 峰值窗口降为
+   `47.5/33.5 MiB`。这验证了该机上至少 `4T` 同时兼顾约 24 个 active expert、
+   96-core 覆盖和 LLC window；`8T` 又损失 tail packing，`2T` 仍有过多 active window。
+5. isolated duration 误差随 route/width 显著变化：1T 的 M1/M28/M197 actual/model
+   中位数分别为 `3.23x/4.58x/1.39x`；M28 runtime 同时活跃最多 33 个 expert。
+   oracle 计划的 M<=12 cold 并发最多 8 个，runtime 却达到 20 个，说明绝对 release
+   不能在 task 变慢后维持计划中的并发上界。
+6. 只给 M<=32 的 1T task 增加 completion-token slot cap，24 slots 将 mixed 从
+   `20.661` 改善到 `19.316 ms`，但 8 slots 退化到 `26.692 ms`。因此容量争用确实是
+   因素，但单独串行化会进一步降低 core occupancy；必须同时调整 team width/placement。
+7. OS context switches 约 `436--462/call` 且 migration 为 0。按 core 预建 task list
+   使 mixed 退休指令减少 `36.8%`，wall time 仍保持约 `20.7 ms`；它只移除了空闲核的
+   扫描工作并暴露 `34.75%` active memory-stall，不是 critical-path 根因。
+
+因此当前可执行证据支持的机制链为：cold-only duration/resource 低估 -> 真实窄任务
+延长并重叠 -> active packed-B window 超过 L3 且 refill 增加 -> 静态 rectangle 出现
+无法回填的 core holes -> 平均占用从约 97% 降至约 60%。下一版候选必须同时满足
+完整 stage-window resource 评分和 runtime 可回填性；不能只优化 cold DRAM 时间轴。
+
+完整命令和机器可读样本见
+`optimizations/fused_moe_sve/results/amazon_192c_cold_phase_oracle_runtime_20260731.md`
+与同名 `.json`。
+
+### 9.21 硬件容量派生的 L1-hot GEMM core 校准
+
+2026-08-02 在 AmazonC5192Cores NUMA0 `0-95` 上，将解析模型的计算上界从
+register-only M12 BFMMLA 改为 8.2.4 定义的 L1-hot M12 full-no-store GEMM。
+sysfs 实测 L1D/L2/LLC 为 `64 KiB / 2 MiB / 96 MiB`，探针几何自动选择为
+`M12/K728/N16`（A+B `40,768 B`）和 `M12/K18720/N16`
+（A+B `1,048,320 B`）。32 MiB HugeTLB、显式绑核下关键 service 为：
+
+| threads | register-only BFMMLA | L1-hot GEMM core | L2-hot GEMM diagnostic |
+| ---: | ---: | ---: | ---: |
+| 1 | `0.412` TFLOP/s | `0.340` TFLOP/s | `0.335` TFLOP/s |
+| 8 | `3.289` TFLOP/s | `2.712` TFLOP/s | `2.646` TFLOP/s |
+| 24 | `9.865` TFLOP/s | `8.154` TFLOP/s | `7.976` TFLOP/s |
+| 48 | `19.539` TFLOP/s | `16.244` TFLOP/s | `15.822` TFLOP/s |
+| 96 | `39.309` TFLOP/s | `30.377` TFLOP/s | `28.215` TFLOP/s |
+
+L1-hot 探针因单次只有约 `0.8 us`，使用 64 次 warmup 和 4096 次 timed call，避免
+慢线程离群样本压低高核数曲线。因此 `39.309 TFLOP/s` 只能表示寄存器矩阵指令上限；实际 production loop 的
+多发射、A/B load、地址更新和分支成本已由 `gemm_core_flops` 吸收。使用相同 12 个
+isolated residual training points 重算后，108 个 isolated holdout 的 MAPE 从
+`10.22%` 降到 `9.18%`，首次通过 isolated 10% 单项门槛；contention P90 从
+`47.79%` 变为 `49.57%`，最大 shape regret 保持 `8.17%`。计算 ceiling 的物理语义
+更正确，common stage residual 从 `1.18546` 降到 `1.10842`，但 per-route residual
+仍为 `418.76 ns`，说明非 GEMM operator work 尚未拆成独立资源。模型仍未通过
+contention/regret production gate；主要剩余误差是多 team packed-B retention 和
+NUMA 内 LLC topology，而不是重新提高 matrix peak。
+
+同日用整批计时复核 V3 高核数曲线：每个 worker 在一次 native call 内连续执行
+131,072 个不逐次计时的 L1-hot kernel，只在 batch 外计时，随机顺序重复 5 次。
+L1-hot 在 `1/48/64/80/96T` 分别为
+`0.345/16.524/21.168/25.820/30.438 TFLOP/s`，相对单核线性效率为
+`100.00/99.69/95.78/93.46/91.82%`；96T 五次范围仅
+`30.406--30.447 TFLOP/s`。相同 batch 口径的 register-only BFMMLA 在线程宽度
+`1/48/64/80/96T` 的线性效率为
+`100.00/99.53/99.36/99.21/98.95%`。因此 V3 的 matrix execution units 本身
+没有显著跨核共享上限，但完整 L1-hot load/control/compute loop 在 48--64 核之间
+出现可复现拐点；它不能被逐调用时钟或单次调度离群解释。sysfs 只暴露 private
+L1/L2 和覆盖 `0-95` 的单一 L3 domain。进一步用 V3 implementation-defined PMU
+事件复核后，可以排除 cache capacity 和普通 DVFS：48/96T 的
+`L1D_CACHE_REFILL/L1D_CACHE` 分别只有 `0.00545%/0.00496%`，
+`STALL_BACKEND_L2D=0`，`CPU_CYCLES/CNT_CYCLES` 均为 `3.300`，且每 FLOP
+retired instructions 不变。相反，每 FLOP backend stall slots 增加 `29.2%`，
+`STALL_BACKEND_CPUBOUND` 增加 `41.4%`，`STALL_BACKEND_BUSY` 增加 `87.0%`；
+其子事件主要是 vector issue queue full，`DISPATCH_STALL_IQ_VX/FLOP` 增加
+`41.2%`，而 LS issue queue 绝对计数小约 160 倍。register-only 对照的
+`IQ_VX/FLOP` 在 48--96T 变化小于 `0.1%`。
+
+48T victim/aggressor 实验给出同一结论：48 个 full-loop victim 单独运行的 worker
+中位时间为 `1.6794 s`；另加 48 个 register-only worker 后为 `1.6864 s`
+（`+0.42%`），另加 48 个 full load/BFMMLA worker 后为 `1.8308 s`
+（`+9.01%`）。因此可观测机制是 socket-wide、由 load-to-vector-compute 混合流
+触发的 vector-dispatch backpressure，不是私有 cache miss、L3 data fabric 或
+BFMMLA 单元共享上限。平台没有暴露可以把 firmware dispatch/power throttling 与
+其他实现特定 vector-issue control 进一步区分的计数器，所以最后一层硬件命名仍是
+推断。模型不应把 V3 视为全范围严格线性，也不应使用单一 power curve 将
+64--96T derate 扩散到 1--48T；后续应改为薄校准的分段 active-core efficiency。
+
+同日的 M12 双 B 寄存器 column-pipeline 反证了仅靠局部指令重排即可关闭该
+derate 的假设。21 轮长窗口中，96T 从 `30.420` 提升到 `30.617 TFLOP/s`
+（`+0.648%`），线性效率从 `91.681%` 提升到 `92.273%`；但
+`DISPATCH_STALL_IQ_VX` 反而增加约 `37.5%`。因此保留现有分段 active-core
+efficiency 建模：这个重排只减少约 `0.74%` 的 active-core cycles，不足以改变
+service curve 或 production calibration。
+
+详细命令、完整 service 表和 artifact 路径见
+`optimizations/fused_moe_sve/results/amazon_192c_analytic_hot_gemm_core_20260802.md`。
+
+### 9.22 Neoverse-V1 的 L1/L2 容量派生复验
+
+同日用相同探针在 AmazonECS8Cores 的 8 个 Neoverse-V1 核上复验。sysfs 实测
+L1D/L2/LLC 为 `64 KiB / 1 MiB / 32 MiB`，因此 L1 几何仍为
+`M12/K728/N16`（A+B `40,768 B`），L2 几何自动缩为
+`M12/K9360/N16`（A+B `524,160 B`）。长采样结果为：
+
+| threads | register-only BFMMLA | L1-hot GEMM core | L2-hot GEMM diagnostic |
+| ---: | ---: | ---: | ---: |
+| 1 | `0.331` TFLOP/s | `0.289` TFLOP/s | `0.302` TFLOP/s |
+| 2 | `0.662` TFLOP/s | `0.483` TFLOP/s | `0.495` TFLOP/s |
+| 4 | `1.058` TFLOP/s | `0.872` TFLOP/s | `0.890` TFLOP/s |
+| 8 | `1.833` TFLOP/s | `1.621` TFLOP/s | `1.663` TFLOP/s |
+
+register-only 在 1T/8T 分别高估完整主循环 `14.4%/13.1%`，支持继续将
+L1-hot full-no-store 作为可执行 compute resource。L2-hot 比 L1-hot 高
+`2.1%--4.5%`，原因是 `K=9360` 比 `K=728` 更充分摊薄固定调用和循环边界成本；
+因此当前 L1-hot 是保守的工程 ceiling，不是严格数学 peak。若后续需要更紧的上界，
+应在一次 JIT 调用内重复同一 L1-resident K chunk，而不是恢复 register-only 值。
+V1 的 8T L1-hot 仅为 1T 的 `5.60x`，register-only 也仅为 `5.54x`；这证明多核
+compute derate 在无 lower-cache 流量时已经存在，必须保留在线程宽度 service curve
+中，不能归因给 DRAM contention。
+
+完整命令、重复性说明和原始 artifact 见
+`optimizations/fused_moe_sve/results/amazon_v1_8c_analytic_hot_gemm_core_20260802.md`。
 
 ## 10. 同步规则
 
@@ -2802,4 +3256,16 @@ E2E 收益。下一步应把 mixed incumbent 转成受限可执行候选，先�
 | 2026-07-30 | v0.49 | Plan V2 strict task 增加连续 route-slice 语义，允许同一 terminal expert 在 M 维拆成两个 disjoint task；native runtime 对每个 slice 独立 gather/W13/W2/direct route store，并在全部 slice 完成后才发布 expert completion。bounded-tail planner 只在 exact-layout anchor 命中时生成 `2 expert x 2 slice x 24T` grouped 候选，使 active-set-8 的尾波占满 96 核；显式 51-run 实验从 whole-expert 24T 的 9.804 ms 降至 8.710 ms，production auto 复测为 8.753 ms、相对同轮 strict throughput 提升 27.73%，未校准形状保持原候选域。 |
 | 2026-07-30 | v0.50 | async ready-token executor 改为同一 resident worker job 排空 queue：expert 阶段保持单 token 领取，compute 完成后默认以两 token batch 和一 token lookahead 预取收尾，不再启动连续 final merge；保留 drain/merge/batch/prefetch 环境变量 fallback。AmazonC5192Cores NUMA0 active-set-8 的 101-run 中位数从旧路径 8.691 ms 降到 8.637 ms，P90 从 8.963 ms 降到 8.706 ms；batch sweep 未证明预取有独立显著收益，planner/cost-model 决策空间保持不变。 |
 | 2026-07-30 | v0.51 | Plan V2 增加 plan-level `early_merge` 三态控制并下沉为 native `-1/0/1`；strict planner 复用 active expert DAG simulator 的逐 task 完成时刻，在聚合 expert finish 于 1 ns/1 ppm 内相同时写入 `false`，统一使用全 worker 连续 post-expert merge，其余候选保持 auto，planner 不强制 on。环境变量仍是全局 kill switch，elastic 拒绝 on；同步更新 API、模型公式、剪枝表、验证要求和 contract tests，combine service time 仍未进入评分。 |
-| 2026-07-31 | v0.52 | 新增独立 cold-phase CP-SAT oracle：以 M12 isolated reference 将 expert 分成 cold packed-B/steady phase，master interval 在共享资源等待期间继续占用原 team，并对 cold phase 增加单 NUMA DRAM cumulative constraint；同模型比较固定 `12x8T` lane DAG 与 `1/2/4/8/16T` mixed-width 域。192-core TP4 profile 的 DSV4 fluid-aggregate 求解给出 `27.7%--49.8%` surrogate headroom；range-level 模型尚未收敛。该工具不接入 production planner。 |
+| 2026-07-31 | v0.52 | 增加默认关闭的 strict suffix-steal runtime：保留 planner 前缀，只允许同 NUMA、同宽 fixed team 领取 peer lane 最后两个 whole-expert task，不抢占、不改宽度，并与 ready-token drain 共存。NUMA topology 增加进程内缓存；192-core NUMA0 的 uniform/active-set-128/captured route 分别提升 0.46%/2.04%/0.23%，tiered hotspot 持平。该动作暂不进入 planner candidate、cache identity 或 cost-model 评分。 |
+| 2026-07-31 | v0.53 | async ready-token merge 从全局 claim queue 改为固定 owner：logical worker 沿用 final merge 的连续 token range，在每个 expert task 边界及无可运行 expert 时扫描本区间的 ready token，compute 后由同一 resident worker 排空本区间；保留 drain/batch/prefetch 和 final fallback 契约，不允许 owner 间 merge stealing，planner 三态和 cost-model 搜索空间不变。 |
+| 2026-07-31 | v0.54 | 新增独立 cold-phase CP-SAT oracle：以 M12 isolated reference 将 expert 分成 cold packed-B/steady phase，master interval 在共享资源等待期间继续占用原 team，并对 cold phase 增加单 NUMA DRAM cumulative constraint；同模型比较固定 `12x8T` lane DAG 与 `1/2/4/8/16T` mixed-width 域。192-core TP4 profile 的 DSV4 fluid-aggregate 求解给出 `27.7%--49.8%` surrogate headroom；range-level 模型尚未收敛。该工具不接入 production planner。 |
+| 2026-07-31 | v0.55 | 将 cold-phase incumbent 降为连续 core strict Plan V2：二维 CP-SAT 固定 oracle 时间区间并求物理 placement，per-task release gate 保留主动 idling，非零 release 仅用于 strict 实验且关闭 tail-steal。192-core NUMA0 的 DSV4 51-run 验证中，fixed/mixed 实测为 `14.854/20.869 ms`，mixed 相对 fixed throughput 回退 `28.82%`，而 `0.25x` release 相对 eager 仅差 `0.03%`；因此首版 cold-only surrogate 被 runtime 反证，不进入 production planner。 |
+| 2026-08-01 | v0.56 | 用 stage trace、width/concurrency sweep 和多核 PMU 定位 cold-phase mixed runtime 回退：mixed 实际平均 active cores 仅 `57.18/96`，W13/W2 峰值 active window 达 `201.5/161.5 MiB`，L2 refill/LL miss 相对 fixed 增加 `19.1%/21.5%`；`min-width=4` 将时间恢复到 `15.087 ms`、距 fixed throughput `2.00%`。模型增加 per-worker L2 retention、完整 active stage window 与 completion-feedback gate 要求；production planner 和默认 runtime 不变。 |
+| 2026-08-01 | v0.57 | 将 analytical backend 重建为 phase-aware ECM：每个 N range 显式拆为零流量 setup、首 M-panel cold-B 和剩余 steady-B，compulsory packed-B DRAM 只进入 cold phase，所有资源 demand 在拆分前后守恒；并发事件按各资源实际 requester threads 计算 offered-load/capacity/utilization/dilation，并增加同推进器的 `explain_dag()` 诊断。该模型不使用 task-pair slowdown matrix；56 个逻辑测试通过，production 仍等待 8-core/192-core 独立薄校准与 holdout gate。 |
+| 2026-08-01 | v0.58 | 在 AmazonC5192Cores NUMA0 完成 matrix/L1/L2/LLC/DRAM 独立薄校准和 96-expert holdout；明确 load probe 为 endpoint service 并按最大下界组合，加入 packed-B repeated-scan 三点 L2 retention，资源诊断增加 allocated rate 容量守恒。108 个 isolated holdout MAPE 为 10.22%，contention P90 为 47.79%，最大 shape regret 为 8.17%，未通过 10/15/5% gate，故 empirical backend 保持 production 默认。 |
+| 2026-08-02 | v0.59 | 解析计算 ceiling 改为由 sysfs L1D 容量派生的 M12 L1-hot full-no-store GEMM core service；register-only BFMMLA/frontend/L1 降为诊断和旧 schema fallback，L2/LLC/DRAM endpoint 保持独立上界。AmazonC5192Cores 的 4096-run 1T/96T core ceiling 为 0.340/30.377 TFLOP/s，holdout MAPE 9.18%、contention P90 49.57%、最大 regret 8.17%；仅 isolated gate 通过，production 默认不变。 |
+| 2026-08-02 | v0.60 | 在 8-core Neoverse-V1 上复验 sysfs cache-derived 几何：L1D/L2 为 64 KiB/1 MiB，对应 M12/K728/N16 与 M12/K9360/N16；1T/8T L1-hot ceiling 为 0.289/1.621 TFLOP/s，register-only 高估 14.4%/13.1%。记录 L2 长 K 的 2.1%--4.5% 固定成本摊销差异和 V1 无 lower-cache 流量时的 5.60x all-core derate；公式、剪枝和 production 默认不变。 |
+| 2026-08-02 | v0.61 | 将 L1-hot full-no-store `gemm_core_flops` 固化为解析模型唯一计算 peak；register-only `matrix_flops` 仅保留诊断，缺少 L1-hot service 的旧 calibration 改为明确拒绝加载，不再使用 kernel 无法达到的 matrix/frontend/L1 fallback。phase 公式、资源取 max 方式、planner 候选和 production empirical 默认不变。 |
+| 2026-08-02 | v0.62 | 用整批 native 计时复核 V3 高核数 compute scaling：L1-hot 在 48T 前保持 99.7% 线性效率，64/80/96T 降为 95.8%/93.5%/91.8%，96T 五次稳定在 30.406--30.447 TFLOP/s；register-only 96T 仍为 98.9%。确认高核数 full-loop derate 真实存在但不是 BFMMLA 单元共享，并要求后续用分段 active-core efficiency 代替把拐点扩散到低核数的单一 power curve；当前 calibration 数值和 production 默认不变。 |
+| 2026-08-02 | v0.63 | 用 V3 top-down PMU 与 48T victim/aggressor 实验归因高核数 L1-hot derate：L1 refill ratio 不增、L2D stall 为 0、频率保持 3.3 GHz；增长来自 CPU-side backend busy 和 vector issue queue full。48 个 register-only aggressor 只使 full-loop victim 中位时间增加 0.42%，48 个 full-loop aggressor 增加 9.01%。因此模型将其定义为 load-to-vector-compute 混合流触发的 socket-wide vector-dispatch backpressure；最终 firmware power/dispatch 机制因无直接计数器仍不作硬编码，production 默认不变。 |
+| 2026-08-02 | v0.64 | 用 M12 双 B 寄存器 column-pipeline 检验局部调度能否关闭 V3 高核数 derate：96T 长窗口吞吐只提升 0.648%，线性效率增加 0.592 个百分点，而 `DISPATCH_STALL_IQ_VX` 增加约 37.5%。该 probe 低于 2% 采用门槛，不进入 production；现有 L1-hot service 和分段 active-core efficiency 结论不变。 |

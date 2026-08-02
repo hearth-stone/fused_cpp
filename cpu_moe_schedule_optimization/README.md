@@ -133,6 +133,9 @@ T_plan(plan) + T_execute(plan)
   planner-compatible 解析 backend；由 exact kernel demand、cache capacity、
   route-independent machine service curves 和共享资源 event simulator 预测
   isolated/contention 时间，并定义薄校准 schema 与 holdout 验收门槛。
+- [`../optimizations/fused_moe_sve/results/amazon_192c_analytic_thin_calibration_20260801.md`](../optimizations/fused_moe_sve/results/amazon_192c_analytic_thin_calibration_20260801.md)：
+  192-core 主机 NUMA0 的独立 service/retention 薄校准与 holdout；排序显著改善，
+  但 contention P90 和最大 regret 未过门槛，因此 production 仍使用经验模型。
 - [`DESIGN.md`](./DESIGN.md)：完整设计文档，定义 plan space、成本模型、严格最优求解方式、multi-plan runtime selector 和阶段性路线图。
 - [`TODO.md`](./TODO.md)：schema-v2 profiling 之后的 policy-aware cost model、planner 与 TP/EP evaluator 待办。
 - [`README.md`](./README.md)：当前入口说明。
@@ -150,8 +153,9 @@ T_plan(plan) + T_execute(plan)
   指令和 cache 流量，不进入通用算法公式。
 - [`cost_model/analytic_model.py`](./cost_model/analytic_model.py) /
   [`cost_model/validate_analytic_model.py`](./cost_model/validate_analytic_model.py)：
-  解析 cost model、机器校准加载和 empirical holdout 验证；完成跨机器门槛前
-  保持 opt-in。
+  phase-aware hierarchical service cost model、机器校准加载和 empirical holdout 验证；按
+  setup/cold-B/steady-B 事件计算 shared-resource offered load，并提供逐事件
+  pressure 解释；完成跨机器门槛前保持 opt-in。
 - [`cost_model/gemm_ecm.py`](./cost_model/gemm_ecm.py)：旧 API 兼容 facade 和
   stage-trace report CLI；三层 GEMM model 当前不进入 planner active cost。
 - [`cost_model/working_set_model.py`](./cost_model/working_set_model.py)：仅针对
