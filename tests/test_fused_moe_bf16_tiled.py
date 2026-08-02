@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import platform
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -440,6 +441,7 @@ def test_sve_plan_v2_route_slices_match_full_experts(
 
 def test_sve_plan_v2_strict_and_tail_pool_match_legacy_async(
     monkeypatch: pytest.MonkeyPatch,
+    capfd: pytest.CaptureFixture[str],
 ) -> None:
     """Native Plan V2 must preserve results across fixed and pooled placement."""
     if "arm_sve_bf16" not in available_fused_moe_bf16_tiled_backends():
@@ -482,6 +484,13 @@ def test_sve_plan_v2_strict_and_tail_pool_match_legacy_async(
         cpu_ids = list(range(4))
     if len(cpu_ids) < 4:
         pytest.skip("requires four available CPUs")
+    numa_nodes = {
+        int(path.name.removeprefix("node"))
+        for cpu in cpu_ids
+        for path in Path(f"/sys/devices/system/cpu/cpu{cpu}").glob("node[0-9]*")
+    }
+    if len(numa_nodes) != 1:
+        pytest.skip("Plan V2 dynamic tests require four CPUs from one NUMA node")
 
     strict_bridge = {
         "num_threads": 4,
@@ -513,6 +522,52 @@ def test_sve_plan_v2_strict_and_tail_pool_match_legacy_async(
         strict_plan,
         w13_split=True,
     )
+
+    steal_bridge = upgrade_legacy_async_plan(
+        {
+            "num_threads": 4,
+            "thread_cpu_ids": cpu_ids,
+            "task_expert_ids": [0, 1, 2, 3],
+            "task_core_begins": [0, 0, 0, 2],
+            "task_threads": [2, 2, 2, 2],
+            "task_dep_offsets": [0, 0, 1, 2, 2],
+            "task_deps": [0, 1],
+        }
+    )
+    steal_bridge["early_merge"] = False
+    monkeypatch.setenv("FUSED_CPP_MOE_STRICT_TAIL_STEAL", "1")
+    monkeypatch.setenv("FUSED_CPP_MOE_STAGE_TIMING", "1")
+    strict_tail_steal = fused_moe_bf16_tiled_async_plan(
+        hidden_states,
+        packed,
+        topk_weights,
+        topk_ids,
+        AsyncMoEPlanV2.from_dict(steal_bridge),
+        w13_split=True,
+    )
+    strict_tail_stderr = capfd.readouterr().err
+    steal_match = re.search(r"\[strict_tail_steal\].*stolen_tasks=(\d+)", strict_tail_stderr)
+    assert steal_match is not None
+    assert int(steal_match.group(1)) > 0
+    steal_ready_bridge = dict(steal_bridge)
+    steal_ready_bridge["early_merge"] = True
+    strict_tail_steal_ready_merge = fused_moe_bf16_tiled_async_plan(
+        hidden_states,
+        packed,
+        topk_weights,
+        topk_ids,
+        AsyncMoEPlanV2.from_dict(steal_ready_bridge),
+        w13_split=True,
+    )
+    steal_ready_stderr = capfd.readouterr().err
+    steal_ready_match = re.search(
+        r"\[strict_tail_steal\].*stolen_tasks=(\d+)",
+        steal_ready_stderr,
+    )
+    assert steal_ready_match is not None
+    assert int(steal_ready_match.group(1)) > 0
+    monkeypatch.delenv("FUSED_CPP_MOE_STRICT_TAIL_STEAL")
+    monkeypatch.delenv("FUSED_CPP_MOE_STAGE_TIMING")
 
     window_bridge = upgrade_legacy_async_plan(strict_bridge)
     window_bridge.update(
@@ -553,13 +608,6 @@ def test_sve_plan_v2_strict_and_tail_pool_match_legacy_async(
         AsyncMoEPlanV2.from_dict(tail_bridge),
         w13_split=True,
     )
-    numa_nodes = {
-        int(path.name.removeprefix("node"))
-        for cpu in cpu_ids
-        for path in Path(f"/sys/devices/system/cpu/cpu{cpu}").glob("node[0-9]*")
-    }
-    if len(numa_nodes) != 1:
-        pytest.skip("elastic Plan V2 test requires four CPUs from one NUMA node")
     elastic_bridge = upgrade_legacy_async_plan(strict_bridge)
     elastic_bridge.update(
         {
@@ -634,6 +682,8 @@ def test_sve_plan_v2_strict_and_tail_pool_match_legacy_async(
     )
 
     torch.testing.assert_close(strict.float(), reference.float(), atol=0, rtol=0)
+    torch.testing.assert_close(strict_tail_steal.float(), strict.float(), atol=0, rtol=0)
+    torch.testing.assert_close(strict_tail_steal_ready_merge.float(), strict.float(), atol=0, rtol=0)
     torch.testing.assert_close(windowed.float(), strict.float(), atol=0, rtol=0)
     torch.testing.assert_close(tail.float(), strict.float(), atol=0, rtol=0)
     torch.testing.assert_close(elastic.float(), strict.float(), atol=0, rtol=0)
@@ -936,6 +986,53 @@ def test_sve_xbyak_pure_gemm_matches_static_asm(monkeypatch: pytest.MonkeyPatch)
             N,
             packed.backend_n_tile,
             True,
+        )
+
+
+@pytest.mark.parametrize(
+    "probe_mode",
+    [4, 10, 11],
+    ids=["full-no-store", "matrix-only", "full-no-store-column-pipeline"],
+)
+def test_sve_xbyak_m12_service_probe_runs(probe_mode: int) -> None:
+    """M12 calibration probes must execute while preserving their exact-M contract."""
+    if "arm_sve_bf16" not in available_fused_moe_bf16_tiled_backends():
+        pytest.skip("requires an SVE BF16 build/runtime")
+    from fused_cpp import _moe_C
+
+    generator = torch.Generator().manual_seed(20260801)
+    K = 64
+    N = 64
+    w13 = _bf16_normal((1, N, K), generator=generator, std=0.05)
+    w2 = _bf16_normal((1, K, N // 2), generator=generator, std=0.05)
+    packed = prepare_fused_moe_bf16_tiled_weights(w13, w2, fuse_silu=True, backend="sve")
+    A = _bf16_normal((12, K), generator=generator, std=0.05)
+
+    samples = _moe_C.fused_moe_bench_sve_jit_w13_gemm(
+        A,
+        packed.w13[0],
+        K,
+        N,
+        packed.backend_n_tile,
+        1,
+        1,
+        3,
+        probe_mode,
+    )
+
+    assert len(samples) == 3
+    assert all(sample > 0.0 for sample in samples)
+    with pytest.raises(RuntimeError, match="M1/M2, or an M12-compatible mode"):
+        _moe_C.fused_moe_bench_sve_jit_w13_gemm(
+            A[:1],
+            packed.w13[0],
+            K,
+            N,
+            packed.backend_n_tile,
+            1,
+            0,
+            1,
+            10,
         )
 
 
@@ -1569,13 +1666,11 @@ def test_async_ready_token_merge_overlaps_imbalanced_experts(
     legacy = run()
     torch.testing.assert_close(legacy.float(), reference.float(), atol=0, rtol=0)
 
-    def trace_stages(path: Path) -> list[str]:
+    def trace_phases(path: Path) -> list[dict[str, str]]:
         return [
-            field.split("=", 1)[1]
+            dict(field.split("=", 1) for field in line.split()[1:])
             for line in path.read_text().splitlines()
             if line.startswith("PHASE ")
-            for field in line.split()
-            if field.startswith("stage=")
         ]
 
     legacy_trace_path = tmp_path / "async_ready_token_merge_legacy.log"
@@ -1584,7 +1679,7 @@ def test_async_ready_token_merge_overlaps_imbalanced_experts(
     traced_legacy = run()
     monkeypatch.setenv("FUSED_CPP_MOE_TRACE", "0")
     torch.testing.assert_close(traced_legacy.float(), reference.float(), atol=0, rtol=0)
-    assert "merge_routes" in trace_stages(legacy_trace_path)
+    assert "merge_routes" in [record["stage"] for record in trace_phases(legacy_trace_path)]
 
     monkeypatch.setenv(drain_flag, "1")
     monkeypatch.setenv(batch_flag, "7")
@@ -1610,9 +1705,19 @@ def test_async_ready_token_merge_overlaps_imbalanced_experts(
     traced = run()
     monkeypatch.setenv("FUSED_CPP_MOE_TRACE", "0")
     torch.testing.assert_close(traced.float(), reference.float(), atol=0, rtol=0)
-    phase_stages = trace_stages(trace_path)
-    assert phase_stages.count("merge_ready_token") == num_tokens
-    assert "merge_routes" not in phase_stages
+    phase_records = trace_phases(trace_path)
+    merge_records = [record for record in phase_records if record["stage"] == "merge_ready_token"]
+    assert len(merge_records) == num_tokens
+    assert all(record["stage"] != "merge_routes" for record in phase_records)
+    tokens_per_owner = (num_tokens + threads - 1) // threads
+    for record in merge_records:
+        owner = int(record["tid"])
+        token = int(record["group"])
+        token_begin = min(num_tokens, owner * tokens_per_owner)
+        token_end = min(num_tokens, token_begin + tokens_per_owner)
+        assert token_begin <= token < token_end, (
+            f"token {token} was merged by tid {owner}, outside owner range [{token_begin}, {token_end})"
+        )
 
 
 @pytest.mark.parametrize("bridge", ["scheduled", "async"])

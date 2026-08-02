@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare post-expert, legacy ready-token, and batched same-job merge."""
+"""Compare post-expert and fixed-owner early-merge drain policies."""
 
 from __future__ import annotations
 
@@ -140,8 +140,8 @@ def main() -> int:
 
     variants = (
         Variant("post_barrier", ready=False, drain=False, batch=1, prefetch=False),
-        Variant("ready_token_legacy", ready=True, drain=False, batch=1, prefetch=False),
-        Variant("ready_token_unified", ready=True, drain=True, batch=args.batch, prefetch=True),
+        Variant("fixed_owner_early_final", ready=True, drain=False, batch=1, prefetch=False),
+        Variant("fixed_owner_drain", ready=True, drain=True, batch=args.batch, prefetch=True),
     )
 
     affinity = sorted(os.sched_getaffinity(0))
@@ -246,7 +246,7 @@ def main() -> int:
             traces[variant.name] = parse_trace(trace_path)
 
     baseline_ms = statistics.median(samples["post_barrier"])
-    legacy_ms = statistics.median(samples["ready_token_legacy"])
+    early_final_ms = statistics.median(samples["fixed_owner_early_final"])
     records: list[dict[str, object]] = []
     for variant in variants:
         median_ms = statistics.median(samples[variant.name])
@@ -261,7 +261,7 @@ def main() -> int:
                 "p10_ms": percentile(samples[variant.name], 0.10),
                 "p90_ms": percentile(samples[variant.name], 0.90),
                 "gain_vs_post_pct": 100.0 * (baseline_ms / median_ms - 1.0),
-                "gain_vs_legacy_pct": 100.0 * (legacy_ms / median_ms - 1.0),
+                "gain_vs_early_final_pct": 100.0 * (early_final_ms / median_ms - 1.0),
                 "samples": samples[variant.name],
             }
         )
@@ -284,11 +284,11 @@ def main() -> int:
         "trace": traces,
         "sink": sink,
     }
-    print("variant                 median_ms   vs_post%  vs_legacy%     p10_ms     p90_ms")
+    print("variant                    median_ms   vs_post%  vs_early%     p10_ms     p90_ms")
     for record in records:
         print(
-            f"{record['variant']:<23} {record['median_ms']:>9.3f} "
-            f"{record['gain_vs_post_pct']:>10.2f} {record['gain_vs_legacy_pct']:>11.2f} "
+            f"{record['variant']:<26} {record['median_ms']:>9.3f} "
+            f"{record['gain_vs_post_pct']:>10.2f} {record['gain_vs_early_final_pct']:>10.2f} "
             f"{record['p10_ms']:>10.3f} {record['p90_ms']:>10.3f}"
         )
     if traces:

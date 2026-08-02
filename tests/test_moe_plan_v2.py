@@ -76,6 +76,7 @@ def test_upgrade_legacy_plan_produces_strict_singleton_widths() -> None:
     assert plan.task_threads.tolist() == [2, 2]
     assert plan.task_w13_window_bytes.tolist() == [-1, -1]
     assert plan.task_w2_window_bytes.tolist() == [-1, -1]
+    assert plan.task_release_ns.tolist() == [0, 0]
     assert plan.task_preferred_core_begins.tolist() == [-1, -1]
     assert plan.early_merge is None
     assert plan.native_early_merge == -1
@@ -323,6 +324,25 @@ def test_plan_v2_rejects_invalid_per_task_stage_windows() -> None:
         AsyncMoEPlanV2.from_dict(upgraded)
 
 
+def test_strict_plan_accepts_timed_task_releases() -> None:
+    upgraded = upgrade_legacy_async_plan(_legacy_bridge())
+    upgraded["task_release_ns"] = [0, 250_000]
+
+    plan = AsyncMoEPlanV2.from_dict(upgraded)
+
+    assert plan.task_release_ns.tolist() == [0, 250_000]
+
+
+@pytest.mark.parametrize("execution_mode", [ASYNC_MOE_EXECUTION_TAIL_POOL, ASYNC_MOE_EXECUTION_ELASTIC])
+def test_non_strict_plan_rejects_timed_task_releases(execution_mode: str) -> None:
+    upgraded = upgrade_legacy_async_plan(_legacy_bridge())
+    upgraded["execution_mode"] = execution_mode
+    upgraded["task_release_ns"] = [0, 1]
+
+    with pytest.raises(ValueError, match="requires strict execution"):
+        AsyncMoEPlanV2.from_dict(upgraded)
+
+
 def test_tail_pool_plan_accepts_explicit_whole_expert_placement() -> None:
     plan = AsyncMoEPlanV2.from_dict(_tail_pool_bridge())
 
@@ -409,7 +429,8 @@ def test_async_plan_wrapper_calls_native_plan_v2(monkeypatch) -> None:
     assert args[37] == 1
     assert args[40].tolist() == [-1, -1]
     assert args[41].tolist() == [-1, -1]
-    assert args[42] == -1
+    assert args[42].tolist() == [0, 0]
+    assert args[43] == -1
 
 
 def test_async_plan_wrapper_calls_elastic_native_and_collects_stats(monkeypatch) -> None:
@@ -459,10 +480,11 @@ def test_async_plan_wrapper_calls_elastic_native_and_collects_stats(monkeypatch)
     args = captured["args"]
     assert isinstance(args, tuple)
     assert args[15] == 2
-    assert args[42].tolist() == [0, 1000]
-    assert args[43] is stats
-    assert args[44].tolist() == [-1, -1]
-    assert args[45] == -1
+    assert args[42].tolist() == [0, 0]
+    assert args[43].tolist() == [0, 1000]
+    assert args[44] is stats
+    assert args[45].tolist() == [-1, -1]
+    assert args[46] == -1
     assert bf16_tiled.decode_async_moe_elastic_stats(stats)["eligible_tasks"] == 0
 
 
@@ -528,6 +550,22 @@ def test_async_plan_wrapper_requires_native_early_merge_control(monkeypatch) -> 
     monkeypatch.setattr(bf16_tiled, "_fused_moe_bf16_tiled_async_plan_v2_impl", None)
 
     with pytest.raises(RuntimeError, match="early_merge control requires native"):
+        bf16_tiled.fused_moe_bf16_tiled_async_plan(
+            torch.empty((1, 1), dtype=torch.bfloat16),
+            object(),
+            torch.ones((1, 1)),
+            torch.zeros((1, 1), dtype=torch.int32),
+            plan,
+        )
+
+
+def test_async_plan_wrapper_requires_native_timed_releases(monkeypatch) -> None:
+    bridge = upgrade_legacy_async_plan(_legacy_bridge())
+    bridge["task_release_ns"] = [0, 1000]
+    plan = AsyncMoEPlanV2.from_dict(bridge)
+    monkeypatch.setattr(bf16_tiled, "_fused_moe_bf16_tiled_async_plan_v2_impl", None)
+
+    with pytest.raises(RuntimeError, match="timed task releases require native"):
         bf16_tiled.fused_moe_bf16_tiled_async_plan(
             torch.empty((1, 1), dtype=torch.bfloat16),
             object(),

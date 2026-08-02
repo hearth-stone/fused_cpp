@@ -107,6 +107,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       py::arg("silu_poly_degree") = 5, py::arg("gemm_backend") = 0, py::arg("backend_n_tile") = 8,
       py::arg("w13_split") = -1, py::arg("weight_window_bytes") = -1, py::arg("out") = c10::nullopt,
       py::arg("task_w13_window_bytes") = c10::nullopt, py::arg("task_w2_window_bytes") = c10::nullopt,
+      py::arg("task_release_ns") = c10::nullopt,
       py::arg("early_merge") = -1,
       py::call_guard<py::gil_scoped_release>());
 
@@ -126,6 +127,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       py::arg("silu_poly_degree") = 5, py::arg("gemm_backend") = 0, py::arg("backend_n_tile") = 8,
       py::arg("w13_split") = -1, py::arg("weight_window_bytes") = -1, py::arg("out") = c10::nullopt,
       py::arg("task_w13_window_bytes") = c10::nullopt, py::arg("task_w2_window_bytes") = c10::nullopt,
+      py::arg("task_release_ns") = c10::nullopt,
       py::arg("task_resize_timeout_ns") = c10::nullopt, py::arg("elastic_stats_out") = c10::nullopt,
       py::arg("task_preferred_core_begins") = c10::nullopt, py::arg("early_merge") = -1,
       py::call_guard<py::gil_scoped_release>());

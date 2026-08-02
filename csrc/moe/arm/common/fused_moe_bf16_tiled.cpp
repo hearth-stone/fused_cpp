@@ -4748,6 +4748,13 @@ struct AsyncTaskRuntime {
   int64_t w2_window_bytes = -1;
 };
 
+struct AsyncStrictTailStealTeam {
+  int64_t core_begin = 0;
+  int64_t threads = 0;
+  int64_t scratch_index = -1;
+  std::vector<int64_t> task_ids;
+};
+
 constexpr int64_t kAsyncPlanV2 = 2;
 constexpr int64_t kAsyncExecutionStrict = 0;
 constexpr int64_t kAsyncExecutionTailPool = 1;
@@ -4777,18 +4784,38 @@ enum AsyncElasticStat : int64_t {
 
 int64_t cpu_numa_node(int64_t cpu) {
 #ifdef __linux__
+  static std::mutex cache_mutex;
+  static std::array<int64_t, CPU_SETSIZE> cache = [] {
+    std::array<int64_t, CPU_SETSIZE> values{};
+    values.fill(-2);
+    return values;
+  }();
+  if (cpu >= 0 && cpu < CPU_SETSIZE) {
+    const std::lock_guard<std::mutex> lock(cache_mutex);
+    const int64_t cached = cache[static_cast<size_t>(cpu)];
+    if (cached != -2) {
+      return cached;
+    }
+  }
   char path[128];
+  int64_t result = -1;
   for (int64_t node = 0; node < 1024; ++node) {
     std::snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%lld/node%lld",
                   static_cast<long long>(cpu), static_cast<long long>(node));
     if (::access(path, F_OK) == 0) {
-      return node;
+      result = node;
+      break;
     }
   }
+  if (cpu >= 0 && cpu < CPU_SETSIZE) {
+    const std::lock_guard<std::mutex> lock(cache_mutex);
+    cache[static_cast<size_t>(cpu)] = result;
+  }
+  return result;
 #else
   (void)cpu;
-#endif
   return -1;
+#endif
 }
 
 // Plan V2 metadata is call-owned and read only while the Python extension
@@ -4809,6 +4836,7 @@ struct AsyncPlanV2NativeArgs {
   at::Tensor task_range_granularities;
   c10::optional<at::Tensor> task_w13_window_bytes;
   c10::optional<at::Tensor> task_w2_window_bytes;
+  c10::optional<at::Tensor> task_release_ns;
   c10::optional<at::Tensor> task_resize_timeout_ns;
   c10::optional<at::Tensor> task_preferred_core_begins;
   c10::optional<at::Tensor> elastic_stats_out;
@@ -5646,7 +5674,7 @@ std::vector<double> fused_moe_bench_sve_jit_w13_gemm(at::Tensor A, at::Tensor w1
   TORCH_CHECK((N / n_ranges) % n_tile == 0, "each N range must contain whole SVE N tiles");
   TORCH_CHECK(warmup >= 0, "warmup must be non-negative");
   TORCH_CHECK(runs > 0, "runs must be positive");
-  TORCH_CHECK(probe_mode >= 0 && probe_mode <= 9, "probe_mode must be in [0, 9]");
+  TORCH_CHECK(probe_mode >= 0 && probe_mode <= 12, "probe_mode must be in [0, 12]");
   A = A.contiguous();
   const PackedExperts weights = checked_packed_experts(w13_packed, K, N, "w13_packed", n_tile);
   TORCH_CHECK(weights.E > 0, "w13_packed must contain at least one expert");
@@ -7440,10 +7468,12 @@ at::Tensor run_fused_moe_bf16_tiled_async(
   std::vector<int64_t> task_range_granularities_v;
   std::vector<int64_t> task_w13_window_bytes_v;
   std::vector<int64_t> task_w2_window_bytes_v;
+  std::vector<int64_t> task_release_ns_v;
   std::vector<int64_t> task_resize_timeout_ns_v;
   std::vector<int64_t> task_preferred_core_begins_v;
   bool has_task_w13_window_bytes = false;
   bool has_task_w2_window_bytes = false;
+  bool has_task_release_ns = false;
   bool has_task_resize_timeout_ns = false;
   bool has_task_preferred_core_begins = false;
   int64_t* elastic_stats_ptr = nullptr;
@@ -7477,6 +7507,8 @@ at::Tensor run_fused_moe_bf16_tiled_async(
         plan_v2->task_w13_window_bytes.has_value() && plan_v2->task_w13_window_bytes->defined();
     has_task_w2_window_bytes =
         plan_v2->task_w2_window_bytes.has_value() && plan_v2->task_w2_window_bytes->defined();
+    has_task_release_ns =
+        plan_v2->task_release_ns.has_value() && plan_v2->task_release_ns->defined();
     has_task_resize_timeout_ns =
         plan_v2->task_resize_timeout_ns.has_value() && plan_v2->task_resize_timeout_ns->defined();
     has_task_preferred_core_begins =
@@ -7488,6 +7520,9 @@ at::Tensor run_fused_moe_bf16_tiled_async(
     if (has_task_w2_window_bytes) {
       task_w2_window_bytes_v =
           tensor_to_i64_vector(*plan_v2->task_w2_window_bytes, "task_w2_window_bytes");
+    }
+    if (has_task_release_ns) {
+      task_release_ns_v = tensor_to_i64_vector(*plan_v2->task_release_ns, "task_release_ns");
     }
     if (has_task_resize_timeout_ns) {
       task_resize_timeout_ns_v =
@@ -7544,6 +7579,11 @@ at::Tensor run_fused_moe_bf16_tiled_async(
     } else {
       task_w2_window_bytes_v.assign(static_cast<size_t>(num_tasks), -1);
     }
+    if (has_task_release_ns) {
+      check_per_task_size(task_release_ns_v, "task_release_ns");
+    } else {
+      task_release_ns_v.assign(static_cast<size_t>(num_tasks), 0);
+    }
     if (has_task_resize_timeout_ns) {
       check_per_task_size(task_resize_timeout_ns_v, "task_resize_timeout_ns");
     } else {
@@ -7573,6 +7613,11 @@ at::Tensor run_fused_moe_bf16_tiled_async(
                   "task_w13_window_bytes must be -1 (inherit) or non-negative: task=", task);
       TORCH_CHECK(task_w2_window_bytes_v[static_cast<size_t>(task)] >= -1,
                   "task_w2_window_bytes must be -1 (inherit) or non-negative: task=", task);
+      TORCH_CHECK(task_release_ns_v[static_cast<size_t>(task)] >= 0,
+                  "task_release_ns must be non-negative: task=", task);
+      TORCH_CHECK(plan_v2->execution_mode == kAsyncExecutionStrict ||
+                      task_release_ns_v[static_cast<size_t>(task)] == 0,
+                  "nonzero task_release_ns currently requires strict execution: task=", task);
       TORCH_CHECK(task_resize_timeout_ns_v[static_cast<size_t>(task)] >= 0,
                   "task_resize_timeout_ns must be non-negative: task=", task);
       TORCH_CHECK(task_preferred_core_begins_v[static_cast<size_t>(task)] >= -1,
@@ -8016,6 +8061,161 @@ at::Tensor run_fused_moe_bf16_tiled_async(
     }
   }
 
+  const bool use_task_release_gate =
+      has_plan_v2 && std::any_of(task_release_ns_v.begin(), task_release_ns_v.end(),
+                                 [](int64_t release_ns) { return release_ns > 0; });
+
+  const bool strict_tail_steal_requested =
+      env_flag_enabled("FUSED_CPP_MOE_STRICT_TAIL_STEAL");
+  bool use_strict_tail_steal =
+      strict_tail_steal_requested && has_plan_v2 &&
+      plan_v2->execution_mode == kAsyncExecutionStrict &&
+      use_sve_backend && fuse_silu && !use_async_short_pool &&
+      !use_task_release_gate;
+  int64_t strict_tail_steal_width = 0;
+  int64_t strict_tail_steal_numa_node = -1;
+  int64_t strict_tail_steal_depth = 0;
+  int64_t strict_tail_steal_min_donor_tasks = 0;
+  int64_t strict_tail_steal_task_count = 0;
+  std::vector<AsyncStrictTailStealTeam> strict_tail_steal_teams;
+  std::vector<int64_t> strict_tail_head_task_counts;
+  if (use_strict_tail_steal) {
+    strict_tail_steal_width = tasks.front().threads;
+    use_strict_tail_steal =
+        strict_tail_steal_width > 0 &&
+        num_threads % strict_tail_steal_width == 0 &&
+        num_threads / strict_tail_steal_width >= 2;
+  }
+  if (use_strict_tail_steal) {
+    const int64_t team_count = num_threads / strict_tail_steal_width;
+    strict_tail_steal_teams.resize(static_cast<size_t>(team_count));
+    for (int64_t team = 0; team < team_count; ++team) {
+      AsyncStrictTailStealTeam& runtime_team =
+          strict_tail_steal_teams[static_cast<size_t>(team)];
+      runtime_team.core_begin = team * strict_tail_steal_width;
+      runtime_team.threads = strict_tail_steal_width;
+    }
+    for (int64_t task_id = 0;
+         task_id < num_tasks && use_strict_tail_steal; ++task_id) {
+      const AsyncTaskRuntime& task = tasks[static_cast<size_t>(task_id)];
+      const bool fixed_full_expert =
+          task_range_granularities_v[static_cast<size_t>(task_id)] ==
+              kAsyncFullExpertRange &&
+          task_placement_modes_v[static_cast<size_t>(task_id)] ==
+              kAsyncPlacementFixed &&
+          seen[static_cast<size_t>(task.expert)] == 1;
+      const bool aligned_team =
+          task.threads == strict_tail_steal_width &&
+          task.core_begin >= 0 &&
+          task.core_begin % strict_tail_steal_width == 0 &&
+          task.core_begin + strict_tail_steal_width <= num_threads;
+      if (!fixed_full_expert || !aligned_team) {
+        use_strict_tail_steal = false;
+        break;
+      }
+      const int64_t team = task.core_begin / strict_tail_steal_width;
+      AsyncStrictTailStealTeam& runtime_team =
+          strict_tail_steal_teams[static_cast<size_t>(team)];
+      if (runtime_team.scratch_index < 0) {
+        runtime_team.scratch_index = task.scratch_index;
+      } else if (runtime_team.scratch_index != task.scratch_index) {
+        use_strict_tail_steal = false;
+        break;
+      }
+      runtime_team.task_ids.push_back(task_id);
+    }
+  }
+  if (use_strict_tail_steal) {
+    // The accepted dependency graph is a set of per-team resource-order
+    // chains. Experts do not have data dependencies, so an idle team may
+    // execute the next unstarted node from another chain.
+    for (const AsyncStrictTailStealTeam& runtime_team :
+         strict_tail_steal_teams) {
+      if (runtime_team.task_ids.empty() || runtime_team.scratch_index < 0) {
+        use_strict_tail_steal = false;
+        break;
+      }
+      int64_t prior_task = -1;
+      for (const int64_t task_id : runtime_team.task_ids) {
+        const int64_t begin =
+            task_dep_offsets_v[static_cast<size_t>(task_id)];
+        const int64_t end =
+            task_dep_offsets_v[static_cast<size_t>(task_id + 1)];
+        const bool dependency_is_resource_chain =
+            begin == end ||
+            (prior_task >= 0 && end == begin + 1 &&
+             task_deps_v[static_cast<size_t>(begin)] == prior_task);
+        if (!dependency_is_resource_chain) {
+          use_strict_tail_steal = false;
+          break;
+        }
+        prior_task = task_id;
+      }
+      if (!use_strict_tail_steal) {
+        break;
+      }
+    }
+  }
+  if (use_strict_tail_steal) {
+    for (const int64_t cpu : async_thread_pinning.cpus) {
+      const int64_t node = cpu_numa_node(cpu);
+      if (node < 0) {
+        use_strict_tail_steal = false;
+        break;
+      }
+      if (strict_tail_steal_numa_node < 0) {
+        strict_tail_steal_numa_node = node;
+      } else if (strict_tail_steal_numa_node != node) {
+        use_strict_tail_steal = false;
+        break;
+      }
+    }
+  }
+  if (use_strict_tail_steal) {
+    strict_tail_steal_depth =
+        env_int_or_default("FUSED_CPP_MOE_STRICT_TAIL_STEAL_DEPTH", 2);
+    strict_tail_steal_min_donor_tasks = env_int_or_default(
+        "FUSED_CPP_MOE_STRICT_TAIL_STEAL_MIN_DONOR_TASKS", 2);
+    use_strict_tail_steal =
+        strict_tail_steal_depth > 0 &&
+        strict_tail_steal_min_donor_tasks > 0;
+  }
+  if (use_strict_tail_steal) {
+    strict_tail_head_task_counts.resize(strict_tail_steal_teams.size());
+    for (size_t team = 0; team < strict_tail_steal_teams.size(); ++team) {
+      const std::vector<int64_t>& team_tasks =
+          strict_tail_steal_teams[team].task_ids;
+      const int64_t tail_count =
+          std::min<int64_t>(strict_tail_steal_depth,
+                            std::max<int64_t>(
+                                0, static_cast<int64_t>(team_tasks.size()) - 1));
+      const int64_t head_count =
+          static_cast<int64_t>(team_tasks.size()) - tail_count;
+      strict_tail_head_task_counts[team] = head_count;
+      strict_tail_steal_task_count += tail_count;
+    }
+    use_strict_tail_steal = strict_tail_steal_task_count > 0;
+  }
+  if (!use_strict_tail_steal) {
+    strict_tail_steal_teams.clear();
+    strict_tail_head_task_counts.clear();
+    strict_tail_steal_task_count = 0;
+  }
+  if (env_flag_enabled("FUSED_CPP_MOE_STAGE_TIMING")) {
+    std::fprintf(
+        stderr,
+        "[fused_moe_bf16_tiled_async][strict_tail_steal_policy] "
+        "requested=%d effective=%d teams=%zu width=%lld numa=%lld "
+        "depth=%lld min_donor_tasks=%lld tail_tasks=%lld\n",
+        strict_tail_steal_requested ? 1 : 0,
+        use_strict_tail_steal ? 1 : 0, strict_tail_steal_teams.size(),
+        static_cast<long long>(strict_tail_steal_width),
+        static_cast<long long>(strict_tail_steal_numa_node),
+        static_cast<long long>(strict_tail_steal_depth),
+        static_cast<long long>(strict_tail_steal_min_donor_tasks),
+        static_cast<long long>(strict_tail_steal_task_count));
+  }
+
   std::vector<std::vector<int64_t>> short_pool_group_blockers;
   if (use_async_short_pool) {
     const int64_t short_pool_groups = num_threads / async_short_pool_threads;
@@ -8065,22 +8265,13 @@ at::Tensor run_fused_moe_bf16_tiled_async(
   const float* topk_w = weights_f32.data_ptr<float>();
   const int route_merge_unroll = skip_weighted ? 0 : resolve_route_merge_unroll(use_sve_backend);
   const size_t ready_token_count = static_cast<size_t>(use_async_ready_token_merge ? num_tokens : 0);
-  std::vector<std::atomic<int64_t>> token_enqueued(ready_token_count);
-  std::vector<std::atomic<int64_t>> ready_token_slots(ready_token_count);
+  std::vector<std::atomic<int64_t>> token_ready(ready_token_count);
   std::vector<std::atomic<int64_t>> token_merged(ready_token_count);
   for (size_t token = 0; token < ready_token_count; ++token) {
-    token_enqueued[token].store(0, std::memory_order_relaxed);
-    ready_token_slots[token].store(-1, std::memory_order_relaxed);
+    token_ready[token].store(0, std::memory_order_relaxed);
     token_merged[token].store(0, std::memory_order_relaxed);
   }
-  std::vector<std::vector<int64_t>> task_ready_tokens(static_cast<size_t>(use_async_ready_token_merge ? num_tasks : 0));
-  if (use_async_ready_token_merge) {
-    for (int64_t task = 0; task < num_tasks; ++task) {
-      task_ready_tokens[static_cast<size_t>(task)].reserve(static_cast<size_t>(tasks[static_cast<size_t>(task)].rows));
-    }
-  }
-  std::atomic<int64_t> ready_token_head{0};
-  std::atomic<int64_t> ready_token_tail{0};
+  std::atomic<int64_t> published_ready_tokens{0};
   std::atomic<int64_t> completed_ready_token_merges{0};
   std::atomic<int64_t> expert_publication_epoch{0};
 
@@ -8105,10 +8296,36 @@ at::Tensor run_fused_moe_bf16_tiled_async(
   for (std::atomic<int64_t>& current_task : short_pool_current_tasks) {
     current_task.store(-1, std::memory_order_relaxed);
   }
+  std::vector<std::atomic<int64_t>> strict_tail_current_tasks(
+      strict_tail_steal_teams.size());
+  std::vector<std::atomic<int64_t>> strict_tail_assignment_epochs(
+      strict_tail_steal_teams.size());
+  std::vector<int64_t> strict_tail_tasks_by_team(
+      strict_tail_steal_teams.size(), 0);
+  std::vector<int64_t> strict_tail_stolen_by_team(
+      strict_tail_steal_teams.size(), 0);
+  std::vector<int64_t> strict_tail_stolen_rows_by_team(
+      strict_tail_steal_teams.size(), 0);
+  for (std::atomic<int64_t>& current_task : strict_tail_current_tasks) {
+    current_task.store(-1, std::memory_order_relaxed);
+  }
+  for (std::atomic<int64_t>& epoch : strict_tail_assignment_epochs) {
+    epoch.store(0, std::memory_order_relaxed);
+  }
 
-  auto publish_ready_tokens = [&](int64_t task_id, const std::vector<int64_t>& expert_routes) {
-    std::vector<int64_t>& newly_ready = task_ready_tokens[static_cast<size_t>(task_id)];
-    newly_ready.clear();
+  const int64_t merge_tokens_per_owner = ceil_div_int64(num_tokens, num_threads);
+  auto owned_token_range = [&](int64_t tid) -> SplitRange {
+    const int64_t begin = std::min<int64_t>(num_tokens, tid * merge_tokens_per_owner);
+    const int64_t end = std::min<int64_t>(num_tokens, begin + merge_tokens_per_owner);
+    return SplitRange{begin, end - begin};
+  };
+  struct alignas(64) ReadyTokenOwnerState {
+    int64_t scan_offset = 0;
+  };
+  std::vector<ReadyTokenOwnerState> ready_token_owner_states(
+      static_cast<size_t>(use_async_ready_token_merge ? num_threads : 0));
+
+  auto publish_ready_tokens = [&](const std::vector<int64_t>& expert_routes) {
     for (const int64_t flat : expert_routes) {
       const int64_t token = flat / top_k;
       bool ready = true;
@@ -8125,48 +8342,12 @@ at::Tensor run_fused_moe_bf16_tiled_async(
         continue;
       }
       int64_t expected = 0;
-      if (token_enqueued[static_cast<size_t>(token)].compare_exchange_strong(expected, 1, std::memory_order_relaxed,
-                                                                             std::memory_order_relaxed)) {
-        newly_ready.push_back(token);
+      if (token_ready[static_cast<size_t>(token)].compare_exchange_strong(
+              expected, 1, std::memory_order_release,
+              std::memory_order_relaxed)) {
+        published_ready_tokens.fetch_add(1, std::memory_order_release);
       }
     }
-    if (newly_ready.empty()) {
-      return;
-    }
-    const int64_t slot_begin =
-        ready_token_tail.fetch_add(static_cast<int64_t>(newly_ready.size()), std::memory_order_relaxed);
-    TORCH_INTERNAL_ASSERT(slot_begin >= 0 && slot_begin + static_cast<int64_t>(newly_ready.size()) <= num_tokens,
-                          "ready-token queue overflow: begin=", slot_begin, " count=", newly_ready.size(),
-                          " tokens=", num_tokens);
-    for (size_t idx = 0; idx < newly_ready.size(); ++idx) {
-      ready_token_slots[static_cast<size_t>(slot_begin) + idx].store(newly_ready[idx], std::memory_order_release);
-    }
-  };
-
-  auto try_claim_ready_token_batch = [&](int64_t claim_limit) -> SplitRange {
-    int64_t head = ready_token_head.load(std::memory_order_relaxed);
-    while (true) {
-      const int64_t tail = ready_token_tail.load(std::memory_order_acquire);
-      if (head >= tail) {
-        return SplitRange{};
-      }
-      const int64_t end = std::min<int64_t>(tail, head + std::min(async_ready_token_batch, claim_limit));
-      if (ready_token_head.compare_exchange_weak(head, end, std::memory_order_relaxed, std::memory_order_relaxed)) {
-        return SplitRange{head, end - head};
-      }
-    }
-  };
-
-  auto load_ready_token = [&](int64_t slot) {
-    int64_t token = -1;
-    while ((token = ready_token_slots[static_cast<size_t>(slot)].load(std::memory_order_acquire)) < 0) {
-#if defined(__aarch64__)
-      __asm__ __volatile__("yield" ::: "memory");
-#else
-      std::this_thread::yield();
-#endif
-    }
-    return token;
   };
 
   auto prefetch_ready_token = [&](int64_t token) {
@@ -8193,25 +8374,39 @@ at::Tensor run_fused_moe_bf16_tiled_async(
                       use_w2_bf16_route, route_merge_unroll);
     token_merged[static_cast<size_t>(token)].store(1, std::memory_order_release);
     completed_ready_token_merges.fetch_add(1, std::memory_order_relaxed);
-    trace_phase_end(tid, -1, -1, -1, 1, "merge_ready_token", worker_phase_begin);
+    // The trace task/group field carries the token id so owner assignment is
+    // directly verifiable without adding hot-path metadata.
+    trace_phase_end(tid, token, -1, -1, 1, "merge_ready_token", worker_phase_begin);
   };
 
-  auto try_merge_ready_token_batch = [&](int64_t tid, int64_t claim_limit) {
-    const SplitRange claimed = try_claim_ready_token_batch(claim_limit);
-    if (claimed.size <= 0) {
+  // Each logical worker owns the same contiguous token range used by final
+  // merge. Only that worker reads token_merged for the range while compute is
+  // active, so ready tokens retain locality without a contended global queue.
+  auto try_merge_owned_ready_tokens = [&](int64_t tid, int64_t merge_limit) {
+    const SplitRange owned = owned_token_range(tid);
+    const int64_t batch_limit = std::min<int64_t>(async_ready_token_batch, merge_limit);
+    if (owned.size <= 0 || batch_limit <= 0) {
       return false;
     }
+    ReadyTokenOwnerState& owner_state = ready_token_owner_states[static_cast<size_t>(tid)];
     std::array<int64_t, 64> tokens{};
-    for (int64_t idx = 0; idx < claimed.size; ++idx) {
-      tokens[static_cast<size_t>(idx)] = load_ready_token(claimed.begin + idx);
+    int64_t token_count = 0;
+    for (int64_t scanned = 0; scanned < owned.size && token_count < batch_limit; ++scanned) {
+      const int64_t token = owned.begin + owner_state.scan_offset;
+      owner_state.scan_offset = owner_state.scan_offset + 1 == owned.size ? 0 : owner_state.scan_offset + 1;
+      if (token_ready[static_cast<size_t>(token)].load(std::memory_order_acquire) == 0 ||
+          token_merged[static_cast<size_t>(token)].load(std::memory_order_acquire) != 0) {
+        continue;
+      }
+      tokens[static_cast<size_t>(token_count++)] = token;
     }
-    for (int64_t idx = 0; idx < claimed.size; ++idx) {
-      if (idx + 1 < claimed.size) {
+    for (int64_t idx = 0; idx < token_count; ++idx) {
+      if (idx + 1 < token_count) {
         prefetch_ready_token(tokens[static_cast<size_t>(idx + 1)]);
       }
       merge_ready_token(tid, tokens[static_cast<size_t>(idx)]);
     }
-    return true;
+    return token_count > 0;
   };
 
   auto run_async_task = [&](int64_t tid, int64_t task_id, const AsyncTaskRuntime& task) {
@@ -8396,11 +8591,17 @@ at::Tensor run_fused_moe_bf16_tiled_async(
         // The slice counter and global RMW chain make prior slice/expert stores
         // visible before token readiness is checked.
         expert_publication_epoch.fetch_add(1, std::memory_order_acq_rel);
-        publish_ready_tokens(task_id, expert_routes);
+        publish_ready_tokens(expert_routes);
       }
       completed_tasks.fetch_add(1);
     }
     barrier.wait();
+    if (use_async_ready_token_merge) {
+      // Expert work remains the synchronization unit. At that safe boundary,
+      // each worker advances one ready token from its own final-merge range
+      // before it joins another expert task.
+      try_merge_owned_ready_tokens(tid, 1);
+    }
   };
 
   auto run_elastic_w13 = [&](int64_t tid, int64_t task_id, const AsyncTaskRuntime& task) {
@@ -8533,6 +8734,13 @@ at::Tensor run_fused_moe_bf16_tiled_async(
       std::all_of(task_resize_timeout_ns_v.begin(), task_resize_timeout_ns_v.end(),
                   [](int64_t timeout_ns) { return timeout_ns == 0; });
 
+  auto steady_now_ns = []() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+  };
+  const int64_t task_release_epoch_ns = use_task_release_gate ? steady_now_ns() : 0;
+
   phase_begin = trace_phase_begin();
   if (plan_v2_nonblocking_elastic) {
     constexpr int64_t kElasticPending = 0;
@@ -8557,12 +8765,6 @@ at::Tensor run_fused_moe_bf16_tiled_async(
       const AsyncTaskRuntime& task = tasks[static_cast<size_t>(task_id)];
       w13_tasks_by_leader[static_cast<size_t>(task.core_begin)].push_back(task_id);
     }
-
-    auto steady_now_ns = []() {
-      return std::chrono::duration_cast<std::chrono::nanoseconds>(
-                 std::chrono::steady_clock::now().time_since_epoch())
-          .count();
-    };
 
     auto release_claimed_cores = [&](int64_t task_id, int64_t core_begin, int64_t threads,
                                      const AsyncTaskRuntime& task) {
@@ -9120,10 +9322,282 @@ at::Tensor run_fused_moe_bf16_tiled_async(
           static_cast<double>(elastic_stats[static_cast<size_t>(kElasticTotalWaitNs)]) / 1000.0,
           static_cast<double>(elastic_stats[static_cast<size_t>(kElasticMaxWaitNs)]) / 1000.0);
     }
+  } else if (use_strict_tail_steal) {
+    run_fixed_threads(num_threads, [&](int64_t tid) {
+      const int64_t team_index = tid / strict_tail_steal_width;
+      const AsyncStrictTailStealTeam& runtime_team =
+          strict_tail_steal_teams[static_cast<size_t>(team_index)];
+      const int64_t local_tid = tid - runtime_team.core_begin;
+      ScheduledTeamScratch& team_scratch =
+          *scratches[static_cast<size_t>(runtime_team.scratch_index)];
+      const int64_t head_task_count =
+          strict_tail_head_task_counts[static_cast<size_t>(team_index)];
+
+      // Execute the planner-owned prefix with the original fixed-team
+      // protocol. Tail tasks are invisible here, so their later state-1
+      // claim cannot cause the donor workers to join a migrated task.
+      while (true) {
+        int64_t selected_task = -1;
+        for (int64_t index = 0; index < head_task_count; ++index) {
+          const int64_t task_id =
+              runtime_team.task_ids[static_cast<size_t>(index)];
+          int64_t state =
+              task_states[static_cast<size_t>(task_id)].load(
+                  std::memory_order_acquire);
+          if (state == 2) {
+            continue;
+          }
+          if (state == 0) {
+            if (deps_remaining[static_cast<size_t>(task_id)].load(
+                    std::memory_order_acquire) != 0) {
+              continue;
+            }
+            int64_t expected = 0;
+            if (!task_states[static_cast<size_t>(task_id)]
+                     .compare_exchange_strong(
+                         expected, 1, std::memory_order_acq_rel,
+                         std::memory_order_acquire)) {
+              state = expected;
+              if (state != 1) {
+                continue;
+              }
+            }
+          }
+          selected_task = task_id;
+          break;
+        }
+        if (selected_task >= 0) {
+          run_async_task(tid, selected_task,
+                         tasks[static_cast<size_t>(selected_task)]);
+          if (local_tid == 0) {
+            ++strict_tail_tasks_by_team[static_cast<size_t>(team_index)];
+          }
+          continue;
+        }
+
+        bool head_complete = true;
+        for (int64_t index = 0; index < head_task_count; ++index) {
+          const int64_t task_id =
+              runtime_team.task_ids[static_cast<size_t>(index)];
+          if (task_states[static_cast<size_t>(task_id)].load(
+                  std::memory_order_acquire) != 2) {
+            head_complete = false;
+            break;
+          }
+        }
+        if (head_complete) {
+          break;
+        }
+        if (use_async_ready_token_merge) {
+          try_merge_owned_ready_tokens(tid, 1);
+        } else {
+          std::this_thread::yield();
+        }
+      }
+
+      const int64_t tail_running_state = 3 + team_index;
+
+      // Keep the original decentralized join protocol for this team's own
+      // suffix. Encoding the owner in the running state lets donor workers
+      // distinguish a local claim from a migrated claim without a new
+      // per-task handoff.
+      while (true) {
+        int64_t selected_task = -1;
+        for (int64_t index = head_task_count;
+             index < static_cast<int64_t>(runtime_team.task_ids.size());
+             ++index) {
+          const int64_t task_id =
+              runtime_team.task_ids[static_cast<size_t>(index)];
+          int64_t state =
+              task_states[static_cast<size_t>(task_id)].load(
+                  std::memory_order_acquire);
+          if (state == 2) {
+            continue;
+          }
+          if (state == 0) {
+            int64_t expected = 0;
+            if (task_states[static_cast<size_t>(task_id)]
+                    .compare_exchange_strong(
+                        expected, tail_running_state,
+                        std::memory_order_acq_rel,
+                        std::memory_order_acquire)) {
+              state = tail_running_state;
+            } else {
+              state = expected;
+            }
+          }
+          if (state == tail_running_state) {
+            selected_task = task_id;
+            break;
+          }
+        }
+        if (selected_task < 0) {
+          break;
+        }
+        run_async_task(tid, selected_task,
+                       tasks[static_cast<size_t>(selected_task)]);
+        if (local_tid == 0) {
+          ++strict_tail_tasks_by_team[static_cast<size_t>(team_index)];
+        }
+      }
+
+      if (local_tid == 0) {
+        while (true) {
+          int64_t selected_task = -1;
+          if (completed_tasks.load(std::memory_order_acquire) < num_tasks) {
+            // The local suffix is complete or owned by another team. Claim
+            // the first pending tail node from the heaviest peer suffix.
+            for (size_t attempt = 0;
+                 selected_task < 0 &&
+                 attempt < strict_tail_steal_teams.size();
+                 ++attempt) {
+              int64_t best_task = -1;
+              int64_t best_remaining_rows = -1;
+              for (size_t donor = 0;
+                   donor < strict_tail_steal_teams.size(); ++donor) {
+                if (static_cast<int64_t>(donor) == team_index) {
+                  continue;
+                }
+                int64_t donor_task = -1;
+                int64_t remaining_tasks = 0;
+                int64_t remaining_rows = 0;
+                const AsyncStrictTailStealTeam& donor_team =
+                    strict_tail_steal_teams[donor];
+                const int64_t donor_head_count =
+                    strict_tail_head_task_counts[donor];
+                for (int64_t index = donor_head_count;
+                     index <
+                     static_cast<int64_t>(donor_team.task_ids.size());
+                     ++index) {
+                  const int64_t task_id =
+                      donor_team.task_ids[static_cast<size_t>(index)];
+                  if (task_states[static_cast<size_t>(task_id)].load(
+                          std::memory_order_acquire) != 0) {
+                    continue;
+                  }
+                  ++remaining_tasks;
+                  remaining_rows +=
+                      tasks[static_cast<size_t>(task_id)].rows;
+                  if (donor_task < 0) {
+                    donor_task = task_id;
+                  }
+                }
+                if (remaining_tasks < strict_tail_steal_min_donor_tasks ||
+                    donor_task < 0 ||
+                    tasks[static_cast<size_t>(donor_task)].rows >
+                        team_scratch.max_rows) {
+                  continue;
+                }
+                if (remaining_rows > best_remaining_rows) {
+                  best_task = donor_task;
+                  best_remaining_rows = remaining_rows;
+                }
+              }
+              if (best_task < 0) {
+                break;
+              }
+              int64_t expected = 0;
+              if (task_states[static_cast<size_t>(best_task)]
+                      .compare_exchange_strong(
+                          expected, tail_running_state,
+                          std::memory_order_acq_rel,
+                          std::memory_order_acquire)) {
+                selected_task = best_task;
+                ++strict_tail_stolen_by_team[static_cast<size_t>(team_index)];
+                strict_tail_stolen_rows_by_team[static_cast<size_t>(team_index)] +=
+                    tasks[static_cast<size_t>(best_task)].rows;
+              }
+            }
+          }
+
+          if (selected_task >= 0) {
+            ++strict_tail_tasks_by_team[static_cast<size_t>(team_index)];
+            strict_tail_current_tasks[static_cast<size_t>(team_index)].store(
+                selected_task, std::memory_order_release);
+            std::atomic<int64_t>& assignment_epoch =
+                strict_tail_assignment_epochs[static_cast<size_t>(team_index)];
+            assignment_epoch.fetch_add(1, std::memory_order_release);
+            assignment_epoch.notify_all();
+            AsyncTaskRuntime migrated_task =
+                tasks[static_cast<size_t>(selected_task)];
+            migrated_task.core_begin = runtime_team.core_begin;
+            migrated_task.scratch_index = runtime_team.scratch_index;
+            run_async_task(tid, selected_task, migrated_task);
+            continue;
+          }
+
+          // No new pending task can appear after this point; task states only
+          // move from pending to running to complete. Release the team now
+          // instead of keeping idle workers alive until global completion.
+          strict_tail_current_tasks[static_cast<size_t>(team_index)].store(
+              -2, std::memory_order_release);
+          std::atomic<int64_t>& assignment_epoch =
+              strict_tail_assignment_epochs[static_cast<size_t>(team_index)];
+          assignment_epoch.fetch_add(1, std::memory_order_release);
+          assignment_epoch.notify_all();
+          break;
+        }
+      } else {
+        int64_t observed_epoch = 0;
+        std::atomic<int64_t>& assignment_epoch =
+            strict_tail_assignment_epochs[static_cast<size_t>(team_index)];
+        while (true) {
+          int64_t published_epoch =
+              assignment_epoch.load(std::memory_order_acquire);
+          while (published_epoch == observed_epoch) {
+            assignment_epoch.wait(observed_epoch, std::memory_order_acquire);
+            published_epoch =
+                assignment_epoch.load(std::memory_order_acquire);
+          }
+          observed_epoch = published_epoch;
+          const int64_t selected_task =
+              strict_tail_current_tasks[static_cast<size_t>(team_index)].load(
+                  std::memory_order_acquire);
+          if (selected_task == -2) {
+            break;
+          }
+          TORCH_INTERNAL_ASSERT(
+              selected_task >= 0,
+              "strict tail assignment published an invalid task: ",
+              selected_task);
+          AsyncTaskRuntime migrated_task =
+              tasks[static_cast<size_t>(selected_task)];
+          migrated_task.core_begin = runtime_team.core_begin;
+          migrated_task.scratch_index = runtime_team.scratch_index;
+          run_async_task(tid, selected_task, migrated_task);
+        }
+      }
+
+      // Tail migration changes only compute placement. Preserve the existing
+      // ready-token contract by letting released workers drain merge work
+      // until every expert and token has been published.
+      while (use_async_ready_token_drain) {
+        const bool compute_complete =
+            completed_tasks.load(std::memory_order_acquire) >= num_tasks;
+        if (try_merge_owned_ready_tokens(
+                tid, compute_complete ? async_ready_token_batch : 1)) {
+          continue;
+        }
+        if (compute_complete) {
+          TORCH_INTERNAL_ASSERT(
+              published_ready_tokens.load(std::memory_order_acquire) == num_tokens,
+              "strict tail stealing is missing published tokens: published=",
+              published_ready_tokens.load(std::memory_order_relaxed),
+              " expected=", num_tokens);
+          if (completed_ready_token_merges.load(std::memory_order_acquire) >=
+              num_tokens) {
+            break;
+          }
+        }
+        std::this_thread::yield();
+      }
+    });
   } else if (!use_async_short_pool) {
     run_fixed_threads(num_threads, [&](int64_t tid) {
       while (true) {
         const bool compute_complete = completed_tasks.load(std::memory_order_acquire) >= num_tasks;
+        const int64_t elapsed_ns =
+            use_task_release_gate ? steady_now_ns() - task_release_epoch_ns : 0;
         int64_t selected_task = -1;
         if (!compute_complete) {
           for (int64_t task_id = 0; task_id < num_tasks; ++task_id) {
@@ -9136,6 +9610,10 @@ at::Tensor run_fused_moe_bf16_tiled_async(
               continue;
             }
             if (state == 0) {
+              if (use_task_release_gate &&
+                  task_release_ns_v[static_cast<size_t>(task_id)] > elapsed_ns) {
+                continue;
+              }
               if (deps_remaining[static_cast<size_t>(task_id)].load() != 0) {
                 continue;
               }
@@ -9159,13 +9637,13 @@ at::Tensor run_fused_moe_bf16_tiled_async(
           break;
         }
         if (use_async_ready_token_merge &&
-            try_merge_ready_token_batch(tid, compute_complete ? async_ready_token_batch : 1)) {
+            try_merge_owned_ready_tokens(tid, compute_complete ? async_ready_token_batch : 1)) {
           continue;
         }
         if (compute_complete && use_async_ready_token_drain) {
-          TORCH_INTERNAL_ASSERT(ready_token_tail.load(std::memory_order_acquire) == num_tokens,
-                                "unified ready-token merge is missing published tokens: published=",
-                                ready_token_tail.load(std::memory_order_relaxed), " expected=", num_tokens);
+          TORCH_INTERNAL_ASSERT(published_ready_tokens.load(std::memory_order_acquire) == num_tokens,
+                                "fixed-owner ready-token merge is missing published tokens: published=",
+                                published_ready_tokens.load(std::memory_order_relaxed), " expected=", num_tokens);
         }
         if (compute_complete && (!use_async_ready_token_drain ||
                                  completed_ready_token_merges.load(std::memory_order_acquire) >= num_tokens)) {
@@ -9268,13 +9746,13 @@ at::Tensor run_fused_moe_bf16_tiled_async(
           break;
         }
         if (use_async_ready_token_merge &&
-            try_merge_ready_token_batch(tid, compute_complete ? async_ready_token_batch : 1)) {
+            try_merge_owned_ready_tokens(tid, compute_complete ? async_ready_token_batch : 1)) {
           continue;
         }
         if (compute_complete && use_async_ready_token_drain) {
-          TORCH_INTERNAL_ASSERT(ready_token_tail.load(std::memory_order_acquire) == num_tokens,
-                                "unified ready-token merge is missing published tokens: published=",
-                                ready_token_tail.load(std::memory_order_relaxed), " expected=", num_tokens);
+          TORCH_INTERNAL_ASSERT(published_ready_tokens.load(std::memory_order_acquire) == num_tokens,
+                                "fixed-owner ready-token merge is missing published tokens: published=",
+                                published_ready_tokens.load(std::memory_order_relaxed), " expected=", num_tokens);
         }
         if (compute_complete && (!use_async_ready_token_drain ||
                                  completed_ready_token_merges.load(std::memory_order_acquire) >= num_tokens)) {
@@ -9286,12 +9764,37 @@ at::Tensor run_fused_moe_bf16_tiled_async(
   }
   TORCH_INTERNAL_ASSERT(
       !use_async_ready_token_drain || completed_ready_token_merges.load(std::memory_order_acquire) == num_tokens,
-      "unified ready-token merge exited before draining every token");
+      "fixed-owner ready-token merge exited before draining every token");
   trace_phase_end(-1, -1, -1, -1, num_routes, "scheduled_compute", phase_begin);
+  if (use_strict_tail_steal &&
+      env_flag_enabled("FUSED_CPP_MOE_STAGE_TIMING")) {
+    int64_t stolen_tasks = 0;
+    int64_t stolen_rows = 0;
+    std::fprintf(
+        stderr,
+        "[fused_moe_bf16_tiled_async][strict_tail_steal] "
+        "teams=%zu width=%lld tasks_by_team=[",
+        strict_tail_steal_teams.size(),
+        static_cast<long long>(strict_tail_steal_width));
+    for (size_t team = 0; team < strict_tail_tasks_by_team.size(); ++team) {
+      std::fprintf(stderr, "%s%lld", team == 0 ? "" : ",",
+                   static_cast<long long>(strict_tail_tasks_by_team[team]));
+      stolen_tasks += strict_tail_stolen_by_team[team];
+      stolen_rows += strict_tail_stolen_rows_by_team[team];
+    }
+    std::fprintf(stderr, "] stolen_by_team=[");
+    for (size_t team = 0; team < strict_tail_stolen_by_team.size(); ++team) {
+      std::fprintf(stderr, "%s%lld", team == 0 ? "" : ",",
+                   static_cast<long long>(strict_tail_stolen_by_team[team]));
+    }
+    std::fprintf(stderr, "] stolen_tasks=%lld stolen_rows=%lld\n",
+                 static_cast<long long>(stolen_tasks),
+                 static_cast<long long>(stolen_rows));
+  }
   if (use_async_ready_token_merge && env_flag_enabled("FUSED_CPP_MOE_STAGE_TIMING")) {
     const int64_t merged_in_worker_job = completed_ready_token_merges.load(std::memory_order_acquire);
     std::fprintf(stderr,
-                 "[fused_moe_bf16_tiled_async][ready_token] same_job_drain=%d batch=%lld "
+                 "[fused_moe_bf16_tiled_async][ready_token] assignment=fixed_owner same_job_drain=%d batch=%lld "
                  "prefetch=%d merged_in_worker_job=%lld remaining_for_final=%lld\n",
                  use_async_ready_token_drain ? 1 : 0, static_cast<long long>(async_ready_token_batch),
                  use_async_ready_token_prefetch ? 1 : 0, static_cast<long long>(merged_in_worker_job),
@@ -9312,9 +9815,9 @@ at::Tensor run_fused_moe_bf16_tiled_async(
 
   auto merge_routes = [&](int64_t tid) {
     auto worker_phase_begin = trace_phase_begin();
-    const int64_t rows_per_thread = ceil_div_int64(num_tokens, num_threads);
-    const int64_t token_begin = tid * rows_per_thread;
-    const int64_t token_end = std::min<int64_t>(num_tokens, token_begin + rows_per_thread);
+    const SplitRange owned = owned_token_range(tid);
+    const int64_t token_begin = owned.begin;
+    const int64_t token_end = owned.begin + owned.size;
     if (!use_async_ready_token_merge) {
       merge_route_range(route_out_ptr, route_out_bf16_ptr, topk_w, out_bf16_ptr, token_begin, token_end, top_k, H,
                         use_w2_bf16_route, route_merge_unroll);
@@ -9389,6 +9892,7 @@ at::Tensor fused_moe_bf16_tiled_async_plan_v2(
     int64_t silu_poly_degree, int64_t gemm_backend, int64_t backend_n_tile, int64_t w13_split,
     int64_t weight_window_bytes, c10::optional<at::Tensor> out,
     c10::optional<at::Tensor> task_w13_window_bytes, c10::optional<at::Tensor> task_w2_window_bytes,
+    c10::optional<at::Tensor> task_release_ns,
     int64_t early_merge) {
   TORCH_CHECK(execution_mode != kAsyncExecutionElastic,
               "elastic Plan V2 requires fused_moe_bf16_tiled_async_plan_v2_elastic");
@@ -9407,6 +9911,7 @@ at::Tensor fused_moe_bf16_tiled_async_plan_v2(
       std::move(task_range_granularities),
       std::move(task_w13_window_bytes),
       std::move(task_w2_window_bytes),
+      std::move(task_release_ns),
       c10::nullopt,
       c10::nullopt,
       c10::nullopt,
@@ -9434,6 +9939,7 @@ at::Tensor fused_moe_bf16_tiled_async_plan_v2_elastic(
     int64_t silu_poly_degree, int64_t gemm_backend, int64_t backend_n_tile, int64_t w13_split,
     int64_t weight_window_bytes, c10::optional<at::Tensor> out,
     c10::optional<at::Tensor> task_w13_window_bytes, c10::optional<at::Tensor> task_w2_window_bytes,
+    c10::optional<at::Tensor> task_release_ns,
     c10::optional<at::Tensor> task_resize_timeout_ns,
     c10::optional<at::Tensor> elastic_stats_out,
     c10::optional<at::Tensor> task_preferred_core_begins,
@@ -9455,6 +9961,7 @@ at::Tensor fused_moe_bf16_tiled_async_plan_v2_elastic(
       std::move(task_range_granularities),
       std::move(task_w13_window_bytes),
       std::move(task_w2_window_bytes),
+      std::move(task_release_ns),
       std::move(task_resize_timeout_ns),
       std::move(task_preferred_core_begins),
       std::move(elastic_stats_out),

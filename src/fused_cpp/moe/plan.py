@@ -62,6 +62,7 @@ _V2_SEQUENCE_FIELDS = (
 _V2_OPTIONAL_PER_TASK_FIELDS = (
     "task_w13_window_bytes",
     "task_w2_window_bytes",
+    "task_release_ns",
     "task_resize_timeout_ns",
     "task_preferred_core_begins",
 )
@@ -69,6 +70,7 @@ _V2_OPTIONAL_PER_TASK_FIELDS = (
 _V2_OPTIONAL_PER_TASK_DEFAULTS = {
     "task_w13_window_bytes": -1,
     "task_w2_window_bytes": -1,
+    "task_release_ns": 0,
     "task_resize_timeout_ns": 0,
     "task_preferred_core_begins": -1,
 }
@@ -125,6 +127,8 @@ class AsyncMoEPlanV2:
     zero retains the full-expert task. ``early_merge`` is a plan-level
     tri-state: ``None`` retains the runtime heuristic, ``True`` forces the
     ready-token path, and ``False`` uses the uniform post-expert merge.
+    ``task_release_ns`` is an experimental strict-only lower bound on a task's
+    start time, relative to the beginning of native scheduled execution.
     """
 
     num_threads: int
@@ -147,6 +151,7 @@ class AsyncMoEPlanV2:
     task_range_granularities: torch.Tensor
     task_w13_window_bytes: torch.Tensor | None = None
     task_w2_window_bytes: torch.Tensor | None = None
+    task_release_ns: torch.Tensor | None = None
     task_resize_timeout_ns: torch.Tensor | None = None
     task_preferred_core_begins: torch.Tensor | None = None
     early_merge: bool | None = None
@@ -269,6 +274,7 @@ class AsyncMoEPlanV2:
             "task_range_granularities": self.task_range_granularities,
             "task_w13_window_bytes": self.task_w13_window_bytes,
             "task_w2_window_bytes": self.task_w2_window_bytes,
+            "task_release_ns": self.task_release_ns,
             "task_resize_timeout_ns": self.task_resize_timeout_ns,
             "task_preferred_core_begins": self.task_preferred_core_begins,
         }
@@ -307,14 +313,20 @@ class AsyncMoEPlanV2:
                 )
         assert self.task_w13_window_bytes is not None
         assert self.task_w2_window_bytes is not None
+        assert self.task_release_ns is not None
         assert self.task_resize_timeout_ns is not None
         assert self.task_preferred_core_begins is not None
         w13_window_bytes = _values(self.task_w13_window_bytes)
         w2_window_bytes = _values(self.task_w2_window_bytes)
+        release_ns = _values(self.task_release_ns)
         resize_timeout_ns = _values(self.task_resize_timeout_ns)
         preferred_core_begins = _values(self.task_preferred_core_begins)
         if any(value < -1 for value in (*w13_window_bytes, *w2_window_bytes)):
             raise ValueError("per-task stage windows must be -1 (inherit) or non-negative")
+        if any(value < 0 for value in release_ns):
+            raise ValueError("task_release_ns must be non-negative")
+        if self.execution_mode != ASYNC_MOE_EXECUTION_STRICT and any(release_ns):
+            raise ValueError("nonzero task_release_ns currently requires strict execution")
         if any(value < 0 for value in resize_timeout_ns):
             raise ValueError("task_resize_timeout_ns must be non-negative")
         if any(value < -1 for value in preferred_core_begins):
@@ -548,6 +560,7 @@ def upgrade_legacy_async_plan(plan: Mapping[str, object]) -> dict[str, object]:
         "task_range_granularities": [ASYNC_MOE_FULL_EXPERT_RANGE] * num_tasks,
         "task_w13_window_bytes": [-1] * num_tasks,
         "task_w2_window_bytes": [-1] * num_tasks,
+        "task_release_ns": [0] * num_tasks,
         "task_resize_timeout_ns": [0] * num_tasks,
         "task_preferred_core_begins": [-1] * num_tasks,
         "early_merge": None,

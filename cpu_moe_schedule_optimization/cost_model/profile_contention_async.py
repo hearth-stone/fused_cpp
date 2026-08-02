@@ -700,6 +700,7 @@ def main() -> int:
             "output_buffer": "preallocated_reused_native_out",
             "rank_synchronization": "socket_barrier" if args.sync_port else "none",
             "omp_proc_bind": os.environ.get("OMP_PROC_BIND", ""),
+            "hugetlbfs_path": os.environ.get("FUSED_CPP_MOE_HUGETLBFS_PATH", ""),
             "runs": args.runs,
             "warmup": args.warmup,
             "assignment": "earliest_finish_lpt_using_streaming_T_iso",

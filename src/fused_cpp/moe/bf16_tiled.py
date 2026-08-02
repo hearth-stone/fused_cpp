@@ -3,8 +3,11 @@
 
 from __future__ import annotations
 
+import os
+import tempfile
 from dataclasses import dataclass
 from operator import index
+from pathlib import Path
 from typing import Any, Mapping, Tuple
 
 import torch
@@ -118,6 +121,13 @@ _INTEGER_DTYPES = {
     torch.int64,
 }
 
+_HUGETLBFS_PATH_ENV = "FUSED_CPP_MOE_HUGETLBFS_PATH"
+_HUGETLB_SIZE_SUFFIXES = {
+    "K": 1024,
+    "M": 1024**2,
+    "G": 1024**3,
+}
+
 
 def _require_backend() -> None:
     if not _HAS_BF16_TILED_FUSED_MOE:
@@ -189,6 +199,96 @@ def _weight_window_argument(weight_window_bytes: int | None) -> int:
     return value
 
 
+def _parse_hugetlb_size(value: str) -> int:
+    normalized = value.strip().upper()
+    if not normalized:
+        raise ValueError("empty HugeTLB page size")
+    suffix = normalized[-1]
+    if suffix in _HUGETLB_SIZE_SUFFIXES:
+        return int(normalized[:-1]) * _HUGETLB_SIZE_SUFFIXES[suffix]
+    return int(normalized)
+
+
+def _hugetlbfs_page_size(path: Path) -> int:
+    if os.name != "posix" or not Path("/proc/mounts").is_file():
+        raise RuntimeError(f"{_HUGETLBFS_PATH_ENV} requires Linux hugetlbfs")
+    try:
+        resolved = path.resolve(strict=True)
+    except FileNotFoundError as error:
+        raise RuntimeError(f"configured hugetlbfs path does not exist: {path}") from error
+    for line in Path("/proc/mounts").read_text(encoding="utf-8").splitlines():
+        fields = line.split()
+        if len(fields) < 4 or fields[2] != "hugetlbfs":
+            continue
+        if Path(fields[1]).resolve() != resolved:
+            continue
+        for option in fields[3].split(","):
+            if option.startswith("pagesize="):
+                page_size = _parse_hugetlb_size(option.partition("=")[2])
+                if page_size <= 0:
+                    break
+                return page_size
+        raise RuntimeError(f"hugetlbfs mount {resolved} does not report a positive pagesize option")
+    raise RuntimeError(f"{resolved} is not a hugetlbfs mount")
+
+
+def _copy_packed_tensor_to_hugetlbfs(
+    source: torch.Tensor,
+    *,
+    mount_path: Path,
+    page_size: int,
+    label: str,
+) -> torch.Tensor:
+    if source.device.type != "cpu" or not source.is_contiguous():
+        raise RuntimeError(f"packed {label} must be a contiguous CPU tensor before HugeTLB migration")
+    logical_bytes = source.numel() * source.element_size()
+    mapped_bytes = ((logical_bytes + page_size - 1) // page_size) * page_size
+    descriptor = -1
+    filename = ""
+    try:
+        descriptor, filename = tempfile.mkstemp(prefix=f"fused_cpp_moe_{label}_", dir=mount_path)
+        os.ftruncate(descriptor, mapped_bytes)
+        os.close(descriptor)
+        descriptor = -1
+        storage = torch.UntypedStorage.from_file(filename, shared=True, nbytes=mapped_bytes)
+        target = torch.empty(0, dtype=source.dtype, device="cpu").set_(
+            storage,
+            0,
+            tuple(source.shape),
+            tuple(source.stride()),
+        )
+        target.copy_(source)
+        return target
+    except (OSError, RuntimeError) as error:
+        raise RuntimeError(
+            f"failed to allocate packed {label} ({mapped_bytes} bytes) from "
+            f"{page_size}-byte hugetlbfs mount {mount_path}"
+        ) from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if filename:
+            try:
+                os.unlink(filename)
+            except FileNotFoundError:
+                pass
+
+
+def _maybe_move_packed_weights_to_hugetlbfs(
+    w13: torch.Tensor,
+    w2: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    raw_path = os.environ.get(_HUGETLBFS_PATH_ENV, "").strip()
+    if not raw_path:
+        return w13, w2
+    mount_path = Path(raw_path)
+    page_size = _hugetlbfs_page_size(mount_path)
+    return (
+        _copy_packed_tensor_to_hugetlbfs(w13, mount_path=mount_path, page_size=page_size, label="w13"),
+        _copy_packed_tensor_to_hugetlbfs(w2, mount_path=mount_path, page_size=page_size, label="w2"),
+    )
+
+
 def prepare_fused_moe_bf16_tiled_weights(
     w13_weight: torch.Tensor,
     w2_weight: torch.Tensor,
@@ -201,6 +301,10 @@ def prepare_fused_moe_bf16_tiled_weights(
     ``w13_weight`` follows the vLLM layout ``[E, 2 * F, H]`` and ``w2_weight``
     follows ``[E, H, F]``. The returned object is reusable across decode steps.
     Set ``FUSED_CPP_MOE_PREPACK_THREADS`` to parallelize packing by expert.
+    Set ``FUSED_CPP_MOE_HUGETLBFS_PATH`` to a mounted hugetlbfs directory to
+    copy only the reusable packed W13/W2 tensors into explicit HugeTLB pages.
+    The configured path is strict: allocation or mount errors do not silently
+    fall back to ordinary pages.
 
     ``fuse_silu=True`` packs w13 in the interleaved gate/up layout required by
     the fused SiLU-and-mul GEMM epilogue. ARM currently requires ``F % 8 == 0``;
@@ -231,9 +335,10 @@ def prepare_fused_moe_bf16_tiled_weights(
         101: "x86_avx512_bf16",
         102: "x86_amx_bf16",
     }
+    packed_w13, packed_w2 = _maybe_move_packed_weights_to_hugetlbfs(packed[0], packed[3])
     return PreparedBF16TiledFusedMoEWeights(
-        w13=(packed[0], int(packed[1]), int(packed[2])),
-        w2=(packed[3], int(packed[4]), int(packed[5])),
+        w13=(packed_w13, int(packed[1]), int(packed[2])),
+        w2=(packed_w2, int(packed[4]), int(packed[5])),
         fused_silu=bool(fuse_silu),
         gemm_backend=backend_id,
         backend_n_tile=int(packed[7]) if len(packed) > 7 else 8,
@@ -557,12 +662,15 @@ def fused_moe_bf16_tiled_async_plan(
     if _fused_moe_bf16_tiled_async_plan_v2_impl is None:
         assert materialized.task_w13_window_bytes is not None
         assert materialized.task_w2_window_bytes is not None
+        assert materialized.task_release_ns is not None
         if materialized.early_merge is not None:
             raise RuntimeError("early_merge control requires native fused_moe_bf16_tiled_async_plan_v2 support")
         if bool((materialized.task_w13_window_bytes >= 0).any()) or bool(
             (materialized.task_w2_window_bytes >= 0).any()
         ):
             raise RuntimeError("per-task W13/W2 windows require native fused_moe_bf16_tiled_async_plan_v2 support")
+        if bool((materialized.task_release_ns > 0).any()):
+            raise RuntimeError("timed task releases require native fused_moe_bf16_tiled_async_plan_v2 support")
         if materialized.execution_mode == ASYNC_MOE_EXECUTION_STRICT:
             return fused_moe_bf16_tiled_async(
                 input,
@@ -595,6 +703,7 @@ def fused_moe_bf16_tiled_async_plan(
     _validate_output_buffer(input, out)
     assert materialized.task_w13_window_bytes is not None
     assert materialized.task_w2_window_bytes is not None
+    assert materialized.task_release_ns is not None
     assert materialized.task_resize_timeout_ns is not None
     assert materialized.task_preferred_core_begins is not None
     if elastic_stats_out is not None:
@@ -651,6 +760,7 @@ def fused_moe_bf16_tiled_async_plan(
         out,
         materialized.task_w13_window_bytes.contiguous(),
         materialized.task_w2_window_bytes.contiguous(),
+        materialized.task_release_ns.contiguous(),
     )
     if materialized.execution_mode == ASYNC_MOE_EXECUTION_ELASTIC:
         assert _fused_moe_bf16_tiled_async_plan_v2_elastic_impl is not None
