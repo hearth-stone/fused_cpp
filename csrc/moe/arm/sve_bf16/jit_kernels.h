@@ -31,6 +31,9 @@ enum class ProbeMode : uint8_t {
   kControlOnly,
   kBAFixedA,
   kFullNoStoreFixedA,
+  kMatrixOnly,
+  kFullNoStoreColumnPipeline,
+  kFullWithStoreColumnPipeline,
 };
 
 using KernelFn = void (*)(const uint16_t*, const uint16_t*, void*, const void*, const gemm_params_t*);
@@ -46,8 +49,8 @@ KernelFn get_kernel(Operation operation, int rows, int degree, std::string* erro
 // Standalone packed-A/packed-B BF16 GEMM with row-major FP32 output.
 KernelFn get_gemm_f32_kernel(int rows, std::string* error);
 KernelFn get_bulk_m12_gemm_f32_kernel(std::string* error);
-// Benchmark-only variants of the M1/M2 pure GEMM kernel. They retain the production
-// loop structure while selectively executing A/B loads, BFMMLA, and stores.
+// Benchmark-only variants of the pure GEMM kernel. M1/M2 support all probe modes;
+// M12 also supports benchmark-only column-pipelined full-loop modes.
 KernelFn get_probe_kernel(int rows, ProbeMode mode, std::string* error);
 // Exact-M kernel with an operation-specific streaming hint ahead of each cold
 // B cache-line load. The caller is responsible for using it only on the first

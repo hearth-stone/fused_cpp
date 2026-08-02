@@ -58,6 +58,7 @@ struct Options {
   int runs = 201;
   int inner = 1;
   bool include_ilv = false;
+  bool include_column_pipeline = false;
 };
 
 uint16_t to_bf16(float value) {
@@ -108,9 +109,12 @@ Options parse_options(int argc, char** argv) {
       options.inner = std::stoi(value());
     } else if (argument == "--include-ilv") {
       options.include_ilv = true;
+    } else if (argument == "--include-column-pipeline") {
+      options.include_column_pipeline = true;
     } else if (argument == "--help") {
       std::cout << "usage: bench_jit_vs_i8mm_pure_gemm [--rows 1,2,4,8,12] [--k K] [--n N]"
-                   " [--experts E] [--warmup W] [--runs R] [--inner I] [--include-ilv]\n";
+                   " [--experts E] [--warmup W] [--runs R] [--inner I] [--include-ilv]"
+                   " [--include-column-pipeline]\n";
       std::exit(0);
     } else {
       throw std::invalid_argument("unknown argument: " + argument);
@@ -129,6 +133,9 @@ Options parse_options(int argc, char** argv) {
     }
     if (options.include_ilv && rows != 8 && rows != 12) {
       throw std::invalid_argument("upstream ILV comparison supports only M=8,12");
+    }
+    if (options.include_column_pipeline && rows != 12) {
+      throw std::invalid_argument("column-pipelined comparison supports only M=12");
     }
   }
   return options;
@@ -259,6 +266,14 @@ bool run_case(const Options& options, int rows) {
   }
   const I8mmKernelFn reference_kernel = i8mm_kernel(rows);
   const I8mmKernelFn ilv_kernel = options.include_ilv ? i8mm_ilv_kernel(rows) : nullptr;
+  const fused_cpp::moe_sve::jit::KernelFn column_kernel =
+      options.include_column_pipeline
+          ? fused_cpp::moe_sve::jit::get_probe_kernel(
+                rows, fused_cpp::moe_sve::jit::ProbeMode::kFullWithStoreColumnPipeline, &error)
+          : nullptr;
+  if (options.include_column_pipeline && column_kernel == nullptr) {
+    throw std::runtime_error("column-pipelined JIT generation failed: " + error);
+  }
   std::vector<float> jit_output(static_cast<size_t>(physical_rows) * options.n,
                                 std::numeric_limits<float>::quiet_NaN());
   std::vector<float> i8mm_output(static_cast<size_t>(physical_rows) * options.n,
@@ -266,6 +281,10 @@ bool run_case(const Options& options, int rows) {
   std::vector<float> ilv_output;
   if (options.include_ilv) {
     ilv_output.assign(static_cast<size_t>(physical_rows) * options.n, std::numeric_limits<float>::quiet_NaN());
+  }
+  std::vector<float> column_output;
+  if (options.include_column_pipeline) {
+    column_output.assign(static_cast<size_t>(physical_rows) * options.n, std::numeric_limits<float>::quiet_NaN());
   }
 
   auto call_jit = [&](int64_t iteration) {
@@ -283,19 +302,30 @@ bool run_case(const Options& options, int rows) {
     const uint16_t* weight = packed_b.data() + expert * one_packed_b.size();
     ilv_kernel(a.data(), weight, ilv_output.data(), const_cast<uint16_t*>(packed_a.data()), &params.gemm);
   };
+  auto call_column = [&](int64_t iteration) {
+    const size_t expert = static_cast<size_t>(iteration % options.experts);
+    const uint16_t* weight = packed_b.data() + expert * one_packed_b.size();
+    column_kernel(packed_a.data(), weight, column_output.data(), nullptr, &params.gemm);
+  };
 
   call_jit(0);
   call_i8mm(0);
   if (options.include_ilv) {
     call_ilv(0);
   }
+  if (options.include_column_pipeline) {
+    call_column(0);
+  }
   const size_t compared_bytes = static_cast<size_t>(rows) * options.n * sizeof(float);
   const bool bitwise_equal = std::memcmp(jit_output.data(), i8mm_output.data(), compared_bytes) == 0;
   const bool ilv_bitwise_equal =
       !options.include_ilv || std::memcmp(i8mm_output.data(), ilv_output.data(), compared_bytes) == 0;
+  const bool column_bitwise_equal =
+      !options.include_column_pipeline || std::memcmp(i8mm_output.data(), column_output.data(), compared_bytes) == 0;
   bool finite_output = true;
   double max_abs_diff = 0.0;
   double ilv_max_abs_diff = 0.0;
+  double column_max_abs_diff = 0.0;
   for (size_t i = 0; i < static_cast<size_t>(rows) * options.n; ++i) {
     finite_output = finite_output && std::isfinite(jit_output[i]) && std::isfinite(i8mm_output[i]);
     max_abs_diff = std::max(max_abs_diff, std::abs(static_cast<double>(jit_output[i] - i8mm_output[i])));
@@ -303,10 +333,16 @@ bool run_case(const Options& options, int rows) {
       finite_output = finite_output && std::isfinite(ilv_output[i]);
       ilv_max_abs_diff = std::max(ilv_max_abs_diff, std::abs(static_cast<double>(ilv_output[i] - i8mm_output[i])));
     }
+    if (options.include_column_pipeline) {
+      finite_output = finite_output && std::isfinite(column_output[i]);
+      column_max_abs_diff =
+          std::max(column_max_abs_diff, std::abs(static_cast<double>(column_output[i] - i8mm_output[i])));
+    }
   }
-  if (!bitwise_equal || !ilv_bitwise_equal || !finite_output) {
+  if (!bitwise_equal || !ilv_bitwise_equal || !column_bitwise_equal || !finite_output) {
     std::cerr << "correctness mismatch for M=" << rows << ", finite=" << finite_output
-              << ", max_abs_diff=" << max_abs_diff << ", ilv_max_abs_diff=" << ilv_max_abs_diff << '\n';
+              << ", max_abs_diff=" << max_abs_diff << ", ilv_max_abs_diff=" << ilv_max_abs_diff
+              << ", column_max_abs_diff=" << column_max_abs_diff << '\n';
     return false;
   }
 
@@ -392,6 +428,10 @@ bool run_case(const Options& options, int rows) {
               << ",\"ilv_speedup_percent\":" << (i8mm_us / ilv_us - 1.0) * 100.0
               << ",\"ilv_max_abs_diff\":" << ilv_max_abs_diff
               << ",\"ilv_bitwise_equal\":" << (ilv_bitwise_equal ? "true" : "false");
+  }
+  if (options.include_column_pipeline) {
+    std::cout << ",\"column_max_abs_diff\":" << column_max_abs_diff
+              << ",\"column_bitwise_equal\":" << (column_bitwise_equal ? "true" : "false");
   }
   std::cout << "}\n";
   return true;

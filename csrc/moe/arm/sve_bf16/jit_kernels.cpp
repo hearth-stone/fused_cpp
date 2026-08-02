@@ -106,6 +106,20 @@ void prewarm_bulk_m12(Operation, int) {}
 
 using namespace Xbyak_aarch64;
 
+bool probe_rows_supported(int rows, ProbeMode mode) {
+  if (mode == ProbeMode::kMatrixOnly) {
+    return rows == 12;
+  }
+  if (mode == ProbeMode::kFullNoStoreColumnPipeline ||
+      mode == ProbeMode::kFullWithStoreColumnPipeline) {
+    return rows == 12;
+  }
+  if (mode == ProbeMode::kFullNoStore) {
+    return (rows >= 1 && rows <= 2) || rows == 12;
+  }
+  return rows >= 1 && rows <= 2;
+}
+
 struct KernelKey {
   Operation operation = Operation::kW13;
   uint8_t rows = 0;
@@ -148,9 +162,11 @@ class SveFusedGenerator final : public CodeGenerator {
     if (dual_n_ && (bulk_m_ || prefetch_b_)) {
       throw std::invalid_argument("SVE JIT dual-N cannot be combined with other experimental load paths");
     }
-    if (probe_mode_ != ProbeMode::kNone &&
-        (operation_ != Operation::kGemmF32 || rows_ > 2 || bulk_m_ || prefetch_b_ || dual_n_)) {
-      throw std::invalid_argument("SVE JIT probes require a plain M1/M2 GEMM kernel");
+    if (probe_mode_ != ProbeMode::kNone) {
+      if (operation_ != Operation::kGemmF32 || !probe_rows_supported(rows_, probe_mode_) || bulk_m_ || prefetch_b_ ||
+          dual_n_) {
+        throw std::invalid_argument("SVE JIT probe mode is incompatible with the requested GEMM kernel");
+      }
     }
     if (operation_ == Operation::kW13 && (degree_ < 4 || degree_ > 6)) {
       throw std::invalid_argument("SVE JIT W13 degree must be 4, 5, or 6");
@@ -224,6 +240,15 @@ class SveFusedGenerator final : public CodeGenerator {
         break;
       case ProbeMode::kFullNoStoreFixedA:
         probe = "_probe_full_nostore_fixed_a";
+        break;
+      case ProbeMode::kMatrixOnly:
+        probe = "_probe_matrix";
+        break;
+      case ProbeMode::kFullNoStoreColumnPipeline:
+        probe = "_probe_full_nostore_column_pipeline";
+        break;
+      case ProbeMode::kFullWithStoreColumnPipeline:
+        probe = "_probe_full_store_column_pipeline";
         break;
     }
     char path[512];
@@ -405,6 +430,42 @@ class SveFusedGenerator final : public CodeGenerator {
   }
 
   void emit_m12_k4(bool prefetch_b = false) {
+    if (probe_mode_ == ProbeMode::kMatrixOnly) {
+      const int first_group = std::min(row_pairs_, 4);
+      const int early_pairs = std::min(first_group, 2);
+      compute_pairs(0, early_pairs, 0, 4);
+      compute_pairs(early_pairs, first_group, early_pairs, 4);
+      compute_pairs(4, row_pairs_, 0, 4);
+      return;
+    }
+    if (probe_mode_ == ProbeMode::kFullNoStoreColumnPipeline ||
+        probe_mode_ == ProbeMode::kFullWithStoreColumnPipeline) {
+      // Keep all six packed-A pairs resident and ping-pong two packed-B
+      // registers. This preserves instruction counts while spacing the four
+      // six-BFMMLA column groups with B loads and pointer updates.
+      ld1h(ZRegH(6), p0 / T_z, ptr(x14));
+      ld1h(ZRegH(7), p0 / T_z, ptr(x14, 1, MUL_VL));
+      for (int pair = 0; pair < row_pairs_; ++pair) {
+        ld1rqh(ZRegH(pair), p0 / T_z, ptr(x13, pair * 16));
+      }
+      for (int pair = 0; pair < row_pairs_; ++pair) {
+        bfmmla(accumulator(pair, 0), ZRegH(pair), ZRegH(6));
+      }
+      ld1h(ZRegH(6), p0 / T_z, ptr(x14, 2, MUL_VL));
+      for (int pair = 0; pair < row_pairs_; ++pair) {
+        bfmmla(accumulator(pair, 1), ZRegH(pair), ZRegH(7));
+      }
+      ld1h(ZRegH(7), p0 / T_z, ptr(x14, 3, MUL_VL));
+      add(x14, x14, x9, LSL, 2);
+      for (int pair = 0; pair < row_pairs_; ++pair) {
+        bfmmla(accumulator(pair, 2), ZRegH(pair), ZRegH(6));
+      }
+      add(x13, x13, physical_rows_ * 8);
+      for (int pair = 0; pair < row_pairs_; ++pair) {
+        bfmmla(accumulator(pair, 3), ZRegH(pair), ZRegH(7));
+      }
+      return;
+    }
     load_b(4, prefetch_b);
     const int first_group = std::min(row_pairs_, 4);
     for (int pair = 0; pair < first_group; ++pair) {
@@ -948,6 +1009,10 @@ class SveFusedGenerator final : public CodeGenerator {
     if (probe_mode_ == ProbeMode::kBFMMLAOnly) {
       mov(ZRegS(0), 0);
       mov(ZRegS(8), 0);
+    } else if (probe_mode_ == ProbeMode::kMatrixOnly) {
+      for (int reg = 0; reg < 8; ++reg) {
+        mov(ZRegD(reg), 0);
+      }
     }
     if (physical_rows_ == 8 && prefetch_b_) {
       emit_small_first_panel_prefetch_k_loop();
@@ -959,7 +1024,8 @@ class SveFusedGenerator final : public CodeGenerator {
       emit_m12_k_loop();
     }
 
-    if (probe_mode_ == ProbeMode::kNone || probe_mode_ == ProbeMode::kFullWithStore) {
+    if (probe_mode_ == ProbeMode::kNone || probe_mode_ == ProbeMode::kFullWithStore ||
+        probe_mode_ == ProbeMode::kFullWithStoreColumnPipeline) {
       if (operation_ == Operation::kW13) {
         store_w13();
       } else {
@@ -1035,7 +1101,7 @@ constexpr size_t kDegreeCount = 3;
 constexpr size_t kBulkMCount = 2;
 constexpr size_t kPrefetchBCount = 2;
 constexpr size_t kDualNCount = 2;
-constexpr size_t kProbeModeCount = 10;
+constexpr size_t kProbeModeCount = static_cast<size_t>(ProbeMode::kFullWithStoreColumnPipeline) + 1;
 
 size_t operation_index(Operation operation) { return static_cast<size_t>(operation); }
 
@@ -1091,9 +1157,9 @@ KernelFn get_kernel(Operation operation, int rows, int degree, std::string* erro
 }
 
 KernelFn get_probe_kernel(int rows, ProbeMode mode, std::string* error) {
-  if (rows < 1 || rows > 2 || mode == ProbeMode::kNone) {
+  if (!probe_rows_supported(rows, mode) || mode == ProbeMode::kNone) {
     if (error != nullptr) {
-      *error = "SVE JIT probe requires rows in [1, 2] and a non-zero probe mode";
+      *error = "SVE JIT probe requires M1/M2, or an M12-compatible mode";
     }
     return nullptr;
   }

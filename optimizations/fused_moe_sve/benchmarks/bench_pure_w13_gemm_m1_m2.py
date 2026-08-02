@@ -30,6 +30,7 @@ PROBE_MODES = {
     "control-only": 7,
     "ba-fixed-a": 8,
     "full-no-store-fixed-a": 9,
+    "matrix-only": 10,
 }
 
 

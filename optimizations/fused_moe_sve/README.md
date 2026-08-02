@@ -106,6 +106,14 @@ Neither schedule is adopted; the current non-ILV fused JIT remains the
 default. Method, five-run ranges, and W13/W2 tables are in
 [`results/amazon_8c_192c_upstream_m8_m12_ilv.md`](results/amazon_8c_192c_upstream_m8_m12_ilv.md).
 
+An M12-only JIT probe that keeps all six packed-A pairs live and ping-pongs two
+packed-B column registers was also tested on all 96 V3 cores. A 21-repeat long
+window improved median L1-hot throughput by only 0.648% and linear efficiency
+by 0.592 percentage points; the vector issue-queue-full event increased by
+about 37.5%. The schedule is therefore retained only as a reproducible probe,
+with measurements in
+[`results/amazon_192c_m12_column_pipeline_20260802.md`](results/amazon_192c_m12_column_pipeline_20260802.md).
+
 The bulk-M experiment is bitwise correct but performance-neutral across the
 192-core host NUMA0 grid, so it remains opt-in. Corrected paired-window results
 are in
