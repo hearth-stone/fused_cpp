@@ -30,6 +30,7 @@ from stage_window_policy import (  # noqa: E402
     AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V1,
     AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V2,
     AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V3,
+    AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V4,
     INHERIT_STAGE_WINDOW,
     StageWindowBand,
     StaticStageWindowPolicy,
@@ -769,6 +770,45 @@ def test_stage_window_v3_fills_the_mid_route_band_without_moving_v2_cells() -> N
             assert v3.select(routes, threads) == v2.select(routes, threads), (routes, threads)
 
 
+def test_stage_window_v4_splits_the_mid_route_band_at_the_shared_a_threshold() -> None:
+    """V4 only moves the 144-287 band's upper part to the larger window."""
+    v1 = AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V1
+    v3 = AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V3
+    v4 = AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V4
+
+    assert [(band.min_routes, band.max_routes) for band in v4.bands] == [
+        (13, 48),
+        (49, 95),
+        (96, 143),
+        (144, 215),
+        (216, 287),
+        (288, 575),
+    ]
+
+    # Below the seam nothing moves, and 144-215 still carries V1's own values.
+    for routes in (13, 28, 48, 49, 72, 95, 96, 120, 143, 144, 180, 215):
+        for threads in STAGE_WIDTHS:
+            assert v4.select(routes, threads) == v3.select(routes, threads), (routes, threads)
+    for routes in (144, 180, 215):
+        for threads in STAGE_WIDTHS:
+            assert v4.select(routes, threads) == v1.select(routes, threads), (routes, threads)
+
+    # The per-thread shared-A scan is 2*M*H, so it crosses the 2 MiB private L2 at
+    # M=256. The measured optimum steps to 0.5 MiB per thread and is
+    # width-independent, which is why the new band carries no thread overrides.
+    for routes in (216, 240, 256, 287):
+        for threads in (1, 2, 4, 8):
+            assert v4.worker_windows(routes, threads) == (MIB // 2, MIB // 8), (routes, threads)
+        for threads in (16, 32):
+            assert v4.select(routes, threads) == (INHERIT_STAGE_WINDOW, INHERIT_STAGE_WINDOW)
+
+    # Above the seam the 288-575 band is untouched, including its 1T override.
+    for routes in (288, 400, 575, 576):
+        for threads in STAGE_WIDTHS:
+            assert v4.select(routes, threads) == v3.select(routes, threads), (routes, threads)
+    assert v4.worker_windows(320, 1) == (1 * MIB, MIB // 2)
+
+
 def test_stage_window_band_rejects_invalid_shapes() -> None:
     valid = {"min_routes": 10, "max_routes": 20, "widths": (1, 2)}
 
@@ -1172,7 +1212,7 @@ def test_default_stage_window_policy_requires_exact_profile(
             num_cores=96,
             cpu_ids=cpu_ids_by_rank[0],
         )
-        is AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V3
+        is AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V4
     )
     assert (
         default_task_stage_window_policy(
@@ -1180,7 +1220,7 @@ def test_default_stage_window_policy_requires_exact_profile(
             num_cores=96,
             cpu_ids=cpu_ids_by_rank[1],
         )
-        is AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V3
+        is AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V4
     )
     assert (
         default_task_stage_window_policy(

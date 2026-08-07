@@ -366,8 +366,17 @@ features:
       threads is worth 3.39x, 2.94x and 1.65x of isolated bandwidth at M=72.
       That landed as amazon_c5_192c_tp4_f512_v3. No catalog preset plans a 49-95
       route expert below 8 threads, so V2 and V3 build element-identical plans on
-      all five presets and the gain is latent. Since w13_split is only a boolean
-      alias for a 4 or 8 MiB W13 budget, dropping it as a search dimension was
+      all five presets and the gain is latent. A follow-up sweep then located the
+      threshold that sets the optimum: each thread scans all of A inside a range,
+      so the per-thread scan is 2*M*K, and the optimum saturates exactly where
+      that fills private L2, at M=256 for W13 and M=2048 for W2, a ratio of H/F=8.
+      That exposed a defect in the V1 table, whose 144-287 band used one eighth of
+      a MiB per thread across its whole range while everything from M=224 up wants
+      one half: at M=256 the old value costs 61 percent at one thread and 23
+      percent at four. amazon_c5_192c_tp4_f512_v4 splits that band at 216 route,
+      an integral number of M12 panels. Only three of dsv4-real-2048-seq70's 223
+      tasks land in the new band, so the five presets again move within noise and
+      the gain is latent. Since w13_split is only a boolean alias for a 4 or 8 MiB W13 budget, dropping it as a search dimension was
       then evaluated and rejected: the bands cover 52 percent of the route-width
       grid and cannot cover the rest, because M<=12 has no reuse to protect and
       widths above 8 already sit near the optimum on the inherited geometry. The

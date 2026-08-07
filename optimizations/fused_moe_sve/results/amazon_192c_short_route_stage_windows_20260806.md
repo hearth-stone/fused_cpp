@@ -399,6 +399,65 @@ calibrated. The candidate set for this identity is already the minimal two, spli
 and no-split, with no measured window variants, so there is no dimension to
 collapse.
 
+## Result 7: the optimum steps where the shared-A scan outgrows L2
+
+The two competing terms in Result 4 predict a threshold. Each thread scans all of
+A inside one range, since the N axis is partitioned across the team, so the
+per-thread scan is `2*M*K`. While that fits private L2 it survives across ranges
+and range multiplication is nearly free; once it does not, the cost is
+proportional to the range count. For W13 with `K = H = 4096` that crossing is at
+`M = 256`; for W2 with `K = F = 512` it is at `M = 2048`, a ratio of exactly
+`H / F = 8`.
+
+Fixed `24x4T`, 192 homogeneous experts, `w2` held at 0.125 MiB per thread, useful
+packed-B bandwidth in GB/s:
+
+| M | A_w13 / L2 | 1/16 | 1/8 | 1/4 | 1/2 | 1 | best |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 120 | 0.47 | 169.8 | **174.2** | 167.1 | 143.7 | 132.0 | 1/8 |
+| 160 | 0.62 | 124.9 | **128.7** | 127.6 | 112.1 | 102.9 | 1/8 |
+| 176 | 0.69 | 114.0 | **117.8** | 116.4 | 106.5 | 95.9 | 1/8 |
+| 192 | 0.75 | 105.5 | **108.2** | 107.9 | 102.7 | 91.3 | 1/8 |
+| 200 | 0.78 | 99.8 | 103.1 | **103.3** | 99.2 | 87.6 | 1/4 |
+| 224 | 0.88 | 86.7 | 88.2 | 88.9 | **89.6** | 81.4 | 1/2 |
+| 240 | 0.94 | 78.5 | 76.0 | 79.4 | **84.1** | 78.2 | 1/2 |
+| 256 | **1.00** | 68.2 | 63.5 | 71.5 | **78.3** | 74.6 | 1/2 |
+| 300 | 1.17 | 49.4 | 47.7 | 61.0 | **67.5** | 66.1 | 1/2 |
+| 320 | 1.25 | 44.6 | 44.0 | 56.8 | **63.0** | 61.8 | 1/2 |
+
+The threshold holds. The optimum climbs 1/8 -> 1/4 -> 1/2 as `A_w13 / L2` goes
+0.62 -> 0.78 -> 1.00 and saturates exactly where A fills L2. It is a two-step ramp
+rather than a jump, starting around `A / L2 = 0.62`, consistent with A not having
+exclusive use of L2: packed B, the intermediate and C stream through it too. The
+1/4 "plateau" is a single point at `M=200` and only 0.2% better than 1/8, so it
+does not earn a band of its own.
+
+The step is width-independent, which is what the mechanism predicts because
+`2*M*K` carries no team-width term. At `M=256` all four widths peak at 1/2 MiB per
+thread:
+
+| t | 1/8 | 1/4 | 1/2 | 1 | cost of the old band's 1/8 |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 41.6 | 55.2 | **67.1** | 65.0 | **-61%** |
+| 2 | 62.8 | 68.2 | **72.8** | 71.1 | -16% |
+| 4 | 63.5 | 71.5 | **78.3** | 74.6 | -23% |
+| 8 | 63.1 | 73.5 | **80.1** | 74.1 | -27% |
+
+That exposes a defect in the V1 table: the `144-287` band prescribed 1/8 MiB
+across its whole range, but everything from `M=224` up wants 1/2 MiB.
+Interpolating between `M=200`, where 1/8 leads by 3.9%, and `M=224`, where 1/2
+leads by 1.6%, puts the crossover at `M ~ 217`.
+`amazon_c5_192c_tp4_f512_v4` splits the band into `144-215`, which keeps V1's own
+values including its 8-thread override, and `216-287` at `(1/2, 1/8)` with no
+overrides. The seam sits at 216, an integral number of M12 panels, and costs at
+most 0.2% there. `288-575` is untouched.
+
+Almost nothing in the catalog lands in the new band: three of
+`dsv4-real-2048-seq70`'s 223 tasks, about 2% of its routes, and zero elsewhere. So
+all five presets move within +-0.78% end to end, against a `legacy` variant that
+swings -1.28% to +0.34% in the same comparison, and every chosen shape is
+unchanged. The gain is latent, like the 49-95 fill.
+
 ## Not established
 
 - The band ties the W13 and W2 targets to one per-thread window. Result 4 shows
@@ -446,5 +505,8 @@ collapse.
 - `results/data/stage_window_omega_20260807/band4995_m72_t{1,2,4,8}.json`: the
   49-95 band's narrow-width calibration.
 - `results/data/stage_window_omega_20260807/v3_{preset}.json`: the V2-to-V3 A/B.
+- `results/data/stage_window_omega_20260807/thresh_m{120..320}.json` and
+  `thresh_m256_t{1,2,8}.json`: the shared-A threshold sweep and its width check.
+- `results/data/stage_window_omega_20260807/v4_{preset}.json`: the V3-to-V4 A/B.
 - `results/data/heterogeneous_overlap_20260806/`: the earlier 195-expert sweeps
   and the heterogeneous co-scheduling probes that led to this measurement.

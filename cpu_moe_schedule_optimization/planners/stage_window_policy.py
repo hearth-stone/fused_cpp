@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import sys
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Protocol
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "cost_model"))
@@ -404,6 +404,47 @@ AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V3 = StaticStageWindowPolicy(
 )
 
 
+# V1 gave 144-287 a single 1/8 MiB per-thread W13 window, but the optimum inside
+# that range is not constant: the per-thread shared-A scan is 2*M*H bytes, so it
+# outgrows the 2 MiB private L2 at M=256 and range multiplication stops being
+# cheap. Measured on 192 homogeneous experts, the optimum steps up from 1/8 MiB
+# to 1/2 MiB between M=200, where 1/8 still wins by 3.9%, and M=224, where 1/2
+# wins by 1.6%; interpolating puts the crossover at M~217. The boundary is placed
+# at 216, an integral number of M12 panels, which costs at most 0.2% at the seam.
+#
+# The step is width-independent, as the mechanism predicts since every thread
+# scans all of A: at M=256 all four widths peak at 1/2 MiB per thread, and the
+# 1/8 MiB the old band prescribed costs 61% at 1T, 16% at 2T, 23% at 4T and 27%
+# at 8T. So the new band carries no thread overrides.
+AMAZON_C5_192C_TP4_F512_MID_ROUTE_BAND_V4 = replace(
+    AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V1.bands[2],
+    max_routes=215,
+)
+
+AMAZON_C5_192C_TP4_F512_LARGE_A_BAND_V4 = StageWindowBand(
+    min_routes=216,
+    max_routes=287,
+    widths=(1, 2, 4, 8),
+    w13_bytes_per_thread=MIB // 2,
+    w2_bytes_per_thread=MIB // 8,
+)
+
+AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V4 = StaticStageWindowPolicy(
+    name="amazon_c5_192c_tp4_f512_v4",
+    hidden_size=4096,
+    intermediate_size=512,
+    backend_n_tile=8,
+    bands=(
+        AMAZON_C5_192C_TP4_F512_SHORT_ROUTE_BAND,
+        AMAZON_C5_192C_TP4_F512_MID_ROUTE_BAND_V3,
+        AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V1.bands[1],
+        AMAZON_C5_192C_TP4_F512_MID_ROUTE_BAND_V4,
+        AMAZON_C5_192C_TP4_F512_LARGE_A_BAND_V4,
+        AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V1.bands[3],
+    ),
+)
+
+
 def default_task_stage_window_policy(
     profile: StageWindowProfilePolicy | None,
     *,
@@ -442,16 +483,19 @@ def default_task_stage_window_policy(
         return None
     if tuple(int(cpu) for cpu in cpu_ids) not in profile.cpu_ids_by_rank:
         return None
-    return AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V3
+    return AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V4
 
 
 __all__ = [
     "AMAZON_C5_192C_NUMA0_TP4_F512_STAGE_WINDOWS_V1",
+    "AMAZON_C5_192C_TP4_F512_LARGE_A_BAND_V4",
     "AMAZON_C5_192C_TP4_F512_MID_ROUTE_BAND_V3",
+    "AMAZON_C5_192C_TP4_F512_MID_ROUTE_BAND_V4",
     "AMAZON_C5_192C_TP4_F512_SHORT_ROUTE_BAND",
     "AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V1",
     "AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V2",
     "AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V3",
+    "AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V4",
     "INHERIT_STAGE_WINDOW",
     "StageWindowBand",
     "StageWindowPolicyEntry",

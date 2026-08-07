@@ -961,14 +961,24 @@ presets with no in-band expert move within ±0.33%, which is under the noise flo
 set by the policy-free `legacy` variant. `moe256-uniform` is `M=48`, exactly one
 route below the old first band, which is why the gap was that large.
 
-The current default `amazon_c5_192c_tp4_f512_v3` then filled the `49-95` band at
-1, 2 and 4 threads, which V1 had calibrated at 8 threads only. That matters
-because the inherited legacy geometry is itself a per-thread window of
-`4 MiB / t`, so it is 32x to 8x too large at narrow widths and worth 3.39x, 2.94x
-and 1.65x of isolated bandwidth at `M=72`. The same identity explains why widths
-16 and 32 stay inherited: `4 MiB / 16` and `4 MiB / 32` already land near the
-measured optimum, leaving only 0.8-8.5% there, and per-thread windows stop being
-transferable above 8 threads anyway, where the width itself costs 13-39%.
+The current default `amazon_c5_192c_tp4_f512_v4` then filled the `49-95` band at
+1, 2 and 4 threads, which V1 had calibrated at 8 threads only, and split the
+`144-287` band at 216 routes. Both matter because the inherited legacy geometry is
+itself a per-thread window of `4 MiB / t`, so it is 32x to 8x too large at narrow
+widths and worth 3.39x, 2.94x and 1.65x of isolated bandwidth at `M=72`. The same
+identity explains why widths 16 and 32 stay inherited: `4 MiB / 16` and
+`4 MiB / 32` already land near the measured optimum, leaving only 0.8-8.5% there,
+and per-thread windows stop being transferable above 8 threads anyway, where the
+width itself costs 13-39%.
+
+The `144-287` split follows a threshold the model predicts. Each thread scans all
+of A inside one range, so the per-thread scan is `2*M*K`, and the optimum saturates
+exactly where that fills private L2: `M=256` for W13, `M=2048` for W2, a ratio of
+`H / F = 8`. The old band used 0.125 MiB per thread across its whole range while
+everything from `M=224` up wants 0.5 MiB, which at `M=256` cost 61% at one thread
+and 23% at four. That also explains the shape of `omega*(M)` overall: it is flat
+and noisy below the threshold, where A stays resident and the objective is nearly
+flat, then climbs once A no longer fits.
 
 One calibration is still open, and one gap is deliberate. W13 and W2 share one
 per-thread window; a two-dimensional sweep found W13 is the strong axis, where one
