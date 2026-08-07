@@ -250,6 +250,43 @@ features:
       the NUMA0 calibration remains shadow-only because contention P90 and
       maximum measured shape regret did not pass the production gates.
 
+  - id: measurement.gemm_operand_memory_services
+    part: measurement
+    status: experimental
+    implementation: >-
+      csrc/moe/arm/common/fused_moe_bf16_tiled.cpp and
+      cpu_moe_schedule_optimization/cost_model/profile_gemm_memory_services.py
+      and cpu_moe_schedule_optimization/cost_model/validate_gemm_four_state.py
+    hypothesis: >-
+      A GEMM generates different memory-service demand when packed A is hot and
+      packed B streams, packed B is hot and packed A streams, or both operands
+      stream. Measuring the production M12 full-no-store instruction body with
+      independently rotating A and B windows gives phase-specific,
+      GEMM-consumable bandwidth curves without substituting generic STREAM
+      bandwidth for the kernel request pattern.
+    depends_on:
+      - compute.xbyak_pure_gemm
+    conflicts_with: []
+    correctness: >-
+      PYTHONPATH=src .venv/bin/python -m pytest -q
+      tests/test_gemm_memory_service_probe.py
+      tests/test_fused_moe_bf16_tiled.py -k m12_service_probe
+    benchmark: >-
+      FUSED_CPP_MOE_HUGETLBFS_PATH=/dev/hugepages-32M
+      PYTHONPATH=src numactl --cpunodebind=0 --membind=0 taskset -c 0-95
+      .venv/bin/python
+      cpu_moe_schedule_optimization/cost_model/profile_gemm_memory_services.py
+      --output /tmp/gemm_memory_services.json --cpu-ids 0-95
+    result: >-
+      At 96 cores the A-hot/B-stream, A-stream/B-hot, and A+B-stream states
+      delivered 364.22, 354.52, and 363.46 GB/s of their designated streaming
+      bytes, but only 4.371, 5.672, and 2.492 TFLOP/s respectively. The result
+      is diagnostic and is not yet consumed by the production cost model. A
+      full-no-store pure-GEMM validation was within 4.85 percent for M>=192 but
+      missed M24 by 16.53 percent because cache geometry, fixed K-independent
+      work, and the known M24 trough are not represented by binary cache-state
+      counts. See results/amazon_192c_gemm_memory_services_20260802.md.
+
   - id: compute.xbyak_bulk_m
     part: compute
     status: experimental

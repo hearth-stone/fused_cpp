@@ -3179,6 +3179,55 @@ compute derate 在无 lower-cache 流量时已经存在，必须保留在线程�
 完整命令、重复性说明和原始 artifact 见
 `optimizations/fused_moe_sve/results/amazon_v1_8c_analytic_hot_gemm_core_20260802.md`。
 
+### 9.23 纯 GEMM 四状态分解验证
+
+2026-08-02 在 AmazonC5192Cores NUMA0 `0-3` 上增加 full-no-store 纯 GEMM
+验证。该实验不改变 8.2 的 active phase 公式，而是检查更细的 M-panel/N-tile
+状态分解能否作为后续 service-cost 细化。对每线程一个 stage window，令
+$P=M/12$，$Q$ 为该线程负责的 N8 tile 数，则当前 M-panel 外层、N-tile 内层
+循环的精确访问状态计数为：
+
+$$
+C_{cc}=1,\qquad C_{hc}=Q-1,\qquad C_{ch}=P-1,\qquad
+C_{hh}=(P-1)(Q-1),
+$$
+
+其中首字母表示 A、次字母表示 B，$c/h$ 分别表示本次 tile 访问前 cold/hot。
+多个 W13 stage window 只将四个计数同时乘以 window 数。该计数来自循环偏序，
+不需要机器校准；每个状态的 service time 才需要薄校准。
+
+4T 的 M12/K728/N16 两 tile probe 重采得到 A-hot/B-stream、
+A-stream/B-hot、A+B-stream 分别为 `1.055/0.778/0.829 TFLOP/s`。结合 L1/L2-hot
+GEMM service 后，K728 每个 N8 tile worker-wave 的
+`cc/hc/ch/hh(L2)` 成本为 `0.819/0.530/1.026/0.422 us`。将成本按 K 线性缩放，
+再对 TP4 的 W13 `K4096,N128/thread,2 windows` 和 W2
+`K512,N1024/thread,1 window` 做纯 GEMM 验证，得到：
+
+| M | predicted | measured | error |
+| ---: | ---: | ---: | ---: |
+| 12 | `0.147 ms` | `0.160 ms` | `-8.48%` |
+| 24 | `0.268 ms` | `0.321 ms` | `-16.53%` |
+| 48 | `0.510 ms` | `0.556 ms` | `-8.15%` |
+| 192 | `1.966 ms` | `1.942 ms` | `+1.23%` |
+| 768 | `7.786 ms` | `7.502 ms` | `+3.79%` |
+| 2040 | `20.641 ms` | `19.685 ms` | `+4.85%` |
+
+每点为 11 个同步 4-process wave 的中位数；每个 worker/wave 使用从未计时访问过的
+独立 packed-B expert，32 MiB HugeTLB，显式绑核和 NUMA-local 内存。全表绝对误差
+中位数为 `6.50%`、最大 `16.53%`；限制到 M>=192 后为 `3.79%/4.85%`。
+
+因此四状态**计数**可保留为解析骨架，但当前单组 service cost 不能跨工作集几何直接
+线性迁移：K728 的 A+B footprint 可放入 L1，而 W13 K4096 的单 M12/N8 tile 不可；
+W2 K512 的固定 control/address/call 成本不随 K 同比缩小；M24/N>=128 的已知低谷
+也不能由独立 M12 状态相加表示。长 route 的误差方向反转，是因为 no-reuse A-stream
+校准比刚完成 pack、随后反复扫描的 packed A 更悲观。该验证当前只作为 shadow
+diagnostic；不修改 production empirical backend、analytic phase service、候选空间或
+剪枝。后续若接入，必须先按 A/B 实际 cache level 和 K-independent fixed cost 分层，
+并重新通过 isolated/contention/regret gate。
+
+完整表、命令和误差归因见
+`optimizations/fused_moe_sve/results/amazon_192c_gemm_memory_services_20260802.md`。
+
 ## 10. 同步规则
 
 发生以下任一变化时，必须同步更新本文档：
@@ -3269,3 +3318,4 @@ compute derate 在无 lower-cache 流量时已经存在，必须保留在线程�
 | 2026-08-02 | v0.62 | 用整批 native 计时复核 V3 高核数 compute scaling：L1-hot 在 48T 前保持 99.7% 线性效率，64/80/96T 降为 95.8%/93.5%/91.8%，96T 五次稳定在 30.406--30.447 TFLOP/s；register-only 96T 仍为 98.9%。确认高核数 full-loop derate 真实存在但不是 BFMMLA 单元共享，并要求后续用分段 active-core efficiency 代替把拐点扩散到低核数的单一 power curve；当前 calibration 数值和 production 默认不变。 |
 | 2026-08-02 | v0.63 | 用 V3 top-down PMU 与 48T victim/aggressor 实验归因高核数 L1-hot derate：L1 refill ratio 不增、L2D stall 为 0、频率保持 3.3 GHz；增长来自 CPU-side backend busy 和 vector issue queue full。48 个 register-only aggressor 只使 full-loop victim 中位时间增加 0.42%，48 个 full-loop aggressor 增加 9.01%。因此模型将其定义为 load-to-vector-compute 混合流触发的 socket-wide vector-dispatch backpressure；最终 firmware power/dispatch 机制因无直接计数器仍不作硬编码，production 默认不变。 |
 | 2026-08-02 | v0.64 | 用 M12 双 B 寄存器 column-pipeline 检验局部调度能否关闭 V3 高核数 derate：96T 长窗口吞吐只提升 0.648%，线性效率增加 0.592 个百分点，而 `DISPATCH_STALL_IQ_VX` 增加约 37.5%。该 probe 低于 2% 采用门槛，不进入 production；现有 L1-hot service 和分段 active-core efficiency 结论不变。 |
+| 2026-08-02 | v0.65 | 增加纯 GEMM 四状态 shadow 验证：由 M-panel/N-tile 循环精确计数 cold/cold、hot-A/cold-B、cold-A/hot-B、hot/hot，并用 4T 独立冷权重扫 M12--M2040。M>=192 的总误差不超过 4.85%，但 M24 低估 16.53%，证明状态计数可解释而单组 K728 service cost 不能跨 K、cache level 和固定成本直接线性迁移；新增可重复 profiler/validator，不改变 production backend、phase 公式、候选或剪枝。 |
