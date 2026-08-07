@@ -70,6 +70,71 @@ def stage_weight_window_geometry(
     )
 
 
+def achievable_worker_windows(
+    *,
+    k: int,
+    n: int,
+    n_tile: int,
+    threads: int,
+) -> dict[int, tuple[int, int]]:
+    """Return ``{bytes_per_worker: (ranges, max_range_bytes)}`` for one stage.
+
+    Enumerating the range count covers every geometry the tile-aligned splitter
+    can produce, so the keys are exactly the per-worker windows a policy may
+    request. Each key keeps the entry with the fewest ranges, which is the
+    largest range budget that reaches that window. ``ranges`` is normalised to
+    the value ``stage_weight_window_geometry`` derives from ``max_range_bytes``,
+    so feeding the returned budget back round-trips exactly.
+    """
+    tile = max(int(n_tile), MIN_SVE_N_TILE)
+    if k <= 0 or n <= 0 or tile <= 0:
+        raise ValueError(f"weight-window GEMM dimensions must be positive: K={k}, N={n}, tile={tile}")
+    if n % tile:
+        raise ValueError(f"weight-window N must be tile aligned: N={n}, tile={tile}")
+    if threads <= 0:
+        raise ValueError(f"threads must be positive, got {threads}")
+
+    total_tiles = n // tile
+    bytes_per_tile = k * tile * 2
+    windows: dict[int, tuple[int, int]] = {}
+    for ranges in range(1, total_tiles + 1):
+        max_range_tiles = _ceil_div(total_tiles, ranges)
+        worker_bytes = _ceil_div(max_range_tiles, threads) * bytes_per_tile
+        windows.setdefault(
+            worker_bytes,
+            (_ceil_div(total_tiles, max_range_tiles), max_range_tiles * bytes_per_tile),
+        )
+    return windows
+
+
+def range_bytes_for_worker_window(
+    *,
+    k: int,
+    n: int,
+    n_tile: int,
+    threads: int,
+    target_worker_bytes: int,
+) -> int:
+    """Return the largest tile-aligned range budget that fits the per-worker window.
+
+    The per-thread window is the measured invariant of packed-B reuse, while the
+    kernel and the plan speak per-range bytes. This inverts
+    ``WeightWindowGeometry.bytes_per_worker`` so a policy can be expressed in the
+    invariant and lowered once, where the team width is known.
+    """
+    if target_worker_bytes <= 0:
+        raise ValueError(f"target_worker_bytes must be positive, got {target_worker_bytes}")
+    windows = achievable_worker_windows(k=k, n=n, n_tile=n_tile, threads=threads)
+    fitting = [worker_bytes for worker_bytes in windows if worker_bytes <= target_worker_bytes]
+    if not fitting:
+        raise ValueError(
+            f"no tile-aligned window fits {target_worker_bytes} bytes per worker for "
+            f"K={k}, N={n}, tile={max(int(n_tile), MIN_SVE_N_TILE)}, threads={threads}: "
+            f"the smallest achievable per-worker window is {min(windows)} bytes"
+        )
+    return windows[max(fitting)][1]
+
+
 def fused_moe_weight_windows(
     *,
     hidden_size: int,

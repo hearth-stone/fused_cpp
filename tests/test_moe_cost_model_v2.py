@@ -27,10 +27,18 @@ from profile_catalog import (  # noqa: E402
 from simulate_schedules import PRESETS  # noqa: E402
 from stage_window_policy import (  # noqa: E402
     AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V1,
+    INHERIT_STAGE_WINDOW,
+    StageWindowBand,
+    StaticStageWindowPolicy,
     default_task_stage_window_policy,
 )
 from tp_vs_ep_model import HierarchicalTopology, ParallelLayerEvaluator  # noqa: E402
-from weight_window import fused_moe_weight_windows  # noqa: E402
+from weight_window import (  # noqa: E402
+    achievable_worker_windows,
+    fused_moe_weight_windows,
+    range_bytes_for_worker_window,
+    stage_weight_window_geometry,
+)
 from workload_catalog import load_routing_workload  # noqa: E402
 
 
@@ -184,9 +192,7 @@ def test_planned_two_stage_planner_can_choose_different_stage_shapes() -> None:
     assert selected["w13"]["bridge"]["num_threads"] == 4
     assert selected["w2"]["bridge"]["num_threads"] == 4
     assert selected["makespan_ns"] == pytest.approx(
-        selected["call_setup_ns"]
-        + selected["w13"]["makespan_ns"]
-        + selected["w2"]["makespan_ns"]
+        selected["call_setup_ns"] + selected["w13"]["makespan_ns"] + selected["w2"]["makespan_ns"]
     )
 
 
@@ -519,6 +525,269 @@ def test_weight_window_geometry_matches_native_tile_partition() -> None:
     assert w13.bytes_per_worker(1) == 1024 * 1024
     assert w13.bytes_per_worker(32) == 64 * 1024
     assert w13.active_threads(32) == 16
+
+
+MIB = 1024 * 1024
+
+# TP4 H=4096 F=512 stage geometry: W13 packs [2F, H], W2 packs [H, F].
+W13_STAGE = {"k": 4096, "n": 1024, "n_tile": 8}
+W2_STAGE = {"k": 512, "n": 4096, "n_tile": 8}
+STAGE_WIDTHS = (1, 2, 4, 8, 16, 32)
+
+# The calibrated ``amazon_c5_192c_tp4_f512_v1`` table exactly as it was measured,
+# keyed by ``(min_routes, max_routes, threads)`` in per-range bytes. Expressing
+# the policy in per-thread windows must reproduce these values byte for byte.
+STAGE_WINDOW_V1_LEGACY_BYTES: dict[tuple[int, int, int], tuple[int, int]] = {
+    (49, 95, 8): (1 * MIB, 1 * MIB),
+    (96, 143, 1): (MIB // 8, MIB // 8),
+    (96, 143, 2): (MIB // 8, MIB // 4),
+    (96, 143, 4): (MIB // 4, MIB // 2),
+    (96, 143, 8): (1 * MIB, MIB // 2),
+    (144, 287, 1): (MIB // 8, MIB // 8),
+    (144, 287, 2): (MIB // 4, MIB // 4),
+    (144, 287, 4): (MIB // 2, MIB // 2),
+    (144, 287, 8): (1 * MIB, MIB // 2),
+    (288, 575, 1): (1 * MIB, MIB // 2),
+    (288, 575, 2): (1 * MIB, MIB // 4),
+    (288, 575, 4): (2 * MIB, MIB // 2),
+    (288, 575, 8): (4 * MIB, 1 * MIB),
+}
+
+
+@pytest.mark.parametrize("stage", [W13_STAGE, W2_STAGE], ids=["w13", "w2"])
+@pytest.mark.parametrize("threads", STAGE_WIDTHS)
+def test_achievable_worker_windows_round_trip(stage: dict, threads: int) -> None:
+    windows = achievable_worker_windows(threads=threads, **stage)
+
+    for worker_bytes, (ranges, range_bytes) in windows.items():
+        assert range_bytes_for_worker_window(threads=threads, target_worker_bytes=worker_bytes, **stage) == range_bytes
+        geometry = stage_weight_window_geometry(target_bytes=range_bytes, **stage)
+        assert geometry.ranges == ranges
+        assert geometry.max_range_bytes == range_bytes
+        assert geometry.bytes_per_worker(threads) == worker_bytes
+
+
+@pytest.mark.parametrize(
+    ("stage", "bytes_per_tile", "total_bytes"),
+    [(W13_STAGE, 64 * 1024, 8 * MIB), (W2_STAGE, 8 * 1024, 4 * MIB)],
+    ids=["w13", "w2"],
+)
+@pytest.mark.parametrize("threads", STAGE_WIDTHS)
+def test_achievable_worker_windows_are_tile_quantized(
+    stage: dict,
+    bytes_per_tile: int,
+    total_bytes: int,
+    threads: int,
+) -> None:
+    windows = achievable_worker_windows(threads=threads, **stage)
+
+    assert all(worker_bytes % bytes_per_tile == 0 for worker_bytes in windows)
+    assert min(windows) == bytes_per_tile
+    assert max(windows) == total_bytes // threads
+
+
+@pytest.mark.parametrize("stage", [W13_STAGE, W2_STAGE], ids=["w13", "w2"])
+def test_range_bytes_for_worker_window_is_monotone(stage: dict) -> None:
+    previous_ranges = 0
+    for target in (4 * MIB, 2 * MIB, 1 * MIB, MIB // 2, MIB // 4, MIB // 8, MIB // 16):
+        range_bytes = range_bytes_for_worker_window(threads=4, target_worker_bytes=target, **stage)
+        ranges = stage_weight_window_geometry(target_bytes=range_bytes, **stage).ranges
+        assert ranges >= previous_ranges
+        previous_ranges = ranges
+
+
+def test_range_bytes_for_worker_window_rejects_unreachable_target() -> None:
+    with pytest.raises(ValueError, match="smallest achievable per-worker window is 65536"):
+        range_bytes_for_worker_window(threads=1, target_worker_bytes=32 * 1024, **W13_STAGE)
+    with pytest.raises(ValueError, match="target_worker_bytes must be positive"):
+        range_bytes_for_worker_window(threads=1, target_worker_bytes=0, **W13_STAGE)
+
+
+def test_calibrated_v1_windows_are_all_reachable() -> None:
+    """Every measured V1 range budget is an achievable per-thread window."""
+    for (_, _, threads), (w13_bytes, w2_bytes) in STAGE_WINDOW_V1_LEGACY_BYTES.items():
+        for stage, range_bytes in ((W13_STAGE, w13_bytes), (W2_STAGE, w2_bytes)):
+            reachable = {value for _, value in achievable_worker_windows(threads=threads, **stage).values()}
+            assert range_bytes in reachable, f"threads={threads} range_bytes={range_bytes} stage={stage}"
+
+
+# The V1 table re-expressed as band-level per-thread windows plus the deviating
+# cells. Task 3 lands this shape in production; the test below proves the two
+# forms are interchangeable before that happens.
+STAGE_WINDOW_V1_PER_THREAD = (
+    (49, 95, (8,), (MIB // 8, MIB // 8), ()),
+    (
+        96,
+        143,
+        (1, 2, 4, 8),
+        (MIB // 8, MIB // 8),
+        ((2, MIB // 16, MIB // 8), (4, MIB // 16, MIB // 8), (8, MIB // 8, MIB // 16)),
+    ),
+    (144, 287, (1, 2, 4, 8), (MIB // 8, MIB // 8), ((8, MIB // 8, MIB // 16),)),
+    (288, 575, (1, 2, 4, 8), (MIB // 2, MIB // 8), ((1, 1 * MIB, MIB // 2),)),
+)
+STAGE_WINDOW_GEOMETRY = {"hidden_size": 4096, "intermediate_size": 512, "backend_n_tile": 8}
+
+
+def _per_thread_policy() -> StaticStageWindowPolicy:
+    return StaticStageWindowPolicy(
+        name="dual_form_per_thread",
+        bands=tuple(
+            StageWindowBand(
+                min_routes=min_routes,
+                max_routes=max_routes,
+                widths=widths,
+                w13_bytes_per_thread=window[0],
+                w2_bytes_per_thread=window[1],
+                thread_overrides=overrides,
+            )
+            for min_routes, max_routes, widths, window, overrides in STAGE_WINDOW_V1_PER_THREAD
+        ),
+        **STAGE_WINDOW_GEOMETRY,
+    )
+
+
+def _literal_policy() -> StaticStageWindowPolicy:
+    by_band: dict[tuple[int, int], list[tuple[int, int, int]]] = {}
+    for (min_routes, max_routes, threads), windows in STAGE_WINDOW_V1_LEGACY_BYTES.items():
+        by_band.setdefault((min_routes, max_routes), []).append((threads, *windows))
+    return StaticStageWindowPolicy(
+        name="dual_form_literal",
+        bands=tuple(
+            StageWindowBand.from_thread_windows(min_routes, max_routes, sorted(rows))
+            for (min_routes, max_routes), rows in sorted(by_band.items())
+        ),
+    )
+
+
+def test_stage_window_band_forms_agree() -> None:
+    """A per-thread band and its lowered per-range twin select identically."""
+    per_thread = _per_thread_policy()
+    literal = _literal_policy()
+
+    for routes in (12, 48, 49, 95, 96, 143, 144, 287, 288, 575, 576, 2040):
+        for threads in STAGE_WIDTHS:
+            assert per_thread.select(routes, threads) == literal.select(routes, threads), (routes, threads)
+
+
+def test_stage_window_band_forms_agree_on_cost_model_entries() -> None:
+    def bands(policy: StaticStageWindowPolicy) -> set[tuple[int, ...]]:
+        return {
+            (entry.min_routes, entry.max_routes, entry.threads, entry.w13_window_bytes, entry.w2_window_bytes)
+            for entry in policy.cost_model_entries()
+        }
+
+    assert bands(_per_thread_policy()) == bands(_literal_policy())
+
+
+def test_stage_window_policy_reports_achieved_worker_windows() -> None:
+    policy = _per_thread_policy()
+
+    assert policy.worker_windows(200, 4) == (MIB // 8, MIB // 8)
+    assert policy.worker_windows(400, 8) == (MIB // 2, MIB // 8)
+    assert policy.worker_windows(12, 4) == (INHERIT_STAGE_WINDOW, INHERIT_STAGE_WINDOW)
+
+
+def test_stage_window_v1_omega_form_matches_legacy_bytes() -> None:
+    """The production per-thread table lowers to the measured per-range bytes."""
+    policy = AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V1
+
+    for (min_routes, max_routes, threads), expected in STAGE_WINDOW_V1_LEGACY_BYTES.items():
+        for routes in (min_routes, (min_routes + max_routes) // 2, max_routes):
+            assert policy.select(routes, threads) == expected, (routes, threads)
+
+    entries = {
+        (entry.min_routes, entry.max_routes, entry.threads): (entry.w13_window_bytes, entry.w2_window_bytes)
+        for entry in policy.cost_model_entries()
+    }
+    assert entries == STAGE_WINDOW_V1_LEGACY_BYTES
+
+
+def test_stage_window_v1_coverage_set_unchanged() -> None:
+    """Widening coverage disables the full-workload anchor, so freeze the holes."""
+    policy = AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V1
+    covered = {(band[0], band[1], threads) for band in STAGE_WINDOW_V1_PER_THREAD for threads in band[2]}
+
+    for routes in (12, 48, 49, 95, 96, 143, 144, 287, 288, 575, 576, 2040):
+        for threads in STAGE_WIDTHS:
+            in_band = any(
+                min_routes <= routes <= max_routes and (min_routes, max_routes, threads) in covered
+                for min_routes, max_routes, _, _, _ in STAGE_WINDOW_V1_PER_THREAD
+            )
+            inherited = policy.select(routes, threads) == (INHERIT_STAGE_WINDOW, INHERIT_STAGE_WINDOW)
+            assert inherited is not in_band, (routes, threads)
+
+
+def test_stage_window_band_rejects_invalid_shapes() -> None:
+    valid = {"min_routes": 10, "max_routes": 20, "widths": (1, 2)}
+
+    with pytest.raises(ValueError, match="either positive per-thread windows or literal"):
+        StageWindowBand(**valid)
+    with pytest.raises(ValueError, match="either positive per-thread windows or literal"):
+        StageWindowBand(
+            **valid,
+            w13_bytes_per_thread=MIB,
+            w2_bytes_per_thread=MIB,
+            literal_windows=((1, MIB, MIB), (2, MIB, MIB)),
+        )
+    with pytest.raises(ValueError, match="both the W13 and the W2 window"):
+        StageWindowBand(**valid, w13_bytes_per_thread=MIB)
+    with pytest.raises(ValueError, match="must target covered widths"):
+        StageWindowBand(
+            **valid,
+            w13_bytes_per_thread=MIB,
+            w2_bytes_per_thread=MIB,
+            thread_overrides=((4, MIB, MIB),),
+        )
+    with pytest.raises(ValueError, match="do not support thread overrides"):
+        StageWindowBand(
+            **valid,
+            literal_windows=((1, MIB, MIB), (2, MIB, MIB)),
+            thread_overrides=((1, MIB, MIB),),
+        )
+    with pytest.raises(ValueError, match="cover exactly the band's widths"):
+        StageWindowBand(**valid, literal_windows=((1, MIB, MIB),))
+    with pytest.raises(ValueError, match="unique within a route band"):
+        StageWindowBand(min_routes=10, max_routes=20, widths=(1, 1), literal_windows=((1, MIB, MIB),))
+    with pytest.raises(ValueError, match="at least one thread width"):
+        StageWindowBand(min_routes=10, max_routes=20, widths=(), literal_windows=())
+
+
+def test_stage_window_policy_rejects_unlowerable_bands() -> None:
+    band = StageWindowBand(
+        min_routes=10,
+        max_routes=20,
+        widths=(1,),
+        w13_bytes_per_thread=MIB,
+        w2_bytes_per_thread=MIB,
+    )
+
+    with pytest.raises(ValueError, match="require hidden_size, intermediate_size and backend_n_tile"):
+        StaticStageWindowPolicy(name="missing_geometry", bands=(band,))
+
+    with pytest.raises(ValueError, match="cannot lower w13 for routes 10-20 at 1 threads"):
+        StaticStageWindowPolicy(
+            name="below_floor",
+            bands=(
+                StageWindowBand(
+                    min_routes=10,
+                    max_routes=20,
+                    widths=(1,),
+                    w13_bytes_per_thread=32 * 1024,
+                    w2_bytes_per_thread=32 * 1024,
+                ),
+            ),
+            **STAGE_WINDOW_GEOMETRY,
+        )
+
+    with pytest.raises(ValueError, match="route bands must not overlap"):
+        StaticStageWindowPolicy(
+            name="overlapping",
+            bands=(
+                StageWindowBand.from_thread_windows(10, 20, ((1, MIB, MIB),)),
+                StageWindowBand.from_thread_windows(20, 30, ((1, MIB, MIB),)),
+            ),
+        )
 
 
 def test_positive_window_profile_rejects_legacy_split_flag(

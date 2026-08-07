@@ -477,7 +477,7 @@ def test_stage_window_policy_changes_analytic_execution_without_expanding_search
     policy = StaticStageWindowPolicy(
         name="synthetic-stage-windows",
         bands=(
-            StageWindowBand(
+            StageWindowBand.from_thread_windows(
                 min_routes=24,
                 max_routes=24,
                 thread_windows=((2, 2048, 1024),),

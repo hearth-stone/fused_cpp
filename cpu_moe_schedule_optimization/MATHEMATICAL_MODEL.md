@@ -2,7 +2,7 @@
 
 > 状态：调度问题定义的 source of truth。
 >
-> 最后更新：2026-07-31。
+> 最后更新：2026-08-06。
 >
 > 修改 planner 的决策变量、目标函数、硬约束、性能响应、线程宽度集合、调度语义、
 > rank 耦合方式或剪枝策略时，必须同步更新本文档及末尾变更记录。
@@ -1835,6 +1835,135 @@ offered/allocated rate、capacity、utilization 和 dilation，且与 planner �
 解析 backend 先用于显式 shadow/what-if 规划。完整 schema、假设和运行命令见
 `cost_model/ANALYTIC_MODEL.md`。
 
+#### 8.2.5 packed-B 复用的实现条件与 range 成本不对称
+
+8.2.2 的保守映射取 $Q_{\mathrm{shared},B}=2KNP$，即假设每个 M panel 都重新扫一
+遍 packed-B；9.23 的四状态计数取相反极限，假设 B 在后续 panel 上恒为 hot
+（$P-1$ 次 `ch` 加 $(P-1)(Q-1)$ 次 `hh`）。两者都是端点，真实取值由**每线程
+瞬时 packed-B 窗口**决定，而该窗口同时受 team 宽度和 stage window 目标控制。
+
+设某个 stage window 的 packed-B 为 $W_s$ 字节，planner 选定的 window 目标为
+$g_s$，执行该 window 的 team 宽度为 $t$。kernel 按 N 轴把单个 range 切给队内
+线程，因此定义
+
+$$
+\omega(g_s,t)=\frac{g_s}{t},
+\qquad
+R(g_s)=\left\lceil\frac{W_s}{g_s}\right\rceil,
+$$
+
+即**每线程窗口**与 **range 数**。有效重读因子定义为实测有用带宽相对该机器
+峰值有用带宽的倒数：
+
+$$
+p_{\mathrm{eff}}
+=\frac{B^{\ast}}{B_{\mathrm{useful}}(M,\omega,t)},
+\qquad
+1\le p_{\mathrm{eff}}\le\left\lceil\frac{M}{12}\right\rceil .
+$$
+
+上界在 $\omega$ 显著超过私有 L2 且并发活跃窗口超过 LLC 时取到；$M\le12$ 时
+$P=1$，上界退化为 $1$，此时窗口不影响流量。9.24 在 $M=28$ 上实测
+$p_{\mathrm{eff}}$ 随 $\omega$ 从 $4$ MiB 降到 $0.25$ MiB 时由 $2.97$ 单调降到
+$1.22$，并在 $\omega\le0.25$ MiB 后进入平台；$M=12$ 的对照在同一 $\omega$ 域内
+变化不超过 $0.7\%$。
+
+上述 $p_{\mathrm{eff}}$ 由墙钟带宽反推，可用 PMU 直接核对。`l2d_cache_refill`
+统计被填入 L2 的行数（含硬件预取），乘 64 即跨越 L2 边界的字节数。$M=12$ 的
+对照给出该口径的标定：跨 L2 字节数为必需 packed-B 的 $1.02$ 倍，即每字节恰好
+跨一次。$M=28$、$192$ expert、`24x4T` 下扣除不随 $R$ 增长的 A 与 C 之后：
+
+| $\omega$ | 跨 L2 / 必需 B | 反解 $p_{\mathrm{eff}}$ | 墙钟 $p_{\mathrm{eff}}$ |
+| ---: | ---: | ---: | ---: |
+| 1 MiB | 1.87 | 1.83 | 1.75 |
+| 0.25 MiB | 1.19 | 1.15 | 1.22 |
+| 0.0625 MiB | 1.19 | 1.16 | 1.23 |
+
+两者吻合在 $5\%$ 内，故 $p_{\mathrm{eff}}$ 就是 packed-B 在 L2 边界上的重复搬运
+次数，机制为私有 L2 驻留而非 DRAM 带宽。（`ll_cache_miss_rd` 只数需求缺失、
+不含预取，$M=12$ 仅 13 MB 而实际搬运 2.4 GB，故不能用作 DRAM 流量；
+`l3d_cache_refill` 在 Neoverse-V3 上返回 0。因此 LLC 与 DRAM 之间那一段仍未量
+到，但与分离实验对 LLC 容量假设的否证方向一致。）
+
+大 $M$ 处于相反区间，且主导项不是 B。$M=2040$、24 expert、`24x4T` 下把
+$\omega$ 从 $1$ MiB 压到 $0.0625$ MiB，跨 L2 流量由 $6.13$ GB 涨到 $50.37$ GB
+（$8.2$ 倍）；$\omega=1$ MiB 处该流量已是必需 packed-B 的 $21.8$ 倍，说明主体是
+随 $M$ 线性增长的操作数被每个 range 重扫：
+
+$$
+\text{每 range 的 A}=2MK_s,
+\qquad
+\text{每 range 的 B}=g_s\ \text{（与}\ M\ \text{无关）}.
+$$
+
+$M=28$ 的 W13 shared-A 为 $229$ KiB，装得进私有 L2，跨 L2 只搬一次、不随 $R$
+增长；$M=2040$ 为 $16.7$ MB，装不进 L2，于是代价正比于 $R$。由此 $\omega^\ast$
+随 $M$ 单调上升：短 route 侧收益大代价小，长 route 侧收益已接近零而代价随 $R$
+线性增长。定量核对：$M=2040$ 从 $\omega=1$ 到 $0.25$ MiB 时 A 重扫增量预测
+$+6.9$ ms，实测墙钟 $+6.18$ ms，误差 $12\%$。
+
+关键结论是 $p_{\mathrm{eff}}$ 由 $\omega$ 而不是由 $t$ 或 $g_s$ 单独决定。因此
+**加宽 team 与缩小窗口是达到同一 $\omega$ 的两条可互换路径**，在相同 $\omega$ 下
+四种宽度的实测差异只有 $3.0\%$--$5.6\%$。两者仍不完全等价，因为
+
+$$
+R(g_s)\ \text{只随}\ g_s\ \text{变化，不随}\ t\ \text{变化},
+$$
+
+而每个 range 都要重跑完整 M-panel 循环，产生一份与 $R$ 成正比的固定成本
+（range dispatch、A 重扫、team barrier、N-tile 收尾）。$t$ 则通过并发 expert 数
+$C/t$ 影响可达的 memory-level parallelism。于是最优点是内部解：9.24 中
+$4T$ 优于 $1T$ 共 $5.5\%$、优于 $8T$ 共 $3.1\%$。
+
+$\omega$ 描述的是**私有**驻留而非共享 LLC 容量。全核忙时聚合活跃窗口恒为
+$C\omega$，因此只扫 $g_s$ 无法区分两级；固定 $t$ 改变活跃核数 $C$ 可以分离。
+9.24 的分离实验显示：同一聚合窗口下 $p_{\mathrm{eff}}$ 相差 2 倍且严格跟随
+$\omega$，而固定 $\omega$ 时聚合窗口变化 8 倍只使 $p_{\mathrm{eff}}$ 变化
+$1.36$--$1.77$ 倍**且方向与 LLC 容量假设相反**。因此共享 LLC 容量被否证，
+$g(M,t)$ 无需引入活跃核数项；实测有效驻留容量约 $0.25$ MiB/线程，即标称
+$2$ MiB 私有 L2 的约 $1/8$，与 packed A、intermediate 和 C 输出穿透同一 L2 一致。
+残余的 $g(C)$ 项（核数越多 $p_{\mathrm{eff}}$ 越好）机制未定，但符号方向使
+96 核标定在更少活跃核时偏保守。
+
+该修正只改变 8.2.2 中 $Q_{\mathrm{shared},B}$ 与 9.23 四状态计数的**实现条件**，
+不改变算法层公式、planner 候选空间、宽度剪枝或 $g(M,t)$ 的确定性性质。当前
+production 仍使用实测 shape derate 隐式吸收该效应；把 $p_{\mathrm{eff}}(\omega)$
+显式写进 demand 之前，需要按 W13/W2 分离标定并通过 9.14 的 contention/regret
+门槛。
+
+**参数化推论。** 既然不变量是 $\omega$ 而不是 $g_s$，stage-window policy 的输入
+单位就应当是 $\omega$，由 policy 在已知 $t$ 处一次性下降为 $g_s$：
+
+$$
+g_s(\omega,t)=b_s\left\lceil\frac{q_s}{R}\right\rceil,
+\qquad
+R=\min\left\{R:\ b_s\left\lceil\frac{\lceil q_s/R\rceil}{t}\right\rceil\le\omega\right\},
+$$
+
+其中 $b_s,q_s$ 沿用 8.3 的单 tile 字节数与总 tile 数。该下降与 8.3 的
+$\widehat S_s$ 精确互逆，因此 plan、kernel ABI 与 native planner 仍只见整数
+$R$ 与 $g_s$，不引入浮点。可达 $\omega$ 因此量化为 $b_s$ 的整数倍，下界
+$b_s$、上界 $W_s/t$；$T$ 越大可达集越密，这是宽度与窗口存在联合量化耦合的根源。
+
+这个换单位使已标定的 `amazon_c5_192c_tp4_f512_v1` 表从「4 route band $\times$ 4
+宽度 $\times$ 2 stage $=26$ 个 $g_s$」塌缩为「4 band $\times$ 2 stage $=8$ 个
+$\omega$」加 6 个偏差格：band `144--287` 的四种宽度精确同为
+$\omega_{W13}=1/8$ MiB，band `288--575` 有 3/4 宽度同为
+$\omega_{W13}=1/2,\omega_{W2}=1/8$ MiB。这张表当初是按 $(\text{band},t)$ 逐格独立
+搜索得到的，它自己收敛到常数 $\omega$，是 $\omega$ 为不变量的独立证据。6 个偏差
+格全部只差一档 factor-2 且集中在 $t=1$ 与 $t=8$ 的 W2，与本节测得的两端不变性
+最弱一致。
+
+两个 stage 的 $\omega^\ast$ 不相等：W13 的 shared-A 为 $2MH$，W2 为 $2MF$，相差
+$H/F=8$ 倍，故 W2 能承受更多 range、最优 $\omega$ 更小。V1 表在 band
+`288--575` 上实测相差 4 倍，与该比例在一档扫描网格内一致。因此 policy 必须为
+两个 stage 各保留一个标量。
+
+split/no-split 由此成为退化情形而非独立维度：W13 总量 $8$ MiB 时
+$g_{W13}=4$ MiB 即 $R=2$（split），$g_{W13}=8$ MiB 即 $R=1$（no-split），且
+$W2$ 总量 $4$ MiB 使任何 $g\ge4$ MiB 都退化为单 range。profile identity 记录的
+是 achieved $R$，本身无单位，所以两种编码共享同一行标定数据。
+
 ### 8.3 Split-W13 owner-cache 工作集 band
 
 当前 production 默认仍将 W13 分为两个相等 N range，而 W2 使用一个 range。
@@ -3228,6 +3357,98 @@ diagnostic；不修改 production empirical backend、analytic phase service、�
 完整表、命令和误差归因见
 `optimizations/fused_moe_sve/results/amazon_192c_gemm_memory_services_20260802.md`。
 
+### 9.24 短 route packed-B 窗口与每线程窗口不变量
+
+2026-08-06 在 AmazonC5192Cores NUMA0 `0-95` 上标定 8.2.5 的
+$p_{\mathrm{eff}}(\omega)$，并对 production planner 做端到端 A/B。形状为 TP4
+`H=4096/F=512`，每 expert 12 MiB packed BF16，单个 stage window 4 MiB，
+split-W13、SVE JIT exact-M、32 MiB HugeTLB、NUMA-local。每个计时 task 使用不同
+expert，因此 packed-B 始终为流式读取。有用带宽只计一次 compulsory 权重字节；
+本节点实测峰值为 `367.4 GB/s`。
+
+隔离扫描使用 192 个 expert，因为 192 能被全部实测 lane 数（96/48/24/12）整除。
+早前的 195-expert 扫描保留在数据目录中，但不可用于宽度比较：多出的 3 个 task
+使临界路径随 lane 数变化，最多给宽 team 带来 4 个百分点的偏置。
+
+$M=28$（panel 为 `12+12+4`）按相同每线程窗口 $\omega$ 对齐四种宽度，有用 GB/s：
+
+| $\omega$ | `96x1T` | `48x2T` | `24x4T` | `12x8T` |
+| ---: | ---: | ---: | ---: | ---: |
+| 4 MiB | 123.8 | | | |
+| 2 MiB | 133.0 | 128.4 | | |
+| 1 MiB | 203.7 | 203.6 | 209.7 | |
+| 0.5 MiB | 236.1 | 241.7 | 249.4 | 240.5 |
+| 0.25 MiB | 285.0 | 297.7 | 300.8 | 290.8 |
+| 0.125 MiB | | 298.9 | 300.8 | 291.7 |
+| 0.0625 MiB | | | 297.7 | 287.7 |
+| 0.03125 MiB | | | | 280.5 |
+
+同一 $\omega$ 下四种宽度差异为 `3.0%--5.6%`，而 $\omega$ 本身跨越
+`123.8--300.8 GB/s`（`2.43x`）。因此 $\omega$ 是主导变量、宽度是二阶效应。对应
+的 $p_{\mathrm{eff}}$ 为 `2.97/2.76/1.75/1.47/1.22/1.22/1.23`：上界
+$\lceil28/12\rceil=3$ 在 $\omega=4$ MiB 处取到，平台值约 `1.22` 从
+$\omega=0.25$ MiB 开始，残余部分归因于 range dispatch、A 重扫和第三个 `M4`
+panel，不属于 packed-B 重读。
+
+$M=12$ 对照（$P=1$，无 packed-B 复用可保护）：`96x1T` 在
+`legacy/2/1/0.5/0.25 MiB` 下为 `364.7/367.4/366.2/365.4/365.3 GB/s`，极差
+`0.7%`；`24x4T` 仅在 $\omega=0.0625$ MiB 处回退 `4.0%`。因此上表的效应确实来自
+panel 复用，而非通用的窗口尺寸伪影。
+
+全核忙时聚合活跃窗口恒为 $C\omega$，因此只扫 $g_s$ 无法区分私有 L2 与共享 LLC。
+固定 $t=4T$、按 `3/6/12/24` lane 改变活跃核数 $C$（192 experts 对全部 lane 数
+整除），并用同点的 $M=12$ 归一化掉该核数下的 DRAM/MLP 上限，得到
+$p_{\mathrm{eff}}=B_{M12}/B_{M28}$：
+
+| $\omega$ | `C=12` | `C=24` | `C=48` | `C=96` |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 MiB | 2.35 (agg 12 MiB) | 2.11 (24) | 1.81 (48) | 1.73 (96) |
+| 0.5 MiB | 2.64 (6) | 2.19 (12) | 1.68 (24) | 1.46 (48) |
+| 0.25 MiB | 2.14 (3) | 1.76 (6) | 1.25 (12) | 1.21 (24) |
+| 0.125 MiB | 2.12 (1.5) | 1.79 (3) | 1.20 (6) | 1.20 (12) |
+
+共享 LLC 容量假设要求 $p_{\mathrm{eff}}$ 只依赖聚合窗口。实测在聚合 12 MiB 的四个
+组合上为 `2.35/2.19/1.25/1.20`（相差 2 倍）且严格跟随 $\omega$；反之固定 $\omega$
+时聚合变化 8 倍只使 $p_{\mathrm{eff}}$ 变化 `1.36--1.77` 倍，**且聚合压力越大越好**。
+因此该假设以相反符号被否证，$\omega$ 仍是主导变量。两项效应可分离且相乘：
+$C=96$ 下 $\omega$ 由 1 降到 0.125 MiB 给出因子 `1.44`，$\omega=1$ MiB 下 $C$ 由 12
+升到 96 给出因子 `1.36`，预测角点 $2.35/(1.36\times1.44)=1.20$ 与实测
+`(C=96, ω=0.125)` 完全一致。由此得到两个结论：$g(M,t)$ 无需活跃核数项，且 96 核
+标定在更少活跃核时只会偏保守；实测有效驻留容量约 0.25 MiB/线程，即标称 2 MiB
+私有 L2 的约 1/8。残余 $g(C)$ 的机制未定，候选为高内存压力下预取被节流，或
+$M=28$ 的三段 panel 循环固定开销在低 $C$（每 expert 0.437 ms vs 1.436 ms）占比更高
+造成的比值抬升；区分需要 PMU 或独立的每 expert 固定成本标定。
+
+端到端 A/B 使用 production planner、5 warmup 与 31 次交错计时，全部变体在计时前
+与关闭 stage-window policy 的 `legacy` 计划 bit-exact。候选 band 为
+$13\le M\le48$，`1T/2T/4T/8T` 分别取 `0.25/0.5/1/1 MiB`，W13 与 W2 同值，
+$M\le12$ 不覆盖：
+
+| workload | band 内 expert / route | `policy_v1` | 候选 band | 提升 |
+| --- | --- | ---: | ---: | ---: |
+| `dsv4-real-2048-seq70` | 120 / 3314 (27%) | 15.155 ms | 14.116 ms | `+7.36%` |
+| `moe256-uniform` | 256 / 12288 (100%) | 17.000 ms | 13.688 ms | `+24.20%` |
+| `moe256-long-short-bimodal` | 0 / 0 | 11.405 ms | 11.415 ms | `-0.09%` |
+| `moe256-active-set-128` | 0 / 0 | 9.646 ms | 9.630 ms | `+0.17%` |
+| `moe256-tiered-hotspot` | 0 / 0 | 8.379 ms | 8.351 ms | `+0.34%` |
+
+反序交错复测给出 `dsv4 +7.83%` 与 `uniform +25.17%`，与正序差不超过 0.9 个
+百分点。把窗口直接覆盖到 `legacy` 计划上（task 图、宽度、placement 逐字节相同）
+与让 cost model 重新评分在每个 workload 上相差不超过 `0.2%`，且所选 shape、
+execution mode 与 `policy_v1` 完全一致；因此收益全部来自窗口值，不来自候选重搜。
+
+两点边界必须记录。第一，现有 policy 的首个 band 为 `min_routes=49`，而
+`moe256-uniform` 恰好是 $M=48$，因此 `policy_v1` 覆盖 0 个 task、只有 `0.06%`
+收益；这是覆盖缺口而非标定上限。第二，`results/amazon_192c_weight_windows.md`
+给出的"每线程约 1 MiB"最优是在 $M=2040$ 上标定的，那里 A 为每 range 16.7 MB，
+range 增殖代价高；该不变量不能外推到短 route，本节实测的短 route 最优为
+$\omega=0.125$--$0.25$ MiB。
+
+本节只标定 8.2.5 的实现条件，并未改变 production 默认：候选 band 尚未落地，
+默认 policy 仍让 $M<49$ 继承 operator-wide 窗口。落地前还需要 W13/W2 分离的
+二维标定、`16T` 及更宽宽度的覆盖，以及至少一台其他机器/并行度的重复测量。
+完整表、命令、逐次样本和数据文件见
+`optimizations/fused_moe_sve/results/amazon_192c_short_route_stage_windows_20260806.md`.
 ## 10. 同步规则
 
 发生以下任一变化时，必须同步更新本文档：
@@ -3319,3 +3540,4 @@ diagnostic；不修改 production empirical backend、analytic phase service、�
 | 2026-08-02 | v0.63 | 用 V3 top-down PMU 与 48T victim/aggressor 实验归因高核数 L1-hot derate：L1 refill ratio 不增、L2D stall 为 0、频率保持 3.3 GHz；增长来自 CPU-side backend busy 和 vector issue queue full。48 个 register-only aggressor 只使 full-loop victim 中位时间增加 0.42%，48 个 full-loop aggressor 增加 9.01%。因此模型将其定义为 load-to-vector-compute 混合流触发的 socket-wide vector-dispatch backpressure；最终 firmware power/dispatch 机制因无直接计数器仍不作硬编码，production 默认不变。 |
 | 2026-08-02 | v0.64 | 用 M12 双 B 寄存器 column-pipeline 检验局部调度能否关闭 V3 高核数 derate：96T 长窗口吞吐只提升 0.648%，线性效率增加 0.592 个百分点，而 `DISPATCH_STALL_IQ_VX` 增加约 37.5%。该 probe 低于 2% 采用门槛，不进入 production；现有 L1-hot service 和分段 active-core efficiency 结论不变。 |
 | 2026-08-02 | v0.65 | 增加纯 GEMM 四状态 shadow 验证：由 M-panel/N-tile 循环精确计数 cold/cold、hot-A/cold-B、cold-A/hot-B、hot/hot，并用 4T 独立冷权重扫 M12--M2040。M>=192 的总误差不超过 4.85%，但 M24 低估 16.53%，证明状态计数可解释而单组 K728 service cost 不能跨 K、cache level 和固定成本直接线性迁移；新增可重复 profiler/validator，不改变 production backend、phase 公式、候选或剪枝。 |
+| 2026-08-06 | v0.66 | 把 packed-B 复用的实现条件写成每线程窗口 $\omega=g_s/t$ 与 range 数 $R=\lceil W_s/g_s\rceil$ 的函数：有效重读因子 $p_{\mathrm{eff}}\in[1,\lceil M/12\rceil]$ 由 $\omega$ 主导，加宽 team 与缩小窗口是达到同一 $\omega$ 的可互换路径，但只有窗口会乘 $R$ 的固定成本、只有宽度会降低 memory-level parallelism，因此最优点为内部解。这统一了 8.2.2 的 $Q_{\mathrm{shared},B}=2KNP$ 上界与 9.23 四状态计数的 hot-B 下界。AmazonC5192Cores NUMA0 在 $M=28$ 上实测 $p_{\mathrm{eff}}$ 随 $\omega$ 由 2.97 单调降到 1.22（上界 3 在 $\omega=4$ MiB 取到），同 $\omega$ 下四种宽度差异仅 3.0%--5.6%，$M=12$ 对照极差 0.7%。固定 $t$ 改变活跃核数的分离实验以相反符号否证共享 LLC 容量假设：同一聚合窗口下 $p_{\mathrm{eff}}$ 相差 2 倍并跟随 $\omega$，固定 $\omega$ 时聚合变化 8 倍只变 1.36--1.77 倍且压力越大越好，故 $g(M,t)$ 无需活跃核数项，有效驻留容量约为标称私有 L2 的 1/8。production planner 端到端 A/B 中，$13\le M\le48$ 的候选 band 使 `dsv4-real-2048-seq70` 与 `moe256-uniform` 分别提升 7.36% 与 24.20%，三个无 band 内 expert 的 workload 变化不超过 0.34%。公式、候选空间、宽度剪枝与 production 默认 policy 均不变。 |
