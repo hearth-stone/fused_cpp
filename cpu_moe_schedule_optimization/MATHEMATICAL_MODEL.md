@@ -1966,7 +1966,11 @@ $W2$ 总量 $4$ MiB 使任何 $g\ge4$ MiB 都退化为单 range。profile identi
 
 ### 8.3 Split-W13 owner-cache 工作集 band
 
-当前 production 默认仍将 W13 分为两个相等 N range，而 W2 使用一个 range。
+当前 production 默认仍将 W13 分为两个相等 N range，而 W2 使用一个 range。按
+8.2.5 的参数化，这等价于 $g_{W13}=4$ MiB、$g_{W2}=4$ MiB，即 `w13_split` 是
+window 目标的布尔别名而非独立的算法分支：packed 布局与之无关
+（`prepare_fused_moe_bf16_tiled_weights` 不接收该参数），它只改变遍历顺序。
+`weight_window_bytes>0` 会直接取代这个两 panel 粒度。
 对 BF16 的 $H,F$，三个顺序 packed-weight stage 都是：
 
 $$
@@ -3444,11 +3448,21 @@ execution mode 与 `policy_v1` 完全一致；因此收益全部来自窗口值�
 range 增殖代价高；该不变量不能外推到短 route，本节实测的短 route 最优为
 $\omega=0.125$--$0.25$ MiB。
 
-本节只标定 8.2.5 的实现条件，并未改变 production 默认：候选 band 尚未落地，
-默认 policy 仍让 $M<49$ 继承 operator-wide 窗口。落地前还需要 W13/W2 分离的
-二维标定、`16T` 及更宽宽度的覆盖，以及至少一台其他机器/并行度的重复测量。
+该 band 已在 v0.67 落地为 production 默认 `amazon_c5_192c_tp4_f512_v2`，写作
+band 级 $\omega=1/4$ MiB、`widths=(1,2,4,8)`、$t=8$ 取 $1/8$ MiB。落地后在同一
+session 重测的默认对默认提速为 `dsv4-real-2048-seq70` $7.59\%$、
+`moe256-uniform` $24.29\%$；三个无 band 内 expert 的 workload 变化在
+$\pm0.33\%$，而同期 `legacy` 变体（不使用 policy，因此可证明不受影响）自身摆动
+$-0.72\%$--$+0.38\%$，即噪声底高于这三个 workload 的位移。`--reverse-order`
+交叉验证给出 $7.38\%$ 与 $23.67\%$，同量级。
+
+仍未完成的标定有三项：W13/W2 分离的二维标定（当前 band 让两个 stage 共用一个
+$\omega$，故收益是下界）、`16T` 及更宽宽度的覆盖（扩覆盖集会翻转
+`can_use_full_workload_anchor`，必须实测而不能由 $\omega$ 不变性推断），以及至少
+一台其他机器/并行度的重复测量。
 完整表、命令、逐次样本和数据文件见
-`optimizations/fused_moe_sve/results/amazon_192c_short_route_stage_windows_20260806.md`.
+`optimizations/fused_moe_sve/results/amazon_192c_short_route_stage_windows_20260806.md`。
+
 ## 10. 同步规则
 
 发生以下任一变化时，必须同步更新本文档：
@@ -3541,3 +3555,4 @@ $\omega=0.125$--$0.25$ MiB。
 | 2026-08-02 | v0.64 | 用 M12 双 B 寄存器 column-pipeline 检验局部调度能否关闭 V3 高核数 derate：96T 长窗口吞吐只提升 0.648%，线性效率增加 0.592 个百分点，而 `DISPATCH_STALL_IQ_VX` 增加约 37.5%。该 probe 低于 2% 采用门槛，不进入 production；现有 L1-hot service 和分段 active-core efficiency 结论不变。 |
 | 2026-08-02 | v0.65 | 增加纯 GEMM 四状态 shadow 验证：由 M-panel/N-tile 循环精确计数 cold/cold、hot-A/cold-B、cold-A/hot-B、hot/hot，并用 4T 独立冷权重扫 M12--M2040。M>=192 的总误差不超过 4.85%，但 M24 低估 16.53%，证明状态计数可解释而单组 K728 service cost 不能跨 K、cache level 和固定成本直接线性迁移；新增可重复 profiler/validator，不改变 production backend、phase 公式、候选或剪枝。 |
 | 2026-08-06 | v0.66 | 把 packed-B 复用的实现条件写成每线程窗口 $\omega=g_s/t$ 与 range 数 $R=\lceil W_s/g_s\rceil$ 的函数：有效重读因子 $p_{\mathrm{eff}}\in[1,\lceil M/12\rceil]$ 由 $\omega$ 主导，加宽 team 与缩小窗口是达到同一 $\omega$ 的可互换路径，但只有窗口会乘 $R$ 的固定成本、只有宽度会降低 memory-level parallelism，因此最优点为内部解。这统一了 8.2.2 的 $Q_{\mathrm{shared},B}=2KNP$ 上界与 9.23 四状态计数的 hot-B 下界。AmazonC5192Cores NUMA0 在 $M=28$ 上实测 $p_{\mathrm{eff}}$ 随 $\omega$ 由 2.97 单调降到 1.22（上界 3 在 $\omega=4$ MiB 取到），同 $\omega$ 下四种宽度差异仅 3.0%--5.6%，$M=12$ 对照极差 0.7%。固定 $t$ 改变活跃核数的分离实验以相反符号否证共享 LLC 容量假设：同一聚合窗口下 $p_{\mathrm{eff}}$ 相差 2 倍并跟随 $\omega$，固定 $\omega$ 时聚合变化 8 倍只变 1.36--1.77 倍且压力越大越好，故 $g(M,t)$ 无需活跃核数项，有效驻留容量约为标称私有 L2 的 1/8。production planner 端到端 A/B 中，$13\le M\le48$ 的候选 band 使 `dsv4-real-2048-seq70` 与 `moe256-uniform` 分别提升 7.36% 与 24.20%，三个无 band 内 expert 的 workload 变化不超过 0.34%。公式、候选空间、宽度剪枝与 production 默认 policy 均不变。 |
+| 2026-08-07 | v0.67 | 用 PMU 把 $p_{\mathrm{eff}}$ 从墙钟反推升级为直接测量，并据此把 stage-window policy 的输入单位从每 range 字节改为每线程窗口 $\omega$。`l2d_cache_refill`（含硬件预取）在 $M=12$ 对照上给出跨 L2 字节 / 必需 packed-B $=1.02$，标定了口径；$M=28$、`24x4T` 下扣除 A 与 C 后反解的 $p_{\mathrm{eff}}$ 为 $1.83/1.15/1.16$，与墙钟的 $1.75/1.22/1.23$ 吻合在 $5\%$ 内，故该因子就是 packed-B 在 L2 边界上的重复搬运次数。大 $M$ 的主导项被改写：$M=2040$ 缩窗口使跨 L2 流量涨 $8.2$ 倍且在 $\omega=1$ MiB 处已是必需 B 的 $21.8$ 倍，主体是 shared-A（$2MK_s$，W13 在 $M=2040$ 时为 $16.7$ MB、装不进私有 L2）被每 range 重扫，而非 B 复用率；A 重扫增量预测 $+6.9$ ms 对实测 $+6.18$ ms。参数化上给出 $\omega\to g_s$ 的整数反解（与 8.3 的 $\widehat S_s$ 精确互逆，plan 与 kernel ABI 仍只见整数 $R$），可达 $\omega$ 量化为 $b_s$ 的整数倍、下界 $b_s$、上界 $W_s/t$。已标定的 V1 表由此从 26 个 $g_s$ 塌缩为 8 个 $\omega$ 加 6 个只差一档的偏差格——该表当初按 $(\text{band},t)$ 逐格独立搜索却自行收敛到常数 $\omega$，构成 $\omega$ 为不变量的独立证据。两个 stage 的 $\omega^\ast$ 因 shared-A 相差 $H/F=8$ 倍而不相等，故各保留一个标量。split/no-split 降级为 $g_{W13}\in\{4,8\}$ MiB 的退化情形，identity 记录的 achieved $R$ 无单位、两种编码共享标定数据。production 默认升级到 `amazon_c5_192c_tp4_f512_v2`，新增 $13\le M\le48$ band（$\omega=1/4$ MiB，`widths=(1,2,4,8)`，$t=8$ 取 $1/8$ MiB）：`dsv4-real-2048-seq70` 提速 $7.59\%$、`moe256-uniform` 提速 $24.29\%$，三个无 band 内 expert 的 workload 变化在 $\pm0.33\%$ 而同期 legacy 变体自身摆动 $-0.72\%$--$+0.38\%$。公式、候选空间与宽度剪枝不变。 |

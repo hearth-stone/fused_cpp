@@ -348,6 +348,33 @@ AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V1 = StaticStageWindowPolicy(
 AMAZON_C5_192C_NUMA0_TP4_F512_STAGE_WINDOWS_V1 = AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V1
 
 
+# Short-route band added in V2. V1 had no band below 49 routes, so every expert
+# with M < 49 inherited the operator-wide legacy split-W13 window: two 4 MiB W13
+# ranges and one 4 MiB W2 range, which is 1 MiB per thread at 4T and 4 MiB at 1T.
+# Isolated sweeps on this host show short-route experts lose a large share of
+# their useful packed-B bandwidth there, because each additional M12 panel
+# re-reads the whole window and only two panels' worth of reuse is available to
+# amortise the fill.
+AMAZON_C5_192C_TP4_F512_SHORT_ROUTE_BAND = StageWindowBand(
+    min_routes=13,
+    max_routes=48,
+    widths=(1, 2, 4, 8),
+    w13_bytes_per_thread=MIB // 4,
+    w2_bytes_per_thread=MIB // 4,
+    thread_overrides=((8, MIB // 8, MIB // 8),),
+)
+
+AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V2 = StaticStageWindowPolicy(
+    name="amazon_c5_192c_tp4_f512_v2",
+    hidden_size=4096,
+    intermediate_size=512,
+    backend_n_tile=8,
+    bands=(
+        AMAZON_C5_192C_TP4_F512_SHORT_ROUTE_BAND,
+        *AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V1.bands,
+    ),
+)
+
 def default_task_stage_window_policy(
     profile: StageWindowProfilePolicy | None,
     *,
@@ -386,12 +413,14 @@ def default_task_stage_window_policy(
         return None
     if tuple(int(cpu) for cpu in cpu_ids) not in profile.cpu_ids_by_rank:
         return None
-    return AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V1
+    return AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V2
 
 
 __all__ = [
     "AMAZON_C5_192C_NUMA0_TP4_F512_STAGE_WINDOWS_V1",
+    "AMAZON_C5_192C_TP4_F512_SHORT_ROUTE_BAND",
     "AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V1",
+    "AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V2",
     "INHERIT_STAGE_WINDOW",
     "StageWindowBand",
     "StageWindowPolicyEntry",

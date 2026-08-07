@@ -26,7 +26,9 @@ from profile_catalog import (  # noqa: E402
 )
 from simulate_schedules import PRESETS  # noqa: E402
 from stage_window_policy import (  # noqa: E402
+    AMAZON_C5_192C_TP4_F512_SHORT_ROUTE_BAND,
     AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V1,
+    AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V2,
     INHERIT_STAGE_WINDOW,
     StageWindowBand,
     StaticStageWindowPolicy,
@@ -718,6 +720,27 @@ def test_stage_window_v1_coverage_set_unchanged() -> None:
             assert inherited is not in_band, (routes, threads)
 
 
+def test_stage_window_v2_adds_short_route_band_without_touching_v1() -> None:
+    """V2 is V1 plus one band, so nothing at 49 routes or above may move."""
+    v1 = AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V1
+    v2 = AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V2
+
+    assert v2.bands[0] is AMAZON_C5_192C_TP4_F512_SHORT_ROUTE_BAND
+    assert v2.bands[1:] == v1.bands
+
+    for routes in (12, 49, 95, 96, 143, 144, 287, 288, 575, 576, 2040):
+        for threads in STAGE_WIDTHS:
+            assert v2.select(routes, threads) == v1.select(routes, threads), (routes, threads)
+
+    # The band lowers to the per-range budgets the isolated sweep measured.
+    expected = {1: (MIB // 4, MIB // 4), 2: (MIB // 2, MIB // 2), 4: (1 * MIB, 1 * MIB), 8: (1 * MIB, 1 * MIB)}
+    for threads, windows in expected.items():
+        assert v2.select(13, threads) == windows
+        assert v2.select(48, threads) == windows
+    for threads in (16, 32):
+        assert v2.select(24, threads) == (INHERIT_STAGE_WINDOW, INHERIT_STAGE_WINDOW)
+
+
 def test_stage_window_band_rejects_invalid_shapes() -> None:
     valid = {"min_routes": 10, "max_routes": 20, "widths": (1, 2)}
 
@@ -1121,7 +1144,7 @@ def test_default_stage_window_policy_requires_exact_profile(
             num_cores=96,
             cpu_ids=cpu_ids_by_rank[0],
         )
-        is AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V1
+        is AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V2
     )
     assert (
         default_task_stage_window_policy(
@@ -1129,7 +1152,7 @@ def test_default_stage_window_policy_requires_exact_profile(
             num_cores=96,
             cpu_ids=cpu_ids_by_rank[1],
         )
-        is AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V1
+        is AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V2
     )
     assert (
         default_task_stage_window_policy(

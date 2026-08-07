@@ -14,19 +14,18 @@ This benchmark measures whether closing that gap survives end to end:
     Production auto plan with the stage-window policy disabled. This is the
     historical comparator.
 
-``policy_v1``
-    Production auto plan with the calibrated default policy, which leaves
-    ``M < 49`` on the inherited window.
+``policy``
+    Production auto plan with the calibrated default policy. Since V2 this
+    includes the ``13 <= M <= 48`` band, so the cost model re-scores every
+    candidate with the short-route windows lowered.
 
-``manual_ext``
-    The ``legacy`` plan with short-route windows applied post hoc. The task
-    graph, widths and placement are byte-identical to ``legacy``, so this
-    isolates the window effect from any planner re-search.
-
-``policy_ext``
-    Production auto plan with the extended policy, so the cost model re-scores
-    every candidate with the short-route windows lowered. This is what a
-    production policy change would actually do.
+``manual``
+    The ``legacy`` plan with the short-route band's windows applied post hoc. The
+    task graph, widths and placement are byte-identical to ``legacy``, so this
+    isolates the window effect from any planner re-search. Widening a band's
+    coverage disables the cost model's full-workload anchor for the widths it
+    adds, which can move the chosen shape, so keeping the two apart stays useful
+    whenever the table changes.
 """
 
 from __future__ import annotations
@@ -60,10 +59,8 @@ from fused_cpp.moe import (  # noqa: E402
 from phase_model import ContentionCostModel  # noqa: E402
 from planned_moe import PlannedMoE  # noqa: E402
 from stage_window_policy import (  # noqa: E402
-    AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V1,
-    MIB,
-    StageWindowBand,
-    StaticStageWindowPolicy,
+    AMAZON_C5_192C_TP4_F512_SHORT_ROUTE_BAND,
+    AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V2,
 )
 from workload_catalog import default_offline_workloads  # noqa: E402
 
@@ -76,40 +73,21 @@ DEFAULT_PROFILE = (
     / "contention_async_amazon_c5_192c_dual_numa_tp4_sve_F512_E256_splitw13_schema_v2_xbyak_exactm_20260727.json"
 )
 
-# Isolated NUMA0 optima from profile_heterogeneous_overlap.py at M=18 and M=28,
-# expressed as the per-thread window the sweep actually held constant. W13 and W2
-# share one target because the probe swept a single byte budget.
-SHORT_ROUTE_MIN = 13
-SHORT_ROUTE_MAX = 48
-SHORT_ROUTE_WIDTHS = (1, 2, 4, 8)
 STAGE_GEOMETRY = {"hidden_size": 4096, "intermediate_size": 512, "backend_n_tile": 8}
+SHORT_ROUTE_BAND = AMAZON_C5_192C_TP4_F512_SHORT_ROUTE_BAND
+SHORT_ROUTE_MIN = SHORT_ROUTE_BAND.min_routes
+SHORT_ROUTE_MAX = SHORT_ROUTE_BAND.max_routes
 
-EXTENDED_POLICY = StaticStageWindowPolicy(
-    name="amazon_c5_192c_tp4_f512_short_route_ext_v1",
-    bands=(
-        StageWindowBand(
-            min_routes=SHORT_ROUTE_MIN,
-            max_routes=SHORT_ROUTE_MAX,
-            widths=SHORT_ROUTE_WIDTHS,
-            w13_bytes_per_thread=MIB // 4,
-            w2_bytes_per_thread=MIB // 4,
-            thread_overrides=((8, MIB // 8, MIB // 8),),
-        ),
-        *AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V1.bands,
-    ),
-    **STAGE_GEOMETRY,
-)
-
-# Derived from the policy so ``manual_ext`` and ``policy_ext`` cannot drift apart.
+# Lowered from the production band so ``manual`` cannot drift from ``policy``.
 SHORT_ROUTE_WINDOWS: dict[int, tuple[int, int]] = {
-    threads: EXTENDED_POLICY.select(SHORT_ROUTE_MIN, threads) for threads in SHORT_ROUTE_WIDTHS
+    threads: AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V2.select(SHORT_ROUTE_MIN, threads)
+    for threads in SHORT_ROUTE_BAND.widths
 }
 
 LEGACY = "legacy"
-POLICY_V1 = "policy_v1"
-MANUAL_EXT = "manual_ext"
-POLICY_EXT = "policy_ext"
-VARIANTS = (LEGACY, POLICY_V1, MANUAL_EXT, POLICY_EXT)
+POLICY = "policy"
+MANUAL = "manual"
+VARIANTS = (LEGACY, POLICY, MANUAL)
 
 
 def short_route_window(routes: int, threads: int) -> tuple[int, int] | None:
@@ -205,19 +183,18 @@ def main() -> int:
 
     planners = {
         LEGACY: PlannedMoE(model, args.threads, cpu_ids=cpu_ids, use_default_stage_window_policy=False),
-        POLICY_V1: PlannedMoE(model, args.threads, cpu_ids=cpu_ids),
-        POLICY_EXT: PlannedMoE(model, args.threads, cpu_ids=cpu_ids, task_stage_window_policy=EXTENDED_POLICY),
+        POLICY: PlannedMoE(model, args.threads, cpu_ids=cpu_ids),
     }
     specs = {name: planner.plan_spec_for(counts) for name, planner in planners.items()}
     metadata = {name: dict(planner.last) for name, planner in planners.items()}
 
     bridges = {name: spec["bridge"] for name, spec in specs.items()}
-    bridges[MANUAL_EXT], manual_overridden = apply_short_route_windows(bridges[LEGACY], routes_by_expert)
-    specs[MANUAL_EXT] = dict(specs[LEGACY])
-    metadata[MANUAL_EXT] = dict(metadata[LEGACY])
-    metadata[MANUAL_EXT]["overridden_tasks"] = manual_overridden
+    bridges[MANUAL], manual_overridden = apply_short_route_windows(bridges[LEGACY], routes_by_expert)
+    specs[MANUAL] = dict(specs[LEGACY])
+    metadata[MANUAL] = dict(metadata[LEGACY])
+    metadata[MANUAL]["overridden_tasks"] = manual_overridden
 
-    for name in (POLICY_V1, POLICY_EXT):
+    for name in (POLICY,):
         pairs = list(zip(bridges[name]["task_w13_window_bytes"], bridges[name]["task_w2_window_bytes"]))
         metadata[name]["overridden_tasks"] = sum(w13 >= 0 or w2 >= 0 for w13, w2 in pairs)
         metadata[name]["window_pairs"] = sorted({f"{w13}:{w2}" for w13, w2 in pairs if w13 >= 0 or w2 >= 0})
@@ -350,7 +327,7 @@ def main() -> int:
                 "short_route_routes": short_route_routes,
             },
             "policy": {
-                "name": EXTENDED_POLICY.name,
+                "name": AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V2.name,
                 "short_route_windows": {str(k): list(v) for k, v in SHORT_ROUTE_WINDOWS.items()},
             },
             "measurement": {

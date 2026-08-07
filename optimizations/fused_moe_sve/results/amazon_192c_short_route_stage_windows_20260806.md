@@ -238,3 +238,40 @@ Two earlier conclusions in this repository need to be read with this result.
   per-thread window is small enough. The `M24` underprediction of `16.53%`
   recorded there is consistent with `p_eff = 2` at the window used.
 
+## Landed
+
+The band is now the production default. On 2026-08-07 the policy input unit
+changed from per-range bytes to the per-thread window, which is the invariant
+these sweeps measured. The calibrated table collapsed from 26 per-range numbers
+to 8 per-thread windows plus 6 cells that sit one factor-of-two step away, and
+the short-route band landed as `amazon_c5_192c_tp4_f512_v2`. Two independent
+confirmations came out of that work:
+
+- PMU. `l2d_cache_refill` times 64 measures bytes crossing into L2 and does
+  include hardware prefetches, which the `M=12` control verifies: crossing bytes
+  over compulsory packed-B is `1.02`. At `M=28`, `24x4T`, after subtracting the
+  A and C traffic that does not grow with the range count, the counter gives
+  `p_eff = 1.83 / 1.15 / 1.16` against `1.75 / 1.22 / 1.23` from wall time. So
+  `p_eff` is literally the number of times packed B crosses the L2 boundary.
+- The large-`M` regime is dominated by A, not B. At `M=2040`, `24x4T`, shrinking
+  the per-thread window from `1 MiB` to `0.0625 MiB` raises L2-boundary traffic
+  from `6.13 GB` to `50.37 GB`, and even at `1 MiB` that traffic is already
+  `21.8x` the compulsory packed-B. Per-range A is `2*M*K`, which is `229 KiB`
+  for W13 at `M=28` and stays resident, versus `16.7 MB` at `M=2040`, which does
+  not. That asymmetry, not the B reuse rate, is why the optimal window rises
+  with `M`.
+
+Re-measured default against default in one session on the same extension:
+
+| preset | V1 default | V2 default | speedup | legacy noise |
+| --- | ---: | ---: | ---: | ---: |
+| dsv4-real-2048-seq70 | 15.156 ms | 14.087 ms | **+7.59%** | -0.21% |
+| moe256-uniform | 16.983 | 13.664 | **+24.29%** | +0.38% |
+| moe256-long-short-bimodal | 11.453 | 11.421 | +0.28% | -0.72% |
+| moe256-active-set-128 | 9.612 | 9.639 | -0.28% | -0.50% |
+| moe256-tiered-hotspot | 8.348 | 8.321 | +0.33% | +0.10% |
+
+The `legacy` variant does not use the policy at all, so its own session-to-session
+swing bounds the noise floor, and it is larger than the movement on the three
+presets with no in-band expert. `--reverse-order` gives `7.38%` and `23.67%`.
+
