@@ -29,6 +29,7 @@ from stage_window_policy import (  # noqa: E402
     AMAZON_C5_192C_TP4_F512_SHORT_ROUTE_BAND,
     AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V1,
     AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V2,
+    AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V3,
     INHERIT_STAGE_WINDOW,
     StageWindowBand,
     StaticStageWindowPolicy,
@@ -741,6 +742,33 @@ def test_stage_window_v2_adds_short_route_band_without_touching_v1() -> None:
         assert v2.select(24, threads) == (INHERIT_STAGE_WINDOW, INHERIT_STAGE_WINDOW)
 
 
+def test_stage_window_v3_fills_the_mid_route_band_without_moving_v2_cells() -> None:
+    """V3 only adds 49-95 at 1, 2 and 4 threads; every other cell is frozen."""
+    v1 = AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V1
+    v2 = AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V2
+    v3 = AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V3
+
+    # The 8-thread cell V1 calibrated is reproduced byte for byte.
+    assert v3.select(72, 8) == v1.select(72, 8) == (1 * MIB, 1 * MIB)
+
+    # The three new cells are the isolated optima measured at M=72.
+    assert v3.worker_windows(72, 1) == (MIB // 8, MIB // 8)
+    assert v3.worker_windows(72, 2) == (MIB // 8, MIB // 8)
+    assert v3.worker_windows(72, 4) == (MIB // 16, MIB // 16)
+    for threads in (1, 2, 4):
+        assert v1.select(72, threads) == (INHERIT_STAGE_WINDOW, INHERIT_STAGE_WINDOW)
+
+    # Widths above 8 stay inherited: the legacy 4 MiB range divided by a wide team
+    # already lands near the optimum, so there is much less to gain there.
+    for threads in (16, 32):
+        assert v3.select(72, threads) == (INHERIT_STAGE_WINDOW, INHERIT_STAGE_WINDOW)
+
+    # Nothing outside the 49-95 band moves.
+    for routes in (13, 28, 48, 96, 120, 143, 144, 287, 288, 575, 576, 2040):
+        for threads in STAGE_WIDTHS:
+            assert v3.select(routes, threads) == v2.select(routes, threads), (routes, threads)
+
+
 def test_stage_window_band_rejects_invalid_shapes() -> None:
     valid = {"min_routes": 10, "max_routes": 20, "widths": (1, 2)}
 
@@ -1144,7 +1172,7 @@ def test_default_stage_window_policy_requires_exact_profile(
             num_cores=96,
             cpu_ids=cpu_ids_by_rank[0],
         )
-        is AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V2
+        is AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V3
     )
     assert (
         default_task_stage_window_policy(
@@ -1152,7 +1180,7 @@ def test_default_stage_window_policy_requires_exact_profile(
             num_cores=96,
             cpu_ids=cpu_ids_by_rank[1],
         )
-        is AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V2
+        is AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V3
     )
     assert (
         default_task_stage_window_policy(

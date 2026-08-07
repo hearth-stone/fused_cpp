@@ -322,3 +322,53 @@ keeps the legacy shape and changes only windows, regresses from 13.686 to
 13.803 ms. The gain is below the 2% adoption threshold and that shape has no
 isolated calibration at this window, so it is not landed.
 
+## Result 5: the legacy geometry already divides by the team width
+
+Holding the per-thread window fixed and sweeping the team width shows the
+invariance measured at 1 to 8 threads does not extend further:
+
+| t | M=28 at 0.25 MiB/thread | M=120 at 0.125 MiB/thread |
+| ---: | ---: | ---: |
+| 1 | 288.3 GB/s (-4.2%) | 153.6 GB/s (-11.4%) |
+| 2 | 296.2 (-1.6%) | 162.8 (-6.1%) |
+| 4 | **300.9** | **173.4** |
+| 8 | 295.0 (-2.0%) | 166.6 (-3.9%) |
+| 16 | 261.9 (**-13.0%**) | 139.2 (**-19.7%**) |
+| 32 | 219.7 (**-27.0%**) | 105.7 (**-39.0%**) |
+
+Beyond 8 threads the width itself costs more than any window can recover, most
+likely through intra-team synchronisation and the collapse in concurrent experts
+to 6 or 3. So a per-thread window is not transferable to 16 and 32 threads.
+
+That turns out not to matter, because the operator-wide legacy geometry is itself
+a per-thread window that shrinks with the team:
+
+```
+split-W13 gives one 4 MiB W13 range and one 4 MiB W2 range, so
+omega = 4 MiB / t:  t=1 -> 4 MiB,  t=2 -> 2,  t=4 -> 1,
+                    t=8 -> 0.5,    t=16 -> 0.25,  t=32 -> 0.125
+```
+
+Wide teams were therefore never in the bad regime. Measured against legacy at
+those widths, the best window is worth only `+2.4%` (M=28, 16T), `+0.8%`
+(M=28, 32T), `+4.2%` (M=120, 16T) and `+8.5%` (M=120, 32T, where legacy at
+0.125 MiB is now slightly *too small*). Widths 16 and 32 are left inherited.
+
+The real hole was the narrow end of the `49-95` band, which V1 calibrated at 8
+threads only. At `M=72`, legacy against the best window:
+
+| t | legacy | best window | best omega | gain |
+| ---: | ---: | ---: | :--- | ---: |
+| 1 | 63.2 GB/s | 214.1 | 0.125 MiB | **3.39x** |
+| 2 | 79.1 | 232.4 | 0.125 | **2.94x** |
+| 4 | 147.6 | 243.9 | 0.0625 | **1.65x** |
+| 8 | 170.7 | 233.7 | 0.0625 | 1.37x (V1 uses 0.125, worth 1.35x) |
+
+`amazon_c5_192c_tp4_f512_v3` fills the three narrow cells at the measured optima
+and leaves the 8-thread cell exactly as V1 calibrated it. No preset in the
+catalog plans a 49-95 route expert at 1, 2 or 4 threads, so V2 and V3 build
+element-identical plans on all five presets; the wall-clock differences of at
+most 1.26% are noise by construction. The value is latent: those cells now have
+a calibrated window instead of a 32x-too-large inherited one, and the cost model
+no longer scores them with the full-workload anchor.
+

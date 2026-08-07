@@ -3510,6 +3510,35 @@ $\omega_{W13}$ 与 $\omega_{W2}$ 做叉乘。per-task stage window 只存在于 
 数据在 `optimizations/fused_moe_sve/results/data/stage_window_omega_20260807/w2_2d_m{13,28,48,120,320}.json`
 与 `w13_eighth_{preset}.json`。
 
+#### 9.26 宽度不变性的边界与 legacy 几何的自动缩放
+
+8.2.5 的 $\omega$ 不变性是在 `1T`--`8T` 上测的。固定 $\omega$ 扫六个宽度显示它不能
+外推：$M=28$ 在 $\omega=0.25$ MiB 下由 `4T` 峰值到 `16T`/`32T` 分别掉
+$13.0\%$/$27.0\%$，$M=120$ 在 $\omega=0.125$ MiB 下掉 $19.7\%$/$39.0\%$，而
+`1T`--`8T` 的极差只有 $4.2\%$/$11.4\%$。超过 8 线程后宽度本身的代价（队内同步、
+并发 expert 数塌到 6 或 3）超过窗口能挽回的量，因此 $\omega$ 在宽 team 上不是
+可迁移量。
+
+这一点不影响 policy，因为**operator-wide legacy 几何本身就是一个随宽度缩小的每
+线程窗口**：split-W13 给出一个 $4$ MiB 的 W13 range 与一个 $4$ MiB 的 W2 range，
+故 $\omega_{\text{legacy}}=4\ \mathrm{MiB}/t$，即 `1T` 为 $4$ MiB 而 `32T` 为
+$0.125$ MiB。宽 team 从来不在病态区：在 `16T`/`32T` 上最优窗口相对 legacy 只值
+$+2.4\%$/$+0.8\%$（$M=28$）与 $+4.2\%$/$+8.5\%$（$M=120$，此时 legacy 的
+$0.125$ MiB 反而略偏小）。因此 `16T` 及更宽宽度保持继承。
+
+真正的空洞在 `49--95` band 的窄端——V1 只标定了 `8T`。$M=72$ 上 legacy 对最优
+窗口为 `1T` $3.39\times$、`2T` $2.94\times$、`4T` $1.65\times$，因为那里
+$\omega_{\text{legacy}}$ 分别是 $4$/$2$/$1$ MiB，比最优大 $32$--$16$ 倍。
+`amazon_c5_192c_tp4_f512_v3` 用实测最优（`1T`/`2T` 取 $1/8$ MiB，`4T` 取
+$1/16$ MiB）补齐这三格，`8T` 逐字节保持 V1 的标定值。catalog 里没有 preset 会把
+$49\le M\le95$ 的 expert 排到 8 线程以下，因此 V2 与 V3 在五个 preset 上生成
+**逐元素相同的 plan**，墙钟差异（最大 $1.26\%$）按定义是噪声。收益是潜在的：这三
+格现在有标定窗口而不是大 $32$ 倍的继承值，且 cost model 不再用 full-workload
+anchor 给它们评分。
+
+数据在 `optimizations/fused_moe_sve/results/data/stage_window_omega_20260807/omega_inv_m{28,120}_t{1,2,4,8,16,32}.json`、
+`wide_m{28,120}_t{16,32}.json`、`band4995_m72_t{1,2,4,8}.json` 与 `v3_{preset}.json`。
+
 ## 10. 同步规则
 
 发生以下任一变化时，必须同步更新本文档：
@@ -3604,3 +3633,4 @@ $\omega_{W13}$ 与 $\omega_{W2}$ 做叉乘。per-task stage window 只存在于 
 | 2026-08-06 | v0.66 | 把 packed-B 复用的实现条件写成每线程窗口 $\omega=g_s/t$ 与 range 数 $R=\lceil W_s/g_s\rceil$ 的函数：有效重读因子 $p_{\mathrm{eff}}\in[1,\lceil M/12\rceil]$ 由 $\omega$ 主导，加宽 team 与缩小窗口是达到同一 $\omega$ 的可互换路径，但只有窗口会乘 $R$ 的固定成本、只有宽度会降低 memory-level parallelism，因此最优点为内部解。这统一了 8.2.2 的 $Q_{\mathrm{shared},B}=2KNP$ 上界与 9.23 四状态计数的 hot-B 下界。AmazonC5192Cores NUMA0 在 $M=28$ 上实测 $p_{\mathrm{eff}}$ 随 $\omega$ 由 2.97 单调降到 1.22（上界 3 在 $\omega=4$ MiB 取到），同 $\omega$ 下四种宽度差异仅 3.0%--5.6%，$M=12$ 对照极差 0.7%。固定 $t$ 改变活跃核数的分离实验以相反符号否证共享 LLC 容量假设：同一聚合窗口下 $p_{\mathrm{eff}}$ 相差 2 倍并跟随 $\omega$，固定 $\omega$ 时聚合变化 8 倍只变 1.36--1.77 倍且压力越大越好，故 $g(M,t)$ 无需活跃核数项，有效驻留容量约为标称私有 L2 的 1/8。production planner 端到端 A/B 中，$13\le M\le48$ 的候选 band 使 `dsv4-real-2048-seq70` 与 `moe256-uniform` 分别提升 7.36% 与 24.20%，三个无 band 内 expert 的 workload 变化不超过 0.34%。公式、候选空间、宽度剪枝与 production 默认 policy 均不变。 |
 | 2026-08-07 | v0.67 | 用 PMU 把 $p_{\mathrm{eff}}$ 从墙钟反推升级为直接测量，并据此把 stage-window policy 的输入单位从每 range 字节改为每线程窗口 $\omega$。`l2d_cache_refill`（含硬件预取）在 $M=12$ 对照上给出跨 L2 字节 / 必需 packed-B $=1.02$，标定了口径；$M=28$、`24x4T` 下扣除 A 与 C 后反解的 $p_{\mathrm{eff}}$ 为 $1.83/1.15/1.16$，与墙钟的 $1.75/1.22/1.23$ 吻合在 $5\%$ 内，故该因子就是 packed-B 在 L2 边界上的重复搬运次数。大 $M$ 的主导项被改写：$M=2040$ 缩窗口使跨 L2 流量涨 $8.2$ 倍且在 $\omega=1$ MiB 处已是必需 B 的 $21.8$ 倍，主体是 shared-A（$2MK_s$，W13 在 $M=2040$ 时为 $16.7$ MB、装不进私有 L2）被每 range 重扫，而非 B 复用率；A 重扫增量预测 $+6.9$ ms 对实测 $+6.18$ ms。参数化上给出 $\omega\to g_s$ 的整数反解（与 8.3 的 $\widehat S_s$ 精确互逆，plan 与 kernel ABI 仍只见整数 $R$），可达 $\omega$ 量化为 $b_s$ 的整数倍、下界 $b_s$、上界 $W_s/t$。已标定的 V1 表由此从 26 个 $g_s$ 塌缩为 8 个 $\omega$ 加 6 个只差一档的偏差格——该表当初按 $(\text{band},t)$ 逐格独立搜索却自行收敛到常数 $\omega$，构成 $\omega$ 为不变量的独立证据。两个 stage 的 $\omega^\ast$ 因 shared-A 相差 $H/F=8$ 倍而不相等，故各保留一个标量。split/no-split 降级为 $g_{W13}\in\{4,8\}$ MiB 的退化情形，identity 记录的 achieved $R$ 无单位、两种编码共享标定数据。production 默认升级到 `amazon_c5_192c_tp4_f512_v2`，新增 $13\le M\le48$ band（$\omega=1/4$ MiB，`widths=(1,2,4,8)`，$t=8$ 取 $1/8$ MiB）：`dsv4-real-2048-seq70` 提速 $7.59\%$、`moe256-uniform` 提速 $24.29\%$，三个无 band 内 expert 的 workload 变化在 $\pm0.33\%$ 而同期 legacy 变体自身摆动 $-0.72\%$--$+0.38\%$。公式、候选空间与宽度剪枝不变。 |
 | 2026-08-07 | v0.68 | 用 `--small-w2-window-sweep` 把 $\omega_{W13}$ 与 $\omega_{W2}$ 做叉乘标定（per-task stage window 只在 Plan V2 存在，故该模式改走 `fused_moe_bf16_tiled_async_plan`），在 `24x4T`、192 同构 expert、$M\in\{13,28,48,120,320\}$ 上得到三项结论。其一，$M=28/120/320$ 的二维最优**精确等于**已标定 band 的 $(\omega_{W13},\omega_{W2})$，而那些值当初是按每 range 字节逐格搜索的，构成对标定表与 $\omega$ 参数化的独立验证。其二，$\omega_{W13}$ 是强轴（偏离一档损失 $3\%$--$30\%$）而 $\omega_{W2}$ 是弱轴（固定最优 $\omega_{W13}$ 后极差多在 $1.5\%$ 内，较大极差全部来自 $\omega_{W2}=1/2$ MiB 的悬崖），因此 v0.67 中"两 stage 共用一个 $\omega$ 使收益成为下界"的保留撤销。其三，$H/F=8$ 的 shared-A 论证只在 $M=320$ 成立（$4$ 倍差），$M=120$ 两者相等，$M\le48$ 时 W2 反而偏好更大的 $\omega$——此时两 stage 的 shared-A 均为 $13$--$393$ KiB、都装得进私有 L2，A 重扫项可忽略，短 route 侧的 $\omega_{W2}^\ast$ 机制未识别但效应 $\le1.5\%$。`13--48` band 的 $\omega_{W13}$ 保持 $1/4$ MiB：$M=13/48$ 的孤立最优 $1/8$ MiB 好 $1.36\%$/$2.95\%$，但 $M=28$ 最优为现值，且端到端只在 `moe256-uniform` 上因 cost model 把 shape 从 `8T` 翻到 `1T` 而得 $+1.33\%$（同次运行里固定 shape 的 `manual` 变体反而退化 $0.85\%$），低于 2% 采用门槛且该形状无孤立标定支撑。production 默认、公式与候选空间均不变。 |
+| 2026-08-07 | v0.69 | 界定 $\omega$ 不变性的宽度边界并据此补齐 `49--95` band 的窄端。固定 $\omega$ 扫六个宽度显示不变性只在 `1T`--`8T` 成立（极差 $4.2\%$/$11.4\%$）：$M=28$ 在 $\omega=0.25$ MiB 下 `16T`/`32T` 相对 `4T` 峰值掉 $13.0\%$/$27.0\%$，$M=120$ 在 $\omega=0.125$ MiB 下掉 $19.7\%$/$39.0\%$，超过 8 线程后队内同步与并发 expert 数塌到 6/3 的代价超过窗口收益。这不影响 policy，因为 operator-wide legacy 几何本身是 $\omega_{\text{legacy}}=4\ \mathrm{MiB}/t$——`1T` 为 $4$ MiB 而 `32T` 为 $0.125$ MiB，宽 team 从来不在病态区：`16T`/`32T` 上最优窗口相对 legacy 只值 $+2.4\%$/$+0.8\%$（$M=28$）与 $+4.2\%$/$+8.5\%$（$M=120$），故这两个宽度保持继承。真正的空洞是 `49--95` band 只标定了 `8T`：$M=72$ 上 legacy 对最优窗口为 `1T` $3.39\times$、`2T` $2.94\times$、`4T` $1.65\times$，因为 $\omega_{\text{legacy}}$ 在那里是 $4$/$2$/$1$ MiB、比最优大 $32$--$16$ 倍。production 默认升级到 `amazon_c5_192c_tp4_f512_v3`，用实测最优补齐三格（`1T`/`2T` 取 $1/8$ MiB，`4T` 取 $1/16$ MiB），`8T` 逐字节保持 V1 值。catalog 无 preset 会把 $49\le M\le95$ 的 expert 排到 8 线程以下，故 V2 与 V3 在五个 preset 上生成逐元素相同的 plan、墙钟差异按定义是噪声；收益是潜在的，且 cost model 不再用 full-workload anchor 给这三格评分。公式、候选空间与宽度剪枝不变。 |

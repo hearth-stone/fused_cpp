@@ -375,6 +375,35 @@ AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V2 = StaticStageWindowPolicy(
     ),
 )
 
+
+# V1 calibrated the 49-95 band at 8 threads only, leaving narrower teams on the
+# operator-wide legacy geometry. That geometry divides one 4 MiB range across the
+# team, so its per-thread window is 4 MiB / t: near the measured optimum at 16 and
+# 32 threads, but 32x to 8x too large at 1 to 4 threads. Filling those three cells
+# is worth 1.65x to 3.39x of isolated useful packed-B bandwidth at M=72. The 8
+# thread cell is left exactly as V1 calibrated it.
+AMAZON_C5_192C_TP4_F512_MID_ROUTE_BAND_V3 = StageWindowBand(
+    min_routes=49,
+    max_routes=95,
+    widths=(1, 2, 4, 8),
+    w13_bytes_per_thread=MIB // 8,
+    w2_bytes_per_thread=MIB // 8,
+    thread_overrides=((4, MIB // 16, MIB // 16),),
+)
+
+AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V3 = StaticStageWindowPolicy(
+    name="amazon_c5_192c_tp4_f512_v3",
+    hidden_size=4096,
+    intermediate_size=512,
+    backend_n_tile=8,
+    bands=(
+        AMAZON_C5_192C_TP4_F512_SHORT_ROUTE_BAND,
+        AMAZON_C5_192C_TP4_F512_MID_ROUTE_BAND_V3,
+        *AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V1.bands[1:],
+    ),
+)
+
+
 def default_task_stage_window_policy(
     profile: StageWindowProfilePolicy | None,
     *,
@@ -413,14 +442,16 @@ def default_task_stage_window_policy(
         return None
     if tuple(int(cpu) for cpu in cpu_ids) not in profile.cpu_ids_by_rank:
         return None
-    return AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V2
+    return AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V3
 
 
 __all__ = [
     "AMAZON_C5_192C_NUMA0_TP4_F512_STAGE_WINDOWS_V1",
+    "AMAZON_C5_192C_TP4_F512_MID_ROUTE_BAND_V3",
     "AMAZON_C5_192C_TP4_F512_SHORT_ROUTE_BAND",
     "AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V1",
     "AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V2",
+    "AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V3",
     "INHERIT_STAGE_WINDOW",
     "StageWindowBand",
     "StageWindowPolicyEntry",
