@@ -275,3 +275,50 @@ The `legacy` variant does not use the policy at all, so its own session-to-sessi
 swing bounds the noise floor, and it is larger than the movement on the three
 presets with no in-band expert. `--reverse-order` gives `7.38%` and `23.67%`.
 
+## Result 4: the W13 and W2 windows are not equally important
+
+`profile_heterogeneous_overlap.py --small-w2-window-sweep` crosses the two
+per-thread windows. Per-task stage windows only exist in Plan V2, so that mode
+routes through `fused_moe_bf16_tiled_async_plan`; the operator-wide path is
+unchanged. Fixed `24x4T`, all 96 cores busy, 192 homogeneous experts:
+
+| M | best (w13, w2) MiB | best GB/s | w2 spread at best w13 | production band | gap |
+| ---: | :--- | ---: | ---: | :--- | ---: |
+| 13 | (0.125, 0.25) | 336.1 | 0.67% | (0.25, 0.25) | -1.36% |
+| 28 | (0.25, 0.25) | 302.4 | 4.81% | (0.25, 0.25) | **exact** |
+| 48 | (0.125, 0.25) | 270.5 | 0.69% | (0.25, 0.25) | -2.95% |
+| 120 | (0.125, 0.125) | 174.2 | 9.53% | (0.125, 0.125) | **exact** |
+| 320 | (0.5, 0.125) | 62.9 | 1.52% | (0.5, 0.125) | **exact** |
+
+Three conclusions.
+
+The three production band values are reproduced exactly. `M=28` sits in the new
+`13-48` band, `M=120` in `96-143`, `M=320` in `288-575`, and the two-dimensional
+optimum lands on the calibrated pair in all three. Those pairs were originally
+found by searching per-range bytes cell by cell, so this independently validates
+both the table and the per-thread parameterization.
+
+W13 is the strong axis and W2 is the weak one. Moving `w13` one step off its peak
+costs 3% to 30%. Holding `w13` at its peak, the spread across three or four `w2`
+values is usually under 1.5%; the larger spreads at `M=28` and `M=120` come
+entirely from the cliff at `w2 = 0.5 MiB`, not from slope near the optimum. The
+earlier caveat that sharing one budget makes the E2E gains a lower bound is
+therefore withdrawn: it does not materially understate them.
+
+The `H/F = 8` shared-A argument holds only at large M. At `M=320` the two optima
+differ by 4x in the predicted direction. At `M=120` they are equal, and at
+`M <= 48` W2 prefers the *larger* window. There both stages' shared-A is only
+13-393 KiB and fits private L2, so the re-scan term is negligible for both; what
+sets the short-route `w2` optimum is not identified, but the effect is under
+1.5%.
+
+The `13-48` band keeps `w13 = 0.25 MiB`. The isolated optimum is `0.125 MiB` at
+`M=13` and `M=48`, worth 1.36% and 2.95%, but `M=28` peaks at the current value
+and a band must pick one. End to end, `0.125 MiB` gives 7.38% against legacy on
+`dsv4-real-2048-seq70` versus 7.25% for the current value, inside noise; on
+`moe256-uniform` it improves 13.693 to 13.513 ms, but only because the cost model
+flips the shape from `8T` to `1T`. In the same run the `manual` variant, which
+keeps the legacy shape and changes only windows, regresses from 13.686 to
+13.803 ms. The gain is below the 2% adoption threshold and that shape has no
+isolated calibration at this window, so it is not landed.
+

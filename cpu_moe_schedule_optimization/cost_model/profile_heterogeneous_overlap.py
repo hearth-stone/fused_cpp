@@ -51,7 +51,15 @@ from profile_contention_async import (
 )
 
 from fused_cpp.moe import (  # noqa: E402
+    ASYNC_MOE_EXECUTION_STRICT,
+    ASYNC_MOE_FULL_EXPERT_RANGE,
+    ASYNC_MOE_PLACEMENT_FIXED,
+    ASYNC_MOE_PLAN_VERSION,
+    ASYNC_MOE_RESIZE_NONE,
+    ASYNC_MOE_STAGE_EXPERT,
+    AsyncMoEPlanV2,
     fused_moe_bf16_tiled_async,
+    fused_moe_bf16_tiled_async_plan,
     prepare_fused_moe_bf16_tiled_weights,
 )
 
@@ -95,8 +103,15 @@ def build_run(
     generator: torch.Generator,
     std: float,
     weight_window_bytes: int = 0,
+    stage_window_bytes: tuple[int, int] | None = None,
 ):
-    """Lower ``lanes`` to the async task DAG and return a callable plus metadata."""
+    """Lower ``lanes`` to the async task DAG and return a callable plus metadata.
+
+    ``weight_window_bytes`` is the operator-wide packed-B budget, which the v1
+    async op applies to both stages. ``stage_window_bytes`` instead sets the W13
+    and W2 budgets independently, which requires the Plan V2 path because
+    per-task stage windows only exist there.
+    """
     used = [expert for lane in lanes for expert in lane.experts]
     if len(set(used)) != len(used):
         raise ValueError("each timed task must use a distinct expert")
@@ -177,6 +192,49 @@ def build_run(
             out=output,
         )
 
+    if stage_window_bytes is not None:
+        num_tasks = len(task_experts)
+        plan = AsyncMoEPlanV2.from_dict(
+            {
+                "plan_version": ASYNC_MOE_PLAN_VERSION,
+                "execution_mode": ASYNC_MOE_EXECUTION_STRICT,
+                "num_threads": num_threads,
+                "thread_cpu_ids": [int(value) for value in thread_cpu_ids.tolist()],
+                "task_expert_ids": task_experts,
+                "task_core_begins": task_cores,
+                "task_threads": task_threads,
+                "task_dep_offsets": dep_offsets,
+                "task_deps": deps,
+                "task_preferred_threads": list(task_threads),
+                "task_min_threads": list(task_threads),
+                "task_max_threads": list(task_threads),
+                "task_allowed_thread_offsets": list(range(num_tasks + 1)),
+                "task_allowed_threads": list(task_threads),
+                "task_placement_modes": [ASYNC_MOE_PLACEMENT_FIXED] * num_tasks,
+                "task_numa_nodes": [-1] * num_tasks,
+                "task_stage_ids": [ASYNC_MOE_STAGE_EXPERT] * num_tasks,
+                "task_resize_points": [ASYNC_MOE_RESIZE_NONE] * num_tasks,
+                "task_range_granularities": [ASYNC_MOE_FULL_EXPERT_RANGE] * num_tasks,
+                "task_w13_window_bytes": [stage_window_bytes[0]] * num_tasks,
+                "task_w2_window_bytes": [stage_window_bytes[1]] * num_tasks,
+            }
+        )
+
+        def run() -> torch.Tensor:  # noqa: F811
+            return fused_moe_bf16_tiled_async_plan(
+                x,
+                packed,
+                topk_weights,
+                topk_ids,
+                plan,
+                activation="silu",
+                global_num_experts=num_profile_experts,
+                skip_weighted=True,
+                w13_split=w13_split,
+                weight_window_bytes=weight_window_bytes,
+                out=output,
+            )
+
     routes_by_task = [expert_routes[expert] for expert in task_experts]
     return run, {
         "tasks": len(task_experts),
@@ -233,6 +291,15 @@ def parse_args() -> argparse.Namespace:
             "When given, only the small-only matrix is measured."
         ),
     )
+    parser.add_argument(
+        "--small-w2-window-sweep",
+        default=None,
+        help=(
+            "optional W2 window targets in MiB, crossed with --small-window-sweep (which then means W13). "
+            "Requires the Plan V2 path because per-task stage windows only exist there. "
+            "0 is not allowed here: legacy geometry cannot be requested per stage."
+        ),
+    )
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--runs", type=int, default=11)
     parser.add_argument("--seed", type=int, default=0)
@@ -262,6 +329,15 @@ def main() -> int:
         window_sweep = [float(item) for item in args.small_window_sweep.split(",") if item.strip()]
         if not window_sweep or any(value < 0 for value in window_sweep):
             raise ValueError("--small-window-sweep must contain non-negative MiB values")
+    w2_window_sweep = None
+    if args.small_w2_window_sweep:
+        if window_sweep is None:
+            raise ValueError("--small-w2-window-sweep requires --small-window-sweep for the W13 axis")
+        w2_window_sweep = [float(item) for item in args.small_w2_window_sweep.split(",") if item.strip()]
+        if not w2_window_sweep or any(value <= 0 for value in w2_window_sweep):
+            raise ValueError("--small-w2-window-sweep must contain positive MiB values")
+        if any(value <= 0 for value in window_sweep):
+            raise ValueError("the W13 axis must be positive when W2 is swept separately")
     if any(lanes * small_threads > total_cores for lanes in lane_sweep):
         raise ValueError(f"--small-lane-sweep values must not exceed {total_cores // small_threads}")
     if args.w13_split and args.w13_split_chunks != 2:
@@ -345,6 +421,7 @@ def main() -> int:
                 "small_lane_sweep": lane_sweep,
                 "mixed_small_lanes": mixed_lanes,
                 "small_window_sweep_mib": window_sweep,
+                "small_w2_window_sweep_mib": w2_window_sweep,
                 "warmup": args.warmup,
                 "runs": args.runs,
                 "timer": "perf_counter_ns",
@@ -362,11 +439,13 @@ def main() -> int:
         physical_cores: list[int],
         extra: dict,
         weight_window_bytes: int = 0,
+        stage_window_bytes: tuple[int, int] | None = None,
     ) -> dict:
         run, meta = build_run(
             lanes=lanes,
             physical_cores=physical_cores,
             weight_window_bytes=weight_window_bytes,
+            stage_window_bytes=stage_window_bytes,
             **common,
         )
         samples = measure(run, warmup=args.warmup, runs=args.runs, sync_client=sync_client)
@@ -378,6 +457,7 @@ def main() -> int:
             **extra,
             **{key: value for key, value in meta.items() if key != "task_routes"},
             "weight_window_bytes": weight_window_bytes,
+            "stage_window_bytes": list(stage_window_bytes) if stage_window_bytes else None,
             "median_ns": median_ns,
             "p10_ns": timing["p10_ns"],
             "p90_ns": timing["p90_ns"],
@@ -416,14 +496,24 @@ def main() -> int:
     entries: list[dict] = []
     small_only: dict[int, dict] = {}
 
-    def measure_small_only(lane_count: int, window_bytes: int = 0) -> dict:
+    def measure_small_only(
+        lane_count: int,
+        window_bytes: int = 0,
+        w2_window_bytes: int | None = None,
+    ) -> dict:
         """Small experts alone on the same core suffix that mixed mode uses."""
-        key = (lane_count, window_bytes)
+        key = (lane_count, window_bytes, w2_window_bytes)
         if key not in small_only:
             cores_used = lane_count * small_threads
             lanes = small_lanes(lane_count, small_experts, 0, threads=small_threads)
             cores = list(range(total_cores - cores_used, total_cores))
-            window_label = "legacy" if window_bytes == 0 else f"{window_bytes / 2**20:g}MiB"
+            per_thread = window_bytes / small_threads / 2**20 if window_bytes else None
+            if w2_window_bytes is None:
+                window_label = "legacy" if window_bytes == 0 else f"{window_bytes / 2**20:g}MiB"
+                w2_per_thread = per_thread
+            else:
+                window_label = f"{window_bytes / 2**20:g}/{w2_window_bytes / 2**20:g}MiB"
+                w2_per_thread = w2_window_bytes / small_threads / 2**20
             entry = timed(
                 "small_only",
                 lanes,
@@ -433,15 +523,47 @@ def main() -> int:
                     "small_lanes": lane_count,
                     "small_threads": small_threads,
                     "big_cores": 0,
-                    "window_per_thread_mib": (window_bytes / small_threads / 2**20 if window_bytes else None),
+                    "window_per_thread_mib": per_thread,
+                    "w2_window_per_thread_mib": w2_per_thread,
                 },
-                weight_window_bytes=window_bytes,
+                weight_window_bytes=0 if w2_window_bytes is not None else window_bytes,
+                stage_window_bytes=None if w2_window_bytes is None else (window_bytes, w2_window_bytes),
             )
             small_only[key] = entry
             entries.append(entry)
         return small_only[key]
 
     print("--- small experts alone (packed-B bandwidth curve) ---")
+    if w2_window_sweep is not None:
+        assert window_sweep is not None
+        for window_mib in window_sweep:
+            for w2_mib in w2_window_sweep:
+                for lane_count in lane_sweep:
+                    measure_small_only(lane_count, int(window_mib * 2**20), int(w2_mib * 2**20))
+        print("\n--- summary: useful packed-B bandwidth vs per-thread (W13, W2) window ---")
+        best: dict[int, dict] = {}
+        for entry in entries:
+            lanes_used = entry["small_lanes"]
+            if entry["weight_gbps"] > best.get(lanes_used, {"weight_gbps": 0.0})["weight_gbps"]:
+                best[lanes_used] = entry
+            print(
+                f"{entry['label']:<30} "
+                f"w13={entry['window_per_thread_mib']:>8.4g} w2={entry['w2_window_per_thread_mib']:>8.4g} MiB/thread  "
+                f"wall={entry['median_ns'] / 1e6:8.3f} ms  "
+                f"{entry['weight_gbps']:7.1f} GB/s  {entry['tflops']:7.3f} TFLOP/s"
+            )
+        print("\n--- best per-thread pair at each lane count ---")
+        for lanes_used in sorted(best):
+            entry = best[lanes_used]
+            print(
+                f"{lanes_used:>3}x{small_threads}T  "
+                f"w13={entry['window_per_thread_mib']:g} w2={entry['w2_window_per_thread_mib']:g} MiB/thread  "
+                f"{entry['weight_gbps']:7.1f} GB/s"
+            )
+        write_payload(entries)
+        sync_client.close()
+        return
+
     if window_sweep is not None:
         for window_mib in window_sweep:
             for lane_count in lane_sweep:

@@ -1954,10 +1954,26 @@ $\omega_{W13}=1/2,\omega_{W2}=1/8$ MiB。这张表当初是按 $(\text{band},t)$
 格全部只差一档 factor-2 且集中在 $t=1$ 与 $t=8$ 的 W2，与本节测得的两端不变性
 最弱一致。
 
-两个 stage 的 $\omega^\ast$ 不相等：W13 的 shared-A 为 $2MH$，W2 为 $2MF$，相差
-$H/F=8$ 倍，故 W2 能承受更多 range、最优 $\omega$ 更小。V1 表在 band
-`288--575` 上实测相差 4 倍，与该比例在一档扫描网格内一致。因此 policy 必须为
-两个 stage 各保留一个标量。
+两个 stage 的 $\omega^\ast$ 不必相等。$W13$ 的 shared-A 为 $2MH$，$W2$ 为 $2MF$，
+相差 $H/F=8$ 倍，因此在 A 重扫成为主导项的长 route 侧，W2 能承受更多 range、
+最优 $\omega$ 更小。9.24 的二维扫描证实了这个方向但界定了适用域：
+
+| $M$ | 最优 $(\omega_{W13},\omega_{W2})$ MiB | 该 $\omega_{W13}$ 下 $\omega_{W2}$ 的极差 | production band |
+| ---: | :--- | ---: | :--- |
+| 13 | $(1/8,\ 1/4)$ | 0.67% | $(1/4,1/4)$，差 $-1.36\%$ |
+| 28 | $(1/4,\ 1/4)$ | 4.81% | $(1/4,1/4)$，**精确命中** |
+| 48 | $(1/8,\ 1/4)$ | 0.69% | $(1/4,1/4)$，差 $-2.95\%$ |
+| 120 | $(1/8,\ 1/8)$ | 9.53% | $(1/8,1/8)$，**精确命中** |
+| 320 | $(1/2,\ 1/8)$ | 1.52% | $(1/2,1/8)$，**精确命中** |
+
+两点结论。第一，$\omega_{W13}$ 是强轴、$\omega_{W2}$ 是弱轴：固定最优
+$\omega_{W13}$ 后 $\omega_{W2}$ 在 3--4 个档位上的极差多在 $1.5\%$ 以内，$M=28$ 与
+$M=120$ 的较大极差全部来自 $\omega_{W2}=1/2$ MiB 处的悬崖，而 $\omega_{W13}$ 在
+每个 $M$ 上都有清晰的内部峰且偏离一档要损失 $3\%$--$30\%$。第二，$H/F$ 论证只在
+$M=320$ 成立（$4$ 倍差），$M=120$ 两者相等，而 $M\le48$ 时 W2 反而偏好**更大**的
+$\omega$——此时两个 stage 的 shared-A 都只有 $13$--$393$ KiB、都装得进私有 L2，
+A 重扫项对两者均可忽略，短 route 侧决定 $\omega_{W2}^\ast$ 的机制未识别，但效应
+不超过 $1.5\%$。
 
 split/no-split 由此成为退化情形而非独立维度：W13 总量 $8$ MiB 时
 $g_{W13}=4$ MiB 即 $R=2$（split），$g_{W13}=8$ MiB 即 $R=1$（no-split），且
@@ -3463,6 +3479,37 @@ $\omega$，故收益是下界）、`16T` 及更宽宽度的覆盖（扩覆盖集
 完整表、命令、逐次样本和数据文件见
 `optimizations/fused_moe_sve/results/amazon_192c_short_route_stage_windows_20260806.md`。
 
+#### 9.25 W13/W2 每线程窗口的二维标定
+
+8.2.5 预测两个 stage 的 $\omega^\ast$ 因 shared-A 相差 $H/F$ 倍而不等。为分离这
+两个轴，`profile_heterogeneous_overlap.py` 增加 `--small-w2-window-sweep`，把
+$\omega_{W13}$ 与 $\omega_{W2}$ 做叉乘。per-task stage window 只存在于 Plan V2，
+因此该模式改走 `fused_moe_bf16_tiled_async_plan`；operator-wide 预算路径不变。
+测量在 AmazonC5192Cores NUMA0 上固定 `24x4T`（96 核全忙）、192 个同构 expert
+（整除 lane 数），扫 $M\in\{13,28,48,120,320\}$。
+
+结果表见 8.2.5。三项结论：
+
+1. **三个 production band 值被独立复现**。$M=28$（新 `13--48` band）、$M=120$
+   （`96--143`）、$M=320$（`288--575`）的二维最优精确等于已标定的
+   $(\omega_{W13},\omega_{W2})$，而这些值当初是按每 range 字节逐格搜索得到的。这
+   同时验证了标定表和 $\omega$ 参数化。
+2. **$\omega_{W2}$ 是弱轴，8.2.5 的"收益是下界"这一保留可以撤销**。固定最优
+   $\omega_{W13}$ 后，$\omega_{W2}$ 在 3--4 个档位上的极差多在 $1.5\%$ 以内；
+   较大的极差全部来自 $\omega_{W2}=1/2$ MiB 处的悬崖，而非最优点附近的坡度。因此
+   两个 stage 共用一个 $\omega$ 并没有实质性低估收益。
+3. **`13--48` band 的 $\omega_{W13}$ 不改**。$M=13$ 与 $M=48$ 的孤立最优是
+   $1/8$ MiB（比现值好 $1.36\%$/$2.95\%$），但 $M=28$ 的最优是现值 $1/4$ MiB
+   （$1/8$ 差 $0.5\%$），band 只能取一个。端到端验证 $\omega_{W13}=1/8$：
+   `dsv4-real-2048-seq70` 对 legacy 为 $7.38\%$ 对现值 $7.25\%$，在噪声内；
+   `moe256-uniform` 从 $13.693$ 改善到 $13.513$ ms（$+1.33\%$），但**唯一原因是
+   cost model 把 shape 从 `8T` 翻到 `1T`**——同一次运行里保持 legacy shape 的
+   `manual` 变体反而从 $13.686$ 退化到 $13.803$ ms。收益低于 2% 采用门槛，且该
+   `1T` 形状在此窗口下没有孤立标定支撑，故不落地。
+
+数据在 `optimizations/fused_moe_sve/results/data/stage_window_omega_20260807/w2_2d_m{13,28,48,120,320}.json`
+与 `w13_eighth_{preset}.json`。
+
 ## 10. 同步规则
 
 发生以下任一变化时，必须同步更新本文档：
@@ -3556,3 +3603,4 @@ $\omega$，故收益是下界）、`16T` 及更宽宽度的覆盖（扩覆盖集
 | 2026-08-02 | v0.65 | 增加纯 GEMM 四状态 shadow 验证：由 M-panel/N-tile 循环精确计数 cold/cold、hot-A/cold-B、cold-A/hot-B、hot/hot，并用 4T 独立冷权重扫 M12--M2040。M>=192 的总误差不超过 4.85%，但 M24 低估 16.53%，证明状态计数可解释而单组 K728 service cost 不能跨 K、cache level 和固定成本直接线性迁移；新增可重复 profiler/validator，不改变 production backend、phase 公式、候选或剪枝。 |
 | 2026-08-06 | v0.66 | 把 packed-B 复用的实现条件写成每线程窗口 $\omega=g_s/t$ 与 range 数 $R=\lceil W_s/g_s\rceil$ 的函数：有效重读因子 $p_{\mathrm{eff}}\in[1,\lceil M/12\rceil]$ 由 $\omega$ 主导，加宽 team 与缩小窗口是达到同一 $\omega$ 的可互换路径，但只有窗口会乘 $R$ 的固定成本、只有宽度会降低 memory-level parallelism，因此最优点为内部解。这统一了 8.2.2 的 $Q_{\mathrm{shared},B}=2KNP$ 上界与 9.23 四状态计数的 hot-B 下界。AmazonC5192Cores NUMA0 在 $M=28$ 上实测 $p_{\mathrm{eff}}$ 随 $\omega$ 由 2.97 单调降到 1.22（上界 3 在 $\omega=4$ MiB 取到），同 $\omega$ 下四种宽度差异仅 3.0%--5.6%，$M=12$ 对照极差 0.7%。固定 $t$ 改变活跃核数的分离实验以相反符号否证共享 LLC 容量假设：同一聚合窗口下 $p_{\mathrm{eff}}$ 相差 2 倍并跟随 $\omega$，固定 $\omega$ 时聚合变化 8 倍只变 1.36--1.77 倍且压力越大越好，故 $g(M,t)$ 无需活跃核数项，有效驻留容量约为标称私有 L2 的 1/8。production planner 端到端 A/B 中，$13\le M\le48$ 的候选 band 使 `dsv4-real-2048-seq70` 与 `moe256-uniform` 分别提升 7.36% 与 24.20%，三个无 band 内 expert 的 workload 变化不超过 0.34%。公式、候选空间、宽度剪枝与 production 默认 policy 均不变。 |
 | 2026-08-07 | v0.67 | 用 PMU 把 $p_{\mathrm{eff}}$ 从墙钟反推升级为直接测量，并据此把 stage-window policy 的输入单位从每 range 字节改为每线程窗口 $\omega$。`l2d_cache_refill`（含硬件预取）在 $M=12$ 对照上给出跨 L2 字节 / 必需 packed-B $=1.02$，标定了口径；$M=28$、`24x4T` 下扣除 A 与 C 后反解的 $p_{\mathrm{eff}}$ 为 $1.83/1.15/1.16$，与墙钟的 $1.75/1.22/1.23$ 吻合在 $5\%$ 内，故该因子就是 packed-B 在 L2 边界上的重复搬运次数。大 $M$ 的主导项被改写：$M=2040$ 缩窗口使跨 L2 流量涨 $8.2$ 倍且在 $\omega=1$ MiB 处已是必需 B 的 $21.8$ 倍，主体是 shared-A（$2MK_s$，W13 在 $M=2040$ 时为 $16.7$ MB、装不进私有 L2）被每 range 重扫，而非 B 复用率；A 重扫增量预测 $+6.9$ ms 对实测 $+6.18$ ms。参数化上给出 $\omega\to g_s$ 的整数反解（与 8.3 的 $\widehat S_s$ 精确互逆，plan 与 kernel ABI 仍只见整数 $R$），可达 $\omega$ 量化为 $b_s$ 的整数倍、下界 $b_s$、上界 $W_s/t$。已标定的 V1 表由此从 26 个 $g_s$ 塌缩为 8 个 $\omega$ 加 6 个只差一档的偏差格——该表当初按 $(\text{band},t)$ 逐格独立搜索却自行收敛到常数 $\omega$，构成 $\omega$ 为不变量的独立证据。两个 stage 的 $\omega^\ast$ 因 shared-A 相差 $H/F=8$ 倍而不相等，故各保留一个标量。split/no-split 降级为 $g_{W13}\in\{4,8\}$ MiB 的退化情形，identity 记录的 achieved $R$ 无单位、两种编码共享标定数据。production 默认升级到 `amazon_c5_192c_tp4_f512_v2`，新增 $13\le M\le48$ band（$\omega=1/4$ MiB，`widths=(1,2,4,8)`，$t=8$ 取 $1/8$ MiB）：`dsv4-real-2048-seq70` 提速 $7.59\%$、`moe256-uniform` 提速 $24.29\%$，三个无 band 内 expert 的 workload 变化在 $\pm0.33\%$ 而同期 legacy 变体自身摆动 $-0.72\%$--$+0.38\%$。公式、候选空间与宽度剪枝不变。 |
+| 2026-08-07 | v0.68 | 用 `--small-w2-window-sweep` 把 $\omega_{W13}$ 与 $\omega_{W2}$ 做叉乘标定（per-task stage window 只在 Plan V2 存在，故该模式改走 `fused_moe_bf16_tiled_async_plan`），在 `24x4T`、192 同构 expert、$M\in\{13,28,48,120,320\}$ 上得到三项结论。其一，$M=28/120/320$ 的二维最优**精确等于**已标定 band 的 $(\omega_{W13},\omega_{W2})$，而那些值当初是按每 range 字节逐格搜索的，构成对标定表与 $\omega$ 参数化的独立验证。其二，$\omega_{W13}$ 是强轴（偏离一档损失 $3\%$--$30\%$）而 $\omega_{W2}$ 是弱轴（固定最优 $\omega_{W13}$ 后极差多在 $1.5\%$ 内，较大极差全部来自 $\omega_{W2}=1/2$ MiB 的悬崖），因此 v0.67 中"两 stage 共用一个 $\omega$ 使收益成为下界"的保留撤销。其三，$H/F=8$ 的 shared-A 论证只在 $M=320$ 成立（$4$ 倍差），$M=120$ 两者相等，$M\le48$ 时 W2 反而偏好更大的 $\omega$——此时两 stage 的 shared-A 均为 $13$--$393$ KiB、都装得进私有 L2，A 重扫项可忽略，短 route 侧的 $\omega_{W2}^\ast$ 机制未识别但效应 $\le1.5\%$。`13--48` band 的 $\omega_{W13}$ 保持 $1/4$ MiB：$M=13/48$ 的孤立最优 $1/8$ MiB 好 $1.36\%$/$2.95\%$，但 $M=28$ 最优为现值，且端到端只在 `moe256-uniform` 上因 cost model 把 shape 从 `8T` 翻到 `1T` 而得 $+1.33\%$（同次运行里固定 shape 的 `manual` 变体反而退化 $0.85\%$），低于 2% 采用门槛且该形状无孤立标定支撑。production 默认、公式与候选空间均不变。 |
