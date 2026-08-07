@@ -287,6 +287,95 @@ features:
       work, and the known M24 trough are not represented by binary cache-state
       counts. See results/amazon_192c_gemm_memory_services_20260802.md.
 
+  - id: measurement.short_route_stage_windows
+    part: measurement
+    status: experimental
+    implementation: >-
+      cpu_moe_schedule_optimization/cost_model/profile_heterogeneous_overlap.py
+      and
+      optimizations/fused_moe_sve/benchmarks/bench_short_route_stage_windows.py
+      and cpu_moe_schedule_optimization/planners/stage_window_policy.py
+    hypothesis: >-
+      The kernel loops M panels outside and N tiles inside, so every additional
+      M12 panel walks the whole packed-B stage window again. Useful packed-B
+      bandwidth should therefore be governed by the per-thread window
+      window_bytes/threads rather than by team width or window target alone, and
+      should degrade by up to ceil(M/12) when that per-thread slice no longer
+      stays resident. The calibrated default policy has no route band below 49
+      routes, so short-route experts should be recoverable by adding one band.
+    depends_on:
+      - dispatch.serial_weight_windows
+      - dispatch.per_task_stage_windows
+    conflicts_with: []
+    correctness: >-
+      PYTHONPATH=src .venv/bin/python -m pytest -q
+      tests/test_moe_cost_model_v2.py -k stage_window
+      && PYTHONPATH=src .venv/bin/python -m pytest -q
+      tests/test_moe_w13_split_api.py -k weight_window
+    benchmark: >-
+      FUSED_CPP_MOE_HUGETLBFS_PATH=/dev/hugepages-32M
+      PYTHONPATH=src numactl --cpunodebind=0 --membind=0 taskset -c 0-95
+      .venv/bin/python
+      optimizations/fused_moe_sve/benchmarks/bench_short_route_stage_windows.py
+      --preset dsv4-real-2048-seq70 --warmup 5 --runs 31
+    result: >-
+      On AmazonC5192Cores NUMA0 the effective packed-B re-read factor at M=28
+      falls monotonically from 2.97 to 1.22 as the per-thread window shrinks
+      from 4 MiB to 0.25 MiB, matching the ceil(M/12)=3 upper bound at 4 MiB.
+      Four team widths agree within 3.0-5.6 percent at equal per-thread window,
+      so width is second order. The M=12 control varies by 0.7 percent because a
+      single M panel has no packed-B reuse. Varying the active core count at
+      fixed team width rejects the shared-LLC capacity hypothesis with the wrong
+      sign: at a fixed 12 MiB aggregate window the factor spans 2.35 to 1.20 and
+      tracks the per-thread window, while holding the per-thread window fixed and
+      growing the aggregate eightfold improves it by 1.36-1.77x. The
+      deterministic g(M, t) form therefore needs no active-core term, and the
+      effective retained capacity is about one eighth of the nominal private L2.
+      An end-to-end A/B with a candidate
+      13-48 route band improved dsv4-real-2048-seq70 by 7.36 percent and
+      moe256-uniform by 24.20 percent, while three presets with no in-band
+      expert moved by at most 0.34 percent. That band is now the production
+      default: the policy input unit changed from per-range bytes to the
+      per-thread window, which collapsed the calibrated V1 table from 26 numbers
+      to 8 plus 6 one-step deviations, and the band landed as
+      amazon_c5_192c_tp4_f512_v2. Re-measured default against default in one
+      session it gives 7.59 and 24.29 percent, with the three unaffected presets
+      inside a noise floor set by the policy-free legacy variant. Still
+      uncalibrated: W13 and W2 share one per-thread window, and widths above 8
+      remain uncovered because widening coverage flips the cost model's
+      full-workload anchor and must be measured. Only one host and profile
+      identity were tested. A follow-up two-dimensional W13/W2 per-thread window
+      sweep reproduced the calibrated pair exactly at M=28, M=120 and M=320,
+      which independently validates both the table and the per-thread
+      parameterization. W13 is the strong axis, where one step off the peak costs
+      3 to 30 percent, and W2 is weak, under 1.5 percent across three or four
+      values at the peak W13, so sharing one window between the stages does not
+      materially understate the gains. The H/F=8 shared-A argument holds only at
+      large M: at M<=48 both stages' shared-A fits private L2 and W2 prefers the
+      larger window instead. A candidate w13=0.125 MiB for the 13-48 band was
+      rejected because M=28 peaks at the current value and end to end it only
+      gains on moe256-uniform by flipping the shape from 8T to 1T, below the 2
+      percent adoption threshold. A width sweep at fixed per-thread window then
+      bounded the invariance to 1 through 8 threads: at 16 and 32 threads the
+      width itself costs 13 to 39 percent. That does not matter for the policy
+      because the inherited legacy geometry is itself a per-thread window of
+      4 MiB divided by the team width, so wide teams already sit near the
+      optimum and only 0.8 to 8.5 percent remains there. The real gap was the
+      narrow end of the 49-95 band, which V1 calibrated at 8 threads only and
+      where the inherited window is 32x to 8x too large; filling 1, 2 and 4
+      threads is worth 3.39x, 2.94x and 1.65x of isolated bandwidth at M=72.
+      That landed as amazon_c5_192c_tp4_f512_v3. No catalog preset plans a 49-95
+      route expert below 8 threads, so V2 and V3 build element-identical plans on
+      all five presets and the gain is latent. Since w13_split is only a boolean
+      alias for a 4 or 8 MiB W13 budget, dropping it as a search dimension was
+      then evaluated and rejected: the bands cover 52 percent of the route-width
+      grid and cannot cover the rest, because M<=12 has no reuse to protect and
+      widths above 8 already sit near the optimum on the inherited geometry. The
+      share of tasks still inheriting ranges from 0 percent on moe256-uniform to
+      100 percent on moe256-long-short-bimodal, where split/no-split is the only
+      window control, so the operator-wide geometry stays a live candidate. See
+      results/amazon_192c_short_route_stage_windows_20260806.md.
+
   - id: compute.xbyak_bulk_m
     part: compute
     status: experimental

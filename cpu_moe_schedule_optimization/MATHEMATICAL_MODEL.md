@@ -3539,6 +3539,30 @@ anchor 给它们评分。
 数据在 `optimizations/fused_moe_sve/results/data/stage_window_omega_20260807/omega_inv_m{28,120}_t{1,2,4,8,16,32}.json`、
 `wide_m{28,120}_t{16,32}.json`、`band4995_m72_t{1,2,4,8}.json` 与 `v3_{preset}.json`。
 
+#### 9.27 为什么 split/no-split 不能退出候选维度
+
+8.2.5 指出 split/no-split 是 $g_{W13}\in\{4,8\}$ MiB 的布尔别名，由此自然会问它能否
+在 $\omega$ band 覆盖足够广时退出 planner 的候选维度。实测结论是**不能**，因为
+band 永远不会覆盖全部 $(M,t)$：
+
+| 继承原因 | 是否可以补 band |
+| :--- | :--- |
+| $M\le12$ | **不应该**。$P=1$ 时没有 packed-B 复用可保护，实测窗口效应仅 $\pm0.7\%$ |
+| $M>575$ | 可以，但需新标定；且 $M=2040$ 的 $\omega^\ast\approx1$ MiB 与 legacy 在 `4T` 上给出的值一致 |
+| $t>8$ | **不应该**。9.26 实测 $\omega_{\text{legacy}}=4\ \mathrm{MiB}/t$ 在 `16T`/`32T` 已接近最优，且 $\omega$ 在那里不可迁移 |
+
+V3 在 $(M,t)$ 网格上的覆盖率为 $52\%$。production preset 上仍走 operator-wide 几何
+的 task 占比为：`moe256-uniform` 与 `moe256-active-set-128` 为 $0\%$，
+`moe256-tiered-hotspot` $6\%$，`dsv4-real-2048-seq70` $35\%$，而
+`moe256-long-short-bimodal` 为 **$100\%$**——它的 route 只有 $\{12,2040\}$、宽度只有
+$\{1,16\}$，每一格都落在上表三种原因里。对该 workload，split/no-split 是**唯一**的
+窗口控制。
+
+因此 operator-wide 几何不是可以退役的兼容层，而是所有继承 task 的实际窗口来源；
+`policy_variants()` 要求完整 legacy pair 的前置条件也随之保留，它正是保证两种活跃
+几何都有标定数据的机制。当前该 identity 的候选集本身已是最小的两项（split 与
+no-split，无 window variant），没有可塌缩的维度。
+
 ## 10. 同步规则
 
 发生以下任一变化时，必须同步更新本文档：
@@ -3634,3 +3658,4 @@ anchor 给它们评分。
 | 2026-08-07 | v0.67 | 用 PMU 把 $p_{\mathrm{eff}}$ 从墙钟反推升级为直接测量，并据此把 stage-window policy 的输入单位从每 range 字节改为每线程窗口 $\omega$。`l2d_cache_refill`（含硬件预取）在 $M=12$ 对照上给出跨 L2 字节 / 必需 packed-B $=1.02$，标定了口径；$M=28$、`24x4T` 下扣除 A 与 C 后反解的 $p_{\mathrm{eff}}$ 为 $1.83/1.15/1.16$，与墙钟的 $1.75/1.22/1.23$ 吻合在 $5\%$ 内，故该因子就是 packed-B 在 L2 边界上的重复搬运次数。大 $M$ 的主导项被改写：$M=2040$ 缩窗口使跨 L2 流量涨 $8.2$ 倍且在 $\omega=1$ MiB 处已是必需 B 的 $21.8$ 倍，主体是 shared-A（$2MK_s$，W13 在 $M=2040$ 时为 $16.7$ MB、装不进私有 L2）被每 range 重扫，而非 B 复用率；A 重扫增量预测 $+6.9$ ms 对实测 $+6.18$ ms。参数化上给出 $\omega\to g_s$ 的整数反解（与 8.3 的 $\widehat S_s$ 精确互逆，plan 与 kernel ABI 仍只见整数 $R$），可达 $\omega$ 量化为 $b_s$ 的整数倍、下界 $b_s$、上界 $W_s/t$。已标定的 V1 表由此从 26 个 $g_s$ 塌缩为 8 个 $\omega$ 加 6 个只差一档的偏差格——该表当初按 $(\text{band},t)$ 逐格独立搜索却自行收敛到常数 $\omega$，构成 $\omega$ 为不变量的独立证据。两个 stage 的 $\omega^\ast$ 因 shared-A 相差 $H/F=8$ 倍而不相等，故各保留一个标量。split/no-split 降级为 $g_{W13}\in\{4,8\}$ MiB 的退化情形，identity 记录的 achieved $R$ 无单位、两种编码共享标定数据。production 默认升级到 `amazon_c5_192c_tp4_f512_v2`，新增 $13\le M\le48$ band（$\omega=1/4$ MiB，`widths=(1,2,4,8)`，$t=8$ 取 $1/8$ MiB）：`dsv4-real-2048-seq70` 提速 $7.59\%$、`moe256-uniform` 提速 $24.29\%$，三个无 band 内 expert 的 workload 变化在 $\pm0.33\%$ 而同期 legacy 变体自身摆动 $-0.72\%$--$+0.38\%$。公式、候选空间与宽度剪枝不变。 |
 | 2026-08-07 | v0.68 | 用 `--small-w2-window-sweep` 把 $\omega_{W13}$ 与 $\omega_{W2}$ 做叉乘标定（per-task stage window 只在 Plan V2 存在，故该模式改走 `fused_moe_bf16_tiled_async_plan`），在 `24x4T`、192 同构 expert、$M\in\{13,28,48,120,320\}$ 上得到三项结论。其一，$M=28/120/320$ 的二维最优**精确等于**已标定 band 的 $(\omega_{W13},\omega_{W2})$，而那些值当初是按每 range 字节逐格搜索的，构成对标定表与 $\omega$ 参数化的独立验证。其二，$\omega_{W13}$ 是强轴（偏离一档损失 $3\%$--$30\%$）而 $\omega_{W2}$ 是弱轴（固定最优 $\omega_{W13}$ 后极差多在 $1.5\%$ 内，较大极差全部来自 $\omega_{W2}=1/2$ MiB 的悬崖），因此 v0.67 中"两 stage 共用一个 $\omega$ 使收益成为下界"的保留撤销。其三，$H/F=8$ 的 shared-A 论证只在 $M=320$ 成立（$4$ 倍差），$M=120$ 两者相等，$M\le48$ 时 W2 反而偏好更大的 $\omega$——此时两 stage 的 shared-A 均为 $13$--$393$ KiB、都装得进私有 L2，A 重扫项可忽略，短 route 侧的 $\omega_{W2}^\ast$ 机制未识别但效应 $\le1.5\%$。`13--48` band 的 $\omega_{W13}$ 保持 $1/4$ MiB：$M=13/48$ 的孤立最优 $1/8$ MiB 好 $1.36\%$/$2.95\%$，但 $M=28$ 最优为现值，且端到端只在 `moe256-uniform` 上因 cost model 把 shape 从 `8T` 翻到 `1T` 而得 $+1.33\%$（同次运行里固定 shape 的 `manual` 变体反而退化 $0.85\%$），低于 2% 采用门槛且该形状无孤立标定支撑。production 默认、公式与候选空间均不变。 |
 | 2026-08-07 | v0.69 | 界定 $\omega$ 不变性的宽度边界并据此补齐 `49--95` band 的窄端。固定 $\omega$ 扫六个宽度显示不变性只在 `1T`--`8T` 成立（极差 $4.2\%$/$11.4\%$）：$M=28$ 在 $\omega=0.25$ MiB 下 `16T`/`32T` 相对 `4T` 峰值掉 $13.0\%$/$27.0\%$，$M=120$ 在 $\omega=0.125$ MiB 下掉 $19.7\%$/$39.0\%$，超过 8 线程后队内同步与并发 expert 数塌到 6/3 的代价超过窗口收益。这不影响 policy，因为 operator-wide legacy 几何本身是 $\omega_{\text{legacy}}=4\ \mathrm{MiB}/t$——`1T` 为 $4$ MiB 而 `32T` 为 $0.125$ MiB，宽 team 从来不在病态区：`16T`/`32T` 上最优窗口相对 legacy 只值 $+2.4\%$/$+0.8\%$（$M=28$）与 $+4.2\%$/$+8.5\%$（$M=120$），故这两个宽度保持继承。真正的空洞是 `49--95` band 只标定了 `8T`：$M=72$ 上 legacy 对最优窗口为 `1T` $3.39\times$、`2T` $2.94\times$、`4T` $1.65\times$，因为 $\omega_{\text{legacy}}$ 在那里是 $4$/$2$/$1$ MiB、比最优大 $32$--$16$ 倍。production 默认升级到 `amazon_c5_192c_tp4_f512_v3`，用实测最优补齐三格（`1T`/`2T` 取 $1/8$ MiB，`4T` 取 $1/16$ MiB），`8T` 逐字节保持 V1 值。catalog 无 preset 会把 $49\le M\le95$ 的 expert 排到 8 线程以下，故 V2 与 V3 在五个 preset 上生成逐元素相同的 plan、墙钟差异按定义是噪声；收益是潜在的，且 cost model 不再用 full-workload anchor 给这三格评分。公式、候选空间与宽度剪枝不变。 |
+| 2026-08-07 | v0.70 | 评估并否决"让 split/no-split 退出 planner 候选维度"。8.2.5 指出 `w13_split` 只是 $g_{W13}\in\{4,8\}$ MiB 的布尔别名，但 $\omega$ band 永远不会覆盖全部 $(M,t)$，且其中两项是有意为之：$M\le12$ 时 $P=1$、没有 packed-B 复用可保护（实测窗口效应仅 $\pm0.7\%$），$t>8$ 时 9.26 已实测 $\omega_{\text{legacy}}=4\ \mathrm{MiB}/t$ 接近最优且 $\omega$ 不可迁移；只有 $M>575$ 属于可补但需新标定。V3 在 $(M,t)$ 网格上覆盖 $52\%$，production preset 上仍走 operator-wide 几何的 task 占比从 `moe256-uniform` 的 $0\%$ 到 `moe256-long-short-bimodal` 的 $100\%$（其 route 只有 $\{12,2040\}$、宽度只有 $\{1,16\}$，每格都落在上述原因里），对后者 split/no-split 是唯一的窗口控制。因此 operator-wide 几何不是可退役的兼容层而是所有继承 task 的实际窗口来源，`policy_variants()` 要求完整 legacy pair 的前置条件保留；该 identity 的候选集本身已是最小的两项（split 与 no-split，无 window variant），没有可塌缩的维度。新增 9.27 记录该否证。代码、production 默认、公式与候选空间均不变。 |

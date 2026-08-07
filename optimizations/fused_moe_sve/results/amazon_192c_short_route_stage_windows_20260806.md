@@ -372,3 +372,79 @@ most 1.26% are noise by construction. The value is latent: those cells now have
 a calibrated window instead of a 32x-too-large inherited one, and the cost model
 no longer scores them with the full-workload anchor.
 
+## Result 6: split/no-split cannot leave the candidate set
+
+Since `w13_split` is only a boolean alias for `g_w13 in {4, 8} MiB`, the natural
+next step would be to drop it as a planner search dimension once the per-thread
+bands cover enough ground. They never will, and two of the three reasons are
+deliberate:
+
+| why a task inherits | can a band cover it |
+| :--- | :--- |
+| `M <= 12` | **should not**. With one M panel there is no packed-B reuse to protect; the measured window effect is ±0.7% |
+| `M > 575` | could, with new calibration. At `M=2040` the optimum is about 1 MiB per thread, which is what legacy already gives at 4T |
+| `t > 8` | **should not**. Result 5 measured that `4 MiB / t` is already near optimal at 16 and 32 threads, and the per-thread window stops transferring there |
+
+V3 covers 52% of the `(routes, threads)` grid. The share of production tasks still
+on the operator-wide geometry is 0% for `moe256-uniform` and
+`moe256-active-set-128`, 6% for `moe256-tiered-hotspot`, 35% for
+`dsv4-real-2048-seq70`, and **100%** for `moe256-long-short-bimodal`, whose routes
+are only `{12, 2040}` and widths only `{1, 16}` so every cell falls into one of the
+three rows above. For that workload split/no-split is the *only* window control.
+
+The operator-wide geometry is therefore not a retirable compatibility layer but
+the live window source for every inherited task, and the `policy_variants()`
+requirement of a complete legacy pair is what keeps both live geometries
+calibrated. The candidate set for this identity is already the minimal two, split
+and no-split, with no measured window variants, so there is no dimension to
+collapse.
+
+## Not established
+
+- The band ties the W13 and W2 targets to one per-thread window. Result 4 shows
+  W2 is the weak axis, so this does not materially cost anything, but the
+  mechanism that sets the short-route W2 optimum is not identified.
+- The mechanism behind the residual `g(C)` term in result 2b, that is why
+  `p_eff` improves as more cores stay busy at fixed per-thread window.
+- Only widths `1, 2, 4, 8` are covered. Result 5 shows that is deliberate rather
+  than a gap: the inherited legacy window is `4 MiB / t`, which already lands near
+  the measured optimum at 16 and 32 threads, and at those widths the per-thread
+  window is no longer transferable. The residual headroom there is 0.8-8.5%,
+  measured but not landed, and no catalog preset plans a banded expert that wide.
+- The `49-95` band's narrow cells are calibrated but unexercised: no catalog
+  preset plans a 49-95 route expert below 8 threads, so their 1.65x-3.39x
+  isolated gain has no end-to-end confirmation.
+- The LLC-to-DRAM segment is still unmeasured. `ll_cache_miss_rd` counts only
+  demand misses, `13 MB` where `2.4 GB` actually moved, and
+  `l3d_cache_refill` reads zero on Neoverse-V3.
+- One host, one profile identity. The policy is profile-bound by design, so the
+  band must not be extrapolated to other machines, `F` values or parallel
+  degrees without repeating the measurement.
+- The runtime extension is the 2026-08-03 build of the current ARM source. It is
+  newer than the profile used for planning, so these numbers validate the
+  runtime policy, not the profile's absolute-time accuracy.
+
+## Data
+
+- `results/data/short_route_windows_20260806/balanced_m{12,28}_T{1,2,4,8}.json`:
+  balanced 192-expert window sweeps.
+- `results/data/short_route_windows_20260806/sep_m{12,28}_t4.json`: the
+  active-core separation experiment at fixed `4T` team width.
+- `results/data/short_route_windows_20260806/{preset}.json` and
+  `{preset}_reversed.json`: end-to-end A/B against the candidate band, per-run
+  samples included.
+- `results/data/stage_window_omega_20260807/{preset}.json`: the same A/B after
+  the band landed, with the simplified `legacy` / `policy` / `manual` variants.
+- `results/data/stage_window_omega_20260807/w2_2d_m{13,28,48,120,320}.json`: the
+  two-dimensional W13/W2 per-thread window calibration.
+- `results/data/stage_window_omega_20260807/w13_eighth_{preset}.json`: the
+  end-to-end test of the rejected `w13 = 0.125 MiB` band.
+- `results/data/stage_window_omega_20260807/omega_inv_m{28,120}_t{1..32}.json`:
+  per-thread window invariance across six team widths.
+- `results/data/stage_window_omega_20260807/wide_m{28,120}_t{16,32}.json`: legacy
+  against explicit windows at 16 and 32 threads.
+- `results/data/stage_window_omega_20260807/band4995_m72_t{1,2,4,8}.json`: the
+  49-95 band's narrow-width calibration.
+- `results/data/stage_window_omega_20260807/v3_{preset}.json`: the V2-to-V3 A/B.
+- `results/data/heterogeneous_overlap_20260806/`: the earlier 195-expert sweeps
+  and the heterogeneous co-scheduling probes that led to this measurement.

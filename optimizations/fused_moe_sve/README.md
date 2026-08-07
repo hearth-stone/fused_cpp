@@ -881,6 +881,9 @@ For the tested TP4 shape, the best windows were 4/2/1 MiB for 4/2/1 threads per
 expert respectively. This is consistent with about 1 MiB of packed B per
 active worker, but the private-L2 and aggregate-cache effects remain
 confounded; treat it as a measured selection rule, not a universal constant.
+That sweep used `M=2040`; the short-route optimum is 4-8x smaller, so the
+1 MiB-per-worker rule must not be extrapolated below about 49 routes. See the
+short-route section below.
 
 The async benchmark also accepts independent experimental pairs such as
 `--window-pairs-mib 4:4,4:2`. The route sweep in
@@ -919,6 +922,76 @@ The captured DSV4 distribution changed by -0.22%. NUMA1 independently measured
 rank CPU sets but is not generalized to other machines or shapes. Full results
 and applicability limits are recorded in
 [`results/amazon_192c_static_stage_window_policy.md`](results/amazon_192c_static_stage_window_policy.md).
+
+That policy originally had no route band below 49 routes, so every expert with
+`M < 49` inherited the operator-wide legacy geometry. Because the kernel loops M
+panels outside and N tiles inside, each additional M12 panel walks the whole
+packed-B window again, so useful packed-B bandwidth is governed by the per-thread
+window `window_bytes / threads`. At `M=28` the effective re-read factor falls
+from 2.97 to 1.22 as that per-thread window shrinks from 4 MiB to 0.25 MiB,
+matching the `ceil(M/12)=3` upper bound at 4 MiB; four team widths agree within
+3.0-5.6% at equal per-thread window, so adding threads and shrinking the window
+are interchangeable and width is second order. The `M=12` control varies by 0.7%
+because a single M panel has no packed-B reuse. PMU confirms the mechanism
+directly: `l2d_cache_refill * 64` over compulsory packed-B is 1.02 for the `M=12`
+control and 1.87 -> 1.19 for `M=28` as the window shrinks, matching the
+wall-clock factor within 5%. Sweep it with:
+
+```bash
+FUSED_CPP_MOE_HUGETLBFS_PATH=/dev/hugepages-32M \
+PYTHONPATH=src numactl --cpunodebind=0 --membind=0 .venv/bin/python \
+  cpu_moe_schedule_optimization/cost_model/profile_heterogeneous_overlap.py \
+  --output /tmp/short_route_windows.json --cpu-ids 0-95 \
+  --hidden-size 4096 --ffn-hidden-size 512 --num-experts 224 \
+  --big-experts 28 --big-routes 317 --big-core-splits 56 \
+  --small-experts 192 --small-routes 28 --small-threads 4 \
+  --small-lane-sweep 24 --small-window-sweep 0,2,1,0.5,0.25
+```
+
+Since the per-thread window is the invariant, the policy takes it as its input
+unit and lowers it to per-range bytes once, where the team width is known. That
+collapsed the calibrated table from 26 per-range numbers to 8 per-thread windows
+plus 6 cells one factor-of-two step away, and it made `w13_split` a degenerate
+case: with W13 at 8 MiB total, split is `g=4 MiB` and no-split is `g=8 MiB`.
+
+The `13 <= M <= 48` band then landed as the production default, at 0.25 MiB per
+thread for widths 1/2/4 and 0.125 MiB at width 8. Default against default it
+gives +7.59% on `dsv4-real-2048-seq70` and +24.29% on `moe256-uniform`; three
+presets with no in-band expert move within ±0.33%, which is under the noise floor
+set by the policy-free `legacy` variant. `moe256-uniform` is `M=48`, exactly one
+route below the old first band, which is why the gap was that large.
+
+The current default `amazon_c5_192c_tp4_f512_v3` then filled the `49-95` band at
+1, 2 and 4 threads, which V1 had calibrated at 8 threads only. That matters
+because the inherited legacy geometry is itself a per-thread window of
+`4 MiB / t`, so it is 32x to 8x too large at narrow widths and worth 3.39x, 2.94x
+and 1.65x of isolated bandwidth at `M=72`. The same identity explains why widths
+16 and 32 stay inherited: `4 MiB / 16` and `4 MiB / 32` already land near the
+measured optimum, leaving only 0.8-8.5% there, and per-thread windows stop being
+transferable above 8 threads anyway, where the width itself costs 13-39%.
+
+One calibration is still open, and one gap is deliberate. W13 and W2 share one
+per-thread window; a two-dimensional sweep found W13 is the strong axis, where one
+step off the peak costs 3-30%, while W2 varies under 1.5% at the peak W13, so
+sharing does not materially cost anything. That sweep also reproduced the
+calibrated pair exactly at M=28, M=120 and M=320, independently validating both
+the table and the per-thread parameterization. Widths above 8 remain uncovered by
+choice as described above. Note that widening a band's coverage set flips
+`can_use_full_workload_anchor` in the cost model, which can move the chosen shape
+even where no window value changes, so every extension needs its own A/B. Sweep
+the two axes with `--small-window-sweep` crossed with `--small-w2-window-sweep`,
+and reproduce the A/B with:
+
+```bash
+FUSED_CPP_MOE_HUGETLBFS_PATH=/dev/hugepages-32M \
+PYTHONPATH=src numactl --cpunodebind=0 --membind=0 taskset -c 0-95 \
+  .venv/bin/python \
+  optimizations/fused_moe_sve/benchmarks/bench_short_route_stage_windows.py \
+  --preset dsv4-real-2048-seq70 --warmup 5 --runs 31
+```
+
+Full tables, the `M=12` control and the not-established list are in
+[`results/amazon_192c_short_route_stage_windows_20260806.md`](results/amazon_192c_short_route_stage_windows_20260806.md).
 The default-on integration rerun, with no enable flag, measured +30.58%/+30.34%
 for active-set-128 on NUMA0/NUMA1 and +0.01% for the non-overridden uniform
 control.
