@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#include "../../../page_policy.h"
 #include "../../common/api.h"
 #include "../../common/backend.h"
 #include "backend.h"
@@ -42,8 +43,8 @@ struct ExpertTask {
 };
 
 struct ThreadScratch {
-  std::vector<uint16_t> input;
-  std::vector<uint16_t> intermediate;
+  std::vector<uint16_t, fused_cpp::PageAllocator<uint16_t>> input;
+  std::vector<uint16_t, fused_cpp::PageAllocator<uint16_t>> intermediate;
 };
 
 constexpr int64_t kMaxExecutorThreads = 256;

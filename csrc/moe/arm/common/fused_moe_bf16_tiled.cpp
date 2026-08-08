@@ -46,6 +46,8 @@
 #include "gemm_params.h"
 #include "../sve_bf16/jit_kernels.h"
 #include "../sve_bf16/packing.h"
+#include "../../../page_policy.h"
+#include "../../../page_tensor.h"
 #include "../../../profile_utils.h"
 
 extern "C" {
@@ -3580,103 +3582,31 @@ struct alignas(128) MoeThreadTraceBuffer {
   bool metadata_initialized = false;
 };
 
-// Backend for scratch-buffer memory, selected once from the environment:
-//   FUSED_CPP_MOE_HUGETLB=1        -> explicit hugetlbfs pages (MAP_HUGETLB),
-//                                     size FUSED_CPP_MOE_HUGETLB_MB (default 32)
-//   FUSED_CPP_MOE_THP != 0 (default)-> anon mmap + madvise(MADV_HUGEPAGE)
-//   FUSED_CPP_MOE_THP == 0         -> plain operator new (4KB pages)
-// Rounding is fixed per mode, so deallocate() recomputes the mmap length from
-// n without extra bookkeeping. hugetlb falls back to a same-length THP mmap if
-// the pool is exhausted (keeps the deallocate length deterministic).
-#ifndef MAP_HUGE_SHIFT
-#define MAP_HUGE_SHIFT 26
-#endif
-#ifndef MAP_HUGETLB
-#define MAP_HUGETLB 0x40000
-#endif
+// Scratch-buffer page backing is decided by csrc/page_policy.h, which owns the
+// single environment surface (FUSED_CPP_PAGES / FUSED_CPP_PAGE_SIZE_MB /
+// FUSED_CPP_HUGETLBFS_PATH) and still honours the older FUSED_CPP_MOE_HUGETLB,
+// FUSED_CPP_MOE_HUGETLB_MB and FUSED_CPP_MOE_THP names as deprecated aliases.
+// The names below are kept so existing call sites read unchanged.
 enum class ScratchBackend { kMalloc, kThp, kHugetlb };
+
 inline ScratchBackend scratch_backend() {
-  static const ScratchBackend b = [] {
-#ifdef __linux__
-    const char* hg = std::getenv("FUSED_CPP_MOE_HUGETLB");
-    if (hg != nullptr && hg[0] != '0' && hg[0] != '\0') return ScratchBackend::kHugetlb;
-    const char* thp = std::getenv("FUSED_CPP_MOE_THP");
-    if (thp == nullptr || thp[0] != '0') return ScratchBackend::kThp;
-    return ScratchBackend::kMalloc;
-#else
-    return ScratchBackend::kMalloc;
-#endif
-  }();
-  return b;
+  switch (fused_cpp::page_config().policy) {
+    case fused_cpp::PagePolicy::kHugetlb:
+      return ScratchBackend::kHugetlb;
+    case fused_cpp::PagePolicy::kThp:
+      return ScratchBackend::kThp;
+    case fused_cpp::PagePolicy::kSmall:
+      break;
+  }
+  return ScratchBackend::kMalloc;
 }
-inline size_t scratch_hugetlb_bytes() {
-  static const size_t b = [] {
-    const char* mb = std::getenv("FUSED_CPP_MOE_HUGETLB_MB");
-    size_t m = (mb != nullptr) ? static_cast<size_t>(std::atoi(mb)) : 32;
-    if (m == 0) m = 32;
-    return m << 20;
-  }();
-  return b;
-}
+
+inline size_t scratch_hugetlb_bytes() { return fused_cpp::page_config().hugetlb_bytes; }
+
 inline size_t round_up_pow2(size_t x, size_t p) { return (x + p - 1) & ~(p - 1); }
 
 template <typename T>
-struct backend_allocator {
-  using value_type = T;
-  backend_allocator() noexcept = default;
-  template <typename U>
-  backend_allocator(const backend_allocator<U>&) noexcept {}
-  T* allocate(std::size_t n) {
-    const size_t bytes = n * sizeof(T);
-#ifdef __linux__
-    const ScratchBackend b = scratch_backend();
-    if (b == ScratchBackend::kHugetlb) {
-      const size_t hp = scratch_hugetlb_bytes();
-      const size_t len = round_up_pow2(bytes, hp);
-      const int shift = __builtin_ctzll(hp);
-      void* pv = ::mmap(nullptr, len, PROT_READ | PROT_WRITE,
-                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | (shift << MAP_HUGE_SHIFT), -1, 0);
-      if (pv == MAP_FAILED) {  // pool exhausted: same-length THP fallback
-        pv = ::mmap(nullptr, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        if (pv == MAP_FAILED) throw std::bad_alloc();
-        ::madvise(pv, len, MADV_HUGEPAGE);
-      }
-      return static_cast<T*>(pv);
-    }
-    if (b == ScratchBackend::kThp) {
-      const size_t len = round_up_pow2(bytes, size_t{2} << 20);
-      void* pv = ::mmap(nullptr, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-      if (pv == MAP_FAILED) throw std::bad_alloc();
-      ::madvise(pv, len, MADV_HUGEPAGE);
-      return static_cast<T*>(pv);
-    }
-#endif
-    return static_cast<T*>(::operator new(bytes));
-  }
-  void deallocate(T* p, std::size_t n) noexcept {
-    [[maybe_unused]] const size_t bytes = n * sizeof(T);
-#ifdef __linux__
-    const ScratchBackend b = scratch_backend();
-    if (b == ScratchBackend::kHugetlb) {
-      ::munmap(p, round_up_pow2(bytes, scratch_hugetlb_bytes()));
-      return;
-    }
-    if (b == ScratchBackend::kThp) {
-      ::munmap(p, round_up_pow2(bytes, size_t{2} << 20));
-      return;
-    }
-#endif
-    ::operator delete(p);
-  }
-  template <typename U>
-  bool operator==(const backend_allocator<U>&) const noexcept {
-    return true;
-  }
-  template <typename U>
-  bool operator!=(const backend_allocator<U>&) const noexcept {
-    return false;
-  }
-};
+using backend_allocator = fused_cpp::PageAllocator<T>;
 
 // Allocator that default-initializes (rather than value-initializes) elements,
 // so vector::resize() on a trivial type allocates WITHOUT zeroing. Used for
@@ -3706,11 +3636,11 @@ struct default_init_allocator : Base {
 struct HierarchicalGroupScratch {
   explicit HierarchicalGroupScratch(int64_t group_size) : barrier(group_size) {}
 
-  std::vector<uint16_t> input;
+  std::vector<uint16_t, backend_allocator<uint16_t>> input;
   std::vector<uint16_t, backend_allocator<uint16_t>> intermediate;
-  std::vector<uint16_t> a_reorder;
+  std::vector<uint16_t, backend_allocator<uint16_t>> a_reorder;
   std::vector<uint16_t, default_init_allocator<uint16_t, backend_allocator<uint16_t>>> packed_a;
-  std::vector<float> gate_up;
+  std::vector<float, backend_allocator<float>> gate_up;
   std::vector<float, default_init_allocator<float, backend_allocator<float>>> down;
   std::vector<uint16_t, default_init_allocator<uint16_t, backend_allocator<uint16_t>>> down_bf16;
   std::atomic<int64_t> current_expert{-1};
@@ -4652,7 +4582,7 @@ struct VllmStagedNTask {
 };
 
 struct VllmStagedThreadScratch {
-  std::vector<uint16_t> packed_a;
+  std::vector<uint16_t, backend_allocator<uint16_t>> packed_a;
 };
 
 int64_t vllm_staged_available_l2_bytes() {
@@ -4722,13 +4652,13 @@ std::vector<VllmStagedNTask> build_vllm_staged_tasks(int64_t num_experts, int64_
 }
 
 struct ThreadScratch {
-  std::vector<uint16_t> input;
-  std::vector<uint16_t> intermediate;
-  std::vector<uint16_t> a_reorder;
-  std::vector<uint16_t> packed_a;
-  std::vector<float> gate_up;
-  std::vector<float> down;
-  std::vector<uint16_t> down_bf16;
+  std::vector<uint16_t, backend_allocator<uint16_t>> input;
+  std::vector<uint16_t, backend_allocator<uint16_t>> intermediate;
+  std::vector<uint16_t, backend_allocator<uint16_t>> a_reorder;
+  std::vector<uint16_t, backend_allocator<uint16_t>> packed_a;
+  std::vector<float, backend_allocator<float>> gate_up;
+  std::vector<float, backend_allocator<float>> down;
+  std::vector<uint16_t, backend_allocator<uint16_t>> down_bf16;
 };
 
 struct ScheduledWaveRuntime {
@@ -4861,13 +4791,13 @@ struct ScheduledTeamScratch {
   int64_t threads = 0;
   int64_t max_rows = 0;
   int64_t a_reorder_stride = 0;
-  std::vector<uint16_t> input;
-  std::vector<uint16_t> intermediate;
-  std::vector<uint16_t> a_reorder;
-  std::vector<uint16_t> packed_a;
-  std::vector<float> gate_up;
-  std::vector<float> down;
-  std::vector<uint16_t> down_bf16;
+  std::vector<uint16_t, backend_allocator<uint16_t>> input;
+  std::vector<uint16_t, backend_allocator<uint16_t>> intermediate;
+  std::vector<uint16_t, backend_allocator<uint16_t>> a_reorder;
+  std::vector<uint16_t, backend_allocator<uint16_t>> packed_a;
+  std::vector<float, backend_allocator<float>> gate_up;
+  std::vector<float, backend_allocator<float>> down;
+  std::vector<uint16_t, backend_allocator<uint16_t>> down_bf16;
   ThreadBarrier barrier;
 };
 
@@ -5851,8 +5781,12 @@ fused_moe_bf16_tiled_prepare_weights(at::Tensor w13_weight, at::Tensor w2_weight
   const int64_t K2_pad = backend.round_k(static_cast<int>(K2));
   const int64_t N2_pad = backend.round_n(static_cast<int>(N2));
 
-  at::Tensor w13_packed = at::empty({E, K13_pad * N13_pad}, w13_weight.options());
-  at::Tensor w2_packed = at::empty({E, K2_pad * N2_pad}, w2_weight.options());
+  // Packed weights are the largest and hottest buffers in the whole path, so
+  // they come from the shared page policy rather than the CPU caching allocator.
+  // This also removes the second full-size copy the Python layer used to make in
+  // order to relocate them onto a hugetlbfs file.
+  at::Tensor w13_packed = fused_cpp::page_backed_empty({E, K13_pad * N13_pad}, w13_weight.options());
+  at::Tensor w2_packed = fused_cpp::page_backed_empty({E, K2_pad * N2_pad}, w2_weight.options());
 
   const uint16_t* w13_ptr = bf16_data_const(w13_weight);
   const uint16_t* w2_ptr = bf16_data_const(w2_weight);

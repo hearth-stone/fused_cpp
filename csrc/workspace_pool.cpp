@@ -1,5 +1,7 @@
 #include "workspace_pool.h"
 
+#include "page_policy.h"
+
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
@@ -14,7 +16,12 @@
 namespace fused_cpp::workspace {
 namespace {
 
-constexpr std::size_t kHugePageBytes = 2 * 1024 * 1024;
+// Slab granularity. Follows the shared page policy so a hugetlb configuration
+// hands out whole huge pages instead of 2 MiB THP-aligned chunks.
+std::size_t SlabGranularity() {
+  const fused_cpp::PageConfig& config = fused_cpp::page_config();
+  return config.policy == fused_cpp::PagePolicy::kHugetlb ? config.hugetlb_bytes : fused_cpp::kThpAlignBytes;
+}
 constexpr std::size_t kDefaultInitialBytes = 128 * 1024 * 1024;
 
 bool EnvDisabled() {
@@ -77,15 +84,8 @@ void Prefault(void* ptr, std::size_t bytes) {
   p[bytes - 1] = 0;
 }
 
-void PreferHugePages(void* ptr, std::size_t bytes) {
-#if defined(__linux__) && defined(MADV_HUGEPAGE)
-  (void)madvise(ptr, bytes, MADV_HUGEPAGE);
-#else
-  (void)ptr;
-  (void)bytes;
-#endif
-}
-
+// page_alloc already applies MADV_HUGEPAGE, so only the stronger collapse hint
+// stays local: it is worth issuing after prefaulting, once the pages exist.
 void CollapseHugePages(void* ptr, std::size_t bytes) {
 #if defined(__linux__) && defined(MADV_COLLAPSE)
   (void)madvise(ptr, bytes, MADV_COLLAPSE);
@@ -99,14 +99,17 @@ struct Slab {
   void* ptr = nullptr;
   std::size_t capacity = 0;
   std::size_t offset = 0;
+  // page_free recomputes the mapping length from the requested size, so keep it.
+  std::size_t request = 0;
 
   Slab() = default;
   Slab(const Slab&) = delete;
   Slab& operator=(const Slab&) = delete;
-  Slab(Slab&& other) noexcept : ptr(other.ptr), capacity(other.capacity), offset(other.offset) {
+  Slab(Slab&& other) noexcept : ptr(other.ptr), capacity(other.capacity), offset(other.offset), request(other.request) {
     other.ptr = nullptr;
     other.capacity = 0;
     other.offset = 0;
+    other.request = 0;
   }
   Slab& operator=(Slab&& other) noexcept {
     if (this != &other) {
@@ -114,9 +117,11 @@ struct Slab {
       ptr = other.ptr;
       capacity = other.capacity;
       offset = other.offset;
+      request = other.request;
       other.ptr = nullptr;
       other.capacity = 0;
       other.offset = 0;
+      other.request = 0;
     }
     return *this;
   }
@@ -126,14 +131,11 @@ struct Slab {
     if (ptr == nullptr) {
       return;
     }
-#if defined(__unix__) || defined(__APPLE__)
-    munmap(ptr, capacity);
-#else
-    std::free(ptr);
-#endif
+    fused_cpp::page_free(ptr, request);
     ptr = nullptr;
     capacity = 0;
     offset = 0;
+    request = 0;
   }
 };
 
@@ -168,7 +170,7 @@ class WorkspacePoolImpl {
         return static_cast<std::uint8_t*>(slab.ptr) + begin;
       }
     }
-    add_slab(std::max(kDefaultInitialBytes, RoundUp(bytes + alignment, kHugePageBytes)));
+    add_slab(std::max(kDefaultInitialBytes, RoundUp(bytes + alignment, SlabGranularity())));
     return alloc(bytes, alignment);
   }
 
@@ -183,15 +185,10 @@ class WorkspacePoolImpl {
 
   void add_slab(std::size_t bytes) {
     Slab slab;
-    slab.capacity = RoundUp(bytes, kHugePageBytes);
-#if defined(__unix__) || defined(__APPLE__)
-    slab.ptr = mmap(nullptr, slab.capacity, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    TORCH_CHECK(slab.ptr != MAP_FAILED, "workspace mmap failed for ", slab.capacity, " bytes");
-    PreferHugePages(slab.ptr, slab.capacity);
-#else
-    slab.ptr = std::aligned_alloc(kHugePageBytes, slab.capacity);
-    TORCH_CHECK(slab.ptr != nullptr, "workspace aligned_alloc failed for ", slab.capacity, " bytes");
-#endif
+    slab.request = RoundUp(bytes, SlabGranularity());
+    slab.ptr = fused_cpp::page_alloc(slab.request);
+    TORCH_CHECK(slab.ptr != nullptr, "workspace page_alloc failed for ", slab.request, " bytes");
+    slab.capacity = fused_cpp::page_alloc_length(slab.request);
     Prefault(slab.ptr, slab.capacity);
     CollapseHugePages(slab.ptr, slab.capacity);
     slabs.emplace_back(std::move(slab));

@@ -2,6 +2,7 @@
 #include <torch/extension.h>
 #include <pybind11/stl.h>
 
+#include "../page_policy.h"
 #include "common/api.h"
 #include "common/backend.h"
 
@@ -155,4 +156,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("num_threads") = 1, py::arg("global_num_experts") = -1, py::arg("fuse_silu") = true,
         py::arg("silu_poly_degree") = 5, py::arg("gemm_backend") = 1, py::arg("backend_n_tile") = 8,
         py::arg("out") = c10::nullopt, py::call_guard<py::gil_scoped_release>());
+
+  m.def(
+      "page_policy_info",
+      [] {
+        py::dict info;
+        for (const auto& [key, value] : fused_cpp::page_policy_strings()) info[key.c_str()] = value;
+        for (const auto& [key, value] : fused_cpp::page_policy_counters()) info[key.c_str()] = value;
+        return info;
+      },
+      "Report the resolved page-backing policy and live allocation counters.");
 }

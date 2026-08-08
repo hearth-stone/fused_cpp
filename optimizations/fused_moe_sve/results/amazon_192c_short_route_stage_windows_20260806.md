@@ -458,6 +458,29 @@ all five presets move within +-0.78% end to end, against a `legacy` variant that
 swings -1.28% to +0.34% in the same comparison, and every chosen shape is
 unchanged. The gain is latent, like the 49-95 fill.
 
+## Result 8: the threshold is not a paging artifact
+
+`2*M*K` crossing L2 is a cache-capacity claim, but a 4 KiB-paged A scan of 2 MiB
+is 512 pages, so a TLB effect could masquerade as one. The unified page policy
+makes that directly testable: `FUSED_CPP_PAGES` selects 4 KiB pages, transparent
+huge pages or 32 MiB `MAP_HUGETLB` for every buffer in the path, including the
+packed A staging area.
+
+Useful packed-B bandwidth in GB/s at `24x4T`, `w2` held at 0.125 MiB per thread,
+for `w13` at 0.125 / 0.25 / 0.5 MiB per thread:
+
+| M | A/L2 | thp | hugetlb 32M | small 4K | best |
+| ---: | ---: | :--- | :--- | :--- | ---: |
+| 192 | 0.75 | **108.7** / 108.3 / 102.8 | **108.7** / 107.9 / 103.1 | **108.8** / 108.2 / 103.1 | 1/8 |
+| 224 | 0.88 | 89.4 / 87.6 / **90.1** | 89.2 / 87.8 / **90.0** | 88.5 / 88.7 / **89.5** | 1/2 |
+| 256 | 1.00 | 63.7 / 70.8 / **78.4** | 63.7 / 71.0 / **78.4** | 63.3 / 71.5 / **78.1** | 1/2 |
+
+The optimum is identical under all three, the step between `M=192` and `M=224`
+appears under all three, and the absolute numbers agree within 0.6%. Page size
+therefore neither moves the threshold nor changes its magnitude, so it is a cache
+capacity effect and not a translation one. This also settles the A-side TLB
+question empirically rather than by assumption.
+
 ## Not established
 
 - The band ties the W13 and W2 targets to one per-thread window. Result 4 shows
@@ -475,7 +498,8 @@ unchanged. The gain is latent, like the 49-95 fill.
   isolated gain has no end-to-end confirmation.
 - The LLC-to-DRAM segment is still unmeasured. `ll_cache_miss_rd` counts only
   demand misses, `13 MB` where `2.4 GB` actually moved, and
-  `l3d_cache_refill` reads zero on Neoverse-V3.
+  `l3d_cache_refill` reads zero on Neoverse-V3. Result 8 rules out paging as an
+  explanation but says nothing about which cache level retains what.
 - One host, one profile identity. The policy is profile-bound by design, so the
   band must not be extrapolated to other machines, `F` values or parallel
   degrees without repeating the measurement.
@@ -508,5 +532,7 @@ unchanged. The gain is latent, like the 49-95 fill.
 - `results/data/stage_window_omega_20260807/thresh_m{120..320}.json` and
   `thresh_m256_t{1,2,8}.json`: the shared-A threshold sweep and its width check.
 - `results/data/stage_window_omega_20260807/v4_{preset}.json`: the V3-to-V4 A/B.
+- `results/data/stage_window_omega_20260807/pages_{thp,hugetlb,small}_m{192,224,256}.json`:
+  the page-size control for the threshold.
 - `results/data/heterogeneous_overlap_20260806/`: the earlier 195-expert sweeps
   and the heterogeneous co-scheduling probes that led to this measurement.

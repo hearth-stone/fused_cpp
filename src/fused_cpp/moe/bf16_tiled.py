@@ -45,9 +45,7 @@ try:
     _fused_moe_bf16_tiled_async_plan_v2_elastic_impl = getattr(
         _moe_native, "fused_moe_bf16_tiled_async_plan_v2_elastic", None
     )
-    _fused_moe_bf16_tiled_planned_staged_impl = getattr(
-        _moe_native, "fused_moe_bf16_tiled_planned_staged", None
-    )
+    _fused_moe_bf16_tiled_planned_staged_impl = getattr(_moe_native, "fused_moe_bf16_tiled_planned_staged", None)
     _fused_moe_bf16_tiled_vllm_staged_impl = _moe_native.fused_moe_bf16_tiled_vllm_staged
     _prepare_bf16_tiled_impl = _moe_native.fused_moe_bf16_tiled_prepare_weights
     _available_backends_impl = _moe_native.fused_moe_bf16_tiled_available_backends
@@ -278,8 +276,19 @@ def _maybe_move_packed_weights_to_hugetlbfs(
     w13: torch.Tensor,
     w2: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compatibility shim for the pre-page-policy relocation path.
+
+    The native packing routine now allocates packed weights through the shared
+    page policy (``FUSED_CPP_PAGES`` / ``FUSED_CPP_PAGE_SIZE_MB`` /
+    ``FUSED_CPP_HUGETLBFS_PATH``), so they already sit on the requested pages and
+    relocating them here would only add a second full-size copy of the largest
+    buffer in the path. ``FUSED_CPP_MOE_FORCE_HUGETLBFS_COPY=1`` restores the old
+    behaviour for comparison.
+    """
     raw_path = os.environ.get(_HUGETLBFS_PATH_ENV, "").strip()
     if not raw_path:
+        return w13, w2
+    if os.environ.get("FUSED_CPP_MOE_FORCE_HUGETLBFS_COPY", "").strip() in ("", "0"):
         return w13, w2
     mount_path = Path(raw_path)
     page_size = _hugetlbfs_page_size(mount_path)
@@ -617,9 +626,7 @@ def decode_async_moe_elastic_stats(stats: torch.Tensor) -> dict[str, int]:
     if stats.device.type != "cpu" or stats.dtype != torch.int64:
         raise TypeError("elastic stats must be a CPU torch.int64 tensor")
     if stats.numel() < len(ASYNC_MOE_ELASTIC_STATS_FIELDS):
-        raise ValueError(
-            f"elastic stats must contain at least {len(ASYNC_MOE_ELASTIC_STATS_FIELDS)} values"
-        )
+        raise ValueError(f"elastic stats must contain at least {len(ASYNC_MOE_ELASTIC_STATS_FIELDS)} values")
     values = stats.reshape(-1).tolist()[: len(ASYNC_MOE_ELASTIC_STATS_FIELDS)]
     return dict(zip(ASYNC_MOE_ELASTIC_STATS_FIELDS, map(int, values), strict=True))
 
@@ -654,9 +661,7 @@ def fused_moe_bf16_tiled_async_plan(
     materialized = plan if isinstance(plan, AsyncMoEPlanV2) else AsyncMoEPlanV2.from_dict(plan)
     if materialized.execution_mode == ASYNC_MOE_EXECUTION_ELASTIC:
         if _fused_moe_bf16_tiled_async_plan_v2_elastic_impl is None:
-            raise RuntimeError(
-                "elastic Plan V2 requires native fused_moe_bf16_tiled_async_plan_v2_elastic support"
-            )
+            raise RuntimeError("elastic Plan V2 requires native fused_moe_bf16_tiled_async_plan_v2_elastic support")
     elif elastic_stats_out is not None:
         raise ValueError("elastic_stats_out is only valid for elastic Plan V2 execution")
     if _fused_moe_bf16_tiled_async_plan_v2_impl is None:
@@ -712,10 +717,7 @@ def fused_moe_bf16_tiled_async_plan(
         if not elastic_stats_out.is_contiguous():
             raise ValueError("elastic_stats_out must be contiguous")
         if elastic_stats_out.numel() < len(ASYNC_MOE_ELASTIC_STATS_FIELDS):
-            raise ValueError(
-                "elastic_stats_out must contain at least "
-                f"{len(ASYNC_MOE_ELASTIC_STATS_FIELDS)} values"
-            )
+            raise ValueError(f"elastic_stats_out must contain at least {len(ASYNC_MOE_ELASTIC_STATS_FIELDS)} values")
 
     common_args = (
         input.contiguous(),
@@ -808,9 +810,7 @@ def fused_moe_bf16_tiled_planned_staged(
             "BF16 tiled planned-staged MoE backend is unavailable; rebuild the "
             "C++ extension with fused_moe_bf16_tiled_planned_staged support."
         )
-    materialized_w13 = (
-        w13_plan if isinstance(w13_plan, AsyncMoEPlanV2) else AsyncMoEPlanV2.from_dict(w13_plan)
-    )
+    materialized_w13 = w13_plan if isinstance(w13_plan, AsyncMoEPlanV2) else AsyncMoEPlanV2.from_dict(w13_plan)
     materialized_w2 = w2_plan if isinstance(w2_plan, AsyncMoEPlanV2) else AsyncMoEPlanV2.from_dict(w2_plan)
     if materialized_w13.num_threads != materialized_w2.num_threads:
         raise ValueError(

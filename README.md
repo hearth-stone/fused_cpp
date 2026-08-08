@@ -258,6 +258,31 @@ pytest -m bench -s tests/bench_sdpa_versions.py \
 | `FUSED_MLA_USE_ORIG_RMSNORM=1` | Delegate RMSNorm to the wrapper's layernorm instead of the internal implementation |
 | `FUSED_MLA_USE_ORIG_ROPE=1` | Delegate RoPE to the wrapper's `rotary_emb` instead of the internal implementation |
 
+## Memory Page Policy
+
+Every large buffer — MoE scratch, the attention workspace pool, and the packed
+MoE weights — is backed through one policy, so the page size is chosen in a
+single place rather than per allocation site.
+
+| Variable | Effect |
+| --- | --- |
+| `FUSED_CPP_PAGES=small\|thp\|hugetlb` | Page backing. `thp` (default) uses anonymous `mmap` plus `madvise(MADV_HUGEPAGE)`; `hugetlb` uses `MAP_HUGETLB` and falls back to `thp` if the pool is exhausted; `small` uses plain aligned allocation. |
+| `FUSED_CPP_PAGE_SIZE_MB=<int>` | Huge page size for `hugetlb`, default `32`. Must be a power of two the kernel supports, otherwise the default is used. |
+| `FUSED_CPP_PAGE_MIN_KB=<int>` | Smallest request that may consume a whole huge page; smaller ones use `thp`. Defaults to one full page, which keeps waste per mapping under 2x. Without it many small scratch buffers each round up to a whole page. |
+| `FUSED_CPP_HUGETLBFS_PATH=<mount>` | Implies `hugetlb` and probes the page size from the mount. |
+
+`fused_cpp._moe_C.page_policy_info()` reports what was actually resolved plus
+live, peak and fallback counters. The policy latches on the first allocation,
+because freeing recomputes the mapping length from it, so change it through the
+environment before the first forward pass rather than mid-run.
+
+`FUSED_CPP_MOE_HUGETLB`, `FUSED_CPP_MOE_HUGETLB_MB`, `FUSED_CPP_MOE_THP` and
+`FUSED_CPP_MOE_HUGETLBFS_PATH` remain as deprecated aliases and are consulted
+only when none of the variables above are set. Packed weights are now allocated
+on the requested pages directly; `FUSED_CPP_MOE_FORCE_HUGETLBFS_COPY=1` restores
+the older behaviour of relocating them after packing, which costs a second
+full-size copy and twice the huge-page budget.
+
 ## Build-Time Environment Variables
 
 | Variable | Effect |
