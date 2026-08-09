@@ -60,6 +60,8 @@ _V2_SEQUENCE_FIELDS = (
 )
 
 _V2_OPTIONAL_PER_TASK_FIELDS = (
+    "task_w13_ranges",
+    "task_w2_ranges",
     "task_w13_window_bytes",
     "task_w2_window_bytes",
     "task_release_ns",
@@ -68,6 +70,8 @@ _V2_OPTIONAL_PER_TASK_FIELDS = (
 )
 
 _V2_OPTIONAL_PER_TASK_DEFAULTS = {
+    "task_w13_ranges": -1,
+    "task_w2_ranges": -1,
     "task_w13_window_bytes": -1,
     "task_w2_window_bytes": -1,
     "task_release_ns": 0,
@@ -149,6 +153,8 @@ class AsyncMoEPlanV2:
     task_stage_ids: torch.Tensor
     task_resize_points: torch.Tensor
     task_range_granularities: torch.Tensor
+    task_w13_ranges: torch.Tensor | None = None
+    task_w2_ranges: torch.Tensor | None = None
     task_w13_window_bytes: torch.Tensor | None = None
     task_w2_window_bytes: torch.Tensor | None = None
     task_release_ns: torch.Tensor | None = None
@@ -272,6 +278,8 @@ class AsyncMoEPlanV2:
             "task_stage_ids": self.task_stage_ids,
             "task_resize_points": self.task_resize_points,
             "task_range_granularities": self.task_range_granularities,
+            "task_w13_ranges": self.task_w13_ranges,
+            "task_w2_ranges": self.task_w2_ranges,
             "task_w13_window_bytes": self.task_w13_window_bytes,
             "task_w2_window_bytes": self.task_w2_window_bytes,
             "task_release_ns": self.task_release_ns,
@@ -311,18 +319,32 @@ class AsyncMoEPlanV2:
                 raise ValueError(
                     f"route-sliced expert {expert} must use one shared positive granularity"
                 )
+        assert self.task_w13_ranges is not None
+        assert self.task_w2_ranges is not None
         assert self.task_w13_window_bytes is not None
         assert self.task_w2_window_bytes is not None
         assert self.task_release_ns is not None
         assert self.task_resize_timeout_ns is not None
         assert self.task_preferred_core_begins is not None
+        w13_ranges = _values(self.task_w13_ranges)
+        w2_ranges = _values(self.task_w2_ranges)
         w13_window_bytes = _values(self.task_w13_window_bytes)
         w2_window_bytes = _values(self.task_w2_window_bytes)
         release_ns = _values(self.task_release_ns)
         resize_timeout_ns = _values(self.task_resize_timeout_ns)
         preferred_core_begins = _values(self.task_preferred_core_begins)
+        if any(value == 0 or value < -1 for value in (*w13_ranges, *w2_ranges)):
+            raise ValueError("per-task stage ranges must be -1 (inherit) or positive")
         if any(value < -1 for value in (*w13_window_bytes, *w2_window_bytes)):
             raise ValueError("per-task stage windows must be -1 (inherit) or non-negative")
+        if any(
+            ranges >= 1 and window_bytes >= 0
+            for ranges, window_bytes in (
+                *zip(w13_ranges, w13_window_bytes, strict=True),
+                *zip(w2_ranges, w2_window_bytes, strict=True),
+            )
+        ):
+            raise ValueError("a task stage cannot specify both ranges and window bytes")
         if any(value < 0 for value in release_ns):
             raise ValueError("task_release_ns must be non-negative")
         if self.execution_mode != ASYNC_MOE_EXECUTION_STRICT and any(release_ns):
@@ -558,6 +580,8 @@ def upgrade_legacy_async_plan(plan: Mapping[str, object]) -> dict[str, object]:
         "task_stage_ids": [ASYNC_MOE_STAGE_EXPERT] * num_tasks,
         "task_resize_points": [ASYNC_MOE_RESIZE_NONE] * num_tasks,
         "task_range_granularities": [ASYNC_MOE_FULL_EXPERT_RANGE] * num_tasks,
+        "task_w13_ranges": [-1] * num_tasks,
+        "task_w2_ranges": [-1] * num_tasks,
         "task_w13_window_bytes": [-1] * num_tasks,
         "task_w2_window_bytes": [-1] * num_tasks,
         "task_release_ns": [0] * num_tasks,

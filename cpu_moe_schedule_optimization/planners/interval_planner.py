@@ -74,6 +74,8 @@ class PlannerCostModel(Protocol):
 
     def task_stage_bytes(self, stage: str, routes: int, threads: int) -> int: ...
 
+    def task_stage_ranges(self, routes: int, threads: int) -> tuple[int, int]: ...
+
     def stage_window_bytes_per_worker(self, stage: str, threads: int, routes: int | None = None) -> int: ...
 
     def supports_shape(self, shape) -> bool: ...
@@ -1077,6 +1079,26 @@ class IntervalPlanner:
             w2_windows.append(int(w2_bytes))
         return w13_windows, w2_windows
 
+    def _task_stage_ranges(
+        self,
+        tasks,
+        w13_threads: Sequence[int],
+        w2_threads: Sequence[int] | None = None,
+    ) -> tuple[list[int], list[int]]:
+        if w2_threads is None:
+            w2_threads = w13_threads
+        w13_ranges: list[int] = []
+        w2_ranges: list[int] = []
+        for values, w13_width, w2_width in zip(tasks, w13_threads, w2_threads, strict=True):
+            _, routes, _, _, _ = values
+            resolved_w13, _ = self.model.task_stage_ranges(int(routes), int(w13_width))
+            _, resolved_w2 = self.model.task_stage_ranges(int(routes), int(w2_width))
+            if min(resolved_w13, resolved_w2) <= 0:
+                raise ValueError("cost model must resolve positive per-task stage ranges")
+            w13_ranges.append(int(resolved_w13))
+            w2_ranges.append(int(resolved_w2))
+        return w13_ranges, w2_ranges
+
     def _early_merge_policy(self, tasks) -> bool | None:
         """Disable early merge only when the model predicts no overlap window."""
         if self.stage is not None:
@@ -1120,7 +1142,7 @@ class IntervalPlanner:
             flat_dependencies.extend(dependencies)
             dependency_offsets.append(len(flat_dependencies))
         task_threads = [threads for _, _, _, threads, _ in tasks]
-        task_w13_window_bytes, task_w2_window_bytes = self._task_stage_windows(tasks, task_threads)
+        task_w13_ranges, task_w2_ranges = self._task_stage_ranges(tasks, task_threads)
         num_tasks = len(tasks)
         expert_task_counts: dict[int, int] = {}
         expert_slice_rows: dict[int, int] = {}
@@ -1157,8 +1179,10 @@ class IntervalPlanner:
             "task_stage_ids": [_ASYNC_STAGE_EXPERT] * num_tasks,
             "task_resize_points": [_ASYNC_RESIZE_NONE] * num_tasks,
             "task_range_granularities": task_range_granularities,
-            "task_w13_window_bytes": task_w13_window_bytes,
-            "task_w2_window_bytes": task_w2_window_bytes,
+            "task_w13_ranges": task_w13_ranges,
+            "task_w2_ranges": task_w2_ranges,
+            "task_w13_window_bytes": [-1] * num_tasks,
+            "task_w2_window_bytes": [-1] * num_tasks,
             "task_release_ns": [0] * num_tasks,
             "task_resize_timeout_ns": [0] * num_tasks,
             "task_preferred_core_begins": [-1] * num_tasks,
@@ -1269,7 +1293,7 @@ class IntervalPlanner:
             timeouts.append(int(resize_timeout_ns))
             preferred_core_begins.append(int(cohort_begin))
 
-        w13_windows, w2_windows = self._task_stage_windows(tasks, selected, preferred)
+        w13_ranges, w2_ranges = self._task_stage_ranges(tasks, selected, preferred)
         bridge.update(
             {
                 "execution_mode": _ASYNC_EXECUTION_ELASTIC,
@@ -1280,8 +1304,10 @@ class IntervalPlanner:
                 "task_allowed_threads": allowed_widths,
                 "task_numa_nodes": task_numa_nodes,
                 "task_resize_points": resize_points,
-                "task_w13_window_bytes": w13_windows,
-                "task_w2_window_bytes": w2_windows,
+                "task_w13_ranges": w13_ranges,
+                "task_w2_ranges": w2_ranges,
+                "task_w13_window_bytes": [-1] * num_tasks,
+                "task_w2_window_bytes": [-1] * num_tasks,
                 "task_resize_timeout_ns": timeouts,
                 "task_preferred_core_begins": preferred_core_begins,
             }
@@ -1309,7 +1335,7 @@ class IntervalPlanner:
             dependency_offsets.append(len(flat_dependencies))
 
         task_threads = [pool_threads if pooled[task] else int(values[3]) for task, values in enumerate(tasks)]
-        task_w13_window_bytes, task_w2_window_bytes = self._task_stage_windows(tasks, task_threads)
+        task_w13_ranges, task_w2_ranges = self._task_stage_ranges(tasks, task_threads)
         num_tasks = len(tasks)
         return {
             "plan_version": _ASYNC_PLAN_VERSION,
@@ -1333,8 +1359,10 @@ class IntervalPlanner:
             "task_stage_ids": [_ASYNC_STAGE_EXPERT] * num_tasks,
             "task_resize_points": [_ASYNC_RESIZE_NONE] * num_tasks,
             "task_range_granularities": [_ASYNC_FULL_EXPERT_RANGE] * num_tasks,
-            "task_w13_window_bytes": task_w13_window_bytes,
-            "task_w2_window_bytes": task_w2_window_bytes,
+            "task_w13_ranges": task_w13_ranges,
+            "task_w2_ranges": task_w2_ranges,
+            "task_w13_window_bytes": [-1] * num_tasks,
+            "task_w2_window_bytes": [-1] * num_tasks,
             "task_release_ns": [0] * num_tasks,
             "task_resize_timeout_ns": [0] * num_tasks,
             "task_preferred_core_begins": [-1] * num_tasks,

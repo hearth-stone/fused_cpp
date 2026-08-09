@@ -665,6 +665,8 @@ def fused_moe_bf16_tiled_async_plan(
     elif elastic_stats_out is not None:
         raise ValueError("elastic_stats_out is only valid for elastic Plan V2 execution")
     if _fused_moe_bf16_tiled_async_plan_v2_impl is None:
+        assert materialized.task_w13_ranges is not None
+        assert materialized.task_w2_ranges is not None
         assert materialized.task_w13_window_bytes is not None
         assert materialized.task_w2_window_bytes is not None
         assert materialized.task_release_ns is not None
@@ -674,6 +676,10 @@ def fused_moe_bf16_tiled_async_plan(
             (materialized.task_w2_window_bytes >= 0).any()
         ):
             raise RuntimeError("per-task W13/W2 windows require native fused_moe_bf16_tiled_async_plan_v2 support")
+        if bool((materialized.task_w13_ranges >= 1).any()) or bool(
+            (materialized.task_w2_ranges >= 1).any()
+        ):
+            raise RuntimeError("per-task W13/W2 ranges require native fused_moe_bf16_tiled_async_plan_v2 support")
         if bool((materialized.task_release_ns > 0).any()):
             raise RuntimeError("timed task releases require native fused_moe_bf16_tiled_async_plan_v2 support")
         if materialized.execution_mode == ASYNC_MOE_EXECUTION_STRICT:
@@ -706,6 +712,8 @@ def fused_moe_bf16_tiled_async_plan(
     if not topk_weights.dtype.is_floating_point:
         raise TypeError(f"topk_weights must use a floating dtype, got {topk_weights.dtype}")
     _validate_output_buffer(input, out)
+    assert materialized.task_w13_ranges is not None
+    assert materialized.task_w2_ranges is not None
     assert materialized.task_w13_window_bytes is not None
     assert materialized.task_w2_window_bytes is not None
     assert materialized.task_release_ns is not None
@@ -762,6 +770,8 @@ def fused_moe_bf16_tiled_async_plan(
         out,
         materialized.task_w13_window_bytes.contiguous(),
         materialized.task_w2_window_bytes.contiguous(),
+        materialized.task_w13_ranges.contiguous(),
+        materialized.task_w2_ranges.contiguous(),
         materialized.task_release_ns.contiguous(),
     )
     if materialized.execution_mode == ASYNC_MOE_EXECUTION_ELASTIC:

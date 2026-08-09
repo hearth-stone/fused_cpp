@@ -1342,7 +1342,7 @@ cold search。
 | 并发配置 | 活跃 job 可形成任意满足 CPU 容量的 $(M_i,t_i)$ 组合 | 搜索静态 core shape，并自动比较 strict、threshold/统一宽度 tail-pool 与恰好两个 terminal expert 的一次 bounded repartition；后者可在 exact anchor 命中时把每个 terminal expert 切成两个连续 M slice，使四个 fixed task 覆盖全部核心；实验 elastic 只接受 planner 显式给出的同 NUMA 对齐 W2 cohort，target 必须包含 source 或与其不相交 | static-partition + boundary regroup 剪枝 |
 | Shape 集合 | 所有满足 CPU 容量的整数宽度组合 | empirical backend 只用 profile shape；analytic backend 生成 homogeneous 和至多两种宽度的 shape，再应用 active 工作集规则；tail-pool 和 bounded tail 只从 strict uncertainty band 和最快两个 head shape 派生 | 候选剪枝 |
 | Assignment | 任意 expert-to-resource 调度 | 按 isolated cost 的 LPT；实验 strict tail-steal 保留每条 lane 的 planner 前缀，只从 peer lane 的受限 pending 后缀迁移 whole expert 到同宽空闲 team | 启发式分配与 suffix-steal 剪枝 |
-| Runtime plan contract | task 可携带离散宽度集合、stage/range、resize 边界和动态 placement | bounded tail 在 terminal expert 启动前生成新的 singleton fixed width 和 blocker DAG；exact-anchor route fission 将同一 expert 的连续 M slice 作为多个 strict task，只有全部 slice 完成后才发布 expert completion；tail_pool 保持 whole-expert 动态 placement；实验 strict tail-steal 只接受单 NUMA、同宽、fixed、whole-expert 资源链，并保留 ready-token drain；实验 elastic 才在 W13/W2 边界扩到 preferred cohort；离线 cold-phase lowering 可为 strict fixed task 添加非负 release lower bound，非零时关闭 tail-steal | 单次 expert-boundary 重分区、受限未启动 task 迁移、实验 stage resize 与实验 task release 剪枝 |
+| Runtime plan contract | task 可携带离散宽度集合、stage/range、resize 边界和动态 placement | bounded tail 在 terminal expert 启动前生成新的 singleton fixed width 和 blocker DAG；每个 production whole-expert task 显式携带由 $(M,t)$ 唯一解析的正整数 $(R_{13},R_2)$，W2 GEMM/scatter 共用 $R_2$；迁移期 `-1` 继承和 byte-window 仅兼容手写旧 plan，且同一 stage 禁止同时指定 byte/range；exact-anchor route fission 将同一 expert 的连续 M slice 作为多个 strict task，只有全部 slice 完成后才发布 expert completion；tail_pool 保持 whole-expert 动态 placement；实验 strict tail-steal 只接受单 NUMA、同宽、fixed、whole-expert 资源链，并保留 ready-token drain；实验 elastic 才在 W13/W2 边界扩到 preferred cohort；离线 cold-phase lowering 可为 strict fixed task 添加非负 release lower bound，非零时关闭 tail-steal | 单次 expert-boundary 重分区、受限未启动 task 迁移、实验 stage resize 与实验 task release 剪枝 |
 | Stage coupling | W13/W2 可形成任意满足依赖和容量的 stage DAG | production 使用 whole-expert pipeline；独立 W13/W2 Plan V2 加全局 barrier 仅作为实验 entrypoint，matched/independent 两种计划都不进入默认搜索 | production 粒度剪枝与实验对照 |
 | x86 synchronous executor team mapping | expert 可取任意合法整数宽度并形成任意 wave | API 接受 1--256 workers；均衡 route 用 atomic expert queue，active expert 不足时按 route/当前宽度贪心组 team，强偏斜时按 64-row target 形成有序 wave | planner 外的确定性 runtime mapper |
 | Ordering | 任意可行开始时间和顺序 | 每个 lane 的 LPT 顺序；实验 strict tail-steal 保留 planner 前缀和本地后缀优先，只允许领取 peer lane 的 pending suffix frontier | 顺序剪枝 |
@@ -2175,25 +2175,26 @@ variant 自己的 isolated/contention 实测表。stage simulator 将 W13 的
 $r_{13}$ 个 range 和 W2 的 $r_2$ 个 range 分别推进，不能把 windowed W2
 当成 legacy 单阶段。
 
-profiled kernel variant 仍只选择一个 operator-wide $S_{\mathrm{target}}$。在此
-基础上，Plan V2 可选携带每个 whole-expert task 的两个 stage override：
+profiled kernel variant 仍只选择一个 operator-wide geometry。在此基础上，
+Plan V2 为每个 whole-expert task 显式携带两个 stage range 数：
 
 $$
-(S_{13,i},S_{2,i})=
+(R_{13,i},R_{2,i})=
 g_\theta(M_i,t_i),\qquad
-S^{\mathrm{eff}}_{s,i}=
+R^{\mathrm{eff}}_{s,i}=
 \begin{cases}
-S_{s,i}, & S_{s,i}\ge0,\\
-S_{\mathrm{target}}, & S_{s,i}=-1.
+R_{s,i}, & R_{s,i}\ge1,\\
+R_{s,\mathrm{operator}}, & R_{s,i}=-1.
 \end{cases}
 $$
 
-其中 $M_i$ 是 route 数，$t_i$ 是 task 实际执行宽度；`-1` 表示继承
-operator-wide policy，`0` 表示该 stage 使用 legacy range 规则，正值表示
-tile-aligned byte target。tail-pool task 使用 pool 的实际宽度，而不是原 strict
-head 宽度。$g_\theta$ 是按机器、NUMA、shape 和 kernel identity 命名的确定性
-策略。对每个已有候选 $(v,\sigma)$，planner 先由候选确定各 task 的 $t_i$，再
-唯一解析 $g_\theta(M_i,t_i)$，之后才计算：
+其中 $M_i$ 是 route 数，$t_i$ 是 task 实际执行宽度；正整数是 runtime 必须
+执行的精确、tile-aligned range 数，`-1` 仅供旧的手写 Plan V2 继承
+operator-wide policy。planner 新生成的 plan 不再使用 `-1`。tail-pool task
+使用 pool 的实际宽度，而不是原 strict head 宽度。$g_\theta$ 是按机器、NUMA、
+shape 和 kernel identity 命名的确定性策略。对每个已有候选 $(v,\sigma)$，
+planner 先由候选确定各 task 的 $t_i$，再唯一解析 $g_\theta(M_i,t_i)$，之后才
+计算：
 
 $$
 \widehat C_\theta(v,\sigma)
@@ -2203,8 +2204,15 @@ $$
 
 因此候选集合仍是原来的
 $\mathcal V_{\mathrm{profiled}}\times\Sigma_v$ 加已有 tail-pool 候选，没有增加
-$S_{13}$ 或 $S_2$ 的枚举维度。plan cache 和结果 metadata 必须包含策略名称，
-避免不同规则共享计划。
+$R_{13}$ 或 $R_2$ 的枚举维度。由 $R_{s,i}$ 和 stage 总 tile 数可唯一恢复
+$\widehat S_{s,i}$。plan cache 和结果 metadata 必须包含策略名称与两个 range
+数，避免不同规则共享计划。
+
+迁移期 ABI 仍接受旧的 per-task byte-window 字段，但同一 task/stage 只能指定
+byte window 或 exact range 之一；两者同时出现是非法计划。native runtime 中
+exact range 的优先级高于 operator-wide legacy 规则，并且 W2 GEMM 与
+owner-scatter 必须使用同一个 $R_{2,i}$。byte-window 与 `w13_split` 只作为旧
+调用的兼容输入，后续步骤从公开 API 和 profile identity 删除。
 
 对 empirical phase model，现有 isolated table 仍校准于 global policy；在没有
 独立 window-isolated residual 前，$\widehat I(M,t)$ 保持原表值，不凭空外推
@@ -4132,3 +4140,4 @@ $M=12$、`1/2/4/8T`，并给 W13 的两个端点写入独立标签，保证后�
 | 2026-08-09 | v0.77 | analytical backend 新增公式生成的 per-task W13/W2 stage-window policy：从 tile-aligned 可达集中过滤 L1D 以下窗口、线程饥饿和非二分 owner tile，W13/W2 分别最小化串行增量 ECM 目标；绝对时间继续使用原 ECM maximum/event simulator，planner 搜索空间不增加。machine schema 增加 runtime `backend_n_tile` 和独立 packed-B retention 有效容量，修正文档中旧 `kM/kN` 门限为历史行为（当前 production 固定 `kN`）。两机 interleaved holdout 中，192C median/P90/max regret 为 `1.63/6.57/11.32%`，8C raw 为 `1.39/3.51/15.22%`、p10 敏感性为 `1.30/1.93/2.78%`；8C retention 仍是显式 transferred prior。clean 192C 未过 5% max gate，故 analytic model 自动使用公式 policy，但 empirical production V4 与候选/剪枝保持不变。 |
 | 2026-08-09 | v0.78 | 修正 analytical stage-window cache traffic：A 改为保留一个在途 panel headroom 的物理 resident/streaming 二态；B 的三点 repeated-scan miss 只作用于 $\lfloor C^A_{2,eff}/A_p\rfloor$ 个 transient reuse，之后按 owner stripe 是否超过物理 L2 进入 resident/streaming steady state，避免长 route 把短程残余 miss 乘到全部 panel。选择器将 $\epsilon_{rel}T_{xfer}$ 内的目标视为不可分辨，并在等价集内取最接近 $\max(C_{L1D},2b_s)$ 的 kernel-native 窗口；没有新增 route 表、候选或剪枝。相同 interleaved holdout 上，192C median/P90/max regret 从 `1.63/6.57/11.32%` 降至 `1.50/2.98/3.38%`，28/28 通过 5% gate，median rank rho 由 0.853 升到 0.903；8C raw 仍受强抢占，p10 median/P90/max 为 `2.01/2.61/4.21%`，且 retention 仍为 transferred prior。analytic backend 默认升级到 policy v2；empirical V4 production 和 planner 搜索空间不变。 |
 | 2026-08-09 | v0.79 | 开始移除 split 语义：analytic stage-window policy v3 将 W13 `no-split/split` 归一为显式 $R=1/R=2$ 几何端点，与 inherited 和解析自然窗口在同一目标中评分，不再用旧 split chunk 数限制 $R\ge2$；$M\le12$ 因单 panel 对 B 无重用而由支配关系固定取 W13/W2 $R=1$。候选仍由已选 $(M,t)$ 确定性生成，不扩大 planner shape 空间；empirical profile、Plan V2 ABI 和 native runtime 本步不变。holdout 默认覆盖 M12 与 `1/2/4/8T` 并显式标记两个 W13 端点；v3 实机 gate 留待 range ABI/profile 迁移后刷新。 |
+| 2026-08-09 | v0.80 | Plan V2 与 ARM native runtime 增加 per-task exact $(R_{13},R_2)$：production planner 在确定 task 的实际宽度后解析正整数 range，并将其用于 W13、W2 GEMM 和 W2 owner-scatter；不增加 shape/window 搜索维度。迁移期 `-1` 继承与 byte-window 字段只兼容旧手写 plan，同一 task/stage 同时指定 byte/range 会被 Python/native 双重拒绝。profile/catalog identity 和公开 split API 留待后续独立步骤迁移。 |

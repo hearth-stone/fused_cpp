@@ -124,6 +124,10 @@ class _DeterministicTailPoolModel:
     def window_bytes_per_worker(self, threads: int) -> int:
         return threads
 
+    def task_stage_ranges(self, routes: int, threads: int) -> tuple[int, int]:
+        del routes, threads
+        return 2, 1
+
 
 class _DeterministicStageModel(_DeterministicTailPoolModel):
     call_setup_ns = 3.0
@@ -1004,6 +1008,8 @@ def test_window_policy_and_thread_shape_are_selected_jointly(
     assert bridge["task_range_granularities"] == [0] * len(bridge["task_threads"])
     assert bridge["task_w13_window_bytes"] == [-1] * len(bridge["task_threads"])
     assert bridge["task_w2_window_bytes"] == [-1] * len(bridge["task_threads"])
+    assert bridge["task_w13_ranges"] == [8] * len(bridge["task_threads"])
+    assert bridge["task_w2_ranges"] == [4] * len(bridge["task_threads"])
     cached_spec = runtime.plan_spec_for([(expert, 192) for expert in range(64)])
     assert cached_spec["operator_options"] == spec["operator_options"]
     assert cached_spec["bridge"] == bridge
@@ -1076,8 +1082,10 @@ def test_static_stage_window_policy_is_lowered_per_task(
 
     bridge = planner.to_async_bridge(tasks)
 
-    assert bridge["task_w13_window_bytes"] == [-1, 1024 * 1024, 1024 * 1024, 4 * 1024 * 1024]
-    assert bridge["task_w2_window_bytes"] == [-1, 512 * 1024, 512 * 1024, 1024 * 1024]
+    assert bridge["task_w13_ranges"] == [2, 16, 16, 4]
+    assert bridge["task_w2_ranges"] == [1, 16, 16, 8]
+    assert bridge["task_w13_window_bytes"] == [-1] * 4
+    assert bridge["task_w2_window_bytes"] == [-1] * 4
     assert bridge["task_range_granularities"] == [0, 0, 0, 0]
 
     sliced_bridge = planner.to_async_bridge(
@@ -1095,8 +1103,8 @@ def test_static_stage_window_policy_is_lowered_per_task(
         max_pooled_routes=96,
     )
     assert pooled_bridge["task_threads"] == [2, 2, 8, 8]
-    assert pooled_bridge["task_w13_window_bytes"] == [-1, 128 * 1024, 1024 * 1024, 4 * 1024 * 1024]
-    assert pooled_bridge["task_w2_window_bytes"] == [-1, 256 * 1024, 512 * 1024, 1024 * 1024]
+    assert pooled_bridge["task_w13_ranges"] == [2, 128, 16, 4]
+    assert pooled_bridge["task_w2_ranges"] == [1, 32, 16, 8]
     assert planner.shapes == baseline.shapes
     assert planner.model is not model
     assert planner.model.T_iso(192, 8) == model.T_iso(192, 8)
@@ -1146,8 +1154,8 @@ def test_elastic_w2_bridge_lowers_local_cohorts_and_stage_widths(
     assert bridge_8t["task_resize_timeout_ns"] == [5000] * 4
     assert bridge_8t["task_numa_nodes"] == [0] * 4
     assert bridge_8t["task_preferred_core_begins"] == [0, 0, 16, 16]
-    assert bridge_8t["task_w13_window_bytes"] == [1024 * 1024] * 4
-    assert bridge_8t["task_w2_window_bytes"] == [-1] * 4
+    assert bridge_8t["task_w13_ranges"] == [16] * 4
+    assert bridge_8t["task_w2_ranges"] == [1] * 4
 
     migrated_bridge = planner.to_elastic_w2_bridge(
         tasks_8t,
@@ -1260,8 +1268,8 @@ def test_planned_moe_applies_default_stage_windows_per_profile(
         AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V1,
     )
     tasks = [(0, 96, 0, 8, [])]
-    assert runtime.interval_planners[0].to_async_bridge(tasks)["task_w13_window_bytes"] == [-1]
-    assert runtime.interval_planners[1].to_async_bridge(tasks)["task_w13_window_bytes"] == [1024 * 1024]
+    assert runtime.interval_planners[0].to_async_bridge(tasks)["task_w13_ranges"] == [1]
+    assert runtime.interval_planners[1].to_async_bridge(tasks)["task_w13_ranges"] == [16]
 
     disabled = PlannedMoE(
         (no_split, split),

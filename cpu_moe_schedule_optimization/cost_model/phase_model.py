@@ -307,6 +307,10 @@ class ContentionCostModel:
         _, w13_bytes, _, w2_bytes = self._task_stage_geometry(int(routes), int(threads))
         return max(w13_bytes, w2_bytes)
 
+    def task_stage_ranges(self, routes: int, threads: int) -> tuple[int, int]:
+        w13_ranges, _, w2_ranges, _ = self._task_stage_geometry(int(routes), int(threads))
+        return w13_ranges, w2_ranges
+
     def task_stage_bytes(self, stage: str, routes: int, threads: int) -> int:
         w13_ranges, w13_bytes, w2_ranges, w2_bytes = self._task_stage_geometry(int(routes), int(threads))
         del w13_ranges, w2_ranges

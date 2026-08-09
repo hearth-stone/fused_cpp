@@ -74,6 +74,8 @@ def test_upgrade_legacy_plan_produces_strict_singleton_widths() -> None:
     assert plan.num_threads == 4
     assert plan.thread_cpu_ids.tolist() == [8, 9, 10, 11]
     assert plan.task_threads.tolist() == [2, 2]
+    assert plan.task_w13_ranges.tolist() == [-1, -1]
+    assert plan.task_w2_ranges.tolist() == [-1, -1]
     assert plan.task_w13_window_bytes.tolist() == [-1, -1]
     assert plan.task_w2_window_bytes.tolist() == [-1, -1]
     assert plan.task_release_ns.tolist() == [0, 0]
@@ -324,6 +326,35 @@ def test_plan_v2_rejects_invalid_per_task_stage_windows() -> None:
         AsyncMoEPlanV2.from_dict(upgraded)
 
 
+def test_plan_v2_accepts_optional_per_task_stage_ranges() -> None:
+    upgraded = upgrade_legacy_async_plan(_legacy_bridge())
+    upgraded["task_w13_ranges"] = [1, 8]
+    upgraded["task_w2_ranges"] = [1, 4]
+
+    plan = AsyncMoEPlanV2.from_dict(upgraded)
+
+    assert plan.task_w13_ranges.tolist() == [1, 8]
+    assert plan.task_w2_ranges.tolist() == [1, 4]
+
+
+@pytest.mark.parametrize("invalid", [0, -2])
+def test_plan_v2_rejects_invalid_per_task_stage_ranges(invalid: int) -> None:
+    upgraded = upgrade_legacy_async_plan(_legacy_bridge())
+    upgraded["task_w13_ranges"] = [invalid, -1]
+
+    with pytest.raises(ValueError, match="must be -1"):
+        AsyncMoEPlanV2.from_dict(upgraded)
+
+
+def test_plan_v2_rejects_ambiguous_stage_range_and_byte_window() -> None:
+    upgraded = upgrade_legacy_async_plan(_legacy_bridge())
+    upgraded["task_w13_ranges"] = [2, -1]
+    upgraded["task_w13_window_bytes"] = [1048576, -1]
+
+    with pytest.raises(ValueError, match="both ranges and window bytes"):
+        AsyncMoEPlanV2.from_dict(upgraded)
+
+
 def test_strict_plan_accepts_timed_task_releases() -> None:
     upgraded = upgrade_legacy_async_plan(_legacy_bridge())
     upgraded["task_release_ns"] = [0, 250_000]
@@ -429,8 +460,10 @@ def test_async_plan_wrapper_calls_native_plan_v2(monkeypatch) -> None:
     assert args[37] == 1
     assert args[40].tolist() == [-1, -1]
     assert args[41].tolist() == [-1, -1]
-    assert args[42].tolist() == [0, 0]
-    assert args[43] == -1
+    assert args[42].tolist() == [-1, -1]
+    assert args[43].tolist() == [-1, -1]
+    assert args[44].tolist() == [0, 0]
+    assert args[45] == -1
 
 
 def test_async_plan_wrapper_calls_elastic_native_and_collects_stats(monkeypatch) -> None:
@@ -480,11 +513,13 @@ def test_async_plan_wrapper_calls_elastic_native_and_collects_stats(monkeypatch)
     args = captured["args"]
     assert isinstance(args, tuple)
     assert args[15] == 2
-    assert args[42].tolist() == [0, 0]
-    assert args[43].tolist() == [0, 1000]
-    assert args[44] is stats
-    assert args[45].tolist() == [-1, -1]
-    assert args[46] == -1
+    assert args[42].tolist() == [-1, -1]
+    assert args[43].tolist() == [-1, -1]
+    assert args[44].tolist() == [0, 0]
+    assert args[45].tolist() == [0, 1000]
+    assert args[46] is stats
+    assert args[47].tolist() == [-1, -1]
+    assert args[48] == -1
     assert bf16_tiled.decode_async_moe_elastic_stats(stats)["eligible_tasks"] == 0
 
 

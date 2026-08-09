@@ -855,6 +855,10 @@ class AnalyticMoeCostModel:
         w13, w2 = self._task_weight_geometries(int(routes), int(threads))
         return max(w13.max_range_bytes, w2.max_range_bytes)
 
+    def task_stage_ranges(self, routes: int, threads: int) -> tuple[int, int]:
+        w13, w2 = self._task_weight_geometries(int(routes), int(threads))
+        return w13.ranges, w2.ranges
+
     def window_bytes_per_worker(self, threads: int, routes: int | None = None) -> int:
         w13, w2 = (
             (self._w13_geometry, self._w2_geometry)

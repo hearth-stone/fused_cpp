@@ -276,12 +276,13 @@ width \(t\), it enumerates the physically achievable tile-aligned range targets
   team members;
 - use a power-of-two owner tile count, matching the kernel's natural halving
   hierarchy;
-- retain at least two W13 ranges for the split-W13 path and one W2 range.
+- retain the physically distinct W13 \(R=1/R=2\) endpoints and W2 \(R=1\)
+  endpoint whenever the stage tile count permits them.
 
-The inherited operator-wide geometry remains in the candidate set as the
-compatibility endpoint. A one-panel expert (\(M\le12\)) always inherits it:
-there is no repeated packed-B scan to protect, so subdividing the stage cannot
-reduce B traffic.
+The inherited operator-wide geometry remains in the candidate set as a
+compatibility endpoint. A one-panel expert (\(M\le12\)) selects \(R=1\) for both
+stages: there is no repeated packed-B scan to protect, so subdividing the stage
+cannot reduce B traffic and adds range control work.
 
 The absolute ECM phase latency remains
 \(\max(T_{\mathrm{core}},T_{\mathrm{xfer}})\). That lower-bound form is not a
@@ -333,8 +334,10 @@ J_s(M,t,g),R_s(g)
 \right).
 \]
 
-W13 and W2 are minimized independently and lowered to the existing per-range
-byte ABI. The uncertainty tie does not add a measured route band: it uses one
+W13 and W2 are minimized independently and lowered to the Plan V2 exact-range
+ABI. The native mapper reconstructs the same tile-balanced geometry from the
+integer range count; it does not round-trip through a byte target. The
+uncertainty tie does not add a measured route band: it uses one
 machine-level uncertainty scalar and the kernel/cache geometry already present
 in the calibration. This objective is used only to choose an execution policy; absolute
 expert and DAG time continues to use the overlapping ECM maximum and the

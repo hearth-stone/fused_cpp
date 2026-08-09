@@ -18,6 +18,20 @@ micro-optimizations. It should close the remaining high-value variables first,
 then refresh the calibration data and cost model once and validate them as a
 coherent system.
 
+The split-to-range migration is intentionally staged so each ABI boundary is
+independently bisectable:
+
+- [x] Unify analytical W13 split/no-split choices as explicit `R=1/R=2`
+  geometry candidates.
+- [x] Carry exact per-task W13/W2 range counts through Plan V2, native W13/W2,
+  and W2 owner-scatter; retain legacy byte/split inputs only as compatibility.
+- [ ] Canonicalize empirical profile/catalog and plan-cache identity on
+  `(w13_ranges, w2_ranges)`.
+- [ ] Remove public split flags, environment controls, and legacy native
+  fallback branches after profile migration.
+- [ ] Refresh both ARM machines' range-native calibration and full planner/E2E
+  validation before treating the migration as closed.
+
 1. Replace the AmazonECS8Cores transferred packed-B retention prior with a
    machine-local multi-team retention/refill probe and add topology-aware LLC
    service. Its cache topology and L1-hot/L2/LLC/DRAM service curves are now

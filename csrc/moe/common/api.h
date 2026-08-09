@@ -74,6 +74,7 @@ at::Tensor fused_moe_bf16_tiled_async_plan_v2(
     int64_t silu_poly_degree, int64_t gemm_backend, int64_t backend_n_tile, int64_t w13_split,
     int64_t weight_window_bytes, c10::optional<at::Tensor> out,
     c10::optional<at::Tensor> task_w13_window_bytes, c10::optional<at::Tensor> task_w2_window_bytes,
+    c10::optional<at::Tensor> task_w13_ranges, c10::optional<at::Tensor> task_w2_ranges,
     c10::optional<at::Tensor> task_release_ns,
     int64_t early_merge);
 at::Tensor fused_moe_bf16_tiled_async_plan_v2_elastic(
@@ -89,6 +90,7 @@ at::Tensor fused_moe_bf16_tiled_async_plan_v2_elastic(
     int64_t silu_poly_degree, int64_t gemm_backend, int64_t backend_n_tile, int64_t w13_split,
     int64_t weight_window_bytes, c10::optional<at::Tensor> out,
     c10::optional<at::Tensor> task_w13_window_bytes, c10::optional<at::Tensor> task_w2_window_bytes,
+    c10::optional<at::Tensor> task_w13_ranges, c10::optional<at::Tensor> task_w2_ranges,
     c10::optional<at::Tensor> task_release_ns,
     c10::optional<at::Tensor> task_resize_timeout_ns,
     c10::optional<at::Tensor> elastic_stats_out,
