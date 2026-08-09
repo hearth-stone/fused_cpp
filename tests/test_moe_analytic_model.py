@@ -638,12 +638,15 @@ def test_analytic_model_generates_deterministic_stage_windows_without_new_shapes
         task_stage_window_policy=policy,
     )
 
-    assert policy.select(12, 4) == (-1, -1)
+    assert policy.select(12, 4) == (
+        model.hidden_size * 2 * model.intermediate_size * 2,
+        model.intermediate_size * model.hidden_size * 2,
+    )
     assert generated.w13_target_bytes > 0
     assert generated.w2_target_bytes > 0
     assert generated.w13_worker_bytes >= calibration.caches.l1d_bytes_per_core
     assert generated.w2_worker_bytes >= calibration.caches.l1d_bytes_per_core
-    assert generated.w13_ranges >= model.w13_split_chunks
+    assert generated.w13_ranges >= 1
     assert generated.w2_ranges >= 1
     for stage, target in (("w13", generated.w13_target_bytes), ("w2", generated.w2_target_bytes)):
         score = model.score_stage_window(stage, routes=120, threads=4, target_bytes=target)
@@ -653,7 +656,39 @@ def test_analytic_model_generates_deterministic_stage_windows_without_new_shapes
         assert owner_tiles & (owner_tiles - 1) == 0
     assert planner.shapes == baseline.shapes
     assert policy.decision(120, 4) is generated
-    assert short.w13_ranges == model.w13_window_ranges
+    assert short.w13_ranges == 1
+    assert short.w2_ranges == 1
+
+
+def test_analytic_w13_candidates_include_unsplit_and_two_range_endpoints() -> None:
+    model = AnalyticMoeCostModel(
+        _calibration(),
+        hidden_size=4096,
+        intermediate_size=512,
+        global_experts=8,
+        local_experts=8,
+    )
+    policy = AnalyticStageWindowPolicy(model)
+
+    explanation = policy.explain(routes=120, threads=4)
+    ranges = {row["ranges"] for row in explanation["candidates"]["w13"]["rows"]}
+
+    assert {1, 2} <= ranges
+
+
+def test_analytic_w13_endpoints_stop_at_the_available_tile_count() -> None:
+    model = AnalyticMoeCostModel(
+        _calibration(),
+        hidden_size=16,
+        intermediate_size=8,
+        global_experts=8,
+        local_experts=8,
+        backend_n_tile=16,
+    )
+
+    explanation = AnalyticStageWindowPolicy(model).explain(routes=120, threads=4)
+
+    assert {row["ranges"] for row in explanation["candidates"]["w13"]["rows"]} == {1}
 
 
 def test_planned_moe_prefers_model_generated_stage_window_policy() -> None:

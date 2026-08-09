@@ -9,13 +9,13 @@ from dataclasses import asdict, dataclass
 from functools import lru_cache
 
 try:
-    from weight_window import achievable_worker_windows
+    from weight_window import achievable_worker_windows, stage_weight_range_geometry
 except ImportError:  # pragma: no cover - package-style import
-    from .weight_window import achievable_worker_windows
+    from .weight_window import achievable_worker_windows, stage_weight_range_geometry
 
 
 INHERIT_STAGE_WINDOW = -1
-POLICY_VERSION = 2
+POLICY_VERSION = 3
 
 
 @dataclass(frozen=True)
@@ -47,7 +47,10 @@ class AnalyticStageWindowPolicy:
             "hidden_size": model.hidden_size,
             "intermediate_size": model.intermediate_size,
             "backend_n_tile": model.policy.backend_n_tile,
-            "w13_split_chunks": model.w13_split_chunks,
+            "inherited_stage_ranges": [
+                model._w13_geometry.ranges,
+                model._w2_geometry.ranges,
+            ],
             "supported_widths": model.supported_widths,
         }
         digest = hashlib.sha256(
@@ -59,12 +62,11 @@ class AnalyticStageWindowPolicy:
     def _is_power_of_two(value: int) -> bool:
         return value > 0 and value & (value - 1) == 0
 
-    def _stage_geometry(self, stage: str) -> tuple[int, int, int, int, int]:
+    def _stage_geometry(self, stage: str) -> tuple[int, int, int, int]:
         if stage == "w13":
             return (
                 self.model.hidden_size,
                 2 * self.model.intermediate_size,
-                self.model.w13_split_chunks,
                 self.model._w13_geometry.ranges,
                 self.model._w13_geometry.max_range_bytes,
             )
@@ -72,15 +74,30 @@ class AnalyticStageWindowPolicy:
             return (
                 self.model.intermediate_size,
                 self.model.hidden_size,
-                1,
                 self.model._w2_geometry.ranges,
                 self.model._w2_geometry.max_range_bytes,
             )
         raise ValueError(f"unsupported stage {stage!r}")
 
+    def _endpoint_targets(self, stage: str) -> tuple[int, ...]:
+        k, n, _, _ = self._stage_geometry(stage)
+        total_tiles = n // self.model.policy.backend_n_tile
+        endpoint_ranges = tuple(
+            ranges for ranges in ((1, 2) if stage == "w13" else (1,)) if ranges <= total_tiles
+        )
+        return tuple(
+            stage_weight_range_geometry(
+                k=k,
+                n=n,
+                n_tile=self.model.policy.backend_n_tile,
+                ranges=ranges,
+            ).max_range_bytes
+            for ranges in endpoint_ranges
+        )
+
     @lru_cache(maxsize=4096)
     def _stage_candidates(self, stage: str, routes: int, threads: int):
-        k, n, minimum_ranges, inherited_ranges, inherited_range_bytes = self._stage_geometry(stage)
+        k, n, inherited_ranges, inherited_range_bytes = self._stage_geometry(stage)
         tile_bytes = k * self.model.policy.backend_n_tile * 2
         total_tiles = n // self.model.policy.backend_n_tile
         geometries = achievable_worker_windows(
@@ -89,12 +106,10 @@ class AnalyticStageWindowPolicy:
             n_tile=self.model.policy.backend_n_tile,
             threads=threads,
         )
-        targets: set[int] = {inherited_range_bytes}
+        targets: set[int] = {inherited_range_bytes, *self._endpoint_targets(stage)}
         for worker_bytes, (ranges, range_bytes) in geometries.items():
             worker_tiles = worker_bytes // tile_bytes
             range_tiles = range_bytes // tile_bytes
-            if ranges < minimum_ranges:
-                continue
             # Once the owner stripe is below one private L1D there is no lower
             # cache level left to protect. More ranges can only add control and
             # synchronization, so such points are analytically dominated even
@@ -106,31 +121,35 @@ class AnalyticStageWindowPolicy:
             if self._is_power_of_two(worker_tiles):
                 targets.add(range_bytes)
 
-        legal_scores = []
-        for target in sorted(targets):
-            score = self.model.score_stage_window(stage, routes, threads, target)
-            if score.ranges >= minimum_ranges:
-                legal_scores.append(score)
-        scores = tuple(legal_scores)
+        scores = tuple(
+            self.model.score_stage_window(stage, routes, threads, target)
+            for target in sorted(targets)
+        )
         if not scores:
             raise RuntimeError(f"no legal analytical {stage} stage-window candidate at {threads} threads")
-        minimum = min(scores, key=lambda score: (score.objective_ns, -score.worker_bytes, score.ranges))
-        objective_resolution_ns = self.model.calibration.relative_uncertainty * minimum.transfer_ns
-        equivalent = tuple(
-            score for score in scores if score.objective_ns <= minimum.objective_ns + objective_resolution_ns
-        )
-        preferred_worker_bytes = max(
-            self.model.calibration.caches.l1d_bytes_per_core,
-            2 * tile_bytes,
-        )
-        selected = min(
-            equivalent,
-            key=lambda score: (
-                abs(math.log2(score.worker_bytes / preferred_worker_bytes)),
-                score.objective_ns,
-                score.ranges,
-            ),
-        )
+        if routes <= 12:
+            # One M12 panel consumes each B tile exactly once. Splitting cannot
+            # improve B retention and only adds range control, so R=1 strictly
+            # dominates every larger range count independent of calibration.
+            selected = next(score for score in scores if score.ranges == 1)
+        else:
+            minimum = min(scores, key=lambda score: (score.objective_ns, -score.worker_bytes, score.ranges))
+            objective_resolution_ns = self.model.calibration.relative_uncertainty * minimum.transfer_ns
+            equivalent = tuple(
+                score for score in scores if score.objective_ns <= minimum.objective_ns + objective_resolution_ns
+            )
+            preferred_worker_bytes = max(
+                self.model.calibration.caches.l1d_bytes_per_core,
+                2 * tile_bytes,
+            )
+            selected = min(
+                equivalent,
+                key=lambda score: (
+                    abs(math.log2(score.worker_bytes / preferred_worker_bytes)),
+                    score.objective_ns,
+                    score.ranges,
+                ),
+            )
         inherited = next(
             (
                 score
@@ -149,28 +168,16 @@ class AnalyticStageWindowPolicy:
             raise ValueError("routes and threads must be positive")
         if threads not in self.model.supported_widths:
             raise KeyError(f"unsupported analytical thread width {threads}")
-        if routes <= 12:
-            return AnalyticStageWindowDecision(
-                routes=routes,
-                threads=threads,
-                w13_target_bytes=INHERIT_STAGE_WINDOW,
-                w2_target_bytes=INHERIT_STAGE_WINDOW,
-                w13_worker_bytes=self.model._w13_geometry.bytes_per_worker(threads),
-                w2_worker_bytes=self.model._w2_geometry.bytes_per_worker(threads),
-                w13_ranges=self.model._w13_geometry.ranges,
-                w2_ranges=self.model._w2_geometry.ranges,
-            )
-
         _, w13, inherited_w13 = self._stage_candidates("w13", routes, threads)
         _, w2, inherited_w2 = self._stage_candidates("w2", routes, threads)
         w13_target = (
             INHERIT_STAGE_WINDOW
-            if inherited_w13 is not None and w13.range_bytes == inherited_w13.range_bytes
+            if routes > 12 and inherited_w13 is not None and w13.range_bytes == inherited_w13.range_bytes
             else w13.range_bytes
         )
         w2_target = (
             INHERIT_STAGE_WINDOW
-            if inherited_w2 is not None and w2.range_bytes == inherited_w2.range_bytes
+            if routes > 12 and inherited_w2 is not None and w2.range_bytes == inherited_w2.range_bytes
             else w2.range_bytes
         )
         return AnalyticStageWindowDecision(
@@ -198,7 +205,7 @@ class AnalyticStageWindowPolicy:
             "policy": self.name,
             "decision": asdict(decision),
             "reason": (
-                "single_m12_panel_inherits"
+                "single_m12_panel_uses_one_range"
                 if routes <= 12
                 else "uncertainty_robust_incremental_ecm_objective"
             ),

@@ -544,7 +544,7 @@ Validate generated stage windows against real full-call execution with:
 ```bash
 python optimizations/fused_moe_sve/benchmarks/bench_analytic_stage_window_holdout.py \
   --calibration machine.json --output stage_window_holdout.json \
-  --cpu-ids 0-95 --routes 28,72,120,216,320,768,2040 \
+  --cpu-ids 0-95 --routes 12,28,72,120,216,320,768,2040 \
   --widths 1,2,4,8 --measurement-experts 96 \
   --warmup 2 --runs 11 --store-samples
 ```
@@ -554,6 +554,12 @@ executes one sample per candidate per round. The coordinate oracle includes the
 analytical and inherited points, both complete one-dimensional axes, and a
 local 3x3 cross. It is not a full Cartesian search, so measured regret is a
 lower bound on regret against the full legal window space.
+
+Policy v3 also retains the W13 `R=1` and `R=2` endpoints explicitly in every
+group. These are the canonical geometries formerly encoded as no-split and
+split. For `M<=12`, both stages select `R=1` analytically because each B tile is
+consumed once and extra ranges cannot create reuse. The v2 table below remains
+historical validation; v3 must be remeasured after the range ABI migration.
 
 The corrected policy-v2 2026-08-09 holdout produced:
 

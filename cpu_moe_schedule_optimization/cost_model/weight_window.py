@@ -70,6 +70,38 @@ def stage_weight_window_geometry(
     )
 
 
+def stage_weight_range_geometry(
+    *,
+    k: int,
+    n: int,
+    n_tile: int,
+    ranges: int,
+) -> WeightWindowGeometry:
+    """Return the exact geometry for an explicit sequential range count.
+
+    This is the canonical representation used while lowering a model decision.
+    Byte targets remain supported as a runtime compatibility encoding, but they
+    are not needed to describe either the unsplit (R=1) or split (R=2) case.
+    """
+    tile = max(int(n_tile), MIN_SVE_N_TILE)
+    if k <= 0 or n <= 0 or tile <= 0:
+        raise ValueError(f"weight-window GEMM dimensions must be positive: K={k}, N={n}, tile={tile}")
+    if n % tile:
+        raise ValueError(f"weight-window N must be tile aligned: N={n}, tile={tile}")
+    total_tiles = n // tile
+    if ranges <= 0 or ranges > total_tiles:
+        raise ValueError(f"ranges must be in [1, {total_tiles}], got {ranges}")
+    max_range_tiles = _ceil_div(total_tiles, int(ranges))
+    return WeightWindowGeometry(
+        target_bytes=0,
+        n_tile=tile,
+        total_tiles=total_tiles,
+        ranges=int(ranges),
+        max_range_tiles=max_range_tiles,
+        max_range_bytes=max_range_tiles * k * tile * 2,
+    )
+
+
 def achievable_worker_windows(
     *,
     k: int,

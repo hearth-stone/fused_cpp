@@ -88,7 +88,13 @@ def candidate_pairs(policy, model: AnalyticMoeCostModel, routes: int, threads: i
     w13_rows = stage_rows["w13"]["rows"]
     w2_rows = stage_rows["w2"]["rows"]
     for row in w13_rows:
-        add((int(row["range_bytes"]), selected_resolved[1]), f"w13:{int(row['worker_bytes'])}")
+        ranges = int(row["ranges"])
+        label = (
+            f"w13_r{ranges}_endpoint"
+            if ranges in {1, 2}
+            else f"w13:{int(row['worker_bytes'])}"
+        )
+        add((int(row["range_bytes"]), selected_resolved[1]), label)
     for row in w2_rows:
         add((selected_resolved[0], int(row["range_bytes"])), f"w2:{int(row['worker_bytes'])}")
 
@@ -176,8 +182,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--calibration", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--cpu-ids", default="0-95")
-    parser.add_argument("--routes", default="28,72,120,216,320,768,2040")
-    parser.add_argument("--widths", default="4,8")
+    parser.add_argument("--routes", default="12,28,72,120,216,320,768,2040")
+    parser.add_argument("--widths", default="1,2,4,8")
     parser.add_argument("--hidden-size", type=int, default=4096)
     parser.add_argument("--intermediate-size", type=int, default=512)
     parser.add_argument("--measurement-experts", type=int, required=True)
@@ -376,6 +382,7 @@ def main() -> int:
             "warmup": args.warmup,
             "runs": args.runs,
             "sampling": "shuffled_group_round_robin",
+            "w13_required_endpoints": [1, 2],
             "policy": policy.name,
             "pages": os.environ.get("FUSED_CPP_PAGES"),
             "page_size_mb": os.environ.get("FUSED_CPP_PAGE_SIZE_MB"),

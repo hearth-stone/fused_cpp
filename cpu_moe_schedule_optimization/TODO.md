@@ -22,10 +22,10 @@ coherent system.
    machine-local multi-team retention/refill probe and add topology-aware LLC
    service. Its cache topology and L1-hot/L2/LLC/DRAM service curves are now
    measured locally; only this retention term remains non-local.
-2. Repeat unseen routes, widths above 8T, mixed distributions, split policy,
-   and per-stage weight-window validation. The analytical M=216 and long-route
-   1T/2T stage-window errors are closed on the original holdout grid: clean
-   192C maximum regret fell from 11.32% to 3.38%.
+2. Repeat unseen routes, widths above 8T, mixed distributions, explicit
+   W13 `R=1/R=2` endpoints, and per-stage range validation. The analytical
+   M=216 and long-route 1T/2T stage-window errors are closed on the original
+   holdout grid: clean 192C maximum regret fell from 11.32% to 3.38%.
 3. Fix cross-rank lifetime switching for the remaining EP absolute-time error.
 4. Add measured gather/pack, route merge, communication, and distributed TP/EP
    terms after the compute model passes its gates.
@@ -119,8 +119,8 @@ coherent system.
   broader full-model gates pass.
 - [ ] Calibrate multi-team packed-B retention/refill and below-NUMA LLC topology
   from independent probes; do not add a task-pair slowdown table.
-- [ ] Validate unseen routes, widths, mixed distributions, split/no-split, and
-  byte-window policies against the acceptance gates in
+- [ ] Validate unseen routes, widths, mixed distributions, W13 `R=1/R=2`, and
+  additional stage-range policies against the acceptance gates in
   `cost_model/ANALYTIC_MODEL.md`.
 - [ ] Switch the production default only after both machines pass; retain the
   empirical backend as an explicit fallback and regression oracle.
