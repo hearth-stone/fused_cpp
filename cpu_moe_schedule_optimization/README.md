@@ -132,7 +132,12 @@ T_plan(plan) + T_execute(plan)
 - [`cost_model/ANALYTIC_MODEL.md`](./cost_model/ANALYTIC_MODEL.md)：
   planner-compatible 解析 backend；由 exact kernel demand、cache capacity、
   route-independent machine service curves 和共享资源 event simulator 预测
-  isolated/contention 时间，并定义薄校准 schema 与 holdout 验收门槛。
+  isolated/contention 时间，直接生成确定性的 W13/W2 stage-window policy，
+  并定义薄校准 schema 与 holdout 验收门槛。
+- [`../optimizations/fused_moe_sve/results/analytic_stage_window_policy_v2_holdout_20260809.md`](../optimizations/fused_moe_sve/results/analytic_stage_window_policy_v2_holdout_20260809.md)：
+  解析 stage-window policy 的 A 驻留/B turnover 修正版在 192C NUMA0 与 8C V1
+  上的交错采样 holdout；192C maximum regret 从 11.32% 降到 3.38%，8C 同时记录
+  raw 与 p10 单边噪声口径。
 - [`../optimizations/fused_moe_sve/results/amazon_192c_analytic_thin_calibration_20260801.md`](../optimizations/fused_moe_sve/results/amazon_192c_analytic_thin_calibration_20260801.md)：
   192-core 主机 NUMA0 的独立 service/retention 薄校准与 holdout；排序显著改善，
   但 contention P90 和最大 regret 未过门槛，因此 production 仍使用经验模型。
@@ -152,6 +157,7 @@ T_plan(plan) + T_execute(plan)
   当前 SVE BF16 exact-M1--M12/static bucket 的实现 mapper；负责 tile、padding、N-split、
   指令和 cache 流量，不进入通用算法公式。
 - [`cost_model/analytic_model.py`](./cost_model/analytic_model.py) /
+  [`cost_model/analytic_stage_window_policy.py`](./cost_model/analytic_stage_window_policy.py) /
   [`cost_model/validate_analytic_model.py`](./cost_model/validate_analytic_model.py)：
   phase-aware hierarchical service cost model、机器校准加载和 empirical holdout 验证；按
   setup/cold-B/steady-B 事件计算 shared-resource offered load，并提供逐事件

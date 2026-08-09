@@ -43,3 +43,11 @@ standalone/moe_planner/moe_planner_omp
 standalone/moe_planner/moe_planner_st
 optimizations/fused_moe_sve/benchmarks/bench_elastic_nsplit
 optimizations/fused_moe_sve/results/expert_barriers_*.json
+
+# Ad hoc MoE benchmark outputs. Curated reports stay as Markdown; raw JSON
+# required to reproduce a report can still be force-added deliberately.
+optimizations/fused_moe_sve/results/*.json
+optimizations/fused_moe_sve/results/*.trace
+optimizations/fused_moe_sve/results/*.html
+optimizations/fused_moe_sve/results/*.png
+optimizations/fused_moe_sve/results/*.svg

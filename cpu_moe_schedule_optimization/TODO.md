@@ -18,13 +18,14 @@ micro-optimizations. It should close the remaining high-value variables first,
 then refresh the calibration data and cost model once and validate them as a
 coherent system.
 
-1. Produce the remaining independent thin analytical calibration on
-   AmazonECS8Cores. The AmazonC5192Cores NUMA0 calibration now uses a
-   hardware-capacity-derived L1-hot M12 GEMM core ceiling, but still does not
-   pass the holdout gates.
-2. Add an independent multi-team packed-B retention/refill probe and
-   topology-aware LLC service, then repeat unseen routes, widths, mixed
-   distributions, split policy, and per-stage weight-window validation.
+1. Replace the AmazonECS8Cores transferred packed-B retention prior with a
+   machine-local multi-team retention/refill probe and add topology-aware LLC
+   service. Its cache topology and L1-hot/L2/LLC/DRAM service curves are now
+   measured locally; only this retention term remains non-local.
+2. Repeat unseen routes, widths above 8T, mixed distributions, split policy,
+   and per-stage weight-window validation. The analytical M=216 and long-route
+   1T/2T stage-window errors are closed on the original holdout grid: clean
+   192C maximum regret fell from 11.32% to 3.38%.
 3. Fix cross-rank lifetime switching for the remaining EP absolute-time error.
 4. Add measured gather/pack, route merge, communication, and distributed TP/EP
    terms after the compute model passes its gates.
@@ -105,8 +106,17 @@ coherent system.
 - [ ] Measure independent exact-M M1-M11 core-efficiency ratios relative to the
   M12 L1-hot service. Admit them only if they improve unseen tail routes without
   becoming another route/thread latency table.
-- [ ] Produce the corresponding independent thin calibration on
-  AmazonECS8Cores.
+- [x] Measure the corresponding machine-local cache topology and
+  L1-hot/L2/LLC/DRAM service curves on AmazonECS8Cores. The runtime uses
+  `backend_n_tile=16`; the profile marks its current 1/8-L2 packed-B retention
+  term as a transferred prior rather than claiming a local measurement.
+- [x] Generate deterministic W13/W2 stage windows directly from the analytical
+  cache/service model without adding a planner variable, and run independent
+  route/width holdout on AmazonC5192Cores NUMA0 and AmazonECS8Cores. The
+  analytical backend now uses this policy automatically. The physical
+  A-residency/B-turnover correction passes the clean 192-core stage-window gate
+  at 3.38% maximum regret; empirical production remains unchanged until the
+  broader full-model gates pass.
 - [ ] Calibrate multi-team packed-B retention/refill and below-NUMA LLC topology
   from independent probes; do not add a task-pair slowdown table.
 - [ ] Validate unseen routes, widths, mixed distributions, split/no-split, and

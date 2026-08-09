@@ -110,27 +110,61 @@ For range \(j\) of one stage, let:
 - \(t_1\) be the first range's active owners. Ranges are non-increasing in size,
   so later owners are a subset of the first range's owners.
 
-The calibrated packed-B retention function \(g_2(W)\) uses three measured miss
+The calibrated packed-B retention function \(g_2(W)\) uses a dedicated
+effective capacity \(C^B_{2,\mathrm{eff}}=\rho^B_2C_2\) plus three measured miss
 anchors: the sub-knee repeated-scan miss floor, miss at nominal L2 capacity, and
-miss at twice nominal capacity. Smoothstep interpolation is used from effective
-to nominal capacity and from nominal to twice nominal capacity. The separate
-\(h_2(W)\) capacity function remains zero below effective capacity and one above
-physical capacity for packed-A reuse. The aggregate LLC-to-L2 traffic is:
+miss at twice nominal capacity. Smoothstep interpolation is used from
+\(C^B_{2,\mathrm{eff}}\) to nominal capacity and from nominal to twice nominal
+capacity. This curve describes the transient repeated scans observed before a
+full effective L2 of distinct A panels has passed the owner.
+
+Define the number of transient B reuses and the physical steady-scan state as:
 
 \[
-Q_{B,L2}=\sum_j B_j\left[1+(P-1)g_2(U_j+A_p)\right],
+L_A=\max\left(\left\lfloor\frac{C^A_{2,\mathrm{eff}}}{A_p}\right\rfloor,1\right),
+\qquad
+q=\min(P-1,L_A),
+\qquad
+r_B(W)=\mathbf 1[W>C_2].
+\]
+
+The full packed A survives a later sequential N range only when it leaves one
+panel of headroom for the kernel's in-flight load/prefetch state:
+
+\[
+r_A(U_j,A)=\mathbf 1[U_j+A>C_2-A_p].
+\]
+
+The packed-B and packed-A effective-capacity fractions remain independent: a
+repeated B stripe competes with A, stores, and prefetch state and reaches its
+transient retention knee before a generic L2 capacity boundary. The aggregate
+LLC-to-L2 traffic is:
+
+\[
+Q_{B,L2}=\sum_j B_j\left[
+1+qg_2(U_j+A_p)+(P-1-q)r_B(U_j+A_p)
+\right],
 \]
 
 \[
-Q_{A,L2}=A\left[t_1+\sum_{j>1}t_jh_2(U_j+A)\right].
+Q_{A,L2}=A\left[t_1+\sum_{j>1}t_jr_A(U_j,A)\right].
 \]
 
 This expresses the kernel loop directly:
 
 - the first B pass is cold and reads each weight once;
-- later M panels reuse the owner stripe if it fits private L2;
+- the first \(q\) B reuses use the calibrated transient retention curve;
+- after A has turned over one effective L2, a B stripe that fits physical L2 is
+  resident, while an over-capacity stripe remains streaming;
 - every N owner reads packed A once;
-- later sequential N ranges reuse A if it remains in private L2.
+- later sequential N ranges reuse A only when the full A plus owner stripe and
+  one in-flight panel fit private L2.
+
+The finite transient is important for long routes. Applying one short-route
+miss probability to all \(P-1\) panels makes a small residual miss grow without
+bound and systematically favors undersized windows. Here the transition length
+comes from cache and panel geometry, not a route threshold or fitted timing
+table.
 
 Packed A and the W13 intermediate were just produced by the operator, so they
 enter the GEMM through the cache hierarchy rather than being compulsory DRAM
@@ -229,6 +263,92 @@ global geometry in both isolated and concurrent calculations. Window targets
 are therefore execution parameters of an existing shape candidate, not an
 additional search dimension.
 
+### Analytical Stage-Window Policy
+
+`AnalyticStageWindowPolicy` generates those execution parameters directly from
+the machine model. For stage \(s\), route count \(M\), and already selected team
+width \(t\), it enumerates the physically achievable tile-aligned range targets
+\(g\in\mathcal G_s(t)\). A generated candidate must:
+
+- leave at least one private L1D of owner work, because a smaller stripe has no
+  lower cache level left to protect;
+- contain at least \(\min(t,q_s)\) N tiles per range, so it does not create idle
+  team members;
+- use a power-of-two owner tile count, matching the kernel's natural halving
+  hierarchy;
+- retain at least two W13 ranges for the split-W13 path and one W2 range.
+
+The inherited operator-wide geometry remains in the candidate set as the
+compatibility endpoint. A one-panel expert (\(M\le12\)) always inherits it:
+there is no repeated packed-B scan to protect, so subdividing the stage cannot
+reduce B traffic.
+
+The absolute ECM phase latency remains
+\(\max(T_{\mathrm{core}},T_{\mathrm{xfer}})\). That lower-bound form is not a
+useful selector when all transfer differences fit below the same compute
+ceiling, because it assigns zero value to reducing refill demand and future
+contention. Stage-window selection therefore uses the serialized incremental
+objective
+
+\[
+J_s(M,t,g)=
+\sum_{p\in\mathcal P_s(g)}
+\left[
+T_{\mathrm{core},p}+T_{\mathrm{epi},p}
++\max\left(T_{L2,p},T_{LLC,p},T_{DRAM,p}\right)
+\right]
++R_s(g)\tau_{\mathrm{range}},
+\]
+
+Let \(J_{\min}\) be the minimum candidate objective and let
+\(\epsilon_{\mathrm{rel}}\) be the calibration's measured relative uncertainty.
+Sub-microsecond ordering inside
+
+\[
+\Delta_J=\epsilon_{\mathrm{rel}}T_{\mathrm{xfer}}(g_{\min})
+\]
+
+is not treated as physically distinguishable. The policy first forms
+
+\[
+\mathcal E_s=\{g:J_s(M,t,g)\le J_{\min}+\Delta_J\},
+\]
+
+then chooses the member nearest in powers-of-two to the kernel-native owner
+window
+
+\[
+U_{s,\mathrm{pref}}=\max(C_{L1D},2b_s),
+\]
+
+where \(b_s=K_s\nu\cdot2\) is one packed-B tile. Exact objective and range count
+break any remaining tie. Equivalently,
+
+\[
+g_s^*(M,t)=
+\arg\min_{g\in\mathcal E_s}
+\left(
+\left|\log_2\frac{U_s(g)}{U_{s,\mathrm{pref}}}\right|,
+J_s(M,t,g),R_s(g)
+\right).
+\]
+
+W13 and W2 are minimized independently and lowered to the existing per-range
+byte ABI. The uncertainty tie does not add a measured route band: it uses one
+machine-level uncertainty scalar and the kernel/cache geometry already present
+in the calibration. This objective is used only to choose an execution policy; absolute
+expert and DAG time continues to use the overlapping ECM maximum and the
+shared-resource event simulator. The policy is deterministic for a calibration
+digest, does not add a planner variable, and does not change the planner's
+shape set.
+
+The packed N tile \(\nu\) is part of the machine/kernel calibration, not a
+portable default. The model defaults to `kernel.backend_n_tile`, and the
+holdout benchmark rejects a calibration when that value differs from the packed
+weight ABI; any production binding must enforce the same check. This matters
+across the two validation machines: the 192-core SVE build uses \(\nu=8\), while
+the 8-core SVE build uses \(\nu=16\).
+
 ## Concurrent Time
 
 The DAG simulator advances setup/cold/steady completion events. For phase \(i\),
@@ -290,12 +410,16 @@ shape. Rates use units per second; overheads use nanoseconds.
     "id": "machine-kernel-frequency-numa-policy",
     "cores_per_rank": 96
   },
+  "kernel": {
+    "backend_n_tile": 8
+  },
   "caches": {
     "l1d_bytes_per_core": 65536,
     "l2_bytes_per_core": 2097152,
     "llc_bytes_per_rank": 100663296,
     "l2_effective_fraction": 0.75,
     "llc_effective_fraction": 0.75,
+    "l2_b_reuse_effective_fraction": 0.125,
     "l2_b_reuse_miss_floor": 0.18,
     "l2_b_reuse_miss_at_capacity": 0.62,
     "l2_b_reuse_miss_ceiling": 0.87
@@ -374,13 +498,18 @@ python cpu_moe_schedule_optimization/cost_model/profile_analytic_services.py \
 python cpu_moe_schedule_optimization/cost_model/build_analytic_calibration.py \
   services.json --output machine.json --report fit.json \
   --training-profile isolated_training.json \
+  --backend-n-tile 8 \
+  --l2-b-reuse-effective-fraction 0.125 \
   --l2-b-reuse-miss-floor 0.18 \
   --l2-b-reuse-miss-at-capacity 0.623 \
   --l2-b-reuse-miss-ceiling 0.869
 ```
 
-The three retention values must come from an independent packed-B repeated-scan
-probe. They must not be fitted from the contention table.
+The effective fraction and three retention values should come from an
+independent packed-B repeated-scan probe. They must not be fitted from the
+contention table. A transferred prior is allowed for a portability holdout only
+when provenance marks it as non-local; it is not a completed machine
+calibration.
 
 ## Planner Use
 
@@ -410,7 +539,47 @@ shapes. Existing active-working-set pruning still applies.
 
 ## Holdout Validation
 
-Run:
+Validate generated stage windows against real full-call execution with:
+
+```bash
+python optimizations/fused_moe_sve/benchmarks/bench_analytic_stage_window_holdout.py \
+  --calibration machine.json --output stage_window_holdout.json \
+  --cpu-ids 0-95 --routes 28,72,120,216,320,768,2040 \
+  --widths 1,2,4,8 --measurement-experts 96 \
+  --warmup 2 --runs 11 --store-samples
+```
+
+Within each `(routes, threads)` group, the benchmark shuffles all candidates and
+executes one sample per candidate per round. The coordinate oracle includes the
+analytical and inherited points, both complete one-dimensional axes, and a
+local 3x3 cross. It is not a full Cartesian search, so measured regret is a
+lower bound on regret against the full legal window space.
+
+The corrected policy-v2 2026-08-09 holdout produced:
+
+| Host / statistic | Median regret | P90 | Maximum | <=2% | <=5% |
+| :--- | ---: | ---: | ---: | ---: | ---: |
+| AmazonC5192Cores NUMA0, median | 1.50% | 2.98% | 3.38% | 17/28 | 28/28 |
+| AmazonECSV1 8C, raw median | 2.88% | 6.05% | 18.41% | 10/28 | 22/28 |
+| AmazonECSV1 8C, p10 sensitivity | 2.01% | 2.61% | 4.21% | 14/28 | 28/28 |
+
+On the clean 192-core host, v1's `1.63/6.57/11.32%` median/P90/maximum
+regret becomes `1.50/2.98/3.38%`. The correction changes cache traffic and
+uncertainty handling only; routes are not added to calibration, and the legal
+planner shape set is unchanged.
+
+The 192-core samples are stable: candidate p90/p10 spread has a 1.46% median,
+and policy v2 passes the 5% maximum-regret gate in both median and p10 analyses.
+The 8-core host was heavily preempted: candidate p90/p10 spread had a 28.47%
+median and 99.66% P90, so its raw maximum is not a valid strict gate; its p10
+sensitivity remains below 5%. Its cache and service curves are local, but
+packed-B retention is still a transferred prior. Analytical models use the
+formula-generated policy, while empirical production models retain their
+measured V4 policy or existing fallback until the remaining full-model gates
+pass. Full protocol and raw artifact links are in
+`optimizations/fused_moe_sve/results/analytic_stage_window_policy_v2_holdout_20260809.md`.
+
+Validate absolute analytical timing and planner shapes with:
 
 ```bash
 python cpu_moe_schedule_optimization/cost_model/validate_analytic_model.py \
@@ -449,8 +618,19 @@ gates still fail. Commands, anchors, and per-route decisions are recorded in
   exact demand mapper plus the common M12 ceiling.
 - Cold distinct-expert weights are assumed. Reusing the same expert across calls
   needs an explicit warm-weight state.
-- The three-anchor packed-B retention curve is not a set-level cache simulator;
-  long-route 1T/2T active windows remain overestimated on the 192-core host.
+- The three-anchor packed-B retention curve plus physical steady-scan state is
+  not a set-level cache simulator. It closes the long-route W13 error in the
+  tested grid, but does not represent cache sets, prefetch streams, or topology
+  below the NUMA-level aggregate service curve.
+- The stage-window selector scores W13 and W2 independently. Residual
+  two-stage interaction remains: the corrected 192-core maximum is 3.38% at
+  M=216/T=2, and long-route coordinate oracles sometimes prefer a larger W2
+  window. A free two-dimensional window search is deliberately not part of the
+  planner.
+- The AmazonECS8Cores cache/service calibration is machine-local, but its
+  packed-B retention fractions are currently a transferred 192-core prior.
+  It remains a portability holdout until a local multi-team refill probe
+  replaces that prior.
 - One-pass B streams are excluded from reusable capacity. Their small persistent
   LLC pollution is not modeled separately from stream bandwidth.
 - Gather, router, final TopK merge, communication, and cross-NUMA traffic are not

@@ -1349,7 +1349,7 @@ cold search。
 | Idling | 允许主动等待以避开争用 | planner 可关闭 tail-pool 和 bounded tail 保留原 strict；bounded tail 只依赖 blocker 完成、不增加主动等待；tail-pool 保持 non-idling；strict tail-steal 找不到满足 $c_h\ge r_{\min}$ 的后缀后立即释放 compute team，并在启用时转入 ready-token drain；elastic timeout=0 不主动等待，正 timeout 只允许在 W13/W2 边界等待有限 $\delta_i$；ready-token 路径仅填充无可运行 expert 的空闲 lane；cold-phase runtime benchmark 可按 oracle task release 主动等待，但 production planner 不生成非零 release | 受限 boundary idling 剪枝；oracle release 仅作可执行性诊断 |
 | Workload 输入 | 任意合法 global 或 rank-local route histogram | planner 接受任意 histogram；catalog preset 只扩展验证覆盖，不过滤运行时输入 | 不剪枝 |
 | Route combine | 任意满足 TopK release 约束和 CPU 容量的 merge 排程 | planner 不搜索 combine service time；strict plan 在预测 expert 同时完成时强制统一连续 post-expert merge，其余情况保留 auto；runtime 将连续 token range 固定映射给 logical worker，在 expert 边界和空闲期处理本 owner 已 release token，并在同一 resident worker job 排空；owner 间不偷取 merge；Plan V2 允许显式 on/off，elastic 不允许 on | 外层启发式限制与支配条件剪枝 |
-| Kernel variant | 任意未被支配的实现 | ARM `auto` 先要求完整 `jit/xbyak_exact_m` legacy split/no-split pair，再加入同 identity 的实测 global packed-B byte-window variants；Plan V2 在精确匹配的 AmazonC5192Cores TP4/F512 split profile 上默认按确定函数 $g(M,t)$ 覆盖单 task 的 W13/W2 window，其余 profile 继承 global policy；$g$ 在每个 shape/tail-pool 候选中确定性解析并进入执行成本，但 window 不成为自由搜索变量；缺少完整 JIT legacy pair 时整体回退 static pair；x86 AMX 使用不进入 planner 的确定性 per-expert pattern/cache policy，AVX-512/AMX 共用确定性 team-N/wave policy | 实例候选限制与 runtime policy |
+| Kernel variant | 任意未被支配的实现 | ARM `auto` 先要求完整 `jit/xbyak_exact_m` legacy split/no-split pair，再加入同 identity 的实测 global packed-B byte-window variants；empirical Plan V2 在精确匹配的 AmazonC5192Cores TP4/F512 split profile 上使用已验证的确定函数 $g(M,t)$，analytic Plan V2 则由 cache/service 解析模型直接生成 W13/W2 window，并以 A 物理驻留、B 有限瞬态/稳态扫描和校准不确定度 tie 确定唯一窗口；两者都在每个 shape/tail-pool 候选中确定性解析并进入执行成本，window 不成为自由搜索变量；缺少完整 JIT legacy pair 时整体回退 static pair；x86 AMX 使用不进入 planner 的确定性 per-expert pattern/cache policy，AVX-512/AMX 共用确定性 team-N/wave policy | 实例候选限制与 runtime policy |
 | Isolated time | 真实 $I_i(t)$ | production 默认仍为经验公式；可选 analytic backend 由 kernel demand、cache traffic 和机器 service curves 计算 | cost 近似，不剪枝可行域 |
 | Contention | 任意动态活跃配置上的真实 $D_i(\mathcal Z)$ | production 默认为实测 profile；bounded tail 仅在 uniform route、root/tail width 与物理 interval 完全匹配时使用 exact-layout full-call anchor，且禁止 route 插值；未命中仍走 stage-aware simulator；实验 strict tail-steal 暂不进入 cost model；analytic backend 按 L1-hot M12 GEMM core、L2/LLC/DRAM/epilogue 共享容量推进事件，register-only matrix/frontend/L1 只保留诊断；cold-phase oracle 只约束首个 M12 packed-B DRAM phase，运行时验证已证明它不能替代 per-worker L2 retention、完整 active stage window、LLC-to-L2 service、容量和 active-set slowdown | cost 近似，不剪枝可行域 |
 | 跨 rank lifetime | 每个 rank 的资源状态随其他 rank 完成而变化 | 有 matching single-rank companion 时，多 rank 活跃阶段使用 concurrent-rank profile，最后一个 rank 的剩余 phase 切换到 single-rank profile；缺表时保守保持 concurrent-rank rate | cost 状态近似，不剪枝可行域 |
@@ -1710,25 +1710,55 @@ $C_{L2}=2$ MiB、$\nu=8$；默认 $f_{L1}=0.625,f_{L2}=0.5$，得到
 设某 stage 有 $P$ 个物理 M panel；第 $j$ 个顺序 N range 的 packed-B 字节为
 $B_j$、每个 owner 的 B 窗口为 $U_j$、active owner 数为 $t_j$；全部物理
 packed-A 字节为 $A$，最大单 panel packed-A 字节为 $A_p$。range 按 tile 数
-非递增分配，因此后续 active owners 是首个 range 的子集。令
-$h_2(W)$ 为 effective L2 到 physical L2 容量不确定带内的 packed-A
-smoothstep miss 比例。packed-B 使用独立 repeated-scan probe 的三点保留率校准
-$g_2(W)$：低于拐点的 miss floor、名义 L2 容量处 miss、两倍容量处 miss，并在
-两段之间 smoothstep 插值。于是：
+非递增分配，因此后续 active owners 是首个 range 的子集。packed-B 使用独立
+repeated-scan probe 的有效容量比例
+$\rho_2^B$ 与三点保留率校准 $g_2(W)$：低于拐点的 miss floor、名义 L2 容量处
+miss、两倍容量处 miss，并在两段之间 smoothstep 插值：
+
+$$
+C^A_{2,\mathrm{eff}}=\rho_2^A C_2,
+\qquad
+C^B_{2,\mathrm{eff}}=\rho_2^B C_2.
+$$
+
+$\rho_2^A$ 与 $\rho_2^B$ 不要求相等；packed-B stripe 与 A、store 和 prefetch
+状态竞争，实测 retention knee 可以显著早于通用 L2 容量边界。$g_2$ 只描述 A
+尚未完成一个 effective-L2 turnover 时的**瞬态** repeated scan。定义：
+
+$$
+L_A=\max\left(\left\lfloor\frac{C^A_{2,\mathrm{eff}}}{A_p}\right\rfloor,1\right),
+\qquad
+q=\min(P-1,L_A),
+$$
+
+$$
+r_B(W)=\mathbf 1[W>C_2],
+\qquad
+r_A(U_j,A)=\mathbf 1[U_j+A>C_2-A_p].
+$$
+
+$L_A$ 是在 owner 前流过一个 effective L2 所需的 A panel 数；之后 B 进入物理
+驻留/流式稳态。$r_A$ 为 kernel 的在途 load/prefetch 保留一个 $A_p$ headroom，
+避免把正好贴住 L2 的 A 错判为可跨 range 驻留。于是：
 
 $$
 Q_{B,L2}
-=\sum_j B_j\left[1+(P-1)g_2(U_j+A_p)\right],
+=\sum_j B_j\left[
+1+qg_2(U_j+A_p)+(P-1-q)r_B(U_j+A_p)
+\right],
 $$
 
 $$
 Q_{A,L2}
-=A\left[t_1+\sum_{j>1}t_jh_2(U_j+A)\right].
+=A\left[t_1+\sum_{j>1}t_jr_A(U_j,A)\right].
 $$
 
-这直接表达当前 kernel loop：首次 B scan 是冷权重，后续 M panel 是否从 L2
-复用由 owner stripe 决定；每个 N owner 至少扫描一次 A，后续顺序 range 若 A
-仍驻留 L2 则不产生新 refill。对 production 的 distinct-expert 流式访问，
+这直接表达当前 kernel loop：首次 B scan 是冷权重；前 $q$ 次复用由实测瞬态
+retention 决定，之后能装进物理 L2 的 B stripe 驻留、超容量 stripe 继续流式；
+每个 N owner 至少扫描一次 A，后续顺序 range 只有在完整 A、owner B 与在途 panel
+共同可驻留时才不产生新 refill。旧公式把一次短 route 的残余 miss 乘到所有
+$P-1$ 个 panel，在长 route 上会无界放大并系统性偏向小窗口；新 turnover 长度完全
+由 cache/panel 几何得到，不引入 route 阈值或时间表。对 production 的 distinct-expert 流式访问，
 compulsory DRAM 只有首次 packed-B：
 
 $$
@@ -2186,18 +2216,94 @@ cache-pressure 变化进入 makespan；单 task 的绝对时间仍受原 isolate
 calibration 限制。解析 backend 则直接用实际 geometry 重算 range overhead、
 owner L2/LLC miss、DRAM demand 和 $\widehat I(M,t)$。
 
+对解析 backend，$g_\theta$ 不再来自 route band 表，而由同一物理 demand 模型直接
+生成。stage $s$、route $M$、已选 team width $t$ 的候选集合
+$\mathcal G_s(t)$ 只包含运行时可实现的 tile-aligned range，并施加：
+
+$$
+\omega_s(g,t)\ge C_{L1},
+\qquad
+n_{s,\mathrm{range}}(g)\ge\min(t,q_s),
+\qquad
+n_{s,\mathrm{owner}}(g,t)\in\{1,2,4,\ldots\},
+$$
+
+以及 W13 至少两个 range、W2 至少一个 range。第一项禁止把 owner stripe 压到
+L1D 以下后继续增加控制开销；第二项禁止 range 内 tile 少于可用 team 线程而造成
+barrier 自旋；第三项限制为 kernel 自然二分层级。operator-wide inherited geometry
+始终作为兼容端点。$M\le12$ 只有一个 physical panel、没有 B 重读可保护，故强制
+继承，不执行窗口优化。
+
+绝对时间仍按 8.2.4 的 ECM 重叠下界
+$T_{body}=\max(T_{core},T_{xfer})$。该式在 transfer 全落于同一 compute ceiling 下时
+无法区分窗口，因而 policy 选择单独使用串行增量目标：
+
+$$
+J_s(M,t,g)=
+\sum_{p\in\mathcal P_s(g)}
+\left[
+T_{core,p}+T_{epi,p}+
+\max(T_{L2,p},T_{LLC,p},T_{DRAM,p})
+\right]
++R_s(g)\tau_{range},
+$$
+
+令 $g_{\min}=\arg\min_gJ_s(M,t,g)$，machine calibration 的相对不确定度为
+$\epsilon_{rel}$。低于
+
+$$
+\Delta_J=\epsilon_{rel}T_{xfer}(g_{\min})
+$$
+
+的候选差异不视为物理可分辨，先形成等价集：
+
+$$
+\mathcal E_s(M,t)=
+\{g\in\mathcal G_s(t):J_s(M,t,g)\le J_s(M,t,g_{\min})+\Delta_J\}.
+$$
+
+令一个 packed-B tile 为 $b_s=K_s\nu\cdot2$，kernel-native owner 窗口为
+
+$$
+U_{s,pref}=\max(C_{L1D},2b_s).
+$$
+
+最终选择：
+
+$$
+g_s^*(M,t)=\arg\min_{g\in\mathcal E_s}
+\left(
+\left|\log_2\frac{U_s(g)}{U_{s,pref}}\right|,
+J_s(M,t,g),R_s(g)
+\right).
+$$
+
+它把候选相关的 refill/争用需求暴露出来，但**不替代**绝对时间模型；选择后仍用
+ECM maximum 和共享资源 event simulator 评分整个 DAG。W13/W2 分别独立选择，再
+下降到现有 per-range byte ABI。不确定度 tie 只使用一个 machine-level 标量和已有
+cache/kernel 几何，不引入 route band 或计时表。策略由 calibration digest 唯一命名，
+planner shape、tail-pool、kernel variant 与剪枝集合均不增加。
+
+SVE packed N tile $\nu$ 进入 machine/kernel calibration。解析模型默认使用
+`kernel.backend_n_tile`，holdout benchmark 将其与 packed weight runtime ABI
+比较并在不一致时拒绝测试。两台验证机分别为 AmazonC5192Cores 的 $\nu=8$ 与
+AmazonECSV1 的 $\nu=16$；若仍硬编码 8，8-core 的 4T 小窗口会只给两个线程分到
+N tile，测得的退化来自错误 ABI 而非解析策略。
+
 profile 的 homogeneous full-call anchor 只有在该 route 和 shape 的所有 lane
 都返回 `-1/-1` 时继续使用；任一 lane 命中 override 时必须走 stage event
 simulation，不能拿 global-policy full-call 时间覆盖新执行语义。候选的
 `active_working_set_bytes` 与 per-worker owner-window 诊断也按每个 lane 实际
 task window 计算。
 
-当前只有同时精确匹配双 NUMA AmazonC5192Cores 的 TP4
+empirical backend 当前只有同时精确匹配双 NUMA AmazonC5192Cores 的 TP4
 `H=4096,F=512,E=256`、96-core rank、SVE JIT exact-M、split-W13 profile
 identity 和 rank CPU 集合时，已在两个 NUMA rank 上验证的
 `amazon_c5_192c_tp4_f512_v1` 作为默认 runtime policy；任一字段不匹配或显式
 设置 `use_default_stage_window_policy=False` 时都继承 global policy。该默认是
-受限的确定性 execution policy，不代表窗口已成为 cost-model 搜索变量。特别是
+受限的确定性 execution policy；analytic backend 则在任意具有完整 machine
+calibration 的 SVE 模型上生成上述 policy。两者都不代表窗口已成为 cost-model
+搜索变量。特别是
 单个 M12 panel 不复用 B，额外 range 通常只有 dispatch 和 lane-width 代价，
 不能仅按 cache 容量规则强制细分。
 
@@ -3635,7 +3741,15 @@ $\{1,16\}$，每一格都落在上表三种原因里。对该 workload，split/n
 几何都有标定数据的机制。当前该 identity 的候选集本身已是最小的两项（split 与
 no-split，无 window variant），没有可塌缩的维度。
 
-#### 9.29 team 分割几何（`kM` / `kN`）与 $\omega$ 的适用域
+#### 9.29 team 分割几何（历史 `kM` / `kN` policy）与 $\omega$ 的适用域
+
+> 当前状态（2026-08-09）：production `plan_team_gemm_split` 的
+> `default_split_selector` 对 W13/W2 均固定返回 `kN`；`choose_moe_gemm_split`
+> 的旧门限只保留给显式 benchmark/诊断，不再决定 fused-expert 主路径。所以下文
+> `kM` 交界表描述的是旧运行时和旧测量的解释边界，不能用于当前解析
+> stage-window policy。当前 policy 的所有候选均满足 $\omega=g_s/t$ 的 `kN`
+> 语义；未来若重新启用 `kM`，必须先给解析 mapper 增加 axis-aware demand，不能
+> 复用本次 holdout 结论。
 
 $\omega=g_s/t$ 被称为「每线程窗口」，但这个物理含义依赖 team 沿哪个轴分割。
 `csrc/moe/arm/common/fused_moe_bf16_tiled.cpp` 的 `choose_moe_gemm_split` 按
@@ -3805,9 +3919,91 @@ $3.62$），计入 `instructions` 而**不计入** `stall_backend`；因此越�
 "多做了工作"而不是"多等了"。以及 shipped 表从不越界：最小 $\omega_{W13}$ 为
 $0.0625$ MiB 即恰好一个 tile，而 $\omega_{W2}$ 距其自身 $8$ KiB 下界还有 8 倍。
 
-由此有一个结构性缺口但生产不可达：tile 数少于线程数的 range 仍可沿 M 切以用满线程
-（即 `kM`），但 `choose_moe_gemm_split` 只按 $(stage,M,t)$ 选轴、从不查窗口。由于表的
-最小值是 1 tile/线程，$g=t$ 个 tile 恒可整除，该缺口触碰不到。
+旧运行时由此有一个结构性缺口但生产不可达：tile 数少于线程数的 range 可沿 M 切以
+用满线程，但旧 `choose_moe_gemm_split` 只按 $(stage,M,t)$ 选轴、从不查窗口。当前
+production 已固定 `kN`，而 8.3 的解析候选显式要求每 range 至少
+$\min(t,q_s)$ 个 tile；因此会饿死线程的点在进入目标函数前就被排除。
+
+#### 9.33 解析生成 stage-window policy 的两机 holdout
+
+2026-08-09 将 8.3 的确定性 $g_\theta(M,t)$ 从经验 band 扩展为解析 backend 可直接
+生成的 policy。候选、约束和增量目标见 8.3；实现为
+`cost_model/analytic_stage_window_policy.py`。`PlannedMoE` 对 analytic model 优先
+绑定该 policy，对 empirical model 继续使用精确 profile 的 V4 表或原 fallback。
+shape、tail-pool、kernel variant 和剪枝集合逐项不变。
+
+holdout 固定 `H=4096,F=512`、独立 expert weights、同一 lane DAG，只改变 W13/W2
+window。route 为 `28,72,120,216,320,768,2040`，width 为 `1,2,4,8`。每个
+$(M,t)$ 测 analytical、inherited、完整 W13/W2 单轴及 analytical 邻域 $3\times3$
+交叉点；该 coordinate oracle 不是完整二维笛卡尔积，故 regret 是对完整 legal space
+的下界。候选按 round 随机交错，避免先连续测完一个窗口造成时间漂移偏置。
+
+| 机器/口径 | median regret | P90 | max | $\le2\%$ | $\le5\%$ | 相对 inherited median gain |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: |
+| AmazonC5192Cores NUMA0，96 experts，11 rounds | 1.63% | 6.57% | 11.32% | 14/28 | 21/28 | 53.83% |
+| AmazonECSV1 8C，32 experts，15 rounds，raw median | 1.39% | 3.51% | 15.22% | 18/28 | 27/28 | 5.59% |
+| 同一 8C 数据，p10 单边噪声敏感性 | 1.30% | 1.93% | 2.78% | 26/28 | 28/28 | 5.43% |
+
+192C 的候选墙钟 `p90/p10` 中位仅 $1.44\%$，最大误差在 p10 口径仍为 $11.22\%$，
+故失败是真实模型误差：$M=2040/768@1T$ 把 W13 owner window 选成 512 KiB，coordinate
+oracle 为 1024 KiB；$M=216@1T/2T$ 和 $M=72@8T$ 又在相反方向错过转折。候选排序
+Spearman $\rho$ 的组间中位为 0.853、28 组中 26 组为正，说明 broad trend 已捕获，
+但 M=216 transition、长 route A/range balance 和两 stage 二阶耦合尚未闭合。
+
+8C 的 `p90/p10` 中位为 $19.56\%$、P90 为 $101.50\%$，后台 remote-agent 造成明显
+单边抢占；raw 最大点 $M=2040@4T$ 的 analytical median/p10 为
+`681.50/578.28 ms`，oracle 为 `591.46/576.39 ms`。所以该机只能说明可迁移方向，
+不能用 raw median 判严格 5% gate。其 cache/service curve 均为本机测量，但
+packed-B retention 暂用 192C 的 $1/8$-L2 prior，并在 profile provenance 标记为
+non-local；仍需本机 multi-team refill probe。
+
+两机另各跑 `M=12,T=4`、21 个 interleaved rounds。inherited owner window 均为
+1024/1024 KiB；192C 缩到最小 W13/W2 后由 3.2409 ms 变为 3.3742/3.2870 ms，8C
+由 4.4063 ms 变为 4.5329/4.5638 ms。中间 W2 点非单调，不据此拟合全局
+`range_fixed_ns`；$M\le12$ 保持继承。
+
+v1 结论（已被下方 v2 修正取代）：解析 backend 直接生成 policy 已可用作
+portable/shadow execution policy，但 clean 192C 的 max regret 未通过 5% gate，
+不能替换 empirical production V4。
+完整数据、噪声说明及 V4 对照见
+`optimizations/fused_moe_sve/results/analytic_stage_window_policy_holdout_20260809.md`。
+
+**Policy v2 修正。** v1 的两个稳定误差来自同一流量抽象：它把短 repeated-scan
+probe 的残余 $g_2$ miss 乘到全部 $P-1$ 个 panel，导致长 route 的小 miss 无界
+累积；同时 A 只走 effective/physical smoothstep，没有表达“完整 A 能否跨顺序 N
+range 驻留”的物理二态。v2 按 8.2.4 修正为：
+
+1. B 的 transient reuse 数由
+   $L_A=\max(\lfloor C^A_{2,eff}/A_p\rfloor,1)$ 给出，之后按
+   $U_j+A_p\le C_2$ 判 resident/streaming steady state；
+2. A 按 $U_j+A\le C_2-A_p$ 判跨 range 驻留，给在途 load/prefetch 留一个 panel；
+3. 若 $J_s$ 差异小于 $\epsilon_{rel}T_{xfer}$，不再相信 sub-microsecond 的顺序，
+   而在等价集内取最接近 $\max(C_{L1D},2b_s)$ 的自然 owner window。
+
+这三个量都来自 cache、panel、packed tile 几何或 machine-level uncertainty；没有
+新增 route 阈值、时延格点或 planner 搜索变量。相同 grid、coordinate oracle 和
+interleaved 协议重新测得：
+
+| 机器/口径 | median regret | P90 | max | $\le2\%$ | $\le5\%$ | 相对 inherited median gain |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: |
+| AmazonC5192Cores NUMA0，median | 1.50% | 2.98% | 3.38% | 17/28 | 28/28 | 56.13% |
+| 同一 192C 数据，p10 | 1.64% | 2.87% | 3.46% | 16/28 | 28/28 | 56.19% |
+| AmazonECSV1 8C，raw median | 2.88% | 6.05% | 18.41% | 10/28 | 22/28 | 3.04% |
+| 同一 8C 数据，p10 | 2.01% | 2.61% | 4.21% | 14/28 | 28/28 | 4.58% |
+
+192C candidate `p90/p10` spread 的 median/P90/max 为
+`1.46/3.20/8.22%`，v2 将 v1 的 `1.63/6.57/11.32%` 降到
+`1.50/2.98/3.38%`，clean 5% stage-window gate 已通过；median rank $\rho$
+由 0.853 升到 0.903。最大残差为 $M=216@2T$ 的 3.38%，其次是
+$M=2040@1T/2T$ 的 3.27/3.10%，现在主要是 W2/双 stage 二阶耦合，而不再是
+W13 transition 或长 route A-scan 的一阶错误。
+
+8C 的 candidate spread median/P90 仍为 `28.47/99.66%`，raw 18.41% 最大值
+来自单边抢占；p10 最大 4.21%。该机 packed-B retention 仍是 transferred prior，
+所以这只是方向性 portability pass，不能替代本地 multi-team probe。解析 backend
+保持 v2 默认；empirical V4 仍为 production default/fallback，直到完整 contention、
+distributed lifetime 和两机本地校准 gate 均通过。完整 v2 记录见
+`optimizations/fused_moe_sve/results/analytic_stage_window_policy_v2_holdout_20260809.md`。
 
 ## 10. 同步规则
 
@@ -3913,3 +4109,5 @@ $0.0625$ MiB 即恰好一个 tile，而 $\omega_{W2}$ 距其自身 $8$ KiB 下�
 | 2026-08-08 | v0.74 | 新增 9.29：记录 team 分割几何 `kM`/`kN` 及其对 $\omega$ 适用域的限制。`choose_moe_gemm_split` 按 $(stage,M,t)$ 选轴，而 weight-window 循环恒切 N 轴，且**不存在 cache 级 M 分块**。`kN` 下每线程 B 占用为 $g_s/t=\omega$、每线程 A 为 $2MK_s$；`kM` 下每线程 B 占用为 $g_s=t\omega$、每线程 A 为 $2(M/t)K_s$，故 $\omega$ 作为"每线程窗口"**仅在 `kN` 下成立**，而 policy 无条件按 $g_s=t\omega$ 下放。据此修正两处：8.2.5 的 $M=2040$/`24x4T` W13 实为 `kM`，$16.7$ MB 是每 range **全队**量而非每线程量，每线程为 $3.98$ MiB（$A/L2=1.99$ 而非 $7.97$）；该点 $+6.9$ ms 预测与 $+6.18$ ms 实测的吻合**反过来判别了几何**——按 `kN` 算应为 $9.63$ GB $\approx27.5$ ms，差 $4.4$ 倍，故实测独立确认 `kM`。9.28 的门限推导以 `kN` 为前提，其测点（$M\le320$，$t\le8$）除 $M\le32\ \&\ t=2$ 外均为 `kN`，适用域内成立。分割规则切开两个 band：`13--48@t=2`（$M\le32$ 为 `kM`）与 `288--575@t=8`（$M\ge512$ 为 `kM`）；W2 门限过高故 catalog 内恒为 `kN`，同一次调用两 stage 可走不同几何。校准数值不因此改动（实测所得，描述真实行为），改动的是解释与跨宽度外推的合法性：跨越交界的 $\omega$ 外推无效。|
 | 2026-08-08 | v0.75 | 新增 9.30：量出 band 表的实际覆盖率并定位 `96--143` 的 band 内梯度。九个 catalog preset 全部经 production planner 规划后按 (route, 宽度) 归格，`amazon_c5_192c_tp4_f512_v4` 的 24 格**只有 6 格被触及**：全部 1T/2T 格为空，4T 仅 `96--143` 一格，其余全在 8T；另有 285 个 task 落表外继承 operator-wide 窗口，含 `moe256-long-short-bimodal` 的全部 179 个。这直接解释了三处 latent gain（9.26 的 `49--95` 窄格、9.28 的 `216--287`、9.26 保留的 16T/32T 继承）——A/B 只能报噪声不是因为标定错，而是没有 preset 会排到那里，故补格子前应先查覆盖。同时暴露 A/B 的结构性盲区：唯一活跃的 4T 格所属 preset 在 A/B 集合内，但两臂为 $1$ MiB 与 $0.0625$ MiB，胜过两者的 $0.125$ MiB 不在任何一臂中。`96--143` 用单一 $\omega$ 覆盖 48 个 route 而最优值在 band 内迁移：4T 上 $\omega=0.125$ 相对生产值 $0.0625$ 在 $M=96/108/120$ 分别领先 $0.28\%/1.44\%/3.26\%$，交叉点在 $M=96$--$108$ 之间，而 9.28 门限表里 $M=120$ 峰值在 $1/8$ 而非生产用的 $1/16$ 这一矛盾此前未标注。唯一活跃格 `moe256-active-set-128` 的 128 个 expert 全在 $route=96$ 即交叉点上，损失 $0.28\%$ 低于噪声底，故不改值；记录为已知偏差：$100$--$143$ 的 4T workload 付 $1.4$--$3.3\%$，该格只在下沿验证过。|
 | 2026-08-08 | v0.76 | 补齐 8 点 $M$ 网格并撤回一处非单调读法；新增 9.31（残余代价不在任何已测计数器中）与 9.32（barrier 是线程饥饿的阶跃）。固定 $g_{W2}=0.5$ MiB 后 4T 上的最优 tile 数是**单调阶梯 1、2、8**：$M\le40$ 窗口无关（4 倍窗口变化只动 $0.33$--$0.59\%$，在 $0.5\%$ 重复性内，故 `13--48` 的 $0.25$ MiB 是三个不可区分选项之一）、$M=56$--$96$ 为 1 tile、$M\ge108$ 为 2 tile、$M\ge224$ 为 8 tile。此前把子集读成"$4\to1\to2$ 下凹"是混用了不同 $g_{W2}$ 的伪像；由此发现二阶耦合——**W2 窗口改变 W13 曲线形状**（$M=28$ 上 $g_{W2}=0.25$ 时 W13 有 $2.0\%$ 梯度，$0.5$ 时变平），9.25 的"W2 为弱轴"按其自身极差仍成立但两轴形状不独立。另两个压在 1-tile 下界的格子实测生产值正确（`49-95@4T` 优 $2.0\%$、`96-143@2T` 优 $0.27\%$），故 `96-143@4T` 是单一 band 边界个案而非系统性偏小；台阶在 $M\approx100$，活跃 preset 恰在 $route=96$ 处两窗口仅差 $0.07\%$，不改值。$\omega$ 的下界经代码与 profile 双重确认为**恰好一个 tile**（$K\cdot\text{n\_tile}\cdot2$，W13 $64$ KiB、W2 $8$ KiB，`max(1,\cdot)` clamp，tile 不可再分），越界的代价是多余线程零工作量后在 barrier **自旋**：占比随空闲线程比例阶跃（$3/4$ 空闲 $41.78\%$、$2/4$ 空闲 $21.86\%$、不空闲 $1.2\%$）而与 $R$ 无关（$R$ 变 8 倍不动）。自旋以高 IPC（$4.76$ vs $3.62$）退休指令，计入 `instructions` 而不计入 `stall_backend`，故越界窗口在 profile 里表现为"多做工作"而非"多等待"——这曾使我先后误判为同步开销、micro-kernel 摊销、A 重载三次。合法区内的残余代价（$M=72$ 上 $5.4\%$）则五个计数器全平，逐一否证 L2 容量、A 重扫流量、B 重读流量、指令数、barrier 与并发干扰，指向延迟/重叠而非体量，与页大小那 $13\%$ 同类，待用需求-预取拆分判别。|
+| 2026-08-09 | v0.77 | analytical backend 新增公式生成的 per-task W13/W2 stage-window policy：从 tile-aligned 可达集中过滤 L1D 以下窗口、线程饥饿和非二分 owner tile，W13/W2 分别最小化串行增量 ECM 目标；绝对时间继续使用原 ECM maximum/event simulator，planner 搜索空间不增加。machine schema 增加 runtime `backend_n_tile` 和独立 packed-B retention 有效容量，修正文档中旧 `kM/kN` 门限为历史行为（当前 production 固定 `kN`）。两机 interleaved holdout 中，192C median/P90/max regret 为 `1.63/6.57/11.32%`，8C raw 为 `1.39/3.51/15.22%`、p10 敏感性为 `1.30/1.93/2.78%`；8C retention 仍是显式 transferred prior。clean 192C 未过 5% max gate，故 analytic model 自动使用公式 policy，但 empirical production V4 与候选/剪枝保持不变。 |
+| 2026-08-09 | v0.78 | 修正 analytical stage-window cache traffic：A 改为保留一个在途 panel headroom 的物理 resident/streaming 二态；B 的三点 repeated-scan miss 只作用于 $\lfloor C^A_{2,eff}/A_p\rfloor$ 个 transient reuse，之后按 owner stripe 是否超过物理 L2 进入 resident/streaming steady state，避免长 route 把短程残余 miss 乘到全部 panel。选择器将 $\epsilon_{rel}T_{xfer}$ 内的目标视为不可分辨，并在等价集内取最接近 $\max(C_{L1D},2b_s)$ 的 kernel-native 窗口；没有新增 route 表、候选或剪枝。相同 interleaved holdout 上，192C median/P90/max regret 从 `1.63/6.57/11.32%` 降至 `1.50/2.98/3.38%`，28/28 通过 5% gate，median rank rho 由 0.853 升到 0.903；8C raw 仍受强抢占，p10 median/P90/max 为 `2.01/2.61/4.21%`，且 retention 仍为 transferred prior。analytic backend 默认升级到 policy v2；empirical V4 production 和 planner 搜索空间不变。 |
