@@ -17,13 +17,13 @@ from working_set_model import (  # noqa: E402
     ScanObservation,
     fit_owner_cache_model,
     isolated_baseline_ns,
+    max_stage_range_bytes,
     recommend_working_sets,
-    split_stage_bytes,
 )
 
 
-def test_split_stage_size_and_v3_owner_cache_band() -> None:
-    stage_bytes = split_stage_bytes(4096, 2048)
+def test_stage_range_size_and_v3_owner_cache_band() -> None:
+    stage_bytes = max_stage_range_bytes(4096, 2048, 8, 2, 1)
     model = OwnerCacheModel(
         cores=96,
         private_cache_bytes_per_core=2 * 2**20,

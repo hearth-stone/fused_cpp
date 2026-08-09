@@ -28,6 +28,7 @@ from profile_contention_async import (
     parse_int_list,
     summarize_times,
 )
+from weight_window import stage_weight_range_geometry
 from fused_cpp.moe import prepare_fused_moe_bf16_tiled_weights
 
 
@@ -160,8 +161,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cpu-ids", default=None, help="physical CPUs, e.g. 0-95")
     parser.add_argument("--numa-node", type=int, default=-1)
     parser.add_argument("--llc-bytes", type=int, default=None)
-    parser.add_argument("--w13-split", type=int, choices=(0, 1), default=1)
-    parser.add_argument("--w13-split-chunks", type=int, default=2)
+    parser.add_argument("--w13-ranges", type=int, default=2)
+    parser.add_argument("--w2-ranges", type=int, default=1)
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--runs", type=int, default=9)
     parser.add_argument("--seed", type=int, default=0)
@@ -184,12 +185,11 @@ def main() -> int:
         raise ValueError("--global-experts cannot be smaller than --num-experts")
     if not 0.0 <= args.throughput_tolerance < 1.0:
         raise ValueError("--throughput-tolerance must be in [0, 1)")
-    if args.w13_split and args.w13_split_chunks != 2:
-        raise ValueError("the current split-W13 kernel has exactly two chunks")
+    if min(args.w13_ranges, args.w2_ranges) <= 0:
+        raise ValueError("--w13-ranges and --w2-ranges must be positive")
 
     allocations = ["one-thread", "uniform-cores"] if args.allocation == "both" else [args.allocation]
     torch.set_num_threads(1)
-    os.environ["FUSED_CPP_MOE_W13_SPLIT_N"] = "1" if args.w13_split else "0"
     generator = torch.Generator().manual_seed(args.seed)
     w13 = bf16(
         (args.num_experts, 2 * args.ffn_hidden_size, args.hidden_size),
@@ -205,9 +205,20 @@ def main() -> int:
     del w13, w2
     w13_bytes = packed.w13[0].numel() * packed.w13[0].element_size()
     w2_bytes = packed.w2[0].numel() * packed.w2[0].element_size()
-    split_chunks = args.w13_split_chunks if args.w13_split else 1
-    w13_stage_bytes = w13_bytes // args.num_experts // split_chunks
-    w2_stage_bytes = w2_bytes // args.num_experts
+    w13_geometry = stage_weight_range_geometry(
+        k=args.hidden_size,
+        n=2 * args.ffn_hidden_size,
+        n_tile=int(packed.backend_n_tile),
+        ranges=args.w13_ranges,
+    )
+    w2_geometry = stage_weight_range_geometry(
+        k=args.ffn_hidden_size,
+        n=args.hidden_size,
+        n_tile=int(packed.backend_n_tile),
+        ranges=args.w2_ranges,
+    )
+    w13_stage_bytes = w13_geometry.max_range_bytes
+    w2_stage_bytes = w2_geometry.max_range_bytes
     stage_bytes = max(w13_stage_bytes, w2_stage_bytes)
     llc_bytes = args.llc_bytes or detect_llc_bytes(cpu_ids[0])
     sync_client = SyncClient(0, 0)
@@ -230,7 +241,8 @@ def main() -> int:
                     measurement_experts=measurement_experts,
                     num_profile_experts=args.num_experts,
                     cpu_ids=cpu_ids,
-                    w13_split=bool(args.w13_split),
+                    w13_ranges=args.w13_ranges,
+                    w2_ranges=args.w2_ranges,
                     generator=generator,
                     std=args.std,
                     lane_experts=lane_experts,
@@ -295,8 +307,8 @@ def main() -> int:
             "gemm_backend": int(packed.gemm_backend),
             "backend_n_tile": int(packed.backend_n_tile),
             "parallel_axis": "N",
-            "w13_split": bool(args.w13_split),
-            "w13_split_chunks": split_chunks,
+            "w13_window_ranges": args.w13_ranges,
+            "w2_window_ranges": args.w2_ranges,
             **kernel_metadata(),
         },
         "parallelism": {
@@ -319,7 +331,7 @@ def main() -> int:
             "w13_stage_bytes_per_expert": w13_stage_bytes,
             "w2_packed_bytes_per_expert": w2_bytes // args.num_experts,
             "max_weight_stage_bytes_per_expert": stage_bytes,
-            "definition": "active_experts * max(w13_chunk_bytes, w2_bytes)",
+            "definition": "active_experts * max(w13_range_bytes, w2_range_bytes)",
         },
         "measurement": {
             "allocations": allocations,

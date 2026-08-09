@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Predict a robust split-W13 expert working-set band from cache metrics.
+"""Predict a robust stage-range expert working-set band from cache metrics.
 
 The model uses a GEMM-free packed-weight scan to identify how many independent
 streams are needed to saturate cache bandwidth.  Its upper bound is derived
@@ -25,6 +25,7 @@ sys.path.insert(0, str(ROOT))
 
 from gemm_ecm import kernel_panels  # noqa: E402
 from iso_formula import IsoFormula  # noqa: E402
+from weight_window import stage_weight_range_geometry  # noqa: E402
 
 
 @dataclass(frozen=True)
@@ -172,12 +173,27 @@ def scan_fit_report(observations: list[ScanObservation], model: OwnerCacheModel)
     return rows
 
 
-def split_stage_bytes(hidden_size: int, intermediate_size: int) -> int:
-    if min(hidden_size, intermediate_size) <= 0:
-        raise ValueError("H and F must be positive")
-    # W13 is split into two equal N ranges. Each range and W2 contain H*F
-    # BF16 values, so all three sequential stages have the same weight size.
-    return 2 * hidden_size * intermediate_size
+def max_stage_range_bytes(
+    hidden_size: int,
+    intermediate_size: int,
+    n_tile: int,
+    w13_ranges: int,
+    w2_ranges: int,
+) -> int:
+    """Return the larger exact packed-B range across the two expert stages."""
+    w13 = stage_weight_range_geometry(
+        k=hidden_size,
+        n=2 * intermediate_size,
+        n_tile=n_tile,
+        ranges=w13_ranges,
+    )
+    w2 = stage_weight_range_geometry(
+        k=intermediate_size,
+        n=hidden_size,
+        n_tile=n_tile,
+        ranges=w2_ranges,
+    )
+    return max(w13.max_range_bytes, w2.max_range_bytes)
 
 
 def isolated_baseline_ns(
@@ -198,14 +214,24 @@ def isolated_baseline_ns(
     return max(loads)
 
 
-def validate_split_profile(profile: dict) -> tuple[int, int, int]:
+def validate_range_profile(profile: dict) -> tuple[int, int, int]:
     kernel = profile.get("kernel", {})
-    if not kernel.get("w13_split") or int(kernel.get("w13_split_chunks", 0)) != 2:
-        raise ValueError("working-set model supports only two-range split-W13")
+    try:
+        n_tile = int(kernel["backend_n_tile"])
+        w13_ranges = int(kernel["w13_window_ranges"])
+        w2_ranges = int(kernel["w2_window_ranges"])
+    except KeyError as error:
+        raise ValueError("working-set profile requires exact W13/W2 stage ranges") from error
     shape = profile["expert_shape"]
     hidden_size = int(shape["hidden_size"])
     intermediate_size = int(shape["intermediate_size"])
-    stage_bytes = split_stage_bytes(hidden_size, intermediate_size)
+    stage_bytes = max_stage_range_bytes(
+        hidden_size,
+        intermediate_size,
+        n_tile,
+        w13_ranges,
+        w2_ranges,
+    )
     recorded = int(profile["working_set"]["max_weight_stage_bytes_per_expert"])
     if recorded != stage_bytes:
         raise ValueError(f"recorded stage bytes {recorded} != formula {stage_bytes}")
@@ -317,7 +343,7 @@ def recommend_working_sets(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("profile", type=Path, help="split schema-v2 profile")
+    parser.add_argument("profile", type=Path, help="exact-range schema-v2 profile")
     parser.add_argument("--scan-csv", type=Path, required=True)
     parser.add_argument("--holdout-search", type=Path, action="append", default=[])
     parser.add_argument("--cores", type=int, default=None)
@@ -334,11 +360,11 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     profile = json.loads(args.profile.read_text(encoding="utf-8"))
-    _, _, stage_bytes = validate_split_profile(profile)
+    _, _, stage_bytes = validate_range_profile(profile)
     formula = IsoFormula.from_dict(profile["iso_formula"])
     observations = load_scan_observations(args.scan_csv)
     if observations[0].stream_bytes != stage_bytes:
-        raise ValueError(f"scan stream is {observations[0].stream_bytes} bytes; split stage is {stage_bytes} bytes")
+        raise ValueError(f"scan stream is {observations[0].stream_bytes} bytes; max stage range is {stage_bytes} bytes")
     cores = args.cores or int(profile["target"]["cores_per_rank"])
     model = fit_owner_cache_model(
         observations,
@@ -361,7 +387,7 @@ def main() -> int:
     holdout_candidates = []
     for path in args.holdout_search:
         search = json.loads(path.read_text(encoding="utf-8"))
-        validate_split_profile(search)
+        validate_range_profile(search)
         holdout_candidates.append(search_candidates(search, formula))
     holdout_summary = (
         recommend_working_sets(

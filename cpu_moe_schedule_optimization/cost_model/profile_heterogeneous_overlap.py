@@ -49,17 +49,10 @@ from profile_contention_async import (
     parse_int_list,
     summarize_times,
 )
+from weight_window import stage_weight_range_geometry, stage_weight_window_geometry
 
 from fused_cpp.moe import (  # noqa: E402
-    ASYNC_MOE_EXECUTION_STRICT,
-    ASYNC_MOE_FULL_EXPERT_RANGE,
-    ASYNC_MOE_PLACEMENT_FIXED,
-    ASYNC_MOE_PLAN_VERSION,
-    ASYNC_MOE_RESIZE_NONE,
-    ASYNC_MOE_STAGE_EXPERT,
-    AsyncMoEPlanV2,
     fused_moe_bf16_tiled_async,
-    fused_moe_bf16_tiled_async_plan,
     prepare_fused_moe_bf16_tiled_weights,
 )
 
@@ -99,19 +92,12 @@ def build_run(
     cpu_ids: list[int],
     physical_cores: list[int],
     num_profile_experts: int,
-    w13_split: bool,
+    w13_ranges: int,
+    w2_ranges: int,
     generator: torch.Generator,
     std: float,
-    weight_window_bytes: int = 0,
-    stage_window_bytes: tuple[int, int] | None = None,
 ):
-    """Lower ``lanes`` to the async task DAG and return a callable plus metadata.
-
-    ``weight_window_bytes`` is the operator-wide packed-B budget, which the v1
-    async op applies to both stages. ``stage_window_bytes`` instead sets the W13
-    and W2 budgets independently, which requires the Plan V2 path because
-    per-task stage windows only exist there.
-    """
+    """Lower ``lanes`` to the async task DAG and return a callable plus metadata."""
     used = [expert for lane in lanes for expert in lane.experts]
     if len(set(used)) != len(used):
         raise ValueError("each timed task must use a distinct expert")
@@ -187,53 +173,10 @@ def build_run(
             activation="silu",
             global_num_experts=num_profile_experts,
             skip_weighted=True,
-            w13_split=w13_split,
-            weight_window_bytes=weight_window_bytes,
+            w13_ranges=w13_ranges,
+            w2_ranges=w2_ranges,
             out=output,
         )
-
-    if stage_window_bytes is not None:
-        num_tasks = len(task_experts)
-        plan = AsyncMoEPlanV2.from_dict(
-            {
-                "plan_version": ASYNC_MOE_PLAN_VERSION,
-                "execution_mode": ASYNC_MOE_EXECUTION_STRICT,
-                "num_threads": num_threads,
-                "thread_cpu_ids": [int(value) for value in thread_cpu_ids.tolist()],
-                "task_expert_ids": task_experts,
-                "task_core_begins": task_cores,
-                "task_threads": task_threads,
-                "task_dep_offsets": dep_offsets,
-                "task_deps": deps,
-                "task_preferred_threads": list(task_threads),
-                "task_min_threads": list(task_threads),
-                "task_max_threads": list(task_threads),
-                "task_allowed_thread_offsets": list(range(num_tasks + 1)),
-                "task_allowed_threads": list(task_threads),
-                "task_placement_modes": [ASYNC_MOE_PLACEMENT_FIXED] * num_tasks,
-                "task_numa_nodes": [-1] * num_tasks,
-                "task_stage_ids": [ASYNC_MOE_STAGE_EXPERT] * num_tasks,
-                "task_resize_points": [ASYNC_MOE_RESIZE_NONE] * num_tasks,
-                "task_range_granularities": [ASYNC_MOE_FULL_EXPERT_RANGE] * num_tasks,
-                "task_w13_window_bytes": [stage_window_bytes[0]] * num_tasks,
-                "task_w2_window_bytes": [stage_window_bytes[1]] * num_tasks,
-            }
-        )
-
-        def run() -> torch.Tensor:  # noqa: F811
-            return fused_moe_bf16_tiled_async_plan(
-                x,
-                packed,
-                topk_weights,
-                topk_ids,
-                plan,
-                activation="silu",
-                global_num_experts=num_profile_experts,
-                skip_weighted=True,
-                w13_split=w13_split,
-                weight_window_bytes=weight_window_bytes,
-                out=output,
-            )
 
     routes_by_task = [expert_routes[expert] for expert in task_experts]
     return run, {
@@ -281,13 +224,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--cpu-ids", default=None, help="physical CPUs, e.g. 0-95")
     parser.add_argument("--llc-bytes", type=int, default=None)
-    parser.add_argument("--w13-split", type=int, choices=(0, 1), default=1)
-    parser.add_argument("--w13-split-chunks", type=int, default=2)
+    parser.add_argument("--w13-ranges", type=int, default=2)
+    parser.add_argument("--w2-ranges", type=int, default=1)
     parser.add_argument(
         "--small-window-sweep",
         default=None,
         help=(
-            "packed-B window targets in MiB for the memory-bound class (0 = legacy split-W13). "
+            "packed-B window targets in MiB for the memory-bound class (0 = baseline ranges). "
             "When given, only the small-only matrix is measured."
         ),
     )
@@ -296,8 +239,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "optional W2 window targets in MiB, crossed with --small-window-sweep (which then means W13). "
-            "Requires the Plan V2 path because per-task stage windows only exist there. "
-            "0 is not allowed here: legacy geometry cannot be requested per stage."
+            "0 is not allowed here because each stage target must be explicit."
         ),
     )
     parser.add_argument("--warmup", type=int, default=3)
@@ -340,8 +282,8 @@ def main() -> int:
             raise ValueError("the W13 axis must be positive when W2 is swept separately")
     if any(lanes * small_threads > total_cores for lanes in lane_sweep):
         raise ValueError(f"--small-lane-sweep values must not exceed {total_cores // small_threads}")
-    if args.w13_split and args.w13_split_chunks != 2:
-        raise ValueError("the current split-W13 kernel has exactly two chunks")
+    if min(args.w13_ranges, args.w2_ranges) <= 0:
+        raise ValueError("--w13-ranges and --w2-ranges must be positive")
 
     big_experts = list(range(args.big_experts))
     small_experts = list(range(args.big_experts, args.big_experts + args.small_experts))
@@ -349,7 +291,6 @@ def main() -> int:
     expert_routes.update({expert: args.small_routes for expert in small_experts})
 
     torch.set_num_threads(1)
-    os.environ["FUSED_CPP_MOE_W13_SPLIT_N"] = "1" if args.w13_split else "0"
     generator = torch.Generator().manual_seed(args.seed)
     w13 = bf16((args.num_experts, 2 * args.ffn_hidden_size, args.hidden_size), generator, args.std)
     w2 = bf16((args.num_experts, args.hidden_size, args.ffn_hidden_size), generator, args.std)
@@ -359,8 +300,19 @@ def main() -> int:
     w13_bytes = packed.w13[0].numel() * packed.w13[0].element_size() // args.num_experts
     w2_bytes = packed.w2[0].numel() * packed.w2[0].element_size() // args.num_experts
     expert_weight_bytes = w13_bytes + w2_bytes
-    split_chunks = args.w13_split_chunks if args.w13_split else 1
-    stage_bytes = max(w13_bytes // split_chunks, w2_bytes)
+    w13_base = stage_weight_range_geometry(
+        k=args.hidden_size,
+        n=2 * args.ffn_hidden_size,
+        n_tile=int(packed.backend_n_tile),
+        ranges=args.w13_ranges,
+    )
+    w2_base = stage_weight_range_geometry(
+        k=args.ffn_hidden_size,
+        n=args.hidden_size,
+        n_tile=int(packed.backend_n_tile),
+        ranges=args.w2_ranges,
+    )
+    stage_bytes = max(w13_base.max_range_bytes, w2_base.max_range_bytes)
     llc_bytes = args.llc_bytes or detect_llc_bytes(cpu_ids[0])
     sync_client = SyncClient(0, 0)
 
@@ -370,10 +322,30 @@ def main() -> int:
         "expert_routes": expert_routes,
         "cpu_ids": cpu_ids,
         "num_profile_experts": args.num_experts,
-        "w13_split": bool(args.w13_split),
         "generator": generator,
         "std": args.std,
     }
+
+    def ranges_for_targets(w13_target_bytes: int, w2_target_bytes: int) -> tuple[int, int]:
+        if w13_target_bytes == 0 and w2_target_bytes == 0:
+            return args.w13_ranges, args.w2_ranges
+        if min(w13_target_bytes, w2_target_bytes) <= 0:
+            raise ValueError("W13 and W2 target bytes must both be positive or both use the baseline")
+        w13 = stage_weight_window_geometry(
+            k=args.hidden_size,
+            n=2 * args.ffn_hidden_size,
+            n_tile=int(packed.backend_n_tile),
+            target_bytes=w13_target_bytes,
+            fallback_ranges=args.w13_ranges,
+        )
+        w2 = stage_weight_window_geometry(
+            k=args.ffn_hidden_size,
+            n=args.hidden_size,
+            n_tile=int(packed.backend_n_tile),
+            target_bytes=w2_target_bytes,
+            fallback_ranges=args.w2_ranges,
+        )
+        return w13.ranges, w2.ranges
 
     def write_payload(entries: list[dict]) -> None:
         payload = {
@@ -391,8 +363,8 @@ def main() -> int:
                 "backend": "sve" if int(packed.gemm_backend) == 1 else "neon",
                 "gemm_backend": int(packed.gemm_backend),
                 "backend_n_tile": int(packed.backend_n_tile),
-                "w13_split": bool(args.w13_split),
-                "w13_split_chunks": split_chunks,
+                "w13_window_ranges": args.w13_ranges,
+                "w2_window_ranges": args.w2_ranges,
                 "hugetlbfs_path": os.environ.get("FUSED_CPP_MOE_HUGETLBFS_PATH", ""),
                 **kernel_metadata(),
             },
@@ -438,14 +410,15 @@ def main() -> int:
         lanes: list[Lane],
         physical_cores: list[int],
         extra: dict,
-        weight_window_bytes: int = 0,
-        stage_window_bytes: tuple[int, int] | None = None,
+        stage_ranges: tuple[int, int] | None = None,
+        requested_windows: tuple[int, int] = (0, 0),
     ) -> dict:
+        selected_ranges = stage_ranges or (args.w13_ranges, args.w2_ranges)
         run, meta = build_run(
             lanes=lanes,
             physical_cores=physical_cores,
-            weight_window_bytes=weight_window_bytes,
-            stage_window_bytes=stage_window_bytes,
+            w13_ranges=selected_ranges[0],
+            w2_ranges=selected_ranges[1],
             **common,
         )
         samples = measure(run, warmup=args.warmup, runs=args.runs, sync_client=sync_client)
@@ -456,8 +429,10 @@ def main() -> int:
             "mode": label,
             **extra,
             **{key: value for key, value in meta.items() if key != "task_routes"},
-            "weight_window_bytes": weight_window_bytes,
-            "stage_window_bytes": list(stage_window_bytes) if stage_window_bytes else None,
+            "w13_window_ranges": selected_ranges[0],
+            "w2_window_ranges": selected_ranges[1],
+            "requested_w13_window_bytes": requested_windows[0],
+            "requested_w2_window_bytes": requested_windows[1],
             "median_ns": median_ns,
             "p10_ns": timing["p10_ns"],
             "p90_ns": timing["p90_ns"],
@@ -509,11 +484,14 @@ def main() -> int:
             cores = list(range(total_cores - cores_used, total_cores))
             per_thread = window_bytes / small_threads / 2**20 if window_bytes else None
             if w2_window_bytes is None:
-                window_label = "legacy" if window_bytes == 0 else f"{window_bytes / 2**20:g}MiB"
+                window_label = "baseline" if window_bytes == 0 else f"{window_bytes / 2**20:g}MiB"
                 w2_per_thread = per_thread
+                requested = (window_bytes, window_bytes)
             else:
                 window_label = f"{window_bytes / 2**20:g}/{w2_window_bytes / 2**20:g}MiB"
                 w2_per_thread = w2_window_bytes / small_threads / 2**20
+                requested = (window_bytes, w2_window_bytes)
+            selected_ranges = ranges_for_targets(*requested)
             entry = timed(
                 "small_only",
                 lanes,
@@ -526,8 +504,8 @@ def main() -> int:
                     "window_per_thread_mib": per_thread,
                     "w2_window_per_thread_mib": w2_per_thread,
                 },
-                weight_window_bytes=0 if w2_window_bytes is not None else window_bytes,
-                stage_window_bytes=None if w2_window_bytes is None else (window_bytes, w2_window_bytes),
+                stage_ranges=selected_ranges,
+                requested_windows=requested,
             )
             small_only[key] = entry
             entries.append(entry)
@@ -572,7 +550,7 @@ def main() -> int:
         for entry in entries:
             per_thread = entry["window_per_thread_mib"]
             print(
-                f"{entry['label']:<26} per-thread={'legacy(4)' if per_thread is None else f'{per_thread:g}':>10} MiB  "
+                f"{entry['label']:<26} per-thread={'baseline' if per_thread is None else f'{per_thread:g}':>10} MiB  "
                 f"wall={entry['median_ns'] / 1e6:8.3f} ms  "
                 f"{entry['weight_gbps']:7.1f} GB/s  {entry['tflops']:7.3f} TFLOP/s"
             )

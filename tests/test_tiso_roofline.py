@@ -59,10 +59,13 @@ def test_nsplit_fused_expert_work_matches_kernel_loops() -> None:
     assert work.w2.c_write_bytes == 4 * 12 * h
     assert work.gemm_flops == 72 * h * f
 
-    split_work = fused_expert_work(12, threads, h, f, w13_n_ranges=2)
-    assert split_work.w13.a_read_bytes == 2 * work.w13.a_read_bytes
-    assert split_work.w13.b_read_bytes == work.w13.b_read_bytes
-    assert split_work.w13.c_write_bytes == work.w13.c_write_bytes
+    two_range_work = fused_expert_work(12, threads, h, f, w13_n_ranges=2)
+    assert two_range_work.w13.a_read_bytes == 2 * work.w13.a_read_bytes
+    assert two_range_work.w13.b_read_bytes == work.w13.b_read_bytes
+    assert two_range_work.w13.c_write_bytes == work.w13.c_write_bytes
+
+    w2_two_range_work = fused_expert_work(12, threads, h, f, w2_n_ranges=2)
+    assert w2_two_range_work.w2.a_read_bytes == 2 * work.w2.a_read_bytes
 
 
 def test_tiso_tail_uses_distinct_compute_pack_and_store_rows() -> None:

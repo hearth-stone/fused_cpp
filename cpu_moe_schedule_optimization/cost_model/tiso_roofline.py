@@ -84,6 +84,7 @@ class TisoWork:
     panel_histogram: dict[int, int]
     threads: int
     w13_n_ranges: int
+    w2_n_ranges: int
     hidden_size: int
     intermediate_size: int
     w13: GemmWork
@@ -111,6 +112,7 @@ def fused_expert_work(
     *,
     parallel_axis: str = "N",
     w13_n_ranges: int = 1,
+    w2_n_ranges: int = 1,
     w2_output_bytes: int = FP32_BYTES,
 ) -> TisoWork:
     """Compute fused W13+W2 work using the current packed-A kernel loops.
@@ -126,8 +128,8 @@ def fused_expert_work(
         raise ValueError("threads, hidden_size, and intermediate_size must be positive")
     if parallel_axis not in {"M", "N"}:
         raise ValueError(f"parallel_axis must be 'M' or 'N', got {parallel_axis!r}")
-    if w13_n_ranges <= 0:
-        raise ValueError(f"w13_n_ranges must be positive, got {w13_n_ranges}")
+    if min(w13_n_ranges, w2_n_ranges) <= 0:
+        raise ValueError("W13 and W2 range counts must be positive")
     if w2_output_bytes not in {BF16_BYTES, FP32_BYTES}:
         raise ValueError("w2_output_bytes must be 2 (bf16) or 4 (fp32)")
 
@@ -152,7 +154,7 @@ def fused_expert_work(
     # down rows before converting/scattering them to the BF16 output.
     w2 = GemmWork(
         flops=2 * effective_rows * h * f,
-        a_read_bytes=BF16_BYTES * effective_rows * f * n_partitions,
+        a_read_bytes=BF16_BYTES * effective_rows * f * n_partitions * int(w2_n_ranges),
         b_read_bytes=BF16_BYTES * panel_count * f * h,
         c_write_bytes=w2_output_bytes * store_rows * h,
     )
@@ -171,6 +173,7 @@ def fused_expert_work(
         panel_histogram=panels,
         threads=int(threads),
         w13_n_ranges=int(w13_n_ranges),
+        w2_n_ranges=int(w2_n_ranges),
         hidden_size=h,
         intermediate_size=f,
         w13=w13,
@@ -283,7 +286,13 @@ def fit_bulk_observations(
     intermediate_size = int(expert["intermediate_size"])
     axis = str(profile.get("kernel", {}).get("parallel_axis", "N"))
     kernel = profile.get("kernel", {})
-    w13_n_ranges = int(kernel.get("w13_split_chunks", 2)) if bool(kernel.get("w13_split", False)) else 1
+    try:
+        w13_n_ranges = int(kernel["w13_window_ranges"])
+        w2_n_ranges = int(kernel["w2_window_ranges"])
+    except KeyError as error:
+        raise ValueError("profile kernel requires exact W13/W2 stage ranges") from error
+    if min(w13_n_ranges, w2_n_ranges) <= 0:
+        raise ValueError("profile W13/W2 stage ranges must be positive")
     isolated = profile["isolated"]
     thread_values = sorted({int(entry["threads"]) for entry in isolated})
     output: list[BulkObservation] = []
@@ -306,6 +315,7 @@ def fit_bulk_observations(
             intermediate_size,
             parallel_axis=axis,
             w13_n_ranges=w13_n_ranges,
+            w2_n_ranges=w2_n_ranges,
         )
         errors = [abs((intercept + panels * panel_ns) / measured - 1.0) for panels, measured in points]
         seconds = panel_ns / 1e9
@@ -328,7 +338,8 @@ def fit_bulk_observations(
 def build_report(profile: dict, profile_path: str, min_routes: int) -> dict:
     observations = fit_bulk_observations(profile, min_routes=min_routes)
     kernel = profile.get("kernel", {})
-    w13_n_ranges = int(kernel.get("w13_split_chunks", 2)) if bool(kernel.get("w13_split", False)) else 1
+    w13_n_ranges = int(kernel["w13_window_ranges"])
+    w2_n_ranges = int(kernel["w2_window_ranges"])
     return {
         "schema_version": 1,
         "kind": "explainable_tiso_roofline_shadow",
@@ -336,10 +347,11 @@ def build_report(profile: dict, profile_path: str, min_routes: int) -> dict:
         "formula": {
             "m_panel": M_PANEL,
             "w13_n_ranges": w13_n_ranges,
+            "w2_n_ranges": w2_n_ranges,
             "w13_flops": "4*m_compute*H*F",
             "w2_flops": "2*m_compute*H*F",
             "w13_bytes_nsplit": ("4*H*F + 2*c13*t*m_compute*H + 2*m_store*F"),
-            "w2_bytes_nsplit": ("2*H*F + 2*t*m_compute*F + 4*m_store*H"),
+            "w2_bytes_nsplit": ("2*H*F + 2*c2*t*m_compute*F + 4*m_store*H"),
             "stage_time": "max(flops / P_stage(t), bytes / B_L3(t))",
             "total_time": "O(t) + T_aux + sum_panels(T_w13 + T_w2)",
         },
