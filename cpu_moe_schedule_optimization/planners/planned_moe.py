@@ -69,6 +69,19 @@ def _tail_pool_signature(counts: List[Tuple[int, int]], max_routes: int) -> tupl
     )
 
 
+def _default_stage_window_policy(model, *, num_cores: int, cpu_ids: tuple[int, ...]):
+    analytic_selector = getattr(model, "default_task_stage_window_policy", None)
+    if callable(analytic_selector):
+        policy = analytic_selector(num_cores=num_cores, cpu_ids=cpu_ids)
+        if policy is not None:
+            return policy
+    return default_task_stage_window_policy(
+        model.policy,
+        num_cores=num_cores,
+        cpu_ids=cpu_ids,
+    )
+
+
 class PlannedMoE:
     def __init__(
         self,
@@ -93,8 +106,8 @@ class PlannedMoE:
             self.task_stage_window_policies = (task_stage_window_policy,) * len(self.models)
         elif self.use_default_stage_window_policy:
             self.task_stage_window_policies = tuple(
-                default_task_stage_window_policy(
-                    model.policy,
+                _default_stage_window_policy(
+                    model,
                     num_cores=self.num_cores,
                     cpu_ids=self.cpu_ids,
                 )

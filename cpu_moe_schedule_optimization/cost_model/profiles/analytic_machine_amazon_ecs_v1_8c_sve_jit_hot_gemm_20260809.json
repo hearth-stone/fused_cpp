@@ -1,0 +1,119 @@
+{
+  "schema_version": 1,
+  "kind": "moe_analytic_machine",
+  "machine": {
+    "id": "AmazonECSV1-8c-sve-jit-hot-gemm-20260809",
+    "cores_per_rank": 8
+  },
+  "kernel": {
+    "backend_n_tile": 16
+  },
+  "caches": {
+    "l1d_bytes_per_core": 65536,
+    "l2_bytes_per_core": 1048576,
+    "llc_bytes_per_rank": 33554432,
+    "l2_effective_fraction": 0.75,
+    "llc_effective_fraction": 0.75,
+    "l2_b_reuse_effective_fraction": 0.125,
+    "l2_b_reuse_miss_floor": 0.18,
+    "l2_b_reuse_miss_at_capacity": 0.623,
+    "l2_b_reuse_miss_ceiling": 0.869
+  },
+  "services": {
+    "dram_bytes": {
+      "single_thread_rate": 32897421153.434185,
+      "saturated_rate": 181030005604.17526,
+      "saturation_threads": 8,
+      "curve": "shared_bottleneck"
+    },
+    "gemm_core_flops": {
+      "single_thread_rate": 289325667936.2279,
+      "saturated_rate": 1621198162339.6704,
+      "saturation_threads": 8,
+      "curve": "power"
+    },
+    "l1_bytes": {
+      "single_thread_rate": 131710228666.64441,
+      "saturated_rate": 1053510213853.1637,
+      "saturation_threads": 8,
+      "curve": "power"
+    },
+    "l2_bytes": {
+      "single_thread_rate": 85344015822.80167,
+      "saturated_rate": 568930049153.5461,
+      "saturation_threads": 8,
+      "curve": "power"
+    },
+    "llc_bytes": {
+      "single_thread_rate": 65244370951.02047,
+      "saturated_rate": 208161901678.40424,
+      "saturation_threads": 8,
+      "curve": "power"
+    },
+    "matrix_flops": {
+      "single_thread_rate": 330841549531.8826,
+      "saturated_rate": 1832833242136.9758,
+      "saturation_threads": 8,
+      "curve": "power"
+    },
+    "frontend_instructions": {
+      "single_thread_rate": 12923498028.589165,
+      "saturated_rate": 71595048520.97562,
+      "saturation_threads": 8,
+      "curve": "power"
+    }
+  },
+  "overheads": {
+    "call_setup_ns": 0.0,
+    "expert_fixed_ns": 0.0,
+    "route_ns": 0.0,
+    "stage_fixed_ns": 0.0,
+    "range_fixed_ns": 0.0
+  },
+  "planner": {
+    "supported_widths": [
+      1,
+      2,
+      4,
+      8
+    ]
+  },
+  "uncertainty": {
+    "relative": 0.15
+  },
+  "stage_scales": {
+    "w13": 1.0,
+    "w2": 1.0
+  },
+  "provenance": {
+    "service_probe_kind": "moe_analytic_service_probe",
+    "service_probe_machine": {
+      "id": "ip-172-31-35-109",
+      "architecture": "aarch64",
+      "logical_cpus": 8,
+      "cpu_ids": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "cores_per_rank": 8
+    },
+    "gemm_core_service": "m12_l1_hot_full_no_store",
+    "matrix_service": "register_only_bfmmla_diagnostic",
+    "contention_measurements_used": false,
+    "l2_b_retention_calibration": {
+      "kind": "transferred_fractional_l2_prior",
+      "source_machine": "AmazonC5192Cores-numa0-sve-jit-hot-gemm-20260802",
+      "machine_local_measurement": false,
+      "effective_fraction": 0.125,
+      "miss_floor": 0.18,
+      "miss_at_nominal_capacity": 0.623,
+      "miss_at_twice_nominal_capacity": 0.869
+    }
+  }
+}

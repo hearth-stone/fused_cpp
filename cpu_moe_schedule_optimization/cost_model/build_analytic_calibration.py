@@ -217,10 +217,12 @@ def build_calibration(
     machine_id: str,
     l2_effective_fraction: float,
     llc_effective_fraction: float,
+    l2_b_reuse_effective_fraction: float | None = None,
     l2_b_reuse_miss_floor: float,
     l2_b_reuse_miss_at_capacity: float,
     l2_b_reuse_miss_ceiling: float,
     relative_uncertainty: float,
+    backend_n_tile: int = 8,
 ) -> tuple[dict, dict]:
     if probe.get("kind") != "moe_analytic_service_probe":
         raise ValueError("input is not an analytical service probe")
@@ -257,12 +259,18 @@ def build_calibration(
             "id": machine_id,
             "cores_per_rank": int(probe["machine"]["cores_per_rank"]),
         },
+        "kernel": {"backend_n_tile": int(backend_n_tile)},
         "caches": {
             "l1d_bytes_per_core": int(caches["l1d_bytes_per_core"]),
             "l2_bytes_per_core": int(caches["l2_bytes_per_core"]),
             "llc_bytes_per_rank": int(caches["llc_bytes_per_rank"]),
             "l2_effective_fraction": l2_effective_fraction,
             "llc_effective_fraction": llc_effective_fraction,
+            "l2_b_reuse_effective_fraction": (
+                l2_effective_fraction
+                if l2_b_reuse_effective_fraction is None
+                else l2_b_reuse_effective_fraction
+            ),
             "l2_b_reuse_miss_floor": l2_b_reuse_miss_floor,
             "l2_b_reuse_miss_at_capacity": l2_b_reuse_miss_at_capacity,
             "l2_b_reuse_miss_ceiling": l2_b_reuse_miss_ceiling,
@@ -289,6 +297,7 @@ def build_calibration(
     if l2_b_reuse_miss_floor > 0.0 or l2_b_reuse_miss_at_capacity < 1.0 or l2_b_reuse_miss_ceiling < 1.0:
         payload["provenance"]["l2_b_retention_calibration"] = {
             "kind": "independent_packed_b_repeated_scan_probe",
+            "effective_fraction": payload["caches"]["l2_b_reuse_effective_fraction"],
             "miss_floor": l2_b_reuse_miss_floor,
             "miss_at_nominal_capacity": l2_b_reuse_miss_at_capacity,
             "miss_at_twice_nominal_capacity": l2_b_reuse_miss_ceiling,
@@ -302,11 +311,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--report", type=Path)
     parser.add_argument("--machine-id")
+    parser.add_argument("--backend-n-tile", type=int, default=8)
     parser.add_argument("--training-profile", type=Path)
     parser.add_argument("--train-routes", type=parse_int_set, default=parse_int_set("12,192,2040"))
     parser.add_argument("--train-threads", type=parse_int_set, default=parse_int_set("1,4,16,48"))
     parser.add_argument("--l2-effective-fraction", type=float, default=0.75)
     parser.add_argument("--llc-effective-fraction", type=float, default=2.0 / 3.0)
+    parser.add_argument(
+        "--l2-b-reuse-effective-fraction",
+        type=float,
+        help="private-L2 fraction below which repeated packed-B scans reach the miss floor",
+    )
     parser.add_argument(
         "--l2-b-reuse-miss-floor",
         type=float,
@@ -338,10 +353,12 @@ def main() -> int:
         machine_id=machine_id,
         l2_effective_fraction=args.l2_effective_fraction,
         llc_effective_fraction=args.llc_effective_fraction,
+        l2_b_reuse_effective_fraction=args.l2_b_reuse_effective_fraction,
         l2_b_reuse_miss_floor=args.l2_b_reuse_miss_floor,
         l2_b_reuse_miss_at_capacity=args.l2_b_reuse_miss_at_capacity,
         l2_b_reuse_miss_ceiling=args.l2_b_reuse_miss_ceiling,
         relative_uncertainty=args.relative_uncertainty,
+        backend_n_tile=args.backend_n_tile,
     )
     residual_fit = None
     if args.training_profile is not None:

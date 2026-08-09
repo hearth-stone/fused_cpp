@@ -5,12 +5,16 @@
     "id": "AmazonC5192Cores-numa0-sve-jit-hot-gemm-20260802",
     "cores_per_rank": 96
   },
+  "kernel": {
+    "backend_n_tile": 8
+  },
   "caches": {
     "l1d_bytes_per_core": 65536,
     "l2_bytes_per_core": 2097152,
     "llc_bytes_per_rank": 100663296,
     "l2_effective_fraction": 0.75,
     "llc_effective_fraction": 0.6666666666666666,
+    "l2_b_reuse_effective_fraction": 0.125,
     "l2_b_reuse_miss_floor": 0.18,
     "l2_b_reuse_miss_at_capacity": 0.623,
     "l2_b_reuse_miss_ceiling": 0.869
@@ -198,6 +202,7 @@
     "contention_measurements_used": false,
     "l2_b_retention_calibration": {
       "kind": "independent_packed_b_repeated_scan_probe",
+      "effective_fraction": 0.125,
       "miss_floor": 0.18,
       "miss_at_nominal_capacity": 0.623,
       "miss_at_twice_nominal_capacity": 0.869

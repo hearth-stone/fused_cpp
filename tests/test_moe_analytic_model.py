@@ -20,6 +20,7 @@ from analytic_model import (  # noqa: E402
     SaturatingServiceCurve,
     analytic_candidate_shapes,
 )
+from analytic_stage_window_policy import AnalyticStageWindowPolicy  # noqa: E402
 from analytic_probe_geometry import (  # noqa: E402
     b_only_geometry,
     m12_gemm_geometry,
@@ -110,6 +111,25 @@ def test_service_curve_uses_two_hardware_anchors() -> None:
     assert curve.rate(2) == pytest.approx(200.0)
     assert curve.rate(4) == pytest.approx(400.0)
     assert curve.rate(16) == pytest.approx(400.0)
+
+
+def test_packed_b_retention_knee_is_distinct_from_general_l2_capacity() -> None:
+    calibration = replace(
+        _calibration(),
+        caches=replace(
+            _calibration().caches,
+            l2_effective_fraction=0.75,
+            l2_b_reuse_effective_fraction=0.125,
+            l2_b_reuse_miss_floor=0.1,
+            l2_b_reuse_miss_at_capacity=0.8,
+            l2_b_reuse_miss_ceiling=0.95,
+        ),
+    )
+    model = _model(calibration)
+    working_set = 0.5 * calibration.caches.l2_bytes_per_core
+
+    assert model._l2_miss_fraction(working_set) == 0.0
+    assert model._l2_b_reuse_miss_fraction(working_set) > calibration.caches.l2_b_reuse_miss_floor
 
 
 def test_shared_bottleneck_curve_preserves_linear_low_thread_scaling() -> None:
@@ -216,8 +236,10 @@ def test_thin_calibration_extracts_private_and_shared_service_curves() -> None:
     assert private_fit["rows"][-1]["relative_error"] == pytest.approx(0.0)
     assert shared_fit["rows"][-1]["predicted_rate"] == pytest.approx(shared["saturated_rate"])
     assert calibration["services"]["dram_bytes"] == shared
+    assert calibration["kernel"]["backend_n_tile"] == 8
     assert calibration["services"]["gemm_core_flops"]["single_thread_rate"] == pytest.approx(60.0)
     assert calibration["services"]["frontend_instructions"]["single_thread_rate"] == pytest.approx(3.90625)
+    assert calibration["caches"]["l2_b_reuse_effective_fraction"] == pytest.approx(0.75)
     assert calibration["caches"]["l2_b_reuse_miss_floor"] == pytest.approx(0.18)
     assert calibration["caches"]["l2_b_reuse_miss_at_capacity"] == pytest.approx(0.62)
     assert calibration["caches"]["l2_b_reuse_miss_ceiling"] == pytest.approx(0.87)
@@ -251,6 +273,25 @@ def test_machine_calibration_json_round_trip() -> None:
     restored = AnalyticMachineCalibration.from_dict(calibration.to_dict())
 
     assert restored == calibration
+
+
+def test_model_defaults_to_calibrated_runtime_n_tile() -> None:
+    calibration = replace(_calibration(), backend_n_tile=16)
+    model = AnalyticMoeCostModel(
+        calibration,
+        hidden_size=64,
+        intermediate_size=32,
+        global_experts=8,
+        local_experts=8,
+    )
+
+    assert model.policy.backend_n_tile == 16
+    assert model.w13_tile_bytes == 64 * 16 * 2
+
+
+def test_machine_calibration_rejects_non_sve_n_tile() -> None:
+    with pytest.raises(ValueError, match="multiple of eight"):
+        replace(_calibration(), backend_n_tile=12)
 
 
 def test_hot_gemm_core_service_subsumes_frontend_and_l1_resources() -> None:
@@ -398,6 +439,66 @@ def test_packed_b_l2_retention_uses_calibrated_miss_anchors() -> None:
     assert model._l2_b_reuse_miss_fraction(2 * cache.l2_bytes_per_core) == pytest.approx(0.87)
 
 
+def test_stage_window_model_uses_physical_a_residency_and_b_cache_turnover() -> None:
+    calibration = _calibration()
+    cache = replace(
+        calibration.caches,
+        l2_bytes_per_core=2 * 1024 * 1024,
+        llc_bytes_per_rank=96 * 1024 * 1024,
+        l2_effective_fraction=0.75,
+        l2_b_reuse_effective_fraction=0.125,
+        l2_b_reuse_miss_floor=0.18,
+        l2_b_reuse_miss_at_capacity=0.623,
+        l2_b_reuse_miss_ceiling=0.869,
+    )
+    model = AnalyticMoeCostModel(
+        replace(calibration, caches=cache),
+        hidden_size=4096,
+        intermediate_size=512,
+        global_experts=8,
+        local_experts=8,
+    )
+
+    resident_a = model.score_stage_window("w13", routes=216, threads=1, target_bytes=128 * 1024)
+    streaming_a = model.score_stage_window("w13", routes=216, threads=1, target_bytes=512 * 1024)
+    turnover_begin = model.score_stage_window("w13", routes=320, threads=1, target_bytes=1024 * 1024)
+    turnover_steady = model.score_stage_window("w13", routes=2040, threads=1, target_bytes=1024 * 1024)
+    over_capacity_begin = model.score_stage_window("w13", routes=320, threads=1, target_bytes=2048 * 1024)
+    over_capacity_steady = model.score_stage_window("w13", routes=2040, threads=1, target_bytes=2048 * 1024)
+
+    assert resident_a.l2_miss_fraction_a == 0.0
+    assert streaming_a.l2_miss_fraction_a == 1.0
+    assert resident_a.a_l2_refill_bytes < streaming_a.a_l2_refill_bytes
+    assert turnover_steady.b_l2_refill_bytes == pytest.approx(turnover_begin.b_l2_refill_bytes)
+    assert over_capacity_steady.b_l2_refill_bytes > over_capacity_begin.b_l2_refill_bytes
+
+
+def test_stage_window_policy_tracks_a_residency_and_long_route_scan_balance() -> None:
+    calibration = _calibration()
+    cache = replace(
+        calibration.caches,
+        l2_bytes_per_core=2 * 1024 * 1024,
+        llc_bytes_per_rank=96 * 1024 * 1024,
+        l2_effective_fraction=0.75,
+        l2_b_reuse_effective_fraction=0.125,
+        l2_b_reuse_miss_floor=0.18,
+        l2_b_reuse_miss_at_capacity=0.623,
+        l2_b_reuse_miss_ceiling=0.869,
+    )
+    model = AnalyticMoeCostModel(
+        replace(calibration, caches=cache),
+        hidden_size=4096,
+        intermediate_size=512,
+        global_experts=8,
+        local_experts=8,
+    )
+    policy = AnalyticStageWindowPolicy(model)
+
+    assert policy.decision(216, 1).w13_worker_bytes == 128 * 1024
+    assert policy.decision(320, 1).w13_worker_bytes == 512 * 1024
+    assert policy.decision(2040, 1).w13_worker_bytes == 1024 * 1024
+
+
 def test_single_panel_stage_is_entirely_cold_b() -> None:
     prediction = _model().predict_expert(routes=12, threads=2)
 
@@ -502,6 +603,65 @@ def test_stage_window_policy_changes_analytic_execution_without_expanding_search
     assert planner.model.T_iso(24, 2) != model.T_iso(24, 2)
     assert planner.model.task_max_stage_bytes(24, 2) == 2048
     assert planner.model.task_max_stage_bytes(12, 2) == model.max_stage_bytes
+
+
+def test_analytic_model_generates_deterministic_stage_windows_without_new_shapes() -> None:
+    calibration = replace(
+        _calibration(),
+        caches=replace(
+            _calibration().caches,
+            l2_bytes_per_core=2 * 1024 * 1024,
+            llc_bytes_per_rank=16 * 1024 * 1024,
+            l2_b_reuse_effective_fraction=0.125,
+            l2_b_reuse_miss_floor=0.18,
+            l2_b_reuse_miss_at_capacity=0.623,
+            l2_b_reuse_miss_ceiling=0.869,
+        ),
+    )
+    model = AnalyticMoeCostModel(
+        calibration,
+        hidden_size=4096,
+        intermediate_size=512,
+        global_experts=256,
+        local_experts=256,
+    )
+    baseline = IntervalPlanner(model, num_cores=8, native_cold_planner=False)
+    policy = model.default_task_stage_window_policy(num_cores=8, cpu_ids=range(8))
+    assert isinstance(policy, AnalyticStageWindowPolicy)
+
+    short = policy.decision(12, 4)
+    generated = policy.decision(120, 4)
+    planner = IntervalPlanner(
+        model,
+        num_cores=8,
+        native_cold_planner=False,
+        task_stage_window_policy=policy,
+    )
+
+    assert policy.select(12, 4) == (-1, -1)
+    assert generated.w13_target_bytes > 0
+    assert generated.w2_target_bytes > 0
+    assert generated.w13_worker_bytes >= calibration.caches.l1d_bytes_per_core
+    assert generated.w2_worker_bytes >= calibration.caches.l1d_bytes_per_core
+    assert generated.w13_ranges >= model.w13_split_chunks
+    assert generated.w2_ranges >= 1
+    for stage, target in (("w13", generated.w13_target_bytes), ("w2", generated.w2_target_bytes)):
+        score = model.score_stage_window(stage, routes=120, threads=4, target_bytes=target)
+        tile_bytes = model.w13_tile_bytes if stage == "w13" else model.w2_tile_bytes
+        owner_tiles = score.worker_bytes // tile_bytes
+        assert score.active_threads == 4
+        assert owner_tiles & (owner_tiles - 1) == 0
+    assert planner.shapes == baseline.shapes
+    assert policy.decision(120, 4) is generated
+    assert short.w13_ranges == model.w13_window_ranges
+
+
+def test_planned_moe_prefers_model_generated_stage_window_policy() -> None:
+    model = _model()
+    runtime = PlannedMoE(model, num_cores=8, cpu_ids=range(8))
+
+    assert isinstance(runtime.task_stage_window_policies[0], AnalyticStageWindowPolicy)
+    assert runtime.interval_planners[0].model.task_stage_window_policy is runtime.task_stage_window_policies[0]
 
 
 def test_shared_resource_capacity_derates_parallel_experts() -> None:
@@ -679,7 +839,7 @@ def test_holdout_validator_reports_absolute_error_and_shape_regret() -> None:
 
     report = build_validation_report(calibration, profile, isolated_training_points={(12, 1)})
 
-    assert report["analytic_model_schema_version"] == 5
+    assert report["analytic_model_schema_version"] == 6
     assert report["analytic_model"] == "phase_ecm_shared_resource_v3"
     assert report["isolated"]["coverage"] == {
         "profile_points": 2,

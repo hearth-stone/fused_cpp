@@ -31,6 +31,7 @@ try:
         WeightWindowGeometry,
         fused_moe_task_weight_windows,
         fused_moe_weight_windows,
+        stage_weight_window_geometry,
     )
 except ImportError:  # pragma: no cover - package-style import
     from .gemm_cost_model import ExecutionSchedule, fused_expert_work
@@ -39,11 +40,12 @@ except ImportError:  # pragma: no cover - package-style import
         WeightWindowGeometry,
         fused_moe_task_weight_windows,
         fused_moe_weight_windows,
+        stage_weight_window_geometry,
     )
 
 
 ANALYTIC_MACHINE_SCHEMA_VERSION = 1
-ANALYTIC_MODEL_SCHEMA_VERSION = 5
+ANALYTIC_MODEL_SCHEMA_VERSION = 6
 ANALYTIC_MODEL_NAME = "phase_ecm_shared_resource_v3"
 _SHARED_RESOURCES = (
     "gemm_core_flops",
@@ -138,6 +140,7 @@ class CacheCalibration:
     llc_bytes_per_rank: int
     l2_effective_fraction: float = 0.75
     llc_effective_fraction: float = 0.75
+    l2_b_reuse_effective_fraction: float | None = None
     l2_b_reuse_miss_floor: float = 0.0
     l2_b_reuse_miss_at_capacity: float = 1.0
     l2_b_reuse_miss_ceiling: float = 1.0
@@ -149,6 +152,10 @@ class CacheCalibration:
             raise ValueError("l2_effective_fraction must be in (0, 1]")
         if not 0.0 < self.llc_effective_fraction <= 1.0:
             raise ValueError("llc_effective_fraction must be in (0, 1]")
+        if self.l2_b_reuse_effective_fraction is not None and not (
+            0.0 < self.l2_b_reuse_effective_fraction <= 1.0
+        ):
+            raise ValueError("l2_b_reuse_effective_fraction must be in (0, 1]")
         if not 0.0 <= self.l2_b_reuse_miss_floor < 1.0:
             raise ValueError("l2_b_reuse_miss_floor must be in [0, 1)")
         if not (self.l2_b_reuse_miss_floor <= self.l2_b_reuse_miss_at_capacity <= self.l2_b_reuse_miss_ceiling <= 1.0):
@@ -162,6 +169,15 @@ class CacheCalibration:
     def effective_llc_bytes_per_rank(self) -> float:
         return self.llc_bytes_per_rank * self.llc_effective_fraction
 
+    @property
+    def effective_l2_b_reuse_bytes_per_core(self) -> float:
+        fraction = (
+            self.l2_effective_fraction
+            if self.l2_b_reuse_effective_fraction is None
+            else self.l2_b_reuse_effective_fraction
+        )
+        return self.l2_bytes_per_core * fraction
+
     @classmethod
     def from_dict(cls, payload: dict) -> "CacheCalibration":
         return cls(
@@ -170,6 +186,11 @@ class CacheCalibration:
             llc_bytes_per_rank=int(payload["llc_bytes_per_rank"]),
             l2_effective_fraction=float(payload.get("l2_effective_fraction", 0.75)),
             llc_effective_fraction=float(payload.get("llc_effective_fraction", 0.75)),
+            l2_b_reuse_effective_fraction=(
+                float(payload["l2_b_reuse_effective_fraction"])
+                if payload.get("l2_b_reuse_effective_fraction") is not None
+                else None
+            ),
             l2_b_reuse_miss_floor=float(payload.get("l2_b_reuse_miss_floor", 0.0)),
             l2_b_reuse_miss_at_capacity=float(payload.get("l2_b_reuse_miss_at_capacity", 1.0)),
             l2_b_reuse_miss_ceiling=float(payload.get("l2_b_reuse_miss_ceiling", 1.0)),
@@ -221,6 +242,7 @@ class AnalyticMachineCalibration:
     l2_bytes: SaturatingServiceCurve
     llc_bytes: SaturatingServiceCurve
     dram_bytes: SaturatingServiceCurve
+    backend_n_tile: int = 8
     frontend_instructions: SaturatingServiceCurve | None = None
     epilogue_elements: SaturatingServiceCurve | None = None
     overheads: RuntimeOverheads = RuntimeOverheads()
@@ -236,6 +258,8 @@ class AnalyticMachineCalibration:
             raise ValueError("cores_per_rank must be positive")
         if self.gemm_core_flops is None:
             raise ValueError("gemm_core_flops must provide the L1-hot GEMM compute peak")
+        if self.backend_n_tile < 8 or self.backend_n_tile % 8:
+            raise ValueError("backend_n_tile must be at least eight and a multiple of eight")
         widths = tuple(sorted(set(int(width) for width in self.supported_widths)))
         if not widths or widths[0] <= 0 or widths[-1] > self.cores_per_rank:
             raise ValueError("supported_widths must be positive and no larger than cores_per_rank")
@@ -277,6 +301,7 @@ class AnalyticMachineCalibration:
             l2_bytes=SaturatingServiceCurve.from_dict(services["l2_bytes"]),
             llc_bytes=SaturatingServiceCurve.from_dict(services["llc_bytes"]),
             dram_bytes=SaturatingServiceCurve.from_dict(services["dram_bytes"]),
+            backend_n_tile=int(payload.get("kernel", {}).get("backend_n_tile", 8)),
             frontend_instructions=(
                 SaturatingServiceCurve.from_dict(optional_frontend) if optional_frontend is not None else None
             ),
@@ -317,6 +342,7 @@ class AnalyticMachineCalibration:
                 "id": self.machine_id,
                 "cores_per_rank": self.cores_per_rank,
             },
+            "kernel": {"backend_n_tile": self.backend_n_tile},
             "caches": asdict(self.caches),
             "services": services,
             "overheads": asdict(self.overheads),
@@ -436,7 +462,13 @@ class AnalyticRangeDemand:
     balanced_work_fraction: float
     owner_window_bytes: int
     l2_miss_fraction_b: float
+    l2_steady_miss_fraction_b: float
     l2_miss_fraction_a: float
+    b_transient_reuses: int
+    b_steady_reuses: int
+    b_reuse_footprint_bytes: int
+    a_residency_footprint_bytes: int
+    a_residency_capacity_bytes: int
     a_l2_refill_bytes: float
     b_l2_refill_bytes: float
     c_write_bytes: float
@@ -585,6 +617,32 @@ class ExpertPrediction:
 
 
 @dataclass(frozen=True)
+class AnalyticStageWindowScore:
+    """Analytical objective for one tile-aligned stage-window geometry."""
+
+    stage: str
+    routes: int
+    threads: int
+    target_bytes: int
+    ranges: int
+    range_bytes: int
+    worker_bytes: int
+    active_threads: int
+    objective_ns: float
+    serialized_core_ns: float
+    transfer_ns: float
+    range_overhead_ns: float
+    l2_miss_fraction_a: float
+    l2_miss_fraction_b: float
+    a_l2_refill_bytes: float
+    b_l2_refill_bytes: float
+    l2_bytes: float
+    llc_bytes: float
+    compulsory_dram_bytes: float
+    spillable_dram_bytes: float
+
+
+@dataclass(frozen=True)
 class AnalyticResourcePressure:
     """Requested and allocated service for one active shared resource."""
 
@@ -617,7 +675,7 @@ class AnalyticMoeCostModel:
         mode: str = "standalone",
         degree: int = 1,
         concurrent_ranks: int = 1,
-        backend_n_tile: int = 8,
+        backend_n_tile: int | None = None,
         activation: str = "silu",
         dtype: str = "bf16",
         w13_split: bool = True,
@@ -636,13 +694,14 @@ class AnalyticMoeCostModel:
             self.profile_path = Path(f"{calibration.machine_id}.analytic.json")
         if min(hidden_size, intermediate_size, global_experts, local_experts) <= 0:
             raise ValueError("expert dimensions and counts must be positive")
-        if degree <= 0 or concurrent_ranks <= 0 or backend_n_tile <= 0:
+        resolved_n_tile = self.calibration.backend_n_tile if backend_n_tile is None else int(backend_n_tile)
+        if degree <= 0 or concurrent_ranks <= 0 or resolved_n_tile <= 0:
             raise ValueError("degree, concurrent_ranks, and backend_n_tile must be positive")
-        if backend_n_tile < 8:
-            raise ValueError(f"SVE backend_n_tile must be at least 8, got {backend_n_tile}")
+        if resolved_n_tile < 8 or resolved_n_tile % 8:
+            raise ValueError(f"SVE backend_n_tile must be at least 8 and a multiple of 8, got {resolved_n_tile}")
         if hidden_size % 8 or intermediate_size % 8:
             raise ValueError("SVE packed K dimensions must be multiples of eight")
-        if hidden_size % backend_n_tile or (2 * intermediate_size) % backend_n_tile:
+        if hidden_size % resolved_n_tile or (2 * intermediate_size) % resolved_n_tile:
             raise ValueError("SVE packed N dimensions must be multiples of backend_n_tile")
         if activation != "silu":
             raise ValueError(f"analytical SVE model supports only activation='silu', got {activation!r}")
@@ -664,11 +723,11 @@ class AnalyticMoeCostModel:
         self.weight_window_bytes = int(weight_window_bytes)
         self.w13_split_chunks = int(w13_split_chunks)
         self._exact_m = bool(exact_m)
-        self._mapper = SveBf16KernelProfile(n_tile=int(backend_n_tile), exact_m=exact_m)
+        self._mapper = SveBf16KernelProfile(n_tile=resolved_n_tile, exact_m=exact_m)
         self._w13_geometry, self._w2_geometry = fused_moe_weight_windows(
             hidden_size=self.hidden_size,
             intermediate_size=self.intermediate_size,
-            n_tile=int(backend_n_tile),
+            n_tile=resolved_n_tile,
             target_bytes=self.weight_window_bytes,
             w13_fallback_ranges=self.w13_split_chunks,
         )
@@ -678,8 +737,8 @@ class AnalyticMoeCostModel:
         self.w2_chunk_bytes = self._w2_geometry.max_range_bytes
         self.w2_bytes = self.w2_chunk_bytes
         self.max_stage_bytes = max(self.w13_chunk_bytes, self.w2_chunk_bytes)
-        self.w13_tile_bytes = self.hidden_size * int(backend_n_tile) * 2
-        self.w2_tile_bytes = self.intermediate_size * int(backend_n_tile) * 2
+        self.w13_tile_bytes = self.hidden_size * resolved_n_tile * 2
+        self.w2_tile_bytes = self.intermediate_size * resolved_n_tile * 2
         self.call_setup_ns = self.calibration.overheads.call_setup_ns
         self.relative_error = self.calibration.relative_uncertainty
         self.profile = self.calibration.to_dict()
@@ -707,7 +766,7 @@ class AnalyticMoeCostModel:
             global_experts=int(global_experts),
             local_experts=self.local_experts,
             backend="sve",
-            backend_n_tile=int(backend_n_tile),
+            backend_n_tile=resolved_n_tile,
             sve_implementation="jit" if exact_m else "asm",
             m_tail_policy="xbyak_exact_m" if exact_m else "static_bucketed",
             activation=str(activation),
@@ -823,7 +882,7 @@ class AnalyticMoeCostModel:
         if working_set_bytes <= cache.l2_bytes_per_core:
             transition = _smooth_capacity_miss(
                 working_set_bytes,
-                cache.effective_l2_bytes_per_core,
+                cache.effective_l2_b_reuse_bytes_per_core,
                 cache.l2_bytes_per_core,
             )
             return floor + (at_capacity - floor) * transition
@@ -833,6 +892,113 @@ class AnalyticMoeCostModel:
             2.0 * cache.l2_bytes_per_core,
         )
         return at_capacity + (ceiling - at_capacity) * transition
+
+    def _l2_steady_scan_miss_fraction(self, working_set_bytes: float) -> float:
+        """Return the physical resident/streaming state of a cyclic L2 scan."""
+        return float(working_set_bytes > self.calibration.caches.l2_bytes_per_core)
+
+    @lru_cache(maxsize=16384)
+    def score_stage_window(
+        self,
+        stage: str,
+        routes: int,
+        threads: int,
+        target_bytes: int,
+    ) -> AnalyticStageWindowScore:
+        """Score a stage window from physical service demand, not a route table.
+
+        The regular isolated ECM uses ``max(core, transfer)`` because the two
+        lower bounds overlap. That is appropriate for absolute latency but is
+        too permissive for choosing a cache window: a transfer reduction hidden
+        below the compute ceiling would otherwise have zero value, despite
+        reducing refill latency and contention. Window selection therefore uses
+        a serialized *incremental* objective. Candidate-independent compute and
+        compulsory-B terms cancel; tile imbalance, L2/LLC refill, DRAM spill and
+        calibrated per-range control remain visible.
+        """
+        stage = str(stage)
+        routes = int(routes)
+        threads = int(threads)
+        target_bytes = int(target_bytes)
+        if stage not in {"w13", "w2"}:
+            raise ValueError(f"unsupported stage {stage!r}")
+        if routes <= 0 or threads <= 0 or target_bytes <= 0:
+            raise ValueError("routes, threads and target_bytes must be positive")
+        if threads not in self.supported_widths:
+            raise KeyError(f"unsupported analytical thread width {threads}")
+
+        work = fused_expert_work(
+            routes,
+            self.hidden_size,
+            self.intermediate_size,
+            down_output_element_bytes=self.down_output_element_bytes,
+        )
+        if stage == "w13":
+            logical = work.w13
+            k = self.hidden_size
+            n = 2 * self.intermediate_size
+            fallback_ranges = self.w13_split_chunks
+        else:
+            logical = work.w2
+            k = self.intermediate_size
+            n = self.hidden_size
+            fallback_ranges = 1
+        geometry = stage_weight_window_geometry(
+            k=k,
+            n=n,
+            n_tile=self.policy.backend_n_tile,
+            target_bytes=target_bytes,
+            fallback_ranges=fallback_ranges,
+        )
+        mapping = self._mapper.lower(
+            logical,
+            ExecutionSchedule(threads=threads, sequential_n_ranges=geometry.ranges),
+        )
+        demand = self._stage_demand(stage, mapping, geometry)
+        phases = self._stage_phases(demand)
+        serialized_core_ns = sum(phase.gemm_core_ns + phase.epilogue_ns for phase in phases)
+        transfer_ns = 0.0
+        range_overhead_ns = 0.0
+        for phase in phases:
+            if phase.kind == "range_setup":
+                range_overhead_ns += phase.fixed_ns
+                continue
+            times = phase.resource_times_ns()
+            transfer_ns += max(times["l2_bytes"], times["llc_bytes"], times["dram_bytes"])
+        return AnalyticStageWindowScore(
+            stage=stage,
+            routes=routes,
+            threads=threads,
+            target_bytes=target_bytes,
+            ranges=geometry.ranges,
+            range_bytes=geometry.max_range_bytes,
+            worker_bytes=geometry.bytes_per_worker(threads),
+            active_threads=geometry.active_threads(threads),
+            objective_ns=serialized_core_ns + transfer_ns + range_overhead_ns,
+            serialized_core_ns=serialized_core_ns,
+            transfer_ns=transfer_ns,
+            range_overhead_ns=range_overhead_ns,
+            l2_miss_fraction_a=demand.l2_miss_fraction_a,
+            l2_miss_fraction_b=demand.l2_miss_fraction_b,
+            a_l2_refill_bytes=demand.a_l2_refill_bytes,
+            b_l2_refill_bytes=demand.b_l2_refill_bytes,
+            l2_bytes=demand.l2_bytes,
+            llc_bytes=demand.llc_bytes,
+            compulsory_dram_bytes=demand.compulsory_dram_bytes,
+            spillable_dram_bytes=demand.spillable_dram_bytes,
+        )
+
+    def default_task_stage_window_policy(self, *, num_cores: int, cpu_ids: Sequence[int]):
+        """Build the deterministic analytical policy for this model instance."""
+        if int(num_cores) <= 0 or int(num_cores) > self.calibration.cores_per_rank:
+            return None
+        if len(tuple(cpu_ids)) != int(num_cores):
+            return None
+        try:
+            from analytic_stage_window_policy import AnalyticStageWindowPolicy
+        except ImportError:  # pragma: no cover - package-style import
+            from .analytic_stage_window_policy import AnalyticStageWindowPolicy
+        return AnalyticStageWindowPolicy(self)
 
     def _llc_miss_fraction(self, working_set_bytes: float) -> float:
         cache = self.calibration.caches
@@ -896,9 +1062,38 @@ class AnalyticMoeCostModel:
             weight_bytes = range_tiles * tile_bytes
             c_write_bytes = mapping.llc_c_write_bytes * range_tiles / total_tiles
 
-            b_l2_miss = self._l2_b_reuse_miss_fraction(owner_window_bytes + a_panel_bytes)
-            b_l2_refill = weight_bytes * (1.0 + (panels - 1) * b_l2_miss)
-            a_l2_miss = self._l2_miss_fraction(owner_window_bytes + a_bytes)
+            # Preserve one panel of L2 headroom for the kernel's in-flight
+            # load/prefetch state. Below this physical capacity boundary the
+            # full packed A survives sequential N ranges; above it, A is a
+            # cyclic stream and each owner must refill it.
+            a_residency_footprint = owner_window_bytes + a_bytes
+            a_residency_capacity = max(
+                self.calibration.caches.l2_bytes_per_core - a_panel_bytes,
+                0,
+            )
+            a_l2_miss = float(a_residency_footprint > a_residency_capacity)
+
+            b_reuse_footprint = owner_window_bytes + a_panel_bytes
+            b_l2_miss = self._l2_b_reuse_miss_fraction(b_reuse_footprint)
+            available_b_reuses = panels - 1
+            # Once one effective L2 of unique A panels has streamed past, the
+            # cyclic B stripe reaches its physical resident/streaming state.
+            # Before that turnover point, use the calibrated repeated-scan
+            # miss curve. This derives the transition from cache and panel
+            # geometry instead of multiplying one short-route miss forever.
+            cache_turnover_reuses = max(
+                int(self.calibration.caches.effective_l2_bytes_per_core // a_panel_bytes),
+                1,
+            )
+            transient_b_reuses = min(
+                available_b_reuses,
+                cache_turnover_reuses,
+            )
+            steady_b_reuses = available_b_reuses - transient_b_reuses
+            b_l2_steady_miss = self._l2_steady_scan_miss_fraction(b_reuse_footprint)
+            b_l2_refill = weight_bytes * (
+                1.0 + transient_b_reuses * b_l2_miss + steady_b_reuses * b_l2_steady_miss
+            )
             new_threads = max(active_threads - seen_active_threads, 0)
             reused_threads = active_threads - new_threads
             a_l2_refill = a_bytes * (new_threads + reused_threads * a_l2_miss)
@@ -913,7 +1108,13 @@ class AnalyticMoeCostModel:
                     balanced_work_fraction=balanced_range_tiles / aggregate_balanced_tiles,
                     owner_window_bytes=owner_window_bytes,
                     l2_miss_fraction_b=b_l2_miss,
+                    l2_steady_miss_fraction_b=b_l2_steady_miss,
                     l2_miss_fraction_a=a_l2_miss,
+                    b_transient_reuses=transient_b_reuses,
+                    b_steady_reuses=steady_b_reuses,
+                    b_reuse_footprint_bytes=b_reuse_footprint,
+                    a_residency_footprint_bytes=a_residency_footprint,
+                    a_residency_capacity_bytes=a_residency_capacity,
                     a_l2_refill_bytes=a_l2_refill,
                     b_l2_refill_bytes=b_l2_refill,
                     c_write_bytes=c_write_bytes,
@@ -1445,6 +1646,12 @@ class AnalyticMoeCostModel:
                         "n_tiles": item.n_tiles,
                         "balanced_work_fraction": item.balanced_work_fraction,
                         "owner_window_bytes": item.owner_window_bytes,
+                        "b_reuse_footprint_bytes": item.b_reuse_footprint_bytes,
+                        "b_transient_reuses": item.b_transient_reuses,
+                        "b_steady_reuses": item.b_steady_reuses,
+                        "l2_steady_miss_fraction_b": item.l2_steady_miss_fraction_b,
+                        "a_residency_footprint_bytes": item.a_residency_footprint_bytes,
+                        "a_residency_capacity_bytes": item.a_residency_capacity_bytes,
                         "a_l2_refill_bytes": item.a_l2_refill_bytes,
                         "b_l2_refill_bytes": item.b_l2_refill_bytes,
                         "compulsory_dram_bytes": item.compulsory_dram_bytes,
