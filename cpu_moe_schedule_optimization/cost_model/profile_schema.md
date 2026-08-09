@@ -4,13 +4,14 @@
 
 Schema v2 is the active format for SVE fused-MoE scheduling profiles. A profile
 is valid only for the exact kernel policy, sharded expert shape, and NUMA/rank
-execution context recorded in the file. Split-W13, non-split, and each global
-packed-B byte window are different calibration domains.
+execution context recorded in the file. The canonical kernel policy is the
+actual `(w13_window_ranges, w2_window_ranges)` geometry.
 
-Schema v2 represents `weight_window_bytes` additively. Historical profiles
-without the field are interpreted as `0`, preserving legacy split behavior.
-A positive value is canonicalized with `w13_split=false` because the explicit
-window supersedes legacy W13 splitting and applies to both W13 and W2.
+Historical schema-v2 files still record `w13_split`, `w13_split_chunks`, and
+`weight_window_bytes`. The reader uses them to reconstruct and validate the
+actual range counts, but they are provenance rather than active identity. Two
+files that resolve to the same range pair are duplicate calibrations even when
+their legacy byte/split fields differ.
 
 ```json
 {
@@ -113,9 +114,9 @@ Required v2 identity fields are:
 
 - hardware: profiled CPU sets, NUMA nodes, LLC bytes, cores per rank, and
   concurrent rank count;
-- kernel: backend, SVE implementation, M-tail policy, N-split policy, W13 split
-  policy, requested global byte window, actual W13/W2 range counts, source hash,
-  and extension binary hash;
+- kernel: backend, SVE implementation, M-tail policy, N-split policy, actual
+  W13/W2 range counts, source hash, and extension binary hash; legacy split and
+  requested-byte fields are validated provenance only;
 - distributed shape: TP/EP mode and degree, global/local expert counts, H, and
   sharded F;
 - calibration scope: the full local expert count, activation, dtype, SVE N tile,
@@ -148,23 +149,19 @@ interpolated through the former M1/M2/M4/M8 buckets. Profiles without these
 fields are interpreted as `asm/static_bucketed` for history compatibility.
 Catalog queries for the production JIT path must specify both fields; a mixed
 catalog intentionally rejects an implementation-unspecified ambiguous query.
-Static and JIT profiles are not a valid split/no-split pair even when all other
-shape fields match.
+Static and JIT profiles are never one range-policy set even when all other shape
+fields match.
 
-`ProfileCatalog.policy_variants()` first requires a complete legacy
-split/no-split pair for one implementation. It then adds compatible positive
-window profiles with the same route/thread/shape grid. This preserves an exact
-legacy fallback and prevents comparing one measured window against an
-interpolated or differently sampled policy. Duplicate positive-window
-identities and positive-window profiles carrying `w13_split=true` are rejected.
+`ProfileCatalog.policy_variants()` returns every uniquely measured range pair
+for one implementation and one non-kernel policy identity. The set may contain
+one or many variants; every member must use the same route/thread/shape grid.
+Duplicate range pairs are rejected rather than treated as separate candidates.
 
-The TP/EP evaluator's `--sve-implementation auto` lookup remains pair-atomic:
-it first requests a complete `jit/xbyak_exact_m` legacy split/no-split pair,
-then adds matching JIT window profiles. If the legacy pair is incomplete, it
-falls back to a complete `asm/static_bucketed` pair and its matching windows.
-It never fills a missing half from another implementation. Explicit `jit` or
-`asm` selection is strict and fails when that implementation's legacy pair is
-unavailable.
+The TP/EP evaluator's `--sve-implementation auto` lookup first requests any
+compatible `jit/xbyak_exact_m` range set. It falls back to
+`asm/static_bucketed` only when the JIT set is empty or invalid. It never fills
+a missing range from another implementation. Explicit `jit` or `asm` selection
+is strict and fails when that implementation has no compatible measured range.
 
 `git_commit` and `git_worktree_dirty` may be `null` on a deployment host without
 repository metadata. `source_sha256` and `extension_sha256` remain mandatory

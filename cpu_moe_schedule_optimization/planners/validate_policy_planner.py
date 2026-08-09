@@ -121,7 +121,7 @@ def select_models(profile_dir: Path, mode: str):
         cores_per_rank=32,
         concurrent_ranks=2,
     )
-    no_split, split = catalog.split_pair(query)
+    no_split, split = catalog.stage_range_pair(query)
     return (
         ContentionCostModel(no_split.path),
         ContentionCostModel(split.path),

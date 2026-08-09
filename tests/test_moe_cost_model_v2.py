@@ -79,7 +79,7 @@ def models(catalog: ProfileCatalog, mode: str, ffn: int, local_experts: int):
         cores_per_rank=32,
         concurrent_ranks=2,
     )
-    no_split, split = catalog.split_pair(query)
+    no_split, split = catalog.stage_range_pair(query)
     return ContentionCostModel(no_split.path), ContentionCostModel(split.path)
 
 
@@ -908,6 +908,67 @@ def test_positive_window_profile_rejects_legacy_split_flag(
         ProfileCatalog.from_paths([path])
 
 
+def test_profile_kernel_policy_identity_is_canonical_stage_ranges(catalog: ProfileCatalog) -> None:
+    query = ProfileQuery(
+        mode="tp",
+        degree=2,
+        hidden_size=4096,
+        intermediate_size=1024,
+        global_experts=64,
+        local_experts=64,
+        backend="sve",
+        backend_n_tile=8,
+        activation="silu",
+        dtype="bf16",
+        measurement_experts=64,
+        cores_per_rank=32,
+        concurrent_ranks=2,
+    )
+
+    one_range, two_range = catalog.stage_range_pair(query)
+
+    assert one_range.policy.w13_split is False
+    assert two_range.policy.w13_split is True
+    assert one_range.policy.kernel_policy_key() == ("stage_ranges", 1, 1)
+    assert two_range.policy.kernel_policy_key() == ("stage_ranges", 2, 1)
+
+
+def test_policy_variants_reject_duplicate_stage_range_identity(
+    catalog: ProfileCatalog,
+    tmp_path: Path,
+) -> None:
+    query = ProfileQuery(
+        mode="tp",
+        degree=2,
+        hidden_size=4096,
+        intermediate_size=1024,
+        global_experts=64,
+        local_experts=64,
+        backend="sve",
+        backend_n_tile=8,
+        activation="silu",
+        dtype="bf16",
+        measurement_experts=64,
+        cores_per_rank=32,
+        concurrent_ranks=2,
+    )
+    one_range, _ = catalog.stage_range_pair(query)
+    payload = json.loads(one_range.path.read_text(encoding="utf-8"))
+    payload["kernel"].update(
+        {
+            "weight_window_bytes": 1 << 40,
+            "w13_window_ranges": 1,
+            "w2_window_ranges": 1,
+        }
+    )
+    duplicate = tmp_path / "duplicate_r1_r1.json"
+    duplicate.write_text(json.dumps(payload), encoding="utf-8")
+    duplicate_catalog = ProfileCatalog.from_paths([one_range.path, duplicate])
+
+    with pytest.raises(ProfileCompatibilityError, match="duplicate kernel policy profile"):
+        duplicate_catalog.policy_variants(query)
+
+
 def test_window_policy_and_thread_shape_are_selected_jointly(
     catalog: ProfileCatalog,
     tmp_path: Path,
@@ -927,7 +988,7 @@ def test_window_policy_and_thread_shape_are_selected_jointly(
         cores_per_rank=32,
         concurrent_ranks=2,
     )
-    no_split, split = catalog.split_pair(query)
+    no_split, split = catalog.stage_range_pair(query)
     window_paths: list[Path] = []
     preferred = {
         1024 * 1024: (tuple([1] * 32), 2_000_000),
@@ -1348,12 +1409,12 @@ def test_exact_m_profile_does_not_round_tail_routes(
     assert model.T_iso(3, 4) != model.T_iso(4, 4)
 
 
-def test_checked_in_xbyak_profiles_are_complete_exact_m_pairs() -> None:
+def test_checked_in_xbyak_profiles_cover_exact_m_range_endpoints() -> None:
     paths = xbyak_profile_paths()
     assert len(paths) >= 4
     exact_catalog = ProfileCatalog.from_paths(paths)
 
-    pairs: dict[tuple[object, ...], dict[bool, Path]] = {}
+    pairs: dict[tuple[object, ...], dict[tuple[int, int], Path]] = {}
     for record in exact_catalog.records:
         payload = record.payload
         policy = record.policy
@@ -1365,25 +1426,27 @@ def test_checked_in_xbyak_profiles_are_complete_exact_m_pairs() -> None:
         assert payload["kernel"]["source_sha256"]
         assert payload["kernel"]["extension_sha256"]
         if policy.weight_window_bytes == 0:
-            split_variants = pairs.setdefault(policy.key_without_kernel_policy(), {})
-            assert policy.w13_split not in split_variants
-            split_variants[policy.w13_split] = record.path
+            range_variants = pairs.setdefault(policy.key_without_kernel_policy(), {})
+            range_key = (policy.w13_window_ranges, policy.w2_window_ranges)
+            assert range_key not in range_variants
+            range_variants[range_key] = record.path
 
         model = ContentionCostModel(
             record.path,
             expected_policy=ProfileQuery(
                 sve_implementation="jit",
                 m_tail_policy="xbyak_exact_m",
-                w13_split=policy.w13_split,
+                w13_window_ranges=policy.w13_window_ranges,
+                w2_window_ranges=policy.w2_window_ranges,
             ),
         )
         assert [model.m12_effective_rows(routes) for routes in range(1, 13)] == list(range(1, 13))
 
     assert len(pairs) >= 2
-    assert all(set(split_variants) == {False, True} for split_variants in pairs.values())
-    for split_variants in pairs.values():
-        pair_catalog = ProfileCatalog.from_paths(split_variants.values())
-        pair_catalog.split_pair(
+    assert all(set(range_variants) == {(1, 1), (2, 1)} for range_variants in pairs.values())
+    for range_variants in pairs.values():
+        pair_catalog = ProfileCatalog.from_paths(range_variants.values())
+        pair_catalog.stage_range_pair(
             ProfileQuery(
                 sve_implementation="jit",
                 m_tail_policy="xbyak_exact_m",
@@ -1391,7 +1454,7 @@ def test_checked_in_xbyak_profiles_are_complete_exact_m_pairs() -> None:
         )
 
 
-def test_parallel_evaluator_auto_requires_a_complete_variant_pair(
+def test_parallel_evaluator_auto_accepts_available_range_variants(
     catalog: ProfileCatalog,
     tmp_path: Path,
 ) -> None:
@@ -1410,7 +1473,7 @@ def test_parallel_evaluator_auto_requires_a_complete_variant_pair(
         cores_per_rank=32,
         concurrent_ranks=2,
     )
-    asm_no_split, asm_split = catalog.split_pair(query)
+    asm_no_split, asm_split = catalog.stage_range_pair(query)
 
     jit_paths: list[Path] = []
     for record in (asm_no_split, asm_split):
@@ -1424,7 +1487,7 @@ def test_parallel_evaluator_auto_requires_a_complete_variant_pair(
     topology = HierarchicalTopology(2, 1, 60e9, 20e9, 1e-6)
 
     incomplete = ProfileCatalog.from_paths([asm_no_split.path, asm_split.path, jit_paths[1]])
-    fallback = ParallelLayerEvaluator(
+    partial = ParallelLayerEvaluator(
         incomplete,
         topology,
         hidden_size=4096,
@@ -1432,7 +1495,8 @@ def test_parallel_evaluator_auto_requires_a_complete_variant_pair(
         global_experts=64,
         cores_per_rank=32,
     )._models("tp", 1024, 64)
-    assert {model.policy.sve_implementation for model in fallback} == {"asm"}
+    assert {model.policy.sve_implementation for model in partial} == {"jit"}
+    assert [model.policy.kernel_policy_key() for model in partial] == [("stage_ranges", 2, 1)]
 
     complete = ProfileCatalog.from_paths([asm_no_split.path, asm_split.path, *jit_paths])
     selected = ParallelLayerEvaluator(
@@ -1444,6 +1508,10 @@ def test_parallel_evaluator_auto_requires_a_complete_variant_pair(
         cores_per_rank=32,
     )._models("tp", 1024, 64)
     assert {model.policy.sve_implementation for model in selected} == {"jit"}
+    assert {model.policy.kernel_policy_key() for model in selected} == {
+        ("stage_ranges", 1, 1),
+        ("stage_ranges", 2, 1),
+    }
 
 
 def test_exact_shape_and_stage_working_sets(catalog: ProfileCatalog) -> None:
@@ -1625,7 +1693,7 @@ def test_ep_rank_lifetime_switches_to_single_rank_profile(
         cores_per_rank=32,
         concurrent_ranks=2,
     )
-    dual_records = catalog.split_pair(query)
+    dual_records = catalog.stage_range_pair(query)
     paths = [record.path for record in dual_records]
     for record in dual_records:
         payload = json.loads(record.path.read_text(encoding="utf-8"))

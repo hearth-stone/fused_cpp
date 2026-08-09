@@ -167,19 +167,11 @@ class PlannedMoE:
             if selected_policy is None or model.policy is None:
                 return index
             selected_kernel_policy = (
-                selected_policy["weight_window_bytes"],
+                "stage_ranges",
                 selected_policy["w13_window_ranges"],
                 selected_policy["w2_window_ranges"],
-                selected_policy["w13_split"],
-                selected_policy["w13_split_chunks"],
             )
-            model_kernel_policy = (
-                model.policy.weight_window_bytes,
-                model.policy.w13_window_ranges,
-                model.policy.w2_window_ranges,
-                model.policy.w13_split,
-                model.policy.w13_split_chunks,
-            )
+            model_kernel_policy = model.policy.kernel_policy_key()
             if model_kernel_policy == selected_kernel_policy:
                 return index
         raise RuntimeError(f"no planner model for selected profile {selected_profile!r}")

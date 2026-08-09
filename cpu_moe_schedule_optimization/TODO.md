@@ -25,7 +25,7 @@ independently bisectable:
   geometry candidates.
 - [x] Carry exact per-task W13/W2 range counts through Plan V2, native W13/W2,
   and W2 owner-scatter; retain legacy byte/split inputs only as compatibility.
-- [ ] Canonicalize empirical profile/catalog and plan-cache identity on
+- [x] Canonicalize empirical profile/catalog and plan-cache identity on
   `(w13_ranges, w2_ranges)`.
 - [ ] Remove public split flags, environment controls, and legacy native
   fallback branches after profile migration.

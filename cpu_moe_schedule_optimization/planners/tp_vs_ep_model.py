@@ -197,13 +197,12 @@ class ParallelLayerEvaluator:
                 errors.append(f"{implementation}/{tail_policy}: {error}")
                 continue
             return [ContentionCostModel(record.path, expected_policy=query) for record in records]
-        raise ProfileCompatibilityError("no complete SVE profile pair matched; " + "; ".join(errors))
+        raise ProfileCompatibilityError("no compatible SVE stage-range profiles matched; " + "; ".join(errors))
 
     @staticmethod
     def _selected_model(models: list[ContentionCostModel], plan: dict[str, object]) -> ContentionCostModel:
         selected = (
-            bool(plan["w13_split"]),
-            int(plan["weight_window_bytes"]),
+            "stage_ranges",
             int(plan["w13_window_ranges"]),
             int(plan["w2_window_ranges"]),
         )
@@ -211,12 +210,7 @@ class ParallelLayerEvaluator:
             policy = model.policy
             if policy is None:
                 continue
-            candidate = (
-                policy.w13_split,
-                policy.weight_window_bytes,
-                policy.w13_window_ranges,
-                policy.w2_window_ranges,
-            )
+            candidate = policy.kernel_policy_key()
             if candidate == selected:
                 return model
         raise ProfileCompatibilityError(f"selected planner policy has no matching model: {selected}")

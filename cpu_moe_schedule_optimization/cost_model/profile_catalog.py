@@ -164,14 +164,7 @@ class ProfilePolicy:
         return self.key_without_kernel_policy()
 
     def kernel_policy_key(self) -> tuple[object, ...]:
-        if self.weight_window_bytes > 0:
-            return (
-                "weight_window",
-                self.weight_window_bytes,
-                self.w13_window_ranges,
-                self.w2_window_ranges,
-            )
-        return ("legacy_split", self.w13_split, self.w13_split_chunks)
+        return ("stage_ranges", self.w13_window_ranges, self.w2_window_ranges)
 
 
 @dataclass(frozen=True)
@@ -240,51 +233,73 @@ class ProfileCatalog:
             "profile query is ambiguous: " + ", ".join(record.path.name for record in matches)
         )
 
+    def stage_range_pair(self, query: ProfileQuery) -> tuple[ProfileRecord, ProfileRecord]:
+        """Return the canonical W13 R=1/R=2 endpoints for compatibility tests."""
+        if any(
+            value is not None
+            for value in (
+                query.w13_split,
+                query.w13_split_chunks,
+                query.weight_window_bytes,
+                query.w13_window_ranges,
+                query.w2_window_ranges,
+            )
+        ):
+            raise ValueError("stage_range_pair query must leave kernel range policy unspecified")
+        base_query = query.__dict__
+        one_range = self.select(
+            ProfileQuery(**{**base_query, "w13_window_ranges": 1, "w2_window_ranges": 1})
+        )
+        two_range = self.select(
+            ProfileQuery(**{**base_query, "w13_window_ranges": 2, "w2_window_ranges": 1})
+        )
+        if one_range.policy.key_without_kernel_policy() != two_range.policy.key_without_kernel_policy():
+            raise ProfileCompatibilityError("R=1/R=2 profiles are not a stage-range pair")
+        if self._grid_signature(one_range.payload) != self._grid_signature(two_range.payload):
+            raise ProfileCompatibilityError("R=1/R=2 profiles use different route/thread/shape grids")
+        return one_range, two_range
+
     def split_pair(self, query: ProfileQuery) -> tuple[ProfileRecord, ProfileRecord]:
-        if query.w13_split is not None:
-            raise ValueError("split_pair query must leave w13_split unspecified")
-        if query.weight_window_bytes not in (None, 0):
-            raise ValueError("split_pair only selects legacy weight_window_bytes=0 profiles")
-        base_query = {**query.__dict__, "weight_window_bytes": 0}
-        no_split = self.select(ProfileQuery(**{**base_query, "w13_split": False}))
-        split = self.select(ProfileQuery(**{**base_query, "w13_split": True}))
-        if no_split.policy.key_without_kernel_policy() != split.policy.key_without_kernel_policy():
-            raise ProfileCompatibilityError("split/no-split profiles are not a pair")
-        if self._grid_signature(no_split.payload) != self._grid_signature(split.payload):
-            raise ProfileCompatibilityError("split/no-split profiles use different route/thread/shape grids")
-        return no_split, split
+        """Compatibility alias; active identity is the canonical stage-range pair."""
+        return self.stage_range_pair(query)
 
     def policy_variants(self, query: ProfileQuery) -> tuple[ProfileRecord, ...]:
-        """Return a complete legacy pair plus compatible measured window variants."""
-        if query.w13_split is not None or query.weight_window_bytes is not None:
-            raise ValueError("policy_variants query must leave split and weight window unspecified")
-        no_split, split = self.split_pair(query)
-        base_key = no_split.policy.key_without_kernel_policy()
-        baseline_grid = self._grid_signature(no_split.payload)
-        variants = [no_split, split]
-        seen = {no_split.policy.kernel_policy_key(), split.policy.kernel_policy_key()}
-        for record in self.records:
-            policy = record.policy
-            if policy.weight_window_bytes <= 0 or policy.key_without_kernel_policy() != base_key:
-                continue
-            if policy.mismatch(query):
-                continue
-            variant_key = policy.kernel_policy_key()
-            if variant_key in seen:
+        """Return every uniquely measured stage-range variant for one profile domain."""
+        if any(
+            value is not None
+            for value in (
+                query.w13_split,
+                query.w13_split_chunks,
+                query.weight_window_bytes,
+                query.w13_window_ranges,
+                query.w2_window_ranges,
+            )
+        ):
+            raise ValueError("policy_variants query must leave kernel range policy unspecified")
+        matches = [record for record in self.records if not record.policy.mismatch(query)]
+        if not matches:
+            details = {record.path.name: record.policy.mismatch(query) for record in self.records}
+            raise ProfileCompatibilityError(f"no stage-range profiles match {query}; mismatches={details}")
+        base_keys = {record.policy.key_without_kernel_policy() for record in matches}
+        if len(base_keys) != 1:
+            raise ProfileCompatibilityError("stage-range profile query is ambiguous outside kernel policy")
+        baseline_grid = self._grid_signature(matches[0].payload)
+        variants: dict[tuple[object, ...], ProfileRecord] = {}
+        for record in matches:
+            variant_key = record.policy.kernel_policy_key()
+            if variant_key in variants:
                 raise ProfileCompatibilityError(f"duplicate kernel policy profile: {variant_key}")
             if self._grid_signature(record.payload) != baseline_grid:
                 raise ProfileCompatibilityError(
-                    f"weight-window profile {record.path.name} uses a different route/thread/shape grid"
+                    f"stage-range profile {record.path.name} uses a different route/thread/shape grid"
                 )
-            seen.add(variant_key)
-            variants.append(record)
+            variants[variant_key] = record
         return tuple(
             sorted(
-                variants,
+                variants.values(),
                 key=lambda record: (
-                    record.policy.weight_window_bytes > 0,
-                    record.policy.weight_window_bytes,
-                    record.policy.w13_split,
+                    record.policy.w13_window_ranges,
+                    record.policy.w2_window_ranges,
                 ),
             )
         )

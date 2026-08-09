@@ -404,14 +404,7 @@ class AnalyticPolicy:
         return self.key_without_kernel_policy()
 
     def kernel_policy_key(self) -> tuple[object, ...]:
-        if self.weight_window_bytes > 0:
-            return (
-                "weight_window",
-                self.weight_window_bytes,
-                self.w13_window_ranges,
-                self.w2_window_ranges,
-            )
-        return ("legacy_split", self.w13_split, self.w13_split_chunks)
+        return ("stage_ranges", self.w13_window_ranges, self.w2_window_ranges)
 
 
 def analytic_candidate_shapes(cores: int, widths: Iterable[int]) -> tuple[tuple[int, ...], ...]:
