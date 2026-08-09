@@ -110,11 +110,10 @@ bool probe_rows_supported(int rows, ProbeMode mode) {
   if (mode == ProbeMode::kMatrixOnly) {
     return rows == 12;
   }
-  if (mode == ProbeMode::kFullNoStoreColumnPipeline ||
-      mode == ProbeMode::kFullWithStoreColumnPipeline) {
+  if (mode == ProbeMode::kFullNoStoreColumnPipeline || mode == ProbeMode::kFullWithStoreColumnPipeline) {
     return rows == 12;
   }
-  if (mode == ProbeMode::kFullNoStore) {
+  if (mode == ProbeMode::kFullNoStore || mode == ProbeMode::kFullWithStore) {
     return (rows >= 1 && rows <= 2) || rows == 12;
   }
   return rows >= 1 && rows <= 2;

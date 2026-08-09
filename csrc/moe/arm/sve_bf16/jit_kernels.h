@@ -50,7 +50,7 @@ KernelFn get_kernel(Operation operation, int rows, int degree, std::string* erro
 KernelFn get_gemm_f32_kernel(int rows, std::string* error);
 KernelFn get_bulk_m12_gemm_f32_kernel(std::string* error);
 // Benchmark-only variants of the pure GEMM kernel. M1/M2 support all probe modes;
-// M12 also supports benchmark-only column-pipelined full-loop modes.
+// M12 supports full-loop, full-loop-with-store, and column-pipelined modes.
 KernelFn get_probe_kernel(int rows, ProbeMode mode, std::string* error);
 // Exact-M kernel with an operation-specific streaming hint ahead of each cold
 // B cache-line load. The caller is responsible for using it only on the first

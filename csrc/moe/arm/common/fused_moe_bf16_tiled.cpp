@@ -5583,18 +5583,23 @@ at::Tensor fused_moe_test_sve_packed_gemm(at::Tensor A, at::Tensor packed_B, int
 }
 
 // Benchmark only the standalone exact-M SVE JIT GEMM for a W13-shaped packed
-// weight. Packing and allocation are outside the timed region; timed
-// iterations rotate experts to keep B cold.
+// weight. Packing and allocation are outside the timed region. A may be either
+// [M,K] or [copies,M,K]; timed iterations independently rotate packed A copies
+// and packed-B experts so cache-state probes can stream either operand. Full
+// M12-compatible probe modes may traverse any positive multiple of 12 rows.
 std::vector<double> fused_moe_bench_sve_jit_w13_gemm(at::Tensor A, at::Tensor w13_packed, int64_t K, int64_t N,
-                                                     int64_t n_tile, int64_t n_ranges, int64_t warmup,
-                                                     int64_t runs, int64_t probe_mode) {
+                                                     int64_t n_tile, int64_t n_ranges, int64_t warmup, int64_t runs,
+                                                     int64_t probe_mode) {
 #if !defined(__aarch64__) || !defined(FUSED_CPP_MOE_HAS_ARM_SVE)
   TORCH_CHECK(false, "fused_moe_bench_sve_jit_w13_gemm requires AArch64 SVE");
 #else
   check_bf16_cpu(A, "A");
-  TORCH_CHECK(A.dim() == 2, "A must be 2-D [M, K]");
-  TORCH_CHECK(A.size(1) == K, "A second dimension must equal K=", K);
-  check_positive_int(A.size(0), "M");
+  TORCH_CHECK(A.dim() == 2 || A.dim() == 3, "A must be 2-D [M, K] or 3-D [copies, M, K]");
+  TORCH_CHECK(A.size(-1) == K, "A last dimension must equal K=", K);
+  const int64_t a_copies = A.dim() == 3 ? A.size(0) : 1;
+  const int64_t rows64 = A.dim() == 3 ? A.size(1) : A.size(0);
+  check_positive_int(a_copies, "A copies");
+  check_positive_int(rows64, "M");
   check_positive_int(K, "K");
   check_positive_int(N, "N");
   TORCH_CHECK(n_tile == ::fused_cpp::moe_sve::n_tile(), "n_tile mismatch: requested ", n_tile, ", runtime ",
@@ -5611,39 +5616,53 @@ std::vector<double> fused_moe_bench_sve_jit_w13_gemm(at::Tensor A, at::Tensor w1
   TORCH_CHECK(sve_jit_configuration_supported(SveJitOperation::kGemmF32, static_cast<int>(K), 0, nullptr),
               "plain SVE JIT GEMM is unavailable for this configuration");
 
-  const int rows = static_cast<int>(A.size(0));
+  const int rows = static_cast<int>(rows64);
   const int64_t packed_rows = sve_hybrid_packed_rows(rows);
-  std::vector<uint16_t> packed_a(static_cast<size_t>(packed_rows * K), static_cast<uint16_t>(0));
+  const size_t packed_a_stride = static_cast<size_t>(packed_rows * K);
+  std::vector<uint16_t> packed_a(static_cast<size_t>(a_copies) * packed_a_stride, static_cast<uint16_t>(0));
   std::vector<int64_t> routes(static_cast<size_t>(rows));
   std::iota(routes.begin(), routes.end(), int64_t{0});
-  gather_pack_a_reorder_sve_hybrid(bf16_data_const(A), K, routes.data(), 1, packed_a.data(), rows,
-                                   static_cast<int>(K), int64_t{1}, int64_t{0});
+  const uint16_t* a_ptr = bf16_data_const(A);
+  const size_t a_stride = static_cast<size_t>(rows64 * K);
+  for (int64_t copy = 0; copy < a_copies; ++copy) {
+    gather_pack_a_reorder_sve_hybrid(a_ptr + static_cast<size_t>(copy) * a_stride, K, routes.data(), 1,
+                                     packed_a.data() + static_cast<size_t>(copy) * packed_a_stride, rows,
+                                     static_cast<int>(K), int64_t{1}, int64_t{0});
+  }
   at::Tensor output = at::empty({packed_rows, N}, at::TensorOptions().dtype(at::kFloat).device(at::kCPU));
   float* output_ptr = output.data_ptr<float>();
   const uint16_t* weights_ptr = bf16_data_const(weights.tensor);
   const int range_cols = static_cast<int>(N / n_ranges);
   ::fused_cpp::moe_sve::jit::KernelFn probe_kernel = nullptr;
   if (probe_mode != 0) {
+    const int probe_rows = rows > 12 ? 12 : rows;
+    TORCH_CHECK(rows <= 12 || rows % 12 == 0,
+                "full-M SVE JIT probes require M to be at most 12 or a positive multiple of 12");
     std::string error;
     probe_kernel = ::fused_cpp::moe_sve::jit::get_probe_kernel(
-        rows, static_cast<::fused_cpp::moe_sve::jit::ProbeMode>(probe_mode), &error);
+        probe_rows, static_cast<::fused_cpp::moe_sve::jit::ProbeMode>(probe_mode), &error);
     TORCH_CHECK(probe_kernel != nullptr, "failed to generate SVE JIT probe kernel: ", error);
   }
 
   auto run_one = [&](int64_t iteration) {
+    const int64_t a_copy = iteration % a_copies;
     const int64_t expert = iteration % weights.E;
+    const uint16_t* packed_a_ptr = packed_a.data() + static_cast<size_t>(a_copy) * packed_a_stride;
     const uint16_t* packed_b = weights_ptr + expert * weights.packed_stride;
     for (int64_t range = 0; range < n_ranges; ++range) {
       const int n_begin = static_cast<int>(range * range_cols);
       if (probe_kernel != nullptr) {
-        SveKBlockParams p = make_sve_kblock_params(12, static_cast<int>(K), range_cols, static_cast<int>(N),
-                                                   static_cast<int>(N), n_begin, 0);
-        p.gemm.m = rows;
-        probe_kernel(packed_a.data(), packed_b, output_ptr + n_begin, nullptr, &p.gemm);
+        const int panel_rows = rows > 12 ? 12 : rows;
+        for (int m_begin = 0; m_begin < rows; m_begin += panel_rows) {
+          SveKBlockParams p = make_sve_kblock_params(panel_rows, static_cast<int>(K), range_cols, static_cast<int>(N),
+                                                     static_cast<int>(N), n_begin, 0);
+          probe_kernel(packed_a_ptr + static_cast<size_t>(m_begin) * K, packed_b,
+                       output_ptr + static_cast<size_t>(m_begin) * N + n_begin, nullptr, &p.gemm);
+        }
       } else {
         const bool dispatched = sve_jit_packed_gemm_f32_exact_dispatch(
-            packed_a.data(), packed_b, output_ptr + n_begin, rows, static_cast<int>(K), range_cols,
-            static_cast<int>(N), static_cast<int>(N), n_begin);
+            packed_a_ptr, packed_b, output_ptr + n_begin, rows, static_cast<int>(K), range_cols, static_cast<int>(N),
+            static_cast<int>(N), n_begin);
         TORCH_CHECK(dispatched, "failed to dispatch plain SVE JIT W13 GEMM");
       }
     }

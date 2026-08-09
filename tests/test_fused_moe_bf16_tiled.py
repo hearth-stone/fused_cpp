@@ -1036,6 +1036,72 @@ def test_sve_xbyak_m12_service_probe_runs(probe_mode: int) -> None:
         )
 
 
+def test_sve_xbyak_m12_service_probe_rotates_packed_a_copies() -> None:
+    """The benchmark-only API accepts independent packed-A stream windows."""
+    if "arm_sve_bf16" not in available_fused_moe_bf16_tiled_backends():
+        pytest.skip("requires an SVE BF16 build/runtime")
+    from fused_cpp import _moe_C
+
+    generator = torch.Generator().manual_seed(20260802)
+    K = 64
+    N = 64
+    w13 = _bf16_normal((3, N, K), generator=generator, std=0.05)
+    w2 = _bf16_normal((3, K, N // 2), generator=generator, std=0.05)
+    packed = prepare_fused_moe_bf16_tiled_weights(w13, w2, fuse_silu=True, backend="sve")
+    A = _bf16_normal((3, 12, K), generator=generator, std=0.05)
+
+    samples = _moe_C.fused_moe_bench_sve_jit_w13_gemm(
+        A,
+        packed.w13[0],
+        K,
+        N,
+        packed.backend_n_tile,
+        1,
+        1,
+        5,
+        4,
+    )
+
+    assert len(samples) == 5
+    assert all(sample > 0.0 for sample in samples)
+
+
+@pytest.mark.parametrize(
+    "probe_mode",
+    [4, 5],
+    ids=["full-no-store", "full-with-fp32-store"],
+)
+def test_sve_xbyak_service_probe_traverses_full_m12_panels(probe_mode: int) -> None:
+    """Full-loop probes can measure a complete pure GEMM without fused epilogues."""
+    if "arm_sve_bf16" not in available_fused_moe_bf16_tiled_backends():
+        pytest.skip("requires an SVE BF16 build/runtime")
+    from fused_cpp import _moe_C
+
+    generator = torch.Generator().manual_seed(20260802)
+    M = 24
+    K = 64
+    N = 64
+    w13 = _bf16_normal((1, N, K), generator=generator, std=0.05)
+    w2 = _bf16_normal((1, K, N // 2), generator=generator, std=0.05)
+    packed = prepare_fused_moe_bf16_tiled_weights(w13, w2, fuse_silu=True, backend="sve")
+    A = _bf16_normal((M, K), generator=generator, std=0.05)
+
+    samples = _moe_C.fused_moe_bench_sve_jit_w13_gemm(
+        A,
+        packed.w13[0],
+        K,
+        N,
+        packed.backend_n_tile,
+        1,
+        1,
+        3,
+        probe_mode,
+    )
+
+    assert len(samples) == 3
+    assert all(sample > 0.0 for sample in samples)
+
+
 @pytest.mark.parametrize("degree", [4, 5, 6], ids=["poly4", "poly5", "poly6"])
 @pytest.mark.parametrize("direct_route", [False, True], ids=["w2", "w2_direct"])
 def test_sve_first_panel_prefetch_matches_panel_jit(
