@@ -266,15 +266,23 @@ single place rather than per allocation site.
 
 | Variable | Effect |
 | --- | --- |
-| `FUSED_CPP_PAGES=small\|thp\|hugetlb` | Page backing. `thp` (default) uses anonymous `mmap` plus `madvise(MADV_HUGEPAGE)`; `hugetlb` uses `MAP_HUGETLB` and falls back to `thp` if the pool is exhausted; `small` uses plain aligned allocation. |
+| `FUSED_CPP_PAGES=small\|thp\|hugetlb` | Page backing. `thp` (default) uses anonymous `mmap` plus `madvise(MADV_HUGEPAGE)`; `hugetlb` uses `MAP_HUGETLB` and falls back to `thp` if the pool is exhausted; `small` maps with `MADV_NOHUGEPAGE` so it is base pages only, which makes it usable as a control. |
 | `FUSED_CPP_PAGE_SIZE_MB=<int>` | Huge page size for `hugetlb`, default `32`. Must be a power of two the kernel supports, otherwise the default is used. |
 | `FUSED_CPP_PAGE_MIN_KB=<int>` | Smallest request that may consume a whole huge page; smaller ones use `thp`. Defaults to one full page, which keeps waste per mapping under 2x. Without it many small scratch buffers each round up to a whole page. |
 | `FUSED_CPP_HUGETLBFS_PATH=<mount>` | Implies `hugetlb` and probes the page size from the mount. |
+| `FUSED_CPP_PAGE_TRACK=1` | Record every live mapping so `page_mappings()` can report its address, requested size, mapping length and whether it got `hugetlb`. Off by default; must be set before the first allocation. |
+
+Page size is worth about 13% on streamed weights, and the crossover is base pages
+to 2 MiB rather than 2 MiB to 32 MiB: measured useful bandwidth is 265.9 GB/s on
+4 KiB, 301.1 on transparent huge pages and 304.0 on 32 MiB pages. The default
+`thp` therefore captures nearly all of it without consuming a huge-page pool.
 
 `fused_cpp._moe_C.page_policy_info()` reports what was actually resolved plus
-live, peak and fallback counters. The policy latches on the first allocation,
-because freeing recomputes the mapping length from it, so change it through the
-environment before the first forward pass rather than mid-run.
+live, peak and fallback counters, and `page_mappings()` reports the individual
+mappings when tracking is on. Aggregate `AnonHugePages` from `/proc` is not a
+substitute: the framework's own allocations dominate it. The policy latches on the
+first allocation, because freeing recomputes the mapping length from it, so change
+it through the environment before the first forward pass rather than mid-run.
 
 `FUSED_CPP_MOE_HUGETLB`, `FUSED_CPP_MOE_HUGETLB_MB`, `FUSED_CPP_MOE_THP` and
 `FUSED_CPP_MOE_HUGETLBFS_PATH` remain as deprecated aliases and are consulted

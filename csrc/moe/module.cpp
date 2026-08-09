@@ -166,4 +166,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         return info;
       },
       "Report the resolved page-backing policy and live allocation counters.");
+
+  m.def("page_mappings", &fused_cpp::page_mappings,
+        "Live page-policy mappings as (address, request, length, hugetlb) rows.");
 }

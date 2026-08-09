@@ -28,14 +28,17 @@
 
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <mutex>
 #include <new>
 #include <string>
+#include <vector>
 
 #if defined(__linux__)
 #include <sys/mman.h>
@@ -46,7 +49,7 @@
 namespace fused_cpp {
 
 enum class PagePolicy {
-  kSmall,   // plain operator new: whatever the allocator and kernel provide
+  kSmall,   // anonymous mmap plus madvise(MADV_NOHUGEPAGE): base pages only
   kThp,     // anonymous mmap rounded to 2 MiB plus madvise(MADV_HUGEPAGE)
   kHugetlb  // anonymous MAP_HUGETLB at the configured size, THP on failure
 };
@@ -154,8 +157,21 @@ inline PageConfig resolve_page_config() {
 #endif
 }
 
+// Optional per-mapping record, enabled by FUSED_CPP_PAGE_TRACK=1. Aggregate
+// counters cannot answer which buffer landed on which page size, and process-wide
+// smaps totals are dominated by the framework's own allocations.
+struct PageMapping {
+  std::uintptr_t address = 0;
+  std::size_t request = 0;
+  std::size_t length = 0;
+  bool hugetlb = false;
+};
+
 struct PageState {
   PageConfig config = resolve_page_config();
+  bool track = env_or_null("FUSED_CPP_PAGE_TRACK") != nullptr;
+  std::mutex registry_mutex;
+  std::vector<PageMapping> registry;
   std::atomic<bool> latched{false};
   std::atomic<std::size_t> live_bytes{0};
   std::atomic<std::size_t> live_mappings{0};
@@ -215,18 +231,30 @@ inline bool page_uses_hugetlb(std::size_t bytes) {
 
 inline std::size_t page_alloc_length(std::size_t bytes) {
   if (page_uses_hugetlb(bytes)) return detail::round_up_pow2(bytes, page_config().hugetlb_bytes);
-  switch (page_config().policy) {
-    case PagePolicy::kHugetlb:
-      return detail::round_up_pow2(bytes, kThpAlignBytes);
-    case PagePolicy::kThp:
-      return detail::round_up_pow2(bytes, kThpAlignBytes);
-    case PagePolicy::kSmall:
-      break;
-  }
-  return bytes;
+  if (page_config().policy != PagePolicy::kSmall) return detail::round_up_pow2(bytes, kThpAlignBytes);
+  return detail::round_up_pow2(bytes, kMinAlignBytes);
 }
 
 namespace detail {
+
+inline void record_mapping(PageState& state, void* pointer, std::size_t request, std::size_t length, bool hugetlb) {
+  if (!state.track) return;
+  const std::lock_guard<std::mutex> guard(state.registry_mutex);
+  state.registry.push_back(PageMapping{reinterpret_cast<std::uintptr_t>(pointer), request, length, hugetlb});
+}
+
+inline void forget_mapping(PageState& state, void* pointer) {
+  if (!state.track) return;
+  const std::lock_guard<std::mutex> guard(state.registry_mutex);
+  const std::uintptr_t address = reinterpret_cast<std::uintptr_t>(pointer);
+  for (std::size_t index = 0; index < state.registry.size(); ++index) {
+    if (state.registry[index].address == address) {
+      state.registry[index] = state.registry.back();
+      state.registry.pop_back();
+      return;
+    }
+  }
+}
 
 inline void note_allocation(PageState& state, std::size_t length) {
   state.total_allocations.fetch_add(1, std::memory_order_relaxed);
@@ -259,6 +287,7 @@ inline void* page_alloc(std::size_t bytes) {
       state.hugetlb_fallbacks.fetch_add(1, std::memory_order_relaxed);
     }
     detail::note_allocation(state, length);
+    detail::record_mapping(state, mapped, bytes, length, true);
     return mapped;
   }
   if (config.policy != PagePolicy::kSmall) {
@@ -267,11 +296,24 @@ inline void* page_alloc(std::size_t bytes) {
     if (mapped == MAP_FAILED) throw std::bad_alloc();
     ::madvise(mapped, length, MADV_HUGEPAGE);
     detail::note_allocation(state, length);
+    detail::record_mapping(state, mapped, bytes, length, false);
     return mapped;
   }
 #endif
-  void* raw = ::operator new(detail::round_up_pow2(bytes, kMinAlignBytes), std::align_val_t{kMinAlignBytes});
-  detail::note_allocation(state, bytes);
+  const std::size_t length = detail::round_up_pow2(bytes, kMinAlignBytes);
+#if defined(__linux__)
+  void* raw = ::mmap(nullptr, length, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (raw == MAP_FAILED) throw std::bad_alloc();
+  // Without this the mapping can inherit VM_HUGEPAGE from a recycled arena, so
+  // "small" would not actually mean base pages.
+#if defined(MADV_NOHUGEPAGE)
+  ::madvise(raw, length, MADV_NOHUGEPAGE);
+#endif
+#else
+  void* raw = ::operator new(length, std::align_val_t{kMinAlignBytes});
+#endif
+  detail::note_allocation(state, length);
+  detail::record_mapping(state, raw, bytes, length, false);
   return raw;
 }
 
@@ -279,15 +321,14 @@ inline void page_free(void* pointer, std::size_t bytes) noexcept {
   if (pointer == nullptr) return;
   detail::PageState& state = detail::page_state();
   const std::size_t length = page_alloc_length(bytes);
+  detail::forget_mapping(state, pointer);
   state.live_bytes.fetch_sub(length, std::memory_order_relaxed);
   state.live_mappings.fetch_sub(1, std::memory_order_relaxed);
 #if defined(__linux__)
-  if (state.config.policy != PagePolicy::kSmall) {
-    ::munmap(pointer, length);
-    return;
-  }
-#endif
+  ::munmap(pointer, length);
+#else
   ::operator delete(pointer, std::align_val_t{kMinAlignBytes});
+#endif
 }
 
 // Stateless STL adapter, so vectors that use it stay swappable and comparable.
@@ -329,6 +370,21 @@ inline std::map<std::string, int64_t> page_policy_counters() {
           {"peak_bytes", static_cast<int64_t>(stats.peak_bytes)},
           {"total_allocations", static_cast<int64_t>(stats.total_allocations)},
           {"hugetlb_fallbacks", static_cast<int64_t>(stats.hugetlb_fallbacks)}};
+}
+
+// Live mappings as (address, request, length, hugetlb) tuples. Empty unless
+// FUSED_CPP_PAGE_TRACK=1 was set before the first allocation.
+inline std::vector<std::array<std::int64_t, 4>> page_mappings() {
+  detail::PageState& state = detail::page_state();
+  if (!state.track) return {};
+  const std::lock_guard<std::mutex> guard(state.registry_mutex);
+  std::vector<std::array<std::int64_t, 4>> rows;
+  rows.reserve(state.registry.size());
+  for (const detail::PageMapping& mapping : state.registry) {
+    rows.push_back({static_cast<std::int64_t>(mapping.address), static_cast<std::int64_t>(mapping.request),
+                    static_cast<std::int64_t>(mapping.length), static_cast<std::int64_t>(mapping.hugetlb)});
+  }
+  return rows;
 }
 
 inline std::map<std::string, std::string> page_policy_strings() {
