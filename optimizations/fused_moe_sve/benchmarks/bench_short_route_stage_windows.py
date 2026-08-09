@@ -3,7 +3,7 @@
 
 The calibrated default policy ``amazon_c5_192c_tp4_f512_v1`` has no route band
 below 49 routes, so every expert with ``M < 49`` inherits the operator-wide
-legacy split-W13 window (two 4 MiB W13 ranges and one 4 MiB W2 range). Isolated
+baseline geometry (two 4 MiB W13 ranges and one 4 MiB W2 range). Isolated
 probes on this host show that short-route experts lose 16%-114% of their useful
 packed-B bandwidth in that regime, because each additional ``M12`` panel
 re-reads the whole window.
@@ -20,9 +20,9 @@ This benchmark measures whether closing that gap survives end to end:
     candidate with the short-route windows lowered.
 
 ``manual``
-    The ``legacy`` plan with the short-route band's windows applied post hoc. The
-    task graph, widths and placement are byte-identical to ``legacy``, so this
-    isolates the window effect from any planner re-search. Widening a band's
+    The ``legacy`` plan with the short-route band's ranges applied post hoc. The
+    task graph, widths and placement are identical to ``legacy``, so this
+    isolates the range effect from any planner re-search. Widening a band's
     coverage disables the cost model's full-workload anchor for the widths it
     adds, which can move the chosen shape, so keeping the two apart stays useful
     whenever the table changes.
@@ -62,6 +62,7 @@ from stage_window_policy import (  # noqa: E402
     AMAZON_C5_192C_TP4_F512_SHORT_ROUTE_BAND,
     AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V2,
 )
+from weight_window import stage_weight_window_geometry  # noqa: E402
 from workload_catalog import default_offline_workloads  # noqa: E402
 
 
@@ -78,9 +79,28 @@ SHORT_ROUTE_BAND = AMAZON_C5_192C_TP4_F512_SHORT_ROUTE_BAND
 SHORT_ROUTE_MIN = SHORT_ROUTE_BAND.min_routes
 SHORT_ROUTE_MAX = SHORT_ROUTE_BAND.max_routes
 
+
+def _stage_ranges(targets: tuple[int, int]) -> tuple[int, int]:
+    w13 = stage_weight_window_geometry(
+        k=STAGE_GEOMETRY["hidden_size"],
+        n=2 * STAGE_GEOMETRY["intermediate_size"],
+        n_tile=STAGE_GEOMETRY["backend_n_tile"],
+        target_bytes=max(targets[0], 0),
+        fallback_ranges=2,
+    )
+    w2 = stage_weight_window_geometry(
+        k=STAGE_GEOMETRY["intermediate_size"],
+        n=STAGE_GEOMETRY["hidden_size"],
+        n_tile=STAGE_GEOMETRY["backend_n_tile"],
+        target_bytes=max(targets[1], 0),
+        fallback_ranges=1,
+    )
+    return w13.ranges, w2.ranges
+
+
 # Lowered from the production band so ``manual`` cannot drift from ``policy``.
-SHORT_ROUTE_WINDOWS: dict[int, tuple[int, int]] = {
-    threads: AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V2.select(SHORT_ROUTE_MIN, threads)
+SHORT_ROUTE_RANGES: dict[int, tuple[int, int]] = {
+    threads: _stage_ranges(AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V2.select(SHORT_ROUTE_MIN, threads))
     for threads in SHORT_ROUTE_BAND.widths
 }
 
@@ -90,26 +110,26 @@ MANUAL = "manual"
 VARIANTS = (LEGACY, POLICY, MANUAL)
 
 
-def short_route_window(routes: int, threads: int) -> tuple[int, int] | None:
+def short_route_ranges(routes: int, threads: int) -> tuple[int, int] | None:
     if not SHORT_ROUTE_MIN <= routes <= SHORT_ROUTE_MAX:
         return None
-    return SHORT_ROUTE_WINDOWS.get(threads)
+    return SHORT_ROUTE_RANGES.get(threads)
 
 
-def apply_short_route_windows(bridge: dict, routes_by_expert: dict[int, int]) -> tuple[dict, int]:
-    """Overwrite per-task windows without touching the task graph."""
+def apply_short_route_ranges(bridge: dict, routes_by_expert: dict[int, int]) -> tuple[dict, int]:
+    """Overwrite per-task ranges without touching the task graph."""
     updated = dict(bridge)
-    w13 = list(bridge["task_w13_window_bytes"])
-    w2 = list(bridge["task_w2_window_bytes"])
+    w13 = list(bridge["task_w13_ranges"])
+    w2 = list(bridge["task_w2_ranges"])
     overridden = 0
     for index, (expert, threads) in enumerate(zip(bridge["task_expert_ids"], bridge["task_threads"])):
-        selected = short_route_window(routes_by_expert[int(expert)], int(threads))
+        selected = short_route_ranges(routes_by_expert[int(expert)], int(threads))
         if selected is None:
             continue
         w13[index], w2[index] = selected
         overridden += 1
-    updated["task_w13_window_bytes"] = w13
-    updated["task_w2_window_bytes"] = w2
+    updated["task_w13_ranges"] = w13
+    updated["task_w2_ranges"] = w2
     return updated, overridden
 
 
@@ -189,15 +209,16 @@ def main() -> int:
     metadata = {name: dict(planner.last) for name, planner in planners.items()}
 
     bridges = {name: spec["bridge"] for name, spec in specs.items()}
-    bridges[MANUAL], manual_overridden = apply_short_route_windows(bridges[LEGACY], routes_by_expert)
+    bridges[MANUAL], manual_overridden = apply_short_route_ranges(bridges[LEGACY], routes_by_expert)
     specs[MANUAL] = dict(specs[LEGACY])
     metadata[MANUAL] = dict(metadata[LEGACY])
     metadata[MANUAL]["overridden_tasks"] = manual_overridden
 
     for name in (POLICY,):
-        pairs = list(zip(bridges[name]["task_w13_window_bytes"], bridges[name]["task_w2_window_bytes"]))
-        metadata[name]["overridden_tasks"] = sum(w13 >= 0 or w2 >= 0 for w13, w2 in pairs)
-        metadata[name]["window_pairs"] = sorted({f"{w13}:{w2}" for w13, w2 in pairs if w13 >= 0 or w2 >= 0})
+        pairs = list(zip(bridges[name]["task_w13_ranges"], bridges[name]["task_w2_ranges"]))
+        baseline = int(specs[name]["w13_ranges"]), int(specs[name]["w2_ranges"])
+        metadata[name]["overridden_tasks"] = sum(pair != baseline for pair in pairs)
+        metadata[name]["range_pairs"] = sorted({f"{w13}:{w2}" for w13, w2 in pairs})
 
     plans = {name: AsyncMoEPlanV2.from_dict(bridge) for name, bridge in bridges.items()}
 
@@ -222,7 +243,6 @@ def main() -> int:
     outputs = {name: torch.empty_like(hidden) for name in VARIANTS}
 
     def run(name: str) -> torch.Tensor:
-        spec = specs[name]
         return fused_moe_bf16_tiled_async_plan(
             hidden,
             packed,
@@ -231,8 +251,6 @@ def main() -> int:
             plans[name],
             activation="silu",
             global_num_experts=experts,
-            w13_split=spec["w13_split"],
-            weight_window_bytes=spec["weight_window_bytes"],
             out=outputs[name],
         )
 
@@ -328,7 +346,7 @@ def main() -> int:
             },
             "policy": {
                 "name": AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V2.name,
-                "short_route_windows": {str(k): list(v) for k, v in SHORT_ROUTE_WINDOWS.items()},
+                "short_route_ranges": {str(k): list(v) for k, v in SHORT_ROUTE_RANGES.items()},
             },
             "measurement": {
                 "profile": str(args.profile),

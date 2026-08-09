@@ -63,7 +63,6 @@ def main() -> None:
     torch.set_num_threads(1)
     os.environ["FUSED_CPP_MOE_SVE"] = "1"
     os.environ["FUSED_CPP_MOE_SVE_IMPL"] = "jit"
-    os.environ["FUSED_CPP_MOE_W13_SPLIT_N"] = "1"
 
     generator = torch.Generator().manual_seed(20260723)
     w13 = bf16((EXPERTS, 2 * F, H), generator)
@@ -139,7 +138,7 @@ def main() -> None:
     max_weight_gbs = max(record["weight_gbs"] for record in records)
     print(
         f"host_core={CORE} H={H} F={F} experts={EXPERTS} "
-        f"w13_split=1 jit=1 peak={BFMMLA_PEAK_GFLOPS:.1f}GF/s "
+        f"w13_ranges=2 w2_ranges=1 jit=1 peak={BFMMLA_PEAK_GFLOPS:.1f}GF/s "
         f"packed_b_read_ceiling={PACKED_B_READ_CEILING_GBS:.2f}GB/s "
         f"max_observed_weight_rate={max_weight_gbs:.3f}GB/s sink={sink}"
     )

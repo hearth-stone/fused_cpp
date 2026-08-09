@@ -115,6 +115,8 @@
     "backend": "sve",
     "gemm_backend": 1,
     "backend_n_tile": 8,
+    "w13_window_ranges": 1,
+    "w2_window_ranges": 1,
     "parallel_axis": "N",
     "w13_split": false,
     "w13_split_chunks": 1,

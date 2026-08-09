@@ -79,7 +79,7 @@ def median(values: Sequence[float]) -> float:
     return float(statistics.median(values))
 
 
-def choose_moe_gemm_split(stage: str, rows: int, n_cols: int, threads: int) -> str:
+def choose_moe_gemm_axis(stage: str, rows: int, n_cols: int, threads: int) -> str:
     if threads <= 1:
         return "N"
     if stage == "w13":
@@ -247,6 +247,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ffn-hidden-size", type=int, default=512)
     parser.add_argument("--routes", default="2048")
     parser.add_argument("--threads", default="1,2,4,8")
+    parser.add_argument("--w13-ranges", type=int, default=2)
+    parser.add_argument("--w2-ranges", type=int, default=1)
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--runs", type=int, default=5)
     parser.add_argument("--seed", type=int, default=123)
@@ -280,6 +282,8 @@ def main() -> int:
         raise ValueError("hidden and FFN sizes must be positive")
     if args.warmup < 0 or args.runs <= 0:
         raise ValueError("warmup must be non-negative and runs positive")
+    if min(args.w13_ranges, args.w2_ranges) <= 0:
+        raise ValueError("stage range counts must be positive")
 
     routes_list = parse_int_list(args.routes)
     threads_list = parse_int_list(args.threads)
@@ -305,7 +309,7 @@ def main() -> int:
         "pct columns are relative to traced C++ e2e_ms"
     )
     print(
-        "routes threads split_w13 split_w2 full_ms trace_ms "
+        "routes threads axis_w13 axis_w2 full_ms trace_ms "
         "route% scratch% gather% w13% act% w2% scatter% gap% merge% cast% other%"
     )
 
@@ -339,6 +343,8 @@ def main() -> int:
                     activation=args.activation,
                     global_num_experts=1,
                     skip_weighted=not args.weighted_merge,
+                    w13_ranges=args.w13_ranges,
+                    w2_ranges=args.w2_ranges,
                 )
 
             os.environ["FUSED_CPP_MOE_TRACE"] = "0"
@@ -360,20 +366,20 @@ def main() -> int:
             trace_rows = parse_trace(args.trace_file)
             summary = summarize_trace_rows(trace_rows)
             full_ms = median(full_times_ms)
-            split_w13 = choose_moe_gemm_split("w13", routes, 2 * args.ffn_hidden_size, threads)
-            split_w2 = choose_moe_gemm_split("w2", routes, args.hidden_size, threads)
+            axis_w13 = choose_moe_gemm_axis("w13", routes, 2 * args.ffn_hidden_size, threads)
+            axis_w2 = choose_moe_gemm_axis("w2", routes, args.hidden_size, threads)
             row = {
                 "routes": routes,
                 "threads": threads,
-                "split_w13": split_w13,
-                "split_w2": split_w2,
+                "w13_parallel_axis": axis_w13,
+                "w2_parallel_axis": axis_w2,
                 "full_call_median_ms": full_ms,
                 "full_call_times_ms": full_times_ms,
                 **summary,
             }
             payload_rows.append(row)
             print(
-                f"{routes:<6} {threads:<7} {split_w13:<8} {split_w2:<7} "
+                f"{routes:<6} {threads:<7} {axis_w13:<8} {axis_w2:<7} "
                 f"{full_ms:7.3f} {summary['trace_e2e_ms']:8.3f} "
                 f"{summary['route_build_pct']:6.1f} "
                 f"{summary['scratch_alloc_pct']:8.1f} "
@@ -389,17 +395,13 @@ def main() -> int:
                 flush=True,
             )
 
-    split_requested = env_enabled("FUSED_CPP_MOE_W13_SPLIT_N")
-    w13_n = int(packed.w13[2])
-    split_active = split_requested and w13_n % 2 == 0 and (w13_n // 2) % packed.backend_n_tile == 0
     payload = {
         "schema_version": 1,
         "kernel": {
             "backend_n_tile": packed.backend_n_tile,
             "parallel_axis": "N",
-            "w13_workset_split_requested": split_requested,
-            "w13_workset_split": split_active,
-            "w13_n_ranges": 2 if split_active else 1,
+            "w13_window_ranges": args.w13_ranges,
+            "w2_window_ranges": args.w2_ranges,
             "w13_skip_silu": env_enabled("FUSED_CPP_MOE_W13_SKIP_SILU"),
         },
         "shape": {

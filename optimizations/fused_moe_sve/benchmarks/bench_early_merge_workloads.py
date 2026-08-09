@@ -90,7 +90,6 @@ def percentile(samples: list[float], fraction: float) -> float:
 
 def configure_runtime(route_dtype: str) -> None:
     os.environ["FUSED_CPP_MOE_SVE"] = "1"
-    os.environ["FUSED_CPP_MOE_W13_SPLIT_N"] = "1"
     os.environ["FUSED_CPP_MOE_ASYNC_READY_TOKEN_MERGE"] = "1"
     os.environ["FUSED_CPP_MOE_ASYNC_READY_TOKEN_DRAIN"] = "1"
     os.environ["FUSED_CPP_MOE_ASYNC_READY_TOKEN_BATCH"] = "2"
@@ -235,8 +234,6 @@ def main() -> int:
                 topk_ids,
                 merge_plans[merge_policy],
                 global_num_experts=workload.num_experts,
-                w13_split=bool(spec["w13_split"]),
-                weight_window_bytes=int(spec["weight_window_bytes"]),
                 out=outputs[name],
             )
 

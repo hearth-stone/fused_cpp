@@ -133,7 +133,6 @@ def main() -> int:
     topk_weights = torch.softmax(torch.randn((args.tokens, args.top_k), generator=generator), dim=-1)
 
     os.environ["FUSED_CPP_MOE_SVE"] = "1"
-    os.environ["FUSED_CPP_MOE_W13_SPLIT_N"] = "1"
     os.environ["FUSED_CPP_MOE_SVE_ROUTE_MERGE_UNROLL"] = "1"
     os.environ["FUSED_CPP_MOE_PIN_THREADS"] = "1"
     os.environ["FUSED_CPP_MOE_PIN_THREAD_CPUS"] = ",".join(str(cpu) for cpu in affinity[: args.threads])
@@ -196,7 +195,8 @@ def main() -> int:
                 thread_cpu_ids=thread_cpu_ids,
                 num_threads=args.threads,
                 global_num_experts=args.experts,
-                w13_split=True,
+                w13_ranges=2,
+                w2_ranges=1,
             )
 
     outputs: dict[str, torch.Tensor] = {}
@@ -295,7 +295,8 @@ def main() -> int:
             "top_k": args.top_k,
             "threads": args.threads,
             "threads_per_expert": None if args.path == "normal" else args.threads // args.experts,
-            "w13_split": True,
+            "w13_ranges": 2,
+            "w2_ranges": 1,
         },
         "logical_post_w2_bytes": {
             "fp32_scatter": 4 * fp32_route_bytes,

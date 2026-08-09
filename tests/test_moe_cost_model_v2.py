@@ -39,7 +39,6 @@ from stage_window_policy import (  # noqa: E402
 from tp_vs_ep_model import HierarchicalTopology, ParallelLayerEvaluator  # noqa: E402
 from weight_window import (  # noqa: E402
     achievable_worker_windows,
-    fused_moe_weight_windows,
     range_bytes_for_worker_window,
     stage_weight_window_geometry,
 )
@@ -520,12 +519,19 @@ def test_catalog_requires_exact_policy(catalog: ProfileCatalog) -> None:
 
 
 def test_weight_window_geometry_matches_native_tile_partition() -> None:
-    w13, w2 = fused_moe_weight_windows(
-        hidden_size=4096,
-        intermediate_size=512,
+    w13 = stage_weight_window_geometry(
+        k=4096,
+        n=1024,
         n_tile=8,
         target_bytes=1024 * 1024,
-        w13_fallback_ranges=1,
+        fallback_ranges=1,
+    )
+    w2 = stage_weight_window_geometry(
+        k=512,
+        n=4096,
+        n_tile=8,
+        target_bytes=1024 * 1024,
+        fallback_ranges=1,
     )
 
     assert (w13.ranges, w2.ranges) == (8, 4)
@@ -994,12 +1000,19 @@ def test_window_policy_and_thread_shape_are_selected_jointly(
     }
     for window_bytes, (preferred_shape, preferred_ns) in preferred.items():
         payload = json.loads(one_range.path.read_text(encoding="utf-8"))
-        w13, w2 = fused_moe_weight_windows(
-            hidden_size=4096,
-            intermediate_size=1024,
+        w13 = stage_weight_window_geometry(
+            k=4096,
+            n=2048,
             n_tile=8,
             target_bytes=window_bytes,
-            w13_fallback_ranges=1,
+            fallback_ranges=1,
+        )
+        w2 = stage_weight_window_geometry(
+            k=1024,
+            n=4096,
+            n_tile=8,
+            target_bytes=window_bytes,
+            fallback_ranges=1,
         )
         payload["kernel"].update(
             {

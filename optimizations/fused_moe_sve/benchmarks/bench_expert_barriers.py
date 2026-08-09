@@ -63,6 +63,8 @@ def make_run(
     topk_ids: torch.Tensor,
     threads: int,
     weighted: bool,
+    w13_ranges: int,
+    w2_ranges: int,
 ) -> Callable[[], torch.Tensor]:
     expert_ids = torch.tensor([0], dtype=torch.int32)
     team_threads = torch.tensor([threads], dtype=torch.int32)
@@ -73,6 +75,8 @@ def make_run(
         "global_num_experts": 1,
         "skip_weighted": not weighted,
         "activation": "silu",
+        "w13_ranges": w13_ranges,
+        "w2_ranges": w2_ranges,
     }
     if path == "scheduled":
         wave_offsets = torch.tensor([0, 1], dtype=torch.int32)
@@ -125,10 +129,12 @@ def benchmark_case(
     sample_ms: float,
     max_inner_iters: int,
     weighted: bool,
+    w13_ranges: int,
+    w2_ranges: int,
 ) -> list[dict[str, object]]:
     topk_ids = torch.zeros((routes, 1), dtype=torch.int32)
     topk_weights = torch.ones((routes, 1), dtype=torch.float32)
-    run = make_run(path, hidden, packed, topk_weights, topk_ids, threads, weighted)
+    run = make_run(path, hidden, packed, topk_weights, topk_ids, threads, weighted, w13_ranges, w2_ranges)
 
     outputs: dict[str, torch.Tensor] = {}
     for name, elide_zero, owner_scatter in VARIANTS:
@@ -220,7 +226,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-inner-iters", type=int, default=256)
     parser.add_argument("--seed", type=int, default=20260714)
     parser.add_argument("--weighted", action="store_true")
-    parser.add_argument("--no-split-w13", action="store_true")
+    parser.add_argument("--w13-ranges", type=int, default=2)
+    parser.add_argument("--w2-ranges", type=int, default=1)
     parser.add_argument("--output", type=Path)
     return parser.parse_args()
 
@@ -234,9 +241,10 @@ def main() -> int:
         raise ValueError("warmup, runs, sample-ms, or max-inner-iters is invalid")
     if max(args.threads) > len(os.sched_getaffinity(0)):
         raise ValueError("thread count exceeds the process CPU affinity")
+    if min(args.w13_ranges, args.w2_ranges) <= 0:
+        raise ValueError("stage range counts must be positive")
 
     os.environ["FUSED_CPP_MOE_SVE"] = "1"
-    os.environ["FUSED_CPP_MOE_W13_SPLIT_N"] = "0" if args.no_split_w13 else "1"
     os.environ["FUSED_CPP_MOE_W2_BF16_ROUTE"] = "1" if args.weighted else "0"
     os.environ["FUSED_CPP_MOE_SVE_W2_DIRECT_ROUTE"] = "0"
     torch.set_num_threads(1)
@@ -277,6 +285,8 @@ def main() -> int:
                     sample_ms=args.sample_ms,
                     max_inner_iters=args.max_inner_iters,
                     weighted=args.weighted,
+                    w13_ranges=args.w13_ranges,
+                    w2_ranges=args.w2_ranges,
                 )
                 records.extend(case_records)
                 by_name = {record["variant"]: record for record in case_records}
@@ -296,7 +306,8 @@ def main() -> int:
         "affinity": sorted(os.sched_getaffinity(0)),
         "hidden_size": args.hidden_size,
         "ffn_hidden_size": args.ffn_hidden_size,
-        "split_w13": not args.no_split_w13,
+        "w13_ranges": args.w13_ranges,
+        "w2_ranges": args.w2_ranges,
         "weighted": args.weighted,
         "warmup": args.warmup,
         "runs": args.runs,

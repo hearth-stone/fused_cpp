@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 from typing import Any
 
 
@@ -40,26 +39,19 @@ def _split_evenly(units: int, parts: int, index: int) -> tuple[int, int]:
 def _owned_n_columns(
     *,
     n: int,
-    k: int,
     n_tile: int,
     threads: int,
     local_tid: int,
-    weight_window_bytes: int,
-    fallback_ranges: int,
+    ranges: int,
 ) -> int:
-    if min(n, k, n_tile, threads) <= 0:
-        raise ValueError("GEMM dimensions, N tile, and thread count must be positive")
+    if min(n, n_tile, threads, ranges) <= 0:
+        raise ValueError("GEMM dimensions, N tile, thread count, and ranges must be positive")
     if n % n_tile != 0:
         raise ValueError(f"GEMM N={n} is not aligned to N tile {n_tile}")
-    if weight_window_bytes < 0:
-        raise ValueError(f"resolved weight window must be non-negative, got {weight_window_bytes}")
 
     total_tiles = n // n_tile
-    ranges = max(1, min(fallback_ranges, total_tiles))
-    if weight_window_bytes > 0:
-        bytes_per_tile = k * n_tile * 2
-        max_tiles_per_window = max(1, weight_window_bytes // bytes_per_tile)
-        ranges = math.ceil(total_tiles / max_tiles_per_window)
+    if ranges > total_tiles:
+        raise ValueError(f"ranges must not exceed the {total_tiles} N tiles")
 
     owned_tiles = 0
     for range_index in range(ranges):
@@ -76,8 +68,6 @@ def annotate_gemm_throughput(
     hidden_size: int,
     intermediate_size: int,
     n_tile: int,
-    w13_split: bool,
-    inherited_weight_window_bytes: int,
     color_max_gflops: float,
 ) -> dict[str, Any]:
     """Attach logical per-core GEMM work and measured throughput to each segment."""
@@ -114,23 +104,18 @@ def annotate_gemm_throughput(
             if kind == "w13":
                 k = hidden_size
                 n = 2 * intermediate_size
-                fallback_ranges = 2 if w13_split else 1
             else:
                 k = intermediate_size
                 n = hidden_size
-                fallback_ranges = 1
-            configured_window = int(task.get(f"{kind}_window_bytes", -1))
-            resolved_window = inherited_weight_window_bytes if configured_window < 0 else configured_window
+            ranges = int(task[f"{kind}_ranges"])
             threads = observed_team_sizes[task_id, kind]
             local_tid = int(segment["local_tid"])
             n_columns = _owned_n_columns(
                 n=n,
-                k=k,
                 n_tile=n_tile,
                 threads=threads,
                 local_tid=local_tid,
-                weight_window_bytes=resolved_window,
-                fallback_ranges=fallback_ranges,
+                ranges=ranges,
             )
             rows = int(task["routes"])
             logical_flops = 2 * rows * k * n_columns
@@ -300,8 +285,6 @@ def enrich_actual_timeline(
         hidden_size=int(case["hidden_size"]),
         intermediate_size=int(case["intermediate_size"]),
         n_tile=int(case.get("backend_n_tile", 8)),
-        w13_split=bool(plan["w13_split"]),
-        inherited_weight_window_bytes=int(plan["weight_window_bytes"]),
         color_max_gflops=color_max,
     )
     compute_idle_metrics(actual, cores=len(case["cpu_ids"]))

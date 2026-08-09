@@ -21,8 +21,8 @@ def test_annotate_gemm_throughput_assigns_per_core_n_work() -> None:
             "task": 0,
             "routes": 4,
             "threads": 2,
-            "w13_window_bytes": -1,
-            "w2_window_bytes": -1,
+            "w13_ranges": 2,
+            "w2_ranges": 1,
         }
     ]
     actual = {
@@ -47,8 +47,6 @@ def test_annotate_gemm_throughput_assigns_per_core_n_work() -> None:
         hidden_size=32,
         intermediate_size=16,
         n_tile=8,
-        w13_split=True,
-        inherited_weight_window_bytes=0,
         color_max_gflops=400.0,
     )
 

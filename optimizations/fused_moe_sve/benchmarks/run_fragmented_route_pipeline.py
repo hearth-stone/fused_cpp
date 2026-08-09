@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Sweep route fragmentation while total FLOPs and active split-W13 B stay fixed."""
+"""Sweep route fragmentation while total FLOPs and active range-local B stay fixed."""
 
 from __future__ import annotations
 
@@ -281,7 +281,7 @@ def main() -> int:
 
     payload = {
         "schema_version": 1,
-        "kind": "split_w13_fixed_active_b_route_fragmentation",
+        "kind": "stage_range_fixed_active_b_route_fragmentation",
         "target": {
             "hostname": platform.node(),
             "machine": platform.machine(),
@@ -312,7 +312,7 @@ def main() -> int:
                 "teams * threads_per_team workers",
                 "teams * base_routes total routes",
                 "6 * total_routes * hidden * intermediate FLOPs",
-                "teams * 2 * hidden * intermediate active split-W13/W2 B bytes",
+                "teams * 2 * hidden * intermediate active W13/W2 range bytes",
             ],
         },
         "rows": rows,

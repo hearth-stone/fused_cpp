@@ -165,7 +165,6 @@ def main() -> int:
     topk_weights = torch.softmax(torch.randn((args.tokens, args.top_k), generator=generator), dim=-1)
 
     os.environ["FUSED_CPP_MOE_SVE"] = "1"
-    os.environ["FUSED_CPP_MOE_W13_SPLIT_N"] = "1"
     os.environ["FUSED_CPP_MOE_W2_BF16_ROUTE"] = "0"
     os.environ["FUSED_CPP_MOE_SVE_W2_DIRECT_ROUTE"] = "1"
     os.environ["FUSED_CPP_MOE_SVE_ROUTE_MERGE_UNROLL"] = "1"
@@ -196,7 +195,8 @@ def main() -> int:
             thread_cpu_ids=thread_cpu_ids,
             num_threads=args.threads,
             global_num_experts=args.experts,
-            w13_split=True,
+            w13_ranges=2,
+            w2_ranges=1,
         )
 
     outputs: dict[str, torch.Tensor] = {}

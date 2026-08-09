@@ -80,7 +80,6 @@ def main() -> int:
     topk_weights = torch.softmax(logits, dim=-1)
 
     os.environ["FUSED_CPP_MOE_SVE"] = "1"
-    os.environ["FUSED_CPP_MOE_W13_SPLIT_N"] = "1"
     os.environ["FUSED_CPP_MOE_W2_BF16_ROUTE"] = "1" if args.bf16_route else "0"
     os.environ["FUSED_CPP_MOE_PIN_THREADS"] = "1"
     os.environ["FUSED_CPP_MOE_PIN_THREAD_CPUS"] = ",".join(str(cpu) for cpu in affinity[: args.threads])
@@ -146,7 +145,8 @@ def main() -> int:
                 num_threads=args.threads,
                 global_num_experts=args.experts,
                 activation="silu",
-                w13_split=True,
+                w13_ranges=2,
+                w2_ranges=1,
             )
 
     outputs: dict[str, torch.Tensor] = {}

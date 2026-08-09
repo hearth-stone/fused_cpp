@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Measure split-W13 packed-B working sets under several thread mappings."""
+"""Measure exact-range packed-B working sets under several thread mappings."""
 
 from __future__ import annotations
 
@@ -71,7 +71,7 @@ def parse_experiments(text: str) -> list[str]:
 
 
 def stage_bytes(hidden: int, intermediate: int) -> int:
-    """Return max(split-W13 chunk, W2) packed-B bytes for one expert."""
+    """Return max(W13 range, W2 range) packed-B bytes for one expert."""
     return 2 * hidden * intermediate
 
 
@@ -455,7 +455,7 @@ def main() -> int:
 
     payload = {
         "schema_version": 1,
-        "kind": "split_w13_thread_weight_working_set",
+        "kind": "stage_range_thread_weight_working_set",
         "target": {
             "hostname": platform.node(),
             "machine": platform.machine(),
@@ -484,7 +484,7 @@ def main() -> int:
             "runs": args.runs,
             "copies": copies,
             "weight_reuse": "one distinct packed-weight copy per warmup and timed invocation",
-            "working_set_definition": "active experts * max(split-W13 chunk bytes, W2 bytes)",
+            "working_set_definition": "active experts * max(W13 range bytes, W2 range bytes)",
         },
         "rows": rows,
     }

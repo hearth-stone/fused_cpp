@@ -38,7 +38,7 @@ from fused_cpp.moe import (  # noqa: E402
 )
 from fused_cpp.moe.plan import upgrade_legacy_async_plan  # noqa: E402
 from stage_window_policy import AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V4  # noqa: E402
-from weight_window import fused_moe_task_weight_windows  # noqa: E402
+from weight_window import stage_weight_window_geometry  # noqa: E402
 
 
 DEFAULT_ROUTES = (
@@ -132,18 +132,22 @@ def build_plan(
         }
     )
     bridge["early_merge"] = False
-    bridge["task_w13_window_bytes"] = [w13_target] * experts
-    bridge["task_w2_window_bytes"] = [w2_target] * experts
-
-    w13_geometry, w2_geometry = fused_moe_task_weight_windows(
-        hidden_size=4096,
-        intermediate_size=512,
+    w13_geometry = stage_weight_window_geometry(
+        k=4096,
+        n=2 * 512,
         n_tile=8,
-        inherited_target_bytes=0,
-        w13_target_bytes=w13_target,
-        w2_target_bytes=w2_target,
-        w13_fallback_ranges=2,
+        target_bytes=max(w13_target, 0),
+        fallback_ranges=2,
     )
+    w2_geometry = stage_weight_window_geometry(
+        k=512,
+        n=4096,
+        n_tile=8,
+        target_bytes=max(w2_target, 0),
+        fallback_ranges=1,
+    )
+    bridge["task_w13_ranges"] = [w13_geometry.ranges] * experts
+    bridge["task_w2_ranges"] = [w2_geometry.ranges] * experts
     geometry = {
         "w13_target_bytes": w13_target,
         "w2_target_bytes": w2_target,
@@ -204,8 +208,6 @@ def benchmark_point(
             activation="silu",
             global_num_experts=256,
             skip_weighted=True,
-            w13_split=True,
-            weight_window_bytes=0,
             out=output,
         )
 
@@ -292,7 +294,6 @@ def main() -> int:
         raise ValueError("warmup must be non-negative and runs must be positive")
 
     torch.set_num_threads(1)
-    os.environ["FUSED_CPP_MOE_W13_SPLIT_N"] = "1"
     os.environ["FUSED_CPP_MOE_SVE_IMPL"] = "jit"
     generator = torch.Generator().manual_seed(args.seed)
     w13 = torch.empty((args.num_experts, 1024, 4096), dtype=torch.bfloat16).normal_(
@@ -423,8 +424,8 @@ def main() -> int:
             "backend": "sve",
             "sve_implementation": "jit",
             "m_tail_policy": "xbyak_exact_m",
-            "w13_split": True,
-            "w13_split_chunks": 2,
+            "w13_window_ranges": 2,
+            "w2_window_ranges": 1,
             "stage_window_policy": AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V4.name,
             "backend_n_tile": int(packed.backend_n_tile),
             "extension": str(extension),

@@ -333,7 +333,6 @@ def main() -> int:
     topk_weights = torch.softmax(torch.randn((tokens, top_k), generator=generator), dim=-1)
 
     os.environ["FUSED_CPP_MOE_SVE"] = "1"
-    os.environ["FUSED_CPP_MOE_W13_SPLIT_N"] = "1"
     os.environ["FUSED_CPP_MOE_ASYNC_READY_TOKEN_MERGE"] = "0"
     os.environ["FUSED_CPP_MOE_SVE_W2_DIRECT_ROUTE"] = "1"
     os.environ["FUSED_CPP_MOE_W2_BF16_ROUTE"] = "1"
@@ -354,7 +353,6 @@ def main() -> int:
             topk_ids,
             plans[name],
             global_num_experts=num_experts,
-            w13_split=True,
             out=outputs[name],
         )
 

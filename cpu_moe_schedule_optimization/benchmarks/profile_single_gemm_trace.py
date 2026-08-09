@@ -116,7 +116,7 @@ def main() -> int:
     packed = prepare_fused_moe_bf16_tiled_weights(w13, w2)
 
     print(f"shape H={args.hidden_size} F={args.ffn_hidden_size}; stage latency=max(thread_slice_ms)")
-    print("routes threads split_w13 split_w2 w13_ms w2_ms gemm_sum_ms full_call_ms speedup_vs_t1")
+    print("routes threads axis_w13 axis_w2 w13_ms w2_ms gemm_sum_ms full_call_ms speedup_vs_t1")
 
     baseline_by_routes: Dict[int, float] = {}
     for routes in routes_list:
@@ -179,10 +179,10 @@ def main() -> int:
             if threads == 1:
                 baseline_by_routes[routes] = gemm_ms
             speedup = baseline_by_routes.get(routes, gemm_ms) / gemm_ms
-            split_w13 = "M" if routes > 2 * args.ffn_hidden_size else "N"
-            split_w2 = "M" if routes > args.hidden_size else "N"
+            axis_w13 = "M" if routes > 2 * args.ffn_hidden_size else "N"
+            axis_w2 = "M" if routes > args.hidden_size else "N"
             print(
-                f"{routes:<6} {threads:<7} {split_w13:<8} {split_w2:<7} "
+                f"{routes:<6} {threads:<7} {axis_w13:<8} {axis_w2:<7} "
                 f"{w13_ms:7.3f} {w2_ms:7.3f} {gemm_ms:11.3f} "
                 f"{full_ms:12.3f} {speedup:12.3f}",
                 flush=True,

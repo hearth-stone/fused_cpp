@@ -673,17 +673,18 @@ def make_production_schedule(
     policy = model.policy
     if policy is None:
         raise ValueError(f"production profile must use schema v2: {profile}")
-    expected = (hidden, intermediate, experts, threads, True)
+    expected = (hidden, intermediate, experts, threads, 2, 1)
     actual = (
         policy.hidden_size,
         policy.intermediate_size,
         policy.local_experts,
         policy.cores_per_rank,
-        policy.w13_split,
+        policy.w13_window_ranges,
+        policy.w2_window_ranges,
     )
     if actual != expected:
         raise ValueError(
-            "production profile hidden/intermediate/local-experts/cores/split mismatch: "
+            "production profile hidden/intermediate/local-experts/cores/ranges mismatch: "
             f"expected {expected}, got {actual}"
         )
 
@@ -720,12 +721,13 @@ def make_production_schedule(
         static_spec = static_planner.plan_spec_for(counts)
         static_bridge = static_spec["bridge"]
         static_stage_window_plan = AsyncMoEPlanV2.from_dict(static_bridge)
-        window_pairs = list(
+        range_pairs = list(
             zip(
-                static_bridge["task_w13_window_bytes"],
-                static_bridge["task_w2_window_bytes"],
+                static_bridge["task_w13_ranges"],
+                static_bridge["task_w2_ranges"],
             )
         )
+        baseline_ranges = int(static_spec["w13_ranges"]), int(static_spec["w2_ranges"])
         static_stage_window_metadata = {
             "name": AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V1.name,
             "shape": list(static_spec["shape"]),
@@ -735,8 +737,8 @@ def make_production_schedule(
             "tail_repartition_width": static_spec["tail_repartition_width"],
             "tail_repartition_tasks": static_spec["tail_repartition_tasks"],
             "tail_repartition_route_slices": static_spec["tail_repartition_route_slices"],
-            "overridden_tasks": sum(w13 >= 0 or w2 >= 0 for w13, w2 in window_pairs),
-            "window_pairs": sorted({f"{w13}:{w2}" for w13, w2 in window_pairs if w13 >= 0 or w2 >= 0}),
+            "overridden_tasks": sum(pair != baseline_ranges for pair in range_pairs),
+            "range_pairs": sorted({f"{w13}:{w2}" for w13, w2 in range_pairs}),
         }
     tail_pool_plan = None
     if tail_pool_threads is not None:
@@ -796,7 +798,8 @@ def make_production_schedule(
             "tail_repartition_tasks": auto_spec["tail_repartition_tasks"],
             "tail_repartition_route_slices": auto_spec["tail_repartition_route_slices"],
             "tail_repartition_candidates": cold_auto_metadata["tail_repartition_candidates"],
-            "w13_split": bool(auto_spec["w13_split"]),
+            "w13_ranges": int(auto_spec["w13_ranges"]),
+            "w2_ranges": int(auto_spec["w2_ranges"]),
             "cold_plan_ms": cold_plan_ns / 1.0e6,
             "warm_plan_ms": warm_plan_ns / 1.0e6,
             "static_stage_windows": static_stage_window_metadata,
@@ -906,7 +909,7 @@ def main() -> int:
             requested_team_threads=args.team_threads,
         )
         team_threads = int(schedule[2][0])
-        w13_split = True
+        w13_ranges, w2_ranges = 2, 1
     else:
         baseline_variant = "production_strict"
         (
@@ -932,7 +935,8 @@ def main() -> int:
             static_stage_windows=args.static_stage_windows,
         )
         team_threads = None
-        w13_split = bool(planner_metadata["w13_split"])
+        w13_ranges = int(planner_metadata["w13_ranges"])
+        w2_ranges = int(planner_metadata["w2_ranges"])
         if elastic_transitions is not None:
             assert production_plan is not None
             for timeout_us in elastic_timeouts_us:
@@ -1033,7 +1037,6 @@ def main() -> int:
     topk_weights = torch.softmax(torch.randn((args.tokens, args.top_k), generator=generator), dim=-1)
 
     os.environ["FUSED_CPP_MOE_SVE"] = "1"
-    os.environ["FUSED_CPP_MOE_W13_SPLIT_N"] = "1"
     os.environ["FUSED_CPP_MOE_ASYNC_READY_TOKEN_MERGE"] = "1" if ready_token_merge else "0"
     os.environ["FUSED_CPP_MOE_SVE_W2_DIRECT_ROUTE"] = "1"
     os.environ["FUSED_CPP_MOE_W2_BF16_ROUTE"] = "1" if args.route_dtype == "bf16" else "0"
@@ -1069,7 +1072,6 @@ def main() -> int:
                 topk_ids,
                 static_tail_plans[name],
                 global_num_experts=args.experts,
-                w13_split=w13_split,
                 out=outputs[name],
             )
         if name in elastic_plans:
@@ -1080,7 +1082,6 @@ def main() -> int:
                 topk_ids,
                 elastic_plans[name],
                 global_num_experts=args.experts,
-                w13_split=w13_split,
                 out=outputs[name],
                 elastic_stats_out=elastic_stats[name],
             )
@@ -1095,7 +1096,6 @@ def main() -> int:
                 selected[0],
                 selected[1],
                 global_num_experts=args.experts,
-                w13_split=w13_split,
                 out=outputs[name],
             )
         if name == DYNAMIC_POOL_VARIANT:
@@ -1107,7 +1107,6 @@ def main() -> int:
                 topk_ids,
                 tail_pool_plan,
                 global_num_experts=args.experts,
-                w13_split=w13_split,
                 out=outputs[name],
             )
         if name == AUTO_VARIANT or name in ready_token_policy_variants:
@@ -1119,7 +1118,6 @@ def main() -> int:
                 topk_ids,
                 auto_plan,
                 global_num_experts=args.experts,
-                w13_split=w13_split,
                 out=outputs[name],
             )
         if name == STATIC_STAGE_WINDOW_VARIANT:
@@ -1131,7 +1129,6 @@ def main() -> int:
                 topk_ids,
                 static_stage_window_plan,
                 global_num_experts=args.experts,
-                w13_split=w13_split,
                 out=outputs[name],
             )
         if name == baseline_variant and production_plan is not None:
@@ -1142,7 +1139,6 @@ def main() -> int:
                 topk_ids,
                 production_plan,
                 global_num_experts=args.experts,
-                w13_split=w13_split,
                 out=outputs[name],
             )
         if name != VLLM_VARIANT:
@@ -1159,7 +1155,8 @@ def main() -> int:
                 thread_cpu_ids=thread_cpu_ids,
                 num_threads=args.threads,
                 global_num_experts=args.experts,
-                w13_split=w13_split,
+                w13_ranges=w13_ranges,
+                w2_ranges=w2_ranges,
                 out=outputs[name],
             )
         return fused_moe_bf16_tiled_vllm_staged(
@@ -1264,7 +1261,8 @@ def main() -> int:
         },
         "method": {
             "baseline_variant": baseline_variant,
-            "w13_split": w13_split,
+            "w13_ranges": w13_ranges,
+            "w2_ranges": w2_ranges,
             "async_ready_token_merge": ready_token_merge,
             "ready_token_policy_sweep": {
                 name: {

@@ -77,7 +77,7 @@ def parse_trace(path: Path, stage_aliases: tuple[str, ...]) -> list[float]:
     return [max(values) for _, values in sorted(by_call.items()) if values]
 
 
-def choose_w13_split(rows: int, n_cols: int, threads: int) -> str:
+def choose_w13_parallel_axis(rows: int, n_cols: int, threads: int) -> str:
     if threads <= 1:
         return "N"
     if threads == 8 and rows >= 512:
@@ -105,7 +105,7 @@ def w13_kernel_memory(
     k: int,
     ffn_hidden_size: int,
     threads: int,
-    split: str,
+    parallel_axis: str,
     m_panel: int,
     bytes_a: int = 2,
     bytes_b: int = 2,
@@ -114,7 +114,7 @@ def w13_kernel_memory(
 ) -> KernelMemory:
     n = 2 * ffn_hidden_size
     m_panels = math.ceil(m / m_panel)
-    n_partitions = threads if split == "N" else 1
+    n_partitions = threads if parallel_axis == "N" else 1
     a_read = m * k * bytes_a * n_partitions
     b_read = m_panels * k * n * bytes_b
     # Fused W13 stores the SiLU(up/gate) product, i.e. F columns, not 2F.
@@ -135,7 +135,7 @@ class RooflineRow:
     n: int
     k: int
     threads: int
-    split: str
+    parallel_axis: str
     m_panels: int
     n_partitions: int
     w13_ms: float
@@ -156,7 +156,7 @@ def make_row(
     hidden_size: int,
     ffn_hidden_size: int,
     threads: int,
-    split: str,
+    parallel_axis: str,
     m_panel: int,
     w13_ms: float,
     peak_tflops: float | None,
@@ -170,7 +170,7 @@ def make_row(
         k=hidden_size,
         ffn_hidden_size=ffn_hidden_size,
         threads=threads,
-        split=split,
+        parallel_axis=parallel_axis,
         m_panel=m_panel,
         include_c_write=include_c_write,
     )
@@ -188,7 +188,7 @@ def make_row(
         n=n,
         k=hidden_size,
         threads=threads,
-        split=split,
+        parallel_axis=parallel_axis,
         m_panels=mem.m_panels,
         n_partitions=mem.n_partitions,
         w13_ms=w13_ms,
@@ -268,13 +268,13 @@ def format_optional(value: float | None, fmt: str) -> str:
 
 def print_table(rows: list[RooflineRow]) -> None:
     print(
-        "M     N     K     T   split panels npart  w13_ms  TFLOP/s  "
+        "M     N     K     T   axis  panels npart  w13_ms  TFLOP/s  "
         "AI(F/B)  BWreq(GB/s)  roof(T) util   A_MiB   B_MiB   C_MiB"
     )
     for r in rows:
         print(
             f"{r.m:<5} {r.n:<5} {r.k:<5} {r.threads:<3} "
-            f"{r.split:<5} {r.m_panels:<6} {r.n_partitions:<5} "
+            f"{r.parallel_axis:<5} {r.m_panels:<6} {r.n_partitions:<5} "
             f"{r.w13_ms:7.3f} {r.tflops:8.3f} "
             f"{r.ai_flop_per_byte:8.2f} {r.bandwidth_gbs:11.1f} "
             f"{format_optional(r.roofline_tflops, '7.3f')} "
@@ -350,12 +350,12 @@ def main() -> int:
         f"{' + Cwrite' if not args.no_c_write else ''}"
     )
     print(
-        "M     N     K     T   split panels npart  w13_ms  TFLOP/s  "
+        "M     N     K     T   axis  panels npart  w13_ms  TFLOP/s  "
         "AI(F/B)  BWreq(GB/s)  roof(T) util   A_MiB   B_MiB   C_MiB"
     )
     for routes in routes_list:
         for threads in threads_list:
-            split = choose_w13_split(routes, 2 * args.ffn_hidden_size, threads)
+            parallel_axis = choose_w13_parallel_axis(routes, 2 * args.ffn_hidden_size, threads)
             w13_ms = measure_w13_ms(
                 hidden_size=args.hidden_size,
                 ffn_hidden_size=args.ffn_hidden_size,
@@ -374,7 +374,7 @@ def main() -> int:
                     hidden_size=args.hidden_size,
                     ffn_hidden_size=args.ffn_hidden_size,
                     threads=threads,
-                    split=split,
+                    parallel_axis=parallel_axis,
                     m_panel=args.m_panel,
                     w13_ms=w13_ms,
                     peak_tflops=args.peak_tflops,
@@ -385,7 +385,7 @@ def main() -> int:
             row = rows[-1]
             print(
                 f"{row.m:<5} {row.n:<5} {row.k:<5} {row.threads:<3} "
-                f"{row.split:<5} {row.m_panels:<6} {row.n_partitions:<5} "
+                f"{row.parallel_axis:<5} {row.m_panels:<6} {row.n_partitions:<5} "
                 f"{row.w13_ms:7.3f} {row.tflops:8.3f} "
                 f"{row.ai_flop_per_byte:8.2f} {row.bandwidth_gbs:11.1f} "
                 f"{format_optional(row.roofline_tflops, '7.3f')} "

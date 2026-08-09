@@ -107,25 +107,34 @@ def candidate_pairs(policy, model: AnalyticMoeCostModel, routes: int, threads: i
         for w2 in neighbors(w2_rows, selected_resolved[1]):
             add((w13, w2), "local_cross")
 
-    result: list[dict] = []
+    result_by_ranges: dict[tuple[int, int], dict] = {}
     for pair, labels in candidates.items():
         w13_score = model.score_stage_window("w13", routes, threads, pair[0])
         w2_score = model.score_stage_window("w2", routes, threads, pair[1])
-        result.append(
-            {
-                "w13_target_bytes": pair[0],
-                "w2_target_bytes": pair[1],
-                "labels": sorted(labels),
-                "analytic_objective_ns": w13_score.objective_ns + w2_score.objective_ns,
-                "analytic_w13_objective_ns": w13_score.objective_ns,
-                "analytic_w2_objective_ns": w2_score.objective_ns,
-                "w13_worker_bytes": w13_score.worker_bytes,
-                "w2_worker_bytes": w2_score.worker_bytes,
-                "w13_ranges": w13_score.ranges,
-                "w2_ranges": w2_score.ranges,
-            }
-        )
-    return sorted(result, key=lambda item: (item["analytic_objective_ns"], item["w13_target_bytes"], item["w2_target_bytes"]))
+        item = {
+            "w13_target_bytes": pair[0],
+            "w2_target_bytes": pair[1],
+            "labels": sorted(labels),
+            "analytic_objective_ns": w13_score.objective_ns + w2_score.objective_ns,
+            "analytic_w13_objective_ns": w13_score.objective_ns,
+            "analytic_w2_objective_ns": w2_score.objective_ns,
+            "w13_worker_bytes": w13_score.worker_bytes,
+            "w2_worker_bytes": w2_score.worker_bytes,
+            "w13_ranges": w13_score.ranges,
+            "w2_ranges": w2_score.ranges,
+        }
+        key = w13_score.ranges, w2_score.ranges
+        previous = result_by_ranges.get(key)
+        if previous is None or item["analytic_objective_ns"] < previous["analytic_objective_ns"]:
+            if previous is not None:
+                item["labels"] = sorted(set(item["labels"]) | set(previous["labels"]))
+            result_by_ranges[key] = item
+        else:
+            previous["labels"] = sorted(set(previous["labels"]) | set(item["labels"]))
+    return sorted(
+        result_by_ranges.values(),
+        key=lambda item: (item["analytic_objective_ns"], item["w13_ranges"], item["w2_ranges"]),
+    )
 
 
 def build_plan(
@@ -133,8 +142,8 @@ def build_plan(
     experts: int,
     threads: int,
     cpu_ids: list[int],
-    w13_target: int,
-    w2_target: int,
+    w13_ranges: int,
+    w2_ranges: int,
     start_lane: int,
 ) -> AsyncMoEPlanV2:
     if len(cpu_ids) % threads:
@@ -172,8 +181,8 @@ def build_plan(
         }
     )
     bridge["early_merge"] = False
-    bridge["task_w13_window_bytes"] = [w13_target] * experts
-    bridge["task_w2_window_bytes"] = [w2_target] * experts
+    bridge["task_w13_ranges"] = [w13_ranges] * experts
+    bridge["task_w2_ranges"] = [w2_ranges] * experts
     return AsyncMoEPlanV2.from_dict(bridge)
 
 
@@ -226,7 +235,6 @@ def main() -> int:
         raise RuntimeError("analytical model did not generate a stage-window policy")
 
     torch.set_num_threads(1)
-    os.environ["FUSED_CPP_MOE_W13_SPLIT_N"] = "1"
     os.environ["FUSED_CPP_MOE_SVE_IMPL"] = "jit"
     generator = torch.Generator().manual_seed(args.seed)
     w13 = torch.empty(
@@ -272,8 +280,8 @@ def main() -> int:
                         experts=args.measurement_experts,
                         threads=threads,
                         cpu_ids=cpu_ids,
-                        w13_target=point["w13_target_bytes"],
-                        w2_target=point["w2_target_bytes"],
+                        w13_ranges=point["w13_ranges"],
+                        w2_ranges=point["w2_ranges"],
                         start_lane=start,
                     )
                     for start in range(min(lanes, args.warmup + args.runs))
@@ -299,8 +307,6 @@ def main() -> int:
                         activation="silu",
                         global_num_experts=args.measurement_experts,
                         skip_weighted=True,
-                        w13_split=True,
-                        weight_window_bytes=0,
                         out=output[:rows],
                     )
                     _ = float(result.flatten()[0])

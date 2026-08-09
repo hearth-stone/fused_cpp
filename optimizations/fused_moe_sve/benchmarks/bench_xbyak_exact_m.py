@@ -150,7 +150,6 @@ def main() -> int:
 
     torch.set_num_threads(1)
     os.environ["FUSED_CPP_MOE_SVE"] = "1"
-    os.environ["FUSED_CPP_MOE_W13_SPLIT_N"] = "1"
     os.environ["FUSED_CPP_MOE_W2_BF16_ROUTE"] = "0"
     prewarm_variant = "jit-bulk" if "jit-bulk" in variants else next(
         (variant for variant in variants if variant != "asm"), "asm"

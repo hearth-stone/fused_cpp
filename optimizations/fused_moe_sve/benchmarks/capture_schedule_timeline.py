@@ -165,8 +165,8 @@ def materialized_plan_tasks(plan: AsyncMoEPlanV2, histogram: list[int] | tuple[i
     threads = plan.task_threads.tolist()
     placement_modes = plan.task_placement_modes.tolist()
     range_granularities = plan.task_range_granularities.tolist()
-    w13_windows = plan.task_w13_window_bytes.tolist()
-    w2_windows = plan.task_w2_window_bytes.tolist()
+    w13_ranges = plan.task_w13_ranges.tolist()
+    w2_ranges = plan.task_w2_ranges.tolist()
     covered_rows = [0] * len(histogram)
     tasks: list[dict[str, Any]] = []
     for task, expert in enumerate(experts):
@@ -197,8 +197,8 @@ def materialized_plan_tasks(plan: AsyncMoEPlanV2, histogram: list[int] | tuple[i
                 "dependencies": [
                     int(value) for value in dependencies[offsets[task] : offsets[task + 1]]
                 ],
-                "w13_window_bytes": int(w13_windows[task]),
-                "w2_window_bytes": int(w2_windows[task]),
+                "w13_ranges": int(w13_ranges[task]),
+                "w2_ranges": int(w2_ranges[task]),
             }
         )
     for expert, total_routes in enumerate(histogram):
@@ -497,8 +497,8 @@ def build_plan(args: argparse.Namespace) -> tuple[dict[str, Any], ContentionCost
             "execution_mode": spec["execution_mode"],
             "shape": list(spec["shape"]),
             "task_stage_window_policy": spec["task_stage_window_policy"],
-            "w13_split": bool(spec["w13_split"]),
-            "weight_window_bytes": int(spec["weight_window_bytes"]),
+            "w13_ranges": int(spec["w13_ranges"]),
+            "w2_ranges": int(spec["w2_ranges"]),
             "tail_repartition_width": spec["tail_repartition_width"],
             "tail_repartition_tasks": int(spec["tail_repartition_tasks"]),
             "tail_repartition_route_slices": int(spec["tail_repartition_route_slices"]),
@@ -624,7 +624,6 @@ def capture_actual(
     )
 
     os.environ["FUSED_CPP_MOE_SVE"] = "1"
-    os.environ["FUSED_CPP_MOE_W13_SPLIT_N"] = "1"
     os.environ["FUSED_CPP_MOE_ASYNC_READY_TOKEN_MERGE"] = "1"
     os.environ["FUSED_CPP_MOE_SVE_W2_DIRECT_ROUTE"] = "1"
     os.environ["FUSED_CPP_MOE_W2_BF16_ROUTE"] = "1" if args.route_dtype == "bf16" else "0"
@@ -652,8 +651,6 @@ def capture_actual(
             topk_ids,
             plan,
             global_num_experts=workload.num_experts,
-            w13_split=bool(payload["plan"]["w13_split"]),
-            weight_window_bytes=int(payload["plan"]["weight_window_bytes"]),
             out=output,
         )
 

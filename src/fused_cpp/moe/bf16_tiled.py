@@ -382,7 +382,7 @@ def fused_moe_bf16_tiled(
     output allocation or copy. The x86 BF16 backends support up to 256 requested
     workers: balanced active experts run independently when there are enough
     experts; underfilled or strongly skewed routes form per-expert teams/waves
-    and split W13/W2 over N blocks.
+    and partition W13/W2 over N blocks.
     """
     _require_backend()
     if input.dtype != torch.bfloat16:

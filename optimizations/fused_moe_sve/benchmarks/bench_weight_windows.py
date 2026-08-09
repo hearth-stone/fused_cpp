@@ -71,14 +71,14 @@ def parse_window_pairs(args: argparse.Namespace) -> list[tuple[int, int]]:
     ]
 
 
-def window_shape(k: int, n: int, n_tile: int, requested_bytes: int, legacy_ranges: int) -> tuple[int, int]:
+def window_shape(k: int, n: int, n_tile: int, requested_bytes: int, baseline_ranges: int) -> tuple[int, int]:
     total_tiles = n // n_tile
     if requested_bytes > 0:
         bytes_per_tile = k * n_tile * BF16_BYTES
         max_tiles = max(1, requested_bytes // bytes_per_tile)
         ranges = (total_tiles + max_tiles - 1) // max_tiles
     else:
-        ranges = legacy_ranges
+        ranges = baseline_ranges
     max_range_tiles = (total_tiles + ranges - 1) // ranges
     return ranges, max_range_tiles * k * n_tile * BF16_BYTES
 
@@ -97,7 +97,6 @@ def main() -> None:
 
     total_threads = args.experts * args.threads_per_expert
     os.environ.setdefault("FUSED_CPP_MOE_SVE", "1")
-    os.environ["FUSED_CPP_MOE_W13_SPLIT_N"] = "1"
     os.environ.setdefault("FUSED_CPP_MOE_SVE_W2_N_OWNER_SCATTER", "1")
     os.environ.setdefault("FUSED_CPP_MOE_W2_BF16_ROUTE", "0")
     torch.set_num_threads(1)
@@ -121,8 +120,20 @@ def main() -> None:
     cpu_ids = torch.arange(args.cpu_start, args.cpu_start + total_threads, dtype=torch.int32)
 
     def invoke(w13_window_bytes: int, w2_window_bytes: int) -> torch.Tensor:
-        os.environ["FUSED_CPP_MOE_EXPERIMENT_W13_WEIGHT_WINDOW_BYTES"] = str(w13_window_bytes)
-        os.environ["FUSED_CPP_MOE_EXPERIMENT_W2_WEIGHT_WINDOW_BYTES"] = str(w2_window_bytes)
+        w13_ranges, _ = window_shape(
+            args.hidden,
+            2 * args.intermediate,
+            packed.backend_n_tile,
+            w13_window_bytes,
+            baseline_ranges=2,
+        )
+        w2_ranges, _ = window_shape(
+            args.intermediate,
+            args.hidden,
+            packed.backend_n_tile,
+            w2_window_bytes,
+            baseline_ranges=1,
+        )
         return fused_moe_bf16_tiled_async(
             hidden,
             packed,
@@ -136,8 +147,8 @@ def main() -> None:
             thread_cpu_ids=cpu_ids,
             num_threads=total_threads,
             skip_weighted=True,
-            w13_split=True,
-            weight_window_bytes=0,
+            w13_ranges=w13_ranges,
+            w2_ranges=w2_ranges,
         )
 
     reference = invoke(*windows[0])
@@ -160,14 +171,14 @@ def main() -> None:
             2 * args.intermediate,
             packed.backend_n_tile,
             w13_window_bytes,
-            legacy_ranges=2,
+            baseline_ranges=2,
         )
         w2_ranges, w2_max_bytes = window_shape(
             args.intermediate,
             args.hidden,
             packed.backend_n_tile,
             w2_window_bytes,
-            legacy_ranges=1,
+            baseline_ranges=1,
         )
         results.append(
             WindowResult(
