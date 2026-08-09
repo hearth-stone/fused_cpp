@@ -428,7 +428,7 @@ def main() -> int:
 
     payload = {
         "schema_version": 1,
-        "kind": "split_working_set_band_validation",
+        "kind": "stage_range_working_set_band_validation",
         "source_profile": str(args.profile),
         "scan_calibration": str(args.scan_csv),
         "holdout_searches": [str(path) for path in args.holdout_search],
