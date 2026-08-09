@@ -265,14 +265,8 @@ def parse_args() -> argparse.Namespace:
         help="Consecutive local experts per call; 0 profiles all local experts.",
     )
     parser.add_argument("--isolated-measurement-experts", type=int, default=8)
-    parser.add_argument("--w13-split", type=int, choices=(0, 1), required=True)
-    parser.add_argument("--w13-split-chunks", type=int, default=2)
-    parser.add_argument(
-        "--weight-window-bytes",
-        type=int,
-        default=0,
-        help="Global packed-B byte window applied to both W13 and W2.",
-    )
+    parser.add_argument("--w13-ranges", type=int, default=1)
+    parser.add_argument("--w2-ranges", type=int, default=1)
     parser.add_argument("--sve-implementation", choices=("jit", "asm"), default="jit")
     parser.add_argument("--cpu-groups", default="0-31;32-63")
     parser.add_argument("--numa-nodes", default="0,1")
@@ -291,10 +285,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    if args.weight_window_bytes < 0:
-        raise ValueError("--weight-window-bytes must be non-negative")
-    if args.weight_window_bytes > 0 and args.w13_split:
-        raise ValueError("positive --weight-window-bytes requires canonical --w13-split 0")
+    if min(args.w13_ranges, args.w2_ranges) <= 0:
+        raise ValueError("--w13-ranges and --w2-ranges must be positive")
     cpu_groups = split_nonempty(args.cpu_groups, ";")
     numa_nodes = [int(value) for value in split_nonempty(args.numa_nodes)]
     if len(cpu_groups) != 2 or len(numa_nodes) != 2:
@@ -348,12 +340,10 @@ def main() -> int:
                     args.parallel_mode,
                     "--parallel-degree",
                     str(args.parallel_degree),
-                    "--w13-split",
-                    str(args.w13_split),
-                    "--w13-split-chunks",
-                    str(args.w13_split_chunks),
-                    "--weight-window-bytes",
-                    str(args.weight_window_bytes),
+                    "--w13-ranges",
+                    str(args.w13_ranges),
+                    "--w2-ranges",
+                    str(args.w2_ranges),
                     "--sve-implementation",
                     args.sve_implementation,
                     "--cpu-ids",

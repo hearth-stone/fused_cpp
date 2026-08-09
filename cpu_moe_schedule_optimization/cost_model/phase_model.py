@@ -25,7 +25,7 @@ try:
         ProfilePolicy,
         ProfileQuery,
     )
-    from weight_window import fused_moe_task_weight_windows
+    from weight_window import stage_weight_window_geometry
 except ImportError:  # pragma: no cover - package-style import
     from .iso_formula import IsoFormula, fit_from_measurements
     from .profile_catalog import (
@@ -33,7 +33,7 @@ except ImportError:  # pragma: no cover - package-style import
         ProfilePolicy,
         ProfileQuery,
     )
-    from .weight_window import fused_moe_task_weight_windows
+    from .weight_window import stage_weight_window_geometry
 
 
 class ContentionCostModel:
@@ -217,8 +217,6 @@ class ContentionCostModel:
         )
         self.w2_bytes = self.w2_chunk_bytes
         self.max_stage_bytes = int(working_set.get("max_weight_stage_bytes_per_expert", 0))
-        self.w13_split_chunks = int(self.policy.w13_split_chunks) if self.policy is not None else 1
-        self.weight_window_bytes = int(self.policy.weight_window_bytes) if self.policy is not None else 0
         self.w13_window_ranges = int(self.policy.w13_window_ranges) if self.policy is not None else 1
         self.w2_window_ranges = int(self.policy.w2_window_ranges) if self.policy is not None else 1
         if self.policy is not None:
@@ -292,14 +290,19 @@ class ContentionCostModel:
         if w13_target == -1 and w2_target == -1:
             return baseline
         assert self.policy is not None
-        w13, w2 = fused_moe_task_weight_windows(
-            hidden_size=self.policy.hidden_size,
-            intermediate_size=self.policy.intermediate_size,
+        w13 = stage_weight_window_geometry(
+            k=self.policy.hidden_size,
+            n=2 * self.policy.intermediate_size,
             n_tile=self.policy.backend_n_tile,
-            inherited_target_bytes=self.weight_window_bytes,
-            w13_target_bytes=int(w13_target),
-            w2_target_bytes=int(w2_target),
-            w13_fallback_ranges=self.w13_split_chunks,
+            target_bytes=max(int(w13_target), 0),
+            fallback_ranges=self.w13_window_ranges,
+        )
+        w2 = stage_weight_window_geometry(
+            k=self.policy.intermediate_size,
+            n=self.policy.hidden_size,
+            n_tile=self.policy.backend_n_tile,
+            target_bytes=max(int(w2_target), 0),
+            fallback_ranges=self.w2_window_ranges,
         )
         return w13.ranges, w13.max_range_bytes, w2.ranges, w2.max_range_bytes
 

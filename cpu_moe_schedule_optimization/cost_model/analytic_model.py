@@ -29,8 +29,7 @@ try:
     from sve_bf16_kernel_model import SveBf16KernelExecution, SveBf16KernelProfile
     from weight_window import (
         WeightWindowGeometry,
-        fused_moe_task_weight_windows,
-        fused_moe_weight_windows,
+        stage_weight_range_geometry,
         stage_weight_window_geometry,
     )
 except ImportError:  # pragma: no cover - package-style import
@@ -38,8 +37,7 @@ except ImportError:  # pragma: no cover - package-style import
     from .sve_bf16_kernel_model import SveBf16KernelExecution, SveBf16KernelProfile
     from .weight_window import (
         WeightWindowGeometry,
-        fused_moe_task_weight_windows,
-        fused_moe_weight_windows,
+        stage_weight_range_geometry,
         stage_weight_window_geometry,
     )
 
@@ -369,9 +367,6 @@ class AnalyticPolicy:
     m_tail_policy: str
     activation: str
     dtype: str
-    w13_split: bool
-    w13_split_chunks: int
-    weight_window_bytes: int
     w13_window_ranges: int
     w2_window_ranges: int
     measurement_experts: int
@@ -399,9 +394,6 @@ class AnalyticPolicy:
             self.concurrent_ranks,
             self.llc_bytes_per_rank,
         )
-
-    def key_without_split(self) -> tuple[object, ...]:
-        return self.key_without_kernel_policy()
 
     def kernel_policy_key(self) -> tuple[object, ...]:
         return ("stage_ranges", self.w13_window_ranges, self.w2_window_ranges)
@@ -671,9 +663,8 @@ class AnalyticMoeCostModel:
         backend_n_tile: int | None = None,
         activation: str = "silu",
         dtype: str = "bf16",
-        w13_split: bool = True,
-        w13_split_chunks: int = 2,
-        weight_window_bytes: int = 0,
+        w13_ranges: int = 1,
+        w2_ranges: int = 1,
         exact_m: bool = True,
         down_output_element_bytes: int = 2,
         supported_widths: Sequence[int] | None = None,
@@ -702,27 +693,26 @@ class AnalyticMoeCostModel:
             raise ValueError(f"analytical SVE model supports only dtype='bf16', got {dtype!r}")
         if down_output_element_bytes <= 0:
             raise ValueError("down_output_element_bytes must be positive")
-        if weight_window_bytes < 0:
-            raise ValueError("weight_window_bytes must be non-negative")
-        if weight_window_bytes > 0 and w13_split:
-            raise ValueError("positive weight_window_bytes uses canonical w13_split=False")
-        if not w13_split and w13_split_chunks != 1:
-            raise ValueError("w13_split_chunks must be one when w13_split is false")
+        if min(w13_ranges, w2_ranges) <= 0:
+            raise ValueError("w13_ranges and w2_ranges must be positive")
 
         self.hidden_size = int(hidden_size)
         self.intermediate_size = int(intermediate_size)
         self.local_experts = int(local_experts)
         self.down_output_element_bytes = int(down_output_element_bytes)
-        self.weight_window_bytes = int(weight_window_bytes)
-        self.w13_split_chunks = int(w13_split_chunks)
         self._exact_m = bool(exact_m)
         self._mapper = SveBf16KernelProfile(n_tile=resolved_n_tile, exact_m=exact_m)
-        self._w13_geometry, self._w2_geometry = fused_moe_weight_windows(
-            hidden_size=self.hidden_size,
-            intermediate_size=self.intermediate_size,
+        self._w13_geometry = stage_weight_range_geometry(
+            k=self.hidden_size,
+            n=2 * self.intermediate_size,
             n_tile=resolved_n_tile,
-            target_bytes=self.weight_window_bytes,
-            w13_fallback_ranges=self.w13_split_chunks,
+            ranges=int(w13_ranges),
+        )
+        self._w2_geometry = stage_weight_range_geometry(
+            k=self.intermediate_size,
+            n=self.hidden_size,
+            n_tile=resolved_n_tile,
+            ranges=int(w2_ranges),
         )
         self.w13_window_ranges = self._w13_geometry.ranges
         self.w2_window_ranges = self._w2_geometry.ranges
@@ -764,9 +754,6 @@ class AnalyticMoeCostModel:
             m_tail_policy="xbyak_exact_m" if exact_m else "static_bucketed",
             activation=str(activation),
             dtype=str(dtype),
-            w13_split=bool(w13_split),
-            w13_split_chunks=self.w13_split_chunks,
-            weight_window_bytes=self.weight_window_bytes,
             w13_window_ranges=self.w13_window_ranges,
             w2_window_ranges=self.w2_window_ranges,
             measurement_experts=0,
@@ -834,15 +821,21 @@ class AnalyticMoeCostModel:
             raise ValueError("task stage-window policy must return -1 or non-negative byte counts")
         if w13_target == -1 and w2_target == -1:
             return self._w13_geometry, self._w2_geometry
-        return fused_moe_task_weight_windows(
-            hidden_size=self.hidden_size,
-            intermediate_size=self.intermediate_size,
+        w13 = stage_weight_window_geometry(
+            k=self.hidden_size,
+            n=2 * self.intermediate_size,
             n_tile=self.policy.backend_n_tile,
-            inherited_target_bytes=self.weight_window_bytes,
-            w13_target_bytes=int(w13_target),
-            w2_target_bytes=int(w2_target),
-            w13_fallback_ranges=self.w13_split_chunks,
+            target_bytes=max(int(w13_target), 0),
+            fallback_ranges=self.w13_window_ranges,
         )
+        w2 = stage_weight_window_geometry(
+            k=self.intermediate_size,
+            n=self.hidden_size,
+            n_tile=self.policy.backend_n_tile,
+            target_bytes=max(int(w2_target), 0),
+            fallback_ranges=self.w2_window_ranges,
+        )
+        return w13, w2
 
     def task_max_stage_bytes(self, routes: int, threads: int) -> int:
         w13, w2 = self._task_weight_geometries(int(routes), int(threads))
@@ -934,12 +927,12 @@ class AnalyticMoeCostModel:
             logical = work.w13
             k = self.hidden_size
             n = 2 * self.intermediate_size
-            fallback_ranges = self.w13_split_chunks
+            fallback_ranges = self.w13_window_ranges
         else:
             logical = work.w2
             k = self.intermediate_size
             n = self.hidden_size
-            fallback_ranges = 1
+            fallback_ranges = self.w2_window_ranges
         geometry = stage_weight_window_geometry(
             k=k,
             n=n,

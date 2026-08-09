@@ -96,6 +96,8 @@
     "parallel_axis": "N",
     "w13_split": false,
     "w13_split_chunks": 1,
+    "w13_window_ranges": 1,
+    "w2_window_ranges": 1,
     "git_available": false,
     "git_commit": null,
     "git_worktree_dirty": null,

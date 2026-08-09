@@ -60,9 +60,8 @@ def _model_from_profile(
         backend_n_tile=int(kernel["backend_n_tile"]),
         activation=str(shape["activation"]),
         dtype=str(shape["dtype"]),
-        w13_split=bool(kernel["w13_split"]),
-        w13_split_chunks=int(kernel["w13_split_chunks"]),
-        weight_window_bytes=int(kernel.get("weight_window_bytes", 0)),
+        w13_ranges=int(kernel["w13_window_ranges"]),
+        w2_ranges=int(kernel["w2_window_ranges"]),
         exact_m=exact_m,
         down_output_element_bytes=down_output_element_bytes,
     )

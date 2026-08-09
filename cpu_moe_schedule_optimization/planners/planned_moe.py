@@ -231,17 +231,14 @@ class PlannedMoE:
             "tail_repartition_width": tail_repartition_width,
             "tail_repartition_tasks": tail_repartition_tasks,
             "tail_repartition_route_slices": tail_repartition_route_slices,
-            "w13_split": (model.policy.w13_split if model.policy is not None else None),
-            "weight_window_bytes": (model.policy.weight_window_bytes if model.policy is not None else None),
+            "w13_ranges": (model.policy.w13_window_ranges if model.policy is not None else None),
+            "w2_ranges": (model.policy.w2_window_ranges if model.policy is not None else None),
             "task_stage_window_policy": (
                 stage_window_policy.name if stage_window_policy is not None else None
             ),
             "policy": (
                 {
                     "profile": str(model.profile_path),
-                    "w13_split": model.policy.w13_split,
-                    "w13_split_chunks": model.policy.w13_split_chunks,
-                    "weight_window_bytes": model.policy.weight_window_bytes,
                     "w13_window_ranges": model.policy.w13_window_ranges,
                     "w2_window_ranges": model.policy.w2_window_ranges,
                 }
@@ -358,8 +355,8 @@ class PlannedMoE:
             "tail_repartition_tasks": result.get("tail_repartition_tasks", 0),
             "tail_repartition_route_slices": result.get("tail_repartition_route_slices", 1),
             "shape": tuple(result["shape"]),
-            "w13_split": result.get("w13_split"),
-            "weight_window_bytes": result.get("weight_window_bytes"),
+            "w13_ranges": result.get("w13_ranges", result.get("w13_window_ranges")),
+            "w2_ranges": result.get("w2_ranges", result.get("w2_window_ranges")),
             "task_stage_window_policy": result.get("task_stage_window_policy"),
             "policy": result.get("policy"),
             "planner_backend": result.get("planner_backend", "cache"),
@@ -379,12 +376,12 @@ class PlannedMoE:
             "tail_repartition_width": result.get("tail_repartition_width"),
             "tail_repartition_tasks": result.get("tail_repartition_tasks", 0),
             "tail_repartition_route_slices": result.get("tail_repartition_route_slices", 1),
-            "w13_split": result.get("w13_split"),
-            "weight_window_bytes": result.get("weight_window_bytes"),
+            "w13_ranges": result.get("w13_ranges", result.get("w13_window_ranges")),
+            "w2_ranges": result.get("w2_ranges", result.get("w2_window_ranges")),
             "task_stage_window_policy": result.get("task_stage_window_policy"),
             "operator_options": {
-                "w13_split": result.get("w13_split"),
-                "weight_window_bytes": result.get("weight_window_bytes"),
+                "w13_ranges": result.get("w13_ranges", result.get("w13_window_ranges")),
+                "w2_ranges": result.get("w2_ranges", result.get("w2_window_ranges")),
             },
             "policy": result.get("policy"),
         }

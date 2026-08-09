@@ -73,10 +73,10 @@ class RankCompute:
     rank: int
     routes: int
     active_experts: int
-    w13_split: bool
+    w13_ranges: int
+    w2_ranges: int
     shape: tuple[int, ...]
     predicted_ms: float
-    weight_window_bytes: int = 0
 
 
 @dataclass
@@ -334,7 +334,7 @@ class ParallelLayerEvaluator:
         rank_results: list[RankCompute] = []
         for rank, histogram in enumerate(rank_histograms):
             if rank in empty_ranks:
-                rank_results.append(RankCompute(rank, 0, 0, False, (), 0.0))
+                rank_results.append(RankCompute(rank, 0, 0, 1, 1, (), 0.0))
                 continue
             experts, plan = plans_by_rank[rank]
             rank_results.append(
@@ -342,10 +342,10 @@ class ParallelLayerEvaluator:
                     rank=rank,
                     routes=sum(histogram),
                     active_experts=len(experts),
-                    w13_split=bool(plan["w13_split"]),
+                    w13_ranges=int(plan["w13_window_ranges"]),
+                    w2_ranges=int(plan["w2_window_ranges"]),
                     shape=tuple(plan["shape"]),
                     predicted_ms=completion_ns[rank] / 1e6,
-                    weight_window_bytes=int(plan["weight_window_bytes"]),
                 )
             )
         return max((result.predicted_ms for result in rank_results), default=0.0), rank_results
@@ -473,7 +473,7 @@ def main() -> int:
             for rank in result.rank_compute:
                 print(
                     f"  rank{rank.rank}: routes={rank.routes:<6} "
-                    f"active={rank.active_experts:<3} split={rank.w13_split!s:<5} "
+                    f"active={rank.active_experts:<3} ranges={rank.w13_ranges}/{rank.w2_ranges} "
                     f"shape={rank.shape} time={rank.predicted_ms:.3f} ms"
                 )
         winner = "TP" if tp.total_ms < ep.total_ms else "EP"

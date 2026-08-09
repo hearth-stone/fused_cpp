@@ -90,8 +90,8 @@ def _calibration(
 def _model(
     calibration: AnalyticMachineCalibration | None = None,
     *,
-    w13_split: bool = True,
-    w13_split_chunks: int = 2,
+    w13_ranges: int = 2,
+    w2_ranges: int = 1,
 ) -> AnalyticMoeCostModel:
     return AnalyticMoeCostModel(
         calibration or _calibration(),
@@ -99,8 +99,8 @@ def _model(
         intermediate_size=32,
         global_experts=8,
         local_experts=8,
-        w13_split=w13_split,
-        w13_split_chunks=w13_split_chunks,
+        w13_ranges=w13_ranges,
+        w2_ranges=w2_ranges,
     )
 
 
@@ -371,9 +371,7 @@ def test_uneven_weight_ranges_use_per_range_traffic() -> None:
         intermediate_size=32,
         global_experts=8,
         local_experts=8,
-        w13_split=False,
-        w13_split_chunks=1,
-        weight_window_bytes=3500,
+        w13_ranges=3,
     )
 
     prediction = model.predict_expert(routes=24, threads=3)
@@ -560,17 +558,17 @@ def test_phase_lowering_conserves_kernel_demand_across_routes_and_widths(routes:
         assert sum(phase.spillable_dram_bytes for phase in phases) == pytest.approx(demand.spillable_dram_bytes)
 
 
-def test_split_w13_keeps_gemm_work_but_adds_range_overhead() -> None:
-    split = _model()
-    unsplit = _model(w13_split=False, w13_split_chunks=1)
+def test_w13_ranges_keep_gemm_work_but_add_range_overhead() -> None:
+    ranged = _model()
+    contiguous = _model(w13_ranges=1)
 
-    split_prediction = split.predict_expert(routes=24, threads=2)
-    unsplit_prediction = unsplit.predict_expert(routes=24, threads=2)
+    ranged_prediction = ranged.predict_expert(routes=24, threads=2)
+    contiguous_prediction = contiguous.predict_expert(routes=24, threads=2)
 
-    assert split_prediction.w13_demand.ranges == 2
-    assert unsplit_prediction.w13_demand.ranges == 1
-    assert split_prediction.w13_demand.mapping.executed_flops == unsplit_prediction.w13_demand.mapping.executed_flops
-    assert split_prediction.w13_ns > unsplit_prediction.w13_ns
+    assert ranged_prediction.w13_demand.ranges == 2
+    assert contiguous_prediction.w13_demand.ranges == 1
+    assert ranged_prediction.w13_demand.mapping.executed_flops == contiguous_prediction.w13_demand.mapping.executed_flops
+    assert ranged_prediction.w13_ns > contiguous_prediction.w13_ns
 
 
 def test_stage_window_policy_changes_analytic_execution_without_expanding_search() -> None:
@@ -660,7 +658,7 @@ def test_analytic_model_generates_deterministic_stage_windows_without_new_shapes
     assert short.w2_ranges == 1
 
 
-def test_analytic_w13_candidates_include_unsplit_and_two_range_endpoints() -> None:
+def test_analytic_w13_candidates_include_one_and_two_range_endpoints() -> None:
     model = AnalyticMoeCostModel(
         _calibration(),
         hidden_size=4096,
@@ -851,9 +849,8 @@ def test_holdout_validator_reports_absolute_error_and_shape_regret() -> None:
         "kernel": {
             "backend_n_tile": 8,
             "m_tail_policy": "xbyak_exact_m",
-            "w13_split": True,
-            "w13_split_chunks": 2,
-            "weight_window_bytes": 0,
+            "w13_window_ranges": 2,
+            "w2_window_ranges": 1,
         },
         "parallelism": {
             "mode": "standalone",
@@ -900,13 +897,13 @@ def test_holdout_validator_rejects_wrong_core_topology() -> None:
 
 def test_policy_runtime_distinguishes_variants_sharing_one_machine_file() -> None:
     calibration = _calibration()
-    split = _model(calibration)
-    unsplit = _model(calibration, w13_split=False, w13_split_chunks=1)
-    runtime = PlannedMoE((split, unsplit), num_cores=8)
+    two_ranges = _model(calibration)
+    one_range = _model(calibration, w13_ranges=1)
+    runtime = PlannedMoE((two_ranges, one_range), num_cores=8)
     experts = [(expert, 24) for expert in range(8)]
 
     first = runtime.plan_spec_for(experts)
     cached = runtime.plan_spec_for(experts)
 
     assert first["operator_options"] == cached["operator_options"]
-    assert first["operator_options"]["w13_split"] == first["policy"]["w13_split"]
+    assert first["operator_options"]["w13_ranges"] == first["policy"]["w13_window_ranges"]

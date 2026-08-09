@@ -37,9 +37,6 @@ class StageWindowProfilePolicy(Protocol):
     m_tail_policy: str
     activation: str
     dtype: str
-    w13_split: bool
-    w13_split_chunks: int
-    weight_window_bytes: int
     w13_window_ranges: int
     w2_window_ranges: int
     measurement_experts: int
@@ -290,7 +287,7 @@ class StaticStageWindowPolicy:
 
 
 # Calibrated on both 96-core NUMA ranks of AmazonC5192Cores for the TP4
-# H=4096/F=512 split-W13 SVE path. Each band carries one per-thread window per
+# H=4096/F=512 SVE R13=2/R2=1 path. Each band carries one per-thread window per
 # stage, which is the invariant the isolated sweeps measured: at equal per-thread
 # window the four widths agree within a few percent, while the per-range budget
 # they lower to spans up to 8x within a single band. The overrides are cells
@@ -349,7 +346,7 @@ AMAZON_C5_192C_NUMA0_TP4_F512_STAGE_WINDOWS_V1 = AMAZON_C5_192C_TP4_F512_STAGE_W
 
 
 # Short-route band added in V2. V1 had no band below 49 routes, so every expert
-# with M < 49 inherited the operator-wide legacy split-W13 window: two 4 MiB W13
+# with M < 49 inherited the operator-wide R13=2 geometry: two 4 MiB W13
 # ranges and one 4 MiB W2 range, which is 1 MiB per thread at 4T and 4 MiB at 1T.
 # Isolated sweeps on this host show short-route experts lose a large share of
 # their useful packed-B bandwidth there, because each additional M12 panel
@@ -467,9 +464,6 @@ def default_task_stage_window_policy(
         "m_tail_policy": "xbyak_exact_m",
         "activation": "silu",
         "dtype": "bf16",
-        "w13_split": True,
-        "w13_split_chunks": 2,
-        "weight_window_bytes": 0,
         "w13_window_ranges": 2,
         "w2_window_ranges": 1,
         "measurement_experts": 256,

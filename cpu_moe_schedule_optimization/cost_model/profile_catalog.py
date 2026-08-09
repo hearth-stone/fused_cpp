@@ -7,11 +7,6 @@ from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Iterable
 
-try:
-    from weight_window import fused_moe_weight_windows
-except ImportError:  # pragma: no cover - package-style import
-    from .weight_window import fused_moe_weight_windows
-
 
 class ProfileCompatibilityError(ValueError):
     """Raised when no exact calibration profile matches a requested policy."""
@@ -31,9 +26,6 @@ class ProfilePolicy:
     m_tail_policy: str
     activation: str
     dtype: str
-    w13_split: bool
-    w13_split_chunks: int
-    weight_window_bytes: int
     w13_window_ranges: int
     w2_window_ranges: int
     measurement_experts: int
@@ -70,31 +62,23 @@ class ProfilePolicy:
         extension_sha = kernel.get("extension_sha256")
         if not source_sha or not extension_sha:
             raise ProfileCompatibilityError("schema-v2 profile requires source and extension hashes")
-        weight_window_bytes = int(kernel.get("weight_window_bytes", 0))
-        w13_split = bool(kernel["w13_split"])
-        w13_split_chunks = int(kernel["w13_split_chunks"])
-        if weight_window_bytes < 0:
-            raise ProfileCompatibilityError("kernel.weight_window_bytes must be non-negative")
-        if weight_window_bytes > 0 and w13_split:
+        try:
+            w13_window_ranges = int(kernel["w13_window_ranges"])
+            w2_window_ranges = int(kernel["w2_window_ranges"])
+        except KeyError as error:
             raise ProfileCompatibilityError(
-                "positive kernel.weight_window_bytes must use the canonical w13_split=false policy"
+                "schema-v2 profile requires exact W13/W2 stage ranges"
+            ) from error
+        n_tile = int(kernel["backend_n_tile"])
+        max_w13_ranges = (2 * int(expert["intermediate_size"])) // n_tile
+        max_w2_ranges = int(expert["hidden_size"]) // n_tile
+        if not (1 <= w13_window_ranges <= max_w13_ranges):
+            raise ProfileCompatibilityError(
+                f"kernel.w13_window_ranges must be in [1, {max_w13_ranges}]"
             )
-        expected_w13, expected_w2 = fused_moe_weight_windows(
-            hidden_size=int(expert["hidden_size"]),
-            intermediate_size=int(expert["intermediate_size"]),
-            n_tile=int(kernel["backend_n_tile"]),
-            target_bytes=weight_window_bytes,
-            w13_fallback_ranges=w13_split_chunks,
-        )
-        w13_window_ranges = int(kernel.get("w13_window_ranges", expected_w13.ranges))
-        w2_window_ranges = int(kernel.get("w2_window_ranges", expected_w2.ranges))
-        if min(w13_split_chunks, w13_window_ranges, w2_window_ranges) <= 0:
-            raise ProfileCompatibilityError("kernel split/window range counts must be positive")
-        if not w13_split and w13_split_chunks != 1:
-            raise ProfileCompatibilityError("kernel.w13_split_chunks must be 1 when w13_split=false")
-        if (w13_window_ranges, w2_window_ranges) != (expected_w13.ranges, expected_w2.ranges):
+        if not (1 <= w2_window_ranges <= max_w2_ranges):
             raise ProfileCompatibilityError(
-                "kernel window range counts do not match the recorded shape, tile, and target bytes"
+                f"kernel.w2_window_ranges must be in [1, {max_w2_ranges}]"
             )
         return cls(
             mode=str(parallelism["mode"]),
@@ -109,9 +93,6 @@ class ProfilePolicy:
             m_tail_policy=str(kernel.get("m_tail_policy", "static_bucketed")),
             activation=str(expert["activation"]),
             dtype=str(expert["dtype"]),
-            w13_split=w13_split,
-            w13_split_chunks=w13_split_chunks,
-            weight_window_bytes=weight_window_bytes,
             w13_window_ranges=w13_window_ranges,
             w2_window_ranges=w2_window_ranges,
             measurement_experts=int(expert["measurement_experts"]),
@@ -159,10 +140,6 @@ class ProfilePolicy:
             self.extension_sha256,
         )
 
-    def key_without_split(self) -> tuple[object, ...]:
-        """Compatibility alias for legacy split-pair callers."""
-        return self.key_without_kernel_policy()
-
     def kernel_policy_key(self) -> tuple[object, ...]:
         return ("stage_ranges", self.w13_window_ranges, self.w2_window_ranges)
 
@@ -181,9 +158,6 @@ class ProfileQuery:
     m_tail_policy: str | None = None
     activation: str | None = None
     dtype: str | None = None
-    w13_split: bool | None = None
-    w13_split_chunks: int | None = None
-    weight_window_bytes: int | None = None
     w13_window_ranges: int | None = None
     w2_window_ranges: int | None = None
     measurement_experts: int | None = None
@@ -237,13 +211,7 @@ class ProfileCatalog:
         """Return the canonical W13 R=1/R=2 endpoints for compatibility tests."""
         if any(
             value is not None
-            for value in (
-                query.w13_split,
-                query.w13_split_chunks,
-                query.weight_window_bytes,
-                query.w13_window_ranges,
-                query.w2_window_ranges,
-            )
+            for value in (query.w13_window_ranges, query.w2_window_ranges)
         ):
             raise ValueError("stage_range_pair query must leave kernel range policy unspecified")
         base_query = query.__dict__
@@ -259,21 +227,11 @@ class ProfileCatalog:
             raise ProfileCompatibilityError("R=1/R=2 profiles use different route/thread/shape grids")
         return one_range, two_range
 
-    def split_pair(self, query: ProfileQuery) -> tuple[ProfileRecord, ProfileRecord]:
-        """Compatibility alias; active identity is the canonical stage-range pair."""
-        return self.stage_range_pair(query)
-
     def policy_variants(self, query: ProfileQuery) -> tuple[ProfileRecord, ...]:
         """Return every uniquely measured stage-range variant for one profile domain."""
         if any(
             value is not None
-            for value in (
-                query.w13_split,
-                query.w13_split_chunks,
-                query.weight_window_bytes,
-                query.w13_window_ranges,
-                query.w2_window_ranges,
-            )
+            for value in (query.w13_window_ranges, query.w2_window_ranges)
         ):
             raise ValueError("policy_variants query must leave kernel range policy unspecified")
         matches = [record for record in self.records if not record.policy.mismatch(query)]

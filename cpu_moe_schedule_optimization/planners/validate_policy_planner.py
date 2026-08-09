@@ -121,10 +121,10 @@ def select_models(profile_dir: Path, mode: str):
         cores_per_rank=32,
         concurrent_ranks=2,
     )
-    no_split, split = catalog.stage_range_pair(query)
+    one_range, two_range = catalog.stage_range_pair(query)
     return (
-        ContentionCostModel(no_split.path),
-        ContentionCostModel(split.path),
+        ContentionCostModel(one_range.path),
+        ContentionCostModel(two_range.path),
     )
 
 
@@ -143,7 +143,6 @@ def build_call(
     ids,
     weights,
     bridge,
-    split_w13: bool,
     skip_weighted: bool,
 ):
     from fused_cpp.moe import AsyncMoEPlanV2, fused_moe_bf16_tiled_async_plan
@@ -159,7 +158,6 @@ def build_call(
             plan,
             activation="silu",
             skip_weighted=skip_weighted,
-            w13_split=split_w13,
         )
 
     return run
@@ -207,11 +205,16 @@ def worker(args: argparse.Namespace) -> int:
         if forced_shape is None:
             selected = joint.plan(experts)
         else:
-            forced_split = bool(args.force_split)
-            forced_planner = planners[int(forced_split)]
+            forced_planner = next(
+                planner
+                for planner in planners
+                if planner.model.policy is not None
+                and planner.model.policy.w13_window_ranges == args.force_w13_ranges
+            )
             predicted, tasks = forced_planner.score_shape(experts, forced_shape)
             selected = {
-                "w13_split": forced_split,
+                "w13_window_ranges": args.force_w13_ranges,
+                "w2_window_ranges": forced_planner.model.policy.w2_window_ranges,
                 "shape": forced_shape,
                 "makespan_ns": predicted,
                 "bridge": forced_planner.to_async_bridge(tasks),
@@ -219,7 +222,10 @@ def worker(args: argparse.Namespace) -> int:
         candidates: list[dict] = [
             {
                 "key": "planner",
-                "split": bool(selected["w13_split"]),
+                "ranges": (
+                    int(selected["w13_window_ranges"]),
+                    int(selected["w2_window_ranges"]),
+                ),
                 "shape": tuple(selected["shape"]),
                 "predicted_ns": float(selected["makespan_ns"]),
                 "bridge": selected["bridge"],
@@ -229,13 +235,17 @@ def worker(args: argparse.Namespace) -> int:
             candidates.append({**candidates[0], "key": "planner_clone"})
         else:
             for planner in planners:
-                split = bool(planner.model.policy.w13_split)
+                assert planner.model.policy is not None
+                ranges = (
+                    planner.model.policy.w13_window_ranges,
+                    planner.model.policy.w2_window_ranges,
+                )
                 for shape in planner.shapes:
                     predicted, tasks = planner.score_shape(experts, shape)
                     candidates.append(
                         {
-                            "key": f"{'split' if split else 'nosplit'}:{','.join(map(str, shape))}",
-                            "split": split,
+                            "key": f"r13_{ranges[0]}_r2_{ranges[1]}:{','.join(map(str, shape))}",
+                            "ranges": ranges,
                             "shape": tuple(shape),
                             "predicted_ns": float(predicted),
                             "bridge": planner.to_async_bridge(tasks),
@@ -258,7 +268,6 @@ def worker(args: argparse.Namespace) -> int:
                 ids,
                 weights,
                 candidate["bridge"],
-                candidate["split"],
                 args.top_k == 1,
             )
             for candidate in candidates
@@ -298,7 +307,7 @@ def worker(args: argparse.Namespace) -> int:
             "histogram": counts,
             "candidates": {
                 candidate["key"]: {
-                    "split": candidate["split"],
+                    "ranges": candidate["ranges"],
                     "shape": candidate["shape"],
                     "predicted_ns": candidate["predicted_ns"],
                     "samples_ns": samples[candidate["key"]],
@@ -374,7 +383,7 @@ def run_pair(args: argparse.Namespace, mode: str) -> dict:
                     command.append("--noise-only")
                 if args.force_shape is not None:
                     command.extend(("--force-shape", args.force_shape))
-                    command.extend(("--force-split", str(args.force_split)))
+                    command.extend(("--force-w13-ranges", str(args.force_w13_ranges)))
                 if args.stage_trace_dir is not None:
                     trace_file = args.stage_trace_dir / f"{mode}_rank{rank}.log"
                     command.extend(("--stage-trace-file", str(trace_file)))
@@ -439,7 +448,7 @@ def run_pair(args: argparse.Namespace, mode: str) -> dict:
             paired = [max(left, right) for left, right in zip(entries[0]["samples_ns"], entries[1]["samples_ns"])]
             row = {
                 "key": key,
-                "rank_plans": [{"split": entry["split"], "shape": entry["shape"]} for entry in entries],
+                "rank_plans": [{"ranges": entry["ranges"], "shape": entry["shape"]} for entry in entries],
                 "predicted_ns": max(entry["predicted_ns"] for entry in entries),
                 "median_ns": statistics.median(paired),
                 "p10_ns": percentile(paired, 0.10),
@@ -476,7 +485,10 @@ def print_summary(result: dict) -> None:
     for name, case in result["cases"].items():
         selected = case["selected"]
         best = case["best_fixed"]
-        plans = "/".join(f"{'S' if plan['split'] else 'N'}:{tuple(plan['shape'])}" for plan in selected["rank_plans"])
+        plans = "/".join(
+            f"R{tuple(plan['ranges'])}:{tuple(plan['shape'])}"
+            for plan in selected["rank_plans"]
+        )
         print(
             f"{name:<10} {plans:<48} {selected['predicted_ns'] / 1e6:9.3f} "
             f"{selected['median_ns'] / 1e6:10.3f} {best['median_ns'] / 1e6:9.3f} "
@@ -503,7 +515,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=20260711)
     parser.add_argument("--top-k", type=int, default=1)
     parser.add_argument("--force-shape")
-    parser.add_argument("--force-split", type=int, choices=(0, 1), default=1)
+    parser.add_argument("--force-w13-ranges", type=int, choices=(1, 2), default=2)
     parser.add_argument(
         "--noise-only",
         action="store_true",

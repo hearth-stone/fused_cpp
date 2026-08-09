@@ -36,9 +36,6 @@ _EARLY_MERGE_EQUAL_FINISH_ABS_NS = 1.0
 
 
 class PlannerPolicy(Protocol):
-    w13_split: bool
-    w13_split_chunks: int
-    weight_window_bytes: int
     w13_window_ranges: int
     w2_window_ranges: int
     intermediate_size: int
@@ -910,9 +907,6 @@ class IntervalPlanner:
         if self.model.policy is not None:
             policy = {
                 "profile": str(self.model.profile_path),
-                "w13_split": self.model.policy.w13_split,
-                "w13_split_chunks": self.model.policy.w13_split_chunks,
-                "weight_window_bytes": self.model.policy.weight_window_bytes,
                 "w13_window_ranges": self.model.policy.w13_window_ranges,
                 "w2_window_ranges": self.model.policy.w2_window_ranges,
                 "intermediate_size": self.model.policy.intermediate_size,
@@ -943,8 +937,6 @@ class IntervalPlanner:
             "uncertainty_ns": selected["uncertainty_ns"],
             "active_working_set_bytes": selected["active_working_set_bytes"],
             "resource_groups": selected["resource_groups"],
-            "w13_split": (self.model.policy.w13_split if self.model.policy is not None else None),
-            "weight_window_bytes": (self.model.policy.weight_window_bytes if self.model.policy is not None else None),
             "w13_window_ranges": (self.model.policy.w13_window_ranges if self.model.policy is not None else None),
             "w2_window_ranges": (self.model.policy.w2_window_ranges if self.model.policy is not None else None),
             "window_bytes_per_worker": tuple(selected["window_bytes_per_worker"]),
@@ -1181,8 +1173,6 @@ class IntervalPlanner:
             "task_range_granularities": task_range_granularities,
             "task_w13_ranges": task_w13_ranges,
             "task_w2_ranges": task_w2_ranges,
-            "task_w13_window_bytes": [-1] * num_tasks,
-            "task_w2_window_bytes": [-1] * num_tasks,
             "task_release_ns": [0] * num_tasks,
             "task_resize_timeout_ns": [0] * num_tasks,
             "task_preferred_core_begins": [-1] * num_tasks,
@@ -1306,8 +1296,6 @@ class IntervalPlanner:
                 "task_resize_points": resize_points,
                 "task_w13_ranges": w13_ranges,
                 "task_w2_ranges": w2_ranges,
-                "task_w13_window_bytes": [-1] * num_tasks,
-                "task_w2_window_bytes": [-1] * num_tasks,
                 "task_resize_timeout_ns": timeouts,
                 "task_preferred_core_begins": preferred_core_begins,
             }
@@ -1361,8 +1349,6 @@ class IntervalPlanner:
             "task_range_granularities": [_ASYNC_FULL_EXPERT_RANGE] * num_tasks,
             "task_w13_ranges": task_w13_ranges,
             "task_w2_ranges": task_w2_ranges,
-            "task_w13_window_bytes": [-1] * num_tasks,
-            "task_w2_window_bytes": [-1] * num_tasks,
             "task_release_ns": [0] * num_tasks,
             "task_resize_timeout_ns": [0] * num_tasks,
             "task_preferred_core_begins": [-1] * num_tasks,
@@ -1531,8 +1517,6 @@ class PolicyAwarePlanner:
         selected = IntervalPlanner._select(candidates)["result"]
         selected["policy_ranking"] = [
             {
-                "w13_split": result["w13_split"],
-                "weight_window_bytes": result["weight_window_bytes"],
                 "w13_window_ranges": result["w13_window_ranges"],
                 "w2_window_ranges": result["w2_window_ranges"],
                 "shape": result["shape"],

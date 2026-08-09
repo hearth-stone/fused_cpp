@@ -79,8 +79,8 @@ def models(catalog: ProfileCatalog, mode: str, ffn: int, local_experts: int):
         cores_per_rank=32,
         concurrent_ranks=2,
     )
-    no_split, split = catalog.stage_range_pair(query)
-    return ContentionCostModel(no_split.path), ContentionCostModel(split.path)
+    one_range, two_range = catalog.stage_range_pair(query)
+    return ContentionCostModel(one_range.path), ContentionCostModel(two_range.path)
 
 
 class _DeterministicTailPoolModel:
@@ -476,7 +476,8 @@ def test_schema_v2_uses_formula_with_table_fallback(catalog: ProfileCatalog) -> 
             hidden_size=4096,
             intermediate_size=1024,
             local_experts=64,
-            w13_split=True,
+            w13_window_ranges=2,
+            w2_window_ranges=1,
         )
     )
     default = ContentionCostModel(record.path)
@@ -499,13 +500,12 @@ def test_catalog_requires_exact_policy(catalog: ProfileCatalog) -> None:
         hidden_size=4096,
         intermediate_size=1024,
         local_experts=64,
-        w13_split=True,
+        w13_window_ranges=2,
+        w2_window_ranges=1,
     )
     record = catalog.select(query)
-    assert record.policy.w13_split
     assert record.policy.llc_bytes_per_rank == 48 * 1024 * 1024
-    assert record.policy.weight_window_bytes == 0
-    assert record.policy.w13_window_ranges == record.policy.w13_split_chunks
+    assert record.policy.w13_window_ranges == 2
     assert record.policy.w2_window_ranges == 1
 
     with pytest.raises(ProfileCompatibilityError, match="no exact profile"):
@@ -885,7 +885,7 @@ def test_stage_window_policy_rejects_unlowerable_bands() -> None:
         )
 
 
-def test_positive_window_profile_rejects_legacy_split_flag(
+def test_profile_requires_explicit_exact_stage_ranges(
     catalog: ProfileCatalog,
     tmp_path: Path,
 ) -> None:
@@ -896,15 +896,16 @@ def test_positive_window_profile_rejects_legacy_split_flag(
             hidden_size=4096,
             intermediate_size=1024,
             local_experts=64,
-            w13_split=True,
+            w13_window_ranges=2,
+            w2_window_ranges=1,
         )
     )
     payload = json.loads(record.path.read_text(encoding="utf-8"))
-    payload["kernel"]["weight_window_bytes"] = 1024 * 1024
-    path = tmp_path / "invalid_window_split.json"
+    del payload["kernel"]["w13_window_ranges"]
+    path = tmp_path / "missing_stage_ranges.json"
     path.write_text(json.dumps(payload), encoding="utf-8")
 
-    with pytest.raises(ProfileCompatibilityError, match="canonical w13_split=false"):
+    with pytest.raises(ProfileCompatibilityError, match="requires exact W13/W2 stage ranges"):
         ProfileCatalog.from_paths([path])
 
 
@@ -927,8 +928,6 @@ def test_profile_kernel_policy_identity_is_canonical_stage_ranges(catalog: Profi
 
     one_range, two_range = catalog.stage_range_pair(query)
 
-    assert one_range.policy.w13_split is False
-    assert two_range.policy.w13_split is True
     assert one_range.policy.kernel_policy_key() == ("stage_ranges", 1, 1)
     assert two_range.policy.kernel_policy_key() == ("stage_ranges", 2, 1)
 
@@ -956,7 +955,6 @@ def test_policy_variants_reject_duplicate_stage_range_identity(
     payload = json.loads(one_range.path.read_text(encoding="utf-8"))
     payload["kernel"].update(
         {
-            "weight_window_bytes": 1 << 40,
             "w13_window_ranges": 1,
             "w2_window_ranges": 1,
         }
@@ -988,14 +986,14 @@ def test_window_policy_and_thread_shape_are_selected_jointly(
         cores_per_rank=32,
         concurrent_ranks=2,
     )
-    no_split, split = catalog.stage_range_pair(query)
+    one_range, two_range = catalog.stage_range_pair(query)
     window_paths: list[Path] = []
     preferred = {
         1024 * 1024: (tuple([1] * 32), 2_000_000),
         2 * 1024 * 1024: (tuple([2] * 16), 1_000_000),
     }
     for window_bytes, (preferred_shape, preferred_ns) in preferred.items():
-        payload = json.loads(no_split.path.read_text(encoding="utf-8"))
+        payload = json.loads(one_range.path.read_text(encoding="utf-8"))
         w13, w2 = fused_moe_weight_windows(
             hidden_size=4096,
             intermediate_size=1024,
@@ -1005,9 +1003,6 @@ def test_window_policy_and_thread_shape_are_selected_jointly(
         )
         payload["kernel"].update(
             {
-                "w13_split": False,
-                "w13_split_chunks": 1,
-                "weight_window_bytes": window_bytes,
                 "w13_window_ranges": w13.ranges,
                 "w2_window_ranges": w2.ranges,
             }
@@ -1034,17 +1029,22 @@ def test_window_policy_and_thread_shape_are_selected_jointly(
         path.write_text(json.dumps(payload), encoding="utf-8")
         window_paths.append(path)
 
-    policy_catalog = ProfileCatalog.from_paths([no_split.path, split.path, *window_paths])
+    policy_catalog = ProfileCatalog.from_paths([one_range.path, two_range.path, *window_paths])
     records = policy_catalog.policy_variants(query)
     policy_models = [ContentionCostModel(record.path) for record in records]
     result = PolicyAwarePlanner(policy_models, 32).plan([(expert, 192) for expert in range(64)])
 
     assert len(records) == 4
-    assert result["weight_window_bytes"] == 2 * 1024 * 1024
+    assert result["w13_window_ranges"] == 8
+    assert result["w2_window_ranges"] == 4
     assert result["shape"] == tuple([2] * 16)
     assert result["active_working_set_bytes"] == 32 * 1024 * 1024
     assert result["window_bytes_per_worker"] == tuple([1024 * 1024] * 16)
-    selected_model = next(model for model in policy_models if model.weight_window_bytes == 2 * 1024 * 1024)
+    selected_model = next(
+        model
+        for model in policy_models
+        if (model.w13_window_ranges, model.w2_window_ranges) == (8, 4)
+    )
     selected_worksets = [workset for _, workset in selected_model._task_phases(192, 2) if workset]
     assert selected_worksets == [2 * 1024 * 1024] * 12
 
@@ -1052,8 +1052,8 @@ def test_window_policy_and_thread_shape_are_selected_jointly(
     spec = runtime.plan_spec_for([(expert, 192) for expert in range(64)])
     assert spec["plan_version"] == 2
     assert spec["operator_options"] == {
-        "w13_split": False,
-        "weight_window_bytes": 2 * 1024 * 1024,
+        "w13_ranges": 8,
+        "w2_ranges": 4,
     }
     bridge = spec["bridge"]
     assert bridge["plan_version"] == 2
@@ -1067,8 +1067,6 @@ def test_window_policy_and_thread_shape_are_selected_jointly(
     assert bridge["task_stage_ids"] == [0] * len(bridge["task_threads"])
     assert bridge["task_resize_points"] == [0] * len(bridge["task_threads"])
     assert bridge["task_range_granularities"] == [0] * len(bridge["task_threads"])
-    assert bridge["task_w13_window_bytes"] == [-1] * len(bridge["task_threads"])
-    assert bridge["task_w2_window_bytes"] == [-1] * len(bridge["task_threads"])
     assert bridge["task_w13_ranges"] == [8] * len(bridge["task_threads"])
     assert bridge["task_w2_ranges"] == [4] * len(bridge["task_threads"])
     cached_spec = runtime.plan_spec_for([(expert, 192) for expert in range(64)])
@@ -1084,7 +1082,7 @@ def test_window_policy_and_thread_shape_are_selected_jointly(
         cores_per_rank=32,
     )
     tp = evaluator.evaluate_tp(2048, 6)
-    assert {rank.weight_window_bytes for rank in tp.rank_compute} == {2 * 1024 * 1024}
+    assert {(rank.w13_ranges, rank.w2_ranges) for rank in tp.rank_compute} == {(8, 4)}
 
 
 def test_tail_pool_bridge_relinks_fixed_lane_dependencies(
@@ -1145,8 +1143,6 @@ def test_static_stage_window_policy_is_lowered_per_task(
 
     assert bridge["task_w13_ranges"] == [2, 16, 16, 4]
     assert bridge["task_w2_ranges"] == [1, 16, 16, 8]
-    assert bridge["task_w13_window_bytes"] == [-1] * 4
-    assert bridge["task_w2_window_bytes"] == [-1] * 4
     assert bridge["task_range_granularities"] == [0, 0, 0, 0]
 
     sliced_bridge = planner.to_async_bridge(
@@ -1262,9 +1258,6 @@ def test_default_stage_window_policy_requires_exact_profile(
         m_tail_policy="xbyak_exact_m",
         activation="silu",
         dtype="bf16",
-        w13_split=True,
-        w13_split_chunks=2,
-        weight_window_bytes=0,
         w13_window_ranges=2,
         w2_window_ranges=1,
         measurement_experts=256,
@@ -1293,7 +1286,7 @@ def test_default_stage_window_policy_requires_exact_profile(
     )
     assert (
         default_task_stage_window_policy(
-            replace(matching, w13_split=False),
+            replace(matching, w13_window_ranges=1),
             num_cores=96,
             cpu_ids=cpu_ids_by_rank[0],
         )
@@ -1313,16 +1306,16 @@ def test_planned_moe_applies_default_stage_windows_per_profile(
     monkeypatch: pytest.MonkeyPatch,
     catalog: ProfileCatalog,
 ) -> None:
-    no_split, split = models(catalog, "tp", 1024, 64)
+    one_range, two_range = models(catalog, "tp", 1024, 64)
 
     def select_default(profile, *, num_cores, cpu_ids):
         del num_cores, cpu_ids
-        if profile is not None and profile.w13_split:
+        if profile is not None and profile.w13_window_ranges == 2:
             return AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V1
         return None
 
     monkeypatch.setattr(planned_moe_module, "default_task_stage_window_policy", select_default)
-    runtime = PlannedMoE((no_split, split), 32, cpu_ids=tuple(range(32)))
+    runtime = PlannedMoE((one_range, two_range), 32, cpu_ids=tuple(range(32)))
 
     assert runtime.task_stage_window_policies == (
         None,
@@ -1333,7 +1326,7 @@ def test_planned_moe_applies_default_stage_windows_per_profile(
     assert runtime.interval_planners[1].to_async_bridge(tasks)["task_w13_ranges"] == [16]
 
     disabled = PlannedMoE(
-        (no_split, split),
+        (one_range, two_range),
         32,
         cpu_ids=tuple(range(32)),
         use_default_stage_window_policy=False,
@@ -1366,7 +1359,8 @@ def test_exact_m_profile_does_not_round_tail_routes(
             hidden_size=4096,
             intermediate_size=1024,
             local_experts=64,
-            w13_split=True,
+            w13_window_ranges=2,
+            w2_window_ranges=1,
         )
     )
     payload = json.loads(record.path.read_text(encoding="utf-8"))
@@ -1384,7 +1378,8 @@ def test_exact_m_profile_does_not_round_tail_routes(
                 hidden_size=4096,
                 intermediate_size=1024,
                 local_experts=64,
-                w13_split=True,
+                w13_window_ranges=2,
+                w2_window_ranges=1,
             )
         )
     selected = mixed_catalog.select(
@@ -1396,7 +1391,8 @@ def test_exact_m_profile_does_not_round_tail_routes(
             local_experts=64,
             sve_implementation="jit",
             m_tail_policy="xbyak_exact_m",
-            w13_split=True,
+            w13_window_ranges=2,
+            w2_window_ranges=1,
         )
     )
     assert selected.path == path
@@ -1425,11 +1421,10 @@ def test_checked_in_xbyak_profiles_cover_exact_m_range_endpoints() -> None:
         assert set(range(1, 13)).issubset(map(int, payload["contention_routes"]))
         assert payload["kernel"]["source_sha256"]
         assert payload["kernel"]["extension_sha256"]
-        if policy.weight_window_bytes == 0:
-            range_variants = pairs.setdefault(policy.key_without_kernel_policy(), {})
-            range_key = (policy.w13_window_ranges, policy.w2_window_ranges)
-            assert range_key not in range_variants
-            range_variants[range_key] = record.path
+        range_variants = pairs.setdefault(policy.key_without_kernel_policy(), {})
+        range_key = (policy.w13_window_ranges, policy.w2_window_ranges)
+        assert range_key not in range_variants
+        range_variants[range_key] = record.path
 
         model = ContentionCostModel(
             record.path,
@@ -1473,20 +1468,20 @@ def test_parallel_evaluator_auto_accepts_available_range_variants(
         cores_per_rank=32,
         concurrent_ranks=2,
     )
-    asm_no_split, asm_split = catalog.stage_range_pair(query)
+    asm_one_range, asm_two_range = catalog.stage_range_pair(query)
 
     jit_paths: list[Path] = []
-    for record in (asm_no_split, asm_split):
+    for record in (asm_one_range, asm_two_range):
         payload = json.loads(record.path.read_text(encoding="utf-8"))
         payload["kernel"]["sve_implementation"] = "jit"
         payload["kernel"]["m_tail_policy"] = "xbyak_exact_m"
-        path = tmp_path / f"jit_{int(record.policy.w13_split)}.json"
+        path = tmp_path / f"jit_r{record.policy.w13_window_ranges}.json"
         path.write_text(json.dumps(payload), encoding="utf-8")
         jit_paths.append(path)
 
     topology = HierarchicalTopology(2, 1, 60e9, 20e9, 1e-6)
 
-    incomplete = ProfileCatalog.from_paths([asm_no_split.path, asm_split.path, jit_paths[1]])
+    incomplete = ProfileCatalog.from_paths([asm_one_range.path, asm_two_range.path, jit_paths[1]])
     partial = ParallelLayerEvaluator(
         incomplete,
         topology,
@@ -1498,7 +1493,7 @@ def test_parallel_evaluator_auto_accepts_available_range_variants(
     assert {model.policy.sve_implementation for model in partial} == {"jit"}
     assert [model.policy.kernel_policy_key() for model in partial] == [("stage_ranges", 2, 1)]
 
-    complete = ProfileCatalog.from_paths([asm_no_split.path, asm_split.path, *jit_paths])
+    complete = ProfileCatalog.from_paths([asm_one_range.path, asm_two_range.path, *jit_paths])
     selected = ParallelLayerEvaluator(
         complete,
         topology,
@@ -1515,47 +1510,47 @@ def test_parallel_evaluator_auto_accepts_available_range_variants(
 
 
 def test_exact_shape_and_stage_working_sets(catalog: ProfileCatalog) -> None:
-    no_split, split = models(catalog, "ep", 2048, 32)
-    assert split.supports_shape((32,))
-    assert not split.supports_shape((24, 8))
+    one_range, two_range = models(catalog, "ep", 2048, 32)
+    assert two_range.supports_shape((32,))
+    assert not two_range.supports_shape((24, 8))
     with pytest.raises(ProfileCompatibilityError, match="was not measured"):
-        split.profiled_group_time(192, (24, 8))
+        two_range.profiled_group_time(192, (24, 8))
 
-    split_worksets = [workset for _, workset in split._task_phases(192, 16)]
-    no_split_worksets = [workset for _, workset in no_split._task_phases(192, 16)]
-    assert [value for value in split_worksets if value] == [
+    two_range_worksets = [workset for _, workset in two_range._task_phases(192, 16)]
+    one_range_worksets = [workset for _, workset in one_range._task_phases(192, 16)]
+    assert [value for value in two_range_worksets if value] == [
         16 * 1024 * 1024,
         16 * 1024 * 1024,
         16 * 1024 * 1024,
     ]
-    assert [value for value in no_split_worksets if value] == [
+    assert [value for value in one_range_worksets if value] == [
         32 * 1024 * 1024,
         16 * 1024 * 1024,
     ]
     tasks = [(192, 16, []), (192, 16, [])]
-    assert no_split.dag_makespan(tasks) != pytest.approx(no_split.flat_dag_makespan(tasks))
-    finish_times = no_split.dag_task_finish_times(tasks)
+    assert one_range.dag_makespan(tasks) != pytest.approx(one_range.flat_dag_makespan(tasks))
+    finish_times = one_range.dag_task_finish_times(tasks)
     assert finish_times[0] == pytest.approx(finish_times[1])
-    assert max(finish_times) == pytest.approx(no_split.dag_makespan(tasks))
+    assert max(finish_times) == pytest.approx(one_range.dag_makespan(tasks))
 
 
 def test_joint_planner_and_physical_cpu_mapping(catalog: ProfileCatalog) -> None:
     tp_models = models(catalog, "tp", 1024, 64)
     assert all(model.has_full_workload_anchors for model in tp_models)
     tp = PolicyAwarePlanner(tp_models, 32, cpu_ids=range(32, 64)).plan([(expert, 192) for expert in range(64)])
-    assert tp["w13_split"] is True
+    assert (tp["w13_window_ranges"], tp["w2_window_ranges"]) == (2, 1)
     assert tp["shape"] == (8, 8, 8, 8)
     assert tp["active_working_set_bytes"] == 32 * 1024 * 1024
     assert tp["bridge"]["thread_cpu_ids"] == list(range(32, 64))
 
-    split_model = tp_models[1]
-    split_planner = PolicyAwarePlanner([split_model], 32, cpu_ids=range(32, 64)).planners[0]
-    anchored_ms, _ = split_planner.score_shape([(expert, 192) for expert in range(64)], (8, 8, 8, 8))
-    assert anchored_ms == split_model.profiled_full_call_time(192, (8, 8, 8, 8))
+    two_range_model = tp_models[1]
+    two_range_planner = PolicyAwarePlanner([two_range_model], 32, cpu_ids=range(32, 64)).planners[0]
+    anchored_ms, _ = two_range_planner.score_shape([(expert, 192) for expert in range(64)], (8, 8, 8, 8))
+    assert anchored_ms == two_range_model.profiled_full_call_time(192, (8, 8, 8, 8))
 
     ep_models = models(catalog, "ep", 2048, 32)
     ep = PolicyAwarePlanner(ep_models, 32).plan([(expert, 192) for expert in range(32)])
-    assert ep["w13_split"] is True
+    assert (ep["w13_window_ranges"], ep["w2_window_ranges"]) == (2, 1)
     assert ep["shape"] == (32,)
 
 
@@ -1568,8 +1563,8 @@ def test_policy_aware_cache_and_richer_signature(catalog: ProfileCatalog) -> Non
     counts = [(expert, 192) for expert in range(64)]
     spec = planner.plan_spec_for(counts)
     assert spec["operator_options"] == {
-        "w13_split": True,
-        "weight_window_bytes": 0,
+        "w13_ranges": 2,
+        "w2_ranges": 1,
     }
     assert planner.last["cache_hit"] is False
     cached = planner.plan_spec_for(counts)
@@ -1615,7 +1610,9 @@ def test_real_routing_summary_offline_plan_and_cost_model(
     selected = next(
         planner
         for planner in policy_planner.planners
-        if planner.model.policy is not None and planner.model.policy.w13_split == strict_result["w13_split"]
+        if planner.model.policy is not None
+        and planner.model.policy.kernel_policy_key()
+        == ("stage_ranges", strict_result["w13_window_ranges"], strict_result["w2_window_ranges"])
     )
     rescored_ns, rescored_tasks = selected.score_shape(
         workload.experts,

@@ -2,7 +2,7 @@
 
 > 状态：调度问题定义的 source of truth。
 >
-> 最后更新：2026-08-06。
+> 最后更新：2026-08-09。
 >
 > 修改 planner 的决策变量、目标函数、硬约束、性能响应、线程宽度集合、调度语义、
 > rank 耦合方式或剪枝策略时，必须同步更新本文档及末尾变更记录。
@@ -19,7 +19,7 @@
    不同近似与表达。
 4. **工程剪枝**：线程宽度、静态 shape、LPT、non-idling 等当前限制。
 
-M12、SVE、W13 split、具体权重布局和 cache 工作集公式不属于核心问题定义。
+M12、SVE、stage range 数、具体权重布局和 cache 工作集公式不属于核心问题定义。
 它们只影响固定执行环境下观测到的 isolated time 和 contention slowdown。
 
 ## 2. 原始问题
@@ -1343,14 +1343,14 @@ cold search。
 | 并发配置 | 活跃 job 可形成任意满足 CPU 容量的 $(M_i,t_i)$ 组合 | 搜索静态 core shape，并自动比较 strict、threshold/统一宽度 tail-pool 与恰好两个 terminal expert 的一次 bounded repartition；后者可在 exact anchor 命中时把每个 terminal expert 切成两个连续 M slice，使四个 fixed task 覆盖全部核心；实验 elastic 只接受 planner 显式给出的同 NUMA 对齐 W2 cohort，target 必须包含 source 或与其不相交 | static-partition + boundary regroup 剪枝 |
 | Shape 集合 | 所有满足 CPU 容量的整数宽度组合 | empirical backend 只用 profile shape；analytic backend 生成 homogeneous 和至多两种宽度的 shape，再应用 active 工作集规则；tail-pool 和 bounded tail 只从 strict uncertainty band 和最快两个 head shape 派生 | 候选剪枝 |
 | Assignment | 任意 expert-to-resource 调度 | 按 isolated cost 的 LPT；实验 strict tail-steal 保留每条 lane 的 planner 前缀，只从 peer lane 的受限 pending 后缀迁移 whole expert 到同宽空闲 team | 启发式分配与 suffix-steal 剪枝 |
-| Runtime plan contract | task 可携带离散宽度集合、stage/range、resize 边界和动态 placement | bounded tail 在 terminal expert 启动前生成新的 singleton fixed width 和 blocker DAG；每个 production whole-expert task 显式携带由 $(M,t)$ 唯一解析的正整数 $(R_{13},R_2)$，W2 GEMM/scatter 共用 $R_2$；迁移期 `-1` 继承和 byte-window 仅兼容手写旧 plan，且同一 stage 禁止同时指定 byte/range；exact-anchor route fission 将同一 expert 的连续 M slice 作为多个 strict task，只有全部 slice 完成后才发布 expert completion；tail_pool 保持 whole-expert 动态 placement；实验 strict tail-steal 只接受单 NUMA、同宽、fixed、whole-expert 资源链，并保留 ready-token drain；实验 elastic 才在 W13/W2 边界扩到 preferred cohort；离线 cold-phase lowering 可为 strict fixed task 添加非负 release lower bound，非零时关闭 tail-steal | 单次 expert-boundary 重分区、受限未启动 task 迁移、实验 stage resize 与实验 task release 剪枝 |
+| Runtime plan contract | task 可携带离散宽度集合、stage/range、resize 边界和动态 placement | bounded tail 在 terminal expert 启动前生成新的 singleton fixed width 和 blocker DAG；每个 production whole-expert task 必须显式携带由 $(M,t)$ 唯一解析的正整数 $(R_{13},R_2)$，W2 GEMM/scatter 共用 $R_2$；runtime 不接受继承 sentinel、byte target 或 split 布尔量；exact-anchor route fission 将同一 expert 的连续 M slice 作为多个 strict task，只有全部 slice 完成后才发布 expert completion；tail_pool 保持 whole-expert 动态 placement；实验 strict tail-steal 只接受单 NUMA、同宽、fixed、whole-expert 资源链，并保留 ready-token drain；实验 elastic 才在 W13/W2 边界扩到 preferred cohort；离线 cold-phase lowering 可为 strict fixed task 添加非负 release lower bound，非零时关闭 tail-steal | 单次 expert-boundary 重分区、受限未启动 task 迁移、实验 stage resize 与实验 task release 剪枝 |
 | Stage coupling | W13/W2 可形成任意满足依赖和容量的 stage DAG | production 使用 whole-expert pipeline；独立 W13/W2 Plan V2 加全局 barrier 仅作为实验 entrypoint，matched/independent 两种计划都不进入默认搜索 | production 粒度剪枝与实验对照 |
 | x86 synchronous executor team mapping | expert 可取任意合法整数宽度并形成任意 wave | API 接受 1--256 workers；均衡 route 用 atomic expert queue，active expert 不足时按 route/当前宽度贪心组 team，强偏斜时按 64-row target 形成有序 wave | planner 外的确定性 runtime mapper |
 | Ordering | 任意可行开始时间和顺序 | 每个 lane 的 LPT 顺序；实验 strict tail-steal 保留 planner 前缀和本地后缀优先，只允许领取 peer lane 的 pending suffix frontier | 顺序剪枝 |
 | Idling | 允许主动等待以避开争用 | planner 可关闭 tail-pool 和 bounded tail 保留原 strict；bounded tail 只依赖 blocker 完成、不增加主动等待；tail-pool 保持 non-idling；strict tail-steal 找不到满足 $c_h\ge r_{\min}$ 的后缀后立即释放 compute team，并在启用时转入 ready-token drain；elastic timeout=0 不主动等待，正 timeout 只允许在 W13/W2 边界等待有限 $\delta_i$；ready-token 路径仅填充无可运行 expert 的空闲 lane；cold-phase runtime benchmark 可按 oracle task release 主动等待，但 production planner 不生成非零 release | 受限 boundary idling 剪枝；oracle release 仅作可执行性诊断 |
 | Workload 输入 | 任意合法 global 或 rank-local route histogram | planner 接受任意 histogram；catalog preset 只扩展验证覆盖，不过滤运行时输入 | 不剪枝 |
 | Route combine | 任意满足 TopK release 约束和 CPU 容量的 merge 排程 | planner 不搜索 combine service time；strict plan 在预测 expert 同时完成时强制统一连续 post-expert merge，其余情况保留 auto；runtime 将连续 token range 固定映射给 logical worker，在 expert 边界和空闲期处理本 owner 已 release token，并在同一 resident worker job 排空；owner 间不偷取 merge；Plan V2 允许显式 on/off，elastic 不允许 on | 外层启发式限制与支配条件剪枝 |
-| Kernel variant | 任意未被支配的实现 | ARM empirical identity 规范为唯一 `("stage_ranges", R13, R2)`；旧 split/byte target 只用于读取历史 profile，不进入 identity。`auto` 优先使用至少含一个合法实测 range variant 的 `jit/xbyak_exact_m`，否则回退 `asm/static_bucketed`；同 implementation 的所有候选必须使用相同 route/thread/shape grid，重复 range identity 直接拒绝。empirical Plan V2 在精确匹配的 AmazonC5192Cores TP4/F512 profile 上使用已验证的确定函数 $g(M,t)$。analytic Plan V2 固定保留 $R=1/R=2$ 端点并加入 cache/service 解析候选，以 A 物理驻留、B 有限瞬态/稳态扫描和校准不确定度 tie 确定唯一 range；两者都在每个 shape/tail-pool 候选中确定性解析并进入执行成本，range 不成为自由搜索变量。公开 split API 的删除在后续步骤完成；x86 AMX 使用不进入 planner 的确定性 per-expert pattern/cache policy，AVX-512/AMX 共用确定性 team-N/wave policy | 实例候选限制与 runtime policy |
+| Kernel variant | 任意未被支配的实现 | ARM empirical identity 规范为唯一 `("stage_ranges", R13, R2)`；schema-v2 profile 必须显式记录两个正整数 range，历史 split/byte 字段即使仍存在也被忽略。`auto` 优先使用至少含一个合法实测 range variant 的 `jit/xbyak_exact_m`，否则回退 `asm/static_bucketed`；同 implementation 的所有候选必须使用相同 route/thread/shape grid，重复 range identity 直接拒绝。empirical Plan V2 在精确匹配的 AmazonC5192Cores TP4/F512 profile 上使用已验证的确定函数 $g(M,t)$。analytic Plan V2 固定保留 $R=1/R=2$ 端点并加入 cache/service 解析候选，以 A 物理驻留、B 有限瞬态/稳态扫描和校准不确定度 tie 确定唯一 range；两者都在每个 shape/tail-pool 候选中确定性解析并进入执行成本，range 不成为自由搜索变量。x86 AMX 使用不进入 planner 的确定性 per-expert pattern/cache policy，AVX-512/AMX 共用确定性 team-N/wave policy | 实例候选限制与 runtime policy |
 | Isolated time | 真实 $I_i(t)$ | production 默认仍为经验公式；可选 analytic backend 由 kernel demand、cache traffic 和机器 service curves 计算 | cost 近似，不剪枝可行域 |
 | Contention | 任意动态活跃配置上的真实 $D_i(\mathcal Z)$ | production 默认为实测 profile；bounded tail 仅在 uniform route、root/tail width 与物理 interval 完全匹配时使用 exact-layout full-call anchor，且禁止 route 插值；未命中仍走 stage-aware simulator；实验 strict tail-steal 暂不进入 cost model；analytic backend 按 L1-hot M12 GEMM core、L2/LLC/DRAM/epilogue 共享容量推进事件，register-only matrix/frontend/L1 只保留诊断；cold-phase oracle 只约束首个 M12 packed-B DRAM phase，运行时验证已证明它不能替代 per-worker L2 retention、完整 active stage window、LLC-to-L2 service、容量和 active-set slowdown | cost 近似，不剪枝可行域 |
 | 跨 rank lifetime | 每个 rank 的资源状态随其他 rank 完成而变化 | 有 matching single-rank companion 时，多 rank 活跃阶段使用 concurrent-rank profile，最后一个 rank 的剩余 phase 切换到 single-rank profile；缺表时保守保持 concurrent-rank rate | cost 状态近似，不剪枝可行域 |
@@ -2013,25 +2013,24 @@ $\omega$——此时两个 stage 的 shared-A 都只有 $13$--$393$ KiB、都装
 A 重扫项对两者均可忽略，短 route 侧决定 $\omega_{W2}^\ast$ 的机制未识别，但效应
 不超过 $1.5\%$。
 
-split/no-split 由此成为退化情形而非独立维度：W13 总量 $8$ MiB 时
-$g_{W13}=4$ MiB 即 $R=2$（split），$g_{W13}=8$ MiB 即 $R=1$（no-split），且
+旧 split/no-split 由此只对应两个 range 端点：W13 总量 $8$ MiB 时
+$g_{W13}=4$ MiB 即 $R=2$，$g_{W13}=8$ MiB 即 $R=1$，且
 $W2$ 总量 $4$ MiB 使任何 $g\ge4$ MiB 都退化为单 range。profile identity 记录的
-是 achieved $R$，本身无单位，所以两种编码共享同一行标定数据。
+是 achieved $R$，本身无单位；runtime 和 catalog 不再保留旧编码。
 
-### 8.3 Split-W13 owner-cache 工作集 band
+### 8.3 Stage-range owner-cache 工作集 band
 
-当前 production 默认仍将 W13 分为两个相等 N range，而 W2 使用一个 range。按
-8.2.5 的参数化，这等价于 $g_{W13}=4$ MiB、$g_{W2}=4$ MiB，即 `w13_split` 是
-window 目标的布尔别名而非独立的算法分支：packed 布局与之无关
-（`prepare_fused_moe_bf16_tiled_weights` 不接收该参数），它只改变遍历顺序。
-`weight_window_bytes>0` 会直接取代这个两 panel 粒度。
+当前 production 基线几何为 W13 两个相等 N range、W2 一个 range，即
+$(R_{13},R_2)=(2,1)$。packed 布局与 range 数无关；range 只改变遍历顺序。
+cache 模型可以先用字节目标 $g_s$ 表达容量需求，但必须在 planner 中量化为精确
+正整数 $R_s$，profile 和 runtime 均不接收字节目标。
 对 BF16 的 $H,F$，三个顺序 packed-weight stage 都是：
 
 $$
 S_0=2HF\quad\text{bytes}.
 $$
 
-SVE fused expert 另提供显式 packed-B byte-window variant。设 stage $s$ 的 packed
+解析模型可构造 packed-B byte-window 候选。设 stage $s$ 的 packed
 维度为 $(K_s,N_s)$，BF16 N tile 为 $\nu$，总 tile 数和单 tile 字节数为：
 
 $$
@@ -2132,10 +2131,11 @@ $$
 v=(r_{13},r_2).
 $$
 
-旧 `w13_split`、`w13_split_chunks` 和 $S_{\mathrm{target}}$ 只用于从 schema-v2
-历史记录重建实际 $(r_{13},r_2)$，不再进入 identity、plan cache 或模型匹配。
-两个不同历史配置若产生相同 range 数，就是同一个执行几何；catalog 将两份同时
-出现视为重复校准错误，而不是两个 planner 候选。每个唯一 profile 分别校准：
+schema-v2 profile 必须显式记录 $(r_{13},r_2)$。旧 `w13_split`、
+`w13_split_chunks` 和 $S_{\mathrm{target}}$ 即使作为历史 provenance 留在 JSON 中也
+不会被读取，更不会重建 identity、plan cache key 或模型匹配。两个 profile 若记录
+相同 range 数，就是同一个执行几何；catalog 将两份同时出现视为重复校准错误，
+而不是两个 planner 候选。每个唯一 profile 分别校准：
 
 $$
 \widehat I_i^{(v)}(t),\qquad
@@ -2296,7 +2296,7 @@ $$
 
 它把候选相关的 refill/争用需求暴露出来，但**不替代**绝对时间模型；选择后仍用
 ECM maximum 和共享资源 event simulator 评分整个 DAG。W13/W2 分别独立选择，再
-下降到现有 per-range byte ABI。不确定度 tie 只使用一个 machine-level 标量和已有
+量化为 exact-range ABI。不确定度 tie 只使用一个 machine-level 标量和已有
 cache/kernel 几何，不引入 route band 或计时表。策略由 calibration digest 唯一命名，
 planner shape、tail-pool、kernel variant 与剪枝集合均不增加。
 
@@ -4140,3 +4140,4 @@ $M=12$、`1/2/4/8T`，并给 W13 的两个端点写入独立标签，保证后�
 | 2026-08-09 | v0.80 | Plan V2 与 ARM native runtime 增加 per-task exact $(R_{13},R_2)$：production planner 在确定 task 的实际宽度后解析正整数 range，并将其用于 W13、W2 GEMM 和 W2 owner-scatter；不增加 shape/window 搜索维度。迁移期 `-1` 继承与 byte-window 字段只兼容旧手写 plan，同一 task/stage 同时指定 byte/range 会被 Python/native 双重拒绝。profile/catalog identity 和公开 split API 留待后续独立步骤迁移。 |
 | 2026-08-09 | v0.81 | empirical/analytic profile、catalog、plan cache 与 TP/EP companion matching 的 kernel policy identity 统一为 `("stage_ranges", R13, R2)`；旧 split/byte 字段仅用于 schema-v2 历史 profile 的几何重建，不参与匹配。catalog 不再要求完整布尔 pair，改为接受同 implementation 下任意非空实测 range 集合，同时严格拒绝重复 range identity 和不同 route/thread/shape grid；`auto` 因此可使用只有一个 range variant 的 JIT 校准，但仍禁止跨 JIT/static 拼表。公开 API 与 native legacy fallback 留待下一步删除。 |
 | 2026-08-09 | v0.82 | 公开 Python/C++ MoE ABI 与 Plan V2 runtime 收敛为 exact stage ranges：同步、scheduled、legacy async 使用正整数 `w13_ranges/w2_ranges`，Plan V2 必须逐 task 携带正整数 range；legacy bridge 显式升级为 `1/1`。删除布尔 split、全局/per-task byte-window、对应环境变量和 Plan V2 到 legacy async 的 fallback；W13/W2 GEMM 与 W2 owner-scatter 只消费同一份精确 range。kernel layout、N-split ownership、planner shape 候选与解析 stage-window policy 均不变。 |
+| 2026-08-09 | v0.83 | 解析/phase cost model、profile catalog、interval planner、TP/EP companion matching 与 contention profile 生成器全部改为 range-only policy：基线由显式正整数 $(R_{13},R_2)$ 构造，内部 cache 字节目标只作为物理模型输入并在进入 plan 前量化；schema-v2 profile 必须显式记录两个 range，旧 split/byte 字段只可作为未读取的历史 provenance。删除 model/query/result 中的 split 别名和 byte identity，不改变 shape 候选、event simulator、stage-window 解析规则或 runtime 执行几何。 |
