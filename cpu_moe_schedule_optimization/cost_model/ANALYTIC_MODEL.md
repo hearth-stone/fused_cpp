@@ -529,8 +529,8 @@ model = AnalyticMoeCostModel(
     mode="tp",
     degree=4,
     concurrent_ranks=2,
-    w13_split=True,
-    w13_split_chunks=2,
+    w13_ranges=2,
+    w2_ranges=1,
 )
 planner = PlannedMoE(model, num_cores=96)
 plan = planner.plan_spec_for(route_counts)
@@ -559,10 +559,10 @@ local 3x3 cross. It is not a full Cartesian search, so measured regret is a
 lower bound on regret against the full legal window space.
 
 Policy v3 also retains the W13 `R=1` and `R=2` endpoints explicitly in every
-group. These are the canonical geometries formerly encoded as no-split and
-split. For `M<=12`, both stages select `R=1` analytically because each B tile is
+group. These are the canonical geometries formerly encoded by the boolean W13
+selector. For `M<=12`, both stages select `R=1` analytically because each B tile is
 consumed once and extra ranges cannot create reuse. The v2 table below remains
-historical validation; v3 must be remeasured after the range ABI migration.
+historical validation; v3 still needs the range-native calibration refresh.
 
 The corrected policy-v2 2026-08-09 holdout produced:
 

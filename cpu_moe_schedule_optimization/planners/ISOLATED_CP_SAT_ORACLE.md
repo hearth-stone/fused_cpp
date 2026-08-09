@@ -51,7 +51,7 @@ Normal package installation and production MoE execution do not require it.
 
 ## Run
 
-The following example uses the current 8-core split-W13 exact-M profile:
+The following example uses the current 8-core exact-M `R13=2,R2=1` profile:
 
 ```bash
 .venv/bin/python \

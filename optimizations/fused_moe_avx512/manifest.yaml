@@ -213,7 +213,7 @@ features:
       -k macro_m_tile_state
     benchmark: >-
       OMP_NUM_THREADS=8 OMP_DYNAMIC=FALSE OMP_PROC_BIND=close
-      OMP_PLACES=cores FUSED_CPP_MOE_W13_SPLIT_N=1 taskset -c 0-7
+      OMP_PLACES=cores taskset -c 0-7
       env PYTHONPATH=src .venv/bin/python
       benchmarks/bench_amx_bf16_patterns.py --patterns auto
       --silu-epilogues auto --w2-epilogues auto
@@ -512,7 +512,7 @@ features:
     benchmark: >-
       OMP_NUM_THREADS=8 OMP_DYNAMIC=FALSE OMP_PROC_BIND=close
       OMP_PLACES=cores OMP_WAIT_POLICY=PASSIVE
-      FUSED_CPP_MOE_W13_SPLIT_N=1 taskset -c 0-7 env PYTHONPATH=src
+      taskset -c 0-7 env PYTHONPATH=src
       .venv/bin/python tests/bench_moe_avx512_bf16.py --backend
       x86_amx_bf16 --tokens 2048 --hidden 4096 --intermediate 512
       --experts 3 --top-k 1 --routing skewed --threads 8 --warmup 8

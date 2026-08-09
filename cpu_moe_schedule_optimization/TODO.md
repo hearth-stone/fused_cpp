@@ -18,17 +18,19 @@ micro-optimizations. It should close the remaining high-value variables first,
 then refresh the calibration data and cost model once and validate them as a
 coherent system.
 
-The split-to-range migration is intentionally staged so each ABI boundary is
+The boolean-to-range migration is intentionally staged so each ABI boundary is
 independently bisectable:
 
-- [x] Unify analytical W13 split/no-split choices as explicit `R=1/R=2`
-  geometry candidates.
+- [x] Unify the former boolean W13 endpoints as explicit `R=1/R=2` geometry
+  candidates.
 - [x] Carry exact per-task W13/W2 range counts through Plan V2, native W13/W2,
-  and W2 owner-scatter; retain legacy byte/split inputs only as compatibility.
+  and W2 owner-scatter.
 - [x] Canonicalize empirical profile/catalog and plan-cache identity on
   `(w13_ranges, w2_ranges)`.
-- [ ] Remove public split flags, environment controls, and legacy native
-  fallback branches after profile migration.
+- [x] Remove public split flags, environment controls, byte-window runtime
+  encodings, and legacy native fallback branches.
+- [x] Migrate calibration, benchmark, timeline, manifest, and schema callers to
+  exact positive ranges; retain old profile filenames only as provenance.
 - [ ] Refresh both ARM machines' range-native calibration and full planner/E2E
   validation before treating the migration as closed.
 
@@ -55,7 +57,8 @@ independently bisectable:
 ## 2. Policy-aware exact-shape cost model
 
 - [x] Key `T_iso` and contention data by the complete profile policy: sharded F,
-  split-W13 mode, kernel identity, NUMA topology, and concurrent-rank count.
+  exact W13/W2 range identity, kernel identity, NUMA topology, and
+  concurrent-rank count.
 - [x] Use exact measured shape data by default instead of collapsing all shapes
   with the same active-expert count into one derate.
 - [x] Preserve once-per-call cost with authoritative full-call anchors rather
@@ -65,11 +68,12 @@ independently bisectable:
 
 ## 3. Joint policy and schedule planner
 
-- [x] Search `(w13_split, core_shape)` rather than core shape alone.
+- [x] Search measured `(stage_range_policy, core_shape)` rather than core shape
+  alone.
 - [x] Use packed working-set bytes to prune candidates, while retaining measured
   latency as the objective.
-- [x] Return split policy as an explicit plan field and replace the
-  process-global environment-variable control with an operator argument.
+- [x] Return exact W13/W2 ranges as explicit plan fields with no process-global
+  geometry control.
 - [x] Add explicit physical CPU sets, a policy-aware cache key, full bucketed
   routing signatures, and confidence-aware tie breaking.
 
@@ -158,9 +162,9 @@ accurate: W13 accounts for 67.3-67.8% of W13+W2 time.
 
 ### P0: close the current calibration update
 
-- [x] Commit the 2026-07-13 TP2/EP2 split/no-split profiles, the expanded
-  contention route grid, and the validator noise/stage-trace modes as separate
-  reviewable changes.
+- [x] Commit the 2026-07-13 TP2/EP2 `R13=2/R13=1` profiles (with historical
+  filenames retained), the expanded contention route grid, and the validator
+  noise/stage-trace modes as separate reviewable changes.
 - [x] Update `POLICY_MODEL_VALIDATION.md` to the 2026-07-13 profiles and real
   routing validation. Remove the stale statement that no target routing dump
   is available.
@@ -395,18 +399,17 @@ claims must include both long-route throughput and short-route latency.
   indices). Let a native interval planner consume the same metadata and avoid
   Python schedule-tensor materialization, with special attention to decode and
   many-layer control overhead.
-- [x] Promote the operator-wide packed-B window into planner policy identity and
-  schema-v2. Jointly search measured `(weight_window_bytes, core_shape)` variants,
-  model the actual W13/W2 range counts, and forward the selected option to the
-  async kernel. Historical profiles map to window 0.
-- [x] Extend Plan V2 with independent per-task W13 and W2 window overrides and
+- [x] Promote the operator-wide packed-B range pair into planner policy identity
+  and schema-v2. Jointly search measured `(R13, R2, core_shape)` variants and
+  forward the selected exact pair to the async kernel.
+- [x] Extend Plan V2 with independent per-task W13 and W2 exact ranges and
   add a named deterministic post-plan policy hook. Unsupported route/width
-  combinations inherit the selected operator-wide policy, so this does not
+  combinations retain the selected operator-wide pair, so this does not
   enlarge the planner search space.
 - [ ] Regenerate isolated/contention calibration for independently selected
-  W13/W2 windows before admitting those combinations to cost-model scoring or
+  W13/W2 range pairs before admitting those combinations to cost-model scoring or
   expanding the default beyond the exact dual-NUMA AmazonC5192Cores
-  TP4/F512 split profile. The measured profile-bound rule is a deterministic
+  TP4/F512 profile. The measured profile-bound rule is a deterministic
   runtime exception, not a scored candidate.
 - [ ] Replace general async task-list polling with a lane-chain executor for the
   current disjoint interval plans, while retaining the general DAG path for plans

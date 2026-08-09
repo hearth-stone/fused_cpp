@@ -7,11 +7,11 @@ is valid only for the exact kernel policy, sharded expert shape, and NUMA/rank
 execution context recorded in the file. The canonical kernel policy is the
 actual `(w13_window_ranges, w2_window_ranges)` geometry.
 
-Historical schema-v2 files still record `w13_split`, `w13_split_chunks`, and
-`weight_window_bytes`. The reader uses them to reconstruct and validate the
-actual range counts, but they are provenance rather than active identity. Two
-files that resolve to the same range pair are duplicate calibrations even when
-their legacy byte/split fields differ.
+Historical schema-v2 files may still record `w13_split`, `w13_split_chunks`, and
+`weight_window_bytes`. The reader ignores those fields; they are provenance,
+not active identity or a geometry fallback. Every schema-v2 file must carry
+positive `w13_window_ranges` and `w2_window_ranges`. Two files with the same
+range pair are duplicate calibrations even when their historical fields differ.
 
 ```json
 {
@@ -33,9 +33,6 @@ their legacy byte/split fields differ.
     "parallel_axis": "N",
     "sve_implementation": "jit",
     "m_tail_policy": "xbyak_exact_m",
-    "w13_split": true,
-    "w13_split_chunks": 2,
-    "weight_window_bytes": 0,
     "w13_window_ranges": 2,
     "w2_window_ranges": 1,
     "git_available": true,
@@ -273,24 +270,23 @@ time per panel/output and the identity-W13 to W2 ratio. These required rates are
 not independent ceilings. Active rollout requires separately measured BFMMLA,
 load/private/shared-cache, and epilogue service rates.
 
-### Split owner-cache working-set shadow
+### Exact-range owner-cache working-set shadow
 
-`working_set_model.py` emits `split_working_set_band_validation`. Its independent
+`working_set_model.py` emits `stage_range_working_set_band_validation`. Its independent
 calibration input is the CSV from `bench_weight_scan.cpp`; it is not a
 `contention_derate` profile and must not be loaded by `ContentionCostModel`.
 The serialized model records per-core private-cache bytes/ways, reserved ways,
 resident scan bandwidth saturation, the derived owner-cache budget, and the
 predicted expert/byte band. `profile_summary` and `holdout_summary` contain
 measured regret but are validation results, not active cost anchors. This path
-supports only two-range split-W13 and is currently gated to at least 16 physical
-M12/tail panels.
+uses the profile's exact W13/W2 range pair and is currently gated to at least
+16 physical M12/tail panels.
 
 New `profile_moe_stage_breakdown.py` output serializes a top-level `kernel`
-object with `backend_n_tile`, `parallel_axis`,
-`w13_workset_split_requested`, the shape-valid `w13_workset_split`,
-`w13_n_ranges`, and `w13_skip_silu`. The older per-row
-`split_w13`/`split_w2` fields are legacy heuristic labels and must not be used
-to infer the measured workset-split policy.
+object with `backend_n_tile`, `parallel_axis`, `w13_window_ranges`,
+`w2_window_ranges`, and `w13_skip_silu`. Per-row `w13_parallel_axis` and
+`w2_parallel_axis` describe M/N team partitioning; they are independent of the
+sequential stage range identity.
 
 TP2 and EP2 reproduction commands for the 64-core/two-NUMA target are:
 
@@ -301,7 +297,7 @@ PYTHONPATH=src .venv/bin/python \
   --hidden-size 4096 --ffn-hidden-size 1024 \
   --global-experts 64 --local-experts 64 --measurement-experts 0 \
   --isolated-measurement-experts 8 \
-  --w13-split 1 --sve-implementation jit --warmup 5 --runs 20
+  --w13-ranges 2 --w2-ranges 1 --sve-implementation jit --warmup 5 --runs 20
 
 PYTHONPATH=src .venv/bin/python \
   cpu_moe_schedule_optimization/cost_model/profile_contention_async_dual_rank.py \
@@ -309,17 +305,17 @@ PYTHONPATH=src .venv/bin/python \
   --hidden-size 4096 --ffn-hidden-size 2048 \
   --global-experts 64 --local-experts 32 --measurement-experts 0 \
   --isolated-measurement-experts 8 \
-  --w13-split 1 --sve-implementation jit --warmup 5 --runs 20
+  --w13-ranges 2 --w2-ranges 1 --sve-implementation jit --warmup 5 --runs 20
 ```
 
-Run each command again with `--w13-split 0` for the non-split policy. Defaults
-bind rank 0 to CPUs 0-31/NUMA0 and rank 1 to CPUs 32-63/NUMA1.
+Run each command again with another measured exact pair, such as
+`--w13-ranges 1 --w2-ranges 1`, when that geometry is a planner candidate.
+Defaults bind rank 0 to CPUs 0-31/NUMA0 and rank 1 to CPUs 32-63/NUMA1.
 
-To generate a canonical global-window profile, use `--w13-split 0` plus, for
-example, `--weight-window-bytes 2097152`. Generate one file per candidate
-window. The profiler mirrors native tile partitioning and records the actual
-W13/W2 range counts and maximum range bytes; the planner will not synthesize
-unmeasured byte values.
+Generate one file per candidate exact range pair. Byte/MiB sweeps remain useful
+calibration inputs, but the tool must quantize them through native packed-tile
+geometry before profiling. Runtime profiles and the planner never carry the
+byte target, and the planner will not synthesize an unmeasured range identity.
 
 ## Legacy schema v1
 

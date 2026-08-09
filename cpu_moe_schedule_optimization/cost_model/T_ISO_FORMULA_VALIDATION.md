@@ -26,7 +26,7 @@ The old complete 2-D table remains available with `iso_mode="table"`.
 
 - Host: `AmazonECS8Cores`, Neoverse V1, 8 cores, 32 MiB LLC.
 - Kernel: SVE fused expert, `backend_n_tile=16`, M12 route kernel.
-- Shape: `H=4096`, `F=512`, BF16, fused SiLU, split-W13 with two chunks.
+- Shape: `H=4096`, `F=512`, BF16, fused SiLU, exact `R13=2,R2=1`.
 - Weights: four consecutive experts per isolated sample, so each call streams
   48 MiB of distinct packed expert weights and exceeds LLC.
 - Sampling: 5 warmups and 20 timed runs, CPUs `0-7`.

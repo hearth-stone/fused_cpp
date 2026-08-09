@@ -334,7 +334,7 @@ padding,memset 作安全兜底)。
 - `=2`:在 NR1 后再执行一次 `r*=frecps(d,r)`。
 
 只替换 M12 主路径;M8/M4/M2/M1 尾块继续使用精确 `fdiv`。测试固定使用
-split-W13、BF16 W2 route、poly5,并在 AWS 64-core 机器的 `0-31` 核运行。
+`R13=2,R2=1`、BF16 W2 route、poly5,并在 AWS 64-core 机器的 `0-31` 核运行。
 
 ## 性能
 
@@ -470,29 +470,29 @@ polynomial 降阶有正收益,但绝对幅度很小。minimax3 相比 Taylor pol
 Shape: W13 `K=4096,N=4096` (32 MiB/expert), W2 `K=2048,N=4096`
 (16 MiB/expert). Measurements use AWS cores `0-31`, 16 distinct expert
 weights, eight consecutive experts per timed call, `skip_weighted=True`, and
-30 interleaved runs per strategy. W13 split means two 16 MiB panels; W2 is not
-split.
+30 interleaved runs per strategy. `R13=2` means two 16 MiB ranges; W2 uses
+`R2=1` throughout.
 
 | strategy | active W13/W2 | M=1024 | M=1536 | M=2048 |
 |---|---:|---:|---:|---:|
-| 1x32, no split | 32/16 MiB | 46.230 ms / 8.919 T | 68.147 ms / 9.076 T | 90.718 ms / 9.090 T |
-| 1x32, split | 16/16 MiB | 46.636 ms / 8.841 T | 69.388 ms / 8.913 T | 93.136 ms / 8.854 T |
-| 2x16, no split | 64/32 MiB | 56.779 ms / 7.262 T | 79.867 ms / 7.744 T | 105.134 ms / 7.844 T |
-| **2x16, split** | **32/32 MiB** | **46.058 ms / 8.952 T** | **67.243 ms / 9.198 T** | **89.492 ms / 9.215 T** |
-| 4x8, no split | 128/64 MiB | 82.241 ms / 5.014 T | 118.532 ms / 5.218 T | 157.251 ms / 5.244 T |
-| 4x8, split | 64/64 MiB | 58.460 ms / 7.053 T | 83.086 ms / 7.444 T | 108.042 ms / 7.633 T |
+| 1x32, R13=1 | 32/16 MiB | 46.230 ms / 8.919 T | 68.147 ms / 9.076 T | 90.718 ms / 9.090 T |
+| 1x32, R13=2 | 16/16 MiB | 46.636 ms / 8.841 T | 69.388 ms / 8.913 T | 93.136 ms / 8.854 T |
+| 2x16, R13=1 | 64/32 MiB | 56.779 ms / 7.262 T | 79.867 ms / 7.744 T | 105.134 ms / 7.844 T |
+| **2x16, R13=2** | **32/32 MiB** | **46.058 ms / 8.952 T** | **67.243 ms / 9.198 T** | **89.492 ms / 9.215 T** |
+| 4x8, R13=1 | 128/64 MiB | 82.241 ms / 5.014 T | 118.532 ms / 5.218 T | 157.251 ms / 5.244 T |
+| 4x8, R13=2 | 64/64 MiB | 58.460 ms / 7.053 T | 83.086 ms / 7.444 T | 108.042 ms / 7.633 T |
 
-For two concurrent experts, splitting W13 improves the same `2x16` schedule by
+For two concurrent experts, W13 `R=2` improves the same `2x16` schedule by
 `23.3%/18.8%/17.5%` at M=`1024/1536/2048`. Compared with the best serial
-candidate (`1x32`, no split), however, `2x16` split is only `0.37%/1.35%/1.37%`
+candidate (`1x32`, `R13=1`), however, `2x16,R13=2` is only `0.37%/1.35%/1.37%`
 faster: both strategies already hold their active weight set near the measured
-32 MiB optimum. `4x8` remains slower because even split W13 and unsplit W2 each
+32 MiB optimum. `4x8` remains slower because even W13 `R=2` and W2 `R=1` each
 create a 64 MiB active set.
 
-Planner implication: use `1x32` without W13 splitting when only one long expert
+Planner implication: use `1x32` with W13 `R=1` when only one long expert
 is ready. With at least two independent long experts, `2x16` plus two-panel W13
 is the throughput choice; the gain is clear from roughly M=1536 onward and is
-effectively a tie at M=1024. Do not split W13 for `1x32`, and do not use `4x8`
+effectively a tie at M=1024. Use W13 `R=1` for `1x32`, and do not use `4x8`
 for uniform long routes on this 32-core partition.
 
 

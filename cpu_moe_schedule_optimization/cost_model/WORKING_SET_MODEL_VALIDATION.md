@@ -1,8 +1,8 @@
-# Split-W13 Owner-Cache Working-Set Model
+# Exact-Range Owner-Cache Working-Set Model
 
 ## Scope
 
-This model covers only the SVE two-range split-W13 path with N-split expert
+This model covers the SVE exact `R13=2,R2=1` path with N-partitioned expert
 teams. It is a shadow candidate filter and does not replace the active measured
 contention model. The validated regime is long M12 bulk (`physical_panels >=
 16`, currently routes >= 192).
@@ -89,7 +89,7 @@ residency, not the nominal 96 MiB LLC capacity.
 ## Fused-Kernel Holdout
 
 The held-out async fused-expert sweep uses 32 consecutive distinct EP2 weights,
-all 96 cores, split-W13 only, 3 warmups and 9 measured runs. Routes 1020 was not
+all 96 cores, exact `R13=2,R2=1`, 3 warmups and 9 measured runs. Routes 1020 was not
 in the contention grid used by the source profile.
 
 | Routes | 48 MiB | 64 MiB | 128 MiB | 160 MiB | 192 MiB |

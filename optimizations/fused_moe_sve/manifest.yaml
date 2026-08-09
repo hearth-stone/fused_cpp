@@ -32,7 +32,8 @@ features:
       --num-experts 256 --measurement-experts 96
       --isolated-measurement-experts 8 --isolated-route-buckets 1
       --contention-route-buckets 1 --thread-buckets 1
-      --contention-shapes 1x96 --w13-split 1 --warmup 12 --runs 101
+      --contention-shapes 1x96 --w13-ranges 2 --w2-ranges 1
+      --warmup 12 --runs 101
 
   - id: compute.xbyak_exact_m
     part: compute
@@ -311,7 +312,7 @@ features:
       PYTHONPATH=src .venv/bin/python -m pytest -q
       tests/test_moe_cost_model_v2.py -k stage_window
       && PYTHONPATH=src .venv/bin/python -m pytest -q
-      tests/test_moe_w13_split_api.py -k weight_window
+      tests/test_moe_stage_range_api.py -k weight_window
     benchmark: >-
       FUSED_CPP_MOE_HUGETLBFS_PATH=/dev/hugepages-32M
       PYTHONPATH=src numactl --cpunodebind=0 --membind=0 taskset -c 0-95
@@ -377,13 +378,12 @@ features:
       percent at four. amazon_c5_192c_tp4_f512_v4 splits that band at 216 route,
       an integral number of M12 panels. Only three of dsv4-real-2048-seq70's 223
       tasks land in the new band, so the five presets again move within noise and
-      the gain is latent. Since w13_split is only a boolean alias for a 4 or 8 MiB W13 budget, dropping it as a search dimension was
-      then evaluated and rejected: the bands cover 52 percent of the route-width
-      grid and cannot cover the rest, because M<=12 has no reuse to protect and
-      widths above 8 already sit near the optimum on the inherited geometry. The
-      share of tasks still inheriting ranges from 0 percent on moe256-uniform to
-      100 percent on moe256-long-short-bimodal, where split/no-split is the only
-      window control, so the operator-wide geometry stays a live candidate. Two
+      the gain is latent. An earlier evaluation kept the boolean W13 selector
+      because the calibrated bands cover only 52 percent of the route-width
+      grid. The range-native migration preserves both measured endpoint
+      geometries as exact R13 identities and materializes a positive R13/R2 for
+      every task, so the boolean selector is no longer part of the search or
+      runtime contract. Two
       later corrections do not change any calibrated value but do bound how the
       table may be read. First, the table assumes huge pages: an earlier base-page
       control was invalid because plain aligned allocation inherited transparent
@@ -663,7 +663,7 @@ features:
       - merge.async_ready_tokens
     correctness: >-
       PYTHONPATH=src .venv/bin/python -m pytest -q
-      tests/test_moe_w13_split_api.py
+      tests/test_moe_stage_range_api.py
       tests/test_fused_moe_bf16_tiled.py
       -k vllm_staged
     benchmark: >-
@@ -722,7 +722,7 @@ features:
     depends_on: []
     conflicts_with: []
     correctness: >-
-      pytest -q tests/test_moe_w13_split_api.py
+      pytest -q tests/test_moe_stage_range_api.py
       -k weight_window
     benchmark: >-
       numactl --cpunodebind=0 --membind=0 taskset -c 0-95
@@ -1201,9 +1201,9 @@ features:
       optimizations/fused_moe_sve/benchmarks/
       run_thread_weight_working_set.py
     hypothesis: >-
-      Under split-W13, N-splitting one expert preserves its aggregate packed-B
-      stage while reducing each thread's stripe, whereas running one expert per
-      thread grows the aggregate packed-B stage linearly unless the per-expert
+      With an exact two-range W13 geometry, N-partitioning one expert preserves
+      its aggregate packed-B stage while reducing each thread's stripe, whereas
+      running one expert per thread grows the aggregate packed-B stage linearly unless the per-expert
       weight is reduced inversely with thread count. With a fixed total thread
       budget, several multi-thread expert teams can trade lower replicated-A
       demand for larger per-thread B stripes and a larger aggregate B stage.
@@ -1216,7 +1216,7 @@ features:
       numactl --cpunodebind=0 --membind=0 taskset -c 0-95
       python optimizations/fused_moe_sve/benchmarks/
       run_thread_weight_working_set.py
-      --output /tmp/split_w13_expert_team.json
+      --output /tmp/stage_range_expert_team.json
       --experiments team-fixed-route,team-fixed-work
       --team-experts 1,2,3,4,6,8,12 --team-total-threads 96
       --team-route 2040 --team-total-routes 2304 --team-stage-mib 16
@@ -1231,7 +1231,7 @@ features:
       optimizations/fused_moe_sve/benchmarks/
       profile_fragmented_route_pipeline.py
     hypothesis: >-
-      When total GEMM FLOPs, 96 workers, and a 96 MiB maximum active split-W13
+      When total GEMM FLOPs, 96 workers, and a 96 MiB maximum active exact-range
       packed-B stage are fixed, replacing some M=2040 experts with more
       independent short-route experts has little effect until packed-weight
       turnover and per-expert fixed costs become comparable to GEMM work.
@@ -1402,7 +1402,7 @@ variants:
       - dispatch.serial_weight_windows
     entrypoint: >-
       fused_moe_bf16_tiled_{scheduled,async}(
-      weight_window_bytes=<positive byte count>)
+      w13_ranges=<positive count>, w2_ranges=<positive count>)
     status: experimental
 
   - id: sve_plan_v2_per_task_stage_windows
@@ -1415,7 +1415,7 @@ variants:
       PlannedMoE(default profile-bound policy;
       use_default_stage_window_policy=False to disable) ->
       fused_moe_bf16_tiled_async_plan(AsyncMoEPlanV2(
-      task_w13_window_bytes=..., task_w2_window_bytes=...))
+      task_w13_ranges=..., task_w2_ranges=...))
     status: enabled
 
   - id: sve_cold_oracle_timed_release

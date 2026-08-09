@@ -37,7 +37,7 @@ therefore tracks compute, packed, and store rows independently.
 For one physical panel with $m_c$ compute rows and $m_s$ store rows, hidden
 size $H$, intermediate size $F$,
 and $t$ N-split partitions, let $c_{13}$ be the number of sequential W13 N
-ranges: one for no-split and two for the current split-W13 policy. W13 has:
+ranges: `R13=1` and `R13=2` are the two measured endpoint identities. W13 has:
 
 $$
 \mathrm{FLOP}_{13}(m_c)=4m_cHF,

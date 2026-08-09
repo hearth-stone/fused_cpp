@@ -11,33 +11,32 @@
 ## 当前 policy-aware 闭环
 
 Schema v2 路径按完整策略选择表：`TP/EP degree + H/F + global/local
-experts + SVE implementation/tail policy + SVE tile + split-W13/packed-B
-window + NUMA/CPU set + LLC + source/binary hash`。split/no-split 和每个
-global byte-window 不共用 derate，也不跨 F 或拓扑做隐式 nearest-profile
-fallback。
+experts + SVE implementation/tail policy + SVE tile + exact (R13,R2) +
+NUMA/CPU set + LLC + source/binary hash`。不同 range identity 不共用
+derate，也不跨 F 或拓扑做隐式 nearest-profile fallback。
 
-`tp_vs_ep_model.py --sve-implementation auto` 先查找完整的
-`jit/xbyak_exact_m` split/no-split pair；只有该 pair 不完整时才整体回退到
-`asm/static_bucketed` pair。它不会把一个 JIT profile 和一个 asm profile
-拼成候选策略。需要可复现实验时可显式指定 `jit` 或 `asm`，此时缺表直接报错。
+`tp_vs_ep_model.py --sve-implementation auto` 优先使用同一
+`jit/xbyak_exact_m` implementation 下所有非空、网格一致的实测 range
+identity；没有可用 JIT profile 时才整体回退到 `asm/static_bucketed`。
+它不会把 JIT 和 asm profile 拼成一个候选集合。需要可复现实验时可显式
+指定 `jit` 或 `asm`，此时缺表直接报错。
 
-`weight_window_bytes` 可将 W13 和 W2 都细分为更小的 packed-B N-range。
-planner 已联合搜索有独立 schema-v2 profile 的 `(window, core_shape)`，并将
-选中值通过 operator options 传入 async kernel；不会用旧 split-W13 profile
-对 1/2 MiB 窗口评分。默认 catalog 未加入重新校准的 window 表时，候选仍只有
-legacy split/no-split。
+runtime 只接受正整数 `w13_ranges/w2_ranges`。解析 stage-window policy 可以
+把 cache byte budget 量化为 exact range，但 byte target 不进入公开 ABI、Plan
+或 profile identity。planner 联合搜索有独立 schema-v2 数据的
+`((R13,R2), core_shape)`，不会用另一 range identity 的表评分。
 
 当前实现入口：
 
 - `cost_model/profile_contention_async_dual_rank.py`：两个 NUMA-local rank
   同步采样；isolated 使用 8 个连续冷权重，contention 使用全部本地专家，
   mixed-width shape 使用与 planner 相同的 LPT assignment。
-- `cost_model/profile_catalog.py`：严格 profile identity、legacy split pair、
-  measured window variants 与 grid 校验。
+- `cost_model/profile_catalog.py`：严格 exact-range profile identity、
+  measured variants 与 grid 校验。
 - `cost_model/phase_model.py`：M12 bulk/tail、精确 full-call anchor，以及按
-  W13 chunk/W2 瞬时 packed working set 驱动的 stage-aware fallback。
+  W13/W2 exact range 瞬时 packed working set 驱动的 stage-aware fallback。
 - `planners/interval_planner.py` / `planned_moe.py`：联合搜索
-  `(w13_split/window, core_shape)`，返回显式 CPU 集与 operator option，并按
+  `((R13,R2), core_shape)`，返回显式 CPU 集与 operator option，并按
   完整 routing bucket histogram 和 kernel policy identity 缓存。
 - `planners/tp_vs_ep_model.py`：当前按 rank-local histogram 独立预测并取全局
   最大 compute，再加上通用分层 all-reduce/all-to-all 模型；尚未建模短 rank
@@ -164,8 +163,8 @@ T_plan(plan) + T_execute(plan)
   pressure 解释；完成跨机器门槛前保持 opt-in。
 - [`cost_model/gemm_ecm.py`](./cost_model/gemm_ecm.py)：旧 API 兼容 facade 和
   stage-trace report CLI；三层 GEMM model 当前不进入 planner active cost。
-- [`cost_model/working_set_model.py`](./cost_model/working_set_model.py)：仅针对
-  split-W13 的 owner-private cache 工作集 band；由独立 weight-scan 与
+- [`cost_model/working_set_model.py`](./cost_model/working_set_model.py)：针对
+  exact W13/W2 range 的 owner-private cache 工作集 band；由独立 weight-scan 与
   `T_iso` 计算稳健候选，当前只做 shadow validation。
 - [`planners/interval_planner.py`](./planners/interval_planner.py)：`IntervalPlanner` —— async interval-DAG 静态 planner（cost-model 驱动）。
 - [`planners/ISOLATED_CP_SAT_ORACLE.md`](./planners/ISOLATED_CP_SAT_ORACLE.md)：
@@ -237,7 +236,7 @@ T_expert(routes, threads) -> ns
 权重误当成 LLC 容量。工具支持每 expert 1 线程和把全部核心均分给 active
 experts 两种口径，结果写入独立诊断 JSON，不会直接修改 planner profile。
 
-例如在 96 个 NUMA-local 核心上搜索 EP2、split-W13 的工作集：
+例如在 96 个 NUMA-local 核心上搜索 EP2、`R13=2,R2=1` 的工作集：
 
 ```bash
 taskset -c 0-95 .venv/bin/python \
@@ -249,7 +248,7 @@ taskset -c 0-95 .venv/bin/python \
   --hidden-size 4096 --ffn-hidden-size 2048 \
   --route-buckets 12,48,192,768,2040 \
   --active-experts auto --allocation both \
-  --w13-split 1 --w13-split-chunks 2 \
+  --w13-ranges 2 --w2-ranges 1 \
   --warmup 3 --runs 9 --throughput-tolerance 0.10
 ```
 
@@ -257,9 +256,9 @@ taskset -c 0-95 .venv/bin/python \
 expert 数使用稀疏扫描，也可用 `--active-experts 1-32,40,48,64` 显式指定。
 汇总中的 near-peak 范围表示 aggregate TFLOP/s 距该 route 最佳点不超过给定
 阈值，工作集定义为
-`active_experts * max(W13_chunk_bytes, W2_bytes)`。
+`active_experts * max(W13_range_bytes, W2_range_bytes)`。
 
-split-W13 路径还可以用独立 owner-cache 指标预测优选工作集，而不直接拟合
+exact-range 路径还可以用独立 owner-cache 指标预测优选工作集，而不直接拟合
 fused wall time。先编译并运行 `benchmarks/bench_weight_scan.cpp`，再用
 `cost_model/working_set_model.py` 将 private-L2 capacity、stream bandwidth
 saturation 与 `T_iso` 组合。当前 V3 EP2 验证得到 48--128 MiB 可行 band，

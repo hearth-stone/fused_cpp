@@ -184,7 +184,7 @@ Configuration:
 
 - host: `AmazonC5192Cores`, Neoverse V3, NUMA0 CPUs `0-31`;
 - shape: $H=4096$, $F=1024$, BF16, fused W13 SiLU, FP32 W2 store;
-- kernel: SVE M12, `backend_n_tile=8`, W13 split into two N ranges;
+- kernel: SVE M12, `backend_n_tile=8`, exact `R13=2,R2=1`;
 - routes: `12,24,48,96,192,384,768,1536,2040`;
 - threads: `1,2,4,8,16,32`;
 - sampling: 3 warmups, 10 timed runs;
@@ -197,12 +197,13 @@ incremental SiLU epilogue cost. The benchmark command was:
 ```bash
 PYTHONPATH=src OMP_NUM_THREADS=32 OMP_DYNAMIC=FALSE OMP_PROC_BIND=close \
 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
-FUSED_CPP_MOE_W13_SPLIT_N=1 taskset -c 0-31 \
+taskset -c 0-31 \
 .venv/bin/python \
   cpu_moe_schedule_optimization/benchmarks/profile_moe_stage_breakdown.py \
   --hidden-size 4096 --ffn-hidden-size 1024 \
   --routes 12,24,48,96,192,384,768,1536,2040 \
-  --threads 1,2,4,8,16,32 --warmup 3 --runs 10 --fuse-silu
+  --threads 1,2,4,8,16,32 --w13-ranges 2 --w2-ranges 1 \
+  --warmup 3 --runs 10 --fuse-silu
 ```
 
 ### M12 panel service and held-out error
@@ -284,7 +285,7 @@ Before planner rollout, collect on the target 64-core host:
 1. pure BFMMLA throughput for every planner thread width;
 2. L1 load issue and private/shared cache transfer rates with the same tile
    access pattern;
-3. SiLU identity/real epilogue pairs for split and no-split W13;
+3. SiLU identity/real epilogue pairs for W13 `R=2` and `R=1`;
 4. PMU instruction and cache-refill counters to test the shared-A scan
    convention;
 5. M1/M2/M4/M8 and one/two-panel startup residuals;

@@ -249,8 +249,8 @@ native `fused_moe_bf16_tiled_async_plan_v2` entrypoint:
   "task_stage_ids": [0, 0, 0],
   "task_resize_points": [0, 0, 0],
   "task_range_granularities": [0, 0, 0],
-  "task_w13_window_bytes": [-1, 1048576, 4194304],
-  "task_w2_window_bytes": [-1, 524288, 1048576],
+  "task_w13_ranges": [2, 8, 2],
+  "task_w2_ranges": [1, 4, 1],
   "task_resize_timeout_ns": [0, 0, 0],
   "task_preferred_core_begins": [-1, -1, -1],
   "early_merge": null
@@ -302,13 +302,11 @@ Rules:
   node, and either fully contain the selected interval or be completely
   disjoint from it. Partial overlap is rejected. Strict, tail-pool, and
   non-resizable elastic tasks require `-1`.
-- `task_w13_window_bytes` and `task_w2_window_bytes` are optional per-task SVE
-  stage overrides. Missing arrays are materialized as `-1`; each present array
-  must have one entry per task. `-1` inherits the operator-wide
-  `weight_window_bytes`, `0` selects the stage's legacy range rule, and a
-  positive value selects a tile-aligned nominal packed-B byte window. Non-SVE
-  backends ignore the override. A pre-V2 native extension rejects a plan with
-  any non-negative override instead of silently changing its execution.
+- `task_w13_ranges` and `task_w2_ranges` are required per-task exact stage
+  geometries. Each array has one positive integer per task. The value is the
+  number of sequential packed-B N ranges executed by that stage; W2 GEMM and
+  owner-scatter consume the same `task_w2_ranges` ownership geometry. There is
+  no inherit sentinel, byte-window runtime encoding, or boolean W13 alias.
 - `early_merge` is an optional plan-level tri-state. Missing or `null` retains
   the runtime team-load heuristic, `true` forces the ready-token path, and
   `false` waits for expert compute to finish before all workers merge uniform
@@ -408,26 +406,27 @@ Rules:
 
   ```json
   {
-    "w13_split": false,
-    "weight_window_bytes": 2097152
+    "w13_ranges": 4,
+    "w2_ranges": 2
   }
   ```
 
-  A positive window serializes both SVE GEMMs into tile-aligned packed-B
-  ranges. It is selected only from an exact schema-v2 profile carrying that
-  target and the actual W13/W2 range counts.
+  The pair serializes both SVE GEMMs into the stated number of tile-aligned
+  packed-B ranges. It is selected only from an exact schema-v2 profile carrying
+  the same W13/W2 range identity.
 
-  An optional named `TaskStageWindowPolicy` may populate the two per-task
-  arrays after task widths and placements have been selected. The current
-  static policy is a deterministic lookup on `(routes, actual_task_threads)`;
-  unsupported combinations emit `-1`. It does not add candidates or change
-  cost-model scores, and tail-pool tasks use the selected pool width. The
-  policy name is part of `PlannedMoE` cache identity and result metadata.
+  An optional named `TaskStageWindowPolicy` may replace the baseline pair in
+  the two per-task arrays after task widths and placements have been selected.
+  The current policy is a deterministic lookup on
+  `(routes, actual_task_threads)`; unsupported combinations retain the baseline
+  exact pair. It is not a free search dimension, but every candidate is scored
+  using its resolved ranges, and tail-pool tasks use the selected pool width.
+  The policy name is part of `PlannedMoE` cache identity and result metadata.
   `PlannedMoE` resolves the policy independently for every candidate model.
-  The measured `amazon_c5_192c_tp4_f512_v1` policy is default-on only when the
-  complete dual-NUMA AmazonC5192Cores TP4/F512 SVE JIT exact-M split profile
-  identity and one of its 96-core rank CPU sets match. No-split and all other
-  profiles inherit their operator-wide policy. Pass
+  The measured `amazon_c5_192c_tp4_f512_v4` policy is default-on only when the
+  complete dual-NUMA AmazonC5192Cores TP4/F512 SVE JIT exact-M
+  `R13=2,R2=1` profile identity and one of its 96-core rank CPU sets match.
+  All other profiles retain their own operator-wide exact pair. Pass
   `use_default_stage_window_policy=False` for a controlled baseline.
 
 ## Planner Kinds

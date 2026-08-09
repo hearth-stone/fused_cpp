@@ -2124,8 +2124,8 @@ owner-cache band 是对 $\widehat D_i(\mathcal Z)$ 和候选空间的实现相�
 3. 使用 contention-aware event simulator 对候选重新评分；
 4. 在线 planner 使用经真实 runtime regret 验证过的低开销启发式。
 
-当前 active policy 将所有 legacy split 和 global byte-window profile 规范化为同一
-stage-range kernel variant $v$：
+当前 active policy 将所有历史 boolean/byte 编码规范化为同一 stage-range
+kernel variant $v$：
 
 $$
 v=(r_{13},r_2).
@@ -2307,16 +2307,16 @@ AmazonECSV1 的 $\nu=16$；若仍硬编码 8，8-core 的 4T 小窗口会只给�
 N tile，测得的退化来自错误 ABI 而非解析策略。
 
 profile 的 homogeneous full-call anchor 只有在该 route 和 shape 的所有 lane
-都返回 `-1/-1` 时继续使用；任一 lane 命中 override 时必须走 stage event
-simulation，不能拿 global-policy full-call 时间覆盖新执行语义。候选的
+都保持 profile baseline range pair 时继续使用；任一 lane 解析到不同 range
+时必须走 stage event simulation，不能拿 baseline full-call 时间覆盖新执行语义。候选的
 `active_working_set_bytes` 与 per-worker owner-window 诊断也按每个 lane 实际
-task window 计算。
+task range 计算。
 
 empirical backend 当前只有同时精确匹配双 NUMA AmazonC5192Cores 的 TP4
-`H=4096,F=512,E=256`、96-core rank、SVE JIT exact-M、split-W13 profile
+`H=4096,F=512,E=256`、96-core rank、SVE JIT exact-M、`R13=2,R2=1` profile
 identity 和 rank CPU 集合时，已在两个 NUMA rank 上验证的
-`amazon_c5_192c_tp4_f512_v1` 作为默认 runtime policy；任一字段不匹配或显式
-设置 `use_default_stage_window_policy=False` 时都继承 global policy。该默认是
+`amazon_c5_192c_tp4_f512_v4` 作为默认 runtime policy；任一字段不匹配或显式
+设置 `use_default_stage_window_policy=False` 时都保留 profile baseline pair。该默认是
 受限的确定性 execution policy；analytic backend 则在任意具有完整 machine
 calibration 的 SVE 模型上生成上述 policy。两者都不代表窗口已成为 cost-model
 搜索变量。特别是
@@ -2459,13 +2459,13 @@ contention。2026-07-16 起 profiler 为每个测量点预分配 native `out`，
 用于校准 $D_i(\mathcal Z)$；allocation/page-fault 应作为独立 E2E 成本处理。
 
 使用 route 96/384/1536 作为 holdout 时，8 个 profile 的公式中位绝对误差为
-0.53%--2.10%；P90 在 split profile 上不超过约 7.3%，但 EP/no-split 可达到
+0.53%--2.10%；P90 在 `R13=2` profile 上不超过约 7.3%，但 EP/`R13=1` 可达到
 约 11%--12%。因此 exact table 与小 M residual 仍是 active profile 的必要部分，
 不能仅凭 USL 主公式替代高线程尾部校正。
 
-### 9.2 Split-W13 owner-cache 留出验证
+### 9.2 Exact-range owner-cache 留出验证
 
-Neoverse-V3 NUMA0 有 96 核、每核 2 MiB 8-way L2。EP2 split stage 为
+Neoverse-V3 NUMA0 有 96 核、每核 2 MiB 8-way L2。EP2 `R13=2,R2=1` stage 为
 16 MiB；预留 2 way 后 $C_{\mathrm{owner}}=144$ MiB。独立 owner-slice scan
 拟合得到 $B_{\max}=8.991$ TB/s、$n_s=0.85$，取 $u=95\%$ 后预测 band 为
 3--8 experts，即 48--128 MiB。resident scan 拟合误差 median 1.1%、max 7.4%。
@@ -2588,7 +2588,7 @@ $q\in\mathcal Q_{\mathrm{tid}(q)}$，并确认 drain 模式恰好产生 $|\mathc
 
 2026-07-31 在 AmazonC5192Cores NUMA0 `0--95` 上完成 fixed-owner 首轮验证。
 `tokens=2048, top_k=6, H=4096, F=512, E=12` 的 25%/75% two-group 分布、
-96T、split-W13、7 次 warmup 和 31 次交错采样中，post-barrier、fixed-owner
+96T、`R13=2,R2=1`、7 次 warmup 和 31 次交错采样中，post-barrier、fixed-owner
 early+final、fixed-owner same-job drain 的中位数分别为
 `10.339/10.279/10.216 ms`；drain 相对 post-barrier 提升 `1.20%`，P10/P90 为
 `10.177/10.537 ms`。该组只验证新 owner policy 相对同轮 fallback 没有性能回退，
@@ -2599,7 +2599,7 @@ early+final、fixed-owner same-job drain 的中位数分别为
 ### 9.4 Amazon 192-core 双 NUMA 稳态校准
 
 2026-07-16 在 Neoverse-V3 的全部 192 核上以两个同步 rank 重测 TP4/F512
-split-W13 profile：rank 0 使用 CPU `0-95`/NUMA0，rank 1 使用 CPU
+`R13=2,R2=1` profile：rank 0 使用 CPU `0-95`/NUMA0，rank 1 使用 CPU
 `96-191`/NUMA1，每轮取两个 rank wall time 的最大值。每个 rank 流式使用 64 份
 不同 expert 权重；profile 包含 117 个 isolated 点和 120 个 contention 点，使用
 5 次 warmup、20 次正式采样，并复用预分配 native `out`。
@@ -2626,7 +2626,7 @@ pairwise-max 聚合，不能用两个 rank median 的平均值替代。
 ### 9.5 256-expert TP4 双 NUMA 校准
 
 2026-07-17 按真实 256 routed-expert TP4 人口重测同一 F512
-split-W13 kernel。TP 不分割 expert 数量，因此每个 rank 都生成并轮换
+`R13=2,R2=1` kernel。TP 不分割 expert 数量，因此每个 rank 都生成并轮换
 256 份不同权重；rank 0/1 仍分别绑定 CPU `0-95`/`96-191` 和
 NUMA0/1。profile 包含 117 个 isolated 点和 140 个 contention 点，
 每点 5 次 warmup、20 次正式采样，并按逐轮两 rank 的较慢者聚合。
@@ -2687,7 +2687,7 @@ planner 仍使用 empirical contention profile；公式、可行域和 productio
 ### 9.7 Xbyak exact-M kernel 验证
 
 2026-07-20 在 Neoverse-V3 NUMA0 CPU `0-95` 和 8-core Neoverse-V1 CPU
-`0-7` 上，以 H4096/F512、8 份连续 expert、split-W13 对比
+`0-7` 上，以 H4096/F512、8 份连续 expert、`R13=2,R2=1` 对比
 `jit/xbyak_exact_m` 与 `asm/static_bucketed`。每次实现切换后先执行一次不计时
 调用，再连续测 5 次，避免把 instruction-cache 切换计入某一 variant；每点取
 11 次样本中位数。M1--M12、SiLU poly4/5/6、normal/scheduled/async 和 W2
@@ -2886,7 +2886,7 @@ planner 是求解器实现替换，不是新的 runtime execution mode。
 uncertainty band 与至少两个最快 head shape，并对 workload 内实际出现的
 `1/2/4/8/12` route threshold 去重，以控制冷搜索成本。
 
-2026-07-26 在 AmazonC5192Cores NUMA0 `0-95` 上使用 split-W13、
+2026-07-26 在 AmazonC5192Cores NUMA0 `0-95` 上使用 `R13=2,R2=1`、
 H4096/F512、256 experts、2048 tokens、TopK=6 验证默认自动策略。远端 Plan V2/
 planner 聚焦回归为 50 passed，native tail-pool 专项为 1 passed；本地全部 MoE
 回归为 1097 passed、176 skipped。所有进入计时的
@@ -2916,7 +2916,7 @@ latency，不用于证明 cost model 的绝对时间或 runtime regret 准确性
 ### 9.13 192-core 双 NUMA 当前二进制校准刷新
 
 2026-07-26 在 AmazonC5192Cores 上按 9.5 的 256-expert TP4/F512 口径重测
-split-W13 和 no-split-W13 完整配对表。两个同步 rank 分别绑定
+`R13=2,R2=1` 和 `R13=1,R2=1` 完整配对表。两个同步 rank 分别绑定
 CPU `0-95`/`96-191` 和 NUMA0/1；每张表包含 180 个 isolated 点和 238 个
 contention 点，每点 5 次 warmup、20 次正式采样。route/thread/shape grid
 保持不变，source SHA 更新为
@@ -2950,7 +2950,7 @@ $\widehat D_i(\mathcal Z)$ 定义、公式形式、candidate space 或 productio
 - 冷 weight 是 compulsory DRAM，而 packed-A refill 是 cache/spillable traffic；
 - M<=12 的 one-pass B 不占 reusable LLC budget，但仍占 DRAM service；
 - 非整除 N range 不丢 tile，并按尾 range 的实际 active owners 收费；
-- split-W13 不改变 GEMM executed work，只增加 range cost；
+- 增加 W13 range 数不改变 GEMM executed work，只增加 range cost；
 - 多个 phase 对同一资源的 aggregate request 超过 ceiling 时产生 derate；
 - 无 measured shape table 的 analytic model 可直接进入
   `IntervalPlanner`/`PlannedMoE`；
@@ -3128,7 +3128,7 @@ task 1 `0-15 -> 0-31`、task 3 `16-31 -> 32-63` 后：
 ### 9.18 单次 bounded tail repartition 验证
 
 2026-07-30 在 AmazonC5192Cores NUMA0 CPU `0-95` 上先做静态可行性验证。固定
-TP4 H4096/F512、8 个 active expert、每 expert `M=1536`、split-W13 SVE JIT
+TP4 H4096/F512、8 个 active expert、每 expert `M=1536`、`R13=2,R2=1` SVE JIT
 kernel；首波保持 `6x16T`，两个第二波 expert 同时改为 `24/32/48T`。每轮以两
 个 tail 中较慢者决定 wall time，结果为：
 
@@ -3228,7 +3228,7 @@ task。production auto 为 `8.753 ms`（p10--p90
 
 在 AmazonC5192Cores 的 NUMA0 `0--95` 上，以 TP4
 `H=4096, F=512, E=256`、2048 tokens、TopK=6、SVE JIT exact-M 和
-split-W13 路径验证 2.3.2。每组复用同一份 packed weights，strict 与
+`R13=2,R2=1` 路径验证 2.3.2。每组复用同一份 packed weights，strict 与
 tail-steal 交错执行；使用 8--10 次 warmup 和每种模式 101 次正式采样，uniform
 额外使用 201 次采样。实验参数为 $d=2,r_{\min}=2$。
 
@@ -3263,7 +3263,7 @@ route 中增加了迁移数，但未增加中位收益；$r_{\min}=1$ 同样只�
 
 ### 9.20 Cold-phase CP-SAT mixed-width oracle
 
-2026-07-31 使用 AmazonC5192Cores 双 NUMA TP4/F512 exact-M split-W13 profile，
+2026-07-31 使用 AmazonC5192Cores 双 NUMA TP4/F512 exact-M `R13=2,R2=1` profile，
 对单 rank 的 96 cores 离线求解 6.2.1。默认 stage-window policy 为
 `amazon_c5_192c_tp4_f512_v1`，width 域为 `1,2,4,8,16`，fixed baseline 为
 当前 DSV4 strict `12x8T` lane DAG。packed-B 带宽 ceiling 取该机单 NUMA
@@ -3511,7 +3511,7 @@ diagnostic；不修改 production empirical backend、analytic phase service、�
 2026-08-06 在 AmazonC5192Cores NUMA0 `0-95` 上标定 8.2.5 的
 $p_{\mathrm{eff}}(\omega)$，并对 production planner 做端到端 A/B。形状为 TP4
 `H=4096/F=512`，每 expert 12 MiB packed BF16，单个 stage window 4 MiB，
-split-W13、SVE JIT exact-M、32 MiB HugeTLB、NUMA-local。每个计时 task 使用不同
+`R13=2,R2=1`、SVE JIT exact-M、32 MiB HugeTLB、NUMA-local。每个计时 task 使用不同
 expert，因此 packed-B 始终为流式读取。有用带宽只计一次 compulsory 权重字节；
 本节点实测峰值为 `367.4 GB/s`。
 
@@ -3648,16 +3648,16 @@ $13.0\%$/$27.0\%$，$M=120$ 在 $\omega=0.125$ MiB 下掉 $19.7\%$/$39.0\%$，�
 并发 expert 数塌到 6 或 3）超过窗口能挽回的量，因此 $\omega$ 在宽 team 上不是
 可迁移量。
 
-这一点不影响 policy，因为**operator-wide legacy 几何本身就是一个随宽度缩小的每
-线程窗口**：split-W13 给出一个 $4$ MiB 的 W13 range 与一个 $4$ MiB 的 W2 range，
-故 $\omega_{\text{legacy}}=4\ \mathrm{MiB}/t$，即 `1T` 为 $4$ MiB 而 `32T` 为
-$0.125$ MiB。宽 team 从来不在病态区：在 `16T`/`32T` 上最优窗口相对 legacy 只值
-$+2.4\%$/$+0.8\%$（$M=28$）与 $+4.2\%$/$+8.5\%$（$M=120$，此时 legacy 的
+这一点不影响 policy，因为**operator-wide baseline 几何本身就是一个随宽度缩小的每
+线程窗口**：`R13=2,R2=1` 给出一个 $4$ MiB 的 W13 range 与一个 $4$ MiB 的 W2 range，
+故 $\omega_{\text{baseline}}=4\ \mathrm{MiB}/t$，即 `1T` 为 $4$ MiB 而 `32T` 为
+$0.125$ MiB。宽 team 从来不在病态区：在 `16T`/`32T` 上最优窗口相对 baseline 只值
+$+2.4\%$/$+0.8\%$（$M=28$）与 $+4.2\%$/$+8.5\%$（$M=120$，此时 baseline 的
 $0.125$ MiB 反而略偏小）。因此 `16T` 及更宽宽度保持继承。
 
-真正的空洞在 `49--95` band 的窄端——V1 只标定了 `8T`。$M=72$ 上 legacy 对最优
+真正的空洞在 `49--95` band 的窄端——V1 只标定了 `8T`。$M=72$ 上 baseline 对最优
 窗口为 `1T` $3.39\times$、`2T` $2.94\times$、`4T` $1.65\times$，因为那里
-$\omega_{\text{legacy}}$ 分别是 $4$/$2$/$1$ MiB，比最优大 $32$--$16$ 倍。
+$\omega_{\text{baseline}}$ 分别是 $4$/$2$/$1$ MiB，比最优大 $32$--$16$ 倍。
 `amazon_c5_192c_tp4_f512_v3` 用实测最优（`1T`/`2T` 取 $1/8$ MiB，`4T` 取
 $1/16$ MiB）补齐这三格，`8T` 逐字节保持 V1 的标定值。catalog 里没有 preset 会把
 $49\le M\le95$ 的 expert 排到 8 线程以下，因此 V2 与 V3 在五个 preset 上生成
@@ -4144,3 +4144,4 @@ $M=12$、`1/2/4/8T`，并给 W13 的两个端点写入独立标签，保证后�
 | 2026-08-09 | v0.84 | 异构 overlap、working-set search、working-set owner-cache 与 $T_{iso}$ roofline 校准工具迁移到 exact $(R_{13},R_2)$：MiB sweep 先按 packed tile 几何量化再调用 runtime，并同时记录请求字节与 achieved range；working-set 尺寸改为两个 stage 最大精确 range，因而不再限定 $R_{13}=2,R_2=1$；$T_{iso}$ 的 W2 shared-A traffic 补乘 $R_2$。工具不再设置 split 环境变量或调用 byte-window ABI，不改变 production planner 候选与剪枝。 |
 | 2026-08-09 | v0.85 | benchmark、timeline trace、stage breakdown 与 roofline caller 全部改为 exact $(R_{13},R_2)$：Plan V2 trace 逐 task 记录实际 range，GEMM throughput 标注直接按该 range 还原 owner N 列；字节窗口 sweep 仅保留为校准输入，并在调用 runtime 前量化为 exact range。补齐全部 schema-v2 历史 profile 的显式 range identity，删除校准 helper 的 runtime byte-window compatibility API；旧 split 字段和 profile 文件名仅保留为未读取 provenance。planner 候选、解析窗口目标和 native 执行几何不变。 |
 | 2026-08-09 | v0.86 | working-set shadow 的诊断 schema kind 从旧布尔策略命名改为 `stage_range_working_set_band_validation`；其输入、owner-cache 公式、推荐结果和 production 隔离边界均不变。 |
+| 2026-08-09 | v0.87 | 文档、Plan/profile schema 与 optimization manifests 收敛到 range-only 契约：公开 entrypoint 只记录正整数 `w13_ranges/w2_ranges`，Plan V2 每 task 必须携带正整数 range，profile 必须显式记录 exact identity；byte target 仅是解析模型在 plan lowering 前的校准输入。修正 homogeneous full-call anchor 的规则为“所有 task 保持 profile baseline pair”，并将默认 stage policy 标记为 V4 的 `R13=2,R2=1` 精确 gate。历史 JSON 字段、profile 文件名和 changelog 术语只作为 provenance 保留。 |

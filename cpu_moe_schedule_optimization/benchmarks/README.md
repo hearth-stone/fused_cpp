@@ -193,7 +193,7 @@ compute_gap merge_routes_total output_cast other
 activation/scatter. It is useful for spotting synchronization, dispatch, and
 unmeasured per-wave overhead.
 
-## Split-W13 Owner-Cache Bandwidth
+## Exact-Range Owner-Cache Bandwidth
 
 `bench_weight_scan.cpp` measures the N-split packed-B ownership pattern without
 GEMM instructions. Each team owns one expert stream and each worker scans a
@@ -211,7 +211,7 @@ taskset -c 0-95 /tmp/bench_weight_scan \
   --output-csv /tmp/weight_scan.csv
 ```
 
-Feed the CSV and a split schema-v2 profile to
+Feed the CSV and an exact-range schema-v2 profile to
 `cost_model/working_set_model.py`. The model fits only resident scan bandwidth;
 the fused profile remains held-out validation. See
 `cost_model/WORKING_SET_MODEL_VALIDATION.md` for the formula and V3 results.

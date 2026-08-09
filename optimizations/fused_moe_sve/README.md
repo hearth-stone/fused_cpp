@@ -90,7 +90,7 @@ numactl --cpunodebind=0 --membind=0 taskset -c 0-95 \
   --warmup 5 --runs 31 --switch-period 5
 ```
 
-With H=4096, F=512, eight distinct experts, and split-W13, the 192-core host's
+With H=4096, F=512, eight distinct experts, and `R13=2,R2=1`, the 192-core host's
 NUMA0 gained 13.6% for M5/M6 and about 10% for M9/M10 at 1T. M1-4, M7/8, and
 M11/12 are within 0.5% of static assembly at 1T. Reproducing the double-buffer
 state machine removed the earlier M7/8 regressions of 2-4% at 1T-4T. The
@@ -139,7 +139,7 @@ in
 
 `bench_pure_w13_gemm_m1_m2.py` removes the fused W13 epilogue by running the
 same exact-M packed-A/B JIT K-loop with the plain FP32 GEMM store. With the
-production two-range W13 split, cold-weight M1/M2 sustain about 36.1-36.6 GB/s,
+production `R13=2,R2=1` geometry, cold-weight M1/M2 sustain about 36.1-36.6 GB/s,
 or 90-91% of the calibrated read ceiling. This is essentially the same as the
 complete M2 W13+W2 stage, locating the remaining bandwidth gap in the GEMM
 load/compute loop rather than SiLU or pack-C. Results and the reproduction
@@ -434,7 +434,7 @@ Warmups consume the first copies and timed iterations continue from that
 offset, so `copies >= warmup + iters` guarantees no copy reuse.
 
 The default shape models EP2 (`H=4096`, `F=2048`) with four concurrent experts,
-24 threads per expert, and the current two-range split-W13 policy:
+24 threads per expert, and the current `R13=2,R2=1` policy:
 
 ```bash
 numactl --cpunodebind=0 --membind=0 taskset -c 0-95 \
@@ -656,7 +656,7 @@ With an explicit calibrated Kc, the isolated cold-B result is positive for
 every Mr on the 192-core host
 (roughly +6% to +13%). On the 8-core host, Kc=568 is the maximin compromise:
 M12/M4/M2/M1 improve by about 2.23%/2.35%/0.95%/0.58%, while M8 regresses by
-about 1.48%. Production split-W13 E2E improves by about 2.0% at route=12 and
+about 1.48%. Production `R13=2,R2=1` E2E improves by about 2.0% at route=12 and
 3.5% at route=2040 for two 4-thread experts on the 8-core host.
 
 The isolated result must not be extrapolated to a saturated expert wave. On
@@ -696,7 +696,7 @@ numactl --cpunodebind=0 --membind=0 \
   --trials 9 --evict-mib 192 --cpu 48
 ```
 
-## Threaded split-W13 working-set experiment
+## Threaded exact-range working-set experiment
 
 `run_thread_weight_working_set.py` drives the production-fused path of
 `bench_unfused_pipeline` with several thread mappings:
@@ -719,7 +719,7 @@ times. Each invocation uses a distinct weight copy.
 numactl --cpunodebind=0 --membind=0 taskset -c 0-95 \
   .venv/bin/python \
   optimizations/fused_moe_sve/benchmarks/run_thread_weight_working_set.py \
-  --output /tmp/split_w13_thread_working_set.json \
+  --output /tmp/stage_range_thread_working_set.json \
   --threads 1,2,4,8,16,32,64,96 --routes 192,2040 \
   --experiments nsplit,expert-fixed,expert-total \
   --nsplit-stage-mib 4,16,64 --expert-stage-mib 0.5,2 \
@@ -733,7 +733,7 @@ the same 96-thread budget:
 numactl --cpunodebind=0 --membind=0 taskset -c 0-95 \
   .venv/bin/python \
   optimizations/fused_moe_sve/benchmarks/run_thread_weight_working_set.py \
-  --output /tmp/split_w13_expert_team.json \
+  --output /tmp/stage_range_expert_team.json \
   --experiments team-fixed-route,team-fixed-work \
   --team-experts 1,2,3,4,6,8,12 --team-total-threads 96 \
   --team-route 2040 --team-total-routes 2304 \
@@ -756,7 +756,7 @@ M12-aligned routes; the default factors `2,5,10` produce routes `1020,408,204`.
 numactl --cpunodebind=0 --membind=0 taskset -c 0-95 \
   .venv/bin/python \
   optimizations/fused_moe_sve/benchmarks/run_fragmented_route_pipeline.py \
-  --output /tmp/split_w13_fixed_active_b_fragmentation.json \
+  --output /tmp/stage_range_fixed_active_b_fragmentation.json \
   --teams 24 --base-routes 2040 --hidden 4096 --intermediate 512 \
   --threads-per-team 4 --schedule dynamic --split-factors 1,2,5,10 \
   --replaced-teams 6,12,24 --warmup 2 --runs 7
@@ -833,39 +833,42 @@ The controlled full-pipeline fusion comparison is recorded in
 The unique-weight single-core cache-window measurements are recorded in
 [`results/amazon_192c_single_core_weight_window.md`](results/amazon_192c_single_core_weight_window.md).
 
-## Configurable packed-B windows
+## Exact packed-B stage ranges
 
-The production fused SVE expert accepts `weight_window_bytes` on the normal,
-scheduled, and async entrypoints. `None` reads
-`FUSED_CPP_MOE_WEIGHT_WINDOW_BYTES`, zero keeps the existing policy (two W13
-ranges and one W2 range when split-W13 is enabled), and a positive value limits
-the nominal packed-B bytes in every sequential W13 and W2 N range.
+The production fused SVE expert accepts positive `w13_ranges` and `w2_ranges`
+on the normal, scheduled, and task-DAG async entrypoints. Plan V2 carries the
+required positive `task_w13_ranges` and `task_w2_ranges` arrays. The values are
+the exact number of sequential packed-B N ranges; there is no boolean W13
+selector, byte-window runtime argument, inheritance sentinel, or geometry
+environment variable. Direct calls default to `R13=1,R2=1`; a production
+planner supplies the exact pair selected by its profile and per-task policy.
 
 For a GEMM with packed dimensions `(K, N)` and SVE BF16 N tile `v`, one packed-B
-tile contains `2*K*v` bytes. The implementation computes
+tile contains `2*K*v` bytes. A byte/MiB calibration target `S` is lowered before
+the runtime call as
 
 ```text
-max_tiles = max(1, floor(weight_window_bytes / (2*K*v)))
+max_tiles = max(1, floor(S / (2*K*v)))
 ranges = ceil((N/v) / max_tiles)
 ```
 
-and balances whole N tiles across those ranges. Therefore a target smaller than
-one packed-B tile rounds up to one tile. For TP4 `H=4096, F=512`, the current
-4 MiB stage corresponds to W13/W2 range counts `2/1`; 2 MiB gives `4/2`, and
-1 MiB gives `8/4`.
+The runtime then balances whole N tiles across that exact range count. A target
+smaller than one packed-B tile therefore lowers to one tile per range. For TP4
+`H=4096, F=512`, a 4 MiB calibration target corresponds to W13/W2 counts
+`2/1`; 2 MiB gives `4/2`, and 1 MiB gives `8/4`.
 
 Each range still uses the existing N-split team and the same assembly kernel.
 There is no barrier between adjacent ranges. W2 owner-scatter mirrors every
-window's potentially discontiguous column ownership, so the existing
-W2-to-scatter barrier remains elided. Consequently the byte target is a loop
-ordering and nominal active-range bound, not a strict synchronized cache
-residency limit. A smaller range also caps useful team width at its N-tile
-count; the planner must account for this before selecting very small windows.
+range's potentially discontiguous column ownership, so the existing
+W2-to-scatter barrier remains elided. Consequently the range count controls
+loop ordering and the nominal active-range bound, not strict synchronized cache
+residency. A smaller range also caps useful team width at its N-tile count; the
+planner must account for this before selecting very small ranges.
 
-The planner chooses a global window only when an exact schema-v2 profile
-contains that window and its W13/W2 range counts. Old split/no-split profiles
-describe only the 4 MiB-equivalent policy and must not be reused to score
-1/2 MiB windows. Compare explicit sizes with:
+The planner chooses a global pair only when an exact schema-v2 profile contains
+the same W13/W2 range identity. Historical boolean/byte fields in old JSON are
+ignored and cannot reconstruct or score another identity. Compare byte-target
+calibration points, lowered to exact ranges by the benchmark, with:
 
 ```bash
 numactl --cpunodebind=0 --membind=0 taskset -c 0-95 \
@@ -891,18 +894,17 @@ The async benchmark also accepts independent experimental pairs such as
 shows that the two stages can prefer different windows at medium routes, while
 long routes still prefer about 1 MiB per worker for both stages.
 
-Plan V2 additionally carries optional `task_w13_window_bytes` and
-`task_w2_window_bytes` arrays. `-1` inherits the operator-wide policy, `0`
-uses the stage's legacy range rule, and a positive value selects an independent
-tile-aligned target. `PlannedMoE` can apply a named deterministic
-`TaskStageWindowPolicy` after it has selected the task DAG and widths; the
-policy is not a search dimension and does not alter cost-model scores.
+`PlannedMoE` can apply a named deterministic `TaskStageWindowPolicy` after it
+has selected the task DAG and widths. Analytical byte targets are quantized at
+that boundary, and the resulting positive exact counts populate the Plan V2
+arrays. The policy is not a free search dimension, but the cost model scores
+each candidate using the ranges that will actually execute.
 
 The first policy is default-on only for the exact dual-NUMA
 AmazonC5192Cores TP4 `H=4096,F=512,E=256`, 96-core/rank, SVE JIT exact-M
-split-W13 profile identity. `PlannedMoE` resolves it independently for each
-candidate profile, so no-split and nonmatching profiles retain their
-operator-wide windows. Pass `use_default_stage_window_policy=False` to build a
+`R13=2,R2=1` profile identity. `PlannedMoE` resolves it independently for each
+candidate profile, so nonmatching profiles retain their own exact baseline
+pair. Pass `use_default_stage_window_policy=False` to build a
 controlled baseline. The benchmark below compares that disabled baseline with
 the default policy; `--no-static-stage-windows` suppresses the comparison:
 
@@ -924,7 +926,7 @@ and applicability limits are recorded in
 [`results/amazon_192c_static_stage_window_policy.md`](results/amazon_192c_static_stage_window_policy.md).
 
 That policy originally had no route band below 49 routes, so every expert with
-`M < 49` inherited the operator-wide legacy geometry. Because the kernel loops M
+`M < 49` retained the operator-wide baseline geometry. Because the kernel loops M
 panels outside and N tiles inside, each additional M12 panel walks the whole
 packed-B window again, so useful packed-B bandwidth is governed by the per-thread
 window `window_bytes / threads`. At `M=28` the effective re-read factor falls
@@ -951,8 +953,9 @@ PYTHONPATH=src numactl --cpunodebind=0 --membind=0 .venv/bin/python \
 Since the per-thread window is the invariant, the policy takes it as its input
 unit and lowers it to per-range bytes once, where the team width is known. That
 collapsed the calibrated table from 26 per-range numbers to 8 per-thread windows
-plus 6 cells one factor-of-two step away, and it made `w13_split` a degenerate
-case: with W13 at 8 MiB total, split is `g=4 MiB` and no-split is `g=8 MiB`.
+plus 6 cells one factor-of-two step away. The old boolean selector merely named
+two endpoints of this same geometry: an 8 MiB W13 matrix with `R13=2` has
+`g=4 MiB`, while `R13=1` has `g=8 MiB`. They are now ordinary exact identities.
 
 The `13 <= M <= 48` band then landed as the production default, at 0.25 MiB per
 thread for widths 1/2/4 and 0.125 MiB at width 8. Default against default it
@@ -963,10 +966,10 @@ route below the old first band, which is why the gap was that large.
 
 The current default `amazon_c5_192c_tp4_f512_v4` then filled the `49-95` band at
 1, 2 and 4 threads, which V1 had calibrated at 8 threads only, and split the
-`144-287` band at 216 routes. Both matter because the inherited legacy geometry is
+`144-287` band at 216 routes. Both matter because the baseline `R13=2` geometry is
 itself a per-thread window of `4 MiB / t`, so it is 32x to 8x too large at narrow
 widths and worth 3.39x, 2.94x and 1.65x of isolated bandwidth at `M=72`. The same
-identity explains why widths 16 and 32 stay inherited: `4 MiB / 16` and
+identity explains why widths 16 and 32 retain the baseline: `4 MiB / 16` and
 `4 MiB / 32` already land near the measured optimum, leaving only 0.8-8.5% there,
 and per-thread windows stop being transferable above 8 threads anyway, where the
 width itself costs 13-39%.
@@ -1006,7 +1009,7 @@ The default-on integration rerun, with no enable flag, measured +30.58%/+30.34%
 for active-set-128 on NUMA0/NUMA1 and +0.01% for the non-overridden uniform
 control.
 
-The split-W13 thread/weight mapping measurements are recorded in
+The exact-range thread/weight mapping measurements are recorded in
 [`results/amazon_192c_thread_weight_working_set.md`](results/amazon_192c_thread_weight_working_set.md).
 
 The fixed-active-B route-fragmentation measurements are recorded in

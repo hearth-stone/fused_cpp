@@ -60,14 +60,14 @@ zero regret.
 
 | Mode | Routing | Selected rank plans | Predicted ms | Actual ms | Best fixed ms | Regret | Prediction error |
 | --- | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| TP2 | uniform | S:`8,8,8,8` / S:`8,8,8,8` | 42.617 | 43.537 | 42.690 | 1.98% | -2.11% |
-| TP2 | hotspot | S:`16,8,8` / S:`16,8,8` | 43.043 | 42.868 | 42.844 | 0.06% | +0.41% |
-| TP2 | trace | S:`16,8,8` / S:`16,8,8` | 42.686 | 43.974 | 43.537 | 1.01% | -2.93% |
-| EP2 | uniform | S:`32` / S:`32` | 45.485 | 45.409 | 45.420 | 0.00% | +0.17% |
-| EP2 | hotspot | S:`32` / S:`32` | 63.340 | 60.671 | 59.659 | 1.70% | +4.40% |
-| EP2 | trace | S:`16,16` / S:`16,16` | 45.055 | 44.694 | 44.680 | 0.03% | +0.81% |
+| TP2 | uniform | R(2,1):`8,8,8,8` / R(2,1):`8,8,8,8` | 42.617 | 43.537 | 42.690 | 1.98% | -2.11% |
+| TP2 | hotspot | R(2,1):`16,8,8` / R(2,1):`16,8,8` | 43.043 | 42.868 | 42.844 | 0.06% | +0.41% |
+| TP2 | trace | R(2,1):`16,8,8` / R(2,1):`16,8,8` | 42.686 | 43.974 | 43.537 | 1.01% | -2.93% |
+| EP2 | uniform | R(2,1):`32` / R(2,1):`32` | 45.485 | 45.409 | 45.420 | 0.00% | +0.17% |
+| EP2 | hotspot | R(2,1):`32` / R(2,1):`32` | 63.340 | 60.671 | 59.659 | 1.70% | +4.40% |
+| EP2 | trace | R(2,1):`16,16` / R(2,1):`16,16` | 45.055 | 44.694 | 44.680 | 0.03% | +0.81% |
 
-`S` means split-W13. The maximum selected-plan regret is 1.98%. Prediction error
+`R(2,1)` means exact `R13=2,R2=1`. The maximum selected-plan regret is 1.98%. Prediction error
 ranges from -2.93% to +4.40%. Separate 30-sample repeats show an approximately
 1% practical noise floor, so sub-percent candidate ordering is not treated as
 significant.
@@ -79,7 +79,7 @@ intervals, raw regret, and rank histograms, is stored in
 ## EP2 hotspot diagnosis
 
 The EP2 hotspot places `4x768 + 12x384 + 16x96 = 9216` routes on rank 0 and
-`32x96 = 3072` routes on rank 1. Both ranks select split-W13 `(32)`, so each rank
+`32x96 = 3072` routes on rank 1. Both ranks select `R13=2,R2=1` with shape `(32)`, so each rank
 runs one expert at a time and the residual is not intra-rank expert contention.
 
 A targeted five-warmup, 30-run replay measured:
