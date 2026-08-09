@@ -367,9 +367,10 @@ features:
       That landed as amazon_c5_192c_tp4_f512_v3. No catalog preset plans a 49-95
       route expert below 8 threads, so V2 and V3 build element-identical plans on
       all five presets and the gain is latent. A follow-up sweep then located the
-      threshold that sets the optimum: each thread scans all of A inside a range,
-      so the per-thread scan is 2*M*K, and the optimum saturates exactly where
-      that fills private L2, at M=256 for W13 and M=2048 for W2, a ratio of H/F=8.
+      threshold that sets the optimum: under an N-split team each thread scans all
+      of A inside a range, so the per-thread scan is 2*M*K, and the optimum
+      saturates exactly where that fills private L2, at M=256 for W13 and M=2048
+      for W2, a ratio of H/F=8.
       That exposed a defect in the V1 table, whose 144-287 band used one eighth of
       a MiB per thread across its whole range while everything from M=224 up wants
       one half: at M=256 the old value costs 61 percent at one thread and 23
@@ -382,7 +383,29 @@ features:
       widths above 8 already sit near the optimum on the inherited geometry. The
       share of tasks still inheriting ranges from 0 percent on moe256-uniform to
       100 percent on moe256-long-short-bimodal, where split/no-split is the only
-      window control, so the operator-wide geometry stays a live candidate. See
+      window control, so the operator-wide geometry stays a live candidate. Two
+      later corrections do not change any calibrated value but do bound how the
+      table may be read. First, the table assumes huge pages: an earlier base-page
+      control was invalid because plain aligned allocation inherited transparent
+      huge pages from a recycled arena, and with a real MADV_NOHUGEPAGE control the
+      page size is worth 13.2 percent on streamed weights, crossing over from 4 KiB
+      to 2 MiB rather than 2 MiB to 32 MiB. The two huge-page arms still agree cell
+      for cell, so production, which defaults to thp, is unaffected, but at M=28 the
+      base-page optimum is two steps smaller and the banded value costs 5.5 percent
+      there. Second, the per-thread window only denotes a per-thread footprint under
+      an N-split team; choose_moe_gemm_split takes the M axis for W13 at two points
+      inside the bands, M<=32 at two threads and M>=512 at eight, where each thread
+      instead holds the whole range. The window must therefore not be extrapolated
+      across those boundaries. Planning all nine presets and binning tasks by route
+      and chosen width then showed the table has only six live cells of twenty-four:
+      every one and two thread cell is dead, four threads is reached only in 96-143,
+      and 285 tasks inherit the operator-wide window, including all of
+      moe256-long-short-bimodal. That is the direct explanation for three latent
+      gains, so coverage is worth checking before a cell is calibrated. The one live
+      four-thread cell also carries an in-band gradient: 0.125 MiB per thread beats
+      the shipped 0.0625 by 0.28, 1.44 and 3.26 percent at route 96, 108 and 120, and
+      moe256-active-set-128 sits at exactly route 96, on the crossover, so the value
+      stays and the 100-143 deficit is recorded instead. See
       results/amazon_192c_short_route_stage_windows_20260806.md.
 
   - id: compute.xbyak_bulk_m

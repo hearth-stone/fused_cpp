@@ -478,8 +478,286 @@ for `w13` at 0.125 / 0.25 / 0.5 MiB per thread:
 The optimum is identical under all three, the step between `M=192` and `M=224`
 appears under all three, and the absolute numbers agree within 0.6%. Page size
 therefore neither moves the threshold nor changes its magnitude, so it is a cache
-capacity effect and not a translation one. This also settles the A-side TLB
-question empirically rather than by assumption.
+capacity effect and not a translation one.
+
+**Correction (2026-08-08): the `small 4K` column above is invalid.** The `kSmall`
+path allocated through `::operator new`, which glibc served from an arena torch had
+already `madvise(MADV_HUGEPAGE)`d, so the mapping silently inherited transparent
+huge pages. Per-VMA measurement of the packed weight: `AnonHugePages` was
+`764 / 768 MiB` under `small` versus `768 / 768` under `thp`. The column is a
+second `thp` run, which is why it agreed to 0.6%. `kSmall` now maps explicitly
+with `MADV_NOHUGEPAGE` and the same probe reads `0 / 768 MiB`.
+
+The conclusion survives on the two valid arms. `thp` (2 MiB) and `hugetlb`
+(32 MiB) differ by a factor of 16 in page size and give identical argmax at every
+cell, so the threshold is not a translation artifact within that range. What the
+table does **not** establish is 4 KiB behaviour, and result 9 shows that arm does
+move the optimum at short routes. The A-side TLB question is therefore settled
+between 2 MiB and 32 MiB, not down to base pages.
+
+## Result 9: the calibrated table assumes huge pages, and the short-route band depends on it
+
+With a real base-page arm, page size is worth 13.2% under streaming access, and
+the crossover is 4 KiB to 2 MiB rather than 2 MiB to 32 MiB. Useful packed-B
+bandwidth at `24x4T`, `M=28`, `w13` and `w2` both at 0.25 MiB per thread:
+
+| policy | achieved page | GB/s | vs 4 KiB |
+| :--- | :--- | ---: | ---: |
+| `small` | 4 KiB | 265.9 | — |
+| `thp` | 2 MiB | 301.1 | +13.2% |
+| `hugetlb` | 32 MiB | 304.0 | +14.3% |
+
+The mechanism is prefetch continuity, not TLB coverage: a 4 KiB page holds only
+64 cache lines, so a streaming scan restarts the prefetcher every 64 lines, while
+2 MiB holds 32768. TLB coverage cannot be the driver because 2.3 GB of weights on
+2 MiB pages is 1150 entries, still inside the roughly 2048-entry L2 TLB — and
+going to 32 MiB, which cuts that to 72 entries, buys only the remaining 1.0%.
+
+The optimum itself moves at short routes. W13 window sweep, `w2` at 0.25 MiB
+per thread, wall time in ms:
+
+| ω MiB/thread | M=28 small | M=28 thp | M=28 hugetlb | M=120 small | M=120 thp | M=120 hugetlb |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0.0156 | 12.168 | 11.851 | 11.824 | 35.285 | 32.608 | 32.571 |
+| 0.0312 | 8.757 | 8.546 | 8.428 | 21.294 | 19.758 | 19.647 |
+| 0.0625 | **8.351** | 8.240 | 8.094 | 15.555 | 14.588 | 14.489 |
+| 0.125 | 8.418 | 8.152 | 8.055 | **15.480** | **14.128** | **14.060** |
+| 0.25 | 8.811 | **8.077** | **8.038** | 16.905 | 14.567 | 14.502 |
+| 0.5 | 9.631 | 9.041 | 9.024 | 17.843 | 17.408 | 17.390 |
+| 1.0 | 10.746 | 10.603 | 10.648 | 19.708 | 19.124 | 19.307 |
+
+`M=120` peaks at 0.125 under all three page sizes, matching the `96-143` band.
+`M=28` peaks at 0.25 on huge pages but at 0.0625 on base pages — two steps apart.
+The production `13-48` band uses 0.25, correct for huge pages; on base pages that
+value costs 5.5%.
+
+This is consistent with result 7. At `M=28` the shared-A ratio is 0.11, so the A
+term is off and the optimum is set entirely by the B side, which is exactly what
+prefetch continuity governs. At `M=120` the ratio is 0.47 and the A term already
+pins the optimum, so page size cannot move it. The reading of the boundary between
+those two states rests on two points and is not independently verified.
+
+Consequence for the table: it is calibrated on huge pages and no cell needs to
+change, because production defaults to `thp` and the two huge-page arms agree.
+But the "runs on huge pages" premise is now explicit, and a host with THP disabled
+would want a separate short-route calibration.
+
+## Result 10: two mechanisms behind the neutral scratch A/B
+
+The per-mapping registry (`FUSED_CPP_PAGE_TRACK=1`, `_moe_C.page_mappings()`)
+shows the scratch pool is not resident on the non-plan path. Three consecutive
+forward passes at `E=64, H=4096, F=512, M=512`:
+
+| phase | total allocations | live mappings | live MiB | new |
+| :--- | ---: | ---: | ---: | ---: |
+| after pack | 2 | 2 | 768.0 | 2 |
+| after call 1 | 42 | 2 | 768.0 | +40 |
+| after call 2 | 82 | 2 | 768.0 | +40 |
+| after call 3 | 122 | 2 | 768.0 | +40 |
+
+Forty scratch buffers are mapped and unmapped on every call; only the two packed
+weight mappings persist. The pool comment claims buffers grow once and are reused,
+which holds for `ScheduledTeamScratch` behind the `static` pool used by the async
+plan path, but not for the `thread_local HierarchicalScratchPool` this path uses.
+
+This changes how the earlier scratch A/B should be read. Switching those buffers to
+huge pages measured neutral, and the natural reading was that scratch does not care
+about page size. The registry says the more likely reading is that scratch never
+got huge pages at all — and that a larger page would also make the per-call
+remapping more expensive, so two opposite effects were being summed. Neither has
+been separated. Weights carry the measured 13.2%, and scratch is about 4 MiB of
+actual footprint against 2.3 GB of streamed weights, so this is an efficiency
+question on a cold path rather than a throughput one.
+
+## Result 11: the per-thread window only means that under an N-split team
+
+`choose_moe_gemm_split` picks the team's partition axis from `(stage, M, threads)`,
+while the weight-window loop always cuts N. Under `kN` a thread owns a column slice
+and reads all `M` rows, so its B window is `g/t = ω`. Under `kM` a thread owns a row
+slice and every thread reads the *same* B window, so its B window is `g = t·ω` and
+its A share is `2(M/t)K`.
+
+| | `kN` | `kM` |
+| :--- | ---: | ---: |
+| per-thread A | `2MK` | `2(M/t)K` |
+| per-thread B window | `g/t = ω` | `g = t·ω` |
+| team total A per range | `t·2MK` | `2MK` |
+
+So `ω` denotes a per-thread footprint only under `kN`, while the policy lowers
+`g = t·ω` unconditionally. For W13 the rule crosses two bands: `13-48` at `t=2`
+splits at `M=32`, and `288-575` at `t=8` splits at `M=512`. W2's thresholds are far
+higher, so it is `kN` throughout the catalog, and the two stages of one call can run
+different geometries.
+
+This corrects the interpretation of result 7's supporting `M=2040` figure. That
+configuration is `24x4T`, where W13 takes `kM`, so its `16.7 MB` is the team total
+per range, not the per-thread amount; per thread it is `3.98 MiB`, giving `A/L2 =
+1.99` rather than `7.97`. The measurement discriminates between the two readings:
+the predicted A-rescan increment from `ω = 1` to `0.25 MiB` is `2.41 GB` under `kM`,
+about 6.9 ms, against 6.18 ms measured, while `kN` would predict `9.63 GB` and about
+27.5 ms. Result 7's own sweep points are all `M ≤ 320` at `t ≤ 8`, which is `kN`
+except for `M ≤ 32` at `t=2`, so its threshold derivation holds on its own domain.
+
+No calibrated value changes: the table was measured against real behaviour, whatever
+its geometry. What changes is that `ω` must not be extrapolated across those two
+boundaries, and that the `M=28, t=2` cell noted in result 4 as a few percent off the
+other widths is now explained — it is `kM`, where the per-thread footprint is `2ω`.
+
+## Result 12: six of the table's twenty-four cells are exercised
+
+Planning all nine catalog presets through the production planner and binning each
+task by its expert's route count and chosen team width shows which cells of
+`amazon_c5_192c_tp4_f512_v4` a preset can actually reach:
+
+| band | 1T | 2T | 4T | 8T |
+| ---: | :---: | :---: | :---: | :--- |
+| 13-48 | — | — | — | `dsv4`:120, `uniform`:256 |
+| 49-95 | — | — | — | — |
+| 96-143 | — | — | `active-set-128`:128 | `tiered-hotspot`:48 |
+| 144-215 | — | — | — | `dsv4`:15, `active-set-64`:64 |
+| 216-287 | — | — | — | `dsv4`:3 |
+| 288-575 | — | — | — | `dsv4`:7, `active-set-32`:32, `tiered-hotspot`:12 |
+
+Every 1T and 2T cell is dead, and 4T is reached only in `96-143`. A further 285
+tasks fall outside the table and inherit the operator-wide window, including all
+179 of `moe256-long-short-bimodal`, whose routes are `{12, 2040}`.
+
+This explains three separate latent gains directly. V3 filled the `49-95` narrow
+widths, all of which are dead; V4 filled `216-287`, which only `dsv4` reaches and
+with three tasks; and result 5 kept 16T and 32T on the inherited geometry. In each
+case the end-to-end A/B could only report noise, not because the calibration was
+wrong but because no preset plans a task there. Coverage is therefore worth checking
+before a cell is calibrated rather than after the A/B fails to move.
+
+The one live 4T cell also shows how an A/B can be structurally blind.
+`moe256-active-set-128` is in the A/B set, but its two arms are `legacy` at
+`4 MiB / t = 1 MiB` and `policy` at `0.0625 MiB`. The value that beats both,
+`0.125 MiB`, appears in neither arm, so no amount of repetition would have found it.
+
+## Result 13: the optimal tile count is a monotone staircase in M, and the window is irrelevant below M=40
+
+An eight-point M grid at 4 threads, with `w2` held at 0.5 MiB per range so the W13
+axis is the only variable, 192 homogeneous experts, wall time in ms:
+
+| M | A/L2 | 1 tile (0.0625) | 2 tiles (0.125) | 4 tiles (0.25) | best | margin |
+| ---: | ---: | ---: | ---: | ---: | :--- | ---: |
+| 28 | 0.109 | 8.075 | 8.077 | 8.048 | (4) | **0.33%** |
+| 40 | 0.156 | 8.744 | 8.733 | 8.682 | (4) | **0.59%** |
+| 56 | 0.219 | **9.362** | 9.452 | 9.529 | 1 | 0.96% |
+| 72 | 0.281 | **9.977** | 10.202 | 10.585 | 1 | 2.26% |
+| 84 | 0.328 | **10.759** | 10.892 | 11.383 | 1 | 1.24% |
+| 96 | 0.375 | **11.687** | 11.695 | 12.302 | 1 | 0.07% |
+| 108 | 0.422 | 12.979 | **12.736** | 13.322 | 2 | 1.91% |
+| 120 | 0.469 | 14.170 | **13.874** | 14.398 | 2 | 2.13% |
+
+Two things follow, and the first retires an earlier reading of this data.
+
+**Below `M = 40` the window does not matter.** A fourfold change in the window moves
+wall time by 0.33-0.59%, at or below the run-to-run repeatability of about 0.5%. The
+`13-48` band's `0.25 MiB` is therefore one of three indistinguishable choices rather
+than a meaningful optimum, which also explains why it survives page-size changes
+poorly: at `M=28` the base-page arm in result 9 picks a different cell, and there is
+almost nothing separating them.
+
+**From `M = 56` the optimum is one tile and steps to two near `M = 100`.** The
+progression is monotone: one tile through 56-96, two tiles from 108. Combined with
+result 7's `1/2 MiB` from `M = 224`, the staircase is 1, 2, 8 tiles per thread with no
+intermediate dip. An earlier reading of a subset of these points as non-monotonic was
+an artifact of comparing runs taken at different `w2` windows.
+
+That last point is itself a finding: **the W2 window changes the shape of the W13
+curve.** At `M = 28` with `w2` at 0.25 MiB per range the W13 axis has a 2.0% gradient
+(8.240 / 8.152 / 8.077 for 1, 2, 4 tiles), while at 0.5 MiB it is flat
+(8.075 / 8.077 / 8.048). Result 4 established W2 as the weak axis by its own range,
+which remains true, but the two axes are not independent in shape.
+
+For the shipped table this changes the reading of `96-143 @ 4T` but not the decision.
+The step lands at `M ≈ 100`, inside the band, and `moe256-active-set-128` sits at
+exactly `route = 96` where the two windows are 0.07% apart. Routes 108-143 at four
+threads pay about 2% against the shipped `0.0625`. Splitting the band near `M = 100`
+would fix that but adds a band and modifies a cell V1 calibrated jointly across four
+widths on a contention grid, which a 0.07% live gap does not justify.
+
+The other two cells that sit exactly on the one-tile floor were measured and the
+shipped value is correct in both: `49-95 @ 4T` at `M = 72` prefers one tile by 2.0%,
+and `96-143 @ 2T` at `M = 120` prefers one tile by 0.27%. So `96-143 @ 4T` is a single
+band-boundary case, not a systematic bias toward too-small windows at the floor.
+
+The `2T` result is worth noting separately: at the same `M = 120`, two threads prefer
+one tile while four threads prefer two. Result 1's width invariance was established as
+a spread of 3.0-5.6% at equal `ω`, which it still is, but the argmax itself is not
+width-invariant here. `R` differs by a factor of two between those widths at equal
+`ω`, which is the obvious suspect and is untested.
+
+## Result 14: the window's remaining cost is not in any counter measured
+
+At `M = 72` the one-tile and four-tile windows differ by 5.4% in wall time while every
+counter is flat. Per-iteration deltas, `R` varying fourfold:
+
+| M | ω | R | wall ms | instructions | l1d access | l1d refill | l2d refill |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 72 | 0.0625 | 32 | **9.954** | 9.57G | 3.10G | 0.05G | 52.6M |
+| 72 | 0.125 | 16 | 10.113 | 9.76G | 3.13G | 0.05G | 52.1M |
+| 72 | 0.25 | 8 | 10.495 | 9.74G | 3.14G | 0.05G | 52.6M |
+| 120 | 0.0625 | 32 | 14.137 | 15.38G | 5.00G | 0.10G | 66.0M |
+| 120 | 0.125 | 16 | **13.858** | 15.41G | 5.06G | 0.06G | 62.5M |
+| 120 | 0.25 | 8 | 14.516 | 15.44G | 5.06G | 0.07G | 63.2M |
+
+At `M = 72` L1 refills are constant at 0.05G and L2 refills vary by 1% while wall time
+varies by 5.4%. Instructions move 2%. At `M = 120` L2 refills do track the optimum,
+66.0 to 62.5M, but a 6% swing in refills cannot account for a 2.1% swing in wall time
+on its own.
+
+This eliminates the explanations that were on the table. Not L2 capacity, since
+`A + ω` occupies about 30% of private L2 through this range. Not A rescan traffic nor
+B reread traffic, since neither refill counter responds to a fourfold change in `R`.
+Not instruction count, so not micro-kernel amortization. Not barrier synchronization,
+which result 15 shows is constant at 1.2% across the legal range. Not interference,
+since reducing the concurrent big experts from 28 to 1 moves wall time by 1%.
+
+Five counters flat against a 5.4% wall-time difference points at latency rather than
+volume: fewer, longer ranges give longer uninterrupted N scans, which can change how
+well misses overlap without changing how many there are. That is the same class of
+effect as result 9, where identical byte counts differ by 13% on page size alone. The
+measurement that would settle it separates demand from prefetch within
+`l2d_cache_refill`, or looks at memory-stall distribution rather than totals.
+
+## Result 15: barrier cost is a step function of thread starvation, not a function of range count
+
+The stage window is quantised in whole packed-B tiles, `K * n_tile * 2`, which is
+64 KiB for W13 and 8 KiB for W2, and `make_weight_window_plan` clamps a range to at
+least one tile. A tile cannot be subdivided: the packed layout is tile-contiguous and
+the micro-kernel's output tile is `n_tile` wide. Under an N-split team this puts a
+floor on the per-thread window of exactly one tile, independent of `t`, because a range
+holding fewer tiles than the team has threads leaves the surplus threads with no work.
+
+Sampled share of `ThreadBarrier::wait()`, at `M = 120` and four threads:
+
+| tiles per range | idle threads | R | barrier share |
+| ---: | ---: | ---: | ---: |
+| 1 | 3 of 4 | 128 | **41.78%** |
+| 2 | 2 of 4 | 64 | **21.86%** |
+| 4 | 0 | 32 | 1.19% |
+| 8 | 0 | 16 | 1.19% |
+| 16 | 0 | 8 | 1.57% |
+| 32 | 0 | 4 | 1.28% |
+
+The share tracks the idle-thread fraction and is otherwise flat: `R` changes eightfold
+across the last four rows without moving it. So the barrier is not a per-range cost
+that accumulates, it is a step that fires only when the window starves threads.
+
+Two details matter for interpreting profiles. Waiting here is a spin, so it retires
+instructions at high IPC — 4.76 against 3.62 at the optimum — and shows up in
+`instructions`, not in `stall_backend`. A window below the floor therefore looks like
+extra work rather than extra waiting. And the shipped table never crosses the floor:
+its smallest `ω_w13` is `0.0625 MiB`, exactly one tile, while `ω_w2` stays eight tiles
+above its own 8 KiB floor.
+
+One structural gap follows without being reachable in production. A range with fewer
+tiles than threads could still use every thread by splitting M instead of N, which is
+what `kM` does, but `choose_moe_gemm_split` selects on `(stage, M, t)` and never
+consults the window. Since the table's minimum is one tile per thread, `g = t` tiles
+always divides evenly and the gap cannot be hit.
 
 ## Not established
 
@@ -495,11 +773,36 @@ question empirically rather than by assumption.
   measured but not landed, and no catalog preset plans a banded expert that wide.
 - The `49-95` band's narrow cells are calibrated but unexercised: no catalog
   preset plans a 49-95 route expert below 8 threads, so their 1.65x-3.39x
-  isolated gain has no end-to-end confirmation.
+  isolated gain has no end-to-end confirmation. Result 12 shows the whole band is
+  in fact dead at every width.
+- Whether the other five bands carry the same in-band step result 13 found in
+  `96-143`. Each band is a single window over a 36-to-288 route span, and only
+  `96-143` has been swept inside its own range at a fixed width.
+- What the window's residual cost actually is. Result 14 shows a 5.4% wall-time
+  spread at `M = 72` with instructions, L1 accesses, L1 refills, L2 refills and
+  barrier share all flat, so the mechanism is not volume of anything measured here.
+- Why the argmax is not width-invariant at `M = 120`, where two threads prefer one
+  tile and four prefer two. `R` differs twofold at equal `ω`, which is untested.
+- Why the W2 window changes the shape of the W13 curve. The effect is visible at
+  `M = 28`, a 2.0% W13 gradient at one `w2` setting against a flat curve at another,
+  and it was enough to make a subset of these measurements look non-monotonic.
 - The LLC-to-DRAM segment is still unmeasured. `ll_cache_miss_rd` counts only
   demand misses, `13 MB` where `2.4 GB` actually moved, and
   `l3d_cache_refill` reads zero on Neoverse-V3. Result 8 rules out paging as an
   explanation but says nothing about which cache level retains what.
+- Whether the `kM` regime has its own `ω*(M)` law. The existing calibration does
+  not stratify by geometry, and re-calibrating `13-48 @ t=2` and `288-575 @ t=8`
+  with `ω` redefined as `g` there may or may not change their values.
+- Whether the A side is page-sensitive at large `M`. Result 11's role swap predicts
+  it should be: past the threshold the streamed operand is A rather than B, so base
+  pages should hurt through the A staging buffer. Untested, and result 10 makes it
+  harder to test, since the scratch page backing is itself not currently pinned
+  down.
+- Whether the boundary in result 9, between "A term off so page size sets the
+  optimum" and "A term binding so it does not", is real. It rests on two points,
+  `M=28` at a ratio of 0.11 and `M=120` at 0.47.
+- What separates the two opposing effects in result 10: scratch never reaching huge
+  pages, versus a larger page making per-call remapping more expensive.
 - One host, one profile identity. The policy is profile-bound by design, so the
   band must not be extrapolated to other machines, `F` values or parallel
   degrees without repeating the measurement.
@@ -533,6 +836,20 @@ question empirically rather than by assumption.
   `thresh_m256_t{1,2,8}.json`: the shared-A threshold sweep and its width check.
 - `results/data/stage_window_omega_20260807/v4_{preset}.json`: the V3-to-V4 A/B.
 - `results/data/stage_window_omega_20260807/pages_{thp,hugetlb,small}_m{192,224,256}.json`:
-  the page-size control for the threshold.
+  the page-size control for the threshold. The `small` arm is invalid, see the
+  correction in result 8.
+- `results/data/stage_window_omega_20260807/realpages_{small,thp,hugetlb}_m28.json`:
+  streaming bandwidth on genuine base pages, transparent huge pages and 32 MiB
+  pages, after `kSmall` was fixed to force `MADV_NOHUGEPAGE`.
+- `results/data/stage_window_omega_20260807/wsweep_{small,thp,hugetlb}_m{28,120}.json`:
+  the W13 window sweep under each page size, which is where the short-route
+  optimum is shown to depend on page size.
+- `results/data/stage_window_omega_20260807/band96143_m{96,108}_t4.json`: the
+  in-band sweep that first located the `96-143` step.
+- `results/data/stage_window_omega_20260807/grid_m{28,40,56,72,84,96,108,120}_t4.json`:
+  the eight-point M grid at a fixed W2 window, which is the version to use — the two
+  files above were taken at a different W2 window and are not comparable to it.
+- `results/data/stage_window_omega_20260807/floor_m72_t4.json` and
+  `floor_m120_t2.json`: the two previously unmeasured one-tile cells.
 - `results/data/heterogeneous_overlap_20260806/`: the earlier 195-expert sweeps
   and the heterogeneous co-scheduling probes that led to this measurement.
