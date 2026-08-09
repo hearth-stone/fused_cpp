@@ -2182,19 +2182,14 @@ Plan V2 为每个 whole-expert task 显式携带两个 stage range 数：
 
 $$
 (R_{13,i},R_{2,i})=
-g_\theta(M_i,t_i),\qquad
-R^{\mathrm{eff}}_{s,i}=
-\begin{cases}
-R_{s,i}, & R_{s,i}\ge1,\\
-R_{s,\mathrm{operator}}, & R_{s,i}=-1.
-\end{cases}
+g_\theta(M_i,t_i),\qquad R_{13,i}\ge1,\quad R_{2,i}\ge1.
 $$
 
-其中 $M_i$ 是 route 数，$t_i$ 是 task 实际执行宽度；正整数是 runtime 必须
-执行的精确、tile-aligned range 数，`-1` 仅供旧的手写 Plan V2 继承
-operator-wide policy。planner 新生成的 plan 不再使用 `-1`。tail-pool task
-使用 pool 的实际宽度，而不是原 strict head 宽度。$g_\theta$ 是按机器、NUMA、
-shape 和 kernel identity 命名的确定性策略。对每个已有候选 $(v,\sigma)$，
+其中 $M_i$ 是 route 数，$t_i$ 是 task 实际执行宽度；每个正整数都是 runtime
+必须执行的精确、tile-aligned range 数。Plan V2 不再存在 `-1` 继承；legacy plan
+bridge 在升级时显式写入 `1/1`。tail-pool task 使用 pool 的实际宽度，而不是原
+strict head 宽度。$g_\theta$ 是按机器、NUMA、shape 和 kernel identity 命名的
+确定性策略。对每个已有候选 $(v,\sigma)$，
 planner 先由候选确定各 task 的 $t_i$，再唯一解析 $g_\theta(M_i,t_i)$，之后才
 计算：
 
@@ -2210,11 +2205,11 @@ $R_{13}$ 或 $R_2$ 的枚举维度。由 $R_{s,i}$ 和 stage 总 tile 数可唯�
 $\widehat S_{s,i}$。plan cache 和结果 metadata 必须包含策略名称与两个 range
 数，避免不同规则共享计划。
 
-迁移期 ABI 仍接受旧的 per-task byte-window 字段，但同一 task/stage 只能指定
-byte window 或 exact range 之一；两者同时出现是非法计划。native runtime 中
-exact range 的优先级高于 operator-wide legacy 规则，并且 W2 GEMM 与
-owner-scatter 必须使用同一个 $R_{2,i}$。byte-window 与 `w13_split` 只作为旧
-调用的兼容输入，后续步骤从公开 API 和 profile identity 删除。
+公开 Python/C++ ABI 只接受 exact range：同步、scheduled 和 legacy async 入口
+分别接收正整数 `w13_ranges`/`w2_ranges`，Plan V2 接收逐 task 的正整数张量。
+布尔 split、全局/per-task byte-window、环境变量回退和 Plan V2 legacy native
+fallback 均已删除。W2 GEMM 与 owner-scatter 必须使用同一个 $R_{2,i}$；非法或
+超过 stage tile 数的 range 由 Python/native 边界拒绝。
 
 对 empirical phase model，现有 isolated table 仍校准于 global policy；在没有
 独立 window-isolated residual 前，$\widehat I(M,t)$ 保持原表值，不凭空外推
@@ -4144,3 +4139,4 @@ $M=12$、`1/2/4/8T`，并给 W13 的两个端点写入独立标签，保证后�
 | 2026-08-09 | v0.79 | 开始移除 split 语义：analytic stage-window policy v3 将 W13 `no-split/split` 归一为显式 $R=1/R=2$ 几何端点，与 inherited 和解析自然窗口在同一目标中评分，不再用旧 split chunk 数限制 $R\ge2$；$M\le12$ 因单 panel 对 B 无重用而由支配关系固定取 W13/W2 $R=1$。候选仍由已选 $(M,t)$ 确定性生成，不扩大 planner shape 空间；empirical profile、Plan V2 ABI 和 native runtime 本步不变。holdout 默认覆盖 M12 与 `1/2/4/8T` 并显式标记两个 W13 端点；v3 实机 gate 留待 range ABI/profile 迁移后刷新。 |
 | 2026-08-09 | v0.80 | Plan V2 与 ARM native runtime 增加 per-task exact $(R_{13},R_2)$：production planner 在确定 task 的实际宽度后解析正整数 range，并将其用于 W13、W2 GEMM 和 W2 owner-scatter；不增加 shape/window 搜索维度。迁移期 `-1` 继承与 byte-window 字段只兼容旧手写 plan，同一 task/stage 同时指定 byte/range 会被 Python/native 双重拒绝。profile/catalog identity 和公开 split API 留待后续独立步骤迁移。 |
 | 2026-08-09 | v0.81 | empirical/analytic profile、catalog、plan cache 与 TP/EP companion matching 的 kernel policy identity 统一为 `("stage_ranges", R13, R2)`；旧 split/byte 字段仅用于 schema-v2 历史 profile 的几何重建，不参与匹配。catalog 不再要求完整布尔 pair，改为接受同 implementation 下任意非空实测 range 集合，同时严格拒绝重复 range identity 和不同 route/thread/shape grid；`auto` 因此可使用只有一个 range variant 的 JIT 校准，但仍禁止跨 JIT/static 拼表。公开 API 与 native legacy fallback 留待下一步删除。 |
+| 2026-08-09 | v0.82 | 公开 Python/C++ MoE ABI 与 Plan V2 runtime 收敛为 exact stage ranges：同步、scheduled、legacy async 使用正整数 `w13_ranges/w2_ranges`，Plan V2 必须逐 task 携带正整数 range；legacy bridge 显式升级为 `1/1`。删除布尔 split、全局/per-task byte-window、对应环境变量和 Plan V2 到 legacy async 的 fallback；W13/W2 GEMM 与 W2 owner-scatter 只消费同一份精确 range。kernel layout、N-split ownership、planner shape 候选与解析 stage-window policy 均不变。 |

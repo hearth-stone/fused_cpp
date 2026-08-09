@@ -15,7 +15,6 @@ import torch
 from fused_cpp.moe.plan import (
     ASYNC_MOE_ELASTIC_STATS_FIELDS,
     ASYNC_MOE_EXECUTION_ELASTIC,
-    ASYNC_MOE_EXECUTION_STRICT,
     AsyncMoEPlanV2,
 )
 
@@ -181,19 +180,17 @@ def _contiguous_moe_bias(bias: torch.Tensor | None) -> torch.Tensor | None:
     return bias.contiguous()
 
 
-def _weight_window_argument(weight_window_bytes: int | None) -> int:
-    if weight_window_bytes is None:
-        return -1
-    if isinstance(weight_window_bytes, bool):
-        raise TypeError("weight_window_bytes must be an integer byte count, not bool")
+def _stage_ranges_argument(stage_ranges: int, name: str) -> int:
+    if isinstance(stage_ranges, bool):
+        raise TypeError(f"{name} must be an integer range count, not bool")
     try:
-        value = index(weight_window_bytes)
+        value = index(stage_ranges)
     except TypeError as error:
-        raise TypeError("weight_window_bytes must be an integer byte count or None") from error
-    if value < 0:
-        raise ValueError(f"weight_window_bytes must be non-negative, got {value}")
+        raise TypeError(f"{name} must be an integer range count") from error
+    if value < 1:
+        raise ValueError(f"{name} must be positive, got {value}")
     if value > (1 << 63) - 1:
-        raise OverflowError(f"weight_window_bytes exceeds int64: {value}")
+        raise OverflowError(f"{name} exceeds int64: {value}")
     return value
 
 
@@ -368,7 +365,8 @@ def fused_moe_bf16_tiled(
     global_num_experts: int = -1,
     skip_weighted: bool = False,
     silu_poly_degree: int = 5,
-    weight_window_bytes: int | None = None,
+    w13_ranges: int = 1,
+    w2_ranges: int = 1,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run the C++ tiled fused MoE path using BF16 GEMMs.
@@ -377,10 +375,8 @@ def fused_moe_bf16_tiled(
     ``"silu"``, the w13 GEMM fuses SiLU-and-mul into its store epilogue
     (``silu_poly_degree`` selects the exp polynomial, 4/5/6).
 
-    A positive ``weight_window_bytes`` serializes each SVE GEMM into
-    tile-aligned packed-B windows no larger than that target, except when one
-    hardware N tile itself is larger. ``None`` reads
-    ``FUSED_CPP_MOE_WEIGHT_WINDOW_BYTES``; zero disables byte-based windows.
+    ``w13_ranges`` and ``w2_ranges`` split each SVE stage into that many
+    tile-aligned packed-B ranges. Both default to one contiguous range.
     A supplied ``out`` must be a contiguous CPU BF16 tensor matching ``input``;
     the native kernel writes it directly and returns it without an intermediate
     output allocation or copy. The x86 BF16 backends support up to 256 requested
@@ -421,7 +417,8 @@ def fused_moe_bf16_tiled(
         int(silu_poly_degree),
         int(weights.gemm_backend),
         int(weights.backend_n_tile),
-        _weight_window_argument(weight_window_bytes),
+        _stage_ranges_argument(w13_ranges, "w13_ranges"),
+        _stage_ranges_argument(w2_ranges, "w2_ranges"),
         out,
     )
     return out if out is not None else result
@@ -444,7 +441,8 @@ def fused_moe_bf16_tiled_scheduled(
     global_num_experts: int = -1,
     skip_weighted: bool = False,
     silu_poly_degree: int = 5,
-    weight_window_bytes: int | None = None,
+    w13_ranges: int = 1,
+    w2_ranges: int = 1,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run the BF16 tiled MoE path using an externally supplied schedule.
@@ -506,7 +504,8 @@ def fused_moe_bf16_tiled_scheduled(
         int(silu_poly_degree),
         int(weights.gemm_backend),
         int(weights.backend_n_tile),
-        _weight_window_argument(weight_window_bytes),
+        _stage_ranges_argument(w13_ranges, "w13_ranges"),
+        _stage_ranges_argument(w2_ranges, "w2_ranges"),
         out,
     )
     return out if out is not None else result
@@ -531,8 +530,8 @@ def fused_moe_bf16_tiled_async(
     global_num_experts: int = -1,
     skip_weighted: bool = False,
     silu_poly_degree: int = 5,
-    w13_split: bool | None = None,
-    weight_window_bytes: int | None = None,
+    w13_ranges: int = 1,
+    w2_ranges: int = 1,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run BF16 tiled MoE with an async task-DAG schedule.
@@ -540,12 +539,10 @@ def fused_moe_bf16_tiled_async(
     Each task computes one active expert on a contiguous logical-thread
     interval. ``task_dep_offsets`` / ``task_deps`` encode a CSR dependency
     list, allowing later tasks to start as soon as their own interval is free
-    instead of waiting for a whole wave barrier. ``w13_split`` explicitly
-    selects the two-panel SVE W13 policy; ``None`` preserves the legacy
-    ``FUSED_CPP_MOE_W13_SPLIT_N`` environment fallback. A positive
-    ``weight_window_bytes`` supersedes that two-panel granularity and applies
-    the same packed-B byte limit to both W13 and W2. A supplied ``out`` is
-    written directly by the native kernel and must be contiguous.
+    instead of waiting for a whole wave barrier. ``w13_ranges`` and
+    ``w2_ranges`` select the exact tile-aligned packed-B range count for each
+    SVE stage. A supplied ``out`` is written directly by the native kernel and
+    must be contiguous.
     """
     _require_backend()
     if _fused_moe_bf16_tiled_async_impl is None:
@@ -609,8 +606,8 @@ def fused_moe_bf16_tiled_async(
         int(silu_poly_degree),
         int(weights.gemm_backend),
         int(weights.backend_n_tile),
-        -1 if w13_split is None else int(bool(w13_split)),
-        _weight_window_argument(weight_window_bytes),
+        _stage_ranges_argument(w13_ranges, "w13_ranges"),
+        _stage_ranges_argument(w2_ranges, "w2_ranges"),
         out,
     )
     return out if out is not None else result
@@ -644,8 +641,6 @@ def fused_moe_bf16_tiled_async_plan(
     global_num_experts: int = -1,
     skip_weighted: bool = False,
     silu_poly_degree: int = 5,
-    w13_split: bool | None = None,
-    weight_window_bytes: int | None = None,
     out: torch.Tensor | None = None,
     elastic_stats_out: torch.Tensor | None = None,
 ) -> torch.Tensor:
@@ -664,44 +659,8 @@ def fused_moe_bf16_tiled_async_plan(
             raise RuntimeError("elastic Plan V2 requires native fused_moe_bf16_tiled_async_plan_v2_elastic support")
     elif elastic_stats_out is not None:
         raise ValueError("elastic_stats_out is only valid for elastic Plan V2 execution")
-    if _fused_moe_bf16_tiled_async_plan_v2_impl is None:
-        assert materialized.task_w13_ranges is not None
-        assert materialized.task_w2_ranges is not None
-        assert materialized.task_w13_window_bytes is not None
-        assert materialized.task_w2_window_bytes is not None
-        assert materialized.task_release_ns is not None
-        if materialized.early_merge is not None:
-            raise RuntimeError("early_merge control requires native fused_moe_bf16_tiled_async_plan_v2 support")
-        if bool((materialized.task_w13_window_bytes >= 0).any()) or bool(
-            (materialized.task_w2_window_bytes >= 0).any()
-        ):
-            raise RuntimeError("per-task W13/W2 windows require native fused_moe_bf16_tiled_async_plan_v2 support")
-        if bool((materialized.task_w13_ranges >= 1).any()) or bool(
-            (materialized.task_w2_ranges >= 1).any()
-        ):
-            raise RuntimeError("per-task W13/W2 ranges require native fused_moe_bf16_tiled_async_plan_v2 support")
-        if bool((materialized.task_release_ns > 0).any()):
-            raise RuntimeError("timed task releases require native fused_moe_bf16_tiled_async_plan_v2 support")
-        if materialized.execution_mode == ASYNC_MOE_EXECUTION_STRICT:
-            return fused_moe_bf16_tiled_async(
-                input,
-                weights,
-                topk_weights,
-                topk_ids,
-                *materialized.legacy_schedule(),
-                thread_cpu_ids=materialized.thread_cpu_ids,
-                w13_bias=w13_bias,
-                w2_bias=w2_bias,
-                num_threads=materialized.num_threads,
-                activation=activation,
-                global_num_experts=global_num_experts,
-                skip_weighted=skip_weighted,
-                silu_poly_degree=silu_poly_degree,
-                w13_split=w13_split,
-                weight_window_bytes=weight_window_bytes,
-                out=out,
-            )
-        raise RuntimeError("Plan V2 tail_pool requires native fused_moe_bf16_tiled_async_plan_v2 support")
+    if materialized.execution_mode != ASYNC_MOE_EXECUTION_ELASTIC and _fused_moe_bf16_tiled_async_plan_v2_impl is None:
+        raise RuntimeError("Plan V2 requires native fused_moe_bf16_tiled_async_plan_v2 support")
     _require_backend()
     if input.dtype != torch.bfloat16:
         raise TypeError(f"input must be torch.bfloat16, got {input.dtype}")
@@ -712,10 +671,6 @@ def fused_moe_bf16_tiled_async_plan(
     if not topk_weights.dtype.is_floating_point:
         raise TypeError(f"topk_weights must use a floating dtype, got {topk_weights.dtype}")
     _validate_output_buffer(input, out)
-    assert materialized.task_w13_ranges is not None
-    assert materialized.task_w2_ranges is not None
-    assert materialized.task_w13_window_bytes is not None
-    assert materialized.task_w2_window_bytes is not None
     assert materialized.task_release_ns is not None
     assert materialized.task_resize_timeout_ns is not None
     assert materialized.task_preferred_core_begins is not None
@@ -754,6 +709,8 @@ def fused_moe_bf16_tiled_async_plan(
         materialized.task_stage_ids.contiguous(),
         materialized.task_resize_points.contiguous(),
         materialized.task_range_granularities.contiguous(),
+        materialized.task_w13_ranges.contiguous(),
+        materialized.task_w2_ranges.contiguous(),
         materialized.thread_cpu_ids.contiguous(),
         _contiguous_moe_bias(w13_bias),
         _contiguous_moe_bias(w2_bias),
@@ -765,13 +722,7 @@ def fused_moe_bf16_tiled_async_plan(
         int(silu_poly_degree),
         int(weights.gemm_backend),
         int(weights.backend_n_tile),
-        -1 if w13_split is None else int(bool(w13_split)),
-        _weight_window_argument(weight_window_bytes),
         out,
-        materialized.task_w13_window_bytes.contiguous(),
-        materialized.task_w2_window_bytes.contiguous(),
-        materialized.task_w13_ranges.contiguous(),
-        materialized.task_w2_ranges.contiguous(),
         materialized.task_release_ns.contiguous(),
     )
     if materialized.execution_mode == ASYNC_MOE_EXECUTION_ELASTIC:
@@ -802,8 +753,6 @@ def fused_moe_bf16_tiled_planned_staged(
     *,
     global_num_experts: int = -1,
     silu_poly_degree: int = 5,
-    w13_split: bool | None = None,
-    weight_window_bytes: int | None = None,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run independent expert-level W13 and W2 plans with a global barrier.
@@ -844,9 +793,6 @@ def fused_moe_bf16_tiled_planned_staged(
     if weights.gemm_backend != 1:
         raise ValueError(f"planned-staged MoE requires the SVE BF16 backend; weights use {weights.backend_name}")
     _validate_output_buffer(input, out)
-    assert materialized_w13.task_w13_window_bytes is not None
-    assert materialized_w2.task_w2_window_bytes is not None
-
     result = _fused_moe_bf16_tiled_planned_staged_impl(
         input.contiguous(),
         weights.w13[0],
@@ -864,7 +810,7 @@ def fused_moe_bf16_tiled_planned_staged(
         materialized_w13.task_deps.contiguous(),
         materialized_w13.native_execution_mode,
         materialized_w13.task_placement_modes.contiguous(),
-        materialized_w13.task_w13_window_bytes.contiguous(),
+        materialized_w13.task_w13_ranges.contiguous(),
         materialized_w2.task_expert_ids.contiguous(),
         materialized_w2.task_core_begins.contiguous(),
         materialized_w2.task_threads.contiguous(),
@@ -872,7 +818,7 @@ def fused_moe_bf16_tiled_planned_staged(
         materialized_w2.task_deps.contiguous(),
         materialized_w2.native_execution_mode,
         materialized_w2.task_placement_modes.contiguous(),
-        materialized_w2.task_w2_window_bytes.contiguous(),
+        materialized_w2.task_w2_ranges.contiguous(),
         materialized_w13.thread_cpu_ids.contiguous(),
         materialized_w13.num_threads,
         int(global_num_experts),
@@ -880,8 +826,6 @@ def fused_moe_bf16_tiled_planned_staged(
         int(silu_poly_degree),
         int(weights.gemm_backend),
         int(weights.backend_n_tile),
-        -1 if w13_split is None else int(bool(w13_split)),
-        _weight_window_argument(weight_window_bytes),
         out,
     )
     return out if out is not None else result

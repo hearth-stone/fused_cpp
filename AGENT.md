@@ -92,9 +92,11 @@ ssh AmazonECS8Cores 'cd /home/ubuntu/zhangxu/fused_cpp && . .venv/bin/activate &
 
 ## Benchmark Hygiene
 
-Unless the user explicitly requests a no-split comparison, fused MoE benchmark
-and analysis work defaults to the split-W13 kernel (`w13_ranges=2` or
-`FUSED_CPP_MOE_W13_SPLIT_N=1`) and must report that choice with the result.
+Fused MoE benchmark and analysis work must report the exact
+`w13_ranges`/`w2_ranges` geometry. Planner benchmarks use the ranges carried by
+the generated plan; direct kernel benchmarks default to `1/1` unless the
+experiment explicitly selects another positive range count. The retired
+split-W13 and byte-window environment controls must not be used.
 
 For single-thread microbenchmarks, bind each process to one dedicated core with
 `taskset` and pin Python/native libraries to one thread:

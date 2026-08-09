@@ -467,7 +467,7 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input, at::Tensor w13_packed, int64_t
                                 c10::optional<at::Tensor> w2_bias, int64_t num_threads, std::string activation,
                                 int64_t global_num_experts, bool skip_weighted, bool fuse_silu,
                                 int64_t silu_poly_degree, int64_t gemm_backend, int64_t backend_n_tile,
-                                int64_t weight_window_bytes, c10::optional<at::Tensor> out) {
+                                int64_t w13_ranges, int64_t w2_ranges, c10::optional<at::Tensor> out) {
   const ::fused_cpp::moe::MoeBackend& backend = ::fused_cpp::moe::backend_from_id(gemm_backend);
   const bool use_amx = backend.id == ::fused_cpp::moe::BackendId::kX86AmxBf16;
   TORCH_CHECK(backend.id == ::fused_cpp::moe::BackendId::kX86Avx512Bf16 || use_amx,
@@ -480,7 +480,7 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input, at::Tensor w13_packed, int64_t
               "silu_poly_degree must be 4, 5, or 6, got ", silu_poly_degree);
   TORCH_CHECK(num_threads > 0 && num_threads <= kMaxExecutorThreads, backend.name, " requires num_threads in [1, ",
               kMaxExecutorThreads, "], got ", num_threads);
-  TORCH_CHECK(weight_window_bytes >= -1, "weight_window_bytes must be -1 or non-negative");
+  TORCH_CHECK(w13_ranges > 0 && w2_ranges > 0, "stage range counts must be positive");
 
   CheckBf16Cpu(input, "input");
   TORCH_CHECK(input.dim() == 2, "input must be 2-D [tokens, hidden]");

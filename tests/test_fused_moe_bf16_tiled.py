@@ -173,7 +173,6 @@ def test_vllm_staged_matches_fused_sve_with_multiple_n_tasks(
         pytest.skip("requires 12 available CPUs to exercise multiple N tasks per expert")
 
     monkeypatch.setenv("FUSED_CPP_MOE_SVE", "1")
-    monkeypatch.setenv("FUSED_CPP_MOE_W13_SPLIT_N", "1")
     monkeypatch.setenv("FUSED_CPP_MOE_SVE_W2_DIRECT_ROUTE", "1")
     monkeypatch.setenv("FUSED_CPP_MOE_W2_BF16_ROUTE", "1" if use_bf16_route else "0")
     monkeypatch.setenv("FUSED_CPP_MOE_SVE_ROUTE_MERGE_UNROLL", "1")
@@ -425,7 +424,6 @@ def test_sve_plan_v2_route_slices_match_full_experts(
         topk_weights,
         topk_ids,
         AsyncMoEPlanV2.from_dict(full_bridge),
-        w13_split=True,
     )
     sliced = fused_moe_bf16_tiled_async_plan(
         hidden_states,
@@ -433,7 +431,6 @@ def test_sve_plan_v2_route_slices_match_full_experts(
         topk_weights,
         topk_ids,
         AsyncMoEPlanV2.from_dict(sliced_bridge),
-        w13_split=True,
     )
 
     torch.testing.assert_close(sliced.float(), full.float(), atol=0, rtol=0)
@@ -510,7 +507,6 @@ def test_sve_plan_v2_strict_and_tail_pool_match_legacy_async(
         *strict_plan.legacy_schedule(),
         thread_cpu_ids=strict_plan.thread_cpu_ids,
         num_threads=4,
-        w13_split=True,
     )
 
     monkeypatch.setenv("FUSED_CPP_MOE_ASYNC_SHORT_POOL_THREADS", "invalid")
@@ -520,7 +516,6 @@ def test_sve_plan_v2_strict_and_tail_pool_match_legacy_async(
         topk_weights,
         topk_ids,
         strict_plan,
-        w13_split=True,
     )
 
     steal_bridge = upgrade_legacy_async_plan(
@@ -543,7 +538,6 @@ def test_sve_plan_v2_strict_and_tail_pool_match_legacy_async(
         topk_weights,
         topk_ids,
         AsyncMoEPlanV2.from_dict(steal_bridge),
-        w13_split=True,
     )
     strict_tail_stderr = capfd.readouterr().err
     steal_match = re.search(r"\[strict_tail_steal\].*stolen_tasks=(\d+)", strict_tail_stderr)
@@ -557,7 +551,6 @@ def test_sve_plan_v2_strict_and_tail_pool_match_legacy_async(
         topk_weights,
         topk_ids,
         AsyncMoEPlanV2.from_dict(steal_ready_bridge),
-        w13_split=True,
     )
     steal_ready_stderr = capfd.readouterr().err
     steal_ready_match = re.search(
@@ -569,26 +562,11 @@ def test_sve_plan_v2_strict_and_tail_pool_match_legacy_async(
     monkeypatch.delenv("FUSED_CPP_MOE_STRICT_TAIL_STEAL")
     monkeypatch.delenv("FUSED_CPP_MOE_STAGE_TIMING")
 
-    window_bridge = upgrade_legacy_async_plan(strict_bridge)
-    window_bridge.update(
-        {
-            "task_w13_window_bytes": [64, 128, 192, 256],
-            "task_w2_window_bytes": [128, 64, 256, 192],
-        }
-    )
-    windowed = fused_moe_bf16_tiled_async_plan(
-        hidden_states,
-        packed,
-        topk_weights,
-        topk_ids,
-        AsyncMoEPlanV2.from_dict(window_bridge),
-        w13_split=True,
-    )
     range_bridge = upgrade_legacy_async_plan(strict_bridge)
     range_bridge.update(
         {
-            "task_w13_ranges": [1, 2, 4, 8],
-            "task_w2_ranges": [8, 4, 2, 1],
+            "task_w13_ranges": [1, 2, 4, 4],
+            "task_w2_ranges": [4, 4, 2, 1],
         }
     )
     ranged = fused_moe_bf16_tiled_async_plan(
@@ -597,7 +575,6 @@ def test_sve_plan_v2_strict_and_tail_pool_match_legacy_async(
         topk_weights,
         topk_ids,
         AsyncMoEPlanV2.from_dict(range_bridge),
-        w13_split=True,
     )
 
     tail_bridge = upgrade_legacy_async_plan(strict_bridge)
@@ -621,7 +598,6 @@ def test_sve_plan_v2_strict_and_tail_pool_match_legacy_async(
         topk_weights,
         topk_ids,
         AsyncMoEPlanV2.from_dict(tail_bridge),
-        w13_split=True,
     )
     elastic_bridge = upgrade_legacy_async_plan(strict_bridge)
     elastic_bridge.update(
@@ -644,7 +620,6 @@ def test_sve_plan_v2_strict_and_tail_pool_match_legacy_async(
         topk_weights,
         topk_ids,
         AsyncMoEPlanV2.from_dict(elastic_bridge),
-        w13_split=True,
         elastic_stats_out=elastic_stats,
     )
     nonblocking_bridge = dict(elastic_bridge)
@@ -656,7 +631,6 @@ def test_sve_plan_v2_strict_and_tail_pool_match_legacy_async(
         topk_weights,
         topk_ids,
         AsyncMoEPlanV2.from_dict(nonblocking_bridge),
-        w13_split=True,
         elastic_stats_out=nonblocking_stats,
     )
     w2_bridge = {
@@ -675,7 +649,6 @@ def test_sve_plan_v2_strict_and_tail_pool_match_legacy_async(
         topk_ids,
         strict_plan,
         AsyncMoEPlanV2.from_dict(upgrade_legacy_async_plan(w2_bridge)),
-        w13_split=True,
     )
     staged_tail = fused_moe_bf16_tiled_planned_staged(
         hidden_states,
@@ -684,7 +657,6 @@ def test_sve_plan_v2_strict_and_tail_pool_match_legacy_async(
         topk_ids,
         AsyncMoEPlanV2.from_dict(tail_bridge),
         AsyncMoEPlanV2.from_dict(tail_bridge),
-        w13_split=True,
     )
     staged_mixed = fused_moe_bf16_tiled_planned_staged(
         hidden_states,
@@ -693,13 +665,11 @@ def test_sve_plan_v2_strict_and_tail_pool_match_legacy_async(
         topk_ids,
         strict_plan,
         AsyncMoEPlanV2.from_dict(tail_bridge),
-        w13_split=True,
     )
 
     torch.testing.assert_close(strict.float(), reference.float(), atol=0, rtol=0)
     torch.testing.assert_close(strict_tail_steal.float(), strict.float(), atol=0, rtol=0)
     torch.testing.assert_close(strict_tail_steal_ready_merge.float(), strict.float(), atol=0, rtol=0)
-    torch.testing.assert_close(windowed.float(), strict.float(), atol=0, rtol=0)
     torch.testing.assert_close(ranged.float(), strict.float(), atol=0, rtol=0)
     torch.testing.assert_close(tail.float(), strict.float(), atol=0, rtol=0)
     torch.testing.assert_close(elastic.float(), strict.float(), atol=0, rtol=0)
@@ -731,7 +701,6 @@ def test_sve_plan_v2_strict_and_tail_pool_match_legacy_async(
         topk_weights,
         single_expert_ids,
         single_strict_plan,
-        w13_split=True,
     )
     single_elastic_bridge = dict(single_strict_bridge)
     single_elastic_bridge.update(
@@ -754,7 +723,6 @@ def test_sve_plan_v2_strict_and_tail_pool_match_legacy_async(
         topk_weights,
         single_expert_ids,
         AsyncMoEPlanV2.from_dict(single_elastic_bridge),
-        w13_split=True,
         elastic_stats_out=single_elastic_stats,
     )
     torch.testing.assert_close(single_elastic.float(), single_strict.float(), atol=0, rtol=0)
@@ -779,7 +747,6 @@ def test_sve_plan_v2_strict_and_tail_pool_match_legacy_async(
         topk_weights,
         migration_ids,
         AsyncMoEPlanV2.from_dict(migration_strict_bridge),
-        w13_split=True,
     )
     migration_bridge = dict(migration_strict_bridge)
     migration_bridge.update(
@@ -803,7 +770,6 @@ def test_sve_plan_v2_strict_and_tail_pool_match_legacy_async(
         topk_weights,
         migration_ids,
         AsyncMoEPlanV2.from_dict(migration_bridge),
-        w13_split=True,
         elastic_stats_out=migration_stats,
     )
     torch.testing.assert_close(migrated.float(), migration_strict.float(), atol=0, rtol=0)
@@ -829,7 +795,6 @@ def test_sve_plan_v2_strict_and_tail_pool_match_legacy_async(
             topk_ids,
             AsyncMoEPlanV2.from_dict(unordered_overlap_bridge),
             strict_plan,
-            w13_split=True,
         )
 
     # The materialized plan owns mutable tensors, so native must validate the
@@ -842,7 +807,6 @@ def test_sve_plan_v2_strict_and_tail_pool_match_legacy_async(
             topk_weights,
             topk_ids,
             strict_plan,
-            w13_split=True,
         )
 
 
@@ -1130,7 +1094,6 @@ def test_sve_first_panel_prefetch_matches_panel_jit(
         pytest.skip("requires an SVE BF16 build/runtime")
     monkeypatch.setenv("FUSED_CPP_MOE_SVE", "1")
     monkeypatch.setenv("FUSED_CPP_MOE_SVE_IMPL", "jit")
-    monkeypatch.setenv("FUSED_CPP_MOE_W13_SPLIT_N", "1")
     monkeypatch.setenv("FUSED_CPP_MOE_SVE_JIT_BULK_M", "0")
     monkeypatch.setenv("FUSED_CPP_MOE_W2_BF16_ROUTE", "0")
     monkeypatch.setenv("FUSED_CPP_MOE_SVE_W2_DIRECT_ROUTE", "1" if direct_route else "0")
@@ -1453,7 +1416,6 @@ def test_sve_w2_direct_route_store_matches_scatter(
 ) -> None:
     """Cover interleaved route IDs, every M tail, and multi-thread N ownership."""
     monkeypatch.setenv("FUSED_CPP_MOE_SVE", "1")
-    monkeypatch.setenv("FUSED_CPP_MOE_W13_SPLIT_N", "1")
     monkeypatch.setenv("FUSED_CPP_MOE_W2_BF16_ROUTE", "1" if w2_bf16_route else "0")
     monkeypatch.setenv("FUSED_CPP_MOE_SVE_ROUTE_MERGE_UNROLL", "0")
     monkeypatch.setenv("FUSED_CPP_MOE_FUSED_2D_SPLIT", "1" if split_2d else "0")
@@ -1586,7 +1548,6 @@ def test_async_short_pool_matches_fixed_dag(
 ) -> None:
     """Release 4T long intervals as 2T dynamic short-expert groups."""
     monkeypatch.setenv("FUSED_CPP_MOE_SVE", "1")
-    monkeypatch.setenv("FUSED_CPP_MOE_W13_SPLIT_N", "1")
     monkeypatch.setenv("FUSED_CPP_MOE_W2_BF16_ROUTE", "1")
     monkeypatch.setenv("FUSED_CPP_MOE_SVE_W2_DIRECT_ROUTE", "1")
     monkeypatch.setenv("FUSED_CPP_MOE_ASYNC_READY_TOKEN_MERGE", "0")
@@ -1675,7 +1636,6 @@ def test_async_ready_token_merge_overlaps_imbalanced_experts(
 ) -> None:
     """Merge short-group tokens while an independent long expert group runs."""
     monkeypatch.setenv("FUSED_CPP_MOE_SVE", "1")
-    monkeypatch.setenv("FUSED_CPP_MOE_W13_SPLIT_N", "1")
     monkeypatch.setenv("FUSED_CPP_MOE_W2_BF16_ROUTE", "1" if w2_bf16_route else "0")
     monkeypatch.setenv("FUSED_CPP_MOE_SVE_W2_DIRECT_ROUTE", "1")
     monkeypatch.setenv("FUSED_CPP_MOE_SVE_ROUTE_MERGE_UNROLL", "1")

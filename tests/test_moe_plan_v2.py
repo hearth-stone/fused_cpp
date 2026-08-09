@@ -74,10 +74,8 @@ def test_upgrade_legacy_plan_produces_strict_singleton_widths() -> None:
     assert plan.num_threads == 4
     assert plan.thread_cpu_ids.tolist() == [8, 9, 10, 11]
     assert plan.task_threads.tolist() == [2, 2]
-    assert plan.task_w13_ranges.tolist() == [-1, -1]
-    assert plan.task_w2_ranges.tolist() == [-1, -1]
-    assert plan.task_w13_window_bytes.tolist() == [-1, -1]
-    assert plan.task_w2_window_bytes.tolist() == [-1, -1]
+    assert plan.task_w13_ranges.tolist() == [1, 1]
+    assert plan.task_w2_ranges.tolist() == [1, 1]
     assert plan.task_release_ns.tolist() == [0, 0]
     assert plan.task_preferred_core_begins.tolist() == [-1, -1]
     assert plan.early_merge is None
@@ -307,26 +305,7 @@ def test_plan_v2_rejects_inconsistent_allowed_widths() -> None:
         raise AssertionError("an inconsistent selected width was accepted")
 
 
-def test_plan_v2_accepts_optional_per_task_stage_windows() -> None:
-    upgraded = upgrade_legacy_async_plan(_legacy_bridge())
-    upgraded["task_w13_window_bytes"] = [1048576, -1]
-    upgraded["task_w2_window_bytes"] = [524288, 0]
-
-    plan = AsyncMoEPlanV2.from_dict(upgraded)
-
-    assert plan.task_w13_window_bytes.tolist() == [1048576, -1]
-    assert plan.task_w2_window_bytes.tolist() == [524288, 0]
-
-
-def test_plan_v2_rejects_invalid_per_task_stage_windows() -> None:
-    upgraded = upgrade_legacy_async_plan(_legacy_bridge())
-    upgraded["task_w13_window_bytes"] = [-2, -1]
-
-    with pytest.raises(ValueError, match="must be -1"):
-        AsyncMoEPlanV2.from_dict(upgraded)
-
-
-def test_plan_v2_accepts_optional_per_task_stage_ranges() -> None:
+def test_plan_v2_accepts_exact_per_task_stage_ranges() -> None:
     upgraded = upgrade_legacy_async_plan(_legacy_bridge())
     upgraded["task_w13_ranges"] = [1, 8]
     upgraded["task_w2_ranges"] = [1, 4]
@@ -340,18 +319,17 @@ def test_plan_v2_accepts_optional_per_task_stage_ranges() -> None:
 @pytest.mark.parametrize("invalid", [0, -2])
 def test_plan_v2_rejects_invalid_per_task_stage_ranges(invalid: int) -> None:
     upgraded = upgrade_legacy_async_plan(_legacy_bridge())
-    upgraded["task_w13_ranges"] = [invalid, -1]
+    upgraded["task_w13_ranges"] = [invalid, 1]
 
-    with pytest.raises(ValueError, match="must be -1"):
+    with pytest.raises(ValueError, match="stage ranges must be positive"):
         AsyncMoEPlanV2.from_dict(upgraded)
 
 
-def test_plan_v2_rejects_ambiguous_stage_range_and_byte_window() -> None:
+def test_plan_v2_requires_exact_stage_ranges() -> None:
     upgraded = upgrade_legacy_async_plan(_legacy_bridge())
-    upgraded["task_w13_ranges"] = [2, -1]
-    upgraded["task_w13_window_bytes"] = [1048576, -1]
+    del upgraded["task_w13_ranges"]
 
-    with pytest.raises(ValueError, match="both ranges and window bytes"):
+    with pytest.raises(ValueError, match="missing required fields: task_w13_ranges"):
         AsyncMoEPlanV2.from_dict(upgraded)
 
 
@@ -439,7 +417,6 @@ def test_async_plan_wrapper_calls_native_plan_v2(monkeypatch) -> None:
         torch.zeros((1, 1), dtype=torch.int32),
         plan,
         skip_weighted=True,
-        w13_split=True,
     )
 
     assert result is sentinel
@@ -454,16 +431,14 @@ def test_async_plan_wrapper_calls_native_plan_v2(monkeypatch) -> None:
         ASYNC_MOE_PLACEMENT_FIXED,
         ASYNC_MOE_PLACEMENT_FIXED,
     ]
-    assert args[26].tolist() == [8, 9, 10, 11]
-    assert args[29] == 4
-    assert args[32] is True
+    assert args[26].tolist() == [1, 1]
+    assert args[27].tolist() == [1, 1]
+    assert args[28].tolist() == [8, 9, 10, 11]
+    assert args[31] == 4
+    assert args[34] is True
     assert args[37] == 1
-    assert args[40].tolist() == [-1, -1]
-    assert args[41].tolist() == [-1, -1]
-    assert args[42].tolist() == [-1, -1]
-    assert args[43].tolist() == [-1, -1]
-    assert args[44].tolist() == [0, 0]
-    assert args[45] == -1
+    assert args[40].tolist() == [0, 0]
+    assert args[41] == -1
 
 
 def test_async_plan_wrapper_calls_elastic_native_and_collects_stats(monkeypatch) -> None:
@@ -513,94 +488,20 @@ def test_async_plan_wrapper_calls_elastic_native_and_collects_stats(monkeypatch)
     args = captured["args"]
     assert isinstance(args, tuple)
     assert args[15] == 2
-    assert args[42].tolist() == [-1, -1]
+    assert args[26].tolist() == [1, 1]
+    assert args[27].tolist() == [1, 1]
+    assert args[40].tolist() == [0, 0]
+    assert args[41].tolist() == [0, 1000]
+    assert args[42] is stats
     assert args[43].tolist() == [-1, -1]
-    assert args[44].tolist() == [0, 0]
-    assert args[45].tolist() == [0, 1000]
-    assert args[46] is stats
-    assert args[47].tolist() == [-1, -1]
-    assert args[48] == -1
+    assert args[44] == -1
     assert bf16_tiled.decode_async_moe_elastic_stats(stats)["eligible_tasks"] == 0
 
 
-def test_async_plan_wrapper_falls_back_for_strict_plan(monkeypatch) -> None:
+def test_async_plan_wrapper_requires_native_plan_v2(monkeypatch) -> None:
     plan = AsyncMoEPlanV2.from_dict(upgrade_legacy_async_plan(_legacy_bridge()))
-    captured: dict[str, object] = {}
-    sentinel = torch.empty(0)
-
-    def fake_async(*args, **kwargs):
-        captured["args"] = args
-        captured["kwargs"] = kwargs
-        return sentinel
-
     monkeypatch.setattr(bf16_tiled, "_fused_moe_bf16_tiled_async_plan_v2_impl", None)
-    monkeypatch.setattr(bf16_tiled, "fused_moe_bf16_tiled_async", fake_async)
-    result = bf16_tiled.fused_moe_bf16_tiled_async_plan(
-        torch.empty((1, 1), dtype=torch.bfloat16),
-        object(),
-        torch.ones((1, 1)),
-        torch.zeros((1, 1), dtype=torch.int32),
-        plan,
-    )
-
-    assert result is sentinel
-    assert captured["args"][4].tolist() == [3, 7]
-    assert captured["kwargs"]["num_threads"] == 4
-
-
-def test_async_plan_wrapper_requires_native_tail_pool(monkeypatch) -> None:
-    plan = AsyncMoEPlanV2.from_dict(_tail_pool_bridge())
-    monkeypatch.setattr(bf16_tiled, "_fused_moe_bf16_tiled_async_plan_v2_impl", None)
-
-    with pytest.raises(RuntimeError, match="tail_pool requires native"):
-        bf16_tiled.fused_moe_bf16_tiled_async_plan(
-            torch.empty((1, 1), dtype=torch.bfloat16),
-            object(),
-            torch.ones((1, 1)),
-            torch.zeros((1, 1), dtype=torch.int32),
-            plan,
-        )
-
-
-def test_async_plan_wrapper_requires_native_per_task_windows(monkeypatch) -> None:
-    bridge = upgrade_legacy_async_plan(_legacy_bridge())
-    bridge["task_w13_window_bytes"] = [1048576, -1]
-    plan = AsyncMoEPlanV2.from_dict(bridge)
-    monkeypatch.setattr(bf16_tiled, "_fused_moe_bf16_tiled_async_plan_v2_impl", None)
-
-    with pytest.raises(RuntimeError, match="per-task W13/W2 windows require native"):
-        bf16_tiled.fused_moe_bf16_tiled_async_plan(
-            torch.empty((1, 1), dtype=torch.bfloat16),
-            object(),
-            torch.ones((1, 1)),
-            torch.zeros((1, 1), dtype=torch.int32),
-            plan,
-        )
-
-
-def test_async_plan_wrapper_requires_native_early_merge_control(monkeypatch) -> None:
-    bridge = upgrade_legacy_async_plan(_legacy_bridge())
-    bridge["early_merge"] = False
-    plan = AsyncMoEPlanV2.from_dict(bridge)
-    monkeypatch.setattr(bf16_tiled, "_fused_moe_bf16_tiled_async_plan_v2_impl", None)
-
-    with pytest.raises(RuntimeError, match="early_merge control requires native"):
-        bf16_tiled.fused_moe_bf16_tiled_async_plan(
-            torch.empty((1, 1), dtype=torch.bfloat16),
-            object(),
-            torch.ones((1, 1)),
-            torch.zeros((1, 1), dtype=torch.int32),
-            plan,
-        )
-
-
-def test_async_plan_wrapper_requires_native_timed_releases(monkeypatch) -> None:
-    bridge = upgrade_legacy_async_plan(_legacy_bridge())
-    bridge["task_release_ns"] = [0, 1000]
-    plan = AsyncMoEPlanV2.from_dict(bridge)
-    monkeypatch.setattr(bf16_tiled, "_fused_moe_bf16_tiled_async_plan_v2_impl", None)
-
-    with pytest.raises(RuntimeError, match="timed task releases require native"):
+    with pytest.raises(RuntimeError, match="Plan V2 requires native"):
         bf16_tiled.fused_moe_bf16_tiled_async_plan(
             torch.empty((1, 1), dtype=torch.bfloat16),
             object(),
