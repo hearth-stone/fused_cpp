@@ -319,8 +319,8 @@ per-core GFLOP/s
 efficiency vs ArmCodex single-core peak
 ```
 
-For ArmCodex, use the peak table in `AGENT.md`. The fp32 FMLA and bf16 MMLA
-single-core references are both around 92.7 GFLOP/s on that machine.
+For ArmCodex, use the peak table referenced by `AGENTS.md`. The fp32 FMLA and
+bf16 MMLA single-core references are both around 92.7 GFLOP/s on that machine.
 
 Important current performance caveats:
 

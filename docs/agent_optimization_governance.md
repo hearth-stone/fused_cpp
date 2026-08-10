@@ -6,8 +6,8 @@ fixes do not need to load this file unless they touch those areas.
 
 These rules keep optimization work traceable without forcing a repository-wide
 rewrite. Follow, in order: the user's current instruction, any nearer
-`AGENT.md`/`AGENTS.md`, root `AGENT.md`, this file, then existing repository
-conventions.
+`AGENTS.override.md`/`AGENTS.md`, the repository `AGENTS.md`, this file, then
+existing repository conventions.
 
 Core intent:
 
@@ -167,7 +167,7 @@ the user asks.
 
 For optimization tasks:
 
-1. Read root `AGENT.md`, this file, and nearer instruction files.
+1. Read the repository `AGENTS.md`, this file, and nearer instruction files.
 2. Check `git status --short`.
 3. Locate baseline, call chain, build entrypoint, tests, and benchmarks.
 4. Identify operator, part, feature, variant, legacy files, and active files.
