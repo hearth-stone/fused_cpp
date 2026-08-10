@@ -25,13 +25,11 @@ from fused_cpp.moe import (  # noqa: E402
 
 
 VARIANT_ENV = {
-    "asm": ("asm", "0", "0", "0", "0"),
-    "jit": ("jit", "0", "0", "0", "0"),
-    "jit-panel": ("jit", "0", "0", "0", "0"),
-    "jit-prefetch": ("jit", "0", "1", "0", "0"),
-    "jit-prefetch-all": ("jit", "0", "0", "1", "0"),
-    "jit-bulk": ("jit", "1", "0", "0", "0"),
-    "jit-dual-n": ("jit", "0", "0", "0", "1"),
+    "asm": ("asm", "0", "0"),
+    "jit": ("jit", "0", "0"),
+    "jit-panel": ("jit", "0", "0"),
+    "jit-bulk": ("jit", "1", "0"),
+    "jit-dual-n": ("jit", "0", "1"),
 }
 
 
@@ -55,11 +53,9 @@ def parse_variant_list(value: str) -> tuple[str, ...]:
 
 
 def select_variant(variant: str) -> None:
-    implementation, bulk_m, w13_prefetch, all_gemm_prefetch, dual_n = VARIANT_ENV[variant]
+    implementation, bulk_m, dual_n = VARIANT_ENV[variant]
     os.environ["FUSED_CPP_MOE_SVE_IMPL"] = implementation
     os.environ["FUSED_CPP_MOE_SVE_JIT_BULK_M"] = bulk_m
-    os.environ["FUSED_CPP_MOE_SVE_W13_FIRST_PANEL_PREFETCH"] = w13_prefetch
-    os.environ["FUSED_CPP_MOE_SVE_FIRST_PANEL_PREFETCH"] = all_gemm_prefetch
     os.environ["FUSED_CPP_MOE_SVE_JIT_M2_DUAL_N"] = dual_n
 
 
@@ -83,7 +79,7 @@ def parse_args() -> argparse.Namespace:
         "--variants",
         default="asm,jit",
         help=(
-            "comma-separated subset of asm,jit,jit-panel,jit-prefetch,jit-prefetch-all,jit-bulk,jit-dual-n; "
+            "comma-separated subset of asm,jit,jit-panel,jit-bulk,jit-dual-n; "
             "first variant is the timing baseline"
         ),
     )

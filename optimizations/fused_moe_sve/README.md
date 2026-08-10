@@ -38,21 +38,6 @@ packed-C row base, regular W2 advances its row-major output, and direct-route W2
 keeps the route-output base fixed while advancing only the route-id table. The
 flag is off by default.
 
-`FUSED_CPP_MOE_SVE_W13_FIRST_PANEL_PREFETCH=1` enables the retired,
-benchmark-only production-wiring experiment derived from the standalone
-streaming-B result below. The JIT cache contains prefetch and ordinary kernels
-for every exact M from 1 through 12.
-Within each thread-owned W13 N stripe, its first actual M panel uses one
-`PLDL1STRM` hint 2 KiB ahead; all subsequent panels use ordinary kernels.
-M1-M8 keep their two-bank K loop and disable hints on the final N tile. M9-M12
-disable only the final 2 KiB of hints on that tile.
-
-`FUSED_CPP_MOE_SVE_FIRST_PANEL_PREFETCH=1` applies this selection to all
-generated GEMMs. W13 keeps its L1/2 KiB policy; FP32 W2 and direct-route W2 use
-the standalone experiment's L2/1 KiB policy. The static BF16-route W2 path is
-unchanged. Both JIT-only flags are off by default and conflict with bulk-M
-because bulk-M owns the M loop inside one generated call.
-
 The A/B benchmark keeps both implementations in one process but measures
 steady blocks. After each implementation switch it executes one unmeasured
 transition call, preventing code-switch I-cache replacement from being charged
@@ -73,27 +58,6 @@ numactl --cpunodebind=0 --membind=0 taskset -c 0-95 \
   --threads 1,4,8,16,32,64,96 --warmup 5 --runs 31 \
   --switch-period 5
 
-# Isolate first-cold-panel prefetch, then repeat at 24 concurrent 4T experts.
-numactl --cpunodebind=0 --membind=0 taskset -c 0-95 \
-  .venv/bin/python \
-  optimizations/fused_moe_sve/benchmarks/bench_xbyak_exact_m.py \
-  --variants jit-panel,jit-prefetch --routes 12,24,48,192,768,2040 \
-  --threads 1,4 --warmup 5 --runs 31 --switch-period 5
-
-numactl --cpunodebind=0 --membind=0 taskset -c 0-95 \
-  .venv/bin/python \
-  optimizations/fused_moe_sve/benchmarks/bench_xbyak_exact_m.py \
-  --variants jit-panel,jit-prefetch --routes 12,192,2040 \
-  --experts 48 --measurement-experts 24 --experts-per-wave 24 \
-  --threads 4 --warmup 5 --runs 31 --switch-period 5
-
-# Compare exact-M W13-only and all-GEMM prefetch policies.
-numactl --cpunodebind=0 --membind=0 taskset -c 0-95 \
-  .venv/bin/python \
-  optimizations/fused_moe_sve/benchmarks/bench_xbyak_exact_m.py \
-  --variants jit-panel,jit-prefetch,jit-prefetch-all \
-  --routes 1,2,3,4,5,6,7,8,9,10,11,12 --threads 1,4 \
-  --warmup 5 --runs 31 --switch-period 5
 ```
 
 With H=4096, F=512, eight distinct experts, and `R13=2,R2=1`, the 192-core host's
@@ -125,14 +89,14 @@ The bulk-M experiment is bitwise correct but performance-neutral across the
 are in
 [`results/amazon_192c_xbyak_bulk_m.md`](results/amazon_192c_xbyak_bulk_m.md).
 
-The exact-M extension gives the W13-only candidate median gains of about 1.93%
-at 1T and 2.10% at 4T over M1-M12 in five-process tests. Prefetching W2 adds no
-stable isolated benefit and regresses by about 7.36% relative to W13-only at
-24 concurrent 4T experts. Reusable W13 B panels also regress, reaching about
--4.35% e2e at M48/4T. W13-only prefetch is therefore retired as a production
-candidate: its flag remains for controlled reproduction, but it is not part of
-default dispatch or planner policy. Full generated-code, phase, exact-M, and
-concurrency results are in
+The removed first-panel-prefetch experiment gave the W13-only candidate median
+gains of about 1.93% at 1T and 2.10% at 4T over M1-M12 in five-process tests.
+Prefetching W2 added no stable isolated benefit and regressed by about 7.36%
+relative to W13-only at 24 concurrent 4T experts. Reusable W13 B panels also
+regressed, reaching about -4.35% e2e at M48/4T. The implementation, environment
+flags, tests, and benchmark variants have been removed from the active tree;
+the measurements remain in this report and the implementation remains in Git
+history:
 [`results/amazon_192c_w13_first_panel_prefetch.md`](results/amazon_192c_w13_first_panel_prefetch.md).
 
 The NUMA0 single-core cold-weight calibration uses 64 rotating H4096/F512

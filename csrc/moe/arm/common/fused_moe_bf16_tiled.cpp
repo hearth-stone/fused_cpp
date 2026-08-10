@@ -1204,31 +1204,6 @@ bool sve_jit_bulk_m_enabled() {
   return value != nullptr && value[0] != '\0' && value[0] != '0';
 }
 
-bool sve_jit_w13_first_panel_prefetch_enabled() {
-  const char* value = std::getenv("FUSED_CPP_MOE_SVE_W13_FIRST_PANEL_PREFETCH");
-  return value != nullptr && value[0] != '\0' && value[0] != '0';
-}
-
-bool sve_jit_all_first_panel_prefetch_enabled() {
-  const char* value = std::getenv("FUSED_CPP_MOE_SVE_FIRST_PANEL_PREFETCH");
-  return value != nullptr && value[0] != '\0' && value[0] != '0';
-}
-
-bool sve_jit_first_panel_prefetch_enabled(SveJitOperation operation) {
-  return sve_jit_all_first_panel_prefetch_enabled() ||
-         (operation == SveJitOperation::kW13 && sve_jit_w13_first_panel_prefetch_enabled());
-}
-
-bool sve_jit_any_first_panel_prefetch_enabled() {
-  return sve_jit_all_first_panel_prefetch_enabled() || sve_jit_w13_first_panel_prefetch_enabled();
-}
-
-bool sve_jit_first_panel_prefetch_supported(SveJitOperation operation, int K) {
-  const int64_t prefetch_distance_bytes = operation == SveJitOperation::kW13 ? 2048 : 1024;
-  const int64_t b_tile_bytes = static_cast<int64_t>(K) * 2 * ::fused_cpp::moe_sve::n_tile();
-  return b_tile_bytes > prefetch_distance_bytes;
-}
-
 bool sve_jit_configuration_supported(SveJitOperation operation, int K, int64_t degree, std::string* reason) {
   const auto mode = ::fused_cpp::moe_sve::jit::implementation_mode();
   if (mode == ::fused_cpp::moe_sve::jit::ImplementationMode::kAsm) {
@@ -1278,18 +1253,6 @@ void prewarm_sve_jit_exact_m_kernels(int w13_k, int w2_k) {
   }
   ::fused_cpp::moe_sve::jit::prewarm(SveJitOperation::kW2, 0);
   ::fused_cpp::moe_sve::jit::prewarm(SveJitOperation::kW2Direct, 0);
-  if (sve_jit_any_first_panel_prefetch_enabled()) {
-    TORCH_CHECK(!sve_jit_bulk_m_enabled(), "SVE first-panel prefetch conflicts with FUSED_CPP_MOE_SVE_JIT_BULK_M");
-  }
-  if (sve_jit_first_panel_prefetch_enabled(SveJitOperation::kW13)) {
-    for (int degree = 4; degree <= 6; ++degree) {
-      ::fused_cpp::moe_sve::jit::prewarm_first_panel_prefetch(SveJitOperation::kW13, degree);
-    }
-  }
-  if (sve_jit_first_panel_prefetch_enabled(SveJitOperation::kW2)) {
-    ::fused_cpp::moe_sve::jit::prewarm_first_panel_prefetch(SveJitOperation::kW2, 0);
-    ::fused_cpp::moe_sve::jit::prewarm_first_panel_prefetch(SveJitOperation::kW2Direct, 0);
-  }
   if (sve_jit_bulk_m_enabled()) {
     for (int degree = 4; degree <= 6; ++degree) {
       ::fused_cpp::moe_sve::jit::prewarm_bulk_m12(SveJitOperation::kW13, degree);
@@ -1335,43 +1298,17 @@ bool resolve_sve_jit_exact_m_kernels(SveJitOperation operation, int rows, int64_
   return resolved;
 }
 
-SveJitKernelFn resolve_sve_jit_first_panel_prefetch_kernel(SveJitOperation operation, int rows, int K, int64_t degree) {
-  if (!sve_jit_first_panel_prefetch_enabled(operation)) {
-    return nullptr;
-  }
-  TORCH_CHECK(!sve_jit_bulk_m_enabled(), "SVE first-panel prefetch conflicts with FUSED_CPP_MOE_SVE_JIT_BULK_M");
-  if (!sve_jit_first_panel_prefetch_supported(operation, K)) {
-    return nullptr;
-  }
-  std::string error;
-  const SveJitKernelFn kernel = ::fused_cpp::moe_sve::jit::get_first_panel_prefetch_kernel(
-      operation, std::min(rows, 12), static_cast<int>(degree), &error);
-  TORCH_CHECK(kernel != nullptr, "failed to generate SVE Xbyak ", sve_jit_operation_name(operation),
-              " first-panel prefetch kernel: ", error);
-  return kernel;
-}
-
 bool sve_jit_packc_w13_exact_dispatch(const uint16_t* packed_A, const uint16_t* w13_packed, uint16_t* C, int rows,
                                       int K, int N, int ldc, int packed_N, int n_begin, int64_t degree,
                                       bool single_window) {
   if (!sve_jit_configuration_supported(SveJitOperation::kW13, K, degree, nullptr)) {
     return false;
   }
-  // Both stripe-level optimizations assume this call covers the worker's whole
-  // owner stripe: the prefetch variant only helps on the first M panel of a cold
-  // stripe, and the bulk kernel advances panel state internally. Under a windowed
-  // traversal (R > 1) the same B is revisited once per window, so neither
-  // assumption holds and both are switched off. Re-enabling them per window is a
-  // separate experiment.
-  const SveJitKernelFn first_panel_kernel =
-      single_window ? resolve_sve_jit_first_panel_prefetch_kernel(SveJitOperation::kW13, rows, K, degree) : nullptr;
   SveJitExactMKernelSet kernels;
-  const bool allow_bulk_m = single_window && first_panel_kernel == nullptr;
-  if (!resolve_sve_jit_exact_m_kernels(SveJitOperation::kW13, rows, degree, allow_bulk_m, &kernels)) {
+  if (!resolve_sve_jit_exact_m_kernels(SveJitOperation::kW13, rows, degree, single_window, &kernels)) {
     return false;
   }
-  TORCH_CHECK(single_window || (!kernels.bulk_m && first_panel_kernel == nullptr),
-              "windowed W13 traversal must not use stripe-level kernels");
+  TORCH_CHECK(single_window || !kernels.bulk_m, "windowed W13 traversal must not use the bulk-M kernel");
   SveKBlockParams p = make_sve_kblock_params(12, K, N, ldc, packed_N, n_begin, static_cast<int>(degree));
   const void* constants = ::fused_cpp::moe_sve::jit::silu_constants();
   if (kernels.bulk_m) {
@@ -1380,19 +1317,16 @@ bool sve_jit_packc_w13_exact_dispatch(const uint16_t* packed_A, const uint16_t* 
   } else {
     for (int mb = 0; mb < kernels.main_rows; mb += 12) {
       p.gemm.m = 12;
-      const SveJitKernelFn kernel = mb == 0 && first_panel_kernel != nullptr ? first_panel_kernel : kernels.m12;
-      kernel(packed_A + static_cast<int64_t>(mb) * K, w13_packed,
-             C + static_cast<int64_t>(mb) * ldc + static_cast<int64_t>(n_begin) * 6, constants, &p.gemm);
+      kernels.m12(packed_A + static_cast<int64_t>(mb) * K, w13_packed,
+                  C + static_cast<int64_t>(mb) * ldc + static_cast<int64_t>(n_begin) * 6, constants, &p.gemm);
     }
   }
   if (kernels.tail_rows > 0) {
     const int physical_pairs = kernels.tail_rows <= 8 ? 4 : 6;
     p.gemm.m = kernels.tail_rows;
-    const SveJitKernelFn kernel =
-        kernels.main_rows == 0 && first_panel_kernel != nullptr ? first_panel_kernel : kernels.tail;
-    kernel(packed_A + static_cast<int64_t>(kernels.main_rows) * K, w13_packed,
-           C + static_cast<int64_t>(kernels.main_rows) * ldc + static_cast<int64_t>(n_begin) * physical_pairs,
-           constants, &p.gemm);
+    kernels.tail(packed_A + static_cast<int64_t>(kernels.main_rows) * K, w13_packed,
+                 C + static_cast<int64_t>(kernels.main_rows) * ldc + static_cast<int64_t>(n_begin) * physical_pairs,
+                 constants, &p.gemm);
   }
   return true;
 }
@@ -1402,17 +1336,11 @@ bool sve_jit_packed_w2_exact_dispatch(const uint16_t* packed_A, const uint16_t* 
   if (!sve_jit_configuration_supported(SveJitOperation::kW2, K, 0, nullptr)) {
     return false;
   }
-  // See sve_jit_packc_w13_exact_dispatch: both stripe-level kernels assume this
-  // call covers the worker's whole owner stripe, which a windowed traversal breaks.
-  const SveJitKernelFn first_panel_kernel =
-      single_window ? resolve_sve_jit_first_panel_prefetch_kernel(SveJitOperation::kW2, rows, K, 0) : nullptr;
   SveJitExactMKernelSet kernels;
-  const bool allow_bulk_m = single_window && first_panel_kernel == nullptr;
-  if (!resolve_sve_jit_exact_m_kernels(SveJitOperation::kW2, rows, 0, allow_bulk_m, &kernels)) {
+  if (!resolve_sve_jit_exact_m_kernels(SveJitOperation::kW2, rows, 0, single_window, &kernels)) {
     return false;
   }
-  TORCH_CHECK(single_window || (!kernels.bulk_m && first_panel_kernel == nullptr),
-              "windowed W2 traversal must not use stripe-level kernels");
+  TORCH_CHECK(single_window || !kernels.bulk_m, "windowed W2 traversal must not use the bulk-M kernel");
   SveKBlockParams p = make_sve_kblock_params(12, K, N, ldc, packed_N, n_begin, 0);
   if (kernels.bulk_m) {
     p.gemm.m = kernels.main_rows;
@@ -1420,17 +1348,14 @@ bool sve_jit_packed_w2_exact_dispatch(const uint16_t* packed_A, const uint16_t* 
   } else {
     for (int mb = 0; mb < kernels.main_rows; mb += 12) {
       p.gemm.m = 12;
-      const SveJitKernelFn kernel = mb == 0 && first_panel_kernel != nullptr ? first_panel_kernel : kernels.m12;
-      kernel(packed_A + static_cast<int64_t>(mb) * K, w2_packed, down + static_cast<int64_t>(mb) * ldc, nullptr,
-             &p.gemm);
+      kernels.m12(packed_A + static_cast<int64_t>(mb) * K, w2_packed, down + static_cast<int64_t>(mb) * ldc, nullptr,
+                  &p.gemm);
     }
   }
   if (kernels.tail_rows > 0) {
     p.gemm.m = kernels.tail_rows;
-    const SveJitKernelFn kernel =
-        kernels.main_rows == 0 && first_panel_kernel != nullptr ? first_panel_kernel : kernels.tail;
-    kernel(packed_A + static_cast<int64_t>(kernels.main_rows) * K, w2_packed,
-           down + static_cast<int64_t>(kernels.main_rows) * ldc, nullptr, &p.gemm);
+    kernels.tail(packed_A + static_cast<int64_t>(kernels.main_rows) * K, w2_packed,
+                 down + static_cast<int64_t>(kernels.main_rows) * ldc, nullptr, &p.gemm);
   }
   return true;
 }
@@ -1469,17 +1394,12 @@ bool sve_jit_packed_w2_direct_route_exact_dispatch(const uint16_t* packed_A, con
   if (!sve_jit_configuration_supported(SveJitOperation::kW2Direct, K, 0, nullptr)) {
     return false;
   }
-  // See sve_jit_packc_w13_exact_dispatch for why a windowed traversal switches
-  // both stripe-level kernels off.
-  const SveJitKernelFn first_panel_kernel =
-      single_window ? resolve_sve_jit_first_panel_prefetch_kernel(SveJitOperation::kW2Direct, rows, K, 0) : nullptr;
   SveJitExactMKernelSet kernels;
-  const bool allow_bulk_m = single_window && first_panel_kernel == nullptr;
-  if (!resolve_sve_jit_exact_m_kernels(SveJitOperation::kW2Direct, rows, 0, allow_bulk_m, &kernels)) {
+  if (!resolve_sve_jit_exact_m_kernels(SveJitOperation::kW2Direct, rows, 0, single_window, &kernels)) {
     return false;
   }
-  TORCH_CHECK(single_window || (!kernels.bulk_m && first_panel_kernel == nullptr),
-              "windowed W2 direct-route traversal must not use stripe-level kernels");
+  TORCH_CHECK(single_window || !kernels.bulk_m,
+              "windowed W2 direct-route traversal must not use the bulk-M kernel");
   SveKBlockParams p = make_sve_kblock_params(12, K, N, route_stride, packed_N, n_begin, 3);
   if (kernels.bulk_m) {
     p.gemm.m = kernels.main_rows;
@@ -1487,16 +1407,13 @@ bool sve_jit_packed_w2_direct_route_exact_dispatch(const uint16_t* packed_A, con
   } else {
     for (int mb = 0; mb < kernels.main_rows; mb += 12) {
       p.gemm.m = 12;
-      const SveJitKernelFn kernel = mb == 0 && first_panel_kernel != nullptr ? first_panel_kernel : kernels.m12;
-      kernel(packed_A + static_cast<int64_t>(mb) * K, w2_packed, route_out, route_ids + mb, &p.gemm);
+      kernels.m12(packed_A + static_cast<int64_t>(mb) * K, w2_packed, route_out, route_ids + mb, &p.gemm);
     }
   }
   if (kernels.tail_rows > 0) {
     p.gemm.m = kernels.tail_rows;
-    const SveJitKernelFn kernel =
-        kernels.main_rows == 0 && first_panel_kernel != nullptr ? first_panel_kernel : kernels.tail;
-    kernel(packed_A + static_cast<int64_t>(kernels.main_rows) * K, w2_packed, route_out, route_ids + kernels.main_rows,
-           &p.gemm);
+    kernels.tail(packed_A + static_cast<int64_t>(kernels.main_rows) * K, w2_packed, route_out,
+                 route_ids + kernels.main_rows, &p.gemm);
   }
   return true;
 }

@@ -74,22 +74,6 @@ asm   force the static assembly compatibility path
 variant. For M>=24 it moves the loop over complete M12 panels into generated
 code; exact tails and packed formats are unchanged. The flag defaults to off.
 
-`FUSED_CPP_MOE_SVE_W13_FIRST_PANEL_PREFETCH=1` enables a retired,
-benchmark-only JIT W13 load variant for every exact M from 1 through 12. For
-each thread-owned N range, only the first actual M panel issues one
-`PLDL1STRM` hint 2 KiB ahead of each B cache-line load; later M panels call the
-ordinary generated kernel. M1-M8 preserve the two-bank K loop and disable hints
-on the final N tile. M9-M12 disable hints for the final 2 KiB of that tile.
-This keeps all hints inside the owned range. It is not selected by production
-dispatch or planner policy.
-
-`FUSED_CPP_MOE_SVE_FIRST_PANEL_PREFETCH=1` extends the same experiment to the
-generated FP32 W2 and direct-route W2 kernels, using `PLDL2STRM` 1 KiB ahead.
-It does not affect the static BF16-route W2 path. Full-NUMA tests show that W2
-prefetch is harmful under contention, so both flags default to off and the
-all-GEMM flag is for controlled experiments only. Either flag conflicts with
-`FUSED_CPP_MOE_SVE_JIT_BULK_M=1`.
-
 The static assembly remains the fallback for builds without the initialized
 submodule, split-K/Kc, identity W13, reciprocal-refinement or minimax SiLU, and
 BF16 W2 route storage. Strict `jit` raises instead of falling back for a
