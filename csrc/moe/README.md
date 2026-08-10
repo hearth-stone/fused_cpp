@@ -71,8 +71,7 @@ asm   force the static assembly compatibility path
 ```
 
 The static assembly remains the fallback for builds without the initialized
-submodule, identity W13, reciprocal-refinement or minimax SiLU, and BF16 W2
-route storage. Strict `jit` raises instead of falling back for a generated
+submodule, identity W13, and BF16 W2 route storage. Strict `jit` raises instead of falling back for a generated
 surface; an explicitly selected static-only surface such as BF16 route storage
 remains available. `FUSED_CPP_MOE_SVE=0`
 still disables the entire SVE backend and selects the NEON implementation.

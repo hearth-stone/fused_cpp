@@ -428,9 +428,9 @@ claims must include both long-route throughput and short-route latency.
   address work and input reads by the team width; only a single-thread or very
   short-route microbenchmark can justify a specialized path.
 - Do not prioritize further SiLU approximation work as an E2E optimization. Its
-  measured contribution is only 2.3-3.7% of W13+W2 time; retain polynomial and
-  reciprocal variants as accuracy/performance experiments, not the main fusion
-  program.
+  measured contribution is only 2.3-3.7% of W13+W2 time. Reciprocal refinement
+  and minimax3 were retired on 2026-08-10 after closed experiments; use the
+  retained poly4/5/6 precision contract for any future model-level study.
 
 The old AUTO selector, bucketized wave-DP, and wave-based Phase 4 items in
 `FINDINGS.md` remain historical only because wave scheduling is deprecated.

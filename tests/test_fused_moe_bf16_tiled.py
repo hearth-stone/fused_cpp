@@ -162,7 +162,7 @@ def test_vllm_staged_matches_fused_sve_with_multiple_n_tasks(
     torch.testing.assert_close(candidate.float(), reference.float(), atol=0, rtol=0)
 
 
-def test_sve_m12_silu_and_w2_bf16_route_match_legacy_for_unit_top1(
+def test_sve_m12_silu_and_w2_bf16_route_for_unit_top1(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Cover M12, padded-M12 tails 9-11, and smaller tails through all bridges."""
@@ -238,7 +238,6 @@ def test_sve_m12_silu_and_w2_bf16_route_match_legacy_for_unit_top1(
     }
     for bridge, call in calls.items():
         monkeypatch.setenv("FUSED_CPP_MOE_SVE_IMPL", "auto")
-        monkeypatch.setenv("FUSED_CPP_MOE_SILU_MINIMAX3", "0")
         monkeypatch.setenv("FUSED_CPP_MOE_W2_BF16_ROUTE", "0")
         reference = call()
         monkeypatch.setenv("FUSED_CPP_MOE_W2_BF16_ROUTE", "1")
@@ -251,46 +250,18 @@ def test_sve_m12_silu_and_w2_bf16_route_match_legacy_for_unit_top1(
             msg=lambda message: f"{bridge}: {message}",
         )
 
-        monkeypatch.setenv("FUSED_CPP_MOE_SVE_IMPL", "asm")
         for degree in (4, 5, 6):
-            monkeypatch.setenv("FUSED_CPP_MOE_SILU_MINIMAX3", "0")
-            monkeypatch.setenv("FUSED_CPP_MOE_SILU_RECIP_NR", "0")
-            monkeypatch.setenv("FUSED_CPP_MOE_SILU_M12_OPT", "0")
+            monkeypatch.setenv("FUSED_CPP_MOE_SVE_IMPL", "jit")
             reference = call(degree)
-            monkeypatch.setenv("FUSED_CPP_MOE_SILU_M12_OPT", "1")
+            monkeypatch.setenv("FUSED_CPP_MOE_SVE_IMPL", "asm")
             candidate = call(degree)
             torch.testing.assert_close(
                 candidate.float(),
                 reference.float(),
                 atol=0,
                 rtol=0,
-                msg=lambda message, bridge=bridge, degree=degree: f"{bridge}/poly{degree}: {message}",
+                msg=lambda message, bridge=bridge, degree=degree: f"{bridge}/poly{degree}/asm-vs-jit: {message}",
             )
-
-            for recip_steps in (1, 2):
-                monkeypatch.setenv("FUSED_CPP_MOE_SILU_RECIP_NR", str(recip_steps))
-                reciprocal = call(degree)
-                torch.testing.assert_close(
-                    reciprocal.float(),
-                    candidate.float(),
-                    atol=1.0e-6,
-                    rtol=1.0e-2,
-                    msg=lambda message, bridge=bridge, degree=degree, recip_steps=recip_steps: (
-                        f"{bridge}/poly{degree}/recip{recip_steps}: {message}"
-                    ),
-                )
-
-            if degree == 5:
-                monkeypatch.setenv("FUSED_CPP_MOE_SILU_RECIP_NR", "0")
-                monkeypatch.setenv("FUSED_CPP_MOE_SILU_MINIMAX3", "1")
-                minimax3 = call(degree)
-                torch.testing.assert_close(
-                    minimax3.float(),
-                    candidate.float(),
-                    atol=1.0e-6,
-                    rtol=2.0e-2,
-                    msg=lambda message, bridge=bridge: f"{bridge}/minimax3: {message}",
-                )
 
 
 def test_sve_plan_v2_route_slices_match_full_experts(
@@ -603,9 +574,6 @@ def test_sve_xbyak_exact_m_matches_static_asm(
         pytest.skip("requires an SVE BF16 build/runtime")
     monkeypatch.setenv("FUSED_CPP_MOE_SVE", "1")
     monkeypatch.setenv("FUSED_CPP_MOE_W2_BF16_ROUTE", "0")
-    monkeypatch.setenv("FUSED_CPP_MOE_SILU_M12_OPT", "0")
-    monkeypatch.setenv("FUSED_CPP_MOE_SILU_RECIP_NR", "0")
-    monkeypatch.setenv("FUSED_CPP_MOE_SILU_MINIMAX3", "0")
 
     generator = torch.Generator().manual_seed(20260720 + degree)
     route_counts = [*range(1, 14), 23, 24, 25, 35, 36, 37, 48, 192]

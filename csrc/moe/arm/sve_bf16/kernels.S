@@ -570,54 +570,7 @@
 	.endif
 	.endm
 
-	.macro SILU_TO_BF16_LOW_TMP gate, up, deg
-	fneg z0.s, p1/m, \gate\().s
-	LOAD_SILU_CONST z4, 32
-	fmin z0.s, p1/m, z0.s, z4.s
-	LOAD_SILU_CONST z4, 36
-	fmax z0.s, p1/m, z0.s, z4.s
-	LOAD_SILU_CONST z4, 8
-	mov z1.d, z0.d
-	fmul z1.s, p1/m, z1.s, z4.s
-	frintn z1.s, p1/m, z1.s
-	fcvtzs z2.s, p1/m, z1.s
-	LOAD_SILU_CONST z4, 12
-	fmls z0.s, p1/m, z1.s, z4.s
-	.if \deg == 4
-	LOAD_SILU_CONST z3, 20
-	.elseif \deg == 5
-	LOAD_SILU_CONST z3, 24
-	LOAD_SILU_CONST z4, 20
-	fmla z4.s, p1/m, z3.s, z0.s
-	mov z3.d, z4.d
-	.else
-	LOAD_SILU_CONST z3, 28
-	LOAD_SILU_CONST z4, 24
-	fmla z4.s, p1/m, z3.s, z0.s
-	LOAD_SILU_CONST z3, 20
-	fmla z3.s, p1/m, z4.s, z0.s
-	.endif
-	LOAD_SILU_CONST z4, 16
-	fmla z4.s, p1/m, z3.s, z0.s
-	LOAD_SILU_CONST z3, 4
-	fmla z3.s, p1/m, z4.s, z0.s
-	LOAD_SILU_CONST z4, 0
-	fmla z4.s, p1/m, z3.s, z0.s
-	LOAD_SILU_CONST z3, 0
-	fmla z3.s, p1/m, z4.s, z0.s
-	mov z4.s, #127
-	add z2.s, z2.s, z4.s
-	lsl z2.s, z2.s, #23
-	fmul z3.s, p1/m, z3.s, z2.s
-	LOAD_SILU_CONST z4, 0
-	fadd z3.s, p1/m, z3.s, z4.s
-	mov z0.d, \gate\().d
-	fmul z0.s, p1/m, z0.s, \up\().s
-	fdiv z0.s, p1/m, z0.s, z3.s
-	bfcvt z0.h, p1/m, z0.s
-	.endm
-
-	.macro SILU_TO_BF16_LOW_TMP_BASE gate, up, deg, recip_steps, poly_kind
+	.macro SILU_TO_BF16_LOW_TMP_BASE gate, up, deg
 	fneg z0.s, p1/m, \gate\().s
 	LOAD_SILU_CONST_BASE z4, 32
 	fmin z0.s, p1/m, z0.s, z4.s
@@ -630,16 +583,6 @@
 	fcvtzs z2.s, p1/m, z1.s
 	LOAD_SILU_CONST_BASE z4, 12
 	fmls z0.s, p1/m, z1.s, z4.s
-	.if \poly_kind == 3
-	LOAD_SILU_CONST_BASE z3, 52
-	LOAD_SILU_CONST_BASE z4, 48
-	fmla z4.s, p1/m, z3.s, z0.s
-	LOAD_SILU_CONST_BASE z3, 44
-	fmla z3.s, p1/m, z4.s, z0.s
-	LOAD_SILU_CONST_BASE z4, 40
-	fmla z4.s, p1/m, z3.s, z0.s
-	mov z3.d, z4.d
-	.else
 	.if \deg == 4
 	LOAD_SILU_CONST_BASE z3, 20
 	.elseif \deg == 5
@@ -662,7 +605,6 @@
 	fmla z4.s, p1/m, z3.s, z0.s
 	LOAD_SILU_CONST_BASE z3, 0
 	fmla z3.s, p1/m, z4.s, z0.s
-	.endif
 	mov z4.s, #127
 	add z2.s, z2.s, z4.s
 	lsl z2.s, z2.s, #23
@@ -671,18 +613,7 @@
 	fadd z3.s, p1/m, z3.s, z4.s
 	mov z0.d, \gate\().d
 	fmul z0.s, p1/m, z0.s, \up\().s
-	.if \recip_steps == 0
 	fdiv z0.s, p1/m, z0.s, z3.s
-	.else
-	frecpe z1.s, z3.s
-	frecps z2.s, z3.s, z1.s
-	fmul z1.s, p1/m, z1.s, z2.s
-	.if \recip_steps == 2
-	frecps z2.s, z3.s, z1.s
-	fmul z1.s, p1/m, z1.s, z2.s
-	.endif
-	fmul z0.s, p1/m, z0.s, z1.s
-	.endif
 	bfcvt z0.h, p1/m, z0.s
 	.endm
 
@@ -712,33 +643,10 @@
 	ld1rw {z31.s}, p1/z, [x3]      // clamp_lo
 	.endm
 
-	// Cubic near-minimax exp(r) on [-ln(2)/2, ln(2)/2]. The coefficient
-	// registers replace the Taylor-only constants; z6 remains 1.0 for the
-	// sigmoid denominator.
-	.macro SILU_CONSTS_LOAD_M12_MINIMAX3
-	ld1rw {z6.s}, p1/z, [x7]        // 1.0 denominator
-	add x3, x7, #8
-	ld1rw {z24.s}, p1/z, [x3]       // invln2
-	add x3, x3, #4
-	ld1rw {z25.s}, p1/z, [x3]       // ln2
-	add x3, x7, #32
-	ld1rw {z30.s}, p1/z, [x3]       // clamp_hi
-	add x3, x3, #4
-	ld1rw {z31.s}, p1/z, [x3]       // clamp_lo
-	add x3, x3, #4
-	ld1rw {z7.s}, p1/z, [x3]        // p0
-	add x3, x3, #4
-	ld1rw {z26.s}, p1/z, [x3]       // p1
-	add x3, x3, #4
-	ld1rw {z27.s}, p1/z, [x3]       // p2
-	add x3, x3, #4
-	ld1rw {z28.s}, p1/z, [x3]       // p3
-	.endm
-
 	// Compute both rows in a row-pair together. The independent chains use
 	// z0/z2/gate0/up0 and z1/z3/gate1/up1, allowing the two FDIV operations to
 	// overlap. Results replace gate0/gate1 as bf16 values ready for st1h.
-	.macro SILU_PAIR_TO_BF16_CACHED gate0, gate1, up0, up1, deg, recip_steps, poly_kind
+	.macro SILU_PAIR_TO_BF16_CACHED gate0, gate1, up0, up1, deg
 	fneg z0.s, p1/m, \gate0\().s
 	fneg z1.s, p1/m, \gate1\().s
 	fmin z0.s, p1/m, z0.s, z30.s
@@ -757,16 +665,7 @@
 	fcvtzs z3.s, p1/m, z3.s
 	fmul \gate0\().s, p1/m, \gate0\().s, \up0\().s
 	fmul \gate1\().s, p1/m, \gate1\().s, \up1\().s
-	.if \poly_kind == 3
-	mov \up0\().d, z28.d
-	mov \up1\().d, z28.d
-	fmad \up0\().s, p1/m, z0.s, z27.s
-	fmad \up1\().s, p1/m, z1.s, z27.s
-	fmad \up0\().s, p1/m, z0.s, z26.s
-	fmad \up1\().s, p1/m, z1.s, z26.s
-	fmad \up0\().s, p1/m, z0.s, z7.s
-	fmad \up1\().s, p1/m, z1.s, z7.s
-	.elseif \deg == 4
+	.if \deg == 4
 	mov \up0\().d, z27.d
 	mov \up1\().d, z27.d
 	.elseif \deg == 5
@@ -782,7 +681,6 @@
 	fmad \up0\().s, p1/m, z0.s, z27.s
 	fmad \up1\().s, p1/m, z1.s, z27.s
 	.endif
-	.if \poly_kind != 3
 	fmad \up0\().s, p1/m, z0.s, z26.s
 	fmad \up1\().s, p1/m, z1.s, z26.s
 	fmad \up0\().s, p1/m, z0.s, z7.s
@@ -791,7 +689,6 @@
 	fmad \up1\().s, p1/m, z1.s, z6.s
 	fmad \up0\().s, p1/m, z0.s, z6.s
 	fmad \up1\().s, p1/m, z1.s, z6.s
-	.endif
 	mov z4.s, #127
 	add z2.s, z2.s, z4.s
 	add z3.s, z3.s, z4.s
@@ -801,25 +698,8 @@
 	fmul \up1\().s, p1/m, \up1\().s, z3.s
 	fadd \up0\().s, p1/m, \up0\().s, z6.s
 	fadd \up1\().s, p1/m, \up1\().s, z6.s
-	.if \recip_steps == 0
 	fdiv \gate0\().s, p1/m, \gate0\().s, \up0\().s
 	fdiv \gate1\().s, p1/m, \gate1\().s, \up1\().s
-	.else
-	frecpe z0.s, \up0\().s
-	frecpe z1.s, \up1\().s
-	frecps z2.s, \up0\().s, z0.s
-	frecps z3.s, \up1\().s, z1.s
-	fmul z0.s, p1/m, z0.s, z2.s
-	fmul z1.s, p1/m, z1.s, z3.s
-	.if \recip_steps == 2
-	frecps z2.s, \up0\().s, z0.s
-	frecps z3.s, \up1\().s, z1.s
-	fmul z0.s, p1/m, z0.s, z2.s
-	fmul z1.s, p1/m, z1.s, z3.s
-	.endif
-	fmul \gate0\().s, p1/m, \gate0\().s, z0.s
-	fmul \gate1\().s, p1/m, \gate1\().s, z1.s
-	.endif
 	bfcvt \gate0\().h, p1/m, \gate0\().s
 	bfcvt \gate1\().h, p1/m, \gate1\().s
 	.endm
@@ -927,69 +807,41 @@
 	STORE_PACKC_PAIR_IDENTITY_GUARDED x16, 0, z16, z17
 	.endm
 
-	.macro STORE_PACKC_PAIR_M12 base, g0, g1, u0, u1, deg
-	SILU_TO_BF16_LOW_TMP \g0, \u0, \deg
+	.macro STORE_PACKC_PAIR_M12_BASE base, g0, g1, u0, u1, deg
+	SILU_TO_BF16_LOW_TMP_BASE \g0, \u0, \deg
 	st1h {z0.s}, p1, [\base, z5.s, sxtw]
-	SILU_TO_BF16_LOW_TMP \g1, \u1, \deg
+	SILU_TO_BF16_LOW_TMP_BASE \g1, \u1, \deg
 	add x3, \base, #4
 	st1h {z0.s}, p1, [x3, z5.s, sxtw]
 	.endm
 
-	.macro STORE_PACKC_PAIR_M12_BASE base, g0, g1, u0, u1, deg, recip_steps, poly_kind
-	SILU_TO_BF16_LOW_TMP_BASE \g0, \u0, \deg, \recip_steps, \poly_kind
-	st1h {z0.s}, p1, [\base, z5.s, sxtw]
-	SILU_TO_BF16_LOW_TMP_BASE \g1, \u1, \deg, \recip_steps, \poly_kind
-	add x3, \base, #4
-	st1h {z0.s}, p1, [x3, z5.s, sxtw]
-	.endm
-
-	.macro STORE_PACKC_PAIR_M12_CACHED base, g0, g1, u0, u1, deg, recip_steps, poly_kind
-	SILU_PAIR_TO_BF16_CACHED \g0, \g1, \u0, \u1, \deg, \recip_steps, \poly_kind
+	.macro STORE_PACKC_PAIR_M12_CACHED base, g0, g1, u0, u1, deg
+	SILU_PAIR_TO_BF16_CACHED \g0, \g1, \u0, \u1, \deg
 	st1h {\g0\().s}, p1, [\base, z5.s, sxtw]
 	add x3, \base, #4
 	st1h {\g1\().s}, p1, [x3, z5.s, sxtw]
 	.endm
 
-	.macro STORE_PACKC_M12 deg
-	BUILD_PACKC_OFFSETS_M12
-	mov x16, x12
-	STORE_PACKC_PAIR_M12 x16, z8, z9, z10, z11, \deg
-	add x16, x12, #16
-	STORE_PACKC_PAIR_M12 x16, z12, z13, z14, z15, \deg
-	add x16, x12, #32
-	STORE_PACKC_PAIR_M12 x16, z16, z17, z18, z19, \deg
-	add x16, x12, #48
-	STORE_PACKC_PAIR_M12 x16, z20, z21, z22, z23, \deg
-	add x16, x12, #64
-	STORE_PACKC_PAIR_M12 x16, z24, z25, z26, z27, \deg
-	add x16, x12, #80
-	STORE_PACKC_PAIR_M12 x16, z28, z29, z30, z31, \deg
-	.endm
-
-	.macro STORE_PACKC_M12_OPT deg, recip_steps, poly_kind
+	.macro STORE_PACKC_M12_OPT deg
 	BUILD_PACKC_OFFSETS_M12
 	ADR_CONST x7, .Lmoe_sve_silu_consts
 	// Free z24..z31 first. These four output rows use the low-register path,
 	// but share one literal-table base instead of rebuilding it per constant.
 	add x16, x12, #64
-	STORE_PACKC_PAIR_M12_BASE x16, z24, z25, z26, z27, \deg, \recip_steps, \poly_kind
+	STORE_PACKC_PAIR_M12_BASE x16, z24, z25, z26, z27, \deg
 	add x16, x12, #80
-	STORE_PACKC_PAIR_M12_BASE x16, z28, z29, z30, z31, \deg, \recip_steps, \poly_kind
+	STORE_PACKC_PAIR_M12_BASE x16, z28, z29, z30, z31, \deg
 	// Cache all constants in the now-dead accumulators, then process the other
 	// four row-pairs with two independent arithmetic/divide chains.
-	.if \poly_kind == 3
-	SILU_CONSTS_LOAD_M12_MINIMAX3
-	.else
 	SILU_CONSTS_LOAD_M12_CACHED
-	.endif
 	mov x16, x12
-	STORE_PACKC_PAIR_M12_CACHED x16, z8, z9, z10, z11, \deg, \recip_steps, \poly_kind
+	STORE_PACKC_PAIR_M12_CACHED x16, z8, z9, z10, z11, \deg
 	add x16, x12, #16
-	STORE_PACKC_PAIR_M12_CACHED x16, z12, z13, z14, z15, \deg, \recip_steps, \poly_kind
+	STORE_PACKC_PAIR_M12_CACHED x16, z12, z13, z14, z15, \deg
 	add x16, x12, #32
-	STORE_PACKC_PAIR_M12_CACHED x16, z16, z17, z18, z19, \deg, \recip_steps, \poly_kind
+	STORE_PACKC_PAIR_M12_CACHED x16, z16, z17, z18, z19, \deg
 	add x16, x12, #48
-	STORE_PACKC_PAIR_M12_CACHED x16, z20, z21, z22, z23, \deg, \recip_steps, \poly_kind
+	STORE_PACKC_PAIR_M12_CACHED x16, z20, z21, z22, z23, \deg
 	.endm
 
 	.macro STORE_PACKC_PAIR_M12_IDENTITY base, g0, g1
@@ -1475,61 +1327,16 @@ moe_sve_kernel_m12_rows:
 	b.eq .L_m12_rows_store_opt_p5
 	cmp w6, #16
 	b.eq .L_m12_rows_store_opt_p6
-	cmp w6, #24
-	b.eq .L_m12_rows_store_recip1_p4
-	cmp w6, #25
-	b.eq .L_m12_rows_store_recip1_p5
-	cmp w6, #26
-	b.eq .L_m12_rows_store_recip1_p6
-	cmp w6, #34
-	b.eq .L_m12_rows_store_recip2_p4
-	cmp w6, #35
-	b.eq .L_m12_rows_store_recip2_p5
-	cmp w6, #36
-	b.eq .L_m12_rows_store_recip2_p6
-	cmp w6, #43
-	b.eq .L_m12_rows_store_minimax3
-	cmp w6, #4
-	b.eq .L_m12_rows_store_p4
-	cmp w6, #5
-	b.eq .L_m12_rows_store_p5
-	STORE_PACKC_M12 6
-	b .L_m12_rows_advance_n
-.L_m12_rows_store_p4:
-	STORE_PACKC_M12 4
-	b .L_m12_rows_advance_n
-.L_m12_rows_store_p5:
-	STORE_PACKC_M12 5
+	STORE_PACKC_M12_OPT 6
 	b .L_m12_rows_advance_n
 .L_m12_rows_store_opt_p4:
-	STORE_PACKC_M12_OPT 4, 0, 0
+	STORE_PACKC_M12_OPT 4
 	b .L_m12_rows_advance_n
 .L_m12_rows_store_opt_p5:
-	STORE_PACKC_M12_OPT 5, 0, 0
+	STORE_PACKC_M12_OPT 5
 	b .L_m12_rows_advance_n
 .L_m12_rows_store_opt_p6:
-	STORE_PACKC_M12_OPT 6, 0, 0
-	b .L_m12_rows_advance_n
-.L_m12_rows_store_recip1_p4:
-	STORE_PACKC_M12_OPT 4, 1, 0
-	b .L_m12_rows_advance_n
-.L_m12_rows_store_recip1_p5:
-	STORE_PACKC_M12_OPT 5, 1, 0
-	b .L_m12_rows_advance_n
-.L_m12_rows_store_recip1_p6:
-	STORE_PACKC_M12_OPT 6, 1, 0
-	b .L_m12_rows_advance_n
-.L_m12_rows_store_recip2_p4:
-	STORE_PACKC_M12_OPT 4, 2, 0
-	b .L_m12_rows_advance_n
-.L_m12_rows_store_recip2_p5:
-	STORE_PACKC_M12_OPT 5, 2, 0
-	b .L_m12_rows_advance_n
-.L_m12_rows_store_recip2_p6:
-	STORE_PACKC_M12_OPT 6, 2, 0
-	b .L_m12_rows_advance_n
-.L_m12_rows_store_minimax3:
-	STORE_PACKC_M12_OPT 5, 0, 3
+	STORE_PACKC_M12_OPT 6
 	b .L_m12_rows_advance_n
 .L_m12_rows_store_identity:
 	STORE_PACKC_M12_IDENTITY
@@ -1609,61 +1416,16 @@ moe_sve_kernel_m12:
 	b.eq .L_m12_store_opt_p5
 	cmp w6, #16
 	b.eq .L_m12_store_opt_p6
-	cmp w6, #24
-	b.eq .L_m12_store_recip1_p4
-	cmp w6, #25
-	b.eq .L_m12_store_recip1_p5
-	cmp w6, #26
-	b.eq .L_m12_store_recip1_p6
-	cmp w6, #34
-	b.eq .L_m12_store_recip2_p4
-	cmp w6, #35
-	b.eq .L_m12_store_recip2_p5
-	cmp w6, #36
-	b.eq .L_m12_store_recip2_p6
-	cmp w6, #43
-	b.eq .L_m12_store_minimax3
-	cmp w6, #4
-	b.eq .L_m12_store_p4
-	cmp w6, #5
-	b.eq .L_m12_store_p5
-	STORE_PACKC_M12 6
-	b .L_m12_advance_packc
-.L_m12_store_p4:
-	STORE_PACKC_M12 4
-	b .L_m12_advance_packc
-.L_m12_store_p5:
-	STORE_PACKC_M12 5
+	STORE_PACKC_M12_OPT 6
 	b .L_m12_advance_packc
 .L_m12_store_opt_p4:
-	STORE_PACKC_M12_OPT 4, 0, 0
+	STORE_PACKC_M12_OPT 4
 	b .L_m12_advance_packc
 .L_m12_store_opt_p5:
-	STORE_PACKC_M12_OPT 5, 0, 0
+	STORE_PACKC_M12_OPT 5
 	b .L_m12_advance_packc
 .L_m12_store_opt_p6:
-	STORE_PACKC_M12_OPT 6, 0, 0
-	b .L_m12_advance_packc
-.L_m12_store_recip1_p4:
-	STORE_PACKC_M12_OPT 4, 1, 0
-	b .L_m12_advance_packc
-.L_m12_store_recip1_p5:
-	STORE_PACKC_M12_OPT 5, 1, 0
-	b .L_m12_advance_packc
-.L_m12_store_recip1_p6:
-	STORE_PACKC_M12_OPT 6, 1, 0
-	b .L_m12_advance_packc
-.L_m12_store_recip2_p4:
-	STORE_PACKC_M12_OPT 4, 2, 0
-	b .L_m12_advance_packc
-.L_m12_store_recip2_p5:
-	STORE_PACKC_M12_OPT 5, 2, 0
-	b .L_m12_advance_packc
-.L_m12_store_recip2_p6:
-	STORE_PACKC_M12_OPT 6, 2, 0
-	b .L_m12_advance_packc
-.L_m12_store_minimax3:
-	STORE_PACKC_M12_OPT 5, 0, 3
+	STORE_PACKC_M12_OPT 6
 	b .L_m12_advance_packc
 .L_m12_store_identity:
 	STORE_PACKC_M12_IDENTITY
@@ -2138,61 +1900,16 @@ moe_sve_kc_kernel_m12:
 	b.eq .L_kc_m12_store_opt_p5
 	cmp w6, #16
 	b.eq .L_kc_m12_store_opt_p6
-	cmp w6, #24
-	b.eq .L_kc_m12_store_recip1_p4
-	cmp w6, #25
-	b.eq .L_kc_m12_store_recip1_p5
-	cmp w6, #26
-	b.eq .L_kc_m12_store_recip1_p6
-	cmp w6, #34
-	b.eq .L_kc_m12_store_recip2_p4
-	cmp w6, #35
-	b.eq .L_kc_m12_store_recip2_p5
-	cmp w6, #36
-	b.eq .L_kc_m12_store_recip2_p6
-	cmp w6, #43
-	b.eq .L_kc_m12_store_minimax3
-	cmp w6, #4
-	b.eq .L_kc_m12_store_p4
-	cmp w6, #5
-	b.eq .L_kc_m12_store_p5
-	STORE_PACKC_M12 6
-	b .L_kc_m12_advance_packc
-.L_kc_m12_store_p4:
-	STORE_PACKC_M12 4
-	b .L_kc_m12_advance_packc
-.L_kc_m12_store_p5:
-	STORE_PACKC_M12 5
+	STORE_PACKC_M12_OPT 6
 	b .L_kc_m12_advance_packc
 .L_kc_m12_store_opt_p4:
-	STORE_PACKC_M12_OPT 4, 0, 0
+	STORE_PACKC_M12_OPT 4
 	b .L_kc_m12_advance_packc
 .L_kc_m12_store_opt_p5:
-	STORE_PACKC_M12_OPT 5, 0, 0
+	STORE_PACKC_M12_OPT 5
 	b .L_kc_m12_advance_packc
 .L_kc_m12_store_opt_p6:
-	STORE_PACKC_M12_OPT 6, 0, 0
-	b .L_kc_m12_advance_packc
-.L_kc_m12_store_recip1_p4:
-	STORE_PACKC_M12_OPT 4, 1, 0
-	b .L_kc_m12_advance_packc
-.L_kc_m12_store_recip1_p5:
-	STORE_PACKC_M12_OPT 5, 1, 0
-	b .L_kc_m12_advance_packc
-.L_kc_m12_store_recip1_p6:
-	STORE_PACKC_M12_OPT 6, 1, 0
-	b .L_kc_m12_advance_packc
-.L_kc_m12_store_recip2_p4:
-	STORE_PACKC_M12_OPT 4, 2, 0
-	b .L_kc_m12_advance_packc
-.L_kc_m12_store_recip2_p5:
-	STORE_PACKC_M12_OPT 5, 2, 0
-	b .L_kc_m12_advance_packc
-.L_kc_m12_store_recip2_p6:
-	STORE_PACKC_M12_OPT 6, 2, 0
-	b .L_kc_m12_advance_packc
-.L_kc_m12_store_minimax3:
-	STORE_PACKC_M12_OPT 5, 0, 3
+	STORE_PACKC_M12_OPT 6
 	b .L_kc_m12_advance_packc
 .L_kc_m12_store_identity:
 	STORE_PACKC_M12_IDENTITY
@@ -2573,32 +2290,12 @@ moe_sve_kc_kernel_m12:
 	.size \name, .-\name
 	.endm
 
-	ENTRY_W13 moe_sve_w13_silu_poly4_packc_m12, moe_sve_kernel_m12, 4
-	ENTRY_W13 moe_sve_w13_silu_poly5_packc_m12, moe_sve_kernel_m12, 5
-	ENTRY_W13 moe_sve_w13_silu_poly6_packc_m12, moe_sve_kernel_m12, 6
-	ENTRY_W13_ROWS moe_sve_w13_silu_poly4_packc_m12_rows, moe_sve_kernel_m12_rows, 4
-	ENTRY_W13_ROWS moe_sve_w13_silu_poly5_packc_m12_rows, moe_sve_kernel_m12_rows, 5
-	ENTRY_W13_ROWS moe_sve_w13_silu_poly6_packc_m12_rows, moe_sve_kernel_m12_rows, 6
 	ENTRY_W13 moe_sve_w13_silu_poly4_packc_m12_opt, moe_sve_kernel_m12, 14
 	ENTRY_W13 moe_sve_w13_silu_poly5_packc_m12_opt, moe_sve_kernel_m12, 15
 	ENTRY_W13 moe_sve_w13_silu_poly6_packc_m12_opt, moe_sve_kernel_m12, 16
 	ENTRY_W13_ROWS moe_sve_w13_silu_poly4_packc_m12_rows_opt, moe_sve_kernel_m12_rows, 14
 	ENTRY_W13_ROWS moe_sve_w13_silu_poly5_packc_m12_rows_opt, moe_sve_kernel_m12_rows, 15
 	ENTRY_W13_ROWS moe_sve_w13_silu_poly6_packc_m12_rows_opt, moe_sve_kernel_m12_rows, 16
-	ENTRY_W13 moe_sve_w13_silu_poly4_packc_m12_recip1, moe_sve_kernel_m12, 24
-	ENTRY_W13 moe_sve_w13_silu_poly5_packc_m12_recip1, moe_sve_kernel_m12, 25
-	ENTRY_W13 moe_sve_w13_silu_poly6_packc_m12_recip1, moe_sve_kernel_m12, 26
-	ENTRY_W13_ROWS moe_sve_w13_silu_poly4_packc_m12_rows_recip1, moe_sve_kernel_m12_rows, 24
-	ENTRY_W13_ROWS moe_sve_w13_silu_poly5_packc_m12_rows_recip1, moe_sve_kernel_m12_rows, 25
-	ENTRY_W13_ROWS moe_sve_w13_silu_poly6_packc_m12_rows_recip1, moe_sve_kernel_m12_rows, 26
-	ENTRY_W13 moe_sve_w13_silu_poly4_packc_m12_recip2, moe_sve_kernel_m12, 34
-	ENTRY_W13 moe_sve_w13_silu_poly5_packc_m12_recip2, moe_sve_kernel_m12, 35
-	ENTRY_W13 moe_sve_w13_silu_poly6_packc_m12_recip2, moe_sve_kernel_m12, 36
-	ENTRY_W13_ROWS moe_sve_w13_silu_poly4_packc_m12_rows_recip2, moe_sve_kernel_m12_rows, 34
-	ENTRY_W13_ROWS moe_sve_w13_silu_poly5_packc_m12_rows_recip2, moe_sve_kernel_m12_rows, 35
-	ENTRY_W13_ROWS moe_sve_w13_silu_poly6_packc_m12_rows_recip2, moe_sve_kernel_m12_rows, 36
-	ENTRY_W13 moe_sve_w13_silu_minimax3_packc_m12, moe_sve_kernel_m12, 43
-	ENTRY_W13_ROWS moe_sve_w13_silu_minimax3_packc_m12_rows, moe_sve_kernel_m12_rows, 43
 	ENTRY_W13 moe_sve_w13_silu_poly4_packc,     moe_sve_kernel_m8, 4
 	ENTRY_W13 moe_sve_w13_silu_poly5_packc,     moe_sve_kernel_m8, 5
 	ENTRY_W13 moe_sve_w13_silu_poly6_packc,     moe_sve_kernel_m8, 6
@@ -2651,9 +2348,5 @@ moe_sve_kc_kernel_m12:
 	.float 0.0013888889
 	.float 87.0
 	.float -87.0
-	.float 0.99992455695087079
-	.float 0.99998492863187383
-	.float 0.5050222842135581
-	.float 0.16767011875167742
 
 	.section .note.GNU-stack,"",@progbits

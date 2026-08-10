@@ -22,7 +22,7 @@ features:
     correctness: >-
       PYTHONPATH=src .venv/bin/python -m pytest -q
       tests/test_moe_hugetlbfs.py
-      tests/test_fused_moe_bf16_tiled.py::test_sve_m12_silu_and_w2_bf16_route_match_legacy_for_unit_top1
+      tests/test_fused_moe_bf16_tiled.py::test_sve_m12_silu_and_w2_bf16_route_for_unit_top1
     benchmark: >-
       FUSED_CPP_MOE_HUGETLBFS_PATH=/dev/hugepages-32M
       numactl --cpunodebind=0 --membind=0 taskset -c 0-95
@@ -1195,6 +1195,24 @@ variants:
     entrypoint: Removed from the active tree; retained in Git history 3faf244.
     status: retired
     history: 3faf244
+
+  - id: sve_m12_legacy_silu_epilogue
+    features: []
+    entrypoint: Removed from the active tree; retained in Git history 233436a.
+    status: retired
+    history: 233436a
+
+  - id: sve_m12_silu_reciprocal
+    features: []
+    entrypoint: Removed from the active tree; retained in Git history 233436a.
+    status: retired
+    history: 233436a
+
+  - id: sve_m12_silu_minimax3
+    features: []
+    entrypoint: Removed from the active tree; retained in Git history 233436a.
+    status: retired
+    history: 233436a
 
   - id: sve_epoch_fixed_nsplit
     features:

@@ -107,15 +107,6 @@ void bf16gemm_k_ldp_m4(const uint16_t*, const uint16_t*, float*, uint16_t*, cons
 void bf16gemm_k_ldp_m2(const uint16_t*, const uint16_t*, float*, uint16_t*, const gemm_params_t*);
 void bf16gemm_k_ldp_m1(const uint16_t*, const uint16_t*, float*, uint16_t*, const gemm_params_t*);
 #if defined(FUSED_CPP_MOE_HAS_ARM_SVE)
-void moe_sve_w13_silu_poly4_packc_m12(const uint16_t*, const uint16_t*, uint16_t*, uint16_t*, const gemm_params_t*);
-void moe_sve_w13_silu_poly5_packc_m12(const uint16_t*, const uint16_t*, uint16_t*, uint16_t*, const gemm_params_t*);
-void moe_sve_w13_silu_poly6_packc_m12(const uint16_t*, const uint16_t*, uint16_t*, uint16_t*, const gemm_params_t*);
-void moe_sve_w13_silu_poly4_packc_m12_rows(const uint16_t*, const uint16_t*, uint16_t*, uint16_t*,
-                                           const gemm_params_t*);
-void moe_sve_w13_silu_poly5_packc_m12_rows(const uint16_t*, const uint16_t*, uint16_t*, uint16_t*,
-                                           const gemm_params_t*);
-void moe_sve_w13_silu_poly6_packc_m12_rows(const uint16_t*, const uint16_t*, uint16_t*, uint16_t*,
-                                           const gemm_params_t*);
 void moe_sve_w13_silu_poly4_packc_m12_opt(const uint16_t*, const uint16_t*, uint16_t*, uint16_t*, const gemm_params_t*);
 void moe_sve_w13_silu_poly5_packc_m12_opt(const uint16_t*, const uint16_t*, uint16_t*, uint16_t*, const gemm_params_t*);
 void moe_sve_w13_silu_poly6_packc_m12_opt(const uint16_t*, const uint16_t*, uint16_t*, uint16_t*, const gemm_params_t*);
@@ -125,33 +116,6 @@ void moe_sve_w13_silu_poly5_packc_m12_rows_opt(const uint16_t*, const uint16_t*,
                                                const gemm_params_t*);
 void moe_sve_w13_silu_poly6_packc_m12_rows_opt(const uint16_t*, const uint16_t*, uint16_t*, uint16_t*,
                                                const gemm_params_t*);
-void moe_sve_w13_silu_poly4_packc_m12_recip1(const uint16_t*, const uint16_t*, uint16_t*, uint16_t*,
-                                             const gemm_params_t*);
-void moe_sve_w13_silu_poly5_packc_m12_recip1(const uint16_t*, const uint16_t*, uint16_t*, uint16_t*,
-                                             const gemm_params_t*);
-void moe_sve_w13_silu_poly6_packc_m12_recip1(const uint16_t*, const uint16_t*, uint16_t*, uint16_t*,
-                                             const gemm_params_t*);
-void moe_sve_w13_silu_poly4_packc_m12_rows_recip1(const uint16_t*, const uint16_t*, uint16_t*, uint16_t*,
-                                                  const gemm_params_t*);
-void moe_sve_w13_silu_poly5_packc_m12_rows_recip1(const uint16_t*, const uint16_t*, uint16_t*, uint16_t*,
-                                                  const gemm_params_t*);
-void moe_sve_w13_silu_poly6_packc_m12_rows_recip1(const uint16_t*, const uint16_t*, uint16_t*, uint16_t*,
-                                                  const gemm_params_t*);
-void moe_sve_w13_silu_poly4_packc_m12_recip2(const uint16_t*, const uint16_t*, uint16_t*, uint16_t*,
-                                             const gemm_params_t*);
-void moe_sve_w13_silu_poly5_packc_m12_recip2(const uint16_t*, const uint16_t*, uint16_t*, uint16_t*,
-                                             const gemm_params_t*);
-void moe_sve_w13_silu_poly6_packc_m12_recip2(const uint16_t*, const uint16_t*, uint16_t*, uint16_t*,
-                                             const gemm_params_t*);
-void moe_sve_w13_silu_poly4_packc_m12_rows_recip2(const uint16_t*, const uint16_t*, uint16_t*, uint16_t*,
-                                                  const gemm_params_t*);
-void moe_sve_w13_silu_poly5_packc_m12_rows_recip2(const uint16_t*, const uint16_t*, uint16_t*, uint16_t*,
-                                                  const gemm_params_t*);
-void moe_sve_w13_silu_poly6_packc_m12_rows_recip2(const uint16_t*, const uint16_t*, uint16_t*, uint16_t*,
-                                                  const gemm_params_t*);
-void moe_sve_w13_silu_minimax3_packc_m12(const uint16_t*, const uint16_t*, uint16_t*, uint16_t*, const gemm_params_t*);
-void moe_sve_w13_silu_minimax3_packc_m12_rows(const uint16_t*, const uint16_t*, uint16_t*, uint16_t*,
-                                              const gemm_params_t*);
 void moe_sve_w13_silu_poly4_packc(const uint16_t*, const uint16_t*, uint16_t*, uint16_t*, const gemm_params_t*);
 void moe_sve_w13_silu_poly5_packc(const uint16_t*, const uint16_t*, uint16_t*, uint16_t*, const gemm_params_t*);
 void moe_sve_w13_silu_poly6_packc(const uint16_t*, const uint16_t*, uint16_t*, uint16_t*, const gemm_params_t*);
@@ -1050,34 +1014,6 @@ bool sve_w2_direct_route_offsets_fit(int64_t num_routes, int64_t route_stride, i
   return num_routes - 1 <= max_route_delta / row_bytes;
 }
 
-bool sve_w13_m12_epilogue_opt_enabled() {
-  const char* value = std::getenv("FUSED_CPP_MOE_SILU_M12_OPT");
-  if (value == nullptr || value[0] == '\0') {
-    return true;
-  }
-  return value[0] != '0';
-}
-
-int sve_w13_silu_recip_nr_steps() {
-  // Experimental M12 epilogue mode. M8/M4/M2/M1 tails retain exact FDIV.
-  const char* value = std::getenv("FUSED_CPP_MOE_SILU_RECIP_NR");
-  if (value == nullptr || value[0] == '\0') {
-    return 0;
-  }
-  if (value[0] == '1' && value[1] == '\0') {
-    return 1;
-  }
-  if (value[0] == '2' && value[1] == '\0') {
-    return 2;
-  }
-  return 0;
-}
-
-bool sve_w13_silu_minimax3_enabled() {
-  const char* value = std::getenv("FUSED_CPP_MOE_SILU_MINIMAX3");
-  return value != nullptr && value[0] != '\0' && value[0] != '0';
-}
-
 #if defined(FUSED_CPP_MOE_HAS_ARM_SVE)
 using SveKcKernelFn = void (*)(const uint16_t*, const uint16_t*, void*, const void*, const gemm_params_t*);
 
@@ -1176,12 +1112,6 @@ bool sve_jit_configuration_supported(SveJitOperation operation, int K, int64_t d
     }
     if (sve_w13_skip_silu_enabled()) {
       return reject("the identity epilogue remains on the static asm fallback");
-    }
-    if (sve_w13_silu_recip_nr_steps() != 0) {
-      return reject("reciprocal-refinement SiLU remains on the static asm fallback");
-    }
-    if (degree == 5 && sve_w13_silu_minimax3_enabled()) {
-      return reject("the minimax SiLU polynomial remains on the static asm fallback");
     }
   }
   return true;
@@ -1333,19 +1263,10 @@ SveKcFusedSiluKernelSet sve_asm_fused_silu_packc_set_for_degree(int64_t degree) 
   if (sve_w13_skip_silu_enabled()) {
     return {m8, m4, m2, m2, m12, 1, 1};
   }
-  const bool use_m12_opt = sve_w13_m12_epilogue_opt_enabled();
-  const bool use_minimax3 = use_m12_opt && degree == 5 && sve_w13_silu_minimax3_enabled();
-  const int recip_nr_steps = sve_w13_silu_recip_nr_steps();
   if (degree < 4 || degree > 6) {
     return {};
   }
-  int m12_mode = static_cast<int>(degree);
-  if (use_minimax3) {
-    m12_mode = 43;
-  } else if (use_m12_opt) {
-    m12_mode += recip_nr_steps == 1 ? 20 : (recip_nr_steps == 2 ? 30 : 10);
-  }
-  return {m8, m4, m2, m2, m12, static_cast<int>(degree), m12_mode};
+  return {m8, m4, m2, m2, m12, static_cast<int>(degree), static_cast<int>(degree + 10)};
 }
 
 void sve_asm_packc_w13_tail_dispatch(const uint16_t* packed_A, const uint16_t* w13_packed, uint16_t* C, int rows, int K,

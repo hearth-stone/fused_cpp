@@ -371,8 +371,9 @@ normal/scheduled/async、poly4/5/6、rows `1..23` 均通过回归。
 当前优化后的 M12 epilogue 已把两个独立 `fdiv` 相邻发射,硬件能够重叠其延迟。
 NR1 将每次除法换成 4 条有依赖的浮点指令,NR2 换成 6 条,同时与 exp polynomial
 争用乘法/FMA 流水线。因此 reciprocal 虽然精度足够,但没有性能价值。默认继续
-使用 `fdiv`;reciprocal 仅保留为实验开关。下一项实验应通过更低阶的 minimax exp
-polynomial 减少 FMA 数量,而不是继续优化除法。
+使用 `fdiv`。该实验源码与运行时开关于 2026-08-10 从活动树移除，最后实现保留在
+Git `233436a`；上述性能与精度数据继续作为否决依据。下一项实验应通过更低阶的
+minimax exp polynomial 减少 FMA 数量,而不是继续优化除法。
 
 
 # SVE hybrid tail 9-11: pad to M12 (2026-07-10)
@@ -460,7 +461,8 @@ normal/scheduled/async 和 rows `1..23` 回归通过。尚未做模型级精度�
 polynomial 降阶有正收益,但绝对幅度很小。minimax3 相比 Taylor poly4 在 T1/E64
 只额外获得约 `0.07%-0.15%`,E8 中没有额外收益,同时最终输出误差约增至 2 倍。
 因此默认继续使用 poly5。若后续愿意用约 `0.05%` rel-L2 换取约 `0.3%` 性能,
-优先直接选择已有 Taylor poly4;minimax3 保留为实验模式,不建议直接设为默认。
+优先直接选择已有 Taylor poly4。minimax3 源码与运行时开关于 2026-08-10 从活动树
+移除，最后实现保留在 Git `233436a`；不建议恢复为默认或长期兼容路径。
 
 
 ---

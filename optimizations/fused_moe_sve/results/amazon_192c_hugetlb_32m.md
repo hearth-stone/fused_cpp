@@ -38,7 +38,7 @@ the live mapping. The corresponding 4 KiB baseline reported
 PYTHONPATH=src FUSED_CPP_MOE_HUGETLBFS_PATH=/dev/hugepages-32M \
   OMP_NUM_THREADS=1 numactl --cpunodebind=0 --membind=0 taskset -c 0-31 \
   .venv/bin/python -m pytest -q \
-  tests/test_fused_moe_bf16_tiled.py::test_sve_m12_silu_and_w2_bf16_route_match_legacy_for_unit_top1
+  tests/test_fused_moe_bf16_tiled.py::test_sve_m12_silu_and_w2_bf16_route_for_unit_top1
 ```
 
 Result: `1 passed`. The storage helper unit tests also passed on local and
