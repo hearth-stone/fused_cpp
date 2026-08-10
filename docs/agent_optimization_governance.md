@@ -11,9 +11,11 @@ existing repository conventions.
 
 Core intent:
 
-- Preserve existing implementations as compatibility baselines.
+- Preserve public contracts and experimental knowledge, not every historical
+  implementation.
 - Apply the rules to active optimization work and newly introduced code.
 - Make features and variants identifiable, testable, reproducible, and comparable.
+- Keep production, active experiments, and retired work physically separate.
 - Treat MUST/MUST NOT as required/prohibited; SHOULD as expected unless there is
   a clear engineering reason.
 
@@ -27,21 +29,41 @@ Active code includes new files, user-requested optimization work, relevant
 uncommitted optimization changes, and new or updated manifests, tests, benchmarks,
 dispatch logic, or adapters.
 
-Before work, check `git status --short` or equivalent. Preserve user changes,
-treat existing implementations as behavior/correctness baselines, and edit legacy
-code only when integration genuinely requires it. Keep legacy API, ABI, default
-dispatch, build entrypoints, and behavior stable unless the user explicitly asks.
+Before work, check `git status --short` or equivalent. Preserve user changes and
+treat established public behavior as the compatibility baseline. Keep public API,
+ABI, packed formats, backend ids, plan schemas, default dispatch, build
+entrypoints, and numerical behavior stable unless the user explicitly asks.
 
-Do not move, rename, reorder, format, refactor, copy, delete, or overwrite legacy
-code just to satisfy this guide. Do not replace a default implementation without
-explicit instruction. If legacy code changes, report which files changed, why,
-how compatibility was preserved, and which tests verified it.
+Legacy source is not automatically a permanent compatibility surface. A legacy
+implementation may be removed when it is internal, superseded, or experimentally
+rejected, provided its externally observable contract remains covered and the
+manifest retains the decision, evidence, and Git location. If legacy code changes,
+report which files changed, why, how compatibility was preserved, and which tests
+verified it.
+
+## Compatibility Classes
+
+- `public`: Python/C++ API, ABI, packed data format, backend id, serialized plan
+  schema, documented numerical behavior, and supported build entrypoint. Changes
+  require an explicit migration or user request.
+- `internal-stable`: production kernel ABI, dispatcher contract, and required ISA
+  fallback. Changes require focused integration tests but do not promise source
+  compatibility.
+- `experimental`: opt-in environment variables, probe enums, benchmark bindings,
+  diagnostic kernels, and candidate-only entrypoints. These carry no compatibility
+  promise and must not force production code to preserve rejected designs.
+
+Every non-public control should be identifiable as `internal-stable` or
+`experimental`. An undocumented default-off switch is experimental, not an
+accidental public API.
 
 ## Optimization Model
 
-- `baseline`: existing reference or current default implementation. It is frozen
-  by default, may be called through adapters, and must not be copied as a new
-  version or replaced just because one benchmark variant is faster.
+- `baseline`: the authoritative behavior or correctness reference for one public
+  contract. Keep at most one practical baseline per contract and ISA. It may be
+  an active implementation, a small reference, an upstream implementation, or a
+  Git-located retired implementation; baseline status does not imply permanent
+  inclusion in the default build.
 - `part`: an independently analyzable operator stage such as `load`, `layout`,
   `compute`, `reduce`, `store`, `epilogue`, or `dispatch`. Prefer local names.
 - `feature`: one primary optimization idea, named `<part>.<mechanism>`, with a
@@ -55,7 +77,18 @@ how compatibility was preserved, and which tests verified it.
 
 ## File Placement
 
-Prefer existing operator, test, and benchmark directories. If no suitable
+Optimization source has three physical lifecycles:
+
+- `Production`: `csrc/`, `src/`, and default-built support code. Only enabled
+  features, required fallbacks, and internal-stable interfaces belong here.
+- `Lab`: `optimizations/<operator>/features`, experiment-only tests, benchmarks,
+  and optional build targets. Experimental, diagnostic, and benchmark-reference
+  code belongs here and must not enter the default extension.
+- `Archive`: manifest tombstones, concise result documents, and Git commits or
+  annotated tags. Retired source must not remain in active build inputs merely to
+  make an old experiment easy to rerun.
+
+Use the existing operator, test, and benchmark directories. If no suitable Lab
 structure exists, use:
 
 ```text
@@ -67,11 +100,35 @@ optimizations/<operator>/
   benchmarks/
 ```
 
-Do not move legacy implementations just to create this layout. Connect new code
-through adapters, wrappers, registries, or minimal build integration. Use existing
-test/benchmark frameworks. Small local duplication in new optimization code is
-acceptable when it avoids risky legacy changes. Copying a whole legacy operator
-or large legacy file requires explicit user approval.
+Connect Lab code through a narrow internal-stable kernel ABI, adapters, or an
+explicit experiment build target. Production code must not include Lab headers or
+branch on Lab-only variants. Small local duplication in Lab code is acceptable
+when it prevents an experiment from expanding the production compatibility
+matrix. Copying a whole legacy operator or large legacy file requires explicit
+user approval.
+
+## Lifecycle And Retention
+
+Features move through `experimental -> candidate -> enabled` or
+`experimental/candidate -> retired`.
+
+- `experimental`: Lab only, opt-in, no compatibility promise.
+- `candidate`: still opt-in; must have an owner or decision date, full
+  correctness coverage, and explicit adoption criteria.
+- `enabled`: production-supported and eligible for default dispatch.
+- `retired`: no active source or default-build entrypoint. Keep only the result,
+  retirement reason, last implementation commit/tag, and reproduction command.
+- `reference`, `diagnostic`, and `benchmark_reference` describe roles, not a
+  reason to compile source into production. Diagnostic and benchmark-reference
+  implementations belong in Lab.
+
+Once evidence rejects an experiment or shows it performance-neutral without a
+separate maintenance benefit, retire it. Do not retain it behind a default-off
+flag. An inconclusive experiment may remain in Lab only while a concrete next
+decision exists. Superseded internal implementations should be deleted after the
+replacement covers their contract; retain a thin adapter only for a public API.
+Existing manifests and source predating this lifecycle are a migration backlog;
+clean them incrementally, but do not add or expand a nonconforming path.
 
 ## Manifest
 
@@ -90,6 +147,10 @@ Required semantics:
   a part.
 - Manifest additions, removals, and renames match real buildable entrypoints.
 - Experimental work is not presented as production.
+- Candidate entries record an adoption gate and decision date or next decision.
+- Retired entries record `implementation: Removed from the active tree`, a result
+  or retirement reason, and a `history` commit/tag when one is known. Their
+  variants must not name a buildable production entrypoint.
 
 Use semantic names, not `v1`, `v2`, `new`, `new2`, `latest`, `fast`, or `final`.
 Recommended statuses: `reference`, `experimental`, `candidate`, `enabled`,
@@ -117,8 +178,10 @@ mass legacy refactors.
 ## Dispatch and Defaults
 
 Adding a variant is not enabling it. Preserve original default dispatch.
-Experimental variants should be reachable only through explicit tests,
-benchmarks, build options, or experimental entrypoints. Dispatch rules must record
+Experimental variants should be reachable only through explicit Lab tests,
+benchmarks, optional build targets, or experimental entrypoints. They must not add
+branches, cache-key dimensions, environment parsing, or pybind symbols to the
+default production extension. Dispatch rules for enabled features must record
 shape, dtype, layout, hardware, and other preconditions, safely fall back to the
 baseline, and keep fallback paths testable.
 
@@ -163,6 +226,11 @@ long-lived `v1/v2/v3` branches, create permanent branches for parameter
 combinations, modify unrelated history, or commit/push/rebase/force-push unless
 the user asks.
 
+For rejected work developed outside the main branch, preserve the final experiment
+with an annotated `archive/<operator>/<feature>` tag or another durable commit
+reference before deleting the branch. Do not copy retired source into an archive
+directory; Git is the source archive.
+
 ## AI Workflow
 
 For optimization tasks:
@@ -176,7 +244,8 @@ For optimization tasks:
 6. Implement a single feature first, register it, test it, and benchmark it.
 7. Add combined variants only when needed; register, test, and benchmark them
    separately.
-8. Preserve default behavior and avoid unrelated legacy edits.
+8. Promote accepted code into Production or retire rejected code from the active
+   tree. Preserve default behavior and avoid unrelated legacy edits.
 
 Before finishing, inspect `git diff --stat` and `git diff`; ensure no accidental
 format churn, manifest entries match real entrypoints, dependencies/conflicts and
@@ -191,7 +260,7 @@ incomplete validation, remaining risk, and whether default behavior changed.
 ## Prohibited Without Current User Request
 
 - Repository-wide migrations or legacy operator rewrites.
-- Deleting legacy implementations or switching default kernels.
+- Switching default kernels without the requested evidence and validation.
 - Refactoring all optimization code at once.
 - Generating every theoretical combination.
 - Creating many permanent branches.
@@ -202,7 +271,8 @@ incomplete validation, remaining risk, and whether default behavior changed.
 - Replacing measured benchmarks with theoretical gains.
 - Hiding negative optimizations, failing shapes, or unsupported conditions.
 
-Guiding principle: keep legacy stable; add optimizations incrementally; features
-express single ideas; variants express explicit combinations; correctness comes
-before performance; data comes before conclusions; experiments do not change
-defaults without explicit approval.
+Guiding principle: preserve contracts and experimental knowledge, not experimental
+source by default. Add optimizations incrementally; features express single ideas;
+variants express explicit combinations; correctness comes before performance;
+data comes before conclusions; experiments do not change defaults without
+explicit approval.
