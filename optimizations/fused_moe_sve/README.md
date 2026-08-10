@@ -4,11 +4,14 @@ This directory contains SVE fused-MoE features and standalone experiments. The
 weighted route-merge U1 kernel and async ready-token merge are enabled by
 default for their supported SVE paths; neither changes the fused-MoE API.
 
-Production W13 and W2 now each execute one complete packed-N stage. There is no
-split/range/window control in the public API, Plan V2, planner, or cost model.
-For stage `(K,N)`, backend N tile `v`, and task width `t`, the maximum owner
-stripe is `ceil((N/v)/t) * K * v * 2` bytes. Sections explicitly labelled
-historical retain earlier range experiments only as provenance.
+Production W13 and W2 each cover one complete packed-N stage. Legacy boolean
+split, range-count, and byte-window controls are gone. Their replacement is one
+explicit per-task owner window in Plan V2: `(threads, window_tiles)` uniquely
+defines a stage, each team window covers `threads * window_tiles` N tiles, and
+successive windows cover the complete N domain. A zero Plan V2 value selects
+the full owner stripe `ceil((N/v)/threads)`; the environment override exists
+only for controlled experiments. Sections explicitly labelled historical retain
+the earlier split/range implementations only as provenance.
 
 ## Xbyak exact-M compute kernels
 

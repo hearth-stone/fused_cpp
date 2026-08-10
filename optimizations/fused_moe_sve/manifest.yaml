@@ -288,6 +288,7 @@ features:
     implementation: >-
       Removed from the active tree; retained in Git history and historical
       result documents only.
+    history: 0962179
     hypothesis: >-
       The kernel loops M panels outside and N tiles inside, so every additional
       M12 panel walks the whole packed-B stage window again. Useful packed-B
@@ -673,6 +674,7 @@ features:
     part: dispatch
     status: retired
     implementation: Removed from the production runtime; available in Git history.
+    history: 0962179
     hypothesis: >-
       Serializing both packed-B GEMMs into a configurable tile-aligned byte
       window reduces the active reusable weight footprint on machines whose
@@ -1090,6 +1092,7 @@ features:
       Removed from the production configuration surface; historical runtime
       integration is retained in Git 44dbcd9. Standalone K-block probes remain
       under optimizations/fused_moe_sve/benchmarks/.
+    history: 44dbcd9
     hypothesis: >-
       Packing B as Kchunk-major/Ntile-minor and keeping one common Kc for
       M12/M8/M4/M2 lets a reusable packed-A slice remain in private L1. An
@@ -1267,10 +1270,9 @@ variants:
       - intermediate.overwrite_elision
       - scatter.w2_n_owner
       - dispatch.serial_weight_windows
-    entrypoint: >-
-      fused_moe_bf16_tiled_{scheduled,async}(
-      w13_ranges=<positive count>, w2_ranges=<positive count>)
+    entrypoint: Removed from the active tree; restore Git 0962179 to reproduce.
     status: retired
+    history: 0962179
 
   - id: sve_plan_v2_full_n_team_stripes
     features:
@@ -1319,6 +1321,7 @@ variants:
       - dispatch.full_n_team_stripes
     entrypoint: Removed; restore Git history commit 0b58091 to reproduce.
     status: retired
+    history: 0b58091
 
   - id: sve_static_16t_to_4x4t
     features:

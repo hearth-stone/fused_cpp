@@ -13,18 +13,18 @@ priority order is:
 Overall conclusion: the ARM main path is now substantially complete. SVE JIT
 exact-M kernels, the double-buffered K-loop, direct FP32 route stores, weighted
 merge, the dynamic short-expert pool, the native cold planner, and stage-aware
-cost modeling have all landed. The current runtime has since collapsed that
-model to full-N stages with width-derived owner stripes. The next phase should not accumulate isolated
-micro-optimizations. It should close the remaining high-value variables first,
-then refresh the calibration data and cost model once and validate them as a
-coherent system.
+cost modeling have all landed. Legacy split/range controls were replaced by the
+single `(threads, window_tiles)` stage geometry: a task still covers full N, but
+may do so as multiple serial owner windows. The next phase should not accumulate
+isolated micro-optimizations. It should close the remaining high-value variables
+first, then refresh calibration and validate the system coherently.
 
-The weight-split removal is complete across the production stack:
+The legacy weight-split removal is complete across the production stack:
 
-- [x] Remove global and per-task W13/W2 ranges, byte windows, split flags,
-  environment controls, Plan V2 tensors, and native fallback branches.
-- [x] Make W13/W2 execute one full-N stage and derive the tile-aligned owner
-  stripe only from `(K, N, backend_n_tile, actual_task_threads)`.
+- [x] Remove global and per-task W13/W2 range counts, byte windows, split flags,
+  their environment controls, old Plan V2 tensors, and native fallback branches.
+- [x] Make W13/W2 cover one full-N stage; represent any serial subdivision only
+  as per-worker tile windows derived from `(threads, window_tiles)`.
 - [x] Remove stage-window policy/search/cache identity and reject non-full-N
   schema-v2 profiles.
 - [x] Migrate calibration generators, benchmark defaults, timeline/schema docs,
@@ -73,7 +73,8 @@ The weight-split removal is complete across the production stack:
   actual width before scoring and lowering.
 - [x] Use packed working-set bytes to prune candidates, while retaining measured
   latency as the objective.
-- [x] Remove W13/W2 geometry fields from Plan V2; full-N is invariant.
+- [x] Remove legacy W13/W2 split/range geometry from Plan V2; retain only the
+  exact per-task window-tile parameter, with zero meaning the full owner stripe.
 - [x] Add explicit physical CPU sets, a calibration-aware cache key, full
   bucketed routing signatures, and confidence-aware tie breaking.
 
