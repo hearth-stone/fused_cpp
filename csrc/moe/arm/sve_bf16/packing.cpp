@@ -2,17 +2,11 @@
 #include "vector_length.h"
 
 #include <algorithm>
-#include <cerrno>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
-#include <limits>
 #include <stdexcept>
 #include <vector>
-
-#if defined(__linux__)
-#include <unistd.h>
-#endif
 
 #if defined(__aarch64__) && defined(__ARM_FEATURE_SVE) && defined(__ARM_FEATURE_BF16)
 #include <arm_sve.h>
@@ -40,51 +34,6 @@ inline bool env_false(const char* name) {
 }
 
 inline int round_up(int x, int q) { return ((x + q - 1) / q) * q; }
-
-struct KBlockConfig {
-  int l1d_bytes = 64 * 1024;
-  int ratio_numerator = 49;
-  int ratio_denominator = 100;
-  int fixed_kc = 0;
-  bool use_l1_selector = false;
-};
-
-const KBlockConfig& k_block_config() {
-  static const KBlockConfig config = []() {
-    KBlockConfig result;
-#if defined(__linux__)
-    const long detected = sysconf(_SC_LEVEL1_DCACHE_SIZE);
-    if (detected > 0 && detected <= std::numeric_limits<int>::max()) {
-      result.l1d_bytes = static_cast<int>(detected);
-    }
-#endif
-    const char* value = std::getenv("FUSED_CPP_MOE_SVE_KC_L1_PERMILLE");
-    if (value != nullptr && value[0] != '\0') {
-      errno = 0;
-      char* end = nullptr;
-      const long parsed = std::strtol(value, &end, 10);
-      if (errno != 0 || end == value || *end != '\0' || parsed <= 0 || parsed > 1000) {
-        throw std::runtime_error("FUSED_CPP_MOE_SVE_KC_L1_PERMILLE must be an integer in [1, 1000]");
-      }
-      result.ratio_numerator = static_cast<int>(parsed);
-      result.ratio_denominator = 1000;
-      result.use_l1_selector = true;
-    }
-    value = std::getenv("FUSED_CPP_MOE_SVE_KC");
-    if (value != nullptr && value[0] != '\0') {
-      errno = 0;
-      char* end = nullptr;
-      const long parsed = std::strtol(value, &end, 10);
-      if (errno != 0 || end == value || *end != '\0' || parsed <= 0 || parsed > std::numeric_limits<int>::max() ||
-          parsed % 8 != 0) {
-        throw std::runtime_error("FUSED_CPP_MOE_SVE_KC must be a positive, 8-aligned int32 value");
-      }
-      result.fixed_kc = static_cast<int>(parsed);
-    }
-    return result;
-  }();
-  return config;
-}
 
 #if defined(__aarch64__) && defined(__ARM_FEATURE_SVE) && defined(__ARM_FEATURE_BF16)
 
@@ -329,52 +278,25 @@ int round_k(int k) { return round_up(k < 8 ? 8 : k, 8); }
 
 int round_n(int n) { return round_up(n < 8 ? 8 : n, n_tile()); }
 
-int l1d_cache_bytes() { return k_block_config().l1d_bytes; }
-
-int k_block(int k) {
-  if (k <= 0) {
-    throw std::invalid_argument("SVE BF16 K must be positive");
-  }
-  const KBlockConfig& config = k_block_config();
-  if (config.fixed_kc > 0) {
-    return std::min(k, config.fixed_kc);
-  }
-  if (!config.use_l1_selector) {
-    return k;
-  }
-  // One M12 microkernel window contains Kc BF16 values for each of 12 A
-  // rows and one runtime-width B N tile. Keep this common M12-derived Kc for
-  // M8/M4/M2/M1 as well so a packed weight has one layout for every tail.
-  const int bytes_per_k = static_cast<int>(sizeof(uint16_t)) * (12 + n_tile());
-  const int64_t budget = static_cast<int64_t>(config.l1d_bytes) * config.ratio_numerator / config.ratio_denominator;
-  int selected = static_cast<int>(budget / bytes_per_k);
-  selected = std::max(8, selected / 8 * 8);
-  return std::min(k, selected);
-}
-
 void pack_b(const uint16_t* B, uint16_t* B_reo, int K, int N) {
 #if defined(__aarch64__) && defined(__ARM_FEATURE_SVE) && defined(__ARM_FEATURE_BF16)
   constexpr int segs = kSegments128;
   constexpr int nt = kNTile;
-  const int kc = k_block(K);
   if (K % 8 != 0 || N % nt != 0) {
     throw std::invalid_argument("SVE BF16 pack_b requires K%8==0 and N%n_tile==0");
   }
   int64_t idx = 0;
-  for (int k_begin = 0; k_begin < K; k_begin += kc) {
-    const int chunk = std::min(kc, K - k_begin);
-    for (int nb = 0; nb < N; nb += nt) {
-      for (int rb = 0; rb < chunk / 4; ++rb) {
-        const int row_base = k_begin + rb * 4;
-        for (int cp = 0; cp < 4; ++cp) {
-          for (int sg = 0; sg < segs; ++sg) {
-            const int col_base = nb + sg * 8 + cp * 2;
-            for (int i = 0; i < 4; ++i) {
-              B_reo[idx++] = B[static_cast<int64_t>(row_base + i) * N + col_base];
-            }
-            for (int i = 0; i < 4; ++i) {
-              B_reo[idx++] = B[static_cast<int64_t>(row_base + i) * N + col_base + 1];
-            }
+  for (int nb = 0; nb < N; nb += nt) {
+    for (int rb = 0; rb < K / 4; ++rb) {
+      const int row_base = rb * 4;
+      for (int cp = 0; cp < 4; ++cp) {
+        for (int sg = 0; sg < segs; ++sg) {
+          const int col_base = nb + sg * 8 + cp * 2;
+          for (int i = 0; i < 4; ++i) {
+            B_reo[idx++] = B[static_cast<int64_t>(row_base + i) * N + col_base];
+          }
+          for (int i = 0; i < 4; ++i) {
+            B_reo[idx++] = B[static_cast<int64_t>(row_base + i) * N + col_base + 1];
           }
         }
       }

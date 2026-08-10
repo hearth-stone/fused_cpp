@@ -329,29 +329,6 @@ StageWindowPlan make_stage_window_plan(int64_t N, int64_t n_tile, int64_t thread
   return StageWindowPlan{tile, total_tiles, team, resolved};
 }
 
-// A window is one contiguous run of packed-B tiles only while the packed layout
-// holds a single K chunk, which is the default. With `FUSED_CPP_MOE_SVE_KC` or
-// `FUSED_CPP_MOE_SVE_KC_L1_PERMILLE` pinning Kc below K, `pack_b` emits K chunks
-// outermost, so one window becomes K/Kc separate runs. Addressing stays correct
-// because the kernel takes `packed_N` alongside `n_begin`, but the locality
-// argument for choosing a window no longer holds, so say so once rather than let
-// a calibration quietly measure a different geometry.
-void warn_once_if_window_is_not_contiguous(int64_t K) {
-#if defined(FUSED_CPP_MOE_HAS_ARM_SVE)
-  static std::once_flag flag;
-  const int kc = ::fused_cpp::moe_sve::k_block(static_cast<int>(K));
-  if (kc < static_cast<int>(K)) {
-    std::call_once(flag, [&] {
-      TORCH_WARN("stage windows are not contiguous in packed B: Kc=", kc, " < K=", K,
-                 ", so one window spans K/Kc runs. Window sizing calibrated under this setting does not transfer to "
-                 "the default single-chunk layout.");
-    });
-  }
-#else
-  (void)K;
-#endif
-}
-
 // Visit this worker's column range in every window, in window order. `fn` takes
 // the range and the window index, so a caller can treat the first window
 // specially without recovering the index itself.
@@ -1174,7 +1151,7 @@ SveKBlockParams make_sve_kblock_params(int m, int K, int N, int ldc, int packed_
   params.gemm.lda = K;
   params.gemm.ldb = K;
   params.gemm.ldc = ldc;
-  params.kc = ::fused_cpp::moe_sve::k_block(K);
+  params.kc = K;
   params.packed_n = packed_n;
   params.n_begin = n_begin;
   params.mode = mode;
@@ -1216,9 +1193,6 @@ bool sve_jit_configuration_supported(SveJitOperation operation, int K, int64_t d
   if (!::fused_cpp::moe_sve::jit::built()) {
     return reject("the extension was built without xbyak_aarch64");
   }
-  if (::fused_cpp::moe_sve::k_block(K) != K) {
-    return reject("split-K/Kc packing remains on the static asm fallback");
-  }
   if (operation == SveJitOperation::kW13) {
     if (degree < 4 || degree > 6) {
       return reject("the exact-M JIT supports SiLU polynomial degrees 4, 5, and 6");
@@ -1238,9 +1212,6 @@ bool sve_jit_configuration_supported(SveJitOperation operation, int K, int64_t d
 
 void prewarm_sve_jit_exact_m_kernels(int w13_k, int w2_k) {
   if (!::fused_cpp::moe_sve::jit::requested_for_current_build()) {
-    return;
-  }
-  if (::fused_cpp::moe_sve::k_block(w13_k) != w13_k || ::fused_cpp::moe_sve::k_block(w2_k) != w2_k) {
     return;
   }
   for (int degree = 4; degree <= 6; ++degree) {
@@ -2913,10 +2884,6 @@ void team_fused_w13_silu_packed_packc_sve(const TeamContext& team, const uint16_
   const SveKcFusedSiluKernelSet ks = sve_asm_fused_silu_packc_set_for_degree(degree);
   TORCH_CHECK(ks.m8 != nullptr, "unsupported fused silu exp degree ", degree);
   const StageWindowPlan windows = make_stage_window_plan(N13, n_tile, team.group_size, window_tiles);
-  const bool single_window = windows.windows() == 1;
-  if (!single_window) {
-    warn_once_if_window_is_not_contiguous(K);
-  }
   for_each_stage_window(windows, team.local_tid, [&](const SplitRange& range, int64_t) {
     sve_packc_w13_hybrid_dispatch(packed_A, w13_packed, intermediate, rows, K, static_cast<int>(range.size), ldc, N13,
                                   static_cast<int>(range.begin), ks, degree);
@@ -3059,10 +3026,6 @@ void team_w2_packed_sve(const TeamContext& team, const uint16_t* packed_A, const
                         int rows, int K, int N, int ldc, int64_t n_tile, int64_t window_tiles) {
 #if defined(FUSED_CPP_MOE_HAS_ARM_SVE)
   const StageWindowPlan windows = make_stage_window_plan(N, n_tile, team.group_size, window_tiles);
-  const bool single_window = windows.windows() == 1;
-  if (!single_window) {
-    warn_once_if_window_is_not_contiguous(K);
-  }
   for_each_stage_window(windows, team.local_tid, [&](const SplitRange& range, int64_t) {
     sve_packed_w2_hybrid_dispatch(packed_A, w2_packed, down + range.begin, rows, K, static_cast<int>(range.size), ldc,
                                   N, static_cast<int>(range.begin));
@@ -3113,10 +3076,6 @@ void team_w2_packed_sve_direct_route(const TeamContext& team, const uint16_t* pa
                                      int route_stride, int64_t n_tile, int64_t window_tiles) {
 #if defined(FUSED_CPP_MOE_HAS_ARM_SVE)
   const StageWindowPlan windows = make_stage_window_plan(N, n_tile, team.group_size, window_tiles);
-  const bool single_window = windows.windows() == 1;
-  if (!single_window) {
-    warn_once_if_window_is_not_contiguous(K);
-  }
   for_each_stage_window(windows, team.local_tid, [&](const SplitRange& range, int64_t) {
     sve_packed_w2_direct_route_hybrid_dispatch(packed_A, w2_packed, route_out + range.begin, route_ids, rows, K,
                                                static_cast<int>(range.size), route_stride, N,
@@ -3172,9 +3131,6 @@ void team_w2_packed_sve_direct_bf16_route(const TeamContext& team, const uint16_
                                           int route_stride, int64_t n_tile, int64_t window_tiles) {
 #if defined(FUSED_CPP_MOE_HAS_ARM_SVE)
   const StageWindowPlan windows = make_stage_window_plan(N, n_tile, team.group_size, window_tiles);
-  if (windows.windows() > 1) {
-    warn_once_if_window_is_not_contiguous(K);
-  }
   for_each_stage_window(windows, team.local_tid, [&](const SplitRange& range, int64_t) {
     sve_asm_packed_w2_direct_bf16_route_hybrid_dispatch(packed_A, w2_packed, route_out + range.begin, route_ids, rows,
                                                         K, static_cast<int>(range.size), route_stride, N,
@@ -3279,9 +3235,6 @@ void team_w2_packed_bf16_sve(const TeamContext& team, const uint16_t* packed_A, 
                              uint16_t* down, int rows, int K, int N, int ldc, int64_t n_tile, int64_t window_tiles) {
 #if defined(FUSED_CPP_MOE_HAS_ARM_SVE)
   const StageWindowPlan windows = make_stage_window_plan(N, n_tile, team.group_size, window_tiles);
-  if (windows.windows() > 1) {
-    warn_once_if_window_is_not_contiguous(K);
-  }
   for_each_stage_window(windows, team.local_tid, [&](const SplitRange& range, int64_t) {
     sve_asm_packed_w2_bf16_hybrid_dispatch(packed_A, w2_packed, down + range.begin, rows, K,
                                            static_cast<int>(range.size), ldc, N, static_cast<int>(range.begin));
@@ -5557,8 +5510,6 @@ at::Tensor fused_moe_test_sve_packed_gemm(at::Tensor A, at::Tensor packed_B, int
   TORCH_CHECK(n_tile == ::fused_cpp::moe_sve::n_tile(), "n_tile mismatch: requested ", n_tile, ", runtime ",
               ::fused_cpp::moe_sve::n_tile());
   TORCH_CHECK(N % n_tile == 0, "N must be divisible by n_tile");
-  TORCH_CHECK(::fused_cpp::moe_sve::k_block(static_cast<int>(K)) == K,
-              "pure SVE JIT GEMM test requires one-chunk K packing");
   A = A.contiguous();
   const PackedExperts weights = checked_packed_experts(packed_B, K, N, "packed_B", n_tile);
 

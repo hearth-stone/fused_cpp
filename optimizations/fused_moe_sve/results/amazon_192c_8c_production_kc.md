@@ -2,6 +2,12 @@
 
 Date: 2026-07-18
 
+> Source lifecycle update (2026-08-10): the production Kc controls and
+> Kchunk-major packing path were retired after one-chunk remained the main-path
+> decision. The implementation immediately before retirement is in Git
+> `44dbcd9`; standalone K-block benchmarks remain active for reproducing the
+> cache-residency result.
+
 ## Scope
 
 This run promoted Kchunk-major packed B and the generic M12/M8/M4/M2 Kc

@@ -89,8 +89,8 @@ each logical M=1..12. Code generation is completed while weights are prepared,
 so the first forward call does not pay generation cost. Use
 `FUSED_CPP_MOE_SVE_IMPL=asm` to force the static assembly reference, or `jit`
 to require generation for the generated W13/FP32-W2 surfaces and raise if one
-of those requires fallback. `auto` falls back to static assembly for split-K/Kc,
-identity/reciprocal/minimax SiLU, or a build made without the initialized
+of those requires fallback. `auto` falls back to static assembly for
+identity/reciprocal/minimax SiLU or a build made without the initialized
 submodule. Explicitly selected static-only operators such as BF16 route storage
 remain on assembly in either mode. Packed weight objects and backend IDs are
 identical between the JIT and assembly paths.

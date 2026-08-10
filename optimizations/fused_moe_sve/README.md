@@ -28,7 +28,7 @@ without changing packed weights, intermediate layout, or public APIs.
 Use `FUSED_CPP_MOE_SVE_IMPL=asm` for the static reference and
 `FUSED_CPP_MOE_SVE_IMPL=jit` for strict validation of the generated W13 and
 FP32-W2 surfaces. The default `auto` selects generated code where supported and
-retains assembly for Kc and the non-default epilogues documented in
+retains assembly for the non-default epilogues documented in
 `csrc/moe/README.md`.
 
 The A/B benchmark keeps both implementations in one process but measures
@@ -602,35 +602,27 @@ done
 Implementation details, dense sweeps, cache-color controls, and PMU results are
 recorded in
 [`results/amazon_192c_msmall_kblock.md`](results/amazon_192c_msmall_kblock.md).
-The benchmark entries remain standalone; production uses separate generic-Kc
-symbols for M12/M8/M4/M2, with M1 predicated through M2.
+The benchmark entries remain standalone. Production uses one full K chunk;
+the historical runtime integration is retained in Git `44dbcd9`.
 
-## Production Kc path
+## Historical production Kc path
 
-The production SVE backend now packs B as `Kchunk -> Ntile -> K4` and dispatches
-W13 and W2 through `moe_sve_kc_kernel_m12/m8/m4/m2`. This applies to normal,
-2D, scheduled, async, and vLLM-staged execution, including direct FP32/BF16
-route stores. The final K chunk alone runs SiLU or the selected W2 epilogue;
-earlier chunks preserve FP32 accumulators in thread-private scratch. NEON and
-the legacy SVE symbols remain compiled, but only NEON is the runtime fallback;
-the legacy SVE symbols are standalone controls and are not fed production Kc
-packed weights.
+This section records a retired production experiment. The active SVE backend
+packs B as `Ntile -> K4` and always computes one full K chunk. The
+`FUSED_CPP_MOE_SVE_KC` and `FUSED_CPP_MOE_SVE_KC_L1_PERMILLE` controls, their
+Kchunk-major packed-B layout, and production correctness branches were removed
+on 2026-08-10. The standalone K-block probes and reports remain reproducible.
 
 One Kc is used by every Mr because a prepared weight has one physical layout.
-The production default is one full K chunk:
+The retained production contract is one full K chunk:
 
 ```text
 Kc = K
 ```
 
-`FUSED_CPP_MOE_SVE_KC` explicitly pins an 8-aligned Kc. Setting
-`FUSED_CPP_MOE_SVE_KC_L1_PERMILLE` explicitly enables the calibrated L1
-selector, where `bytes_per_K = 2 * (12 + n_tile)` and the environment value is
-the permille of detected L1D available to the M12 A+B window. L1D is read with
-`_SC_LEVEL1_DCACHE_SIZE`, with a 64 KiB fallback. The historical 49% selector
-maps to Kc=800 on the SVE128 192-core host and Kc=568 on the SVE256 8-core
-host. Both controls are read once at process start; they must be set before
-packing weights and must remain unchanged while those weights are used.
+Historically, the two removed environment controls selected an 8-aligned Kc or
+a calibrated fraction of L1D. The 49% selector mapped to Kc=800 on the SVE128
+192-core host and Kc=568 on the SVE256 8-core host.
 
 With an explicit calibrated Kc, the isolated cold-B result is positive for
 every Mr on the 192-core host
@@ -646,9 +638,10 @@ Sweeping Kc through 1024/1536/2048 reduced but did not reverse this loss. Cold
 B is then memory-bandwidth dominated, so A-side L1 residency has little value
 while partial-C instructions remain. Cost tables must therefore be regenerated
 with the production path. On 2026-07-19 the default was restored to one K
-chunk; split-K remains an explicit process-level experiment for calibrated
-low-pressure deployments. A future selector would need concurrent memory
-pressure rather than isolated Kc timing alone.
+chunk. The production selector was retired because its applicability depended
+on concurrent memory pressure, while the standalone probes already preserve
+the useful cache-residency result without expanding the runtime compatibility
+surface.
 
 Calibration, correctness, production commands, and repeated timings are in
 [`results/amazon_192c_8c_production_kc.md`](results/amazon_192c_8c_production_kc.md).

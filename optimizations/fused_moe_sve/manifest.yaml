@@ -1094,33 +1094,26 @@ features:
 
   - id: compute.production_kblock_a_reuse
     part: compute
-    status: candidate
+    status: retired
     implementation: >-
-      csrc/moe/arm/sve_bf16/kernels.S,
-      csrc/moe/arm/sve_bf16/packing.cpp, and
-      csrc/moe/arm/common/fused_moe_bf16_tiled.cpp
+      Removed from the production configuration surface; historical runtime
+      integration is retained in Git 44dbcd9. Standalone K-block probes remain
+      under optimizations/fused_moe_sve/benchmarks/.
     hypothesis: >-
       Packing B as Kchunk-major/Ntile-minor and keeping one common Kc for
       M12/M8/M4/M2 lets a reusable packed-A slice remain in private L1. An
       explicitly configured selector can reserve a calibrated fraction of
       detected L1D for one physical M12 A+B tile, giving Kc=800 at SVE128 and
       Kc=568 at SVE256 for the historical 49 percent setting. This is an
-      isolated-kernel optimization: a saturated cold-expert wave can remain
-      memory bound and lose to one K chunk because FP32 partial-C traffic is
-      then pure overhead. Production therefore defaults to one K chunk.
+      isolated-kernel optimization: a saturated cold-expert wave remains
+      memory bound and loses to one K chunk because FP32 partial-C traffic is
+      then pure overhead. Production now exposes only one K chunk.
     depends_on:
       - compute.m12_kblock_a_reuse
       - compute.msmall_kblock_a_reuse
     conflicts_with: []
-    correctness: >-
-      env -u FUSED_CPP_MOE_SVE_KC
-      -u FUSED_CPP_MOE_SVE_KC_L1_PERMILLE
-      .venv/bin/python -m pytest -q
-      tests/test_fused_moe_bf16_tiled.py
-      -k 'sve_default_packing or sve_kc_path' &&
-      FUSED_CPP_MOE_SVE_KC=256 .venv/bin/python -m pytest -q
-      tests/test_fused_moe_bf16_tiled.py -k sve_kc_path
-    benchmark: historical; the removed window sweep remains in Git history.
+    correctness: historical; see results/amazon_192c_8c_production_kc.md
+    benchmark: historical; the production integration remains in Git 44dbcd9.
 
   - id: measurement.thread_weight_working_set
     part: measurement
@@ -1188,28 +1181,18 @@ variants:
     entrypoint: elastic::Executor::run_static
     status: reference
 
-  - id: sve_production_kc
-    features:
-      - compute.production_kblock_a_reuse
-    entrypoint: >-
-      FUSED_CPP_MOE_SVE_KC=<calibrated Kc>
-      fused_moe_bf16_tiled_{sync,scheduled,async,vllm_staged}
-    status: candidate
-
   - id: sve_production_one_kchunk
     features:
-      - compute.production_kblock_a_reuse
       - compute.xbyak_exact_m
       - compute.xbyak_double_buffer_kloop
     entrypoint: >-
-      default with FUSED_CPP_MOE_SVE_KC unset
+      default one-chunk packed-B path
       fused_moe_bf16_tiled_{sync,scheduled,async,vllm_staged}
     status: enabled
 
   - id: sve_production_one_kchunk_hugetlbfs
     features:
       - weights.hugetlbfs_backing
-      - compute.production_kblock_a_reuse
       - compute.xbyak_exact_m
       - compute.xbyak_double_buffer_kloop
     entrypoint: >-

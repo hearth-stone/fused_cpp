@@ -17,14 +17,6 @@ int n_tile();
 int round_k(int k);
 int round_n(int n);
 
-// K chunk used by the production packed-B layout. The default is one full K
-// chunk. FUSED_CPP_MOE_SVE_KC can pin a positive, 8-aligned Kc, while
-// FUSED_CPP_MOE_SVE_KC_L1_PERMILLE explicitly enables the private-L1 selector
-// used by calibration experiments. Configure Kc before packing weights and do
-// not change it while those packed weights remain in use.
-int l1d_cache_bytes();
-int k_block(int k);
-
 void pack_b(const uint16_t* B, uint16_t* B_reo, int K, int N);
 
 void pack_a_block(const uint16_t* A, uint16_t* packed, int rows, int K);

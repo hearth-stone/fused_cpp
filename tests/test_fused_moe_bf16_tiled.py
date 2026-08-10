@@ -1,12 +1,9 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-import json
 import os
 import platform
 import re
-import subprocess
-import sys
 from pathlib import Path
 from typing import Optional
 
@@ -55,55 +52,6 @@ def _first_affinity_cpu() -> int:
         if cpus:
             return min(cpus)
     return 0
-
-
-def _sve_packed_digest(kc: str | None) -> dict[str, str]:
-    script = """
-import hashlib
-import json
-
-import torch
-
-from fused_cpp.moe import prepare_fused_moe_bf16_tiled_weights
-
-
-def digest(tensor):
-    data = bytes(tensor.contiguous().view(torch.uint8).flatten().tolist())
-    return hashlib.sha256(data).hexdigest()
-
-
-w13 = (torch.arange(512 * 1024, dtype=torch.float32) % 251).reshape(1, 512, 1024).to(torch.bfloat16)
-w2 = (torch.arange(1024 * 256, dtype=torch.float32) % 241).reshape(1, 1024, 256).to(torch.bfloat16)
-packed = prepare_fused_moe_bf16_tiled_weights(w13, w2, fuse_silu=True, backend="sve")
-print("PACKED_DIGEST " + json.dumps({"w13": digest(packed.w13[0]), "w2": digest(packed.w2[0])}, sort_keys=True))
-"""
-    environment = os.environ.copy()
-    environment.pop("FUSED_CPP_MOE_SVE_KC", None)
-    environment.pop("FUSED_CPP_MOE_SVE_KC_L1_PERMILLE", None)
-    environment.update(
-        {
-            "OMP_NUM_THREADS": "1",
-            "MKL_NUM_THREADS": "1",
-            "OPENBLAS_NUM_THREADS": "1",
-        }
-    )
-    if kc is not None:
-        environment["FUSED_CPP_MOE_SVE_KC"] = kc
-    completed = subprocess.run(
-        [sys.executable, "-c", script],
-        cwd=Path(__file__).resolve().parents[1],
-        env=environment,
-        check=False,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-    )
-    if completed.returncode != 0:
-        raise AssertionError(f"packed digest child failed:\n{completed.stdout}")
-    for line in reversed(completed.stdout.splitlines()):
-        if line.startswith("PACKED_DIGEST "):
-            return json.loads(line.removeprefix("PACKED_DIGEST "))
-    raise AssertionError(f"packed digest is missing from child output:\n{completed.stdout}")
 
 
 def _case(seed: int = 0) -> tuple[torch.Tensor, ...]:
@@ -659,8 +607,6 @@ def test_sve_xbyak_exact_m_matches_static_asm(
     monkeypatch.setenv("FUSED_CPP_MOE_SILU_M12_OPT", "0")
     monkeypatch.setenv("FUSED_CPP_MOE_SILU_RECIP_NR", "0")
     monkeypatch.setenv("FUSED_CPP_MOE_SILU_MINIMAX3", "0")
-    monkeypatch.delenv("FUSED_CPP_MOE_SVE_KC", raising=False)
-    monkeypatch.delenv("FUSED_CPP_MOE_SVE_KC_L1_PERMILLE", raising=False)
 
     generator = torch.Generator().manual_seed(20260720 + degree)
     route_counts = [*range(1, 14), 23, 24, 25, 35, 36, 37, 48, 192]
@@ -754,8 +700,6 @@ def test_sve_xbyak_pure_gemm_matches_static_asm(monkeypatch: pytest.MonkeyPatch)
         pytest.skip("requires an SVE BF16 build/runtime")
     from fused_cpp import _moe_C
 
-    monkeypatch.delenv("FUSED_CPP_MOE_SVE_KC", raising=False)
-    monkeypatch.delenv("FUSED_CPP_MOE_SVE_KC_L1_PERMILLE", raising=False)
     generator = torch.Generator().manual_seed(20260725)
     K = 64
     N = 64
@@ -919,119 +863,6 @@ def test_sve_xbyak_service_probe_traverses_full_m12_panels() -> None:
 
     assert len(samples) == 3
     assert all(sample > 0.0 for sample in samples)
-
-
-def test_sve_xbyak_strict_mode_rejects_kc_fallback() -> None:
-    """Auto may use static Kc, while strict JIT must expose the unsupported mode."""
-    if "arm_sve_bf16" not in available_fused_moe_bf16_tiled_backends():
-        pytest.skip("requires an SVE BF16 build/runtime")
-    script = r"""
-import os
-
-import torch
-
-from fused_cpp.moe import fused_moe_bf16_tiled
-from fused_cpp.moe import prepare_fused_moe_bf16_tiled_weights
-
-generator = torch.Generator().manual_seed(20260720)
-rows, hidden_size, ffn_hidden_size = 5, 64, 32
-hidden = torch.empty((rows, hidden_size), dtype=torch.bfloat16).normal_(std=0.01, generator=generator)
-w13 = torch.empty((1, 2 * ffn_hidden_size, hidden_size), dtype=torch.bfloat16).normal_(
-    std=0.01, generator=generator
-)
-w2 = torch.empty((1, hidden_size, ffn_hidden_size), dtype=torch.bfloat16).normal_(
-    std=0.01, generator=generator
-)
-topk_ids = torch.zeros((rows, 1), dtype=torch.int32)
-topk_weights = torch.ones((rows, 1), dtype=torch.float32)
-packed = prepare_fused_moe_bf16_tiled_weights(w13, w2, fuse_silu=True, backend="sve")
-
-auto = fused_moe_bf16_tiled(hidden, packed, topk_weights, topk_ids, num_threads=1)
-os.environ["FUSED_CPP_MOE_SVE_IMPL"] = "asm"
-static = fused_moe_bf16_tiled(hidden, packed, topk_weights, topk_ids, num_threads=1)
-torch.testing.assert_close(auto.float(), static.float(), atol=0, rtol=0)
-
-os.environ["FUSED_CPP_MOE_SVE_IMPL"] = "jit"
-try:
-    fused_moe_bf16_tiled(hidden, packed, topk_weights, topk_ids, num_threads=1)
-except RuntimeError as error:
-    assert "split-K/Kc packing remains on the static asm fallback" in str(error)
-    print("STRICT_KC_OK")
-else:
-    raise AssertionError("strict JIT unexpectedly accepted split-K packing")
-"""
-    environment = os.environ.copy()
-    environment.update(
-        {
-            "FUSED_CPP_MOE_SVE": "1",
-            "FUSED_CPP_MOE_SVE_KC": "32",
-            "FUSED_CPP_MOE_SVE_IMPL": "auto",
-            "OMP_NUM_THREADS": "1",
-        }
-    )
-    environment.pop("FUSED_CPP_MOE_SVE_KC_L1_PERMILLE", None)
-    completed = subprocess.run(
-        [sys.executable, "-c", script],
-        cwd=Path(__file__).resolve().parents[1],
-        env=environment,
-        check=False,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-    )
-    assert completed.returncode == 0, completed.stdout
-    assert "STRICT_KC_OK" in completed.stdout
-
-
-@pytest.mark.parametrize("use_bf16_route", [False, True], ids=["fp32-route", "bf16-route"])
-@pytest.mark.parametrize("rows", [1, 2, 4, 8, 12, 13], ids=["m1", "m2", "m4", "m8", "m12", "m12-m1"])
-def test_sve_kc_path_matches_reference_and_threaded_output(
-    monkeypatch: pytest.MonkeyPatch,
-    use_bf16_route: bool,
-    rows: int,
-) -> None:
-    """Exercise every generic production Kc kernel and direct-route mode."""
-    if "arm_sve_bf16" not in available_fused_moe_bf16_tiled_backends():
-        pytest.skip("requires an SVE BF16 build/runtime")
-    affinity = sorted(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else list(range(4))
-    if len(affinity) < 4:
-        pytest.skip("requires four available CPUs")
-
-    monkeypatch.setenv("FUSED_CPP_MOE_SVE", "1")
-    monkeypatch.setenv("FUSED_CPP_MOE_W2_BF16_ROUTE", "1" if use_bf16_route else "0")
-    monkeypatch.setenv("FUSED_CPP_MOE_SVE_W2_DIRECT_ROUTE", "1")
-    generator = torch.Generator().manual_seed(20260718)
-    hidden_size = 1024
-    ffn_hidden_size = 1024
-    hidden = _bf16_normal((rows, hidden_size), generator=generator, std=0.01)
-    w13 = _bf16_normal((1, 2 * ffn_hidden_size, hidden_size), generator=generator, std=0.01)
-    w2 = _bf16_normal((1, hidden_size, ffn_hidden_size), generator=generator, std=0.01)
-    topk_ids = torch.zeros((rows, 1), dtype=torch.int32)
-    topk_weights = torch.ones((rows, 1), dtype=torch.float32)
-    packed = prepare_fused_moe_bf16_tiled_weights(w13, w2, fuse_silu=True, backend="sve")
-    if packed.gemm_backend != 1:
-        pytest.skip("requires an SVE BF16 build/runtime")
-
-    serial = fused_moe_bf16_tiled(hidden, packed, topk_weights, topk_ids, num_threads=1)
-    threaded = fused_moe_bf16_tiled(hidden, packed, topk_weights, topk_ids, num_threads=4)
-    torch.testing.assert_close(threaded.float(), serial.float(), atol=0, rtol=0)
-
-    reference = fused_moe_naive(hidden.float(), w13.float(), w2.float(), topk_weights, topk_ids).to(torch.bfloat16)
-    torch.testing.assert_close(serial.float(), reference.float(), atol=2.0e-3, rtol=2.0e-2)
-
-
-def test_sve_default_packing_uses_one_k_chunk() -> None:
-    """Default SVE packing must match an explicit one-chunk process configuration."""
-    if "arm_sve_bf16" not in available_fused_moe_bf16_tiled_backends():
-        pytest.skip("requires an SVE BF16 build/runtime")
-
-    default = _sve_packed_digest(None)
-    one_chunk = _sve_packed_digest("4096")
-    split_k = _sve_packed_digest("256")
-
-    assert default == one_chunk
-    assert default["w13"] != split_k["w13"]
-    assert default["w2"] == split_k["w2"]
 
 
 @pytest.mark.parametrize("bridge", ["normal", "scheduled", "async"])
