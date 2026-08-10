@@ -22,6 +22,41 @@
 M12、SVE、stage range 数、具体权重布局和 cache 工作集公式不属于核心问题定义。
 它们只影响固定执行环境下观测到的 isolated time 和 contention slowdown。
 
+### 1.1 Production full-stage 不变量
+
+当前 ARM SVE production runtime 不再有 weight split/range/window 决策。每个
+whole-expert task 的 W13 和 W2 各遍历一次完整 packed-N domain；planner 与 Plan
+V2 只选择 task team width，不携带 W13/W2 range 或 byte-window 字段。
+
+对 stage $s=(K_s,N_s)$、BF16 N tile $\nu$ 和 team width $t$，定义：
+
+$$
+q_s=\frac{N_s}{\nu},\qquad
+a_s(t)=\min(t,q_s),
+$$
+
+$$
+B_s=2K_sN_s,qquad
+u_s(t)=2K_s\nu\left\lceil\frac{q_s}{t}\right\rceil.
+$$
+
+$B_s$ 是该 expert 的完整 packed-B stage 字节数；$u_s(t)$ 是最忙 worker 的
+tile-aligned owner stripe。当前 fused expert 中：
+
+$$
+(K_{13},N_{13})=(H,2F),\quad B_{13}=4HF,
+$$
+
+$$
+(K_2,N_2)=(F,H),\quad B_2=2HF.
+$$
+
+因此 team width 是唯一的 production cache-window 控制。增加 $t$ 会缩小
+$u_s(t)$，同时让 $a_s(t)$ 个 owner 各扫描 packed A；不存在第二个顺序 N range，
+也不存在因 range 数增加而产生的 A 重扫、range dispatch 或 range barrier。
+本文后面标为“历史”的 stage-window/range 章节只保留实验推导与变更 provenance，
+不定义当前可行域、ABI、profile 或 cost model。
+
 ## 2. 原始问题
 
 ### 2.1 Expert route tasks
@@ -368,7 +403,7 @@ U(q)=\frac{\max(A_{\mathrm{median}}-A_{p10},
 $$
 
 该 anchor 仅对 uniform route、相同 root shape/顺序、相同 tail 起点、宽度与
-route-slice 数、相同 kernel/stage-window policy 生效，并且只做 exact-route
+route-slice 数、相同 kernel/full-N geometry 生效，并且只做 exact-route
 lookup，不插值或外推。$s=1$ 签名不匹配时回退 stage-aware DAG simulator；
 $s>1$ 因包含同一 packed-B 被多个 team 同时扫描的额外 contention 状态，签名
 不匹配时直接剪枝。因此 anchor 校准的是 interval placement 与 task-boundary
@@ -548,13 +583,13 @@ j_{i,13}=(i,\mathrm{W13}),\qquad
 j_{i,2}=(i,\mathrm{W2}).
 $$
 
-W13 和 W2 分别生成完整 Plan V2，因而可以独立选择线程宽度、fixed interval、
-strict/tail-pool placement 和确定性的 stage window：
+W13 和 W2 分别生成完整 Plan V2，因而可以独立选择线程宽度、fixed interval 和
+strict/tail-pool placement；两个 stage 都执行完整 N domain：
 
 $$
-t_{i,13},q_{i,13},g_{13}(M_i,t_{i,13}),
+(t_{i,13},q_{i,13},u_{13}(t_{i,13})),
 \qquad
-t_{i,2},q_{i,2},g_2(M_i,t_{i,2}).
+(t_{i,2},q_{i,2},u_2(t_{i,2})).
 $$
 
 两阶段之间存在全局 barrier。令
@@ -1044,9 +1079,9 @@ I_i^{(v_1)}(t)D_i^{(v_1)}(\mathcal Z)
 I_i^{(v_2)}(t)D_i^{(v_2)}(\mathcal Z),
 $$
 
-则 $v_2$ 被 $v_1$ 支配，可以在进入 planner 前删除。不同
-$(R_{13},R_2)$ 不再按这个外层公式比较：它们是 $g_\theta(M,t)$ 内部的逐 task
-物理几何，不是 $\mathcal V$ 的成员。
+则 $v_2$ 被 $v_1$ 支配，可以在进入 planner 前删除。Weight
+split/range/window 不再是 implementation variant 或内部执行参数；给定 variant、
+stage shape、N tile 和 team width 后，full-N owner geometry 唯一确定。
 
 SVE 静态 asm 与 Xbyak exact-M 也属于不同的 $v$。两者虽然共享 packed weight、
 N-split 和 M12 主体，但尾部映射不同，因此 profile identity 必须同时包含
@@ -1138,9 +1173,9 @@ $$
 c_i(t)=\min\left(I_i(t),I_{\min(M_i,M_R)}(t)\right),
 $$
 
-steady duration 为 $h_i(t)=I_i(t)-c_i(t)$。令 $W_i$ 为该 expert 的 W13/W2
-packed-B 总字节数；默认 `expert` 粒度把全部 weight range 流体聚合成按顺序执行的
-两个 phase：
+steady duration 为 $h_i(t)=I_i(t)-c_i(t)$。令 $W_i$ 为该 expert 的完整 W13/W2
+packed-B 总字节数；默认 `expert` 粒度将 compulsory full-stage weight service
+聚合成按顺序执行的两个 phase：
 
 $$
 P_{it}=\left[(c_i(t),W_i),(h_i(t),0)\right],
@@ -1148,9 +1183,9 @@ P_{it}=\left[(c_i(t),W_i),(h_i(t),0)\right],
 b_i(t)=\frac{W_i}{c_i(t)}.
 $$
 
-第二个 phase 在 $h_i(t)=0$ 时省略。诊断用 `range` 粒度按现有 stage-window
-policy 展开每个 W13/W2 range；cold time 按 range 字节比例分配，steady time 按
-原 stage phase duration 比例分配，因此两种粒度都保持
+第二个 phase 在 $h_i(t)=0$ 时省略。诊断用 `stage` 粒度展开完整 W13/W2 stage；
+cold time 按 stage 字节比例分配，steady time 按原 stage phase duration 比例
+分配，因此两种粒度都保持
 
 $$
 \sum_p d_{itp}=I_i(t),
@@ -1344,16 +1379,16 @@ cold search。
 | 并发配置 | 活跃 job 可形成任意满足 CPU 容量的 $(M_i,t_i)$ 组合 | 搜索静态 core shape，并自动比较 strict、threshold/统一宽度 tail-pool 与恰好两个 terminal expert 的一次 bounded repartition；后者可在 exact anchor 命中时把每个 terminal expert 切成两个连续 M slice，使四个 fixed task 覆盖全部核心；实验 elastic 只接受 planner 显式给出的同 NUMA 对齐 W2 cohort，target 必须包含 source 或与其不相交 | static-partition + boundary regroup 剪枝 |
 | Shape 集合 | 所有满足 CPU 容量的整数宽度组合 | empirical backend 只用 profile shape；analytic backend 生成 homogeneous 和至多两种宽度的 shape，再应用 active 工作集规则；tail-pool 和 bounded tail 只从 strict uncertainty band 和最快两个 head shape 派生 | 候选剪枝 |
 | Assignment | 任意 expert-to-resource 调度 | 按 isolated cost 的 LPT；实验 strict tail-steal 保留每条 lane 的 planner 前缀，只从 peer lane 的受限 pending 后缀迁移 whole expert 到同宽空闲 team | 启发式分配与 suffix-steal 剪枝 |
-| Runtime plan contract | task 可携带离散宽度集合、stage/range、resize 边界和动态 placement | bounded tail 在 terminal expert 启动前生成新的 singleton fixed width 和 blocker DAG；每个 production whole-expert task 必须显式携带由 $(M,t)$ 唯一解析的正整数 $(R_{13},R_2)$，W2 GEMM/scatter 共用 $R_2$；runtime 不接受继承 sentinel、byte target 或 split 布尔量；exact-anchor route fission 将同一 expert 的连续 M slice 作为多个 strict task，只有全部 slice 完成后才发布 expert completion；tail_pool 保持 whole-expert 动态 placement；实验 strict tail-steal 只接受单 NUMA、同宽、fixed、whole-expert 资源链，并保留 ready-token drain；实验 elastic 才在 W13/W2 边界扩到 preferred cohort；离线 cold-phase lowering 可为 strict fixed task 添加非负 release lower bound，非零时关闭 tail-steal | 单次 expert-boundary 重分区、受限未启动 task 迁移、实验 stage resize 与实验 task release 剪枝 |
+| Runtime plan contract | task 可携带离散宽度集合、stage、route-slice、resize 边界和动态 placement | bounded tail 在 terminal expert 启动前生成新的 singleton fixed width 和 blocker DAG；production whole-expert task 的 W13/W2 均执行完整 N domain，Plan/ABI 不携带 weight range、split 或 byte-window；每线程 owner stripe 仅由实际 width 和 backend N tile 推导；exact-anchor route fission 将同一 expert 的连续 M slice 作为多个 strict task，只有全部 slice 完成后才发布 expert completion；tail_pool 保持 whole-expert 动态 placement；实验 strict tail-steal 只接受单 NUMA、同宽、fixed、whole-expert 资源链，并保留 ready-token drain；实验 elastic 才在 W13/W2 边界扩到 preferred cohort；离线 cold-phase lowering 可为 strict fixed task 添加非负 release lower bound，非零时关闭 tail-steal | 单次 expert-boundary 重分区、受限未启动 task 迁移、实验 stage resize 与实验 task release 剪枝 |
 | Stage coupling | W13/W2 可形成任意满足依赖和容量的 stage DAG | production 使用 whole-expert pipeline；独立 W13/W2 Plan V2 加全局 barrier 仅作为实验 entrypoint，matched/independent 两种计划都不进入默认搜索 | production 粒度剪枝与实验对照 |
 | x86 synchronous executor team mapping | expert 可取任意合法整数宽度并形成任意 wave | API 接受 1--256 workers；均衡 route 用 atomic expert queue，active expert 不足时按 route/当前宽度贪心组 team，强偏斜时按 64-row target 形成有序 wave | planner 外的确定性 runtime mapper |
 | Ordering | 任意可行开始时间和顺序 | 每个 lane 的 LPT 顺序；实验 strict tail-steal 保留 planner 前缀和本地后缀优先，只允许领取 peer lane 的 pending suffix frontier | 顺序剪枝 |
 | Idling | 允许主动等待以避开争用 | planner 可关闭 tail-pool 和 bounded tail 保留原 strict；bounded tail 只依赖 blocker 完成、不增加主动等待；tail-pool 保持 non-idling；strict tail-steal 找不到满足 $c_h\ge r_{\min}$ 的后缀后立即释放 compute team，并在启用时转入 ready-token drain；elastic timeout=0 不主动等待，正 timeout 只允许在 W13/W2 边界等待有限 $\delta_i$；ready-token 路径仅填充无可运行 expert 的空闲 lane；cold-phase runtime benchmark 可按 oracle task release 主动等待，但 production planner 不生成非零 release | 受限 boundary idling 剪枝；oracle release 仅作可执行性诊断 |
 | Workload 输入 | 任意合法 global 或 rank-local route histogram | planner 接受任意 histogram；catalog preset 只扩展验证覆盖，不过滤运行时输入 | 不剪枝 |
 | Route combine | 任意满足 TopK release 约束和 CPU 容量的 merge 排程 | planner 不搜索 combine service time；strict plan 在预测 expert 同时完成时强制统一连续 post-expert merge，其余情况保留 auto；runtime 将连续 token range 固定映射给 logical worker，在 expert 边界和空闲期处理本 owner 已 release token，并在同一 resident worker job 排空；owner 间不偷取 merge；Plan V2 允许显式 on/off，elastic 不允许 on | 外层启发式限制与支配条件剪枝 |
-| Kernel variant | 任意未被支配的实现 | ARM empirical identity 只包含机器/拓扑、分布式 expert shape、SVE implementation/tail policy 和 source/binary hash；每个 identity 只允许一个活动校准。profile 中的正整数 $(R_{13}^{cal},R_2^{cal})$ 只描述采样几何，不构成 variant、query、cache key 或搜索轴。`auto` 优先选择唯一匹配的 `jit/xbyak_exact_m` 校准，否则回退唯一匹配的 `asm/static_bucketed` 校准。每个 shape/tail-pool 候选确定 team width 后，empirical/analytic Plan V2 都由确定函数 $g(M,t)$ 解析逐 task range 并进入执行成本；analytic 的 $R=1/R=2$ 只是该函数内部比较的物理端点，不是 operator-wide 候选。x86 AMX 使用不进入 planner 的确定性 per-expert pattern/cache policy，AVX-512/AMX 共用确定性 team-N/wave policy | 实现候选限制与逐 task runtime policy |
+| Kernel variant | 任意未被支配的实现 | ARM empirical identity 只包含机器/拓扑、分布式 expert shape、SVE implementation/tail policy、`full_n_team_stripes` 和 source/binary hash；每个 identity 只允许一个活动校准，旧 split/range profile 不兼容。`auto` 优先选择唯一匹配的 `jit/xbyak_exact_m` 校准，否则回退唯一匹配的 `asm/static_bucketed` 校准。每个 shape/tail-pool 候选确定 team width 后，empirical/analytic model 直接按 $u_s(t)$ 计算 owner stripe，不生成额外执行参数。x86 AMX 使用不进入 planner 的确定性 per-expert pattern/cache policy，AVX-512/AMX 共用确定性 team-N/wave policy | 实现候选限制与 width-derived runtime geometry |
 | Isolated time | 真实 $I_i(t)$ | production 默认仍为经验公式；可选 analytic backend 由 kernel demand、cache traffic 和机器 service curves 计算 | cost 近似，不剪枝可行域 |
-| Contention | 任意动态活跃配置上的真实 $D_i(\mathcal Z)$ | production 默认为实测 profile；bounded tail 仅在 uniform route、root/tail width 与物理 interval 完全匹配时使用 exact-layout full-call anchor，且禁止 route 插值；未命中仍走 stage-aware simulator；实验 strict tail-steal 暂不进入 cost model；analytic backend 按 L1-hot M12 GEMM core、L2/LLC/DRAM/epilogue 共享容量推进事件，register-only matrix/frontend/L1 只保留诊断；cold-phase oracle 只约束首个 M12 packed-B DRAM phase，运行时验证已证明它不能替代 per-worker L2 retention、完整 active stage window、LLC-to-L2 service、容量和 active-set slowdown | cost 近似，不剪枝可行域 |
+| Contention | 任意动态活跃配置上的真实 $D_i(\mathcal Z)$ | production 默认为实测 profile；bounded tail 仅在 uniform route、root/tail width 与物理 interval 完全匹配时使用 exact-layout full-call anchor，且禁止 route 插值；未命中仍走 stage-aware simulator；实验 strict tail-steal 暂不进入 cost model；analytic backend 按 L1-hot M12 GEMM core、L2/LLC/DRAM/epilogue 共享容量推进事件，register-only matrix/frontend/L1 只保留诊断；cold-phase oracle 只约束首个 M12 packed-B DRAM phase，运行时验证已证明它不能替代 per-worker L2 retention、完整 active full-stage working set、LLC-to-L2 service、容量和 active-set slowdown | cost 近似，不剪枝可行域 |
 | 跨 rank lifetime | 每个 rank 的资源状态随其他 rank 完成而变化 | 有 matching single-rank companion 时，多 rank 活跃阶段使用 concurrent-rank profile，最后一个 rank 的剩余 phase 切换到 single-rank profile；缺表时保守保持 concurrent-rank rate | cost 状态近似，不剪枝可行域 |
 
 当前 `IntervalPlanner` 搜索的是上述剪枝后 plan space 中的方案，不是原始问题
@@ -1867,7 +1902,60 @@ offered/allocated rate、capacity、utilization 和 dilation，且与 planner �
 解析 backend 先用于显式 shadow/what-if 规划。完整 schema、假设和运行命令见
 `cost_model/ANALYTIC_MODEL.md`。
 
-#### 8.2.5 packed-B 复用的实现条件与 range 成本不对称
+#### 8.2.5 Full-stage packed-B 复用与 width-derived owner stripe
+
+当前 production 对每个 stage 只有一个 full-N tile domain。沿用 1.1 的记号，
+单 tile 字节数、活跃 owner 数和最忙 owner stripe 为：
+
+$$
+b_s=2K_s\nu,\qquad
+a_s(t)=\min(t,q_s),\qquad
+u_s(t)=b_s\left\lceil\frac{q_s}{t}\right\rceil.
+$$
+
+首个 M panel 对 packed B 的 compulsory 流量为完整 $B_s=b_sq_s$；后续 panel
+是否从 private L2/LLC 重用由 $u_s(t)+A_{p,s}$ 与 cache capacity 决定。N-split
+下每个活跃 owner 扫描完整 packed A，因此 stage 的 owner 聚合 A 边界流量基线为
+
+$$
+Q_{A,s}=a_s(t)A_s,qquad A_s=2M K_s.
+$$
+
+这两个量都由 $(M,t,K_s,N_s,\nu)$ 唯一确定。planner 只能通过选择 $t$ 同时改变
+GEMM 并行度、A 扫描数和 owner stripe；不能在固定 $t$ 下再拆 weight stage。
+cost model 的 active shared working set 使用完整 $B_s$，private-cache 诊断使用
+$u_s(t)$，不得把二者混为一个 byte-window。
+
+### 8.3 Full-stage owner-cache 工作集 band
+
+对并发 active task 集 $\mathcal A(\tau)$，stage working set 与最大 owner stripe
+分别记录为：
+
+$$
+S_{active}(\tau)=\sum_{i\in\mathcal A(\tau)}B_{s_i},
+\qquad
+U_{max}(\tau)=\max_{i\in\mathcal A(\tau)}u_{s_i}(t_i).
+$$
+
+owner-cache shadow 仍可用独立 weight-scan 推导并发 stream band，但一个 expert 的
+stream size 必须是完整 stage，不是人为 range。若每核 private L2 为 $L_2$、组相联
+路数为 $A$、预留 $r$ 个 way，可用总 owner budget 为
+
+$$
+C_{owner}=CL_2\frac{A-r}{A},
+$$
+
+并以严格不等式 $nB_s<C_{owner}$ 得到容量上界。该 band 只用于候选排序/验证，
+不是执行硬约束；最终仍由 contention-aware event simulator 评分。profile 必须
+声明 `stage_geometry=full_n_team_stripes`，旧非单位 range calibration 直接拒绝，
+不能通过重命名复用。
+
+#### 历史：packed-B range/window 模型（非规范）
+
+以下直到 8.4 的内容记录 2026-08-09 之前的 range/window 实验、反例和演进，
+只用于解释历史结果。其 $R_s$、$g_s$、$g_\theta$、stage-window policy 与 Plan
+字段均已从 production 实现删除；若与 1.1、8.2.5 或本节冲突，以 full-stage
+公式为准。
 
 8.2.2 的保守映射取 $Q_{\mathrm{shared},B}=2KNP$，即假设每个 M panel 都重新扫一
 遍 packed-B；9.23 的四状态计数取相反极限，假设 B 在后续 panel 上恒为 hot
@@ -2019,7 +2107,7 @@ $g_{W13}=4$ MiB 即 $R=2$，$g_{W13}=8$ MiB 即 $R=1$，且
 $W2$ 总量 $4$ MiB 使任何 $g\ge4$ MiB 都退化为单 range。profile identity 记录的
 是 achieved $R$，本身无单位；runtime 和 catalog 不再保留旧编码。
 
-### 8.3 Stage-range owner-cache 工作集 band
+#### 历史续：Stage-range owner-cache 工作集 band
 
 当前 production 基线几何为 W13 两个相等 N range、W2 一个 range，即
 $(R_{13},R_2)=(2,1)$。packed 布局与 range 数无关；range 只改变遍历顺序。
@@ -2418,6 +2506,10 @@ C8i、H=4096/F=512 上做过性能校准；team/wave 门槛只在 8-core C8i 上
 不能把这些阈值解释为体系结构常数。
 
 ## 9. 剪枝验证
+
+> 本章按时间保留实验记录。凡使用 `R13/R2`、split、stage-window 或旧 profile
+> 文件名的结果均为 v0.89 之前的历史证据，不能直接校准当前 full-N runtime；当前
+> 验证状态以 9.34 和变更记录 v0.89 为准。
 
 令未剪枝 oracle 的最优值为 $C^*$，求解器下界为 $LB$，剪枝 planner 的可行
 结果为 $C_{\mathrm{pruned}}$。则：
@@ -4040,6 +4132,41 @@ $M=12$、`1/2/4/8T`，并给 W13 的两个端点写入独立标签，保证后�
 可做逐点 shadow 对照。当前提交只增加候选覆盖和单元验证，**不复用 v2 的 3.38% 数字
 声称 v3 实机 gate 已通过**；完整实机数据在 runtime/profile range 化后统一刷新。
 
+以上 9.33 全节是 range/window 运行时仍存在时的历史验证，不再定义当前生产模型。
+
+#### 9.34 full-N team-stripe 迁移与验收
+
+2026-08-09 的 v0.89 删除了 production weight split/range/window。每个 expert 的
+W13 和 W2 各执行一次完整 packed-N domain；team 宽度 $t$ 是唯一的 N-owner 窗口
+控制量。令 $q_s=N_s/\nu$ 为 stage $s$ 的 N tile 数，则最大 worker stripe 为
+
+$$
+u_s(t)=2K_s\nu\left\lceil\frac{q_s}{t}\right\rceil,
+$$
+
+而完整 stage 权重分别固定为 $B_{13}=4HF$、$B_2=2HF$。这里的
+`task_range_granularities` 仍只表示 route/M slicing，不是 weight-N split。
+
+迁移同步删除 Python/C++ public ABI 的 `w13_ranges/w2_ranges`、Plan V2 的
+`task_w13_ranges/task_w2_ranges`、ARM/x86 production range 循环、native planner
+bridge、解析 stage-window policy、profile identity 和默认 benchmark 控制。旧
+split profile 从 active catalog 删除；catalog 对非 `full_n_team_stripes` 几何和
+历史非单位 range metadata fail closed。显式 vLLM staged N-task baseline 与独立
+microbenchmark range 开关只保留为实验/历史对照，不可进入 production calibration。
+
+验收结果：
+
+- macOS ARM64 stub build 通过；核心 planner/model/runtime 回归为
+  `174 passed, 101 skipped`。全仓额外失败来自本机不可用的 KleidiAI 和既有 MLA
+  mock，与本次 MoE 变更无关。
+- `AmazonC5192Cores` 重新编译真实 AArch64 SVE/JIT/asm 扩展成功；在 NUMA0
+  `0-95` 核运行同组测试为 `274 passed, 1 skipped`。
+- 同机 HugeTLB TP4 smoke（$H=4096,F=512,M=12$）输出
+  `stage_geometry=full_n_team_stripes`，记录 W13/W2 stage 为 `8/4 MiB`；1T/4T
+  isolated 每 expert median 为 `0.579/0.185 ms`，单个 `4T` contention group 为
+  `0.187 ms`、derate `1.010`。该三轮 smoke 只验证执行与 metadata 契约，不作为
+  新的 production calibration table。
+
 ## 10. 同步规则
 
 
@@ -4054,6 +4181,7 @@ $M=12$、`1/2/4/8T`，并给 W13 的两个端点写入独立标签，保证后�
 - rank-local 与跨 rank 资源耦合方式变化；
 - 目标函数加入或移除 planning、dispatch、communication、scatter、combine；
 - kernel variant 从全局选择改为 per-expert 选择；
+- full-stage/N-owner 几何、backend N tile 或 team-width 到 owner stripe 的映射变化；
 - shape、assignment、ordering 或 cache 相关剪枝变化；
 - CP-SAT/MILP 编码改变原始可行域，而不只是等价重写。
 
@@ -4156,3 +4284,4 @@ $M=12$、`1/2/4/8T`，并给 W13 的两个端点写入独立标签，保证后�
 | 2026-08-09 | v0.86 | working-set shadow 的诊断 schema kind 从旧布尔策略命名改为 `stage_range_working_set_band_validation`；其输入、owner-cache 公式、推荐结果和 production 隔离边界均不变。 |
 | 2026-08-09 | v0.87 | 文档、Plan/profile schema 与 optimization manifests 收敛到 range-only 契约：公开 entrypoint 只记录正整数 `w13_ranges/w2_ranges`，Plan V2 每 task 必须携带正整数 range，profile 必须显式记录 exact identity；byte target 仅是解析模型在 plan lowering 前的校准输入。修正 homogeneous full-call anchor 的规则为“所有 task 保持 profile baseline pair”，并将默认 stage policy 标记为 V4 的 `R13=2,R2=1` 精确 gate。历史 JSON 字段、profile 文件名和 changelog 术语只作为 provenance 保留。 |
 | 2026-08-09 | v0.88 | 删除 operator-wide $(R_{13},R_2)$ planner 控制：`ProfilePolicy/ProfileQuery` 不再包含 range，catalog 每个机器/拓扑/shape/implementation/source 域只允许一个活动校准，旧 `(1,1)/(2,1)` 配对表从活动目录移除；range 字段降级为采样几何 provenance。删除 `PolicyAwarePlanner`、range variant 枚举、联合 `(range,shape)` 搜索、plan-level `operator_options` 和对应 cache identity。planner 只搜索 shape，随后由 $g_\theta(M,t)$ 生成 Plan V2 的逐 task exact range；native cold planner 中的 pair 仅是未覆盖 task 的 calibration fallback，不是候选。同步更新 TP/EP evaluator、validator、schema 和 full-call anchor 判定。 |
+| 2026-08-09 | v0.89 | 完全删除 production weight split/range/window 语义：Python/C++ ABI、Plan V2、ARM/x86 executor、native planner、empirical/analytic cost model、profile generator 和默认 benchmark 均只执行 `full_n_team_stripes`。W13/W2 stage bytes 固定为 $4HF/2HF$；team width 通过 $u_s(t)=2K_s\nu\lceil(N_s/\nu)/t\rceil$ 唯一决定每线程 owner stripe。删除逐 task range 张量、解析 stage-window policy、range 搜索/缓存 identity 和旧 active split profiles；route/M slicing 保留且与 weight split 明确区分。profile catalog 拒绝非 full-N 几何，planner 候选/剪枝只保留既有 width、shape、tail-pool 和 bounded route-slice 维度。 |

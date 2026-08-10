@@ -145,8 +145,6 @@ def main() -> int:
                 num_threads=args.threads,
                 global_num_experts=args.experts,
                 activation="silu",
-                w13_ranges=2,
-                w2_ranges=1,
             )
 
     outputs: dict[str, torch.Tensor] = {}

@@ -192,13 +192,6 @@ struct NativeIntervalPlanner::Impl {
     int64_t working_set_bytes = 0;
   };
 
-  struct StageGeometry {
-    int w13_ranges = 1;
-    int w2_ranges = 1;
-    int64_t w13_chunk_bytes = 0;
-    int64_t w2_chunk_bytes = 0;
-  };
-
   struct SimulationTask {
     int routes = 0;
     int threads = 0;
@@ -226,20 +219,8 @@ struct NativeIntervalPlanner::Impl {
     if (config.profile_runs <= 0) {
       throw std::invalid_argument("profile_runs must be positive");
     }
-    for (size_t index = 0; index < config.task_stage_windows.size(); ++index) {
-      const IntervalStageWindowEntry& entry = config.task_stage_windows[index];
-      if (entry.min_routes <= 0 || entry.max_routes < entry.min_routes || entry.threads <= 0 || entry.w13_ranges <= 0 ||
-          entry.w2_ranges <= 0 || entry.w13_chunk_bytes <= 0 || entry.w2_chunk_bytes <= 0) {
-        throw std::invalid_argument("task stage-window entries must have positive geometry and route ranges");
-      }
-      for (size_t previous = 0; previous < index; ++previous) {
-        const IntervalStageWindowEntry& other = config.task_stage_windows[previous];
-        const bool overlaps = entry.threads == other.threads && entry.min_routes <= other.max_routes &&
-                              other.min_routes <= entry.max_routes;
-        if (overlaps) {
-          throw std::invalid_argument("task stage-window entries must not overlap for one thread width");
-        }
-      }
+    if (config.w13_stage_bytes <= 0 || config.w2_stage_bytes <= 0) {
+      throw std::invalid_argument("full-N stage byte counts must be positive");
     }
 
     std::map<int, std::map<int, double>> iso_by_threads;
@@ -462,54 +443,28 @@ struct NativeIntervalPlanner::Impl {
     return overhead + std::max(bulk - overhead, 0.0) + std::max(tail_time - overhead, 0.0);
   }
 
-  int64_t OwnerRangeBytes(int64_t range_bytes, int64_t tile_bytes, int threads) const {
+  int64_t OwnerStageBytes(int64_t stage_bytes, int64_t tile_bytes, int threads) const {
     if (threads <= 0) {
       throw std::invalid_argument("threads must be positive");
     }
-    if (range_bytes <= 0 || tile_bytes <= 0) {
+    if (stage_bytes <= 0 || tile_bytes <= 0) {
       return 0;
     }
-    const int64_t range_tiles = (range_bytes + tile_bytes - 1) / tile_bytes;
-    const int64_t owner_tiles = (range_tiles + threads - 1) / threads;
+    const int64_t stage_tiles = (stage_bytes + tile_bytes - 1) / tile_bytes;
+    const int64_t owner_tiles = (stage_tiles + threads - 1) / threads;
     return owner_tiles * tile_bytes;
   }
 
-  const IntervalStageWindowEntry* FindStageWindow(int routes, int threads) const {
-    for (const IntervalStageWindowEntry& entry : config.task_stage_windows) {
-      if (entry.threads == threads && entry.min_routes <= routes && routes <= entry.max_routes) {
-        return &entry;
-      }
-    }
-    return nullptr;
-  }
-
-  StageGeometry TaskStageGeometry(int routes, int threads) const {
-    const IntervalStageWindowEntry* entry = FindStageWindow(routes, threads);
-    if (entry == nullptr) {
-      return {
-          config.calibration_w13_ranges,
-          config.calibration_w2_ranges,
-          config.w13_chunk_bytes,
-          config.w2_chunk_bytes,
-      };
-    }
-    return {
-        entry->w13_ranges,
-        entry->w2_ranges,
-        entry->w13_chunk_bytes,
-        entry->w2_chunk_bytes,
-    };
-  }
-
   int64_t TaskMaxStageBytes(int routes, int threads) const {
-    const StageGeometry geometry = TaskStageGeometry(routes, threads);
-    return std::max(geometry.w13_chunk_bytes, geometry.w2_chunk_bytes);
+    (void)routes;
+    (void)threads;
+    return std::max(config.w13_stage_bytes, config.w2_stage_bytes);
   }
 
   int64_t WindowBytesPerWorker(int routes, int threads) const {
-    const StageGeometry geometry = TaskStageGeometry(routes, threads);
-    return std::max(OwnerRangeBytes(geometry.w13_chunk_bytes, config.w13_tile_bytes, threads),
-                    OwnerRangeBytes(geometry.w2_chunk_bytes, config.w2_tile_bytes, threads));
+    (void)routes;
+    return std::max(OwnerStageBytes(config.w13_stage_bytes, config.w13_tile_bytes, threads),
+                    OwnerStageBytes(config.w2_stage_bytes, config.w2_tile_bytes, threads));
   }
 
   std::vector<Phase> TaskPhases(int routes, int threads) const {
@@ -520,20 +475,13 @@ struct NativeIntervalPlanner::Impl {
     if (overhead > 0.0) {
       phases.push_back({overhead, 0});
     }
-    const StageGeometry geometry = TaskStageGeometry(routes, threads);
-    const int w13_ranges = std::max(geometry.w13_ranges, 1);
-    const double w13_phase = compute * (2.0 / 3.0) / w13_ranges;
-    for (int range = 0; range < w13_ranges; ++range) {
-      if (w13_phase > 0.0) {
-        phases.push_back({w13_phase, geometry.w13_chunk_bytes});
-      }
+    const double w13_phase = compute * (2.0 / 3.0);
+    if (w13_phase > 0.0) {
+      phases.push_back({w13_phase, config.w13_stage_bytes});
     }
-    const int w2_ranges = std::max(geometry.w2_ranges, 1);
-    const double w2_phase = compute / 3.0 / w2_ranges;
-    for (int range = 0; range < w2_ranges; ++range) {
-      if (w2_phase > 0.0) {
-        phases.push_back({w2_phase, geometry.w2_chunk_bytes});
-      }
+    const double w2_phase = compute / 3.0;
+    if (w2_phase > 0.0) {
+      phases.push_back({w2_phase, config.w2_stage_bytes});
     }
     return phases;
   }
@@ -866,6 +814,7 @@ struct NativeIntervalPlanner::Impl {
   }
 
   bool UsesFullWorkloadAnchor(const std::vector<Expert>& experts, const std::vector<int>& shape) const {
+    (void)shape;
     if (!config.has_full_workload_anchors || static_cast<int>(experts.size()) != config.local_experts ||
         experts.empty()) {
       return false;
@@ -874,8 +823,7 @@ struct NativeIntervalPlanner::Impl {
                      [&](const Expert& expert) { return expert.routes == experts.front().routes; })) {
       return false;
     }
-    return std::none_of(shape.begin(), shape.end(),
-                        [&](int threads) { return FindStageWindow(experts.front().routes, threads) != nullptr; });
+    return true;
   }
 
   std::optional<std::pair<double, double>> BoundedTailAnchor(
@@ -888,9 +836,7 @@ struct NativeIntervalPlanner::Impl {
       return std::nullopt;
     }
     const int routes = M12EffectiveRows(experts.front().routes);
-    if (routes % route_slices != 0 || FindStageWindow(routes / route_slices, tail_width) != nullptr ||
-        std::any_of(root_shape.begin(), root_shape.end(),
-                    [&](int threads) { return FindStageWindow(routes, threads) != nullptr; })) {
+    if (routes % route_slices != 0) {
       return std::nullopt;
     }
     const auto anchor =

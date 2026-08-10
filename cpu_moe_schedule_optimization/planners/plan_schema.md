@@ -249,8 +249,6 @@ native `fused_moe_bf16_tiled_async_plan_v2` entrypoint:
   "task_stage_ids": [0, 0, 0],
   "task_resize_points": [0, 0, 0],
   "task_range_granularities": [0, 0, 0],
-  "task_w13_ranges": [2, 8, 2],
-  "task_w2_ranges": [1, 4, 1],
   "task_resize_timeout_ns": [0, 0, 0],
   "task_preferred_core_begins": [-1, -1, -1],
   "early_merge": null
@@ -302,11 +300,9 @@ Rules:
   node, and either fully contain the selected interval or be completely
   disjoint from it. Partial overlap is rejected. Strict, tail-pool, and
   non-resizable elastic tasks require `-1`.
-- `task_w13_ranges` and `task_w2_ranges` are required per-task exact stage
-  geometries. Each array has one positive integer per task. The value is the
-  number of sequential packed-B N ranges executed by that stage; W2 GEMM and
-  owner-scatter consume the same `task_w2_ranges` ownership geometry. There is
-  no inherit sentinel, byte-window runtime encoding, or boolean W13 alias.
+- W13 and W2 always execute one complete packed-N stage. There are no per-task
+  weight-range or byte-window fields. `task_threads[i]` partitions the full N
+  tile domain among workers, and W2 owner-scatter follows the same ownership.
 - `early_merge` is an optional plan-level tri-state. Missing or `null` retains
   the runtime team-load heuristic, `true` forces the ready-token path, and
   `false` waits for expert compute to finish before all workers merge uniform
@@ -314,11 +310,11 @@ Rules:
   for elastic execution. `FUSED_CPP_MOE_ASYNC_READY_TOKEN_MERGE=0` remains a
   global kill switch. A Python wrapper connected to a native extension without
   this argument rejects explicit `true`/`false` instead of ignoring it.
-- Strict execution permits either one full-range task per active expert or
+- Strict execution permits either one full-route task per active expert or
   multiple route-slice tasks. All repeated tasks for one expert must carry the
-  same positive granularity. Mixing full-range and sliced tasks, leaving a
+  same positive granularity. Mixing full-route and sliced tasks, leaving a
   route gap, or extending past the available task count is rejected natively.
-  Tail-pool and elastic execution still require one full-range task per expert.
+  Tail-pool and elastic execution still require one full-route task per expert.
   An expert becomes ready for token merge only after all of its slices finish;
   each slice owns disjoint route rows and an independent fixed team/scratch
   interval.
@@ -401,21 +397,18 @@ Rules:
   reference implementation, while `FUSED_CPP_MOE_PLANNER_THREADS` controls
   native candidate workers. Cache hits rebuild the same bridge without rerunning
   either cold solver.
-- A plan has no operator-wide W13/W2 range option. `PlannedMoE` accepts one
-  calibration model, searches the core shape, and then resolves the two
-  required per-task arrays after each task's actual width and placement are
-  known. A named `TaskStageWindowPolicy` is a deterministic mapping on
-  `(routes, actual_task_threads)`; uncovered combinations use the calibration's
-  measured geometry as a cost-model fallback. It is not a free search
-  dimension. Every candidate is scored with its resolved task ranges, and
-  tail-pool tasks use the selected pool width. The policy name is part of the
-  plan-cache identity and result metadata; there is no `operator_options`,
-  range-profile variant, or global `(1,1)/(2,1)` cache key.
-  The measured `amazon_c5_192c_tp4_f512_v4` policy is default-on only when the
-  complete dual-NUMA AmazonC5192Cores TP4/F512 SVE JIT exact-M
-  `R13=2,R2=1` profile identity and one of its 96-core rank CPU sets match.
-  All other profiles retain their own operator-wide exact pair. Pass
-  `use_default_stage_window_policy=False` for a controlled baseline.
+- A plan has no W13/W2 split or window option. `PlannedMoE` accepts one full-N
+  calibration model and searches the existing core shape/tail strategy space.
+  For stage `(K,N)`, backend tile `nu`, and selected task width `t`, the maximum
+  owner stripe is derived, not searched:
+
+  ```text
+  owner_tiles = ceil((N / nu) / t)
+  owner_bytes = owner_tiles * K * nu * 2
+  ```
+
+  Tail-pool tasks use their selected pool width. The plan cache therefore needs
+  no stage-policy identity, range-profile variant, or `(1,1)/(2,1)` key.
 
 ## Planner Kinds
 

@@ -97,7 +97,7 @@ bool sve_runtime_supported() {
 }
 
 const MoeBackend kArmNeonBackend{
-    BackendId::kArmNeonBf16, "arm_neon_bf16", "arm",        "neon_bf16",  kFusedSiluPackC | kWeightWindows,
+    BackendId::kArmNeonBf16, "arm_neon_bf16", "arm",        "neon_bf16",  kFusedSiluPackC,
     neon_runtime_supported,  neon_n_tile,     neon_round_k, neon_round_n, neon_pack_b,
 };
 
@@ -106,7 +106,7 @@ const MoeBackend kArmSveBackend{
     "arm_sve_bf16",
     "arm",
     "sve_bf16",
-    kFusedSiluPackC | kDirectRouteF32 | kDirectRouteBf16 | kRouteMerge | kWeightWindows,
+    kFusedSiluPackC | kDirectRouteF32 | kDirectRouteBf16 | kRouteMerge,
     sve_runtime_supported,
 #if defined(FUSED_CPP_MOE_HAS_ARM_SVE)
     ::fused_cpp::moe_sve::n_tile,

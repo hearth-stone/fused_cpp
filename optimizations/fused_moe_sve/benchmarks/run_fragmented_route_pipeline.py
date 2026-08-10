@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Sweep route fragmentation while total FLOPs and active range-local B stay fixed."""
+"""Sweep route fragmentation while total FLOPs and active full-stage B stay fixed."""
 
 from __future__ import annotations
 
@@ -64,7 +64,7 @@ def build_points(
     if any(replaced < 0 or replaced > teams for replaced in replaced_teams):
         raise ValueError("replaced team count is outside [0, teams]")
 
-    active_stage_bytes = teams * 2 * hidden * intermediate
+    active_stage_bytes = teams * 4 * hidden * intermediate
     total_routes = teams * base_routes
     points: list[Point] = []
     for split_factor in split_factors:
@@ -122,7 +122,7 @@ def benchmark_command(
         "--schedule",
         schedule,
         "--w13-ranges",
-        "2",
+        "1",
         "--copies",
         str(copies),
         "--cpu-start",
@@ -281,7 +281,7 @@ def main() -> int:
 
     payload = {
         "schema_version": 1,
-        "kind": "stage_range_fixed_active_b_route_fragmentation",
+        "kind": "full_stage_fixed_active_b_route_fragmentation",
         "target": {
             "hostname": platform.node(),
             "machine": platform.machine(),
@@ -290,7 +290,7 @@ def main() -> int:
         },
         "kernel": {
             "entrypoint": "production fused SVE M12 W13 and W2 kernels",
-            "w13_ranges": 2,
+            "stage_geometry": "full_n_team_stripes",
             "parallel_axis": "N",
             "binary": str(args.binary.resolve()),
             "binary_sha256": sha256_file(args.binary),
@@ -312,7 +312,7 @@ def main() -> int:
                 "teams * threads_per_team workers",
                 "teams * base_routes total routes",
                 "6 * total_routes * hidden * intermediate FLOPs",
-                "teams * 2 * hidden * intermediate active W13/W2 range bytes",
+                "teams * max(full W13 bytes, full W2 bytes)",
             ],
         },
         "rows": rows,

@@ -222,9 +222,8 @@ def _build_profile_mode(
     if not math.isfinite(isolated_ns) or isolated_ns <= 0.0:
         raise ValueError(f"invalid isolated duration for routes={routes}, threads={threads}: {isolated_ns!r}")
 
-    ranges: list[tuple[str, float, int]] = []
+    stages: list[tuple[str, float, int]] = []
     for stage in ("w13", "w2"):
-        weight_index = 0
         for duration_ns, weight_bytes in model.task_stage_phases(stage, routes, threads):
             duration_ns = float(duration_ns)
             weight_bytes = int(weight_bytes)
@@ -236,13 +235,12 @@ def _build_profile_mode(
                 raise ValueError(f"invalid {stage} packed-B bytes: {weight_bytes}")
             if weight_bytes == 0:
                 continue
-            ranges.append((f"{stage}:{weight_index}", duration_ns, weight_bytes))
-            weight_index += 1
-    if not ranges:
+            stages.append((stage, duration_ns, weight_bytes))
+    if not stages:
         raise ValueError(f"no packed-B phases for routes={routes}, threads={threads}")
 
-    total_weight_bytes = sum(weight_bytes for _, _, weight_bytes in ranges)
-    raw_weight_ns = sum(duration_ns for _, duration_ns, _ in ranges)
+    total_weight_bytes = sum(weight_bytes for _, _, weight_bytes in stages)
+    raw_weight_ns = sum(duration_ns for _, duration_ns, _ in stages)
     reference_routes = min(routes, cold_panel_rows)
     cold_ns = min(float(model.T_iso(reference_routes, threads)), isolated_ns)
     steady_ns = max(isolated_ns - cold_ns, 0.0)
@@ -258,25 +256,25 @@ def _build_profile_mode(
         if steady_ns > 0.0:
             phases.append(ColdPhase(name="expert:steady", duration_ns=steady_ns))
         return ColdPhaseMode(threads=threads, phases=tuple(phases))
-    if phase_granularity != "range":
-        raise ValueError(f"phase_granularity must be 'expert' or 'range', got {phase_granularity!r}")
+    if phase_granularity != "stage":
+        raise ValueError(f"phase_granularity must be 'expert' or 'stage', got {phase_granularity!r}")
 
     phases: list[ColdPhase] = []
-    for name, raw_duration_ns, weight_bytes in ranges:
-        range_cold_ns = cold_ns * weight_bytes / total_weight_bytes
+    for name, raw_duration_ns, weight_bytes in stages:
+        stage_cold_ns = cold_ns * weight_bytes / total_weight_bytes
         phases.append(
             ColdPhase(
                 name=f"{name}:cold",
-                duration_ns=range_cold_ns,
+                duration_ns=stage_cold_ns,
                 cold_weight_bytes=weight_bytes,
             )
         )
-        range_steady_ns = steady_ns * raw_duration_ns / raw_weight_ns
-        if range_steady_ns > 0.0:
+        stage_steady_ns = steady_ns * raw_duration_ns / raw_weight_ns
+        if stage_steady_ns > 0.0:
             phases.append(
                 ColdPhase(
                     name=f"{name}:steady",
-                    duration_ns=range_steady_ns,
+                    duration_ns=stage_steady_ns,
                 )
             )
 
@@ -298,8 +296,8 @@ def build_cold_phase_jobs(
         raise ValueError(f"num_cores must be positive, got {num_cores}")
     if cold_panel_rows <= 0:
         raise ValueError(f"cold_panel_rows must be positive, got {cold_panel_rows}")
-    if phase_granularity not in {"expert", "range"}:
-        raise ValueError(f"phase_granularity must be 'expert' or 'range', got {phase_granularity!r}")
+    if phase_granularity not in {"expert", "stage"}:
+        raise ValueError(f"phase_granularity must be 'expert' or 'stage', got {phase_granularity!r}")
     normalized_widths = tuple(sorted({int(width) for width in widths}))
     if not normalized_widths:
         raise ValueError("at least one thread width is required")
@@ -997,13 +995,11 @@ def _load_modules(profile: Path):
     sys.path[:0] = [str(cost_model_dir), str(planners_dir)]
     from interval_planner import IntervalPlanner
     from phase_model import ContentionCostModel
-    from stage_window_policy import default_task_stage_window_policy
     from workload_catalog import default_offline_workloads
 
     return (
         ContentionCostModel(profile),
         IntervalPlanner,
-        default_task_stage_window_policy,
         default_offline_workloads,
     )
 
@@ -1019,7 +1015,7 @@ def _model_widths(model, num_cores: int) -> tuple[int, ...]:
 
 
 def _run_cli(args: argparse.Namespace) -> dict[str, object]:
-    raw_model, interval_planner_type, default_stage_policy, workload_loader = _load_modules(args.profile)
+    raw_model, interval_planner_type, workload_loader = _load_modules(args.profile)
     if args.routes:
         routes = _parse_int_list(args.routes, name="routes")
         experts = tuple((expert_id, count) for expert_id, count in enumerate(routes) if count > 0)
@@ -1054,18 +1050,10 @@ def _run_cli(args: argparse.Namespace) -> dict[str, object]:
     if args.baseline_width not in widths:
         raise ValueError("mixed widths must include baseline_width so the mixed domain contains the fixed baseline")
 
-    stage_policy = None
-    if not args.no_default_stage_windows:
-        stage_policy = default_stage_policy(
-            raw_model.policy,
-            num_cores=args.num_cores,
-            cpu_ids=tuple(range(args.num_cores)),
-        )
     planner = interval_planner_type(
         raw_model,
         args.num_cores,
         widths=_model_widths(raw_model, args.num_cores),
-        task_stage_window_policy=stage_policy,
         native_cold_planner=False,
     )
     phase_model = planner.model
@@ -1138,17 +1126,16 @@ def _run_cli(args: argparse.Namespace) -> dict[str, object]:
         "dram_bandwidth_gbps": args.dram_bandwidth_gbps,
         "bandwidth_quantum_gbps": args.bandwidth_quantum_gbps,
         "cold_phase_slots": args.cold_phase_slots,
-        "task_stage_window_policy": stage_policy.name if stage_policy is not None else None,
         "assumptions": {
             "cold_phase": (
-                "first min(routes, cold_panel_rows) rows; packed-B ranges are fluid-aggregated"
+                "first min(routes, cold_panel_rows) rows; W13/W2 are fluid-aggregated"
                 if args.phase_granularity == "expert"
-                else "first min(routes, cold_panel_rows) rows, split across packed-B ranges by bytes"
+                else "first min(routes, cold_panel_rows) rows, split across full-N W13/W2 stages by bytes"
             ),
             "steady_phase": (
                 "remaining isolated time as one aggregate phase"
                 if args.phase_granularity == "expert"
-                else "remaining isolated time, split across ranges by existing stage weights"
+                else "remaining isolated time, split across full-N W13/W2 stages"
             ),
             "cpu": "selected team is retained from expert start through all phase waits",
             "mode": "whole-expert fixed width; no preemption or W13-to-W2 resizing",
@@ -1188,7 +1175,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--baseline-width", type=int, default=8)
     parser.add_argument("--cold-panel-rows", type=int, default=12)
-    parser.add_argument("--phase-granularity", choices=("expert", "range"), default="expert")
+    parser.add_argument("--phase-granularity", choices=("expert", "stage"), default="expert")
     parser.add_argument("--dram-bandwidth-gbps", type=float, default=336.4)
     parser.add_argument("--bandwidth-quantum-gbps", type=float, default=0.25)
     parser.add_argument("--cold-phase-slots", type=int)
@@ -1197,7 +1184,6 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--relative-gap-limit", type=float, default=0.0)
     parser.add_argument("--time-quantum-ns", type=int, default=1000)
     parser.add_argument("--random-seed", type=int, default=0)
-    parser.add_argument("--no-default-stage-windows", action="store_true")
     parser.add_argument("--log-search-progress", action="store_true")
     parser.add_argument("--include-phases", action="store_true")
     parser.add_argument("--output", type=Path)

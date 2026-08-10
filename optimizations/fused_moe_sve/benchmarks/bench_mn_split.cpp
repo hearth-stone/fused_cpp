@@ -42,7 +42,7 @@ struct Options {
   std::vector<SplitPlan> plans = {
       {1, 64}, {1, 96}, {8, 12}, {12, 8}, {16, 6}, {24, 4}, {32, 3}, {48, 2}, {96, 1},
   };
-  int w13_ranges = 2;
+  int w13_ranges = 1;
   int warmup = 3;
   int iterations = 11;
   int copies = 8;

@@ -37,7 +37,7 @@ DEFAULT_PROFILE = (
     / "cpu_moe_schedule_optimization"
     / "cost_model"
     / "profiles"
-    / "contention_async_amazon_c5_192c_numa0_tp4_sve_F512_E256_splitw13_schema_v2_xbyak_exactm_20260727.json"
+    / "contention_async_amazon_c5_192c_numa0_tp4_sve_F512_E256_fulln_schema_v2_xbyak_exactm_20260727.json"
 )
 
 

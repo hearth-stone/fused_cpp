@@ -352,7 +352,7 @@ def main() -> int:
 
     payload = {
         "schema_version": 1,
-        "kind": "fixed_active_b_route_fragmentation_perf",
+        "kind": "full_stage_fixed_active_b_route_fragmentation_perf",
         "target": {
             "hostname": platform.node(),
             "machine": platform.machine(),
@@ -360,7 +360,7 @@ def main() -> int:
         },
         "kernel": {
             "entrypoint": "production fused SVE M12 W13 and W2 kernels",
-            "w13_ranges": 2,
+            "stage_geometry": "full_n_team_stripes",
             "binary": str(args.binary.resolve()),
             "binary_sha256": sha256_file(args.binary),
         },

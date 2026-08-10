@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate per-task-range plans against exhaustive measured TP2/EP2 shapes.
+"""Validate full-N team-width plans against exhaustive measured TP2/EP2 shapes.
 
 The parent launches one NUMA-local worker per rank and synchronizes every timed
 operator call.  Each worker uses its rank-local histogram and may therefore
@@ -103,11 +103,7 @@ def select_model(profile_dir: Path, mode: str):
 
     ffn = 1024 if mode == "tp" else 2048
     local_experts = 64 if mode == "tp" else 32
-    paths = [
-        path
-        for path in profile_dir.glob("*_splitw13_v2_r1_20260713.json")
-        if "nosplitw13" not in path.name
-    ]
+    paths = list(profile_dir.glob("*_fulln_v2_r1_20260713.json"))
     catalog = ProfileCatalog.from_paths(paths)
     query = ProfileQuery(
         mode=mode,
@@ -172,6 +168,18 @@ def local_histogram(global_histogram: list[int], mode: str, rank: int) -> list[i
     return list(global_histogram[rank * local : (rank + 1) * local])
 
 
+def worker_window_pairs(model, tasks) -> list[tuple[int, int]]:
+    return sorted(
+        {
+            (
+                model.stage_bytes_per_worker("w13", int(threads), int(routes)),
+                model.stage_bytes_per_worker("w2", int(threads), int(routes)),
+            )
+            for _, routes, _, threads, _ in tasks
+        }
+    )
+
+
 def worker(args: argparse.Namespace) -> int:
     import torch
     from fused_cpp.moe import prepare_fused_moe_bf16_tiled_weights
@@ -210,15 +218,14 @@ def worker(args: argparse.Namespace) -> int:
             selected = {
                 "shape": forced_shape,
                 "makespan_ns": predicted,
+                "tasks": tasks,
                 "bridge": planner.to_async_bridge(tasks),
             }
-        selected_pairs = sorted(
-            set(zip(selected["bridge"]["task_w13_ranges"], selected["bridge"]["task_w2_ranges"], strict=True))
-        )
+        selected_pairs = worker_window_pairs(model, selected["tasks"])
         candidates: list[dict] = [
             {
                 "key": "planner",
-                "task_range_pairs": selected_pairs,
+                "task_worker_window_pairs_bytes": selected_pairs,
                 "shape": tuple(selected["shape"]),
                 "predicted_ns": float(selected["makespan_ns"]),
                 "bridge": selected["bridge"],
@@ -233,9 +240,7 @@ def worker(args: argparse.Namespace) -> int:
                 candidates.append(
                     {
                         "key": f"shape:{','.join(map(str, shape))}",
-                        "task_range_pairs": sorted(
-                            set(zip(bridge["task_w13_ranges"], bridge["task_w2_ranges"], strict=True))
-                        ),
+                        "task_worker_window_pairs_bytes": worker_window_pairs(model, tasks),
                         "shape": tuple(shape),
                         "predicted_ns": float(predicted),
                         "bridge": bridge,
@@ -297,7 +302,7 @@ def worker(args: argparse.Namespace) -> int:
             "histogram": counts,
             "candidates": {
                 candidate["key"]: {
-                    "task_range_pairs": candidate["task_range_pairs"],
+                    "task_worker_window_pairs_bytes": candidate["task_worker_window_pairs_bytes"],
                     "shape": candidate["shape"],
                     "predicted_ns": candidate["predicted_ns"],
                     "samples_ns": samples[candidate["key"]],
@@ -438,7 +443,10 @@ def run_pair(args: argparse.Namespace, mode: str) -> dict:
             row = {
                 "key": key,
                 "rank_plans": [
-                    {"task_range_pairs": entry["task_range_pairs"], "shape": entry["shape"]}
+                    {
+                        "task_worker_window_pairs_bytes": entry["task_worker_window_pairs_bytes"],
+                        "shape": entry["shape"],
+                    }
                     for entry in entries
                 ],
                 "predicted_ns": max(entry["predicted_ns"] for entry in entries),
@@ -478,7 +486,7 @@ def print_summary(result: dict) -> None:
         selected = case["selected"]
         best = case["best_fixed"]
         plans = "/".join(
-            f"R{tuple(map(tuple, plan['task_range_pairs']))}:{tuple(plan['shape'])}"
+            f"W{tuple(map(tuple, plan['task_worker_window_pairs_bytes']))}:{tuple(plan['shape'])}"
             for plan in selected["rank_plans"]
         )
         print(

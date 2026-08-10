@@ -54,7 +54,7 @@ KernelFn get_bulk_m12_gemm_f32_kernel(std::string* error);
 KernelFn get_probe_kernel(int rows, ProbeMode mode, std::string* error);
 // Exact-M kernel with an operation-specific streaming hint ahead of each cold
 // B cache-line load. The caller is responsible for using it only on the first
-// M panel of a weight range; later panels should use get_kernel().
+// M panel of a worker-owned N stripe; later panels should use get_kernel().
 KernelFn get_first_panel_prefetch_kernel(Operation operation, int rows, int degree, std::string* error);
 // The bulk kernel consumes a positive multiple of 12 rows from params->m. It
 // preserves the exact-M kernel ABI but advances packed A and output state inside

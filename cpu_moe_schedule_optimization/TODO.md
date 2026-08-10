@@ -12,38 +12,37 @@ priority order is:
 
 Overall conclusion: the ARM main path is now substantially complete. SVE JIT
 exact-M kernels, the double-buffered K-loop, direct FP32 route stores, weighted
-merge, the dynamic short-expert pool, the native cold planner, and stage-window
-cost modeling have all landed. The next phase should not accumulate isolated
+merge, the dynamic short-expert pool, the native cold planner, and stage-aware
+cost modeling have all landed. The current runtime has since collapsed that
+model to full-N stages with width-derived owner stripes. The next phase should not accumulate isolated
 micro-optimizations. It should close the remaining high-value variables first,
 then refresh the calibration data and cost model once and validate them as a
 coherent system.
 
-The boolean-to-range migration is intentionally staged so each ABI boundary is
-independently bisectable:
+The weight-split removal is complete across the production stack:
 
-- [x] Unify the former boolean W13 endpoints as explicit `R=1/R=2` geometry
-  candidates.
-- [x] Carry exact per-task W13/W2 range counts through Plan V2, native W13/W2,
-  and W2 owner-scatter.
-- [x] Remove operator-wide ranges from empirical profile/query and plan-cache
-  identity; keep the measured pair only as calibration provenance.
-- [x] Remove public split flags, environment controls, byte-window runtime
-  encodings, and legacy native fallback branches.
-- [x] Migrate calibration, benchmark, timeline, manifest, and schema callers to
-  exact positive ranges; retain old profile filenames only as provenance.
-- [x] Delete the global `(1,1)/(2,1)` profile variants, joint range/shape
-  planner, plan-level operator options, and paired active calibration files.
-- [ ] Refresh both ARM machines' range-native calibration and full planner/E2E
-  validation before treating the migration as closed.
+- [x] Remove global and per-task W13/W2 ranges, byte windows, split flags,
+  environment controls, Plan V2 tensors, and native fallback branches.
+- [x] Make W13/W2 execute one full-N stage and derive the tile-aligned owner
+  stripe only from `(K, N, backend_n_tile, actual_task_threads)`.
+- [x] Remove stage-window policy/search/cache identity and reject non-full-N
+  schema-v2 profiles.
+- [x] Migrate calibration generators, benchmark defaults, timeline/schema docs,
+  empirical/analytic models, and the native cold planner to full-N geometry.
+- [ ] Refresh both ARM machines' full-N calibration and full planner/E2E
+  validation before treating the migration as closed. The retired 192-core
+  TP4/F512 `(1,1)` and `(2,1)` tables remain available in Git/results as the
+  2026-08-09 comparison; each machine/domain now needs one canonical full-N
+  calibration plus route/width holdout. The thin analytical calibration still
+  reaches 10.79% maximum ranking regret at the M=24/48 crossover.
 
 1. Replace the AmazonECS8Cores transferred packed-B retention prior with a
    machine-local multi-team retention/refill probe and add topology-aware LLC
    service. Its cache topology and L1-hot/L2/LLC/DRAM service curves are now
    measured locally; only this retention term remains non-local.
-2. Repeat unseen routes, widths above 8T, mixed distributions, explicit
-   W13 `R=1/R=2` endpoints, and per-stage range validation. The analytical
-   M=216 and long-route 1T/2T stage-window errors are closed on the original
-   holdout grid: clean 192C maximum regret fell from 11.32% to 3.38%.
+2. Repeat unseen routes, widths above 8T, mixed distributions, and full-stage
+   owner-stripe validation. The old analytical stage-window holdout is
+   historical and cannot validate the new geometry.
 3. Fix cross-rank lifetime switching for the remaining EP absolute-time error.
 4. Add measured gather/pack, route merge, communication, and distributed TP/EP
    terms after the compute model passes its gates.
@@ -60,7 +59,7 @@ independently bisectable:
 
 - [x] Key `T_iso` and contention data by the complete calibration domain:
   sharded F, kernel identity, NUMA topology, and concurrent-rank count; retain
-  measured W13/W2 ranges only as table provenance.
+  require `full_n_team_stripes` and reject old split measurements.
 - [x] Use exact measured shape data by default instead of collapsing all shapes
   with the same active-expert count into one derate.
 - [x] Preserve once-per-call cost with authoritative full-call anchors rather
@@ -68,15 +67,14 @@ independently bisectable:
 - [x] Make route lookup M12-aware, including the M1/M2/M4/M8 tail kernels.
 - [x] Reject incompatible, ambiguous, or grid-mismatched profiles.
 
-## 3. Shape planner and per-task stage policy
+## 3. Shape planner and full-stage geometry
 
-- [x] Search `core_shape` only, then deterministically resolve each task's stage
-  ranges from `(routes, actual_task_threads)` before scoring and lowering.
+- [x] Search `core_shape` only; derive each stage's owner stripe from the task's
+  actual width before scoring and lowering.
 - [x] Use packed working-set bytes to prune candidates, while retaining measured
   latency as the objective.
-- [x] Return exact W13/W2 ranges as explicit plan fields with no process-global
-  geometry control.
-- [x] Add explicit physical CPU sets, a calibration/policy-aware cache key, full
+- [x] Remove W13/W2 geometry fields from Plan V2; full-N is invariant.
+- [x] Add explicit physical CPU sets, a calibration-aware cache key, full
   bucketed routing signatures, and confidence-aware tie breaking.
 
 ## 4. TP/EP layer evaluator
@@ -90,7 +88,7 @@ independently bisectable:
 
 ## 5. Stage-aware working-set model
 
-- [x] Add W13 chunk and W2 phases to the event simulation if exact-policy tables
+- [x] Add full W13 and W2 phases to the event simulation if exact-profile tables
   do not generalize adequately across F or unseen shapes.
 - [x] Derive contention from the sum of active phase working sets rather than
   only the number of active expert tasks.
@@ -102,7 +100,7 @@ independently bisectable:
 - [x] Separate logical GEMM work, exact SVE kernel demand, and machine response.
 - [x] Replace route/thread latency lookup with cache-capacity formulas and
   route-independent matrix/L1/L2/LLC/DRAM service curves.
-- [x] Split each W13/W2 range into zero-demand setup, first-panel cold-B, and
+- [x] Split each full W13/W2 stage into zero-demand setup, first-panel cold-B, and
   remaining-panel steady-B phases; preserve physical demand exactly.
 - [x] Derive contention from per-resource offered load and calibrated service
   capacity using only threads that actually request that resource.
@@ -130,17 +128,12 @@ independently bisectable:
   L1-hot/L2/LLC/DRAM service curves on AmazonECS8Cores. The runtime uses
   `backend_n_tile=16`; the profile marks its current 1/8-L2 packed-B retention
   term as a transferred prior rather than claiming a local measurement.
-- [x] Generate deterministic W13/W2 stage windows directly from the analytical
-  cache/service model without adding a planner variable, and run independent
-  route/width holdout on AmazonC5192Cores NUMA0 and AmazonECS8Cores. The
-  analytical backend now uses this policy automatically. The physical
-  A-residency/B-turnover correction passes the clean 192-core stage-window gate
-  at 3.38% maximum regret; empirical production remains unchanged until the
-  broader full-model gates pass.
+- [x] Retire deterministic W13/W2 stage-window generation after the full-N ABI
+  migration. Its 3.38% holdout remains historical evidence only.
 - [ ] Calibrate multi-team packed-B retention/refill and below-NUMA LLC topology
   from independent probes; do not add a task-pair slowdown table.
-- [ ] Validate unseen routes, widths, mixed distributions, W13 `R=1/R=2`, and
-  additional stage-range policies against the acceptance gates in
+- [ ] Validate unseen routes, widths, mixed distributions, and full-stage
+  owner-stripe behavior against the acceptance gates in
   `cost_model/ANALYTIC_MODEL.md`.
 - [ ] Switch the production default only after both machines pass; retain the
   empirical backend as an explicit fallback and regression oracle.
@@ -401,18 +394,9 @@ claims must include both long-route throughput and short-route latency.
   indices). Let a native interval planner consume the same metadata and avoid
   Python schedule-tensor materialization, with special attention to decode and
   many-layer control overhead.
-- [x] Promote the operator-wide packed-B range pair into planner policy identity
-  and schema-v2. Jointly search measured `(R13, R2, core_shape)` variants and
-  forward the selected exact pair to the async kernel.
-- [x] Extend Plan V2 with independent per-task W13 and W2 exact ranges and
-  add a named deterministic post-plan policy hook. Unsupported route/width
-  combinations retain the selected operator-wide pair, so this does not
-  enlarge the planner search space.
-- [ ] Regenerate isolated/contention calibration for independently selected
-  W13/W2 range pairs before admitting those combinations to cost-model scoring or
-  expanding the default beyond the exact dual-NUMA AmazonC5192Cores
-  TP4/F512 profile. The measured profile-bound rule is a deterministic
-  runtime exception, not a scored candidate.
+- [x] Retire the former operator-wide and per-task range-policy experiments.
+  Their implementation and active calibration files now live only in Git
+  history; production uses full-N stages and width-derived owner stripes.
 - [ ] Replace general async task-list polling with a lane-chain executor for the
   current disjoint interval plans, while retaining the general DAG path for plans
   with genuinely overlapping intervals. Measure dispatch and barrier overhead on

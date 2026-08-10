@@ -49,8 +49,6 @@ from profile_contention_async import (
     parse_int_list,
     summarize_times,
 )
-from weight_window import stage_weight_range_geometry, stage_weight_window_geometry
-
 from fused_cpp.moe import (  # noqa: E402
     fused_moe_bf16_tiled_async,
     prepare_fused_moe_bf16_tiled_weights,
@@ -92,8 +90,6 @@ def build_run(
     cpu_ids: list[int],
     physical_cores: list[int],
     num_profile_experts: int,
-    w13_ranges: int,
-    w2_ranges: int,
     generator: torch.Generator,
     std: float,
 ):
@@ -173,8 +169,6 @@ def build_run(
             activation="silu",
             global_num_experts=num_profile_experts,
             skip_weighted=True,
-            w13_ranges=w13_ranges,
-            w2_ranges=w2_ranges,
             out=output,
         )
 
@@ -224,24 +218,6 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--cpu-ids", default=None, help="physical CPUs, e.g. 0-95")
     parser.add_argument("--llc-bytes", type=int, default=None)
-    parser.add_argument("--w13-ranges", type=int, default=2)
-    parser.add_argument("--w2-ranges", type=int, default=1)
-    parser.add_argument(
-        "--small-window-sweep",
-        default=None,
-        help=(
-            "packed-B window targets in MiB for the memory-bound class (0 = baseline ranges). "
-            "When given, only the small-only matrix is measured."
-        ),
-    )
-    parser.add_argument(
-        "--small-w2-window-sweep",
-        default=None,
-        help=(
-            "optional W2 window targets in MiB, crossed with --small-window-sweep (which then means W13). "
-            "0 is not allowed here because each stage target must be explicit."
-        ),
-    )
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--runs", type=int, default=11)
     parser.add_argument("--seed", type=int, default=0)
@@ -266,24 +242,8 @@ def main() -> int:
     small_threads = int(args.small_threads)
     if small_threads <= 0 or total_cores % small_threads:
         raise ValueError(f"--small-threads must be a positive divisor of {total_cores}")
-    window_sweep = None
-    if args.small_window_sweep:
-        window_sweep = [float(item) for item in args.small_window_sweep.split(",") if item.strip()]
-        if not window_sweep or any(value < 0 for value in window_sweep):
-            raise ValueError("--small-window-sweep must contain non-negative MiB values")
-    w2_window_sweep = None
-    if args.small_w2_window_sweep:
-        if window_sweep is None:
-            raise ValueError("--small-w2-window-sweep requires --small-window-sweep for the W13 axis")
-        w2_window_sweep = [float(item) for item in args.small_w2_window_sweep.split(",") if item.strip()]
-        if not w2_window_sweep or any(value <= 0 for value in w2_window_sweep):
-            raise ValueError("--small-w2-window-sweep must contain positive MiB values")
-        if any(value <= 0 for value in window_sweep):
-            raise ValueError("the W13 axis must be positive when W2 is swept separately")
     if any(lanes * small_threads > total_cores for lanes in lane_sweep):
         raise ValueError(f"--small-lane-sweep values must not exceed {total_cores // small_threads}")
-    if min(args.w13_ranges, args.w2_ranges) <= 0:
-        raise ValueError("--w13-ranges and --w2-ranges must be positive")
 
     big_experts = list(range(args.big_experts))
     small_experts = list(range(args.big_experts, args.big_experts + args.small_experts))
@@ -300,19 +260,15 @@ def main() -> int:
     w13_bytes = packed.w13[0].numel() * packed.w13[0].element_size() // args.num_experts
     w2_bytes = packed.w2[0].numel() * packed.w2[0].element_size() // args.num_experts
     expert_weight_bytes = w13_bytes + w2_bytes
-    w13_base = stage_weight_range_geometry(
-        k=args.hidden_size,
-        n=2 * args.ffn_hidden_size,
-        n_tile=int(packed.backend_n_tile),
-        ranges=args.w13_ranges,
-    )
-    w2_base = stage_weight_range_geometry(
-        k=args.ffn_hidden_size,
-        n=args.hidden_size,
-        n_tile=int(packed.backend_n_tile),
-        ranges=args.w2_ranges,
-    )
-    stage_bytes = max(w13_base.max_range_bytes, w2_base.max_range_bytes)
+    stage_bytes = max(w13_bytes, w2_bytes)
+    n_tile = int(packed.backend_n_tile)
+    w13_tile_bytes = args.hidden_size * n_tile * 2
+    w2_tile_bytes = args.ffn_hidden_size * n_tile * 2
+
+    def owner_window(stage_bytes: int, tile_bytes: int, threads: int) -> int:
+        stage_tiles = stage_bytes // tile_bytes
+        return ((stage_tiles + threads - 1) // threads) * tile_bytes
+
     llc_bytes = args.llc_bytes or detect_llc_bytes(cpu_ids[0])
     sync_client = SyncClient(0, 0)
 
@@ -325,27 +281,6 @@ def main() -> int:
         "generator": generator,
         "std": args.std,
     }
-
-    def ranges_for_targets(w13_target_bytes: int, w2_target_bytes: int) -> tuple[int, int]:
-        if w13_target_bytes == 0 and w2_target_bytes == 0:
-            return args.w13_ranges, args.w2_ranges
-        if min(w13_target_bytes, w2_target_bytes) <= 0:
-            raise ValueError("W13 and W2 target bytes must both be positive or both use the baseline")
-        w13 = stage_weight_window_geometry(
-            k=args.hidden_size,
-            n=2 * args.ffn_hidden_size,
-            n_tile=int(packed.backend_n_tile),
-            target_bytes=w13_target_bytes,
-            fallback_ranges=args.w13_ranges,
-        )
-        w2 = stage_weight_window_geometry(
-            k=args.ffn_hidden_size,
-            n=args.hidden_size,
-            n_tile=int(packed.backend_n_tile),
-            target_bytes=w2_target_bytes,
-            fallback_ranges=args.w2_ranges,
-        )
-        return w13.ranges, w2.ranges
 
     def write_payload(entries: list[dict]) -> None:
         payload = {
@@ -363,8 +298,7 @@ def main() -> int:
                 "backend": "sve" if int(packed.gemm_backend) == 1 else "neon",
                 "gemm_backend": int(packed.gemm_backend),
                 "backend_n_tile": int(packed.backend_n_tile),
-                "w13_window_ranges": args.w13_ranges,
-                "w2_window_ranges": args.w2_ranges,
+                "stage_geometry": "full_n_team_stripes",
                 "hugetlbfs_path": os.environ.get("FUSED_CPP_MOE_HUGETLBFS_PATH", ""),
                 **kernel_metadata(),
             },
@@ -392,8 +326,6 @@ def main() -> int:
                 "big_core_splits": splits,
                 "small_lane_sweep": lane_sweep,
                 "mixed_small_lanes": mixed_lanes,
-                "small_window_sweep_mib": window_sweep,
-                "small_w2_window_sweep_mib": w2_window_sweep,
                 "warmup": args.warmup,
                 "runs": args.runs,
                 "timer": "perf_counter_ns",
@@ -410,15 +342,10 @@ def main() -> int:
         lanes: list[Lane],
         physical_cores: list[int],
         extra: dict,
-        stage_ranges: tuple[int, int] | None = None,
-        requested_windows: tuple[int, int] = (0, 0),
     ) -> dict:
-        selected_ranges = stage_ranges or (args.w13_ranges, args.w2_ranges)
         run, meta = build_run(
             lanes=lanes,
             physical_cores=physical_cores,
-            w13_ranges=selected_ranges[0],
-            w2_ranges=selected_ranges[1],
             **common,
         )
         samples = measure(run, warmup=args.warmup, runs=args.runs, sync_client=sync_client)
@@ -429,10 +356,6 @@ def main() -> int:
             "mode": label,
             **extra,
             **{key: value for key, value in meta.items() if key != "task_routes"},
-            "w13_window_ranges": selected_ranges[0],
-            "w2_window_ranges": selected_ranges[1],
-            "requested_w13_window_bytes": requested_windows[0],
-            "requested_w2_window_bytes": requested_windows[1],
             "median_ns": median_ns,
             "p10_ns": timing["p10_ns"],
             "p90_ns": timing["p90_ns"],
@@ -471,92 +394,31 @@ def main() -> int:
     entries: list[dict] = []
     small_only: dict[int, dict] = {}
 
-    def measure_small_only(
-        lane_count: int,
-        window_bytes: int = 0,
-        w2_window_bytes: int | None = None,
-    ) -> dict:
+    def measure_small_only(lane_count: int) -> dict:
         """Small experts alone on the same core suffix that mixed mode uses."""
-        key = (lane_count, window_bytes, w2_window_bytes)
+        key = lane_count
         if key not in small_only:
             cores_used = lane_count * small_threads
             lanes = small_lanes(lane_count, small_experts, 0, threads=small_threads)
             cores = list(range(total_cores - cores_used, total_cores))
-            per_thread = window_bytes / small_threads / 2**20 if window_bytes else None
-            if w2_window_bytes is None:
-                window_label = "baseline" if window_bytes == 0 else f"{window_bytes / 2**20:g}MiB"
-                w2_per_thread = per_thread
-                requested = (window_bytes, window_bytes)
-            else:
-                window_label = f"{window_bytes / 2**20:g}/{w2_window_bytes / 2**20:g}MiB"
-                w2_per_thread = w2_window_bytes / small_threads / 2**20
-                requested = (window_bytes, w2_window_bytes)
-            selected_ranges = ranges_for_targets(*requested)
             entry = timed(
                 "small_only",
                 lanes,
                 cores,
                 {
-                    "label": f"{lane_count}x{small_threads}T w={window_label}",
+                    "label": f"{lane_count}x{small_threads}T",
                     "small_lanes": lane_count,
                     "small_threads": small_threads,
                     "big_cores": 0,
-                    "window_per_thread_mib": per_thread,
-                    "w2_window_per_thread_mib": w2_per_thread,
+                    "w13_worker_window_bytes": owner_window(w13_bytes, w13_tile_bytes, small_threads),
+                    "w2_worker_window_bytes": owner_window(w2_bytes, w2_tile_bytes, small_threads),
                 },
-                stage_ranges=selected_ranges,
-                requested_windows=requested,
             )
             small_only[key] = entry
             entries.append(entry)
         return small_only[key]
 
     print("--- small experts alone (packed-B bandwidth curve) ---")
-    if w2_window_sweep is not None:
-        assert window_sweep is not None
-        for window_mib in window_sweep:
-            for w2_mib in w2_window_sweep:
-                for lane_count in lane_sweep:
-                    measure_small_only(lane_count, int(window_mib * 2**20), int(w2_mib * 2**20))
-        print("\n--- summary: useful packed-B bandwidth vs per-thread (W13, W2) window ---")
-        best: dict[int, dict] = {}
-        for entry in entries:
-            lanes_used = entry["small_lanes"]
-            if entry["weight_gbps"] > best.get(lanes_used, {"weight_gbps": 0.0})["weight_gbps"]:
-                best[lanes_used] = entry
-            print(
-                f"{entry['label']:<30} "
-                f"w13={entry['window_per_thread_mib']:>8.4g} w2={entry['w2_window_per_thread_mib']:>8.4g} MiB/thread  "
-                f"wall={entry['median_ns'] / 1e6:8.3f} ms  "
-                f"{entry['weight_gbps']:7.1f} GB/s  {entry['tflops']:7.3f} TFLOP/s"
-            )
-        print("\n--- best per-thread pair at each lane count ---")
-        for lanes_used in sorted(best):
-            entry = best[lanes_used]
-            print(
-                f"{lanes_used:>3}x{small_threads}T  "
-                f"w13={entry['window_per_thread_mib']:g} w2={entry['w2_window_per_thread_mib']:g} MiB/thread  "
-                f"{entry['weight_gbps']:7.1f} GB/s"
-            )
-        write_payload(entries)
-        sync_client.close()
-        return
-
-    if window_sweep is not None:
-        for window_mib in window_sweep:
-            for lane_count in lane_sweep:
-                measure_small_only(lane_count, int(window_mib * 2**20))
-        print("\n--- summary: useful packed-B bandwidth vs per-thread window ---")
-        for entry in entries:
-            per_thread = entry["window_per_thread_mib"]
-            print(
-                f"{entry['label']:<26} per-thread={'baseline' if per_thread is None else f'{per_thread:g}':>10} MiB  "
-                f"wall={entry['median_ns'] / 1e6:8.3f} ms  "
-                f"{entry['weight_gbps']:7.1f} GB/s  {entry['tflops']:7.3f} TFLOP/s"
-            )
-        write_payload(entries)
-        sync_client.close()
-        return 0
     for lane_count in lane_sweep:
         measure_small_only(lane_count)
 

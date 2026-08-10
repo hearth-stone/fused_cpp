@@ -42,22 +42,14 @@ def _owned_n_columns(
     n_tile: int,
     threads: int,
     local_tid: int,
-    ranges: int,
 ) -> int:
-    if min(n, n_tile, threads, ranges) <= 0:
-        raise ValueError("GEMM dimensions, N tile, thread count, and ranges must be positive")
+    if min(n, n_tile, threads) <= 0:
+        raise ValueError("GEMM dimensions, N tile, and thread count must be positive")
     if n % n_tile != 0:
         raise ValueError(f"GEMM N={n} is not aligned to N tile {n_tile}")
 
     total_tiles = n // n_tile
-    if ranges > total_tiles:
-        raise ValueError(f"ranges must not exceed the {total_tiles} N tiles")
-
-    owned_tiles = 0
-    for range_index in range(ranges):
-        _, window_tiles = _split_evenly(total_tiles, ranges, range_index)
-        _, local_tiles = _split_evenly(window_tiles, threads, local_tid)
-        owned_tiles += local_tiles
+    _, owned_tiles = _split_evenly(total_tiles, threads, local_tid)
     return owned_tiles * n_tile
 
 
@@ -107,7 +99,6 @@ def annotate_gemm_throughput(
             else:
                 k = intermediate_size
                 n = hidden_size
-            ranges = int(task[f"{kind}_ranges"])
             threads = observed_team_sizes[task_id, kind]
             local_tid = int(segment["local_tid"])
             n_columns = _owned_n_columns(
@@ -115,7 +106,6 @@ def annotate_gemm_throughput(
                 n_tile=n_tile,
                 threads=threads,
                 local_tid=local_tid,
-                ranges=ranges,
             )
             rows = int(task["routes"])
             logical_flops = 2 * rows * k * n_columns

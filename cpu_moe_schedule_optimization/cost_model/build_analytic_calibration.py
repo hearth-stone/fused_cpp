@@ -281,7 +281,6 @@ def build_calibration(
             "expert_fixed_ns": 0.0,
             "route_ns": 0.0,
             "stage_fixed_ns": 0.0,
-            "range_fixed_ns": 0.0,
         },
         "planner": {"supported_widths": widths},
         "uncertainty": {"relative": relative_uncertainty},

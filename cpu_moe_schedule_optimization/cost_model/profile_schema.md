@@ -4,16 +4,15 @@
 
 Schema v2 is the active format for SVE fused-MoE scheduling profiles. A profile
 is valid only for the exact implementation, sharded expert shape, and NUMA/rank
-execution context recorded in the file. The recorded
-`(w13_window_ranges, w2_window_ranges)` pair is the geometry used to collect
-the calibration; it is measurement provenance, not a planner policy identity.
+execution context recorded in the file. The only active SVE geometry is
+`full_n_team_stripes`: W13 and W2 each traverse their complete packed N domain
+once, and team width partitions N tiles among workers.
 
-Historical schema-v2 files may still record `w13_split`, `w13_split_chunks`, and
-`weight_window_bytes`. The reader ignores those fields; they are provenance,
-not active identity or a geometry fallback. Every schema-v2 file must carry
-positive `w13_window_ranges` and `w2_window_ranges`. Only one active calibration
-may exist for a complete domain identity. Changing the measured pair does not
-create a second planner variant; a second file in the same domain is rejected.
+Historical schema-v2 files may record `w13_split`, `w13_split_chunks`,
+`weight_window_bytes`, `w13_window_ranges`, or `w2_window_ranges`. They are not
+active calibration inputs. A non-unit legacy range pair is rejected because its
+timings describe a different loop order. Only one full-N calibration may exist
+for a complete domain identity.
 
 ```json
 {
@@ -35,8 +34,7 @@ create a second planner variant; a second file in the same domain is rejected.
     "parallel_axis": "N",
     "sve_implementation": "jit",
     "m_tail_policy": "xbyak_exact_m",
-    "w13_window_ranges": 2,
-    "w2_window_ranges": 1,
+    "stage_geometry": "full_n_team_stripes",
     "git_available": true,
     "git_commit": "...",
     "git_worktree_dirty": true,
@@ -61,11 +59,9 @@ create a second planner variant; a second file in the same domain is rejected.
   "working_set": {
     "w13_packed_bytes_per_expert": 16777216,
     "w2_packed_bytes_per_expert": 8388608,
-    "w13_chunk_bytes_per_expert": 8388608,
-    "w2_chunk_bytes_per_expert": 8388608,
-    "w13_window_bytes_per_expert": 8388608,
-    "w2_window_bytes_per_expert": 8388608,
-    "max_weight_stage_bytes_per_expert": 8388608
+    "w13_stage_bytes_per_expert": 16777216,
+    "w2_stage_bytes_per_expert": 8388608,
+    "max_weight_stage_bytes_per_expert": 16777216
   },
   "measurement": {
     "rank_synchronization": "socket_barrier_per_call",
@@ -113,15 +109,13 @@ Required v2 identity fields are:
 
 - hardware: profiled CPU sets, NUMA nodes, LLC bytes, cores per rank, and
   concurrent rank count;
-- kernel identity: backend, SVE implementation, M-tail policy, N-split policy,
-  source hash, and extension binary hash; measured W13/W2 range counts and
-  legacy split/requested-byte fields are provenance only;
+- kernel identity: backend, SVE implementation, M-tail policy,
+  `full_n_team_stripes`, N-split policy, source hash, and extension binary hash;
 - distributed shape: TP/EP mode and degree, global/local expert counts, H, and
   sharded F;
 - calibration scope: the full local expert count, activation, dtype, SVE N tile,
   NUMA nodes, and exact physical CPU sets;
-- working set: actual packed W13/W2 bytes per expert and both maximum range
-  sizes;
+- working set: actual full packed W13/W2 stage bytes per expert;
 - measurement: whether ranks were synchronized and how per-rank samples were
   reduced to global wall time.
 
@@ -150,8 +144,8 @@ Catalog queries for the production JIT path must specify both fields; a mixed
 catalog intentionally rejects an implementation-unspecified ambiguous query.
 Static and JIT profiles remain distinct calibration domains.
 
-`ProfileCatalog` has no range-variant API. It rejects two records with the same
-domain identity regardless of their measured range pair.
+`ProfileCatalog` has no range/window variant API. It rejects non-full-N records
+and two records with the same domain identity.
 
 The TP/EP evaluator's `--sve-implementation auto` lookup first requests one
 compatible `jit/xbyak_exact_m` calibration. It falls back to
@@ -199,10 +193,9 @@ as a validation baseline.
 
 The complete `full_call_*` curve is the authoritative calibration for a uniform
 full-rank workload. `makespan_ns` remains a normalized diagnostic; it must not
-be multiplied by an arbitrary number of waves. For the calibration fallback,
-the stage-aware simulator emits the measured number of W13/W2 phases. For Plan
-V2 candidates it instead uses each task's resolved `task_w13_ranges` and
-`task_w2_ranges`.
+be multiplied by an arbitrary number of waves. The stage-aware simulator emits
+one full W13 phase and one full W2 phase per task. Team width determines each
+phase's tile-aligned owner stripe.
 
 `bounded_tail_repartition` is an optional, placement-aware full-call anchor for
 the terminal repartitions supported by the production planner. Unlike a
@@ -213,7 +206,7 @@ experts is divided into that many contiguous M/route slices, placed in grouped
 expert order; such candidates require an exact anchor and are never estimated
 by the generic DAG model. The model consumes an entry only when all active
 experts have exactly the recorded route count, the strict root shape, tail
-width, route-slice count, and stage-window policy match the measured geometry.
+width, route-slice count, and full-N kernel geometry match the measurement.
 Route interpolation and extrapolation are intentionally forbidden. Unmatched
 unsliced workloads continue through the analytical stage/DAG simulator;
 unmatched sliced candidates are pruned.
@@ -255,9 +248,9 @@ residuals separately before using the roofline prediction path.
 - `machine_response`: the measured-profile identity and response formula.
 
 The legacy `kernel` section remains for report compatibility and records the
-actual SVE N tile and W13 range count, exact M12/M8/M4/M2 BFMMLA and A/B load
-counts, logical/compute/packed/store tail rows, L1 traffic, and the current
-shared-cache traffic convention. Stage observations expose the following
+actual SVE N tile, exact M12/M8/M4/M2 BFMMLA and A/B load counts,
+logical/compute/packed/store tail rows, L1 traffic, and the current shared-cache
+traffic convention. Stage observations expose the following
 equivalent lower-bound views of one measured M12 panel slope:
 
 - required executed TFLOP/s and BFMMLA instruction/s;
@@ -270,23 +263,24 @@ time per panel/output and the identity-W13 to W2 ratio. These required rates are
 not independent ceilings. Active rollout requires separately measured BFMMLA,
 load/private/shared-cache, and epilogue service rates.
 
-### Exact-range owner-cache working-set shadow
+### Full-stage owner-cache working-set shadow
 
-`working_set_model.py` emits `stage_range_working_set_band_validation`. Its independent
+`working_set_model.py` emits `full_stage_working_set_band_validation`. Its independent
 calibration input is the CSV from `bench_weight_scan.cpp`; it is not a
 `contention_derate` profile and must not be loaded by `ContentionCostModel`.
 The serialized model records per-core private-cache bytes/ways, reserved ways,
 resident scan bandwidth saturation, the derived owner-cache budget, and the
 predicted expert/byte band. `profile_summary` and `holdout_summary` contain
 measured regret but are validation results, not active cost anchors. This path
-uses the profile's measured W13/W2 geometry and is currently gated to at least
-16 physical M12/tail panels.
+uses the profile's full W13/W2 stage sizes and is currently gated to at least 16
+physical M12/tail panels.
 
 New `profile_moe_stage_breakdown.py` output serializes a top-level `kernel`
-object with `backend_n_tile`, `parallel_axis`, `w13_window_ranges`,
-`w2_window_ranges`, and `w13_skip_silu`. Per-row `w13_parallel_axis` and
+object with `backend_n_tile`, `parallel_axis`,
+`stage_geometry=full_n_team_stripes`, and `w13_skip_silu`. Per-row
+`w13_parallel_axis` and
 `w2_parallel_axis` describe M/N team partitioning; they are independent of the
-sequential stage measurement geometry.
+full-stage geometry.
 
 TP2 and EP2 reproduction commands for the 64-core/two-NUMA target are:
 
@@ -297,7 +291,7 @@ PYTHONPATH=src .venv/bin/python \
   --hidden-size 4096 --ffn-hidden-size 1024 \
   --global-experts 64 --local-experts 64 --measurement-experts 0 \
   --isolated-measurement-experts 8 \
-  --w13-ranges 2 --w2-ranges 1 --sve-implementation jit --warmup 5 --runs 20
+  --sve-implementation jit --warmup 5 --runs 20
 
 PYTHONPATH=src .venv/bin/python \
   cpu_moe_schedule_optimization/cost_model/profile_contention_async_dual_rank.py \
@@ -305,16 +299,15 @@ PYTHONPATH=src .venv/bin/python \
   --hidden-size 4096 --ffn-hidden-size 2048 \
   --global-experts 64 --local-experts 32 --measurement-experts 0 \
   --isolated-measurement-experts 8 \
-  --w13-ranges 2 --w2-ranges 1 --sve-implementation jit --warmup 5 --runs 20
+  --sve-implementation jit --warmup 5 --runs 20
 ```
 
 Defaults bind rank 0 to CPUs 0-31/NUMA0 and rank 1 to CPUs 32-63/NUMA1.
 
-Generate one canonical file per calibration domain. Alternate exact pairs and
-byte/MiB sweeps remain useful holdout inputs, but keep them outside the active
-profile catalog and quantize byte requests through native packed-tile geometry.
-Runtime profiles and the planner never carry a byte target or enumerate a
-second operator-wide range profile.
+Generate one canonical full-N file per calibration domain. Historical
+range/window sweeps remain research artifacts only; they are not valid runtime
+profiles. Runtime profiles and the planner carry no weight-range or byte-window
+control.
 
 ## Legacy schema v1
 

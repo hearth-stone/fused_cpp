@@ -1,8 +1,13 @@
-# Exact-Range Owner-Cache Working-Set Model
+# Historical Exact-Range Owner-Cache Working-Set Model
+
+> Retired by the v0.89 full-N migration. The measurements and commands below
+> describe the deleted `R13=2,R2=1` geometry and must not be used as current
+> calibration. The active `working_set_model.py` consumes one complete stage
+> (`W13=4HF`, `W2=2HF`) and requires a new matching full-stage scan.
 
 ## Scope
 
-This model covers the SVE exact `R13=2,R2=1` path with N-partitioned expert
+This historical model covers the SVE exact `R13=2,R2=1` path with N-partitioned expert
 teams. It is a shadow candidate filter and does not replace the active measured
 contention model. The validated regime is long M12 bulk (`physical_panels >=
 16`, currently routes >= 192).

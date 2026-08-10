@@ -247,8 +247,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ffn-hidden-size", type=int, default=512)
     parser.add_argument("--routes", default="2048")
     parser.add_argument("--threads", default="1,2,4,8")
-    parser.add_argument("--w13-ranges", type=int, default=2)
-    parser.add_argument("--w2-ranges", type=int, default=1)
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--runs", type=int, default=5)
     parser.add_argument("--seed", type=int, default=123)
@@ -282,8 +280,6 @@ def main() -> int:
         raise ValueError("hidden and FFN sizes must be positive")
     if args.warmup < 0 or args.runs <= 0:
         raise ValueError("warmup must be non-negative and runs positive")
-    if min(args.w13_ranges, args.w2_ranges) <= 0:
-        raise ValueError("stage range counts must be positive")
 
     routes_list = parse_int_list(args.routes)
     threads_list = parse_int_list(args.threads)
@@ -343,8 +339,6 @@ def main() -> int:
                     activation=args.activation,
                     global_num_experts=1,
                     skip_weighted=not args.weighted_merge,
-                    w13_ranges=args.w13_ranges,
-                    w2_ranges=args.w2_ranges,
                 )
 
             os.environ["FUSED_CPP_MOE_TRACE"] = "0"
@@ -400,8 +394,7 @@ def main() -> int:
         "kernel": {
             "backend_n_tile": packed.backend_n_tile,
             "parallel_axis": "N",
-            "w13_window_ranges": args.w13_ranges,
-            "w2_window_ranges": args.w2_ranges,
+            "stage_geometry": "full_n_team_stripes",
             "w13_skip_silu": env_enabled("FUSED_CPP_MOE_W13_SKIP_SILU"),
         },
         "shape": {

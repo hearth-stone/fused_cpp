@@ -38,7 +38,6 @@ from fused_cpp.moe import (  # noqa: E402
 )
 from interval_planner import IntervalPlanner  # noqa: E402
 from phase_model import ContentionCostModel  # noqa: E402
-from stage_window_policy import default_task_stage_window_policy  # noqa: E402
 
 
 def _parse_cpu_ids(value: str) -> tuple[int, ...]:
@@ -245,16 +244,10 @@ def main() -> int:
         raise ValueError("runtime benchmark requires a schema-v2 profile")
     if policy.cores_per_rank != num_cores or policy.local_experts != num_experts:
         raise ValueError("oracle report and profile core/expert geometry differ")
-    stage_policy = default_task_stage_window_policy(
-        policy,
-        num_cores=num_cores,
-        cpu_ids=args.cpu_ids,
-    )
     planner = IntervalPlanner(
         model,
         num_cores,
         cpu_ids=args.cpu_ids,
-        task_stage_window_policy=stage_policy,
         native_cold_planner=False,
     )
     experts = [(expert, count) for expert, count in enumerate(routes) if count > 0]

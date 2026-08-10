@@ -92,11 +92,13 @@ ssh AmazonECS8Cores 'cd /home/ubuntu/zhangxu/fused_cpp && . .venv/bin/activate &
 
 ## Benchmark Hygiene
 
-Fused MoE benchmark and analysis work must report the exact
-`w13_ranges`/`w2_ranges` geometry. Planner benchmarks use the ranges carried by
-the generated plan; direct kernel benchmarks default to `1/1` unless the
-experiment explicitly selects another positive range count. The retired
-split-W13 and byte-window environment controls must not be used.
+Production fused MoE benchmark and analysis work must report
+`stage_geometry=full_n_team_stripes`, the team width, backend N tile, full W13/W2
+stage bytes, and the derived maximum packed-B owner stripe per worker. The team
+width is the only production cache-window control. Weight-range, split-W13, and
+byte-window controls are retired and must not be used by production paths.
+Benchmarks that retain an explicit N-range loop as a historical baseline must
+label it experimental and must not emit production calibration profiles.
 
 For single-thread microbenchmarks, bind each process to one dedicated core with
 `taskset` and pin Python/native libraries to one thread:

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Measure exact-range packed-B working sets under several thread mappings."""
+"""Measure full-stage packed-B owner stripes under several thread mappings."""
 
 from __future__ import annotations
 
@@ -71,13 +71,13 @@ def parse_experiments(text: str) -> list[str]:
 
 
 def stage_bytes(hidden: int, intermediate: int) -> int:
-    """Return max(W13 range, W2 range) packed-B bytes for one expert."""
-    return 2 * hidden * intermediate
+    """Return the larger full packed-B stage (W13) for one expert."""
+    return 4 * hidden * intermediate
 
 
 def intermediate_for_exact_stage(hidden: int, requested_mib: float, n_tile: int) -> int:
     requested_bytes = round(requested_mib * MIB)
-    denominator = 2 * hidden
+    denominator = 4 * hidden
     if requested_bytes % denominator != 0:
         raise ValueError(f"{requested_mib} MiB is not exact for hidden={hidden}")
     intermediate = requested_bytes // denominator
@@ -87,13 +87,13 @@ def intermediate_for_exact_stage(hidden: int, requested_mib: float, n_tile: int)
 
 
 def intermediate_for_total_stage(hidden: int, total_mib: float, threads: int, n_tile: int) -> int:
-    bytes_per_tile_per_expert = 2 * hidden * n_tile
+    bytes_per_tile_per_expert = 4 * hidden * n_tile
     ideal_tiles = total_mib * MIB / (threads * bytes_per_tile_per_expert)
     return max(1, math.floor(ideal_tiles + 0.5)) * n_tile
 
 
 def max_nsplit_thread_stage_bytes(hidden: int, intermediate: int, threads: int, n_tile: int) -> int:
-    w13_tiles = intermediate // n_tile
+    w13_tiles = 2 * intermediate // n_tile
     w2_tiles = hidden // n_tile
     max_w13_tiles = (w13_tiles + threads - 1) // threads
     max_w2_tiles = (w2_tiles + threads - 1) // threads
@@ -119,7 +119,7 @@ def build_points(
         if "nsplit" in experiments:
             for requested_mib in nsplit_stage_mib:
                 intermediate = intermediate_for_exact_stage(hidden, requested_mib, n_tile)
-                max_threads = min(hidden // n_tile, intermediate // n_tile)
+                max_threads = min(hidden // n_tile, 2 * intermediate // n_tile)
                 for thread_count in threads:
                     if thread_count <= max_threads:
                         points.append(
@@ -262,7 +262,7 @@ def benchmark_command(
         "--threads-per-expert",
         str(point.threads_per_expert),
         "--w13-ranges",
-        "2",
+        "1",
         "--copies",
         str(copies),
         "--cpu-start",
@@ -455,7 +455,7 @@ def main() -> int:
 
     payload = {
         "schema_version": 1,
-        "kind": "stage_range_thread_weight_working_set",
+        "kind": "full_stage_thread_weight_working_set",
         "target": {
             "hostname": platform.node(),
             "machine": platform.machine(),
@@ -464,7 +464,7 @@ def main() -> int:
         },
         "kernel": {
             "entrypoint": "production_fused direct SVE M12 kernels",
-            "w13_ranges": 2,
+            "stage_geometry": "full_n_team_stripes",
             "parallel_axis": "N",
             "n_tile": n_tile,
             "binary": str(args.binary.resolve()),
@@ -484,7 +484,7 @@ def main() -> int:
             "runs": args.runs,
             "copies": copies,
             "weight_reuse": "one distinct packed-weight copy per warmup and timed invocation",
-            "working_set_definition": "active experts * max(W13 range bytes, W2 range bytes)",
+            "working_set_definition": "active experts * max(full W13 bytes, full W2 bytes)",
         },
         "rows": rows,
     }

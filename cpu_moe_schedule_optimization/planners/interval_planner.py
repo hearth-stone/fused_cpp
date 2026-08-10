@@ -13,7 +13,6 @@ from typing import Dict, List, Mapping, Protocol, Sequence, Tuple
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "cost_model"))
 from phase_model import ContentionCostModel  # noqa: E402
 from profile_catalog import ProfileCompatibilityError  # noqa: E402
-from stage_window_policy import TaskStageWindowPolicy  # noqa: E402
 
 
 _ASYNC_PLAN_VERSION = 2
@@ -67,9 +66,7 @@ class PlannerCostModel(Protocol):
 
     def task_stage_bytes(self, stage: str, routes: int, threads: int) -> int: ...
 
-    def task_stage_ranges(self, routes: int, threads: int) -> tuple[int, int]: ...
-
-    def stage_window_bytes_per_worker(self, stage: str, threads: int, routes: int | None = None) -> int: ...
+    def stage_bytes_per_worker(self, stage: str, threads: int, routes: int | None = None) -> int: ...
 
     def supports_shape(self, shape) -> bool: ...
 
@@ -153,23 +150,13 @@ class IntervalPlanner:
         shapes: Sequence[Sequence[int]] | None = None,
         native_cold_planner: bool | None = None,
         planner_threads: int | None = None,
-        task_stage_window_policy: TaskStageWindowPolicy | None = None,
         tail_repartition_widths: Sequence[int] | None = None,
         stage: str | None = None,
     ):
         if stage not in {None, "w13", "w2"}:
             raise ValueError(f"stage must be None, 'w13', or 'w2', got {stage!r}")
         self.stage = stage
-        self.task_stage_window_policy = task_stage_window_policy
-        if task_stage_window_policy is None:
-            self.model = model
-        else:
-            binder = getattr(model, "with_task_stage_window_policy", None)
-            if not callable(binder):
-                raise ProfileCompatibilityError(
-                    "task stage-window policy requires a cost model that can bind execution windows"
-                )
-            self.model = binder(task_stage_window_policy)
+        self.model = model
         self.num_cores = int(num_cores)
         model_widths = getattr(self.model, "supported_widths", None)
         self.widths = tuple(widths or model_widths or _default_widths(self.num_cores))
@@ -345,13 +332,11 @@ class IntervalPlanner:
 
     def _task_window_bytes_per_worker(self, routes: int, threads: int) -> int:
         if self.stage is not None:
-            resolver = getattr(self.model, "stage_window_bytes_per_worker", None)
+            resolver = getattr(self.model, "stage_bytes_per_worker", None)
             if callable(resolver):
                 return int(resolver(self.stage, threads, routes))
         resolver = self.model.window_bytes_per_worker
-        if self.task_stage_window_policy is not None:
-            return int(resolver(threads, routes))
-        return int(resolver(threads))
+        return int(resolver(threads, routes))
 
     def active_working_set_bytes(self, shape, tasks=None) -> int:
         if tasks is None:
@@ -373,7 +358,7 @@ class IntervalPlanner:
         if tasks is None:
             if self.stage is not None:
                 return tuple(
-                    self.model.stage_window_bytes_per_worker(self.stage, int(width)) for width in shape
+                    self.model.stage_bytes_per_worker(self.stage, int(width)) for width in shape
                 )
             return tuple(self.model.window_bytes_per_worker(int(width)) for width in shape)
         lane_windows: dict[tuple[int, int], int] = {}
@@ -932,9 +917,6 @@ class IntervalPlanner:
             "active_working_set_bytes": selected["active_working_set_bytes"],
             "resource_groups": selected["resource_groups"],
             "window_bytes_per_worker": tuple(selected["window_bytes_per_worker"]),
-            "task_stage_window_policy": (
-                self.task_stage_window_policy.name if self.task_stage_window_policy is not None else None
-            ),
             "early_merge": bridge["early_merge"],
             "policy": policy,
             "tasks": selected["tasks"],
@@ -1040,49 +1022,6 @@ class IntervalPlanner:
             tail_repartition_candidates=len(tail_repartition_candidates),
         )
 
-    def _task_stage_windows(
-        self,
-        tasks,
-        w13_threads: Sequence[int],
-        w2_threads: Sequence[int] | None = None,
-    ) -> tuple[list[int], list[int]]:
-        if self.task_stage_window_policy is None:
-            inherited = [-1] * len(tasks)
-            return inherited, list(inherited)
-        if w2_threads is None:
-            w2_threads = w13_threads
-        w13_windows: list[int] = []
-        w2_windows: list[int] = []
-        for values, w13_width, w2_width in zip(tasks, w13_threads, w2_threads, strict=True):
-            _, routes, _, _, _ = values
-            w13_bytes, _ = self.task_stage_window_policy.select(int(routes), int(w13_width))
-            _, w2_bytes = self.task_stage_window_policy.select(int(routes), int(w2_width))
-            if min(w13_bytes, w2_bytes) < -1:
-                raise ValueError("task stage-window policy must return -1 or non-negative byte counts")
-            w13_windows.append(int(w13_bytes))
-            w2_windows.append(int(w2_bytes))
-        return w13_windows, w2_windows
-
-    def _task_stage_ranges(
-        self,
-        tasks,
-        w13_threads: Sequence[int],
-        w2_threads: Sequence[int] | None = None,
-    ) -> tuple[list[int], list[int]]:
-        if w2_threads is None:
-            w2_threads = w13_threads
-        w13_ranges: list[int] = []
-        w2_ranges: list[int] = []
-        for values, w13_width, w2_width in zip(tasks, w13_threads, w2_threads, strict=True):
-            _, routes, _, _, _ = values
-            resolved_w13, _ = self.model.task_stage_ranges(int(routes), int(w13_width))
-            _, resolved_w2 = self.model.task_stage_ranges(int(routes), int(w2_width))
-            if min(resolved_w13, resolved_w2) <= 0:
-                raise ValueError("cost model must resolve positive per-task stage ranges")
-            w13_ranges.append(int(resolved_w13))
-            w2_ranges.append(int(resolved_w2))
-        return w13_ranges, w2_ranges
-
     def _early_merge_policy(self, tasks) -> bool | None:
         """Disable early merge only when the model predicts no overlap window."""
         if self.stage is not None:
@@ -1126,7 +1065,6 @@ class IntervalPlanner:
             flat_dependencies.extend(dependencies)
             dependency_offsets.append(len(flat_dependencies))
         task_threads = [threads for _, _, _, threads, _ in tasks]
-        task_w13_ranges, task_w2_ranges = self._task_stage_ranges(tasks, task_threads)
         num_tasks = len(tasks)
         expert_task_counts: dict[int, int] = {}
         expert_slice_rows: dict[int, int] = {}
@@ -1163,8 +1101,6 @@ class IntervalPlanner:
             "task_stage_ids": [_ASYNC_STAGE_EXPERT] * num_tasks,
             "task_resize_points": [_ASYNC_RESIZE_NONE] * num_tasks,
             "task_range_granularities": task_range_granularities,
-            "task_w13_ranges": task_w13_ranges,
-            "task_w2_ranges": task_w2_ranges,
             "task_release_ns": [0] * num_tasks,
             "task_resize_timeout_ns": [0] * num_tasks,
             "task_preferred_core_begins": [-1] * num_tasks,
@@ -1275,7 +1211,6 @@ class IntervalPlanner:
             timeouts.append(int(resize_timeout_ns))
             preferred_core_begins.append(int(cohort_begin))
 
-        w13_ranges, w2_ranges = self._task_stage_ranges(tasks, selected, preferred)
         bridge.update(
             {
                 "execution_mode": _ASYNC_EXECUTION_ELASTIC,
@@ -1286,8 +1221,6 @@ class IntervalPlanner:
                 "task_allowed_threads": allowed_widths,
                 "task_numa_nodes": task_numa_nodes,
                 "task_resize_points": resize_points,
-                "task_w13_ranges": w13_ranges,
-                "task_w2_ranges": w2_ranges,
                 "task_resize_timeout_ns": timeouts,
                 "task_preferred_core_begins": preferred_core_begins,
             }
@@ -1315,7 +1248,6 @@ class IntervalPlanner:
             dependency_offsets.append(len(flat_dependencies))
 
         task_threads = [pool_threads if pooled[task] else int(values[3]) for task, values in enumerate(tasks)]
-        task_w13_ranges, task_w2_ranges = self._task_stage_ranges(tasks, task_threads)
         num_tasks = len(tasks)
         return {
             "plan_version": _ASYNC_PLAN_VERSION,
@@ -1339,8 +1271,6 @@ class IntervalPlanner:
             "task_stage_ids": [_ASYNC_STAGE_EXPERT] * num_tasks,
             "task_resize_points": [_ASYNC_RESIZE_NONE] * num_tasks,
             "task_range_granularities": [_ASYNC_FULL_EXPERT_RANGE] * num_tasks,
-            "task_w13_ranges": task_w13_ranges,
-            "task_w2_ranges": task_w2_ranges,
             "task_release_ns": [0] * num_tasks,
             "task_resize_timeout_ns": [0] * num_tasks,
             "task_preferred_core_begins": [-1] * num_tasks,
@@ -1363,14 +1293,12 @@ class PlannedTwoStagePlanner:
         *,
         cpu_ids: Sequence[int] | None = None,
         shapes: Sequence[Sequence[int]] | None = None,
-        task_stage_window_policy: TaskStageWindowPolicy | None = None,
     ):
         common = {
             "widths": widths,
             "cpu_ids": cpu_ids,
             "shapes": shapes,
             "native_cold_planner": False,
-            "task_stage_window_policy": task_stage_window_policy,
         }
         self.model = model
         self.w13_planner = IntervalPlanner(model, num_cores, stage="w13", **common)

@@ -30,18 +30,14 @@
     "parallel_axis": "N",
     "sve_implementation": "jit",
     "m_tail_policy": "xbyak_exact_m",
-    "w13_split": true,
-    "w13_split_chunks": 2,
-    "weight_window_bytes": 0,
-    "w13_window_ranges": 2,
-    "w2_window_ranges": 1,
     "git_available": true,
     "git_commit": "46228bbfffffa8641283364f1f030a4917d19fe2",
     "git_worktree_dirty": true,
     "xbyak_aarch64_commit": "3f8c682b9c6ff562dc008c7d1b8307a683f05d20",
     "source_sha256": "b317ec9326870652e38c0c7d6e8ae51217466ffad2686b9292d37fb8fd39c9ad",
     "extension_path": "/home/ubuntu/zhangxu/fused_cpp/src/fused_cpp/_moe_C.cpython-312-aarch64-linux-gnu.so",
-    "extension_sha256": "9188710fe0fc1e3edfb44a859e61e67698a8251ed33226358ca33324518dd667"
+    "extension_sha256": "9188710fe0fc1e3edfb44a859e61e67698a8251ed33226358ca33324518dd667",
+    "stage_geometry": "full_n_team_stripes"
   },
   "parallelism": {
     "mode": "standalone",
@@ -69,12 +65,9 @@
     "w2_dense_bytes_per_expert": 4194304,
     "w13_packed_bytes_per_expert": 8388608,
     "w2_packed_bytes_per_expert": 4194304,
-    "weight_window_target_bytes": 0,
-    "w13_chunk_bytes_per_expert": 4194304,
-    "w2_chunk_bytes_per_expert": 4194304,
-    "w13_window_bytes_per_expert": 4194304,
-    "w2_window_bytes_per_expert": 4194304,
-    "max_weight_stage_bytes_per_expert": 4194304
+    "max_weight_stage_bytes_per_expert": 8388608,
+    "w13_stage_bytes_per_expert": 8388608,
+    "w2_stage_bytes_per_expert": 4194304
   },
   "measurement": {
     "path": "fused_moe_bf16_tiled_async",
@@ -182,11 +175,11 @@
     {
       "routes": 1,
       "threads": 1,
-      "median_ns": 435330,
-      "p10_ns": 425206,
-      "p90_ns": 444733,
-      "min_ns": 422483,
-      "mean_ns": 434787,
+      "median_ns": 437381,
+      "p10_ns": 428144,
+      "p90_ns": 444411,
+      "min_ns": 423858,
+      "mean_ns": 437174,
       "num_iters": 20,
       "measurement_experts": 8,
       "measurement_tasks": 8,
@@ -195,16 +188,16 @@
       "lane_task_counts": [
         8
       ],
-      "full_call_median_ns": 3482638
+      "full_call_median_ns": 3499051
     },
     {
       "routes": 1,
       "threads": 2,
-      "median_ns": 240487,
-      "p10_ns": 234784,
-      "p90_ns": 245172,
-      "min_ns": 231989,
-      "mean_ns": 240533,
+      "median_ns": 241126,
+      "p10_ns": 235187,
+      "p90_ns": 247310,
+      "min_ns": 233135,
+      "mean_ns": 241247,
       "num_iters": 20,
       "measurement_experts": 8,
       "measurement_tasks": 8,
@@ -213,16 +206,16 @@
       "lane_task_counts": [
         8
       ],
-      "full_call_median_ns": 1923902
+      "full_call_median_ns": 1929014
     },
     {
       "routes": 1,
       "threads": 4,
-      "median_ns": 155495,
-      "p10_ns": 151329,
-      "p90_ns": 160078,
-      "min_ns": 150162,
-      "mean_ns": 156287,
+      "median_ns": 152317,
+      "p10_ns": 149255,
+      "p90_ns": 159681,
+      "min_ns": 147618,
+      "mean_ns": 162866,
       "num_iters": 20,
       "measurement_experts": 8,
       "measurement_tasks": 8,
@@ -231,16 +224,16 @@
       "lane_task_counts": [
         8
       ],
-      "full_call_median_ns": 1243963
+      "full_call_median_ns": 1218541
     },
     {
       "routes": 1,
       "threads": 8,
-      "median_ns": 116170,
-      "p10_ns": 115007,
-      "p90_ns": 124205,
-      "min_ns": 114284,
-      "mean_ns": 118807,
+      "median_ns": 119094,
+      "p10_ns": 114779,
+      "p90_ns": 136338,
+      "min_ns": 113373,
+      "mean_ns": 123209,
       "num_iters": 20,
       "measurement_experts": 8,
       "measurement_tasks": 8,
@@ -249,16 +242,16 @@
       "lane_task_counts": [
         8
       ],
-      "full_call_median_ns": 929357
+      "full_call_median_ns": 952757
     },
     {
       "routes": 2,
       "threads": 1,
-      "median_ns": 434415,
-      "p10_ns": 427666,
-      "p90_ns": 444306,
-      "min_ns": 426974,
-      "mean_ns": 435472,
+      "median_ns": 431005,
+      "p10_ns": 421835,
+      "p90_ns": 441528,
+      "min_ns": 419475,
+      "mean_ns": 431743,
       "num_iters": 20,
       "measurement_experts": 8,
       "measurement_tasks": 8,
@@ -267,16 +260,16 @@
       "lane_task_counts": [
         8
       ],
-      "full_call_median_ns": 3475319
+      "full_call_median_ns": 3448041
     },
     {
       "routes": 2,
       "threads": 2,
-      "median_ns": 247098,
-      "p10_ns": 243611,
-      "p90_ns": 257284,
-      "min_ns": 241563,
-      "mean_ns": 248969,
+      "median_ns": 245996,
+      "p10_ns": 241207,
+      "p90_ns": 253065,
+      "min_ns": 239313,
+      "mean_ns": 246812,
       "num_iters": 20,
       "measurement_experts": 8,
       "measurement_tasks": 8,
@@ -285,16 +278,16 @@
       "lane_task_counts": [
         8
       ],
-      "full_call_median_ns": 1976789
+      "full_call_median_ns": 1967972
     },
     {
       "routes": 2,
       "threads": 4,
-      "median_ns": 158336,
-      "p10_ns": 154495,
-      "p90_ns": 162804,
-      "min_ns": 152810,
-      "mean_ns": 158909,
+      "median_ns": 158281,
+      "p10_ns": 155542,
+      "p90_ns": 162243,
+      "min_ns": 153892,
+      "mean_ns": 159384,
       "num_iters": 20,
       "measurement_experts": 8,
       "measurement_tasks": 8,
@@ -303,16 +296,16 @@
       "lane_task_counts": [
         8
       ],
-      "full_call_median_ns": 1266694
+      "full_call_median_ns": 1266252
     },
     {
       "routes": 2,
       "threads": 8,
-      "median_ns": 116460,
-      "p10_ns": 115183,
-      "p90_ns": 133336,
-      "min_ns": 114718,
-      "mean_ns": 122458,
+      "median_ns": 118568,
+      "p10_ns": 116453,
+      "p90_ns": 135025,
+      "min_ns": 115342,
+      "mean_ns": 123579,
       "num_iters": 20,
       "measurement_experts": 8,
       "measurement_tasks": 8,
@@ -321,16 +314,16 @@
       "lane_task_counts": [
         8
       ],
-      "full_call_median_ns": 931684
+      "full_call_median_ns": 948544
     },
     {
       "routes": 3,
       "threads": 1,
-      "median_ns": 464878,
-      "p10_ns": 458350,
-      "p90_ns": 471484,
-      "min_ns": 456339,
-      "mean_ns": 465841,
+      "median_ns": 468300,
+      "p10_ns": 461410,
+      "p90_ns": 475992,
+      "min_ns": 459708,
+      "mean_ns": 468509,
       "num_iters": 20,
       "measurement_experts": 8,
       "measurement_tasks": 8,
@@ -339,16 +332,16 @@
       "lane_task_counts": [
         8
       ],
-      "full_call_median_ns": 3719028
+      "full_call_median_ns": 3746401
     },
     {
       "routes": 3,
       "threads": 2,
-      "median_ns": 273188,
-      "p10_ns": 269788,
-      "p90_ns": 280122,
-      "min_ns": 264444,
-      "mean_ns": 274101,
+      "median_ns": 272258,
+      "p10_ns": 269268,
+      "p90_ns": 275218,
+      "min_ns": 267955,
+      "mean_ns": 272602,
       "num_iters": 20,
       "measurement_experts": 8,
       "measurement_tasks": 8,
@@ -357,16 +350,16 @@
       "lane_task_counts": [
         8
       ],
-      "full_call_median_ns": 2185505
+      "full_call_median_ns": 2178061
     },
     {
       "routes": 3,
       "threads": 4,
-      "median_ns": 197401,
-      "p10_ns": 169122,
-      "p90_ns": 530967,
-      "min_ns": 168525,
-      "mean_ns": 285274,
+      "median_ns": 167801,
+      "p10_ns": 164332,
+      "p90_ns": 172034,
+      "min_ns": 163940,
+      "mean_ns": 168710,
       "num_iters": 20,
       "measurement_experts": 8,
       "measurement_tasks": 8,
@@ -375,16 +368,16 @@
       "lane_task_counts": [
         8
       ],
-      "full_call_median_ns": 1579211
+      "full_call_median_ns": 1342411
     },
     {
       "routes": 3,
       "threads": 8,
-      "median_ns": 188562,
-      "p10_ns": 119730,
-      "p90_ns": 471940,
-      "min_ns": 118718,
-      "mean_ns": 245473,
+      "median_ns": 120152,
+      "p10_ns": 117908,
+      "p90_ns": 125479,
+      "min_ns": 115297,
+      "mean_ns": 121185,
       "num_iters": 20,
       "measurement_experts": 8,
       "measurement_tasks": 8,
@@ -393,16 +386,16 @@
       "lane_task_counts": [
         8
       ],
-      "full_call_median_ns": 1508497
+      "full_call_median_ns": 961214
     },
     {
       "routes": 4,
       "threads": 1,
-      "median_ns": 472129,
-      "p10_ns": 463980,
-      "p90_ns": 478723,
-      "min_ns": 462420,
-      "mean_ns": 473878,
+      "median_ns": 468240,
+      "p10_ns": 463784,
+      "p90_ns": 474808,
+      "min_ns": 460603,
+      "mean_ns": 469564,
       "num_iters": 20,
       "measurement_experts": 8,
       "measurement_tasks": 8,
@@ -411,16 +404,16 @@
       "lane_task_counts": [
         8
       ],
-      "full_call_median_ns": 3777032
+      "full_call_median_ns": 3745916
     },
     {
       "routes": 4,
       "threads": 2,
-      "median_ns": 275519,
-      "p10_ns": 269504,
-      "p90_ns": 280484,
-      "min_ns": 268588,
-      "mean_ns": 277270,
+      "median_ns": 271165,
+      "p10_ns": 269193,
+      "p90_ns": 278904,
+      "min_ns": 267565,
+      "mean_ns": 272975,
       "num_iters": 20,
       "measurement_experts": 8,
       "measurement_tasks": 8,
@@ -429,16 +422,16 @@
       "lane_task_counts": [
         8
       ],
-      "full_call_median_ns": 2204156
+      "full_call_median_ns": 2169321
     },
     {
       "routes": 4,
       "threads": 4,
-      "median_ns": 171673,
-      "p10_ns": 168130,
-      "p90_ns": 177692,
-      "min_ns": 166248,
-      "mean_ns": 172825,
+      "median_ns": 169739,
+      "p10_ns": 166839,
+      "p90_ns": 174992,
+      "min_ns": 166041,
+      "mean_ns": 170766,
       "num_iters": 20,
       "measurement_experts": 8,
       "measurement_tasks": 8,
@@ -447,16 +440,16 @@
       "lane_task_counts": [
         8
       ],
-      "full_call_median_ns": 1373386
+      "full_call_median_ns": 1357913
     },
     {
       "routes": 4,
       "threads": 8,
-      "median_ns": 120639,
-      "p10_ns": 119315,
-      "p90_ns": 124295,
-      "min_ns": 117407,
-      "mean_ns": 122132,
+      "median_ns": 119755,
+      "p10_ns": 117947,
+      "p90_ns": 122868,
+      "min_ns": 117409,
+      "mean_ns": 120753,
       "num_iters": 20,
       "measurement_experts": 8,
       "measurement_tasks": 8,
@@ -465,16 +458,16 @@
       "lane_task_counts": [
         8
       ],
-      "full_call_median_ns": 965114
+      "full_call_median_ns": 958042
     },
     {
       "routes": 5,
       "threads": 1,
-      "median_ns": 500255,
-      "p10_ns": 496052,
-      "p90_ns": 505880,
-      "min_ns": 494428,
-      "mean_ns": 501424,
+      "median_ns": 499169,
+      "p10_ns": 494011,
+      "p90_ns": 506230,
+      "min_ns": 491332,
+      "mean_ns": 499817,
       "num_iters": 20,
       "measurement_experts": 8,
       "measurement_tasks": 8,
@@ -483,16 +476,16 @@
       "lane_task_counts": [
         8
       ],
-      "full_call_median_ns": 4002043
+      "full_call_median_ns": 3993356
     },
     {
       "routes": 5,
       "threads": 2,
-      "median_ns": 295288,
-      "p10_ns": 294449,
-      "p90_ns": 301158,
-      "min_ns": 293452,
-      "mean_ns": 296996,
+      "median_ns": 299683,
+      "p10_ns": 298092,
+      "p90_ns": 304224,
+      "min_ns": 296901,
+      "mean_ns": 301675,
       "num_iters": 20,
       "measurement_experts": 8,
       "measurement_tasks": 8,
@@ -501,16 +494,16 @@
       "lane_task_counts": [
         8
       ],
-      "full_call_median_ns": 2362309
+      "full_call_median_ns": 2397467
     },
     {
       "routes": 5,
       "threads": 4,
-      "median_ns": 183876,
-      "p10_ns": 178218,
-      "p90_ns": 188493,
-      "min_ns": 177541,
-      "mean_ns": 183643,
+      "median_ns": 183751,
+      "p10_ns": 181573,
+      "p90_ns": 199994,
+      "min_ns": 180214,
+      "mean_ns": 186511,
       "num_iters": 20,
       "measurement_experts": 8,
       "measurement_tasks": 8,
@@ -519,16 +512,16 @@
       "lane_task_counts": [
         8
       ],
-      "full_call_median_ns": 1471010
+      "full_call_median_ns": 1470010
     },
     {
       "routes": 5,
       "threads": 8,
-      "median_ns": 123062,
-      "p10_ns": 121082,
-      "p90_ns": 142348,
-      "min_ns": 120399,
-      "mean_ns": 130994,
+      "median_ns": 126038,
+      "p10_ns": 122650,
+      "p90_ns": 144162,
+      "min_ns": 121936,
+      "mean_ns": 132303,
       "num_iters": 20,
       "measurement_experts": 8,
       "measurement_tasks": 8,
@@ -537,16 +530,16 @@
       "lane_task_counts": [
         8
       ],
-      "full_call_median_ns": 984499
+      "full_call_median_ns": 1008308
     },
     {
       "routes": 6,
       "threads": 1,
-      "median_ns": 499795,
-      "p10_ns": 495914,
-      "p90_ns": 508081,
-      "min_ns": 495034,
-      "mean_ns": 501584,
+      "median_ns": 503524,
+      "p10_ns": 497608,
+      "p90_ns": 512715,
+      "min_ns": 496864,
+      "mean_ns": 504046,
       "num_iters": 20,
       "measurement_experts": 8,
       "measurement_tasks": 8,
@@ -555,16 +548,16 @@
       "lane_task_counts": [
         8
       ],
-      "full_call_median_ns": 3998364
+      "full_call_median_ns": 4028197
     },
     {
       "routes": 6,
       "threads": 2,
-      "median_ns": 303454,
-      "p10_ns": 298840,
-      "p90_ns": 308580,
-      "min_ns": 295508,
-      "mean_ns": 303601,
+      "median_ns": 297927,
+      "p10_ns": 294267,
+      "p90_ns": 300597,
+      "min_ns": 293462,
+      "mean_ns": 298178,
       "num_iters": 20,
       "measurement_experts": 8,
       "measurement_tasks": 8,
@@ -573,16 +566,16 @@
       "lane_task_counts": [
         8
       ],
-      "full_call_median_ns": 2427637
+      "full_call_median_ns": 2383421
     },
     {
       "routes": 6,
       "threads": 4,
-      "median_ns": 185875,
-      "p10_ns": 181335,
-      "p90_ns": 189442,
-      "min_ns": 180789,
-      "mean_ns": 186308,
+      "median_ns": 183121,
+      "p10_ns": 180205,
+      "p90_ns": 186531,
+      "min_ns": 177944,
+      "mean_ns": 183546,
       "num_iters": 20,
       "measurement_experts": 8,
       "measurement_tasks": 8,
@@ -591,16 +584,16 @@
       "lane_task_counts": [
         8
       ],
-      "full_call_median_ns": 1487003
+      "full_call_median_ns": 1464967
     },
     {
       "routes": 6,
       "threads": 8,
-      "median_ns": 123924,
-      "p10_ns": 121750,
-      "p90_ns": 128971,
-      "min_ns": 120858,
-      "mean_ns": 125729,
+      "median_ns": 125163,
+      "p10_ns": 122556,
+      "p90_ns": 133384,
+      "min_ns": 122155,
+      "mean_ns": 127880,
       "num_iters": 20,
       "measurement_experts": 8,
       "measurement_tasks": 8,
@@ -609,16 +602,16 @@
       "lane_task_counts": [
         8
       ],
-      "full_call_median_ns": 991391
+      "full_call_median_ns": 1001308
     },
     {
       "routes": 7,
       "threads": 1,
-      "median_ns": 532248,
-      "p10_ns": 530682,
-      "p90_ns": 538070,
-      "min_ns": 528533,
-      "mean_ns": 534151,
+      "median_ns": 537819,
+      "p10_ns": 531247,
+      "p90_ns": 543307,
+      "min_ns": 531106,
+      "mean_ns": 537986,
       "num_iters": 20,
       "measurement_experts": 8,
       "measurement_tasks": 8,
@@ -627,16 +620,16 @@
       "lane_task_counts": [
         8
       ],
-      "full_call_median_ns": 4257989
+      "full_call_median_ns": 4302551
     },
     {
       "routes": 7,
       "threads": 2,
-      "median_ns": 338209,
-      "p10_ns": 335433,
-      "p90_ns": 343058,
-      "min_ns": 333732,
-      "mean_ns": 338958,
+      "median_ns": 340307,
+      "p10_ns": 334276,
+      "p90_ns": 498820,
+      "min_ns": 332183,
+      "mean_ns": 378687,
       "num_iters": 20,
       "measurement_experts": 8,
       "measurement_tasks": 8,
@@ -645,16 +638,16 @@
       "lane_task_counts": [
         8
       ],
-      "full_call_median_ns": 2705672
+      "full_call_median_ns": 2722455
     },
     {
       "routes": 7,
       "threads": 4,
-      "median_ns": 208529,
-      "p10_ns": 205986,
-      "p90_ns": 210589,
-      "min_ns": 205046,
-      "mean_ns": 209082,
+      "median_ns": 213492,
+      "p10_ns": 205659,
+      "p90_ns": 353294,
+      "min_ns": 204250,
+      "mean_ns": 256188,
       "num_iters": 20,
       "measurement_experts": 8,
       "measurement_tasks": 8,
@@ -663,16 +656,16 @@
       "lane_task_counts": [
         8
       ],
-      "full_call_median_ns": 1668236
+      "full_call_median_ns": 1707940
     },
     {
       "routes": 7,
       "threads": 8,
-      "median_ns": 134840,
-      "p10_ns": 132165,
-      "p90_ns": 159158,
-      "min_ns": 131436,
-      "mean_ns": 141770,
+      "median_ns": 132352,
+      "p10_ns": 130061,
+      "p90_ns": 145977,
+      "min_ns": 129693,
+      "mean_ns": 134844,
       "num_iters": 20,
       "measurement_experts": 8,
       "measurement_tasks": 8,
@@ -681,16 +674,16 @@
       "lane_task_counts": [
         8
       ],
-      "full_call_median_ns": 1078724
+      "full_call_median_ns": 1058822
     },
     {
       "routes": 8,
       "threads": 1,
-      "median_ns": 534931,
-      "p10_ns": 531295,
-      "p90_ns": 549442,
-      "min_ns": 530494,
-      "mean_ns": 537632,
+      "median_ns": 541137,
+      "p10_ns": 537186,
+      "p90_ns": 554456,
+      "min_ns": 535933,
+      "mean_ns": 543818,
       "num_iters": 20,
       "measurement_experts": 8,
       "measurement_tasks": 8,
@@ -699,16 +692,16 @@
       "lane_task_counts": [
         8
       ],
-      "full_call_median_ns": 4279451
+      "full_call_median_ns": 4329099
     },
     {
       "routes": 8,
       "threads": 2,
-      "median_ns": 339744,
-      "p10_ns": 336989,
-      "p90_ns": 342922,
-      "min_ns": 334724,
-      "mean_ns": 344231,
+      "median_ns": 338156,
+      "p10_ns": 333524,
+      "p90_ns": 342033,
+      "min_ns": 333130,
+      "mean_ns": 338692,
       "num_iters": 20,
       "measurement_experts": 8,
       "measurement_tasks": 8,
@@ -717,16 +710,16 @@
       "lane_task_counts": [
         8
       ],
-      "full_call_median_ns": 2717959
+      "full_call_median_ns": 2705253
     },
     {
       "routes": 8,
       "threads": 4,
-      "median_ns": 210985,
-      "p10_ns": 208266,
-      "p90_ns": 212908,
-      "min_ns": 207712,
-      "mean_ns": 211299,
+      "median_ns": 211463,
+      "p10_ns": 209755,
+      "p90_ns": 213818,
+      "min_ns": 208460,
+      "mean_ns": 211977,
       "num_iters": 20,
       "measurement_experts": 8,
       "measurement_tasks": 8,
@@ -735,16 +728,16 @@
       "lane_task_counts": [
         8
       ],
-      "full_call_median_ns": 1687886
+      "full_call_median_ns": 1691705
     },
     {
       "routes": 8,
       "threads": 8,
-      "median_ns": 134236,
-      "p10_ns": 131624,
-      "p90_ns": 152848,
-      "min_ns": 130165,
-      "mean_ns": 140793,
+      "median_ns": 135933,
+      "p10_ns": 133340,
+      "p90_ns": 145349,
+      "min_ns": 132237,
+      "mean_ns": 137883,
       "num_iters": 20,
       "measurement_experts": 8,
       "measurement_tasks": 8,
@@ -753,16 +746,16 @@
       "lane_task_counts": [
         8
       ],
-      "full_call_median_ns": 1073892
+      "full_call_median_ns": 1087468
     },
     {
       "routes": 9,
       "threads": 1,
-      "median_ns": 595185,
-      "p10_ns": 590071,
-      "p90_ns": 599232,
-      "min_ns": 589026,
-      "mean_ns": 595126,
+      "median_ns": 598824,
+      "p10_ns": 593970,
+      "p90_ns": 608197,
+      "min_ns": 591125,
+      "mean_ns": 599810,
       "num_iters": 20,
       "measurement_experts": 8,
       "measurement_tasks": 8,
@@ -771,16 +764,16 @@
       "lane_task_counts": [
         8
       ],
-      "full_call_median_ns": 4761481
+      "full_call_median_ns": 4790594
     },
     {
       "routes": 9,
       "threads": 2,
-      "median_ns": 387982,
-      "p10_ns": 380853,
-      "p90_ns": 498528,
-      "min_ns": 379052,
-      "mean_ns": 415171,
+      "median_ns": 384443,
+      "p10_ns": 382287,
+      "p90_ns": 390652,
+      "min_ns": 379317,
+      "mean_ns": 385995,
       "num_iters": 20,
       "measurement_experts": 8,
       "measurement_tasks": 8,
@@ -789,16 +782,16 @@
       "lane_task_counts": [
         8
       ],
-      "full_call_median_ns": 3103855
+      "full_call_median_ns": 3075547
     },
     {
       "routes": 9,
       "threads": 4,
-      "median_ns": 242558,
-      "p10_ns": 237417,
-      "p90_ns": 245711,
-      "min_ns": 235849,
-      "mean_ns": 242642,
+      "median_ns": 240491,
+      "p10_ns": 237210,
+      "p90_ns": 244359,
+      "min_ns": 236036,
+      "mean_ns": 241154,
       "num_iters": 20,
       "measurement_experts": 8,
       "measurement_tasks": 8,
@@ -807,16 +800,16 @@
       "lane_task_counts": [
         8
       ],
-      "full_call_median_ns": 1940468
+      "full_call_median_ns": 1923933
     },
     {
       "routes": 9,
       "threads": 8,
-      "median_ns": 160690,
-      "p10_ns": 157691,
-      "p90_ns": 177084,
-      "min_ns": 156513,
-      "mean_ns": 167757,
+      "median_ns": 159839,
+      "p10_ns": 158030,
+      "p90_ns": 166910,
+      "min_ns": 155897,
+      "mean_ns": 161494,
       "num_iters": 20,
       "measurement_experts": 8,
       "measurement_tasks": 8,
@@ -825,16 +818,16 @@
       "lane_task_counts": [
         8
       ],
-      "full_call_median_ns": 1285521
+      "full_call_median_ns": 1278713
     },
     {
       "routes": 10,
       "threads": 1,
-      "median_ns": 594121,
-      "p10_ns": 591528,
-      "p90_ns": 601202,
-      "min_ns": 591024,
-      "mean_ns": 595374,
+      "median_ns": 593786,
+      "p10_ns": 588690,
+      "p90_ns": 603124,
+      "min_ns": 586705,
+      "mean_ns": 596245,
       "num_iters": 20,
       "measurement_experts": 8,
       "measurement_tasks": 8,
@@ -843,16 +836,16 @@
       "lane_task_counts": [
         8
       ],
-      "full_call_median_ns": 4752965
+      "full_call_median_ns": 4750291
     },
     {
       "routes": 10,
       "threads": 2,
-      "median_ns": 384780,
-      "p10_ns": 381868,
-      "p90_ns": 389124,
-      "min_ns": 377937,
-      "mean_ns": 385491,
+      "median_ns": 384266,
+      "p10_ns": 381035,
+      "p90_ns": 387657,
+      "min_ns": 380113,
+      "mean_ns": 384714,
       "num_iters": 20,
       "measurement_experts": 8,
       "measurement_tasks": 8,
@@ -861,16 +854,16 @@
       "lane_task_counts": [
         8
       ],
-      "full_call_median_ns": 3078245
+      "full_call_median_ns": 3074132
     },
     {
       "routes": 10,
       "threads": 4,
-      "median_ns": 244150,
-      "p10_ns": 241510,
-      "p90_ns": 255914,
-      "min_ns": 238383,
-      "mean_ns": 247043,
+      "median_ns": 241664,
+      "p10_ns": 238354,
+      "p90_ns": 244898,
+      "min_ns": 238262,
+      "mean_ns": 242057,
       "num_iters": 20,
       "measurement_experts": 8,
       "measurement_tasks": 8,
@@ -879,16 +872,16 @@
       "lane_task_counts": [
         8
       ],
-      "full_call_median_ns": 1953200
+      "full_call_median_ns": 1933312
     },
     {
       "routes": 10,
       "threads": 8,
-      "median_ns": 162311,
-      "p10_ns": 159856,
-      "p90_ns": 180815,
+      "median_ns": 163673,
+      "p10_ns": 160756,
+      "p90_ns": 231222,
       "min_ns": 158427,
-      "mean_ns": 170015,
+      "mean_ns": 176448,
       "num_iters": 20,
       "measurement_experts": 8,
       "measurement_tasks": 8,
@@ -897,16 +890,16 @@
       "lane_task_counts": [
         8
       ],
-      "full_call_median_ns": 1298491
+      "full_call_median_ns": 1309386
     },
     {
       "routes": 11,
       "threads": 1,
-      "median_ns": 672827,
-      "p10_ns": 669072,
-      "p90_ns": 678457,
-      "min_ns": 668548,
-      "mean_ns": 673240,
+      "median_ns": 674465,
+      "p10_ns": 671232,
+      "p90_ns": 677732,
+      "min_ns": 669892,
+      "mean_ns": 674942,
       "num_iters": 20,
       "measurement_experts": 8,
       "measurement_tasks": 8,
@@ -915,16 +908,16 @@
       "lane_task_counts": [
         8
       ],
-      "full_call_median_ns": 5382621
+      "full_call_median_ns": 5395723
     },
     {
       "routes": 11,
       "threads": 2,
-      "median_ns": 431543,
-      "p10_ns": 429244,
-      "p90_ns": 447486,
-      "min_ns": 427701,
-      "mean_ns": 442576,
+      "median_ns": 427650,
+      "p10_ns": 424920,
+      "p90_ns": 431282,
+      "min_ns": 423300,
+      "mean_ns": 428191,
       "num_iters": 20,
       "measurement_experts": 8,
       "measurement_tasks": 8,
@@ -933,16 +926,16 @@
       "lane_task_counts": [
         8
       ],
-      "full_call_median_ns": 3452344
+      "full_call_median_ns": 3421204
     },
     {
       "routes": 11,
       "threads": 4,
-      "median_ns": 268325,
-      "p10_ns": 266036,
-      "p90_ns": 274595,
-      "min_ns": 262106,
-      "mean_ns": 269253,
+      "median_ns": 267811,
+      "p10_ns": 264710,
+      "p90_ns": 269344,
+      "min_ns": 263922,
+      "mean_ns": 267937,
       "num_iters": 20,
       "measurement_experts": 8,
       "measurement_tasks": 8,
@@ -951,16 +944,16 @@
       "lane_task_counts": [
         8
       ],
-      "full_call_median_ns": 2146605
+      "full_call_median_ns": 2142487
     },
     {
       "routes": 11,
       "threads": 8,
-      "median_ns": 176320,
-      "p10_ns": 174165,
-      "p90_ns": 180291,
-      "min_ns": 172590,
-      "mean_ns": 177113,
+      "median_ns": 177015,
+      "p10_ns": 174096,
+      "p90_ns": 189947,
+      "min_ns": 170784,
+      "mean_ns": 180346,
       "num_iters": 20,
       "measurement_experts": 8,
       "measurement_tasks": 8,
@@ -969,16 +962,16 @@
       "lane_task_counts": [
         8
       ],
-      "full_call_median_ns": 1410567
+      "full_call_median_ns": 1416120
     },
     {
       "routes": 12,
       "threads": 1,
-      "median_ns": 676756,
-      "p10_ns": 672819,
-      "p90_ns": 680567,
-      "min_ns": 670367,
-      "mean_ns": 677113,
+      "median_ns": 679193,
+      "p10_ns": 675704,
+      "p90_ns": 687231,
+      "min_ns": 674667,
+      "mean_ns": 681296,
       "num_iters": 20,
       "measurement_experts": 8,
       "measurement_tasks": 8,
@@ -987,16 +980,16 @@
       "lane_task_counts": [
         8
       ],
-      "full_call_median_ns": 5414053
+      "full_call_median_ns": 5433548
     },
     {
       "routes": 12,
       "threads": 2,
-      "median_ns": 433521,
-      "p10_ns": 430368,
-      "p90_ns": 438342,
-      "min_ns": 427569,
-      "mean_ns": 438095,
+      "median_ns": 433571,
+      "p10_ns": 430204,
+      "p90_ns": 460623,
+      "min_ns": 427415,
+      "mean_ns": 447873,
       "num_iters": 20,
       "measurement_experts": 8,
       "measurement_tasks": 8,
@@ -1005,16 +998,16 @@
       "lane_task_counts": [
         8
       ],
-      "full_call_median_ns": 3468173
+      "full_call_median_ns": 3468572
     },
     {
       "routes": 12,
       "threads": 4,
-      "median_ns": 270629,
-      "p10_ns": 267375,
-      "p90_ns": 274254,
-      "min_ns": 265711,
-      "mean_ns": 271019,
+      "median_ns": 270790,
+      "p10_ns": 267955,
+      "p90_ns": 285737,
+      "min_ns": 266581,
+      "mean_ns": 273259,
       "num_iters": 20,
       "measurement_experts": 8,
       "measurement_tasks": 8,
@@ -1023,16 +1016,16 @@
       "lane_task_counts": [
         8
       ],
-      "full_call_median_ns": 2165032
+      "full_call_median_ns": 2166325
     },
     {
       "routes": 12,
       "threads": 8,
-      "median_ns": 179853,
-      "p10_ns": 176785,
-      "p90_ns": 193947,
-      "min_ns": 176208,
-      "mean_ns": 185874,
+      "median_ns": 179724,
+      "p10_ns": 177134,
+      "p90_ns": 190676,
+      "min_ns": 176941,
+      "mean_ns": 184458,
       "num_iters": 20,
       "measurement_experts": 8,
       "measurement_tasks": 8,
@@ -1041,16 +1034,16 @@
       "lane_task_counts": [
         8
       ],
-      "full_call_median_ns": 1438829
+      "full_call_median_ns": 1437792
     },
     {
       "routes": 24,
       "threads": 1,
-      "median_ns": 1335434,
-      "p10_ns": 1329526,
-      "p90_ns": 1341240,
-      "min_ns": 1325407,
-      "mean_ns": 1335916,
+      "median_ns": 1319643,
+      "p10_ns": 1313755,
+      "p90_ns": 1329278,
+      "min_ns": 1313174,
+      "mean_ns": 1320814,
       "num_iters": 20,
       "measurement_experts": 8,
       "measurement_tasks": 8,
@@ -1059,16 +1052,16 @@
       "lane_task_counts": [
         8
       ],
-      "full_call_median_ns": 10683472
+      "full_call_median_ns": 10557149
     },
     {
       "routes": 24,
       "threads": 2,
-      "median_ns": 826738,
-      "p10_ns": 819049,
-      "p90_ns": 888366,
-      "min_ns": 817933,
-      "mean_ns": 843810,
+      "median_ns": 815435,
+      "p10_ns": 810846,
+      "p90_ns": 826473,
+      "min_ns": 809100,
+      "mean_ns": 816162,
       "num_iters": 20,
       "measurement_experts": 8,
       "measurement_tasks": 8,
@@ -1077,16 +1070,16 @@
       "lane_task_counts": [
         8
       ],
-      "full_call_median_ns": 6613910
+      "full_call_median_ns": 6523480
     },
     {
       "routes": 24,
       "threads": 4,
-      "median_ns": 494242,
-      "p10_ns": 488421,
-      "p90_ns": 498083,
-      "min_ns": 486941,
-      "mean_ns": 493997,
+      "median_ns": 487960,
+      "p10_ns": 485589,
+      "p90_ns": 490592,
+      "min_ns": 482876,
+      "mean_ns": 488265,
       "num_iters": 20,
       "measurement_experts": 8,
       "measurement_tasks": 8,
@@ -1095,16 +1088,16 @@
       "lane_task_counts": [
         8
       ],
-      "full_call_median_ns": 3953937
+      "full_call_median_ns": 3903679
     },
     {
       "routes": 24,
       "threads": 8,
-      "median_ns": 300954,
-      "p10_ns": 295613,
-      "p90_ns": 334814,
-      "min_ns": 293297,
-      "mean_ns": 307490,
+      "median_ns": 303307,
+      "p10_ns": 300316,
+      "p90_ns": 325993,
+      "min_ns": 297571,
+      "mean_ns": 313402,
       "num_iters": 20,
       "measurement_experts": 8,
       "measurement_tasks": 8,
@@ -1113,16 +1106,16 @@
       "lane_task_counts": [
         8
       ],
-      "full_call_median_ns": 2407637
+      "full_call_median_ns": 2426456
     },
     {
       "routes": 48,
       "threads": 1,
-      "median_ns": 2802495,
-      "p10_ns": 2782765,
-      "p90_ns": 2815049,
-      "min_ns": 2753632,
-      "mean_ns": 2798033,
+      "median_ns": 2784560,
+      "p10_ns": 2764681,
+      "p90_ns": 2795408,
+      "min_ns": 2660491,
+      "mean_ns": 2776726,
       "num_iters": 20,
       "measurement_experts": 8,
       "measurement_tasks": 8,
@@ -1131,16 +1124,16 @@
       "lane_task_counts": [
         8
       ],
-      "full_call_median_ns": 22419958
+      "full_call_median_ns": 22276481
     },
     {
       "routes": 48,
       "threads": 2,
-      "median_ns": 1626677,
-      "p10_ns": 1617777,
-      "p90_ns": 1636366,
-      "min_ns": 1616094,
-      "mean_ns": 1626594,
+      "median_ns": 1656527,
+      "p10_ns": 1649588,
+      "p90_ns": 1659852,
+      "min_ns": 1643708,
+      "mean_ns": 1655998,
       "num_iters": 20,
       "measurement_experts": 8,
       "measurement_tasks": 8,
@@ -1149,16 +1142,16 @@
       "lane_task_counts": [
         8
       ],
-      "full_call_median_ns": 13013419
+      "full_call_median_ns": 13252223
     },
     {
       "routes": 48,
       "threads": 4,
-      "median_ns": 906316,
-      "p10_ns": 904984,
-      "p90_ns": 911184,
-      "min_ns": 902703,
-      "mean_ns": 908603,
+      "median_ns": 938940,
+      "p10_ns": 918602,
+      "p90_ns": 1098405,
+      "min_ns": 914938,
+      "mean_ns": 999278,
       "num_iters": 20,
       "measurement_experts": 8,
       "measurement_tasks": 8,
@@ -1167,16 +1160,16 @@
       "lane_task_counts": [
         8
       ],
-      "full_call_median_ns": 7250532
+      "full_call_median_ns": 7511521
     },
     {
       "routes": 48,
       "threads": 8,
-      "median_ns": 511678,
-      "p10_ns": 504860,
-      "p90_ns": 603976,
-      "min_ns": 502358,
-      "mean_ns": 534660,
+      "median_ns": 534080,
+      "p10_ns": 525630,
+      "p90_ns": 574510,
+      "min_ns": 521651,
+      "mean_ns": 543686,
       "num_iters": 20,
       "measurement_experts": 8,
       "measurement_tasks": 8,
@@ -1185,16 +1178,16 @@
       "lane_task_counts": [
         8
       ],
-      "full_call_median_ns": 4093424
+      "full_call_median_ns": 4272641
     },
     {
       "routes": 96,
       "threads": 1,
-      "median_ns": 5496025,
-      "p10_ns": 5481025,
-      "p90_ns": 5522610,
-      "min_ns": 5476952,
-      "mean_ns": 5498684,
+      "median_ns": 5571728,
+      "p10_ns": 5538193,
+      "p90_ns": 5611550,
+      "min_ns": 5530683,
+      "mean_ns": 5572343,
       "num_iters": 20,
       "measurement_experts": 8,
       "measurement_tasks": 8,
@@ -1203,16 +1196,16 @@
       "lane_task_counts": [
         8
       ],
-      "full_call_median_ns": 43968207
+      "full_call_median_ns": 44573823
     },
     {
       "routes": 96,
       "threads": 2,
-      "median_ns": 3123527,
-      "p10_ns": 3102250,
-      "p90_ns": 3142512,
-      "min_ns": 3097278,
-      "mean_ns": 3121008,
+      "median_ns": 3190505,
+      "p10_ns": 3180299,
+      "p90_ns": 3207019,
+      "min_ns": 3177034,
+      "mean_ns": 3199633,
       "num_iters": 20,
       "measurement_experts": 8,
       "measurement_tasks": 8,
@@ -1221,16 +1214,16 @@
       "lane_task_counts": [
         8
       ],
-      "full_call_median_ns": 24988220
+      "full_call_median_ns": 25524041
     },
     {
       "routes": 96,
       "threads": 4,
-      "median_ns": 1726960,
-      "p10_ns": 1722474,
-      "p90_ns": 1734774,
-      "min_ns": 1718828,
-      "mean_ns": 1727700,
+      "median_ns": 1753479,
+      "p10_ns": 1743511,
+      "p90_ns": 1763517,
+      "min_ns": 1736983,
+      "mean_ns": 1753679,
       "num_iters": 20,
       "measurement_experts": 8,
       "measurement_tasks": 8,
@@ -1239,16 +1232,16 @@
       "lane_task_counts": [
         8
       ],
-      "full_call_median_ns": 13815684
+      "full_call_median_ns": 14027832
     },
     {
       "routes": 96,
       "threads": 8,
-      "median_ns": 917263,
-      "p10_ns": 905688,
-      "p90_ns": 1007118,
-      "min_ns": 903704,
-      "mean_ns": 977283,
+      "median_ns": 970179,
+      "p10_ns": 952233,
+      "p90_ns": 1064372,
+      "min_ns": 949514,
+      "mean_ns": 1001692,
       "num_iters": 20,
       "measurement_experts": 8,
       "measurement_tasks": 8,
@@ -1257,16 +1250,16 @@
       "lane_task_counts": [
         8
       ],
-      "full_call_median_ns": 7338106
+      "full_call_median_ns": 7761429
     },
     {
       "routes": 192,
       "threads": 1,
-      "median_ns": 10411830,
-      "p10_ns": 10340291,
-      "p90_ns": 10488299,
-      "min_ns": 10323838,
-      "mean_ns": 10412698,
+      "median_ns": 10803367,
+      "p10_ns": 10744868,
+      "p90_ns": 10873587,
+      "min_ns": 10690431,
+      "mean_ns": 10803811,
       "num_iters": 20,
       "measurement_experts": 8,
       "measurement_tasks": 8,
@@ -1275,16 +1268,16 @@
       "lane_task_counts": [
         8
       ],
-      "full_call_median_ns": 83294639
+      "full_call_median_ns": 86426935
     },
     {
       "routes": 192,
       "threads": 2,
-      "median_ns": 6032035,
-      "p10_ns": 6019453,
-      "p90_ns": 6050214,
-      "min_ns": 6007137,
-      "mean_ns": 6034195,
+      "median_ns": 6205118,
+      "p10_ns": 6127240,
+      "p90_ns": 6297192,
+      "min_ns": 6073884,
+      "mean_ns": 6208505,
       "num_iters": 20,
       "measurement_experts": 8,
       "measurement_tasks": 8,
@@ -1293,16 +1286,16 @@
       "lane_task_counts": [
         8
       ],
-      "full_call_median_ns": 48256278
+      "full_call_median_ns": 49640944
     },
     {
       "routes": 192,
       "threads": 4,
-      "median_ns": 3322949,
-      "p10_ns": 3315008,
-      "p90_ns": 3330756,
-      "min_ns": 3312341,
-      "mean_ns": 3331446,
+      "median_ns": 3403214,
+      "p10_ns": 3388962,
+      "p90_ns": 3428557,
+      "min_ns": 3385826,
+      "mean_ns": 3412390,
       "num_iters": 20,
       "measurement_experts": 8,
       "measurement_tasks": 8,
@@ -1311,16 +1304,16 @@
       "lane_task_counts": [
         8
       ],
-      "full_call_median_ns": 26583597
+      "full_call_median_ns": 27225711
     },
     {
       "routes": 192,
       "threads": 8,
-      "median_ns": 1767414,
-      "p10_ns": 1736653,
-      "p90_ns": 1828982,
-      "min_ns": 1726864,
-      "mean_ns": 1775944,
+      "median_ns": 1859605,
+      "p10_ns": 1833053,
+      "p90_ns": 1963887,
+      "min_ns": 1827569,
+      "mean_ns": 1885494,
       "num_iters": 20,
       "measurement_experts": 8,
       "measurement_tasks": 8,
@@ -1329,16 +1322,16 @@
       "lane_task_counts": [
         8
       ],
-      "full_call_median_ns": 14139317
+      "full_call_median_ns": 14876842
     },
     {
       "routes": 384,
       "threads": 1,
-      "median_ns": 20080114,
-      "p10_ns": 19973295,
-      "p90_ns": 20145134,
-      "min_ns": 19903861,
-      "mean_ns": 20062626,
+      "median_ns": 20771877,
+      "p10_ns": 20666040,
+      "p90_ns": 20860958,
+      "min_ns": 20547094,
+      "mean_ns": 20761705,
       "num_iters": 20,
       "measurement_experts": 8,
       "measurement_tasks": 8,
@@ -1347,16 +1340,16 @@
       "lane_task_counts": [
         8
       ],
-      "full_call_median_ns": 160640913
+      "full_call_median_ns": 166175021
     },
     {
       "routes": 384,
       "threads": 2,
-      "median_ns": 11851253,
-      "p10_ns": 11834426,
-      "p90_ns": 11916812,
-      "min_ns": 11807796,
-      "mean_ns": 11866868,
+      "median_ns": 12224081,
+      "p10_ns": 12139090,
+      "p90_ns": 12283487,
+      "min_ns": 12110604,
+      "mean_ns": 12215451,
       "num_iters": 20,
       "measurement_experts": 8,
       "measurement_tasks": 8,
@@ -1365,16 +1358,16 @@
       "lane_task_counts": [
         8
       ],
-      "full_call_median_ns": 94810029
+      "full_call_median_ns": 97792647
     },
     {
       "routes": 384,
       "threads": 4,
-      "median_ns": 6541135,
-      "p10_ns": 6526893,
-      "p90_ns": 6563641,
-      "min_ns": 6514851,
-      "mean_ns": 6552095,
+      "median_ns": 6691473,
+      "p10_ns": 6654516,
+      "p90_ns": 6724565,
+      "min_ns": 6648895,
+      "mean_ns": 6690930,
       "num_iters": 20,
       "measurement_experts": 8,
       "measurement_tasks": 8,
@@ -1383,16 +1376,16 @@
       "lane_task_counts": [
         8
       ],
-      "full_call_median_ns": 52329083
+      "full_call_median_ns": 53531782
     },
     {
       "routes": 384,
       "threads": 8,
-      "median_ns": 3480306,
-      "p10_ns": 3420915,
-      "p90_ns": 3515695,
-      "min_ns": 3401001,
-      "mean_ns": 3479785,
+      "median_ns": 3675447,
+      "p10_ns": 3598441,
+      "p90_ns": 3934149,
+      "min_ns": 3579530,
+      "mean_ns": 4390642,
       "num_iters": 20,
       "measurement_experts": 8,
       "measurement_tasks": 8,
@@ -1401,16 +1394,16 @@
       "lane_task_counts": [
         8
       ],
-      "full_call_median_ns": 27842452
+      "full_call_median_ns": 29403581
     },
     {
       "routes": 768,
       "threads": 1,
-      "median_ns": 38999293,
-      "p10_ns": 38902318,
-      "p90_ns": 39117574,
-      "min_ns": 38819788,
-      "mean_ns": 38997817,
+      "median_ns": 39341752,
+      "p10_ns": 39248627,
+      "p90_ns": 39452524,
+      "min_ns": 39219720,
+      "mean_ns": 39352429,
       "num_iters": 20,
       "measurement_experts": 8,
       "measurement_tasks": 8,
@@ -1419,16 +1412,16 @@
       "lane_task_counts": [
         8
       ],
-      "full_call_median_ns": 311994345
+      "full_call_median_ns": 314734020
     },
     {
       "routes": 768,
       "threads": 2,
-      "median_ns": 23476079,
-      "p10_ns": 23458993,
-      "p90_ns": 23536663,
-      "min_ns": 23446082,
-      "mean_ns": 23498299,
+      "median_ns": 23738936,
+      "p10_ns": 23693853,
+      "p90_ns": 23784388,
+      "min_ns": 23690652,
+      "mean_ns": 23739386,
       "num_iters": 20,
       "measurement_experts": 8,
       "measurement_tasks": 8,
@@ -1437,16 +1430,16 @@
       "lane_task_counts": [
         8
       ],
-      "full_call_median_ns": 187808630
+      "full_call_median_ns": 189911494
     },
     {
       "routes": 768,
       "threads": 4,
-      "median_ns": 13018197,
-      "p10_ns": 13004525,
-      "p90_ns": 13041456,
-      "min_ns": 13000814,
-      "mean_ns": 13022085,
+      "median_ns": 13274640,
+      "p10_ns": 13236647,
+      "p90_ns": 13296646,
+      "min_ns": 13232430,
+      "mean_ns": 13280819,
       "num_iters": 20,
       "measurement_experts": 8,
       "measurement_tasks": 8,
@@ -1455,16 +1448,16 @@
       "lane_task_counts": [
         8
       ],
-      "full_call_median_ns": 104145582
+      "full_call_median_ns": 106197122
     },
     {
       "routes": 768,
       "threads": 8,
-      "median_ns": 6891393,
-      "p10_ns": 6844152,
-      "p90_ns": 7011658,
-      "min_ns": 6806045,
-      "mean_ns": 6932371,
+      "median_ns": 7253038,
+      "p10_ns": 7190525,
+      "p90_ns": 7341151,
+      "min_ns": 7165908,
+      "mean_ns": 7260516,
       "num_iters": 20,
       "measurement_experts": 8,
       "measurement_tasks": 8,
@@ -1473,16 +1466,16 @@
       "lane_task_counts": [
         8
       ],
-      "full_call_median_ns": 55131149
+      "full_call_median_ns": 58024310
     },
     {
       "routes": 1536,
       "threads": 1,
-      "median_ns": 76080341,
-      "p10_ns": 75982917,
-      "p90_ns": 76183312,
-      "min_ns": 75891944,
-      "mean_ns": 76080913,
+      "median_ns": 76264674,
+      "p10_ns": 76166847,
+      "p90_ns": 76353991,
+      "min_ns": 76133931,
+      "mean_ns": 76266652,
       "num_iters": 20,
       "measurement_experts": 8,
       "measurement_tasks": 8,
@@ -1491,16 +1484,16 @@
       "lane_task_counts": [
         8
       ],
-      "full_call_median_ns": 608642730
+      "full_call_median_ns": 610117397
     },
     {
       "routes": 1536,
       "threads": 2,
-      "median_ns": 46431837,
-      "p10_ns": 46389358,
-      "p90_ns": 46463452,
-      "min_ns": 46355705,
-      "mean_ns": 46428186,
+      "median_ns": 46590759,
+      "p10_ns": 46565402,
+      "p90_ns": 46624560,
+      "min_ns": 46490546,
+      "mean_ns": 46589887,
       "num_iters": 20,
       "measurement_experts": 8,
       "measurement_tasks": 8,
@@ -1509,16 +1502,16 @@
       "lane_task_counts": [
         8
       ],
-      "full_call_median_ns": 371454696
+      "full_call_median_ns": 372726077
     },
     {
       "routes": 1536,
       "threads": 4,
-      "median_ns": 25964870,
-      "p10_ns": 25945515,
-      "p90_ns": 25994582,
-      "min_ns": 25931882,
-      "mean_ns": 25968338,
+      "median_ns": 26328755,
+      "p10_ns": 26300558,
+      "p90_ns": 26348436,
+      "min_ns": 26292624,
+      "mean_ns": 26325703,
       "num_iters": 20,
       "measurement_experts": 8,
       "measurement_tasks": 8,
@@ -1527,16 +1520,16 @@
       "lane_task_counts": [
         8
       ],
-      "full_call_median_ns": 207718959
+      "full_call_median_ns": 210630039
     },
     {
       "routes": 1536,
       "threads": 8,
-      "median_ns": 13717167,
-      "p10_ns": 13624386,
-      "p90_ns": 13988676,
-      "min_ns": 13603818,
-      "mean_ns": 14339624,
+      "median_ns": 14398508,
+      "p10_ns": 14284523,
+      "p90_ns": 14636696,
+      "min_ns": 14256184,
+      "mean_ns": 14980727,
       "num_iters": 20,
       "measurement_experts": 8,
       "measurement_tasks": 8,
@@ -1545,16 +1538,16 @@
       "lane_task_counts": [
         8
       ],
-      "full_call_median_ns": 109737342
+      "full_call_median_ns": 115188065
     },
     {
       "routes": 2040,
       "threads": 1,
-      "median_ns": 100228004,
-      "p10_ns": 100118522,
-      "p90_ns": 100298285,
-      "min_ns": 100092016,
-      "mean_ns": 100214745,
+      "median_ns": 100215238,
+      "p10_ns": 100129640,
+      "p90_ns": 100322061,
+      "min_ns": 100080871,
+      "mean_ns": 100226892,
       "num_iters": 20,
       "measurement_experts": 8,
       "measurement_tasks": 8,
@@ -1563,16 +1556,16 @@
       "lane_task_counts": [
         8
       ],
-      "full_call_median_ns": 801824033
+      "full_call_median_ns": 801721906
     },
     {
       "routes": 2040,
       "threads": 2,
-      "median_ns": 61450301,
-      "p10_ns": 61409501,
-      "p90_ns": 61491952,
-      "min_ns": 61357598,
-      "mean_ns": 61454697,
+      "median_ns": 61744464,
+      "p10_ns": 61693280,
+      "p90_ns": 61806587,
+      "min_ns": 61656677,
+      "mean_ns": 61745485,
       "num_iters": 20,
       "measurement_experts": 8,
       "measurement_tasks": 8,
@@ -1581,16 +1574,16 @@
       "lane_task_counts": [
         8
       ],
-      "full_call_median_ns": 491602406
+      "full_call_median_ns": 493955712
     },
     {
       "routes": 2040,
       "threads": 4,
-      "median_ns": 34439144,
-      "p10_ns": 34406869,
-      "p90_ns": 34491808,
-      "min_ns": 34398967,
-      "mean_ns": 34444933,
+      "median_ns": 34893186,
+      "p10_ns": 34877451,
+      "p90_ns": 34918346,
+      "min_ns": 34864290,
+      "mean_ns": 34896103,
       "num_iters": 20,
       "measurement_experts": 8,
       "measurement_tasks": 8,
@@ -1599,16 +1592,16 @@
       "lane_task_counts": [
         8
       ],
-      "full_call_median_ns": 275513156
+      "full_call_median_ns": 279145491
     },
     {
       "routes": 2040,
       "threads": 8,
-      "median_ns": 18230474,
-      "p10_ns": 18087091,
-      "p90_ns": 18870965,
-      "min_ns": 18067190,
-      "mean_ns": 18807743,
+      "median_ns": 19050601,
+      "p10_ns": 19001347,
+      "p90_ns": 19430993,
+      "min_ns": 18962599,
+      "mean_ns": 19573066,
       "num_iters": 20,
       "measurement_experts": 8,
       "measurement_tasks": 8,
@@ -1617,97 +1610,97 @@
       "lane_task_counts": [
         8
       ],
-      "full_call_median_ns": 145843789
+      "full_call_median_ns": 152404811
     }
   ],
   "iso_formula": {
     "version": 3,
     "kind": "separable_route_usl_calibrated",
     "equation": "O(t) + C(R) * phi_usl(t) * k_phi(t)",
-    "o0": 72036.13119387552,
-    "o1": 132130.44424058413,
-    "alpha": 0.19019376915218913,
-    "beta": -0.016345519376865784,
+    "o0": 59458.53984430518,
+    "o1": 148460.24823309,
+    "alpha": 0.1910622088403466,
+    "beta": -0.015262939825447523,
     "c_pts": [
       [
         1,
-        231163.42456554034
+        229462.21192260482
       ],
       [
         2,
-        230248.42456554034
+        223086.21192260482
       ],
       [
         3,
-        260711.42456554034
+        260381.21192260482
       ],
       [
         4,
-        267962.42456554034
+        260321.21192260482
       ],
       [
         5,
-        296088.42456554034
+        291250.2119226048
       ],
       [
         6,
-        295628.42456554034
+        295605.2119226048
       ],
       [
         7,
-        328081.42456554034
+        329900.2119226048
       ],
       [
         8,
-        330764.42456554034
+        333218.2119226048
       ],
       [
         9,
-        391018.42456554034
+        390905.2119226048
       ],
       [
         10,
-        389954.42456554034
+        385867.2119226048
       ],
       [
         11,
-        468660.42456554034
+        466546.2119226048
       ],
       [
         12,
-        472589.42456554034
+        471274.2119226048
       ],
       [
         24,
-        1131267.4245655404
+        1111724.2119226048
       ],
       [
         48,
-        2598328.42456554
+        2576641.2119226046
       ],
       [
         96,
-        5291858.424565541
+        5363809.211922605
       ],
       [
         192,
-        10207663.42456554
+        10595448.211922605
       ],
       [
         384,
-        19875947.42456554
+        20563958.211922605
       ],
       [
         768,
-        38795126.42456554
+        39133833.21192261
       ],
       [
         1536,
-        75876174.42456554
+        76056755.2119226
       ],
       [
         2040,
-        100023837.42456554
+        100007319.2119226
       ]
     ],
     "phi_pts": [
@@ -1717,15 +1710,15 @@
       ],
       [
         2,
-        0.605845996909619
+        0.6070069579958564
       ],
       [
         4,
-        0.3368351108059471
+        0.3408231388036345
       ],
       [
         8,
-        0.1774847450792192
+        0.185816332410762
       ]
     ],
     "thread_domain": [
@@ -1740,8 +1733,8 @@
       ],
       "distinct_experts": 1,
       "routes": 1,
-      "makespan_ns": 116833,
-      "full_call_median_ns": 934666,
+      "makespan_ns": 117448,
+      "full_call_median_ns": 939581,
       "measurement_experts": 8,
       "measurement_groups": 8,
       "measurement_tasks": 8,
@@ -1750,11 +1743,11 @@
       "lane_task_counts": [
         8
       ],
-      "iso_max_ns": 116170,
-      "iso_baseline_makespan_ns": 929360,
-      "derate": 1.005709305328398,
-      "p10_ns": 115708,
-      "p90_ns": 123296,
+      "iso_max_ns": 119094,
+      "iso_baseline_makespan_ns": 952752,
+      "derate": 0.9861758358943356,
+      "p10_ns": 115662,
+      "p90_ns": 126768,
       "num_iters": 20
     },
     {
@@ -1763,8 +1756,8 @@
       ],
       "distinct_experts": 1,
       "routes": 2,
-      "makespan_ns": 119315,
-      "full_call_median_ns": 954521,
+      "makespan_ns": 120493,
+      "full_call_median_ns": 963945,
       "measurement_experts": 8,
       "measurement_groups": 8,
       "measurement_tasks": 8,
@@ -1773,11 +1766,11 @@
       "lane_task_counts": [
         8
       ],
-      "iso_max_ns": 116460,
-      "iso_baseline_makespan_ns": 931680,
-      "derate": 1.0245159282156964,
-      "p10_ns": 116599,
-      "p90_ns": 124004,
+      "iso_max_ns": 118568,
+      "iso_baseline_makespan_ns": 948544,
+      "derate": 1.0162364634640038,
+      "p10_ns": 117826,
+      "p90_ns": 129032,
       "num_iters": 20
     },
     {
@@ -1786,8 +1779,8 @@
       ],
       "distinct_experts": 1,
       "routes": 3,
-      "makespan_ns": 121282,
-      "full_call_median_ns": 970263,
+      "makespan_ns": 123262,
+      "full_call_median_ns": 986098,
       "measurement_experts": 8,
       "measurement_groups": 8,
       "measurement_tasks": 8,
@@ -1796,11 +1789,11 @@
       "lane_task_counts": [
         8
       ],
-      "iso_max_ns": 188562,
-      "iso_baseline_makespan_ns": 1508496,
-      "derate": 0.6431989213097018,
-      "p10_ns": 119363,
-      "p90_ns": 136097,
+      "iso_max_ns": 120152,
+      "iso_baseline_makespan_ns": 961216,
+      "derate": 1.02588596111592,
+      "p10_ns": 120879,
+      "p90_ns": 130741,
       "num_iters": 20
     },
     {
@@ -1809,8 +1802,8 @@
       ],
       "distinct_experts": 1,
       "routes": 4,
-      "makespan_ns": 124096,
-      "full_call_median_ns": 992767,
+      "makespan_ns": 125631,
+      "full_call_median_ns": 1005047,
       "measurement_experts": 8,
       "measurement_groups": 8,
       "measurement_tasks": 8,
@@ -1819,11 +1812,11 @@
       "lane_task_counts": [
         8
       ],
-      "iso_max_ns": 120639,
-      "iso_baseline_makespan_ns": 965112,
-      "derate": 1.0286547053606214,
-      "p10_ns": 121516,
-      "p90_ns": 138103,
+      "iso_max_ns": 119755,
+      "iso_baseline_makespan_ns": 958040,
+      "derate": 1.0490658010103961,
+      "p10_ns": 122283,
+      "p90_ns": 141291,
       "num_iters": 20
     },
     {
@@ -1832,8 +1825,8 @@
       ],
       "distinct_experts": 1,
       "routes": 5,
-      "makespan_ns": 124455,
-      "full_call_median_ns": 995643,
+      "makespan_ns": 127744,
+      "full_call_median_ns": 1021956,
       "measurement_experts": 8,
       "measurement_groups": 8,
       "measurement_tasks": 8,
@@ -1842,11 +1835,11 @@
       "lane_task_counts": [
         8
       ],
-      "iso_max_ns": 123062,
-      "iso_baseline_makespan_ns": 984496,
-      "derate": 1.011322544733549,
-      "p10_ns": 122449,
-      "p90_ns": 125719,
+      "iso_max_ns": 126038,
+      "iso_baseline_makespan_ns": 1008304,
+      "derate": 1.0135395674320442,
+      "p10_ns": 126007,
+      "p90_ns": 133217,
       "num_iters": 20
     },
     {
@@ -1855,8 +1848,8 @@
       ],
       "distinct_experts": 1,
       "routes": 6,
-      "makespan_ns": 126843,
-      "full_call_median_ns": 1014748,
+      "makespan_ns": 125885,
+      "full_call_median_ns": 1007076,
       "measurement_experts": 8,
       "measurement_groups": 8,
       "measurement_tasks": 8,
@@ -1865,11 +1858,11 @@
       "lane_task_counts": [
         8
       ],
-      "iso_max_ns": 123924,
-      "iso_baseline_makespan_ns": 991392,
-      "derate": 1.0235587940996094,
-      "p10_ns": 124058,
-      "p90_ns": 141080,
+      "iso_max_ns": 125163,
+      "iso_baseline_makespan_ns": 1001304,
+      "derate": 1.0057644831140193,
+      "p10_ns": 124194,
+      "p90_ns": 130350,
       "num_iters": 20
     },
     {
@@ -1878,8 +1871,8 @@
       ],
       "distinct_experts": 1,
       "routes": 7,
-      "makespan_ns": 134856,
-      "full_call_median_ns": 1078852,
+      "makespan_ns": 136902,
+      "full_call_median_ns": 1095219,
       "measurement_experts": 8,
       "measurement_groups": 8,
       "measurement_tasks": 8,
@@ -1888,11 +1881,11 @@
       "lane_task_counts": [
         8
       ],
-      "iso_max_ns": 134840,
-      "iso_baseline_makespan_ns": 1078720,
-      "derate": 1.000122367250074,
-      "p10_ns": 131502,
-      "p90_ns": 140116,
+      "iso_max_ns": 132352,
+      "iso_baseline_makespan_ns": 1058816,
+      "derate": 1.0343808555971954,
+      "p10_ns": 133772,
+      "p90_ns": 150122,
       "num_iters": 20
     },
     {
@@ -1901,8 +1894,8 @@
       ],
       "distinct_experts": 1,
       "routes": 8,
-      "makespan_ns": 136118,
-      "full_call_median_ns": 1088942,
+      "makespan_ns": 138664,
+      "full_call_median_ns": 1109310,
       "measurement_experts": 8,
       "measurement_groups": 8,
       "measurement_tasks": 8,
@@ -1911,11 +1904,11 @@
       "lane_task_counts": [
         8
       ],
-      "iso_max_ns": 134236,
-      "iso_baseline_makespan_ns": 1073888,
-      "derate": 1.0140182216395006,
-      "p10_ns": 134663,
-      "p90_ns": 139990,
+      "iso_max_ns": 135933,
+      "iso_baseline_makespan_ns": 1087464,
+      "derate": 1.0200889408752842,
+      "p10_ns": 136700,
+      "p90_ns": 174266,
       "num_iters": 20
     },
     {
@@ -1924,8 +1917,8 @@
       ],
       "distinct_experts": 1,
       "routes": 9,
-      "makespan_ns": 158584,
-      "full_call_median_ns": 1268672,
+      "makespan_ns": 159820,
+      "full_call_median_ns": 1278561,
       "measurement_experts": 8,
       "measurement_groups": 8,
       "measurement_tasks": 8,
@@ -1934,11 +1927,11 @@
       "lane_task_counts": [
         8
       ],
-      "iso_max_ns": 160690,
-      "iso_baseline_makespan_ns": 1285520,
-      "derate": 0.9868940195407306,
-      "p10_ns": 156477,
-      "p90_ns": 164813,
+      "iso_max_ns": 159839,
+      "iso_baseline_makespan_ns": 1278712,
+      "derate": 0.9998819124243771,
+      "p10_ns": 157614,
+      "p90_ns": 175885,
       "num_iters": 20
     },
     {
@@ -1947,8 +1940,8 @@
       ],
       "distinct_experts": 1,
       "routes": 10,
-      "makespan_ns": 160962,
-      "full_call_median_ns": 1287701,
+      "makespan_ns": 162940,
+      "full_call_median_ns": 1303523,
       "measurement_experts": 8,
       "measurement_groups": 8,
       "measurement_tasks": 8,
@@ -1957,11 +1950,11 @@
       "lane_task_counts": [
         8
       ],
-      "iso_max_ns": 162311,
-      "iso_baseline_makespan_ns": 1298488,
-      "derate": 0.9916926456001134,
-      "p10_ns": 158957,
-      "p90_ns": 169536,
+      "iso_max_ns": 163673,
+      "iso_baseline_makespan_ns": 1309384,
+      "derate": 0.9955238493826104,
+      "p10_ns": 160626,
+      "p90_ns": 174825,
       "num_iters": 20
     },
     {
@@ -1970,8 +1963,8 @@
       ],
       "distinct_experts": 1,
       "routes": 11,
-      "makespan_ns": 177593,
-      "full_call_median_ns": 1420748,
+      "makespan_ns": 176901,
+      "full_call_median_ns": 1415207,
       "measurement_experts": 8,
       "measurement_groups": 8,
       "measurement_tasks": 8,
@@ -1980,11 +1973,11 @@
       "lane_task_counts": [
         8
       ],
-      "iso_max_ns": 176320,
-      "iso_baseline_makespan_ns": 1410560,
-      "derate": 1.007222663339383,
-      "p10_ns": 174847,
-      "p90_ns": 183768,
+      "iso_max_ns": 177015,
+      "iso_baseline_makespan_ns": 1416120,
+      "derate": 0.9993552806259357,
+      "p10_ns": 173859,
+      "p90_ns": 206065,
       "num_iters": 20
     },
     {
@@ -1993,8 +1986,8 @@
       ],
       "distinct_experts": 1,
       "routes": 12,
-      "makespan_ns": 178727,
-      "full_call_median_ns": 1429819,
+      "makespan_ns": 179515,
+      "full_call_median_ns": 1436122,
       "measurement_experts": 8,
       "measurement_groups": 8,
       "measurement_tasks": 8,
@@ -2003,11 +1996,11 @@
       "lane_task_counts": [
         8
       ],
-      "iso_max_ns": 179853,
-      "iso_baseline_makespan_ns": 1438824,
-      "derate": 0.9937414166013355,
-      "p10_ns": 176642,
-      "p90_ns": 191780,
+      "iso_max_ns": 179724,
+      "iso_baseline_makespan_ns": 1437792,
+      "derate": 0.998838496806214,
+      "p10_ns": 176695,
+      "p90_ns": 193833,
       "num_iters": 20
     },
     {
@@ -2016,8 +2009,8 @@
       ],
       "distinct_experts": 1,
       "routes": 24,
-      "makespan_ns": 299959,
-      "full_call_median_ns": 2399675,
+      "makespan_ns": 977675,
+      "full_call_median_ns": 7821405,
       "measurement_experts": 8,
       "measurement_groups": 8,
       "measurement_tasks": 8,
@@ -2026,11 +2019,11 @@
       "lane_task_counts": [
         8
       ],
-      "iso_max_ns": 300954,
-      "iso_baseline_makespan_ns": 2407632,
-      "derate": 0.9966950929377911,
-      "p10_ns": 295312,
-      "p90_ns": 825906,
+      "iso_max_ns": 303307,
+      "iso_baseline_makespan_ns": 2426456,
+      "derate": 3.223386288479989,
+      "p10_ns": 776392,
+      "p90_ns": 1240553,
       "num_iters": 20
     },
     {
@@ -2039,8 +2032,8 @@
       ],
       "distinct_experts": 1,
       "routes": 48,
-      "makespan_ns": 518025,
-      "full_call_median_ns": 4144197,
+      "makespan_ns": 529468,
+      "full_call_median_ns": 4235750,
       "measurement_experts": 8,
       "measurement_groups": 8,
       "measurement_tasks": 8,
@@ -2049,11 +2042,11 @@
       "lane_task_counts": [
         8
       ],
-      "iso_max_ns": 511678,
-      "iso_baseline_makespan_ns": 4093424,
-      "derate": 1.012403552624893,
-      "p10_ns": 507283,
-      "p90_ns": 553823,
+      "iso_max_ns": 534080,
+      "iso_baseline_makespan_ns": 4272640,
+      "derate": 0.9913659938585979,
+      "p10_ns": 523627,
+      "p90_ns": 547176,
       "num_iters": 20
     },
     {
@@ -2062,8 +2055,8 @@
       ],
       "distinct_experts": 1,
       "routes": 192,
-      "makespan_ns": 1758246,
-      "full_call_median_ns": 14065969,
+      "makespan_ns": 1868075,
+      "full_call_median_ns": 14944605,
       "measurement_experts": 8,
       "measurement_groups": 8,
       "measurement_tasks": 8,
@@ -2072,11 +2065,11 @@
       "lane_task_counts": [
         8
       ],
-      "iso_max_ns": 1767414,
-      "iso_baseline_makespan_ns": 14139312,
-      "derate": 0.9948128310627844,
-      "p10_ns": 1741225,
-      "p90_ns": 1843330,
+      "iso_max_ns": 1859605,
+      "iso_baseline_makespan_ns": 14876840,
+      "derate": 1.0045550668018208,
+      "p10_ns": 1836611,
+      "p90_ns": 1932664,
       "num_iters": 20
     },
     {
@@ -2085,8 +2078,8 @@
       ],
       "distinct_experts": 1,
       "routes": 768,
-      "makespan_ns": 6836275,
-      "full_call_median_ns": 54690202,
+      "makespan_ns": 7229244,
+      "full_call_median_ns": 57833957,
       "measurement_experts": 8,
       "measurement_groups": 8,
       "measurement_tasks": 8,
@@ -2095,11 +2088,11 @@
       "lane_task_counts": [
         8
       ],
-      "iso_max_ns": 6891393,
-      "iso_baseline_makespan_ns": 55131144,
-      "derate": 0.9920019435838299,
-      "p10_ns": 6811289,
-      "p90_ns": 9534056,
+      "iso_max_ns": 7253038,
+      "iso_baseline_makespan_ns": 58024304,
+      "derate": 0.9967195298025462,
+      "p10_ns": 7190471,
+      "p90_ns": 7301593,
       "num_iters": 20
     },
     {
@@ -2108,8 +2101,8 @@
       ],
       "distinct_experts": 1,
       "routes": 2040,
-      "makespan_ns": 18343012,
-      "full_call_median_ns": 146744102,
+      "makespan_ns": 19138235,
+      "full_call_median_ns": 153105884,
       "measurement_experts": 8,
       "measurement_groups": 8,
       "measurement_tasks": 8,
@@ -2118,11 +2111,11 @@
       "lane_task_counts": [
         8
       ],
-      "iso_max_ns": 18230474,
-      "iso_baseline_makespan_ns": 145843792,
-      "derate": 1.0061731115713173,
-      "p10_ns": 18210259,
-      "p90_ns": 20017560,
+      "iso_max_ns": 19050601,
+      "iso_baseline_makespan_ns": 152404808,
+      "derate": 1.004600091094239,
+      "p10_ns": 19013387,
+      "p90_ns": 20721796,
       "num_iters": 20
     },
     {
@@ -2132,8 +2125,8 @@
       ],
       "distinct_experts": 2,
       "routes": 1,
-      "makespan_ns": 215280,
-      "full_call_median_ns": 861121,
+      "makespan_ns": 219935,
+      "full_call_median_ns": 879742,
       "measurement_experts": 8,
       "measurement_groups": 4,
       "measurement_tasks": 8,
@@ -2143,11 +2136,11 @@
         4,
         4
       ],
-      "iso_max_ns": 155495,
-      "iso_baseline_makespan_ns": 621980,
-      "derate": 1.3844834239043056,
-      "p10_ns": 212618,
-      "p90_ns": 224184,
+      "iso_max_ns": 152317,
+      "iso_baseline_makespan_ns": 609268,
+      "derate": 1.4439327192631157,
+      "p10_ns": 212671,
+      "p90_ns": 257909,
       "num_iters": 20
     },
     {
@@ -2157,8 +2150,8 @@
       ],
       "distinct_experts": 2,
       "routes": 2,
-      "makespan_ns": 216321,
-      "full_call_median_ns": 865286,
+      "makespan_ns": 215772,
+      "full_call_median_ns": 863086,
       "measurement_experts": 8,
       "measurement_groups": 4,
       "measurement_tasks": 8,
@@ -2168,11 +2161,11 @@
         4,
         4
       ],
-      "iso_max_ns": 158336,
-      "iso_baseline_makespan_ns": 633344,
-      "derate": 1.3662180426434922,
-      "p10_ns": 212788,
-      "p90_ns": 237738,
+      "iso_max_ns": 158281,
+      "iso_baseline_makespan_ns": 633124,
+      "derate": 1.363217947826966,
+      "p10_ns": 210760,
+      "p90_ns": 254725,
       "num_iters": 20
     },
     {
@@ -2182,8 +2175,8 @@
       ],
       "distinct_experts": 2,
       "routes": 3,
-      "makespan_ns": 223606,
-      "full_call_median_ns": 894427,
+      "makespan_ns": 223471,
+      "full_call_median_ns": 893885,
       "measurement_experts": 8,
       "measurement_groups": 4,
       "measurement_tasks": 8,
@@ -2193,11 +2186,11 @@
         4,
         4
       ],
-      "iso_max_ns": 197401,
-      "iso_baseline_makespan_ns": 789604,
-      "derate": 1.1327538867584257,
-      "p10_ns": 218180,
-      "p90_ns": 255966,
+      "iso_max_ns": 167801,
+      "iso_baseline_makespan_ns": 671204,
+      "derate": 1.3317635174998956,
+      "p10_ns": 218668,
+      "p90_ns": 275021,
       "num_iters": 20
     },
     {
@@ -2207,8 +2200,8 @@
       ],
       "distinct_experts": 2,
       "routes": 4,
-      "makespan_ns": 224840,
-      "full_call_median_ns": 899361,
+      "makespan_ns": 223912,
+      "full_call_median_ns": 895647,
       "measurement_experts": 8,
       "measurement_groups": 4,
       "measurement_tasks": 8,
@@ -2218,11 +2211,11 @@
         4,
         4
       ],
-      "iso_max_ns": 171673,
-      "iso_baseline_makespan_ns": 686692,
-      "derate": 1.3097007100708906,
-      "p10_ns": 221108,
-      "p90_ns": 238283,
+      "iso_max_ns": 169739,
+      "iso_baseline_makespan_ns": 678956,
+      "derate": 1.3191532293697972,
+      "p10_ns": 220194,
+      "p90_ns": 248885,
       "num_iters": 20
     },
     {
@@ -2232,8 +2225,8 @@
       ],
       "distinct_experts": 2,
       "routes": 5,
-      "makespan_ns": 231945,
-      "full_call_median_ns": 927781,
+      "makespan_ns": 230900,
+      "full_call_median_ns": 923601,
       "measurement_experts": 8,
       "measurement_groups": 4,
       "measurement_tasks": 8,
@@ -2243,11 +2236,11 @@
         4,
         4
       ],
-      "iso_max_ns": 183876,
-      "iso_baseline_makespan_ns": 735504,
-      "derate": 1.2614220996758685,
-      "p10_ns": 225476,
-      "p90_ns": 260595,
+      "iso_max_ns": 183751,
+      "iso_baseline_makespan_ns": 735004,
+      "derate": 1.256593161397761,
+      "p10_ns": 226536,
+      "p90_ns": 245516,
       "num_iters": 20
     },
     {
@@ -2257,8 +2250,8 @@
       ],
       "distinct_experts": 2,
       "routes": 6,
-      "makespan_ns": 230328,
-      "full_call_median_ns": 921311,
+      "makespan_ns": 230495,
+      "full_call_median_ns": 921980,
       "measurement_experts": 8,
       "measurement_groups": 4,
       "measurement_tasks": 8,
@@ -2268,11 +2261,11 @@
         4,
         4
       ],
-      "iso_max_ns": 185875,
-      "iso_baseline_makespan_ns": 743500,
-      "derate": 1.23915400134499,
-      "p10_ns": 225637,
-      "p90_ns": 265791,
+      "iso_max_ns": 183121,
+      "iso_baseline_makespan_ns": 732484,
+      "derate": 1.2587032617777316,
+      "p10_ns": 226510,
+      "p90_ns": 309579,
       "num_iters": 20
     },
     {
@@ -2282,8 +2275,8 @@
       ],
       "distinct_experts": 2,
       "routes": 7,
-      "makespan_ns": 248327,
-      "full_call_median_ns": 993308,
+      "makespan_ns": 251538,
+      "full_call_median_ns": 1006153,
       "measurement_experts": 8,
       "measurement_groups": 4,
       "measurement_tasks": 8,
@@ -2293,11 +2286,11 @@
         4,
         4
       ],
-      "iso_max_ns": 208529,
-      "iso_baseline_makespan_ns": 834116,
-      "derate": 1.1908511525974805,
-      "p10_ns": 244946,
-      "p90_ns": 284212,
+      "iso_max_ns": 213492,
+      "iso_baseline_makespan_ns": 853968,
+      "derate": 1.178209253742529,
+      "p10_ns": 247078,
+      "p90_ns": 277029,
       "num_iters": 20
     },
     {
@@ -2307,8 +2300,8 @@
       ],
       "distinct_experts": 2,
       "routes": 8,
-      "makespan_ns": 250185,
-      "full_call_median_ns": 1000739,
+      "makespan_ns": 251610,
+      "full_call_median_ns": 1006438,
       "measurement_experts": 8,
       "measurement_groups": 4,
       "measurement_tasks": 8,
@@ -2318,11 +2311,11 @@
         4,
         4
       ],
-      "iso_max_ns": 210985,
-      "iso_baseline_makespan_ns": 843940,
-      "derate": 1.1857940137924496,
-      "p10_ns": 245293,
-      "p90_ns": 255181,
+      "iso_max_ns": 211463,
+      "iso_baseline_makespan_ns": 845852,
+      "derate": 1.1898511796389912,
+      "p10_ns": 247149,
+      "p90_ns": 267128,
       "num_iters": 20
     },
     {
@@ -2332,8 +2325,8 @@
       ],
       "distinct_experts": 2,
       "routes": 9,
-      "makespan_ns": 290174,
-      "full_call_median_ns": 1160696,
+      "makespan_ns": 293767,
+      "full_call_median_ns": 1175068,
       "measurement_experts": 8,
       "measurement_groups": 4,
       "measurement_tasks": 8,
@@ -2343,11 +2336,11 @@
         4,
         4
       ],
-      "iso_max_ns": 242558,
-      "iso_baseline_makespan_ns": 970232,
-      "derate": 1.196307687233569,
-      "p10_ns": 284534,
-      "p90_ns": 294204,
+      "iso_max_ns": 240491,
+      "iso_baseline_makespan_ns": 961964,
+      "derate": 1.2215301196302564,
+      "p10_ns": 286035,
+      "p90_ns": 301738,
       "num_iters": 20
     },
     {
@@ -2357,8 +2350,8 @@
       ],
       "distinct_experts": 2,
       "routes": 10,
-      "makespan_ns": 290352,
-      "full_call_median_ns": 1161409,
+      "makespan_ns": 291280,
+      "full_call_median_ns": 1165122,
       "measurement_experts": 8,
       "measurement_groups": 4,
       "measurement_tasks": 8,
@@ -2368,11 +2361,11 @@
         4,
         4
       ],
-      "iso_max_ns": 244150,
-      "iso_baseline_makespan_ns": 976600,
-      "derate": 1.189237149293467,
-      "p10_ns": 287884,
-      "p90_ns": 307707,
+      "iso_max_ns": 241664,
+      "iso_baseline_makespan_ns": 966656,
+      "derate": 1.2053119206832628,
+      "p10_ns": 286166,
+      "p90_ns": 300790,
       "num_iters": 20
     },
     {
@@ -2382,8 +2375,8 @@
       ],
       "distinct_experts": 2,
       "routes": 11,
-      "makespan_ns": 319736,
-      "full_call_median_ns": 1278944,
+      "makespan_ns": 322522,
+      "full_call_median_ns": 1290089,
       "measurement_experts": 8,
       "measurement_groups": 4,
       "measurement_tasks": 8,
@@ -2393,11 +2386,11 @@
         4,
         4
       ],
-      "iso_max_ns": 268325,
-      "iso_baseline_makespan_ns": 1073300,
-      "derate": 1.191599739122333,
-      "p10_ns": 313742,
-      "p90_ns": 401912,
+      "iso_max_ns": 267811,
+      "iso_baseline_makespan_ns": 1071244,
+      "derate": 1.2042905257812413,
+      "p10_ns": 314027,
+      "p90_ns": 392542,
       "num_iters": 20
     },
     {
@@ -2407,8 +2400,8 @@
       ],
       "distinct_experts": 2,
       "routes": 12,
-      "makespan_ns": 320743,
-      "full_call_median_ns": 1282973,
+      "makespan_ns": 321433,
+      "full_call_median_ns": 1285734,
       "measurement_experts": 8,
       "measurement_groups": 4,
       "measurement_tasks": 8,
@@ -2418,11 +2411,11 @@
         4,
         4
       ],
-      "iso_max_ns": 270629,
-      "iso_baseline_makespan_ns": 1082516,
-      "derate": 1.1851769396480052,
-      "p10_ns": 317496,
-      "p90_ns": 349512,
+      "iso_max_ns": 270790,
+      "iso_baseline_makespan_ns": 1083160,
+      "derate": 1.1870213080246685,
+      "p10_ns": 317701,
+      "p90_ns": 333217,
       "num_iters": 20
     },
     {
@@ -2432,8 +2425,8 @@
       ],
       "distinct_experts": 2,
       "routes": 24,
-      "makespan_ns": 569537,
-      "full_call_median_ns": 2278148,
+      "makespan_ns": 569214,
+      "full_call_median_ns": 2276857,
       "measurement_experts": 8,
       "measurement_groups": 4,
       "measurement_tasks": 8,
@@ -2443,11 +2436,11 @@
         4,
         4
       ],
-      "iso_max_ns": 494242,
-      "iso_baseline_makespan_ns": 1976968,
-      "derate": 1.1523443980883858,
-      "p10_ns": 561670,
-      "p90_ns": 610893,
+      "iso_max_ns": 487960,
+      "iso_baseline_makespan_ns": 1951840,
+      "derate": 1.1665182596934176,
+      "p10_ns": 558292,
+      "p90_ns": 649246,
       "num_iters": 20
     },
     {
@@ -2457,8 +2450,8 @@
       ],
       "distinct_experts": 2,
       "routes": 48,
-      "makespan_ns": 1018874,
-      "full_call_median_ns": 4075496,
+      "makespan_ns": 1037497,
+      "full_call_median_ns": 4149990,
       "measurement_experts": 8,
       "measurement_groups": 4,
       "measurement_tasks": 8,
@@ -2468,11 +2461,11 @@
         4,
         4
       ],
-      "iso_max_ns": 906316,
-      "iso_baseline_makespan_ns": 3625264,
-      "derate": 1.1241928863663446,
-      "p10_ns": 1005455,
-      "p90_ns": 1086126,
+      "iso_max_ns": 938940,
+      "iso_baseline_makespan_ns": 3755760,
+      "derate": 1.104966771039683,
+      "p10_ns": 1016743,
+      "p90_ns": 1141009,
       "num_iters": 20
     },
     {
@@ -2482,8 +2475,8 @@
       ],
       "distinct_experts": 2,
       "routes": 192,
-      "makespan_ns": 3710984,
-      "full_call_median_ns": 14843938,
+      "makespan_ns": 3804437,
+      "full_call_median_ns": 15217751,
       "measurement_experts": 8,
       "measurement_groups": 4,
       "measurement_tasks": 8,
@@ -2493,11 +2486,11 @@
         4,
         4
       ],
-      "iso_max_ns": 3322949,
-      "iso_baseline_makespan_ns": 13291796,
-      "derate": 1.1167744374048474,
-      "p10_ns": 3661684,
-      "p90_ns": 7039310,
+      "iso_max_ns": 3403214,
+      "iso_baseline_makespan_ns": 13612856,
+      "derate": 1.1178955393342882,
+      "p10_ns": 3721533,
+      "p90_ns": 4951417,
       "num_iters": 20
     },
     {
@@ -2507,8 +2500,8 @@
       ],
       "distinct_experts": 2,
       "routes": 768,
-      "makespan_ns": 14340889,
-      "full_call_median_ns": 57363556,
+      "makespan_ns": 14585920,
+      "full_call_median_ns": 58343679,
       "measurement_experts": 8,
       "measurement_groups": 4,
       "measurement_tasks": 8,
@@ -2518,11 +2511,11 @@
         4,
         4
       ],
-      "iso_max_ns": 13018197,
-      "iso_baseline_makespan_ns": 52072788,
-      "derate": 1.1016033172642878,
-      "p10_ns": 14225752,
-      "p90_ns": 14683831,
+      "iso_max_ns": 13274640,
+      "iso_baseline_makespan_ns": 53098560,
+      "derate": 1.0987808143949667,
+      "p10_ns": 14455491,
+      "p90_ns": 15626859,
       "num_iters": 20
     },
     {
@@ -2532,8 +2525,8 @@
       ],
       "distinct_experts": 2,
       "routes": 2040,
-      "makespan_ns": 37716230,
-      "full_call_median_ns": 150864923,
+      "makespan_ns": 38618118,
+      "full_call_median_ns": 154472472,
       "measurement_experts": 8,
       "measurement_groups": 4,
       "measurement_tasks": 8,
@@ -2543,11 +2536,11 @@
         4,
         4
       ],
-      "iso_max_ns": 34439144,
-      "iso_baseline_makespan_ns": 137756576,
-      "derate": 1.0951558711796088,
-      "p10_ns": 37485736,
-      "p90_ns": 46298709,
+      "iso_max_ns": 34893186,
+      "iso_baseline_makespan_ns": 139572744,
+      "derate": 1.1067524186527422,
+      "p10_ns": 38381841,
+      "p90_ns": 41410959,
       "num_iters": 20
     },
     {
@@ -2559,8 +2552,8 @@
       ],
       "distinct_experts": 4,
       "routes": 1,
-      "makespan_ns": 414176,
-      "full_call_median_ns": 828351,
+      "makespan_ns": 416544,
+      "full_call_median_ns": 833088,
       "measurement_experts": 8,
       "measurement_groups": 2,
       "measurement_tasks": 8,
@@ -2572,11 +2565,11 @@
         2,
         2
       ],
-      "iso_max_ns": 240487,
-      "iso_baseline_makespan_ns": 480974,
-      "derate": 1.722236545010749,
-      "p10_ns": 397911,
-      "p90_ns": 428780,
+      "iso_max_ns": 241126,
+      "iso_baseline_makespan_ns": 482252,
+      "derate": 1.7274951685011155,
+      "p10_ns": 399092,
+      "p90_ns": 476164,
       "num_iters": 20
     },
     {
@@ -2588,8 +2581,8 @@
       ],
       "distinct_experts": 4,
       "routes": 2,
-      "makespan_ns": 417407,
-      "full_call_median_ns": 834814,
+      "makespan_ns": 419904,
+      "full_call_median_ns": 839807,
       "measurement_experts": 8,
       "measurement_groups": 2,
       "measurement_tasks": 8,
@@ -2601,11 +2594,11 @@
         2,
         2
       ],
-      "iso_max_ns": 247098,
-      "iso_baseline_makespan_ns": 494196,
-      "derate": 1.6892366591392889,
-      "p10_ns": 400921,
-      "p90_ns": 429734,
+      "iso_max_ns": 245996,
+      "iso_baseline_makespan_ns": 491992,
+      "derate": 1.7069525520740174,
+      "p10_ns": 413895,
+      "p90_ns": 543057,
       "num_iters": 20
     },
     {
@@ -2617,8 +2610,8 @@
       ],
       "distinct_experts": 4,
       "routes": 3,
-      "makespan_ns": 422593,
-      "full_call_median_ns": 845187,
+      "makespan_ns": 421379,
+      "full_call_median_ns": 842758,
       "measurement_experts": 8,
       "measurement_groups": 2,
       "measurement_tasks": 8,
@@ -2630,11 +2623,11 @@
         2,
         2
       ],
-      "iso_max_ns": 273188,
-      "iso_baseline_makespan_ns": 546376,
-      "derate": 1.5468962765568033,
-      "p10_ns": 414551,
-      "p90_ns": 463290,
+      "iso_max_ns": 272258,
+      "iso_baseline_makespan_ns": 544516,
+      "derate": 1.5477194425875456,
+      "p10_ns": 408546,
+      "p90_ns": 482816,
       "num_iters": 20
     },
     {
@@ -2646,8 +2639,8 @@
       ],
       "distinct_experts": 4,
       "routes": 4,
-      "makespan_ns": 422917,
-      "full_call_median_ns": 845835,
+      "makespan_ns": 425422,
+      "full_call_median_ns": 850844,
       "measurement_experts": 8,
       "measurement_groups": 2,
       "measurement_tasks": 8,
@@ -2659,11 +2652,11 @@
         2,
         2
       ],
-      "iso_max_ns": 275519,
-      "iso_baseline_makespan_ns": 551038,
-      "derate": 1.5349848830752144,
-      "p10_ns": 413636,
-      "p90_ns": 435801,
+      "iso_max_ns": 271165,
+      "iso_baseline_makespan_ns": 542330,
+      "derate": 1.5688676635996532,
+      "p10_ns": 416044,
+      "p90_ns": 447525,
       "num_iters": 20
     },
     {
@@ -2675,8 +2668,8 @@
       ],
       "distinct_experts": 4,
       "routes": 5,
-      "makespan_ns": 436929,
-      "full_call_median_ns": 873859,
+      "makespan_ns": 435843,
+      "full_call_median_ns": 871686,
       "measurement_experts": 8,
       "measurement_groups": 2,
       "measurement_tasks": 8,
@@ -2688,11 +2681,11 @@
         2,
         2
       ],
-      "iso_max_ns": 295288,
-      "iso_baseline_makespan_ns": 590576,
-      "derate": 1.4796723876351223,
-      "p10_ns": 424767,
-      "p90_ns": 481129,
+      "iso_max_ns": 299683,
+      "iso_baseline_makespan_ns": 599366,
+      "derate": 1.4543467597427948,
+      "p10_ns": 425905,
+      "p90_ns": 448261,
       "num_iters": 20
     },
     {
@@ -2704,8 +2697,8 @@
       ],
       "distinct_experts": 4,
       "routes": 6,
-      "makespan_ns": 437903,
-      "full_call_median_ns": 875807,
+      "makespan_ns": 430456,
+      "full_call_median_ns": 860912,
       "measurement_experts": 8,
       "measurement_groups": 2,
       "measurement_tasks": 8,
@@ -2717,11 +2710,11 @@
         2,
         2
       ],
-      "iso_max_ns": 303454,
-      "iso_baseline_makespan_ns": 606908,
-      "derate": 1.4430638581135855,
-      "p10_ns": 431670,
-      "p90_ns": 456785,
+      "iso_max_ns": 297927,
+      "iso_baseline_makespan_ns": 595854,
+      "derate": 1.444837158095775,
+      "p10_ns": 425059,
+      "p90_ns": 447294,
       "num_iters": 20
     },
     {
@@ -2733,8 +2726,8 @@
       ],
       "distinct_experts": 4,
       "routes": 7,
-      "makespan_ns": 470810,
-      "full_call_median_ns": 941619,
+      "makespan_ns": 469323,
+      "full_call_median_ns": 938647,
       "measurement_experts": 8,
       "measurement_groups": 2,
       "measurement_tasks": 8,
@@ -2746,11 +2739,11 @@
         2,
         2
       ],
-      "iso_max_ns": 338209,
-      "iso_baseline_makespan_ns": 676418,
-      "derate": 1.3920667397969895,
-      "p10_ns": 464895,
-      "p90_ns": 485851,
+      "iso_max_ns": 340307,
+      "iso_baseline_makespan_ns": 680614,
+      "derate": 1.3791179728891854,
+      "p10_ns": 462062,
+      "p90_ns": 486371,
       "num_iters": 20
     },
     {
@@ -2762,8 +2755,8 @@
       ],
       "distinct_experts": 4,
       "routes": 8,
-      "makespan_ns": 472956,
-      "full_call_median_ns": 945912,
+      "makespan_ns": 472961,
+      "full_call_median_ns": 945922,
       "measurement_experts": 8,
       "measurement_groups": 2,
       "measurement_tasks": 8,
@@ -2775,11 +2768,11 @@
         2,
         2
       ],
-      "iso_max_ns": 339744,
-      "iso_baseline_makespan_ns": 679488,
-      "derate": 1.3920952246397287,
-      "p10_ns": 466233,
-      "p90_ns": 488600,
+      "iso_max_ns": 338156,
+      "iso_baseline_makespan_ns": 676312,
+      "derate": 1.3986473698529673,
+      "p10_ns": 459048,
+      "p90_ns": 487961,
       "num_iters": 20
     },
     {
@@ -2791,8 +2784,8 @@
       ],
       "distinct_experts": 4,
       "routes": 9,
-      "makespan_ns": 543561,
-      "full_call_median_ns": 1087123,
+      "makespan_ns": 547019,
+      "full_call_median_ns": 1094039,
       "measurement_experts": 8,
       "measurement_groups": 2,
       "measurement_tasks": 8,
@@ -2804,11 +2797,11 @@
         2,
         2
       ],
-      "iso_max_ns": 387982,
-      "iso_baseline_makespan_ns": 775964,
-      "derate": 1.4009966957229976,
-      "p10_ns": 532944,
-      "p90_ns": 563558,
+      "iso_max_ns": 384443,
+      "iso_baseline_makespan_ns": 768886,
+      "derate": 1.4228884385981797,
+      "p10_ns": 535094,
+      "p90_ns": 566634,
       "num_iters": 20
     },
     {
@@ -2820,8 +2813,8 @@
       ],
       "distinct_experts": 4,
       "routes": 10,
-      "makespan_ns": 546414,
-      "full_call_median_ns": 1092828,
+      "makespan_ns": 551680,
+      "full_call_median_ns": 1103360,
       "measurement_experts": 8,
       "measurement_groups": 2,
       "measurement_tasks": 8,
@@ -2833,11 +2826,11 @@
         2,
         2
       ],
-      "iso_max_ns": 384780,
-      "iso_baseline_makespan_ns": 769560,
-      "derate": 1.4200686106346483,
-      "p10_ns": 539621,
-      "p90_ns": 566246,
+      "iso_max_ns": 384266,
+      "iso_baseline_makespan_ns": 768532,
+      "derate": 1.4356721645943176,
+      "p10_ns": 532453,
+      "p90_ns": 673452,
       "num_iters": 20
     },
     {
@@ -2849,8 +2842,8 @@
       ],
       "distinct_experts": 4,
       "routes": 11,
-      "makespan_ns": 602380,
-      "full_call_median_ns": 1204759,
+      "makespan_ns": 600337,
+      "full_call_median_ns": 1200675,
       "measurement_experts": 8,
       "measurement_groups": 2,
       "measurement_tasks": 8,
@@ -2862,11 +2855,11 @@
         2,
         2
       ],
-      "iso_max_ns": 431543,
-      "iso_baseline_makespan_ns": 863086,
-      "derate": 1.3958736441096253,
-      "p10_ns": 593204,
-      "p90_ns": 672948,
+      "iso_max_ns": 427650,
+      "iso_baseline_makespan_ns": 855300,
+      "derate": 1.403805682216766,
+      "p10_ns": 580403,
+      "p90_ns": 656507,
       "num_iters": 20
     },
     {
@@ -2878,8 +2871,8 @@
       ],
       "distinct_experts": 4,
       "routes": 12,
-      "makespan_ns": 602650,
-      "full_call_median_ns": 1205301,
+      "makespan_ns": 600449,
+      "full_call_median_ns": 1200897,
       "measurement_experts": 8,
       "measurement_groups": 2,
       "measurement_tasks": 8,
@@ -2891,11 +2884,11 @@
         2,
         2
       ],
-      "iso_max_ns": 433521,
-      "iso_baseline_makespan_ns": 867042,
-      "derate": 1.3901298899015273,
-      "p10_ns": 591606,
-      "p90_ns": 673626,
+      "iso_max_ns": 433571,
+      "iso_baseline_makespan_ns": 867142,
+      "derate": 1.3848908252627596,
+      "p10_ns": 591797,
+      "p90_ns": 661553,
       "num_iters": 20
     },
     {
@@ -2907,8 +2900,8 @@
       ],
       "distinct_experts": 4,
       "routes": 24,
-      "makespan_ns": 1092683,
-      "full_call_median_ns": 2185366,
+      "makespan_ns": 1104136,
+      "full_call_median_ns": 2208272,
       "measurement_experts": 8,
       "measurement_groups": 2,
       "measurement_tasks": 8,
@@ -2920,11 +2913,11 @@
         2,
         2
       ],
-      "iso_max_ns": 826738,
-      "iso_baseline_makespan_ns": 1653476,
-      "derate": 1.321679903427688,
-      "p10_ns": 1079991,
-      "p90_ns": 1182738,
+      "iso_max_ns": 815435,
+      "iso_baseline_makespan_ns": 1630870,
+      "derate": 1.3540453868180786,
+      "p10_ns": 1078239,
+      "p90_ns": 1226459,
       "num_iters": 20
     },
     {
@@ -2936,8 +2929,8 @@
       ],
       "distinct_experts": 4,
       "routes": 48,
-      "makespan_ns": 2062908,
-      "full_call_median_ns": 4125816,
+      "makespan_ns": 2071078,
+      "full_call_median_ns": 4142157,
       "measurement_experts": 8,
       "measurement_groups": 2,
       "measurement_tasks": 8,
@@ -2949,11 +2942,11 @@
         2,
         2
       ],
-      "iso_max_ns": 1626677,
-      "iso_baseline_makespan_ns": 3253354,
-      "derate": 1.268173091523394,
-      "p10_ns": 2022638,
-      "p90_ns": 2227179,
+      "iso_max_ns": 1656527,
+      "iso_baseline_makespan_ns": 3313054,
+      "derate": 1.250253391583717,
+      "p10_ns": 2026867,
+      "p90_ns": 2235262,
       "num_iters": 20
     },
     {
@@ -2965,8 +2958,8 @@
       ],
       "distinct_experts": 4,
       "routes": 192,
-      "makespan_ns": 7559083,
-      "full_call_median_ns": 15118167,
+      "makespan_ns": 7835200,
+      "full_call_median_ns": 15670401,
       "measurement_experts": 8,
       "measurement_groups": 2,
       "measurement_tasks": 8,
@@ -2978,11 +2971,11 @@
         2,
         2
       ],
-      "iso_max_ns": 6032035,
-      "iso_baseline_makespan_ns": 12064070,
-      "derate": 1.2531564389132357,
-      "p10_ns": 7488770,
-      "p90_ns": 7859389,
+      "iso_max_ns": 6205118,
+      "iso_baseline_makespan_ns": 12410236,
+      "derate": 1.2626996779110404,
+      "p10_ns": 7666624,
+      "p90_ns": 13958165,
       "num_iters": 20
     },
     {
@@ -2994,8 +2987,8 @@
       ],
       "distinct_experts": 4,
       "routes": 768,
-      "makespan_ns": 29264768,
-      "full_call_median_ns": 58529537,
+      "makespan_ns": 29915436,
+      "full_call_median_ns": 59830871,
       "measurement_experts": 8,
       "measurement_groups": 2,
       "measurement_tasks": 8,
@@ -3007,11 +3000,11 @@
         2,
         2
       ],
-      "iso_max_ns": 23476079,
-      "iso_baseline_makespan_ns": 46952158,
-      "derate": 1.2465782083967258,
-      "p10_ns": 29144924,
-      "p90_ns": 29430543,
+      "iso_max_ns": 23738936,
+      "iso_baseline_makespan_ns": 47477872,
+      "derate": 1.2601843444036414,
+      "p10_ns": 29754153,
+      "p90_ns": 30145982,
       "num_iters": 20
     },
     {
@@ -3023,8 +3016,8 @@
       ],
       "distinct_experts": 4,
       "routes": 2040,
-      "makespan_ns": 76724191,
-      "full_call_median_ns": 153448383,
+      "makespan_ns": 78823391,
+      "full_call_median_ns": 157646783,
       "measurement_experts": 8,
       "measurement_groups": 2,
       "measurement_tasks": 8,
@@ -3036,11 +3029,11 @@
         2,
         2
       ],
-      "iso_max_ns": 61450301,
-      "iso_baseline_makespan_ns": 122900602,
-      "derate": 1.248556805279115,
-      "p10_ns": 76541369,
-      "p90_ns": 77635540,
+      "iso_max_ns": 61744464,
+      "iso_baseline_makespan_ns": 123488928,
+      "derate": 1.2766066201497839,
+      "p10_ns": 78450551,
+      "p90_ns": 87185919,
       "num_iters": 20
     },
     {
@@ -3056,8 +3049,8 @@
       ],
       "distinct_experts": 8,
       "routes": 1,
-      "makespan_ns": 795733,
-      "full_call_median_ns": 795733,
+      "makespan_ns": 801222,
+      "full_call_median_ns": 801222,
       "measurement_experts": 8,
       "measurement_groups": 1,
       "measurement_tasks": 8,
@@ -3073,11 +3066,11 @@
         1,
         1
       ],
-      "iso_max_ns": 435330,
-      "iso_baseline_makespan_ns": 435330,
-      "derate": 1.8278845932970391,
-      "p10_ns": 753649,
-      "p90_ns": 955640,
+      "iso_max_ns": 437381,
+      "iso_baseline_makespan_ns": 437381,
+      "derate": 1.8318628381205402,
+      "p10_ns": 769406,
+      "p90_ns": 815576,
       "num_iters": 20
     },
     {
@@ -3093,8 +3086,8 @@
       ],
       "distinct_experts": 8,
       "routes": 2,
-      "makespan_ns": 809234,
-      "full_call_median_ns": 809234,
+      "makespan_ns": 801725,
+      "full_call_median_ns": 801725,
       "measurement_experts": 8,
       "measurement_groups": 1,
       "measurement_tasks": 8,
@@ -3110,11 +3103,11 @@
         1,
         1
       ],
-      "iso_max_ns": 434415,
-      "iso_baseline_makespan_ns": 434415,
-      "derate": 1.8628132085678442,
-      "p10_ns": 794662,
-      "p90_ns": 841155,
+      "iso_max_ns": 431005,
+      "iso_baseline_makespan_ns": 431005,
+      "derate": 1.8601292328395262,
+      "p10_ns": 756975,
+      "p90_ns": 814312,
       "num_iters": 20
     },
     {
@@ -3130,8 +3123,8 @@
       ],
       "distinct_experts": 8,
       "routes": 3,
-      "makespan_ns": 818564,
-      "full_call_median_ns": 818564,
+      "makespan_ns": 807478,
+      "full_call_median_ns": 807478,
       "measurement_experts": 8,
       "measurement_groups": 1,
       "measurement_tasks": 8,
@@ -3147,11 +3140,11 @@
         1,
         1
       ],
-      "iso_max_ns": 464878,
-      "iso_baseline_makespan_ns": 464878,
-      "derate": 1.7608146653530603,
-      "p10_ns": 790997,
-      "p90_ns": 939375,
+      "iso_max_ns": 468300,
+      "iso_baseline_makespan_ns": 468300,
+      "derate": 1.7242750373692077,
+      "p10_ns": 777740,
+      "p90_ns": 833260,
       "num_iters": 20
     },
     {
@@ -3167,8 +3160,8 @@
       ],
       "distinct_experts": 8,
       "routes": 4,
-      "makespan_ns": 827838,
-      "full_call_median_ns": 827838,
+      "makespan_ns": 809060,
+      "full_call_median_ns": 809060,
       "measurement_experts": 8,
       "measurement_groups": 1,
       "measurement_tasks": 8,
@@ -3184,11 +3177,11 @@
         1,
         1
       ],
-      "iso_max_ns": 472129,
-      "iso_baseline_makespan_ns": 472129,
-      "derate": 1.7534148506022718,
-      "p10_ns": 805947,
-      "p90_ns": 889815,
+      "iso_max_ns": 468240,
+      "iso_baseline_makespan_ns": 468240,
+      "derate": 1.7278745942251836,
+      "p10_ns": 795424,
+      "p90_ns": 851270,
       "num_iters": 20
     },
     {
@@ -3204,8 +3197,8 @@
       ],
       "distinct_experts": 8,
       "routes": 5,
-      "makespan_ns": 1100863,
-      "full_call_median_ns": 1100863,
+      "makespan_ns": 827513,
+      "full_call_median_ns": 827513,
       "measurement_experts": 8,
       "measurement_groups": 1,
       "measurement_tasks": 8,
@@ -3221,11 +3214,11 @@
         1,
         1
       ],
-      "iso_max_ns": 500255,
-      "iso_baseline_makespan_ns": 500255,
-      "derate": 2.2006036921170202,
-      "p10_ns": 969435,
-      "p90_ns": 1902745,
+      "iso_max_ns": 499169,
+      "iso_baseline_makespan_ns": 499169,
+      "derate": 1.6577812324082626,
+      "p10_ns": 812018,
+      "p90_ns": 840118,
       "num_iters": 20
     },
     {
@@ -3241,8 +3234,8 @@
       ],
       "distinct_experts": 8,
       "routes": 6,
-      "makespan_ns": 881416,
-      "full_call_median_ns": 881416,
+      "makespan_ns": 826479,
+      "full_call_median_ns": 826479,
       "measurement_experts": 8,
       "measurement_groups": 1,
       "measurement_tasks": 8,
@@ -3258,11 +3251,11 @@
         1,
         1
       ],
-      "iso_max_ns": 499795,
-      "iso_baseline_makespan_ns": 499795,
-      "derate": 1.7635550575736052,
-      "p10_ns": 833788,
-      "p90_ns": 2269640,
+      "iso_max_ns": 503524,
+      "iso_baseline_makespan_ns": 503524,
+      "derate": 1.6413894868963546,
+      "p10_ns": 809070,
+      "p90_ns": 847662,
       "num_iters": 20
     },
     {
@@ -3278,8 +3271,8 @@
       ],
       "distinct_experts": 8,
       "routes": 7,
-      "makespan_ns": 907697,
-      "full_call_median_ns": 907697,
+      "makespan_ns": 899904,
+      "full_call_median_ns": 899904,
       "measurement_experts": 8,
       "measurement_groups": 1,
       "measurement_tasks": 8,
@@ -3295,11 +3288,11 @@
         1,
         1
       ],
-      "iso_max_ns": 532248,
-      "iso_baseline_makespan_ns": 532248,
-      "derate": 1.7054023688205497,
-      "p10_ns": 890746,
-      "p90_ns": 1101905,
+      "iso_max_ns": 537819,
+      "iso_baseline_makespan_ns": 537819,
+      "derate": 1.673246947393082,
+      "p10_ns": 883225,
+      "p90_ns": 939126,
       "num_iters": 20
     },
     {
@@ -3315,8 +3308,8 @@
       ],
       "distinct_experts": 8,
       "routes": 8,
-      "makespan_ns": 907064,
-      "full_call_median_ns": 907064,
+      "makespan_ns": 903640,
+      "full_call_median_ns": 903640,
       "measurement_experts": 8,
       "measurement_groups": 1,
       "measurement_tasks": 8,
@@ -3332,11 +3325,11 @@
         1,
         1
       ],
-      "iso_max_ns": 534931,
-      "iso_baseline_makespan_ns": 534931,
-      "derate": 1.695665422269414,
-      "p10_ns": 890995,
-      "p90_ns": 956702,
+      "iso_max_ns": 541137,
+      "iso_baseline_makespan_ns": 541137,
+      "derate": 1.669891358380595,
+      "p10_ns": 878172,
+      "p90_ns": 924251,
       "num_iters": 20
     },
     {
@@ -3352,8 +3345,8 @@
       ],
       "distinct_experts": 8,
       "routes": 9,
-      "makespan_ns": 1024641,
-      "full_call_median_ns": 1024641,
+      "makespan_ns": 1031660,
+      "full_call_median_ns": 1031660,
       "measurement_experts": 8,
       "measurement_groups": 1,
       "measurement_tasks": 8,
@@ -3369,11 +3362,11 @@
         1,
         1
       ],
-      "iso_max_ns": 595185,
-      "iso_baseline_makespan_ns": 595185,
-      "derate": 1.7215504422994532,
-      "p10_ns": 1005702,
-      "p90_ns": 1050233,
+      "iso_max_ns": 598824,
+      "iso_baseline_makespan_ns": 598824,
+      "derate": 1.7228100410137202,
+      "p10_ns": 1000797,
+      "p90_ns": 1144938,
       "num_iters": 20
     },
     {
@@ -3389,8 +3382,8 @@
       ],
       "distinct_experts": 8,
       "routes": 10,
-      "makespan_ns": 1045776,
-      "full_call_median_ns": 1045776,
+      "makespan_ns": 1043501,
+      "full_call_median_ns": 1043501,
       "measurement_experts": 8,
       "measurement_groups": 1,
       "measurement_tasks": 8,
@@ -3406,11 +3399,11 @@
         1,
         1
       ],
-      "iso_max_ns": 594121,
-      "iso_baseline_makespan_ns": 594121,
-      "derate": 1.7602070958609441,
-      "p10_ns": 1031817,
-      "p90_ns": 1094835,
+      "iso_max_ns": 593786,
+      "iso_baseline_makespan_ns": 593786,
+      "derate": 1.757368816374923,
+      "p10_ns": 998827,
+      "p90_ns": 1102374,
       "num_iters": 20
     },
     {
@@ -3426,8 +3419,8 @@
       ],
       "distinct_experts": 8,
       "routes": 11,
-      "makespan_ns": 1145790,
-      "full_call_median_ns": 1145790,
+      "makespan_ns": 1142701,
+      "full_call_median_ns": 1142701,
       "measurement_experts": 8,
       "measurement_groups": 1,
       "measurement_tasks": 8,
@@ -3443,11 +3436,11 @@
         1,
         1
       ],
-      "iso_max_ns": 672827,
-      "iso_baseline_makespan_ns": 672827,
-      "derate": 1.7029489006832366,
-      "p10_ns": 1131125,
-      "p90_ns": 1176179,
+      "iso_max_ns": 674465,
+      "iso_baseline_makespan_ns": 674465,
+      "derate": 1.694233207060411,
+      "p10_ns": 1115957,
+      "p90_ns": 1282608,
       "num_iters": 20
     },
     {
@@ -3463,8 +3456,8 @@
       ],
       "distinct_experts": 8,
       "routes": 12,
-      "makespan_ns": 1144012,
-      "full_call_median_ns": 1144012,
+      "makespan_ns": 1158137,
+      "full_call_median_ns": 1158137,
       "measurement_experts": 8,
       "measurement_groups": 1,
       "measurement_tasks": 8,
@@ -3480,11 +3473,11 @@
         1,
         1
       ],
-      "iso_max_ns": 676756,
-      "iso_baseline_makespan_ns": 676756,
-      "derate": 1.6904349573553836,
-      "p10_ns": 1126331,
-      "p90_ns": 1168529,
+      "iso_max_ns": 679193,
+      "iso_baseline_makespan_ns": 679193,
+      "derate": 1.7051662782154704,
+      "p10_ns": 1111421,
+      "p90_ns": 2021782,
       "num_iters": 20
     },
     {
@@ -3500,8 +3493,8 @@
       ],
       "distinct_experts": 8,
       "routes": 24,
-      "makespan_ns": 2139367,
-      "full_call_median_ns": 2139367,
+      "makespan_ns": 2139326,
+      "full_call_median_ns": 2139326,
       "measurement_experts": 8,
       "measurement_groups": 1,
       "measurement_tasks": 8,
@@ -3517,11 +3510,11 @@
         1,
         1
       ],
-      "iso_max_ns": 1335434,
-      "iso_baseline_makespan_ns": 1335434,
-      "derate": 1.6020012969566448,
-      "p10_ns": 2115504,
-      "p90_ns": 2360047,
+      "iso_max_ns": 1319643,
+      "iso_baseline_makespan_ns": 1319643,
+      "derate": 1.6211399598224672,
+      "p10_ns": 2104162,
+      "p90_ns": 2270594,
       "num_iters": 20
     },
     {
@@ -3537,8 +3530,8 @@
       ],
       "distinct_experts": 8,
       "routes": 48,
-      "makespan_ns": 4048210,
-      "full_call_median_ns": 4048210,
+      "makespan_ns": 4054527,
+      "full_call_median_ns": 4054527,
       "measurement_experts": 8,
       "measurement_groups": 1,
       "measurement_tasks": 8,
@@ -3554,11 +3547,11 @@
         1,
         1
       ],
-      "iso_max_ns": 2802495,
-      "iso_baseline_makespan_ns": 2802495,
-      "derate": 1.4445021311367192,
-      "p10_ns": 4020467,
-      "p90_ns": 4219395,
+      "iso_max_ns": 2784560,
+      "iso_baseline_makespan_ns": 2784560,
+      "derate": 1.4560745683339558,
+      "p10_ns": 4018046,
+      "p90_ns": 4210310,
       "num_iters": 20
     },
     {
@@ -3574,8 +3567,8 @@
       ],
       "distinct_experts": 8,
       "routes": 192,
-      "makespan_ns": 15379628,
-      "full_call_median_ns": 15379628,
+      "makespan_ns": 15421390,
+      "full_call_median_ns": 15421390,
       "measurement_experts": 8,
       "measurement_groups": 1,
       "measurement_tasks": 8,
@@ -3591,11 +3584,11 @@
         1,
         1
       ],
-      "iso_max_ns": 10411830,
-      "iso_baseline_makespan_ns": 10411830,
-      "derate": 1.4771301490708166,
-      "p10_ns": 15276261,
-      "p90_ns": 16148500,
+      "iso_max_ns": 10803367,
+      "iso_baseline_makespan_ns": 10803367,
+      "derate": 1.4274614571549777,
+      "p10_ns": 15122839,
+      "p90_ns": 15918019,
       "num_iters": 20
     },
     {
@@ -3611,8 +3604,8 @@
       ],
       "distinct_experts": 8,
       "routes": 768,
-      "makespan_ns": 60257619,
-      "full_call_median_ns": 60257619,
+      "makespan_ns": 59882122,
+      "full_call_median_ns": 59882122,
       "measurement_experts": 8,
       "measurement_groups": 1,
       "measurement_tasks": 8,
@@ -3628,11 +3621,11 @@
         1,
         1
       ],
-      "iso_max_ns": 38999293,
-      "iso_baseline_makespan_ns": 38999293,
-      "derate": 1.545095163648223,
-      "p10_ns": 59962812,
-      "p90_ns": 62726183,
+      "iso_max_ns": 39341752,
+      "iso_baseline_makespan_ns": 39341752,
+      "derate": 1.5221010492872813,
+      "p10_ns": 59537150,
+      "p90_ns": 60503183,
       "num_iters": 20
     },
     {
@@ -3648,8 +3641,8 @@
       ],
       "distinct_experts": 8,
       "routes": 2040,
-      "makespan_ns": 158919991,
-      "full_call_median_ns": 158919991,
+      "makespan_ns": 157755838,
+      "full_call_median_ns": 157755838,
       "measurement_experts": 8,
       "measurement_groups": 1,
       "measurement_tasks": 8,
@@ -3665,11 +3658,11 @@
         1,
         1
       ],
-      "iso_max_ns": 100228004,
-      "iso_baseline_makespan_ns": 100228004,
-      "derate": 1.5855847134299912,
-      "p10_ns": 157649636,
-      "p90_ns": 164023146,
+      "iso_max_ns": 100215238,
+      "iso_baseline_makespan_ns": 100215238,
+      "derate": 1.5741701676146296,
+      "p10_ns": 157005383,
+      "p90_ns": 179085415,
       "num_iters": 20
     }
   ]

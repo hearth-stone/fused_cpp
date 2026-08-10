@@ -195,8 +195,6 @@ def main() -> int:
             thread_cpu_ids=thread_cpu_ids,
             num_threads=args.threads,
             global_num_experts=args.experts,
-            w13_ranges=2,
-            w2_ranges=1,
         )
 
     outputs: dict[str, torch.Tensor] = {}

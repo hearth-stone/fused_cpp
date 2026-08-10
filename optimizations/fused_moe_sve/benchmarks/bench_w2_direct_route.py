@@ -195,8 +195,6 @@ def main() -> int:
                 thread_cpu_ids=thread_cpu_ids,
                 num_threads=args.threads,
                 global_num_experts=args.experts,
-                w13_ranges=2,
-                w2_ranges=1,
             )
 
     outputs: dict[str, torch.Tensor] = {}
@@ -295,8 +293,7 @@ def main() -> int:
             "top_k": args.top_k,
             "threads": args.threads,
             "threads_per_expert": None if args.path == "normal" else args.threads // args.experts,
-            "w13_ranges": 2,
-            "w2_ranges": 1,
+            "stage_geometry": "full_n_team_stripes",
         },
         "logical_post_w2_bytes": {
             "fp32_scatter": 4 * fp32_route_bytes,

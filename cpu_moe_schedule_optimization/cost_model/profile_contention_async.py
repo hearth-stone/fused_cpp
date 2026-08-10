@@ -35,10 +35,8 @@ from fused_cpp.moe import (  # noqa: E402
 
 try:
     from iso_formula import fit_from_measurements  # noqa: E402
-    from weight_window import stage_weight_range_geometry  # noqa: E402
 except ImportError:  # pragma: no cover - package-style import
     from .iso_formula import fit_from_measurements  # type: ignore[no-redef]
-    from .weight_window import stage_weight_range_geometry  # type: ignore[no-redef]
 
 
 DEFAULT_ISOLATED_ROUTES = "1,2,3,4,5,6,7,8,9,10,11,12,24,48,96,192,384,768,1536,2040"
@@ -273,8 +271,6 @@ def make_async_run(
     measurement_experts: int,
     num_profile_experts: int,
     cpu_ids: list[int],
-    w13_ranges: int,
-    w2_ranges: int,
     generator: torch.Generator,
     std: float,
     lane_experts: list[list[int]] | None = None,
@@ -345,8 +341,6 @@ def make_async_run(
             activation="silu",
             global_num_experts=num_profile_experts,
             skip_weighted=True,
-            w13_ranges=w13_ranges,
-            w2_ranges=w2_ranges,
             out=output,
         )
 
@@ -426,8 +420,6 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--parallel-degree", type=int, default=1)
     parser.add_argument("--global-experts", type=int, default=None)
-    parser.add_argument("--w13-ranges", type=int, default=1)
-    parser.add_argument("--w2-ranges", type=int, default=1)
     parser.add_argument(
         "--sve-implementation",
         choices=("jit", "asm"),
@@ -467,8 +459,6 @@ def main() -> int:
         raise ValueError("--rank-id must be in [0, concurrent-ranks)")
     if args.parallel_degree <= 0:
         raise ValueError("--parallel-degree must be positive")
-    if min(args.w13_ranges, args.w2_ranges) <= 0:
-        raise ValueError("--w13-ranges and --w2-ranges must be positive")
     global_experts = args.global_experts or args.num_experts
     if global_experts < args.num_experts:
         raise ValueError("--global-experts cannot be smaller than --num-experts")
@@ -516,8 +506,6 @@ def main() -> int:
                 measurement_experts=isolated_measurement_experts,
                 num_profile_experts=args.num_experts,
                 cpu_ids=cpu_ids,
-                w13_ranges=args.w13_ranges,
-                w2_ranges=args.w2_ranges,
                 generator=generator,
                 std=args.std,
             )
@@ -559,8 +547,6 @@ def main() -> int:
                 measurement_experts=measurement_experts,
                 num_profile_experts=args.num_experts,
                 cpu_ids=cpu_ids,
-                w13_ranges=args.w13_ranges,
-                w2_ranges=args.w2_ranges,
                 generator=generator,
                 std=args.std,
                 lane_experts=lane_experts,
@@ -610,18 +596,8 @@ def main() -> int:
     sync_client.close()
     w13_packed_bytes = packed.w13[0].numel() * packed.w13[0].element_size()
     w2_packed_bytes = packed.w2[0].numel() * packed.w2[0].element_size()
-    w13_window = stage_weight_range_geometry(
-        k=args.hidden_size,
-        n=2 * args.ffn_hidden_size,
-        n_tile=int(packed.backend_n_tile),
-        ranges=args.w13_ranges,
-    )
-    w2_window = stage_weight_range_geometry(
-        k=args.ffn_hidden_size,
-        n=args.hidden_size,
-        n_tile=int(packed.backend_n_tile),
-        ranges=args.w2_ranges,
-    )
+    w13_stage_bytes = w13_packed_bytes // args.num_experts
+    w2_stage_bytes = w2_packed_bytes // args.num_experts
     llc_bytes = args.llc_bytes or detect_llc_bytes(cpu_ids[0])
     iso_formula = fit_from_measurements((entry["routes"], entry["threads"], entry["median_ns"]) for entry in isolated)
     payload = {
@@ -645,10 +621,9 @@ def main() -> int:
             "gemm_backend": int(packed.gemm_backend),
             "backend_n_tile": int(packed.backend_n_tile),
             "parallel_axis": "N",
+            "stage_geometry": "full_n_team_stripes",
             "sve_implementation": args.sve_implementation,
             "m_tail_policy": "xbyak_exact_m" if args.sve_implementation == "jit" else "static_bucketed",
-            "w13_window_ranges": w13_window.ranges,
-            "w2_window_ranges": w2_window.ranges,
             **kernel_metadata(),
         },
         "parallelism": {
@@ -677,11 +652,9 @@ def main() -> int:
             "w2_dense_bytes_per_expert": (args.hidden_size * args.ffn_hidden_size * 2),
             "w13_packed_bytes_per_expert": w13_packed_bytes // args.num_experts,
             "w2_packed_bytes_per_expert": w2_packed_bytes // args.num_experts,
-            "w13_chunk_bytes_per_expert": w13_window.max_range_bytes,
-            "w2_chunk_bytes_per_expert": w2_window.max_range_bytes,
-            "w13_window_bytes_per_expert": w13_window.max_range_bytes,
-            "w2_window_bytes_per_expert": w2_window.max_range_bytes,
-            "max_weight_stage_bytes_per_expert": max(w13_window.max_range_bytes, w2_window.max_range_bytes),
+            "w13_stage_bytes_per_expert": w13_stage_bytes,
+            "w2_stage_bytes_per_expert": w2_stage_bytes,
+            "max_weight_stage_bytes_per_expert": max(w13_stage_bytes, w2_stage_bytes),
         },
         "measurement": {
             "path": "fused_moe_bf16_tiled_async",

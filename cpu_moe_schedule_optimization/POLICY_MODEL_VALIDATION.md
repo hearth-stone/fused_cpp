@@ -1,20 +1,18 @@
 # Historical policy-aware MoE planner validation
 
-> This document records the 2026-07-13 four-profile experiment. Since v0.88,
-> `(R13,R2)` is no longer an operator-wide profile/planner dimension. The two
-> no-split files below were removed from the active catalog and remain available
-> only in Git history. Current validation uses one calibration per domain,
-> enumerates core shapes, and records the Plan V2 per-task range histogram.
+> This document records the 2026-07-13 four-profile experiment. Since v0.89,
+> weight ranges are absent from the production ABI, Plan V2, planner, and cost
+> model. All four files below were removed from the active catalog and remain
+> available only in Git history. Current validation uses one full-N calibration
+> per domain, enumerates core shapes, and records width-derived owner stripes.
 
-## Current v0.88 validation
+## Current v0.89 validation
 
-The range-variant removal passed the cost/profile/planner/native-planner suite
-on both local Arm64 and AmazonC5192Cores (`151 passed` on each). On the 192-core
-host, Plan V2, the exact-range ABI, timeline metrics, and fused-MoE tests passed
-`154` tests with one unsupported case skipped. A 96-core DSV4 real-routing plan
-resolved four task-local geometries in one plan and emitted no
-`operator_options`, confirming that the measured profile pair is no longer an
-operator-wide decision.
+The full-N migration removes the previous exact-range ABI and task-local
+geometry arrays. Current profiles require
+`kernel.stage_geometry=full_n_team_stripes`; old range measurements are rejected
+rather than relabelled. Validation numbers for the new implementation are
+recorded in `MATHEMATICAL_MODEL.md` v0.89 and the current test report.
 
 ## Target and calibration
 
@@ -52,8 +50,8 @@ describe two concurrently active ranks; they are not single-rank profiles.
 
 The historical `validate_policy_planner.py` run measured every core shape under
 both W13 policies, plus an independent execution of the planner-selected plan.
-The current tool measures every core shape under one canonical calibration and
-diagnoses the resolved per-task ranges. The 2026-07-13 result used two warmups
+The current tool measures every core shape under one canonical full-N
+calibration and diagnoses task widths/owner stripes. The 2026-07-13 result used two warmups
 and ten timed runs for each candidate and contained three workloads:
 
 - `uniform`: equal routes per expert;

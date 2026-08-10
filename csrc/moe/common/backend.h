@@ -20,7 +20,6 @@ enum BackendCapability : uint64_t {
   kDirectRouteF32 = uint64_t{1} << 1,
   kDirectRouteBf16 = uint64_t{1} << 2,
   kRouteMerge = uint64_t{1} << 3,
-  kWeightWindows = uint64_t{1} << 4,
 };
 
 using RuntimeSupportedFn = bool (*)();

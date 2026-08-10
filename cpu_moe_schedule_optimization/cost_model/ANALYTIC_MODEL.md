@@ -18,9 +18,10 @@ The prediction has three layers:
 1. `gemm_cost_model.py` emits logical W13 and W2 work.
 2. `sve_bf16_kernel_model.py` lowers work to exact physical panels, instructions,
    executed FLOPs, N ownership, cache traffic, and epilogue elements.
-3. `analytic_model.py` splits every N range into explicit setup, cold-B, and
-   steady-B phases, then maps physical demand through machine service curves,
-   cache capacities, runtime overheads, and a shared-resource event simulator.
+3. `analytic_model.py` partitions each full-N stage among the selected team,
+   splits it into setup, cold-B, and steady-B phases, then maps physical demand
+   through machine service curves, cache capacities, runtime overheads, and a
+   shared-resource event simulator.
 
 No route/thread latency table or measured contention shape is loaded.
 
@@ -99,16 +100,14 @@ M12/K18720/N16 (1,048,320 B) from a 2 MiB L2.
 
 ## Cache Traffic
 
-For range \(j\) of one stage, let:
+For one full-N stage, let:
 
 - \(P\) be the number of physical M panels;
-- \(B_j\) be the range's packed-weight bytes;
+- \(B\) be the full stage's packed-weight bytes;
 - \(A\) be all physical packed-A bytes;
 - \(A_p\) be the largest M-panel packed-A bytes;
-- \(U_j\) be one N owner's packed-B window;
-- \(t_j\) be the range's active owners;
-- \(t_1\) be the first range's active owners. Ranges are non-increasing in size,
-  so later owners are a subset of the first range's owners.
+- \(U\) be the busiest N owner's tile-aligned packed-B stripe;
+- \(t_a=\min(t,q_s)\) be the active owners, where \(q_s=N_s/\nu\).
 
 The calibrated packed-B retention function \(g_2(W)\) uses a dedicated
 effective capacity \(C^B_{2,\mathrm{eff}}=\rho^B_2C_2\) plus three measured miss
@@ -128,26 +127,19 @@ q=\min(P-1,L_A),
 r_B(W)=\mathbf 1[W>C_2].
 \]
 
-The full packed A survives a later sequential N range only when it leaves one
-panel of headroom for the kernel's in-flight load/prefetch state:
-
-\[
-r_A(U_j,A)=\mathbf 1[U_j+A>C_2-A_p].
-\]
-
 The packed-B and packed-A effective-capacity fractions remain independent: a
 repeated B stripe competes with A, stores, and prefetch state and reaches its
 transient retention knee before a generic L2 capacity boundary. The aggregate
 LLC-to-L2 traffic is:
 
 \[
-Q_{B,L2}=\sum_j B_j\left[
-1+qg_2(U_j+A_p)+(P-1-q)r_B(U_j+A_p)
+Q_{B,L2}=B\left[
+1+qg_2(U+A_p)+(P-1-q)r_B(U+A_p)
 \right],
 \]
 
 \[
-Q_{A,L2}=A\left[t_1+\sum_{j>1}t_jr_A(U_j,A)\right].
+Q_{A,L2}=At_a.
 \]
 
 This expresses the kernel loop directly:
@@ -156,9 +148,9 @@ This expresses the kernel loop directly:
 - the first \(q\) B reuses use the calibrated transient retention curve;
 - after A has turned over one effective L2, a B stripe that fits physical L2 is
   resident, while an over-capacity stripe remains streaming;
-- every N owner reads packed A once;
-- later sequential N ranges reuse A only when the full A plus owner stripe and
-  one in-flight panel fit private L2.
+- every active N owner scans packed A once;
+- there is no second sequential N range and therefore no planner-controlled A
+  rescan multiplier.
 
 The finite transient is important for long routes. Applying one short-route
 miss probability to all \(P-1\) panels makes a small residual miss grow without
@@ -171,7 +163,7 @@ enter the GEMM through the cache hierarchy rather than being compulsory DRAM
 reads. For distinct experts, the first B pass is compulsory DRAM:
 
 \[
-Q_{\mathrm{DRAM}}^{\mathrm{comp}}=\sum_j B_j.
+Q_{\mathrm{DRAM}}^{\mathrm{comp}}=B.
 \]
 
 Repeated B refills, A refills, and C writeback are spillable traffic. Their
@@ -186,11 +178,11 @@ the reusable-weight budget while retaining their bandwidth pressure.
 
 ## Physical Phases
 
-Each sequential N range is lowered into the phases that actually change its
-resource signature:
+Each full-N stage is lowered into the phases that actually change its resource
+signature:
 
-1. `range_setup` contains stage/range control cost and has no GEMM traffic;
-2. `cold_b` executes the first physical M panel and owns the range's entire
+1. `stage_setup` contains one stage-dispatch cost and has no GEMM traffic;
+2. `cold_b` executes the first physical M panel and owns the full stage's
    compulsory packed-B DRAM scan;
 3. `steady_b`, when more M panels exist, executes all remaining panels with no
    compulsory B traffic. It contains repeated B refills, remaining A scans,
@@ -198,7 +190,7 @@ resource signature:
 
 The mapper derives matrix FLOPs, frontend instructions, L1 loads, and epilogue
 elements separately for the first panel and the remaining panels. A/cache and
-C traffic are split by physical compute/store rows. For every range, the phase
+C traffic are split by physical compute/store rows. For every stage, the phase
 demands sum exactly to the original physical kernel demand. M<=12 therefore has
 only `cold_b`, while a long route exposes a short cold phase followed by a
 compute/cache-reuse steady phase.
@@ -231,23 +223,19 @@ T_{\mathrm{xfer}}
 \]
 
 \[
-T_s=\sum_j\left(
-T_{\mathrm{setup},j}
-+T_{\mathrm{cold},j}
-+T_{\mathrm{steady},j}
-\right).
+T_s=T_{\mathrm{setup}}+T_{\mathrm{cold}}+T_{\mathrm{steady}}.
 \]
 
-`steady` is absent for a one-panel range and the stage residual \(\gamma_s\)
-is applied to each phase. Splitting before taking the ECM maximum is required:
+`steady` is absent for a one-panel stage and the stage residual \(\gamma_s\)
+is applied to each phase. Separating cold and steady service before taking the
+ECM maximum is required:
 a cold panel can be DRAM/refill limited while the remaining panels are GEMM-core
 or private-cache limited. `gemm_core_flops` is mandatory; register-only
 matrix/frontend/L1 observations cannot replace this production-loop peak.
 
-Each range charges
-\(\lceil n_j/t\rceil\min(n_j,t)\) balanced N tiles. This equals the busiest
-lane work times that range's actual active owners, so a final range with fewer
-tiles does not pay for inactive threads.
+The full stage charges \(\lceil q_s/t\rceil\min(q_s,t)\) balanced N tiles. This
+equals the busiest lane work times the stage's actual active owners, so widths
+larger than the tile count do not create fictitious GEMM work.
 \(\gamma_{13}\) and \(\gamma_2\) are optional stage residual scales. They are the
 only stage-specific corrections and should stay near one; a large correction
 means a missing resource or incorrect traffic mapping.
@@ -256,14 +244,24 @@ Expert fixed and per-route runtime costs cover gather/dispatch/scatter work not
 yet represented by a dedicated physical mapper. They are deliberately separate
 from GEMM demand.
 
-When a deterministic Plan V2 stage-window policy is bound, each candidate
-resolves its task's W13/W2 targets from `(routes, actual_threads)` before
-calling this mapper. The resulting tile-aligned range geometry replaces the
-global geometry in both isolated and concurrent calculations. Window targets
-are therefore execution parameters of an existing shape candidate, not an
-additional search dimension.
+Plan V2 supplies only the selected task width. For stage \(s=(K_s,N_s)\), tile
+width \(\nu\), and team width \(t\), the production mapper derives
 
-### Analytical Stage-Window Policy
+\[
+q_s=N_s/\nu,\qquad
+u_s(t)=\left\lceil q_s/t\right\rceil K_s\nu\cdot2.
+\]
+
+The full stage bytes \(B_s=2K_sN_s\) are fixed; \(u_s(t)\) is the maximum
+per-worker owner stripe. Thus team width is the only cache-window control and
+no window decision is added to the planner or ABI.
+
+### Historical Stage-Window Policy (Retired)
+
+The remainder of this subsection records the superseded range-policy model for
+experiment provenance only. Production code, Plan V2, and the active analytical
+model no longer enumerate or execute these ranges; the full-stage equations
+above are normative.
 
 `AnalyticStageWindowPolicy` generates those execution parameters directly from
 the machine model. For stage \(s\), route count \(M\), and already selected team
@@ -469,8 +467,7 @@ shape. Rates use units per second; overheads use nanoseconds.
     "call_setup_ns": 0.0,
     "expert_fixed_ns": 0.0,
     "route_ns": 0.0,
-    "stage_fixed_ns": 0.0,
-    "range_fixed_ns": 0.0
+    "stage_fixed_ns": 0.0
   },
   "planner": {
     "supported_widths": [1, 2, 4, 8, 16, 32, 48, 64, 96]
@@ -529,8 +526,6 @@ model = AnalyticMoeCostModel(
     mode="tp",
     degree=4,
     concurrent_ranks=2,
-    calibration_w13_ranges=2,
-    calibration_w2_ranges=1,
 )
 planner = PlannedMoE(model, num_cores=96)
 plan = planner.plan_spec_for(route_counts)
@@ -542,27 +537,21 @@ shapes. Existing active-working-set pruning still applies.
 
 ## Holdout Validation
 
-Validate generated stage windows against real full-call execution with:
+Validate full-stage isolated and contention predictions against a compatible
+empirical profile with:
 
 ```bash
-python optimizations/fused_moe_sve/benchmarks/bench_analytic_stage_window_holdout.py \
-  --calibration machine.json --output stage_window_holdout.json \
-  --cpu-ids 0-95 --routes 12,28,72,120,216,320,768,2040 \
-  --widths 1,2,4,8 --measurement-experts 96 \
-  --warmup 2 --runs 11 --store-samples
+python cpu_moe_schedule_optimization/cost_model/validate_analytic_model.py \
+  machine.json fulln_profile.json --output analytic_holdout.json
 ```
 
-Within each `(routes, threads)` group, the benchmark shuffles all candidates and
-executes one sample per candidate per round. The coordinate oracle includes the
-analytical and inherited points, both complete one-dimensional axes, and a
-local 3x3 cross. It is not a full Cartesian search, so measured regret is a
-lower bound on regret against the full legal window space.
+The holdout must use `kernel.stage_geometry=full_n_team_stripes`, the same
+backend N tile, and the same machine/NUMA/kernel identity. It evaluates only
+team-width choices; no internal W13/W2 range coordinate exists.
 
-Policy v3 also retains the W13 `R=1` and `R=2` endpoints explicitly in every
-group. These are the canonical geometries formerly encoded by the boolean W13
-selector. For `M<=12`, both stages select `R=1` analytically because each B tile is
-consumed once and extra ranges cannot create reuse. The v2 table below remains
-historical validation; v3 still needs the range-native calibration refresh.
+The table below is retained only as historical evidence from the removed
+stage-window selector. Its regret values must not be used as a gate for the
+current full-stage model:
 
 The corrected policy-v2 2026-08-09 holdout produced:
 
@@ -572,7 +561,8 @@ The corrected policy-v2 2026-08-09 holdout produced:
 | AmazonECSV1 8C, raw median | 2.88% | 6.05% | 18.41% | 10/28 | 22/28 |
 | AmazonECSV1 8C, p10 sensitivity | 2.01% | 2.61% | 4.21% | 14/28 | 28/28 |
 
-On the clean 192-core host, v1's `1.63/6.57/11.32%` median/P90/maximum
+Historically, on the clean 192-core host, v1's `1.63/6.57/11.32%`
+median/P90/maximum
 regret becomes `1.50/2.98/3.38%`. The correction changes cache traffic and
 uncertainty handling only; routes are not added to calibration, and the legal
 planner shape set is unchanged.
@@ -582,10 +572,8 @@ and policy v2 passes the 5% maximum-regret gate in both median and p10 analyses.
 The 8-core host was heavily preempted: candidate p90/p10 spread had a 28.47%
 median and 99.66% P90, so its raw maximum is not a valid strict gate; its p10
 sensitivity remains below 5%. Its cache and service curves are local, but
-packed-B retention is still a transferred prior. Analytical models use the
-formula-generated policy, while empirical production models retain their
-measured V4 policy or existing fallback until the remaining full-model gates
-pass. Full protocol and raw artifact links are in
+packed-B retention is still a transferred prior. These numbers describe the
+retired policy only. Full protocol and raw artifact links are in
 `optimizations/fused_moe_sve/results/analytic_stage_window_policy_v2_holdout_20260809.md`.
 
 Validate absolute analytical timing and planner shapes with:
@@ -604,8 +592,8 @@ The report includes:
 - measured regret of the shape selected by analytical prediction.
 
 Before changing the production default, validate unseen routes, widths, mixed
-route distributions, split/window policies, and both isolated and concurrent
-execution. Initial acceptance gates are isolated MAPE at most 10%, contention
+route distributions, and both isolated and concurrent full-stage execution.
+Initial acceptance gates are isolated MAPE at most 10%, contention
 P90 absolute error at most 15%, and maximum measured shape regret at most 5%.
 Any failed gate keeps the empirical model as the runtime default.
 
@@ -631,11 +619,9 @@ gates still fail. Commands, anchors, and per-route decisions are recorded in
   not a set-level cache simulator. It closes the long-route W13 error in the
   tested grid, but does not represent cache sets, prefetch streams, or topology
   below the NUMA-level aggregate service curve.
-- The stage-window selector scores W13 and W2 independently. Residual
-  two-stage interaction remains: the corrected 192-core maximum is 3.38% at
-  M=216/T=2, and long-route coordinate oracles sometimes prefer a larger W2
-  window. A free two-dimensional window search is deliberately not part of the
-  planner.
+- W13 and W2 share one task width even though their full-stage N/K shapes and
+  resulting owner stripes differ. A future stage-width planner would need an
+  explicit handoff/runtime contract; there is no hidden window selector.
 - The AmazonECS8Cores cache/service calibration is machine-local, but its
   packed-B retention fractions are currently a transferred 192-core prior.
   It remains a portability holdout until a local multi-team refill probe

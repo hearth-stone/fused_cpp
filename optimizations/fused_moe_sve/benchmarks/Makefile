@@ -78,14 +78,14 @@ check: $(TARGETS)
 	./bench_elastic_nsplit --stage w2_bf16 --m 120 --k 64 --n 64 --threads 4 \
 		--low-threads 2 --epoch-rows 24 --copies 1 --check
 	./bench_unfused_pipeline --experts 2 --m 24 --h 64 --f 64 \
-		--threads-per-expert 2 --w13-ranges 2 --copies 1 --check
+		--threads-per-expert 2 --w13-ranges 1 --copies 1 --check
 	./bench_single_core_weight_window --m 24 --k 64 --n 64 \
 		--warmup 1 --runs 2 --cold-tail-mib 1 --check
 	./bench_m12_llc_pollution --victim-mib 1 --polluter-experts 1 \
 		--polluter-panels 1 --trials 1 --evict-mib 1 --cpu 0
 	./bench_fragmented_route_pipeline --teams 2 --base-routes 24 \
 		--replaced-teams 1 --split-factor 2 --hidden 64 --intermediate 64 \
-		--threads-per-team 2 --schedule dynamic --w13-ranges 2 --copies 1 --check
+		--threads-per-team 2 --schedule dynamic --w13-ranges 1 --copies 1 --check
 	for top_k in 1 2 3 4 5 6 7 8 9; do \
 		./bench_route_merge_tree --tokens 5 --top-k $$top_k --hidden 103 --threads 4 \
 			--warmup 1 --runs 2 --source both --check || exit 1; \
@@ -93,11 +93,11 @@ check: $(TARGETS)
 
 check-mn-split: bench_mn_split
 	./bench_mn_split --stage w13 --m 120 --k 64 --n 64 --plans 1x4,2x2,4x1 \
-		--w13-ranges 2 --copies 1 --check
+		--w13-ranges 1 --copies 1 --check
 	./bench_mn_split --stage w2_bf16 --m 120 --k 64 --n 64 --plans 1x4,2x2,4x1 \
 		--copies 1 --check
 	./bench_mn_split --stage w13 --m 120 --k 64 --n 64 --plans 2x2,1x2 \
-		--w13-ranges 2 --experts 2 --total-workers 4 --copies 1 --check
+		--w13-ranges 1 --experts 2 --total-workers 4 --copies 1 --check
 
 check-m12-streaming-b: bench_m12_streaming_b
 	./bench_m12_streaming_b --k 64 --n 64 --cpu 0 --check-only

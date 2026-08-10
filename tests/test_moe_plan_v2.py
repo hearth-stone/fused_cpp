@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 from types import SimpleNamespace
 
 import pytest
@@ -58,6 +59,21 @@ def _prepared_weights() -> SimpleNamespace:
     )
 
 
+def test_production_api_has_no_weight_range_controls() -> None:
+    entrypoints = (
+        bf16_tiled.fused_moe_bf16_tiled,
+        bf16_tiled.fused_moe_bf16_tiled_scheduled,
+        bf16_tiled.fused_moe_bf16_tiled_async,
+        bf16_tiled.fused_moe_bf16_tiled_async_plan,
+        bf16_tiled.fused_moe_bf16_tiled_planned_staged,
+    )
+    removed_controls = {"w13_ranges", "w2_ranges", "task_w13_ranges", "task_w2_ranges"}
+
+    for entrypoint in entrypoints:
+        assert removed_controls.isdisjoint(inspect.signature(entrypoint).parameters)
+    assert removed_controls.isdisjoint(AsyncMoEPlanV2.__dataclass_fields__)
+
+
 def test_upgrade_legacy_plan_produces_strict_singleton_widths() -> None:
     upgraded = upgrade_legacy_async_plan(_legacy_bridge())
     plan = AsyncMoEPlanV2.from_dict(upgraded)
@@ -74,8 +90,6 @@ def test_upgrade_legacy_plan_produces_strict_singleton_widths() -> None:
     assert plan.num_threads == 4
     assert plan.thread_cpu_ids.tolist() == [8, 9, 10, 11]
     assert plan.task_threads.tolist() == [2, 2]
-    assert plan.task_w13_ranges.tolist() == [1, 1]
-    assert plan.task_w2_ranges.tolist() == [1, 1]
     assert plan.task_release_ns.tolist() == [0, 0]
     assert plan.task_preferred_core_begins.tolist() == [-1, -1]
     assert plan.early_merge is None
@@ -305,34 +319,6 @@ def test_plan_v2_rejects_inconsistent_allowed_widths() -> None:
         raise AssertionError("an inconsistent selected width was accepted")
 
 
-def test_plan_v2_accepts_exact_per_task_stage_ranges() -> None:
-    upgraded = upgrade_legacy_async_plan(_legacy_bridge())
-    upgraded["task_w13_ranges"] = [1, 8]
-    upgraded["task_w2_ranges"] = [1, 4]
-
-    plan = AsyncMoEPlanV2.from_dict(upgraded)
-
-    assert plan.task_w13_ranges.tolist() == [1, 8]
-    assert plan.task_w2_ranges.tolist() == [1, 4]
-
-
-@pytest.mark.parametrize("invalid", [0, -2])
-def test_plan_v2_rejects_invalid_per_task_stage_ranges(invalid: int) -> None:
-    upgraded = upgrade_legacy_async_plan(_legacy_bridge())
-    upgraded["task_w13_ranges"] = [invalid, 1]
-
-    with pytest.raises(ValueError, match="stage ranges must be positive"):
-        AsyncMoEPlanV2.from_dict(upgraded)
-
-
-def test_plan_v2_requires_exact_stage_ranges() -> None:
-    upgraded = upgrade_legacy_async_plan(_legacy_bridge())
-    del upgraded["task_w13_ranges"]
-
-    with pytest.raises(ValueError, match="missing required fields: task_w13_ranges"):
-        AsyncMoEPlanV2.from_dict(upgraded)
-
-
 def test_strict_plan_accepts_timed_task_releases() -> None:
     upgraded = upgrade_legacy_async_plan(_legacy_bridge())
     upgraded["task_release_ns"] = [0, 250_000]
@@ -431,14 +417,13 @@ def test_async_plan_wrapper_calls_native_plan_v2(monkeypatch) -> None:
         ASYNC_MOE_PLACEMENT_FIXED,
         ASYNC_MOE_PLACEMENT_FIXED,
     ]
-    assert args[26].tolist() == [1, 1]
-    assert args[27].tolist() == [1, 1]
-    assert args[28].tolist() == [8, 9, 10, 11]
-    assert args[31] == 4
-    assert args[34] is True
-    assert args[37] == 1
-    assert args[40].tolist() == [0, 0]
-    assert args[41] == -1
+    assert args[25].tolist() == [0, 0]
+    assert args[26].tolist() == [8, 9, 10, 11]
+    assert args[29] == 4
+    assert args[32] is True
+    assert args[36] == 8
+    assert args[38].tolist() == [0, 0]
+    assert args[39] == -1
 
 
 def test_async_plan_wrapper_calls_elastic_native_and_collects_stats(monkeypatch) -> None:
@@ -488,13 +473,12 @@ def test_async_plan_wrapper_calls_elastic_native_and_collects_stats(monkeypatch)
     args = captured["args"]
     assert isinstance(args, tuple)
     assert args[15] == 2
-    assert args[26].tolist() == [1, 1]
-    assert args[27].tolist() == [1, 1]
-    assert args[40].tolist() == [0, 0]
-    assert args[41].tolist() == [0, 1000]
-    assert args[42] is stats
-    assert args[43].tolist() == [-1, -1]
-    assert args[44] == -1
+    assert args[25].tolist() == [0, 0]
+    assert args[38].tolist() == [0, 0]
+    assert args[39].tolist() == [0, 1000]
+    assert args[40] is stats
+    assert args[41].tolist() == [-1, -1]
+    assert args[42] == -1
     assert bf16_tiled.decode_async_moe_elastic_stats(stats)["eligible_tasks"] == 0
 
 

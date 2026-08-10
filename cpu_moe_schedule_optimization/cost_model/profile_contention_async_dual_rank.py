@@ -265,8 +265,6 @@ def parse_args() -> argparse.Namespace:
         help="Consecutive local experts per call; 0 profiles all local experts.",
     )
     parser.add_argument("--isolated-measurement-experts", type=int, default=8)
-    parser.add_argument("--w13-ranges", type=int, default=1)
-    parser.add_argument("--w2-ranges", type=int, default=1)
     parser.add_argument("--sve-implementation", choices=("jit", "asm"), default="jit")
     parser.add_argument("--cpu-groups", default="0-31;32-63")
     parser.add_argument("--numa-nodes", default="0,1")
@@ -285,8 +283,6 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    if min(args.w13_ranges, args.w2_ranges) <= 0:
-        raise ValueError("--w13-ranges and --w2-ranges must be positive")
     cpu_groups = split_nonempty(args.cpu_groups, ";")
     numa_nodes = [int(value) for value in split_nonempty(args.numa_nodes)]
     if len(cpu_groups) != 2 or len(numa_nodes) != 2:
@@ -340,10 +336,6 @@ def main() -> int:
                     args.parallel_mode,
                     "--parallel-degree",
                     str(args.parallel_degree),
-                    "--w13-ranges",
-                    str(args.w13_ranges),
-                    "--w2-ranges",
-                    str(args.w2_ranges),
                     "--sve-implementation",
                     args.sve_implementation,
                     "--cpu-ids",

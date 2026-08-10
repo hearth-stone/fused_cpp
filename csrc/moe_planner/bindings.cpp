@@ -157,26 +157,6 @@ std::vector<IntervalShapeCurveEntry> parse_shape_curve_entries(const py::handle&
   return result;
 }
 
-std::vector<IntervalStageWindowEntry> parse_stage_window_entries(const py::handle& values) {
-  std::vector<IntervalStageWindowEntry> result;
-  for (const py::handle row_handle : py::reinterpret_borrow<py::iterable>(values)) {
-    const py::sequence row = py::reinterpret_borrow<py::sequence>(row_handle);
-    if (py::len(row) != 7) {
-      throw std::invalid_argument("native planner stage-window rows must have seven fields");
-    }
-    result.push_back({
-        py::cast<int>(row[0]),
-        py::cast<int>(row[1]),
-        py::cast<int>(row[2]),
-        py::cast<int>(row[3]),
-        py::cast<int>(row[4]),
-        py::cast<int64_t>(row[5]),
-        py::cast<int64_t>(row[6]),
-    });
-  }
-  return result;
-}
-
 std::vector<IntervalTailRepartitionEntry> parse_tail_repartition_entries(const py::handle& values) {
   std::vector<IntervalTailRepartitionEntry> result;
   for (const py::handle row_handle : py::reinterpret_borrow<py::iterable>(values)) {
@@ -226,16 +206,11 @@ IntervalCostModelConfig parse_interval_cost_model(const py::dict& payload) {
   result.local_experts = required_value<int>(payload, "local_experts");
   result.profile_runs = required_value<int>(payload, "profile_runs");
   result.measurement_experts = required_value<int>(payload, "measurement_experts");
-  result.calibration_w13_ranges = required_value<int>(payload, "calibration_w13_ranges");
-  result.calibration_w2_ranges = required_value<int>(payload, "calibration_w2_ranges");
-  result.w13_chunk_bytes = required_value<int64_t>(payload, "w13_chunk_bytes");
-  result.w2_chunk_bytes = required_value<int64_t>(payload, "w2_chunk_bytes");
+  result.w13_stage_bytes = required_value<int64_t>(payload, "w13_stage_bytes");
+  result.w2_stage_bytes = required_value<int64_t>(payload, "w2_stage_bytes");
   result.max_stage_bytes = required_value<int64_t>(payload, "max_stage_bytes");
   result.w13_tile_bytes = required_value<int64_t>(payload, "w13_tile_bytes");
   result.w2_tile_bytes = required_value<int64_t>(payload, "w2_tile_bytes");
-  if (payload.contains("task_stage_windows")) {
-    result.task_stage_windows = parse_stage_window_entries(payload["task_stage_windows"]);
-  }
   result.call_setup_ns = required_value<double>(payload, "call_setup_ns");
   result.isolated = parse_iso_entries(payload["isolated"]);
   result.overheads = parse_pairs(payload["overheads"]);

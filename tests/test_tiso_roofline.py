@@ -41,7 +41,7 @@ def test_m12_panel_mapping() -> None:
     assert panel_histogram(25) == {12: 2, 2: 1}
 
 
-def test_nsplit_fused_expert_work_matches_kernel_loops() -> None:
+def test_full_stage_nsplit_fused_expert_work_matches_kernel_loops() -> None:
     h, f, threads = 4096, 1024, 8
     work = fused_expert_work(12, threads, h, f)
 
@@ -58,15 +58,6 @@ def test_nsplit_fused_expert_work_matches_kernel_loops() -> None:
     assert work.w2.b_read_bytes == 2 * h * f
     assert work.w2.c_write_bytes == 4 * 12 * h
     assert work.gemm_flops == 72 * h * f
-
-    two_range_work = fused_expert_work(12, threads, h, f, w13_n_ranges=2)
-    assert two_range_work.w13.a_read_bytes == 2 * work.w13.a_read_bytes
-    assert two_range_work.w13.b_read_bytes == work.w13.b_read_bytes
-    assert two_range_work.w13.c_write_bytes == work.w13.c_write_bytes
-
-    w2_two_range_work = fused_expert_work(12, threads, h, f, w2_n_ranges=2)
-    assert w2_two_range_work.w2.a_read_bytes == 2 * work.w2.a_read_bytes
-
 
 def test_tiso_tail_uses_distinct_compute_pack_and_store_rows() -> None:
     work = fused_expert_work(1, 1, 64, 32)
@@ -99,14 +90,14 @@ def test_roofline_uses_active_compute_or_memory_ceiling() -> None:
 
 
 def test_64core_profile_bulk_observations_have_physical_units() -> None:
-    path = COST_MODEL / "profiles" / "contention_async_amazon_c5_64c_tp2_sve_F1024_splitw13_v2_r1_20260713.json"
+    path = COST_MODEL / "profiles" / "contention_async_amazon_c5_64c_tp2_sve_F1024_fulln_v2_r1_20260713.json"
     profile = json.loads(path.read_text(encoding="utf-8"))
     observations = {row.threads: row for row in fit_bulk_observations(profile)}
 
     assert tuple(observations) == (1, 2, 4, 8, 16, 32)
-    assert observations[1].required_tflops == pytest.approx(0.310, abs=0.002)
-    assert observations[8].required_tflops == pytest.approx(2.451, abs=0.003)
-    assert observations[32].required_tflops == pytest.approx(7.616, abs=0.003)
+    assert observations[1].required_tflops == pytest.approx(0.312, abs=0.002)
+    assert observations[8].required_tflops == pytest.approx(2.384, abs=0.003)
+    assert observations[32].required_tflops == pytest.approx(8.401, abs=0.003)
     assert observations[1].required_l3_gbs == pytest.approx(26.3, abs=0.5)
-    assert observations[8].required_l3_gbs == pytest.approx(220.4, abs=1.0)
-    assert observations[32].required_l3_gbs == pytest.approx(818.8, abs=1.0)
+    assert observations[8].required_l3_gbs == pytest.approx(208.2, abs=1.0)
+    assert observations[32].required_l3_gbs == pytest.approx(815.7, abs=1.0)

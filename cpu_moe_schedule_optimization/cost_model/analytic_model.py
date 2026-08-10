@@ -16,7 +16,6 @@ frontend, cache, DRAM, and epilogue service ceilings.
 
 from __future__ import annotations
 
-import copy
 import json
 import math
 from dataclasses import asdict, dataclass
@@ -25,21 +24,13 @@ from pathlib import Path
 from typing import Iterable, Mapping, Sequence
 
 try:
+    from full_stage_geometry import FullStageGeometry, full_stage_geometry
     from gemm_cost_model import ExecutionSchedule, fused_expert_work
     from sve_bf16_kernel_model import SveBf16KernelExecution, SveBf16KernelProfile
-    from weight_window import (
-        WeightWindowGeometry,
-        stage_weight_range_geometry,
-        stage_weight_window_geometry,
-    )
 except ImportError:  # pragma: no cover - package-style import
+    from .full_stage_geometry import FullStageGeometry, full_stage_geometry
     from .gemm_cost_model import ExecutionSchedule, fused_expert_work
     from .sve_bf16_kernel_model import SveBf16KernelExecution, SveBf16KernelProfile
-    from .weight_window import (
-        WeightWindowGeometry,
-        stage_weight_range_geometry,
-        stage_weight_window_geometry,
-    )
 
 
 ANALYTIC_MACHINE_SCHEMA_VERSION = 1
@@ -201,7 +192,6 @@ class RuntimeOverheads:
     expert_fixed_ns: float = 0.0
     route_ns: float = 0.0
     stage_fixed_ns: float = 0.0
-    range_fixed_ns: float = 0.0
 
     def __post_init__(self) -> None:
         if (
@@ -210,7 +200,6 @@ class RuntimeOverheads:
                 self.expert_fixed_ns,
                 self.route_ns,
                 self.stage_fixed_ns,
-                self.range_fixed_ns,
             )
             < 0.0
         ):
@@ -223,7 +212,6 @@ class RuntimeOverheads:
             expert_fixed_ns=float(payload.get("expert_fixed_ns", 0.0)),
             route_ns=float(payload.get("route_ns", 0.0)),
             stage_fixed_ns=float(payload.get("stage_fixed_ns", 0.0)),
-            range_fixed_ns=float(payload.get("range_fixed_ns", 0.0)),
         )
 
 
@@ -429,12 +417,11 @@ def _smooth_capacity_miss(working_set: float, effective_capacity: float, physica
 
 
 @dataclass(frozen=True)
-class AnalyticRangeDemand:
-    """Range-local demand.
+class AnalyticStripeDemand:
+    """Demand for one worker stripe of a full-N stage.
 
     ``balanced_work_fraction`` scales the mapper's aggregate busiest-lane
-    upper bound. It can sum to less than one when a tail range activates fewer
-    N owners than the full team.
+    upper bound when N tiles do not divide the team evenly.
     """
 
     n_tiles: int
@@ -463,8 +450,7 @@ class AnalyticRangeDemand:
 class AnalyticStageDemand:
     stage: str
     mapping: SveBf16KernelExecution
-    ranges: int
-    window_bytes: int
+    stage_bytes: int
     owner_window_bytes: int
     reusable_b_bytes: int
     l2_miss_fraction_b: float
@@ -478,7 +464,7 @@ class AnalyticStageDemand:
     compulsory_dram_bytes: float
     spillable_dram_bytes: float
     llc_working_set_bytes: float
-    range_demands: tuple[AnalyticRangeDemand, ...]
+    stripe_demand: AnalyticStripeDemand | None
 
 
 @dataclass(frozen=True)
@@ -509,11 +495,11 @@ class AnalyticPhase:
     residual_scale: float = 1.0
 
     def __post_init__(self) -> None:
-        if self.kind not in {"operator", "range_setup", "cold_b", "steady_b"}:
+        if self.kind not in {"operator", "stage_setup", "cold_b", "steady_b"}:
             raise ValueError(f"unsupported analytical phase kind {self.kind!r}")
         if self.panel_count < 0:
             raise ValueError("panel_count must be non-negative")
-        if self.kind in {"operator", "range_setup"} and self.panel_count != 0:
+        if self.kind in {"operator", "stage_setup"} and self.panel_count != 0:
             raise ValueError("non-GEMM phases cannot contain GEMM panels")
         if self.kind in {"cold_b", "steady_b"} and self.panel_count == 0:
             raise ValueError("GEMM phases must contain at least one panel")
@@ -596,32 +582,6 @@ class ExpertPrediction:
 
 
 @dataclass(frozen=True)
-class AnalyticStageWindowScore:
-    """Analytical objective for one tile-aligned stage-window geometry."""
-
-    stage: str
-    routes: int
-    threads: int
-    target_bytes: int
-    ranges: int
-    range_bytes: int
-    worker_bytes: int
-    active_threads: int
-    objective_ns: float
-    serialized_core_ns: float
-    transfer_ns: float
-    range_overhead_ns: float
-    l2_miss_fraction_a: float
-    l2_miss_fraction_b: float
-    a_l2_refill_bytes: float
-    b_l2_refill_bytes: float
-    l2_bytes: float
-    llc_bytes: float
-    compulsory_dram_bytes: float
-    spillable_dram_bytes: float
-
-
-@dataclass(frozen=True)
 class AnalyticResourcePressure:
     """Requested and allocated service for one active shared resource."""
 
@@ -657,8 +617,6 @@ class AnalyticMoeCostModel:
         backend_n_tile: int | None = None,
         activation: str = "silu",
         dtype: str = "bf16",
-        calibration_w13_ranges: int = 1,
-        calibration_w2_ranges: int = 1,
         exact_m: bool = True,
         down_output_element_bytes: int = 2,
         supported_widths: Sequence[int] | None = None,
@@ -687,33 +645,26 @@ class AnalyticMoeCostModel:
             raise ValueError(f"analytical SVE model supports only dtype='bf16', got {dtype!r}")
         if down_output_element_bytes <= 0:
             raise ValueError("down_output_element_bytes must be positive")
-        if min(calibration_w13_ranges, calibration_w2_ranges) <= 0:
-            raise ValueError("calibration stage ranges must be positive")
-
         self.hidden_size = int(hidden_size)
         self.intermediate_size = int(intermediate_size)
         self.local_experts = int(local_experts)
         self.down_output_element_bytes = int(down_output_element_bytes)
         self._exact_m = bool(exact_m)
         self._mapper = SveBf16KernelProfile(n_tile=resolved_n_tile, exact_m=exact_m)
-        self._w13_geometry = stage_weight_range_geometry(
+        self._w13_geometry = full_stage_geometry(
             k=self.hidden_size,
             n=2 * self.intermediate_size,
             n_tile=resolved_n_tile,
-            ranges=int(calibration_w13_ranges),
         )
-        self._w2_geometry = stage_weight_range_geometry(
+        self._w2_geometry = full_stage_geometry(
             k=self.intermediate_size,
             n=self.hidden_size,
             n_tile=resolved_n_tile,
-            ranges=int(calibration_w2_ranges),
         )
-        self.calibration_w13_ranges = self._w13_geometry.ranges
-        self.calibration_w2_ranges = self._w2_geometry.ranges
-        self.w13_chunk_bytes = self._w13_geometry.max_range_bytes
-        self.w2_chunk_bytes = self._w2_geometry.max_range_bytes
-        self.w2_bytes = self.w2_chunk_bytes
-        self.max_stage_bytes = max(self.w13_chunk_bytes, self.w2_chunk_bytes)
+        self.w13_stage_bytes = self._w13_geometry.stage_bytes
+        self.w2_stage_bytes = self._w2_geometry.stage_bytes
+        self.w2_bytes = self.w2_stage_bytes
+        self.max_stage_bytes = max(self.w13_stage_bytes, self.w2_stage_bytes)
         self.w13_tile_bytes = self.hidden_size * resolved_n_tile * 2
         self.w2_tile_bytes = self.intermediate_size * resolved_n_tile * 2
         self.call_setup_ns = self.calibration.overheads.call_setup_ns
@@ -753,7 +704,6 @@ class AnalyticMoeCostModel:
             concurrent_ranks=int(concurrent_ranks),
             llc_bytes_per_rank=self.calibration.caches.llc_bytes_per_rank,
         )
-        self.task_stage_window_policy = None
 
     @property
     def supported_shapes(self) -> tuple[tuple[int, ...], ...]:
@@ -792,61 +742,26 @@ class AnalyticMoeCostModel:
         blocks, remainder = divmod(max(int(routes), 0), 12)
         return blocks * 12 + self.m12_tail_capacity(remainder)
 
-    def with_task_stage_window_policy(self, policy):
-        """Return a clone that analytically lowers the policy-selected windows."""
-        if not callable(getattr(policy, "select", None)):
-            raise TypeError("task stage-window policy must provide select(routes, threads)")
-        bound = copy.copy(self)
-        bound.task_stage_window_policy = policy
-        return bound
-
-    @lru_cache(maxsize=4096)
-    def _task_weight_geometries(
-        self,
-        routes: int,
-        threads: int,
-    ) -> tuple[WeightWindowGeometry, WeightWindowGeometry]:
-        if self.task_stage_window_policy is None:
-            return self._w13_geometry, self._w2_geometry
-        w13_target, w2_target = self.task_stage_window_policy.select(int(routes), int(threads))
-        if min(w13_target, w2_target) < -1:
-            raise ValueError("task stage-window policy must return -1 or non-negative byte counts")
-        if w13_target == -1 and w2_target == -1:
-            return self._w13_geometry, self._w2_geometry
-        w13 = stage_weight_window_geometry(
-            k=self.hidden_size,
-            n=2 * self.intermediate_size,
-            n_tile=self.policy.backend_n_tile,
-            target_bytes=max(int(w13_target), 0),
-            fallback_ranges=self.calibration_w13_ranges,
-        )
-        w2 = stage_weight_window_geometry(
-            k=self.intermediate_size,
-            n=self.hidden_size,
-            n_tile=self.policy.backend_n_tile,
-            target_bytes=max(int(w2_target), 0),
-            fallback_ranges=self.calibration_w2_ranges,
-        )
-        return w13, w2
-
     def task_max_stage_bytes(self, routes: int, threads: int) -> int:
-        w13, w2 = self._task_weight_geometries(int(routes), int(threads))
-        return max(w13.max_range_bytes, w2.max_range_bytes)
-
-    def task_stage_ranges(self, routes: int, threads: int) -> tuple[int, int]:
-        w13, w2 = self._task_weight_geometries(int(routes), int(threads))
-        return w13.ranges, w2.ranges
+        del routes, threads
+        return self.max_stage_bytes
 
     def window_bytes_per_worker(self, threads: int, routes: int | None = None) -> int:
-        w13, w2 = (
-            (self._w13_geometry, self._w2_geometry)
-            if routes is None
-            else self._task_weight_geometries(int(routes), int(threads))
-        )
+        del routes
         return max(
-            w13.bytes_per_worker(threads),
-            w2.bytes_per_worker(threads),
+            self._w13_geometry.bytes_per_worker(threads),
+            self._w2_geometry.bytes_per_worker(threads),
         )
+
+    def stage_bytes_per_worker(self, stage: str, threads: int, routes: int | None = None) -> int:
+        del routes
+        if stage == "w13":
+            geometry = self._w13_geometry
+        elif stage == "w2":
+            geometry = self._w2_geometry
+        else:
+            raise ValueError(f"stage must be 'w13' or 'w2', got {stage!r}")
+        return geometry.bytes_per_worker(threads)
 
     def _l2_miss_fraction(self, working_set_bytes: float) -> float:
         cache = self.calibration.caches
@@ -879,109 +794,6 @@ class AnalyticMoeCostModel:
         """Return the physical resident/streaming state of a cyclic L2 scan."""
         return float(working_set_bytes > self.calibration.caches.l2_bytes_per_core)
 
-    @lru_cache(maxsize=16384)
-    def score_stage_window(
-        self,
-        stage: str,
-        routes: int,
-        threads: int,
-        target_bytes: int,
-    ) -> AnalyticStageWindowScore:
-        """Score a stage window from physical service demand, not a route table.
-
-        The regular isolated ECM uses ``max(core, transfer)`` because the two
-        lower bounds overlap. That is appropriate for absolute latency but is
-        too permissive for choosing a cache window: a transfer reduction hidden
-        below the compute ceiling would otherwise have zero value, despite
-        reducing refill latency and contention. Window selection therefore uses
-        a serialized *incremental* objective. Candidate-independent compute and
-        compulsory-B terms cancel; tile imbalance, L2/LLC refill, DRAM spill and
-        calibrated per-range control remain visible.
-        """
-        stage = str(stage)
-        routes = int(routes)
-        threads = int(threads)
-        target_bytes = int(target_bytes)
-        if stage not in {"w13", "w2"}:
-            raise ValueError(f"unsupported stage {stage!r}")
-        if routes <= 0 or threads <= 0 or target_bytes <= 0:
-            raise ValueError("routes, threads and target_bytes must be positive")
-        if threads not in self.supported_widths:
-            raise KeyError(f"unsupported analytical thread width {threads}")
-
-        work = fused_expert_work(
-            routes,
-            self.hidden_size,
-            self.intermediate_size,
-            down_output_element_bytes=self.down_output_element_bytes,
-        )
-        if stage == "w13":
-            logical = work.w13
-            k = self.hidden_size
-            n = 2 * self.intermediate_size
-            fallback_ranges = self.calibration_w13_ranges
-        else:
-            logical = work.w2
-            k = self.intermediate_size
-            n = self.hidden_size
-            fallback_ranges = self.calibration_w2_ranges
-        geometry = stage_weight_window_geometry(
-            k=k,
-            n=n,
-            n_tile=self.policy.backend_n_tile,
-            target_bytes=target_bytes,
-            fallback_ranges=fallback_ranges,
-        )
-        mapping = self._mapper.lower(
-            logical,
-            ExecutionSchedule(threads=threads, sequential_n_ranges=geometry.ranges),
-        )
-        demand = self._stage_demand(stage, mapping, geometry)
-        phases = self._stage_phases(demand)
-        serialized_core_ns = sum(phase.gemm_core_ns + phase.epilogue_ns for phase in phases)
-        transfer_ns = 0.0
-        range_overhead_ns = 0.0
-        for phase in phases:
-            if phase.kind == "range_setup":
-                range_overhead_ns += phase.fixed_ns
-                continue
-            times = phase.resource_times_ns()
-            transfer_ns += max(times["l2_bytes"], times["llc_bytes"], times["dram_bytes"])
-        return AnalyticStageWindowScore(
-            stage=stage,
-            routes=routes,
-            threads=threads,
-            target_bytes=target_bytes,
-            ranges=geometry.ranges,
-            range_bytes=geometry.max_range_bytes,
-            worker_bytes=geometry.bytes_per_worker(threads),
-            active_threads=geometry.active_threads(threads),
-            objective_ns=serialized_core_ns + transfer_ns + range_overhead_ns,
-            serialized_core_ns=serialized_core_ns,
-            transfer_ns=transfer_ns,
-            range_overhead_ns=range_overhead_ns,
-            l2_miss_fraction_a=demand.l2_miss_fraction_a,
-            l2_miss_fraction_b=demand.l2_miss_fraction_b,
-            a_l2_refill_bytes=demand.a_l2_refill_bytes,
-            b_l2_refill_bytes=demand.b_l2_refill_bytes,
-            l2_bytes=demand.l2_bytes,
-            llc_bytes=demand.llc_bytes,
-            compulsory_dram_bytes=demand.compulsory_dram_bytes,
-            spillable_dram_bytes=demand.spillable_dram_bytes,
-        )
-
-    def default_task_stage_window_policy(self, *, num_cores: int, cpu_ids: Sequence[int]):
-        """Build the deterministic analytical policy for this model instance."""
-        if int(num_cores) <= 0 or int(num_cores) > self.calibration.cores_per_rank:
-            return None
-        if len(tuple(cpu_ids)) != int(num_cores):
-            return None
-        try:
-            from analytic_stage_window_policy import AnalyticStageWindowPolicy
-        except ImportError:  # pragma: no cover - package-style import
-            from .analytic_stage_window_policy import AnalyticStageWindowPolicy
-        return AnalyticStageWindowPolicy(self)
-
     def _llc_miss_fraction(self, working_set_bytes: float) -> float:
         cache = self.calibration.caches
         return _smooth_capacity_miss(
@@ -994,17 +806,18 @@ class AnalyticMoeCostModel:
         self,
         stage: str,
         mapping: SveBf16KernelExecution,
-        geometry: WeightWindowGeometry,
+        geometry: FullStageGeometry,
     ) -> AnalyticStageDemand:
         if stage not in {"w13", "w2"}:
             raise ValueError(f"unsupported stage {stage!r}")
+        if mapping.schedule.sequential_n_ranges != 1:
+            raise ValueError("the production analytical model requires one full-N stage")
         panels = len(mapping.panels)
         if panels == 0:
             return AnalyticStageDemand(
                 stage=stage,
                 mapping=mapping,
-                ranges=geometry.ranges,
-                window_bytes=0,
+                stage_bytes=0,
                 owner_window_bytes=0,
                 reusable_b_bytes=0,
                 l2_miss_fraction_b=0.0,
@@ -1018,7 +831,7 @@ class AnalyticMoeCostModel:
                 compulsory_dram_bytes=0.0,
                 spillable_dram_bytes=0.0,
                 llc_working_set_bytes=0.0,
-                range_demands=(),
+                stripe_demand=None,
             )
 
         logical = mapping.logical_work
@@ -1027,111 +840,67 @@ class AnalyticMoeCostModel:
         a_panel_bytes = max_panel_rows * logical.k * logical.input_element_bytes
         total_tiles = mapping.allocation.total_tiles
         tile_bytes = logical.k * mapping.n_tile * logical.weight_element_bytes
-        balanced_tiles = tuple(
-            math.ceil(tiles / mapping.schedule.threads) * min(tiles, mapping.schedule.threads)
-            for tiles in mapping.allocation.range_tiles
+        active_threads = min(total_tiles, mapping.schedule.threads)
+        owner_tiles = math.ceil(total_tiles / mapping.schedule.threads)
+        balanced_tiles = owner_tiles * active_threads
+        owner_window_bytes = owner_tiles * tile_bytes
+        weight_bytes = total_tiles * tile_bytes
+        c_write_bytes = mapping.llc_c_write_bytes
+
+        # Team width is the only cache-window control: each owner repeatedly
+        # scans its full-N packed-B stripe while consuming successive A panels.
+        a_residency_footprint = owner_window_bytes + a_bytes
+        a_residency_capacity = max(
+            self.calibration.caches.l2_bytes_per_core - a_panel_bytes,
+            0,
         )
-        aggregate_balanced_tiles = mapping.allocation.busiest_thread_tiles * mapping.allocation.active_threads
-        seen_active_threads = 0
-        range_demands: list[AnalyticRangeDemand] = []
-        for range_tiles, balanced_range_tiles in zip(
-            mapping.allocation.range_tiles,
-            balanced_tiles,
-        ):
-            active_threads = min(range_tiles, mapping.schedule.threads)
-            owner_tiles = math.ceil(range_tiles / mapping.schedule.threads)
-            owner_window_bytes = owner_tiles * tile_bytes
-            weight_bytes = range_tiles * tile_bytes
-            c_write_bytes = mapping.llc_c_write_bytes * range_tiles / total_tiles
-
-            # Preserve one panel of L2 headroom for the kernel's in-flight
-            # load/prefetch state. Below this physical capacity boundary the
-            # full packed A survives sequential N ranges; above it, A is a
-            # cyclic stream and each owner must refill it.
-            a_residency_footprint = owner_window_bytes + a_bytes
-            a_residency_capacity = max(
-                self.calibration.caches.l2_bytes_per_core - a_panel_bytes,
-                0,
-            )
-            a_l2_miss = float(a_residency_footprint > a_residency_capacity)
-
-            b_reuse_footprint = owner_window_bytes + a_panel_bytes
-            b_l2_miss = self._l2_b_reuse_miss_fraction(b_reuse_footprint)
-            available_b_reuses = panels - 1
-            # Once one effective L2 of unique A panels has streamed past, the
-            # cyclic B stripe reaches its physical resident/streaming state.
-            # Before that turnover point, use the calibrated repeated-scan
-            # miss curve. This derives the transition from cache and panel
-            # geometry instead of multiplying one short-route miss forever.
-            cache_turnover_reuses = max(
-                int(self.calibration.caches.effective_l2_bytes_per_core // a_panel_bytes),
-                1,
-            )
-            transient_b_reuses = min(
-                available_b_reuses,
-                cache_turnover_reuses,
-            )
-            steady_b_reuses = available_b_reuses - transient_b_reuses
-            b_l2_steady_miss = self._l2_steady_scan_miss_fraction(b_reuse_footprint)
-            b_l2_refill = weight_bytes * (
-                1.0 + transient_b_reuses * b_l2_miss + steady_b_reuses * b_l2_steady_miss
-            )
-            new_threads = max(active_threads - seen_active_threads, 0)
-            reused_threads = active_threads - new_threads
-            a_l2_refill = a_bytes * (new_threads + reused_threads * a_l2_miss)
-            seen_active_threads = max(seen_active_threads, active_threads)
-
-            l2_bytes = a_l2_refill + b_l2_refill + c_write_bytes
-            reusable_b_bytes = weight_bytes if panels > 1 else 0
-            spillable_dram = a_l2_refill + max(b_l2_refill - weight_bytes, 0.0) + c_write_bytes
-            range_demands.append(
-                AnalyticRangeDemand(
-                    n_tiles=range_tiles,
-                    balanced_work_fraction=balanced_range_tiles / aggregate_balanced_tiles,
-                    owner_window_bytes=owner_window_bytes,
-                    l2_miss_fraction_b=b_l2_miss,
-                    l2_steady_miss_fraction_b=b_l2_steady_miss,
-                    l2_miss_fraction_a=a_l2_miss,
-                    b_transient_reuses=transient_b_reuses,
-                    b_steady_reuses=steady_b_reuses,
-                    b_reuse_footprint_bytes=b_reuse_footprint,
-                    a_residency_footprint_bytes=a_residency_footprint,
-                    a_residency_capacity_bytes=a_residency_capacity,
-                    a_l2_refill_bytes=a_l2_refill,
-                    b_l2_refill_bytes=b_l2_refill,
-                    c_write_bytes=c_write_bytes,
-                    l2_bytes=l2_bytes,
-                    llc_bytes=l2_bytes,
-                    compulsory_dram_bytes=weight_bytes,
-                    spillable_dram_bytes=spillable_dram,
-                    reusable_b_bytes=reusable_b_bytes,
-                    llc_working_set_bytes=reusable_b_bytes + a_bytes + c_write_bytes,
-                )
-            )
-
-        a_l2_refill = sum(item.a_l2_refill_bytes for item in range_demands)
-        b_l2_refill = sum(item.b_l2_refill_bytes for item in range_demands)
-        c_write_bytes = sum(item.c_write_bytes for item in range_demands)
+        a_l2_miss = float(a_residency_footprint > a_residency_capacity)
+        b_reuse_footprint = owner_window_bytes + a_panel_bytes
+        b_l2_miss = self._l2_b_reuse_miss_fraction(b_reuse_footprint)
+        available_b_reuses = panels - 1
+        cache_turnover_reuses = max(
+            int(self.calibration.caches.effective_l2_bytes_per_core // a_panel_bytes),
+            1,
+        )
+        transient_b_reuses = min(available_b_reuses, cache_turnover_reuses)
+        steady_b_reuses = available_b_reuses - transient_b_reuses
+        b_l2_steady_miss = self._l2_steady_scan_miss_fraction(b_reuse_footprint)
+        b_l2_refill = weight_bytes * (
+            1.0 + transient_b_reuses * b_l2_miss + steady_b_reuses * b_l2_steady_miss
+        )
+        a_l2_refill = a_bytes * active_threads
         l2_refill_bytes = a_l2_refill + b_l2_refill
-        l2_bytes = sum(item.l2_bytes for item in range_demands)
-        llc_bytes = sum(item.llc_bytes for item in range_demands)
-        compulsory_dram = sum(item.compulsory_dram_bytes for item in range_demands)
-        spillable_dram = sum(item.spillable_dram_bytes for item in range_demands)
-        owner_window_bytes = max(item.owner_window_bytes for item in range_demands)
-        reusable_b_bytes = max(item.reusable_b_bytes for item in range_demands)
-        llc_working_set = max(item.llc_working_set_bytes for item in range_demands)
-        b_l2_miss = (
-            sum(item.l2_miss_fraction_b * item.compulsory_dram_bytes for item in range_demands) / compulsory_dram
-        )
-        active_scans = tuple(min(tiles, mapping.schedule.threads) for tiles in mapping.allocation.range_tiles)
-        a_l2_miss = sum(item.l2_miss_fraction_a * scans for item, scans in zip(range_demands, active_scans)) / sum(
-            active_scans
+        l2_bytes = l2_refill_bytes + c_write_bytes
+        reusable_b_bytes = weight_bytes if panels > 1 else 0
+        spillable_dram = a_l2_refill + max(b_l2_refill - weight_bytes, 0.0) + c_write_bytes
+        llc_working_set = reusable_b_bytes + a_bytes + c_write_bytes
+        stripe = AnalyticStripeDemand(
+            n_tiles=total_tiles,
+            balanced_work_fraction=balanced_tiles
+            / (mapping.allocation.busiest_thread_tiles * mapping.allocation.active_threads),
+            owner_window_bytes=owner_window_bytes,
+            l2_miss_fraction_b=b_l2_miss,
+            l2_steady_miss_fraction_b=b_l2_steady_miss,
+            l2_miss_fraction_a=a_l2_miss,
+            b_transient_reuses=transient_b_reuses,
+            b_steady_reuses=steady_b_reuses,
+            b_reuse_footprint_bytes=b_reuse_footprint,
+            a_residency_footprint_bytes=a_residency_footprint,
+            a_residency_capacity_bytes=a_residency_capacity,
+            a_l2_refill_bytes=a_l2_refill,
+            b_l2_refill_bytes=b_l2_refill,
+            c_write_bytes=c_write_bytes,
+            l2_bytes=l2_bytes,
+            llc_bytes=l2_bytes,
+            compulsory_dram_bytes=weight_bytes,
+            spillable_dram_bytes=spillable_dram,
+            reusable_b_bytes=reusable_b_bytes,
+            llc_working_set_bytes=llc_working_set,
         )
         return AnalyticStageDemand(
             stage=stage,
             mapping=mapping,
-            ranges=geometry.ranges,
-            window_bytes=geometry.max_range_bytes,
+            stage_bytes=weight_bytes,
             owner_window_bytes=owner_window_bytes,
             reusable_b_bytes=reusable_b_bytes,
             l2_miss_fraction_b=b_l2_miss,
@@ -1141,11 +910,11 @@ class AnalyticMoeCostModel:
             l2_refill_bytes=l2_refill_bytes,
             c_write_bytes=c_write_bytes,
             l2_bytes=l2_bytes,
-            llc_bytes=llc_bytes,
-            compulsory_dram_bytes=compulsory_dram,
+            llc_bytes=l2_bytes,
+            compulsory_dram_bytes=weight_bytes,
             spillable_dram_bytes=spillable_dram,
             llc_working_set_bytes=llc_working_set,
-            range_demands=tuple(range_demands),
+            stripe_demand=stripe,
         )
 
     def _stage_phases(self, demand: AnalyticStageDemand) -> tuple[AnalyticPhase, ...]:
@@ -1161,7 +930,6 @@ class AnalyticMoeCostModel:
 
         def append_phase(
             *,
-            range_index: int,
             phase_kind: str,
             panels,
             active_threads: int,
@@ -1200,7 +968,7 @@ class AnalyticMoeCostModel:
                 epilogue_ns = epilogue_elements / machine.service_rate("epilogue_elements", active_threads) * 1e9
             phases.append(
                 AnalyticPhase(
-                    name=f"{demand.stage}:r{range_index}:{phase_kind}",
+                    name=f"{demand.stage}:{phase_kind}",
                     kind=phase_kind,
                     panel_count=panel_count,
                     active_threads=active_threads,
@@ -1227,74 +995,72 @@ class AnalyticMoeCostModel:
                 )
             )
 
-        for index, range_demand in enumerate(demand.range_demands):
-            stage_fraction = range_demand.n_tiles / mapping.allocation.total_tiles
-            active_threads = min(range_demand.n_tiles, mapping.schedule.threads)
-            balanced_tiles = math.ceil(range_demand.n_tiles / mapping.schedule.threads) * active_threads
-            setup_ns = machine.overheads.stage_fixed_ns * stage_fraction + machine.overheads.range_fixed_ns
-            if setup_ns > 0.0:
-                phases.append(
-                    AnalyticPhase(
-                        name=f"{demand.stage}:r{index}:setup",
-                        kind="range_setup",
-                        panel_count=0,
-                        active_threads=active_threads,
-                        fixed_ns=setup_ns,
-                        gemm_core_ns=0.0,
-                        matrix_ns=0.0,
-                        frontend_ns=0.0,
-                        l1_ns=0.0,
-                        l2_ns=0.0,
-                        llc_ns=0.0,
-                        epilogue_ns=0.0,
-                        matrix_flops=0.0,
-                        frontend_instructions=0.0,
-                        l1_bytes=0.0,
-                        l2_bytes=0.0,
-                        llc_bytes=0.0,
-                        epilogue_elements=0.0,
-                        compulsory_dram_bytes=0.0,
-                        spillable_dram_bytes=0.0,
-                        dram_rate=machine.service_rate("dram_bytes", active_threads),
-                        working_set_bytes=0.0,
-                        isolated_spill_fraction=0.0,
-                        residual_scale=residual_scale,
-                    )
+        stripe = demand.stripe_demand
+        if stripe is None:
+            return ()
+        active_threads = min(stripe.n_tiles, mapping.schedule.threads)
+        balanced_tiles = math.ceil(stripe.n_tiles / mapping.schedule.threads) * active_threads
+        if machine.overheads.stage_fixed_ns > 0.0:
+            phases.append(
+                AnalyticPhase(
+                    name=f"{demand.stage}:setup",
+                    kind="stage_setup",
+                    panel_count=0,
+                    active_threads=active_threads,
+                    fixed_ns=machine.overheads.stage_fixed_ns,
+                    gemm_core_ns=0.0,
+                    matrix_ns=0.0,
+                    frontend_ns=0.0,
+                    l1_ns=0.0,
+                    l2_ns=0.0,
+                    llc_ns=0.0,
+                    epilogue_ns=0.0,
+                    matrix_flops=0.0,
+                    frontend_instructions=0.0,
+                    l1_bytes=0.0,
+                    l2_bytes=0.0,
+                    llc_bytes=0.0,
+                    epilogue_elements=0.0,
+                    compulsory_dram_bytes=0.0,
+                    spillable_dram_bytes=0.0,
+                    dram_rate=machine.service_rate("dram_bytes", active_threads),
+                    working_set_bytes=0.0,
+                    isolated_spill_fraction=0.0,
+                    residual_scale=residual_scale,
                 )
-            cold_panels = mapping.panels[:1]
-            steady_panels = mapping.panels[1:]
-            cold_compute_fraction = cold_panels[0].compute_rows / total_compute_rows
-            cold_store_fraction = cold_panels[0].store_rows / total_store_rows
-            cold_a_l2_bytes = range_demand.a_l2_refill_bytes * cold_compute_fraction
-            cold_c_write_bytes = range_demand.c_write_bytes * cold_store_fraction
-            cold_b_l2_bytes = range_demand.compulsory_dram_bytes
+            )
+        cold_panels = mapping.panels[:1]
+        steady_panels = mapping.panels[1:]
+        cold_compute_fraction = cold_panels[0].compute_rows / total_compute_rows
+        cold_store_fraction = cold_panels[0].store_rows / total_store_rows
+        cold_a_l2_bytes = stripe.a_l2_refill_bytes * cold_compute_fraction
+        cold_c_write_bytes = stripe.c_write_bytes * cold_store_fraction
+        cold_b_l2_bytes = stripe.compulsory_dram_bytes
+        append_phase(
+            phase_kind="cold_b",
+            panels=cold_panels,
+            active_threads=active_threads,
+            balanced_tiles=balanced_tiles,
+            a_l2_bytes=cold_a_l2_bytes,
+            b_l2_bytes=cold_b_l2_bytes,
+            c_write_bytes=cold_c_write_bytes,
+            compulsory_dram_bytes=stripe.compulsory_dram_bytes,
+            spillable_dram_bytes=cold_a_l2_bytes + cold_c_write_bytes,
+            working_set_bytes=stripe.llc_working_set_bytes,
+        )
+        if steady_panels:
             append_phase(
-                range_index=index,
-                phase_kind="cold_b",
-                panels=cold_panels,
+                phase_kind="steady_b",
+                panels=steady_panels,
                 active_threads=active_threads,
                 balanced_tiles=balanced_tiles,
-                a_l2_bytes=cold_a_l2_bytes,
-                b_l2_bytes=cold_b_l2_bytes,
-                c_write_bytes=cold_c_write_bytes,
-                compulsory_dram_bytes=range_demand.compulsory_dram_bytes,
-                spillable_dram_bytes=cold_a_l2_bytes + cold_c_write_bytes,
-                working_set_bytes=range_demand.llc_working_set_bytes,
+                a_l2_bytes=stripe.a_l2_refill_bytes - cold_a_l2_bytes,
+                b_l2_bytes=stripe.b_l2_refill_bytes - cold_b_l2_bytes,
+                c_write_bytes=stripe.c_write_bytes - cold_c_write_bytes,
+                compulsory_dram_bytes=0.0,
+                spillable_dram_bytes=stripe.spillable_dram_bytes - cold_a_l2_bytes - cold_c_write_bytes,
+                working_set_bytes=stripe.llc_working_set_bytes,
             )
-            if steady_panels:
-                append_phase(
-                    range_index=index,
-                    phase_kind="steady_b",
-                    panels=steady_panels,
-                    active_threads=active_threads,
-                    balanced_tiles=balanced_tiles,
-                    a_l2_bytes=range_demand.a_l2_refill_bytes - cold_a_l2_bytes,
-                    b_l2_bytes=range_demand.b_l2_refill_bytes - cold_b_l2_bytes,
-                    c_write_bytes=range_demand.c_write_bytes - cold_c_write_bytes,
-                    compulsory_dram_bytes=0.0,
-                    spillable_dram_bytes=range_demand.spillable_dram_bytes - cold_a_l2_bytes - cold_c_write_bytes,
-                    working_set_bytes=range_demand.llc_working_set_bytes,
-                )
         return tuple(phases)
 
     @lru_cache(maxsize=4096)
@@ -1311,17 +1077,16 @@ class AnalyticMoeCostModel:
             self.intermediate_size,
             down_output_element_bytes=self.down_output_element_bytes,
         )
-        w13_geometry, w2_geometry = self._task_weight_geometries(routes, threads)
         w13_mapping = self._mapper.lower(
             work.w13,
-            ExecutionSchedule(threads=threads, sequential_n_ranges=w13_geometry.ranges),
+            ExecutionSchedule(threads=threads),
         )
         w2_mapping = self._mapper.lower(
             work.w2,
-            ExecutionSchedule(threads=threads, sequential_n_ranges=w2_geometry.ranges),
+            ExecutionSchedule(threads=threads),
         )
-        w13_demand = self._stage_demand("w13", w13_mapping, w13_geometry)
-        w2_demand = self._stage_demand("w2", w2_mapping, w2_geometry)
+        w13_demand = self._stage_demand("w13", w13_mapping, self._w13_geometry)
+        w2_demand = self._stage_demand("w2", w2_mapping, self._w2_geometry)
         overhead_ns = self.calibration.overheads.expert_fixed_ns + routes * self.calibration.overheads.route_ns
         phases: list[AnalyticPhase] = []
         if overhead_ns > 0.0:
@@ -1604,9 +1369,9 @@ class AnalyticMoeCostModel:
 
         def demand(stage: AnalyticStageDemand) -> dict:
             stage_phases = tuple(phase for phase in prediction.phases if phase.name.startswith(f"{stage.stage}:"))
+            stripe = stage.stripe_demand
             return {
-                "ranges": stage.ranges,
-                "window_bytes": stage.window_bytes,
+                "stage_bytes": stage.stage_bytes,
                 "owner_window_bytes": stage.owner_window_bytes,
                 "reusable_b_bytes": stage.reusable_b_bytes,
                 "l2_miss_fraction_b": stage.l2_miss_fraction_b,
@@ -1623,25 +1388,26 @@ class AnalyticMoeCostModel:
                 "executed_flops": sum(phase.matrix_flops for phase in stage_phases),
                 "mapping_balanced_executed_flops_upper_bound": (stage.mapping.demand.balanced_executed_flops),
                 "active_threads": stage.mapping.demand.active_threads,
-                "range_demands": [
+                "worker_stripe": (
                     {
-                        "n_tiles": item.n_tiles,
-                        "balanced_work_fraction": item.balanced_work_fraction,
-                        "owner_window_bytes": item.owner_window_bytes,
-                        "b_reuse_footprint_bytes": item.b_reuse_footprint_bytes,
-                        "b_transient_reuses": item.b_transient_reuses,
-                        "b_steady_reuses": item.b_steady_reuses,
-                        "l2_steady_miss_fraction_b": item.l2_steady_miss_fraction_b,
-                        "a_residency_footprint_bytes": item.a_residency_footprint_bytes,
-                        "a_residency_capacity_bytes": item.a_residency_capacity_bytes,
-                        "a_l2_refill_bytes": item.a_l2_refill_bytes,
-                        "b_l2_refill_bytes": item.b_l2_refill_bytes,
-                        "compulsory_dram_bytes": item.compulsory_dram_bytes,
-                        "spillable_dram_bytes": item.spillable_dram_bytes,
-                        "llc_working_set_bytes": item.llc_working_set_bytes,
+                        "n_tiles": stripe.n_tiles,
+                        "balanced_work_fraction": stripe.balanced_work_fraction,
+                        "owner_window_bytes": stripe.owner_window_bytes,
+                        "b_reuse_footprint_bytes": stripe.b_reuse_footprint_bytes,
+                        "b_transient_reuses": stripe.b_transient_reuses,
+                        "b_steady_reuses": stripe.b_steady_reuses,
+                        "l2_steady_miss_fraction_b": stripe.l2_steady_miss_fraction_b,
+                        "a_residency_footprint_bytes": stripe.a_residency_footprint_bytes,
+                        "a_residency_capacity_bytes": stripe.a_residency_capacity_bytes,
+                        "a_l2_refill_bytes": stripe.a_l2_refill_bytes,
+                        "b_l2_refill_bytes": stripe.b_l2_refill_bytes,
+                        "compulsory_dram_bytes": stripe.compulsory_dram_bytes,
+                        "spillable_dram_bytes": stripe.spillable_dram_bytes,
+                        "llc_working_set_bytes": stripe.llc_working_set_bytes,
                     }
-                    for item in stage.range_demands
-                ],
+                    if stripe is not None
+                    else None
+                ),
             }
 
         def phase_detail(phase: AnalyticPhase) -> dict:

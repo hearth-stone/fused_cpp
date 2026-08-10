@@ -16,11 +16,9 @@ from phase_model import ContentionCostModel  # noqa: E402
 from profile_catalog import (  # noqa: E402
     ProfileCatalog,
     ProfileCompatibilityError,
-    ProfilePolicy,
     ProfileQuery,
 )
 from interval_planner import IntervalPlanner  # noqa: E402
-from stage_window_policy import default_task_stage_window_policy  # noqa: E402
 
 
 @dataclass(frozen=True)
@@ -76,7 +74,7 @@ class RankCompute:
     rank: int
     routes: int
     active_experts: int
-    stage_range_histogram: tuple[tuple[int, int, int], ...]
+    stage_worker_window_histogram: tuple[tuple[int, int, int], ...]
     shape: tuple[int, ...]
     predicted_ms: float
 
@@ -206,16 +204,11 @@ class ParallelLayerEvaluator:
         model: ContentionCostModel,
         cores: int,
         cpu_ids: tuple[int, ...],
-        *,
-        execution_policy_profile: ProfilePolicy | None = None,
     ) -> IntervalPlanner:
-        profile = model.policy if execution_policy_profile is None else execution_policy_profile
-        policy = default_task_stage_window_policy(profile, num_cores=cores, cpu_ids=cpu_ids)
         return IntervalPlanner(
             model,
             cores,
             cpu_ids=cpu_ids,
-            task_stage_window_policy=policy,
         )
 
     @staticmethod
@@ -288,7 +281,6 @@ class ParallelLayerEvaluator:
                 planning_model,
                 self.cores_per_rank,
                 cpu_ids,
-                execution_policy_profile=model.policy,
             )
             plan = planner.plan(experts)
             rank_plans.append(
@@ -315,36 +307,33 @@ class ParallelLayerEvaluator:
             last_rank, _, last_plan, last_model = ordered[-1]
             switch_ns = completion_ns[ordered[-2][0]]
             if completion_ns[last_rank] > switch_ns:
-                task_policy = last_model.task_stage_window_policy
-                standalone_model = (
-                    single_rank_model.with_task_stage_window_policy(task_policy)
-                    if task_policy is not None
-                    else single_rank_model
-                )
                 completion_ns[last_rank] = last_model.dag_makespan_with_model_switch(
                     self._model_tasks(last_plan),
                     switch_ns,
-                    standalone_model,
+                    single_rank_model,
                 )
 
-        plans_by_rank = {rank: (experts, plan) for rank, experts, plan, _ in rank_plans}
+        plans_by_rank = {rank: (experts, plan, rank_model) for rank, experts, plan, rank_model in rank_plans}
         rank_results: list[RankCompute] = []
         for rank, histogram in enumerate(rank_histograms):
             if rank in empty_ranks:
                 rank_results.append(RankCompute(rank, 0, 0, (), (), 0.0))
                 continue
-            experts, plan = plans_by_rank[rank]
-            bridge = plan["bridge"]
-            range_counts = Counter(
-                zip(bridge["task_w13_ranges"], bridge["task_w2_ranges"], strict=True)
+            experts, plan, rank_model = plans_by_rank[rank]
+            window_counts = Counter(
+                (
+                    rank_model.stage_bytes_per_worker("w13", int(threads), int(routes)),
+                    rank_model.stage_bytes_per_worker("w2", int(threads), int(routes)),
+                )
+                for _, routes, _, threads, _ in plan["tasks"]
             )
             rank_results.append(
                 RankCompute(
                     rank=rank,
                     routes=sum(histogram),
                     active_experts=len(experts),
-                    stage_range_histogram=tuple(
-                        sorted((int(w13), int(w2), int(count)) for (w13, w2), count in range_counts.items())
+                    stage_worker_window_histogram=tuple(
+                        sorted((int(w13), int(w2), int(count)) for (w13, w2), count in window_counts.items())
                     ),
                     shape=tuple(plan["shape"]),
                     predicted_ms=completion_ns[rank] / 1e6,
@@ -407,7 +396,7 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=ROOT / "cpu_moe_schedule_optimization" / "cost_model" / "profiles",
     )
-    parser.add_argument("--profile-pattern", default="*_v2_*.json")
+    parser.add_argument("--profile-pattern", default="*fulln*.json")
     parser.add_argument("--tokens", type=int, default=2048)
     parser.add_argument("--topk", type=int, default=6)
     parser.add_argument("--experts", type=int, default=64)
@@ -475,7 +464,7 @@ def main() -> int:
             for rank in result.rank_compute:
                 print(
                     f"  rank{rank.rank}: routes={rank.routes:<6} "
-                    f"active={rank.active_experts:<3} task_ranges={rank.stage_range_histogram} "
+                    f"active={rank.active_experts:<3} worker_windows={rank.stage_worker_window_histogram} "
                     f"shape={rank.shape} time={rank.predicted_ms:.3f} ms"
                 )
         winner = "TP" if tp.total_ms < ep.total_ms else "EP"

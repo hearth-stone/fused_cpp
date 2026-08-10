@@ -37,16 +37,6 @@ struct IntervalIsoFormulaConfig {
   std::vector<std::pair<int, double>> measured_phi;
 };
 
-struct IntervalStageWindowEntry {
-  int min_routes = 0;
-  int max_routes = 0;
-  int threads = 0;
-  int w13_ranges = 1;
-  int w2_ranges = 1;
-  int64_t w13_chunk_bytes = 0;
-  int64_t w2_chunk_bytes = 0;
-};
-
 struct IntervalTailRepartitionEntry {
   std::vector<int> root_shape;
   int tail_width = 0;
@@ -69,14 +59,11 @@ struct IntervalCostModelConfig {
   int local_experts = 0;
   int profile_runs = 1;
   int measurement_experts = 0;
-  int calibration_w13_ranges = 1;
-  int calibration_w2_ranges = 1;
-  int64_t w13_chunk_bytes = 0;
-  int64_t w2_chunk_bytes = 0;
+  int64_t w13_stage_bytes = 0;
+  int64_t w2_stage_bytes = 0;
   int64_t max_stage_bytes = 0;
   int64_t w13_tile_bytes = 0;
   int64_t w2_tile_bytes = 0;
-  std::vector<IntervalStageWindowEntry> task_stage_windows;
   double call_setup_ns = 0.0;
   std::vector<IntervalIsoEntry> isolated;
   std::vector<std::pair<int, double>> overheads;

@@ -1,41 +1,34 @@
 """Domain-bound, exact-shape and stage-aware MoE contention model.
 
 Schema-v2 profiles bind measurements to a sharded expert shape, kernel binary,
-NUMA topology, and concurrent-rank count. The stage ranges recorded in a file
-describe its measurement geometry; runtime geometry is resolved per task after
-team-width selection. Legacy schema-v1 profiles retain the old flat-task
-behavior for reproducibility.
+NUMA topology, and concurrent-rank count. Each production GEMM consumes its
+full N domain; team width alone determines each worker's packed-B stripe.
+Legacy schema-v1 profiles retain the old flat-task behavior for reproducibility.
 """
 
 from __future__ import annotations
 
-import copy
 import json
 import math
 import os
 import statistics
 from bisect import bisect_left
-from functools import lru_cache
 from pathlib import Path
 
 try:
     from iso_formula import IsoFormula, fit_from_measurements
     from profile_catalog import (
         ProfileCompatibilityError,
-        ProfileMeasurementGeometry,
         ProfilePolicy,
         ProfileQuery,
     )
-    from weight_window import stage_weight_window_geometry
 except ImportError:  # pragma: no cover - package-style import
     from .iso_formula import IsoFormula, fit_from_measurements
     from .profile_catalog import (
         ProfileCompatibilityError,
-        ProfileMeasurementGeometry,
         ProfilePolicy,
         ProfileQuery,
     )
-    from .weight_window import stage_weight_window_geometry
 
 
 class ContentionCostModel:
@@ -58,11 +51,6 @@ class ContentionCostModel:
             raise ValueError(f"unsupported kernel.m_tail_policy={self.m_tail_policy!r}")
         formula_payload = prof.get("iso_formula")
         self.policy = ProfilePolicy.from_payload(prof) if self.schema_version >= 2 else None
-        self.measurement_geometry = (
-            ProfileMeasurementGeometry.from_payload(prof)
-            if self.schema_version >= 2
-            else ProfileMeasurementGeometry(1, 1)
-        )
         if expected_policy is not None:
             if self.policy is None:
                 raise ProfileCompatibilityError("cannot apply a policy query to a legacy profile")
@@ -215,17 +203,28 @@ class ContentionCostModel:
         self.call_setup_ns = float(measurement.get("call_setup_ns", 0.0))
         self.profile_runs = max(int(measurement.get("runs", 1)), 1)
         working_set = prof.get("working_set", {})
-        self.w13_chunk_bytes = int(working_set.get("w13_chunk_bytes_per_expert", 0))
-        self.w2_chunk_bytes = int(
+        self.w13_stage_bytes = int(
             working_set.get(
-                "w2_chunk_bytes_per_expert",
-                working_set.get("w2_packed_bytes_per_expert", 0),
+                "w13_stage_bytes_per_expert",
+                working_set.get(
+                    "w13_packed_bytes_per_expert",
+                    working_set.get("w13_dense_bytes_per_expert", 0),
+                ),
             )
         )
-        self.w2_bytes = self.w2_chunk_bytes
-        self.max_stage_bytes = int(working_set.get("max_weight_stage_bytes_per_expert", 0))
-        self.calibration_w13_ranges = self.measurement_geometry.w13_ranges
-        self.calibration_w2_ranges = self.measurement_geometry.w2_ranges
+        self.w2_stage_bytes = int(
+            working_set.get(
+                "w2_stage_bytes_per_expert",
+                working_set.get(
+                    "w2_packed_bytes_per_expert",
+                    working_set.get("w2_dense_bytes_per_expert", 0),
+                ),
+            )
+        )
+        if min(self.w13_stage_bytes, self.w2_stage_bytes) <= 0:
+            raise ValueError("profile must record positive full packed W13/W2 bytes per expert")
+        self.w2_bytes = self.w2_stage_bytes
+        self.max_stage_bytes = max(self.w13_stage_bytes, self.w2_stage_bytes)
         if self.policy is not None:
             n_tile = self.policy.backend_n_tile
             self.w13_tile_bytes = self.policy.hidden_size * n_tile * 2
@@ -239,7 +238,6 @@ class ContentionCostModel:
         self.has_full_workload_anchors = (
             self.schema_version >= 2 and self.local_experts > 0 and self.measurement_experts == self.local_experts
         )
-        self.task_stage_window_policy = None
 
     @staticmethod
     def _linear_intercept(points: list[tuple[int, float]]) -> float:
@@ -260,136 +258,51 @@ class ContentionCostModel:
         return tuple(sorted((int(value) for value in threads if int(value) > 0), reverse=True))
 
     @staticmethod
-    def _owner_range_bytes(range_bytes: int, tile_bytes: int, threads: int) -> int:
+    def _owner_stage_bytes(stage_bytes: int, tile_bytes: int, threads: int) -> int:
         if threads <= 0:
             raise ValueError(f"threads must be positive, got {threads}")
-        if range_bytes <= 0 or tile_bytes <= 0:
+        if stage_bytes <= 0 or tile_bytes <= 0:
             return 0
-        range_tiles = math.ceil(range_bytes / tile_bytes)
-        owner_tiles = math.ceil(range_tiles / threads)
+        stage_tiles = math.ceil(stage_bytes / tile_bytes)
+        owner_tiles = math.ceil(stage_tiles / threads)
         return owner_tiles * tile_bytes
 
-    def with_task_stage_window_policy(self, policy):
-        """Return an immutable-view clone whose execution model applies ``policy``."""
-        if self.schema_version < 2 or self.policy is None:
-            raise ProfileCompatibilityError("per-task stage windows require a schema-v2 profile")
-        if not callable(getattr(policy, "select", None)):
-            raise TypeError("task stage-window policy must provide select(routes, threads)")
-        if not callable(getattr(policy, "cost_model_entries", None)):
-            raise TypeError("task stage-window policy must provide finite cost_model_entries()")
-        bound = copy.copy(self)
-        bound.task_stage_window_policy = policy
-        return bound
-
-    @lru_cache(maxsize=4096)
-    def _task_stage_geometry(self, routes: int, threads: int) -> tuple[int, int, int, int]:
-        baseline = (
-            self.calibration_w13_ranges,
-            self.w13_chunk_bytes,
-            self.calibration_w2_ranges,
-            self.w2_chunk_bytes,
-        )
-        if self.task_stage_window_policy is None:
-            return baseline
-        w13_target, w2_target = self.task_stage_window_policy.select(int(routes), int(threads))
-        if min(w13_target, w2_target) < -1:
-            raise ValueError("task stage-window policy must return -1 or non-negative byte counts")
-        if w13_target == -1 and w2_target == -1:
-            return baseline
-        assert self.policy is not None
-        w13 = stage_weight_window_geometry(
-            k=self.policy.hidden_size,
-            n=2 * self.policy.intermediate_size,
-            n_tile=self.policy.backend_n_tile,
-            target_bytes=max(int(w13_target), 0),
-            fallback_ranges=self.calibration_w13_ranges,
-        )
-        w2 = stage_weight_window_geometry(
-            k=self.policy.intermediate_size,
-            n=self.policy.hidden_size,
-            n_tile=self.policy.backend_n_tile,
-            target_bytes=max(int(w2_target), 0),
-            fallback_ranges=self.calibration_w2_ranges,
-        )
-        return w13.ranges, w13.max_range_bytes, w2.ranges, w2.max_range_bytes
-
     def task_max_stage_bytes(self, routes: int, threads: int) -> int:
-        _, w13_bytes, _, w2_bytes = self._task_stage_geometry(int(routes), int(threads))
-        return max(w13_bytes, w2_bytes)
-
-    def task_stage_ranges(self, routes: int, threads: int) -> tuple[int, int]:
-        w13_ranges, _, w2_ranges, _ = self._task_stage_geometry(int(routes), int(threads))
-        return w13_ranges, w2_ranges
+        del routes, threads
+        return self.max_stage_bytes
 
     def task_stage_bytes(self, stage: str, routes: int, threads: int) -> int:
-        w13_ranges, w13_bytes, w2_ranges, w2_bytes = self._task_stage_geometry(int(routes), int(threads))
-        del w13_ranges, w2_ranges
+        del routes, threads
         if stage == "w13":
-            return w13_bytes
+            return self.w13_stage_bytes
         if stage == "w2":
-            return w2_bytes
+            return self.w2_stage_bytes
         raise ValueError(f"stage must be 'w13' or 'w2', got {stage!r}")
 
     def window_bytes_per_worker(self, threads: int, routes: int | None = None) -> int:
         """Maximum tile-aligned packed-B owner stripe across W13 and W2."""
-        if routes is None:
-            w13_bytes = self.w13_chunk_bytes
-            w2_bytes = self.w2_chunk_bytes
-        else:
-            _, w13_bytes, _, w2_bytes = self._task_stage_geometry(int(routes), int(threads))
+        del routes
         return max(
-            self._owner_range_bytes(w13_bytes, self.w13_tile_bytes, threads),
-            self._owner_range_bytes(w2_bytes, self.w2_tile_bytes, threads),
+            self._owner_stage_bytes(self.w13_stage_bytes, self.w13_tile_bytes, threads),
+            self._owner_stage_bytes(self.w2_stage_bytes, self.w2_tile_bytes, threads),
         )
 
-    def stage_window_bytes_per_worker(self, stage: str, threads: int, routes: int | None = None) -> int:
+    def stage_bytes_per_worker(self, stage: str, threads: int, routes: int | None = None) -> int:
         """Tile-aligned packed-B owner stripe for one named GEMM stage."""
+        del routes
         if stage == "w13":
-            range_bytes = (
-                self.w13_chunk_bytes
-                if routes is None
-                else self._task_stage_geometry(int(routes), int(threads))[1]
-            )
+            stage_bytes = self.w13_stage_bytes
             tile_bytes = self.w13_tile_bytes
         elif stage == "w2":
-            range_bytes = (
-                self.w2_chunk_bytes
-                if routes is None
-                else self._task_stage_geometry(int(routes), int(threads))[3]
-            )
+            stage_bytes = self.w2_stage_bytes
             tile_bytes = self.w2_tile_bytes
         else:
             raise ValueError(f"stage must be 'w13' or 'w2', got {stage!r}")
-        return self._owner_range_bytes(range_bytes, tile_bytes, threads)
+        return self._owner_stage_bytes(stage_bytes, tile_bytes, threads)
 
     def can_use_full_workload_anchor(self, routes: int, shape) -> bool:
-        if not self.has_full_workload_anchors:
-            return False
-        if self.task_stage_window_policy is None:
-            return True
-        return all(self.task_stage_window_policy.select(int(routes), int(threads)) == (-1, -1) for threads in shape)
-
-    def _native_stage_window_rows(self) -> list[tuple[int, int, int, int, int, int, int]]:
-        if self.task_stage_window_policy is None:
-            return []
-        rows = []
-        for entry in self.task_stage_window_policy.cost_model_entries():
-            w13_ranges, w13_bytes, w2_ranges, w2_bytes = self._task_stage_geometry(
-                int(entry.min_routes),
-                int(entry.threads),
-            )
-            rows.append(
-                (
-                    int(entry.min_routes),
-                    int(entry.max_routes),
-                    int(entry.threads),
-                    w13_ranges,
-                    w2_ranges,
-                    w13_bytes,
-                    w2_bytes,
-                )
-            )
-        return rows
+        del routes, shape
+        return self.has_full_workload_anchors
 
     @staticmethod
     def _native_shape_curve_rows(curves) -> list[tuple[list[int], int, float]]:
@@ -414,14 +327,11 @@ class ContentionCostModel:
             "local_experts": self.local_experts,
             "profile_runs": self.profile_runs,
             "measurement_experts": self.measurement_experts,
-            "calibration_w13_ranges": self.calibration_w13_ranges,
-            "calibration_w2_ranges": self.calibration_w2_ranges,
-            "w13_chunk_bytes": self.w13_chunk_bytes,
-            "w2_chunk_bytes": self.w2_chunk_bytes,
+            "w13_stage_bytes": self.w13_stage_bytes,
+            "w2_stage_bytes": self.w2_stage_bytes,
             "max_stage_bytes": self.max_stage_bytes,
             "w13_tile_bytes": self.w13_tile_bytes,
             "w2_tile_bytes": self.w2_tile_bytes,
-            "task_stage_windows": self._native_stage_window_rows(),
             "call_setup_ns": self.call_setup_ns,
             "isolated": [(routes, threads, value) for (routes, threads), value in sorted(self._iso.items())],
             "overheads": sorted(self._O.items()),
@@ -625,20 +535,7 @@ class ContentionCostModel:
             return False
         effective = self.m12_effective_rows(routes)
         curve = self._tail_repartition_median.get((root_shape, tail_width, route_slices))
-        if curve is None or effective not in curve:
-            return False
-        if self.task_stage_window_policy is None:
-            return True
-        if effective % route_slices != 0:
-            return False
-        tail_routes = effective // route_slices
-        return (
-            all(
-                self.task_stage_window_policy.select(effective, threads) == (-1, -1)
-                for threads in root_shape
-            )
-            and self.task_stage_window_policy.select(tail_routes, tail_width) == (-1, -1)
-        )
+        return curve is not None and effective in curve
 
     def profiled_bounded_tail_repartition(
         self,
@@ -855,33 +752,21 @@ class ContentionCostModel:
         phases: list[tuple[float, int]] = []
         if overhead > 0:
             phases.append((overhead, 0))
-        w13_ranges, w13_bytes, w2_ranges, w2_bytes = self._task_stage_geometry(routes, threads)
-        w13_ranges = max(w13_ranges, 1)
-        w13_phase = compute * (2.0 / 3.0) / w13_ranges
-        for _ in range(w13_ranges):
-            phases.append((w13_phase, w13_bytes))
-        w2_ranges = max(w2_ranges, 1)
-        w2_phase = compute / 3.0 / w2_ranges
-        for _ in range(w2_ranges):
-            phases.append((w2_phase, w2_bytes))
+        phases.append((compute * (2.0 / 3.0), self.w13_stage_bytes))
+        phases.append((compute / 3.0, self.w2_stage_bytes))
         return [(duration, workset) for duration, workset in phases if duration > 0]
 
     def _task_stage_phases(self, stage: str, routes: int, threads: int) -> list[tuple[float, int]]:
         isolated = self.T_iso(routes, threads)
         overhead = min(self._overhead(threads), isolated * 0.9)
         compute = max(isolated - overhead, 0.0)
-        w13_ranges, w13_bytes, w2_ranges, w2_bytes = self._task_stage_geometry(routes, threads)
         phases: list[tuple[float, int]] = []
         if stage == "w13":
             if overhead > 0:
                 phases.append((overhead, 0))
-            w13_ranges = max(w13_ranges, 1)
-            duration = compute * (2.0 / 3.0) / w13_ranges
-            phases.extend((duration, w13_bytes) for _ in range(w13_ranges))
+            phases.append((compute * (2.0 / 3.0), self.w13_stage_bytes))
         elif stage == "w2":
-            w2_ranges = max(w2_ranges, 1)
-            duration = compute / 3.0 / w2_ranges
-            phases.extend((duration, w2_bytes) for _ in range(w2_ranges))
+            phases.append((compute / 3.0, self.w2_stage_bytes))
         else:
             raise ValueError(f"stage must be 'w13' or 'w2', got {stage!r}")
         return [(duration, workset) for duration, workset in phases if duration > 0]

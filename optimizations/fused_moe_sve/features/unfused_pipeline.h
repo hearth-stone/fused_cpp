@@ -18,7 +18,7 @@ struct Config {
   int hidden = 4096;
   int intermediate = 2048;
   int threads_per_expert = 24;
-  int w13_ranges = 2;
+  int w13_ranges = 1;
   int copies = 2;
   int cpu_start = 0;
 };
@@ -73,7 +73,7 @@ struct FragmentedConfig {
   int hidden = 4096;
   int intermediate = 512;
   int threads_per_team = 4;
-  int w13_ranges = 2;
+  int w13_ranges = 1;
   int copies = 2;
   int cpu_start = 0;
   Schedule schedule = Schedule::kDynamic;

@@ -4,6 +4,12 @@ This directory contains SVE fused-MoE features and standalone experiments. The
 weighted route-merge U1 kernel and async ready-token merge are enabled by
 default for their supported SVE paths; neither changes the fused-MoE API.
 
+Production W13 and W2 now each execute one complete packed-N stage. There is no
+split/range/window control in the public API, Plan V2, planner, or cost model.
+For stage `(K,N)`, backend N tile `v`, and task width `t`, the maximum owner
+stripe is `ceil((N/v)/t) * K * v * 2` bytes. Sections explicitly labelled
+historical retain earlier range experiments only as provenance.
+
 ## Xbyak exact-M compute kernels
 
 The default one-chunk SVE path generates W13 fused-SiLU/packC, W2 FP32, and W2
@@ -36,7 +42,7 @@ flag is off by default.
 benchmark-only production-wiring experiment derived from the standalone
 streaming-B result below. The JIT cache contains prefetch and ordinary kernels
 for every exact M from 1 through 12.
-Within each thread-owned W13 N range, its first actual M panel uses one
+Within each thread-owned W13 N stripe, its first actual M panel uses one
 `PLDL1STRM` hint 2 KiB ahead; all subsequent panels use ordinary kernels.
 M1-M8 keep their two-bank K loop and disable hints on the final N tile. M9-M12
 disable only the final 2 KiB of hints on that tile.
@@ -332,7 +338,7 @@ to compare the vLLM-style queue against the actual production planner:
 ```bash
 P=cpu_moe_schedule_optimization/cost_model/profiles/\
 contention_async_amazon_c5_192c_dual_numa_tp4_sve_F512_E256_\
-splitw13_schema_v2_xbyak_exactm_20260726.json
+fulln_schema_v2_xbyak_exactm_20260727.json
 PYTHONPATH=src numactl --cpunodebind=0 --membind=0 taskset -c 0-95 \
   .venv/bin/python \
   optimizations/fused_moe_sve/benchmarks/bench_vllm_staged_schedule.py \
@@ -696,7 +702,7 @@ numactl --cpunodebind=0 --membind=0 \
   --trials 9 --evict-mib 192 --cpu 48
 ```
 
-## Threaded exact-range working-set experiment
+## Threaded full-stage working-set experiment
 
 `run_thread_weight_working_set.py` drives the production-fused path of
 `bench_unfused_pipeline` with several thread mappings:
@@ -710,16 +716,17 @@ numactl --cpunodebind=0 --membind=0 \
 - `team-fixed-work`: the same team shapes are used while total route count and
   total GEMM FLOPs remain fixed.
 
-All modes use two W13 ranges. The instantaneous packed-B working set is
-`active_experts * max(W13_chunk_bytes, W2_bytes)`. The runner also records the
-largest per-thread N stripe, full wall time, aggregate TFLOP/s, and W13/W2 stage
-times. Each invocation uses a distinct weight copy.
+All modes execute one full W13 and W2 stage. The instantaneous packed-B working
+set is `active_experts * max(full_W13_bytes, full_W2_bytes)`. The runner also
+records the largest width-derived per-thread N stripe, full wall time,
+aggregate TFLOP/s, and W13/W2 stage times. Each invocation uses a distinct
+weight copy.
 
 ```bash
 numactl --cpunodebind=0 --membind=0 taskset -c 0-95 \
   .venv/bin/python \
   optimizations/fused_moe_sve/benchmarks/run_thread_weight_working_set.py \
-  --output /tmp/stage_range_thread_working_set.json \
+  --output /tmp/full_stage_thread_working_set.json \
   --threads 1,2,4,8,16,32,64,96 --routes 192,2040 \
   --experiments nsplit,expert-fixed,expert-total \
   --nsplit-stage-mib 4,16,64 --expert-stage-mib 0.5,2 \
@@ -733,7 +740,7 @@ the same 96-thread budget:
 numactl --cpunodebind=0 --membind=0 taskset -c 0-95 \
   .venv/bin/python \
   optimizations/fused_moe_sve/benchmarks/run_thread_weight_working_set.py \
-  --output /tmp/stage_range_expert_team.json \
+  --output /tmp/full_stage_expert_team.json \
   --experiments team-fixed-route,team-fixed-work \
   --team-experts 1,2,3,4,6,8,12 --team-total-threads 96 \
   --team-route 2040 --team-total-routes 2304 \
@@ -756,7 +763,7 @@ M12-aligned routes; the default factors `2,5,10` produce routes `1020,408,204`.
 numactl --cpunodebind=0 --membind=0 taskset -c 0-95 \
   .venv/bin/python \
   optimizations/fused_moe_sve/benchmarks/run_fragmented_route_pipeline.py \
-  --output /tmp/stage_range_fixed_active_b_fragmentation.json \
+  --output /tmp/full_stage_fixed_active_b_fragmentation.json \
   --teams 24 --base-routes 2040 --hidden 4096 --intermediate 512 \
   --threads-per-team 4 --schedule dynamic --split-factors 1,2,5,10 \
   --replaced-teams 6,12,24 --warmup 2 --runs 7
@@ -833,7 +840,12 @@ The controlled full-pipeline fusion comparison is recorded in
 The unique-weight single-core cache-window measurements are recorded in
 [`results/amazon_192c_single_core_weight_window.md`](results/amazon_192c_single_core_weight_window.md).
 
-## Exact packed-B stage ranges
+## Historical packed-B stage ranges (retired)
+
+This section documents the removed range/window implementation and its old
+measurements. None of the APIs, policies, scripts, or defaults described below
+is active production behavior; current behavior is the full-stage contract at
+the top of this file.
 
 The production fused SVE expert accepts positive `w13_ranges` and `w2_ranges`
 on the normal, scheduled, and task-DAG async entrypoints. Plan V2 carries the

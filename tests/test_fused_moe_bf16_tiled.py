@@ -562,21 +562,6 @@ def test_sve_plan_v2_strict_and_tail_pool_match_legacy_async(
     monkeypatch.delenv("FUSED_CPP_MOE_STRICT_TAIL_STEAL")
     monkeypatch.delenv("FUSED_CPP_MOE_STAGE_TIMING")
 
-    range_bridge = upgrade_legacy_async_plan(strict_bridge)
-    range_bridge.update(
-        {
-            "task_w13_ranges": [1, 2, 4, 4],
-            "task_w2_ranges": [4, 4, 2, 1],
-        }
-    )
-    ranged = fused_moe_bf16_tiled_async_plan(
-        hidden_states,
-        packed,
-        topk_weights,
-        topk_ids,
-        AsyncMoEPlanV2.from_dict(range_bridge),
-    )
-
     tail_bridge = upgrade_legacy_async_plan(strict_bridge)
     tail_bridge.update(
         {
@@ -670,7 +655,6 @@ def test_sve_plan_v2_strict_and_tail_pool_match_legacy_async(
     torch.testing.assert_close(strict.float(), reference.float(), atol=0, rtol=0)
     torch.testing.assert_close(strict_tail_steal.float(), strict.float(), atol=0, rtol=0)
     torch.testing.assert_close(strict_tail_steal_ready_merge.float(), strict.float(), atol=0, rtol=0)
-    torch.testing.assert_close(ranged.float(), strict.float(), atol=0, rtol=0)
     torch.testing.assert_close(tail.float(), strict.float(), atol=0, rtol=0)
     torch.testing.assert_close(elastic.float(), strict.float(), atol=0, rtol=0)
     torch.testing.assert_close(nonblocking.float(), strict.float(), atol=0, rtol=0)

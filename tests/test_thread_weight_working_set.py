@@ -21,14 +21,14 @@ from run_thread_weight_working_set import (  # noqa: E402
 
 
 def test_nsplit_keeps_total_stage_constant_and_reduces_thread_stripe() -> None:
-    assert stage_bytes(4096, 2048) == 16 * 1024 * 1024
-    assert max_nsplit_thread_stage_bytes(4096, 2048, 1, 8) == 16 * 1024 * 1024
-    assert max_nsplit_thread_stage_bytes(4096, 2048, 8, 8) == 2 * 1024 * 1024
+    assert stage_bytes(4096, 2048) == 32 * 1024 * 1024
+    assert max_nsplit_thread_stage_bytes(4096, 2048, 1, 8) == 32 * 1024 * 1024
+    assert max_nsplit_thread_stage_bytes(4096, 2048, 8, 8) == 4 * 1024 * 1024
 
 
 def test_fixed_total_expert_mapping_reduces_each_expert_weight() -> None:
     intermediate = intermediate_for_total_stage(4096, 64.0, 32, 8)
-    assert intermediate == 256
+    assert intermediate == 128
     assert 32 * stage_bytes(4096, intermediate) == 64 * 1024 * 1024
 
 
@@ -84,7 +84,7 @@ def test_team_point_builder_rejects_non_integral_team_shapes() -> None:
 
 def test_output_parser_requires_production_fused_stage_data() -> None:
     output = """\
-config experts=1 routes=192 hidden=4096 intermediate=512 threads_per_expert=1 workers=1 w13_ranges=2 n_tile=8 copies=3 allocated_gib=0.125
+config experts=1 routes=192 hidden=4096 intermediate=512 threads_per_expert=1 workers=1 w13_ranges=1 n_tile=8 copies=3 allocated_gib=0.125
 stage variant=production_fused name=fused_w13_silu_mul_packc median_max_team_ms=1.250 min_ms=1.200 mean_ms=1.300
 RESULT_JSON {"variant":"production_fused","median_ms":2.5,"p99_ms":2.7,"tflops":1.25}
 """

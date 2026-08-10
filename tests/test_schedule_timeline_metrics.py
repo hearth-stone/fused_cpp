@@ -21,8 +21,6 @@ def test_annotate_gemm_throughput_assigns_per_core_n_work() -> None:
             "task": 0,
             "routes": 4,
             "threads": 2,
-            "w13_ranges": 2,
-            "w2_ranges": 1,
         }
     ]
     actual = {

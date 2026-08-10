@@ -20,7 +20,6 @@ from analytic_model import (  # noqa: E402
     SaturatingServiceCurve,
     analytic_candidate_shapes,
 )
-from analytic_stage_window_policy import AnalyticStageWindowPolicy  # noqa: E402
 from analytic_probe_geometry import (  # noqa: E402
     b_only_geometry,
     m12_gemm_geometry,
@@ -33,8 +32,7 @@ from build_analytic_calibration import (  # noqa: E402
 )
 from interval_planner import IntervalPlanner  # noqa: E402
 from planned_moe import PlannedMoE  # noqa: E402
-from stage_window_policy import StageWindowBand, StaticStageWindowPolicy  # noqa: E402
-from sve_bf16_kernel_model import allocate_n_tiles  # noqa: E402
+from full_stage_geometry import full_stage_geometry  # noqa: E402
 from validate_analytic_model import build_validation_report  # noqa: E402
 
 
@@ -80,7 +78,6 @@ def _calibration(
             expert_fixed_ns=200.0,
             route_ns=2.0,
             stage_fixed_ns=100.0,
-            range_fixed_ns=50.0,
         ),
         supported_widths=supported_widths,
         relative_uncertainty=0.04,
@@ -89,9 +86,6 @@ def _calibration(
 
 def _model(
     calibration: AnalyticMachineCalibration | None = None,
-    *,
-    w13_ranges: int = 2,
-    w2_ranges: int = 1,
 ) -> AnalyticMoeCostModel:
     return AnalyticMoeCostModel(
         calibration or _calibration(),
@@ -99,8 +93,6 @@ def _model(
         intermediate_size=32,
         global_experts=8,
         local_experts=8,
-        calibration_w13_ranges=w13_ranges,
-        calibration_w2_ranges=w2_ranges,
     )
 
 
@@ -350,46 +342,16 @@ def test_model_rejects_dimensions_not_representable_by_sve_mapper() -> None:
         )
 
 
-def test_uneven_weight_ranges_preserve_all_n_tiles() -> None:
-    allocation = allocate_n_tiles(
-        n_columns=80,
-        n_tile=8,
-        threads=2,
-        n_ranges=3,
-    )
+def test_full_stage_geometry_uses_team_width_as_the_only_window_control() -> None:
+    geometry = full_stage_geometry(k=64, n=80, n_tile=8)
 
-    assert allocation.range_tiles == (4, 3, 3)
-    assert sum(allocation.range_tiles) == allocation.total_tiles
-    assert allocation.per_thread_tiles == (6, 4)
-
-
-def test_uneven_weight_ranges_use_per_range_traffic() -> None:
-    calibration = replace(_calibration(), supported_widths=(1, 2, 3, 4, 8))
-    model = AnalyticMoeCostModel(
-        calibration,
-        hidden_size=64,
-        intermediate_size=32,
-        global_experts=8,
-        local_experts=8,
-        calibration_w13_ranges=3,
-    )
-
-    prediction = model.predict_expert(routes=24, threads=3)
-    demand = prediction.w13_demand
-    phases = [phase for phase in prediction.phases if phase.name.startswith("w13")]
-    cold_phases = [phase for phase in phases if phase.kind == "cold_b"]
-    steady_phases = [phase for phase in phases if phase.kind == "steady_b"]
-
-    assert [item.n_tiles for item in demand.range_demands] == [3, 3, 2]
-    assert sum(item.balanced_work_fraction for item in demand.range_demands) == pytest.approx(8 / 9)
-    assert sum(item.compulsory_dram_bytes for item in demand.range_demands) == 2 * 64 * 32 * 2
-    assert len(cold_phases) == 3
-    assert len(steady_phases) == 3
-    assert [phase.active_threads for phase in cold_phases] == [3, 3, 2]
-    assert cold_phases[-1].working_set_bytes < cold_phases[0].working_set_bytes
-    explained = model.explain(routes=24, threads=3)["w13"]
-    assert explained["executed_flops"] == sum(phase.matrix_flops for phase in phases)
-    assert explained["executed_flops"] < explained["mapping_balanced_executed_flops_upper_bound"]
+    assert geometry.total_tiles == 10
+    assert geometry.stage_bytes == 64 * 80 * 2
+    assert geometry.tiles_per_worker(1) == 10
+    assert geometry.tiles_per_worker(2) == 5
+    assert geometry.tiles_per_worker(3) == 4
+    assert geometry.bytes_per_worker(3) == 4 * 64 * 8 * 2
+    assert geometry.active_threads(16) == 10
 
 
 def test_exact_m1_charges_physical_m2_compute() -> None:
@@ -418,7 +380,7 @@ def test_single_panel_weight_does_not_consume_reusable_llc_budget() -> None:
     two_panels = model.predict_expert(routes=24, threads=1).w13_demand
 
     assert single_panel.reusable_b_bytes == 0
-    assert two_panels.reusable_b_bytes == two_panels.window_bytes
+    assert two_panels.reusable_b_bytes == two_panels.stage_bytes
     assert two_panels.llc_working_set_bytes > single_panel.llc_working_set_bytes
 
 
@@ -437,7 +399,7 @@ def test_packed_b_l2_retention_uses_calibrated_miss_anchors() -> None:
     assert model._l2_b_reuse_miss_fraction(2 * cache.l2_bytes_per_core) == pytest.approx(0.87)
 
 
-def test_stage_window_model_uses_physical_a_residency_and_b_cache_turnover() -> None:
+def test_team_width_naturally_controls_full_stage_worker_window() -> None:
     calibration = _calibration()
     cache = replace(
         calibration.caches,
@@ -457,44 +419,22 @@ def test_stage_window_model_uses_physical_a_residency_and_b_cache_turnover() -> 
         local_experts=8,
     )
 
-    resident_a = model.score_stage_window("w13", routes=216, threads=1, target_bytes=128 * 1024)
-    streaming_a = model.score_stage_window("w13", routes=216, threads=1, target_bytes=512 * 1024)
-    turnover_begin = model.score_stage_window("w13", routes=320, threads=1, target_bytes=1024 * 1024)
-    turnover_steady = model.score_stage_window("w13", routes=2040, threads=1, target_bytes=1024 * 1024)
-    over_capacity_begin = model.score_stage_window("w13", routes=320, threads=1, target_bytes=2048 * 1024)
-    over_capacity_steady = model.score_stage_window("w13", routes=2040, threads=1, target_bytes=2048 * 1024)
-
-    assert resident_a.l2_miss_fraction_a == 0.0
-    assert streaming_a.l2_miss_fraction_a == 1.0
-    assert resident_a.a_l2_refill_bytes < streaming_a.a_l2_refill_bytes
-    assert turnover_steady.b_l2_refill_bytes == pytest.approx(turnover_begin.b_l2_refill_bytes)
-    assert over_capacity_steady.b_l2_refill_bytes > over_capacity_begin.b_l2_refill_bytes
-
-
-def test_stage_window_policy_tracks_a_residency_and_long_route_scan_balance() -> None:
-    calibration = _calibration()
-    cache = replace(
-        calibration.caches,
-        l2_bytes_per_core=2 * 1024 * 1024,
-        llc_bytes_per_rank=96 * 1024 * 1024,
-        l2_effective_fraction=0.75,
-        l2_b_reuse_effective_fraction=0.125,
-        l2_b_reuse_miss_floor=0.18,
-        l2_b_reuse_miss_at_capacity=0.623,
-        l2_b_reuse_miss_ceiling=0.869,
-    )
-    model = AnalyticMoeCostModel(
-        replace(calibration, caches=cache),
-        hidden_size=4096,
-        intermediate_size=512,
-        global_experts=8,
-        local_experts=8,
-    )
-    policy = AnalyticStageWindowPolicy(model)
-
-    assert policy.decision(216, 1).w13_worker_bytes == 128 * 1024
-    assert policy.decision(320, 1).w13_worker_bytes == 512 * 1024
-    assert policy.decision(2040, 1).w13_worker_bytes == 1024 * 1024
+    assert model.w13_stage_bytes == 8 * 1024 * 1024
+    assert model.w2_stage_bytes == 4 * 1024 * 1024
+    assert [model.stage_bytes_per_worker("w13", threads) for threads in (1, 2, 4, 8)] == [
+        8 * 1024 * 1024,
+        4 * 1024 * 1024,
+        2 * 1024 * 1024,
+        1 * 1024 * 1024,
+    ]
+    assert [model.stage_bytes_per_worker("w2", threads) for threads in (1, 2, 4, 8)] == [
+        4 * 1024 * 1024,
+        2 * 1024 * 1024,
+        1 * 1024 * 1024,
+        512 * 1024,
+    ]
+    assert model.predict_expert(routes=216, threads=4).w13_demand.owner_window_bytes == 2 * 1024 * 1024
+    assert model.predict_expert(routes=2040, threads=4).w13_demand.owner_window_bytes == 2 * 1024 * 1024
 
 
 def test_single_panel_stage_is_entirely_cold_b() -> None:
@@ -507,7 +447,7 @@ def test_single_panel_stage_is_entirely_cold_b() -> None:
         assert gemm_phases
         assert all(phase.kind == "cold_b" for phase in gemm_phases)
         assert sum(phase.compulsory_dram_bytes for phase in gemm_phases) == demand.compulsory_dram_bytes
-        assert sum(phase.panel_count for phase in gemm_phases) == demand.ranges
+        assert sum(phase.panel_count for phase in gemm_phases) == len(demand.mapping.panels)
 
 
 def test_long_stage_splits_cold_and_steady_demand_without_changing_work() -> None:
@@ -522,8 +462,8 @@ def test_long_stage_splits_cold_and_steady_demand_without_changing_work() -> Non
         cold = [phase for phase in phases if phase.kind == "cold_b"]
         steady = [phase for phase in phases if phase.kind == "steady_b"]
 
-        assert len(cold) == demand.ranges
-        assert len(steady) == demand.ranges
+        assert len(cold) == 1
+        assert len(steady) == 1
         assert all(phase.compulsory_dram_bytes > 0 for phase in cold)
         assert all(phase.compulsory_dram_bytes == 0 for phase in steady)
         assert sum(phase.matrix_flops for phase in phases) == demand.mapping.demand.balanced_executed_flops
@@ -545,7 +485,7 @@ def test_phase_lowering_conserves_kernel_demand_across_routes_and_widths(routes:
             if phase.name.startswith(stage) and phase.kind in {"cold_b", "steady_b"}
         ]
 
-        assert sum(phase.panel_count for phase in phases) == len(demand.mapping.panels) * demand.ranges
+        assert sum(phase.panel_count for phase in phases) == len(demand.mapping.panels)
         assert sum(phase.matrix_flops for phase in phases) == demand.mapping.demand.balanced_executed_flops
         assert (
             sum(phase.frontend_instructions for phase in phases) == demand.mapping.demand.balanced_key_body_instructions
@@ -556,145 +496,6 @@ def test_phase_lowering_conserves_kernel_demand_across_routes_and_widths(routes:
         assert sum(phase.llc_bytes for phase in phases) == pytest.approx(demand.llc_bytes)
         assert sum(phase.compulsory_dram_bytes for phase in phases) == pytest.approx(demand.compulsory_dram_bytes)
         assert sum(phase.spillable_dram_bytes for phase in phases) == pytest.approx(demand.spillable_dram_bytes)
-
-
-def test_w13_ranges_keep_gemm_work_but_add_range_overhead() -> None:
-    ranged = _model()
-    contiguous = _model(w13_ranges=1)
-
-    ranged_prediction = ranged.predict_expert(routes=24, threads=2)
-    contiguous_prediction = contiguous.predict_expert(routes=24, threads=2)
-
-    assert ranged_prediction.w13_demand.ranges == 2
-    assert contiguous_prediction.w13_demand.ranges == 1
-    assert ranged_prediction.w13_demand.mapping.executed_flops == contiguous_prediction.w13_demand.mapping.executed_flops
-    assert ranged_prediction.w13_ns > contiguous_prediction.w13_ns
-
-
-def test_stage_window_policy_changes_analytic_execution_without_expanding_search() -> None:
-    model = _model()
-    policy = StaticStageWindowPolicy(
-        name="synthetic-stage-windows",
-        bands=(
-            StageWindowBand.from_thread_windows(
-                min_routes=24,
-                max_routes=24,
-                thread_windows=((2, 2048, 1024),),
-            ),
-        ),
-    )
-    baseline = IntervalPlanner(model, num_cores=8, native_cold_planner=False)
-    planner = IntervalPlanner(
-        model,
-        num_cores=8,
-        native_cold_planner=False,
-        task_stage_window_policy=policy,
-    )
-
-    prediction = planner.model.predict_expert(routes=24, threads=2)
-
-    assert planner.shapes == baseline.shapes
-    assert prediction.w13_demand.ranges == 4
-    assert prediction.w2_demand.ranges == 4
-    assert prediction.w13_demand.window_bytes == 2048
-    assert prediction.w2_demand.window_bytes == 1024
-    assert planner.model.T_iso(24, 2) != model.T_iso(24, 2)
-    assert planner.model.task_max_stage_bytes(24, 2) == 2048
-    assert planner.model.task_max_stage_bytes(12, 2) == model.max_stage_bytes
-
-
-def test_analytic_model_generates_deterministic_stage_windows_without_new_shapes() -> None:
-    calibration = replace(
-        _calibration(),
-        caches=replace(
-            _calibration().caches,
-            l2_bytes_per_core=2 * 1024 * 1024,
-            llc_bytes_per_rank=16 * 1024 * 1024,
-            l2_b_reuse_effective_fraction=0.125,
-            l2_b_reuse_miss_floor=0.18,
-            l2_b_reuse_miss_at_capacity=0.623,
-            l2_b_reuse_miss_ceiling=0.869,
-        ),
-    )
-    model = AnalyticMoeCostModel(
-        calibration,
-        hidden_size=4096,
-        intermediate_size=512,
-        global_experts=256,
-        local_experts=256,
-    )
-    baseline = IntervalPlanner(model, num_cores=8, native_cold_planner=False)
-    policy = model.default_task_stage_window_policy(num_cores=8, cpu_ids=range(8))
-    assert isinstance(policy, AnalyticStageWindowPolicy)
-
-    short = policy.decision(12, 4)
-    generated = policy.decision(120, 4)
-    planner = IntervalPlanner(
-        model,
-        num_cores=8,
-        native_cold_planner=False,
-        task_stage_window_policy=policy,
-    )
-
-    assert policy.select(12, 4) == (
-        model.hidden_size * 2 * model.intermediate_size * 2,
-        model.intermediate_size * model.hidden_size * 2,
-    )
-    assert generated.w13_target_bytes > 0
-    assert generated.w2_target_bytes > 0
-    assert generated.w13_worker_bytes >= calibration.caches.l1d_bytes_per_core
-    assert generated.w2_worker_bytes >= calibration.caches.l1d_bytes_per_core
-    assert generated.w13_ranges >= 1
-    assert generated.w2_ranges >= 1
-    for stage, target in (("w13", generated.w13_target_bytes), ("w2", generated.w2_target_bytes)):
-        score = model.score_stage_window(stage, routes=120, threads=4, target_bytes=target)
-        tile_bytes = model.w13_tile_bytes if stage == "w13" else model.w2_tile_bytes
-        owner_tiles = score.worker_bytes // tile_bytes
-        assert score.active_threads == 4
-        assert owner_tiles & (owner_tiles - 1) == 0
-    assert planner.shapes == baseline.shapes
-    assert policy.decision(120, 4) is generated
-    assert short.w13_ranges == 1
-    assert short.w2_ranges == 1
-
-
-def test_analytic_w13_candidates_include_one_and_two_range_endpoints() -> None:
-    model = AnalyticMoeCostModel(
-        _calibration(),
-        hidden_size=4096,
-        intermediate_size=512,
-        global_experts=8,
-        local_experts=8,
-    )
-    policy = AnalyticStageWindowPolicy(model)
-
-    explanation = policy.explain(routes=120, threads=4)
-    ranges = {row["ranges"] for row in explanation["candidates"]["w13"]["rows"]}
-
-    assert {1, 2} <= ranges
-
-
-def test_analytic_w13_endpoints_stop_at_the_available_tile_count() -> None:
-    model = AnalyticMoeCostModel(
-        _calibration(),
-        hidden_size=16,
-        intermediate_size=8,
-        global_experts=8,
-        local_experts=8,
-        backend_n_tile=16,
-    )
-
-    explanation = AnalyticStageWindowPolicy(model).explain(routes=120, threads=4)
-
-    assert {row["ranges"] for row in explanation["candidates"]["w13"]["rows"]} == {1}
-
-
-def test_planned_moe_prefers_model_generated_stage_window_policy() -> None:
-    model = _model()
-    runtime = PlannedMoE(model, num_cores=8, cpu_ids=range(8))
-
-    assert isinstance(runtime.task_stage_window_policies[0], AnalyticStageWindowPolicy)
-    assert runtime.interval_planners[0].model.task_stage_window_policy is runtime.task_stage_window_policies[0]
 
 
 def test_shared_resource_capacity_derates_parallel_experts() -> None:
@@ -720,7 +521,7 @@ def test_shared_resource_capacity_derates_parallel_experts() -> None:
 def test_resource_pressure_uses_requesting_threads_and_named_capacity() -> None:
     model = _model()
     prediction = model.predict_expert(routes=24, threads=2)
-    setup = next(phase for phase in prediction.phases if phase.kind == "range_setup")
+    setup = next(phase for phase in prediction.phases if phase.kind == "stage_setup")
     cold = next(phase for phase in prediction.phases if phase.kind == "cold_b")
 
     pressures = model.active_resource_pressure((setup, cold))
@@ -849,8 +650,7 @@ def test_holdout_validator_reports_absolute_error_and_shape_regret() -> None:
         "kernel": {
             "backend_n_tile": 8,
             "m_tail_policy": "xbyak_exact_m",
-            "w13_window_ranges": 2,
-            "w2_window_ranges": 1,
+            "stage_geometry": "full_n_team_stripes",
         },
         "parallelism": {
             "mode": "standalone",
@@ -895,11 +695,11 @@ def test_holdout_validator_rejects_wrong_core_topology() -> None:
         build_validation_report(_calibration(), profile)
 
 
-def test_runtime_uses_one_calibration_and_emits_only_per_task_ranges() -> None:
+def test_runtime_uses_one_calibration_and_emits_no_stage_split_controls() -> None:
     calibration = _calibration()
     model = _model(calibration)
     with pytest.raises(ValueError, match="one calibration model"):
-        PlannedMoE((model, _model(calibration, w13_ranges=1)), num_cores=8)
+        PlannedMoE((model, _model(calibration)), num_cores=8)
 
     runtime = PlannedMoE(model, num_cores=8)
     experts = [(expert, 24) for expert in range(8)]
@@ -910,5 +710,6 @@ def test_runtime_uses_one_calibration_and_emits_only_per_task_ranges() -> None:
     assert "operator_options" not in first
     assert "w13_window_ranges" not in first["policy"]
     assert "w2_window_ranges" not in first["policy"]
-    assert first["bridge"]["task_w13_ranges"] == cached["bridge"]["task_w13_ranges"]
-    assert first["bridge"]["task_w2_ranges"] == cached["bridge"]["task_w2_ranges"]
+    assert "task_w13_ranges" not in first["bridge"]
+    assert "task_w2_ranges" not in first["bridge"]
+    assert first["bridge"] == cached["bridge"]

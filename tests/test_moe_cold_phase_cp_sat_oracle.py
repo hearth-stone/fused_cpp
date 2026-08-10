@@ -30,7 +30,7 @@ PROFILE = (
     / "cpu_moe_schedule_optimization"
     / "cost_model"
     / "profiles"
-    / "contention_async_amazon_ecs_8c_standalone_sve_F512_E8_splitw13_xbyak_exactm_v2_20260727.json"
+    / "contention_async_amazon_ecs_8c_standalone_sve_F512_E8_fulln_xbyak_exactm_v2_20260727.json"
 )
 
 
@@ -42,7 +42,7 @@ class _FakePhaseModel:
     def task_stage_phases(self, stage: str, routes: int, threads: int):
         del routes, threads
         if stage == "w13":
-            return ((2.0, 4), (2.0, 4))
+            return ((4.0, 8),)
         if stage == "w2":
             return ((2.0, 4),)
         raise ValueError(stage)
@@ -91,7 +91,7 @@ def test_build_cold_phase_jobs_preserves_isolated_time_and_weight_bytes() -> Non
         [1],
         _FakePhaseModel(),
         num_cores=4,
-        phase_granularity="range",
+        phase_granularity="stage",
     )
 
     mode = jobs[0].modes[0]
@@ -99,12 +99,10 @@ def test_build_cold_phase_jobs_preserves_isolated_time_and_weight_bytes() -> Non
     assert sum(phase.duration_ns for phase in mode.phases if phase.is_cold) == pytest.approx(30.0)
     assert sum(phase.cold_weight_bytes for phase in mode.phases) == 12
     assert [phase.name for phase in mode.phases] == [
-        "w13:0:cold",
-        "w13:0:steady",
-        "w13:1:cold",
-        "w13:1:steady",
-        "w2:0:cold",
-        "w2:0:steady",
+        "w13:cold",
+        "w13:steady",
+        "w2:cold",
+        "w2:steady",
     ]
 
     aggregate = build_cold_phase_jobs(

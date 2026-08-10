@@ -51,14 +51,14 @@ Normal package installation and production MoE execution do not require it.
 
 ## Run
 
-The following example uses the current 8-core exact-M `R13=2,R2=1` profile:
+The following example uses the current 8-core exact-M full-N profile:
 
 ```bash
 .venv/bin/python \
   cpu_moe_schedule_optimization/planners/isolated_cp_sat_oracle.py \
   cpu_moe_schedule_optimization/cost_model/profiles/\
-contention_async_amazon_ecs_8c_standalone_sve_F512_E8_splitw13_\
-xbyak_exactm_v2_20260720.json \
+contention_async_amazon_ecs_8c_standalone_sve_F512_E8_fulln_\
+xbyak_exactm_v2_20260727.json \
   --routes 2040,2040,768,768,192,48,12,4 \
   --num-cores 8 \
   --workers 8 \
@@ -142,7 +142,8 @@ high-active-set wall time remains far above the no-contention bound.
 - The oracle only covers whole-expert, fixed-width, non-preemptive jobs.
 - CPU cores are fungible capacity; production contiguous interval placement
   and NUMA affinity are relaxed.
-- W13/W2 stage windows affect the result only through the supplied `T_iso`.
+- Width-derived W13/W2 owner stripes affect the result only through the
+  supplied full-stage `T_iso`.
 - The model permits aggregate compute or bandwidth demand beyond hardware
   saturation because contention is deliberately absent.
 - A low isolated bound efficiency does not by itself prove that the planner is

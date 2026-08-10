@@ -45,7 +45,7 @@ DEFAULT_PROFILE = (
     / "cpu_moe_schedule_optimization"
     / "cost_model"
     / "profiles"
-    / "contention_async_amazon_c5_192c_numa0_tp4_sve_F512_E256_splitw13_schema_v2_xbyak_exactm_20260727.json"
+    / "contention_async_amazon_c5_192c_numa0_tp4_sve_F512_E256_fulln_schema_v2_xbyak_exactm_20260727.json"
 )
 DEFAULT_OUTPUT = (
     REPO_ROOT
@@ -63,6 +63,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--profile", type=Path, default=DEFAULT_PROFILE)
     parser.add_argument("--preset", choices=sorted(workloads), default="moe256-active-set-8")
     parser.add_argument("--threads", type=int, default=96)
+    parser.add_argument(
+        "--force-shape",
+        help="force a comma-separated strict lane shape, for example 16,16,16,16,16,16",
+    )
+    parser.add_argument(
+        "--force-tail-pool-threads",
+        type=int,
+        help="move experts at or below --tail-pool-max-routes into a forced dynamic pool",
+    )
+    parser.add_argument("--tail-pool-max-routes", type=int, default=12)
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--runs", type=int, default=5)
     parser.add_argument("--seed", type=int, default=20260729)
@@ -120,6 +130,82 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def parse_shape(value: str | None) -> tuple[int, ...] | None:
+    if value is None:
+        return None
+    shape = tuple(int(item) for item in value.split(",") if item.strip())
+    if not shape or any(width <= 0 for width in shape):
+        raise ValueError(f"invalid forced shape: {value!r}")
+    return shape
+
+
+def build_plan_spec(
+    args: argparse.Namespace,
+    model: ContentionCostModel,
+    workload: Any,
+    cpu_ids: list[int],
+) -> tuple[dict[str, Any], PlannedMoE]:
+    planner = PlannedMoE(
+        model,
+        args.threads,
+        cpu_ids=cpu_ids,
+    )
+    shape = parse_shape(args.force_shape)
+    if shape is None:
+        return (
+            planner.plan_spec_for(
+                workload.experts,
+                tail_pool_threads=args.force_tail_pool_threads,
+                tail_pool_max_routes=args.tail_pool_max_routes,
+            ),
+            planner,
+        )
+    if sum(shape) != args.threads:
+        raise ValueError(f"forced shape uses {sum(shape)} threads, expected {args.threads}")
+
+    interval_planner = planner.interval_planners[0]
+    makespan_ns, tasks = interval_planner.score_shape(workload.experts, shape)
+    if args.force_tail_pool_threads is None:
+        bridge = interval_planner.to_async_bridge(tasks)
+    else:
+        if args.force_tail_pool_threads <= 0:
+            raise ValueError("--force-tail-pool-threads must be positive")
+        if args.tail_pool_max_routes <= 0:
+            raise ValueError("--tail-pool-max-routes must be positive")
+        bridge = interval_planner.to_tail_pool_bridge(
+            tasks,
+            pool_threads=args.force_tail_pool_threads,
+            max_pooled_routes=args.tail_pool_max_routes,
+        )
+    if model.policy is None:
+        raise ValueError("forced shape requires a policy-bound profile")
+    return (
+        {
+            "plan_version": bridge["plan_version"],
+            "execution_mode": bridge["execution_mode"],
+            "bridge": bridge,
+            "shape": shape,
+            "tail_pool_threads": args.force_tail_pool_threads,
+            "tail_pool_max_routes": (
+                args.tail_pool_max_routes if args.force_tail_pool_threads is not None else None
+            ),
+            "tail_pool_tasks": (
+                sum(routes <= args.tail_pool_max_routes for _, routes in workload.experts)
+                if args.force_tail_pool_threads is not None
+                else 0
+            ),
+            "tail_repartition_width": None,
+            "tail_repartition_tasks": 0,
+            "tail_repartition_route_slices": 1,
+            "policy": {
+                "profile": str(model.profile_path),
+            },
+            "makespan_ns": makespan_ns,
+        },
+        planner,
+    )
+
+
 def override_early_merge(plan: AsyncMoEPlanV2, policy: str) -> AsyncMoEPlanV2:
     if policy == "auto":
         return plan
@@ -157,7 +243,11 @@ def task_dependencies(bridge: dict[str, Any], task: int) -> list[int]:
     return [int(value) for value in dependencies[offsets[task] : offsets[task + 1]]]
 
 
-def materialized_plan_tasks(plan: AsyncMoEPlanV2, histogram: list[int] | tuple[int, ...]) -> list[dict[str, Any]]:
+def materialized_plan_tasks(
+    plan: AsyncMoEPlanV2,
+    histogram: list[int] | tuple[int, ...],
+    model: ContentionCostModel,
+) -> list[dict[str, Any]]:
     offsets = plan.task_dep_offsets.tolist()
     dependencies = plan.task_deps.tolist()
     experts = plan.task_expert_ids.tolist()
@@ -165,8 +255,6 @@ def materialized_plan_tasks(plan: AsyncMoEPlanV2, histogram: list[int] | tuple[i
     threads = plan.task_threads.tolist()
     placement_modes = plan.task_placement_modes.tolist()
     range_granularities = plan.task_range_granularities.tolist()
-    w13_ranges = plan.task_w13_ranges.tolist()
-    w2_ranges = plan.task_w2_ranges.tolist()
     covered_rows = [0] * len(histogram)
     tasks: list[dict[str, Any]] = []
     for task, expert in enumerate(experts):
@@ -197,8 +285,8 @@ def materialized_plan_tasks(plan: AsyncMoEPlanV2, histogram: list[int] | tuple[i
                 "dependencies": [
                     int(value) for value in dependencies[offsets[task] : offsets[task + 1]]
                 ],
-                "w13_ranges": int(w13_ranges[task]),
-                "w2_ranges": int(w2_ranges[task]),
+                "w13_worker_window_bytes": model.stage_bytes_per_worker("w13", int(threads[task]), routes),
+                "w2_worker_window_bytes": model.stage_bytes_per_worker("w2", int(threads[task]), routes),
             }
         )
     for expert, total_routes in enumerate(histogram):
@@ -211,7 +299,6 @@ def materialized_plan_tasks(plan: AsyncMoEPlanV2, histogram: list[int] | tuple[i
 
 def phase_descriptions(model: ContentionCostModel, routes: int, threads: int) -> list[dict[str, Any]]:
     raw_phases = model._task_phases(routes, threads)
-    w13_ranges, _, w2_ranges, _ = model._task_stage_geometry(routes, threads)
     descriptions: list[dict[str, Any]] = []
     raw_index = 0
     if raw_phases and raw_phases[0][1] == 0:
@@ -221,29 +308,16 @@ def phase_descriptions(model: ContentionCostModel, routes: int, threads: int) ->
                 "duration_ns": float(duration),
                 "workset_bytes": int(workset),
                 "stage": "task_overhead",
-                "range": 0,
             }
         )
         raw_index = 1
-    for range_index in range(max(int(w13_ranges), 1)):
+    for stage in ("w13", "w2"):
         duration, workset = raw_phases[raw_index]
         descriptions.append(
             {
                 "duration_ns": float(duration),
                 "workset_bytes": int(workset),
-                "stage": "w13",
-                "range": range_index,
-            }
-        )
-        raw_index += 1
-    for range_index in range(max(int(w2_ranges), 1)):
-        duration, workset = raw_phases[raw_index]
-        descriptions.append(
-            {
-                "duration_ns": float(duration),
-                "workset_bytes": int(workset),
-                "stage": "w2",
-                "range": range_index,
+                "stage": stage,
             }
         )
         raw_index += 1
@@ -257,7 +331,6 @@ def append_segment(segments: list[dict[str, Any]], segment: dict[str, Any]) -> N
         segments
         and segments[-1]["task"] == segment["task"]
         and segments[-1]["stage"] == segment["stage"]
-        and segments[-1]["range"] == segment["range"]
         and abs(segments[-1]["end_ms"] - segment["start_ms"]) < 1.0e-9
         and abs(segments[-1]["slowdown"] - segment["slowdown"]) < 1.0e-9
     ):
@@ -304,7 +377,6 @@ def predict_timeline(
                 {
                     "task": index,
                     "stage": phase["stage"],
-                    "range": int(phase["range"]),
                     "start_ms": wall / 1.0e6,
                     "end_ms": next_wall / 1.0e6,
                     "workset_bytes": int(phase["workset_bytes"]),
@@ -400,12 +472,11 @@ def build_plan(args: argparse.Namespace) -> tuple[dict[str, Any], ContentionCost
         raise ValueError(f"affinity exposes {len(cpu_ids)} CPUs, expected {args.threads}")
 
     model = ContentionCostModel(args.profile)
-    planner = PlannedMoE(model, args.threads, cpu_ids=cpu_ids)
-    spec = planner.plan_spec_for(workload.experts)
+    spec, planner = build_plan_spec(args, model, workload, cpu_ids)
     bridge = spec["bridge"]
     plan = override_early_merge(AsyncMoEPlanV2.from_dict(bridge), args.early_merge)
     bound_model = planner.interval_planners[0].model
-    tasks = materialized_plan_tasks(plan, workload.histogram)
+    tasks = materialized_plan_tasks(plan, workload.histogram, bound_model)
     predicted_cores: dict[str, list[dict[str, Any]]] = {str(core): [] for core in range(args.threads)}
     if spec["execution_mode"] == "strict":
         model_tasks = [
@@ -496,15 +567,11 @@ def build_plan(args: argparse.Namespace) -> tuple[dict[str, Any], ContentionCost
         "plan": {
             "execution_mode": spec["execution_mode"],
             "shape": list(spec["shape"]),
-            "task_stage_window_policy": spec["task_stage_window_policy"],
-            "task_range_pairs": sorted(
+            "stage_geometry": "full_n_team_stripes",
+            "task_worker_window_pairs_bytes": sorted(
                 {
-                    f"{int(w13)}:{int(w2)}"
-                    for w13, w2 in zip(
-                        plan.task_w13_ranges.tolist(),
-                        plan.task_w2_ranges.tolist(),
-                        strict=True,
-                    )
+                    f"{task['w13_worker_window_bytes']}:{task['w2_worker_window_bytes']}"
+                    for task in tasks
                 }
             ),
             "tail_repartition_width": spec["tail_repartition_width"],
@@ -546,11 +613,14 @@ def capture_actual(
     payload: dict[str, Any],
     workload: Any,
 ) -> dict[str, Any]:
-    plan_payload = PlannedMoE(
-        ContentionCostModel(args.profile),
-        args.threads,
-        cpu_ids=payload["case"]["cpu_ids"],
-    ).plan_spec_for(workload.experts)["bridge"]
+    model = ContentionCostModel(args.profile)
+    plan_payload, _ = build_plan_spec(
+        args,
+        model,
+        workload,
+        payload["case"]["cpu_ids"],
+    )
+    plan_payload = plan_payload["bridge"]
     plan = AsyncMoEPlanV2.from_dict(plan_payload)
     transitions = parse_int_mapping(
         args.elastic_w2_transitions,
@@ -570,7 +640,6 @@ def capture_actual(
             profile=args.profile,
             transitions=transitions,
             timeout_ns=round(args.elastic_timeout_us * 1.0e3),
-            static_stage_windows=False,
             resizable_task_ids=task_ids,
             task_preferred_core_begins=target_core_begins or None,
         )
@@ -597,9 +666,8 @@ def capture_actual(
             torch.tensor(workload.histogram, dtype=torch.int64),
             profile=args.profile,
             tail_width=args.static_tail_width,
-            static_stage_windows=payload["plan"]["task_stage_window_policy"] is not None,
         )
-        payload["plan"]["tasks"] = materialized_plan_tasks(plan, workload.histogram)
+        payload["plan"]["tasks"] = materialized_plan_tasks(plan, workload.histogram, model)
         payload["plan"]["static_tail_width"] = args.static_tail_width
         payload["plan"]["shape"] = [16, 16, 16, 16, 16, 16, args.static_tail_width, args.static_tail_width]
     plan = override_early_merge(plan, args.early_merge)

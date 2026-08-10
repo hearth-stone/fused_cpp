@@ -12,20 +12,25 @@
 
 Schema v2 路径按完整校准域选择表：`TP/EP degree + H/F + global/local
 experts + SVE implementation/tail policy + SVE tile + NUMA/CPU set + LLC +
-source/binary hash`。profile 记录的 `(R13,R2)` 只描述采样几何，不参与域
-identity；同一域只允许一张活动表，也不跨 F 或拓扑做隐式 nearest-profile
-fallback。
+source/binary hash`。每个活动 profile 必须使用
+`stage_geometry=full_n_team_stripes`；同一域只允许一张活动表，也不跨 F 或拓扑做
+隐式 nearest-profile fallback。
 
 `tp_vs_ep_model.py --sve-implementation auto` 优先使用唯一匹配的
 `jit/xbyak_exact_m` calibration；没有可用 JIT profile 时才整体回退到
 `asm/static_bucketed`。它不会拼接 JIT/asm 或多个 range profile。需要可复现
 实验时可显式指定 `jit` 或 `asm`，此时缺表直接报错。
 
-runtime 只接受正整数 `w13_ranges/w2_ranges`。解析 stage-window policy 可以
-把 cache byte budget 量化为每任务 exact range，但 byte target 不进入公开 ABI、
-Plan 或 profile identity。planner 只搜索 `core_shape`，在 task team width 确定后
-由 `g(routes, threads)` 生成 Plan V2 的逐 task range；不存在全局
-`(1,1)/(2,1)` 搜索。
+runtime 对 W13、W2 都只执行一次完整 N stage。planner 只搜索 `core_shape`；task
+的实际 team width 直接决定 N-tile ownership 和每线程 packed-B stripe，不再存在
+stage split、range/window policy、Plan 字段或公开 ABI 控制。对 stage
+$s=(K_s,N_s)$、N tile $\nu$、team width $t$：
+
+```text
+q_s                 = N_s / nu
+tiles_per_worker    = ceil(q_s / t)
+owner_stripe_bytes  = tiles_per_worker * K_s * nu * 2
+```
 
 当前实现入口：
 
@@ -33,17 +38,18 @@ Plan 或 profile identity。planner 只搜索 `core_shape`，在 task team width
   同步采样；isolated 使用 8 个连续冷权重，contention 使用全部本地专家，
   mixed-width shape 使用与 planner 相同的 LPT assignment。
 - `cost_model/profile_catalog.py`：严格 calibration-domain identity、单活动
-  profile 与 measurement-geometry 校验。
-- `cost_model/phase_model.py`：M12 bulk/tail、精确 full-call anchor，以及按
-  W13/W2 exact range 瞬时 packed working set 驱动的 stage-aware fallback。
-- `planners/interval_planner.py` / `planned_moe.py`：搜索 `core_shape`，随后
-  生成逐 task range 和显式 CPU 集，并按完整 routing bucket histogram、
-  calibration identity 与 task-stage policy 缓存。
+  profile 与 full-N measurement-geometry 校验；旧 split profile 明确拒绝。
+- `cost_model/phase_model.py`：M12 bulk/tail、精确 full-call anchor，以及完整
+  W13/W2 stage working set 驱动的 stage-aware fallback。
+- `planners/interval_planner.py` / `planned_moe.py`：只搜索 `core_shape` 和既有
+  tail 策略，生成显式 CPU 集，并按完整 routing bucket histogram 与 calibration
+  identity 缓存；每线程窗口由 task width 解析得到。
 - `planners/tp_vs_ep_model.py`：当前按 rank-local histogram 独立预测并取全局
   最大 compute，再加上通用分层 all-reduce/all-to-all 模型；尚未建模短 rank
   完成后长 rank 的争用释放。
-- `planners/validate_policy_planner.py`：双 rank 枚举实测 shape，并记录每任务
-  range 分布、预测误差和真实 regret；可用 `--routes-json` 输入真实路由直方图。
+- `planners/validate_policy_planner.py`：双 rank 枚举实测 shape，并记录 team
+  width、派生 owner stripe、预测误差和真实 regret；可用 `--routes-json` 输入真实
+  路由直方图。
 - `POLICY_MODEL_VALIDATION.md`：AWS 64-core TP2/EP2 的 2026-07-13 校准配置、
   synthetic/真实路由 regret、EP2 hotspot 诊断和通信模型估计。
 
@@ -130,14 +136,9 @@ T_plan(plan) + T_execute(plan)
   实现弱相关三层 GEMM shadow；分离算法 work、SVE mapper 和实测机器响应，
   并记录 V3 长 route 留出验证及当前可迁移性限制。
 - [`cost_model/ANALYTIC_MODEL.md`](./cost_model/ANALYTIC_MODEL.md)：
-  planner-compatible 解析 backend；由 exact kernel demand、cache capacity、
-  route-independent machine service curves 和共享资源 event simulator 预测
-  isolated/contention 时间，直接生成确定性的 W13/W2 stage-window policy，
-  并定义薄校准 schema 与 holdout 验收门槛。
-- [`../optimizations/fused_moe_sve/results/analytic_stage_window_policy_v2_holdout_20260809.md`](../optimizations/fused_moe_sve/results/analytic_stage_window_policy_v2_holdout_20260809.md)：
-  解析 stage-window policy 的 A 驻留/B turnover 修正版在 192C NUMA0 与 8C V1
-  上的交错采样 holdout；192C maximum regret 从 11.32% 降到 3.38%，8C 同时记录
-  raw 与 p10 单边噪声口径。
+  planner-compatible 解析 backend；由 exact full-stage kernel demand、cache
+  capacity、route-independent machine service curves 和共享资源 event simulator
+  预测 isolated/contention 时间，并定义薄校准 schema 与 holdout 验收门槛。
 - [`../optimizations/fused_moe_sve/results/amazon_192c_analytic_thin_calibration_20260801.md`](../optimizations/fused_moe_sve/results/amazon_192c_analytic_thin_calibration_20260801.md)：
   192-core 主机 NUMA0 的独立 service/retention 薄校准与 holdout；排序显著改善，
   但 contention P90 和最大 regret 未过门槛，因此 production 仍使用经验模型。
@@ -157,15 +158,14 @@ T_plan(plan) + T_execute(plan)
   当前 SVE BF16 exact-M1--M12/static bucket 的实现 mapper；负责 tile、padding、N-split、
   指令和 cache 流量，不进入通用算法公式。
 - [`cost_model/analytic_model.py`](./cost_model/analytic_model.py) /
-  [`cost_model/analytic_stage_window_policy.py`](./cost_model/analytic_stage_window_policy.py) /
   [`cost_model/validate_analytic_model.py`](./cost_model/validate_analytic_model.py)：
   phase-aware hierarchical service cost model、机器校准加载和 empirical holdout 验证；按
   setup/cold-B/steady-B 事件计算 shared-resource offered load，并提供逐事件
   pressure 解释；完成跨机器门槛前保持 opt-in。
 - [`cost_model/gemm_ecm.py`](./cost_model/gemm_ecm.py)：旧 API 兼容 facade 和
   stage-trace report CLI；三层 GEMM model 当前不进入 planner active cost。
-- [`cost_model/working_set_model.py`](./cost_model/working_set_model.py)：针对
-  exact W13/W2 range 的 owner-private cache 工作集 band；由独立 weight-scan 与
+- [`cost_model/working_set_model.py`](./cost_model/working_set_model.py)：针对完整
+  W13/W2 stage 的 owner-private cache 工作集 band；由独立 weight-scan 与
   `T_iso` 计算稳健候选，当前只做 shadow validation。
 - [`planners/interval_planner.py`](./planners/interval_planner.py)：`IntervalPlanner` —— async interval-DAG 静态 planner（cost-model 驱动）。
 - [`planners/ISOLATED_CP_SAT_ORACLE.md`](./planners/ISOLATED_CP_SAT_ORACLE.md)：

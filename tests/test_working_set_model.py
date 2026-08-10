@@ -17,13 +17,13 @@ from working_set_model import (  # noqa: E402
     ScanObservation,
     fit_owner_cache_model,
     isolated_baseline_ns,
-    max_stage_range_bytes,
+    max_full_stage_bytes,
     recommend_working_sets,
 )
 
 
-def test_stage_range_size_and_v3_owner_cache_band() -> None:
-    stage_bytes = max_stage_range_bytes(4096, 2048, 8, 2, 1)
+def test_full_stage_size_and_v3_owner_cache_band() -> None:
+    stage_bytes = max_full_stage_bytes(4096, 2048)
     model = OwnerCacheModel(
         cores=96,
         private_cache_bytes_per_core=2 * 2**20,
@@ -33,10 +33,10 @@ def test_stage_range_size_and_v3_owner_cache_band() -> None:
         stream_saturation=0.85,
         target_bandwidth_utilization=0.95,
     )
-    assert stage_bytes == 16 * 2**20
+    assert stage_bytes == 32 * 2**20
     assert model.owner_cache_budget_bytes == 144 * 2**20
     assert model.minimum_streams() == 3
-    assert model.maximum_streams(stage_bytes) == 8
+    assert model.maximum_streams(stage_bytes) == 4
 
 
 def test_owner_cache_fit_recovers_resident_stream_saturation() -> None:
@@ -124,9 +124,9 @@ def test_iso_headroom_selects_smallest_robust_working_set() -> None:
     ]
     summary = recommend_working_sets(
         candidates,
-        stage_bytes=16 * 2**20,
+        stage_bytes=32 * 2**20,
         model=model,
         iso_headroom=0.05,
     )[0]
-    assert summary["recommended_active_experts"] == 4
-    assert summary["measured_regret"] == 0.0
+    assert summary["recommended_active_experts"] == 3
+    assert summary["measured_regret"] == pytest.approx(0.03)

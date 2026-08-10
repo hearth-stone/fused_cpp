@@ -13,42 +13,6 @@ class ProfileCompatibilityError(ValueError):
 
 
 @dataclass(frozen=True)
-class ProfileMeasurementGeometry:
-    """Exact stage geometry used while collecting one calibration profile.
-
-    This is measurement provenance, not a planner policy. Runtime stage ranges
-    are resolved per task after the planner has selected a team width.
-    """
-
-    w13_ranges: int
-    w2_ranges: int
-
-    @classmethod
-    def from_payload(cls, payload: dict) -> "ProfileMeasurementGeometry":
-        kernel = payload["kernel"]
-        expert = payload["expert_shape"]
-        try:
-            w13_ranges = int(kernel["w13_window_ranges"])
-            w2_ranges = int(kernel["w2_window_ranges"])
-        except KeyError as error:
-            raise ProfileCompatibilityError(
-                "schema-v2 profile requires measured W13/W2 stage ranges"
-            ) from error
-        n_tile = int(kernel["backend_n_tile"])
-        max_w13_ranges = (2 * int(expert["intermediate_size"])) // n_tile
-        max_w2_ranges = int(expert["hidden_size"]) // n_tile
-        if not (1 <= w13_ranges <= max_w13_ranges):
-            raise ProfileCompatibilityError(
-                f"kernel.w13_window_ranges must be in [1, {max_w13_ranges}]"
-            )
-        if not (1 <= w2_ranges <= max_w2_ranges):
-            raise ProfileCompatibilityError(
-                f"kernel.w2_window_ranges must be in [1, {max_w2_ranges}]"
-            )
-        return cls(w13_ranges=w13_ranges, w2_ranges=w2_ranges)
-
-
-@dataclass(frozen=True)
 class ProfilePolicy:
     mode: str
     degree: int
@@ -96,6 +60,20 @@ class ProfilePolicy:
         extension_sha = kernel.get("extension_sha256")
         if not source_sha or not extension_sha:
             raise ProfileCompatibilityError("schema-v2 profile requires source and extension hashes")
+        legacy_ranges = (
+            int(kernel.get("w13_window_ranges", 1)),
+            int(kernel.get("w2_window_ranges", 1)),
+        )
+        if legacy_ranges != (1, 1):
+            raise ProfileCompatibilityError(
+                "split-stage calibration is incompatible with the full-N runtime: "
+                f"measured W13/W2 ranges={legacy_ranges}"
+            )
+        stage_geometry = str(kernel.get("stage_geometry", ""))
+        if stage_geometry != "full_n_team_stripes":
+            raise ProfileCompatibilityError(
+                "schema-v2 profile requires kernel.stage_geometry='full_n_team_stripes'"
+            )
         return cls(
             mode=str(parallelism["mode"]),
             degree=int(parallelism["degree"]),
@@ -184,7 +162,6 @@ class ProfileRecord:
     path: Path
     payload: dict
     policy: ProfilePolicy
-    measurement_geometry: ProfileMeasurementGeometry
 
 
 class ProfileCatalog:
@@ -199,8 +176,7 @@ class ProfileCatalog:
             if previous is not None:
                 raise ProfileCompatibilityError(
                     "duplicate calibration domain: "
-                    f"{previous.name}, {record.path.name}; stage measurement geometry "
-                    "is provenance and cannot create planner variants"
+                    f"{previous.name}, {record.path.name}"
                 )
             paths_by_identity[identity] = record.path
 
@@ -215,13 +191,12 @@ class ProfileCatalog:
                     path,
                     payload,
                     ProfilePolicy.from_payload(payload),
-                    ProfileMeasurementGeometry.from_payload(payload),
                 )
             )
         return cls(records)
 
     @classmethod
-    def from_directory(cls, directory: str | Path, pattern: str = "*_v2_*.json") -> "ProfileCatalog":
+    def from_directory(cls, directory: str | Path, pattern: str = "*fulln*.json") -> "ProfileCatalog":
         return cls.from_paths(sorted(Path(directory).glob(pattern)))
 
     def select(self, query: ProfileQuery) -> ProfileRecord:

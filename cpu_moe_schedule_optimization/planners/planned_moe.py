@@ -6,10 +6,6 @@ import time
 from typing import Dict, List, Sequence, Tuple
 
 from interval_planner import IntervalPlanner, PlannerCostModel  # noqa: E402
-from stage_window_policy import (  # noqa: E402
-    TaskStageWindowPolicy,
-    default_task_stage_window_policy,
-)
 
 
 _BUCKETS = [1, 2, 4, 8, 12, 24, 48, 96, 192, 384, 768, 1536, 2040, 4096, 8192]
@@ -69,19 +65,6 @@ def _tail_pool_signature(counts: List[Tuple[int, int]], max_routes: int) -> tupl
     )
 
 
-def _default_stage_window_policy(model, *, num_cores: int, cpu_ids: tuple[int, ...]):
-    analytic_selector = getattr(model, "default_task_stage_window_policy", None)
-    if callable(analytic_selector):
-        policy = analytic_selector(num_cores=num_cores, cpu_ids=cpu_ids)
-        if policy is not None:
-            return policy
-    return default_task_stage_window_policy(
-        model.policy,
-        num_cores=num_cores,
-        cpu_ids=cpu_ids,
-    )
-
-
 class PlannedMoE:
     def __init__(
         self,
@@ -89,8 +72,6 @@ class PlannedMoE:
         num_cores: int = 8,
         *,
         cpu_ids: Sequence[int] | None = None,
-        task_stage_window_policy: TaskStageWindowPolicy | None = None,
-        use_default_stage_window_policy: bool = True,
         tail_repartition_widths: Sequence[int] | None = None,
     ):
         if callable(getattr(models, "T_iso", None)) and callable(getattr(models, "dag_makespan", None)):
@@ -99,34 +80,18 @@ class PlannedMoE:
             self.models = tuple(models)
         if len(self.models) != 1:
             raise ValueError(
-                "PlannedMoE requires one calibration model; stage ranges are "
-                "resolved per task and are not a profile search dimension"
+                "PlannedMoE requires one calibration model"
             )
         self.num_cores = int(num_cores)
         self.cpu_ids = tuple(cpu_ids) if cpu_ids is not None else tuple(range(num_cores))
-        self.use_default_stage_window_policy = bool(use_default_stage_window_policy)
-        if task_stage_window_policy is not None:
-            self.task_stage_window_policies = (task_stage_window_policy,) * len(self.models)
-        elif self.use_default_stage_window_policy:
-            self.task_stage_window_policies = tuple(
-                _default_stage_window_policy(
-                    model,
-                    num_cores=self.num_cores,
-                    cpu_ids=self.cpu_ids,
-                )
-                for model in self.models
-            )
-        else:
-            self.task_stage_window_policies = (None,) * len(self.models)
         self.interval_planners = tuple(
             IntervalPlanner(
                 model,
                 num_cores,
                 cpu_ids=self.cpu_ids,
-                task_stage_window_policy=stage_window_policy,
                 tail_repartition_widths=tail_repartition_widths,
             )
-            for model, stage_window_policy in zip(self.models, self.task_stage_window_policies)
+            for model in self.models
         )
         self.policy_identity = tuple(
             (
@@ -136,11 +101,6 @@ class PlannedMoE:
             if model.policy is not None
             else (str(model.profile_path),)
             for model in self.models
-        ) + (
-            (
-                "task_stage_window_policies",
-                tuple(policy.name if policy is not None else None for policy in self.task_stage_window_policies),
-            ),
         )
         self.shape_cache: Dict[
             Tuple[object, ...],
@@ -183,7 +143,6 @@ class PlannedMoE:
             for _, routes, _, threads, _ in tasks[-physical_tail_tasks:]:
                 planner._task_time(routes, threads)
         model = self.models[planner_index]
-        stage_window_policy = self.task_stage_window_policies[planner_index]
         if execution_mode == "tail_pool":
             assert tail_pool_threads is not None
             assert tail_pool_max_routes is not None
@@ -207,9 +166,6 @@ class PlannedMoE:
             "tail_repartition_width": tail_repartition_width,
             "tail_repartition_tasks": tail_repartition_tasks,
             "tail_repartition_route_slices": tail_repartition_route_slices,
-            "task_stage_window_policy": (
-                stage_window_policy.name if stage_window_policy is not None else None
-            ),
             "policy": (
                 {
                     "profile": str(model.profile_path),
@@ -318,7 +274,6 @@ class PlannedMoE:
             "tail_repartition_tasks": result.get("tail_repartition_tasks", 0),
             "tail_repartition_route_slices": result.get("tail_repartition_route_slices", 1),
             "shape": tuple(result["shape"]),
-            "task_stage_window_policy": result.get("task_stage_window_policy"),
             "policy": result.get("policy"),
             "planner_backend": result.get("planner_backend", "cache"),
             "planner_workers": result.get("planner_workers", 1),
@@ -337,7 +292,6 @@ class PlannedMoE:
             "tail_repartition_width": result.get("tail_repartition_width"),
             "tail_repartition_tasks": result.get("tail_repartition_tasks", 0),
             "tail_repartition_route_slices": result.get("tail_repartition_route_slices", 1),
-            "task_stage_window_policy": result.get("task_stage_window_policy"),
             "policy": result.get("policy"),
         }
 

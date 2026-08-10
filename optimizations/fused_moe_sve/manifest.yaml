@@ -290,12 +290,10 @@ features:
 
   - id: measurement.short_route_stage_windows
     part: measurement
-    status: experimental
+    status: retired
     implementation: >-
-      cpu_moe_schedule_optimization/cost_model/profile_heterogeneous_overlap.py
-      and
-      optimizations/fused_moe_sve/benchmarks/bench_short_route_stage_windows.py
-      and cpu_moe_schedule_optimization/planners/stage_window_policy.py
+      Removed from the active tree; retained in Git history and historical
+      result documents only.
     hypothesis: >-
       The kernel loops M panels outside and N tiles inside, so every additional
       M12 panel walks the whole packed-B stage window again. Useful packed-B
@@ -304,21 +302,10 @@ features:
       should degrade by up to ceil(M/12) when that per-thread slice no longer
       stays resident. The calibrated default policy has no route band below 49
       routes, so short-route experts should be recoverable by adding one band.
-    depends_on:
-      - dispatch.serial_weight_windows
-      - dispatch.per_task_stage_windows
+    depends_on: []
     conflicts_with: []
-    correctness: >-
-      PYTHONPATH=src .venv/bin/python -m pytest -q
-      tests/test_moe_cost_model_v2.py -k stage_window
-      && PYTHONPATH=src .venv/bin/python -m pytest -q
-      tests/test_moe_stage_range_api.py -k weight_window
-    benchmark: >-
-      FUSED_CPP_MOE_HUGETLBFS_PATH=/dev/hugepages-32M
-      PYTHONPATH=src numactl --cpunodebind=0 --membind=0 taskset -c 0-95
-      .venv/bin/python
-      optimizations/fused_moe_sve/benchmarks/bench_short_route_stage_windows.py
-      --preset dsv4-real-2048-seq70 --warmup 5 --runs 31
+    correctness: historical
+    benchmark: historical
     result: >-
       On AmazonC5192Cores NUMA0 the effective packed-B re-read factor at M=28
       falls monotonically from 2.97 to 1.22 as the per-thread window shrinks
@@ -577,7 +564,7 @@ features:
       16T-to-32T migrations must never wait indefinitely.
     depends_on:
       - store.w2_direct_route
-      - dispatch.per_task_stage_windows
+      - dispatch.full_n_team_stripes
     conflicts_with:
       - merge.async_ready_tokens
     correctness: >-
@@ -590,7 +577,7 @@ features:
       .venv/bin/python
       optimizations/fused_moe_sve/benchmarks/bench_vllm_staged_schedule.py
       --preset moe256-active-set-8 --production-profile
-      cpu_moe_schedule_optimization/cost_model/profiles/contention_async_amazon_c5_192c_numa0_tp4_sve_F512_E256_splitw13_schema_v2_xbyak_exactm_20260727.json
+      cpu_moe_schedule_optimization/cost_model/profiles/contention_async_amazon_c5_192c_numa0_tp4_sve_F512_E256_fulln_schema_v2_xbyak_exactm_20260727.json
       --elastic-w2-transitions 16:32
       --elastic-task-ids 1,3
       --elastic-w2-core-begins 1:0,3:32
@@ -613,7 +600,7 @@ features:
       release retains the existing clock-free path; nonzero release is
       strict-only and disables tail stealing.
     depends_on:
-      - dispatch.per_task_stage_windows
+      - dispatch.full_n_team_stripes
     conflicts_with:
       - dispatch.w2_boundary_elastic
       - dispatch.dynamic_short_expert_pool
@@ -663,7 +650,6 @@ features:
       - merge.async_ready_tokens
     correctness: >-
       PYTHONPATH=src .venv/bin/python -m pytest -q
-      tests/test_moe_stage_range_api.py
       tests/test_fused_moe_bf16_tiled.py
       -k vllm_staged
     benchmark: >-
@@ -685,13 +671,14 @@ features:
       src/fused_cpp/moe/bf16_tiled.py
     hypothesis: >-
       Planning W13 and W2 as independent whole-expert Plan V2 stages can use
-      different strict/tail-pool shapes and stage windows to reduce each
-      stage's tail and contention. Packing A once per expert and retaining the
+      different strict/tail-pool shapes and therefore different width-derived
+      owner stripes to reduce each stage's tail and contention. Packing A once
+      per expert and retaining the
       production GEMM/store/merge kernels isolates that benefit from the
       repeated A-pack overhead of the global N-range task-pool baseline, while
       the mandatory global barrier measures the lost whole-expert pipelining.
     depends_on:
-      - dispatch.per_task_stage_windows
+      - dispatch.full_n_team_stripes
       - store.w2_direct_route
     conflicts_with:
       - dispatch.global_stage_task_pool
@@ -706,13 +693,13 @@ features:
       .venv/bin/python
       optimizations/fused_moe_sve/benchmarks/bench_vllm_staged_schedule.py
       --preset moe256-long-short-bimodal --production-profile
-      cpu_moe_schedule_optimization/cost_model/profiles/contention_async_amazon_c5_192c_dual_numa_tp4_sve_F512_E256_splitw13_schema_v2_xbyak_exactm_20260726.json
+      cpu_moe_schedule_optimization/cost_model/profiles/contention_async_amazon_c5_192c_dual_numa_tp4_sve_F512_E256_fulln_schema_v2_xbyak_exactm_20260727.json
       --route-dtype bf16 --warmup 3 --runs 11
 
   - id: dispatch.serial_weight_windows
     part: dispatch
-    status: experimental
-    implementation: csrc/moe/arm/common/fused_moe_bf16_tiled.cpp
+    status: retired
+    implementation: Removed from the production runtime; available in Git history.
     hypothesis: >-
       Serializing both packed-B GEMMs into a configurable tile-aligned byte
       window reduces the active reusable weight footprint on machines whose
@@ -721,33 +708,25 @@ features:
       reduced N-tile lane count remain measurable tradeoffs.
     depends_on: []
     conflicts_with: []
-    correctness: >-
-      pytest -q tests/test_moe_stage_range_api.py
-      -k weight_window
-    benchmark: >-
-      numactl --cpunodebind=0 --membind=0 taskset -c 0-95
-      .venv/bin/python
-      optimizations/fused_moe_sve/benchmarks/bench_weight_windows.py
-      --experts 24 --routes 2040 --hidden 4096 --intermediate 512
-      --threads-per-expert 4 --window-mib 0,4,2,1 --warmup 3 --runs 9
+    correctness: historical
+    benchmark: historical
 
-  - id: dispatch.per_task_stage_windows
+  - id: dispatch.full_n_team_stripes
     part: dispatch
     status: enabled
     implementation: >-
-      cpu_moe_schedule_optimization/planners/stage_window_policy.py;
+      cpu_moe_schedule_optimization/cost_model/full_stage_geometry.py;
       cpu_moe_schedule_optimization/cost_model/phase_model.py;
       cpu_moe_schedule_optimization/cost_model/analytic_model.py;
       csrc/moe_planner/interval_planner.cpp;
       src/fused_cpp/moe/plan.py;
       csrc/moe/arm/common/fused_moe_bf16_tiled.cpp
     hypothesis: >-
-      Selecting independent W13/W2 packed-B windows from each task's route
-      count and final team width captures the medium-route cache-residency gain
-      without adding window values to the planner search space. Unsupported
-      combinations inherit the profiled operator-wide policy.
-    depends_on:
-      - dispatch.serial_weight_windows
+      Executing one complete W13 and W2 N domain removes sequential range
+      control and A rescans. The selected team width naturally determines each
+      worker's tile-aligned packed-B owner stripe, so planner width is the only
+      production cache-window control.
+    depends_on: []
     conflicts_with: []
     correctness: >-
       PYTHONPATH=src .venv/bin/python -m pytest -q
@@ -756,13 +735,13 @@ features:
       tests/test_moe_analytic_model.py
       tests/test_moe_native_interval_planner.py
       tests/test_fused_moe_bf16_tiled.py
-      -k plan_v2_strict_and_tail_pool
+      -k plan_v2
     benchmark: >-
       numactl --cpunodebind=0 --membind=0 taskset -c 0-95
       .venv/bin/python
       optimizations/fused_moe_sve/benchmarks/bench_vllm_staged_schedule.py
       --preset moe256-active-set-128 --production-profile
-      cpu_moe_schedule_optimization/cost_model/profiles/contention_async_amazon_c5_192c_dual_numa_tp4_sve_F512_E256_splitw13_schema_v2_xbyak_exactm_20260726.json
+      cpu_moe_schedule_optimization/cost_model/profiles/contention_async_amazon_c5_192c_dual_numa_tp4_sve_F512_E256_fulln_schema_v2_xbyak_exactm_20260727.json
       --route-dtype bf16 --warmup 5 --runs 21
 
   - id: dispatch.static_team_fission
@@ -789,7 +768,7 @@ features:
       optimizations/fused_moe_sve/benchmarks/bench_vllm_staged_schedule.py
       --preset moe256-long-short-bimodal
       --production-profile
-      cpu_moe_schedule_optimization/cost_model/profiles/contention_async_amazon_c5_192c_dual_numa_tp4_sve_F512_E256_splitw13_schema_v2_xbyak_exactm_20260726.json
+      cpu_moe_schedule_optimization/cost_model/profiles/contention_async_amazon_c5_192c_dual_numa_tp4_sve_F512_E256_fulln_schema_v2_xbyak_exactm_20260727.json
       --static-16-to-4 --route-dtype bf16 --warmup 5 --runs 21
 
   - id: dispatch.bounded_tail_route_fission
@@ -807,11 +786,11 @@ features:
       When exactly two long terminal experts remain after a 6x16T head wave,
       splitting each route range into two disjoint M slices lets four 24T
       fixed tasks occupy all 96 NUMA-local cores. Restricting the candidate to
-      an exact root-shape, route, placement, stage-window, and kernel anchor
+      an exact root-shape, route, placement, full-N geometry, and kernel anchor
       captures the measured tail gain without extrapolating M-split
       contention to unmeasured workloads.
     depends_on:
-      - dispatch.per_task_stage_windows
+      - dispatch.full_n_team_stripes
       - store.w2_direct_route
     conflicts_with:
       - dispatch.global_stage_task_pool
@@ -826,7 +805,7 @@ features:
       .venv/bin/python
       optimizations/fused_moe_sve/benchmarks/bench_vllm_staged_schedule.py
       --preset moe256-active-set-8 --production-profile
-      cpu_moe_schedule_optimization/cost_model/profiles/contention_async_amazon_c5_192c_numa0_tp4_sve_F512_E256_splitw13_schema_v2_xbyak_exactm_20260727.json
+      cpu_moe_schedule_optimization/cost_model/profiles/contention_async_amazon_c5_192c_numa0_tp4_sve_F512_E256_fulln_schema_v2_xbyak_exactm_20260727.json
       --static-tail-widths 24 --static-tail-m-split
       --route-dtype bf16 --warmup 7 --runs 51
     result: >-
@@ -869,7 +848,7 @@ features:
       optimizations/fused_moe_sve/benchmarks/bench_vllm_staged_schedule.py
       --preset moe256-long-short-bimodal
       --production-profile
-      cpu_moe_schedule_optimization/cost_model/profiles/contention_async_amazon_c5_192c_dual_numa_tp4_sve_F512_E256_splitw13_schema_v2_xbyak_exactm_20260726.json
+      cpu_moe_schedule_optimization/cost_model/profiles/contention_async_amazon_c5_192c_dual_numa_tp4_sve_F512_E256_fulln_schema_v2_xbyak_exactm_20260727.json
       --route-dtype bf16 --warmup 5 --runs 21
 
   - id: planner.native_cold_search
@@ -899,7 +878,7 @@ features:
       taskset -c 0-95 .venv/bin/python
       cpu_moe_schedule_optimization/planners/bench_native_cold_planner.py
       --profile
-      cpu_moe_schedule_optimization/cost_model/profiles/contention_async_amazon_c5_192c_dual_numa_tp4_sve_F512_E256_splitw13_schema_v2_xbyak_exactm_20260726.json
+      cpu_moe_schedule_optimization/cost_model/profiles/contention_async_amazon_c5_192c_dual_numa_tp4_sve_F512_E256_fulln_schema_v2_xbyak_exactm_20260727.json
       --cores 96 --workers 1,2,4,8,16 --warmup 5 --runs 21
 
   - id: pipeline.explicit_unfused_reference
@@ -1187,12 +1166,7 @@ features:
       -k 'sve_default_packing or sve_kc_path' &&
       FUSED_CPP_MOE_SVE_KC=256 .venv/bin/python -m pytest -q
       tests/test_fused_moe_bf16_tiled.py -k sve_kc_path
-    benchmark: >-
-      FUSED_CPP_MOE_SVE_KC=800 PYTHONPATH=src python3
-      optimizations/fused_moe_sve/benchmarks/bench_weight_windows.py
-      --experts 24 --routes 2040 --hidden 4096 --intermediate 512
-      --threads-per-expert 4 --cpu-start 0 --window-mib 0
-      --warmup 5 --runs 15
+    benchmark: historical; the removed window sweep remains in Git history.
 
   - id: measurement.thread_weight_working_set
     part: measurement
@@ -1403,25 +1377,23 @@ variants:
     entrypoint: >-
       fused_moe_bf16_tiled_{scheduled,async}(
       w13_ranges=<positive count>, w2_ranges=<positive count>)
-    status: experimental
+    status: retired
 
-  - id: sve_plan_v2_per_task_stage_windows
+  - id: sve_plan_v2_full_n_team_stripes
     features:
       - intermediate.overwrite_elision
       - scatter.w2_n_owner
-      - dispatch.serial_weight_windows
-      - dispatch.per_task_stage_windows
+      - dispatch.full_n_team_stripes
     entrypoint: >-
-      PlannedMoE(default profile-bound policy;
-      use_default_stage_window_policy=False to disable) ->
-      fused_moe_bf16_tiled_async_plan(AsyncMoEPlanV2(
-      task_w13_ranges=..., task_w2_ranges=...))
+      PlannedMoE -> fused_moe_bf16_tiled_async_plan(AsyncMoEPlanV2(...));
+      W13/W2 each execute one full N domain and task_threads determines owner
+      stripes.
     status: enabled
 
   - id: sve_cold_oracle_timed_release
     features:
       - dispatch.timed_task_release
-      - dispatch.per_task_stage_windows
+      - dispatch.full_n_team_stripes
       - store.w2_direct_route
       - merge.sve_weighted_reduce
     entrypoint: >-
@@ -1442,7 +1414,7 @@ variants:
   - id: sve_planned_global_two_stage
     features:
       - dispatch.planned_global_stages
-      - dispatch.per_task_stage_windows
+      - dispatch.full_n_team_stripes
       - store.w2_direct_route
       - merge.sve_weighted_reduce
     entrypoint: >-
@@ -1454,7 +1426,7 @@ variants:
     features:
       - dispatch.w2_boundary_elastic
       - store.w2_direct_route
-      - dispatch.per_task_stage_windows
+      - dispatch.full_n_team_stripes
     entrypoint: >-
       fused_moe_bf16_tiled_async_plan
       (Plan V2 execution_mode=elastic, resize point before W2)
@@ -1485,7 +1457,7 @@ variants:
   - id: sve_bounded_tail_route_fission
     features:
       - dispatch.bounded_tail_route_fission
-      - dispatch.per_task_stage_windows
+      - dispatch.full_n_team_stripes
       - planner.native_cold_search
       - store.w2_direct_route
       - store.w2_direct_bf16_route

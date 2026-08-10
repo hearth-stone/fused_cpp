@@ -138,7 +138,7 @@ def main() -> None:
     max_weight_gbs = max(record["weight_gbs"] for record in records)
     print(
         f"host_core={CORE} H={H} F={F} experts={EXPERTS} "
-        f"w13_ranges=2 w2_ranges=1 jit=1 peak={BFMMLA_PEAK_GFLOPS:.1f}GF/s "
+        f"stage_geometry=full_n_team_stripes jit=1 peak={BFMMLA_PEAK_GFLOPS:.1f}GF/s "
         f"packed_b_read_ceiling={PACKED_B_READ_CEILING_GBS:.2f}GB/s "
         f"max_observed_weight_rate={max_weight_gbs:.3f}GB/s sink={sink}"
     )

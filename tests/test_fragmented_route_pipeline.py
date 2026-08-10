@@ -34,7 +34,7 @@ def test_fragmentation_keeps_total_routes_and_active_stage_constant() -> None:
 
     assert len(points) == 10
     assert {point.total_routes for point in points} == {24 * 2040}
-    assert {point.active_stage_bytes for point in points} == {96 * 1024 * 1024}
+    assert {point.active_stage_bytes for point in points} == {24 * 4 * 4096 * 512}
     assert [(point.split_factor, point.replaced_teams) for point in points[:4]] == [
         (1, 0),
         (2, 6),
