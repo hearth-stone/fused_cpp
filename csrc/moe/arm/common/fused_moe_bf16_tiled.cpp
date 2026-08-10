@@ -541,56 +541,6 @@ int64_t n_split_active_threads(int64_t N, int64_t group_size) {
   return std::min(group_size, blocks);
 }
 
-// Experiment-only override for the per-thread owner windows, as
-// `FUSED_CPP_MOE_STAGE_WINDOW_TILES=<w13>,<w2>` in whole N tiles. It applies only
-// where the plan left the window at the full stripe, so a planner-selected window
-// always wins and the variable cannot silently reinterpret a calibrated plan.
-// Production windows come from the task plan; this exists so a grid can be swept
-// without regenerating plans.
-struct StageWindowEnvOverride {
-  int64_t w13_tiles = 0;
-  int64_t w2_tiles = 0;
-  bool present = false;
-};
-
-const StageWindowEnvOverride& stage_window_env_override() {
-  static const StageWindowEnvOverride value = [] {
-    StageWindowEnvOverride parsed;
-    const char* raw = std::getenv("FUSED_CPP_MOE_STAGE_WINDOW_TILES");
-    if (raw == nullptr || raw[0] == '\0') {
-      return parsed;
-    }
-    char* end = nullptr;
-    const long long first = std::strtoll(raw, &end, 10);
-    TORCH_CHECK(end != raw && first >= 0, "FUSED_CPP_MOE_STAGE_WINDOW_TILES must start with a non-negative integer");
-    long long second = first;
-    if (end != nullptr && *end == ',') {
-      const char* rest = end + 1;
-      char* end2 = nullptr;
-      second = std::strtoll(rest, &end2, 10);
-      TORCH_CHECK(end2 != rest && second >= 0,
-                  "FUSED_CPP_MOE_STAGE_WINDOW_TILES second field must be a non-negative integer");
-    }
-    parsed.w13_tiles = static_cast<int64_t>(first);
-    parsed.w2_tiles = static_cast<int64_t>(second);
-    parsed.present = true;
-    return parsed;
-  }();
-  return value;
-}
-
-// `plan_tiles` wins; the override only fills in a full stripe the plan did not pin.
-int64_t resolve_stage_window_tiles(int64_t plan_tiles, bool is_w13) {
-  if (plan_tiles > 0) {
-    return plan_tiles;
-  }
-  const StageWindowEnvOverride& env = stage_window_env_override();
-  if (!env.present) {
-    return 0;
-  }
-  return is_w13 ? env.w13_tiles : env.w2_tiles;
-}
-
 struct GemmSplitContext {
   MoeGemmStage stage = MoeGemmStage::kW13;
   int64_t M = 0;
@@ -6026,7 +5976,7 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input, at::Tensor w13_packed, int64_t
         const int64_t rows = static_cast<int64_t>(expert_routes.size());
         // W2 GEMM and owner-scatter must use the same per-thread owner window.
         // The legacy hierarchical path keeps W13 on its full owner stripe.
-        const int64_t w2_window_tiles = resolve_stage_window_tiles(0, /*is_w13=*/false);
+        const int64_t w2_window_tiles = 0;
 
         if (fuse_silu && fused_packa) {
           // Fused gather + m8 reorder pack (Part 1): write the w13 A
@@ -6623,13 +6573,10 @@ at::Tensor fused_moe_bf16_tiled_scheduled(at::Tensor input, at::Tensor w13_packe
         ThreadBarrier& barrier = scratch.barrier;
         const int64_t expert = team_expert_ids_v[static_cast<size_t>(selected_team)];
         const int64_t rows = team_rows[static_cast<size_t>(selected_team)];
-        // Per-thread owner windows in whole N tiles; 0 is the full stripe (R = 1).
-        // The GEMM and the owner-scatter must use the same value, so it is declared
-        // where both can see it. It comes from the task plan, or from the
-        // FUSED_CPP_MOE_STAGE_WINDOW_TILES experiment override when the plan left it
-        // at the full stripe.
-        const int64_t w13_window_tiles = resolve_stage_window_tiles(0, /*is_w13=*/true);
-        const int64_t w2_window_tiles = resolve_stage_window_tiles(0, /*is_w13=*/false);
+        // Legacy scheduled plans use the full owner stripe. Per-task windows
+        // are represented explicitly by Plan V2.
+        const int64_t w13_window_tiles = 0;
+        const int64_t w2_window_tiles = 0;
         const int64_t group_size = team_threads_v[static_cast<size_t>(selected_team)];
         TORCH_CHECK(scratch.threads == group_size, "scratch thread count mismatch for team ", selected_team);
         TORCH_CHECK(rows <= scratch.max_rows, "scratch row capacity mismatch for team ", selected_team);
@@ -7717,15 +7664,11 @@ at::Tensor run_fused_moe_bf16_tiled_async(
     ThreadBarrier& barrier = scratch.barrier;
     const int64_t expert = task.expert;
     const int64_t rows = task.rows;
-    // Per-thread owner windows in whole N tiles; 0 is the full stripe (R = 1).
-    // The GEMM and the owner-scatter must use the same value, so it is declared
-    // where both can see it. It comes from the task plan, or from the
-    // FUSED_CPP_MOE_STAGE_WINDOW_TILES experiment override when the plan left it
-    // at the full stripe.
-    const int64_t w13_window_tiles = resolve_stage_window_tiles(
-        has_plan_v2 ? task_w13_window_tiles_v[static_cast<size_t>(task_id)] : 0, /*is_w13=*/true);
-    const int64_t w2_window_tiles = resolve_stage_window_tiles(
-        has_plan_v2 ? task_w2_window_tiles_v[static_cast<size_t>(task_id)] : 0, /*is_w13=*/false);
+    // Per-thread owner windows are explicit Plan V2 task fields; legacy async
+    // plans use the full owner stripe.
+    const int64_t w13_window_tiles =
+        has_plan_v2 ? task_w13_window_tiles_v[static_cast<size_t>(task_id)] : 0;
+    const int64_t w2_window_tiles = has_plan_v2 ? task_w2_window_tiles_v[static_cast<size_t>(task_id)] : 0;
     const int64_t group_size = task.threads;
     const auto& expert_routes = routes[static_cast<size_t>(expert)];
     const int64_t* task_routes = expert_routes.data() + task.route_begin;

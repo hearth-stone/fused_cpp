@@ -743,6 +743,23 @@ features:
       cpu_moe_schedule_optimization/cost_model/profiles/contention_async_amazon_c5_192c_dual_numa_tp4_sve_F512_E256_fulln_schema_v2_xbyak_exactm_20260727.json
       --route-dtype bf16 --warmup 5 --runs 21
 
+  - id: dispatch.stage_window_env_override
+    part: dispatch
+    status: retired
+    implementation: Removed from the production runtime; retained in Git history.
+    history: 208743e
+    hypothesis: >-
+      A process-wide W13/W2 tile-window override made calibration sweeps easy,
+      but it also let an experimental environment variable alter every legacy
+      scheduled or async task whose plan selected the full stripe. Plan V2 now
+      carries exact per-task window fields, so experiments can express the same
+      geometry without adding an implicit branch to production dispatch.
+    depends_on:
+      - dispatch.stage_window_tiles
+    conflicts_with: []
+    correctness: historical; restore Git 208743e to reproduce
+    benchmark: historical; use an explicit Plan V2 for current window sweeps
+
   - id: dispatch.stage_window_tiles
     part: dispatch
     status: enabled
@@ -777,9 +794,8 @@ features:
       tests/test_moe_cost_model_v2.py
     benchmark: >-
       see optimizations/fused_moe_sve/results/amazon_192c_stage_window_tiles_20260810.md
-      for the sweep driver and the end-to-end A/B; windows can be forced for an
-      experiment with FUSED_CPP_MOE_STAGE_WINDOW_TILES=<w13>,<w2> in tiles,
-      which only fills a window the plan left at the full stripe
+      for the sweep driver and the end-to-end A/B; current experiments set
+      task_w13_window_tiles/task_w2_window_tiles explicitly in Plan V2
 
   - id: dispatch.static_team_fission
     part: dispatch

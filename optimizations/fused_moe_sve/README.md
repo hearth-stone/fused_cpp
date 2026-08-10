@@ -9,9 +9,10 @@ split, range-count, and byte-window controls are gone. Their replacement is one
 explicit per-task owner window in Plan V2: `(threads, window_tiles)` uniquely
 defines a stage, each team window covers `threads * window_tiles` N tiles, and
 successive windows cover the complete N domain. A zero Plan V2 value selects
-the full owner stripe `ceil((N/v)/threads)`; the environment override exists
-only for controlled experiments. Sections explicitly labelled historical retain
-the earlier split/range implementations only as provenance.
+the full owner stripe `ceil((N/v)/threads)`. Window experiments must construct
+an explicit Plan V2 rather than changing production dispatch through process
+environment. Sections explicitly labelled historical retain the earlier
+split/range implementations only as provenance.
 
 The production `FUSED_CPP_MOE_FUSED_2D_SPLIT` adapter was also removed on
 2026-08-10. It always lowered to `tm=1, tn=threads`, and its SVE wrappers only
