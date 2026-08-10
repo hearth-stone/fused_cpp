@@ -357,7 +357,7 @@ E8/topk6 最终输出:
 | NR1 | 1.0351% | 99.7152% | 0.03655% |
 | NR2 | 0.03251% | 99.9913% | 0.00603% |
 
-用 identity-W2 直接导出 SiLU BF16 intermediate,并覆盖 input/weight 多种尺度:
+历史实验用 identity-W2 直接导出 SiLU BF16 intermediate,并覆盖 input/weight 多种尺度:
 
 - NR1:约 `0.025%-0.030%` 元素变化,全部在 1 ULP 内,rel-L2
   `0.0078%-0.0096%`。
@@ -365,6 +365,10 @@ E8/topk6 最终输出:
   `0.00048%-0.00194%`。
 
 normal/scheduled/async、poly4/5/6、rows `1..23` 均通过回归。
+
+该 identity W13 诊断会改变生产算子语义，已于 2026-08-10 从活动树移除；最后实现
+保留在 Git `8bac39a`。上述 intermediate 精度数据继续作为历史依据，后续指令分解
+使用 standalone pure-GEMM/service probe，不再给 production kernel 增加旁路。
 
 ## 结论
 
@@ -447,7 +451,7 @@ E8/topk6 最终输出:
 | minimax3 | 10.5798% | 97.0309% | 0.11885% |
 | poly6 | 0.1323% | 99.9654% | 0.01293% |
 
-identity-W2 直接观察 intermediate,覆盖 input/weight 多种尺度:
+历史实验用 identity-W2 直接观察 intermediate,覆盖 input/weight 多种尺度:
 
 - Taylor poly4:约 `0.053%-0.068%` 元素变化,全部在 1 ULP 内,rel-L2
   `0.00064%-0.01945%`。
@@ -455,6 +459,10 @@ identity-W2 直接观察 intermediate,覆盖 input/weight 多种尺度:
   `0.00165%-0.03580%`。
 
 normal/scheduled/async 和 rows `1..23` 回归通过。尚未做模型级精度评估。
+
+该 identity W13 诊断会改变生产算子语义，已于 2026-08-10 从活动树移除；最后实现
+保留在 Git `8bac39a`。上述数据仍用于比较 polynomial 精度，不再维护对应运行时
+开关、汇编 epilogue 或导出符号。
 
 ## 结论
 

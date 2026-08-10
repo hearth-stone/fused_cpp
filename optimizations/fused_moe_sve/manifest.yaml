@@ -428,6 +428,27 @@ features:
       benchmark selector no longer justify production maintenance. Full paired
       measurements remain in results/amazon_192c_xbyak_bulk_m.md.
 
+  - id: compute.w13_identity_diagnostic
+    part: compute
+    status: retired
+    implementation: Removed from the active tree; retained in Git history.
+    history: 8bac39a
+    hypothesis: >-
+      Replacing the fused SiLU and gate-up multiply with a gate-only BF16
+      packC epilogue isolates the incremental nonlinear epilogue cost while
+      preserving the W13 GEMM and intermediate layout.
+    depends_on: []
+    conflicts_with: []
+    correctness: diagnostic only; restore history commit 8bac39a to reproduce
+    benchmark: historical; restore history commit 8bac39a to reproduce
+    result: >-
+      Retired on 2026-08-10. The override deliberately changed production
+      operator semantics and was no longer consumed by the cost model. Pure
+      GEMM and service probes now provide the required thin calibration surface;
+      historical SiLU decomposition and precision results remain in
+      cpu_moe_schedule_optimization/cost_model/GEMM_ECM_VALIDATION.md and
+      cpu_moe_schedule_optimization/SILU_FUSION_FINDINGS.md.
+
   - id: compute.m_epoch
     part: compute
     status: experimental

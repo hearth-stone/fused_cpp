@@ -191,8 +191,12 @@ Configuration:
 - calibration routes: `192,384,768`;
 - fully held-out routes: `1536,2040`.
 
-The same sweep was repeated with `FUSED_CPP_MOE_W13_SKIP_SILU=1` to isolate the
-incremental SiLU epilogue cost. The benchmark command was:
+The same sweep was repeated with the historical
+`FUSED_CPP_MOE_W13_SKIP_SILU=1` diagnostic to isolate the incremental SiLU
+epilogue cost. That production-semantic override was retired on 2026-08-10;
+check out Git `8bac39a` to reproduce this exact decomposition. New calibration
+must use the standalone pure-GEMM and service probes instead of changing the
+fused operator's W13 epilogue. The benchmark command was:
 
 ```bash
 PYTHONPATH=src OMP_NUM_THREADS=32 OMP_DYNAMIC=FALSE OMP_PROC_BIND=close \

@@ -128,12 +128,6 @@ void moe_sve_w13_silu_poly6_packc_m2(const uint16_t*, const uint16_t*, uint16_t*
 void moe_sve_w13_silu_poly4_packc_m1(const uint16_t*, const uint16_t*, uint16_t*, uint16_t*, const gemm_params_t*);
 void moe_sve_w13_silu_poly5_packc_m1(const uint16_t*, const uint16_t*, uint16_t*, uint16_t*, const gemm_params_t*);
 void moe_sve_w13_silu_poly6_packc_m1(const uint16_t*, const uint16_t*, uint16_t*, uint16_t*, const gemm_params_t*);
-void moe_sve_w13_identity_packc_m12(const uint16_t*, const uint16_t*, uint16_t*, uint16_t*, const gemm_params_t*);
-void moe_sve_w13_identity_packc_m12_rows(const uint16_t*, const uint16_t*, uint16_t*, uint16_t*, const gemm_params_t*);
-void moe_sve_w13_identity_packc(const uint16_t*, const uint16_t*, uint16_t*, uint16_t*, const gemm_params_t*);
-void moe_sve_w13_identity_packc_m4(const uint16_t*, const uint16_t*, uint16_t*, uint16_t*, const gemm_params_t*);
-void moe_sve_w13_identity_packc_m2(const uint16_t*, const uint16_t*, uint16_t*, uint16_t*, const gemm_params_t*);
-void moe_sve_w13_identity_packc_m1(const uint16_t*, const uint16_t*, uint16_t*, uint16_t*, const gemm_params_t*);
 void moe_sve_w2_packed(const uint16_t*, const uint16_t*, float*, uint16_t*, const gemm_params_t*);
 void moe_sve_w2_packed_m12(const uint16_t*, const uint16_t*, float*, uint16_t*, const gemm_params_t*);
 void moe_sve_w2_packed_m4(const uint16_t*, const uint16_t*, float*, uint16_t*, const gemm_params_t*);
@@ -980,11 +974,6 @@ void packed_w2_tail_dispatch(const uint16_t* packed_A, const uint16_t* w2_packed
   }
 }
 
-bool sve_w13_skip_silu_enabled() {
-  const char* value = std::getenv("FUSED_CPP_MOE_W13_SKIP_SILU");
-  return value != nullptr && value[0] != '\0' && value[0] != '0';
-}
-
 bool sve_w2_bf16_route_enabled() {
   const char* value = std::getenv("FUSED_CPP_MOE_W2_BF16_ROUTE");
   return value != nullptr && value[0] != '\0' && value[0] != '0';
@@ -1109,9 +1098,6 @@ bool sve_jit_configuration_supported(SveJitOperation operation, int K, int64_t d
   if (operation == SveJitOperation::kW13) {
     if (degree < 4 || degree > 6) {
       return reject("the exact-M JIT supports SiLU polynomial degrees 4, 5, and 6");
-    }
-    if (sve_w13_skip_silu_enabled()) {
-      return reject("the identity epilogue remains on the static asm fallback");
     }
   }
   return true;
@@ -1260,9 +1246,6 @@ SveKcFusedSiluKernelSet sve_asm_fused_silu_packc_set_for_degree(int64_t degree) 
   const SveKcKernelFn m8 = moe_sve_kc_kernel_m8;
   const SveKcKernelFn m4 = moe_sve_kc_kernel_m4;
   const SveKcKernelFn m2 = moe_sve_kc_kernel_m2;
-  if (sve_w13_skip_silu_enabled()) {
-    return {m8, m4, m2, m2, m12, 1, 1};
-  }
   if (degree < 4 || degree > 6) {
     return {};
   }

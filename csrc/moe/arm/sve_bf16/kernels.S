@@ -704,14 +704,6 @@
 	bfcvt \gate1\().h, p1/m, \gate1\().s
 	.endm
 
-	// Diagnostic epilogue: preserve the full W13 GEMM but feed its gate half
-	// directly to W2. This keeps the packed-C layout identical while removing
-	// SiLU and the gate*up multiply from the timed path.
-	.macro IDENTITY_TO_BF16 value
-	mov z0.d, \value\().d
-	bfcvt z0.h, p1/m, z0.s
-	.endm
-
 	.macro STORE_PACKC_PAIR base, pred, g0, g1, u0, u1, deg
 	SILU_TO_BF16 \g0, \u0, \deg
 	st1h {z0.s}, \pred, [\base, z5.s, sxtw]
@@ -730,26 +722,6 @@
 951\@:
 	STORE_PACKC_PAIR \base, p4, \g0, \g1, \u0, \u1, \deg
 950\@:
-	.endm
-
-	.macro STORE_PACKC_PAIR_IDENTITY base, pred, g0, g1
-	IDENTITY_TO_BF16 \g0
-	st1h {z0.s}, \pred, [\base, z5.s, sxtw]
-	IDENTITY_TO_BF16 \g1
-	add x3, \base, #4
-	st1h {z0.s}, \pred, [x3, z5.s, sxtw]
-	.endm
-
-	.macro STORE_PACKC_PAIR_IDENTITY_GUARDED base, row, g0, g1
-	cmp w19, #\row
-	b.le 952\@f
-	cmp w19, #(\row + 1)
-	b.eq 953\@f
-	STORE_PACKC_PAIR_IDENTITY \base, p1, \g0, \g1
-	b 952\@f
-953\@:
-	STORE_PACKC_PAIR_IDENTITY \base, p4, \g0, \g1
-952\@:
 	.endm
 
 	.macro STORE_PACKC_M8 deg
@@ -779,32 +751,6 @@
 	SILU_CONSTS_LOAD
 	mov x16, x12
 	STORE_PACKC_PAIR_GUARDED x16, 0, z16, z17, z18, z19, \deg
-	.endm
-
-	.macro STORE_PACKC_M8_IDENTITY
-	BUILD_PACKC_OFFSETS
-	mov x16, x12
-	STORE_PACKC_PAIR_IDENTITY_GUARDED x16, 0, z16, z17
-	add x16, x12, #16
-	STORE_PACKC_PAIR_IDENTITY_GUARDED x16, 2, z20, z21
-	add x16, x12, #32
-	STORE_PACKC_PAIR_IDENTITY_GUARDED x16, 4, z24, z25
-	add x16, x12, #48
-	STORE_PACKC_PAIR_IDENTITY_GUARDED x16, 6, z28, z29
-	.endm
-
-	.macro STORE_PACKC_M4_IDENTITY
-	BUILD_PACKC_OFFSETS
-	mov x16, x12
-	STORE_PACKC_PAIR_IDENTITY_GUARDED x16, 0, z16, z17
-	add x16, x12, #16
-	STORE_PACKC_PAIR_IDENTITY_GUARDED x16, 2, z20, z21
-	.endm
-
-	.macro STORE_PACKC_M2_IDENTITY
-	BUILD_PACKC_OFFSETS
-	mov x16, x12
-	STORE_PACKC_PAIR_IDENTITY_GUARDED x16, 0, z16, z17
 	.endm
 
 	.macro STORE_PACKC_PAIR_M12_BASE base, g0, g1, u0, u1, deg
@@ -842,30 +788,6 @@
 	STORE_PACKC_PAIR_M12_CACHED x16, z16, z17, z18, z19, \deg
 	add x16, x12, #48
 	STORE_PACKC_PAIR_M12_CACHED x16, z20, z21, z22, z23, \deg
-	.endm
-
-	.macro STORE_PACKC_PAIR_M12_IDENTITY base, g0, g1
-	IDENTITY_TO_BF16 \g0
-	st1h {z0.s}, p1, [\base, z5.s, sxtw]
-	IDENTITY_TO_BF16 \g1
-	add x3, \base, #4
-	st1h {z0.s}, p1, [x3, z5.s, sxtw]
-	.endm
-
-	.macro STORE_PACKC_M12_IDENTITY
-	BUILD_PACKC_OFFSETS_M12
-	mov x16, x12
-	STORE_PACKC_PAIR_M12_IDENTITY x16, z8, z9
-	add x16, x12, #16
-	STORE_PACKC_PAIR_M12_IDENTITY x16, z12, z13
-	add x16, x12, #32
-	STORE_PACKC_PAIR_M12_IDENTITY x16, z16, z17
-	add x16, x12, #48
-	STORE_PACKC_PAIR_M12_IDENTITY x16, z20, z21
-	add x16, x12, #64
-	STORE_PACKC_PAIR_M12_IDENTITY x16, z24, z25
-	add x16, x12, #80
-	STORE_PACKC_PAIR_M12_IDENTITY x16, z28, z29
 	.endm
 
 	.macro STORE_W2_M8
@@ -1319,8 +1241,6 @@ moe_sve_kernel_m12_rows:
 	subs w15, w15, #8
 	b.gt .L_m12_rows_k_loop
 
-	cmp w6, #1
-	b.eq .L_m12_rows_store_identity
 	cmp w6, #14
 	b.eq .L_m12_rows_store_opt_p4
 	cmp w6, #15
@@ -1338,9 +1258,6 @@ moe_sve_kernel_m12_rows:
 .L_m12_rows_store_opt_p6:
 	STORE_PACKC_M12_OPT 6
 	b .L_m12_rows_advance_n
-.L_m12_rows_store_identity:
-	STORE_PACKC_M12_IDENTITY
-
 .L_m12_rows_advance_n:
 	add x12, x12, x24
 	add x11, x11, x13
@@ -1408,8 +1325,6 @@ moe_sve_kernel_m12:
 	b.eq .L_m12_store_w2_direct
 	cmp w6, #44
 	b.eq .L_m12_store_w2_direct_bf16
-	cmp w6, #1
-	b.eq .L_m12_store_identity
 	cmp w6, #14
 	b.eq .L_m12_store_opt_p4
 	cmp w6, #15
@@ -1426,9 +1341,6 @@ moe_sve_kernel_m12:
 	b .L_m12_advance_packc
 .L_m12_store_opt_p6:
 	STORE_PACKC_M12_OPT 6
-	b .L_m12_advance_packc
-.L_m12_store_identity:
-	STORE_PACKC_M12_IDENTITY
 	b .L_m12_advance_packc
 .L_m12_store_w2:
 	STORE_W2_M12
@@ -1523,8 +1435,6 @@ moe_sve_kernel_m8:
 	b.eq .L_m8_store_w2_direct
 	cmp w6, #44
 	b.eq .L_m8_store_w2_direct_bf16
-	cmp w6, #1
-	b.eq .L_m8_store_identity
 	cmp w6, #4
 	b.eq .L_m8_store_p4
 	cmp w6, #5
@@ -1536,9 +1446,6 @@ moe_sve_kernel_m8:
 	b .L_m8_advance_packc
 .L_m8_store_p5:
 	STORE_PACKC_M8 5
-	b .L_m8_advance_packc
-.L_m8_store_identity:
-	STORE_PACKC_M8_IDENTITY
 	b .L_m8_advance_packc
 .L_m8_store_w2:
 	STORE_W2_M8
@@ -1633,8 +1540,6 @@ moe_sve_kernel_m4:
 	b.eq .L_m4_store_w2_direct
 	cmp w6, #44
 	b.eq .L_m4_store_w2_direct_bf16
-	cmp w6, #1
-	b.eq .L_m4_store_identity
 	cmp w6, #4
 	b.eq .L_m4_store_p4
 	cmp w6, #5
@@ -1646,9 +1551,6 @@ moe_sve_kernel_m4:
 	b .L_m4_advance_packc
 .L_m4_store_p5:
 	STORE_PACKC_M4 5
-	b .L_m4_advance_packc
-.L_m4_store_identity:
-	STORE_PACKC_M4_IDENTITY
 	b .L_m4_advance_packc
 .L_m4_store_w2:
 	STORE_W2_M4
@@ -1743,8 +1645,6 @@ moe_sve_kernel_m2:
 	b.eq .L_m2_store_w2_direct
 	cmp w6, #44
 	b.eq .L_m2_store_w2_direct_bf16
-	cmp w6, #1
-	b.eq .L_m2_store_identity
 	cmp w6, #4
 	b.eq .L_m2_store_p4
 	cmp w6, #5
@@ -1756,9 +1656,6 @@ moe_sve_kernel_m2:
 	b .L_m2_advance_packc
 .L_m2_store_p5:
 	STORE_PACKC_M2 5
-	b .L_m2_advance_packc
-.L_m2_store_identity:
-	STORE_PACKC_M2_IDENTITY
 	b .L_m2_advance_packc
 .L_m2_store_w2:
 	STORE_W2_M2
@@ -1892,8 +1789,6 @@ moe_sve_kc_kernel_m12:
 	b.eq .L_kc_m12_store_w2_direct
 	cmp w6, #44
 	b.eq .L_kc_m12_store_w2_direct_bf16
-	cmp w6, #1
-	b.eq .L_kc_m12_store_identity
 	cmp w6, #14
 	b.eq .L_kc_m12_store_opt_p4
 	cmp w6, #15
@@ -1910,9 +1805,6 @@ moe_sve_kc_kernel_m12:
 	b .L_kc_m12_advance_packc
 .L_kc_m12_store_opt_p6:
 	STORE_PACKC_M12_OPT 6
-	b .L_kc_m12_advance_packc
-.L_kc_m12_store_identity:
-	STORE_PACKC_M12_IDENTITY
 	b .L_kc_m12_advance_packc
 .L_kc_m12_store_w2:
 	STORE_W2_M12
@@ -2126,8 +2018,6 @@ moe_sve_kc_kernel_m12:
 	b.eq .L_\name\()_store_w2_direct
 	cmp w6, #44
 	b.eq .L_\name\()_store_w2_direct_bf16
-	cmp w6, #1
-	b.eq .L_\name\()_store_identity
 	cmp w6, #4
 	b.eq .L_\name\()_store_p4
 	cmp w6, #5
@@ -2156,15 +2046,6 @@ moe_sve_kc_kernel_m12:
 	STORE_PACKC_M4 5
 	.else
 	STORE_PACKC_M2 5
-	.endif
-	b .L_\name\()_advance_packc
-.L_\name\()_store_identity:
-	.if \height == 8
-	STORE_PACKC_M8_IDENTITY
-	.elseif \height == 4
-	STORE_PACKC_M4_IDENTITY
-	.else
-	STORE_PACKC_M2_IDENTITY
 	.endif
 	b .L_\name\()_advance_packc
 .L_\name\()_store_w2:
@@ -2308,13 +2189,6 @@ moe_sve_kc_kernel_m12:
 	ENTRY_W13 moe_sve_w13_silu_poly4_packc_m1, moe_sve_kernel_m2, 4
 	ENTRY_W13 moe_sve_w13_silu_poly5_packc_m1, moe_sve_kernel_m2, 5
 	ENTRY_W13 moe_sve_w13_silu_poly6_packc_m1, moe_sve_kernel_m2, 6
-	ENTRY_W13 moe_sve_w13_identity_packc_m12, moe_sve_kernel_m12, 1
-	ENTRY_W13_ROWS moe_sve_w13_identity_packc_m12_rows, moe_sve_kernel_m12_rows, 1
-	ENTRY_W13 moe_sve_w13_identity_packc,     moe_sve_kernel_m8, 1
-	ENTRY_W13 moe_sve_w13_identity_packc_m4,  moe_sve_kernel_m4, 1
-	ENTRY_W13 moe_sve_w13_identity_packc_m2,  moe_sve_kernel_m2, 1
-	ENTRY_W13 moe_sve_w13_identity_packc_m1,  moe_sve_kernel_m2, 1
-
 	ENTRY_W2 moe_sve_w2_packed_m12, moe_sve_kernel_m12
 	ENTRY_W2 moe_sve_w2_packed,     moe_sve_kernel_m8
 	ENTRY_W2 moe_sve_w2_packed_m4,  moe_sve_kernel_m4

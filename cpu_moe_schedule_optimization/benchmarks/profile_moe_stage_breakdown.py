@@ -395,7 +395,6 @@ def main() -> int:
             "backend_n_tile": packed.backend_n_tile,
             "parallel_axis": "N",
             "stage_geometry": "full_n_team_stripes",
-            "w13_skip_silu": env_enabled("FUSED_CPP_MOE_W13_SKIP_SILU"),
         },
         "shape": {
             "hidden_size": args.hidden_size,
