@@ -68,135 +68,87 @@ FUSED_CPP_ALWAYS_INLINE svfloat32_t reduce_fixed(svbool_t pg, const Src* token_s
   }
 }
 
-template <typename Src, int TopK, int Unroll>
+template <typename Src, int TopK>
 FUSED_CPP_ALWAYS_INLINE void merge_fixed_block(svbool_t pg, const Src* token_src, const float* weights, uint16_t* dst,
-                                               int64_t hidden_size, int64_t offset, int64_t vl) {
+                                               int64_t hidden_size, int64_t offset) {
   static_assert(TopK == 2 || TopK == 4 || TopK == 6 || TopK == 8);
-  static_assert(Unroll == 1 || Unroll == 2 || Unroll == 4);
-  if constexpr (Unroll == 1) {
-    store_bf16(pg, dst + offset, reduce_fixed<Src, 0, TopK>(pg, token_src, weights, hidden_size, offset));
-  } else if constexpr (Unroll == 2) {
-    const svfloat32_t value0 = reduce_fixed<Src, 0, TopK>(pg, token_src, weights, hidden_size, offset);
-    const svfloat32_t value1 = reduce_fixed<Src, 0, TopK>(pg, token_src, weights, hidden_size, offset + vl);
-    store_bf16(pg, dst + offset, value0);
-    store_bf16(pg, dst + offset + vl, value1);
-  } else {
-    const svfloat32_t value0 = reduce_fixed<Src, 0, TopK>(pg, token_src, weights, hidden_size, offset);
-    const svfloat32_t value1 = reduce_fixed<Src, 0, TopK>(pg, token_src, weights, hidden_size, offset + vl);
-    const svfloat32_t value2 = reduce_fixed<Src, 0, TopK>(pg, token_src, weights, hidden_size, offset + 2 * vl);
-    const svfloat32_t value3 = reduce_fixed<Src, 0, TopK>(pg, token_src, weights, hidden_size, offset + 3 * vl);
-    store_bf16(pg, dst + offset, value0);
-    store_bf16(pg, dst + offset + vl, value1);
-    store_bf16(pg, dst + offset + 2 * vl, value2);
-    store_bf16(pg, dst + offset + 3 * vl, value3);
-  }
+  store_bf16(pg, dst + offset, reduce_fixed<Src, 0, TopK>(pg, token_src, weights, hidden_size, offset));
 }
 
-template <typename Src, int Unroll>
+template <typename Src>
 FUSED_CPP_ALWAYS_INLINE void merge_dynamic_block(svbool_t pg, const Src* token_src, const float* weights, uint16_t* dst,
-                                                 int64_t top_k, int64_t hidden_size, int64_t offset, int64_t vl) {
-  static_assert(Unroll == 1 || Unroll == 2 || Unroll == 4);
-  svfloat32_t acc0 = svdup_f32(0.0f);
-  if constexpr (Unroll == 1) {
-    for (int64_t slot = 0; slot < top_k; ++slot) {
-      acc0 = svmla_n_f32_x(pg, acc0, load_f32(pg, token_src + slot * hidden_size + offset), weights[slot]);
-    }
-    store_bf16(pg, dst + offset, acc0);
-  } else if constexpr (Unroll == 2) {
-    svfloat32_t acc1 = svdup_f32(0.0f);
-    for (int64_t slot = 0; slot < top_k; ++slot) {
-      const Src* src = token_src + slot * hidden_size + offset;
-      const float weight = weights[slot];
-      acc0 = svmla_n_f32_x(pg, acc0, load_f32(pg, src), weight);
-      acc1 = svmla_n_f32_x(pg, acc1, load_f32(pg, src + vl), weight);
-    }
-    store_bf16(pg, dst + offset, acc0);
-    store_bf16(pg, dst + offset + vl, acc1);
-  } else {
-    svfloat32_t acc1 = svdup_f32(0.0f);
-    svfloat32_t acc2 = svdup_f32(0.0f);
-    svfloat32_t acc3 = svdup_f32(0.0f);
-    for (int64_t slot = 0; slot < top_k; ++slot) {
-      const Src* src = token_src + slot * hidden_size + offset;
-      const float weight = weights[slot];
-      acc0 = svmla_n_f32_x(pg, acc0, load_f32(pg, src), weight);
-      acc1 = svmla_n_f32_x(pg, acc1, load_f32(pg, src + vl), weight);
-      acc2 = svmla_n_f32_x(pg, acc2, load_f32(pg, src + 2 * vl), weight);
-      acc3 = svmla_n_f32_x(pg, acc3, load_f32(pg, src + 3 * vl), weight);
-    }
-    store_bf16(pg, dst + offset, acc0);
-    store_bf16(pg, dst + offset + vl, acc1);
-    store_bf16(pg, dst + offset + 2 * vl, acc2);
-    store_bf16(pg, dst + offset + 3 * vl, acc3);
+                                                 int64_t top_k, int64_t hidden_size, int64_t offset) {
+  svfloat32_t acc = svdup_f32(0.0f);
+  for (int64_t slot = 0; slot < top_k; ++slot) {
+    acc = svmla_n_f32_x(pg, acc, load_f32(pg, token_src + slot * hidden_size + offset), weights[slot]);
   }
+  store_bf16(pg, dst + offset, acc);
 }
 
-template <typename Src, int TopK, int Unroll>
+template <typename Src, int TopK>
 void merge_fixed_range(const Src* route_output, const float* weights, uint16_t* output, int64_t token_begin,
                        int64_t token_end, int64_t hidden_size) {
   constexpr int64_t vl = fused_cpp::moe_sve::kF32Lanes;
-  const int64_t step = Unroll * vl;
   const svbool_t all = svptrue_b32();
   for (int64_t token = token_begin; token < token_end; ++token) {
     const Src* token_src = route_output + token * TopK * hidden_size;
     const float* token_weights = weights + token * TopK;
     uint16_t* dst = output + token * hidden_size;
     int64_t offset = 0;
-    for (; offset + step <= hidden_size; offset += step) {
-      merge_fixed_block<Src, TopK, Unroll>(all, token_src, token_weights, dst, hidden_size, offset, vl);
+    for (; offset + vl <= hidden_size; offset += vl) {
+      merge_fixed_block<Src, TopK>(all, token_src, token_weights, dst, hidden_size, offset);
     }
     for (; offset < hidden_size; offset += vl) {
       const svbool_t pg = svwhilelt_b32(offset, hidden_size);
-      merge_fixed_block<Src, TopK, 1>(pg, token_src, token_weights, dst, hidden_size, offset, vl);
+      merge_fixed_block<Src, TopK>(pg, token_src, token_weights, dst, hidden_size, offset);
     }
   }
 }
 
-template <typename Src, int Unroll>
+template <typename Src>
 void merge_dynamic_range(const Src* route_output, const float* weights, uint16_t* output, int64_t token_begin,
                          int64_t token_end, int64_t top_k, int64_t hidden_size) {
   constexpr int64_t vl = fused_cpp::moe_sve::kF32Lanes;
-  const int64_t step = Unroll * vl;
   const svbool_t all = svptrue_b32();
   for (int64_t token = token_begin; token < token_end; ++token) {
     const Src* token_src = route_output + token * top_k * hidden_size;
     const float* token_weights = weights + token * top_k;
     uint16_t* dst = output + token * hidden_size;
     int64_t offset = 0;
-    for (; offset + step <= hidden_size; offset += step) {
-      merge_dynamic_block<Src, Unroll>(all, token_src, token_weights, dst, top_k, hidden_size, offset, vl);
+    for (; offset + vl <= hidden_size; offset += vl) {
+      merge_dynamic_block<Src>(all, token_src, token_weights, dst, top_k, hidden_size, offset);
     }
     for (; offset < hidden_size; offset += vl) {
       const svbool_t pg = svwhilelt_b32(offset, hidden_size);
-      merge_dynamic_block<Src, 1>(pg, token_src, token_weights, dst, top_k, hidden_size, offset, vl);
+      merge_dynamic_block<Src>(pg, token_src, token_weights, dst, top_k, hidden_size, offset);
     }
   }
 }
 
-template <typename Src, int Unroll>
+template <typename Src>
 void dispatch_top_k(const Src* route_output, const float* weights, uint16_t* output, int64_t token_begin,
                     int64_t token_end, int64_t top_k, int64_t hidden_size) {
   switch (top_k) {
     case 2:
-      merge_fixed_range<Src, 2, Unroll>(route_output, weights, output, token_begin, token_end, hidden_size);
+      merge_fixed_range<Src, 2>(route_output, weights, output, token_begin, token_end, hidden_size);
       return;
     case 4:
-      merge_fixed_range<Src, 4, Unroll>(route_output, weights, output, token_begin, token_end, hidden_size);
+      merge_fixed_range<Src, 4>(route_output, weights, output, token_begin, token_end, hidden_size);
       return;
     case 6:
-      merge_fixed_range<Src, 6, Unroll>(route_output, weights, output, token_begin, token_end, hidden_size);
+      merge_fixed_range<Src, 6>(route_output, weights, output, token_begin, token_end, hidden_size);
       return;
     case 8:
-      merge_fixed_range<Src, 8, Unroll>(route_output, weights, output, token_begin, token_end, hidden_size);
+      merge_fixed_range<Src, 8>(route_output, weights, output, token_begin, token_end, hidden_size);
       return;
     default:
-      merge_dynamic_range<Src, Unroll>(route_output, weights, output, token_begin, token_end, top_k, hidden_size);
+      merge_dynamic_range<Src>(route_output, weights, output, token_begin, token_end, top_k, hidden_size);
   }
 }
 
 template <typename Src>
 void dispatch(const Src* route_output, const float* weights, uint16_t* output, int64_t token_begin, int64_t token_end,
-              int64_t top_k, int64_t hidden_size, int unroll) {
+              int64_t top_k, int64_t hidden_size) {
   if (route_output == nullptr || weights == nullptr || output == nullptr) {
     throw std::invalid_argument("SVE route merge received a null pointer");
   }
@@ -206,19 +158,7 @@ void dispatch(const Src* route_output, const float* weights, uint16_t* output, i
   if (token_begin >= token_end) {
     return;
   }
-  switch (unroll) {
-    case 1:
-      dispatch_top_k<Src, 1>(route_output, weights, output, token_begin, token_end, top_k, hidden_size);
-      return;
-    case 2:
-      dispatch_top_k<Src, 2>(route_output, weights, output, token_begin, token_end, top_k, hidden_size);
-      return;
-    case 4:
-      dispatch_top_k<Src, 4>(route_output, weights, output, token_begin, token_end, top_k, hidden_size);
-      return;
-    default:
-      throw std::invalid_argument("SVE route merge unroll must be 1, 2, or 4");
-  }
+  dispatch_top_k<Src>(route_output, weights, output, token_begin, token_end, top_k, hidden_size);
 }
 
 #endif
@@ -234,9 +174,9 @@ bool sve_available() {
 }
 
 void merge_f32_sve(const float* route_output, const float* weights, uint16_t* output, int64_t token_begin,
-                   int64_t token_end, int64_t top_k, int64_t hidden_size, int unroll) {
+                   int64_t token_end, int64_t top_k, int64_t hidden_size) {
 #if defined(__aarch64__) && defined(__ARM_FEATURE_SVE)
-  dispatch(route_output, weights, output, token_begin, token_end, top_k, hidden_size, unroll);
+  dispatch(route_output, weights, output, token_begin, token_end, top_k, hidden_size);
 #else
   (void)route_output;
   (void)weights;
@@ -245,15 +185,14 @@ void merge_f32_sve(const float* route_output, const float* weights, uint16_t* ou
   (void)token_end;
   (void)top_k;
   (void)hidden_size;
-  (void)unroll;
   throw std::runtime_error("SVE route merge is unavailable in this build");
 #endif
 }
 
 void merge_bf16_sve(const uint16_t* route_output, const float* weights, uint16_t* output, int64_t token_begin,
-                    int64_t token_end, int64_t top_k, int64_t hidden_size, int unroll) {
+                    int64_t token_end, int64_t top_k, int64_t hidden_size) {
 #if defined(__aarch64__) && defined(__ARM_FEATURE_SVE)
-  dispatch(route_output, weights, output, token_begin, token_end, top_k, hidden_size, unroll);
+  dispatch(route_output, weights, output, token_begin, token_end, top_k, hidden_size);
 #else
   (void)route_output;
   (void)weights;
@@ -262,7 +201,6 @@ void merge_bf16_sve(const uint16_t* route_output, const float* weights, uint16_t
   (void)token_end;
   (void)top_k;
   (void)hidden_size;
-  (void)unroll;
   throw std::runtime_error("SVE route merge is unavailable in this build");
 #endif
 }

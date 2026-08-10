@@ -96,7 +96,6 @@ def configure_runtime(route_dtype: str) -> None:
     os.environ["FUSED_CPP_MOE_ASYNC_READY_TOKEN_PREFETCH"] = "1"
     os.environ["FUSED_CPP_MOE_SVE_W2_DIRECT_ROUTE"] = "1"
     os.environ["FUSED_CPP_MOE_W2_BF16_ROUTE"] = "1" if route_dtype == "bf16" else "0"
-    os.environ["FUSED_CPP_MOE_SVE_ROUTE_MERGE_UNROLL"] = "1"
     os.environ["FUSED_CPP_MOE_ASYNC_SHORT_POOL_THREADS"] = "0"
     os.environ["FUSED_CPP_MOE_STAGE_TIMING"] = "0"
     os.environ["FUSED_CPP_MOE_TRACE"] = "0"

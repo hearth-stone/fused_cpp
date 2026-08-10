@@ -5,8 +5,11 @@ XBYAK := $(ROOT)/3rdparty/xbyak_aarch64
 
 CXX ?= g++
 CXXFLAGS ?= -O2
+SVE_VECTOR_BITS ?= 128
 CXXFLAGS += -std=c++20 -pthread -Wall -Wextra -Werror \
-	-march=armv8.6-a+sve+bf16+i8mm -I$(FEATURES) -I$(I8GEMM) -I$(ROOT)/csrc
+	-march=armv8.6-a+sve+bf16+i8mm -msve-vector-bits=$(SVE_VECTOR_BITS) \
+	-DFUSED_CPP_MOE_SVE_VECTOR_BITS=$(SVE_VECTOR_BITS) \
+	-I$(FEATURES) -I$(I8GEMM) -I$(ROOT)/csrc
 LDFLAGS += -pthread
 
 TARGETS := bench_elastic_nsplit bench_unfused_pipeline bench_single_core_weight_window \

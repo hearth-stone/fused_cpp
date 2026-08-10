@@ -133,7 +133,6 @@ def main() -> int:
     topk_weights = torch.softmax(torch.randn((args.tokens, args.top_k), generator=generator), dim=-1)
 
     os.environ["FUSED_CPP_MOE_SVE"] = "1"
-    os.environ["FUSED_CPP_MOE_SVE_ROUTE_MERGE_UNROLL"] = "1"
     os.environ["FUSED_CPP_MOE_PIN_THREADS"] = "1"
     os.environ["FUSED_CPP_MOE_PIN_THREAD_CPUS"] = ",".join(str(cpu) for cpu in affinity[: args.threads])
     packed = prepare_fused_moe_bf16_tiled_weights(w13, w2, fuse_silu=True)

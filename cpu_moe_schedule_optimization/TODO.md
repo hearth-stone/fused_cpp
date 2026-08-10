@@ -301,15 +301,15 @@ bytes, not predicted DRAM traffic.
   for short-token calls. The same epilogue should optionally fold routed scaling,
   shared-output addition, and residual addition without changing FP32
   accumulation semantics.
-  - 2026-07-16 experiment: `FUSED_CPP_MOE_SVE_ROUTE_MERGE_UNROLL` provides
-    U1/U2/U4 SVE variants. `top_k=2/4/6/8` uses compile-time adjacent binary
-    trees; other values use a one-token-row ordered runtime-loop fallback. The
-    legacy `FUSED_CPP_MOE_SVE_ROUTE_MERGE_TREE_UNROLL` name remains an alias.
+  - 2026-07-16 experiment: the SVE route merge tested U1/U2/U4 variants.
+    `top_k=2/4/6/8` uses compile-time adjacent binary
+    trees; other values use a one-token-row ordered runtime-loop fallback.
     On the 192-core host NUMA0, isolated BF16-route gains were 11-24% across
     top-k 2-8, while FP32 route regressed for top-k 7-8. Preplanned async E2E
     gains remained at or below 1.04%. U1 is now the SVE default to eliminate the
-    per-worker FP32 allocation and accumulator traffic; explicit value `0`
-    retains the sequential compatibility path, while U2/U4 remain experimental.
+    per-worker FP32 allocation and accumulator traffic. On 2026-08-10 the
+    sequential/U2/U4 source and runtime selector were retired after the
+    production decision; the last comparison implementation is in `7fc10fc`.
     An ordered fixed-top-k policy, short-token 2-D partitioning, model-level
     precision validation, and the additional folded epilogues above remain open.
 - [x] Prototype a precision-neutral W2 FP32 direct-route-store epilogue. Pass the

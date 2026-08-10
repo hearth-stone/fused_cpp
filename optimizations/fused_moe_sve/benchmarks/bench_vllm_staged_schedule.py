@@ -798,7 +798,6 @@ def main() -> int:
     os.environ["FUSED_CPP_MOE_ASYNC_READY_TOKEN_MERGE"] = "1" if ready_token_merge else "0"
     os.environ["FUSED_CPP_MOE_SVE_W2_DIRECT_ROUTE"] = "1"
     os.environ["FUSED_CPP_MOE_W2_BF16_ROUTE"] = "1" if args.route_dtype == "bf16" else "0"
-    os.environ["FUSED_CPP_MOE_SVE_ROUTE_MERGE_UNROLL"] = "1"
     os.environ["FUSED_CPP_MOE_ASYNC_SHORT_POOL_THREADS"] = "0"
     os.environ["FUSED_CPP_MOE_ASYNC_SHORT_POOL_MAX_ROWS"] = str(args.static_long_route_threshold)
     os.environ["FUSED_CPP_MOE_STAGE_TIMING"] = "0"
@@ -988,7 +987,6 @@ def main() -> int:
             if ready_token_policy_variants
             else None,
             "direct_route_store": True,
-            "route_merge_unroll": 1,
             "planner": planner_metadata,
             "static_16_to_4": static_metadata,
             "dynamic_short_pool": {

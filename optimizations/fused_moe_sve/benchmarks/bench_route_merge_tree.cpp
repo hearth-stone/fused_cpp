@@ -97,9 +97,8 @@ Config parse_args(int argc, char** argv) {
   if (config.source != "f32" && config.source != "bf16" && config.source != "both") {
     throw std::invalid_argument("source must be f32, bf16, or both");
   }
-  if (config.variant != "all" && config.variant != "baseline" && config.variant != "u1" &&
-      config.variant != "u2" && config.variant != "u4") {
-    throw std::invalid_argument("variant must be all, baseline, u1, u2, or u4");
+  if (config.variant != "all" && config.variant != "baseline" && config.variant != "u1") {
+    throw std::invalid_argument("variant must be all, baseline, or u1");
   }
   if (config.stop_before_run && config.source == "both") {
     throw std::invalid_argument("--stop-before-run requires one source dtype");
@@ -339,15 +338,11 @@ void run_source(const Config& config, const std::vector<Src>& route, const std::
 
   std::vector<int> variants;
   if (config.variant == "all") {
-    variants = {0, 1, 2, 4};
+    variants = {0, 1};
   } else if (config.variant == "baseline") {
     variants = {0};
-  } else if (config.variant == "u1") {
-    variants = {1};
-  } else if (config.variant == "u2") {
-    variants = {2};
   } else {
-    variants = {4};
+    variants = {1};
   }
   double baseline_ms = 0.0;
   int64_t iteration = 0;
@@ -363,10 +358,10 @@ void run_source(const Config& config, const std::vector<Src>& route, const std::
         merge_sequential(route_ptr, weights.data(), output_ptr, begin, end, config.top_k, config.hidden);
       } else if constexpr (std::is_same_v<Src, float>) {
         fused_cpp::moe_route_merge::merge_f32_sve(route_ptr, weights.data(), output_ptr, begin, end, config.top_k,
-                                                  config.hidden, variant);
+                                                  config.hidden);
       } else {
         fused_cpp::moe_route_merge::merge_bf16_sve(route_ptr, weights.data(), output_ptr, begin, end, config.top_k,
-                                                   config.hidden, variant);
+                                                   config.hidden);
       }
     };
     auto run_once = [&]() {

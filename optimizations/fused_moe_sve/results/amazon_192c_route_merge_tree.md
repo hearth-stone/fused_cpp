@@ -361,6 +361,13 @@ reason.
 The fixed TopK 2/4/6/8 templates use adjacent tree association, so arbitrary
 inputs may differ from the old sequential-FMA path within the existing BF16
 output tolerance. Other TopK values retain ordered runtime accumulation.
-Setting `FUSED_CPP_MOE_SVE_ROUTE_MERGE_UNROLL=0` restores the old accumulator
-path; non-SVE backends continue to select it automatically. Cached narrowing
-`ST1H` remains the output store.
+Non-SVE backends continue to use their scalar accumulator path. Cached
+narrowing `ST1H` remains the output store.
+
+## Lifecycle
+
+On 2026-08-10 the production SVE implementation was narrowed to U1. The
+sequential SVE compatibility path, U2/U4 template bodies, runtime selector,
+and E2E selector benchmark were removed from the active tree. This report
+retains their measurements and reproduction commands as historical evidence;
+checkout Git commit `7fc10fc` to reproduce the retired variants.

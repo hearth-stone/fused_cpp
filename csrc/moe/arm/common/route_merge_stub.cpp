@@ -8,11 +8,11 @@ namespace fused_cpp::moe_route_merge {
 
 bool sve_available() { return false; }
 
-void merge_f32_sve(const float*, const float*, uint16_t*, int64_t, int64_t, int64_t, int64_t, int) {
+void merge_f32_sve(const float*, const float*, uint16_t*, int64_t, int64_t, int64_t, int64_t) {
   throw std::runtime_error("SVE route merge is unavailable in this build");
 }
 
-void merge_bf16_sve(const uint16_t*, const float*, uint16_t*, int64_t, int64_t, int64_t, int64_t, int) {
+void merge_bf16_sve(const uint16_t*, const float*, uint16_t*, int64_t, int64_t, int64_t, int64_t) {
   throw std::runtime_error("SVE route merge is unavailable in this build");
 }
 

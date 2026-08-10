@@ -120,7 +120,6 @@ def test_vllm_staged_matches_fused_sve_with_multiple_n_tasks(
     monkeypatch.setenv("FUSED_CPP_MOE_SVE", "1")
     monkeypatch.setenv("FUSED_CPP_MOE_SVE_W2_DIRECT_ROUTE", "1")
     monkeypatch.setenv("FUSED_CPP_MOE_W2_BF16_ROUTE", "1" if use_bf16_route else "0")
-    monkeypatch.setenv("FUSED_CPP_MOE_SVE_ROUTE_MERGE_UNROLL", "1")
     generator = torch.Generator().manual_seed(20260717)
     num_tokens, hidden_size, intermediate_size = 29, 128, 64
     num_experts, top_k, num_threads = 8, 6, 12
@@ -868,13 +867,13 @@ def test_sve_xbyak_service_probe_traverses_full_m12_panels() -> None:
 @pytest.mark.parametrize("bridge", ["normal", "scheduled", "async"])
 @pytest.mark.parametrize("w2_bf16_route", [False, True])
 @pytest.mark.parametrize("top_k", [2, 4, 5, 6, 8], ids=["fixed2", "fixed4", "dynamic5", "fixed6", "fixed8"])
-def test_sve_route_merge_matches_sequential(
+def test_sve_route_merge_matches_reference(
     monkeypatch: pytest.MonkeyPatch,
     bridge: str,
     w2_bf16_route: bool,
     top_k: int,
 ) -> None:
-    """Cover fixed trees, dynamic fallback, H-unroll variants, and the U1 default."""
+    """Cover the production fixed trees and dynamic TopK fallback."""
     monkeypatch.setenv("FUSED_CPP_MOE_SVE", "1")
     monkeypatch.setenv("FUSED_CPP_MOE_W2_BF16_ROUTE", "1" if w2_bf16_route else "0")
     generator = torch.Generator().manual_seed(20260716)
@@ -956,40 +955,21 @@ def test_sve_route_merge_matches_sequential(
                 num_threads=threads,
             )
 
-    merge_flag = "FUSED_CPP_MOE_SVE_ROUTE_MERGE_UNROLL"
-    legacy_merge_flag = "FUSED_CPP_MOE_SVE_ROUTE_MERGE_TREE_UNROLL"
-    monkeypatch.setenv(merge_flag, "0")
-    reference = run().float()
-    candidates: dict[int, torch.Tensor] = {}
-    for unroll in (1, 2, 4):
-        monkeypatch.setenv(merge_flag, str(unroll))
-        candidate = run().float()
-        candidates[unroll] = candidate
-        atol = 1.0e-5 if top_k in (2, 4, 6, 8) else 0.0
-        rtol = 2.0e-2 if top_k in (2, 4, 6, 8) else 0.0
-        torch.testing.assert_close(
-            candidate,
-            reference,
-            atol=atol,
-            rtol=rtol,
-            msg=lambda message, unroll=unroll: (
-                f"{bridge}/top_k={top_k}/bf16_route={w2_bf16_route}/sve_u{unroll}: {message}"
-            ),
-        )
-    monkeypatch.delenv(merge_flag)
-    monkeypatch.delenv(legacy_merge_flag, raising=False)
-    default = run().float()
+    reference = fused_moe_naive(
+        hidden_states.float(),
+        w13_weight.float(),
+        w2_weight.float(),
+        topk_weights,
+        topk_ids,
+    ).to(torch.bfloat16)
+    candidate = run()
     torch.testing.assert_close(
-        default,
-        candidates[1],
-        atol=0.0,
-        rtol=0.0,
-        msg=lambda message: f"{bridge}/top_k={top_k}/bf16_route={w2_bf16_route}/default_u1: {message}",
+        candidate.float(),
+        reference.float(),
+        atol=7.0e-2,
+        rtol=7.0e-2,
+        msg=lambda message: f"{bridge}/top_k={top_k}/bf16_route={w2_bf16_route}: {message}",
     )
-    if bridge == "normal" and not w2_bf16_route and top_k == 6:
-        monkeypatch.setenv(legacy_merge_flag, "1")
-        legacy_alias = run().float()
-        torch.testing.assert_close(legacy_alias, reference, atol=1.0e-5, rtol=2.0e-2)
 
 
 @pytest.mark.parametrize("bridge", ["normal", "scheduled", "async"])
@@ -1005,7 +985,6 @@ def test_sve_w2_direct_route_store_matches_scatter(
     """Cover interleaved route IDs, every M tail, and multi-thread N ownership."""
     monkeypatch.setenv("FUSED_CPP_MOE_SVE", "1")
     monkeypatch.setenv("FUSED_CPP_MOE_W2_BF16_ROUTE", "1" if w2_bf16_route else "0")
-    monkeypatch.setenv("FUSED_CPP_MOE_SVE_ROUTE_MERGE_UNROLL", "0")
     monkeypatch.setenv("FUSED_CPP_MOE_FUSED_2D_SPLIT", "1" if split_2d else "0")
     generator = torch.Generator().manual_seed(20260716)
     hidden_size = 64
@@ -1226,7 +1205,6 @@ def test_async_ready_token_merge_overlaps_imbalanced_experts(
     monkeypatch.setenv("FUSED_CPP_MOE_SVE", "1")
     monkeypatch.setenv("FUSED_CPP_MOE_W2_BF16_ROUTE", "1" if w2_bf16_route else "0")
     monkeypatch.setenv("FUSED_CPP_MOE_SVE_W2_DIRECT_ROUTE", "1")
-    monkeypatch.setenv("FUSED_CPP_MOE_SVE_ROUTE_MERGE_UNROLL", "1")
     monkeypatch.setenv("FUSED_CPP_MOE_FUSED_2D_SPLIT", "0")
 
     generator = torch.Generator().manual_seed(20260716)
@@ -1467,9 +1445,7 @@ def test_fused_moe_bf16_tiled_skip_weighted_matches_unit_weighted(monkeypatch: p
         w2_bias=w2_bias,
         num_threads=1,
     )
-    # The top-k=1 direct-scatter path must bypass route-merge dispatch even
-    # when an experimental SVE merge variant is requested.
-    monkeypatch.setenv("FUSED_CPP_MOE_SVE_ROUTE_MERGE_UNROLL", "4")
+    # The top-k=1 direct-scatter path bypasses route merge entirely.
 
     out_a = fused_moe_bf16_tiled(
         hidden_states,

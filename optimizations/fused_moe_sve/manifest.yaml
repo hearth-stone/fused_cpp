@@ -953,9 +953,9 @@ features:
       Compile-time adjacent binary trees for top-k 2/4/6/8 and an ordered
       runtime-loop fallback for other values remove the thread-local FP32
       accumulator's repeated L1 load/store traffic without reducing
-      compulsory route reads or output writes. Keeping 1, 2, or 4
-      independent hidden-axis vectors exposes latency-hiding choices without
-      changing the token-major route layout or final BF16 output contract.
+      compulsory route reads or output writes. The retained U1 loop processes
+      one SVE vector at a time; retired U2/U4 latency-hiding variants did not
+      improve full-operator performance consistently.
     depends_on: []
     conflicts_with: []
     correctness: >-
@@ -966,7 +966,7 @@ features:
       --tokens 5 --top-k $top_k --hidden 103 --threads 4
       --source both --check || exit 1; done &&
       pytest -q tests/test_fused_moe_bf16_tiled.py
-      -k sve_route_merge_matches_sequential
+      -k sve_route_merge_matches_reference
     benchmark: >-
       numactl --cpunodebind=0 --membind=0 taskset -c 0-95
       optimizations/fused_moe_sve/benchmarks/bench_route_merge_tree
@@ -975,12 +975,7 @@ features:
       numactl --cpunodebind=0 --membind=0 taskset -c 0-95
       optimizations/fused_moe_sve/benchmarks/bench_route_merge_tree
       --tokens 2048 --top-k 6 --hidden 4096 --threads 96
-      --copies 8 --source both --warmup 8 --runs 11 &&
-      numactl --cpunodebind=0 --membind=0 taskset -c 0-95
-      .venv/bin/python
-      optimizations/fused_moe_sve/benchmarks/bench_route_merge_e2e.py
-      --path async --tokens 2048 --hidden 4096 --intermediate 512
-      --experts 8 --top-k 6 --threads 96 --warmup 5 --runs 31
+      --copies 8 --source both --warmup 8 --runs 11
 
   - id: measurement.single_core_unique_weight_window
     part: measurement
@@ -1352,17 +1347,16 @@ variants:
 
   - id: sve_route_merge_sequential
     features: []
-    entrypoint: >-
-      FUSED_CPP_MOE_SVE_ROUTE_MERGE_UNROLL=0
-      fused_moe_bf16_tiled_{sync,scheduled,async}
-    status: reference
+    entrypoint: Removed from the active tree; retained in Git history 7fc10fc.
+    status: retired
+    history: 7fc10fc
 
   - id: sve_route_merge_u1
     features:
       - merge.sve_weighted_reduce
     entrypoint: >-
       fused_moe_bf16_tiled_{sync,scheduled,async}
-      (SVE default; FUSED_CPP_MOE_SVE_ROUTE_MERGE_UNROLL=1 is equivalent)
+      (the only SVE weighted-route merge implementation)
     status: enabled
 
   - id: sve_async_ready_token_merge
@@ -1383,18 +1377,16 @@ variants:
   - id: sve_route_merge_u2
     features:
       - merge.sve_weighted_reduce
-    entrypoint: >-
-      FUSED_CPP_MOE_SVE_ROUTE_MERGE_UNROLL=2
-      fused_moe_bf16_tiled_{sync,scheduled,async}
-    status: experimental
+    entrypoint: Removed from the active tree; retained in Git history 7fc10fc.
+    status: retired
+    history: 7fc10fc
 
   - id: sve_route_merge_u4
     features:
       - merge.sve_weighted_reduce
-    entrypoint: >-
-      FUSED_CPP_MOE_SVE_ROUTE_MERGE_UNROLL=4
-      fused_moe_bf16_tiled_{sync,scheduled,async}
-    status: experimental
+    entrypoint: Removed from the active tree; retained in Git history 7fc10fc.
+    status: retired
+    history: 7fc10fc
 
   - id: sve_explicit_unfused_expert
     features:

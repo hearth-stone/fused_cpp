@@ -167,7 +167,6 @@ def main() -> int:
     os.environ["FUSED_CPP_MOE_SVE"] = "1"
     os.environ["FUSED_CPP_MOE_W2_BF16_ROUTE"] = "0"
     os.environ["FUSED_CPP_MOE_SVE_W2_DIRECT_ROUTE"] = "1"
-    os.environ["FUSED_CPP_MOE_SVE_ROUTE_MERGE_UNROLL"] = "1"
     os.environ["FUSED_CPP_MOE_TRACE"] = "0"
     packed = prepare_fused_moe_bf16_tiled_weights(w13, w2, fuse_silu=True)
     if packed.gemm_backend != 1:

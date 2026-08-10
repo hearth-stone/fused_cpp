@@ -133,26 +133,18 @@ token-major `[tokens, top_k, hidden]` route buffer. Fixed `top_k=2/4/6/8`
 dispatches to compile-time templates. Template recursion first forms adjacent
 weighted pairs and then a power-of-two-prefix binary tree; for example,
 top-k=6 is `((0+1)+(2+3))+(4+5)`. Other positive values use a runtime slot
-loop that retains one token row's accumulator vectors in SVE registers and
-preserves slot order. U1, U2, and U4 process one, two, or four independent
-hidden-axis vectors per loop. The existing `top_k=1, skip_weighted=true` path
+loop that retains one token row's accumulator vector in an SVE register and
+preserves slot order. The existing `top_k=1, skip_weighted=true` path
 still writes the W2 result directly during scatter and bypasses merge entirely.
 
-The SVE backend defaults to U1, which keeps the accumulator in SVE registers
-and writes BF16 directly without allocating a thread-local FP32 row. Select a
-different unroll, or restore the sequential accumulator explicitly, with:
-
-```bash
-FUSED_CPP_MOE_SVE_ROUTE_MERGE_UNROLL=0  # sequential compatibility path
-FUSED_CPP_MOE_SVE_ROUTE_MERGE_UNROLL=2  # or 1 / 4
-```
-
-`FUSED_CPP_MOE_SVE_ROUTE_MERGE_TREE_UNROLL` remains a compatibility alias when
-the new variable is unset. Fixed templates change FP32 association relative to
-the sequential baseline; the dynamic fallback does not. The standalone
-benchmark checks both policies against exact scalar references for FP32 and
-BF16 route buffers. The E2E benchmark uses a preplanned async schedule by
-default, avoiding planner time in the measured operator:
+The SVE backend uses the former U1 implementation exclusively. It keeps the
+accumulator in SVE registers and writes BF16 directly without allocating a
+thread-local FP32 row. The sequential accumulator and U2/U4 variants were
+retired after showing no consistent full-operator advantage; their source is
+available in Git history at `7fc10fc`. Fixed templates change FP32 association
+relative to the historical sequential baseline; the dynamic fallback does not.
+The standalone benchmark checks the production kernel against scalar
+references for FP32 and BF16 route buffers:
 
 ```bash
 numactl --cpunodebind=0 --membind=0 taskset -c 0-95 \
@@ -165,12 +157,6 @@ numactl --cpunodebind=0 --membind=0 taskset -c 0-95 \
   optimizations/fused_moe_sve/benchmarks/bench_route_merge_tree \
   --tokens 2048 --top-k 6 --hidden 4096 --threads 96 --copies 8 \
   --source both --warmup 8 --runs 31 --check
-
-numactl --cpunodebind=0 --membind=0 taskset -c 0-95 \
-  .venv/bin/python \
-  optimizations/fused_moe_sve/benchmarks/bench_route_merge_e2e.py \
-  --path async --tokens 2048 --hidden 4096 --intermediate 512 \
-  --experts 8 --top-k 6 --threads 96 --warmup 5 --runs 31
 ```
 
 The 192-core-host NUMA0 measurements are recorded in
