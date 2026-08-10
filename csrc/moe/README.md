@@ -52,10 +52,10 @@ The M1-M8 generated K loop uses the static M2/M4/M8 two-bank load/compute state
 machine. M9-M12 use the static M12 register-reuse schedule because the larger
 accumulator set cannot coexist with two complete A/B banks.
 
-The standalone `Operation::kGemmF32` surface has no fused epilogue and never
-enables the experimental M1/M2 dual-N path. Its M1/M2/M4/M8/M12 instruction
-schedules are compared directly, in the same process and with the same packed
-A/B buffers, against `refs/i8gemm/lib/bf16gemm_sve.S`:
+The standalone `Operation::kGemmF32` surface has no fused epilogue. Its
+M1/M2/M4/M8/M12 instruction schedules are compared directly, in the same
+process and with the same packed A/B buffers, against
+`refs/i8gemm/lib/bf16gemm_sve.S`:
 
 ```bash
 taskset -c 0 optimizations/fused_moe_sve/benchmarks/run_jit_vs_i8mm_pure_gemm.sh \

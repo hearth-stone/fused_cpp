@@ -33,11 +33,6 @@ struct alignas(64) SiluConstants {
 
 const SiluConstants kSiluConstants;
 
-bool m2_dual_n_enabled() {
-  const char* value = std::getenv("FUSED_CPP_MOE_SVE_JIT_M2_DUAL_N");
-  return value != nullptr && value[0] != '\0' && value[0] != '0';
-}
-
 }  // namespace
 
 ImplementationMode implementation_mode() {
@@ -108,13 +103,12 @@ struct KernelKey {
   Operation operation = Operation::kW13;
   uint8_t rows = 0;
   uint8_t degree = 0;
-  bool dual_n = false;
   ProbeMode probe_mode = ProbeMode::kNone;
 };
 
 class SveFusedGenerator final : public CodeGenerator {
  public:
-  SveFusedGenerator(Operation operation, int rows, int degree, bool dual_n, ProbeMode probe_mode)
+  SveFusedGenerator(Operation operation, int rows, int degree, ProbeMode probe_mode)
       : CodeGenerator(64 * 1024, AutoGrow),
         operation_(operation),
         rows_(rows),
@@ -122,16 +116,12 @@ class SveFusedGenerator final : public CodeGenerator {
         row_pairs_((rows + 1) / 2),
         accumulator_base_(rows <= 8 ? 16 : 8),
         physical_rows_(rows <= 8 ? 8 : 12),
-        dual_n_(dual_n),
         probe_mode_(probe_mode) {
     if (rows_ < 1 || rows_ > 12) {
       throw std::invalid_argument("SVE JIT rows must be in [1, 12]");
     }
-    if (dual_n_ && rows_ > 2) {
-      throw std::invalid_argument("SVE JIT dual-N is only valid for M1/M2 kernels");
-    }
     if (probe_mode_ != ProbeMode::kNone) {
-      if (operation_ != Operation::kGemmF32 || !probe_rows_supported(rows_, probe_mode_) || dual_n_) {
+      if (operation_ != Operation::kGemmF32 || !probe_rows_supported(rows_, probe_mode_)) {
         throw std::invalid_argument("SVE JIT probe mode is incompatible with the requested GEMM kernel");
       }
     }
@@ -155,8 +145,6 @@ class SveFusedGenerator final : public CodeGenerator {
   static constexpr int kParamNBegin = 32;
 
   ZRegS accumulator(int pair, int column) const { return ZRegS(accumulator_base_ + pair * 4 + column); }
-  ZRegS dual_n_accumulator(int column) const { return ZRegS(20 + column); }
-
   void dump_if_requested() const {
     const char* directory = std::getenv("FUSED_CPP_MOE_SVE_JIT_DUMP_DIR");
     if (directory == nullptr || directory[0] == '\0') {
@@ -191,8 +179,8 @@ class SveFusedGenerator final : public CodeGenerator {
         break;
     }
     char path[512];
-    const int written = std::snprintf(path, sizeof(path), "%s/moe_sve_%s_m%d_d%d%s%s.bin", directory, operation,
-                                      rows_, degree_, dual_n_ ? "_dual_n" : "", probe);
+    const int written = std::snprintf(path, sizeof(path), "%s/moe_sve_%s_m%d_d%d%s.bin", directory, operation, rows_,
+                                      degree_, probe);
     if (written <= 0 || static_cast<size_t>(written) >= sizeof(path)) {
       return;
     }
@@ -278,59 +266,6 @@ class SveFusedGenerator final : public CodeGenerator {
     L(tail_next);
     compute_pairs(0, row_pairs_, kNextABase, kNextBBase);
     L(k_done);
-  }
-
-  void load_dual_n_ab(int a_register, int first_b_register, int second_b_register) {
-    for (int column = 0; column < 4; ++column) {
-      ld1h(ZRegH(first_b_register + column), p0 / T_z, ptr(x14, column, MUL_VL));
-      ld1h(ZRegH(second_b_register + column), p0 / T_z, ptr(x18, column, MUL_VL));
-    }
-    add(x14, x14, x9, LSL, 2);
-    add(x18, x18, x9, LSL, 2);
-    ld1rqh(ZRegH(a_register), p0 / T_z, ptr(x13));
-    add(x13, x13, physical_rows_ * 8);
-  }
-
-  void compute_dual_n(int a_register, int first_b_register, int second_b_register) {
-    for (int column = 0; column < 4; ++column) {
-      bfmmla(accumulator(0, column), ZRegH(a_register), ZRegH(first_b_register + column));
-      bfmmla(dual_n_accumulator(column), ZRegH(a_register), ZRegH(second_b_register + column));
-    }
-  }
-
-  void emit_dual_n_k_loop() {
-    constexpr int kCurrentA = 0;
-    constexpr int kCurrentFirstB = 1;
-    constexpr int kCurrentSecondB = 5;
-    constexpr int kNextA = 9;
-    constexpr int kNextFirstB = 10;
-    constexpr int kNextSecondB = 24;
-    Label k_loop;
-    Label tail_current;
-    Label tail_next;
-    Label done;
-
-    load_dual_n_ab(kCurrentA, kCurrentFirstB, kCurrentSecondB);
-    subs(w15, w15, 4);
-    b(EQ, tail_current);
-
-    L(k_loop);
-    load_dual_n_ab(kNextA, kNextFirstB, kNextSecondB);
-    compute_dual_n(kCurrentA, kCurrentFirstB, kCurrentSecondB);
-    subs(w15, w15, 4);
-    b(EQ, tail_next);
-    load_dual_n_ab(kCurrentA, kCurrentFirstB, kCurrentSecondB);
-    compute_dual_n(kNextA, kNextFirstB, kNextSecondB);
-    subs(w15, w15, 4);
-    b(GT, k_loop);
-
-    L(tail_current);
-    compute_dual_n(kCurrentA, kCurrentFirstB, kCurrentSecondB);
-    b(done);
-
-    L(tail_next);
-    compute_dual_n(kNextA, kNextFirstB, kNextSecondB);
-    L(done);
   }
 
   void emit_m12_k4() {
@@ -695,17 +630,6 @@ class SveFusedGenerator final : public CodeGenerator {
     st1h(z0.s, predicate, ptr(x13, z5.s, SXTW));
   }
 
-  void store_w13_dual_n() {
-    build_packc_offsets();
-    load_small_silu_constants();
-    store_w13_small_pair_cached(0);
-    add(x7, x7, x17);
-    for (int column = 0; column < 4; ++column) {
-      mov(ZRegD(accumulator(0, column).getIdx()), ZRegD(dual_n_accumulator(column).getIdx()));
-    }
-    store_w13_small_pair_cached(0);
-  }
-
   void store_w13() {
     build_packc_offsets();
     if (physical_rows_ == 12) {
@@ -756,41 +680,10 @@ class SveFusedGenerator final : public CodeGenerator {
     ptrue(p1.s);
 
     Label n_loop;
-    Label single_n;
     Label done;
     L(n_loop);
     cmp(x12, 0);
     b(LE, done);
-    if (dual_n_) {
-      cmp(w5, 1024);
-      b(LT, single_n);
-      cmp(x12, 2 * kNTile);
-      b(LT, single_n);
-      for (int column = 0; column < 4; ++column) {
-        mov(accumulator(0, column), 0);
-        mov(dual_n_accumulator(column), 0);
-      }
-      mov(x13, x0);
-      mov(x14, x6);
-      add(x18, x6, x11);
-      mov(w15, w5);
-      emit_dual_n_k_loop();
-      if (operation_ == Operation::kW13) {
-        store_w13_dual_n();
-      } else {
-        store_w2();
-        for (int column = 0; column < 4; ++column) {
-          mov(ZRegD(accumulator(0, column).getIdx()), ZRegD(dual_n_accumulator(column).getIdx()));
-        }
-        add(x7, x7, x17);
-        store_w2();
-      }
-      add(x6, x6, x11, LSL, 1);
-      add(x7, x7, x17);
-      sub(x12, x12, 2 * kNTile);
-      b(n_loop);
-      L(single_n);
-    }
     for (int pair = 0; pair < row_pairs_; ++pair) {
       for (int column = 0; column < 4; ++column) {
         mov(accumulator(pair, column), 0);
@@ -833,7 +726,6 @@ class SveFusedGenerator final : public CodeGenerator {
   int row_pairs_;
   int accumulator_base_;
   int physical_rows_;
-  bool dual_n_;
   ProbeMode probe_mode_;
 };
 
@@ -846,8 +738,7 @@ struct KernelHandle {
 KernelHandle create_kernel(const KernelKey& key) {
   KernelHandle handle;
   try {
-    handle.owner =
-        std::make_shared<SveFusedGenerator>(key.operation, key.rows, key.degree, key.dual_n, key.probe_mode);
+    handle.owner = std::make_shared<SveFusedGenerator>(key.operation, key.rows, key.degree, key.probe_mode);
     handle.function = handle.owner->function();
   } catch (const std::exception& exception) {
     handle.error = exception.what();
@@ -865,7 +756,6 @@ struct KernelCacheSlot {
 constexpr size_t kOperationCount = 4;
 constexpr size_t kRowCount = 12;
 constexpr size_t kDegreeCount = 3;
-constexpr size_t kDualNCount = 2;
 constexpr size_t kProbeModeCount = 4;
 
 size_t operation_index(Operation operation) { return static_cast<size_t>(operation); }
@@ -890,14 +780,13 @@ size_t probe_index(ProbeMode mode) {
 
 KernelHandle& cached_kernel(const KernelKey& key) {
   using ProbeCache = std::array<KernelCacheSlot, kProbeModeCount>;
-  using DualNCache = std::array<ProbeCache, kDualNCount>;
-  using DegreeCache = std::array<DualNCache, kDegreeCount>;
+  using DegreeCache = std::array<ProbeCache, kDegreeCount>;
   using RowCache = std::array<DegreeCache, kRowCount>;
   using OperationCache = std::array<RowCache, kOperationCount>;
   static OperationCache cache;
   KernelCacheSlot& slot =
       cache[operation_index(key.operation)][static_cast<size_t>(key.rows - 1)][degree_index(key.operation, key.degree)]
-           [key.dual_n ? 1 : 0][probe_index(key.probe_mode)];
+           [probe_index(key.probe_mode)];
   std::call_once(slot.once, [&slot, &key]() { slot.handle = create_kernel(key); });
   return slot.handle;
 }
@@ -919,11 +808,7 @@ KernelFn get_kernel(Operation operation, int rows, int degree, std::string* erro
     }
     return nullptr;
   }
-  const KernelKey key{operation,
-                      static_cast<uint8_t>(rows),
-                      static_cast<uint8_t>(degree),
-                      operation != Operation::kGemmF32 && rows <= 2 && m2_dual_n_enabled(),
-                      ProbeMode::kNone};
+  const KernelKey key{operation, static_cast<uint8_t>(rows), static_cast<uint8_t>(degree), ProbeMode::kNone};
   KernelHandle& handle = cached_kernel(key);
   if (error != nullptr) {
     *error = handle.error;
@@ -938,7 +823,7 @@ KernelFn get_probe_kernel(int rows, ProbeMode mode, std::string* error) {
     }
     return nullptr;
   }
-  const KernelKey key{Operation::kGemmF32, static_cast<uint8_t>(rows), 0, false, mode};
+  const KernelKey key{Operation::kGemmF32, static_cast<uint8_t>(rows), 0, mode};
   KernelHandle& handle = cached_kernel(key);
   if (error != nullptr) {
     *error = handle.error;

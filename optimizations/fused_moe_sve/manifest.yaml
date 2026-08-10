@@ -180,8 +180,9 @@ features:
 
   - id: compute.xbyak_m2_dual_n
     part: compute
-    status: experimental
-    implementation: csrc/moe/arm/sve_bf16/jit_kernels.cpp
+    status: retired
+    implementation: Removed from the active tree; retained in Git history.
+    history: f671f7e
     hypothesis: >-
       Computing two adjacent N tiles in one M1/M2 K loop shares the packed-A
       load and loop control. Restricting the path to K>=1024 avoids the
@@ -193,17 +194,17 @@ features:
       - compute.xbyak_exact_m
       - compute.xbyak_double_buffer_kloop
     conflicts_with: []
-    correctness: >-
-      FUSED_CPP_MOE_SVE_JIT_M2_DUAL_N=1 PYTHONPATH=src
-      .venv/bin/python -m pytest -q
-      tests/test_fused_moe_bf16_tiled.py::test_sve_xbyak_exact_m_matches_static_asm
-    benchmark: >-
-      numactl --cpunodebind=0 --membind=0 taskset -c 0-95
-      .venv/bin/python
-      optimizations/fused_moe_sve/benchmarks/bench_xbyak_exact_m.py
-      --variants jit,jit-dual-n --routes 1,2 --threads 1
-      --experts 192 --measurement-experts 96 --experts-per-wave 8
-      --warmup 4 --runs 31 --switch-period 1
+    correctness: historical; restore history commit f671f7e to reproduce
+    benchmark: historical; restore history commit f671f7e to reproduce
+    result: >-
+      Retired on 2026-08-10. It improved 8-way M1/M2 waves by about 2.3
+      percent, but regressed 24-way waves by 5.4-5.7 percent and 96-way M2 by
+      5.0 percent because lane-time variance was amplified at wave barriers.
+      A safe selector would require planner-visible concurrency and barrier
+      topology, so the environment flag, generated two-N state machine, cache
+      dimension, test branch, and benchmark selector no longer justify active
+      maintenance. Full evidence remains in
+      results/amazon_192c_xbyak_m2_dual_n.md.
 
   - id: compute.small_m_gemm_bandwidth_probes
     part: compute

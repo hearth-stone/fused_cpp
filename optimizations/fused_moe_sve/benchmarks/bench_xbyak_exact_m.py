@@ -25,9 +25,8 @@ from fused_cpp.moe import (  # noqa: E402
 
 
 VARIANT_ENV = {
-    "asm": ("asm", "0"),
-    "jit": ("jit", "0"),
-    "jit-dual-n": ("jit", "1"),
+    "asm": "asm",
+    "jit": "jit",
 }
 
 
@@ -51,9 +50,7 @@ def parse_variant_list(value: str) -> tuple[str, ...]:
 
 
 def select_variant(variant: str) -> None:
-    implementation, dual_n = VARIANT_ENV[variant]
-    os.environ["FUSED_CPP_MOE_SVE_IMPL"] = implementation
-    os.environ["FUSED_CPP_MOE_SVE_JIT_M2_DUAL_N"] = dual_n
+    os.environ["FUSED_CPP_MOE_SVE_IMPL"] = VARIANT_ENV[variant]
 
 
 def parse_args() -> argparse.Namespace:
@@ -75,7 +72,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--variants",
         default="asm,jit",
-        help="comma-separated subset of asm,jit,jit-dual-n; first variant is the timing baseline",
+        help="comma-separated subset of asm,jit; first variant is the timing baseline",
     )
     parser.add_argument(
         "--switch-period",

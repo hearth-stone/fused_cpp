@@ -76,6 +76,13 @@ the implementation remains available at Git commit `3faf244`. Corrected
 paired-window results are in
 [`results/amazon_192c_xbyak_bulk_m.md`](results/amazon_192c_xbyak_bulk_m.md).
 
+The M1/M2 dual-N experiment shared packed-A loads across two adjacent N tiles,
+but its low-concurrency gain reversed at larger expert waves: about +2.3% at
+8 active experts became -5.4% to -5.7% at 24 and as low as -5.0% at 96. The
+environment flag and generated dual-N state machine were removed on 2026-08-10;
+the source remains at Git commit `f671f7e` and the synchronization evidence is
+in [`results/amazon_192c_xbyak_m2_dual_n.md`](results/amazon_192c_xbyak_m2_dual_n.md).
+
 The removed first-panel-prefetch experiment gave the W13-only candidate median
 gains of about 1.93% at 1T and 2.10% at 4T over M1-M12 in five-process tests.
 Prefetching W2 added no stable isolated benefit and regressed by about 7.36%

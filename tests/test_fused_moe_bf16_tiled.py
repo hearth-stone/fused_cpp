@@ -904,10 +904,6 @@ def test_sve_xbyak_pure_gemm_matches_static_asm(monkeypatch: pytest.MonkeyPatch)
 
     monkeypatch.delenv("FUSED_CPP_MOE_SVE_KC", raising=False)
     monkeypatch.delenv("FUSED_CPP_MOE_SVE_KC_L1_PERMILLE", raising=False)
-    # The pure operation must remain a one-N-tile kernel even when the fused
-    # M1/M2 dual-N experiment is enabled.
-    monkeypatch.setenv("FUSED_CPP_MOE_SVE_JIT_M2_DUAL_N", "1")
-
     generator = torch.Generator().manual_seed(20260725)
     K = 64
     N = 64
