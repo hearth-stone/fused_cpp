@@ -92,13 +92,31 @@ ssh AmazonECS8Cores 'cd /home/ubuntu/zhangxu/fused_cpp && . .venv/bin/activate &
 
 ## Benchmark Hygiene
 
-Production fused MoE benchmark and analysis work must report
-`stage_geometry=full_n_team_stripes`, the team width, backend N tile, full W13/W2
-stage bytes, and the derived maximum packed-B owner stripe per worker. The team
-width is the only production cache-window control. Weight-range, split-W13, and
-byte-window controls are retired and must not be used by production paths.
-Benchmarks that retain an explicit N-range loop as a historical baseline must
-label it experimental and must not emit production calibration profiles.
+Production fused MoE benchmark and analysis work must report the stage geometry,
+the team width, the backend N tile, the full W13/W2 stage bytes, and the per-thread
+owner window for each stage.
+
+A stage's computation pattern is determined by the pair `(threads, window_tiles)`,
+where `window_tiles` counts whole packed-B N tiles per thread. The team consumes
+`threads * window_tiles` tiles per window and covers the stage in
+`ceil(total_tiles / (threads * window_tiles))` windows, the last of which may be
+short. `window_tiles = 0` selects the full stripe, which is the single-window
+`full_n_team_stripes` geometry and the default; report that name only when the
+window is the full stripe for both stages.
+
+Report windows as tile counts, not bytes. The runtime ABI carries tile counts and
+`FullStageGeometry.window_tiles_from_bytes` is the only place a byte budget may be
+converted, so a byte-denominated window in a report cannot be mapped back to a
+unique pattern. Quote `(t, w13_window_tiles, w2_window_tiles, R13, R2)`.
+
+The retired controls are the **byte-window** and **split-W13** environment and plan
+fields, which were ambiguous: several byte budgets mapped to one pattern, and a
+split and a range could express the same geometry. Those must not come back. The
+tile-counted per-thread window above is not one of them; it is the parameter the
+planner selects and the runtime executes.
+
+Benchmarks that retain their own N-range loop outside this mechanism must label it
+experimental and must not emit production calibration profiles.
 
 For single-thread microbenchmarks, bind each process to one dedicated core with
 `taskset` and pin Python/native libraries to one thread:

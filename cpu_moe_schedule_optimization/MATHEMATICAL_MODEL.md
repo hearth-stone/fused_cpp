@@ -4167,7 +4167,60 @@ microbenchmark range 开关只保留为实验/历史对照，不可进入 produc
   `0.187 ms`、derate `1.010`。该三轮 smoke 只验证执行与 metadata 契约，不作为
   新的 production calibration table。
 
+#### 9.35 窗口作为一等参数：$(t,\omega_{13},\omega_2)$
+
+v0.89 的 full-N team stripe 是 $R=1$ 端点，不是唯一几何。把每线程 owner 窗口
+$\omega_s$（以整 N tile 计）恢复为一等参数后，一个 stage 的计算模式由
+$(t,\omega_s)$ 唯一确定：
+
+$$
+\text{range}_s = t\,\omega_s,\qquad
+R_s = \left\lceil \frac{q_s}{t\,\omega_s} \right\rceil,\qquad
+\omega_s = \left\lceil q_s/t \right\rceil \iff R_s = 1
+$$
+
+窗口 $i$ 覆盖 tile $[i\cdot\text{range}_s,\ \min((i+1)\text{range}_s,\ q_s))$，尾窗口
+可短，窗口内按 `split_evenly` 分给 $t$ 个线程。**$R=1$ 即 9.34 的 full-N team
+stripe**，故新参数化是旧几何的超集，默认逐位一致。
+
+三条结构性质。**纯调度旋钮**：每个 (M panel, window) 对被访问恰好一次、各线程写
+disjoint C、融合 W13 无 K 分块，故任何合法 $\omega$ 输出逐位相同。**饥饿边界可
+判定**：尾窗口 $r=q_s \bmod \text{range}_s$，若 $t\mid q_s$ 则 $r$ 必为 $t$ 的倍数、
+永不饿死线程；TP4 下 $q_{13}=128$、$q_2=512$ 使 $t\in\{1,2,4,8,16,32\}$ 全部安全。
+**下界为一个 tile**：packed B 以 tile 连续、micro-kernel 输出块宽 $\nu$，故
+$\omega_s\ge1$ 且与 $t$ 无关。
+
+ABI 传 tile 数而非字节。字节口径的 $\lfloor b/b_s\rfloor$ 换算是多对一，无法反推唯一
+模式，故 `FullStageGeometry.window_tiles_from_bytes` 是唯一允许换算的地方，Plan V2
+的 `task_w13_window_tiles`/`task_w2_window_tiles` 只接受 tile 数，$0$ 表示全条带。
+两者与 route/M slicing 的 `task_range_granularities` **正交**：切 route 改 $M$，不改
+worker 拥有哪些权重列。
+
+$R>1$ 时禁用两个 stripe 级 kernel 优化（`first_panel_prefetch` 与 `bulk_m`），因为
+两者都假设一次调用覆盖 worker 的整条 stripe，而窗口下同一 B 每窗口被重访一次。
+
+**代价与收益**（`results/amazon_192c_stage_window_tiles_20260810.md`）。全条带在窄
+宽度上代价很大：$t=4$ 时每 worker 2 MiB，96 核并发使 192 MiB packed B 同时活着对
+96 MiB L3，实测比最优窗口慢 $75\%$--$104\%$（$M=56$--$120$）；$t=8$ 慢
+$23\%$--$31\%$；$t=16$ 在 $M\le120$ 慢 $4\%$--$15\%$。但 $t=16$ 且 route $\ge144$
+起全条带最优，强制 1 tile 在 $M=384$ 慢 $80\%$——大 $M$ 区 $A$ 不再常驻，需要大窗口
+摊销其重扫，与 9.28 的门限方向一致。$t=32$ 的 stripe 已只有 4 tile，所有窗口在
+$0.6\%$ 噪声内。
+
+policy 是 route band 表 + per-width override，在**已选定**的 $(M,t)$ 上确定性读表，
+**不增加 planner 搜索维度**。未覆盖的 route/width 返回全条带，故报
+`stage_geometry=full_n_team_stripes` 且行为与迁移前一致，旧 profile 继续有效；只有
+$R>1$ 时报 `windowed_team_stripes`。planner 生成的 plan 上端到端 A/B：
+`moe256-uniform` $+12.4\%$、`dsv4-real-2048-seq70` $+10.6\%$，
+`moe256-tiered-hotspot` $+1.5\%$ 与 `moe256-active-set-128` $-0.65\%$ 在
+$1.3\%$--$1.7\%$ 噪声底内（噪声底由"两臂 plan 完全相同"测得）。
+
+未验证：`moe256-active-set-128` 的 52 个加窗 task 正落在孤立实测 $+9.2\%$ 的格子却
+端到端不动，推测因其余 76 个 task 在 $t=32$（policy 不动）决定 makespan，未测。
+$t=16$ 的项只标定了 W13 轴，其 W2 项取全条带。宽度 $1,2,3,6,12$ 沿用 V4 或未覆盖。
+
 ## 10. 同步规则
+
 
 
 
@@ -4285,3 +4338,4 @@ microbenchmark range 开关只保留为实验/历史对照，不可进入 produc
 | 2026-08-09 | v0.87 | 文档、Plan/profile schema 与 optimization manifests 收敛到 range-only 契约：公开 entrypoint 只记录正整数 `w13_ranges/w2_ranges`，Plan V2 每 task 必须携带正整数 range，profile 必须显式记录 exact identity；byte target 仅是解析模型在 plan lowering 前的校准输入。修正 homogeneous full-call anchor 的规则为“所有 task 保持 profile baseline pair”，并将默认 stage policy 标记为 V4 的 `R13=2,R2=1` 精确 gate。历史 JSON 字段、profile 文件名和 changelog 术语只作为 provenance 保留。 |
 | 2026-08-09 | v0.88 | 删除 operator-wide $(R_{13},R_2)$ planner 控制：`ProfilePolicy/ProfileQuery` 不再包含 range，catalog 每个机器/拓扑/shape/implementation/source 域只允许一个活动校准，旧 `(1,1)/(2,1)` 配对表从活动目录移除；range 字段降级为采样几何 provenance。删除 `PolicyAwarePlanner`、range variant 枚举、联合 `(range,shape)` 搜索、plan-level `operator_options` 和对应 cache identity。planner 只搜索 shape，随后由 $g_\theta(M,t)$ 生成 Plan V2 的逐 task exact range；native cold planner 中的 pair 仅是未覆盖 task 的 calibration fallback，不是候选。同步更新 TP/EP evaluator、validator、schema 和 full-call anchor 判定。 |
 | 2026-08-09 | v0.89 | 完全删除 production weight split/range/window 语义：Python/C++ ABI、Plan V2、ARM/x86 executor、native planner、empirical/analytic cost model、profile generator 和默认 benchmark 均只执行 `full_n_team_stripes`。W13/W2 stage bytes 固定为 $4HF/2HF$；team width 通过 $u_s(t)=2K_s\nu\lceil(N_s/\nu)/t\rceil$ 唯一决定每线程 owner stripe。删除逐 task range 张量、解析 stage-window policy、range 搜索/缓存 identity 和旧 active split profiles；route/M slicing 保留且与 weight split 明确区分。profile catalog 拒绝非 full-N 几何，planner 候选/剪枝只保留既有 width、shape、tail-pool 和 bounded route-slice 维度。 |
+| 2026-08-10 | v0.90 | 把每线程 owner 窗口恢复为一等参数（9.35）：一个 stage 的计算模式由 $(t,\omega_s)$ 唯一确定，$\text{range}_s=t\omega_s$、$R_s=\lceil q_s/(t\omega_s)\rceil$，尾窗口可短并按 `split_evenly` 分配；$\omega_s=\lceil q_s/t\rceil$ 即 v0.89 的 full-N team stripe，故新参数化是旧几何的**超集**、默认逐位一致。ABI 以 **tile 数**承载（Plan V2 新增 optional `task_w13_window_tiles`/`task_w2_window_tiles`，$0$=全条带），字节换算只允许在 `FullStageGeometry.window_tiles_from_bytes` 一处发生，因为 $\lfloor b/b_s\rfloor$ 是多对一、无法反推唯一模式；与 route/M slicing 的 `task_range_granularities` 正交。三条结构性质：窗口是**纯调度旋钮**（每 (panel, window) 对访问一次、线程写 disjoint C、融合 W13 无 K 分块 ⇒ 任何合法 $\omega$ 逐位相同，已用 rows/宽度/后端矩阵实测）；饥饿边界可判定（$t\mid q_s$ 时尾窗口必为 $t$ 的倍数，TP4 下 $t\in\{1,2,4,8,16,32\}$ 全安全）；下界恰为一个 tile 且与 $t$ 无关。$R>1$ 时禁用 `first_panel_prefetch` 与 `bulk_m`（两者都假设一次调用覆盖整条 stripe）。实测全条带在窄宽度代价很大——$t=4$ 慢 $75\%$--$104\%$、$t=8$ 慢 $23\%$--$31\%$、$t=16$ 在 $M\le120$ 慢 $4\%$--$15\%$，机制是聚合而非单核（$t=4$ 时 96 核共 192 MiB packed B 对 96 MiB L3）；但 $t=16$ 且 route $\ge144$ 起全条带最优、强制 1 tile 在 $M=384$ 慢 $80\%$，与 9.28 大 $M$ 需大窗口摊销 $A$ 重扫的门限方向一致，故 policy 不在该区加 16T；$t=32$ 的 stripe 已只有 4 tile、所有窗口在 $0.6\%$ 噪声内，故意不覆盖。policy 为 route band + per-width override，在已选定 $(M,t)$ 上确定性读表，**不增加 planner 搜索维度**；未覆盖 route/width 返回全条带并继续报 `stage_geometry=full_n_team_stripes`，旧 profile 与 catalog 拒绝规则均不变，仅 $R>1$ 报 `windowed_team_stripes`。planner plan 上端到端 A/B：`moe256-uniform` $+12.4\%$、`dsv4-real-2048-seq70` $+10.6\%$，另两个 preset 在 $1.3\%$--$1.7\%$ 噪声底内。harness 已对齐退役前网格（9 格 $-1.82\%$--$+0.12\%$、argmax 逐格复现）。未验证：`moe256-active-set-128` 落在孤立 $+9.2\%$ 格子却端到端不动的原因；16T 项只标定 W13 轴。|
