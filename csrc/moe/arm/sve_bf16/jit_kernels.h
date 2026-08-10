@@ -48,15 +48,9 @@ const void* silu_constants();
 KernelFn get_kernel(Operation operation, int rows, int degree, std::string* error);
 // Standalone packed-A/packed-B BF16 GEMM with row-major FP32 output.
 KernelFn get_gemm_f32_kernel(int rows, std::string* error);
-KernelFn get_bulk_m12_gemm_f32_kernel(std::string* error);
 // Benchmark-only variants of the pure GEMM kernel. M1/M2 support all probe modes;
 // M12 supports full-loop, full-loop-with-store, and column-pipelined modes.
 KernelFn get_probe_kernel(int rows, ProbeMode mode, std::string* error);
-// The bulk kernel consumes a positive multiple of 12 rows from params->m. It
-// preserves the exact-M kernel ABI but advances packed A and output state inside
-// generated code, amortizing the function prologue across all full M12 panels.
-KernelFn get_bulk_m12_kernel(Operation operation, int degree, std::string* error);
 void prewarm(Operation operation, int degree);
-void prewarm_bulk_m12(Operation operation, int degree);
 
 }  // namespace fused_cpp::moe_sve::jit

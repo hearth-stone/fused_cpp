@@ -1199,11 +1199,6 @@ const char* sve_jit_operation_name(SveJitOperation operation) {
   return "unknown";
 }
 
-bool sve_jit_bulk_m_enabled() {
-  const char* value = std::getenv("FUSED_CPP_MOE_SVE_JIT_BULK_M");
-  return value != nullptr && value[0] != '\0' && value[0] != '0';
-}
-
 bool sve_jit_configuration_supported(SveJitOperation operation, int K, int64_t degree, std::string* reason) {
   const auto mode = ::fused_cpp::moe_sve::jit::implementation_mode();
   if (mode == ::fused_cpp::moe_sve::jit::ImplementationMode::kAsm) {
@@ -1253,13 +1248,6 @@ void prewarm_sve_jit_exact_m_kernels(int w13_k, int w2_k) {
   }
   ::fused_cpp::moe_sve::jit::prewarm(SveJitOperation::kW2, 0);
   ::fused_cpp::moe_sve::jit::prewarm(SveJitOperation::kW2Direct, 0);
-  if (sve_jit_bulk_m_enabled()) {
-    for (int degree = 4; degree <= 6; ++degree) {
-      ::fused_cpp::moe_sve::jit::prewarm_bulk_m12(SveJitOperation::kW13, degree);
-    }
-    ::fused_cpp::moe_sve::jit::prewarm_bulk_m12(SveJitOperation::kW2, 0);
-    ::fused_cpp::moe_sve::jit::prewarm_bulk_m12(SveJitOperation::kW2Direct, 0);
-  }
 }
 
 struct SveJitExactMKernelSet {
@@ -1267,20 +1255,16 @@ struct SveJitExactMKernelSet {
   SveJitKernelFn tail = nullptr;
   int main_rows = 0;
   int tail_rows = 0;
-  bool bulk_m = false;
 };
 
-bool resolve_sve_jit_exact_m_kernels(SveJitOperation operation, int rows, int64_t degree, bool allow_bulk_m,
+bool resolve_sve_jit_exact_m_kernels(SveJitOperation operation, int rows, int64_t degree,
                                      SveJitExactMKernelSet* kernels) {
   TORCH_CHECK(rows > 0, "SVE JIT dispatch requires a positive row count");
   kernels->main_rows = rows / 12 * 12;
   kernels->tail_rows = rows - kernels->main_rows;
-  kernels->bulk_m = allow_bulk_m && sve_jit_bulk_m_enabled() && kernels->main_rows >= 24;
   std::string error;
   if (kernels->main_rows > 0) {
-    kernels->m12 = kernels->bulk_m
-                       ? ::fused_cpp::moe_sve::jit::get_bulk_m12_kernel(operation, static_cast<int>(degree), &error)
-                       : ::fused_cpp::moe_sve::jit::get_kernel(operation, 12, static_cast<int>(degree), &error);
+    kernels->m12 = ::fused_cpp::moe_sve::jit::get_kernel(operation, 12, static_cast<int>(degree), &error);
   }
   if (kernels->tail_rows > 0 && kernels->m12 != nullptr) {
     kernels->tail =
@@ -1299,27 +1283,20 @@ bool resolve_sve_jit_exact_m_kernels(SveJitOperation operation, int rows, int64_
 }
 
 bool sve_jit_packc_w13_exact_dispatch(const uint16_t* packed_A, const uint16_t* w13_packed, uint16_t* C, int rows,
-                                      int K, int N, int ldc, int packed_N, int n_begin, int64_t degree,
-                                      bool single_window) {
+                                      int K, int N, int ldc, int packed_N, int n_begin, int64_t degree) {
   if (!sve_jit_configuration_supported(SveJitOperation::kW13, K, degree, nullptr)) {
     return false;
   }
   SveJitExactMKernelSet kernels;
-  if (!resolve_sve_jit_exact_m_kernels(SveJitOperation::kW13, rows, degree, single_window, &kernels)) {
+  if (!resolve_sve_jit_exact_m_kernels(SveJitOperation::kW13, rows, degree, &kernels)) {
     return false;
   }
-  TORCH_CHECK(single_window || !kernels.bulk_m, "windowed W13 traversal must not use the bulk-M kernel");
   SveKBlockParams p = make_sve_kblock_params(12, K, N, ldc, packed_N, n_begin, static_cast<int>(degree));
   const void* constants = ::fused_cpp::moe_sve::jit::silu_constants();
-  if (kernels.bulk_m) {
-    p.gemm.m = kernels.main_rows;
-    kernels.m12(packed_A, w13_packed, C + static_cast<int64_t>(n_begin) * 6, constants, &p.gemm);
-  } else {
-    for (int mb = 0; mb < kernels.main_rows; mb += 12) {
-      p.gemm.m = 12;
-      kernels.m12(packed_A + static_cast<int64_t>(mb) * K, w13_packed,
-                  C + static_cast<int64_t>(mb) * ldc + static_cast<int64_t>(n_begin) * 6, constants, &p.gemm);
-    }
+  for (int mb = 0; mb < kernels.main_rows; mb += 12) {
+    p.gemm.m = 12;
+    kernels.m12(packed_A + static_cast<int64_t>(mb) * K, w13_packed,
+                C + static_cast<int64_t>(mb) * ldc + static_cast<int64_t>(n_begin) * 6, constants, &p.gemm);
   }
   if (kernels.tail_rows > 0) {
     const int physical_pairs = kernels.tail_rows <= 8 ? 4 : 6;
@@ -1332,25 +1309,19 @@ bool sve_jit_packc_w13_exact_dispatch(const uint16_t* packed_A, const uint16_t* 
 }
 
 bool sve_jit_packed_w2_exact_dispatch(const uint16_t* packed_A, const uint16_t* w2_packed, float* down, int rows, int K,
-                                      int N, int ldc, int packed_N, int n_begin, bool single_window) {
+                                      int N, int ldc, int packed_N, int n_begin) {
   if (!sve_jit_configuration_supported(SveJitOperation::kW2, K, 0, nullptr)) {
     return false;
   }
   SveJitExactMKernelSet kernels;
-  if (!resolve_sve_jit_exact_m_kernels(SveJitOperation::kW2, rows, 0, single_window, &kernels)) {
+  if (!resolve_sve_jit_exact_m_kernels(SveJitOperation::kW2, rows, 0, &kernels)) {
     return false;
   }
-  TORCH_CHECK(single_window || !kernels.bulk_m, "windowed W2 traversal must not use the bulk-M kernel");
   SveKBlockParams p = make_sve_kblock_params(12, K, N, ldc, packed_N, n_begin, 0);
-  if (kernels.bulk_m) {
-    p.gemm.m = kernels.main_rows;
-    kernels.m12(packed_A, w2_packed, down, nullptr, &p.gemm);
-  } else {
-    for (int mb = 0; mb < kernels.main_rows; mb += 12) {
-      p.gemm.m = 12;
-      kernels.m12(packed_A + static_cast<int64_t>(mb) * K, w2_packed, down + static_cast<int64_t>(mb) * ldc, nullptr,
-                  &p.gemm);
-    }
+  for (int mb = 0; mb < kernels.main_rows; mb += 12) {
+    p.gemm.m = 12;
+    kernels.m12(packed_A + static_cast<int64_t>(mb) * K, w2_packed, down + static_cast<int64_t>(mb) * ldc, nullptr,
+                &p.gemm);
   }
   if (kernels.tail_rows > 0) {
     p.gemm.m = kernels.tail_rows;
@@ -1366,19 +1337,14 @@ bool sve_jit_packed_gemm_f32_exact_dispatch(const uint16_t* packed_A, const uint
     return false;
   }
   SveJitExactMKernelSet kernels;
-  if (!resolve_sve_jit_exact_m_kernels(SveJitOperation::kGemmF32, rows, 0, true, &kernels)) {
+  if (!resolve_sve_jit_exact_m_kernels(SveJitOperation::kGemmF32, rows, 0, &kernels)) {
     return false;
   }
   SveKBlockParams p = make_sve_kblock_params(12, K, N, ldc, packed_N, n_begin, 0);
-  if (kernels.bulk_m) {
-    p.gemm.m = kernels.main_rows;
-    kernels.m12(packed_A, packed_B, output, nullptr, &p.gemm);
-  } else {
-    for (int mb = 0; mb < kernels.main_rows; mb += 12) {
-      p.gemm.m = 12;
-      kernels.m12(packed_A + static_cast<int64_t>(mb) * K, packed_B,
-                  output + static_cast<int64_t>(mb) * ldc, nullptr, &p.gemm);
-    }
+  for (int mb = 0; mb < kernels.main_rows; mb += 12) {
+    p.gemm.m = 12;
+    kernels.m12(packed_A + static_cast<int64_t>(mb) * K, packed_B, output + static_cast<int64_t>(mb) * ldc, nullptr,
+                &p.gemm);
   }
   if (kernels.tail_rows > 0) {
     p.gemm.m = kernels.tail_rows;
@@ -1390,25 +1356,18 @@ bool sve_jit_packed_gemm_f32_exact_dispatch(const uint16_t* packed_A, const uint
 
 bool sve_jit_packed_w2_direct_route_exact_dispatch(const uint16_t* packed_A, const uint16_t* w2_packed,
                                                    float* route_out, const int64_t* route_ids, int rows, int K, int N,
-                                                   int route_stride, int packed_N, int n_begin, bool single_window) {
+                                                   int route_stride, int packed_N, int n_begin) {
   if (!sve_jit_configuration_supported(SveJitOperation::kW2Direct, K, 0, nullptr)) {
     return false;
   }
   SveJitExactMKernelSet kernels;
-  if (!resolve_sve_jit_exact_m_kernels(SveJitOperation::kW2Direct, rows, 0, single_window, &kernels)) {
+  if (!resolve_sve_jit_exact_m_kernels(SveJitOperation::kW2Direct, rows, 0, &kernels)) {
     return false;
   }
-  TORCH_CHECK(single_window || !kernels.bulk_m,
-              "windowed W2 direct-route traversal must not use the bulk-M kernel");
   SveKBlockParams p = make_sve_kblock_params(12, K, N, route_stride, packed_N, n_begin, 3);
-  if (kernels.bulk_m) {
-    p.gemm.m = kernels.main_rows;
-    kernels.m12(packed_A, w2_packed, route_out, route_ids, &p.gemm);
-  } else {
-    for (int mb = 0; mb < kernels.main_rows; mb += 12) {
-      p.gemm.m = 12;
-      kernels.m12(packed_A + static_cast<int64_t>(mb) * K, w2_packed, route_out, route_ids + mb, &p.gemm);
-    }
+  for (int mb = 0; mb < kernels.main_rows; mb += 12) {
+    p.gemm.m = 12;
+    kernels.m12(packed_A + static_cast<int64_t>(mb) * K, w2_packed, route_out, route_ids + mb, &p.gemm);
   }
   if (kernels.tail_rows > 0) {
     p.gemm.m = kernels.tail_rows;
@@ -1747,17 +1706,16 @@ void sve_asm_packed_w2_bf16_hybrid_dispatch(const uint16_t* packed_A, const uint
 
 void sve_packc_w13_hybrid_dispatch(const uint16_t* packed_A, const uint16_t* w13_packed, uint16_t* C, int rows, int K,
                                    int N, int ldc, int packed_N, int n_begin,
-                                   const SveKcFusedSiluKernelSet& asm_kernels, int64_t degree, bool single_window) {
-  if (sve_jit_packc_w13_exact_dispatch(packed_A, w13_packed, C, rows, K, N, ldc, packed_N, n_begin, degree,
-                                       single_window)) {
+                                   const SveKcFusedSiluKernelSet& asm_kernels, int64_t degree) {
+  if (sve_jit_packc_w13_exact_dispatch(packed_A, w13_packed, C, rows, K, N, ldc, packed_N, n_begin, degree)) {
     return;
   }
   sve_asm_packc_w13_hybrid_dispatch(packed_A, w13_packed, C, rows, K, N, ldc, packed_N, n_begin, asm_kernels);
 }
 
 void sve_packed_w2_hybrid_dispatch(const uint16_t* packed_A, const uint16_t* w2_packed, float* down, int rows, int K,
-                                   int N, int ldc, int packed_N, int n_begin, bool single_window) {
-  if (sve_jit_packed_w2_exact_dispatch(packed_A, w2_packed, down, rows, K, N, ldc, packed_N, n_begin, single_window)) {
+                                   int N, int ldc, int packed_N, int n_begin) {
+  if (sve_jit_packed_w2_exact_dispatch(packed_A, w2_packed, down, rows, K, N, ldc, packed_N, n_begin)) {
     return;
   }
   sve_asm_packed_w2_hybrid_dispatch(packed_A, w2_packed, down, rows, K, N, ldc, packed_N, n_begin);
@@ -1765,9 +1723,9 @@ void sve_packed_w2_hybrid_dispatch(const uint16_t* packed_A, const uint16_t* w2_
 
 void sve_packed_w2_direct_route_hybrid_dispatch(const uint16_t* packed_A, const uint16_t* w2_packed, float* route_out,
                                                 const int64_t* route_ids, int rows, int K, int N, int route_stride,
-                                                int packed_N, int n_begin, bool single_window) {
+                                                int packed_N, int n_begin) {
   if (sve_jit_packed_w2_direct_route_exact_dispatch(packed_A, w2_packed, route_out, route_ids, rows, K, N, route_stride,
-                                                    packed_N, n_begin, single_window)) {
+                                                    packed_N, n_begin)) {
     return;
   }
   sve_asm_packed_w2_direct_route_hybrid_dispatch(packed_A, w2_packed, route_out, route_ids, rows, K, N, route_stride,
@@ -2961,7 +2919,7 @@ void team_fused_w13_silu_packed_packc_sve(const TeamContext& team, const uint16_
   }
   for_each_stage_window(windows, team.local_tid, [&](const SplitRange& range, int64_t) {
     sve_packc_w13_hybrid_dispatch(packed_A, w13_packed, intermediate, rows, K, static_cast<int>(range.size), ldc, N13,
-                                  static_cast<int>(range.begin), ks, degree, single_window);
+                                  static_cast<int>(range.begin), ks, degree);
   });
 #else
   (void)team;
@@ -2994,7 +2952,7 @@ void vllm_staged_w13_range_sve(const uint16_t* packed_A, const uint16_t* w13_pac
   const SveKcFusedSiluKernelSet kernels = sve_asm_fused_silu_packc_set_for_degree(degree);
   TORCH_CHECK(kernels.m8 != nullptr, "unsupported fused silu exp degree ", degree);
   sve_packc_w13_hybrid_dispatch(packed_A, w13_packed, intermediate, rows, K, static_cast<int>(n_cols), ldc, 2 * ldc,
-                                static_cast<int>(n_begin), kernels, degree, /*single_window=*/true);
+                                static_cast<int>(n_begin), kernels, degree);
 #else
   (void)packed_A;
   (void)w13_packed;
@@ -3031,8 +2989,7 @@ void team_fused_w13_silu_packed_packc_sve_2d(const TeamContext& team, const Gemm
   }
   TORCH_CHECK(range.row_begin == 0, "SVE fused expert only supports N-split ranges");
   sve_packc_w13_hybrid_dispatch(packed_A, w13_packed, intermediate, static_cast<int>(range.rows), K,
-                                static_cast<int>(range.n_cols), ldc, N13, static_cast<int>(range.n_begin), ks, degree,
-                                /*single_window=*/true);
+                                static_cast<int>(range.n_cols), ldc, N13, static_cast<int>(range.n_begin), ks, degree);
 #else
   (void)team;
   (void)plan;
@@ -3108,7 +3065,7 @@ void team_w2_packed_sve(const TeamContext& team, const uint16_t* packed_A, const
   }
   for_each_stage_window(windows, team.local_tid, [&](const SplitRange& range, int64_t) {
     sve_packed_w2_hybrid_dispatch(packed_A, w2_packed, down + range.begin, rows, K, static_cast<int>(range.size), ldc,
-                                  N, static_cast<int>(range.begin), single_window);
+                                  N, static_cast<int>(range.begin));
   });
 #else
   (void)team;
@@ -3136,8 +3093,7 @@ void team_w2_packed_sve_2d(const TeamContext& team, const Gemm2DSplitPlan& plan,
   }
   TORCH_CHECK(range.row_begin == 0, "SVE fused expert only supports N-split ranges");
   sve_packed_w2_hybrid_dispatch(packed_A, w2_packed, down + range.n_begin, static_cast<int>(range.rows), K,
-                                static_cast<int>(range.n_cols), ldc, N, static_cast<int>(range.n_begin),
-                                /*single_window=*/true);
+                                static_cast<int>(range.n_cols), ldc, N, static_cast<int>(range.n_begin));
 #else
   (void)team;
   (void)plan;
@@ -3164,7 +3120,7 @@ void team_w2_packed_sve_direct_route(const TeamContext& team, const uint16_t* pa
   for_each_stage_window(windows, team.local_tid, [&](const SplitRange& range, int64_t) {
     sve_packed_w2_direct_route_hybrid_dispatch(packed_A, w2_packed, route_out + range.begin, route_ids, rows, K,
                                                static_cast<int>(range.size), route_stride, N,
-                                               static_cast<int>(range.begin), single_window);
+                                               static_cast<int>(range.begin));
   });
 #else
   (void)team;
@@ -3195,8 +3151,7 @@ void team_w2_packed_sve_direct_route_2d(const TeamContext& team, const Gemm2DSpl
   TORCH_CHECK(range.row_begin == 0, "SVE fused expert only supports N-split ranges");
   sve_packed_w2_direct_route_hybrid_dispatch(packed_A, w2_packed, route_out + range.n_begin, route_ids,
                                              static_cast<int>(range.rows), K, static_cast<int>(range.n_cols),
-                                             route_stride, N, static_cast<int>(range.n_begin),
-                                             /*single_window=*/true);
+                                             route_stride, N, static_cast<int>(range.n_begin));
 #else
   (void)team;
   (void)plan;
@@ -3250,7 +3205,7 @@ void vllm_staged_w2_direct_route_range_sve(const uint16_t* packed_A, const uint1
               " tile=", n_tile);
   sve_packed_w2_direct_route_hybrid_dispatch(packed_A, w2_packed, route_out + n_begin, route_ids, rows, K,
                                              static_cast<int>(n_cols), route_stride, route_stride,
-                                             static_cast<int>(n_begin), /*single_window=*/true);
+                                             static_cast<int>(n_begin));
 #else
   (void)packed_A;
   (void)w2_packed;

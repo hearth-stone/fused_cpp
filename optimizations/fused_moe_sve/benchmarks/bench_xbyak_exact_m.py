@@ -25,11 +25,9 @@ from fused_cpp.moe import (  # noqa: E402
 
 
 VARIANT_ENV = {
-    "asm": ("asm", "0", "0"),
-    "jit": ("jit", "0", "0"),
-    "jit-panel": ("jit", "0", "0"),
-    "jit-bulk": ("jit", "1", "0"),
-    "jit-dual-n": ("jit", "0", "1"),
+    "asm": ("asm", "0"),
+    "jit": ("jit", "0"),
+    "jit-dual-n": ("jit", "1"),
 }
 
 
@@ -53,9 +51,8 @@ def parse_variant_list(value: str) -> tuple[str, ...]:
 
 
 def select_variant(variant: str) -> None:
-    implementation, bulk_m, dual_n = VARIANT_ENV[variant]
+    implementation, dual_n = VARIANT_ENV[variant]
     os.environ["FUSED_CPP_MOE_SVE_IMPL"] = implementation
-    os.environ["FUSED_CPP_MOE_SVE_JIT_BULK_M"] = bulk_m
     os.environ["FUSED_CPP_MOE_SVE_JIT_M2_DUAL_N"] = dual_n
 
 
@@ -78,10 +75,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--variants",
         default="asm,jit",
-        help=(
-            "comma-separated subset of asm,jit,jit-panel,jit-bulk,jit-dual-n; "
-            "first variant is the timing baseline"
-        ),
+        help="comma-separated subset of asm,jit,jit-dual-n; first variant is the timing baseline",
     )
     parser.add_argument(
         "--switch-period",
@@ -147,9 +141,7 @@ def main() -> int:
     torch.set_num_threads(1)
     os.environ["FUSED_CPP_MOE_SVE"] = "1"
     os.environ["FUSED_CPP_MOE_W2_BF16_ROUTE"] = "0"
-    prewarm_variant = "jit-bulk" if "jit-bulk" in variants else next(
-        (variant for variant in variants if variant != "asm"), "asm"
-    )
+    prewarm_variant = next((variant for variant in variants if variant != "asm"), "asm")
     select_variant(prewarm_variant)
     generator = torch.Generator().manual_seed(args.seed)
     w13 = bf16_normal((args.experts, 2 * args.intermediate, args.hidden), generator)

@@ -799,7 +799,7 @@ def test_sve_xbyak_exact_m_matches_static_asm(
     monkeypatch: pytest.MonkeyPatch,
     degree: int,
 ) -> None:
-    """Cover exact tails and bulk-M W13/W2 JIT kernels through all bridges."""
+    """Cover exact-tail W13/W2 JIT kernels through all bridges."""
     if "arm_sve_bf16" not in available_fused_moe_bf16_tiled_backends():
         pytest.skip("requires an SVE BF16 build/runtime")
     monkeypatch.setenv("FUSED_CPP_MOE_SVE", "1")
@@ -807,7 +807,6 @@ def test_sve_xbyak_exact_m_matches_static_asm(
     monkeypatch.setenv("FUSED_CPP_MOE_SILU_M12_OPT", "0")
     monkeypatch.setenv("FUSED_CPP_MOE_SILU_RECIP_NR", "0")
     monkeypatch.setenv("FUSED_CPP_MOE_SILU_MINIMAX3", "0")
-    monkeypatch.setenv("FUSED_CPP_MOE_SVE_JIT_BULK_M", "1")
     monkeypatch.delenv("FUSED_CPP_MOE_SVE_KC", raising=False)
     monkeypatch.delenv("FUSED_CPP_MOE_SVE_KC_L1_PERMILLE", raising=False)
 
@@ -885,25 +884,15 @@ def test_sve_xbyak_exact_m_matches_static_asm(
         monkeypatch.setenv("FUSED_CPP_MOE_SVE_W2_DIRECT_ROUTE", direct_route)
         for bridge, call in calls.items():
             monkeypatch.setenv("FUSED_CPP_MOE_SVE_IMPL", "asm")
-            monkeypatch.setenv("FUSED_CPP_MOE_SVE_JIT_BULK_M", "0")
             reference = call()
             monkeypatch.setenv("FUSED_CPP_MOE_SVE_IMPL", "jit")
-            panel_candidate = call()
+            candidate = call()
             torch.testing.assert_close(
-                panel_candidate.float(),
+                candidate.float(),
                 reference.float(),
                 atol=0,
                 rtol=0,
-                msg=lambda message, bridge=bridge: f"{bridge}/panel/poly{degree}: {message}",
-            )
-            monkeypatch.setenv("FUSED_CPP_MOE_SVE_JIT_BULK_M", "1")
-            bulk_candidate = call()
-            torch.testing.assert_close(
-                bulk_candidate.float(),
-                reference.float(),
-                atol=0,
-                rtol=0,
-                msg=lambda message, bridge=bridge: f"{bridge}/bulk/poly{degree}: {message}",
+                msg=lambda message, bridge=bridge: f"{bridge}/poly{degree}: {message}",
             )
 
 
@@ -928,19 +917,17 @@ def test_sve_xbyak_pure_gemm_matches_static_asm(monkeypatch: pytest.MonkeyPatch)
     if packed.gemm_backend != 1:
         pytest.skip("requires an SVE BF16 build/runtime")
 
-    for bulk_m in ("0", "1"):
-        monkeypatch.setenv("FUSED_CPP_MOE_SVE_JIT_BULK_M", bulk_m)
-        for rows in [*range(1, 14), 23, 24, 25]:
-            A = _bf16_normal((rows, K), generator=generator, std=0.05)
-            reference = _moe_C.fused_moe_test_sve_packed_gemm(A, packed.w13[0], K, N, packed.backend_n_tile, False)
-            candidate = _moe_C.fused_moe_test_sve_packed_gemm(A, packed.w13[0], K, N, packed.backend_n_tile, True)
-            torch.testing.assert_close(
-                candidate,
-                reference,
-                atol=0,
-                rtol=0,
-                msg=lambda message, rows=rows, bulk_m=bulk_m: f"M={rows}/bulk={bulk_m}: {message}",
-            )
+    for rows in [*range(1, 14), 23, 24, 25]:
+        A = _bf16_normal((rows, K), generator=generator, std=0.05)
+        reference = _moe_C.fused_moe_test_sve_packed_gemm(A, packed.w13[0], K, N, packed.backend_n_tile, False)
+        candidate = _moe_C.fused_moe_test_sve_packed_gemm(A, packed.w13[0], K, N, packed.backend_n_tile, True)
+        torch.testing.assert_close(
+            candidate,
+            reference,
+            atol=0,
+            rtol=0,
+            msg=lambda message, rows=rows: f"M={rows}: {message}",
+        )
 
     with pytest.raises(RuntimeError, match="K must be divisible by 8"):
         _moe_C.fused_moe_test_sve_packed_gemm(

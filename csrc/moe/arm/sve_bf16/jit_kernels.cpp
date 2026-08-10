@@ -84,15 +84,7 @@ KernelFn get_probe_kernel(int, ProbeMode, std::string* error) {
   return nullptr;
 }
 
-KernelFn get_bulk_m12_kernel(Operation, int, std::string* error) {
-  if (error != nullptr) {
-    *error = "xbyak_aarch64 is unavailable in this build";
-  }
-  return nullptr;
-}
-
 void prewarm(Operation, int) {}
-void prewarm_bulk_m12(Operation, int) {}
 
 #else
 
@@ -115,14 +107,13 @@ struct KernelKey {
   Operation operation = Operation::kW13;
   uint8_t rows = 0;
   uint8_t degree = 0;
-  bool bulk_m = false;
   bool dual_n = false;
   ProbeMode probe_mode = ProbeMode::kNone;
 };
 
 class SveFusedGenerator final : public CodeGenerator {
  public:
-  SveFusedGenerator(Operation operation, int rows, int degree, bool bulk_m, bool dual_n, ProbeMode probe_mode)
+  SveFusedGenerator(Operation operation, int rows, int degree, bool dual_n, ProbeMode probe_mode)
       : CodeGenerator(64 * 1024, AutoGrow),
         operation_(operation),
         rows_(rows),
@@ -130,23 +121,16 @@ class SveFusedGenerator final : public CodeGenerator {
         row_pairs_((rows + 1) / 2),
         accumulator_base_(rows <= 8 ? 16 : 8),
         physical_rows_(rows <= 8 ? 8 : 12),
-        bulk_m_(bulk_m),
         dual_n_(dual_n),
         probe_mode_(probe_mode) {
     if (rows_ < 1 || rows_ > 12) {
       throw std::invalid_argument("SVE JIT rows must be in [1, 12]");
     }
-    if (bulk_m_ && rows_ != 12) {
-      throw std::invalid_argument("SVE JIT bulk-M is only valid for M12 kernels");
-    }
     if (dual_n_ && rows_ > 2) {
       throw std::invalid_argument("SVE JIT dual-N is only valid for M1/M2 kernels");
     }
-    if (dual_n_ && bulk_m_) {
-      throw std::invalid_argument("SVE JIT dual-N cannot be combined with other experimental load paths");
-    }
     if (probe_mode_ != ProbeMode::kNone) {
-      if (operation_ != Operation::kGemmF32 || !probe_rows_supported(rows_, probe_mode_) || bulk_m_ || dual_n_) {
+      if (operation_ != Operation::kGemmF32 || !probe_rows_supported(rows_, probe_mode_) || dual_n_) {
         throw std::invalid_argument("SVE JIT probe mode is incompatible with the requested GEMM kernel");
       }
     }
@@ -164,7 +148,6 @@ class SveFusedGenerator final : public CodeGenerator {
   KernelFn function() const { return getCode<KernelFn>(); }
 
  private:
-  static constexpr int kParamM = 0;
   static constexpr int kParamK = 4;
   static constexpr int kParamN = 8;
   static constexpr int kParamLdc = 20;
@@ -234,8 +217,8 @@ class SveFusedGenerator final : public CodeGenerator {
         break;
     }
     char path[512];
-    const int written = std::snprintf(path, sizeof(path), "%s/moe_sve_%s_m%d_d%d%s%s%s.bin", directory, operation,
-                                      rows_, degree_, bulk_m_ ? "_bulk" : "", dual_n_ ? "_dual_n" : "", probe);
+    const int written = std::snprintf(path, sizeof(path), "%s/moe_sve_%s_m%d_d%d%s%s.bin", directory, operation,
+                                      rows_, degree_, dual_n_ ? "_dual_n" : "", probe);
     if (written <= 0 || static_cast<size_t>(written) >= sizeof(path)) {
       return;
     }
@@ -257,18 +240,6 @@ class SveFusedGenerator final : public CodeGenerator {
     ldp(d12, d13, post_ptr(sp, 16));
     ldp(d10, d11, post_ptr(sp, 16));
     ldp(d8, d9, post_ptr(sp, 16));
-  }
-
-  void save_bulk_callee_gprs() {
-    stp(x19, x20, pre_ptr(sp, -16));
-    stp(x21, x22, pre_ptr(sp, -16));
-    stp(x23, x24, pre_ptr(sp, -16));
-  }
-
-  void restore_bulk_callee_gprs() {
-    ldp(x23, x24, post_ptr(sp, 16));
-    ldp(x21, x22, post_ptr(sp, 16));
-    ldp(x19, x20, post_ptr(sp, 16));
   }
 
   void load_b(int register_base) {
@@ -823,9 +794,6 @@ class SveFusedGenerator final : public CodeGenerator {
   }
 
   void generate() {
-    if (bulk_m_) {
-      save_bulk_callee_gprs();
-    }
     save_callee_simd();
     mov(x8, x3);
     ldr(w5, ptr(x4, kParamK));
@@ -852,37 +820,12 @@ class SveFusedGenerator final : public CodeGenerator {
     ptrue(p0.b);
     ptrue(p1.s);
 
-    Label m_loop;
     Label n_loop;
     Label single_n;
-    Label n_done;
     Label done;
-    if (bulk_m_) {
-      mov(x19, x6);
-      mov(x20, x2);
-      mov(w21, w12);
-      ldr(w22, ptr(x4, kParamM));
-      mov(x23, 24);
-      mul(x23, x23, x5);
-      if (operation_ == Operation::kW13) {
-        mov(x24, 6);
-        mul(x24, x24, x16);
-      } else if (operation_ == Operation::kW2 || operation_ == Operation::kGemmF32) {
-        mov(x24, 12);
-        mul(x24, x24, x16);
-      } else {
-        mov(x24, 0);
-      }
-      L(m_loop);
-      cmp(w22, 12);
-      b(LT, done);
-      mov(x6, x19);
-      mov(x7, x20);
-      mov(w12, w21);
-    }
     L(n_loop);
     cmp(x12, 0);
-    b(LE, bulk_m_ ? n_done : done);
+    b(LE, done);
     if (dual_n_) {
       cmp(w5, 1024);
       b(LT, single_n);
@@ -948,22 +891,8 @@ class SveFusedGenerator final : public CodeGenerator {
     sub(x12, x12, x10);
     b(n_loop);
 
-    if (bulk_m_) {
-      L(n_done);
-      add(x0, x0, x23);
-      if (operation_ == Operation::kW2Direct) {
-        add(x8, x8, 12 * static_cast<int>(sizeof(int64_t)));
-      } else {
-        add(x20, x20, x24);
-      }
-      sub(w22, w22, 12);
-      b(m_loop);
-    }
     L(done);
     restore_callee_simd();
-    if (bulk_m_) {
-      restore_bulk_callee_gprs();
-    }
     ret();
   }
 
@@ -973,7 +902,6 @@ class SveFusedGenerator final : public CodeGenerator {
   int row_pairs_;
   int accumulator_base_;
   int physical_rows_;
-  bool bulk_m_;
   bool dual_n_;
   ProbeMode probe_mode_;
 };
@@ -988,7 +916,7 @@ KernelHandle create_kernel(const KernelKey& key) {
   KernelHandle handle;
   try {
     handle.owner =
-        std::make_shared<SveFusedGenerator>(key.operation, key.rows, key.degree, key.bulk_m, key.dual_n, key.probe_mode);
+        std::make_shared<SveFusedGenerator>(key.operation, key.rows, key.degree, key.dual_n, key.probe_mode);
     handle.function = handle.owner->function();
   } catch (const std::exception& exception) {
     handle.error = exception.what();
@@ -1006,7 +934,6 @@ struct KernelCacheSlot {
 constexpr size_t kOperationCount = 4;
 constexpr size_t kRowCount = 12;
 constexpr size_t kDegreeCount = 3;
-constexpr size_t kBulkMCount = 2;
 constexpr size_t kDualNCount = 2;
 constexpr size_t kProbeModeCount = static_cast<size_t>(ProbeMode::kFullWithStoreColumnPipeline) + 1;
 
@@ -1019,14 +946,13 @@ size_t degree_index(Operation operation, int degree) {
 KernelHandle& cached_kernel(const KernelKey& key) {
   using ProbeCache = std::array<KernelCacheSlot, kProbeModeCount>;
   using DualNCache = std::array<ProbeCache, kDualNCount>;
-  using BulkCache = std::array<DualNCache, kBulkMCount>;
-  using DegreeCache = std::array<BulkCache, kDegreeCount>;
+  using DegreeCache = std::array<DualNCache, kDegreeCount>;
   using RowCache = std::array<DegreeCache, kRowCount>;
   using OperationCache = std::array<RowCache, kOperationCount>;
   static OperationCache cache;
   KernelCacheSlot& slot =
       cache[operation_index(key.operation)][static_cast<size_t>(key.rows - 1)][degree_index(key.operation, key.degree)]
-           [key.bulk_m ? 1 : 0][key.dual_n ? 1 : 0][static_cast<size_t>(key.probe_mode)];
+           [key.dual_n ? 1 : 0][static_cast<size_t>(key.probe_mode)];
   std::call_once(slot.once, [&slot, &key]() { slot.handle = create_kernel(key); });
   return slot.handle;
 }
@@ -1051,7 +977,6 @@ KernelFn get_kernel(Operation operation, int rows, int degree, std::string* erro
   const KernelKey key{operation,
                       static_cast<uint8_t>(rows),
                       static_cast<uint8_t>(degree),
-                      false,
                       operation != Operation::kGemmF32 && rows <= 2 && m2_dual_n_enabled(),
                       ProbeMode::kNone};
   KernelHandle& handle = cached_kernel(key);
@@ -1068,22 +993,7 @@ KernelFn get_probe_kernel(int rows, ProbeMode mode, std::string* error) {
     }
     return nullptr;
   }
-  const KernelKey key{Operation::kGemmF32, static_cast<uint8_t>(rows), 0, false, false, mode};
-  KernelHandle& handle = cached_kernel(key);
-  if (error != nullptr) {
-    *error = handle.error;
-  }
-  return handle.function;
-}
-
-KernelFn get_bulk_m12_kernel(Operation operation, int degree, std::string* error) {
-  if (operation == Operation::kW13 && (degree < 4 || degree > 6)) {
-    if (error != nullptr) {
-      *error = "SVE Xbyak W13 degree must be 4, 5, or 6";
-    }
-    return nullptr;
-  }
-  const KernelKey key{operation, 12, static_cast<uint8_t>(degree), true, false, ProbeMode::kNone};
+  const KernelKey key{Operation::kGemmF32, static_cast<uint8_t>(rows), 0, false, mode};
   KernelHandle& handle = cached_kernel(key);
   if (error != nullptr) {
     *error = handle.error;
@@ -1101,22 +1011,10 @@ void prewarm(Operation operation, int degree) {
   }
 }
 
-void prewarm_bulk_m12(Operation operation, int degree) {
-  std::string error;
-  const KernelFn function = get_bulk_m12_kernel(operation, degree, &error);
-  if (function == nullptr && implementation_mode() == ImplementationMode::kJit) {
-    throw std::runtime_error("failed to generate SVE Xbyak bulk-M kernel: " + error);
-  }
-}
-
 #endif
 
 KernelFn get_gemm_f32_kernel(int rows, std::string* error) {
   return get_kernel(Operation::kGemmF32, rows, 0, error);
-}
-
-KernelFn get_bulk_m12_gemm_f32_kernel(std::string* error) {
-  return get_bulk_m12_kernel(Operation::kGemmF32, 0, error);
 }
 
 }  // namespace fused_cpp::moe_sve::jit

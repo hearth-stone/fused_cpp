@@ -397,10 +397,9 @@ features:
 
   - id: compute.xbyak_bulk_m
     part: compute
-    status: experimental
-    implementation: >-
-      csrc/moe/arm/sve_bf16/jit_kernels.cpp and
-      csrc/moe/arm/common/fused_moe_bf16_tiled.cpp
+    status: retired
+    implementation: Removed from the active tree; retained in Git history.
+    history: 3faf244
     hypothesis: >-
       Looping over all complete M12 panels inside one generated W13 or W2
       kernel amortizes code-entry, callee-save, and invariant setup overhead for
@@ -409,17 +408,14 @@ features:
     depends_on:
       - compute.xbyak_exact_m
     conflicts_with: []
-    correctness: >-
-      PYTHONPATH=src FUSED_CPP_MOE_SVE=1 .venv/bin/python -m pytest -q
-      tests/test_fused_moe_bf16_tiled.py
-      -k sve_xbyak_exact_m_matches_static_asm
-    benchmark: >-
-      numactl --cpunodebind=0 --membind=0 taskset -c 0-95
-      .venv/bin/python
-      optimizations/fused_moe_sve/benchmarks/bench_xbyak_exact_m.py
-      --variants jit-panel,jit-bulk --routes 24,48,192,768,2040
-      --threads 1,4,8,16,32,64,96 --warmup 5 --runs 31
-      --switch-period 5
+    correctness: historical; restore history commit 3faf244 to reproduce
+    benchmark: historical; restore history commit 3faf244 to reproduce
+    result: >-
+      Retired on 2026-08-10. The implementation was bitwise correct but
+      performance-neutral across the AmazonC5192Cores NUMA0 grid, so its
+      generated outer-M loop, cache-key dimension, runtime flag, tests, and
+      benchmark selector no longer justify production maintenance. Full paired
+      measurements remain in results/amazon_192c_xbyak_bulk_m.md.
 
   - id: compute.m_epoch
     part: compute
@@ -1245,10 +1241,9 @@ variants:
       - compute.xbyak_exact_m
       - compute.xbyak_double_buffer_kloop
       - compute.xbyak_bulk_m
-    entrypoint: >-
-      FUSED_CPP_MOE_SVE_JIT_BULK_M=1
-      fused_moe_bf16_tiled_{sync,scheduled,async,vllm_staged}
-    status: experimental
+    entrypoint: Removed from the active tree; retained in Git history 3faf244.
+    status: retired
+    history: 3faf244
 
   - id: sve_epoch_fixed_nsplit
     features:
