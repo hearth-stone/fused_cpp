@@ -235,9 +235,10 @@ Acceptance gates:
 - [x] Close W13-only first-panel software prefetch as a production candidate.
   It hides cold-B latency under low or moderate concurrency, but crosses over
   near 18-20 concurrent streams on AmazonC5192Cores and can regress reusable-B
-  long routes. Keep the explicit environment flag and benchmark as regression
-  evidence, but leave production dispatch off and do not add a planner gate.
-  Reopen only with a new hardware result or a cache-retaining prefetch policy.
+  long routes. The environment flag, production dispatch, generated code and
+  benchmark variant were retired on 2026-08-10; preserve the result document
+  and Git history only. Reopen only with a new hardware result or a
+  cache-retaining prefetch policy.
 - [x] Add an offline no-contention CP-SAT oracle for the unrestricted supplied
   width set. It selects one fixed thread width per expert, removes dominated
   modes, returns incumbent and best-bound regret intervals, and compares the

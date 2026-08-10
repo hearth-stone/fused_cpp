@@ -60,6 +60,10 @@ W13. M12 ILV gains only 0.27-1.09% on the stable V3 cases and is mixed on V1.
 Neither schedule is adopted; the current non-ILV fused JIT remains the
 default. Method, five-run ranges, and W13/W2 tables are in
 [`results/amazon_8c_192c_upstream_m8_m12_ilv.md`](results/amazon_8c_192c_upstream_m8_m12_ilv.md).
+The rejected `--include-ilv` benchmark adapter was removed from the active tree
+on 2026-08-10; restore Git `fe0ca5a` to reproduce that exact comparison. The
+upstream assembly file remains an external reference, not an active fused-MoE
+variant.
 
 An M12-only JIT probe that keeps all six packed-A pairs live and ping-pongs two
 packed-B column registers was also tested on all 96 V3 cores. A 21-repeat long
