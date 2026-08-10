@@ -38,7 +38,6 @@ from fused_cpp.moe import prepare_fused_moe_bf16_tiled_weights  # noqa: E402
 PROBE_B_ONLY = 1
 PROBE_FULL_NO_STORE = 4
 PROBE_MATRIX_ONLY = 10
-PROBE_FULL_NO_STORE_COLUMN_PIPELINE = 11
 M12_ROWS = 12
 DEFAULT_N_TILE = 8
 

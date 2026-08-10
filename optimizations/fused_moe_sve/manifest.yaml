@@ -152,9 +152,8 @@ features:
   - id: compute.xbyak_m12_column_pipeline
     part: compute
     status: retired
-    implementation: >-
-      csrc/moe/arm/sve_bf16/jit_kernels.cpp and
-      optimizations/fused_moe_sve/benchmarks/bench_m12_column_pipeline_scaling.py
+    implementation: Removed from the active tree; retained in Git history.
+    history: 4825bf9
     hypothesis: >-
       Keeping all six M12 packed-A row pairs live while ping-ponging two
       packed-B column registers spaces the four six-BFMMLA groups with B loads
@@ -167,25 +166,16 @@ features:
       - compute.xbyak_pure_gemm
     conflicts_with:
       - compute.upstream_m8_m12_ilv
-    correctness: >-
-      taskset -c 48
-      optimizations/fused_moe_sve/benchmarks/run_jit_vs_i8mm_pure_gemm.sh
-      --rows 12 --k 64 --n 64 --experts 1 --warmup 1 --runs 3
-      --include-column-pipeline
-    benchmark: >-
-      FUSED_CPP_MOE_HUGETLBFS_PATH=/dev/hugepages-32M
-      numactl --cpunodebind=0 --membind=0 taskset -c 0-95
-      .venv/bin/python
-      optimizations/fused_moe_sve/benchmarks/bench_m12_column_pipeline_scaling.py
-      --widths 1,48,64,80,96 --cpu-ids 0-95 --batch-runs 262144
-      --repeats 5
+    correctness: historical; restore history commit 4825bf9 to reproduce
+    benchmark: historical; restore history commit 4825bf9 to reproduce
     result: >-
       Rejected on 2026-08-02. A 21-repeat 96-core run improved median
       throughput from 30.420 to 30.617 TFLOP/s (+0.648 percent) and linear
       efficiency from 91.681 to 92.273 percent, below the 2 percent adoption
       threshold. DISPATCH_STALL_IQ_VX increased by about 37.5 percent rather
-      than falling. The probe remains benchmark-only; production dispatch is
-      unchanged. Full measurements are in
+      than falling. Its JIT modes and benchmark sources were removed from the
+      active tree on 2026-08-10; production dispatch remains unchanged. Full
+      measurements are in
       results/amazon_192c_m12_column_pipeline_20260802.md.
 
   - id: compute.xbyak_m2_dual_n

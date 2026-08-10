@@ -94,9 +94,6 @@ bool probe_rows_supported(int rows, ProbeMode mode) {
   if (mode == ProbeMode::kMatrixOnly) {
     return rows == 12;
   }
-  if (mode == ProbeMode::kFullNoStoreColumnPipeline || mode == ProbeMode::kFullWithStoreColumnPipeline) {
-    return rows == 12;
-  }
   if (mode == ProbeMode::kFullNoStore || mode == ProbeMode::kFullWithStore) {
     return (rows >= 1 && rows <= 2) || rows == 12;
   }
@@ -208,12 +205,6 @@ class SveFusedGenerator final : public CodeGenerator {
         break;
       case ProbeMode::kMatrixOnly:
         probe = "_probe_matrix";
-        break;
-      case ProbeMode::kFullNoStoreColumnPipeline:
-        probe = "_probe_full_nostore_column_pipeline";
-        break;
-      case ProbeMode::kFullWithStoreColumnPipeline:
-        probe = "_probe_full_store_column_pipeline";
         break;
     }
     char path[512];
@@ -377,34 +368,6 @@ class SveFusedGenerator final : public CodeGenerator {
       compute_pairs(0, early_pairs, 0, 4);
       compute_pairs(early_pairs, first_group, early_pairs, 4);
       compute_pairs(4, row_pairs_, 0, 4);
-      return;
-    }
-    if (probe_mode_ == ProbeMode::kFullNoStoreColumnPipeline ||
-        probe_mode_ == ProbeMode::kFullWithStoreColumnPipeline) {
-      // Keep all six packed-A pairs resident and ping-pong two packed-B
-      // registers. This preserves instruction counts while spacing the four
-      // six-BFMMLA column groups with B loads and pointer updates.
-      ld1h(ZRegH(6), p0 / T_z, ptr(x14));
-      ld1h(ZRegH(7), p0 / T_z, ptr(x14, 1, MUL_VL));
-      for (int pair = 0; pair < row_pairs_; ++pair) {
-        ld1rqh(ZRegH(pair), p0 / T_z, ptr(x13, pair * 16));
-      }
-      for (int pair = 0; pair < row_pairs_; ++pair) {
-        bfmmla(accumulator(pair, 0), ZRegH(pair), ZRegH(6));
-      }
-      ld1h(ZRegH(6), p0 / T_z, ptr(x14, 2, MUL_VL));
-      for (int pair = 0; pair < row_pairs_; ++pair) {
-        bfmmla(accumulator(pair, 1), ZRegH(pair), ZRegH(7));
-      }
-      ld1h(ZRegH(7), p0 / T_z, ptr(x14, 3, MUL_VL));
-      add(x14, x14, x9, LSL, 2);
-      for (int pair = 0; pair < row_pairs_; ++pair) {
-        bfmmla(accumulator(pair, 2), ZRegH(pair), ZRegH(6));
-      }
-      add(x13, x13, physical_rows_ * 8);
-      for (int pair = 0; pair < row_pairs_; ++pair) {
-        bfmmla(accumulator(pair, 3), ZRegH(pair), ZRegH(7));
-      }
       return;
     }
     load_b(4);
@@ -878,8 +841,7 @@ class SveFusedGenerator final : public CodeGenerator {
       emit_m12_k_loop();
     }
 
-    if (probe_mode_ == ProbeMode::kNone || probe_mode_ == ProbeMode::kFullWithStore ||
-        probe_mode_ == ProbeMode::kFullWithStoreColumnPipeline) {
+    if (probe_mode_ == ProbeMode::kNone || probe_mode_ == ProbeMode::kFullWithStore) {
       if (operation_ == Operation::kW13) {
         store_w13();
       } else {
@@ -935,7 +897,7 @@ constexpr size_t kOperationCount = 4;
 constexpr size_t kRowCount = 12;
 constexpr size_t kDegreeCount = 3;
 constexpr size_t kDualNCount = 2;
-constexpr size_t kProbeModeCount = static_cast<size_t>(ProbeMode::kFullWithStoreColumnPipeline) + 1;
+constexpr size_t kProbeModeCount = static_cast<size_t>(ProbeMode::kMatrixOnly) + 1;
 
 size_t operation_index(Operation operation) { return static_cast<size_t>(operation); }
 

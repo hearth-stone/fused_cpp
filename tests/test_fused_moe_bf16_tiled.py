@@ -942,8 +942,8 @@ def test_sve_xbyak_pure_gemm_matches_static_asm(monkeypatch: pytest.MonkeyPatch)
 
 @pytest.mark.parametrize(
     "probe_mode",
-    [4, 10, 11],
-    ids=["full-no-store", "matrix-only", "full-no-store-column-pipeline"],
+    [4, 10],
+    ids=["full-no-store", "matrix-only"],
 )
 def test_sve_xbyak_m12_service_probe_runs(probe_mode: int) -> None:
     """M12 calibration probes must execute while preserving their exact-M contract."""

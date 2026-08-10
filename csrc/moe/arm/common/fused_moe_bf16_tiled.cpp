@@ -5699,7 +5699,7 @@ std::vector<double> fused_moe_bench_sve_jit_w13_gemm(at::Tensor A, at::Tensor w1
   TORCH_CHECK((N / n_ranges) % n_tile == 0, "each N range must contain whole SVE N tiles");
   TORCH_CHECK(warmup >= 0, "warmup must be non-negative");
   TORCH_CHECK(runs > 0, "runs must be positive");
-  TORCH_CHECK(probe_mode >= 0 && probe_mode <= 12, "probe_mode must be in [0, 12]");
+  TORCH_CHECK(probe_mode >= 0 && probe_mode <= 10, "probe_mode must be in [0, 10]");
   A = A.contiguous();
   const PackedExperts weights = checked_packed_experts(w13_packed, K, N, "w13_packed", n_tile);
   TORCH_CHECK(weights.E > 0, "w13_packed must contain at least one expert");

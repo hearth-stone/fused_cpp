@@ -228,8 +228,9 @@ Acceptance gates:
   on all 96 Neoverse-V3 cores. The 21-repeat median rose from 30.420 to 30.617
   TFLOP/s (+0.648%), and linear efficiency rose by 0.592 percentage points,
   but `DISPATCH_STALL_IQ_VX` increased about 37.5%. This is below the 2%
-  adoption threshold, so keep it benchmark-only and retain the existing M12
-  production schedule. Full results are in
+  adoption threshold, so retain the existing M12 production schedule. The
+  rejected probe source was removed from the active tree and remains available
+  at Git commit `4825bf9`. Full results are in
   `../optimizations/fused_moe_sve/results/amazon_192c_m12_column_pipeline_20260802.md`.
 - [x] Close W13-only first-panel software prefetch as a production candidate.
   It hides cold-B latency under low or moderate concurrency, but crosses over
