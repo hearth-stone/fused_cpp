@@ -973,6 +973,19 @@ def test_sve_xbyak_m12_service_probe_runs(probe_mode: int) -> None:
 
     assert len(samples) == 3
     assert all(sample > 0.0 for sample in samples)
+    b_only_samples = _moe_C.fused_moe_bench_sve_jit_w13_gemm(
+        A[:1],
+        packed.w13[0],
+        K,
+        N,
+        packed.backend_n_tile,
+        1,
+        1,
+        2,
+        1,
+    )
+    assert len(b_only_samples) == 2
+    assert all(sample > 0.0 for sample in b_only_samples)
     with pytest.raises(RuntimeError, match="M1/M2, or an M12-compatible mode"):
         _moe_C.fused_moe_bench_sve_jit_w13_gemm(
             A[:1],
@@ -984,6 +997,18 @@ def test_sve_xbyak_m12_service_probe_runs(probe_mode: int) -> None:
             0,
             1,
             10,
+        )
+    with pytest.raises(RuntimeError, match="probe_mode must be one of"):
+        _moe_C.fused_moe_bench_sve_jit_w13_gemm(
+            A,
+            packed.w13[0],
+            K,
+            N,
+            packed.backend_n_tile,
+            1,
+            0,
+            1,
+            2,
         )
 
 
@@ -1017,13 +1042,8 @@ def test_sve_xbyak_m12_service_probe_rotates_packed_a_copies() -> None:
     assert all(sample > 0.0 for sample in samples)
 
 
-@pytest.mark.parametrize(
-    "probe_mode",
-    [4, 5],
-    ids=["full-no-store", "full-with-fp32-store"],
-)
-def test_sve_xbyak_service_probe_traverses_full_m12_panels(probe_mode: int) -> None:
-    """Full-loop probes can measure a complete pure GEMM without fused epilogues."""
+def test_sve_xbyak_service_probe_traverses_full_m12_panels() -> None:
+    """The no-store service can measure a complete pure GEMM."""
     if "arm_sve_bf16" not in available_fused_moe_bf16_tiled_backends():
         pytest.skip("requires an SVE BF16 build/runtime")
     from fused_cpp import _moe_C
@@ -1046,7 +1066,7 @@ def test_sve_xbyak_service_probe_traverses_full_m12_panels(probe_mode: int) -> N
         1,
         1,
         3,
-        probe_mode,
+        4,
     )
 
     assert len(samples) == 3

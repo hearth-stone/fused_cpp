@@ -91,13 +91,17 @@ void prewarm(Operation, int) {}
 using namespace Xbyak_aarch64;
 
 bool probe_rows_supported(int rows, ProbeMode mode) {
-  if (mode == ProbeMode::kMatrixOnly) {
-    return rows == 12;
+  switch (mode) {
+    case ProbeMode::kNone:
+      return false;
+    case ProbeMode::kBOnly:
+      return rows >= 1 && rows <= 2;
+    case ProbeMode::kFullNoStore:
+      return (rows >= 1 && rows <= 2) || rows == 12;
+    case ProbeMode::kMatrixOnly:
+      return rows == 12;
   }
-  if (mode == ProbeMode::kFullNoStore || mode == ProbeMode::kFullWithStore) {
-    return (rows >= 1 && rows <= 2) || rows == 12;
-  }
-  return rows >= 1 && rows <= 2;
+  return false;
 }
 
 struct KernelKey {
@@ -179,29 +183,8 @@ class SveFusedGenerator final : public CodeGenerator {
       case ProbeMode::kBOnly:
         probe = "_probe_b";
         break;
-      case ProbeMode::kBAOnly:
-        probe = "_probe_ba";
-        break;
-      case ProbeMode::kBFMMLAOnly:
-        probe = "_probe_bfmmla";
-        break;
       case ProbeMode::kFullNoStore:
         probe = "_probe_full_nostore";
-        break;
-      case ProbeMode::kFullWithStore:
-        probe = "_probe_full_store";
-        break;
-      case ProbeMode::kAOnly:
-        probe = "_probe_a";
-        break;
-      case ProbeMode::kControlOnly:
-        probe = "_probe_control";
-        break;
-      case ProbeMode::kBAFixedA:
-        probe = "_probe_ba_fixed_a";
-        break;
-      case ProbeMode::kFullNoStoreFixedA:
-        probe = "_probe_full_nostore_fixed_a";
         break;
       case ProbeMode::kMatrixOnly:
         probe = "_probe_matrix";
@@ -242,9 +225,7 @@ class SveFusedGenerator final : public CodeGenerator {
   }
 
   void compute_pairs(int begin_pair, int end_pair, int a_register_base, int b_register_base) {
-    if (probe_mode_ == ProbeMode::kBOnly || probe_mode_ == ProbeMode::kBAOnly ||
-        probe_mode_ == ProbeMode::kAOnly || probe_mode_ == ProbeMode::kControlOnly ||
-        probe_mode_ == ProbeMode::kBAFixedA) {
+    if (probe_mode_ == ProbeMode::kBOnly) {
       return;
     }
     for (int column = 0; column < 4; ++column) {
@@ -255,19 +236,10 @@ class SveFusedGenerator final : public CodeGenerator {
   }
 
   void load_ab_small(int a_register_base, int b_register_base) {
-    if (probe_mode_ == ProbeMode::kAOnly || probe_mode_ == ProbeMode::kControlOnly) {
-      add(x14, x14, x9, LSL, 2);
-    } else {
-      load_b(b_register_base);
-    }
-    if (probe_mode_ != ProbeMode::kBOnly && probe_mode_ != ProbeMode::kBFMMLAOnly &&
-        probe_mode_ != ProbeMode::kControlOnly) {
+    load_b(b_register_base);
+    if (probe_mode_ != ProbeMode::kBOnly) {
       for (int pair = 0; pair < row_pairs_; ++pair) {
-        if (probe_mode_ == ProbeMode::kBAFixedA || probe_mode_ == ProbeMode::kFullNoStoreFixedA) {
-          ld1rqh(ZRegH(a_register_base + pair), p0 / T_z, ptr(x0, pair * 16));
-        } else {
-          ld1rqh(ZRegH(a_register_base + pair), p0 / T_z, ptr(x13, pair * 16));
-        }
+        ld1rqh(ZRegH(a_register_base + pair), p0 / T_z, ptr(x13, pair * 16));
       }
     }
     add(x13, x13, physical_rows_ * 8);
@@ -827,10 +799,7 @@ class SveFusedGenerator final : public CodeGenerator {
     mov(x13, x0);
     mov(x14, x6);
     mov(w15, w5);
-    if (probe_mode_ == ProbeMode::kBFMMLAOnly) {
-      mov(ZRegS(0), 0);
-      mov(ZRegS(8), 0);
-    } else if (probe_mode_ == ProbeMode::kMatrixOnly) {
+    if (probe_mode_ == ProbeMode::kMatrixOnly) {
       for (int reg = 0; reg < 8; ++reg) {
         mov(ZRegD(reg), 0);
       }
@@ -841,7 +810,7 @@ class SveFusedGenerator final : public CodeGenerator {
       emit_m12_k_loop();
     }
 
-    if (probe_mode_ == ProbeMode::kNone || probe_mode_ == ProbeMode::kFullWithStore) {
+    if (probe_mode_ == ProbeMode::kNone) {
       if (operation_ == Operation::kW13) {
         store_w13();
       } else {
@@ -897,12 +866,26 @@ constexpr size_t kOperationCount = 4;
 constexpr size_t kRowCount = 12;
 constexpr size_t kDegreeCount = 3;
 constexpr size_t kDualNCount = 2;
-constexpr size_t kProbeModeCount = static_cast<size_t>(ProbeMode::kMatrixOnly) + 1;
+constexpr size_t kProbeModeCount = 4;
 
 size_t operation_index(Operation operation) { return static_cast<size_t>(operation); }
 
 size_t degree_index(Operation operation, int degree) {
   return operation == Operation::kW13 ? static_cast<size_t>(degree - 4) : 0;
+}
+
+size_t probe_index(ProbeMode mode) {
+  switch (mode) {
+    case ProbeMode::kNone:
+      return 0;
+    case ProbeMode::kBOnly:
+      return 1;
+    case ProbeMode::kFullNoStore:
+      return 2;
+    case ProbeMode::kMatrixOnly:
+      return 3;
+  }
+  throw std::invalid_argument("invalid SVE JIT calibration mode");
 }
 
 KernelHandle& cached_kernel(const KernelKey& key) {
@@ -914,7 +897,7 @@ KernelHandle& cached_kernel(const KernelKey& key) {
   static OperationCache cache;
   KernelCacheSlot& slot =
       cache[operation_index(key.operation)][static_cast<size_t>(key.rows - 1)][degree_index(key.operation, key.degree)]
-           [key.dual_n ? 1 : 0][static_cast<size_t>(key.probe_mode)];
+           [key.dual_n ? 1 : 0][probe_index(key.probe_mode)];
   std::call_once(slot.once, [&slot, &key]() { slot.handle = create_kernel(key); });
   return slot.handle;
 }

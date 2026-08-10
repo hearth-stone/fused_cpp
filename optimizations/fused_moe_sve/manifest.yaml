@@ -207,15 +207,9 @@ features:
 
   - id: compute.small_m_gemm_bandwidth_probes
     part: compute
-    status: experimental
-    implementation: >-
-      csrc/moe/arm/sve_bf16/jit_kernels.cpp,
-      csrc/moe/arm/common/fused_moe_bf16_tiled.cpp,
-      optimizations/fused_moe_sve/benchmarks/bench_pure_w13_gemm_m1_m2.py,
-      and
-      optimizations/fused_moe_sve/benchmarks/profile_pure_gemm_probe.sh, plus
-      cpu_moe_schedule_optimization/cost_model/profile_analytic_services.py
-      and cpu_moe_schedule_optimization/cost_model/build_analytic_calibration.py
+    status: retired
+    implementation: Removed from the active tree; retained in Git history.
+    history: 9aa9248
     hypothesis: >-
       For a cold packed-B M1 GEMM, same-traversal B-only, A-only, B+A,
       B+BFMMLA, no-store, store, and fixed-A controls can separate lower-level
@@ -227,19 +221,45 @@ features:
       - compute.xbyak_exact_m
       - compute.xbyak_double_buffer_kloop
     conflicts_with: []
+    correctness: historical; restore history commit 9aa9248 to reproduce
+    benchmark: historical; restore history commit 9aa9248 to reproduce
+    result: >-
+      Retired on 2026-08-10 after the instruction-level decomposition was
+      complete. BA-only, BFMMLA-only, A-only, control-only, store, and fixed-A
+      modes plus their dedicated Python/perf harnesses no longer justify
+      production maintenance. Measurements and conclusions remain in
+      results/amazon_192c_small_m_gemm_bandwidth.md.
+
+  - id: measurement.analytic_service_kernels
+    part: measurement
+    status: experimental
+    implementation: >-
+      csrc/moe/arm/sve_bf16/jit_kernels.cpp,
+      csrc/moe/arm/common/fused_moe_bf16_tiled.cpp, and
+      cpu_moe_schedule_optimization/cost_model/profile_analytic_services.py
+    hypothesis: >-
+      Three stable generated services are sufficient for thin machine
+      calibration: B-only measures endpoint-to-register packed-weight service,
+      M12 full-no-store measures the executable L1/L2 GEMM core ceiling, and
+      M12 matrix-only preserves register-only arithmetic provenance. Their
+      numeric mode ids remain stable because profile files record them.
+    depends_on:
+      - compute.xbyak_exact_m
+      - compute.xbyak_double_buffer_kloop
+    conflicts_with: []
     correctness: >-
-      PYTHONPATH=src FUSED_CPP_MOE_SVE_JIT_M2_DUAL_N=1
-      .venv/bin/python -m pytest -q
-      tests/test_fused_moe_bf16_tiled.py::test_sve_xbyak_exact_m_matches_static_asm
+      PYTHONPATH=src FUSED_CPP_MOE_SVE=1 .venv/bin/python -m pytest -q
+      tests/test_fused_moe_bf16_tiled.py -k m12_service_probe
     benchmark: >-
       PYTHONPATH=src numactl --cpunodebind=0 --membind=0 taskset -c 0-95
       .venv/bin/python
       cpu_moe_schedule_optimization/cost_model/profile_analytic_services.py
       --output /tmp/moe_analytic_services.json --cpu-ids 0-95
     result: >-
-      optimizations/fused_moe_sve/results/amazon_192c_analytic_thin_calibration_20260801.md;
-      the NUMA0 calibration remains shadow-only because contention P90 and
-      maximum measured shape regret did not pass the production gates.
+      These services feed the analytical machine calibration. The current
+      AmazonC5192Cores NUMA0 calibration remains shadow-only because contention
+      P90 and maximum measured shape regret did not pass production gates; see
+      results/amazon_192c_analytic_thin_calibration_20260801.md.
 
   - id: measurement.gemm_operand_memory_services
     part: measurement
@@ -256,7 +276,7 @@ features:
       GEMM-consumable bandwidth curves without substituting generic STREAM
       bandwidth for the kernel request pattern.
     depends_on:
-      - compute.xbyak_pure_gemm
+      - measurement.analytic_service_kernels
     conflicts_with: []
     correctness: >-
       PYTHONPATH=src .venv/bin/python -m pytest -q

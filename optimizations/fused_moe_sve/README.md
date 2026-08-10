@@ -86,6 +86,14 @@ the measurements remain in this report and the implementation remains in Git
 history:
 [`results/amazon_192c_w13_first_panel_prefetch.md`](results/amazon_192c_w13_first_panel_prefetch.md).
 
+The one-off small-M instruction decomposition is complete. Its BA-only,
+BFMMLA-only, A-only, control-only, store, and fixed-A JIT modes and dedicated
+perf harnesses were removed from the active tree on 2026-08-10 and remain at
+Git commit `9aa9248`; the evidence remains in
+[`results/amazon_192c_small_m_gemm_bandwidth.md`](results/amazon_192c_small_m_gemm_bandwidth.md).
+Machine calibration retains only the stable B-only, M12 full-no-store, and M12
+matrix-only services, with their historical numeric mode ids unchanged.
+
 The NUMA0 single-core cold-weight calibration uses 64 rotating H4096/F512
 experts and a standalone SVE `LD1H` reader. The production-like 12 MiB chunk
 read ceiling is 40.04 GB/s; the M2 fused W13+W2 stages reach 36.50 GB/s
@@ -94,13 +102,13 @@ rises to 71.3%. Exact definitions, M1-M12 tables, and reproduction commands are
 in
 [`results/amazon_192c_single_core_m1_m12_efficiency.md`](results/amazon_192c_single_core_m1_m12_efficiency.md).
 
-`bench_pure_w13_gemm_m1_m2.py` removes the fused W13 epilogue by running the
-same exact-M packed-A/B JIT K-loop with the plain FP32 GEMM store. With the
+The retired pure-W13 M1/M2 benchmark removed the fused W13 epilogue by running
+the same exact-M packed-A/B JIT K-loop with the plain FP32 GEMM store. With the
 production `R13=2,R2=1` geometry, cold-weight M1/M2 sustain about 36.1-36.6 GB/s,
 or 90-91% of the calibrated read ceiling. This is essentially the same as the
 complete M2 W13+W2 stage, locating the remaining bandwidth gap in the GEMM
-load/compute loop rather than SiLU or pack-C. Results and the reproduction
-command are in
+load/compute loop rather than SiLU or pack-C. The source remains at Git commit
+`9aa9248`; results and the historical reproduction command are in
 [`results/amazon_192c_pure_w13_gemm_m1_m2.md`](results/amazon_192c_pure_w13_gemm_m1_m2.md).
 
 ## SVE weighted route merge
