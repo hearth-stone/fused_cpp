@@ -13,6 +13,8 @@ from typing import Dict, List, Mapping, Protocol, Sequence, Tuple
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "cost_model"))
 from phase_model import ContentionCostModel  # noqa: E402
 from profile_catalog import ProfileCompatibilityError  # noqa: E402
+from stage_window_policy import FULL_STRIPE as _FULL_STRIPE_WINDOW  # noqa: E402
+from stage_window_policy import default_stage_window_policy  # noqa: E402
 
 
 _ASYNC_PLAN_VERSION = 2
@@ -32,6 +34,8 @@ _BOUNDED_TAIL_TASKS = 2
 _BOUNDED_TAIL_DEFAULT_CORES = 96
 _EARLY_MERGE_EQUAL_FINISH_REL_TOL = 1e-6
 _EARLY_MERGE_EQUAL_FINISH_ABS_NS = 1.0
+# Sentinel so a resolved-to-None stage-window policy is only looked up once.
+_UNSET = object()
 
 
 class PlannerPolicy(Protocol):
@@ -157,6 +161,7 @@ class IntervalPlanner:
             raise ValueError(f"stage must be None, 'w13', or 'w2', got {stage!r}")
         self.stage = stage
         self.model = model
+        self._stage_window_policy_cached = _UNSET
         self.num_cores = int(num_cores)
         model_widths = getattr(self.model, "supported_widths", None)
         self.widths = tuple(widths or model_widths or _default_widths(self.num_cores))
@@ -1081,6 +1086,7 @@ class IntervalPlanner:
             int(routes) if expert_task_counts[int(expert)] > 1 else _ASYNC_FULL_EXPERT_RANGE
             for expert, routes, _, _, _ in tasks
         ]
+        w13_windows, w2_windows = self._stage_windows(tasks, task_threads)
         return {
             "plan_version": _ASYNC_PLAN_VERSION,
             "execution_mode": _ASYNC_EXECUTION_STRICT,
@@ -1101,11 +1107,50 @@ class IntervalPlanner:
             "task_stage_ids": [_ASYNC_STAGE_EXPERT] * num_tasks,
             "task_resize_points": [_ASYNC_RESIZE_NONE] * num_tasks,
             "task_range_granularities": task_range_granularities,
+            "task_w13_window_tiles": w13_windows,
+            "task_w2_window_tiles": w2_windows,
             "task_release_ns": [0] * num_tasks,
             "task_resize_timeout_ns": [0] * num_tasks,
             "task_preferred_core_begins": [-1] * num_tasks,
             "early_merge": self._early_merge_policy(tasks),
         }
+
+    def _stage_windows(self, tasks, task_threads) -> tuple[list[int], list[int]]:
+        """Per-task `(w13, w2)` owner windows in whole N tiles.
+
+        A deterministic read of the calibrated table at the already-selected
+        `(routes, threads)`, so this adds no search dimension. Shapes with no
+        calibrated policy get the full stripe, which is the pre-window geometry.
+        """
+        num_tasks = len(tasks)
+        policy = self._stage_window_policy()
+        if policy is None:
+            return ([_FULL_STRIPE_WINDOW] * num_tasks, [_FULL_STRIPE_WINDOW] * num_tasks)
+        w13_windows: list[int] = []
+        w2_windows: list[int] = []
+        for (_, routes, _, _, _), threads in zip(tasks, task_threads):
+            w13, w2 = policy.select(int(routes), int(threads))
+            w13_windows.append(int(w13))
+            w2_windows.append(int(w2))
+        return (w13_windows, w2_windows)
+
+    def _stage_window_policy(self):
+        if self._stage_window_policy_cached is not _UNSET:
+            return self._stage_window_policy_cached
+        policy = getattr(self.model, "policy", None)
+        resolved = None
+        if policy is not None:
+            hidden_size = getattr(policy, "hidden_size", None)
+            intermediate_size = getattr(policy, "intermediate_size", None)
+            backend_n_tile = getattr(policy, "backend_n_tile", None)
+            if None not in (hidden_size, intermediate_size, backend_n_tile):
+                resolved = default_stage_window_policy(
+                    hidden_size=int(hidden_size),
+                    intermediate_size=int(intermediate_size),
+                    backend_n_tile=int(backend_n_tile),
+                )
+        self._stage_window_policy_cached = resolved
+        return resolved
 
     def to_elastic_w2_bridge(
         self,
@@ -1249,6 +1294,7 @@ class IntervalPlanner:
 
         task_threads = [pool_threads if pooled[task] else int(values[3]) for task, values in enumerate(tasks)]
         num_tasks = len(tasks)
+        tail_pool_w13_windows, tail_pool_w2_windows = self._stage_windows(tasks, task_threads)
         return {
             "plan_version": _ASYNC_PLAN_VERSION,
             "execution_mode": _ASYNC_EXECUTION_TAIL_POOL,
@@ -1271,6 +1317,8 @@ class IntervalPlanner:
             "task_stage_ids": [_ASYNC_STAGE_EXPERT] * num_tasks,
             "task_resize_points": [_ASYNC_RESIZE_NONE] * num_tasks,
             "task_range_granularities": [_ASYNC_FULL_EXPERT_RANGE] * num_tasks,
+            "task_w13_window_tiles": tail_pool_w13_windows,
+            "task_w2_window_tiles": tail_pool_w2_windows,
             "task_release_ns": [0] * num_tasks,
             "task_resize_timeout_ns": [0] * num_tasks,
             "task_preferred_core_begins": [-1] * num_tasks,
