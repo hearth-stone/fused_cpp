@@ -686,6 +686,27 @@ features:
     correctness: historical
     benchmark: historical
 
+  - id: dispatch.production_2d_adapter
+    part: dispatch
+    status: retired
+    implementation: Removed from the production runtime; retained in Git history.
+    history: 8e9fcbd
+    hypothesis: >-
+      A production M-by-N adapter could expose mixed team geometry without
+      changing the packed weights or microkernels. The implementation never
+      selected an M split: its planner always returned tm=1 and tn=team width,
+      and every SVE wrapper required row_begin=0. It therefore duplicated the
+      existing N-split dispatch while adding wrappers, branches, tests, and an
+      environment compatibility surface. The independent mixed-MN Lab
+      benchmark remains the supported place to evaluate this hypothesis.
+    depends_on:
+      - dispatch.full_n_team_stripes
+    conflicts_with: []
+    correctness: historical; restore Git 8e9fcbd to reproduce
+    benchmark: >-
+      Active mixed-MN evaluation remains in
+      optimizations/fused_moe_sve/benchmarks/bench_mn_split.cpp.
+
   - id: dispatch.full_n_team_stripes
     part: dispatch
     status: enabled
@@ -1174,6 +1195,13 @@ variants:
     features: []
     entrypoint: elastic::Executor::run_static
     status: reference
+
+  - id: sve_production_2d_adapter
+    features:
+      - dispatch.production_2d_adapter
+    entrypoint: Removed from the active tree; retained in Git history 8e9fcbd.
+    status: retired
+    history: 8e9fcbd
 
   - id: sve_production_one_kchunk
     features:

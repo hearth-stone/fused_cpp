@@ -941,19 +941,16 @@ def test_sve_route_merge_matches_reference(
 
 
 @pytest.mark.parametrize("bridge", ["normal", "scheduled", "async"])
-@pytest.mark.parametrize("split_2d", [False, True], ids=["nsplit", "2d-nsplit"])
 @pytest.mark.parametrize("w2_bf16_route", [False, True], ids=["fp32-route", "bf16-route"])
 def test_sve_w2_direct_route_store_matches_scatter(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     bridge: str,
-    split_2d: bool,
     w2_bf16_route: bool,
 ) -> None:
     """Cover interleaved route IDs, every M tail, and multi-thread N ownership."""
     monkeypatch.setenv("FUSED_CPP_MOE_SVE", "1")
     monkeypatch.setenv("FUSED_CPP_MOE_W2_BF16_ROUTE", "1" if w2_bf16_route else "0")
-    monkeypatch.setenv("FUSED_CPP_MOE_FUSED_2D_SPLIT", "1" if split_2d else "0")
     generator = torch.Generator().manual_seed(20260716)
     hidden_size = 64
     ffn_hidden_size = 32
@@ -967,12 +964,7 @@ def test_sve_w2_direct_route_store_matches_scatter(
     affinity = sorted(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else list(range(threads))
     if len(affinity) < threads:
         pytest.skip(f"requires {threads} available CPUs")
-    if bridge == "normal" and split_2d:
-        monkeypatch.setenv("FUSED_CPP_MOE_HIERARCHICAL_N_SPLIT", "1")
-        monkeypatch.setenv("FUSED_CPP_MOE_N_SPLIT_CORE_BASES", str(affinity[0]))
-        monkeypatch.setenv("FUSED_CPP_MOE_N_SPLIT_GROUPS_PER_PARTITION", "1")
-    else:
-        monkeypatch.setenv("FUSED_CPP_MOE_HIERARCHICAL_N_SPLIT", "0")
+    monkeypatch.setenv("FUSED_CPP_MOE_HIERARCHICAL_N_SPLIT", "0")
 
     hidden_states = _bf16_normal((num_tokens, hidden_size), generator=generator, std=0.01)
     w13_weight = _bf16_normal(
@@ -1060,18 +1052,18 @@ def test_sve_w2_direct_route_store_matches_scatter(
             reference.float(),
             atol=0,
             rtol=0,
-            msg=lambda message: f"{bridge}/split_2d={split_2d}/bf16_route={w2_bf16_route}: {message}",
+            msg=lambda message: f"{bridge}/bf16_route={w2_bf16_route}: {message}",
         )
     assert candidate is not None
     monkeypatch.delenv(direct_flag)
-    if bridge == "async" and not split_2d:
+    if bridge == "async":
         trace_path = tmp_path / "default_w2_direct_route.log"
         monkeypatch.setenv("FUSED_CPP_MOE_TRACE", "1")
         monkeypatch.setenv("FUSED_CPP_MOE_TRACE_FILE", str(trace_path))
     default = run()
     monkeypatch.setenv("FUSED_CPP_MOE_TRACE", "0")
     torch.testing.assert_close(default.float(), candidate.float(), atol=0, rtol=0)
-    if bridge == "async" and not split_2d:
+    if bridge == "async":
         trace = trace_path.read_text()
         assert "stage=w2_direct_route" in trace
         assert "stage=scatter_route_out" not in trace
@@ -1173,8 +1165,6 @@ def test_async_ready_token_merge_overlaps_imbalanced_experts(
     monkeypatch.setenv("FUSED_CPP_MOE_SVE", "1")
     monkeypatch.setenv("FUSED_CPP_MOE_W2_BF16_ROUTE", "1" if w2_bf16_route else "0")
     monkeypatch.setenv("FUSED_CPP_MOE_SVE_W2_DIRECT_ROUTE", "1")
-    monkeypatch.setenv("FUSED_CPP_MOE_FUSED_2D_SPLIT", "0")
-
     generator = torch.Generator().manual_seed(20260716)
     hidden_size = 512
     ffn_hidden_size = 256

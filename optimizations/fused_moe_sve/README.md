@@ -13,6 +13,13 @@ the full owner stripe `ceil((N/v)/threads)`; the environment override exists
 only for controlled experiments. Sections explicitly labelled historical retain
 the earlier split/range implementations only as provenance.
 
+The production `FUSED_CPP_MOE_FUSED_2D_SPLIT` adapter was also removed on
+2026-08-10. It always lowered to `tm=1, tn=threads`, and its SVE wrappers only
+accepted `row_begin=0`, so it was an N-split compatibility layer rather than a
+mixed M-by-N implementation. The actual mixed-MN experiment remains isolated
+in `bench_mn_split.cpp`; restore Git `8e9fcbd` only when reproducing the retired
+production adapter.
+
 ## Xbyak exact-M compute kernels
 
 The default one-chunk SVE path generates W13 fused-SiLU/packC, W2 FP32, and W2
