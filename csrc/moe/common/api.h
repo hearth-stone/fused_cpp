@@ -82,20 +82,6 @@ at::Tensor fused_moe_bf16_tiled_async_plan_v2(
     c10::optional<at::Tensor> w13_bias, c10::optional<at::Tensor> w2_bias, int64_t num_threads, std::string activation,
     int64_t global_num_experts, bool skip_weighted, bool fuse_silu, int64_t silu_poly_degree, int64_t gemm_backend,
     int64_t backend_n_tile, c10::optional<at::Tensor> out, int64_t early_merge);
-at::Tensor fused_moe_bf16_tiled_async_plan_v2_elastic(
-    at::Tensor input, at::Tensor w13_packed, int64_t w13_K, int64_t w13_N, at::Tensor w2_packed, int64_t w2_K,
-    int64_t w2_N, at::Tensor topk_weights, at::Tensor topk_ids, at::Tensor task_expert_ids, at::Tensor task_core_begins,
-    at::Tensor task_threads, at::Tensor task_dep_offsets, at::Tensor task_deps, int64_t plan_version,
-    int64_t execution_mode, at::Tensor task_preferred_threads, at::Tensor task_min_threads, at::Tensor task_max_threads,
-    at::Tensor task_allowed_thread_offsets, at::Tensor task_allowed_threads, at::Tensor task_placement_modes,
-    at::Tensor task_numa_nodes, at::Tensor task_stage_ids, at::Tensor task_resize_points,
-    at::Tensor task_range_granularities, c10::optional<at::Tensor> task_w13_window_tiles,
-    c10::optional<at::Tensor> task_w2_window_tiles, c10::optional<at::Tensor> thread_cpu_ids,
-    c10::optional<at::Tensor> w13_bias, c10::optional<at::Tensor> w2_bias, int64_t num_threads, std::string activation,
-    int64_t global_num_experts, bool skip_weighted, bool fuse_silu, int64_t silu_poly_degree, int64_t gemm_backend,
-    int64_t backend_n_tile, c10::optional<at::Tensor> out,
-    c10::optional<at::Tensor> task_resize_timeout_ns, c10::optional<at::Tensor> elastic_stats_out,
-    c10::optional<at::Tensor> task_preferred_core_begins, int64_t early_merge);
 at::Tensor fused_moe_bf16_tiled_planned_staged(
     at::Tensor input, at::Tensor w13_packed, int64_t w13_K, int64_t w13_N, at::Tensor w2_packed, int64_t w2_K,
     int64_t w2_N, at::Tensor topk_weights, at::Tensor topk_ids, at::Tensor w13_task_expert_ids,

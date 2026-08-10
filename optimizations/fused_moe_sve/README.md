@@ -814,6 +814,17 @@ The controlled full-pipeline fusion comparison is recorded in
 The unique-weight single-core cache-window measurements are recorded in
 [`results/amazon_192c_single_core_weight_window.md`](results/amazon_192c_single_core_weight_window.md).
 
+## W2 boundary elasticity (retired)
+
+The experimental Plan V2 W13-to-W2 elastic cohort path has been removed from
+the active source tree. Generic workloads regressed by 2.5%--24.8% because
+boundary handoff and cohort formation outweighed the scarce natural regrouping
+opportunities. One explicitly placed active-set tail improved by 3.66%, but the
+production bounded tail repartition captures that planner-visible case without
+carrying a second runtime scheduler and ABI. The implementation remains in Git
+history at `0b58091`; measurements and commands remain in
+`results/amazon_192c_w2_boundary_elastic.md`.
+
 ## Historical packed-B stage ranges (retired)
 
 This section documents the removed range/window implementation and its old

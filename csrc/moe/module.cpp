@@ -131,24 +131,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("early_merge") = -1,
         py::call_guard<py::gil_scoped_release>());
 
-  m.def("fused_moe_bf16_tiled_async_plan_v2_elastic", &fused_moe_bf16_tiled_async_plan_v2_elastic,
-        "Run experimental W13-to-W2 elastic Plan V2 execution.", py::arg("input"), py::arg("w13_packed"),
-        py::arg("w13_K"), py::arg("w13_N"), py::arg("w2_packed"), py::arg("w2_K"), py::arg("w2_N"),
-        py::arg("topk_weights"), py::arg("topk_ids"), py::arg("task_expert_ids"), py::arg("task_core_begins"),
-        py::arg("task_threads"), py::arg("task_dep_offsets"), py::arg("task_deps"), py::arg("plan_version"),
-        py::arg("execution_mode"), py::arg("task_preferred_threads"), py::arg("task_min_threads"),
-        py::arg("task_max_threads"), py::arg("task_allowed_thread_offsets"), py::arg("task_allowed_threads"),
-        py::arg("task_placement_modes"), py::arg("task_numa_nodes"), py::arg("task_stage_ids"),
-        py::arg("task_resize_points"), py::arg("task_range_granularities"),
-        py::arg("task_w13_window_tiles") = c10::nullopt, py::arg("task_w2_window_tiles") = c10::nullopt,
-        py::arg("thread_cpu_ids") = c10::nullopt, py::arg("w13_bias") = c10::nullopt, py::arg("w2_bias") = c10::nullopt,
-        py::arg("num_threads") = 1, py::arg("activation") = "silu", py::arg("global_num_experts") = -1,
-        py::arg("skip_weighted") = false, py::arg("fuse_silu") = false, py::arg("silu_poly_degree") = 5,
-        py::arg("gemm_backend") = 0, py::arg("backend_n_tile") = 8, py::arg("out") = c10::nullopt,
-        py::arg("task_resize_timeout_ns") = c10::nullopt,
-        py::arg("elastic_stats_out") = c10::nullopt, py::arg("task_preferred_core_begins") = c10::nullopt,
-        py::arg("early_merge") = -1, py::call_guard<py::gil_scoped_release>());
-
   m.def("fused_moe_bf16_tiled_planned_staged", &fused_moe_bf16_tiled_planned_staged,
         "Run experimental independently planned global W13/W2 stages.", py::arg("input"), py::arg("w13_packed"),
         py::arg("w13_K"), py::arg("w13_N"), py::arg("w2_packed"), py::arg("w2_K"), py::arg("w2_N"),

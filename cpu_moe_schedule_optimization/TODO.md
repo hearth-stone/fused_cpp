@@ -261,9 +261,10 @@ Acceptance gates:
   measured elastic variant is slower than strict. Keep it outside production
   cost-model ranking. See
   `optimizations/fused_moe_sve/results/amazon_192c_w2_boundary_elastic.md`.
-- [ ] If W2 boundary elasticity is revisited, preserve the strict hot path for
-  fallback tasks and charge boundary handoff plus non-preemptible cohort
-  queueing in the admission rule before adding it to planner search.
+- [x] Retire W2 boundary elasticity from the active runtime, Plan V2 schema,
+  planner bridge, and benchmark CLI. Generic cases regressed 2.5%--24.8%; the
+  planner-visible `+3.66%` tail case is covered by bounded tail repartition.
+  Preserve the implementation at Git `0b58091` and the result report above.
 - [x] Allow the experimental elastic bridge to assign a disjoint same-NUMA W2
   target cohort. The runtime acquires the destination before releasing the
   source, so paired tail tasks can realize mappings such as

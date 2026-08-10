@@ -11,11 +11,7 @@ from typing import Any, Mapping, Tuple
 
 import torch
 
-from fused_cpp.moe.plan import (
-    ASYNC_MOE_ELASTIC_STATS_FIELDS,
-    ASYNC_MOE_EXECUTION_ELASTIC,
-    AsyncMoEPlanV2,
-)
+from fused_cpp.moe.plan import AsyncMoEPlanV2
 
 PreparedWeight = Tuple[torch.Tensor, int, int]
 
@@ -40,9 +36,6 @@ try:
     _fused_moe_bf16_tiled_scheduled_impl = _moe_native.fused_moe_bf16_tiled_scheduled
     _fused_moe_bf16_tiled_async_impl = _moe_native.fused_moe_bf16_tiled_async
     _fused_moe_bf16_tiled_async_plan_v2_impl = getattr(_moe_native, "fused_moe_bf16_tiled_async_plan_v2", None)
-    _fused_moe_bf16_tiled_async_plan_v2_elastic_impl = getattr(
-        _moe_native, "fused_moe_bf16_tiled_async_plan_v2_elastic", None
-    )
     _fused_moe_bf16_tiled_planned_staged_impl = getattr(_moe_native, "fused_moe_bf16_tiled_planned_staged", None)
     _fused_moe_bf16_tiled_vllm_staged_impl = _moe_native.fused_moe_bf16_tiled_vllm_staged
     _prepare_bf16_tiled_impl = _moe_native.fused_moe_bf16_tiled_prepare_weights
@@ -63,7 +56,6 @@ try:
         "fused_moe_bf16_tiled_scheduled",
         "fused_moe_bf16_tiled_async",
         "fused_moe_bf16_tiled_async_plan_v2",
-        "fused_moe_bf16_tiled_async_plan_v2_elastic",
         "fused_moe_bf16_tiled_planned_staged",
         "fused_moe_bf16_tiled_vllm_staged",
         "fused_moe_test_split_plan",
@@ -94,7 +86,6 @@ except ImportError as error:
     _fused_moe_bf16_tiled_scheduled_impl = None
     _fused_moe_bf16_tiled_async_impl = None
     _fused_moe_bf16_tiled_async_plan_v2_impl = None
-    _fused_moe_bf16_tiled_async_plan_v2_elastic_impl = None
     _fused_moe_bf16_tiled_planned_staged_impl = None
     _fused_moe_bf16_tiled_vllm_staged_impl = None
     _prepare_bf16_tiled_impl = None
@@ -106,7 +97,6 @@ except AttributeError:
     _fused_moe_bf16_tiled_scheduled_impl = None
     _fused_moe_bf16_tiled_async_impl = None
     _fused_moe_bf16_tiled_async_plan_v2_impl = None
-    _fused_moe_bf16_tiled_async_plan_v2_elastic_impl = None
     _fused_moe_bf16_tiled_planned_staged_impl = None
     _fused_moe_bf16_tiled_vllm_staged_impl = None
     _prepare_bf16_tiled_impl = None
@@ -586,21 +576,6 @@ def fused_moe_bf16_tiled_async(
     return out if out is not None else result
 
 
-def make_async_moe_elastic_stats() -> torch.Tensor:
-    """Allocate the native elastic scheduler's fixed-layout counters."""
-    return torch.zeros(len(ASYNC_MOE_ELASTIC_STATS_FIELDS), dtype=torch.int64)
-
-
-def decode_async_moe_elastic_stats(stats: torch.Tensor) -> dict[str, int]:
-    """Convert native elastic scheduler counters into a named dictionary."""
-    if stats.device.type != "cpu" or stats.dtype != torch.int64:
-        raise TypeError("elastic stats must be a CPU torch.int64 tensor")
-    if stats.numel() < len(ASYNC_MOE_ELASTIC_STATS_FIELDS):
-        raise ValueError(f"elastic stats must contain at least {len(ASYNC_MOE_ELASTIC_STATS_FIELDS)} values")
-    values = stats.reshape(-1).tolist()[: len(ASYNC_MOE_ELASTIC_STATS_FIELDS)]
-    return dict(zip(ASYNC_MOE_ELASTIC_STATS_FIELDS, map(int, values), strict=True))
-
-
 def fused_moe_bf16_tiled_async_plan(
     input: torch.Tensor,
     weights: PreparedBF16TiledFusedMoEWeights,
@@ -615,24 +590,16 @@ def fused_moe_bf16_tiled_async_plan(
     skip_weighted: bool = False,
     silu_poly_degree: int = 5,
     out: torch.Tensor | None = None,
-    elastic_stats_out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Execute a validated Plan V2 through the native async DAG.
 
     ``strict`` preserves every fixed logical-thread interval. ``tail_pool``
     releases aligned thread groups after their fixed experts finish and lets
     each group claim whole pooled experts. Task widths remain fixed after
-    startup in both modes. ``elastic`` may expand or move W2 to a planner
-    selected same-NUMA cohort at the W13-to-W2 boundary;
-    ``elastic_stats_out`` receives the acquisition/fallback counts.
+    startup in both modes.
     """
     materialized = plan if isinstance(plan, AsyncMoEPlanV2) else AsyncMoEPlanV2.from_dict(plan)
-    if materialized.execution_mode == ASYNC_MOE_EXECUTION_ELASTIC:
-        if _fused_moe_bf16_tiled_async_plan_v2_elastic_impl is None:
-            raise RuntimeError("elastic Plan V2 requires native fused_moe_bf16_tiled_async_plan_v2_elastic support")
-    elif elastic_stats_out is not None:
-        raise ValueError("elastic_stats_out is only valid for elastic Plan V2 execution")
-    if materialized.execution_mode != ASYNC_MOE_EXECUTION_ELASTIC and _fused_moe_bf16_tiled_async_plan_v2_impl is None:
+    if _fused_moe_bf16_tiled_async_plan_v2_impl is None:
         raise RuntimeError("Plan V2 requires native fused_moe_bf16_tiled_async_plan_v2 support")
     _require_backend()
     if input.dtype != torch.bfloat16:
@@ -644,16 +611,6 @@ def fused_moe_bf16_tiled_async_plan(
     if not topk_weights.dtype.is_floating_point:
         raise TypeError(f"topk_weights must use a floating dtype, got {topk_weights.dtype}")
     _validate_output_buffer(input, out)
-    assert materialized.task_resize_timeout_ns is not None
-    assert materialized.task_preferred_core_begins is not None
-    if elastic_stats_out is not None:
-        if elastic_stats_out.device.type != "cpu" or elastic_stats_out.dtype != torch.int64:
-            raise TypeError("elastic_stats_out must be a CPU torch.int64 tensor")
-        if not elastic_stats_out.is_contiguous():
-            raise ValueError("elastic_stats_out must be contiguous")
-        if elastic_stats_out.numel() < len(ASYNC_MOE_ELASTIC_STATS_FIELDS):
-            raise ValueError(f"elastic_stats_out must contain at least {len(ASYNC_MOE_ELASTIC_STATS_FIELDS)} values")
-
     common_args = (
         input.contiguous(),
         weights.w13[0],
@@ -696,21 +653,10 @@ def fused_moe_bf16_tiled_async_plan(
         int(weights.backend_n_tile),
         out,
     )
-    if materialized.execution_mode == ASYNC_MOE_EXECUTION_ELASTIC:
-        assert _fused_moe_bf16_tiled_async_plan_v2_elastic_impl is not None
-        result = _fused_moe_bf16_tiled_async_plan_v2_elastic_impl(
-            *common_args,
-            materialized.task_resize_timeout_ns.contiguous(),
-            elastic_stats_out,
-            materialized.task_preferred_core_begins.contiguous(),
-            materialized.native_early_merge,
-        )
-    else:
-        assert _fused_moe_bf16_tiled_async_plan_v2_impl is not None
-        result = _fused_moe_bf16_tiled_async_plan_v2_impl(
-            *common_args,
-            materialized.native_early_merge,
-        )
+    result = _fused_moe_bf16_tiled_async_plan_v2_impl(
+        *common_args,
+        materialized.native_early_merge,
+    )
     return out if out is not None else result
 
 
@@ -892,8 +838,6 @@ __all__ = [
     "fused_moe_bf16_tiled_scheduled",
     "fused_moe_bf16_tiled_async",
     "fused_moe_bf16_tiled_async_plan",
-    "decode_async_moe_elastic_stats",
-    "make_async_moe_elastic_stats",
     "fused_moe_bf16_tiled_planned_staged",
     "fused_moe_bf16_tiled_vllm_staged",
     "bf16_tiled_fused_moe",

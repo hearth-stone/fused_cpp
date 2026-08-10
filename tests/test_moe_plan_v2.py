@@ -8,12 +8,10 @@ import torch
 
 import fused_cpp.moe.bf16_tiled as bf16_tiled
 from fused_cpp.moe.plan import (
-    ASYNC_MOE_EXECUTION_ELASTIC,
     ASYNC_MOE_EXECUTION_TAIL_POOL,
     ASYNC_MOE_PLACEMENT_FIXED,
     ASYNC_MOE_PLACEMENT_TAIL_POOL,
     ASYNC_MOE_PLAN_VERSION,
-    ASYNC_MOE_RESIZE_BEFORE_W2,
     AsyncMoEPlanV2,
     upgrade_legacy_async_plan,
 )
@@ -90,7 +88,6 @@ def test_upgrade_legacy_plan_produces_strict_singleton_widths() -> None:
     assert plan.num_threads == 4
     assert plan.thread_cpu_ids.tolist() == [8, 9, 10, 11]
     assert plan.task_threads.tolist() == [2, 2]
-    assert plan.task_preferred_core_begins.tolist() == [-1, -1]
     assert plan.early_merge is None
     assert plan.native_early_merge == -1
     assert plan.legacy_schedule()[0].tolist() == [3, 7]
@@ -115,20 +112,23 @@ def test_plan_v2_rejects_invalid_early_merge_control() -> None:
         AsyncMoEPlanV2.from_dict(bridge)
 
 
-def test_plan_v2_rejects_retired_task_release() -> None:
+@pytest.mark.parametrize(
+    "field",
+    ("task_release_ns", "task_resize_timeout_ns", "task_preferred_core_begins"),
+)
+def test_plan_v2_rejects_retired_task_fields(field: str) -> None:
     bridge = upgrade_legacy_async_plan(_legacy_bridge())
-    bridge["task_release_ns"] = [0, 0]
+    bridge[field] = [0, 0]
 
-    with pytest.raises(ValueError, match="task_release_ns has been retired"):
+    with pytest.raises(ValueError, match=f"{field} has been retired"):
         AsyncMoEPlanV2.from_dict(bridge)
 
 
-def test_elastic_plan_rejects_forced_early_merge() -> None:
+def test_plan_v2_rejects_retired_elastic_execution() -> None:
     bridge = upgrade_legacy_async_plan(_legacy_bridge())
-    bridge["execution_mode"] = ASYNC_MOE_EXECUTION_ELASTIC
-    bridge["early_merge"] = True
+    bridge["execution_mode"] = "elastic"
 
-    with pytest.raises(ValueError, match="does not support"):
+    with pytest.raises(ValueError, match="must be 'strict' or 'tail_pool'"):
         AsyncMoEPlanV2.from_dict(bridge)
 
 
@@ -200,118 +200,6 @@ def test_plan_v2_rejects_unsupported_resize_semantics() -> None:
         assert "do not support resize points" in str(error)
     else:
         raise AssertionError("unsupported resize metadata was accepted")
-
-
-def test_elastic_plan_accepts_same_numa_w2_expansion(monkeypatch) -> None:
-    bridge = upgrade_legacy_async_plan(_legacy_bridge())
-    bridge.update(
-        {
-            "execution_mode": ASYNC_MOE_EXECUTION_ELASTIC,
-            "task_preferred_threads": [4, 4],
-            "task_min_threads": [2, 2],
-            "task_max_threads": [4, 4],
-            "task_allowed_thread_offsets": [0, 2, 4],
-            "task_allowed_threads": [2, 4, 2, 4],
-            "task_numa_nodes": [0, 0],
-            "task_resize_points": [ASYNC_MOE_RESIZE_BEFORE_W2] * 2,
-            "task_resize_timeout_ns": [0, 5000],
-        }
-    )
-    monkeypatch.setattr("fused_cpp.moe.plan._linux_cpu_numa_node", lambda cpu: 0)
-
-    plan = AsyncMoEPlanV2.from_dict(bridge)
-
-    assert plan.native_execution_mode == 2
-    assert plan.task_preferred_threads.tolist() == [4, 4]
-    assert plan.task_resize_timeout_ns.tolist() == [0, 5000]
-    assert plan.task_preferred_core_begins.tolist() == [-1, -1]
-
-
-def test_elastic_plan_accepts_disjoint_w2_migration(monkeypatch) -> None:
-    bridge = upgrade_legacy_async_plan(
-        {
-            "num_threads": 8,
-            "thread_cpu_ids": list(range(8, 16)),
-            "task_expert_ids": [3, 7],
-            "task_core_begins": [0, 2],
-            "task_threads": [2, 2],
-            "task_dep_offsets": [0, 0, 0],
-            "task_deps": [],
-        }
-    )
-    bridge.update(
-        {
-            "execution_mode": ASYNC_MOE_EXECUTION_ELASTIC,
-            "task_preferred_threads": [4, 4],
-            "task_min_threads": [2, 2],
-            "task_max_threads": [4, 4],
-            "task_allowed_thread_offsets": [0, 2, 4],
-            "task_allowed_threads": [2, 4, 2, 4],
-            "task_numa_nodes": [0, 0],
-            "task_resize_points": [ASYNC_MOE_RESIZE_BEFORE_W2] * 2,
-            "task_resize_timeout_ns": [1000, 1000],
-            "task_preferred_core_begins": [0, 4],
-        }
-    )
-    monkeypatch.setattr("fused_cpp.moe.plan._linux_cpu_numa_node", lambda cpu: 0)
-
-    plan = AsyncMoEPlanV2.from_dict(bridge)
-
-    assert plan.task_preferred_core_begins.tolist() == [0, 4]
-
-
-def test_elastic_plan_rejects_partially_overlapping_w2_migration(monkeypatch) -> None:
-    bridge = upgrade_legacy_async_plan(
-        {
-            "num_threads": 8,
-            "thread_cpu_ids": list(range(8, 16)),
-            "task_expert_ids": [3],
-            "task_core_begins": [3],
-            "task_threads": [2],
-            "task_dep_offsets": [0, 0],
-            "task_deps": [],
-        }
-    )
-    bridge.update(
-        {
-            "execution_mode": ASYNC_MOE_EXECUTION_ELASTIC,
-            "task_preferred_threads": [4],
-            "task_min_threads": [2],
-            "task_max_threads": [4],
-            "task_allowed_thread_offsets": [0, 2],
-            "task_allowed_threads": [2, 4],
-            "task_numa_nodes": [0],
-            "task_resize_points": [ASYNC_MOE_RESIZE_BEFORE_W2],
-            "task_preferred_core_begins": [0],
-        }
-    )
-    monkeypatch.setattr("fused_cpp.moe.plan._linux_cpu_numa_node", lambda cpu: 0)
-
-    with pytest.raises(ValueError, match="contain or be disjoint"):
-        AsyncMoEPlanV2.from_dict(bridge)
-
-
-def test_elastic_plan_rejects_cross_numa_cohort(monkeypatch) -> None:
-    bridge = upgrade_legacy_async_plan(_legacy_bridge())
-    bridge.update(
-        {
-            "execution_mode": ASYNC_MOE_EXECUTION_ELASTIC,
-            "task_preferred_threads": [4, 4],
-            "task_min_threads": [2, 2],
-            "task_max_threads": [4, 4],
-            "task_allowed_thread_offsets": [0, 2, 4],
-            "task_allowed_threads": [2, 4, 2, 4],
-            "task_numa_nodes": [0, 0],
-            "task_resize_points": [ASYNC_MOE_RESIZE_BEFORE_W2] * 2,
-        }
-    )
-    monkeypatch.setattr(
-        "fused_cpp.moe.plan._linux_cpu_numa_node",
-        lambda cpu: 1 if cpu == 11 else 0,
-    )
-
-    with pytest.raises(ValueError, match="crosses NUMA"):
-        AsyncMoEPlanV2.from_dict(bridge)
 
 
 def test_plan_v2_rejects_inconsistent_allowed_widths() -> None:
@@ -415,61 +303,6 @@ def test_async_plan_wrapper_calls_native_plan_v2(monkeypatch) -> None:
     assert args[34] is True
     assert args[38] == 8
     assert args[40] == -1
-
-
-def test_async_plan_wrapper_calls_elastic_native_and_collects_stats(monkeypatch) -> None:
-    bridge = upgrade_legacy_async_plan(_legacy_bridge())
-    bridge.update(
-        {
-            "execution_mode": ASYNC_MOE_EXECUTION_ELASTIC,
-            "task_preferred_threads": [4, 4],
-            "task_min_threads": [2, 2],
-            "task_max_threads": [4, 4],
-            "task_allowed_thread_offsets": [0, 2, 4],
-            "task_allowed_threads": [2, 4, 2, 4],
-            "task_numa_nodes": [0, 0],
-            "task_resize_points": [ASYNC_MOE_RESIZE_BEFORE_W2] * 2,
-            "task_resize_timeout_ns": [0, 1000],
-        }
-    )
-    monkeypatch.setattr("fused_cpp.moe.plan._linux_cpu_numa_node", lambda cpu: 0)
-    plan = AsyncMoEPlanV2.from_dict(bridge)
-    captured: dict[str, object] = {}
-    sentinel = torch.empty(0)
-
-    def fake_elastic(*args):
-        captured["args"] = args
-        return sentinel
-
-    monkeypatch.setattr(bf16_tiled, "_HAS_BF16_TILED_FUSED_MOE", True)
-    monkeypatch.setattr(bf16_tiled, "_fused_moe_bf16_tiled_async_plan_v2_impl", lambda *args: sentinel)
-    monkeypatch.setattr(
-        bf16_tiled,
-        "_fused_moe_bf16_tiled_async_plan_v2_elastic_impl",
-        fake_elastic,
-    )
-    stats = bf16_tiled.make_async_moe_elastic_stats()
-
-    result = bf16_tiled.fused_moe_bf16_tiled_async_plan(
-        torch.empty((1, 1), dtype=torch.bfloat16),
-        _prepared_weights(),
-        torch.ones((1, 1)),
-        torch.zeros((1, 1), dtype=torch.int32),
-        plan,
-        skip_weighted=True,
-        elastic_stats_out=stats,
-    )
-
-    assert result is sentinel
-    args = captured["args"]
-    assert isinstance(args, tuple)
-    assert args[15] == 2
-    assert args[25].tolist() == [0, 0]
-    assert args[40].tolist() == [0, 1000]
-    assert args[41] is stats
-    assert args[42].tolist() == [-1, -1]
-    assert args[43] == -1
-    assert bf16_tiled.decode_async_moe_elastic_stats(stats)["eligible_tasks"] == 0
 
 
 def test_async_plan_wrapper_requires_native_plan_v2(monkeypatch) -> None:

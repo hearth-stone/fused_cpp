@@ -249,16 +249,13 @@ native `fused_moe_bf16_tiled_async_plan_v2` entrypoint:
   "task_stage_ids": [0, 0, 0],
   "task_resize_points": [0, 0, 0],
   "task_range_granularities": [0, 0, 0],
-  "task_resize_timeout_ns": [0, 0, 0],
-  "task_preferred_core_begins": [-1, -1, -1],
   "early_merge": null
 }
 ```
 
 Rules:
 
-- `plan_version` must be `2`; `execution_mode` is `strict`, `tail_pool`, or
-  experimental `elastic`.
+- `plan_version` must be `2`; `execution_mode` is `strict` or `tail_pool`.
 - `task_expert_ids`, `task_core_begins`, and `task_threads` have one entry per
   task.
 - `task_dep_offsets` / `task_deps` are a CSR dependency list. Dependencies must
@@ -272,49 +269,30 @@ Rules:
 - `task_preferred_threads[i]` and the selected `task_threads[i]` must both be in
   the task's allowed-width list. `task_min_threads` and `task_max_threads` must
   equal the first and last entries of that list.
-- `task_numa_nodes=-1` means no additional NUMA constraint and remains required
-  by strict/tail-pool execution. An elastic task with a resize point must carry
-  an explicit NUMA node, and every physical CPU in its preferred cohort must
-  resolve to that node.
+- `task_numa_nodes=-1` means no additional NUMA constraint and is required by
+  strict/tail-pool execution.
 - Stage id `0` means an expert pipeline task, resize mask `0` means no legal
   resize point, resize mask `1` means W13-to-W2 only, and range granularity
   `0` means the full expert task. A positive range granularity assigns the
   next contiguous route slice of that many rows to this occurrence of the
   expert id. Repeated occurrences are consumed in task-array order; the final
-  slice may be shorter, but the slices must cover the expert exactly. Mask `1`
-  is accepted only in elastic mode.
-- `task_resize_timeout_ns` is optional and defaults to zero. A zero timeout is a
-  nonblocking acquisition: the W2 stage expands only when all extra cohort
-  workers are already idle, otherwise its original team continues immediately.
-  A positive timeout lets W2-ready base teams in the same planner cohort
-  rendezvous until the deadline. Once a task reaches its deadline, later
-  cohorts cannot borrow its original team; it falls back as soon as any already
-  running finite W2 job releases those workers. The timeout therefore bounds
-  new-cohort formation, not preemption of an already running W2; observed
-  ready-to-assignment delay can include at most that final finite cohort job.
-- `task_preferred_core_begins` is optional and defaults to `-1`. For a
-  resizable elastic task, `-1` derives the aligned preferred cohort containing
-  the selected team. A non-negative value explicitly selects the logical-core
-  start of W2's preferred cohort. The explicit target must be aligned to
-  `task_preferred_threads`, fit within `num_threads`, remain on the task's NUMA
-  node, and either fully contain the selected interval or be completely
-  disjoint from it. Partial overlap is rejected. Strict, tail-pool, and
-  non-resizable elastic tasks require `-1`.
+  slice may be shorter, but the slices must cover the expert exactly. Resize
+  mask `1` is retired and rejected.
 - W13 and W2 always execute one complete packed-N stage. There are no per-task
   weight-range or byte-window fields. `task_threads[i]` partitions the full N
   tile domain among workers, and W2 owner-scatter follows the same ownership.
 - `early_merge` is an optional plan-level tri-state. Missing or `null` retains
   the runtime team-load heuristic, `true` forces the ready-token path, and
   `false` waits for expert compute to finish before all workers merge uniform
-  contiguous token ranges. `true` requires SVE direct-route W2 and is rejected
-  for elastic execution. `FUSED_CPP_MOE_ASYNC_READY_TOKEN_MERGE=0` remains a
+  contiguous token ranges. `true` requires SVE direct-route W2.
+  `FUSED_CPP_MOE_ASYNC_READY_TOKEN_MERGE=0` remains a
   global kill switch. A Python wrapper connected to a native extension without
   this argument rejects explicit `true`/`false` instead of ignoring it.
 - Strict execution permits either one full-route task per active expert or
   multiple route-slice tasks. All repeated tasks for one expert must carry the
   same positive granularity. Mixing full-route and sliced tasks, leaving a
   route gap, or extending past the available task count is rejected natively.
-  Tail-pool and elastic execution still require one full-route task per expert.
+  Tail-pool execution still requires one full-route task per expert.
   An expert becomes ready for token merge only after all of its slices finish;
   each slice owns disjoint route rows and an independent fixed team/scratch
   interval.
@@ -325,15 +303,6 @@ Rules:
   to that width. Pooled tasks have no dependencies, and fixed tasks cannot
   depend on pooled tasks. A released group claims one whole pooled expert at a
   time from the shared queue.
-- Elastic mode requires fixed placement and the fused ARM SVE backend. A
-  resizable task must have `preferred_threads > task_threads`, the preferred
-  width must be an integer multiple of the selected width. With a derived
-  target, the selected interval must fit in
-  `[floor(core_begin/preferred)*preferred, ... + preferred)`. An explicit
-  disjoint target migrates only W2: the runtime first acquires every target
-  worker, then releases source workers outside the target. It never preempts a
-  GEMM and never copies the task-owned packed-C intermediate. Failure to
-  acquire the complete target preserves the original team and kernel path.
 - Offline simulator JSON includes this representation under `async_bridge`.
 - The production planner currently emits a singleton allowed-width list for
   every task:
@@ -344,21 +313,19 @@ Rules:
   ```
 
   `AsyncMoEPlanV2` accepts a wider envelope so cached/offline plans can be
-  forward-compatible. Strict/tail-pool still use `task_threads` exactly after
-  a task starts; elastic may select `task_preferred_threads` only for W2.
+  forward-compatible. Strict/tail-pool use `task_threads` exactly after a task
+  starts.
 - `upgrade_legacy_async_plan()` converts the previous fixed-width dictionary to
   this singleton-width, all-fixed representation.
 - `fused_moe_bf16_tiled_async_plan()` is the public adapter. Callers
   should materialize and cache `AsyncMoEPlanV2` outside the timed operator path.
   A pre-V2 native extension can execute strict plans through the legacy entry,
-  but tail-pool plans require the V2 symbol and elastic plans require the
-  dedicated experimental elastic symbol.
-- `IntervalPlanner.to_elastic_w2_bridge()` lowers explicit planner transitions
-  such as `8:16` and `2:8` into aligned local cohorts. The bridge may restrict
-  resizing to selected task ids and attach an explicit W2 target start to each
-  selected task, enabling planner-specified disjoint cohorts such as
-  `16-31 -> 32-63`. This is currently a benchmark/validation bridge, not an
-  automatically searched production candidate.
+  but tail-pool plans require the V2 symbol.
+- The retired W2-boundary elastic fields `task_resize_timeout_ns` and
+  `task_preferred_core_begins`, and `execution_mode=elastic`, are rejected.
+  Restore Git history commit `0b58091` and consult
+  `optimizations/fused_moe_sve/results/amazon_192c_w2_boundary_elastic.md` to
+  reproduce the experiment.
 - `IntervalPlanner` and `PlannedMoE` compare the original strict execution with
   eligible whole-expert tail-pool and bounded terminal-repartition candidates
   by default. The tail pool searches route buckets `1/2/4/8/12` at or below

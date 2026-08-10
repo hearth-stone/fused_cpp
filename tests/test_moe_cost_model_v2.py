@@ -677,51 +677,6 @@ def test_tail_pool_bridge_relinks_fixed_lane_dependencies(
     assert runtime.last["execution_mode"] == "tail_pool"
 
 
-def test_elastic_w2_bridge_keeps_full_n_stage_geometry(
-    catalog: ProfileCatalog,
-) -> None:
-    model = model_for(catalog, "tp", 1024, 64)
-    planner = IntervalPlanner(model, 32, native_cold_planner=False)
-    tasks = [
-        (0, 192, 0, 8, []),
-        (1, 192, 8, 8, []),
-        (2, 192, 16, 8, []),
-        (3, 192, 24, 8, []),
-    ]
-
-    bridge = planner.to_elastic_w2_bridge(
-        tasks,
-        width_transitions={8: 16},
-        numa_node=0,
-        resize_timeout_ns=5000,
-    )
-
-    assert bridge["execution_mode"] == "elastic"
-    assert bridge["task_threads"] == [8, 8, 8, 8]
-    assert bridge["task_preferred_threads"] == [16, 16, 16, 16]
-    assert bridge["task_allowed_thread_offsets"] == [0, 2, 4, 6, 8]
-    assert bridge["task_allowed_threads"] == [8, 16] * 4
-    assert bridge["task_resize_points"] == [1] * 4
-    assert bridge["task_resize_timeout_ns"] == [5000] * 4
-    assert bridge["task_numa_nodes"] == [0] * 4
-    assert bridge["task_preferred_core_begins"] == [0, 0, 16, 16]
-    assert "task_w13_ranges" not in bridge
-    assert "task_w2_ranges" not in bridge
-
-    migrated_bridge = planner.to_elastic_w2_bridge(
-        tasks,
-        width_transitions={8: 16},
-        numa_node=0,
-        resize_timeout_ns=100_000,
-        resizable_task_ids=[0, 1],
-        task_preferred_core_begins={0: 0, 1: 16},
-    )
-    assert migrated_bridge["task_preferred_threads"] == [16, 16, 8, 8]
-    assert migrated_bridge["task_resize_points"] == [1, 1, 0, 0]
-    assert migrated_bridge["task_preferred_core_begins"] == [0, 16, -1, -1]
-    assert migrated_bridge["task_resize_timeout_ns"] == [100_000, 100_000, 0, 0]
-
-
 def test_m12_tail_composition(catalog: ProfileCatalog) -> None:
     model = model_for(catalog, "tp", 1024, 64)
     assert model.m12_effective_rows(3) == 4

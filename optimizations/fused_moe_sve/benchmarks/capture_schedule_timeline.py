@@ -22,7 +22,6 @@ PLANNER_DIR = REPO_ROOT / "cpu_moe_schedule_optimization" / "planners"
 sys.path[:0] = [str(REPO_ROOT / "src"), str(COST_MODEL_DIR), str(PLANNER_DIR)]
 
 from bench_vllm_staged_schedule import (  # noqa: E402
-    make_elastic_w2_plan,
     make_static_tail_repartition_plan,
     materialize_topk_ids,
 )
@@ -91,22 +90,6 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--trace-file", type=Path, default=DEFAULT_TRACE)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
-    parser.add_argument(
-        "--elastic-w2-transitions",
-        default="",
-        help="comma-separated selected:preferred W2 widths, for example 16:32",
-    )
-    parser.add_argument(
-        "--elastic-task-ids",
-        default="",
-        help="comma-separated task ids eligible for W2 resize",
-    )
-    parser.add_argument(
-        "--elastic-w2-core-begins",
-        default="",
-        help="comma-separated task_id:logical_core_begin W2 targets",
-    )
-    parser.add_argument("--elastic-timeout-us", type=float, default=0.0)
     parser.add_argument(
         "--static-tail-width",
         type=int,
@@ -210,31 +193,6 @@ def override_early_merge(plan: AsyncMoEPlanV2, policy: str) -> AsyncMoEPlanV2:
     if policy == "auto":
         return plan
     return replace(plan, early_merge=policy == "on")
-
-
-def parse_int_mapping(value: str, *, description: str) -> dict[int, int]:
-    if not value:
-        return {}
-    result: dict[int, int] = {}
-    for item in value.split(","):
-        try:
-            key_text, value_text = item.split(":", maxsplit=1)
-            key, parsed_value = int(key_text), int(value_text)
-        except ValueError as error:
-            raise ValueError(f"invalid {description} {item!r}; expected integer:integer") from error
-        if key < 0 or parsed_value < 0:
-            raise ValueError(f"{description} values must be non-negative, got {item!r}")
-        result[key] = parsed_value
-    return result
-
-
-def parse_task_ids(value: str) -> list[int] | None:
-    if not value:
-        return None
-    task_ids = [int(item) for item in value.split(",")]
-    if any(task < 0 for task in task_ids):
-        raise ValueError("--elastic-task-ids values must be non-negative")
-    return task_ids
 
 
 def task_dependencies(bridge: dict[str, Any], task: int) -> list[int]:
@@ -622,45 +580,7 @@ def capture_actual(
     )
     plan_payload = plan_payload["bridge"]
     plan = AsyncMoEPlanV2.from_dict(plan_payload)
-    transitions = parse_int_mapping(
-        args.elastic_w2_transitions,
-        description="elastic W2 transition",
-    )
-    if transitions and args.static_tail_width is not None:
-        raise ValueError("--elastic-w2-transitions and --static-tail-width are mutually exclusive")
-    if transitions:
-        task_ids = parse_task_ids(args.elastic_task_ids)
-        target_core_begins = parse_int_mapping(
-            args.elastic_w2_core_begins,
-            description="elastic W2 target",
-        )
-        plan = make_elastic_w2_plan(
-            plan,
-            torch.tensor(workload.histogram, dtype=torch.int64),
-            profile=args.profile,
-            transitions=transitions,
-            timeout_ns=round(args.elastic_timeout_us * 1.0e3),
-            resizable_task_ids=task_ids,
-            task_preferred_core_begins=target_core_begins or None,
-        )
-        payload["plan"]["execution_mode"] = plan.execution_mode
-        payload["plan"]["elastic_w2"] = {
-            "transitions": {str(key): value for key, value in transitions.items()},
-            "task_ids": task_ids,
-            "target_core_begins": {
-                str(key): value for key, value in target_core_begins.items()
-            },
-            "timeout_us": args.elastic_timeout_us,
-        }
-        preferred_threads = plan.task_preferred_threads.tolist()
-        preferred_core_begins = plan.task_preferred_core_begins.tolist()
-        resize_points = plan.task_resize_points.tolist()
-        for task in payload["plan"]["tasks"]:
-            task_id = task["task"]
-            task["preferred_threads"] = int(preferred_threads[task_id])
-            task["preferred_core_begin"] = int(preferred_core_begins[task_id])
-            task["resize_point"] = int(resize_points[task_id])
-    elif args.static_tail_width is not None:
+    if args.static_tail_width is not None:
         plan = make_static_tail_repartition_plan(
             plan,
             torch.tensor(workload.histogram, dtype=torch.int64),
