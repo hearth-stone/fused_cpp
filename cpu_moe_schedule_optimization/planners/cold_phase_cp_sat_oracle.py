@@ -957,27 +957,6 @@ def materialize_cold_phase_runtime_placement(
     )
 
 
-def cold_phase_runtime_bridge(
-    placement: ColdPhaseRuntimePlacement,
-    planner,
-    *,
-    timed: bool,
-    early_merge: bool | None = False,
-) -> dict[str, object]:
-    """Lower a feasible physical placement to the native Plan V2 bridge."""
-
-    if not placement.tasks or placement.status not in {"FEASIBLE", "OPTIMAL"}:
-        raise ValueError(f"runtime placement is not feasible: status={placement.status}")
-    if int(planner.num_cores) != placement.num_cores:
-        raise ValueError(
-            f"planner and runtime placement core counts differ: {planner.num_cores} vs {placement.num_cores}"
-        )
-    bridge = planner.to_async_bridge([task.planner_tuple() for task in placement.tasks])
-    bridge["task_release_ns"] = [task.release_ns if timed else 0 for task in placement.tasks]
-    bridge["early_merge"] = early_merge
-    return bridge
-
-
 def _parse_int_list(value: str, *, name: str) -> tuple[int, ...]:
     try:
         values = tuple(int(item.strip()) for item in value.split(",") if item.strip())

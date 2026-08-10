@@ -644,7 +644,6 @@ def fused_moe_bf16_tiled_async_plan(
     if not topk_weights.dtype.is_floating_point:
         raise TypeError(f"topk_weights must use a floating dtype, got {topk_weights.dtype}")
     _validate_output_buffer(input, out)
-    assert materialized.task_release_ns is not None
     assert materialized.task_resize_timeout_ns is not None
     assert materialized.task_preferred_core_begins is not None
     if elastic_stats_out is not None:
@@ -696,7 +695,6 @@ def fused_moe_bf16_tiled_async_plan(
         int(weights.gemm_backend),
         int(weights.backend_n_tile),
         out,
-        materialized.task_release_ns.contiguous(),
     )
     if materialized.execution_mode == ASYNC_MOE_EXECUTION_ELASTIC:
         assert _fused_moe_bf16_tiled_async_plan_v2_elastic_impl is not None

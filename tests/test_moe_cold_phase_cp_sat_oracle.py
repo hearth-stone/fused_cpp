@@ -17,7 +17,6 @@ from cold_phase_cp_sat_oracle import (  # noqa: E402
     ColdPhaseJob,
     ColdPhaseMode,
     build_cold_phase_jobs,
-    cold_phase_runtime_bridge,
     compare_cold_phase_oracles,
     main,
     materialize_cold_phase_runtime_placement,
@@ -246,20 +245,6 @@ def test_cold_phase_runtime_placement_uses_contiguous_teams_and_resource_edges()
     assert placement.tasks[-1].release_ns == 10
     assert placement.tasks[-1].threads == 4
     assert placement.tasks[-1].dependencies
-
-    class _Planner:
-        num_cores = 4
-
-        @staticmethod
-        def to_async_bridge(tasks):
-            return {"tasks": tasks}
-
-    timed = cold_phase_runtime_bridge(placement, _Planner(), timed=True)
-    eager = cold_phase_runtime_bridge(placement, _Planner(), timed=False)
-    assert timed["task_release_ns"] == [task.release_ns for task in placement.tasks]
-    assert eager["task_release_ns"] == [0] * len(placement.tasks)
-    assert timed["early_merge"] is False
-
 
 def test_cold_phase_runtime_placement_rejects_internal_waits() -> None:
     assignment = ColdPhaseAssignment(0, 12, 1, 0, 5, 1, 6, ())

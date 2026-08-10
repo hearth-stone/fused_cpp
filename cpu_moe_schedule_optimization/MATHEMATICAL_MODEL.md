@@ -1294,23 +1294,12 @@ $$
 [q_i,q_i+t_i)\cap[q_j,q_j+t_j)=\varnothing.
 $$
 
-实现使用二维 no-overlap CP-SAT；求解后，每个物理 core 上相邻 task 形成 strict
-Plan V2 dependency。为保留 oracle 的主动 idling，每个 task 另携带相对 schedule
-epoch 的 release lower bound $r_i=s_i-\min_j s_j$，native executor 只有在
-
-$$
-\tau_{\mathrm{runtime}}\ge r_i
-$$
-
-时才允许 claim ready task。零 release 的 production 路径不读取时钟。非零 release
-目前只允许 strict、whole-expert、固定宽度 task，并关闭 strict tail stealing；
-`tail_pool`/`elastic` 不接受该字段。首版 lowering 也拒绝 phase 间存在内部 wait 的
-assignment，因为当前 runtime 只能在 task 起点执行一次 release gate，不能在 W13/W2
-内部暂停并保持 team。
-
-这个 lowering 只证明候选可在连续 core team 上执行并复现 task-level 开始时间下界，
-不把 surrogate duration 变成硬件真实性保证，也不进入 production planner 或 cache
-identity。
+实现使用二维 no-overlap CP-SAT；求解后，每个物理 core 上相邻 task 可形成 dependency，
+但 oracle 的开始时间只作为离线下界和 regret 解释数据，不再下沉到 Plan V2。曾实现的
+per-task release gate 使 DSV4 mixed incumbent 吞吐回退 28.82%，且 0.25x release 与 eager
+执行仅差 0.03%，说明错误来自 cold-only surrogate 对持续 cache/contention 的遗漏，而非
+release 时钟精度。该 runtime ABI、主动 idling 与复现实验源码已退役；oracle 继续用于
+计算不可争用上界和物理 placement，不声称其 duration 可直接执行复现。
 
 ### 6.3 MILP
 
@@ -1379,11 +1368,11 @@ cold search。
 | 并发配置 | 活跃 job 可形成任意满足 CPU 容量的 $(M_i,t_i)$ 组合 | 搜索静态 core shape，并自动比较 strict、threshold/统一宽度 tail-pool 与恰好两个 terminal expert 的一次 bounded repartition；后者可在 exact anchor 命中时把每个 terminal expert 切成两个连续 M slice，使四个 fixed task 覆盖全部核心；实验 elastic 只接受 planner 显式给出的同 NUMA 对齐 W2 cohort，target 必须包含 source 或与其不相交 | static-partition + boundary regroup 剪枝 |
 | Shape 集合 | 所有满足 CPU 容量的整数宽度组合 | empirical backend 只用 profile shape；analytic backend 生成 homogeneous 和至多两种宽度的 shape，再应用 active 工作集规则；tail-pool 和 bounded tail 只从 strict uncertainty band 和最快两个 head shape 派生 | 候选剪枝 |
 | Assignment | 任意 expert-to-resource 调度 | 按 isolated cost 的 LPT；实验 strict tail-steal 保留每条 lane 的 planner 前缀，只从 peer lane 的受限 pending 后缀迁移 whole expert 到同宽空闲 team | 启发式分配与 suffix-steal 剪枝 |
-| Runtime plan contract | task 可携带离散宽度集合、stage、route-slice、resize 边界和动态 placement | bounded tail 在 terminal expert 启动前生成新的 singleton fixed width 和 blocker DAG；production whole-expert task 的 W13/W2 均执行完整 N domain，Plan/ABI 不携带 weight range、split 或 byte-window；每线程 owner stripe 仅由实际 width 和 backend N tile 推导；exact-anchor route fission 将同一 expert 的连续 M slice 作为多个 strict task，只有全部 slice 完成后才发布 expert completion；tail_pool 保持 whole-expert 动态 placement；实验 strict tail-steal 只接受单 NUMA、同宽、fixed、whole-expert 资源链，并保留 ready-token drain；实验 elastic 才在 W13/W2 边界扩到 preferred cohort；离线 cold-phase lowering 可为 strict fixed task 添加非负 release lower bound，非零时关闭 tail-steal | 单次 expert-boundary 重分区、受限未启动 task 迁移、实验 stage resize 与实验 task release 剪枝 |
+| Runtime plan contract | task 可携带离散宽度集合、stage、route-slice、resize 边界和动态 placement | bounded tail 在 terminal expert 启动前生成新的 singleton fixed width 和 blocker DAG；production whole-expert task 的 W13/W2 均执行完整 N domain，Plan/ABI 不携带 weight range、split、byte-window 或 task release；每线程 owner stripe 仅由实际 width 和 backend N tile 推导；exact-anchor route fission 将同一 expert 的连续 M slice 作为多个 strict task，只有全部 slice 完成后才发布 expert completion；tail_pool 保持 whole-expert 动态 placement；实验 strict tail-steal 只接受单 NUMA、同宽、fixed、whole-expert 资源链，并保留 ready-token drain；实验 elastic 才在 W13/W2 边界扩到 preferred cohort | 单次 expert-boundary 重分区、受限未启动 task 迁移与实验 stage resize 剪枝 |
 | Stage coupling | W13/W2 可形成任意满足依赖和容量的 stage DAG | production 使用 whole-expert pipeline；独立 W13/W2 Plan V2 加全局 barrier 仅作为实验 entrypoint，matched/independent 两种计划都不进入默认搜索 | production 粒度剪枝与实验对照 |
 | x86 synchronous executor team mapping | expert 可取任意合法整数宽度并形成任意 wave | API 接受 1--256 workers；均衡 route 用 atomic expert queue，active expert 不足时按 route/当前宽度贪心组 team，强偏斜时按 64-row target 形成有序 wave | planner 外的确定性 runtime mapper |
 | Ordering | 任意可行开始时间和顺序 | 每个 lane 的 LPT 顺序；实验 strict tail-steal 保留 planner 前缀和本地后缀优先，只允许领取 peer lane 的 pending suffix frontier | 顺序剪枝 |
-| Idling | 允许主动等待以避开争用 | planner 可关闭 tail-pool 和 bounded tail 保留原 strict；bounded tail 只依赖 blocker 完成、不增加主动等待；tail-pool 保持 non-idling；strict tail-steal 找不到满足 $c_h\ge r_{\min}$ 的后缀后立即释放 compute team，并在启用时转入 ready-token drain；elastic timeout=0 不主动等待，正 timeout 只允许在 W13/W2 边界等待有限 $\delta_i$；ready-token 路径仅填充无可运行 expert 的空闲 lane；cold-phase runtime benchmark 可按 oracle task release 主动等待，但 production planner 不生成非零 release | 受限 boundary idling 剪枝；oracle release 仅作可执行性诊断 |
+| Idling | 允许主动等待以避开争用 | planner 可关闭 tail-pool 和 bounded tail 保留原 strict；bounded tail 只依赖 blocker 完成、不增加主动等待；tail-pool 保持 non-idling；strict tail-steal 找不到满足 $c_h\ge r_{\min}$ 的后缀后立即释放 compute team，并在启用时转入 ready-token drain；elastic timeout=0 不主动等待，正 timeout 只允许在 W13/W2 边界等待有限 $\delta_i$；ready-token 路径仅填充无可运行 expert 的空闲 lane；已拒绝的 cold-phase task-release 主动等待不再属于 runtime 可行域 | 仅保留受限 boundary idling 剪枝 |
 | Workload 输入 | 任意合法 global 或 rank-local route histogram | planner 接受任意 histogram；catalog preset 只扩展验证覆盖，不过滤运行时输入 | 不剪枝 |
 | Route combine | 任意满足 TopK release 约束和 CPU 容量的 merge 排程 | planner 不搜索 combine service time；strict plan 在预测 expert 同时完成时强制统一连续 post-expert merge，其余情况保留 auto；runtime 将连续 token range 固定映射给 logical worker，在 expert 边界和空闲期处理本 owner 已 release token，并在同一 resident worker job 排空；owner 间不偷取 merge；Plan V2 允许显式 on/off，elastic 不允许 on | 外层启发式限制与支配条件剪枝 |
 | Kernel variant | 任意未被支配的实现 | ARM empirical identity 只包含机器/拓扑、分布式 expert shape、SVE implementation/tail policy、`full_n_team_stripes` 和 source/binary hash；每个 identity 只允许一个活动校准，旧 split/range profile 不兼容。`auto` 优先选择唯一匹配的 `jit/xbyak_exact_m` 校准，否则回退唯一匹配的 `asm/static_bucketed` 校准。每个 shape/tail-pool 候选确定 team width 后，empirical/analytic model 直接按 $u_s(t)$ 计算 owner stripe，不生成额外执行参数。x86 AMX 使用不进入 planner 的确定性 per-expert pattern/cache policy，AVX-512/AMX 共用确定性 team-N/wave policy | 实现候选限制与 width-derived runtime geometry |
@@ -4346,3 +4335,4 @@ $t=16$ 的项只标定了 W13 轴，其 W2 项取全条带。宽度 $1,2,3,6,12$
 | 2026-08-10 | v0.93 | 删除已被 2% gate 否决的 M12 双 B 寄存器 column-pipeline 实验源码：移除两个 JIT probe mode、生成器分支、cache slot、通用 pure-GEMM benchmark selector、专用 scaling benchmark 和重复测试项。production M12 state machine、probe API 的其余模式和 cost-model 校准语义不变；历史实现固定在 Git `4825bf9`，性能与 perf 结论继续保留在 `amazon_192c_m12_column_pipeline_20260802.md`。|
 | 2026-08-10 | v0.94 | 将 SVE JIT service probes 从一次性指令分解收敛为薄机器校准接口：删除 BA-only、BFMMLA-only、A-only、control-only、with-store、BA-fixed-A 和 full-no-store-fixed-A 七种模式及专用 Python/perf harness，只保留 profile 实际消费的 B-only、M12 full-no-store 和 M12 matrix-only。三个保留模式继续使用历史 id 1/4/10，避免破坏 calibration provenance；JIT cache 从 11 个稀疏 slot 收敛为 4 个显式 service slot。旧分解实现固定在 Git `9aa9248`，结果保留在 `amazon_192c_small_m_gemm_bandwidth.md`。|
 | 2026-08-10 | v0.95 | 退役 M1/M2 dual-N JIT：删除环境变量、双 N-tile K-loop/epilogue、generator/cache 维度、重复正确性分支和 benchmark selector。该路径仅在 8 个 active experts 时约 +2.3%，24-way 回退 5.4%--5.7%，96-way M2 回退约 5.0%；根因是 wave barrier 下 lane-time 方差放大，安全选择需要 planner-visible concurrency 与 barrier topology，超出 kernel-local selector 的合理边界。普通 exact-M state machine、ABI、layout 和默认 dispatch 不变；历史实现固定在 Git `f671f7e`。|
+| 2026-08-10 | v0.96 | 退役 cold-phase timed task release：从 Plan V2 schema/materialization、Python bridge、C++ ABI/pybind、native claim loop、strict-tail gate、interval planner 默认字段、CP-SAT runtime lowering、测试和 benchmark 中删除 `task_release_ns`。离线 CP-SAT 的 `ColdPhaseRuntimeTask.release_ns` 继续作为 placement 分析数据，不再声称可由 runtime 复现。该路径使 DSV4 从 14.854 ms 回退到 20.869 ms（-28.82% throughput），且 0.25x release 与 eager mixed 仅差 0.03%；历史实现固定在 Git `94e977d`。|

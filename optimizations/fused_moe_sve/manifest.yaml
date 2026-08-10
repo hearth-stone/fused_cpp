@@ -594,12 +594,9 @@ features:
 
   - id: dispatch.timed_task_release
     part: dispatch
-    status: diagnostic
-    implementation: >-
-      cpu_moe_schedule_optimization/planners/cold_phase_cp_sat_oracle.py,
-      src/fused_cpp/moe/plan.py,
-      src/fused_cpp/moe/bf16_tiled.py, and
-      csrc/moe/arm/common/fused_moe_bf16_tiled.cpp
+    status: retired
+    implementation: Removed from the active tree; retained in Git history.
+    history: 94e977d
     hypothesis: >-
       Lowering an offline cold-phase incumbent to contiguous strict Plan V2
       teams and enforcing each task's modeled release time can reproduce
@@ -611,18 +608,8 @@ features:
     conflicts_with:
       - dispatch.w2_boundary_elastic
       - dispatch.dynamic_short_expert_pool
-    correctness: >-
-      PYTHONPATH=src .venv/bin/python -m pytest -q
-      tests/test_moe_plan_v2.py
-      tests/test_moe_cold_phase_cp_sat_oracle.py
-    benchmark: >-
-      numactl --cpunodebind=0 --membind=0 taskset -c 0-95
-      env PYTHONPATH=src .venv/bin/python
-      optimizations/fused_moe_sve/benchmarks/bench_cold_phase_oracle_runtime.py
-      --oracle-report /tmp/dsv4_cold_oracle.json
-      --placement-input /tmp/dsv4_runtime_placement.json
-      --release-scales 0,0.25,0.5,0.75,1,1.25
-      --warmup 7 --runs 51
+    correctness: historical; restore history commit 94e977d to reproduce
+    benchmark: historical; restore history commit 94e977d to reproduce
     result: >-
       On AmazonC5192Cores NUMA0, fixed 12x8T measured 14.854 ms and
       10.409 TFLOP/s. The fully timed mixed incumbent measured 20.869 ms and
@@ -1356,12 +1343,9 @@ variants:
       - dispatch.full_n_team_stripes
       - store.w2_direct_route
       - merge.sve_weighted_reduce
-    entrypoint: >-
-      bench_cold_phase_oracle_runtime.py
-      --oracle-report <cold-phase-report>
-      --placement-input <contiguous-placement>
-      --release-scales 1
+    entrypoint: Removed from the active tree; retained in Git history 94e977d.
     status: retired
+    history: 94e977d
 
   - id: sve_vllm_staged_task_pool
     features:

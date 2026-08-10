@@ -60,7 +60,6 @@ _V2_SEQUENCE_FIELDS = (
 )
 
 _V2_OPTIONAL_PER_TASK_FIELDS = (
-    "task_release_ns",
     "task_resize_timeout_ns",
     "task_preferred_core_begins",
     "task_w13_window_tiles",
@@ -68,7 +67,6 @@ _V2_OPTIONAL_PER_TASK_FIELDS = (
 )
 
 _V2_OPTIONAL_PER_TASK_DEFAULTS = {
-    "task_release_ns": 0,
     "task_resize_timeout_ns": 0,
     "task_preferred_core_begins": -1,
     # 0 is the full stripe, i.e. one window per worker (R = 1).
@@ -128,8 +126,6 @@ class AsyncMoEPlanV2:
     zero retains the full-expert task. ``early_merge`` is a plan-level
     tri-state: ``None`` retains the runtime heuristic, ``True`` forces the
     ready-token path, and ``False`` uses the uniform post-expert merge.
-    ``task_release_ns`` is an experimental strict-only lower bound on a task's
-    start time, relative to the beginning of native scheduled execution.
     """
 
     num_threads: int
@@ -150,7 +146,6 @@ class AsyncMoEPlanV2:
     task_stage_ids: torch.Tensor
     task_resize_points: torch.Tensor
     task_range_granularities: torch.Tensor
-    task_release_ns: torch.Tensor | None = None
     task_resize_timeout_ns: torch.Tensor | None = None
     task_preferred_core_begins: torch.Tensor | None = None
     task_w13_window_tiles: torch.Tensor | None = None
@@ -189,6 +184,8 @@ class AsyncMoEPlanV2:
     @classmethod
     def from_dict(cls, plan: Mapping[str, object]) -> "AsyncMoEPlanV2":
         """Validate and materialize a JSON-compatible Plan V2 bridge."""
+        if "task_release_ns" in plan:
+            raise ValueError("task_release_ns has been retired from Plan V2")
         version = int(plan.get("plan_version", -1))
         if version != ASYNC_MOE_PLAN_VERSION:
             raise ValueError(f"plan_version must be {ASYNC_MOE_PLAN_VERSION}, got {version}")
@@ -273,7 +270,6 @@ class AsyncMoEPlanV2:
             "task_stage_ids": self.task_stage_ids,
             "task_resize_points": self.task_resize_points,
             "task_range_granularities": self.task_range_granularities,
-            "task_release_ns": self.task_release_ns,
             "task_resize_timeout_ns": self.task_resize_timeout_ns,
             "task_preferred_core_begins": self.task_preferred_core_begins,
             "task_w13_window_tiles": self.task_w13_window_tiles,
@@ -318,16 +314,10 @@ class AsyncMoEPlanV2:
                 raise ValueError(
                     f"route-sliced expert {expert} must use one shared positive granularity"
                 )
-        assert self.task_release_ns is not None
         assert self.task_resize_timeout_ns is not None
         assert self.task_preferred_core_begins is not None
-        release_ns = _values(self.task_release_ns)
         resize_timeout_ns = _values(self.task_resize_timeout_ns)
         preferred_core_begins = _values(self.task_preferred_core_begins)
-        if any(value < 0 for value in release_ns):
-            raise ValueError("task_release_ns must be non-negative")
-        if self.execution_mode != ASYNC_MOE_EXECUTION_STRICT and any(release_ns):
-            raise ValueError("nonzero task_release_ns currently requires strict execution")
         if any(value < 0 for value in resize_timeout_ns):
             raise ValueError("task_resize_timeout_ns must be non-negative")
         if any(value < -1 for value in preferred_core_begins):
@@ -559,7 +549,6 @@ def upgrade_legacy_async_plan(plan: Mapping[str, object]) -> dict[str, object]:
         "task_stage_ids": [ASYNC_MOE_STAGE_EXPERT] * num_tasks,
         "task_resize_points": [ASYNC_MOE_RESIZE_NONE] * num_tasks,
         "task_range_granularities": [ASYNC_MOE_FULL_EXPERT_RANGE] * num_tasks,
-        "task_release_ns": [0] * num_tasks,
         "task_resize_timeout_ns": [0] * num_tasks,
         "task_preferred_core_begins": [-1] * num_tasks,
         "early_merge": None,

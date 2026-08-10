@@ -4698,7 +4698,6 @@ struct AsyncPlanV2NativeArgs {
   // `task_range_granularities`, which slices routes rather than the weight.
   c10::optional<at::Tensor> task_w13_window_tiles;
   c10::optional<at::Tensor> task_w2_window_tiles;
-  c10::optional<at::Tensor> task_release_ns;
   c10::optional<at::Tensor> task_resize_timeout_ns;
   c10::optional<at::Tensor> task_preferred_core_begins;
   c10::optional<at::Tensor> elastic_stats_out;
@@ -7507,10 +7506,8 @@ at::Tensor run_fused_moe_bf16_tiled_async(
   std::vector<int64_t> task_range_granularities_v;
   std::vector<int64_t> task_w13_window_tiles_v;
   std::vector<int64_t> task_w2_window_tiles_v;
-  std::vector<int64_t> task_release_ns_v;
   std::vector<int64_t> task_resize_timeout_ns_v;
   std::vector<int64_t> task_preferred_core_begins_v;
-  bool has_task_release_ns = false;
   bool has_task_resize_timeout_ns = false;
   bool has_task_preferred_core_begins = false;
   int64_t* elastic_stats_ptr = nullptr;
@@ -7548,15 +7545,10 @@ at::Tensor run_fused_moe_bf16_tiled_async(
     if (plan_v2->task_w2_window_tiles.has_value() && plan_v2->task_w2_window_tiles->defined()) {
       task_w2_window_tiles_v = tensor_to_i64_vector(*plan_v2->task_w2_window_tiles, "task_w2_window_tiles");
     }
-    has_task_release_ns =
-        plan_v2->task_release_ns.has_value() && plan_v2->task_release_ns->defined();
     has_task_resize_timeout_ns =
         plan_v2->task_resize_timeout_ns.has_value() && plan_v2->task_resize_timeout_ns->defined();
     has_task_preferred_core_begins =
         plan_v2->task_preferred_core_begins.has_value() && plan_v2->task_preferred_core_begins->defined();
-    if (has_task_release_ns) {
-      task_release_ns_v = tensor_to_i64_vector(*plan_v2->task_release_ns, "task_release_ns");
-    }
     if (has_task_resize_timeout_ns) {
       task_resize_timeout_ns_v =
           tensor_to_i64_vector(*plan_v2->task_resize_timeout_ns, "task_resize_timeout_ns");
@@ -7610,11 +7602,6 @@ at::Tensor run_fused_moe_bf16_tiled_async(
     }
     check_per_task_size(task_w13_window_tiles_v, "task_w13_window_tiles");
     check_per_task_size(task_w2_window_tiles_v, "task_w2_window_tiles");
-    if (has_task_release_ns) {
-      check_per_task_size(task_release_ns_v, "task_release_ns");
-    } else {
-      task_release_ns_v.assign(static_cast<size_t>(num_tasks), 0);
-    }
     if (has_task_resize_timeout_ns) {
       check_per_task_size(task_resize_timeout_ns_v, "task_resize_timeout_ns");
     } else {
@@ -7651,11 +7638,6 @@ at::Tensor run_fused_moe_bf16_tiled_async(
       TORCH_CHECK(route_granularity == kAsyncFullExpertRange ||
                       plan_v2->execution_mode == kAsyncExecutionStrict,
                   "route-sliced tasks currently require strict execution: task=", task);
-      TORCH_CHECK(task_release_ns_v[static_cast<size_t>(task)] >= 0,
-                  "task_release_ns must be non-negative: task=", task);
-      TORCH_CHECK(plan_v2->execution_mode == kAsyncExecutionStrict ||
-                      task_release_ns_v[static_cast<size_t>(task)] == 0,
-                  "nonzero task_release_ns currently requires strict execution: task=", task);
       TORCH_CHECK(task_resize_timeout_ns_v[static_cast<size_t>(task)] >= 0,
                   "task_resize_timeout_ns must be non-negative: task=", task);
       TORCH_CHECK(task_preferred_core_begins_v[static_cast<size_t>(task)] >= -1,
@@ -8091,17 +8073,12 @@ at::Tensor run_fused_moe_bf16_tiled_async(
     }
   }
 
-  const bool use_task_release_gate =
-      has_plan_v2 && std::any_of(task_release_ns_v.begin(), task_release_ns_v.end(),
-                                 [](int64_t release_ns) { return release_ns > 0; });
-
   const bool strict_tail_steal_requested =
       env_flag_enabled("FUSED_CPP_MOE_STRICT_TAIL_STEAL");
   bool use_strict_tail_steal =
       strict_tail_steal_requested && has_plan_v2 &&
       plan_v2->execution_mode == kAsyncExecutionStrict &&
-      use_sve_backend && fuse_silu && !use_async_short_pool &&
-      !use_task_release_gate;
+      use_sve_backend && fuse_silu && !use_async_short_pool;
   int64_t strict_tail_steal_width = 0;
   int64_t strict_tail_steal_numa_node = -1;
   int64_t strict_tail_steal_depth = 0;
@@ -8775,8 +8752,6 @@ at::Tensor run_fused_moe_bf16_tiled_async(
                std::chrono::steady_clock::now().time_since_epoch())
         .count();
   };
-  const int64_t task_release_epoch_ns = use_task_release_gate ? steady_now_ns() : 0;
-
   phase_begin = trace_phase_begin();
   if (plan_v2_nonblocking_elastic) {
     constexpr int64_t kElasticPending = 0;
@@ -9632,8 +9607,6 @@ at::Tensor run_fused_moe_bf16_tiled_async(
     run_fixed_threads(num_threads, [&](int64_t tid) {
       while (true) {
         const bool compute_complete = completed_tasks.load(std::memory_order_acquire) >= num_tasks;
-        const int64_t elapsed_ns =
-            use_task_release_gate ? steady_now_ns() - task_release_epoch_ns : 0;
         int64_t selected_task = -1;
         if (!compute_complete) {
           for (int64_t task_id = 0; task_id < num_tasks; ++task_id) {
@@ -9646,10 +9619,6 @@ at::Tensor run_fused_moe_bf16_tiled_async(
               continue;
             }
             if (state == 0) {
-              if (use_task_release_gate &&
-                  task_release_ns_v[static_cast<size_t>(task_id)] > elapsed_ns) {
-                continue;
-              }
               if (deps_remaining[static_cast<size_t>(task_id)].load() != 0) {
                 continue;
               }
@@ -9925,8 +9894,7 @@ at::Tensor fused_moe_bf16_tiled_async_plan_v2(
     c10::optional<at::Tensor> task_w2_window_tiles, c10::optional<at::Tensor> thread_cpu_ids,
     c10::optional<at::Tensor> w13_bias, c10::optional<at::Tensor> w2_bias, int64_t num_threads, std::string activation,
     int64_t global_num_experts, bool skip_weighted, bool fuse_silu, int64_t silu_poly_degree, int64_t gemm_backend,
-    int64_t backend_n_tile, c10::optional<at::Tensor> out, c10::optional<at::Tensor> task_release_ns,
-    int64_t early_merge) {
+    int64_t backend_n_tile, c10::optional<at::Tensor> out, int64_t early_merge) {
   TORCH_CHECK(execution_mode != kAsyncExecutionElastic,
               "elastic Plan V2 requires fused_moe_bf16_tiled_async_plan_v2_elastic");
   const AsyncPlanV2NativeArgs plan_v2{
@@ -9944,7 +9912,6 @@ at::Tensor fused_moe_bf16_tiled_async_plan_v2(
       std::move(task_range_granularities),
       std::move(task_w13_window_tiles),
       std::move(task_w2_window_tiles),
-      std::move(task_release_ns),
       c10::nullopt,
       c10::nullopt,
       c10::nullopt,
@@ -9969,7 +9936,7 @@ at::Tensor fused_moe_bf16_tiled_async_plan_v2_elastic(
     c10::optional<at::Tensor> task_w2_window_tiles, c10::optional<at::Tensor> thread_cpu_ids,
     c10::optional<at::Tensor> w13_bias, c10::optional<at::Tensor> w2_bias, int64_t num_threads, std::string activation,
     int64_t global_num_experts, bool skip_weighted, bool fuse_silu, int64_t silu_poly_degree, int64_t gemm_backend,
-    int64_t backend_n_tile, c10::optional<at::Tensor> out, c10::optional<at::Tensor> task_release_ns,
+    int64_t backend_n_tile, c10::optional<at::Tensor> out,
     c10::optional<at::Tensor> task_resize_timeout_ns, c10::optional<at::Tensor> elastic_stats_out,
     c10::optional<at::Tensor> task_preferred_core_begins, int64_t early_merge) {
   TORCH_CHECK(execution_mode == kAsyncExecutionElastic, "elastic Plan V2 entry point requires execution_mode=",
@@ -9989,7 +9956,6 @@ at::Tensor fused_moe_bf16_tiled_async_plan_v2_elastic(
       std::move(task_range_granularities),
       std::move(task_w13_window_tiles),
       std::move(task_w2_window_tiles),
-      std::move(task_release_ns),
       std::move(task_resize_timeout_ns),
       std::move(task_preferred_core_begins),
       std::move(elastic_stats_out),

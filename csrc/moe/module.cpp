@@ -128,7 +128,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("num_threads") = 1, py::arg("activation") = "silu", py::arg("global_num_experts") = -1,
         py::arg("skip_weighted") = false, py::arg("fuse_silu") = false, py::arg("silu_poly_degree") = 5,
         py::arg("gemm_backend") = 0, py::arg("backend_n_tile") = 8, py::arg("out") = c10::nullopt,
-        py::arg("task_release_ns") = c10::nullopt, py::arg("early_merge") = -1,
+        py::arg("early_merge") = -1,
         py::call_guard<py::gil_scoped_release>());
 
   m.def("fused_moe_bf16_tiled_async_plan_v2_elastic", &fused_moe_bf16_tiled_async_plan_v2_elastic,
@@ -145,7 +145,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("num_threads") = 1, py::arg("activation") = "silu", py::arg("global_num_experts") = -1,
         py::arg("skip_weighted") = false, py::arg("fuse_silu") = false, py::arg("silu_poly_degree") = 5,
         py::arg("gemm_backend") = 0, py::arg("backend_n_tile") = 8, py::arg("out") = c10::nullopt,
-        py::arg("task_release_ns") = c10::nullopt, py::arg("task_resize_timeout_ns") = c10::nullopt,
+        py::arg("task_resize_timeout_ns") = c10::nullopt,
         py::arg("elastic_stats_out") = c10::nullopt, py::arg("task_preferred_core_begins") = c10::nullopt,
         py::arg("early_merge") = -1, py::call_guard<py::gil_scoped_release>());
 
