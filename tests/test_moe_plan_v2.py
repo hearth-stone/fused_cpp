@@ -418,12 +418,16 @@ def test_async_plan_wrapper_calls_native_plan_v2(monkeypatch) -> None:
         ASYNC_MOE_PLACEMENT_FIXED,
     ]
     assert args[25].tolist() == [0, 0]
-    assert args[26].tolist() == [8, 9, 10, 11]
-    assert args[29] == 4
-    assert args[32] is True
-    assert args[36] == 8
-    assert args[38].tolist() == [0, 0]
-    assert args[39] == -1
+    # Windows default to 0, i.e. the full stripe, and sit between the route
+    # granularities and thread_cpu_ids.
+    assert args[26].tolist() == [0, 0]
+    assert args[27].tolist() == [0, 0]
+    assert args[28].tolist() == [8, 9, 10, 11]
+    assert args[31] == 4
+    assert args[34] is True
+    assert args[38] == 8
+    assert args[40].tolist() == [0, 0]
+    assert args[41] == -1
 
 
 def test_async_plan_wrapper_calls_elastic_native_and_collects_stats(monkeypatch) -> None:
@@ -474,11 +478,11 @@ def test_async_plan_wrapper_calls_elastic_native_and_collects_stats(monkeypatch)
     assert isinstance(args, tuple)
     assert args[15] == 2
     assert args[25].tolist() == [0, 0]
-    assert args[38].tolist() == [0, 0]
-    assert args[39].tolist() == [0, 1000]
-    assert args[40] is stats
-    assert args[41].tolist() == [-1, -1]
-    assert args[42] == -1
+    assert args[40].tolist() == [0, 0]
+    assert args[41].tolist() == [0, 1000]
+    assert args[42] is stats
+    assert args[43].tolist() == [-1, -1]
+    assert args[44] == -1
     assert bf16_tiled.decode_async_moe_elastic_stats(stats)["eligible_tasks"] == 0
 
 

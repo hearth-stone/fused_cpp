@@ -107,6 +107,7 @@ class _DeterministicTailPoolModel:
         del routes
         return threads
 
+
 class _DeterministicStageModel(_DeterministicTailPoolModel):
     call_setup_ns = 3.0
 
@@ -480,6 +481,97 @@ def test_full_stage_geometry_matches_native_tile_partition() -> None:
     assert w13.bytes_per_worker(8) == 1024 * 1024
     assert w13.bytes_per_worker(32) == 256 * 1024
     assert w2.bytes_per_worker(32) == 128 * 1024
+
+
+@pytest.mark.parametrize("threads", [1, 2, 3, 4, 6, 8, 12, 16, 24, 32])
+def test_full_stripe_plan_is_the_single_window_endpoint(threads: int) -> None:
+    """`window_tiles = tiles_per_worker(t)` must reproduce full_n_team_stripes."""
+    for k, n in ((4096, 1024), (512, 4096)):
+        geometry = full_stage_geometry(k=k, n=n, n_tile=8)
+        plan = geometry.full_stripe_plan(threads)
+
+        assert plan.windows == 1
+        assert plan.bytes_per_worker == geometry.bytes_per_worker(threads)
+
+        covered = [plan.thread_range(0, tid) for tid in range(threads)]
+        assert sum(item.tiles for item in covered) == geometry.total_tiles
+        assert sum(1 for item in covered if not item.is_empty) == geometry.active_threads(threads)
+        # Ranges tile the stage in order with no gap and no overlap.
+        cursor = 0
+        for item in covered:
+            assert item.begin_tile == cursor
+            cursor += item.tiles
+
+
+@pytest.mark.parametrize("threads", [1, 2, 4, 8, 16, 32])
+def test_power_of_two_widths_never_starve_a_worker(threads: int) -> None:
+    """When `threads` divides `total_tiles` the short tail stays a multiple of it."""
+    for k, n in ((4096, 1024), (512, 4096)):
+        geometry = full_stage_geometry(k=k, n=n, n_tile=8)
+        assert geometry.total_tiles % threads == 0
+        for window_tiles in range(1, geometry.tiles_per_worker(threads) + 1):
+            plan = geometry.window_plan(threads, window_tiles)
+            assert not plan.starves_any_thread(), f"t={threads} omega={window_tiles}"
+
+
+def test_short_tail_window_can_starve_a_non_power_of_two_width() -> None:
+    """t=6, omega=7 leaves a 2-tile tail for 6 workers, only in the last window."""
+    geometry = full_stage_geometry(k=4096, n=1024, n_tile=8)
+    plan = geometry.window_plan(threads=6, window_tiles=7)
+
+    assert plan.range_tiles == 42
+    assert plan.windows == 4
+    assert plan.window_tile_span(3) == (126, 2)
+
+    for index in range(plan.windows - 1):
+        assert plan.idle_threads(index) == 0
+    assert plan.idle_threads(3) == 4
+    assert plan.starves_any_thread()
+
+
+def test_windows_tile_the_stage_exactly() -> None:
+    geometry = full_stage_geometry(k=4096, n=1024, n_tile=8)
+    for threads in (1, 2, 3, 4, 6, 8):
+        for window_tiles in (1, 2, 3, 5, 7, 16, geometry.tiles_per_worker(threads)):
+            plan = geometry.window_plan(threads, window_tiles)
+            seen: list[tuple[int, int]] = []
+            for index in range(plan.windows):
+                for tid in range(threads):
+                    item = plan.thread_range(index, tid)
+                    if not item.is_empty:
+                        seen.append((item.begin_tile, item.tiles))
+            seen.sort()
+            cursor = 0
+            for begin, tiles in seen:
+                assert begin == cursor, f"t={threads} omega={window_tiles}"
+                cursor += tiles
+            assert cursor == geometry.total_tiles, f"t={threads} omega={window_tiles}"
+
+
+def test_window_tiles_from_bytes_is_the_only_byte_conversion() -> None:
+    w13 = full_stage_geometry(k=4096, n=1024, n_tile=8)
+    assert w13.bytes_per_tile == 64 * 1024
+
+    assert w13.window_tiles_from_bytes(64 * 1024) == 1
+    assert w13.window_tiles_from_bytes(128 * 1024) == 2
+    # Floors to whole tiles, so a range of byte budgets shares one pattern.
+    assert w13.window_tiles_from_bytes(191 * 1024) == 2
+    # Clamps: a tile cannot be subdivided, and the window cannot exceed the stage.
+    assert w13.window_tiles_from_bytes(1) == 1
+    assert w13.window_tiles_from_bytes(64 * 1024 * 1024) == w13.total_tiles
+
+    with pytest.raises(ValueError, match="must be positive"):
+        w13.window_tiles_from_bytes(0)
+
+
+def test_window_plan_rejects_illegal_windows() -> None:
+    geometry = full_stage_geometry(k=4096, n=1024, n_tile=8)
+    with pytest.raises(ValueError, match="window tiles must be positive"):
+        geometry.window_plan(threads=4, window_tiles=0)
+    with pytest.raises(ValueError, match="exceeds stage tiles"):
+        geometry.window_plan(threads=4, window_tiles=geometry.total_tiles + 1)
+    with pytest.raises(ValueError, match="threads must be positive"):
+        geometry.window_plan(threads=0, window_tiles=1)
 
 
 def test_profile_rejects_legacy_split_stage_calibration(

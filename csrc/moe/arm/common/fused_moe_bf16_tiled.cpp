@@ -264,11 +264,132 @@ SplitRange n_split_range_tile(int N, int64_t group_size, int64_t local_tid, int6
   return SplitRange{block_range.begin * t, block_range.size * t};
 }
 
+// The unique computation pattern implied by a team width and a per-thread owner
+// window. `window_tiles` counts whole packed-B N tiles, which is the smallest
+// addressable unit: the packed layout is tile contiguous and the microkernel's
+// output tile is `n_tile` wide, so a window is always a whole number of tiles.
+//
+// The team consumes `threads * window_tiles` tiles per window and the stage takes
+// `ceil(total_tiles / range_tiles)` windows. The last window may be short; its
+// tiles are spread over the team exactly like a full window's.
+//
+// `window_tiles == ceil(total_tiles / threads)` gives one window, which is the
+// `full_n_team_stripes` geometry: one contiguous stripe per worker traversed once.
+// That is the default and is reproduced tile for tile.
+//
+// Mirrors cpu_moe_schedule_optimization/cost_model/full_stage_geometry.py; the two
+// must stay in step because the planner derives windows there and the runtime
+// executes them here.
+struct StageWindowPlan {
+  int64_t n_tile = kKernelTile;
+  int64_t total_tiles = 0;
+  int64_t threads = 1;
+  int64_t window_tiles = 0;
+
+  int64_t range_tiles() const { return threads * window_tiles; }
+
+  int64_t windows() const { return range_tiles() > 0 ? ceil_div_int64(total_tiles, range_tiles()) : 0; }
+
+  // Tile span of one window; the final window is short when the range does not
+  // divide the stage.
+  SplitRange window_tile_span(int64_t window_index) const {
+    if (window_index < 0 || window_index >= windows()) {
+      return SplitRange{};
+    }
+    const int64_t begin = window_index * range_tiles();
+    return SplitRange{begin, std::min(range_tiles(), total_tiles - begin)};
+  }
+
+  // One worker's tile range inside one window.
+  SplitRange thread_tile_range(int64_t window_index, int64_t local_tid) const {
+    const SplitRange window = window_tile_span(window_index);
+    if (window.size <= 0) {
+      return SplitRange{};
+    }
+    const SplitRange local = split_evenly(window.size, threads, local_tid);
+    return SplitRange{window.begin + local.begin, local.size};
+  }
+
+  // The same range in packed-B columns, which is what the kernel ABI takes.
+  SplitRange thread_col_range(int64_t window_index, int64_t local_tid) const {
+    const SplitRange tiles = thread_tile_range(window_index, local_tid);
+    return SplitRange{tiles.begin * n_tile, tiles.size * n_tile};
+  }
+};
+
+// `window_tiles <= 0` selects the full stripe, i.e. the R=1 endpoint.
+StageWindowPlan make_stage_window_plan(int64_t N, int64_t n_tile, int64_t threads, int64_t window_tiles) {
+  const int64_t tile = std::max<int64_t>(n_tile, kKernelTile);
+  const int64_t team = std::max<int64_t>(threads, 1);
+  TORCH_CHECK(N > 0, "stage-window N must be positive, got ", N);
+  TORCH_CHECK(N % tile == 0, "stage-window N must be tile aligned: N=", N, " tile=", tile);
+  const int64_t total_tiles = N / tile;
+  const int64_t resolved = window_tiles > 0 ? window_tiles : ceil_div_int64(total_tiles, team);
+  TORCH_CHECK(resolved <= total_tiles, "stage-window tiles ", resolved, " exceed stage tiles ", total_tiles);
+  return StageWindowPlan{tile, total_tiles, team, resolved};
+}
+
+// A window is one contiguous run of packed-B tiles only while the packed layout
+// holds a single K chunk, which is the default. With `FUSED_CPP_MOE_SVE_KC` or
+// `FUSED_CPP_MOE_SVE_KC_L1_PERMILLE` pinning Kc below K, `pack_b` emits K chunks
+// outermost, so one window becomes K/Kc separate runs. Addressing stays correct
+// because the kernel takes `packed_N` alongside `n_begin`, but the locality
+// argument for choosing a window no longer holds, so say so once rather than let
+// a calibration quietly measure a different geometry.
+void warn_once_if_window_is_not_contiguous(int64_t K) {
+#if defined(FUSED_CPP_MOE_HAS_ARM_SVE)
+  static std::once_flag flag;
+  const int kc = ::fused_cpp::moe_sve::k_block(static_cast<int>(K));
+  if (kc < static_cast<int>(K)) {
+    std::call_once(flag, [&] {
+      TORCH_WARN("stage windows are not contiguous in packed B: Kc=", kc, " < K=", K,
+                 ", so one window spans K/Kc runs. Window sizing calibrated under this setting does not transfer to "
+                 "the default single-chunk layout.");
+    });
+  }
+#else
+  (void)K;
+#endif
+}
+
+// Visit this worker's column range in every window, in window order. `fn` takes
+// the range and the window index, so a caller can treat the first window
+// specially without recovering the index itself.
 template <typename Fn>
-void with_w2_scatter_owner(int N, int64_t group_size, int64_t local_tid, int64_t n_tile,
-                           bool use_w2_n_owner, Fn&& fn) {
-  fn(use_w2_n_owner ? n_split_range_tile(N, group_size, local_tid, n_tile)
-                    : n_split_range(N, group_size, local_tid));
+void for_each_stage_window(const StageWindowPlan& plan, int64_t local_tid, Fn&& fn) {
+  const int64_t count = plan.windows();
+  for (int64_t index = 0; index < count; ++index) {
+    const SplitRange cols = plan.thread_col_range(index, local_tid);
+    if (cols.size > 0) {
+      fn(cols, index);
+    }
+  }
+}
+
+// Visit the H ranges this worker is responsible for scattering.
+//
+// The owner path mirrors the W2 GEMM windows exactly. That matters once R > 1:
+// a worker then owns a strided set of tile runs rather than one contiguous
+// stripe, so scattering a single stripe would touch columns it never computed.
+// Mirroring is what lets this path skip the W2-to-scatter team barrier, because
+// a worker only reads back its own stores.
+//
+// The non-owner path runs after a team barrier, so every column is visible and
+// any exact partition of N will do; it does not mirror the windows.
+template <typename Fn>
+void for_each_w2_scatter_range(int N, int64_t group_size, int64_t local_tid, int64_t n_tile, int64_t window_tiles,
+                               bool use_w2_n_owner, Fn&& fn) {
+  if (!use_w2_n_owner) {
+    fn(n_split_range(N, group_size, local_tid));
+    return;
+  }
+  const StageWindowPlan windows = make_stage_window_plan(N, n_tile, group_size, window_tiles);
+  for (int64_t index = 0; index < windows.windows(); ++index) {
+    const SplitRange tiles = windows.thread_tile_range(index, local_tid);
+    if (tiles.size > 0) {
+      fn(SplitRange{tiles.begin * windows.n_tile, tiles.size * windows.n_tile});
+    }
+  }
 }
 
 void check_positive_int(int64_t value, const char* name) {
@@ -477,6 +598,9 @@ struct Gemm2DSplitPlan {
   int64_t tm = 1;
   int64_t tn = 1;
   int64_t n_tile = kKernelTile;
+  // Per-thread owner window in whole N tiles. 0 selects the full stripe, which is
+  // the R=1 endpoint and the pre-window behaviour.
+  int64_t window_tiles = 0;
 };
 
 struct Gemm2DThreadRange {
@@ -523,13 +647,66 @@ int64_t n_split_active_threads(int64_t N, int64_t group_size) {
   return std::min(group_size, blocks);
 }
 
-Gemm2DSplitPlan plan_2d_gemm_split(int64_t M, int64_t K, int64_t N, int64_t group_size, int64_t n_tile) {
+// Experiment-only override for the per-thread owner windows, as
+// `FUSED_CPP_MOE_STAGE_WINDOW_TILES=<w13>,<w2>` in whole N tiles. It applies only
+// where the plan left the window at the full stripe, so a planner-selected window
+// always wins and the variable cannot silently reinterpret a calibrated plan.
+// Production windows come from the task plan; this exists so a grid can be swept
+// without regenerating plans.
+struct StageWindowEnvOverride {
+  int64_t w13_tiles = 0;
+  int64_t w2_tiles = 0;
+  bool present = false;
+};
+
+const StageWindowEnvOverride& stage_window_env_override() {
+  static const StageWindowEnvOverride value = [] {
+    StageWindowEnvOverride parsed;
+    const char* raw = std::getenv("FUSED_CPP_MOE_STAGE_WINDOW_TILES");
+    if (raw == nullptr || raw[0] == '\0') {
+      return parsed;
+    }
+    char* end = nullptr;
+    const long long first = std::strtoll(raw, &end, 10);
+    TORCH_CHECK(end != raw && first >= 0, "FUSED_CPP_MOE_STAGE_WINDOW_TILES must start with a non-negative integer");
+    long long second = first;
+    if (end != nullptr && *end == ',') {
+      const char* rest = end + 1;
+      char* end2 = nullptr;
+      second = std::strtoll(rest, &end2, 10);
+      TORCH_CHECK(end2 != rest && second >= 0,
+                  "FUSED_CPP_MOE_STAGE_WINDOW_TILES second field must be a non-negative integer");
+    }
+    parsed.w13_tiles = static_cast<int64_t>(first);
+    parsed.w2_tiles = static_cast<int64_t>(second);
+    parsed.present = true;
+    return parsed;
+  }();
+  return value;
+}
+
+// `plan_tiles` wins; the override only fills in a full stripe the plan did not pin.
+int64_t resolve_stage_window_tiles(int64_t plan_tiles, bool is_w13) {
+  if (plan_tiles > 0) {
+    return plan_tiles;
+  }
+  const StageWindowEnvOverride& env = stage_window_env_override();
+  if (!env.present) {
+    return 0;
+  }
+  return is_w13 ? env.w13_tiles : env.w2_tiles;
+}
+
+// `window_tiles` is the per-thread owner window in whole N tiles; 0 selects the
+// full stripe, which is the R=1 endpoint and the pre-window behaviour.
+Gemm2DSplitPlan plan_2d_gemm_split(int64_t M, int64_t K, int64_t N, int64_t group_size, int64_t n_tile,
+                                   int64_t window_tiles) {
   (void)M;
   (void)K;
   (void)N;
   const int64_t threads = std::max<int64_t>(group_size, 1);
   const int64_t tile = std::max<int64_t>(n_tile, kKernelTile);
-  return Gemm2DSplitPlan{1, threads, tile};
+  return Gemm2DSplitPlan{1, threads, tile, window_tiles};
 }
 
 Gemm2DThreadRange gemm_2d_thread_range(const Gemm2DSplitPlan& plan, int64_t M, int64_t N, int64_t local_tid) {
@@ -540,9 +717,11 @@ Gemm2DThreadRange gemm_2d_thread_range(const Gemm2DSplitPlan& plan, int64_t M, i
   const int64_t m_id = local_tid / plan.tn;
   const int64_t n_id = local_tid % plan.tn;
   const int64_t m_blocks_total = ceil_div_int64(M, kKernelTile);
-  const int64_t n_tiles_total = N / plan.n_tile;
   const SplitRange m_block_range = split_evenly(m_blocks_total, plan.tm, m_id);
-  const SplitRange n_tile_range = split_evenly(n_tiles_total, plan.tn, n_id);
+  // The N side is the R=1 endpoint of the stage-window geometry, so the single
+  // window's split is the same tile partition this used to compute inline.
+  const StageWindowPlan window_plan = make_stage_window_plan(N, plan.n_tile, plan.tn, 0);
+  const SplitRange n_range = window_plan.thread_col_range(0, n_id);
   Gemm2DThreadRange range;
   range.m_block_begin = m_block_range.begin;
   range.m_blocks = m_block_range.size;
@@ -550,8 +729,8 @@ Gemm2DThreadRange gemm_2d_thread_range(const Gemm2DSplitPlan& plan, int64_t M, i
   if (range.row_begin < M) {
     range.rows = std::min<int64_t>(m_block_range.size * kKernelTile, M - range.row_begin);
   }
-  range.n_begin = n_tile_range.begin * plan.n_tile;
-  range.n_cols = n_tile_range.size * plan.n_tile;
+  range.n_begin = n_range.begin;
+  range.n_cols = n_range.size;
   return range;
 }
 
@@ -1173,16 +1352,26 @@ SveJitKernelFn resolve_sve_jit_first_panel_prefetch_kernel(SveJitOperation opera
 }
 
 bool sve_jit_packc_w13_exact_dispatch(const uint16_t* packed_A, const uint16_t* w13_packed, uint16_t* C, int rows,
-                                      int K, int N, int ldc, int packed_N, int n_begin, int64_t degree) {
+                                      int K, int N, int ldc, int packed_N, int n_begin, int64_t degree,
+                                      bool single_window) {
   if (!sve_jit_configuration_supported(SveJitOperation::kW13, K, degree, nullptr)) {
     return false;
   }
+  // Both stripe-level optimizations assume this call covers the worker's whole
+  // owner stripe: the prefetch variant only helps on the first M panel of a cold
+  // stripe, and the bulk kernel advances panel state internally. Under a windowed
+  // traversal (R > 1) the same B is revisited once per window, so neither
+  // assumption holds and both are switched off. Re-enabling them per window is a
+  // separate experiment.
   const SveJitKernelFn first_panel_kernel =
-      resolve_sve_jit_first_panel_prefetch_kernel(SveJitOperation::kW13, rows, K, degree);
+      single_window ? resolve_sve_jit_first_panel_prefetch_kernel(SveJitOperation::kW13, rows, K, degree) : nullptr;
   SveJitExactMKernelSet kernels;
-  if (!resolve_sve_jit_exact_m_kernels(SveJitOperation::kW13, rows, degree, first_panel_kernel == nullptr, &kernels)) {
+  const bool allow_bulk_m = single_window && first_panel_kernel == nullptr;
+  if (!resolve_sve_jit_exact_m_kernels(SveJitOperation::kW13, rows, degree, allow_bulk_m, &kernels)) {
     return false;
   }
+  TORCH_CHECK(single_window || (!kernels.bulk_m && first_panel_kernel == nullptr),
+              "windowed W13 traversal must not use stripe-level kernels");
   SveKBlockParams p = make_sve_kblock_params(12, K, N, ldc, packed_N, n_begin, static_cast<int>(degree));
   const void* constants = ::fused_cpp::moe_sve::jit::silu_constants();
   if (kernels.bulk_m) {
@@ -1209,16 +1398,21 @@ bool sve_jit_packc_w13_exact_dispatch(const uint16_t* packed_A, const uint16_t* 
 }
 
 bool sve_jit_packed_w2_exact_dispatch(const uint16_t* packed_A, const uint16_t* w2_packed, float* down, int rows, int K,
-                                      int N, int ldc, int packed_N, int n_begin) {
+                                      int N, int ldc, int packed_N, int n_begin, bool single_window) {
   if (!sve_jit_configuration_supported(SveJitOperation::kW2, K, 0, nullptr)) {
     return false;
   }
+  // See sve_jit_packc_w13_exact_dispatch: both stripe-level kernels assume this
+  // call covers the worker's whole owner stripe, which a windowed traversal breaks.
   const SveJitKernelFn first_panel_kernel =
-      resolve_sve_jit_first_panel_prefetch_kernel(SveJitOperation::kW2, rows, K, 0);
+      single_window ? resolve_sve_jit_first_panel_prefetch_kernel(SveJitOperation::kW2, rows, K, 0) : nullptr;
   SveJitExactMKernelSet kernels;
-  if (!resolve_sve_jit_exact_m_kernels(SveJitOperation::kW2, rows, 0, first_panel_kernel == nullptr, &kernels)) {
+  const bool allow_bulk_m = single_window && first_panel_kernel == nullptr;
+  if (!resolve_sve_jit_exact_m_kernels(SveJitOperation::kW2, rows, 0, allow_bulk_m, &kernels)) {
     return false;
   }
+  TORCH_CHECK(single_window || (!kernels.bulk_m && first_panel_kernel == nullptr),
+              "windowed W2 traversal must not use stripe-level kernels");
   SveKBlockParams p = make_sve_kblock_params(12, K, N, ldc, packed_N, n_begin, 0);
   if (kernels.bulk_m) {
     p.gemm.m = kernels.main_rows;
@@ -1271,16 +1465,21 @@ bool sve_jit_packed_gemm_f32_exact_dispatch(const uint16_t* packed_A, const uint
 
 bool sve_jit_packed_w2_direct_route_exact_dispatch(const uint16_t* packed_A, const uint16_t* w2_packed,
                                                    float* route_out, const int64_t* route_ids, int rows, int K, int N,
-                                                   int route_stride, int packed_N, int n_begin) {
+                                                   int route_stride, int packed_N, int n_begin, bool single_window) {
   if (!sve_jit_configuration_supported(SveJitOperation::kW2Direct, K, 0, nullptr)) {
     return false;
   }
+  // See sve_jit_packc_w13_exact_dispatch for why a windowed traversal switches
+  // both stripe-level kernels off.
   const SveJitKernelFn first_panel_kernel =
-      resolve_sve_jit_first_panel_prefetch_kernel(SveJitOperation::kW2Direct, rows, K, 0);
+      single_window ? resolve_sve_jit_first_panel_prefetch_kernel(SveJitOperation::kW2Direct, rows, K, 0) : nullptr;
   SveJitExactMKernelSet kernels;
-  if (!resolve_sve_jit_exact_m_kernels(SveJitOperation::kW2Direct, rows, 0, first_panel_kernel == nullptr, &kernels)) {
+  const bool allow_bulk_m = single_window && first_panel_kernel == nullptr;
+  if (!resolve_sve_jit_exact_m_kernels(SveJitOperation::kW2Direct, rows, 0, allow_bulk_m, &kernels)) {
     return false;
   }
+  TORCH_CHECK(single_window || (!kernels.bulk_m && first_panel_kernel == nullptr),
+              "windowed W2 direct-route traversal must not use stripe-level kernels");
   SveKBlockParams p = make_sve_kblock_params(12, K, N, route_stride, packed_N, n_begin, 3);
   if (kernels.bulk_m) {
     p.gemm.m = kernels.main_rows;
@@ -1629,28 +1828,29 @@ void sve_asm_packed_w2_bf16_hybrid_dispatch(const uint16_t* packed_A, const uint
                                        n_begin);
 }
 
-void sve_packc_w13_hybrid_dispatch(const uint16_t* packed_A, const uint16_t* w13_packed, uint16_t* C, int rows,
-                                   int K, int N, int ldc, int packed_N, int n_begin,
-                                   const SveKcFusedSiluKernelSet& asm_kernels, int64_t degree) {
-  if (sve_jit_packc_w13_exact_dispatch(packed_A, w13_packed, C, rows, K, N, ldc, packed_N, n_begin, degree)) {
+void sve_packc_w13_hybrid_dispatch(const uint16_t* packed_A, const uint16_t* w13_packed, uint16_t* C, int rows, int K,
+                                   int N, int ldc, int packed_N, int n_begin,
+                                   const SveKcFusedSiluKernelSet& asm_kernels, int64_t degree, bool single_window) {
+  if (sve_jit_packc_w13_exact_dispatch(packed_A, w13_packed, C, rows, K, N, ldc, packed_N, n_begin, degree,
+                                       single_window)) {
     return;
   }
   sve_asm_packc_w13_hybrid_dispatch(packed_A, w13_packed, C, rows, K, N, ldc, packed_N, n_begin, asm_kernels);
 }
 
 void sve_packed_w2_hybrid_dispatch(const uint16_t* packed_A, const uint16_t* w2_packed, float* down, int rows, int K,
-                                   int N, int ldc, int packed_N, int n_begin) {
-  if (sve_jit_packed_w2_exact_dispatch(packed_A, w2_packed, down, rows, K, N, ldc, packed_N, n_begin)) {
+                                   int N, int ldc, int packed_N, int n_begin, bool single_window) {
+  if (sve_jit_packed_w2_exact_dispatch(packed_A, w2_packed, down, rows, K, N, ldc, packed_N, n_begin, single_window)) {
     return;
   }
   sve_asm_packed_w2_hybrid_dispatch(packed_A, w2_packed, down, rows, K, N, ldc, packed_N, n_begin);
 }
 
-void sve_packed_w2_direct_route_hybrid_dispatch(const uint16_t* packed_A, const uint16_t* w2_packed,
-                                                float* route_out, const int64_t* route_ids, int rows, int K, int N,
-                                                int route_stride, int packed_N, int n_begin) {
-  if (sve_jit_packed_w2_direct_route_exact_dispatch(packed_A, w2_packed, route_out, route_ids, rows, K, N,
-                                                    route_stride, packed_N, n_begin)) {
+void sve_packed_w2_direct_route_hybrid_dispatch(const uint16_t* packed_A, const uint16_t* w2_packed, float* route_out,
+                                                const int64_t* route_ids, int rows, int K, int N, int route_stride,
+                                                int packed_N, int n_begin, bool single_window) {
+  if (sve_jit_packed_w2_direct_route_exact_dispatch(packed_A, w2_packed, route_out, route_ids, rows, K, N, route_stride,
+                                                    packed_N, n_begin, single_window)) {
     return;
   }
   sve_asm_packed_w2_direct_route_hybrid_dispatch(packed_A, w2_packed, route_out, route_ids, rows, K, N, route_stride,
@@ -2798,20 +2998,18 @@ void team_fused_w13_silu_packed(const TeamContext& team, const uint16_t* packed_
 // `intermediate + range.begin*4` uint16 (feature-block fb0 = range.begin/8, one
 // K-block = 32 uint16). ldc = w2.K_pad. M_padded a multiple of 8.
 void team_fused_w13_silu_packed_packc(const TeamContext& team, const uint16_t* packed_A, const uint16_t* w13_packed,
-                                      uint16_t* intermediate, int rows, int K, int N13, int ldc, int64_t degree) {
+                                      uint16_t* intermediate, int rows, int K, int N13, int ldc, int64_t degree,
+                                      int64_t window_tiles) {
   const FusedSiluKernelSet ks = fused_silu_packc_set_for_degree(degree);
   TORCH_CHECK(ks.m8 != nullptr, "unsupported fused silu exp degree ", degree);
-  const GemmSplitPlan plan{MoeGemmSplit::kN};
-  const int M_padded = (rows + 7) / 8 * 8;  // N-split range is over columns
-  const SplitRange range = team_gemm_split_range(plan, M_padded, N13, team.group_size, team.local_tid);
-  if (range.size <= 0) {
-    return;
-  }
-  const int64_t start_block = range.begin / kKernelTile;
-  // m8 over full 8-row blocks + per-tail (rows%8) packed dispatch on this
-  // thread's N-slice. No padding-to-8 compute waste for small experts.
-  packc_w13_tail_dispatch(packed_A, w13_packed + start_block * static_cast<int64_t>(K) * kKernelTile,
-                          intermediate + range.begin * 4, rows, K, static_cast<int>(range.size), ldc, ks);
+  const StageWindowPlan windows = make_stage_window_plan(N13, kKernelTile, team.group_size, window_tiles);
+  for_each_stage_window(windows, team.local_tid, [&](const SplitRange& range, int64_t) {
+    const int64_t start_block = range.begin / kKernelTile;
+    // m8 over full 8-row blocks + per-tail (rows%8) packed dispatch on this
+    // thread's N-slice. No padding-to-8 compute waste for small experts.
+    packc_w13_tail_dispatch(packed_A, w13_packed + start_block * static_cast<int64_t>(K) * kKernelTile,
+                            intermediate + range.begin * 4, rows, K, static_cast<int>(range.size), ldc, ks);
+  });
 }
 
 void team_fused_w13_silu_packed_packc_2d(const TeamContext& team, const Gemm2DSplitPlan& plan, const uint16_t* packed_A,
@@ -2819,6 +3017,8 @@ void team_fused_w13_silu_packed_packc_2d(const TeamContext& team, const Gemm2DSp
                                          int ldc, int64_t degree) {
   const FusedSiluKernelSet ks = fused_silu_packc_set_for_degree(degree);
   TORCH_CHECK(ks.m8 != nullptr, "unsupported fused silu exp degree ", degree);
+  TORCH_CHECK(plan.window_tiles <= 0,
+              "the 2D-split W13 path only supports the full stripe, got window_tiles=", plan.window_tiles);
   const Gemm2DThreadRange range = gemm_2d_thread_range(plan, rows, N13, team.local_tid);
   if (range.rows <= 0 || range.n_cols <= 0) {
     return;
@@ -2833,16 +3033,19 @@ void team_fused_w13_silu_packed_packc_2d(const TeamContext& team, const Gemm2DSp
 
 void team_fused_w13_silu_packed_packc_sve(const TeamContext& team, const uint16_t* packed_A, const uint16_t* w13_packed,
                                           uint16_t* intermediate, int rows, int K, int N13, int ldc, int64_t degree,
-                                          int64_t n_tile) {
+                                          int64_t n_tile, int64_t window_tiles) {
 #if defined(FUSED_CPP_MOE_HAS_ARM_SVE)
   const SveKcFusedSiluKernelSet ks = sve_asm_fused_silu_packc_set_for_degree(degree);
   TORCH_CHECK(ks.m8 != nullptr, "unsupported fused silu exp degree ", degree);
-  const SplitRange range = n_split_range_tile(N13, team.group_size, team.local_tid, n_tile);
-  if (range.size <= 0) {
-    return;
+  const StageWindowPlan windows = make_stage_window_plan(N13, n_tile, team.group_size, window_tiles);
+  const bool single_window = windows.windows() == 1;
+  if (!single_window) {
+    warn_once_if_window_is_not_contiguous(K);
   }
-  sve_packc_w13_hybrid_dispatch(packed_A, w13_packed, intermediate, rows, K, static_cast<int>(range.size), ldc,
-                                N13, static_cast<int>(range.begin), ks, degree);
+  for_each_stage_window(windows, team.local_tid, [&](const SplitRange& range, int64_t) {
+    sve_packc_w13_hybrid_dispatch(packed_A, w13_packed, intermediate, rows, K, static_cast<int>(range.size), ldc, N13,
+                                  static_cast<int>(range.begin), ks, degree, single_window);
+  });
 #else
   (void)team;
   (void)packed_A;
@@ -2854,6 +3057,7 @@ void team_fused_w13_silu_packed_packc_sve(const TeamContext& team, const uint16_
   (void)ldc;
   (void)degree;
   (void)n_tile;
+  (void)window_tiles;
   TORCH_CHECK(false, "SVE MoE asm packC kernel is unavailable in this build");
 #endif
 }
@@ -2873,7 +3077,7 @@ void vllm_staged_w13_range_sve(const uint16_t* packed_A, const uint16_t* w13_pac
   const SveKcFusedSiluKernelSet kernels = sve_asm_fused_silu_packc_set_for_degree(degree);
   TORCH_CHECK(kernels.m8 != nullptr, "unsupported fused silu exp degree ", degree);
   sve_packc_w13_hybrid_dispatch(packed_A, w13_packed, intermediate, rows, K, static_cast<int>(n_cols), ldc, 2 * ldc,
-                                static_cast<int>(n_begin), kernels, degree);
+                                static_cast<int>(n_begin), kernels, degree, /*single_window=*/true);
 #else
   (void)packed_A;
   (void)w13_packed;
@@ -2900,13 +3104,18 @@ void team_fused_w13_silu_packed_packc_sve_2d(const TeamContext& team, const Gemm
   n_plan.tn = plan.tm * plan.tn;
   n_plan.tm = 1;
   n_plan.n_tile = n_tile;
+  // The 2D split path is env-gated and has no window loop, so it only accepts the
+  // R=1 endpoint rather than silently ignoring a narrower window.
+  TORCH_CHECK(plan.window_tiles <= 0,
+              "the 2D-split W13 path only supports the full stripe, got window_tiles=", plan.window_tiles);
   const Gemm2DThreadRange range = gemm_2d_thread_range(n_plan, rows, N13, team.local_tid);
   if (range.rows <= 0 || range.n_cols <= 0) {
     return;
   }
   TORCH_CHECK(range.row_begin == 0, "SVE fused expert only supports N-split ranges");
   sve_packc_w13_hybrid_dispatch(packed_A, w13_packed, intermediate, static_cast<int>(range.rows), K,
-                                static_cast<int>(range.n_cols), ldc, N13, static_cast<int>(range.n_begin), ks, degree);
+                                static_cast<int>(range.n_cols), ldc, N13, static_cast<int>(range.n_begin), ks, degree,
+                                /*single_window=*/true);
 #else
   (void)team;
   (void)plan;
@@ -2947,21 +3156,20 @@ void team_fused_w13_silu_sve(const TeamContext& team, const uint16_t* A, const u
 // A (the packed intermediate). No per-member repack, no a_reorder. down is
 // row-major fp32 [M_padded, N], ldc = N. M_padded a multiple of 8.
 void team_w2_packed(const TeamContext& team, const uint16_t* packed_A, const uint16_t* w2_packed, float* down, int rows,
-                    int K, int N, int ldc) {
-  const GemmSplitPlan plan{MoeGemmSplit::kN};
-  const int M_padded = (rows + 7) / 8 * 8;
-  const SplitRange range = team_gemm_split_range(plan, M_padded, N, team.group_size, team.local_tid);
-  if (range.size <= 0) {
-    return;
-  }
-  const int64_t start_block = range.begin / kKernelTile;
-  // m8 full blocks + same per-tail dispatch as w13 (fp32 rowmajor store).
-  packed_w2_tail_dispatch(packed_A, w2_packed + start_block * static_cast<int64_t>(K) * kKernelTile, down + range.begin,
-                          rows, K, static_cast<int>(range.size), ldc);
+                    int K, int N, int ldc, int64_t window_tiles) {
+  const StageWindowPlan windows = make_stage_window_plan(N, kKernelTile, team.group_size, window_tiles);
+  for_each_stage_window(windows, team.local_tid, [&](const SplitRange& range, int64_t) {
+    const int64_t start_block = range.begin / kKernelTile;
+    // m8 full blocks + same per-tail dispatch as w13 (fp32 rowmajor store).
+    packed_w2_tail_dispatch(packed_A, w2_packed + start_block * static_cast<int64_t>(K) * kKernelTile,
+                            down + range.begin, rows, K, static_cast<int>(range.size), ldc);
+  });
 }
 
 void team_w2_packed_2d(const TeamContext& team, const Gemm2DSplitPlan& plan, const uint16_t* packed_A,
                        const uint16_t* w2_packed, float* down, int rows, int K, int N, int ldc) {
+  TORCH_CHECK(plan.window_tiles <= 0,
+              "the 2D-split W2 path only supports the full stripe, got window_tiles=", plan.window_tiles);
   const Gemm2DThreadRange range = gemm_2d_thread_range(plan, rows, N, team.local_tid);
   if (range.rows <= 0 || range.n_cols <= 0) {
     return;
@@ -2974,14 +3182,17 @@ void team_w2_packed_2d(const TeamContext& team, const Gemm2DSplitPlan& plan, con
 }
 
 void team_w2_packed_sve(const TeamContext& team, const uint16_t* packed_A, const uint16_t* w2_packed, float* down,
-                        int rows, int K, int N, int ldc, int64_t n_tile) {
+                        int rows, int K, int N, int ldc, int64_t n_tile, int64_t window_tiles) {
 #if defined(FUSED_CPP_MOE_HAS_ARM_SVE)
-  const SplitRange range = n_split_range_tile(N, team.group_size, team.local_tid, n_tile);
-  if (range.size <= 0) {
-    return;
+  const StageWindowPlan windows = make_stage_window_plan(N, n_tile, team.group_size, window_tiles);
+  const bool single_window = windows.windows() == 1;
+  if (!single_window) {
+    warn_once_if_window_is_not_contiguous(K);
   }
-  sve_packed_w2_hybrid_dispatch(packed_A, w2_packed, down + range.begin, rows, K, static_cast<int>(range.size), ldc,
-                                N, static_cast<int>(range.begin));
+  for_each_stage_window(windows, team.local_tid, [&](const SplitRange& range, int64_t) {
+    sve_packed_w2_hybrid_dispatch(packed_A, w2_packed, down + range.begin, rows, K, static_cast<int>(range.size), ldc,
+                                  N, static_cast<int>(range.begin), single_window);
+  });
 #else
   (void)team;
   (void)packed_A;
@@ -2992,6 +3203,7 @@ void team_w2_packed_sve(const TeamContext& team, const uint16_t* packed_A, const
   (void)N;
   (void)ldc;
   (void)n_tile;
+  (void)window_tiles;
   TORCH_CHECK(false, "SVE MoE asm w2 kernel is unavailable in this build");
 #endif
 }
@@ -2999,13 +3211,16 @@ void team_w2_packed_sve(const TeamContext& team, const uint16_t* packed_A, const
 void team_w2_packed_sve_2d(const TeamContext& team, const Gemm2DSplitPlan& plan, const uint16_t* packed_A,
                            const uint16_t* w2_packed, float* down, int rows, int K, int N, int ldc) {
 #if defined(FUSED_CPP_MOE_HAS_ARM_SVE)
+  TORCH_CHECK(plan.window_tiles <= 0,
+              "the 2D-split W2 path only supports the full stripe, got window_tiles=", plan.window_tiles);
   const Gemm2DThreadRange range = gemm_2d_thread_range(plan, rows, N, team.local_tid);
   if (range.rows <= 0 || range.n_cols <= 0) {
     return;
   }
   TORCH_CHECK(range.row_begin == 0, "SVE fused expert only supports N-split ranges");
   sve_packed_w2_hybrid_dispatch(packed_A, w2_packed, down + range.n_begin, static_cast<int>(range.rows), K,
-                                static_cast<int>(range.n_cols), ldc, N, static_cast<int>(range.n_begin));
+                                static_cast<int>(range.n_cols), ldc, N, static_cast<int>(range.n_begin),
+                                /*single_window=*/true);
 #else
   (void)team;
   (void)plan;
@@ -3022,21 +3237,25 @@ void team_w2_packed_sve_2d(const TeamContext& team, const Gemm2DSplitPlan& plan,
 
 void team_w2_packed_sve_direct_route(const TeamContext& team, const uint16_t* packed_A, const uint16_t* w2_packed,
                                      float* route_out, const int64_t* route_ids, int rows, int K, int N,
-                                     int route_stride, int64_t n_tile) {
+                                     int route_stride, int64_t n_tile, int64_t window_tiles) {
 #if defined(FUSED_CPP_MOE_HAS_ARM_SVE)
-  const SplitRange range = n_split_range_tile(N, team.group_size, team.local_tid, n_tile);
-  if (range.size <= 0) {
-    return;
+  const StageWindowPlan windows = make_stage_window_plan(N, n_tile, team.group_size, window_tiles);
+  const bool single_window = windows.windows() == 1;
+  if (!single_window) {
+    warn_once_if_window_is_not_contiguous(K);
   }
-  sve_packed_w2_direct_route_hybrid_dispatch(packed_A, w2_packed, route_out + range.begin, route_ids, rows, K,
-                                             static_cast<int>(range.size), route_stride, N,
-                                             static_cast<int>(range.begin));
+  for_each_stage_window(windows, team.local_tid, [&](const SplitRange& range, int64_t) {
+    sve_packed_w2_direct_route_hybrid_dispatch(packed_A, w2_packed, route_out + range.begin, route_ids, rows, K,
+                                               static_cast<int>(range.size), route_stride, N,
+                                               static_cast<int>(range.begin), single_window);
+  });
 #else
   (void)team;
   (void)packed_A;
   (void)w2_packed;
   (void)route_out;
   (void)route_ids;
+  (void)window_tiles;
   (void)rows;
   (void)K;
   (void)N;
@@ -3050,6 +3269,8 @@ void team_w2_packed_sve_direct_route_2d(const TeamContext& team, const Gemm2DSpl
                                         const uint16_t* w2_packed, float* route_out, const int64_t* route_ids, int rows,
                                         int K, int N, int route_stride) {
 #if defined(FUSED_CPP_MOE_HAS_ARM_SVE)
+  TORCH_CHECK(plan.window_tiles <= 0,
+              "the 2D-split W2 path only supports the full stripe, got window_tiles=", plan.window_tiles);
   const Gemm2DThreadRange range = gemm_2d_thread_range(plan, rows, N, team.local_tid);
   if (range.rows <= 0 || range.n_cols <= 0) {
     return;
@@ -3057,7 +3278,8 @@ void team_w2_packed_sve_direct_route_2d(const TeamContext& team, const Gemm2DSpl
   TORCH_CHECK(range.row_begin == 0, "SVE fused expert only supports N-split ranges");
   sve_packed_w2_direct_route_hybrid_dispatch(packed_A, w2_packed, route_out + range.n_begin, route_ids,
                                              static_cast<int>(range.rows), K, static_cast<int>(range.n_cols),
-                                             route_stride, N, static_cast<int>(range.n_begin));
+                                             route_stride, N, static_cast<int>(range.n_begin),
+                                             /*single_window=*/true);
 #else
   (void)team;
   (void)plan;
@@ -3073,17 +3295,19 @@ void team_w2_packed_sve_direct_route_2d(const TeamContext& team, const Gemm2DSpl
 #endif
 }
 
-void team_w2_packed_sve_direct_bf16_route(const TeamContext& team, const uint16_t* packed_A,
-                                          const uint16_t* w2_packed, uint16_t* route_out, const int64_t* route_ids,
-                                          int rows, int K, int N, int route_stride, int64_t n_tile) {
+void team_w2_packed_sve_direct_bf16_route(const TeamContext& team, const uint16_t* packed_A, const uint16_t* w2_packed,
+                                          uint16_t* route_out, const int64_t* route_ids, int rows, int K, int N,
+                                          int route_stride, int64_t n_tile, int64_t window_tiles) {
 #if defined(FUSED_CPP_MOE_HAS_ARM_SVE)
-  const SplitRange range = n_split_range_tile(N, team.group_size, team.local_tid, n_tile);
-  if (range.size <= 0) {
-    return;
+  const StageWindowPlan windows = make_stage_window_plan(N, n_tile, team.group_size, window_tiles);
+  if (windows.windows() > 1) {
+    warn_once_if_window_is_not_contiguous(K);
   }
-  sve_asm_packed_w2_direct_bf16_route_hybrid_dispatch(
-      packed_A, w2_packed, route_out + range.begin, route_ids, rows, K, static_cast<int>(range.size), route_stride, N,
-      static_cast<int>(range.begin));
+  for_each_stage_window(windows, team.local_tid, [&](const SplitRange& range, int64_t) {
+    sve_asm_packed_w2_direct_bf16_route_hybrid_dispatch(packed_A, w2_packed, route_out + range.begin, route_ids, rows,
+                                                        K, static_cast<int>(range.size), route_stride, N,
+                                                        static_cast<int>(range.begin));
+  });
 #else
   (void)team;
   (void)packed_A;
@@ -3095,6 +3319,7 @@ void team_w2_packed_sve_direct_bf16_route(const TeamContext& team, const uint16_
   (void)N;
   (void)route_stride;
   (void)n_tile;
+  (void)window_tiles;
   TORCH_CHECK(false, "SVE MoE asm direct-BF16-route w2 kernel is unavailable in this build");
 #endif
 }
@@ -3108,7 +3333,7 @@ void vllm_staged_w2_direct_route_range_sve(const uint16_t* packed_A, const uint1
               " tile=", n_tile);
   sve_packed_w2_direct_route_hybrid_dispatch(packed_A, w2_packed, route_out + n_begin, route_ids, rows, K,
                                              static_cast<int>(n_cols), route_stride, route_stride,
-                                             static_cast<int>(n_begin));
+                                             static_cast<int>(n_begin), /*single_window=*/true);
 #else
   (void)packed_A;
   (void)w2_packed;
@@ -3153,6 +3378,8 @@ void team_w2_packed_sve_direct_bf16_route_2d(const TeamContext& team, const Gemm
                                              const uint16_t* packed_A, const uint16_t* w2_packed, uint16_t* route_out,
                                              const int64_t* route_ids, int rows, int K, int N, int route_stride) {
 #if defined(FUSED_CPP_MOE_HAS_ARM_SVE)
+  TORCH_CHECK(plan.window_tiles <= 0,
+              "the 2D-split W2 path only supports the full stripe, got window_tiles=", plan.window_tiles);
   const Gemm2DThreadRange range = gemm_2d_thread_range(plan, rows, N, team.local_tid);
   if (range.rows <= 0 || range.n_cols <= 0) {
     return;
@@ -3177,14 +3404,16 @@ void team_w2_packed_sve_direct_bf16_route_2d(const TeamContext& team, const Gemm
 }
 
 void team_w2_packed_bf16_sve(const TeamContext& team, const uint16_t* packed_A, const uint16_t* w2_packed,
-                             uint16_t* down, int rows, int K, int N, int ldc, int64_t n_tile) {
+                             uint16_t* down, int rows, int K, int N, int ldc, int64_t n_tile, int64_t window_tiles) {
 #if defined(FUSED_CPP_MOE_HAS_ARM_SVE)
-  const SplitRange range = n_split_range_tile(N, team.group_size, team.local_tid, n_tile);
-  if (range.size <= 0) {
-    return;
+  const StageWindowPlan windows = make_stage_window_plan(N, n_tile, team.group_size, window_tiles);
+  if (windows.windows() > 1) {
+    warn_once_if_window_is_not_contiguous(K);
   }
-  sve_asm_packed_w2_bf16_hybrid_dispatch(packed_A, w2_packed, down + range.begin, rows, K,
-                                         static_cast<int>(range.size), ldc, N, static_cast<int>(range.begin));
+  for_each_stage_window(windows, team.local_tid, [&](const SplitRange& range, int64_t) {
+    sve_asm_packed_w2_bf16_hybrid_dispatch(packed_A, w2_packed, down + range.begin, rows, K,
+                                           static_cast<int>(range.size), ldc, N, static_cast<int>(range.begin));
+  });
 #else
   (void)team;
   (void)packed_A;
@@ -3195,6 +3424,7 @@ void team_w2_packed_bf16_sve(const TeamContext& team, const uint16_t* packed_A, 
   (void)N;
   (void)ldc;
   (void)n_tile;
+  (void)window_tiles;
   TORCH_CHECK(false, "SVE MoE asm bf16-output w2 kernel is unavailable in this build");
 #endif
 }
@@ -3202,6 +3432,8 @@ void team_w2_packed_bf16_sve(const TeamContext& team, const uint16_t* packed_A, 
 void team_w2_packed_bf16_sve_2d(const TeamContext& team, const Gemm2DSplitPlan& plan, const uint16_t* packed_A,
                                 const uint16_t* w2_packed, uint16_t* down, int rows, int K, int N, int ldc) {
 #if defined(FUSED_CPP_MOE_HAS_ARM_SVE)
+  TORCH_CHECK(plan.window_tiles <= 0,
+              "the 2D-split W2 path only supports the full stripe, got window_tiles=", plan.window_tiles);
   const Gemm2DThreadRange range = gemm_2d_thread_range(plan, rows, N, team.local_tid);
   if (range.rows <= 0 || range.n_cols <= 0) {
     return;
@@ -3267,7 +3499,8 @@ void team_fused_w13_silu_packed_packc_backend(bool use_sve_backend, bool use_2d_
       team_fused_w13_silu_packed_packc_sve_2d(team, plan, packed_A, w13_packed, intermediate, rows, K, N13, ldc, degree,
                                               n_tile);
     } else {
-      team_fused_w13_silu_packed_packc_sve(team, packed_A, w13_packed, intermediate, rows, K, N13, ldc, degree, n_tile);
+      team_fused_w13_silu_packed_packc_sve(team, packed_A, w13_packed, intermediate, rows, K, N13, ldc, degree, n_tile,
+                                           plan.window_tiles);
     }
     return;
   }
@@ -3277,7 +3510,8 @@ void team_fused_w13_silu_packed_packc_backend(bool use_sve_backend, bool use_2d_
   if (use_2d_split) {
     team_fused_w13_silu_packed_packc_2d(team, plan, packed_A, w13_packed, intermediate, rows, K, N13, ldc, degree);
   } else {
-    team_fused_w13_silu_packed_packc(team, packed_A, w13_packed, intermediate, rows, K, N13, ldc, degree);
+    team_fused_w13_silu_packed_packc(team, packed_A, w13_packed, intermediate, rows, K, N13, ldc, degree,
+                                     plan.window_tiles);
   }
 }
 
@@ -3289,7 +3523,7 @@ void team_w2_packed_backend(bool use_sve_backend, bool use_2d_split, const TeamC
     if (use_2d_split) {
       team_w2_packed_sve_2d(team, plan, packed_A, w2_packed, down, rows, K, N, ldc);
     } else {
-      team_w2_packed_sve(team, packed_A, w2_packed, down, rows, K, N, ldc, n_tile);
+      team_w2_packed_sve(team, packed_A, w2_packed, down, rows, K, N, ldc, n_tile, plan.window_tiles);
     }
     return;
   }
@@ -3299,7 +3533,7 @@ void team_w2_packed_backend(bool use_sve_backend, bool use_2d_split, const TeamC
   if (use_2d_split) {
     team_w2_packed_2d(team, plan, packed_A, w2_packed, down, rows, K, N, ldc);
   } else {
-    team_w2_packed(team, packed_A, w2_packed, down, rows, K, N, ldc);
+    team_w2_packed(team, packed_A, w2_packed, down, rows, K, N, ldc, plan.window_tiles);
   }
 }
 
@@ -3308,10 +3542,10 @@ void team_w2_packed_sve_direct_route_backend(bool use_2d_split, const TeamContex
                                              const int64_t* route_ids, int rows, int K, int N, int route_stride,
                                              int64_t n_tile) {
   if (use_2d_split) {
-    team_w2_packed_sve_direct_route_2d(team, plan, packed_A, w2_packed, route_out, route_ids, rows, K, N,
-                                       route_stride);
+    team_w2_packed_sve_direct_route_2d(team, plan, packed_A, w2_packed, route_out, route_ids, rows, K, N, route_stride);
   } else {
-    team_w2_packed_sve_direct_route(team, packed_A, w2_packed, route_out, route_ids, rows, K, N, route_stride, n_tile);
+    team_w2_packed_sve_direct_route(team, packed_A, w2_packed, route_out, route_ids, rows, K, N, route_stride, n_tile,
+                                    plan.window_tiles);
   }
 }
 
@@ -3324,7 +3558,7 @@ void team_w2_packed_sve_direct_bf16_route_backend(
                                             route_stride);
   } else {
     team_w2_packed_sve_direct_bf16_route(team, packed_A, w2_packed, route_out, route_ids, rows, K, N, route_stride,
-                                         n_tile);
+                                         n_tile, plan.window_tiles);
   }
 }
 
@@ -3334,7 +3568,7 @@ void team_w2_packed_bf16_sve_backend(bool use_2d_split, const TeamContext& team,
   if (use_2d_split) {
     team_w2_packed_bf16_sve_2d(team, plan, packed_A, w2_packed, down, rows, K, N, ldc);
   } else {
-    team_w2_packed_bf16_sve(team, packed_A, w2_packed, down, rows, K, N, ldc, n_tile);
+    team_w2_packed_bf16_sve(team, packed_A, w2_packed, down, rows, K, N, ldc, n_tile, plan.window_tiles);
   }
 }
 #endif  // __aarch64__
@@ -4586,6 +4820,12 @@ struct AsyncPlanV2NativeArgs {
   at::Tensor task_stage_ids;
   at::Tensor task_resize_points;
   at::Tensor task_range_granularities;
+  // Per-task per-thread owner windows in whole N tiles, one entry per task and
+  // stage. 0 means the full stripe, which is the R=1 endpoint. Optional so plans
+  // written before windows existed keep running unchanged. Orthogonal to
+  // `task_range_granularities`, which slices routes rather than the weight.
+  c10::optional<at::Tensor> task_w13_window_tiles;
+  c10::optional<at::Tensor> task_w2_window_tiles;
   c10::optional<at::Tensor> task_release_ns;
   c10::optional<at::Tensor> task_resize_timeout_ns;
   c10::optional<at::Tensor> task_preferred_core_begins;
@@ -4823,6 +5063,27 @@ fused_moe_test_split_plan(std::string stage, int64_t M, int64_t K, int64_t N, in
     n_ranges.emplace_back(nr.begin, nr.size);
   }
   return std::make_tuple(selected, m_ranges, n_ranges);
+}
+
+// Test-only entry: expose the stage-window geometry so tests can pin the
+// `(threads, window_tiles)` -> pattern mapping against the Python derivation in
+// cost_model/full_stage_geometry.py, and can assert the R=1 endpoint reproduces
+// the full-N team stripes this used to compute inline.
+std::tuple<int64_t, int64_t, int64_t, std::vector<std::vector<std::pair<int64_t, int64_t>>>>
+fused_moe_test_stage_window_plan(int64_t N, int64_t n_tile, int64_t threads, int64_t window_tiles) {
+  const StageWindowPlan plan = make_stage_window_plan(N, n_tile, threads, window_tiles);
+  std::vector<std::vector<std::pair<int64_t, int64_t>>> ranges;
+  ranges.reserve(static_cast<size_t>(plan.windows()));
+  for (int64_t index = 0; index < plan.windows(); ++index) {
+    std::vector<std::pair<int64_t, int64_t>> per_thread;
+    per_thread.reserve(static_cast<size_t>(plan.threads));
+    for (int64_t tid = 0; tid < plan.threads; ++tid) {
+      const SplitRange cols = plan.thread_col_range(index, tid);
+      per_thread.emplace_back(cols.begin, cols.size);
+    }
+    ranges.push_back(std::move(per_thread));
+  }
+  return std::make_tuple(plan.windows(), plan.range_tiles(), plan.window_tiles, std::move(ranges));
 }
 
 // Test-only entry: run the bottom-layer single_thread_gemm for a dense
@@ -5215,6 +5476,78 @@ at::Tensor fused_moe_test_fused_w13_silu_packc(at::Tensor A, at::Tensor w13, int
 #endif
 }
 
+// Test-only: assemble the packed-C intermediate by running the windowed team W13
+// stage for every local_tid of a `group_size` team into ONE shared buffer, with an
+// explicit per-thread owner window. Reordering the (M panel, window) traversal
+// visits every pair exactly once and each thread writes disjoint columns, so the
+// result must be bitwise identical for every legal `window_tiles`, including the
+// R=1 full stripe.
+at::Tensor fused_moe_test_team_w13_silu_packc_window(at::Tensor A, at::Tensor w13, int64_t group_size, int64_t degree,
+                                                     int64_t n_tile, int64_t window_tiles, bool use_sve) {
+#ifndef __aarch64__
+  TORCH_CHECK(false, "fused_moe_test_team_w13_silu_packc_window requires AArch64");
+#else
+  check_bf16_cpu(A, "A");
+  check_bf16_cpu(w13, "w13");
+  TORCH_CHECK(A.dim() == 2, "A must be 2-D [M, H]");
+  TORCH_CHECK(w13.dim() == 2, "w13 must be 2-D [2F, H]");
+  TORCH_CHECK(group_size > 0, "group_size must be positive");
+  A = A.contiguous();
+  w13 = w13.contiguous();
+  const int64_t M = A.size(0);
+  const int64_t H = A.size(1);
+  const int64_t N13 = w13.size(0);
+  TORCH_CHECK(w13.size(1) == H, "w13 second dim must equal H=", H);
+  TORCH_CHECK(N13 % 2 == 0, "w13 output dim must be even, got ", N13);
+  const int64_t F = N13 / 2;
+  check_positive_int(M, "M");
+  check_positive_int(H, "H");
+
+  const int64_t K_pad = ceil_to_multiple(H, kKernelTile);
+  const int64_t F_pad4 = ceil_to_multiple(F, 4);
+  const int64_t N_pad = 2 * F_pad4;
+  const int64_t Mp = ceil_to_multiple(M, kKernelTile);
+  // The packed-C intermediate is panel major and the two backends use different
+  // panel heights: the SVE path is M12 padded, the static path is 8-row padded.
+  // Size for whichever is larger so one buffer serves both, mirroring how the
+  // executor picks `sve_hybrid_packed_rows` or `ceil_to_multiple(rows, 8)` from
+  // its own `fused_packa` flag.
+  const int64_t ldc = ceil_to_multiple(F, kKernelTile);
+  const int64_t packed_rows = std::max(sve_hybrid_packed_rows(M), ceil_to_multiple(M, int64_t{kKernelTile}));
+
+  std::vector<uint16_t> packed(static_cast<size_t>(K_pad * N_pad), static_cast<uint16_t>(0));
+  pack_transposed_expert_weight_interleaved(bf16_data_const(w13), 0, F, H, K_pad, N_pad, packed.data());
+
+  std::vector<uint16_t> a_pad(static_cast<size_t>(M * K_pad), static_cast<uint16_t>(0));
+  const uint16_t* a_src = bf16_data_const(A);
+  for (int64_t m = 0; m < M; ++m) {
+    std::copy(a_src + m * H, a_src + m * H + H, a_pad.data() + m * K_pad);
+  }
+  std::vector<uint16_t> packed_a(static_cast<size_t>(Mp * K_pad), static_cast<uint16_t>(0));
+  pack_a_reorder_m8(a_pad.data(), packed_a.data(), static_cast<int>(M), static_cast<int>(K_pad), 0,
+                    static_cast<int>(Mp / 8));
+
+  at::Tensor C = at::zeros({packed_rows * ldc}, at::TensorOptions().dtype(at::kBFloat16));
+  for (int64_t local_tid = 0; local_tid < group_size; ++local_tid) {
+    TeamContext team;
+    team.group_size = group_size;
+    team.local_tid = local_tid;
+    team.barrier = nullptr;
+    team.a_reorder = nullptr;
+    if (use_sve) {
+      team_fused_w13_silu_packed_packc_sve(team, packed_a.data(), packed.data(), bf16_data(C), static_cast<int>(M),
+                                           static_cast<int>(K_pad), static_cast<int>(N_pad), static_cast<int>(ldc),
+                                           degree, n_tile, window_tiles);
+    } else {
+      team_fused_w13_silu_packed_packc(team, packed_a.data(), packed.data(), bf16_data(C), static_cast<int>(M),
+                                       static_cast<int>(K_pad), static_cast<int>(N_pad), static_cast<int>(ldc), degree,
+                                       window_tiles);
+    }
+  }
+  return C;
+#endif
+}
+
 // Test-only: run the middle-layer team_gemm on the resident thread pool for a
 // dense A[M,K] x B[N,K]^T -> C[M,N] (fp32). split is "m", "n", or "auto".
 at::Tensor fused_moe_test_team_gemm(at::Tensor A, at::Tensor B, int64_t group_size, std::string split,
@@ -5399,6 +5732,71 @@ at::Tensor fused_moe_test_sve_packed_gemm(at::Tensor A, at::Tensor packed_B, int
                                       static_cast<int>(N), 0);
   }
   return output.narrow(0, 0, rows).clone();
+#endif
+}
+
+// Test-only: assemble the W2 output by running the windowed team W2 stage for
+// every local_tid of a `group_size` team into ONE shared buffer, with an explicit
+// per-thread owner window. `mode` selects the stage variant: 0 = packed fp32
+// output, 1 = direct-route fp32 scatter. Like the W13 counterpart the result must
+// be bitwise identical for every legal window.
+at::Tensor fused_moe_test_team_w2_window(at::Tensor A, at::Tensor w2_packed, int64_t K, int64_t N, int64_t group_size,
+                                         int64_t n_tile, int64_t window_tiles, int64_t mode) {
+#if !defined(__aarch64__) || !defined(FUSED_CPP_MOE_HAS_ARM_SVE)
+  TORCH_CHECK(false, "fused_moe_test_team_w2_window requires AArch64 SVE");
+#else
+  check_bf16_cpu(A, "A");
+  TORCH_CHECK(A.dim() == 2 && A.size(1) == K, "A must be 2-D [M, K] with K=", K);
+  TORCH_CHECK(group_size > 0, "group_size must be positive");
+  TORCH_CHECK(mode == 0 || mode == 1, "mode must be 0 (packed) or 1 (direct route)");
+  check_positive_int(A.size(0), "M");
+  check_positive_int(K, "K");
+  check_positive_int(N, "N");
+  A = A.contiguous();
+  const PackedExperts weights = checked_packed_experts(w2_packed, K, N, "w2_packed", n_tile);
+
+  const int rows = static_cast<int>(A.size(0));
+  const int64_t packed_rows = sve_hybrid_packed_rows(rows);
+  std::vector<uint16_t> packed_a(static_cast<size_t>(packed_rows * K), static_cast<uint16_t>(0));
+  std::vector<int64_t> routes(static_cast<size_t>(rows));
+  std::iota(routes.begin(), routes.end(), int64_t{0});
+  gather_pack_a_reorder_sve_hybrid(bf16_data_const(A), K, routes.data(), 1, packed_a.data(), rows, static_cast<int>(K),
+                                   int64_t{1}, int64_t{0});
+
+  at::Tensor out = at::zeros({packed_rows, N}, at::TensorOptions().dtype(at::kFloat));
+  const uint16_t* packed_b = bf16_data_const(weights.tensor);
+  for (int64_t local_tid = 0; local_tid < group_size; ++local_tid) {
+    TeamContext team;
+    team.group_size = group_size;
+    team.local_tid = local_tid;
+    team.barrier = nullptr;
+    team.a_reorder = nullptr;
+    if (mode == 0) {
+      team_w2_packed_sve(team, packed_a.data(), packed_b, out.data_ptr<float>(), rows, static_cast<int>(K),
+                         static_cast<int>(N), static_cast<int>(N), n_tile, window_tiles);
+    } else {
+      team_w2_packed_sve_direct_route(team, packed_a.data(), packed_b, out.data_ptr<float>(), routes.data(), rows,
+                                      static_cast<int>(K), static_cast<int>(N), static_cast<int>(N), n_tile,
+                                      window_tiles);
+    }
+  }
+  return out.narrow(0, 0, rows).clone();
+#endif
+}
+
+// Test-only: the H ranges a worker scatters, in visit order. Under the owner path
+// these must mirror the W2 GEMM windows exactly, because that is what lets the
+// executor skip the W2-to-scatter team barrier.
+std::vector<std::pair<int64_t, int64_t>> fused_moe_test_w2_scatter_ranges(int64_t N, int64_t n_tile, int64_t group_size,
+                                                                          int64_t local_tid, int64_t window_tiles,
+                                                                          bool use_w2_n_owner) {
+#ifndef __aarch64__
+  TORCH_CHECK(false, "fused_moe_test_w2_scatter_ranges requires AArch64");
+#else
+  std::vector<std::pair<int64_t, int64_t>> ranges;
+  for_each_w2_scatter_range(static_cast<int>(N), group_size, local_tid, n_tile, window_tiles, use_w2_n_owner,
+                            [&](const SplitRange& range) { ranges.emplace_back(range.begin, range.size); });
+  return ranges;
 #endif
 }
 
@@ -5965,7 +6363,7 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input, at::Tensor w13_packed, int64_t
               team_fused_w13_silu_packed_packc_sve(
                   team, scratch.packed_a.data(), w13_ptr + task.expert * w13.packed_stride, scratch.intermediate.data(),
                   static_cast<int>(rows), static_cast<int>(w13.K_pad), static_cast<int>(w13.N_pad),
-                  static_cast<int>(w2.K_pad), silu_poly_degree, w13.n_tile);
+                  static_cast<int>(w2.K_pad), silu_poly_degree, w13.n_tile, /*window_tiles=*/0);
             } else {
               single_thread_gemm_fused_silu(scratch.input.data(), w13_ptr + task.expert * w13.packed_stride,
                                             scratch.intermediate.data(), scratch.a_reorder.data(),
@@ -5998,21 +6396,23 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input, at::Tensor w13_packed, int64_t
                 team_w2_packed_sve_direct_bf16_route(
                     team, scratch.intermediate.data(), w2_ptr + task.expert * w2.packed_stride, route_out_bf16_ptr,
                     expert_routes.data() + task.route_begin, static_cast<int>(rows), static_cast<int>(w2.K_pad),
-                    static_cast<int>(w2.N_pad), static_cast<int>(H), w2.n_tile);
+                    static_cast<int>(w2.N_pad), static_cast<int>(H), w2.n_tile, /*window_tiles=*/0);
               } else {
                 team_w2_packed_sve_direct_route(
                     team, scratch.intermediate.data(), w2_ptr + task.expert * w2.packed_stride, route_out_ptr,
                     expert_routes.data() + task.route_begin, static_cast<int>(rows), static_cast<int>(w2.K_pad),
-                    static_cast<int>(w2.N_pad), static_cast<int>(H), w2.n_tile);
+                    static_cast<int>(w2.N_pad), static_cast<int>(H), w2.n_tile, /*window_tiles=*/0);
               }
             } else if (use_w2_bf16_route) {
               team_w2_packed_bf16_sve(team, scratch.intermediate.data(), w2_ptr + task.expert * w2.packed_stride,
                                       scratch.down_bf16.data(), static_cast<int>(rows), static_cast<int>(w2.K_pad),
-                                      static_cast<int>(w2.N_pad), static_cast<int>(w2.N_pad), w2.n_tile);
+                                      static_cast<int>(w2.N_pad), static_cast<int>(w2.N_pad), w2.n_tile,
+                                      /*window_tiles=*/0);
             } else {
               team_w2_packed_sve(team, scratch.intermediate.data(), w2_ptr + task.expert * w2.packed_stride,
                                  scratch.down.data(), static_cast<int>(rows), static_cast<int>(w2.K_pad),
-                                 static_cast<int>(w2.N_pad), static_cast<int>(w2.N_pad), w2.n_tile);
+                                 static_cast<int>(w2.N_pad), static_cast<int>(w2.N_pad), w2.n_tile,
+                                 /*window_tiles=*/0);
             }
           } else {
             trace_dispatch_fp32_gemm(moe_trace, "w2", tid, -1, -1, -1, task.expert, task.route_begin, rows,
@@ -6222,6 +6622,13 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input, at::Tensor w13_packed, int64_t
 
         const auto& expert_routes = routes[static_cast<size_t>(expert)];
         const int64_t rows = static_cast<int64_t>(expert_routes.size());
+        // Per-thread owner windows in whole N tiles; 0 is the full stripe (R = 1).
+        // The GEMM and the owner-scatter must use the same value, so it is declared
+        // where both can see it. It comes from the task plan, or from the
+        // FUSED_CPP_MOE_STAGE_WINDOW_TILES experiment override when the plan left it
+        // at the full stripe.
+        const int64_t w13_window_tiles = resolve_stage_window_tiles(0, /*is_w13=*/true);
+        const int64_t w2_window_tiles = resolve_stage_window_tiles(0, /*is_w13=*/false);
 
         if (fuse_silu && fused_packa) {
           // Fused gather + m8 reorder pack (Part 1): write the w13 A
@@ -6274,7 +6681,7 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input, at::Tensor w13_packed, int64_t
             const int64_t nb = (rows + 7) / 8;
             if (fused_packa_w2) {
               const Gemm2DSplitPlan w13_2d_plan =
-                  plan_2d_gemm_split(rows, w13.K_pad, w13.N_pad, nsplit_group_size, w13.n_tile);
+                  plan_2d_gemm_split(rows, w13.K_pad, w13.N_pad, nsplit_group_size, w13.n_tile, w13_window_tiles);
               time_phase(phase_w13_ms, [&] {
                 if (use_sve_backend) {
                   if (use_fused_2d_split) {
@@ -6287,7 +6694,8 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input, at::Tensor w13_packed, int64_t
                     team_fused_w13_silu_packed_packc_sve(
                         team, scratch.packed_a.data(), w13_ptr + expert * w13.packed_stride,
                         scratch.intermediate.data(), static_cast<int>(rows), static_cast<int>(w13.K_pad),
-                        static_cast<int>(w13.N_pad), static_cast<int>(w2.K_pad), silu_poly_degree, w13.n_tile);
+                        static_cast<int>(w13.N_pad), static_cast<int>(w2.K_pad), silu_poly_degree, w13.n_tile,
+                        /*window_tiles=*/0);
                   }
                 } else {
                   if (use_fused_2d_split) {
@@ -6299,7 +6707,8 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input, at::Tensor w13_packed, int64_t
                     team_fused_w13_silu_packed_packc(
                         team, scratch.packed_a.data(), w13_ptr + expert * w13.packed_stride,
                         scratch.intermediate.data(), static_cast<int>(rows), static_cast<int>(w13.K_pad),
-                        static_cast<int>(w13.N_pad), static_cast<int>(w2.K_pad), silu_poly_degree);
+                        static_cast<int>(w13.N_pad), static_cast<int>(w2.K_pad), silu_poly_degree,
+                        /*window_tiles=*/0);
                   }
                 }
               });
@@ -6360,7 +6769,8 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input, at::Tensor w13_packed, int64_t
         if (fused_packa_w2) {
           // w2 reads the PACKED intermediate directly (no repack);
           // N-split over w2.N_pad. M padded to a multiple of 8.
-          const Gemm2DSplitPlan w2_2d_plan = plan_2d_gemm_split(rows, w2.K_pad, w2.N_pad, nsplit_group_size, w2.n_tile);
+          const Gemm2DSplitPlan w2_2d_plan =
+              plan_2d_gemm_split(rows, w2.K_pad, w2.N_pad, nsplit_group_size, w2.n_tile, w2_window_tiles);
           time_phase(phase_w2_ms, [&] {
             if (use_w2_direct_route) {
               if (use_w2_bf16_route) {
@@ -6389,7 +6799,7 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input, at::Tensor w13_packed, int64_t
               } else {
                 team_w2_packed_sve(w2team, scratch.intermediate.data(), w2_ptr + expert * w2.packed_stride,
                                    scratch.down.data(), static_cast<int>(rows), static_cast<int>(w2.K_pad),
-                                   static_cast<int>(w2.N_pad), static_cast<int>(w2.N_pad), w2.n_tile);
+                                   static_cast<int>(w2.N_pad), static_cast<int>(w2.N_pad), w2.n_tile, w2_window_tiles);
               }
             } else {
               if (use_fused_2d_split) {
@@ -6399,7 +6809,7 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input, at::Tensor w13_packed, int64_t
               } else {
                 team_w2_packed(w2team, scratch.intermediate.data(), w2_ptr + expert * w2.packed_stride,
                                scratch.down.data(), static_cast<int>(rows), static_cast<int>(w2.K_pad),
-                               static_cast<int>(w2.N_pad), static_cast<int>(w2.N_pad));
+                               static_cast<int>(w2.N_pad), static_cast<int>(w2.N_pad), w2_window_tiles);
               }
             }
           });
@@ -6423,8 +6833,8 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input, at::Tensor w13_packed, int64_t
 
         if (!use_w2_direct_route) {
           time_phase(phase_scatter_ms, [&] {
-            with_w2_scatter_owner(static_cast<int>(w2.N_pad), nsplit_group_size, local_tid, w2.n_tile,
-                                  use_w2_n_owner_scatter, [&](const SplitRange& h_range) {
+            for_each_w2_scatter_range(static_cast<int>(w2.N_pad), nsplit_group_size, local_tid, w2.n_tile,
+                                      w2_window_tiles, use_w2_n_owner_scatter, [&](const SplitRange& h_range) {
                                         const int64_t h_begin = h_range.begin;
                                         const int64_t h_end = std::min<int64_t>(H, h_begin + h_range.size);
                                         if (h_begin >= h_end) {
@@ -6867,6 +7277,13 @@ at::Tensor fused_moe_bf16_tiled_scheduled(at::Tensor input, at::Tensor w13_packe
         ThreadBarrier& barrier = scratch.barrier;
         const int64_t expert = team_expert_ids_v[static_cast<size_t>(selected_team)];
         const int64_t rows = team_rows[static_cast<size_t>(selected_team)];
+        // Per-thread owner windows in whole N tiles; 0 is the full stripe (R = 1).
+        // The GEMM and the owner-scatter must use the same value, so it is declared
+        // where both can see it. It comes from the task plan, or from the
+        // FUSED_CPP_MOE_STAGE_WINDOW_TILES experiment override when the plan left it
+        // at the full stripe.
+        const int64_t w13_window_tiles = resolve_stage_window_tiles(0, /*is_w13=*/true);
+        const int64_t w2_window_tiles = resolve_stage_window_tiles(0, /*is_w13=*/false);
         const int64_t group_size = team_threads_v[static_cast<size_t>(selected_team)];
         TORCH_CHECK(scratch.threads == group_size, "scratch thread count mismatch for team ", selected_team);
         TORCH_CHECK(rows <= scratch.max_rows, "scratch row capacity mismatch for team ", selected_team);
@@ -6928,7 +7345,8 @@ at::Tensor fused_moe_bf16_tiled_scheduled(at::Tensor input, at::Tensor w13_packe
           team.local_tid = local_tid;
           team.barrier = group_size > 1 ? &barrier : nullptr;
           team.a_reorder = nullptr;
-          const Gemm2DSplitPlan w13_2d_plan = plan_2d_gemm_split(rows, w13.K_pad, w13.N_pad, group_size, w13.n_tile);
+          const Gemm2DSplitPlan w13_2d_plan =
+              plan_2d_gemm_split(rows, w13.K_pad, w13.N_pad, group_size, w13.n_tile, w13_window_tiles);
           team_fused_w13_silu_packed_packc_backend(
               use_sve_backend, use_fused_2d_split, team, w13_2d_plan, scratch.packed_a.data(),
               w13_ptr + expert * w13.packed_stride, scratch.intermediate.data(), static_cast<int>(rows),
@@ -6963,7 +7381,8 @@ at::Tensor fused_moe_bf16_tiled_scheduled(at::Tensor input, at::Tensor w13_packe
           w2team.local_tid = local_tid;
           w2team.barrier = nullptr;
           w2team.a_reorder = nullptr;
-          const Gemm2DSplitPlan w2_2d_plan = plan_2d_gemm_split(rows, w2.K_pad, w2.N_pad, group_size, w2.n_tile);
+          const Gemm2DSplitPlan w2_2d_plan =
+              plan_2d_gemm_split(rows, w2.K_pad, w2.N_pad, group_size, w2.n_tile, w2_window_tiles);
           if (use_w2_direct_route) {
             if (use_w2_bf16_route) {
               team_w2_packed_sve_direct_bf16_route_backend(
@@ -7003,8 +7422,8 @@ at::Tensor fused_moe_bf16_tiled_scheduled(at::Tensor input, at::Tensor w13_packe
 
         if (!use_w2_direct_route) {
           worker_phase_begin = trace_phase_begin();
-          with_w2_scatter_owner(static_cast<int>(w2.N_pad), group_size, local_tid, w2.n_tile,
-                                use_w2_n_owner_scatter, [&](const SplitRange& h_range) {
+          for_each_w2_scatter_range(static_cast<int>(w2.N_pad), group_size, local_tid, w2.n_tile, w2_window_tiles,
+                                    use_w2_n_owner_scatter, [&](const SplitRange& h_range) {
                                       const int64_t h_begin = h_range.begin;
                                       const int64_t h_end = std::min<int64_t>(H, h_begin + h_range.size);
                                       if (h_begin >= h_end) {
@@ -7213,6 +7632,8 @@ at::Tensor run_fused_moe_bf16_tiled_async(
   std::vector<int64_t> task_stage_ids_v;
   std::vector<int64_t> task_resize_points_v;
   std::vector<int64_t> task_range_granularities_v;
+  std::vector<int64_t> task_w13_window_tiles_v;
+  std::vector<int64_t> task_w2_window_tiles_v;
   std::vector<int64_t> task_release_ns_v;
   std::vector<int64_t> task_resize_timeout_ns_v;
   std::vector<int64_t> task_preferred_core_begins_v;
@@ -7246,6 +7667,14 @@ at::Tensor run_fused_moe_bf16_tiled_async(
     task_resize_points_v = tensor_to_i64_vector(plan_v2->task_resize_points, "task_resize_points");
     task_range_granularities_v =
         tensor_to_i64_vector(plan_v2->task_range_granularities, "task_range_granularities");
+    // Absent window tensors mean the full stripe, so a plan written before windows
+    // existed keeps its exact behaviour. Sized against the task count below.
+    if (plan_v2->task_w13_window_tiles.has_value() && plan_v2->task_w13_window_tiles->defined()) {
+      task_w13_window_tiles_v = tensor_to_i64_vector(*plan_v2->task_w13_window_tiles, "task_w13_window_tiles");
+    }
+    if (plan_v2->task_w2_window_tiles.has_value() && plan_v2->task_w2_window_tiles->defined()) {
+      task_w2_window_tiles_v = tensor_to_i64_vector(*plan_v2->task_w2_window_tiles, "task_w2_window_tiles");
+    }
     has_task_release_ns =
         plan_v2->task_release_ns.has_value() && plan_v2->task_release_ns->defined();
     has_task_resize_timeout_ns =
@@ -7300,6 +7729,14 @@ at::Tensor run_fused_moe_bf16_tiled_async(
     check_per_task_size(task_stage_ids_v, "task_stage_ids");
     check_per_task_size(task_resize_points_v, "task_resize_points");
     check_per_task_size(task_range_granularities_v, "task_range_granularities");
+    if (task_w13_window_tiles_v.empty()) {
+      task_w13_window_tiles_v.assign(static_cast<size_t>(num_tasks), 0);
+    }
+    if (task_w2_window_tiles_v.empty()) {
+      task_w2_window_tiles_v.assign(static_cast<size_t>(num_tasks), 0);
+    }
+    check_per_task_size(task_w13_window_tiles_v, "task_w13_window_tiles");
+    check_per_task_size(task_w2_window_tiles_v, "task_w2_window_tiles");
     if (has_task_release_ns) {
       check_per_task_size(task_release_ns_v, "task_release_ns");
     } else {
@@ -7327,6 +7764,17 @@ at::Tensor run_fused_moe_bf16_tiled_async(
       TORCH_CHECK(route_granularity >= kAsyncFullExpertRange,
                   "task_range_granularities must be non-negative: task=", task,
                   " granularity=", route_granularity);
+      // Windows are per-thread and counted in whole N tiles, and are independent of
+      // the route slicing above: slicing routes changes M, not which weight columns
+      // a worker owns. 0 selects the full stripe.
+      const int64_t w13_window = task_w13_window_tiles_v[static_cast<size_t>(task)];
+      const int64_t w2_window = task_w2_window_tiles_v[static_cast<size_t>(task)];
+      const int64_t w13_total_tiles = w13.N_pad / std::max<int64_t>(w13.n_tile, kKernelTile);
+      const int64_t w2_total_tiles = w2.N_pad / std::max<int64_t>(w2.n_tile, kKernelTile);
+      TORCH_CHECK(w13_window >= 0 && w13_window <= w13_total_tiles, "task_w13_window_tiles must be in [0, ",
+                  w13_total_tiles, "] where 0 is the full stripe: task=", task, " window_tiles=", w13_window);
+      TORCH_CHECK(w2_window >= 0 && w2_window <= w2_total_tiles, "task_w2_window_tiles must be in [0, ", w2_total_tiles,
+                  "] where 0 is the full stripe: task=", task, " window_tiles=", w2_window);
       TORCH_CHECK(route_granularity == kAsyncFullExpertRange ||
                       plan_v2->execution_mode == kAsyncExecutionStrict,
                   "route-sliced tasks currently require strict execution: task=", task);
@@ -8124,6 +8572,15 @@ at::Tensor run_fused_moe_bf16_tiled_async(
     ThreadBarrier& barrier = scratch.barrier;
     const int64_t expert = task.expert;
     const int64_t rows = task.rows;
+    // Per-thread owner windows in whole N tiles; 0 is the full stripe (R = 1).
+    // The GEMM and the owner-scatter must use the same value, so it is declared
+    // where both can see it. It comes from the task plan, or from the
+    // FUSED_CPP_MOE_STAGE_WINDOW_TILES experiment override when the plan left it
+    // at the full stripe.
+    const int64_t w13_window_tiles = resolve_stage_window_tiles(
+        has_plan_v2 ? task_w13_window_tiles_v[static_cast<size_t>(task_id)] : 0, /*is_w13=*/true);
+    const int64_t w2_window_tiles = resolve_stage_window_tiles(
+        has_plan_v2 ? task_w2_window_tiles_v[static_cast<size_t>(task_id)] : 0, /*is_w13=*/false);
     const int64_t group_size = task.threads;
     const auto& expert_routes = routes[static_cast<size_t>(expert)];
     const int64_t* task_routes = expert_routes.data() + task.route_begin;
@@ -8177,7 +8634,8 @@ at::Tensor run_fused_moe_bf16_tiled_async(
       team.local_tid = local_tid;
       team.barrier = group_size > 1 ? &barrier : nullptr;
       team.a_reorder = nullptr;
-      const Gemm2DSplitPlan w13_2d_plan = plan_2d_gemm_split(rows, w13.K_pad, w13.N_pad, group_size, w13.n_tile);
+      const Gemm2DSplitPlan w13_2d_plan =
+          plan_2d_gemm_split(rows, w13.K_pad, w13.N_pad, group_size, w13.n_tile, w13_window_tiles);
       team_fused_w13_silu_packed_packc_backend(
           use_sve_backend, use_fused_2d_split, team, w13_2d_plan, scratch.packed_a.data(),
           w13_ptr + expert * w13.packed_stride, scratch.intermediate.data(), static_cast<int>(rows),
@@ -8210,7 +8668,8 @@ at::Tensor run_fused_moe_bf16_tiled_async(
       w2team.local_tid = local_tid;
       w2team.barrier = nullptr;
       w2team.a_reorder = nullptr;
-      const Gemm2DSplitPlan w2_2d_plan = plan_2d_gemm_split(rows, w2.K_pad, w2.N_pad, group_size, w2.n_tile);
+      const Gemm2DSplitPlan w2_2d_plan =
+          plan_2d_gemm_split(rows, w2.K_pad, w2.N_pad, group_size, w2.n_tile, w2_window_tiles);
       if (use_w2_direct_route) {
         if (use_w2_bf16_route) {
           team_w2_packed_sve_direct_bf16_route_backend(
@@ -8250,8 +8709,8 @@ at::Tensor run_fused_moe_bf16_tiled_async(
 
     if (!use_w2_direct_route) {
       worker_phase_begin = trace_phase_begin();
-      with_w2_scatter_owner(static_cast<int>(w2.N_pad), group_size, local_tid, w2.n_tile, use_w2_n_owner_scatter,
-                            [&](const SplitRange& h_range) {
+      for_each_w2_scatter_range(static_cast<int>(w2.N_pad), group_size, local_tid, w2.n_tile, w2_window_tiles,
+                                use_w2_n_owner_scatter, [&](const SplitRange& h_range) {
                                   const int64_t h_begin = h_range.begin;
                                   const int64_t h_end = std::min<int64_t>(H, h_begin + h_range.size);
                                   if (h_begin >= h_end) {
@@ -8312,6 +8771,11 @@ at::Tensor run_fused_moe_bf16_tiled_async(
     ScheduledTeamScratch& scratch = *scratches[static_cast<size_t>(task.scratch_index)];
     ThreadBarrier& barrier = scratch.barrier;
     const int64_t expert = task.expert;
+    // Per-thread owner window in whole N tiles; 0 is the full stripe (R = 1).
+    // It comes from the task plan, or from the FUSED_CPP_MOE_STAGE_WINDOW_TILES
+    // experiment override when the plan left it at the full stripe.
+    const int64_t w13_window_tiles = resolve_stage_window_tiles(
+        has_plan_v2 ? task_w13_window_tiles_v[static_cast<size_t>(task_id)] : 0, /*is_w13=*/true);
     const int64_t rows = task.rows;
     const int64_t group_size = task.threads;
     const auto& expert_routes = routes[static_cast<size_t>(expert)];
@@ -8337,7 +8801,7 @@ at::Tensor run_fused_moe_bf16_tiled_async(
     team.barrier = group_size > 1 ? &barrier : nullptr;
     team.a_reorder = nullptr;
     const Gemm2DSplitPlan w13_2d_plan =
-        plan_2d_gemm_split(rows, w13.K_pad, w13.N_pad, group_size, w13.n_tile);
+        plan_2d_gemm_split(rows, w13.K_pad, w13.N_pad, group_size, w13.n_tile, w13_window_tiles);
     team_fused_w13_silu_packed_packc_backend(
         true, use_fused_2d_split, team, w13_2d_plan, scratch.packed_a.data(),
         w13_ptr + expert * w13.packed_stride, scratch.intermediate.data(), static_cast<int>(rows),
@@ -8353,6 +8817,11 @@ at::Tensor run_fused_moe_bf16_tiled_async(
     ScheduledTeamScratch& scratch = *scratches[static_cast<size_t>(task.scratch_index)];
     const int64_t expert = task.expert;
     const int64_t rows = task.rows;
+    // Per-thread owner window in whole N tiles; 0 is the full stripe (R = 1). The
+    // W2 GEMM and the owner-scatter must use the same value, so it is declared
+    // where both can see it.
+    const int64_t w2_window_tiles = resolve_stage_window_tiles(
+        has_plan_v2 ? task_w2_window_tiles_v[static_cast<size_t>(task_id)] : 0, /*is_w13=*/false);
     const auto& expert_routes = routes[static_cast<size_t>(expert)];
 
     auto worker_phase_begin = trace_phase_begin();
@@ -8362,7 +8831,7 @@ at::Tensor run_fused_moe_bf16_tiled_async(
     w2team.barrier = nullptr;
     w2team.a_reorder = nullptr;
     const Gemm2DSplitPlan w2_2d_plan =
-        plan_2d_gemm_split(rows, w2.K_pad, w2.N_pad, group_size, w2.n_tile);
+        plan_2d_gemm_split(rows, w2.K_pad, w2.N_pad, group_size, w2.n_tile, w2_window_tiles);
     if (use_w2_direct_route) {
       if (use_w2_bf16_route) {
         team_w2_packed_sve_direct_bf16_route_backend(
@@ -8394,8 +8863,8 @@ at::Tensor run_fused_moe_bf16_tiled_async(
 
     if (!use_w2_direct_route) {
       worker_phase_begin = trace_phase_begin();
-      with_w2_scatter_owner(static_cast<int>(w2.N_pad), group_size, local_tid, w2.n_tile, use_w2_n_owner_scatter,
-                            [&](const SplitRange& h_range) {
+      for_each_w2_scatter_range(static_cast<int>(w2.N_pad), group_size, local_tid, w2.n_tile, w2_window_tiles,
+                                use_w2_n_owner_scatter, [&](const SplitRange& h_range) {
                                   const int64_t h_begin = h_range.begin;
                                   const int64_t h_end = std::min<int64_t>(H, h_begin + h_range.size);
                                   if (h_begin >= h_end) {
@@ -9574,17 +10043,16 @@ at::Tensor fused_moe_bf16_tiled_async(at::Tensor input, at::Tensor w13_packed, i
 
 at::Tensor fused_moe_bf16_tiled_async_plan_v2(
     at::Tensor input, at::Tensor w13_packed, int64_t w13_K, int64_t w13_N, at::Tensor w2_packed, int64_t w2_K,
-    int64_t w2_N, at::Tensor topk_weights, at::Tensor topk_ids, at::Tensor task_expert_ids,
-    at::Tensor task_core_begins, at::Tensor task_threads, at::Tensor task_dep_offsets, at::Tensor task_deps,
-    int64_t plan_version, int64_t execution_mode, at::Tensor task_preferred_threads, at::Tensor task_min_threads,
-    at::Tensor task_max_threads, at::Tensor task_allowed_thread_offsets, at::Tensor task_allowed_threads,
-    at::Tensor task_placement_modes, at::Tensor task_numa_nodes, at::Tensor task_stage_ids,
-    at::Tensor task_resize_points, at::Tensor task_range_granularities,
-    c10::optional<at::Tensor> thread_cpu_ids,
-    c10::optional<at::Tensor> w13_bias, c10::optional<at::Tensor> w2_bias, int64_t num_threads,
-    std::string activation, int64_t global_num_experts, bool skip_weighted, bool fuse_silu,
-    int64_t silu_poly_degree, int64_t gemm_backend, int64_t backend_n_tile, c10::optional<at::Tensor> out,
-    c10::optional<at::Tensor> task_release_ns,
+    int64_t w2_N, at::Tensor topk_weights, at::Tensor topk_ids, at::Tensor task_expert_ids, at::Tensor task_core_begins,
+    at::Tensor task_threads, at::Tensor task_dep_offsets, at::Tensor task_deps, int64_t plan_version,
+    int64_t execution_mode, at::Tensor task_preferred_threads, at::Tensor task_min_threads, at::Tensor task_max_threads,
+    at::Tensor task_allowed_thread_offsets, at::Tensor task_allowed_threads, at::Tensor task_placement_modes,
+    at::Tensor task_numa_nodes, at::Tensor task_stage_ids, at::Tensor task_resize_points,
+    at::Tensor task_range_granularities, c10::optional<at::Tensor> task_w13_window_tiles,
+    c10::optional<at::Tensor> task_w2_window_tiles, c10::optional<at::Tensor> thread_cpu_ids,
+    c10::optional<at::Tensor> w13_bias, c10::optional<at::Tensor> w2_bias, int64_t num_threads, std::string activation,
+    int64_t global_num_experts, bool skip_weighted, bool fuse_silu, int64_t silu_poly_degree, int64_t gemm_backend,
+    int64_t backend_n_tile, c10::optional<at::Tensor> out, c10::optional<at::Tensor> task_release_ns,
     int64_t early_merge) {
   TORCH_CHECK(execution_mode != kAsyncExecutionElastic,
               "elastic Plan V2 requires fused_moe_bf16_tiled_async_plan_v2_elastic");
@@ -9601,6 +10069,8 @@ at::Tensor fused_moe_bf16_tiled_async_plan_v2(
       std::move(task_stage_ids),
       std::move(task_resize_points),
       std::move(task_range_granularities),
+      std::move(task_w13_window_tiles),
+      std::move(task_w2_window_tiles),
       std::move(task_release_ns),
       c10::nullopt,
       c10::nullopt,
@@ -9617,21 +10087,18 @@ at::Tensor fused_moe_bf16_tiled_async_plan_v2(
 
 at::Tensor fused_moe_bf16_tiled_async_plan_v2_elastic(
     at::Tensor input, at::Tensor w13_packed, int64_t w13_K, int64_t w13_N, at::Tensor w2_packed, int64_t w2_K,
-    int64_t w2_N, at::Tensor topk_weights, at::Tensor topk_ids, at::Tensor task_expert_ids,
-    at::Tensor task_core_begins, at::Tensor task_threads, at::Tensor task_dep_offsets, at::Tensor task_deps,
-    int64_t plan_version, int64_t execution_mode, at::Tensor task_preferred_threads, at::Tensor task_min_threads,
-    at::Tensor task_max_threads, at::Tensor task_allowed_thread_offsets, at::Tensor task_allowed_threads,
-    at::Tensor task_placement_modes, at::Tensor task_numa_nodes, at::Tensor task_stage_ids,
-    at::Tensor task_resize_points, at::Tensor task_range_granularities,
-    c10::optional<at::Tensor> thread_cpu_ids,
-    c10::optional<at::Tensor> w13_bias, c10::optional<at::Tensor> w2_bias, int64_t num_threads,
-    std::string activation, int64_t global_num_experts, bool skip_weighted, bool fuse_silu,
-    int64_t silu_poly_degree, int64_t gemm_backend, int64_t backend_n_tile, c10::optional<at::Tensor> out,
-    c10::optional<at::Tensor> task_release_ns,
-    c10::optional<at::Tensor> task_resize_timeout_ns,
-    c10::optional<at::Tensor> elastic_stats_out,
-    c10::optional<at::Tensor> task_preferred_core_begins,
-    int64_t early_merge) {
+    int64_t w2_N, at::Tensor topk_weights, at::Tensor topk_ids, at::Tensor task_expert_ids, at::Tensor task_core_begins,
+    at::Tensor task_threads, at::Tensor task_dep_offsets, at::Tensor task_deps, int64_t plan_version,
+    int64_t execution_mode, at::Tensor task_preferred_threads, at::Tensor task_min_threads, at::Tensor task_max_threads,
+    at::Tensor task_allowed_thread_offsets, at::Tensor task_allowed_threads, at::Tensor task_placement_modes,
+    at::Tensor task_numa_nodes, at::Tensor task_stage_ids, at::Tensor task_resize_points,
+    at::Tensor task_range_granularities, c10::optional<at::Tensor> task_w13_window_tiles,
+    c10::optional<at::Tensor> task_w2_window_tiles, c10::optional<at::Tensor> thread_cpu_ids,
+    c10::optional<at::Tensor> w13_bias, c10::optional<at::Tensor> w2_bias, int64_t num_threads, std::string activation,
+    int64_t global_num_experts, bool skip_weighted, bool fuse_silu, int64_t silu_poly_degree, int64_t gemm_backend,
+    int64_t backend_n_tile, c10::optional<at::Tensor> out, c10::optional<at::Tensor> task_release_ns,
+    c10::optional<at::Tensor> task_resize_timeout_ns, c10::optional<at::Tensor> elastic_stats_out,
+    c10::optional<at::Tensor> task_preferred_core_begins, int64_t early_merge) {
   TORCH_CHECK(execution_mode == kAsyncExecutionElastic, "elastic Plan V2 entry point requires execution_mode=",
               kAsyncExecutionElastic, ", got ", execution_mode);
   const AsyncPlanV2NativeArgs plan_v2{
@@ -9647,6 +10114,8 @@ at::Tensor fused_moe_bf16_tiled_async_plan_v2_elastic(
       std::move(task_stage_ids),
       std::move(task_resize_points),
       std::move(task_range_granularities),
+      std::move(task_w13_window_tiles),
+      std::move(task_w2_window_tiles),
       std::move(task_release_ns),
       std::move(task_resize_timeout_ns),
       std::move(task_preferred_core_begins),
@@ -10208,8 +10677,8 @@ at::Tensor fused_moe_bf16_tiled_planned_staged(
                           team.group_size = task.threads;
                           team.local_tid = local_tid;
                           team.barrier = task.threads > 1 ? &scratch.barrier : nullptr;
-                          const Gemm2DSplitPlan split =
-                              plan_2d_gemm_split(rows, w13.K_pad, w13.N_pad, task.threads, w13.n_tile);
+                          const Gemm2DSplitPlan split = plan_2d_gemm_split(rows, w13.K_pad, w13.N_pad, task.threads,
+                                                                           w13.n_tile, /*window_tiles=*/0);
                           team_fused_w13_silu_packed_packc_backend(
                               true, use_fused_2d_split, team, split, scratch.packed_a.data(),
                               w13_ptr + expert * w13.packed_stride, expert_intermediate, static_cast<int>(rows),
@@ -10230,7 +10699,7 @@ at::Tensor fused_moe_bf16_tiled_planned_staged(
                           team.local_tid = local_tid;
                           team.barrier = nullptr;
                           const Gemm2DSplitPlan split =
-                              plan_2d_gemm_split(rows, w2.K_pad, w2.N_pad, task.threads, w2.n_tile);
+                              plan_2d_gemm_split(rows, w2.K_pad, w2.N_pad, task.threads, w2.n_tile, /*window_tiles=*/0);
                           const uint16_t* expert_intermediate =
                               intermediate_ptr + intermediate_offsets[static_cast<size_t>(expert)];
                           const auto& expert_routes = routes[static_cast<size_t>(expert)];

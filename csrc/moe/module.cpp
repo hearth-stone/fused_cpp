@@ -20,6 +20,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("fused_moe_test_split_plan", &fused_moe_test_split_plan, "Test-only: return the cooperative GEMM split plan.",
         py::arg("stage"), py::arg("M"), py::arg("K"), py::arg("N"), py::arg("group_size"),
         py::call_guard<py::gil_scoped_release>());
+  m.def("fused_moe_test_stage_window_plan", &fused_moe_test_stage_window_plan,
+        "Test-only: return (windows, range_tiles, window_tiles, per-window per-thread (n_begin, n_cols)) for a "
+        "team width and per-thread owner window. window_tiles <= 0 selects the R=1 full stripe.",
+        py::arg("N"), py::arg("n_tile"), py::arg("threads"), py::arg("window_tiles") = 0,
+        py::call_guard<py::gil_scoped_release>());
   m.def("fused_moe_test_single_thread_gemm", &fused_moe_test_single_thread_gemm, "Test-only: run one BF16 GEMM.",
         py::arg("A"), py::arg("B"), py::arg("bias") = c10::nullopt, py::call_guard<py::gil_scoped_release>());
   m.def("fused_moe_test_pack_interleaved_gemm", &fused_moe_test_pack_interleaved_gemm,
@@ -44,6 +49,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("fused_moe_test_fused_w13_silu_packc_tail", &fused_moe_test_fused_w13_silu_packc_tail,
         "Test-only: run tail-aware fused w13 packed-C.", py::arg("A"), py::arg("w13"), py::arg("degree") = 5,
         py::call_guard<py::gil_scoped_release>());
+  m.def("fused_moe_test_team_w13_silu_packc_window", &fused_moe_test_team_w13_silu_packc_window,
+        "Test-only: run the windowed team W13 packed-C stage for every local_tid into one buffer. "
+        "window_tiles <= 0 selects the R=1 full stripe.",
+        py::arg("A"), py::arg("w13"), py::arg("group_size"), py::arg("degree") = 5, py::arg("n_tile") = 8,
+        py::arg("window_tiles") = 0, py::arg("use_sve") = true, py::call_guard<py::gil_scoped_release>());
   m.def("fused_moe_bench_fused_w13_silu_packc_tail", &fused_moe_bench_fused_w13_silu_packc_tail,
         "Benchmark fused w13 packed-C tail dispatch.", py::arg("A"), py::arg("w13"), py::arg("degree") = 5,
         py::arg("mode") = 0, py::arg("warmup") = 20, py::arg("runs") = 100, py::call_guard<py::gil_scoped_release>());
@@ -57,6 +67,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "Test-only: run standalone packed-A/B SVE GEMM with JIT or static asm.", py::arg("A"), py::arg("packed_B"),
         py::arg("K"), py::arg("N"), py::arg("n_tile"), py::arg("use_jit") = true,
         py::call_guard<py::gil_scoped_release>());
+  m.def("fused_moe_test_team_w2_window", &fused_moe_test_team_w2_window,
+        "Test-only: run the windowed team W2 stage for every local_tid into one buffer. mode 0 = packed fp32, "
+        "1 = direct-route fp32. window_tiles <= 0 selects the R=1 full stripe.",
+        py::arg("A"), py::arg("w2_packed"), py::arg("K"), py::arg("N"), py::arg("group_size"), py::arg("n_tile") = 8,
+        py::arg("window_tiles") = 0, py::arg("mode") = 0, py::call_guard<py::gil_scoped_release>());
+  m.def("fused_moe_test_w2_scatter_ranges", &fused_moe_test_w2_scatter_ranges,
+        "Test-only: the H ranges one worker scatters, in visit order. The owner path mirrors the W2 GEMM windows.",
+        py::arg("N"), py::arg("n_tile"), py::arg("group_size"), py::arg("local_tid"), py::arg("window_tiles") = 0,
+        py::arg("use_w2_n_owner") = true, py::call_guard<py::gil_scoped_release>());
   m.def("fused_moe_bench_sve_jit_w13_gemm", &fused_moe_bench_sve_jit_w13_gemm,
         "Benchmark the exact-M SVE JIT GEMM body, including full-M M12 probes, optionally rotating 3-D A copies and "
         "packed-B experts.",
@@ -104,13 +123,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("task_max_threads"), py::arg("task_allowed_thread_offsets"), py::arg("task_allowed_threads"),
         py::arg("task_placement_modes"), py::arg("task_numa_nodes"), py::arg("task_stage_ids"),
         py::arg("task_resize_points"), py::arg("task_range_granularities"),
-        py::arg("thread_cpu_ids") = c10::nullopt,
-        py::arg("w13_bias") = c10::nullopt, py::arg("w2_bias") = c10::nullopt, py::arg("num_threads") = 1,
-        py::arg("activation") = "silu", py::arg("global_num_experts") = -1, py::arg("skip_weighted") = false,
-        py::arg("fuse_silu") = false, py::arg("silu_poly_degree") = 5, py::arg("gemm_backend") = 0,
-        py::arg("backend_n_tile") = 8, py::arg("out") = c10::nullopt,
-        py::arg("task_release_ns") = c10::nullopt,
-        py::arg("early_merge") = -1, py::call_guard<py::gil_scoped_release>());
+        py::arg("task_w13_window_tiles") = c10::nullopt, py::arg("task_w2_window_tiles") = c10::nullopt,
+        py::arg("thread_cpu_ids") = c10::nullopt, py::arg("w13_bias") = c10::nullopt, py::arg("w2_bias") = c10::nullopt,
+        py::arg("num_threads") = 1, py::arg("activation") = "silu", py::arg("global_num_experts") = -1,
+        py::arg("skip_weighted") = false, py::arg("fuse_silu") = false, py::arg("silu_poly_degree") = 5,
+        py::arg("gemm_backend") = 0, py::arg("backend_n_tile") = 8, py::arg("out") = c10::nullopt,
+        py::arg("task_release_ns") = c10::nullopt, py::arg("early_merge") = -1,
+        py::call_guard<py::gil_scoped_release>());
 
   m.def("fused_moe_bf16_tiled_async_plan_v2_elastic", &fused_moe_bf16_tiled_async_plan_v2_elastic,
         "Run experimental W13-to-W2 elastic Plan V2 execution.", py::arg("input"), py::arg("w13_packed"),
@@ -121,15 +140,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("task_max_threads"), py::arg("task_allowed_thread_offsets"), py::arg("task_allowed_threads"),
         py::arg("task_placement_modes"), py::arg("task_numa_nodes"), py::arg("task_stage_ids"),
         py::arg("task_resize_points"), py::arg("task_range_granularities"),
-        py::arg("thread_cpu_ids") = c10::nullopt,
-        py::arg("w13_bias") = c10::nullopt, py::arg("w2_bias") = c10::nullopt, py::arg("num_threads") = 1,
-        py::arg("activation") = "silu", py::arg("global_num_experts") = -1, py::arg("skip_weighted") = false,
-        py::arg("fuse_silu") = false, py::arg("silu_poly_degree") = 5, py::arg("gemm_backend") = 0,
-        py::arg("backend_n_tile") = 8, py::arg("out") = c10::nullopt,
-        py::arg("task_release_ns") = c10::nullopt,
-        py::arg("task_resize_timeout_ns") = c10::nullopt, py::arg("elastic_stats_out") = c10::nullopt,
-        py::arg("task_preferred_core_begins") = c10::nullopt, py::arg("early_merge") = -1,
-        py::call_guard<py::gil_scoped_release>());
+        py::arg("task_w13_window_tiles") = c10::nullopt, py::arg("task_w2_window_tiles") = c10::nullopt,
+        py::arg("thread_cpu_ids") = c10::nullopt, py::arg("w13_bias") = c10::nullopt, py::arg("w2_bias") = c10::nullopt,
+        py::arg("num_threads") = 1, py::arg("activation") = "silu", py::arg("global_num_experts") = -1,
+        py::arg("skip_weighted") = false, py::arg("fuse_silu") = false, py::arg("silu_poly_degree") = 5,
+        py::arg("gemm_backend") = 0, py::arg("backend_n_tile") = 8, py::arg("out") = c10::nullopt,
+        py::arg("task_release_ns") = c10::nullopt, py::arg("task_resize_timeout_ns") = c10::nullopt,
+        py::arg("elastic_stats_out") = c10::nullopt, py::arg("task_preferred_core_begins") = c10::nullopt,
+        py::arg("early_merge") = -1, py::call_guard<py::gil_scoped_release>());
 
   m.def("fused_moe_bf16_tiled_planned_staged", &fused_moe_bf16_tiled_planned_staged,
         "Run experimental independently planned global W13/W2 stages.", py::arg("input"), py::arg("w13_packed"),

@@ -63,12 +63,17 @@ _V2_OPTIONAL_PER_TASK_FIELDS = (
     "task_release_ns",
     "task_resize_timeout_ns",
     "task_preferred_core_begins",
+    "task_w13_window_tiles",
+    "task_w2_window_tiles",
 )
 
 _V2_OPTIONAL_PER_TASK_DEFAULTS = {
     "task_release_ns": 0,
     "task_resize_timeout_ns": 0,
     "task_preferred_core_begins": -1,
+    # 0 is the full stripe, i.e. one window per worker (R = 1).
+    "task_w13_window_tiles": 0,
+    "task_w2_window_tiles": 0,
 }
 
 
@@ -148,6 +153,8 @@ class AsyncMoEPlanV2:
     task_release_ns: torch.Tensor | None = None
     task_resize_timeout_ns: torch.Tensor | None = None
     task_preferred_core_begins: torch.Tensor | None = None
+    task_w13_window_tiles: torch.Tensor | None = None
+    task_w2_window_tiles: torch.Tensor | None = None
     early_merge: bool | None = None
 
     @property
@@ -269,6 +276,8 @@ class AsyncMoEPlanV2:
             "task_release_ns": self.task_release_ns,
             "task_resize_timeout_ns": self.task_resize_timeout_ns,
             "task_preferred_core_begins": self.task_preferred_core_begins,
+            "task_w13_window_tiles": self.task_w13_window_tiles,
+            "task_w2_window_tiles": self.task_w2_window_tiles,
         }
         for name, tensor in per_task.items():
             if tensor.numel() != num_tasks:
@@ -286,6 +295,12 @@ class AsyncMoEPlanV2:
         range_granularities = _values(self.task_range_granularities)
         if any(granularity < 0 for granularity in range_granularities):
             raise ValueError("task_range_granularities must be non-negative")
+        # Per-thread owner windows in whole N tiles; 0 is the full stripe. The upper
+        # bound depends on the stage geometry, so only the native side can check it.
+        for field in ("task_w13_window_tiles", "task_w2_window_tiles"):
+            windows = _values(getattr(self, field))
+            if any(window < 0 for window in windows):
+                raise ValueError(f"{field} must be non-negative, 0 meaning the full stripe")
         tasks_by_expert: dict[int, list[int]] = {}
         for task, expert in enumerate(experts):
             tasks_by_expert.setdefault(expert, []).append(task)
