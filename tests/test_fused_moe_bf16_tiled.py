@@ -1352,17 +1352,10 @@ def test_async_ready_token_merge_overlaps_imbalanced_experts(
 
 @pytest.mark.parametrize("bridge", ["scheduled", "async"])
 @pytest.mark.parametrize("w2_bf16_route", [False, True])
-@pytest.mark.parametrize(
-    "elide_zero,owner_scatter",
-    [(True, False), (False, True), (True, True), (None, None)],
-    ids=["no-zero", "owner-scatter", "combined", "default"],
-)
 def test_sve_expert_barrier_elision_reuses_dirty_scratch(
     monkeypatch: pytest.MonkeyPatch,
     bridge: str,
     w2_bf16_route: bool,
-    elide_zero: Optional[bool],
-    owner_scatter: Optional[bool],
 ) -> None:
     """Exercise all M tails while repeatedly reusing dirty team scratch."""
     monkeypatch.setenv("FUSED_CPP_MOE_SVE", "1")
@@ -1437,18 +1430,7 @@ def test_sve_expert_barrier_elision_reuses_dirty_scratch(
                 num_threads=threads,
             )
 
-    zero_flag = "FUSED_CPP_MOE_SVE_ELIDE_INTERMEDIATE_ZERO"
-    owner_flag = "FUSED_CPP_MOE_SVE_W2_N_OWNER_SCATTER"
-    monkeypatch.setenv(zero_flag, "0")
-    monkeypatch.setenv(owner_flag, "0")
     reference = run()
-
-    if elide_zero is None:
-        monkeypatch.delenv(zero_flag)
-        monkeypatch.delenv(owner_flag)
-    else:
-        monkeypatch.setenv(zero_flag, "1" if elide_zero else "0")
-        monkeypatch.setenv(owner_flag, "1" if owner_scatter else "0")
     for _ in range(3):
         candidate = run()
         torch.testing.assert_close(
@@ -1456,9 +1438,7 @@ def test_sve_expert_barrier_elision_reuses_dirty_scratch(
             reference.float(),
             atol=0,
             rtol=0,
-            msg=lambda message: (
-                f"{bridge}/bf16_route={w2_bf16_route}/zero={elide_zero}/owner={owner_scatter}: {message}"
-            ),
+            msg=lambda message: f"{bridge}/bf16_route={w2_bf16_route}: {message}",
         )
 
 

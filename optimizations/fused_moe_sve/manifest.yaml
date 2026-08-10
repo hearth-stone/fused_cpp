@@ -459,11 +459,7 @@ features:
     correctness: >-
       pytest -q tests/test_fused_moe_bf16_tiled.py
       -k expert_barrier_elision_reuses_dirty_scratch
-    benchmark: >-
-      numactl --cpunodebind=0 --membind=0 taskset -c 0-95
-      .venv/bin/python
-      optimizations/fused_moe_sve/benchmarks/bench_expert_barriers.py
-      --warmup 4 --runs 17 --sample-ms 10
+    benchmark: historical; see results/expert_barriers_amazon_c5_192c_numa0_20260714.md
 
   - id: scatter.w2_n_owner
     part: scatter
@@ -478,11 +474,7 @@ features:
     correctness: >-
       pytest -q tests/test_fused_moe_bf16_tiled.py
       -k expert_barrier_elision_reuses_dirty_scratch
-    benchmark: >-
-      numactl --cpunodebind=0 --membind=0 taskset -c 0-95
-      .venv/bin/python
-      optimizations/fused_moe_sve/benchmarks/bench_expert_barriers.py
-      --warmup 4 --runs 17 --sample-ms 10
+    benchmark: historical; see results/expert_barriers_amazon_c5_192c_numa0_20260714.md
 
   - id: store.w2_direct_route
     part: store
@@ -1229,40 +1221,11 @@ variants:
     entrypoint: elastic::Executor::run_epoch_claim
     status: benchmark_reference
 
-  - id: sve_fused_expert_barrier_baseline
-    features: []
-    entrypoint: >-
-      FUSED_CPP_MOE_SVE_ELIDE_INTERMEDIATE_ZERO=0
-      FUSED_CPP_MOE_SVE_W2_N_OWNER_SCATTER=0
-      fused_moe_bf16_tiled_{scheduled,async}
-    status: reference
-
-  - id: sve_fused_expert_no_intermediate_zero
-    features:
-      - intermediate.overwrite_elision
-    entrypoint: >-
-      FUSED_CPP_MOE_SVE_ELIDE_INTERMEDIATE_ZERO=1
-      FUSED_CPP_MOE_SVE_W2_N_OWNER_SCATTER=0
-      fused_moe_bf16_tiled_{scheduled,async}
-    status: candidate
-
-  - id: sve_fused_expert_owner_scatter
-    features:
-      - scatter.w2_n_owner
-    entrypoint: >-
-      FUSED_CPP_MOE_SVE_ELIDE_INTERMEDIATE_ZERO=0
-      FUSED_CPP_MOE_SVE_W2_N_OWNER_SCATTER=1
-      fused_moe_bf16_tiled_{scheduled,async}
-    status: candidate
-
   - id: sve_fused_expert_barrier_elision
     features:
       - intermediate.overwrite_elision
       - scatter.w2_n_owner
-    entrypoint: >-
-      FUSED_CPP_MOE_SVE_ELIDE_INTERMEDIATE_ZERO=1
-      FUSED_CPP_MOE_SVE_W2_N_OWNER_SCATTER=1
-      fused_moe_bf16_tiled_{scheduled,async}
+    entrypoint: fused_moe_bf16_tiled_{scheduled,async} SVE fused-SiLU path
     status: enabled
 
   - id: sve_w2_fp32_direct_route

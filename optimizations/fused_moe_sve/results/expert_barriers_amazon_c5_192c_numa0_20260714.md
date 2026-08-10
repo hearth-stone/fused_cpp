@@ -1,5 +1,10 @@
 # SVE fused-expert barrier elision on Amazon 192C
 
+> Source lifecycle update (2026-08-10): both optimizations are now fixed
+> production semantics for SVE fused-SiLU. The two legacy barrier environment
+> controls and the four-way benchmark source were removed; the last comparison
+> implementation is retained in Git `b6d168d`.
+
 ## Environment
 
 - Host: `AmazonC5192Cores`, 192 logical Neoverse-V3 cores
@@ -111,8 +116,11 @@ single feature, the combined variant, and the default-on configuration. Results:
 - Forced NEON fallback (`FUSED_CPP_MOE_SVE=0`): `27 passed, 1 skipped`
 - Hierarchical N-split, packA fusion, and team-GEMM suites: `894 passed`
 
-The SVE default enables both features. Set either of these to `0` to restore its
-legacy barrier independently:
+At the time of measurement, either feature could be disabled independently:
 
 - `FUSED_CPP_MOE_SVE_ELIDE_INTERMEDIATE_ZERO=0`
 - `FUSED_CPP_MOE_SVE_W2_N_OWNER_SCATTER=0`
+
+Those controls were retired on 2026-08-10 after the combined path became the
+only supported SVE fused-SiLU behavior. This section is historical provenance,
+not an active runtime contract.

@@ -6041,8 +6041,7 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input, at::Tensor w13_packed, int64_t
   }
   const bool fused_2d_split = env_flag_enabled("FUSED_CPP_MOE_FUSED_2D_SPLIT");
   const bool use_fused_2d_split = use_hierarchical_nsplit && fuse_silu && fused_packa_w2 && fused_2d_split;
-  const bool use_w2_n_owner_scatter = use_sve_backend && fuse_silu && fused_packa_w2 &&
-                                      env_flag_enabled_by_default("FUSED_CPP_MOE_SVE_W2_N_OWNER_SCATTER");
+  const bool use_w2_n_owner_scatter = use_sve_backend && fuse_silu && fused_packa_w2;
   const char* moe_trace_strategy =
       use_hierarchical_nsplit
           ? (use_fused_2d_split ? "hierarchical_fused_2d_split_dynamic_expert" : "hierarchical_mn_split_dynamic_expert")
@@ -6829,13 +6828,11 @@ at::Tensor fused_moe_bf16_tiled_scheduled(at::Tensor input, at::Tensor w13_packe
                 "silu_poly_degree must be 4, 5, or 6, got ", silu_poly_degree);
   }
   const bool use_fused_2d_split = fuse_silu && env_flag_enabled("FUSED_CPP_MOE_FUSED_2D_SPLIT");
-  // The SVE packC tails overwrite every row that the matching W2 tail reads.
-  // Both switches default on; setting either environment flag to 0 restores
-  // the corresponding legacy barrier for comparison or diagnosis.
-  const bool elide_intermediate_zero =
-      use_sve_backend && fuse_silu && env_flag_enabled_by_default("FUSED_CPP_MOE_SVE_ELIDE_INTERMEDIATE_ZERO");
-  const bool use_w2_n_owner_scatter =
-      use_sve_backend && fuse_silu && env_flag_enabled_by_default("FUSED_CPP_MOE_SVE_W2_N_OWNER_SCATTER");
+  // SVE packC tails overwrite every row consumed by W2, and each W2 worker
+  // scatters only the columns it owns. Other backends retain the legacy
+  // initialization and barrier protocol.
+  const bool w13_overwrites_intermediate = use_sve_backend && fuse_silu;
+  const bool use_w2_n_owner_scatter = use_sve_backend && fuse_silu;
 
   const int64_t num_tokens = input.size(0);
   const int64_t top_k = topk_ids.size(1);
@@ -7111,13 +7108,13 @@ at::Tensor fused_moe_bf16_tiled_scheduled(at::Tensor input, at::Tensor w13_packe
 
         auto worker_phase_begin = trace_phase_begin();
         if (fuse_silu) {
-          if (!elide_intermediate_zero && local_tid == 0) {
+          if (!w13_overwrites_intermediate && local_tid == 0) {
             const int64_t rows_padded =
                 use_sve_backend ? sve_hybrid_packed_rows(rows) : ceil_to_multiple(rows, int64_t{kKernelTile});
             std::fill(scratch.intermediate.begin(), scratch.intermediate.begin() + rows_padded * w2.K_pad,
                       static_cast<uint16_t>(0));
           }
-          if (!elide_intermediate_zero) {
+          if (!w13_overwrites_intermediate) {
             barrier.wait();
           }
           TeamContext team;
@@ -7345,10 +7342,8 @@ at::Tensor run_fused_moe_bf16_tiled_async(
                 "silu_poly_degree must be 4, 5, or 6, got ", silu_poly_degree);
   }
   const bool use_fused_2d_split = fuse_silu && env_flag_enabled("FUSED_CPP_MOE_FUSED_2D_SPLIT");
-  const bool elide_intermediate_zero =
-      use_sve_backend && fuse_silu && env_flag_enabled_by_default("FUSED_CPP_MOE_SVE_ELIDE_INTERMEDIATE_ZERO");
-  const bool use_w2_n_owner_scatter =
-      use_sve_backend && fuse_silu && env_flag_enabled_by_default("FUSED_CPP_MOE_SVE_W2_N_OWNER_SCATTER");
+  const bool w13_overwrites_intermediate = use_sve_backend && fuse_silu;
+  const bool use_w2_n_owner_scatter = use_sve_backend && fuse_silu;
 
   const int64_t num_tokens = input.size(0);
   const int64_t top_k = topk_ids.size(1);
@@ -8209,13 +8204,13 @@ at::Tensor run_fused_moe_bf16_tiled_async(
 
     auto worker_phase_begin = trace_phase_begin();
     if (fuse_silu) {
-      if (!elide_intermediate_zero && local_tid == 0) {
+      if (!w13_overwrites_intermediate && local_tid == 0) {
         const int64_t rows_padded =
             use_sve_backend ? sve_hybrid_packed_rows(rows) : ceil_to_multiple(rows, int64_t{kKernelTile});
         std::fill(scratch.intermediate.begin(), scratch.intermediate.begin() + rows_padded * w2.K_pad,
                   static_cast<uint16_t>(0));
       }
-      if (!elide_intermediate_zero) {
+      if (!w13_overwrites_intermediate) {
         barrier.wait();
       }
       TeamContext team;
@@ -9459,8 +9454,6 @@ at::Tensor fused_moe_bf16_tiled_planned_staged(
   const double scratch_ms = ::fused_cpp::profile::elapsed_ms(scratch_begin);
 
   const bool use_fused_2d_split = env_flag_enabled("FUSED_CPP_MOE_FUSED_2D_SPLIT");
-  const bool elide_intermediate_zero =
-      env_flag_enabled_by_default("FUSED_CPP_MOE_SVE_ELIDE_INTERMEDIATE_ZERO");
   const auto w13_begin = ::fused_cpp::profile::now();
   execute_planned_stage(num_threads, w13_runtime, scratches,
                         [&](int64_t tid, int64_t, const AsyncTaskRuntime& task,
@@ -9476,16 +9469,6 @@ at::Tensor fused_moe_bf16_tiled_planned_staged(
 
                           uint16_t* expert_intermediate =
                               intermediate_ptr + intermediate_offsets[static_cast<size_t>(expert)];
-                          if (!elide_intermediate_zero && local_tid == 0) {
-                            std::fill(expert_intermediate,
-                                      expert_intermediate +
-                                          (intermediate_offsets[static_cast<size_t>(expert + 1)] -
-                                           intermediate_offsets[static_cast<size_t>(expert)]),
-                                      static_cast<uint16_t>(0));
-                          }
-                          if (!elide_intermediate_zero) {
-                            scratch.barrier.wait();
-                          }
                           TeamContext team;
                           team.group_size = task.threads;
                           team.local_tid = local_tid;
