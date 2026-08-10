@@ -1,4 +1,4 @@
-"""Static interval-DAG planner with exact-profile and policy-aware search."""
+"""Static interval-DAG planner with exact-domain calibration."""
 
 from __future__ import annotations
 
@@ -36,16 +36,12 @@ _EARLY_MERGE_EQUAL_FINISH_ABS_NS = 1.0
 
 
 class PlannerPolicy(Protocol):
-    w13_window_ranges: int
-    w2_window_ranges: int
     intermediate_size: int
     mode: str
     degree: int
     llc_bytes_per_rank: int
 
-    def key_without_kernel_policy(self) -> tuple[object, ...]: ...
-
-    def kernel_policy_key(self) -> tuple[object, ...]: ...
+    def identity_key(self) -> tuple[object, ...]: ...
 
 
 class PlannerCostModel(Protocol):
@@ -907,8 +903,6 @@ class IntervalPlanner:
         if self.model.policy is not None:
             policy = {
                 "profile": str(self.model.profile_path),
-                "w13_window_ranges": self.model.policy.w13_window_ranges,
-                "w2_window_ranges": self.model.policy.w2_window_ranges,
                 "intermediate_size": self.model.policy.intermediate_size,
                 "mode": self.model.policy.mode,
                 "degree": self.model.policy.degree,
@@ -937,8 +931,6 @@ class IntervalPlanner:
             "uncertainty_ns": selected["uncertainty_ns"],
             "active_working_set_bytes": selected["active_working_set_bytes"],
             "resource_groups": selected["resource_groups"],
-            "w13_window_ranges": (self.model.policy.w13_window_ranges if self.model.policy is not None else None),
-            "w2_window_ranges": (self.model.policy.w2_window_ranges if self.model.policy is not None else None),
             "window_bytes_per_worker": tuple(selected["window_bytes_per_worker"]),
             "task_stage_window_policy": (
                 self.task_stage_window_policy.name if self.task_stage_window_policy is not None else None
@@ -1413,128 +1405,6 @@ class PlannedTwoStagePlanner:
             "makespan_ns": call_setup_ns + w13["makespan_ns"] + stage_barrier_ns + w2["makespan_ns"],
             "uncertainty_ns": w13["uncertainty_ns"] + w2["uncertainty_ns"],
         }
-
-
-class PolicyAwarePlanner:
-    """Search packed-B window policy and an exact profiled core shape together."""
-
-    def __init__(
-        self,
-        models: Sequence[PlannerCostModel],
-        num_cores: int,
-        *,
-        cpu_ids: Sequence[int] | None = None,
-        working_set_target_fraction: float = 2.0 / 3.0,
-        task_stage_window_policy: TaskStageWindowPolicy | None = None,
-        task_stage_window_policies: Sequence[TaskStageWindowPolicy | None] | None = None,
-        tail_repartition_widths: Sequence[int] | None = None,
-    ):
-        if not models:
-            raise ValueError("at least one policy model is required")
-        if task_stage_window_policy is not None and task_stage_window_policies is not None:
-            raise ValueError("provide either one task stage-window policy or per-model policies, not both")
-        if task_stage_window_policies is None:
-            task_stage_window_policies = (task_stage_window_policy,) * len(models)
-        else:
-            task_stage_window_policies = tuple(task_stage_window_policies)
-            if len(task_stage_window_policies) != len(models):
-                raise ValueError("task_stage_window_policies must match the model count")
-        policies = [model.policy for model in models]
-        if any(policy is None for policy in policies):
-            raise ProfileCompatibilityError("joint policy search requires schema-v2 profiles")
-        base_key = policies[0].key_without_kernel_policy()
-        if any(policy.key_without_kernel_policy() != base_key for policy in policies[1:]):
-            raise ProfileCompatibilityError("joint planner profiles differ outside the packed-B window policy")
-        variant_keys = [policy.kernel_policy_key() for policy in policies]
-        if len(variant_keys) != len(set(variant_keys)):
-            raise ProfileCompatibilityError("joint planner received duplicate packed-B window policies")
-        self.models = tuple(models)
-        self.num_cores = int(num_cores)
-        self.cpu_ids = cpu_ids
-        self.working_set_target_fraction = float(working_set_target_fraction)
-        self.planners = tuple(
-            IntervalPlanner(
-                model,
-                num_cores,
-                cpu_ids=cpu_ids,
-                shapes=self._pruned_shapes(model),
-                task_stage_window_policy=stage_window_policy,
-                tail_repartition_widths=tail_repartition_widths,
-            )
-            for model, stage_window_policy in zip(self.models, task_stage_window_policies)
-        )
-
-    def _pruned_shapes(self, model: PlannerCostModel):
-        policy = model.policy
-        assert policy is not None
-        target = policy.llc_bytes_per_rank * self.working_set_target_fraction
-        shapes = [shape for shape in _model_candidate_shapes(model, self.num_cores) if sum(shape) == self.num_cores]
-        by_distance = sorted(
-            shapes,
-            key=lambda shape: abs(len(shape) * model.max_stage_bytes - target),
-        )
-        keep = {shape for shape in shapes if len(shape) == 1 or len(shape) * model.max_stage_bytes <= target * 1.25}
-        keep.update(by_distance[:2])
-        lane_counts = {len(shape) for shape in keep}
-        for shape in shapes:
-            if len(shape) in lane_counts:
-                keep.add(shape)
-        return tuple(sorted(keep, key=lambda shape: (len(shape), shape), reverse=False))
-
-    def plan(
-        self,
-        experts: List[Tuple[int, int]],
-        *,
-        dynamic_tail_pool: bool = True,
-        tail_pool_max_routes: int = 12,
-        forced_tail_pool_threads: int | None = None,
-        bounded_tail_repartition: bool | None = None,
-    ) -> Dict[str, object]:
-        policy_results = [
-            planner.plan(
-                experts,
-                dynamic_tail_pool=dynamic_tail_pool,
-                tail_pool_max_routes=tail_pool_max_routes,
-                forced_tail_pool_threads=forced_tail_pool_threads,
-                bounded_tail_repartition=bounded_tail_repartition,
-            )
-            for planner in self.planners
-        ]
-        candidates = []
-        for result in policy_results:
-            candidates.append(
-                {
-                    "result": result,
-                    "makespan_ns": result["makespan_ns"],
-                    "uncertainty_ns": result["uncertainty_ns"],
-                    "pessimistic_ns": result["makespan_ns"] + result["uncertainty_ns"],
-                    "active_working_set_bytes": result["active_working_set_bytes"],
-                    "shape": result["shape"],
-                    "resource_groups": result["resource_groups"],
-                    "execution_mode": result["execution_mode"],
-                }
-            )
-        selected = IntervalPlanner._select(candidates)["result"]
-        selected["policy_ranking"] = [
-            {
-                "w13_window_ranges": result["w13_window_ranges"],
-                "w2_window_ranges": result["w2_window_ranges"],
-                "shape": result["shape"],
-                "execution_mode": result["execution_mode"],
-                "tail_pool_threads": result["tail_pool_threads"],
-                "tail_pool_max_routes": result["tail_pool_max_routes"],
-                "tail_pool_tasks": result["tail_pool_tasks"],
-                "tail_repartition_width": result["tail_repartition_width"],
-                "tail_repartition_tasks": result["tail_repartition_tasks"],
-                "tail_repartition_route_slices": result["tail_repartition_route_slices"],
-                "makespan_ms": result["makespan_ns"] / 1e6,
-                "uncertainty_ms": result["uncertainty_ns"] / 1e6,
-                "active_working_set_bytes": result["active_working_set_bytes"],
-                "window_bytes_per_worker": result["window_bytes_per_worker"],
-            }
-            for result in sorted(policy_results, key=lambda result: result["makespan_ns"])
-        ]
-        return selected
 
 
 if __name__ == "__main__":

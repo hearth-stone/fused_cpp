@@ -14,7 +14,7 @@ COST_MODEL = ROOT / "cpu_moe_schedule_optimization" / "cost_model"
 PLANNERS = ROOT / "cpu_moe_schedule_optimization" / "planners"
 sys.path[:0] = [str(COST_MODEL), str(PLANNERS)]
 
-from interval_planner import IntervalPlanner, PlannedTwoStagePlanner, PolicyAwarePlanner  # noqa: E402
+from interval_planner import IntervalPlanner, PlannedTwoStagePlanner  # noqa: E402
 from iso_formula import IsoFormula, fit_from_measurements  # noqa: E402
 from phase_model import ContentionCostModel  # noqa: E402
 import planned_moe as planned_moe_module  # noqa: E402
@@ -62,7 +62,7 @@ def catalog() -> ProfileCatalog:
     return ProfileCatalog.from_paths(profile_paths())
 
 
-def models(catalog: ProfileCatalog, mode: str, ffn: int, local_experts: int):
+def model_for(catalog: ProfileCatalog, mode: str, ffn: int, local_experts: int):
     query = ProfileQuery(
         mode=mode,
         degree=2,
@@ -78,8 +78,8 @@ def models(catalog: ProfileCatalog, mode: str, ffn: int, local_experts: int):
         cores_per_rank=32,
         concurrent_ranks=2,
     )
-    one_range, two_range = catalog.stage_range_pair(query)
-    return ContentionCostModel(one_range.path), ContentionCostModel(two_range.path)
+    record = catalog.select(query)
+    return ContentionCostModel(record.path, expected_policy=query)
 
 
 class _DeterministicTailPoolModel:
@@ -475,8 +475,6 @@ def test_schema_v2_uses_formula_with_table_fallback(catalog: ProfileCatalog) -> 
             hidden_size=4096,
             intermediate_size=1024,
             local_experts=64,
-            w13_window_ranges=2,
-            w2_window_ranges=1,
         )
     )
     default = ContentionCostModel(record.path)
@@ -492,20 +490,18 @@ def test_schema_v2_uses_formula_with_table_fallback(catalog: ProfileCatalog) -> 
     assert formula.T_iso(192, 8) != pytest.approx(table.T_iso(192, 8))
 
 
-def test_catalog_requires_exact_policy(catalog: ProfileCatalog) -> None:
+def test_catalog_requires_exact_calibration_domain(catalog: ProfileCatalog) -> None:
     query = ProfileQuery(
         mode="tp",
         degree=2,
         hidden_size=4096,
         intermediate_size=1024,
         local_experts=64,
-        w13_window_ranges=2,
-        w2_window_ranges=1,
     )
     record = catalog.select(query)
     assert record.policy.llc_bytes_per_rank == 48 * 1024 * 1024
-    assert record.policy.w13_window_ranges == 2
-    assert record.policy.w2_window_ranges == 1
+    assert record.measurement_geometry.w13_ranges == 2
+    assert record.measurement_geometry.w2_ranges == 1
 
     with pytest.raises(ProfileCompatibilityError, match="no exact profile"):
         catalog.select(
@@ -902,8 +898,6 @@ def test_profile_requires_explicit_exact_stage_ranges(
             hidden_size=4096,
             intermediate_size=1024,
             local_experts=64,
-            w13_window_ranges=2,
-            w2_window_ranges=1,
         )
     )
     payload = json.loads(record.path.read_text(encoding="utf-8"))
@@ -911,11 +905,11 @@ def test_profile_requires_explicit_exact_stage_ranges(
     path = tmp_path / "missing_stage_ranges.json"
     path.write_text(json.dumps(payload), encoding="utf-8")
 
-    with pytest.raises(ProfileCompatibilityError, match="requires exact W13/W2 stage ranges"):
+    with pytest.raises(ProfileCompatibilityError, match="requires measured W13/W2 stage ranges"):
         ProfileCatalog.from_paths([path])
 
 
-def test_profile_kernel_policy_identity_is_canonical_stage_ranges(catalog: ProfileCatalog) -> None:
+def test_profile_stage_ranges_are_measurement_provenance(catalog: ProfileCatalog) -> None:
     query = ProfileQuery(
         mode="tp",
         degree=2,
@@ -931,14 +925,16 @@ def test_profile_kernel_policy_identity_is_canonical_stage_ranges(catalog: Profi
         cores_per_rank=32,
         concurrent_ranks=2,
     )
+    record = catalog.select(query)
+    assert record.measurement_geometry.w13_ranges == 2
+    assert record.measurement_geometry.w2_ranges == 1
+    assert not hasattr(record.policy, "w13_window_ranges")
+    assert not hasattr(record.policy, "w2_window_ranges")
+    with pytest.raises(TypeError, match="unexpected keyword argument"):
+        ProfileQuery(w13_window_ranges=1)
 
-    one_range, two_range = catalog.stage_range_pair(query)
 
-    assert one_range.policy.kernel_policy_key() == ("stage_ranges", 1, 1)
-    assert two_range.policy.kernel_policy_key() == ("stage_ranges", 2, 1)
-
-
-def test_policy_variants_reject_duplicate_stage_range_identity(
+def test_catalog_rejects_duplicate_domain_instead_of_searching_range_variants(
     catalog: ProfileCatalog,
     tmp_path: Path,
 ) -> None:
@@ -957,8 +953,8 @@ def test_policy_variants_reject_duplicate_stage_range_identity(
         cores_per_rank=32,
         concurrent_ranks=2,
     )
-    one_range, _ = catalog.stage_range_pair(query)
-    payload = json.loads(one_range.path.read_text(encoding="utf-8"))
+    record = catalog.select(query)
+    payload = json.loads(record.path.read_text(encoding="utf-8"))
     payload["kernel"].update(
         {
             "w13_window_ranges": 1,
@@ -967,141 +963,20 @@ def test_policy_variants_reject_duplicate_stage_range_identity(
     )
     duplicate = tmp_path / "duplicate_r1_r1.json"
     duplicate.write_text(json.dumps(payload), encoding="utf-8")
-    duplicate_catalog = ProfileCatalog.from_paths([one_range.path, duplicate])
-
-    with pytest.raises(ProfileCompatibilityError, match="duplicate kernel policy profile"):
-        duplicate_catalog.policy_variants(query)
+    with pytest.raises(ProfileCompatibilityError, match="duplicate calibration domain"):
+        ProfileCatalog.from_paths([record.path, duplicate])
 
 
-def test_window_policy_and_thread_shape_are_selected_jointly(
-    catalog: ProfileCatalog,
-    tmp_path: Path,
-) -> None:
-    query = ProfileQuery(
-        mode="tp",
-        degree=2,
-        hidden_size=4096,
-        intermediate_size=1024,
-        global_experts=64,
-        local_experts=64,
-        backend="sve",
-        backend_n_tile=8,
-        activation="silu",
-        dtype="bf16",
-        measurement_experts=64,
-        cores_per_rank=32,
-        concurrent_ranks=2,
-    )
-    one_range, two_range = catalog.stage_range_pair(query)
-    window_paths: list[Path] = []
-    preferred = {
-        1024 * 1024: (tuple([1] * 32), 2_000_000),
-        2 * 1024 * 1024: (tuple([2] * 16), 1_000_000),
-    }
-    for window_bytes, (preferred_shape, preferred_ns) in preferred.items():
-        payload = json.loads(one_range.path.read_text(encoding="utf-8"))
-        w13 = stage_weight_window_geometry(
-            k=4096,
-            n=2048,
-            n_tile=8,
-            target_bytes=window_bytes,
-            fallback_ranges=1,
-        )
-        w2 = stage_weight_window_geometry(
-            k=1024,
-            n=4096,
-            n_tile=8,
-            target_bytes=window_bytes,
-            fallback_ranges=1,
-        )
-        payload["kernel"].update(
-            {
-                "w13_window_ranges": w13.ranges,
-                "w2_window_ranges": w2.ranges,
-            }
-        )
-        payload["working_set"].update(
-            {
-                "weight_window_target_bytes": window_bytes,
-                "w13_chunk_bytes_per_expert": w13.max_range_bytes,
-                "w2_chunk_bytes_per_expert": w2.max_range_bytes,
-                "w13_window_bytes_per_expert": w13.max_range_bytes,
-                "w2_window_bytes_per_expert": w2.max_range_bytes,
-                "max_weight_stage_bytes_per_expert": max(w13.max_range_bytes, w2.max_range_bytes),
-            }
-        )
-        for entry in payload["entries"]:
-            value = preferred_ns if tuple(entry["shape"]) == preferred_shape else 1_000_000_000
-            entry["makespan_ns"] = value
-            entry["p10_ns"] = value
-            entry["p90_ns"] = value
-            entry["full_call_median_ns"] = value
-            entry["full_call_p10_ns"] = value
-            entry["full_call_p90_ns"] = value
-        path = tmp_path / f"window_{window_bytes}.json"
-        path.write_text(json.dumps(payload), encoding="utf-8")
-        window_paths.append(path)
-
-    policy_catalog = ProfileCatalog.from_paths([one_range.path, two_range.path, *window_paths])
-    records = policy_catalog.policy_variants(query)
-    policy_models = [ContentionCostModel(record.path) for record in records]
-    result = PolicyAwarePlanner(policy_models, 32).plan([(expert, 192) for expert in range(64)])
-
-    assert len(records) == 4
-    assert result["w13_window_ranges"] == 8
-    assert result["w2_window_ranges"] == 4
-    assert result["shape"] == tuple([2] * 16)
-    assert result["active_working_set_bytes"] == 32 * 1024 * 1024
-    assert result["window_bytes_per_worker"] == tuple([1024 * 1024] * 16)
-    selected_model = next(
-        model
-        for model in policy_models
-        if (model.w13_window_ranges, model.w2_window_ranges) == (8, 4)
-    )
-    selected_worksets = [workset for _, workset in selected_model._task_phases(192, 2) if workset]
-    assert selected_worksets == [2 * 1024 * 1024] * 12
-
-    runtime = PlannedMoE(policy_models, 32)
-    spec = runtime.plan_spec_for([(expert, 192) for expert in range(64)])
-    assert spec["plan_version"] == 2
-    assert spec["operator_options"] == {
-        "w13_ranges": 8,
-        "w2_ranges": 4,
-    }
-    bridge = spec["bridge"]
-    assert bridge["plan_version"] == 2
-    assert bridge["execution_mode"] == "strict"
-    assert bridge["task_preferred_threads"] == bridge["task_threads"]
-    assert bridge["task_min_threads"] == bridge["task_threads"]
-    assert bridge["task_max_threads"] == bridge["task_threads"]
-    assert bridge["task_allowed_thread_offsets"] == list(range(len(bridge["task_threads"]) + 1))
-    assert bridge["task_allowed_threads"] == bridge["task_threads"]
-    assert bridge["task_placement_modes"] == [0] * len(bridge["task_threads"])
-    assert bridge["task_stage_ids"] == [0] * len(bridge["task_threads"])
-    assert bridge["task_resize_points"] == [0] * len(bridge["task_threads"])
-    assert bridge["task_range_granularities"] == [0] * len(bridge["task_threads"])
-    assert bridge["task_w13_ranges"] == [8] * len(bridge["task_threads"])
-    assert bridge["task_w2_ranges"] == [4] * len(bridge["task_threads"])
-    cached_spec = runtime.plan_spec_for([(expert, 192) for expert in range(64)])
-    assert cached_spec["operator_options"] == spec["operator_options"]
-    assert cached_spec["bridge"] == bridge
-    assert runtime.last["cache_hit"] is True
-    evaluator = ParallelLayerEvaluator(
-        policy_catalog,
-        HierarchicalTopology(2, 1, 60e9, 20e9, 1e-6),
-        hidden_size=4096,
-        full_intermediate_size=2048,
-        global_experts=64,
-        cores_per_rank=32,
-    )
-    tp = evaluator.evaluate_tp(2048, 6)
-    assert {(rank.w13_ranges, rank.w2_ranges) for rank in tp.rank_compute} == {(8, 4)}
+def test_planned_moe_rejects_multiple_calibration_models(catalog: ProfileCatalog) -> None:
+    model = model_for(catalog, "tp", 1024, 64)
+    with pytest.raises(ValueError, match="one calibration model"):
+        PlannedMoE((model, model), 32)
 
 
 def test_tail_pool_bridge_relinks_fixed_lane_dependencies(
     catalog: ProfileCatalog,
 ) -> None:
-    _, model = models(catalog, "tp", 1024, 64)
+    model = model_for(catalog, "tp", 1024, 64)
     runtime = PlannedMoE(model, 32)
     planner = runtime.interval_planners[0]
     tasks = [
@@ -1137,7 +1012,7 @@ def test_tail_pool_bridge_relinks_fixed_lane_dependencies(
 def test_static_stage_window_policy_is_lowered_per_task(
     catalog: ProfileCatalog,
 ) -> None:
-    _, model = models(catalog, "tp", 1024, 64)
+    model = model_for(catalog, "tp", 1024, 64)
     baseline = IntervalPlanner(model, 32, native_cold_planner=False)
     planner = IntervalPlanner(
         model,
@@ -1194,7 +1069,7 @@ def test_static_stage_window_policy_is_lowered_per_task(
 def test_elastic_w2_bridge_lowers_local_cohorts_and_stage_widths(
     catalog: ProfileCatalog,
 ) -> None:
-    _, model = models(catalog, "tp", 1024, 64)
+    model = model_for(catalog, "tp", 1024, 64)
     planner = IntervalPlanner(
         model,
         32,
@@ -1254,7 +1129,7 @@ def test_elastic_w2_bridge_lowers_local_cohorts_and_stage_widths(
 def test_default_stage_window_policy_requires_exact_profile(
     catalog: ProfileCatalog,
 ) -> None:
-    _, model = models(catalog, "tp", 1024, 64)
+    model = model_for(catalog, "tp", 1024, 64)
     assert model.policy is not None
     cpu_ids_by_rank = (tuple(range(96)), tuple(range(96, 192)))
     matching = replace(
@@ -1271,8 +1146,6 @@ def test_default_stage_window_policy_requires_exact_profile(
         m_tail_policy="xbyak_exact_m",
         activation="silu",
         dtype="bf16",
-        w13_window_ranges=2,
-        w2_window_ranges=1,
         measurement_experts=256,
         cores_per_rank=96,
         concurrent_ranks=2,
@@ -1299,7 +1172,7 @@ def test_default_stage_window_policy_requires_exact_profile(
     )
     assert (
         default_task_stage_window_policy(
-            replace(matching, w13_window_ranges=1),
+            replace(matching, mode="standalone"),
             num_cores=96,
             cpu_ids=cpu_ids_by_rank[0],
         )
@@ -1319,36 +1192,33 @@ def test_planned_moe_applies_default_stage_windows_per_profile(
     monkeypatch: pytest.MonkeyPatch,
     catalog: ProfileCatalog,
 ) -> None:
-    one_range, two_range = models(catalog, "tp", 1024, 64)
+    model = model_for(catalog, "tp", 1024, 64)
 
     def select_default(profile, *, num_cores, cpu_ids):
         del num_cores, cpu_ids
-        if profile is not None and profile.w13_window_ranges == 2:
+        if profile is not None:
             return AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V1
         return None
 
     monkeypatch.setattr(planned_moe_module, "default_task_stage_window_policy", select_default)
-    runtime = PlannedMoE((one_range, two_range), 32, cpu_ids=tuple(range(32)))
+    runtime = PlannedMoE(model, 32, cpu_ids=tuple(range(32)))
 
-    assert runtime.task_stage_window_policies == (
-        None,
-        AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V1,
-    )
+    assert runtime.task_stage_window_policies == (AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V1,)
     tasks = [(0, 96, 0, 8, [])]
-    assert runtime.interval_planners[0].to_async_bridge(tasks)["task_w13_ranges"] == [1]
-    assert runtime.interval_planners[1].to_async_bridge(tasks)["task_w13_ranges"] == [16]
+    assert runtime.interval_planners[0].to_async_bridge(tasks)["task_w13_ranges"] == [16]
 
     disabled = PlannedMoE(
-        (one_range, two_range),
+        model,
         32,
         cpu_ids=tuple(range(32)),
         use_default_stage_window_policy=False,
     )
-    assert disabled.task_stage_window_policies == (None, None)
+    assert disabled.task_stage_window_policies == (None,)
+    assert disabled.interval_planners[0].to_async_bridge(tasks)["task_w13_ranges"] == [2]
 
 
 def test_m12_tail_composition(catalog: ProfileCatalog) -> None:
-    _, model = models(catalog, "tp", 1024, 64)
+    model = model_for(catalog, "tp", 1024, 64)
     assert model.m12_effective_rows(3) == 4
     assert model.m12_effective_rows(7) == 8
     assert model.m12_effective_rows(11) == 12
@@ -1372,8 +1242,6 @@ def test_exact_m_profile_does_not_round_tail_routes(
             hidden_size=4096,
             intermediate_size=1024,
             local_experts=64,
-            w13_window_ranges=2,
-            w2_window_ranges=1,
         )
     )
     payload = json.loads(record.path.read_text(encoding="utf-8"))
@@ -1391,8 +1259,6 @@ def test_exact_m_profile_does_not_round_tail_routes(
                 hidden_size=4096,
                 intermediate_size=1024,
                 local_experts=64,
-                w13_window_ranges=2,
-                w2_window_ranges=1,
             )
         )
     selected = mixed_catalog.select(
@@ -1404,8 +1270,6 @@ def test_exact_m_profile_does_not_round_tail_routes(
             local_experts=64,
             sve_implementation="jit",
             m_tail_policy="xbyak_exact_m",
-            w13_window_ranges=2,
-            w2_window_ranges=1,
         )
     )
     assert selected.path == path
@@ -1423,46 +1287,35 @@ def test_checked_in_xbyak_profiles_cover_exact_m_range_endpoints() -> None:
     assert len(paths) >= 4
     exact_catalog = ProfileCatalog.from_paths(paths)
 
-    pairs: dict[tuple[object, ...], dict[tuple[int, int], Path]] = {}
+    identities: set[tuple[object, ...]] = set()
     for record in exact_catalog.records:
         payload = record.payload
         policy = record.policy
         assert policy.sve_implementation == "jit"
         assert policy.m_tail_policy == "xbyak_exact_m"
+        assert record.measurement_geometry.w13_ranges == 2
+        assert record.measurement_geometry.w2_ranges == 1
         assert payload["kernel"]["xbyak_aarch64_commit"] == XBYAK_AARCH64_COMMIT
         assert set(range(1, 13)).issubset(map(int, payload["isolated_routes"]))
         assert set(range(1, 13)).issubset(map(int, payload["contention_routes"]))
         assert payload["kernel"]["source_sha256"]
         assert payload["kernel"]["extension_sha256"]
-        range_variants = pairs.setdefault(policy.key_without_kernel_policy(), {})
-        range_key = (policy.w13_window_ranges, policy.w2_window_ranges)
-        assert range_key not in range_variants
-        range_variants[range_key] = record.path
+        assert policy.identity_key() not in identities
+        identities.add(policy.identity_key())
 
         model = ContentionCostModel(
             record.path,
             expected_policy=ProfileQuery(
                 sve_implementation="jit",
                 m_tail_policy="xbyak_exact_m",
-                w13_window_ranges=policy.w13_window_ranges,
-                w2_window_ranges=policy.w2_window_ranges,
             ),
         )
         assert [model.m12_effective_rows(routes) for routes in range(1, 13)] == list(range(1, 13))
 
-    assert len(pairs) >= 2
-    assert all(set(range_variants) == {(1, 1), (2, 1)} for range_variants in pairs.values())
-    for range_variants in pairs.values():
-        pair_catalog = ProfileCatalog.from_paths(range_variants.values())
-        pair_catalog.stage_range_pair(
-            ProfileQuery(
-                sve_implementation="jit",
-                m_tail_policy="xbyak_exact_m",
-            )
-        )
+    assert len(identities) == len(exact_catalog.records)
 
 
-def test_parallel_evaluator_auto_accepts_available_range_variants(
+def test_parallel_evaluator_prefers_jit_calibration_when_available(
     catalog: ProfileCatalog,
     tmp_path: Path,
 ) -> None:
@@ -1481,104 +1334,89 @@ def test_parallel_evaluator_auto_accepts_available_range_variants(
         cores_per_rank=32,
         concurrent_ranks=2,
     )
-    asm_one_range, asm_two_range = catalog.stage_range_pair(query)
-
-    jit_paths: list[Path] = []
-    for record in (asm_one_range, asm_two_range):
-        payload = json.loads(record.path.read_text(encoding="utf-8"))
-        payload["kernel"]["sve_implementation"] = "jit"
-        payload["kernel"]["m_tail_policy"] = "xbyak_exact_m"
-        path = tmp_path / f"jit_r{record.policy.w13_window_ranges}.json"
-        path.write_text(json.dumps(payload), encoding="utf-8")
-        jit_paths.append(path)
+    asm_record = catalog.select(query)
+    payload = json.loads(asm_record.path.read_text(encoding="utf-8"))
+    payload["kernel"]["sve_implementation"] = "jit"
+    payload["kernel"]["m_tail_policy"] = "xbyak_exact_m"
+    jit_path = tmp_path / "jit.json"
+    jit_path.write_text(json.dumps(payload), encoding="utf-8")
 
     topology = HierarchicalTopology(2, 1, 60e9, 20e9, 1e-6)
 
-    incomplete = ProfileCatalog.from_paths([asm_one_range.path, asm_two_range.path, jit_paths[1]])
-    partial = ParallelLayerEvaluator(
-        incomplete,
+    asm_only = ParallelLayerEvaluator(
+        ProfileCatalog.from_paths([asm_record.path]),
         topology,
         hidden_size=4096,
         full_intermediate_size=2048,
         global_experts=64,
         cores_per_rank=32,
-    )._models("tp", 1024, 64)
-    assert {model.policy.sve_implementation for model in partial} == {"jit"}
-    assert [model.policy.kernel_policy_key() for model in partial] == [("stage_ranges", 2, 1)]
+    )._model("tp", 1024, 64)
+    assert asm_only.policy.sve_implementation == "asm"
 
-    complete = ProfileCatalog.from_paths([asm_one_range.path, asm_two_range.path, *jit_paths])
     selected = ParallelLayerEvaluator(
-        complete,
+        ProfileCatalog.from_paths([asm_record.path, jit_path]),
         topology,
         hidden_size=4096,
         full_intermediate_size=2048,
         global_experts=64,
         cores_per_rank=32,
-    )._models("tp", 1024, 64)
-    assert {model.policy.sve_implementation for model in selected} == {"jit"}
-    assert {model.policy.kernel_policy_key() for model in selected} == {
-        ("stage_ranges", 1, 1),
-        ("stage_ranges", 2, 1),
-    }
+    )._model("tp", 1024, 64)
+    assert selected.policy.sve_implementation == "jit"
 
 
 def test_exact_shape_and_stage_working_sets(catalog: ProfileCatalog) -> None:
-    one_range, two_range = models(catalog, "ep", 2048, 32)
-    assert two_range.supports_shape((32,))
-    assert not two_range.supports_shape((24, 8))
+    model = model_for(catalog, "ep", 2048, 32)
+    assert model.supports_shape((32,))
+    assert not model.supports_shape((24, 8))
     with pytest.raises(ProfileCompatibilityError, match="was not measured"):
-        two_range.profiled_group_time(192, (24, 8))
+        model.profiled_group_time(192, (24, 8))
 
-    two_range_worksets = [workset for _, workset in two_range._task_phases(192, 16)]
-    one_range_worksets = [workset for _, workset in one_range._task_phases(192, 16)]
-    assert [value for value in two_range_worksets if value] == [
+    calibration_worksets = [workset for _, workset in model._task_phases(192, 16)]
+    assert [value for value in calibration_worksets if value] == [
         16 * 1024 * 1024,
         16 * 1024 * 1024,
-        16 * 1024 * 1024,
-    ]
-    assert [value for value in one_range_worksets if value] == [
-        32 * 1024 * 1024,
         16 * 1024 * 1024,
     ]
     tasks = [(192, 16, []), (192, 16, [])]
-    assert one_range.dag_makespan(tasks) != pytest.approx(one_range.flat_dag_makespan(tasks))
-    finish_times = one_range.dag_task_finish_times(tasks)
+    finish_times = model.dag_task_finish_times(tasks)
     assert finish_times[0] == pytest.approx(finish_times[1])
-    assert max(finish_times) == pytest.approx(one_range.dag_makespan(tasks))
+    assert max(finish_times) == pytest.approx(model.dag_makespan(tasks))
 
 
 def test_joint_planner_and_physical_cpu_mapping(catalog: ProfileCatalog) -> None:
-    tp_models = models(catalog, "tp", 1024, 64)
-    assert all(model.has_full_workload_anchors for model in tp_models)
-    tp = PolicyAwarePlanner(tp_models, 32, cpu_ids=range(32, 64)).plan([(expert, 192) for expert in range(64)])
-    assert (tp["w13_window_ranges"], tp["w2_window_ranges"]) == (2, 1)
+    tp_model = model_for(catalog, "tp", 1024, 64)
+    assert tp_model.has_full_workload_anchors
+    tp_planner = IntervalPlanner(tp_model, 32, cpu_ids=range(32, 64))
+    tp = tp_planner.plan([(expert, 192) for expert in range(64)])
     assert tp["shape"] == (8, 8, 8, 8)
     assert tp["active_working_set_bytes"] == 32 * 1024 * 1024
     assert tp["bridge"]["thread_cpu_ids"] == list(range(32, 64))
+    assert "w13_window_ranges" not in tp
+    assert "w2_window_ranges" not in tp
 
-    two_range_model = tp_models[1]
-    two_range_planner = PolicyAwarePlanner([two_range_model], 32, cpu_ids=range(32, 64)).planners[0]
-    anchored_ms, _ = two_range_planner.score_shape([(expert, 192) for expert in range(64)], (8, 8, 8, 8))
-    assert anchored_ms == two_range_model.profiled_full_call_time(192, (8, 8, 8, 8))
+    anchored_ms, _ = tp_planner.score_shape([(expert, 192) for expert in range(64)], (8, 8, 8, 8))
+    assert anchored_ms == tp_model.profiled_full_call_time(192, (8, 8, 8, 8))
 
-    ep_models = models(catalog, "ep", 2048, 32)
-    ep = PolicyAwarePlanner(ep_models, 32).plan([(expert, 192) for expert in range(32)])
-    assert (ep["w13_window_ranges"], ep["w2_window_ranges"]) == (2, 1)
+    ep = IntervalPlanner(model_for(catalog, "ep", 2048, 32), 32).plan(
+        [(expert, 192) for expert in range(32)]
+    )
     assert ep["shape"] == (32,)
 
 
-def test_policy_aware_cache_and_richer_signature(catalog: ProfileCatalog) -> None:
+def test_domain_bound_cache_and_richer_signature(catalog: ProfileCatalog) -> None:
     first = [(0, 10), (1, 6), (2, 2), (3, 2)]
     second = [(0, 10), (1, 4), (2, 4), (3, 2)]
     assert signature(first) != signature(second)
 
-    planner = PlannedMoE(models(catalog, "tp", 1024, 64), 32)
+    planner = PlannedMoE(model_for(catalog, "tp", 1024, 64), 32)
     counts = [(expert, 192) for expert in range(64)]
     spec = planner.plan_spec_for(counts)
-    assert spec["operator_options"] == {
-        "w13_ranges": 2,
-        "w2_ranges": 1,
-    }
+    assert "operator_options" not in spec
+    assert "w13_window_ranges" not in spec
+    assert "w2_window_ranges" not in spec
+    task_count = len(spec["bridge"]["task_expert_ids"])
+    assert len(spec["bridge"]["task_w13_ranges"]) == task_count
+    assert len(spec["bridge"]["task_w2_ranges"]) == task_count
     assert planner.last["cache_hit"] is False
     cached = planner.plan_spec_for(counts)
     assert cached["shape"] == spec["shape"]
@@ -1606,28 +1444,18 @@ def test_real_routing_summary_offline_plan_and_cost_model(
     assert workload.histogram[45] == 674
     assert PRESETS[workload.name] == workload.experts
 
-    policy_planner = PolicyAwarePlanner(
-        models(catalog, "tp", 1024, 64),
-        32,
-    )
-    result = policy_planner.plan(workload.experts)
-    strict_result = policy_planner.plan(workload.experts, dynamic_tail_pool=False)
+    planner = IntervalPlanner(model_for(catalog, "tp", 1024, 64), 32)
+    result = planner.plan(workload.experts)
+    strict_result = planner.plan(workload.experts, dynamic_tail_pool=False)
     assert math.isfinite(result["makespan_ns"])
     assert result["makespan_ns"] > 0
     assert result["makespan_ns"] <= strict_result["makespan_ns"]
     assert len(result["tasks"]) == workload.observed_active_experts
     assert sum(task[1] for task in result["tasks"]) == workload.routes
     assert len(result["bridge"]["task_expert_ids"]) == len(result["tasks"])
-    assert len(result["policy_ranking"]) == 2
+    assert "policy_ranking" not in result
 
-    selected = next(
-        planner
-        for planner in policy_planner.planners
-        if planner.model.policy is not None
-        and planner.model.policy.kernel_policy_key()
-        == ("stage_ranges", strict_result["w13_window_ranges"], strict_result["w2_window_ranges"])
-    )
-    rescored_ns, rescored_tasks = selected.score_shape(
+    rescored_ns, rescored_tasks = planner.score_shape(
         workload.experts,
         strict_result["shape"],
     )
@@ -1703,23 +1531,22 @@ def test_ep_rank_lifetime_switches_to_single_rank_profile(
         cores_per_rank=32,
         concurrent_ranks=2,
     )
-    dual_records = catalog.stage_range_pair(query)
-    paths = [record.path for record in dual_records]
-    for record in dual_records:
-        payload = json.loads(record.path.read_text(encoding="utf-8"))
-        target = payload["target"]
-        target["concurrent_ranks"] = 1
-        target["cpu_ids_by_rank"] = [target["cpu_ids_by_rank"][0]]
-        target["numa_nodes"] = [target["numa_nodes"][0]]
-        target["llc_bytes_by_rank"] = [target["llc_bytes_by_rank"][0]]
-        for section in ("isolated", "entries"):
-            for entry in payload[section]:
-                for key, value in list(entry.items()):
-                    if key.endswith("_ns") and isinstance(value, (int, float)):
-                        entry[key] = value * 0.5
-        single_path = tmp_path / f"single_{record.path.name}"
-        single_path.write_text(json.dumps(payload), encoding="utf-8")
-        paths.append(single_path)
+    dual_record = catalog.select(query)
+    paths = [dual_record.path]
+    payload = json.loads(dual_record.path.read_text(encoding="utf-8"))
+    target = payload["target"]
+    target["concurrent_ranks"] = 1
+    target["cpu_ids_by_rank"] = [target["cpu_ids_by_rank"][0]]
+    target["numa_nodes"] = [target["numa_nodes"][0]]
+    target["llc_bytes_by_rank"] = [target["llc_bytes_by_rank"][0]]
+    for section in ("isolated", "entries"):
+        for entry in payload[section]:
+            for key, value in list(entry.items()):
+                if key.endswith("_ns") and isinstance(value, (int, float)):
+                    entry[key] = value * 0.5
+    single_path = tmp_path / f"single_{dual_record.path.name}"
+    single_path.write_text(json.dumps(payload), encoding="utf-8")
+    paths.append(single_path)
 
     topology = HierarchicalTopology(2, 1, 60e9, 20e9, 1e-6)
     conservative = ParallelLayerEvaluator(

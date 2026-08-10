@@ -673,18 +673,16 @@ def make_production_schedule(
     policy = model.policy
     if policy is None:
         raise ValueError(f"production profile must use schema v2: {profile}")
-    expected = (hidden, intermediate, experts, threads, 2, 1)
+    expected = (hidden, intermediate, experts, threads)
     actual = (
         policy.hidden_size,
         policy.intermediate_size,
         policy.local_experts,
         policy.cores_per_rank,
-        policy.w13_window_ranges,
-        policy.w2_window_ranges,
     )
     if actual != expected:
         raise ValueError(
-            "production profile hidden/intermediate/local-experts/cores/ranges mismatch: "
+            "production profile hidden/intermediate/local-experts/cores mismatch: "
             f"expected {expected}, got {actual}"
         )
 
@@ -727,7 +725,10 @@ def make_production_schedule(
                 static_bridge["task_w2_ranges"],
             )
         )
-        baseline_ranges = int(static_spec["w13_ranges"]), int(static_spec["w2_ranges"])
+        baseline_ranges = (
+            model.measurement_geometry.w13_ranges,
+            model.measurement_geometry.w2_ranges,
+        )
         static_stage_window_metadata = {
             "name": AMAZON_C5_192C_TP4_F512_STAGE_WINDOWS_V1.name,
             "shape": list(static_spec["shape"]),
@@ -798,8 +799,20 @@ def make_production_schedule(
             "tail_repartition_tasks": auto_spec["tail_repartition_tasks"],
             "tail_repartition_route_slices": auto_spec["tail_repartition_route_slices"],
             "tail_repartition_candidates": cold_auto_metadata["tail_repartition_candidates"],
-            "w13_ranges": int(auto_spec["w13_ranges"]),
-            "w2_ranges": int(auto_spec["w2_ranges"]),
+            "task_range_pairs": sorted(
+                {
+                    f"{int(w13)}:{int(w2)}"
+                    for w13, w2 in zip(
+                        auto_spec["bridge"]["task_w13_ranges"],
+                        auto_spec["bridge"]["task_w2_ranges"],
+                        strict=True,
+                    )
+                }
+            ),
+            "calibration_ranges": [
+                model.measurement_geometry.w13_ranges,
+                model.measurement_geometry.w2_ranges,
+            ],
             "cold_plan_ms": cold_plan_ns / 1.0e6,
             "warm_plan_ms": warm_plan_ns / 1.0e6,
             "static_stage_windows": static_stage_window_metadata,
@@ -935,8 +948,8 @@ def main() -> int:
             static_stage_windows=args.static_stage_windows,
         )
         team_threads = None
-        w13_ranges = int(planner_metadata["w13_ranges"])
-        w2_ranges = int(planner_metadata["w2_ranges"])
+        calibration_ranges = planner_metadata["calibration_ranges"]
+        w13_ranges, w2_ranges = map(int, calibration_ranges)
         if elastic_transitions is not None:
             assert production_plan is not None
             for timeout_us in elastic_timeouts_us:

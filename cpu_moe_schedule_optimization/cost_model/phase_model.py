@@ -1,9 +1,9 @@
-"""Policy-bound, exact-shape and stage-aware MoE contention model.
+"""Domain-bound, exact-shape and stage-aware MoE contention model.
 
-Schema-v2 profiles bind measurements to a sharded expert shape, packed-B window
-policy, kernel binary, NUMA topology, and concurrent-rank count.  The model
-keeps the validated event-driven DAG mechanics, but models W13 and W2 ranges as
-separate working-set phases.  Legacy schema-v1 profiles retain the old flat-task
+Schema-v2 profiles bind measurements to a sharded expert shape, kernel binary,
+NUMA topology, and concurrent-rank count. The stage ranges recorded in a file
+describe its measurement geometry; runtime geometry is resolved per task after
+team-width selection. Legacy schema-v1 profiles retain the old flat-task
 behavior for reproducibility.
 """
 
@@ -22,6 +22,7 @@ try:
     from iso_formula import IsoFormula, fit_from_measurements
     from profile_catalog import (
         ProfileCompatibilityError,
+        ProfileMeasurementGeometry,
         ProfilePolicy,
         ProfileQuery,
     )
@@ -30,6 +31,7 @@ except ImportError:  # pragma: no cover - package-style import
     from .iso_formula import IsoFormula, fit_from_measurements
     from .profile_catalog import (
         ProfileCompatibilityError,
+        ProfileMeasurementGeometry,
         ProfilePolicy,
         ProfileQuery,
     )
@@ -56,6 +58,11 @@ class ContentionCostModel:
             raise ValueError(f"unsupported kernel.m_tail_policy={self.m_tail_policy!r}")
         formula_payload = prof.get("iso_formula")
         self.policy = ProfilePolicy.from_payload(prof) if self.schema_version >= 2 else None
+        self.measurement_geometry = (
+            ProfileMeasurementGeometry.from_payload(prof)
+            if self.schema_version >= 2
+            else ProfileMeasurementGeometry(1, 1)
+        )
         if expected_policy is not None:
             if self.policy is None:
                 raise ProfileCompatibilityError("cannot apply a policy query to a legacy profile")
@@ -217,8 +224,8 @@ class ContentionCostModel:
         )
         self.w2_bytes = self.w2_chunk_bytes
         self.max_stage_bytes = int(working_set.get("max_weight_stage_bytes_per_expert", 0))
-        self.w13_window_ranges = int(self.policy.w13_window_ranges) if self.policy is not None else 1
-        self.w2_window_ranges = int(self.policy.w2_window_ranges) if self.policy is not None else 1
+        self.calibration_w13_ranges = self.measurement_geometry.w13_ranges
+        self.calibration_w2_ranges = self.measurement_geometry.w2_ranges
         if self.policy is not None:
             n_tile = self.policy.backend_n_tile
             self.w13_tile_bytes = self.policy.hidden_size * n_tile * 2
@@ -277,9 +284,9 @@ class ContentionCostModel:
     @lru_cache(maxsize=4096)
     def _task_stage_geometry(self, routes: int, threads: int) -> tuple[int, int, int, int]:
         baseline = (
-            self.w13_window_ranges,
+            self.calibration_w13_ranges,
             self.w13_chunk_bytes,
-            self.w2_window_ranges,
+            self.calibration_w2_ranges,
             self.w2_chunk_bytes,
         )
         if self.task_stage_window_policy is None:
@@ -295,14 +302,14 @@ class ContentionCostModel:
             n=2 * self.policy.intermediate_size,
             n_tile=self.policy.backend_n_tile,
             target_bytes=max(int(w13_target), 0),
-            fallback_ranges=self.w13_window_ranges,
+            fallback_ranges=self.calibration_w13_ranges,
         )
         w2 = stage_weight_window_geometry(
             k=self.policy.intermediate_size,
             n=self.policy.hidden_size,
             n_tile=self.policy.backend_n_tile,
             target_bytes=max(int(w2_target), 0),
-            fallback_ranges=self.w2_window_ranges,
+            fallback_ranges=self.calibration_w2_ranges,
         )
         return w13.ranges, w13.max_range_bytes, w2.ranges, w2.max_range_bytes
 
@@ -407,8 +414,8 @@ class ContentionCostModel:
             "local_experts": self.local_experts,
             "profile_runs": self.profile_runs,
             "measurement_experts": self.measurement_experts,
-            "w13_window_ranges": self.w13_window_ranges,
-            "w2_window_ranges": self.w2_window_ranges,
+            "calibration_w13_ranges": self.calibration_w13_ranges,
+            "calibration_w2_ranges": self.calibration_w2_ranges,
             "w13_chunk_bytes": self.w13_chunk_bytes,
             "w2_chunk_bytes": self.w2_chunk_bytes,
             "max_stage_bytes": self.max_stage_bytes,

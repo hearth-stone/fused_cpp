@@ -5,7 +5,7 @@ from __future__ import annotations
 import time
 from typing import Dict, List, Sequence, Tuple
 
-from interval_planner import IntervalPlanner, PlannerCostModel, PolicyAwarePlanner  # noqa: E402
+from interval_planner import IntervalPlanner, PlannerCostModel  # noqa: E402
 from stage_window_policy import (  # noqa: E402
     TaskStageWindowPolicy,
     default_task_stage_window_policy,
@@ -97,8 +97,11 @@ class PlannedMoE:
             self.models = (models,)
         else:
             self.models = tuple(models)
-        if not self.models:
-            raise ValueError("at least one cost model is required")
+        if len(self.models) != 1:
+            raise ValueError(
+                "PlannedMoE requires one calibration model; stage ranges are "
+                "resolved per task and are not a profile search dimension"
+            )
         self.num_cores = int(num_cores)
         self.cpu_ids = tuple(cpu_ids) if cpu_ids is not None else tuple(range(num_cores))
         self.use_default_stage_window_policy = bool(use_default_stage_window_policy)
@@ -125,21 +128,10 @@ class PlannedMoE:
             )
             for model, stage_window_policy in zip(self.models, self.task_stage_window_policies)
         )
-        self.policy_planner = (
-            PolicyAwarePlanner(
-                self.models,
-                num_cores,
-                cpu_ids=self.cpu_ids,
-                task_stage_window_policies=self.task_stage_window_policies,
-                tail_repartition_widths=tail_repartition_widths,
-            )
-            if len(self.models) > 1
-            else None
-        )
         self.policy_identity = tuple(
             (
-                model.policy.key_without_kernel_policy(),
-                model.policy.kernel_policy_key(),
+                model.policy.identity_key(),
+                str(model.profile_path),
             )
             if model.policy is not None
             else (str(model.profile_path),)
@@ -157,24 +149,8 @@ class PlannedMoE:
         self.last: dict[str, object] = {}
 
     def _planner_index(self, result: dict) -> int:
-        if len(self.models) == 1:
-            return 0
-        selected_policy = result.get("policy")
-        selected_profile = selected_policy.get("profile") if selected_policy is not None else None
-        for index, model in enumerate(self.models):
-            if str(model.profile_path) != selected_profile:
-                continue
-            if selected_policy is None or model.policy is None:
-                return index
-            selected_kernel_policy = (
-                "stage_ranges",
-                selected_policy["w13_window_ranges"],
-                selected_policy["w2_window_ranges"],
-            )
-            model_kernel_policy = model.policy.kernel_policy_key()
-            if model_kernel_policy == selected_kernel_policy:
-                return index
-        raise RuntimeError(f"no planner model for selected profile {selected_profile!r}")
+        del result
+        return 0
 
     def _build_cached(
         self,
@@ -231,16 +207,12 @@ class PlannedMoE:
             "tail_repartition_width": tail_repartition_width,
             "tail_repartition_tasks": tail_repartition_tasks,
             "tail_repartition_route_slices": tail_repartition_route_slices,
-            "w13_ranges": (model.policy.w13_window_ranges if model.policy is not None else None),
-            "w2_ranges": (model.policy.w2_window_ranges if model.policy is not None else None),
             "task_stage_window_policy": (
                 stage_window_policy.name if stage_window_policy is not None else None
             ),
             "policy": (
                 {
                     "profile": str(model.profile_path),
-                    "w13_window_ranges": model.policy.w13_window_ranges,
-                    "w2_window_ranges": model.policy.w2_window_ranges,
                 }
                 if model.policy is not None
                 else None
@@ -308,22 +280,13 @@ class PlannedMoE:
                 self.shape_cache.pop(cache_key, None)
                 hit = False
         if not hit:
-            if self.policy_planner is not None:
-                result = self.policy_planner.plan(
-                    counts,
-                    dynamic_tail_pool=dynamic_tail_pool,
-                    tail_pool_max_routes=tail_pool_max_routes,
-                    forced_tail_pool_threads=tail_pool_threads,
-                    bounded_tail_repartition=bounded_tail_repartition,
-                )
-            else:
-                result = self.interval_planners[0].plan(
-                    counts,
-                    dynamic_tail_pool=dynamic_tail_pool,
-                    tail_pool_max_routes=tail_pool_max_routes,
-                    forced_tail_pool_threads=tail_pool_threads,
-                    bounded_tail_repartition=bounded_tail_repartition,
-                )
+            result = self.interval_planners[0].plan(
+                counts,
+                dynamic_tail_pool=dynamic_tail_pool,
+                tail_pool_max_routes=tail_pool_max_routes,
+                forced_tail_pool_threads=tail_pool_threads,
+                bounded_tail_repartition=bounded_tail_repartition,
+            )
             planner_index = self._planner_index(result)
             shape = tuple(result["shape"])
             self.shape_cache[cache_key] = (
@@ -355,8 +318,6 @@ class PlannedMoE:
             "tail_repartition_tasks": result.get("tail_repartition_tasks", 0),
             "tail_repartition_route_slices": result.get("tail_repartition_route_slices", 1),
             "shape": tuple(result["shape"]),
-            "w13_ranges": result.get("w13_ranges", result.get("w13_window_ranges")),
-            "w2_ranges": result.get("w2_ranges", result.get("w2_window_ranges")),
             "task_stage_window_policy": result.get("task_stage_window_policy"),
             "policy": result.get("policy"),
             "planner_backend": result.get("planner_backend", "cache"),
@@ -376,13 +337,7 @@ class PlannedMoE:
             "tail_repartition_width": result.get("tail_repartition_width"),
             "tail_repartition_tasks": result.get("tail_repartition_tasks", 0),
             "tail_repartition_route_slices": result.get("tail_repartition_route_slices", 1),
-            "w13_ranges": result.get("w13_ranges", result.get("w13_window_ranges")),
-            "w2_ranges": result.get("w2_ranges", result.get("w2_window_ranges")),
             "task_stage_window_policy": result.get("task_stage_window_policy"),
-            "operator_options": {
-                "w13_ranges": result.get("w13_ranges", result.get("w13_window_ranges")),
-                "w2_ranges": result.get("w2_ranges", result.get("w2_window_ranges")),
-            },
             "policy": result.get("policy"),
         }
 

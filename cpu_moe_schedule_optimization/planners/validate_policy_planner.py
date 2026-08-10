@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate policy-aware plans against exhaustive measured TP2/EP2 choices.
+"""Validate per-task-range plans against exhaustive measured TP2/EP2 shapes.
 
 The parent launches one NUMA-local worker per rank and synchronizes every timed
 operator call.  Each worker uses its rank-local histogram and may therefore
@@ -97,13 +97,18 @@ def load_histograms(path: Path | None, total_routes: int, experts: int) -> dict:
     return histograms
 
 
-def select_models(profile_dir: Path, mode: str):
+def select_model(profile_dir: Path, mode: str):
     from phase_model import ContentionCostModel
     from profile_catalog import ProfileCatalog, ProfileQuery
 
     ffn = 1024 if mode == "tp" else 2048
     local_experts = 64 if mode == "tp" else 32
-    catalog = ProfileCatalog.from_directory(profile_dir, "*_v2_r1_20260713.json")
+    paths = [
+        path
+        for path in profile_dir.glob("*_splitw13_v2_r1_20260713.json")
+        if "nosplitw13" not in path.name
+    ]
+    catalog = ProfileCatalog.from_paths(paths)
     query = ProfileQuery(
         mode=mode,
         degree=2,
@@ -121,11 +126,8 @@ def select_models(profile_dir: Path, mode: str):
         cores_per_rank=32,
         concurrent_ranks=2,
     )
-    one_range, two_range = catalog.stage_range_pair(query)
-    return (
-        ContentionCostModel(one_range.path),
-        ContentionCostModel(two_range.path),
-    )
+    record = catalog.select(query)
+    return ContentionCostModel(record.path, expected_policy=query)
 
 
 def parse_shape(value: str | None) -> tuple[int, ...] | None:
@@ -173,14 +175,13 @@ def local_histogram(global_histogram: list[int], mode: str, rank: int) -> list[i
 def worker(args: argparse.Namespace) -> int:
     import torch
     from fused_cpp.moe import prepare_fused_moe_bf16_tiled_weights
-    from interval_planner import IntervalPlanner, PolicyAwarePlanner
+    from interval_planner import IntervalPlanner
 
     torch.set_num_threads(1)
-    models = select_models(args.profile_dir, args.mode)
-    assert models[0].policy is not None
-    cpu_ids = models[0].policy.cpu_ids_by_rank[args.rank]
-    planners = tuple(IntervalPlanner(model, 32, cpu_ids=cpu_ids) for model in models)
-    joint = PolicyAwarePlanner(models, 32, cpu_ids=cpu_ids)
+    model = select_model(args.profile_dir, args.mode)
+    assert model.policy is not None
+    cpu_ids = model.policy.cpu_ids_by_rank[args.rank]
+    planner = IntervalPlanner(model, 32, cpu_ids=cpu_ids)
     ffn = 1024 if args.mode == "tp" else 2048
     local_experts = 64 if args.mode == "tp" else 32
 
@@ -203,29 +204,21 @@ def worker(args: argparse.Namespace) -> int:
         experts = [(expert, routes) for expert, routes in enumerate(counts) if routes]
         forced_shape = parse_shape(args.force_shape)
         if forced_shape is None:
-            selected = joint.plan(experts)
+            selected = planner.plan(experts)
         else:
-            forced_planner = next(
-                planner
-                for planner in planners
-                if planner.model.policy is not None
-                and planner.model.policy.w13_window_ranges == args.force_w13_ranges
-            )
-            predicted, tasks = forced_planner.score_shape(experts, forced_shape)
+            predicted, tasks = planner.score_shape(experts, forced_shape)
             selected = {
-                "w13_window_ranges": args.force_w13_ranges,
-                "w2_window_ranges": forced_planner.model.policy.w2_window_ranges,
                 "shape": forced_shape,
                 "makespan_ns": predicted,
-                "bridge": forced_planner.to_async_bridge(tasks),
+                "bridge": planner.to_async_bridge(tasks),
             }
+        selected_pairs = sorted(
+            set(zip(selected["bridge"]["task_w13_ranges"], selected["bridge"]["task_w2_ranges"], strict=True))
+        )
         candidates: list[dict] = [
             {
                 "key": "planner",
-                "ranges": (
-                    int(selected["w13_window_ranges"]),
-                    int(selected["w2_window_ranges"]),
-                ),
+                "task_range_pairs": selected_pairs,
                 "shape": tuple(selected["shape"]),
                 "predicted_ns": float(selected["makespan_ns"]),
                 "bridge": selected["bridge"],
@@ -234,23 +227,20 @@ def worker(args: argparse.Namespace) -> int:
         if args.noise_only:
             candidates.append({**candidates[0], "key": "planner_clone"})
         else:
-            for planner in planners:
-                assert planner.model.policy is not None
-                ranges = (
-                    planner.model.policy.w13_window_ranges,
-                    planner.model.policy.w2_window_ranges,
+            for shape in planner.shapes:
+                predicted, tasks = planner.score_shape(experts, shape)
+                bridge = planner.to_async_bridge(tasks)
+                candidates.append(
+                    {
+                        "key": f"shape:{','.join(map(str, shape))}",
+                        "task_range_pairs": sorted(
+                            set(zip(bridge["task_w13_ranges"], bridge["task_w2_ranges"], strict=True))
+                        ),
+                        "shape": tuple(shape),
+                        "predicted_ns": float(predicted),
+                        "bridge": bridge,
+                    }
                 )
-                for shape in planner.shapes:
-                    predicted, tasks = planner.score_shape(experts, shape)
-                    candidates.append(
-                        {
-                            "key": f"r13_{ranges[0]}_r2_{ranges[1]}:{','.join(map(str, shape))}",
-                            "ranges": ranges,
-                            "shape": tuple(shape),
-                            "predicted_ns": float(predicted),
-                            "bridge": planner.to_async_bridge(tasks),
-                        }
-                    )
 
         total_routes = sum(counts)
         if total_routes % args.top_k:
@@ -307,7 +297,7 @@ def worker(args: argparse.Namespace) -> int:
             "histogram": counts,
             "candidates": {
                 candidate["key"]: {
-                    "ranges": candidate["ranges"],
+                    "task_range_pairs": candidate["task_range_pairs"],
                     "shape": candidate["shape"],
                     "predicted_ns": candidate["predicted_ns"],
                     "samples_ns": samples[candidate["key"]],
@@ -321,9 +311,9 @@ def worker(args: argparse.Namespace) -> int:
 
 
 def run_pair(args: argparse.Namespace, mode: str) -> dict:
-    models = select_models(args.profile_dir, mode)
-    assert models[0].policy is not None
-    numa_nodes = models[0].policy.numa_nodes
+    model = select_model(args.profile_dir, mode)
+    assert model.policy is not None
+    numa_nodes = model.policy.numa_nodes
     if len(numa_nodes) != 2:
         raise ValueError("dual-rank validation requires two profiled NUMA nodes")
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -383,7 +373,6 @@ def run_pair(args: argparse.Namespace, mode: str) -> dict:
                     command.append("--noise-only")
                 if args.force_shape is not None:
                     command.extend(("--force-shape", args.force_shape))
-                    command.extend(("--force-w13-ranges", str(args.force_w13_ranges)))
                 if args.stage_trace_dir is not None:
                     trace_file = args.stage_trace_dir / f"{mode}_rank{rank}.log"
                     command.extend(("--stage-trace-file", str(trace_file)))
@@ -413,8 +402,8 @@ def run_pair(args: argparse.Namespace, mode: str) -> dict:
                 connections[rank] = connection
 
             case_count = len(load_histograms(args.routes_json, 12_288, 64))
-            shape_count = len(models[0].supported_shapes)
-            candidate_count = 2 if args.noise_only else 1 + 2 * shape_count
+            shape_count = len(model.supported_shapes)
+            candidate_count = 2 if args.noise_only else 1 + shape_count
             barriers = case_count * candidate_count * (args.warmup + args.runs)
             if args.stage_trace_dir is not None:
                 barriers += case_count
@@ -448,7 +437,10 @@ def run_pair(args: argparse.Namespace, mode: str) -> dict:
             paired = [max(left, right) for left, right in zip(entries[0]["samples_ns"], entries[1]["samples_ns"])]
             row = {
                 "key": key,
-                "rank_plans": [{"ranges": entry["ranges"], "shape": entry["shape"]} for entry in entries],
+                "rank_plans": [
+                    {"task_range_pairs": entry["task_range_pairs"], "shape": entry["shape"]}
+                    for entry in entries
+                ],
                 "predicted_ns": max(entry["predicted_ns"] for entry in entries),
                 "median_ns": statistics.median(paired),
                 "p10_ns": percentile(paired, 0.10),
@@ -486,7 +478,7 @@ def print_summary(result: dict) -> None:
         selected = case["selected"]
         best = case["best_fixed"]
         plans = "/".join(
-            f"R{tuple(plan['ranges'])}:{tuple(plan['shape'])}"
+            f"R{tuple(map(tuple, plan['task_range_pairs']))}:{tuple(plan['shape'])}"
             for plan in selected["rank_plans"]
         )
         print(
@@ -515,7 +507,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=20260711)
     parser.add_argument("--top-k", type=int, default=1)
     parser.add_argument("--force-shape")
-    parser.add_argument("--force-w13-ranges", type=int, choices=(1, 2), default=2)
     parser.add_argument(
         "--noise-only",
         action="store_true",

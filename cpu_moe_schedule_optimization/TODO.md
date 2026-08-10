@@ -25,12 +25,14 @@ independently bisectable:
   candidates.
 - [x] Carry exact per-task W13/W2 range counts through Plan V2, native W13/W2,
   and W2 owner-scatter.
-- [x] Canonicalize empirical profile/catalog and plan-cache identity on
-  `(w13_ranges, w2_ranges)`.
+- [x] Remove operator-wide ranges from empirical profile/query and plan-cache
+  identity; keep the measured pair only as calibration provenance.
 - [x] Remove public split flags, environment controls, byte-window runtime
   encodings, and legacy native fallback branches.
 - [x] Migrate calibration, benchmark, timeline, manifest, and schema callers to
   exact positive ranges; retain old profile filenames only as provenance.
+- [x] Delete the global `(1,1)/(2,1)` profile variants, joint range/shape
+  planner, plan-level operator options, and paired active calibration files.
 - [ ] Refresh both ARM machines' range-native calibration and full planner/E2E
   validation before treating the migration as closed.
 
@@ -56,9 +58,9 @@ independently bisectable:
 
 ## 2. Policy-aware exact-shape cost model
 
-- [x] Key `T_iso` and contention data by the complete profile policy: sharded F,
-  exact W13/W2 range identity, kernel identity, NUMA topology, and
-  concurrent-rank count.
+- [x] Key `T_iso` and contention data by the complete calibration domain:
+  sharded F, kernel identity, NUMA topology, and concurrent-rank count; retain
+  measured W13/W2 ranges only as table provenance.
 - [x] Use exact measured shape data by default instead of collapsing all shapes
   with the same active-expert count into one derate.
 - [x] Preserve once-per-call cost with authoritative full-call anchors rather
@@ -66,16 +68,16 @@ independently bisectable:
 - [x] Make route lookup M12-aware, including the M1/M2/M4/M8 tail kernels.
 - [x] Reject incompatible, ambiguous, or grid-mismatched profiles.
 
-## 3. Joint policy and schedule planner
+## 3. Shape planner and per-task stage policy
 
-- [x] Search measured `(stage_range_policy, core_shape)` rather than core shape
-  alone.
+- [x] Search `core_shape` only, then deterministically resolve each task's stage
+  ranges from `(routes, actual_task_threads)` before scoring and lowering.
 - [x] Use packed working-set bytes to prune candidates, while retaining measured
   latency as the objective.
 - [x] Return exact W13/W2 ranges as explicit plan fields with no process-global
   geometry control.
-- [x] Add explicit physical CPU sets, a policy-aware cache key, full bucketed
-  routing signatures, and confidence-aware tie breaking.
+- [x] Add explicit physical CPU sets, a calibration/policy-aware cache key, full
+  bucketed routing signatures, and confidence-aware tie breaking.
 
 ## 4. TP/EP layer evaluator
 

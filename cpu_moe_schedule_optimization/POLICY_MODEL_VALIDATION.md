@@ -1,4 +1,20 @@
-# Policy-aware MoE planner validation
+# Historical policy-aware MoE planner validation
+
+> This document records the 2026-07-13 four-profile experiment. Since v0.88,
+> `(R13,R2)` is no longer an operator-wide profile/planner dimension. The two
+> no-split files below were removed from the active catalog and remain available
+> only in Git history. Current validation uses one calibration per domain,
+> enumerates core shapes, and records the Plan V2 per-task range histogram.
+
+## Current v0.88 validation
+
+The range-variant removal passed the cost/profile/planner/native-planner suite
+on both local Arm64 and AmazonC5192Cores (`151 passed` on each). On the 192-core
+host, Plan V2, the exact-range ABI, timeline metrics, and fused-MoE tests passed
+`154` tests with one unsupported case skipped. A 96-core DSV4 real-routing plan
+resolved four task-local geometries in one plan and emitted no
+`operator_options`, confirming that the measured profile pair is no longer an
+operator-wide decision.
 
 ## Target and calibration
 
@@ -13,14 +29,15 @@
 - Source SHA256: `21853affada8848aaaea863c04e2701be2b77ba0411248ed16fcfccb40470ddf`.
 - Extension SHA256: `2d5fc0411c6f5e0887e9728037fe8249d4758e789e974ed4f30ffca33a77d1da`.
 
-The active schema-v2 calibration consists of four exact-policy profiles:
+At the time of this experiment, schema-v2 calibration consisted of four
+exact-policy profiles:
 
 - `contention_async_amazon_c5_64c_tp2_sve_F1024_splitw13_v2_r1_20260713.json`
 - `contention_async_amazon_c5_64c_tp2_sve_F1024_nosplitw13_v2_r1_20260713.json`
 - `contention_async_amazon_c5_64c_ep2_sve_F2048_splitw13_v2_r1_20260713.json`
 - `contention_async_amazon_c5_64c_ep2_sve_F2048_nosplitw13_v2_r1_20260713.json`
 
-The split and non-split tables use identical grids:
+Those historical split and non-split tables used identical grids:
 
 - isolated routes: `1,2,4,8,12,24,48,96,192,384,768,1536,2040`;
 - contention routes: `1,2,4,8,12,24,48,192,768,2040`;
@@ -33,10 +50,11 @@ describe two concurrently active ranks; they are not single-rank profiles.
 
 ## Validation workloads
 
-`validate_policy_planner.py` measures every core shape under both W13 policies,
-plus an independent execution of the planner-selected plan. The 2026-07-13
-result uses two warmups and ten timed runs for each candidate and contains three
-workloads:
+The historical `validate_policy_planner.py` run measured every core shape under
+both W13 policies, plus an independent execution of the planner-selected plan.
+The current tool measures every core shape under one canonical calibration and
+diagnoses the resolved per-task ranges. The 2026-07-13 result used two warmups
+and ten timed runs for each candidate and contained three workloads:
 
 - `uniform`: equal routes per expert;
 - `hotspot`: four 768-route experts, twelve 384-route experts, and 48 96-route
@@ -54,9 +72,9 @@ routes respectively.
 
 ## Exhaustive results
 
-Regret is computed from measured medians against the fastest fixed policy and
-shape. A negative raw delta caused by repeated-measurement noise is reported as
-zero regret.
+For this historical table, regret was computed from measured medians against
+the fastest fixed policy and shape. A negative raw delta caused by
+repeated-measurement noise was reported as zero regret.
 
 | Mode | Routing | Selected rank plans | Predicted ms | Actual ms | Best fixed ms | Regret | Prediction error |
 | --- | --- | --- | ---: | ---: | ---: | ---: | ---: |
@@ -67,7 +85,9 @@ zero regret.
 | EP2 | hotspot | R(2,1):`32` / R(2,1):`32` | 63.340 | 60.671 | 59.659 | 1.70% | +4.40% |
 | EP2 | trace | R(2,1):`16,16` / R(2,1):`16,16` | 45.055 | 44.694 | 44.680 | 0.03% | +0.81% |
 
-`R(2,1)` means exact `R13=2,R2=1`. The maximum selected-plan regret is 1.98%. Prediction error
+`R(2,1)` identifies the measurement/execution geometry used by this historical
+run; it is not a current planner choice. The maximum selected-plan regret was
+1.98%. Prediction error
 ranges from -2.93% to +4.40%. Separate 30-sample repeats show an approximately
 1% practical noise floor, so sub-percent candidate ordering is not treated as
 significant.

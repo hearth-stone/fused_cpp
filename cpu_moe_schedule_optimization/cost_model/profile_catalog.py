@@ -9,7 +9,43 @@ from typing import Iterable
 
 
 class ProfileCompatibilityError(ValueError):
-    """Raised when no exact calibration profile matches a requested policy."""
+    """Raised when no exact calibration profile matches a requested domain."""
+
+
+@dataclass(frozen=True)
+class ProfileMeasurementGeometry:
+    """Exact stage geometry used while collecting one calibration profile.
+
+    This is measurement provenance, not a planner policy. Runtime stage ranges
+    are resolved per task after the planner has selected a team width.
+    """
+
+    w13_ranges: int
+    w2_ranges: int
+
+    @classmethod
+    def from_payload(cls, payload: dict) -> "ProfileMeasurementGeometry":
+        kernel = payload["kernel"]
+        expert = payload["expert_shape"]
+        try:
+            w13_ranges = int(kernel["w13_window_ranges"])
+            w2_ranges = int(kernel["w2_window_ranges"])
+        except KeyError as error:
+            raise ProfileCompatibilityError(
+                "schema-v2 profile requires measured W13/W2 stage ranges"
+            ) from error
+        n_tile = int(kernel["backend_n_tile"])
+        max_w13_ranges = (2 * int(expert["intermediate_size"])) // n_tile
+        max_w2_ranges = int(expert["hidden_size"]) // n_tile
+        if not (1 <= w13_ranges <= max_w13_ranges):
+            raise ProfileCompatibilityError(
+                f"kernel.w13_window_ranges must be in [1, {max_w13_ranges}]"
+            )
+        if not (1 <= w2_ranges <= max_w2_ranges):
+            raise ProfileCompatibilityError(
+                f"kernel.w2_window_ranges must be in [1, {max_w2_ranges}]"
+            )
+        return cls(w13_ranges=w13_ranges, w2_ranges=w2_ranges)
 
 
 @dataclass(frozen=True)
@@ -26,8 +62,6 @@ class ProfilePolicy:
     m_tail_policy: str
     activation: str
     dtype: str
-    w13_window_ranges: int
-    w2_window_ranges: int
     measurement_experts: int
     cores_per_rank: int
     concurrent_ranks: int
@@ -62,24 +96,6 @@ class ProfilePolicy:
         extension_sha = kernel.get("extension_sha256")
         if not source_sha or not extension_sha:
             raise ProfileCompatibilityError("schema-v2 profile requires source and extension hashes")
-        try:
-            w13_window_ranges = int(kernel["w13_window_ranges"])
-            w2_window_ranges = int(kernel["w2_window_ranges"])
-        except KeyError as error:
-            raise ProfileCompatibilityError(
-                "schema-v2 profile requires exact W13/W2 stage ranges"
-            ) from error
-        n_tile = int(kernel["backend_n_tile"])
-        max_w13_ranges = (2 * int(expert["intermediate_size"])) // n_tile
-        max_w2_ranges = int(expert["hidden_size"]) // n_tile
-        if not (1 <= w13_window_ranges <= max_w13_ranges):
-            raise ProfileCompatibilityError(
-                f"kernel.w13_window_ranges must be in [1, {max_w13_ranges}]"
-            )
-        if not (1 <= w2_window_ranges <= max_w2_ranges):
-            raise ProfileCompatibilityError(
-                f"kernel.w2_window_ranges must be in [1, {max_w2_ranges}]"
-            )
         return cls(
             mode=str(parallelism["mode"]),
             degree=int(parallelism["degree"]),
@@ -93,8 +109,6 @@ class ProfilePolicy:
             m_tail_policy=str(kernel.get("m_tail_policy", "static_bucketed")),
             activation=str(expert["activation"]),
             dtype=str(expert["dtype"]),
-            w13_window_ranges=w13_window_ranges,
-            w2_window_ranges=w2_window_ranges,
             measurement_experts=int(expert["measurement_experts"]),
             cores_per_rank=int(target["cores_per_rank"]),
             concurrent_ranks=int(target["concurrent_ranks"]),
@@ -116,7 +130,7 @@ class ProfilePolicy:
                 mismatches[field.name] = (actual, expected)
         return mismatches
 
-    def key_without_kernel_policy(self) -> tuple[object, ...]:
+    def identity_key(self) -> tuple[object, ...]:
         return (
             self.mode,
             self.degree,
@@ -140,9 +154,6 @@ class ProfilePolicy:
             self.extension_sha256,
         )
 
-    def kernel_policy_key(self) -> tuple[object, ...]:
-        return ("stage_ranges", self.w13_window_ranges, self.w2_window_ranges)
-
 
 @dataclass(frozen=True)
 class ProfileQuery:
@@ -158,8 +169,6 @@ class ProfileQuery:
     m_tail_policy: str | None = None
     activation: str | None = None
     dtype: str | None = None
-    w13_window_ranges: int | None = None
-    w2_window_ranges: int | None = None
     measurement_experts: int | None = None
     cores_per_rank: int | None = None
     concurrent_ranks: int | None = None
@@ -175,6 +184,7 @@ class ProfileRecord:
     path: Path
     payload: dict
     policy: ProfilePolicy
+    measurement_geometry: ProfileMeasurementGeometry
 
 
 class ProfileCatalog:
@@ -182,6 +192,17 @@ class ProfileCatalog:
         self.records = tuple(records)
         if not self.records:
             raise ProfileCompatibilityError("profile catalog is empty")
+        paths_by_identity: dict[tuple[object, ...], Path] = {}
+        for record in self.records:
+            identity = record.policy.identity_key()
+            previous = paths_by_identity.get(identity)
+            if previous is not None:
+                raise ProfileCompatibilityError(
+                    "duplicate calibration domain: "
+                    f"{previous.name}, {record.path.name}; stage measurement geometry "
+                    "is provenance and cannot create planner variants"
+                )
+            paths_by_identity[identity] = record.path
 
     @classmethod
     def from_paths(cls, paths: Iterable[str | Path]) -> "ProfileCatalog":
@@ -189,7 +210,14 @@ class ProfileCatalog:
         for raw_path in paths:
             path = Path(raw_path)
             payload = json.loads(path.read_text(encoding="utf-8"))
-            records.append(ProfileRecord(path, payload, ProfilePolicy.from_payload(payload)))
+            records.append(
+                ProfileRecord(
+                    path,
+                    payload,
+                    ProfilePolicy.from_payload(payload),
+                    ProfileMeasurementGeometry.from_payload(payload),
+                )
+            )
         return cls(records)
 
     @classmethod
@@ -206,72 +234,3 @@ class ProfileCatalog:
         raise ProfileCompatibilityError(
             "profile query is ambiguous: " + ", ".join(record.path.name for record in matches)
         )
-
-    def stage_range_pair(self, query: ProfileQuery) -> tuple[ProfileRecord, ProfileRecord]:
-        """Return the canonical W13 R=1/R=2 endpoints for compatibility tests."""
-        if any(
-            value is not None
-            for value in (query.w13_window_ranges, query.w2_window_ranges)
-        ):
-            raise ValueError("stage_range_pair query must leave kernel range policy unspecified")
-        base_query = query.__dict__
-        one_range = self.select(
-            ProfileQuery(**{**base_query, "w13_window_ranges": 1, "w2_window_ranges": 1})
-        )
-        two_range = self.select(
-            ProfileQuery(**{**base_query, "w13_window_ranges": 2, "w2_window_ranges": 1})
-        )
-        if one_range.policy.key_without_kernel_policy() != two_range.policy.key_without_kernel_policy():
-            raise ProfileCompatibilityError("R=1/R=2 profiles are not a stage-range pair")
-        if self._grid_signature(one_range.payload) != self._grid_signature(two_range.payload):
-            raise ProfileCompatibilityError("R=1/R=2 profiles use different route/thread/shape grids")
-        return one_range, two_range
-
-    def policy_variants(self, query: ProfileQuery) -> tuple[ProfileRecord, ...]:
-        """Return every uniquely measured stage-range variant for one profile domain."""
-        if any(
-            value is not None
-            for value in (query.w13_window_ranges, query.w2_window_ranges)
-        ):
-            raise ValueError("policy_variants query must leave kernel range policy unspecified")
-        matches = [record for record in self.records if not record.policy.mismatch(query)]
-        if not matches:
-            details = {record.path.name: record.policy.mismatch(query) for record in self.records}
-            raise ProfileCompatibilityError(f"no stage-range profiles match {query}; mismatches={details}")
-        base_keys = {record.policy.key_without_kernel_policy() for record in matches}
-        if len(base_keys) != 1:
-            raise ProfileCompatibilityError("stage-range profile query is ambiguous outside kernel policy")
-        baseline_grid = self._grid_signature(matches[0].payload)
-        variants: dict[tuple[object, ...], ProfileRecord] = {}
-        for record in matches:
-            variant_key = record.policy.kernel_policy_key()
-            if variant_key in variants:
-                raise ProfileCompatibilityError(f"duplicate kernel policy profile: {variant_key}")
-            if self._grid_signature(record.payload) != baseline_grid:
-                raise ProfileCompatibilityError(
-                    f"stage-range profile {record.path.name} uses a different route/thread/shape grid"
-                )
-            variants[variant_key] = record
-        return tuple(
-            sorted(
-                variants.values(),
-                key=lambda record: (
-                    record.policy.w13_window_ranges,
-                    record.policy.w2_window_ranges,
-                ),
-            )
-        )
-
-    @staticmethod
-    def _grid_signature(payload: dict) -> tuple[object, ...]:
-        isolated = tuple(sorted((int(entry["routes"]), int(entry["threads"])) for entry in payload["isolated"]))
-        contention = tuple(
-            sorted(
-                (
-                    tuple(sorted(map(int, entry["shape"]), reverse=True)),
-                    int(entry["routes"]),
-                )
-                for entry in payload["entries"]
-            )
-        )
-        return isolated, contention

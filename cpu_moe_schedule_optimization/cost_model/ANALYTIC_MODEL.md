@@ -529,8 +529,8 @@ model = AnalyticMoeCostModel(
     mode="tp",
     degree=4,
     concurrent_ranks=2,
-    w13_ranges=2,
-    w2_ranges=1,
+    calibration_w13_ranges=2,
+    calibration_w2_ranges=1,
 )
 planner = PlannedMoE(model, num_cores=96)
 plan = planner.plan_spec_for(route_counts)

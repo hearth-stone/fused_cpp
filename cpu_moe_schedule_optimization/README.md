@@ -8,41 +8,42 @@
 
 当前阶段仅建立研究文档和工程边界。
 
-## 当前 policy-aware 闭环
+## 当前 calibration-domain 闭环
 
-Schema v2 路径按完整策略选择表：`TP/EP degree + H/F + global/local
-experts + SVE implementation/tail policy + SVE tile + exact (R13,R2) +
-NUMA/CPU set + LLC + source/binary hash`。不同 range identity 不共用
-derate，也不跨 F 或拓扑做隐式 nearest-profile fallback。
+Schema v2 路径按完整校准域选择表：`TP/EP degree + H/F + global/local
+experts + SVE implementation/tail policy + SVE tile + NUMA/CPU set + LLC +
+source/binary hash`。profile 记录的 `(R13,R2)` 只描述采样几何，不参与域
+identity；同一域只允许一张活动表，也不跨 F 或拓扑做隐式 nearest-profile
+fallback。
 
-`tp_vs_ep_model.py --sve-implementation auto` 优先使用同一
-`jit/xbyak_exact_m` implementation 下所有非空、网格一致的实测 range
-identity；没有可用 JIT profile 时才整体回退到 `asm/static_bucketed`。
-它不会把 JIT 和 asm profile 拼成一个候选集合。需要可复现实验时可显式
-指定 `jit` 或 `asm`，此时缺表直接报错。
+`tp_vs_ep_model.py --sve-implementation auto` 优先使用唯一匹配的
+`jit/xbyak_exact_m` calibration；没有可用 JIT profile 时才整体回退到
+`asm/static_bucketed`。它不会拼接 JIT/asm 或多个 range profile。需要可复现
+实验时可显式指定 `jit` 或 `asm`，此时缺表直接报错。
 
 runtime 只接受正整数 `w13_ranges/w2_ranges`。解析 stage-window policy 可以
-把 cache byte budget 量化为 exact range，但 byte target 不进入公开 ABI、Plan
-或 profile identity。planner 联合搜索有独立 schema-v2 数据的
-`((R13,R2), core_shape)`，不会用另一 range identity 的表评分。
+把 cache byte budget 量化为每任务 exact range，但 byte target 不进入公开 ABI、
+Plan 或 profile identity。planner 只搜索 `core_shape`，在 task team width 确定后
+由 `g(routes, threads)` 生成 Plan V2 的逐 task range；不存在全局
+`(1,1)/(2,1)` 搜索。
 
 当前实现入口：
 
 - `cost_model/profile_contention_async_dual_rank.py`：两个 NUMA-local rank
   同步采样；isolated 使用 8 个连续冷权重，contention 使用全部本地专家，
   mixed-width shape 使用与 planner 相同的 LPT assignment。
-- `cost_model/profile_catalog.py`：严格 exact-range profile identity、
-  measured variants 与 grid 校验。
+- `cost_model/profile_catalog.py`：严格 calibration-domain identity、单活动
+  profile 与 measurement-geometry 校验。
 - `cost_model/phase_model.py`：M12 bulk/tail、精确 full-call anchor，以及按
   W13/W2 exact range 瞬时 packed working set 驱动的 stage-aware fallback。
-- `planners/interval_planner.py` / `planned_moe.py`：联合搜索
-  `((R13,R2), core_shape)`，返回显式 CPU 集与 operator option，并按
-  完整 routing bucket histogram 和 kernel policy identity 缓存。
+- `planners/interval_planner.py` / `planned_moe.py`：搜索 `core_shape`，随后
+  生成逐 task range 和显式 CPU 集，并按完整 routing bucket histogram、
+  calibration identity 与 task-stage policy 缓存。
 - `planners/tp_vs_ep_model.py`：当前按 rank-local histogram 独立预测并取全局
   最大 compute，再加上通用分层 all-reduce/all-to-all 模型；尚未建模短 rank
   完成后长 rank 的争用释放。
-- `planners/validate_policy_planner.py`：双 rank 枚举实测所有 policy/shape，
-  报告预测误差和真实 regret；可用 `--routes-json` 输入真实路由直方图。
+- `planners/validate_policy_planner.py`：双 rank 枚举实测 shape，并记录每任务
+  range 分布、预测误差和真实 regret；可用 `--routes-json` 输入真实路由直方图。
 - `POLICY_MODEL_VALIDATION.md`：AWS 64-core TP2/EP2 的 2026-07-13 校准配置、
   synthetic/真实路由 regret、EP2 hotspot 诊断和通信模型估计。
 

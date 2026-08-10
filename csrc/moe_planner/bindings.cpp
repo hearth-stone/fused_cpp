@@ -226,8 +226,8 @@ IntervalCostModelConfig parse_interval_cost_model(const py::dict& payload) {
   result.local_experts = required_value<int>(payload, "local_experts");
   result.profile_runs = required_value<int>(payload, "profile_runs");
   result.measurement_experts = required_value<int>(payload, "measurement_experts");
-  result.w13_window_ranges = required_value<int>(payload, "w13_window_ranges");
-  result.w2_window_ranges = required_value<int>(payload, "w2_window_ranges");
+  result.calibration_w13_ranges = required_value<int>(payload, "calibration_w13_ranges");
+  result.calibration_w2_ranges = required_value<int>(payload, "calibration_w2_ranges");
   result.w13_chunk_bytes = required_value<int64_t>(payload, "w13_chunk_bytes");
   result.w2_chunk_bytes = required_value<int64_t>(payload, "w2_chunk_bytes");
   result.max_stage_bytes = required_value<int64_t>(payload, "max_stage_bytes");

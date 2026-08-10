@@ -352,7 +352,7 @@ class AnalyticMachineCalibration:
 
 @dataclass(frozen=True)
 class AnalyticPolicy:
-    """Planner-visible policy identity without measured profile hashes."""
+    """Planner-visible machine and kernel domain identity."""
 
     machine_id: str
     mode: str
@@ -367,14 +367,12 @@ class AnalyticPolicy:
     m_tail_policy: str
     activation: str
     dtype: str
-    w13_window_ranges: int
-    w2_window_ranges: int
     measurement_experts: int
     cores_per_rank: int
     concurrent_ranks: int
     llc_bytes_per_rank: int
 
-    def key_without_kernel_policy(self) -> tuple[object, ...]:
+    def identity_key(self) -> tuple[object, ...]:
         return (
             "analytic",
             self.machine_id,
@@ -394,10 +392,6 @@ class AnalyticPolicy:
             self.concurrent_ranks,
             self.llc_bytes_per_rank,
         )
-
-    def kernel_policy_key(self) -> tuple[object, ...]:
-        return ("stage_ranges", self.w13_window_ranges, self.w2_window_ranges)
-
 
 def analytic_candidate_shapes(cores: int, widths: Iterable[int]) -> tuple[tuple[int, ...], ...]:
     """Generate homogeneous and two-width static interval shapes.
@@ -663,8 +657,8 @@ class AnalyticMoeCostModel:
         backend_n_tile: int | None = None,
         activation: str = "silu",
         dtype: str = "bf16",
-        w13_ranges: int = 1,
-        w2_ranges: int = 1,
+        calibration_w13_ranges: int = 1,
+        calibration_w2_ranges: int = 1,
         exact_m: bool = True,
         down_output_element_bytes: int = 2,
         supported_widths: Sequence[int] | None = None,
@@ -693,8 +687,8 @@ class AnalyticMoeCostModel:
             raise ValueError(f"analytical SVE model supports only dtype='bf16', got {dtype!r}")
         if down_output_element_bytes <= 0:
             raise ValueError("down_output_element_bytes must be positive")
-        if min(w13_ranges, w2_ranges) <= 0:
-            raise ValueError("w13_ranges and w2_ranges must be positive")
+        if min(calibration_w13_ranges, calibration_w2_ranges) <= 0:
+            raise ValueError("calibration stage ranges must be positive")
 
         self.hidden_size = int(hidden_size)
         self.intermediate_size = int(intermediate_size)
@@ -706,16 +700,16 @@ class AnalyticMoeCostModel:
             k=self.hidden_size,
             n=2 * self.intermediate_size,
             n_tile=resolved_n_tile,
-            ranges=int(w13_ranges),
+            ranges=int(calibration_w13_ranges),
         )
         self._w2_geometry = stage_weight_range_geometry(
             k=self.intermediate_size,
             n=self.hidden_size,
             n_tile=resolved_n_tile,
-            ranges=int(w2_ranges),
+            ranges=int(calibration_w2_ranges),
         )
-        self.w13_window_ranges = self._w13_geometry.ranges
-        self.w2_window_ranges = self._w2_geometry.ranges
+        self.calibration_w13_ranges = self._w13_geometry.ranges
+        self.calibration_w2_ranges = self._w2_geometry.ranges
         self.w13_chunk_bytes = self._w13_geometry.max_range_bytes
         self.w2_chunk_bytes = self._w2_geometry.max_range_bytes
         self.w2_bytes = self.w2_chunk_bytes
@@ -754,8 +748,6 @@ class AnalyticMoeCostModel:
             m_tail_policy="xbyak_exact_m" if exact_m else "static_bucketed",
             activation=str(activation),
             dtype=str(dtype),
-            w13_window_ranges=self.w13_window_ranges,
-            w2_window_ranges=self.w2_window_ranges,
             measurement_experts=0,
             cores_per_rank=self.calibration.cores_per_rank,
             concurrent_ranks=int(concurrent_ranks),
@@ -826,14 +818,14 @@ class AnalyticMoeCostModel:
             n=2 * self.intermediate_size,
             n_tile=self.policy.backend_n_tile,
             target_bytes=max(int(w13_target), 0),
-            fallback_ranges=self.w13_window_ranges,
+            fallback_ranges=self.calibration_w13_ranges,
         )
         w2 = stage_weight_window_geometry(
             k=self.intermediate_size,
             n=self.hidden_size,
             n_tile=self.policy.backend_n_tile,
             target_bytes=max(int(w2_target), 0),
-            fallback_ranges=self.w2_window_ranges,
+            fallback_ranges=self.calibration_w2_ranges,
         )
         return w13, w2
 
@@ -927,12 +919,12 @@ class AnalyticMoeCostModel:
             logical = work.w13
             k = self.hidden_size
             n = 2 * self.intermediate_size
-            fallback_ranges = self.w13_window_ranges
+            fallback_ranges = self.calibration_w13_ranges
         else:
             logical = work.w2
             k = self.intermediate_size
             n = self.hidden_size
-            fallback_ranges = self.w2_window_ranges
+            fallback_ranges = self.calibration_w2_ranges
         geometry = stage_weight_window_geometry(
             k=k,
             n=n,

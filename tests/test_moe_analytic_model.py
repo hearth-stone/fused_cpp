@@ -99,8 +99,8 @@ def _model(
         intermediate_size=32,
         global_experts=8,
         local_experts=8,
-        w13_ranges=w13_ranges,
-        w2_ranges=w2_ranges,
+        calibration_w13_ranges=w13_ranges,
+        calibration_w2_ranges=w2_ranges,
     )
 
 
@@ -371,7 +371,7 @@ def test_uneven_weight_ranges_use_per_range_traffic() -> None:
         intermediate_size=32,
         global_experts=8,
         local_experts=8,
-        w13_ranges=3,
+        calibration_w13_ranges=3,
     )
 
     prediction = model.predict_expert(routes=24, threads=3)
@@ -895,15 +895,20 @@ def test_holdout_validator_rejects_wrong_core_topology() -> None:
         build_validation_report(_calibration(), profile)
 
 
-def test_policy_runtime_distinguishes_variants_sharing_one_machine_file() -> None:
+def test_runtime_uses_one_calibration_and_emits_only_per_task_ranges() -> None:
     calibration = _calibration()
-    two_ranges = _model(calibration)
-    one_range = _model(calibration, w13_ranges=1)
-    runtime = PlannedMoE((two_ranges, one_range), num_cores=8)
+    model = _model(calibration)
+    with pytest.raises(ValueError, match="one calibration model"):
+        PlannedMoE((model, _model(calibration, w13_ranges=1)), num_cores=8)
+
+    runtime = PlannedMoE(model, num_cores=8)
     experts = [(expert, 24) for expert in range(8)]
 
     first = runtime.plan_spec_for(experts)
     cached = runtime.plan_spec_for(experts)
 
-    assert first["operator_options"] == cached["operator_options"]
-    assert first["operator_options"]["w13_ranges"] == first["policy"]["w13_window_ranges"]
+    assert "operator_options" not in first
+    assert "w13_window_ranges" not in first["policy"]
+    assert "w2_window_ranges" not in first["policy"]
+    assert first["bridge"]["task_w13_ranges"] == cached["bridge"]["task_w13_ranges"]
+    assert first["bridge"]["task_w2_ranges"] == cached["bridge"]["task_w2_ranges"]

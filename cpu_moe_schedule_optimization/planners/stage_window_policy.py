@@ -37,8 +37,6 @@ class StageWindowProfilePolicy(Protocol):
     m_tail_policy: str
     activation: str
     dtype: str
-    w13_window_ranges: int
-    w2_window_ranges: int
     measurement_experts: int
     cores_per_rank: int
     concurrent_ranks: int
@@ -464,8 +462,6 @@ def default_task_stage_window_policy(
         "m_tail_policy": "xbyak_exact_m",
         "activation": "silu",
         "dtype": "bf16",
-        "w13_window_ranges": 2,
-        "w2_window_ranges": 1,
         "measurement_experts": 256,
         "cores_per_rank": 96,
         "concurrent_ranks": 2,

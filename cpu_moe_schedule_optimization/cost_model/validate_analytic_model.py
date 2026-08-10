@@ -60,8 +60,8 @@ def _model_from_profile(
         backend_n_tile=int(kernel["backend_n_tile"]),
         activation=str(shape["activation"]),
         dtype=str(shape["dtype"]),
-        w13_ranges=int(kernel["w13_window_ranges"]),
-        w2_ranges=int(kernel["w2_window_ranges"]),
+        calibration_w13_ranges=int(kernel["w13_window_ranges"]),
+        calibration_w2_ranges=int(kernel["w2_window_ranges"]),
         exact_m=exact_m,
         down_output_element_bytes=down_output_element_bytes,
     )
@@ -183,8 +183,8 @@ def build_validation_report(
         "model_policy": {
             "hidden_size": model.hidden_size,
             "intermediate_size": model.intermediate_size,
-            "w13_window_ranges": model.w13_window_ranges,
-            "w2_window_ranges": model.w2_window_ranges,
+            "calibration_w13_ranges": model.calibration_w13_ranges,
+            "calibration_w2_ranges": model.calibration_w2_ranges,
             "supported_widths": list(model.supported_widths),
         },
         "isolated": {

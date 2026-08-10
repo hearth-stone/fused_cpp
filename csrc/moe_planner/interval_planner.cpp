@@ -487,8 +487,8 @@ struct NativeIntervalPlanner::Impl {
     const IntervalStageWindowEntry* entry = FindStageWindow(routes, threads);
     if (entry == nullptr) {
       return {
-          config.w13_window_ranges,
-          config.w2_window_ranges,
+          config.calibration_w13_ranges,
+          config.calibration_w2_ranges,
           config.w13_chunk_bytes,
           config.w2_chunk_bytes,
       };

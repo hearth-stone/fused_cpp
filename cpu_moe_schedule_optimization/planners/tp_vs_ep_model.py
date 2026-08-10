@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from collections import Counter
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -15,9 +16,11 @@ from phase_model import ContentionCostModel  # noqa: E402
 from profile_catalog import (  # noqa: E402
     ProfileCatalog,
     ProfileCompatibilityError,
+    ProfilePolicy,
     ProfileQuery,
 )
-from interval_planner import PolicyAwarePlanner  # noqa: E402
+from interval_planner import IntervalPlanner  # noqa: E402
+from stage_window_policy import default_task_stage_window_policy  # noqa: E402
 
 
 @dataclass(frozen=True)
@@ -73,8 +76,7 @@ class RankCompute:
     rank: int
     routes: int
     active_experts: int
-    w13_ranges: int
-    w2_ranges: int
+    stage_range_histogram: tuple[tuple[int, int, int], ...]
     shape: tuple[int, ...]
     predicted_ms: float
 
@@ -152,14 +154,14 @@ class ParallelLayerEvaluator:
             raise ValueError("m_tail_policy cannot override automatic SVE profile selection")
         self.m_tail_policy = None if m_tail_policy is None else str(m_tail_policy)
 
-    def _models(
+    def _model(
         self,
         mode: str,
         intermediate_size: int,
         local_experts: int,
         *,
         concurrent_ranks: int | None = None,
-    ) -> list[ContentionCostModel]:
+    ) -> ContentionCostModel:
         if concurrent_ranks is None:
             concurrent_ranks = self.topology.ranks
         variants = (
@@ -192,28 +194,29 @@ class ParallelLayerEvaluator:
                 concurrent_ranks=concurrent_ranks,
             )
             try:
-                records = self.catalog.policy_variants(query)
+                record = self.catalog.select(query)
             except ProfileCompatibilityError as error:
                 errors.append(f"{implementation}/{tail_policy}: {error}")
                 continue
-            return [ContentionCostModel(record.path, expected_policy=query) for record in records]
-        raise ProfileCompatibilityError("no compatible SVE stage-range profiles matched; " + "; ".join(errors))
+            return ContentionCostModel(record.path, expected_policy=query)
+        raise ProfileCompatibilityError("no compatible SVE calibration profile matched; " + "; ".join(errors))
 
     @staticmethod
-    def _selected_model(models: list[ContentionCostModel], plan: dict[str, object]) -> ContentionCostModel:
-        selected = (
-            "stage_ranges",
-            int(plan["w13_window_ranges"]),
-            int(plan["w2_window_ranges"]),
+    def _planner(
+        model: ContentionCostModel,
+        cores: int,
+        cpu_ids: tuple[int, ...],
+        *,
+        execution_policy_profile: ProfilePolicy | None = None,
+    ) -> IntervalPlanner:
+        profile = model.policy if execution_policy_profile is None else execution_policy_profile
+        policy = default_task_stage_window_policy(profile, num_cores=cores, cpu_ids=cpu_ids)
+        return IntervalPlanner(
+            model,
+            cores,
+            cpu_ids=cpu_ids,
+            task_stage_window_policy=policy,
         )
-        for model in models:
-            policy = model.policy
-            if policy is None:
-                continue
-            candidate = policy.kernel_policy_key()
-            if candidate == selected:
-                return model
-        raise ProfileCompatibilityError(f"selected planner policy has no matching model: {selected}")
 
     @staticmethod
     def _model_tasks(plan: dict[str, object]) -> list[tuple[int, int, list[int]]]:
@@ -223,32 +226,20 @@ class ParallelLayerEvaluator:
         ]
 
     @staticmethod
-    def _matching_companion_grids(
-        concurrent_models: list[ContentionCostModel],
-        single_rank_models: list[ContentionCostModel],
+    def _matching_companion_grid(
+        concurrent_model: ContentionCostModel,
+        single_rank_model: ContentionCostModel,
     ) -> bool:
-        if len(concurrent_models) != len(single_rank_models):
+        policy = concurrent_model.policy
+        companion = single_rank_model.policy
+        if policy is None or companion is None:
             return False
-        singles = {
-            model.policy.kernel_policy_key(): model
-            for model in single_rank_models
-            if model.policy is not None
-        }
-        for model in concurrent_models:
-            policy = model.policy
-            if policy is None:
-                return False
-            companion = singles.get(policy.kernel_policy_key())
-            if companion is None or companion.policy is None:
-                return False
-            if (
-                companion.policy.source_sha256 != policy.source_sha256
-                or companion.policy.extension_sha256 != policy.extension_sha256
-                or companion._iso.keys() != model._iso.keys()
-                or companion.supported_shapes != model.supported_shapes
-            ):
-                return False
-        return True
+        return (
+            companion.source_sha256 == policy.source_sha256
+            and companion.extension_sha256 == policy.extension_sha256
+            and single_rank_model._iso.keys() == concurrent_model._iso.keys()
+            and single_rank_model.supported_shapes == concurrent_model.supported_shapes
+        )
 
     def _compute(
         self,
@@ -261,14 +252,14 @@ class ParallelLayerEvaluator:
             raise ValueError("rank histogram count must match topology ranks")
         if any(len(histogram) != local_experts for histogram in rank_histograms):
             raise ValueError("all rank histograms must have the same expert count")
-        models = self._models(mode, intermediate_size, local_experts)
-        policy = models[0].policy
+        model = self._model(mode, intermediate_size, local_experts)
+        policy = model.policy
         if policy is None or len(policy.cpu_ids_by_rank) != self.topology.ranks:
             raise ValueError("profile does not contain one physical CPU set per rank")
-        single_rank_models: list[ContentionCostModel] | None = None
+        single_rank_model: ContentionCostModel | None = None
         if self.topology.ranks > 1:
             try:
-                single_rank_models = self._models(
+                single_rank_model = self._model(
                     mode,
                     intermediate_size,
                     local_experts,
@@ -277,9 +268,9 @@ class ParallelLayerEvaluator:
             except ProfileCompatibilityError:
                 # Old profile sets remain usable, but retain the conservative
                 # all-ranks-active estimate until companion profiles exist.
-                single_rank_models = None
-            if single_rank_models is not None and not self._matching_companion_grids(models, single_rank_models):
-                single_rank_models = None
+                single_rank_model = None
+            if single_rank_model is not None and not self._matching_companion_grid(model, single_rank_model):
+                single_rank_model = None
 
         active_rank_count = sum(any(histogram) for histogram in rank_histograms)
         rank_plans: list[tuple[int, list[tuple[int, int]], dict[str, object], ContentionCostModel]] = []
@@ -292,11 +283,12 @@ class ParallelLayerEvaluator:
             cpu_ids = policy.cpu_ids_by_rank[rank]
             if len(cpu_ids) != self.cores_per_rank:
                 raise ValueError("profile CPU set does not match cores_per_rank")
-            planning_models = single_rank_models if single_rank_models is not None and active_rank_count == 1 else models
-            planner = PolicyAwarePlanner(
-                planning_models,
+            planning_model = single_rank_model if single_rank_model is not None and active_rank_count == 1 else model
+            planner = self._planner(
+                planning_model,
                 self.cores_per_rank,
-                cpu_ids=cpu_ids,
+                cpu_ids,
+                execution_policy_profile=model.policy,
             )
             plan = planner.plan(experts)
             rank_plans.append(
@@ -304,11 +296,11 @@ class ParallelLayerEvaluator:
                     rank,
                     experts,
                     plan,
-                    self._selected_model(planning_models, plan),
+                    planner.model,
                 )
             )
 
-        use_lifetime_switch = single_rank_models is not None and len(rank_plans) > 1
+        use_lifetime_switch = single_rank_model is not None and len(rank_plans) > 1
         completion_ns: dict[int, float] = {
             rank: (
                 model.dag_makespan(self._model_tasks(plan))
@@ -318,12 +310,17 @@ class ParallelLayerEvaluator:
             for rank, _, plan, model in rank_plans
         }
         if use_lifetime_switch:
-            assert single_rank_models is not None
+            assert single_rank_model is not None
             ordered = sorted(rank_plans, key=lambda item: completion_ns[item[0]])
             last_rank, _, last_plan, last_model = ordered[-1]
             switch_ns = completion_ns[ordered[-2][0]]
             if completion_ns[last_rank] > switch_ns:
-                standalone_model = self._selected_model(single_rank_models, last_plan)
+                task_policy = last_model.task_stage_window_policy
+                standalone_model = (
+                    single_rank_model.with_task_stage_window_policy(task_policy)
+                    if task_policy is not None
+                    else single_rank_model
+                )
                 completion_ns[last_rank] = last_model.dag_makespan_with_model_switch(
                     self._model_tasks(last_plan),
                     switch_ns,
@@ -334,16 +331,21 @@ class ParallelLayerEvaluator:
         rank_results: list[RankCompute] = []
         for rank, histogram in enumerate(rank_histograms):
             if rank in empty_ranks:
-                rank_results.append(RankCompute(rank, 0, 0, 1, 1, (), 0.0))
+                rank_results.append(RankCompute(rank, 0, 0, (), (), 0.0))
                 continue
             experts, plan = plans_by_rank[rank]
+            bridge = plan["bridge"]
+            range_counts = Counter(
+                zip(bridge["task_w13_ranges"], bridge["task_w2_ranges"], strict=True)
+            )
             rank_results.append(
                 RankCompute(
                     rank=rank,
                     routes=sum(histogram),
                     active_experts=len(experts),
-                    w13_ranges=int(plan["w13_window_ranges"]),
-                    w2_ranges=int(plan["w2_window_ranges"]),
+                    stage_range_histogram=tuple(
+                        sorted((int(w13), int(w2), int(count)) for (w13, w2), count in range_counts.items())
+                    ),
                     shape=tuple(plan["shape"]),
                     predicted_ms=completion_ns[rank] / 1e6,
                 )
@@ -473,7 +475,7 @@ def main() -> int:
             for rank in result.rank_compute:
                 print(
                     f"  rank{rank.rank}: routes={rank.routes:<6} "
-                    f"active={rank.active_experts:<3} ranges={rank.w13_ranges}/{rank.w2_ranges} "
+                    f"active={rank.active_experts:<3} task_ranges={rank.stage_range_histogram} "
                     f"shape={rank.shape} time={rank.predicted_ms:.3f} ms"
                 )
         winner = "TP" if tp.total_ms < ep.total_ms else "EP"

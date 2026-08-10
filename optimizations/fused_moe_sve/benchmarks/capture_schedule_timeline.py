@@ -497,8 +497,16 @@ def build_plan(args: argparse.Namespace) -> tuple[dict[str, Any], ContentionCost
             "execution_mode": spec["execution_mode"],
             "shape": list(spec["shape"]),
             "task_stage_window_policy": spec["task_stage_window_policy"],
-            "w13_ranges": int(spec["w13_ranges"]),
-            "w2_ranges": int(spec["w2_ranges"]),
+            "task_range_pairs": sorted(
+                {
+                    f"{int(w13)}:{int(w2)}"
+                    for w13, w2 in zip(
+                        plan.task_w13_ranges.tolist(),
+                        plan.task_w2_ranges.tolist(),
+                        strict=True,
+                    )
+                }
+            ),
             "tail_repartition_width": spec["tail_repartition_width"],
             "tail_repartition_tasks": int(spec["tail_repartition_tasks"]),
             "tail_repartition_route_slices": int(spec["tail_repartition_route_slices"]),

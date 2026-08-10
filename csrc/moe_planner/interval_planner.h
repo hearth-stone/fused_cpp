@@ -69,8 +69,8 @@ struct IntervalCostModelConfig {
   int local_experts = 0;
   int profile_runs = 1;
   int measurement_experts = 0;
-  int w13_window_ranges = 1;
-  int w2_window_ranges = 1;
+  int calibration_w13_ranges = 1;
+  int calibration_w2_ranges = 1;
   int64_t w13_chunk_bytes = 0;
   int64_t w2_chunk_bytes = 0;
   int64_t max_stage_bytes = 0;

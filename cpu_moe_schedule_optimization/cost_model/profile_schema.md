@@ -1,17 +1,19 @@
 # Expert Cost Profile Schema
 
-## Schema v2: policy- and topology-bound contention profile
+## Schema v2: calibration-domain- and topology-bound contention profile
 
 Schema v2 is the active format for SVE fused-MoE scheduling profiles. A profile
-is valid only for the exact kernel policy, sharded expert shape, and NUMA/rank
-execution context recorded in the file. The canonical kernel policy is the
-actual `(w13_window_ranges, w2_window_ranges)` geometry.
+is valid only for the exact implementation, sharded expert shape, and NUMA/rank
+execution context recorded in the file. The recorded
+`(w13_window_ranges, w2_window_ranges)` pair is the geometry used to collect
+the calibration; it is measurement provenance, not a planner policy identity.
 
 Historical schema-v2 files may still record `w13_split`, `w13_split_chunks`, and
 `weight_window_bytes`. The reader ignores those fields; they are provenance,
 not active identity or a geometry fallback. Every schema-v2 file must carry
-positive `w13_window_ranges` and `w2_window_ranges`. Two files with the same
-range pair are duplicate calibrations even when their historical fields differ.
+positive `w13_window_ranges` and `w2_window_ranges`. Only one active calibration
+may exist for a complete domain identity. Changing the measured pair does not
+create a second planner variant; a second file in the same domain is rejected.
 
 ```json
 {
@@ -111,9 +113,9 @@ Required v2 identity fields are:
 
 - hardware: profiled CPU sets, NUMA nodes, LLC bytes, cores per rank, and
   concurrent rank count;
-- kernel: backend, SVE implementation, M-tail policy, N-split policy, actual
-  W13/W2 range counts, source hash, and extension binary hash; legacy split and
-  requested-byte fields are validated provenance only;
+- kernel identity: backend, SVE implementation, M-tail policy, N-split policy,
+  source hash, and extension binary hash; measured W13/W2 range counts and
+  legacy split/requested-byte fields are provenance only;
 - distributed shape: TP/EP mode and degree, global/local expert counts, H, and
   sharded F;
 - calibration scope: the full local expert count, activation, dtype, SVE N tile,
@@ -146,19 +148,16 @@ interpolated through the former M1/M2/M4/M8 buckets. Profiles without these
 fields are interpreted as `asm/static_bucketed` for history compatibility.
 Catalog queries for the production JIT path must specify both fields; a mixed
 catalog intentionally rejects an implementation-unspecified ambiguous query.
-Static and JIT profiles are never one range-policy set even when all other shape
-fields match.
+Static and JIT profiles remain distinct calibration domains.
 
-`ProfileCatalog.policy_variants()` returns every uniquely measured range pair
-for one implementation and one non-kernel policy identity. The set may contain
-one or many variants; every member must use the same route/thread/shape grid.
-Duplicate range pairs are rejected rather than treated as separate candidates.
+`ProfileCatalog` has no range-variant API. It rejects two records with the same
+domain identity regardless of their measured range pair.
 
-The TP/EP evaluator's `--sve-implementation auto` lookup first requests any
-compatible `jit/xbyak_exact_m` range set. It falls back to
-`asm/static_bucketed` only when the JIT set is empty or invalid. It never fills
-a missing range from another implementation. Explicit `jit` or `asm` selection
-is strict and fails when that implementation has no compatible measured range.
+The TP/EP evaluator's `--sve-implementation auto` lookup first requests one
+compatible `jit/xbyak_exact_m` calibration. It falls back to
+`asm/static_bucketed` only when no JIT calibration matches. It never composes
+calibrations across implementations. Explicit `jit` or `asm` selection is
+strict and fails when that implementation has no compatible calibration.
 
 `git_commit` and `git_worktree_dirty` may be `null` on a deployment host without
 repository metadata. `source_sha256` and `extension_sha256` remain mandatory
@@ -200,9 +199,10 @@ as a validation baseline.
 
 The complete `full_call_*` curve is the authoritative calibration for a uniform
 full-rank workload. `makespan_ns` remains a normalized diagnostic; it must not
-be multiplied by an arbitrary number of waves. For a positive window, the
-stage-aware simulator emits `w13_window_ranges` W13 phases and
-`w2_window_ranges` W2 phases using their actual maximum range bytes.
+be multiplied by an arbitrary number of waves. For the calibration fallback,
+the stage-aware simulator emits the measured number of W13/W2 phases. For Plan
+V2 candidates it instead uses each task's resolved `task_w13_ranges` and
+`task_w2_ranges`.
 
 `bounded_tail_repartition` is an optional, placement-aware full-call anchor for
 the terminal repartitions supported by the production planner. Unlike a
@@ -279,14 +279,14 @@ The serialized model records per-core private-cache bytes/ways, reserved ways,
 resident scan bandwidth saturation, the derived owner-cache budget, and the
 predicted expert/byte band. `profile_summary` and `holdout_summary` contain
 measured regret but are validation results, not active cost anchors. This path
-uses the profile's exact W13/W2 range pair and is currently gated to at least
+uses the profile's measured W13/W2 geometry and is currently gated to at least
 16 physical M12/tail panels.
 
 New `profile_moe_stage_breakdown.py` output serializes a top-level `kernel`
 object with `backend_n_tile`, `parallel_axis`, `w13_window_ranges`,
 `w2_window_ranges`, and `w13_skip_silu`. Per-row `w13_parallel_axis` and
 `w2_parallel_axis` describe M/N team partitioning; they are independent of the
-sequential stage range identity.
+sequential stage measurement geometry.
 
 TP2 and EP2 reproduction commands for the 64-core/two-NUMA target are:
 
@@ -308,14 +308,13 @@ PYTHONPATH=src .venv/bin/python \
   --w13-ranges 2 --w2-ranges 1 --sve-implementation jit --warmup 5 --runs 20
 ```
 
-Run each command again with another measured exact pair, such as
-`--w13-ranges 1 --w2-ranges 1`, when that geometry is a planner candidate.
 Defaults bind rank 0 to CPUs 0-31/NUMA0 and rank 1 to CPUs 32-63/NUMA1.
 
-Generate one file per candidate exact range pair. Byte/MiB sweeps remain useful
-calibration inputs, but the tool must quantize them through native packed-tile
-geometry before profiling. Runtime profiles and the planner never carry the
-byte target, and the planner will not synthesize an unmeasured range identity.
+Generate one canonical file per calibration domain. Alternate exact pairs and
+byte/MiB sweeps remain useful holdout inputs, but keep them outside the active
+profile catalog and quantize byte requests through native packed-tile geometry.
+Runtime profiles and the planner never carry a byte target or enumerate a
+second operator-wide range profile.
 
 ## Legacy schema v1
 

@@ -216,7 +216,10 @@ def main() -> int:
 
     for name in (POLICY,):
         pairs = list(zip(bridges[name]["task_w13_ranges"], bridges[name]["task_w2_ranges"]))
-        baseline = int(specs[name]["w13_ranges"]), int(specs[name]["w2_ranges"])
+        baseline = (
+            model.measurement_geometry.w13_ranges,
+            model.measurement_geometry.w2_ranges,
+        )
         metadata[name]["overridden_tasks"] = sum(pair != baseline for pair in pairs)
         metadata[name]["range_pairs"] = sorted({f"{w13}:{w2}" for w13, w2 in pairs})
 

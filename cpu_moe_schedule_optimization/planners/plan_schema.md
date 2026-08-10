@@ -401,28 +401,16 @@ Rules:
   reference implementation, while `FUSED_CPP_MOE_PLANNER_THREADS` controls
   native candidate workers. Cache hits rebuild the same bridge without rerunning
   either cold solver.
-- Profiled kernel selection remains operator-wide. A policy-aware plan emits
-  adjacent `operator_options`:
-
-  ```json
-  {
-    "w13_ranges": 4,
-    "w2_ranges": 2
-  }
-  ```
-
-  The pair serializes both SVE GEMMs into the stated number of tile-aligned
-  packed-B ranges. It is selected only from an exact schema-v2 profile carrying
-  the same W13/W2 range identity.
-
-  An optional named `TaskStageWindowPolicy` may replace the baseline pair in
-  the two per-task arrays after task widths and placements have been selected.
-  The current policy is a deterministic lookup on
-  `(routes, actual_task_threads)`; unsupported combinations retain the baseline
-  exact pair. It is not a free search dimension, but every candidate is scored
-  using its resolved ranges, and tail-pool tasks use the selected pool width.
-  The policy name is part of `PlannedMoE` cache identity and result metadata.
-  `PlannedMoE` resolves the policy independently for every candidate model.
+- A plan has no operator-wide W13/W2 range option. `PlannedMoE` accepts one
+  calibration model, searches the core shape, and then resolves the two
+  required per-task arrays after each task's actual width and placement are
+  known. A named `TaskStageWindowPolicy` is a deterministic mapping on
+  `(routes, actual_task_threads)`; uncovered combinations use the calibration's
+  measured geometry as a cost-model fallback. It is not a free search
+  dimension. Every candidate is scored with its resolved task ranges, and
+  tail-pool tasks use the selected pool width. The policy name is part of the
+  plan-cache identity and result metadata; there is no `operator_options`,
+  range-profile variant, or global `(1,1)/(2,1)` cache key.
   The measured `amazon_c5_192c_tp4_f512_v4` policy is default-on only when the
   complete dual-NUMA AmazonC5192Cores TP4/F512 SVE JIT exact-M
   `R13=2,R2=1` profile identity and one of its 96-core rank CPU sets match.
