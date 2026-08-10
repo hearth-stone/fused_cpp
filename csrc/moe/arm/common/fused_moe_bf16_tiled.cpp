@@ -6065,14 +6065,6 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input, at::Tensor w13_packed, int64_t
                 "silu_poly_degree must be 4, 5, or 6, got ", silu_poly_degree);
   }
   const bool use_hierarchical_nsplit = nsplit_config.enabled;
-  // Shared A pre-pack for the fused N-split path (opt-in, default OFF).
-  // Benchmarks showed no benefit: the A-pack write is a one-time M*K store,
-  // dwarfed by the repeated cached A-reads + compute, so de-duplicating it
-  // changes nothing. Kept behind a flag for experimentation.
-  bool fused_shared_apack = false;
-  if (env_has_value("FUSED_CPP_MOE_FUSED_SHARED_APACK")) {
-    fused_shared_apack = env_flag_enabled("FUSED_CPP_MOE_FUSED_SHARED_APACK");
-  }
   // packA fusion: fold the A repack into the gather (w13, Part 1) and the
   // w13 epilogue store (w2, Part 2), so the GEMM kernels only compute and the
   // per-thread a_reorder scratch is no longer needed. Default ON; set 0 to
@@ -6590,21 +6582,6 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input, at::Tensor w13_packed, int64_t
                                          static_cast<int>(w13.K_pad), static_cast<int>(w13.N_pad),
                                          static_cast<int>(w2.K_pad), silu_poly_degree);
             }
-            barrier.wait();
-          } else if (fused_shared_apack) {
-            // Pack the w13 A once into the group-shared buffer
-            // (each member packs its 8-row block range), then all
-            // members read it for their N-slice: no G-fold repack.
-            const int64_t nb = (rows + 7) / 8;
-            const SplitRange brange = split_evenly(nb, nsplit_group_size, local_tid);
-            pack_a_reorder_m8(scratch.input.data(), scratch.packed_a.data(), static_cast<int>(rows),
-                              static_cast<int>(w13.K_pad), static_cast<int>(brange.begin),
-                              static_cast<int>(brange.begin + brange.size));
-            barrier.wait();
-            team_fused_w13_silu_packed(team, scratch.packed_a.data(), w13_ptr + expert * w13.packed_stride,
-                                       scratch.intermediate.data(), static_cast<int>(nb * 8),
-                                       static_cast<int>(w13.K_pad), static_cast<int>(w13.N_pad),
-                                       static_cast<int>(w2.K_pad), silu_poly_degree);
             barrier.wait();
           } else {
             if (use_sve_backend) {
