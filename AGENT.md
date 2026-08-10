@@ -77,8 +77,19 @@ ssh AmazonECS8Cores 'cd /home/ubuntu/zhangxu/fused_cpp && . .venv/bin/activate &
 ### Amazon C5 192 Cores
 
 - Host alias: `AmazonC5192Cores`
-- Remote work root: `/home/ubuntu/zhangxu`
-- Remote project root: `/home/ubuntu/zhangxu/fused_cpp`
+- Remote work root: `/data/zhangxu`
+- Remote project root: `/data/zhangxu/fused_cpp`
+- Python executable: `/data/zhangxu/fused_cpp/.venv/bin/python`
+- The work root moved off `/home/ubuntu/zhangxu` on 2026-08-10 because the root
+  filesystem is only 8.7 GiB and filled up. `/data` is a separate 49 GiB NVMe
+  volume. Do not recreate anything under `/home/ubuntu`; that path no longer
+  exists.
+- The remote tree is an rsync mirror, not a git checkout. A leftover empty `.git`
+  directory makes `git -C` commands fail rather than report a clean tree, so
+  never infer remote state from git. `rsync -a` also does not delete, so a file
+  removed locally lingers remotely; delete stale files explicitly after a
+  refactor, and remember `rsync -a` preserves mtime, which makes a rebuild
+  silently skip a reverted source unless it is `touch`ed first.
 - CPU topology: 192 CPUs across two NUMA nodes, `0-95` and `96-191`
 - Explicit HugeTLB benchmark pool: 320 x 32 MiB pages (10 GiB total),
   distributed as 160 pages per NUMA node and mounted at
