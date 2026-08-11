@@ -112,9 +112,13 @@ user approval.
 Features move through `experimental -> candidate -> enabled` or
 `experimental/candidate -> retired`.
 
-- `experimental`: Lab only, opt-in, no compatibility promise.
-- `candidate`: still opt-in; must have an owner or decision date, full
-  correctness coverage, and explicit adoption criteria.
+- `experimental`: Lab only, opt-in, no compatibility promise. New or materially
+  changed entries must name an owner, opening date, decision deadline, next
+  decision, and falsifiable adoption gate. The first decision deadline must be
+  no more than 90 days after opening.
+- `candidate`: still opt-in; must name an owner, opening date, decision deadline,
+  next decision, and adoption gate, with full correctness coverage. A candidate
+  decision deadline must be no more than 30 days after promotion.
 - `enabled`: production-supported and eligible for default dispatch.
 - `retired`: no active source or default-build entrypoint. Keep only the result,
   retirement reason, last implementation commit/tag, and reproduction command.
@@ -125,10 +129,16 @@ Features move through `experimental -> candidate -> enabled` or
 Once evidence rejects an experiment or shows it performance-neutral without a
 separate maintenance benefit, retire it. Do not retain it behind a default-off
 flag. An inconclusive experiment may remain in Lab only while a concrete next
-decision exists. Superseded internal implementations should be deleted after the
-replacement covers their contract; retain a thin adapter only for a public API.
-Existing manifests and source predating this lifecycle are a migration backlog;
-clean them incrementally, but do not add or expand a nonconforming path.
+decision exists. When `decision_by` expires, update the evidence and set one new
+bounded decision or retire the entry; an expired entry must not gain variants,
+Production hooks, or new compatibility obligations. Superseded internal
+implementations should be deleted after the replacement covers their contract;
+retain a thin adapter only for a public API.
+
+Existing manifest entries predating this lifecycle are a migration backlog.
+They may remain untouched, but any material edit must add the required lifecycle
+fields. Audit or retire the remaining legacy entries by `2026-11-08`; do not add
+or expand a nonconforming path.
 
 ## Manifest
 
@@ -147,7 +157,9 @@ Required semantics:
   a part.
 - Manifest additions, removals, and renames match real buildable entrypoints.
 - Experimental work is not presented as production.
-- Candidate entries record an adoption gate and decision date or next decision.
+- Experimental and candidate entries created or materially changed under this
+  policy record `owner`, `opened`, `decision_by`, `next_decision`, and
+  `adoption_gate`. Dates use `YYYY-MM-DD`.
 - Retired entries record `implementation: Removed from the active tree`, a result
   or retirement reason, and a `history` commit/tag when one is known. Their
   variants must not name a buildable production entrypoint.
@@ -155,6 +167,30 @@ Required semantics:
 Use semantic names, not `v1`, `v2`, `new`, `new2`, `latest`, `fast`, or `final`.
 Recommended statuses: `reference`, `experimental`, `candidate`, `enabled`,
 `retired`. New variants default to `experimental`.
+
+## Production Environment Variables
+
+`docs/production_environment.yaml` is the authoritative registry for
+repository-owned environment variables parsed by Production (`csrc/`,
+`src/fused_cpp/`) or by the supported build entrypoint. Register a variable
+before adding its parser. An entry must list every exact name, scope, class,
+owner, implementation location, purpose, and default behavior.
+
+Registry classes are:
+
+- `supported`: an internal-stable operational or build control. Preserve its
+  documented meaning or perform an explicit migration.
+- `diagnostic`: a benchmark, trace, profiling, comparison, or recovery control.
+  It has no compatibility promise and must not be required for normal operation.
+- `temporary`: a Production-resident experiment or migration shim. It must name
+  a linked feature or debt, an owner, and `decision_by`; adopt it as supported,
+  move it to Lab, or remove it by that decision.
+
+Do not add unregistered `getenv`, `os.getenv`, or `os.environ` reads for
+repository-owned names. Prefer function arguments or a versioned plan for
+per-call behavior, build configuration for compile-time behavior, and Lab
+entrypoints for experiments. External variables owned by OpenMP, compilers, or
+third-party dependencies are recorded as exclusions rather than redefined here.
 
 ## Feature and Variant Work
 

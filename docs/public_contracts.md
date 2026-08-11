@@ -184,9 +184,11 @@ optimization must not change them merely because its source is compiled.
 Environment variables are not public Python API. A variable explicitly
 documented as a supported operational control is internal-stable configuration;
 diagnostic and experimental variables carry no compatibility promise. Every
-production variable must be classified in the repository's production
-environment registry. An undocumented default-off switch is experimental and
-must not be retained as accidental compatibility.
+repository-owned variable read by Production or the build must be classified in
+`docs/production_environment.yaml`. Its `supported`, `diagnostic`, or
+`temporary` class controls compatibility and retirement; merely appearing in
+the registry does not make it public API. An undocumented default-off switch is
+experimental and must not be retained as accidental compatibility.
 
 Exact latency, throughput, internal file layout, private class names, trace text,
 benchmark CLI details, generated symbol addresses, and cache/JIT implementation

@@ -47,6 +47,8 @@ by the relevant skill.
 - Read `docs/public_contracts.md` before changing exports, signatures, native C
   ABI, packed objects, plan schemas, backend ids, numerical behavior, or
   supported configuration.
+- Register every repository-owned environment variable read by Production or
+  the build in `docs/production_environment.yaml` before adding its parser.
 - Preserve public APIs, ABI, packed formats, plan schemas, backend ids, build
   entrypoints, numerical behavior, and default dispatch unless the user
   explicitly requests a migration or behavior change.

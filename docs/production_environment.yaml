@@ -1,0 +1,431 @@
+schema_version: 1
+description: >-
+  Authoritative inventory of repository-owned environment variables parsed by
+  Production source or the supported setup.py build. Entries classify internal
+  compatibility; no variable becomes public API by being listed here.
+
+inventory:
+  production_roots:
+    - csrc
+    - src/fused_cpp
+  build_entrypoints:
+    - setup.py
+  owned_prefixes:
+    - FUSED_CPP_
+    - FUSED_MLA_
+  excluded_external_names:
+    - ACL_ROOT
+    - CC
+    - KLEIDIAI_ROOT
+    - LIBOMP_ROOT
+    - OMP_DYNAMIC
+    - OMP_NESTED
+    - OMP_NUM_THREADS
+    - OMP_PLACES
+    - OMP_PROC_BIND
+    - OMP_SCHEDULE
+    - OMP_WAIT_POLICY
+  excluded_compile_definitions:
+    - FUSED_CPP_HAS_ACL
+    - FUSED_CPP_HAS_BF16GEMM
+    - FUSED_CPP_HAS_I8GEMM
+    - FUSED_CPP_HAS_KLEIDIAI
+    - FUSED_CPP_HAS_OMP
+    - FUSED_CPP_I8GEMM_BACKEND
+    - FUSED_CPP_MOE_HAS_ARM_SVE
+    - FUSED_CPP_MOE_HAS_X86_AVX512_BF16
+    - FUSED_CPP_MOE_HAS_XBYAK
+    - FUSED_CPP_MOE_HAS_XBYAK_AARCH64
+    - FUSED_CPP_MOE_SVE_VECTOR_BITS
+
+classes:
+  supported: Internal-stable operational or build configuration.
+  diagnostic: Debug, profiling, benchmark comparison, or recovery control.
+  temporary: Production-resident experiment or migration shim with a decision deadline.
+
+entries:
+  - id: build.target_and_features
+    names:
+      - FUSED_CPP_BUILD_TYPE
+      - FUSED_CPP_DISABLE_OMP
+      - FUSED_CPP_ENABLE_KLEIDIAI
+      - FUSED_CPP_RELEASE
+      - FUSED_CPP_STRICT_MODE
+      - FUSED_CPP_SVE_VECTOR_BITS
+      - FUSED_CPP_TARGET_CPU
+    scope: build
+    class: supported
+    owner: build
+    implementation:
+      - setup.py
+    purpose: Select supported compiler targets, optional dependencies, and release behavior.
+    default: Host-derived target, OpenMP when found, KleidiAI disabled, SVE VL 128.
+
+  - id: build.instrumentation
+    names:
+      - FUSED_CPP_BUILD_MOE_ONLY
+      - FUSED_CPP_ENABLE_PROFILING
+    scope: build
+    class: diagnostic
+    owner: build
+    implementation:
+      - setup.py
+    purpose: Build a reduced extension set or compile profiling hooks for development.
+    default: Build both extensions; profiling follows build type.
+
+  - id: memory.page_policy
+    names:
+      - FUSED_CPP_HUGETLBFS_PATH
+      - FUSED_CPP_PAGES
+      - FUSED_CPP_PAGE_MIN_KB
+      - FUSED_CPP_PAGE_SIZE_MB
+      - FUSED_CPP_WORKSPACE_POOL
+    scope: runtime
+    class: supported
+    owner: memory
+    implementation:
+      - csrc/page_policy.h
+      - csrc/workspace_pool.cpp
+    purpose: Select page backing, huge-page thresholds, and pooled workspace allocation.
+    default: THP page policy, 32 MiB HugeTLB size, pool enabled.
+
+  - id: memory.page_diagnostics
+    names:
+      - FUSED_CPP_MOE_FORCE_HUGETLBFS_COPY
+      - FUSED_CPP_PAGE_TRACK
+    scope: runtime
+    class: diagnostic
+    owner: memory
+    implementation:
+      - csrc/page_policy.h
+      - src/fused_cpp/moe/bf16_tiled.py
+    purpose: Track page mappings or restore the retired post-pack HugeTLB copy for comparison.
+    default: Disabled.
+
+  - id: memory.moe_page_aliases
+    names:
+      - FUSED_CPP_MOE_HUGETLB
+      - FUSED_CPP_MOE_HUGETLBFS_PATH
+      - FUSED_CPP_MOE_HUGETLB_MB
+      - FUSED_CPP_MOE_THP
+    scope: runtime
+    class: temporary
+    owner: memory
+    implementation:
+      - csrc/page_policy.h
+      - src/fused_cpp/moe/bf16_tiled.py
+    purpose: Deprecated compatibility aliases for the shared page policy.
+    default: Ignored unless set.
+    debt: Replace callers with FUSED_CPP_PAGES, FUSED_CPP_PAGE_SIZE_MB, and FUSED_CPP_HUGETLBFS_PATH.
+    decision_by: "2026-11-08"
+
+  - id: moe.backend_availability
+    names:
+      - FUSED_CPP_MOE_AMX_BF16
+      - FUSED_CPP_MOE_AVX512_BF16
+      - FUSED_CPP_MOE_SVE
+    scope: runtime
+    class: supported
+    owner: moe
+    implementation:
+      - csrc/moe/common/backend.cpp
+      - csrc/moe/arm/sve_bf16/packing.cpp
+      - csrc/moe/x86/avx512_bf16/backend.cpp
+    purpose: Disable an otherwise supported ISA backend for deployment fallback.
+    default: Every compiled and runtime-supported backend is available.
+
+  - id: moe.implementation_comparison
+    names:
+      - FUSED_CPP_MOE_AVX512_IMPL
+      - FUSED_CPP_MOE_DISABLE_RESIDENT_THREADS
+      - FUSED_CPP_MOE_FUSED_PACKA
+      - FUSED_CPP_MOE_SVE_IMPL
+      - FUSED_CPP_MOE_SVE_W2_DIRECT_ROUTE
+    scope: runtime
+    class: diagnostic
+    owner: moe
+    implementation:
+      - csrc/moe/arm/common/fused_moe_bf16_tiled.cpp
+      - csrc/moe/arm/sve_bf16/jit_kernels.cpp
+      - csrc/moe/x86/avx512_bf16/jit_kernels.cpp
+    purpose: Compare production implementations with retained correctness fallbacks.
+    default: Automatic/default implementation and resident/direct optimized paths.
+
+  - id: moe.x86_kernel_candidates
+    names:
+      - FUSED_CPP_MOE_AMX_PATTERN
+      - FUSED_CPP_MOE_AMX_SILU_EPILOGUE
+      - FUSED_CPP_MOE_AMX_TILE_STATE
+      - FUSED_CPP_MOE_AMX_W2_EPILOGUE
+      - FUSED_CPP_MOE_X86_W13_CACHE_BLOCKS
+      - FUSED_CPP_MOE_X86_W2_CACHE_BLOCKS
+    scope: runtime
+    class: temporary
+    owner: moe-x86
+    implementation:
+      - csrc/moe/x86/avx512_bf16/jit_kernels.cpp
+    purpose: Select AMX candidate schedules, epilogues, tile lifetime, and cache windows.
+    default: Automatic kernel policy; cache windows are implementation-derived.
+    feature: optimizations/fused_moe_avx512/manifest.yaml
+    decision_by: "2026-11-08"
+
+  - id: moe.w2_bf16_route_candidate
+    names:
+      - FUSED_CPP_MOE_W2_BF16_ROUTE
+    scope: runtime
+    class: temporary
+    owner: moe-arm
+    implementation:
+      - csrc/moe/arm/common/fused_moe_bf16_tiled.cpp
+    purpose: Evaluate direct BF16 route storage before FP32 weighted merge.
+    default: Disabled; direct FP32 route storage remains the reference.
+    feature: store.w2_direct_bf16_route
+    decision_by: "2026-11-08"
+
+  - id: moe.runtime_controls
+    names:
+      - FUSED_CPP_MOE_ASYNC_READY_TOKEN_BATCH
+      - FUSED_CPP_MOE_ASYNC_READY_TOKEN_DRAIN
+      - FUSED_CPP_MOE_ASYNC_READY_TOKEN_MERGE
+      - FUSED_CPP_MOE_ASYNC_READY_TOKEN_PREFETCH
+      - FUSED_CPP_MOE_ASYNC_SHORT_POOL_MAX_ROWS
+      - FUSED_CPP_MOE_ASYNC_SHORT_POOL_THREADS
+      - FUSED_CPP_MOE_PIN_THREAD_CPUS
+      - FUSED_CPP_MOE_PIN_THREADS
+      - FUSED_CPP_MOE_PREPACK_THREADS
+    scope: runtime
+    class: supported
+    owner: moe-runtime
+    implementation:
+      - csrc/moe/arm/common/fused_moe_bf16_tiled.cpp
+      - csrc/moe/x86/avx512_bf16/executor.cpp
+    purpose: Configure thread placement, prepack parallelism, ready-token merge, and short-task pooling.
+    default: Source-defined automatic policy; pinning and explicit short pool disabled.
+
+  - id: moe.legacy_nsplit_controls
+    names:
+      - FUSED_CPP_MOE_HIERARCHICAL_N_SPLIT
+      - FUSED_CPP_MOE_N_SPLIT_CORE_BASES
+      - FUSED_CPP_MOE_N_SPLIT_CORE_SKIP
+      - FUSED_CPP_MOE_N_SPLIT_GROUPS_PER_PARTITION
+    scope: runtime
+    class: temporary
+    owner: moe-runtime
+    implementation:
+      - csrc/moe/arm/common/fused_moe_bf16_tiled.cpp
+    purpose: Retained comparison controls for the legacy hierarchical N-split scheduler.
+    default: Disabled.
+    debt: Move reproducible comparison to Lab or retire after Plan V2 coverage is confirmed.
+    decision_by: "2026-11-08"
+
+  - id: moe.tail_steal_candidate
+    names:
+      - FUSED_CPP_MOE_STRICT_TAIL_STEAL
+      - FUSED_CPP_MOE_STRICT_TAIL_STEAL_DEPTH
+      - FUSED_CPP_MOE_STRICT_TAIL_STEAL_MIN_DONOR_TASKS
+    scope: runtime
+    class: temporary
+    owner: moe-runtime
+    implementation:
+      - csrc/moe/arm/common/fused_moe_bf16_tiled.cpp
+    purpose: Evaluate bounded tail task migration in the async executor.
+    default: Disabled.
+    feature: optimizations/fused_moe_sve/manifest.yaml
+    decision_by: "2026-11-08"
+
+  # Additional exact-name groups continue below; do not replace them with a
+  # prefix wildcard because that would silently register future controls.
+
+  - id: moe.scheduler_calibration
+    names:
+      - FUSED_CPP_MOE_SCHEDULE_BEAM_WIDTH
+      - FUSED_CPP_MOE_SCHEDULE_COST_ACTIVATION_WEIGHT
+      - FUSED_CPP_MOE_SCHEDULE_COST_ACTIVATION_WORK_UNIT
+      - FUSED_CPP_MOE_SCHEDULE_COST_ACTIVE_GEMM_SLOWDOWN
+      - FUSED_CPP_MOE_SCHEDULE_COST_ALIGNMENT_PENALTY
+      - FUSED_CPP_MOE_SCHEDULE_COST_A_PACK_WEIGHT
+      - FUSED_CPP_MOE_SCHEDULE_COST_BANDWIDTH_CAPACITY
+      - FUSED_CPP_MOE_SCHEDULE_COST_BANDWIDTH_SLOWDOWN
+      - FUSED_CPP_MOE_SCHEDULE_COST_BANDWIDTH_THREAD_WEIGHT
+      - FUSED_CPP_MOE_SCHEDULE_COST_BANDWIDTH_WORK_WEIGHT
+      - FUSED_CPP_MOE_SCHEDULE_COST_CACHE_CAPACITY
+      - FUSED_CPP_MOE_SCHEDULE_COST_CACHE_SLOWDOWN
+      - FUSED_CPP_MOE_SCHEDULE_COST_CACHE_THREAD_WEIGHT
+      - FUSED_CPP_MOE_SCHEDULE_COST_CACHE_TOKEN_WEIGHT
+      - FUSED_CPP_MOE_SCHEDULE_COST_COMPUTE_SLOWDOWN
+      - FUSED_CPP_MOE_SCHEDULE_COST_FIXED_OVERHEAD
+      - FUSED_CPP_MOE_SCHEDULE_COST_GEMM_WORK_UNIT
+      - FUSED_CPP_MOE_SCHEDULE_COST_GEMM_WORK_WEIGHT
+      - FUSED_CPP_MOE_SCHEDULE_COST_INITIAL_BIAS
+      - FUSED_CPP_MOE_SCHEDULE_COST_INITIAL_HW_PROFILE_DRIFT
+      - FUSED_CPP_MOE_SCHEDULE_COST_INITIAL_SCALE
+      - FUSED_CPP_MOE_SCHEDULE_COST_MEMORY_CAPACITY
+      - FUSED_CPP_MOE_SCHEDULE_COST_MEMORY_SLOWDOWN
+      - FUSED_CPP_MOE_SCHEDULE_COST_MEMORY_THREAD_WEIGHT
+      - FUSED_CPP_MOE_SCHEDULE_COST_MEMORY_TOKEN_WEIGHT
+      - FUSED_CPP_MOE_SCHEDULE_COST_M_SPLIT_CACHE
+      - FUSED_CPP_MOE_SCHEDULE_COST_M_SPLIT_SYNC
+      - FUSED_CPP_MOE_SCHEDULE_COST_N_SPLIT_CACHE
+      - FUSED_CPP_MOE_SCHEDULE_COST_N_SPLIT_REPACK_FACTOR
+      - FUSED_CPP_MOE_SCHEDULE_COST_N_SPLIT_SYNC
+      - FUSED_CPP_MOE_SCHEDULE_COST_PACK_WORK_UNIT
+      - FUSED_CPP_MOE_SCHEDULE_COST_POST_WEIGHT
+      - FUSED_CPP_MOE_SCHEDULE_COST_POST_WORK_UNIT
+      - FUSED_CPP_MOE_SCHEDULE_COST_SPEEDUP_GAIN
+      - FUSED_CPP_MOE_SCHEDULE_COST_SPEEDUP_POWER
+      - FUSED_CPP_MOE_SCHEDULE_COST_THREAD_LINEAR
+      - FUSED_CPP_MOE_SCHEDULE_COST_THREAD_QUADRATIC
+      - FUSED_CPP_MOE_SCHEDULE_COST_UPDATE_ALPHA
+      - FUSED_CPP_MOE_SCHEDULE_COST_UPDATE_INTERVAL
+      - FUSED_CPP_MOE_SCHEDULE_COST_WEIGHT_PACK_WEIGHT
+      - FUSED_CPP_MOE_SCHEDULE_INTERFERENCE_PROJECTION
+    scope: runtime
+    class: diagnostic
+    owner: moe-cost-model
+    implementation:
+      - csrc/moe/arm/common/fused_moe_bf16_tiled.cpp
+    purpose: Override legacy/native cold scheduler calibration for controlled model experiments.
+    default: Constants embedded beside each parser.
+
+  - id: moe.observability
+    names:
+      - FUSED_CPP_MOE_BENCH_PROFILE_WINDOW
+      - FUSED_CPP_MOE_BENCH_STOP_AFTER_SETUP
+      - FUSED_CPP_MOE_SCHEDULE_DEBUG
+      - FUSED_CPP_MOE_STAGE_TIMING
+      - FUSED_CPP_MOE_SVE_JIT_DUMP_DIR
+      - FUSED_CPP_MOE_TRACE
+      - FUSED_CPP_MOE_TRACE_FILE
+    scope: runtime
+    class: diagnostic
+    owner: moe
+    implementation:
+      - csrc/moe/arm/common/fused_moe_bf16_tiled.cpp
+      - csrc/moe/arm/sve_bf16/jit_kernels.cpp
+    purpose: Emit benchmark stops, scheduler diagnostics, stage timing, traces, or JIT code dumps.
+    default: Disabled.
+
+  - id: attention.gemm_policy
+    names:
+      - FUSED_CPP_ATTN_GEMM_N_GROUPS
+      - FUSED_CPP_ATTN_GEMM_PREPACK_A
+      - FUSED_CPP_ATTN_GEMM_SCHEDULE
+      - FUSED_CPP_POST_GEMM_M8_ALIGNED
+      - FUSED_CPP_POST_GEMM_SHARED_Q_POOL
+    scope: runtime
+    class: diagnostic
+    owner: deepseek-v4-attention
+    implementation:
+      - csrc/deepseek_v4_attn_gemm_fused.cpp
+      - csrc/deepseek_v4_post_gemm_stage.cpp
+    purpose: Force supported schedule components or their retained comparison baselines.
+    default: MN pool for attention; M8-aligned shared-Q policy when eligible.
+
+  - id: attention.sve_candidate
+    names:
+      - FUSED_CPP_ATTN_GEMM_BACKEND
+      - FUSED_CPP_ATTN_GEMM_SVE
+      - FUSED_CPP_POST_GEMM_BACKEND
+    scope: runtime
+    class: temporary
+    owner: deepseek-v4-attention
+    implementation:
+      - csrc/deepseek_v4_attn_gemm_fused.cpp
+      - csrc/deepseek_v4_attn_gemm_sve.cpp
+      - csrc/deepseek_v4_post_gemm_stage.cpp
+    purpose: Select the opt-in SVE BF16 GEMM backend while cross-shape validation is incomplete.
+    default: NEON.
+    feature: optimizations/deepseek_v4_attn_gemm/manifest.yaml
+    decision_by: "2026-11-08"
+
+  - id: attention.post_gemm_n_groups_candidate
+    names:
+      - FUSED_CPP_POST_GEMM_N_GROUPS
+    scope: runtime
+    class: temporary
+    owner: deepseek-v4-attention
+    implementation:
+      - csrc/deepseek_v4_post_gemm_stage.cpp
+    purpose: Select the candidate Q GEMM N-group count.
+    default: Two groups.
+    feature: schedule.q_gemm_mn_groups
+    decision_by: "2026-09-09"
+
+  - id: attention.post_gemm_candidate_controls
+    names:
+      - FUSED_CPP_DEEPSEEK_V4_KV_ROPE_WRITE_KV
+      - FUSED_CPP_DEEPSEEK_V4_POST_GEMM_STAGE
+    scope: runtime
+    class: temporary
+    owner: deepseek-v4-attention
+    implementation:
+      - csrc/deepseek_v4_post_gemm_stage.cpp
+      - src/fused_cpp/deepseek_v4_post_gemm_stage.py
+    purpose: Select candidate KV write fusion or whole-stage implementation.
+    default: KV write fusion disabled; stage selected automatically.
+    feature: optimizations/deepseek_v4_post_gemm/manifest.yaml
+    decision_by: "2026-11-08"
+
+  - id: attention.post_gemm_profile
+    names:
+      - FUSED_CPP_DEEPSEEK_V4_POST_GEMM_PROFILE
+    scope: runtime
+    class: diagnostic
+    owner: deepseek-v4-attention
+    implementation:
+      - csrc/deepseek_v4_post_gemm_stage.cpp
+    purpose: Emit post-GEMM stage timing diagnostics.
+    default: Disabled.
+
+  - id: sdpa.observability
+    names:
+      - FUSED_CPP_SDPA_DEBUG_TILE
+      - FUSED_CPP_SDPA_L3KV_DEBUG_GROUPS
+      - FUSED_CPP_SDPA_PROFILE
+      - FUSED_CPP_SDPA_PROFILE_DEEP
+    scope: runtime
+    class: diagnostic
+    owner: sdpa
+    implementation:
+      - csrc/sdpa_flash2_neon_l3kv.cpp
+      - csrc/sdpa_flash2_neon_l3kv_packv.cpp
+      - csrc/sdpa_profile.h
+      - csrc/sdpa_tile_sizes.h
+    purpose: Print tile/group decisions or collect SDPA timing details.
+    default: Disabled.
+
+  - id: python.operator_comparisons
+    names:
+      - FUSED_CPP_SPARSE_ATTN_INDEXER_VERSION
+      - FUSED_CPP_W4A8_SKIP
+    scope: runtime
+    class: diagnostic
+    owner: python-operators
+    implementation:
+      - src/fused_cpp/sparse_attn_indexer.py
+      - src/fused_cpp/w4a8_linear.py
+    purpose: Select a sparse-indexer comparison path or skip W4A8 compute during profiling.
+    default: Torch sparse-indexer path; real W4A8 compute. W4A8 skip is not numerically valid.
+
+  - id: mla.runtime
+    names:
+      - FUSED_MLA_NUM_THREADS
+    scope: runtime
+    class: supported
+    owner: mla
+    implementation:
+      - src/fused_cpp/mla/impl.py
+    purpose: Set the MLA operator thread count.
+    default: Operator-defined automatic thread count.
+
+  - id: mla.comparison
+    names:
+      - FUSED_MLA_USE_ORIG_RMSNORM
+      - FUSED_MLA_USE_ORIG_ROPE
+    scope: runtime
+    class: diagnostic
+    owner: mla
+    implementation:
+      - src/fused_cpp/mla/impl.py
+    purpose: Restore original RMSNorm or RoPE stages for comparison and debugging.
+    default: Disabled.
