@@ -44,6 +44,9 @@ by the relevant skill.
 - Keep edits scoped to the requested operator, module, and behavioral surface.
 - Keep generated builds, benchmark dumps, model files, caches, traces, and
   temporary outputs out of source commits unless explicitly requested.
+- Read `docs/public_contracts.md` before changing exports, signatures, native C
+  ABI, packed objects, plan schemas, backend ids, numerical behavior, or
+  supported configuration.
 - Preserve public APIs, ABI, packed formats, plan schemas, backend ids, build
   entrypoints, numerical behavior, and default dispatch unless the user
   explicitly requests a migration or behavior change.

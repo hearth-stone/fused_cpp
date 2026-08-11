@@ -16,6 +16,7 @@ These rules apply under `csrc/moe/` in addition to the repository guide.
 
 ## Contracts
 
+- Use `docs/public_contracts.md` as the authoritative compatibility boundary.
 - Treat `common/api.h`, module bindings, backend ids, packed-weight layouts,
   Plan V2 inputs, output dtype/layout, and numerical behavior as compatibility
   surfaces.
