@@ -104,6 +104,8 @@ Read the matching parent rule before editing:
 
 ## Git
 
+- Read `docs/git_workflow.md` before creating branches, synchronizing divergent
+  work, or archiving experiments.
 - Do not commit, push, rebase, force-push, or mutate remote repository state
   unless the user asks.
 - When commits are requested, keep each commit focused and review the exact

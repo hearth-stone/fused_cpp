@@ -255,12 +255,12 @@ out of commits unless the repo already says otherwise.
 
 ## Git
 
-Git records implementation history; the manifest records version facts. Use
-short-lived branches such as `opt/<operator>/<feature>` when useful, keep commits
-focused, and separate single-feature work from unrelated optimizations. Do not use
-long-lived `v1/v2/v3` branches, create permanent branches for parameter
-combinations, modify unrelated history, or commit/push/rebase/force-push unless
-the user asks.
+Follow `docs/git_workflow.md`. Git records implementation history; the manifest
+records optimization facts. Use a short-lived `opt/<operator>/<feature>` branch
+only when isolation or concurrent work needs it, and separate single-feature
+work from unrelated optimizations. Do not use long-lived `v1/v2/v3` or WIP
+branches, create permanent branches for parameter combinations, modify unrelated
+history, or commit/push/rebase/force-push unless the user asks.
 
 For rejected work developed outside the main branch, preserve the final experiment
 with an annotated `archive/<operator>/<feature>` tag or another durable commit
