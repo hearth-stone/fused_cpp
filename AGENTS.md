@@ -55,6 +55,11 @@ by the relevant skill.
 
 ## Coding And Validation
 
+Classify nontrivial work with `docs/change_policy.md` before editing. State the
+primary change class, contracts/defaults affected, required validation level,
+and rollback boundary. When work spans classes, apply the strictest relevant
+gate.
+
 Read the matching parent rule before editing:
 
 | Area | Rule file |

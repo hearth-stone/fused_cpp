@@ -36,6 +36,8 @@ These rules apply under `tests/` in addition to the repository guide and
 
 ## Validation Discipline
 
+- Use the L0-L3 levels in `docs/change_policy.md`; a higher level supplements
+  rather than replaces lower-level correctness checks.
 - Run the narrowest direct test first, then broader integration tests only when
   the impact crosses modules or processes.
 - Never replace a correctness assertion with a benchmark observation.
