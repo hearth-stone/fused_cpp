@@ -812,6 +812,54 @@ features:
       cpu_moe_schedule_optimization/cost_model/profiles/contention_async_amazon_c5_192c_dual_numa_tp4_sve_F512_E256_fulln_schema_v2_xbyak_exactm_20260727.json
       --route-dtype bf16 --warmup 5 --runs 21
 
+  - id: dispatch.strict_tail_suffix_steal
+    part: dispatch
+    status: experimental
+    owner: zhangxu
+    opened: 2026-07-31
+    decision_by: 2026-11-10
+    next_decision: >-
+      Test only a named held-out workload with materially larger whole-expert
+      tail opportunity; otherwise retire the runtime at decision_by because
+      DSV4 failed the E2E and P90 gates.
+    adoption_gate: >-
+      Bitwise-correct SVE coverage for every active width cohort, no cross-NUMA
+      migration or scratch allocation after leasing begins, and at least
+      2 percent paired median E2E improvement without a material P90 regression.
+    implementation: csrc/moe/arm/common/fused_moe_bf16_tiled.cpp
+    hypothesis: >-
+      Once a strict fixed team completes its planner-owned prefix, it can reduce
+      static lane tail by claiming one unstarted whole-expert task from a peer
+      with the same thread width and NUMA node. Keeping width, stage windows,
+      route range, and destination scratch fixed avoids the handoff costs that
+      invalidated W13-to-W2 elastic resizing.
+    depends_on:
+      - dispatch.full_n_team_stripes
+    conflicts_with:
+      - dispatch.dynamic_short_expert_pool
+      - dispatch.bounded_tail_route_fission
+    correctness: >-
+      PYTHONPATH=src .venv/bin/python -m pytest -q
+      tests/test_fused_moe_bf16_tiled.py
+      -k strict_tail_steal
+    benchmark: >-
+      numactl --cpunodebind=0 --membind=0 taskset -c 0-95
+      .venv/bin/python
+      optimizations/fused_moe_sve/benchmarks/capture_schedule_timeline.py
+      --preset dsv4-real-2048-seq70
+      --large-medium-stream-partition 48:12:48:8:16
+      --strict-tail-steal --compare-strict-tail-steal
+      --warmup 11 --runs 101 --route-dtype bf16 --seed 20260811
+    result: >-
+      AmazonC5192Cores NUMA0, 32 MiB HugeTLB, DSV4 48C-by-8T large plus
+      32C-by-1T medium plus 16C-by-1T short, 11 warmup and 101 paired runs:
+      strict 11.738 ms versus candidate 11.720 ms (+0.15 percent). The paired
+      mean was +0.20 percent with a 95 percent bootstrap interval of
+      [-0.21,+0.60] percent; P90 regressed from 11.863 to 11.910 ms. The trace
+      migrated 20 experts (19x1T and 1x8T, 686 routes) and reduced tail idle to
+      75.1 core-ms, but failed the 2 percent adoption gate. Remains default off;
+      W2 boundary resizing stays retired.
+
   - id: dispatch.stage_window_env_override
     part: dispatch
     status: retired
@@ -1545,6 +1593,18 @@ variants:
       PlannedMoE.plan_spec_for (default dynamic_tail_pool=True)
       fused_moe_bf16_tiled_async_plan
     status: enabled
+
+  - id: sve_strict_tail_suffix_steal
+    features:
+      - dispatch.strict_tail_suffix_steal
+      - dispatch.full_n_team_stripes
+      - store.w2_direct_route
+      - store.w2_direct_bf16_route
+      - merge.sve_weighted_reduce
+    entrypoint: >-
+      FUSED_CPP_MOE_STRICT_TAIL_STEAL=1
+      fused_moe_bf16_tiled_async_plan
+    status: experimental
 
   - id: sve_route_merge_sequential
     features: []

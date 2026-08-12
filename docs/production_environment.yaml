@@ -117,7 +117,7 @@ entries:
     purpose: Deprecated compatibility aliases for the shared page policy.
     default: Ignored unless set.
     debt: Replace callers with FUSED_CPP_PAGES, FUSED_CPP_PAGE_SIZE_MB, and FUSED_CPP_HUGETLBFS_PATH.
-    decision_by: "2026-11-08"
+    decision_by: "2026-11-10"
 
   - id: moe.backend_availability
     names:
@@ -228,8 +228,8 @@ entries:
     owner: moe-runtime
     implementation:
       - csrc/moe/arm/common/fused_moe_bf16_tiled.cpp
-    purpose: Evaluate bounded tail task migration in the async executor.
-    default: Disabled.
+    purpose: Evaluate same-width, same-NUMA bounded tail task migration in the async executor.
+    default: Feature disabled; when enabled, depth=2 and min_donor_tasks=1.
     feature: optimizations/fused_moe_sve/manifest.yaml
     decision_by: "2026-11-08"
 

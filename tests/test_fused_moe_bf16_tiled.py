@@ -564,6 +564,103 @@ def test_sve_plan_v2_strict_and_tail_pool_match_legacy_async(
         )
 
 
+def test_sve_plan_v2_strict_tail_steal_supports_mixed_width_cohorts(
+    monkeypatch: pytest.MonkeyPatch,
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    """Idle teams may steal whole experts only from same-width NUMA peers."""
+    if "arm_sve_bf16" not in available_fused_moe_bf16_tiled_backends():
+        pytest.skip("requires an SVE BF16 build/runtime")
+    if hasattr(os, "sched_getaffinity"):
+        cpu_ids = sorted(os.sched_getaffinity(0))[:6]
+    else:
+        cpu_ids = list(range(6))
+    if len(cpu_ids) < 6:
+        pytest.skip("requires six available CPUs")
+
+    monkeypatch.setenv("FUSED_CPP_MOE_SVE", "1")
+    generator = torch.Generator().manual_seed(20260812)
+    route_counts = [192] * 5 + [1] + [192] * 5 + [1]
+    num_experts = len(route_counts)
+    num_tokens = sum(route_counts)
+    hidden_size = 64
+    ffn_hidden_size = 32
+    hidden_states = _bf16_normal(
+        (num_tokens, hidden_size), generator=generator, std=0.01
+    )
+    w13_weight = _bf16_normal(
+        (num_experts, 2 * ffn_hidden_size, hidden_size),
+        generator=generator,
+        std=0.01,
+    )
+    w2_weight = _bf16_normal(
+        (num_experts, hidden_size, ffn_hidden_size),
+        generator=generator,
+        std=0.01,
+    )
+    topk_ids = torch.cat(
+        [
+            torch.full((count,), expert, dtype=torch.int32)
+            for expert, count in enumerate(route_counts)
+        ]
+    ).reshape(num_tokens, 1)
+    topk_weights = torch.ones((num_tokens, 1), dtype=torch.float32)
+    packed = prepare_fused_moe_bf16_tiled_weights(
+        w13_weight,
+        w2_weight,
+        fuse_silu=True,
+        backend="sve",
+    )
+
+    task_deps: list[int] = []
+    task_dep_offsets = [0]
+    for task in range(num_experts):
+        if task in {1, 2, 3, 4, 7, 8, 9, 10}:
+            task_deps.append(task - 1)
+        task_dep_offsets.append(len(task_deps))
+    bridge = upgrade_legacy_async_plan(
+        {
+            "num_threads": 6,
+            "thread_cpu_ids": cpu_ids,
+            "task_expert_ids": list(range(num_experts)),
+            "task_core_begins": [0] * 5 + [2] + [4] * 5 + [5],
+            "task_threads": [2] * 6 + [1] * 6,
+            "task_dep_offsets": task_dep_offsets,
+            "task_deps": task_deps,
+        }
+    )
+    bridge["early_merge"] = False
+    plan = AsyncMoEPlanV2.from_dict(bridge)
+
+    monkeypatch.setenv("FUSED_CPP_MOE_STRICT_TAIL_STEAL", "0")
+    reference = fused_moe_bf16_tiled_async_plan(
+        hidden_states,
+        packed,
+        topk_weights,
+        topk_ids,
+        plan,
+    )
+
+    monkeypatch.setenv("FUSED_CPP_MOE_STRICT_TAIL_STEAL", "1")
+    monkeypatch.setenv("FUSED_CPP_MOE_STAGE_TIMING", "1")
+    migrated = fused_moe_bf16_tiled_async_plan(
+        hidden_states,
+        packed,
+        topk_weights,
+        topk_ids,
+        plan,
+    )
+    stderr = capfd.readouterr().err
+    assert "effective=1" in stderr
+    assert "min_donor_tasks=1" in stderr
+    assert "geometry=[2T@" in stderr
+    assert ",1T@" in stderr
+    cohort_match = re.search(r"stolen_by_cohort=\[([0-9,]+)\]", stderr)
+    assert cohort_match is not None
+    assert all(int(value) > 0 for value in cohort_match.group(1).split(","))
+    torch.testing.assert_close(migrated.float(), reference.float(), atol=0, rtol=0)
+
+
 @pytest.mark.parametrize("degree", [4, 5, 6], ids=["poly4", "poly5", "poly6"])
 def test_sve_xbyak_exact_m_matches_static_asm(
     monkeypatch: pytest.MonkeyPatch,

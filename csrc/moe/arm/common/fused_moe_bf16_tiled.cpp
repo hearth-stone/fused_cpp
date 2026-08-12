@@ -4125,7 +4125,15 @@ struct AsyncStrictTailStealTeam {
   int64_t core_begin = 0;
   int64_t threads = 0;
   int64_t scratch_index = -1;
+  int64_t cohort_index = -1;
   std::vector<int64_t> task_ids;
+};
+
+struct AsyncStrictTailStealCohort {
+  int64_t threads = 0;
+  int64_t numa_node = -1;
+  int64_t max_rows = 0;
+  std::vector<int64_t> team_indices;
 };
 
 constexpr int64_t kAsyncPlanV2 = 2;
@@ -7332,56 +7340,44 @@ at::Tensor run_fused_moe_bf16_tiled_async(
     }
   }
 
-  const bool strict_tail_steal_requested =
-      env_flag_enabled("FUSED_CPP_MOE_STRICT_TAIL_STEAL");
-  bool use_strict_tail_steal =
-      strict_tail_steal_requested && has_plan_v2 &&
-      plan_v2->execution_mode == kAsyncExecutionStrict &&
-      use_sve_backend && fuse_silu && !use_async_short_pool;
-  int64_t strict_tail_steal_width = 0;
-  int64_t strict_tail_steal_numa_node = -1;
+  const bool strict_tail_steal_requested = env_flag_enabled("FUSED_CPP_MOE_STRICT_TAIL_STEAL");
+  bool use_strict_tail_steal = strict_tail_steal_requested && has_plan_v2 &&
+                               plan_v2->execution_mode == kAsyncExecutionStrict && use_sve_backend && fuse_silu &&
+                               !use_async_short_pool;
   int64_t strict_tail_steal_depth = 0;
   int64_t strict_tail_steal_min_donor_tasks = 0;
   int64_t strict_tail_steal_task_count = 0;
   std::vector<AsyncStrictTailStealTeam> strict_tail_steal_teams;
+  std::vector<AsyncStrictTailStealCohort> strict_tail_steal_cohorts;
+  std::vector<int64_t> strict_tail_team_by_tid;
   std::vector<int64_t> strict_tail_head_task_counts;
   if (use_strict_tail_steal) {
-    strict_tail_steal_width = tasks.front().threads;
-    use_strict_tail_steal =
-        strict_tail_steal_width > 0 &&
-        num_threads % strict_tail_steal_width == 0 &&
-        num_threads / strict_tail_steal_width >= 2;
-  }
-  if (use_strict_tail_steal) {
-    const int64_t team_count = num_threads / strict_tail_steal_width;
-    strict_tail_steal_teams.resize(static_cast<size_t>(team_count));
-    for (int64_t team = 0; team < team_count; ++team) {
-      AsyncStrictTailStealTeam& runtime_team =
-          strict_tail_steal_teams[static_cast<size_t>(team)];
-      runtime_team.core_begin = team * strict_tail_steal_width;
-      runtime_team.threads = strict_tail_steal_width;
-    }
-    for (int64_t task_id = 0;
-         task_id < num_tasks && use_strict_tail_steal; ++task_id) {
+    for (int64_t task_id = 0; task_id < num_tasks && use_strict_tail_steal; ++task_id) {
       const AsyncTaskRuntime& task = tasks[static_cast<size_t>(task_id)];
       const bool fixed_full_expert =
-          task_range_granularities_v[static_cast<size_t>(task_id)] ==
-              kAsyncFullExpertRange &&
-          task_placement_modes_v[static_cast<size_t>(task_id)] ==
-              kAsyncPlacementFixed &&
+          task_range_granularities_v[static_cast<size_t>(task_id)] == kAsyncFullExpertRange &&
+          task_placement_modes_v[static_cast<size_t>(task_id)] == kAsyncPlacementFixed &&
           seen[static_cast<size_t>(task.expert)] == 1;
-      const bool aligned_team =
-          task.threads == strict_tail_steal_width &&
-          task.core_begin >= 0 &&
-          task.core_begin % strict_tail_steal_width == 0 &&
-          task.core_begin + strict_tail_steal_width <= num_threads;
-      if (!fixed_full_expert || !aligned_team) {
+      const bool valid_team = task.threads > 0 && task.core_begin >= 0 && task.core_begin + task.threads <= num_threads;
+      if (!fixed_full_expert || !valid_team) {
         use_strict_tail_steal = false;
         break;
       }
-      const int64_t team = task.core_begin / strict_tail_steal_width;
-      AsyncStrictTailStealTeam& runtime_team =
-          strict_tail_steal_teams[static_cast<size_t>(team)];
+
+      int64_t team = -1;
+      for (size_t candidate = 0; candidate < strict_tail_steal_teams.size(); ++candidate) {
+        const AsyncStrictTailStealTeam& runtime_team = strict_tail_steal_teams[candidate];
+        if (runtime_team.core_begin == task.core_begin && runtime_team.threads == task.threads) {
+          team = static_cast<int64_t>(candidate);
+          break;
+        }
+      }
+      if (team < 0) {
+        team = static_cast<int64_t>(strict_tail_steal_teams.size());
+        strict_tail_steal_teams.push_back(
+            AsyncStrictTailStealTeam{task.core_begin, task.threads, task.scratch_index, -1, {}});
+      }
+      AsyncStrictTailStealTeam& runtime_team = strict_tail_steal_teams[static_cast<size_t>(team)];
       if (runtime_team.scratch_index < 0) {
         runtime_team.scratch_index = task.scratch_index;
       } else if (runtime_team.scratch_index != task.scratch_index) {
@@ -7392,25 +7388,43 @@ at::Tensor run_fused_moe_bf16_tiled_async(
     }
   }
   if (use_strict_tail_steal) {
+    std::sort(strict_tail_steal_teams.begin(), strict_tail_steal_teams.end(),
+              [](const AsyncStrictTailStealTeam& lhs, const AsyncStrictTailStealTeam& rhs) {
+                return std::tie(lhs.core_begin, lhs.threads) < std::tie(rhs.core_begin, rhs.threads);
+              });
+    strict_tail_team_by_tid.assign(static_cast<size_t>(num_threads), -1);
+    for (size_t team = 0; team < strict_tail_steal_teams.size() && use_strict_tail_steal; ++team) {
+      const AsyncStrictTailStealTeam& runtime_team = strict_tail_steal_teams[team];
+      for (int64_t tid = runtime_team.core_begin; tid < runtime_team.core_begin + runtime_team.threads; ++tid) {
+        int64_t& owner = strict_tail_team_by_tid[static_cast<size_t>(tid)];
+        if (owner >= 0) {
+          use_strict_tail_steal = false;
+          break;
+        }
+        owner = static_cast<int64_t>(team);
+      }
+    }
+    if (use_strict_tail_steal) {
+      use_strict_tail_steal = std::all_of(strict_tail_team_by_tid.begin(), strict_tail_team_by_tid.end(),
+                                          [](int64_t team) { return team >= 0; });
+    }
+  }
+  if (use_strict_tail_steal) {
     // The accepted dependency graph is a set of per-team resource-order
     // chains. Experts do not have data dependencies, so an idle team may
     // execute the next unstarted node from another chain.
-    for (const AsyncStrictTailStealTeam& runtime_team :
-         strict_tail_steal_teams) {
+    for (const AsyncStrictTailStealTeam& runtime_team : strict_tail_steal_teams) {
       if (runtime_team.task_ids.empty() || runtime_team.scratch_index < 0) {
         use_strict_tail_steal = false;
         break;
       }
       int64_t prior_task = -1;
       for (const int64_t task_id : runtime_team.task_ids) {
-        const int64_t begin =
-            task_dep_offsets_v[static_cast<size_t>(task_id)];
-        const int64_t end =
-            task_dep_offsets_v[static_cast<size_t>(task_id + 1)];
+        const int64_t begin = task_dep_offsets_v[static_cast<size_t>(task_id)];
+        const int64_t end = task_dep_offsets_v[static_cast<size_t>(task_id + 1)];
         const bool dependency_is_resource_chain =
             begin == end ||
-            (prior_task >= 0 && end == begin + 1 &&
-             task_deps_v[static_cast<size_t>(begin)] == prior_task);
+            (prior_task >= 0 && end == begin + 1 && task_deps_v[static_cast<size_t>(begin)] == prior_task);
         if (!dependency_is_resource_chain) {
           use_strict_tail_steal = false;
           break;
@@ -7423,63 +7437,98 @@ at::Tensor run_fused_moe_bf16_tiled_async(
     }
   }
   if (use_strict_tail_steal) {
-    for (const int64_t cpu : async_thread_pinning.cpus) {
-      const int64_t node = cpu_numa_node(cpu);
-      if (node < 0) {
-        use_strict_tail_steal = false;
+    use_strict_tail_steal = async_thread_pinning.cpus.size() == static_cast<size_t>(num_threads);
+    for (size_t team = 0; team < strict_tail_steal_teams.size() && use_strict_tail_steal; ++team) {
+      AsyncStrictTailStealTeam& runtime_team = strict_tail_steal_teams[team];
+      int64_t team_numa_node = -1;
+      for (int64_t tid = runtime_team.core_begin; tid < runtime_team.core_begin + runtime_team.threads; ++tid) {
+        const int64_t node = cpu_numa_node(async_thread_pinning.cpus[static_cast<size_t>(tid)]);
+        if (node < 0 || (team_numa_node >= 0 && team_numa_node != node)) {
+          use_strict_tail_steal = false;
+          break;
+        }
+        team_numa_node = node;
+      }
+      if (!use_strict_tail_steal) {
         break;
       }
-      if (strict_tail_steal_numa_node < 0) {
-        strict_tail_steal_numa_node = node;
-      } else if (strict_tail_steal_numa_node != node) {
-        use_strict_tail_steal = false;
-        break;
+
+      int64_t cohort_index = -1;
+      for (size_t cohort = 0; cohort < strict_tail_steal_cohorts.size(); ++cohort) {
+        const AsyncStrictTailStealCohort& runtime_cohort = strict_tail_steal_cohorts[cohort];
+        if (runtime_cohort.threads == runtime_team.threads && runtime_cohort.numa_node == team_numa_node) {
+          cohort_index = static_cast<int64_t>(cohort);
+          break;
+        }
+      }
+      if (cohort_index < 0) {
+        cohort_index = static_cast<int64_t>(strict_tail_steal_cohorts.size());
+        strict_tail_steal_cohorts.push_back(AsyncStrictTailStealCohort{runtime_team.threads, team_numa_node, 0, {}});
+      }
+      runtime_team.cohort_index = cohort_index;
+      AsyncStrictTailStealCohort& runtime_cohort = strict_tail_steal_cohorts[static_cast<size_t>(cohort_index)];
+      runtime_cohort.team_indices.push_back(static_cast<int64_t>(team));
+      for (const int64_t task_id : runtime_team.task_ids) {
+        runtime_cohort.max_rows = std::max(runtime_cohort.max_rows, tasks[static_cast<size_t>(task_id)].rows);
       }
     }
   }
   if (use_strict_tail_steal) {
-    strict_tail_steal_depth =
-        env_int_or_default("FUSED_CPP_MOE_STRICT_TAIL_STEAL_DEPTH", 2);
-    strict_tail_steal_min_donor_tasks = env_int_or_default(
-        "FUSED_CPP_MOE_STRICT_TAIL_STEAL_MIN_DONOR_TASKS", 2);
-    use_strict_tail_steal =
-        strict_tail_steal_depth > 0 &&
-        strict_tail_steal_min_donor_tasks > 0;
+    strict_tail_steal_depth = env_int_or_default("FUSED_CPP_MOE_STRICT_TAIL_STEAL_DEPTH", 2);
+    strict_tail_steal_min_donor_tasks = env_int_or_default("FUSED_CPP_MOE_STRICT_TAIL_STEAL_MIN_DONOR_TASKS", 1);
+    use_strict_tail_steal = strict_tail_steal_depth > 0 && strict_tail_steal_min_donor_tasks > 0;
   }
   if (use_strict_tail_steal) {
     strict_tail_head_task_counts.resize(strict_tail_steal_teams.size());
     for (size_t team = 0; team < strict_tail_steal_teams.size(); ++team) {
-      const std::vector<int64_t>& team_tasks =
-          strict_tail_steal_teams[team].task_ids;
+      const std::vector<int64_t>& team_tasks = strict_tail_steal_teams[team].task_ids;
+      const AsyncStrictTailStealCohort& runtime_cohort =
+          strict_tail_steal_cohorts[static_cast<size_t>(strict_tail_steal_teams[team].cohort_index)];
       const int64_t tail_count =
-          std::min<int64_t>(strict_tail_steal_depth,
-                            std::max<int64_t>(
-                                0, static_cast<int64_t>(team_tasks.size()) - 1));
-      const int64_t head_count =
-          static_cast<int64_t>(team_tasks.size()) - tail_count;
+          runtime_cohort.team_indices.size() >= 2
+              ? std::min<int64_t>(strict_tail_steal_depth,
+                                  std::max<int64_t>(0, static_cast<int64_t>(team_tasks.size()) - 1))
+              : 0;
+      const int64_t head_count = static_cast<int64_t>(team_tasks.size()) - tail_count;
       strict_tail_head_task_counts[team] = head_count;
       strict_tail_steal_task_count += tail_count;
     }
     use_strict_tail_steal = strict_tail_steal_task_count > 0;
   }
+  if (use_strict_tail_steal) {
+    // A short-team scratch may have been sized only for its original tasks.
+    // Resize every destination before leasing scratch so any same-cohort task
+    // can migrate without a runtime allocation or a size-dependent rejection.
+    for (const AsyncStrictTailStealCohort& runtime_cohort : strict_tail_steal_cohorts) {
+      for (const int64_t team : runtime_cohort.team_indices) {
+        AsyncStrictTailStealTeam& runtime_team = strict_tail_steal_teams[static_cast<size_t>(team)];
+        runtime_team.scratch_index =
+            ensure_scratch_config(runtime_team.core_begin, runtime_team.threads, runtime_cohort.max_rows);
+      }
+    }
+  }
   if (!use_strict_tail_steal) {
     strict_tail_steal_teams.clear();
+    strict_tail_steal_cohorts.clear();
+    strict_tail_team_by_tid.clear();
     strict_tail_head_task_counts.clear();
     strict_tail_steal_task_count = 0;
   }
   if (env_flag_enabled("FUSED_CPP_MOE_STAGE_TIMING")) {
-    std::fprintf(
-        stderr,
-        "[fused_moe_bf16_tiled_async][strict_tail_steal_policy] "
-        "requested=%d effective=%d teams=%zu width=%lld numa=%lld "
-        "depth=%lld min_donor_tasks=%lld tail_tasks=%lld\n",
-        strict_tail_steal_requested ? 1 : 0,
-        use_strict_tail_steal ? 1 : 0, strict_tail_steal_teams.size(),
-        static_cast<long long>(strict_tail_steal_width),
-        static_cast<long long>(strict_tail_steal_numa_node),
-        static_cast<long long>(strict_tail_steal_depth),
-        static_cast<long long>(strict_tail_steal_min_donor_tasks),
-        static_cast<long long>(strict_tail_steal_task_count));
+    std::fprintf(stderr,
+                 "[fused_moe_bf16_tiled_async][strict_tail_steal_policy] "
+                 "requested=%d effective=%d teams=%zu cohorts=%zu geometry=[",
+                 strict_tail_steal_requested ? 1 : 0, use_strict_tail_steal ? 1 : 0, strict_tail_steal_teams.size(),
+                 strict_tail_steal_cohorts.size());
+    for (size_t cohort = 0; cohort < strict_tail_steal_cohorts.size(); ++cohort) {
+      const AsyncStrictTailStealCohort& runtime_cohort = strict_tail_steal_cohorts[cohort];
+      std::fprintf(stderr, "%s%lldT@N%lld:%zu", cohort == 0 ? "" : ",", static_cast<long long>(runtime_cohort.threads),
+                   static_cast<long long>(runtime_cohort.numa_node), runtime_cohort.team_indices.size());
+    }
+    std::fprintf(stderr, "] depth=%lld min_donor_tasks=%lld tail_tasks=%lld\n",
+                 static_cast<long long>(strict_tail_steal_depth),
+                 static_cast<long long>(strict_tail_steal_min_donor_tasks),
+                 static_cast<long long>(strict_tail_steal_task_count));
   }
 
   std::vector<std::vector<int64_t>> short_pool_group_blockers;
@@ -7869,14 +7918,14 @@ at::Tensor run_fused_moe_bf16_tiled_async(
   phase_begin = trace_phase_begin();
   if (use_strict_tail_steal) {
     run_fixed_threads(num_threads, [&](int64_t tid) {
-      const int64_t team_index = tid / strict_tail_steal_width;
-      const AsyncStrictTailStealTeam& runtime_team =
-          strict_tail_steal_teams[static_cast<size_t>(team_index)];
+      const int64_t team_index = strict_tail_team_by_tid[static_cast<size_t>(tid)];
+      TORCH_INTERNAL_ASSERT(team_index >= 0, "strict tail worker has no owning team: tid=", tid);
+      const AsyncStrictTailStealTeam& runtime_team = strict_tail_steal_teams[static_cast<size_t>(team_index)];
+      const AsyncStrictTailStealCohort& runtime_cohort =
+          strict_tail_steal_cohorts[static_cast<size_t>(runtime_team.cohort_index)];
       const int64_t local_tid = tid - runtime_team.core_begin;
-      ScheduledTeamScratch& team_scratch =
-          *scratches[static_cast<size_t>(runtime_team.scratch_index)];
-      const int64_t head_task_count =
-          strict_tail_head_task_counts[static_cast<size_t>(team_index)];
+      ScheduledTeamScratch& team_scratch = *scratches[static_cast<size_t>(runtime_team.scratch_index)];
+      const int64_t head_task_count = strict_tail_head_task_counts[static_cast<size_t>(team_index)];
 
       // Execute the planner-owned prefix with the original fixed-team
       // protocol. Tail tasks are invisible here, so their later state-1
@@ -7884,24 +7933,18 @@ at::Tensor run_fused_moe_bf16_tiled_async(
       while (true) {
         int64_t selected_task = -1;
         for (int64_t index = 0; index < head_task_count; ++index) {
-          const int64_t task_id =
-              runtime_team.task_ids[static_cast<size_t>(index)];
-          int64_t state =
-              task_states[static_cast<size_t>(task_id)].load(
-                  std::memory_order_acquire);
+          const int64_t task_id = runtime_team.task_ids[static_cast<size_t>(index)];
+          int64_t state = task_states[static_cast<size_t>(task_id)].load(std::memory_order_acquire);
           if (state == 2) {
             continue;
           }
           if (state == 0) {
-            if (deps_remaining[static_cast<size_t>(task_id)].load(
-                    std::memory_order_acquire) != 0) {
+            if (deps_remaining[static_cast<size_t>(task_id)].load(std::memory_order_acquire) != 0) {
               continue;
             }
             int64_t expected = 0;
-            if (!task_states[static_cast<size_t>(task_id)]
-                     .compare_exchange_strong(
-                         expected, 1, std::memory_order_acq_rel,
-                         std::memory_order_acquire)) {
+            if (!task_states[static_cast<size_t>(task_id)].compare_exchange_strong(
+                    expected, 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
               state = expected;
               if (state != 1) {
                 continue;
@@ -7912,8 +7955,7 @@ at::Tensor run_fused_moe_bf16_tiled_async(
           break;
         }
         if (selected_task >= 0) {
-          run_async_task(tid, selected_task,
-                         tasks[static_cast<size_t>(selected_task)]);
+          run_async_task(tid, selected_task, tasks[static_cast<size_t>(selected_task)]);
           if (local_tid == 0) {
             ++strict_tail_tasks_by_team[static_cast<size_t>(team_index)];
           }
@@ -7922,10 +7964,8 @@ at::Tensor run_fused_moe_bf16_tiled_async(
 
         bool head_complete = true;
         for (int64_t index = 0; index < head_task_count; ++index) {
-          const int64_t task_id =
-              runtime_team.task_ids[static_cast<size_t>(index)];
-          if (task_states[static_cast<size_t>(task_id)].load(
-                  std::memory_order_acquire) != 2) {
+          const int64_t task_id = runtime_team.task_ids[static_cast<size_t>(index)];
+          if (task_states[static_cast<size_t>(task_id)].load(std::memory_order_acquire) != 2) {
             head_complete = false;
             break;
           }
@@ -7948,24 +7988,16 @@ at::Tensor run_fused_moe_bf16_tiled_async(
       // per-task handoff.
       while (true) {
         int64_t selected_task = -1;
-        for (int64_t index = head_task_count;
-             index < static_cast<int64_t>(runtime_team.task_ids.size());
-             ++index) {
-          const int64_t task_id =
-              runtime_team.task_ids[static_cast<size_t>(index)];
-          int64_t state =
-              task_states[static_cast<size_t>(task_id)].load(
-                  std::memory_order_acquire);
+        for (int64_t index = head_task_count; index < static_cast<int64_t>(runtime_team.task_ids.size()); ++index) {
+          const int64_t task_id = runtime_team.task_ids[static_cast<size_t>(index)];
+          int64_t state = task_states[static_cast<size_t>(task_id)].load(std::memory_order_acquire);
           if (state == 2) {
             continue;
           }
           if (state == 0) {
             int64_t expected = 0;
-            if (task_states[static_cast<size_t>(task_id)]
-                    .compare_exchange_strong(
-                        expected, tail_running_state,
-                        std::memory_order_acq_rel,
-                        std::memory_order_acquire)) {
+            if (task_states[static_cast<size_t>(task_id)].compare_exchange_strong(
+                    expected, tail_running_state, std::memory_order_acq_rel, std::memory_order_acquire)) {
               state = tail_running_state;
             } else {
               state = expected;
@@ -7979,8 +8011,7 @@ at::Tensor run_fused_moe_bf16_tiled_async(
         if (selected_task < 0) {
           break;
         }
-        run_async_task(tid, selected_task,
-                       tasks[static_cast<size_t>(selected_task)]);
+        run_async_task(tid, selected_task, tasks[static_cast<size_t>(selected_task)]);
         if (local_tid == 0) {
           ++strict_tail_tasks_by_team[static_cast<size_t>(team_index)];
         }
@@ -7992,45 +8023,32 @@ at::Tensor run_fused_moe_bf16_tiled_async(
           if (completed_tasks.load(std::memory_order_acquire) < num_tasks) {
             // The local suffix is complete or owned by another team. Claim
             // the first pending tail node from the heaviest peer suffix.
-            for (size_t attempt = 0;
-                 selected_task < 0 &&
-                 attempt < strict_tail_steal_teams.size();
-                 ++attempt) {
+            for (size_t attempt = 0; selected_task < 0 && attempt < runtime_cohort.team_indices.size(); ++attempt) {
               int64_t best_task = -1;
               int64_t best_remaining_rows = -1;
-              for (size_t donor = 0;
-                   donor < strict_tail_steal_teams.size(); ++donor) {
-                if (static_cast<int64_t>(donor) == team_index) {
+              for (const int64_t donor : runtime_cohort.team_indices) {
+                if (donor == team_index) {
                   continue;
                 }
                 int64_t donor_task = -1;
                 int64_t remaining_tasks = 0;
                 int64_t remaining_rows = 0;
-                const AsyncStrictTailStealTeam& donor_team =
-                    strict_tail_steal_teams[donor];
-                const int64_t donor_head_count =
-                    strict_tail_head_task_counts[donor];
-                for (int64_t index = donor_head_count;
-                     index <
-                     static_cast<int64_t>(donor_team.task_ids.size());
+                const AsyncStrictTailStealTeam& donor_team = strict_tail_steal_teams[static_cast<size_t>(donor)];
+                const int64_t donor_head_count = strict_tail_head_task_counts[static_cast<size_t>(donor)];
+                for (int64_t index = donor_head_count; index < static_cast<int64_t>(donor_team.task_ids.size());
                      ++index) {
-                  const int64_t task_id =
-                      donor_team.task_ids[static_cast<size_t>(index)];
-                  if (task_states[static_cast<size_t>(task_id)].load(
-                          std::memory_order_acquire) != 0) {
+                  const int64_t task_id = donor_team.task_ids[static_cast<size_t>(index)];
+                  if (task_states[static_cast<size_t>(task_id)].load(std::memory_order_acquire) != 0) {
                     continue;
                   }
                   ++remaining_tasks;
-                  remaining_rows +=
-                      tasks[static_cast<size_t>(task_id)].rows;
+                  remaining_rows += tasks[static_cast<size_t>(task_id)].rows;
                   if (donor_task < 0) {
                     donor_task = task_id;
                   }
                 }
-                if (remaining_tasks < strict_tail_steal_min_donor_tasks ||
-                    donor_task < 0 ||
-                    tasks[static_cast<size_t>(donor_task)].rows >
-                        team_scratch.max_rows) {
+                if (remaining_tasks < strict_tail_steal_min_donor_tasks || donor_task < 0 ||
+                    tasks[static_cast<size_t>(donor_task)].rows > team_scratch.max_rows) {
                   continue;
                 }
                 if (remaining_rows > best_remaining_rows) {
@@ -8042,11 +8060,8 @@ at::Tensor run_fused_moe_bf16_tiled_async(
                 break;
               }
               int64_t expected = 0;
-              if (task_states[static_cast<size_t>(best_task)]
-                      .compare_exchange_strong(
-                          expected, tail_running_state,
-                          std::memory_order_acq_rel,
-                          std::memory_order_acquire)) {
+              if (task_states[static_cast<size_t>(best_task)].compare_exchange_strong(
+                      expected, tail_running_state, std::memory_order_acq_rel, std::memory_order_acquire)) {
                 selected_task = best_task;
                 ++strict_tail_stolen_by_team[static_cast<size_t>(team_index)];
                 strict_tail_stolen_rows_by_team[static_cast<size_t>(team_index)] +=
@@ -8057,14 +8072,11 @@ at::Tensor run_fused_moe_bf16_tiled_async(
 
           if (selected_task >= 0) {
             ++strict_tail_tasks_by_team[static_cast<size_t>(team_index)];
-            strict_tail_current_tasks[static_cast<size_t>(team_index)].store(
-                selected_task, std::memory_order_release);
-            std::atomic<int64_t>& assignment_epoch =
-                strict_tail_assignment_epochs[static_cast<size_t>(team_index)];
+            strict_tail_current_tasks[static_cast<size_t>(team_index)].store(selected_task, std::memory_order_release);
+            std::atomic<int64_t>& assignment_epoch = strict_tail_assignment_epochs[static_cast<size_t>(team_index)];
             assignment_epoch.fetch_add(1, std::memory_order_release);
             assignment_epoch.notify_all();
-            AsyncTaskRuntime migrated_task =
-                tasks[static_cast<size_t>(selected_task)];
+            AsyncTaskRuntime migrated_task = tasks[static_cast<size_t>(selected_task)];
             migrated_task.core_begin = runtime_team.core_begin;
             migrated_task.scratch_index = runtime_team.scratch_index;
             run_async_task(tid, selected_task, migrated_task);
@@ -8074,39 +8086,30 @@ at::Tensor run_fused_moe_bf16_tiled_async(
           // No new pending task can appear after this point; task states only
           // move from pending to running to complete. Release the team now
           // instead of keeping idle workers alive until global completion.
-          strict_tail_current_tasks[static_cast<size_t>(team_index)].store(
-              -2, std::memory_order_release);
-          std::atomic<int64_t>& assignment_epoch =
-              strict_tail_assignment_epochs[static_cast<size_t>(team_index)];
+          strict_tail_current_tasks[static_cast<size_t>(team_index)].store(-2, std::memory_order_release);
+          std::atomic<int64_t>& assignment_epoch = strict_tail_assignment_epochs[static_cast<size_t>(team_index)];
           assignment_epoch.fetch_add(1, std::memory_order_release);
           assignment_epoch.notify_all();
           break;
         }
       } else {
         int64_t observed_epoch = 0;
-        std::atomic<int64_t>& assignment_epoch =
-            strict_tail_assignment_epochs[static_cast<size_t>(team_index)];
+        std::atomic<int64_t>& assignment_epoch = strict_tail_assignment_epochs[static_cast<size_t>(team_index)];
         while (true) {
-          int64_t published_epoch =
-              assignment_epoch.load(std::memory_order_acquire);
+          int64_t published_epoch = assignment_epoch.load(std::memory_order_acquire);
           while (published_epoch == observed_epoch) {
             assignment_epoch.wait(observed_epoch, std::memory_order_acquire);
-            published_epoch =
-                assignment_epoch.load(std::memory_order_acquire);
+            published_epoch = assignment_epoch.load(std::memory_order_acquire);
           }
           observed_epoch = published_epoch;
           const int64_t selected_task =
-              strict_tail_current_tasks[static_cast<size_t>(team_index)].load(
-                  std::memory_order_acquire);
+              strict_tail_current_tasks[static_cast<size_t>(team_index)].load(std::memory_order_acquire);
           if (selected_task == -2) {
             break;
           }
-          TORCH_INTERNAL_ASSERT(
-              selected_task >= 0,
-              "strict tail assignment published an invalid task: ",
-              selected_task);
-          AsyncTaskRuntime migrated_task =
-              tasks[static_cast<size_t>(selected_task)];
+          TORCH_INTERNAL_ASSERT(selected_task >= 0,
+                                "strict tail assignment published an invalid task: ", selected_task);
+          AsyncTaskRuntime migrated_task = tasks[static_cast<size_t>(selected_task)];
           migrated_task.core_begin = runtime_team.core_begin;
           migrated_task.scratch_index = runtime_team.scratch_index;
           run_async_task(tid, selected_task, migrated_task);
@@ -8117,20 +8120,15 @@ at::Tensor run_fused_moe_bf16_tiled_async(
       // ready-token contract by letting released workers drain merge work
       // until every expert and token has been published.
       while (use_async_ready_token_drain) {
-        const bool compute_complete =
-            completed_tasks.load(std::memory_order_acquire) >= num_tasks;
-        if (try_merge_owned_ready_tokens(
-                tid, compute_complete ? async_ready_token_batch : 1)) {
+        const bool compute_complete = completed_tasks.load(std::memory_order_acquire) >= num_tasks;
+        if (try_merge_owned_ready_tokens(tid, compute_complete ? async_ready_token_batch : 1)) {
           continue;
         }
         if (compute_complete) {
-          TORCH_INTERNAL_ASSERT(
-              published_ready_tokens.load(std::memory_order_acquire) == num_tokens,
-              "strict tail stealing is missing published tokens: published=",
-              published_ready_tokens.load(std::memory_order_relaxed),
-              " expected=", num_tokens);
-          if (completed_ready_token_merges.load(std::memory_order_acquire) >=
-              num_tokens) {
+          TORCH_INTERNAL_ASSERT(published_ready_tokens.load(std::memory_order_acquire) == num_tokens,
+                                "strict tail stealing is missing published tokens: published=",
+                                published_ready_tokens.load(std::memory_order_relaxed), " expected=", num_tokens);
+          if (completed_ready_token_merges.load(std::memory_order_acquire) >= num_tokens) {
             break;
           }
         }
@@ -8305,29 +8303,30 @@ at::Tensor run_fused_moe_bf16_tiled_async(
       !use_async_ready_token_drain || completed_ready_token_merges.load(std::memory_order_acquire) == num_tokens,
       "fixed-owner ready-token merge exited before draining every token");
   trace_phase_end(-1, -1, -1, -1, num_routes, "scheduled_compute", phase_begin);
-  if (use_strict_tail_steal &&
-      env_flag_enabled("FUSED_CPP_MOE_STAGE_TIMING")) {
+  if (use_strict_tail_steal && env_flag_enabled("FUSED_CPP_MOE_STAGE_TIMING")) {
     int64_t stolen_tasks = 0;
     int64_t stolen_rows = 0;
-    std::fprintf(
-        stderr,
-        "[fused_moe_bf16_tiled_async][strict_tail_steal] "
-        "teams=%zu width=%lld tasks_by_team=[",
-        strict_tail_steal_teams.size(),
-        static_cast<long long>(strict_tail_steal_width));
+    std::vector<int64_t> stolen_by_cohort(strict_tail_steal_cohorts.size(), 0);
+    std::fprintf(stderr,
+                 "[fused_moe_bf16_tiled_async][strict_tail_steal] "
+                 "teams=%zu cohorts=%zu tasks_by_team=[",
+                 strict_tail_steal_teams.size(), strict_tail_steal_cohorts.size());
     for (size_t team = 0; team < strict_tail_tasks_by_team.size(); ++team) {
-      std::fprintf(stderr, "%s%lld", team == 0 ? "" : ",",
-                   static_cast<long long>(strict_tail_tasks_by_team[team]));
+      std::fprintf(stderr, "%s%lld", team == 0 ? "" : ",", static_cast<long long>(strict_tail_tasks_by_team[team]));
       stolen_tasks += strict_tail_stolen_by_team[team];
       stolen_rows += strict_tail_stolen_rows_by_team[team];
+      const int64_t cohort = strict_tail_steal_teams[team].cohort_index;
+      stolen_by_cohort[static_cast<size_t>(cohort)] += strict_tail_stolen_by_team[team];
     }
     std::fprintf(stderr, "] stolen_by_team=[");
     for (size_t team = 0; team < strict_tail_stolen_by_team.size(); ++team) {
-      std::fprintf(stderr, "%s%lld", team == 0 ? "" : ",",
-                   static_cast<long long>(strict_tail_stolen_by_team[team]));
+      std::fprintf(stderr, "%s%lld", team == 0 ? "" : ",", static_cast<long long>(strict_tail_stolen_by_team[team]));
     }
-    std::fprintf(stderr, "] stolen_tasks=%lld stolen_rows=%lld\n",
-                 static_cast<long long>(stolen_tasks),
+    std::fprintf(stderr, "] stolen_by_cohort=[");
+    for (size_t cohort = 0; cohort < stolen_by_cohort.size(); ++cohort) {
+      std::fprintf(stderr, "%s%lld", cohort == 0 ? "" : ",", static_cast<long long>(stolen_by_cohort[cohort]));
+    }
+    std::fprintf(stderr, "] stolen_tasks=%lld stolen_rows=%lld\n", static_cast<long long>(stolen_tasks),
                  static_cast<long long>(stolen_rows));
   }
   if (use_async_ready_token_merge && env_flag_enabled("FUSED_CPP_MOE_STAGE_TIMING")) {

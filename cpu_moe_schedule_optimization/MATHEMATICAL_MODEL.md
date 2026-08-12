@@ -432,13 +432,19 @@ entry 并重新 cold search。
 
 #### 2.3.2 实验性 strict 尾部任务领取
 
-strict plan 的 lane dependency 是资源排序，不是 expert 间数据依赖。对于同宽
-lane，记 planner 给出的有序任务队列为
+strict plan 的 lane dependency 是资源排序，不是 expert 间数据依赖。按
+$\kappa=(t,\nu)$ 将 team 分成线程宽度 $t$、NUMA node $\nu$ 相同的 cohort，
+记其 team 集合为 $G_\kappa$。对任意 $g\in G_\kappa$，planner 给出的有序
+任务队列和固定 logical-core interval 为
 
 $$
 Q_g=(i_{g,1},\ldots,i_{g,n_g}),\qquad
-B_g=[gt,(g+1)t),\qquad g=0,\ldots,C/t-1.
+B_g=[b_g,b_g+t).
 $$
+
+全部 $B_g$ 两两不交并恰好覆盖 logical workers；一个 team 内的物理 CPU 必须
+属于同一 NUMA node，但不同 cohort 可以位于不同 node。迁移仅发生在同一个
+$G_\kappa$ 内，因此不改变 task 的线程宽度，也不跨 NUMA。
 
 给定很小的尾部深度 $d$，runtime 将每条 lane 分为 planner-owned 前缀和可迁移
 后缀：
@@ -456,8 +462,8 @@ $x_i\in\{\mathrm{pending},\mathrm{running}(g),\mathrm{complete}\}$；
 `running(g)` 在原子状态中编码实际 owner team，防止 donor worker 错误加入已被
 迁移的 task。
 
-当 team $g$ 的后缀已完成或已被其他 team 领取时，只有 leader 扫描 peer
-后缀。对 donor $h$ 定义
+当 team $g$ 的后缀已完成或已被其他 team 领取时，只有 leader 扫描同 cohort
+的 peer 后缀。对 donor $h\in G_{\kappa(g)}$ 定义
 
 $$
 c_h=\left|\{i\in U_h\mid x_i=\mathrm{pending}\}\right|,\qquad
@@ -467,7 +473,7 @@ $$
 并选择
 
 $$
-h^*=\arg\max_{h\ne g,\ c_h\ge r_{\min}}R_h.
+h^*=\arg\max_{h\in G_{\kappa(g)},\ h\ne g,\ c_h\ge r_{\min}}R_h.
 $$
 
 leader 对 $U_{h^*}$ 中最早的 pending task 做一次
@@ -484,10 +490,12 @@ expert-completion release 控制。CAS 失败立即重新扫描，不等待 dono
 当前 runtime 仅在以下条件全部成立时允许该动作：
 
 1. strict Plan V2、fused SVE、fixed placement；
-2. 单 NUMA，全部 team 同宽且恰好分区覆盖 logical workers；
+2. 每个 team 内为单 NUMA，全部 team 恰好分区覆盖 logical workers；迁移只在
+   $(t,\nu)$ 相同的 cohort 内发生；
 3. 每个 task 是唯一的 whole-expert task，不含 route slice；
 4. dependency 为空或仅指向同 lane 的直接前驱，因此可证明是资源排序链；
-5. thief scratch 的 `max_rows` 不小于被领取 task 的 route 数。
+5. scratch lease 前将每个 team 的 `max_rows` 扩到其 cohort 的最大 task route
+   数，迁移期间不分配内存。
 
 该动作不改变 $t_i$，因此 task 仍是非抢占 moldable job；变化的是未启动 task
 的实际 placement 和 start time。它也不同于 `tail_pool`：planner 没有预先把
@@ -495,8 +503,9 @@ expert 标成 pooled，runtime 只在 planner 前缀结束后借用另一个 str
 的受限后缀。环境变量 `FUSED_CPP_MOE_STRICT_TAIL_STEAL=1` 显式启用；
 `FUSED_CPP_MOE_STRICT_TAIL_STEAL_DEPTH` 默认 $d=2$，
 `FUSED_CPP_MOE_STRICT_TAIL_STEAL_MIN_DONOR_TASKS` 默认
-$r_{\min}=2$。功能默认关闭，planner candidate、cache identity 和 cost-model
-评分均不变。现有 strict DAG simulator 不解除 lane resource edge，因此不能
+$r_{\min}=1$，即存在一个完整、未启动的合法后缀 task 就可领取。功能默认关闭，
+planner candidate、cache identity 和 cost-model 评分均不变。现有 strict DAG
+simulator 不解除 lane resource edge，因此不能
 预测该实验路径；进入 production 前必须增加相同 suffix policy 的事件模拟和
 held-out E2E 验证。
 
@@ -1533,8 +1542,8 @@ cold search。
 | 线程宽度 | $1,2,\ldots,T_{\max}$ | empirical strict backend 为 `1,2,4,8,16,32`；analytic strict backend 使用 machine calibration 中显式允许的宽度；自动短 expert pool 只搜索 `1,2,4`；96-core bounded tail whole-expert 候选只搜索 `24,32,48`，其中缺表宽度仅允许长整 M12 formula 插值；route-sliced tail 只允许 exact-layout anchor 中显式校准的宽度，当前为 `24T`；forced override 可用其他已校准宽度；离线 cold-phase oracle 默认比较 `1,2,4,8,16`，不扩大 production 域 | 离散宽度剪枝 |
 | 并发配置 | 活跃 job 可形成任意满足 CPU 容量的 $(M_i,t_i)$ 组合 | 搜索静态 core shape，并自动比较 strict、threshold/统一宽度 tail-pool 与恰好两个 terminal expert 的一次 bounded repartition；后者可在 exact anchor 命中时把每个 terminal expert 切成两个连续 M slice，使四个 fixed task 覆盖全部核心。benchmark-only large/small 候选按一个 route threshold 把同 NUMA 核心切成两个互不重叠区域，从调用开始并发执行两类 whole expert；已反证的三类 bounded-stream 扩展再保留固定数量的 M<=12 1T 区，只用于实验 | static-partition + terminal repartition 剪枝 |
 | Shape 集合 | 所有满足 CPU 容量的整数宽度组合 | empirical backend 只用 profile shape；analytic backend 生成 homogeneous 和至多两种宽度的 shape，再应用 active 工作集规则；tail-pool 和 bounded tail 只从 strict uncertainty band 和最快两个 head shape 派生。large/small 与三类 bounded-stream 实验只允许 profile 已校准宽度、连续且可整除的 core region，不进入 production 搜索 | 候选剪枝 |
-| Assignment | 任意 expert-to-resource 调度 | 先按 isolated cost 的 LPT 固定 expert-to-lane membership；非 full-call-anchor strict 候选再比较原顺序与两个奇偶 lane 反序 seed，但不把 expert 移到另一 lane。large/small 实验在两个区域内分别做 LPT；三类 bounded-stream 在 large/medium/short 区内分别做 LPT，均禁止跨区迁移。实验 strict tail-steal 保留每条 lane 的 planner 前缀，只从 peer lane 的受限 pending 后缀迁移 whole expert 到同宽空闲 team | 启发式分配与 suffix-steal 剪枝 |
-| Runtime plan contract | task 可携带离散宽度集合、stage、route-slice、resize 边界、动态 placement 和合法的 tile-aligned owner window | bounded tail 在 terminal expert 启动前生成新的 singleton fixed width 和 blocker DAG；production whole-expert task 的 W13/W2 均执行完整 N domain，Plan/ABI 不携带 weight range、split、byte-window、task release 或 W2 resize，但可逐 stage 携带 per-worker `window_tiles`（0 表示 full stripe）；窗口只改变完整 N domain 的访问顺序。production 由确定性 band policy 在 width 选定后给值，analytic v6 仅作 shadow post-policy，不把 window 扩成 planner 自由变量；exact-anchor route fission 将同一 expert 的连续 M slice 作为多个 strict task，只有全部 slice 完成后才发布 expert completion；tail_pool 保持 whole-expert 动态 placement；实验 strict tail-steal 只接受单 NUMA、同宽、fixed、whole-expert 资源链，并保留 ready-token drain | 单次 terminal expert 重分区、结构化 window 候选与受限未启动 task 迁移剪枝 |
+| Assignment | 任意 expert-to-resource 调度 | 先按 isolated cost 的 LPT 固定 expert-to-lane membership；非 full-call-anchor strict 候选再比较原顺序与两个奇偶 lane 反序 seed，但不把 expert 移到另一 lane。large/small 实验在两个区域内分别做 LPT；三类 bounded-stream 在 large/medium/short 区内分别做 LPT，均禁止跨区迁移。实验 strict tail-steal 保留每条 lane 的 planner 前缀，只从同 $(threads,NUMA)$ cohort 的 peer lane 受限 pending 后缀迁移 whole expert | 启发式分配与 suffix-steal 剪枝 |
+| Runtime plan contract | task 可携带离散宽度集合、stage、route-slice、resize 边界、动态 placement 和合法的 tile-aligned owner window | bounded tail 在 terminal expert 启动前生成新的 singleton fixed width 和 blocker DAG；production whole-expert task 的 W13/W2 均执行完整 N domain，Plan/ABI 不携带 weight range、split、byte-window、task release 或 W2 resize，但可逐 stage 携带 per-worker `window_tiles`（0 表示 full stripe）；窗口只改变完整 N domain 的访问顺序。production 由确定性 band policy 在 width 选定后给值，analytic v6 仅作 shadow post-policy，不把 window 扩成 planner 自由变量；exact-anchor route fission 将同一 expert 的连续 M slice 作为多个 strict task，只有全部 slice 完成后才发布 expert completion；tail_pool 保持 whole-expert 动态 placement；实验 strict tail-steal 只接受 fixed、whole-expert 资源链和恰好覆盖 worker 的不重叠 team，并仅在同线程宽度、同 NUMA cohort 内迁移，同时保留 ready-token drain | 单次 terminal expert 重分区、结构化 window 候选与受限未启动 task 迁移剪枝 |
 | Stage coupling | W13/W2 可形成任意满足依赖和容量的 stage DAG | production 使用 whole-expert pipeline；独立 W13/W2 Plan V2 加全局 barrier 仅作为实验 entrypoint，matched/independent 两种计划都不进入默认搜索 | production 粒度剪枝与实验对照 |
 | x86 synchronous executor team mapping | expert 可取任意合法整数宽度并形成任意 wave | API 接受 1--256 workers；均衡 route 用 atomic expert queue，active expert 不足时按 route/当前宽度贪心组 team，强偏斜时按 64-row target 形成有序 wave | planner 外的确定性 runtime mapper |
 | Ordering | 任意可行开始时间和顺序 | strict 候选只比较三种确定性顺序：全部 lane 保持 LPT、奇数 lane 整链反序、偶数 lane 整链反序，并用完整 event-time cost model 严格判优；不搜索任意排列或主动 start delay。full-call anchor 保持原 LPT。实验 strict tail-steal 保留 planner 前缀和本地后缀优先，只允许领取 peer lane 的 pending suffix frontier | 顺序剪枝 |
@@ -4908,4 +4917,5 @@ auto；DSV4/tiered 两个顺序均保持 auto。由此关闭 192C host 的 2% he
 | 2026-08-11 | v1.12 | 定位 temporal strict bimodal 回退：phase trace 显示 reverse-even 的 compute end 比 LPT 提前 `0.80--1.05 ms`，W13/W2 与 compute core-ms 都更低；但 compute 后 ready token 从 `47/59` 增至 `2040/2041`，fixed-owner merge tail 从 `0.037/0.051 ms` 放大到 `0.347/1.939 ms`。原因是最后长 expert 的单个 `local_tid==0` 串行扫描约 2040 routes 并发布 token，同时 96 owners 轮询/排空，形成当前 expert-only DAG 未建模的 burst 与双稳态。关闭 ready-token early merge 后，两个独立 51-pair strict A/B 稳定提升 `+5.88%/+6.07%`，证明回退来自 merge-readiness 交互而非 GEMM 时间交错。production gate 继续保持 open，下一步需联合建模 token readiness 或对 bursty temporal plan 禁用 early merge。|
 | 2026-08-11 | v1.13 | strict planner 增加不扩大搜索空间的 routing-shape/route-bound early-merge 保守 gate：复用选中 compute DAG 的 expert finish time；对每个高覆盖 expert，以自身 route count 减去所有更晚波次 route occurrence，形成其 ready burst 的安全下界。若该下界之外的 token 不超过默认一轮 fixed-owner drain（$B_{merge}T=2T$），Plan V2 写入 `early_merge=false`，否则保持 `null/auto`，从不强制开启。gate 只读取 `topk_ids` 的 $(N,K)$ 形状，复杂度 $O(E|\mathcal H|)$，不扫描 token 内容；冷/热 path 每次重算，不把 token 数决策错误缓存到 histogram shape 上。tail-pool、candidate score、shape cache、native planner ABI 与 kernel ABI 不变。合成测试覆盖同 histogram 的不同 $(N,K)$ 在 cache hit 上 `null -> false -> null`；plan-only 对 selected strict `6x16T` bimodal 得到 `2016/2048` burst 下界并关闭，对 DSV4/tiered 的 `917/384` 保持 auto。AmazonC5192Cores NUMA0 的 9-case strict catalog 以 7-warmup/51-pair 复验得到 bimodal/DSV4/tiered `+6.28%/+8.80%/-0.56%`，六个未改序对照 median 绝对偏差不超过 `0.89%`，关闭该 host 的 2% held-out gate。|
 | 2026-08-11 | v1.14 | 增加 benchmark-only large/medium/short bounded-stream comparator：在原 `48C x 8T + 48C x 1T` shape 内，为 M<=12 静态保留可配置数量的 1T lane，并让三类 LPT 链从调用起点并发。DSV4 上 isolated short service 预测 3 lane 足够，但 4/6/8 lane 实测严重成为尾部；12--16 lane 才恢复，51-round 最优 16 lane 为 11.789 ms，仍比原双区 11.595 ms 慢 1.67%。trace 中 short 启动从 5.177 提前到 0.277 ms、峰值 26 降到 16，但 short W13+W2 core-time 不降，medium W13 增加 5.6%，且 short 区提前约 2 ms 空闲。delayed-short 控制证明 service time 随 active mix 显著变化，但因同时改变活跃核心数、wave 和尾部，不能完成因果分解。进一步固定同一批 M28/M1、48 个 1T lane 与每核任务量；独立 long-expert 进程只制造 0/16/32/48 核背景而不进入前景计时。背景使 grouped 前景回退 20.0%/36.8%/48.0%，证明争用真实存在，但 grouped/crossed 无单调差异：16 核交错略慢、48 核中性，仅 32 核出现约 1% 且置信区间跨零的弱收益。因此均匀 M/S 混合不进入 planner 约束，只可作无成本 tie-break；新入口仅用于后续 allocation/release/tail 对照，不进入 production planner、cache identity 或默认 runtime。|
+| 2026-08-12 | v1.15 | 将默认关闭的 strict suffix-steal 从“全 plan 单一宽度、单一 NUMA”泛化为 `(threads, NUMA)` cohort：runtime 从 fixed whole-expert task 恢复不重叠 team 分区，只在同 cohort 领取尚未启动的受限后缀，禁止改宽、跨 NUMA、抢占或等待；scratch lease 前按 cohort 最大 route 扩容，迁移期间不分配。新增混合 `2T+1T` 双 cohort SVE 回归，要求两个 cohort 均实际迁移且输出逐位一致。opt-in 的 $r_{\min}$ 从 2 改为 1，使存在一个完整 pending task 时即可领取；feature enable 默认仍关闭。AmazonC5192Cores NUMA0 的 DSV4 `48C×8T + 32C×1T medium + 16C×1T short` 做 11 warmup/101 paired runs：strict/candidate 中位数为 `11.738/11.720 ms`（`+0.15%`），配对均值 `+0.20%` 的 95% bootstrap 区间为 `[-0.21%,+0.60%]`，P90 由 `11.863` 增至 `11.910 ms`；候选 trace 迁移 `20` 个 expert（`19×1T + 1×8T`，686 routes），tail idle 降至 `75.1 core-ms`，但未通过 2% E2E gate。因此 planner candidate、cache identity、cost-model 评分保持不变，不恢复已退役的 W2 boundary elastic。|
 | 2026-08-12 | v1.16 | 增加与 production 解耦的第一版可证明 makespan 下界：通用层实现逐资源/critical-chain 的 `LB0` 和共享 fractional mode 的 mode-relaxed LP，并输出经整数 simplex 量化、`Fraction` 精确重算和定向舍入的 dual/primal certificate；优先使用 GLOP，缺少可选依赖时回退 entropic mirror ascent。SVE adapter 将当前 exact-M W13/W2 mapper 降为 BFMMLA、key instruction、L1 load、epilogue、core-time 和可选 compulsory-DRAM 需求；core-time 由 aggregate work/per-core ceiling 推导，不假设不均衡 N lane 等时结束。第一版省略 window replay、gather/merge、NUMA 与 contention，只提供安全但偏松的 GEMM-only 下界，不改变 production 候选、剪枝、cost model 或 runtime。|
