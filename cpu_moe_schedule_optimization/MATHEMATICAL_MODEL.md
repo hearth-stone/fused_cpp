@@ -794,10 +794,42 @@ $$
 
 planner 写入 `early_merge=false`。此时模型预测所有 active expert 同时完成，没有
 可供 combine 隐藏的 expert-compute 区间；executor 在 compute 后由全部 worker
-按连续 token range 均匀分配 merge。若预测存在完成时间差、模型不能返回逐 task
-时刻、使用 stage-only/tail-pool plan，planner 写入 `null`，保留 runtime
-heuristic。由于 $G_q$ 和 expert/merge contention 尚未进入目标，planner 不会仅凭
-$\Delta_f>0$ 强制 `early_merge=true`。
+按连续 token range 均匀分配 merge。
+
+若 strict caller 同时提供本轮真实 `topk_ids`，planner 在选定 compute plan 后增加一个
+不进入候选搜索的保守 gate。第一版只读取其 $(N,K)$ 形状，不扫描 token 内容；要求
+`counts` 来自同一 `topk_ids`，且标准 TopK 保证一个 token 内 expert id 不重复。对 expert
+$e$，令严格晚于其完成波次的 route occurrence 总量为
+
+$$
+R_{>e}=\sum_{j:\widehat f_j>\widehat f_e,\ \widehat f_j\not\simeq\widehat f_e}M_j.
+$$
+
+包含 $e$ 的 $M_e$ 个 token 中，最多 $\min(N,R_{>e})$ 个还能被更晚 expert 推迟。因此
+$e$ 所在 ready 波次的 token 数满足可解释下界
+
+$$
+L_e=\max\left(0,M_e-\min(N,R_{>e})\right).
+$$
+
+当前 fixed-owner drain 的默认 batch 为 $B_{merge}=2$。若 $N\le B_{merge}T$，全部
+token 本来就只占每个 owner 一轮，直接关闭 early merge。否则只需检查
+$M_e\ge N-B_{merge}T$ 的高覆盖 expert；其余 expert 不可能单独证明目标 burst。令
+$L^*=\max_eL_e$，若
+
+$$
+N-L^*\le B_{merge}T,
+$$
+
+则已有下界证明几乎全部 token 集中在一个 publication/drain 波次，波次外工作总量至多
+为每个 owner 的一轮默认 drain，planner 写入 `early_merge=false`。令高覆盖集合为
+$\mathcal H$；计算复杂度为 $O(E|\mathcal H|)$，且
+$|\mathcal H|\le NK/(N-B_{merge}T)$，TP4 2048-token/96T 下最多约 6 个。该 gate 不增加
+shape/order 候选，不改变 compute-plan histogram cache；每次调用只重新读取 $N$ 并用
+本轮 task routes 计算下界。若不满足该充分条件、未提供 routing shape、模型不能返回
+逐 task 时刻，或使用 stage-only/tail-pool plan，planner 写入 `null`，保留 runtime
+heuristic。由于 $G_q$ 和 expert/merge contention 尚未进入目标，planner 仍不会强制
+`early_merge=true`。
 
 Plan V2 的 `early_merge` 是三态手动控制：`null` 为上述 auto，`true` 强制
 ready-token 路径并跳过 team-load gate，`false` 强制统一 post-expert merge。
@@ -1505,10 +1537,10 @@ cold search。
 | Runtime plan contract | task 可携带离散宽度集合、stage、route-slice、resize 边界和动态 placement | bounded tail 在 terminal expert 启动前生成新的 singleton fixed width 和 blocker DAG；production whole-expert task 的 W13/W2 均执行完整 N domain，Plan/ABI 不携带 weight range、split、byte-window、task release 或 W2 resize；每线程 owner stripe 仅由实际 width 和 backend N tile 推导；exact-anchor route fission 将同一 expert 的连续 M slice 作为多个 strict task，只有全部 slice 完成后才发布 expert completion；tail_pool 保持 whole-expert 动态 placement；实验 strict tail-steal 只接受单 NUMA、同宽、fixed、whole-expert 资源链，并保留 ready-token drain | 单次 terminal expert 重分区与受限未启动 task 迁移剪枝 |
 | Stage coupling | W13/W2 可形成任意满足依赖和容量的 stage DAG | production 使用 whole-expert pipeline；独立 W13/W2 Plan V2 加全局 barrier 仅作为实验 entrypoint，matched/independent 两种计划都不进入默认搜索 | production 粒度剪枝与实验对照 |
 | x86 synchronous executor team mapping | expert 可取任意合法整数宽度并形成任意 wave | API 接受 1--256 workers；均衡 route 用 atomic expert queue，active expert 不足时按 route/当前宽度贪心组 team，强偏斜时按 64-row target 形成有序 wave | planner 外的确定性 runtime mapper |
-| Ordering | 任意可行开始时间和顺序 | 每个 lane 的 LPT 顺序；实验 strict tail-steal 保留 planner 前缀和本地后缀优先，只允许领取 peer lane 的 pending suffix frontier | 顺序剪枝 |
+| Ordering | 任意可行开始时间和顺序 | strict 候选只比较三种确定性顺序：全部 lane 保持 LPT、奇数 lane 整链反序、偶数 lane 整链反序，并用完整 event-time cost model 严格判优；不搜索任意排列或主动 start delay。full-call anchor 保持原 LPT。实验 strict tail-steal 保留 planner 前缀和本地后缀优先，只允许领取 peer lane 的 pending suffix frontier | 顺序剪枝 |
 | Idling | 允许主动等待以避开争用 | planner 可关闭 tail-pool 和 bounded tail 保留原 strict；bounded tail 只依赖 blocker 完成、不增加主动等待；tail-pool 保持 non-idling；strict tail-steal 找不到满足 $c_h\ge r_{\min}$ 的后缀后立即释放 compute team，并在启用时转入 ready-token drain；ready-token 路径仅填充无可运行 expert 的空闲 lane；已拒绝的 cold-phase task-release 和 W2 cohort timeout 不再属于 runtime 可行域 | 仅保留 non-idling 与依赖边界剪枝 |
 | Workload 输入 | 任意合法 global 或 rank-local route histogram | planner 接受任意 histogram；catalog preset 只扩展验证覆盖，不过滤运行时输入 | 不剪枝 |
-| Route combine | 任意满足 TopK release 约束和 CPU 容量的 merge 排程 | planner 不搜索 combine service time；strict plan 在预测 expert 同时完成时强制统一连续 post-expert merge，其余情况保留 auto；runtime 将连续 token range 固定映射给 logical worker，在 expert 边界和空闲期处理本 owner 已 release token，并在同一 resident worker job 排空；owner 间不偷取 merge；Plan V2 允许显式 on/off | 外层启发式限制与支配条件剪枝 |
+| Route combine | 任意满足 TopK release 约束和 CPU 容量的 merge 排程 | planner 不搜索 combine service time；strict plan 在预测 expert 同时完成时关闭 early merge；若 caller 提供真实 TopK shape，选定 compute plan 后用 route counts 减去更晚波次 route 总量，得到单 expert 所在 ready burst 的保守下界；当该下界证明 burst 外 token 不超过一轮默认 owner drain（$2T$）时同样关闭。其他情况保留 auto，且从不由该 gate 强制开启；runtime 将连续 token range 固定映射给 logical worker，在 expert 边界和空闲期处理本 owner 已 release token，并在同一 resident worker job 排空；owner 间不偷取 merge；Plan V2 允许显式 on/off | 不扩大搜索空间的 routing-shape/route-bound 保守后处理 |
 | Kernel variant | 任意未被支配的实现 | ARM empirical identity 只包含机器/拓扑、分布式 expert shape、SVE implementation/tail policy、`full_n_team_stripes` 和 source/binary hash；每个 identity 只允许一个活动校准，旧 split/range profile 不兼容。`auto` 优先选择唯一匹配的 `jit/xbyak_exact_m` 校准，否则回退唯一匹配的 `asm/static_bucketed` 校准。每个 shape/tail-pool 候选确定 team width 后，empirical/analytic model 直接按 $u_s(t)$ 计算 owner stripe，不生成额外执行参数。x86 AMX 使用不进入 planner 的确定性 per-expert pattern/cache policy，AVX-512/AMX 共用确定性 team-N/wave policy | 实现候选限制与 width-derived runtime geometry |
 | Isolated time | 真实 $I_i(t)$ | production 默认仍为经验公式；可选 analytic backend 由 kernel demand、cache traffic 和机器 service curves 计算 | cost 近似，不剪枝可行域 |
 | Contention | 任意动态活跃配置上的真实 $D_i(\mathcal Z)$ | production 默认为实测 profile；bounded tail 仅在 uniform route、root/tail width 与物理 interval 完全匹配时使用 exact-layout full-call anchor，且禁止 route 插值；未命中仍走 stage-aware simulator；实验 strict tail-steal 暂不进入 cost model；analytic backend 按 L1-hot M12 GEMM core、L2/LLC/DRAM/epilogue 共享容量推进事件，register-only matrix/frontend/L1 只保留诊断；cold-phase oracle 只约束首个 M12 packed-B DRAM phase，运行时验证已证明它不能替代 per-worker L2 retention、完整 active full-stage working set、LLC-to-L2 service、容量和 active-set slowdown | cost 近似，不剪枝可行域 |
@@ -4457,6 +4489,142 @@ $M=72,t=16$ 的全排序 $\rho=0.098$，虽然 selected regret 只有 1.74%。�
 仍需独立 holdout，production policy 与 planner 剪枝保持不变。完整协议和反例见
 `optimizations/fused_moe_sve/results/analytic_stage_window_policy_v6_closure_20260811.md`。
 
+#### 9.38 固定 lane membership 的时间交错顺序
+
+原 strict planner 先按 route 降序做 isolated-time LPT，并把每条 lane 的 expert 按同一
+降序执行。异构 workload 因此容易形成“先同时运行大 expert、后同时运行小 expert”的
+时间聚集。第一版不改变 LPT 的 lane membership、线程宽度、连续 core interval、stage
+window 或 Plan V2 DAG 形状，只给每条已有链增加一个二值方向：
+
+$$
+o_l\in\{+1,-1\},\qquad
+\pi_l(o_l)=
+\begin{cases}
+\pi_l^{LPT}, & o_l=+1,\\
+\operatorname{reverse}(\pi_l^{LPT}), & o_l=-1.
+\end{cases}
+$$
+
+其中 LPT 的插入顺序为 route 非增，因此反序 lane 会提前小 expert、延后大 expert。在线
+候选固定为三个 seed：
+
+$$
+\mathcal O=\{(+1,\ldots,+1),\;o_l=(-1)^{l+1},\;o_l=(-1)^l\}.
+$$
+
+三个 DAG 都由现有完整 event-time contention model 评分，选择
+
+$$
+o^*=\arg\min_{o\in\mathcal O}\widehat C(o).
+$$
+
+只有当候选满足
+
+$$
+\widehat C(o)<\widehat C(o_{best})-
+\max(10^{-6}\ \mathrm{ns},10^{-10}|\widehat C(o_{best})|)
+$$
+
+时才替换当前方案；因此浮点平局确定性保留原 LPT。uniform full-call anchor 不包含顺序
+语义，命中时不做反序搜索。Python reference planner 与 native C++ cold planner 使用同一
+seed 顺序和阈值。选中的 `assignment_order` 是 planner/cache 内部诊断元数据，不进入
+Plan V2 bridge；`PlannedMoE` cache hit 重新计算便宜的 LPT membership 后直接应用缓存的
+方向，不重复运行 event-time DAG 评分。
+
+这个候选仍是 non-idling fixed-lane DAG：每条 lane 的前一个 expert 完成后立即启动下一
+个；没有跨 lane 迁移、route 切分、抢占、动态扩缩或新的 runtime 字段。它也不是任意
+permutation 的局部最优证明。曾评估在最好 seed 后逐 lane 做一次坐标下降，但当前 192C
+profile 上 DSV4 的预测改善只从 10.01% 增至 10.03%，tiered hotspot 从 8.52% 增至
+8.72%，却显著增加 cold-plan DAG 评分次数，故第一版不保留该搜索。
+
+当前 TP4/F512 96-core empirical profile 的 strict-only 离线评分如下；数值是同一模型对
+原 LPT 与三 seed 最优值的比较，不是硬件实测加速：
+
+| workload | 原 LPT 最优 | 时间 seed 最优 | 预测改善 |
+| --- | ---: | ---: | ---: |
+| captured DSV4 | 9.784 ms | 8.894 ms | 10.01% |
+| long/short bimodal | 9.687 ms | 9.461 ms | 2.39% |
+| tiered hotspot | 8.258 ms | 7.610 ms | 8.52% |
+| active-set 128 | 10.076 ms | 10.076 ms | 0.00% |
+
+合成 phase-contention 单测把同类 phase 同时运行设为 2x slowdown；原始两条
+`large->small` lane 的 makespan 为 24，奇偶反序后为 20，同时逐 lane expert 集合保持
+不变。无 contention 的平局单测则逐 task 保留 LPT。现有 table/formula、strict/auto/
+forced-tail、bounded-tail 的 Python/native parity 全部保持。同一开发机上的 planner-only
+smoke 使用上述 192C profile 时，native 8-worker cold median 为 bimodal 1.057 ms、DSV4
+3.588 ms；缓存方向后 warm median 为 1.121/2.209 ms，且单测确认 cache hit 不调用
+`dag_makespan`。这些数字只度量 planner 开销，不是目标 ARM kernel 性能。
+
+边界必须与 9.37 一起解释：当前 cross-class service 的绝对时间 gate 尚未闭合，所以
+上表只能证明候选在现有模型目标下可取，不能证明真实 E2E 同比例改善。
+
+2026-08-11 在 `AmazonC5192Cores` NUMA0 `0-95` 上完成第一轮真实 A/B。构建使用当前
+未提交开发树（base `f6debf5d1b8d`）、Linux AArch64 SVE JIT exact-M、有效 `-O2`、
+32 MiB HugeTLB packed weights、TP4 `H=4096,F=512,E=256`、BF16 route store；每个
+case 做 7 次 warmup 和 51 对随机交错调用。基线与候选的 shape、core interval、线程宽度、
+stage window、tail policy、输入和权重完全相同，只把候选的 `assignment_order` 恢复为
+`lpt`；输出逐位一致。下表以逐对 speedup 的中位数为主，括号内为 P10/P90：
+
+| execution | workload | order | LPT median | temporal median | paired speedup |
+| --- | --- | --- | ---: | ---: | ---: |
+| strict | tiered hotspot | reverse odd | 8.005 ms | 8.033 ms | -0.35% (-2.27%, +2.04%) |
+| strict | long/short bimodal | reverse even | 11.954 ms | 12.769 ms | -5.90% (-9.14%, -0.56%) |
+| strict | captured DSV4 | reverse even | 13.274 ms | 12.248 ms | +8.34% (+5.06%, +9.55%) |
+| tail pool | long/short bimodal | reverse even | 9.928 ms | 9.916 ms | +0.11% (-0.71%, +0.90%) |
+| tail pool | captured DSV4 | reverse even | 13.255 ms | 11.983 ms | +10.65% (+9.01%, +11.41%) |
+
+DSV4 使用另一组 seed 的独立 51-pair 复测为 `13.277 -> 12.004 ms`，paired median
+`+10.64%`，51 对中 50 对获胜。uniform 的两个 bridge 相同，paired median 为
+`-0.01%`，作为本轮测量噪声对照。active-set workload 因 route 相同仍逐位选择 LPT，
+不会产生 runtime 计划变化。
+
+该结果同时验证收益与否定无条件启用：模型正确选中 DSV4，却把 tiered 的中性结果预测为
+`+8.52%`，并把 strict bimodal 的首轮 `-5.90%` 回退预测为 `+2.39%`。因此第一版未通过
+held-out regression `<=2%` gate，不能作为无条件 production strict 顺序。
+
+随后对 strict bimodal 做两组进程内 phase trace。反序的 GEMM 主体并未回退：两组中
+compute end 都从 LPT 的 `11.734/11.836 ms` 提前到 `10.933/10.785 ms`，W13/W2 task
+median 均下降，compute core-ms 也从 `910.8/903.9` 降为 `891.3/886.1`。差异全部出现在
+ready-token 尾部：
+
+| process state | order | compute end | compute 后 late tokens | ready-merge tail |
+| --- | --- | ---: | ---: | ---: |
+| fast | LPT | 11.734 ms | 47 | 0.037 ms |
+| fast | reverse even | 10.933 ms | 2040 | 0.347 ms |
+| slow | LPT | 11.836 ms | 59 | 0.051 ms |
+| slow | reverse even | 10.785 ms | 2041 | 1.939 ms |
+
+该分布的 5 个长 expert 都有 `M=2040`，TopK=6 的多数 token 需要这些长 expert 和一个
+短 expert。LPT 先完成长 expert，再由 174 个 `M=12` expert 逐批发布 token；时间反序则
+提前完成短 expert，并在最后几个长 expert 完成时集中使约 2040 个 token ready。runtime
+在最后一个 route slice 的 `local_tid==0` 上串行执行 `publish_ready_tokens(expert_routes)`：
+对每个 route 扫描 TopK completion，并写 `token_ready`；同时 96 个 fixed owner 轮询各自
+token range。该 publication/owner-drain 相位不在当前 expert phase cost model 内，且在
+实机上出现 `0.35--1.94 ms` 双稳态，足以覆盖反序约 1 ms 的 compute 收益。
+
+因果对照关闭 ready-token early merge、保留同一 strict plan 和最终完整 merge。两个独立
+51-pair 进程分别从 `12.066 -> 11.386 ms`、`12.023 -> 11.363 ms`，paired median 为
+`+5.88%/+6.07%`，P10 仍为 `+3.83%/+4.56%`。因此 bimodal 回退不是 GEMM/cache 时间
+交错本身，而是 temporal order 与 fixed-owner ready-token publication/drain 的组合效应。
+	进入 production 前应让 planner 同时建模 merge-readiness，或在会形成大 ready burst 的
+	temporal plan 上关闭 early merge；只按 expert GEMM DAG 评分仍不满足 2% gate。
+
+第一版采用 2.5 节的 routing-shape/route-bound 保守 gate，而不引入完整 merge queue：
+选定 strict compute plan 后，对高覆盖 expert 用 route count 减去全部更晚 expert route
+occurrence，得到其 ready burst 下界；若该下界之外的 token 至多为默认一轮 owner drain
+（$2T$），直接选择连续 final merge，否则保留 auto。
+该 gate 不改变 temporal candidate 分数、shape cache 或 Plan V2 ABI，也不对 early merge
+作正向收益判断。当前 selected strict `6x16T` bimodal plan 的 burst 下界为
+$L^*=2016,N=2048,T=96$，故 $N-L^*=32<192$，plan-only 已选择
+`early_merge=false`；同一检查对 DSV4/tiered 的下界只有 `917/384`，保持 auto。
+AmazonC5192Cores NUMA0 随后以 32 MiB HugeTLB、7 次 warmup 和 51 次成对交错调用
+复验完整 9-case catalog。三个改变 lane 顺序的 strict case 中，bimodal、DSV4 和
+tiered hotspot 的 median 分别为 `+6.28%/+8.80%/-0.56%`；bimodal paired median/P10
+为 `+6.39%/+3.04%`。六个保持 LPT 的对照 median 绝对偏差均不超过 `0.89%`。
+最终只有 bimodal 的 selected plan 从 auto 改为 `early_merge=false`，其 LPT 对照仍为
+auto；DSV4/tiered 两个顺序均保持 auto。由此关闭 192C host 的 2% held-out gate，
+但不替代跨机器验证。
+
 ## 10. 同步规则
 
 
@@ -4595,4 +4763,8 @@ $M=72,t=16$ 的全排序 $\rho=0.098$，虽然 selected regret 只有 1.74%。�
 | 2026-08-10 | v1.06 | 退役 production `FUSED_CPP_MOE_FUSED_2D_SPLIT` compatibility adapter：删除恒定返回 $t_M=1,t_N=t$ 的 2D plan/range structs、NEON/SVE `_2d` wrappers、normal/scheduled/async/planned-staged 分支和重复测试。该实现从未切 M，SVE wrappers 还强制 `row_begin=0`，所以其行为只是已有 N-split 的重复封装；真正的 mixed-MN 假设继续由隔离的 `bench_mn_split.cpp` Lab 路径验证，历史 production 适配器固定在 Git `8e9fcbd`。hierarchical N-split、Plan V2 $(t,\omega_s)$、planner 候选、cost model 公式和默认数值不变。|
 | 2026-08-10 | v1.07 | 删除 production `FUSED_CPP_MOE_STAGE_WINDOW_TILES` 实验环境适配器及其 process-static parser。stage window 继续由 Plan V2 的逐 task `task_w13_window_tiles/task_w2_window_tiles` 唯一表达，legacy scheduled/async 与 hierarchical fallback 明确使用 full owner stripe；校准 sweep 通过构造显式 Plan V2 复现，不再让进程环境隐式改写未指定窗口。历史适配器固定在 Git `208743e`。窗口计算语义、planner policy、cost model 公式、候选和默认 Plan V2 数值不变。|
 | 2026-08-11 | v1.08 | 闭合解析 stage-window 的当前选择问题（9.36）：shadow policy v6 按 exact tile-window geometry 计算 A/B/C task-local demand，仅以 reusable packed-B 形成 rank 级 LLC resident surcharge；增加 fused-W13/pure-W2 的 per-panel extra-range 薄校准（45.27/6.70 ns），并在模型不确定性等价集内用 $\max(C_{L1D},2b_s,\sqrt{C_{L1D}C^{B,eff}_{L2}})$ 做无 route 表 tie-break。同步实验否证“纯 GEMM restart 足够”和“barrier 决定 M216 转折”两个假设。AmazonC5192Cores NUMA0 当前 tile runtime 的 6 组 full Cartesian holdout 得到 median/P90/max regret `1.10/3.45/4.40%`，6/6 通过预设 5% gate；但极端 pair 的二阶交互残差仍达 17.69%，故只关闭声明域内的 window 选择，不声称绝对时间、跨机器或完整 planner 闭合。production band policy、shape 搜索、剪枝和 Plan V2 默认不变。|
+| 2026-08-11 | v1.10 | strict planner 增加固定 LPT lane membership 的时间交错顺序：每个 shape 只比较原 LPT、奇数 lane 反序和偶数 lane 反序三个 deterministic DAG，以完整 event-time model 严格判优；full-call anchor、线程宽度、window、core interval 和 Plan V2 runtime contract 不变。当前 TP4/F512 profile 对 captured DSV4/tiered hotspot 的 strict-only 预测改善为 10.01%/8.52%，active-set-128 保持 LPT；这些仍是模型预测，cross-class 实机 gate 未闭合。Python/native parity、合成 contention 改善与 tie-retention 已覆盖；`PlannedMoE` 缓存三态 order 并在命中时跳过 DAG 重评分。逐 lane 坐标下降因收益不足且 cold-plan 成本过高而未纳入。|
+| 2026-08-11 | v1.11 | 在 AmazonC5192Cores NUMA0 对 fixed-lane temporal order 做 7-warmup/51-pair 真实交错 A/B。strict captured DSV4 为 `+8.34%`，默认 tail-pool 为 `+10.65%`，独立 seed 复测 `+10.64%`；但 tiered 为 `-0.35%`，strict long/short bimodal 回退 `-5.90%`（tail-pool 下 `+0.11%`）。uniform 相同 bridge 的 paired noise 为 `-0.01%`，全部输出逐位一致。由此确认模型能选中 DSV4 收益，但 cross-class 时间排序尚未闭合并违反 2% held-out gate；第一版不能无条件进入 production strict 顺序，需先完成 stage trace 和保守启用条件。|
+| 2026-08-11 | v1.12 | 定位 temporal strict bimodal 回退：phase trace 显示 reverse-even 的 compute end 比 LPT 提前 `0.80--1.05 ms`，W13/W2 与 compute core-ms 都更低；但 compute 后 ready token 从 `47/59` 增至 `2040/2041`，fixed-owner merge tail 从 `0.037/0.051 ms` 放大到 `0.347/1.939 ms`。原因是最后长 expert 的单个 `local_tid==0` 串行扫描约 2040 routes 并发布 token，同时 96 owners 轮询/排空，形成当前 expert-only DAG 未建模的 burst 与双稳态。关闭 ready-token early merge 后，两个独立 51-pair strict A/B 稳定提升 `+5.88%/+6.07%`，证明回退来自 merge-readiness 交互而非 GEMM 时间交错。production gate 继续保持 open，下一步需联合建模 token readiness 或对 bursty temporal plan 禁用 early merge。|
+| 2026-08-11 | v1.13 | strict planner 增加不扩大搜索空间的 routing-shape/route-bound early-merge 保守 gate：复用选中 compute DAG 的 expert finish time；对每个高覆盖 expert，以自身 route count 减去所有更晚波次 route occurrence，形成其 ready burst 的安全下界。若该下界之外的 token 不超过默认一轮 fixed-owner drain（$B_{merge}T=2T$），Plan V2 写入 `early_merge=false`，否则保持 `null/auto`，从不强制开启。gate 只读取 `topk_ids` 的 $(N,K)$ 形状，复杂度 $O(E|\mathcal H|)$，不扫描 token 内容；冷/热 path 每次重算，不把 token 数决策错误缓存到 histogram shape 上。tail-pool、candidate score、shape cache、native planner ABI 与 kernel ABI 不变。合成测试覆盖同 histogram 的不同 $(N,K)$ 在 cache hit 上 `null -> false -> null`；plan-only 对 selected strict `6x16T` bimodal 得到 `2016/2048` burst 下界并关闭，对 DSV4/tiered 的 `917/384` 保持 auto。AmazonC5192Cores NUMA0 的 9-case strict catalog 以 7-warmup/51-pair 复验得到 bimodal/DSV4/tiered `+6.28%/+8.80%/-0.56%`，六个未改序对照 median 绝对偏差不超过 `0.89%`，关闭该 host 的 2% held-out gate。|
 | 2026-08-12 | v1.16 | 增加与 production 解耦的第一版可证明 makespan 下界：通用层实现逐资源/critical-chain 的 `LB0` 和共享 fractional mode 的 mode-relaxed LP，并输出经整数 simplex 量化、`Fraction` 精确重算和定向舍入的 dual/primal certificate；优先使用 GLOP，缺少可选依赖时回退 entropic mirror ascent。SVE adapter 将当前 exact-M W13/W2 mapper 降为 BFMMLA、key instruction、L1 load、epilogue、core-time 和可选 compulsory-DRAM 需求；core-time 由 aggregate work/per-core ceiling 推导，不假设不均衡 N lane 等时结束。第一版省略 window replay、gather/merge、NUMA 与 contention，只提供安全但偏松的 GEMM-only 下界，不改变 production 候选、剪枝、cost model 或 runtime。|

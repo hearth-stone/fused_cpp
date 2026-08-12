@@ -104,7 +104,7 @@ class PlannedMoE:
         )
         self.shape_cache: Dict[
             Tuple[object, ...],
-            Tuple[int, Tuple[int, ...], str, int | None, int | None, int | None, int],
+            Tuple[int, Tuple[int, ...], str, str, int | None, int | None, int | None, int, int],
         ] = {}
         self.last: dict[str, object] = {}
 
@@ -118,15 +118,19 @@ class PlannedMoE:
         planner_index: int,
         shape: Tuple[int, ...],
         execution_mode: str,
+        assignment_order: str,
         tail_pool_threads: int | None,
         tail_pool_max_routes: int | None,
         tail_repartition_width: int | None,
         tail_repartition_tasks: int,
         tail_repartition_route_slices: int,
+        topk_ids=None,
     ):
         planner = self.interval_planners[planner_index]
         lanes = planner._lanes(shape)
-        tasks = planner._build_tasks(counts, lanes, planner._assign(counts, lanes))
+        lpt_assignment = planner._assign_lpt(counts, lanes)
+        assignment = planner._assignment_for_order(lpt_assignment, assignment_order)
+        tasks = planner._build_tasks(counts, lanes, assignment)
         if tail_repartition_width is not None:
             if (
                 execution_mode != "strict"
@@ -152,9 +156,10 @@ class PlannedMoE:
                 max_pooled_routes=tail_pool_max_routes,
             )
         else:
-            bridge = planner.to_async_bridge(tasks)
+            bridge = planner.to_async_bridge(tasks, topk_ids=topk_ids)
         return {
             "shape": shape,
+            "assignment_order": assignment_order,
             "execution_mode": bridge["execution_mode"],
             "tail_pool_threads": tail_pool_threads if execution_mode == "tail_pool" else None,
             "tail_pool_max_routes": tail_pool_max_routes if execution_mode == "tail_pool" else None,
@@ -181,6 +186,7 @@ class PlannedMoE:
         self,
         counts,
         *,
+        topk_ids=None,
         dynamic_tail_pool: bool = True,
         tail_pool_threads: int | None = None,
         tail_pool_max_routes: int = 12,
@@ -213,6 +219,7 @@ class PlannedMoE:
                 planner_index,
                 shape,
                 execution_mode,
+                assignment_order,
                 selected_pool_threads,
                 selected_max_routes,
                 selected_tail_width,
@@ -225,11 +232,13 @@ class PlannedMoE:
                     planner_index,
                     shape,
                     execution_mode,
+                    assignment_order,
                     selected_pool_threads,
                     selected_max_routes,
                     selected_tail_width,
                     selected_tail_tasks,
                     selected_tail_route_slices,
+                    topk_ids,
                 )
                 after_search = time.perf_counter_ns()
             except (KeyError, ValueError):
@@ -238,6 +247,7 @@ class PlannedMoE:
         if not hit:
             result = self.interval_planners[0].plan(
                 counts,
+                topk_ids=topk_ids,
                 dynamic_tail_pool=dynamic_tail_pool,
                 tail_pool_max_routes=tail_pool_max_routes,
                 forced_tail_pool_threads=tail_pool_threads,
@@ -249,6 +259,7 @@ class PlannedMoE:
                 planner_index,
                 shape,
                 str(result["execution_mode"]),
+                str(result["assignment_order"]),
                 result["tail_pool_threads"],
                 result["tail_pool_max_routes"],
                 result["tail_repartition_width"],
@@ -274,18 +285,22 @@ class PlannedMoE:
             "tail_repartition_tasks": result.get("tail_repartition_tasks", 0),
             "tail_repartition_route_slices": result.get("tail_repartition_route_slices", 1),
             "shape": tuple(result["shape"]),
+            "assignment_order": result.get("assignment_order", "lpt"),
             "policy": result.get("policy"),
             "planner_backend": result.get("planner_backend", "cache"),
             "planner_workers": result.get("planner_workers", 1),
             "strict_candidates": result.get("strict_candidates", 0),
             "dynamic_candidates": result.get("dynamic_candidates", 0),
             "tail_repartition_candidates": result.get("tail_repartition_candidates", 0),
+            "early_merge": bridge.get("early_merge"),
+            "routing_aware_early_merge": topk_ids is not None and bridge["execution_mode"] == "strict",
         }
         return {
             "plan_version": bridge["plan_version"],
             "execution_mode": bridge["execution_mode"],
             "bridge": bridge,
             "shape": tuple(result["shape"]),
+            "assignment_order": result.get("assignment_order", "lpt"),
             "tail_pool_threads": result.get("tail_pool_threads"),
             "tail_pool_max_routes": result.get("tail_pool_max_routes"),
             "tail_pool_tasks": result.get("tail_pool_tasks", 0),
@@ -299,6 +314,7 @@ class PlannedMoE:
         self,
         counts,
         *,
+        topk_ids=None,
         dynamic_tail_pool: bool = True,
         tail_pool_threads: int | None = None,
         tail_pool_max_routes: int = 12,
@@ -307,6 +323,7 @@ class PlannedMoE:
         """Bridge-only API; returns Plan V2 with legacy fixed arrays retained."""
         return self.plan_spec_for(
             counts,
+            topk_ids=topk_ids,
             dynamic_tail_pool=dynamic_tail_pool,
             tail_pool_threads=tail_pool_threads,
             tail_pool_max_routes=tail_pool_max_routes,

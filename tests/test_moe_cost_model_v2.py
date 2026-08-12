@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import torch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -149,6 +150,14 @@ class _FinishAwareModel(_DeterministicTailPoolModel):
         return tuple(finish)
 
 
+class _RoutingFinishAwareModel(_FinishAwareModel):
+    supported_shapes = ((1, 1),)
+    supported_widths = (1,)
+
+    def supports_shape(self, shape) -> bool:
+        return tuple(shape) == self.supported_shapes[0]
+
+
 class _DeterministicTailRepartitionModel(_DeterministicTailPoolModel):
     schema_version = 2
     supported_shapes = ((2, 2, 2, 2, 2, 2),)
@@ -162,6 +171,118 @@ class _DeterministicTailRepartitionModel(_DeterministicTailPoolModel):
 
     def supports_shape(self, shape) -> bool:
         return tuple(shape) == self.supported_shapes[0]
+
+
+class _TemporalOrderingModel(_DeterministicTailPoolModel):
+    """Synthetic event model where like resource phases contend."""
+
+    supported_widths = (1,)
+
+    def __init__(self) -> None:
+        self.dag_calls = 0
+
+    def T_iso(self, routes: int, threads: int) -> float:
+        assert threads == 1
+        return 10.0 if routes >= 100 else 2.0
+
+    def dag_makespan(self, tasks) -> float:
+        self.dag_calls += 1
+        task_list = list(tasks)
+        remaining = [self.T_iso(routes, threads) for routes, threads, _ in task_list]
+        completed = [False] * len(task_list)
+        active = {
+            task_id
+            for task_id, (_, _, dependencies) in enumerate(task_list)
+            if not dependencies
+        }
+        elapsed = 0.0
+        while active:
+            resource_classes = {task_list[task_id][0] >= 100 for task_id in active}
+            slowdown = 2.0 if len(active) > 1 and len(resource_classes) == 1 else 1.0
+            step = min(remaining[task_id] * slowdown for task_id in active)
+            elapsed += step
+            for task_id in active:
+                remaining[task_id] -= step / slowdown
+            finished = [task_id for task_id in active if remaining[task_id] <= 1e-12]
+            for task_id in finished:
+                active.remove(task_id)
+                completed[task_id] = True
+            for task_id, (_, _, dependencies) in enumerate(task_list):
+                if not completed[task_id] and task_id not in active and all(
+                    completed[dependency] for dependency in dependencies
+                ):
+                    active.add(task_id)
+        assert all(completed)
+        return elapsed
+
+
+def _expert_ids_by_core(tasks) -> dict[int, tuple[int, ...]]:
+    result: dict[int, list[int]] = {}
+    for expert_id, _, core_begin, _, _ in tasks:
+        result.setdefault(core_begin, []).append(expert_id)
+    return {core_begin: tuple(expert_ids) for core_begin, expert_ids in result.items()}
+
+
+def test_temporal_assignment_interleaves_resource_classes_without_moving_lanes() -> None:
+    planner = IntervalPlanner(
+        _TemporalOrderingModel(),
+        num_cores=2,
+        widths=(1,),
+        shapes=((1, 1),),
+        native_cold_planner=False,
+        tail_repartition_widths=(),
+    )
+    experts = [(0, 100), (1, 100), (2, 1), (3, 1)]
+    lanes = planner._lanes((1, 1))
+    lpt_tasks = planner._build_tasks(experts, lanes, planner._assign_lpt(experts, lanes))
+
+    makespan, tasks = planner.score_shape(experts, (1, 1))
+
+    assert planner._score(lpt_tasks) == pytest.approx(24.0)
+    assert makespan == pytest.approx(20.0)
+    assert sorted(routes for _, routes, _, _, dependencies in tasks if not dependencies) == [1, 100]
+    assert {
+        core_begin: frozenset(expert_ids)
+        for core_begin, expert_ids in _expert_ids_by_core(tasks).items()
+    } == {
+        core_begin: frozenset(expert_ids)
+        for core_begin, expert_ids in _expert_ids_by_core(lpt_tasks).items()
+    }
+
+
+def test_temporal_assignment_retains_lpt_on_model_tie() -> None:
+    planner = IntervalPlanner(
+        _DeterministicTailPoolModel(),
+        num_cores=2,
+        widths=(1,),
+        shapes=((1, 1),),
+        native_cold_planner=False,
+        tail_repartition_widths=(),
+    )
+    experts = [(0, 100), (1, 100), (2, 1), (3, 1)]
+    lanes = planner._lanes((1, 1))
+    lpt_tasks = planner._build_tasks(experts, lanes, planner._assign_lpt(experts, lanes))
+
+    _, tasks = planner.score_shape(experts, (1, 1))
+
+    assert tasks == lpt_tasks
+
+
+def test_cached_plan_reuses_temporal_order_without_rescoring() -> None:
+    model = _TemporalOrderingModel()
+    runtime = PlannedMoE(model, num_cores=2)
+    experts = [(0, 100), (1, 100), (2, 1), (3, 1)]
+
+    cold = runtime.plan_spec_for(experts, dynamic_tail_pool=False)
+    assert model.dag_calls > 0
+    model.dag_calls = 0
+
+    cached = runtime.plan_spec_for(experts, dynamic_tail_pool=False)
+
+    assert runtime.last["cache_hit"] is True
+    assert cached["assignment_order"] == cold["assignment_order"] == "reverse_odd"
+    assert cached["bridge"] == cold["bridge"]
+    assert model.dag_calls == 0
 
 
 def test_planned_two_stage_planner_can_choose_different_stage_shapes() -> None:
@@ -203,6 +324,76 @@ def test_strict_bridge_disables_early_merge_for_equal_predicted_finishes() -> No
 
     assert planner.to_async_bridge(balanced)["early_merge"] is False
     assert planner.to_async_bridge(staggered)["early_merge"] is None
+
+
+def test_routing_tail_gate_is_recomputed_for_same_histogram_cache_hit() -> None:
+    runtime = PlannedMoE(_RoutingFinishAwareModel(), num_cores=2)
+    counts = [(expert, 16) for expert in range(4)]
+    overlapping_tail = torch.tensor(
+        [[2, 3]] * 16 + [[0, 1]] * 16,
+        dtype=torch.int32,
+    )
+    concentrated_tail = torch.tensor(
+        [[0, 1, 2, 3]] * 16,
+        dtype=torch.int32,
+    )
+
+    overlap = runtime.plan_spec_for(
+        counts,
+        topk_ids=overlapping_tail,
+        dynamic_tail_pool=False,
+    )
+    assert overlap["bridge"]["early_merge"] is None
+    assert runtime.last["cache_hit"] is False
+
+    concentrated = runtime.plan_spec_for(
+        counts,
+        topk_ids=concentrated_tail,
+        dynamic_tail_pool=False,
+    )
+    assert concentrated["bridge"]["early_merge"] is False
+    assert runtime.last["cache_hit"] is True
+    assert runtime.last["routing_aware_early_merge"] is True
+
+    without_routing = runtime.plan_spec_for(counts, dynamic_tail_pool=False)
+    assert without_routing["bridge"]["early_merge"] is None
+    assert runtime.last["cache_hit"] is True
+    assert runtime.last["routing_aware_early_merge"] is False
+
+
+def test_routing_tail_gate_uses_one_owner_batch_as_conservative_cutoff() -> None:
+    planner = IntervalPlanner(
+        _RoutingFinishAwareModel(),
+        num_cores=2,
+        widths=(1,),
+        shapes=((1, 1),),
+        native_cold_planner=False,
+        tail_repartition_widths=(),
+    )
+    tasks = [
+        (0, 4, 0, 1, []),
+        (2, 28, 0, 1, [0]),
+        (1, 4, 1, 1, []),
+        (3, 28, 1, 1, [2]),
+    ]
+    topk_ids = torch.tensor(
+        [[2, 3]] * 28 + [[0, 1]] * 4,
+        dtype=torch.int64,
+    )
+
+    policy, diagnostics = planner._early_merge_decision(tasks, topk_ids)
+
+    assert policy is False
+    assert diagnostics == {
+        "reason": "routing_tail_bound",
+        "dominant_expert": 2,
+        "dominant_wave_experts": (2, 3),
+        "dominant_wave_finish_ns": 20.0,
+        "burst_tokens_lower_bound": 28,
+        "outside_burst_tokens_upper_bound": 4,
+        "later_route_occurrences": 0,
+        "drain_capacity": 4,
+    }
 
 
 def test_planner_selects_tail_pool_width_and_can_disable_dynamic() -> None:

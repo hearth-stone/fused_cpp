@@ -501,6 +501,7 @@ def make_static_16t_to_4x4t_schedule(
 
 def make_production_schedule(
     route_counts: torch.Tensor,
+    topk_ids: torch.Tensor,
     *,
     profile: Path,
     threads: int,
@@ -551,19 +552,20 @@ def make_production_schedule(
         cpu_ids=cpu_ids,
     )
     begin = time.perf_counter_ns()
-    planner.plan_spec_for(counts)
+    planner.plan_spec_for(counts, topk_ids=topk_ids)
     cold_plan_ns = time.perf_counter_ns() - begin
     cold_auto_metadata = dict(planner.last)
     begin = time.perf_counter_ns()
-    auto_spec = planner.plan_spec_for(counts)
+    auto_spec = planner.plan_spec_for(counts, topk_ids=topk_ids)
     warm_plan_ns = time.perf_counter_ns() - begin
-    strict_spec = planner.plan_spec_for(counts, dynamic_tail_pool=False)
+    strict_spec = planner.plan_spec_for(counts, topk_ids=topk_ids, dynamic_tail_pool=False)
     strict_plan = AsyncMoEPlanV2.from_dict(strict_spec["bridge"])
     auto_plan = AsyncMoEPlanV2.from_dict(auto_spec["bridge"])
     tail_pool_plan = None
     if tail_pool_threads is not None:
         tail_pool_spec = planner.plan_spec_for(
             counts,
+            topk_ids=topk_ids,
             tail_pool_threads=tail_pool_threads,
             tail_pool_max_routes=tail_pool_max_routes,
         )
@@ -711,6 +713,7 @@ def main() -> int:
             iso_time_ns,
         ) = make_production_schedule(
             route_counts,
+            topk_ids,
             profile=args.production_profile,
             threads=args.threads,
             cpu_ids=cpu_ids,

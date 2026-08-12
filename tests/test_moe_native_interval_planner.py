@@ -14,6 +14,7 @@ sys.path[:0] = [str(COST_MODEL), str(PLANNERS)]
 
 from interval_planner import IntervalPlanner  # noqa: E402
 from phase_model import ContentionCostModel  # noqa: E402
+from workload_catalog import load_routing_workload  # noqa: E402
 
 
 PROFILE = (
@@ -41,6 +42,7 @@ def _native_extension():
 def _assert_plan_equivalent(reference: dict, actual: dict) -> None:
     exact_fields = (
         "shape",
+        "assignment_order",
         "execution_mode",
         "tail_pool_threads",
         "tail_pool_max_routes",
@@ -205,6 +207,33 @@ def test_native_bounded_tail_repartition_matches_python() -> None:
     assert auto["selected"]["tail_repartition_route_slices"] == 1
     assert strict["tail_repartition_candidates"] == 0
     assert strict["selected"]["tail_repartition_width"] is None
+
+
+def test_native_temporal_order_matches_python_on_captured_routing() -> None:
+    _native_extension()
+    model = ContentionCostModel(TP4_96C_PROFILE)
+    experts = load_routing_workload().experts
+    reference = IntervalPlanner(model, num_cores=96, native_cold_planner=False)
+    native = IntervalPlanner(
+        model,
+        num_cores=96,
+        native_cold_planner=True,
+        planner_threads=4,
+    )
+
+    expected = reference.plan(
+        experts,
+        dynamic_tail_pool=False,
+        bounded_tail_repartition=False,
+    )
+    actual = native.plan(
+        experts,
+        dynamic_tail_pool=False,
+        bounded_tail_repartition=False,
+    )
+
+    assert expected["assignment_order"] == "reverse_even"
+    _assert_plan_equivalent(expected, actual)
 
 
 def test_explicit_native_request_rejects_unsupported_model() -> None:

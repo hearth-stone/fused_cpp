@@ -93,8 +93,15 @@ enum class IntervalExecutionMode {
   kTailPool,
 };
 
+enum class IntervalAssignmentOrder {
+  kLpt,
+  kReverseOdd,
+  kReverseEven,
+};
+
 struct IntervalCandidate {
   std::vector<int> shape;
+  IntervalAssignmentOrder assignment_order = IntervalAssignmentOrder::kLpt;
   IntervalExecutionMode execution_mode = IntervalExecutionMode::kStrict;
   std::optional<int> tail_pool_threads;
   std::optional<int> tail_pool_max_routes;

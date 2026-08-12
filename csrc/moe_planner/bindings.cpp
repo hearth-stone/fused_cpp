@@ -234,6 +234,18 @@ const char* interval_execution_mode_name(IntervalExecutionMode mode) {
   return mode == IntervalExecutionMode::kStrict ? "strict" : "tail_pool";
 }
 
+const char* interval_assignment_order_name(IntervalAssignmentOrder order) {
+  switch (order) {
+    case IntervalAssignmentOrder::kLpt:
+      return "lpt";
+    case IntervalAssignmentOrder::kReverseOdd:
+      return "reverse_odd";
+    case IntervalAssignmentOrder::kReverseEven:
+      return "reverse_even";
+  }
+  throw std::invalid_argument("unknown interval assignment order");
+}
+
 py::list interval_tasks_to_python(const std::vector<IntervalTask>& tasks) {
   py::list result;
   for (const IntervalTask& task : tasks) {
@@ -245,6 +257,7 @@ py::list interval_tasks_to_python(const std::vector<IntervalTask>& tasks) {
 py::dict interval_candidate_to_python(const IntervalCandidate& candidate) {
   py::dict result;
   result["shape"] = candidate.shape;
+  result["assignment_order"] = interval_assignment_order_name(candidate.assignment_order);
   result["execution_mode"] = interval_execution_mode_name(candidate.execution_mode);
   result["tail_pool_threads"] =
       candidate.tail_pool_threads.has_value() ? py::cast(*candidate.tail_pool_threads) : py::none();

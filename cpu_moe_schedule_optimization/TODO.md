@@ -263,6 +263,27 @@ Acceptance gates:
 - [ ] Add conservative per-mode hardware lower-bound durations and aggregate
   matrix/LLC/DRAM capacity bounds before interpreting the CP-SAT result as a
   physical performance certificate rather than a `T_iso` model oracle.
+- [x] Validate the fixed-lane temporal-order seeds on the 192-core host before
+  interpreting their modeled gain as runtime gain. Use interleaved LPT/temporal
+  calls for every catalog workload, report strict-only E2E and stage times, and
+  require no held-out regression above 2%. The current TP4/F512 profile predicts
+  +10.01% for captured DSV4 and +8.52% for tiered hotspot, but the cross-class
+  absolute-time gate above is still open. The first 2026-08-11 NUMA0 E2E A/B
+  found strict DSV4 `+8.34%`, tiered `-0.35%`, and strict long/short bimodal
+  `-5.90%`; default tail-pool DSV4/bimodal were `+10.65%/+0.11%`. The candidate
+  therefore fails the 2% gate. Phase traces localize bimodal's loss to a
+  2040-token fixed-owner ready-merge burst (`0.35-1.94 ms` tail), not GEMM:
+  disabling ready-token early merge gives `+5.88%/+6.07%` in two independent
+  51-pair runs. A strict-only conservative gate now uses token count, route counts,
+  and predicted expert finish waves after the cached compute plan to prove a ready
+  burst lower bound; it disables early merge when at most one default owner batch
+  (`2T` tokens) can remain outside that burst. The 2026-08-11 strict-only
+  7-warmup/51-pair NUMA0 catalog rerun closes this host gate: bimodal improves
+  `+6.28%`, DSV4 improves `+8.80%`, and tiered hotspot is `-0.56%`; all six
+  unchanged-order controls remain within `0.89%` by median. The gate changes
+  only bimodal (`early_merge: null -> false`) and creates no held-out median
+  regression above 2%. Cross-machine promotion remains governed by the
+  separate validation rule above.
 - [ ] Measure lane-tail weighted idle loss on a larger routing corpus. Current
   TP cases have a perfect-rebalance upper bound of only 0.7-2.4%; prototype
   same-width-lane work stealing only if representative cases repeatedly exceed

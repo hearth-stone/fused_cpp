@@ -32,6 +32,12 @@ _BOUNDED_TAIL_TASKS = 2
 _BOUNDED_TAIL_DEFAULT_CORES = 96
 _EARLY_MERGE_EQUAL_FINISH_REL_TOL = 1e-6
 _EARLY_MERGE_EQUAL_FINISH_ABS_NS = 1.0
+_EARLY_MERGE_OWNER_BATCH = 2
+_TEMPORAL_ASSIGNMENT_REL_TOL = 1e-10
+_TEMPORAL_ASSIGNMENT_ABS_NS = 1e-6
+_ASSIGNMENT_ORDER_LPT = "lpt"
+_ASSIGNMENT_ORDER_REVERSE_ODD = "reverse_odd"
+_ASSIGNMENT_ORDER_REVERSE_EVEN = "reverse_even"
 # Sentinel so a resolved-to-None stage-window policy is only looked up once.
 _UNSET = object()
 
@@ -266,7 +272,7 @@ class IntervalPlanner:
             core += width
         return list(zip(begins, shape))
 
-    def _assign(self, experts, lanes):
+    def _assign_lpt(self, experts, lanes):
         lane_count = len(lanes)
         load = [0.0] * lane_count
         lane_experts: List[List[int]] = [[] for _ in range(lane_count)]
@@ -280,6 +286,77 @@ class IntervalPlanner:
             lane_experts[lane].append(index)
             load[lane] += self._task_time(routes, lanes[lane][1])
         return lane_experts
+
+    @staticmethod
+    def _reverse_lanes(lane_experts, parity: int):
+        return [
+            list(reversed(expert_indices)) if lane % 2 == parity else list(expert_indices)
+            for lane, expert_indices in enumerate(lane_experts)
+        ]
+
+    def _assignment_for_order(self, lpt_assignment, assignment_order: str):
+        if assignment_order == _ASSIGNMENT_ORDER_LPT:
+            return [list(expert_indices) for expert_indices in lpt_assignment]
+        if assignment_order == _ASSIGNMENT_ORDER_REVERSE_ODD:
+            return self._reverse_lanes(lpt_assignment, 1)
+        if assignment_order == _ASSIGNMENT_ORDER_REVERSE_EVEN:
+            return self._reverse_lanes(lpt_assignment, 0)
+        raise ValueError(f"unknown assignment order: {assignment_order}")
+
+    @staticmethod
+    def _assignment_better(candidate: float, reference: float) -> bool:
+        tolerance = max(
+            _TEMPORAL_ASSIGNMENT_ABS_NS,
+            abs(reference) * _TEMPORAL_ASSIGNMENT_REL_TOL,
+        )
+        return candidate < reference - tolerance
+
+    def _temporal_assignment(self, experts, lanes, lpt_assignment):
+        """Greedily orient fixed LPT lanes using the full event-time model.
+
+        Lane membership, width, core interval, and isolated lane work remain
+        unchanged. Reversing selected lanes advances their smaller experts and
+        delays their larger experts, allowing the DAG model to overlap unlike
+        resource phases without adding idling or a new runtime contract.
+        """
+
+        def score(assignment):
+            return self._score(self._build_tasks(experts, lanes, assignment))
+
+        best = [list(expert_indices) for expert_indices in lpt_assignment]
+        best_score = score(best)
+        best_order = _ASSIGNMENT_ORDER_LPT
+        if (
+            len(lanes) <= 1
+            or all(len(expert_indices) <= 1 for expert_indices in lpt_assignment)
+            or len({routes for _, routes in experts}) <= 1
+        ):
+            return best, best_score, best_order
+
+        # The two checkerboard seeds can express a mixed first wave even when
+        # no single-lane reversal is independently profitable.
+        for parity in (1, 0):
+            candidate = self._reverse_lanes(lpt_assignment, parity)
+            candidate_score = score(candidate)
+            if self._assignment_better(candidate_score, best_score):
+                best = candidate
+                best_score = candidate_score
+                best_order = (
+                    _ASSIGNMENT_ORDER_REVERSE_ODD if parity == 1 else _ASSIGNMENT_ORDER_REVERSE_EVEN
+                )
+
+        return best, best_score, best_order
+
+    def _select_assignment(self, experts, lanes):
+        lpt_assignment = self._assign_lpt(experts, lanes)
+        shape = tuple(width for _, width in lanes)
+        if self._uses_full_workload_anchor(experts, shape):
+            return lpt_assignment, None, _ASSIGNMENT_ORDER_LPT
+        return self._temporal_assignment(experts, lanes, lpt_assignment)
+
+    def _assign(self, experts, lanes):
+        assignment, _, _ = self._select_assignment(experts, lanes)
+        return assignment
 
     def _build_tasks(self, experts, lanes, lane_experts):
         tasks = []
@@ -387,18 +464,24 @@ class IntervalPlanner:
         resolver = getattr(self.model, "can_use_full_workload_anchor", None)
         return not callable(resolver) or bool(resolver(experts[0][1], shape))
 
-    def score_shape(self, experts, shape):
+    def _score_shape_with_order(self, experts, shape):
         signature = tuple(int(value) for value in shape)
         if self.model.schema_version >= 2 and not self.model.supports_shape(signature):
             raise ProfileCompatibilityError(f"shape {signature} is not supported by {self.model.profile_path.name}")
         lanes = self._lanes(signature)
-        tasks = self._build_tasks(experts, lanes, self._assign(experts, lanes))
+        assignment, assignment_score, assignment_order = self._select_assignment(experts, lanes)
+        tasks = self._build_tasks(experts, lanes, assignment)
         if self._uses_full_workload_anchor(experts, signature):
-            return self.model.profiled_full_call_time(experts[0][1], signature), tasks
-        return self._score(tasks), tasks
+            return self.model.profiled_full_call_time(experts[0][1], signature), tasks, assignment_order
+        assert assignment_score is not None
+        return assignment_score, tasks, assignment_order
+
+    def score_shape(self, experts, shape):
+        makespan, tasks, _ = self._score_shape_with_order(experts, shape)
+        return makespan, tasks
 
     def _candidate(self, experts, shape) -> dict:
-        makespan, tasks = self.score_shape(experts, shape)
+        makespan, tasks, assignment_order = self._score_shape_with_order(experts, shape)
         uncertainty = self._uncertainty(experts, shape, makespan)
         resource_groups = len({(core, threads) for _, _, core, threads, _ in tasks})
         return {
@@ -410,6 +493,7 @@ class IntervalPlanner:
             "tail_repartition_width": None,
             "tail_repartition_tasks": 0,
             "tail_repartition_route_slices": 1,
+            "assignment_order": assignment_order,
             "makespan_ns": makespan,
             "uncertainty_ns": uncertainty,
             "pessimistic_ns": makespan + uncertainty,
@@ -588,6 +672,7 @@ class IntervalPlanner:
             "tail_repartition_width": int(tail_width),
             "tail_repartition_tasks": _BOUNDED_TAIL_TASKS,
             "tail_repartition_route_slices": int(route_slices),
+            "assignment_order": strict_candidate["assignment_order"],
             "makespan_ns": makespan,
             "uncertainty_ns": uncertainty,
             "pessimistic_ns": makespan + uncertainty,
@@ -796,6 +881,7 @@ class IntervalPlanner:
             "tail_repartition_width": None,
             "tail_repartition_tasks": 0,
             "tail_repartition_route_slices": 1,
+            "assignment_order": strict_candidate["assignment_order"],
             "makespan_ns": makespan,
             "uncertainty_ns": uncertainty,
             "pessimistic_ns": makespan + uncertainty,
@@ -881,6 +967,7 @@ class IntervalPlanner:
         selected: dict,
         candidates: Sequence[dict],
         *,
+        topk_ids=None,
         planner_backend: str,
         planner_workers: int,
         strict_candidates: int,
@@ -902,12 +989,13 @@ class IntervalPlanner:
                 max_pooled_routes=selected["tail_pool_max_routes"],
             )
             if selected["execution_mode"] == _ASYNC_EXECUTION_TAIL_POOL
-            else self.to_async_bridge(selected["tasks"])
+            else self.to_async_bridge(selected["tasks"], topk_ids=topk_ids)
         )
         return {
             "plan_version": _ASYNC_PLAN_VERSION,
             "stage": self.stage,
             "shape": tuple(selected["shape"]),
+            "assignment_order": selected.get("assignment_order", _ASSIGNMENT_ORDER_LPT),
             "execution_mode": selected["execution_mode"],
             "tail_pool_threads": selected["tail_pool_threads"],
             "tail_pool_max_routes": selected["tail_pool_max_routes"],
@@ -953,6 +1041,7 @@ class IntervalPlanner:
         self,
         experts: List[Tuple[int, int]],
         *,
+        topk_ids=None,
         dynamic_tail_pool: bool = True,
         tail_pool_max_routes: int = 12,
         forced_tail_pool_threads: int | None = None,
@@ -975,6 +1064,7 @@ class IntervalPlanner:
             return self._finalize_plan(
                 native["selected"],
                 native["candidates"],
+                topk_ids=topk_ids,
                 planner_backend="cpp",
                 planner_workers=int(native["configured_workers"]),
                 strict_candidates=int(native["strict_candidates"]),
@@ -1018,6 +1108,7 @@ class IntervalPlanner:
         return self._finalize_plan(
             selected,
             candidates,
+            topk_ids=topk_ids,
             planner_backend="python",
             planner_workers=1,
             strict_candidates=len(strict_candidates),
@@ -1025,8 +1116,7 @@ class IntervalPlanner:
             tail_repartition_candidates=len(tail_repartition_candidates),
         )
 
-    def _early_merge_policy(self, tasks) -> bool | None:
-        """Disable early merge only when the model predicts no overlap window."""
+    def _predicted_expert_finish_times(self, tasks) -> dict[int, float] | None:
         if self.stage is not None:
             return None
         finish_time_fn = getattr(self.model, "dag_task_finish_times", None)
@@ -1049,6 +1139,18 @@ class IntervalPlanner:
                 finish_time,
                 expert_finish_times.get(expert, -math.inf),
             )
+        return expert_finish_times
+
+    def _early_merge_decision(self, tasks, topk_ids=None) -> tuple[bool | None, dict[str, object]]:
+        """Conservatively disable early merge when one ready wave dominates.
+
+        This remains a post-plan gate: it never changes the compute candidate and
+        never forces early merge on. It reads only the shape of ``topk_ids`` and
+        derives a conservative ready-burst lower bound from existing route counts.
+        """
+        expert_finish_times = self._predicted_expert_finish_times(tasks)
+        if not expert_finish_times:
+            return None, {"reason": "finish_times_unavailable"}
         earliest = min(expert_finish_times.values())
         latest = max(expert_finish_times.values())
         if math.isclose(
@@ -1057,12 +1159,109 @@ class IntervalPlanner:
             rel_tol=_EARLY_MERGE_EQUAL_FINISH_REL_TOL,
             abs_tol=_EARLY_MERGE_EQUAL_FINISH_ABS_NS,
         ):
-            return False
-        # The current objective does not model merge/computation contention,
-        # so a predicted gap is insufficient evidence to force early merge on.
-        return None
+            return False, {
+                "reason": "equal_expert_finish",
+                "late_experts": tuple(sorted(expert_finish_times)),
+            }
+        if topk_ids is None:
+            return None, {"reason": "routing_unavailable"}
 
-    def to_async_bridge(self, tasks) -> Dict[str, object]:
+        import torch
+
+        ids = torch.as_tensor(topk_ids)
+        if ids.device.type != "cpu":
+            raise ValueError("routing-aware early merge requires CPU topk_ids")
+        if ids.dim() != 2 or ids.shape[0] <= 0 or ids.shape[1] <= 0:
+            raise ValueError("topk_ids must be a non-empty 2-D [tokens, top_k] tensor")
+        if ids.dtype == torch.bool or ids.is_floating_point() or ids.is_complex():
+            raise TypeError("topk_ids must use an integer dtype")
+
+        route_counts: dict[int, int] = {}
+        for expert, routes, _, _, _ in tasks:
+            expert = int(expert)
+            route_counts[expert] = route_counts.get(expert, 0) + int(routes)
+        if int(ids.numel()) != sum(route_counts.values()):
+            raise ValueError("topk_ids size does not match the selected plan route count")
+        num_tokens = int(ids.shape[0])
+        if any(routes > num_tokens for routes in route_counts.values()):
+            return None, {"reason": "topk_uniqueness_not_provable"}
+
+        drain_capacity = _EARLY_MERGE_OWNER_BATCH * self.num_cores
+        if num_tokens <= drain_capacity:
+            return False, {
+                "reason": "all_tokens_fit_one_owner_batch",
+                "num_tokens": num_tokens,
+                "drain_capacity": drain_capacity,
+            }
+
+        required_burst = num_tokens - drain_capacity
+        high_coverage_experts = [
+            expert for expert, routes in route_counts.items() if routes >= required_burst
+        ]
+        if not high_coverage_experts:
+            return None, {
+                "reason": "routing_tail_bound_inconclusive",
+                "required_burst": required_burst,
+                "max_expert_routes": max(route_counts.values()),
+                "drain_capacity": drain_capacity,
+            }
+
+        bounds: list[tuple[int, float, int, int]] = []
+        for expert in high_coverage_experts:
+            finish_time = expert_finish_times[expert]
+            later_route_occurrences = sum(
+                route_counts[other]
+                for other, other_finish in expert_finish_times.items()
+                if other_finish > finish_time
+                and not math.isclose(
+                    other_finish,
+                    finish_time,
+                    rel_tol=_EARLY_MERGE_EQUAL_FINISH_REL_TOL,
+                    abs_tol=_EARLY_MERGE_EQUAL_FINISH_ABS_NS,
+                )
+            )
+            burst_lower_bound = max(
+                0,
+                route_counts[expert] - min(num_tokens, later_route_occurrences),
+            )
+            bounds.append((burst_lower_bound, finish_time, -expert, later_route_occurrences))
+        burst_lower_bound, dominant_finish, negative_expert, later_route_occurrences = max(bounds)
+        dominant_expert = -negative_expert
+        dominant_wave_experts = tuple(
+            sorted(
+                expert
+                for expert, finish_time in expert_finish_times.items()
+                if math.isclose(
+                    finish_time,
+                    dominant_finish,
+                    rel_tol=_EARLY_MERGE_EQUAL_FINISH_REL_TOL,
+                    abs_tol=_EARLY_MERGE_EQUAL_FINISH_ABS_NS,
+                )
+            )
+        )
+        outside_burst_upper_bound = num_tokens - burst_lower_bound
+        diagnostics = {
+            "reason": "routing_tail_bound",
+            "dominant_expert": dominant_expert,
+            "dominant_wave_experts": dominant_wave_experts,
+            "dominant_wave_finish_ns": dominant_finish,
+            "burst_tokens_lower_bound": burst_lower_bound,
+            "outside_burst_tokens_upper_bound": outside_burst_upper_bound,
+            "later_route_occurrences": later_route_occurrences,
+            "drain_capacity": drain_capacity,
+        }
+        if outside_burst_upper_bound <= drain_capacity:
+            return False, diagnostics
+
+        diagnostics["reason"] = "routing_tail_bound_inconclusive"
+        # A predicted gap is still insufficient evidence to force early merge
+        # on until merge/computation contention has an active service model.
+        return None, diagnostics
+
+    def _early_merge_policy(self, tasks, topk_ids=None) -> bool | None:
+        return self._early_merge_decision(tasks, topk_ids)[0]
+
+    def to_async_bridge(self, tasks, *, topk_ids=None) -> Dict[str, object]:
         dependency_offsets, flat_dependencies = [0], []
         for _, _, _, _, dependencies in tasks:
             flat_dependencies.extend(dependencies)
@@ -1107,7 +1306,7 @@ class IntervalPlanner:
             "task_range_granularities": task_range_granularities,
             "task_w13_window_tiles": w13_windows,
             "task_w2_window_tiles": w2_windows,
-            "early_merge": self._early_merge_policy(tasks),
+            "early_merge": self._early_merge_policy(tasks, topk_ids),
         }
 
     def _stage_windows(self, tasks, task_threads) -> tuple[list[int], list[int]]:

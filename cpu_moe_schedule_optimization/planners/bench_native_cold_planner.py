@@ -35,6 +35,7 @@ def _percentile(samples: list[float], quantile: float) -> float:
 def _assert_plan_equivalent(case: str, backend: str, expected: dict, actual: dict) -> None:
     exact_fields = (
         "shape",
+        "assignment_order",
         "execution_mode",
         "tail_pool_threads",
         "tail_pool_max_routes",

@@ -23,6 +23,8 @@ namespace moe_planner {
 namespace {
 
 constexpr double kCompletionTolerance = 1e-6;
+constexpr double kTemporalAssignmentRelativeTolerance = 1e-10;
+constexpr double kTemporalAssignmentAbsoluteNs = 1e-6;
 constexpr int kAutoTailPoolMinHeadShapes = 2;
 constexpr int kDefaultPlannerWorkers = 8;
 constexpr int kAutoTailPoolThresholds[] = {1, 2, 4, 8, 12};
@@ -908,8 +910,8 @@ std::vector<Expert> BuildExperts(const std::vector<int>& expert_ids, const std::
   return experts;
 }
 
-std::vector<IntervalTask> BuildStrictTasks(const NativeIntervalPlanner::Impl& model, const std::vector<Expert>& experts,
-                                           const std::vector<int>& shape) {
+std::vector<std::vector<int>> BuildLptLaneExperts(const NativeIntervalPlanner::Impl& model,
+                                                  const std::vector<Expert>& experts, const std::vector<int>& shape) {
   const int lane_count = static_cast<int>(shape.size());
   std::vector<double> loads(lane_count, 0.0);
   std::vector<std::vector<int>> lane_experts(lane_count);
@@ -932,11 +934,15 @@ std::vector<IntervalTask> BuildStrictTasks(const NativeIntervalPlanner::Impl& mo
     lane_experts[selected_lane].push_back(expert_index);
     loads[selected_lane] += model.Tiso(experts[expert_index].routes, shape[selected_lane]);
   }
+  return lane_experts;
+}
 
+std::vector<IntervalTask> BuildTasksFromLaneExperts(const std::vector<Expert>& experts, const std::vector<int>& shape,
+                                                    const std::vector<std::vector<int>>& lane_experts) {
   std::vector<IntervalTask> tasks;
   tasks.reserve(experts.size());
   int core_begin = 0;
-  for (int lane = 0; lane < lane_count; ++lane) {
+  for (size_t lane = 0; lane < lane_experts.size(); ++lane) {
     int previous = -1;
     for (int expert_index : lane_experts[lane]) {
       IntervalTask task;
@@ -955,6 +961,16 @@ std::vector<IntervalTask> BuildStrictTasks(const NativeIntervalPlanner::Impl& mo
   return tasks;
 }
 
+std::vector<std::vector<int>> ReverseLanes(const std::vector<std::vector<int>>& lane_experts, int parity) {
+  std::vector<std::vector<int>> result = lane_experts;
+  for (size_t lane = 0; lane < result.size(); ++lane) {
+    if (static_cast<int>(lane % 2) == parity) {
+      std::reverse(result[lane].begin(), result[lane].end());
+    }
+  }
+  return result;
+}
+
 std::vector<NativeIntervalPlanner::Impl::SimulationTask> ToSimulationTasks(const std::vector<IntervalTask>& tasks) {
   std::vector<NativeIntervalPlanner::Impl::SimulationTask> result;
   result.reserve(tasks.size());
@@ -964,15 +980,64 @@ std::vector<NativeIntervalPlanner::Impl::SimulationTask> ToSimulationTasks(const
   return result;
 }
 
+bool TemporalAssignmentBetter(double candidate, double reference) {
+  const double tolerance =
+      std::max(kTemporalAssignmentAbsoluteNs, std::abs(reference) * kTemporalAssignmentRelativeTolerance);
+  return candidate < reference - tolerance;
+}
+
+struct StrictSchedule {
+  std::vector<IntervalTask> tasks;
+  double makespan_ns = 0.0;
+  IntervalAssignmentOrder assignment_order = IntervalAssignmentOrder::kLpt;
+};
+
+StrictSchedule BuildTemporalStrictSchedule(const NativeIntervalPlanner::Impl& model, const std::vector<Expert>& experts,
+                                           const std::vector<int>& shape,
+                                           const std::vector<std::vector<int>>& lpt_lane_experts) {
+  auto score = [&](const std::vector<std::vector<int>>& lane_experts, IntervalAssignmentOrder assignment_order) {
+    std::vector<IntervalTask> tasks = BuildTasksFromLaneExperts(experts, shape, lane_experts);
+    const double makespan_ns = model.DagMakespan(ToSimulationTasks(tasks));
+    return StrictSchedule{std::move(tasks), makespan_ns, assignment_order};
+  };
+
+  StrictSchedule best = score(lpt_lane_experts, IntervalAssignmentOrder::kLpt);
+  const bool no_reorderable_lane =
+      std::all_of(lpt_lane_experts.begin(), lpt_lane_experts.end(), [](const auto& lane) { return lane.size() <= 1; });
+  const bool uniform_routes = std::all_of(
+      experts.begin(), experts.end(), [&](const Expert& expert) { return expert.routes == experts.front().routes; });
+  if (lpt_lane_experts.size() <= 1 || no_reorderable_lane || uniform_routes) {
+    return best;
+  }
+
+  // Checkerboard seeds can expose a mixed first wave even when reversing one
+  // lane in isolation is not profitable.
+  for (int parity : {1, 0}) {
+    std::vector<std::vector<int>> candidate_lane_experts = ReverseLanes(lpt_lane_experts, parity);
+    const IntervalAssignmentOrder assignment_order =
+        parity == 1 ? IntervalAssignmentOrder::kReverseOdd : IntervalAssignmentOrder::kReverseEven;
+    StrictSchedule candidate = score(candidate_lane_experts, assignment_order);
+    if (TemporalAssignmentBetter(candidate.makespan_ns, best.makespan_ns)) {
+      best = std::move(candidate);
+    }
+  }
+
+  return best;
+}
+
 IntervalCandidate BuildStrictCandidate(const NativeIntervalPlanner::Impl& model, const std::vector<Expert>& experts,
                                        const std::vector<int>& shape) {
   IntervalCandidate candidate;
   candidate.shape = shape;
-  candidate.tasks = BuildStrictTasks(model, experts, shape);
+  const std::vector<std::vector<int>> lpt_lane_experts = BuildLptLaneExperts(model, experts, shape);
   if (model.UsesFullWorkloadAnchor(experts, shape)) {
+    candidate.tasks = BuildTasksFromLaneExperts(experts, shape, lpt_lane_experts);
     candidate.makespan_ns = model.ProfiledCurve(model.full_call_curves, experts.front().routes, shape);
   } else {
-    candidate.makespan_ns = model.DagMakespan(ToSimulationTasks(candidate.tasks));
+    StrictSchedule schedule = BuildTemporalStrictSchedule(model, experts, shape, lpt_lane_experts);
+    candidate.tasks = std::move(schedule.tasks);
+    candidate.makespan_ns = schedule.makespan_ns;
+    candidate.assignment_order = schedule.assignment_order;
   }
   candidate.uncertainty_ns = model.Uncertainty(experts, shape, candidate.makespan_ns, true);
   candidate.pessimistic_ns = candidate.makespan_ns + candidate.uncertainty_ns;
@@ -1093,6 +1158,7 @@ std::optional<IntervalCandidate> BuildBoundedTailCandidate(const NativeIntervalP
     const int physical_tail_tasks = kTailExperts * route_slices;
     IntervalCandidate candidate;
     candidate.shape = strict_candidate.shape;
+    candidate.assignment_order = strict_candidate.assignment_order;
     candidate.tail_repartition_width = tail_width;
     candidate.tail_repartition_tasks = kTailExperts;
     candidate.tail_repartition_route_slices = route_slices;
@@ -1311,6 +1377,7 @@ std::optional<IntervalCandidate> BuildTailPoolCandidate(const NativeIntervalPlan
   }
   IntervalCandidate candidate;
   candidate.shape = strict_candidate.shape;
+  candidate.assignment_order = strict_candidate.assignment_order;
   candidate.execution_mode = IntervalExecutionMode::kTailPool;
   candidate.tail_pool_threads = pool_threads;
   candidate.tail_pool_max_routes = max_pooled_routes;
