@@ -78,6 +78,7 @@ def _calibration(
             expert_fixed_ns=200.0,
             route_ns=2.0,
             stage_fixed_ns=100.0,
+            panel_range_restart_ns=3.0,
         ),
         supported_widths=supported_widths,
         relative_uncertainty=0.04,
@@ -190,6 +191,8 @@ def _service_probe() -> dict:
             "llc_bytes_per_rank": 8 * 1024 * 1024,
         },
         "services": {
+            "panel_range_restart": {"panel_range_restart_ns": 7.5},
+            "w13_fused_panel_range_restart": {"panel_range_restart_ns": 41.0},
             "gemm_core_flops": service((60.0, 115.0, 210.0, 360.0)),
             "gemm_l2_flops": service((45.0, 85.0, 150.0, 250.0)),
             "matrix_flops": service((100.0, 190.0, 350.0, 600.0)),
@@ -236,11 +239,39 @@ def test_thin_calibration_extracts_private_and_shared_service_curves() -> None:
     assert calibration["caches"]["l2_b_reuse_miss_at_capacity"] == pytest.approx(0.62)
     assert calibration["caches"]["l2_b_reuse_miss_ceiling"] == pytest.approx(0.87)
     assert calibration["planner"]["supported_widths"] == [1, 2, 4, 8]
+    assert calibration["overheads"]["panel_range_restart_ns"] == pytest.approx(7.5)
+    assert calibration["overheads"]["w13_panel_range_restart_ns"] == pytest.approx(41.0)
+    assert calibration["overheads"]["w2_panel_range_restart_ns"] == pytest.approx(7.5)
     assert calibration["provenance"]["contention_measurements_used"] is False
     assert calibration["provenance"]["gemm_core_service"] == "m12_l1_hot_full_no_store"
+    assert calibration["provenance"]["panel_range_restart_service"] == {
+        "w13": "m12_l1_hot_fused_w13_extra_n_range",
+        "w2": "m12_l1_hot_full_no_store_extra_n_range",
+    }
     assert calibration["provenance"]["l2_b_retention_calibration"]["kind"].startswith("independent_")
     assert report["dram_bytes"] == shared_fit
     assert report["gemm_l2_flops"]["curve"]["single_thread_rate"] == pytest.approx(45.0)
+
+
+def test_thin_calibration_marks_legacy_w13_restart_fallback() -> None:
+    probe = _service_probe()
+    del probe["services"]["w13_fused_panel_range_restart"]
+
+    calibration, _ = build_calibration(
+        probe,
+        machine_id="test-legacy-restart",
+        l2_effective_fraction=0.75,
+        llc_effective_fraction=0.625,
+        l2_b_reuse_miss_floor=0.18,
+        l2_b_reuse_miss_at_capacity=0.62,
+        l2_b_reuse_miss_ceiling=0.87,
+        relative_uncertainty=0.15,
+    )
+
+    assert calibration["overheads"]["w13_panel_range_restart_ns"] == pytest.approx(7.5)
+    assert calibration["provenance"]["panel_range_restart_service"]["w13"] == (
+        "fallback_to_m12_l1_hot_full_no_store_extra_n_range"
+    )
 
 
 def test_thin_residual_fit_recovers_nonnegative_operator_terms() -> None:
@@ -435,6 +466,124 @@ def test_team_width_naturally_controls_full_stage_worker_window() -> None:
     ]
     assert model.predict_expert(routes=216, threads=4).w13_demand.owner_window_bytes == 2 * 1024 * 1024
     assert model.predict_expert(routes=2040, threads=4).w13_demand.owner_window_bytes == 2 * 1024 * 1024
+
+
+def _tp4_analytic_model(*, supported_widths: tuple[int, ...] = (1, 2, 4, 8)) -> AnalyticMoeCostModel:
+    profile = (
+        COST_MODEL
+        / "profiles"
+        / "analytic_machine_amazon_c5_192c_numa0_sve_jit_hot_gemm_20260802.json"
+    )
+    return AnalyticMoeCostModel(
+        profile,
+        hidden_size=4096,
+        intermediate_size=512,
+        global_experts=256,
+        local_experts=256,
+        supported_widths=supported_widths,
+    )
+
+
+def test_stage_window_score_uses_exact_runtime_tile_geometry() -> None:
+    model = _tp4_analytic_model(supported_widths=(4,))
+    score = model.score_stage_window("w13", routes=120, threads=4, window_tiles=2)
+
+    assert score.window_tiles == 2
+    assert score.range_tiles == 8
+    assert score.windows == 16
+    assert score.full_stripe_window_tiles == 32
+    assert score.owner_window_bytes == 128 * 1024
+    assert sum(window.n_tiles for window in score.window_demands) == 128
+    assert all(window.owner_tiles == 2 for window in score.window_demands)
+    assert score.compulsory_dram_bytes == model.w13_stage_bytes
+    assert score.starves_any_thread is False
+
+
+def test_stage_window_score_exposes_b_retention_vs_a_rescan_tradeoff() -> None:
+    model = _tp4_analytic_model(supported_widths=(4,))
+    narrow = model.score_stage_window("w13", routes=2040, threads=4, window_tiles=1)
+    full = model.score_stage_window("w13", routes=2040, threads=4, window_tiles=0)
+
+    assert narrow.b_l2_refill_bytes < full.b_l2_refill_bytes
+    assert narrow.a_l2_refill_bytes > full.a_l2_refill_bytes
+    assert narrow.windows == 32
+    assert full.windows == 1
+    assert narrow.objective_ns > full.objective_ns
+
+
+def test_stage_window_a_residency_uses_effective_private_l2_capacity() -> None:
+    model = _tp4_analytic_model(supported_widths=(16,))
+    resident = model.score_stage_window("w13", routes=120, threads=16, window_tiles=1)
+    streaming = model.score_stage_window("w13", routes=216, threads=16, window_tiles=1)
+    cache = model.calibration.caches
+
+    expected_capacity = cache.effective_l2_bytes_per_core - 12 * 4096 * 2
+    assert resident.window_demands[0].a_residency_capacity_bytes == expected_capacity
+    assert resident.l2_miss_fraction_a == 0.0
+    assert 0.0 < streaming.l2_miss_fraction_a < 1.0
+    assert streaming.a_l2_refill_bytes > resident.a_l2_refill_bytes
+
+
+def test_stage_window_uses_stage_specific_range_restart_services() -> None:
+    model = _tp4_analytic_model(supported_widths=(4,))
+    w13 = model.score_stage_window("w13", routes=216, threads=4, window_tiles=2)
+    w2 = model.score_stage_window("w2", routes=216, threads=4, window_tiles=8)
+
+    assert w13.panel_range_restart_ns == pytest.approx(45.2695652173913)
+    assert w2.panel_range_restart_ns == pytest.approx(6.695652173913044)
+    assert w13.range_restart_ns == pytest.approx(18 * 15 * w13.panel_range_restart_ns)
+    assert w2.range_restart_ns == pytest.approx(18 * 15 * w2.panel_range_restart_ns)
+
+
+def test_single_panel_analytical_window_policy_selects_full_stripe() -> None:
+    model = _tp4_analytic_model()
+    policy = model.shadow_stage_window_policy()
+
+    assert policy.select(routes=12, threads=4) == (0, 0)
+    assert policy.explain(routes=12, threads=4)["reason"] == "single_panel_has_no_packed_b_reuse"
+
+
+def test_analytical_window_policy_uses_formula_candidates_and_explains_deltas() -> None:
+    model = _tp4_analytic_model(supported_widths=(4, 16))
+    policy = model.shadow_stage_window_policy()
+
+    assert policy.candidate_window_tiles("w13", routes=216, threads=4) == (1, 2, 4, 8, 16, 32)
+    assert policy.select(routes=216, threads=4) == (8, 16)
+    assert policy.select(routes=216, threads=16) == (0, 16)
+    assert policy.select(routes=320, threads=4) == (8, 16)
+
+    explanation = policy.explain(routes=216, threads=4)
+    w13 = explanation["candidates"]["w13"]
+    w2 = explanation["candidates"]["w2"]
+    assert w13["selected"]["window_tiles"] == 8
+    assert w2["selected"]["owner_window_bytes"] == 128 * 1024
+    assert w13["selected"]["shared_b_llc_spill_ns"] < w13["full_stripe"]["shared_b_llc_spill_ns"]
+    assert w13["selected_vs_full"]["b_l2_refill_bytes"] < 0
+    assert "window_demands" not in w13["selected"]
+
+
+def test_analytical_window_policy_adds_only_cohort_induced_reusable_b_spill() -> None:
+    model = _tp4_analytic_model(supported_widths=(4,))
+    policy = model.shadow_stage_window_policy()
+    evaluations = policy.stage_evaluations("w13", routes=216, threads=4)
+    by_tiles = {item.score.window_tiles: item for item in evaluations}
+
+    assert by_tiles[2].shared_b_llc_spill_ns == 0.0
+    assert by_tiles[32].shared_b_llc_spill_ns > 0.0
+    assert by_tiles[32].policy_objective_ns == pytest.approx(
+        by_tiles[32].score.objective_ns + by_tiles[32].shared_b_llc_spill_ns
+    )
+
+
+def test_shadow_window_scoring_does_not_change_default_expert_prediction() -> None:
+    model = _tp4_analytic_model(supported_widths=(4,))
+    before = model.predict_expert(routes=120, threads=4)
+    _ = model.shadow_stage_window_policy().explain(routes=120, threads=4)
+    after = model.predict_expert(routes=120, threads=4)
+
+    assert after is before
+    assert after.w13_demand.owner_window_bytes == 2 * 1024 * 1024
+    assert after.w13_demand.stripe_demand is not None
 
 
 def test_single_panel_stage_is_entirely_cold_b() -> None:

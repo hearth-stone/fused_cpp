@@ -252,6 +252,15 @@ def build_calibration(
     }
     caches = probe["caches"]
     widths = sorted(int(row["threads"]) for row in probe["services"]["gemm_core_flops"]["rows"])
+    service_payload = probe.get("services", {})
+    panel_range_restart_ns = float(
+        service_payload.get("panel_range_restart", {}).get("panel_range_restart_ns", 0.0)
+    )
+    has_fused_w13_restart = "w13_fused_panel_range_restart" in service_payload
+    w13_panel_range_restart_ns = float(
+        service_payload.get("w13_fused_panel_range_restart", {})
+        .get("panel_range_restart_ns", panel_range_restart_ns)
+    )
     payload = {
         "schema_version": 1,
         "kind": "moe_analytic_machine",
@@ -281,6 +290,10 @@ def build_calibration(
             "expert_fixed_ns": 0.0,
             "route_ns": 0.0,
             "stage_fixed_ns": 0.0,
+            "range_fixed_ns": 0.0,
+            "panel_range_restart_ns": panel_range_restart_ns,
+            "w13_panel_range_restart_ns": w13_panel_range_restart_ns,
+            "w2_panel_range_restart_ns": panel_range_restart_ns,
         },
         "planner": {"supported_widths": widths},
         "uncertainty": {"relative": relative_uncertainty},
@@ -291,6 +304,14 @@ def build_calibration(
             "gemm_core_service": "m12_l1_hot_full_no_store",
             "matrix_service": "register_only_bfmmla_diagnostic",
             "contention_measurements_used": False,
+            "panel_range_restart_service": {
+                "w13": (
+                    "m12_l1_hot_fused_w13_extra_n_range"
+                    if has_fused_w13_restart
+                    else "fallback_to_m12_l1_hot_full_no_store_extra_n_range"
+                ),
+                "w2": "m12_l1_hot_full_no_store_extra_n_range",
+            },
         },
     }
     if l2_b_reuse_miss_floor > 0.0 or l2_b_reuse_miss_at_capacity < 1.0 or l2_b_reuse_miss_ceiling < 1.0:

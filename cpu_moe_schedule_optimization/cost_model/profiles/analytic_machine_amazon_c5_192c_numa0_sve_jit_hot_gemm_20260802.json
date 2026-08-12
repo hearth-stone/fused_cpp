@@ -68,7 +68,10 @@
     "expert_fixed_ns": 51406.537086644385,
     "route_ns": 418.7552029551573,
     "stage_fixed_ns": 0.0,
-    "range_fixed_ns": 0.0
+    "range_fixed_ns": 0.0,
+    "panel_range_restart_ns": 6.695652173913044,
+    "w13_panel_range_restart_ns": 45.2695652173913,
+    "w2_panel_range_restart_ns": 6.695652173913044
   },
   "planner": {
     "supported_widths": [
@@ -200,6 +203,15 @@
     "gemm_core_service": "m12_l1_hot_full_no_store",
     "matrix_service": "register_only_bfmmla_diagnostic",
     "contention_measurements_used": false,
+    "panel_range_restart_service": {
+      "kind": "independent_m12_l1_hot_extra_n_range",
+      "w13_probe": "fused_silu_packc",
+      "w2_proxy_probe": "full_no_store",
+      "measured_on": "2026-08-11",
+      "warmup": 256,
+      "runs": 8192,
+      "repeats": 7
+    },
     "l2_b_retention_calibration": {
       "kind": "independent_packed_b_repeated_scan_probe",
       "effective_fraction": 0.125,

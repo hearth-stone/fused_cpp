@@ -5191,13 +5191,20 @@ std::vector<double> fused_moe_bench_sve_jit_w13_gemm(at::Tensor A, at::Tensor w1
   TORCH_CHECK((N / n_ranges) % n_tile == 0, "each N range must contain whole SVE N tiles");
   TORCH_CHECK(warmup >= 0, "warmup must be non-negative");
   TORCH_CHECK(runs > 0, "runs must be positive");
-  TORCH_CHECK(probe_mode == 0 || probe_mode == 1 || probe_mode == 4 || probe_mode == 10,
-              "probe_mode must be one of 0 (production), 1 (B-only), 4 (full-no-store), or 10 (matrix-only)");
+  constexpr int64_t kFusedW13ProbeMode = 11;
+  TORCH_CHECK(probe_mode == 0 || probe_mode == 1 || probe_mode == 4 || probe_mode == 10 ||
+                  probe_mode == kFusedW13ProbeMode,
+              "probe_mode must be one of 0 (plain GEMM), 1 (B-only), 4 (full-no-store), 10 (matrix-only), "
+              "or 11 (fused W13)");
   A = A.contiguous();
   const PackedExperts weights = checked_packed_experts(w13_packed, K, N, "w13_packed", n_tile);
   TORCH_CHECK(weights.E > 0, "w13_packed must contain at least one expert");
-  TORCH_CHECK(sve_jit_configuration_supported(SveJitOperation::kGemmF32, static_cast<int>(K), 0, nullptr),
-              "plain SVE JIT GEMM is unavailable for this configuration");
+  const bool fused_w13_probe = probe_mode == kFusedW13ProbeMode;
+  const SveJitOperation operation = fused_w13_probe ? SveJitOperation::kW13 : SveJitOperation::kGemmF32;
+  constexpr int64_t kFusedW13ProbeDegree = 5;
+  TORCH_CHECK(sve_jit_configuration_supported(operation, static_cast<int>(K),
+                                              fused_w13_probe ? kFusedW13ProbeDegree : 0, nullptr),
+              sve_jit_operation_name(operation), " is unavailable for this configuration");
 
   const int rows = static_cast<int>(rows64);
   const int64_t packed_rows = sve_hybrid_packed_rows(rows);
@@ -5212,12 +5219,16 @@ std::vector<double> fused_moe_bench_sve_jit_w13_gemm(at::Tensor A, at::Tensor w1
                                      packed_a.data() + static_cast<size_t>(copy) * packed_a_stride, rows,
                                      static_cast<int>(K), int64_t{1}, int64_t{0});
   }
-  at::Tensor output = at::empty({packed_rows, N}, at::TensorOptions().dtype(at::kFloat).device(at::kCPU));
-  float* output_ptr = output.data_ptr<float>();
+  TORCH_CHECK(!fused_w13_probe || N % 2 == 0, "fused W13 probe requires an even packed N");
+  at::Tensor output = at::empty(
+      {packed_rows, fused_w13_probe ? N / 2 : N},
+      at::TensorOptions().dtype(fused_w13_probe ? at::kBFloat16 : at::kFloat).device(at::kCPU));
+  float* output_ptr = fused_w13_probe ? nullptr : output.data_ptr<float>();
+  uint16_t* packc_output_ptr = fused_w13_probe ? bf16_data(output) : nullptr;
   const uint16_t* weights_ptr = bf16_data_const(weights.tensor);
   const int range_cols = static_cast<int>(N / n_ranges);
   ::fused_cpp::moe_sve::jit::KernelFn probe_kernel = nullptr;
-  if (probe_mode != 0) {
+  if (probe_mode != 0 && !fused_w13_probe) {
     const int probe_rows = rows > 12 ? 12 : rows;
     TORCH_CHECK(rows <= 12 || rows % 12 == 0,
                 "full-M SVE JIT probes require M to be at most 12 or a positive multiple of 12");
@@ -5234,7 +5245,12 @@ std::vector<double> fused_moe_bench_sve_jit_w13_gemm(at::Tensor A, at::Tensor w1
     const uint16_t* packed_b = weights_ptr + expert * weights.packed_stride;
     for (int64_t range = 0; range < n_ranges; ++range) {
       const int n_begin = static_cast<int>(range * range_cols);
-      if (probe_kernel != nullptr) {
+      if (fused_w13_probe) {
+        const bool dispatched = sve_jit_packc_w13_exact_dispatch(
+            packed_a_ptr, packed_b, packc_output_ptr, rows, static_cast<int>(K), range_cols,
+            static_cast<int>(N / 2), static_cast<int>(N), n_begin, kFusedW13ProbeDegree);
+        TORCH_CHECK(dispatched, "failed to dispatch fused SVE JIT W13 GEMM");
+      } else if (probe_kernel != nullptr) {
         const int panel_rows = rows > 12 ? 12 : rows;
         for (int m_begin = 0; m_begin < rows; m_begin += panel_rows) {
           SveKBlockParams p = make_sve_kblock_params(panel_rows, static_cast<int>(K), range_cols, static_cast<int>(N),

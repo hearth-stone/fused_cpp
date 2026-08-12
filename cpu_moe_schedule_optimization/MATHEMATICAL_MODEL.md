@@ -22,11 +22,13 @@
 M12、SVE、stage range 数、具体权重布局和 cache 工作集公式不属于核心问题定义。
 它们只影响固定执行环境下观测到的 isolated time 和 contention slowdown。
 
-### 1.1 Production full-stage 不变量
+### 1.1 Production full-N 与 tile-window 不变量
 
-当前 ARM SVE production runtime 不再有 weight split/range/window 决策。每个
-whole-expert task 的 W13 和 W2 各遍历一次完整 packed-N domain；planner 与 Plan
-V2 只选择 task team width，不携带 W13/W2 range 或 byte-window 字段。
+当前 ARM SVE production runtime 不再有 legacy weight split、range-count 或
+byte-window 决策。每个 whole-expert task 的 W13 和 W2 都覆盖完整 packed-N domain；
+Plan V2 可在已选 team width 之外逐 stage 携带 per-worker `window_tiles`，其中 0 表示
+full owner stripe。窗口只改变完整 N domain 的访问顺序，不改变权重子集、算术量、
+packed layout 或输出 ownership。
 
 对 stage $s=(K_s,N_s)$、BF16 N tile $\nu$ 和 team width $t$，定义：
 
@@ -36,12 +38,21 @@ a_s(t)=\min(t,q_s),
 $$
 
 $$
-B_s=2K_sN_s,qquad
-u_s(t)=2K_s\nu\left\lceil\frac{q_s}{t}\right\rceil.
+B_s=2K_sN_s,\qquad
+b_s=2K_s\nu.
 $$
 
-$B_s$ 是该 expert 的完整 packed-B stage 字节数；$u_s(t)$ 是最忙 worker 的
-tile-aligned owner stripe。当前 fused expert 中：
+令每线程窗口为 $w_s$ 个 tile，则
+
+$$
+g_s=t w_s,\qquad
+R_s=\left\lceil\frac{q_s}{g_s}\right\rceil,
+$$
+
+且 $w_s=\lceil q_s/t\rceil$ 即 full-stripe、$R_s=1$ 端点。
+
+$B_s$ 是该 expert 的完整 packed-B stage 字节数；$w_sb_s$ 是最忙 worker 在一个
+window 内的 tile-aligned owner footprint。当前 fused expert 中：
 
 $$
 (K_{13},N_{13})=(H,2F),\quad B_{13}=4HF,
@@ -51,11 +62,11 @@ $$
 (K_2,N_2)=(F,H),\quad B_2=2HF.
 $$
 
-因此 team width 是唯一的 production cache-window 控制。增加 $t$ 会缩小
-$u_s(t)$，同时让 $a_s(t)$ 个 owner 各扫描 packed A；不存在第二个顺序 N range，
-也不存在因 range 数增加而产生的 A 重扫、range dispatch 或 range barrier。
-本文后面标为“历史”的 stage-window/range 章节只保留实验推导与变更 provenance，
-不定义当前可行域、ABI、profile 或 cost model。
+因此当前计算模式由 $(t,w_{13},w_2)$ 决定。增加 $t$ 或减小 $w_s$ 都会缩小每线程
+瞬时 B footprint；只有减小 $w_s$ 会增加 $R_s$，并可能引入跨 window 的 A 重扫与
+range restart。production 在 width 选定后使用确定性 band policy 给出窗口，不把
+$w_s$ 扩成 planner 自由搜索变量；9.36 的解析 v6 只作 shadow selector。本文后面明确
+标为“历史”的 range-count/split 章节仅保留 provenance，不定义当前 ABI。
 
 ## 2. 原始问题
 
@@ -4336,6 +4347,116 @@ $1.3\%$--$1.7\%$ 噪声底内（噪声底由"两臂 plan 完全相同"测得）�
 端到端不动，推测因其余 76 个 task 在 $t=32$（policy 不动）决定 makespan，未测。
 $t=16$ 的项只标定了 W13 轴，其 W2 项取全条带。宽度 $1,2,3,6,12$ 沿用 V4 或未覆盖。
 
+#### 9.36 解析 stage-window v6：选择问题闭合，绝对时间分解仍有边界
+
+9.33 的 `1.50/2.98/3.38%` 是旧 range ABI 上的 coordinate oracle：它证明 v2 在已测
+坐标附近**选择接近最优**，但既不是完整 W13 x W2 笛卡尔积，也不能证明每个候选的
+绝对时间被正确解释。当前 tile-window runtime 因此重新定义闭合门槛：在预先声明的
+192C TP4 转折域上跑全部合法二阶组合，要求
+
+$$
+\max_{(M,t)\in\mathcal H}
+\frac{T(\widehat w_{13},\widehat w_2)-
+      \min_{w_{13},w_2}T(w_{13},w_2)}
+     {\min_{w_{13},w_2}T(w_{13},w_2)}
+\le 5\%.
+$$
+
+这里 $\mathcal H=\{72,216,384\}\times\{4,16\}$，覆盖短 route、$A/L2$ 转折和
+长 route，以及窄/宽 team；它是当前高价值 window 选择域，不代表所有机器、shape 或
+完整 planner 已闭合。
+
+**精确执行几何。** 对 stage $s$，令 packed-N tile 数 $q_s=N_s/\nu$、单 tile 字节
+$b_s=2K_s\nu$、每线程窗口为 $w_s$ tiles。则
+
+$$
+g_s=t w_s,\qquad
+R_s=\left\lceil\frac{q_s}{g_s}\right\rceil,
+$$
+
+尾窗口由 `split_evenly` 分配；$w_s=\lceil q_s/t\rceil$ 是 full-stripe 端点。候选只
+保留 full stripe 与满足 $w_sb_s\ge C_{L1D}$ 的二次幂 owner window，并剪掉会让任一
+线程在尾窗口无 tile 的点。$M\le12$ 只有一个 M panel、没有 B 重用可保护，按支配关系
+固定 full stripe。这个规则是已选 $(M,t)$ 上的 deterministic post-policy，不增加 shape
+搜索变量；production 仍使用现有 band policy，v6 只作 shadow。
+
+**解析需求。** 令 $P_s=|\mathcal P_s(M)|$ 为 exact-M mapper 生成的 panel 数，
+$A_s$ 为完整 packed A，$A_{p,s}$ 为最大单 panel。每个 window 分别计算：
+
+1. 必需 packed-B 首读 $n_jb_s$；
+2. effective L2 周转期内的 transient B refill，以及其后的 resident/streaming 状态；
+3. 当 $A_s+U_j$ 超过为在途 panel 留出 headroom 后的 L2 容量时，跨 window 的 A refill；
+4. C 的流式写入。
+
+task-local transfer 保留 A/B/C 全部流量。rank 级容量附加项只给**可重用 B** 记 resident
+budget：若 $h=\lfloor T_{rank}/t\rfloor$ 个完整 team 同时工作，则
+
+$$
+G_{B,j}=h\,n_jb_s,
+$$
+
+LLC spill 增量只乘 $\max(B^{L2}_j-n_jb_s,0)$。A 与 C 仍消耗带宽，但二者是一次性流，
+不能作为同等大小的 B 驻留集合再次扣 LLC 容量。旧实现把三者相加，系统性高估大 window
+的共享 cache 代价。
+
+**range restart。** 纯 GEMM/no-store probe 把额外 N range 的代价测成约 $6.70$ ns，
+但 fused W13 真实执行 SiLU、gate multiply 与 BF16 packC，独立 L1-hot probe 为
+$45.27$ ns。因此使用 stage-specific 项
+
+$$
+T_{restart,s}=P_s(R_s-1)\delta_s,
+$$
+
+当前 $\delta_{13}=45.27$ ns，$\delta_2=6.70$ ns；W2 是 pure no-store proxy，仍是显式
+校准边界。两条曲线分别用 256 warmups、8192 timed calls、7 组随机 range 顺序拟合，
+最大拟合误差为 $0.087\%/0.180\%$。同步 barrier 假设被独立否证：$M=216,t=4$ 加 team
+critical-path 同步后 W13 仍选择 8 tiles，同步税仅 $1.9\%$--$3.9\%$，不足以改变最优点，
+所以模型不加入不可识别的 barrier 拟合项。
+
+最终 stage 目标为
+
+$$
+J_s=\sum_j\left[T_{core,j}+T_{epi,j}+
+\max(T_{L2,j},T_{LLC,j},T_{DRAM,j})\right]
++T_{restart,s}+T_{sharedB,s}.
+$$
+
+若候选差小于 $\epsilon_{rel}(T_{xfer}+T_{sharedB})$，模型承认其在机器不确定性内等价，
+再用纯 cache 几何确定 tie-break：
+
+$$
+U_{pref,s}=\max\left(C_{L1D},2b_s,
+\sqrt{C_{L1D}C^{B,eff}_{L2}}\right).
+$$
+
+192C 上 $C_{L1D}=64$ KiB、$C^{B,eff}_{L2}=256$ KiB，故偏好 128 KiB；没有新增
+route、thread 或 latency table。需要校准的只有硬件/实现 service：GEMM、L2/LLC/DRAM、
+cache 容量、B retention 三锚点、相对不确定性和两个 $\delta_s$；panel 数、流量、候选集、
+cohort 大小均由公式生成。
+
+**完整 Cartesian holdout。** `AmazonC5192Cores` NUMA0 `0-95`，$H=4096,F=512$，
+96 份不同 expert 权重，32 MiB HugeTLB；每组 2 warmups + 15 个随机交错 rounds：
+
+| $M$ | $t$ | v6 W13/W2 tiles | oracle tiles | regret |
+| ---: | ---: | :--- | :--- | ---: |
+| 72 | 4 | 2 / 16 | 1 / 8 | 4.40% |
+| 72 | 16 | 2 / 16 | 1 / 8 | 1.74% |
+| 216 | 4 | 8 / 16 | 2 / 16 | 2.51% |
+| 216 | 16 | 8 / 16 | 8 / 16 | 0.00% |
+| 384 | 4 | 8 / 16 | 8 / 16 | 0.00% |
+| 384 | 16 | 8 / 16 | 8 / 32 | 0.47% |
+
+median/线性插值 P90/max regret 为 `1.10/3.45/4.40%`，4/6 在 2% 内、6/6 通过 5% gate；候选
+Spearman $\rho$ 中位为 0.869。因此**当前域内的 window 选择问题闭合**：解析公式无需
+$(M,t)$ 时间表即可选择 5% 内的 runtime pair。
+
+边界同样明确。paired-round 的 W13/W2 可加性残差在极端未选点上最高仍为 17.69%，且
+$M=72,t=16$ 的全排序 $\rho=0.098$，虽然 selected regret 只有 1.74%。所以本结论不是
+“模型精确解释了每一个时间”，更不是 production default 的采用证据；它只证明当前域
+内的决策质量。8C 的本机 B-retention、其他 route/width、混合 workload 和完整 planner
+仍需独立 holdout，production policy 与 planner 剪枝保持不变。完整协议和反例见
+`optimizations/fused_moe_sve/results/analytic_stage_window_policy_v6_closure_20260811.md`。
+
 ## 10. 同步规则
 
 
@@ -4473,4 +4594,5 @@ $t=16$ 的项只标定了 W13 轴，其 W2 项取全条带。宽度 $1,2,3,6,12$
 | 2026-08-10 | v1.05 | 修复优化治理索引与当前 window 模型文档：为 5 个 legacy retired feature/variant 补齐最后活动 Git 定位，并将 README/TODO 中“无 window/full-N 仅由线程宽度决定”的陈旧描述改为当前唯一的 $(t,\omega_s)$ 参数化；旧 split/range-count/byte-window 仍保持删除，Plan V2 的 per-task tile window 为零时回到 full owner stripe。仅修正文档与 provenance，不改变公式、planner 或 runtime。|
 | 2026-08-10 | v1.06 | 退役 production `FUSED_CPP_MOE_FUSED_2D_SPLIT` compatibility adapter：删除恒定返回 $t_M=1,t_N=t$ 的 2D plan/range structs、NEON/SVE `_2d` wrappers、normal/scheduled/async/planned-staged 分支和重复测试。该实现从未切 M，SVE wrappers 还强制 `row_begin=0`，所以其行为只是已有 N-split 的重复封装；真正的 mixed-MN 假设继续由隔离的 `bench_mn_split.cpp` Lab 路径验证，历史 production 适配器固定在 Git `8e9fcbd`。hierarchical N-split、Plan V2 $(t,\omega_s)$、planner 候选、cost model 公式和默认数值不变。|
 | 2026-08-10 | v1.07 | 删除 production `FUSED_CPP_MOE_STAGE_WINDOW_TILES` 实验环境适配器及其 process-static parser。stage window 继续由 Plan V2 的逐 task `task_w13_window_tiles/task_w2_window_tiles` 唯一表达，legacy scheduled/async 与 hierarchical fallback 明确使用 full owner stripe；校准 sweep 通过构造显式 Plan V2 复现，不再让进程环境隐式改写未指定窗口。历史适配器固定在 Git `208743e`。窗口计算语义、planner policy、cost model 公式、候选和默认 Plan V2 数值不变。|
+| 2026-08-11 | v1.08 | 闭合解析 stage-window 的当前选择问题（9.36）：shadow policy v6 按 exact tile-window geometry 计算 A/B/C task-local demand，仅以 reusable packed-B 形成 rank 级 LLC resident surcharge；增加 fused-W13/pure-W2 的 per-panel extra-range 薄校准（45.27/6.70 ns），并在模型不确定性等价集内用 $\max(C_{L1D},2b_s,\sqrt{C_{L1D}C^{B,eff}_{L2}})$ 做无 route 表 tie-break。同步实验否证“纯 GEMM restart 足够”和“barrier 决定 M216 转折”两个假设。AmazonC5192Cores NUMA0 当前 tile runtime 的 6 组 full Cartesian holdout 得到 median/P90/max regret `1.10/3.45/4.40%`，6/6 通过预设 5% gate；但极端 pair 的二阶交互残差仍达 17.69%，故只关闭声明域内的 window 选择，不声称绝对时间、跨机器或完整 planner 闭合。production band policy、shape 搜索、剪枝和 Plan V2 默认不变。|
 | 2026-08-12 | v1.16 | 增加与 production 解耦的第一版可证明 makespan 下界：通用层实现逐资源/critical-chain 的 `LB0` 和共享 fractional mode 的 mode-relaxed LP，并输出经整数 simplex 量化、`Fraction` 精确重算和定向舍入的 dual/primal certificate；优先使用 GLOP，缺少可选依赖时回退 entropic mirror ascent。SVE adapter 将当前 exact-M W13/W2 mapper 降为 BFMMLA、key instruction、L1 load、epilogue、core-time 和可选 compulsory-DRAM 需求；core-time 由 aggregate work/per-core ceiling 推导，不假设不均衡 N lane 等时结束。第一版省略 window replay、gather/merge、NUMA 与 contention，只提供安全但偏松的 GEMM-only 下界，不改变 production 候选、剪枝、cost model 或 runtime。|

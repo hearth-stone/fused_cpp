@@ -24,11 +24,11 @@ from pathlib import Path
 from typing import Iterable, Mapping, Sequence
 
 try:
-    from full_stage_geometry import FullStageGeometry, full_stage_geometry
+    from full_stage_geometry import FullStageGeometry, StageWindowPlan, full_stage_geometry
     from gemm_cost_model import ExecutionSchedule, fused_expert_work
     from sve_bf16_kernel_model import SveBf16KernelExecution, SveBf16KernelProfile
 except ImportError:  # pragma: no cover - package-style import
-    from .full_stage_geometry import FullStageGeometry, full_stage_geometry
+    from .full_stage_geometry import FullStageGeometry, StageWindowPlan, full_stage_geometry
     from .gemm_cost_model import ExecutionSchedule, fused_expert_work
     from .sve_bf16_kernel_model import SveBf16KernelExecution, SveBf16KernelProfile
 
@@ -192,18 +192,35 @@ class RuntimeOverheads:
     expert_fixed_ns: float = 0.0
     route_ns: float = 0.0
     stage_fixed_ns: float = 0.0
+    range_fixed_ns: float = 0.0
+    panel_range_restart_ns: float = 0.0
+    w13_panel_range_restart_ns: float | None = None
+    w2_panel_range_restart_ns: float | None = None
 
     def __post_init__(self) -> None:
-        if (
-            min(
-                self.call_setup_ns,
-                self.expert_fixed_ns,
-                self.route_ns,
-                self.stage_fixed_ns,
-            )
-            < 0.0
-        ):
+        values = (
+            self.call_setup_ns,
+            self.expert_fixed_ns,
+            self.route_ns,
+            self.stage_fixed_ns,
+            self.range_fixed_ns,
+            self.panel_range_restart_ns,
+        ) + tuple(
+            value
+            for value in (self.w13_panel_range_restart_ns, self.w2_panel_range_restart_ns)
+            if value is not None
+        )
+        if min(values) < 0.0:
             raise ValueError("runtime overheads must be non-negative")
+
+    def panel_range_restart_for_stage(self, stage: str) -> float:
+        if stage == "w13":
+            value = self.w13_panel_range_restart_ns
+        elif stage == "w2":
+            value = self.w2_panel_range_restart_ns
+        else:
+            raise ValueError(f"unsupported stage {stage!r}")
+        return self.panel_range_restart_ns if value is None else value
 
     @classmethod
     def from_dict(cls, payload: dict) -> "RuntimeOverheads":
@@ -212,6 +229,18 @@ class RuntimeOverheads:
             expert_fixed_ns=float(payload.get("expert_fixed_ns", 0.0)),
             route_ns=float(payload.get("route_ns", 0.0)),
             stage_fixed_ns=float(payload.get("stage_fixed_ns", 0.0)),
+            range_fixed_ns=float(payload.get("range_fixed_ns", 0.0)),
+            panel_range_restart_ns=float(payload.get("panel_range_restart_ns", 0.0)),
+            w13_panel_range_restart_ns=(
+                float(payload["w13_panel_range_restart_ns"])
+                if payload.get("w13_panel_range_restart_ns") is not None
+                else None
+            ),
+            w2_panel_range_restart_ns=(
+                float(payload["w2_panel_range_restart_ns"])
+                if payload.get("w2_panel_range_restart_ns") is not None
+                else None
+            ),
         )
 
 
@@ -465,6 +494,88 @@ class AnalyticStageDemand:
     spillable_dram_bytes: float
     llc_working_set_bytes: float
     stripe_demand: AnalyticStripeDemand | None
+
+
+@dataclass(frozen=True)
+class AnalyticWindowDemand:
+    """Physical demand of one exact runtime stage window.
+
+    Byte counts are for one expert. Timing fields describe one homogeneous
+    cohort wave, so aggregate cache pressure is visible without turning the
+    selector into a route/thread latency table.
+    """
+
+    window_index: int
+    begin_tile: int
+    n_tiles: int
+    active_threads: int
+    balanced_tiles: int
+    owner_tiles: int
+    owner_window_bytes: int
+    l2_miss_fraction_b: float
+    l2_steady_miss_fraction_b: float
+    l2_miss_fraction_a: float
+    b_transient_reuses: int
+    b_steady_reuses: int
+    b_reuse_footprint_bytes: int
+    a_residency_footprint_bytes: int
+    a_residency_capacity_bytes: int
+    a_l2_refill_bytes: float
+    b_l2_refill_bytes: float
+    c_write_bytes: float
+    l2_bytes: float
+    llc_bytes: float
+    compulsory_dram_bytes: float
+    spillable_dram_bytes: float
+    reusable_b_bytes: int
+    llc_working_set_bytes: float
+    aggregate_working_set_bytes: float
+    serialized_core_ns: float
+    transfer_ns: float
+    ecm_ns: float
+
+
+@dataclass(frozen=True)
+class AnalyticStageWindowScore:
+    """Interpretable objective for one ``(stage, M, T, window_tiles)`` point."""
+
+    stage: str
+    routes: int
+    threads: int
+    cohort_threads: int
+    cohort_tasks: int
+    requested_window_tiles: int
+    window_tiles: int
+    full_stripe_window_tiles: int
+    range_tiles: int
+    windows: int
+    owner_window_bytes: int
+    objective_ns: float
+    ecm_ns: float
+    serialized_core_ns: float
+    transfer_ns: float
+    window_overhead_ns: float
+    panel_range_restart_ns: float
+    range_restart_ns: float
+    l2_ns: float
+    llc_ns: float
+    dram_ns: float
+    l2_miss_fraction_a: float
+    l2_miss_fraction_b: float
+    a_l2_refill_bytes: float
+    b_l2_refill_bytes: float
+    l2_bytes: float
+    llc_bytes: float
+    compulsory_dram_bytes: float
+    spillable_dram_bytes: float
+    max_llc_working_set_bytes: float
+    max_aggregate_working_set_bytes: float
+    starves_any_thread: bool
+    window_demands: tuple[AnalyticWindowDemand, ...]
+
+    @property
+    def is_full_stripe(self) -> bool:
+        return self.window_tiles == self.full_stripe_window_tiles
 
 
 @dataclass(frozen=True)
@@ -801,6 +912,314 @@ class AnalyticMoeCostModel:
             cache.effective_llc_bytes_per_rank,
             cache.llc_bytes_per_rank,
         )
+
+    def _stage_mapping_and_geometry(
+        self,
+        stage: str,
+        routes: int,
+        threads: int,
+    ) -> tuple[SveBf16KernelExecution, FullStageGeometry]:
+        work = fused_expert_work(
+            routes,
+            self.hidden_size,
+            self.intermediate_size,
+            down_output_element_bytes=self.down_output_element_bytes,
+        )
+        if stage == "w13":
+            logical = work.w13
+            geometry = self._w13_geometry
+        elif stage == "w2":
+            logical = work.w2
+            geometry = self._w2_geometry
+        else:
+            raise ValueError(f"unsupported stage {stage!r}")
+        mapping = self._mapper.lower(logical, ExecutionSchedule(threads=threads))
+        return mapping, geometry
+
+    @lru_cache(maxsize=16384)
+    def score_stage_window(
+        self,
+        stage: str,
+        routes: int,
+        threads: int,
+        window_tiles: int,
+        cohort_threads: int | None = None,
+    ) -> AnalyticStageWindowScore:
+        """Score the exact tile-window geometry executed by the native runtime.
+
+        ``window_tiles=0`` is the full-stripe endpoint. The demand fields are
+        per expert, while timing uses a homogeneous cohort occupying
+        ``cohort_threads``. This keeps cache-capacity effects explicit: private
+        L2 retention is per owner, and LLC spill is evaluated on the aggregate
+        simultaneous footprint. Candidate-independent compute and compulsory
+        B traffic remain in the report, but the selector uses a serialized
+        incremental objective so hidden refill reductions are not assigned
+        zero value merely because GEMM compute is the ECM maximum.
+        """
+        stage = str(stage)
+        routes = int(routes)
+        threads = int(threads)
+        requested_window_tiles = int(window_tiles)
+        if stage not in {"w13", "w2"}:
+            raise ValueError(f"unsupported stage {stage!r}")
+        if routes <= 0 or threads <= 0 or requested_window_tiles < 0:
+            raise ValueError("routes and threads must be positive and window_tiles non-negative")
+        if threads not in self.supported_widths:
+            raise KeyError(f"unsupported analytical thread width {threads}")
+
+        requested_cohort_threads = threads if cohort_threads is None else int(cohort_threads)
+        if requested_cohort_threads < threads:
+            raise ValueError("cohort_threads cannot be smaller than the task width")
+        if requested_cohort_threads > self.calibration.cores_per_rank:
+            raise ValueError("cohort_threads cannot exceed cores_per_rank")
+        cohort_tasks = requested_cohort_threads // threads
+        if cohort_tasks <= 0:
+            raise ValueError("cohort_threads must contain at least one complete task team")
+        used_cohort_threads = cohort_tasks * threads
+
+        mapping, geometry = self._stage_mapping_and_geometry(stage, routes, threads)
+        plan: StageWindowPlan
+        if requested_window_tiles == 0:
+            plan = geometry.full_stripe_plan(threads)
+        else:
+            plan = geometry.window_plan(threads, requested_window_tiles)
+        if plan.total_tiles != mapping.allocation.total_tiles:
+            raise RuntimeError("stage-window geometry and SVE kernel mapping disagree on N tiles")
+
+        logical = mapping.logical_work
+        panels = len(mapping.panels)
+        if panels <= 0:
+            raise RuntimeError("positive-route stage must contain at least one M panel")
+        a_bytes = mapping.compute_rows * logical.k * logical.input_element_bytes
+        a_panel_bytes = max(panel.compute_rows for panel in mapping.panels) * logical.k * logical.input_element_bytes
+        tile_bytes = logical.k * mapping.n_tile * logical.weight_element_bytes
+        if tile_bytes != plan.bytes_per_tile:
+            raise RuntimeError("stage-window geometry and SVE kernel mapping disagree on tile bytes")
+        total_tiles = plan.total_tiles
+        output_columns_per_tile = logical.output_columns * mapping.n_tile // logical.n
+        total_store_rows = sum(panel.store_rows for panel in mapping.panels)
+        available_b_reuses = panels - 1
+        cache_turnover_reuses = max(
+            int(self.calibration.caches.effective_l2_bytes_per_core // a_panel_bytes),
+            1,
+        )
+        transient_b_reuses = min(available_b_reuses, cache_turnover_reuses)
+        steady_b_reuses = available_b_reuses - transient_b_reuses
+        # A must survive the complete B owner window between successive N
+        # windows.  Use the calibrated usable L2 capacity here, not the nominal
+        # cache size: replacement, prefetch, and the in-flight A panel consume
+        # the headroom that the effective-capacity calibration represents.
+        a_residency_capacity = max(
+            self.calibration.caches.effective_l2_bytes_per_core - a_panel_bytes,
+            0,
+        )
+
+        seen_active_threads = 0
+        windows: list[AnalyticWindowDemand] = []
+        for window_index in range(plan.windows):
+            begin_tile, n_tiles = plan.window_tile_span(window_index)
+            active_threads = min(n_tiles, threads)
+            owner_tiles = math.ceil(n_tiles / threads)
+            balanced_tiles = owner_tiles * active_threads
+            owner_window_bytes = owner_tiles * tile_bytes
+            weight_bytes = n_tiles * tile_bytes
+            c_write_bytes = mapping.llc_c_write_bytes * n_tiles / total_tiles
+
+            a_residency_footprint = owner_window_bytes + a_bytes
+            a_l2_miss = _smooth_capacity_miss(
+                a_residency_footprint,
+                a_residency_capacity,
+                max(self.calibration.caches.l2_bytes_per_core - a_panel_bytes, 0),
+            )
+            b_reuse_footprint = owner_window_bytes + a_panel_bytes
+            b_l2_miss = self._l2_b_reuse_miss_fraction(b_reuse_footprint)
+            b_l2_steady_miss = self._l2_steady_scan_miss_fraction(b_reuse_footprint)
+            b_l2_refill = weight_bytes * (
+                1.0
+                + transient_b_reuses * b_l2_miss
+                + steady_b_reuses * b_l2_steady_miss
+            )
+
+            new_threads = max(active_threads - seen_active_threads, 0)
+            reused_threads = active_threads - new_threads
+            a_l2_refill = a_bytes * (new_threads + reused_threads * a_l2_miss)
+            seen_active_threads = max(seen_active_threads, active_threads)
+
+            l2_bytes = a_l2_refill + b_l2_refill + c_write_bytes
+            reusable_b_bytes = weight_bytes if panels > 1 else 0
+            spillable_dram_bytes = (
+                a_l2_refill + max(b_l2_refill - weight_bytes, 0.0) + c_write_bytes
+            )
+            llc_working_set_bytes = reusable_b_bytes + a_bytes + c_write_bytes
+            aggregate_working_set_bytes = llc_working_set_bytes * cohort_tasks
+            aggregate_active_threads = active_threads * cohort_tasks
+
+            bfmmla_instructions = mapping.compute_rows * logical.k // 2 * balanced_tiles
+            matrix_flops = bfmmla_instructions * (2 * mapping.vector_bytes)
+            epilogue_elements = total_store_rows * output_columns_per_tile * balanced_tiles
+            gemm_core_ns = (
+                matrix_flops
+                * cohort_tasks
+                / self.calibration.service_rate("gemm_core_flops", aggregate_active_threads)
+                * 1e9
+            )
+            epilogue_ns = 0.0
+            if self.calibration.epilogue_elements is not None:
+                epilogue_ns = (
+                    epilogue_elements
+                    * cohort_tasks
+                    / self.calibration.service_rate("epilogue_elements", aggregate_active_threads)
+                    * 1e9
+                )
+            l2_ns = (
+                l2_bytes
+                * cohort_tasks
+                / self.calibration.service_rate("l2_bytes", aggregate_active_threads)
+                * 1e9
+            )
+            llc_ns = (
+                l2_bytes
+                * cohort_tasks
+                / self.calibration.service_rate("llc_bytes", aggregate_active_threads)
+                * 1e9
+            )
+            llc_spill_fraction = self._llc_miss_fraction(aggregate_working_set_bytes)
+            aggregate_dram_bytes = (
+                weight_bytes + llc_spill_fraction * spillable_dram_bytes
+            ) * cohort_tasks
+            dram_ns = (
+                aggregate_dram_bytes
+                / self.calibration.service_rate("dram_bytes", aggregate_active_threads)
+                * 1e9
+            )
+            transfer_ns = max(l2_ns, llc_ns, dram_ns)
+            serialized_core_ns = gemm_core_ns + epilogue_ns
+            windows.append(
+                AnalyticWindowDemand(
+                    window_index=window_index,
+                    begin_tile=begin_tile,
+                    n_tiles=n_tiles,
+                    active_threads=active_threads,
+                    balanced_tiles=balanced_tiles,
+                    owner_tiles=owner_tiles,
+                    owner_window_bytes=owner_window_bytes,
+                    l2_miss_fraction_b=b_l2_miss,
+                    l2_steady_miss_fraction_b=b_l2_steady_miss,
+                    l2_miss_fraction_a=a_l2_miss,
+                    b_transient_reuses=transient_b_reuses,
+                    b_steady_reuses=steady_b_reuses,
+                    b_reuse_footprint_bytes=b_reuse_footprint,
+                    a_residency_footprint_bytes=a_residency_footprint,
+                    a_residency_capacity_bytes=a_residency_capacity,
+                    a_l2_refill_bytes=a_l2_refill,
+                    b_l2_refill_bytes=b_l2_refill,
+                    c_write_bytes=c_write_bytes,
+                    l2_bytes=l2_bytes,
+                    llc_bytes=l2_bytes,
+                    compulsory_dram_bytes=weight_bytes,
+                    spillable_dram_bytes=spillable_dram_bytes,
+                    reusable_b_bytes=reusable_b_bytes,
+                    llc_working_set_bytes=llc_working_set_bytes,
+                    aggregate_working_set_bytes=aggregate_working_set_bytes,
+                    serialized_core_ns=serialized_core_ns,
+                    transfer_ns=transfer_ns,
+                    ecm_ns=max(gemm_core_ns, transfer_ns) + epilogue_ns,
+                )
+            )
+
+        compulsory_dram_bytes = sum(window.compulsory_dram_bytes for window in windows)
+        active_scans = sum(window.active_threads for window in windows)
+        panel_range_restart_ns = self.calibration.overheads.panel_range_restart_for_stage(stage)
+        range_restart_ns = panels * max(plan.windows - 1, 0) * panel_range_restart_ns
+        window_overhead_ns = (
+            self.calibration.overheads.stage_fixed_ns
+            + plan.windows * self.calibration.overheads.range_fixed_ns
+            + range_restart_ns
+        )
+        serialized_core_ns = sum(window.serialized_core_ns for window in windows)
+        transfer_ns = sum(window.transfer_ns for window in windows)
+        return AnalyticStageWindowScore(
+            stage=stage,
+            routes=routes,
+            threads=threads,
+            cohort_threads=used_cohort_threads,
+            cohort_tasks=cohort_tasks,
+            requested_window_tiles=requested_window_tiles,
+            window_tiles=plan.window_tiles,
+            full_stripe_window_tiles=geometry.tiles_per_worker(threads),
+            range_tiles=plan.range_tiles,
+            windows=plan.windows,
+            owner_window_bytes=max(window.owner_window_bytes for window in windows),
+            objective_ns=serialized_core_ns + transfer_ns + window_overhead_ns,
+            ecm_ns=sum(window.ecm_ns for window in windows) + window_overhead_ns,
+            serialized_core_ns=serialized_core_ns,
+            transfer_ns=transfer_ns,
+            window_overhead_ns=window_overhead_ns,
+            panel_range_restart_ns=panel_range_restart_ns,
+            range_restart_ns=range_restart_ns,
+            l2_ns=sum(
+                window.l2_bytes
+                * cohort_tasks
+                / self.calibration.service_rate(
+                    "l2_bytes", window.active_threads * cohort_tasks
+                )
+                * 1e9
+                for window in windows
+            ),
+            llc_ns=sum(
+                window.llc_bytes
+                * cohort_tasks
+                / self.calibration.service_rate(
+                    "llc_bytes", window.active_threads * cohort_tasks
+                )
+                * 1e9
+                for window in windows
+            ),
+            dram_ns=sum(
+                (
+                    window.compulsory_dram_bytes
+                    + self._llc_miss_fraction(window.aggregate_working_set_bytes)
+                    * window.spillable_dram_bytes
+                )
+                * cohort_tasks
+                / self.calibration.service_rate(
+                    "dram_bytes", window.active_threads * cohort_tasks
+                )
+                * 1e9
+                for window in windows
+            ),
+            l2_miss_fraction_a=(
+                sum(window.l2_miss_fraction_a * window.active_threads for window in windows)
+                / active_scans
+            ),
+            l2_miss_fraction_b=(
+                sum(
+                    window.l2_miss_fraction_b * window.compulsory_dram_bytes
+                    for window in windows
+                )
+                / compulsory_dram_bytes
+            ),
+            a_l2_refill_bytes=sum(window.a_l2_refill_bytes for window in windows),
+            b_l2_refill_bytes=sum(window.b_l2_refill_bytes for window in windows),
+            l2_bytes=sum(window.l2_bytes for window in windows),
+            llc_bytes=sum(window.llc_bytes for window in windows),
+            compulsory_dram_bytes=compulsory_dram_bytes,
+            spillable_dram_bytes=sum(window.spillable_dram_bytes for window in windows),
+            max_llc_working_set_bytes=max(window.llc_working_set_bytes for window in windows),
+            max_aggregate_working_set_bytes=max(
+                window.aggregate_working_set_bytes for window in windows
+            ),
+            starves_any_thread=plan.starves_any_thread(),
+            window_demands=tuple(windows),
+        )
+
+    def shadow_stage_window_policy(self, *, cohort_threads: int | None = None):
+        """Build the analytical selector without binding it to production."""
+        try:
+            from analytic_stage_window_policy import AnalyticStageWindowPolicy
+        except ImportError:  # pragma: no cover - package-style import
+            from .analytic_stage_window_policy import AnalyticStageWindowPolicy
+        return AnalyticStageWindowPolicy(self, cohort_threads=cohort_threads)
 
     def _stage_demand(
         self,

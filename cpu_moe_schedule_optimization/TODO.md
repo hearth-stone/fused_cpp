@@ -25,24 +25,29 @@ The legacy weight-split removal is complete across the production stack:
   their environment controls, old Plan V2 tensors, and native fallback branches.
 - [x] Make W13/W2 cover one full-N stage; represent any serial subdivision only
   as per-worker tile windows derived from `(threads, window_tiles)`.
-- [x] Remove stage-window policy/search/cache identity and reject non-full-N
-  schema-v2 profiles.
+- [x] Remove legacy split/range stage-window search and cache identity. Restore
+  only the exact per-worker tile-window traversal, which still covers full N
+  and is selected deterministically after team width rather than searched as a
+  free planner variable.
 - [x] Migrate calibration generators, benchmark defaults, timeline/schema docs,
   empirical/analytic models, and the native cold planner to full-N geometry.
-- [ ] Refresh both ARM machines' full-N calibration and full planner/E2E
-  validation before treating the migration as closed. The retired 192-core
-  TP4/F512 `(1,1)` and `(2,1)` tables remain available in Git/results as the
-  2026-08-09 comparison; each machine/domain now needs one canonical full-N
-  calibration plus route/width holdout. The thin analytical calibration still
-  reaches 10.79% maximum ranking regret at the M=24/48 crossover.
+- [x] Close the 192-core TP4 analytical tile-window selection subproblem on the
+  declared transition domain. Policy v6 uses independent service/cache
+  calibration and reaches `1.10/3.45/4.40%` median/P90/max regret on a full
+  W13 x W2 Cartesian holdout for M=`72,216,384`, T=`4,16` (6/6 below 5%).
+  This is a shadow-policy gate, not a production-default switch.
+- [ ] Repeat the current tile-window holdout on the 8-core ARM machine after
+  replacing its transferred packed-B retention prior, then extend 192-core
+  coverage to unseen routes, widths, and mixed planner workloads. Do not reuse
+  the retired range-policy `1.50/2.98/3.38%` result as current evidence.
 
 1. Replace the AmazonECS8Cores transferred packed-B retention prior with a
    machine-local multi-team retention/refill probe and add topology-aware LLC
    service. Its cache topology and L1-hot/L2/LLC/DRAM service curves are now
    measured locally; only this retention term remains non-local.
-2. Repeat unseen routes, widths above 8T, mixed distributions, and full-stage
-   owner-stripe validation. The old analytical stage-window holdout is
-   historical and cannot validate the new geometry.
+2. Repeat unseen routes, widths outside `4T/16T`, mixed distributions, and
+   complete planner validation. The current 192-core full-Cartesian result
+   closes only its declared transition domain.
 3. Fix cross-rank lifetime switching for the remaining EP absolute-time error.
 4. Add measured gather/pack, route merge, communication, and distributed TP/EP
    terms after the compute model passes its gates.
@@ -129,8 +134,18 @@ The legacy weight-split removal is complete across the production stack:
   L1-hot/L2/LLC/DRAM service curves on AmazonECS8Cores. The runtime uses
   `backend_n_tile=16`; the profile marks its current 1/8-L2 packed-B retention
   term as a transferred prior rather than claiming a local measurement.
-- [x] Retire deterministic W13/W2 stage-window generation after the full-N ABI
-  migration. Its 3.38% holdout remains historical evidence only.
+- [x] Retire the old range-count stage-window generator after the full-N ABI
+  migration. Its 3.38% coordinate-oracle holdout remains historical evidence
+  only; the current tile-window runtime is covered by shadow policy v6 and the
+  2026-08-11 full-Cartesian holdout.
+- [x] Separate analytical stage-window structure from thin calibration: exact
+  tile geometry, reusable-B-only shared LLC pressure, and cache-derived
+  tie-breaking are formulas; service curves, retention anchors, uncertainty,
+  and W13/W2 range-restart constants are machine calibration.
+- [ ] Model or bound the remaining W13/W2 second-order pair interaction before
+  using the selector for absolute-time prediction. Extreme unselected pairs
+  have up to 17.69% paired-round residual even though selected regret is below
+  5% throughout the declared 192-core domain.
 - [ ] Calibrate multi-team packed-B retention/refill and below-NUMA LLC topology
   from independent probes; do not add a task-pair slowdown table.
 - [ ] Validate unseen routes, widths, mixed distributions, and full-stage

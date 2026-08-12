@@ -217,33 +217,102 @@ features:
   - id: measurement.analytic_service_kernels
     part: measurement
     status: experimental
+    owner: zhangxu
+    opened: 2026-08-11
+    decision_by: 2026-11-09
+    next_decision: >-
+      Keep the fused-W13 restart service only if a second ARM machine consumes
+      it and the stage-window holdout remains below the declared regret gate.
+    adoption_gate: >-
+      The service must remain an independently measurable machine/kernel
+      constant, fit randomized range counts within 1 percent, and improve an
+      unseen full-Cartesian selector holdout without adding route-time samples.
     implementation: >-
       csrc/moe/arm/sve_bf16/jit_kernels.cpp,
       csrc/moe/arm/common/fused_moe_bf16_tiled.cpp, and
       cpu_moe_schedule_optimization/cost_model/profile_analytic_services.py
     hypothesis: >-
-      Three stable generated services are sufficient for thin machine
+      Four stable generated services are sufficient for thin machine
       calibration: B-only measures endpoint-to-register packed-weight service,
       M12 full-no-store measures the executable L1/L2 GEMM core ceiling, and
-      M12 matrix-only preserves register-only arithmetic provenance. Their
-      numeric mode ids remain stable because profile files record them.
+      M12 matrix-only preserves register-only arithmetic provenance. A fused
+      W13 SiLU/packC service separately measures the per-panel cost of restarting
+      an N range, because the pure-GEMM restart does not execute that epilogue.
+      Their numeric mode ids remain stable because profile files record them.
     depends_on:
       - compute.xbyak_exact_m
       - compute.xbyak_double_buffer_kloop
     conflicts_with: []
     correctness: >-
       PYTHONPATH=src FUSED_CPP_MOE_SVE=1 .venv/bin/python -m pytest -q
-      tests/test_fused_moe_bf16_tiled.py -k m12_service_probe
+      tests/test_fused_moe_bf16_tiled.py -k service_probe
     benchmark: >-
       PYTHONPATH=src numactl --cpunodebind=0 --membind=0 taskset -c 0-95
       .venv/bin/python
       cpu_moe_schedule_optimization/cost_model/profile_analytic_services.py
       --output /tmp/moe_analytic_services.json --cpu-ids 0-95
+      --range-warmup 256 --range-runs 8192 --range-repeats 7
     result: >-
-      These services feed the analytical machine calibration. The current
-      AmazonC5192Cores NUMA0 calibration remains shadow-only because contention
-      P90 and maximum measured shape regret did not pass production gates; see
-      results/amazon_192c_analytic_thin_calibration_20260801.md.
+      These services feed the analytical machine calibration. On
+      AmazonC5192Cores NUMA0 the randomized M12/K264/N64 L1-hot fit measured
+      6.70 ns per extra pure-GEMM panel/range and 45.27 ns for fused W13; the
+      maximum fit errors were 0.180 and 0.087 percent. The calibration remains
+      shadow-only; see
+      results/analytic_stage_window_policy_v6_closure_20260811.md.
+
+  - id: measurement.analytic_stage_window_selector
+    part: measurement
+    status: experimental
+    owner: zhangxu
+    opened: 2026-08-11
+    decision_by: 2026-11-09
+    next_decision: >-
+      Measure local packed-B retention and repeat the full-Cartesian selector
+      holdout on the 8-core ARM host, then extend the 192-core holdout to unseen
+      routes, widths, and mixed planner workloads.
+    adoption_gate: >-
+      Maximum measured selection regret must stay at or below 5 percent on both
+      ARM machines with machine-local calibration, and production planner/E2E
+      gates must pass before this shadow policy can replace the current band
+      policy.
+    implementation: >-
+      cpu_moe_schedule_optimization/cost_model/analytic_model.py,
+      cpu_moe_schedule_optimization/cost_model/analytic_stage_window_policy.py,
+      optimizations/fused_moe_sve/benchmarks/bench_analytic_stage_window_tiles.py,
+      optimizations/fused_moe_sve/benchmarks/profile_stage_window_service.py,
+      and optimizations/fused_moe_sve/benchmarks/profile_stage_window_handoff.py
+    hypothesis: >-
+      Exact tile geometry, private-cache A/B retention, reusable-B-only rank LLC
+      pressure, stage-specific range restart, and a cache-derived uncertainty
+      tie-break can select near-oracle W13/W2 owner windows without a route/team
+      latency table or a new planner search variable.
+    depends_on:
+      - dispatch.stage_window_tiles
+      - measurement.analytic_service_kernels
+    conflicts_with: []
+    correctness: >-
+      PYTHONPATH=src .venv/bin/python -m pytest -q
+      tests/test_moe_analytic_model.py
+      tests/test_gemm_memory_service_probe.py
+      tests/test_fused_moe_bf16_tiled.py -k service_probe
+    benchmark: >-
+      FUSED_CPP_MOE_HUGETLBFS_PATH=/dev/hugepages-32M
+      numactl --physcpubind=0-95 --membind=0
+      .venv/bin/python
+      optimizations/fused_moe_sve/benchmarks/bench_analytic_stage_window_tiles.py
+      --calibration
+      cpu_moe_schedule_optimization/cost_model/profiles/analytic_machine_amazon_c5_192c_numa0_sve_jit_hot_gemm_20260802.json
+      --cpu-ids 0-95 --routes 72,216,384 --widths 4,16
+      --measurement-experts 96 --warmup 2 --runs 15
+      --full-cartesian --store-samples
+    result: >-
+      The 192-core NUMA0 full-Cartesian holdout selected windows with
+      1.10/3.45/4.40 percent median/P90/maximum regret, passing the declared
+      5-percent gate at all six M/T points. Pairwise additivity residual still
+      reaches 17.69 percent on extreme unselected pairs, so the result closes
+      only window selection in the declared domain, not absolute-time modeling
+      or production adoption. See
+      results/analytic_stage_window_policy_v6_closure_20260811.md.
 
   - id: measurement.gemm_operand_memory_services
     part: measurement

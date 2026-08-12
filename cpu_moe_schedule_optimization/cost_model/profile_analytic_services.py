@@ -6,7 +6,8 @@ stores disabled. Hot working sets select endpoint-to-register service from L1,
 private L2, or shared LLC; the DRAM probe rotates disjoint packed weights whose
 aggregate reuse distance is larger than the NUMA-local LLC. These endpoint
 ceilings overlap and are composed with max by the model. No routed-expert
-latency is used by this script.
+latency is used by this script. Two randomized L1-hot range-count probes also
+measure the per-panel control increment for pure GEMM and fused W13 SiLU/packC.
 """
 
 from __future__ import annotations
@@ -38,6 +39,7 @@ from fused_cpp.moe import prepare_fused_moe_bf16_tiled_weights  # noqa: E402
 PROBE_B_ONLY = 1
 PROBE_FULL_NO_STORE = 4
 PROBE_MATRIX_ONLY = 10
+PROBE_FUSED_W13 = 11
 M12_ROWS = 12
 DEFAULT_N_TILE = 8
 
@@ -313,6 +315,113 @@ def profile_matrix(
     return payload
 
 
+def profile_panel_range_restart(
+    *,
+    cache_bytes: int,
+    cache_fraction: float,
+    n_tile: int,
+    cpu: int,
+    warmup: int,
+    runs: int,
+    seed: int,
+    probe_mode: int = PROBE_FULL_NO_STORE,
+    repeats: int = 5,
+) -> dict:
+    """Measure one extra `(M12 panel, N range)` entry with A+B L1-hot."""
+    if min(cache_bytes, n_tile, runs, repeats) <= 0 or warmup < 0:
+        raise ValueError("range-restart probe arguments must be positive")
+    if probe_mode not in {PROBE_FULL_NO_STORE, PROBE_FUSED_W13}:
+        raise ValueError(f"unsupported range-restart probe mode {probe_mode}")
+    n = 8 * n_tile
+    geometry = m12_gemm_geometry(
+        cache_bytes,
+        n,
+        cache_fraction=cache_fraction,
+    )
+    packed = packed_weights(experts=1, k=geometry.k, n=n, seed=seed)
+    runtime_tile = int(packed.backend_n_tile)
+    if runtime_tile != n_tile:
+        raise RuntimeError(f"runtime N tile {runtime_tile} != requested {n_tile}")
+    a = torch.zeros((M12_ROWS, geometry.k), dtype=torch.bfloat16)
+    bind_current_thread(cpu)
+    range_counts = (1, 2, 4, 8)
+    randomizer = random.Random(seed)
+    samples_by_ranges = {n_ranges: [] for n_ranges in range_counts}
+    repeat_orders = []
+    for _ in range(repeats):
+        order = list(range_counts)
+        randomizer.shuffle(order)
+        repeat_orders.append(order)
+        for n_ranges in order:
+            samples_ms = list(
+                _moe_C.fused_moe_bench_sve_jit_w13_gemm(
+                    a,
+                    packed.w13[0],
+                    geometry.k,
+                    n,
+                    n_tile,
+                    n_ranges,
+                    warmup,
+                    runs,
+                    probe_mode,
+                )
+            )
+            samples_by_ranges[n_ranges].append(statistics.median(samples_ms) * 1e6)
+
+    rows = []
+    for n_ranges in range_counts:
+        samples_ns = samples_by_ranges[n_ranges]
+        rows.append(
+            {
+                "n_ranges": n_ranges,
+                "median_ns": statistics.median(samples_ns),
+                "p10_ns": sorted(samples_ns)[round((repeats - 1) * 0.10)],
+                "p90_ns": sorted(samples_ns)[round((repeats - 1) * 0.90)],
+                "repeat_medians_ns": samples_ns,
+            }
+        )
+
+    rows.sort(key=lambda row: int(row["n_ranges"]))
+    mean_x = statistics.fmean(float(row["n_ranges"] - 1) for row in rows)
+    mean_y = statistics.fmean(float(row["median_ns"]) for row in rows)
+    numerator = sum(
+        (float(row["n_ranges"] - 1) - mean_x) * (float(row["median_ns"]) - mean_y)
+        for row in rows
+    )
+    denominator = sum((float(row["n_ranges"] - 1) - mean_x) ** 2 for row in rows)
+    restart_ns = max(numerator / denominator, 0.0)
+    intercept_ns = statistics.fmean(
+        float(row["median_ns"]) - restart_ns * float(row["n_ranges"] - 1)
+        for row in rows
+    )
+    for row in rows:
+        predicted = intercept_ns + restart_ns * float(row["n_ranges"] - 1)
+        row["predicted_ns"] = predicted
+        row["relative_error"] = predicted / float(row["median_ns"]) - 1.0
+    del packed
+    gc.collect()
+    return {
+        "m": M12_ROWS,
+        "k": geometry.k,
+        "n": n,
+        "working_set_bytes": geometry.working_set_bytes,
+        "target_bytes": geometry.target_bytes,
+        "cache_bytes": geometry.cache_bytes,
+        "cache_fraction": geometry.cache_fraction,
+        "probe_mode": probe_mode,
+        "probe": (
+            "generated_sve_m12_l1_hot_fused_w13_extra_n_range"
+            if probe_mode == PROBE_FUSED_W13
+            else "generated_sve_m12_l1_hot_full_no_store_extra_n_range"
+        ),
+        "repeat_orders": repeat_orders,
+        "panel_range_restart_ns": restart_ns,
+        "intercept_ns": intercept_ns,
+        "max_absolute_relative_error": max(abs(float(row["relative_error"])) for row in rows),
+        "rows": rows,
+    }
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
@@ -324,6 +433,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--core-runs", type=int, default=4096)
     parser.add_argument("--hot-warmup", type=int, default=32)
     parser.add_argument("--hot-runs", type=int, default=128)
+    parser.add_argument("--range-warmup", type=int, default=128)
+    parser.add_argument("--range-runs", type=int, default=4096)
+    parser.add_argument("--range-repeats", type=int, default=5)
     parser.add_argument("--dram-warmup", type=int, default=4)
     parser.add_argument("--dram-runs", type=int, default=32)
     parser.add_argument("--n-tile", type=int, default=DEFAULT_N_TILE)
@@ -342,9 +454,16 @@ def main() -> int:
     args = parse_args()
     if max(args.widths) > len(args.cpu_ids):
         raise ValueError("largest width exceeds the supplied CPU list")
-    if min(args.matrix_warmup, args.core_warmup, args.hot_warmup, args.dram_warmup) < 0:
+    if min(args.matrix_warmup, args.core_warmup, args.hot_warmup, args.dram_warmup, args.range_warmup) < 0:
         raise ValueError("warmup counts must be non-negative")
-    if min(args.matrix_runs, args.core_runs, args.hot_runs, args.dram_runs) <= 0:
+    if min(
+        args.matrix_runs,
+        args.core_runs,
+        args.hot_runs,
+        args.dram_runs,
+        args.range_runs,
+        args.range_repeats,
+    ) <= 0:
         raise ValueError("run counts must be positive")
     if args.n_tile <= 0:
         raise ValueError("n_tile must be positive")
@@ -386,6 +505,27 @@ def main() -> int:
         cache_fraction=1.0,
     )
     services = {
+        "panel_range_restart": profile_panel_range_restart(
+            cache_bytes=caches["l1d_bytes_per_core"],
+            cache_fraction=args.gemm_l1_fraction,
+            n_tile=args.n_tile,
+            cpu=args.cpu_ids[0],
+            warmup=args.range_warmup,
+            runs=args.range_runs,
+            seed=args.seed,
+            repeats=args.range_repeats,
+        ),
+        "w13_fused_panel_range_restart": profile_panel_range_restart(
+            cache_bytes=caches["l1d_bytes_per_core"],
+            cache_fraction=args.gemm_l1_fraction,
+            n_tile=args.n_tile,
+            cpu=args.cpu_ids[0],
+            warmup=args.range_warmup,
+            runs=args.range_runs,
+            seed=args.seed + 7,
+            probe_mode=PROBE_FUSED_W13,
+            repeats=args.range_repeats,
+        ),
         "matrix_flops": profile_matrix(
             name="bfmmla",
             widths=args.widths,
@@ -503,6 +643,9 @@ def main() -> int:
             "core_runs": args.core_runs,
             "hot_warmup": args.hot_warmup,
             "hot_runs": args.hot_runs,
+            "range_warmup": args.range_warmup,
+            "range_runs": args.range_runs,
+            "range_repeats": args.range_repeats,
             "dram_warmup": args.dram_warmup,
             "dram_runs": args.dram_runs,
             "thread_pinning": "explicit_cpu_ids",

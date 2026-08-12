@@ -244,111 +244,110 @@ Expert fixed and per-route runtime costs cover gather/dispatch/scatter work not
 yet represented by a dedicated physical mapper. They are deliberately separate
 from GEMM demand.
 
-Plan V2 supplies only the selected task width. For stage \(s=(K_s,N_s)\), tile
-width \(\nu\), and team width \(t\), the production mapper derives
+Plan V2 supplies the selected task width and may also supply an exact per-worker
+window in whole N tiles. For stage \(s=(K_s,N_s)\), packed tile width \(\nu\),
+team width \(t\), and owner window \(w_s\), the native and analytical mappers
+share the same geometry:
 
 \[
 q_s=N_s/\nu,\qquad
-u_s(t)=\left\lceil q_s/t\right\rceil K_s\nu\cdot2.
+g_s=t w_s,\qquad
+R_s=\left\lceil\frac{q_s}{g_s}\right\rceil,\qquad
+b_s=2K_s\nu.
 \]
 
-The full stage bytes \(B_s=2K_sN_s\) are fixed; \(u_s(t)\) is the maximum
-per-worker owner stripe. Thus team width is the only cache-window control and
-no window decision is added to the planner or ABI.
+`window_tiles=0` denotes the full-stripe endpoint
+\(w_s=\lceil q_s/t\rceil\), hence \(R_s=1\). Every other legal value changes
+only the order in which the same full N domain is visited. The full stage bytes
+\(B_s=2K_sN_s\), arithmetic, output ownership, and packed ABI are invariant.
+The current production planner uses its deterministic stage-window policy;
+`AnalyticStageWindowPolicy` v6 is a shadow selector and does not change the
+planner search space or production default.
 
-### Historical Stage-Window Policy (Retired)
+### Analytical Stage-Window Selector
 
-The remainder of this subsection records the superseded range-policy model for
-experiment provenance only. Production code, Plan V2, and the active analytical
-model no longer enumerate or execute these ranges; the full-stage equations
-above are normative.
+For an already selected \((M,t)\), the selector enumerates the full stripe and
+power-of-two owner windows that are at least one L1D and do not starve a worker.
+When \(M\le12\), there is only one M panel and therefore no repeated packed-B
+scan to preserve; the full stripe dominates and is selected directly.
 
-`AnalyticStageWindowPolicy` generates those execution parameters directly from
-the machine model. For stage \(s\), route count \(M\), and already selected team
-width \(t\), it enumerates the physically achievable tile-aligned range targets
-\(g\in\mathcal G_s(t)\). A generated candidate must:
+Let \(P_s\) be the exact number of M panels emitted by the SVE mapper,
+\(A_s\) the complete packed-A input for the stage, and \(A_{p,s}\) one maximum
+M panel. For one window containing \(n_j\) packed-B tiles, the owner footprint
+is \(U_j=\lceil n_j/t\rceil b_s\). The physical demand mapper then separates:
 
-- leave at least one private L1D of owner work, because a smaller stripe has no
-  lower cache level left to protect;
-- contain at least \(\min(t,q_s)\) N tiles per range, so it does not create idle
-  team members;
-- use a power-of-two owner tile count, matching the kernel's natural halving
-  hierarchy;
-- retain the physically distinct W13 \(R=1/R=2\) endpoints and W2 \(R=1\)
-  endpoint whenever the stage tile count permits them.
+- compulsory B bytes \(n_jb_s\), paid exactly once;
+- transient repeated-B refill while distinct A panels turn over the effective
+  private L2, followed by a physical resident/streaming state;
+- A refill when \(A_s+U_j\) cannot survive between consecutive N windows;
+- C write traffic, which is streaming demand rather than a reusable cache set.
 
-The inherited operator-wide geometry remains in the candidate set as a
-compatibility endpoint. A one-panel expert (\(M\le12\)) selects \(R=1\) for both
-stages: there is no repeated packed-B scan to protect, so subdividing the stage
-cannot reduce B traffic and adds range control work.
-
-The absolute ECM phase latency remains
-\(\max(T_{\mathrm{core}},T_{\mathrm{xfer}})\). That lower-bound form is not a
-useful selector when all transfer differences fit below the same compute
-ceiling, because it assigns zero value to reducing refill demand and future
-contention. Stage-window selection therefore uses the serialized incremental
-objective
+The task-local score retains all of those transfer bytes. The additional
+full-rank LLC surcharge is narrower: only reusable packed B contributes to the
+resident set. For \(h=\lfloor T_{rank}/t\rfloor\) simultaneous complete teams,
 
 \[
-J_s(M,t,g)=
-\sum_{p\in\mathcal P_s(g)}
+G_{B,j}=h\,n_jb_s,
+\]
+
+and the extra DRAM charge applies only to repeated B refill bytes
+\(\max(B^{L2}_{j}-n_jb_s,0)\). Streaming A and C remain in the transfer demand
+but are not counted again as reusable LLC capacity. This distinction prevents
+the selector from treating a one-pass stream as if it displaced an equally
+sized reusable B window.
+
+Changing windows restarts the N-range control path once per M panel. This cost
+is stage-specific because fused W13 executes SiLU, gate multiplication, and
+BF16 packC in the range epilogue while the W2 calibration currently uses the
+pure full-no-store path as a proxy:
+
+\[
+T_{restart,s}=P_s(R_s-1)\delta_s.
+\]
+
+The selector uses the serialized incremental objective
+
+\[
+J_s=
+\sum_{j=1}^{R_s}
 \left[
-T_{\mathrm{core},p}+T_{\mathrm{epi},p}
-+\max\left(T_{L2,p},T_{LLC,p},T_{DRAM,p}\right)
+T_{core,j}+T_{epi,j}
++\max(T_{L2,j},T_{LLC,j},T_{DRAM,j})
 \right]
-+R_s(g)\tau_{\mathrm{range}},
++T_{restart,s}+T_{sharedB,s}.
 \]
 
-Let \(J_{\min}\) be the minimum candidate objective and let
-\(\epsilon_{\mathrm{rel}}\) be the calibration's measured relative uncertainty.
-Sub-microsecond ordering inside
+This objective is for policy selection. Absolute expert and DAG time continues
+to use the overlapping ECM maximum and the shared-resource event simulator.
+Let \(J_{min}\) be the minimum candidate objective and
+\(\epsilon_{rel}\) the machine calibration uncertainty. Candidates inside
 
 \[
-\Delta_J=\epsilon_{\mathrm{rel}}T_{\mathrm{xfer}}(g_{\min})
+\mathcal E_s=\left\{w:J_s(w)\le J_{min}+
+\epsilon_{rel}\left(T_{xfer}(w_{min})+T_{sharedB}(w_{min})\right)\right\}
 \]
 
-is not treated as physically distinguishable. The policy first forms
+are intentionally treated as indistinguishable. The deterministic tie-break
+uses a cache-derived owner window rather than an M/T lookup table:
 
 \[
-\mathcal E_s=\{g:J_s(M,t,g)\le J_{\min}+\Delta_J\},
+U_{pref,s}=\max\left(C_{L1D},2b_s,
+\sqrt{C_{L1D}C^{B,eff}_{L2}}\right).
 \]
 
-then chooses the member nearest in powers-of-two to the kernel-native owner
-window
+For the 192-core calibration this is
+\(\sqrt{64\text{ KiB}\cdot256\text{ KiB}}=128\text{ KiB}\). The selected
+candidate minimizes log-distance to \(U_{pref,s}\), then exact \(J_s\), then
+prefers the larger window. W13 and W2 are selected independently and their pair
+is validated against a full Cartesian runtime oracle.
 
-\[
-U_{s,\mathrm{pref}}=\max(C_{L1D},2b_s),
-\]
-
-where \(b_s=K_s\nu\cdot2\) is one packed-B tile. Exact objective and range count
-break any remaining tie. Equivalently,
-
-\[
-g_s^*(M,t)=
-\arg\min_{g\in\mathcal E_s}
-\left(
-\left|\log_2\frac{U_s(g)}{U_{s,\mathrm{pref}}}\right|,
-J_s(M,t,g),R_s(g)
-\right).
-\]
-
-W13 and W2 are minimized independently and lowered to the Plan V2 exact-range
-ABI. The native mapper reconstructs the same tile-balanced geometry from the
-integer range count; it does not round-trip through a byte target. The
-uncertainty tie does not add a measured route band: it uses one
-machine-level uncertainty scalar and the kernel/cache geometry already present
-in the calibration. This objective is used only to choose an execution policy; absolute
-expert and DAG time continues to use the overlapping ECM maximum and the
-shared-resource event simulator. The policy is deterministic for a calibration
-digest, does not add a planner variable, and does not change the planner's
-shape set.
-
-The packed N tile \(\nu\) is part of the machine/kernel calibration, not a
-portable default. The model defaults to `kernel.backend_n_tile`, and the
-holdout benchmark rejects a calibration when that value differs from the packed
-weight ABI; any production binding must enforce the same check. This matters
-across the two validation machines: the 192-core SVE build uses \(\nu=8\), while
-the 8-core SVE build uses \(\nu=16\).
+The calibrated quantities are machine services and capacities, not route-time
+samples: L1/L2/LLC/DRAM and GEMM service curves, physical/effective cache
+capacities, packed-B retention anchors, relative uncertainty, and
+\(\delta_{13}/\delta_2\). Shape, panel count, traffic, candidate windows, and
+cohort size are derived analytically. The packed N tile \(\nu\) is part of the
+machine/kernel identity; a holdout must reject a calibration whose tile differs
+from the packed runtime ABI.
 
 ## Concurrent Time
 
@@ -467,7 +466,11 @@ shape. Rates use units per second; overheads use nanoseconds.
     "call_setup_ns": 0.0,
     "expert_fixed_ns": 0.0,
     "route_ns": 0.0,
-    "stage_fixed_ns": 0.0
+    "stage_fixed_ns": 0.0,
+    "range_fixed_ns": 0.0,
+    "panel_range_restart_ns": 0.0,
+    "w13_panel_range_restart_ns": null,
+    "w2_panel_range_restart_ns": null
   },
   "planner": {
     "supported_widths": [1, 2, 4, 8, 16, 32, 48, 64, 96]
@@ -493,7 +496,8 @@ Generate the independent service probe and build a thin calibration with:
 ```bash
 python cpu_moe_schedule_optimization/cost_model/profile_analytic_services.py \
   --output services.json --cpu-ids 0-95 \
-  --widths 1,2,4,8,16,24,32,48,64,96
+  --widths 1,2,4,8,16,24,32,48,64,96 \
+  --range-repeats 7
 
 python cpu_moe_schedule_optimization/cost_model/build_analytic_calibration.py \
   services.json --output machine.json --report fit.json \
@@ -545,36 +549,49 @@ python cpu_moe_schedule_optimization/cost_model/validate_analytic_model.py \
   machine.json fulln_profile.json --output analytic_holdout.json
 ```
 
-The holdout must use `kernel.stage_geometry=full_n_team_stripes`, the same
-backend N tile, and the same machine/NUMA/kernel identity. It evaluates only
-team-width choices; no internal W13/W2 range coordinate exists.
+The full-stage validator still evaluates task-width timing. Validate the
+independent shadow stage-window selector with the exact runtime tile geometry:
 
-The table below is retained only as historical evidence from the removed
-stage-window selector. Its regret values must not be used as a gate for the
-current full-stage model:
+```bash
+numactl --physcpubind=0-95 --membind=0 \
+  python optimizations/fused_moe_sve/benchmarks/bench_analytic_stage_window_tiles.py \
+  --calibration machine.json --cpu-ids 0-95 \
+  --routes 72,216,384 --widths 4,16 \
+  --measurement-experts 96 --warmup 2 --runs 15 \
+  --full-cartesian --store-samples
+```
 
-The corrected policy-v2 2026-08-09 holdout produced:
+The 2026-08-11 v6 decision holdout used 96 distinct expert weights, 32 MiB
+HugeTLB, shuffled candidate order, and the full legal W13 x W2 Cartesian set for
+each of six high-value transition points:
 
-| Host / statistic | Median regret | P90 | Maximum | <=2% | <=5% |
-| :--- | ---: | ---: | ---: | ---: | ---: |
-| AmazonC5192Cores NUMA0, median | 1.50% | 2.98% | 3.38% | 17/28 | 28/28 |
-| AmazonECSV1 8C, raw median | 2.88% | 6.05% | 18.41% | 10/28 | 22/28 |
-| AmazonECSV1 8C, p10 sensitivity | 2.01% | 2.61% | 4.21% | 14/28 | 28/28 |
+| M | T | Analytical W13/W2 tiles | Runtime oracle tiles | Regret |
+| ---: | ---: | :--- | :--- | ---: |
+| 72 | 4 | 2 / 16 | 1 / 8 | 4.40% |
+| 72 | 16 | 2 / 16 | 1 / 8 | 1.74% |
+| 216 | 4 | 8 / 16 | 2 / 16 | 2.51% |
+| 216 | 16 | 8 / 16 | 8 / 16 | 0.00% |
+| 384 | 4 | 8 / 16 | 8 / 16 | 0.00% |
+| 384 | 16 | 8 / 16 | 8 / 32 | 0.47% |
 
-Historically, on the clean 192-core host, v1's `1.63/6.57/11.32%`
-median/P90/maximum
-regret becomes `1.50/2.98/3.38%`. The correction changes cache traffic and
-uncertainty handling only; routes are not added to calibration, and the legal
-planner shape set is unchanged.
+Median/linearly-interpolated-P90/maximum regret is `1.10/3.45/4.40%`; 4/6 points are within 2% and
+6/6 pass the declared 5% maximum-regret gate. Median candidate-rank Spearman
+correlation is 0.869. This closes the **window-selection subproblem on the
+declared 192-core TP4 transition domain**: the formula selects a near-oracle
+pair without an M/T latency table.
 
-The 192-core samples are stable: candidate p90/p10 spread has a 1.46% median,
-and policy v2 passes the 5% maximum-regret gate in both median and p10 analyses.
-The 8-core host was heavily preempted: candidate p90/p10 spread had a 28.47%
-median and 99.66% P90, so its raw maximum is not a valid strict gate; its p10
-sensitivity remains below 5%. Its cache and service curves are local, but
-packed-B retention is still a transferred prior. These numbers describe the
-retired policy only. Full protocol and raw artifact links are in
-`optimizations/fused_moe_sve/results/analytic_stage_window_policy_v2_holdout_20260809.md`.
+It does not prove an exact absolute-time decomposition. A paired-round
+additivity check still sees up to 17.69% W13/W2 interaction residual on extreme
+non-selected pairs, and M=72/T=16 has rank correlation 0.098 despite only 1.74%
+selected regret. These are explicit limits: v6 is adequate for choosing a
+window inside the tested domain, not for predicting every Cartesian point or
+for replacing the production planner.
+
+The older policy-v2 `1.50/2.98/3.38%` result used a coordinate oracle and a
+retired range ABI. It remains useful provenance but cannot gate the current
+tile-window runtime. The current protocol, thin-calibration evidence, rejected
+hypotheses, and full result table are recorded in
+`optimizations/fused_moe_sve/results/analytic_stage_window_policy_v6_closure_20260811.md`.
 
 Validate absolute analytical timing and planner shapes with:
 
@@ -610,6 +627,12 @@ gates still fail. Commands, anchors, and per-route decisions are recorded in
 ## Known Limits
 
 - SVE BF16 N-split only; a different ISA or M/MN split needs a new kernel mapper.
+- Analytical stage-window v6 is shadow-only. Its 5% selection gate covers the
+  192-core TP4 M=`72,216,384`, T=`4,16` transition domain, not arbitrary routes,
+  widths, shapes, machines, or mixed-workload planner decisions.
+- W2 range restart currently uses the pure full-no-store service as a proxy, and
+  extreme W13/W2 pairs retain up to 17.69% paired additivity residual. Do not use
+  the selector score as an exact absolute pair latency.
 - The core ceiling is currently M12. Exact-M M1-M11 issue-efficiency ratios are
   not yet independent services, so short-tail accuracy still depends on the
   exact demand mapper plus the common M12 ceiling.

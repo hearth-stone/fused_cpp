@@ -112,6 +112,7 @@ def _worker(
     warmup: int,
     runs: int,
     probe_mode: int,
+    n_ranges: int,
 ) -> None:
     try:
         os.sched_setaffinity(0, {cpu})
@@ -123,7 +124,7 @@ def _worker(
                 k,
                 n,
                 n_tile,
-                1,
+                n_ranges,
                 warmup,
                 runs,
                 probe_mode,
@@ -159,14 +160,25 @@ def concurrent_probe(
     warmup: int,
     runs: int,
     probe_mode: int = PROBE_FULL_NO_STORE,
+    n_ranges: int = 1,
+    a_group_size: int | None = None,
 ) -> list[list[float]]:
     """Run one synchronized process wave and return per-worker scan timings."""
     context = mp.get_context("fork")
+    if n_ranges <= 0 or n % n_ranges or (n // n_ranges) % n_tile:
+        raise ValueError("n_ranges must divide N into whole N tiles")
+    if a_group_size is not None:
+        if state.stream_a or a_group_size <= 0 or width % a_group_size:
+            raise ValueError("group-shared A requires a positive group size dividing width and a hot-A state")
+        if a.dim() != 3 or a.size(0) != width // a_group_size:
+            raise ValueError("group-shared A must have shape [width / group_size, M, K]")
     processes: list[mp.Process] = []
     parents = []
     for worker_id in range(width):
         if state.stream_a:
             worker_a = a[worker_id]
+        elif a_group_size is not None:
+            worker_a = a[worker_id // a_group_size]
         else:
             worker_a = a
         b_begin = worker_id * copies_per_worker if state.stream_b else worker_id
@@ -175,7 +187,19 @@ def concurrent_probe(
         parent, child = context.Pipe(duplex=False)
         process = context.Process(
             target=_worker,
-            args=(child, cpu_ids[worker_id], worker_a, worker_b, k, n, n_tile, warmup, runs, probe_mode),
+            args=(
+                child,
+                cpu_ids[worker_id],
+                worker_a,
+                worker_b,
+                k,
+                n,
+                n_tile,
+                warmup,
+                runs,
+                probe_mode,
+                n_ranges,
+            ),
         )
         process.start()
         child.close()
@@ -183,10 +207,23 @@ def concurrent_probe(
         parents.append(parent)
 
     try:
-        for process in processes:
-            pid, status = os.waitpid(process.pid, os.WUNTRACED)
+        for worker_id, process in enumerate(processes):
+            try:
+                pid, status = os.waitpid(process.pid, os.WUNTRACED)
+            except ChildProcessError as exc:
+                process.join(timeout=0.0)
+                detail = f"exitcode={process.exitcode}"
+                if parents[worker_id].poll():
+                    child_status, payload = parents[worker_id].recv()
+                    detail += f" child_status={child_status} payload={payload}"
+                raise RuntimeError(
+                    f"worker {worker_id} pid={process.pid} exited before SIGSTOP ({detail})"
+                ) from exc
             if pid != process.pid or not os.WIFSTOPPED(status):
-                raise RuntimeError(f"worker {process.pid} exited before the synchronized kernel window")
+                raise RuntimeError(
+                    f"worker {worker_id} pid={process.pid} exited before the synchronized kernel window: "
+                    f"wait_status={status} exitcode={process.exitcode}"
+                )
         for process in processes:
             os.kill(process.pid, signal.SIGCONT)
 

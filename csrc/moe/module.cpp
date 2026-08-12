@@ -77,8 +77,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("N"), py::arg("n_tile"), py::arg("group_size"), py::arg("local_tid"), py::arg("window_tiles") = 0,
         py::arg("use_w2_n_owner") = true, py::call_guard<py::gil_scoped_release>());
   m.def("fused_moe_bench_sve_jit_w13_gemm", &fused_moe_bench_sve_jit_w13_gemm,
-        "Benchmark the exact-M SVE JIT GEMM body, including full-M M12 probes, optionally rotating 3-D A copies and "
-        "packed-B experts.",
+        "Benchmark the exact-M SVE JIT GEMM body, including full-M M12 and fused-W13 probes, optionally rotating "
+        "3-D A copies and packed-B experts.",
         py::arg("A"), py::arg("w13_packed"), py::arg("K"), py::arg("N"), py::arg("n_tile"), py::arg("n_ranges") = 2,
         py::arg("warmup") = 64, py::arg("runs") = 192, py::arg("probe_mode") = 0,
         py::call_guard<py::gil_scoped_release>());
