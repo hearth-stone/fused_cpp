@@ -1,0 +1,171 @@
+operator: sparse_mla
+
+baseline:
+  id: indexed_4x4
+  implementation: csrc/sparse_mla.cpp
+  entrypoint: flash_mla_sparse_fwd
+  status: reference
+
+benchmark_scenarios:
+  full_forward: >-
+    tests/bench_sparse_mla_tail_variants.py --workload v4-forward
+    --s-q 2048 --warmup 5 --iters 21
+  tail_causal: >-
+    tests/bench_sparse_mla_tail_variants.py --workload tail-causal
+    --tail-blocks 1024 --warmup 5 --iters 21
+  tail_v4_mix: >-
+    tests/bench_sparse_mla_tail_variants.py --workload tail-v4-mix
+    --tail-blocks 1024 --warmup 5 --iters 21
+
+features:
+  - id: planning.masked_dense_tail
+    part: planning
+    status: candidate
+    owner: zhangxu
+    opened: 2026-08-12
+    decision_by: 2026-09-11
+    implementation: csrc/sparse_mla.cpp
+    hypothesis: >-
+      Promoting an eight-query monotonic contiguous tail from indexed 4x4
+      tiles to one masked 8x8 tile removes gather-oriented QK and scalar PV
+      overhead while preserving duplicate, non-contiguous, partial-query, and
+      out-of-range fallback behavior.
+    depends_on: []
+    conflicts_with: []
+    next_decision: >-
+      Retire the production-resident comparison path unless repeated target-host
+      measurements justify a single-thread-only dispatch or a multi-thread result
+      within 0.5% of the indexed baseline.
+    adoption_gate: >-
+      Pass the focused sparse MLA suite and show at least 5% lower median latency
+      at one thread without more than 0.5% regression at 12, 32, or 96 threads
+      in three independent 21-run sessions on the 192-core target.
+    correctness: >-
+      PYTHONPATH=src OMP_NUM_THREADS=12 .venv/bin/python -m pytest -q
+      tests/test_sparse_mla.py
+    benchmark: >-
+      OMP_NUM_THREADS=12 OMP_PROC_BIND=close OMP_PLACES=cores
+      numactl --physcpubind=96-191 --membind=1 env PYTHONPATH=src
+      .venv/bin/python tests/bench_sparse_mla_tail_variants.py
+      --threads 12 --warmup 5 --iters 21
+    result: optimizations/sparse_mla/results/amazon_192c_masked_tail_20260812.md
+
+  - id: packing.masked_dense_kv
+    part: packing
+    status: candidate
+    owner: zhangxu
+    opened: 2026-08-12
+    decision_by: 2026-09-11
+    implementation: csrc/sparse_mla.cpp
+    hypothesis: >-
+      Packing each promoted K/V tile once per eight-query plan and reusing the
+      current head's packed Q across dense and masked segments amortizes layout
+      conversion across 32 query heads.
+    depends_on:
+      - planning.masked_dense_tail
+    conflicts_with: []
+    next_decision: >-
+      Measure allocator and pack traffic separately if the masked variants are
+      retained after the target-host decision.
+    adoption_gate: >-
+      Meet the planning.masked_dense_tail latency gate with packing included in
+      the timed forward call.
+    correctness: >-
+      PYTHONPATH=src OMP_NUM_THREADS=12 .venv/bin/python -m pytest -q
+      tests/test_sparse_mla.py
+    benchmark: >-
+      OMP_NUM_THREADS=12 OMP_PROC_BIND=close OMP_PLACES=cores
+      numactl --physcpubind=96-191 --membind=1 env PYTHONPATH=src
+      .venv/bin/python tests/bench_sparse_mla_tail_variants.py
+      --threads 12 --warmup 5 --iters 21
+    result: optimizations/sparse_mla/results/amazon_192c_masked_tail_20260812.md
+
+  - id: compute.bfmmla_2x2_pruning
+    part: compute
+    status: candidate
+    owner: zhangxu
+    opened: 2026-08-12
+    decision_by: 2026-09-11
+    implementation:
+      - csrc/sparse_mla_tail_microkernels.cpp
+      - csrc/sparse_mla_tail_microkernels.h
+    hypothesis: >-
+      Compile-time pruning of inactive BFMMLA 2x2 blocks reduces a causal 8x8
+      QK tile from 16 to 10 BFMMLA updates per E/4 step and outperforms the
+      full masked-dense tile.
+    depends_on:
+      - planning.masked_dense_tail
+      - packing.masked_dense_kv
+    conflicts_with: []
+    next_decision: >-
+      The tail-only gate passed by 4.7% to 12.9%, but the 2048 full forward did
+      not improve at 12 or more threads. Retain only if a production workload
+      justifies a tail-heavy or single-thread dispatch; otherwise remove the
+      specialized dispatch by the decision deadline.
+    adoption_gate: >-
+      At least 1% lower median latency than masked_dense_8x8 and no regression
+      against indexed_4x4 at the selected production thread count.
+    correctness: >-
+      PYTHONPATH=src OMP_NUM_THREADS=12 .venv/bin/python -m pytest -q
+      tests/test_sparse_mla.py -k tail_variants
+    benchmark: >-
+      OMP_NUM_THREADS=12 OMP_PROC_BIND=close OMP_PLACES=cores
+      numactl --physcpubind=96-191 --membind=1 env PYTHONPATH=src
+      .venv/bin/python tests/bench_sparse_mla_tail_variants.py
+      --threads 12 --warmup 5 --iters 21
+    result: optimizations/sparse_mla/results/amazon_192c_masked_tail_20260812.md
+
+  - id: compute.bfmlal_lane_pruning
+    part: compute
+    status: candidate
+    owner: zhangxu
+    opened: 2026-08-12
+    decision_by: 2026-09-11
+    implementation:
+      - csrc/sparse_mla_tail_microkernels.cpp
+      - csrc/sparse_mla_tail_microkernels.h
+    hypothesis: >-
+      Skipping invalid masked P coefficients reduces a causal 8x8 PV tile from
+      64 to 36 coefficient updates and lets the pruned variant outperform the
+      full masked-dense PV kernel.
+    depends_on:
+      - compute.bfmmla_2x2_pruning
+    conflicts_with: []
+    next_decision: >-
+      Evaluate only together with compute.bfmmla_2x2_pruning because there is no
+      PV-only variant. The combined path passes the tail-only isolation gate but
+      still requires an end-to-end dispatch case before adoption.
+    adoption_gate: >-
+      The combined pruned variant must satisfy the BFMMLA pruning adoption gate
+      and remain within the sparse MLA numerical tolerance.
+    correctness: >-
+      PYTHONPATH=src OMP_NUM_THREADS=12 .venv/bin/python -m pytest -q
+      tests/test_sparse_mla.py -k tail_variants
+    benchmark: >-
+      OMP_NUM_THREADS=12 OMP_PROC_BIND=close OMP_PLACES=cores
+      numactl --physcpubind=96-191 --membind=1 env PYTHONPATH=src
+      .venv/bin/python tests/bench_sparse_mla_tail_variants.py
+      --threads 12 --warmup 5 --iters 21
+    result: optimizations/sparse_mla/results/amazon_192c_masked_tail_20260812.md
+
+variants:
+  - id: indexed_4x4
+    entrypoint: _flash_mla_sparse_fwd_variant(..., "indexed_4x4")
+    status: reference
+    features: []
+
+  - id: masked_dense_8x8
+    entrypoint: _flash_mla_sparse_fwd_variant(..., "masked_dense_8x8")
+    status: candidate
+    features:
+      - planning.masked_dense_tail
+      - packing.masked_dense_kv
+
+  - id: masked_dense_8x8_pruned
+    entrypoint: _flash_mla_sparse_fwd_variant(..., "masked_dense_8x8_pruned")
+    status: candidate
+    features:
+      - planning.masked_dense_tail
+      - packing.masked_dense_kv
+      - compute.bfmmla_2x2_pruning
+      - compute.bfmlal_lane_pruning

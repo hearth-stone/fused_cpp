@@ -385,6 +385,35 @@ wide-stride `TILESTORED` 的 raw store path 比 scratch→ZMM store 更慢。当
 实验模式都保留 ZMM FP32→BF16 转换。下一优先级是 scratch/workspace 生命周期，
 不是把 shape-dependent 的 tile-store 路径提前设为默认。
 
+### Sparse MLA 连续尾块 8×8 候选
+
+`flash_mla_sparse_fwd` 的默认尾部仍是 `indexed_4x4`。内部比较入口新增
+`masked_dense_8x8` 与 `masked_dense_8x8_pruned`：planner 只提升完整 8-query、
+单调连续前缀且可安全加载 8 行 K/V 的 ragged tail；重复、离散、partial block
+及越界风险继续回落 indexed 路径。
+
+- full masked：复用已有 packed-Q/K BFMMLA 8×8 与 pbf16 PV，softmax 前按行
+  `valid_len` mask；同一 head 的 packed Q 在 dense/masked segment 间复用。
+- pruned：对已知 causal/compressed/uniform mask 模板化；标准 causal tile 的 QK
+  从 16 个 2×2 BFMMLA 子块减到 10 个，PV 从 64 个 P 系数减到 36 个 BFMLAL
+  更新。初版逐 block 标量落盘和 E/4 循环没有收益，随后改为 E/8 双步展开、
+  2-lane 向量落盘，并加入精确 PV lane pruning。
+- Amazon 192C NUMA1、BF16 `q[2048,32,192]`、`kv[2560,1,192]`、`d_v=128`、
+  5 warmup + 21 次轮转交错中，1T latency 为 586.217 / 544.225 / 541.370 ms
+  （indexed/full/pruned）；12T 为 55.710 / 55.832 / 55.949 ms，32T 为
+  54.702 / 55.402 / 55.500 ms，96T 为 55.281 / 55.426 / 55.352 ms。
+  单线程快 7.2--7.7%，但 ≥12T 已到约 55 ms 平台且没有收益，故不切默认。
+
+为避免把全算子稀释误判为尾部核无收益，另用 1,024 个独立 8-query block
+做 tail-only 隔离。纯 causal 下 pruned 相对 full dense 在 1/12/32/96T 分别
+快 12.9% / 11.2% / 8.9% / 5.0%；按 V4 比例混合 causal 与四种 compressed
+mask 时分别快 5.8% / 5.8% / 5.1% / 4.7%。因此 2×2 QK 与 exact-lane PV
+pruning 本身有效；2048 forward 无收益来自 masked tail 仅占有效 pairs 的
+0.644%，而不是 pruned 微内核没有减少尾部开销。
+
+完整方法、逐轮尝试、数值结果与保留门限见
+`optimizations/sparse_mla/results/amazon_192c_masked_tail_20260812.md`。
+
 ---
 
 ## 选型矩阵
@@ -409,6 +438,7 @@ wide-stride `TILESTORED` 的 raw store path 比 scratch→ZMM store 更慢。当
 
 | 日期 | 改动概述 | 受影响文件 |
 |---|---|---|
+| 2026-08-12 | **Sparse MLA 连续 ragged tail 的 full/pruned 8×8 候选**：新增安全的 monotonic-tail planner、packed masked 8×8 QK/PV、2×2 BFMMLA pruning、BFMLAL valid-lane pruning、跨 segment packed-Q 复用与内部三版本 benchmark 入口。Amazon 192C NUMA1、`q[2048,32,192]`、V4-like 2,621,952 pairs/head、21-run 轮转交错：1T indexed/full/pruned 为 586.217/544.225/541.370 ms（候选快 7.2--7.7%）；12/32/96T 三者均约 55 ms，full/pruned 没有稳定收益且 32T 回退约 1.3--1.5%，因此公开默认继续 `indexed_4x4`。1,024-block tail-only 隔离确认 pruned 相对 full 在 causal 快 5.0--12.9%、V4-mix 快 4.7--5.8%，说明 E2E 差异小是尾部占比稀释而非 pruning 无效。记录了初版 full tile、初版 QK pruning、E/8 展开+向量 store+Q reuse、精确 PV pruning 四轮尝试。 | 改 `csrc/{sparse_mla.cpp,module.cpp,SDPA_VERSIONS.md}`、`tests/{test_sparse_mla.py,bench_sparse_mla_tail_variants.py}`；新建 `csrc/sparse_mla_tail_microkernels.{h,cpp}`、`optimizations/sparse_mla/{manifest.yaml,results/amazon_192c_masked_tail_20260812.md}` |
 | 2026-07-28 | **DeepSeek V4 attention MN 路径 A 只 pack 一次**：Linux NEON 下新增 attention-prefixed packed-A M8 BF16/FP32 row-major store kernel；OpenMP team 先协作把 hidden states 写成一份 reorder-M8 buffer，尾部补零，经一次 publish barrier 后由四个 GEMM 的全部 N-group 复用。默认仅在 MN requested N groups >=24 时启用，`FUSED_CPP_ATTN_GEMM_PREPACK_A=on/off` 可强制选择，SVE 与其他 schedule 保持原路径。Amazon 192C NUMA0、M2048/K4096/N 总计3904：强制 off/on 在 24/32/48/64/80/96T 分别加速 1.038/1.028/1.047/1.020/1.016/1.030x；96T 21-run 为 3.154→3.059 ms、20.764→21.411 TFLOP/s。2--16T 存在最高约 4.7% 回退，因此 auto 门限避开该区间；31 项本地、远程 NEON、远程 SVE 测试均通过。 | 改 `csrc/deepseek_v4_attn_gemm_fused.cpp`、`csrc/moe/arm/neon_bf16/kernels.S`、`setup.py`、`tests/{bench_deepseek_v4_attn_gemm_fused.py,test_deepseek_v4_attn_gemm_fused.py}`、`optimizations/deepseek_v4_attn_gemm/{manifest.yaml,results/amazon_192c_attn_gemm_scheduler_20260728.md}`、`csrc/SDPA_VERSIONS.md` |
 | 2026-07-28 | **DeepSeek V4 attention 四 GEMM MN auto 默认调度**：新增 `legacy/m8/pool/mn` 四种运行时选择并将无环境变量时的默认值切到 `mn`；M8 对齐切 M 只保留一次全局尾块，共享 OpenMP 任务池允许四个不同 N 的 GEMM 互相补齐负载，MN 模式再按 backend N tile 切 packed-B 并采用 owner-first M8 panel stealing。Amazon 192C NUMA0 0-95、M2048/K4096/N 总计 3904、65.498 GFLOP：legacy 12.361 ms / 5.299 TFLOP/s，M8 8.674 ms / 7.551 TFLOP/s，pool 7.914 ms / 8.276 TFLOP/s，MN auto 3.329 ms / 19.676 TFLOP/s；MN 1T→96T 为 268.1 GFLOP/s→20.66 TFLOP/s（77.1x，80.3% 线性度）。配对 sweep 中 MN 在 1--4T 与 legacy 持平，8/16/24/32/48/64/80/96T 分别为 1.115/1.276/1.827/2.404/3.688/2.839/3.242/3.735x。`legacy` 保留为显式回退，normed 路径尚未接入。 | 改 `csrc/deepseek_v4_attn_gemm_fused.cpp`、`tests/{bench_deepseek_v4_attn_gemm_fused.py,test_deepseek_v4_attn_gemm_fused.py}`；新建 `optimizations/deepseek_v4_attn_gemm/{manifest.yaml,results/amazon_192c_attn_gemm_scheduler_20260728.md}`；改 `csrc/SDPA_VERSIONS.md` |
 | 2026-07-22 | **x86 MoE 参考 SVE 引入多线程切 N 与 skew-aware wave 调度**：AVX-512/AMX executor 从只支持 1/2T 扩展为 1--256 requested workers；active expert 不足时建立 route-weighted teams，并行 gather 后经 barrier 分别切分 W13 F16 与 W2 N32 blocks；最大 route 至少 64 且为次大 2x 时按 route 降序组成 waves，均衡且 active expert 足够时保留 atomic expert queue。barrier 支持异常取消，scratch 按 wave slot 最大 route 复用，merge threads capped by token count。C8i8 H4096/F512/M2048：AMX hot 26.45→5.76 ms（1T→8T，4.60x），`[1536,256,256]` 39.22→11.89 ms（3.30x）；完整 x86 suite 163 passed。 | 改 `csrc/moe/x86/avx512_bf16/executor.cpp`、`src/fused_cpp/moe/bf16_tiled.py`、`tests/{test_moe_avx512_bf16.py,bench_moe_avx512_bf16.py}`、`optimizations/fused_moe_avx512/{README.md,TODO.md,manifest.yaml,results/amazon_c8i_8core_nsplit_20260722.md}`、`cpu_moe_schedule_optimization/MATHEMATICAL_MODEL.md`、`csrc/SDPA_VERSIONS.md` |
