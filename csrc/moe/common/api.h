@@ -20,6 +20,10 @@ at::Tensor fused_moe_test_fused_w13_silu(at::Tensor A, at::Tensor w13, int64_t d
 at::Tensor fused_moe_test_team_fused_w13_silu(at::Tensor A, at::Tensor w13, int64_t group_size, int64_t degree);
 at::Tensor fused_moe_test_pack_a_reorder_m8(at::Tensor A);
 at::Tensor fused_moe_test_gather_pack_a_reorder_m8(at::Tensor input, at::Tensor routes, int64_t top_k, int64_t K_pad);
+std::vector<std::tuple<int64_t, int64_t, int64_t, int64_t, int64_t>> fused_moe_test_gather_pack_a_work(
+    int64_t total_rows, int64_t K_pad, int64_t group_size);
+at::Tensor fused_moe_test_gather_pack_a_reorder_sve_hybrid(at::Tensor input, at::Tensor routes, int64_t top_k,
+                                                           int64_t K_pad, int64_t group_size);
 at::Tensor fused_moe_test_fused_w13_silu_packc(at::Tensor A, at::Tensor w13, int64_t degree);
 at::Tensor fused_moe_test_fused_w13_silu_packc_tail(at::Tensor A, at::Tensor w13, int64_t degree);
 at::Tensor fused_moe_test_team_w13_silu_packc_window(at::Tensor A, at::Tensor w13, int64_t group_size, int64_t degree,

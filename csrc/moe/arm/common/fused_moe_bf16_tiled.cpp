@@ -176,6 +176,11 @@ void bf16gemm_k_ld_silu_poly6_m4(const uint16_t*, const uint16_t*, uint16_t*, ui
 namespace {
 
 constexpr int64_t kKernelTile = 8;
+// K stripes smaller than this spend too much time rebuilding row pointers.
+// Keep every cooperative stripe at least 32 bf16 K elements; a short K tail is
+// folded into its stripe, and every interior boundary is separately aligned to
+// eight K elements so M8/M12 writers never share an output cache line.
+constexpr int64_t kGatherPackMinKChunk = 32;
 
 int64_t ceil_div_int64(int64_t x, int64_t y) { return (x + y - 1) / y; }
 
@@ -209,6 +214,113 @@ SplitRange split_evenly(int64_t units, int64_t group_size, int64_t local_tid) {
   }
   return SplitRange{extra_units * (units_per_thread + 1) + (local_tid - extra_units) * units_per_thread,
                     units_per_thread};
+}
+
+struct GatherPackAPlan {
+  int64_t main_blocks = 0;
+  int64_t tail_rows = 0;
+  int64_t panel_count = 0;
+  int64_t active_threads = 0;
+  int64_t main_k_chunks = 1;
+  int64_t tail_k_chunks = 0;
+  int64_t main_atoms = 0;
+  int64_t total_atoms = 0;
+};
+
+GatherPackAPlan make_gather_pack_a_plan(int64_t total_rows, int64_t K_pad, int64_t group_size) {
+  GatherPackAPlan plan;
+  if (total_rows <= 0 || K_pad <= 0 || group_size <= 0) {
+    return plan;
+  }
+
+  const int64_t main_rows = sve_m12_main_rows(total_rows);
+  plan.main_blocks = main_rows / 12;
+  plan.tail_rows = total_rows - main_rows;
+  plan.panel_count = plan.main_blocks + (plan.tail_rows > 0 ? 1 : 0);
+  if (plan.panel_count <= 0) {
+    return plan;
+  }
+  // Keep the established one-panel-per-worker traversal whenever M alone can
+  // occupy the team. Otherwise flatten physical M panels and bounded K
+  // stripes into one work domain so every available worker can help pack A.
+  if (plan.panel_count >= group_size || K_pad < 2 * kGatherPackMinKChunk) {
+    plan.main_k_chunks = 1;
+    plan.tail_k_chunks = plan.tail_rows > 0 ? 1 : 0;
+    plan.main_atoms = plan.main_blocks;
+    plan.total_atoms = plan.panel_count;
+    plan.active_threads = std::min(group_size, plan.total_atoms);
+    return plan;
+  }
+  plan.main_k_chunks = std::max<int64_t>(1, K_pad / kGatherPackMinKChunk);
+  plan.main_atoms = plan.main_blocks * plan.main_k_chunks;
+  if (plan.tail_rows > 0) {
+    // An M12 atom contains about 12*32 packed elements. Give the physical M8
+    // tail roughly 48 K elements per atom so both atom kinds have comparable
+    // work, while retaining the same hard 32-element minimum.
+    const int64_t max_tail_chunks = std::max<int64_t>(1, K_pad / kGatherPackMinKChunk);
+    const int64_t equal_work_tail_chunks = std::max<int64_t>(1, (K_pad + 24) / 48);
+    plan.tail_k_chunks = std::min(max_tail_chunks, equal_work_tail_chunks);
+  }
+  plan.total_atoms = plan.main_atoms + plan.tail_k_chunks;
+  plan.active_threads = std::min(group_size, plan.total_atoms);
+  return plan;
+}
+
+int64_t gather_pack_k_chunk_boundary(int64_t K_pad, int64_t chunk_count, int64_t boundary) {
+  if (boundary <= 0) {
+    return 0;
+  }
+  if (boundary >= chunk_count) {
+    return K_pad;
+  }
+  // Eight K elements advance an M12 packed output by 192 bytes and an M8
+  // output by 128 bytes, so every interior boundary remains cache-line aligned.
+  const int64_t aligned_units = K_pad / 8;
+  const int64_t units_per_chunk = aligned_units / chunk_count;
+  const int64_t extra_units = aligned_units % chunk_count;
+  return (boundary * units_per_chunk + std::min(boundary, extra_units)) * 8;
+}
+
+template <typename Fn>
+void emit_gather_pack_a_work(const GatherPackAPlan& plan, int64_t K_pad, int64_t local_tid, Fn&& fn) {
+  const SplitRange atoms = split_evenly(plan.total_atoms, plan.active_threads, local_tid);
+  int64_t atom = atoms.begin;
+  int64_t atoms_left = atoms.size;
+  while (atoms_left > 0) {
+    const bool is_main = atom < plan.main_atoms;
+    const int64_t local_atom = is_main ? atom : atom - plan.main_atoms;
+    const int64_t k_chunks = is_main ? plan.main_k_chunks : plan.tail_k_chunks;
+    const int64_t panel = is_main ? local_atom / k_chunks : plan.main_blocks;
+    const int64_t first_chunk = local_atom % k_chunks;
+    const int64_t chunks = std::min(atoms_left, k_chunks - first_chunk);
+    const int64_t k_begin = gather_pack_k_chunk_boundary(K_pad, k_chunks, first_chunk);
+    const int64_t k_end = gather_pack_k_chunk_boundary(K_pad, k_chunks, first_chunk + chunks);
+    fn(panel, is_main ? 12 : 8, SplitRange{k_begin, k_end - k_begin});
+    atom += chunks;
+    atoms_left -= chunks;
+  }
+}
+
+template <typename Fn>
+void for_each_gather_pack_a_work(int64_t total_rows, int64_t K_pad, int64_t group_size, int64_t local_tid,
+                                 Fn&& fn) {
+  const GatherPackAPlan plan = make_gather_pack_a_plan(total_rows, K_pad, group_size);
+  if (local_tid < 0 || local_tid >= group_size || plan.panel_count <= 0) {
+    return;
+  }
+  if (local_tid >= plan.active_threads) {
+    return;
+  }
+  emit_gather_pack_a_work(plan, K_pad, local_tid, std::forward<Fn>(fn));
+}
+
+int64_t gather_pack_a_equivalent_rows(int64_t total_rows, int64_t K_pad, int64_t group_size, int64_t local_tid) {
+  int64_t packed_elements = 0;
+  for_each_gather_pack_a_work(total_rows, K_pad, group_size, local_tid,
+                              [&](int64_t, int64_t panel_rows, const SplitRange& k_range) {
+                                packed_elements += panel_rows * k_range.size;
+                              });
+  return packed_elements > 0 ? ceil_div_int64(packed_elements, K_pad) : 0;
 }
 
 SplitRange n_split_range(int N, int64_t group_size, int64_t local_tid) {
@@ -2473,9 +2585,11 @@ void pack_a_reorder_m8(const uint16_t* A, uint16_t* packed, int total_rows, int 
 // columns beyond H (K padding) are zero-filled. `packed` holds
 // ceil(total_rows/8)*8*K_pad uint16. Bit-identical to gather-to-rowmajor(K_pad)
 // followed by pack_a_reorder_m8.
-void gather_pack_a_reorder_m8(const uint16_t* input, int64_t H, const int64_t* expert_routes, int64_t top_k,
-                              uint16_t* packed, int total_rows, int K_pad, int block_begin, int block_end) {
-  const int kb_count = K_pad / 4;
+void gather_pack_a_reorder_m8_k_range(const uint16_t* input, int64_t H, const int64_t* expert_routes, int64_t top_k,
+                                      uint16_t* packed, int total_rows, int K_pad, int block_begin, int block_end,
+                                      int k_begin, int k_end) {
+  const int kb_begin = k_begin / 4;
+  const int kb_end = k_end / 4;
   const int h_full_kb = static_cast<int>(H) / 4;
   for (int mb = block_begin; mb < block_end; ++mb) {
     uint16_t* blk = packed + static_cast<int64_t>(mb) * 8 * K_pad;
@@ -2489,7 +2603,7 @@ void gather_pack_a_reorder_m8(const uint16_t* input, int64_t H, const int64_t* e
     // one contiguous 64-byte cache line before advancing. This avoids the
     // 8x write amplification of the row-outer order (which touched every
     // output line 8 times, 8 bytes each). Reads become 8 sequential streams.
-    for (int kb = 0; kb < kb_count; ++kb) {
+    for (int kb = kb_begin; kb < kb_end; ++kb) {
       uint16_t* d = blk + static_cast<int64_t>(kb) * 32;  // 64 bytes
       const int k0 = kb * 4;
       if (kb < h_full_kb) {
@@ -2522,9 +2636,17 @@ void gather_pack_a_reorder_m8(const uint16_t* input, int64_t H, const int64_t* e
   }
 }
 
-void gather_pack_a_reorder_m12(const uint16_t* input, int64_t H, const int64_t* expert_routes, int64_t top_k,
-                               uint16_t* packed, int total_rows, int K_pad, int block_begin, int block_end) {
-  const int kb_count = K_pad / 4;
+void gather_pack_a_reorder_m8(const uint16_t* input, int64_t H, const int64_t* expert_routes, int64_t top_k,
+                              uint16_t* packed, int total_rows, int K_pad, int block_begin, int block_end) {
+  gather_pack_a_reorder_m8_k_range(input, H, expert_routes, top_k, packed, total_rows, K_pad, block_begin, block_end, 0,
+                                   K_pad);
+}
+
+void gather_pack_a_reorder_m12_k_range(const uint16_t* input, int64_t H, const int64_t* expert_routes, int64_t top_k,
+                                       uint16_t* packed, int total_rows, int K_pad, int block_begin, int block_end,
+                                       int k_begin, int k_end) {
+  const int kb_begin = k_begin / 4;
+  const int kb_end = k_end / 4;
   const int h_full_kb = static_cast<int>(H) / 4;
   for (int mb = block_begin; mb < block_end; ++mb) {
     uint16_t* blk = packed + static_cast<int64_t>(mb) * 12 * K_pad;
@@ -2533,7 +2655,7 @@ void gather_pack_a_reorder_m12(const uint16_t* input, int64_t H, const int64_t* 
       const int gr = mb * 12 + r;
       srcs[r] = (gr < total_rows) ? input + (expert_routes[gr] / top_k) * H : nullptr;
     }
-    for (int kb = 0; kb < kb_count; ++kb) {
+    for (int kb = kb_begin; kb < kb_end; ++kb) {
       uint16_t* d = blk + static_cast<int64_t>(kb) * 48;
       const int k0 = kb * 4;
       if (kb < h_full_kb) {
@@ -2571,19 +2693,22 @@ void gather_pack_a_reorder_sve_hybrid(const uint16_t* input, int64_t H, const in
                                       int64_t local_tid) {
   const int64_t main_rows = sve_m12_main_rows(total_rows);
   const int64_t main_blocks = main_rows / 12;
-  const SplitRange m12_range = split_evenly(main_blocks, group_size, local_tid);
-  gather_pack_a_reorder_m12(input, H, expert_routes, top_k, packed, total_rows, K_pad,
-                            static_cast<int>(m12_range.begin), static_cast<int>(m12_range.begin + m12_range.size));
-
   const int64_t tail_rows = total_rows - main_rows;
-  if (tail_rows <= 0) {
-    return;
-  }
-  const int64_t tail_blocks = ceil_div_int64(tail_rows, int64_t{8});
-  const SplitRange tail_range = split_evenly(tail_blocks, group_size, local_tid);
-  gather_pack_a_reorder_m8(input, H, expert_routes + main_rows, top_k, packed + main_rows * static_cast<int64_t>(K_pad),
-                           static_cast<int>(tail_rows), K_pad, static_cast<int>(tail_range.begin),
-                           static_cast<int>(tail_range.begin + tail_range.size));
+  for_each_gather_pack_a_work(total_rows, K_pad, group_size, local_tid,
+                              [&](int64_t panel, int64_t, const SplitRange& k_range) {
+                                const int k_begin = static_cast<int>(k_range.begin);
+                                const int k_end = static_cast<int>(k_range.begin + k_range.size);
+                                if (panel < main_blocks) {
+                                  gather_pack_a_reorder_m12_k_range(
+                                      input, H, expert_routes, top_k, packed, total_rows, K_pad,
+                                      static_cast<int>(panel), static_cast<int>(panel + 1), k_begin, k_end);
+                                  return;
+                                }
+                                gather_pack_a_reorder_m8_k_range(
+                                    input, H, expert_routes + main_rows, top_k,
+                                    packed + main_rows * static_cast<int64_t>(K_pad), static_cast<int>(tail_rows),
+                                    K_pad, 0, 1, k_begin, k_end);
+                              });
 }
 
 // N-split fused w13 + SiLU-and-mul reading a group-shared pre-packed A (m8,
@@ -4751,6 +4876,54 @@ at::Tensor fused_moe_test_gather_pack_a_reorder_m8(at::Tensor input, at::Tensor 
 #endif
 }
 
+std::vector<std::tuple<int64_t, int64_t, int64_t, int64_t, int64_t>> fused_moe_test_gather_pack_a_work(
+    int64_t total_rows, int64_t K_pad, int64_t group_size) {
+#ifndef __aarch64__
+  TORCH_CHECK(false, "fused_moe_test_gather_pack_a_work requires AArch64");
+#else
+  TORCH_CHECK(total_rows > 0, "total_rows must be positive");
+  TORCH_CHECK(K_pad > 0 && K_pad % 8 == 0, "K_pad must be a positive multiple of 8, got ", K_pad);
+  TORCH_CHECK(group_size > 0, "group_size must be positive");
+  std::vector<std::tuple<int64_t, int64_t, int64_t, int64_t, int64_t>> work;
+  work.reserve(static_cast<size_t>(group_size));
+  for (int64_t tid = 0; tid < group_size; ++tid) {
+    for_each_gather_pack_a_work(total_rows, K_pad, group_size, tid,
+                                [&](int64_t panel, int64_t panel_rows, const SplitRange& k_range) {
+                                  work.emplace_back(tid, panel, panel_rows, k_range.begin, k_range.size);
+                                });
+  }
+  return work;
+#endif
+}
+
+at::Tensor fused_moe_test_gather_pack_a_reorder_sve_hybrid(at::Tensor input, at::Tensor routes, int64_t top_k,
+                                                           int64_t K_pad, int64_t group_size) {
+#ifndef __aarch64__
+  TORCH_CHECK(false, "fused_moe_test_gather_pack_a_reorder_sve_hybrid requires AArch64");
+#else
+  check_bf16_cpu(input, "input");
+  TORCH_CHECK(input.dim() == 2, "input must be 2-D [num_tokens, H]");
+  TORCH_CHECK(routes.dim() == 1, "routes must be 1-D [rows]");
+  TORCH_CHECK(routes.scalar_type() == at::kLong, "routes must be int64");
+  TORCH_CHECK(top_k > 0, "top_k must be positive");
+  TORCH_CHECK(K_pad > 0 && K_pad % 8 == 0, "K_pad must be a positive multiple of 8, got ", K_pad);
+  TORCH_CHECK(group_size > 0, "group_size must be positive");
+  input = input.contiguous();
+  routes = routes.contiguous();
+  const int64_t H = input.size(1);
+  const int64_t rows = routes.size(0);
+  TORCH_CHECK(rows > 0, "routes must not be empty");
+  TORCH_CHECK(K_pad >= H, "K_pad must be >= H");
+  const int64_t packed_rows = sve_hybrid_packed_rows(rows);
+  at::Tensor out = at::zeros({packed_rows * K_pad}, at::TensorOptions().dtype(at::kBFloat16));
+  run_fixed_threads(group_size, [&](int64_t tid) {
+    gather_pack_a_reorder_sve_hybrid(bf16_data_const(input), H, routes.data_ptr<int64_t>(), top_k, bf16_data(out),
+                                     static_cast<int>(rows), static_cast<int>(K_pad), group_size, tid);
+  });
+  return out;
+#endif
+}
+
 // Test-only: fused w13 SiLU-and-mul with a packed-C (reorder-m8) store. Pads M
 // to a multiple of 8, pre-packs A, runs the packc m8 kernel, and returns the
 // packed intermediate as a flat bf16 buffer of length ceil(M/8)*8*F_pad4. Must
@@ -6003,10 +6176,9 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input, at::Tensor w13_packed, int64_t
         const int64_t w2_window_tiles = 0;
 
         if (fuse_silu && fused_packa) {
-          // Fused gather + m8 reorder pack (Part 1): write the w13 A
-          // directly into the packed layout, skipping the row-major
-          // scratch.input round-trip and the in-kernel repack. Split
-          // by 8-row blocks so each member packs whole blocks.
+          // Fused gather + hybrid reorder pack (Part 1): write W13 A directly
+          // into the M12/M8 packed layout. Whole M panels are assigned first;
+          // an underfilled team cooperates over cache-line-aligned K stripes.
           const int64_t nb = (rows + 7) / 8;
           const SplitRange brange = split_evenly(nb, nsplit_group_size, local_tid);
           time_phase(phase_gather_ms, [&] {
@@ -6627,7 +6799,10 @@ at::Tensor fused_moe_bf16_tiled_scheduled(at::Tensor input, at::Tensor w13_packe
                                             static_cast<int>(brange.begin),
                                             static_cast<int>(brange.begin + brange.size));
             }
-            trace_phase_end(tid, wave_idx, selected_team, local_tid, expert, brange.size * kKernelTile, "gather_pack_a",
+            const int64_t packed_rows = use_sve_backend && moe_trace.enabled()
+                                            ? gather_pack_a_equivalent_rows(rows, w13.K_pad, group_size, local_tid)
+                                            : brange.size * kKernelTile;
+            trace_phase_end(tid, wave_idx, selected_team, local_tid, expert, packed_rows, "gather_pack_a",
                             worker_phase_begin);
           } else {
             // Parallel gather: each team thread copies its own row
@@ -7753,8 +7928,10 @@ at::Tensor run_fused_moe_bf16_tiled_async(
                                         static_cast<int>(rows), static_cast<int>(w13.K_pad),
                                         static_cast<int>(brange.begin), static_cast<int>(brange.begin + brange.size));
         }
-        trace_phase_end(tid, task_id, local_tid, expert, brange.size * kKernelTile, "gather_pack_a",
-                        worker_phase_begin);
+        const int64_t packed_rows = use_sve_backend && moe_trace.enabled()
+                                        ? gather_pack_a_equivalent_rows(rows, w13.K_pad, group_size, local_tid)
+                                        : brange.size * kKernelTile;
+        trace_phase_end(tid, task_id, local_tid, expert, packed_rows, "gather_pack_a", worker_phase_begin);
       } else {
         // Parallel gather: each team thread copies its own row slice
         // (was serial on local_tid==0 with the rest idle).

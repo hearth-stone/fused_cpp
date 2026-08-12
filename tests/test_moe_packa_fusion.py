@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""packA fusion: fused gather + m8 reorder pack.
+"""packA fusion: fused gather + M12/M8 reorder packing.
 
 Task 1: `gather_pack_a_reorder_m8` must produce a byte-for-byte identical
 packed buffer to the two-step reference (gather tokens into a row-major,
@@ -45,6 +45,130 @@ def _fused_packed(input_tokens, routes, top_k, k_pad):
     from fused_cpp import _C
 
     return _C.fused_moe_test_gather_pack_a_reorder_m8(input_tokens, routes, top_k, k_pad)
+
+
+def _m12_main_rows(rows: int) -> int:
+    full_rows = rows // 12 * 12
+    return full_rows + 12 if rows - full_rows >= 9 else full_rows
+
+
+def _reference_sve_hybrid_packed(input_tokens, routes, top_k, k_pad):
+    rows = routes.numel()
+    h = input_tokens.size(1)
+    main_rows = _m12_main_rows(rows)
+    physical_rows = main_rows + (_ceil8(rows - main_rows) if rows > main_rows else 0)
+    gathered = torch.zeros(physical_rows, k_pad, dtype=torch.bfloat16)
+    for m in range(rows):
+        token = int(routes[m].item()) // top_k
+        gathered[m, :h] = input_tokens[token]
+
+    panels = []
+    for begin in range(0, main_rows, 12):
+        panel = gathered[begin : begin + 12]
+        panels.append(panel.reshape(12, k_pad // 4, 4).permute(1, 0, 2).contiguous().flatten())
+    if rows > main_rows:
+        panel = gathered[main_rows : main_rows + 8]
+        panels.append(panel.reshape(8, k_pad // 4, 4).permute(1, 0, 2).contiguous().flatten())
+    return torch.cat(panels)
+
+
+@pytest.mark.parametrize(
+    "rows,k_pad,group_size",
+    [
+        (1, 24, 8),
+        (1, 32, 8),
+        (1, 64, 8),
+        (1, 72, 8),
+        (9, 40, 8),
+        (12, 4096, 8),
+        (13, 4096, 2),
+        (13, 4096, 8),
+        (24, 4096, 8),
+        (37, 4096, 16),
+        (85, 4096, 8),
+        (95, 4096, 8),
+    ],
+)
+def test_sve_hybrid_mk_work_covers_panels_with_minimum_k_chunk(rows, k_pad, group_size):
+    from fused_cpp import _moe_C
+
+    work = _moe_C.fused_moe_test_gather_pack_a_work(rows, k_pad, group_size)
+    main_rows = _m12_main_rows(rows)
+    panel_count = main_rows // 12 + (1 if rows > main_rows else 0)
+    by_panel = {panel: [] for panel in range(panel_count)}
+    active_tids = set()
+    for tid, panel, panel_rows, k_begin, k_size in work:
+        assert 0 <= tid < group_size
+        assert panel_rows == (12 if panel < main_rows // 12 else 8)
+        assert k_size > 0
+        by_panel[panel].append((k_begin, k_size))
+        active_tids.add(tid)
+
+    for ranges in by_panel.values():
+        ranges.sort()
+        cursor = 0
+        for k_begin, k_size in ranges:
+            assert k_begin == cursor
+            if len(ranges) > 1:
+                assert k_size >= 32
+                assert k_begin % 8 == 0
+            cursor += k_size
+        assert cursor == k_pad
+
+    main_blocks = main_rows // 12
+    if panel_count >= group_size or k_pad < 64:
+        expected_active = min(panel_count, group_size)
+    else:
+        main_atoms = main_blocks * max(1, k_pad // 32)
+        tail_atoms = min(max(1, k_pad // 32), max(1, (k_pad + 24) // 48)) if rows > main_rows else 0
+        expected_active = min(group_size, main_atoms + tail_atoms)
+    assert len(active_tids) == expected_active
+    if panel_count >= group_size or k_pad < 64:
+        assert all(len(ranges) == 1 for ranges in by_panel.values())
+    if rows == 13 and group_size == 2:
+        assert active_tids == {0, 1}
+        assert set(panel for _, panel, _, _, _ in work) == {0, 1}
+    if rows == 72 and group_size == 8:
+        work_per_tid = {tid: 0 for tid in active_tids}
+        for tid, _, panel_rows, _, k_size in work:
+            work_per_tid[tid] += panel_rows * k_size
+        assert set(work_per_tid.values()) == {rows * k_pad // group_size}
+
+
+@pytest.mark.parametrize(
+    "rows,h,k_pad,top_k,group_size",
+    [
+        (1, 20, 24, 6, 8),
+        (1, 65, 72, 6, 8),
+        (9, 33, 40, 2, 8),
+        (12, 61, 64, 1, 8),
+        (13, 130, 136, 6, 8),
+        (37, 128, 128, 2, 16),
+        (85, 130, 136, 6, 8),
+        (95, 130, 136, 6, 8),
+    ],
+)
+def test_sve_hybrid_mk_gather_pack_matches_serial_layout(rows, h, k_pad, top_k, group_size):
+    from fused_cpp import _moe_C
+
+    torch.manual_seed(rows * 257 + h + top_k + group_size)
+    num_tokens = rows + 4
+    tokens = (torch.randn(num_tokens, h) * 0.1).to(torch.bfloat16)
+    routes = torch.randint(0, num_tokens * top_k, (rows,), dtype=torch.int64)
+    ref = _reference_sve_hybrid_packed(tokens, routes, top_k, k_pad)
+    out = _moe_C.fused_moe_test_gather_pack_a_reorder_sve_hybrid(tokens, routes, top_k, k_pad, group_size)
+
+    assert ref.shape == out.shape
+    assert torch.equal(ref.view(torch.int16), out.view(torch.int16)), (
+        f"hybrid pack mismatch rows={rows} h={h} top_k={top_k} threads={group_size}"
+    )
+
+
+def test_sve_hybrid_mk_rejects_non_k8_padding():
+    from fused_cpp import _moe_C
+
+    with pytest.raises(RuntimeError, match="multiple of 8"):
+        _moe_C.fused_moe_test_gather_pack_a_work(12, 68, 8)
 
 
 @pytest.mark.parametrize("top_k", [1, 2, 6])

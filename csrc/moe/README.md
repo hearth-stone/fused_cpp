@@ -52,6 +52,21 @@ The M1-M8 generated K loop uses the static M2/M4/M8 two-bank load/compute state
 machine. M9-M12 use the static M12 register-reuse schedule because the larger
 accumulator set cannot coexist with two complete A/B banks.
 
+Before W13, the fused SVE gather writes input routes directly into that M12/M8
+packed-A layout. It normally assigns complete physical M panels to workers. If
+the number of panels is smaller than the expert team, it instead flattens the
+panel and K dimensions into one adaptive work domain. Every cooperative K
+stripe contains at least 32 BF16 elements and starts on an eight-element K
+boundary; these boundaries advance the M12/M8 packed output by 192/128 bytes,
+so workers never write the same cache line. Consecutive stripes owned by one
+worker are coalesced before execution. K splitting is disabled when K is too
+short or M panels already occupy the team. The existing team barrier before
+W13 remains because all N owners consume the complete shared packed A.
+
+This is a gather/pack-A optimization, not a GEMM split. W13 and W2 retain their
+N-owner execution, and packed weights, packed-A layout, numerical order,
+backend ids, Python APIs, and Plan V2 semantics are unchanged.
+
 The standalone `Operation::kGemmF32` surface has no fused epilogue. Its
 M1/M2/M4/M8/M12 instruction schedules are compared directly, in the same
 process and with the same packed A/B buffers, against

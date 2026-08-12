@@ -43,6 +43,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("fused_moe_test_gather_pack_a_reorder_m8", &fused_moe_test_gather_pack_a_reorder_m8,
         "Test-only: fuse route gather with reorder-m8 packing.", py::arg("input"), py::arg("routes"), py::arg("top_k"),
         py::arg("K_pad"), py::call_guard<py::gil_scoped_release>());
+  m.def("fused_moe_test_gather_pack_a_work", &fused_moe_test_gather_pack_a_work,
+        "Test-only: return adaptive (tid, M panel, panel rows, K begin, K size) gather-pack work.",
+        py::arg("total_rows"), py::arg("K_pad"), py::arg("group_size"),
+        py::call_guard<py::gil_scoped_release>());
+  m.def("fused_moe_test_gather_pack_a_reorder_sve_hybrid", &fused_moe_test_gather_pack_a_reorder_sve_hybrid,
+        "Test-only: run all workers of the adaptive SVE hybrid gather-pack.", py::arg("input"), py::arg("routes"),
+        py::arg("top_k"), py::arg("K_pad"), py::arg("group_size"), py::call_guard<py::gil_scoped_release>());
   m.def("fused_moe_test_fused_w13_silu_packc", &fused_moe_test_fused_w13_silu_packc,
         "Test-only: run fused w13 SiLU-and-mul with packed-C store.", py::arg("A"), py::arg("w13"),
         py::arg("degree") = 5, py::call_guard<py::gil_scoped_release>());

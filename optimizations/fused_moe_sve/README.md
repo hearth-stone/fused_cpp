@@ -21,6 +21,29 @@ mixed M-by-N implementation. The actual mixed-MN experiment remains isolated
 in `bench_mn_split.cpp`; restore Git `8e9fcbd` only when reproducing the retired
 production adapter.
 
+## Adaptive M-by-K gather-pack
+
+The production fused-SVE gather/pack-A stage uses physical M12 panels plus at
+most one M8 tail panel. Complete panels remain the unit of work whenever they
+can occupy the expert team. For an underfilled team, the stage flattens
+`(M panel, K stripe)` into a single work sequence and divides that sequence
+across the existing team. This removes Gather-to-W13 idle time without changing
+the GEMM's N-split ownership.
+
+The minimum K stripe is 32 BF16 elements. Boundaries are aligned to K8, which
+maps to 192 bytes in an M12 packed panel and 128 bytes in an M8 packed panel;
+there is therefore no cross-worker output-cache-line sharing. A worker's
+adjacent stripes in the same panel are coalesced. The adaptive path is disabled
+when `K_pad < 64` or the M-panel count is at least the team width. All workers
+still meet at the existing pre-W13 barrier because every W13 N owner reads the
+complete shared packed A.
+
+On the eight-core Neoverse-V1 host, the complete eight-expert scheduled call
+improved by 2.3-12.6% at every sampled M in `{1,9,12,13,24,37}` with
+8T/expert; M=72 and M=96 controls did not regress. Correctness, commands,
+cache geometry, sample spread, and the adoption decision are recorded in
+[`results/amazon_8c_adaptive_mk_gather_pack_20260812.md`](results/amazon_8c_adaptive_mk_gather_pack_20260812.md).
+
 ## Xbyak exact-M compute kernels
 
 The default one-chunk SVE path generates W13 fused-SiLU/packC, W2 FP32, and W2

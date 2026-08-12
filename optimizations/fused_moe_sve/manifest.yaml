@@ -35,6 +35,44 @@ features:
       --contention-shapes 1x96 --w13-ranges 2 --w2-ranges 1
       --warmup 12 --runs 101
 
+  - id: packing.adaptive_mk_gather_pack
+    part: packing
+    status: enabled
+    implementation: csrc/moe/arm/common/fused_moe_bf16_tiled.cpp
+    hypothesis: >-
+      When an SVE expert team has fewer physical M12/M8 packed-A panels than
+      workers, flattening each panel with cache-line-aligned K stripes lets the
+      idle workers participate in fused gather-pack. A 32-BF16 minimum stripe
+      should improve complete scheduled-MoE median time by at least 2 percent
+      for the M=1,9,12,13,24,37 underfilled grid at 8T without regressing M=72
+      or M=96 controls by more than 2 percent. Packed-A layout, numerical order,
+      GEMM N ownership, and the pre-W13 dependency barrier remain unchanged.
+    depends_on: []
+    conflicts_with: []
+    correctness: >-
+      PYTHONPATH=src FUSED_CPP_MOE_SVE=1 taskset -c 0-7
+      .venv/bin/python -m pytest -q tests/test_moe_packa_fusion.py &&
+      PYTHONPATH=src FUSED_CPP_MOE_SVE=1 taskset -c 0-7
+      .venv/bin/python -m pytest -q tests/test_fused_moe_bf16_tiled.py
+      -k 'sve_m12_silu_and_w2_bf16_route_for_unit_top1 or
+      sve_expert_barrier_elision_reuses_dirty_scratch or
+      sve_plan_v2_route_slices_match_full_experts or
+      vllm_staged_matches_fused_sve_with_multiple_n_tasks'
+    benchmark: >-
+      PYTHONPATH=src OMP_NUM_THREADS=1 OMP_DYNAMIC=FALSE
+      MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1
+      taskset -c 0-7 .venv/bin/python
+      optimizations/fused_moe_sve/benchmarks/bench_xbyak_exact_m.py
+      --hidden 4096 --intermediate 512
+      --routes 1,9,12,13,24,37,72,96 --threads 8
+      --experts 16 --measurement-experts 8 --experts-per-wave 1
+      --warmup 5 --runs 31 --variants jit --switch-period 5
+    result: >-
+      Enabled on 2026-08-12. Complete-call medians improved by 2.3-12.6
+      percent for M=1..37 and did not regress at M=72/96 on the eight-core
+      Neoverse-V1 host. See
+      results/amazon_8c_adaptive_mk_gather_pack_20260812.md.
+
   - id: compute.xbyak_exact_m
     part: compute
     status: enabled
@@ -1388,6 +1426,7 @@ variants:
 
   - id: sve_production_one_kchunk
     features:
+      - packing.adaptive_mk_gather_pack
       - compute.xbyak_exact_m
       - compute.xbyak_double_buffer_kloop
     entrypoint: >-
@@ -1398,6 +1437,7 @@ variants:
   - id: sve_production_one_kchunk_hugetlbfs
     features:
       - weights.hugetlbfs_backing
+      - packing.adaptive_mk_gather_pack
       - compute.xbyak_exact_m
       - compute.xbyak_double_buffer_kloop
     entrypoint: >-
