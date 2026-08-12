@@ -2,7 +2,7 @@
 
 > 状态：调度问题定义的 source of truth。
 >
-> 最后更新：2026-08-09。
+> 最后更新：2026-08-12。
 >
 > 修改 planner 的决策变量、目标函数、硬约束、性能响应、线程宽度集合、调度语义、
 > rank 耦合方式或剪枝策略时，必须同步更新本文档及末尾变更记录。
@@ -1326,7 +1326,124 @@ $$
 One-hot 是线程宽度的等价求解器编码，不是剪枝。一般 active-set slowdown 会
 引入状态相关的非线性处理速率，需要额外变量或分段/枚举近似。
 
-### 6.4 Production cold search 的 native 并行编码
+### 6.4 可证明资源下界：LB0 与 mode-relaxed LP
+
+当前 planner 的最优性不能由某个已测 candidate 或 fixed-duration CP-SAT 单独证明。第一版
+下界因此不构造可执行计划，只放宽任务的离散 mode、placement、开始时间和 contention，保留
+任何真实执行都无法绕过的资源守恒与数据依赖。实现位于
+`planners/resource_lower_bound.py`；SVE fused expert 的当前适配位于
+`planners/sve_fused_expert_lower_bound.py`，不进入 production planner。该 adapter 的
+$T^*$ 是“固定当前 exact-M SVE kernel、允许所列全部 width/mode”的调度最优值，不是允许
+替换 GEMM 算法后的跨实现全局最优值。
+
+令 phase 集合为 $\mathcal J$，phase $j$ 的合法 mode 集合为 $\mathcal M_j$，资源集合为
+$\mathcal R$。mode $m$ 对资源 $r$ 的不可避免需求为 $q_{jmr}\ge0$，完整调度域的资源服务
+上界为 $C_r>0$。归一化系数为：
+
+$$
+c_{jmr}=\frac{q_{jmr}}{C_r}.
+$$
+
+对每条不可重叠依赖链 $p\in\mathcal P$，把 mode-local wall-time 下界
+$\ell_{jm}$ 当作该链对应的另一行系数：若 $j\in p$，则
+$c_{jmp}=\ell_{jm}$，否则为零。以下统一用 $a\in\mathcal A=\mathcal R\cup\mathcal P$
+表示资源行与链行。
+
+**独立约束下界 LB0。** 每一行允许独立选择对自身最有利的 mode：
+
+$$
+LB_a=\sum_{j\in\mathcal J}\min_{m\in\mathcal M_j}c_{jma},
+\qquad
+LB_0=\max_{a\in\mathcal A}LB_a.
+$$
+
+不同 $a$ 的最小值可以来自互不兼容的 mode，因此 $LB_0$ 故意很松。对任意真实计划，phase
+$j$ 最终采用的 mode $m_j$ 满足
+$c_{jm_ja}\ge\min_m c_{jma}$；资源在 makespan $T$ 内最多提供 $C_rT$，依赖链各 phase
+不能重叠，所以 $T\ge LB_a$ 对所有 $a$ 成立，进而：
+
+$$
+\boxed{LB_0\le T^*.}
+$$
+
+**mode-relaxed LP。** 为让所有资源行共享同一组 mode，引入凸组合
+$x_{jm}\ge0,\sum_mx_{jm}=1$：
+
+$$
+\begin{aligned}
+L_{LP}=\min\quad &T\\
+\text{s.t.}\quad
+&\sum_{j,m}c_{jma}x_{jm}\le T, &&\forall a\in\mathcal A,\\
+&\sum_mx_{jm}=1, &&\forall j\in\mathcal J,\\
+&x_{jm}\ge0.
+\end{aligned}
+$$
+
+任意真实离散 mode 选择都映射为 one-hot $x$，再删除 placement、gang 同步、不可抢占、
+contention 和离散性约束只会扩大可行域，因此：
+
+$$
+\boxed{LB_0\le L_{LP}\le T^*.}
+$$
+
+这里 LP 的 fractional mode 不是可执行计划，只是用于收紧下界。其对偶为：
+
+$$
+L_{LP}=\max_{\lambda\in\Delta_{|\mathcal A|}}
+\sum_j\min_m\sum_a\lambda_a c_{jma},
+\qquad
+\Delta_d=\{\lambda\ge0:\sum_a\lambda_a=1\}.
+$$
+
+任何 simplex 中的 $\lambda$ 都给出合法下界。实现优先用可选 `oracle` extra 中的 GLOP
+同时求 primal/dual；没有该依赖时使用 entropic mirror ascent。求解器浮点 objective 不作为
+最终证书：输出的 $\lambda$ 投影到分母 $2^{40}$ 的整数 simplex，再用 Python `Fraction`
+对原始输入系数重算 dual 并向下舍入；primal mixture 同样量化、精确重算并向上舍入。因此
+即使 solver 未闭合，仍有：
+
+$$
+L_{dual}^{cert}\le L_{LP}\le U_{primal}^{cert},
+$$
+
+报告同时给出绝对/相对 gap、整数对偶权重和 fractional stage mixture，可独立复核。
+
+**第一版 SVE lowering。** 对每个 active expert 生成
+`W13 -> W2` 两个 phase，并为声明的线程宽度生成 mode。需求来自当前 exact-M mapper：
+
+- physical/balanced BFMMLA work，包括 M1 的 M2 physical padding；
+- key-body instruction、L1 load 与 fused epilogue work；
+- 由 aggregate ceiling 和 busiest-lane per-core ceiling 推导的 $\ell_{jm}$；
+- 对具有 per-core ceiling $C_r^{(1)}$ 的服务，以
+  $q_{jm,core}=\max_r q_{jmr}/C_r^{(1)}$ 推导的总 core-time 下界；
+- 可选的每个 active expert W13/W2 packed weight compulsory DRAM 首读。
+
+这里不能用 $t\ell_{jm}$ 作为 core-time：当 N tile 不能被 $t$ 整除时，$\ell_{jm}$
+可能由 busiest lane 决定，而其他 lane 可以提前结束。aggregate demand 除以 per-core
+service ceiling 只要求所有 lane 合计必须消耗的 core-time，因此保持下界方向。
+
+该 lowering 只保留所有合法 stage window 都必须执行的 inner-loop、epilogue 与首读工作；
+省略 A/cache replay、range restart、gather、publication、merge 和 spill，因此不把 full-N
+窗口错误限定为唯一可行 mode，只会让下界更松。`include_weight_dram` 默认关闭；只有 invocation
+初态明确保证每份 active expert 权重至少从 DRAM 进入一次时才允许打开。
+
+严格性还取决于容量口径：$C_r$ 必须是完整可行域上的**硬件服务上界**。架构最大发射率、
+最大频率和内存通道理论上界可形成真实硬件证书；L1-hot GEMM、STREAM 或 PMU 实测峰值通常
+只是已达到的下限，不能无条件作为真实容量上界。后者产生的是 calibrated analytic-model
+下界，必须与 hardware-certified 下界分开标注。
+
+当前未进入下界的项包括 stage-window 特有 replay、LLC/L2 容量 configuration、TopK ready
+merge、跨 rank 通信和 NUMA placement；加入这些项前必须先证明其需求对声明初态和完整可行域
+不可避免。调用方还必须给出声明调度域内完整的合法线程宽度集合；漏掉一个实际允许的 mode
+可能抬高结果，此时证书只适用于显式受限域。该模块不改变第 7 节 production 搜索空间、剪枝
+或 runtime。
+
+**第一版验证。** 双资源、双 mode 的解析例中，两 mode 需求分别为 $(1,9)$ 与 $(9,1)$、
+容量均为 1：实现得到 $LB_0=1$、$L_{LP}=5$，而枚举离散 mode 的最优值为 9。单测还覆盖
+未收敛 mirror iterate 的 dual 有效性、critical chain、空 workload、非法 schema、JSON
+certificate、M1 exact-M physical padding，以及 N tile 不均衡时不使用 $t\ell_{jm}$ 高估
+core-time。
+
+### 6.5 Production cold search 的 native 并行编码
 
 schema-v2 empirical backend 的 cold miss 路径将剪枝后的 `IntervalPlanner`
 搜索原样编码到 C++。Python 只负责解析 profile、生成合法 width/shape 集合并
@@ -4356,3 +4473,4 @@ $t=16$ 的项只标定了 W13 轴，其 W2 项取全条带。宽度 $1,2,3,6,12$
 | 2026-08-10 | v1.05 | 修复优化治理索引与当前 window 模型文档：为 5 个 legacy retired feature/variant 补齐最后活动 Git 定位，并将 README/TODO 中“无 window/full-N 仅由线程宽度决定”的陈旧描述改为当前唯一的 $(t,\omega_s)$ 参数化；旧 split/range-count/byte-window 仍保持删除，Plan V2 的 per-task tile window 为零时回到 full owner stripe。仅修正文档与 provenance，不改变公式、planner 或 runtime。|
 | 2026-08-10 | v1.06 | 退役 production `FUSED_CPP_MOE_FUSED_2D_SPLIT` compatibility adapter：删除恒定返回 $t_M=1,t_N=t$ 的 2D plan/range structs、NEON/SVE `_2d` wrappers、normal/scheduled/async/planned-staged 分支和重复测试。该实现从未切 M，SVE wrappers 还强制 `row_begin=0`，所以其行为只是已有 N-split 的重复封装；真正的 mixed-MN 假设继续由隔离的 `bench_mn_split.cpp` Lab 路径验证，历史 production 适配器固定在 Git `8e9fcbd`。hierarchical N-split、Plan V2 $(t,\omega_s)$、planner 候选、cost model 公式和默认数值不变。|
 | 2026-08-10 | v1.07 | 删除 production `FUSED_CPP_MOE_STAGE_WINDOW_TILES` 实验环境适配器及其 process-static parser。stage window 继续由 Plan V2 的逐 task `task_w13_window_tiles/task_w2_window_tiles` 唯一表达，legacy scheduled/async 与 hierarchical fallback 明确使用 full owner stripe；校准 sweep 通过构造显式 Plan V2 复现，不再让进程环境隐式改写未指定窗口。历史适配器固定在 Git `208743e`。窗口计算语义、planner policy、cost model 公式、候选和默认 Plan V2 数值不变。|
+| 2026-08-12 | v1.16 | 增加与 production 解耦的第一版可证明 makespan 下界：通用层实现逐资源/critical-chain 的 `LB0` 和共享 fractional mode 的 mode-relaxed LP，并输出经整数 simplex 量化、`Fraction` 精确重算和定向舍入的 dual/primal certificate；优先使用 GLOP，缺少可选依赖时回退 entropic mirror ascent。SVE adapter 将当前 exact-M W13/W2 mapper 降为 BFMMLA、key instruction、L1 load、epilogue、core-time 和可选 compulsory-DRAM 需求；core-time 由 aggregate work/per-core ceiling 推导，不假设不均衡 N lane 等时结束。第一版省略 window replay、gather/merge、NUMA 与 contention，只提供安全但偏松的 GEMM-only 下界，不改变 production 候选、剪枝、cost model 或 runtime。|
