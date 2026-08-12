@@ -973,6 +973,56 @@ features:
       cpu_moe_schedule_optimization/cost_model/profiles/contention_async_amazon_c5_192c_dual_numa_tp4_sve_F512_E256_fulln_schema_v2_xbyak_exactm_20260727.json
       --route-dtype bf16 --warmup 5 --runs 21
 
+  - id: dispatch.large_small_core_partition
+    part: dispatch
+    status: experimental
+    owner: zhangxu
+    opened: 2026-08-11
+    decision_by: 2026-11-09
+    next_decision: >-
+      Replace isolated-LPT scoring with phase-local cross-class service, then
+      run held-out DSV4 seeds, mixed catalog workloads, and a second ARM host.
+    adoption_gate: >-
+      Absolute-time error must be at most 3 percent, selected measured regret
+      at most 2 percent, and no held-out workload may regress by more than
+      2 percent on either ARM machine.
+    implementation: >-
+      optimizations/fused_moe_sve/benchmarks/bench_vllm_staged_schedule.py and
+      optimizations/fused_moe_sve/benchmarks/capture_schedule_timeline.py
+    hypothesis: >-
+      Running large-route multi-thread teams and short-route single-thread
+      weight streams concurrently on disjoint NUMA-local core regions combines
+      compute/cache reuse with higher cold-B memory-level parallelism. The
+      first version uses one route threshold, calibrated fixed widths, and
+      independent LPT lanes; it does not alter Plan V2 or the native runtime.
+    depends_on:
+      - dispatch.full_n_team_stripes
+      - dispatch.stage_window_tiles
+      - store.w2_direct_route
+    conflicts_with:
+      - dispatch.global_stage_task_pool
+    correctness: >-
+      PYTHONPATH=src .venv/bin/python -m pytest -q
+      tests/test_moe_workload_catalog.py &&
+      PYTHONPATH=src .venv/bin/python -m ruff check
+      optimizations/fused_moe_sve/benchmarks/bench_vllm_staged_schedule.py
+      optimizations/fused_moe_sve/benchmarks/capture_schedule_timeline.py
+    benchmark: >-
+      FUSED_CPP_MOE_HUGETLBFS_PATH=/dev/hugepages-32M
+      numactl --physcpubind=0-95 --membind=0 .venv/bin/python
+      optimizations/fused_moe_sve/benchmarks/bench_vllm_staged_schedule.py
+      --preset dsv4-real-2048-seq70 --production-profile
+      cpu_moe_schedule_optimization/cost_model/profiles/contention_async_amazon_c5_192c_numa0_tp4_sve_F512_E256_fulln_schema_v2_xbyak_exactm_20260727.json
+      --route-dtype bf16 --warmup 5 --runs 51
+      --large-small-partition 48:48:8:1
+    result: >-
+      AmazonC5192Cores NUMA0 measured 11.625 ms and 13.301 TFLOP/s versus
+      strict 12x8T at 13.367 ms and 11.567 TFLOP/s (+14.99%). A separate
+      31-run confirmation measured +15.53%. Actual large/small completion skew
+      was 0.214 ms; memory-stall cycles fell 29.07%. The current model
+      overpredicts the candidate by 28.81%, so it remains outside production.
+      See results/amazon_192c_dsv4_large_small_partition_20260811.md.
+
   - id: planner.native_cold_search
     part: dispatch
     status: enabled
@@ -1456,6 +1506,19 @@ variants:
     entrypoint: >-
       bench_vllm_staged_schedule.py --dynamic-short-pool
       (forced-4T benchmark comparator using the native async executor)
+    status: experimental
+
+  - id: sve_large_small_core_partition
+    features:
+      - dispatch.large_small_core_partition
+      - dispatch.full_n_team_stripes
+      - dispatch.stage_window_tiles
+      - store.w2_direct_route
+      - store.w2_direct_bf16_route
+      - merge.sve_weighted_reduce
+    entrypoint: >-
+      bench_vllm_staged_schedule.py --large-small-partition M:LCORES:LT:ST
+      (benchmark-only strict Plan V2 comparator)
     status: experimental
 
   - id: sve_bounded_tail_route_fission

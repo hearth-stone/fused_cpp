@@ -263,6 +263,19 @@ Acceptance gates:
 - [ ] Add conservative per-mode hardware lower-bound durations and aggregate
   matrix/LLC/DRAM capacity bounds before interpreting the CP-SAT result as a
   physical performance certificate rather than a `T_iso` model oracle.
+- [x] Add a benchmark-only large/small route core partition for DSV4 TP4. Keep
+  the two classes on disjoint NUMA-local core regions, use independent LPT lane
+  chains, and preserve the production Plan V2 kernel/window/merge path. On the
+  192-core host's NUMA0, `48C x 8T` for `M>48` plus `48C x 1T` for `M<=48`
+  reduced the 51-run median from 13.367 to 11.625 ms (+14.99% throughput), with
+  0.214 ms measured class-completion skew.
+- [ ] Replace isolated-LPT scoring for the large/small partition with
+  phase-local compute/L2/LLC/DRAM offered demand and cross-class service
+  capacity. The current global simulator predicts 14.932 ms versus 11.593 ms
+  measured (+28.81%), and underestimates the small-region dilation by 2.93x.
+  Do not add this candidate to the production planner or plan cache until
+  absolute error is <=3%, selected regret is <=2%, and no held-out workload
+  regresses by more than 2% on two ARM machines.
 - [x] Validate the fixed-lane temporal-order seeds on the 192-core host before
   interpreting their modeled gain as runtime gain. Use interleaved LPT/temporal
   calls for every catalog workload, report strict-only E2E and stage times, and

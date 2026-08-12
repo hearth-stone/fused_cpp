@@ -201,8 +201,8 @@ Raw records:
 - `static_tail_repartition_active8_51runs_timing.json`
 - `static_tail_repartition_active8_32aligned_51runs.json`
 - `static_tail_repartition_active8_reverse_51runs.json`
-- `active8_static_tail_{24,32aligned,48}_timeline.json`
-- `active8_static_tail_{24,32aligned,48}_timeline.trace`
+- `tmp/moe_timeline/moe256-active-set-8/active8_static_tail_{24,32aligned,48}_timeline.json`
+- `tmp/moe_timeline/moe256-active-set-8/active8_static_tail_{24,32aligned,48}_timeline.trace`
 - `static_tail_calibration_active8_101runs_20260730.json`
 - `active8_calibrated_auto_51runs_20260730.json`
 - `active8_tail_msplit_51runs_20260730.json`

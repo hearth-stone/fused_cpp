@@ -33,6 +33,8 @@ from fused_cpp.moe import (  # noqa: E402
     fused_moe_bf16_tiled_vllm_staged,
     prepare_fused_moe_bf16_tiled_weights,
 )
+from fused_cpp.moe.plan import upgrade_legacy_async_plan  # noqa: E402
+from stage_window_policy import default_stage_window_policy  # noqa: E402
 from workload_catalog import default_offline_workloads  # noqa: E402
 
 
@@ -44,6 +46,8 @@ VLLM_VARIANT = "vllm_staged"
 MATCHED_STAGED_VARIANT = "planned_staged_matched"
 FINE_STAGED_VARIANT = "planned_staged_independent"
 STATIC_TAIL_VARIANT_PREFIX = "static_tail"
+LARGE_SMALL_VARIANT_PREFIX = "large_small"
+LARGE_MEDIUM_STREAM_VARIANT_PREFIX = "large_medium_stream"
 
 
 def parse_args() -> argparse.Namespace:
@@ -93,6 +97,27 @@ def parse_args() -> argparse.Namespace:
         help="experts above this route count use the 16T head of the static split DAG",
     )
     parser.add_argument(
+        "--large-small-partition",
+        action="append",
+        default=[],
+        metavar="M:LCORES:LT:ST",
+        help=(
+            "add a strict Plan V2 comparator with routes>M on LCORES using LT threads "
+            "and the remaining cores running routes<=M with ST threads; repeatable"
+        ),
+    )
+    parser.add_argument(
+        "--large-medium-stream-partition",
+        action="append",
+        default=[],
+        metavar="LM:SM:LCORES:LT:SCORES",
+        help=(
+            "add a strict Plan V2 comparator with routes>LM on LCORES using LT threads, "
+            "SM<routes<=LM on 1T lanes, and routes<=SM on SCORES persistent 1T lanes; "
+            "repeatable"
+        ),
+    )
+    parser.add_argument(
         "--static-tail-widths",
         help=(
             "comma-separated widths for a 6x16T-to-2xWT static tail experiment; "
@@ -112,6 +137,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--runs", type=int, default=11)
     parser.add_argument("--seed", type=int, default=20260717)
     parser.add_argument("--stage-timing", action="store_true")
+    parser.add_argument(
+        "--profile-variant",
+        help="run one named variant in a final tight loop for process-level PMU sampling",
+    )
+    parser.add_argument(
+        "--profile-runs",
+        type=int,
+        default=0,
+        help="number of final --profile-variant iterations (zero disables the profiling loop)",
+    )
     parser.add_argument("--output", type=Path)
     return parser.parse_args()
 
@@ -126,6 +161,39 @@ def parse_integer_list(value: str) -> list[int]:
     if not values:
         raise ValueError("at least one integer is required")
     return values
+
+
+def parse_large_small_partition(value: str) -> tuple[int, int, int, int]:
+    try:
+        fields = tuple(int(item) for item in value.split(":"))
+    except ValueError as exc:
+        raise ValueError("large/small partition must be M:LCORES:LT:ST") from exc
+    if len(fields) != 4 or min(fields) <= 0:
+        raise ValueError(
+            "large/small partition must contain four positive integers: M:LCORES:LT:ST"
+        )
+    return fields
+
+
+def parse_large_medium_stream_partition(value: str) -> tuple[int, int, int, int, int]:
+    try:
+        fields = tuple(int(item) for item in value.split(":"))
+    except ValueError as exc:
+        raise ValueError(
+            "large/medium/stream partition must be LM:SM:LCORES:LT:SCORES"
+        ) from exc
+    if len(fields) != 5 or min(fields) <= 0:
+        raise ValueError(
+            "large/medium/stream partition must contain five positive integers: "
+            "LM:SM:LCORES:LT:SCORES"
+        )
+    large_threshold, short_threshold, *_ = fields
+    if short_threshold >= large_threshold:
+        raise ValueError(
+            "large/medium/stream partition requires 0 < SM < LM, got "
+            f"SM={short_threshold} LM={large_threshold}"
+        )
+    return fields
 
 
 def make_static_tail_repartition_plan(
@@ -499,6 +567,286 @@ def make_static_16t_to_4x4t_schedule(
     return schedule, metadata
 
 
+def _make_disjoint_lpt_partition_plan(
+    *,
+    cpu_ids: list[int],
+    regions: list[tuple[str, list[tuple[int, int]], int, int, int]],
+    iso_time_ns: Callable[[int, int], float],
+    stage_window_select: Callable[[int, int], tuple[int, int]],
+    early_merge: bool | None,
+    context: str,
+) -> tuple[AsyncMoEPlanV2, dict[str, dict[str, object]]]:
+    """Build fixed, disjoint LPT regions that all become runnable at call start."""
+    expected_begin = 0
+    for label, jobs, region_begin, core_count, width in regions:
+        if not jobs:
+            raise ValueError(f"{context} region {label!r} has no active experts")
+        if min(core_count, width) <= 0 or core_count % width:
+            raise ValueError(
+                f"{context} region {label!r} requires positive core_count divisible by width, "
+                f"got core_count={core_count} width={width}"
+            )
+        if region_begin != expected_begin or region_begin % width:
+            raise ValueError(
+                f"{context} region {label!r} must be contiguous and width-aligned: "
+                f"expected_begin={expected_begin} region_begin={region_begin} width={width}"
+            )
+        expected_begin += core_count
+    if expected_begin != len(cpu_ids):
+        raise ValueError(
+            f"{context} regions cover {expected_begin} cores, expected {len(cpu_ids)}"
+        )
+
+    iso_costs: dict[tuple[int, int], float] = {}
+
+    def isolated_cost(routes: int, width: int) -> float:
+        key = (routes, width)
+        if key not in iso_costs:
+            try:
+                value = float(iso_time_ns(routes, width))
+            except KeyError as exc:
+                raise ValueError(
+                    f"{context} has no isolated calibration for threads={width}"
+                ) from exc
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError(
+                    f"isolated time must be finite and positive for routes={routes}, "
+                    f"threads={width}, got {value}"
+                )
+            iso_costs[key] = value
+        return iso_costs[key]
+
+    task_experts: list[int] = []
+    task_core_begins: list[int] = []
+    task_threads: list[int] = []
+    task_dep_offsets = [0]
+    task_deps: list[int] = []
+    task_w13_windows: list[int] = []
+    task_w2_windows: list[int] = []
+    region_metadata: dict[str, dict[str, object]] = {}
+
+    for label, jobs, region_begin, core_count, width in regions:
+        lane_count = core_count // width
+        lane_jobs: list[list[tuple[int, int]]] = [[] for _ in range(lane_count)]
+        lane_loads = [0.0] * lane_count
+        order = sorted(
+            jobs,
+            key=lambda job: (-isolated_cost(job[1], width), -job[1], job[0]),
+        )
+        queue = [(0.0, lane) for lane in range(lane_count)]
+        heapq.heapify(queue)
+        for job in order:
+            load, lane = heapq.heappop(queue)
+            lane_jobs[lane].append(job)
+            load += isolated_cost(job[1], width)
+            lane_loads[lane] = load
+            heapq.heappush(queue, (load, lane))
+
+        for lane, assigned_jobs in enumerate(lane_jobs):
+            previous: int | None = None
+            for expert, routes in assigned_jobs:
+                task_id = len(task_experts)
+                task_experts.append(expert)
+                task_core_begins.append(region_begin + lane * width)
+                task_threads.append(width)
+                if previous is not None:
+                    task_deps.append(previous)
+                task_dep_offsets.append(len(task_deps))
+                w13, w2 = stage_window_select(routes, width)
+                task_w13_windows.append(int(w13))
+                task_w2_windows.append(int(w2))
+                previous = task_id
+
+        region_metadata[label] = {
+            "core_begin": region_begin,
+            "core_count": core_count,
+            "team_threads": width,
+            "tasks": len(jobs),
+            "routes": sum(routes for _, routes in jobs),
+            "lane_task_counts": [len(lane) for lane in lane_jobs],
+            "lane_isolated_ms": [value / 1.0e6 for value in lane_loads],
+            "isolated_core_ms": sum(lane_loads) / 1.0e6,
+            "predicted_ms": max(lane_loads) / 1.0e6,
+        }
+
+    bridge = upgrade_legacy_async_plan(
+        {
+            "num_threads": len(cpu_ids),
+            "thread_cpu_ids": cpu_ids,
+            "task_expert_ids": task_experts,
+            "task_core_begins": task_core_begins,
+            "task_threads": task_threads,
+            "task_dep_offsets": task_dep_offsets,
+            "task_deps": task_deps,
+        }
+    )
+    bridge["early_merge"] = early_merge
+    bridge["task_w13_window_tiles"] = task_w13_windows
+    bridge["task_w2_window_tiles"] = task_w2_windows
+    return AsyncMoEPlanV2.from_dict(bridge), region_metadata
+
+
+def make_large_small_partition_plan(
+    route_counts: torch.Tensor,
+    *,
+    cpu_ids: list[int],
+    route_threshold: int,
+    large_core_count: int,
+    large_team_threads: int,
+    small_team_threads: int,
+    iso_time_ns: Callable[[int, int], float],
+    stage_window_select: Callable[[int, int], tuple[int, int]],
+    early_merge: bool | None,
+) -> tuple[AsyncMoEPlanV2, dict[str, object]]:
+    """Run large- and small-route LPT lanes on disjoint core regions."""
+    if route_counts.dim() != 1:
+        raise ValueError(f"route_counts must be one-dimensional, got shape={tuple(route_counts.shape)}")
+    num_threads = len(cpu_ids)
+    small_core_count = num_threads - large_core_count
+    if route_threshold <= 0:
+        raise ValueError("large/small route threshold must be positive")
+    if not 0 < large_core_count < num_threads:
+        raise ValueError("large_core_count must leave non-empty large and small regions")
+    if min(large_team_threads, small_team_threads) <= 0:
+        raise ValueError("large and small team widths must be positive")
+    if large_core_count % large_team_threads:
+        raise ValueError("large_core_count must be divisible by large_team_threads")
+    if small_core_count % small_team_threads:
+        raise ValueError("remaining small-core region must be divisible by small_team_threads")
+    if large_core_count % small_team_threads:
+        raise ValueError("small-core region must begin on a small-team boundary")
+    jobs = [(expert, int(routes)) for expert, routes in enumerate(route_counts.tolist()) if routes > 0]
+    large_jobs = [job for job in jobs if job[1] > route_threshold]
+    small_jobs = [job for job in jobs if job[1] <= route_threshold]
+    if not large_jobs or not small_jobs:
+        raise ValueError(
+            "large/small partition requires active experts on both sides of the threshold: "
+            f"large={len(large_jobs)} small={len(small_jobs)} threshold={route_threshold}"
+        )
+
+    plan, regions = _make_disjoint_lpt_partition_plan(
+        cpu_ids=cpu_ids,
+        regions=[
+            ("large", large_jobs, 0, large_core_count, large_team_threads),
+            ("small", small_jobs, large_core_count, small_core_count, small_team_threads),
+        ],
+        iso_time_ns=iso_time_ns,
+        stage_window_select=stage_window_select,
+        early_merge=early_merge,
+        context="large/small partition",
+    )
+    large = regions["large"]
+    small = regions["small"]
+    metadata = {
+        "route_threshold": route_threshold,
+        "large_core_count": large_core_count,
+        "small_core_count": small_core_count,
+        "large_team_threads": large_team_threads,
+        "small_team_threads": small_team_threads,
+        "large_tasks": len(large_jobs),
+        "small_tasks": len(small_jobs),
+        "large_lane_task_counts": large["lane_task_counts"],
+        "small_lane_task_counts": small["lane_task_counts"],
+        "large_lane_isolated_ms": large["lane_isolated_ms"],
+        "small_lane_isolated_ms": small["lane_isolated_ms"],
+        "predicted_large_ms": large["predicted_ms"],
+        "predicted_small_ms": small["predicted_ms"],
+        "predicted_isolated_makespan_ms": max(
+            float(large["predicted_ms"]), float(small["predicted_ms"])
+        ),
+    }
+    return plan, metadata
+
+
+def make_large_medium_stream_partition_plan(
+    route_counts: torch.Tensor,
+    *,
+    cpu_ids: list[int],
+    large_route_threshold: int,
+    short_route_threshold: int,
+    large_core_count: int,
+    large_team_threads: int,
+    short_stream_core_count: int,
+    iso_time_ns: Callable[[int, int], float],
+    stage_window_select: Callable[[int, int], tuple[int, int]],
+    early_merge: bool | None,
+) -> tuple[AsyncMoEPlanV2, dict[str, object]]:
+    """Keep a bounded set of 1T cold-weight streams active beside large/medium work."""
+    if route_counts.dim() != 1:
+        raise ValueError(f"route_counts must be one-dimensional, got shape={tuple(route_counts.shape)}")
+    if not 0 < short_route_threshold < large_route_threshold:
+        raise ValueError(
+            "large/medium/stream thresholds must satisfy 0 < short < large, got "
+            f"short={short_route_threshold} large={large_route_threshold}"
+        )
+    num_threads = len(cpu_ids)
+    medium_core_count = num_threads - large_core_count - short_stream_core_count
+    if min(large_core_count, medium_core_count, short_stream_core_count) <= 0:
+        raise ValueError(
+            "large/medium/stream partition must leave non-empty large, medium, and short regions"
+        )
+    if large_team_threads <= 0 or large_core_count % large_team_threads:
+        raise ValueError(
+            "large_core_count must be divisible by a positive large_team_threads"
+        )
+
+    jobs = [(expert, int(routes)) for expert, routes in enumerate(route_counts.tolist()) if routes > 0]
+    large_jobs = [job for job in jobs if job[1] > large_route_threshold]
+    medium_jobs = [
+        job for job in jobs if short_route_threshold < job[1] <= large_route_threshold
+    ]
+    short_jobs = [job for job in jobs if job[1] <= short_route_threshold]
+    if not large_jobs or not medium_jobs or not short_jobs:
+        raise ValueError(
+            "large/medium/stream partition requires active experts in all three classes: "
+            f"large={len(large_jobs)} medium={len(medium_jobs)} short={len(short_jobs)}"
+        )
+
+    short_begin = large_core_count + medium_core_count
+    plan, regions = _make_disjoint_lpt_partition_plan(
+        cpu_ids=cpu_ids,
+        regions=[
+            ("large", large_jobs, 0, large_core_count, large_team_threads),
+            ("medium", medium_jobs, large_core_count, medium_core_count, 1),
+            ("short", short_jobs, short_begin, short_stream_core_count, 1),
+        ],
+        iso_time_ns=iso_time_ns,
+        stage_window_select=stage_window_select,
+        early_merge=early_merge,
+        context="large/medium/stream partition",
+    )
+    predicted = {
+        label: float(region["predicted_ms"]) for label, region in regions.items()
+    }
+    return plan, {
+        "large_route_threshold": large_route_threshold,
+        "short_route_threshold": short_route_threshold,
+        "large_core_count": large_core_count,
+        "medium_core_count": medium_core_count,
+        "short_stream_core_count": short_stream_core_count,
+        "large_team_threads": large_team_threads,
+        "medium_team_threads": 1,
+        "short_team_threads": 1,
+        "large_tasks": len(large_jobs),
+        "medium_tasks": len(medium_jobs),
+        "short_tasks": len(short_jobs),
+        "large_routes": regions["large"]["routes"],
+        "medium_routes": regions["medium"]["routes"],
+        "short_routes": regions["short"]["routes"],
+        "short_isolated_core_ms": regions["short"]["isolated_core_ms"],
+        "large_lane_task_counts": regions["large"]["lane_task_counts"],
+        "medium_lane_task_counts": regions["medium"]["lane_task_counts"],
+        "short_lane_task_counts": regions["short"]["lane_task_counts"],
+        "large_lane_isolated_ms": regions["large"]["lane_isolated_ms"],
+        "medium_lane_isolated_ms": regions["medium"]["lane_isolated_ms"],
+        "short_lane_isolated_ms": regions["short"]["lane_isolated_ms"],
+        "predicted_large_ms": predicted["large"],
+        "predicted_medium_ms": predicted["medium"],
+        "predicted_short_ms": predicted["short"],
+        "predicted_isolated_makespan_ms": max(predicted.values()),
+    }
+
+
 def make_production_schedule(
     route_counts: torch.Tensor,
     topk_ids: torch.Tensor,
@@ -605,6 +953,7 @@ def make_production_schedule(
             "extension_hash_match": runtime_extension_sha256 == policy.extension_sha256,
             "shape": list(auto_spec["shape"]),
             "strict_shape": list(strict_spec["shape"]),
+            "backend_n_tile": int(policy.backend_n_tile),
             "execution_mode": auto_spec["execution_mode"],
             "tail_pool_threads": auto_spec["tail_pool_threads"],
             "tail_pool_max_routes": auto_spec["tail_pool_max_routes"],
@@ -615,9 +964,13 @@ def make_production_schedule(
             "tail_repartition_candidates": cold_auto_metadata["tail_repartition_candidates"],
             "task_worker_window_pairs_bytes": sorted(
                 {
-                    f"{model.stage_bytes_per_worker('w13', int(task[3]), int(task[1]))}:"
-                    f"{model.stage_bytes_per_worker('w2', int(task[3]), int(task[1]))}"
-                    for task in auto_spec["tasks"]
+                    f"{model.stage_bytes_per_worker('w13', int(width), int(route_counts[int(expert)]))}:"
+                    f"{model.stage_bytes_per_worker('w2', int(width), int(route_counts[int(expert)]))}"
+                    for expert, width in zip(
+                        auto_plan.task_expert_ids.tolist(),
+                        auto_plan.task_threads.tolist(),
+                        strict=True,
+                    )
                 }
             ),
             "cold_plan_ms": cold_plan_ns / 1.0e6,
@@ -652,6 +1005,10 @@ def main() -> int:
     )
     if min(positive) <= 0 or args.warmup < 0:
         raise ValueError("shapes, threads, and runs must be positive; warmup must be non-negative")
+    if args.profile_runs < 0:
+        raise ValueError("--profile-runs must be non-negative")
+    if bool(args.profile_variant) != (args.profile_runs > 0):
+        raise ValueError("--profile-variant and a positive --profile-runs must be specified together")
     if args.top_k > args.experts:
         raise ValueError("top-k cannot exceed experts")
     if args.hidden % 8 != 0 or args.intermediate % 8 != 0:
@@ -663,6 +1020,15 @@ def main() -> int:
         if args.static_tail_widths is not None
         else []
     )
+    large_small_specs = [parse_large_small_partition(value) for value in args.large_small_partition]
+    large_medium_stream_specs = [
+        parse_large_medium_stream_partition(value)
+        for value in args.large_medium_stream_partition
+    ]
+    if len(large_small_specs) != len(set(large_small_specs)):
+        raise ValueError("duplicate --large-small-partition specifications")
+    if len(large_medium_stream_specs) != len(set(large_medium_stream_specs)):
+        raise ValueError("duplicate --large-medium-stream-partition specifications")
     if static_tail_widths and args.production_profile is None:
         raise ValueError("--static-tail-widths requires --production-profile")
     if args.static_tail_m_split and args.production_profile is None:
@@ -671,6 +1037,10 @@ def main() -> int:
         raise ValueError("--static-16-to-4 requires --production-profile for isolated-time lane assignment")
     if args.dynamic_short_pool and args.production_profile is None:
         raise ValueError("--dynamic-short-pool requires --production-profile")
+    if large_small_specs and args.production_profile is None:
+        raise ValueError("--large-small-partition requires --production-profile")
+    if large_medium_stream_specs and args.production_profile is None:
+        raise ValueError("--large-medium-stream-partition requires --production-profile")
     if args.dynamic_short_pool and (args.static_long_route_threshold <= 0 or args.threads % 4 != 0):
         raise ValueError("--dynamic-short-pool requires a positive route threshold and threads divisible by 4")
 
@@ -692,6 +1062,10 @@ def main() -> int:
     matched_staged_plans: tuple[AsyncMoEPlanV2, AsyncMoEPlanV2] | None = None
     fine_staged_plans: tuple[AsyncMoEPlanV2, AsyncMoEPlanV2] | None = None
     static_tail_plans: dict[str, AsyncMoEPlanV2] = {}
+    large_small_plans: dict[str, AsyncMoEPlanV2] = {}
+    large_small_metadata: dict[str, dict[str, object]] = {}
+    large_medium_stream_plans: dict[str, AsyncMoEPlanV2] = {}
+    large_medium_stream_metadata: dict[str, dict[str, object]] = {}
     if args.production_profile is None:
         baseline_variant = "fixed_team_async"
         schedule = make_fixed_team_schedule(
@@ -744,6 +1118,68 @@ def main() -> int:
                     profile=args.production_profile,
                     layout=layout,
                 )
+        if large_small_specs or large_medium_stream_specs:
+            assert production_plan is not None
+            assert planner_metadata is not None
+            assert iso_time_ns is not None
+            window_policy = default_stage_window_policy(
+                hidden_size=args.hidden,
+                intermediate_size=args.intermediate,
+                backend_n_tile=int(planner_metadata["backend_n_tile"]),
+            )
+            if window_policy is None:
+                def stage_window_select(routes: int, width: int) -> tuple[int, int]:
+                    del routes, width
+                    return (0, 0)
+            else:
+                stage_window_select = window_policy.select
+            for threshold, large_cores, large_width, small_width in large_small_specs:
+                variant = (
+                    f"{LARGE_SMALL_VARIANT_PREFIX}_m{threshold}_"
+                    f"l{large_cores}x{large_width}t_"
+                    f"s{args.threads - large_cores}x{small_width}t"
+                )
+                plan, metadata = make_large_small_partition_plan(
+                    route_counts,
+                    cpu_ids=cpu_ids,
+                    route_threshold=threshold,
+                    large_core_count=large_cores,
+                    large_team_threads=large_width,
+                    small_team_threads=small_width,
+                    iso_time_ns=iso_time_ns,
+                    stage_window_select=stage_window_select,
+                    early_merge=production_plan.early_merge,
+                )
+                large_small_plans[variant] = plan
+                large_small_metadata[variant] = metadata
+            for (
+                large_threshold,
+                short_threshold,
+                large_cores,
+                large_width,
+                short_cores,
+            ) in large_medium_stream_specs:
+                medium_cores = args.threads - large_cores - short_cores
+                variant = (
+                    f"{LARGE_MEDIUM_STREAM_VARIANT_PREFIX}_"
+                    f"lm{large_threshold}_sm{short_threshold}_"
+                    f"l{large_cores}x{large_width}t_"
+                    f"m{medium_cores}x1t_s{short_cores}x1t"
+                )
+                plan, metadata = make_large_medium_stream_partition_plan(
+                    route_counts,
+                    cpu_ids=cpu_ids,
+                    large_route_threshold=large_threshold,
+                    short_route_threshold=short_threshold,
+                    large_core_count=large_cores,
+                    large_team_threads=large_width,
+                    short_stream_core_count=short_cores,
+                    iso_time_ns=iso_time_ns,
+                    stage_window_select=stage_window_select,
+                    early_merge=production_plan.early_merge,
+                )
+                large_medium_stream_plans[variant] = plan
+                large_medium_stream_metadata[variant] = metadata
     static_schedule: tuple[torch.Tensor, ...] | None = None
     static_metadata: dict[str, object] | None = None
     ready_token_policy_variants: dict[str, tuple[bool, int, bool]] = {}
@@ -776,10 +1212,16 @@ def main() -> int:
     if args.dynamic_short_pool:
         variant_names.append(DYNAMIC_POOL_VARIANT)
     variant_names.extend(static_tail_plans)
+    variant_names.extend(large_small_plans)
+    variant_names.extend(large_medium_stream_plans)
     if matched_staged_plans is not None:
         variant_names.extend((MATCHED_STAGED_VARIANT, FINE_STAGED_VARIANT))
     variant_names.append(VLLM_VARIANT)
     variants = tuple(variant_names)
+    if args.profile_variant is not None and args.profile_variant not in variants:
+        raise ValueError(
+            f"unknown --profile-variant {args.profile_variant!r}; available: {', '.join(variants)}"
+        )
     ready_token_merge = args.production_ready_token_merge
     if ready_token_merge is None:
         ready_token_merge = args.production_profile is not None
@@ -829,6 +1271,26 @@ def main() -> int:
                 topk_weights,
                 topk_ids,
                 static_tail_plans[name],
+                global_num_experts=args.experts,
+                out=outputs[name],
+            )
+        if name in large_small_plans:
+            return fused_moe_bf16_tiled_async_plan(
+                hidden,
+                packed,
+                topk_weights,
+                topk_ids,
+                large_small_plans[name],
+                global_num_experts=args.experts,
+                out=outputs[name],
+            )
+        if name in large_medium_stream_plans:
+            return fused_moe_bf16_tiled_async_plan(
+                hidden,
+                packed,
+                topk_weights,
+                topk_ids,
+                large_medium_stream_plans[name],
                 global_num_experts=args.experts,
                 out=outputs[name],
             )
@@ -936,6 +1398,20 @@ def main() -> int:
             run(name)
         os.environ["FUSED_CPP_MOE_STAGE_TIMING"] = "0"
 
+    profile_loop: dict[str, object] | None = None
+    if args.profile_variant is not None:
+        begin = time.perf_counter_ns()
+        for _ in range(args.profile_runs):
+            result = run(args.profile_variant)
+            sink ^= int(result.view(torch.int16)[0, 0])
+        elapsed_ns = time.perf_counter_ns() - begin
+        profile_loop = {
+            "variant": args.profile_variant,
+            "runs": args.profile_runs,
+            "elapsed_ms": elapsed_ns / 1.0e6,
+            "mean_ms": elapsed_ns / args.profile_runs / 1.0e6,
+        }
+
     total_flops = 6 * args.tokens * args.top_k * args.hidden * args.intermediate
     baseline_ms = statistics.median(samples[baseline_variant])
     auto_ms = statistics.median(samples[AUTO_VARIANT]) if AUTO_VARIANT in samples else baseline_ms
@@ -1013,6 +1489,9 @@ def main() -> int:
             }
             if static_tail_plans
             else None,
+            "large_small_partitions": large_small_metadata or None,
+            "large_medium_stream_partitions": large_medium_stream_metadata or None,
+            "profile_loop": profile_loop,
             "warmup": args.warmup,
             "runs": args.runs,
         },
@@ -1042,6 +1521,11 @@ def main() -> int:
             f"{record['variant']:<24} {record['median_ms']:>9.3f} "
             f"{record['aggregate_tflops']:>9.3f} {record['gain_pct']:>10.2f} "
             f"{record['p10_ms']:>10.3f} {record['p90_ms']:>10.3f}"
+        )
+    if profile_loop is not None:
+        print(
+            f"profile_loop variant={profile_loop['variant']} runs={profile_loop['runs']} "
+            f"mean_ms={profile_loop['mean_ms']:.3f}"
         )
     if args.output is not None:
         args.output.parent.mkdir(parents=True, exist_ok=True)

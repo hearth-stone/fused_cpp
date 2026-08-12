@@ -22,8 +22,12 @@ PLANNER_DIR = REPO_ROOT / "cpu_moe_schedule_optimization" / "planners"
 sys.path[:0] = [str(REPO_ROOT / "src"), str(COST_MODEL_DIR), str(PLANNER_DIR)]
 
 from bench_vllm_staged_schedule import (  # noqa: E402
+    make_large_medium_stream_partition_plan,
+    make_large_small_partition_plan,
     make_static_tail_repartition_plan,
     materialize_topk_ids,
+    parse_large_medium_stream_partition,
+    parse_large_small_partition,
 )
 from fused_cpp.moe import (  # noqa: E402
     AsyncMoEPlanV2,
@@ -36,6 +40,7 @@ from schedule_timeline_metrics import (  # noqa: E402
     DEFAULT_GFLOPS_COLOR_MAX,
     enrich_actual_timeline,
 )
+from stage_window_policy import default_stage_window_policy  # noqa: E402
 from workload_catalog import default_offline_workloads  # noqa: E402
 
 
@@ -46,14 +51,7 @@ DEFAULT_PROFILE = (
     / "profiles"
     / "contention_async_amazon_c5_192c_numa0_tp4_sve_F512_E256_fulln_schema_v2_xbyak_exactm_20260727.json"
 )
-DEFAULT_OUTPUT = (
-    REPO_ROOT
-    / "optimizations"
-    / "fused_moe_sve"
-    / "results"
-    / "amazon_192c_active8_schedule_timeline.json"
-)
-DEFAULT_TRACE = DEFAULT_OUTPUT.with_suffix(".trace")
+TIMELINE_OUTPUT_ROOT = REPO_ROOT / "tmp" / "moe_timeline"
 
 
 def parse_args() -> argparse.Namespace:
@@ -65,6 +63,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--force-shape",
         help="force a comma-separated strict lane shape, for example 16,16,16,16,16,16",
+    )
+    parser.add_argument(
+        "--large-small-partition",
+        metavar="M:LCORES:LT:ST",
+        help=(
+            "capture a strict plan with routes>M on LCORES using LT threads and "
+            "the remaining cores running routes<=M with ST threads"
+        ),
+    )
+    parser.add_argument(
+        "--large-medium-stream-partition",
+        metavar="LM:SM:LCORES:LT:SCORES",
+        help=(
+            "capture a strict plan with routes>LM on LCORES using LT threads, "
+            "SM<routes<=LM on 1T lanes, and routes<=SM on SCORES persistent 1T lanes"
+        ),
     )
     parser.add_argument(
         "--force-tail-pool-threads",
@@ -88,8 +102,16 @@ def parse_args() -> argparse.Namespace:
         default="auto",
         help="override Plan V2 early merge without changing the planned task graph",
     )
-    parser.add_argument("--trace-file", type=Path, default=DEFAULT_TRACE)
-    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument(
+        "--trace-file",
+        type=Path,
+        help="raw trace path; defaults beside --output with a .trace suffix",
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        help="timeline JSON path; defaults to tmp/moe_timeline/<preset>/default.json",
+    )
     parser.add_argument(
         "--static-tail-width",
         type=int,
@@ -98,12 +120,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--strict-tail-steal",
         action="store_true",
-        help="enable equal-width strict tail task stealing for the captured run",
+        help="enable same-width, same-NUMA strict tail task stealing for the captured run",
     )
     parser.add_argument(
         "--compare-strict-tail-steal",
         action="store_true",
         help="interleave strict and strict-tail-steal timing on the same packed weights",
+    )
+    parser.add_argument(
+        "--stage-timing",
+        action="store_true",
+        help="enable native stage/policy diagnostics; disabled by default to minimize trace overhead",
     )
     parser.add_argument(
         "--plan-only",
@@ -122,22 +149,178 @@ def parse_shape(value: str | None) -> tuple[int, ...] | None:
     return shape
 
 
+def resolve_output_paths(args: argparse.Namespace) -> None:
+    if args.output is None:
+        args.output = TIMELINE_OUTPUT_ROOT / args.preset / "default.json"
+    if args.trace_file is None:
+        args.trace_file = args.output.with_suffix(".trace")
+
+
+def plan_to_bridge(plan: AsyncMoEPlanV2) -> dict[str, Any]:
+    fields = (
+        "thread_cpu_ids",
+        "task_expert_ids",
+        "task_core_begins",
+        "task_threads",
+        "task_dep_offsets",
+        "task_deps",
+        "task_preferred_threads",
+        "task_min_threads",
+        "task_max_threads",
+        "task_allowed_thread_offsets",
+        "task_allowed_threads",
+        "task_placement_modes",
+        "task_numa_nodes",
+        "task_stage_ids",
+        "task_resize_points",
+        "task_range_granularities",
+        "task_w13_window_tiles",
+        "task_w2_window_tiles",
+    )
+    return {
+        "plan_version": plan.plan_version,
+        "num_threads": plan.num_threads,
+        "execution_mode": plan.execution_mode,
+        "early_merge": plan.early_merge,
+        **{name: getattr(plan, name).tolist() for name in fields},
+    }
+
+
 def build_plan_spec(
     args: argparse.Namespace,
     model: ContentionCostModel,
     workload: Any,
     cpu_ids: list[int],
+    topk_ids: torch.Tensor | None = None,
 ) -> tuple[dict[str, Any], PlannedMoE]:
     planner = PlannedMoE(
         model,
         args.threads,
         cpu_ids=cpu_ids,
     )
+    if args.large_medium_stream_partition is not None:
+        (
+            large_threshold,
+            short_threshold,
+            large_cores,
+            large_width,
+            short_cores,
+        ) = parse_large_medium_stream_partition(args.large_medium_stream_partition)
+        if model.policy is None:
+            raise ValueError("large/medium/stream partition requires a policy-bound profile")
+        base_spec = planner.plan_spec_for(
+            workload.experts,
+            topk_ids=topk_ids,
+            dynamic_tail_pool=False,
+        )
+        base_plan = AsyncMoEPlanV2.from_dict(base_spec["bridge"])
+        window_policy = default_stage_window_policy(
+            hidden_size=int(model.policy.hidden_size),
+            intermediate_size=int(model.policy.intermediate_size),
+            backend_n_tile=int(model.policy.backend_n_tile),
+        )
+
+        def stage_window_select(routes: int, width: int) -> tuple[int, int]:
+            if window_policy is None:
+                return (0, 0)
+            return window_policy.select(routes, width)
+
+        plan, partition = make_large_medium_stream_partition_plan(
+            torch.tensor(workload.histogram, dtype=torch.int64),
+            cpu_ids=cpu_ids,
+            large_route_threshold=large_threshold,
+            short_route_threshold=short_threshold,
+            large_core_count=large_cores,
+            large_team_threads=large_width,
+            short_stream_core_count=short_cores,
+            iso_time_ns=model.T_iso,
+            stage_window_select=stage_window_select,
+            early_merge=base_plan.early_merge,
+        )
+        shape = (
+            *((large_width,) * (large_cores // large_width)),
+            *((1,) * (args.threads - large_cores)),
+        )
+        return (
+            {
+                "plan_version": plan.plan_version,
+                "execution_mode": plan.execution_mode,
+                "bridge": plan_to_bridge(plan),
+                "shape": shape,
+                "tail_pool_threads": None,
+                "tail_pool_max_routes": None,
+                "tail_pool_tasks": 0,
+                "tail_repartition_width": None,
+                "tail_repartition_tasks": 0,
+                "tail_repartition_route_slices": 1,
+                "policy": {"profile": str(model.profile_path)},
+                "makespan_ns": partition["predicted_isolated_makespan_ms"] * 1.0e6,
+                "large_medium_stream_partition": partition,
+            },
+            planner,
+        )
+    if args.large_small_partition is not None:
+        threshold, large_cores, large_width, small_width = parse_large_small_partition(
+            args.large_small_partition
+        )
+        if model.policy is None:
+            raise ValueError("large/small partition requires a policy-bound profile")
+        base_spec = planner.plan_spec_for(
+            workload.experts,
+            topk_ids=topk_ids,
+            dynamic_tail_pool=False,
+        )
+        base_plan = AsyncMoEPlanV2.from_dict(base_spec["bridge"])
+        window_policy = default_stage_window_policy(
+            hidden_size=int(model.policy.hidden_size),
+            intermediate_size=int(model.policy.intermediate_size),
+            backend_n_tile=int(model.policy.backend_n_tile),
+        )
+
+        def stage_window_select(routes: int, width: int) -> tuple[int, int]:
+            if window_policy is None:
+                return (0, 0)
+            return window_policy.select(routes, width)
+
+        plan, partition = make_large_small_partition_plan(
+            torch.tensor(workload.histogram, dtype=torch.int64),
+            cpu_ids=cpu_ids,
+            route_threshold=threshold,
+            large_core_count=large_cores,
+            large_team_threads=large_width,
+            small_team_threads=small_width,
+            iso_time_ns=model.T_iso,
+            stage_window_select=stage_window_select,
+            early_merge=base_plan.early_merge,
+        )
+        shape = (
+            *((large_width,) * (large_cores // large_width)),
+            *((small_width,) * ((args.threads - large_cores) // small_width)),
+        )
+        return (
+            {
+                "plan_version": plan.plan_version,
+                "execution_mode": plan.execution_mode,
+                "bridge": plan_to_bridge(plan),
+                "shape": shape,
+                "tail_pool_threads": None,
+                "tail_pool_max_routes": None,
+                "tail_pool_tasks": 0,
+                "tail_repartition_width": None,
+                "tail_repartition_tasks": 0,
+                "tail_repartition_route_slices": 1,
+                "policy": {"profile": str(model.profile_path)},
+                "makespan_ns": partition["predicted_isolated_makespan_ms"] * 1.0e6,
+                "large_small_partition": partition,
+            },
+            planner,
+        )
     shape = parse_shape(args.force_shape)
     if shape is None:
         return (
             planner.plan_spec_for(
                 workload.experts,
+                topk_ids=topk_ids,
                 tail_pool_threads=args.force_tail_pool_threads,
                 tail_pool_max_routes=args.tail_pool_max_routes,
             ),
@@ -149,7 +332,7 @@ def build_plan_spec(
     interval_planner = planner.interval_planners[0]
     makespan_ns, tasks = interval_planner.score_shape(workload.experts, shape)
     if args.force_tail_pool_threads is None:
-        bridge = interval_planner.to_async_bridge(tasks)
+        bridge = interval_planner.to_async_bridge(tasks, topk_ids=topk_ids)
     else:
         if args.force_tail_pool_threads <= 0:
             raise ValueError("--force-tail-pool-threads must be positive")
@@ -430,7 +613,13 @@ def build_plan(args: argparse.Namespace) -> tuple[dict[str, Any], ContentionCost
         raise ValueError(f"affinity exposes {len(cpu_ids)} CPUs, expected {args.threads}")
 
     model = ContentionCostModel(args.profile)
-    spec, planner = build_plan_spec(args, model, workload, cpu_ids)
+    topk_ids = materialize_topk_ids(
+        workload.histogram,
+        tokens=workload.tokens,
+        top_k=workload.top_k,
+        seed=args.seed,
+    )
+    spec, planner = build_plan_spec(args, model, workload, cpu_ids, topk_ids)
     bridge = spec["bridge"]
     plan = override_early_merge(AsyncMoEPlanV2.from_dict(bridge), args.early_merge)
     bound_model = planner.interval_planners[0].model
@@ -540,6 +729,8 @@ def build_plan(args: argparse.Namespace) -> tuple[dict[str, Any], ContentionCost
             "tail_pool_tasks": int(spec["tail_pool_tasks"]),
             "early_merge": plan.early_merge,
             "strict_tail_steal": bool(args.strict_tail_steal),
+            "large_small_partition": spec.get("large_small_partition"),
+            "large_medium_stream_partition": spec.get("large_medium_stream_partition"),
             "tasks": tasks,
         },
         "predicted": {
@@ -572,11 +763,18 @@ def capture_actual(
     workload: Any,
 ) -> dict[str, Any]:
     model = ContentionCostModel(args.profile)
+    topk_ids = materialize_topk_ids(
+        workload.histogram,
+        tokens=workload.tokens,
+        top_k=workload.top_k,
+        seed=args.seed,
+    )
     plan_payload, _ = build_plan_spec(
         args,
         model,
         workload,
         payload["case"]["cpu_ids"],
+        topk_ids,
     )
     plan_payload = plan_payload["bridge"]
     plan = AsyncMoEPlanV2.from_dict(plan_payload)
@@ -608,12 +806,6 @@ def capture_actual(
         (workload.num_experts, policy.hidden_size, policy.intermediate_size),
         dtype=torch.bfloat16,
     )
-    topk_ids = materialize_topk_ids(
-        workload.histogram,
-        tokens=workload.tokens,
-        top_k=workload.top_k,
-        seed=args.seed,
-    )
     topk_weights = torch.softmax(
         torch.randn((workload.tokens, workload.top_k), generator=generator),
         dim=-1,
@@ -624,7 +816,7 @@ def capture_actual(
     os.environ["FUSED_CPP_MOE_SVE_W2_DIRECT_ROUTE"] = "1"
     os.environ["FUSED_CPP_MOE_W2_BF16_ROUTE"] = "1" if args.route_dtype == "bf16" else "0"
     os.environ["FUSED_CPP_MOE_ASYNC_SHORT_POOL_THREADS"] = "0"
-    os.environ["FUSED_CPP_MOE_STAGE_TIMING"] = "0"
+    os.environ["FUSED_CPP_MOE_STAGE_TIMING"] = "1" if args.stage_timing else "0"
     os.environ["FUSED_CPP_MOE_TRACE_FILE"] = str(args.trace_file)
     os.environ["FUSED_CPP_MOE_TRACE"] = "0"
     os.environ["FUSED_CPP_MOE_STRICT_TAIL_STEAL"] = "1" if args.strict_tail_steal else "0"
@@ -738,10 +930,28 @@ def capture_actual(
 
 def main() -> int:
     args = parse_args()
+    resolve_output_paths(args)
     if args.warmup < 0 or args.runs <= 0:
         raise ValueError("--warmup must be non-negative and --runs must be positive")
     if args.gflops_color_max <= 0:
         raise ValueError("--gflops-color-max must be positive")
+    partition_options = (
+        args.large_small_partition,
+        args.large_medium_stream_partition,
+    )
+    if sum(value is not None for value in partition_options) > 1:
+        raise ValueError("only one partition timeline can be captured at a time")
+    if any(value is not None for value in partition_options) and any(
+        value is not None
+        for value in (
+            args.force_shape,
+            args.force_tail_pool_threads,
+            args.static_tail_width,
+        )
+    ):
+        raise ValueError(
+            "partition timelines cannot be combined with forced shape, tail pool, or static tail"
+        )
     payload, _, workload = build_plan(args)
     if not args.plan_only:
         payload["actual"] = capture_actual(args, payload, workload)
