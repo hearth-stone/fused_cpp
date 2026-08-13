@@ -461,6 +461,25 @@ window（完整序列呈梯形）。Amazon 192C NUMA1 cores 96--191、96T、BF16
 说明同一门限不会在小线程池误拆。完整方法、命令、raw-sample 结论、数值覆盖与
 下一步见 `optimizations/sparse_mla/results/amazon_sparse_mla_2d_fused_20260812.md`。
 
+### Sparse MLA head-major dense 8x8 候选
+
+新增内部 `heads_dense_8x8`：全 query 共享同一段连续 indices 时，QK/PV 的
+8×8 M 维从“同一 head 的 8 个 token”改成“同一 token 的 8 个 head”。K/V
+仍只在调用级 pack 一次，Q 和输出则直接消费公开 `[token,head,dim]` 中相邻的
+head 行。公开 `flash_mla_sparse_fwd` 与默认 `indexed_4x4_2d` 不变。
+
+BF16 `q[2048,32,192]`、共享 `KV=640`、`d_v=128`、3 warmup + 11 次轮转交错：
+Amazon 8C 的 1T 为 335.131→332.821 ms（-0.69%），8T 为
+54.648→54.658 ms（持平）；Arm-codex NUMA0 的 1T 为
+421.224→423.739 ms（+0.60%），0--79 共 80T 为 7.325→5.936 ms
+（-18.96%，1.234×）。两机运行时 SVL 均为 256 bit，各 37 项 sparse MLA
+测试通过，benchmark 输出 bitwise equal。
+
+单核没有算术收益，80T 收益来自调度粒度：旧路径只有 256 个 8-token task，
+80 workers 必然出现 3/4 task 不均；新路径有 2,048 个 token task，分配为
+25/26。8C 下两种 task 数均可整除线程数，因此持平。详细命令、配置与限制见
+`optimizations/sparse_mla/results/arm_head_major_20260813.md`。
+
 完整方法、逐轮尝试、数值结果与保留门限见
 `optimizations/sparse_mla/results/amazon_192c_masked_tail_20260812.md`。
 
@@ -489,6 +508,7 @@ window（完整序列呈梯形）。Amazon 192C NUMA1 cores 96--191、96T、BF16
 
 | 日期 | 改动概述 | 受影响文件 |
 |---|---|---|
+| 2026-08-13 | **Sparse MLA head-major dense 8×8 实验**：新增内部 `heads_dense_8x8`，以同一 token 的 8 个 head 作为 QK/PV M 维，调用级复用 shared-MQA K/V pack，并增加 dense-shared benchmark 与输出/stats/fallback 测试。`q[2048,32,192]`、KV640、Dv128 下 Amazon 8C 的 1T 快 0.69%、8T 持平；Arm-codex 1T 慢 0.60%，80T 快 18.96%，后者主要来自 2,048 token tasks 相对旧 256 token-tile tasks 的静态负载均衡改善。两机实际 SVL256、各 37 tests passed；公开默认不变。 | 改 `csrc/{sparse_mla.cpp,SDPA_VERSIONS.md}`、`tests/{test_sparse_mla.py,bench_sparse_mla_tail_variants.py}`、`optimizations/sparse_mla/{manifest.yaml,results/arm_head_major_20260813.md}` |
 | 2026-08-12 | **Sparse MLA fused online epilogue、三种 PV 指令比较与 2D KV split**：新增 SVL128/256 的 fused QK→online-softmax→PV 实验，消除 8×8 score/`p_hat` scratch；同一框架比较 FMLA/BFMLAL/BFMMLA，tail-only 上 SVL256 以 FMLA 最快（45.385 ms vs materialized 55.238），SVL128 则 materialized 最快（27.361 ms），BFMMLA 两边均非最优，故不切默认。新增 associative online-softmax partial merge 与最多 8-way KV shard，BF16 公开入口在 query blocks≤threads/2 时启用；真实 DSV4 4a 离散 top-k + 128 sliding window 下，192C cores96--191 的 64/128/256-token chunk 分别加速 5.317/3.872/2.276×，full 4096/8192 保持 ±0.22%。两台 SVL128/256 目标机各 34 tests passed。 | 改 `csrc/{sparse_mla.cpp,sparse_mla_tail_microkernels.cpp,sparse_mla_tail_microkernels.h,SDPA_VERSIONS.md}`、`tests/{test_sparse_mla.py,bench_sparse_mla_tail_variants.py}`、`docs/sparse_mla_vllm_integration.md`、`optimizations/sparse_mla/{manifest.yaml,results/amazon_sparse_mla_2d_fused_20260812.md}` |
 | 2026-08-12 | **Sparse MLA 连续 ragged tail 的 full/pruned 8×8 候选**：新增安全的 monotonic-tail planner、packed masked 8×8 QK/PV、2×2 BFMMLA pruning、BFMLAL valid-lane pruning、跨 segment packed-Q 复用与内部三版本 benchmark 入口。Amazon 192C NUMA1、`q[2048,32,192]`、V4-like 2,621,952 pairs/head、21-run 轮转交错：1T indexed/full/pruned 为 586.217/544.225/541.370 ms（候选快 7.2--7.7%）；12/32/96T 三者均约 55 ms，full/pruned 没有稳定收益且 32T 回退约 1.3--1.5%，因此公开默认继续 `indexed_4x4`。1,024-block tail-only 隔离确认 pruned 相对 full 在 causal 快 5.0--12.9%、V4-mix 快 4.7--5.8%，说明 E2E 差异小是尾部占比稀释而非 pruning 无效。记录了初版 full tile、初版 QK pruning、E/8 展开+向量 store+Q reuse、精确 PV pruning 四轮尝试。 | 改 `csrc/{sparse_mla.cpp,module.cpp,SDPA_VERSIONS.md}`、`tests/{test_sparse_mla.py,bench_sparse_mla_tail_variants.py}`；新建 `csrc/sparse_mla_tail_microkernels.{h,cpp}`、`optimizations/sparse_mla/{manifest.yaml,results/amazon_192c_masked_tail_20260812.md}` |
 | 2026-07-28 | **DeepSeek V4 attention MN 路径 A 只 pack 一次**：Linux NEON 下新增 attention-prefixed packed-A M8 BF16/FP32 row-major store kernel；OpenMP team 先协作把 hidden states 写成一份 reorder-M8 buffer，尾部补零，经一次 publish barrier 后由四个 GEMM 的全部 N-group 复用。默认仅在 MN requested N groups >=24 时启用，`FUSED_CPP_ATTN_GEMM_PREPACK_A=on/off` 可强制选择，SVE 与其他 schedule 保持原路径。Amazon 192C NUMA0、M2048/K4096/N 总计3904：强制 off/on 在 24/32/48/64/80/96T 分别加速 1.038/1.028/1.047/1.020/1.016/1.030x；96T 21-run 为 3.154→3.059 ms、20.764→21.411 TFLOP/s。2--16T 存在最高约 4.7% 回退，因此 auto 门限避开该区间；31 项本地、远程 NEON、远程 SVE 测试均通过。 | 改 `csrc/deepseek_v4_attn_gemm_fused.cpp`、`csrc/moe/arm/neon_bf16/kernels.S`、`setup.py`、`tests/{bench_deepseek_v4_attn_gemm_fused.py,test_deepseek_v4_attn_gemm_fused.py}`、`optimizations/deepseek_v4_attn_gemm/{manifest.yaml,results/amazon_192c_attn_gemm_scheduler_20260728.md}`、`csrc/SDPA_VERSIONS.md` |

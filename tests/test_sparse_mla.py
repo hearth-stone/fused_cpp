@@ -23,6 +23,7 @@ from fused_cpp.sparse_mla import (
 _CPP_TAIL_VARIANTS = (
     "indexed_4x4",
     "indexed_4x4_2d",
+    "heads_dense_8x8",
     "masked_dense_8x8",
     "masked_dense_8x8_pruned",
     "masked_dense_8x8_pruned_2d",
@@ -35,6 +36,69 @@ _CPP_FUSED_TAIL_VARIANTS = (
 _HAS_CPP_TAIL_VARIANTS = _fused_cpp_C is not None and hasattr(
     _fused_cpp_C, "_flash_mla_sparse_fwd_variant"
 )
+
+
+@pytest.mark.skipif(not _HAS_CPP_TAIL_VARIANTS, reason="C++ sparse MLA variants unavailable")
+@pytest.mark.parametrize("return_stats", [False, True])
+def test_flash_mla_sparse_fwd_cpp_dense_heads_matches_token_major(
+    return_stats: bool,
+) -> None:
+    """Head-major dense tiles must preserve output and optional statistics."""
+    torch.manual_seed(173)
+    s_q, h_q, s_kv, d_qk, d_v = 11, 16, 32, 32, 24
+    q = torch.randn(s_q, h_q, d_qk).bfloat16()
+    kv = torch.randn(s_kv, 1, d_qk).bfloat16()
+    indices = (
+        torch.arange(8, 32, dtype=torch.int32)
+        .reshape(1, 1, -1)
+        .expand(s_q, 1, -1)
+        .clone()
+    )
+    scale = 1.0 / (d_qk**0.5)
+
+    expected = _fused_cpp_C._flash_mla_sparse_fwd_variant(
+        q,
+        kv,
+        indices,
+        scale,
+        "indexed_4x4",
+        d_v=d_v,
+        return_stats=return_stats,
+    )
+    actual = _fused_cpp_C._flash_mla_sparse_fwd_variant(
+        q,
+        kv,
+        indices,
+        scale,
+        "heads_dense_8x8",
+        d_v=d_v,
+        return_stats=return_stats,
+    )
+    if return_stats:
+        _assert_sparse_close(actual, expected)
+    else:
+        torch.testing.assert_close(actual, expected, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.skipif(not _HAS_CPP_TAIL_VARIANTS, reason="C++ sparse MLA variants unavailable")
+def test_flash_mla_sparse_fwd_cpp_dense_heads_preserves_sparse_fallback() -> None:
+    """Non-contiguous indices must fall back to the existing indexed executor."""
+    torch.manual_seed(179)
+    s_q, h_q, s_kv, d_qk, d_v = 8, 8, 32, 16, 16
+    q = torch.randn(s_q, h_q, d_qk).bfloat16()
+    kv = torch.randn(s_kv, 1, d_qk).bfloat16()
+    row = torch.tensor([0, 2, 5, 9, 14, 20, 27, 31], dtype=torch.int32)
+    indices = row.reshape(1, 1, -1).expand(s_q, 1, -1).clone()
+    scale = 1.0 / (d_qk**0.5)
+
+    expected = _fused_cpp_C._flash_mla_sparse_fwd_variant(
+        q, kv, indices, scale, "indexed_4x4", d_v=d_v, return_stats=True
+    )
+    actual = _fused_cpp_C._flash_mla_sparse_fwd_variant(
+        q, kv, indices, scale, "heads_dense_8x8", d_v=d_v, return_stats=True
+    )
+    for actual_value, expected_value in zip(actual, expected, strict=True):
+        torch.testing.assert_close(actual_value, expected_value, rtol=0.0, atol=0.0)
 
 
 def _vllm_cpu_sparse_attention_reference(

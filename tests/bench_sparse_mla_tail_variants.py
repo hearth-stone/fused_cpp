@@ -21,6 +21,7 @@ from fused_cpp import _C
 TAIL_VARIANTS = (
     "indexed_4x4",
     "indexed_4x4_2d",
+    "heads_dense_8x8",
     "masked_dense_8x8",
     "masked_dense_8x8_pruned",
     "masked_dense_8x8_pruned_2d",
@@ -29,6 +30,7 @@ TAIL_VARIANTS = (
     "masked_dense_8x8_fused_bfmmla",
 )
 WORKLOADS = (
+    "dense-shared",
     "v4-forward",
     "dsv4-sparse",
     "tail-causal",
@@ -167,6 +169,7 @@ def main() -> None:
     parser.add_argument("--d-qk", type=int, default=192)
     parser.add_argument("--d-v", type=int, default=128)
     parser.add_argument("--compressed-capacity", type=int, default=512)
+    parser.add_argument("--dense-kv", type=int, default=640)
     parser.add_argument("--window-size", type=int, default=128)
     parser.add_argument("--compress-ratio", type=int, default=4)
     parser.add_argument("--context-start", type=int, default=0)
@@ -188,7 +191,20 @@ def main() -> None:
         pass
 
     torch.manual_seed(args.seed)
-    if args.workload == "v4-forward":
+    if args.workload == "dense-shared":
+        if args.dense_kv <= 0:
+            raise ValueError("dense-kv must be positive")
+        s_q = args.s_q
+        s_kv = args.dense_kv
+        indices = (
+            torch.arange(args.dense_kv, dtype=torch.int32)
+            .reshape(1, 1, -1)
+            .expand(s_q, 1, -1)
+            .clone()
+        )
+        valid_pairs = s_q * args.dense_kv
+        tail_tiles = 0
+    elif args.workload == "v4-forward":
         s_q = args.s_q
         s_kv = args.compressed_capacity + s_q
         indices, valid_pairs = _build_v4_like_indices(s_q, args.compressed_capacity)
