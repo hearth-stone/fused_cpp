@@ -480,6 +480,27 @@ Amazon 8C 的 1T 为 335.131→332.821 ms（-0.69%），8T 为
 25/26。8C 下两种 task 数均可整除线程数，因此持平。详细命令、配置与限制见
 `optimizations/sparse_mla/results/arm_head_major_20260813.md`。
 
+### Sparse MLA head-major sparse 8x8 组合候选
+
+新增内部 `heads_sparse_8x8`：对 BF16 MQA 的每个 token，把有效 sparse
+indices 对应的 K/V gather+pack 一次，再由同 token 的所有 8-head group 复用；
+QK 使用现有 packed BFMMLA 8×8，PV 使用 BF16-probability 8×8，并在 L2
+chunk 之间保留同一份 online-softmax max/sum/O 状态。负索引 padding 被跳过，
+正索引顺序及重复语义不变，sink/output/stats 与 unsupported-shape fallback 均保留。
+组合候选先尝试 `heads_dense_8x8`，因此全 query 共享连续 KV 时仍只做一次调用级
+K/V pack；公开 `flash_mla_sparse_fwd` 和默认 `indexed_4x4_2d` 不变。
+
+BF16 `q[2048,32,192]`、DSV4 512 compressed + 128 sliding-window、
+`context_start=0`、`d_v=128`、3 warmup + 11 次轮转交错：Amazon 8C 的
+1T 为 360.442→251.737 ms（-30.16%，1.432×），8T 为
+55.664→38.682 ms（-30.51%，1.439×）；Arm-codex 的 1T 为
+384.633→327.617 ms（-14.82%，1.174×），0--79 共 80T 为
+10.262→4.704 ms（-54.16%，2.182×）。全 dense 组合版与 dense-only head
+版本相差不超过 0.14%，Arm-codex 80T 相对 token-major 为
+7.318→6.014 ms（-17.82%）。两机实际 SVL256、各 43 tests passed；sparse
+输出 max abs 0.015625，max/LSE 通过 1e-5 容差。详细方法、raw-sample 范围、
+诊断占比与保留实验状态的原因见同一结果文件。
+
 完整方法、逐轮尝试、数值结果与保留门限见
 `optimizations/sparse_mla/results/amazon_192c_masked_tail_20260812.md`。
 
@@ -508,6 +529,7 @@ Amazon 8C 的 1T 为 335.131→332.821 ms（-0.69%），8T 为
 
 | 日期 | 改动概述 | 受影响文件 |
 |---|---|---|
+| 2026-08-13 | **Sparse MLA head-major sparse 8×8 组合实验**：新增内部 `heads_sparse_8x8`，按 token gather/pack 一份 sparse MQA K/V 并复用于所有 8-head group，按 L2 chunk 保留 online-softmax 状态；组合 dispatch 对全局共享连续 KV 先走 dense-head 调用级 pack。`q[2048,32,192]`、DSV4 top-k512+window128、context0、Dv128 下，Amazon 8C 1T/8T 分别快 30.16%/30.51%，Arm-codex 1T/80T 分别快 14.82%/54.16%；全 dense 与 `heads_dense_8x8` 持平。两机 SVL256 各 43 tests passed，公开默认不变，候选因尚缺三次独立 session 保持 experimental。 | 改 `csrc/{sparse_mla.cpp,SDPA_VERSIONS.md}`、`tests/{test_sparse_mla.py,bench_sparse_mla_tail_variants.py}`、`optimizations/sparse_mla/{manifest.yaml,results/arm_head_major_20260813.md}` |
 | 2026-08-13 | **Sparse MLA head-major dense 8×8 实验**：新增内部 `heads_dense_8x8`，以同一 token 的 8 个 head 作为 QK/PV M 维，调用级复用 shared-MQA K/V pack，并增加 dense-shared benchmark 与输出/stats/fallback 测试。`q[2048,32,192]`、KV640、Dv128 下 Amazon 8C 的 1T 快 0.69%、8T 持平；Arm-codex 1T 慢 0.60%，80T 快 18.96%，后者主要来自 2,048 token tasks 相对旧 256 token-tile tasks 的静态负载均衡改善。两机实际 SVL256、各 37 tests passed；公开默认不变。 | 改 `csrc/{sparse_mla.cpp,SDPA_VERSIONS.md}`、`tests/{test_sparse_mla.py,bench_sparse_mla_tail_variants.py}`、`optimizations/sparse_mla/{manifest.yaml,results/arm_head_major_20260813.md}` |
 | 2026-08-12 | **Sparse MLA fused online epilogue、三种 PV 指令比较与 2D KV split**：新增 SVL128/256 的 fused QK→online-softmax→PV 实验，消除 8×8 score/`p_hat` scratch；同一框架比较 FMLA/BFMLAL/BFMMLA，tail-only 上 SVL256 以 FMLA 最快（45.385 ms vs materialized 55.238），SVL128 则 materialized 最快（27.361 ms），BFMMLA 两边均非最优，故不切默认。新增 associative online-softmax partial merge 与最多 8-way KV shard，BF16 公开入口在 query blocks≤threads/2 时启用；真实 DSV4 4a 离散 top-k + 128 sliding window 下，192C cores96--191 的 64/128/256-token chunk 分别加速 5.317/3.872/2.276×，full 4096/8192 保持 ±0.22%。两台 SVL128/256 目标机各 34 tests passed。 | 改 `csrc/{sparse_mla.cpp,sparse_mla_tail_microkernels.cpp,sparse_mla_tail_microkernels.h,SDPA_VERSIONS.md}`、`tests/{test_sparse_mla.py,bench_sparse_mla_tail_variants.py}`、`docs/sparse_mla_vllm_integration.md`、`optimizations/sparse_mla/{manifest.yaml,results/amazon_sparse_mla_2d_fused_20260812.md}` |
 | 2026-08-12 | **Sparse MLA 连续 ragged tail 的 full/pruned 8×8 候选**：新增安全的 monotonic-tail planner、packed masked 8×8 QK/PV、2×2 BFMMLA pruning、BFMLAL valid-lane pruning、跨 segment packed-Q 复用与内部三版本 benchmark 入口。Amazon 192C NUMA1、`q[2048,32,192]`、V4-like 2,621,952 pairs/head、21-run 轮转交错：1T indexed/full/pruned 为 586.217/544.225/541.370 ms（候选快 7.2--7.7%）；12/32/96T 三者均约 55 ms，full/pruned 没有稳定收益且 32T 回退约 1.3--1.5%，因此公开默认继续 `indexed_4x4`。1,024-block tail-only 隔离确认 pruned 相对 full 在 causal 快 5.0--12.9%、V4-mix 快 4.7--5.8%，说明 E2E 差异小是尾部占比稀释而非 pruning 无效。记录了初版 full tile、初版 QK pruning、E/8 展开+向量 store+Q reuse、精确 PV pruning 四轮尝试。 | 改 `csrc/{sparse_mla.cpp,module.cpp,SDPA_VERSIONS.md}`、`tests/{test_sparse_mla.py,bench_sparse_mla_tail_variants.py}`；新建 `csrc/sparse_mla_tail_microkernels.{h,cpp}`、`optimizations/sparse_mla/{manifest.yaml,results/amazon_192c_masked_tail_20260812.md}` |

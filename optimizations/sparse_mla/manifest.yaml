@@ -36,7 +36,13 @@ benchmark_scenarios:
   dense_shared_2048: >-
     tests/bench_sparse_mla_tail_variants.py --workload dense-shared
     --s-q 2048 --dense-kv 640 --h-q 32 --d-qk 192 --d-v 128
-    --variants indexed_4x4 heads_dense_8x8 --warmup 3 --iters 11
+    --variants indexed_4x4 heads_dense_8x8 heads_sparse_8x8
+    --warmup 3 --iters 11
+  dsv4_sparse_heads_2048: >-
+    tests/bench_sparse_mla_tail_variants.py --workload dsv4-sparse
+    --s-q 2048 --context-start 0 --h-q 32 --d-qk 192 --d-v 128
+    --variants indexed_4x4 indexed_4x4_2d heads_sparse_8x8
+    --warmup 3 --iters 11
 
 features:
   - id: scheduling.head_major_dense
@@ -68,6 +74,44 @@ features:
       .venv/bin/python tests/bench_sparse_mla_tail_variants.py
       --workload dense-shared --s-q 2048 --dense-kv 640
       --variants indexed_4x4 heads_dense_8x8 --warmup 3 --iters 11
+    result: optimizations/sparse_mla/results/arm_head_major_20260813.md
+
+  - id: scheduling.head_major_sparse
+    part: scheduling
+    status: experimental
+    owner: zhangxu
+    opened: 2026-08-13
+    decision_by: 2026-09-12
+    implementation: csrc/sparse_mla.cpp
+    hypothesis: >-
+      Packing one token's selected MQA K/V rows once and reusing them across
+      eight-head QK/PV groups reduces sparse gather and arithmetic overhead,
+      while one dynamically scheduled task per token improves high-core load
+      balance for position-dependent prefill work.
+    depends_on:
+      - scheduling.head_major_dense
+    conflicts_with:
+      - scheduling.kv_2d_split
+    next_decision: >-
+      Keep experimental until three independent sessions cover representative
+      sequence lengths, head counts, context starts, and thread counts; evaluate
+      whether a guarded production dispatch can retain short-chunk 2D KV split.
+    adoption_gate: >-
+      At least 10% lower median latency on representative sparse prefill at the
+      selected production thread count, no more than 0.5% dense regression,
+      tolerance-equivalent output/stats on supported shapes, and no default
+      change until three independent target sessions pass.
+    correctness: >-
+      PYTHONPATH=src OMP_NUM_THREADS=4 FUSED_CPP_NUM_THREADS=4
+      .venv/bin/python -m pytest -q tests/test_sparse_mla.py
+    benchmark: >-
+      OMP_NUM_THREADS=<threads> FUSED_CPP_NUM_THREADS=<threads>
+      OMP_DYNAMIC=FALSE OMP_PROC_BIND=close OMP_PLACES=cores
+      taskset -c <cores> env PYTHONPATH=src .venv/bin/python
+      tests/bench_sparse_mla_tail_variants.py --workload dsv4-sparse
+      --s-q 2048 --context-start 0 --threads <threads>
+      --variants indexed_4x4 indexed_4x4_2d heads_sparse_8x8
+      --warmup 3 --iters 11
     result: optimizations/sparse_mla/results/arm_head_major_20260813.md
 
   - id: planning.masked_dense_tail
@@ -283,6 +327,13 @@ variants:
     status: experimental
     features:
       - scheduling.head_major_dense
+
+  - id: heads_sparse_8x8
+    entrypoint: _flash_mla_sparse_fwd_variant(..., "heads_sparse_8x8")
+    status: experimental
+    features:
+      - scheduling.head_major_dense
+      - scheduling.head_major_sparse
 
   - id: masked_dense_8x8
     entrypoint: _flash_mla_sparse_fwd_variant(..., "masked_dense_8x8")

@@ -33,6 +33,7 @@ enum class SparseMlaTailVariant {
   kIndexed4x4,
   kIndexed4x4_2d,
   kHeadsDense8x8,
+  kHeadsSparse8x8,
   kMaskedDense8x8,
   kMaskedDense8x8Pruned,
   kMaskedDense8x8FusedFmla,
@@ -45,7 +46,8 @@ template <SparseMlaTailVariant kTailVariant>
 constexpr bool sparse_mla_uses_masked_dense() {
   return kTailVariant != SparseMlaTailVariant::kIndexed4x4 &&
          kTailVariant != SparseMlaTailVariant::kIndexed4x4_2d &&
-         kTailVariant != SparseMlaTailVariant::kHeadsDense8x8;
+         kTailVariant != SparseMlaTailVariant::kHeadsDense8x8 &&
+         kTailVariant != SparseMlaTailVariant::kHeadsSparse8x8;
 }
 
 template <SparseMlaTailVariant kTailVariant>
@@ -1286,6 +1288,316 @@ static inline bool run_dense_heads_packqkv_mqa_fast_path(
         }
       }
     }
+  }
+  return true;
+}
+
+static inline void pack_indexed_kv_heads_tile_bf16(
+    const at::BFloat16* kv_ptr, int64_t kv_row_stride, const int64_t* indices,
+    int64_t d_qk, int64_t d_v, uint16_t* k_packed, at::BFloat16* v_packed,
+    int64_t v_evblock_stride) {
+  const auto* kv_u16 = reinterpret_cast<const uint16_t*>(kv_ptr);
+  const int64_t e_main = d_qk & ~int64_t{3};
+  for (int64_t e = 0; e < e_main; e += 4) {
+    uint16_t* dst = k_packed + (e / 4) * 32;
+    for (int64_t row = 0; row < kQueryBlock; ++row) {
+      ::fused_cpp::sdpa_pack_utils::copy_u16x4(
+          kv_u16 + indices[row] * kv_row_stride + e, dst + row * 4);
+    }
+  }
+
+  for (int64_t ev = 0; ev < d_v; ev += kQueryBlock) {
+    at::BFloat16* v_block = v_packed + (ev / kQueryBlock) * v_evblock_stride;
+    for (int64_t row = 0; row < kQueryBlock; ++row) {
+      std::memcpy(v_block + row * kQueryBlock,
+                  kv_ptr + indices[row] * kv_row_stride + ev,
+                  kQueryBlock * sizeof(at::BFloat16));
+    }
+  }
+}
+
+static inline void apply_sink_head(float sink_score, int64_t d_v,
+                                   float* running_max, float* running_sum,
+                                   float* output_acc) {
+  if (std::isinf(sink_score) && sink_score < 0.0f) {
+    return;
+  }
+  if (std::isinf(sink_score) && sink_score > 0.0f) {
+    *running_max = sink_score;
+    *running_sum = 1.0f;
+    std::fill(output_acc, output_acc + d_v, 0.0f);
+    return;
+  }
+  const float new_max = std::max(*running_max, sink_score);
+  const float correction =
+      *running_sum > 0.0f ? std::exp(*running_max - new_max) : 0.0f;
+  const float sink_scale = std::exp(sink_score - new_max);
+  ::fused_cpp::sdpa_flash2_neon_l3kv_impl::scale_inplace_impl(output_acc,
+                                                              correction, d_v);
+  *running_sum = *running_sum * correction + sink_scale;
+  *running_max = new_max;
+}
+
+// Experimental sparse MQA executor whose 8x8 M dimension is eight heads of
+// one token. Each sparse K/V tile is gathered and packed once, then reused by
+// every head group while the online-softmax state remains independent per head.
+template <bool kReturnStats>
+static inline bool run_sparse_heads_packqkv_mqa_fast_path(
+    const at::Tensor& q, const at::Tensor& kv, const at::Tensor& indices_2d,
+    float scale, int64_t d_v, const at::Tensor* sink_tensor, at::Tensor& output,
+    at::Tensor* max_logits, at::Tensor* lse) {
+  if (q.scalar_type() != at::kBFloat16) {
+    return false;
+  }
+
+  const int64_t s_q = q.size(0);
+  const int64_t h_q = q.size(1);
+  const int64_t d_qk = q.size(2);
+  const int64_t s_kv = kv.size(0);
+  const int64_t topk = indices_2d.size(1);
+  if (h_q % kQueryBlock != 0 || d_qk % 4 != 0 || d_v % kQueryBlock != 0) {
+    return false;
+  }
+
+  const bool profile_on = ::fused_cpp::sdpa_profile::enabled();
+  if (profile_on) {
+    ::fused_cpp::sdpa_profile::reset();
+  }
+  const uint64_t profile_total_t0 =
+      profile_on ? ::fused_cpp::sdpa_profile::now_ns() : 0;
+
+  const auto* q_ptr = q.data_ptr<at::BFloat16>();
+  const auto* kv_ptr = kv.data_ptr<at::BFloat16>();
+  const auto* idx_ptr = indices_2d.data_ptr<int64_t>();
+  const float* sink_ptr =
+      sink_tensor == nullptr ? nullptr : sink_tensor->data_ptr<float>();
+  auto* out_ptr = output.data_ptr<at::BFloat16>();
+  float* max_ptr = nullptr;
+  float* lse_ptr = nullptr;
+  if constexpr (kReturnStats) {
+    max_ptr = max_logits->data_ptr<float>();
+    lse_ptr = lse->data_ptr<float>();
+  }
+
+  const int64_t qblock_u16 = (d_qk / 4) * 32;
+  const int64_t head_groups = h_q / kQueryBlock;
+  const auto ts = ::fused_cpp::sdpa_tile_sizes::compute_tile_sizes_l3kv(
+      /*B=*/1, h_q, topk, s_q, d_qk, d_v, sizeof(at::BFloat16));
+  const int64_t chunk_capacity = std::max<int64_t>(kQueryBlock, ts.Sc_l2);
+  const int64_t chunk_blocks = chunk_capacity / kQueryBlock;
+  const int64_t v_tile_elements =
+      (d_v / kQueryBlock) * chunk_capacity * kQueryBlock;
+  const float neg_inf = -std::numeric_limits<float>::infinity();
+  for (int64_t offset = 0; offset < s_q * topk; ++offset) {
+    const int64_t index = idx_ptr[offset];
+    TORCH_CHECK(index < s_kv, "sparse_mla: index out of range idx=", index,
+                ", s_kv=", s_kv);
+  }
+
+#ifdef _OPENMP
+#pragma omp parallel
+#endif
+  {
+    std::vector<float> output_acc(static_cast<size_t>(h_q * d_v));
+    std::vector<float> running_max(static_cast<size_t>(h_q));
+    std::vector<float> running_sum(static_cast<size_t>(h_q));
+    std::vector<float> real_max;
+    std::vector<float> real_sum;
+    if constexpr (kReturnStats) {
+      real_max.resize(static_cast<size_t>(h_q));
+      real_sum.resize(static_cast<size_t>(h_q));
+    }
+    std::vector<uint16_t> q_packed(
+        static_cast<size_t>(head_groups * qblock_u16));
+    std::vector<uint16_t> k_packed(
+        static_cast<size_t>(chunk_blocks * qblock_u16));
+    std::vector<at::BFloat16> v_packed(static_cast<size_t>(v_tile_elements));
+    std::vector<float> scores(
+        static_cast<size_t>(kQueryBlock * chunk_capacity));
+    std::vector<at::BFloat16> p_hat_bf16(
+        static_cast<size_t>(kQueryBlock * chunk_capacity));
+    int64_t gathered_indices[kQueryBlock];
+
+#ifdef _OPENMP
+#pragma omp for schedule(dynamic, 1)
+#endif
+    for (int64_t token = 0; token < s_q; ++token) {
+      std::fill(output_acc.begin(), output_acc.end(), 0.0f);
+      std::fill(running_max.begin(), running_max.end(), neg_inf);
+      std::fill(running_sum.begin(), running_sum.end(), 0.0f);
+      if constexpr (kReturnStats) {
+        std::fill(real_max.begin(), real_max.end(), neg_inf);
+        std::fill(real_sum.begin(), real_sum.end(), 0.0f);
+      }
+
+      const at::BFloat16* q_token = q_ptr + token * h_q * d_qk;
+      {
+        FUSED_CPP_SDPA_PROFILE_SCOPE(::fused_cpp::sdpa_profile::Slot::kQPack);
+        for (int64_t group = 0; group < head_groups; ++group) {
+          ::fused_cpp::sdpa_microkernels::pack_q_8rows_to_seq_bf16(
+              q_token + group * kQueryBlock * d_qk,
+              /*q_row_stride=*/d_qk, d_qk,
+              q_packed.data() + group * qblock_u16);
+        }
+      }
+
+      const int64_t* token_indices = idx_ptr + token * topk;
+      int64_t gathered_count = 0;
+      int64_t chunk_count = 0;
+      const auto pack_tile = [&](int64_t valid_count) {
+        const int64_t padding_index = gathered_indices[0];
+        for (int64_t row = valid_count; row < kQueryBlock; ++row) {
+          gathered_indices[row] = padding_index;
+        }
+        {
+          FUSED_CPP_SDPA_PROFILE_SCOPE(::fused_cpp::sdpa_profile::Slot::kKPack);
+          pack_indexed_kv_heads_tile_bf16(
+              kv_ptr, d_qk, gathered_indices, d_qk, d_v,
+              k_packed.data() + (chunk_count / kQueryBlock) * qblock_u16,
+              v_packed.data() + chunk_count * kQueryBlock,
+              chunk_capacity * kQueryBlock);
+        }
+
+        chunk_count += valid_count;
+      };
+
+      const auto process_chunk = [&]() {
+        if (chunk_count == 0) {
+          return;
+        }
+
+        for (int64_t group = 0; group < head_groups; ++group) {
+          const int64_t head0 = group * kQueryBlock;
+          {
+            FUSED_CPP_SDPA_PROFILE_SCOPE(::fused_cpp::sdpa_profile::Slot::kQkt);
+            for (int64_t s_off = 0; s_off < chunk_count; s_off += kQueryBlock) {
+              alignas(64) float qkt_tile[kQueryBlock * kQueryBlock];
+              ::fused_cpp::sdpa_microkernels::
+                  gemm_qkt_microkernel_8x8_bf16_packqk_seq4_bmajor_inner(
+                      q_packed.data() + group * qblock_u16,
+                      q_token + head0 * d_qk, d_qk,
+                      k_packed.data() + (s_off / kQueryBlock) * qblock_u16,
+                      kv_ptr, d_qk, d_qk, scale, qkt_tile);
+              for (int64_t row = 0; row < kQueryBlock; ++row) {
+                const int64_t valid_keys =
+                    std::min<int64_t>(kQueryBlock, chunk_count - s_off);
+                std::copy_n(qkt_tile + row * kQueryBlock, valid_keys,
+                            scores.data() + row * chunk_count + s_off);
+              }
+            }
+          }
+
+          {
+            FUSED_CPP_SDPA_PROFILE_SCOPE(
+                ::fused_cpp::sdpa_profile::Slot::kSoftmax);
+            for (int64_t row = 0; row < kQueryBlock; ++row) {
+              const int64_t head = head0 + row;
+              const float* score_row = scores.data() + row * chunk_count;
+              const float tile_max =
+                  ::fused_cpp::sdpa_flash2_neon_l3kv_impl::max_update_impl(
+                      neg_inf, score_row, chunk_count);
+              const float new_max = std::max(running_max[head], tile_max);
+              const float correction =
+                  running_sum[head] > 0.0f
+                      ? std::exp(running_max[head] - new_max)
+                      : 0.0f;
+              running_sum[head] *= correction;
+              ::fused_cpp::sdpa_flash2_neon_l3kv_impl::scale_inplace_impl(
+                  output_acc.data() + head * d_v, correction, d_v);
+              running_sum[head] += ::fused_cpp::sdpa_flash2_neon_l3kv_impl::
+                  vectorized_exp_minus_bf16_impl<5>(
+                      p_hat_bf16.data() + row * chunk_count, score_row, new_max,
+                      chunk_count);
+              running_max[head] = new_max;
+
+              if constexpr (kReturnStats) {
+                const float real_new_max = std::max(real_max[head], tile_max);
+                const float real_correction =
+                    real_sum[head] > 0.0f
+                        ? std::exp(real_max[head] - real_new_max)
+                        : 0.0f;
+                float tile_sum = 0.0f;
+                for (int64_t col = 0; col < chunk_count; ++col) {
+                  tile_sum += std::exp(score_row[col] - real_new_max);
+                }
+                real_sum[head] = real_sum[head] * real_correction + tile_sum;
+                real_max[head] = real_new_max;
+              }
+            }
+          }
+
+          {
+            FUSED_CPP_SDPA_PROFILE_SCOPE(::fused_cpp::sdpa_profile::Slot::kPv);
+            for (int64_t ev = 0; ev < d_v; ev += kQueryBlock) {
+              ::fused_cpp::sdpa_microkernels::MK_QkPackqkSeq4BmajorPvPquad::
+                  pv_8x8_pbf16(p_hat_bf16.data(), chunk_count,
+                               v_packed.data() + (ev / kQueryBlock) *
+                                                     chunk_capacity *
+                                                     kQueryBlock,
+                               /*v_row_stride=*/kQueryBlock, chunk_count,
+                               output_acc.data() + head0 * d_v + ev, d_v);
+            }
+          }
+        }
+        chunk_count = 0;
+      };
+
+      for (int64_t col = 0; col < topk; ++col) {
+        const int64_t index = token_indices[col];
+        if (index < 0) {
+          continue;
+        }
+        gathered_indices[gathered_count++] = index;
+        if (gathered_count == kQueryBlock) {
+          pack_tile(gathered_count);
+          gathered_count = 0;
+          if (chunk_count == chunk_capacity) {
+            process_chunk();
+          }
+        }
+      }
+      if (gathered_count != 0) {
+        pack_tile(gathered_count);
+      }
+      process_chunk();
+
+      for (int64_t head = 0; head < h_q; ++head) {
+        if (sink_ptr != nullptr) {
+          apply_sink_head(sink_ptr[head], d_v, running_max.data() + head,
+                          running_sum.data() + head,
+                          output_acc.data() + head * d_v);
+        }
+        at::BFloat16* out_row = out_ptr + (token * h_q + head) * d_v;
+        if (running_sum[head] > 0.0f) {
+          store_normalized_bf16_row(out_row, output_acc.data() + head * d_v,
+                                    1.0f / running_sum[head], d_v);
+        } else {
+          std::fill(out_row, out_row + d_v, at::BFloat16(0.0f));
+        }
+        if constexpr (kReturnStats) {
+          max_ptr[token * h_q + head] = real_max[head];
+          lse_ptr[token * h_q + head] =
+              real_sum[head] > 0.0f ? real_max[head] + std::log(real_sum[head])
+                                    : std::numeric_limits<float>::infinity();
+        }
+      }
+    }
+  }
+  if (profile_on) {
+    ::fused_cpp::sdpa_profile::add(
+        ::fused_cpp::sdpa_profile::Slot::kTotal,
+        ::fused_cpp::sdpa_profile::now_ns() - profile_total_t0);
+    SdpaParams profile_params{};
+    profile_params.B = 1;
+    profile_params.N = h_q;
+    profile_params.L = s_q;
+    profile_params.S = topk;
+    profile_params.E = d_qk;
+    profile_params.Ev = d_v;
+    profile_params.dtype = SdpaDtype::kBFloat16;
+    ::fused_cpp::sdpa_profile::print_summary(
+        "sparse_mla_heads", "heads_sparse_8x8", profile_params,
+        "indexed_gather_packqkv_mqa");
   }
   return true;
 }
@@ -2754,27 +3066,47 @@ static py::object flash_mla_sparse_fwd_impl(at::Tensor q, at::Tensor kv, at::Ten
   };
 
   if (return_stats) {
-    const bool used_dense_fast_path =
-        tail_variant == SparseMlaTailVariant::kHeadsDense8x8
-            ? run_dense_heads_packqkv_mqa_fast_path<true>(
-                  q_c, kv_c, indices_2d, static_cast<float>(sm_scale), d_v,
-                  sink_ptr, output_compute, &max_logits, &lse)
-            : run_dense_packqkv_mqa_fast_path<true>(
-                  q_c, kv_c, indices_2d, static_cast<float>(sm_scale), d_v,
-                  sink_ptr, output_compute, &max_logits, &lse);
-    if (used_dense_fast_path) {
+    bool used_fast_path = false;
+    if (tail_variant == SparseMlaTailVariant::kHeadsDense8x8) {
+      used_fast_path = run_dense_heads_packqkv_mqa_fast_path<true>(
+          q_c, kv_c, indices_2d, static_cast<float>(sm_scale), d_v, sink_ptr,
+          output_compute, &max_logits, &lse);
+    } else if (tail_variant == SparseMlaTailVariant::kHeadsSparse8x8) {
+      used_fast_path =
+          run_dense_heads_packqkv_mqa_fast_path<true>(
+              q_c, kv_c, indices_2d, static_cast<float>(sm_scale), d_v,
+              sink_ptr, output_compute, &max_logits, &lse) ||
+          run_sparse_heads_packqkv_mqa_fast_path<true>(
+              q_c, kv_c, indices_2d, static_cast<float>(sm_scale), d_v,
+              sink_ptr, output_compute, &max_logits, &lse);
+    } else {
+      used_fast_path = run_dense_packqkv_mqa_fast_path<true>(
+          q_c, kv_c, indices_2d, static_cast<float>(sm_scale), d_v, sink_ptr,
+          output_compute, &max_logits, &lse);
+    }
+    if (used_fast_path) {
       return finish();
     }
   } else {
-    const bool used_dense_fast_path =
-        tail_variant == SparseMlaTailVariant::kHeadsDense8x8
-            ? run_dense_heads_packqkv_mqa_fast_path<false>(
-                  q_c, kv_c, indices_2d, static_cast<float>(sm_scale), d_v,
-                  sink_ptr, output_compute, nullptr, nullptr)
-            : run_dense_packqkv_mqa_fast_path<false>(
-                  q_c, kv_c, indices_2d, static_cast<float>(sm_scale), d_v,
-                  sink_ptr, output_compute, nullptr, nullptr);
-    if (used_dense_fast_path) {
+    bool used_fast_path = false;
+    if (tail_variant == SparseMlaTailVariant::kHeadsDense8x8) {
+      used_fast_path = run_dense_heads_packqkv_mqa_fast_path<false>(
+          q_c, kv_c, indices_2d, static_cast<float>(sm_scale), d_v, sink_ptr,
+          output_compute, nullptr, nullptr);
+    } else if (tail_variant == SparseMlaTailVariant::kHeadsSparse8x8) {
+      used_fast_path =
+          run_dense_heads_packqkv_mqa_fast_path<false>(
+              q_c, kv_c, indices_2d, static_cast<float>(sm_scale), d_v,
+              sink_ptr, output_compute, nullptr, nullptr) ||
+          run_sparse_heads_packqkv_mqa_fast_path<false>(
+              q_c, kv_c, indices_2d, static_cast<float>(sm_scale), d_v,
+              sink_ptr, output_compute, nullptr, nullptr);
+    } else {
+      used_fast_path = run_dense_packqkv_mqa_fast_path<false>(
+          q_c, kv_c, indices_2d, static_cast<float>(sm_scale), d_v, sink_ptr,
+          output_compute, nullptr, nullptr);
+    }
+    if (used_fast_path) {
       return finish();
     }
   }
@@ -2795,6 +3127,12 @@ static py::object flash_mla_sparse_fwd_impl(at::Tensor q, at::Tensor kv, at::Ten
         case SparseMlaTailVariant::kHeadsDense8x8:
           run_sparse_mla_kernel<at::BFloat16, true,
                                 SparseMlaTailVariant::kHeadsDense8x8>(
+              q_c, kv_c, indices_2d, sink_ptr, static_cast<float>(sm_scale),
+              d_v, output_compute, max_logits, lse);
+          break;
+        case SparseMlaTailVariant::kHeadsSparse8x8:
+          run_sparse_mla_kernel<at::BFloat16, true,
+                                SparseMlaTailVariant::kHeadsSparse8x8>(
               q_c, kv_c, indices_2d, sink_ptr, static_cast<float>(sm_scale),
               d_v, output_compute, max_logits, lse);
           break;
@@ -2834,6 +3172,12 @@ static py::object flash_mla_sparse_fwd_impl(at::Tensor q, at::Tensor kv, at::Ten
         case SparseMlaTailVariant::kHeadsDense8x8:
           run_sparse_mla_kernel<at::BFloat16, false,
                                 SparseMlaTailVariant::kHeadsDense8x8>(
+              q_c, kv_c, indices_2d, sink_ptr, static_cast<float>(sm_scale),
+              d_v, output_compute, max_logits, lse);
+          break;
+        case SparseMlaTailVariant::kHeadsSparse8x8:
+          run_sparse_mla_kernel<at::BFloat16, false,
+                                SparseMlaTailVariant::kHeadsSparse8x8>(
               q_c, kv_c, indices_2d, sink_ptr, static_cast<float>(sm_scale),
               d_v, output_compute, max_logits, lse);
           break;
@@ -2909,6 +3253,8 @@ py::object flash_mla_sparse_fwd_variant(at::Tensor q, at::Tensor kv, at::Tensor 
     variant = SparseMlaTailVariant::kIndexed4x4_2d;
   } else if (tail_variant == "heads_dense_8x8") {
     variant = SparseMlaTailVariant::kHeadsDense8x8;
+  } else if (tail_variant == "heads_sparse_8x8") {
+    variant = SparseMlaTailVariant::kHeadsSparse8x8;
   } else if (tail_variant == "masked_dense_8x8") {
     variant = SparseMlaTailVariant::kMaskedDense8x8;
   } else if (tail_variant == "masked_dense_8x8_pruned") {
@@ -2925,6 +3271,7 @@ py::object flash_mla_sparse_fwd_variant(at::Tensor q, at::Tensor kv, at::Tensor 
     TORCH_CHECK(
         false, "unknown sparse MLA tail variant: ", tail_variant,
         "; expected indexed_4x4, indexed_4x4_2d, heads_dense_8x8, "
+        "heads_sparse_8x8, "
         "masked_dense_8x8, "
         "masked_dense_8x8_pruned, "
         "masked_dense_8x8_pruned_2d, "
@@ -2934,6 +3281,7 @@ py::object flash_mla_sparse_fwd_variant(at::Tensor q, at::Tensor kv, at::Tensor 
   TORCH_CHECK(variant == SparseMlaTailVariant::kIndexed4x4 ||
                   variant == SparseMlaTailVariant::kIndexed4x4_2d ||
                   variant == SparseMlaTailVariant::kHeadsDense8x8 ||
+                  variant == SparseMlaTailVariant::kHeadsSparse8x8 ||
                   q.scalar_type() == at::kBFloat16,
               "masked dense sparse MLA tail variants require bfloat16 q/kv");
   const bool fused_online =

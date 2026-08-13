@@ -22,6 +22,7 @@ TAIL_VARIANTS = (
     "indexed_4x4",
     "indexed_4x4_2d",
     "heads_dense_8x8",
+    "heads_sparse_8x8",
     "masked_dense_8x8",
     "masked_dense_8x8_pruned",
     "masked_dense_8x8_pruned_2d",
