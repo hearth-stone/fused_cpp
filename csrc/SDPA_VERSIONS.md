@@ -147,7 +147,7 @@ flash2_neon_l3kv_packqkv_pbf16pv    ← softmax 直接产出 bf16 P scratch，PV
   3. **dtype 保留**：bf16 → bf16、fp32 → fp32，pack 不 widen，减少访存数据量。
   4. **微内核行 stride 退化为编译期常量 `8`**：通过 `if constexpr (kPackedV)` 在 `process_q_tile_lc` 内显式传字面量，让编译器把 ldr 折成 imm offset。
   5. **L1 BFMLAL 实验版本**：`flash2_neon_l3kv_packv_l1_bfmlal_layout` / alias `flash2_neon_l3kv_l1_bfmlal_layout` 绑定到 `MK_L1BfmlalLayout`。bf16 QKᵀ 8×8 通过 K_col 转成 BFMLAL lane 拓扑；bf16 PV 在 `process_q_tile_lc` 内把 `P_hat` scratch 转成 bf16 后调用 `pv_8x8_pbf16`。这是把 L1-only 85%+ peak 微内核接到端到端 SDPA 的第一版，仍会在外层支付 K_col pack 和 P_hat→bf16 转换成本。
-     - Arm-codex core80 单线程，BGE-small-zh 形状 `B1-N8-L512-S512-E64-Ev64` bf16：non-causal 13.972 → **12.682 ms**（+10.2%），causal 15.176 → **14.210 ms**（+6.8%），对比基线均为 `flash2_neon_l3kv_packv`。
+     - Arm-codex-internal/Arm-codex core80 单线程，BGE-small-zh 形状 `B1-N8-L512-S512-E64-Ev64` bf16：non-causal 13.972 → **12.682 ms**（+10.2%），causal 15.176 → **14.210 ms**（+6.8%），对比基线均为 `flash2_neon_l3kv_packv`。
 - **限制**：`Ev % 8 == 0`（生产场景 head_dim_v ∈ {64, 128, 256} 全满足；不满足时 `TORCH_CHECK` 报错）。
 - **代价**：pack 阶段需要遍历整个 V tensor 一次（读 + 写），bf16 V 总流量 `2 * B*N*S*Ev` 字节，多线程下 ~ms 量级；fp32 时翻倍。
 - **数值等价性**：pack 是纯 memcpy bit-exact 重排，喂给 microkernel 的数据**逐字节相同**；fma 累加序不变，**端到端按位等价**。
@@ -183,7 +183,7 @@ flash2_neon_l3kv_packqkv_pbf16pv    ← softmax 直接产出 bf16 P scratch，PV
   - **`S % 8 == 0` 且 `Ev % 8 == 0`**：`TORCH_CHECK` 失败时引导用户改用 `flash2_neon_l3kv_packv`
   - bf16 下 `E % 4 != 0` 时 partial e_block 不 pack，inner 标量 tail 自动从原始 K 读 [E_main, E)；与 baseline bit-for-bit 等价。fp32 packed-K path 的 tail 直接从 packed K lane layout 标量计算。
 - **Path B 行为**：bf16 路径仍在 KV 不装 L3 且多线程时退化到 `packv_pquad`，避免 3× DRAM 带宽；fp32 packed-K path 会继续使用同一份全量 packed K/V，只把调度切到 taskloop。
-- **数值等价性**：bf16 QKᵀ BFMMLA 累加顺序与 baseline 完全一致；PV bf16 BFMLAL 快路径会把 P_hat 临时 round 到 bf16，非按位等价但误差很小（Arm-codex 小形状 SDPA 对 naive max_abs 0.0078125）。fp32 packed-K QKᵀ 改变累加顺序，不再与旧 `packv_pquad` byte-exact，但应满足 fp32 SDPA 容差。
+- **数值等价性**：bf16 QKᵀ BFMMLA 累加顺序与 baseline 完全一致；PV bf16 BFMLAL 快路径会把 P_hat 临时 round 到 bf16，非按位等价但误差很小（Arm-codex-internal/Arm-codex 小形状 SDPA 对 naive max_abs 0.0078125）。fp32 packed-K QKᵀ 改变累加顺序，不再与旧 `packv_pquad` byte-exact，但应满足 fp32 SDPA 容差。
 - **本机端到端实测**（Apple Silicon P-core，OMP=1，B=1 N=8 E=192 Ev=128，bf16）：
   - 改 PV pquad 前（baseline PV）：L=1024 ≈ 54.5 GFLOPS（同 `packv_pquad`）
   - 改 PV pquad 后：L=256 57.6 / L=512 58.4 / **L=1024 59.3 GFLOPS**，端到端 +7~9% vs baseline；L=128 因 pack overhead 占比高略亏 ~2%
@@ -197,7 +197,7 @@ flash2_neon_l3kv_packqkv_pbf16pv    ← softmax 直接产出 bf16 P scratch，PV
 
 - **文件**：`csrc/sdpa_flash2_neon_l3kv_packqkv.cpp`；核心分支在 `process_q_tile_lc_packqkv<..., kPbf16PV=true>`
 - **数值语义**：softmax 归一化分母保持 fp32；只有写给 PV 的概率矩阵降为 bf16。BGE-small-zh 形状旧/新最大绝对差约 `0.0009765625`。
-- **Arm-codex core80 单线程实测**：
+- **Arm-codex-internal/Arm-codex core80 单线程实测**：
   - BGE-small-zh attention 形状 `B1-N8-L512-S512-E64-Ev64` bf16：non-causal `10.776 → 9.989 ms`（`50.80 → 54.79 GFLOPS`，+7.3%）；causal `12.389 → 11.317 ms`（`22.13 → 24.23 GFLOPS`，+9.5%）。
   - 长序列 MLA 形状 `B1-N32-L2048-S2048-E192-Ev128` bf16：non-causal `1422.704 → 1276.547 ms`（`60.85 → 67.82 GFLOPS`，+11.5%）；causal `952.715 → 867.951 ms`（`45.46 → 49.89 GFLOPS`，+9.8%）。
 - **profile 组成**：BGE non-causal 下 PV `4.548 → 3.353 ms`，softmax `1.963 → 2.586 ms`；长序列 non-causal 下 PV `577.535 → 429.397 ms`，softmax `129.362 → 169.733 ms`。因此收益主要来自 PV，代价是 softmax 阶段多一次 bf16 store / conversion。
@@ -272,7 +272,7 @@ flash2_neon_l3kv_packqkv_pbf16pv    ← softmax 直接产出 bf16 P scratch，PV
 - **QKᵀ bf16 layout**：Q 保持 `Q[8][E]` row-major；K 预转置成 `K_col[E][8]`，即 reduce 维优先。这样每个 reduce step 可以用一条 `vld1q_bf16` 取 8 个 K 列，QKT 在计算形态上变成 `P_bf16[8,E] @ V_bf16[E,8]`。
 - **QKᵀ bf16 kernel**：`gemm_qkt_microkernel_8x8_bf16_qrow_kcol_bfmlal`。主体每 4 个 E lane 载入 8 行 Q 的 `bfloat16x4_t` 和 4 条 K_col `bfloat16x8_t`，用 `vbfmlalbq_lane_f32 / vbfmlaltq_lane_f32` 累加 even/odd 列，末尾 `zip` 回 row-major 并乘 `scale`。benchmark 中 `qkt_8x8_kcol` 直接计时 K_col 已由 caller 提供的纯 L1 layout；`qkt_8x8` 仍保留 thread-local cache 版本。
 - **PV bf16 layout**：沿用 `pv_8x8_pbf16` 上限路径，假设 softmax 已经直接产出 bf16 P scratch，V 为 `V[Sk][8]` 连续布局；该路径只评估 microkernel 上限，不改变当前真实 fp32-P PV 入口。
-- **Arm-codex core80 单线程实测**（`OMP_NUM_THREADS=1 taskset -c 80`，E=Sk=768，iters=1,000,000，单核峰值按 92 GFLOPS）：
+- **Arm-codex-internal/Arm-codex core80 单线程实测**（`OMP_NUM_THREADS=1 taskset -c 80`，E=Sk=768，iters=1,000,000，单核峰值按 92 GFLOPS）：
   - `qkt_8x8_kcol`：82.64 GFLOPS，约 **89.8% peak**。
   - `pv_8x8_pbf16`：82.62 GFLOPS，约 **89.8% peak**。
 - **正确性**：`validate_microkernel("l1_bfmlal_layout", "bf16", E, Sk)` 在 E/Sk=17/64/512 上 `qkt_8x8_max_abs=0`、`qkt_8x8_kcol_max_abs=0`、`pv_8x8_pbf16_max_abs=0`；默认真实 `pv_8x8` 仍是 P_hat fp32→bf16 的 pquad BFMLAL 路径，`max_abs≈1.6e-6`。
@@ -316,8 +316,8 @@ flash2_neon_l3kv_packqkv_pbf16pv    ← softmax 直接产出 bf16 P scratch，PV
 | 2. Q+K 双 pack + `x4` | `qk_packqk_seq` | `qk_packk_inner` 仍胜 | E=1024,Sk=1024：`qk_packqk_seq` 53.48 GFLOPS / 0.90× | 双侧 `vld1q_u16_x4` 在目标机上不适合该 kernel |
 | 3. Q+K 双 pack + 4×1 load | `qk_packqk_seq4` | **`qk_packqk_seq4`** | E=1024,Sk=1024：70.28 GFLOPS / 1.18× | 4 条独立 `vld1q_u16` 明显优于 `x4`；Q 侧 pack 在 microkernel 层有额外收益 |
 | 4. seq4 调度变体 | `ptr` / `bmajor` / `pipe_a` / `pipe_b` | **`qk_packqk_seq4_bmajor`** | E=1024,Sk=1024：73.24 GFLOPS / 1.23× | B-major 顺序额外 +4.2%；指针递增无收益；pipe_a/pipe_b 因 load-use latency 不如全 load 后 compute |
-| 5. bmajor 地址计算削减 | 在 `qk_packqk_seq4_bmajor` 内合并 `ptr` 思路并做 2-way e-block unroll | **`qk_packqk_seq4_bmajor`** | Arm-codex core80，Sk=128：E64 53.44→57.00 / E128 60.34→64.78 / E192 65.07→69.05 GFLOPS | 对 packqkv 组合 trait 的 QKᵀ 主路径提升 +6.1%~+7.4%；PV 未改，仍约 55 GFLOPS |
-| 6. L1-only 自由 layout | K 改为 reduce-major `K_col[E][8]`，QKT 改走 BFMLAL lane 拓扑 | **`l1_bfmlal_layout`** | Arm-codex core80，E=Sk=768：`qkt_8x8_kcol` 82.64 GFLOPS / PV pbf16 82.62 GFLOPS，均约 89.8% peak | 不考虑外层接入成本时，bf16 QKT/PV microkernel 已超过 85% of 92 GFLOPS；后续外层化要解决 K_col 和 bf16 P scratch 的生产成本 |
+| 5. bmajor 地址计算削减 | 在 `qk_packqk_seq4_bmajor` 内合并 `ptr` 思路并做 2-way e-block unroll | **`qk_packqk_seq4_bmajor`** | Arm-codex-internal/Arm-codex core80，Sk=128：E64 53.44→57.00 / E128 60.34→64.78 / E192 65.07→69.05 GFLOPS | 对 packqkv 组合 trait 的 QKᵀ 主路径提升 +6.1%~+7.4%；PV 未改，仍约 55 GFLOPS |
+| 6. L1-only 自由 layout | K 改为 reduce-major `K_col[E][8]`，QKT 改走 BFMLAL lane 拓扑 | **`l1_bfmlal_layout`** | Arm-codex-internal/Arm-codex core80，E=Sk=768：`qkt_8x8_kcol` 82.64 GFLOPS / PV pbf16 82.62 GFLOPS，均约 89.8% peak | 不考虑外层接入成本时，bf16 QKT/PV microkernel 已超过 85% of 92 GFLOPS；后续外层化要解决 K_col 和 bf16 P scratch 的生产成本 |
 
 #### 目标机 E=1024,Sk=1024 单点数据
 
@@ -387,10 +387,20 @@ wide-stride `TILESTORED` 的 raw store path 比 scratch→ZMM store 更慢。当
 
 ### Sparse MLA 连续尾块 8×8 候选
 
-`flash_mla_sparse_fwd` 的默认尾部仍是 `indexed_4x4`。内部比较入口新增
-`masked_dense_8x8` 与 `masked_dense_8x8_pruned`：planner 只提升完整 8-query、
-单调连续前缀且可安全加载 8 行 K/V 的 ragged tail；重复、离散、partial block
-及越界风险继续回落 indexed 路径。
+`flash_mla_sparse_fwd` 的 BF16 默认变体已从纯 `indexed_4x4` 切到带门限的
+`indexed_4x4_2d`；未触发 split 时，两者使用同一个 4×4 尾部计算。当 8-query
+block 数不超过请求线程数的一半时，
+最重的 block 最多拆成 8 个互斥 KV shard；每个 shard 产出局部 online-softmax
+`(m,l,O)`，再按 max-shift 公式合并。query-block 并行度已经足够时不分片、
+不分配 partial state，也不启动 merge OpenMP 区域。fp32 路径保持原 1D 调度。
+
+planner 同时支持 sliding recent window：相邻 8 行起点不同的连续 run 会提取
+共同交集为 dense segment，左右 fringe 留给 indexed/masked 路径。这样 128-token
+recent window 在完整序列上形成梯形，而不是退化成大量 4×4 gather tile。
+
+内部比较入口保留 `masked_dense_8x8` 与 `masked_dense_8x8_pruned`：planner 只提升
+完整 8-query、单调连续前缀且可安全加载 8 行 K/V 的 ragged tail；重复、离散、
+partial block 及越界风险继续回落 indexed 路径。
 
 - full masked：复用已有 packed-Q/K BFMMLA 8×8 与 pbf16 PV，softmax 前按行
   `valid_len` mask；同一 head 的 packed Q 在 dense/masked segment 间复用。
@@ -411,6 +421,46 @@ mask 时分别快 5.8% / 5.8% / 5.1% / 4.7%。因此 2×2 QK 与 exact-lane PV
 pruning 本身有效；2048 forward 无收益来自 masked tail 仅占有效 pairs 的
 0.644%，而不是 pruned 微内核没有减少尾部开销。
 
+### Sparse MLA fused online epilogue 与 PV 指令比较
+
+新增三个内部实验入口：`masked_dense_8x8_fused_fmla`、
+`masked_dense_8x8_fused_bfmlal`、`masked_dense_8x8_fused_bfmmla`。三者共用
+pruned BFMMLA QK 和 SVE online-softmax，score 与 BF16 `p_hat` 不再写入 scratch；
+差别只在 PV。实现仅对 SVL128/256 开启，其他 SVL 明确回落 materialized 路径。
+
+1,024-block causal tail-only、单线程、BF16 `q[8192,32,192]`、`d_v=128`、
+5 warmup + 21 次轮转交错结果：
+
+| 机器 / SVL | materialized pruned | fused FMLA | fused BFMLAL | fused BFMMLA | 结论 |
+|---|---:|---:|---:|---:|---|
+| Amazon 192C CPU96 / 128 | 27.361 ms | 29.532 ms | 28.267 ms | 46.403 ms | materialized 最快 |
+| Amazon 8C CPU0 / 256 | 55.238 ms | 45.385 ms | 49.876 ms | 49.505 ms | FMLA 最快 |
+
+所以“消除中间往返”不是跨机器恒胜：SVL256 的 fused FMLA 比 materialized 快
+17.84%，但 SVL128 慢 7.93%。BFMMLA 还要支付 probability replication、专用 V
+pack 和 2×2 output interleave/deinterleave；K=8 太小，矩阵指令数减少不足以覆盖
+固定开销，两台机器都不是最优。三个 fused 入口保持实验状态，不进入公开默认。
+
+### Sparse MLA 真实 DSV4 长上下文与 2D 调度
+
+`dsv4-sparse` benchmark 使用两个不重叠的 cache 区域：4:1 compressed cache 中
+最多 512 个排序但离散的选择（4a 不是三角），以及达到 128 后滑动的 recent
+window（完整序列呈梯形）。Amazon 192C NUMA1 cores 96--191、96T、BF16
+`h_q=32,d_qk=192,d_v=128`、5 warmup + 21 次轮转交错：
+
+| query / context | indexed 1D | guarded 2D | speedup / change |
+|---|---:|---:|---:|
+| 64 / end 4096 | 13.600 ms | 2.558 ms | 5.317× |
+| 128 / end 4096 | 13.876 ms | 3.584 ms | 3.872× |
+| 256 / end 4096 | 14.657 ms | 6.439 ms | 2.276× |
+| full 4096 | 51.269 ms | 51.156 ms | -0.22% latency |
+| full 8192 | 138.608 ms | 138.866 ms | +0.19% latency |
+
+短 chunk 的 2D 输出相对 1D max abs 为 0.00195312；full 4096/8192 因门限
+关闭 split，输出 bitwise equal。8-core SVL256 上 64-token 为 26.278/26.298 ms，
+说明同一门限不会在小线程池误拆。完整方法、命令、raw-sample 结论、数值覆盖与
+下一步见 `optimizations/sparse_mla/results/amazon_sparse_mla_2d_fused_20260812.md`。
+
 完整方法、逐轮尝试、数值结果与保留门限见
 `optimizations/sparse_mla/results/amazon_192c_masked_tail_20260812.md`。
 
@@ -428,6 +478,7 @@ pruning 本身有效；2048 forward 无收益来自 masked tail 仅占有效 pai
 | **Long-context bf16，KV 装 L3，S%8==0** | **`flash2_neon_l3kv_packqkv`** | Q + K + V 都 pre-pack，BFMMLA inner 走 packqk_seq4_bmajor 路径（microkernel +23%）；端到端预期 +2–5% vs `packv` |
 | Long-context fp32 | `flash2_neon_l3kv_qk_ublock4` | 唯一打开 fp32 GEMM 瓶颈的路径；packv 在 fp32 下负收益 |
 | 想跑 cache-aware 但 KV 装得下 L3 | `flash2_neon_cache_qk_ublock4`（fp32）/ `flash2_neon_cache_pquad`（bf16 PV 或 fp32 PV-only）/ `flash2_neon_l3kv_pquad`（path A 退化） | 性能近似 |
+| Sparse MLA BF16，短 query chunk + 长 KV | 公开 `flash_mla_sparse_fwd`（guarded `indexed_4x4_2d`） | query blocks≤threads/2 时最多 8-way KV split；否则回退 1D indexed；fused 8×8 FMLA/BFMLAL/BFMMLA 只作实验比较 |
 | 历史接口兼容 | `flash2_neon_cache` / `flash2_neon_l3kv`（无后缀别名） | 自动映射到 `_baseline` |
 
 ---
@@ -438,6 +489,7 @@ pruning 本身有效；2048 forward 无收益来自 masked tail 仅占有效 pai
 
 | 日期 | 改动概述 | 受影响文件 |
 |---|---|---|
+| 2026-08-12 | **Sparse MLA fused online epilogue、三种 PV 指令比较与 2D KV split**：新增 SVL128/256 的 fused QK→online-softmax→PV 实验，消除 8×8 score/`p_hat` scratch；同一框架比较 FMLA/BFMLAL/BFMMLA，tail-only 上 SVL256 以 FMLA 最快（45.385 ms vs materialized 55.238），SVL128 则 materialized 最快（27.361 ms），BFMMLA 两边均非最优，故不切默认。新增 associative online-softmax partial merge 与最多 8-way KV shard，BF16 公开入口在 query blocks≤threads/2 时启用；真实 DSV4 4a 离散 top-k + 128 sliding window 下，192C cores96--191 的 64/128/256-token chunk 分别加速 5.317/3.872/2.276×，full 4096/8192 保持 ±0.22%。两台 SVL128/256 目标机各 34 tests passed。 | 改 `csrc/{sparse_mla.cpp,sparse_mla_tail_microkernels.cpp,sparse_mla_tail_microkernels.h,SDPA_VERSIONS.md}`、`tests/{test_sparse_mla.py,bench_sparse_mla_tail_variants.py}`、`docs/sparse_mla_vllm_integration.md`、`optimizations/sparse_mla/{manifest.yaml,results/amazon_sparse_mla_2d_fused_20260812.md}` |
 | 2026-08-12 | **Sparse MLA 连续 ragged tail 的 full/pruned 8×8 候选**：新增安全的 monotonic-tail planner、packed masked 8×8 QK/PV、2×2 BFMMLA pruning、BFMLAL valid-lane pruning、跨 segment packed-Q 复用与内部三版本 benchmark 入口。Amazon 192C NUMA1、`q[2048,32,192]`、V4-like 2,621,952 pairs/head、21-run 轮转交错：1T indexed/full/pruned 为 586.217/544.225/541.370 ms（候选快 7.2--7.7%）；12/32/96T 三者均约 55 ms，full/pruned 没有稳定收益且 32T 回退约 1.3--1.5%，因此公开默认继续 `indexed_4x4`。1,024-block tail-only 隔离确认 pruned 相对 full 在 causal 快 5.0--12.9%、V4-mix 快 4.7--5.8%，说明 E2E 差异小是尾部占比稀释而非 pruning 无效。记录了初版 full tile、初版 QK pruning、E/8 展开+向量 store+Q reuse、精确 PV pruning 四轮尝试。 | 改 `csrc/{sparse_mla.cpp,module.cpp,SDPA_VERSIONS.md}`、`tests/{test_sparse_mla.py,bench_sparse_mla_tail_variants.py}`；新建 `csrc/sparse_mla_tail_microkernels.{h,cpp}`、`optimizations/sparse_mla/{manifest.yaml,results/amazon_192c_masked_tail_20260812.md}` |
 | 2026-07-28 | **DeepSeek V4 attention MN 路径 A 只 pack 一次**：Linux NEON 下新增 attention-prefixed packed-A M8 BF16/FP32 row-major store kernel；OpenMP team 先协作把 hidden states 写成一份 reorder-M8 buffer，尾部补零，经一次 publish barrier 后由四个 GEMM 的全部 N-group 复用。默认仅在 MN requested N groups >=24 时启用，`FUSED_CPP_ATTN_GEMM_PREPACK_A=on/off` 可强制选择，SVE 与其他 schedule 保持原路径。Amazon 192C NUMA0、M2048/K4096/N 总计3904：强制 off/on 在 24/32/48/64/80/96T 分别加速 1.038/1.028/1.047/1.020/1.016/1.030x；96T 21-run 为 3.154→3.059 ms、20.764→21.411 TFLOP/s。2--16T 存在最高约 4.7% 回退，因此 auto 门限避开该区间；31 项本地、远程 NEON、远程 SVE 测试均通过。 | 改 `csrc/deepseek_v4_attn_gemm_fused.cpp`、`csrc/moe/arm/neon_bf16/kernels.S`、`setup.py`、`tests/{bench_deepseek_v4_attn_gemm_fused.py,test_deepseek_v4_attn_gemm_fused.py}`、`optimizations/deepseek_v4_attn_gemm/{manifest.yaml,results/amazon_192c_attn_gemm_scheduler_20260728.md}`、`csrc/SDPA_VERSIONS.md` |
 | 2026-07-28 | **DeepSeek V4 attention 四 GEMM MN auto 默认调度**：新增 `legacy/m8/pool/mn` 四种运行时选择并将无环境变量时的默认值切到 `mn`；M8 对齐切 M 只保留一次全局尾块，共享 OpenMP 任务池允许四个不同 N 的 GEMM 互相补齐负载，MN 模式再按 backend N tile 切 packed-B 并采用 owner-first M8 panel stealing。Amazon 192C NUMA0 0-95、M2048/K4096/N 总计 3904、65.498 GFLOP：legacy 12.361 ms / 5.299 TFLOP/s，M8 8.674 ms / 7.551 TFLOP/s，pool 7.914 ms / 8.276 TFLOP/s，MN auto 3.329 ms / 19.676 TFLOP/s；MN 1T→96T 为 268.1 GFLOP/s→20.66 TFLOP/s（77.1x，80.3% 线性度）。配对 sweep 中 MN 在 1--4T 与 legacy 持平，8/16/24/32/48/64/80/96T 分别为 1.115/1.276/1.827/2.404/3.688/2.839/3.242/3.735x。`legacy` 保留为显式回退，normed 路径尚未接入。 | 改 `csrc/deepseek_v4_attn_gemm_fused.cpp`、`tests/{bench_deepseek_v4_attn_gemm_fused.py,test_deepseek_v4_attn_gemm_fused.py}`；新建 `optimizations/deepseek_v4_attn_gemm/{manifest.yaml,results/amazon_192c_attn_gemm_scheduler_20260728.md}`；改 `csrc/SDPA_VERSIONS.md` |
@@ -445,11 +497,11 @@ pruning 本身有效；2048 forward 无收益来自 masked tail 仅占有效 pai
 | 2026-07-20 | **x86 AMX MoE W2 store/merge epilogue 实验与负结果保留**：新增 cache-key 隔离的 `baseline/combined/tile_store`。`combined` 在 M1N4/N64 只生成一次 row route address；`tile_store` 让 TMM 直接写 expert-contiguous FP32 workspace，并由预建 route-row map 做 AVX-512 weighted merge。三条路径跨 pattern/tail/单双线程 bit-exact，top-k=1 direct BF16 保持 vector conversion。C8i K512 rotated W2-only `tile_store` 为 +1.0%~+14.5%，但 K32 store-dominated latency +12.8%~+22.8%，end-to-end 为 -4.5%~+1.7%，所以 auto 仍为 baseline；完整 x86 suite 122 passed/4 skipped。 | 改 `csrc/moe/x86/avx512_bf16/{jit_kernels.cpp,kernels.cpp,kernels.h,executor.cpp}`、`tests/test_moe_avx512_bf16.py`、`benchmarks/bench_amx_bf16_{patterns.py,w2_epilogues.cpp,merge.cpp}`、`optimizations/fused_moe_avx512/{README.md,TODO.md,manifest.yaml,results/amazon_c8i_2core_amx_w2_epilogue_20260720.md}`、`csrc/SDPA_VERSIONS.md` |
 | 2026-07-20 | **x86 AMX MoE W13 SiLU epilogue 优化与负结果保留**：新增 `baseline/resident/pipelined/rcp14` 四种 cache-key 隔离的 Xbyak 路径。`resident` 把多项式/exp 常量一次广播后驻留 ZMM，保持逐行算术顺序和 BF16 bit-exact，M16/degree5 JIT 3972→2836 B，K256 standalone +8.4%，设为 auto；两行 stage pipeline 未稳定胜过 resident，`VRCP14PS` 非 bit-exact 且端到端收益处于噪声范围，均仅保留实验开关。C8i 完整 x86 suite 114 passed/4 skipped。 | 改 `csrc/moe/x86/avx512_bf16/jit_kernels.cpp`、`tests/test_moe_avx512_bf16.py`、`benchmarks/bench_amx_bf16_w13.cpp`、`benchmarks/bench_amx_bf16_patterns.py`、`optimizations/fused_moe_avx512/{README.md,TODO.md,manifest.yaml,results/amazon_c8i_2core_amx_silu_20260720.md}`、`csrc/SDPA_VERSIONS.md` |
 | 2026-06-10 | **`flash2_neon_l3kv_packqkv*` fp32 路径改为全量 pack K + packed-K lane-FMLA QKᵀ**：fp32 输入不再 delegate 到 `flash2_neon_l3kv_packv_pquad`。入口新增 K pack layout `[B,N,S/8,E,8]`，Q 保持 row-major；QKᵀ 8×8 用 `MK_Fp32PackK8PQuad` 按 4 个 E lane 加载 Q、按 K lane 向量累加，消掉旧 fp32 QKᵀ 的 per-score horizontal reduction；PV 继续使用 fp32 pquad。fp32 数值不再与旧 delegate bit-exact，改按 fp32 SDPA 容差验证。 | 改 `csrc/sdpa_flash2_neon_l3kv_packqkv.cpp`（fp32 packK helper、packed-K QKᵀ trait、fp32 entry 路由）；改 `tests/test_sdpa_l3kv_packqkv.py`（fp32 delegate 断言改为 baseline 容差比较）；改 `src/fused_cpp/sdpa.py` 与 `csrc/SDPA_VERSIONS.md`（metadata/文档） |
-| 2026-06-01 | **新增 SDPA 版本 `flash2_neon_l3kv_packqkv_pbf16pv`**：在 packqkv 的 Q/K/V pre-pack 路径上增加 `kPbf16PV` 模板开关，softmax 计算 fp32 sum 但把 full 8-row block 的 `P_hat` 直接写成 bf16 scratch，PV 改调 `pv_8x8_pbf16`，旧 `flash2_neon_l3kv_packqkv` 保持不变。SVE `FCVT/FCVTNT` 压缩 store 实测 softmax 过慢，最终 bf16-store helper 使用 NEON `vcvt_bf16_f32`。Arm-codex core80 单线程：BGE-small-zh 形状 bf16 non-causal 10.776→9.989 ms（+7.3%）、causal 12.389→11.317 ms（+9.5%）；`B1-N32-L2048-S2048-E192-Ev128` bf16 non-causal 1422.704→1276.547 ms（+11.5%）、causal 952.715→867.951 ms（+9.8%）。 | 改 `csrc/sdpa_flash2_neon_l3kv_impl.h`（新增 `vectorized_exp_minus_bf16_impl`、`process_q_tile_lc_packqkv` / run path 的 `kPbf16PV` 分支与 bf16 P scratch）；改 `csrc/sdpa_flash2_neon_l3kv_packqkv.cpp`（新增版本入口和注册）；改 `src/fused_cpp/sdpa.py`（metadata）；改 `tests/test_sdpa_versions_equiv.py`（packqkv 约束覆盖新版本）；改 `csrc/SDPA_VERSIONS.md` |
-| 2026-05-31 | **新增 SDPA 版本 `flash2_neon_l3kv_packv_l1_bfmlal_layout` 与别名 `flash2_neon_l3kv_l1_bfmlal_layout`**：在 packv L3KV 拓扑上接入 `MK_L1BfmlalLayout`，bf16 QKᵀ 8×8 使用 K_col BFMLAL microkernel，bf16 PV 对支持 `kHasPvPbf16` 的 trait 自动把 `P_hat` scratch 转 bf16 并调用 `pv_8x8_pbf16`。这版用于端到端评估 L1-only 85%+ peak 微内核的外层成本；fp32 仍走同 trait 的普通 fp32 fallback。Arm-codex core80 单线程 BGE-small-zh 形状 bf16：non-causal 12.682 ms（43.16 GFLOPS）vs packv 13.972 ms；causal 14.210 ms（19.30 GFLOPS）vs packv 15.176 ms。 | 改 `csrc/sdpa_flash2_neon_l3kv_impl.h`（增加 `pv_8x8_pbf16` trait 检测、P_hat_bf16 scratch 与 PV 分发）；改 `csrc/sdpa_flash2_neon_l3kv_packv.cpp`（注册新 SDPA 版本与别名）；改 `src/fused_cpp/sdpa.py`（Python registry metadata）；改 `csrc/SDPA_VERSIONS.md` |
-| 2026-05-31 | **新增 L1-only bf16 自由 layout 微内核 `l1_bfmlal_layout`，目标从 90% 调整为 85% 后达标**：新增 `pack_k_8rows_to_col_bf16` 把 K 从 `K[8][E]` 转成 reduce-major `K_col[E][8]`，并新增 `gemm_qkt_microkernel_8x8_bf16_qrow_kcol_bfmlal`，让 QKT 在 microkernel 层变成与 pre-bf16-P PV 相同的 BFMLAL lane 形态。该 trait 只做 L1 工作集上限评估，不考虑 SDPA 外层布局生产成本；`qkt_8x8_kcol` 直接计时 K_col 已由 caller 提供的纯布局路径。Arm-codex core80 单线程、E=Sk=768、iters=1,000,000：`qkt_8x8_kcol` 82.64 GFLOPS、`pv_8x8_pbf16` 82.62 GFLOPS，均约 89.8% of 92 GFLOPS，超过 85% 目标；`validate_microkernel` E/Sk=17/64/512 上 `qkt_8x8_max_abs=0`、`qkt_8x8_kcol_max_abs=0`、`pv_8x8_pbf16_max_abs=0`。 | 新建 `csrc/sdpa_microkernels/impls/mk_l1_bfmlal_layout.h`；改 `csrc/sdpa_microkernels/neon_cache_microkernels.h`（新增 K_col pack helper、QKT K_col BFMLAL 内核，并微调 pbf16 PV load/compute 交错）；改 `csrc/sdpa_microkernels/all_impls.h`、`csrc/sdpa_microkernels/mk_registry.cpp`（注册新 trait）；改 `csrc/sdpa_microkernels/mk_registry_helpers.h`（新增 `qkt_8x8_kcol` validate/bench 可选项）；改 `csrc/SDPA_VERSIONS.md`（新增 trait 章节、迭代表和 changelog） |
-| 2026-05-31 | **bf16 PV pquad 切 BFMLAL 快路径**：`gemm_pv_microkernel_8x8_bf16_pquad` 在 BF16 arithmetic 目标上优先派到新增 `gemm_pv_microkernel_8x8_bf16_pbf16_bfmlal`。每 4-k 段把 8 行 P_hat quad 用 `vcvt_bf16_f32` 临时 round 到 bf16，再用 `vbfmlalbq_lane_f32 / vbfmlaltq_lane_f32` 乘 bf16 V；主体避开 V widen，尾部 Sk%4 保持原 fp32 widen FMA。Arm-codex core80 单线程：`pquad` / `qk_packqk_seq4_bmajor_pv_pquad` 的 bf16 `pv_8x8` 在 Sk=128 从上一轮约 54.8 GFLOPS 提到 E64 59.10 / E128 59.52 / E192 58.68 GFLOPS，约 64–65% of 92 GFLOPS 单核峰值；`validate_microkernel` E=17/64/128/192 max_abs≈1.6e-6，小形状 SDPA 对 naive max_abs=0.0078125。仍未达到 90%，下一步重点是降低 BFMLAL 路径的 P convert / lane 指令开销，或改 PV 数据布局。 | 改 `csrc/sdpa_microkernels/neon_cache_microkernels.h`（新增 pbf16 BFMLAL PV 内核并接到 bf16 pquad）；改 `csrc/sdpa_microkernels/impls/mk_pquad.h`、`csrc/sdpa_microkernels/impls/mk_qk_packqk_seq4_bmajor_pv_pquad.h`（注释同步数值语义）；改 `csrc/SDPA_VERSIONS.md`（本节 + `MK_PQuad` / packqkv 记录） |
-| 2026-05-31 | **`qk_packqk_seq4_bmajor` bf16 QKᵀ inner loop 优化**：把 `gemm_qkt_microkernel_8x8_bf16_packqk_seq4_bmajor_inner` 的 packed Q/K 地址从每轮 `(e/4)*32` 改为显式 `q_ptr/k_ptr` 递增，并将常见 `E % 8 == 0` 路径按 2 个 e-block 展开；BFMMLA 发射顺序、pack layout、tail 与数值语义不变。Arm-codex core80 单线程验证：`qk_packqk_seq4_bmajor_pv_pquad` bf16 QKᵀ 在 Sk=128 下 E64 53.44→57.00 GFLOPS（+6.7%）、E128 60.34→64.78（+7.4%）、E192 65.07→69.05（+6.1%）；PV 未改，仍约 55 GFLOPS（约 60% of 92 GFLOPS 单核峰值），后续优化重点仍是 PV 与 QKᵀ 90% peak。验证包含 `validate_microkernel` E=17/64/128/192 全部 max_abs=0。 | 改 `csrc/sdpa_microkernels/neon_cache_microkernels.h`（bmajor inner loop 指针递增 + 2-way 展开）；改 `csrc/SDPA_VERSIONS.md`（本节 + packqkv/microkernel 记录） |
+| 2026-06-01 | **新增 SDPA 版本 `flash2_neon_l3kv_packqkv_pbf16pv`**：在 packqkv 的 Q/K/V pre-pack 路径上增加 `kPbf16PV` 模板开关，softmax 计算 fp32 sum 但把 full 8-row block 的 `P_hat` 直接写成 bf16 scratch，PV 改调 `pv_8x8_pbf16`，旧 `flash2_neon_l3kv_packqkv` 保持不变。SVE `FCVT/FCVTNT` 压缩 store 实测 softmax 过慢，最终 bf16-store helper 使用 NEON `vcvt_bf16_f32`。Arm-codex-internal/Arm-codex core80 单线程：BGE-small-zh 形状 bf16 non-causal 10.776→9.989 ms（+7.3%）、causal 12.389→11.317 ms（+9.5%）；`B1-N32-L2048-S2048-E192-Ev128` bf16 non-causal 1422.704→1276.547 ms（+11.5%）、causal 952.715→867.951 ms（+9.8%）。 | 改 `csrc/sdpa_flash2_neon_l3kv_impl.h`（新增 `vectorized_exp_minus_bf16_impl`、`process_q_tile_lc_packqkv` / run path 的 `kPbf16PV` 分支与 bf16 P scratch）；改 `csrc/sdpa_flash2_neon_l3kv_packqkv.cpp`（新增版本入口和注册）；改 `src/fused_cpp/sdpa.py`（metadata）；改 `tests/test_sdpa_versions_equiv.py`（packqkv 约束覆盖新版本）；改 `csrc/SDPA_VERSIONS.md` |
+| 2026-05-31 | **新增 SDPA 版本 `flash2_neon_l3kv_packv_l1_bfmlal_layout` 与别名 `flash2_neon_l3kv_l1_bfmlal_layout`**：在 packv L3KV 拓扑上接入 `MK_L1BfmlalLayout`，bf16 QKᵀ 8×8 使用 K_col BFMLAL microkernel，bf16 PV 对支持 `kHasPvPbf16` 的 trait 自动把 `P_hat` scratch 转 bf16 并调用 `pv_8x8_pbf16`。这版用于端到端评估 L1-only 85%+ peak 微内核的外层成本；fp32 仍走同 trait 的普通 fp32 fallback。Arm-codex-internal/Arm-codex core80 单线程 BGE-small-zh 形状 bf16：non-causal 12.682 ms（43.16 GFLOPS）vs packv 13.972 ms；causal 14.210 ms（19.30 GFLOPS）vs packv 15.176 ms。 | 改 `csrc/sdpa_flash2_neon_l3kv_impl.h`（增加 `pv_8x8_pbf16` trait 检测、P_hat_bf16 scratch 与 PV 分发）；改 `csrc/sdpa_flash2_neon_l3kv_packv.cpp`（注册新 SDPA 版本与别名）；改 `src/fused_cpp/sdpa.py`（Python registry metadata）；改 `csrc/SDPA_VERSIONS.md` |
+| 2026-05-31 | **新增 L1-only bf16 自由 layout 微内核 `l1_bfmlal_layout`，目标从 90% 调整为 85% 后达标**：新增 `pack_k_8rows_to_col_bf16` 把 K 从 `K[8][E]` 转成 reduce-major `K_col[E][8]`，并新增 `gemm_qkt_microkernel_8x8_bf16_qrow_kcol_bfmlal`，让 QKT 在 microkernel 层变成与 pre-bf16-P PV 相同的 BFMLAL lane 形态。该 trait 只做 L1 工作集上限评估，不考虑 SDPA 外层布局生产成本；`qkt_8x8_kcol` 直接计时 K_col 已由 caller 提供的纯布局路径。Arm-codex-internal/Arm-codex core80 单线程、E=Sk=768、iters=1,000,000：`qkt_8x8_kcol` 82.64 GFLOPS、`pv_8x8_pbf16` 82.62 GFLOPS，均约 89.8% of 92 GFLOPS，超过 85% 目标；`validate_microkernel` E/Sk=17/64/512 上 `qkt_8x8_max_abs=0`、`qkt_8x8_kcol_max_abs=0`、`pv_8x8_pbf16_max_abs=0`。 | 新建 `csrc/sdpa_microkernels/impls/mk_l1_bfmlal_layout.h`；改 `csrc/sdpa_microkernels/neon_cache_microkernels.h`（新增 K_col pack helper、QKT K_col BFMLAL 内核，并微调 pbf16 PV load/compute 交错）；改 `csrc/sdpa_microkernels/all_impls.h`、`csrc/sdpa_microkernels/mk_registry.cpp`（注册新 trait）；改 `csrc/sdpa_microkernels/mk_registry_helpers.h`（新增 `qkt_8x8_kcol` validate/bench 可选项）；改 `csrc/SDPA_VERSIONS.md`（新增 trait 章节、迭代表和 changelog） |
+| 2026-05-31 | **bf16 PV pquad 切 BFMLAL 快路径**：`gemm_pv_microkernel_8x8_bf16_pquad` 在 BF16 arithmetic 目标上优先派到新增 `gemm_pv_microkernel_8x8_bf16_pbf16_bfmlal`。每 4-k 段把 8 行 P_hat quad 用 `vcvt_bf16_f32` 临时 round 到 bf16，再用 `vbfmlalbq_lane_f32 / vbfmlaltq_lane_f32` 乘 bf16 V；主体避开 V widen，尾部 Sk%4 保持原 fp32 widen FMA。Arm-codex-internal/Arm-codex core80 单线程：`pquad` / `qk_packqk_seq4_bmajor_pv_pquad` 的 bf16 `pv_8x8` 在 Sk=128 从上一轮约 54.8 GFLOPS 提到 E64 59.10 / E128 59.52 / E192 58.68 GFLOPS，约 64–65% of 92 GFLOPS 单核峰值；`validate_microkernel` E=17/64/128/192 max_abs≈1.6e-6，小形状 SDPA 对 naive max_abs=0.0078125。仍未达到 90%，下一步重点是降低 BFMLAL 路径的 P convert / lane 指令开销，或改 PV 数据布局。 | 改 `csrc/sdpa_microkernels/neon_cache_microkernels.h`（新增 pbf16 BFMLAL PV 内核并接到 bf16 pquad）；改 `csrc/sdpa_microkernels/impls/mk_pquad.h`、`csrc/sdpa_microkernels/impls/mk_qk_packqk_seq4_bmajor_pv_pquad.h`（注释同步数值语义）；改 `csrc/SDPA_VERSIONS.md`（本节 + `MK_PQuad` / packqkv 记录） |
+| 2026-05-31 | **`qk_packqk_seq4_bmajor` bf16 QKᵀ inner loop 优化**：把 `gemm_qkt_microkernel_8x8_bf16_packqk_seq4_bmajor_inner` 的 packed Q/K 地址从每轮 `(e/4)*32` 改为显式 `q_ptr/k_ptr` 递增，并将常见 `E % 8 == 0` 路径按 2 个 e-block 展开；BFMMLA 发射顺序、pack layout、tail 与数值语义不变。Arm-codex-internal/Arm-codex core80 单线程验证：`qk_packqk_seq4_bmajor_pv_pquad` bf16 QKᵀ 在 Sk=128 下 E64 53.44→57.00 GFLOPS（+6.7%）、E128 60.34→64.78（+7.4%）、E192 65.07→69.05（+6.1%）；PV 未改，仍约 55 GFLOPS（约 60% of 92 GFLOPS 单核峰值），后续优化重点仍是 PV 与 QKᵀ 90% peak。验证包含 `validate_microkernel` E=17/64/128/192 全部 max_abs=0。 | 改 `csrc/sdpa_microkernels/neon_cache_microkernels.h`（bmajor inner loop 指针递增 + 2-way 展开）；改 `csrc/SDPA_VERSIONS.md`（本节 + packqkv/microkernel 记录） |
 | 2026-05-29 | **`flash2_neon_l3kv_packqkv` 接入 PV pquad**：`process_q_tile_lc_packqkv` 的 PV 调用从 hardcoded `gemm_pv_8x8 / gemm_pv_tail`（baseline）切到 `MK_QkPackqkSeq4BmajorPvPquad::pv_8x8 / pv_tail`，bf16 路径走新 `gemm_pv_microkernel_8x8_bf16_pquad`；fp32 输入的 delegate 路由从 `flash2_neon_l3kv_packv` 改为 `flash2_neon_l3kv_packv_pquad`（同步两处：fp32 entry + path B 退化）。不新增 SDPA 顶层变体、不模板化 packqkv（保持 bf16-only 专用 path 形态）。`test_sdpa_versions_equiv` 645 项全过（含 packqkv bf16/fp32 noncausal/causal mask）。**本机端到端实测**（Apple Silicon P-core，OMP=1，B=1 N=8 E=192 Ev=128，bf16）：L=128 50.4（pack overhead 占比高，-2%）/ L=256 57.6（+8.0%）/ L=512 58.4（+9.3%）/ **L=1024 59.3 GFLOPS（+8.7%）** vs `flash2_neon_l3kv_packv` baseline。fp32 路径三个版本都~15.2 GFLOPS（瓶颈在 fp32 QKᵀ 不在 PV，无回归） | 改 `csrc/sdpa_flash2_neon_l3kv_impl.h`（顶部 include trait 头；line 951-964 PV 调用切换）；改 `csrc/sdpa_flash2_neon_l3kv_packqkv.cpp`（line 163 / 239 两处 `sdpa_dispatch` 路由）；改 `csrc/SDPA_VERSIONS.md`（`flash2_neon_l3kv_packqkv` 章节 + 本节） |
 | 2026-05-29 | **`MK_PQuad` 扩展到 bf16 PV**：新增 `gemm_pv_microkernel_8x8_bf16_pquad`，照搬 fp32 pquad 的 P-端 quad load + lane FMA + 4-k 外展 + 段 2 中段跨迭代 V 预取调度。V 端从 baseline 的 `2× vld1_u16 + 2× widen` 改成 `1× vld1q_u16 + vshll_n_u16(lo) + vshll_high_n_u16(hi)`，每 4-k 段 LSU 从 36 降到 12。`MK_PQuad::pv_8x8(bf16)` 与 `MK_QkPackqkSeq4BmajorPvPquad::pv_8x8(bf16)` 都改派到新内核。数值与 baseline 等价（widen 后 fp32 累加序逐段一致）。**远程机器实测**（E=192 / Sk=128 / iters=20000）：pv_8x8 bf16 baseline 44.27 → **54.74 GFLOPS（+24%，60% peak）**；fp32 PV 同时受 5/28 方案 A 调度优化保持 72.28 GFLOPS（+13% vs baseline 63.86，79% peak）。bench 表 `TRAIT_OVERRIDES` 同步标注 pquad 与组合 trait 现在拥有 bf16 PV cell | 改 `csrc/sdpa_microkernels/neon_cache_microkernels.h`（新增 `gemm_pv_microkernel_8x8_bf16_pquad`）；改 `csrc/sdpa_microkernels/impls/mk_pquad.h`（bf16 pv 不再 fall through）；改 `csrc/sdpa_microkernels/impls/mk_qk_packqk_seq4_bmajor_pv_pquad.h`（bf16 pv 同步派发）；改 `tests/bench_pv_vs_qkt.py`（`TRAIT_OVERRIDES` 加上 pquad/组合 trait 的 bf16 PV）；改 `csrc/SDPA_VERSIONS.md`（本节 + `MK_PQuad` 章节） |
 | 2026-05-29 | **`gemm_pv_microkernel_8x8_fp32_pquad` 方案 A 调度优化**：把跨迭代 V[k+4] 预取从段 3 末尾移到段 2 中段。原排布下，跨迭代 V load 距下一轮段 0 第 1 条消费 FMA 只有 2 条 FMA 间隔（~1 cycle），覆盖不了 L1 vld1q 5 cycle 延迟；新排布拉到 ~16 条 FMA（~8 cycle），完全隐藏，同时段 3 改为纯 FMA 段消除跨迭代 OoO 阻塞。寄存器活跃峰值 28→30（≤32 仍安全）。`objdump -d` 确认 inner loop **零 spill**（callee-saved 之外没有 `str/ldr q*, [sp...]`）。**远程机器实测**（E=192 / Sk=128 / iters=20000）：pv_8x8 fp32 pquad 69.9 → **79.81 GFLOPS（+14%，87% peak）**（同会话单跑数据；与表格上一次 72.28 的差异是环境噪声）。数值上仍按位等价（只动调度顺序，未改累加序） | 改 `csrc/sdpa_microkernels/neon_cache_microkernels.h`（`gemm_pv_microkernel_8x8_fp32_pquad` 段 2/段 3 排布） |

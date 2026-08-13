@@ -20,11 +20,17 @@ from fused_cpp import _C
 
 TAIL_VARIANTS = (
     "indexed_4x4",
+    "indexed_4x4_2d",
     "masked_dense_8x8",
     "masked_dense_8x8_pruned",
+    "masked_dense_8x8_pruned_2d",
+    "masked_dense_8x8_fused_fmla",
+    "masked_dense_8x8_fused_bfmlal",
+    "masked_dense_8x8_fused_bfmmla",
 )
 WORKLOADS = (
     "v4-forward",
+    "dsv4-sparse",
     "tail-causal",
     "tail-v4-mix",
 )
@@ -46,6 +52,52 @@ def _build_v4_like_indices(s_q: int, compressed_capacity: int) -> tuple[torch.Te
     )
     valid_pairs = int((compressed_len + dense_len).sum().item())
     return values.to(torch.int32).reshape(s_q, 1, topk).contiguous(), valid_pairs
+
+
+def _build_dsv4_sparse_indices(
+    s_q: int,
+    compressed_capacity: int,
+    window_size: int,
+    compress_ratio: int,
+    context_start: int,
+) -> tuple[torch.Tensor, int, int]:
+    """Build DSV4 top-k compressed indices plus a sliding recent window."""
+    if min(s_q, compressed_capacity, window_size, compress_ratio) <= 0 or context_start < 0:
+        raise ValueError("DSV4 sparse shape parameters must be positive")
+
+    topk = compressed_capacity + window_size
+    values = torch.full((s_q, topk), -1, dtype=torch.int32)
+    valid_pairs = 0
+    max_position = context_start + s_q
+    compressed_region = (max_position + compress_ratio - 1) // compress_ratio
+    for token in range(s_q):
+        position = context_start + token
+        compressed_source = (position + 1) // compress_ratio
+        compressed_len = min(compressed_source, compressed_capacity)
+        if compressed_len:
+            # Model the selected 4a path as sorted, non-contiguous top-k values
+            # from the compressed cache, rather than another dense triangle.
+            selected = torch.linspace(
+                0,
+                compressed_source - 1,
+                compressed_len,
+                dtype=torch.float64,
+            ).round().to(torch.int32)
+            values[token, :compressed_len] = selected
+
+        recent_len = min(position + 1, window_size)
+        recent_start = position + 1 - recent_len
+        values[token, compressed_len : compressed_len + recent_len] = (
+            compressed_region
+            + torch.arange(recent_start, position + 1, dtype=torch.int32)
+        )
+        valid_pairs += compressed_len + recent_len
+
+    return (
+        values.reshape(s_q, 1, topk).contiguous(),
+        valid_pairs,
+        compressed_region + max_position,
+    )
 
 
 def _build_tail_only_indices(tail_blocks: int, workload: str) -> tuple[torch.Tensor, int, int, int]:
@@ -115,6 +167,9 @@ def main() -> None:
     parser.add_argument("--d-qk", type=int, default=192)
     parser.add_argument("--d-v", type=int, default=128)
     parser.add_argument("--compressed-capacity", type=int, default=512)
+    parser.add_argument("--window-size", type=int, default=128)
+    parser.add_argument("--compress-ratio", type=int, default=4)
+    parser.add_argument("--context-start", type=int, default=0)
     parser.add_argument("--tail-blocks", type=int, default=1024)
     parser.add_argument("--threads", type=int, default=int(os.environ.get("OMP_NUM_THREADS", "1")))
     parser.add_argument("--warmup", type=int, default=5)
@@ -137,6 +192,16 @@ def main() -> None:
         s_q = args.s_q
         s_kv = args.compressed_capacity + s_q
         indices, valid_pairs = _build_v4_like_indices(s_q, args.compressed_capacity)
+        tail_tiles = (s_q // 8) * 2
+    elif args.workload == "dsv4-sparse":
+        s_q = args.s_q
+        indices, valid_pairs, s_kv = _build_dsv4_sparse_indices(
+            s_q,
+            args.compressed_capacity,
+            args.window_size,
+            args.compress_ratio,
+            args.context_start,
+        )
         tail_tiles = (s_q // 8) * 2
     else:
         indices, s_kv, valid_pairs, tail_tiles = _build_tail_only_indices(args.tail_blocks, args.workload)
@@ -171,7 +236,8 @@ def main() -> None:
     print(
         f"workload={args.workload},tail_tiles={tail_tiles},"
         f"shape=q[{s_q},{args.h_q},{args.d_qk}],kv[{s_kv},1,{args.d_qk}],d_v={args.d_v},"
-        f"topk={indices.shape[-1]},valid_pairs_per_head={valid_pairs},source_flops={source_flops:.0f}"
+        f"topk={indices.shape[-1]},context_start={args.context_start},"
+        f"valid_pairs_per_head={valid_pairs},source_flops={source_flops:.0f}"
     )
     print(
         f"threads={args.threads},torch_threads={torch.get_num_threads()},warmup={args.warmup},iters={args.iters},"

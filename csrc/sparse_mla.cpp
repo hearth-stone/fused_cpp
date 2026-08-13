@@ -31,9 +31,57 @@ constexpr int64_t kDenseThreshold = 8;
 
 enum class SparseMlaTailVariant {
   kIndexed4x4,
+  kIndexed4x4_2d,
   kMaskedDense8x8,
   kMaskedDense8x8Pruned,
+  kMaskedDense8x8FusedFmla,
+  kMaskedDense8x8FusedBfmlal,
+  kMaskedDense8x8FusedBfmmla,
+  kMaskedDense8x8Pruned2d,
 };
+
+template <SparseMlaTailVariant kTailVariant>
+constexpr bool sparse_mla_uses_masked_dense() {
+  return kTailVariant != SparseMlaTailVariant::kIndexed4x4 &&
+         kTailVariant != SparseMlaTailVariant::kIndexed4x4_2d;
+}
+
+template <SparseMlaTailVariant kTailVariant>
+constexpr bool sparse_mla_prunes_masked_2x2() {
+  return kTailVariant == SparseMlaTailVariant::kMaskedDense8x8Pruned ||
+         kTailVariant == SparseMlaTailVariant::kMaskedDense8x8Pruned2d ||
+         kTailVariant == SparseMlaTailVariant::kMaskedDense8x8FusedFmla ||
+         kTailVariant == SparseMlaTailVariant::kMaskedDense8x8FusedBfmlal ||
+         kTailVariant == SparseMlaTailVariant::kMaskedDense8x8FusedBfmmla;
+}
+
+template <SparseMlaTailVariant kTailVariant>
+constexpr bool sparse_mla_uses_2d_schedule() {
+  return kTailVariant == SparseMlaTailVariant::kIndexed4x4_2d ||
+         kTailVariant == SparseMlaTailVariant::kMaskedDense8x8Pruned2d;
+}
+
+template <SparseMlaTailVariant kTailVariant>
+constexpr bool sparse_mla_uses_fused_online_epilogue() {
+  return kTailVariant == SparseMlaTailVariant::kMaskedDense8x8FusedFmla ||
+         kTailVariant == SparseMlaTailVariant::kMaskedDense8x8FusedBfmlal ||
+         kTailVariant == SparseMlaTailVariant::kMaskedDense8x8FusedBfmmla;
+}
+
+template <SparseMlaTailVariant kTailVariant>
+constexpr ::fused_cpp::sparse_mla_tail_microkernels::SparseMlaPvBackend
+sparse_mla_pv_backend() {
+  using Backend = ::fused_cpp::sparse_mla_tail_microkernels::SparseMlaPvBackend;
+  if constexpr (kTailVariant ==
+                SparseMlaTailVariant::kMaskedDense8x8FusedFmla) {
+    return Backend::kFmla;
+  }
+  if constexpr (kTailVariant ==
+                SparseMlaTailVariant::kMaskedDense8x8FusedBfmlal) {
+    return Backend::kBfmlal;
+  }
+  return Backend::kBfmmla;
+}
 
 struct DenseSeg {
   int64_t start;
@@ -71,8 +119,10 @@ struct PackedDenseSeg {
   DenseSeg seg;
   int64_t k_sblock_stride = 0;
   int64_t v_evblock_stride = 0;
+  int64_t v_bfmmla_evblock_stride = 0;
   std::vector<uint16_t> k_packed;
   std::vector<at::BFloat16> v_packed;
+  std::vector<at::BFloat16> v_bfmmla_packed;
 };
 
 struct Run {
@@ -150,10 +200,22 @@ static inline BlockPlan build_block_plan(int64_t token0, const std::vector<std::
   }
 
   std::vector<std::vector<Run>> row_runs;
+  std::vector<std::vector<int64_t>> row_long_run_indices;
   if (plan.lq_eff == kQueryBlock) {
     row_runs.reserve(kQueryBlock);
+    row_long_run_indices.resize(kQueryBlock);
     for (const auto& row : rows) {
       row_runs.push_back(contiguous_runs(row));
+    }
+    for (int64_t row_idx = 0; row_idx < kQueryBlock; ++row_idx) {
+      auto& long_runs = row_long_run_indices[row_idx];
+      for (int64_t run_idx = 0;
+           run_idx < static_cast<int64_t>(row_runs[row_idx].size());
+           ++run_idx) {
+        if (row_runs[row_idx][run_idx].length >= kDenseThreshold) {
+          long_runs.push_back(run_idx);
+        }
+      }
     }
 
     for (const Run& first_run : row_runs[0]) {
@@ -168,19 +230,20 @@ static inline BlockPlan build_block_plan(int64_t token0, const std::vector<std::
 
       bool matched_all = true;
       for (int64_t row_idx = 1; row_idx < kQueryBlock; ++row_idx) {
-        bool matched_row = false;
-        for (const Run& run : row_runs[row_idx]) {
+        const Run* matched = nullptr;
+        for (const int64_t run_idx : row_long_run_indices[row_idx]) {
+          const Run& run = row_runs[row_idx][run_idx];
           if (run.start == first_run.start) {
-            match_pos[row_idx] = run.pos;
-            match_len[row_idx] = run.length;
-            matched_row = true;
+            matched = &run;
             break;
           }
         }
-        if (!matched_row) {
+        if (matched == nullptr) {
           matched_all = false;
           break;
         }
+        match_pos[row_idx] = matched->pos;
+        match_len[row_idx] = matched->length;
       }
       if (!matched_all) {
         continue;
@@ -218,12 +281,159 @@ static inline BlockPlan build_block_plan(int64_t token0, const std::vector<std::
         }
       }
     }
+
+    // Sliding windows have different run starts in adjacent query rows but a
+    // large shared intersection. Extract that intersection as a dense segment;
+    // the small asymmetric left/right fringes remain available to the masked
+    // and indexed planners below.
+    for (const Run& first_run : row_runs[0]) {
+      if (first_run.length < kDenseThreshold) {
+        continue;
+      }
+      std::array<Run, kQueryBlock> matches{};
+      matches[0] = first_run;
+      int64_t common_start = first_run.start;
+      int64_t common_end = first_run.start + first_run.length;
+      bool matched_all = true;
+      for (int64_t row_idx = 1; row_idx < kQueryBlock; ++row_idx) {
+        const Run* best = nullptr;
+        int64_t best_overlap = 0;
+        for (const int64_t run_idx : row_long_run_indices[row_idx]) {
+          const Run& run = row_runs[row_idx][run_idx];
+          const int64_t overlap_start = std::max(common_start, run.start);
+          const int64_t overlap_end =
+              std::min(common_end, run.start + run.length);
+          const int64_t overlap =
+              std::max<int64_t>(0, overlap_end - overlap_start);
+          if (overlap > best_overlap) {
+            best = &run;
+            best_overlap = overlap;
+          }
+        }
+        if (best == nullptr || best_overlap < kDenseThreshold) {
+          matched_all = false;
+          break;
+        }
+        matches[row_idx] = *best;
+        common_start = std::max(common_start, best->start);
+        common_end = std::min(common_end, best->start + best->length);
+      }
+      if (!matched_all) {
+        continue;
+      }
+
+      const int64_t dense_len =
+          ((common_end - common_start) / kQueryBlock) * kQueryBlock;
+      if (dense_len < kDenseThreshold) {
+        continue;
+      }
+      bool overlaps = false;
+      std::array<int64_t, kQueryBlock> match_pos{};
+      for (int64_t row_idx = 0; row_idx < kQueryBlock && !overlaps; ++row_idx) {
+        match_pos[row_idx] =
+            matches[row_idx].pos + common_start - matches[row_idx].start;
+        for (int64_t off = 0; off < dense_len; ++off) {
+          if (consumed[row_idx][match_pos[row_idx] + off]) {
+            overlaps = true;
+            break;
+          }
+        }
+      }
+      if (overlaps) {
+        continue;
+      }
+      plan.dense_segments.push_back({common_start, dense_len});
+      for (int64_t row_idx = 0; row_idx < kQueryBlock; ++row_idx) {
+        for (int64_t off = 0; off < dense_len; ++off) {
+          consumed[row_idx][match_pos[row_idx] + off] = 1;
+        }
+      }
+    }
   }
 
   if (enable_masked_dense && plan.lq_eff == kQueryBlock) {
+    // A dense intersection of a sliding window normally leaves a common-start
+    // right fringe (1..8 keys). Promote that fringe to the same masked 8x8
+    // kernel used by causal tails.
+    for (const DenseSeg& seg : plan.dense_segments) {
+      MaskedDenseTile tile;
+      tile.start = seg.start + seg.length;
+      if (tile.start > s_kv || s_kv - tile.start < kQueryBlock) {
+        continue;
+      }
+      std::array<int64_t, kQueryBlock> residual_pos{};
+      residual_pos.fill(-1);
+      bool valid_shape = false;
+      bool monotonic = true;
+      bool varied_shape = false;
+      for (int64_t row_idx = 0; row_idx < kQueryBlock; ++row_idx) {
+        const Run* containing = nullptr;
+        for (const Run& run : row_runs[row_idx]) {
+          if (run.start <= seg.start && run.start + run.length >= tile.start) {
+            containing = &run;
+            break;
+          }
+        }
+        int64_t residual_len = 0;
+        if (containing != nullptr) {
+          residual_pos[row_idx] =
+              containing->pos + tile.start - containing->start;
+          residual_len = std::min<int64_t>(
+              kQueryBlock, containing->start + containing->length - tile.start);
+        }
+        if (residual_len < 0 || residual_len > kQueryBlock ||
+            (row_idx > 0 && residual_len < tile.valid_len[row_idx - 1])) {
+          monotonic = false;
+          break;
+        }
+        tile.valid_len[row_idx] = static_cast<uint8_t>(residual_len);
+        valid_shape = valid_shape || residual_len != 0;
+        varied_shape =
+            varied_shape || (row_idx > 0 && residual_len != tile.valid_len[0]);
+      }
+      if (!monotonic || !valid_shape || !varied_shape) {
+        continue;
+      }
+
+      bool overlaps = false;
+      for (int64_t row_idx = 0; row_idx < kQueryBlock && !overlaps; ++row_idx) {
+        for (int64_t col = 0; col < tile.valid_len[row_idx]; ++col) {
+          const int64_t pos = residual_pos[row_idx] + col;
+          if (residual_pos[row_idx] < 0 || consumed[row_idx][pos] ||
+              rows[row_idx][pos] != tile.start + col) {
+            overlaps = true;
+            break;
+          }
+          tile.valid_mask |= uint64_t{1} << (row_idx * kQueryBlock + col);
+        }
+      }
+      if (overlaps) {
+        continue;
+      }
+      for (int64_t row_pair = 0; row_pair < kQueryBlock / 2; ++row_pair) {
+        const int64_t pair_valid_len = std::max<int64_t>(
+            tile.valid_len[2 * row_pair], tile.valid_len[2 * row_pair + 1]);
+        for (int64_t col_pair = 0; col_pair < kQueryBlock / 2; ++col_pair) {
+          if (pair_valid_len > 2 * col_pair) {
+            tile.active_2x2_mask |=
+                static_cast<uint16_t>(uint16_t{1} << (row_pair * 4 + col_pair));
+          }
+        }
+      }
+      for (int64_t row_idx = 0; row_idx < kQueryBlock; ++row_idx) {
+        for (int64_t col = 0; col < tile.valid_len[row_idx]; ++col) {
+          consumed[row_idx][residual_pos[row_idx] + col] = 1;
+        }
+      }
+      plan.masked_dense_tiles.push_back(tile);
+    }
+
     std::vector<int64_t> candidate_starts;
     for (const auto& runs : row_runs) {
       for (const Run& run : runs) {
+        if (run.length < 2) {
+          continue;
+        }
         candidate_starts.push_back(run.start);
       }
     }
@@ -470,8 +680,9 @@ static inline void pack_mqa_v_to_evblock8(const scalar_t* v_src, int64_t v_row_s
   }
 }
 
-static inline PackedDenseSeg pack_dense_segment_bf16(const at::BFloat16* kv_ptr, int64_t d_qk, int64_t d_v,
-                                                     const DenseSeg& seg) {
+static inline PackedDenseSeg pack_dense_segment_bf16(
+    const at::BFloat16* kv_ptr, int64_t d_qk, int64_t d_v, const DenseSeg& seg,
+    bool pack_bfmmla_v = false) {
   PackedDenseSeg packed;
   packed.seg = seg;
 
@@ -491,6 +702,18 @@ static inline PackedDenseSeg pack_dense_segment_bf16(const at::BFloat16* kv_ptr,
 
   packed.v_packed.resize(static_cast<size_t>((d_v / 8) * seg.length * 8));
   pack_mqa_v_to_evblock8<at::BFloat16>(kv_seg, d_qk, packed.v_packed.data(), seg.length, d_v);
+
+  if (pack_bfmmla_v) {
+    TORCH_INTERNAL_ASSERT(seg.length == kQueryBlock);
+    packed.v_bfmmla_evblock_stride = kQueryBlock * kQueryBlock;
+    packed.v_bfmmla_packed.resize(static_cast<size_t>(
+        (d_v / kQueryBlock) * packed.v_bfmmla_evblock_stride));
+    if (!::fused_cpp::sparse_mla_tail_microkernels::pack_v_8x8_bfmmla_sve(
+            kv_seg, d_qk, d_v, packed.v_bfmmla_packed.data())) {
+      packed.v_bfmmla_evblock_stride = 0;
+      packed.v_bfmmla_packed.clear();
+    }
+  }
   return packed;
 }
 
@@ -1314,23 +1537,44 @@ static inline float exp_sum_to(float* dst, const float* scores, float max_value,
   return sum;
 }
 
-template <bool kReturnStats, bool kPrune2x2>
+template <bool kReturnStats, SparseMlaTailVariant kTailVariant>
 static inline void update_masked_dense_tile_packqkv_bf16(
-    const at::BFloat16* q_block, int64_t q_row_stride, const at::BFloat16* kv_tile, int64_t kv_row_stride,
-    const MaskedDenseTile& tile, const PackedDenseSeg& packed, int64_t d_qk, int64_t d_v, float scale,
-    float* running_max, float* running_sum, float* output_acc, float* real_max, float* real_sum,
-    std::vector<float>& scores, std::vector<at::BFloat16>& p_hat_bf16, std::vector<uint16_t>& q_seq, bool q_seq_ready) {
+    const at::BFloat16* q_block, int64_t q_row_stride,
+    const at::BFloat16* kv_tile, int64_t kv_row_stride,
+    const MaskedDenseTile& tile, const PackedDenseSeg& packed, int64_t d_qk,
+    int64_t d_v, float scale, float* running_max, float* running_sum,
+    float* output_acc, float* real_max, float* real_sum,
+    std::vector<float>& scores, std::vector<at::BFloat16>& p_hat_bf16,
+    std::vector<uint16_t>& q_seq, bool q_seq_ready) {
   using ::fused_cpp::sdpa_flash2_neon_l3kv_impl::scale_inplace_impl;
   using ::fused_cpp::sdpa_flash2_neon_l3kv_impl::vectorized_exp_minus_bf16_impl;
 
   const int64_t e_main = d_qk & ~int64_t{3};
   const int64_t qblock_u16 = (e_main / 4) * 32;
   q_seq.resize(static_cast<size_t>(qblock_u16));
-  scores.resize(kQueryBlock * kQueryBlock);
-  p_hat_bf16.assign(kQueryBlock * kQueryBlock, at::BFloat16(0.0f));
   if (!q_seq_ready) {
     ::fused_cpp::sdpa_microkernels::pack_q_8rows_to_seq_bf16(q_block, q_row_stride, d_qk, q_seq.data());
   }
+
+  constexpr bool kPrune2x2 = sparse_mla_prunes_masked_2x2<kTailVariant>();
+  if constexpr (!kReturnStats &&
+                sparse_mla_uses_fused_online_epilogue<kTailVariant>()) {
+    const at::BFloat16* v_bfmmla = packed.v_bfmmla_packed.empty()
+                                       ? nullptr
+                                       : packed.v_bfmmla_packed.data();
+    if (::fused_cpp::sparse_mla_tail_microkernels::
+            online_softmax_pv_8x8_bf16_sve(
+                q_seq.data(), packed.k_packed.data(), packed.v_packed.data(),
+                packed.v_evblock_stride, d_qk, v_bfmmla,
+                packed.v_bfmmla_evblock_stride, d_v, scale, tile.valid_mask,
+                kPrune2x2, sparse_mla_pv_backend<kTailVariant>(), running_max,
+                running_sum, output_acc, d_v)) {
+      return;
+    }
+  }
+
+  scores.resize(kQueryBlock * kQueryBlock);
+  p_hat_bf16.assign(kQueryBlock * kQueryBlock, at::BFloat16(0.0f));
 
   bool used_pruned_qkt = false;
   if constexpr (kPrune2x2) {
@@ -1615,6 +1859,21 @@ struct SparseMlaPlanTask {
   int64_t work = 0;
 };
 
+struct SparseMla2dTask {
+  int64_t plan_idx = 0;
+  int64_t work = 0;
+  int64_t partial_slot = -1;
+  BlockPlan shard;
+};
+
+struct SparseMla2dSchedule {
+  std::vector<SparseMla2dTask> tasks;
+  std::vector<int64_t> task_order;
+  std::vector<int64_t> partial_begin;
+  std::vector<int64_t> partial_count;
+  int64_t num_partials = 0;
+};
+
 static inline int64_t popcount_u64(uint64_t value) {
 #if defined(__GNUC__) || defined(__clang__)
   return static_cast<int64_t>(__builtin_popcountll(value));
@@ -1657,6 +1916,146 @@ static inline std::vector<SparseMlaPlanTask> build_sparse_mla_task_order(const s
   return order;
 }
 
+static inline int64_t block_plan_parallel_pieces(const BlockPlan& plan) {
+  int64_t pieces = static_cast<int64_t>(plan.masked_dense_tiles.size() +
+                                        plan.indexed_tiles.size());
+  for (const DenseSeg& seg : plan.dense_segments) {
+    pieces += seg.length / kQueryBlock;
+  }
+  return std::max<int64_t>(pieces, 1);
+}
+
+static inline std::vector<BlockPlan> split_block_plan_kv(
+    const BlockPlan& plan, int64_t requested_shards) {
+  const int64_t shard_count = std::max<int64_t>(
+      1, std::min<int64_t>(requested_shards, block_plan_parallel_pieces(plan)));
+  std::vector<BlockPlan> shards(static_cast<size_t>(shard_count));
+  std::vector<int64_t> shard_work(static_cast<size_t>(shard_count), 0);
+  for (BlockPlan& shard : shards) {
+    shard.token0 = plan.token0;
+    shard.lq_eff = plan.lq_eff;
+  }
+
+  const auto lightest_shard = [&]() {
+    return static_cast<int64_t>(
+        std::min_element(shard_work.begin(), shard_work.end()) -
+        shard_work.begin());
+  };
+
+  // Dense segments carry most of the work. Split each one into at most one
+  // contiguous slice per shard so packing remains coarse-grained and every
+  // original K position is owned by exactly one partial online-softmax state.
+  for (const DenseSeg& seg : plan.dense_segments) {
+    int64_t blocks_left = seg.length / kQueryBlock;
+    int64_t start = seg.start;
+    const int64_t piece_count = std::min<int64_t>(shard_count, blocks_left);
+    for (int64_t piece = 0; piece < piece_count; ++piece) {
+      const int64_t pieces_left = piece_count - piece;
+      const int64_t take_blocks = (blocks_left + pieces_left - 1) / pieces_left;
+      const int64_t length = take_blocks * kQueryBlock;
+      const int64_t shard_idx = lightest_shard();
+      shards[shard_idx].dense_segments.push_back({start, length});
+      shard_work[shard_idx] += plan.lq_eff * length;
+      start += length;
+      blocks_left -= take_blocks;
+    }
+  }
+
+  for (const MaskedDenseTile& tile : plan.masked_dense_tiles) {
+    const int64_t shard_idx = lightest_shard();
+    shards[shard_idx].masked_dense_tiles.push_back(tile);
+    shard_work[shard_idx] += popcount_u64(tile.valid_mask);
+  }
+  for (const IndexedTile& tile : plan.indexed_tiles) {
+    const int64_t shard_idx = lightest_shard();
+    shards[shard_idx].indexed_tiles.push_back(tile);
+    shard_work[shard_idx] += popcount_u64(tile.valid_mask);
+  }
+  return shards;
+}
+
+static inline SparseMla2dSchedule build_sparse_mla_2d_schedule(
+    const std::vector<BlockPlan>& plans, int requested_threads) {
+  SparseMla2dSchedule schedule;
+  schedule.partial_begin.assign(plans.size(), -1);
+  schedule.partial_count.assign(plans.size(), 0);
+
+  constexpr int64_t kMaxKvShards = 8;
+  std::vector<int64_t> shard_counts(plans.size(), 1);
+  int64_t task_count = static_cast<int64_t>(plans.size());
+  // Splitting is profitable only while query-block parallelism leaves at least
+  // half of the worker pool idle. Near saturation, duplicate packing and the
+  // partial-state reduction cost more than the extra concurrency saves.
+  const bool split_underfilled =
+      task_count <= std::max<int64_t>(1, requested_threads / 2);
+  const int64_t target_tasks =
+      split_underfilled ? std::max<int64_t>(task_count, requested_threads)
+                        : task_count;
+  while (task_count < target_tasks) {
+    int64_t best_plan = -1;
+    double best_shard_work = -1.0;
+    for (int64_t plan_idx = 0; plan_idx < static_cast<int64_t>(plans.size());
+         ++plan_idx) {
+      const int64_t max_shards = std::min<int64_t>(
+          kMaxKvShards, block_plan_parallel_pieces(plans[plan_idx]));
+      if (shard_counts[plan_idx] >= max_shards) {
+        continue;
+      }
+      const double shard_work =
+          static_cast<double>(estimate_plan_attention_pairs(plans[plan_idx])) /
+          static_cast<double>(shard_counts[plan_idx]);
+      if (shard_work > best_shard_work) {
+        best_shard_work = shard_work;
+        best_plan = plan_idx;
+      }
+    }
+    if (best_plan < 0) {
+      break;
+    }
+    ++shard_counts[best_plan];
+    ++task_count;
+  }
+
+  for (int64_t plan_idx = 0; plan_idx < static_cast<int64_t>(plans.size());
+       ++plan_idx) {
+    const BlockPlan& plan = plans[plan_idx];
+    const int64_t work = estimate_plan_attention_pairs(plan);
+    const int64_t requested_shards = shard_counts[plan_idx];
+    if (requested_shards == 1) {
+      schedule.tasks.push_back({plan_idx, work, -1, {}});
+      continue;
+    }
+
+    std::vector<BlockPlan> shards = split_block_plan_kv(plan, requested_shards);
+    if (shards.size() <= 1) {
+      schedule.tasks.push_back({plan_idx, work, -1, {}});
+      continue;
+    }
+    schedule.partial_begin[plan_idx] = schedule.num_partials;
+    schedule.partial_count[plan_idx] = static_cast<int64_t>(shards.size());
+    for (BlockPlan& shard : shards) {
+      const int64_t shard_work = estimate_plan_attention_pairs(shard);
+      schedule.tasks.push_back(
+          {plan_idx, shard_work, schedule.num_partials++, std::move(shard)});
+    }
+  }
+
+  schedule.task_order.reserve(schedule.tasks.size());
+  for (int64_t task_idx = 0;
+       task_idx < static_cast<int64_t>(schedule.tasks.size()); ++task_idx) {
+    schedule.task_order.push_back(task_idx);
+  }
+  std::stable_sort(schedule.task_order.begin(), schedule.task_order.end(),
+                   [&](int64_t a, int64_t b) {
+                     if (schedule.tasks[a].work != schedule.tasks[b].work) {
+                       return schedule.tasks[a].work > schedule.tasks[b].work;
+                     }
+                     return schedule.tasks[a].plan_idx >
+                            schedule.tasks[b].plan_idx;
+                   });
+  return schedule;
+}
+
 static inline int sparse_mla_max_parallel_groups_mqa(int64_t s_kv, int64_t d_qk, size_t elem_size,
                                                      int requested_threads) {
   if (requested_threads <= 1) {
@@ -1697,15 +2096,41 @@ static inline void run_sparse_mla_kernel(const at::Tensor& q, const at::Tensor& 
   const float* sink_ptr = sink_tensor == nullptr ? nullptr : sink_tensor->data_ptr<float>();
 
   constexpr bool kEnableMaskedDense =
-      std::is_same_v<scalar_t, at::BFloat16> && kTailVariant != SparseMlaTailVariant::kIndexed4x4;
+      std::is_same_v<scalar_t, at::BFloat16> &&
+      sparse_mla_uses_masked_dense<kTailVariant>();
   const std::vector<BlockPlan> plans =
       build_sparse_mla_plans(idx_ptr, s_q, topk, s_kv, kEnableMaskedDense && d_v % 8 == 0);
   const auto dense_ts = ::fused_cpp::sdpa_tile_sizes::compute_tile_sizes_l3kv(
       /*B=*/1, h_q, topk, s_q, d_qk, d_v, sizeof(scalar_t));
+  const int requested_threads =
+#ifdef _OPENMP
+      omp_get_max_threads();
+#else
+      1;
+#endif
   const std::vector<SparseMlaPlanTask> task_order = build_sparse_mla_task_order(plans);
+  SparseMla2dSchedule schedule_2d;
+  if constexpr (sparse_mla_uses_2d_schedule<kTailVariant>()) {
+    schedule_2d = build_sparse_mla_2d_schedule(plans, requested_threads);
+  }
 
-  const auto process_task = [&](int64_t task_pos) {
-    const BlockPlan& plan = plans[task_order[task_pos].plan_idx];
+  const size_t partial_state_count =
+      static_cast<size_t>(schedule_2d.num_partials * h_q * kQueryBlock);
+  const size_t partial_output_count =
+      partial_state_count * static_cast<size_t>(d_v);
+  std::vector<float> partial_max(partial_state_count,
+                                 -std::numeric_limits<float>::infinity());
+  std::vector<float> partial_sum(partial_state_count, 0.0f);
+  std::vector<float> partial_output(partial_output_count, 0.0f);
+  std::vector<float> partial_real_max;
+  std::vector<float> partial_real_sum;
+  if constexpr (kReturnStats) {
+    partial_real_max.assign(partial_state_count,
+                            -std::numeric_limits<float>::infinity());
+    partial_real_sum.assign(partial_state_count, 0.0f);
+  }
+
+  const auto process_plan = [&](const BlockPlan& plan, int64_t partial_slot) {
     std::vector<float> output_acc(kQueryBlock * d_v);
     std::vector<float> dense_scores;
     std::vector<float> dense_p_hat;
@@ -1733,7 +2158,10 @@ static inline void run_sparse_mla_kernel(const at::Tensor& q, const at::Tensor& 
       if constexpr (kEnableMaskedDense) {
         packed_masked_dense_tiles.reserve(plan.masked_dense_tiles.size());
         for (const MaskedDenseTile& tile : plan.masked_dense_tiles) {
-          packed_masked_dense_tiles.push_back(pack_dense_segment_bf16(kv_ptr, d_qk, d_v, {tile.start, kQueryBlock}));
+          constexpr bool kPackBfmmlaV =
+              kTailVariant == SparseMlaTailVariant::kMaskedDense8x8FusedBfmmla;
+          packed_masked_dense_tiles.push_back(pack_dense_segment_bf16(
+              kv_ptr, d_qk, d_v, {tile.start, kQueryBlock}, kPackBfmmlaV));
         }
       }
     }
@@ -1777,14 +2205,15 @@ static inline void run_sparse_mla_kernel(const at::Tensor& q, const at::Tensor& 
       }
 
       if constexpr (kEnableMaskedDense) {
-        constexpr bool kPrune2x2 = kTailVariant == SparseMlaTailVariant::kMaskedDense8x8Pruned;
         for (int64_t tile_idx = 0; tile_idx < static_cast<int64_t>(plan.masked_dense_tiles.size()); ++tile_idx) {
           const MaskedDenseTile& tile = plan.masked_dense_tiles[tile_idx];
           const at::BFloat16* kv_tile = kv_ptr + tile.start * d_qk;
-          update_masked_dense_tile_packqkv_bf16<kReturnStats, kPrune2x2>(
-              q_block, h_q * d_qk, kv_tile, d_qk, tile, packed_masked_dense_tiles[tile_idx], d_qk, d_v, scale,
-              running_max.data(), running_sum.data(), output_acc.data(), real_max.data(), real_sum.data(), dense_scores,
-              dense_p_hat_bf16, dense_q_seq, q_seq_ready);
+          update_masked_dense_tile_packqkv_bf16<kReturnStats, kTailVariant>(
+              q_block, h_q * d_qk, kv_tile, d_qk, tile,
+              packed_masked_dense_tiles[tile_idx], d_qk, d_v, scale,
+              running_max.data(), running_sum.data(), output_acc.data(),
+              real_max.data(), real_sum.data(), dense_scores, dense_p_hat_bf16,
+              dense_q_seq, q_seq_ready);
           q_seq_ready = true;
         }
       }
@@ -1820,7 +2249,7 @@ static inline void run_sparse_mla_kernel(const at::Tensor& q, const at::Tensor& 
         }
       }
 
-      if (sink_ptr != nullptr) {
+      if (partial_slot < 0 && sink_ptr != nullptr) {
         const float sink_score = sink_ptr[head];
         for (int64_t row = 0; row < plan.lq_eff; ++row) {
           apply_sink_row(sink_score, row, d_v, running_max.data(), running_sum.data(), output_acc.data());
@@ -1829,6 +2258,20 @@ static inline void run_sparse_mla_kernel(const at::Tensor& q, const at::Tensor& 
 
       for (int64_t row = 0; row < plan.lq_eff; ++row) {
         const int64_t token = plan.token0 + row;
+        if (partial_slot >= 0) {
+          const size_t state_offset = static_cast<size_t>(
+              (partial_slot * h_q + head) * kQueryBlock + row);
+          partial_max[state_offset] = running_max[row];
+          partial_sum[state_offset] = running_sum[row];
+          std::copy_n(
+              output_acc.data() + row * d_v, d_v,
+              partial_output.data() + state_offset * static_cast<size_t>(d_v));
+          if constexpr (kReturnStats) {
+            partial_real_max[state_offset] = real_max[row];
+            partial_real_sum[state_offset] = real_sum[row];
+          }
+          continue;
+        }
         if constexpr (kReturnStats) {
           float* max_cell = max_ptr + token * h_q + head;
           float* lse_cell = lse_ptr + token * h_q + head;
@@ -1847,18 +2290,159 @@ static inline void run_sparse_mla_kernel(const at::Tensor& q, const at::Tensor& 
       }
     }
   };
+  const int max_groups = sparse_mla_max_parallel_groups_mqa(
+      s_kv, d_qk, sizeof(scalar_t), requested_threads);
 
-  const int requested_threads =
+  const auto process_1d_task = [&](int64_t task_pos) {
+    process_plan(plans[task_order[task_pos].plan_idx], -1);
+  };
+
+  if constexpr (sparse_mla_uses_2d_schedule<kTailVariant>()) {
+    const auto process_2d_task = [&](int64_t task_pos) {
+      const SparseMla2dTask& task =
+          schedule_2d.tasks[schedule_2d.task_order[task_pos]];
+      if (task.partial_slot >= 0) {
+        process_plan(task.shard, task.partial_slot);
+      } else {
+        process_plan(plans[task.plan_idx], -1);
+      }
+    };
+
+    if (max_groups <= 1 || schedule_2d.task_order.size() <= 1) {
+      for (int64_t task_pos = 0;
+           task_pos < static_cast<int64_t>(schedule_2d.task_order.size());
+           ++task_pos) {
+        process_2d_task(task_pos);
+      }
+    } else {
 #ifdef _OPENMP
-      omp_get_max_threads();
+#pragma omp parallel num_threads(max_groups)
+      {
+#pragma omp for schedule(dynamic, 1)
+        for (int64_t task_pos = 0;
+             task_pos < static_cast<int64_t>(schedule_2d.task_order.size());
+             ++task_pos) {
+          process_2d_task(task_pos);
+        }
+      }
 #else
-      1;
+      for (int64_t task_pos = 0;
+           task_pos < static_cast<int64_t>(schedule_2d.task_order.size());
+           ++task_pos) {
+        process_2d_task(task_pos);
+      }
 #endif
-  const int max_groups = sparse_mla_max_parallel_groups_mqa(s_kv, d_qk, sizeof(scalar_t), requested_threads);
+    }
+
+    if (schedule_2d.num_partials == 0) {
+      return;
+    }
+
+    const auto merge_plan = [&](int64_t plan_idx) {
+      const int64_t partial_count = schedule_2d.partial_count[plan_idx];
+      if (partial_count <= 0) {
+        return;
+      }
+      const BlockPlan& plan = plans[plan_idx];
+      const int64_t partial_begin = schedule_2d.partial_begin[plan_idx];
+      std::vector<float> merged_output(static_cast<size_t>(kQueryBlock * d_v));
+      for (int64_t head = 0; head < h_q; ++head) {
+        for (int64_t row = 0; row < plan.lq_eff; ++row) {
+          float merged_max = -std::numeric_limits<float>::infinity();
+          float merged_sum = 0.0f;
+          float* merged_row = merged_output.data() + row * d_v;
+          std::fill(merged_row, merged_row + d_v, 0.0f);
+          float merged_real_max = -std::numeric_limits<float>::infinity();
+          float merged_real_sum = 0.0f;
+
+          for (int64_t partial = 0; partial < partial_count; ++partial) {
+            const int64_t slot = partial_begin + partial;
+            const size_t state_offset =
+                static_cast<size_t>((slot * h_q + head) * kQueryBlock + row);
+            const float shard_sum = partial_sum[state_offset];
+            if (shard_sum <= 0.0f) {
+              continue;
+            }
+            const float shard_max = partial_max[state_offset];
+            const float new_max = std::max(merged_max, shard_max);
+            const float old_scale =
+                merged_sum > 0.0f ? std::exp(merged_max - new_max) : 0.0f;
+            const float shard_scale = std::exp(shard_max - new_max);
+            const float* shard_output =
+                partial_output.data() + state_offset * static_cast<size_t>(d_v);
+            for (int64_t ev = 0; ev < d_v; ++ev) {
+              merged_row[ev] =
+                  merged_row[ev] * old_scale + shard_output[ev] * shard_scale;
+            }
+            merged_sum = merged_sum * old_scale + shard_sum * shard_scale;
+            merged_max = new_max;
+
+            if constexpr (kReturnStats) {
+              const float shard_real_sum = partial_real_sum[state_offset];
+              if (shard_real_sum > 0.0f) {
+                const float shard_real_max = partial_real_max[state_offset];
+                const float new_real_max =
+                    std::max(merged_real_max, shard_real_max);
+                const float old_real_scale =
+                    merged_real_sum > 0.0f
+                        ? std::exp(merged_real_max - new_real_max)
+                        : 0.0f;
+                const float shard_real_scale =
+                    std::exp(shard_real_max - new_real_max);
+                merged_real_sum = merged_real_sum * old_real_scale +
+                                  shard_real_sum * shard_real_scale;
+                merged_real_max = new_real_max;
+              }
+            }
+          }
+
+          if (sink_ptr != nullptr) {
+            apply_sink_row(sink_ptr[head], /*row=*/0, d_v, &merged_max,
+                           &merged_sum, merged_row);
+          }
+          const int64_t token = plan.token0 + row;
+          scalar_t* out_row = out_ptr + (token * h_q + head) * d_v;
+          if (merged_sum > 0.0f) {
+            store_output_row(out_row, merged_row, 1.0f / merged_sum, d_v);
+          } else {
+            std::fill(out_row, out_row + d_v, scalar_t{0});
+          }
+          if constexpr (kReturnStats) {
+            if (merged_real_sum > 0.0f) {
+              max_ptr[token * h_q + head] = merged_real_max;
+              lse_ptr[token * h_q + head] =
+                  merged_real_max + std::log(merged_real_sum);
+            }
+          }
+        }
+      }
+    };
+
+    if (max_groups <= 1 || plans.size() <= 1) {
+      for (int64_t plan_idx = 0; plan_idx < static_cast<int64_t>(plans.size());
+           ++plan_idx) {
+        merge_plan(plan_idx);
+      }
+    } else {
+#ifdef _OPENMP
+#pragma omp parallel for num_threads(max_groups) schedule(dynamic, 1)
+      for (int64_t plan_idx = 0; plan_idx < static_cast<int64_t>(plans.size());
+           ++plan_idx) {
+        merge_plan(plan_idx);
+      }
+#else
+      for (int64_t plan_idx = 0; plan_idx < static_cast<int64_t>(plans.size());
+           ++plan_idx) {
+        merge_plan(plan_idx);
+      }
+#endif
+    }
+    return;
+  }
 
   if (max_groups <= 1 || task_order.size() <= 1) {
     for (int64_t task_pos = 0; task_pos < static_cast<int64_t>(task_order.size()); ++task_pos) {
-      process_task(task_pos);
+      process_1d_task(task_pos);
     }
     return;
   }
@@ -1868,12 +2452,12 @@ static inline void run_sparse_mla_kernel(const at::Tensor& q, const at::Tensor& 
   {
 #pragma omp for schedule(dynamic, 1)
     for (int64_t task_pos = 0; task_pos < static_cast<int64_t>(task_order.size()); ++task_pos) {
-      process_task(task_pos);
+      process_1d_task(task_pos);
     }
   }
 #else
   for (int64_t task_pos = 0; task_pos < static_cast<int64_t>(task_order.size()); ++task_pos) {
-    process_task(task_pos);
+    process_1d_task(task_pos);
   }
 #endif
 }
@@ -1997,6 +2581,12 @@ static py::object flash_mla_sparse_fwd_impl(at::Tensor q, at::Tensor kv, at::Ten
           run_sparse_mla_kernel<at::BFloat16, true, SparseMlaTailVariant::kIndexed4x4>(
               q_c, kv_c, indices_2d, sink_ptr, static_cast<float>(sm_scale), d_v, output_compute, max_logits, lse);
           break;
+        case SparseMlaTailVariant::kIndexed4x4_2d:
+          run_sparse_mla_kernel<at::BFloat16, true,
+                                SparseMlaTailVariant::kIndexed4x4_2d>(
+              q_c, kv_c, indices_2d, sink_ptr, static_cast<float>(sm_scale),
+              d_v, output_compute, max_logits, lse);
+          break;
         case SparseMlaTailVariant::kMaskedDense8x8:
           run_sparse_mla_kernel<at::BFloat16, true, SparseMlaTailVariant::kMaskedDense8x8>(
               q_c, kv_c, indices_2d, sink_ptr, static_cast<float>(sm_scale), d_v, output_compute, max_logits, lse);
@@ -2005,12 +2595,30 @@ static py::object flash_mla_sparse_fwd_impl(at::Tensor q, at::Tensor kv, at::Ten
           run_sparse_mla_kernel<at::BFloat16, true, SparseMlaTailVariant::kMaskedDense8x8Pruned>(
               q_c, kv_c, indices_2d, sink_ptr, static_cast<float>(sm_scale), d_v, output_compute, max_logits, lse);
           break;
+        case SparseMlaTailVariant::kMaskedDense8x8Pruned2d:
+          run_sparse_mla_kernel<at::BFloat16, true,
+                                SparseMlaTailVariant::kMaskedDense8x8Pruned2d>(
+              q_c, kv_c, indices_2d, sink_ptr, static_cast<float>(sm_scale),
+              d_v, output_compute, max_logits, lse);
+          break;
+        case SparseMlaTailVariant::kMaskedDense8x8FusedFmla:
+        case SparseMlaTailVariant::kMaskedDense8x8FusedBfmlal:
+        case SparseMlaTailVariant::kMaskedDense8x8FusedBfmmla:
+          TORCH_INTERNAL_ASSERT(
+              false,
+              "fused online sparse MLA variants do not support return_stats");
       }
     } else {
       switch (tail_variant) {
         case SparseMlaTailVariant::kIndexed4x4:
           run_sparse_mla_kernel<at::BFloat16, false, SparseMlaTailVariant::kIndexed4x4>(
               q_c, kv_c, indices_2d, sink_ptr, static_cast<float>(sm_scale), d_v, output_compute, max_logits, lse);
+          break;
+        case SparseMlaTailVariant::kIndexed4x4_2d:
+          run_sparse_mla_kernel<at::BFloat16, false,
+                                SparseMlaTailVariant::kIndexed4x4_2d>(
+              q_c, kv_c, indices_2d, sink_ptr, static_cast<float>(sm_scale),
+              d_v, output_compute, max_logits, lse);
           break;
         case SparseMlaTailVariant::kMaskedDense8x8:
           run_sparse_mla_kernel<at::BFloat16, false, SparseMlaTailVariant::kMaskedDense8x8>(
@@ -2019,6 +2627,32 @@ static py::object flash_mla_sparse_fwd_impl(at::Tensor q, at::Tensor kv, at::Ten
         case SparseMlaTailVariant::kMaskedDense8x8Pruned:
           run_sparse_mla_kernel<at::BFloat16, false, SparseMlaTailVariant::kMaskedDense8x8Pruned>(
               q_c, kv_c, indices_2d, sink_ptr, static_cast<float>(sm_scale), d_v, output_compute, max_logits, lse);
+          break;
+        case SparseMlaTailVariant::kMaskedDense8x8Pruned2d:
+          run_sparse_mla_kernel<at::BFloat16, false,
+                                SparseMlaTailVariant::kMaskedDense8x8Pruned2d>(
+              q_c, kv_c, indices_2d, sink_ptr, static_cast<float>(sm_scale),
+              d_v, output_compute, max_logits, lse);
+          break;
+        case SparseMlaTailVariant::kMaskedDense8x8FusedFmla:
+          run_sparse_mla_kernel<at::BFloat16, false,
+                                SparseMlaTailVariant::kMaskedDense8x8FusedFmla>(
+              q_c, kv_c, indices_2d, sink_ptr, static_cast<float>(sm_scale),
+              d_v, output_compute, max_logits, lse);
+          break;
+        case SparseMlaTailVariant::kMaskedDense8x8FusedBfmlal:
+          run_sparse_mla_kernel<
+              at::BFloat16, false,
+              SparseMlaTailVariant::kMaskedDense8x8FusedBfmlal>(
+              q_c, kv_c, indices_2d, sink_ptr, static_cast<float>(sm_scale),
+              d_v, output_compute, max_logits, lse);
+          break;
+        case SparseMlaTailVariant::kMaskedDense8x8FusedBfmmla:
+          run_sparse_mla_kernel<
+              at::BFloat16, false,
+              SparseMlaTailVariant::kMaskedDense8x8FusedBfmmla>(
+              q_c, kv_c, indices_2d, sink_ptr, static_cast<float>(sm_scale),
+              d_v, output_compute, max_logits, lse);
           break;
       }
     }
@@ -2038,8 +2672,13 @@ py::object flash_mla_sparse_fwd(at::Tensor q, at::Tensor kv, at::Tensor indices,
                                 c10::optional<int64_t> d_v_opt, c10::optional<at::Tensor> attn_sink,
                                 c10::optional<at::Tensor> topk_length, c10::optional<at::Tensor> out,
                                 bool return_stats) {
-  return flash_mla_sparse_fwd_impl(q, kv, indices, sm_scale, d_v_opt, attn_sink, topk_length, out, return_stats,
-                                   SparseMlaTailVariant::kIndexed4x4);
+  // The 2-D scheduler is guarded by its own underfill threshold, so large
+  // prefill batches retain the 1-D query-block schedule while short chunks can
+  // split each block over disjoint KV shards. The float32 implementation keeps
+  // its existing 1-D instantiation in flash_mla_sparse_fwd_impl.
+  return flash_mla_sparse_fwd_impl(q, kv, indices, sm_scale, d_v_opt, attn_sink,
+                                   topk_length, out, return_stats,
+                                   SparseMlaTailVariant::kIndexed4x4_2d);
 }
 
 py::object flash_mla_sparse_fwd_variant(at::Tensor q, at::Tensor kv, at::Tensor indices, double sm_scale,
@@ -2049,16 +2688,40 @@ py::object flash_mla_sparse_fwd_variant(at::Tensor q, at::Tensor kv, at::Tensor 
   SparseMlaTailVariant variant = SparseMlaTailVariant::kIndexed4x4;
   if (tail_variant == "indexed_4x4") {
     variant = SparseMlaTailVariant::kIndexed4x4;
+  } else if (tail_variant == "indexed_4x4_2d") {
+    variant = SparseMlaTailVariant::kIndexed4x4_2d;
   } else if (tail_variant == "masked_dense_8x8") {
     variant = SparseMlaTailVariant::kMaskedDense8x8;
   } else if (tail_variant == "masked_dense_8x8_pruned") {
     variant = SparseMlaTailVariant::kMaskedDense8x8Pruned;
+  } else if (tail_variant == "masked_dense_8x8_pruned_2d") {
+    variant = SparseMlaTailVariant::kMaskedDense8x8Pruned2d;
+  } else if (tail_variant == "masked_dense_8x8_fused_fmla") {
+    variant = SparseMlaTailVariant::kMaskedDense8x8FusedFmla;
+  } else if (tail_variant == "masked_dense_8x8_fused_bfmlal") {
+    variant = SparseMlaTailVariant::kMaskedDense8x8FusedBfmlal;
+  } else if (tail_variant == "masked_dense_8x8_fused_bfmmla") {
+    variant = SparseMlaTailVariant::kMaskedDense8x8FusedBfmmla;
   } else {
-    TORCH_CHECK(false, "unknown sparse MLA tail variant: ", tail_variant,
-                "; expected indexed_4x4, masked_dense_8x8, or masked_dense_8x8_pruned");
+    TORCH_CHECK(
+        false, "unknown sparse MLA tail variant: ", tail_variant,
+        "; expected indexed_4x4, indexed_4x4_2d, masked_dense_8x8, "
+        "masked_dense_8x8_pruned, "
+        "masked_dense_8x8_pruned_2d, "
+        "masked_dense_8x8_fused_fmla, masked_dense_8x8_fused_bfmlal, or "
+        "masked_dense_8x8_fused_bfmmla");
   }
-  TORCH_CHECK(variant == SparseMlaTailVariant::kIndexed4x4 || q.scalar_type() == at::kBFloat16,
+  TORCH_CHECK(variant == SparseMlaTailVariant::kIndexed4x4 ||
+                  variant == SparseMlaTailVariant::kIndexed4x4_2d ||
+                  q.scalar_type() == at::kBFloat16,
               "masked dense sparse MLA tail variants require bfloat16 q/kv");
+  const bool fused_online =
+      variant == SparseMlaTailVariant::kMaskedDense8x8FusedFmla ||
+      variant == SparseMlaTailVariant::kMaskedDense8x8FusedBfmlal ||
+      variant == SparseMlaTailVariant::kMaskedDense8x8FusedBfmmla;
+  TORCH_CHECK(
+      !return_stats || !fused_online,
+      "fused online sparse MLA variants currently require return_stats=false");
   return flash_mla_sparse_fwd_impl(q, kv, indices, sm_scale, d_v_opt, attn_sink, topk_length, out, return_stats,
                                    variant);
 }

@@ -3,8 +3,17 @@ operator: sparse_mla
 baseline:
   id: indexed_4x4
   implementation: csrc/sparse_mla.cpp
-  entrypoint: flash_mla_sparse_fwd
+  entrypoint: _flash_mla_sparse_fwd_variant(..., "indexed_4x4")
   status: reference
+
+default:
+  id: indexed_4x4_2d
+  entrypoint: flash_mla_sparse_fwd
+  dispatch: >-
+    BF16 uses guarded KV splitting when eight-query block count is no more than
+    half the requested worker count, with at most eight KV shards per block.
+    FP32 and BF16 shapes that do not trigger the guard retain the indexed 1D
+    schedule and numerical behavior.
 
 benchmark_scenarios:
   full_forward: >-
@@ -16,6 +25,14 @@ benchmark_scenarios:
   tail_v4_mix: >-
     tests/bench_sparse_mla_tail_variants.py --workload tail-v4-mix
     --tail-blocks 1024 --warmup 5 --iters 21
+  dsv4_sparse_4096: >-
+    tests/bench_sparse_mla_tail_variants.py --workload dsv4-sparse
+    --s-q 4096 --compressed-capacity 512 --window-size 128
+    --compress-ratio 4 --warmup 5 --iters 21
+  dsv4_sparse_8192: >-
+    tests/bench_sparse_mla_tail_variants.py --workload dsv4-sparse
+    --s-q 8192 --compressed-capacity 512 --window-size 128
+    --compress-ratio 4 --warmup 5 --iters 21
 
 features:
   - id: planning.masked_dense_tail
@@ -148,11 +165,83 @@ features:
       --threads 12 --warmup 5 --iters 21
     result: optimizations/sparse_mla/results/amazon_192c_masked_tail_20260812.md
 
+  - id: compute.fused_online_epilogue
+    part: compute
+    status: experimental
+    owner: zhangxu
+    opened: 2026-08-12
+    decision_by: 2026-09-11
+    implementation:
+      - csrc/sparse_mla.cpp
+      - csrc/sparse_mla_tail_microkernels.cpp
+      - csrc/sparse_mla_tail_microkernels.h
+    hypothesis: >-
+      Keeping one 8x8 score tile and its rounded BF16 probabilities in SVE
+      registers removes score and p_hat scratch traffic while preserving the
+      existing online-softmax state update.
+    depends_on:
+      - compute.bfmmla_2x2_pruning
+    conflicts_with: []
+    next_decision: >-
+      Keep as an experimental comparison only. FMLA wins at SVL256 but the
+      materialized pruned path wins at SVL128, so there is no single default
+      epilogue across the validated machines.
+    adoption_gate: >-
+      Beat masked_dense_8x8_pruned by at least 3% on both SVL128 and SVL256
+      without losing mask coverage or return_stats support.
+    correctness: >-
+      PYTHONPATH=src OMP_NUM_THREADS=4 .venv/bin/python -m pytest -q
+      tests/test_sparse_mla.py
+    benchmark: >-
+      OMP_NUM_THREADS=1 OMP_DYNAMIC=FALSE OMP_PROC_BIND=close
+      tests/bench_sparse_mla_tail_variants.py --workload tail-causal
+      --tail-blocks 1024 --variants indexed_4x4 masked_dense_8x8_pruned
+      masked_dense_8x8_fused_fmla masked_dense_8x8_fused_bfmlal
+      masked_dense_8x8_fused_bfmmla --warmup 5 --iters 21
+    result: optimizations/sparse_mla/results/amazon_sparse_mla_2d_fused_20260812.md
+
+  - id: scheduling.kv_2d_split
+    part: scheduling
+    status: enabled
+    owner: zhangxu
+    opened: 2026-08-12
+    decision_by: 2026-09-11
+    implementation: csrc/sparse_mla.cpp
+    hypothesis: >-
+      When eight-query block count leaves at least half of the requested worker
+      pool idle, split heavy blocks across disjoint KV shards and merge their
+      local online-softmax states associatively.
+    depends_on: []
+    conflicts_with: []
+    next_decision: >-
+      Profile task construction, packing duplication, and partial-state merge;
+      consider a calibrated shard count after collecting production chunk-size
+      distributions.
+    adoption_gate: >-
+      At least 2x lower 64-token latency on 96 cores, within 0.5% at 4096 and
+      8192 tokens, and tolerance-equivalent output with stats and attention sink.
+    correctness: >-
+      PYTHONPATH=src OMP_NUM_THREADS=4 .venv/bin/python -m pytest -q
+      tests/test_sparse_mla.py
+    benchmark: >-
+      OMP_NUM_THREADS=96 OMP_DYNAMIC=FALSE OMP_PROC_BIND=close OMP_PLACES=cores
+      numactl --physcpubind=96-191 --membind=1 env PYTHONPATH=src
+      .venv/bin/python tests/bench_sparse_mla_tail_variants.py
+      --workload dsv4-sparse --s-q 64 --context-start 4032
+      --variants indexed_4x4 indexed_4x4_2d --warmup 5 --iters 21
+    result: optimizations/sparse_mla/results/amazon_sparse_mla_2d_fused_20260812.md
+
 variants:
   - id: indexed_4x4
     entrypoint: _flash_mla_sparse_fwd_variant(..., "indexed_4x4")
     status: reference
     features: []
+
+  - id: indexed_4x4_2d
+    entrypoint: _flash_mla_sparse_fwd_variant(..., "indexed_4x4_2d")
+    status: enabled
+    features:
+      - scheduling.kv_2d_split
 
   - id: masked_dense_8x8
     entrypoint: _flash_mla_sparse_fwd_variant(..., "masked_dense_8x8")
@@ -169,3 +258,40 @@ variants:
       - packing.masked_dense_kv
       - compute.bfmmla_2x2_pruning
       - compute.bfmlal_lane_pruning
+
+  - id: masked_dense_8x8_pruned_2d
+    entrypoint: _flash_mla_sparse_fwd_variant(..., "masked_dense_8x8_pruned_2d")
+    status: experimental
+    features:
+      - planning.masked_dense_tail
+      - packing.masked_dense_kv
+      - compute.bfmmla_2x2_pruning
+      - compute.bfmlal_lane_pruning
+      - scheduling.kv_2d_split
+
+  - id: masked_dense_8x8_fused_fmla
+    entrypoint: _flash_mla_sparse_fwd_variant(..., "masked_dense_8x8_fused_fmla")
+    status: experimental
+    features:
+      - planning.masked_dense_tail
+      - packing.masked_dense_kv
+      - compute.bfmmla_2x2_pruning
+      - compute.fused_online_epilogue
+
+  - id: masked_dense_8x8_fused_bfmlal
+    entrypoint: _flash_mla_sparse_fwd_variant(..., "masked_dense_8x8_fused_bfmlal")
+    status: experimental
+    features:
+      - planning.masked_dense_tail
+      - packing.masked_dense_kv
+      - compute.bfmmla_2x2_pruning
+      - compute.fused_online_epilogue
+
+  - id: masked_dense_8x8_fused_bfmmla
+    entrypoint: _flash_mla_sparse_fwd_variant(..., "masked_dense_8x8_fused_bfmmla")
+    status: experimental
+    features:
+      - planning.masked_dense_tail
+      - packing.masked_dense_kv
+      - compute.bfmmla_2x2_pruning
+      - compute.fused_online_epilogue

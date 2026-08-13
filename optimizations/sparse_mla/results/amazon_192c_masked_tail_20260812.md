@@ -1,5 +1,11 @@
 # Sparse MLA masked-tail comparison on Amazon 192-core Arm
 
+> Follow-up (2026-08-12): this report's decision remains the conclusion for the
+> masked 8x8 compute candidates. A later, independent guarded 2D KV scheduler
+> was adopted for the public BF16 path; see
+> `amazon_sparse_mla_2d_fused_20260812.md`. The indexed 4x4 kernel remains the
+> correctness baseline and the no-split fallback.
+
 ## Decision
 
 Keep the public/default `indexed_4x4` dispatch unchanged. Both masked 8x8

@@ -22,8 +22,15 @@ from fused_cpp.sparse_mla import (
 
 _CPP_TAIL_VARIANTS = (
     "indexed_4x4",
+    "indexed_4x4_2d",
     "masked_dense_8x8",
     "masked_dense_8x8_pruned",
+    "masked_dense_8x8_pruned_2d",
+)
+_CPP_FUSED_TAIL_VARIANTS = (
+    "masked_dense_8x8_fused_fmla",
+    "masked_dense_8x8_fused_bfmlal",
+    "masked_dense_8x8_fused_bfmmla",
 )
 _HAS_CPP_TAIL_VARIANTS = _fused_cpp_C is not None and hasattr(
     _fused_cpp_C, "_flash_mla_sparse_fwd_variant"
@@ -390,6 +397,137 @@ def test_flash_mla_sparse_fwd_cpp_tail_variants_match_naive(
             return_stats=True,
         )
         _assert_sparse_close(actual, expected)
+
+
+@pytest.mark.skipif(not _HAS_CPP_TAIL_VARIANTS, reason="C++ sparse MLA tail variants unavailable")
+@pytest.mark.parametrize(
+    ("start", "valid_lens", "topk"),
+    [
+        (4, (1, 2, 3, 4, 5, 6, 7, 8), 8),
+        (8, (0, 0, 0, 1, 1, 1, 1, 2), 2),
+        (8, (2, 2, 2, 3, 3, 3, 3, 4), 4),
+        (8, (4, 4, 4, 5, 5, 5, 5, 6), 6),
+        (8, (6, 6, 6, 7, 7, 7, 7, 8), 8),
+        (0, (18, 18, 18, 18, 18, 18, 18, 18), 24),
+        (0, (20, 20, 20, 20, 20, 20, 20, 20), 24),
+        (0, (22, 22, 22, 22, 22, 22, 22, 22), 24),
+    ],
+)
+def test_flash_mla_sparse_fwd_cpp_fused_tail_variants_match_naive_output(
+    start: int,
+    valid_lens: tuple[int, ...],
+    topk: int,
+) -> None:
+    """Fused online epilogues must cover every recognized 8x8 mask."""
+    torch.manual_seed(101 + start + topk)
+    s_q, h_q, s_kv, d_qk, d_v = 8, 3, 32, 16, 16
+    q = torch.randn(s_q, h_q, d_qk).bfloat16()
+    kv = torch.randn(s_kv, 1, d_qk).bfloat16()
+    indices = torch.full((s_q, 1, topk), -1, dtype=torch.int32)
+    for row, valid_len in enumerate(valid_lens):
+        if valid_len:
+            indices[row, 0, :valid_len] = torch.arange(start, start + valid_len, dtype=torch.int32)
+    scale = 1.0 / (d_qk**0.5)
+    expected = flash_mla_sparse_fwd_naive(q, kv, indices, scale, d_v=d_v)
+
+    for variant in _CPP_FUSED_TAIL_VARIANTS:
+        actual = _fused_cpp_C._flash_mla_sparse_fwd_variant(
+            q,
+            kv,
+            indices,
+            scale,
+            variant,
+            d_v=d_v,
+        )
+        torch.testing.assert_close(actual, expected, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.skipif(not _HAS_CPP_TAIL_VARIANTS, reason="C++ sparse MLA tail variants unavailable")
+def test_flash_mla_sparse_fwd_cpp_2d_kv_split_matches_1d_with_stats_and_sink() -> None:
+    """A heavy block split across K/V shards must merge online-softmax state."""
+    torch.manual_seed(149)
+    s_q, h_q, s_kv, d_qk, d_v = 16, 4, 320, 32, 24
+    q = torch.randn(s_q, h_q, d_qk).bfloat16()
+    kv = torch.randn(s_kv, 1, d_qk).bfloat16()
+    # Keep a long shared dense run for coarse KV shards, but prefix it with
+    # sparse 4a-like selections so the all-dense fast path cannot bypass the
+    # scheduler under test.
+    sparse_prefix = torch.arange(0, 128, 2, dtype=torch.int32)
+    dense_window = torch.arange(160, 288, dtype=torch.int32)
+    index_row = torch.cat((sparse_prefix, dense_window))
+    indices = index_row.reshape(1, 1, -1).expand(s_q, 1, -1).clone()
+    sink = torch.tensor([float("-inf"), -0.5, 0.25, 1.0], dtype=torch.float32)
+    scale = 1.0 / (d_qk**0.5)
+
+    expected = _fused_cpp_C._flash_mla_sparse_fwd_variant(
+        q,
+        kv,
+        indices,
+        scale,
+        "indexed_4x4",
+        d_v=d_v,
+        attn_sink=sink,
+        return_stats=True,
+    )
+    actual = _fused_cpp_C._flash_mla_sparse_fwd_variant(
+        q,
+        kv,
+        indices,
+        scale,
+        "indexed_4x4_2d",
+        d_v=d_v,
+        attn_sink=sink,
+        return_stats=True,
+    )
+    _assert_sparse_close(actual, expected)
+
+    default_actual = flash_mla_sparse_fwd(
+        q,
+        kv,
+        indices,
+        scale,
+        d_v=d_v,
+        attn_sink=sink,
+        return_stats=True,
+    )
+    _assert_sparse_close(default_actual, expected)
+
+
+@pytest.mark.skipif(not _HAS_CPP_TAIL_VARIANTS, reason="C++ sparse MLA tail variants unavailable")
+def test_flash_mla_sparse_fwd_cpp_sliding_window_intersection_matches_indexed() -> None:
+    """Sliding-window common-intersection extraction must preserve both fringes."""
+    torch.manual_seed(157)
+    s_q, h_q, d_qk, d_v, window = 16, 3, 32, 24, 16
+    context_start = 24
+    s_kv = context_start + s_q + 8
+    q = torch.randn(s_q, h_q, d_qk).bfloat16()
+    kv = torch.randn(s_kv, 1, d_qk).bfloat16()
+    indices = torch.full((s_q, 1, window), -1, dtype=torch.int32)
+    for token in range(s_q):
+        position = context_start + token
+        start = position + 1 - window
+        indices[token, 0] = torch.arange(start, position + 1, dtype=torch.int32)
+    scale = 1.0 / (d_qk**0.5)
+
+    expected = _fused_cpp_C._flash_mla_sparse_fwd_variant(
+        q,
+        kv,
+        indices,
+        scale,
+        "indexed_4x4",
+        d_v=d_v,
+        return_stats=True,
+    )
+    actual = _fused_cpp_C._flash_mla_sparse_fwd_variant(
+        q,
+        kv,
+        indices,
+        scale,
+        "masked_dense_8x8_pruned",
+        d_v=d_v,
+        return_stats=True,
+    )
+    _assert_sparse_close(actual, expected)
 
 
 @pytest.mark.skipif(not _HAS_CPP_TAIL_VARIANTS, reason="C++ sparse MLA tail variants unavailable")
