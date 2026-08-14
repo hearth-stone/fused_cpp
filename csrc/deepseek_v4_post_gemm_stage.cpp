@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "deepseek_v4_attn_gemm_sve.h"
+#include "deepseek_v4_indexer_sve.h"
 #include "deepseek_v4_q_norm_rope_sve.h"
 #include "profile_utils.h"
 #include "workspace_pool.h"
@@ -84,7 +85,10 @@ struct PostGemmStageProfile {
   double sparse_indexer_short_path_ms = 0.0;
   double sparse_indexer_gather_ms = 0.0;
   double sparse_indexer_fold_q_ms = 0.0;
-  double sparse_indexer_score_topk_ms = 0.0;
+  double sparse_indexer_score_ms = 0.0;
+  double sparse_indexer_topk_ms = 0.0;
+  int sparse_indexer_sve_n_tile = -1;
+  int sparse_indexer_topk_native = -1;
 };
 
 #if FUSED_CPP_ENABLE_PROFILING
@@ -98,7 +102,7 @@ void PrintPostGemmProfile(const PostGemmStageProfile& profile, double total_ms) 
                           profile.mla_compress_norm_rope_insert_ms + profile.indexer_save_partial_states_ms +
                           profile.indexer_compress_norm_rope_insert_ms + profile.sparse_indexer_short_path_ms +
                           profile.sparse_indexer_gather_ms + profile.sparse_indexer_fold_q_ms +
-                          profile.sparse_indexer_score_topk_ms;
+                          profile.sparse_indexer_score_ms + profile.sparse_indexer_topk_ms;
   const double other_ms = std::max(0.0, total_ms - known_ms);
   const auto pct = [total_ms](double ms) -> double { return total_ms > 0.0 ? (100.0 * ms / total_ms) : 0.0; };
 
@@ -126,9 +130,22 @@ void PrintPostGemmProfile(const PostGemmStageProfile& profile, double total_ms) 
             << pct(profile.sparse_indexer_gather_ms) << "%)"
             << " sparse_indexer_fold_q_ms=" << profile.sparse_indexer_fold_q_ms << "("
             << pct(profile.sparse_indexer_fold_q_ms) << "%)"
-            << " sparse_indexer_score_topk_ms=" << profile.sparse_indexer_score_topk_ms << "("
-            << pct(profile.sparse_indexer_score_topk_ms) << "%)"
-            << " other_ms=" << other_ms << "(" << pct(other_ms) << "%)" << '\n';
+            << " sparse_indexer_score_topk_ms=" << profile.sparse_indexer_score_ms + profile.sparse_indexer_topk_ms
+            << "(" << pct(profile.sparse_indexer_score_ms + profile.sparse_indexer_topk_ms) << "%)"
+            << " sparse_indexer_score_ms=" << profile.sparse_indexer_score_ms << "("
+            << pct(profile.sparse_indexer_score_ms) << "%)"
+            << " sparse_indexer_topk_ms=" << profile.sparse_indexer_topk_ms << "("
+            << pct(profile.sparse_indexer_topk_ms) << "%)"
+            << " sparse_indexer_topk_backend="
+            << (profile.sparse_indexer_topk_native > 0
+                    ? "native_batch_exact"
+                    : (profile.sparse_indexer_topk_native == 0 ? "aten_rowwise" : "short_path"))
+            << " sparse_indexer_backend="
+            << (profile.sparse_indexer_sve_n_tile > 0
+                    ? "sve_8x2vl"
+                    : (profile.sparse_indexer_sve_n_tile == 0 ? "fallback" : "short_path"))
+            << " sparse_indexer_n_tile=" << profile.sparse_indexer_sve_n_tile << " other_ms=" << other_ms << "("
+            << pct(other_ms) << "%)" << '\n';
 }
 
 #endif  // FUSED_CPP_ENABLE_PROFILING
@@ -2401,45 +2418,141 @@ void SparseAttnIndexerPrefill(const at::Tensor& q_quant, const at::Tensor& weigh
 
   topk_indices_buffer.slice(0, 0, num_tokens).fill_(-1);
 
-  at::Tensor cu_cpu = ToLongCpu(cu_seq_lens).reshape({-1});
+  CheckCpuTensor(q_quant, "indexer q");
+  CheckCpuTensor(weights, "indexer weights");
+  CheckCpuTensor(kv_cache, "indexer kv_cache");
+  CheckCpuTensor(block_table, "prefill block_table");
+  CheckDim(q_quant, "indexer q", 3);
+  CheckDim(weights, "indexer weights", 2);
+  CheckDim(kv_cache, "indexer kv_cache", 3);
+  TORCH_CHECK(weights.size(0) == num_tokens && weights.size(1) == q_quant.size(1),
+              "indexer weights must have shape [num_tokens, num_heads]");
+  TORCH_CHECK(block_size > 0, "indexer kv_cache block size must be positive");
+  TORCH_CHECK(kv_cache.size(2) == head_dim, "indexer kv_cache head_dim must match indexer q head_dim");
+
+  at::Tensor cu_cpu = ToLongCpu(cu_seq_lens).reshape({-1}).contiguous();
+  TORCH_CHECK(cu_cpu.numel() >= 1, "prefill cu_seq_lens must contain at least one element");
   const int64_t num_reqs = cu_cpu.numel() - 1;
-  const int64_t total_seq_lens = cu_cpu[-1].item<int64_t>();
+  const int64_t* cu_data = cu_cpu.data_ptr<int64_t>();
+  const int64_t total_seq_lens = cu_data[num_reqs];
+  TORCH_CHECK(total_seq_lens >= 0, "prefill total sequence length must be non-negative");
+  TORCH_CHECK(block_table.dim() == 2 && block_table.size(0) >= num_reqs, "prefill block_table must cover all requests");
+
+  const int64_t num_heads = q_quant.size(1);
+  const bool use_sve_indexer =
+      ::fused_cpp::deepseek_v4::indexer_sve::available() && q_quant.scalar_type() == at::kBFloat16 &&
+      weights.scalar_type() == at::kFloat && kv_cache.scalar_type() == at::kBFloat16 && q_quant.is_contiguous() &&
+      weights.is_contiguous() && kv_cache.is_contiguous() && num_heads > 0 && num_heads % 8 == 0 && head_dim > 0 &&
+      head_dim % 4 == 0 && num_tokens <= std::numeric_limits<int>::max() &&
+      num_heads <= std::numeric_limits<int>::max() && head_dim <= std::numeric_limits<int>::max() &&
+      total_seq_lens <= std::numeric_limits<int>::max();
+  if (profile != nullptr) {
+    profile->sparse_indexer_sve_n_tile = use_sve_indexer ? ::fused_cpp::deepseek_v4::indexer_sve::n_tile() : 0;
+  }
+
+  at::Tensor packed_k;
+  at::Tensor k_gathered;
   FUSED_CPP_PROFILE_START(phase_start);
-  at::Tensor k_gathered = at::empty({total_seq_lens, head_dim}, q_quant.options().dtype(at::kFloat));
-  for (int64_t req = 0; req < num_reqs; ++req) {
-    const int64_t seq_start = cu_cpu[req].item<int64_t>();
-    const int64_t seq_end = cu_cpu[req + 1].item<int64_t>();
-    const int64_t seq_len = seq_end - seq_start;
-    if (seq_len == 0) {
-      continue;
+  if (use_sve_indexer) {
+    at::Tensor block_table_cpu = block_table.contiguous();
+    const int32_t* block_ids = block_table_cpu.data_ptr<int32_t>();
+    const int64_t block_table_stride = block_table_cpu.stride(0);
+    std::vector<int64_t> key_row_offsets(static_cast<size_t>(total_seq_lens), -1);
+    for (int64_t req = 0; req < num_reqs; ++req) {
+      const int64_t seq_start = cu_data[req];
+      const int64_t seq_end = cu_data[req + 1];
+      TORCH_CHECK(seq_start >= 0 && seq_end >= seq_start && seq_end <= total_seq_lens,
+                  "prefill cu_seq_lens must be non-negative and monotonic");
+      const int64_t seq_len = seq_end - seq_start;
+      const int64_t num_blocks = (seq_len + block_size - 1) / block_size;
+      TORCH_CHECK(block_table_cpu.size(1) >= num_blocks, "prefill block_table row is too short for request ", req);
+      for (int64_t local = 0; local < seq_len; ++local) {
+        const int64_t logical_block = local / block_size;
+        const int32_t block_id = block_ids[req * block_table_stride + logical_block];
+        TORCH_CHECK(block_id >= 0 && block_id < kv_cache.size(0), "prefill block id out of range: ", block_id);
+        key_row_offsets[seq_start + local] =
+            (static_cast<int64_t>(block_id) * block_size + local % block_size) * head_dim;
+      }
     }
-    const int64_t num_blocks = (seq_len + block_size - 1) / block_size;
-    at::Tensor block_ids = block_table.index({req, Slice(0, num_blocks)}).to(at::kLong);
-    at::Tensor gathered = kv_cache.index_select(0, block_ids).reshape({num_blocks * block_size, head_dim});
-    k_gathered.index({Slice(seq_start, seq_end)}).copy_(gathered.slice(0, 0, seq_len).to(at::kFloat));
+    const int64_t packed_n = ::fused_cpp::deepseek_v4::indexer_sve::round_n(static_cast<int>(total_seq_lens));
+    packed_k = at::empty({head_dim * packed_n}, q_quant.options().dtype(at::kBFloat16));
+    ::fused_cpp::deepseek_v4::indexer_sve::pack_paged_k(Bf16ConstData(kv_cache), key_row_offsets.data(),
+                                                        Bf16Data(packed_k), static_cast<int>(head_dim),
+                                                        static_cast<int>(total_seq_lens), static_cast<int>(packed_n));
+  } else {
+    k_gathered = at::empty({total_seq_lens, head_dim}, q_quant.options().dtype(at::kFloat));
+    for (int64_t req = 0; req < num_reqs; ++req) {
+      const int64_t seq_start = cu_data[req];
+      const int64_t seq_end = cu_data[req + 1];
+      TORCH_CHECK(seq_start >= 0 && seq_end >= seq_start && seq_end <= total_seq_lens,
+                  "prefill cu_seq_lens must be non-negative and monotonic");
+      const int64_t seq_len = seq_end - seq_start;
+      if (seq_len == 0) {
+        continue;
+      }
+      const int64_t num_blocks = (seq_len + block_size - 1) / block_size;
+      at::Tensor block_ids_tensor = block_table.index({req, Slice(0, num_blocks)}).to(at::kLong);
+      at::Tensor gathered = kv_cache.index_select(0, block_ids_tensor).reshape({num_blocks * block_size, head_dim});
+      k_gathered.index({Slice(seq_start, seq_end)}).copy_(gathered.slice(0, 0, seq_len).to(at::kFloat));
+    }
   }
   FUSED_CPP_PROFILE_ADD_IF_PTR(profile == nullptr ? nullptr : &profile->sparse_indexer_gather_ms, phase_start);
 
   FUSED_CPP_PROFILE_RESTART(phase_start);
-  at::Tensor q_w = (q_quant.to(at::kFloat) * weights.to(at::kFloat).unsqueeze(-1)).sum(1);
-  FUSED_CPP_PROFILE_ADD_IF_PTR(profile == nullptr ? nullptr : &profile->sparse_indexer_fold_q_ms, phase_start);
+  at::Tensor logits;
+  if (use_sve_indexer) {
+    const int64_t packed_n = packed_k.numel() / head_dim;
+    logits = at::empty({num_tokens, packed_n}, q_quant.options().dtype(at::kFloat));
+    ::fused_cpp::deepseek_v4::indexer_sve::weighted_relu_scores(
+        Bf16ConstData(q_quant), weights.data_ptr<float>(), Bf16ConstData(packed_k), logits.data_ptr<float>(),
+        static_cast<int>(num_tokens), static_cast<int>(num_heads), static_cast<int>(head_dim),
+        static_cast<int>(packed_n));
+  } else {
+    const at::Tensor q_f = q_quant.to(at::kFloat);
+    const at::Tensor weights_f = weights.to(at::kFloat);
+    logits = at::zeros({num_tokens, total_seq_lens}, q_quant.options().dtype(at::kFloat));
+    const at::Tensor k_t = k_gathered.t();
+    for (int64_t head = 0; head < num_heads; ++head) {
+      at::Tensor head_scores = at::relu(at::matmul(q_f.select(1, head), k_t));
+      head_scores.mul_(weights_f.select(1, head).unsqueeze(1));
+      logits.add_(head_scores);
+    }
+  }
+  FUSED_CPP_PROFILE_ADD_IF_PTR(profile == nullptr ? nullptr : &profile->sparse_indexer_score_ms, phase_start);
 
   FUSED_CPP_PROFILE_RESTART(phase_start);
-  at::Tensor logits = at::matmul(q_w, k_gathered.t());
-  for (int64_t i = 0; i < num_tokens; ++i) {
-    const int64_t row_start = ks_cpu[i].item<int64_t>();
-    const int64_t row_end = ke_cpu[i].item<int64_t>();
-    const int64_t valid_len = row_end - row_start;
-    if (valid_len <= 0) {
-      continue;
-    }
-    const int64_t k_take = std::min<int64_t>(topk_tokens, valid_len);
-    at::Tensor row = logits.index({i, Slice(row_start, row_end)});
-    auto topk = row.topk(k_take, -1);
-    at::Tensor idx = std::get<1>(topk).to(at::kInt);
-    topk_indices_buffer.index({i, Slice(0, k_take)}).copy_(idx);
+  const bool use_native_topk =
+      logits.device().is_cpu() && logits.scalar_type() == at::kFloat && logits.dim() == 2 && logits.stride(1) == 1 &&
+      topk_indices_buffer.device().is_cpu() && topk_indices_buffer.scalar_type() == at::kInt &&
+      topk_indices_buffer.dim() == 2 && topk_indices_buffer.size(0) >= num_tokens && topk_tokens >= 0 &&
+      topk_indices_buffer.size(1) >= topk_tokens && topk_indices_buffer.stride(0) > 0 &&
+      topk_indices_buffer.stride(1) > 0 &&
+      (topk_tokens == 0 || (topk_indices_buffer.stride(1) <= std::numeric_limits<int64_t>::max() / topk_tokens &&
+                            topk_indices_buffer.stride(0) >= topk_tokens * topk_indices_buffer.stride(1)));
+  if (profile != nullptr) {
+    profile->sparse_indexer_topk_native = use_native_topk ? 1 : 0;
   }
-  FUSED_CPP_PROFILE_ADD_IF_PTR(profile == nullptr ? nullptr : &profile->sparse_indexer_score_topk_ms, phase_start);
+  if (use_native_topk) {
+    ::fused_cpp::deepseek_v4::indexer_sve::batched_topk_indices(
+        logits.data_ptr<float>(), logits.stride(0), logits.size(1), ks_data, ke_data,
+        topk_indices_buffer.data_ptr<int32_t>(), topk_indices_buffer.stride(0), topk_indices_buffer.stride(1),
+        num_tokens, topk_tokens);
+  } else {
+    for (int64_t i = 0; i < num_tokens; ++i) {
+      const int64_t row_start = ks_data[i];
+      const int64_t row_end = ke_data[i];
+      const int64_t valid_len = row_end - row_start;
+      if (valid_len <= 0) {
+        continue;
+      }
+      const int64_t k_take = std::min<int64_t>(topk_tokens, valid_len);
+      at::Tensor row = logits.index({i, Slice(row_start, row_end)});
+      auto topk = row.topk(k_take, -1);
+      at::Tensor idx = std::get<1>(topk).to(at::kInt);
+      topk_indices_buffer.index({i, Slice(0, k_take)}).copy_(idx);
+    }
+  }
+  FUSED_CPP_PROFILE_ADD_IF_PTR(profile == nullptr ? nullptr : &profile->sparse_indexer_topk_ms, phase_start);
 }
 
 void RunCompressor(const at::Tensor& kv_score, const at::Tensor& positions, const at::Tensor& ape,

@@ -504,6 +504,58 @@ BF16 `q[2048,32,192]`、DSV4 512 compressed + 128 sliding-window、
 完整方法、逐轮尝试、数值结果与保留门限见
 `optimizations/sparse_mla/results/amazon_192c_masked_tail_20260812.md`。
 
+### DeepSeek V4 sparse indexer weighted-ReLU 8×2VL 候选
+
+Indexer 长路径的目标公式改为逐 head 的
+`sum_h weight[h] * ReLU(dot(q[h], key))`；旧实现先把 weighted Q 沿 head
+求和再做一次 GEMM，不仅无法在 ReLU 前交换求和次序，也与模型定义不等价。
+
+新增 scalable-SVE `8 heads × 2VL keys` BFMMLA 候选。每个 tile 使用 16 个
+FP32 BFMMLA 累加器，Q 每个 query 在线程私有缓冲中 pack 一次；四个 score
+向量跨全部 head blocks 保持在寄存器中。每组两个 head 的 weight 生成
+`[w0,w0,w1,w1]`，在寄存器内完成 ReLU、加权累加和最终 head reduce，之后
+只散写最终 FP32 score。K 不再先 gather 成 FP32 tensor，而是在 packB 时按
+paged-cache row offset 直接抽取 BF16。支持条件为 contiguous BF16 Q/K、FP32
+weights、`H%8==0`、`D%4==0`；其他形状使用等价的逐 head FP32 fallback。
+`n_tile=svcntb()/2`，因此同一份源码随运行时 SVL 变化，不固定为 128 或 256 bit。
+
+Amazon 8C Neoverse-V1、cores 0--7、SVL256 上，45 个随机/尾块 score 组合
+（`H={8,16,64},D={4,16,128},N={1,7,16,19,33}`）最大绝对误差
+`9.53674e-7`、最大相对误差 `2.6939e-6`；相关集成测试 25 passed/5 个退休
+`cpp_v0` 用例 skipped。生成汇编的 8×2VL 热内核没有 Z 寄存器 spill。
+
+生产 score 形状 `M2048/H64/D128/N1536`、3 warmup + 15 runs：1T 为
+202.285 ms / 254.8 GFLOP/s，8T 为 36.653 ms / 1.406 TFLOP/s（5.52×，
+69.0% 并行效率）。完整 post-GEMM `context_start=4096,topk=512` 的 8T
+中位数 186.251 ms；profile 中 direct packB 0.044 ms、score 36.154 ms、
+逐行 TopK 75.155 ms，瓶颈已转为 TopK。旧 weighted-Q fold 公式错误，不能作为
+等价性能 baseline。当前仍保持 candidate：按用户要求本轮只验证了 8-core
+SVL256，192-core/SVL128 待测。完整命令和样本范围见
+`optimizations/deepseek_v4_post_gemm/results/amazon_8c_indexer_weighted_relu_sve_20260813.md`。
+
+### DeepSeek V4 Indexer native batched exact TopK 候选
+
+把 weighted-ReLU score 后的逐行 `at::Tensor::topk` 循环替换为单次 native
+batched exact TopK。每个 OpenMP worker 只建立一个可复用 `score,index` 缓冲，
+每行先用 `std::nth_element` 分出最大的 K 项，再只对选中项按 score 降序排序，
+最终直接写 strided int32 index；NaN 视为最大，tie 按较小 local index 排序。
+CPU contiguous-row FP32 score 与无重叠 int32 输出自动使用 native 路径，其他
+tensor contract 保留原 ATen fallback。score 计算与完整 logits 物化本轮不变。
+
+Amazon 8C Neoverse-V1、cores 0--7、SVL256 上，独立 TopK 的 20 个
+empty/`K={0,1,4,20}`/tie/NaN/strided-output case 全过；score 的 45 个形状仍为
+最大绝对误差 `9.53674e-7`，集成测试 `25 passed, 5 skipped`，并覆盖两 request
+长路径及 stride-2 输出。
+
+生产形状 `M2048/H64/D128/N1536`、`context_start=4096,topk=512`、3 warmup +
+15 runs：完整 stage 中位数 `186.251→120.758 ms`（-35.16%，1.542×）；profile
+中的 TopK `75.155→9.637 ms`（-87.18%，7.799×），score
+`36.154→36.158 ms`（+0.01%），score+TopK `111.310→45.795 ms`（-58.86%，
+2.431×）。另一次同配置复测中位数 `120.940 ms`、TopK `9.656 ms`，结果稳定。
+仅完成用户要求的 8-core 首测，保持 candidate，192-core/SVL128 待测。完整命令、
+范围和 raw summary 见
+`optimizations/deepseek_v4_post_gemm/results/amazon_8c_indexer_native_batch_topk_20260813.md`。
+
 ---
 
 ## 选型矩阵
@@ -529,6 +581,8 @@ BF16 `q[2048,32,192]`、DSV4 512 compressed + 128 sliding-window、
 
 | 日期 | 改动概述 | 受影响文件 |
 |---|---|---|
+| 2026-08-13 | **DeepSeek V4 Indexer native batched exact TopK 候选**：把 2,048 次逐行 ATen TopK 替换为单次 OpenMP batched `nth_element + selected-K sort`，每 worker 复用候选缓冲，只写 strided int32 indices；保留 score 降序、tie/NaN 定义和非标准 tensor contract 的 ATen fallback。Amazon 8C SVL256 上 20 个独立 TopK 边界 case 与 25 项集成测试通过；`M2048,N1536,K512` 的 TopK 75.155→9.637 ms（7.799×），完整 stage 186.251→120.758 ms（1.542×），score 保持 36.15 ms。仅完成 8C 首测，192C/SVL128 待测，故保持 candidate。 | 改 `csrc/{deepseek_v4_indexer_sve.h,deepseek_v4_indexer_sve.cpp,deepseek_v4_post_gemm_stage.cpp,SDPA_VERSIONS.md}`、`benchmarks/bench_deepseek_v4_indexer_sve.cpp`、`tests/test_deepseek_v4_post_gemm_stage.py`、`optimizations/deepseek_v4_post_gemm/{manifest.yaml,results/amazon_8c_indexer_native_batch_topk_20260813.md}` |
+| 2026-08-13 | **DeepSeek V4 sparse indexer weighted-ReLU 8×2VL 候选**：修正长路径为逐 head `ReLU(q·k)` 后乘 weight 再归约；新增 scalable-SVE 8×2VL BFMMLA 内核，Q 每 query 私有 pack、K 从 paged cache 直接 packB、ReLU/weight/head reduce 全部留在寄存器并只写最终 FP32 score；非 SVE/非 H8-D4 形状走等价 FP32 fallback。Amazon 8C SVL256 的 45 个 score 组合最大绝对误差 `9.54e-7`，25 tests passed/5 retired skipped，汇编无 Z spill；生产 score 形状 1T/8T 为 202.285/36.653 ms（1.406 TFLOP/s），完整 stage 186.251 ms，其中 score/TopK 为 36.154/75.155 ms。仅完成用户要求的 8C 首测，SVL128/192C 待测，故保持 candidate。 | 新建 `csrc/deepseek_v4_indexer_sve.{h,cpp}`、`benchmarks/bench_deepseek_v4_indexer_sve.cpp`、`optimizations/deepseek_v4_post_gemm/results/amazon_8c_indexer_weighted_relu_sve_20260813.md`；改 `csrc/{deepseek_v4_post_gemm_stage.cpp,SDPA_VERSIONS.md}`、`src/fused_cpp/{sparse_attn_indexer.py,deepseek_v4_post_gemm_stage.py}`、`tests/{test_sparse_attn_indexer.py,test_deepseek_v4_post_gemm_stage.py,bench_deepseek_v4_post_gemm_stage.py}`、`optimizations/deepseek_v4_post_gemm/manifest.yaml` |
 | 2026-08-13 | **Sparse MLA head-major sparse 8×8 组合实验**：新增内部 `heads_sparse_8x8`，按 token gather/pack 一份 sparse MQA K/V 并复用于所有 8-head group，按 L2 chunk 保留 online-softmax 状态；组合 dispatch 对全局共享连续 KV 先走 dense-head 调用级 pack。`q[2048,32,192]`、DSV4 top-k512+window128、context0、Dv128 下，Amazon 8C 1T/8T 分别快 30.16%/30.51%，Arm-codex 1T/80T 分别快 14.82%/54.16%；全 dense 与 `heads_dense_8x8` 持平。两机 SVL256 各 43 tests passed，公开默认不变，候选因尚缺三次独立 session 保持 experimental。 | 改 `csrc/{sparse_mla.cpp,SDPA_VERSIONS.md}`、`tests/{test_sparse_mla.py,bench_sparse_mla_tail_variants.py}`、`optimizations/sparse_mla/{manifest.yaml,results/arm_head_major_20260813.md}` |
 | 2026-08-13 | **Sparse MLA head-major dense 8×8 实验**：新增内部 `heads_dense_8x8`，以同一 token 的 8 个 head 作为 QK/PV M 维，调用级复用 shared-MQA K/V pack，并增加 dense-shared benchmark 与输出/stats/fallback 测试。`q[2048,32,192]`、KV640、Dv128 下 Amazon 8C 的 1T 快 0.69%、8T 持平；Arm-codex 1T 慢 0.60%，80T 快 18.96%，后者主要来自 2,048 token tasks 相对旧 256 token-tile tasks 的静态负载均衡改善。两机实际 SVL256、各 37 tests passed；公开默认不变。 | 改 `csrc/{sparse_mla.cpp,SDPA_VERSIONS.md}`、`tests/{test_sparse_mla.py,bench_sparse_mla_tail_variants.py}`、`optimizations/sparse_mla/{manifest.yaml,results/arm_head_major_20260813.md}` |
 | 2026-08-12 | **Sparse MLA fused online epilogue、三种 PV 指令比较与 2D KV split**：新增 SVL128/256 的 fused QK→online-softmax→PV 实验，消除 8×8 score/`p_hat` scratch；同一框架比较 FMLA/BFMLAL/BFMMLA，tail-only 上 SVL256 以 FMLA 最快（45.385 ms vs materialized 55.238），SVL128 则 materialized 最快（27.361 ms），BFMMLA 两边均非最优，故不切默认。新增 associative online-softmax partial merge 与最多 8-way KV shard，BF16 公开入口在 query blocks≤threads/2 时启用；真实 DSV4 4a 离散 top-k + 128 sliding window 下，192C cores96--191 的 64/128/256-token chunk 分别加速 5.317/3.872/2.276×，full 4096/8192 保持 ±0.22%。两台 SVL128/256 目标机各 34 tests passed。 | 改 `csrc/{sparse_mla.cpp,sparse_mla_tail_microkernels.cpp,sparse_mla_tail_microkernels.h,SDPA_VERSIONS.md}`、`tests/{test_sparse_mla.py,bench_sparse_mla_tail_variants.py}`、`docs/sparse_mla_vllm_integration.md`、`optimizations/sparse_mla/{manifest.yaml,results/amazon_sparse_mla_2d_fused_20260812.md}` |

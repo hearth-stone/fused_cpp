@@ -36,16 +36,17 @@ def _bf16_random(*shape: int) -> torch.Tensor:
 
 def _make_compressor(
     *,
-    num_tokens: int,
+    positions: torch.Tensor,
     head_dim: int,
     state_width: int,
     compress_ratio: int,
     block_size: int,
 ) -> CompressorState:
-    state_blocks = (num_tokens + block_size - 1) // block_size
-    compressed_tokens = (num_tokens + compress_ratio - 1) // compress_ratio
+    num_tokens = positions.numel()
+    total_tokens = int(positions[-1].item()) + 1 if num_tokens > 0 else 0
+    state_blocks = (total_tokens + block_size - 1) // block_size
+    compressed_tokens = (total_tokens + compress_ratio - 1) // compress_ratio
     kv_blocks = (compressed_tokens + block_size - 1) // block_size
-    positions = torch.arange(num_tokens, dtype=torch.int64)
     active = (positions + 1).remainder(compress_ratio).eq(0)
     kv_slots = torch.where(
         active,
@@ -63,7 +64,7 @@ def _make_compressor(
         state_slot_mapping=positions.clone(),
         token_to_req_indices=torch.zeros(num_tokens, dtype=torch.int64),
         block_table=torch.arange(state_blocks, dtype=torch.int32).view(1, state_blocks),
-        kv_cache=torch.zeros(kv_blocks, block_size, head_dim, dtype=torch.bfloat16),
+        kv_cache=_bf16_random(kv_blocks, block_size, head_dim),
         kv_slot_mapping=kv_slots,
         norm_weight=torch.ones(head_dim, dtype=torch.float32),
         compress_ratio=compress_ratio,
@@ -71,7 +72,10 @@ def _make_compressor(
     )
 
 
-def _make_inputs(num_tokens: int) -> tuple[PostGemmStageInputs, PreparedDeepSeekV4PostGemmWeights]:
+def _make_inputs(
+    num_tokens: int,
+    context_start: int,
+) -> tuple[PostGemmStageInputs, PreparedDeepSeekV4PostGemmWeights]:
     torch.manual_seed(20260729)
     q_lora_rank = 1024
     main_num_heads = 16
@@ -90,9 +94,10 @@ def _make_inputs(num_tokens: int) -> tuple[PostGemmStageInputs, PreparedDeepSeek
     indexer_weight = _bf16_random(indexer_num_heads * indexer_head_dim, q_lora_rank)
     weights = prepare_deepseek_v4_post_gemm_weights(main_weight, indexer_weight)
 
-    positions = torch.arange(num_tokens, dtype=torch.int64)
-    state_blocks = (num_tokens + block_size - 1) // block_size
-    compressed_tokens = (num_tokens + compress_ratio - 1) // compress_ratio
+    positions = torch.arange(context_start, context_start + num_tokens, dtype=torch.int64)
+    total_tokens = context_start + num_tokens
+    state_blocks = (total_tokens + block_size - 1) // block_size
+    compressed_tokens = (total_tokens + compress_ratio - 1) // compress_ratio
     compressed_blocks = (compressed_tokens + block_size - 1) // block_size
     valid_compressed = (positions + 1).div(compress_ratio, rounding_mode="floor")
 
@@ -109,8 +114,8 @@ def _make_inputs(num_tokens: int) -> tuple[PostGemmStageInputs, PreparedDeepSeek
         positions=positions,
         main_wq_b_weight=main_weight,
         indexer_wq_b_weight=indexer_weight,
-        main_cos_sin_cache=_cos_sin_cache(num_tokens + 1, rope_dim),
-        indexer_cos_sin_cache=_cos_sin_cache(num_tokens + 1, rope_dim),
+        main_cos_sin_cache=_cos_sin_cache(total_tokens + 1, rope_dim),
+        indexer_cos_sin_cache=_cos_sin_cache(total_tokens + 1, rope_dim),
         swa=SWACacheState(
             kv_cache=torch.zeros(
                 state_blocks,
@@ -121,14 +126,14 @@ def _make_inputs(num_tokens: int) -> tuple[PostGemmStageInputs, PreparedDeepSeek
             slot_mapping=positions.clone(),
         ),
         mla_compressor=_make_compressor(
-            num_tokens=num_tokens,
+            positions=positions,
             head_dim=main_head_dim,
             state_width=main_state_width,
             compress_ratio=compress_ratio,
             block_size=block_size,
         ),
         indexer_compressor=_make_compressor(
-            num_tokens=num_tokens,
+            positions=positions,
             head_dim=indexer_head_dim,
             state_width=indexer_state_width,
             compress_ratio=compress_ratio,
@@ -151,6 +156,12 @@ def _make_inputs(num_tokens: int) -> tuple[PostGemmStageInputs, PreparedDeepSeek
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--m", type=int, default=2048)
+    parser.add_argument(
+        "--context-start",
+        type=int,
+        default=0,
+        help="Absolute position of the first query token; use >0 to exercise the long indexer path.",
+    )
     parser.add_argument("--threads", type=int, default=96)
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--runs", type=int, default=15)
@@ -181,7 +192,9 @@ def main() -> None:
         os.environ["FUSED_CPP_POST_GEMM_N_GROUPS"] = str(args.n_groups)
     torch.set_num_threads(args.threads)
     torch.set_num_interop_threads(1)
-    inputs, weights = _make_inputs(args.m)
+    if args.context_start < 0:
+        raise ValueError("--context-start must be non-negative")
+    inputs, weights = _make_inputs(args.m, args.context_start)
 
     with torch.inference_mode():
         for _ in range(args.warmup):
@@ -201,6 +214,7 @@ def main() -> None:
     gemm_flops = 4 * args.m * 1024 * 8192
     result = {
         "m": args.m,
+        "context_start": args.context_start,
         "threads": args.threads,
         "schedule": args.schedule,
         "q_pool": args.q_pool,

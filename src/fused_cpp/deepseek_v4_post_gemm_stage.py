@@ -380,6 +380,26 @@ def _indexer_q_rope_quant(
     return q_rot.to(torch.bfloat16), weights
 
 
+def _weighted_relu_indexer_scores(
+    q_quant: torch.Tensor,
+    weights: torch.Tensor,
+    k_rows: torch.Tensor,
+) -> torch.Tensor:
+    """Compute the DeepSeek indexer headwise ReLU score in fp32."""
+    q_f = q_quant.to(torch.float32)
+    weights_f = weights.to(torch.float32)
+    k_f = k_rows.to(torch.float32)
+    scores = torch.zeros(
+        (q_f.shape[0], k_f.shape[0]),
+        dtype=torch.float32,
+        device=q_f.device,
+    )
+    for head in range(q_f.shape[1]):
+        head_scores = F.linear(q_f[:, head], k_f).relu_()
+        scores.add_(head_scores * weights_f[:, head].unsqueeze(1))
+    return scores
+
+
 def _sparse_indexer_prefill(
     q_quant: torch.Tensor,
     weights: torch.Tensor,
@@ -429,8 +449,7 @@ def _sparse_indexer_prefill(
         )
         k_gathered[seq_start:seq_end] = gathered[:seq_len].to(torch.float32)
 
-    q_w = (q_quant.to(torch.float32) * weights.to(torch.float32).unsqueeze(-1)).sum(dim=1)
-    logits = F.linear(q_w, k_gathered)
+    logits = _weighted_relu_indexer_scores(q_quant, weights, k_gathered)
     for i in range(num_tokens):
         row_start = int(cu_seqlen_ks_cpu[i].item())
         row_end = int(cu_seqlen_ke_cpu[i].item())
