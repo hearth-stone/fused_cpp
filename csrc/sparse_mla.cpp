@@ -28,6 +28,7 @@ constexpr int64_t kIndexedLq = 4;
 constexpr int64_t kIndexedKt = 4;
 constexpr int64_t kIndexedRowBlocks = kQueryBlock / kIndexedLq;
 constexpr int64_t kDenseThreshold = 8;
+constexpr int64_t kMaxSharedPrefixSegments = 2;
 
 enum class SparseMlaTailVariant {
   kIndexed4x4,
@@ -387,6 +388,110 @@ static inline bool find_full_shared_contiguous_run(const int64_t* indices, int64
     }
   }
   return true;
+}
+
+struct SharedPrefixSegments {
+  int64_t count = 0;
+  std::array<int64_t, kMaxSharedPrefixSegments> starts{};
+  std::array<int64_t, kMaxSharedPrefixSegments> max_lengths{};
+  std::vector<int64_t> token_lengths;
+};
+
+// Detect the V4 select-all prefill shape without relying on an absolute-token
+// threshold: every row is the concatenation of up to two fixed-start contiguous
+// prefixes (compressed cache, then SWA cache). Later query-dependent TopK rows
+// or a sliding SWA start introduce additional run starts and safely fall back.
+static inline bool find_shared_contiguous_prefix_segments(
+    const int64_t* indices, int64_t s_q, int64_t topk, int64_t s_kv,
+    int64_t required_alignment, SharedPrefixSegments& plan) {
+  if (s_q <= 1 || topk <= 0 || required_alignment <= 0) {
+    return false;
+  }
+
+  std::array<int64_t, kMaxSharedPrefixSegments> candidate_starts{};
+  int64_t candidate_count = 0;
+  for (int64_t token = 0; token < s_q; ++token) {
+    const int64_t* row = indices + token * topk;
+    int64_t previous = -2;
+    for (int64_t col = 0; col < topk; ++col) {
+      const int64_t index = row[col];
+      if (index < 0) {
+        continue;
+      }
+      if (index >= s_kv) {
+        return false;
+      }
+      if (index != previous + 1) {
+        bool known = false;
+        for (int64_t segment = 0; segment < candidate_count; ++segment) {
+          known |= candidate_starts[segment] == index;
+        }
+        if (!known) {
+          if (candidate_count == kMaxSharedPrefixSegments) {
+            return false;
+          }
+          candidate_starts[candidate_count++] = index;
+        }
+      }
+      previous = index;
+    }
+  }
+  if (candidate_count == 0) {
+    return false;
+  }
+  std::sort(candidate_starts.begin(),
+            candidate_starts.begin() + candidate_count);
+
+  plan = SharedPrefixSegments{};
+  plan.count = candidate_count;
+  std::copy_n(candidate_starts.begin(), candidate_count, plan.starts.begin());
+  plan.token_lengths.assign(
+      static_cast<size_t>(s_q * candidate_count), int64_t{0});
+  int64_t total_valid = 0;
+
+  for (int64_t token = 0; token < s_q; ++token) {
+    const int64_t* row = indices + token * topk;
+    int64_t segment = 0;
+    int64_t expected = plan.starts[0];
+    for (int64_t col = 0; col < topk; ++col) {
+      const int64_t index = row[col];
+      if (index < 0) {
+        continue;
+      }
+      while (segment + 1 < candidate_count &&
+             index >= plan.starts[segment + 1]) {
+        ++segment;
+        expected = plan.starts[segment];
+      }
+      if (index != expected) {
+        return false;
+      }
+      ++plan.token_lengths[static_cast<size_t>(token * candidate_count +
+                                               segment)];
+      ++expected;
+      ++total_valid;
+    }
+    for (int64_t current = 0; current < candidate_count; ++current) {
+      const int64_t length = plan.token_lengths[static_cast<size_t>(
+          token * candidate_count + current)];
+      plan.max_lengths[current] =
+          std::max(plan.max_lengths[current], length);
+    }
+  }
+
+  int64_t packed_keys = 0;
+  for (int64_t segment = 0; segment < candidate_count; ++segment) {
+    const int64_t max_length = plan.max_lengths[segment];
+    if (max_length == 0 || max_length % required_alignment != 0) {
+      return false;
+    }
+    if (segment + 1 < candidate_count &&
+        plan.starts[segment] + max_length > plan.starts[segment + 1]) {
+      return false;
+    }
+    packed_keys += max_length;
+  }
+  return total_valid > packed_keys;
 }
 
 template <typename scalar_t>
@@ -1157,6 +1262,246 @@ static inline bool run_dense_heads_packqkv_mqa_fast_path(
     }
   }
   return true;
+}
+
+static inline void apply_sink_head(float sink_score, int64_t d_v,
+                                   float* running_max, float* running_sum,
+                                   float* output_acc);
+
+// The first V4 select-all region consists of a compressed-cache prefix and an
+// SWA-cache prefix. Pack the maximum extent of each read-only segment once, then
+// let every token consume only its own prefix length through the common online
+// QK/PV executor. The detector rejects later sliding or query-dependent rows.
+template <bool kReturnStats>
+static inline bool run_shared_prefix_heads_packqkv_mqa_fast_path(
+    const at::Tensor& q, const at::Tensor& kv, const at::Tensor& indices_2d,
+    float scale, int64_t d_v, const at::Tensor* sink_tensor, at::Tensor& output,
+    at::Tensor* max_logits, at::Tensor* lse) {
+#if !FUSED_CPP_SPARSE_MLA_HAS_SVE_BFMMLA
+  return false;
+#else
+  if (q.scalar_type() != at::kBFloat16) {
+    return false;
+  }
+
+  const int64_t s_q = q.size(0);
+  const int64_t h_q = q.size(1);
+  const int64_t d_qk = q.size(2);
+  const int64_t s_kv = kv.size(0);
+  const int64_t topk = indices_2d.size(1);
+  if (h_q % kQueryBlock != 0 || d_qk % 4 != 0 ||
+      d_v % kQueryBlock != 0) {
+    return false;
+  }
+
+  const int64_t key_tile = ::fused_cpp::sparse_mla_sve::n_tile();
+  const int64_t value_tile = key_tile;
+  SharedPrefixSegments prefix_plan;
+  if (!find_shared_contiguous_prefix_segments(
+          indices_2d.data_ptr<int64_t>(), s_q, topk, s_kv, key_tile,
+          prefix_plan)) {
+    return false;
+  }
+
+  const bool profile_on = ::fused_cpp::sdpa_profile::enabled();
+  if (profile_on) {
+    ::fused_cpp::sdpa_profile::reset();
+  }
+  const uint64_t profile_total_t0 =
+      profile_on ? ::fused_cpp::sdpa_profile::now_ns() : 0;
+
+  const auto* q_ptr = q.data_ptr<at::BFloat16>();
+  const auto* kv_ptr = kv.data_ptr<at::BFloat16>();
+  auto* out_ptr = output.data_ptr<at::BFloat16>();
+  const float* sink_ptr =
+      sink_tensor == nullptr ? nullptr : sink_tensor->data_ptr<float>();
+  float* max_ptr = nullptr;
+  float* lse_ptr = nullptr;
+  if constexpr (kReturnStats) {
+    max_ptr = max_logits->data_ptr<float>();
+    lse_ptr = lse->data_ptr<float>();
+  }
+
+  const int64_t qblock_u16 = (d_qk / 4) * 32;
+  const int64_t kblock_u16 =
+      ::fused_cpp::sparse_mla_sve::packed_k_tile_elements(d_qk);
+  const int64_t head_groups = h_q / kQueryBlock;
+  const int64_t value_blocks = (d_v + value_tile - 1) / value_tile;
+  std::array<at::Tensor, kMaxSharedPrefixSegments> packed_k;
+  std::array<at::Tensor, kMaxSharedPrefixSegments> packed_v;
+
+  for (int64_t segment = 0; segment < prefix_plan.count; ++segment) {
+    const int64_t segment_start = prefix_plan.starts[segment];
+    const int64_t segment_length = prefix_plan.max_lengths[segment];
+    const int64_t key_blocks = segment_length / key_tile;
+    packed_k[segment] =
+        at::empty({key_blocks * kblock_u16}, q.options());
+    packed_v[segment] = at::empty(
+        {value_blocks * segment_length * value_tile}, q.options());
+    auto* packed_k_ptr =
+        reinterpret_cast<uint16_t*>(packed_k[segment].data_ptr());
+    auto* packed_v_ptr =
+        reinterpret_cast<uint16_t*>(packed_v[segment].data_ptr());
+    const auto* segment_kv = reinterpret_cast<const uint16_t*>(
+        kv_ptr + segment_start * d_qk);
+
+    {
+      FUSED_CPP_SDPA_PROFILE_SCOPE(::fused_cpp::sdpa_profile::Slot::kKPack);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+      for (int64_t block = 0; block < key_blocks; ++block) {
+        ::fused_cpp::sparse_mla_sve::pack_contiguous_k_tile_bf16(
+            segment_kv + block * key_tile * d_qk, d_qk, key_tile, d_qk,
+            packed_k_ptr + block * kblock_u16);
+      }
+    }
+    {
+      FUSED_CPP_SDPA_PROFILE_SCOPE(::fused_cpp::sdpa_profile::Slot::kVPack);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+      for (int64_t value_block = 0; value_block < value_blocks;
+           ++value_block) {
+        const int64_t output_base = value_block * value_tile;
+        const int64_t valid_columns =
+            std::min<int64_t>(value_tile, d_v - output_base);
+        ::fused_cpp::sparse_mla_sve::pack_contiguous_v_tile_bf16(
+            segment_kv, d_qk, segment_length, output_base, valid_columns,
+            packed_v_ptr + value_block * segment_length * value_tile);
+      }
+    }
+  }
+
+  const auto tile_sizes =
+      ::fused_cpp::sdpa_tile_sizes::compute_tile_sizes_l3kv(
+          /*B=*/1, h_q, topk, s_q, d_qk, d_v,
+          sizeof(at::BFloat16));
+  const int64_t sc_tile =
+      std::max<int64_t>(key_tile,
+                        (tile_sizes.Sc_l2 / key_tile) * key_tile);
+  const float neg_inf = -std::numeric_limits<float>::infinity();
+
+#ifdef _OPENMP
+#pragma omp parallel
+#endif
+  {
+    std::vector<float> scores(
+        static_cast<size_t>(kQueryBlock * sc_tile));
+    std::vector<at::BFloat16> p_hat_bf16(
+        static_cast<size_t>(kQueryBlock * sc_tile));
+    std::vector<float> output_acc(static_cast<size_t>(h_q * d_v));
+    std::vector<float> running_max(static_cast<size_t>(h_q));
+    std::vector<float> running_sum(static_cast<size_t>(h_q));
+    std::vector<float> exact_max;
+    std::vector<float> exact_sum;
+    if constexpr (kReturnStats) {
+      exact_max.resize(static_cast<size_t>(h_q));
+      exact_sum.resize(static_cast<size_t>(h_q));
+    }
+    std::vector<uint16_t> q_packed(
+        static_cast<size_t>(head_groups * qblock_u16));
+    std::vector<float> qkt_tile(
+        static_cast<size_t>(kQueryBlock * key_tile));
+    std::vector<uint16_t> p_packed(
+        static_cast<size_t>(kQueryBlock * sc_tile));
+
+#ifdef _OPENMP
+#pragma omp for schedule(dynamic, 1)
+#endif
+    for (int64_t token = 0; token < s_q; ++token) {
+      std::fill(output_acc.begin(), output_acc.end(), 0.0f);
+      std::fill(running_max.begin(), running_max.end(), neg_inf);
+      std::fill(running_sum.begin(), running_sum.end(), 0.0f);
+      if constexpr (kReturnStats) {
+        std::fill(exact_max.begin(), exact_max.end(), neg_inf);
+        std::fill(exact_sum.begin(), exact_sum.end(), 0.0f);
+      }
+
+      const at::BFloat16* q_token = q_ptr + token * h_q * d_qk;
+      {
+        FUSED_CPP_SDPA_PROFILE_SCOPE(::fused_cpp::sdpa_profile::Slot::kQPack);
+        for (int64_t group = 0; group < head_groups; ++group) {
+          ::fused_cpp::sdpa_microkernels::pack_q_8rows_to_seq_bf16(
+              q_token + group * kQueryBlock * d_qk, d_qk, d_qk,
+              q_packed.data() + group * qblock_u16);
+        }
+      }
+
+      for (int64_t segment = 0; segment < prefix_plan.count; ++segment) {
+        const int64_t segment_length = prefix_plan.max_lengths[segment];
+        const int64_t token_length = prefix_plan.token_lengths[static_cast<size_t>(
+            token * prefix_plan.count + segment)];
+        const auto* segment_kv =
+            kv_ptr + prefix_plan.starts[segment] * d_qk;
+        const auto* packed_k_ptr = reinterpret_cast<const uint16_t*>(
+            packed_k[segment].data_ptr());
+        const auto* packed_v_ptr = reinterpret_cast<const uint16_t*>(
+            packed_v[segment].data_ptr());
+        for (int64_t key_offset = 0; key_offset < token_length;
+             key_offset += sc_tile) {
+          const int64_t key_count =
+              std::min<int64_t>(sc_tile, token_length - key_offset);
+          HeadsChunkScratch scratch{scores.data(), p_hat_bf16.data(),
+                                    qkt_tile.data(), p_packed.data()};
+          HeadsOnlineState state{
+              output_acc.data(), running_max.data(), running_sum.data(),
+              kReturnStats ? exact_max.data() : nullptr,
+              kReturnStats ? exact_sum.data() : nullptr};
+          run_heads_qkpv_chunk_bf16<kReturnStats,
+                                     /*kEmptySumCorrectionIsZero=*/true>(
+              q_token, q_packed.data(),
+              packed_k_ptr + (key_offset / key_tile) * kblock_u16,
+              segment_kv + key_offset * d_qk, packed_v_ptr, h_q, d_qk, d_v,
+              key_count, segment_length, key_offset, key_tile, value_tile,
+              kblock_u16, scale, scratch, state);
+        }
+      }
+
+      for (int64_t head = 0; head < h_q; ++head) {
+        if (sink_ptr != nullptr) {
+          apply_sink_head(sink_ptr[head], d_v, running_max.data() + head,
+                          running_sum.data() + head,
+                          output_acc.data() + head * d_v);
+        }
+        at::BFloat16* out_row =
+            out_ptr + (token * h_q + head) * d_v;
+        if (running_sum[head] > 0.0f) {
+          store_normalized_bf16_row(out_row,
+                                    output_acc.data() + head * d_v,
+                                    1.0f / running_sum[head], d_v);
+        } else {
+          std::fill(out_row, out_row + d_v, at::BFloat16(0.0f));
+        }
+        if constexpr (kReturnStats) {
+          max_ptr[token * h_q + head] = exact_max[head];
+          lse_ptr[token * h_q + head] =
+              exact_sum[head] > 0.0f
+                  ? exact_max[head] + std::log(exact_sum[head])
+                  : std::numeric_limits<float>::infinity();
+        }
+      }
+    }
+  }
+
+  if (profile_on) {
+    ::fused_cpp::sdpa_profile::add(
+        ::fused_cpp::sdpa_profile::Slot::kTotal,
+        ::fused_cpp::sdpa_profile::now_ns() - profile_total_t0);
+    SdpaParams profile_params{};
+    profile_params.B = 1;
+    profile_params.N = h_q;
+    profile_params.L = s_q;
+    profile_params.S = topk;
+    profile_params.E = d_qk;
+    profile_params.Ev = d_v;
+    profile_params.dtype = SdpaDtype::kBFloat16;
+    ::fused_cpp::sdpa_profile::print_summary(
+        "sparse_mla_shared_prefix", "heads_shared_prefix_sve_qkpv_8x2vl",
+        profile_params, "shared_prefix_packqkv_mqa");
+  }
+  return true;
+#endif
 }
 
 static inline void pack_indexed_kv_heads_tile_bf16(
@@ -2801,6 +3146,9 @@ static py::object flash_mla_sparse_fwd_impl(at::Tensor q, at::Tensor kv, at::Ten
           run_dense_heads_packqkv_mqa_fast_path<true>(
               q_c, kv_c, indices_2d, static_cast<float>(sm_scale), d_v,
               sink_ptr, output_compute, &max_logits, &lse) ||
+          run_shared_prefix_heads_packqkv_mqa_fast_path<true>(
+              q_c, kv_c, indices_2d, static_cast<float>(sm_scale), d_v,
+              sink_ptr, output_compute, &max_logits, &lse) ||
           run_sparse_heads_packqkv_mqa_fast_path<true>(
               q_c, kv_c, indices_2d, static_cast<float>(sm_scale), d_v,
               sink_ptr, output_compute, &max_logits, &lse);
@@ -2818,6 +3166,9 @@ static py::object flash_mla_sparse_fwd_impl(at::Tensor q, at::Tensor kv, at::Ten
     if (use_head_major) {
       used_fast_path =
           run_dense_heads_packqkv_mqa_fast_path<false>(
+              q_c, kv_c, indices_2d, static_cast<float>(sm_scale), d_v,
+              sink_ptr, output_compute, nullptr, nullptr) ||
+          run_shared_prefix_heads_packqkv_mqa_fast_path<false>(
               q_c, kv_c, indices_2d, static_cast<float>(sm_scale), d_v,
               sink_ptr, output_compute, nullptr, nullptr) ||
           run_sparse_heads_packqkv_mqa_fast_path<false>(
