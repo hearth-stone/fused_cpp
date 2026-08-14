@@ -6,7 +6,7 @@ calibration:
 * :mod:`gemm_cost_model` describes logical W13/W2 work;
 * :mod:`sve_bf16_kernel_model` lowers it to physical SVE kernel demand;
 * this module maps that demand through a small set of cache capacities,
-  saturating service curves, and fixed runtime costs.
+  measured service curves, and fixed runtime costs.
 
 Unlike ``ContentionCostModel``, no route/thread latency table or measured
 contention shape is required. Concurrent tasks are simulated as W13/W2
@@ -33,9 +33,10 @@ except ImportError:  # pragma: no cover - package-style import
     from .sve_bf16_kernel_model import SveBf16KernelExecution, SveBf16KernelProfile
 
 
-ANALYTIC_MACHINE_SCHEMA_VERSION = 1
-ANALYTIC_MODEL_SCHEMA_VERSION = 6
-ANALYTIC_MODEL_NAME = "phase_ecm_shared_resource_v3"
+ANALYTIC_MACHINE_SCHEMA_VERSION = 2
+SUPPORTED_ANALYTIC_MACHINE_SCHEMA_VERSIONS = frozenset({1, 2})
+ANALYTIC_MODEL_SCHEMA_VERSION = 7
+ANALYTIC_MODEL_NAME = "phase_ecm_llc_domain_v4"
 _SHARED_RESOURCES = (
     "gemm_core_flops",
     "matrix_flops",
@@ -60,24 +61,25 @@ _RESOURCE_PATHS = {
 
 @dataclass(frozen=True)
 class SaturatingServiceCurve:
-    """Monotone service curve fixed by one-core and saturation measurements.
+    """Monotone smooth or measured-point service curve.
 
-    The selected curve family interpolates between one-core service and the
-    sustainable aggregate knee without storing a value for every active width.
+    Compute resources may use a compact smooth family. Shared LLC/DRAM
+    resources use piecewise interpolation so topology knees remain explicit.
     """
 
     single_thread_rate: float
     saturated_rate: float
     saturation_threads: int
     curve: str = "power"
+    points: tuple[tuple[int, float], ...] = ()
 
     def __post_init__(self) -> None:
         if min(self.single_thread_rate, self.saturated_rate) <= 0.0:
             raise ValueError("service rates must be positive")
         if self.saturation_threads <= 0:
             raise ValueError("saturation_threads must be positive")
-        if self.curve not in {"power", "shared_bottleneck"}:
-            raise ValueError("curve must be 'power' or 'shared_bottleneck'")
+        if self.curve not in {"power", "shared_bottleneck", "piecewise_linear"}:
+            raise ValueError("curve must be 'power', 'shared_bottleneck', or 'piecewise_linear'")
         if self.saturated_rate < self.single_thread_rate:
             raise ValueError("saturated_rate cannot be below single_thread_rate")
         if (
@@ -91,6 +93,25 @@ class SaturatingServiceCurve:
             rel_tol=1e-12,
         ):
             raise ValueError("a one-thread saturation point must equal the single-thread rate")
+        if self.curve == "piecewise_linear":
+            if not self.points or self.points[0][0] != 1:
+                raise ValueError("piecewise_linear service requires a one-thread point")
+            if any(thread <= 0 or rate <= 0.0 for thread, rate in self.points):
+                raise ValueError("piecewise_linear points must be positive")
+            if any(right[0] <= left[0] for left, right in zip(self.points, self.points[1:])):
+                raise ValueError("piecewise_linear thread points must be strictly increasing")
+            if any(right[1] < left[1] for left, right in zip(self.points, self.points[1:])):
+                raise ValueError("piecewise_linear rates must be monotone")
+            if not math.isclose(self.single_thread_rate, self.points[0][1], rel_tol=1e-12):
+                raise ValueError("single_thread_rate must match the first piecewise point")
+            if self.saturation_threads != self.points[-1][0] or not math.isclose(
+                self.saturated_rate,
+                self.points[-1][1],
+                rel_tol=1e-12,
+            ):
+                raise ValueError("piecewise saturation anchor must match the final point")
+        elif self.points:
+            raise ValueError("service points are only valid for piecewise_linear curves")
 
     @property
     def exponent(self) -> float:
@@ -101,6 +122,17 @@ class SaturatingServiceCurve:
     def rate(self, active_threads: int) -> float:
         if active_threads <= 0:
             raise ValueError("active_threads must be positive")
+        if self.curve == "piecewise_linear":
+            if active_threads >= self.points[-1][0]:
+                return self.points[-1][1]
+            for (left_threads, left_rate), (right_threads, right_rate) in zip(
+                self.points,
+                self.points[1:],
+            ):
+                if active_threads <= right_threads:
+                    fraction = (active_threads - left_threads) / (right_threads - left_threads)
+                    return left_rate + fraction * (right_rate - left_rate)
+            raise AssertionError("piecewise service interpolation did not find an interval")
         if active_threads >= self.saturation_threads:
             return self.saturated_rate
         if self.curve == "shared_bottleneck":
@@ -114,12 +146,71 @@ class SaturatingServiceCurve:
 
     @classmethod
     def from_dict(cls, payload: dict) -> "SaturatingServiceCurve":
+        points = []
+        for point in payload.get("points", ()):
+            if isinstance(point, Mapping):
+                points.append((int(point["threads"]), float(point["rate"])))
+            else:
+                threads, rate = point
+                points.append((int(threads), float(rate)))
         return cls(
             single_thread_rate=float(payload["single_thread_rate"]),
             saturated_rate=float(payload["saturated_rate"]),
             saturation_threads=int(payload["saturation_threads"]),
             curve=str(payload.get("curve", "power")),
+            points=tuple(points),
         )
+
+    def to_dict(self) -> dict:
+        payload = {
+            "single_thread_rate": self.single_thread_rate,
+            "saturated_rate": self.saturated_rate,
+            "saturation_threads": self.saturation_threads,
+            "curve": self.curve,
+        }
+        if self.curve == "piecewise_linear":
+            payload["points"] = [
+                {"threads": threads, "rate": rate}
+                for threads, rate in self.points
+            ]
+        return payload
+
+
+@dataclass(frozen=True)
+class LlcDomainCalibration:
+    """One shared LLC domain inside a NUMA scheduling rank."""
+
+    domain_id: str
+    cpu_ids: tuple[int, ...]
+    capacity_bytes: int
+    service: SaturatingServiceCurve
+
+    def __post_init__(self) -> None:
+        if not self.domain_id:
+            raise ValueError("LLC domain id must be non-empty")
+        if self.capacity_bytes <= 0:
+            raise ValueError("LLC domain capacity must be positive")
+        if not self.cpu_ids or min(self.cpu_ids) < 0 or len(set(self.cpu_ids)) != len(self.cpu_ids):
+            raise ValueError("LLC domain CPU ids must be unique and non-negative")
+        if self.service.saturation_threads > len(self.cpu_ids):
+            raise ValueError("LLC domain service cannot saturate beyond its CPU count")
+
+    @classmethod
+    def from_dict(cls, payload: dict) -> "LlcDomainCalibration":
+        return cls(
+            domain_id=str(payload["id"]),
+            cpu_ids=tuple(int(cpu) for cpu in payload["cpu_ids"]),
+            capacity_bytes=int(payload["capacity_bytes"]),
+            service=SaturatingServiceCurve.from_dict(payload["service"]),
+        )
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.domain_id,
+            "cpu_ids": list(self.cpu_ids),
+            "capacity_bytes": self.capacity_bytes,
+            "service": self.service.to_dict(),
+        }
 
 
 @dataclass(frozen=True)
@@ -265,6 +356,9 @@ class AnalyticMachineCalibration:
     relative_uncertainty: float = 0.05
     w13_scale: float = 1.0
     w2_scale: float = 1.0
+    rank_cpu_ids: tuple[int, ...] = ()
+    llc_domains: tuple[LlcDomainCalibration, ...] = ()
+    dram_scope: str = "numa_rank"
 
     def __post_init__(self) -> None:
         if not self.machine_id:
@@ -282,20 +376,142 @@ class AnalyticMachineCalibration:
             raise ValueError("relative_uncertainty must be in [0, 1)")
         if min(self.w13_scale, self.w2_scale) <= 0.0:
             raise ValueError("stage scales must be positive")
+        if self.dram_scope != "numa_rank":
+            raise ValueError("only NUMA-rank shared DRAM service is supported")
+        rank_cpu_ids = tuple(int(cpu) for cpu in self.rank_cpu_ids)
+        if rank_cpu_ids and (
+            len(rank_cpu_ids) != self.cores_per_rank
+            or min(rank_cpu_ids) < 0
+            or len(set(rank_cpu_ids)) != len(rank_cpu_ids)
+        ):
+            raise ValueError("rank_cpu_ids must contain one unique non-negative id per rank core")
+        if self.llc_domains:
+            domain_ids = [domain.domain_id for domain in self.llc_domains]
+            domain_cpus = [cpu for domain in self.llc_domains for cpu in domain.cpu_ids]
+            if len(set(domain_ids)) != len(domain_ids):
+                raise ValueError("LLC domain ids must be unique")
+            if len(set(domain_cpus)) != len(domain_cpus):
+                raise ValueError("LLC domain CPU sets must be disjoint")
+            if not rank_cpu_ids:
+                rank_cpu_ids = tuple(domain_cpus)
+            if set(domain_cpus) != set(rank_cpu_ids):
+                raise ValueError("LLC domains must partition rank_cpu_ids")
+            if sum(domain.capacity_bytes for domain in self.llc_domains) != self.caches.llc_bytes_per_rank:
+                raise ValueError("LLC domain capacities must sum to llc_bytes_per_rank")
         object.__setattr__(self, "supported_widths", widths)
+        object.__setattr__(self, "rank_cpu_ids", rank_cpu_ids)
 
-    def service_rate(self, resource: str, active_threads: int) -> float:
+    def llc_domain_thread_counts(self, active_cpu_ids: Iterable[int]) -> dict[str, int]:
+        if not self.llc_domains:
+            raise ValueError("calibration does not describe LLC domains")
+        requested = tuple(int(cpu) for cpu in active_cpu_ids)
+        if not requested or len(set(requested)) != len(requested):
+            raise ValueError("active_cpu_ids must be non-empty and unique")
+        cpu_to_domain = {
+            cpu: domain.domain_id
+            for domain in self.llc_domains
+            for cpu in domain.cpu_ids
+        }
+        unknown = sorted(set(requested) - cpu_to_domain.keys())
+        if unknown:
+            raise ValueError(f"active CPUs are outside the calibrated rank: {unknown}")
+        counts = {domain.domain_id: 0 for domain in self.llc_domains}
+        for cpu in requested:
+            counts[cpu_to_domain[cpu]] += 1
+        return counts
+
+    def llc_capacity_bytes(
+        self,
+        *,
+        active_cpu_ids: Iterable[int] | None = None,
+        llc_domain_threads: Mapping[str, int] | None = None,
+    ) -> int:
+        if not self.llc_domains or (active_cpu_ids is None and llc_domain_threads is None):
+            return self.caches.llc_bytes_per_rank
+        counts = self._resolve_llc_domain_threads(
+            active_cpu_ids=active_cpu_ids,
+            llc_domain_threads=llc_domain_threads,
+        )
+        return sum(
+            domain.capacity_bytes
+            for domain in self.llc_domains
+            if counts[domain.domain_id] > 0
+        )
+
+    def _resolve_llc_domain_threads(
+        self,
+        *,
+        active_cpu_ids: Iterable[int] | None,
+        llc_domain_threads: Mapping[str, int] | None,
+    ) -> dict[str, int]:
+        if active_cpu_ids is not None and llc_domain_threads is not None:
+            raise ValueError("provide active_cpu_ids or llc_domain_threads, not both")
+        if active_cpu_ids is not None:
+            return self.llc_domain_thread_counts(active_cpu_ids)
+        if llc_domain_threads is None:
+            raise ValueError("LLC domain placement is missing")
+        provided = {str(domain_id): int(count) for domain_id, count in llc_domain_threads.items()}
+        known = {domain.domain_id: len(domain.cpu_ids) for domain in self.llc_domains}
+        unknown = sorted(set(provided) - known.keys())
+        if unknown:
+            raise ValueError(f"unknown LLC domains: {unknown}")
+        counts = {domain_id: provided.get(domain_id, 0) for domain_id in known}
+        if any(count < 0 or count > known[domain_id] for domain_id, count in counts.items()):
+            raise ValueError("LLC domain thread counts must fit each domain")
+        if sum(counts.values()) <= 0:
+            raise ValueError("at least one LLC-domain thread must be active")
+        return counts
+
+    def service_rate(
+        self,
+        resource: str,
+        active_threads: int,
+        *,
+        active_cpu_ids: Iterable[int] | None = None,
+        llc_domain_threads: Mapping[str, int] | None = None,
+    ) -> float:
+        if active_threads <= 0:
+            raise ValueError("active_threads must be positive")
+        placement_counts = None
+        if active_cpu_ids is not None:
+            active_cpu_ids = tuple(int(cpu) for cpu in active_cpu_ids)
+            if len(active_cpu_ids) != active_threads:
+                raise ValueError("active_cpu_ids count must match active_threads")
+        if active_cpu_ids is not None or llc_domain_threads is not None:
+            if not self.llc_domains:
+                raise ValueError("placement-aware service requires calibrated LLC domains")
+            placement_counts = self._resolve_llc_domain_threads(
+                active_cpu_ids=active_cpu_ids,
+                llc_domain_threads=llc_domain_threads,
+            )
+            if sum(placement_counts.values()) != active_threads:
+                raise ValueError("LLC domain thread counts must sum to active_threads")
         curve = getattr(self, resource)
         if curve is None:
             return math.inf
-        return curve.rate(min(active_threads, self.cores_per_rank))
+        capped_threads = min(active_threads, self.cores_per_rank)
+        if resource != "llc_bytes" or placement_counts is None:
+            return curve.rate(capped_threads)
+        domain_rate = sum(
+            domain.service.rate(placement_counts[domain.domain_id])
+            for domain in self.llc_domains
+            if placement_counts[domain.domain_id] > 0
+        )
+        active_domains = sum(count > 0 for count in placement_counts.values())
+        if active_domains == 1:
+            return domain_rate
+        # Domain curves already model low-width injection. Multiple domains
+        # only share the measured rank-level fabric ceiling; prefix points of
+        # the rank curve may still describe a single-domain placement.
+        return min(domain_rate, curve.saturated_rate)
 
     @classmethod
     def from_dict(cls, payload: dict) -> "AnalyticMachineCalibration":
-        if int(payload.get("schema_version", 0)) != ANALYTIC_MACHINE_SCHEMA_VERSION:
+        schema_version = int(payload.get("schema_version", 0))
+        if schema_version not in SUPPORTED_ANALYTIC_MACHINE_SCHEMA_VERSIONS:
             raise ValueError(
                 f"unsupported analytic machine schema {payload.get('schema_version')!r}; "
-                f"expected {ANALYTIC_MACHINE_SCHEMA_VERSION}"
+                f"expected one of {sorted(SUPPORTED_ANALYTIC_MACHINE_SCHEMA_VERSIONS)}"
             )
         if payload.get("kind") != "moe_analytic_machine":
             raise ValueError("analytic calibration kind must be 'moe_analytic_machine'")
@@ -304,6 +520,7 @@ class AnalyticMachineCalibration:
         stage_scales = payload.get("stage_scales", {})
         optional_frontend = services.get("frontend_instructions")
         optional_epilogue = services.get("epilogue_elements")
+        topology = payload.get("topology", {}) if schema_version >= 2 else {}
         if "gemm_core_flops" not in services:
             raise ValueError("analytic calibration must contain the L1-hot gemm_core_flops service")
         return cls(
@@ -328,6 +545,12 @@ class AnalyticMachineCalibration:
             relative_uncertainty=float(payload.get("uncertainty", {}).get("relative", 0.05)),
             w13_scale=float(stage_scales.get("w13", 1.0)),
             w2_scale=float(stage_scales.get("w2", 1.0)),
+            rank_cpu_ids=tuple(int(cpu) for cpu in topology.get("rank_cpu_ids", ())),
+            llc_domains=tuple(
+                LlcDomainCalibration.from_dict(domain)
+                for domain in topology.get("llc_domains", ())
+            ),
+            dram_scope=str(topology.get("dram_scope", "numa_rank")),
         )
 
     @classmethod
@@ -336,7 +559,7 @@ class AnalyticMachineCalibration:
 
     def to_dict(self) -> dict:
         def service(curve: SaturatingServiceCurve | None) -> dict | None:
-            return asdict(curve) if curve is not None else None
+            return curve.to_dict() if curve is not None else None
 
         services = {
             "matrix_flops": service(self.matrix_flops),
@@ -350,7 +573,7 @@ class AnalyticMachineCalibration:
             services["frontend_instructions"] = service(self.frontend_instructions)
         if self.epilogue_elements is not None:
             services["epilogue_elements"] = service(self.epilogue_elements)
-        return {
+        payload = {
             "schema_version": ANALYTIC_MACHINE_SCHEMA_VERSION,
             "kind": "moe_analytic_machine",
             "machine": {
@@ -365,6 +588,13 @@ class AnalyticMachineCalibration:
             "uncertainty": {"relative": self.relative_uncertainty},
             "stage_scales": {"w13": self.w13_scale, "w2": self.w2_scale},
         }
+        if self.rank_cpu_ids or self.llc_domains:
+            payload["topology"] = {
+                "rank_cpu_ids": list(self.rank_cpu_ids),
+                "llc_domains": [domain.to_dict() for domain in self.llc_domains],
+                "dram_scope": self.dram_scope,
+            }
+        return payload
 
 
 @dataclass(frozen=True)
@@ -388,6 +618,7 @@ class AnalyticPolicy:
     cores_per_rank: int
     concurrent_ranks: int
     llc_bytes_per_rank: int
+    llc_topology_signature: tuple[tuple[tuple[int, ...], int], ...]
 
     def identity_key(self) -> tuple[object, ...]:
         return (
@@ -408,6 +639,7 @@ class AnalyticPolicy:
             self.cores_per_rank,
             self.concurrent_ranks,
             self.llc_bytes_per_rank,
+            self.llc_topology_signature,
         )
 
 def analytic_candidate_shapes(cores: int, widths: Iterable[int]) -> tuple[tuple[int, ...], ...]:
@@ -814,6 +1046,10 @@ class AnalyticMoeCostModel:
             cores_per_rank=self.calibration.cores_per_rank,
             concurrent_ranks=int(concurrent_ranks),
             llc_bytes_per_rank=self.calibration.caches.llc_bytes_per_rank,
+            llc_topology_signature=tuple(
+                (domain.cpu_ids, domain.capacity_bytes)
+                for domain in self.calibration.llc_domains
+            ),
         )
 
     @property
@@ -905,12 +1141,22 @@ class AnalyticMoeCostModel:
         """Return the physical resident/streaming state of a cyclic L2 scan."""
         return float(working_set_bytes > self.calibration.caches.l2_bytes_per_core)
 
-    def _llc_miss_fraction(self, working_set_bytes: float) -> float:
+    def _llc_miss_fraction(
+        self,
+        working_set_bytes: float,
+        *,
+        active_cpu_ids: Iterable[int] | None = None,
+        llc_domain_threads: Mapping[str, int] | None = None,
+    ) -> float:
         cache = self.calibration.caches
+        physical_capacity = self.calibration.llc_capacity_bytes(
+            active_cpu_ids=active_cpu_ids,
+            llc_domain_threads=llc_domain_threads,
+        )
         return _smooth_capacity_miss(
             working_set_bytes,
-            cache.effective_llc_bytes_per_rank,
-            cache.llc_bytes_per_rank,
+            physical_capacity * cache.llc_effective_fraction,
+            physical_capacity,
         )
 
     def _stage_mapping_and_geometry(

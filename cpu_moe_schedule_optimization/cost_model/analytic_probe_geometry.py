@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterable
 
 
 BF16_BYTES = 2
@@ -23,6 +24,45 @@ def parse_cache_size(value: str) -> int:
     if size <= 0:
         raise ValueError(f"cache size must be positive, got {value!r}")
     return size
+
+
+def parse_linux_cpu_list(value: str) -> tuple[int, ...]:
+    """Parse Linux sysfs CPU-list syntax such as ``0-3,8,10-11``."""
+    cpus: list[int] = []
+    for item in value.strip().split(","):
+        if not item:
+            continue
+        if "-" in item:
+            first_text, last_text = item.split("-", 1)
+            first, last = int(first_text), int(last_text)
+            if first < 0 or last < first:
+                raise ValueError(f"invalid CPU range {item!r}")
+            cpus.extend(range(first, last + 1))
+        else:
+            cpu = int(item)
+            if cpu < 0:
+                raise ValueError(f"invalid CPU id {cpu}")
+            cpus.append(cpu)
+    if not cpus or len(set(cpus)) != len(cpus):
+        raise ValueError(f"invalid Linux CPU list {value!r}")
+    return tuple(cpus)
+
+
+def format_linux_cpu_list(cpu_ids: Iterable[int]) -> str:
+    """Return a stable compact Linux CPU-list representation."""
+    cpus = sorted({int(cpu) for cpu in cpu_ids})
+    if not cpus or cpus[0] < 0:
+        raise ValueError("cpu_ids must contain non-negative values")
+    ranges: list[str] = []
+    first = last = cpus[0]
+    for cpu in cpus[1:]:
+        if cpu == last + 1:
+            last = cpu
+            continue
+        ranges.append(str(first) if first == last else f"{first}-{last}")
+        first = last = cpu
+    ranges.append(str(first) if first == last else f"{first}-{last}")
+    return ",".join(ranges)
 
 
 def read_cache_info(cpu: int, *, sysfs_cpu_root: Path = Path("/sys/devices/system/cpu")) -> dict[str, int]:
@@ -51,6 +91,67 @@ def read_cache_info(cpu: int, *, sysfs_cpu_root: Path = Path("/sys/devices/syste
     if missing:
         raise RuntimeError(f"failed to detect cache fields for CPU {cpu}: {sorted(missing)}")
     return result
+
+
+def read_llc_domains(
+    cpu_ids: Iterable[int],
+    *,
+    sysfs_cpu_root: Path = Path("/sys/devices/system/cpu"),
+) -> tuple[dict, ...]:
+    """Return the LLC domains intersecting an explicitly pinned CPU rank.
+
+    Domain membership comes from Linux ``shared_cpu_list`` rather than CPU-id
+    adjacency. The returned CPU sets contain only CPUs selected for this rank.
+    """
+    selected = tuple(int(cpu) for cpu in cpu_ids)
+    if not selected or min(selected) < 0 or len(set(selected)) != len(selected):
+        raise ValueError("cpu_ids must be unique and non-negative")
+    selected_set = set(selected)
+    domains: dict[tuple[str, tuple[int, ...]], dict] = {}
+    covered: set[int] = set()
+    for cpu in selected:
+        cache_root = sysfs_cpu_root / f"cpu{cpu}" / "cache"
+        candidates = []
+        for index in sorted(cache_root.glob("index*")):
+            try:
+                level = int((index / "level").read_text(encoding="utf-8").strip())
+                cache_type = (index / "type").read_text(encoding="utf-8").strip().lower()
+                size = parse_cache_size((index / "size").read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if level < 3 or cache_type not in {"data", "unified"}:
+                continue
+            try:
+                shared = parse_linux_cpu_list((index / "shared_cpu_list").read_text(encoding="utf-8"))
+            except (OSError, ValueError) as error:
+                raise RuntimeError(f"failed to read LLC shared_cpu_list for CPU {cpu}") from error
+            try:
+                cache_id = (index / "id").read_text(encoding="utf-8").strip()
+            except OSError:
+                cache_id = format_linux_cpu_list(shared)
+            candidates.append((level, size, cache_id, shared))
+        if not candidates:
+            raise RuntimeError(f"failed to detect an LLC domain for CPU {cpu}")
+        level, size, cache_id, shared = max(candidates, key=lambda item: (item[0], item[1]))
+        del level
+        rank_cpus = tuple(value for value in selected if value in set(shared))
+        if cpu not in rank_cpus:
+            raise RuntimeError(f"CPU {cpu} is absent from its LLC shared_cpu_list")
+        key = (cache_id, tuple(shared))
+        existing = domains.get(key)
+        if existing is not None and existing["capacity_bytes"] != size:
+            raise RuntimeError(f"inconsistent capacity for LLC domain {cache_id}")
+        domains[key] = {
+            "id": cache_id,
+            "cpu_ids": list(rank_cpus),
+            "capacity_bytes": size,
+        }
+        covered.update(rank_cpus)
+    if covered != selected_set:
+        raise RuntimeError(f"LLC domains do not cover selected CPUs: {sorted(selected_set - covered)}")
+    return tuple(
+        sorted(domains.values(), key=lambda domain: min(domain["cpu_ids"]))
+    )
 
 
 @dataclass(frozen=True)

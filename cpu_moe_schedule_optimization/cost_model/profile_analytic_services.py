@@ -31,7 +31,13 @@ import torch
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
 
-from analytic_probe_geometry import ProbeGeometry, b_only_geometry, m12_gemm_geometry, read_cache_info  # noqa: E402
+from analytic_probe_geometry import (  # noqa: E402
+    ProbeGeometry,
+    b_only_geometry,
+    m12_gemm_geometry,
+    read_cache_info,
+    read_llc_domains,
+)
 from fused_cpp import _moe_C  # noqa: E402
 from fused_cpp.moe import prepare_fused_moe_bf16_tiled_weights  # noqa: E402
 
@@ -42,6 +48,7 @@ PROBE_MATRIX_ONLY = 10
 PROBE_FUSED_W13 = 11
 M12_ROWS = 12
 DEFAULT_N_TILE = 8
+SERVICE_PROBE_SCHEMA_VERSION = 2
 
 
 def parse_int_list(value: str) -> list[int]:
@@ -473,6 +480,10 @@ def main() -> int:
     torch.set_num_threads(1)
     os.environ["FUSED_CPP_MOE_SVE_IMPL"] = "jit"
     caches = read_cache_info(args.cpu_ids[0])
+    llc_domains = read_llc_domains(args.cpu_ids)
+    llc_probe_capacity = max(domain["capacity_bytes"] for domain in llc_domains)
+    caches["llc_bytes_per_rank"] = sum(domain["capacity_bytes"] for domain in llc_domains)
+    caches["llc_bytes_per_domain"] = llc_probe_capacity
     packed_panel_columns = 2 * args.n_tile
     l1_gemm = m12_gemm_geometry(
         caches["l1d_bytes_per_core"],
@@ -495,7 +506,7 @@ def main() -> int:
         cache_fraction=args.load_l2_fraction,
     )
     llc_load = b_only_geometry(
-        caches["llc_bytes_per_rank"],
+        llc_probe_capacity,
         packed_panel_columns,
         cache_fraction=args.load_llc_fraction,
     )
@@ -616,7 +627,7 @@ def main() -> int:
         ),
     }
     payload = {
-        "schema_version": 1,
+        "schema_version": SERVICE_PROBE_SCHEMA_VERSION,
         "kind": "moe_analytic_service_probe",
         "machine": {
             "id": platform.node(),
@@ -624,6 +635,11 @@ def main() -> int:
             "logical_cpus": os.cpu_count(),
             "cpu_ids": args.cpu_ids,
             "cores_per_rank": len(args.cpu_ids),
+        },
+        "topology": {
+            "rank_cpu_ids": args.cpu_ids,
+            "llc_domains": llc_domains,
+            "dram_scope": "numa_rank",
         },
         "kernel": {
             "sve_implementation": "jit",
