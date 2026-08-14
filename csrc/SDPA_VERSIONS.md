@@ -556,6 +556,30 @@ empty/`K={0,1,4,20}`/tie/NaN/strided-output case 全过；score 的 45 个形状
 范围和 raw summary 见
 `optimizations/deepseek_v4_post_gemm/results/amazon_8c_indexer_native_batch_topk_20260813.md`。
 
+### DeepSeek V4 Indexer select-all 提前短路
+
+原有短路在两个 Q GEMM、Indexer Q RoPE/weight scaling 和两个 compressor
+全部完成后，才根据 `max(cu_seqlen_ke-cu_seqlen_ks) <= topk_tokens` 判断每行
+TopK 实际会选择全部有效位置。因此 `context_start=0` 等形状虽然 score/TopK 已经
+短路，仍会无效计算完整的 Indexer Q 分支。
+
+现把 `ks/ke` 转换和最大有效长度判定提前到 Q 调度之前。命中时 raw-weight 与
+prepacked 两个入口都只计算 Main Q；prepacked 即使强制 shared-Q pool，也绕过
+Main/Indexer pair 而调用 Main-Q-only 路径。MLA/Indexer 两个 compressor 仍按原
+顺序更新，select-all indices 也仍在 compressor 之后写入；未命中的长路径复用
+同一份计划并保持原 score/TopK 实现。公开签名、packed layout、输出和数值语义
+不变。
+
+Amazon 8C Neoverse-V1、cores 0--7、SVL256、NEON Q GEMM，`M=2048`、
+`context_start=0`、`topk=512`、3 warmup + 15 runs：完整 stage 中位数
+`74.309→40.176 ms`（-45.93%，1.850×），profile total
+`74.135→39.074 ms`（-47.29%）；Indexer Q GEMM + RoPE/weight scaling 的
+`34.063+0.791=34.854 ms` 变为 0，Main Q `33.429→32.989 ms`。raw 与
+prepacked（强制 shared pool）两个专项测试通过，完整 post-GEMM 文件
+`20 passed`，并覆盖长路径。192-core/SVL128 主机 SSH 无响应，未冒充测试结果；
+该机运行验证仍待补。完整命令、样本范围和回滚边界见
+`optimizations/deepseek_v4_post_gemm/results/amazon_8c_indexer_select_all_early_exit_20260813.md`。
+
 ---
 
 ## 选型矩阵
@@ -581,6 +605,7 @@ empty/`K={0,1,4,20}`/tie/NaN/strided-output case 全过；score 的 45 个形状
 
 | 日期 | 改动概述 | 受影响文件 |
 |---|---|---|
+| 2026-08-13 | **DeepSeek V4 Indexer select-all 提前短路**：把 `max(ke-ks)<=topk` 判定移到 Q 调度之前；命中时 raw/prepacked 都跳过 Indexer Q GEMM 和 Q RoPE/weight scaling，prepacked 强制 shared-Q pool 时也只运行 Main Q，同时保留 Main Q、两个 compressor 及阶段末尾 TopK 写入顺序。Amazon 8C SVL256 上 raw/prepacked 专项与完整文件 20 tests passed；`M2048,context_start=0,topk512` 中位数 74.309→40.176 ms（1.850×），34.854 ms Indexer Q 工作归零。192-core/SVL128 主机 SSH 无响应，未报告结果。 | 改 `csrc/{deepseek_v4_post_gemm_stage.cpp,SDPA_VERSIONS.md}`、`tests/test_deepseek_v4_post_gemm_stage.py`、`optimizations/deepseek_v4_post_gemm/{manifest.yaml,results/amazon_8c_indexer_select_all_early_exit_20260813.md}` |
 | 2026-08-13 | **DeepSeek V4 Indexer native batched exact TopK 候选**：把 2,048 次逐行 ATen TopK 替换为单次 OpenMP batched `nth_element + selected-K sort`，每 worker 复用候选缓冲，只写 strided int32 indices；保留 score 降序、tie/NaN 定义和非标准 tensor contract 的 ATen fallback。Amazon 8C SVL256 上 20 个独立 TopK 边界 case 与 25 项集成测试通过；`M2048,N1536,K512` 的 TopK 75.155→9.637 ms（7.799×），完整 stage 186.251→120.758 ms（1.542×），score 保持 36.15 ms。仅完成 8C 首测，192C/SVL128 待测，故保持 candidate。 | 改 `csrc/{deepseek_v4_indexer_sve.h,deepseek_v4_indexer_sve.cpp,deepseek_v4_post_gemm_stage.cpp,SDPA_VERSIONS.md}`、`benchmarks/bench_deepseek_v4_indexer_sve.cpp`、`tests/test_deepseek_v4_post_gemm_stage.py`、`optimizations/deepseek_v4_post_gemm/{manifest.yaml,results/amazon_8c_indexer_native_batch_topk_20260813.md}` |
 | 2026-08-13 | **DeepSeek V4 sparse indexer weighted-ReLU 8×2VL 候选**：修正长路径为逐 head `ReLU(q·k)` 后乘 weight 再归约；新增 scalable-SVE 8×2VL BFMMLA 内核，Q 每 query 私有 pack、K 从 paged cache 直接 packB、ReLU/weight/head reduce 全部留在寄存器并只写最终 FP32 score；非 SVE/非 H8-D4 形状走等价 FP32 fallback。Amazon 8C SVL256 的 45 个 score 组合最大绝对误差 `9.54e-7`，25 tests passed/5 retired skipped，汇编无 Z spill；生产 score 形状 1T/8T 为 202.285/36.653 ms（1.406 TFLOP/s），完整 stage 186.251 ms，其中 score/TopK 为 36.154/75.155 ms。仅完成用户要求的 8C 首测，SVL128/192C 待测，故保持 candidate。 | 新建 `csrc/deepseek_v4_indexer_sve.{h,cpp}`、`benchmarks/bench_deepseek_v4_indexer_sve.cpp`、`optimizations/deepseek_v4_post_gemm/results/amazon_8c_indexer_weighted_relu_sve_20260813.md`；改 `csrc/{deepseek_v4_post_gemm_stage.cpp,SDPA_VERSIONS.md}`、`src/fused_cpp/{sparse_attn_indexer.py,deepseek_v4_post_gemm_stage.py}`、`tests/{test_sparse_attn_indexer.py,test_deepseek_v4_post_gemm_stage.py,bench_deepseek_v4_post_gemm_stage.py}`、`optimizations/deepseek_v4_post_gemm/manifest.yaml` |
 | 2026-08-13 | **Sparse MLA head-major sparse 8×8 组合实验**：新增内部 `heads_sparse_8x8`，按 token gather/pack 一份 sparse MQA K/V 并复用于所有 8-head group，按 L2 chunk 保留 online-softmax 状态；组合 dispatch 对全局共享连续 KV 先走 dense-head 调用级 pack。`q[2048,32,192]`、DSV4 top-k512+window128、context0、Dv128 下，Amazon 8C 1T/8T 分别快 30.16%/30.51%，Arm-codex 1T/80T 分别快 14.82%/54.16%；全 dense 与 `heads_dense_8x8` 持平。两机 SVL256 各 43 tests passed，公开默认不变，候选因尚缺三次独立 session 保持 experimental。 | 改 `csrc/{sparse_mla.cpp,SDPA_VERSIONS.md}`、`tests/{test_sparse_mla.py,bench_sparse_mla_tail_variants.py}`、`optimizations/sparse_mla/{manifest.yaml,results/arm_head_major_20260813.md}` |

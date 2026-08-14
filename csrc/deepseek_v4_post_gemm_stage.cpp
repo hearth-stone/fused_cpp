@@ -2378,13 +2378,15 @@ std::tuple<at::Tensor, at::Tensor> IndexerQRopeQuant(const at::Tensor& positions
   return std::make_tuple(q_rot, weights);
 }
 
-void SparseAttnIndexerPrefill(const at::Tensor& q_quant, const at::Tensor& weights, const at::Tensor& kv_cache,
-                              const at::Tensor& topk_indices_buffer, int64_t topk_tokens, const at::Tensor& cu_seq_lens,
-                              const at::Tensor& cu_seqlen_ks, const at::Tensor& cu_seqlen_ke,
-                              const at::Tensor& block_table, PostGemmStageProfile* profile) {
-  const int64_t num_tokens = q_quant.size(0);
-  const int64_t head_dim = q_quant.size(-1);
-  const int64_t block_size = kv_cache.size(1);
+struct SparseIndexerPrefillPlan {
+  at::Tensor ks_cpu;
+  at::Tensor ke_cpu;
+  bool select_all = false;
+};
+
+SparseIndexerPrefillPlan PrepareSparseIndexerPrefillPlan(int64_t num_tokens, int64_t topk_tokens,
+                                                         const at::Tensor& cu_seqlen_ks, const at::Tensor& cu_seqlen_ke,
+                                                         const at::Tensor& block_table) {
   TORCH_CHECK(block_table.scalar_type() == at::kInt, "prefill block_table must be int32, got ",
               block_table.scalar_type());
 
@@ -2399,22 +2401,42 @@ void SparseAttnIndexerPrefill(const at::Tensor& q_quant, const at::Tensor& weigh
     max_valid_len = std::max(max_valid_len, ke_data[i] - ks_data[i]);
   }
 
-  if (num_tokens > 0 && max_valid_len <= topk_tokens) {
-    FUSED_CPP_PROFILE_START(phase_start);
-    at::Tensor arange_topk = at::arange(topk_tokens, topk_indices_buffer.options().dtype(at::kInt));
-    if (!TryWriteSparseIndexerShortPathRaw(topk_indices_buffer, ks_cpu, ke_cpu, arange_topk, num_tokens, topk_tokens)) {
-      topk_indices_buffer.slice(0, 0, num_tokens).fill_(-1);
-      for (int64_t i = 0; i < num_tokens; ++i) {
-        const int64_t valid_len = ke_data[i] - ks_data[i];
-        if (valid_len <= 0) {
-          continue;
-        }
-        topk_indices_buffer.index({i, Slice(0, valid_len)}).copy_(arange_topk.slice(0, 0, valid_len));
+  return SparseIndexerPrefillPlan{
+      ks_cpu,
+      ke_cpu,
+      num_tokens > 0 && max_valid_len <= topk_tokens,
+  };
+}
+
+void WriteSparseIndexerShortPath(const SparseIndexerPrefillPlan& plan, const at::Tensor& topk_indices_buffer,
+                                 int64_t num_tokens, int64_t topk_tokens, PostGemmStageProfile* profile) {
+  FUSED_CPP_PROFILE_START(phase_start);
+  at::Tensor arange_topk = at::arange(topk_tokens, topk_indices_buffer.options().dtype(at::kInt));
+  if (!TryWriteSparseIndexerShortPathRaw(topk_indices_buffer, plan.ks_cpu, plan.ke_cpu, arange_topk, num_tokens,
+                                         topk_tokens)) {
+    topk_indices_buffer.slice(0, 0, num_tokens).fill_(-1);
+    const int64_t* ks_data = plan.ks_cpu.data_ptr<int64_t>();
+    const int64_t* ke_data = plan.ke_cpu.data_ptr<int64_t>();
+    for (int64_t i = 0; i < num_tokens; ++i) {
+      const int64_t valid_len = ke_data[i] - ks_data[i];
+      if (valid_len <= 0) {
+        continue;
       }
+      topk_indices_buffer.index({i, Slice(0, valid_len)}).copy_(arange_topk.slice(0, 0, valid_len));
     }
-    FUSED_CPP_PROFILE_ADD_IF_PTR(profile == nullptr ? nullptr : &profile->sparse_indexer_short_path_ms, phase_start);
-    return;
   }
+  FUSED_CPP_PROFILE_ADD_IF_PTR(profile == nullptr ? nullptr : &profile->sparse_indexer_short_path_ms, phase_start);
+}
+
+void SparseAttnIndexerPrefillLong(const at::Tensor& q_quant, const at::Tensor& weights, const at::Tensor& kv_cache,
+                                  const at::Tensor& topk_indices_buffer, int64_t topk_tokens,
+                                  const at::Tensor& cu_seq_lens, const SparseIndexerPrefillPlan& plan,
+                                  const at::Tensor& block_table, PostGemmStageProfile* profile) {
+  const int64_t num_tokens = q_quant.size(0);
+  const int64_t head_dim = q_quant.size(-1);
+  const int64_t block_size = kv_cache.size(1);
+  const int64_t* ks_data = plan.ks_cpu.data_ptr<int64_t>();
+  const int64_t* ke_data = plan.ke_cpu.data_ptr<int64_t>();
 
   topk_indices_buffer.slice(0, 0, num_tokens).fill_(-1);
 
@@ -2648,6 +2670,8 @@ std::tuple<at::Tensor, at::Tensor> deepseek_v4_post_gemm_parallel_stage(
               "main_wq_b_weight out features must be divisible by main_head_dim");
   TORCH_CHECK(indexer_wq_b_weight.size(0) % indexer_norm_weight.size(0) == 0,
               "indexer_wq_b_weight out features must be divisible by indexer head_dim");
+  const SparseIndexerPrefillPlan prefill_plan = PrepareSparseIndexerPrefillPlan(
+      qr.size(0), topk_tokens, prefill_cu_seqlen_ks, prefill_cu_seqlen_ke, prefill_block_table);
   FUSED_CPP_PROFILE_ADD_IF_PTR(profile_ptr == nullptr ? nullptr : &profile_ptr->input_check_ms, phase_start);
 
   const int64_t main_num_heads = main_wq_b_weight.size(0) / main_head_dim;
@@ -2664,20 +2688,25 @@ std::tuple<at::Tensor, at::Tensor> deepseek_v4_post_gemm_parallel_stage(
                                phase_start);
 
   const int64_t indexer_head_dim = indexer_norm_weight.size(0);
-  FUSED_CPP_PROFILE_RESTART(phase_start);
-  at::Tensor indexer_q_linear = LinearToDtype(qr, indexer_wq_b_weight, qr.scalar_type());
-  TORCH_CHECK(indexer_q_linear.size(1) % indexer_head_dim == 0,
-              "indexer q linear out features must be divisible by indexer head_dim");
-  FUSED_CPP_PROFILE_ADD_IF_PTR(profile_ptr == nullptr ? nullptr : &profile_ptr->indexer_q_gemm_ms, phase_start);
+  at::Tensor q_quant;
+  at::Tensor scaled_weights;
+  if (!prefill_plan.select_all) {
+    FUSED_CPP_PROFILE_RESTART(phase_start);
+    at::Tensor indexer_q_linear = LinearToDtype(qr, indexer_wq_b_weight, qr.scalar_type());
+    TORCH_CHECK(indexer_q_linear.size(1) % indexer_head_dim == 0,
+                "indexer q linear out features must be divisible by indexer head_dim");
+    FUSED_CPP_PROFILE_ADD_IF_PTR(profile_ptr == nullptr ? nullptr : &profile_ptr->indexer_q_gemm_ms, phase_start);
 
-  const int64_t indexer_num_heads = indexer_q_linear.size(1) / indexer_head_dim;
-  at::Tensor indexer_q = indexer_q_linear.reshape({indexer_q_linear.size(0), indexer_num_heads, indexer_head_dim});
+    const int64_t indexer_num_heads = indexer_q_linear.size(1) / indexer_head_dim;
+    at::Tensor indexer_q = indexer_q_linear.reshape({indexer_q_linear.size(0), indexer_num_heads, indexer_head_dim});
 
-  FUSED_CPP_PROFILE_RESTART(phase_start);
-  auto indexer_q_and_weights = IndexerQRopeQuant(positions, indexer_q, indexer_cos_sin_cache, indexer_weights);
-  at::Tensor q_quant = std::get<0>(indexer_q_and_weights);
-  at::Tensor scaled_weights = std::get<1>(indexer_q_and_weights);
-  FUSED_CPP_PROFILE_ADD_IF_PTR(profile_ptr == nullptr ? nullptr : &profile_ptr->indexer_q_rope_weights_ms, phase_start);
+    FUSED_CPP_PROFILE_RESTART(phase_start);
+    auto indexer_q_and_weights = IndexerQRopeQuant(positions, indexer_q, indexer_cos_sin_cache, indexer_weights);
+    q_quant = std::get<0>(indexer_q_and_weights);
+    scaled_weights = std::get<1>(indexer_q_and_weights);
+    FUSED_CPP_PROFILE_ADD_IF_PTR(profile_ptr == nullptr ? nullptr : &profile_ptr->indexer_q_rope_weights_ms,
+                                 phase_start);
+  }
 
   RunCompressor(kv_score, positions, mla_ape, mla_state_cache, mla_state_slot_mapping, mla_token_to_req_indices,
                 mla_block_table, mla_kv_cache, mla_kv_slot_mapping, mla_norm_weight, main_cos_sin_cache,
@@ -2692,9 +2721,12 @@ std::tuple<at::Tensor, at::Tensor> deepseek_v4_post_gemm_parallel_stage(
 
   // Keep the migrated native post-GEMM path self-contained.  Do not dispatch
   // through the retired standalone sparse_attn_indexer_prefill_cpp_v0 symbol.
-  SparseAttnIndexerPrefill(q_quant, scaled_weights, indexer_kv_cache, topk_indices_buffer, topk_tokens,
-                           prefill_cu_seq_lens, prefill_cu_seqlen_ks, prefill_cu_seqlen_ke, prefill_block_table,
-                           profile_ptr);
+  if (prefill_plan.select_all) {
+    WriteSparseIndexerShortPath(prefill_plan, topk_indices_buffer, qr.size(0), topk_tokens, profile_ptr);
+  } else {
+    SparseAttnIndexerPrefillLong(q_quant, scaled_weights, indexer_kv_cache, topk_indices_buffer, topk_tokens,
+                                 prefill_cu_seq_lens, prefill_plan, prefill_block_table, profile_ptr);
+  }
   FUSED_CPP_PROFILE_IF_ENABLED(profile_ptr != nullptr,
                                PrintPostGemmProfile(*profile_ptr, ::fused_cpp::profile::elapsed_ms(total_start)));
   return std::make_tuple(q, topk_indices_buffer);
@@ -2799,13 +2831,15 @@ std::tuple<at::Tensor, at::Tensor> deepseek_v4_post_gemm_parallel_stage_prepacke
   TORCH_CHECK(main_wq_b_N % main_head_dim == 0, "main_wq_b_N must be divisible by main_head_dim");
   TORCH_CHECK(indexer_wq_b_N % indexer_norm_weight.size(0) == 0,
               "indexer_wq_b_N must be divisible by indexer head_dim");
+  const SparseIndexerPrefillPlan prefill_plan = PrepareSparseIndexerPrefillPlan(
+      qr.size(0), topk_tokens, prefill_cu_seqlen_ks, prefill_cu_seqlen_ke, prefill_block_table);
   FUSED_CPP_PROFILE_ADD_IF_PTR(profile_ptr == nullptr ? nullptr : &profile_ptr->input_check_ms, phase_start);
 
   const int64_t main_num_heads = main_wq_b_N / main_head_dim;
   const int64_t indexer_head_dim = indexer_norm_weight.size(0);
   at::Tensor q;
   at::Tensor indexer_q_linear;
-  if (PostGemmSharedQPoolEnabled(qr.size(0))) {
+  if (!prefill_plan.select_all && PostGemmSharedQPoolEnabled(qr.size(0))) {
     FUSED_CPP_PROFILE_RESTART(phase_start);
     auto workspace_lease = ::fused_cpp::workspace::acquire();
     auto q_pair = PostLinearPrepackedPairToDtypeWorkspace(qr, main_wq_b_packed, main_wq_b_K, main_wq_b_N, main_wq_b_Np,
@@ -2818,23 +2852,30 @@ std::tuple<at::Tensor, at::Tensor> deepseek_v4_post_gemm_parallel_stage_prepacke
   } else {
     q = RunMainQAndSwaPrepacked(qr, kv, positions, main_wq_b_packed, main_wq_b_K, main_wq_b_N, main_wq_b_Np,
                                 main_cos_sin_cache, swa_kv_cache, swa_slot_mapping, main_head_dim, q_eps, profile_ptr);
-    auto workspace_lease = ::fused_cpp::workspace::acquire();
-    FUSED_CPP_PROFILE_RESTART(phase_start);
-    indexer_q_linear = LinearPrepackedToDtypeWorkspace(qr, indexer_wq_b_packed, indexer_wq_b_K, indexer_wq_b_N,
-                                                       indexer_wq_b_Np, qr.scalar_type(), workspace_lease);
-    FUSED_CPP_PROFILE_ADD_IF_PTR(profile_ptr == nullptr ? nullptr : &profile_ptr->indexer_q_gemm_ms, phase_start);
+    if (!prefill_plan.select_all) {
+      auto workspace_lease = ::fused_cpp::workspace::acquire();
+      FUSED_CPP_PROFILE_RESTART(phase_start);
+      indexer_q_linear = LinearPrepackedToDtypeWorkspace(qr, indexer_wq_b_packed, indexer_wq_b_K, indexer_wq_b_N,
+                                                         indexer_wq_b_Np, qr.scalar_type(), workspace_lease);
+      FUSED_CPP_PROFILE_ADD_IF_PTR(profile_ptr == nullptr ? nullptr : &profile_ptr->indexer_q_gemm_ms, phase_start);
+    }
   }
-  TORCH_CHECK(indexer_q_linear.size(1) % indexer_head_dim == 0,
-              "indexer q linear out features must be divisible by indexer head_dim");
+  at::Tensor q_quant;
+  at::Tensor scaled_weights;
+  if (!prefill_plan.select_all) {
+    TORCH_CHECK(indexer_q_linear.size(1) % indexer_head_dim == 0,
+                "indexer q linear out features must be divisible by indexer head_dim");
 
-  const int64_t indexer_num_heads = indexer_q_linear.size(1) / indexer_head_dim;
-  at::Tensor indexer_q = indexer_q_linear.reshape({indexer_q_linear.size(0), indexer_num_heads, indexer_head_dim});
+    const int64_t indexer_num_heads = indexer_q_linear.size(1) / indexer_head_dim;
+    at::Tensor indexer_q = indexer_q_linear.reshape({indexer_q_linear.size(0), indexer_num_heads, indexer_head_dim});
 
-  FUSED_CPP_PROFILE_RESTART(phase_start);
-  auto indexer_q_and_weights = IndexerQRopeQuant(positions, indexer_q, indexer_cos_sin_cache, indexer_weights);
-  at::Tensor q_quant = std::get<0>(indexer_q_and_weights);
-  at::Tensor scaled_weights = std::get<1>(indexer_q_and_weights);
-  FUSED_CPP_PROFILE_ADD_IF_PTR(profile_ptr == nullptr ? nullptr : &profile_ptr->indexer_q_rope_weights_ms, phase_start);
+    FUSED_CPP_PROFILE_RESTART(phase_start);
+    auto indexer_q_and_weights = IndexerQRopeQuant(positions, indexer_q, indexer_cos_sin_cache, indexer_weights);
+    q_quant = std::get<0>(indexer_q_and_weights);
+    scaled_weights = std::get<1>(indexer_q_and_weights);
+    FUSED_CPP_PROFILE_ADD_IF_PTR(profile_ptr == nullptr ? nullptr : &profile_ptr->indexer_q_rope_weights_ms,
+                                 phase_start);
+  }
 
   RunCompressor(kv_score, positions, mla_ape, mla_state_cache, mla_state_slot_mapping, mla_token_to_req_indices,
                 mla_block_table, mla_kv_cache, mla_kv_slot_mapping, mla_norm_weight, main_cos_sin_cache,
@@ -2849,9 +2890,12 @@ std::tuple<at::Tensor, at::Tensor> deepseek_v4_post_gemm_parallel_stage_prepacke
 
   // Keep the migrated native post-GEMM path self-contained.  Do not dispatch
   // through the retired standalone sparse_attn_indexer_prefill_cpp_v0 symbol.
-  SparseAttnIndexerPrefill(q_quant, scaled_weights, indexer_kv_cache, topk_indices_buffer, topk_tokens,
-                           prefill_cu_seq_lens, prefill_cu_seqlen_ks, prefill_cu_seqlen_ke, prefill_block_table,
-                           profile_ptr);
+  if (prefill_plan.select_all) {
+    WriteSparseIndexerShortPath(prefill_plan, topk_indices_buffer, qr.size(0), topk_tokens, profile_ptr);
+  } else {
+    SparseAttnIndexerPrefillLong(q_quant, scaled_weights, indexer_kv_cache, topk_indices_buffer, topk_tokens,
+                                 prefill_cu_seq_lens, prefill_plan, prefill_block_table, profile_ptr);
+  }
   FUSED_CPP_PROFILE_IF_ENABLED(profile_ptr != nullptr,
                                PrintPostGemmProfile(*profile_ptr, ::fused_cpp::profile::elapsed_ms(total_start)));
   return std::make_tuple(q, topk_indices_buffer);

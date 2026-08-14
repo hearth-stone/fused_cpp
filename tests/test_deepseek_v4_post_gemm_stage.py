@@ -6,6 +6,7 @@ import platform
 import pytest
 import torch
 
+import fused_cpp.deepseek_v4_post_gemm_stage as post_gemm_stage_module
 from fused_cpp.deepseek_v4_post_gemm_stage import (
     CompressorState,
     PostGemmStageInputs,
@@ -525,6 +526,106 @@ def test_post_gemm_shared_q_pool_matches_sequential(monkeypatch) -> None:
         sequential_inputs.indexer_compressor.state_cache,
         "shared Q pool indexer state_cache",
     )
+
+
+@pytest.mark.skipif(
+    not _HAS_DEEPSEEK_V4_POST_GEMM_STAGE,
+    reason="DeepSeek V4 post-GEMM raw C++ stage is unavailable",
+)
+def test_post_gemm_raw_select_all_short_path_skips_indexer_q(monkeypatch, capfd) -> None:
+    """The raw-weight fallback must apply the same early select-all dispatch."""
+    ref_inputs = _make_inputs(seed=42, num_tokens=9)
+    cpp_inputs = _make_inputs(seed=42, num_tokens=9)
+    for inputs in (ref_inputs, cpp_inputs):
+        assert inputs.prefill is not None
+        inputs.prefill.cu_seqlen_ke.clamp_(max=inputs.prefill.topk_tokens)
+
+    ref_q, ref_topk = post_gemm_parallel_stage_torch_baseline(ref_inputs)
+    monkeypatch.setattr(post_gemm_stage_module, "_HAS_DEEPSEEK_V4_POST_GEMM_STAGE_PREPACKED", False)
+    monkeypatch.setenv("FUSED_CPP_DEEPSEEK_V4_POST_GEMM_PROFILE", "1")
+    capfd.readouterr()
+    cpp_q, cpp_topk = post_gemm_parallel_stage_cpp(cpp_inputs)
+    stderr = capfd.readouterr().err
+
+    _assert_close(cpp_q, ref_q, "raw select-all q")
+    assert torch.equal(cpp_topk, ref_topk)
+    _assert_close(cpp_inputs.swa.kv_cache, ref_inputs.swa.kv_cache, "raw select-all swa kv_cache")
+    _assert_close(
+        cpp_inputs.mla_compressor.kv_cache,
+        ref_inputs.mla_compressor.kv_cache,
+        "raw select-all mla kv_cache",
+    )
+    _assert_close(
+        cpp_inputs.indexer_compressor.kv_cache,
+        ref_inputs.indexer_compressor.kv_cache,
+        "raw select-all indexer kv_cache",
+    )
+    assert "indexer_q_gemm_ms=0.000" in stderr
+    assert "indexer_q_rope_weights_ms=0.000" in stderr
+    assert "sparse_indexer_backend=short_path" in stderr
+
+
+@pytest.mark.skipif(
+    not _HAS_DEEPSEEK_V4_POST_GEMM_STAGE_PREPACKED,
+    reason="DeepSeek V4 post-GEMM prepacked C++ stage is unavailable",
+)
+def test_post_gemm_select_all_short_path_skips_indexer_q(monkeypatch, capfd) -> None:
+    """A select-all TopK must bypass both shared and standalone Indexer Q work."""
+    shape = {
+        "num_tokens": 25,
+        "q_lora_rank": 16,
+        "main_num_heads": 8,
+        "main_head_dim": 16,
+        "indexer_num_heads": 8,
+        "indexer_head_dim": 16,
+    }
+    ref_inputs = _make_inputs(seed=43, **shape)
+    cpp_inputs = _make_inputs(seed=43, **shape)
+    for inputs in (ref_inputs, cpp_inputs):
+        assert inputs.prefill is not None
+        inputs.prefill.cu_seqlen_ke.clamp_(max=inputs.prefill.topk_tokens)
+
+    ref_q, ref_topk = post_gemm_parallel_stage_torch_baseline(ref_inputs)
+    weights = prepare_deepseek_v4_post_gemm_weights(
+        cpp_inputs.main_wq_b_weight,
+        cpp_inputs.indexer_wq_b_weight,
+    )
+
+    monkeypatch.setenv("FUSED_CPP_POST_GEMM_M8_ALIGNED", "1")
+    monkeypatch.setenv("FUSED_CPP_POST_GEMM_SHARED_Q_POOL", "1")
+    monkeypatch.setenv("FUSED_CPP_DEEPSEEK_V4_POST_GEMM_PROFILE", "1")
+    capfd.readouterr()
+    cpp_q, cpp_topk = post_gemm_parallel_stage_cpp_prepacked(cpp_inputs, weights)
+    stderr = capfd.readouterr().err
+
+    _assert_close(cpp_q, ref_q, "select-all q")
+    assert torch.equal(cpp_topk, ref_topk)
+    _assert_close(cpp_inputs.swa.kv_cache, ref_inputs.swa.kv_cache, "select-all swa kv_cache")
+    _assert_close(
+        cpp_inputs.mla_compressor.state_cache,
+        ref_inputs.mla_compressor.state_cache,
+        "select-all mla state_cache",
+    )
+    _assert_close(
+        cpp_inputs.mla_compressor.kv_cache,
+        ref_inputs.mla_compressor.kv_cache,
+        "select-all mla kv_cache",
+    )
+    _assert_close(
+        cpp_inputs.indexer_compressor.state_cache,
+        ref_inputs.indexer_compressor.state_cache,
+        "select-all indexer state_cache",
+    )
+    _assert_close(
+        cpp_inputs.indexer_compressor.kv_cache,
+        ref_inputs.indexer_compressor.kv_cache,
+        "select-all indexer kv_cache",
+    )
+    assert "shared_q_gemm_ms=0.000" in stderr
+    assert "indexer_q_gemm_ms=0.000" in stderr
+    assert "indexer_q_rope_weights_ms=0.000" in stderr
+    assert "sparse_indexer_topk_backend=short_path" in stderr
+    assert "sparse_indexer_backend=short_path" in stderr
 
 
 @pytest.mark.skipif(

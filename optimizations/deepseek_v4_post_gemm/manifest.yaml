@@ -8,6 +8,37 @@ baseline:
   selection: FUSED_CPP_POST_GEMM_M8_ALIGNED=0
 
 features:
+  - id: dispatch.indexer_select_all_early_exit
+    part: dispatch
+    status: enabled
+    implementation: csrc/deepseek_v4_post_gemm_stage.cpp
+    hypothesis: >-
+      Detecting that every sparse-indexer row selects its complete valid range
+      before the Q branches run removes the otherwise unused Indexer Q GEMM and
+      Indexer Q RoPE/weight scaling, while preserving Main Q, both compressor
+      updates, the final TopK buffer contents, and the long-path dispatch.
+    depends_on: []
+    conflicts_with: []
+    selection: >-
+      Enabled automatically when num_tokens is positive and
+      max(cu_seqlen_ke - cu_seqlen_ks) is no larger than topk_tokens. The
+      select-all indices are still written after both compressors. All other
+      inputs retain the existing score and TopK path.
+    correctness: >-
+      PYTHONPATH=src OMP_NUM_THREADS=8 OMP_DYNAMIC=FALSE
+      OMP_PROC_BIND=close OMP_PLACES=cores taskset -c 0-7
+      .venv/bin/python -m pytest -q
+      tests/test_deepseek_v4_post_gemm_stage.py
+    benchmark: >-
+      PYTHONPATH=src FUSED_CPP_POST_GEMM_BACKEND=neon
+      OMP_NUM_THREADS=8 OMP_DYNAMIC=FALSE OMP_PROC_BIND=close
+      OMP_PLACES=cores taskset -c 0-7
+      .venv/bin/python tests/bench_deepseek_v4_post_gemm_stage.py
+      --m 2048 --context-start 0 --threads 8 --warmup 3 --runs 15
+      --schedule m8 --q-pool auto --profile
+    result: >-
+      optimizations/deepseek_v4_post_gemm/results/amazon_8c_indexer_select_all_early_exit_20260813.md
+
   - id: schedule.m8_aligned
     part: schedule
     status: enabled
@@ -164,6 +195,12 @@ features:
       optimizations/deepseek_v4_post_gemm/results/amazon_8c_indexer_native_batch_topk_20260813.md
 
 variants:
+  - id: post_gemm_indexer_select_all_early_exit
+    entrypoint: deepseek_v4_post_gemm_parallel_stage_prepacked
+    status: enabled
+    features:
+      - dispatch.indexer_select_all_early_exit
+
   - id: post_gemm_m8_aligned
     entrypoint: deepseek_v4_post_gemm_parallel_stage_prepacked
     status: enabled
