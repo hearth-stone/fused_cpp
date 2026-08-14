@@ -7,19 +7,20 @@ baseline:
   status: reference
 
 default:
-  id: head_major_8x8
+  id: head_major_sve_qk_8x2vl_neon_pv
   entrypoint: flash_mla_sparse_fwd
   dispatch: >-
-    Supported BF16 MQA shapes use one-token tasks and 8-head by 8-key packed
-    QK/PV kernels once eight-query block parallelism exceeds half the requested
-    workers. Fully shared dense indices use call-level K/V packing. Short query
-    chunks retain guarded 2D KV splitting, and FP32 or unsupported BF16 shapes
-    retain the indexed implementation.
+    Supported SVE BF16 MQA shapes use one-token tasks, 8-head by 2VL-key packed
+    QK, and the existing 8-row PV once eight-query block parallelism exceeds
+    half the requested workers. Fully shared dense indices use the fixed 8x8
+    call-level K/V packing path. Non-SVE, short-query, FP32, and unsupported
+    shapes retain their existing fallbacks.
 
 benchmark_scenarios:
   production_smoke: >-
     tests/bench_sparse_mla.py --warmup 5 --iters 30
-  adoption_evidence: optimizations/sparse_mla/results/arm_head_major_20260813.md
+  adoption_evidence: >-
+    optimizations/sparse_mla/results/amazon_8c_scalable_sve_20260814.md
   short_chunk_evidence: >-
     optimizations/sparse_mla/results/amazon_sparse_mla_2d_fused_20260812.md
   retired_tail_evidence: >-
@@ -77,6 +78,24 @@ features:
       See optimizations/sparse_mla/results/amazon_sparse_mla_2d_fused_20260812.md.
     result: optimizations/sparse_mla/results/amazon_sparse_mla_2d_fused_20260812.md
 
+  - id: compute.sve_qk_8x2vl_bfmmla
+    part: compute
+    status: enabled
+    implementation: csrc/sparse_mla_sve.h
+    hypothesis: >-
+      Preserve the same 16-accumulator BFMMLA topology across SVE vector
+      lengths while doubling the sparse QK key tile from 8 to 16 at SVL256.
+    depends_on:
+      - scheduling.head_major_sparse
+    conflicts_with: []
+    correctness: >-
+      Forced SVL128 and default SVL256 each pass tests/test_sparse_mla.py;
+      see the result record for the prctl launcher and commands.
+    benchmark: >-
+      tests/bench_sparse_mla_scalable.py --threads 1|8 --warmup 5 --iters 21
+    result: >-
+      optimizations/sparse_mla/results/amazon_8c_scalable_sve_20260814.md
+
   - id: planning.masked_dense_tail
     part: planning
     status: retired
@@ -124,9 +143,21 @@ features:
       No single FMLA/BFMLAL/BFMMLA epilogue won across SVL128 and SVL256.
 
 variants:
+  - id: head_major_sve_qk_8x2vl_neon_pv
+    entrypoint: flash_mla_sparse_fwd
+    status: enabled
+    features:
+      - scheduling.head_major_dense
+      - scheduling.head_major_sparse
+      - scheduling.kv_2d_split
+      - compute.sve_qk_8x2vl_bfmmla
+    result: >-
+      optimizations/sparse_mla/results/amazon_8c_scalable_sve_20260814.md
+
   - id: head_major_8x8
     entrypoint: flash_mla_sparse_fwd
     status: enabled
+    implementation: Fixed NEON path retained for non-SVE builds
     features:
       - scheduling.head_major_dense
       - scheduling.head_major_sparse

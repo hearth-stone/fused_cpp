@@ -182,11 +182,13 @@ The exported `flash_mla_sparse_fwd`, `flash_mla_sparse_fwd_naive`, and
 output and optional statistics semantics, attention-sink behavior, and `out=`
 contract.
 
-For supported BF16 MQA shapes, the public optimized entrypoint uses head-major
-8x8 QK/PV once query parallelism is sufficient. Short query chunks retain
-guarded 2D KV partitioning; FP32 and unsupported BF16 shapes retain the indexed
-fallback. Task layout, packing, split count, partial buffers, and merge order
-are internal. Every dispatch must preserve the documented numerical tolerances,
+For supported SVE BF16 MQA shapes, the public optimized entrypoint uses a
+head-major scalable 8x2VL sparse QK kernel once query parallelism is sufficient;
+the current sparse PV and shared-dense subpath remain fixed 8x8. Non-SVE builds
+retain fixed 8x8 head-major kernels. Short query chunks retain guarded 2D KV
+partitioning; FP32 and unsupported BF16 shapes retain the indexed fallback.
+Task layout, packing, split count, partial buffers, and merge order are internal.
+Every dispatch must preserve the documented numerical tolerances,
 return-statistics definitions, attention-sink semantics, and safe fallback for
 unsupported or non-canonical sparse patterns.
 

@@ -385,13 +385,26 @@ wide-stride `TILESTORED` 的 raw store path 比 scratch→ZMM store 更慢。当
 实验模式都保留 ZMM FP32→BF16 转换。下一优先级是 scratch/workspace 生命周期，
 不是把 shape-dependent 的 tile-store 路径提前设为默认。
 
-### Sparse MLA production head-major 8×8
+### Sparse MLA production head-major scalable QK
 
 `flash_mla_sparse_fwd` 的 BF16 默认实现使用 combined head-major：当 8-query
 block 数大于请求线程数的一半时，每个 token 建立一个任务，QK/PV 的 M 维为同一
 token 的 8 个 query head；每组 gathered MQA K/V 只 pack 一次并由所有 head
 group 复用。全 query 共享连续 indices 时先走调用级 K/V pack 的 dense-head
 子路径。
+
+SVE BF16 build 的 sparse gathered 子路径现用 scalable BFMMLA QK
+`8×2VL`：`N=svcntb()/2`，所以 SVL128 为 8×8、SVL256 为 8×16；16 个 FP32
+累加器和每 K=4 的 16 条 BFMMLA 在各 128-bit segment 中保持同一拓扑。当前 PV
+仍使用原 BF16-probability 8-row kernel，共享 dense 子路径也仍为 fixed 8×8；
+非 SVE build 保留完整 fixed NEON 8×8 路径。
+
+Amazon 8C 的 DSV4-like `q[2048,32,192]`、top-k capacity 640、`d_v=128`，
+5 warmup + 21 samples：fixed 8×8 的 1T/8T 为 252.176/38.508 ms；SVE QK
+在 SVL128 为 250.760/38.313 ms，在 SVL256 为 225.232/36.759 ms，后者分别
+降低 10.68%/4.54% latency。强制 SVL128 与默认 SVL256 各 24 项 focused tests
+通过；生成 QK reduction loop 无 SVE spill。完整命令、raw samples 与限制见
+`optimizations/sparse_mla/results/amazon_8c_scalable_sve_20260814.md`。
 
 短 query chunk 继续走 guarded 2D indexed fallback；FP32 或不满足
 `Hq%8==0、Dqk%4==0、Dv%8==0` 的 BF16 形状也走 indexed fallback。公开 API、
@@ -494,7 +507,7 @@ Amazon 8C 的 1T 为 335.131→332.821 ms（-0.69%），8T 为
 25/26。8C 下两种 task 数均可整除线程数，因此持平。详细命令、配置与限制见
 `optimizations/sparse_mla/results/arm_head_major_20260813.md`。
 
-### Sparse MLA head-major sparse 8x8（已采用）
+### Sparse MLA head-major sparse fixed 8x8（已采用的基线历史）
 
 新增内部 `heads_sparse_8x8`：对 BF16 MQA 的每个 token，把有效 sparse
 indices 对应的 K/V gather+pack 一次，再由同 token 的所有 8-head group 复用；
@@ -502,7 +515,8 @@ QK 使用现有 packed BFMMLA 8×8，PV 使用 BF16-probability 8×8，并在 L2
 chunk 之间保留同一份 online-softmax max/sum/O 状态。负索引 padding 被跳过，
 正索引顺序及重复语义不变，sink/output/stats 与 unsupported-shape fallback 均保留。
 组合候选先尝试 `heads_dense_8x8`，因此全 query 共享连续 KV 时仍只做一次调用级
-K/V pack；该组合现为公开 `flash_mla_sparse_fwd` 的 BF16 默认实现。
+K/V pack；该组合调度现为公开 `flash_mla_sparse_fwd` 的 BF16 默认实现，sparse
+QK 微内核随后已由上面的 scalable SVE 8×2VL 取代。
 
 BF16 `q[2048,32,192]`、DSV4 512 compressed + 128 sliding-window、
 `context_start=0`、`d_v=128`、3 warmup + 11 次轮转交错：Amazon 8C 的
@@ -608,7 +622,7 @@ prepacked（强制 shared pool）两个专项测试通过，完整 post-GEMM 文
 | **Long-context bf16，KV 装 L3，S%8==0** | **`flash2_neon_l3kv_packqkv`** | Q + K + V 都 pre-pack，BFMMLA inner 走 packqk_seq4_bmajor 路径（microkernel +23%）；端到端预期 +2–5% vs `packv` |
 | Long-context fp32 | `flash2_neon_l3kv_qk_ublock4` | 唯一打开 fp32 GEMM 瓶颈的路径；packv 在 fp32 下负收益 |
 | 想跑 cache-aware 但 KV 装得下 L3 | `flash2_neon_cache_qk_ublock4`（fp32）/ `flash2_neon_cache_pquad`（bf16 PV 或 fp32 PV-only）/ `flash2_neon_l3kv_pquad`（path A 退化） | 性能近似 |
-| Sparse MLA BF16 | 公开 `flash_mla_sparse_fwd`（head-major 8×8） | query blocks>threads/2 时按 token 做 8-head×8-key QK/PV；短 chunk 最多 8-way KV split；unsupported shape 回退 indexed |
+| Sparse MLA BF16 | 公开 `flash_mla_sparse_fwd`（head-major scalable QK） | SVE sparse gathered 路径按 token 做 8-head×2VL-key QK，当前 PV/dense 仍 fixed 8×8；短 chunk 最多 8-way KV split；non-SVE/unsupported shape 保留回退 |
 | 历史接口兼容 | `flash2_neon_cache` / `flash2_neon_l3kv`（无后缀别名） | 自动映射到 `_baseline` |
 
 ---
@@ -619,6 +633,7 @@ prepacked（强制 shared pool）两个专项测试通过，完整 post-GEMM 文
 
 | 日期 | 改动概述 | 受影响文件 |
 |---|---|---|
+| 2026-08-14 | **Sparse MLA sparse QK 从 fixed NEON 8×8 改为 scalable SVE 8×2VL**：保持 16 个 BFMMLA FP32 累加器与 K=4 instruction topology，K pack 和 score epilogue 随运行时 VL 扩展；SVL128 为 8×8，SVL256 为 8×16。PV、online softmax、shared-dense 8×8 与 non-SVE fallback 不变。Amazon 8C DSV4-like `q[2048,32,192],topk640,Dv128` 上，1T/8T 从 252.176/38.508 降至 SVL256 的 225.232/36.759 ms（-10.68%/-4.54%）；SVL128 为 250.760/38.313 ms。两种 VL 各 24 tests passed，QK 汇编 16 条 `bfmmla`/K4 且无 spill。 | 新建 `csrc/sparse_mla_sve.h`、`tests/bench_sparse_mla_scalable.py`、`optimizations/sparse_mla/results/amazon_8c_scalable_sve_20260814.md`；改 `csrc/{sparse_mla.cpp,SDPA_VERSIONS.md}`、`docs/public_contracts.md`、`optimizations/sparse_mla/manifest.yaml` |
 | 2026-08-14 | **Sparse MLA head-major 8×8 转为公开默认实现**：BF16 且 `Hq%8==0,Dqk%4==0,Dv%8==0` 的常见长 query 按 token 复用 MQA K/V pack，并分别处理共享连续 KV 与 sparse indexed KV；短 query 保留最多 8-way KV split，FP32/非支持维度保留 indexed fallback。删除内部 variant selector、masked/pruned/fused tail 实验源码和专用 benchmark，负结果与回滚点保留在 manifest、结果文档和 Git 历史。公开签名及数值语义不变。Amazon 8C SVL256、cores 0--3、OMP=4 release build 成功，Sparse MLA 24 tests passed，实验 selector ABI removal 检查通过；192-core/SVL128 主机 SSH 无响应，未报告该机验证结果。 | 改 `csrc/{sparse_mla.cpp,module.cpp,SDPA_VERSIONS.md}`、`tests/test_sparse_mla.py`、`docs/public_contracts.md`、`optimizations/sparse_mla/{manifest.yaml,results/arm_head_major_20260813.md}`；删 `csrc/sparse_mla_tail_microkernels.{h,cpp}`、`tests/bench_sparse_mla_tail_variants.py` |
 | 2026-08-13 | **DeepSeek V4 Indexer select-all 提前短路**：把 `max(ke-ks)<=topk` 判定移到 Q 调度之前；命中时 raw/prepacked 都跳过 Indexer Q GEMM 和 Q RoPE/weight scaling，prepacked 强制 shared-Q pool 时也只运行 Main Q，同时保留 Main Q、两个 compressor 及阶段末尾 TopK 写入顺序。Amazon 8C SVL256 上 raw/prepacked 专项与完整文件 20 tests passed；`M2048,context_start=0,topk512` 中位数 74.309→40.176 ms（1.850×），34.854 ms Indexer Q 工作归零。192-core/SVL128 主机 SSH 无响应，未报告结果。 | 改 `csrc/{deepseek_v4_post_gemm_stage.cpp,SDPA_VERSIONS.md}`、`tests/test_deepseek_v4_post_gemm_stage.py`、`optimizations/deepseek_v4_post_gemm/{manifest.yaml,results/amazon_8c_indexer_select_all_early_exit_20260813.md}` |
 | 2026-08-13 | **DeepSeek V4 Indexer native batched exact TopK 候选**：把 2,048 次逐行 ATen TopK 替换为单次 OpenMP batched `nth_element + selected-K sort`，每 worker 复用候选缓冲，只写 strided int32 indices；保留 score 降序、tie/NaN 定义和非标准 tensor contract 的 ATen fallback。Amazon 8C SVL256 上 20 个独立 TopK 边界 case 与 25 项集成测试通过；`M2048,N1536,K512` 的 TopK 75.155→9.637 ms（7.799×），完整 stage 186.251→120.758 ms（1.542×），score 保持 36.15 ms。仅完成 8C 首测，192C/SVL128 待测，故保持 candidate。 | 改 `csrc/{deepseek_v4_indexer_sve.h,deepseek_v4_indexer_sve.cpp,deepseek_v4_post_gemm_stage.cpp,SDPA_VERSIONS.md}`、`benchmarks/bench_deepseek_v4_indexer_sve.cpp`、`tests/test_deepseek_v4_post_gemm_stage.py`、`optimizations/deepseek_v4_post_gemm/{manifest.yaml,results/amazon_8c_indexer_native_batch_topk_20260813.md}` |

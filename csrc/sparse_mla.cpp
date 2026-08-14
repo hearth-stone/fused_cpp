@@ -15,6 +15,7 @@
 #include "sdpa_microkernels/neon_cache_microkernels.h"
 #include "sdpa_pack_utils.h"
 #include "sdpa_tile_sizes.h"
+#include "sparse_mla_sve.h"
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -1013,8 +1014,12 @@ static inline bool run_dense_heads_packqkv_mqa_fast_path(
 static inline void pack_indexed_kv_heads_tile_bf16(
     const at::BFloat16* kv_ptr, int64_t kv_row_stride, const int64_t* indices,
     int64_t d_qk, int64_t d_v, uint16_t* k_packed, at::BFloat16* v_packed,
-    int64_t v_evblock_stride) {
+    int64_t v_evblock_stride, int64_t key_tile) {
   const auto* kv_u16 = reinterpret_cast<const uint16_t*>(kv_ptr);
+#if FUSED_CPP_SPARSE_MLA_HAS_SVE_BFMMLA
+  ::fused_cpp::sparse_mla_sve::pack_indexed_k_tile_bf16(
+      kv_u16, kv_row_stride, indices, d_qk, k_packed);
+#else
   const int64_t e_main = d_qk & ~int64_t{3};
   for (int64_t e = 0; e < e_main; e += 4) {
     uint16_t* dst = k_packed + (e / 4) * 32;
@@ -1023,10 +1028,11 @@ static inline void pack_indexed_kv_heads_tile_bf16(
           kv_u16 + indices[row] * kv_row_stride + e, dst + row * 4);
     }
   }
+#endif
 
   for (int64_t ev = 0; ev < d_v; ev += kQueryBlock) {
     at::BFloat16* v_block = v_packed + (ev / kQueryBlock) * v_evblock_stride;
-    for (int64_t row = 0; row < kQueryBlock; ++row) {
+    for (int64_t row = 0; row < key_tile; ++row) {
       std::memcpy(v_block + row * kQueryBlock,
                   kv_ptr + indices[row] * kv_row_stride + ev,
                   kQueryBlock * sizeof(at::BFloat16));
@@ -1097,12 +1103,20 @@ static inline bool run_sparse_heads_packqkv_mqa_fast_path(
     lse_ptr = lse->data_ptr<float>();
   }
 
+  const int64_t key_tile = ::fused_cpp::sparse_mla_sve::n_tile();
   const int64_t qblock_u16 = (d_qk / 4) * 32;
+#if FUSED_CPP_SPARSE_MLA_HAS_SVE_BFMMLA
+  const int64_t kblock_u16 =
+      ::fused_cpp::sparse_mla_sve::packed_k_tile_elements(d_qk);
+#else
+  const int64_t kblock_u16 = qblock_u16;
+#endif
   const int64_t head_groups = h_q / kQueryBlock;
   const auto ts = ::fused_cpp::sdpa_tile_sizes::compute_tile_sizes_l3kv(
       /*B=*/1, h_q, topk, s_q, d_qk, d_v, sizeof(at::BFloat16));
-  const int64_t chunk_capacity = std::max<int64_t>(kQueryBlock, ts.Sc_l2);
-  const int64_t chunk_blocks = chunk_capacity / kQueryBlock;
+  const int64_t chunk_capacity =
+      std::max<int64_t>(key_tile, (ts.Sc_l2 / key_tile) * key_tile);
+  const int64_t chunk_blocks = chunk_capacity / key_tile;
   const int64_t v_tile_elements =
       (d_v / kQueryBlock) * chunk_capacity * kQueryBlock;
   const float neg_inf = -std::numeric_limits<float>::infinity();
@@ -1128,13 +1142,15 @@ static inline bool run_sparse_heads_packqkv_mqa_fast_path(
     std::vector<uint16_t> q_packed(
         static_cast<size_t>(head_groups * qblock_u16));
     std::vector<uint16_t> k_packed(
-        static_cast<size_t>(chunk_blocks * qblock_u16));
+        static_cast<size_t>(chunk_blocks * kblock_u16));
     std::vector<at::BFloat16> v_packed(static_cast<size_t>(v_tile_elements));
     std::vector<float> scores(
         static_cast<size_t>(kQueryBlock * chunk_capacity));
     std::vector<at::BFloat16> p_hat_bf16(
         static_cast<size_t>(kQueryBlock * chunk_capacity));
-    int64_t gathered_indices[kQueryBlock];
+    std::vector<float> qkt_tile(
+        static_cast<size_t>(kQueryBlock * key_tile));
+    std::vector<int64_t> gathered_indices(static_cast<size_t>(key_tile));
 
 #ifdef _OPENMP
 #pragma omp for schedule(dynamic, 1)
@@ -1164,16 +1180,16 @@ static inline bool run_sparse_heads_packqkv_mqa_fast_path(
       int64_t chunk_count = 0;
       const auto pack_tile = [&](int64_t valid_count) {
         const int64_t padding_index = gathered_indices[0];
-        for (int64_t row = valid_count; row < kQueryBlock; ++row) {
+        for (int64_t row = valid_count; row < key_tile; ++row) {
           gathered_indices[row] = padding_index;
         }
         {
           FUSED_CPP_SDPA_PROFILE_SCOPE(::fused_cpp::sdpa_profile::Slot::kKPack);
           pack_indexed_kv_heads_tile_bf16(
-              kv_ptr, d_qk, gathered_indices, d_qk, d_v,
-              k_packed.data() + (chunk_count / kQueryBlock) * qblock_u16,
+              kv_ptr, d_qk, gathered_indices.data(), d_qk, d_v,
+              k_packed.data() + (chunk_count / key_tile) * kblock_u16,
               v_packed.data() + chunk_count * kQueryBlock,
-              chunk_capacity * kQueryBlock);
+              chunk_capacity * kQueryBlock, key_tile);
         }
 
         chunk_count += valid_count;
@@ -1188,18 +1204,24 @@ static inline bool run_sparse_heads_packqkv_mqa_fast_path(
           const int64_t head0 = group * kQueryBlock;
           {
             FUSED_CPP_SDPA_PROFILE_SCOPE(::fused_cpp::sdpa_profile::Slot::kQkt);
-            for (int64_t s_off = 0; s_off < chunk_count; s_off += kQueryBlock) {
-              alignas(64) float qkt_tile[kQueryBlock * kQueryBlock];
+            for (int64_t s_off = 0; s_off < chunk_count; s_off += key_tile) {
+#if FUSED_CPP_SPARSE_MLA_HAS_SVE_BFMMLA
+              ::fused_cpp::sparse_mla_sve::qkt_8x2vl_bf16(
+                  q_packed.data() + group * qblock_u16,
+                  k_packed.data() + (s_off / key_tile) * kblock_u16, d_qk,
+                  scale, qkt_tile.data());
+#else
               ::fused_cpp::sdpa_microkernels::
                   gemm_qkt_microkernel_8x8_bf16_packqk_seq4_bmajor_inner(
                       q_packed.data() + group * qblock_u16,
                       q_token + head0 * d_qk, d_qk,
-                      k_packed.data() + (s_off / kQueryBlock) * qblock_u16,
-                      kv_ptr, d_qk, d_qk, scale, qkt_tile);
+                      k_packed.data() + (s_off / key_tile) * kblock_u16,
+                      kv_ptr, d_qk, d_qk, scale, qkt_tile.data());
+#endif
               for (int64_t row = 0; row < kQueryBlock; ++row) {
                 const int64_t valid_keys =
-                    std::min<int64_t>(kQueryBlock, chunk_count - s_off);
-                std::copy_n(qkt_tile + row * kQueryBlock, valid_keys,
+                    std::min<int64_t>(key_tile, chunk_count - s_off);
+                std::copy_n(qkt_tile.data() + row * key_tile, valid_keys,
                             scores.data() + row * chunk_count + s_off);
               }
             }
@@ -1266,7 +1288,7 @@ static inline bool run_sparse_heads_packqkv_mqa_fast_path(
           continue;
         }
         gathered_indices[gathered_count++] = index;
-        if (gathered_count == kQueryBlock) {
+        if (gathered_count == key_tile) {
           pack_tile(gathered_count);
           gathered_count = 0;
           if (chunk_count == chunk_capacity) {
@@ -1314,7 +1336,13 @@ static inline bool run_sparse_heads_packqkv_mqa_fast_path(
     profile_params.Ev = d_v;
     profile_params.dtype = SdpaDtype::kBFloat16;
     ::fused_cpp::sdpa_profile::print_summary(
-        "sparse_mla_heads", "heads_sparse_8x8", profile_params,
+        "sparse_mla_heads",
+#if FUSED_CPP_SPARSE_MLA_HAS_SVE_BFMMLA
+        "heads_sparse_sve_qk_8x2vl_neon_pv",
+#else
+        "heads_sparse_8x8",
+#endif
+        profile_params,
         "indexed_gather_packqkv_mqa");
   }
   return true;
