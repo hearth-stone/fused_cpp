@@ -1,5 +1,12 @@
 # Sparse MLA Head-major 8x8 Experiments (2026-08-13)
 
+> Adoption update (2026-08-14): the user approved `heads_sparse_8x8` as the
+> production BF16 default. The named comparison selector was removed; the
+> combined head-major mechanism now lives behind `flash_mla_sparse_fwd`.
+> Guarded 2D indexed scheduling remains the short-chunk fallback, and the
+> original measurements and checkpoint decisions below are retained verbatim
+> as historical evidence.
+
 ## Scope
 
 This experiment changes the QK 8x8 M dimension from eight query tokens of one

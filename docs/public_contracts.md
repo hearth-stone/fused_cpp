@@ -175,6 +175,21 @@ experimental. The scalar/reference implementation and supported default
 dispatch remain correctness/fallback contracts even when optimized versions are
 added.
 
+## Sparse MLA
+
+The exported `flash_mla_sparse_fwd`, `flash_mla_sparse_fwd_naive`, and
+`sparse_mla` Python names retain their documented signatures, tensor validation,
+output and optional statistics semantics, attention-sink behavior, and `out=`
+contract.
+
+For supported BF16 MQA shapes, the public optimized entrypoint uses head-major
+8x8 QK/PV once query parallelism is sufficient. Short query chunks retain
+guarded 2D KV partitioning; FP32 and unsupported BF16 shapes retain the indexed
+fallback. Task layout, packing, split count, partial buffers, and merge order
+are internal. Every dispatch must preserve the documented numerical tolerances,
+return-statistics definitions, attention-sink semantics, and safe fallback for
+unsupported or non-canonical sparse patterns.
+
 ## Configuration And Defaults
 
 Default dispatch, backend fallback order, numerical mode, precision, page policy,

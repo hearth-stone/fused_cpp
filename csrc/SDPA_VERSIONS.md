@@ -385,10 +385,24 @@ wide-stride `TILESTORED` 的 raw store path 比 scratch→ZMM store 更慢。当
 实验模式都保留 ZMM FP32→BF16 转换。下一优先级是 scratch/workspace 生命周期，
 不是把 shape-dependent 的 tile-store 路径提前设为默认。
 
-### Sparse MLA 连续尾块 8×8 候选
+### Sparse MLA production head-major 8×8
 
-`flash_mla_sparse_fwd` 的 BF16 默认变体已从纯 `indexed_4x4` 切到带门限的
-`indexed_4x4_2d`；未触发 split 时，两者使用同一个 4×4 尾部计算。当 8-query
+`flash_mla_sparse_fwd` 的 BF16 默认实现使用 combined head-major：当 8-query
+block 数大于请求线程数的一半时，每个 token 建立一个任务，QK/PV 的 M 维为同一
+token 的 8 个 query head；每组 gathered MQA K/V 只 pack 一次并由所有 head
+group 复用。全 query 共享连续 indices 时先走调用级 K/V pack 的 dense-head
+子路径。
+
+短 query chunk 继续走 guarded 2D indexed fallback；FP32 或不满足
+`Hq%8==0、Dqk%4==0、Dv%8==0` 的 BF16 形状也走 indexed fallback。公开 API、
+sink、stats、`out=` 与数值容差不变。旧 `_flash_mla_sparse_fwd_variant` 比较入口、
+masked/pruned/fused tail 实现和 variant benchmark 已从 active tree 删除，由
+manifest tombstone、结果文档与 Git commit 保存。
+
+### Sparse MLA 连续尾块 8×8（已退役历史）
+
+indexed fallback 的 BF16 调度带有 2D KV 分片；未触发 split 时使用 4×4
+尾部计算。当 8-query
 block 数不超过请求线程数的一半时，
 最重的 block 最多拆成 8 个互斥 KV shard；每个 shard 产出局部 online-softmax
 `(m,l,O)`，再按 max-shift 公式合并。query-block 并行度已经足够时不分片、
@@ -398,7 +412,7 @@ planner 同时支持 sliding recent window：相邻 8 行起点不同的连续 r
 共同交集为 dense segment，左右 fringe 留给 indexed/masked 路径。这样 128-token
 recent window 在完整序列上形成梯形，而不是退化成大量 4×4 gather tile。
 
-内部比较入口保留 `masked_dense_8x8` 与 `masked_dense_8x8_pruned`：planner 只提升
+历史比较入口 `masked_dense_8x8` 与 `masked_dense_8x8_pruned` 曾让 planner 提升
 完整 8-query、单调连续前缀且可安全加载 8 行 K/V 的 ragged tail；重复、离散、
 partial block 及越界风险继续回落 indexed 路径。
 
@@ -421,7 +435,7 @@ mask 时分别快 5.8% / 5.8% / 5.1% / 4.7%。因此 2×2 QK 与 exact-lane PV
 pruning 本身有效；2048 forward 无收益来自 masked tail 仅占有效 pairs 的
 0.644%，而不是 pruned 微内核没有减少尾部开销。
 
-### Sparse MLA fused online epilogue 与 PV 指令比较
+### Sparse MLA fused online epilogue 与 PV 指令比较（已退役历史）
 
 新增三个内部实验入口：`masked_dense_8x8_fused_fmla`、
 `masked_dense_8x8_fused_bfmlal`、`masked_dense_8x8_fused_bfmmla`。三者共用
@@ -439,7 +453,7 @@ pruned BFMMLA QK 和 SVE online-softmax，score 与 BF16 `p_hat` 不再写入 sc
 所以“消除中间往返”不是跨机器恒胜：SVL256 的 fused FMLA 比 materialized 快
 17.84%，但 SVL128 慢 7.93%。BFMMLA 还要支付 probability replication、专用 V
 pack 和 2×2 output interleave/deinterleave；K=8 太小，矩阵指令数减少不足以覆盖
-固定开销，两台机器都不是最优。三个 fused 入口保持实验状态，不进入公开默认。
+固定开销，两台机器都不是最优。三个 fused 入口均已从 active tree 删除。
 
 ### Sparse MLA 真实 DSV4 长上下文与 2D 调度
 
@@ -461,12 +475,12 @@ window（完整序列呈梯形）。Amazon 192C NUMA1 cores 96--191、96T、BF16
 说明同一门限不会在小线程池误拆。完整方法、命令、raw-sample 结论、数值覆盖与
 下一步见 `optimizations/sparse_mla/results/amazon_sparse_mla_2d_fused_20260812.md`。
 
-### Sparse MLA head-major dense 8x8 候选
+### Sparse MLA head-major dense 8x8（已采用的子路径历史）
 
 新增内部 `heads_dense_8x8`：全 query 共享同一段连续 indices 时，QK/PV 的
 8×8 M 维从“同一 head 的 8 个 token”改成“同一 token 的 8 个 head”。K/V
 仍只在调用级 pack 一次，Q 和输出则直接消费公开 `[token,head,dim]` 中相邻的
-head 行。公开 `flash_mla_sparse_fwd` 与默认 `indexed_4x4_2d` 不变。
+head 行。该机制现已成为 production combined head-major 的 dense 子路径。
 
 BF16 `q[2048,32,192]`、共享 `KV=640`、`d_v=128`、3 warmup + 11 次轮转交错：
 Amazon 8C 的 1T 为 335.131→332.821 ms（-0.69%），8T 为
@@ -480,7 +494,7 @@ Amazon 8C 的 1T 为 335.131→332.821 ms（-0.69%），8T 为
 25/26。8C 下两种 task 数均可整除线程数，因此持平。详细命令、配置与限制见
 `optimizations/sparse_mla/results/arm_head_major_20260813.md`。
 
-### Sparse MLA head-major sparse 8x8 组合候选
+### Sparse MLA head-major sparse 8x8（已采用）
 
 新增内部 `heads_sparse_8x8`：对 BF16 MQA 的每个 token，把有效 sparse
 indices 对应的 K/V gather+pack 一次，再由同 token 的所有 8-head group 复用；
@@ -488,7 +502,7 @@ QK 使用现有 packed BFMMLA 8×8，PV 使用 BF16-probability 8×8，并在 L2
 chunk 之间保留同一份 online-softmax max/sum/O 状态。负索引 padding 被跳过，
 正索引顺序及重复语义不变，sink/output/stats 与 unsupported-shape fallback 均保留。
 组合候选先尝试 `heads_dense_8x8`，因此全 query 共享连续 KV 时仍只做一次调用级
-K/V pack；公开 `flash_mla_sparse_fwd` 和默认 `indexed_4x4_2d` 不变。
+K/V pack；该组合现为公开 `flash_mla_sparse_fwd` 的 BF16 默认实现。
 
 BF16 `q[2048,32,192]`、DSV4 512 compressed + 128 sliding-window、
 `context_start=0`、`d_v=128`、3 warmup + 11 次轮转交错：Amazon 8C 的
@@ -594,7 +608,7 @@ prepacked（强制 shared pool）两个专项测试通过，完整 post-GEMM 文
 | **Long-context bf16，KV 装 L3，S%8==0** | **`flash2_neon_l3kv_packqkv`** | Q + K + V 都 pre-pack，BFMMLA inner 走 packqk_seq4_bmajor 路径（microkernel +23%）；端到端预期 +2–5% vs `packv` |
 | Long-context fp32 | `flash2_neon_l3kv_qk_ublock4` | 唯一打开 fp32 GEMM 瓶颈的路径；packv 在 fp32 下负收益 |
 | 想跑 cache-aware 但 KV 装得下 L3 | `flash2_neon_cache_qk_ublock4`（fp32）/ `flash2_neon_cache_pquad`（bf16 PV 或 fp32 PV-only）/ `flash2_neon_l3kv_pquad`（path A 退化） | 性能近似 |
-| Sparse MLA BF16，短 query chunk + 长 KV | 公开 `flash_mla_sparse_fwd`（guarded `indexed_4x4_2d`） | query blocks≤threads/2 时最多 8-way KV split；否则回退 1D indexed；fused 8×8 FMLA/BFMLAL/BFMMLA 只作实验比较 |
+| Sparse MLA BF16 | 公开 `flash_mla_sparse_fwd`（head-major 8×8） | query blocks>threads/2 时按 token 做 8-head×8-key QK/PV；短 chunk 最多 8-way KV split；unsupported shape 回退 indexed |
 | 历史接口兼容 | `flash2_neon_cache` / `flash2_neon_l3kv`（无后缀别名） | 自动映射到 `_baseline` |
 
 ---
@@ -605,6 +619,7 @@ prepacked（强制 shared pool）两个专项测试通过，完整 post-GEMM 文
 
 | 日期 | 改动概述 | 受影响文件 |
 |---|---|---|
+| 2026-08-14 | **Sparse MLA head-major 8×8 转为公开默认实现**：BF16 且 `Hq%8==0,Dqk%4==0,Dv%8==0` 的常见长 query 按 token 复用 MQA K/V pack，并分别处理共享连续 KV 与 sparse indexed KV；短 query 保留最多 8-way KV split，FP32/非支持维度保留 indexed fallback。删除内部 variant selector、masked/pruned/fused tail 实验源码和专用 benchmark，负结果与回滚点保留在 manifest、结果文档和 Git 历史。公开签名及数值语义不变。Amazon 8C SVL256、cores 0--3、OMP=4 release build 成功，Sparse MLA 24 tests passed，实验 selector ABI removal 检查通过；192-core/SVL128 主机 SSH 无响应，未报告该机验证结果。 | 改 `csrc/{sparse_mla.cpp,module.cpp,SDPA_VERSIONS.md}`、`tests/test_sparse_mla.py`、`docs/public_contracts.md`、`optimizations/sparse_mla/{manifest.yaml,results/arm_head_major_20260813.md}`；删 `csrc/sparse_mla_tail_microkernels.{h,cpp}`、`tests/bench_sparse_mla_tail_variants.py` |
 | 2026-08-13 | **DeepSeek V4 Indexer select-all 提前短路**：把 `max(ke-ks)<=topk` 判定移到 Q 调度之前；命中时 raw/prepacked 都跳过 Indexer Q GEMM 和 Q RoPE/weight scaling，prepacked 强制 shared-Q pool 时也只运行 Main Q，同时保留 Main Q、两个 compressor 及阶段末尾 TopK 写入顺序。Amazon 8C SVL256 上 raw/prepacked 专项与完整文件 20 tests passed；`M2048,context_start=0,topk512` 中位数 74.309→40.176 ms（1.850×），34.854 ms Indexer Q 工作归零。192-core/SVL128 主机 SSH 无响应，未报告结果。 | 改 `csrc/{deepseek_v4_post_gemm_stage.cpp,SDPA_VERSIONS.md}`、`tests/test_deepseek_v4_post_gemm_stage.py`、`optimizations/deepseek_v4_post_gemm/{manifest.yaml,results/amazon_8c_indexer_select_all_early_exit_20260813.md}` |
 | 2026-08-13 | **DeepSeek V4 Indexer native batched exact TopK 候选**：把 2,048 次逐行 ATen TopK 替换为单次 OpenMP batched `nth_element + selected-K sort`，每 worker 复用候选缓冲，只写 strided int32 indices；保留 score 降序、tie/NaN 定义和非标准 tensor contract 的 ATen fallback。Amazon 8C SVL256 上 20 个独立 TopK 边界 case 与 25 项集成测试通过；`M2048,N1536,K512` 的 TopK 75.155→9.637 ms（7.799×），完整 stage 186.251→120.758 ms（1.542×），score 保持 36.15 ms。仅完成 8C 首测，192C/SVL128 待测，故保持 candidate。 | 改 `csrc/{deepseek_v4_indexer_sve.h,deepseek_v4_indexer_sve.cpp,deepseek_v4_post_gemm_stage.cpp,SDPA_VERSIONS.md}`、`benchmarks/bench_deepseek_v4_indexer_sve.cpp`、`tests/test_deepseek_v4_post_gemm_stage.py`、`optimizations/deepseek_v4_post_gemm/{manifest.yaml,results/amazon_8c_indexer_native_batch_topk_20260813.md}` |
 | 2026-08-13 | **DeepSeek V4 sparse indexer weighted-ReLU 8×2VL 候选**：修正长路径为逐 head `ReLU(q·k)` 后乘 weight 再归约；新增 scalable-SVE 8×2VL BFMMLA 内核，Q 每 query 私有 pack、K 从 paged cache 直接 packB、ReLU/weight/head reduce 全部留在寄存器并只写最终 FP32 score；非 SVE/非 H8-D4 形状走等价 FP32 fallback。Amazon 8C SVL256 的 45 个 score 组合最大绝对误差 `9.54e-7`，25 tests passed/5 retired skipped，汇编无 Z spill；生产 score 形状 1T/8T 为 202.285/36.653 ms（1.406 TFLOP/s），完整 stage 186.251 ms，其中 score/TopK 为 36.154/75.155 ms。仅完成用户要求的 8C 首测，SVL128/192C 待测，故保持 candidate。 | 新建 `csrc/deepseek_v4_indexer_sve.{h,cpp}`、`benchmarks/bench_deepseek_v4_indexer_sve.cpp`、`optimizations/deepseek_v4_post_gemm/results/amazon_8c_indexer_weighted_relu_sve_20260813.md`；改 `csrc/{deepseek_v4_post_gemm_stage.cpp,SDPA_VERSIONS.md}`、`src/fused_cpp/{sparse_attn_indexer.py,deepseek_v4_post_gemm_stage.py}`、`tests/{test_sparse_attn_indexer.py,test_deepseek_v4_post_gemm_stage.py,bench_deepseek_v4_post_gemm_stage.py}`、`optimizations/deepseek_v4_post_gemm/manifest.yaml` |
