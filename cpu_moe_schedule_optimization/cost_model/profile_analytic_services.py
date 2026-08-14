@@ -24,6 +24,7 @@ import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Callable
 
 import torch
 
@@ -31,13 +32,22 @@ import torch
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
 
-from analytic_probe_geometry import (  # noqa: E402
-    ProbeGeometry,
-    b_only_geometry,
-    m12_gemm_geometry,
-    read_cache_info,
-    read_llc_domains,
-)
+try:
+    from analytic_probe_geometry import (  # noqa: E402
+        ProbeGeometry,
+        b_only_geometry,
+        m12_gemm_geometry,
+        read_cache_info,
+        read_llc_domains,
+    )
+except ImportError:  # pragma: no cover - installed package import
+    from .analytic_probe_geometry import (
+        ProbeGeometry,
+        b_only_geometry,
+        m12_gemm_geometry,
+        read_cache_info,
+        read_llc_domains,
+    )
 from fused_cpp import _moe_C  # noqa: E402
 from fused_cpp.moe import prepare_fused_moe_bf16_tiled_weights  # noqa: E402
 
@@ -49,6 +59,10 @@ PROBE_FUSED_W13 = 11
 M12_ROWS = 12
 DEFAULT_N_TILE = 8
 SERVICE_PROBE_SCHEMA_VERSION = 2
+
+
+def _print_progress(message: str) -> None:
+    print(message, flush=True)
 
 
 def parse_int_list(value: str) -> list[int]:
@@ -166,6 +180,7 @@ def profile_load_resource(
     cold: bool,
     minimum_cold_experts: int,
     cold_experts_per_thread: int,
+    report: Callable[[str], None] | None = None,
 ) -> dict:
     k = geometry.k
     n = geometry.n
@@ -201,11 +216,11 @@ def profile_load_resource(
             runs=runs,
         )
         rows.append(row)
-        print(
-            f"{name:<12} threads={width:>2} rate={row['aggregate_gbytes_per_second']:>8.2f} GB/s "
-            f"median={row['slowest_worker_median_ms']:>8.4f} ms",
-            flush=True,
-        )
+        if report is not None:
+            report(
+                f"{name:<12} threads={width:>2} rate={row['aggregate_gbytes_per_second']:>8.2f} GB/s "
+                f"median={row['slowest_worker_median_ms']:>8.4f} ms"
+            )
     del packed
     gc.collect()
     rows.sort(key=lambda row: int(row["threads"]))
@@ -237,6 +252,7 @@ def profile_matrix(
     probe_mode: int,
     cache_level: str | None = None,
     cache_geometry: ProbeGeometry | None = None,
+    report: Callable[[str], None] | None = None,
 ) -> dict:
     if m != M12_ROWS:
         raise ValueError("compute service probes require the M12 kernel")
@@ -285,11 +301,11 @@ def profile_matrix(
             "worker_median_ms": [statistics.median(samples) for samples in samples_by_worker],
         }
         rows.append(row)
-        print(
-            f"{name:<12} threads={width:>2} rate={row['aggregate_tflops']:>8.3f} TFLOP/s "
-            f"median={slowest_median_ms:>8.4f} ms",
-            flush=True,
-        )
+        if report is not None:
+            report(
+                f"{name:<12} threads={width:>2} rate={row['aggregate_tflops']:>8.3f} TFLOP/s "
+                f"median={slowest_median_ms:>8.4f} ms"
+            )
     del packed
     gc.collect()
     rows.sort(key=lambda row: int(row["threads"]))
@@ -548,6 +564,7 @@ def main() -> int:
             runs=args.matrix_runs,
             seed=args.seed,
             probe_mode=PROBE_MATRIX_ONLY,
+            report=_print_progress,
         ),
         "gemm_core_flops": profile_matrix(
             name="gemm_l1",
@@ -562,6 +579,7 @@ def main() -> int:
             probe_mode=PROBE_FULL_NO_STORE,
             cache_level="l1d",
             cache_geometry=l1_gemm,
+            report=_print_progress,
         ),
         "gemm_l2_flops": profile_matrix(
             name="gemm_l2",
@@ -576,6 +594,7 @@ def main() -> int:
             probe_mode=PROBE_FULL_NO_STORE,
             cache_level="l2",
             cache_geometry=l2_gemm,
+            report=_print_progress,
         ),
         "l1_bytes": profile_load_resource(
             name="l1_bytes",
@@ -588,6 +607,7 @@ def main() -> int:
             cold=False,
             minimum_cold_experts=1,
             cold_experts_per_thread=1,
+            report=_print_progress,
         ),
         "l2_bytes": profile_load_resource(
             name="l2_bytes",
@@ -600,6 +620,7 @@ def main() -> int:
             cold=False,
             minimum_cold_experts=1,
             cold_experts_per_thread=1,
+            report=_print_progress,
         ),
         "llc_bytes": profile_load_resource(
             name="llc_bytes",
@@ -612,6 +633,7 @@ def main() -> int:
             cold=False,
             minimum_cold_experts=1,
             cold_experts_per_thread=1,
+            report=_print_progress,
         ),
         "dram_bytes": profile_load_resource(
             name="dram_bytes",
@@ -624,6 +646,7 @@ def main() -> int:
             cold=True,
             minimum_cold_experts=64,
             cold_experts_per_thread=4,
+            report=_print_progress,
         ),
     }
     payload = {

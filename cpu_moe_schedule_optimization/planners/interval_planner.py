@@ -10,11 +10,17 @@ from heapq import heapify, heappop, heappush
 from pathlib import Path
 from typing import Dict, List, Protocol, Sequence, Tuple
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "cost_model"))
-from phase_model import ContentionCostModel  # noqa: E402
-from profile_catalog import ProfileCompatibilityError  # noqa: E402
-from stage_window_policy import FULL_STRIPE as _FULL_STRIPE_WINDOW  # noqa: E402
-from stage_window_policy import default_stage_window_policy  # noqa: E402
+try:
+    from ..cost_model.phase_model import ContentionCostModel
+    from ..cost_model.profile_catalog import ProfileCompatibilityError
+    from .stage_window_policy import FULL_STRIPE as _FULL_STRIPE_WINDOW
+    from .stage_window_policy import default_stage_window_policy
+except ImportError:  # pragma: no cover - direct script and legacy path import
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "cost_model"))
+    from phase_model import ContentionCostModel  # noqa: E402
+    from profile_catalog import ProfileCompatibilityError  # noqa: E402
+    from stage_window_policy import FULL_STRIPE as _FULL_STRIPE_WINDOW  # noqa: E402
+    from stage_window_policy import default_stage_window_policy  # noqa: E402
 
 
 _ASYNC_PLAN_VERSION = 2
@@ -501,6 +507,44 @@ class IntervalPlanner:
             "active_working_set_bytes": self.active_working_set_bytes(shape, tasks),
             "window_bytes_per_worker": self.window_bytes_per_worker(shape, tasks),
             "resource_groups": resource_groups,
+        }
+
+    def _quick_candidate(self, experts, shape) -> dict:
+        """Score one homogeneous shape with isolated LPT lane loads.
+
+        This deliberately avoids the event-time contention simulator.  It is
+        the bounded online path used before analytical native scoring exists;
+        the full planner remains the source of performance-oracle decisions.
+        """
+        signature = tuple(int(value) for value in shape)
+        if len(set(signature)) != 1:
+            raise ValueError("quick planning accepts only homogeneous shapes")
+        lanes = self._lanes(signature)
+        assignment = self._assign_lpt(experts, lanes)
+        tasks = self._build_tasks(experts, lanes, assignment)
+        lane_loads = [0.0] * len(lanes)
+        for lane, expert_indices in enumerate(assignment):
+            width = lanes[lane][1]
+            lane_loads[lane] = sum(self._task_time(experts[index][1], width) for index in expert_indices)
+        makespan = max(lane_loads, default=0.0)
+        uncertainty = self._uncertainty(experts, signature, makespan, use_full_workload_anchor=False)
+        return {
+            "shape": signature,
+            "execution_mode": _ASYNC_EXECUTION_STRICT,
+            "tail_pool_threads": None,
+            "tail_pool_max_routes": None,
+            "tail_pool_tasks": 0,
+            "tail_repartition_width": None,
+            "tail_repartition_tasks": 0,
+            "tail_repartition_route_slices": 1,
+            "assignment_order": _ASSIGNMENT_ORDER_LPT,
+            "makespan_ns": makespan,
+            "uncertainty_ns": uncertainty,
+            "pessimistic_ns": makespan + uncertainty,
+            "tasks": tasks,
+            "active_working_set_bytes": self.active_working_set_bytes(signature, tasks),
+            "window_bytes_per_worker": self.window_bytes_per_worker(signature, tasks),
+            "resource_groups": len(lanes),
         }
 
     @staticmethod
@@ -1114,6 +1158,39 @@ class IntervalPlanner:
             strict_candidates=len(strict_candidates),
             dynamic_candidates=len(tail_pool_candidates),
             tail_repartition_candidates=len(tail_repartition_candidates),
+        )
+
+    def plan_quick(
+        self,
+        experts: List[Tuple[int, int]],
+        *,
+        topk_ids=None,
+    ) -> Dict[str, object]:
+        """Build a low-overhead strict plan from homogeneous team shapes."""
+        experts = [(expert, routes) for expert, routes in experts if routes > 0]
+        if not experts:
+            raise ValueError("at least one active expert is required")
+        homogeneous_shapes = [shape for shape in self.shapes if len(set(shape)) == 1]
+        if not homogeneous_shapes:
+            raise ProfileCompatibilityError("quick planning requires at least one homogeneous shape")
+        candidates = [self._quick_candidate(experts, shape) for shape in homogeneous_shapes]
+        selected = min(
+            candidates,
+            key=lambda candidate: (
+                candidate["makespan_ns"],
+                candidate["active_working_set_bytes"],
+                candidate["resource_groups"],
+            ),
+        )
+        return self._finalize_plan(
+            selected,
+            candidates,
+            topk_ids=topk_ids,
+            planner_backend="python_quick",
+            planner_workers=1,
+            strict_candidates=len(candidates),
+            dynamic_candidates=0,
+            tail_repartition_candidates=0,
         )
 
     def _predicted_expert_finish_times(self, tasks) -> dict[int, float] | None:

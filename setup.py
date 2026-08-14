@@ -6,7 +6,7 @@ import os
 import platform
 import subprocess
 
-from setuptools import setup
+from setuptools import find_packages, setup
 from torch.utils.cpp_extension import BuildExtension, CppExtension
 
 
@@ -773,6 +773,11 @@ moe_extension = CppExtension(
 extensions = [moe_extension] if _env_truthy("FUSED_CPP_BUILD_MOE_ONLY") else [main_extension, moe_extension]
 
 setup(
+    packages=[
+        *find_packages(where="src"),
+        *find_packages(where=".", include=("cpu_moe_schedule_optimization", "cpu_moe_schedule_optimization.*")),
+    ],
+    package_dir={"": "src", "cpu_moe_schedule_optimization": "cpu_moe_schedule_optimization"},
     ext_modules=extensions,
     cmdclass={"build_ext": _BuildExtensionWithFixup},
 )

@@ -137,6 +137,25 @@ GEMM tiling, thread ownership, cache windows, barriers, intermediate dtype, and
 merge implementation are not public unless they change documented numerical
 behavior.
 
+`MoePlannerRuntime` is an additive, process-local scheduling API for the SVE
+BF16 fused-SiLU path. Calibration is explicit through
+`calibrate_moe_planner_quick`; importing the package and the first operator call
+must never start calibration. `set_default_moe_planner_runtime(runtime)` makes
+the normal `fused_moe_bf16_tiled` entrypoint use a compatible Plan V2 and
+returns the previously installed runtime. Passing `None` restores the existing
+native dispatcher. Calls outside the runtime's calibrated CPU, expert-shape,
+backend, activation, or thread domain retain the existing dispatcher. The
+registry and planner cache are thread-safe; replacing a runtime does not cancel
+an invocation which already obtained the previous object. The initial runtime
+uses a bounded homogeneous-team strict-plan search; mixed-width and dynamic-tail
+search remain offline behavior and are not part of this initial public runtime
+contract.
+
+`enable_moe_planner_quick(...)` is the deployment convenience API. It runs the
+same explicit synchronous quick calibration, constructs a shape-bound runtime,
+and installs it only after both steps succeed. After it returns, compatible
+calls to the normal fused-MoE entrypoint require no additional planner API.
+
 Bitwise equality between different backends is not promised unless a test or
 operator document explicitly requires it. Tolerance changes need a numerical
 justification and an explicit contract update; they must not be relaxed only to

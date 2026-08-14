@@ -597,6 +597,41 @@ legacy service file captured before topology metadata was embedded; new probes
 write topology themselves. `--supported-widths` declares planner-legal widths
 independently of the denser service-probe width set.
 
+For deployment bootstrap, use the explicit quick-calibration function instead
+of running the full research probe. It samples only powers-of-two up to 16,
+per-domain half/full widths, and the full rank; planner-legal widths remain a
+separate set. The call is synchronous, has no import-time or first-request
+hook, restores the caller's affinity/Torch-thread/SVE-dispatch state, and
+refuses to overwrite an existing profile unless requested:
+
+```python
+from fused_cpp.moe import enable_moe_planner_quick
+
+runtime = enable_moe_planner_quick(
+    cpu_ids=range(96),
+    output="/var/cache/fused_cpp/moe-machine.json",
+    hidden_size=4096,
+    intermediate_size=512,
+    global_experts=256,
+    local_experts=256,
+    mode="tp",
+    degree=4,
+)
+```
+
+Call this during deployment or service setup. Compatible calls through the
+normal `fused_moe_bf16_tiled` entrypoint then use cached Plan V2 scheduling;
+passing `None` to `set_default_moe_planner_runtime` restores the existing
+dispatcher. The quick workflow deliberately omits isolated-operator residual
+training and records a larger uncertainty than the full calibration.
+
+The production runtime currently bounds cold planning to homogeneous team
+shapes. It ranks those shapes with analytical isolated expert times and LPT
+lane loads, emits a strict Plan V2, and caches the selected shape. It does not
+run mixed-width phase-DAG, temporal-order, or dynamic-tail candidate search on
+the request path. Use the full `PlannedMoE` search for offline analysis; native
+analytical scoring and production candidate expansion remain follow-up work.
+
 The effective fraction and three retention values should come from an
 independent packed-B repeated-scan probe. They must not be fitted from the
 contention table. A transferred prior is allowed for a portability holdout only

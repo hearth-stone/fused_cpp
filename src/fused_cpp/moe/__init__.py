@@ -40,6 +40,13 @@ from fused_cpp.moe.bf16_tiled import (
     prepare_bf16_tiled_fused_moe_weights,
 )
 from fused_cpp.moe.naive import fused_moe_naive, naive_fused_moe
+from fused_cpp.moe.planner_runtime import (
+    MoePlannerRuntime,
+    calibrate_moe_planner_quick,
+    enable_moe_planner_quick,
+    get_default_moe_planner_runtime,
+    set_default_moe_planner_runtime,
+)
 
 __all__ = [
     "AWQExpertWeights",
@@ -54,9 +61,12 @@ __all__ = [
     "ASYNC_MOE_STAGE_EXPERT",
     "AsyncMoEPlanV2",
     "FusedMoEImpl",
+    "MoePlannerRuntime",
     "PreparedBF16TiledFusedMoEWeights",
     "_HAS_BF16_TILED_FUSED_MOE",
     "available_fused_moe_bf16_tiled_backends",
+    "calibrate_moe_planner_quick",
+    "enable_moe_planner_quick",
     "awq_moe_expert_ffn_reference",
     "awq_moe_expert_ffn_w4a8",
     "dequant_awq_to_bf16",
@@ -67,6 +77,7 @@ __all__ = [
     "fused_moe_bf16_tiled_planned_staged",
     "fused_moe_bf16_tiled_vllm_staged",
     "fused_moe_naive",
+    "get_default_moe_planner_runtime",
     "bf16_tiled_fused_moe",
     "bf16_tiled_fused_moe_scheduled",
     "bf16_tiled_fused_moe_async",
@@ -76,5 +87,6 @@ __all__ = [
     "naive_fused_moe",
     "prepare_fused_moe_bf16_tiled_weights",
     "prepare_bf16_tiled_fused_moe_weights",
+    "set_default_moe_planner_runtime",
     "upgrade_legacy_async_plan",
 ]

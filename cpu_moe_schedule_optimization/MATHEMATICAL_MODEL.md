@@ -1,5 +1,14 @@
 # CPU MoE 调度数学模型
 
+> Runtime integration note (2026-08-14): machine calibration remains an
+> explicit deployment action. An installed `MoePlannerRuntime` binds one
+> analytical model and cached `PlannedMoE` to the calibration's ordered CPU
+> rank. The normal BF16 tiled entrypoint lowers compatible standalone/TP SVE
+> fused-SiLU calls to Plan V2; calls outside that domain preserve the original
+> dispatcher. The first production version uses a bounded homogeneous-team LPT
+> search described below; the full analytical candidate space remains available
+> offline. The serialized Plan V2 schema is unchanged.
+
 > 状态：调度问题定义的 source of truth。
 >
 > 最后更新：2026-08-12。
@@ -1980,6 +1989,33 @@ $C_{L2}=2$ MiB、$\nu=8$；默认 $f_{L1}=0.625,f_{L2}=0.5$，得到
 `M12/K728/N16` 的 `40,768 B` L1 工作集和 `M12/K18720/N16` 的
 `1,048,320 B` L2 诊断工作集。比例是探针保留空间的机器无关策略参数，容量本身
 必须来自硬件；CLI 可显式改变比例，但不能把某台机器的 KiB 数写入模型公式。
+
+部署用 quick calibration 不改变上述资源定义或公式，只减少采样密度与重复次数。
+service 线程点取 $\{1,2,4,8,16\}$ 中不超过 rank 核心数的点、每种 LLC 域的
+半宽/全宽和 rank 全宽；planner 合法宽度仍单独声明，不要求每个候选宽度都成为
+service 采样点。对同构 LLC 域只测一个代表域并按容量/核心数签名复用，异构域各补
+一个 LLC-only probe；DRAM 仍只测 rank 聚合。quick profile 不做 isolated operator
+residual fit，并将相对不确定性设为 20%，因此只用于 bootstrap，不替代 full
+calibration 的 held-out 精度验证。校准必须由部署代码显式调用，不在 import、模型
+构造或首请求中隐式执行。
+部署方可用 `enable_moe_planner_quick(...)` 一次完成同步轻校准、shape-bound runtime
+构造和进程注册；只有前两步全部成功才替换当前 runtime，返回后 normal MoE API 对
+兼容输入直接使用 Plan V2。
+
+上线 runtime 的第一版不在请求路径运行完整 phase-DAG 搜索。设 homogeneous team
+宽度为 $t$、lane 数为 $L=C/t$，解析模型给出 isolated expert 时间
+$p_i(t)=T_{iso}(M_i,t)$。对每个能整除 rank 核心数的合法 $t$，按 $M_i$ 降序将
+expert 分配给使当前 lane 累计时间最小的 lane，并用
+
+$$
+\hat T_{LPT}(t)=\max_{1\le l\le L}\sum_{i\in l}p_i(t)
+$$
+
+选择最小的 homogeneous shape。该路径只生成 strict Plan V2，不搜索 mixed-width、
+temporal reversal、tail pool 或 bounded tail repartition；目标是将首次未命中规划从
+秒级完整 Python phase simulation 限制到少量 $T_{iso}$ 与 LPT 操作。它是可解释的
+部署 bootstrap，不是完整模型的性能 oracle；完整 planner 仍用于离线比较和后续
+native analytical scorer 的验证。
 
 设某 stage 有 $P$ 个物理 M panel；第 $j$ 个顺序 N range 的 packed-B 字节为
 $B_j$、每个 owner 的 B 窗口为 $U_j$、active owner 数为 $t_j$；全部物理
@@ -5047,3 +5083,5 @@ leave-one-sampled-width-out（非独立复测）的采样密度诊断，LLC MAPE
 | 2026-08-12 | v1.16 | 增加与 production 解耦的第一版可证明 makespan 下界：通用层实现逐资源/critical-chain 的 `LB0` 和共享 fractional mode 的 mode-relaxed LP，并输出经整数 simplex 量化、`Fraction` 精确重算和定向舍入的 dual/primal certificate；优先使用 GLOP，缺少可选依赖时回退 entropic mirror ascent。SVE adapter 将当前 exact-M W13/W2 mapper 降为 BFMMLA、key instruction、L1 load、epilogue、core-time 和可选 compulsory-DRAM 需求；core-time 由 aggregate work/per-core ceiling 推导，不假设不均衡 N lane 等时结束。第一版省略 window replay、gather/merge、NUMA 与 contention，只提供安全但偏松的 GEMM-only 下界，不改变 production 候选、剪枝、cost model 或 runtime。|
 | 2026-08-12 | v1.17 | 闭合四类 DSV4 尾部候选：完整 `1/2/4/8T` cohort 重组、非阻塞 `2/4T` 重组、短任务队列重排、cost-model suffix DAG 和实际完成时 residual-M 均为中性或负收益，相关 runtime/schema/API/planner 实现全部删除。唯一稳定为正的是手工 E218/core40 静态 residual-M route slice，五次复测提升 `0.48%--1.20%`（均值约 `0.93%`），但其他 terminal target 为 `-0.19%--+0.05%`，且未过 2% production gate；仅保留复用现有 Plan V2 的 Lab benchmark comparator，不改变默认 planner、cost model、cache identity 或 production runtime。|
 | 2026-08-13 | v1.18 | analytical machine schema 升到 v2、model schema 升到 v7：从 Linux `shared_cpu_list` 显式记录 rank CPU 与 LLC 域分区/容量/域内 refill curve；LLC/DRAM 服务改为 isotonic 去噪后的实测点分段插值。给定 placement 时 LLC 按活跃域服务求和并受 rank 饱和值限制，容量只汇总活跃域；DRAM 保持 NUMA-rank 共享。旧 schema-v1 calibration 可读，未携带 placement 的 planner DAG 继续走 rank 聚合兼容路径，因此本变更不扩大 shape/width/window/ordering 搜索，也不宣称 production placement 已闭合。|
+| 2026-08-14 | v1.19 | 增加显式 `calibrate_moe_planner_quick()` 部署校准：复用 schema-v2 的相同 service 定义和 builder，仅采 powers-of-two 到 16、LLC 域半宽/全宽与 rank 全宽，并降低 warmup/run；同构域复用代表性 LLC probe，异构域补 LLC-only probe。函数恢复调用者 affinity、Torch 线程数和 SVE dispatch 环境，原子输出并默认拒绝覆盖；不在 import/首请求运行，不做 operator residual fit，不改变 planner 候选、公式或默认 dispatch。|
+| 2026-08-14 | v1.20 | 将显式 quick calibration 与 analytical planner 纳入可安装 Python 包，并增加线程安全的进程级 `MoePlannerRuntime` 注册。只有调用方显式安装且调用属于同一 ordered CPU rank、standalone/TP、SVE BF16 fused-SiLU、完整本地 expert 域时，normal `fused_moe_bf16_tiled` 才降低为现有 Plan V2；清空 runtime 或任何兼容性不匹配均保持旧 dispatcher。生产 runtime 首版用 analytical `T_iso` 对 homogeneous team 做 bounded LPT 搜索，只生成 strict Plan V2；完整 mixed-shape/phase-DAG/tail 搜索仍保留为离线 planner。Plan V2 schema 不变，native analytical scoring、性能精调及 EP 分片支持后续完成。|

@@ -109,6 +109,12 @@ class _DeterministicTailPoolModel:
         return threads
 
 
+class _QuickPlannerModel(_DeterministicTailPoolModel):
+    def dag_makespan(self, tasks) -> float:
+        del tasks
+        raise AssertionError("quick planner must not run the event-time simulator")
+
+
 class _DeterministicStageModel(_DeterministicTailPoolModel):
     call_setup_ns = 3.0
 
@@ -214,6 +220,42 @@ class _TemporalOrderingModel(_DeterministicTailPoolModel):
                     active.add(task_id)
         assert all(completed)
         return elapsed
+
+
+def test_quick_planner_uses_bounded_homogeneous_lpt_search() -> None:
+    planner = IntervalPlanner(
+        _QuickPlannerModel(),
+        num_cores=4,
+        native_cold_planner=False,
+    )
+
+    large = planner.plan_quick([(0, 100), (1, 100)])
+    short = planner.plan_quick([(expert, 1) for expert in range(8)])
+
+    assert large["shape"] == (4,)
+    assert large["makespan_ns"] == 200.0
+    assert short["shape"] == (1, 1, 1, 1)
+    assert short["makespan_ns"] == 20.0
+    assert large["planner_backend"] == "python_quick"
+    assert large["dynamic_candidates"] == 0
+
+
+def test_planned_moe_quick_search_caches_selected_shape() -> None:
+    planner = PlannedMoE(_QuickPlannerModel(), num_cores=4, search_mode="quick")
+
+    first = planner.plan_spec_for([(0, 100), (1, 100)])
+    assert first["shape"] == (4,)
+    assert planner.last["planner_backend"] == "python_quick"
+    assert not planner.last["cache_hit"]
+
+    second = planner.plan_spec_for([(0, 100), (1, 100)])
+    assert second["shape"] == (4,)
+    assert planner.last["cache_hit"]
+
+
+def test_planned_moe_rejects_unknown_search_mode() -> None:
+    with pytest.raises(ValueError, match="search_mode"):
+        PlannedMoE(_QuickPlannerModel(), num_cores=4, search_mode="unknown")
 
 
 def _expert_ids_by_core(tasks) -> dict[int, tuple[int, ...]]:
