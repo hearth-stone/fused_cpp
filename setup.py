@@ -1,5 +1,6 @@
 """Build script for fused_cpp C++ extension."""
 
+import ctypes
 import glob
 import os
 import platform
@@ -9,15 +10,72 @@ from setuptools import setup
 from torch.utils.cpp_extension import BuildExtension, CppExtension
 
 
-def _sve_vector_bits_for_build() -> int:
-    raw = os.environ.get("FUSED_CPP_SVE_VECTOR_BITS", "128").strip()
+_SUPPORTED_FIXED_SVE_VECTOR_BITS = (128, 256, 512, 1024, 2048)
+
+
+def _detect_max_sve_vector_bits_for_build(prctl=None) -> int:
+    """Return the largest SVE VL supported by the running Linux host.
+
+    Linux exposes the supported range by rounding ``PR_SVE_SET_VL`` down to
+    the largest available vector length. Restore the build thread's original
+    configuration before returning so probing does not affect setuptools or
+    compiler subprocesses.
+    """
+    pr_sve_set_vl = 50
+    pr_sve_get_vl = 51
+    pr_sve_vl_len_mask = 0xFFFF
+    max_sve_vector_bytes = max(_SUPPORTED_FIXED_SVE_VECTOR_BITS) // 8
+
+    if prctl is None:
+        libc = ctypes.CDLL(None, use_errno=True)
+        prctl = libc.prctl
+        prctl.restype = ctypes.c_int
+
+    original_config = prctl(pr_sve_get_vl, 0, 0, 0, 0)
+    if original_config < 0:
+        error = ctypes.get_errno()
+        raise RuntimeError(
+            "failed to query SVE vector length with PR_SVE_GET_VL "
+            f"({os.strerror(error)}); set FUSED_CPP_SVE_VECTOR_BITS explicitly"
+        )
+
+    selected_config = prctl(pr_sve_set_vl, max_sve_vector_bytes, 0, 0, 0)
+    if selected_config < 0:
+        error = ctypes.get_errno()
+        raise RuntimeError(
+            "failed to probe the maximum SVE vector length with PR_SVE_SET_VL "
+            f"({os.strerror(error)}); set FUSED_CPP_SVE_VECTOR_BITS explicitly"
+        )
+
+    restore_result = prctl(pr_sve_set_vl, original_config, 0, 0, 0)
+    if restore_result < 0:
+        error = ctypes.get_errno()
+        raise RuntimeError(f"failed to restore the build thread's SVE vector length ({os.strerror(error)})")
+
+    bits = (selected_config & pr_sve_vl_len_mask) * 8
+    if bits not in _SUPPORTED_FIXED_SVE_VECTOR_BITS:
+        raise RuntimeError(
+            f"detected maximum SVE vector length {bits}, but fixed-length builds support only "
+            f"{_SUPPORTED_FIXED_SVE_VECTOR_BITS}; set FUSED_CPP_SVE_VECTOR_BITS explicitly"
+        )
+    return bits
+
+
+def _sve_vector_bits_for_build(detect_host_max: bool = True) -> int:
+    raw = os.environ.get("FUSED_CPP_SVE_VECTOR_BITS")
+    if raw is None:
+        if not detect_host_max:
+            return 128
+        bits = _detect_max_sve_vector_bits_for_build()
+        print(f"Detected maximum host SVE vector length: {bits} bits")
+        return bits
+    raw = raw.strip()
     try:
         bits = int(raw)
     except ValueError as exc:
         raise RuntimeError(f"FUSED_CPP_SVE_VECTOR_BITS must be an integer, got {raw!r}") from exc
-    supported = (128, 256, 512, 1024, 2048)
-    if bits not in supported:
-        raise RuntimeError(f"FUSED_CPP_SVE_VECTOR_BITS must be one of {supported}")
+    if bits not in _SUPPORTED_FIXED_SVE_VECTOR_BITS:
+        raise RuntimeError(f"FUSED_CPP_SVE_VECTOR_BITS must be one of {_SUPPORTED_FIXED_SVE_VECTOR_BITS}")
     return bits
 
 
@@ -532,7 +590,7 @@ if is_aarch64:
         "sve" in target_cpu.lower() if target_cpu else platform.system() != "Darwin" and _host_cpu_has_flag("sve")
     )
     if platform.system() == "Linux":
-        sve_vector_bits = _sve_vector_bits_for_build()
+        sve_vector_bits = _sve_vector_bits_for_build(detect_host_max=target_has_sve)
         moe_define_macros.append(("FUSED_CPP_MOE_HAS_ARM_SVE", "1"))
         moe_define_macros.append(("FUSED_CPP_MOE_SVE_VECTOR_BITS", str(sve_vector_bits)))
         sve_args = [

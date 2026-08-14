@@ -59,7 +59,7 @@ entries:
     implementation:
       - setup.py
     purpose: Select supported compiler targets, optional dependencies, and release behavior.
-    default: Host-derived target, OpenMP when found, KleidiAI disabled, SVE VL 128.
+    default: Host-derived target, OpenMP when found, KleidiAI disabled, maximum host-supported SVE VL on SVE-capable Linux AArch64 hosts (128-bit build fallback without host SVE).
 
   - id: build.instrumentation
     names:

@@ -94,11 +94,17 @@ still disables the entire SVE backend and selects the NEON implementation.
 Backend IDs in packed metadata remain stable: `0` is `arm_neon_bf16` and `1`
 is `arm_sve_bf16`. Packed weights are backend-specific. SVE packed weights are
 also vector-length-specific. The SVE vector length is fixed at build time by
-`FUSED_CPP_SVE_VECTOR_BITS` (default `128`) and passed to the compiler through
-`-msve-vector-bits`. The Xbyak kernels use that compile-time constant rather
-than emitting `CNTB`. Importing `fused_cpp._moe_C` queries the importing
-thread's actual VL with `PR_SVE_GET_VL` and fails immediately when it differs
-from the build. Do not change the process or worker-thread VL after import.
+`FUSED_CPP_SVE_VECTOR_BITS` and passed to the compiler through
+`-msve-vector-bits`. When the variable is unset, Linux AArch64 builds probe the
+largest VL supported by the host with `PR_SVE_SET_VL`, then restore the build
+thread's original VL. Linux AArch64 hosts without SVE retain the 128-bit build
+fallback for the runtime-disabled backend. An explicit value overrides probing.
+Cross-compiling an SVE target on a host that cannot execute the probe therefore
+requires an explicit value. The Xbyak kernels use that compile-time constant
+rather than emitting `CNTB`. Importing
+`fused_cpp._moe_C` queries the importing thread's actual VL with
+`PR_SVE_GET_VL` and fails immediately when it differs from the build. Do not
+change the process or worker-thread VL after import.
 
 ## Async Plan V2
 
