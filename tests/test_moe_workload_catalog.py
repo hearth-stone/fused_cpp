@@ -22,8 +22,16 @@ from bench_vllm_staged_schedule import (  # noqa: E402
     parse_large_medium_stream_partition,
     parse_large_small_partition,
 )
-from capture_schedule_timeline import plan_to_bridge  # noqa: E402
+from capture_schedule_timeline import (  # noqa: E402
+    DEFAULT_PROFILE,
+    ContentionCostModel,
+    make_residual_m_split_plan,
+    materialized_plan_tasks,
+    parse_residual_m_split,
+    plan_to_bridge,
+)
 from fused_cpp.moe import AsyncMoEPlanV2  # noqa: E402
+from fused_cpp.moe.plan import upgrade_legacy_async_plan  # noqa: E402
 from workload_catalog import (  # noqa: E402
     PAPER_ACTIVE_SET_SIZES,
     PAPER_NUM_EXPERTS,
@@ -59,6 +67,68 @@ def test_paper_workloads_are_valid_global_topk_histograms() -> None:
         mean = sum(active) / len(active)
         population_std = math.sqrt(sum((routes - mean) ** 2 for routes in active) / len(active))
         assert workload.observed_routes_std == population_std
+
+
+def _terminal_residual_split_base_plan() -> AsyncMoEPlanV2:
+    bridge = upgrade_legacy_async_plan(
+        {
+            "num_threads": 4,
+            "thread_cpu_ids": [0, 1, 2, 3],
+            "task_expert_ids": [0, 1, 2, 3],
+            "task_core_begins": [0, 2, 0, 2],
+            "task_threads": [2, 2, 2, 2],
+            "task_dep_offsets": [0, 0, 0, 1, 2],
+            "task_deps": [0, 1],
+        }
+    )
+    bridge["task_w13_window_tiles"] = [3, 4, 5, 6]
+    bridge["task_w2_window_tiles"] = [7, 8, 9, 10]
+    return AsyncMoEPlanV2.from_dict(bridge)
+
+
+def test_residual_m_split_plan_covers_odd_route_tail_on_two_terminal_lanes() -> None:
+    histogram = [24, 24, 25, 24]
+    model = ContentionCostModel(DEFAULT_PROFILE)
+    base_plan = _terminal_residual_split_base_plan()
+
+    split_plan = make_residual_m_split_plan(
+        base_plan,
+        histogram,
+        target_expert=2,
+        donor_core=2,
+        model=model,
+    )
+    tasks = materialized_plan_tasks(split_plan, histogram, model)
+    target_tasks = [task for task in tasks if task["expert"] == 2]
+
+    assert [task["routes"] for task in target_tasks] == [13, 12]
+    assert [task["route_begin"] for task in target_tasks] == [0, 13]
+    assert [task["core_begin"] for task in target_tasks] == [0, 2]
+    assert [task["range_granularity"] for task in target_tasks] == [13, 13]
+    assert target_tasks[0]["dependencies"] == [0]
+    assert target_tasks[1]["dependencies"] == [2]
+    assert sum(task["routes"] for task in target_tasks) == histogram[2]
+    assert split_plan.task_w13_window_tiles.tolist()[-2:] == [5, 5]
+    assert split_plan.task_w2_window_tiles.tolist()[-2:] == [9, 9]
+
+
+@pytest.mark.parametrize("value", ("2", "2:3:4", "-1:2", "2:-1"))
+def test_parse_residual_m_split_rejects_invalid_values(value: str) -> None:
+    with pytest.raises(ValueError, match="residual-M|EXPERT:DONOR_CORE"):
+        parse_residual_m_split(value)
+
+
+def test_residual_m_split_plan_rejects_nonterminal_target() -> None:
+    model = ContentionCostModel(DEFAULT_PROFILE)
+
+    with pytest.raises(ValueError, match="must be terminal"):
+        make_residual_m_split_plan(
+            _terminal_residual_split_base_plan(),
+            [24, 24, 25, 24],
+            target_expert=0,
+            donor_core=2,
+            model=model,
+        )
 
 
 def test_uniform_and_active_set_sweep_hold_total_routes_constant() -> None:

@@ -118,6 +118,19 @@ def parse_args() -> argparse.Namespace:
         help="capture a 6x16T-to-2xWT static tail plan instead of the strict baseline",
     )
     parser.add_argument(
+        "--residual-m-split",
+        metavar="EXPERT:DONOR_CORE",
+        help=(
+            "split one terminal expert into two equal-granularity route tasks; "
+            "the second slice runs on DONOR_CORE after that lane's terminal task"
+        ),
+    )
+    parser.add_argument(
+        "--compare-residual-m-split",
+        action="store_true",
+        help="interleave the residual-M suffix plan with its unsplit base plan",
+    )
+    parser.add_argument(
         "--strict-tail-steal",
         action="store_true",
         help="enable same-width, same-NUMA strict tail task stealing for the captured run",
@@ -147,6 +160,139 @@ def parse_shape(value: str | None) -> tuple[int, ...] | None:
     if not shape or any(width <= 0 for width in shape):
         raise ValueError(f"invalid forced shape: {value!r}")
     return shape
+
+
+def parse_residual_m_split(value: str) -> tuple[int, int]:
+    fields = value.split(":")
+    if len(fields) != 2:
+        raise ValueError("--residual-m-split must be EXPERT:DONOR_CORE")
+    expert, donor_core = (int(field) for field in fields)
+    if expert < 0 or donor_core < 0:
+        raise ValueError("residual-M expert and donor core must be non-negative")
+    return expert, donor_core
+
+
+def make_residual_m_split_plan(
+    base_plan: AsyncMoEPlanV2,
+    histogram: list[int] | tuple[int, ...],
+    *,
+    target_expert: int,
+    donor_core: int,
+    model: ContentionCostModel,
+) -> AsyncMoEPlanV2:
+    """Split one terminal expert across its owner and one released peer lane."""
+    if base_plan.execution_mode != "strict":
+        raise ValueError("residual-M splitting requires a strict base plan")
+    if any(int(value) != 0 for value in base_plan.task_range_granularities.tolist()):
+        raise ValueError("residual-M splitting requires an unsliced base plan")
+    task_count = int(base_plan.task_expert_ids.numel())
+    offsets = base_plan.task_dep_offsets.tolist()
+    flat_dependencies = base_plan.task_deps.tolist()
+    old_tasks: list[tuple[int, int, int, int, list[int]]] = []
+    for task in range(task_count):
+        expert = int(base_plan.task_expert_ids[task])
+        if expert >= len(histogram):
+            raise ValueError(f"task expert {expert} is outside a {len(histogram)}-expert histogram")
+        old_tasks.append(
+            (
+                expert,
+                int(histogram[expert]),
+                int(base_plan.task_core_begins[task]),
+                int(base_plan.task_threads[task]),
+                [int(dep) for dep in flat_dependencies[offsets[task] : offsets[task + 1]]],
+            )
+        )
+    successors = [[] for _ in old_tasks]
+    for task, (_, _, _, _, dependencies) in enumerate(old_tasks):
+        for dependency in dependencies:
+            successors[dependency].append(task)
+
+    targets = [task for task, values in enumerate(old_tasks) if values[0] == target_expert]
+    if len(targets) != 1:
+        raise ValueError(f"target expert {target_expert} must have exactly one task, got {targets}")
+    target = targets[0]
+    expert, routes, target_core, width, target_dependencies = old_tasks[target]
+    if successors[target]:
+        raise ValueError(f"target expert {expert} must be terminal in its lane")
+    if routes < 24:
+        raise ValueError(f"residual-M target requires at least 24 routes, got {routes}")
+    if donor_core == target_core:
+        raise ValueError("residual-M donor must differ from the target lane")
+    donor_tasks = [
+        task
+        for task, (_, _, core_begin, threads, _) in enumerate(old_tasks)
+        if core_begin == donor_core and threads == width
+    ]
+    donor_terminals = [task for task in donor_tasks if not successors[task]]
+    if len(donor_terminals) != 1:
+        raise ValueError(
+            f"donor lane {donor_core} must have one terminal {width}T task, got {donor_terminals}"
+        )
+    donor = donor_terminals[0]
+
+    # Repeated Plan V2 tasks are materialized in task-id order. Use one
+    # granularity for both slices; the second may contain one fewer row.
+    granularity = (routes + 1) // 2
+    tasks: list[tuple[int, int, int, int, list[int]]] = []
+    old_to_new: dict[int, int] = {}
+    for old_task, values in enumerate(old_tasks):
+        if old_task == target:
+            continue
+        old_to_new[old_task] = len(tasks)
+        tasks.append((values[0], values[1], values[2], values[3], []))
+    for old_task, values in enumerate(old_tasks):
+        if old_task == target:
+            continue
+        new_task = old_to_new[old_task]
+        tasks[new_task] = (
+            values[0],
+            values[1],
+            values[2],
+            values[3],
+            [old_to_new[dependency] for dependency in values[4]],
+        )
+    tasks.append(
+        (
+            expert,
+            granularity,
+            target_core,
+            width,
+            [old_to_new[dependency] for dependency in target_dependencies],
+        )
+    )
+    tasks.append((expert, granularity, donor_core, width, [old_to_new[donor]]))
+
+    from interval_planner import IntervalPlanner
+
+    lane_intervals = sorted({(core, threads) for _, _, core, threads, _ in old_tasks})
+    expected_core = 0
+    lane_shape: list[int] = []
+    for core, threads in lane_intervals:
+        if core != expected_core:
+            raise ValueError("residual-M base plan must use a non-overlapping full-core lane partition")
+        lane_shape.append(threads)
+        expected_core += threads
+    if expected_core != base_plan.num_threads:
+        raise ValueError("residual-M base plan lanes must cover every logical core")
+
+    planner = IntervalPlanner(
+        model,
+        base_plan.num_threads,
+        widths=sorted(set(lane_shape)),
+        cpu_ids=[int(cpu) for cpu in base_plan.thread_cpu_ids.tolist()],
+        shapes=[lane_shape],
+        tail_repartition_widths=(),
+    )
+    bridge = planner.to_async_bridge(tasks)
+    for field in ("task_w13_window_tiles", "task_w2_window_tiles"):
+        base_windows = getattr(base_plan, field)
+        assert base_windows is not None
+        bridge[field] = [
+            int(base_windows[old_task])
+            for old_task in range(task_count)
+            if old_task != target
+        ] + [int(base_windows[target]), int(base_windows[target])]
+    return replace(AsyncMoEPlanV2.from_dict(bridge), early_merge=base_plan.early_merge)
 
 
 def resolve_output_paths(args: argparse.Namespace) -> None:
@@ -620,9 +766,23 @@ def build_plan(args: argparse.Namespace) -> tuple[dict[str, Any], ContentionCost
         seed=args.seed,
     )
     spec, planner = build_plan_spec(args, model, workload, cpu_ids, topk_ids)
-    bridge = spec["bridge"]
-    plan = override_early_merge(AsyncMoEPlanV2.from_dict(bridge), args.early_merge)
     bound_model = planner.interval_planners[0].model
+    plan = AsyncMoEPlanV2.from_dict(spec["bridge"])
+    residual_m_split = None
+    if args.residual_m_split is not None:
+        target_expert, donor_core = parse_residual_m_split(args.residual_m_split)
+        plan = make_residual_m_split_plan(
+            plan,
+            workload.histogram,
+            target_expert=target_expert,
+            donor_core=donor_core,
+            model=bound_model,
+        )
+        residual_m_split = {
+            "target_expert": target_expert,
+            "donor_core": donor_core,
+        }
+    plan = override_early_merge(plan, args.early_merge)
     tasks = materialized_plan_tasks(plan, workload.histogram, bound_model)
     predicted_cores: dict[str, list[dict[str, Any]]] = {str(core): [] for core in range(args.threads)}
     if spec["execution_mode"] == "strict":
@@ -729,6 +889,7 @@ def build_plan(args: argparse.Namespace) -> tuple[dict[str, Any], ContentionCost
             "tail_pool_tasks": int(spec["tail_pool_tasks"]),
             "early_merge": plan.early_merge,
             "strict_tail_steal": bool(args.strict_tail_steal),
+            "residual_m_split": residual_m_split,
             "large_small_partition": spec.get("large_small_partition"),
             "large_medium_stream_partition": spec.get("large_medium_stream_partition"),
             "tasks": tasks,
@@ -776,8 +937,7 @@ def capture_actual(
         payload["case"]["cpu_ids"],
         topk_ids,
     )
-    plan_payload = plan_payload["bridge"]
-    plan = AsyncMoEPlanV2.from_dict(plan_payload)
+    plan = AsyncMoEPlanV2.from_dict(plan_payload["bridge"])
     if args.static_tail_width is not None:
         plan = make_static_tail_repartition_plan(
             plan,
@@ -789,6 +949,17 @@ def capture_actual(
         payload["plan"]["static_tail_width"] = args.static_tail_width
         payload["plan"]["shape"] = [16, 16, 16, 16, 16, 16, args.static_tail_width, args.static_tail_width]
     plan = override_early_merge(plan, args.early_merge)
+    unsplit_plan = plan
+    if args.residual_m_split is not None:
+        target_expert, donor_core = parse_residual_m_split(args.residual_m_split)
+        plan = make_residual_m_split_plan(
+            plan,
+            workload.histogram,
+            target_expert=target_expert,
+            donor_core=donor_core,
+            model=model,
+        )
+        payload["plan"]["tasks"] = materialized_plan_tasks(plan, workload.histogram, model)
     payload["plan"]["early_merge"] = plan.early_merge
     bridge = payload["plan"]["tasks"]
     policy = ContentionCostModel(args.profile).policy
@@ -830,19 +1001,57 @@ def capture_actual(
     del w13, w2
     output = torch.empty_like(hidden)
 
-    def run() -> torch.Tensor:
+    def run(selected_plan: AsyncMoEPlanV2 = plan) -> torch.Tensor:
         return fused_moe_bf16_tiled_async_plan(
             hidden,
             packed,
             topk_weights,
             topk_ids,
-            plan,
+            selected_plan,
             global_num_experts=workload.num_experts,
             out=output,
         )
 
-    comparison: dict[str, Any] | None = None
-    if args.compare_strict_tail_steal:
+    residual_m_split_comparison: dict[str, Any] | None = None
+    strict_tail_steal_comparison: dict[str, Any] | None = None
+    if args.compare_residual_m_split:
+        unsplit_output = run(unsplit_plan).clone()
+        split_output = run(plan).clone()
+        torch.testing.assert_close(split_output, unsplit_output, rtol=0.0, atol=0.0)
+        comparison_samples = {"unsplit": [], "residual_m_split": []}
+        for iteration in range(args.warmup):
+            order = (
+                (("unsplit", unsplit_plan), ("residual_m_split", plan))
+                if iteration % 2 == 0
+                else (("residual_m_split", plan), ("unsplit", unsplit_plan))
+            )
+            for _, selected_plan in order:
+                run(selected_plan)
+        for iteration in range(args.runs):
+            order = (
+                (("unsplit", unsplit_plan), ("residual_m_split", plan))
+                if iteration % 2 == 0
+                else (("residual_m_split", plan), ("unsplit", unsplit_plan))
+            )
+            for name, selected_plan in order:
+                begin = time.perf_counter_ns()
+                run(selected_plan)
+                comparison_samples[name].append((time.perf_counter_ns() - begin) / 1.0e6)
+        residual_m_split_comparison = {
+            name: {
+                "samples_ms": samples,
+                "median_ms": statistics.median(samples),
+            }
+            for name, samples in comparison_samples.items()
+        }
+        unsplit_median = residual_m_split_comparison["unsplit"]["median_ms"]
+        split_median = residual_m_split_comparison["residual_m_split"]["median_ms"]
+        residual_m_split_comparison["speedup_pct"] = 100.0 * (
+            unsplit_median / split_median - 1.0
+        )
+        residual_m_split_comparison["bit_exact"] = True
+        untraced_samples_ms = comparison_samples["residual_m_split"]
+    elif args.compare_strict_tail_steal:
         comparison_samples = {"strict": [], "strict_tail_steal": []}
         for iteration in range(args.warmup):
             for enabled in ((False, True) if iteration % 2 == 0 else (True, False)):
@@ -855,16 +1064,18 @@ def capture_actual(
                 run()
                 name = "strict_tail_steal" if enabled else "strict"
                 comparison_samples[name].append((time.perf_counter_ns() - begin) / 1.0e6)
-        comparison = {
+        strict_tail_steal_comparison = {
             name: {
                 "samples_ms": samples,
                 "median_ms": statistics.median(samples),
             }
             for name, samples in comparison_samples.items()
         }
-        strict_median = comparison["strict"]["median_ms"]
-        steal_median = comparison["strict_tail_steal"]["median_ms"]
-        comparison["speedup_pct"] = 100.0 * (strict_median / steal_median - 1.0)
+        strict_median = strict_tail_steal_comparison["strict"]["median_ms"]
+        steal_median = strict_tail_steal_comparison["strict_tail_steal"]["median_ms"]
+        strict_tail_steal_comparison["speedup_pct"] = 100.0 * (
+            strict_median / steal_median - 1.0
+        )
         selected_name = "strict_tail_steal" if args.strict_tail_steal else "strict"
         untraced_samples_ms = comparison_samples[selected_name]
     else:
@@ -924,7 +1135,8 @@ def capture_actual(
         "trace_file": str(args.trace_file),
         "early_merge": plan.early_merge,
         "strict_tail_steal": args.strict_tail_steal,
-        "strict_tail_steal_comparison": comparison,
+        "strict_tail_steal_comparison": strict_tail_steal_comparison,
+        "residual_m_split_comparison": residual_m_split_comparison,
     }
 
 
@@ -935,6 +1147,16 @@ def main() -> int:
         raise ValueError("--warmup must be non-negative and --runs must be positive")
     if args.gflops_color_max <= 0:
         raise ValueError("--gflops-color-max must be positive")
+    if args.compare_residual_m_split and args.residual_m_split is None:
+        raise ValueError("--compare-residual-m-split requires --residual-m-split")
+    if args.compare_residual_m_split and args.plan_only:
+        raise ValueError("--compare-residual-m-split requires an actual capture")
+    if args.residual_m_split is not None:
+        parse_residual_m_split(args.residual_m_split)
+        if args.static_tail_width is not None:
+            raise ValueError("residual-M splitting cannot be combined with a static-tail plan")
+        if args.strict_tail_steal or args.compare_strict_tail_steal:
+            raise ValueError("residual-M splitting cannot be combined with strict tail stealing")
     partition_options = (
         args.large_small_partition,
         args.large_medium_stream_partition,
@@ -975,6 +1197,9 @@ def main() -> int:
                 "tail_idle_core_ms": (actual["idle_metrics"]["tail_idle_core_ms"] if actual is not None else None),
                 "strict_tail_steal_comparison": (
                     actual["strict_tail_steal_comparison"] if actual is not None else None
+                ),
+                "residual_m_split_comparison": (
+                    actual["residual_m_split_comparison"] if actual is not None else None
                 ),
             },
             indent=2,
