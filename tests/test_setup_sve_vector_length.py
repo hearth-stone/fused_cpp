@@ -14,6 +14,7 @@ def _load_setup_sve_helpers() -> dict[str, object]:
     setup_path = Path(__file__).resolve().parents[1] / "setup.py"
     tree = ast.parse(setup_path.read_text(encoding="utf-8"), filename=str(setup_path))
     selected_names = {
+        "_cxx17_compile_flag",
         "_SUPPORTED_FIXED_SVE_VECTOR_BITS",
         "_detect_max_sve_vector_bits_for_build",
         "_sve_vector_bits_for_build",
@@ -27,14 +28,27 @@ def _load_setup_sve_helpers() -> dict[str, object]:
             if names & selected_names:
                 selected_nodes.append(node)
     module = ast.Module(body=selected_nodes, type_ignores=[])
-    namespace: dict[str, object] = {"ctypes": __import__("ctypes"), "os": os}
+    namespace: dict[str, object] = {
+        "ctypes": __import__("ctypes"),
+        "os": os,
+        "platform": __import__("platform"),
+    }
     exec(compile(module, str(setup_path), "exec"), namespace)
     return namespace
 
 
 _HELPERS = _load_setup_sve_helpers()
+_CXX17_FLAG = _HELPERS["_cxx17_compile_flag"]
 _DETECT_MAX = _HELPERS["_detect_max_sve_vector_bits_for_build"]
 _SELECT_FOR_BUILD = _HELPERS["_sve_vector_bits_for_build"]
+
+
+@pytest.mark.parametrize(
+    ("system", "expected"),
+    [("Linux", "-std=c++17"), ("Darwin", "-std=c++17"), ("Windows", "/std:c++17")],
+)
+def test_cxx17_compile_flag_matches_compiler_family(system: str, expected: str) -> None:
+    assert _CXX17_FLAG(system) == expected
 
 
 def test_detect_max_sve_vector_bits_restores_original_configuration() -> None:

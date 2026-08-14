@@ -1,7 +1,6 @@
 #include <algorithm>
 #include <arm_sve.h>
 #include <array>
-#include <barrier>
 #include <chrono>
 #include <csignal>
 #include <cmath>
@@ -19,6 +18,8 @@
 #include <string_view>
 #include <thread>
 #include <vector>
+
+#include "../cxx17_compat.h"
 
 #include <pthread.h>
 #include <sched.h>
@@ -686,11 +687,15 @@ void RunShapeWave(const Shape& shape, const Options& options, const std::vector<
   std::vector<uint64_t> a_checksums(workers, 0);
   Clock::time_point wave_start;
   size_t completed = 0;
-  std::barrier start_barrier(options.workers, [&]() noexcept { wave_start = Clock::now(); });
-  std::barrier finish_barrier(options.workers, [&]() noexcept {
+  const auto start_completion = [&]() noexcept { wave_start = Clock::now(); };
+  const auto finish_completion = [&]() noexcept {
     wave_seconds[completed++] = std::chrono::duration<double>(Clock::now() - wave_start).count();
-  });
-  std::barrier launch_barrier(options.workers + 1);
+  };
+  fused_moe_sve::support::PhaseBarrier<decltype(start_completion)> start_barrier(
+      options.workers, start_completion);
+  fused_moe_sve::support::PhaseBarrier<decltype(finish_completion)> finish_barrier(
+      options.workers, finish_completion);
+  fused_moe_sve::support::PhaseBarrier<> launch_barrier(options.workers + 1);
   bool abort_workers = false;
   int affinity_error = 0;
   std::vector<std::thread> threads;

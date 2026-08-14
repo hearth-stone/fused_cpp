@@ -3,8 +3,6 @@
 #include <algorithm>
 #include <arm_sve.h>
 #include <atomic>
-#include <barrier>
-#include <bit>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -27,6 +25,7 @@
 #include <sched.h>
 
 #include "gemm_params.h"
+#include "../cxx17_compat.h"
 
 #if !defined(__aarch64__) || !defined(__ARM_FEATURE_SVE) || !defined(__ARM_FEATURE_BF16)
 #error "unfused_pipeline requires AArch64 SVE BF16"
@@ -107,12 +106,12 @@ class AlignedBuffer {
 };
 
 uint16_t float_to_bf16(float value) {
-  uint32_t bits = std::bit_cast<uint32_t>(value);
+  uint32_t bits = support::BitCast<uint32_t>(value);
   bits += 0x7fffu + ((bits >> 16) & 1u);
   return static_cast<uint16_t>(bits >> 16);
 }
 
-float bf16_to_float(uint16_t value) { return std::bit_cast<float>(static_cast<uint32_t>(value) << 16); }
+float bf16_to_float(uint16_t value) { return support::BitCast<float>(static_cast<uint32_t>(value) << 16); }
 
 uint32_t mix32(uint32_t value) {
   value ^= value >> 16;
@@ -547,7 +546,7 @@ struct TimingCompletion {
   void operator()() noexcept { (*boundaries)[(*phase)++] = Clock::now(); }
 };
 
-using TeamBarrier = std::barrier<TimingCompletion>;
+using TeamBarrier = support::PhaseBarrier<TimingCompletion>;
 
 struct ClockCompletion {
   Clock::time_point* timestamp = nullptr;
@@ -555,7 +554,7 @@ struct ClockCompletion {
   void operator()() noexcept { *timestamp = Clock::now(); }
 };
 
-using ClockBarrier = std::barrier<ClockCompletion>;
+using ClockBarrier = support::PhaseBarrier<ClockCompletion>;
 
 }  // namespace
 
@@ -792,7 +791,7 @@ class FragmentedExperiment::Impl {
     std::vector<size_t> phases(static_cast<size_t>(config_.teams), 0);
     std::vector<size_t> team_task_counts(static_cast<size_t>(config_.teams), 0);
     std::vector<std::unique_ptr<TeamBarrier>> team_barriers;
-    std::vector<std::unique_ptr<std::barrier<>>> claim_barriers;
+    std::vector<std::unique_ptr<support::PhaseBarrier<>>> claim_barriers;
     boundaries.reserve(static_cast<size_t>(config_.teams));
     team_barriers.reserve(static_cast<size_t>(config_.teams));
     claim_barriers.reserve(static_cast<size_t>(config_.teams));
@@ -803,7 +802,7 @@ class FragmentedExperiment::Impl {
       team_barriers.push_back(std::make_unique<TeamBarrier>(
           config_.threads_per_team,
           TimingCompletion{&boundaries[static_cast<size_t>(team)], &phases[static_cast<size_t>(team)]}));
-      claim_barriers.push_back(std::make_unique<std::barrier<>>(config_.threads_per_team));
+      claim_barriers.push_back(std::make_unique<support::PhaseBarrier<>>(config_.threads_per_team));
       if (!dynamic) {
         team_task_counts[static_cast<size_t>(team)] = team_tasks_[static_cast<size_t>(team)].size();
       }
@@ -1045,7 +1044,7 @@ class FragmentedExperiment::Impl {
 
   void run_dynamic_team(const DataCopy& data, int team, int lane, std::atomic<int>& next_task,
                         std::vector<int>& current_tasks, std::vector<size_t>& team_task_counts,
-                        std::barrier<>& claim_barrier, TeamBarrier& timing_barrier) {
+                        support::PhaseBarrier<>& claim_barrier, TeamBarrier& timing_barrier) {
     while (true) {
       if (lane == 0) {
         const int order_index = next_task.fetch_add(1, std::memory_order_relaxed);

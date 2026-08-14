@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <atomic>
-#include <barrier>
 #include <chrono>
 #include <csignal>
 #include <cmath>
@@ -18,6 +17,8 @@
 #include <thread>
 #include <type_traits>
 #include <vector>
+
+#include "../cxx17_compat.h"
 
 #if defined(__aarch64__)
 #include <arm_neon.h>
@@ -242,8 +243,8 @@ class ParallelRunner {
   }
 
  private:
-  std::barrier<> start_;
-  std::barrier<> done_;
+  fused_moe_sve::support::PhaseBarrier<> start_;
+  fused_moe_sve::support::PhaseBarrier<> done_;
   std::atomic<bool> stop_{false};
   std::function<void(int)> job_;
   std::vector<std::thread> workers_;

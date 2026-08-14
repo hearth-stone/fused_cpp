@@ -13,6 +13,12 @@ from torch.utils.cpp_extension import BuildExtension, CppExtension
 _SUPPORTED_FIXED_SVE_VECTOR_BITS = (128, 256, 512, 1024, 2048)
 
 
+def _cxx17_compile_flag(system=None) -> str:
+    """Return the explicit C++17 flag for the active host compiler family."""
+    system = platform.system() if system is None else system
+    return "/std:c++17" if system == "Windows" else "-std=c++17"
+
+
 def _detect_max_sve_vector_bits_for_build(prctl=None) -> int:
     """Return the largest SVE VL supported by the running Linux host.
 
@@ -144,6 +150,13 @@ class _BuildExtensionWithFixup(BuildExtension):
         compiler_cmd = getattr(self.compiler, "compiler", None)
         compiler = compiler_cmd[0] if isinstance(compiler_cmd, list) else compiler_cmd
         compiler = os.environ.get("CC") or compiler or "cc"
+        source_uses_cxx = os.path.splitext(src)[1].lower() in {
+            ".cc",
+            ".cpp",
+            ".cxx",
+            ".c++",
+            ".mm",
+        }
 
         extra_compile_args = getattr(ext, "extra_compile_args", []) or []
         if isinstance(extra_compile_args, dict):
@@ -160,7 +173,9 @@ class _BuildExtensionWithFixup(BuildExtension):
                 native_args.append(arg)
                 keep_next = True
                 continue
-            if arg == "-fopenmp" or arg.startswith(("-march=", "-mcpu=", "-O", "-I", "-std=")):
+            if arg.startswith(("-std=", "/std:")) and not source_uses_cxx:
+                continue
+            if arg == "-fopenmp" or arg.startswith(("-march=", "-mcpu=", "-O", "-I", "-std=", "/std:")):
                 native_args.append(arg)
 
         native_args.extend(source_args)
@@ -476,7 +491,7 @@ kai_available, kai_root = _detect_kleidiai()
 kai_enabled = os.environ.get("FUSED_CPP_ENABLE_KLEIDIAI", "0") == "1"
 use_kai = is_aarch64 and kai_available and kai_enabled
 
-extra_compile_args = []
+extra_compile_args = [_cxx17_compile_flag()]
 extra_link_args = []
 include_dirs = ["csrc"]
 library_dirs = []
@@ -485,7 +500,7 @@ define_macros = []
 bf16gemm_workspace = os.path.abspath("refs/i8gemm")
 bf16gemm_lib = os.path.join(bf16gemm_workspace, "lib")
 moe_include_dirs = ["csrc", bf16gemm_workspace, bf16gemm_lib]
-moe_compile_args = [*omp_compile_args, "-O2"]
+moe_compile_args = [*omp_compile_args, "-O2", _cxx17_compile_flag()]
 moe_link_args = list(omp_link_args)
 moe_define_macros = [
     ("FUSED_CPP_ENABLE_PROFILING", "1" if _profiling_enabled_for_build() else "0"),

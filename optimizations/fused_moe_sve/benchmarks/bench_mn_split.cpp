@@ -5,7 +5,6 @@
 #include "elastic_nsplit.h"
 
 #include <algorithm>
-#include <bit>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -20,6 +19,8 @@
 #include <string_view>
 #include <utility>
 #include <vector>
+
+#include "../cxx17_compat.h"
 
 namespace elastic = fused_moe_sve::elastic;
 
@@ -146,7 +147,7 @@ Options parse_options(int argc, char** argv) {
 }
 
 uint16_t float_to_bf16(float value) {
-  uint32_t bits = std::bit_cast<uint32_t>(value);
+  uint32_t bits = fused_moe_sve::support::BitCast<uint32_t>(value);
   bits += 0x7fffu + ((bits >> 16) & 1u);
   return static_cast<uint16_t>(bits >> 16);
 }
