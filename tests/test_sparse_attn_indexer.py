@@ -18,8 +18,13 @@ from fused_cpp import (
 import fused_cpp.sparse_attn_indexer as sparse_attn_indexer_mod
 
 
-def _fold_q_weights(q_quant: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
-    return (q_quant.float() * weights.float().unsqueeze(-1)).sum(dim=1)
+def _weighted_relu_scores(
+    q_quant: torch.Tensor,
+    weights: torch.Tensor,
+    k_rows: torch.Tensor,
+) -> torch.Tensor:
+    dots = torch.einsum("mhd,nd->mhn", q_quant.float(), k_rows.float())
+    return (dots.relu() * weights.float().unsqueeze(-1)).sum(dim=1)
 
 
 def _gather_paged_k(
@@ -34,9 +39,15 @@ def _gather_paged_k(
     return gathered.reshape(num_blocks * block_size, head_dim)[:seq_len].float()
 
 
-def _topk_for_row(q_w: torch.Tensor, k_rows: torch.Tensor, topk_tokens: int) -> torch.Tensor:
+def _topk_for_row(
+    q_row: torch.Tensor,
+    weights_row: torch.Tensor,
+    k_rows: torch.Tensor,
+    topk_tokens: int,
+) -> torch.Tensor:
     k_take = min(topk_tokens, k_rows.shape[0])
-    _, indices = torch.topk(torch.mv(k_rows, q_w), k_take, dim=-1)
+    scores = _weighted_relu_scores(q_row.unsqueeze(0), weights_row.unsqueeze(0), k_rows)[0]
+    _, indices = torch.topk(scores, k_take, dim=-1)
     return indices.to(torch.int32)
 
 
@@ -202,16 +213,46 @@ def test_cpu_sparse_attn_indexer_prefill_scores_paged_cache() -> None:
         attn_metadata=metadata,
     )
 
-    q_w = _fold_q_weights(q_quant, weights)
     req0_k = _gather_paged_k(kv_cache, block_table[0], 5)
     req1_k = _gather_paged_k(kv_cache, block_table[1], 3)
     all_k = torch.cat([req0_k, req1_k], dim=0)
     expected = torch.full((3, 3), -1, dtype=torch.int32)
-    expected[0, :topk_tokens] = _topk_for_row(q_w[0], all_k[0:5], topk_tokens)
-    expected[1, :topk_tokens] = _topk_for_row(q_w[1], all_k[2:5], topk_tokens)
-    expected[2, :topk_tokens] = _topk_for_row(q_w[2], all_k[5:8], topk_tokens)
+    expected[0, :topk_tokens] = _topk_for_row(q_quant[0], weights[0], all_k[0:5], topk_tokens)
+    expected[1, :topk_tokens] = _topk_for_row(q_quant[1], weights[1], all_k[2:5], topk_tokens)
+    expected[2, :topk_tokens] = _topk_for_row(q_quant[2], weights[2], all_k[5:8], topk_tokens)
 
     torch.testing.assert_close(out, expected)
+
+
+def test_cpu_sparse_attn_indexer_applies_relu_before_head_weights() -> None:
+    """Headwise ReLU must happen before weighting and reducing the heads."""
+    q_quant = torch.tensor([[[1.0], [-0.5]]], dtype=torch.bfloat16)
+    weights = torch.ones((1, 2), dtype=torch.float32)
+    kv_cache = torch.tensor([[[1.0], [-3.0], [0.5], [0.0]]], dtype=torch.bfloat16)
+    metadata = _make_prefill_metadata(
+        block_table=torch.tensor([[0]], dtype=torch.int32),
+        cu_seqlen_ks=torch.tensor([0], dtype=torch.int32),
+        cu_seqlen_ke=torch.tensor([3], dtype=torch.int32),
+        cu_seq_lens=torch.tensor([0, 3], dtype=torch.int32),
+        total_seq_lens=3,
+        token_start=0,
+        token_end=1,
+        num_reqs=1,
+    )
+    topk_indices = torch.full((1, 1), -1, dtype=torch.int32)
+
+    out = cpu_sparse_attn_indexer_op(
+        q_quant,
+        weights,
+        kv_cache,
+        topk_indices,
+        1,
+        metadata,
+    )
+
+    # Correct scores are [1.0, 1.5, 0.5].  Folding the two weighted Q heads
+    # before ReLU would instead rank key 0 first.
+    torch.testing.assert_close(out, torch.tensor([[1]], dtype=torch.int32))
 
 
 @pytest.mark.skipif(
@@ -418,12 +459,11 @@ def test_cpu_sparse_attn_indexer_decode_expands_block_table() -> None:
         attn_metadata=metadata,
     )
 
-    q_w = _fold_q_weights(q_quant, weights)
     expected = torch.full((3, 3), -1, dtype=torch.int32)
     token0_k = _gather_paged_k(kv_cache, block_table[0], 3)
     token1_k = _gather_paged_k(kv_cache, block_table[0], 6)
-    expected[0, :topk_tokens] = _topk_for_row(q_w[0], token0_k, topk_tokens)
-    expected[1, :topk_tokens] = _topk_for_row(q_w[1], token1_k, topk_tokens)
+    expected[0, :topk_tokens] = _topk_for_row(q_quant[0], weights[0], token0_k, topk_tokens)
+    expected[1, :topk_tokens] = _topk_for_row(q_quant[1], weights[1], token1_k, topk_tokens)
     expected[2, :2] = torch.tensor([0, 1], dtype=torch.int32)
 
     torch.testing.assert_close(out, expected)

@@ -6,6 +6,7 @@ import platform
 import pytest
 import torch
 
+import fused_cpp.deepseek_v4_post_gemm_stage as post_gemm_stage_module
 from fused_cpp.deepseek_v4_post_gemm_stage import (
     CompressorState,
     PostGemmStageInputs,
@@ -296,6 +297,87 @@ def test_post_gemm_cpp_matches_torch_baseline() -> None:
     not _HAS_DEEPSEEK_V4_POST_GEMM_STAGE,
     reason="DeepSeek V4 post-GEMM C++ stage is unavailable",
 )
+def test_post_gemm_cpp_indexer_8x2vl_shape_matches_torch_baseline() -> None:
+    """H8/D16 exercises the SVE 8x2VL indexer shape on supported Arm builds."""
+    shape = {
+        "num_tokens": 17,
+        "q_lora_rank": 16,
+        "main_num_heads": 4,
+        "main_head_dim": 16,
+        "indexer_num_heads": 8,
+        "indexer_head_dim": 16,
+    }
+    ref_inputs = _make_inputs(seed=37, **shape)
+    cpp_inputs = _make_inputs(seed=37, **shape)
+
+    ref_q, ref_topk = post_gemm_parallel_stage_torch_baseline(ref_inputs)
+    cpp_q, cpp_topk = post_gemm_parallel_stage_cpp(cpp_inputs)
+
+    _assert_close(cpp_q, ref_q, "8x2VL-shape q")
+    assert torch.equal(cpp_topk, ref_topk)
+    _assert_close(
+        cpp_inputs.indexer_compressor.kv_cache,
+        ref_inputs.indexer_compressor.kv_cache,
+        "8x2VL-shape indexer kv_cache",
+    )
+
+
+@pytest.mark.skipif(
+    not _HAS_DEEPSEEK_V4_POST_GEMM_STAGE,
+    reason="DeepSeek V4 post-GEMM C++ stage is unavailable",
+)
+def test_post_gemm_cpp_indexer_8x2vl_multi_request_matches_torch_baseline() -> None:
+    """Paged packB must preserve two concatenated request-local key ranges."""
+
+    def make_two_request_inputs() -> PostGemmStageInputs:
+        inputs = _make_inputs(
+            seed=41,
+            num_tokens=6,
+            q_lora_rank=16,
+            main_num_heads=4,
+            main_head_dim=16,
+            indexer_num_heads=8,
+            indexer_head_dim=16,
+        )
+        positions = torch.tensor([0, 1, 2, 0, 1, 2], dtype=torch.int64)
+        physical_slots = torch.tensor([0, 1, 2, 4, 5, 6], dtype=torch.int64)
+        request_ids = torch.tensor([0, 0, 0, 1, 1, 1], dtype=torch.int64)
+        request_blocks = torch.tensor([[0], [1]], dtype=torch.int32)
+        inputs.positions = positions
+        inputs.swa.slot_mapping = physical_slots
+        for compressor in (inputs.mla_compressor, inputs.indexer_compressor):
+            assert compressor is not None
+            compressor.state_slot_mapping = physical_slots
+            compressor.token_to_req_indices = request_ids
+            compressor.block_table = request_blocks
+            compressor.kv_slot_mapping = physical_slots
+        inputs.prefill = SparseIndexerPrefillMetadata(
+            cu_seq_lens=torch.tensor([0, 3, 6], dtype=torch.int64),
+            cu_seqlen_ks=torch.tensor([0, 0, 0, 3, 3, 3], dtype=torch.int64),
+            cu_seqlen_ke=torch.tensor([1, 2, 3, 4, 5, 6], dtype=torch.int64),
+            block_table=request_blocks,
+            topk_tokens=2,
+        )
+        topk_width = inputs.topk_indices_buffer.shape[1]
+        topk_backing = torch.full((6, 2 * topk_width), 99, dtype=torch.int32)
+        inputs.topk_indices_buffer = topk_backing[:, ::2]
+        assert inputs.topk_indices_buffer.stride(1) == 2
+        return inputs
+
+    ref_inputs = make_two_request_inputs()
+    cpp_inputs = make_two_request_inputs()
+
+    ref_q, ref_topk = post_gemm_parallel_stage_torch_baseline(ref_inputs)
+    cpp_q, cpp_topk = post_gemm_parallel_stage_cpp(cpp_inputs)
+
+    _assert_close(cpp_q, ref_q, "multi-request 8x2VL-shape q")
+    assert torch.equal(cpp_topk, ref_topk)
+
+
+@pytest.mark.skipif(
+    not _HAS_DEEPSEEK_V4_POST_GEMM_STAGE,
+    reason="DeepSeek V4 post-GEMM C++ stage is unavailable",
+)
 def test_post_gemm_cpp_rejects_int64_block_tables() -> None:
     inputs = _make_inputs(seed=7)
     inputs.mla_compressor.block_table = inputs.mla_compressor.block_table.to(torch.int64)
@@ -447,6 +529,106 @@ def test_post_gemm_shared_q_pool_matches_sequential(monkeypatch) -> None:
 
 
 @pytest.mark.skipif(
+    not _HAS_DEEPSEEK_V4_POST_GEMM_STAGE,
+    reason="DeepSeek V4 post-GEMM raw C++ stage is unavailable",
+)
+def test_post_gemm_raw_select_all_short_path_skips_indexer_q(monkeypatch, capfd) -> None:
+    """The raw-weight fallback must apply the same early select-all dispatch."""
+    ref_inputs = _make_inputs(seed=42, num_tokens=9)
+    cpp_inputs = _make_inputs(seed=42, num_tokens=9)
+    for inputs in (ref_inputs, cpp_inputs):
+        assert inputs.prefill is not None
+        inputs.prefill.cu_seqlen_ke.clamp_(max=inputs.prefill.topk_tokens)
+
+    ref_q, ref_topk = post_gemm_parallel_stage_torch_baseline(ref_inputs)
+    monkeypatch.setattr(post_gemm_stage_module, "_HAS_DEEPSEEK_V4_POST_GEMM_STAGE_PREPACKED", False)
+    monkeypatch.setenv("FUSED_CPP_DEEPSEEK_V4_POST_GEMM_PROFILE", "1")
+    capfd.readouterr()
+    cpp_q, cpp_topk = post_gemm_parallel_stage_cpp(cpp_inputs)
+    stderr = capfd.readouterr().err
+
+    _assert_close(cpp_q, ref_q, "raw select-all q")
+    assert torch.equal(cpp_topk, ref_topk)
+    _assert_close(cpp_inputs.swa.kv_cache, ref_inputs.swa.kv_cache, "raw select-all swa kv_cache")
+    _assert_close(
+        cpp_inputs.mla_compressor.kv_cache,
+        ref_inputs.mla_compressor.kv_cache,
+        "raw select-all mla kv_cache",
+    )
+    _assert_close(
+        cpp_inputs.indexer_compressor.kv_cache,
+        ref_inputs.indexer_compressor.kv_cache,
+        "raw select-all indexer kv_cache",
+    )
+    assert "indexer_q_gemm_ms=0.000" in stderr
+    assert "indexer_q_rope_weights_ms=0.000" in stderr
+    assert "sparse_indexer_backend=short_path" in stderr
+
+
+@pytest.mark.skipif(
+    not _HAS_DEEPSEEK_V4_POST_GEMM_STAGE_PREPACKED,
+    reason="DeepSeek V4 post-GEMM prepacked C++ stage is unavailable",
+)
+def test_post_gemm_select_all_short_path_skips_indexer_q(monkeypatch, capfd) -> None:
+    """A select-all TopK must bypass both shared and standalone Indexer Q work."""
+    shape = {
+        "num_tokens": 25,
+        "q_lora_rank": 16,
+        "main_num_heads": 8,
+        "main_head_dim": 16,
+        "indexer_num_heads": 8,
+        "indexer_head_dim": 16,
+    }
+    ref_inputs = _make_inputs(seed=43, **shape)
+    cpp_inputs = _make_inputs(seed=43, **shape)
+    for inputs in (ref_inputs, cpp_inputs):
+        assert inputs.prefill is not None
+        inputs.prefill.cu_seqlen_ke.clamp_(max=inputs.prefill.topk_tokens)
+
+    ref_q, ref_topk = post_gemm_parallel_stage_torch_baseline(ref_inputs)
+    weights = prepare_deepseek_v4_post_gemm_weights(
+        cpp_inputs.main_wq_b_weight,
+        cpp_inputs.indexer_wq_b_weight,
+    )
+
+    monkeypatch.setenv("FUSED_CPP_POST_GEMM_M8_ALIGNED", "1")
+    monkeypatch.setenv("FUSED_CPP_POST_GEMM_SHARED_Q_POOL", "1")
+    monkeypatch.setenv("FUSED_CPP_DEEPSEEK_V4_POST_GEMM_PROFILE", "1")
+    capfd.readouterr()
+    cpp_q, cpp_topk = post_gemm_parallel_stage_cpp_prepacked(cpp_inputs, weights)
+    stderr = capfd.readouterr().err
+
+    _assert_close(cpp_q, ref_q, "select-all q")
+    assert torch.equal(cpp_topk, ref_topk)
+    _assert_close(cpp_inputs.swa.kv_cache, ref_inputs.swa.kv_cache, "select-all swa kv_cache")
+    _assert_close(
+        cpp_inputs.mla_compressor.state_cache,
+        ref_inputs.mla_compressor.state_cache,
+        "select-all mla state_cache",
+    )
+    _assert_close(
+        cpp_inputs.mla_compressor.kv_cache,
+        ref_inputs.mla_compressor.kv_cache,
+        "select-all mla kv_cache",
+    )
+    _assert_close(
+        cpp_inputs.indexer_compressor.state_cache,
+        ref_inputs.indexer_compressor.state_cache,
+        "select-all indexer state_cache",
+    )
+    _assert_close(
+        cpp_inputs.indexer_compressor.kv_cache,
+        ref_inputs.indexer_compressor.kv_cache,
+        "select-all indexer kv_cache",
+    )
+    assert "shared_q_gemm_ms=0.000" in stderr
+    assert "indexer_q_gemm_ms=0.000" in stderr
+    assert "indexer_q_rope_weights_ms=0.000" in stderr
+    assert "sparse_indexer_topk_backend=short_path" in stderr
+    assert "sparse_indexer_backend=short_path" in stderr
+
+
+@pytest.mark.skipif(
     platform.machine() not in ("aarch64", "arm64") or not _HAS_DEEPSEEK_V4_POST_GEMM_STAGE_PREPACKED,
     reason="post-GEMM Q MN groups require the AArch64 prepacked C++ stage",
 )
@@ -556,6 +738,11 @@ def test_post_gemm_cpp_profile_summary(monkeypatch, capfd) -> None:
         "sparse_indexer_gather_ms=",
         "sparse_indexer_fold_q_ms=",
         "sparse_indexer_score_topk_ms=",
+        "sparse_indexer_score_ms=",
+        "sparse_indexer_topk_ms=",
+        "sparse_indexer_topk_backend=",
+        "sparse_indexer_backend=",
+        "sparse_indexer_n_tile=",
         "other_ms=",
     ):
         assert field in stderr

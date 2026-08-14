@@ -54,6 +54,10 @@ py::object flash_mla_sparse_fwd(at::Tensor q, at::Tensor kv, at::Tensor indices,
                                 c10::optional<int64_t> d_v, c10::optional<at::Tensor> attn_sink,
                                 c10::optional<at::Tensor> topk_length, c10::optional<at::Tensor> out,
                                 bool return_stats);
+py::object flash_mla_sparse_fwd_variant(at::Tensor q, at::Tensor kv, at::Tensor indices, double sm_scale,
+                                        std::string tail_variant, c10::optional<int64_t> d_v,
+                                        c10::optional<at::Tensor> attn_sink, c10::optional<at::Tensor> topk_length,
+                                        c10::optional<at::Tensor> out, bool return_stats);
 at::Tensor sparse_attn_indexer_prefill_cpp_v0(at::Tensor q_quant, at::Tensor weights, at::Tensor kv_cache,
                                               at::Tensor topk_indices_buffer, int64_t topk_tokens,
                                               py::object attn_metadata);
@@ -300,6 +304,12 @@ PYBIND11_MODULE(_C, m) {
         "Plan-based sparse MLA forward. Dense shared KV runs reuse 8x8 "
         "NEON SDPA microkernels; indexed tails use fp32 FMLA/scalar fallback.",
         py::arg("q"), py::arg("kv"), py::arg("indices"), py::arg("sm_scale"), py::arg("d_v") = c10::nullopt,
+        py::arg("attn_sink") = c10::nullopt, py::arg("topk_length") = c10::nullopt, py::arg("out") = c10::nullopt,
+        py::arg("return_stats") = false, py::call_guard<py::gil_scoped_release>());
+
+  m.def("_flash_mla_sparse_fwd_variant", &flash_mla_sparse_fwd_variant,
+        "Experimental sparse MLA tail-kernel comparison entry point.", py::arg("q"), py::arg("kv"), py::arg("indices"),
+        py::arg("sm_scale"), py::arg("tail_variant"), py::arg("d_v") = c10::nullopt,
         py::arg("attn_sink") = c10::nullopt, py::arg("topk_length") = c10::nullopt, py::arg("out") = c10::nullopt,
         py::arg("return_stats") = false, py::call_guard<py::gil_scoped_release>());
 

@@ -40,9 +40,24 @@ __all__ = [
 ]
 
 
-def _fold_q_weights(q_quant: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
-    """Fold per-head indexer weights into Q for scalar K dot products."""
-    return (q_quant.to(torch.float32) * weights.to(torch.float32).unsqueeze(-1)).sum(dim=1)
+def _weighted_relu_scores(
+    q_quant: torch.Tensor,
+    weights: torch.Tensor,
+    k_rows: torch.Tensor,
+) -> torch.Tensor:
+    """Return ``sum_h weight_h * relu(q_h @ k)`` in fp32."""
+    q_f = q_quant.to(torch.float32)
+    weights_f = weights.to(torch.float32)
+    k_f = k_rows.to(torch.float32)
+    scores = torch.zeros(
+        (q_f.shape[0], k_f.shape[0]),
+        dtype=torch.float32,
+        device=q_f.device,
+    )
+    for head in range(q_f.shape[1]):
+        head_scores = F.linear(q_f[:, head], k_f).relu_()
+        scores.add_(head_scores * weights_f[:, head].unsqueeze(1))
+    return scores
 
 
 def cpu_sparse_attn_indexer_op_torch_baseline(
@@ -80,14 +95,6 @@ def cpu_sparse_attn_indexer_op_torch_baseline(
     has_decode = attn_metadata.num_decodes > 0
     has_prefill = attn_metadata.num_prefills > 0
     num_decode_tokens = attn_metadata.num_decode_tokens
-
-    q_w: torch.Tensor | None = None
-
-    def get_q_w() -> torch.Tensor:
-        nonlocal q_w
-        if q_w is None:
-            q_w = _fold_q_weights(q_quant, weights)
-        return q_w
 
     if has_prefill:
         prefill_metadata = attn_metadata.prefill
@@ -137,8 +144,11 @@ def cpu_sparse_attn_indexer_op_torch_baseline(
                 )
                 k_gathered[ks:ke] = gathered[:seq_len].to(torch.float32)
 
-            q_w_chunk = get_q_w()[token_start:token_end]
-            logits = F.linear(q_w_chunk, k_gathered)
+            logits = _weighted_relu_scores(
+                q_quant[token_start:token_end],
+                weights[token_start:token_end],
+                k_gathered,
+            )
             for i in range(num_chunk_tokens):
                 ks_i = int(cu_seqlen_ks_cpu[i].item())
                 ke_i = int(cu_seqlen_ke_cpu[i].item())
@@ -188,7 +198,11 @@ def cpu_sparse_attn_indexer_op_torch_baseline(
                 head_dim,
             )
             k_t = gathered[:seq_len].to(torch.float32)
-            row = F.linear(get_q_w()[token_idx], k_t)
+            row = _weighted_relu_scores(
+                q_quant[token_idx : token_idx + 1],
+                weights[token_idx : token_idx + 1],
+                k_t,
+            )[0]
             k_take = min(topk_tokens, seq_len)
             _, idx_local = torch.topk(row, k_take, dim=-1)
             topk_indices_buffer[token_idx, :k_take] = idx_local.to(torch.int32)
