@@ -385,7 +385,7 @@ wide-stride `TILESTORED` 的 raw store path 比 scratch→ZMM store 更慢。当
 实验模式都保留 ZMM FP32→BF16 转换。下一优先级是 scratch/workspace 生命周期，
 不是把 shape-dependent 的 tile-store 路径提前设为默认。
 
-### Sparse MLA production head-major scalable QK
+### Sparse MLA production head-major scalable QK/PV
 
 `flash_mla_sparse_fwd` 的 BF16 默认实现使用 combined head-major：当 8-query
 block 数大于请求线程数的一半时，每个 token 建立一个任务，QK/PV 的 M 维为同一
@@ -393,11 +393,13 @@ token 的 8 个 query head；每组 gathered MQA K/V 只 pack 一次并由所有
 group 复用。全 query 共享连续 indices 时先走调用级 K/V pack 的 dense-head
 子路径。
 
-SVE BF16 build 的 sparse gathered 子路径现用 scalable BFMMLA QK
-`8×2VL`：`N=svcntb()/2`，所以 SVL128 为 8×8、SVL256 为 8×16；16 个 FP32
-累加器和每 K=4 的 16 条 BFMMLA 在各 128-bit segment 中保持同一拓扑。当前 PV
-仍使用原 BF16-probability 8-row kernel，共享 dense 子路径也仍为 fixed 8×8；
-非 SVE build 保留完整 fixed NEON 8×8 路径。
+SVE BF16 build 的 sparse gathered 子路径现用 scalable BFMMLA QK/PV
+`8×2VL`：`N=svcntb()/2`，所以 SVL128 为 8×8、SVL256 为 8×16；两者都用
+16 个 FP32 累加器，并在每 K=4 发出 16 条 BFMMLA。QK 直接 pack gathered K；
+PV 以 NEON 4×8 transpose 在 gather 时直接生成 scalable V B-layout，softmax
+产生的 BF16 P 再 pack 为 2-row A panels。K 尾部补零，SVL256 的 8-column Dv
+半 tile 用谓词保护。共享 dense 子路径仍为 fixed 8×8；非 SVE build 保留完整
+fixed NEON 8×8 路径。
 
 Amazon 8C 的 DSV4-like `q[2048,32,192]`、top-k capacity 640、`d_v=128`，
 5 warmup + 21 samples：fixed 8×8 的 1T/8T 为 252.176/38.508 ms；SVE QK
@@ -405,6 +407,14 @@ Amazon 8C 的 DSV4-like `q[2048,32,192]`、top-k capacity 640、`d_v=128`，
 降低 10.68%/4.54% latency。强制 SVL128 与默认 SVL256 各 24 项 focused tests
 通过；生成 QK reduction loop 无 SVE spill。完整命令、raw samples 与限制见
 `optimizations/sparse_mla/results/amazon_8c_scalable_sve_20260814.md`。
+
+第二阶段 commit `58881f8` 只替换 QK、保留原 PV。最终阶段在相同 workload
+把完整 SVE QK/PV 的 SVL128 1T/8T 降到 201.848/28.257 ms，相对 fixed
+8×8 降低 19.96%/26.62%；SVL256 为 180.951/26.817 ms，降低
+28.24%/30.36%。PV reduction loop 无 spill；GCC 仅在最终
+unzip/gather/add/scatter epilogue spill 三个临时 Z。曾尝试从旧 O 初始化 BFMMLA
+累加器以删除显式 add，但 spill 增至四个 Z，1T 179.869→181.225 ms（+0.75%），
+故撤回。最终 SVL128/256 各 24 项 focused tests 通过。
 
 短 query chunk 继续走 guarded 2D indexed fallback；FP32 或不满足
 `Hq%8==0、Dqk%4==0、Dv%8==0` 的 BF16 形状也走 indexed fallback。公开 API、
@@ -622,7 +632,7 @@ prepacked（强制 shared pool）两个专项测试通过，完整 post-GEMM 文
 | **Long-context bf16，KV 装 L3，S%8==0** | **`flash2_neon_l3kv_packqkv`** | Q + K + V 都 pre-pack，BFMMLA inner 走 packqk_seq4_bmajor 路径（microkernel +23%）；端到端预期 +2–5% vs `packv` |
 | Long-context fp32 | `flash2_neon_l3kv_qk_ublock4` | 唯一打开 fp32 GEMM 瓶颈的路径；packv 在 fp32 下负收益 |
 | 想跑 cache-aware 但 KV 装得下 L3 | `flash2_neon_cache_qk_ublock4`（fp32）/ `flash2_neon_cache_pquad`（bf16 PV 或 fp32 PV-only）/ `flash2_neon_l3kv_pquad`（path A 退化） | 性能近似 |
-| Sparse MLA BF16 | 公开 `flash_mla_sparse_fwd`（head-major scalable QK） | SVE sparse gathered 路径按 token 做 8-head×2VL-key QK，当前 PV/dense 仍 fixed 8×8；短 chunk 最多 8-way KV split；non-SVE/unsupported shape 保留回退 |
+| Sparse MLA BF16 | 公开 `flash_mla_sparse_fwd`（head-major scalable QK/PV） | SVE sparse gathered 路径按 token 做 8-head×2VL-column QK/PV，shared-dense 仍 fixed 8×8；短 chunk 最多 8-way KV split；non-SVE/unsupported shape 保留回退 |
 | 历史接口兼容 | `flash2_neon_cache` / `flash2_neon_l3kv`（无后缀别名） | 自动映射到 `_baseline` |
 
 ---
@@ -633,6 +643,7 @@ prepacked（强制 shared pool）两个专项测试通过，完整 post-GEMM 文
 
 | 日期 | 改动概述 | 受影响文件 |
 |---|---|---|
+| 2026-08-14 | **Sparse MLA PV 完成 scalable SVE 8×2VL BFMMLA**：gather V 时用 NEON 4×8 transpose 直接生成 scalable B-layout；row-major BF16 P pack 为 2-row A panels，K4 尾部补零，SVL256 的 Dv 半 tile 谓词保护；每 K4 用 16 条 `bfmmla` 并加回原 online-softmax O。Amazon 8C DSV4-like `q[2048,32,192],topk640,Dv128` 上，SVL256 1T/8T 相对 fixed 8×8 从 252.176/38.508 降到 180.951/26.817 ms（-28.24%/-30.36%），相对 QK-only commit `58881f8` 再降 19.66%/27.05%；SVL128 相对 fixed 降 19.96%/26.62%。两种 VL 各 24 tests passed。旧 O 预装 accumulator 方案因 4-Z spill 和 0.75% 单核回退撤销。 | 改 `csrc/{sparse_mla.cpp,sparse_mla_sve.h,SDPA_VERSIONS.md}`、`docs/public_contracts.md`、`optimizations/sparse_mla/{manifest.yaml,results/amazon_8c_scalable_sve_20260814.md}` |
 | 2026-08-14 | **Sparse MLA sparse QK 从 fixed NEON 8×8 改为 scalable SVE 8×2VL**：保持 16 个 BFMMLA FP32 累加器与 K=4 instruction topology，K pack 和 score epilogue 随运行时 VL 扩展；SVL128 为 8×8，SVL256 为 8×16。PV、online softmax、shared-dense 8×8 与 non-SVE fallback 不变。Amazon 8C DSV4-like `q[2048,32,192],topk640,Dv128` 上，1T/8T 从 252.176/38.508 降至 SVL256 的 225.232/36.759 ms（-10.68%/-4.54%）；SVL128 为 250.760/38.313 ms。两种 VL 各 24 tests passed，QK 汇编 16 条 `bfmmla`/K4 且无 spill。 | 新建 `csrc/sparse_mla_sve.h`、`tests/bench_sparse_mla_scalable.py`、`optimizations/sparse_mla/results/amazon_8c_scalable_sve_20260814.md`；改 `csrc/{sparse_mla.cpp,SDPA_VERSIONS.md}`、`docs/public_contracts.md`、`optimizations/sparse_mla/manifest.yaml` |
 | 2026-08-14 | **Sparse MLA head-major 8×8 转为公开默认实现**：BF16 且 `Hq%8==0,Dqk%4==0,Dv%8==0` 的常见长 query 按 token 复用 MQA K/V pack，并分别处理共享连续 KV 与 sparse indexed KV；短 query 保留最多 8-way KV split，FP32/非支持维度保留 indexed fallback。删除内部 variant selector、masked/pruned/fused tail 实验源码和专用 benchmark，负结果与回滚点保留在 manifest、结果文档和 Git 历史。公开签名及数值语义不变。Amazon 8C SVL256、cores 0--3、OMP=4 release build 成功，Sparse MLA 24 tests passed，实验 selector ABI removal 检查通过；192-core/SVL128 主机 SSH 无响应，未报告该机验证结果。 | 改 `csrc/{sparse_mla.cpp,module.cpp,SDPA_VERSIONS.md}`、`tests/test_sparse_mla.py`、`docs/public_contracts.md`、`optimizations/sparse_mla/{manifest.yaml,results/arm_head_major_20260813.md}`；删 `csrc/sparse_mla_tail_microkernels.{h,cpp}`、`tests/bench_sparse_mla_tail_variants.py` |
 | 2026-08-13 | **DeepSeek V4 Indexer select-all 提前短路**：把 `max(ke-ks)<=topk` 判定移到 Q 调度之前；命中时 raw/prepacked 都跳过 Indexer Q GEMM 和 Q RoPE/weight scaling，prepacked 强制 shared-Q pool 时也只运行 Main Q，同时保留 Main Q、两个 compressor 及阶段末尾 TopK 写入顺序。Amazon 8C SVL256 上 raw/prepacked 专项与完整文件 20 tests passed；`M2048,context_start=0,topk512` 中位数 74.309→40.176 ms（1.850×），34.854 ms Indexer Q 工作归零。192-core/SVL128 主机 SSH 无响应，未报告结果。 | 改 `csrc/{deepseek_v4_post_gemm_stage.cpp,SDPA_VERSIONS.md}`、`tests/test_deepseek_v4_post_gemm_stage.py`、`optimizations/deepseek_v4_post_gemm/{manifest.yaml,results/amazon_8c_indexer_select_all_early_exit_20260813.md}` |

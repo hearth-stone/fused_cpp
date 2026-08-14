@@ -7,14 +7,14 @@ baseline:
   status: reference
 
 default:
-  id: head_major_sve_qk_8x2vl_neon_pv
+  id: head_major_sve_qkpv_8x2vl
   entrypoint: flash_mla_sparse_fwd
   dispatch: >-
-    Supported SVE BF16 MQA shapes use one-token tasks, 8-head by 2VL-key packed
-    QK, and the existing 8-row PV once eight-query block parallelism exceeds
-    half the requested workers. Fully shared dense indices use the fixed 8x8
-    call-level K/V packing path. Non-SVE, short-query, FP32, and unsupported
-    shapes retain their existing fallbacks.
+    Supported SVE BF16 MQA shapes use one-token tasks and scalable 8-head by
+    2VL-column BFMMLA QK/PV once eight-query block parallelism exceeds half the
+    requested workers. Fully shared dense indices use the fixed 8x8 call-level
+    K/V packing path. Non-SVE, short-query, FP32, and unsupported shapes retain
+    their existing fallbacks.
 
 benchmark_scenarios:
   production_smoke: >-
@@ -96,6 +96,25 @@ features:
     result: >-
       optimizations/sparse_mla/results/amazon_8c_scalable_sve_20260814.md
 
+  - id: compute.sve_pv_8x2vl_bfmmla
+    part: compute
+    status: enabled
+    implementation: csrc/sparse_mla_sve.h
+    hypothesis: >-
+      Directly pack gathered V through a 4x8 transpose and use the same
+      scalable 16-accumulator BFMMLA topology for the probability-value GEMM.
+    depends_on:
+      - scheduling.head_major_sparse
+      - compute.sve_qk_8x2vl_bfmmla
+    conflicts_with: []
+    correctness: >-
+      Forced SVL128 and default SVL256 each pass tests/test_sparse_mla.py,
+      including Dv=8 and the SVL256 half-tile Dv=24 cases.
+    benchmark: >-
+      tests/bench_sparse_mla_scalable.py --threads 1|8 --warmup 5 --iters 21
+    result: >-
+      optimizations/sparse_mla/results/amazon_8c_scalable_sve_20260814.md
+
   - id: planning.masked_dense_tail
     part: planning
     status: retired
@@ -143,7 +162,7 @@ features:
       No single FMLA/BFMLAL/BFMMLA epilogue won across SVL128 and SVL256.
 
 variants:
-  - id: head_major_sve_qk_8x2vl_neon_pv
+  - id: head_major_sve_qkpv_8x2vl
     entrypoint: flash_mla_sparse_fwd
     status: enabled
     features:
@@ -151,8 +170,24 @@ variants:
       - scheduling.head_major_sparse
       - scheduling.kv_2d_split
       - compute.sve_qk_8x2vl_bfmmla
+      - compute.sve_pv_8x2vl_bfmmla
     result: >-
       optimizations/sparse_mla/results/amazon_8c_scalable_sve_20260814.md
+
+  - id: head_major_sve_qk_8x2vl_neon_pv
+    status: retired
+    implementation: Superseded by the full scalable QK/PV path
+    history: 58881f8
+    features:
+      - scheduling.head_major_dense
+      - scheduling.head_major_sparse
+      - scheduling.kv_2d_split
+      - compute.sve_qk_8x2vl_bfmmla
+    result: >-
+      optimizations/sparse_mla/results/amazon_8c_scalable_sve_20260814.md
+    retirement_reason: >-
+      Full SVE PV reduced 1/8-thread latency by another 19.66%/27.05% at
+      SVL256 and also won at SVL128.
 
   - id: head_major_8x8
     entrypoint: flash_mla_sparse_fwd

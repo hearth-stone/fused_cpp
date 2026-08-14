@@ -183,9 +183,9 @@ output and optional statistics semantics, attention-sink behavior, and `out=`
 contract.
 
 For supported SVE BF16 MQA shapes, the public optimized entrypoint uses a
-head-major scalable 8x2VL sparse QK kernel once query parallelism is sufficient;
-the current sparse PV and shared-dense subpath remain fixed 8x8. Non-SVE builds
-retain fixed 8x8 head-major kernels. Short query chunks retain guarded 2D KV
+head-major scalable 8x2VL sparse QK/PV kernel once query parallelism is
+sufficient; the shared-dense subpath remains fixed 8x8. Non-SVE builds retain
+fixed 8x8 head-major kernels. Short query chunks retain guarded 2D KV
 partitioning; FP32 and unsupported BF16 shapes retain the indexed fallback.
 Task layout, packing, split count, partial buffers, and merge order are internal.
 Every dispatch must preserve the documented numerical tolerances,
