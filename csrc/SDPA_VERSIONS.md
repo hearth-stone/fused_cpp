@@ -422,6 +422,19 @@ query-dependent sparse 在 1T/8T 为 +0.04%/-0.20%。两种 VL 各 26 tests
 passed；完整方法和 raw samples 见
 `optimizations/sparse_mla/results/amazon_8c_shared_prefix_pack_20260814.md`。
 
+后续 query-dependent sparse 路径不具备跨 token 共享 pack 的条件，但同一 KV
+行的 V 是 K 的前 `d_v` 维。SVE indexed pack 因此改为每 4 行、每 8 维只加载
+一次：同一组 NEON vectors 同时写两个 K=4 BFMMLA panels，并经 4×8 transpose
+写 V panel。相较原先独立 K pack 与 V pack，输入 KV payload 从每行
+`d_qk+d_v` 降为 `d_qk`，packed layout、QK/PV、online softmax 与 non-SVE
+fallback 均不变。Amazon 8C、SVL256、`q[2048,32,192]`、`topk=640`、
+`d_v=128`、`context_start=10000`：1T 280.552→254.908 ms（-9.14%）；
+8T 两种执行顺序分别为 41.584→39.161 ms（-5.83%）和
+41.671→39.155 ms（-6.04%）。单次 profile 的 pack 阶段
+61.209→37.819 ms（-38.21%）；共享前缀路径 8T 仅 -0.18%。SVL256/SVL128
+完整文件各 26 tests passed。完整方法与 raw samples 见
+`optimizations/sparse_mla/results/amazon_8c_indexed_single_pack_20260814.md`。
+
 Amazon 8C 的 DSV4-like `q[2048,32,192]`、top-k capacity 640、`d_v=128`，
 5 warmup + 21 samples：fixed 8×8 的 1T/8T 为 252.176/38.508 ms；SVE QK
 在 SVL128 为 250.760/38.313 ms，在 SVL256 为 225.232/36.759 ms，后者分别
@@ -680,6 +693,7 @@ prepacked（强制 shared pool）两个专项测试通过，完整 post-GEMM 文
 
 | 日期 | 改动概述 | 受影响文件 |
 |---|---|---|
+| 2026-08-14 | **Sparse MLA indexed K/V 单次 gather+pack**：后续 query-dependent sparse 的跨 token KV 重叠不足以共享 pack，因此在每个 2VL key tile 内将 K 与 V pack 融合；每 4 个 indexed KV 行的 8-wide load 同时生成两个 K=4 BFMMLA panels 和一个转置 V panel，输入 KV payload 从 `d_qk+d_v` 降到 `d_qk`。Amazon 8C `q[2048,32,192],topk640,Dv128,context_start10000`：1T 280.552→254.908 ms（-9.14%），8T 正/反顺序为 -5.83%/-6.04%，profile pack 61.209→37.819 ms（-38.21%）；共享前缀 8T -0.18%。SVL256/SVL128 各 `26 passed`，checksum 一致。 | 改 `csrc/{sparse_mla.cpp,sparse_mla_sve.h,SDPA_VERSIONS.md}`、`optimizations/sparse_mla/manifest.yaml`；新建 `optimizations/sparse_mla/results/amazon_8c_indexed_single_pack_20260814.md` |
 | 2026-08-14 | **Sparse MLA 前 2048 V4-like 双前缀共享 K/V pack**：SVE BF16 head-major 自动识别 compressed + causal/SWA 两段固定起点连续前缀，把每段最大范围按运行时 2VL BFMMLA layout 在调用级只 pack 一次；每 token 仅消费自身有效长度，不增加 QK/PV。query-dependent TopK、滑动 SWA、低复用、非整 tile 和 non-SVE 保持 per-token gather-pack fallback。Amazon 8C、`q[2048,32,192],Dv128`、compressed512+SWA2048：1T 552.018→451.861 ms（-18.14%），8T 反向顺序稳态 82.702→76.929 ms（-6.98%）；后续 sparse 1T/8T 为 +0.04%/-0.20%。SVL256/SVL128 完整文件各 `26 passed`。 | 改 `csrc/{sparse_mla.cpp,SDPA_VERSIONS.md}`、`tests/test_sparse_mla.py`、`optimizations/sparse_mla/manifest.yaml`；新建 `optimizations/sparse_mla/results/amazon_8c_shared_prefix_pack_20260814.md` |
 | 2026-08-14 | **统一 Sparse MLA head-major QK/PV 与 online-softmax 中间计算**：shared-dense 与 indexed-sparse 保留各自 K/V pack 和任务调度，但共同调用一个内部 chunk executor，统一执行 QK、score materialization、online max/sum/O correction、BF16 P、P pack 和 PV。sparse 的 ragged/重复索引、sink、精确 stats，及 dense 的在线 stats 语义均保持不变；默认 dispatch、公开 API 和 packed layout 不变。Amazon 8C SVE-BF16 extension 全量构建成功；SVL256 cores 0--3 与强制 SVL128 cores 4--7、OMP=4 各 `24 passed`。AmazonM5192Cores 原生 SVL128 上主 `_C` extension 以 C++17 构建成功，NUMA1 cores 96--99、OMP=4 为 `24 passed`；完整 setup 后续仍被无关 MoE C++17 `atomic::wait/notify_all` 编译错误阻断。M5 NUMA1、cores 96--191、`q[2048,32,192],topk640,Dv128`、5 warmup + 21 iterations、三个独立 session 的 session-median 再取中位数：1T sparse 220.664→212.849 ms（-3.54%）、dense 172.402→168.588 ms（-2.21%）；96T sparse 3.025→2.914 ms（-3.67%），dense 因性能状态呈双峰，稳态约 2.457→2.433 ms（约 -0.98%，只判定无稳定回退）。`q[8192,...]` 的两个 paired session 中 sparse 11.819→11.359 ms（约 -3.89%）；dense 两轮均不回退但幅度受机器状态影响，不量化收益。baseline 为同一 HEAD 源码单文件重编译，candidate 只替换 `sparse_mla.o`，链接对象、编译参数、绑核和 NUMA 配置一致；checksum 一致。 | 改 `csrc/{sparse_mla.cpp,SDPA_VERSIONS.md}` |
 | 2026-08-14 | **Sparse MLA shared-dense QK/PV 从 fixed 8×8 改为 scalable SVE 8×2VL**：保持同一 token 的 8 个连续 Q head 为 M，在调用级把连续 K/V 一次 pack 为 scalable B-layout；SVL128 计算 8×8，SVL256 计算 8×16，final key/Dv 半 tile 零填充并谓词写回，online softmax 不变，non-SVE 保留原 fixed 8×8。Amazon 8C dense `q[2048,32,192],KV640,Dv128` 上，SVL128 1T/8T 由 334.450/54.206 降为 250.042/36.384 ms（-25.24%/-32.88%），SVL256 由 332.588/54.248 降为 213.853/32.610 ms（-35.70%/-39.89%）；gathered sparse 四点无回退。最终两种 VL 各 24 tests passed，non-SVE AArch64 syntax compile 通过，QK/PV 各 16 条 `bfmmla` 且无 Z spill。 | 改 `csrc/{sparse_mla.cpp,sparse_mla_sve.h,SDPA_VERSIONS.md}`、`tests/bench_sparse_mla_scalable.py`、`docs/public_contracts.md`、`optimizations/sparse_mla/{manifest.yaml,results/amazon_8c_scalable_sve_20260814.md}`；新建 `optimizations/sparse_mla/results/amazon_8c_dense_scalable_sve_20260814.md` |

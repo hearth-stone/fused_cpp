@@ -100,14 +100,9 @@ inline void pack_contiguous_k_tile_bf16(
   }
 }
 
-inline void store_v_4x8_bfmmla_segment(
-    const uint16_t* row0_ptr, const uint16_t* row1_ptr,
-    const uint16_t* row2_ptr, const uint16_t* row3_ptr, uint16_t* block,
-    int64_t tile, int64_t segment) {
-  const uint16x8_t row0 = vld1q_u16(row0_ptr);
-  const uint16x8_t row1 = vld1q_u16(row1_ptr);
-  const uint16x8_t row2 = vld1q_u16(row2_ptr);
-  const uint16x8_t row3 = vld1q_u16(row3_ptr);
+inline void store_v_4x8_bfmmla_vectors(
+    uint16x8_t row0, uint16x8_t row1, uint16x8_t row2, uint16x8_t row3,
+    uint16_t* block, int64_t tile, int64_t segment) {
   const uint16x8x2_t rows01 = vzipq_u16(row0, row1);
   const uint16x8x2_t rows23 = vzipq_u16(row2, row3);
   const uint32x4x2_t columns03 = vzipq_u32(
@@ -124,6 +119,15 @@ inline void store_v_4x8_bfmmla_segment(
             vreinterpretq_u16_u32(columns47.val[0]));
   vst1q_u16(block + 3 * tile + segment * 8,
             vreinterpretq_u16_u32(columns47.val[1]));
+}
+
+inline void store_v_4x8_bfmmla_segment(
+    const uint16_t* row0_ptr, const uint16_t* row1_ptr,
+    const uint16_t* row2_ptr, const uint16_t* row3_ptr, uint16_t* block,
+    int64_t tile, int64_t segment) {
+  store_v_4x8_bfmmla_vectors(
+      vld1q_u16(row0_ptr), vld1q_u16(row1_ptr), vld1q_u16(row2_ptr),
+      vld1q_u16(row3_ptr), block, tile, segment);
 }
 
 inline void zero_v_bfmmla_segment(uint16_t* block, int64_t tile,
@@ -167,6 +171,80 @@ inline void pack_indexed_v_tile_bf16(
           zero_v_bfmmla_segment(block, tile, segment);
         }
       }
+    }
+  }
+}
+
+// Gather each group of four indexed KV rows once and materialize both packed
+// operands. V is the leading output_columns slice of each K row, so its 4x8
+// transpose reuses the vectors already loaded for two adjacent K=4 panels.
+inline void pack_indexed_kv_tile_bf16(
+    const uint16_t* kv, int64_t kv_row_stride, const int64_t* indices,
+    int64_t reduction, int64_t output_columns, int64_t reduction_capacity,
+    int64_t reduction_offset, uint16_t* packed_k, uint16_t* packed_v) {
+  const int64_t tile = n_tile();
+  const int64_t segments = static_cast<int64_t>(svcntb() / 16);
+  for (int64_t row_base = 0; row_base < tile; row_base += 4) {
+    const uint16_t* row0 = kv + indices[row_base + 0] * kv_row_stride;
+    const uint16_t* row1 = kv + indices[row_base + 1] * kv_row_stride;
+    const uint16_t* row2 = kv + indices[row_base + 2] * kv_row_stride;
+    const uint16_t* row3 = kv + indices[row_base + 3] * kv_row_stride;
+    const int64_t key_segment = row_base / 8;
+    const int64_t key_pair = (row_base % 8) / 2;
+
+    int64_t reduction_base = 0;
+    for (; reduction_base + 8 <= reduction; reduction_base += 8) {
+      const uint16x8_t values0 = vld1q_u16(row0 + reduction_base);
+      const uint16x8_t values1 = vld1q_u16(row1 + reduction_base);
+      const uint16x8_t values2 = vld1q_u16(row2 + reduction_base);
+      const uint16x8_t values3 = vld1q_u16(row3 + reduction_base);
+
+      for (int64_t half = 0; half < 2; ++half) {
+        uint16_t* k_block =
+            packed_k + ((reduction_base / 4) + half) * 4 * tile;
+        uint16_t* k_pair01 =
+            k_block + (key_pair * segments + key_segment) * 8;
+        uint16_t* k_pair23 =
+            k_block + ((key_pair + 1) * segments + key_segment) * 8;
+        if (half == 0) {
+          vst1q_u16(k_pair01,
+                    vcombine_u16(vget_low_u16(values0),
+                                 vget_low_u16(values1)));
+          vst1q_u16(k_pair23,
+                    vcombine_u16(vget_low_u16(values2),
+                                 vget_low_u16(values3)));
+        } else {
+          vst1q_u16(k_pair01,
+                    vcombine_u16(vget_high_u16(values0),
+                                 vget_high_u16(values1)));
+          vst1q_u16(k_pair23,
+                    vcombine_u16(vget_high_u16(values2),
+                                 vget_high_u16(values3)));
+        }
+      }
+
+      if (reduction_base < output_columns) {
+        const int64_t output_tile = reduction_base / tile;
+        const int64_t output_segment = (reduction_base % tile) / 8;
+        uint16_t* v_block =
+            packed_v + output_tile * reduction_capacity * tile +
+            (reduction_offset + row_base) * tile;
+        store_v_4x8_bfmmla_vectors(values0, values1, values2, values3,
+                                   v_block, tile, output_segment);
+      }
+    }
+
+    if (reduction_base < reduction) {
+      uint16_t* k_block = packed_k + (reduction_base / 4) * 4 * tile;
+      std::memcpy(k_block + (key_pair * segments + key_segment) * 8,
+                  row0 + reduction_base, 4 * sizeof(uint16_t));
+      std::memcpy(k_block + (key_pair * segments + key_segment) * 8 + 4,
+                  row1 + reduction_base, 4 * sizeof(uint16_t));
+      std::memcpy(k_block + ((key_pair + 1) * segments + key_segment) * 8,
+                  row2 + reduction_base, 4 * sizeof(uint16_t));
+      std::memcpy(
+          k_block + ((key_pair + 1) * segments + key_segment) * 8 + 4,
+          row3 + reduction_base, 4 * sizeof(uint16_t));
     }
   }
 }

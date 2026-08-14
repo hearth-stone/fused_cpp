@@ -107,7 +107,8 @@ def test_flash_mla_sparse_fwd_cpp_head_major_sparse_matches_naive(
 ) -> None:
     """The production sparse path preserves ragged and duplicate indices."""
     torch.manual_seed(181)
-    s_q, h_q, s_kv, d_qk, d_v, topk = 24, 16, 64, 32, 24, 19
+    # d_qk=36 also exercises the fused packer's final K=4-only tail.
+    s_q, h_q, s_kv, d_qk, d_v, topk = 24, 16, 64, 36, 24, 19
     q = torch.randn(s_q, h_q, d_qk).bfloat16()
     kv = torch.randn(s_kv, 1, d_qk).bfloat16()
     indices = torch.full((s_q, 1, topk), -1, dtype=torch.int32)

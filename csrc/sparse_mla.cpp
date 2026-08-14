@@ -439,8 +439,9 @@ static inline bool find_shared_contiguous_prefix_segments(
   if (candidate_count == 0) {
     return false;
   }
-  std::sort(candidate_starts.begin(),
-            candidate_starts.begin() + candidate_count);
+  if (candidate_count == 2 && candidate_starts[0] > candidate_starts[1]) {
+    std::swap(candidate_starts[0], candidate_starts[1]);
+  }
 
   plan = SharedPrefixSegments{};
   plan.count = candidate_count;
@@ -1510,11 +1511,9 @@ static inline void pack_indexed_kv_heads_tile_bf16(
     int64_t chunk_capacity, int64_t chunk_offset, int64_t key_tile) {
   const auto* kv_u16 = reinterpret_cast<const uint16_t*>(kv_ptr);
 #if FUSED_CPP_SPARSE_MLA_HAS_SVE_BFMMLA
-  ::fused_cpp::sparse_mla_sve::pack_indexed_k_tile_bf16(
-      kv_u16, kv_row_stride, indices, d_qk, k_packed);
-  ::fused_cpp::sparse_mla_sve::pack_indexed_v_tile_bf16(
-      kv_u16, kv_row_stride, indices, key_tile, d_v, chunk_capacity,
-      chunk_offset, v_packed);
+  ::fused_cpp::sparse_mla_sve::pack_indexed_kv_tile_bf16(
+      kv_u16, kv_row_stride, indices, d_qk, d_v, chunk_capacity, chunk_offset,
+      k_packed, v_packed);
 #else
   const int64_t e_main = d_qk & ~int64_t{3};
   for (int64_t e = 0; e < e_main; e += 4) {
