@@ -8,7 +8,14 @@
 #include <stdexcept>
 #include <vector>
 
-#if defined(__aarch64__) && defined(__ARM_FEATURE_SVE) && defined(__ARM_FEATURE_BF16)
+#if defined(__aarch64__) && defined(__ARM_FEATURE_SVE) && \
+    (defined(__ARM_FEATURE_BF16) || defined(__ARM_FEATURE_BF16_VECTOR_ARITHMETIC))
+#define FUSED_CPP_MOE_HAS_SVE_BF16_INTRINSICS 1
+#else
+#define FUSED_CPP_MOE_HAS_SVE_BF16_INTRINSICS 0
+#endif
+
+#if FUSED_CPP_MOE_HAS_SVE_BF16_INTRINSICS
 #include <arm_sve.h>
 #endif
 
@@ -35,7 +42,7 @@ inline bool env_false(const char* name) {
 
 inline int round_up(int x, int q) { return ((x + q - 1) / q) * q; }
 
-#if defined(__aarch64__) && defined(__ARM_FEATURE_SVE) && defined(__ARM_FEATURE_BF16)
+#if FUSED_CPP_MOE_HAS_SVE_BF16_INTRINSICS
 
 inline svbfloat16_t load_bf16(const uint16_t* ptr) {
   return svld1_bf16(svptrue_b16(), reinterpret_cast<const __bf16*>(ptr));
@@ -257,7 +264,7 @@ void gemm_packed_block(const uint16_t* packed_A, const uint16_t* B_reo, void* C,
 }  // namespace
 
 bool available() {
-#if defined(__aarch64__) && defined(__ARM_FEATURE_SVE) && defined(__ARM_FEATURE_BF16)
+#if FUSED_CPP_MOE_HAS_SVE_BF16_INTRINSICS
   return true;
 #else
   return false;
@@ -267,7 +274,7 @@ bool available() {
 bool enabled_by_env() { return available() && !env_false("FUSED_CPP_MOE_SVE"); }
 
 int n_tile() {
-#if defined(__aarch64__) && defined(__ARM_FEATURE_SVE) && defined(__ARM_FEATURE_BF16)
+#if FUSED_CPP_MOE_HAS_SVE_BF16_INTRINSICS
   return kNTile;
 #else
   return 8;
@@ -279,7 +286,7 @@ int round_k(int k) { return round_up(k < 8 ? 8 : k, 8); }
 int round_n(int n) { return round_up(n < 8 ? 8 : n, n_tile()); }
 
 void pack_b(const uint16_t* B, uint16_t* B_reo, int K, int N) {
-#if defined(__aarch64__) && defined(__ARM_FEATURE_SVE) && defined(__ARM_FEATURE_BF16)
+#if FUSED_CPP_MOE_HAS_SVE_BF16_INTRINSICS
   constexpr int segs = kSegments128;
   constexpr int nt = kNTile;
   if (K % 8 != 0 || N % nt != 0) {
@@ -312,7 +319,7 @@ void pack_b(const uint16_t* B, uint16_t* B_reo, int K, int N) {
 }
 
 void pack_a_block(const uint16_t* A, uint16_t* packed, int rows, int K) {
-#if defined(__aarch64__) && defined(__ARM_FEATURE_SVE) && defined(__ARM_FEATURE_BF16)
+#if FUSED_CPP_MOE_HAS_SVE_BF16_INTRINSICS
   pack_a_block_sve(A, packed, rows, K, K);
 #else
   (void)A;
@@ -325,7 +332,7 @@ void pack_a_block(const uint16_t* A, uint16_t* packed, int rows, int K) {
 
 void gather_pack_a(const uint16_t* input, int64_t H, const int64_t* expert_routes, int64_t top_k, uint16_t* packed,
                    int total_rows, int K_pad, int block_begin, int block_end) {
-#if defined(__aarch64__) && defined(__ARM_FEATURE_SVE) && defined(__ARM_FEATURE_BF16)
+#if FUSED_CPP_MOE_HAS_SVE_BF16_INTRINSICS
   for (int mb = block_begin; mb < block_end; ++mb) {
     uint16_t* block = packed + static_cast<int64_t>(mb) * 8 * K_pad;
     for (int kb = 0; kb < K_pad; kb += 4) {
@@ -363,7 +370,7 @@ void gather_pack_a(const uint16_t* input, int64_t H, const int64_t* expert_route
 
 void w13_silu_rowmajor(const uint16_t* A, const uint16_t* B_reo, uint16_t* C, uint16_t* A_reorder,
                        const gemm_params_t* params, int64_t degree) {
-#if defined(__aarch64__) && defined(__ARM_FEATURE_SVE) && defined(__ARM_FEATURE_BF16)
+#if FUSED_CPP_MOE_HAS_SVE_BF16_INTRINSICS
   const int M = params->m;
   const int K = params->k;
   const int N = params->n;
@@ -388,7 +395,7 @@ void w13_silu_rowmajor(const uint16_t* A, const uint16_t* B_reo, uint16_t* C, ui
 
 void w13_silu_packed(const uint16_t* packed_A, const uint16_t* B_reo, uint16_t* C, const gemm_params_t* params,
                      int64_t degree) {
-#if defined(__aarch64__) && defined(__ARM_FEATURE_SVE) && defined(__ARM_FEATURE_BF16)
+#if FUSED_CPP_MOE_HAS_SVE_BF16_INTRINSICS
   const int M = params->m;
   const int K = params->k;
   const int N = params->n;
@@ -411,7 +418,7 @@ void w13_silu_packed(const uint16_t* packed_A, const uint16_t* B_reo, uint16_t* 
 
 void w13_silu_packc(const uint16_t* packed_A, const uint16_t* B_reo, uint16_t* C, const gemm_params_t* params,
                     int64_t rows_total, int64_t degree) {
-#if defined(__aarch64__) && defined(__ARM_FEATURE_SVE) && defined(__ARM_FEATURE_BF16)
+#if FUSED_CPP_MOE_HAS_SVE_BF16_INTRINSICS
   const int K = params->k;
   const int N = params->n;
   const int ldc = params->ldc;
@@ -434,7 +441,7 @@ void w13_silu_packc(const uint16_t* packed_A, const uint16_t* B_reo, uint16_t* C
 
 void w2_packed(const uint16_t* packed_A, const uint16_t* B_reo, float* C, const gemm_params_t* params,
                int64_t rows_total) {
-#if defined(__aarch64__) && defined(__ARM_FEATURE_SVE) && defined(__ARM_FEATURE_BF16)
+#if FUSED_CPP_MOE_HAS_SVE_BF16_INTRINSICS
   const int K = params->k;
   const int N = params->n;
   const int ldc = params->ldc;
@@ -455,7 +462,7 @@ void w2_packed(const uint16_t* packed_A, const uint16_t* B_reo, float* C, const 
 }
 
 void w2_rowmajor(const uint16_t* A, const uint16_t* B_reo, float* C, uint16_t* A_reorder, const gemm_params_t* params) {
-#if defined(__aarch64__) && defined(__ARM_FEATURE_SVE) && defined(__ARM_FEATURE_BF16)
+#if FUSED_CPP_MOE_HAS_SVE_BF16_INTRINSICS
   const int M = params->m;
   const int K = params->k;
   const int N = params->n;
