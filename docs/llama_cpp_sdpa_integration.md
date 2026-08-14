@@ -15,10 +15,10 @@ libtorch 或 `fused_cpp._C`。它只保留一个纯 C/C++ 裸指针入口和一�
 
 ## 编译
 
-在 Arm-codex 上：
+在 Arm Codex（`Arm-codex-internal` / `Arm-codex`）上：
 
 ```sh
-cd /home/zhangxu/codex/fused_cpp/standalone/fp32_packqkv
+cd /home/zhangxu/code/standalone/fp32_packqkv
 make -j
 ```
 
@@ -240,7 +240,7 @@ int rc = fused_cpp_sdpa_flash2_neon_l3kv_packqkv_pbf16pv_fp32_llamacpp(
 5. 按 ggml tensor 的 `nb[]` 传入真实 byte stride。
 6. `rc != 0` 时 fallback 到原 `ggml_flash_attn_ext`。
 
-## 当前 Arm-codex 验证
+## 当前 Arm Codex 验证
 
 ```text
 isolated directory build:
@@ -252,8 +252,8 @@ make check:
   causal    max_abs_diff=0
 
 BGE-small fp32, B=1 H=8 L=S=512 D=DV=64, OMP_NUM_THREADS=1:
-  Arm-codex isolated mean_ms ~= 11.00
-  Arm-codex isolated GFLOP/s ~= 49.75
+  Arm Codex isolated mean_ms ~= 11.00
+  Arm Codex isolated GFLOP/s ~= 49.75
   AWS isolated mean_ms ~= 11.78
   AWS isolated GFLOP/s ~= 46.45
 

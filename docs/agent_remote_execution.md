@@ -6,9 +6,10 @@ otherwise.
 
 ## General Rules
 
-- Remote development and benchmark runs primarily use the `Arm-codex` SSH
-  alias. When the user says `aws机器` without naming another host, use
-  `AmazonECS8Cores`.
+- Remote development and benchmark runs primarily use the Arm Codex machine.
+  Use `Arm-codex-internal` on the internal network and `Arm-codex` through the
+  external route. When the user says `aws机器` without naming another host,
+  use `AmazonECS8Cores`.
 - If a requested remote instance cannot be reached, stop the task immediately
   and report the connection failure. Do not silently switch machines or treat a
   local run as equivalent.
@@ -16,14 +17,20 @@ otherwise.
 - Sync local files before remote validation. Preserve unrelated remote data and
   remove stale mirrored source explicitly when a local refactor deletes files.
 
-## Arm-codex
+## Arm Codex
 
-- Host alias: `Arm-codex`
+- Host aliases: `Arm-codex-internal` and `Arm-codex`
+- Preferred/default alias: `Arm-codex-internal`
 - User: `zhangxu`
-- Remote project root: `/home/zhangxu/codex/fused_cpp`
+- Remote project/work directory: `/home/zhangxu/code`
 - Local project root: repository root
-- Python: `/home/zhangxu/codex/fused_cpp/.venv/bin/python`
+- Python: `/home/zhangxu/code/.venv/bin/python`
 - Package manager: `uv`
+
+Both aliases identify the same machine and use the same remote paths. The
+internal alias is the repository default because it is reachable from the
+current development network. The external alias must be configured in the
+caller's SSH config before use.
 
 Sync with:
 
@@ -31,16 +38,22 @@ Sync with:
 bash rsync.sh
 ```
 
+Use the external alias explicitly when needed:
+
+```bash
+ARM_CODEX_HOST=Arm-codex bash rsync.sh
+```
+
 Example check:
 
 ```bash
-ssh Arm-codex 'cd /home/zhangxu/codex/fused_cpp && .venv/bin/python -c "from fused_cpp import _C; print(_C.has_openmp())"'
+ssh Arm-codex-internal 'cd /home/zhangxu/code && .venv/bin/python -c "from fused_cpp import _C; print(_C.has_openmp())"'
 ```
 
 Install missing benchmark dependencies into the project environment:
 
 ```bash
-ssh Arm-codex 'cd /home/zhangxu/codex/fused_cpp && uv pip install <package>'
+ssh Arm-codex-internal 'cd /home/zhangxu/code && uv pip install <package>'
 ```
 
 ## Amazon ECS 8 Cores

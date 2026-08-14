@@ -269,11 +269,11 @@ Basic validation:
 python -m pytest tests/test_sparse_mla.py -q
 ```
 
-Remote ArmCodex flow used during development:
+Remote Arm Codex flow used during development:
 
 ```bash
 bash rsync.sh
-ssh Arm-codex 'cd /home/zhangxu/codex/fused_cpp && touch csrc/sparse_mla.cpp && .venv/bin/python setup.py build_ext --inplace'
+ssh Arm-codex-internal 'cd /home/zhangxu/code && touch csrc/sparse_mla.cpp && .venv/bin/python setup.py build_ext --inplace'
 ```
 
 ## Correctness Checklist
@@ -316,10 +316,10 @@ min_ms
 max_ms
 source-pair GFLOP/s
 per-core GFLOP/s
-efficiency vs ArmCodex single-core peak
+efficiency vs Arm Codex single-core peak
 ```
 
-For ArmCodex, use the peak table referenced by `AGENTS.md`. The fp32 FMLA and
+For Arm Codex, use the peak table referenced by `AGENTS.md`. The fp32 FMLA and
 bf16 MMLA single-core references are both around 92.7 GFLOP/s on that machine.
 
 Important current performance caveats:

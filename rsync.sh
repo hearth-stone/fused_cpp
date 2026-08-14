@@ -1,3 +1,5 @@
+ARM_CODEX_HOST="${ARM_CODEX_HOST:-Arm-codex-internal}"
+
 rsync -avzP \
     --copy-links \
     --exclude='.git/' \
@@ -22,4 +24,4 @@ rsync -avzP \
     --exclude='bench/sdpa/sdpa_versions_*.csv' \
     --exclude='bench/sdpa/sdpa_versions_*.json' \
     --exclude='.codegraph/' \
-    ./ "Arm-codex:/home/zhangxu/codex/fused_cpp"
+    ./ "${ARM_CODEX_HOST}:/home/zhangxu/code"
