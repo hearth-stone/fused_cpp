@@ -13,8 +13,11 @@ This record now covers all three stages. Stage 2 is preserved as commit
 `58881f8`; stage 3 is the selected SVE implementation. The optimized public
 entrypoint and its tensor/API contracts are unchanged. On an SVE BF16 build,
 the gathered sparse head-major QK and PV paths use `N=svcntb()/2`, which is 8
-columns at SVL128 and 16 at SVL256. The shared-dense head-major subpath remains
-fixed 8x8, and non-SVE builds retain the fixed NEON implementation.
+columns at SVL128 and 16 at SVL256. At the time of this staged sparse result,
+the shared-dense head-major subpath remained fixed 8x8. It was subsequently
+converted to the same scalable kernels; see
+`amazon_8c_dense_scalable_sve_20260814.md`. Non-SVE builds retain the fixed
+NEON implementation.
 
 Primary change class: O (production optimization). Numerical behavior remains
 within the existing BF16 tolerance. Each stage has its own commit rollback

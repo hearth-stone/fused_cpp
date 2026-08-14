@@ -65,6 +65,75 @@ inline void pack_indexed_k_tile_bf16(const uint16_t* kv, int64_t kv_row_stride,
   }
 }
 
+// Pack a contiguous K tile into the same scalable B layout. valid_columns may
+// be smaller than 2VL for the final tile; zero panels keep the fixed BFMMLA
+// instruction topology without reading past the shared dense interval.
+inline void pack_contiguous_k_tile_bf16(
+    const uint16_t* kv, int64_t kv_row_stride, int64_t valid_columns,
+    int64_t reduction, uint16_t* packed_k) {
+  const int64_t segments = static_cast<int64_t>(svcntb() / 16);
+  int64_t out = 0;
+  for (int64_t reduction_base = 0; reduction_base < reduction;
+       reduction_base += 4) {
+    for (int64_t column_pair = 0; column_pair < 4; ++column_pair) {
+      for (int64_t segment = 0; segment < segments; ++segment) {
+        const int64_t column0 = segment * 8 + column_pair * 2;
+        const int64_t column1 = column0 + 1;
+        if (column0 < valid_columns) {
+          std::memcpy(packed_k + out,
+                      kv + column0 * kv_row_stride + reduction_base,
+                      4 * sizeof(uint16_t));
+        } else {
+          std::memset(packed_k + out, 0, 4 * sizeof(uint16_t));
+        }
+        out += 4;
+        if (column1 < valid_columns) {
+          std::memcpy(packed_k + out,
+                      kv + column1 * kv_row_stride + reduction_base,
+                      4 * sizeof(uint16_t));
+        } else {
+          std::memset(packed_k + out, 0, 4 * sizeof(uint16_t));
+        }
+        out += 4;
+      }
+    }
+  }
+}
+
+inline void store_v_4x8_bfmmla_segment(
+    const uint16_t* row0_ptr, const uint16_t* row1_ptr,
+    const uint16_t* row2_ptr, const uint16_t* row3_ptr, uint16_t* block,
+    int64_t tile, int64_t segment) {
+  const uint16x8_t row0 = vld1q_u16(row0_ptr);
+  const uint16x8_t row1 = vld1q_u16(row1_ptr);
+  const uint16x8_t row2 = vld1q_u16(row2_ptr);
+  const uint16x8_t row3 = vld1q_u16(row3_ptr);
+  const uint16x8x2_t rows01 = vzipq_u16(row0, row1);
+  const uint16x8x2_t rows23 = vzipq_u16(row2, row3);
+  const uint32x4x2_t columns03 = vzipq_u32(
+      vreinterpretq_u32_u16(rows01.val[0]),
+      vreinterpretq_u32_u16(rows23.val[0]));
+  const uint32x4x2_t columns47 = vzipq_u32(
+      vreinterpretq_u32_u16(rows01.val[1]),
+      vreinterpretq_u32_u16(rows23.val[1]));
+  vst1q_u16(block + 0 * tile + segment * 8,
+            vreinterpretq_u16_u32(columns03.val[0]));
+  vst1q_u16(block + 1 * tile + segment * 8,
+            vreinterpretq_u16_u32(columns03.val[1]));
+  vst1q_u16(block + 2 * tile + segment * 8,
+            vreinterpretq_u16_u32(columns47.val[0]));
+  vst1q_u16(block + 3 * tile + segment * 8,
+            vreinterpretq_u16_u32(columns47.val[1]));
+}
+
+inline void zero_v_bfmmla_segment(uint16_t* block, int64_t tile,
+                                  int64_t segment) {
+  for (int64_t panel = 0; panel < 4; ++panel) {
+    std::memset(block + panel * tile + segment * 8, 0,
+                8 * sizeof(uint16_t));
+  }
+}
+
 // Pack four gathered V rows at a time into the scalable BFMMLA B layout. A
 // NEON 4x8 transpose produces four 4x2 panels for every 128-bit SVE segment;
 // the panels for equal column pairs are adjacent across all segments and form
@@ -87,41 +156,44 @@ inline void pack_indexed_v_tile_bf16(
           output_tile + (reduction_offset + reduction_base) * tile;
       for (int64_t segment = 0; segment < segments; ++segment) {
         const int64_t column = output_base + segment * 8;
-        uint16x8_t row0 = vdupq_n_u16(0);
-        uint16x8_t row1 = vdupq_n_u16(0);
-        uint16x8_t row2 = vdupq_n_u16(0);
-        uint16x8_t row3 = vdupq_n_u16(0);
         if (column + 8 <= output_columns) {
-          row0 = vld1q_u16(kv + indices[reduction_base + 0] *
-                                    kv_row_stride +
-                            column);
-          row1 = vld1q_u16(kv + indices[reduction_base + 1] *
-                                    kv_row_stride +
-                            column);
-          row2 = vld1q_u16(kv + indices[reduction_base + 2] *
-                                    kv_row_stride +
-                            column);
-          row3 = vld1q_u16(kv + indices[reduction_base + 3] *
-                                    kv_row_stride +
-                            column);
+          store_v_4x8_bfmmla_segment(
+              kv + indices[reduction_base + 0] * kv_row_stride + column,
+              kv + indices[reduction_base + 1] * kv_row_stride + column,
+              kv + indices[reduction_base + 2] * kv_row_stride + column,
+              kv + indices[reduction_base + 3] * kv_row_stride + column,
+              block, tile, segment);
+        } else {
+          zero_v_bfmmla_segment(block, tile, segment);
         }
+      }
+    }
+  }
+}
 
-        const uint16x8x2_t rows01 = vzipq_u16(row0, row1);
-        const uint16x8x2_t rows23 = vzipq_u16(row2, row3);
-        const uint32x4x2_t columns03 = vzipq_u32(
-            vreinterpretq_u32_u16(rows01.val[0]),
-            vreinterpretq_u32_u16(rows23.val[0]));
-        const uint32x4x2_t columns47 = vzipq_u32(
-            vreinterpretq_u32_u16(rows01.val[1]),
-            vreinterpretq_u32_u16(rows23.val[1]));
-        vst1q_u16(block + 0 * tile + segment * 8,
-                  vreinterpretq_u16_u32(columns03.val[0]));
-        vst1q_u16(block + 1 * tile + segment * 8,
-                  vreinterpretq_u16_u32(columns03.val[1]));
-        vst1q_u16(block + 2 * tile + segment * 8,
-                  vreinterpretq_u16_u32(columns47.val[0]));
-        vst1q_u16(block + 3 * tile + segment * 8,
-                  vreinterpretq_u16_u32(columns47.val[1]));
+// Pack a contiguous V slab into one scalable B tile. The caller parallelizes
+// independent output tiles and supplies valid_columns for an optional final
+// eight-column half tile at SVL256.
+inline void pack_contiguous_v_tile_bf16(
+    const uint16_t* kv, int64_t kv_row_stride, int64_t reduction_rows,
+    int64_t output_base, int64_t valid_columns, uint16_t* packed_v) {
+  const int64_t tile = n_tile();
+  const int64_t segments = static_cast<int64_t>(svcntb() / 16);
+  for (int64_t reduction_base = 0; reduction_base < reduction_rows;
+       reduction_base += 4) {
+    uint16_t* block = packed_v + reduction_base * tile;
+    for (int64_t segment = 0; segment < segments; ++segment) {
+      const int64_t local_column = segment * 8;
+      if (local_column + 8 <= valid_columns) {
+        const int64_t column = output_base + local_column;
+        store_v_4x8_bfmmla_segment(
+            kv + (reduction_base + 0) * kv_row_stride + column,
+            kv + (reduction_base + 1) * kv_row_stride + column,
+            kv + (reduction_base + 2) * kv_row_stride + column,
+            kv + (reduction_base + 3) * kv_row_stride + column, block, tile,
+            segment);
+      } else {
+        zero_v_bfmmla_segment(block, tile, segment);
       }
     }
   }

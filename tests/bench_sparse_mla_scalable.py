@@ -54,8 +54,32 @@ def build_indices(
     )
 
 
+def build_dense_indices(
+    s_q: int,
+    topk: int,
+    dense_start: int,
+) -> tuple[torch.Tensor, int, int]:
+    values = (
+        torch.arange(dense_start, dense_start + topk, dtype=torch.int32)
+        .reshape(1, 1, topk)
+        .expand(s_q, 1, topk)
+        .clone()
+    )
+    return values, s_q * topk, dense_start + topk
+
+
+def percentile(samples: list[float], fraction: float) -> float:
+    ordered = sorted(samples)
+    position = fraction * (len(ordered) - 1)
+    lower = int(position)
+    upper = min(lower + 1, len(ordered) - 1)
+    weight = position - lower
+    return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--pattern", choices=("sparse", "dense"), default="sparse")
     parser.add_argument("--s-q", type=int, default=2048)
     parser.add_argument("--h-q", type=int, default=32)
     parser.add_argument("--d-qk", type=int, default=192)
@@ -64,6 +88,7 @@ def main() -> None:
     parser.add_argument("--window-size", type=int, default=128)
     parser.add_argument("--compress-ratio", type=int, default=4)
     parser.add_argument("--context-start", type=int, default=0)
+    parser.add_argument("--dense-start", type=int, default=0)
     parser.add_argument("--threads", type=int, default=1)
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iters", type=int, default=21)
@@ -76,13 +101,20 @@ def main() -> None:
     except RuntimeError:
         pass
     torch.manual_seed(args.seed)
-    indices, valid_pairs, s_kv = build_indices(
-        args.s_q,
-        args.compressed_capacity,
-        args.window_size,
-        args.compress_ratio,
-        args.context_start,
-    )
+    if args.pattern == "dense":
+        indices, valid_pairs, s_kv = build_dense_indices(
+            args.s_q,
+            args.compressed_capacity + args.window_size,
+            args.dense_start,
+        )
+    else:
+        indices, valid_pairs, s_kv = build_indices(
+            args.s_q,
+            args.compressed_capacity,
+            args.window_size,
+            args.compress_ratio,
+            args.context_start,
+        )
     q = torch.randn(args.s_q, args.h_q, args.d_qk).bfloat16()
     kv = torch.randn(s_kv, 1, args.d_qk).bfloat16()
     output = torch.empty(
@@ -104,14 +136,19 @@ def main() -> None:
         samples.append((time.perf_counter() - start) * 1e3)
     source_flops = 2.0 * valid_pairs * args.h_q * (args.d_qk + args.d_v)
     median_ms = statistics.median(samples)
+    mean_ms = statistics.mean(samples)
+    std_ms = statistics.stdev(samples) if len(samples) > 1 else 0.0
     print(
-        f"shape=q[{args.s_q},{args.h_q},{args.d_qk}],"
+        f"pattern={args.pattern},shape=q[{args.s_q},{args.h_q},{args.d_qk}],"
         f"kv[{s_kv},1,{args.d_qk}],topk={indices.shape[-1]},"
         f"d_v={args.d_v},valid_pairs={valid_pairs}"
     )
     print(
         f"threads={args.threads},warmup={args.warmup},iters={args.iters},"
         f"seed={args.seed},median_ms={median_ms:.3f},"
+        f"mean_ms={mean_ms:.3f},std_ms={std_ms:.3f},"
+        f"p90_ms={percentile(samples, 0.90):.3f},"
+        f"p99_ms={percentile(samples, 0.99):.3f},"
         f"min_ms={min(samples):.3f},max_ms={max(samples):.3f},"
         f"source_gflops={source_flops / (median_ms / 1e3) / 1e9:.2f},"
         f"checksum={output.float().sum().item():.6f}"

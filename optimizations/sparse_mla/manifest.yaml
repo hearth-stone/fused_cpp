@@ -10,17 +10,19 @@ default:
   id: head_major_sve_qkpv_8x2vl
   entrypoint: flash_mla_sparse_fwd
   dispatch: >-
-    Supported SVE BF16 MQA shapes use one-token tasks and scalable 8-head by
-    2VL-column BFMMLA QK/PV once eight-query block parallelism exceeds half the
-    requested workers. Fully shared dense indices use the fixed 8x8 call-level
-    K/V packing path. Non-SVE, short-query, FP32, and unsupported shapes retain
-    their existing fallbacks.
+    Once eight-query block parallelism exceeds half the requested workers,
+    supported SVE BF16 MQA shapes use one-token tasks and scalable 8-head by
+    2VL-column BFMMLA QK/PV for gathered sparse or fully shared dense indices;
+    the latter uses scalable call-level K/V packing. Non-SVE, short-query,
+    FP32, and unsupported shapes retain their existing fallbacks.
 
 benchmark_scenarios:
   production_smoke: >-
     tests/bench_sparse_mla.py --warmup 5 --iters 30
   adoption_evidence: >-
     optimizations/sparse_mla/results/amazon_8c_scalable_sve_20260814.md
+  dense_adoption_evidence: >-
+    optimizations/sparse_mla/results/amazon_8c_dense_scalable_sve_20260814.md
   short_chunk_evidence: >-
     optimizations/sparse_mla/results/amazon_sparse_mla_2d_fused_20260812.md
   retired_tail_evidence: >-
@@ -40,8 +42,11 @@ features:
       PYTHONPATH=src OMP_NUM_THREADS=4 .venv/bin/python -m pytest -q
       tests/test_sparse_mla.py
     benchmark: >-
-      See optimizations/sparse_mla/results/arm_head_major_20260813.md.
-    result: optimizations/sparse_mla/results/arm_head_major_20260813.md
+      tests/bench_sparse_mla_scalable.py --pattern dense --threads 1|8
+      --warmup 5 --iters 21
+    result: >-
+      optimizations/sparse_mla/results/arm_head_major_20260813.md and
+      optimizations/sparse_mla/results/amazon_8c_dense_scalable_sve_20260814.md
 
   - id: scheduling.head_major_sparse
     part: scheduling
@@ -78,42 +83,70 @@ features:
       See optimizations/sparse_mla/results/amazon_sparse_mla_2d_fused_20260812.md.
     result: optimizations/sparse_mla/results/amazon_sparse_mla_2d_fused_20260812.md
 
+  - id: packing.sve_dense_kv_2vl
+    part: packing
+    status: enabled
+    implementation: csrc/sparse_mla_sve.h
+    hypothesis: >-
+      Pack shared contiguous K/V once per call into the scalable BFMMLA layout,
+      zero-padding only the optional final SVL256 half tile, so every 8-head
+      group can reuse 2VL-column QK/PV panels without indexed gather overhead.
+    depends_on:
+      - scheduling.head_major_dense
+    conflicts_with: []
+    correctness: >-
+      Forced SVL128 and SVL256 each pass tests/test_sparse_mla.py, including
+      shared-dense output/statistics and SVL256 half-tile cases.
+    benchmark: >-
+      tests/bench_sparse_mla_scalable.py --pattern dense --threads 1|8
+      --warmup 5 --iters 21
+    result: >-
+      optimizations/sparse_mla/results/amazon_8c_dense_scalable_sve_20260814.md
+
   - id: compute.sve_qk_8x2vl_bfmmla
     part: compute
     status: enabled
     implementation: csrc/sparse_mla_sve.h
     hypothesis: >-
       Preserve the same 16-accumulator BFMMLA topology across SVE vector
-      lengths while doubling the sparse QK key tile from 8 to 16 at SVL256.
+      lengths while using an 8-key tile at SVL128 and a 16-key tile at SVL256
+      for both gathered-sparse and fully shared dense QK.
     depends_on:
+      - scheduling.head_major_dense
       - scheduling.head_major_sparse
     conflicts_with: []
     correctness: >-
       Forced SVL128 and default SVL256 each pass tests/test_sparse_mla.py;
       see the result record for the prctl launcher and commands.
     benchmark: >-
-      tests/bench_sparse_mla_scalable.py --threads 1|8 --warmup 5 --iters 21
+      tests/bench_sparse_mla_scalable.py --pattern sparse|dense --threads 1|8
+      --warmup 5 --iters 21
     result: >-
-      optimizations/sparse_mla/results/amazon_8c_scalable_sve_20260814.md
+      optimizations/sparse_mla/results/amazon_8c_scalable_sve_20260814.md and
+      optimizations/sparse_mla/results/amazon_8c_dense_scalable_sve_20260814.md
 
   - id: compute.sve_pv_8x2vl_bfmmla
     part: compute
     status: enabled
     implementation: csrc/sparse_mla_sve.h
     hypothesis: >-
-      Directly pack gathered V through a 4x8 transpose and use the same
+      Pack gathered or contiguous V through a 4x8 transpose and use the same
       scalable 16-accumulator BFMMLA topology for the probability-value GEMM.
     depends_on:
+      - scheduling.head_major_dense
       - scheduling.head_major_sparse
+      - packing.sve_dense_kv_2vl
       - compute.sve_qk_8x2vl_bfmmla
     conflicts_with: []
     correctness: >-
       Forced SVL128 and default SVL256 each pass tests/test_sparse_mla.py,
       including Dv=8 and the SVL256 half-tile Dv=24 cases.
     benchmark: >-
-      tests/bench_sparse_mla_scalable.py --threads 1|8 --warmup 5 --iters 21
+      tests/bench_sparse_mla_scalable.py --pattern sparse|dense --threads 1|8
+      --warmup 5 --iters 21
     result: >-
-      optimizations/sparse_mla/results/amazon_8c_scalable_sve_20260814.md
+      optimizations/sparse_mla/results/amazon_8c_scalable_sve_20260814.md and
+      optimizations/sparse_mla/results/amazon_8c_dense_scalable_sve_20260814.md
 
   - id: planning.masked_dense_tail
     part: planning
@@ -169,10 +202,12 @@ variants:
       - scheduling.head_major_dense
       - scheduling.head_major_sparse
       - scheduling.kv_2d_split
+      - packing.sve_dense_kv_2vl
       - compute.sve_qk_8x2vl_bfmmla
       - compute.sve_pv_8x2vl_bfmmla
     result: >-
-      optimizations/sparse_mla/results/amazon_8c_scalable_sve_20260814.md
+      optimizations/sparse_mla/results/amazon_8c_scalable_sve_20260814.md and
+      optimizations/sparse_mla/results/amazon_8c_dense_scalable_sve_20260814.md
 
   - id: head_major_sve_qk_8x2vl_neon_pv
     status: retired
