@@ -1100,6 +1100,18 @@ class AnalyticMoeCostModel:
             self._w2_geometry.bytes_per_worker(threads),
         )
 
+    def native_quick_planner_payload(self) -> dict[str, object]:
+        """Export immutable metadata used around native homogeneous LPT."""
+        return {
+            "max_stage_bytes": self.max_stage_bytes,
+            "relative_error": self.relative_error,
+            "profile_runs": self.profile_runs,
+            "window_bytes_by_width": [
+                (width, self.window_bytes_per_worker(width))
+                for width in self.supported_widths
+            ],
+        }
+
     def stage_bytes_per_worker(self, stage: str, threads: int, routes: int | None = None) -> int:
         del routes
         if stage == "w13":

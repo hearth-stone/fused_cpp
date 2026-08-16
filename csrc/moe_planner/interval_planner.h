@@ -164,4 +164,28 @@ class NativeIntervalPlanner {
   ~NativeIntervalPlanner();
 };
 
+// Native homogeneous LPT and candidate selection for the analytical online
+// planner. Isolated costs are computed by the Python analytical model and
+// passed as immutable doubles; this class owns no Python state and is safe for
+// concurrent calls.
+class NativeQuickPlanner {
+ public:
+  NativeQuickPlanner(int num_cores, std::vector<std::vector<int>> shapes, int64_t max_stage_bytes,
+                     std::vector<std::pair<int, int64_t>> window_bytes_by_width, double relative_error,
+                     int profile_runs);
+
+  IntervalPlanResult Plan(const std::vector<int>& expert_ids, const std::vector<int>& routes,
+                          const std::vector<std::vector<double>>& costs) const;
+  IntervalCandidate Assign(const std::vector<int>& expert_ids, const std::vector<int>& routes,
+                           const std::vector<int>& shape, const std::vector<double>& costs) const;
+
+ private:
+  int num_cores_ = 0;
+  std::vector<std::vector<int>> shapes_;
+  int64_t max_stage_bytes_ = 0;
+  std::vector<std::pair<int, int64_t>> window_bytes_by_width_;
+  double relative_error_ = 0.0;
+  int profile_runs_ = 1;
+};
+
 }  // namespace moe_planner

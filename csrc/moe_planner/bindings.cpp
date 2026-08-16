@@ -278,6 +278,28 @@ py::dict interval_candidate_to_python(const IntervalCandidate& candidate) {
   return result;
 }
 
+py::dict interval_candidate_summary_to_python(const IntervalCandidate& candidate) {
+  py::dict result;
+  result["shape"] = candidate.shape;
+  result["execution_mode"] = interval_execution_mode_name(candidate.execution_mode);
+  result["tail_pool_threads"] =
+      candidate.tail_pool_threads.has_value() ? py::cast(*candidate.tail_pool_threads) : py::none();
+  result["tail_pool_max_routes"] =
+      candidate.tail_pool_max_routes.has_value() ? py::cast(*candidate.tail_pool_max_routes) : py::none();
+  result["tail_pool_tasks"] = candidate.tail_pool_tasks;
+  result["tail_repartition_width"] =
+      candidate.tail_repartition_width.has_value() ? py::cast(*candidate.tail_repartition_width) : py::none();
+  result["tail_repartition_tasks"] = candidate.tail_repartition_tasks;
+  result["tail_repartition_route_slices"] = candidate.tail_repartition_route_slices;
+  result["makespan_ns"] = candidate.makespan_ns;
+  result["uncertainty_ns"] = candidate.uncertainty_ns;
+  result["pessimistic_ns"] = candidate.pessimistic_ns;
+  result["active_working_set_bytes"] = candidate.active_working_set_bytes;
+  result["window_bytes_per_worker"] = candidate.window_bytes_per_worker;
+  result["resource_groups"] = candidate.resource_groups;
+  return result;
+}
+
 py::dict native_interval_plan(const NativeIntervalPlanner& planner, const std::vector<int>& expert_ids,
                               const std::vector<int>& routes, bool dynamic_tail_pool, int tail_pool_max_routes,
                               std::optional<int> forced_tail_pool_threads,
@@ -302,6 +324,36 @@ py::dict native_interval_plan(const NativeIntervalPlanner& planner, const std::v
   result["dynamic_candidates"] = native_result.dynamic_candidates;
   result["tail_repartition_candidates"] = native_result.tail_repartition_candidates;
   return result;
+}
+
+py::dict native_quick_plan(const NativeQuickPlanner& planner, const std::vector<int>& expert_ids,
+                           const std::vector<int>& routes, const std::vector<std::vector<double>>& costs) {
+  IntervalPlanResult native_result;
+  {
+    py::gil_scoped_release release;
+    native_result = planner.Plan(expert_ids, routes, costs);
+  }
+  py::dict result;
+  result["selected"] = interval_candidate_to_python(native_result.selected);
+  py::list candidates;
+  for (const IntervalCandidate& candidate : native_result.candidates) {
+    candidates.append(interval_candidate_summary_to_python(candidate));
+  }
+  result["candidates"] = std::move(candidates);
+  result["configured_workers"] = native_result.configured_workers;
+  result["strict_candidates"] = native_result.strict_candidates;
+  return result;
+}
+
+py::dict native_quick_assign(const NativeQuickPlanner& planner, const std::vector<int>& expert_ids,
+                             const std::vector<int>& routes, const std::vector<int>& shape,
+                             const std::vector<double>& costs) {
+  IntervalCandidate candidate;
+  {
+    py::gil_scoped_release release;
+    candidate = planner.Assign(expert_ids, routes, shape, costs);
+  }
+  return interval_candidate_to_python(candidate);
 }
 
 // routes_hist: 1-D histogram (length num_experts). Returns a dict mirroring
@@ -463,6 +515,14 @@ void register_moe_planner(py::module_& m) {
       .def("_estimate_isolated", &moe_planner::NativeIntervalPlanner::EstimateIsolated)
       .def("_score_dag", &moe_planner::NativeIntervalPlanner::ScoreDag)
       .def_property_readonly("configured_workers", &moe_planner::NativeIntervalPlanner::configured_workers);
+
+  py::class_<moe_planner::NativeQuickPlanner>(m, "NativeQuickPlanner")
+      .def(py::init<int, std::vector<std::vector<int>>, int64_t, std::vector<std::pair<int, int64_t>>, double, int>(),
+           py::arg("num_cores"), py::arg("shapes"), py::arg("max_stage_bytes"), py::arg("window_bytes_by_width"),
+           py::arg("relative_error"), py::arg("profile_runs") = 1)
+      .def("plan", &native_quick_plan, py::arg("expert_ids"), py::arg("routes"), py::arg("costs"))
+      .def("assign", &native_quick_assign, py::arg("expert_ids"), py::arg("routes"), py::arg("shape"),
+           py::arg("costs"));
 
   m.def("moe_schedule_plan", &moe_schedule_plan,
         "CPU MoE schedule planner (FIXED / SORTED_TOKEN_BALANCED_1T / "

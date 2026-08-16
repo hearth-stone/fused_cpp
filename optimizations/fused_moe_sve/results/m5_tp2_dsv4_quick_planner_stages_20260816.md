@@ -41,12 +41,19 @@ committed.
 | baseline Python generic LPT | 1 | 126.788 ms | 125.917 ms | 125.610 ms | 32.676 ms | -- |
 | 1: deduplicated cost + homogeneous heap LPT | 0 | 36.486 ms | 35.633 ms | 35.334 ms | 32.665 ms | +71.15% |
 | 1: deduplicated cost + homogeneous heap LPT | 1 | 36.258 ms | 35.378 ms | 35.067 ms | 32.569 ms | +71.87% |
+| 2: single-thread native LPT/search boundary | 0 | 32.869 ms | 31.998 ms | 31.683 ms | 29.633 ms | +10.15% vs stage 1; +74.17% cumulative |
+| 2: single-thread native LPT/search boundary | 1 | 32.617 ms | 31.739 ms | 31.425 ms | 29.546 ms | +10.01% vs stage 1; +74.73% cumulative |
 
 The immediate-hit change was -0.78% on rank0 and +0.43% on rank1 by median
 paired layer, within the 2% gate. Sequential first-pass total planner time fell
 from 5.759 s to 2.079 s on rank0 (+63.91%) and from 5.879 s to 2.090 s on
 rank1 (+64.45%). First-pass medians are noisier than forced misses because the
 two ranks progress through differently sized layers concurrently.
+
+Stage 2 also improved immediate-hit planner overhead by 9.68% on rank0 and
+9.27% on rank1 relative to stage 1. Sequential first-pass total planner time
+fell from 2.079 s to 1.940 s on rank0 (+6.69%) and from 2.090 s to 1.952 s on
+rank1 (+6.58%).
 
 ## Stage 1 implementation and parity
 
@@ -70,16 +77,37 @@ The comparison includes every `AsyncMoEPlanV2` tensor field, task order,
 dependencies, stage windows, CPU ids, execution mode, and tri-state
 `early_merge`, plus the selected shape.
 
+## Stage 2 implementation and parity
+
+Stage 2 keeps exact analytical `T_iso` evaluation in Python and passes one
+immutable cost row per homogeneous shape to a single-threaded C++ planner.
+Native code performs the deterministic heap LPT assignment, candidate scoring,
+and winner selection. The pybind boundary fully materializes only the selected
+candidate; non-selected candidates return only the fields needed by ranking.
+Cached-shape materialization uses the same native assignment, while builds
+without `NativeQuickPlanner` retain the stage-1 Python fallback.
+
+The native implementation preserves stable route ordering and the rounded
+`load + cost` low-lane-id tie-break. All 43 fully materialized plans remained
+byte-identical to stage 1 on both ranks, with the same SHA256 values shown
+above. The runtime reported `planner_backend=cpp_quick`; this stage deliberately
+uses one planner worker so candidate parallelism can be measured independently.
+
 ## Validation
 
 ```text
 PYTHONPATH=src .venv/bin/python -m pytest -q \
+  tests/test_moe_native_interval_planner.py \
   tests/test_moe_cost_model_v2.py tests/test_moe_analytic_model.py
 .venv/bin/python -m ruff check \
+  cpu_moe_schedule_optimization/cost_model/analytic_model.py \
   cpu_moe_schedule_optimization/planners/interval_planner.py \
-  tests/test_moe_cost_model_v2.py
+  cpu_moe_schedule_optimization/planners/planned_moe.py \
+  tests/test_moe_native_interval_planner.py
 ```
 
 Stage 1 adds direct coverage for generic/heap assignment parity, analytical
-cost deduplication, and the rounded-score low-lane-id tie-break. Later stages
-will append results to the same table.
+cost deduplication, and the rounded-score low-lane-id tie-break. Stage 2 adds
+native analytical quick-plan equivalence and direct native tie coverage. Local
+validation passed 149 tests; the matching m5 build passed 146 tests. Later
+stages will append results to the same table.

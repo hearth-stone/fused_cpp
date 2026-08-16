@@ -215,10 +215,34 @@ class IntervalPlanner:
                 native_cold_planner=native_cold_planner,
                 planner_threads=planner_threads,
             )
+            self._native_quick_planner = self._create_native_quick_planner()
         else:
             if native_cold_planner is True:
                 raise ValueError("native cold planner does not yet support stage-specific scoring")
             self._native_planner = None
+            self._native_quick_planner = None
+
+    def _create_native_quick_planner(self):
+        exporter = getattr(self.model, "native_quick_planner_payload", None)
+        if not callable(exporter):
+            return None
+        try:
+            extension = importlib.import_module("fused_cpp._C")
+            native_type = extension.NativeQuickPlanner
+        except (ImportError, AttributeError):
+            return None
+        homogeneous_shapes = [shape for shape in self.shapes if len(set(shape)) == 1]
+        if not homogeneous_shapes:
+            return None
+        payload = exporter()
+        return native_type(
+            self.num_cores,
+            [list(shape) for shape in homogeneous_shapes],
+            int(payload["max_stage_bytes"]),
+            payload["window_bytes_by_width"],
+            float(payload["relative_error"]),
+            int(payload["profile_runs"]),
+        )
 
     def _create_native_planner(
         self,
@@ -325,6 +349,33 @@ class IntervalPlanner:
         for load, lane in availability:
             lane_loads[lane] = load
         return lane_experts, lane_loads
+
+    def _quick_cost_rows(self, experts, shapes):
+        rows = []
+        for shape in shapes:
+            width = int(shape[0])
+            task_times = {
+                routes: self._task_time(routes, width)
+                for routes in dict.fromkeys(routes for _, routes in experts)
+            }
+            rows.append([task_times[routes] for _, routes in experts])
+        return rows
+
+    def quick_tasks_for_shape(self, experts, shape):
+        """Build exact homogeneous LPT tasks using the native helper when available."""
+        signature = tuple(int(value) for value in shape)
+        lanes = self._lanes(signature)
+        if self._native_quick_planner is None:
+            assignment, _ = self._assign_homogeneous_lpt(experts, lanes)
+            return self._build_tasks(experts, lanes, assignment)
+        costs = self._quick_cost_rows(experts, (signature,))[0]
+        result = self._native_quick_planner.assign(
+            [expert for expert, _ in experts],
+            [routes for _, routes in experts],
+            list(signature),
+            costs,
+        )
+        return result["tasks"]
 
     @staticmethod
     def _reverse_lanes(lane_experts, parity: int):
@@ -1202,6 +1253,22 @@ class IntervalPlanner:
         homogeneous_shapes = [shape for shape in self.shapes if len(set(shape)) == 1]
         if not homogeneous_shapes:
             raise ProfileCompatibilityError("quick planning requires at least one homogeneous shape")
+        if self._native_quick_planner is not None:
+            native = self._native_quick_planner.plan(
+                [expert for expert, _ in experts],
+                [routes for _, routes in experts],
+                self._quick_cost_rows(experts, homogeneous_shapes),
+            )
+            return self._finalize_plan(
+                native["selected"],
+                native["candidates"],
+                topk_ids=topk_ids,
+                planner_backend="cpp_quick",
+                planner_workers=int(native["configured_workers"]),
+                strict_candidates=int(native["strict_candidates"]),
+                dynamic_candidates=0,
+                tail_repartition_candidates=0,
+            )
         candidates = [self._quick_candidate(experts, shape) for shape in homogeneous_shapes]
         selected = min(
             candidates,

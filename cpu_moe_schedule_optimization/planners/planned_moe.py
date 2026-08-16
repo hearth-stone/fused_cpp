@@ -134,10 +134,13 @@ class PlannedMoE:
         topk_ids=None,
     ):
         planner = self.interval_planners[planner_index]
-        lanes = planner._lanes(shape)
-        lpt_assignment = planner._assign_lpt(counts, lanes)
-        assignment = planner._assignment_for_order(lpt_assignment, assignment_order)
-        tasks = planner._build_tasks(counts, lanes, assignment)
+        if self.search_mode == "quick" and len(set(shape)) == 1:
+            tasks = planner.quick_tasks_for_shape(counts, shape)
+        else:
+            lanes = planner._lanes(shape)
+            lpt_assignment = planner._assign_lpt(counts, lanes)
+            assignment = planner._assignment_for_order(lpt_assignment, assignment_order)
+            tasks = planner._build_tasks(counts, lanes, assignment)
         if tail_repartition_width is not None:
             if (
                 execution_mode != "strict"

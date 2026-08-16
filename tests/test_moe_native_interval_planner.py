@@ -13,6 +13,7 @@ PLANNERS = ROOT / "cpu_moe_schedule_optimization" / "planners"
 sys.path[:0] = [str(COST_MODEL), str(PLANNERS)]
 
 from interval_planner import IntervalPlanner  # noqa: E402
+from analytic_model import AnalyticMoeCostModel  # noqa: E402
 from phase_model import ContentionCostModel  # noqa: E402
 from workload_catalog import load_routing_workload  # noqa: E402
 
@@ -26,6 +27,11 @@ TP4_96C_PROFILE = (
     COST_MODEL
     / "profiles"
     / "contention_async_amazon_c5_192c_numa0_tp4_sve_F512_E256_fulln_schema_v2_xbyak_exactm_20260727.json"
+)
+ANALYTIC_PROFILE = (
+    COST_MODEL
+    / "profiles"
+    / "analytic_machine_amazon_ecs_v1_8c_sve_jit_hot_gemm_20260809.json"
 )
 
 
@@ -150,6 +156,58 @@ def test_native_parallel_cold_search_matches_python(iso_mode: str) -> None:
             _assert_plan_equivalent(expected, actual)
             assert actual["planner_backend"] == "cpp"
             assert actual["planner_workers"] == workers
+
+
+def test_native_analytical_quick_search_matches_python() -> None:
+    extension = _native_extension()
+    if not hasattr(extension, "NativeQuickPlanner"):
+        pytest.skip("fused_cpp._C was built without NativeQuickPlanner")
+    model = AnalyticMoeCostModel(
+        ANALYTIC_PROFILE,
+        hidden_size=64,
+        intermediate_size=32,
+        global_experts=8,
+        local_experts=8,
+    )
+    reference = IntervalPlanner(model, num_cores=8, native_cold_planner=False)
+    actual = IntervalPlanner(model, num_cores=8, native_cold_planner=False)
+    assert actual._native_quick_planner is not None
+    reference._native_quick_planner = None
+    experts = [
+        (0, 2040),
+        (1, 768),
+        (2, 192),
+        (3, 48),
+        (4, 12),
+        (5, 8),
+        (6, 4),
+        (7, 1),
+    ]
+
+    expected = reference.plan_quick(experts)
+    result = actual.plan_quick(experts)
+
+    _assert_plan_equivalent(expected, result)
+    assert result["planner_backend"] == "cpp_quick"
+    assert result["planner_workers"] == 1
+
+
+def test_native_quick_assignment_preserves_rounded_score_tie_break() -> None:
+    extension = _native_extension()
+    if not hasattr(extension, "NativeQuickPlanner"):
+        pytest.skip("fused_cpp._C was built without NativeQuickPlanner")
+    planner = extension.NativeQuickPlanner(
+        2,
+        [[1, 1]],
+        1,
+        [(1, 1)],
+        0.0,
+        1,
+    )
+
+    result = planner.assign([0, 1, 2], [4, 3, 2], [1, 1], [2.0, 1.0, 1.0e20])
+
+    assert [task[0] for task in result["tasks"]] == [0, 2, 1]
 
 
 def test_native_bounded_tail_repartition_matches_python() -> None:

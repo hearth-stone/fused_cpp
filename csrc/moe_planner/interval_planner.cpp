@@ -7,6 +7,7 @@
 #include <exception>
 #include <limits>
 #include <map>
+#include <numeric>
 #include <queue>
 #include <set>
 #include <stdexcept>
@@ -1609,6 +1610,149 @@ IntervalPlanResult NativeIntervalPlanner::Plan(const std::vector<int>& expert_id
   result.configured_workers = configured_workers_;
   result.selected = SelectCandidate(&candidates);
   result.candidates = std::move(candidates);
+  return result;
+}
+
+NativeQuickPlanner::NativeQuickPlanner(int num_cores, std::vector<std::vector<int>> shapes, int64_t max_stage_bytes,
+                                       std::vector<std::pair<int, int64_t>> window_bytes_by_width,
+                                       double relative_error, int profile_runs)
+    : num_cores_(num_cores),
+      shapes_(std::move(shapes)),
+      max_stage_bytes_(max_stage_bytes),
+      window_bytes_by_width_(std::move(window_bytes_by_width)),
+      relative_error_(relative_error),
+      profile_runs_(profile_runs) {
+  if (num_cores_ <= 0 || max_stage_bytes_ <= 0 || profile_runs_ <= 0) {
+    throw std::invalid_argument("native quick planner dimensions and profile_runs must be positive");
+  }
+  if (!std::isfinite(relative_error_) || relative_error_ < 0.0) {
+    throw std::invalid_argument("native quick planner relative_error must be finite and non-negative");
+  }
+  if (shapes_.empty()) {
+    throw std::invalid_argument("native quick planner requires homogeneous shapes");
+  }
+  for (const std::vector<int>& shape : shapes_) {
+    if (shape.empty() || std::accumulate(shape.begin(), shape.end(), 0) != num_cores_ ||
+        !std::all_of(shape.begin(), shape.end(), [&](int width) { return width == shape.front(); })) {
+      throw std::invalid_argument("native quick planner shapes must be homogeneous and cover num_cores");
+    }
+    const auto window = std::find_if(window_bytes_by_width_.begin(), window_bytes_by_width_.end(),
+                                     [&](const auto& entry) { return entry.first == shape.front(); });
+    if (window == window_bytes_by_width_.end() || window->second <= 0) {
+      throw std::invalid_argument("native quick planner is missing positive window bytes for a shape width");
+    }
+  }
+}
+
+IntervalCandidate NativeQuickPlanner::Assign(const std::vector<int>& expert_ids, const std::vector<int>& routes,
+                                             const std::vector<int>& shape, const std::vector<double>& costs) const {
+  if (expert_ids.empty() || expert_ids.size() != routes.size() || routes.size() != costs.size()) {
+    throw std::invalid_argument("native quick planner expert_ids, routes, and costs must have equal positive size");
+  }
+  if (shape.empty() || std::accumulate(shape.begin(), shape.end(), 0) != num_cores_ ||
+      !std::all_of(shape.begin(), shape.end(), [&](int width) { return width == shape.front(); })) {
+    throw std::invalid_argument("native quick assignment requires a homogeneous shape covering num_cores");
+  }
+  if (std::any_of(routes.begin(), routes.end(), [](int value) { return value <= 0; }) ||
+      std::any_of(costs.begin(), costs.end(), [](double value) { return !std::isfinite(value) || value <= 0.0; })) {
+    throw std::invalid_argument("native quick planner routes and costs must be positive and finite");
+  }
+
+  struct LaneAvailability {
+    double load = 0.0;
+    int lane = 0;
+  };
+  const auto greater = [](const LaneAvailability& left, const LaneAvailability& right) {
+    return std::tie(left.load, left.lane) > std::tie(right.load, right.lane);
+  };
+  std::priority_queue<LaneAvailability, std::vector<LaneAvailability>, decltype(greater)> availability(greater);
+  std::vector<std::vector<size_t>> lane_experts(shape.size());
+  for (size_t lane = 0; lane < shape.size(); ++lane) {
+    availability.push({0.0, static_cast<int>(lane)});
+  }
+  std::vector<size_t> order(routes.size());
+  std::iota(order.begin(), order.end(), 0);
+  std::stable_sort(order.begin(), order.end(), [&](size_t left, size_t right) { return routes[left] > routes[right]; });
+  for (size_t index : order) {
+    LaneAvailability selected = availability.top();
+    availability.pop();
+    const double score = selected.load + costs[index];
+    std::vector<LaneAvailability> tied;
+    while (!availability.empty() && availability.top().load + costs[index] == score) {
+      tied.push_back(availability.top());
+      availability.pop();
+    }
+    for (const LaneAvailability& candidate : tied) {
+      if (candidate.lane < selected.lane) {
+        availability.push(selected);
+        selected = candidate;
+      } else {
+        availability.push(candidate);
+      }
+    }
+    lane_experts[static_cast<size_t>(selected.lane)].push_back(index);
+    availability.push({score, selected.lane});
+  }
+
+  std::vector<double> lane_loads(shape.size(), 0.0);
+  while (!availability.empty()) {
+    const LaneAvailability lane = availability.top();
+    availability.pop();
+    lane_loads[static_cast<size_t>(lane.lane)] = lane.load;
+  }
+  IntervalCandidate candidate;
+  candidate.shape = shape;
+  candidate.makespan_ns = *std::max_element(lane_loads.begin(), lane_loads.end());
+  const int waves = std::max(1, static_cast<int>((routes.size() + shape.size() - 1) / shape.size()));
+  candidate.uncertainty_ns =
+      candidate.makespan_ns * relative_error_ / std::sqrt(static_cast<double>(waves * profile_runs_));
+  candidate.pessimistic_ns = candidate.makespan_ns + candidate.uncertainty_ns;
+  candidate.active_working_set_bytes = static_cast<int64_t>(shape.size()) * max_stage_bytes_;
+  candidate.resource_groups = static_cast<int>(shape.size());
+  const auto window = std::find_if(window_bytes_by_width_.begin(), window_bytes_by_width_.end(),
+                                   [&](const auto& entry) { return entry.first == shape.front(); });
+  if (window == window_bytes_by_width_.end()) {
+    throw std::invalid_argument("native quick planner is missing window bytes for assignment width");
+  }
+  candidate.window_bytes_per_worker.assign(shape.size(), window->second);
+  int core_begin = 0;
+  for (size_t lane = 0; lane < shape.size(); ++lane) {
+    int previous = -1;
+    for (size_t index : lane_experts[lane]) {
+      IntervalTask task;
+      task.expert_id = expert_ids[index];
+      task.routes = routes[index];
+      task.core_begin = core_begin;
+      task.threads = shape[lane];
+      if (previous >= 0) {
+        task.dependencies.push_back(previous);
+      }
+      candidate.tasks.push_back(std::move(task));
+      previous = static_cast<int>(candidate.tasks.size()) - 1;
+    }
+    core_begin += shape[lane];
+  }
+  return candidate;
+}
+
+IntervalPlanResult NativeQuickPlanner::Plan(const std::vector<int>& expert_ids, const std::vector<int>& routes,
+                                            const std::vector<std::vector<double>>& costs) const {
+  if (costs.size() != shapes_.size()) {
+    throw std::invalid_argument("native quick planner requires one cost row per shape");
+  }
+  IntervalPlanResult result;
+  result.configured_workers = 1;
+  result.strict_candidates = static_cast<int>(shapes_.size());
+  result.candidates.reserve(shapes_.size());
+  for (size_t index = 0; index < shapes_.size(); ++index) {
+    result.candidates.push_back(Assign(expert_ids, routes, shapes_[index], costs[index]));
+  }
+  result.selected =
+      *std::min_element(result.candidates.begin(), result.candidates.end(),
+                        [](const IntervalCandidate& left, const IntervalCandidate& right) {
+                          return std::tie(left.makespan_ns, left.active_working_set_bytes, left.resource_groups) <
+                                 std::tie(right.makespan_ns, right.active_working_set_bytes, right.resource_groups);
+                        });
   return result;
 }
 
