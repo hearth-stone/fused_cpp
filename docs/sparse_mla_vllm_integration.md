@@ -73,20 +73,37 @@ src/fused_cpp/sparse_mla.py
 Scheduling:
 
 ```text
-1. Split queries into 8-token blocks.
-2. For each 8-query block, build a plan from indices.
-3. Long fully shared contiguous KV runs use dense 8x8-style SDPA kernels.
-4. Remaining indexed work uses fixed 4x4 indexed QK tiles with fp32 FMLA.
-5. Each OpenMP task computes one 8-query block across all heads.
-6. Tasks are sorted by estimated attention pairs, then scheduled dynamically.
+1. Supported BF16 shapes use one token per task once the number of 8-token
+   query blocks exceeds half of the requested workers.
+2. Each task treats eight query heads as M. SVE uses scalable 8x2VL BFMMLA
+   QK/PV; the non-SVE implementation retains its fixed-width path.
+3. On SVE, a fully shared contiguous run, or up to two fixed-start growing
+   prefixes, packs K/V once per call. Query-dependent indices use per-token
+   fused K/V gather-pack and reuse that data across all query-head groups.
+4. Short BF16 chunks build one plan per 8-query block. Heavy plans can split
+   into at most eight disjoint KV shards when query blocks leave at least half
+   of the worker pool idle.
+5. Each shard computes a local online-softmax state `(m, l, O)`. The states are
+   merged associatively and `attn_sink` is applied exactly once after the merge.
+6. Unsupported BF16 shapes and fp32 retain the indexed query-block fallback;
+   fp32 does not use the 2D KV split.
 ```
+
+The public `flash_mla_sparse_fwd` entrypoint selects the head-major path for
+long BF16 queries and retains the guarded 2D scheduler for short BF16 chunks.
+These schedules do not alter the Python signature or accepted layouts. Because
+KV shards change the online-softmax reduction order, 2D BF16 results are
+tolerance-equivalent rather than bitwise-identical to the 1D path.
 
 Dense paths:
 
-- If all queries share one full contiguous run, the fast path reuses the
-  pack-QKV MQA schedule from SDPA.
-- Inside the sparse planner, fully shared dense segments within an 8-query
-  block also use packed dense segment code.
+- If all queries share one full contiguous run, the head-major fast path packs
+  K/V once per call.
+- On SVE, up to two fixed-start growing prefixes, such as compressed and
+  causal/SWA regions before the window starts sliding, also use call-level
+  shared packing.
+- Inside the short-query planner, fully shared dense segments within an
+  8-query block use packed dense segment code.
 
 MQA cache policy:
 
@@ -269,11 +286,11 @@ Basic validation:
 python -m pytest tests/test_sparse_mla.py -q
 ```
 
-Remote ArmCodex flow used during development:
+Remote Arm-codex-internal/Arm-codex flow used during development:
 
 ```bash
 bash rsync.sh
-ssh Arm-codex 'cd /home/zhangxu/codex/fused_cpp && touch csrc/sparse_mla.cpp && .venv/bin/python setup.py build_ext --inplace'
+ssh Arm-codex-internal 'cd /home/zhangxu/code && touch csrc/sparse_mla.cpp && .venv/bin/python setup.py build_ext --inplace'
 ```
 
 ## Correctness Checklist
@@ -316,21 +333,31 @@ min_ms
 max_ms
 source-pair GFLOP/s
 per-core GFLOP/s
-efficiency vs ArmCodex single-core peak
+efficiency vs Arm-codex-internal/Arm-codex single-core peak
 ```
 
-For ArmCodex, use the peak table referenced by `AGENTS.md`. The fp32 FMLA and
-bf16 MMLA single-core references are both around 92.7 GFLOP/s on that machine.
+For Arm-codex-internal/Arm-codex, use the peak table referenced by `AGENTS.md`.
+The fp32 FMLA and bf16 MMLA single-core references are both around 92.7 GFLOP/s
+on that machine.
 
 Important current performance caveats:
 
-- Parallel task space is currently one task per 8 query tokens.
-- Each task computes all heads for that 8-query block.
-- For `s_q=2048`, this exposes 256 tasks. This is enough for 64 workers but
-  starts to be tight for 80+ workers.
-- Splitting by head group can expose more tasks, but a naive split may duplicate
-  dense segment packing. If implemented, share packed dense segments per query
-  block or measure the packing overhead explicitly.
+- Supported BF16 shapes use one token per task and treat eight query heads as
+  the QK/PV M dimension once eight-query block count exceeds half of the
+  requested workers. Selected MQA K/V rows are packed once per token and reused
+  by all head groups.
+- The 2D split is retained for shorter prefill chunks with long KV histories.
+  It is disabled when query-block count is greater than half of the requested
+  worker count, because duplicate packing and partial-state reduction then cost
+  more than the extra concurrency saves.
+- A split plan currently permits at most eight KV shards. This is sufficient to
+  fill 96 workers from 12 heavy query blocks, but is a policy constant rather
+  than a calibrated machine model.
+- Split shards still process all query heads. Head-group splitting was not
+  adopted because it would duplicate or require sharing packed segment state.
+- Planning, packing, partial-state allocation, and merge are inside the timed
+  forward call. Production chunk-size distributions should be measured before
+  changing the underfill threshold or shard cap.
 
 ## Rollout Plan
 
@@ -366,8 +393,11 @@ output width > kv width
 - `topk_length` is not used to mask positive values. Invalid slots must be
   negative in `indices`.
 - Decode is not covered by this kernel.
-- Current high-core scaling is limited by 8-query task granularity and by the
-  per-task "all heads" loop.
+- BF16 requires `Hq % 8 == 0`, `Dqk % 4 == 0`, and `Dv % 8 == 0` for the
+  head-major path. Other shapes use the indexed fallback.
+- BF16 short-chunk parallelism uses the guarded 2D KV split described above;
+  fp32 remains limited to 8-query task granularity and the per-task all-heads
+  loop.
 
 ## Files To Touch In vLLM
 
