@@ -51,12 +51,64 @@ def test_flash_mla_sparse_fwd_cpp_head_major_dense_matches_naive(
     not _HAS_CPP_SPARSE_MLA, reason="C++ sparse MLA extension unavailable"
 )
 @pytest.mark.parametrize("return_stats", [False, True])
+def test_flash_mla_sparse_fwd_cpp_shared_prefix_segments_match_naive(
+    return_stats: bool,
+) -> None:
+    """Compressed and SWA prefixes may share call-level packed K/V."""
+    torch.manual_seed(179)
+    s_q, h_q, s_kv, d_qk, d_v, topk = 24, 16, 96, 32, 24, 48
+    q = torch.randn(s_q, h_q, d_qk).bfloat16()
+    kv = torch.randn(s_kv, 1, d_qk).bfloat16()
+    indices = torch.full((s_q, 1, topk), -1, dtype=torch.int32)
+    for token in range(s_q):
+        compressed_len = min(token + 1, 16)
+        swa_len = min(2 * (token + 1), 32)
+        indices[token, 0, :compressed_len] = torch.arange(
+            compressed_len, dtype=torch.int32
+        )
+        indices[
+            token,
+            0,
+            compressed_len : compressed_len + swa_len,
+        ] = torch.arange(48, 48 + swa_len, dtype=torch.int32)
+    scale = 1.0 / (d_qk**0.5)
+    sink = torch.linspace(-0.75, 0.75, h_q)
+
+    expected = flash_mla_sparse_fwd_naive(
+        q,
+        kv,
+        indices,
+        scale,
+        d_v=d_v,
+        attn_sink=sink,
+        return_stats=return_stats,
+    )
+    actual = flash_mla_sparse_fwd(
+        q,
+        kv,
+        indices,
+        scale,
+        d_v=d_v,
+        attn_sink=sink,
+        return_stats=return_stats,
+    )
+    if return_stats:
+        _assert_sparse_close(actual, expected)
+    else:
+        torch.testing.assert_close(actual, expected, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.skipif(
+    not _HAS_CPP_SPARSE_MLA, reason="C++ sparse MLA extension unavailable"
+)
+@pytest.mark.parametrize("return_stats", [False, True])
 def test_flash_mla_sparse_fwd_cpp_head_major_sparse_matches_naive(
     return_stats: bool,
 ) -> None:
     """The production sparse path preserves ragged and duplicate indices."""
     torch.manual_seed(181)
-    s_q, h_q, s_kv, d_qk, d_v, topk = 24, 16, 64, 32, 24, 19
+    # d_qk=36 also exercises the fused packer's final K=4-only tail.
+    s_q, h_q, s_kv, d_qk, d_v, topk = 24, 16, 64, 36, 24, 19
     q = torch.randn(s_q, h_q, d_qk).bfloat16()
     kv = torch.randn(s_kv, 1, d_qk).bfloat16()
     indices = torch.full((s_q, 1, topk), -1, dtype=torch.int32)

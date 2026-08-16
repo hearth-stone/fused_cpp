@@ -13,8 +13,10 @@ default:
     Once eight-query block parallelism exceeds half the requested workers,
     supported SVE BF16 MQA shapes use one-token tasks and scalable 8-head by
     2VL-column BFMMLA QK/PV for gathered sparse or fully shared dense indices;
-    the latter uses scalable call-level K/V packing. Non-SVE, short-query,
-    FP32, and unsupported shapes retain their existing fallbacks.
+    fully shared dense and up to two fixed-start contiguous prefix segments use
+    scalable call-level K/V packing; query-dependent sparse tiles gather each
+    KV row once while producing both packed K and V. Non-SVE, short-query,
+    FP32, and unsupported shapes retain their fallbacks.
 
 benchmark_scenarios:
   production_smoke: >-
@@ -23,6 +25,10 @@ benchmark_scenarios:
     optimizations/sparse_mla/results/amazon_8c_scalable_sve_20260814.md
   dense_adoption_evidence: >-
     optimizations/sparse_mla/results/amazon_8c_dense_scalable_sve_20260814.md
+  shared_prefix_evidence: >-
+    optimizations/sparse_mla/results/amazon_8c_shared_prefix_pack_20260814.md
+  indexed_single_pack_evidence: >-
+    optimizations/sparse_mla/results/amazon_8c_indexed_single_pack_20260814.md
   short_chunk_evidence: >-
     optimizations/sparse_mla/results/amazon_sparse_mla_2d_fused_20260812.md
   retired_tail_evidence: >-
@@ -83,6 +89,30 @@ features:
       See optimizations/sparse_mla/results/amazon_sparse_mla_2d_fused_20260812.md.
     result: optimizations/sparse_mla/results/amazon_sparse_mla_2d_fused_20260812.md
 
+  - id: packing.shared_prefix_kv_2vl
+    part: packing
+    status: enabled
+    implementation: csrc/sparse_mla.cpp
+    hypothesis: >-
+      In V4 select-all prefill, pack the maximum compressed-cache and causal/SWA
+      prefixes once per call, then let every token consume only its valid prefix
+      lengths, eliminating repeated gather-pack without adding QK/PV work.
+    depends_on:
+      - scheduling.head_major_sparse
+      - compute.sve_qk_8x2vl_bfmmla
+      - compute.sve_pv_8x2vl_bfmmla
+    conflicts_with:
+      - scheduling.kv_2d_split
+    correctness: >-
+      Native SVL256 and forced SVL128 each pass tests/test_sparse_mla.py,
+      including two prefix segments, sink, exact stats, and negative padding.
+    benchmark: >-
+      tests/bench_sparse_mla_scalable.py --pattern sparse --s-q 2048
+      --compressed-capacity 512 --window-size 2048 --context-start 0
+      --threads 1|8 --warmup 5 --iters 21
+    result: >-
+      optimizations/sparse_mla/results/amazon_8c_shared_prefix_pack_20260814.md
+
   - id: packing.sve_dense_kv_2vl
     part: packing
     status: enabled
@@ -102,6 +132,29 @@ features:
       --warmup 5 --iters 21
     result: >-
       optimizations/sparse_mla/results/amazon_8c_dense_scalable_sve_20260814.md
+
+  - id: packing.sve_indexed_kv_single_load
+    part: packing
+    status: enabled
+    implementation: csrc/sparse_mla_sve.h
+    hypothesis: >-
+      V is the leading Dv slice of each indexed K row, so one 4x8 load can
+      populate two adjacent K=4 panels and the transposed V panel instead of
+      traversing and loading the indexed rows independently for K and V.
+    depends_on:
+      - scheduling.head_major_sparse
+      - compute.sve_qk_8x2vl_bfmmla
+      - compute.sve_pv_8x2vl_bfmmla
+    conflicts_with: []
+    correctness: >-
+      Native SVL256 and forced SVL128 each pass all 26 tests in
+      tests/test_sparse_mla.py on Amazon 8C.
+    benchmark: >-
+      tests/bench_sparse_mla_scalable.py --pattern sparse --s-q 2048
+      --compressed-capacity 512 --window-size 128 --context-start 10000
+      --threads 1|8 --warmup 5 --iters 21
+    result: >-
+      optimizations/sparse_mla/results/amazon_8c_indexed_single_pack_20260814.md
 
   - id: compute.sve_qk_8x2vl_bfmmla
     part: compute
@@ -203,6 +256,8 @@ variants:
       - scheduling.head_major_sparse
       - scheduling.kv_2d_split
       - packing.sve_dense_kv_2vl
+      - packing.shared_prefix_kv_2vl
+      - packing.sve_indexed_kv_single_load
       - compute.sve_qk_8x2vl_bfmmla
       - compute.sve_pv_8x2vl_bfmmla
     result: >-
