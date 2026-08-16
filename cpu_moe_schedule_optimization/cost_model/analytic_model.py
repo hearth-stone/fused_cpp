@@ -19,7 +19,7 @@ from __future__ import annotations
 import json
 import math
 from dataclasses import asdict, dataclass
-from functools import lru_cache
+from functools import cached_property, lru_cache
 from pathlib import Path
 from typing import Iterable, Mapping, Sequence
 
@@ -862,16 +862,52 @@ class AnalyticPhase:
     def resource_times_ns(self, spill_fraction: float | None = None) -> dict[str, float]:
         if spill_fraction is None:
             spill_fraction = self.isolated_spill_fraction
-        return {
-            "gemm_core_flops": self.gemm_core_ns,
-            "matrix_flops": self.matrix_ns,
-            "frontend_instructions": self.frontend_ns,
-            "l1_bytes": self.l1_ns,
-            "l2_bytes": self.l2_ns,
-            "llc_bytes": self.llc_ns,
-            "dram_bytes": self.dram_bytes(spill_fraction) / self.dram_rate * 1e9,
-            "epilogue_elements": self.epilogue_ns,
-        }
+        return dict(zip(_SHARED_RESOURCES, self.resource_time_vector(spill_fraction)))
+
+    def resource_vectors(self, spill_fraction: float) -> tuple[tuple[float, ...], tuple[float, ...]]:
+        """Return fixed-order demand/time vectors for contention simulation."""
+        dram_bytes = self.dram_bytes(spill_fraction)
+        return (
+            (
+                self.matrix_flops,
+                0.0,
+                0.0,
+                0.0,
+                self.l2_bytes,
+                self.llc_bytes,
+                dram_bytes,
+                self.epilogue_elements,
+            ),
+            (
+                self.gemm_core_ns,
+                self.matrix_ns,
+                self.frontend_ns,
+                self.l1_ns,
+                self.l2_ns,
+                self.llc_ns,
+                dram_bytes / self.dram_rate * 1e9,
+                self.epilogue_ns,
+            ),
+        )
+
+    def resource_time_vector(self, spill_fraction: float) -> tuple[float, ...]:
+        return self.resource_vectors(spill_fraction)[1]
+
+    def _duration_from_resource_times(
+        self,
+        times: Sequence[float],
+        resource_scales: Mapping[str, float] | None = None,
+    ) -> float:
+        scales = resource_scales or {}
+        gemm_core_ns = times[0] * scales.get("gemm_core_flops", 1.0)
+        transfer_ns = max(
+            times[4] * scales.get("l2_bytes", 1.0),
+            times[5] * scales.get("llc_bytes", 1.0),
+            times[6] * scales.get("dram_bytes", 1.0),
+        )
+        body_ns = max(gemm_core_ns, transfer_ns)
+        epilogue_ns = times[7] * scales.get("epilogue_elements", 1.0)
+        return self.residual_scale * (self.fixed_ns + body_ns + epilogue_ns)
 
     def duration_ns(
         self,
@@ -881,24 +917,15 @@ class AnalyticPhase:
     ) -> float:
         if spill_fraction is None:
             spill_fraction = self.isolated_spill_fraction
-        scales = resource_scales or {}
-        times = self.resource_times_ns(spill_fraction)
-        gemm_core_ns = times["gemm_core_flops"] * scales.get("gemm_core_flops", 1.0)
+        times = self.resource_time_vector(spill_fraction)
         # The calibrated load probes measure endpoint-to-register service:
         # LLC already includes LLC->L2->L1 and DRAM includes the whole path.
         # Their lower bounds overlap and therefore compose with max, not sum.
         # The L1-hot M12 GEMM peak already includes BFMMLA, frontend, and L1
         # load delivery. Only lower hierarchy endpoint bounds remain.
-        transfer_ns = max(
-            times["l2_bytes"] * scales.get("l2_bytes", 1.0),
-            times["llc_bytes"] * scales.get("llc_bytes", 1.0),
-            times["dram_bytes"] * scales.get("dram_bytes", 1.0),
-        )
-        body_ns = max(gemm_core_ns, transfer_ns)
-        epilogue_ns = times["epilogue_elements"] * scales.get("epilogue_elements", 1.0)
-        return self.residual_scale * (self.fixed_ns + body_ns + epilogue_ns)
+        return self._duration_from_resource_times(times, resource_scales)
 
-    @property
+    @cached_property
     def base_ns(self) -> float:
         return self.duration_ns()
 
@@ -1847,13 +1874,24 @@ class AnalyticMoeCostModel:
         dict[str, AnalyticResourcePressure],
         dict[int, float],
     ]:
-        total_working_set = sum(phase.working_set_bytes for phase in current.values())
+        current_items = tuple(current.items())
+        total_working_set = sum(phase.working_set_bytes for _, phase in current_items)
         spill_fraction = self._llc_miss_fraction(total_working_set)
-        provisional = {index: phase.duration_ns(spill_fraction=spill_fraction) for index, phase in current.items()}
+        resource_vectors = {
+            index: phase.resource_vectors(spill_fraction)
+            for index, phase in current_items
+        }
+        provisional = {
+            index: phase._duration_from_resource_times(resource_vectors[index][1])
+            for index, phase in current_items
+        }
         pressures: dict[str, AnalyticResourcePressure] = {}
         resource_scales: dict[str, float] = {}
-        for resource in _SHARED_RESOURCES:
-            demands = {index: phase.resource_demand(resource, spill_fraction) for index, phase in current.items()}
+        for resource_index, resource in enumerate(_SHARED_RESOURCES):
+            demands = {
+                index: resource_vectors[index][0][resource_index]
+                for index, _ in current_items
+            }
             active_threads = min(
                 sum(current[index].active_threads for index, demand in demands.items() if demand > 0.0),
                 self.calibration.cores_per_rank,
@@ -1871,7 +1909,7 @@ class AnalyticMoeCostModel:
                     demand
                     / max(
                         current[index].residual_scale
-                        * current[index].resource_times_ns(spill_fraction)[resource]
+                        * resource_vectors[index][1][resource_index]
                         * 1e-9,
                         1e-30,
                     )
@@ -1896,13 +1934,12 @@ class AnalyticMoeCostModel:
             resource_scales[resource] = dilation
         multipliers = {
             index: (
-                phase.duration_ns(
-                    spill_fraction=spill_fraction,
-                    resource_scales=resource_scales,
+                phase._duration_from_resource_times(
+                    resource_vectors[index][1], resource_scales
                 )
                 / phase.base_ns
             )
-            for index, phase in current.items()
+            for index, phase in current_items
         }
         return spill_fraction, provisional, pressures, multipliers
 

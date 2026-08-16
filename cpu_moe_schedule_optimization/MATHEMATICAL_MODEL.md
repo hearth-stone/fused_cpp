@@ -2044,6 +2044,14 @@ homogeneous 候选。实现复用固定 candidate-index 的 `ParallelFor`：每�
 hardware-bounded auto workers。m5 实测 2/4/8 workers 均未达到 10% 边界优化门槛，
 因此多线程只保留为诊断能力，不成为 production quick 默认。
 
+analytical DAG 的资源公式仍按上文 8 个固定 resource 顺序定义，但 production
+实现不再为每个 active phase、每个 resource 重复构造 Python demand/time dict。
+每个 phase/event 一次生成同序 demand/time tuple，contention loop 用固定下标读取，
+并缓存 immutable phase 的 isolated `base_ns`。scalar `resource_demand()`、
+`resource_times_ns()`、pressure 字段和 explain event 继续保留；vector tuple 只是
+相同公式的数据布局。归约仍使用相同 Python `sum/max` 顺序，spill fraction、service
+capacity、dilation、event 边界、completion epsilon 和 early-merge 三态均不改变。
+
 设某 stage 有 $P$ 个物理 M panel；第 $j$ 个顺序 N range 的 packed-B 字节为
 $B_j$、每个 owner 的 B 窗口为 $U_j$、active owner 数为 $t_j$；全部物理
 packed-A 字节为 $A$，最大单 panel packed-A 字节为 $A_p$。range 按 tile 数
@@ -5115,3 +5123,4 @@ leave-one-sampled-width-out（非独立复测）的采样密度诊断，LLC MAPE
 | 2026-08-16 | v1.21 | 优化 production quick planner 的 homogeneous LPT 实现，不改变数学问题或候选：每个候选宽度只对 distinct route count 计算一次 analytical `T_iso`，用 `(load,lane)` heap 替代通用 mixed-width 逐 lane cost 扫描，并显式保留 `load + cost` 浮点舍入同分时的低 lane-id tie-break。m5 TP2、H4096/F1024/E256、43 层真实 DSV4 路由上，两 rank 的 materialized Plan V2 与旧实现逐字节一致；双 rank 并发、每层 7 次 forced-miss 的 planner-overhead layer-median 从 123.892/125.917 ms 降至 35.633/35.378 ms（逐层收益中位数 71.15%/71.87%），cache-hit 路径保持在约 32.6 ms。候选、目标、不确定性、early merge、schema、ABI 与默认 dispatch 均不变。|
 | 2026-08-16 | v1.22 | 将 production analytical quick planner 的 homogeneous heap LPT、候选评分与最优 shape 选择等价迁移到单线程 C++；Python 继续计算精确 distinct-route `T_iso` cost rows，pybind 只完整转换胜出候选、其余返回 ranking 摘要，扩展不可用时回退 Python。m5 TP2、H4096/F1024/E256、43 层真实 DSV4 路由上，两 rank 的 Plan V2 与 v1.21 逐字节一致；双 rank 并发、每层 7 次 forced-miss 的 planner-overhead layer-median 为 31.998/31.739 ms，相对 v1.21 逐层收益中位数 10.15%/10.01%，累计相对原始 generic LPT 为 74.17%/74.73%。本阶段固定一个 planner worker，且不改变公式、候选、剪枝、排序、schema、ABI 或默认 dispatch。|
 | 2026-08-16 | v1.23 | 为 analytical quick planner 增加固定 candidate-index 的候选级 OpenMP 并行，并复用 `FUSED_CPP_MOE_PLANNER_THREADS`/构造参数；每个候选内部仍单线程且按原索引归并，43 层双 rank Plan V2 在 1/2/4/8 workers 下保持逐字节一致。m5 TP2 双 rank sweep 中，2 workers 相对同二进制 1 worker 的 forced-miss planner 逐层收益中位数仅 0.19%/0.15%；4 workers 为 0.13%/-1.55%，8 workers 为 -0.26%/+0.80%，均未达到 10% 门槛。因此 production quick 未配置时继续使用 1 worker，多线程只保留为显式诊断能力。|
+| 2026-08-16 | v1.24 | 将 analytical DAG active-phase pressure 计算改为固定 8-resource demand/time tuple，并缓存 immutable phase 的 isolated `base_ns`；scalar 诊断访问器、公式、归约顺序、event 边界和 early-merge 决策保持不变。m5 TP2、43 层真实 DSV4 路由、双 rank 并发、每层 7 次 forced-miss 中，planner-overhead layer-median 从同二进制 1T 对照的 31.823/31.676 ms 降至 23.565/23.549 ms（逐层收益中位数 26.00%/26.17%），累计相对原始 generic LPT 为 80.97%/81.33%；两个 rank 的 materialized Plan V2 仍逐字节一致。|

@@ -45,6 +45,8 @@ committed.
 | 2: single-thread native LPT/search boundary | 1 | 32.617 ms | 31.739 ms | 31.425 ms | 29.546 ms | +10.01% vs stage 1; +74.73% cumulative |
 | 3: candidate parallelism rejected; 1T retained | 0 | 32.675 ms | 31.823 ms | 31.522 ms | 29.546 ms | no production change |
 | 3: candidate parallelism rejected; 1T retained | 1 | 32.554 ms | 31.676 ms | 31.360 ms | 29.583 ms | no production change |
+| 4: fixed resource vectors + cached phase base | 0 | 24.406 ms | 23.565 ms | 23.263 ms | 22.512 ms | +26.00% vs stage 3; +80.97% cumulative |
+| 4: fixed resource vectors + cached phase base | 1 | 24.387 ms | 23.549 ms | 23.247 ms | 22.617 ms | +26.17% vs stage 3; +81.33% cumulative |
 
 The immediate-hit change was -0.78% on rank0 and +0.43% on rank1 by median
 paired layer, within the 2% gate. Sequential first-pass total planner time fell
@@ -117,6 +119,26 @@ amortize OpenMP startup reliably. Production quick planning therefore defaults
 to one worker; explicit multi-worker settings remain diagnostic. All worker
 counts produced byte-identical Plan V2 JSON on both ranks.
 
+## Stage 4 analytical resource-vector path
+
+cProfile of 130 rank0 planner calls attributed 13.45 of 16.41 cumulative
+seconds to early-merge analytical DAG simulation, versus 2.42 seconds to quick
+cost-row construction. Within the DAG, `_active_phase_state` repeatedly built
+resource dictionaries and recalculated immutable isolated phase duration.
+
+Stage 4 emits one fixed-order eight-resource demand/time tuple per active phase
+and event, then reads it by resource index. The public scalar diagnostic
+accessors remain available, and immutable `AnalyticPhase.base_ns` is cached.
+Python `sum/max` reduction order, resource formulas, spill fraction, service
+capacity, dilation, event progression, and completion tolerance are unchanged.
+
+Relative to the stage-3 same-binary 1T control, paired per-layer forced-miss
+planner gains were 26.00% on rank0 and 26.17% on rank1. Immediate-hit planner
+gains were 23.65% and 23.49%. Sequential first-pass total planner time fell
+from 1.929 s to 1.513 s on rank0 (+21.56%) and from 1.954 s to 1.527 s on
+rank1 (+21.88%). Both 43-layer Plan JSON files retained the original SHA256
+values listed above.
+
 ## Validation
 
 ```text
@@ -133,6 +155,6 @@ PYTHONPATH=src .venv/bin/python -m pytest -q \
 Stage 1 adds direct coverage for generic/heap assignment parity, analytical
 cost deduplication, and the rounded-score low-lane-id tie-break. Stage 2 adds
 native analytical quick-plan equivalence and direct native tie coverage. Local
-validation passed 149 tests; the matching m5 build passed 146 tests. Stage 3
-extends native parity coverage across 1/2/4 workers. Later stages will append
-results to the same table.
+validation passed 150 tests; the matching m5 build passed 147 tests. Stage 3
+extends native parity coverage across 1/2/4 workers; stage 4 directly checks
+vector/scalar resource parity. All planned stages are recorded above.

@@ -13,6 +13,7 @@ PLANNERS = ROOT / "cpu_moe_schedule_optimization" / "planners"
 sys.path[:0] = [str(COST_MODEL), str(PLANNERS)]
 
 from analytic_model import (  # noqa: E402
+    _SHARED_RESOURCES,
     AnalyticMachineCalibration,
     AnalyticMoeCostModel,
     CacheCalibration,
@@ -481,6 +482,26 @@ def test_hot_gemm_core_service_subsumes_frontend_and_l1_resources() -> None:
     assert pressures["matrix_flops"].offered_rate == 0.0
     assert pressures["frontend_instructions"].offered_rate == 0.0
     assert pressures["l1_bytes"].offered_rate == 0.0
+
+
+def test_phase_resource_vectors_match_scalar_resource_accessors() -> None:
+    model = _model()
+    phase = next(item for item in model.predict_expert(12, 1).phases if item.kind == "cold_b")
+    spill_fraction = 0.375
+
+    demands, times = phase.resource_vectors(spill_fraction)
+
+    assert demands == tuple(
+        phase.resource_demand(resource, spill_fraction)
+        for resource in _SHARED_RESOURCES
+    )
+    assert times == tuple(
+        phase.resource_times_ns(spill_fraction)[resource]
+        for resource in _SHARED_RESOURCES
+    )
+    assert phase._duration_from_resource_times(times) == phase.duration_ns(
+        spill_fraction=spill_fraction
+    )
 
 
 def test_machine_without_l1_hot_gemm_peak_is_rejected() -> None:
