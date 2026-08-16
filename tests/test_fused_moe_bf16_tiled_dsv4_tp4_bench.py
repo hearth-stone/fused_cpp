@@ -532,7 +532,7 @@ def test_fused_moe_bf16_tiled_deepseek_v4_flash_tp4_bound_gflops() -> None:
 
 
 def test_fused_moe_bf16_tiled_deepseek_v4_flash_tp4_2000_tokens_arm_codex_layout() -> None:
-    """Arm-codex-internal/Arm-codex TP=4 MoE on rank bases 0/80/160/240."""
+    """Arm-codex-internal/Arm-codex TP=4 MoE: 2000 tokens on four ranks."""
     defaults = DSV4TP4MoEBenchConfig()
     config = DSV4TP4MoEBenchConfig(
         tokens=_env_int("FUSED_CPP_DSV4_MOE_BENCH_TOKENS", 2000),
@@ -566,7 +566,7 @@ def test_fused_moe_bf16_tiled_deepseek_v4_flash_tp4_2000_tokens_arm_codex_layout
 
 
 def test_fused_moe_bf16_tiled_deepseek_v4_flash_tp4_profiler_routing_arm_codex_layout() -> None:
-    """Arm-codex-internal/Arm-codex TP=4 benchmark using captured routing."""
+    """Arm-codex-internal/Arm-codex TP=4 benchmark with captured routing."""
     routing_dir = os.environ.get(
         "FUSED_CPP_DSV4_MOE_ROUTING_DIR",
         "/home/zhangxu/codex/vllm-aarch64-v0.22.0-dsv4/tests/v1/e2e/"
@@ -613,7 +613,7 @@ def test_fused_moe_bf16_tiled_deepseek_v4_flash_tp4_profiler_routing_arm_codex_l
 
 
 def test_fused_moe_bf16_tiled_deepseek_v4_flash_tp4_profiler_routing_2048_arm_codex_layout() -> None:
-    """Arm-codex-internal/Arm-codex TP=4 benchmark using 2048-token routing."""
+    """Arm-codex-internal/Arm-codex TP=4 benchmark with 2048-token routing."""
     routing_dir = os.environ.get(
         "FUSED_CPP_DSV4_MOE_ROUTING_DIR",
         "/home/zhangxu/codex/vllm-aarch64-v0.22.0-dsv4/tests/v1/e2e/"

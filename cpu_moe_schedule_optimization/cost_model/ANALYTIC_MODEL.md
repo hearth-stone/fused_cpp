@@ -27,7 +27,7 @@ No route/thread latency table or measured contention shape is loaded.
 
 ## Machine Service Curves
 
-Each resource uses three route-independent values: one-thread rate
+Compute resources use three route-independent values: one-thread rate
 \(R_1\), saturated aggregate rate \(R_{\mathrm{sat}}\), and the thread count
 \(t_{\mathrm{sat}}\) where saturation is reached. A `power` curve models
 per-core issue/frequency derate:
@@ -54,8 +54,32 @@ R_{\mathrm{sat}},
 \right).
 \]
 
-Both curves use the same three measurements. The curve family is a hardware
-topology statement, not another route-dependent fit.
+Both compact curves use the same three measurements. LLC and DRAM instead use
+monotone piecewise-linear interpolation through independently measured thread
+widths. If adjacent measurements are noisy and non-monotone, equal-weight
+isotonic regression first projects them onto a monotone service envelope. An
+interpolation fit has zero error at its retained points by construction;
+predictive accuracy must therefore be reported on held-out thread widths.
+
+Machine schema v2 records the pinned rank CPU ids and each Linux LLC domain's
+id, CPU set, capacity, and local refill curve. For a placement with (t_d)
+active threads in LLC domain (d), topology-aware LLC service is:
+
+\[
+B_{LLC}(\{t_d\})=
+\begin{cases}
+B_d(t_d), & \text{one active domain},\\
+\min\left(\sum_d B_d(t_d),B_{LLC,rank}^{sat}\right),
+& \text{multiple active domains}.
+\end{cases}
+\]
+
+The LLC capacity used by a placement is likewise the sum of its active-domain
+capacities. DRAM remains one NUMA-rank service
+(B_{DRAM}(\sum_dt_d)); it is never summed per LLC domain. The rank LLC curve
+is retained as the placement-free compatibility path and its final point is
+the shared multi-domain fabric ceiling. Schema v1 remains readable but cannot
+answer placement-aware queries.
 
 The primary compute resource is `gemm_core_flops`: the production M12 A/B load,
 address/control, and BFMMLA K-loop with no store or epilogue, measured with A+B
@@ -92,11 +116,21 @@ K_L=8\left\lfloor\frac{f_LC_L}{16(12+N_p)}\right\rfloor,
 Q_L=2K_L(12+N_p)\le f_LC_L.
 \]
 
-`profile_analytic_services.py` reads L1D, L2, LLC, and cache-line sizes from
-`/sys/devices/system/cpu/cpuX/cache/index*`. Its default fractions are 0.625 for
+`profile_analytic_services.py` reads L1D, L2, LLC, cache-line sizes, LLC ids,
+and `shared_cpu_list` from
+`/sys/devices/system/cpu/cpuX/cache/index*`. Rank LLC capacity is the sum of
+unique domains intersecting the pinned CPU list; LLC probe geometry uses one
+domain's capacity rather than pretending all domains form one shared cache.
+Its default fractions are 0.625 for
 the L1 GEMM core probe and 0.5 for the L2-hot diagnostic. On
 AmazonC5192Cores this gives M12/K728/N16 (40,768 B) from a 64 KiB L1D and
 M12/K18720/N16 (1,048,320 B) from a 2 MiB L2.
+
+`AnalyticMoeCostModel` schema v7 exposes this placement-aware capacity and
+service through the machine calibration API. The current planner DAG still
+passes only aggregate active thread counts, so default scoring deliberately
+uses the rank curve until physical CPU intervals become part of the simulated
+task state. This avoids silently inventing an LLC placement.
 
 ## Cache Traffic
 
@@ -404,11 +438,47 @@ shape. Rates use units per second; overheads use nanoseconds.
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "kind": "moe_analytic_machine",
   "machine": {
     "id": "machine-kernel-frequency-numa-policy",
-    "cores_per_rank": 96
+    "cores_per_rank": 8
+  },
+  "topology": {
+    "rank_cpu_ids": [0, 1, 2, 3, 4, 5, 6, 7],
+    "dram_scope": "numa_rank",
+    "llc_domains": [
+      {
+        "id": "0",
+        "cpu_ids": [0, 1, 2, 3],
+        "capacity_bytes": 50331648,
+        "service": {
+          "single_thread_rate": 2.5e10,
+          "saturated_rate": 5.0e11,
+          "saturation_threads": 4,
+          "curve": "piecewise_linear",
+          "points": [
+            {"threads": 1, "rate": 2.5e10},
+            {"threads": 4, "rate": 5.0e11}
+          ]
+        }
+      },
+      {
+        "id": "1",
+        "cpu_ids": [4, 5, 6, 7],
+        "capacity_bytes": 50331648,
+        "service": {
+          "single_thread_rate": 2.5e10,
+          "saturated_rate": 5.0e11,
+          "saturation_threads": 4,
+          "curve": "piecewise_linear",
+          "points": [
+            {"threads": 1, "rate": 2.5e10},
+            {"threads": 4, "rate": 5.0e11}
+          ]
+        }
+      }
+    ]
   },
   "kernel": {
     "backend_n_tile": 8
@@ -427,39 +497,49 @@ shape. Rates use units per second; overheads use nanoseconds.
   "services": {
     "gemm_core_flops": {
       "single_thread_rate": 3.4e11,
-      "saturated_rate": 2.4e13,
-      "saturation_threads": 96,
+      "saturated_rate": 2.4e12,
+      "saturation_threads": 8,
       "curve": "power"
     },
     "matrix_flops": {
       "single_thread_rate": 4.1e11,
-      "saturated_rate": 3.9e13,
-      "saturation_threads": 96,
+      "saturated_rate": 3.0e12,
+      "saturation_threads": 8,
       "curve": "power"
     },
     "l1_bytes": {
       "single_thread_rate": 1.0e11,
-      "saturated_rate": 9.6e12,
-      "saturation_threads": 96,
+      "saturated_rate": 8.0e11,
+      "saturation_threads": 8,
       "curve": "shared_bottleneck"
     },
     "l2_bytes": {
       "single_thread_rate": 5.0e10,
-      "saturated_rate": 4.8e12,
-      "saturation_threads": 96,
+      "saturated_rate": 4.0e11,
+      "saturation_threads": 8,
       "curve": "shared_bottleneck"
     },
     "llc_bytes": {
       "single_thread_rate": 2.5e10,
       "saturated_rate": 1.0e12,
-      "saturation_threads": 48,
-      "curve": "shared_bottleneck"
+      "saturation_threads": 8,
+      "curve": "piecewise_linear",
+      "points": [
+        {"threads": 1, "rate": 2.5e10},
+        {"threads": 4, "rate": 5.0e11},
+        {"threads": 8, "rate": 1.0e12}
+      ]
     },
     "dram_bytes": {
       "single_thread_rate": 4.0e10,
       "saturated_rate": 3.8e11,
-      "saturation_threads": 48,
-      "curve": "shared_bottleneck"
+      "saturation_threads": 8,
+      "curve": "piecewise_linear",
+      "points": [
+        {"threads": 1, "rate": 4.0e10},
+        {"threads": 4, "rate": 3.5e11},
+        {"threads": 8, "rate": 3.8e11}
+      ]
     }
   },
   "overheads": {
@@ -473,7 +553,7 @@ shape. Rates use units per second; overheads use nanoseconds.
     "w2_panel_range_restart_ns": null
   },
   "planner": {
-    "supported_widths": [1, 2, 4, 8, 16, 32, 48, 64, 96]
+    "supported_widths": [1, 2, 4, 8]
   },
   "uncertainty": {
     "relative": 0.05
@@ -501,6 +581,7 @@ python cpu_moe_schedule_optimization/cost_model/profile_analytic_services.py \
 
 python cpu_moe_schedule_optimization/cost_model/build_analytic_calibration.py \
   services.json --output machine.json --report fit.json \
+  --supported-widths 1,2,4,8,16,32 \
   --training-profile isolated_training.json \
   --backend-n-tile 8 \
   --l2-b-reuse-effective-fraction 0.125 \
@@ -508,6 +589,48 @@ python cpu_moe_schedule_optimization/cost_model/build_analytic_calibration.py \
   --l2-b-reuse-miss-at-capacity 0.623 \
   --l2-b-reuse-miss-ceiling 0.869
 ```
+
+On a multi-LLC NUMA rank, profile the full rank and at least one representative
+domain, then pass `--llc-domain-probe DOMAIN_ID=domain-services.json`. Repeat it
+for heterogeneous domains. `--topology topology.json` exists only to replay a
+legacy service file captured before topology metadata was embedded; new probes
+write topology themselves. `--supported-widths` declares planner-legal widths
+independently of the denser service-probe width set.
+
+For deployment bootstrap, use the explicit quick-calibration function instead
+of running the full research probe. It samples only powers-of-two up to 16,
+per-domain half/full widths, and the full rank; planner-legal widths remain a
+separate set. The call is synchronous, has no import-time or first-request
+hook, restores the caller's affinity/Torch-thread/SVE-dispatch state, and
+refuses to overwrite an existing profile unless requested:
+
+```python
+from fused_cpp.moe import enable_moe_planner_quick
+
+runtime = enable_moe_planner_quick(
+    cpu_ids=range(96),
+    output="/var/cache/fused_cpp/moe-machine.json",
+    hidden_size=4096,
+    intermediate_size=512,
+    global_experts=256,
+    local_experts=256,
+    mode="tp",
+    degree=4,
+)
+```
+
+Call this during deployment or service setup. Compatible calls through the
+normal `fused_moe_bf16_tiled` entrypoint then use cached Plan V2 scheduling;
+passing `None` to `set_default_moe_planner_runtime` restores the existing
+dispatcher. The quick workflow deliberately omits isolated-operator residual
+training and records a larger uncertainty than the full calibration.
+
+The production runtime currently bounds cold planning to homogeneous team
+shapes. It ranks those shapes with analytical isolated expert times and LPT
+lane loads, emits a strict Plan V2, and caches the selected shape. It does not
+run mixed-width phase-DAG, temporal-order, or dynamic-tail candidate search on
+the request path. Use the full `PlannedMoE` search for offline analysis; native
+analytical scoring and production candidate expansion remain follow-up work.
 
 The effective fraction and three retention values should come from an
 independent packed-B repeated-scan probe. They must not be fitted from the
@@ -640,8 +763,9 @@ gates still fail. Commands, anchors, and per-route decisions are recorded in
   needs an explicit warm-weight state.
 - The three-anchor packed-B retention curve plus physical steady-scan state is
   not a set-level cache simulator. It closes the long-route W13 error in the
-  tested grid, but does not represent cache sets, prefetch streams, or topology
-  below the NUMA-level aggregate service curve.
+  tested grid, but does not represent cache sets or prefetch streams. Machine
+  schema v2 represents LLC domains, but the current planner DAG does not yet
+  carry physical placement into scoring.
 - W13 and W2 share one task width even though their full-stage N/K shapes and
   resulting owner stripes differ. A future stage-width planner would need an
   explicit handoff/runtime contract; there is no hidden window selector.

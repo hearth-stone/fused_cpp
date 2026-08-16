@@ -147,6 +147,13 @@ features:
       optimizations/fused_moe_sve/benchmarks/run_jit_vs_i8mm_pure_gemm.sh
       --rows 1,2,4,8,12 --k 4096 --n 1024 --experts 1
       --warmup 32 --runs 201
+    result: >-
+      Arm-codex NUMA3 measurements on 2026-08-13 found 97.4-99.2 percent
+      isolated M2040 efficiency through 32T. Under full 80-core occupancy,
+      however, the best width depends on both route and stage; W13 M2040 peaks
+      at 8T while W2 peaks at 16T, and a saturated W2 2T trough does not appear
+      in isolation. See
+      results/arm_codex_320c_numa3_pure_gemm_scaling_20260813.md.
 
   - id: compute.upstream_m8_m12_ilv
     part: compute
@@ -1058,6 +1065,80 @@ features:
       --production-profile
       cpu_moe_schedule_optimization/cost_model/profiles/contention_async_amazon_c5_192c_dual_numa_tp4_sve_F512_E256_fulln_schema_v2_xbyak_exactm_20260727.json
       --route-dtype bf16 --warmup 5 --runs 21
+
+  - id: dispatch.adaptive_short_tail_pool
+    part: dispatch
+    status: retired
+    implementation: Removed from the active tree; the prototype was never committed.
+    history: not-committed
+    hypothesis: >-
+      Keeping M<=12 experts at low priority while fixed large/medium work runs,
+      then choosing 1/2/4/8T N-split teams only at whole-expert start boundaries,
+      can consume the final idle area without preemption or a W13-to-W2 handoff.
+    depends_on:
+      - dispatch.dynamic_short_expert_pool
+      - dispatch.full_n_team_stripes
+    conflicts_with:
+      - dispatch.strict_tail_suffix_steal
+      - dispatch.global_stage_task_pool
+    correctness: historical; see the result report for the bit-exact A/B method
+    benchmark: historical; the uncommitted prototype was removed after measurement
+    result: >-
+      AmazonC5192Cores NUMA0 paired medians were 11.497479 ms fixed versus
+      11.595985 ms adaptive (-0.849 percent). Of 75 pooled experts, 73 remained
+      1T and two used 4T. Tail idle decreased by 26.43 core-ms, but internal
+      idle increased by 10.29 core-ms and the E2E gate failed. Opportunistic
+      2T/4T regrouping, model-selected suffix DAGs, runtime residual-M handoff,
+      and short-queue reordering were also neutral or negative. No runtime,
+      schema, API, planner, or environment control remains active.
+
+  - id: dispatch.static_residual_m_suffix
+    part: dispatch
+    status: experimental
+    owner: zhangxu
+    opened: 2026-08-12
+    decision_by: 2026-09-11
+    next_decision: >-
+      Retire unless a held-out target/donor selector predicts the favorable
+      terminal route slice across multiple distributions and clears the 2
+      percent paired E2E gate without adding a production search dimension.
+    adoption_gate: >-
+      Bit-exact output; strict same-NUMA fixed lanes; at least 2 percent paired
+      median E2E improvement across held-out workloads; no P90 regression above
+      2 percent; and planner overhead below 100 microseconds when selection is
+      eventually modeled.
+    implementation: >-
+      optimizations/fused_moe_sve/benchmarks/capture_schedule_timeline.py
+      --residual-m-split EXPERT:DONOR_CORE
+    hypothesis: >-
+      Once a peer lane's terminal task is known to finish first, replacing one
+      later terminal expert by two equal-granularity contiguous M slices can use
+      both same-width lanes while preserving the fixed head, existing kernel,
+      stage windows, and expert-completion publication semantics.
+    depends_on:
+      - dispatch.full_n_team_stripes
+      - store.w2_direct_route
+    conflicts_with:
+      - dispatch.strict_tail_suffix_steal
+      - dispatch.global_stage_task_pool
+    correctness: >-
+      PYTHONPATH=src .venv/bin/python -m pytest -q
+      tests/test_moe_workload_catalog.py
+      -k residual_m_split
+    benchmark: >-
+      numactl --cpunodebind=0 --membind=0 taskset -c 0-95
+      .venv/bin/python
+      optimizations/fused_moe_sve/benchmarks/capture_schedule_timeline.py
+      --preset dsv4-real-2048-seq70 --large-small-partition 48:48:8:1
+      --residual-m-split 218:40 --compare-residual-m-split
+      --route-dtype bf16 --warmup 7 --runs 51
+    result: >-
+      E218/core40 repeated gains were 1.093, 0.482, 1.205, 0.685, and 1.193
+      percent (about 0.93 percent mean), below the 2 percent adoption gate. Four other
+      terminal targets measured between -0.190 and +0.046 percent. Runtime
+      discovery and handoff regressed by 0.358 percent, so only this explicit
+      Lab comparator remains. Full results are in
+      results/amazon_192c_dsv4_tail_candidate_closure_20260812.md.
 
   - id: dispatch.large_small_core_partition
     part: dispatch

@@ -4261,6 +4261,31 @@ struct AsyncStrictTailStealCohort {
   std::vector<int64_t> team_indices;
 };
 
+class StrictTailAssignment {
+ public:
+  void publish(int64_t task) {
+    {
+      const std::lock_guard<std::mutex> lock(mutex_);
+      task_ = task;
+      ++epoch_;
+    }
+    cv_.notify_all();
+  }
+
+  int64_t wait_next(int64_t& observed_epoch) {
+    std::unique_lock<std::mutex> lock(mutex_);
+    cv_.wait(lock, [&]() { return epoch_ != observed_epoch; });
+    observed_epoch = epoch_;
+    return task_;
+  }
+
+ private:
+  std::mutex mutex_;
+  std::condition_variable cv_;
+  int64_t task_ = -1;
+  int64_t epoch_ = 0;
+};
+
 constexpr int64_t kAsyncPlanV2 = 2;
 constexpr int64_t kAsyncExecutionStrict = 0;
 constexpr int64_t kAsyncExecutionTailPool = 1;
@@ -7785,23 +7810,17 @@ at::Tensor run_fused_moe_bf16_tiled_async(
   for (std::atomic<int64_t>& current_task : short_pool_current_tasks) {
     current_task.store(-1, std::memory_order_relaxed);
   }
-  std::vector<std::atomic<int64_t>> strict_tail_current_tasks(
-      strict_tail_steal_teams.size());
-  std::vector<std::atomic<int64_t>> strict_tail_assignment_epochs(
-      strict_tail_steal_teams.size());
+  std::vector<std::unique_ptr<StrictTailAssignment>> strict_tail_assignments;
+  strict_tail_assignments.reserve(strict_tail_steal_teams.size());
+  for (size_t team = 0; team < strict_tail_steal_teams.size(); ++team) {
+    strict_tail_assignments.push_back(std::make_unique<StrictTailAssignment>());
+  }
   std::vector<int64_t> strict_tail_tasks_by_team(
       strict_tail_steal_teams.size(), 0);
   std::vector<int64_t> strict_tail_stolen_by_team(
       strict_tail_steal_teams.size(), 0);
   std::vector<int64_t> strict_tail_stolen_rows_by_team(
       strict_tail_steal_teams.size(), 0);
-  for (std::atomic<int64_t>& current_task : strict_tail_current_tasks) {
-    current_task.store(-1, std::memory_order_relaxed);
-  }
-  for (std::atomic<int64_t>& epoch : strict_tail_assignment_epochs) {
-    epoch.store(0, std::memory_order_relaxed);
-  }
-
   const int64_t merge_tokens_per_owner = ceil_div_int64(num_tokens, num_threads);
   auto owned_token_range = [&](int64_t tid) -> SplitRange {
     const int64_t begin = std::min<int64_t>(num_tokens, tid * merge_tokens_per_owner);
@@ -8249,10 +8268,7 @@ at::Tensor run_fused_moe_bf16_tiled_async(
 
           if (selected_task >= 0) {
             ++strict_tail_tasks_by_team[static_cast<size_t>(team_index)];
-            strict_tail_current_tasks[static_cast<size_t>(team_index)].store(selected_task, std::memory_order_release);
-            std::atomic<int64_t>& assignment_epoch = strict_tail_assignment_epochs[static_cast<size_t>(team_index)];
-            assignment_epoch.fetch_add(1, std::memory_order_release);
-            assignment_epoch.notify_all();
+            strict_tail_assignments[static_cast<size_t>(team_index)]->publish(selected_task);
             AsyncTaskRuntime migrated_task = tasks[static_cast<size_t>(selected_task)];
             migrated_task.core_begin = runtime_team.core_begin;
             migrated_task.scratch_index = runtime_team.scratch_index;
@@ -8263,24 +8279,14 @@ at::Tensor run_fused_moe_bf16_tiled_async(
           // No new pending task can appear after this point; task states only
           // move from pending to running to complete. Release the team now
           // instead of keeping idle workers alive until global completion.
-          strict_tail_current_tasks[static_cast<size_t>(team_index)].store(-2, std::memory_order_release);
-          std::atomic<int64_t>& assignment_epoch = strict_tail_assignment_epochs[static_cast<size_t>(team_index)];
-          assignment_epoch.fetch_add(1, std::memory_order_release);
-          assignment_epoch.notify_all();
+          strict_tail_assignments[static_cast<size_t>(team_index)]->publish(-2);
           break;
         }
       } else {
         int64_t observed_epoch = 0;
-        std::atomic<int64_t>& assignment_epoch = strict_tail_assignment_epochs[static_cast<size_t>(team_index)];
         while (true) {
-          int64_t published_epoch = assignment_epoch.load(std::memory_order_acquire);
-          while (published_epoch == observed_epoch) {
-            assignment_epoch.wait(observed_epoch, std::memory_order_acquire);
-            published_epoch = assignment_epoch.load(std::memory_order_acquire);
-          }
-          observed_epoch = published_epoch;
           const int64_t selected_task =
-              strict_tail_current_tasks[static_cast<size_t>(team_index)].load(std::memory_order_acquire);
+              strict_tail_assignments[static_cast<size_t>(team_index)]->wait_next(observed_epoch);
           if (selected_task == -2) {
             break;
           }

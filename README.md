@@ -29,6 +29,9 @@ the PyTorch CPU wheel index via `tool.uv.sources`.
 `vLLM` is intentionally not a default dependency. vLLM-specific integration
 tests are skipped unless vLLM is importable in the active environment.
 
+All repository-owned native targets use C++17. Building from source requires a
+C++17-capable compiler; newer compiler defaults are not relied upon.
+
 ## Code Style
 
 Install the pinned formatting tools without installing the runtime dependencies:

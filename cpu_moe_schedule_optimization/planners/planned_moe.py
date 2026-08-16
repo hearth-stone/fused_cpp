@@ -5,7 +5,10 @@ from __future__ import annotations
 import time
 from typing import Dict, List, Sequence, Tuple
 
-from interval_planner import IntervalPlanner, PlannerCostModel  # noqa: E402
+try:
+    from interval_planner import IntervalPlanner, PlannerCostModel  # noqa: E402
+except ImportError:  # pragma: no cover - installed package import
+    from .interval_planner import IntervalPlanner, PlannerCostModel
 
 
 _BUCKETS = [1, 2, 4, 8, 12, 24, 48, 96, 192, 384, 768, 1536, 2040, 4096, 8192]
@@ -73,6 +76,7 @@ class PlannedMoE:
         *,
         cpu_ids: Sequence[int] | None = None,
         tail_repartition_widths: Sequence[int] | None = None,
+        search_mode: str = "full",
     ):
         if callable(getattr(models, "T_iso", None)) and callable(getattr(models, "dag_makespan", None)):
             self.models = (models,)
@@ -83,6 +87,9 @@ class PlannedMoE:
                 "PlannedMoE requires one calibration model"
             )
         self.num_cores = int(num_cores)
+        if search_mode not in {"full", "quick"}:
+            raise ValueError("search_mode must be 'full' or 'quick'")
+        self.search_mode = search_mode
         self.cpu_ids = tuple(cpu_ids) if cpu_ids is not None else tuple(range(num_cores))
         self.interval_planners = tuple(
             IntervalPlanner(
@@ -245,14 +252,19 @@ class PlannedMoE:
                 self.shape_cache.pop(cache_key, None)
                 hit = False
         if not hit:
-            result = self.interval_planners[0].plan(
-                counts,
-                topk_ids=topk_ids,
-                dynamic_tail_pool=dynamic_tail_pool,
-                tail_pool_max_routes=tail_pool_max_routes,
-                forced_tail_pool_threads=tail_pool_threads,
-                bounded_tail_repartition=bounded_tail_repartition,
-            )
+            if self.search_mode == "quick":
+                if tail_pool_threads is not None:
+                    raise ValueError("quick search does not support a forced tail pool")
+                result = self.interval_planners[0].plan_quick(counts, topk_ids=topk_ids)
+            else:
+                result = self.interval_planners[0].plan(
+                    counts,
+                    topk_ids=topk_ids,
+                    dynamic_tail_pool=dynamic_tail_pool,
+                    tail_pool_max_routes=tail_pool_max_routes,
+                    forced_tail_pool_threads=tail_pool_threads,
+                    bounded_tail_repartition=bounded_tail_repartition,
+                )
             planner_index = self._planner_index(result)
             shape = tuple(result["shape"])
             self.shape_cache[cache_key] = (

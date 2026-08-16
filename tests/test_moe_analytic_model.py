@@ -16,6 +16,7 @@ from analytic_model import (  # noqa: E402
     AnalyticMachineCalibration,
     AnalyticMoeCostModel,
     CacheCalibration,
+    LlcDomainCalibration,
     RuntimeOverheads,
     SaturatingServiceCurve,
     analytic_candidate_shapes,
@@ -24,6 +25,7 @@ from analytic_probe_geometry import (  # noqa: E402
     b_only_geometry,
     m12_gemm_geometry,
     read_cache_info,
+    read_llc_domains,
 )
 from build_analytic_calibration import (  # noqa: E402
     build_calibration,
@@ -134,6 +136,22 @@ def test_shared_bottleneck_curve_preserves_linear_low_thread_scaling() -> None:
     assert curve.rate(128) == pytest.approx(360.0)
 
 
+def test_piecewise_service_curve_interpolates_measured_widths_and_saturates() -> None:
+    curve = SaturatingServiceCurve(
+        single_thread_rate=40.0,
+        saturated_rate=180.0,
+        saturation_threads=8,
+        curve="piecewise_linear",
+        points=((1, 40.0), (2, 70.0), (4, 120.0), (8, 180.0)),
+    )
+
+    assert curve.rate(1) == pytest.approx(40.0)
+    assert curve.rate(3) == pytest.approx(95.0)
+    assert curve.rate(6) == pytest.approx(150.0)
+    assert curve.rate(16) == pytest.approx(180.0)
+    assert SaturatingServiceCurve.from_dict(curve.to_dict()) == curve
+
+
 def test_cache_probe_geometry_uses_detected_hardware_capacity() -> None:
     l1_gemm = m12_gemm_geometry(64 * 1024, 16, cache_fraction=0.625)
     l2_gemm = m12_gemm_geometry(2 * 1024 * 1024, 16, cache_fraction=0.5)
@@ -169,6 +187,23 @@ def test_cache_info_reads_linux_sysfs_hierarchy(tmp_path: Path) -> None:
         "llc_bytes_per_rank": 96 * 1024 * 1024,
         "cache_line_bytes": 64,
     }
+
+
+def test_llc_domains_follow_sysfs_shared_cpu_lists(tmp_path: Path) -> None:
+    for cpu in range(4):
+        index = tmp_path / f"cpu{cpu}" / "cache" / "index3"
+        index.mkdir(parents=True)
+        domain = "0-1" if cpu < 2 else "2-3"
+        (index / "level").write_text("3", encoding="utf-8")
+        (index / "type").write_text("Unified", encoding="utf-8")
+        (index / "size").write_text("8M", encoding="utf-8")
+        (index / "shared_cpu_list").write_text(domain, encoding="utf-8")
+        (index / "id").write_text("0" if cpu < 2 else "1", encoding="utf-8")
+
+    assert read_llc_domains((0, 1, 2, 3), sysfs_cpu_root=tmp_path) == (
+        {"id": "0", "cpu_ids": [0, 1], "capacity_bytes": 8 * 1024 * 1024},
+        {"id": "1", "cpu_ids": [2, 3], "capacity_bytes": 8 * 1024 * 1024},
+    )
 
 
 def _service_probe() -> dict:
@@ -226,11 +261,13 @@ def test_thin_calibration_extracts_private_and_shared_service_curves() -> None:
         "saturation_threads": 8,
         "curve": "power",
     }
-    assert shared["curve"] == "shared_bottleneck"
-    assert shared["saturation_threads"] == 4
+    assert shared["curve"] == "piecewise_linear"
+    assert shared["saturation_threads"] == 8
+    assert [point["rate"] for point in shared["points"]] == pytest.approx((10.0, 19.0, 34.5, 34.5))
     assert private_fit["rows"][-1]["relative_error"] == pytest.approx(0.0)
     assert shared_fit["rows"][-1]["predicted_rate"] == pytest.approx(shared["saturated_rate"])
     assert calibration["services"]["dram_bytes"] == shared
+    assert calibration["schema_version"] == 2
     assert calibration["kernel"]["backend_n_tile"] == 8
     assert calibration["services"]["gemm_core_flops"]["single_thread_rate"] == pytest.approx(60.0)
     assert calibration["services"]["frontend_instructions"]["single_thread_rate"] == pytest.approx(3.90625)
@@ -250,7 +287,120 @@ def test_thin_calibration_extracts_private_and_shared_service_curves() -> None:
     }
     assert calibration["provenance"]["l2_b_retention_calibration"]["kind"].startswith("independent_")
     assert report["dram_bytes"] == shared_fit
+    assert report["dram_bytes"]["leave_one_sampled_width_out"]["points"] == 2
     assert report["gemm_l2_flops"]["curve"]["single_thread_rate"] == pytest.approx(45.0)
+
+
+def test_topology_aware_llc_service_sums_domains_then_applies_rank_cap() -> None:
+    domain_curve = SaturatingServiceCurve(
+        single_thread_rate=40.0,
+        saturated_rate=300.0,
+        saturation_threads=4,
+        curve="piecewise_linear",
+        points=((1, 40.0), (2, 200.0), (4, 300.0)),
+    )
+    rank_curve = SaturatingServiceCurve(
+        single_thread_rate=40.0,
+        saturated_rate=550.0,
+        saturation_threads=8,
+        curve="piecewise_linear",
+        points=((1, 40.0), (2, 90.0), (4, 300.0), (8, 550.0)),
+    )
+    base = _calibration(cores=8)
+    calibration = replace(
+        base,
+        caches=replace(base.caches, llc_bytes_per_rank=16 * 1024 * 1024),
+        llc_bytes=rank_curve,
+        rank_cpu_ids=tuple(range(8)),
+        llc_domains=(
+            LlcDomainCalibration("0", (0, 1, 2, 3), 8 * 1024 * 1024, domain_curve),
+            LlcDomainCalibration("1", (4, 5, 6, 7), 8 * 1024 * 1024, domain_curve),
+        ),
+    )
+
+    assert calibration.service_rate("llc_bytes", 4, active_cpu_ids=(0, 1, 2, 3)) == pytest.approx(300.0)
+    assert calibration.service_rate("llc_bytes", 4, active_cpu_ids=(0, 1, 4, 5)) == pytest.approx(400.0)
+    assert calibration.service_rate("llc_bytes", 8, active_cpu_ids=range(8)) == pytest.approx(550.0)
+    assert calibration.llc_capacity_bytes(active_cpu_ids=(0, 1)) == 8 * 1024 * 1024
+    assert calibration.llc_capacity_bytes(active_cpu_ids=(0, 4)) == 16 * 1024 * 1024
+    assert calibration.service_rate("dram_bytes", 4, active_cpu_ids=(0, 1, 4, 5)) == pytest.approx(
+        calibration.service_rate("dram_bytes", 4)
+    )
+    model = _model(calibration)
+    assert model._llc_miss_fraction(10 * 1024 * 1024, active_cpu_ids=(0, 1)) > 0.0
+    assert model._llc_miss_fraction(10 * 1024 * 1024, active_cpu_ids=(0, 4)) == 0.0
+
+
+def test_calibration_builder_attaches_explicit_and_symmetric_llc_domains() -> None:
+    probe = _service_probe()
+    probe["machine"]["cpu_ids"] = list(range(8))
+    probe["topology"] = {
+        "rank_cpu_ids": list(range(8)),
+        "dram_scope": "numa_rank",
+        "llc_domains": [
+            {"id": "0", "cpu_ids": [0, 1, 2, 3], "capacity_bytes": 4 * 1024 * 1024},
+            {"id": "1", "cpu_ids": [4, 5, 6, 7], "capacity_bytes": 4 * 1024 * 1024},
+        ],
+    }
+    domain_probe = _service_probe()
+    domain_probe["machine"].update({"cpu_ids": [0, 1, 2, 3], "cores_per_rank": 4})
+    for service in domain_probe["services"].values():
+        if "rows" in service:
+            service["rows"] = service["rows"][:3]
+
+    payload, report = build_calibration(
+        probe,
+        machine_id="topology-v2",
+        l2_effective_fraction=0.75,
+        llc_effective_fraction=0.625,
+        l2_b_reuse_miss_floor=0.0,
+        l2_b_reuse_miss_at_capacity=1.0,
+        l2_b_reuse_miss_ceiling=1.0,
+        relative_uncertainty=0.15,
+        llc_domain_probes={"0": domain_probe},
+        supported_widths=(1, 2, 4),
+    )
+    calibration = AnalyticMachineCalibration.from_dict(payload)
+
+    assert payload["planner"]["supported_widths"] == [1, 2, 4]
+    assert [domain["service"] for domain in payload["topology"]["llc_domains"]][0] == (
+        payload["topology"]["llc_domains"][1]["service"]
+    )
+    assert report["llc_domains"]["0"]["source"] == "explicit_domain_probe:0"
+    assert report["llc_domains"]["1"]["source"] == "symmetric_clone:0"
+    assert report["llc_capacity"]["corrected_from_legacy_single_domain_value"] is False
+    assert report["llc_topology_composition"]["rank_to_summed_domain_ratio"] == pytest.approx(70.0 / 136.0)
+    assert calibration.service_rate("llc_bytes", 8, active_cpu_ids=range(8)) == pytest.approx(70.0)
+
+
+def test_schema_v2_probe_requires_planner_widths_separate_from_service_points() -> None:
+    probe = _service_probe()
+    probe["schema_version"] = 2
+
+    with pytest.raises(ValueError, match="explicit supported_widths"):
+        build_calibration(
+            probe,
+            machine_id="missing-width-domain",
+            l2_effective_fraction=0.75,
+            llc_effective_fraction=0.625,
+            l2_b_reuse_miss_floor=0.0,
+            l2_b_reuse_miss_at_capacity=1.0,
+            l2_b_reuse_miss_ceiling=1.0,
+            relative_uncertainty=0.15,
+        )
+
+
+def test_schema_v1_machine_calibration_remains_readable() -> None:
+    payload = _calibration().to_dict()
+    payload["schema_version"] = 1
+    payload.pop("topology", None)
+
+    restored = AnalyticMachineCalibration.from_dict(payload)
+
+    assert restored.machine_id == _calibration().machine_id
+    assert restored.llc_domains == ()
+    with pytest.raises(ValueError, match="calibrated LLC domains"):
+        restored.service_rate("dram_bytes", 2, active_cpu_ids=(0, 1))
 
 
 def test_thin_calibration_marks_legacy_w13_restart_fallback() -> None:
@@ -820,8 +970,8 @@ def test_holdout_validator_reports_absolute_error_and_shape_regret() -> None:
 
     report = build_validation_report(calibration, profile, isolated_training_points={(12, 1)})
 
-    assert report["analytic_model_schema_version"] == 6
-    assert report["analytic_model"] == "phase_ecm_shared_resource_v3"
+    assert report["analytic_model_schema_version"] == 7
+    assert report["analytic_model"] == "phase_ecm_llc_domain_v4"
     assert report["isolated"]["coverage"] == {
         "profile_points": 2,
         "evaluated_points": 2,

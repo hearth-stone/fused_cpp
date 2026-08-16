@@ -1,6 +1,6 @@
 CXX ?= c++
 ARCH_FLAGS ?= -march=armv8.6-a+sve+bf16+i8mm
-CXXFLAGS ?= -pthread -fno-strict-overflow -Wsign-compare -Wunreachable-code -DNDEBUG -g -O3 -Wall -Wno-class-memaccess -O3 -fPIC -std=c++20
+CXXFLAGS ?= -pthread -fno-strict-overflow -Wsign-compare -Wunreachable-code -DNDEBUG -g -O3 -Wall -Wno-class-memaccess -O3 -fPIC -std=c++17
 CPPFLAGS ?= -I. -I../../csrc/sdpa_microkernels
 LDFLAGS ?=
 USE_OPENMP ?= 1

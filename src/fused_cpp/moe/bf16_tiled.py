@@ -372,6 +372,36 @@ def fused_moe_bf16_tiled(
         raise ValueError(f"num_threads must be positive, got {num_threads}")
     _validate_output_buffer(input, out)
 
+    # Calibration is always explicit. Once a caller installs a compatible
+    # runtime, the normal entrypoint lowers through Plan V2; all other calls
+    # retain the established native dispatcher.
+    from fused_cpp.moe.planner_runtime import get_default_moe_planner_runtime
+
+    planner_runtime = get_default_moe_planner_runtime()
+    if planner_runtime is not None:
+        plan = planner_runtime.plan_for_dispatch(
+            weights,
+            topk_ids,
+            num_threads=int(num_threads),
+            activation=activation,
+            global_num_experts=int(global_num_experts),
+        )
+        if plan is not None:
+            return fused_moe_bf16_tiled_async_plan(
+                input,
+                weights,
+                topk_weights,
+                topk_ids,
+                plan,
+                w13_bias=w13_bias,
+                w2_bias=w2_bias,
+                activation=activation,
+                global_num_experts=global_num_experts,
+                skip_weighted=skip_weighted,
+                silu_poly_degree=silu_poly_degree,
+                out=out,
+            )
+
     result = _fused_moe_bf16_tiled_impl(
         input.contiguous(),
         weights.w13[0],

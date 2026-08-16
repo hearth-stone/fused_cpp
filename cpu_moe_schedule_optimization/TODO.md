@@ -301,6 +301,46 @@ Acceptance gates:
   TP cases have a perfect-rebalance upper bound of only 0.7-2.4%; prototype
   same-width-lane work stealing only if representative cases repeatedly exceed
   5%.
+- [ ] **P0: Reduce end-of-run tail idle without weakening the selected head
+  plan.** The 2026-08-12 AmazonC5192Cores NUMA0 DSV4 trace (`0-95`, 2048
+  tokens, top-k 6, TP4/F512, 223 active experts) records `71.32 core-ms` of
+  tail idle, equal to 6.62% of available core time and 73.42% of all visible
+  bubble area. Start with bounded same-width suffix ownership transfer and
+  residual-M repartition for the last lanes; do not introduce width changes,
+  waiting, or cross-NUMA migration. Close only after paired E2E runs show a
+  repeatable gain, P90 does not regress by more than 2%, correctness is
+  unchanged, and a fresh trace confirms that tail area actually falls.
+- [x] Close the first four P0 candidates on the same DSV4 case. Full
+  `1/2/4/8T` cohort regrouping was `-0.849%`; opportunistic `2/4T` regrouping
+  was `-0.613%` and created no widened task; changing the existing 1T LPT queue
+  to ascending M was neutral (`-0.069%` for LPT); the model-selected E219
+  suffix DAG was `-0.077%`; and bounded runtime residual-M was `-0.358%`.
+  Remove those implementations rather than preserving default-off branches.
+  A manually selected static E218/core40 residual-M split repeated
+  `+0.48%--+1.20%` (five-run mean about `+0.93%`), but did not clear the 2% gate and
+  other terminal targets were neutral or negative. Keep only its Lab
+  comparator and evidence; it does not close P0. See
+  `optimizations/fused_moe_sve/results/amazon_192c_dsv4_tail_candidate_closure_20260812.md`.
+- [ ] **P1: Attribute and reduce the W13-to-W2 same-task barrier wait.** The
+  same trace records `12.08 core-ms` (1.12% of available core time; 12.43% of
+  visible bubbles). Each worker has the same 128-column W13 stripe (16 N8
+  tiles and about 1 MiB of packed-B), while the slow local worker rotates
+  across tasks, so first separate runtime service variation, topology, and
+  kernel completion skew with repeated traces and counters. Evaluate a
+  per-range ready handoff or static worker remap only after that attribution;
+  do not remove the packed-C publication barrier without proving producer and
+  W2 consumer ordering. Accept it as residual overhead if a safe candidate
+  cannot produce a repeatable E2E improvement.
+- [ ] **P2: Reduce deterministic Gather-to-W13 residual-panel imbalance.** The
+  same trace records `3.87 core-ms` (0.36% of available core time; 3.98% of
+  visible bubbles). For 8-thread experts, `split_evenly(panel_count, 8)` gives
+  low local worker IDs the remainder panels; local worker 0 is last for 20 of
+  28 tasks and averages 1.27x normalized gather time. Prototype K-splitting
+  only the `panel_count % threads` remainder panels, using the existing K8
+  partition with a minimum K chunk of 32 BF16 values, while preserving full-M
+  ownership for the quotient panels. Keep global K-split disabled: the
+  optimistic critical-path headroom in this trace is only about 0.08 ms, so
+  promote this only if a broader routing corpus shows material E2E gain.
 - [x] Add an experimental non-preemptive W13-to-W2 elastic boundary. A zero
   timeout uses only immediately idle same-NUMA workers; explicit local
   `2x8T->16T` and `4x2T->8T` cohorts may wait for a bounded interval and always
