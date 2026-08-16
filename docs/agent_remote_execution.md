@@ -136,7 +136,8 @@ experiment.
 - Host alias: `AmazonM5192Cores`
 - Remote work root: `/mnt/develop`
 - Remote project-root rule: `/mnt/develop/<local-project-directory-name>`
-- This worktree's remote project root:
+- Main worktree remote project root: `/mnt/develop/fused_cpp`
+- Sparse-attention worktree remote project root:
   `/mnt/develop/fused_cpp-sparse-attn`
 - Architecture: AArch64, Neoverse V3
 - Online CPUs: `0-191`
@@ -147,5 +148,5 @@ name. Run synchronization from the local project root, derive the destination
 name from that root's basename, and preserve source-relative paths below the
 remote project root. Do not copy project files directly into `/mnt/develop` and
 do not reuse another worktree's generic directory name. For this repository,
-all copied files therefore belong under
-`/mnt/develop/fused_cpp-sparse-attn/`.
+use `/mnt/develop/fused_cpp/` from the main worktree and
+`/mnt/develop/fused_cpp-sparse-attn/` from the sparse-attention worktree.
