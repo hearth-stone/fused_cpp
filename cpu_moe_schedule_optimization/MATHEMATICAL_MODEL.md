@@ -2037,6 +2037,13 @@ assignment；扩展不可用时保留逐位等价的 Python heap fallback。该�
 $T_{iso}$、候选集合、LPT 顺序、浮点同分规则、目标函数、Plan V2 schema 或默认
 dispatch，且本阶段固定为一个 planner worker；候选并行属于独立的后续阶段。
 
+quick planner 也支持用现有 `FUSED_CPP_MOE_PLANNER_THREADS` 或构造参数显式并行
+homogeneous 候选。实现复用固定 candidate-index 的 `ParallelFor`：每个 worker
+独立运行一个候选的确定性 heap LPT，只写预分配 slot，join 后按原始候选顺序选择
+和生成 ranking。未设置线程配置时 quick planner 保持 1 worker；显式 `0` 才采用
+hardware-bounded auto workers。m5 实测 2/4/8 workers 均未达到 10% 边界优化门槛，
+因此多线程只保留为诊断能力，不成为 production quick 默认。
+
 设某 stage 有 $P$ 个物理 M panel；第 $j$ 个顺序 N range 的 packed-B 字节为
 $B_j$、每个 owner 的 B 窗口为 $U_j$、active owner 数为 $t_j$；全部物理
 packed-A 字节为 $A$，最大单 panel packed-A 字节为 $A_p$。range 按 tile 数
@@ -5107,3 +5114,4 @@ leave-one-sampled-width-out（非独立复测）的采样密度诊断，LLC MAPE
 | 2026-08-14 | v1.20 | 将显式 quick calibration 与 analytical planner 纳入可安装 Python 包，并增加线程安全的进程级 `MoePlannerRuntime` 注册。只有调用方显式安装且调用属于同一 ordered CPU rank、standalone/TP、SVE BF16 fused-SiLU、完整本地 expert 域时，normal `fused_moe_bf16_tiled` 才降低为现有 Plan V2；清空 runtime 或任何兼容性不匹配均保持旧 dispatcher。生产 runtime 首版用 analytical `T_iso` 对 homogeneous team 做 bounded LPT 搜索，只生成 strict Plan V2；完整 mixed-shape/phase-DAG/tail 搜索仍保留为离线 planner。Plan V2 schema 不变，native analytical scoring、性能精调及 EP 分片支持后续完成。|
 | 2026-08-16 | v1.21 | 优化 production quick planner 的 homogeneous LPT 实现，不改变数学问题或候选：每个候选宽度只对 distinct route count 计算一次 analytical `T_iso`，用 `(load,lane)` heap 替代通用 mixed-width 逐 lane cost 扫描，并显式保留 `load + cost` 浮点舍入同分时的低 lane-id tie-break。m5 TP2、H4096/F1024/E256、43 层真实 DSV4 路由上，两 rank 的 materialized Plan V2 与旧实现逐字节一致；双 rank 并发、每层 7 次 forced-miss 的 planner-overhead layer-median 从 123.892/125.917 ms 降至 35.633/35.378 ms（逐层收益中位数 71.15%/71.87%），cache-hit 路径保持在约 32.6 ms。候选、目标、不确定性、early merge、schema、ABI 与默认 dispatch 均不变。|
 | 2026-08-16 | v1.22 | 将 production analytical quick planner 的 homogeneous heap LPT、候选评分与最优 shape 选择等价迁移到单线程 C++；Python 继续计算精确 distinct-route `T_iso` cost rows，pybind 只完整转换胜出候选、其余返回 ranking 摘要，扩展不可用时回退 Python。m5 TP2、H4096/F1024/E256、43 层真实 DSV4 路由上，两 rank 的 Plan V2 与 v1.21 逐字节一致；双 rank 并发、每层 7 次 forced-miss 的 planner-overhead layer-median 为 31.998/31.739 ms，相对 v1.21 逐层收益中位数 10.15%/10.01%，累计相对原始 generic LPT 为 74.17%/74.73%。本阶段固定一个 planner worker，且不改变公式、候选、剪枝、排序、schema、ABI 或默认 dispatch。|
+| 2026-08-16 | v1.23 | 为 analytical quick planner 增加固定 candidate-index 的候选级 OpenMP 并行，并复用 `FUSED_CPP_MOE_PLANNER_THREADS`/构造参数；每个候选内部仍单线程且按原索引归并，43 层双 rank Plan V2 在 1/2/4/8 workers 下保持逐字节一致。m5 TP2 双 rank sweep 中，2 workers 相对同二进制 1 worker 的 forced-miss planner 逐层收益中位数仅 0.19%/0.15%；4 workers 为 0.13%/-1.55%，8 workers 为 -0.26%/+0.80%，均未达到 10% 门槛。因此 production quick 未配置时继续使用 1 worker，多线程只保留为显式诊断能力。|

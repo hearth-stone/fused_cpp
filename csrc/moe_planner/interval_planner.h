@@ -172,7 +172,7 @@ class NativeQuickPlanner {
  public:
   NativeQuickPlanner(int num_cores, std::vector<std::vector<int>> shapes, int64_t max_stage_bytes,
                      std::vector<std::pair<int, int64_t>> window_bytes_by_width, double relative_error,
-                     int profile_runs);
+                     int profile_runs, int planner_threads);
 
   IntervalPlanResult Plan(const std::vector<int>& expert_ids, const std::vector<int>& routes,
                           const std::vector<std::vector<double>>& costs) const;
@@ -186,6 +186,7 @@ class NativeQuickPlanner {
   std::vector<std::pair<int, int64_t>> window_bytes_by_width_;
   double relative_error_ = 0.0;
   int profile_runs_ = 1;
+  int configured_workers_ = 1;
 };
 
 }  // namespace moe_planner

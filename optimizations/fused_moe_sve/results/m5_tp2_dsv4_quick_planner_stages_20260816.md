@@ -43,6 +43,8 @@ committed.
 | 1: deduplicated cost + homogeneous heap LPT | 1 | 36.258 ms | 35.378 ms | 35.067 ms | 32.569 ms | +71.87% |
 | 2: single-thread native LPT/search boundary | 0 | 32.869 ms | 31.998 ms | 31.683 ms | 29.633 ms | +10.15% vs stage 1; +74.17% cumulative |
 | 2: single-thread native LPT/search boundary | 1 | 32.617 ms | 31.739 ms | 31.425 ms | 29.546 ms | +10.01% vs stage 1; +74.73% cumulative |
+| 3: candidate parallelism rejected; 1T retained | 0 | 32.675 ms | 31.823 ms | 31.522 ms | 29.546 ms | no production change |
+| 3: candidate parallelism rejected; 1T retained | 1 | 32.554 ms | 31.676 ms | 31.360 ms | 29.583 ms | no production change |
 
 The immediate-hit change was -0.78% on rank0 and +0.43% on rank1 by median
 paired layer, within the 2% gate. Sequential first-pass total planner time fell
@@ -93,6 +95,28 @@ byte-identical to stage 1 on both ranks, with the same SHA256 values shown
 above. The runtime reported `planner_backend=cpp_quick`; this stage deliberately
 uses one planner worker so candidate parallelism can be measured independently.
 
+## Stage 3 candidate-thread sweep
+
+Stage 3 preallocates one result slot per homogeneous shape and reuses the
+native planner's fixed-index `ParallelFor`. Each candidate remains
+single-threaded, exceptions are replayed by candidate index, and selection and
+ranking occur after the join in original candidate order. The existing
+`FUSED_CPP_MOE_PLANNER_THREADS` control and constructor parameter select the
+worker count.
+
+| workers | rank0 miss planner | rank1 miss planner | rank0 paired gain vs 1T | rank1 paired gain vs 1T |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 31.823 ms | 31.676 ms | -- | -- |
+| 2 | 31.663 ms | 31.627 ms | +0.19% | +0.15% |
+| 4 | 31.677 ms | 32.205 ms | +0.13% | -1.55% |
+| 8 | 31.793 ms | 31.395 ms | -0.26% | +0.80% |
+
+No shared worker count met the 10% stage gate. The native candidate portion is
+too small relative to Python analytical cost evaluation and bridge lowering to
+amortize OpenMP startup reliably. Production quick planning therefore defaults
+to one worker; explicit multi-worker settings remain diagnostic. All worker
+counts produced byte-identical Plan V2 JSON on both ranks.
+
 ## Validation
 
 ```text
@@ -109,5 +133,6 @@ PYTHONPATH=src .venv/bin/python -m pytest -q \
 Stage 1 adds direct coverage for generic/heap assignment parity, analytical
 cost deduplication, and the rounded-score low-lane-id tie-break. Stage 2 adds
 native analytical quick-plan equivalence and direct native tie coverage. Local
-validation passed 149 tests; the matching m5 build passed 146 tests. Later
-stages will append results to the same table.
+validation passed 149 tests; the matching m5 build passed 146 tests. Stage 3
+extends native parity coverage across 1/2/4 workers. Later stages will append
+results to the same table.

@@ -215,14 +215,14 @@ class IntervalPlanner:
                 native_cold_planner=native_cold_planner,
                 planner_threads=planner_threads,
             )
-            self._native_quick_planner = self._create_native_quick_planner()
+            self._native_quick_planner = self._create_native_quick_planner(planner_threads)
         else:
             if native_cold_planner is True:
                 raise ValueError("native cold planner does not yet support stage-specific scoring")
             self._native_planner = None
             self._native_quick_planner = None
 
-    def _create_native_quick_planner(self):
+    def _create_native_quick_planner(self, planner_threads):
         exporter = getattr(self.model, "native_quick_planner_payload", None)
         if not callable(exporter):
             return None
@@ -234,6 +234,11 @@ class IntervalPlanner:
         homogeneous_shapes = [shape for shape in self.shapes if len(set(shape)) == 1]
         if not homogeneous_shapes:
             return None
+        if planner_threads is None:
+            configured_threads = os.environ.get("FUSED_CPP_MOE_PLANNER_THREADS")
+            planner_threads = 1 if configured_threads is None else int(configured_threads)
+        if planner_threads < 0:
+            raise ValueError(f"planner_threads must be non-negative, got {planner_threads}")
         payload = exporter()
         return native_type(
             self.num_cores,
@@ -242,6 +247,7 @@ class IntervalPlanner:
             payload["window_bytes_by_width"],
             float(payload["relative_error"]),
             int(payload["profile_runs"]),
+            planner_threads,
         )
 
     def _create_native_planner(

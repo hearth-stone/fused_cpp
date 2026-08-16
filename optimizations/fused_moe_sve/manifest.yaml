@@ -1258,6 +1258,38 @@ features:
       Full materialized Plan V2 JSON remained byte-identical on both ranks.
       See results/m5_tp2_dsv4_quick_planner_stages_20260816.md.
 
+  - id: planner.native_quick_candidate_parallel
+    part: dispatch
+    status: diagnostic
+    implementation: >-
+      csrc/moe_planner/interval_planner.cpp,
+      csrc/moe_planner/interval_planner.h,
+      csrc/moe_planner/bindings.cpp, and
+      cpu_moe_schedule_optimization/planners/interval_planner.py
+    hypothesis: >-
+      Evaluating the eight independent homogeneous candidates with fixed-index
+      OpenMP workers may reduce forced-miss planner overhead by at least 10
+      percent while preserving candidate order and fully materialized plans.
+    depends_on:
+      - planner.native_quick_search
+    conflicts_with: []
+    correctness: >-
+      PYTHONPATH=src .venv/bin/python -m pytest -q
+      tests/test_moe_native_interval_planner.py tests/test_moe_cost_model_v2.py
+      tests/test_moe_analytic_model.py
+    benchmark: >-
+      Sweep FUSED_CPP_MOE_PLANNER_THREADS=1,2,4,8 with both m5 ranks running
+      concurrently, 7 forced misses per layer, matching rank profiles, and
+      /tmp/m5_tp2_dsv4_token_expert_ids_2048_20260816.json.
+    result: >-
+      Not enabled by default on 2026-08-16. Relative to a same-binary 1-worker
+      control, rank0/rank1 median per-layer forced-miss planner gains were
+      0.19/0.15 percent at 2 workers, 0.13/-1.55 percent at 4 workers, and
+      -0.26/0.80 percent at 8 workers. All were below the 10 percent gate.
+      Explicit thread control remains available for diagnostics; quick planning
+      defaults to one worker. Full Plan V2 JSON stayed byte-identical. See
+      results/m5_tp2_dsv4_quick_planner_stages_20260816.md.
+
   - id: planner.native_cold_search
     part: dispatch
     status: enabled

@@ -170,8 +170,6 @@ def test_native_analytical_quick_search_matches_python() -> None:
         local_experts=8,
     )
     reference = IntervalPlanner(model, num_cores=8, native_cold_planner=False)
-    actual = IntervalPlanner(model, num_cores=8, native_cold_planner=False)
-    assert actual._native_quick_planner is not None
     reference._native_quick_planner = None
     experts = [
         (0, 2040),
@@ -185,11 +183,23 @@ def test_native_analytical_quick_search_matches_python() -> None:
     ]
 
     expected = reference.plan_quick(experts)
-    result = actual.plan_quick(experts)
+    default = IntervalPlanner(model, num_cores=8, native_cold_planner=False)
+    default_result = default.plan_quick(experts)
+    _assert_plan_equivalent(expected, default_result)
+    assert default_result["planner_workers"] == 1
+    for workers in (1, 2, 4):
+        actual = IntervalPlanner(
+            model,
+            num_cores=8,
+            native_cold_planner=False,
+            planner_threads=workers,
+        )
+        assert actual._native_quick_planner is not None
+        result = actual.plan_quick(experts)
 
-    _assert_plan_equivalent(expected, result)
-    assert result["planner_backend"] == "cpp_quick"
-    assert result["planner_workers"] == 1
+        _assert_plan_equivalent(expected, result)
+        assert result["planner_backend"] == "cpp_quick"
+        assert result["planner_workers"] == workers
 
 
 def test_native_quick_assignment_preserves_rounded_score_tie_break() -> None:

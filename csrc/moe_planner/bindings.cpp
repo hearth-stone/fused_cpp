@@ -517,9 +517,10 @@ void register_moe_planner(py::module_& m) {
       .def_property_readonly("configured_workers", &moe_planner::NativeIntervalPlanner::configured_workers);
 
   py::class_<moe_planner::NativeQuickPlanner>(m, "NativeQuickPlanner")
-      .def(py::init<int, std::vector<std::vector<int>>, int64_t, std::vector<std::pair<int, int64_t>>, double, int>(),
+      .def(py::init<int, std::vector<std::vector<int>>, int64_t, std::vector<std::pair<int, int64_t>>, double, int,
+                    int>(),
            py::arg("num_cores"), py::arg("shapes"), py::arg("max_stage_bytes"), py::arg("window_bytes_by_width"),
-           py::arg("relative_error"), py::arg("profile_runs") = 1)
+           py::arg("relative_error"), py::arg("profile_runs") = 1, py::arg("planner_threads") = 1)
       .def("plan", &native_quick_plan, py::arg("expert_ids"), py::arg("routes"), py::arg("costs"))
       .def("assign", &native_quick_assign, py::arg("expert_ids"), py::arg("routes"), py::arg("shape"),
            py::arg("costs"));

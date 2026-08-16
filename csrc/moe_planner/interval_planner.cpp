@@ -1615,16 +1615,21 @@ IntervalPlanResult NativeIntervalPlanner::Plan(const std::vector<int>& expert_id
 
 NativeQuickPlanner::NativeQuickPlanner(int num_cores, std::vector<std::vector<int>> shapes, int64_t max_stage_bytes,
                                        std::vector<std::pair<int, int64_t>> window_bytes_by_width,
-                                       double relative_error, int profile_runs)
+                                       double relative_error, int profile_runs, int planner_threads)
     : num_cores_(num_cores),
       shapes_(std::move(shapes)),
       max_stage_bytes_(max_stage_bytes),
       window_bytes_by_width_(std::move(window_bytes_by_width)),
       relative_error_(relative_error),
-      profile_runs_(profile_runs) {
+      profile_runs_(profile_runs),
+      configured_workers_(planner_threads > 0 ? planner_threads : DefaultPlannerWorkers(num_cores)) {
   if (num_cores_ <= 0 || max_stage_bytes_ <= 0 || profile_runs_ <= 0) {
     throw std::invalid_argument("native quick planner dimensions and profile_runs must be positive");
   }
+  if (planner_threads < 0) {
+    throw std::invalid_argument("native quick planner threads must be non-negative");
+  }
+  configured_workers_ = std::max(1, std::min(configured_workers_, num_cores_));
   if (!std::isfinite(relative_error_) || relative_error_ < 0.0) {
     throw std::invalid_argument("native quick planner relative_error must be finite and non-negative");
   }
@@ -1741,12 +1746,12 @@ IntervalPlanResult NativeQuickPlanner::Plan(const std::vector<int>& expert_ids, 
     throw std::invalid_argument("native quick planner requires one cost row per shape");
   }
   IntervalPlanResult result;
-  result.configured_workers = 1;
+  result.configured_workers = configured_workers_;
   result.strict_candidates = static_cast<int>(shapes_.size());
-  result.candidates.reserve(shapes_.size());
-  for (size_t index = 0; index < shapes_.size(); ++index) {
-    result.candidates.push_back(Assign(expert_ids, routes, shapes_[index], costs[index]));
-  }
+  result.candidates.resize(shapes_.size());
+  ParallelFor(shapes_.size(), configured_workers_, [&](size_t index) {
+    result.candidates[index] = Assign(expert_ids, routes, shapes_[index], costs[index]);
+  });
   result.selected =
       *std::min_element(result.candidates.begin(), result.candidates.end(),
                         [](const IntervalCandidate& left, const IntervalCandidate& right) {
