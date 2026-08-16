@@ -1319,6 +1319,42 @@ features:
       materialized Plan V2 JSON remained byte-identical on both ranks. See
       results/m5_tp2_dsv4_quick_planner_stages_20260816.md.
 
+  - id: planner.fixed_early_merge_on
+    part: dispatch
+    status: enabled
+    implementation: >-
+      cpu_moe_schedule_optimization/planners/interval_planner.py and
+      cpu_moe_schedule_optimization/planners/planned_moe.py
+    hypothesis: >-
+      Materializing early_merge=true directly should preserve the effective
+      runtime path for m5 TP2 DSV4 while removing the analytical completion-DAG
+      and routing-tail gate from every cache miss and hit. Kernel latency must
+      remain within 2 percent and forced-miss planner latency should improve by
+      at least 10 percent.
+    depends_on:
+      - merge.async_ready_tokens
+    conflicts_with: []
+    correctness: >-
+      PYTHONPATH=src .venv/bin/python -m pytest -q
+      tests/test_moe_native_interval_planner.py tests/test_moe_cost_model_v2.py
+      tests/test_moe_analytic_model.py
+    benchmark: >-
+      Run both m5 TP2 ranks concurrently on the 43-layer
+      /tmp/m5_tp2_dsv4_token_expert_ids_2048_20260816.json routing capture,
+      using 7 forced misses per layer for planner timing and 5 synchronized
+      full-layer sweeps for planner-plus-kernel timing.
+    result: >-
+      Enabled on 2026-08-16. The previous auto policy resolved to on for all 43
+      layers. Rank0/rank1 forced-miss planner layer-medians fell from
+      23.565/23.549 ms to 1.424/1.401 ms, while the measured 43-layer kernel
+      remained about 1.24 s. Synchronized forced-miss planner-plus-kernel
+      medians fell from 2.973/2.968 s to 1.833/1.829 s, a 38.36/38.38 percent
+      latency reduction. All 43 on/off/auto kernel outputs matched exactly.
+      Historical TP4/F512 bimodal data favored disabling early merge by about
+      6 percent, so the user-requested global fixed-on default retains a known
+      cross-workload risk and is not presented as a model-derived optimum.
+      See results/m5_tp2_dsv4_quick_planner_stages_20260816.md.
+
   - id: planner.native_cold_search
     part: dispatch
     status: enabled

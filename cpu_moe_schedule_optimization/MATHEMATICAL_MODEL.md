@@ -828,60 +828,21 @@ $$
 C_{\max}^{+}=\max\left(\max_i f_i,\max_q g_q\right).
 $$
 
-当前 production planner 仍只优化 2.4 节的 expert-compute makespan，但 active
-DAG simulator 同时返回每个 task 的预测完成时刻 $\widehat f_j$。route-sliced
-expert 的预测完成时刻取其全部 slice 的最大值：
+当前 production planner 仍只优化 2.4 节的 expert-compute makespan。选定 compute
+plan 后固定写入 `early_merge=true`，不再为 merge policy 运行逐 task completion-time
+DAG，也不读取 `topk_ids` 做 routing-tail/burst gate。该 policy 不增加 shape、width、
+window 或 ordering 候选，不改变候选评分、剪枝和 histogram cache identity；它只是固定
+Plan V2 的执行策略。
 
-$$
-\widehat f_e=\max_{j:e(j)=e}\widehat f_j,\qquad
-\Delta_f=\max_e\widehat f_e-\min_e\widehat f_e.
-$$
+这个固定 policy 是实测 operational default，不是 active cost model 推导的最优性结论。
+m5 TP2 DSV4 的 43 层真实路由上，旧 auto 在 43/43 层本来就由 native team-load
+heuristic 解析为 on；强制 on 的 kernel 总时间与 auto 差异小于 0.06%，而跳过 planner
+DAG 显著降低 cache-miss 开销。其他 workload、机器和非 direct-route backend 不在这组
+性能证据的声明域内。
 
-对 strict plan，若
-
-$$
-\Delta_f\le
-\max\left(1\ \mathrm{ns},10^{-6}\max_e|\widehat f_e|\right),
-$$
-
-planner 写入 `early_merge=false`。此时模型预测所有 active expert 同时完成，没有
-可供 combine 隐藏的 expert-compute 区间；executor 在 compute 后由全部 worker
-按连续 token range 均匀分配 merge。
-
-若 strict caller 同时提供本轮真实 `topk_ids`，planner 在选定 compute plan 后增加一个
-不进入候选搜索的保守 gate。第一版只读取其 $(N,K)$ 形状，不扫描 token 内容；要求
-`counts` 来自同一 `topk_ids`，且标准 TopK 保证一个 token 内 expert id 不重复。对 expert
-$e$，令严格晚于其完成波次的 route occurrence 总量为
-
-$$
-R_{>e}=\sum_{j:\widehat f_j>\widehat f_e,\ \widehat f_j\not\simeq\widehat f_e}M_j.
-$$
-
-包含 $e$ 的 $M_e$ 个 token 中，最多 $\min(N,R_{>e})$ 个还能被更晚 expert 推迟。因此
-$e$ 所在 ready 波次的 token 数满足可解释下界
-
-$$
-L_e=\max\left(0,M_e-\min(N,R_{>e})\right).
-$$
-
-当前 fixed-owner drain 的默认 batch 为 $B_{merge}=2$。若 $N\le B_{merge}T$，全部
-token 本来就只占每个 owner 一轮，直接关闭 early merge。否则只需检查
-$M_e\ge N-B_{merge}T$ 的高覆盖 expert；其余 expert 不可能单独证明目标 burst。令
-$L^*=\max_eL_e$，若
-
-$$
-N-L^*\le B_{merge}T,
-$$
-
-则已有下界证明几乎全部 token 集中在一个 publication/drain 波次，波次外工作总量至多
-为每个 owner 的一轮默认 drain，planner 写入 `early_merge=false`。令高覆盖集合为
-$\mathcal H$；计算复杂度为 $O(E|\mathcal H|)$，且
-$|\mathcal H|\le NK/(N-B_{merge}T)$，TP4 2048-token/96T 下最多约 6 个。该 gate 不增加
-shape/order 候选，不改变 compute-plan histogram cache；每次调用只重新读取 $N$ 并用
-本轮 task routes 计算下界。若不满足该充分条件、未提供 routing shape、模型不能返回
-逐 task 时刻，或使用 stage-only/tail-pool plan，planner 写入 `null`，保留 runtime
-heuristic。由于 $G_q$ 和 expert/merge contention 尚未进入目标，planner 仍不会强制
-`early_merge=true`。
+历史 TP4/F512 long/short bimodal 的 temporal-order 实验中，关闭 early merge
+曾带来约 5.88%--6.07% 收益；全局固定 on 会放弃该保守 gate，因此这是已知的
+cross-workload 回退风险，而不是尚未观测到的理论风险。
 
 Plan V2 的 `early_merge` 是三态手动控制：`null` 为上述 auto，`true` 强制
 ready-token 路径并跳过 team-load gate，`false` 强制统一 post-expert merge。
@@ -1638,10 +1599,10 @@ $$
 容量定义的原始可行域。
 
 2.5 节的 ready-token merge service time 尚未进入 active cost model。当前
-profile 的 $\widehat I_i,\widehat D_i$ 仍只描述 expert compute；新增逐 task
-$\widehat f_j$ 与 `early_merge=false` 只识别“预测无重叠窗口”的情况，不估计
-combine 收益。在增加 merge service time、expert/merge 异构 contention 和真实
-分布留出验证前，planner 不得把实验重叠时间当作确定收益。
+profile 的 $\widehat I_i,\widehat D_i$ 仍只描述 expert compute；production planner
+固定 `early_merge=true` 是独立于模型目标的执行 policy，不代表模型已经估计 combine
+收益。在增加 merge service time、expert/merge 异构 contention 和真实分布留出验证
+前，不得把该固定 policy 解释为跨 workload 或跨机器的最优性结论。
 
 ### 8.1 当前 active isolated model
 
@@ -5124,3 +5085,4 @@ leave-one-sampled-width-out（非独立复测）的采样密度诊断，LLC MAPE
 | 2026-08-16 | v1.22 | 将 production analytical quick planner 的 homogeneous heap LPT、候选评分与最优 shape 选择等价迁移到单线程 C++；Python 继续计算精确 distinct-route `T_iso` cost rows，pybind 只完整转换胜出候选、其余返回 ranking 摘要，扩展不可用时回退 Python。m5 TP2、H4096/F1024/E256、43 层真实 DSV4 路由上，两 rank 的 Plan V2 与 v1.21 逐字节一致；双 rank 并发、每层 7 次 forced-miss 的 planner-overhead layer-median 为 31.998/31.739 ms，相对 v1.21 逐层收益中位数 10.15%/10.01%，累计相对原始 generic LPT 为 74.17%/74.73%。本阶段固定一个 planner worker，且不改变公式、候选、剪枝、排序、schema、ABI 或默认 dispatch。|
 | 2026-08-16 | v1.23 | 为 analytical quick planner 增加固定 candidate-index 的候选级 OpenMP 并行，并复用 `FUSED_CPP_MOE_PLANNER_THREADS`/构造参数；每个候选内部仍单线程且按原索引归并，43 层双 rank Plan V2 在 1/2/4/8 workers 下保持逐字节一致。m5 TP2 双 rank sweep 中，2 workers 相对同二进制 1 worker 的 forced-miss planner 逐层收益中位数仅 0.19%/0.15%；4 workers 为 0.13%/-1.55%，8 workers 为 -0.26%/+0.80%，均未达到 10% 门槛。因此 production quick 未配置时继续使用 1 worker，多线程只保留为显式诊断能力。|
 | 2026-08-16 | v1.24 | 将 analytical DAG active-phase pressure 计算改为固定 8-resource demand/time tuple，并缓存 immutable phase 的 isolated `base_ns`；scalar 诊断访问器、公式、归约顺序、event 边界和 early-merge 决策保持不变。m5 TP2、43 层真实 DSV4 路由、双 rank 并发、每层 7 次 forced-miss 中，planner-overhead layer-median 从同二进制 1T 对照的 31.823/31.676 ms 降至 23.565/23.549 ms（逐层收益中位数 26.00%/26.17%），累计相对原始 generic LPT 为 80.97%/81.33%；两个 rank 的 materialized Plan V2 仍逐字节一致。|
+| 2026-08-16 | v1.25 | production planner 的 early-merge policy 固定为 `true`，删除 plan lowering 上逐 task completion-time DAG 与 routing-tail/burst gate；compute candidate、评分、剪枝、cache identity、Plan V2 三态 schema、native ABI 和手工 `true/false/null` runtime 控制均不变。m5 TP2、H4096/F1024/E256、2048-token TopK6 的 43 层真实 DSV4 路由上，旧 auto 在 43/43 层本来就解析为 on，on/off/auto 输出逐层完全一致，kernel 43 层总时间均约 1.24 s。双 rank 并发、每层 7 次 forced-miss 的 planner-overhead layer-median 从 23.565/23.549 ms 降至 1.424/1.401 ms；5 次同步全层 forced-miss planner+kernel 中位数从 2.973/2.968 s 降至 1.833/1.829 s，延迟降低 38.36%/38.38%。该 policy 是 m5 TP2 DSV4 的实测 operational default，不声称 merge service 已被 cost model 建模或跨 workload/机器最优。|

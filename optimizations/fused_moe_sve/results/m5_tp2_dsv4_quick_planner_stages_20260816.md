@@ -7,13 +7,14 @@ Date: 2026-08-16
 This record tracks the staged optimization of the production analytical quick
 planner. It measures plan construction only; it is not a fused-MoE kernel or
 model E2E result. The public Python API, candidate space, cost objective,
-uncertainty, early-merge policy, Plan V2 schema, and native runtime are fixed.
+uncertainty, Plan V2 schema, and native runtime are fixed. Stages 1--4 preserve
+the prior early-merge policy; stage 5 intentionally fixes it on.
 
-Each stage must preserve the fully materialized plan on both ranks for all 43
-captured layers. Performance is accepted when forced-miss planner overhead
-improves by at least 10% for an algorithm/boundary stage, or 2% for a local
-SIMD stage, without a cache-hit regression beyond 2%. A stage is independently
-revertible by its commit.
+Stages 1--4 must preserve the fully materialized plan on both ranks for all 43
+captured layers. Stage 5 may change only `early_merge`. Performance is accepted
+when forced-miss planner overhead improves by at least 10% for an
+algorithm/boundary stage, or 2% for a local SIMD stage, without a cache-hit or
+kernel regression beyond 2%. A stage is independently revertible by its commit.
 
 ## System and method
 
@@ -47,6 +48,8 @@ committed.
 | 3: candidate parallelism rejected; 1T retained | 1 | 32.554 ms | 31.676 ms | 31.360 ms | 29.583 ms | no production change |
 | 4: fixed resource vectors + cached phase base | 0 | 24.406 ms | 23.565 ms | 23.263 ms | 22.512 ms | +26.00% vs stage 3; +80.97% cumulative |
 | 4: fixed resource vectors + cached phase base | 1 | 24.387 ms | 23.549 ms | 23.247 ms | 22.617 ms | +26.17% vs stage 3; +81.33% cumulative |
+| 5: fixed early merge on | 0 | 2.239 ms | 1.424 ms | 1.131 ms | 0.474 ms | +93.95% vs stage 4 |
+| 5: fixed early merge on | 1 | 2.223 ms | 1.401 ms | 1.104 ms | 0.466 ms | +94.05% vs stage 4 |
 
 The immediate-hit change was -0.78% on rank0 and +0.43% on rank1 by median
 paired layer, within the 2% gate. Sequential first-pass total planner time fell
@@ -139,6 +142,33 @@ from 1.929 s to 1.513 s on rank0 (+21.56%) and from 1.954 s to 1.527 s on
 rank1 (+21.88%). Both 43-layer Plan JSON files retained the original SHA256
 values listed above.
 
+## Stage 5 fixed early merge on
+
+The previous analytical post-plan gate consumed most of both cache-miss and
+cache-hit planning time, while all 43 captured m5 TP2 DSV4 plans retained
+`early_merge=None` and the native team-load heuristic resolved every layer to
+on. Stage 5 therefore materializes `early_merge=True` directly and removes the
+completion-time DAG and routing-tail analysis from plan lowering. Compute-plan
+candidates, scoring, pruning, cache identity, placement, windows, Plan V2
+schema, and native execution remain unchanged.
+
+With both ranks running concurrently and seven forced misses per layer, the
+planner-overhead layer-median fell from 23.565/23.549 ms to 1.424/1.401 ms on
+rank0/rank1, a 93.95%/94.05% reduction. Sequential first-pass total planner
+time fell from 1.513/1.527 s to 0.429/0.425 s. Immediate-hit planner overhead
+fell to 0.474/0.466 ms because the routing-dependent gate is no longer
+recomputed after a histogram cache hit.
+
+Before adoption, nine full-layer kernel sweeps compared auto, forced on, and
+forced off on the same 43 routes. Rank0 totals were 1236.901/1237.567/1235.703
+ms and rank1 totals were 1237.695/1238.013/1240.509 ms; the largest difference
+was 0.23%, and every layer matched exactly. After adoption, five synchronized
+forced-miss planner-plus-kernel sweeps measured current production at
+1832.910/1828.793 ms, down from the pre-change 2973.364/2968.055 ms. This is a
+38.36%/38.38% latency reduction while kernel time remains about 1.24 s.
+Historical TP4/F512 bimodal measurements favored disabling early merge by
+about 6%, so this global fixed-on policy retains a known cross-workload risk.
+
 ## Validation
 
 ```text
@@ -155,6 +185,8 @@ PYTHONPATH=src .venv/bin/python -m pytest -q \
 Stage 1 adds direct coverage for generic/heap assignment parity, analytical
 cost deduplication, and the rounded-score low-lane-id tie-break. Stage 2 adds
 native analytical quick-plan equivalence and direct native tie coverage. Local
-validation passed 150 tests; the matching m5 build passed 147 tests. Stage 3
+validation passed 150 tests; the matching m5 build passed 150 tests. Stage 3
 extends native parity coverage across 1/2/4 workers; stage 4 directly checks
-vector/scalar resource parity. All planned stages are recorded above.
+vector/scalar resource parity. Stage 5 checks fixed-on materialization and fails
+if plan lowering invokes the analytical DAG. All planned stages are recorded
+above.

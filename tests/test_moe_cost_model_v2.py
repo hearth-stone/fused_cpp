@@ -407,9 +407,10 @@ def test_planned_two_stage_planner_can_choose_different_stage_shapes() -> None:
     )
 
 
-def test_strict_bridge_disables_early_merge_for_equal_predicted_finishes() -> None:
+def test_strict_bridge_enables_early_merge_for_all_predicted_finishes() -> None:
+    model = _FinishAwareModel()
     planner = IntervalPlanner(
-        _FinishAwareModel(),
+        model,
         num_cores=4,
         widths=(2,),
         shapes=((2, 2),),
@@ -425,11 +426,16 @@ def test_strict_bridge_disables_early_merge_for_equal_predicted_finishes() -> No
         (1, 100, 2, 2, [0]),
     ]
 
-    assert planner.to_async_bridge(balanced)["early_merge"] is False
-    assert planner.to_async_bridge(staggered)["early_merge"] is None
+    def unexpected_dag_call(tasks) -> tuple[float, ...]:
+        raise AssertionError("fixed early-merge policy must not run the analytical DAG")
+
+    model.dag_task_finish_times = unexpected_dag_call
+
+    assert planner.to_async_bridge(balanced)["early_merge"] is True
+    assert planner.to_async_bridge(staggered)["early_merge"] is True
 
 
-def test_routing_tail_gate_is_recomputed_for_same_histogram_cache_hit() -> None:
+def test_fixed_early_merge_is_preserved_for_same_histogram_cache_hit() -> None:
     runtime = PlannedMoE(_RoutingFinishAwareModel(), num_cores=2)
     counts = [(expert, 16) for expert in range(4)]
     overlapping_tail = torch.tensor(
@@ -446,7 +452,7 @@ def test_routing_tail_gate_is_recomputed_for_same_histogram_cache_hit() -> None:
         topk_ids=overlapping_tail,
         dynamic_tail_pool=False,
     )
-    assert overlap["bridge"]["early_merge"] is None
+    assert overlap["bridge"]["early_merge"] is True
     assert runtime.last["cache_hit"] is False
 
     concentrated = runtime.plan_spec_for(
@@ -454,17 +460,17 @@ def test_routing_tail_gate_is_recomputed_for_same_histogram_cache_hit() -> None:
         topk_ids=concentrated_tail,
         dynamic_tail_pool=False,
     )
-    assert concentrated["bridge"]["early_merge"] is False
+    assert concentrated["bridge"]["early_merge"] is True
     assert runtime.last["cache_hit"] is True
-    assert runtime.last["routing_aware_early_merge"] is True
+    assert runtime.last["routing_aware_early_merge"] is False
 
     without_routing = runtime.plan_spec_for(counts, dynamic_tail_pool=False)
-    assert without_routing["bridge"]["early_merge"] is None
+    assert without_routing["bridge"]["early_merge"] is True
     assert runtime.last["cache_hit"] is True
     assert runtime.last["routing_aware_early_merge"] is False
 
 
-def test_routing_tail_gate_uses_one_owner_batch_as_conservative_cutoff() -> None:
+def test_fixed_early_merge_skips_routing_tail_analysis() -> None:
     planner = IntervalPlanner(
         _RoutingFinishAwareModel(),
         num_cores=2,
@@ -486,17 +492,8 @@ def test_routing_tail_gate_uses_one_owner_batch_as_conservative_cutoff() -> None
 
     policy, diagnostics = planner._early_merge_decision(tasks, topk_ids)
 
-    assert policy is False
-    assert diagnostics == {
-        "reason": "routing_tail_bound",
-        "dominant_expert": 2,
-        "dominant_wave_experts": (2, 3),
-        "dominant_wave_finish_ns": 20.0,
-        "burst_tokens_lower_bound": 28,
-        "outside_burst_tokens_upper_bound": 4,
-        "later_route_occurrences": 0,
-        "drain_capacity": 4,
-    }
+    assert policy is True
+    assert diagnostics == {"reason": "fixed_on"}
 
 
 def test_planner_selects_tail_pool_width_and_can_disable_dynamic() -> None:

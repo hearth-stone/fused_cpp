@@ -308,7 +308,7 @@ class PlannedMoE:
             "dynamic_candidates": result.get("dynamic_candidates", 0),
             "tail_repartition_candidates": result.get("tail_repartition_candidates", 0),
             "early_merge": bridge.get("early_merge"),
-            "routing_aware_early_merge": topk_ids is not None and bridge["execution_mode"] == "strict",
+            "routing_aware_early_merge": False,
         }
         return {
             "plan_version": bridge["plan_version"],

@@ -36,9 +36,6 @@ _AUTO_TAIL_POOL_THRESHOLDS = (1, 2, 4, 8, 12)
 _AUTO_TAIL_POOL_MIN_HEAD_SHAPES = 2
 _BOUNDED_TAIL_TASKS = 2
 _BOUNDED_TAIL_DEFAULT_CORES = 96
-_EARLY_MERGE_EQUAL_FINISH_REL_TOL = 1e-6
-_EARLY_MERGE_EQUAL_FINISH_ABS_NS = 1.0
-_EARLY_MERGE_OWNER_BATCH = 2
 _TEMPORAL_ASSIGNMENT_REL_TOL = 1e-10
 _TEMPORAL_ASSIGNMENT_ABS_NS = 1e-6
 _ASSIGNMENT_ORDER_LPT = "lpt"
@@ -1295,147 +1292,9 @@ class IntervalPlanner:
             tail_repartition_candidates=0,
         )
 
-    def _predicted_expert_finish_times(self, tasks) -> dict[int, float] | None:
-        if self.stage is not None:
-            return None
-        finish_time_fn = getattr(self.model, "dag_task_finish_times", None)
-        if not callable(finish_time_fn):
-            return None
-        model_tasks = [
-            (int(routes), int(threads), list(dependencies))
-            for _, routes, _, threads, dependencies in tasks
-        ]
-        try:
-            task_finish_times = tuple(float(value) for value in finish_time_fn(model_tasks))
-        except (KeyError, ValueError):
-            return None
-        if len(task_finish_times) != len(tasks) or not task_finish_times:
-            return None
-        expert_finish_times: dict[int, float] = {}
-        for values, finish_time in zip(tasks, task_finish_times, strict=True):
-            expert = int(values[0])
-            expert_finish_times[expert] = max(
-                finish_time,
-                expert_finish_times.get(expert, -math.inf),
-            )
-        return expert_finish_times
-
-    def _early_merge_decision(self, tasks, topk_ids=None) -> tuple[bool | None, dict[str, object]]:
-        """Conservatively disable early merge when one ready wave dominates.
-
-        This remains a post-plan gate: it never changes the compute candidate and
-        never forces early merge on. It reads only the shape of ``topk_ids`` and
-        derives a conservative ready-burst lower bound from existing route counts.
-        """
-        expert_finish_times = self._predicted_expert_finish_times(tasks)
-        if not expert_finish_times:
-            return None, {"reason": "finish_times_unavailable"}
-        earliest = min(expert_finish_times.values())
-        latest = max(expert_finish_times.values())
-        if math.isclose(
-            earliest,
-            latest,
-            rel_tol=_EARLY_MERGE_EQUAL_FINISH_REL_TOL,
-            abs_tol=_EARLY_MERGE_EQUAL_FINISH_ABS_NS,
-        ):
-            return False, {
-                "reason": "equal_expert_finish",
-                "late_experts": tuple(sorted(expert_finish_times)),
-            }
-        if topk_ids is None:
-            return None, {"reason": "routing_unavailable"}
-
-        import torch
-
-        ids = torch.as_tensor(topk_ids)
-        if ids.device.type != "cpu":
-            raise ValueError("routing-aware early merge requires CPU topk_ids")
-        if ids.dim() != 2 or ids.shape[0] <= 0 or ids.shape[1] <= 0:
-            raise ValueError("topk_ids must be a non-empty 2-D [tokens, top_k] tensor")
-        if ids.dtype == torch.bool or ids.is_floating_point() or ids.is_complex():
-            raise TypeError("topk_ids must use an integer dtype")
-
-        route_counts: dict[int, int] = {}
-        for expert, routes, _, _, _ in tasks:
-            expert = int(expert)
-            route_counts[expert] = route_counts.get(expert, 0) + int(routes)
-        if int(ids.numel()) != sum(route_counts.values()):
-            raise ValueError("topk_ids size does not match the selected plan route count")
-        num_tokens = int(ids.shape[0])
-        if any(routes > num_tokens for routes in route_counts.values()):
-            return None, {"reason": "topk_uniqueness_not_provable"}
-
-        drain_capacity = _EARLY_MERGE_OWNER_BATCH * self.num_cores
-        if num_tokens <= drain_capacity:
-            return False, {
-                "reason": "all_tokens_fit_one_owner_batch",
-                "num_tokens": num_tokens,
-                "drain_capacity": drain_capacity,
-            }
-
-        required_burst = num_tokens - drain_capacity
-        high_coverage_experts = [
-            expert for expert, routes in route_counts.items() if routes >= required_burst
-        ]
-        if not high_coverage_experts:
-            return None, {
-                "reason": "routing_tail_bound_inconclusive",
-                "required_burst": required_burst,
-                "max_expert_routes": max(route_counts.values()),
-                "drain_capacity": drain_capacity,
-            }
-
-        bounds: list[tuple[int, float, int, int]] = []
-        for expert in high_coverage_experts:
-            finish_time = expert_finish_times[expert]
-            later_route_occurrences = sum(
-                route_counts[other]
-                for other, other_finish in expert_finish_times.items()
-                if other_finish > finish_time
-                and not math.isclose(
-                    other_finish,
-                    finish_time,
-                    rel_tol=_EARLY_MERGE_EQUAL_FINISH_REL_TOL,
-                    abs_tol=_EARLY_MERGE_EQUAL_FINISH_ABS_NS,
-                )
-            )
-            burst_lower_bound = max(
-                0,
-                route_counts[expert] - min(num_tokens, later_route_occurrences),
-            )
-            bounds.append((burst_lower_bound, finish_time, -expert, later_route_occurrences))
-        burst_lower_bound, dominant_finish, negative_expert, later_route_occurrences = max(bounds)
-        dominant_expert = -negative_expert
-        dominant_wave_experts = tuple(
-            sorted(
-                expert
-                for expert, finish_time in expert_finish_times.items()
-                if math.isclose(
-                    finish_time,
-                    dominant_finish,
-                    rel_tol=_EARLY_MERGE_EQUAL_FINISH_REL_TOL,
-                    abs_tol=_EARLY_MERGE_EQUAL_FINISH_ABS_NS,
-                )
-            )
-        )
-        outside_burst_upper_bound = num_tokens - burst_lower_bound
-        diagnostics = {
-            "reason": "routing_tail_bound",
-            "dominant_expert": dominant_expert,
-            "dominant_wave_experts": dominant_wave_experts,
-            "dominant_wave_finish_ns": dominant_finish,
-            "burst_tokens_lower_bound": burst_lower_bound,
-            "outside_burst_tokens_upper_bound": outside_burst_upper_bound,
-            "later_route_occurrences": later_route_occurrences,
-            "drain_capacity": drain_capacity,
-        }
-        if outside_burst_upper_bound <= drain_capacity:
-            return False, diagnostics
-
-        diagnostics["reason"] = "routing_tail_bound_inconclusive"
-        # A predicted gap is still insufficient evidence to force early merge
-        # on until merge/computation contention has an active service model.
-        return None, diagnostics
+    def _early_merge_decision(self, tasks, topk_ids=None) -> tuple[bool, dict[str, object]]:
+        """Enable ready-token merge without running the analytical DAG gate."""
+        return True, {"reason": "fixed_on"}
 
     def _early_merge_policy(self, tasks, topk_ids=None) -> bool | None:
         return self._early_merge_decision(tasks, topk_ids)[0]

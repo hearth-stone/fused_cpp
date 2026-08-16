@@ -181,14 +181,10 @@ diagnostics. It is useful for understanding prototype overhead, but it should no
 be interpreted as native runtime planner cost.
 
 `T_dispatch` and the duration/contention response of `T_combine` are not
-included in the planner objective. Plan V2 does expose a conservative
-`early_merge` execution choice. Besides disabling overlap when predicted expert
-completion times coincide, a strict caller may provide the actual `topk_ids` so
-a post-plan gate can use its token count and the existing route histogram to
-prove a lower bound on one ready burst. It disables overlap when that lower bound
-contains all but one default owner-drain batch of tokens. The gate does not scan
-token identities, add search candidates,
-or score an unmodeled combine gain, and it never forces early merge on.
+included in the planner objective. Production planning writes
+`early_merge=true` after selecting the compute plan, without running an
+additional completion-time or routing-tail analysis. This fixed execution
+policy does not add search candidates or alter compute-plan scoring.
 
 ## Scheduled C++ Bridge
 
@@ -290,11 +286,8 @@ Rules:
   the runtime team-load heuristic, `true` forces the ready-token path, and
   `false` waits for expert compute to finish before all workers merge uniform
   contiguous token ranges. `true` requires SVE direct-route W2.
-  `PlannedMoE.plan_spec_for(..., topk_ids=...)` may conservatively materialize
-  `false` after selecting a strict compute plan. `counts` must come from the same
-  standard TopK tensor, whose rows contain distinct expert ids. The compute-plan
-  cache remains histogram-based, while the token-count bound is recomputed for
-  every supplied `topk_ids` shape.
+  Production `PlannedMoE` materializes `true` after selecting the compute plan;
+  callers constructing Plan V2 directly retain all three controls.
   `FUSED_CPP_MOE_ASYNC_READY_TOKEN_MERGE=0` remains a
   global kill switch. A Python wrapper connected to a native extension without
   this argument rejects explicit `true`/`false` instead of ignoring it.

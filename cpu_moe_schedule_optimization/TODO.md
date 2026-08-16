@@ -295,8 +295,13 @@ Acceptance gates:
   `+6.28%`, DSV4 improves `+8.80%`, and tiered hotspot is `-0.56%`; all six
   unchanged-order controls remain within `0.89%` by median. The gate changes
   only bimodal (`early_merge: null -> false`) and creates no held-out median
-  regression above 2%. Cross-machine promotion remains governed by the
-  separate validation rule above.
+  regression above 2%. On 2026-08-16 this routing-aware gate was superseded by
+  the user-requested global fixed-on policy after m5 TP2 DSV4 resolved auto to
+  on for all 43 captured layers and removing the gate cut forced-miss planner
+  overhead by about 94%. The earlier TP4/F512 bimodal evidence remains a known
+  cross-workload regression risk; fixed-on is not a model-derived claim and
+  cross-machine promotion remains governed by the separate validation rule
+  above.
 - [ ] Measure lane-tail weighted idle loss on a larger routing corpus. Current
   TP cases have a perfect-rebalance upper bound of only 0.7-2.4%; prototype
   same-width-lane work stealing only if representative cases repeatedly exceed
