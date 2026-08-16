@@ -115,6 +115,21 @@ class _QuickPlannerModel(_DeterministicTailPoolModel):
         raise AssertionError("quick planner must not run the event-time simulator")
 
 
+class _CountingQuickPlannerModel(_QuickPlannerModel):
+    def __init__(self) -> None:
+        self.iso_calls: list[tuple[int, int]] = []
+
+    def T_iso(self, routes: int, threads: int) -> float:
+        self.iso_calls.append((routes, threads))
+        return super().T_iso(routes, threads)
+
+
+class _RoundedTieQuickPlannerModel(_QuickPlannerModel):
+    def T_iso(self, routes: int, threads: int) -> float:
+        del threads
+        return {4: 2.0, 3: 1.0, 2: 1.0e20}[routes]
+
+
 class _DeterministicStageModel(_DeterministicTailPoolModel):
     call_setup_ns = 3.0
 
@@ -238,6 +253,52 @@ def test_quick_planner_uses_bounded_homogeneous_lpt_search() -> None:
     assert short["makespan_ns"] == 20.0
     assert large["planner_backend"] == "python_quick"
     assert large["dynamic_candidates"] == 0
+
+
+def test_homogeneous_heap_lpt_matches_generic_assignment_and_loads() -> None:
+    planner = IntervalPlanner(
+        _QuickPlannerModel(),
+        num_cores=4,
+        native_cold_planner=False,
+    )
+    experts = [(0, 100), (1, 100), (2, 1), (3, 1), (4, 1)]
+    lanes = planner._lanes((2, 2))
+
+    expected_assignment = planner._assign_lpt(experts, lanes)
+    assignment, lane_loads = planner._assign_homogeneous_lpt(experts, lanes)
+
+    assert assignment == expected_assignment
+    assert lane_loads == [236.0, 228.0]
+
+
+def test_homogeneous_heap_lpt_preserves_rounded_score_tie_break() -> None:
+    planner = IntervalPlanner(_RoundedTieQuickPlannerModel(), num_cores=2, native_cold_planner=False)
+    experts = [(0, 4), (1, 3), (2, 2)]
+    lanes = planner._lanes((1, 1))
+
+    expected_assignment = planner._assign_lpt(experts, lanes)
+    assignment, _ = planner._assign_homogeneous_lpt(experts, lanes)
+
+    assert expected_assignment == [[0, 2], [1]]
+    assert assignment == expected_assignment
+
+
+def test_quick_planner_deduplicates_isolated_costs_per_width() -> None:
+    model = _CountingQuickPlannerModel()
+    planner = IntervalPlanner(model, num_cores=4, native_cold_planner=False)
+
+    planner.plan_quick([(0, 100), (1, 100), (2, 1), (3, 1)])
+
+    assert sorted(model.iso_calls) == sorted(
+        [
+            (100, 1),
+            (1, 1),
+            (100, 2),
+            (1, 2),
+            (100, 4),
+            (1, 4),
+        ]
+    )
 
 
 def test_planned_moe_quick_search_caches_selected_shape() -> None:

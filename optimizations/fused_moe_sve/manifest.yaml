@@ -1190,6 +1190,36 @@ features:
       overpredicts the candidate by 28.81%, so it remains outside production.
       See results/amazon_192c_dsv4_large_small_partition_20260811.md.
 
+  - id: planner.quick_homogeneous_heap_lpt
+    part: dispatch
+    status: enabled
+    implementation: cpu_moe_schedule_optimization/planners/interval_planner.py
+    hypothesis: >-
+      Deduplicating analytical isolated-time evaluation by (routes, width) and
+      using a deterministic heap for homogeneous LPT removes repeated Python
+      model evaluation and lane scans. The materialized Plan V2 must remain
+      byte-identical, including floating-point score ties, and forced-miss
+      planner overhead should improve by at least 10 percent on the captured
+      m5 TP2 DSV4 routing workload without regressing cache-hit latency by more
+      than 2 percent.
+    depends_on: []
+    conflicts_with: []
+    correctness: >-
+      PYTHONPATH=src .venv/bin/python -m pytest -q
+      tests/test_moe_cost_model_v2.py tests/test_moe_analytic_model.py
+    benchmark: >-
+      Run both m5 ranks concurrently with numactl --physcpubind=0-95
+      --membind=0 and --physcpubind=96-191 --membind=1 using
+      /tmp/bench_m5_real_routing_planner.py, the matching
+      profiles/m5-tp2-rank{0,1}.json, 7 forced misses per layer, and
+      /tmp/m5_tp2_dsv4_token_expert_ids_2048_20260816.json.
+    result: >-
+      Enabled on 2026-08-16. Across 43 real DSV4 layers, rank0/rank1
+      forced-miss planner-overhead layer-medians fell from 123.892/125.917 ms
+      to 35.633/35.378 ms; median per-layer gains were 71.15/71.87 percent.
+      Full materialized Plan V2 JSON was byte-identical on both ranks. See
+      results/m5_tp2_dsv4_quick_planner_stages_20260816.md.
+
   - id: planner.native_cold_search
     part: dispatch
     status: enabled
@@ -1497,6 +1527,12 @@ variants:
     features: []
     entrypoint: elastic::Executor::run_static
     status: reference
+
+  - id: sve_quick_homogeneous_planner
+    features:
+      - planner.quick_homogeneous_heap_lpt
+    entrypoint: MoePlannerRuntime.plan_for_dispatch -> fused_moe_bf16_tiled_async_plan
+    status: enabled
 
   - id: sve_production_2d_adapter
     features:

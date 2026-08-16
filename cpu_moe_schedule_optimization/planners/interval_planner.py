@@ -293,6 +293,39 @@ class IntervalPlanner:
             load[lane] += self._task_time(routes, lanes[lane][1])
         return lane_experts
 
+    def _assign_homogeneous_lpt(self, experts, lanes):
+        """Assign a homogeneous shape and return its exact isolated lane loads."""
+        if not lanes or len({width for _, width in lanes}) != 1:
+            raise ValueError("homogeneous LPT requires lanes with one shared width")
+        width = lanes[0][1]
+        task_times = {
+            routes: self._task_time(routes, width)
+            for routes in dict.fromkeys(routes for _, routes in experts)
+        }
+        availability = [(0.0, lane) for lane in range(len(lanes))]
+        heapify(availability)
+        lane_experts: List[List[int]] = [[] for _ in lanes]
+        order = sorted(range(len(experts)), key=lambda index: -experts[index][1])
+        for index in order:
+            task_time = task_times[experts[index][1]]
+            load, lane = heappop(availability)
+            score = load + task_time
+            tied = []
+            while availability and availability[0][0] + task_time == score:
+                tied.append(heappop(availability))
+            if tied:
+                tied.append((load, lane))
+                load, lane = min(tied, key=lambda item: item[1])
+                for candidate in tied:
+                    if candidate[1] != lane:
+                        heappush(availability, candidate)
+            lane_experts[lane].append(index)
+            heappush(availability, (score, lane))
+        lane_loads = [0.0] * len(lanes)
+        for load, lane in availability:
+            lane_loads[lane] = load
+        return lane_experts, lane_loads
+
     @staticmethod
     def _reverse_lanes(lane_experts, parity: int):
         return [
@@ -520,12 +553,8 @@ class IntervalPlanner:
         if len(set(signature)) != 1:
             raise ValueError("quick planning accepts only homogeneous shapes")
         lanes = self._lanes(signature)
-        assignment = self._assign_lpt(experts, lanes)
+        assignment, lane_loads = self._assign_homogeneous_lpt(experts, lanes)
         tasks = self._build_tasks(experts, lanes, assignment)
-        lane_loads = [0.0] * len(lanes)
-        for lane, expert_indices in enumerate(assignment):
-            width = lanes[lane][1]
-            lane_loads[lane] = sum(self._task_time(experts[index][1], width) for index in expert_indices)
         makespan = max(lane_loads, default=0.0)
         uncertainty = self._uncertainty(experts, signature, makespan, use_full_workload_anchor=False)
         return {
