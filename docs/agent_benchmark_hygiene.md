@@ -54,8 +54,8 @@ MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 \
 taskset -c <core> <command>
 ```
 
-On `Arm-codex`, independent benchmark cores are `0`, `80`, `160`, and `240`.
-Use one process per core and report the selected core.
+On `Arm-codex-internal` / `Arm-codex`, independent benchmark cores are `0`,
+`80`, `160`, and `240`. Use one process per core and report the selected core.
 
 On `AmazonECS8Cores`, use one process per core from `0` through `7`. Example:
 

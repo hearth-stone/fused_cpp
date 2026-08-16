@@ -22,4 +22,4 @@ rsync -avzP \
     --exclude='bench/sdpa/sdpa_versions_*.csv' \
     --exclude='bench/sdpa/sdpa_versions_*.json' \
     --exclude='.codegraph/' \
-    ./ "Arm-codex:/home/zhangxu/codex/fused_cpp"
+    ./ "Arm-codex-internal:/home/zhangxu/code/"

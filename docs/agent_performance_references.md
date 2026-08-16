@@ -4,11 +4,11 @@ Read this file only when comparing benchmark results with peak/sanity reference
 data or investigating hardware-specific throughput on the configured remote
 machines.
 
-## Arm-codex Peak FLOPs Reference
+## Arm-codex-internal / Arm-codex Peak FLOPs Reference
 
-The following numbers are `Arm-codex` single-core peak measurements unless noted
-otherwise. Use them as sanity checks for SDPA and microkernel benchmark results on
-that machine.
+The following numbers are `Arm-codex-internal` / `Arm-codex` single-core peak
+measurements unless noted otherwise. Use them as sanity checks for SDPA and
+microkernel benchmark results on that machine.
 
 ```
 | Instruction Set | Core Computation              | Peak Performance | IPC      | Latency |
