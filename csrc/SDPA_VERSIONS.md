@@ -668,6 +668,60 @@ prepacked（强制 shared pool）两个专项测试通过，完整 post-GEMM 文
 该机运行验证仍待补。完整命令、样本范围和回滚边界见
 `optimizations/deepseek_v4_post_gemm/results/amazon_8c_indexer_select_all_early_exit_20260813.md`。
 
+### Online-softmax exp packed-lane constants Lab experiment
+
+Compared the existing broadcast-constant degree-5 Horner exp with a
+dependency-broken Estrin form. The candidate keeps range-reduction constants
+in one NEON register and the six polynomial coefficients in two registers;
+generated GCC 15 assembly was checked for indexed `FMUL/FMLS/FMLA` lane forms.
+Both paths sweep U1/U2/U4/U8 so their different dependency depths are not
+confused with constant-loading cost.
+
+On Amazon M5 Neoverse V3, NUMA1 core 96, SVE128, length 2048, three sessions of
+21 samples, isolated best-to-best was Horner U4 0.605697 versus packed/Estrin U8
+0.571827 ns/element (+5.92% throughput). With 16 SVE accumulators forced live
+across softmax, best-to-best was 0.613147 versus 0.579812 ns/element (+5.75%).
+Matched U8 improved throughput 12.66% and reduced hot-loop Q spill pairs from
+14 to 5, while both saved eight Z accumulators across softmax. Best-to-best is
+not spill-free because the candidate requires deeper unrolling. Both variants
+had max relative error 3.2874e-6, max 39 ULP, and 76 BF16 mismatches out of
+1,048,570 versus rounded `std::exp`. No production path changed; full method is
+in `optimizations/sparse_mla/results/amazon_m5_softmax_exp_constants_20260816.md`.
+
+### Shared-prefix token-panel L2 scheduling experiment
+
+Tested a MoE-like macro schedule for the first-2048 shared-prefix path: group
+adjacent input tokens into a thread-private panel, keep packed Q and online
+`(m,l,O)` plus score/P scratch in L2, and move the shared packed-K/V chunk loop
+outside the token loop. Token panels remain the primary parallel dimension;
+the existing short-query KV split remains the secondary source of parallelism.
+Each token retained its original segment/chunk order.
+
+Amazon 8C, SVL256, `q[2048,32,192]`, compressed 512 + causal/SWA 2048,
+`d_v=128`, 5 warmups + 21 samples: panel 4 reduced 1T latency in two orders
+from 454.085/453.853 to 447.179/447.129 ms (-1.52%/-1.48%), and 8T from
+76.714/76.838 to 75.983/76.165 ms (-0.95%/-0.88%). Panel 8 was -1.43% at 1T
+but +1.06% at 8T. Forcing the existing 8-query token-major fallback was
+827.890/137.295 ms at 1T/8T, 82%/79% slower than head-major, although this also
+changes the scalable microkernel path. Panel 4 passed shared-prefix output/stats
+tests and all timed checksums matched. The experiment missed its 3% gate, so
+the source was removed and the production token-major-first/KV-second dispatch
+was left unchanged. M5 was not measured because the migrated `/data` worktree
+had no project Python/PyTorch environment in the first pass.
+
+The requested M5 follow-up used native SVL128 on NUMA1 cores 96--191 and kept
+the `8x2VL` QK/PV microkernels unchanged. It scanned token panels `{4,8,16}`,
+B blocks `{64,128,256}`, fixed single-scratch storage, plus panel8/B256 double
+scratch. No point approached the gate. In the paired panel8/B256/single run,
+2048 shared-prefix changed 11.635 to 11.619 ms (-0.14%), 8192 shared-dense
+changed 9.222 to 9.250 ms (+0.30%), and later low-overlap sparse changed 2.606
+to 2.611 ms (+0.19%). PMU sampling showed 2048 L2 data refills down 12--16%
+and bus accesses down 8--11%, but duration improved only 0.24% and LLC read
+misses increased; at 8192, L2 refills were unchanged and duration regressed.
+M5 has no exposed uncore/DDR PMU, so bus-access times 64 bytes is reported only
+as a traffic proxy. The prototype was removed. Full data is in
+`optimizations/sparse_mla/results/{amazon_8c_token_panel_cache_20260817.md,amazon_m5_token_panel_cache_20260817.md}`.
+
 ---
 
 ## 选型矩阵
@@ -693,6 +747,8 @@ prepacked（强制 shared pool）两个专项测试通过，完整 post-GEMM 文
 
 | 日期 | 改动概述 | 受影响文件 |
 |---|---|---|
+| 2026-08-17 | **Sparse MLA shared-prefix token-panel/B-block L2 调度负结果**：参考 MoE cache blocking，把相邻 token 的 Q 与 online `(m,l,O)` 作为线程私有 A/C panel，共享 packed-K/V B chunk 提到 token 内循环外，score/P scratch 固定为单/双 B-block slot，causal 拆 common rectangle + triangular fringe，QK/PV 保持 `8x2VL`。Amazon 8C panel4 仅改善 0.9--1.5%。M5 NUMA1 cores96--191/SVL128 完整扫 panel `{4,8,16}` x B block `{64,128,256}`；配对 panel8/B256/single 的 2048/8192/later-sparse 分别为 -0.14%/+0.30%/+0.19%。PMU 显示 2048 L2 refill 降 12--16%、bus access 降 8--11%，但 duration 仅 -0.24%且 LLC miss 上升；8192 L2 几乎不变。未达 3% gate，故撤销源码且不增加开关。 | 改 `csrc/{SDPA_TODO.md,SDPA_VERSIONS.md}`、`optimizations/sparse_mla/manifest.yaml`；新建 `optimizations/sparse_mla/results/{amazon_8c_token_panel_cache_20260817.md,amazon_m5_token_panel_cache_20260817.md}` |
+| 2026-08-16 | **Online-softmax exp packed-lane/Estrin Lab 比较**：用 1 个 range-reduction + 2 个 polynomial packed NEON 常数寄存器生成 indexed lane FMUL/FMLS/FMLA，并对 Horner/Estrin 各扫 U1/U2/U4/U8。M5 SVE128、length2048 三会话中 isolated best-to-best 吞吐 +5.92%，16 个 SVE accumulator 跨 softmax 活跃时 +5.75%；同 U8 时 Z spill 均为 8 slots，热循环 Q spill pairs 14→5，吞吐 +12.66%，但 best-to-best 的 U8 candidate 相比 U4 baseline 增加 spill，故只保留 Lab。两者 max 39 ULP、BF16 mismatch 均 76/1,048,570。 | 新建 `optimizations/sparse_mla/benchmarks/{softmax_exp_constants.cpp,Makefile}`、`optimizations/sparse_mla/results/amazon_m5_softmax_exp_constants_20260816.md`；改 `optimizations/sparse_mla/manifest.yaml`、`csrc/SDPA_VERSIONS.md` |
 | 2026-08-14 | **Sparse MLA indexed K/V 单次 gather+pack**：后续 query-dependent sparse 的跨 token KV 重叠不足以共享 pack，因此在每个 2VL key tile 内将 K 与 V pack 融合；每 4 个 indexed KV 行的 8-wide load 同时生成两个 K=4 BFMMLA panels 和一个转置 V panel，输入 KV payload 从 `d_qk+d_v` 降到 `d_qk`。Amazon 8C `q[2048,32,192],topk640,Dv128,context_start10000`：1T 280.552→254.908 ms（-9.14%），8T 正/反顺序为 -5.83%/-6.04%，profile pack 61.209→37.819 ms（-38.21%）；共享前缀 8T -0.18%。SVL256/SVL128 各 `26 passed`，checksum 一致。 | 改 `csrc/{sparse_mla.cpp,sparse_mla_sve.h,SDPA_VERSIONS.md}`、`optimizations/sparse_mla/manifest.yaml`；新建 `optimizations/sparse_mla/results/amazon_8c_indexed_single_pack_20260814.md` |
 | 2026-08-14 | **Sparse MLA 前 2048 V4-like 双前缀共享 K/V pack**：SVE BF16 head-major 自动识别 compressed + causal/SWA 两段固定起点连续前缀，把每段最大范围按运行时 2VL BFMMLA layout 在调用级只 pack 一次；每 token 仅消费自身有效长度，不增加 QK/PV。query-dependent TopK、滑动 SWA、低复用、非整 tile 和 non-SVE 保持 per-token gather-pack fallback。Amazon 8C、`q[2048,32,192],Dv128`、compressed512+SWA2048：1T 552.018→451.861 ms（-18.14%），8T 反向顺序稳态 82.702→76.929 ms（-6.98%）；后续 sparse 1T/8T 为 +0.04%/-0.20%。SVL256/SVL128 完整文件各 `26 passed`。 | 改 `csrc/{sparse_mla.cpp,SDPA_VERSIONS.md}`、`tests/test_sparse_mla.py`、`optimizations/sparse_mla/manifest.yaml`；新建 `optimizations/sparse_mla/results/amazon_8c_shared_prefix_pack_20260814.md` |
 | 2026-08-14 | **统一 Sparse MLA head-major QK/PV 与 online-softmax 中间计算**：shared-dense 与 indexed-sparse 保留各自 K/V pack 和任务调度，但共同调用一个内部 chunk executor，统一执行 QK、score materialization、online max/sum/O correction、BF16 P、P pack 和 PV。sparse 的 ragged/重复索引、sink、精确 stats，及 dense 的在线 stats 语义均保持不变；默认 dispatch、公开 API 和 packed layout 不变。Amazon 8C SVE-BF16 extension 全量构建成功；SVL256 cores 0--3 与强制 SVL128 cores 4--7、OMP=4 各 `24 passed`。AmazonM5192Cores 原生 SVL128 上主 `_C` extension 以 C++17 构建成功，NUMA1 cores 96--99、OMP=4 为 `24 passed`；完整 setup 后续仍被无关 MoE C++17 `atomic::wait/notify_all` 编译错误阻断。M5 NUMA1、cores 96--191、`q[2048,32,192],topk640,Dv128`、5 warmup + 21 iterations、三个独立 session 的 session-median 再取中位数：1T sparse 220.664→212.849 ms（-3.54%）、dense 172.402→168.588 ms（-2.21%）；96T sparse 3.025→2.914 ms（-3.67%），dense 因性能状态呈双峰，稳态约 2.457→2.433 ms（约 -0.98%，只判定无稳定回退）。`q[8192,...]` 的两个 paired session 中 sparse 11.819→11.359 ms（约 -3.89%）；dense 两轮均不回退但幅度受机器状态影响，不量化收益。baseline 为同一 HEAD 源码单文件重编译，candidate 只替换 `sparse_mla.o`，链接对象、编译参数、绑核和 NUMA 配置一致；checksum 一致。 | 改 `csrc/{sparse_mla.cpp,SDPA_VERSIONS.md}` |

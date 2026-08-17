@@ -202,6 +202,15 @@
 
 ## 已完成（参 SDPA_VERSIONS.md 的 Changelog）
 
+- ✅ **Sparse MLA token-panel L2 cache schedule rejected** —— 2026-08-17
+  - panel 4 kept per-token online-softmax order and reused each packed B chunk
+    across four adjacent tokens, but improved Amazon 8C by only 1.5%/0.9% at
+    1/8 threads; panel 8 regressed eight-thread latency by 1.1%
+  - the existing token-major fallback was 79--82% slower; retain the current
+    head-major token-first schedule and use KV shards only for query underfill
+  - M5 cores 96--191: the full panel `{4,8,16}` x B-block `{64,128,256}`
+    sweep also failed; paired panel8/B256 changed 2048/8192/later-sparse by
+    -0.14%/+0.30%/+0.19%. PMU showed fewer 2048 L2 refills without wall-time gain
 - ✅ **P0: QKᵀ-fp32 重写为 4×4 双向分块（`MK_QkUblock4` trait）** —— 2026-05-23
   - 新增 `gemm_qkt_microkernel_8x8_fp32_ublock4`：8×8 输出切 4 个 4×4 子块，每块 16 个独立 fp32 累加器外积扇出 + vpaddq 树 reduce，把 ILP 从 1 条链拉到 16 条独立 fma 链
   - 不需要 K 转置或 pre-pack；Q/K 仍按行连续 vld1q_f32 加载

@@ -89,6 +89,39 @@ features:
       See optimizations/sparse_mla/results/amazon_sparse_mla_2d_fused_20260812.md.
     result: optimizations/sparse_mla/results/amazon_sparse_mla_2d_fused_20260812.md
 
+  - id: scheduling.token_panel_ac_l2
+    part: scheduling
+    status: retired
+    implementation: Removed from the active tree
+    hypothesis: >-
+      Group adjacent input tokens into a thread-local panel so packed Q and
+      online output state remain in private L2 while each shared packed-K/V B
+      chunk streams once through the panel; split tokens before KV/B shards.
+    depends_on:
+      - scheduling.head_major_sparse
+      - packing.shared_prefix_kv_2vl
+    conflicts_with: []
+    correctness: >-
+      Amazon 8C native SVL256 shared-prefix output/statistics tests passed for
+      panel 4. M5 native SVL128 direct native-versus-naive output/statistics
+      checks passed for shared dense, shared prefix, and later sparse with
+      panel4/B64/single and panel8/B256/double scratch. Timed checksums matched.
+    benchmark: >-
+      tests/bench_sparse_mla_scalable.py --pattern sparse --s-q 2048
+      --compressed-capacity 512 --window-size 2048 --context-start 0
+      --threads 1|8 --warmup 5 --iters 21 --seed 20260817
+    result: >-
+      optimizations/sparse_mla/results/amazon_8c_token_panel_cache_20260817.md
+      and optimizations/sparse_mla/results/amazon_m5_token_panel_cache_20260817.md
+    history: uncommitted prototype; no source retained
+    retirement_reason: >-
+      Panel 4 reduced latency only 1.48-1.52% at one thread and 0.88-0.95% at
+      eight threads, below the 3% adoption gate. Panel 8 regressed eight-thread
+      latency by 1.06%, and the existing token-major fallback was 79-82% slower.
+      On M5 cores 96-191, all nine panel/B-block combinations missed the gate;
+      paired panel8/B256 changed 2048, 8192, and later sparse latency by
+      -0.14%, +0.30%, and +0.19% respectively.
+
   - id: packing.shared_prefix_kv_2vl
     part: packing
     status: enabled
@@ -200,6 +233,46 @@ features:
     result: >-
       optimizations/sparse_mla/results/amazon_8c_scalable_sve_20260814.md and
       optimizations/sparse_mla/results/amazon_8c_dense_scalable_sve_20260814.md
+
+  - id: compute.softmax_exp_packed_constants
+    part: compute
+    status: experimental
+    implementation: optimizations/sparse_mla/benchmarks/softmax_exp_constants.cpp
+    hypothesis: >-
+      Packing degree-5 exp constants into NEON lanes and evaluating the
+      polynomial with dependency-broken Estrin FMLA reduces latency and spills
+      relative to broadcast-constant Horner, especially while the 16 SVE
+      accumulators of an 8x2VL BFMMLA tile remain live.
+    depends_on:
+      - compute.sve_qk_8x2vl_bfmmla
+    conflicts_with: []
+    owner: zhangxu
+    opened: 2026-08-16
+    decision_by: 2026-09-15
+    next_decision: >-
+      Retire if M5 accuracy exceeds the existing degree-5 envelope, if the
+      dependency-broken candidate does not improve the best adequately
+      unrolled baseline, or if register-pressure gains do not survive the
+      synthetic 8x2VL live-accumulator benchmark.
+    adoption_gate: >-
+      Match the current degree-5 BF16 tolerance, improve median isolated
+      exp-minus throughput by at least 3%, and introduce no additional stack
+      vector spills under the 8x2VL pressure wrapper on AmazonM5192Cores.
+    correctness: >-
+      optimizations/sparse_mla/benchmarks/softmax_exp_constants
+      --length=2048 --warmup=1 --iterations=1 --samples=1
+    benchmark: >-
+      numactl --physcpubind=96 --membind=1
+      optimizations/sparse_mla/benchmarks/softmax_exp_constants
+      --length=2048 --warmup=200 --iterations=2000 --samples=21
+    result: >-
+      optimizations/sparse_mla/results/amazon_m5_softmax_exp_constants_20260816.md
+    conclusion: >-
+      BF16 accuracy was unchanged and packed-lane Estrin improved best-to-best
+      isolated and 16-live-accumulator throughput by 5.92% and 5.75%. However,
+      that comparison uses U8 instead of Horner U4 and therefore adds spills;
+      matched U8 keeps eight Z spill slots while reducing repeated Q spill
+      pairs from 14 to 5. Keep Lab-only pending an integrated tile prototype.
 
   - id: planning.masked_dense_tail
     part: planning
