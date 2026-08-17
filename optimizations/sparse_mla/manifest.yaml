@@ -364,6 +364,37 @@ features:
       0.68%. Repeating row-scale work in every PV output tile outweighed the
       removed contiguous output-scale pass.
 
+  - id: compute.sve_dense_multi_query_16xvl
+    part: compute
+    status: experimental
+    implementation: csrc/sparse_mla.cpp and csrc/sparse_mla_sve.h on exp/sdpa/sparse-attn
+    hypothesis: >-
+      Replacing two independent 8x2VL dense kernels with two 16xVL half-tile
+      kernels reuses each packed K/V B vector across adjacent query tokens and
+      halves B loads while keeping 16 accumulators and independent softmax.
+    depends_on:
+      - compute.softmax_direct_packed_p
+      - packing.sve_dense_kv_2vl
+    conflicts_with: []
+    owner: zhangxu
+    opened: 2026-08-17
+    decision_by: 2026-08-17
+    next_decision: >-
+      Retire after preserving the implementation in Git, then run final cache
+      parameter checks from the faster direct packed-P checkpoint.
+    adoption_gate: >-
+      Improve 8192 shared-dense by at least 3%, preserve 2048 and later sparse
+      within 1%, and pass even/odd-token SVL128 plus full SVL256 correctness.
+    correctness: >-
+      OMP_NUM_THREADS=4 OMP_PROC_BIND=close OMP_PLACES=cores taskset -c 0-3
+      .venv/bin/python -m pytest -q tests/test_sparse_mla.py
+    benchmark: >-
+      numactl --physcpubind=96-191 --membind=1
+      tests/bench_sparse_mla_scalable.py --pattern dense --s-q 8192
+      --threads 96 --warmup 10 --iters 21 --seed 20260817
+    result: >-
+      optimizations/sparse_mla/results/amazon_m5_dense_multi_query_16xvl_20260817.md
+
   - id: planning.masked_dense_tail
     part: planning
     status: retired
