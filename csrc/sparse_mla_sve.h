@@ -346,6 +346,7 @@ inline void store_qkt_row_pair(float* scores, int64_t scores_row_stride,
 inline void add_pv_row_pair(float* output, int64_t output_row_stride,
                             int row_pair, int column_pair,
                             int64_t valid_columns,
+                            const float* output_scale,
                             svfloat32_t accumulator) {
   const svuint64_t accumulator_u64 = svreinterpret_u64_f32(accumulator);
   const svfloat32_t row0 =
@@ -372,10 +373,14 @@ inline void add_pv_row_pair(float* output, int64_t output_row_stride,
       svld1_gather_u32index_f32(pg, row0_out, offsets);
   const svfloat32_t old1 =
       svld1_gather_u32index_f32(pg, row1_out, offsets);
+  const svfloat32_t corrected0 = svmul_n_f32_x(
+      pg, old0, output_scale[static_cast<size_t>(2 * row_pair)]);
+  const svfloat32_t corrected1 = svmul_n_f32_x(
+      pg, old1, output_scale[static_cast<size_t>(2 * row_pair + 1)]);
   svst1_scatter_u32index_f32(pg, row0_out, offsets,
-                             svadd_f32_x(pg, old0, row0));
+                             svadd_f32_x(pg, corrected0, row0));
   svst1_scatter_u32index_f32(pg, row1_out, offsets,
-                             svadd_f32_x(pg, old1, row1));
+                             svadd_f32_x(pg, corrected1, row1));
 }
 
 // Q is packed as [reduction/4][four 2-row x 4-reduction panels]. K uses the
@@ -457,7 +462,8 @@ __attribute__((noinline)) inline void qkt_8x2vl_bf16(
 // 8-column segment at SVL256; valid_columns predicates those lanes on update.
 __attribute__((noinline)) inline void pv_8x2vl_bf16(
     const uint16_t* packed_p, const uint16_t* packed_v, int64_t reduction,
-    int64_t valid_columns, float* output, int64_t output_row_stride) {
+    int64_t valid_columns, const float* output_scale, float* output,
+    int64_t output_row_stride) {
   svfloat32_t c00 = svdup_f32(0.0f), c01 = svdup_f32(0.0f);
   svfloat32_t c02 = svdup_f32(0.0f), c03 = svdup_f32(0.0f);
   svfloat32_t c10 = svdup_f32(0.0f), c11 = svdup_f32(0.0f);
@@ -507,22 +513,38 @@ __attribute__((noinline)) inline void pv_8x2vl_bf16(
     c33 = svbfmmla_f32(c33, a3, b3);
   }
 
-  add_pv_row_pair(output, output_row_stride, 0, 0, valid_columns, c00);
-  add_pv_row_pair(output, output_row_stride, 0, 1, valid_columns, c01);
-  add_pv_row_pair(output, output_row_stride, 0, 2, valid_columns, c02);
-  add_pv_row_pair(output, output_row_stride, 0, 3, valid_columns, c03);
-  add_pv_row_pair(output, output_row_stride, 1, 0, valid_columns, c10);
-  add_pv_row_pair(output, output_row_stride, 1, 1, valid_columns, c11);
-  add_pv_row_pair(output, output_row_stride, 1, 2, valid_columns, c12);
-  add_pv_row_pair(output, output_row_stride, 1, 3, valid_columns, c13);
-  add_pv_row_pair(output, output_row_stride, 2, 0, valid_columns, c20);
-  add_pv_row_pair(output, output_row_stride, 2, 1, valid_columns, c21);
-  add_pv_row_pair(output, output_row_stride, 2, 2, valid_columns, c22);
-  add_pv_row_pair(output, output_row_stride, 2, 3, valid_columns, c23);
-  add_pv_row_pair(output, output_row_stride, 3, 0, valid_columns, c30);
-  add_pv_row_pair(output, output_row_stride, 3, 1, valid_columns, c31);
-  add_pv_row_pair(output, output_row_stride, 3, 2, valid_columns, c32);
-  add_pv_row_pair(output, output_row_stride, 3, 3, valid_columns, c33);
+  add_pv_row_pair(output, output_row_stride, 0, 0, valid_columns,
+                  output_scale, c00);
+  add_pv_row_pair(output, output_row_stride, 0, 1, valid_columns,
+                  output_scale, c01);
+  add_pv_row_pair(output, output_row_stride, 0, 2, valid_columns,
+                  output_scale, c02);
+  add_pv_row_pair(output, output_row_stride, 0, 3, valid_columns,
+                  output_scale, c03);
+  add_pv_row_pair(output, output_row_stride, 1, 0, valid_columns,
+                  output_scale, c10);
+  add_pv_row_pair(output, output_row_stride, 1, 1, valid_columns,
+                  output_scale, c11);
+  add_pv_row_pair(output, output_row_stride, 1, 2, valid_columns,
+                  output_scale, c12);
+  add_pv_row_pair(output, output_row_stride, 1, 3, valid_columns,
+                  output_scale, c13);
+  add_pv_row_pair(output, output_row_stride, 2, 0, valid_columns,
+                  output_scale, c20);
+  add_pv_row_pair(output, output_row_stride, 2, 1, valid_columns,
+                  output_scale, c21);
+  add_pv_row_pair(output, output_row_stride, 2, 2, valid_columns,
+                  output_scale, c22);
+  add_pv_row_pair(output, output_row_stride, 2, 3, valid_columns,
+                  output_scale, c23);
+  add_pv_row_pair(output, output_row_stride, 3, 0, valid_columns,
+                  output_scale, c30);
+  add_pv_row_pair(output, output_row_stride, 3, 1, valid_columns,
+                  output_scale, c31);
+  add_pv_row_pair(output, output_row_stride, 3, 2, valid_columns,
+                  output_scale, c32);
+  add_pv_row_pair(output, output_row_stride, 3, 3, valid_columns,
+                  output_scale, c33);
 }
 
 #endif  // FUSED_CPP_SPARSE_MLA_HAS_SVE_BFMMLA
