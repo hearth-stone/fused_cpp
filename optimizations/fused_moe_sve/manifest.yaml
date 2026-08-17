@@ -7,6 +7,47 @@ baseline:
   status: reference
 
 features:
+  - id: epilogue.indexed_polynomial_evaluation
+    part: epilogue
+    status: experimental
+    implementation: >-
+      optimizations/fused_moe_sve/benchmarks/bench_sve_exp_evaluators.cpp and
+      optimizations/fused_moe_sve/benchmarks/sve_exp_evaluators.S
+    hypothesis: >-
+      Packing degree-5 coefficients into two SVE registers and evaluating the
+      polynomial with indexed FMLA reduces dependency depth enough for Estrin
+      or even/odd evaluation to beat the resident-constant Horner baseline at
+      M8 or M12, including when division and limit-10 SwiGLU clamp are present.
+    depends_on:
+      - compute.xbyak_exact_m
+    conflicts_with: []
+    correctness: >-
+      FUSED_CPP_MOE_SVE_VECTOR_BITS=128
+      optimizations/fused_moe_sve/benchmarks/run_sve_exp_evaluators.sh
+      --warmup 1 --runs 1 --inner 1 --threads 1
+    benchmark: >-
+      OMP_NUM_THREADS=92 OMP_DYNAMIC=FALSE OMP_PROC_BIND=TRUE
+      OMP_PLACES=cores numactl --physcpubind=0-91 --membind=0
+      env FUSED_CPP_MOE_SVE_VECTOR_BITS=128
+      optimizations/fused_moe_sve/benchmarks/run_sve_exp_evaluators.sh
+      --warmup 30 --runs 51 --inner 4000 --threads 92
+    owner: zhangxu
+    opened: 2026-08-17
+    decision_by: 2026-09-16
+    next_decision: >-
+      Validate whether even/odd's clamped-SiLU result survives the actual
+      pair-interleaved fused W13 epilogue; otherwise retire the experiment.
+    adoption_gate: >-
+      At least 2 percent median improvement for M8 and M12 full SiLU, no more
+      than 1 percent regression with limit-10 clamp, and focused numerical
+      validation on the target SVE128 machine.
+    result: >-
+      Rejected for default dispatch on AmazonM5192Cores SVE128. Even/odd was
+      -0.18/-0.21 percent for complete M8/M12 SiLU and +0.97/+2.64 percent for
+      clamped SiLU; Estrin regressed complete SiLU by 4.48/4.47 percent. The
+      single-core control had the same ordering. See
+      results/amazon_m5_92c_sve_exp_evaluators_20260817.md.
+
   - id: weights.hugetlbfs_backing
     part: weights
     status: enabled
