@@ -947,6 +947,32 @@ struct HeadsOnlineState {
   float* exact_sum;
 };
 
+// Move one QK row into the chunk score buffer while it is still hot and retain
+// the row maximum for the online-softmax epilogue. This removes the later
+// max-only pass over score scratch without changing score storage or the
+// per-chunk softmax/PV order.
+static inline float copy_score_row_and_update_max(float* destination,
+                                                  const float* source,
+                                                  int64_t length,
+                                                  float current_max) {
+  int64_t column = 0;
+#if FUSED_CPP_SDPA_CACHE_HAS_NEON
+  float32x4_t vector_max = vdupq_n_f32(current_max);
+  for (; column + 4 <= length; column += 4) {
+    const float32x4_t values = vld1q_f32(source + column);
+    vst1q_f32(destination + column, values);
+    vector_max = vmaxq_f32(vector_max, values);
+  }
+  current_max = vmaxvq_f32(vector_max);
+#endif
+  for (; column < length; ++column) {
+    const float value = source[column];
+    destination[column] = value;
+    current_max = std::max(current_max, value);
+  }
+  return current_max;
+}
+
 // Executes the layout-independent part of one head-major attention chunk. K/V
 // may come from a shared contiguous pack or an indexed gather-pack, but both
 // paths use the same QK, online-softmax, P-pack, and PV sequence here.
@@ -964,6 +990,8 @@ static inline void run_heads_qkpv_chunk_bf16(
 
   for (int64_t group = 0; group < head_groups; ++group) {
     const int64_t head0 = group * kQueryBlock;
+    std::array<float, kQueryBlock> chunk_max;
+    chunk_max.fill(neg_inf);
     {
       FUSED_CPP_SDPA_PROFILE_SCOPE(::fused_cpp::sdpa_profile::Slot::kQkt);
       for (int64_t s_off = 0; s_off < key_count; s_off += key_tile) {
@@ -983,8 +1011,11 @@ static inline void run_heads_qkpv_chunk_bf16(
         const int64_t valid_keys =
             std::min<int64_t>(key_tile, key_count - s_off);
         for (int64_t row = 0; row < kQueryBlock; ++row) {
-          std::copy_n(scratch.qkt_tile + row * key_tile, valid_keys,
-                      scratch.scores + row * key_count + s_off);
+          chunk_max[static_cast<size_t>(row)] =
+              copy_score_row_and_update_max(
+                  scratch.scores + row * key_count + s_off,
+                  scratch.qkt_tile + row * key_tile, valid_keys,
+                  chunk_max[static_cast<size_t>(row)]);
         }
       }
     }
@@ -995,9 +1026,7 @@ static inline void run_heads_qkpv_chunk_bf16(
       for (int64_t row = 0; row < kQueryBlock; ++row) {
         const int64_t head = head0 + row;
         const float* score_row = scratch.scores + row * key_count;
-        const float tile_max =
-            ::fused_cpp::sdpa_flash2_neon_l3kv_impl::max_update_impl(
-                neg_inf, score_row, key_count);
+        const float tile_max = chunk_max[static_cast<size_t>(row)];
         const float new_max = std::max(state.running_max[head], tile_max);
         const float correction =
             kEmptySumCorrectionIsZero && state.running_sum[head] <= 0.0f

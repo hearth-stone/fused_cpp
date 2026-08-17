@@ -688,6 +688,23 @@ had max relative error 3.2874e-6, max 39 ULP, and 76 BF16 mismatches out of
 1,048,570 versus rounded `std::exp`. No production path changed; full method is
 in `optimizations/sparse_mla/results/amazon_m5_softmax_exp_constants_20260816.md`.
 
+### Sparse MLA QK score-copy/max fusion checkpoint
+
+The shared `run_heads_qkpv_chunk_bf16` path now accumulates each head's chunk
+maximum while copying the just-produced `8x2VL` QK tile into score scratch.
+This removes the later max-only score scan while retaining score storage for
+exp, the same online-softmax chunk order, row-major BF16 P, P pack, and PV.
+
+M5 NUMA1 cores 96--191/SVL128, 96 threads, ten warmups + 21 samples in three
+paired sessions: 2048 shared-prefix median-of-session medians changed 11.626 to
+11.484 ms (-1.22%); later sparse changed 2.606 to 2.537 ms (-2.65%). The 8192
+shared-dense host state alternated between roughly 8.9--9.2 and 10.3--10.6 ms
+independently of binary/order, so no 8192 claim is made. M5 direct checks passed
+for dense/shared-prefix/later-sparse; Amazon 8C native SVL256 full Sparse MLA
+file passed 26 tests. This is an experimental sequence checkpoint below the
+standalone 3% gate; direct packed-P generation is evaluated next. Full data is
+in `optimizations/sparse_mla/results/amazon_m5_score_copy_max_20260817.md`.
+
 ### Shared-prefix token-panel L2 scheduling experiment
 
 Tested a MoE-like macro schedule for the first-2048 shared-prefix path: group
@@ -747,6 +764,7 @@ as a traffic proxy. The prototype was removed. Full data is in
 
 | 日期 | 改动概述 | 受影响文件 |
 |---|---|---|
+| 2026-08-17 | **Sparse MLA QK score-copy/max 融合 checkpoint**：`run_heads_qkpv_chunk_bf16` 在把 `8x2VL` QK tile 搬到 score scratch 时同步累计每行 max，消除 softmax 之前的 max-only score 二次扫描；score/exp/BF16-P/P-pack/PV 和 online chunk 顺序不变。M5 96T/SVL128 三轮配对：2048 shared-prefix -1.22%，later sparse -2.65%；8192 受主机 8.9--9.2/10.3--10.6 ms 双模态影响，不声称收益。M5 direct checks 通过，Amazon 8C/SVL256 `26 passed`。未达独立 3% gate，作为 direct packed-P 的组合序列 checkpoint。 | 改 `csrc/{sparse_mla.cpp,SDPA_VERSIONS.md}`、`optimizations/sparse_mla/manifest.yaml`；新建 `optimizations/sparse_mla/results/amazon_m5_score_copy_max_20260817.md` |
 | 2026-08-17 | **Sparse MLA shared-prefix token-panel/B-block L2 调度负结果**：参考 MoE cache blocking，把相邻 token 的 Q 与 online `(m,l,O)` 作为线程私有 A/C panel，共享 packed-K/V B chunk 提到 token 内循环外，score/P scratch 固定为单/双 B-block slot，causal 拆 common rectangle + triangular fringe，QK/PV 保持 `8x2VL`。Amazon 8C panel4 仅改善 0.9--1.5%。M5 NUMA1 cores96--191/SVL128 完整扫 panel `{4,8,16}` x B block `{64,128,256}`；配对 panel8/B256/single 的 2048/8192/later-sparse 分别为 -0.14%/+0.30%/+0.19%。PMU 显示 2048 L2 refill 降 12--16%、bus access 降 8--11%，但 duration 仅 -0.24%且 LLC miss 上升；8192 L2 几乎不变。未达 3% gate，故撤销源码且不增加开关。 | 改 `csrc/{SDPA_TODO.md,SDPA_VERSIONS.md}`、`optimizations/sparse_mla/manifest.yaml`；新建 `optimizations/sparse_mla/results/{amazon_8c_token_panel_cache_20260817.md,amazon_m5_token_panel_cache_20260817.md}` |
 | 2026-08-16 | **Online-softmax exp packed-lane/Estrin Lab 比较**：用 1 个 range-reduction + 2 个 polynomial packed NEON 常数寄存器生成 indexed lane FMUL/FMLS/FMLA，并对 Horner/Estrin 各扫 U1/U2/U4/U8。M5 SVE128、length2048 三会话中 isolated best-to-best 吞吐 +5.92%，16 个 SVE accumulator 跨 softmax 活跃时 +5.75%；同 U8 时 Z spill 均为 8 slots，热循环 Q spill pairs 14→5，吞吐 +12.66%，但 best-to-best 的 U8 candidate 相比 U4 baseline 增加 spill，故只保留 Lab。两者 max 39 ULP、BF16 mismatch 均 76/1,048,570。 | 新建 `optimizations/sparse_mla/benchmarks/{softmax_exp_constants.cpp,Makefile}`、`optimizations/sparse_mla/results/amazon_m5_softmax_exp_constants_20260816.md`；改 `optimizations/sparse_mla/manifest.yaml`、`csrc/SDPA_VERSIONS.md` |
 | 2026-08-14 | **Sparse MLA indexed K/V 单次 gather+pack**：后续 query-dependent sparse 的跨 token KV 重叠不足以共享 pack，因此在每个 2VL key tile 内将 K 与 V pack 融合；每 4 个 indexed KV 行的 8-wide load 同时生成两个 K=4 BFMMLA panels 和一个转置 V panel，输入 KV payload 从 `d_qk+d_v` 降到 `d_qk`。Amazon 8C `q[2048,32,192],topk640,Dv128,context_start10000`：1T 280.552→254.908 ms（-9.14%），8T 正/反顺序为 -5.83%/-6.04%，profile pack 61.209→37.819 ms（-38.21%）；共享前缀 8T -0.18%。SVL256/SVL128 各 `26 passed`，checksum 一致。 | 改 `csrc/{sparse_mla.cpp,sparse_mla_sve.h,SDPA_VERSIONS.md}`、`optimizations/sparse_mla/manifest.yaml`；新建 `optimizations/sparse_mla/results/amazon_8c_indexed_single_pack_20260814.md` |
