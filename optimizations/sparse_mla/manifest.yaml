@@ -122,6 +122,32 @@ features:
       paired panel8/B256 changed 2048, 8192, and later sparse latency by
       -0.14%, +0.30%, and +0.19% respectively.
 
+  - id: scheduling.sc_tile_retune_after_fusion
+    part: scheduling
+    status: retired
+    implementation: Removed from the active tree
+    hypothesis: >-
+      After eliminating max-only score scans and row-major P packing, smaller
+      shared-path Sc tiles may fit the remaining score/online state better and
+      expose cache gains that the original token-panel experiment missed.
+    depends_on:
+      - compute.qk_score_copy_max_fusion
+      - compute.softmax_direct_packed_p
+    conflicts_with: []
+    correctness: >-
+      M5 native-versus-naive dense, odd-tail dense, shared-prefix, and later
+      sparse output/statistics checks passed for fixed Sc tiles 64 and 512.
+    benchmark: >-
+      numactl --physcpubind=96-191 --membind=1
+      tests/bench_sparse_mla_scalable.py --threads 96 --warmup 10 --iters 21
+      --seed 20260817
+    result: >-
+      optimizations/sparse_mla/results/amazon_m5_post_fusion_cache_retune_20260817.md
+    history: no source retained; temporary compile-time override removed
+    retirement_reason: >-
+      Auto beat fixed 64/128/256/512. The closest 512 tile was 0.29-0.87%
+      slower at 2048 and about 3.6-3.9% slower in the clean 8192 low mode.
+
   - id: packing.shared_prefix_kv_2vl
     part: packing
     status: enabled

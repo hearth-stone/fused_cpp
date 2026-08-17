@@ -211,6 +211,8 @@
   - M5 cores 96--191: the full panel `{4,8,16}` x B-block `{64,128,256}`
     sweep also failed; paired panel8/B256 changed 2048/8192/later-sparse by
     -0.14%/+0.30%/+0.19%. PMU showed fewer 2048 L2 refills without wall-time gain
+  - after score/max and packed-P fusion, fixed Sc tiles 64/128/256/512 were
+    rescanned; auto remained fastest, with fixed 512 slower on 2048 and 8192
 - ✅ **P0: QKᵀ-fp32 重写为 4×4 双向分块（`MK_QkUblock4` trait）** —— 2026-05-23
   - 新增 `gemm_qkt_microkernel_8x8_fp32_ublock4`：8×8 输出切 4 个 4×4 子块，每块 16 个独立 fp32 累加器外积扇出 + vpaddq 树 reduce，把 ILP 从 1 条链拉到 16 条独立 fma 链
   - 不需要 K 转置或 pre-pack；Q/K 仍按行连续 vld1q_f32 加载

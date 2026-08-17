@@ -756,6 +756,20 @@ token state, so the candidate was removed after Git checkpoint `bedd7f2`.
 Full data is in
 `optimizations/sparse_mla/results/amazon_m5_dense_multi_query_16xvl_20260817.md`.
 
+### Sparse MLA post-fusion Sc-tile/cache retune
+
+After score-copy/max and direct packed-P fusion, rescanned shared-dense and
+shared-prefix Sc tiles `{64,128,256,512}` against the existing auto heuristic.
+M5 96T/SVL128 forward/reverse 2048 medians were auto 11.380/11.399 ms, fixed
+512 11.486/11.481, fixed 256 11.687/11.703, fixed 128 12.184/12.170, and fixed
+64 12.905/12.883 ms. In clean 8192 low modes, auto was 8.736--8.776 ms versus
+512 at 9.079--9.088 ms (+3.6--3.9%). Auto also beat 512 by 0.3--0.5% on later
+sparse run noise. Fixed 64/512 native-versus-naive checks passed; checksum
+changes reflect different online chunk boundaries. Combined with the earlier
+token-panel PMU result and rejected 16xVL B-load reuse, no cache override or
+token panel is retained. Full data is in
+`optimizations/sparse_mla/results/amazon_m5_post_fusion_cache_retune_20260817.md`.
+
 ### Shared-prefix token-panel L2 scheduling experiment
 
 Tested a MoE-like macro schedule for the first-2048 shared-prefix path: group
@@ -815,6 +829,7 @@ as a traffic proxy. The prototype was removed. Full data is in
 
 | 日期 | 改动概述 | 受影响文件 |
 |---|---|---|
+| 2026-08-17 | **Sparse MLA 融合后 Sc-tile/cache 重扫保持 auto**：在 score-copy/max + direct packed-P 上扫 shared 路径 Sc tile `{64,128,256,512}`。M5 96T/SVL128 2048 正/反顺序：auto 11.380/11.399 ms，512 11.486/11.481，256 11.687/11.703，128 12.184/12.170，64 12.905/12.883。8192 clean low-mode auto 8.736--8.776 vs 512 9.079--9.088 ms（+3.6--3.9%）。结合之前 token-panel PMU 和 16xVL 负结果，不保留实验宏、手工 block 或 token panel。 | 改 `csrc/{SDPA_TODO.md,SDPA_VERSIONS.md}`、`optimizations/sparse_mla/manifest.yaml`；新建 `optimizations/sparse_mla/results/amazon_m5_post_fusion_cache_retune_20260817.md` |
 | 2026-08-17 | **撤回 Sparse MLA dense 双 token `16xVL` kernel**：完整实现已由 `bedd7f2` 保留，活动源恢复到 direct packed-P；manifest 改为 retired，shared-dense 继续使用更快的单 token `8x2VL`。 | 改 `csrc/{sparse_mla.cpp,sparse_mla_sve.h,SDPA_VERSIONS.md}`、`optimizations/sparse_mla/manifest.yaml` |
 | 2026-08-17 | **Sparse MLA dense 双 token `16xVL` 负实验**：新增 QK/PV `16xVL` kernel，两个 token 保持独立 softmax，共享 packed B；两次 VL half-tile 覆盖原 2VL 布局，累加器仍为 16。M5 96T/SVL128 clean low-mode 8192：9.056 vs direct packed-P 8.814 ms（+2.75%），相对原基线 9.219 ms 仅 -1.77%；2048/later sparse 约 +0.04%。M5 偶数/奇数 token 检查与 Amazon 8C/SVL256 `26 passed`。B load 减半不足以抵消 half-tile/epilogue 开销，故保留 Git checkpoint 后撤回。 | 改 `csrc/{sparse_mla.cpp,sparse_mla_sve.h,SDPA_VERSIONS.md}`、`optimizations/sparse_mla/manifest.yaml`；新建 `optimizations/sparse_mla/results/amazon_m5_dense_multi_query_16xvl_20260817.md` |
 | 2026-08-17 | **撤回 Sparse MLA PV online-output correction 融合**：负实验实现已由 `6d5de7a` 保留，活动源恢复到 direct packed-P checkpoint；manifest 改为 retired，默认路径不保留退化 epilogue。 | 改 `csrc/{sparse_mla.cpp,sparse_mla_sve.h,SDPA_VERSIONS.md}`、`optimizations/sparse_mla/manifest.yaml` |
