@@ -1136,107 +1136,6 @@ static inline void run_heads_qkpv_chunk_bf16(
   }
 }
 
-#if FUSED_CPP_SPARSE_MLA_HAS_SVE_BFMMLA
-// Dense-only two-token executor. Each token keeps independent online-softmax
-// state, while 16xVL QK/PV kernels reuse every packed B vector across the two
-// corresponding 8-head groups.
-static inline void run_dense_heads_token_pair_chunk_bf16(
-    const uint16_t* q0_packed, const uint16_t* q1_packed,
-    const uint16_t* k_packed, const uint16_t* v_packed, int64_t h_q,
-    int64_t d_qk, int64_t d_v, int64_t key_count, int64_t key_capacity,
-    int64_t key_offset, int64_t key_tile, int64_t value_tile,
-    int64_t kblock_u16, float scale, HeadsChunkScratch scratch0,
-    HeadsChunkScratch scratch1, HeadsOnlineState state0,
-    HeadsOnlineState state1) {
-  const int64_t qblock_u16 = (d_qk / 4) * 32;
-  const int64_t head_groups = h_q / kQueryBlock;
-  const int64_t padded_reduction = (key_count + 3) & ~int64_t{3};
-  const float neg_inf = -std::numeric_limits<float>::infinity();
-
-  for (int64_t group = 0; group < head_groups; ++group) {
-    const int64_t head0 = group * kQueryBlock;
-    std::array<float, kQueryBlock> chunk_max0;
-    std::array<float, kQueryBlock> chunk_max1;
-    chunk_max0.fill(neg_inf);
-    chunk_max1.fill(neg_inf);
-
-    {
-      FUSED_CPP_SDPA_PROFILE_SCOPE(::fused_cpp::sdpa_profile::Slot::kQkt);
-      for (int64_t s_off = 0; s_off < key_count; s_off += key_tile) {
-        const uint16_t* k_tile =
-            k_packed + (s_off / key_tile) * kblock_u16;
-        for (int column_pair_base = 0; column_pair_base < 4;
-             column_pair_base += 2) {
-          ::fused_cpp::sparse_mla_sve::qkt_16xvl_bf16(
-              q0_packed + group * qblock_u16,
-              q1_packed + group * qblock_u16, k_tile, d_qk,
-              column_pair_base, scale, scratch0.qkt_tile,
-              scratch1.qkt_tile);
-        }
-        const int64_t valid_keys =
-            std::min<int64_t>(key_tile, key_count - s_off);
-        for (int64_t row = 0; row < kQueryBlock; ++row) {
-          chunk_max0[static_cast<size_t>(row)] =
-              copy_score_row_and_update_max(
-                  scratch0.scores + row * key_count + s_off,
-                  scratch0.qkt_tile + row * key_tile, valid_keys,
-                  chunk_max0[static_cast<size_t>(row)]);
-          chunk_max1[static_cast<size_t>(row)] =
-              copy_score_row_and_update_max(
-                  scratch1.scores + row * key_count + s_off,
-                  scratch1.qkt_tile + row * key_tile, valid_keys,
-                  chunk_max1[static_cast<size_t>(row)]);
-        }
-      }
-    }
-
-    {
-      FUSED_CPP_SDPA_PROFILE_SCOPE(
-          ::fused_cpp::sdpa_profile::Slot::kSoftmax);
-      for (int token_slot = 0; token_slot < 2; ++token_slot) {
-        HeadsChunkScratch scratch = token_slot == 0 ? scratch0 : scratch1;
-        HeadsOnlineState state = token_slot == 0 ? state0 : state1;
-        const auto& chunk_max = token_slot == 0 ? chunk_max0 : chunk_max1;
-        for (int64_t row = 0; row < kQueryBlock; ++row) {
-          const int64_t head = head0 + row;
-          const float* score_row = scratch.scores + row * key_count;
-          const float new_max =
-              std::max(state.running_max[head],
-                       chunk_max[static_cast<size_t>(row)]);
-          const float correction =
-              std::exp(state.running_max[head] - new_max);
-          state.running_sum[head] *= correction;
-          ::fused_cpp::sdpa_flash2_neon_l3kv_impl::scale_inplace_impl(
-              state.output_acc + head * d_v, correction, d_v);
-          state.running_sum[head] += vectorized_exp_minus_packed_p_bf16<5>(
-              scratch.p_packed, row, score_row, new_max, key_count);
-          state.running_max[head] = new_max;
-        }
-      }
-    }
-
-    {
-      FUSED_CPP_SDPA_PROFILE_SCOPE(::fused_cpp::sdpa_profile::Slot::kPv);
-      for (int64_t ev = 0; ev < d_v; ev += value_tile) {
-        const int64_t valid_columns =
-            std::min<int64_t>(value_tile, d_v - ev);
-        const uint16_t* v_tile =
-            v_packed + (ev / value_tile) * key_capacity * value_tile +
-            key_offset * value_tile;
-        for (int column_pair_base = 0; column_pair_base < 4;
-             column_pair_base += 2) {
-          ::fused_cpp::sparse_mla_sve::pv_16xvl_bf16(
-              scratch0.p_packed, scratch1.p_packed, v_tile,
-              padded_reduction, column_pair_base, valid_columns,
-              state0.output_acc + head0 * d_v + ev,
-              state1.output_acc + head0 * d_v + ev, d_v);
-        }
-      }
-    }
-  }
-}
-#endif
-
 template <bool kReturnStats>
 static inline bool run_dense_heads_packqkv_mqa_fast_path(
     const at::Tensor& q, const at::Tensor& kv, const at::Tensor& indices_2d,
@@ -1353,37 +1252,29 @@ static inline bool run_dense_heads_packqkv_mqa_fast_path(
   const int64_t sc_max = std::max<int64_t>(kQueryBlock, ts.Sc_l2);
 #endif
   const float neg_inf = -std::numeric_limits<float>::infinity();
-#if FUSED_CPP_SPARSE_MLA_HAS_SVE_BFMMLA
-  constexpr int64_t kDenseTokenSlots = 2;
-#else
-  constexpr int64_t kDenseTokenSlots = 1;
-#endif
 
 #ifdef _OPENMP
 #pragma omp parallel
 #endif
   {
-    std::vector<float> scores(static_cast<size_t>(
-        kDenseTokenSlots * kQueryBlock * sc_max));
+    std::vector<float> scores(static_cast<size_t>(kQueryBlock * sc_max));
 #if FUSED_CPP_SPARSE_MLA_HAS_SVE_BFMMLA
     std::vector<at::BFloat16> p_hat_bf16;
 #else
     std::vector<at::BFloat16> p_hat_bf16(
         static_cast<size_t>(kQueryBlock * sc_max));
 #endif
-    std::vector<float> output_acc(
-        static_cast<size_t>(kDenseTokenSlots * h_q * d_v));
-    std::vector<float> running_max(
-        static_cast<size_t>(kDenseTokenSlots * h_q));
-    std::vector<float> running_sum(
-        static_cast<size_t>(kDenseTokenSlots * h_q));
-    std::vector<uint16_t> q_packed(static_cast<size_t>(
-        kDenseTokenSlots * head_groups * qblock_u16));
+    std::vector<float> output_acc(static_cast<size_t>(h_q * d_v));
+    std::vector<float> running_max(static_cast<size_t>(h_q));
+    std::vector<float> running_sum(static_cast<size_t>(h_q));
+    std::vector<uint16_t> q_packed(
+        static_cast<size_t>(head_groups * qblock_u16));
 #if FUSED_CPP_SPARSE_MLA_HAS_SVE_BFMMLA
     std::vector<float> qkt_tile_storage(
-        static_cast<size_t>(kDenseTokenSlots * kQueryBlock * key_tile));
-    std::vector<uint16_t> p_packed(static_cast<size_t>(
-        kDenseTokenSlots * kQueryBlock * sc_max));
+        static_cast<size_t>(kQueryBlock * key_tile));
+    float* qkt_tile = qkt_tile_storage.data();
+    std::vector<uint16_t> p_packed(
+        static_cast<size_t>(kQueryBlock * sc_max));
 #else
     alignas(64) float qkt_tile[kQueryBlock * kQueryBlock];
 #endif
@@ -1391,27 +1282,19 @@ static inline bool run_dense_heads_packqkv_mqa_fast_path(
 #ifdef _OPENMP
 #pragma omp for schedule(static)
 #endif
-    for (int64_t token0 = 0; token0 < s_q; token0 += kDenseTokenSlots) {
-      const int64_t panel_tokens =
-          std::min<int64_t>(kDenseTokenSlots, s_q - token0);
+    for (int64_t token = 0; token < s_q; ++token) {
       std::fill(output_acc.begin(), output_acc.end(), 0.0f);
       std::fill(running_max.begin(), running_max.end(), neg_inf);
       std::fill(running_sum.begin(), running_sum.end(), 0.0f);
 
+      const at::BFloat16* q_token = q_ptr + token * h_q * d_qk;
       {
         FUSED_CPP_SDPA_PROFILE_SCOPE(::fused_cpp::sdpa_profile::Slot::kQPack);
-        for (int64_t token_slot = 0; token_slot < panel_tokens;
-             ++token_slot) {
-          const at::BFloat16* q_token =
-              q_ptr + (token0 + token_slot) * h_q * d_qk;
-          uint16_t* token_q_packed =
-              q_packed.data() + token_slot * head_groups * qblock_u16;
-          for (int64_t group = 0; group < head_groups; ++group) {
-            ::fused_cpp::sdpa_microkernels::pack_q_8rows_to_seq_bf16(
-                q_token + group * kQueryBlock * d_qk,
-                /*q_row_stride=*/d_qk, d_qk,
-                token_q_packed + group * qblock_u16);
-          }
+        for (int64_t group = 0; group < head_groups; ++group) {
+          ::fused_cpp::sdpa_microkernels::pack_q_8rows_to_seq_bf16(
+              q_token + group * kQueryBlock * d_qk,
+              /*q_row_stride=*/d_qk, d_qk,
+              q_packed.data() + group * qblock_u16);
         }
       }
 
@@ -1421,66 +1304,38 @@ static inline bool run_dense_heads_packqkv_mqa_fast_path(
         const uint16_t* k_seq =
             k_packed_ptr + (s_l2 / key_tile) * kblock_u16;
 
-        HeadsChunkScratch scratch0{
-            scores.data(), p_hat_bf16.data(),
+        HeadsChunkScratch scratch{
+            scores.data(), p_hat_bf16.data(), qkt_tile,
 #if FUSED_CPP_SPARSE_MLA_HAS_SVE_BFMMLA
-            qkt_tile_storage.data(), p_packed.data()
+            p_packed.data()
 #else
-            qkt_tile,
             nullptr
 #endif
         };
-        HeadsOnlineState state0{output_acc.data(), running_max.data(),
-                                running_sum.data(), nullptr, nullptr};
-#if FUSED_CPP_SPARSE_MLA_HAS_SVE_BFMMLA
-        if (panel_tokens == 2) {
-          HeadsChunkScratch scratch1{
-              scores.data() + kQueryBlock * sc_max, nullptr,
-              qkt_tile_storage.data() + kQueryBlock * key_tile,
-              p_packed.data() + kQueryBlock * sc_max};
-          HeadsOnlineState state1{
-              output_acc.data() + h_q * d_v, running_max.data() + h_q,
-              running_sum.data() + h_q, nullptr, nullptr};
-          run_dense_heads_token_pair_chunk_bf16(
-              q_packed.data(),
-              q_packed.data() + head_groups * qblock_u16, k_seq,
-              reinterpret_cast<const uint16_t*>(v_packed_ptr), h_q, d_qk,
-              d_v, sc_cur, topk, s_l2, key_tile, value_tile, kblock_u16,
-              scale, scratch0, scratch1, state0, state1);
-          continue;
-        }
-#endif
-        const at::BFloat16* q_token = q_ptr + token0 * h_q * d_qk;
+        HeadsOnlineState state{output_acc.data(), running_max.data(),
+                               running_sum.data(), nullptr, nullptr};
         run_heads_qkpv_chunk_bf16</*kExactStats=*/false,
                                    /*kEmptySumCorrectionIsZero=*/false>(
             q_token, q_packed.data(), k_seq, k_orig,
             reinterpret_cast<const uint16_t*>(v_packed_ptr), h_q, d_qk, d_v,
             sc_cur, topk, s_l2, key_tile, value_tile, kblock_u16, scale,
-            scratch0, state0);
+            scratch, state);
       }
 
-      for (int64_t token_slot = 0; token_slot < panel_tokens; ++token_slot) {
-        const int64_t token = token0 + token_slot;
-        float* token_output =
-            output_acc.data() + token_slot * h_q * d_v;
-        float* token_max = running_max.data() + token_slot * h_q;
-        float* token_sum = running_sum.data() + token_slot * h_q;
-        for (int64_t head = 0; head < h_q; ++head) {
-          at::BFloat16* out_row = out_ptr + (token * h_q + head) * d_v;
-          if (token_sum[head] > 0.0f) {
-            store_normalized_bf16_row(
-                out_row, token_output + head * d_v,
-                1.0f / token_sum[head], d_v);
-          } else {
-            std::fill(out_row, out_row + d_v, at::BFloat16(0.0f));
-          }
-          if constexpr (kReturnStats) {
-            max_ptr[token * h_q + head] = token_max[head];
-            lse_ptr[token * h_q + head] =
-                token_sum[head] > 0.0f
-                    ? token_max[head] + std::log(token_sum[head])
-                    : std::numeric_limits<float>::infinity();
-          }
+      for (int64_t head = 0; head < h_q; ++head) {
+        at::BFloat16* out_row = out_ptr + (token * h_q + head) * d_v;
+        if (running_sum[head] > 0.0f) {
+          store_normalized_bf16_row(out_row, output_acc.data() + head * d_v,
+                                    1.0f / running_sum[head], d_v);
+        } else {
+          std::fill(out_row, out_row + d_v, at::BFloat16(0.0f));
+        }
+        if constexpr (kReturnStats) {
+          max_ptr[token * h_q + head] = running_max[head];
+          lse_ptr[token * h_q + head] =
+              running_sum[head] > 0.0f
+                  ? running_max[head] + std::log(running_sum[head])
+                  : std::numeric_limits<float>::infinity();
         }
       }
     }
