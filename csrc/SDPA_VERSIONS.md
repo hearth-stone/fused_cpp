@@ -705,6 +705,24 @@ file passed 26 tests. This is an experimental sequence checkpoint below the
 standalone 3% gate; direct packed-P generation is evaluated next. Full data is
 in `optimizations/sparse_mla/results/amazon_m5_score_copy_max_20260817.md`.
 
+### Sparse MLA direct packed-P checkpoint
+
+The SVE head-major exp loop now writes every four BF16 probabilities directly
+to the PV BFMMLA A-panel layout. It no longer allocates row-major BF16 P scratch
+or calls a separate P-pack pass; K%4 is zero padded in the final packed block.
+The exp polynomial/sum order, BF16 conversion, online chunk order, `8x2VL` PV,
+and non-SVE fallback remain unchanged.
+
+M5 NUMA1 cores 96--191/SVL128, 96 threads, three paired sessions: relative to
+the score-copy/max checkpoint, 2048 shared-prefix improved another 1.03% and
+later sparse another 2.13%; relative to the original baseline the cumulative
+changes are -2.07% and -4.72%. Two low-mode 8192 sessions were 8.753/8.765 ms
+versus step 1 at 8.936/8.937 and baseline at 9.196/9.253 ms, but one step-2
+session entered the known 10.445 ms high mode, so the 8192 gain is not treated
+as unconditional. M5 direct checks passed and Amazon 8C/SVL256 reported
+`26 passed`. Full data is in
+`optimizations/sparse_mla/results/amazon_m5_direct_packed_p_20260817.md`.
+
 ### Shared-prefix token-panel L2 scheduling experiment
 
 Tested a MoE-like macro schedule for the first-2048 shared-prefix path: group
@@ -764,6 +782,7 @@ as a traffic proxy. The prototype was removed. Full data is in
 
 | 日期 | 改动概述 | 受影响文件 |
 |---|---|---|
+| 2026-08-17 | **Sparse MLA softmax direct packed-P checkpoint**：SVE head-major exp 每生成 4 个 BF16 probability 就直接写入 PV BFMMLA A-panel，删除 row-major BF16 P scratch 往返和独立 P-pack，K%4 尾块显式补零；exp/sum/BF16/PV 算术与 non-SVE fallback 不变。M5 96T 相对步骤1：2048 -1.03%、later sparse -2.13%；相对原始基线累计 -2.07%/-4.72%。8192 两轮 low-mode 累计约 -5%，但一轮进入 10.445 ms 高模态，不做无条件声称。M5 direct checks 通过，Amazon 8C/SVL256 `26 passed`。 | 改 `csrc/{sparse_mla.cpp,SDPA_VERSIONS.md}`、`optimizations/sparse_mla/manifest.yaml`；新建 `optimizations/sparse_mla/results/amazon_m5_direct_packed_p_20260817.md` |
 | 2026-08-17 | **Sparse MLA QK score-copy/max 融合 checkpoint**：`run_heads_qkpv_chunk_bf16` 在把 `8x2VL` QK tile 搬到 score scratch 时同步累计每行 max，消除 softmax 之前的 max-only score 二次扫描；score/exp/BF16-P/P-pack/PV 和 online chunk 顺序不变。M5 96T/SVL128 三轮配对：2048 shared-prefix -1.22%，later sparse -2.65%；8192 受主机 8.9--9.2/10.3--10.6 ms 双模态影响，不声称收益。M5 direct checks 通过，Amazon 8C/SVL256 `26 passed`。未达独立 3% gate，作为 direct packed-P 的组合序列 checkpoint。 | 改 `csrc/{sparse_mla.cpp,SDPA_VERSIONS.md}`、`optimizations/sparse_mla/manifest.yaml`；新建 `optimizations/sparse_mla/results/amazon_m5_score_copy_max_20260817.md` |
 | 2026-08-17 | **Sparse MLA shared-prefix token-panel/B-block L2 调度负结果**：参考 MoE cache blocking，把相邻 token 的 Q 与 online `(m,l,O)` 作为线程私有 A/C panel，共享 packed-K/V B chunk 提到 token 内循环外，score/P scratch 固定为单/双 B-block slot，causal 拆 common rectangle + triangular fringe，QK/PV 保持 `8x2VL`。Amazon 8C panel4 仅改善 0.9--1.5%。M5 NUMA1 cores96--191/SVL128 完整扫 panel `{4,8,16}` x B block `{64,128,256}`；配对 panel8/B256/single 的 2048/8192/later-sparse 分别为 -0.14%/+0.30%/+0.19%。PMU 显示 2048 L2 refill 降 12--16%、bus access 降 8--11%，但 duration 仅 -0.24%且 LLC miss 上升；8192 L2 几乎不变。未达 3% gate，故撤销源码且不增加开关。 | 改 `csrc/{SDPA_TODO.md,SDPA_VERSIONS.md}`、`optimizations/sparse_mla/manifest.yaml`；新建 `optimizations/sparse_mla/results/{amazon_8c_token_panel_cache_20260817.md,amazon_m5_token_panel_cache_20260817.md}` |
 | 2026-08-16 | **Online-softmax exp packed-lane/Estrin Lab 比较**：用 1 个 range-reduction + 2 个 polynomial packed NEON 常数寄存器生成 indexed lane FMUL/FMLS/FMLA，并对 Horner/Estrin 各扫 U1/U2/U4/U8。M5 SVE128、length2048 三会话中 isolated best-to-best 吞吐 +5.92%，16 个 SVE accumulator 跨 softmax 活跃时 +5.75%；同 U8 时 Z spill 均为 8 slots，热循环 Q spill pairs 14→5，吞吐 +12.66%，但 best-to-best 的 U8 candidate 相比 U4 baseline 增加 spill，故只保留 Lab。两者 max 39 ULP、BF16 mismatch 均 76/1,048,570。 | 新建 `optimizations/sparse_mla/benchmarks/{softmax_exp_constants.cpp,Makefile}`、`optimizations/sparse_mla/results/amazon_m5_softmax_exp_constants_20260816.md`；改 `optimizations/sparse_mla/manifest.yaml`、`csrc/SDPA_VERSIONS.md` |

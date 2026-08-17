@@ -305,6 +305,38 @@ features:
     result: >-
       optimizations/sparse_mla/results/amazon_m5_score_copy_max_20260817.md
 
+  - id: compute.softmax_direct_packed_p
+    part: compute
+    status: experimental
+    implementation: csrc/sparse_mla.cpp on exp/sdpa/sparse-attn
+    hypothesis: >-
+      Writing each four-value BF16 exp result directly into the BFMMLA PV A
+      layout removes the row-major probability scratch round-trip and separate
+      P-pack pass without changing exp, sum, conversion, or PV arithmetic.
+    depends_on:
+      - compute.qk_score_copy_max_fusion
+      - compute.sve_pv_8x2vl_bfmmla
+    conflicts_with: []
+    owner: zhangxu
+    opened: 2026-08-17
+    decision_by: 2026-09-15
+    next_decision: >-
+      Fuse online max/sum/output correction with the QK/PV epilogue and rerun
+      original-baseline, step-2, and combined comparisons.
+    adoption_gate: >-
+      Preserve current Sparse MLA tolerances on SVL128 and SVL256; improve 2048
+      or 8192 median latency by at least 3%, regress the other shared case by no
+      more than 1%, and regress later sparse by no more than 1%.
+    correctness: >-
+      OMP_NUM_THREADS=4 OMP_PROC_BIND=close OMP_PLACES=cores taskset -c 0-3
+      .venv/bin/python -m pytest -q tests/test_sparse_mla.py
+    benchmark: >-
+      numactl --physcpubind=96-191 --membind=1
+      tests/bench_sparse_mla_scalable.py --threads 96 --warmup 10 --iters 21
+      --seed 20260817
+    result: >-
+      optimizations/sparse_mla/results/amazon_m5_direct_packed_p_20260817.md
+
   - id: planning.masked_dense_tail
     part: planning
     status: retired
