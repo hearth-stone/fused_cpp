@@ -736,7 +736,7 @@ M5 96T/SVL128 three-session median-of-medians: relative to direct packed-P,
 checks and Amazon 8C/SVL256 `26 passed` confirmed correctness. The separate
 contiguous O scale is cheaper than adding row-scale work to every PV output
 tile for the important 2048/sparse cases, so the candidate is rejected and
-will be removed after this Git checkpoint. Full data is in
+was removed after Git checkpoint `6d5de7a`. Full data is in
 `optimizations/sparse_mla/results/amazon_m5_pv_online_correction_20260817.md`.
 
 ### Shared-prefix token-panel L2 scheduling experiment
@@ -798,6 +798,7 @@ as a traffic proxy. The prototype was removed. Full data is in
 
 | 日期 | 改动概述 | 受影响文件 |
 |---|---|---|
+| 2026-08-17 | **撤回 Sparse MLA PV online-output correction 融合**：负实验实现已由 `6d5de7a` 保留，活动源恢复到 direct packed-P checkpoint；manifest 改为 retired，默认路径不保留退化 epilogue。 | 改 `csrc/{sparse_mla.cpp,sparse_mla_sve.h,SDPA_VERSIONS.md}`、`optimizations/sparse_mla/manifest.yaml` |
 | 2026-08-17 | **Sparse MLA PV online-output correction 融合负实验**：取消独立 O rescale，把每行 `exp(old_m-new_m)` 传入 SVE PV store epilogue，一次执行 `old_O*correction+PV`；QK/exp/m/l/packed-P 和 `8x2VL` BFMMLA body 不变。M5 96T 相对 direct packed-P：2048 +0.11%、later sparse +0.68%；8192 同模态约 -0.3%~-1.8%，但主机仍双模态。M5 direct checks 和 Amazon 8C/SVL256 `26 passed`。PV 每个输出 tile 额外 scale 指令抵消访存节省，故保留 Git checkpoint 后撤回。 | 改 `csrc/{sparse_mla.cpp,sparse_mla_sve.h,SDPA_VERSIONS.md}`、`optimizations/sparse_mla/manifest.yaml`；新建 `optimizations/sparse_mla/results/amazon_m5_pv_online_correction_20260817.md` |
 | 2026-08-17 | **Sparse MLA softmax direct packed-P checkpoint**：SVE head-major exp 每生成 4 个 BF16 probability 就直接写入 PV BFMMLA A-panel，删除 row-major BF16 P scratch 往返和独立 P-pack，K%4 尾块显式补零；exp/sum/BF16/PV 算术与 non-SVE fallback 不变。M5 96T 相对步骤1：2048 -1.03%、later sparse -2.13%；相对原始基线累计 -2.07%/-4.72%。8192 两轮 low-mode 累计约 -5%，但一轮进入 10.445 ms 高模态，不做无条件声称。M5 direct checks 通过，Amazon 8C/SVL256 `26 passed`。 | 改 `csrc/{sparse_mla.cpp,SDPA_VERSIONS.md}`、`optimizations/sparse_mla/manifest.yaml`；新建 `optimizations/sparse_mla/results/amazon_m5_direct_packed_p_20260817.md` |
 | 2026-08-17 | **Sparse MLA QK score-copy/max 融合 checkpoint**：`run_heads_qkpv_chunk_bf16` 在把 `8x2VL` QK tile 搬到 score scratch 时同步累计每行 max，消除 softmax 之前的 max-only score 二次扫描；score/exp/BF16-P/P-pack/PV 和 online chunk 顺序不变。M5 96T/SVL128 三轮配对：2048 shared-prefix -1.22%，later sparse -2.65%；8192 受主机 8.9--9.2/10.3--10.6 ms 双模态影响，不声称收益。M5 direct checks 通过，Amazon 8C/SVL256 `26 passed`。未达独立 3% gate，作为 direct packed-P 的组合序列 checkpoint。 | 改 `csrc/{sparse_mla.cpp,SDPA_VERSIONS.md}`、`optimizations/sparse_mla/manifest.yaml`；新建 `optimizations/sparse_mla/results/amazon_m5_score_copy_max_20260817.md` |

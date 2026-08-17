@@ -339,8 +339,8 @@ features:
 
   - id: compute.pv_online_output_correction
     part: compute
-    status: experimental
-    implementation: csrc/sparse_mla.cpp and csrc/sparse_mla_sve.h on exp/sdpa/sparse-attn
+    status: retired
+    implementation: Removed from the active tree
     hypothesis: >-
       Applying each online-softmax output correction in the SVE PV store
       epilogue removes a standalone full-output scale pass and its memory
@@ -349,15 +349,6 @@ features:
       - compute.softmax_direct_packed_p
       - compute.sve_pv_8x2vl_bfmmla
     conflicts_with: []
-    owner: zhangxu
-    opened: 2026-08-17
-    decision_by: 2026-08-17
-    next_decision: >-
-      Retire after preserving this implementation in Git; continue the ordered
-      sequence from direct packed-P without the PV correction fusion.
-    adoption_gate: >-
-      Improve either 2048 or 8192 by at least 3%, regress the other shared case
-      and later sparse by no more than 1%, and pass SVL128/SVL256 correctness.
     correctness: >-
       OMP_NUM_THREADS=4 OMP_PROC_BIND=close OMP_PLACES=cores taskset -c 0-3
       .venv/bin/python -m pytest -q tests/test_sparse_mla.py
@@ -367,6 +358,11 @@ features:
       --seed 20260817
     result: >-
       optimizations/sparse_mla/results/amazon_m5_pv_online_correction_20260817.md
+    history: 6d5de7a
+    retirement_reason: >-
+      Relative to direct packed-P, 2048 and later sparse regressed 0.11% and
+      0.68%. Repeating row-scale work in every PV output tile outweighed the
+      removed contiguous output-scale pass.
 
   - id: planning.masked_dense_tail
     part: planning

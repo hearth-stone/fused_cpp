@@ -1033,7 +1033,6 @@ static inline void run_heads_qkpv_chunk_bf16(
     const int64_t head0 = group * kQueryBlock;
 #if FUSED_CPP_SPARSE_MLA_HAS_SVE_BFMMLA
     const int64_t padded_reduction = (key_count + 3) & ~int64_t{3};
-    std::array<float, kQueryBlock> output_correction;
 #endif
     std::array<float, kQueryBlock> chunk_max;
     chunk_max.fill(neg_inf);
@@ -1078,12 +1077,8 @@ static inline void run_heads_qkpv_chunk_bf16(
                 ? 0.0f
                 : std::exp(state.running_max[head] - new_max);
         state.running_sum[head] *= correction;
-#if FUSED_CPP_SPARSE_MLA_HAS_SVE_BFMMLA
-        output_correction[static_cast<size_t>(row)] = correction;
-#else
         ::fused_cpp::sdpa_flash2_neon_l3kv_impl::scale_inplace_impl(
             state.output_acc + head * d_v, correction, d_v);
-#endif
 #if FUSED_CPP_SPARSE_MLA_HAS_SVE_BFMMLA
         state.running_sum[head] += vectorized_exp_minus_packed_p_bf16<5>(
             scratch.p_packed, row, score_row, new_max, key_count);
@@ -1124,7 +1119,6 @@ static inline void run_heads_qkpv_chunk_bf16(
             key_offset * value_tile;
         ::fused_cpp::sparse_mla_sve::pv_8x2vl_bf16(
             scratch.p_packed, v_tile, padded_reduction, valid_columns,
-            output_correction.data(),
             state.output_acc + head0 * d_v + ev, d_v);
       }
 #else
