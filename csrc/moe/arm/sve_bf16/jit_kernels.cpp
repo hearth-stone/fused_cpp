@@ -29,6 +29,7 @@ struct alignas(64) SiluConstants {
   float c6 = 0.0013888889f;
   float clamp_hi = 87.0f;
   float clamp_lo = -87.0f;
+  float swiglu_limit = 10.0f;
 };
 
 const SiluConstants kSiluConstants;
@@ -66,6 +67,20 @@ bool requested_for_current_build() {
 }
 
 KernelFn get_kernel(Operation, int, int, std::string* error) {
+  if (error != nullptr) {
+    *error = "xbyak_aarch64 is unavailable in this build";
+  }
+  return nullptr;
+}
+
+W8KernelFn get_w8_kernel(Operation, int, int, std::string* error) {
+  if (error != nullptr) {
+    *error = "xbyak_aarch64 is unavailable in this build";
+  }
+  return nullptr;
+}
+
+W8DequantFn get_w8_dequant_kernel(std::string* error) {
   if (error != nullptr) {
     *error = "xbyak_aarch64 is unavailable in this build";
   }
@@ -116,7 +131,10 @@ class SveFusedGenerator final : public CodeGenerator {
         row_pairs_((rows + 1) / 2),
         accumulator_base_(rows <= 8 ? 16 : 8),
         physical_rows_(rows <= 8 ? 8 : 12),
-        probe_mode_(probe_mode) {
+        probe_mode_(probe_mode),
+        clamp_swiglu_(operation == Operation::kW13Clamped || operation == Operation::kW8W13Clamped),
+        w8_weights_(operation == Operation::kW8W13 || operation == Operation::kW8W13Clamped ||
+                    operation == Operation::kW8W2Direct) {
     if (rows_ < 1 || rows_ > 12) {
       throw std::invalid_argument("SVE JIT rows must be in [1, 12]");
     }
@@ -125,10 +143,13 @@ class SveFusedGenerator final : public CodeGenerator {
         throw std::invalid_argument("SVE JIT probe mode is incompatible with the requested GEMM kernel");
       }
     }
-    if (operation_ == Operation::kW13 && (degree_ < 4 || degree_ > 6)) {
+    if ((operation_ == Operation::kW13 || operation_ == Operation::kW13Clamped ||
+         operation_ == Operation::kW8W13 || operation_ == Operation::kW8W13Clamped) &&
+        (degree_ < 4 || degree_ > 6)) {
       throw std::invalid_argument("SVE JIT W13 degree must be 4, 5, or 6");
     }
-    if (operation_ != Operation::kW13 && degree_ != 0) {
+    if (operation_ != Operation::kW13 && operation_ != Operation::kW13Clamped &&
+        operation_ != Operation::kW8W13 && operation_ != Operation::kW8W13Clamped && degree_ != 0) {
       throw std::invalid_argument("SVE JIT plain GEMM operations require degree 0");
     }
     generate();
@@ -155,6 +176,9 @@ class SveFusedGenerator final : public CodeGenerator {
       case Operation::kW13:
         operation = "w13";
         break;
+      case Operation::kW13Clamped:
+        operation = "w13_clamped";
+        break;
       case Operation::kW2:
         operation = "w2";
         break;
@@ -162,6 +186,15 @@ class SveFusedGenerator final : public CodeGenerator {
         operation = "w2_direct";
         break;
       case Operation::kGemmF32:
+        break;
+      case Operation::kW8W13:
+        operation = "w8_w13";
+        break;
+      case Operation::kW8W13Clamped:
+        operation = "w8_w13_clamped";
+        break;
+      case Operation::kW8W2Direct:
+        operation = "w8_w2_direct";
         break;
     }
     const char* probe = "";
@@ -305,6 +338,48 @@ class SveFusedGenerator final : public CodeGenerator {
     b(GT, k_loop);
   }
 
+  void load_w8_b() {
+    ld1sb(z6.s, p1 / T_z, ptr(x14));
+    add(x14, x14, x19);
+    ld1sb(z7.s, p1 / T_z, ptr(x14));
+    add(x14, x14, x19);
+    scvtf(z6.s, p1 / T_m, z6.s);
+    scvtf(z7.s, p1 / T_m, z7.s);
+    bfcvt(z6.h, p1 / T_m, z6.s);
+    bfcvtnt(z6.h, p1 / T_m, z7.s);
+  }
+
+  void emit_w8_k4() {
+    for (int pair = 0; pair < row_pairs_; ++pair) {
+      ld1rqh(ZRegH(pair), p0 / T_z, ptr(x13, pair * 16));
+    }
+    for (int column = 0; column < 4; ++column) {
+      load_w8_b();
+      for (int pair = 0; pair < row_pairs_; ++pair) {
+        bfmmla(accumulator(pair, column), ZRegH(pair), z6.h);
+      }
+    }
+    add(x13, x13, physical_rows_ * 8);
+  }
+
+  void emit_w8_k_loop() {
+    Label k_loop;
+    L(k_loop);
+    emit_w8_k4();
+    subs(w15, w15, 4);
+    b(GT, k_loop);
+  }
+
+  void apply_w8_scales() {
+    for (int column = 0; column < 4; ++column) {
+      ld1w(z6.s, p1 / T_z, ptr(x20));
+      add(x20, x20, x9);
+      for (int pair = 0; pair < row_pairs_; ++pair) {
+        fmul(accumulator(pair, column), p1 / T_m, z6.s);
+      }
+    }
+  }
+
   void build_row_offsets(bool direct) {
     index(z0.s, 0, 1);
     mov(z1.d, z0.d);
@@ -338,7 +413,7 @@ class SveFusedGenerator final : public CodeGenerator {
   }
 
   void store_w2() {
-    const bool direct = operation_ == Operation::kW2Direct;
+    const bool direct = operation_ == Operation::kW2Direct || operation_ == Operation::kW8W2Direct;
     build_row_offsets(direct);
     for (int pair = 0; pair < row_pairs_; ++pair) {
       const bool partial = (rows_ & 1) != 0 && pair == row_pairs_ - 1;
@@ -404,11 +479,20 @@ class SveFusedGenerator final : public CodeGenerator {
   }
 
   void silu_to_bf16(const ZRegS& gate, const ZRegS& up) {
+    if (clamp_swiglu_) {
+      load_silu_constant(offsetof(SiluConstants, swiglu_limit));
+      fmin(gate, p1 / T_m, z4.s);
+      fmin(up, p1 / T_m, z4.s);
+      fneg(z0.s, p1 / T_m, z4.s);
+      fmax(up, p1 / T_m, z0.s);
+    }
     fneg(z0.s, p1 / T_m, gate);
     load_silu_constant(offsetof(SiluConstants, clamp_hi));
     fmin(z0.s, p1 / T_m, z4.s);
-    load_silu_constant(offsetof(SiluConstants, clamp_lo));
-    fmax(z0.s, p1 / T_m, z4.s);
+    if (!clamp_swiglu_) {
+      load_silu_constant(offsetof(SiluConstants, clamp_lo));
+      fmax(z0.s, p1 / T_m, z4.s);
+    }
     mov(z1.d, z0.d);
     load_silu_constant(offsetof(SiluConstants, inv_ln2));
     fmul(z1.s, p1 / T_m, z4.s);
@@ -479,13 +563,24 @@ class SveFusedGenerator final : public CodeGenerator {
     add(x14, x14, 4);
     ld1rw(z14.s, p1 / T_z, ptr(x14));
     add(x14, x14, 4);
+    if (clamp_swiglu_) {
+      add(x14, x8, offsetof(SiluConstants, swiglu_limit));
+    }
     ld1rw(z15.s, p1 / T_z, ptr(x14));
   }
 
   void silu_to_bf16_cached(const ZRegS& gate, const ZRegS& up) {
+    if (clamp_swiglu_) {
+      fmin(gate, p1 / T_m, z15.s);
+      fmin(up, p1 / T_m, z15.s);
+      fneg(z4.s, p1 / T_m, z15.s);
+      fmax(up, p1 / T_m, z4.s);
+    }
     fneg(z0.s, p1 / T_m, gate);
     fmin(z0.s, p1 / T_m, z14.s);
-    fmax(z0.s, p1 / T_m, z15.s);
+    if (!clamp_swiglu_) {
+      fmax(z0.s, p1 / T_m, z15.s);
+    }
     mov(z1.d, z0.d);
     fmul(z1.s, p1 / T_m, z8.s);
     frintn(z1.s, p1 / T_m, z1.s);
@@ -543,6 +638,9 @@ class SveFusedGenerator final : public CodeGenerator {
     add(x14, x14, 4);
     ld1rw(z30.s, p1 / T_z, ptr(x14));
     add(x14, x14, 4);
+    if (clamp_swiglu_) {
+      add(x14, x8, offsetof(SiluConstants, swiglu_limit));
+    }
     ld1rw(z31.s, p1 / T_z, ptr(x14));
   }
 
@@ -551,12 +649,23 @@ class SveFusedGenerator final : public CodeGenerator {
     const ZRegS gate1 = accumulator(pair, 1);
     const ZRegS up0 = accumulator(pair, 2);
     const ZRegS up1 = accumulator(pair, 3);
+    if (clamp_swiglu_) {
+      fmin(gate0, p1 / T_m, z31.s);
+      fmin(gate1, p1 / T_m, z31.s);
+      fmin(up0, p1 / T_m, z31.s);
+      fmin(up1, p1 / T_m, z31.s);
+      fneg(z4.s, p1 / T_m, z31.s);
+      fmax(up0, p1 / T_m, z4.s);
+      fmax(up1, p1 / T_m, z4.s);
+    }
     fneg(z0.s, p1 / T_m, gate0);
     fneg(z1.s, p1 / T_m, gate1);
     fmin(z0.s, p1 / T_m, z30.s);
     fmin(z1.s, p1 / T_m, z30.s);
-    fmax(z0.s, p1 / T_m, z31.s);
-    fmax(z1.s, p1 / T_m, z31.s);
+    if (!clamp_swiglu_) {
+      fmax(z0.s, p1 / T_m, z31.s);
+      fmax(z1.s, p1 / T_m, z31.s);
+    }
     mov(z2.d, z0.d);
     mov(z3.d, z1.d);
     fmul(z2.s, p1 / T_m, z24.s);
@@ -653,24 +762,48 @@ class SveFusedGenerator final : public CodeGenerator {
   }
 
   void generate() {
+    if (w8_weights_) {
+      stp(x19, x20, pre_ptr(sp, -16));
+    }
     save_callee_simd();
-    mov(x8, x3);
+    if (w8_weights_) {
+      mov(x8, x4);
+      mov(x4, x5);
+    } else {
+      mov(x8, x3);
+    }
     ldr(w5, ptr(x4, kParamK));
     ldr(w6, ptr(x4, kParamNBegin));
     mov(w11, w5);
     mul(x6, x6, x11);
-    lsl(x6, x6, 1);
+    if (!w8_weights_) {
+      lsl(x6, x6, 1);
+    }
     add(x6, x1, x6);
     ldr(w12, ptr(x4, kParamN));
     ldr(w7, ptr(x4, kParamLdc));
     mov(w16, w7);
     lsl(x16, x16, 2);
-    mov(x7, x2);
+    if (w8_weights_) {
+      mov(x7, x3);
+    } else {
+      mov(x7, x2);
+    }
     mov(x9, kVectorBytes);
+    if (w8_weights_) {
+      mov(x19, kVectorBytes / 4);
+    }
     mov(x10, kNTile);
     mov(w11, w5);
     mul(x11, x11, x9);
-    if (operation_ == Operation::kW13) {
+    if (w8_weights_) {
+      lsr(x11, x11, 1);
+      ldr(w15, ptr(x4, kParamNBegin));
+      lsl(x15, x15, 3);
+      add(x2, x2, x15);
+    }
+    if (operation_ == Operation::kW13 || operation_ == Operation::kW13Clamped ||
+        operation_ == Operation::kW8W13 || operation_ == Operation::kW8W13Clamped) {
       mov(x17, physical_rows_ / 2);
       mul(x17, x17, x9);
     } else {
@@ -697,26 +830,37 @@ class SveFusedGenerator final : public CodeGenerator {
         mov(ZRegD(reg), 0);
       }
     }
-    if (physical_rows_ == 8) {
+    if (w8_weights_) {
+      emit_w8_k_loop();
+      mov(x20, x2);
+      apply_w8_scales();
+    } else if (physical_rows_ == 8) {
       emit_small_double_buffered_k_loop();
     } else {
       emit_m12_k_loop();
     }
 
     if (probe_mode_ == ProbeMode::kNone) {
-      if (operation_ == Operation::kW13) {
+      if (operation_ == Operation::kW13 || operation_ == Operation::kW13Clamped ||
+          operation_ == Operation::kW8W13 || operation_ == Operation::kW8W13Clamped) {
         store_w13();
       } else {
         store_w2();
       }
     }
     add(x6, x6, x11);
+    if (w8_weights_) {
+      add(x2, x2, x9, LSL, 2);
+    }
     add(x7, x7, x17);
     sub(x12, x12, x10);
     b(n_loop);
 
     L(done);
     restore_callee_simd();
+    if (w8_weights_) {
+      ldp(x19, x20, post_ptr(sp, 16));
+    }
     ret();
   }
 
@@ -727,11 +871,66 @@ class SveFusedGenerator final : public CodeGenerator {
   int accumulator_base_;
   int physical_rows_;
   ProbeMode probe_mode_;
+  bool clamp_swiglu_ = false;
+  bool w8_weights_ = false;
+};
+
+class SveW8DequantGenerator final : public CodeGenerator {
+ public:
+  SveW8DequantGenerator() : CodeGenerator(16 * 1024, AutoGrow) {
+    generate();
+    readyRE();
+  }
+
+  W8DequantFn function() const { return getCode<W8DequantFn>(); }
+
+ private:
+  void generate() {
+    ptrue(p0.s);
+    ptrue(p1.h);
+    mov(x5, x0);
+    mov(x6, x2);
+    mov(w8, w4);
+
+    Label n_loop;
+    Label k_loop;
+    Label done;
+    L(n_loop);
+    cmp(w8, 0);
+    b(LE, done);
+    mov(w9, w3);
+    L(k_loop);
+    mov(x7, x1);
+    for (int column = 0; column < 4; ++column) {
+      ld1sb(z0.s, p0 / T_z, ptr(x5));
+      add(x5, x5, kVectorBytes / 4);
+      ld1sb(z1.s, p0 / T_z, ptr(x5));
+      add(x5, x5, kVectorBytes / 4);
+      scvtf(z0.s, p0 / T_m, z0.s);
+      scvtf(z1.s, p0 / T_m, z1.s);
+      ld1w(z2.s, p0 / T_z, ptr(x7));
+      add(x7, x7, kVectorBytes);
+      fmul(z0.s, p0 / T_m, z2.s);
+      fmul(z1.s, p0 / T_m, z2.s);
+      bfcvt(z0.h, p0 / T_m, z0.s);
+      bfcvtnt(z0.h, p0 / T_m, z1.s);
+      st1h(z0.h, p1, ptr(x6));
+      add(x6, x6, kVectorBytes);
+    }
+    subs(w9, w9, 4);
+    b(GT, k_loop);
+    add(x1, x1, kVectorBytes * 4);
+    sub(w8, w8, kNTile);
+    b(n_loop);
+    L(done);
+    ret();
+  }
 };
 
 struct KernelHandle {
   std::shared_ptr<SveFusedGenerator> owner;
   KernelFn function = nullptr;
+  W8KernelFn w8_function = nullptr;
   std::string error;
 };
 
@@ -739,7 +938,12 @@ KernelHandle create_kernel(const KernelKey& key) {
   KernelHandle handle;
   try {
     handle.owner = std::make_shared<SveFusedGenerator>(key.operation, key.rows, key.degree, key.probe_mode);
-    handle.function = handle.owner->function();
+    if (key.operation == Operation::kW8W13 || key.operation == Operation::kW8W13Clamped ||
+        key.operation == Operation::kW8W2Direct) {
+      handle.w8_function = handle.owner->getCode<W8KernelFn>();
+    } else {
+      handle.function = handle.owner->function();
+    }
   } catch (const std::exception& exception) {
     handle.error = exception.what();
   } catch (...) {
@@ -753,7 +957,7 @@ struct KernelCacheSlot {
   KernelHandle handle;
 };
 
-constexpr size_t kOperationCount = 4;
+constexpr size_t kOperationCount = 8;
 constexpr size_t kRowCount = 12;
 constexpr size_t kDegreeCount = 3;
 constexpr size_t kProbeModeCount = 4;
@@ -761,7 +965,10 @@ constexpr size_t kProbeModeCount = 4;
 size_t operation_index(Operation operation) { return static_cast<size_t>(operation); }
 
 size_t degree_index(Operation operation, int degree) {
-  return operation == Operation::kW13 ? static_cast<size_t>(degree - 4) : 0;
+  return operation == Operation::kW13 || operation == Operation::kW13Clamped ||
+                 operation == Operation::kW8W13 || operation == Operation::kW8W13Clamped
+             ? static_cast<size_t>(degree - 4)
+             : 0;
 }
 
 size_t probe_index(ProbeMode mode) {
@@ -802,7 +1009,8 @@ KernelFn get_kernel(Operation operation, int rows, int degree, std::string* erro
     }
     return nullptr;
   }
-  if (operation == Operation::kW13 && (degree < 4 || degree > 6)) {
+  if ((operation == Operation::kW13 || operation == Operation::kW13Clamped) &&
+      (degree < 4 || degree > 6)) {
     if (error != nullptr) {
       *error = "SVE Xbyak W13 degree must be 4, 5, or 6";
     }
@@ -810,6 +1018,49 @@ KernelFn get_kernel(Operation operation, int rows, int degree, std::string* erro
   }
   const KernelKey key{operation, static_cast<uint8_t>(rows), static_cast<uint8_t>(degree), ProbeMode::kNone};
   KernelHandle& handle = cached_kernel(key);
+  if (error != nullptr) {
+    *error = handle.error;
+  }
+  return handle.function;
+}
+
+W8KernelFn get_w8_kernel(Operation operation, int rows, int degree, std::string* error) {
+  const bool is_w8 = operation == Operation::kW8W13 || operation == Operation::kW8W13Clamped ||
+                     operation == Operation::kW8W2Direct;
+  if (!is_w8 || rows < 1 || rows > 12 ||
+      ((operation == Operation::kW8W13 || operation == Operation::kW8W13Clamped) &&
+       (degree < 4 || degree > 6))) {
+    if (error != nullptr) {
+      *error = "invalid SVE Xbyak W8A16 operation, rows, or degree";
+    }
+    return nullptr;
+  }
+  const KernelKey key{operation, static_cast<uint8_t>(rows), static_cast<uint8_t>(degree), ProbeMode::kNone};
+  KernelHandle& handle = cached_kernel(key);
+  if (error != nullptr) {
+    *error = handle.error;
+  }
+  return handle.w8_function;
+}
+
+W8DequantFn get_w8_dequant_kernel(std::string* error) {
+  struct DequantHandle {
+    std::shared_ptr<SveW8DequantGenerator> owner;
+    W8DequantFn function = nullptr;
+    std::string error;
+  };
+  static std::once_flag once;
+  static DequantHandle handle;
+  std::call_once(once, [] {
+    try {
+      handle.owner = std::make_shared<SveW8DequantGenerator>();
+      handle.function = handle.owner->function();
+    } catch (const std::exception& exception) {
+      handle.error = exception.what();
+    } catch (...) {
+      handle.error = "unknown xbyak_aarch64 W8 dequant generation failure";
+    }
+  });
   if (error != nullptr) {
     *error = handle.error;
   }
@@ -832,10 +1083,13 @@ KernelFn get_probe_kernel(int rows, ProbeMode mode, std::string* error) {
 }
 
 void prewarm(Operation operation, int degree) {
+  const bool is_w8 = operation == Operation::kW8W13 || operation == Operation::kW8W13Clamped ||
+                     operation == Operation::kW8W2Direct;
   for (int rows = 1; rows <= 12; ++rows) {
     std::string error;
-    const KernelFn function = get_kernel(operation, rows, degree, &error);
-    if (function == nullptr && implementation_mode() == ImplementationMode::kJit) {
+    const bool resolved = is_w8 ? get_w8_kernel(operation, rows, degree, &error) != nullptr
+                                : get_kernel(operation, rows, degree, &error) != nullptr;
+    if (!resolved && implementation_mode() == ImplementationMode::kJit) {
       throw std::runtime_error("failed to generate SVE Xbyak kernel: " + error);
     }
   }

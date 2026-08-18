@@ -36,13 +36,19 @@ class MoePlannerRuntime:
         degree: int = 1,
         concurrent_ranks: int = 1,
         cpu_ids: Sequence[int] | None = None,
+        shared_experts: int = 0,
     ) -> None:
+        if int(shared_experts) not in {0, 1}:
+            raise ValueError("shared_experts must be 0 or 1")
+        self.shared_experts = int(shared_experts)
+        planner_global_experts = int(global_experts) + self.shared_experts
+        planner_local_experts = int(local_experts) + self.shared_experts
         self.model = AnalyticMoeCostModel(
             calibration,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
-            global_experts=global_experts,
-            local_experts=local_experts,
+            global_experts=planner_global_experts,
+            local_experts=planner_local_experts,
             mode=mode,
             degree=degree,
             concurrent_ranks=concurrent_ranks,
@@ -95,7 +101,8 @@ class MoePlannerRuntime:
         activation_name = getattr(activation, "value", activation)
         effective_global_experts = self.global_experts if global_num_experts < 0 else int(global_num_experts)
         return (
-            self.local_experts == self.global_experts
+            getattr(self, "shared_experts", 0) == 0
+            and self.local_experts == self.global_experts
             and self.mode in {"standalone", "tp"}
             and int(num_threads) == self.num_cores
             and str(activation_name) == "silu"
@@ -132,6 +139,55 @@ class MoePlannerRuntime:
             return None
         with self._lock:
             spec = self._planner.plan_spec_for(counts, topk_ids=topk_ids)
+        return AsyncMoEPlanV2.from_dict(spec["bridge"])
+
+    def plan_for_shared_dispatch(
+        self,
+        weights: Any,
+        combined_topk_ids: torch.Tensor,
+        *,
+        num_threads: int,
+        activation: Any,
+    ) -> AsyncMoEPlanV2 | None:
+        """Return a mixed-width plan for one synthetic all-token shared expert."""
+        if self.shared_experts != 1 or self.local_experts != self.global_experts:
+            return None
+        activation_name = getattr(activation, "value", activation)
+        packed = getattr(weights, "packed", None)
+        routed_experts = int(getattr(weights, "routed_experts", -1))
+        shared_expert_id = int(getattr(weights, "shared_expert_id", -1))
+        if (
+            self.mode not in {"standalone", "tp"}
+            or int(num_threads) != self.num_cores
+            or str(activation_name) != "silu"
+            or routed_experts != self.local_experts
+            or shared_expert_id != self.local_experts
+            or packed is None
+            or not bool(packed.fused_silu)
+            or int(packed.gemm_backend) != 1
+            or int(packed.backend_n_tile) != self.model.policy.backend_n_tile
+            or int(packed.w13[0].shape[0]) != self.local_experts + 1
+            or int(packed.w13[1]) != self.hidden_size
+            or int(packed.w13[2]) != 2 * self.intermediate_size
+            or int(packed.w2[1]) != self.intermediate_size
+            or int(packed.w2[2]) != self.hidden_size
+        ):
+            return None
+        if combined_topk_ids.dim() != 2:
+            return None
+        shared_occurrences = combined_topk_ids == shared_expert_id
+        if not torch.all(shared_occurrences.sum(dim=1) == 1):
+            return None
+        counts = route_counts(combined_topk_ids, self.local_experts + 1)
+        if not counts:
+            return None
+        with self._lock:
+            spec = self._planner.plan_spec_for(
+                counts,
+                topk_ids=combined_topk_ids,
+                shared_expert_id=shared_expert_id,
+            )
+            self._planner.last["combined_top_k"] = int(combined_topk_ids.shape[1])
         return AsyncMoEPlanV2.from_dict(spec["bridge"])
 
     @property
@@ -179,6 +235,7 @@ def enable_moe_planner_quick(
     mode: str = "standalone",
     degree: int = 1,
     concurrent_ranks: int = 1,
+    shared_experts: int = 0,
     output: str | Path | None = None,
     supported_widths: Sequence[int] | None = None,
     machine_id: str | None = None,
@@ -206,6 +263,7 @@ def enable_moe_planner_quick(
         degree=degree,
         concurrent_ranks=concurrent_ranks,
         cpu_ids=result.cpu_ids,
+        shared_experts=shared_experts,
     )
     set_default_moe_planner_runtime(runtime)
     return runtime

@@ -178,8 +178,16 @@ class NativeQuickPlanner {
                           const std::vector<std::vector<double>>& costs) const;
   IntervalCandidate Assign(const std::vector<int>& expert_ids, const std::vector<int>& routes,
                            const std::vector<int>& shape, const std::vector<double>& costs) const;
+  IntervalPlanResult PlanShared(const std::vector<int>& expert_ids, const std::vector<int>& routes,
+                                int shared_expert_id, const std::vector<std::vector<int>>& shapes,
+                                const std::vector<int>& cost_widths,
+                                const std::vector<std::vector<double>>& costs_by_width) const;
 
  private:
+  IntervalCandidate AssignShared(const std::vector<int>& expert_ids, const std::vector<int>& routes,
+                                 int shared_expert_id, const std::vector<int>& shape,
+                                 const std::vector<int>& cost_widths,
+                                 const std::vector<std::vector<double>>& costs_by_width) const;
   int num_cores_ = 0;
   std::vector<std::vector<int>> shapes_;
   int64_t max_stage_bytes_ = 0;

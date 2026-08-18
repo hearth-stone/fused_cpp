@@ -137,6 +137,13 @@ GEMM tiling, thread ownership, cache windows, barriers, intermediate dtype, and
 merge implementation are not public unless they change documented numerical
 behavior.
 
+The normal, scheduled, async, Plan V2, combined routed+shared, and standalone
+shared APIs accept the additive keyword `swiglu_limit`. The only positive value
+currently supported is `10.0`, with `activation="silu"`, fused-SiLU packed
+weights, and backend `arm_sve_bf16`; it selects the DeepSeek-V4 SVE JIT
+clamped-SwiGLU operation. The experimental planned-staged and vLLM-staged
+comparators do not expose this mode.
+
 `MoePlannerRuntime` is an additive, process-local scheduling API for the SVE
 BF16 fused-SiLU path. Calibration is explicit through
 `calibrate_moe_planner_quick`; importing the package and the first operator call
@@ -161,7 +168,71 @@ operator document explicitly requires it. Tolerance changes need a numerical
 justification and an explicit contract update; they must not be relaxed only to
 adopt a faster candidate.
 
+### Shared MLP
+
+`prepare_shared_mlp_bf16_tiled_weights` and `shared_mlp_bf16_tiled` are the
+standalone one-expert SVE BF16 MLP API. Dense weights use `[2 * F, H]` W13 and
+`[H, F]` W2 layouts; the prepared object reuses the opaque E=1 fused-MoE packed
+layout with fused SiLU enabled. Execution accepts contiguous CPU BF16 `[M, H]`
+input and returns contiguous CPU BF16 `[M, H]` output. A valid `out=` buffer is
+written in place and returned. Biases and non-SVE backends are not supported by
+this initial version.
+
+N-window selection, M12 row partitioning, dynamic task order, cache sizing,
+scratch layout, and thread ownership are internal scheduling details. The
+operator is thread-compatible, not thread-safe: callers must serialize
+invocations because they use the process-wide resident MoE worker pool.
+Prepared weights are read-only and reusable across serialized calls.
+
+`prepare_routed_shared_moe_bf16_tiled_weights` and
+`fused_moe_bf16_tiled_with_shared` are the additive combined scheduling API.
+The initial contract accepts one shared expert whose `[2 * F, H]` / `[H, F]`
+weights match the routed experts' rank-local `H` and `F`. Packing writes routed
+experts followed by the shared expert into one opaque SVE allocation without a
+full routed-weight copy. Execution appends one unit-weight shared route per
+token, scales routed route weights by `routed_scaling_factor`, and performs one
+FP32 route merge followed by one BF16 output store.
+
+The combined API supports fused SiLU, standalone and TP only. Passing
+`swiglu_limit=10.0` selects DeepSeek-V4 clamped SwiGLU: gate is capped at 10,
+up is clamped to `[-10, 10]`, then the existing `silu(gate) * up` epilogue is
+evaluated. This mode requires the SVE BF16 JIT; static asm, NEON, x86, biases,
+EP, multiple shared experts, and a distinct shared intermediate size are not
+supported. `None` and `0.0` retain the existing unclamped behavior bitwise;
+other positive limits are rejected. `MoePlannerRuntime(shared_experts=1)` may
+select a bounded mixed-width strict plan for this API. Existing runtimes default
+to `shared_experts=0`; routed-only API behavior and Plan V2 schema remain
+unchanged.
+
 ## Async MoE Plan V2
+
+### Experimental W8A16 Plan V2
+
+`prepare_fused_moe_w8a16_tiled_weights` prepares symmetric signed INT8
+weights with one FP32 scale per output channel. The opaque prepared object is
+accepted by `fused_moe_w8a16_tiled_async_plan`, by the planner-owning
+`fused_moe_w8a16_tiled` entrypoint, and by the type-dispatched
+`fused_moe_tiled` facade. `fused_moe_w8a16_tiled` requires an explicitly
+installed compatible `MoePlannerRuntime`; it does not construct an uncalibrated
+fallback plan. `fused_moe_tiled` selects BF16 or W8A16 solely from the prepared
+weight type, so existing BF16 calls and defaults are unchanged. By default, the
+SVE JIT loads packed INT8 B in the GEMM
+K-loop, converts it to BF16 registers immediately before BFMMLA, and applies
+packed per-output-channel FP32 scales once after accumulation.
+`cache_dequant=True` is an explicit experimental alternative: for tasks with
+more than 12 routes, each Plan V2 B window is converted once into thread-local
+BF16 scratch and consumed by the existing BF16 JIT kernels. Tasks with at most
+12 routes retain register dequantization because they have no cross-panel B
+reuse. A zero window still means the full owner stripe; callers evaluating
+cache dequantization must provide machine-calibrated nonzero windows when a
+full stripe does not fit the intended cache level. Packed formats, expanded
+scale vectors, and cache scratch are internal.
+
+This API is experimental. It supports no bias or non-SVE fallback, requires
+the direct-route W2 path, and currently uses FP32 route storage. Quantization
+changes numerical behavior relative to BF16 and callers must validate
+model-level quality. The planner schedules an explicitly supplied W8A16
+prepared object but never converts or selects BF16 weights as W8A16.
 
 `ASYNC_MOE_PLAN_VERSION == 2` and `AsyncMoEPlanV2.from_dict()` define a public,
 versioned plan schema. The authoritative field and validation description is

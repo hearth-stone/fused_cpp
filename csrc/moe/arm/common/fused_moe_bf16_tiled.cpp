@@ -727,6 +727,35 @@ void bf16_pack_b(const uint16_t* B, uint16_t* B_reo, int K, int N) {
   }
 }
 
+void int8_pack_b(const int8_t* B, int8_t* B_reo, int K, int N, int n_tile) {
+  const int segments = n_tile / 8;
+  int64_t idx = 0;
+  for (int cb = 0; cb < N; cb += n_tile) {
+    for (int rb = 0; rb < K / 4; ++rb) {
+      const int row_base = rb * 4;
+      for (int cp = 0; cp < 4; ++cp) {
+        for (int segment = 0; segment < segments; ++segment) {
+          const int c0 = cb + segment * 8 + cp * 2;
+          const int c1 = c0 + 1;
+          B_reo[idx++] = B[(row_base + 0) * N + c0];
+          B_reo[idx++] = B[(row_base + 2) * N + c0];
+          B_reo[idx++] = B[(row_base + 0) * N + c1];
+          B_reo[idx++] = B[(row_base + 2) * N + c1];
+        }
+        for (int segment = 0; segment < segments; ++segment) {
+          const int c0 = cb + segment * 8 + cp * 2;
+          const int c1 = c0 + 1;
+          B_reo[idx++] = B[(row_base + 1) * N + c0];
+          B_reo[idx++] = B[(row_base + 3) * N + c0];
+          B_reo[idx++] = B[(row_base + 1) * N + c1];
+          B_reo[idx++] = B[(row_base + 3) * N + c1];
+        }
+      }
+    }
+  }
+  TORCH_INTERNAL_ASSERT(idx == static_cast<int64_t>(K) * N);
+}
+
 #ifdef __aarch64__
 
 // Bottom layer: single-thread bf16 GEMM over the whole [M, N] slice.
@@ -1075,12 +1104,20 @@ const char* sve_jit_operation_name(SveJitOperation operation) {
   switch (operation) {
     case SveJitOperation::kW13:
       return "W13";
+    case SveJitOperation::kW13Clamped:
+      return "W13 clamped-SwiGLU";
     case SveJitOperation::kW2:
       return "W2";
     case SveJitOperation::kW2Direct:
       return "W2 direct-route";
     case SveJitOperation::kGemmF32:
       return "plain GEMM FP32";
+    case SveJitOperation::kW8W13:
+      return "W8A16 W13";
+    case SveJitOperation::kW8W13Clamped:
+      return "W8A16 W13 clamped-SwiGLU";
+    case SveJitOperation::kW8W2Direct:
+      return "W8A16 W2 direct-route";
   }
   return "unknown";
 }
@@ -1102,7 +1139,7 @@ bool sve_jit_configuration_supported(SveJitOperation operation, int K, int64_t d
   if (!::fused_cpp::moe_sve::jit::built()) {
     return reject("the extension was built without xbyak_aarch64");
   }
-  if (operation == SveJitOperation::kW13) {
+  if (operation == SveJitOperation::kW13 || operation == SveJitOperation::kW13Clamped) {
     if (degree < 4 || degree > 6) {
       return reject("the exact-M JIT supports SiLU polynomial degrees 4, 5, and 6");
     }
@@ -1119,6 +1156,17 @@ void prewarm_sve_jit_exact_m_kernels(int w13_k, int w2_k) {
   }
   ::fused_cpp::moe_sve::jit::prewarm(SveJitOperation::kW2, 0);
   ::fused_cpp::moe_sve::jit::prewarm(SveJitOperation::kW2Direct, 0);
+}
+
+void prewarm_sve_jit_w8a16_kernels() {
+  if (!::fused_cpp::moe_sve::jit::requested_for_current_build()) {
+    return;
+  }
+  for (int degree = 4; degree <= 6; ++degree) {
+    ::fused_cpp::moe_sve::jit::prewarm(SveJitOperation::kW8W13, degree);
+    ::fused_cpp::moe_sve::jit::prewarm(SveJitOperation::kW8W13Clamped, degree);
+  }
+  ::fused_cpp::moe_sve::jit::prewarm(SveJitOperation::kW8W2Direct, 0);
 }
 
 struct SveJitExactMKernelSet {
@@ -1154,12 +1202,15 @@ bool resolve_sve_jit_exact_m_kernels(SveJitOperation operation, int rows, int64_
 }
 
 bool sve_jit_packc_w13_exact_dispatch(const uint16_t* packed_A, const uint16_t* w13_packed, uint16_t* C, int rows,
-                                      int K, int N, int ldc, int packed_N, int n_begin, int64_t degree) {
-  if (!sve_jit_configuration_supported(SveJitOperation::kW13, K, degree, nullptr)) {
+                                      int K, int N, int ldc, int packed_N, int n_begin, int64_t degree,
+                                      bool clamp_swiglu) {
+  const SveJitOperation operation =
+      clamp_swiglu ? SveJitOperation::kW13Clamped : SveJitOperation::kW13;
+  if (!sve_jit_configuration_supported(operation, K, degree, nullptr)) {
     return false;
   }
   SveJitExactMKernelSet kernels;
-  if (!resolve_sve_jit_exact_m_kernels(SveJitOperation::kW13, rows, degree, &kernels)) {
+  if (!resolve_sve_jit_exact_m_kernels(operation, rows, degree, &kernels)) {
     return false;
   }
   SveKBlockParams p = make_sve_kblock_params(12, K, N, ldc, packed_N, n_begin, static_cast<int>(degree));
@@ -1565,10 +1616,12 @@ void sve_asm_packed_w2_bf16_hybrid_dispatch(const uint16_t* packed_A, const uint
 
 void sve_packc_w13_hybrid_dispatch(const uint16_t* packed_A, const uint16_t* w13_packed, uint16_t* C, int rows, int K,
                                    int N, int ldc, int packed_N, int n_begin,
-                                   const SveKcFusedSiluKernelSet& asm_kernels, int64_t degree) {
-  if (sve_jit_packc_w13_exact_dispatch(packed_A, w13_packed, C, rows, K, N, ldc, packed_N, n_begin, degree)) {
+                                   const SveKcFusedSiluKernelSet& asm_kernels, int64_t degree, bool clamp_swiglu) {
+  if (sve_jit_packc_w13_exact_dispatch(packed_A, w13_packed, C, rows, K, N, ldc, packed_N, n_begin, degree,
+                                       clamp_swiglu)) {
     return;
   }
+  TORCH_CHECK(!clamp_swiglu, "clamped SwiGLU requires the SVE JIT W13 kernel");
   sve_asm_packc_w13_hybrid_dispatch(packed_A, w13_packed, C, rows, K, N, ldc, packed_N, n_begin, asm_kernels);
 }
 
@@ -1654,6 +1707,11 @@ struct PackedExperts {
   int64_t n_tile = kKernelTile;
 };
 
+struct PackedW8A16Experts {
+  PackedExperts packed;
+  at::Tensor scales;
+};
+
 PackedExperts checked_packed_experts(const at::Tensor& packed, int64_t K, int64_t N, const char* name,
                                      int64_t n_tile = kKernelTile) {
   check_bf16_cpu(packed, name);
@@ -1669,6 +1727,30 @@ PackedExperts checked_packed_experts(const at::Tensor& packed, int64_t K, int64_
   TORCH_CHECK(packed.size(0) > 0, name, " must contain at least one expert");
   return PackedExperts{
       packed, packed.size(0), K, N, K_pad, N_pad, expected_stride, std::max<int64_t>(n_tile, kKernelTile)};
+}
+
+PackedW8A16Experts checked_w8a16_experts(const at::Tensor& packed, const at::Tensor& scales, int64_t K, int64_t N,
+                                         const char* name, int64_t n_tile) {
+  TORCH_CHECK(packed.device().is_cpu(), name, " must be a CPU tensor");
+  TORCH_CHECK(packed.scalar_type() == at::kChar, name, " must have dtype torch.int8");
+  TORCH_CHECK(packed.dim() == 2 && packed.is_contiguous(), name, " must be contiguous [experts, packed_numel]");
+  check_positive_int(K, "K");
+  check_positive_int(N, "N");
+  const int64_t K_pad = ceil_to_multiple(K, kKernelTile);
+  const int64_t N_pad = ceil_to_multiple(N, std::max<int64_t>(n_tile, kKernelTile));
+  const int64_t expected_stride = K_pad * N_pad;
+  TORCH_CHECK(packed.size(0) > 0 && packed.size(1) == expected_stride, name, " packed shape mismatch");
+  TORCH_CHECK(scales.device().is_cpu() && scales.scalar_type() == at::kFloat, name,
+              " scales must be a CPU float32 tensor");
+  TORCH_CHECK(scales.dim() == 2 && scales.is_contiguous(), name,
+              " scales must be contiguous [experts, 4 * N_pad]");
+  TORCH_CHECK(scales.size(0) == packed.size(0) && scales.size(1) == 4 * N_pad, name,
+              " scale shape mismatch: expected [", packed.size(0), ", ", 4 * N_pad, "]");
+  return PackedW8A16Experts{
+      PackedExperts{packed, packed.size(0), K, N, K_pad, N_pad, expected_stride,
+                    std::max<int64_t>(n_tile, kKernelTile)},
+      scales,
+  };
 }
 
 void check_optional_bias(const c10::optional<at::Tensor>& bias, int64_t E, int64_t N, const char* name) {
@@ -1717,6 +1799,25 @@ at::Tensor finalize_moe_output(at::Tensor output, const c10::optional<at::Tensor
   if (out.has_value()) {
     torch::autograd::impl::bump_version(output);
   }
+  return output;
+}
+
+at::Tensor prepare_shared_mlp_output(const at::Tensor& input, const at::Tensor& w13_packed,
+                                     const at::Tensor& w2_packed, const c10::optional<at::Tensor>& out) {
+  if (!out.has_value()) {
+    return at::empty(input.sizes(), input.options().dtype(at::kBFloat16));
+  }
+  const at::Tensor& output = out.value();
+  TORCH_CHECK(output.defined(), "out must be a defined tensor");
+  check_bf16_cpu(output, "out");
+  TORCH_CHECK(output.dim() == 2 && output.sizes() == input.sizes(), "out must have shape ", input.sizes(),
+              ", got ", output.sizes());
+  TORCH_CHECK(output.is_contiguous(), "out must be contiguous");
+  TORCH_CHECK(!output.requires_grad(), "out with requires_grad=True is not supported");
+  TORCH_CHECK(at::has_internal_overlap(output) == at::MemOverlap::No, "out must not have internal overlap");
+  check_output_no_overlap(output, input, "input");
+  check_output_no_overlap(output, w13_packed, "w13_packed");
+  check_output_no_overlap(output, w2_packed, "w2_packed");
   return output;
 }
 
@@ -1835,8 +1936,30 @@ enum class MoeActivationKind {
   kSwigluOai,
 };
 
+bool is_fused_silu_activation(const std::string& activation) {
+  return activation == "silu" || activation == "silu_clamp10";
+}
+
+bool uses_clamped_swiglu(const std::string& activation) { return activation == "silu_clamp10"; }
+
+void check_clamped_swiglu_jit(const std::string& activation, bool use_sve_backend, int K, int64_t degree) {
+  if (!uses_clamped_swiglu(activation)) {
+    return;
+  }
+  TORCH_CHECK(use_sve_backend, "clamped SwiGLU requires the SVE BF16 backend");
+#if defined(FUSED_CPP_MOE_HAS_ARM_SVE)
+  std::string reason;
+  TORCH_CHECK(sve_jit_configuration_supported(::fused_cpp::moe_sve::jit::Operation::kW13Clamped, K, degree, &reason),
+              "clamped SwiGLU requires the SVE JIT W13 kernel: ", reason);
+#else
+  (void)K;
+  (void)degree;
+  TORCH_CHECK(false, "clamped SwiGLU requires an SVE JIT-enabled build");
+#endif
+}
+
 MoeActivationKind moe_activation_kind(const std::string& activation) {
-  if (activation == "silu") {
+  if (is_fused_silu_activation(activation)) {
     return MoeActivationKind::kSilu;
   }
   if (activation == "gelu") {
@@ -2761,14 +2884,14 @@ void team_fused_w13_silu_packed_packc(const TeamContext& team, const uint16_t* p
 
 void team_fused_w13_silu_packed_packc_sve(const TeamContext& team, const uint16_t* packed_A, const uint16_t* w13_packed,
                                           uint16_t* intermediate, int rows, int K, int N13, int ldc, int64_t degree,
-                                          int64_t n_tile, int64_t window_tiles) {
+                                          int64_t n_tile, int64_t window_tiles, bool clamp_swiglu) {
 #if defined(FUSED_CPP_MOE_HAS_ARM_SVE)
   const SveKcFusedSiluKernelSet ks = sve_asm_fused_silu_packc_set_for_degree(degree);
   TORCH_CHECK(ks.m8 != nullptr, "unsupported fused silu exp degree ", degree);
   const StageWindowPlan windows = make_stage_window_plan(N13, n_tile, team.group_size, window_tiles);
   for_each_stage_window(windows, team.local_tid, [&](const SplitRange& range, int64_t) {
     sve_packc_w13_hybrid_dispatch(packed_A, w13_packed, intermediate, rows, K, static_cast<int>(range.size), ldc, N13,
-                                  static_cast<int>(range.begin), ks, degree);
+                                  static_cast<int>(range.begin), ks, degree, clamp_swiglu);
   });
 #else
   (void)team;
@@ -2782,9 +2905,158 @@ void team_fused_w13_silu_packed_packc_sve(const TeamContext& team, const uint16_
   (void)degree;
   (void)n_tile;
   (void)window_tiles;
+  (void)clamp_swiglu;
   TORCH_CHECK(false, "SVE MoE asm packC kernel is unavailable in this build");
 #endif
 }
+
+#if defined(FUSED_CPP_MOE_HAS_ARM_SVE)
+using SveW8JitKernelFn = ::fused_cpp::moe_sve::jit::W8KernelFn;
+
+struct SveW8JitKernelSet {
+  SveW8JitKernelFn m12 = nullptr;
+  SveW8JitKernelFn tail = nullptr;
+  int main_rows = 0;
+  int tail_rows = 0;
+};
+
+SveW8JitKernelSet resolve_w8_jit_kernels(SveJitOperation operation, int rows, int64_t degree) {
+  SveW8JitKernelSet kernels;
+  kernels.main_rows = rows / 12 * 12;
+  kernels.tail_rows = rows - kernels.main_rows;
+  std::string error;
+  if (kernels.main_rows > 0) {
+    kernels.m12 = ::fused_cpp::moe_sve::jit::get_w8_kernel(operation, 12, static_cast<int>(degree), &error);
+  }
+  if (kernels.tail_rows > 0) {
+    kernels.tail =
+        ::fused_cpp::moe_sve::jit::get_w8_kernel(operation, kernels.tail_rows, static_cast<int>(degree), &error);
+  }
+  TORCH_CHECK((kernels.main_rows == 0 || kernels.m12 != nullptr) &&
+                  (kernels.tail_rows == 0 || kernels.tail != nullptr),
+              "failed to generate SVE W8A16 kernel: ", error);
+  return kernels;
+}
+
+const uint16_t* dequantize_w8_window(const int8_t* packed, const float* scales, int K, int N) {
+  thread_local std::vector<uint16_t> dequantized;
+  dequantized.resize(static_cast<size_t>(K) * N);
+  std::string error;
+  const auto kernel = ::fused_cpp::moe_sve::jit::get_w8_dequant_kernel(&error);
+  TORCH_CHECK(kernel != nullptr, "failed to generate SVE W8 cache-dequant kernel: ", error);
+  kernel(packed, scales, dequantized.data(), K, N);
+  return dequantized.data();
+}
+
+void sve_jit_packc_w13_local_dispatch(const uint16_t* packed_A, const uint16_t* local_w13, uint16_t* output,
+                                      int rows, int K, int N, int ldc, int global_n_begin, int64_t degree,
+                                      bool clamp_swiglu) {
+  const SveJitOperation operation = clamp_swiglu ? SveJitOperation::kW13Clamped : SveJitOperation::kW13;
+  SveJitExactMKernelSet kernels;
+  TORCH_CHECK(resolve_sve_jit_exact_m_kernels(operation, rows, degree, &kernels),
+              "W8A16 cache-dequant W13 requires the SVE exact-M JIT");
+  SveKBlockParams params = make_sve_kblock_params(12, K, N, ldc, N, /*n_begin=*/0, static_cast<int>(degree));
+  const void* constants = ::fused_cpp::moe_sve::jit::silu_constants();
+  for (int mb = 0; mb < kernels.main_rows; mb += 12) {
+    params.gemm.m = 12;
+    kernels.m12(packed_A + static_cast<int64_t>(mb) * K, local_w13,
+                output + static_cast<int64_t>(mb) * ldc + static_cast<int64_t>(global_n_begin) * 6, constants,
+                &params.gemm);
+  }
+  if (kernels.tail_rows > 0) {
+    const int physical_pairs = kernels.tail_rows <= 8 ? 4 : 6;
+    params.gemm.m = kernels.tail_rows;
+    kernels.tail(packed_A + static_cast<int64_t>(kernels.main_rows) * K, local_w13,
+                 output + static_cast<int64_t>(kernels.main_rows) * ldc +
+                     static_cast<int64_t>(global_n_begin) * physical_pairs,
+                 constants, &params.gemm);
+  }
+}
+
+void team_w8a16_w13_packc_sve(const TeamContext& team, int64_t window_tiles, const uint16_t* packed_A,
+                              const int8_t* packed_w13, const float* scales, uint16_t* intermediate, int rows, int K,
+                              int N, int ldc, int64_t degree, int64_t n_tile, bool clamp_swiglu) {
+  const StageWindowPlan windows = make_stage_window_plan(N, n_tile, team.group_size, window_tiles);
+  for_each_stage_window(windows, team.local_tid, [&](const SplitRange& range, int64_t) {
+    const int64_t packed_offset = (range.begin / n_tile) * static_cast<int64_t>(K) * n_tile;
+    const SveJitOperation operation =
+        clamp_swiglu ? SveJitOperation::kW8W13Clamped : SveJitOperation::kW8W13;
+    const SveW8JitKernelSet kernels = resolve_w8_jit_kernels(operation, rows, degree);
+    SveKBlockParams params = make_sve_kblock_params(12, K, static_cast<int>(range.size), ldc,
+                                                    static_cast<int>(range.size), /*n_begin=*/0,
+                                                    static_cast<int>(degree));
+    const void* constants = ::fused_cpp::moe_sve::jit::silu_constants();
+    const int8_t* local_b = packed_w13 + packed_offset;
+    const float* local_scales = scales + 2 * range.begin;
+    for (int mb = 0; mb < kernels.main_rows; mb += 12) {
+      params.gemm.m = 12;
+      kernels.m12(packed_A + static_cast<int64_t>(mb) * K, local_b, local_scales,
+                  intermediate + static_cast<int64_t>(mb) * ldc + static_cast<int64_t>(range.begin) * 6,
+                  constants, &params.gemm);
+    }
+    if (kernels.tail_rows > 0) {
+      const int physical_pairs = kernels.tail_rows <= 8 ? 4 : 6;
+      params.gemm.m = kernels.tail_rows;
+      kernels.tail(packed_A + static_cast<int64_t>(kernels.main_rows) * K, local_b, local_scales,
+                   intermediate + static_cast<int64_t>(kernels.main_rows) * ldc +
+                       static_cast<int64_t>(range.begin) * physical_pairs,
+                   constants, &params.gemm);
+    }
+  });
+}
+
+void team_w8a16_w13_packc_cache_sve(const TeamContext& team, int64_t window_tiles, const uint16_t* packed_A,
+                                    const int8_t* packed_w13, const float* scales, uint16_t* intermediate, int rows,
+                                    int K, int N, int ldc, int64_t degree, int64_t n_tile, bool clamp_swiglu) {
+  const StageWindowPlan windows = make_stage_window_plan(N, n_tile, team.group_size, window_tiles);
+  for_each_stage_window(windows, team.local_tid, [&](const SplitRange& range, int64_t) {
+    const int64_t packed_offset = (range.begin / n_tile) * static_cast<int64_t>(K) * n_tile;
+    const uint16_t* local_b = dequantize_w8_window(
+        packed_w13 + packed_offset, scales + 2 * N + 2 * range.begin, K, static_cast<int>(range.size));
+    sve_jit_packc_w13_local_dispatch(packed_A, local_b, intermediate, rows, K, static_cast<int>(range.size), ldc,
+                                     static_cast<int>(range.begin), degree, clamp_swiglu);
+  });
+}
+
+void team_w8a16_w2_direct_f32_sve(const TeamContext& team, int64_t window_tiles, const uint16_t* packed_A,
+                                  const int8_t* packed_w2, const float* scales, float* route_out,
+                                  const int64_t* route_ids, int rows, int K, int N, int route_stride, int64_t n_tile) {
+  const StageWindowPlan windows = make_stage_window_plan(N, n_tile, team.group_size, window_tiles);
+  for_each_stage_window(windows, team.local_tid, [&](const SplitRange& range, int64_t) {
+    const int64_t packed_offset = (range.begin / n_tile) * static_cast<int64_t>(K) * n_tile;
+    const SveW8JitKernelSet kernels = resolve_w8_jit_kernels(SveJitOperation::kW8W2Direct, rows, 0);
+    SveKBlockParams params = make_sve_kblock_params(12, K, static_cast<int>(range.size), route_stride,
+                                                    static_cast<int>(range.size), /*n_begin=*/0, 3);
+    const int8_t* local_b = packed_w2 + packed_offset;
+    const float* local_scales = scales + 2 * range.begin;
+    for (int mb = 0; mb < kernels.main_rows; mb += 12) {
+      params.gemm.m = 12;
+      kernels.m12(packed_A + static_cast<int64_t>(mb) * K, local_b, local_scales, route_out + range.begin,
+                  route_ids + mb, &params.gemm);
+    }
+    if (kernels.tail_rows > 0) {
+      params.gemm.m = kernels.tail_rows;
+      kernels.tail(packed_A + static_cast<int64_t>(kernels.main_rows) * K, local_b, local_scales,
+                   route_out + range.begin, route_ids + kernels.main_rows, &params.gemm);
+    }
+  });
+}
+
+void team_w8a16_w2_direct_f32_cache_sve(const TeamContext& team, int64_t window_tiles, const uint16_t* packed_A,
+                                        const int8_t* packed_w2, const float* scales, float* route_out,
+                                        const int64_t* route_ids, int rows, int K, int N, int route_stride,
+                                        int64_t n_tile) {
+  const StageWindowPlan windows = make_stage_window_plan(N, n_tile, team.group_size, window_tiles);
+  for_each_stage_window(windows, team.local_tid, [&](const SplitRange& range, int64_t) {
+    const int64_t packed_offset = (range.begin / n_tile) * static_cast<int64_t>(K) * n_tile;
+    const uint16_t* local_b = dequantize_w8_window(
+        packed_w2 + packed_offset, scales + 2 * N + 2 * range.begin, K, static_cast<int>(range.size));
+    sve_packed_w2_direct_route_hybrid_dispatch(packed_A, local_b, route_out + range.begin, route_ids, rows, K,
+                                               static_cast<int>(range.size), route_stride,
+                                               static_cast<int>(range.size), /*n_begin=*/0);
+  });
+}
+#endif
 
 // Explicit contiguous-N task used by the vLLM-style staged baseline. Unlike
 // the cooperative team wrapper above, one caller owns the complete range and
@@ -2793,7 +3065,7 @@ void team_fused_w13_silu_packed_packc_sve(const TeamContext& team, const uint16_
 // work queue.
 void vllm_staged_w13_range_sve(const uint16_t* packed_A, const uint16_t* w13_packed, uint16_t* intermediate,
                                int rows, int K, int ldc, int64_t degree, int64_t n_tile, int64_t n_begin,
-                               int64_t n_cols) {
+                               int64_t n_cols, bool clamp_swiglu) {
 #if defined(FUSED_CPP_MOE_HAS_ARM_SVE)
   TORCH_CHECK(n_begin >= 0 && n_cols > 0 && n_begin % n_tile == 0 && n_cols % n_tile == 0,
               "vLLM-staged W13 range must be positive and N-tile aligned: begin=", n_begin, " size=", n_cols,
@@ -2801,7 +3073,7 @@ void vllm_staged_w13_range_sve(const uint16_t* packed_A, const uint16_t* w13_pac
   const SveKcFusedSiluKernelSet kernels = sve_asm_fused_silu_packc_set_for_degree(degree);
   TORCH_CHECK(kernels.m8 != nullptr, "unsupported fused silu exp degree ", degree);
   sve_packc_w13_hybrid_dispatch(packed_A, w13_packed, intermediate, rows, K, static_cast<int>(n_cols), ldc, 2 * ldc,
-                                static_cast<int>(n_begin), kernels, degree);
+                                static_cast<int>(n_begin), kernels, degree, clamp_swiglu);
 #else
   (void)packed_A;
   (void)w13_packed;
@@ -2813,6 +3085,7 @@ void vllm_staged_w13_range_sve(const uint16_t* packed_A, const uint16_t* w13_pac
   (void)n_tile;
   (void)n_begin;
   (void)n_cols;
+  (void)clamp_swiglu;
   TORCH_CHECK(false, "SVE MoE asm packC kernel is unavailable in this build");
 #endif
 }
@@ -3035,16 +3308,18 @@ void gather_pack_a_reorder_backend(bool use_sve_backend, const uint16_t* input, 
 void team_fused_w13_silu_packed_packc_backend(bool use_sve_backend, const TeamContext& team, int64_t window_tiles,
                                               const uint16_t* packed_A,
                                               const uint16_t* w13_packed, uint16_t* intermediate, int rows, int K,
-                                              int N13, int ldc, int64_t degree, int64_t n_tile) {
+                                              int N13, int ldc, int64_t degree, int64_t n_tile,
+                                              bool clamp_swiglu) {
 #if defined(FUSED_CPP_MOE_HAS_ARM_SVE)
   if (use_sve_backend) {
     team_fused_w13_silu_packed_packc_sve(team, packed_A, w13_packed, intermediate, rows, K, N13, ldc, degree, n_tile,
-                                         window_tiles);
+                                         window_tiles, clamp_swiglu);
     return;
   }
 #else
   TORCH_CHECK(!use_sve_backend, "SVE MoE asm packC kernel is unavailable in this build");
 #endif
+  TORCH_CHECK(!clamp_swiglu, "clamped SwiGLU requires the SVE JIT W13 kernel");
   team_fused_w13_silu_packed_packc(team, packed_A, w13_packed, intermediate, rows, K, N13, ldc, degree, window_tiles);
 }
 
@@ -4155,6 +4430,13 @@ struct VllmStagedThreadScratch {
   std::vector<uint16_t, backend_allocator<uint16_t>> packed_a;
 };
 
+struct SharedMlpTask {
+  int64_t n_begin = 0;
+  int64_t n_cols = 0;
+  int64_t m_begin = 0;
+  int64_t m_rows = 0;
+};
+
 int64_t vllm_staged_available_l2_bytes() {
   static const int64_t available_bytes = []() {
     int64_t l2_bytes = 0;
@@ -4216,6 +4498,59 @@ std::vector<VllmStagedNTask> build_vllm_staged_tasks(int64_t num_experts, int64_
   for (int64_t expert = 0; expert < num_experts; ++expert) {
     for (int64_t n_begin = 0; n_begin < N; n_begin += task_n) {
       tasks.push_back(VllmStagedNTask{expert, n_begin, std::min<int64_t>(task_n, N - n_begin)});
+    }
+  }
+  return tasks;
+}
+
+int64_t shared_mlp_task_n(MoeGemmStage stage, int64_t M, int64_t K, int64_t N, int64_t n_tile) {
+  TORCH_CHECK(M > 0 && K > 0 && N > 0 && n_tile > 0 && N % n_tile == 0,
+              "shared MLP task dimensions must be positive and N-tile aligned");
+  const int64_t minimum_task_n = stage == MoeGemmStage::kW13 ? 2 * n_tile : n_tile;
+  const int64_t available_l2 = vllm_staged_available_l2_bytes();
+  const auto saturating_bytes = [](int64_t x, int64_t y, int64_t element_bytes) {
+    if (x > std::numeric_limits<int64_t>::max() / y / element_bytes) {
+      return std::numeric_limits<int64_t>::max();
+    }
+    return x * y * element_bytes;
+  };
+  const int64_t input_bytes = saturating_bytes(M, K, static_cast<int64_t>(sizeof(uint16_t)));
+  int64_t bytes_per_column = K * static_cast<int64_t>(sizeof(uint16_t));
+  if (stage == MoeGemmStage::kW13) {
+    const int64_t output_bytes =
+        M > std::numeric_limits<int64_t>::max() / static_cast<int64_t>(sizeof(float))
+            ? std::numeric_limits<int64_t>::max()
+            : M * static_cast<int64_t>(sizeof(float));
+    bytes_per_column = output_bytes > std::numeric_limits<int64_t>::max() - bytes_per_column
+                           ? std::numeric_limits<int64_t>::max()
+                           : bytes_per_column + output_bytes;
+  }
+  const int64_t cache_budget = input_bytes >= available_l2 ? 0 : available_l2 - input_bytes;
+  const int64_t cache_limit = bytes_per_column == 0 ? 0 : cache_budget / bytes_per_column;
+  const int64_t aligned = cache_limit / minimum_task_n * minimum_task_n;
+  return std::min<int64_t>(N, std::max<int64_t>(minimum_task_n, aligned));
+}
+
+std::vector<SharedMlpTask> build_shared_mlp_tasks(int64_t M, int64_t N, int64_t task_n, int64_t n_tile,
+                                                  int64_t num_threads) {
+  TORCH_CHECK(M > 0 && N > 0 && task_n > 0 && n_tile > 0 && num_threads > 0,
+              "invalid shared MLP task geometry");
+  TORCH_CHECK(N % n_tile == 0 && task_n % n_tile == 0,
+              "shared MLP N and task width must be N-tile aligned");
+  const int64_t n_tasks = ceil_div_int64(N, task_n);
+  const int64_t m_panels = ceil_div_int64(M, int64_t{12});
+  const int64_t m_splits = std::min<int64_t>(m_panels, ceil_div_int64(num_threads, n_tasks));
+  TORCH_CHECK(n_tasks <= std::numeric_limits<int64_t>::max() / m_splits,
+              "shared MLP task count exceeds int64");
+  std::vector<SharedMlpTask> tasks;
+  tasks.reserve(static_cast<size_t>(n_tasks * m_splits));
+  for (int64_t n_begin = 0; n_begin < N; n_begin += task_n) {
+    const int64_t n_cols = std::min<int64_t>(task_n, N - n_begin);
+    for (int64_t split = 0; split < m_splits; ++split) {
+      const SplitRange panels = split_evenly(m_panels, m_splits, split);
+      const int64_t m_begin = panels.begin * 12;
+      const int64_t m_rows = std::min<int64_t>(M - m_begin, panels.size * 12);
+      tasks.push_back(SharedMlpTask{n_begin, n_cols, m_begin, m_rows});
     }
   }
   return tasks;
@@ -4355,6 +4690,12 @@ struct AsyncPlanV2NativeArgs {
   c10::optional<at::Tensor> task_w13_window_tiles;
   c10::optional<at::Tensor> task_w2_window_tiles;
   int64_t early_merge = kAsyncEarlyMergeAuto;
+};
+
+struct W8A16RuntimeWeights {
+  at::Tensor w13_scales;
+  at::Tensor w2_scales;
+  bool cache_dequant = false;
 };
 
 struct ScheduledScratchUnitConfig {
@@ -4561,6 +4902,63 @@ void pack_transposed_expert_weight_interleaved(const uint16_t* weight, int64_t e
   } else {
     backend->pack_b(transposed.data(), packed_dst, static_cast<int>(K_pad), static_cast<int>(N_pad));
   }
+}
+
+void quantize_pack_expert_weight_per_channel(const uint16_t* weight, int64_t expert_offset, int64_t out_features,
+                                             int64_t in_features, int64_t K_pad, int64_t N_pad, int64_t n_tile,
+                                             int8_t* packed_dst, float* scale_dst, bool interleaved_w13) {
+  std::vector<int8_t> transposed(static_cast<size_t>(K_pad * N_pad), int8_t{0});
+  std::vector<float> channel_scales(static_cast<size_t>(N_pad), 1.0f);
+  const int64_t logical_features = interleaved_w13 ? out_features / 2 : out_features;
+  for (int64_t n = 0; n < out_features; ++n) {
+    int64_t packed_column = n;
+    if (interleaved_w13) {
+      const bool is_up = n >= logical_features;
+      const int64_t feature = is_up ? n - logical_features : n;
+      packed_column = (feature / 4) * 8 + (is_up ? 4 : 0) + feature % 4;
+    }
+    const uint16_t* src_row = weight + expert_offset + n * in_features;
+    float max_abs = 0.0f;
+    for (int64_t k = 0; k < in_features; ++k) {
+      max_abs = std::max(max_abs, std::abs(bf16_bits_to_float(src_row[k])));
+    }
+    const float scale = max_abs > 0.0f ? max_abs / 127.0f : 1.0f;
+    channel_scales[static_cast<size_t>(packed_column)] = scale;
+    for (int64_t k = 0; k < in_features; ++k) {
+      const float value = bf16_bits_to_float(src_row[k]) / scale;
+      const int quantized = std::max(-127, std::min(127, static_cast<int>(std::nearbyint(value))));
+      transposed[static_cast<size_t>(k * N_pad + packed_column)] = static_cast<int8_t>(quantized);
+    }
+  }
+  int8_pack_b(transposed.data(), packed_dst, static_cast<int>(K_pad), static_cast<int>(N_pad),
+              static_cast<int>(n_tile));
+  int64_t scale_index = 0;
+  for (int64_t cb = 0; cb < N_pad; cb += n_tile) {
+    for (int64_t cp = 0; cp < 4; ++cp) {
+      for (int64_t segment = 0; segment < n_tile / 8; ++segment) {
+        const int64_t c0 = cb + segment * 8 + cp * 2;
+        const int64_t c1 = c0 + 1;
+        scale_dst[scale_index++] = channel_scales[static_cast<size_t>(c0)];
+        scale_dst[scale_index++] = channel_scales[static_cast<size_t>(c1)];
+        scale_dst[scale_index++] = channel_scales[static_cast<size_t>(c0)];
+        scale_dst[scale_index++] = channel_scales[static_cast<size_t>(c1)];
+      }
+    }
+  }
+  TORCH_INTERNAL_ASSERT(scale_index == 2 * N_pad);
+  for (int64_t cb = 0; cb < N_pad; cb += n_tile) {
+    for (int64_t cp = 0; cp < 4; ++cp) {
+      for (int64_t segment = 0; segment < n_tile / 8; ++segment) {
+        const int64_t c0 = cb + segment * 8 + cp * 2;
+        const int64_t c1 = c0 + 1;
+        scale_dst[scale_index++] = channel_scales[static_cast<size_t>(c0)];
+        scale_dst[scale_index++] = channel_scales[static_cast<size_t>(c0)];
+        scale_dst[scale_index++] = channel_scales[static_cast<size_t>(c1)];
+        scale_dst[scale_index++] = channel_scales[static_cast<size_t>(c1)];
+      }
+    }
+  }
+  TORCH_INTERNAL_ASSERT(scale_index == 4 * N_pad);
 }
 
 }  // namespace
@@ -5109,7 +5507,7 @@ at::Tensor fused_moe_test_team_w13_silu_packc_window(at::Tensor A, at::Tensor w1
     if (use_sve) {
       team_fused_w13_silu_packed_packc_sve(team, packed_a.data(), packed.data(), bf16_data(C), static_cast<int>(M),
                                            static_cast<int>(K_pad), static_cast<int>(N_pad), static_cast<int>(ldc),
-                                           degree, n_tile, window_tiles);
+                                           degree, n_tile, window_tiles, false);
     } else {
       team_fused_w13_silu_packed_packc(team, packed_a.data(), packed.data(), bf16_data(C), static_cast<int>(M),
                                        static_cast<int>(K_pad), static_cast<int>(N_pad), static_cast<int>(ldc), degree,
@@ -5377,7 +5775,7 @@ std::vector<std::pair<int64_t, int64_t>> fused_moe_test_w2_scatter_ranges(int64_
 // M12-compatible probe modes may traverse any positive multiple of 12 rows.
 std::vector<double> fused_moe_bench_sve_jit_w13_gemm(at::Tensor A, at::Tensor w13_packed, int64_t K, int64_t N,
                                                      int64_t n_tile, int64_t n_ranges, int64_t warmup, int64_t runs,
-                                                     int64_t probe_mode) {
+                                                     int64_t probe_mode, bool clamp_swiglu) {
 #if !defined(__aarch64__) || !defined(FUSED_CPP_MOE_HAS_ARM_SVE)
   TORCH_CHECK(false, "fused_moe_bench_sve_jit_w13_gemm requires AArch64 SVE");
 #else
@@ -5406,7 +5804,10 @@ std::vector<double> fused_moe_bench_sve_jit_w13_gemm(at::Tensor A, at::Tensor w1
   const PackedExperts weights = checked_packed_experts(w13_packed, K, N, "w13_packed", n_tile);
   TORCH_CHECK(weights.E > 0, "w13_packed must contain at least one expert");
   const bool fused_w13_probe = probe_mode == kFusedW13ProbeMode;
-  const SveJitOperation operation = fused_w13_probe ? SveJitOperation::kW13 : SveJitOperation::kGemmF32;
+  TORCH_CHECK(!clamp_swiglu || fused_w13_probe, "clamp_swiglu requires probe_mode=11 (fused W13)");
+  const SveJitOperation operation = fused_w13_probe
+                                        ? clamp_swiglu ? SveJitOperation::kW13Clamped : SveJitOperation::kW13
+                                        : SveJitOperation::kGemmF32;
   constexpr int64_t kFusedW13ProbeDegree = 5;
   TORCH_CHECK(sve_jit_configuration_supported(operation, static_cast<int>(K),
                                               fused_w13_probe ? kFusedW13ProbeDegree : 0, nullptr),
@@ -5454,7 +5855,7 @@ std::vector<double> fused_moe_bench_sve_jit_w13_gemm(at::Tensor A, at::Tensor w1
       if (fused_w13_probe) {
         const bool dispatched = sve_jit_packc_w13_exact_dispatch(
             packed_a_ptr, packed_b, packc_output_ptr, rows, static_cast<int>(K), range_cols,
-            static_cast<int>(N / 2), static_cast<int>(N), n_begin, kFusedW13ProbeDegree);
+            static_cast<int>(N / 2), static_cast<int>(N), n_begin, kFusedW13ProbeDegree, clamp_swiglu);
         TORCH_CHECK(dispatched, "failed to dispatch fused SVE JIT W13 GEMM");
       } else if (probe_kernel != nullptr) {
         const int panel_rows = rows > 12 ? 12 : rows;
@@ -5646,6 +6047,149 @@ fused_moe_bf16_tiled_prepare_weights(at::Tensor w13_weight, at::Tensor w2_weight
 #endif
 }
 
+std::tuple<at::Tensor, int64_t, int64_t, at::Tensor, at::Tensor, int64_t, int64_t, at::Tensor, int64_t, int64_t>
+fused_moe_w8a16_tiled_prepare_weights(at::Tensor w13_weight, at::Tensor w2_weight) {
+#ifndef __aarch64__
+  TORCH_CHECK(false, "W8A16 fused MoE packing requires AArch64 SVE");
+#else
+  const ::fused_cpp::moe::MoeBackend& backend =
+      ::fused_cpp::moe::resolve_backend("arm_sve_bf16", /*fuse_silu=*/true);
+  check_bf16_cpu(w13_weight, "w13_weight");
+  check_bf16_cpu(w2_weight, "w2_weight");
+  TORCH_CHECK(w13_weight.dim() == 3 && w2_weight.dim() == 3,
+              "W8A16 weights must be [E, 2F, H] and [E, H, F]");
+  TORCH_CHECK(w13_weight.size(0) == w2_weight.size(0), "W8A16 expert counts must match");
+  w13_weight = w13_weight.contiguous();
+  w2_weight = w2_weight.contiguous();
+  const int64_t E = w13_weight.size(0);
+  const int64_t N13 = w13_weight.size(1);
+  const int64_t H = w13_weight.size(2);
+  TORCH_CHECK(N13 % 2 == 0, "W8A16 W13 output dimension must be even");
+  const int64_t F = N13 / 2;
+  TORCH_CHECK(F % 8 == 0, "W8A16 fused W13 requires F % 8 == 0, got ", F);
+  TORCH_CHECK(w2_weight.size(0) == E && w2_weight.size(1) == H && w2_weight.size(2) == F,
+              "W8A16 W2 shape mismatch");
+  const int64_t n_tile = backend.n_tile();
+  const int64_t K13_pad = backend.round_k(static_cast<int>(H));
+  const int64_t N13_pad = backend.round_n(static_cast<int>(N13));
+  const int64_t K2_pad = backend.round_k(static_cast<int>(F));
+  const int64_t N2_pad = backend.round_n(static_cast<int>(H));
+  at::Tensor q13 =
+      fused_cpp::page_backed_empty({E, K13_pad * N13_pad}, w13_weight.options().dtype(at::kChar));
+  at::Tensor q2 = fused_cpp::page_backed_empty({E, K2_pad * N2_pad}, w2_weight.options().dtype(at::kChar));
+  at::Tensor s13 = at::empty({E, 4 * N13_pad}, w13_weight.options().dtype(at::kFloat));
+  at::Tensor s2 = at::empty({E, 4 * N2_pad}, w2_weight.options().dtype(at::kFloat));
+  const uint16_t* w13_ptr = bf16_data_const(w13_weight);
+  const uint16_t* w2_ptr = bf16_data_const(w2_weight);
+  int8_t* q13_ptr = q13.data_ptr<int8_t>();
+  int8_t* q2_ptr = q2.data_ptr<int8_t>();
+  float* s13_ptr = s13.data_ptr<float>();
+  float* s2_ptr = s2.data_ptr<float>();
+  const int64_t w13_stride = N13 * H;
+  const int64_t w2_stride = H * F;
+  int64_t threads = std::min<int64_t>(E, env_int_or_default("FUSED_CPP_MOE_PREPACK_THREADS", 1));
+  TORCH_CHECK(threads > 0, "FUSED_CPP_MOE_PREPACK_THREADS must be positive");
+  run_fixed_threads(threads, [&](int64_t tid) {
+    for (int64_t expert = tid; expert < E; expert += threads) {
+      quantize_pack_expert_weight_per_channel(
+          w13_ptr, expert * w13_stride, N13, H, K13_pad, N13_pad, n_tile,
+          q13_ptr + expert * K13_pad * N13_pad, s13_ptr + expert * 4 * N13_pad, /*interleaved_w13=*/true);
+      quantize_pack_expert_weight_per_channel(
+          w2_ptr, expert * w2_stride, H, F, K2_pad, N2_pad, n_tile,
+          q2_ptr + expert * K2_pad * N2_pad, s2_ptr + expert * 4 * N2_pad, /*interleaved_w13=*/false);
+    }
+  });
+  prewarm_sve_jit_w8a16_kernels();
+  return std::make_tuple(q13, H, N13, s13, q2, F, H, s2, static_cast<int64_t>(backend.id), n_tile);
+#endif
+}
+
+std::tuple<at::Tensor, int64_t, int64_t, at::Tensor, int64_t, int64_t, int64_t, int64_t>
+fused_moe_bf16_tiled_prepare_routed_shared_weights(at::Tensor routed_w13_weight, at::Tensor routed_w2_weight,
+                                                   at::Tensor shared_w13_weight, at::Tensor shared_w2_weight,
+                                                   std::string backend_name) {
+#ifndef __aarch64__
+  TORCH_CHECK(false, "routed+shared BF16 packing requires AArch64 SVE");
+#else
+  const ::fused_cpp::moe::MoeBackend& backend = ::fused_cpp::moe::resolve_backend(backend_name, true);
+  TORCH_CHECK(backend.id == ::fused_cpp::moe::BackendId::kArmSveBf16,
+              "routed+shared BF16 packing requires arm_sve_bf16, got ", backend.name);
+  check_bf16_cpu(routed_w13_weight, "routed_w13_weight");
+  check_bf16_cpu(routed_w2_weight, "routed_w2_weight");
+  check_bf16_cpu(shared_w13_weight, "shared_w13_weight");
+  check_bf16_cpu(shared_w2_weight, "shared_w2_weight");
+  TORCH_CHECK(routed_w13_weight.dim() == 3, "routed_w13_weight must be [E, 2 * F, H]");
+  TORCH_CHECK(routed_w2_weight.dim() == 3, "routed_w2_weight must be [E, H, F]");
+  TORCH_CHECK(shared_w13_weight.dim() == 2, "shared_w13_weight must be [2 * F, H]");
+  TORCH_CHECK(shared_w2_weight.dim() == 2, "shared_w2_weight must be [H, F]");
+
+  routed_w13_weight = routed_w13_weight.contiguous();
+  routed_w2_weight = routed_w2_weight.contiguous();
+  shared_w13_weight = shared_w13_weight.contiguous();
+  shared_w2_weight = shared_w2_weight.contiguous();
+
+  const int64_t routed_experts = routed_w13_weight.size(0);
+  TORCH_CHECK(routed_experts > 0, "routed expert count must be positive");
+  TORCH_CHECK(routed_w2_weight.size(0) == routed_experts,
+              "routed W13 and W2 must have the same expert count");
+  const int64_t n13 = routed_w13_weight.size(1);
+  const int64_t hidden = routed_w13_weight.size(2);
+  TORCH_CHECK(n13 > 0 && n13 % 2 == 0, "routed W13 output dimension must be positive and even");
+  const int64_t intermediate = n13 / 2;
+  TORCH_CHECK(intermediate % 8 == 0,
+              "routed+shared fused SiLU requires F to be a multiple of 8, got F=", intermediate);
+  TORCH_CHECK(routed_w2_weight.size(1) == hidden && routed_w2_weight.size(2) == intermediate,
+              "routed W2 shape must be [E, H, F]");
+  TORCH_CHECK(shared_w13_weight.size(0) == n13 && shared_w13_weight.size(1) == hidden,
+              "shared W13 shape must match routed [2 * F, H]");
+  TORCH_CHECK(shared_w2_weight.size(0) == hidden && shared_w2_weight.size(1) == intermediate,
+              "shared W2 shape must match routed [H, F]");
+  check_positive_int(hidden, "hidden size");
+  check_positive_int(intermediate, "ffn hidden size");
+
+  const int64_t total_experts = routed_experts + 1;
+  const int64_t k13_pad = backend.round_k(static_cast<int>(hidden));
+  const int64_t n13_pad = backend.round_n(static_cast<int>(n13));
+  const int64_t k2_pad = backend.round_k(static_cast<int>(intermediate));
+  const int64_t n2_pad = backend.round_n(static_cast<int>(hidden));
+  at::Tensor w13_packed =
+      fused_cpp::page_backed_empty({total_experts, k13_pad * n13_pad}, routed_w13_weight.options());
+  at::Tensor w2_packed =
+      fused_cpp::page_backed_empty({total_experts, k2_pad * n2_pad}, routed_w2_weight.options());
+
+  const uint16_t* routed_w13 = bf16_data_const(routed_w13_weight);
+  const uint16_t* routed_w2 = bf16_data_const(routed_w2_weight);
+  const uint16_t* shared_w13 = bf16_data_const(shared_w13_weight);
+  const uint16_t* shared_w2 = bf16_data_const(shared_w2_weight);
+  uint16_t* packed_w13 = bf16_data(w13_packed);
+  uint16_t* packed_w2 = bf16_data(w2_packed);
+  const int64_t routed_w13_stride = n13 * hidden;
+  const int64_t routed_w2_stride = hidden * intermediate;
+
+#if defined(FUSED_CPP_MOE_HAS_ARM_SVE)
+  prewarm_sve_jit_exact_m_kernels(static_cast<int>(k13_pad), static_cast<int>(k2_pad));
+#endif
+  int64_t prepack_threads = env_int_or_default("FUSED_CPP_MOE_PREPACK_THREADS", 1);
+  TORCH_CHECK(prepack_threads > 0, "FUSED_CPP_MOE_PREPACK_THREADS must be positive, got ", prepack_threads);
+  prepack_threads = std::min(prepack_threads, total_experts);
+  run_fixed_threads(prepack_threads, [&](int64_t tid) {
+    for (int64_t expert = tid; expert < total_experts; expert += prepack_threads) {
+      const bool is_shared = expert == routed_experts;
+      const uint16_t* source_w13 = is_shared ? shared_w13 : routed_w13;
+      const uint16_t* source_w2 = is_shared ? shared_w2 : routed_w2;
+      const int64_t source_w13_offset = is_shared ? 0 : expert * routed_w13_stride;
+      const int64_t source_w2_offset = is_shared ? 0 : expert * routed_w2_stride;
+      pack_transposed_expert_weight_interleaved(source_w13, source_w13_offset, intermediate, hidden, k13_pad,
+                                                n13_pad, packed_w13 + expert * k13_pad * n13_pad, &backend);
+      pack_transposed_expert_weight(source_w2, source_w2_offset, hidden, intermediate, k2_pad, n2_pad,
+                                    packed_w2 + expert * k2_pad * n2_pad, &backend);
+    }
+  });
+  return std::make_tuple(w13_packed, hidden, n13, w2_packed, intermediate, hidden,
+                         static_cast<int64_t>(backend.id), backend.n_tile());
+#endif
+}
+
 at::Tensor fused_moe_bf16_tiled(at::Tensor input, at::Tensor w13_packed, int64_t w13_K, int64_t w13_N,
                                 at::Tensor w2_packed, int64_t w2_K, int64_t w2_N, at::Tensor topk_weights,
                                 at::Tensor topk_ids, c10::optional<at::Tensor> w13_bias,
@@ -5770,7 +6314,8 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input, at::Tensor w13_packed, int64_t
   // fp32 buffer are skipped. Only the default per-expert path is wired (Task
   // 6); hierarchical N-split is left on the legacy path for now.
   if (fuse_silu) {
-    TORCH_CHECK(activation == "silu", "fuse_silu only supports activation='silu', got ", activation);
+    TORCH_CHECK(is_fused_silu_activation(activation),
+                "fuse_silu only supports activation='silu' with an optional SVE JIT clamp, got ", activation);
     TORCH_CHECK(F % 8 == 0, "fuse_silu requires F % 8 == 0, got F=", F);
     TORCH_CHECK(w13.N_pad == 2 * F, "fuse_silu expects interleaved w13 with N_pad=2F (=", 2 * F,
                 "), got N_pad=", w13.N_pad);
@@ -5778,6 +6323,7 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input, at::Tensor w13_packed, int64_t
     TORCH_CHECK(!use_sve_backend || w2_bias_base == nullptr, "SVE fused MoE does not support w2_bias yet");
     TORCH_CHECK(silu_poly_degree == 4 || silu_poly_degree == 5 || silu_poly_degree == 6,
                 "silu_poly_degree must be 4, 5, or 6, got ", silu_poly_degree);
+    check_clamped_swiglu_jit(activation, use_sve_backend, static_cast<int>(w13.K_pad), silu_poly_degree);
   }
   const bool use_hierarchical_nsplit = nsplit_config.enabled;
   // packA fusion: fold the A repack into the gather (w13, Part 1) and the
@@ -5937,7 +6483,8 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input, at::Tensor w13_packed, int64_t
               team_fused_w13_silu_packed_packc_sve(
                   team, scratch.packed_a.data(), w13_ptr + task.expert * w13.packed_stride, scratch.intermediate.data(),
                   static_cast<int>(rows), static_cast<int>(w13.K_pad), static_cast<int>(w13.N_pad),
-                  static_cast<int>(w2.K_pad), silu_poly_degree, w13.n_tile, /*window_tiles=*/0);
+                  static_cast<int>(w2.K_pad), silu_poly_degree, w13.n_tile, /*window_tiles=*/0,
+                  uses_clamped_swiglu(activation));
             } else {
               single_thread_gemm_fused_silu(scratch.input.data(), w13_ptr + task.expert * w13.packed_stride,
                                             scratch.intermediate.data(), scratch.a_reorder.data(),
@@ -6255,7 +6802,7 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor input, at::Tensor w13_packed, int64_t
                       team, scratch.packed_a.data(), w13_ptr + expert * w13.packed_stride,
                       scratch.intermediate.data(), static_cast<int>(rows), static_cast<int>(w13.K_pad),
                       static_cast<int>(w13.N_pad), static_cast<int>(w2.K_pad), silu_poly_degree, w13.n_tile,
-                      /*window_tiles=*/0);
+                      /*window_tiles=*/0, uses_clamped_swiglu(activation));
                 } else {
                   team_fused_w13_silu_packed_packc(
                       team, scratch.packed_a.data(), w13_ptr + expert * w13.packed_stride,
@@ -6559,7 +7106,8 @@ at::Tensor fused_moe_bf16_tiled_scheduled(at::Tensor input, at::Tensor w13_packe
   const float* w2_bias_base = w2_bias_f32.defined() ? w2_bias_f32.data_ptr<float>() : nullptr;
 
   if (fuse_silu) {
-    TORCH_CHECK(activation == "silu", "fuse_silu only supports activation='silu', got ", activation);
+    TORCH_CHECK(is_fused_silu_activation(activation),
+                "fuse_silu only supports activation='silu' with an optional SVE JIT clamp, got ", activation);
     TORCH_CHECK(F % 8 == 0, "fuse_silu requires F % 8 == 0, got F=", F);
     TORCH_CHECK(w13.N_pad == 2 * F, "fuse_silu expects interleaved w13 with N_pad=2F (=", 2 * F,
                 "), got N_pad=", w13.N_pad);
@@ -6567,6 +7115,7 @@ at::Tensor fused_moe_bf16_tiled_scheduled(at::Tensor input, at::Tensor w13_packe
     TORCH_CHECK(w2_bias_base == nullptr, "scheduled fuse_silu does not support w2_bias yet");
     TORCH_CHECK(silu_poly_degree == 4 || silu_poly_degree == 5 || silu_poly_degree == 6,
                 "silu_poly_degree must be 4, 5, or 6, got ", silu_poly_degree);
+    check_clamped_swiglu_jit(activation, use_sve_backend, static_cast<int>(w13.K_pad), silu_poly_degree);
   }
   // SVE packC tails overwrite every row consumed by W2, and each W2 worker
   // scatters only the columns it owns. Other backends retain the legacy
@@ -6866,7 +7415,7 @@ at::Tensor fused_moe_bf16_tiled_scheduled(at::Tensor input, at::Tensor w13_packe
               use_sve_backend, team, w13_window_tiles, scratch.packed_a.data(),
               w13_ptr + expert * w13.packed_stride, scratch.intermediate.data(), static_cast<int>(rows),
               static_cast<int>(w13.K_pad), static_cast<int>(w13.N_pad), static_cast<int>(w2.K_pad), silu_poly_degree,
-              w13.n_tile);
+              w13.n_tile, uses_clamped_swiglu(activation));
           trace_phase_end(tid, wave_idx, selected_team, local_tid, expert, rows, "w13_fused_silu_packc",
                           worker_phase_begin);
         } else {
@@ -7007,7 +7556,8 @@ at::Tensor run_fused_moe_bf16_tiled_async(
     c10::optional<at::Tensor> thread_cpu_ids, c10::optional<at::Tensor> w13_bias,
     c10::optional<at::Tensor> w2_bias, int64_t num_threads, std::string activation, int64_t global_num_experts,
     bool skip_weighted, bool fuse_silu, int64_t silu_poly_degree, int64_t gemm_backend, int64_t backend_n_tile,
-    c10::optional<at::Tensor> out, const AsyncPlanV2NativeArgs* plan_v2) {
+    c10::optional<at::Tensor> out, const AsyncPlanV2NativeArgs* plan_v2,
+    const W8A16RuntimeWeights* w8a16_weights) {
 #ifndef __aarch64__
   TORCH_CHECK(false, "fused_moe_bf16_tiled_async requires AArch64");
 #else
@@ -7050,8 +7600,20 @@ at::Tensor run_fused_moe_bf16_tiled_async(
   TORCH_CHECK(backend_n_tile == backend.n_tile(), "MoE backend_n_tile mismatch for ", backend.name,
               ": weights use ", backend_n_tile, ", runtime uses ", backend.n_tile());
 
-  PackedExperts w13 = checked_packed_experts(w13_packed, w13_K, w13_N, "w13_packed", backend_n_tile);
-  PackedExperts w2 = checked_packed_experts(w2_packed, w2_K, w2_N, "w2_packed", backend_n_tile);
+  const bool use_w8a16 = w8a16_weights != nullptr;
+  PackedExperts w13;
+  PackedExperts w2;
+  if (use_w8a16) {
+    TORCH_CHECK(use_sve_backend && fuse_silu, "W8A16 Plan V2 requires fused SVE execution");
+    w13 = checked_w8a16_experts(w13_packed, w8a16_weights->w13_scales, w13_K, w13_N, "w13_packed",
+                                backend_n_tile)
+              .packed;
+    w2 = checked_w8a16_experts(w2_packed, w8a16_weights->w2_scales, w2_K, w2_N, "w2_packed", backend_n_tile)
+             .packed;
+  } else {
+    w13 = checked_packed_experts(w13_packed, w13_K, w13_N, "w13_packed", backend_n_tile);
+    w2 = checked_packed_experts(w2_packed, w2_K, w2_N, "w2_packed", backend_n_tile);
+  }
   TORCH_CHECK(w13.E == w2.E, "w13 and w2 expert count mismatch");
   TORCH_CHECK(w13.K == input.size(1), "input hidden size mismatch: input H=", input.size(1), ", w13 K=", w13.K);
   TORCH_CHECK(w13.N % 2 == 0, "w13 N must be even, got ", w13.N);
@@ -7066,7 +7628,8 @@ at::Tensor run_fused_moe_bf16_tiled_async(
   const float* w2_bias_base = w2_bias_f32.defined() ? w2_bias_f32.data_ptr<float>() : nullptr;
 
   if (fuse_silu) {
-    TORCH_CHECK(activation == "silu", "fuse_silu only supports activation='silu', got ", activation);
+    TORCH_CHECK(is_fused_silu_activation(activation),
+                "fuse_silu only supports activation='silu' with an optional SVE JIT clamp, got ", activation);
     TORCH_CHECK(F % 8 == 0, "fuse_silu requires F % 8 == 0, got F=", F);
     TORCH_CHECK(w13.N_pad == 2 * F, "fuse_silu expects interleaved w13 with N_pad=2F (=", 2 * F,
                 "), got N_pad=", w13.N_pad);
@@ -7074,6 +7637,7 @@ at::Tensor run_fused_moe_bf16_tiled_async(
     TORCH_CHECK(w2_bias_base == nullptr, "async fuse_silu does not support w2_bias yet");
     TORCH_CHECK(silu_poly_degree == 4 || silu_poly_degree == 5 || silu_poly_degree == 6,
                 "silu_poly_degree must be 4, 5, or 6, got ", silu_poly_degree);
+    check_clamped_swiglu_jit(activation, use_sve_backend, static_cast<int>(w13.K_pad), silu_poly_degree);
   }
   const bool w13_overwrites_intermediate = use_sve_backend && fuse_silu;
   const bool use_w2_n_owner_scatter = use_sve_backend && fuse_silu;
@@ -7086,7 +7650,8 @@ at::Tensor run_fused_moe_bf16_tiled_async(
   bool use_w2_bf16_route = false;
 #if defined(FUSED_CPP_MOE_HAS_ARM_SVE)
   use_w2_bf16_route =
-      !skip_weighted && use_sve_backend && fuse_silu && w2_bias_base == nullptr && sve_w2_bf16_route_enabled();
+      !use_w8a16 && !skip_weighted && use_sve_backend && fuse_silu && w2_bias_base == nullptr &&
+      sve_w2_bf16_route_enabled();
 #endif
   if (num_tokens == 0) {
     return finalize_moe_output(prepare_moe_output(input, w13_packed, w2_packed, topk_weights, topk_ids, out), out);
@@ -7285,6 +7850,8 @@ at::Tensor run_fused_moe_bf16_tiled_async(
                         sve_w2_direct_route_offsets_fit(num_routes, H, w2.n_tile, route_element_bytes) &&
                         sve_w2_direct_route_enabled();
 #endif
+  TORCH_CHECK(!use_w8a16 || use_w2_direct_route,
+              "W8A16 Plan V2 requires the SVE direct-route W2 path");
   const int64_t early_merge_policy =
       has_plan_v2 ? plan_v2->early_merge : kAsyncEarlyMergeAuto;
   const bool ready_token_merge_enabled =
@@ -7769,8 +8336,12 @@ at::Tensor run_fused_moe_bf16_tiled_async(
     }
   }
   const uint16_t* input_ptr = bf16_data_const(input);
-  const uint16_t* w13_ptr = bf16_data_const(w13.tensor);
-  const uint16_t* w2_ptr = bf16_data_const(w2.tensor);
+  const uint16_t* w13_ptr = use_w8a16 ? nullptr : bf16_data_const(w13.tensor);
+  const uint16_t* w2_ptr = use_w8a16 ? nullptr : bf16_data_const(w2.tensor);
+  const int8_t* w13_qptr = use_w8a16 ? w13.tensor.data_ptr<int8_t>() : nullptr;
+  const int8_t* w2_qptr = use_w8a16 ? w2.tensor.data_ptr<int8_t>() : nullptr;
+  const float* w13_scale_ptr = use_w8a16 ? w8a16_weights->w13_scales.data_ptr<float>() : nullptr;
+  const float* w2_scale_ptr = use_w8a16 ? w8a16_weights->w2_scales.data_ptr<float>() : nullptr;
 
   phase_begin = trace_phase_begin();
   ScheduledScratchLease scratch_lease = resident_scheduled_scratch_pool().lease(scratch_unit_configs, w13, w2);
@@ -7983,11 +8554,32 @@ at::Tensor run_fused_moe_bf16_tiled_async(
       team.local_tid = local_tid;
       team.barrier = group_size > 1 ? &barrier : nullptr;
       team.a_reorder = nullptr;
-      team_fused_w13_silu_packed_packc_backend(
-          use_sve_backend, team, w13_window_tiles, scratch.packed_a.data(),
-          w13_ptr + expert * w13.packed_stride, scratch.intermediate.data(), static_cast<int>(rows),
-          static_cast<int>(w13.K_pad), static_cast<int>(w13.N_pad), static_cast<int>(w2.K_pad), silu_poly_degree,
-          w13.n_tile);
+      if (use_w8a16) {
+#if defined(FUSED_CPP_MOE_HAS_ARM_SVE)
+        const float* expert_scales = w13_scale_ptr + expert * 4 * w13.N_pad;
+        if (w8a16_weights->cache_dequant && rows > 12) {
+          team_w8a16_w13_packc_cache_sve(
+              team, w13_window_tiles, scratch.packed_a.data(), w13_qptr + expert * w13.packed_stride,
+              expert_scales, scratch.intermediate.data(), static_cast<int>(rows), static_cast<int>(w13.K_pad),
+              static_cast<int>(w13.N_pad), static_cast<int>(w2.K_pad), silu_poly_degree, w13.n_tile,
+              uses_clamped_swiglu(activation));
+        } else {
+          team_w8a16_w13_packc_sve(
+              team, w13_window_tiles, scratch.packed_a.data(), w13_qptr + expert * w13.packed_stride,
+              expert_scales, scratch.intermediate.data(), static_cast<int>(rows), static_cast<int>(w13.K_pad),
+              static_cast<int>(w13.N_pad), static_cast<int>(w2.K_pad), silu_poly_degree, w13.n_tile,
+              uses_clamped_swiglu(activation));
+        }
+#else
+        TORCH_CHECK(false, "W8A16 W13 requires SVE");
+#endif
+      } else {
+        team_fused_w13_silu_packed_packc_backend(
+            use_sve_backend, team, w13_window_tiles, scratch.packed_a.data(),
+            w13_ptr + expert * w13.packed_stride, scratch.intermediate.data(), static_cast<int>(rows),
+            static_cast<int>(w13.K_pad), static_cast<int>(w13.N_pad), static_cast<int>(w2.K_pad), silu_poly_degree,
+            w13.n_tile, uses_clamped_swiglu(activation));
+      }
       trace_phase_end(tid, task_id, local_tid, expert, rows, "w13_fused_silu_packc", worker_phase_begin);
     } else {
       trace_dispatch_fp32_gemm_stage_split(
@@ -8016,7 +8608,24 @@ at::Tensor run_fused_moe_bf16_tiled_async(
       w2team.barrier = nullptr;
       w2team.a_reorder = nullptr;
       if (use_w2_direct_route) {
-        if (use_w2_bf16_route) {
+        if (use_w8a16) {
+#if defined(FUSED_CPP_MOE_HAS_ARM_SVE)
+          const float* expert_scales = w2_scale_ptr + expert * 4 * w2.N_pad;
+          if (w8a16_weights->cache_dequant && rows > 12) {
+            team_w8a16_w2_direct_f32_cache_sve(
+                w2team, w2_window_tiles, scratch.intermediate.data(), w2_qptr + expert * w2.packed_stride,
+                expert_scales, route_out_ptr, task_routes, static_cast<int>(rows), static_cast<int>(w2.K_pad),
+                static_cast<int>(w2.N_pad), static_cast<int>(H), w2.n_tile);
+          } else {
+            team_w8a16_w2_direct_f32_sve(
+                w2team, w2_window_tiles, scratch.intermediate.data(), w2_qptr + expert * w2.packed_stride,
+                expert_scales, route_out_ptr, task_routes, static_cast<int>(rows), static_cast<int>(w2.K_pad),
+                static_cast<int>(w2.N_pad), static_cast<int>(H), w2.n_tile);
+          }
+#else
+          TORCH_CHECK(false, "W8A16 W2 requires SVE");
+#endif
+        } else if (use_w2_bf16_route) {
           team_w2_packed_sve_direct_bf16_route_backend(
               w2team, w2_window_tiles, scratch.intermediate.data(),
               w2_ptr + expert * w2.packed_stride, route_out_bf16_ptr, task_routes, static_cast<int>(rows),
@@ -8596,7 +9205,7 @@ at::Tensor fused_moe_bf16_tiled_async(at::Tensor input, at::Tensor w13_packed, i
       std::move(topk_weights), std::move(topk_ids), std::move(task_expert_ids), std::move(task_core_begins),
       std::move(task_threads), std::move(task_dep_offsets), std::move(task_deps), std::move(thread_cpu_ids),
       std::move(w13_bias), std::move(w2_bias), num_threads, std::move(activation), global_num_experts, skip_weighted,
-      fuse_silu, silu_poly_degree, gemm_backend, backend_n_tile, std::move(out), nullptr);
+      fuse_silu, silu_poly_degree, gemm_backend, backend_n_tile, std::move(out), nullptr, nullptr);
 }
 
 at::Tensor fused_moe_bf16_tiled_async_plan_v2(
@@ -8633,7 +9242,46 @@ at::Tensor fused_moe_bf16_tiled_async_plan_v2(
       std::move(topk_weights), std::move(topk_ids), std::move(task_expert_ids), std::move(task_core_begins),
       std::move(task_threads), std::move(task_dep_offsets), std::move(task_deps), std::move(thread_cpu_ids),
       std::move(w13_bias), std::move(w2_bias), num_threads, std::move(activation), global_num_experts, skip_weighted,
-      fuse_silu, silu_poly_degree, gemm_backend, backend_n_tile, std::move(out), &plan_v2);
+      fuse_silu, silu_poly_degree, gemm_backend, backend_n_tile, std::move(out), &plan_v2, nullptr);
+}
+
+at::Tensor fused_moe_w8a16_tiled_async_plan_v2(
+    at::Tensor input, at::Tensor w13_packed, int64_t w13_K, int64_t w13_N, at::Tensor w13_scales,
+    at::Tensor w2_packed, int64_t w2_K, int64_t w2_N, at::Tensor w2_scales, at::Tensor topk_weights,
+    at::Tensor topk_ids, at::Tensor task_expert_ids, at::Tensor task_core_begins, at::Tensor task_threads,
+    at::Tensor task_dep_offsets, at::Tensor task_deps, int64_t plan_version, int64_t execution_mode,
+    at::Tensor task_preferred_threads, at::Tensor task_min_threads, at::Tensor task_max_threads,
+    at::Tensor task_allowed_thread_offsets, at::Tensor task_allowed_threads, at::Tensor task_placement_modes,
+    at::Tensor task_numa_nodes, at::Tensor task_stage_ids, at::Tensor task_resize_points,
+    at::Tensor task_range_granularities, c10::optional<at::Tensor> task_w13_window_tiles,
+    c10::optional<at::Tensor> task_w2_window_tiles, c10::optional<at::Tensor> thread_cpu_ids, int64_t num_threads,
+    std::string activation, int64_t global_num_experts, bool skip_weighted, int64_t silu_poly_degree,
+    int64_t backend_n_tile, c10::optional<at::Tensor> out, int64_t early_merge, bool cache_dequant) {
+  const AsyncPlanV2NativeArgs plan_v2{
+      plan_version,
+      execution_mode,
+      std::move(task_preferred_threads),
+      std::move(task_min_threads),
+      std::move(task_max_threads),
+      std::move(task_allowed_thread_offsets),
+      std::move(task_allowed_threads),
+      std::move(task_placement_modes),
+      std::move(task_numa_nodes),
+      std::move(task_stage_ids),
+      std::move(task_resize_points),
+      std::move(task_range_granularities),
+      std::move(task_w13_window_tiles),
+      std::move(task_w2_window_tiles),
+      early_merge,
+  };
+  const W8A16RuntimeWeights w8a16_weights{std::move(w13_scales), std::move(w2_scales), cache_dequant};
+  return run_fused_moe_bf16_tiled_async(
+      std::move(input), std::move(w13_packed), w13_K, w13_N, std::move(w2_packed), w2_K, w2_N,
+      std::move(topk_weights), std::move(topk_ids), std::move(task_expert_ids), std::move(task_core_begins),
+      std::move(task_threads), std::move(task_dep_offsets), std::move(task_deps), std::move(thread_cpu_ids),
+      c10::nullopt, c10::nullopt, num_threads, std::move(activation), global_num_experts, skip_weighted,
+      /*fuse_silu=*/true, silu_poly_degree, static_cast<int64_t>(::fused_cpp::moe::BackendId::kArmSveBf16),
+      backend_n_tile, std::move(out), &plan_v2, &w8a16_weights);
 }
 
 namespace {
@@ -9174,7 +9822,7 @@ at::Tensor fused_moe_bf16_tiled_planned_staged(
                               true, team, /*window_tiles=*/0, scratch.packed_a.data(),
                               w13_ptr + expert * w13.packed_stride, expert_intermediate, static_cast<int>(rows),
                               static_cast<int>(w13.K_pad), static_cast<int>(w13.N_pad),
-                              static_cast<int>(w2.K_pad), silu_poly_degree, w13.n_tile);
+                              static_cast<int>(w2.K_pad), silu_poly_degree, w13.n_tile, false);
                         });
   const double w13_ms = ::fused_cpp::profile::elapsed_ms(w13_begin);
 
@@ -9411,7 +10059,7 @@ at::Tensor fused_moe_bf16_tiled_vllm_staged(
         vllm_staged_w13_range_sve(
             scratch.packed_a.data(), expert_w13, expert_intermediate + row_begin * w2.K_pad,
             static_cast<int>(panel_rows), static_cast<int>(w13.K_pad), static_cast<int>(w2.K_pad),
-            silu_poly_degree, w13.n_tile, task.n_begin, task.n_cols);
+            silu_poly_degree, w13.n_tile, task.n_begin, task.n_cols, false);
       }
     }
   });
@@ -9467,6 +10115,156 @@ at::Tensor fused_moe_bf16_tiled_vllm_staged(
                  static_cast<long long>(num_routes), static_cast<long long>(vllm_staged_available_l2_bytes()),
                  static_cast<long long>(w13_task_n), w13_tasks.size(), static_cast<long long>(w2_task_n),
                  w2_tasks.size(), route_build_ms, w13_ms, w2_ms, merge_ms,
+                 ::fused_cpp::profile::elapsed_ms(call_begin));
+  }
+  return finalize_moe_output(output, out);
+#endif
+}
+
+at::Tensor shared_mlp_bf16_tiled(
+    at::Tensor input, at::Tensor w13_packed, int64_t w13_K, int64_t w13_N, at::Tensor w2_packed, int64_t w2_K,
+    int64_t w2_N, c10::optional<at::Tensor> thread_cpu_ids, int64_t num_threads, bool fuse_silu,
+    int64_t silu_poly_degree, int64_t gemm_backend, int64_t backend_n_tile, c10::optional<at::Tensor> out,
+    bool clamp_swiglu) {
+#ifndef __aarch64__
+  TORCH_CHECK(false, "shared_mlp_bf16_tiled requires AArch64");
+#else
+  const auto call_begin = ::fused_cpp::profile::now();
+  check_bf16_cpu(input, "input");
+  TORCH_CHECK(input.dim() == 2, "input must be 2-D [tokens, hidden]");
+  TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
+  TORCH_CHECK(num_threads > 0 && num_threads <= std::numeric_limits<int>::max(),
+              "num_threads must be in [1, INT_MAX], got ", num_threads);
+  TORCH_CHECK(input.size(0) <= std::numeric_limits<int>::max() && input.size(1) <= std::numeric_limits<int>::max(),
+              "shared MLP dimensions must fit int32 kernels");
+
+  const ::fused_cpp::moe::MoeBackend& backend = ::fused_cpp::moe::backend_from_id(gemm_backend);
+  TORCH_CHECK(backend.id == ::fused_cpp::moe::BackendId::kArmSveBf16,
+              "shared MLP requires the SVE BF16 backend, got ", backend.name);
+  check_clamped_swiglu_jit(clamp_swiglu ? "silu_clamp10" : "silu", true, static_cast<int>(w13_K),
+                           silu_poly_degree);
+  TORCH_CHECK(backend_n_tile == backend.n_tile(), "MoE backend_n_tile mismatch for ", backend.name,
+              ": weights use ", backend_n_tile, ", runtime uses ", backend.n_tile());
+  TORCH_CHECK(fuse_silu, "shared MLP requires weights prepared with fuse_silu=True");
+  TORCH_CHECK(silu_poly_degree == 4 || silu_poly_degree == 5 || silu_poly_degree == 6,
+              "silu_poly_degree must be 4, 5, or 6, got ", silu_poly_degree);
+
+  PackedExperts w13 = checked_packed_experts(w13_packed, w13_K, w13_N, "w13_packed", backend_n_tile);
+  PackedExperts w2 = checked_packed_experts(w2_packed, w2_K, w2_N, "w2_packed", backend_n_tile);
+  TORCH_CHECK(w13.E == 1 && w2.E == 1, "shared MLP requires exactly one packed expert");
+  TORCH_CHECK(w13.K == input.size(1), "input hidden size mismatch: input H=", input.size(1), ", w13 K=", w13.K);
+  TORCH_CHECK(w13.N % 2 == 0, "w13 N must be even, got ", w13.N);
+  const int64_t M = input.size(0);
+  const int64_t F = w13.N / 2;
+  const int64_t H = input.size(1);
+  TORCH_CHECK(F % kKernelTile == 0, "shared MLP fused SiLU requires F to be a multiple of ", kKernelTile,
+              ", got ", F);
+  TORCH_CHECK(w13.N_pad == 2 * F, "shared MLP requires interleaved W13 with N_pad=2F, got ", w13.N_pad,
+              " vs ", 2 * F);
+  TORCH_CHECK(w2.K == F && w2.N == H, "w2 shape mismatch: expected K=", F, " N=", H, ", got K=", w2.K,
+              " N=", w2.N);
+  TORCH_CHECK(w2.K_pad == F, "shared MLP requires unpadded W2 K, got K_pad=", w2.K_pad, " F=", F);
+  TORCH_CHECK(w2.N_pad == H, "shared MLP direct store requires H to be N-tile aligned: H=", H,
+              " N_pad=", w2.N_pad);
+
+  ThreadPinningConfig pinning;
+  bool has_thread_pinning = false;
+  if (thread_cpu_ids.has_value() && thread_cpu_ids->defined() && thread_cpu_ids->numel() > 0) {
+    pinning.cpus = tensor_to_i64_vector(*thread_cpu_ids, "thread_cpu_ids");
+    TORCH_CHECK(static_cast<int64_t>(pinning.cpus.size()) == num_threads,
+                "thread_cpu_ids must have exactly num_threads entries: got ", pinning.cpus.size(), " vs ",
+                num_threads);
+    for (size_t idx = 0; idx < pinning.cpus.size(); ++idx) {
+      TORCH_CHECK(pinning.cpus[idx] >= 0, "thread_cpu_ids[", idx, "] must be non-negative, got ",
+                  pinning.cpus[idx]);
+    }
+    pinning.enabled = true;
+    has_thread_pinning = true;
+  }
+
+  at::Tensor output = prepare_shared_mlp_output(input, w13_packed, w2_packed, out);
+  if (M == 0) {
+    return finalize_moe_output(output, out);
+  }
+  TORCH_CHECK(sve_w2_direct_route_offsets_fit(M, H, w2.n_tile, static_cast<int64_t>(sizeof(uint16_t))),
+              "shared MLP direct-store offsets exceed the SVE kernel's int32 byte range");
+
+  ThreadPinningScope pinning_scope(has_thread_pinning ? &pinning : nullptr);
+  prepare_moe_threads_for_operator(num_threads);
+
+  const int64_t packed_rows = sve_hybrid_packed_rows(M);
+  TORCH_CHECK(packed_rows <= std::numeric_limits<int64_t>::max() / H,
+              "shared MLP packed input size overflows int64");
+  TORCH_CHECK(packed_rows <= std::numeric_limits<int64_t>::max() / F,
+              "shared MLP intermediate size overflows int64");
+  at::Tensor packed_input = at::empty({packed_rows * H}, input.options());
+  at::Tensor intermediate = at::empty({packed_rows * F}, input.options());
+  std::vector<int64_t> routes(static_cast<size_t>(M));
+  std::iota(routes.begin(), routes.end(), int64_t{0});
+
+  const uint16_t* input_ptr = bf16_data_const(input);
+  uint16_t* packed_input_ptr = bf16_data(packed_input);
+  uint16_t* intermediate_ptr = bf16_data(intermediate);
+  uint16_t* output_ptr = bf16_data(output);
+  const uint16_t* w13_ptr = bf16_data_const(w13.tensor);
+  const uint16_t* w2_ptr = bf16_data_const(w2.tensor);
+
+  const auto pack_begin = ::fused_cpp::profile::now();
+  run_fixed_threads(num_threads, [&](int64_t tid) {
+    gather_pack_a_reorder_sve_hybrid(input_ptr, H, routes.data(), 1, packed_input_ptr, static_cast<int>(M),
+                                     static_cast<int>(H), num_threads, tid);
+  });
+  const double pack_ms = ::fused_cpp::profile::elapsed_ms(pack_begin);
+
+  const int64_t w13_task_n = shared_mlp_task_n(MoeGemmStage::kW13, M, w13.K_pad, w13.N_pad, w13.n_tile);
+  const int64_t w2_task_n = shared_mlp_task_n(MoeGemmStage::kW2, M, w2.K_pad, w2.N_pad, w2.n_tile);
+  const std::vector<SharedMlpTask> w13_tasks =
+      build_shared_mlp_tasks(M, w13.N_pad, w13_task_n, w13.n_tile, num_threads);
+  const std::vector<SharedMlpTask> w2_tasks =
+      build_shared_mlp_tasks(M, w2.N_pad, w2_task_n, w2.n_tile, num_threads);
+
+  alignas(64) std::atomic<int64_t> next_w13_task{0};
+  const auto w13_begin = ::fused_cpp::profile::now();
+  run_fixed_threads(num_threads, [&](int64_t) {
+    while (true) {
+      const int64_t task_id = next_w13_task.fetch_add(1, std::memory_order_relaxed);
+      if (task_id >= static_cast<int64_t>(w13_tasks.size())) {
+        break;
+      }
+      const SharedMlpTask& task = w13_tasks[static_cast<size_t>(task_id)];
+      vllm_staged_w13_range_sve(
+          packed_input_ptr + task.m_begin * H, w13_ptr, intermediate_ptr + task.m_begin * F,
+          static_cast<int>(task.m_rows), static_cast<int>(H), static_cast<int>(F), silu_poly_degree, w13.n_tile,
+          task.n_begin, task.n_cols, clamp_swiglu);
+    }
+  });
+  const double w13_ms = ::fused_cpp::profile::elapsed_ms(w13_begin);
+
+  alignas(64) std::atomic<int64_t> next_w2_task{0};
+  const auto w2_begin = ::fused_cpp::profile::now();
+  run_fixed_threads(num_threads, [&](int64_t) {
+    while (true) {
+      const int64_t task_id = next_w2_task.fetch_add(1, std::memory_order_relaxed);
+      if (task_id >= static_cast<int64_t>(w2_tasks.size())) {
+        break;
+      }
+      const SharedMlpTask& task = w2_tasks[static_cast<size_t>(task_id)];
+      vllm_staged_w2_direct_bf16_route_range_sve(
+          intermediate_ptr + task.m_begin * F, w2_ptr, output_ptr, routes.data() + task.m_begin,
+          static_cast<int>(task.m_rows), static_cast<int>(F), static_cast<int>(H), w2.n_tile, task.n_begin,
+          task.n_cols);
+    }
+  });
+  const double w2_ms = ::fused_cpp::profile::elapsed_ms(w2_begin);
+
+  if (env_flag_enabled("FUSED_CPP_MOE_STAGE_TIMING")) {
+    std::fprintf(stderr,
+                 "[shared_mlp_bf16_tiled][stage_timing] threads=%lld rows=%lld available_l2_bytes=%lld "
+                 "w13_task_n=%lld w13_tasks=%zu w2_task_n=%lld w2_tasks=%zu pack_ms=%.3f w13_ms=%.3f "
+                 "w2_ms=%.3f e2e_ms=%.3f\n",
+                 static_cast<long long>(num_threads), static_cast<long long>(M),
+                 static_cast<long long>(vllm_staged_available_l2_bytes()), static_cast<long long>(w13_task_n),
+                 w13_tasks.size(), static_cast<long long>(w2_task_n), w2_tasks.size(), pack_ms, w13_ms, w2_ms,
                  ::fused_cpp::profile::elapsed_ms(call_begin));
   }
   return finalize_moe_output(output, out);

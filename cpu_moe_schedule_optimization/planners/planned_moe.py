@@ -132,9 +132,12 @@ class PlannedMoE:
         tail_repartition_tasks: int,
         tail_repartition_route_slices: int,
         topk_ids=None,
+        shared_expert_id: int | None = None,
     ):
         planner = self.interval_planners[planner_index]
-        if self.search_mode == "quick" and len(set(shape)) == 1:
+        if self.search_mode == "quick" and shared_expert_id is not None:
+            tasks = planner.quick_tasks_for_shared_shape(counts, shape, shared_expert_id)
+        elif self.search_mode == "quick" and len(set(shape)) == 1:
             tasks = planner.quick_tasks_for_shape(counts, shape)
         else:
             lanes = planner._lanes(shape)
@@ -190,6 +193,13 @@ class PlannedMoE:
             ),
             "tasks": tasks,
             "bridge": bridge,
+            "shared_expert_id": shared_expert_id,
+            "shared_width": shape[0] if shared_expert_id is not None else None,
+            "routed_width": (
+                shape[1] if shared_expert_id is not None and len(shape) > 1 else shape[0]
+                if shared_expert_id is not None
+                else None
+            ),
         }
 
     def plan_spec_for(
@@ -201,15 +211,31 @@ class PlannedMoE:
         tail_pool_threads: int | None = None,
         tail_pool_max_routes: int = 12,
         bounded_tail_repartition: bool | None = None,
+        shared_expert_id: int | None = None,
     ) -> Dict[str, object]:
         begin = time.perf_counter_ns()
         counts = [(int(expert), int(routes)) for expert, routes in counts if int(routes) > 0]
         if bounded_tail_repartition is None:
             bounded_tail_repartition = dynamic_tail_pool and tail_pool_threads is None
-        requested_mode = "forced" if tail_pool_threads is not None else ("auto" if dynamic_tail_pool else "strict")
+        if shared_expert_id is not None:
+            if self.search_mode != "quick":
+                raise ValueError("synthetic shared expert planning currently requires quick search")
+            if tail_pool_threads is not None:
+                raise ValueError("synthetic shared expert planning does not support a forced tail pool")
+            dynamic_tail_pool = False
+            bounded_tail_repartition = False
+        requested_mode = (
+            "shared"
+            if shared_expert_id is not None
+            else "forced"
+            if tail_pool_threads is not None
+            else "auto"
+            if dynamic_tail_pool
+            else "strict"
+        )
         tail_pool_cache_signature = (
             _tail_pool_signature(counts, tail_pool_max_routes)
-            if requested_mode != "strict"
+            if requested_mode in {"auto", "forced"}
             else ()
         )
         cache_key = (
@@ -219,6 +245,7 @@ class PlannedMoE:
             tail_pool_max_routes if requested_mode != "strict" else None,
             tail_pool_cache_signature,
             bounded_tail_repartition,
+            shared_expert_id,
         )
         after_signature = time.perf_counter_ns()
         cached = self.shape_cache.get(cache_key)
@@ -248,7 +275,8 @@ class PlannedMoE:
                     selected_tail_width,
                     selected_tail_tasks,
                     selected_tail_route_slices,
-                    topk_ids,
+                    topk_ids=topk_ids,
+                    shared_expert_id=shared_expert_id,
                 )
                 after_search = time.perf_counter_ns()
             except (KeyError, ValueError):
@@ -258,7 +286,14 @@ class PlannedMoE:
             if self.search_mode == "quick":
                 if tail_pool_threads is not None:
                     raise ValueError("quick search does not support a forced tail pool")
-                result = self.interval_planners[0].plan_quick(counts, topk_ids=topk_ids)
+                if shared_expert_id is None:
+                    result = self.interval_planners[0].plan_quick(counts, topk_ids=topk_ids)
+                else:
+                    result = self.interval_planners[0].plan_quick_with_shared(
+                        counts,
+                        shared_expert_id=shared_expert_id,
+                        topk_ids=topk_ids,
+                    )
             else:
                 result = self.interval_planners[0].plan(
                     counts,
@@ -309,6 +344,9 @@ class PlannedMoE:
             "tail_repartition_candidates": result.get("tail_repartition_candidates", 0),
             "early_merge": bridge.get("early_merge"),
             "routing_aware_early_merge": False,
+            "shared_expert_id": result.get("shared_expert_id"),
+            "shared_width": result.get("shared_width"),
+            "routed_width": result.get("routed_width"),
         }
         return {
             "plan_version": bridge["plan_version"],
@@ -323,6 +361,9 @@ class PlannedMoE:
             "tail_repartition_tasks": result.get("tail_repartition_tasks", 0),
             "tail_repartition_route_slices": result.get("tail_repartition_route_slices", 1),
             "policy": result.get("policy"),
+            "shared_expert_id": result.get("shared_expert_id"),
+            "shared_width": result.get("shared_width"),
+            "routed_width": result.get("routed_width"),
         }
 
     def plan_for(

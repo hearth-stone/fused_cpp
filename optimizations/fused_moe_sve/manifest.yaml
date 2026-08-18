@@ -7,6 +7,53 @@ baseline:
   status: reference
 
 features:
+  - id: weights.w8a16_per_channel_range_dequant
+    part: weights
+    status: experimental
+    implementation: >-
+      csrc/moe/arm/common/fused_moe_bf16_tiled.cpp and
+      src/fused_cpp/moe/bf16_tiled.py
+    hypothesis: >-
+      Halving packed expert weight bytes can improve routed-MoE E2E when the
+      saved shared-cache and DRAM traffic exceeds INT8-to-BF16 conversion
+      cost. For reused B, converting one searched stage window into BF16 cache
+      scratch once should avoid paying that conversion in every M panel.
+    depends_on:
+      - compute.xbyak_exact_m
+    conflicts_with: []
+    correctness: >-
+      tests/test_moe_w8a16.py, tests/test_moe_planner_runtime.py, and the paired
+      W8A16 Plan V2 benchmark compare against packed BF16 execution and verify
+      the optional high-level planner dispatch.
+    benchmark: >-
+      AmazonM5192Cores NUMA0, 2048 tokens, TopK6, limit-10 SwiGLU,
+      5 warmups and 21 alternating runs with FP32 route storage: V4-Pro TP4
+      H7168/F768/E384 and V4-Flash TP2 H4096/F1024/E256.
+    owner: zhangxu
+    opened: 2026-08-17
+    decision_by: 2026-09-16
+    next_decision: >-
+      Add model-level quality validation and teach the cost model to select
+      W8A16 only for cold-weight/high-concurrency domains where it beats BF16.
+    adoption_gate: >-
+      At least 5 percent V4-Pro TP4 E2E improvement, no tested-shape
+      regression above 1 percent, and model-quality validation.
+    result: >-
+      The register-dequantized JIT reduced V4-Pro TP4 from 101.540 to
+      51.555 ms (1.970x) with 50.21 percent packed bytes and 1.52 percent
+      relative L2 error. V4-Flash TP2 improved from 56.565 to 34.804 ms
+      (1.625x) for balanced M48, but the captured seq70/layer27 long tail
+      regressed from 29.135 to 36.013 ms because its 6x16T plan reuses B across
+      routes up to M918. Experimental cache dequantization removes that repeated
+      conversion: on the captured workload, searched 512 KiB/thread W13 and
+      256 KiB/thread W2 windows measured 27.378 ms BF16 versus 20.565 ms W8A16
+      cache (1.331x at the same window). Uniform M48 requires a nonzero window:
+      full-stripe cache dequantization took 60.379 ms, while searched windows
+      reduced it to about 18.1 ms. M<=12 automatically retains register
+      dequantization. The model-quality gate and automatic per-machine window
+      selection remain open. Keep experimental and out of default dispatch. See
+      results/amazon_m5_96c_w8a16_plan_v2_20260817.md.
+
   - id: epilogue.indexed_polynomial_evaluation
     part: epilogue
     status: experimental
@@ -47,6 +94,89 @@ features:
       clamped SiLU; Estrin regressed complete SiLU by 4.48/4.47 percent. The
       single-core control had the same ordering. See
       results/amazon_m5_92c_sve_exp_evaluators_20260817.md.
+
+  - id: epilogue.deepseek_v4_clamped_swiglu
+    part: epilogue
+    status: enabled
+    implementation: >-
+      csrc/moe/arm/sve_bf16/jit_kernels.cpp and
+      src/fused_cpp/moe/bf16_tiled.py
+    hypothesis: >-
+      Applying DeepSeek-V4's limit-10 gate/up clamp in the resident fused W13
+      epilogue preserves packing and GEMM throughput while closing the model's
+      activation semantics without intermediate memory traffic.
+    depends_on:
+      - compute.xbyak_exact_m
+    conflicts_with: []
+    correctness: >-
+      optimizations/fused_moe_sve/benchmarks/bench_clamped_swiglu.py validates
+      M1-12, standard-path identity, shared/combined propagation, and asm rejection.
+    benchmark: >-
+      AmazonM5192Cores NUMA0, H7168/F768, M12/1T and M2040/16T,
+      8/5 warmups and 51/31 runs.
+    result: >-
+      Enabled on 2026-08-17. Pure W13 overhead was -0.00 percent at M12 and
+      +0.12 percent at M2040; complete expert overhead was +0.16/-0.06 percent.
+      See results/amazon_m5_192c_clamped_swiglu_20260817.md.
+
+  - id: dispatch.synthetic_shared_plan_v2
+    part: dispatch
+    status: enabled
+    implementation: >-
+      src/fused_cpp/moe/bf16_tiled.py and
+      cpu_moe_schedule_optimization/planners/interval_planner.py and
+      csrc/moe_planner/interval_planner.cpp
+    hypothesis: >-
+      Representing one same-shape shared expert as an all-token unit-weight
+      synthetic expert allows Plan V2 to overlap it with routed experts and
+      reuse its lane after completion, removing most standalone shared latency
+      without changing the fused expert kernel or Plan V2 schema.
+    depends_on:
+      - dispatch.shared_mlp_nm_task_pool
+    conflicts_with: []
+    correctness: >-
+      PYTHONPATH=src .venv/bin/python -m pytest -q
+      tests/test_moe_cost_model_v2.py tests/test_moe_planner_runtime.py
+      tests/test_shared_mlp_bf16_tiled.py
+    benchmark: >-
+      M5 NUMA0 DeepSeek-V4-Pro TP4 H7168 F768 E384 TopK6, explicit quick
+      calibration, 3 warmups and 21 alternating paired runs.
+    result: >-
+      Enabled on 2026-08-17. On AmazonM5192Cores NUMA0 with the V4-Pro TP4
+      BF16 shape with swiglu_limit=10, balanced/uniform/hotspot improved by
+      16.99/20.98/78.59 percent. Maximum cold and cache-hit planner time was
+      23.607/1.118 ms, and maximum absolute output difference versus sequential
+      execution was 5.96e-8. See
+      results/amazon_m5_192c_routed_shared_schedule_20260817.md.
+
+  - id: dispatch.shared_mlp_nm_task_pool
+    part: dispatch
+    status: enabled
+    implementation: csrc/moe/arm/common/fused_moe_bf16_tiled.cpp
+    hypothesis: >-
+      A standalone E=1 shared MLP can reuse the fused expert W13 and direct-BF16
+      W2 kernels while avoiding route construction and weighted merge. Choosing
+      cache-sized N windows from the complete input row count and then splitting
+      each window into M12-aligned row tasks should expose enough independent
+      work for all requested cores without changing the packed weight layout or
+      kernel arithmetic.
+    depends_on:
+      - store.w2_direct_bf16_route
+    conflicts_with: []
+    correctness: >-
+      PYTHONPATH=src FUSED_CPP_MOE_SVE=1 .venv/bin/python -m pytest -q
+      tests/test_shared_mlp_bf16_tiled.py
+    benchmark: >-
+      numactl --physcpubind=0-191 --interleave=0,1 .venv/bin/python
+      optimizations/fused_moe_sve/benchmarks/bench_shared_mlp.py
+      --rows 2048 --hidden 7168 --intermediate 2048 --threads 192
+      --warmup 3 --runs 11
+    result: >-
+      Enabled on 2026-08-16 after bitwise comparison against the existing E=1
+      path. On AmazonM5192Cores at M=2048, H=7168, F=2048, BF16, 192 threads,
+      NUMA-interleaved ordinary pages, the paired alternating-run median was
+      24.230 ms versus 1309.744 ms for the general E=1 fused-MoE entrypoint.
+      See results/amazon_m5_192c_shared_mlp_20260816.md.
 
   - id: weights.hugetlbfs_backing
     part: weights

@@ -1,478 +1,451 @@
-# vLLM BF16 Tiled MoE Integration Guide
+# vLLM CPU BF16 MoE Integration Guide
 
-This document describes how to integrate the `fused_cpp` BF16 tiled fused MoE
-CPU kernel into a vLLM-style MoE path.
+This document describes the supported Python integration for the `fused_cpp`
+CPU BF16 fused MoE operator. The recommended production path is the ARM SVE
+fused-SiLU backend with an explicitly calibrated Plan V2 runtime.
 
-The intended use case is an AArch64 CPU backend with BF16 matrix instructions.
-Weights are packed once when the vLLM MoE layer is initialized, then reused by
-decode or prefill forward calls.
+The integration has three lifecycle phases:
 
-## Kernel Scope
+1. calibrate the machine or load an existing calibration profile;
+2. pack each MoE layer's weights once;
+3. call `fused_moe_tiled()` with BF16 or explicitly prepared W8A16 weights.
 
-The public Python API is in `src/fused_cpp/moe/bf16_tiled.py`:
+Calibration never runs at package import time or on the first MoE request.
+
+## Supported Scope
+
+The public APIs used by an integration are exported from both `fused_cpp.moe`
+and `fused_cpp`:
 
 ```python
 from fused_cpp.moe import (
-    _HAS_BF16_TILED_FUSED_MOE,
+    MoePlannerRuntime,
     available_fused_moe_bf16_tiled_backends,
+    enable_moe_planner_quick,
     fused_moe_bf16_tiled,
+    fused_moe_bf16_tiled_with_shared,
+    fused_moe_tiled,
+    get_default_moe_planner_runtime,
     prepare_fused_moe_bf16_tiled_weights,
+    prepare_fused_moe_w8a16_tiled_weights,
+    prepare_routed_shared_moe_bf16_tiled_weights,
+    set_default_moe_planner_runtime,
 )
 ```
 
-Supported tensors:
+The calibrated production runtime currently supports:
 
-| Tensor | Shape | Dtype | Device | Notes |
-| --- | --- | --- | --- | --- |
-| `hidden_states` | `[num_tokens, hidden_size]` | `torch.bfloat16` | CPU | Contiguous input activations |
-| `w13_weight` | `[num_experts, 2 * ffn_hidden_size, hidden_size]` | `torch.bfloat16` | CPU | Gate/up projection, vLLM layout |
-| `w2_weight` | `[num_experts, hidden_size, ffn_hidden_size]` | `torch.bfloat16` | CPU | Down projection, vLLM layout |
-| `topk_weights` | `[num_tokens, top_k]` | floating | CPU | Routing weights |
-| `topk_ids` | `[num_tokens, top_k]` | integer | CPU | Local expert ids |
-| `w13_bias` | `[num_experts, 2 * ffn_hidden_size]` | `float32` or `bfloat16` | CPU | Optional |
-| `w2_bias` | `[num_experts, hidden_size]` | `float32` or `bfloat16` | CPU | Optional |
+- Linux AArch64 with the `arm_sve_bf16` backend;
+- BF16 weights packed with `fuse_silu=True`;
+- `activation="silu"`;
+- standalone and tensor-parallel execution;
+- one process-local runtime bound to a fixed CPU set and expert shape.
 
-The output is `[num_tokens, hidden_size]` in `torch.bfloat16`.
+Expert-parallel execution is not yet owned by `MoePlannerRuntime`. Calls that
+do not satisfy the runtime domain use the existing native dispatcher instead.
+The normal operator remains usable on other advertised backends without the
+calibrated runtime.
 
-Supported activations:
+Per-channel W8A16 is an optional experimental ARM SVE implementation. It is
+selected only by passing `PreparedW8A16TiledFusedMoEWeights` to
+`fused_moe_tiled()`. It requires a compatible installed planner, supports no
+W13/W2 bias, and has no native unplanned fallback. BF16 remains the default and
+supported fallback for integrations that do not explicitly prepare W8A16.
 
-```text
-silu
-gelu
-swigluoai
+Check backend availability before creating the optimized layer:
+
+```python
+backends = available_fused_moe_bf16_tiled_backends()
+if "arm_sve_bf16" not in backends:
+    # Keep the framework's existing CPU MoE implementation.
+    ...
 ```
 
-`skip_weighted=True` is only valid when `top_k == 1`.
+## Tensor Contract
 
-## Build Requirements
+Let `T` be the token count, `K` the router TopK, `E` the number of locally
+packed experts, `H` the hidden size, and `F` the rank-local intermediate size.
 
-The MoE code is built as the independent `fused_cpp._moe_C` extension. On
-Linux AArch64, one binary contains a NEON/BFMMLA baseline and independently
-compiled SVE/SVEBF16 objects; runtime HWCAP selection does not change the ISA
-target used by the main `fused_cpp._C` extension. Both ARM backends use
-`refs/i8gemm/lib` packing contracts.
+| Value | Shape | Dtype | Device | Notes |
+| --- | --- | --- | --- | --- |
+| `input` | `[T, H]` | `torch.bfloat16` | CPU | Hidden states |
+| `w13_weight` | `[E, 2 * F, H]` | `torch.bfloat16` | CPU | vLLM gate/up layout |
+| `w2_weight` | `[E, H, F]` | `torch.bfloat16` | CPU | vLLM down layout |
+| `topk_weights` | `[T, K]` | floating | CPU | Router weights |
+| `topk_ids` | `[T, K]` | integer | CPU | Indices into the packed local expert array |
+| result | `[T, H]` | `torch.bfloat16` | CPU | Weighted routed output |
 
-The default SVE compute path additionally uses the pinned
-`3rdparty/xbyak_aarch64` submodule. From a fresh checkout, initialize it before
-building:
+Optional biases use `[E, 2 * F]` for W13 and `[E, H]` for W2. A supplied
+`out=` tensor must be contiguous CPU BF16 storage with the same shape as
+`input`, must not require gradients, and must not alias any input or packed
+weight tensor.
+
+`skip_weighted=True` is valid only for `K == 1`. The default weighted path
+supports larger TopK values and performs the route accumulation in FP32 after
+loading the BF16 route results.
+
+## Build And Startup Check
+
+Initialize the SVE JIT dependency and build the extension:
 
 ```bash
 git submodule update --init --recursive 3rdparty/xbyak_aarch64
-```
-
-Build:
-
-```bash
 python setup.py build_ext --inplace
 ```
 
-Basic validation:
+At service startup, fail over to the framework implementation if the required
+backend is unavailable. Do not attempt to recover an SVE vector-length mismatch
+inside the request path: generated kernels and packed weights are tied to the
+build/runtime SVE vector-length contract.
 
-```bash
-python -m pytest -q tests/test_fused_moe_bf16_tiled.py -m 'not slow'
-```
+## Quick Calibration
 
-The backend is available only when:
+Run quick calibration once for each machine type, CPU placement, and planner
+width domain. It is synchronous and should run during deployment setup or
+service initialization, before accepting requests.
 
 ```python
-_HAS_BF16_TILED_FUSED_MOE is True
+from fused_cpp.moe import enable_moe_planner_quick
+
+runtime = enable_moe_planner_quick(
+    cpu_ids=tuple(range(96)),
+    output="/var/cache/fused_cpp/moe-numa0.json",
+    hidden_size=4096,
+    intermediate_size=512,
+    global_experts=256,
+    local_experts=256,
+    mode="tp",
+    degree=4,
+    concurrent_ranks=1,
+    report=print,
+)
 ```
 
-The exact runtime choices are queryable with
-`available_fused_moe_bf16_tiled_backends()`. The current names are
-`arm_neon_bf16` and `arm_sve_bf16`; NEON still requires BF16/BFMMLA. Setting
-`FUSED_CPP_MOE_SVE=0` removes SVE from automatic selection.
+This call measures the machine, writes the calibration profile, creates a
+shape-bound `MoePlannerRuntime`, and installs it as the process default only
+after calibration and runtime construction both succeed.
 
-Within the SVE backend, `FUSED_CPP_MOE_SVE_IMPL=auto` is the default. It uses
-Xbyak-generated W13, W2 FP32, and W2 FP32 direct-route kernels specialized for
-each logical M=1..12. Code generation is completed while weights are prepared,
-so the first forward call does not pay generation cost. Use
-`FUSED_CPP_MOE_SVE_IMPL=asm` to force the static assembly reference, or `jit`
-to require generation for the generated W13/FP32-W2 surfaces and raise if one
-of those requires fallback. `auto` falls back to static assembly for
-identity/reciprocal/minimax SiLU or a build made without the initialized
-submodule. Explicitly selected static-only operators such as BF16 route storage
-remain on assembly in either mode. Packed weight objects and backend IDs are
-identical between the JIT and assembly paths.
+Important calibration rules:
 
-vLLM should keep a fallback path for non-AArch64 hosts, missing extension builds,
-unsupported dtype/device combinations, and unsupported activations.
+- `cpu_ids` is an ordered list and becomes part of the profile contract.
+- The inference call must use exactly `len(cpu_ids)` threads.
+- Reserve the same CPUs for the rank at runtime; Plan V2 places workers on
+  those CPU IDs.
+- `output` is not overwritten unless `overwrite=True` is explicitly passed.
+- `supported_widths` may restrict planner-legal team widths; omit it to use
+  the topology-derived quick defaults.
+- `degree` is the TP degree for `mode="tp"`; it is not the worker count.
+- `concurrent_ranks` describes ranks concurrently sharing the calibrated
+  machine resources.
+
+Do not run quick calibration independently in several concurrent ranks on the
+same CPU or memory domain. Calibrate each placement without competing service
+load, then persist and reuse the result.
+
+## Loading A Saved Calibration
+
+Normal process restarts should load the saved profile rather than recalibrate:
+
+```python
+from fused_cpp.moe import MoePlannerRuntime, set_default_moe_planner_runtime
+
+runtime = MoePlannerRuntime(
+    "/var/cache/fused_cpp/moe-numa0.json",
+    hidden_size=4096,
+    intermediate_size=512,
+    global_experts=256,
+    local_experts=256,
+    mode="tp",
+    degree=4,
+    concurrent_ranks=1,
+    cpu_ids=tuple(range(96)),
+)
+previous_runtime = set_default_moe_planner_runtime(runtime)
+```
+
+The registry is process-global and thread-safe. Save `previous_runtime` when a
+test or temporary component needs to restore the prior process state:
+
+```python
+try:
+    set_default_moe_planner_runtime(runtime)
+    ...
+finally:
+    set_default_moe_planner_runtime(previous_runtime)
+```
+
+Passing `None` disables calibrated planning and restores the established native
+dispatcher:
+
+```python
+set_default_moe_planner_runtime(None)
+```
 
 ## Weight Preparation
 
-Pack weights once during MoE layer initialization or after weights are loaded.
-Do not pack inside every forward call.
+Pack weights once after model weights are loaded, not in `forward()`:
 
 ```python
-packed = prepare_fused_moe_bf16_tiled_weights(
+from fused_cpp.moe import prepare_fused_moe_bf16_tiled_weights
+
+packed_weights = prepare_fused_moe_bf16_tiled_weights(
     w13_weight.contiguous(),
     w2_weight.contiguous(),
-    backend="auto",
+    fuse_silu=True,
+    backend="arm_sve_bf16",
 )
 ```
 
-`packed` is a `PreparedBF16TiledFusedMoEWeights` object containing packed
-`w13` and `w2` tensors, their original dimensions, and the selected backend
-identity. Explicit backend names are useful for validation; production should
-normally use `auto`.
+The returned `PreparedBF16TiledFusedMoEWeights` is reusable across requests.
+It records the selected backend, packed dimensions, backend N tile, and whether
+the fused SiLU layout was used.
 
-Large expert sets can pack weights in parallel:
-
-```bash
-FUSED_CPP_MOE_PREPACK_THREADS=16
-```
-
-Packing is split by expert, so each thread writes disjoint slices of the packed
-`w13` and `w2` tensors. The default is `1` to keep initialization behavior
-predictable unless explicitly enabled.
-
-Recommended vLLM layer state:
+To opt one layer into experimental per-channel W8A16, prepare the same BF16
+source weights with the W8A16 packer instead:
 
 ```python
-class CpuBF16TiledMoEState:
-    def __init__(self, w13_weight, w2_weight):
-        self.packed_weights = prepare_fused_moe_bf16_tiled_weights(
-            w13_weight,
-            w2_weight,
-        )
+from fused_cpp.moe import prepare_fused_moe_w8a16_tiled_weights
+
+packed_weights = prepare_fused_moe_w8a16_tiled_weights(
+    w13_weight.contiguous(),
+    w2_weight.contiguous(),
+)
 ```
 
-Important:
+This is the implementation selection point. The planner does not quantize or
+replace BF16 weights at request time.
 
-- Expert ids in `topk_ids` must match the packed weight expert index.
-- Packed tensors are ISA-specific and must not be moved between NEON and SVE
-  processes. SVE packing is also vector-length-specific; repack after moving
-  weights to a machine with a different SVE vector length.
-- Pass `global_num_experts=-1` for normal local packed weights.
-- Do not pass the model-wide expert count if it is larger than the packed local
-  expert count. The C++ path checks that the requested expert count does not
-  exceed prepared weights.
+Packing considerations:
 
-## Forward Call
+- `FUSED_CPP_MOE_PREPACK_THREADS` parallelizes packing across experts.
+- Packed weights are ISA- and SVE-vector-length-specific; repack on a machine
+  with a different contract.
+- Expert IDs in `topk_ids` must index this packed local expert array.
+- In TP, each rank normally packs all experts with rank-local `F`.
+- In EP, keep using the framework/native fallback until the calibrated runtime
+  explicitly supports `local_experts != global_experts`.
 
-Minimal call:
+Page placement is controlled by the repository-wide page policy documented in
+`docs/production_environment.yaml`. Configure it before packing because page
+placement applies to the reusable packed tensors.
+
+## Forward Integration
+
+Once a compatible runtime is installed, the type-dispatched operator is the
+only request-path API needed:
 
 ```python
-out = fused_moe_bf16_tiled(
+out = fused_moe_tiled(
     hidden_states,
     packed_weights,
     topk_weights,
     topk_ids,
-    num_threads=num_threads,
-    activation=activation,
-)
-```
-
-With optional bias and output buffer:
-
-```python
-out = fused_moe_bf16_tiled(
-    hidden_states,
-    packed_weights,
-    topk_weights,
-    topk_ids,
-    w13_bias=w13_bias,
-    w2_bias=w2_bias,
-    num_threads=num_threads,
+    num_threads=96,
     activation="silu",
     global_num_experts=-1,
     skip_weighted=False,
-    out=out_buffer,
+    out=output_buffer,
 )
 ```
 
-`out_buffer` must be a contiguous CPU BF16 tensor with the same shape as
-`hidden_states` and `requires_grad=False`. The native normal, scheduled, and
-async entrypoints write the final BF16 result directly into this storage,
-increment its version counter, and the Python wrapper returns the same tensor
-object; there is no temporary final-output tensor or trailing `copy_`. The
-buffer must not overlap the input, packed weights, `topk_weights`, or `topk_ids`.
-Internal per-route storage used for weighted TopK merge remains operator-owned.
+For W8A16, `cache_dequant=False` selects register dequantization. Set
+`cache_dequant=True` only when the installed Plan V2 policy supplies suitable
+stage windows; zero still means a full owner stripe and is not automatically
+an L2-sized window. W8A16 rejects bias arguments instead of silently ignoring
+them.
 
-Recommended vLLM adapter shape:
+The wrapper counts routes, obtains or reuses a cached plan, and lowers a
+compatible call through `fused_moe_bf16_tiled_async_plan()`. Native execution
+runs outside the planner cache lock. Callers should not invoke the Plan V2 API
+directly unless they own plan construction and validation.
 
-```python
-def cpu_bf16_tiled_moe_forward(
-    hidden_states,
-    packed_weights,
-    topk_weights,
-    topk_ids,
-    *,
-    activation,
-    num_threads,
-    w13_bias=None,
-    w2_bias=None,
-):
-    if not _HAS_BF16_TILED_FUSED_MOE:
-        return fallback_moe(...)
-    if hidden_states.dtype != torch.bfloat16 or hidden_states.device.type != "cpu":
-        return fallback_moe(...)
+`global_num_experts=-1` is the recommended value when `topk_ids` already use
+the packed local expert index space. For the current TP runtime, an explicit
+value must equal the runtime's `global_experts`.
 
-    return fused_moe_bf16_tiled(
-        hidden_states.contiguous(),
-        packed_weights,
-        topk_weights.contiguous(),
-        topk_ids.contiguous(),
-        w13_bias=w13_bias,
-        w2_bias=w2_bias,
-        num_threads=num_threads,
-        activation=activation,
-    )
-```
-
-## Threading Modes
-
-### Default Mode
-
-By default, `num_threads` creates that many `std::thread` workers.
-
-Scheduling:
-
-```text
-expert-affinity greedy assignment
-one worker processes its assigned expert/tile ranges
-```
-
-This mode is simple and requires no environment variables.
-
-### Hierarchical Dynamic Expert N-Split Mode
-
-Enable with:
-
-```bash
-FUSED_CPP_MOE_HIERARCHICAL_N_SPLIT=1
-```
-
-This mode is intended for high core counts and large BF16 MoE shapes.
-
-Scheduling:
-
-```text
-1. Count routed rows per expert.
-2. Sort experts by routed rows descending.
-3. Split total threads into fixed groups.
-4. Each group dynamically takes the next expert from a shared queue.
-5. Threads inside the group compute that expert together by splitting GEMM N.
-6. Inside one expert, rows are still processed in 16-row tiles for the
-   low-level GEMM microkernel.
-```
-
-Default group topology:
-
-```text
-partitions = len(core_bases), default 2
-groups_per_partition = FUSED_CPP_MOE_N_SPLIT_GROUPS_PER_PARTITION, default 4
-groups = partitions * groups_per_partition
-group_size = num_threads / groups
-```
-
-Default core bases use absolute CPU IDs:
-
-```bash
-FUSED_CPP_MOE_N_SPLIT_CORE_BASES=0,40
-```
-
-For multi-rank launches where each rank already has a different CPU affinity,
-you can generate core bases relative to the first CPU in the current affinity:
-
-```bash
-FUSED_CPP_MOE_N_SPLIT_CORE_SKIP=40
-```
-
-With `num_threads=64`, `groups_per_partition=4`, and affinity starting at CPU
-80, the generated core bases are `80,120`, so the worker cores are `80-111`
-and `120-151`. If `FUSED_CPP_MOE_N_SPLIT_CORE_BASES` is set, it takes
-precedence and is interpreted as absolute CPU IDs.
-
-Examples:
-
-```text
-num_threads=64 -> groups=8, group_size=8
-cores: 0-31 and 40-71
-
-num_threads=80 -> groups=8, group_size=10
-cores: 0-39 and 40-79
-```
-
-The thread count must be divisible by:
-
-```text
-len(core_bases) * groups_per_partition
-```
-
-Recommended launch on the Arm test machine:
-
-```bash
-taskset -c 0-79 env \
-  OMP_PROC_BIND=FALSE \
-  FUSED_CPP_MOE_HIERARCHICAL_N_SPLIT=1 \
-  FUSED_CPP_MOE_N_SPLIT_CORE_SKIP=40 \
-  python tests/bench_fused_moe_bf16_tiled.py \
-    --experts 256 --threads 80
-```
-
-Notes:
-
-- The kernel uses `std::thread`, not OpenMP, for MoE worker threads.
-- `OMP_PROC_BIND=FALSE` is recommended when running in an environment where
-  other OpenMP users may be present.
-- The hierarchical mode uses `pthread_setaffinity_np` on Linux and restores the
-  caller thread's original affinity when the call returns.
-- On non-Linux platforms, core binding is ignored but the scheduling mode still
-  functions.
-
-## Runtime Configuration
-
-| Env var | Default | Meaning |
-| --- | --- | --- |
-| `FUSED_CPP_MOE_HIERARCHICAL_N_SPLIT` | `0` | Enable dynamic expert group mode |
-| `FUSED_CPP_MOE_N_SPLIT_CORE_BASES` | `0,40` | Partition core base list |
-| `FUSED_CPP_MOE_N_SPLIT_CORE_SKIP` | unset | Generate two partition core bases from current affinity first CPU and this skip; ignored when `FUSED_CPP_MOE_N_SPLIT_CORE_BASES` is set |
-| `FUSED_CPP_MOE_N_SPLIT_GROUPS_PER_PARTITION` | `4` | Number of groups in each partition |
-| `FUSED_CPP_MOE_SCHEDULE_DEBUG` | `0` | `1` prints summary, `2` prints all workers/groups |
-| `FUSED_CPP_MOE_PREPACK_THREADS` | `1` | Number of threads used when packing expert weights |
-
-Debug example:
-
-```bash
-taskset -c 0-79 env \
-  FUSED_CPP_MOE_HIERARCHICAL_N_SPLIT=1 \
-  FUSED_CPP_MOE_N_SPLIT_CORE_SKIP=40 \
-  FUSED_CPP_MOE_SCHEDULE_DEBUG=2 \
-  python tests/bench_fused_moe_bf16_tiled.py \
-    --experts 256 --threads 80 --warmup 0 --runs 1
-```
-
-Expected debug header:
-
-```text
-strategy=hierarchical_n_split_dynamic_expert
-groups=8
-group_size=10
-core_bases=[0,40]
-```
-
-Per-group debug lines include:
-
-```text
-rows=<routed rows processed by this group>
-tiles=<16-row micro tiles processed by this group>
-experts=[expert_id:rows,...]
-```
-
-## vLLM Integration Points
-
-Recommended integration flow:
-
-1. Add a CPU BF16 tiled MoE implementation option in the vLLM MoE dispatch layer.
-2. During layer weight loading, identify BF16 CPU expert weights in vLLM layout:
-   `w13=[E, 2F, H]`, `w2=[E, H, F]`.
-3. Call `prepare_fused_moe_bf16_tiled_weights` once and store the packed object
-   on the layer or implementation object.
-4. In forward, after routing has produced `topk_weights` and `topk_ids`, call
-   `fused_moe_bf16_tiled`.
-5. Choose `num_threads` from vLLM CPU worker configuration, a model config knob,
-   or an environment override.
-6. Keep a fallback path when the backend is unavailable or inputs do not satisfy
-   the shape/dtype/device constraints.
-
-Pseudo-code:
+A minimal vLLM-style layer adapter is:
 
 ```python
-class VllmCpuBF16TiledMoE:
-    def __init__(self, w13_weight, w2_weight, activation, num_threads):
-        self.activation = activation
+class CpuSVEFusedMoE:
+    def __init__(self, w13_weight, w2_weight, *, num_threads):
         self.num_threads = num_threads
         self.packed_weights = prepare_fused_moe_bf16_tiled_weights(
             w13_weight,
             w2_weight,
+            fuse_silu=True,
+            backend="arm_sve_bf16",
         )
 
-    def forward(self, hidden_states, topk_weights, topk_ids):
+    def forward(self, hidden_states, topk_weights, topk_ids, *, out=None):
         return fused_moe_bf16_tiled(
             hidden_states,
             self.packed_weights,
             topk_weights,
             topk_ids,
             num_threads=self.num_threads,
-            activation=self.activation,
+            activation="silu",
+            out=out,
         )
 ```
 
-## Validation Checklist
+The framework must retain its existing fallback for unavailable backends,
+unsupported devices or dtypes, non-SiLU activations, EP layouts, and extension
+load failures.
 
-Correctness:
+## Combined Routed And Shared Expert
+
+For standalone or TP models with one shared expert and the same rank-local
+`F` as each routed expert, pack both arrays without concatenating the full raw
+weights:
+
+```python
+packed_with_shared = prepare_routed_shared_moe_bf16_tiled_weights(
+    routed_w13,
+    routed_w2,
+    shared_w13,
+    shared_w2,
+)
+```
+
+Install the runtime with the routed expert count and `shared_experts=1`:
+
+```python
+runtime = MoePlannerRuntime(
+    calibration_path,
+    hidden_size=H,
+    intermediate_size=F_per_rank,
+    global_experts=routed_experts,
+    local_experts=routed_experts,
+    mode="tp",
+    degree=tp_degree,
+    cpu_ids=rank_cpu_ids,
+    shared_experts=1,
+)
+set_default_moe_planner_runtime(runtime)
+```
+
+The request path then uses one combined call:
+
+```python
+output = fused_moe_bf16_tiled_with_shared(
+    hidden_states,
+    packed_with_shared,
+    topk_weights,
+    topk_ids,
+    num_threads=len(rank_cpu_ids),
+    routed_scaling_factor=2.5,
+    swiglu_limit=10.0,
+)
+```
+
+Internally, the shared expert is one all-token synthetic expert. The quick
+planner searches a bounded `shared_width + routed_width` family and allows the
+shared lane to process routed experts after the shared task completes. Route
+weights and the shared contribution are accumulated in FP32 before the single
+BF16 output store. DeepSeek-V4 clamped SwiGLU is enabled only by explicitly
+passing `swiglu_limit=10.0`; it requires the SVE JIT path. EP, biases, multiple
+shared experts, mismatched shared `F`, static asm, and other clamp limits remain
+unsupported by this initial combined API.
+
+## Runtime Ownership And Fallback
+
+The runtime owns a call only when all of the following are true:
+
+| Condition | Required value |
+| --- | --- |
+| Planner mode | `standalone` or `tp` |
+| Expert ownership | `local_experts == global_experts` |
+| Threads | exactly the calibrated core count |
+| Activation | `silu` |
+| Packed layout | `fuse_silu=True` |
+| Backend | `arm_sve_bf16` |
+| Backend N tile | equal to the calibrated policy |
+| Shape | runtime `H`, `F`, and `E` match packed weights |
+| Global expert count | omitted with `-1`, or equal to runtime value |
+
+If any condition fails, `fused_moe_bf16_tiled()` does not raise a
+planner-compatibility error. It bypasses Plan V2 and calls the existing native
+dispatcher. This preserves the pre-runtime behavior, but it also means an
+integration must inspect diagnostics when it needs to prove that calibrated
+scheduling was used.
+
+## Diagnostics
+
+After a compatible invocation, inspect the latest planning decision:
+
+```python
+runtime = get_default_moe_planner_runtime()
+if runtime is not None:
+    diagnostics = runtime.last_plan
+    print(diagnostics)
+```
+
+`last_plan` is a snapshot intended for diagnostics and benchmarking. It
+contains the latest planner decision and cache information; callers should not
+treat its internal keys as a serialized public plan schema.
+
+To distinguish Plan V2 from fallback in an integration test, use a known
+compatible call and assert that `last_plan` was updated. Also exercise one
+deliberately incompatible call and compare it with the established native
+dispatcher.
+
+## Recommended Initialization Order
+
+Use this order in each CPU rank:
+
+1. Set rank affinity and page policy.
+2. Import `fused_cpp` and verify `arm_sve_bf16` availability.
+3. Load a saved calibration into `MoePlannerRuntime`, or explicitly run quick
+   calibration during machine provisioning.
+4. Install the runtime with `set_default_moe_planner_runtime()`.
+5. Load model weights and prepack each MoE layer with `fuse_silu=True`.
+6. Warm up representative route shapes outside the measured/request path so
+   the planner cache contains common distributions.
+7. Start serving and call only `fused_moe_bf16_tiled()` from layer forwards.
+
+The calibration is machine/placement-specific, while packed weights are
+model-layer/ISA-specific. Their lifecycles should therefore remain separate.
+
+## Validation
+
+Run focused API and dispatch tests after integration changes:
+
+```bash
+python -m pytest -q \
+  tests/test_moe_planner_runtime.py \
+  tests/test_moe_backend_dispatch.py
+```
+
+Run numerical coverage on the target ARM machine:
 
 ```bash
 python -m pytest -q tests/test_fused_moe_bf16_tiled.py -m 'not slow'
 ```
 
-Default benchmark:
+For a deployment smoke test, verify all of the following:
 
-```bash
-python tests/bench_fused_moe_bf16_tiled.py \
-  --experts 256 --threads 64 --warmup 2 --runs 5
-```
+- the SVE backend is advertised;
+- quick calibration or saved-profile loading succeeds on the intended CPU IDs;
+- packed weights report `backend_name == "arm_sve_bf16"` and
+  `fused_silu is True`;
+- a compatible call updates `runtime.last_plan`;
+- planned output matches the framework reference within the established BF16
+  tolerance;
+- a deliberately incompatible activation or thread count follows the fallback
+  path without changing numerical semantics.
 
-Hierarchical benchmark:
+Do not report a performance improvement without recording the machine, NUMA
+placement, CPU IDs, route distribution, `T/K/E/H/F`, TP degree, thread count,
+page policy, warmup/runs, statistic, baseline, and absolute measured time.
 
-```bash
-taskset -c 0-31,40-71 env \
-  OMP_PROC_BIND=FALSE \
-  FUSED_CPP_MOE_HIERARCHICAL_N_SPLIT=1 \
-  FUSED_CPP_MOE_N_SPLIT_CORE_SKIP=40 \
-  python tests/bench_fused_moe_bf16_tiled.py \
-    --experts 256 --threads 64 --warmup 2 --runs 5
-```
+## Source Map
 
-Metrics to track:
-
-- `median_ms`
-- `median_gflops`
-- effective efficiency:
-
-```text
-efficiency = median_gflops / (num_threads * single_core_peak_gflops)
-```
-
-On the Arm test machine used during development, `single_core_peak_gflops` was
-measured as approximately `92.704 GFLOP/s/core`.
-
-The benchmark defaults model the DeepSeek-V4-Flash TP=4 per-rank MoE shape:
-
-```text
-tokens=2048
-experts=256
-top_k=6
-H=4096
-F_per_rank=2048 / 4 = 512
-w13=[256, 1024, 4096]
-w2=[256, 4096, 512]
-```
-
-Older development reference results for shape
-`tokens=2048, experts=256, top_k=8, H=7168, F=512`:
-
-| Mode | Threads | Median ms | Median GFLOP/s | Efficiency |
-| --- | ---: | ---: | ---: | ---: |
-| Default expert/tile workers | 64 | 199.065 | 1812.356 | 30.5% |
-| Hierarchical dynamic expert N-split | 64 | 138.526 | 2604.398 | 43.9% |
-| Hierarchical dynamic expert N-split | 80 | 126.069 | 2861.737 | 38.6% |
-
-Use these numbers as regression references, not as fixed guarantees. They are
-host, affinity, and routing-distribution dependent.
-
-## Common Failure Modes
-
-- Repacking weights every forward call. Packing can take seconds for large
-  expert counts and must be outside the timed path.
-- Passing global model expert ids when only local expert weights are packed.
-- Running with PyTorch intra-op threads greater than one and oversubscribing the
-  CPU. Prefer `torch.set_num_threads(1)` around this benchmark path.
-- Setting `OMP_PROC_BIND=close` in a process that also uses `std::thread`; this
-  can accidentally pin worker threads poorly in some environments.
-- Enabling hierarchical mode with a `num_threads` value that is not divisible by
-  `len(core_bases) * groups_per_partition`.
-- Using absolute `FUSED_CPP_MOE_N_SPLIT_CORE_BASES` in multi-process runs
-  without adjusting it for each rank. Prefer `FUSED_CPP_MOE_N_SPLIT_CORE_SKIP`
-  when every rank already has a distinct CPU affinity.
+- Python operator and weight packing: `src/fused_cpp/moe/bf16_tiled.py`
+- Calibrated process runtime: `src/fused_cpp/moe/planner_runtime.py`
+- Public Plan V2 types: `src/fused_cpp/moe/plan.py`
+- Quick calibration: `cpu_moe_schedule_optimization/cost_model/quick_calibration.py`
+- Analytical model: `cpu_moe_schedule_optimization/cost_model/analytic_model.py`
+- Production planner: `cpu_moe_schedule_optimization/planners/planned_moe.py`
+- Plan schema: `cpu_moe_schedule_optimization/planners/plan_schema.md`
+- Public contracts: `docs/public_contracts.md`
+- Production environment variables: `docs/production_environment.yaml`

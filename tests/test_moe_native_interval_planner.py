@@ -220,6 +220,32 @@ def test_native_quick_assignment_preserves_rounded_score_tie_break() -> None:
     assert [task[0] for task in result["tasks"]] == [0, 2, 1]
 
 
+def test_native_shared_quick_search_matches_python() -> None:
+    extension = _native_extension()
+    if not hasattr(extension.NativeQuickPlanner, "plan_shared"):
+        pytest.skip("fused_cpp._C was built without shared quick planning")
+    model = AnalyticMoeCostModel(
+        ANALYTIC_PROFILE,
+        hidden_size=64,
+        intermediate_size=32,
+        global_experts=9,
+        local_experts=9,
+    )
+    experts = [(expert, routes) for expert, routes in enumerate((12, 11, 10, 9, 8, 7, 6, 5, 128))]
+    reference = IntervalPlanner(model, num_cores=8, native_cold_planner=False)
+    reference._native_quick_planner = None
+    expected = reference.plan_quick_with_shared(experts, shared_expert_id=8)
+    actual = IntervalPlanner(model, num_cores=8, native_cold_planner=False).plan_quick_with_shared(
+        experts,
+        shared_expert_id=8,
+    )
+
+    for field in ("shape", "tasks", "bridge", "shared_expert_id", "shared_width", "routed_width"):
+        assert actual[field] == expected[field], field
+    assert actual["makespan_ns"] == pytest.approx(expected["makespan_ns"], rel=1e-13)
+    assert actual["planner_backend"] == "cpp_shared_quick"
+
+
 def test_native_bounded_tail_repartition_matches_python() -> None:
     extension = _native_extension()
     model = ContentionCostModel(TP4_96C_PROFILE)

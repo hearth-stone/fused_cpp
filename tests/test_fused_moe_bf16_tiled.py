@@ -264,6 +264,97 @@ def test_sve_m12_silu_and_w2_bf16_route_for_unit_top1(
             )
 
 
+def test_sve_jit_clamped_swiglu_matches_deepseek_v4_reference(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cover every exact-M JIT tail with DeepSeek V4's limit-10 SwiGLU."""
+    if "arm_sve_bf16" not in available_fused_moe_bf16_tiled_backends():
+        pytest.skip("requires the ARM SVE BF16 backend")
+    monkeypatch.setenv("FUSED_CPP_MOE_SVE", "1")
+    monkeypatch.setenv("FUSED_CPP_MOE_SVE_IMPL", "jit")
+    monkeypatch.setenv("FUSED_CPP_MOE_W2_BF16_ROUTE", "0")
+    generator = torch.Generator().manual_seed(20260818)
+    route_counts = list(range(1, 13))
+    num_experts = len(route_counts)
+    num_tokens = sum(route_counts)
+    hidden_size = 64
+    intermediate_size = 32
+    hidden = torch.randn((num_tokens, hidden_size), dtype=torch.bfloat16, generator=generator)
+    w13 = torch.randn(
+        (num_experts, 2 * intermediate_size, hidden_size),
+        dtype=torch.bfloat16,
+        generator=generator,
+    )
+    w2 = torch.empty(
+        (num_experts, hidden_size, intermediate_size),
+        dtype=torch.bfloat16,
+    ).normal_(mean=0.0, std=0.02, generator=generator)
+    topk_ids = torch.cat(
+        [torch.full((routes,), expert, dtype=torch.int32) for expert, routes in enumerate(route_counts)]
+    ).reshape(-1, 1)
+    topk_weights = torch.ones((num_tokens, 1), dtype=torch.float32)
+    packed = prepare_fused_moe_bf16_tiled_weights(
+        w13,
+        w2,
+        fuse_silu=True,
+        backend="arm_sve_bf16",
+    )
+
+    unclamped = fused_moe_bf16_tiled(
+        hidden,
+        packed,
+        topk_weights,
+        topk_ids,
+        num_threads=1,
+    )
+    zero_limit = fused_moe_bf16_tiled(
+        hidden,
+        packed,
+        topk_weights,
+        topk_ids,
+        num_threads=1,
+        swiglu_limit=0.0,
+    )
+    clamped = fused_moe_bf16_tiled(
+        hidden,
+        packed,
+        topk_weights,
+        topk_ids,
+        num_threads=1,
+        swiglu_limit=10.0,
+    )
+    torch.testing.assert_close(zero_limit, unclamped, atol=0, rtol=0)
+
+    reference = torch.empty_like(hidden)
+    row_begin = 0
+    for expert, rows in enumerate(route_counts):
+        x = hidden[row_begin : row_begin + rows].float()
+        gate_up = x @ w13[expert].float().T
+        gate, up = gate_up.chunk(2, dim=-1)
+        intermediate = (
+            torch.nn.functional.silu(gate.clamp(max=10.0))
+            * up.clamp(min=-10.0, max=10.0)
+        ).to(torch.bfloat16)
+        reference[row_begin : row_begin + rows] = (
+            intermediate.float() @ w2[expert].float().T
+        ).to(torch.bfloat16)
+        row_begin += rows
+
+    torch.testing.assert_close(clamped.float(), reference.float(), atol=0.25, rtol=0.08)
+    assert float((clamped.float() - unclamped.float()).abs().max()) > 0.5
+
+    monkeypatch.setenv("FUSED_CPP_MOE_SVE_IMPL", "asm")
+    with pytest.raises(RuntimeError, match="requires the SVE JIT"):
+        fused_moe_bf16_tiled(
+            hidden,
+            packed,
+            topk_weights,
+            topk_ids,
+            num_threads=1,
+            swiglu_limit=10.0,
+        )
+
+
 def test_sve_plan_v2_route_slices_match_full_experts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

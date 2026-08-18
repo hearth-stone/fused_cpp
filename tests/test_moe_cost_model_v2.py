@@ -130,6 +130,13 @@ class _RoundedTieQuickPlannerModel(_QuickPlannerModel):
         return {4: 2.0, 3: 1.0, 2: 1.0e20}[routes]
 
 
+class _SharedQuickPlannerModel(_QuickPlannerModel):
+    def T_iso(self, routes: int, threads: int) -> float:
+        if routes >= 100:
+            return {1: 100.0, 2: 20.0, 4: 30.0}[threads]
+        return {1: 10.0, 2: 8.0, 4: 7.0}[threads]
+
+
 class _DeterministicStageModel(_DeterministicTailPoolModel):
     call_setup_ns = 3.0
 
@@ -312,6 +319,41 @@ def test_planned_moe_quick_search_caches_selected_shape() -> None:
     second = planner.plan_spec_for([(0, 100), (1, 100)])
     assert second["shape"] == (4,)
     assert planner.last["cache_hit"]
+
+
+def test_shared_quick_planner_pins_shared_first_and_reuses_its_lane() -> None:
+    planner = PlannedMoE(_SharedQuickPlannerModel(), num_cores=4, search_mode="quick")
+    counts = [(expert, 1) for expert in range(8)] + [(8, 100)]
+
+    first = planner.plan_spec_for(counts, shared_expert_id=8)
+
+    assert first["shape"] == (2, 1, 1)
+    assert first["shared_expert_id"] == 8
+    assert first["shared_width"] == 2
+    assert first["routed_width"] == 1
+    tasks = first["bridge"]["task_expert_ids"]
+    dependencies = first["bridge"]["task_deps"]
+    dependency_offsets = first["bridge"]["task_dep_offsets"]
+    assert tasks[0] == 8
+    shared_lane_followers = [
+        task
+        for task in range(1, len(tasks))
+        if dependency_offsets[task + 1] > dependency_offsets[task]
+        and dependencies[dependency_offsets[task]] == 0
+    ]
+    assert shared_lane_followers
+
+    second = planner.plan_spec_for(counts, shared_expert_id=8)
+    assert second["bridge"] == first["bridge"]
+    assert planner.last["cache_hit"]
+    assert planner.last["shared_width"] == 2
+
+
+def test_shared_quick_planner_rejects_missing_synthetic_expert() -> None:
+    planner = PlannedMoE(_SharedQuickPlannerModel(), num_cores=4, search_mode="quick")
+
+    with pytest.raises(ValueError, match="exactly one active synthetic shared expert"):
+        planner.plan_spec_for([(0, 12), (1, 8)], shared_expert_id=8)
 
 
 def test_planned_moe_rejects_unknown_search_mode() -> None:

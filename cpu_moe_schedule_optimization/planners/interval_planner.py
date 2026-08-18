@@ -169,6 +169,7 @@ class IntervalPlanner:
         self.stage = stage
         self.model = model
         self._stage_window_policy_cached = _UNSET
+        self._shared_quick_cost_cache: dict[tuple[int, int], float] = {}
         self.num_cores = int(num_cores)
         model_widths = getattr(self.model, "supported_widths", None)
         self.widths = tuple(widths or model_widths or _default_widths(self.num_cores))
@@ -380,6 +381,81 @@ class IntervalPlanner:
         )
         return result["tasks"]
 
+    def _shared_quick_shapes(self) -> tuple[tuple[int, ...], ...]:
+        candidates: set[tuple[int, ...]] = set()
+        for shared_width in self.widths:
+            if shared_width == self.num_cores:
+                candidates.add((shared_width,))
+                continue
+            remaining = self.num_cores - shared_width
+            if remaining <= 0:
+                continue
+            for routed_width in self.widths:
+                if (
+                    routed_width <= shared_width
+                    and routed_width <= remaining
+                    and remaining % routed_width == 0
+                ):
+                    candidates.add((shared_width,) + (routed_width,) * (remaining // routed_width))
+        return tuple(sorted(candidates, key=lambda shape: (shape[0], shape[1] if len(shape) > 1 else shape[0], shape)))
+
+    def _assign_shared_lpt(self, experts, lanes, shared_expert_id: int):
+        shared_indices = [index for index, (expert, _) in enumerate(experts) if expert == shared_expert_id]
+        if len(shared_indices) != 1:
+            raise ValueError("shared-aware quick planning requires exactly one active synthetic shared expert")
+        shared_index = shared_indices[0]
+        lane_experts: List[List[int]] = [[] for _ in lanes]
+        lane_experts[0].append(shared_index)
+        lane_loads = [0.0] * len(lanes)
+        lane_loads[0] = self._shared_quick_task_time(experts[shared_index][1], lanes[0][1])
+        availability: dict[int, list[tuple[float, int]]] = {}
+        for lane, (_, width) in enumerate(lanes):
+            availability.setdefault(width, []).append((lane_loads[lane], lane))
+        for heap in availability.values():
+            heapify(heap)
+        order = sorted(
+            (index for index in range(len(experts)) if index != shared_index),
+            key=lambda index: (-experts[index][1], index),
+        )
+        for index in order:
+            routes = experts[index][1]
+            _, lane, width = min(
+                (
+                    heap[0][0] + self._shared_quick_task_time(routes, width),
+                    heap[0][1],
+                    width,
+                )
+                for width, heap in availability.items()
+            )
+            load, selected_lane = heappop(availability[width])
+            assert selected_lane == lane
+            lane_experts[lane].append(index)
+            lane_loads[lane] = load + self._shared_quick_task_time(routes, width)
+            heappush(availability[width], (lane_loads[lane], lane))
+        return lane_experts, lane_loads
+
+    def _shared_quick_task_time(self, routes: int, threads: int) -> float:
+        key = (int(routes), int(threads))
+        cached = self._shared_quick_cost_cache.get(key)
+        if cached is None:
+            cached = self._task_time(*key)
+            self._shared_quick_cost_cache[key] = cached
+        return cached
+
+    def _shared_quick_cost_rows(self, experts, shapes):
+        widths = sorted({int(width) for shape in shapes for width in shape})
+        rows = [
+            [self._shared_quick_task_time(routes, width) for _, routes in experts]
+            for width in widths
+        ]
+        return widths, rows
+
+    def quick_tasks_for_shared_shape(self, experts, shape, shared_expert_id: int):
+        signature = tuple(int(value) for value in shape)
+        lanes = self._lanes(signature)
+        assignment, _ = self._assign_shared_lpt(experts, lanes, shared_expert_id)
+        return self._build_tasks(experts, lanes, assignment)
+
     @staticmethod
     def _reverse_lanes(lane_experts, parity: int):
         return [
@@ -489,7 +565,14 @@ class IntervalPlanner:
         if use_full_workload_anchor and self._uses_full_workload_anchor(experts, shape):
             relative = self.model.relative_full_call_uncertainty(experts[0][1], shape)
             return makespan * relative / math.sqrt(self.model.profile_runs)
-        relative = max(self.model.relative_uncertainty(routes, shape) for _, routes in experts)
+        constant_relative = getattr(self.model, "relative_error", None)
+        if constant_relative is None:
+            relative = max(
+                self.model.relative_uncertainty(routes, shape)
+                for routes in dict.fromkeys(routes for _, routes in experts)
+            )
+        else:
+            relative = float(constant_relative)
         waves = max(1, math.ceil(len(experts) / len(shape)))
         return makespan * relative / math.sqrt(waves * self.model.profile_runs)
 
@@ -630,6 +713,35 @@ class IntervalPlanner:
             "resource_groups": len(lanes),
         }
 
+    def _quick_shared_candidate(self, experts, shape, shared_expert_id: int) -> dict:
+        signature = tuple(int(value) for value in shape)
+        lanes = self._lanes(signature)
+        assignment, lane_loads = self._assign_shared_lpt(experts, lanes, shared_expert_id)
+        tasks = self._build_tasks(experts, lanes, assignment)
+        makespan = max(lane_loads, default=0.0)
+        uncertainty = self._uncertainty(experts, signature, makespan, use_full_workload_anchor=False)
+        return {
+            "shape": signature,
+            "execution_mode": _ASYNC_EXECUTION_STRICT,
+            "tail_pool_threads": None,
+            "tail_pool_max_routes": None,
+            "tail_pool_tasks": 0,
+            "tail_repartition_width": None,
+            "tail_repartition_tasks": 0,
+            "tail_repartition_route_slices": 1,
+            "assignment_order": _ASSIGNMENT_ORDER_LPT,
+            "makespan_ns": makespan,
+            "uncertainty_ns": uncertainty,
+            "pessimistic_ns": makespan + uncertainty,
+            "tasks": tasks,
+            "active_working_set_bytes": None,
+            "window_bytes_per_worker": None,
+            "resource_groups": len(lanes),
+            "shared_expert_id": shared_expert_id,
+            "shared_width": signature[0],
+            "routed_width": signature[1] if len(signature) > 1 else signature[0],
+        }
+
     @staticmethod
     def _select(candidates: list[dict]) -> dict:
         candidates.sort(key=lambda candidate: candidate["makespan_ns"])
@@ -648,6 +760,30 @@ class IntervalPlanner:
                 candidate["active_working_set_bytes"],
                 candidate.get("resource_groups", len(candidate["shape"])),
                 candidate.get("execution_mode", _ASYNC_EXECUTION_STRICT) != _ASYNC_EXECUTION_STRICT,
+                candidate["pessimistic_ns"],
+                candidate["makespan_ns"],
+            ),
+        )
+
+    def _select_shared_quick(self, candidates: list[dict]) -> dict:
+        candidates.sort(key=lambda candidate: candidate["makespan_ns"])
+        fastest = candidates[0]
+        fastest_lower = fastest["makespan_ns"] - fastest["uncertainty_ns"]
+        fastest_upper = fastest["pessimistic_ns"]
+        overlapping = [
+            candidate
+            for candidate in candidates
+            if candidate["makespan_ns"] - candidate["uncertainty_ns"] <= fastest_upper
+            and candidate["pessimistic_ns"] >= fastest_lower
+        ]
+        for candidate in overlapping:
+            candidate["active_working_set_bytes"] = self.active_working_set_bytes(candidate["shape"])
+            candidate["window_bytes_per_worker"] = self.window_bytes_per_worker(candidate["shape"])
+        return min(
+            overlapping,
+            key=lambda candidate: (
+                candidate["active_working_set_bytes"],
+                candidate["resource_groups"],
                 candidate["pessimistic_ns"],
                 candidate["makespan_ns"],
             ),
@@ -1144,6 +1280,9 @@ class IntervalPlanner:
             "strict_candidates": strict_candidates,
             "dynamic_candidates": dynamic_candidates,
             "tail_repartition_candidates": tail_repartition_candidates,
+            "shared_expert_id": selected.get("shared_expert_id"),
+            "shared_width": selected.get("shared_width"),
+            "routed_width": selected.get("routed_width"),
             "ranking": [
                 {
                     "shape": tuple(candidate["shape"]),
@@ -1157,8 +1296,14 @@ class IntervalPlanner:
                     "makespan_ms": round(candidate["makespan_ns"] / 1e6, 6),
                     "pessimistic_ms": round(candidate["pessimistic_ns"] / 1e6, 6),
                     "active_working_set_bytes": candidate["active_working_set_bytes"],
-                    "window_bytes_per_worker": tuple(candidate["window_bytes_per_worker"]),
+                    "window_bytes_per_worker": (
+                        tuple(candidate["window_bytes_per_worker"])
+                        if candidate["window_bytes_per_worker"] is not None
+                        else None
+                    ),
                     "resource_groups": candidate["resource_groups"],
+                    "shared_width": candidate.get("shared_width"),
+                    "routed_width": candidate.get("routed_width"),
                 }
                 for candidate in sorted(candidates, key=lambda candidate: candidate["makespan_ns"])
             ],
@@ -1286,6 +1431,84 @@ class IntervalPlanner:
             candidates,
             topk_ids=topk_ids,
             planner_backend="python_quick",
+            planner_workers=1,
+            strict_candidates=len(candidates),
+            dynamic_candidates=0,
+            tail_repartition_candidates=0,
+        )
+
+    def plan_quick_with_shared(
+        self,
+        experts: List[Tuple[int, int]],
+        *,
+        shared_expert_id: int,
+        topk_ids=None,
+    ) -> Dict[str, object]:
+        """Build a bounded mixed-width plan with one all-token synthetic expert."""
+        experts = [(expert, routes) for expert, routes in experts if routes > 0]
+        if not experts:
+            raise ValueError("at least one active expert is required")
+        shared_matches = [
+            routes for expert, routes in experts if expert == int(shared_expert_id)
+        ]
+        if len(shared_matches) != 1:
+            raise ValueError(
+                "shared-aware quick planning requires exactly one active synthetic shared expert"
+            )
+        shapes = self._shared_quick_shapes()
+        if len(experts) > 2:
+            shapes = tuple(shape for shape in shapes if len(shape) > 1)
+            shared_routes = shared_matches[0]
+            routed_routes = sum(
+                routes for expert, routes in experts if expert != int(shared_expert_id)
+            )
+            if routed_routes >= shared_routes:
+                shapes = tuple(
+                    shape for shape in shapes if int(shape[0]) <= self.num_cores // 2
+                )
+        if not shapes:
+            raise ProfileCompatibilityError("shared-aware quick planning has no legal mixed-width shape")
+        if self._native_quick_planner is not None and hasattr(self._native_quick_planner, "plan_shared"):
+            widths, cost_rows = self._shared_quick_cost_rows(experts, shapes)
+            native = self._native_quick_planner.plan_shared(
+                [expert for expert, _ in experts],
+                [routes for _, routes in experts],
+                int(shared_expert_id),
+                [list(shape) for shape in shapes],
+                widths,
+                cost_rows,
+            )
+            selected = native["selected"]
+            selected["shared_expert_id"] = int(shared_expert_id)
+            selected["shared_width"] = int(selected["shape"][0])
+            selected["routed_width"] = int(
+                selected["shape"][1] if len(selected["shape"]) > 1 else selected["shape"][0]
+            )
+            for candidate in native["candidates"]:
+                candidate["shared_width"] = int(candidate["shape"][0])
+                candidate["routed_width"] = int(
+                    candidate["shape"][1] if len(candidate["shape"]) > 1 else candidate["shape"][0]
+                )
+            return self._finalize_plan(
+                selected,
+                native["candidates"],
+                topk_ids=topk_ids,
+                planner_backend="cpp_shared_quick",
+                planner_workers=int(native["configured_workers"]),
+                strict_candidates=int(native["strict_candidates"]),
+                dynamic_candidates=0,
+                tail_repartition_candidates=0,
+            )
+        candidates = [
+            self._quick_shared_candidate(experts, shape, int(shared_expert_id))
+            for shape in shapes
+        ]
+        selected = self._select_shared_quick(candidates)
+        return self._finalize_plan(
+            selected,
+            candidates,
+            topk_ids=topk_ids,
+            planner_backend="python_shared_quick",
             planner_workers=1,
             strict_candidates=len(candidates),
             dynamic_candidates=0,

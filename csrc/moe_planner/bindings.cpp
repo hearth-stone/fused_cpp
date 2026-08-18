@@ -356,6 +356,28 @@ py::dict native_quick_assign(const NativeQuickPlanner& planner, const std::vecto
   return interval_candidate_to_python(candidate);
 }
 
+py::dict native_quick_plan_shared(const NativeQuickPlanner& planner, const std::vector<int>& expert_ids,
+                                  const std::vector<int>& routes, int shared_expert_id,
+                                  const std::vector<std::vector<int>>& shapes, const std::vector<int>& cost_widths,
+                                  const std::vector<std::vector<double>>& costs_by_width) {
+  IntervalPlanResult native_result;
+  {
+    py::gil_scoped_release release;
+    native_result =
+        planner.PlanShared(expert_ids, routes, shared_expert_id, shapes, cost_widths, costs_by_width);
+  }
+  py::dict result;
+  result["selected"] = interval_candidate_to_python(native_result.selected);
+  py::list candidates;
+  for (const IntervalCandidate& candidate : native_result.candidates) {
+    candidates.append(interval_candidate_summary_to_python(candidate));
+  }
+  result["candidates"] = std::move(candidates);
+  result["configured_workers"] = native_result.configured_workers;
+  result["strict_candidates"] = native_result.strict_candidates;
+  return result;
+}
+
 // routes_hist: 1-D histogram (length num_experts). Returns a dict mirroring
 // Plan.to_scheduled_bridge() plus active-expert view and cost estimate.
 py::dict moe_schedule_plan(std::vector<int64_t> routes_hist, int64_t num_cores, const std::string& kind,
@@ -522,6 +544,8 @@ void register_moe_planner(py::module_& m) {
            py::arg("num_cores"), py::arg("shapes"), py::arg("max_stage_bytes"), py::arg("window_bytes_by_width"),
            py::arg("relative_error"), py::arg("profile_runs") = 1, py::arg("planner_threads") = 1)
       .def("plan", &native_quick_plan, py::arg("expert_ids"), py::arg("routes"), py::arg("costs"))
+      .def("plan_shared", &native_quick_plan_shared, py::arg("expert_ids"), py::arg("routes"),
+           py::arg("shared_expert_id"), py::arg("shapes"), py::arg("cost_widths"), py::arg("costs_by_width"))
       .def("assign", &native_quick_assign, py::arg("expert_ids"), py::arg("routes"), py::arg("shape"),
            py::arg("costs"));
 

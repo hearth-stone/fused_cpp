@@ -4931,6 +4931,44 @@ leave-one-sampled-width-out（非独立复测）的采样密度诊断，LLC MAPE
 因此这次只关闭 schema、拓扑服务 API 与旧数据回放，不关闭 production absolute-time
 或 placement-aware scheduling gate。
 
+#### 9.41 Synthetic shared expert 的有限 mixed-width quick plan
+
+standalone/TP 且 shared 与 routed expert 使用相同 rank-local $(H,F)$ 时，把唯一 shared
+expert 表示为内部 expert $e_s=E$。对每个 token 在原 TopK route 后追加
+$(e_s,1)$，并将原 routed 权重乘 `routed_scaling_factor`；因此现有 FP32 route merge
+一次完成 routed scaling、shared 相加和 BF16 store。该等价只改变新 combined API
+的舍入位置，不改变 routed-only API；EP 中 shared 必须位于 routed all-reduce 之后，
+不属于本适用域。
+
+设 rank 有 $C$ 个核心，quick calibration 给出合法宽度集 $W$。首版候选为
+
+$$
+\mathcal S_{rs}=\{(s,r,\ldots,r):s,r\in W,\ r\le s,\ C-s\ge0,\ r\mid(C-s)\},
+$$
+
+其中第一条 lane 宽度为 $s$，其余 $(C-s)/r$ 条 lane 宽度为 $r$；$s=C$ 时只有
+一条 lane，作为顺序 endpoint；该 endpoint 只在至多一个 active routed expert 时保留，
+多个 routed task 时不搜索完全串行的全核计划。约束 $r\le s$ 排除给短 routed expert
+比全 token shared expert 更宽 team 的候选。当
+$\sum_{i\ne s}M_i\ge M_s$（正常 TopK 至少为 1）时还要求 $s\le\lfloor C/2\rfloor$：
+routed 总 GEMM 工作不少于 shared，不能让 shared 独占超过一半的不可抢占核心。
+shared task 固定为 lane 0 的首任务，初始 load 为
+$T_{iso}(M=T,s)$。随后 routed experts 按 route 数降序，以
+
+$$
+\arg\min_l\left(L_l+T_{iso}(M_i,t_l),l\right)
+$$
+
+做确定性异构 LPT；shared 完成后 lane 0 可继续领取 routed task。候选 makespan
+为 $\max_l L_l$，不运行完整 phase-DAG，也不引入实测 route 表。每个 task 的
+W13/W2 window 仍由既有 $(M,t,H,F,n_{tile})$ 解析 policy 选择。
+
+cache identity 在原 route histogram/signature 后增加 synthetic-shared mode 和
+$e_s$；同一 histogram 的 routed-only 与 combined plan 不得互命中。Plan lowering
+仍产生 whole-expert strict Plan V2，故 schema、native task ABI、依赖语义和 worker
+pool 均不改变。首版只支持一个 shared expert、SVE BF16 fused-SiLU、完整本地 expert
+域和 standalone/TP；不同 $F$、bias、EP 与 clamped-SwiGLU 必须拒绝或走旧路径。
+
 ## 10. 同步规则
 
 
@@ -5086,3 +5124,5 @@ leave-one-sampled-width-out（非独立复测）的采样密度诊断，LLC MAPE
 | 2026-08-16 | v1.23 | 为 analytical quick planner 增加固定 candidate-index 的候选级 OpenMP 并行，并复用 `FUSED_CPP_MOE_PLANNER_THREADS`/构造参数；每个候选内部仍单线程且按原索引归并，43 层双 rank Plan V2 在 1/2/4/8 workers 下保持逐字节一致。m5 TP2 双 rank sweep 中，2 workers 相对同二进制 1 worker 的 forced-miss planner 逐层收益中位数仅 0.19%/0.15%；4 workers 为 0.13%/-1.55%，8 workers 为 -0.26%/+0.80%，均未达到 10% 门槛。因此 production quick 未配置时继续使用 1 worker，多线程只保留为显式诊断能力。|
 | 2026-08-16 | v1.24 | 将 analytical DAG active-phase pressure 计算改为固定 8-resource demand/time tuple，并缓存 immutable phase 的 isolated `base_ns`；scalar 诊断访问器、公式、归约顺序、event 边界和 early-merge 决策保持不变。m5 TP2、43 层真实 DSV4 路由、双 rank 并发、每层 7 次 forced-miss 中，planner-overhead layer-median 从同二进制 1T 对照的 31.823/31.676 ms 降至 23.565/23.549 ms（逐层收益中位数 26.00%/26.17%），累计相对原始 generic LPT 为 80.97%/81.33%；两个 rank 的 materialized Plan V2 仍逐字节一致。|
 | 2026-08-16 | v1.25 | production planner 的 early-merge policy 固定为 `true`，删除 plan lowering 上逐 task completion-time DAG 与 routing-tail/burst gate；compute candidate、评分、剪枝、cache identity、Plan V2 三态 schema、native ABI 和手工 `true/false/null` runtime 控制均不变。m5 TP2、H4096/F1024/E256、2048-token TopK6 的 43 层真实 DSV4 路由上，旧 auto 在 43/43 层本来就解析为 on，on/off/auto 输出逐层完全一致，kernel 43 层总时间均约 1.24 s。双 rank 并发、每层 7 次 forced-miss 的 planner-overhead layer-median 从 23.565/23.549 ms 降至 1.424/1.401 ms；5 次同步全层 forced-miss planner+kernel 中位数从 2.973/2.968 s 降至 1.833/1.829 s，延迟降低 38.36%/38.38%。该 policy 是 m5 TP2 DSV4 的实测 operational default，不声称 merge service 已被 cost model 建模或跨 workload/机器最优。|
+| 2026-08-17 | v1.26 | 新增 9.41 的 synthetic shared expert quick plan：standalone/TP 下把一个同形 shared expert 作为全 token、单位权重的内部 expert；有限搜索 `1x shared_width + N x routed_width`，要求 routed width 不超过 shared width，routed 总工作不少于 shared 时 shared 最多占半个 rank，并删除多 routed task 的全核串行 endpoint。shared 固定 lane 0 首任务且该 lane 完成后复用；distinct-route 解析 cost 由 native C++ mixed-width LPT 搜索消费。isolated cost、stage window、uncertainty 与 Plan V2 lowering 全部复用现有解析模型，cache identity 增加 shared mode；routed-only 候选和 Plan V2 schema 不变。M5 V4-Pro TP4 BF16 proxy 的 balanced/uniform/hotspot 21-run 中位数分别提升 16.31%/19.93%/75.88%，最大 cold/hit planner 为 23.574/1.120 ms，最大绝对输出差为 5.96e-8，因而通过 2%/1%/25 ms/3 ms gate 并启用。 |
+| 2026-08-17 | v1.27 | SVE JIT W13 增加与标准 SiLU 分离 cache key 的 DeepSeek-V4 limit-10 clamped-SwiGLU epilogue；显式 `swiglu_limit=10.0` 才启用，0/None 保持旧指令流，static asm 和其他 limit 拒绝。该 variant 只增加逐 row-pair gate/up clamp，不改变 GEMM、packing、window、candidate、Plan V2 或解析资源公式；M5 H7168/F768 上 pure W13 的 M12/1T 与 M2040/16T 开销为 -0.00%/+0.12%，低于模型当前误差，因此首版复用同一 isolated cost。clamped V4-Pro TP4 balanced/uniform/hotspot 实测提升 16.99%/20.98%/78.59%，计划与 planner latency gate 不变。 |

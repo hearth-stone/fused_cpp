@@ -16,6 +16,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "Pack BF16 MoE expert weights for the selected ISA backend.", py::arg("w13_weight"), py::arg("w2_weight"),
         py::arg("fuse_silu") = false, py::arg("backend") = "auto", py::call_guard<py::gil_scoped_release>());
 
+  m.def("fused_moe_bf16_tiled_prepare_routed_shared_weights",
+        &fused_moe_bf16_tiled_prepare_routed_shared_weights,
+        "Pack routed and one same-shape shared expert into one SVE BF16 expert array.",
+        py::arg("routed_w13_weight"), py::arg("routed_w2_weight"), py::arg("shared_w13_weight"),
+        py::arg("shared_w2_weight"), py::arg("backend") = "arm_sve_bf16",
+        py::call_guard<py::gil_scoped_release>());
+
 #if defined(__aarch64__)
   m.def("fused_moe_test_split_plan", &fused_moe_test_split_plan, "Test-only: return the cooperative GEMM split plan.",
         py::arg("stage"), py::arg("M"), py::arg("K"), py::arg("N"), py::arg("group_size"),
@@ -88,8 +95,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "3-D A copies and packed-B experts.",
         py::arg("A"), py::arg("w13_packed"), py::arg("K"), py::arg("N"), py::arg("n_tile"), py::arg("n_ranges") = 2,
         py::arg("warmup") = 64, py::arg("runs") = 192, py::arg("probe_mode") = 0,
+        py::arg("clamp_swiglu") = false,
         py::call_guard<py::gil_scoped_release>());
 #endif
+
+  m.def("fused_moe_w8a16_tiled_prepare_weights", &fused_moe_w8a16_tiled_prepare_weights,
+        "Quantize and pack per-output-channel INT8 expert weights for the experimental W8A16 Plan V2 path.",
+        py::arg("w13_weight"), py::arg("w2_weight"), py::call_guard<py::gil_scoped_release>());
 
   m.def("fused_moe_bf16_tiled", &fused_moe_bf16_tiled, "Run BF16 tiled fused MoE.", py::arg("input"),
         py::arg("w13_packed"), py::arg("w13_K"), py::arg("w13_N"), py::arg("w2_packed"), py::arg("w2_K"),
@@ -138,6 +150,23 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("early_merge") = -1,
         py::call_guard<py::gil_scoped_release>());
 
+  m.def(
+      "fused_moe_w8a16_tiled_async_plan_v2", &fused_moe_w8a16_tiled_async_plan_v2,
+      "Run per-channel W8A16 fused MoE through the existing Plan V2 scheduler.", py::arg("input"),
+      py::arg("w13_packed"), py::arg("w13_K"), py::arg("w13_N"), py::arg("w13_scales"), py::arg("w2_packed"),
+      py::arg("w2_K"), py::arg("w2_N"), py::arg("w2_scales"), py::arg("topk_weights"), py::arg("topk_ids"),
+      py::arg("task_expert_ids"), py::arg("task_core_begins"), py::arg("task_threads"),
+      py::arg("task_dep_offsets"), py::arg("task_deps"), py::arg("plan_version"), py::arg("execution_mode"),
+      py::arg("task_preferred_threads"), py::arg("task_min_threads"), py::arg("task_max_threads"),
+      py::arg("task_allowed_thread_offsets"), py::arg("task_allowed_threads"), py::arg("task_placement_modes"),
+      py::arg("task_numa_nodes"), py::arg("task_stage_ids"), py::arg("task_resize_points"),
+      py::arg("task_range_granularities"), py::arg("task_w13_window_tiles") = c10::nullopt,
+      py::arg("task_w2_window_tiles") = c10::nullopt, py::arg("thread_cpu_ids") = c10::nullopt,
+      py::arg("num_threads") = 1, py::arg("activation") = "silu", py::arg("global_num_experts") = -1,
+      py::arg("skip_weighted") = false, py::arg("silu_poly_degree") = 5, py::arg("backend_n_tile") = 8,
+      py::arg("out") = c10::nullopt, py::arg("early_merge") = -1, py::arg("cache_dequant") = false,
+      py::call_guard<py::gil_scoped_release>());
+
   m.def("fused_moe_bf16_tiled_planned_staged", &fused_moe_bf16_tiled_planned_staged,
         "Run experimental independently planned global W13/W2 stages.", py::arg("input"), py::arg("w13_packed"),
         py::arg("w13_K"), py::arg("w13_N"), py::arg("w2_packed"), py::arg("w2_K"), py::arg("w2_N"),
@@ -159,6 +188,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("num_threads") = 1, py::arg("global_num_experts") = -1, py::arg("fuse_silu") = true,
         py::arg("silu_poly_degree") = 5, py::arg("gemm_backend") = 1, py::arg("backend_n_tile") = 8,
         py::arg("out") = c10::nullopt, py::call_guard<py::gil_scoped_release>());
+
+  m.def("shared_mlp_bf16_tiled", &shared_mlp_bf16_tiled,
+        "Run one packed BF16 expert as a standalone shared MLP.", py::arg("input"), py::arg("w13_packed"),
+        py::arg("w13_K"), py::arg("w13_N"), py::arg("w2_packed"), py::arg("w2_K"), py::arg("w2_N"),
+        py::arg("thread_cpu_ids") = c10::nullopt, py::arg("num_threads") = 1, py::arg("fuse_silu") = true,
+        py::arg("silu_poly_degree") = 5, py::arg("gemm_backend") = 1, py::arg("backend_n_tile") = 8,
+        py::arg("out") = c10::nullopt, py::arg("clamp_swiglu") = false,
+        py::call_guard<py::gil_scoped_release>());
 
   m.def(
       "page_policy_info",
