@@ -14,6 +14,7 @@ from cpu_moe_schedule_optimization.cost_model.analytic_model import (
     AnalyticMoeCostModel,
 )
 from cpu_moe_schedule_optimization.planners.planned_moe import PlannedMoE, route_counts
+from fused_cpp.moe.cost_cache import DEFAULT_MOE_COST_CACHE_DIR, MoeCostDiskCache
 from fused_cpp.moe.plan import AsyncMoEPlanV2
 
 
@@ -37,6 +38,7 @@ class MoePlannerRuntime:
         concurrent_ranks: int = 1,
         cpu_ids: Sequence[int] | None = None,
         shared_experts: int = 0,
+        cost_cache_dir: str | Path | None = DEFAULT_MOE_COST_CACHE_DIR,
     ) -> None:
         if int(shared_experts) not in {0, 1}:
             raise ValueError("shared_experts must be 0 or 1")
@@ -78,6 +80,30 @@ class MoePlannerRuntime:
             search_mode="quick",
         )
         self._lock = threading.RLock()
+        self._cost_disk_cache = (
+            MoeCostDiskCache(cost_cache_dir, self.model.t_iso_cache_identity())
+            if cost_cache_dir is not None
+            else None
+        )
+        self._cost_cache_persisted_keys: set[tuple[int, int]] = set()
+        self._cost_cache_diagnostics: dict[str, object] = {
+            "status": "disabled",
+            "path": None,
+            "loaded_entries": 0,
+            "total_entries": 0,
+            "error": None,
+        }
+        if self._cost_disk_cache is not None:
+            loaded = self._cost_disk_cache.load()
+            loaded_entries = self.model.import_t_iso_cache(loaded.entries)
+            self._cost_cache_persisted_keys = set(loaded.entries)
+            self._cost_cache_diagnostics = {
+                "status": loaded.status,
+                "path": str(loaded.path),
+                "loaded_entries": loaded_entries,
+                "total_entries": loaded_entries,
+                "error": loaded.error,
+            }
 
     @staticmethod
     def _current_affinity(core_count: int) -> tuple[int, ...]:
@@ -139,6 +165,7 @@ class MoePlannerRuntime:
             return None
         with self._lock:
             spec = self._planner.plan_spec_for(counts, topk_ids=topk_ids)
+            self._persist_cost_cache_if_needed()
         return AsyncMoEPlanV2.from_dict(spec["bridge"])
 
     def plan_for_shared_dispatch(
@@ -188,13 +215,34 @@ class MoePlannerRuntime:
                 shared_expert_id=shared_expert_id,
             )
             self._planner.last["combined_top_k"] = int(combined_topk_ids.shape[1])
+            self._persist_cost_cache_if_needed()
         return AsyncMoEPlanV2.from_dict(spec["bridge"])
+
+    def _persist_cost_cache_if_needed(self) -> None:
+        entries = self.model.export_t_iso_cache()
+        total_entries = len(entries)
+        if self._cost_disk_cache is None or entries.keys() <= self._cost_cache_persisted_keys:
+            self._cost_cache_diagnostics["total_entries"] = total_entries
+            return
+        stored = self._cost_disk_cache.store(entries)
+        if stored.status == "stored":
+            self._cost_cache_persisted_keys = set(stored.entries)
+        self._cost_cache_diagnostics.update(
+            {
+                "status": stored.status,
+                "path": str(stored.path),
+                "total_entries": total_entries,
+                "error": stored.error,
+            }
+        )
 
     @property
     def last_plan(self) -> dict[str, object]:
         """Return a snapshot of planner diagnostics for the latest call."""
         with self._lock:
-            return dict(self._planner.last)
+            snapshot = dict(self._planner.last)
+            snapshot["cost_disk_cache"] = dict(self._cost_cache_diagnostics)
+            return snapshot
 
 
 _default_runtime_lock = threading.RLock()
@@ -236,6 +284,7 @@ def enable_moe_planner_quick(
     degree: int = 1,
     concurrent_ranks: int = 1,
     shared_experts: int = 0,
+    cost_cache_dir: str | Path | None = DEFAULT_MOE_COST_CACHE_DIR,
     output: str | Path | None = None,
     supported_widths: Sequence[int] | None = None,
     machine_id: str | None = None,
@@ -264,12 +313,14 @@ def enable_moe_planner_quick(
         concurrent_ranks=concurrent_ranks,
         cpu_ids=result.cpu_ids,
         shared_experts=shared_experts,
+        cost_cache_dir=cost_cache_dir,
     )
     set_default_moe_planner_runtime(runtime)
     return runtime
 
 
 __all__ = [
+    "DEFAULT_MOE_COST_CACHE_DIR",
     "MoePlannerRuntime",
     "calibrate_moe_planner_quick",
     "enable_moe_planner_quick",

@@ -4969,6 +4969,27 @@ $e_s$；同一 histogram 的 routed-only 与 combined plan 不得互命中。Pla
 pool 均不改变。首版只支持一个 shared expert、SVE BF16 fused-SiLU、完整本地 expert
 域和 standalone/TP；不同 $F$、bias、EP 与 clamped-SwiGLU 必须拒绝或走旧路径。
 
+#### 9.42 Quick planner 的版本化 $T_{iso}$ 磁盘缓存
+
+production quick planner 的候选评分只消费标量 $T_{iso}(M,t)$。解析模型首次见到
+$(M,t)$ 时仍按本章定义完整构造 W13/W2 mapping、cache/DRAM demand 和 phase，并将
+结果写入
+
+$$
+\mathcal C_{iso}[I_{model},M,t]=T_{iso}(M,t),
+$$
+
+其中 $I_{model}$ 包含 analytical model schema/name 与公式源文件 SHA256、完整 machine calibration、
+$(H,F,E)$、standalone/TP mode 与 degree、并发 rank、backend N tile、exact-M policy、
+down-output element size 和 supported widths。只有完整 identity 相等的文件才可加载；
+任一字段变化都映射到不同 cache 文件。cache 只存有限正数的标量时间，不序列化
+`ExpertPrediction`、route signature 或最终 Plan V2。
+
+默认目录为 `~/.fused_cpp/cache/moe_costs`。runtime 初始化时只读匹配文件，quick
+planning 对未命中点执行原解析公式；首次调用结束后在文件锁内合并已有点，并以临时文件
+加 `os.replace` 原子写回。文件缺失、损坏、identity 不符或不可写都降级为进程内解析，
+不改变候选、排序、目标、Plan V2 或算子正确性。`cost_cache_dir=None` 可显式关闭。
+
 ## 10. 同步规则
 
 
@@ -4999,6 +5020,7 @@ pool 均不改变。首版只支持一个 shared expert、SVE BF16 fused-SiLU、
 
 | 日期 | 版本 | 变更 |
 | --- | --- | --- |
+| 2026-08-18 | v1.28 | production analytical quick planner 增加版本化 $T_{iso}(M,t)$ 磁盘缓存，默认位于 `~/.fused_cpp/cache/moe_costs`。identity 绑定完整机器校准、解析模型版本、shape/TP/ISA/exact-M/width 域；命中只替代标量解析求值，最终 route plan 仍按当前输入重新生成。写入使用文件锁和原子替换，缺失、损坏、失配或权限错误均降级为原解析路径，不改变公式、候选、排序、Plan V2 或默认 BF16/W8A16 dispatch。 |
 | 2026-07-13 | v0.1 | 建立未剪枝通用问题；将线程宽度定义为 $1\ldots T_{\max}$；区分 kernel variant、求解器编码和当前工程剪枝。 |
 | 2026-07-14 | v0.2 | schema-v2 的 isolated processing time 改为 $O(t)+C(R)\phi_{\mathrm{USL}}(t)k_\phi(t)$；保留小 M residual 和二维 table 回归模式。 |
 | 2026-07-14 | v0.3 | 将资源需求记号明确为 $d_{i,r}(t)$；补充下标含义、量纲一致性及总流量与瞬时 cumulative demand 的区别。 |

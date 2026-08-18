@@ -7,6 +7,39 @@ baseline:
   status: reference
 
 features:
+  - id: planner.t_iso_disk_cache
+    part: planner
+    status: production
+    implementation: >-
+      src/fused_cpp/moe/cost_cache.py,
+      src/fused_cpp/moe/planner_runtime.py, and
+      cpu_moe_schedule_optimization/cost_model/analytic_model.py
+    hypothesis: >-
+      Persisting identity-bound analytical T_iso scalars removes repeated
+      cross-process cost construction without changing quick-planner results.
+    depends_on: []
+    conflicts_with: []
+    correctness: >-
+      tests/test_moe_cost_disk_cache.py and tests/test_moe_analytic_model.py
+      cover round-trip, identity mismatch, corruption repair, merged writes,
+      and cross-runtime reuse without predict_expert recomputation.
+    benchmark: >-
+      AmazonM5192Cores NUMA0, DSV4 TP2 H4096/F1024/E256 captured seq70,
+      two independent processes over one initially empty cache directory.
+    owner: zhangxu
+    opened: 2026-08-18
+    decision_by: 2026-08-18
+    next_decision: >-
+      Retain while model identity invalidation and atomic-write tests pass.
+    adoption_gate: >-
+      Identical Plan V2 hash, at least 50 percent cross-process cold-plan
+      reduction, and non-fatal cache failure behavior.
+    result: >-
+      Miss/store versus hit plan wall was 21.982 versus 2.636 ms, an 88.01
+      percent reduction. Both Plan V2 hashes matched; 224 entries occupied
+      30,837 bytes. See
+      results/amazon_m5_96c_t_iso_disk_cache_20260818.md.
+
   - id: weights.w8a16_per_channel_range_dequant
     part: weights
     status: experimental

@@ -158,6 +158,14 @@ uses a bounded homogeneous-team strict-plan search; mixed-width and dynamic-tail
 search remain offline behavior and are not part of this initial public runtime
 contract.
 
+`MoePlannerRuntime` uses a versioned analytical-cost disk cache by default at
+`~/.fused_cpp/cache/moe_costs`; callers may pass `cost_cache_dir=` to relocate
+it or `None` to disable it. A cache hit requires exact formula-source/model/calibration,
+shape, topology, backend, and supported-width identity. The cache contains only
+`T_iso(M,T)` scalars, never packed weights, routing tensors, or Plan V2 payloads.
+Missing, stale, malformed, or unwritable cache files must fall back to the same
+analytical computation without changing planner results or operator behavior.
+
 `enable_moe_planner_quick(...)` is the deployment convenience API. It runs the
 same explicit synchronous quick calibration, constructs a shape-bound runtime,
 and installs it only after both steps succeed. After it returns, compatible

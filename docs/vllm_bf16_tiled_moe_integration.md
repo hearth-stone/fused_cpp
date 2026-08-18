@@ -159,6 +159,7 @@ runtime = MoePlannerRuntime(
     degree=4,
     concurrent_ranks=1,
     cpu_ids=tuple(range(96)),
+    cost_cache_dir="/var/cache/fused_cpp/moe-costs",
 )
 previous_runtime = set_default_moe_planner_runtime(runtime)
 ```
@@ -180,6 +181,15 @@ dispatcher:
 ```python
 set_default_moe_planner_runtime(None)
 ```
+
+The runtime separately caches analytical `T_iso(M,T)` values on disk. Its
+default directory is `~/.fused_cpp/cache/moe_costs`; `cost_cache_dir=None`
+disables disk caching. Exact machine calibration, model dimensions, TP mode,
+backend geometry, analytical model version, and supported widths are part of
+the cache identity. Matching values are loaded at runtime construction;
+missing points are computed normally and atomically written back. Corrupt,
+stale, or unwritable files are ignored rather than failing inference. Final
+plans are not persisted because they still depend on the current routing input.
 
 ## Weight Preparation
 
@@ -383,6 +393,10 @@ if runtime is not None:
 `last_plan` is a snapshot intended for diagnostics and benchmarking. It
 contains the latest planner decision and cache information; callers should not
 treat its internal keys as a serialized public plan schema.
+
+The `cost_disk_cache` diagnostic reports `status`, `path`, `loaded_entries`,
+`total_entries`, and any non-fatal `error`. Expected states are `miss`, `hit`,
+`stored`, `disabled`, and `error`.
 
 To distinguish Plan V2 from fallback in an integration test, use a known
 compatible call and assert that `last_plan` was updated. Also exercise one

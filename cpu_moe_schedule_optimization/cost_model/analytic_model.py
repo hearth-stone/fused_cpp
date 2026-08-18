@@ -16,6 +16,7 @@ frontend, cache, DRAM, and epilogue service ceilings.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 from dataclasses import asdict, dataclass
@@ -57,6 +58,16 @@ _RESOURCE_PATHS = {
     "dram_bytes": "dram_to_llc_compulsory_and_spill",
     "epilogue_elements": "fused_epilogue_execution",
 }
+
+
+@lru_cache(maxsize=1)
+def _formula_source_sha256() -> str:
+    digest = hashlib.sha256()
+    root = Path(__file__).resolve().parent
+    for name in ("analytic_model.py", "full_stage_geometry.py", "gemm_cost_model.py", "sve_bf16_kernel_model.py"):
+        digest.update(name.encode("ascii"))
+        digest.update((root / name).read_bytes())
+    return digest.hexdigest()
 
 
 @dataclass(frozen=True)
@@ -1078,6 +1089,7 @@ class AnalyticMoeCostModel:
                 for domain in self.calibration.llc_domains
             ),
         )
+        self._t_iso_scalar_cache: dict[tuple[int, int], float] = {}
 
     @property
     def supported_shapes(self) -> tuple[tuple[int, ...], ...]:
@@ -1832,9 +1844,47 @@ class AnalyticMoeCostModel:
         )
 
     def T_iso(self, routes: int, threads: int) -> float:
-        if int(routes) <= 0:
+        routes = int(routes)
+        threads = int(threads)
+        if routes <= 0:
             return 0.0
-        return self.predict_expert(int(routes), int(threads)).total_ns
+        key = (routes, threads)
+        cached = self._t_iso_scalar_cache.get(key)
+        if cached is not None:
+            return cached
+        value = self.predict_expert(routes, threads).total_ns
+        self._t_iso_scalar_cache[key] = value
+        return value
+
+    def t_iso_cache_identity(self) -> dict[str, object]:
+        """Return every stable input needed to validate persisted T_iso values."""
+        return {
+            "analytic_model_schema_version": ANALYTIC_MODEL_SCHEMA_VERSION,
+            "analytic_model_name": ANALYTIC_MODEL_NAME,
+            "formula_source_sha256": _formula_source_sha256(),
+            "calibration": self.calibration.to_dict(),
+            "policy": list(self.policy.identity_key()),
+            "supported_widths": list(self.supported_widths),
+            "down_output_element_bytes": self.down_output_element_bytes,
+            "exact_m": self._exact_m,
+        }
+
+    def import_t_iso_cache(self, entries: Mapping[tuple[int, int], float]) -> int:
+        """Load validated scalar costs for this model's legal thread widths."""
+        loaded = 0
+        for (routes, threads), value in entries.items():
+            routes = int(routes)
+            threads = int(threads)
+            value = float(value)
+            if routes <= 0 or threads not in self.supported_widths or not math.isfinite(value) or value <= 0.0:
+                continue
+            self._t_iso_scalar_cache[(routes, threads)] = value
+            loaded += 1
+        return loaded
+
+    def export_t_iso_cache(self) -> dict[tuple[int, int], float]:
+        """Return a copy suitable for an atomic disk-cache write."""
+        return dict(self._t_iso_scalar_cache)
 
     def _task_phases(self, routes: int, threads: int) -> list[tuple[float, int]]:
         prediction = self.predict_expert(routes, threads)

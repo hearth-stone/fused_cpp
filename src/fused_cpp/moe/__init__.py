@@ -51,6 +51,7 @@ from fused_cpp.moe.bf16_tiled import (
 )
 from fused_cpp.moe.naive import fused_moe_naive, naive_fused_moe
 from fused_cpp.moe.planner_runtime import (
+    DEFAULT_MOE_COST_CACHE_DIR,
     MoePlannerRuntime,
     calibrate_moe_planner_quick,
     enable_moe_planner_quick,
@@ -70,6 +71,7 @@ __all__ = [
     "ASYNC_MOE_RESIZE_NONE",
     "ASYNC_MOE_STAGE_EXPERT",
     "AsyncMoEPlanV2",
+    "DEFAULT_MOE_COST_CACHE_DIR",
     "FusedMoEImpl",
     "MoePlannerRuntime",
     "PreparedBF16TiledFusedMoEWeights",

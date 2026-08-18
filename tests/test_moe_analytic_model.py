@@ -37,6 +37,7 @@ from interval_planner import IntervalPlanner  # noqa: E402
 from planned_moe import PlannedMoE  # noqa: E402
 from full_stage_geometry import full_stage_geometry  # noqa: E402
 from validate_analytic_model import build_validation_report  # noqa: E402
+from fused_cpp.moe import MoePlannerRuntime, PreparedBF16TiledFusedMoEWeights  # noqa: E402
 
 
 def _curve(
@@ -98,6 +99,79 @@ def _model(
         global_experts=8,
         local_experts=8,
     )
+
+
+def _runtime_weights(experts: int = 8) -> PreparedBF16TiledFusedMoEWeights:
+    import torch
+
+    packed = torch.empty((experts, 1), dtype=torch.bfloat16)
+    return PreparedBF16TiledFusedMoEWeights(
+        w13=(packed, 64, 64),
+        w2=(packed, 32, 64),
+        fused_silu=True,
+        gemm_backend=1,
+        backend_n_tile=8,
+        backend_name="arm_sve_bf16",
+    )
+
+
+def test_runtime_reuses_persisted_t_iso_without_recomputing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import torch
+
+    calibration = _calibration()
+    topk_ids = torch.tensor([[0], [0], [1], [1], [1], [2], [3], [3]], dtype=torch.int32)
+    kwargs = {
+        "hidden_size": 64,
+        "intermediate_size": 32,
+        "global_experts": 8,
+        "local_experts": 8,
+        "cpu_ids": tuple(range(8)),
+        "cost_cache_dir": tmp_path,
+    }
+    first = MoePlannerRuntime(calibration, **kwargs)
+    first_plan = first.plan_for_dispatch(
+        _runtime_weights(),
+        topk_ids,
+        num_threads=8,
+        activation="silu",
+        global_num_experts=-1,
+    )
+    assert first_plan is not None
+    assert first.last_plan["cost_disk_cache"]["status"] == "stored"
+    assert first.last_plan["cost_disk_cache"]["total_entries"] > 0
+
+    second = MoePlannerRuntime(calibration, **kwargs)
+
+    def fail_predict(*args, **kwargs):
+        raise AssertionError("persisted T_iso should bypass predict_expert")
+
+    monkeypatch.setattr(second.model, "predict_expert", fail_predict)
+    second_plan = second.plan_for_dispatch(
+        _runtime_weights(),
+        topk_ids,
+        num_threads=8,
+        activation="silu",
+        global_num_experts=-1,
+    )
+    assert second_plan is not None
+    assert second.last_plan["cost_disk_cache"]["status"] == "hit"
+    assert second.last_plan["cost_disk_cache"]["loaded_entries"] > 0
+    assert second_plan.task_threads.tolist() == first_plan.task_threads.tolist()
+    assert second_plan.task_core_begins.tolist() == first_plan.task_core_begins.tolist()
+
+    disabled = MoePlannerRuntime(calibration, **{**kwargs, "cost_cache_dir": None})
+    disabled_plan = disabled.plan_for_dispatch(
+        _runtime_weights(),
+        topk_ids,
+        num_threads=8,
+        activation="silu",
+        global_num_experts=-1,
+    )
+    assert disabled_plan is not None
+    assert disabled.last_plan["cost_disk_cache"]["status"] == "disabled"
 
 
 def test_service_curve_uses_two_hardware_anchors() -> None:
