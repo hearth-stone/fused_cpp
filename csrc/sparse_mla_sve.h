@@ -312,9 +312,9 @@ inline svbfloat16_t load_bf16(const uint16_t* ptr) {
   return svld1_bf16(svptrue_b16(), reinterpret_cast<const __bf16*>(ptr));
 }
 
-inline void store_qkt_row_pair(float* scores, int64_t scores_row_stride,
-                               int row_pair, int column_pair, float scale,
-                               svfloat32_t accumulator) {
+[[gnu::always_inline]] inline void store_qkt_accumulator_scatter(
+    float* scores, int64_t scores_row_stride, int row_pair, int column_pair,
+    float scale, svfloat32_t accumulator) {
   const svbool_t pg_all = svptrue_b32();
   const svfloat32_t scaled =
       svmul_f32_x(pg_all, accumulator, svdup_f32(scale));
@@ -323,9 +323,6 @@ inline void store_qkt_row_pair(float* scores, int64_t scores_row_stride,
       svreinterpret_f32_u64(svuzp1_u64(scaled_u64, scaled_u64));
   const svfloat32_t row1 =
       svreinterpret_f32_u64(svuzp2_u64(scaled_u64, scaled_u64));
-
-  // UZP packs one two-column result from every 128-bit segment into the low
-  // half. Scatter those pairs to their row-major positions in the 2VL tile.
   const uint64_t packed_lanes = static_cast<uint64_t>(svcntw() / 2);
   const svbool_t pg = svwhilelt_b32(uint64_t{0}, packed_lanes);
   const svuint32_t lane = svindex_u32(0, 1);
@@ -335,12 +332,76 @@ inline void store_qkt_row_pair(float* scores, int64_t scores_row_stride,
       svadd_u32_x(pg, svlsl_n_u32_x(pg, segment, 3), column_in_pair);
   offsets = svadd_n_u32_x(pg, offsets,
                           static_cast<uint32_t>(2 * column_pair));
-
   float* row0_out = scores + static_cast<int64_t>(2 * row_pair) *
                                  scores_row_stride;
   float* row1_out = row0_out + scores_row_stride;
   svst1_scatter_u32index_f32(pg, row0_out, offsets, row0);
   svst1_scatter_u32index_f32(pg, row1_out, offsets, row1);
+}
+
+[[gnu::always_inline]] inline void store_qkt_row_pair_contiguous(
+    float* scores, int64_t scores_row_stride, int row_pair, float scale,
+    svfloat32_t accumulator0, svfloat32_t accumulator1,
+    svfloat32_t accumulator2, svfloat32_t accumulator3) {
+  const int64_t vector_bytes = static_cast<int64_t>(svcntb());
+  if (vector_bytes != 16 && vector_bytes != 32) {
+    store_qkt_accumulator_scatter(scores, scores_row_stride, row_pair, 0,
+                                  scale, accumulator0);
+    store_qkt_accumulator_scatter(scores, scores_row_stride, row_pair, 1,
+                                  scale, accumulator1);
+    store_qkt_accumulator_scatter(scores, scores_row_stride, row_pair, 2,
+                                  scale, accumulator2);
+    store_qkt_accumulator_scatter(scores, scores_row_stride, row_pair, 3,
+                                  scale, accumulator3);
+    return;
+  }
+
+  const svbool_t pg_all = svptrue_b32();
+  const svfloat32_t vector_scale = svdup_f32(scale);
+  const svuint64_t a0 = svreinterpret_u64_f32(
+      svmul_f32_x(pg_all, accumulator0, vector_scale));
+  const svuint64_t a1 = svreinterpret_u64_f32(
+      svmul_f32_x(pg_all, accumulator1, vector_scale));
+  const svuint64_t a2 = svreinterpret_u64_f32(
+      svmul_f32_x(pg_all, accumulator2, vector_scale));
+  const svuint64_t a3 = svreinterpret_u64_f32(
+      svmul_f32_x(pg_all, accumulator3, vector_scale));
+
+  // At VL128, one deinterleave level joins adjacent column pairs. At VL256,
+  // each accumulator also contains a second 128-bit segment, so the second
+  // level groups the low/high N8 halves into contiguous row vectors.
+  const svuint64_t row0_pair01 = svuzp1_u64(a0, a1);
+  const svuint64_t row0_pair23 = svuzp1_u64(a2, a3);
+  const svuint64_t row1_pair01 = svuzp2_u64(a0, a1);
+  const svuint64_t row1_pair23 = svuzp2_u64(a2, a3);
+  svfloat32_t row0_lo;
+  svfloat32_t row0_hi;
+  svfloat32_t row1_lo;
+  svfloat32_t row1_hi;
+  if (vector_bytes == 16) {
+    row0_lo = svreinterpret_f32_u64(row0_pair01);
+    row0_hi = svreinterpret_f32_u64(row0_pair23);
+    row1_lo = svreinterpret_f32_u64(row1_pair01);
+    row1_hi = svreinterpret_f32_u64(row1_pair23);
+  } else {
+    row0_lo = svreinterpret_f32_u64(
+        svuzp1_u64(row0_pair01, row0_pair23));
+    row0_hi = svreinterpret_f32_u64(
+        svuzp2_u64(row0_pair01, row0_pair23));
+    row1_lo = svreinterpret_f32_u64(
+        svuzp1_u64(row1_pair01, row1_pair23));
+    row1_hi = svreinterpret_f32_u64(
+        svuzp2_u64(row1_pair01, row1_pair23));
+  }
+
+  float* row0_out = scores + static_cast<int64_t>(2 * row_pair) *
+                                 scores_row_stride;
+  float* row1_out = row0_out + scores_row_stride;
+  const int64_t vector_lanes = static_cast<int64_t>(svcntw());
+  svst1_f32(pg_all, row0_out, row0_lo);
+  svst1_f32(pg_all, row0_out + vector_lanes, row0_hi);
+  svst1_f32(pg_all, row1_out, row1_lo);
+  svst1_f32(pg_all, row1_out + vector_lanes, row1_hi);
 }
 
 inline void add_pv_row_pair(float* output, int64_t output_row_stride,
@@ -376,6 +437,62 @@ inline void add_pv_row_pair(float* output, int64_t output_row_stride,
                              svadd_f32_x(pg, old0, row0));
   svst1_scatter_u32index_f32(pg, row1_out, offsets,
                              svadd_f32_x(pg, old1, row1));
+}
+
+[[gnu::always_inline]] inline void add_pv_row_pair_contiguous(
+    float* output, int64_t output_row_stride, int row_pair,
+    int64_t valid_columns, svfloat32_t accumulator0,
+    svfloat32_t accumulator1, svfloat32_t accumulator2,
+    svfloat32_t accumulator3) {
+  const svuint64_t a0 = svreinterpret_u64_f32(accumulator0);
+  const svuint64_t a1 = svreinterpret_u64_f32(accumulator1);
+  const svuint64_t a2 = svreinterpret_u64_f32(accumulator2);
+  const svuint64_t a3 = svreinterpret_u64_f32(accumulator3);
+
+  // Join the four two-column accumulators into contiguous output rows. VL128
+  // needs one UZP level; VL256 needs a second level to join its N8 segments.
+  const svuint64_t row0_pair01 = svuzp1_u64(a0, a1);
+  const svuint64_t row0_pair23 = svuzp1_u64(a2, a3);
+  const svuint64_t row1_pair01 = svuzp2_u64(a0, a1);
+  const svuint64_t row1_pair23 = svuzp2_u64(a2, a3);
+  svfloat32_t row0_lo;
+  svfloat32_t row0_hi;
+  svfloat32_t row1_lo;
+  svfloat32_t row1_hi;
+  if (svcntb() == 16) {
+    row0_lo = svreinterpret_f32_u64(row0_pair01);
+    row0_hi = svreinterpret_f32_u64(row0_pair23);
+    row1_lo = svreinterpret_f32_u64(row1_pair01);
+    row1_hi = svreinterpret_f32_u64(row1_pair23);
+  } else {
+    row0_lo = svreinterpret_f32_u64(
+        svuzp1_u64(row0_pair01, row0_pair23));
+    row0_hi = svreinterpret_f32_u64(
+        svuzp2_u64(row0_pair01, row0_pair23));
+    row1_lo = svreinterpret_f32_u64(
+        svuzp1_u64(row1_pair01, row1_pair23));
+    row1_hi = svreinterpret_f32_u64(
+        svuzp2_u64(row1_pair01, row1_pair23));
+  }
+
+  const uint64_t vector_lanes = static_cast<uint64_t>(svcntw());
+  const uint64_t columns = static_cast<uint64_t>(valid_columns);
+  const svbool_t pg_lo = svwhilelt_b32(uint64_t{0}, columns);
+  const svbool_t pg_hi = svwhilelt_b32(vector_lanes, columns);
+  float* row0_out = output + static_cast<int64_t>(2 * row_pair) *
+                                 output_row_stride;
+  float* row1_out = row0_out + output_row_stride;
+
+  const svfloat32_t old0_lo = svld1_f32(pg_lo, row0_out);
+  const svfloat32_t old0_hi = svld1_f32(pg_hi, row0_out + vector_lanes);
+  const svfloat32_t old1_lo = svld1_f32(pg_lo, row1_out);
+  const svfloat32_t old1_hi = svld1_f32(pg_hi, row1_out + vector_lanes);
+  svst1_f32(pg_lo, row0_out, svadd_f32_x(pg_lo, old0_lo, row0_lo));
+  svst1_f32(pg_hi, row0_out + vector_lanes,
+            svadd_f32_x(pg_hi, old0_hi, row0_hi));
+  svst1_f32(pg_lo, row1_out, svadd_f32_x(pg_lo, old1_lo, row1_lo));
+  svst1_f32(pg_hi, row1_out + vector_lanes,
+            svadd_f32_x(pg_hi, old1_hi, row1_hi));
 }
 
 // Q is packed as [reduction/4][four 2-row x 4-reduction panels]. K uses the
@@ -434,22 +551,14 @@ __attribute__((noinline)) inline void qkt_8x2vl_bf16(
   }
 
   const int64_t tile = n_tile();
-  store_qkt_row_pair(scores, tile, 0, 0, scale, c00);
-  store_qkt_row_pair(scores, tile, 0, 1, scale, c01);
-  store_qkt_row_pair(scores, tile, 0, 2, scale, c02);
-  store_qkt_row_pair(scores, tile, 0, 3, scale, c03);
-  store_qkt_row_pair(scores, tile, 1, 0, scale, c10);
-  store_qkt_row_pair(scores, tile, 1, 1, scale, c11);
-  store_qkt_row_pair(scores, tile, 1, 2, scale, c12);
-  store_qkt_row_pair(scores, tile, 1, 3, scale, c13);
-  store_qkt_row_pair(scores, tile, 2, 0, scale, c20);
-  store_qkt_row_pair(scores, tile, 2, 1, scale, c21);
-  store_qkt_row_pair(scores, tile, 2, 2, scale, c22);
-  store_qkt_row_pair(scores, tile, 2, 3, scale, c23);
-  store_qkt_row_pair(scores, tile, 3, 0, scale, c30);
-  store_qkt_row_pair(scores, tile, 3, 1, scale, c31);
-  store_qkt_row_pair(scores, tile, 3, 2, scale, c32);
-  store_qkt_row_pair(scores, tile, 3, 3, scale, c33);
+  store_qkt_row_pair_contiguous(scores, tile, 0, scale, c00, c01, c02,
+                                c03);
+  store_qkt_row_pair_contiguous(scores, tile, 1, scale, c10, c11, c12,
+                                c13);
+  store_qkt_row_pair_contiguous(scores, tile, 2, scale, c20, c21, c22,
+                                c23);
+  store_qkt_row_pair_contiguous(scores, tile, 3, scale, c30, c31, c32,
+                                c33);
 }
 
 // Compute O[8, 2VL] += P[8, K] * V[K, 2VL]. P and V use the scalable A/B
@@ -507,22 +616,34 @@ __attribute__((noinline)) inline void pv_8x2vl_bf16(
     c33 = svbfmmla_f32(c33, a3, b3);
   }
 
-  add_pv_row_pair(output, output_row_stride, 0, 0, valid_columns, c00);
-  add_pv_row_pair(output, output_row_stride, 0, 1, valid_columns, c01);
-  add_pv_row_pair(output, output_row_stride, 0, 2, valid_columns, c02);
-  add_pv_row_pair(output, output_row_stride, 0, 3, valid_columns, c03);
-  add_pv_row_pair(output, output_row_stride, 1, 0, valid_columns, c10);
-  add_pv_row_pair(output, output_row_stride, 1, 1, valid_columns, c11);
-  add_pv_row_pair(output, output_row_stride, 1, 2, valid_columns, c12);
-  add_pv_row_pair(output, output_row_stride, 1, 3, valid_columns, c13);
-  add_pv_row_pair(output, output_row_stride, 2, 0, valid_columns, c20);
-  add_pv_row_pair(output, output_row_stride, 2, 1, valid_columns, c21);
-  add_pv_row_pair(output, output_row_stride, 2, 2, valid_columns, c22);
-  add_pv_row_pair(output, output_row_stride, 2, 3, valid_columns, c23);
-  add_pv_row_pair(output, output_row_stride, 3, 0, valid_columns, c30);
-  add_pv_row_pair(output, output_row_stride, 3, 1, valid_columns, c31);
-  add_pv_row_pair(output, output_row_stride, 3, 2, valid_columns, c32);
-  add_pv_row_pair(output, output_row_stride, 3, 3, valid_columns, c33);
+  const int64_t vector_bytes = static_cast<int64_t>(svcntb());
+  if (vector_bytes == 16 || vector_bytes == 32) {
+    add_pv_row_pair_contiguous(output, output_row_stride, 0, valid_columns,
+                               c00, c01, c02, c03);
+    add_pv_row_pair_contiguous(output, output_row_stride, 1, valid_columns,
+                               c10, c11, c12, c13);
+    add_pv_row_pair_contiguous(output, output_row_stride, 2, valid_columns,
+                               c20, c21, c22, c23);
+    add_pv_row_pair_contiguous(output, output_row_stride, 3, valid_columns,
+                               c30, c31, c32, c33);
+  } else {
+    add_pv_row_pair(output, output_row_stride, 0, 0, valid_columns, c00);
+    add_pv_row_pair(output, output_row_stride, 0, 1, valid_columns, c01);
+    add_pv_row_pair(output, output_row_stride, 0, 2, valid_columns, c02);
+    add_pv_row_pair(output, output_row_stride, 0, 3, valid_columns, c03);
+    add_pv_row_pair(output, output_row_stride, 1, 0, valid_columns, c10);
+    add_pv_row_pair(output, output_row_stride, 1, 1, valid_columns, c11);
+    add_pv_row_pair(output, output_row_stride, 1, 2, valid_columns, c12);
+    add_pv_row_pair(output, output_row_stride, 1, 3, valid_columns, c13);
+    add_pv_row_pair(output, output_row_stride, 2, 0, valid_columns, c20);
+    add_pv_row_pair(output, output_row_stride, 2, 1, valid_columns, c21);
+    add_pv_row_pair(output, output_row_stride, 2, 2, valid_columns, c22);
+    add_pv_row_pair(output, output_row_stride, 2, 3, valid_columns, c23);
+    add_pv_row_pair(output, output_row_stride, 3, 0, valid_columns, c30);
+    add_pv_row_pair(output, output_row_stride, 3, 1, valid_columns, c31);
+    add_pv_row_pair(output, output_row_stride, 3, 2, valid_columns, c32);
+    add_pv_row_pair(output, output_row_stride, 3, 3, valid_columns, c33);
+  }
 }
 
 #endif  // FUSED_CPP_SPARSE_MLA_HAS_SVE_BFMMLA

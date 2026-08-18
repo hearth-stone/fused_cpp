@@ -25,6 +25,7 @@ enum class Slot : int {
   kFinalize,
   kKColPack,
   kQktMicro,
+  kQktMicroOverhead,
   kCount,
 };
 
@@ -118,6 +119,8 @@ inline const char* slot_name(Slot slot) {
       return "k_col_pack";
     case Slot::kQktMicro:
       return "qkt_micro";
+    case Slot::kQktMicroOverhead:
+      return "qkt_micro_overhead";
     case Slot::kCount:
       return "count";
   }
@@ -166,6 +169,7 @@ inline void print_summary(const char* version, const char* kernel, const SdpaPar
   print_slot(Slot::kQkt, total_ns);
   print_slot(Slot::kKColPack, total_ns);
   print_slot(Slot::kQktMicro, total_ns);
+  print_slot(Slot::kQktMicroOverhead, total_ns);
   print_slot(Slot::kMask, total_ns);
   print_slot(Slot::kSoftmax, total_ns);
   print_slot(Slot::kPConvert, total_ns);

@@ -89,6 +89,65 @@ features:
       See optimizations/sparse_mla/results/amazon_sparse_mla_2d_fused_20260812.md.
     result: optimizations/sparse_mla/results/amazon_sparse_mla_2d_fused_20260812.md
 
+  - id: scheduling.token_panel_ac_l2
+    part: scheduling
+    status: retired
+    implementation: Removed from the active tree
+    hypothesis: >-
+      Group adjacent input tokens into a thread-local panel so packed Q and
+      online output state remain in private L2 while each shared packed-K/V B
+      chunk streams once through the panel; split tokens before KV/B shards.
+    depends_on:
+      - scheduling.head_major_sparse
+      - packing.shared_prefix_kv_2vl
+    conflicts_with: []
+    correctness: >-
+      Amazon 8C native SVL256 shared-prefix output/statistics tests passed for
+      panel 4. M5 native SVL128 direct native-versus-naive output/statistics
+      checks passed for shared dense, shared prefix, and later sparse with
+      panel4/B64/single and panel8/B256/double scratch. Timed checksums matched.
+    benchmark: >-
+      tests/bench_sparse_mla_scalable.py --pattern sparse --s-q 2048
+      --compressed-capacity 512 --window-size 2048 --context-start 0
+      --threads 1|8 --warmup 5 --iters 21 --seed 20260817
+    result: >-
+      optimizations/sparse_mla/results/amazon_8c_token_panel_cache_20260817.md
+      and optimizations/sparse_mla/results/amazon_m5_token_panel_cache_20260817.md
+    history: uncommitted prototype; no source retained
+    retirement_reason: >-
+      Panel 4 reduced latency only 1.48-1.52% at one thread and 0.88-0.95% at
+      eight threads, below the 3% adoption gate. Panel 8 regressed eight-thread
+      latency by 1.06%, and the existing token-major fallback was 79-82% slower.
+      On M5 cores 96-191, all nine panel/B-block combinations missed the gate;
+      paired panel8/B256 changed 2048, 8192, and later sparse latency by
+      -0.14%, +0.30%, and +0.19% respectively.
+
+  - id: scheduling.sc_tile_retune_after_fusion
+    part: scheduling
+    status: retired
+    implementation: Removed from the active tree
+    hypothesis: >-
+      After eliminating max-only score scans and row-major P packing, smaller
+      shared-path Sc tiles may fit the remaining score/online state better and
+      expose cache gains that the original token-panel experiment missed.
+    depends_on:
+      - compute.qk_score_copy_max_fusion
+      - compute.softmax_direct_packed_p
+    conflicts_with: []
+    correctness: >-
+      M5 native-versus-naive dense, odd-tail dense, shared-prefix, and later
+      sparse output/statistics checks passed for fixed Sc tiles 64 and 512.
+    benchmark: >-
+      numactl --physcpubind=96-191 --membind=1
+      tests/bench_sparse_mla_scalable.py --threads 96 --warmup 10 --iters 21
+      --seed 20260817
+    result: >-
+      optimizations/sparse_mla/results/amazon_m5_post_fusion_cache_retune_20260817.md
+    history: no source retained; temporary compile-time override removed
+    retirement_reason: >-
+      Auto beat fixed 64/128/256/512. The closest 512 tile was 0.29-0.87%
+      slower at 2048 and about 3.6-3.9% slower in the clean 8192 low mode.
+
   - id: packing.shared_prefix_kv_2vl
     part: packing
     status: enabled
@@ -177,6 +236,29 @@ features:
     result: >-
       optimizations/sparse_mla/results/amazon_8c_scalable_sve_20260814.md and
       optimizations/sparse_mla/results/amazon_8c_dense_scalable_sve_20260814.md
+      and optimizations/sparse_mla/results/amazon_qk_contiguous_store_20260817.md
+      and optimizations/sparse_mla/results/amazon_qkt_micro_profile_20260817.md
+
+  - id: compute.sve_qk_contiguous_store
+    part: compute
+    status: enabled
+    implementation: csrc/sparse_mla_sve.h
+    hypothesis: >-
+      Reordering each row-pair's four QK accumulators with one VL128 or two
+      VL256 UZP levels and using contiguous ST1W removes indexed scatter and
+      address-generation backend stalls without changing score order.
+    depends_on:
+      - compute.sve_qk_8x2vl_bfmmla
+      - compute.qk_score_copy_max_fusion
+    conflicts_with: []
+    correctness: >-
+      Native SVL256 and forced SVL128 each pass all 26 cases in
+      tests/test_sparse_mla.py; M5 native SVL128 direct checks also pass.
+    benchmark: >-
+      tests/bench_sparse_mla_scalable.py --pattern sparse|dense --threads 1|8|96
+      --warmup 5|10 --iters 9|21 --seed 20260817
+    result: >-
+      optimizations/sparse_mla/results/amazon_qk_contiguous_store_20260817.md
 
   - id: compute.sve_pv_8x2vl_bfmmla
     part: compute
@@ -200,6 +282,164 @@ features:
     result: >-
       optimizations/sparse_mla/results/amazon_8c_scalable_sve_20260814.md and
       optimizations/sparse_mla/results/amazon_8c_dense_scalable_sve_20260814.md
+      and optimizations/sparse_mla/results/amazon_pv_contiguous_store_20260817.md
+
+  - id: compute.sve_pv_contiguous_update
+    part: compute
+    status: enabled
+    implementation: csrc/sparse_mla_sve.h
+    hypothesis: >-
+      Reordering each row-pair's four PV accumulators with VL-specific UZP and
+      using predicated contiguous LD1W/FADD/ST1W removes indexed gather/scatter
+      address overhead while preserving online output accumulation.
+    depends_on:
+      - compute.sve_pv_8x2vl_bfmmla
+      - compute.softmax_direct_packed_p
+    conflicts_with: []
+    correctness: >-
+      Native SVL256 and forced SVL128 each pass all 26 cases in
+      tests/test_sparse_mla.py; M5 native SVL128 direct checks also pass.
+    benchmark: >-
+      tests/bench_sparse_mla_scalable.py --threads 8|96 --warmup 5|10
+      --iters 21 --seed 20260817
+    result: >-
+      optimizations/sparse_mla/results/amazon_pv_contiguous_store_20260817.md
+
+  - id: compute.softmax_exp_packed_constants
+    part: compute
+    status: experimental
+    implementation: optimizations/sparse_mla/benchmarks/softmax_exp_constants.cpp
+    hypothesis: >-
+      Packing degree-5 exp constants into NEON lanes and evaluating the
+      polynomial with dependency-broken Estrin FMLA reduces latency and spills
+      relative to broadcast-constant Horner, especially while the 16 SVE
+      accumulators of an 8x2VL BFMMLA tile remain live.
+    depends_on:
+      - compute.sve_qk_8x2vl_bfmmla
+    conflicts_with: []
+    owner: zhangxu
+    opened: 2026-08-16
+    decision_by: 2026-09-15
+    next_decision: >-
+      Retire if M5 accuracy exceeds the existing degree-5 envelope, if the
+      dependency-broken candidate does not improve the best adequately
+      unrolled baseline, or if register-pressure gains do not survive the
+      synthetic 8x2VL live-accumulator benchmark.
+    adoption_gate: >-
+      Match the current degree-5 BF16 tolerance, improve median isolated
+      exp-minus throughput by at least 3%, and introduce no additional stack
+      vector spills under the 8x2VL pressure wrapper on AmazonM5192Cores.
+    correctness: >-
+      optimizations/sparse_mla/benchmarks/softmax_exp_constants
+      --length=2048 --warmup=1 --iterations=1 --samples=1
+    benchmark: >-
+      numactl --physcpubind=96 --membind=1
+      optimizations/sparse_mla/benchmarks/softmax_exp_constants
+      --length=2048 --warmup=200 --iterations=2000 --samples=21
+    result: >-
+      optimizations/sparse_mla/results/amazon_m5_softmax_exp_constants_20260816.md
+    conclusion: >-
+      BF16 accuracy was unchanged and packed-lane Estrin improved best-to-best
+      isolated and 16-live-accumulator throughput by 5.92% and 5.75%. However,
+      that comparison uses U8 instead of Horner U4 and therefore adds spills;
+      matched U8 keeps eight Z spill slots while reducing repeated Q spill
+      pairs from 14 to 5. Keep Lab-only pending an integrated tile prototype.
+
+  - id: compute.qk_score_copy_max_fusion
+    part: compute
+    status: enabled
+    implementation: csrc/sparse_mla.cpp
+    hypothesis: >-
+      Accumulating each row maximum while copying an 8x2VL QK tile into score
+      scratch removes the later max-only score scan without changing online
+      softmax order, numerical behavior, or the QK/PV microkernels.
+    depends_on:
+      - compute.sve_qk_8x2vl_bfmmla
+    conflicts_with: []
+    correctness: >-
+      OMP_NUM_THREADS=4 OMP_PROC_BIND=close OMP_PLACES=cores taskset -c 0-3
+      .venv/bin/python -m pytest -q tests/test_sparse_mla.py
+    benchmark: >-
+      numactl --physcpubind=96-191 --membind=1
+      tests/bench_sparse_mla_scalable.py --threads 96 --warmup 10 --iters 21
+      --seed 20260817
+    result: >-
+      optimizations/sparse_mla/results/amazon_m5_score_copy_max_20260817.md
+
+  - id: compute.softmax_direct_packed_p
+    part: compute
+    status: enabled
+    implementation: csrc/sparse_mla.cpp
+    hypothesis: >-
+      Writing each four-value BF16 exp result directly into the BFMMLA PV A
+      layout removes the row-major probability scratch round-trip and separate
+      P-pack pass without changing exp, sum, conversion, or PV arithmetic.
+    depends_on:
+      - compute.qk_score_copy_max_fusion
+      - compute.sve_pv_8x2vl_bfmmla
+    conflicts_with: []
+    correctness: >-
+      OMP_NUM_THREADS=4 OMP_PROC_BIND=close OMP_PLACES=cores taskset -c 0-3
+      .venv/bin/python -m pytest -q tests/test_sparse_mla.py
+    benchmark: >-
+      numactl --physcpubind=96-191 --membind=1
+      tests/bench_sparse_mla_scalable.py --threads 96 --warmup 10 --iters 21
+      --seed 20260817
+    result: >-
+      optimizations/sparse_mla/results/amazon_m5_direct_packed_p_20260817.md
+
+  - id: compute.pv_online_output_correction
+    part: compute
+    status: retired
+    implementation: Removed from the active tree
+    hypothesis: >-
+      Applying each online-softmax output correction in the SVE PV store
+      epilogue removes a standalone full-output scale pass and its memory
+      traffic while preserving scalar max/sum update order.
+    depends_on:
+      - compute.softmax_direct_packed_p
+      - compute.sve_pv_8x2vl_bfmmla
+    conflicts_with: []
+    correctness: >-
+      OMP_NUM_THREADS=4 OMP_PROC_BIND=close OMP_PLACES=cores taskset -c 0-3
+      .venv/bin/python -m pytest -q tests/test_sparse_mla.py
+    benchmark: >-
+      numactl --physcpubind=96-191 --membind=1
+      tests/bench_sparse_mla_scalable.py --threads 96 --warmup 10 --iters 21
+      --seed 20260817
+    result: >-
+      optimizations/sparse_mla/results/amazon_m5_pv_online_correction_20260817.md
+    history: 6d5de7a
+    retirement_reason: >-
+      Relative to direct packed-P, 2048 and later sparse regressed 0.11% and
+      0.68%. Repeating row-scale work in every PV output tile outweighed the
+      removed contiguous output-scale pass.
+
+  - id: compute.sve_dense_multi_query_16xvl
+    part: compute
+    status: retired
+    implementation: Removed from the active tree
+    hypothesis: >-
+      Replacing two independent 8x2VL dense kernels with two 16xVL half-tile
+      kernels reuses each packed K/V B vector across adjacent query tokens and
+      halves B loads while keeping 16 accumulators and independent softmax.
+    depends_on:
+      - compute.softmax_direct_packed_p
+      - packing.sve_dense_kv_2vl
+    conflicts_with: []
+    correctness: >-
+      OMP_NUM_THREADS=4 OMP_PROC_BIND=close OMP_PLACES=cores taskset -c 0-3
+      .venv/bin/python -m pytest -q tests/test_sparse_mla.py
+    benchmark: >-
+      numactl --physcpubind=96-191 --membind=1
+      tests/bench_sparse_mla_scalable.py --pattern dense --s-q 8192
+      --threads 96 --warmup 10 --iters 21 --seed 20260817
+    result: >-
+      optimizations/sparse_mla/results/amazon_m5_dense_multi_query_16xvl_20260817.md
+    history: bedd7f2
+    retirement_reason: >-
+      A clean low-mode 8192 comparison regressed 2.75% versus direct packed-P.
+      Halving B loads did not offset two half-tile calls and doubled token state.
 
   - id: planning.masked_dense_tail
     part: planning
@@ -259,10 +499,16 @@ variants:
       - packing.shared_prefix_kv_2vl
       - packing.sve_indexed_kv_single_load
       - compute.sve_qk_8x2vl_bfmmla
+      - compute.sve_qk_contiguous_store
       - compute.sve_pv_8x2vl_bfmmla
+      - compute.sve_pv_contiguous_update
+      - compute.qk_score_copy_max_fusion
+      - compute.softmax_direct_packed_p
     result: >-
       optimizations/sparse_mla/results/amazon_8c_scalable_sve_20260814.md and
       optimizations/sparse_mla/results/amazon_8c_dense_scalable_sve_20260814.md
+      and optimizations/sparse_mla/results/amazon_qk_contiguous_store_20260817.md
+      and optimizations/sparse_mla/results/amazon_pv_contiguous_store_20260817.md
 
   - id: head_major_sve_qk_8x2vl_neon_pv
     status: retired

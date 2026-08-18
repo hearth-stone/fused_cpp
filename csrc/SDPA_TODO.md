@@ -202,6 +202,32 @@
 
 ## 已完成（参 SDPA_VERSIONS.md 的 Changelog）
 
+- ✅ **Sparse MLA sampled QKT micro-profile** —— 2026-08-17
+  - deep profile samples one of every 16 QKT tiles in a cold noinline helper
+    and subtracts a matched empty-timer slot from the measured kernel time
+  - 2048 prefix, 1T: M5/SVL128 308.3 GFLOP/s; Amazon 8C/SVL256 255.7 GFLOP/s
+  - default-profile-off paired checks show no consistent regression
+- ✅ **Sparse MLA SVE PV contiguous output update** —— 2026-08-17
+  - combine each row-pair's four accumulators with VL-specific UZP, then use
+    predicated contiguous LD1W/FADD/ST1W instead of 16 indexed updates
+  - M5 96T/SVL128: 2048 -3.4%, 8192 -2.6%, later sparse -2.1%; 1T PV -20.2%
+  - Amazon 8C/SVL256: 8T -5.5% to -5.7%; native VL256 and forced VL128 26 passed
+- ✅ **Sparse MLA SVE QK contiguous score store** —— 2026-08-17
+  - replace accumulator-by-accumulator score scatter with one-level VL128 or
+    two-level VL256 UZP and contiguous ST1W; other VLs retain scatter fallback
+  - M5 96T: 2048 -2.93%, stable 8192 about -7.4%, later sparse -6.59%
+  - Amazon 8C SVL256: 8T -5.8% to -7.4%, 1T -8.2% to -10.4%; both VLs 26 passed
+- ✅ **Sparse MLA token-panel L2 cache schedule rejected** —— 2026-08-17
+  - panel 4 kept per-token online-softmax order and reused each packed B chunk
+    across four adjacent tokens, but improved Amazon 8C by only 1.5%/0.9% at
+    1/8 threads; panel 8 regressed eight-thread latency by 1.1%
+  - the existing token-major fallback was 79--82% slower; retain the current
+    head-major token-first schedule and use KV shards only for query underfill
+  - M5 cores 96--191: the full panel `{4,8,16}` x B-block `{64,128,256}`
+    sweep also failed; paired panel8/B256 changed 2048/8192/later-sparse by
+    -0.14%/+0.30%/+0.19%. PMU showed fewer 2048 L2 refills without wall-time gain
+  - after score/max and packed-P fusion, fixed Sc tiles 64/128/256/512 were
+    rescanned; auto remained fastest, with fixed 512 slower on 2048 and 8192
 - ✅ **P0: QKᵀ-fp32 重写为 4×4 双向分块（`MK_QkUblock4` trait）** —— 2026-05-23
   - 新增 `gemm_qkt_microkernel_8x8_fp32_ublock4`：8×8 输出切 4 个 4×4 子块，每块 16 个独立 fp32 累加器外积扇出 + vpaddq 树 reduce，把 ILP 从 1 条链拉到 16 条独立 fma 链
   - 不需要 K 转置或 pre-pack；Q/K 仍按行连续 vld1q_f32 加载
