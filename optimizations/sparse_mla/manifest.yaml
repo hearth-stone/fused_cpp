@@ -236,6 +236,29 @@ features:
     result: >-
       optimizations/sparse_mla/results/amazon_8c_scalable_sve_20260814.md and
       optimizations/sparse_mla/results/amazon_8c_dense_scalable_sve_20260814.md
+      and optimizations/sparse_mla/results/amazon_qk_contiguous_store_20260817.md
+      and optimizations/sparse_mla/results/amazon_qkt_micro_profile_20260817.md
+
+  - id: compute.sve_qk_contiguous_store
+    part: compute
+    status: enabled
+    implementation: csrc/sparse_mla_sve.h
+    hypothesis: >-
+      Reordering each row-pair's four QK accumulators with one VL128 or two
+      VL256 UZP levels and using contiguous ST1W removes indexed scatter and
+      address-generation backend stalls without changing score order.
+    depends_on:
+      - compute.sve_qk_8x2vl_bfmmla
+      - compute.qk_score_copy_max_fusion
+    conflicts_with: []
+    correctness: >-
+      Native SVL256 and forced SVL128 each pass all 26 cases in
+      tests/test_sparse_mla.py; M5 native SVL128 direct checks also pass.
+    benchmark: >-
+      tests/bench_sparse_mla_scalable.py --pattern sparse|dense --threads 1|8|96
+      --warmup 5|10 --iters 9|21 --seed 20260817
+    result: >-
+      optimizations/sparse_mla/results/amazon_qk_contiguous_store_20260817.md
 
   - id: compute.sve_pv_8x2vl_bfmmla
     part: compute
@@ -259,6 +282,28 @@ features:
     result: >-
       optimizations/sparse_mla/results/amazon_8c_scalable_sve_20260814.md and
       optimizations/sparse_mla/results/amazon_8c_dense_scalable_sve_20260814.md
+      and optimizations/sparse_mla/results/amazon_pv_contiguous_store_20260817.md
+
+  - id: compute.sve_pv_contiguous_update
+    part: compute
+    status: enabled
+    implementation: csrc/sparse_mla_sve.h
+    hypothesis: >-
+      Reordering each row-pair's four PV accumulators with VL-specific UZP and
+      using predicated contiguous LD1W/FADD/ST1W removes indexed gather/scatter
+      address overhead while preserving online output accumulation.
+    depends_on:
+      - compute.sve_pv_8x2vl_bfmmla
+      - compute.softmax_direct_packed_p
+    conflicts_with: []
+    correctness: >-
+      Native SVL256 and forced SVL128 each pass all 26 cases in
+      tests/test_sparse_mla.py; M5 native SVL128 direct checks also pass.
+    benchmark: >-
+      tests/bench_sparse_mla_scalable.py --threads 8|96 --warmup 5|10
+      --iters 21 --seed 20260817
+    result: >-
+      optimizations/sparse_mla/results/amazon_pv_contiguous_store_20260817.md
 
   - id: compute.softmax_exp_packed_constants
     part: compute
@@ -302,8 +347,8 @@ features:
 
   - id: compute.qk_score_copy_max_fusion
     part: compute
-    status: experimental
-    implementation: csrc/sparse_mla.cpp on exp/sdpa/sparse-attn
+    status: enabled
+    implementation: csrc/sparse_mla.cpp
     hypothesis: >-
       Accumulating each row maximum while copying an 8x2VL QK tile into score
       scratch removes the later max-only score scan without changing online
@@ -311,16 +356,6 @@ features:
     depends_on:
       - compute.sve_qk_8x2vl_bfmmla
     conflicts_with: []
-    owner: zhangxu
-    opened: 2026-08-17
-    decision_by: 2026-09-15
-    next_decision: >-
-      Combine with direct packed-P generation, then compare the combined path
-      with the original baseline on 2048, 8192, and later sparse M5 workloads.
-    adoption_gate: >-
-      Preserve current Sparse MLA tolerances on SVL128 and SVL256; improve 2048
-      or 8192 median latency by at least 3%, regress the other shared case by no
-      more than 1%, and regress later sparse by no more than 1%.
     correctness: >-
       OMP_NUM_THREADS=4 OMP_PROC_BIND=close OMP_PLACES=cores taskset -c 0-3
       .venv/bin/python -m pytest -q tests/test_sparse_mla.py
@@ -333,8 +368,8 @@ features:
 
   - id: compute.softmax_direct_packed_p
     part: compute
-    status: experimental
-    implementation: csrc/sparse_mla.cpp on exp/sdpa/sparse-attn
+    status: enabled
+    implementation: csrc/sparse_mla.cpp
     hypothesis: >-
       Writing each four-value BF16 exp result directly into the BFMMLA PV A
       layout removes the row-major probability scratch round-trip and separate
@@ -343,16 +378,6 @@ features:
       - compute.qk_score_copy_max_fusion
       - compute.sve_pv_8x2vl_bfmmla
     conflicts_with: []
-    owner: zhangxu
-    opened: 2026-08-17
-    decision_by: 2026-09-15
-    next_decision: >-
-      Fuse online max/sum/output correction with the QK/PV epilogue and rerun
-      original-baseline, step-2, and combined comparisons.
-    adoption_gate: >-
-      Preserve current Sparse MLA tolerances on SVL128 and SVL256; improve 2048
-      or 8192 median latency by at least 3%, regress the other shared case by no
-      more than 1%, and regress later sparse by no more than 1%.
     correctness: >-
       OMP_NUM_THREADS=4 OMP_PROC_BIND=close OMP_PLACES=cores taskset -c 0-3
       .venv/bin/python -m pytest -q tests/test_sparse_mla.py
@@ -474,10 +499,16 @@ variants:
       - packing.shared_prefix_kv_2vl
       - packing.sve_indexed_kv_single_load
       - compute.sve_qk_8x2vl_bfmmla
+      - compute.sve_qk_contiguous_store
       - compute.sve_pv_8x2vl_bfmmla
+      - compute.sve_pv_contiguous_update
+      - compute.qk_score_copy_max_fusion
+      - compute.softmax_direct_packed_p
     result: >-
       optimizations/sparse_mla/results/amazon_8c_scalable_sve_20260814.md and
       optimizations/sparse_mla/results/amazon_8c_dense_scalable_sve_20260814.md
+      and optimizations/sparse_mla/results/amazon_qk_contiguous_store_20260817.md
+      and optimizations/sparse_mla/results/amazon_pv_contiguous_store_20260817.md
 
   - id: head_major_sve_qk_8x2vl_neon_pv
     status: retired

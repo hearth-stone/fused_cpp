@@ -705,6 +705,64 @@ file passed 26 tests. This is an experimental sequence checkpoint below the
 standalone 3% gate; direct packed-P generation is evaluated next. Full data is
 in `optimizations/sparse_mla/results/amazon_m5_score_copy_max_20260817.md`.
 
+### Sparse MLA SVE QK contiguous score store
+
+Replaced per-accumulator indexed score scatter in `qkt_8x2vl_bf16` with the
+continuous-C technique validated by the Amazon 8C i8gemm K128 study. VL128
+uses one `UZP .d` level; VL256 uses two levels; other VLs retain scatter. Four
+row-pair helpers are forced inline, producing ordinary `ST1W` in the hot path.
+QK BFMMLA, scale, score order, softmax, packed-P, PV, and dispatch are unchanged.
+
+M5 96T/SVL128 three-session results versus direct packed-P scatter: 2048
+shared-prefix -2.93%, stable-low-mode 8192 about -7.4%, and later sparse
+-6.59%. One-thread profile attributed the change to `qkt_total`
+160.175→125.254 ms (-21.80%) while softmax/PV stayed flat. Amazon 8C/SVL256
+8T forward/reverse improved 2048 by 5.79%/6.11%, 8192 by 7.06%/7.40%, and later
+sparse by 6.47%/6.57%; 1T improved 9.96%/10.44%/8.16%. Native SVL256 and forced
+SVL128 each reported `26 passed`; timed checksums were identical. Full data is
+in `optimizations/sparse_mla/results/amazon_qk_contiguous_store_20260817.md`.
+
+### Sparse MLA SVE PV contiguous output update
+
+Replaced the 16 accumulator-at-a-time indexed output updates in
+`pv_8x2vl_bf16` with four row-pair updates. As in the QK epilogue, VL128 uses
+one `UZP .d` level and VL256 uses two; each reconstructed row is then updated
+with predicated contiguous `LD1W + FADD + ST1W`. Other vector lengths retain
+the original gather/scatter fallback. The output load/add remains necessary for
+online-softmax chunk accumulation; BFMMLA, packed P/V, correction order,
+normalization, dispatch, and public numerical contracts are unchanged.
+
+Against the QK-contiguous baseline, M5 NUMA1 cores 96--191/SVL128 forward and
+reverse session medians improved 2048 by 3.4%, 8192 by 2.6%, and later sparse
+by 2.1%. A one-thread profile reduced `pv` from 28.027 to 22.354 ms (-20.24%)
+and total from 103.691 to 97.885 ms (-5.60%), while QK and softmax stayed flat.
+Amazon 8C/SVL256 forward/reverse improved the same cases by 5.5%, 5.7%, and
+5.7%. Native SVL256 and forced SVL128 each reported `26 passed`; M5 direct
+dense/shared-prefix/later-sparse checks passed and timed checksums matched.
+Full commands and values are in
+`optimizations/sparse_mla/results/amazon_pv_contiguous_store_20260817.md`.
+
+### Sparse MLA sampled QKT micro-profile
+
+Added a deep-only QKT micro-profile for the shared head-major chunk executor.
+The hot default loop remains separate; when both `FUSED_CPP_SDPA_PROFILE=1`
+and `FUSED_CPP_SDPA_PROFILE_DEEP=1` are set, a cold noinline helper samples one
+of every 16 `qkt_8x2vl_bf16` calls. A matched empty `qkt_micro_overhead` timer
+uses the same sample count, so corrected kernel time is
+`qkt_micro - qkt_micro_overhead`. This avoids the severe perturbation from
+timing every roughly 50--100 ns tile call.
+
+For the 2048 prefix workload (`Hq=32,Dqk=192,Dv=128`, one thread), five-process
+medians give M5/SVL128 28,224 sampled 8x8 tiles in 2.250 ms after correction,
+or 308.3 GFLOP/s. Amazon 8C/SVL256 sampled 17,128 8x16 tiles in 3.292 ms, or
+255.7 GFLOP/s. The timed function includes BFMMLA, scale, VL-specific UZP, and
+contiguous score store, but excludes score copy/max fusion. Profile-off paired
+checks versus the pre-instrumentation binary changed M5 by +0.23% and Amazon
+8C by -0.38%; deployment-width checks changed M5 96T by -0.03% and Amazon 8T
+by -0.36%, so there is no consistent default-path regression. Full data and
+formulas are in
+`optimizations/sparse_mla/results/amazon_qkt_micro_profile_20260817.md`.
+
 ### Sparse MLA direct packed-P checkpoint
 
 The SVE head-major exp loop now writes every four BF16 probabilities directly
@@ -829,6 +887,9 @@ as a traffic proxy. The prototype was removed. Full data is in
 
 | 日期 | 改动概述 | 受影响文件 |
 |---|---|---|
+| 2026-08-17 | **Sparse MLA sampled QKT micro-profile**：在冷 `noinline` helper 中对 `qkt_8x2vl_bf16` 每 16 个 tile 采样一个，并新增同次数空计时 `qkt_micro_overhead`；校正时间为两者之差，默认热 loop 不含逐 tile 判断。2048 prefix/1T 五进程中位：M5/SVL128 308.3 GFLOP/s，Amazon 8C/SVL256 255.7 GFLOP/s；计时包含 scale/UZP/score store，不含 score copy/max。关闭 deep-profile 的配对对照为 M5 1T/96T +0.23%/-0.03%、Amazon 1T/8T -0.38%/-0.36%，无一致回退；VL256/VL128 各 `26 passed`。 | 改 `csrc/{sparse_mla.cpp,sdpa_profile.h,SDPA_TODO.md,SDPA_VERSIONS.md}`、`optimizations/sparse_mla/manifest.yaml`；新建 `optimizations/sparse_mla/results/amazon_qkt_micro_profile_20260817.md` |
+| 2026-08-17 | **Sparse MLA SVE PV 连续 output 更新**：`pv_8x2vl_bf16` 将 16 次逐 accumulator indexed gather/add/scatter 改为 4 次 row-pair UZP + predicated contiguous `LD1W/FADD/ST1W`；VL128 一级 UZP，VL256 两级，其他 VL 保留 fallback。相对 QK-contiguous baseline，M5 96T 的 2048/8192/later sparse 分别 -3.4%/-2.6%/-2.1%，1T profile `pv` -20.24%；Amazon 8C/SVL256 8T 分别约 -5.5%/-5.7%/-5.7%。原生 SVL256、强制 SVL128 各 `26 passed`，checksum 一致。 | 改 `csrc/{sparse_mla_sve.h,SDPA_TODO.md,SDPA_VERSIONS.md}`、`optimizations/sparse_mla/manifest.yaml`；新建 `optimizations/sparse_mla/results/amazon_pv_contiguous_store_20260817.md` |
+| 2026-08-17 | **Sparse MLA SVE QK 连续 score 写回**：参考 i8gemm K128 连续 C store，`qkt_8x2vl_bf16` 把逐 accumulator indexed scatter 改为 row-pair UZP + 连续 `ST1W`；VL128 一级 UZP，VL256 两级，其他VL保留scatter fallback，helper强制内联。M5 96T/SVL128：2048 -2.93%、8192 stable low-mode 约 -7.4%、later sparse -6.59%，profile `qkt_total` -21.80%。Amazon 8C/SVL256 8T 三形状 -5.8%~-7.4%，1T -8.2%~-10.4%。SVL128/SVL256 各 `26 passed`，checksum 一致。 | 改 `csrc/{sparse_mla_sve.h,SDPA_TODO.md,SDPA_VERSIONS.md}`、`optimizations/sparse_mla/manifest.yaml`；新建 `optimizations/sparse_mla/results/amazon_qk_contiguous_store_20260817.md` |
 | 2026-08-17 | **Sparse MLA 融合后 Sc-tile/cache 重扫保持 auto**：在 score-copy/max + direct packed-P 上扫 shared 路径 Sc tile `{64,128,256,512}`。M5 96T/SVL128 2048 正/反顺序：auto 11.380/11.399 ms，512 11.486/11.481，256 11.687/11.703，128 12.184/12.170，64 12.905/12.883。8192 clean low-mode auto 8.736--8.776 vs 512 9.079--9.088 ms（+3.6--3.9%）。结合之前 token-panel PMU 和 16xVL 负结果，不保留实验宏、手工 block 或 token panel。 | 改 `csrc/{SDPA_TODO.md,SDPA_VERSIONS.md}`、`optimizations/sparse_mla/manifest.yaml`；新建 `optimizations/sparse_mla/results/amazon_m5_post_fusion_cache_retune_20260817.md` |
 | 2026-08-17 | **撤回 Sparse MLA dense 双 token `16xVL` kernel**：完整实现已由 `bedd7f2` 保留，活动源恢复到 direct packed-P；manifest 改为 retired，shared-dense 继续使用更快的单 token `8x2VL`。 | 改 `csrc/{sparse_mla.cpp,sparse_mla_sve.h,SDPA_VERSIONS.md}`、`optimizations/sparse_mla/manifest.yaml` |
 | 2026-08-17 | **Sparse MLA dense 双 token `16xVL` 负实验**：新增 QK/PV `16xVL` kernel，两个 token 保持独立 softmax，共享 packed B；两次 VL half-tile 覆盖原 2VL 布局，累加器仍为 16。M5 96T/SVL128 clean low-mode 8192：9.056 vs direct packed-P 8.814 ms（+2.75%），相对原基线 9.219 ms 仅 -1.77%；2048/later sparse 约 +0.04%。M5 偶数/奇数 token 检查与 Amazon 8C/SVL256 `26 passed`。B load 减半不足以抵消 half-tile/epilogue 开销，故保留 Git checkpoint 后撤回。 | 改 `csrc/{sparse_mla.cpp,sparse_mla_sve.h,SDPA_VERSIONS.md}`、`optimizations/sparse_mla/manifest.yaml`；新建 `optimizations/sparse_mla/results/amazon_m5_dense_multi_query_16xvl_20260817.md` |

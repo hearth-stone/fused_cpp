@@ -1014,6 +1014,39 @@ static inline float vectorized_exp_minus_packed_p_bf16(
   return block_sum;
 }
 
+#if FUSED_CPP_SPARSE_MLA_HAS_SVE_BFMMLA
+[[gnu::noinline]] static void run_heads_qkt_deep_profile_sve(
+    const uint16_t* q_packed, const uint16_t* k_packed, int64_t d_qk,
+    int64_t key_count, int64_t key_tile, int64_t kblock_u16, float scale,
+    float* qkt_tile, float* scores, float* chunk_max) {
+  for (int64_t s_off = 0; s_off < key_count; s_off += key_tile) {
+    const auto run_qkt_kernel = [&]() {
+      ::fused_cpp::sparse_mla_sve::qkt_8x2vl_bf16(
+          q_packed, k_packed + (s_off / key_tile) * kblock_u16, d_qk,
+          scale, qkt_tile);
+    };
+    if (((s_off / key_tile) & int64_t{15}) == 0) {
+      {
+        FUSED_CPP_SDPA_PROFILE_DEEP_SCOPE(
+            ::fused_cpp::sdpa_profile::Slot::kQktMicroOverhead);
+      }
+      FUSED_CPP_SDPA_PROFILE_DEEP_SCOPE(
+          ::fused_cpp::sdpa_profile::Slot::kQktMicro);
+      run_qkt_kernel();
+    } else {
+      run_qkt_kernel();
+    }
+    const int64_t valid_keys =
+        std::min<int64_t>(key_tile, key_count - s_off);
+    for (int64_t row = 0; row < kQueryBlock; ++row) {
+      chunk_max[row] = copy_score_row_and_update_max(
+          scores + row * key_count + s_off, qkt_tile + row * key_tile,
+          valid_keys, chunk_max[row]);
+    }
+  }
+}
+#endif
+
 // Executes the layout-independent part of one head-major attention chunk. K/V
 // may come from a shared contiguous pack or an indexed gather-pack, but both
 // paths use the same QK, online-softmax, P-pack, and PV sequence here.
@@ -1038,20 +1071,37 @@ static inline void run_heads_qkpv_chunk_bf16(
     chunk_max.fill(neg_inf);
     {
       FUSED_CPP_SDPA_PROFILE_SCOPE(::fused_cpp::sdpa_profile::Slot::kQkt);
-      for (int64_t s_off = 0; s_off < key_count; s_off += key_tile) {
 #if FUSED_CPP_SPARSE_MLA_HAS_SVE_BFMMLA
-        ::fused_cpp::sparse_mla_sve::qkt_8x2vl_bf16(
-            q_packed + group * qblock_u16,
-            k_packed + (s_off / key_tile) * kblock_u16, d_qk, scale,
-            scratch.qkt_tile);
+      if (::fused_cpp::sdpa_profile::deep_enabled()) {
+        run_heads_qkt_deep_profile_sve(
+            q_packed + group * qblock_u16, k_packed, d_qk, key_count,
+            key_tile, kblock_u16, scale, scratch.qkt_tile, scratch.scores,
+            chunk_max.data());
+      } else {
+        for (int64_t s_off = 0; s_off < key_count; s_off += key_tile) {
+          ::fused_cpp::sparse_mla_sve::qkt_8x2vl_bf16(
+              q_packed + group * qblock_u16,
+              k_packed + (s_off / key_tile) * kblock_u16, d_qk, scale,
+              scratch.qkt_tile);
+          const int64_t valid_keys =
+              std::min<int64_t>(key_tile, key_count - s_off);
+          for (int64_t row = 0; row < kQueryBlock; ++row) {
+            chunk_max[static_cast<size_t>(row)] =
+                copy_score_row_and_update_max(
+                    scratch.scores + row * key_count + s_off,
+                    scratch.qkt_tile + row * key_tile, valid_keys,
+                    chunk_max[static_cast<size_t>(row)]);
+          }
+        }
+      }
 #else
+      for (int64_t s_off = 0; s_off < key_count; s_off += key_tile) {
         ::fused_cpp::sdpa_microkernels::
             gemm_qkt_microkernel_8x8_bf16_packqk_seq4_bmajor_inner(
                 q_packed + group * qblock_u16, q_orig + head0 * d_qk,
                 d_qk, k_packed + (s_off / key_tile) * kblock_u16,
                 k_orig + s_off * d_qk, d_qk, d_qk, scale,
                 scratch.qkt_tile);
-#endif
         const int64_t valid_keys =
             std::min<int64_t>(key_tile, key_count - s_off);
         for (int64_t row = 0; row < kQueryBlock; ++row) {
@@ -1062,6 +1112,7 @@ static inline void run_heads_qkpv_chunk_bf16(
                   chunk_max[static_cast<size_t>(row)]);
         }
       }
+#endif
     }
 
     {
