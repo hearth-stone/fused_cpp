@@ -28,7 +28,9 @@ from fused_cpp.moe import (
     get_default_moe_planner_runtime,
     prepare_fused_moe_bf16_tiled_weights,
     prepare_fused_moe_w8a16_tiled_weights,
+    prepare_fused_moe_w8a16_tiled_quantized_weights,
     prepare_routed_shared_moe_bf16_tiled_weights,
+    prepare_routed_shared_moe_w8a16_tiled_quantized_weights,
     set_default_moe_planner_runtime,
 )
 ```
@@ -224,6 +226,15 @@ packed_weights = prepare_fused_moe_w8a16_tiled_weights(
 
 This is the implementation selection point. The planner does not quantize or
 replace BF16 weights at request time.
+
+For compressed-tensors checkpoints which already store symmetric channel-wise
+INT8 expert weights, use
+`prepare_fused_moe_w8a16_tiled_quantized_weights`. Pass raw INT8 W13/W2 and
+their FP32 per-output-channel scales directly; the packer preserves them and
+does not allocate a BF16 model-sized intermediate. When one same-shape shared
+expert is fused with routed experts, use
+`prepare_routed_shared_moe_w8a16_tiled_quantized_weights` and execute through
+`fused_moe_w8a16_tiled_with_shared` with a shared-aware planner runtime.
 
 Packing considerations:
 

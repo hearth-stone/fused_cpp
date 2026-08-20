@@ -1647,6 +1647,10 @@ void sve_packed_w2_direct_route_hybrid_dispatch(const uint16_t* packed_A, const 
 }
 #endif
 
+#if !defined(FUSED_CPP_MOE_HAS_ARM_SVE)
+void prewarm_sve_jit_w8a16_kernels() {}
+#endif
+
 #endif  // __aarch64__
 
 // Bottom-layer fused w13 + SiLU-and-mul over the whole [M] slice: interleaved
@@ -4906,6 +4910,37 @@ void pack_transposed_expert_weight_interleaved(const uint16_t* weight, int64_t e
   }
 }
 
+void pack_w8a16_scale_layout(const std::vector<float>& channel_scales, int64_t N_pad, int64_t n_tile,
+                             float* scale_dst) {
+  int64_t scale_index = 0;
+  for (int64_t cb = 0; cb < N_pad; cb += n_tile) {
+    for (int64_t cp = 0; cp < 4; ++cp) {
+      for (int64_t segment = 0; segment < n_tile / 8; ++segment) {
+        const int64_t c0 = cb + segment * 8 + cp * 2;
+        const int64_t c1 = c0 + 1;
+        scale_dst[scale_index++] = channel_scales[static_cast<size_t>(c0)];
+        scale_dst[scale_index++] = channel_scales[static_cast<size_t>(c1)];
+        scale_dst[scale_index++] = channel_scales[static_cast<size_t>(c0)];
+        scale_dst[scale_index++] = channel_scales[static_cast<size_t>(c1)];
+      }
+    }
+  }
+  TORCH_INTERNAL_ASSERT(scale_index == 2 * N_pad);
+  for (int64_t cb = 0; cb < N_pad; cb += n_tile) {
+    for (int64_t cp = 0; cp < 4; ++cp) {
+      for (int64_t segment = 0; segment < n_tile / 8; ++segment) {
+        const int64_t c0 = cb + segment * 8 + cp * 2;
+        const int64_t c1 = c0 + 1;
+        scale_dst[scale_index++] = channel_scales[static_cast<size_t>(c0)];
+        scale_dst[scale_index++] = channel_scales[static_cast<size_t>(c0)];
+        scale_dst[scale_index++] = channel_scales[static_cast<size_t>(c1)];
+        scale_dst[scale_index++] = channel_scales[static_cast<size_t>(c1)];
+      }
+    }
+  }
+  TORCH_INTERNAL_ASSERT(scale_index == 4 * N_pad);
+}
+
 void quantize_pack_expert_weight_per_channel(const uint16_t* weight, int64_t expert_offset, int64_t out_features,
                                              int64_t in_features, int64_t K_pad, int64_t N_pad, int64_t n_tile,
                                              int8_t* packed_dst, float* scale_dst, bool interleaved_w13) {
@@ -4934,33 +4969,146 @@ void quantize_pack_expert_weight_per_channel(const uint16_t* weight, int64_t exp
   }
   int8_pack_b(transposed.data(), packed_dst, static_cast<int>(K_pad), static_cast<int>(N_pad),
               static_cast<int>(n_tile));
-  int64_t scale_index = 0;
-  for (int64_t cb = 0; cb < N_pad; cb += n_tile) {
-    for (int64_t cp = 0; cp < 4; ++cp) {
-      for (int64_t segment = 0; segment < n_tile / 8; ++segment) {
-        const int64_t c0 = cb + segment * 8 + cp * 2;
-        const int64_t c1 = c0 + 1;
-        scale_dst[scale_index++] = channel_scales[static_cast<size_t>(c0)];
-        scale_dst[scale_index++] = channel_scales[static_cast<size_t>(c1)];
-        scale_dst[scale_index++] = channel_scales[static_cast<size_t>(c0)];
-        scale_dst[scale_index++] = channel_scales[static_cast<size_t>(c1)];
-      }
+  pack_w8a16_scale_layout(channel_scales, N_pad, n_tile, scale_dst);
+}
+
+void pack_quantized_expert_weight_per_channel(const int8_t* weight, const float* scales, int64_t out_features,
+                                              int64_t in_features, int64_t K_pad, int64_t N_pad, int64_t n_tile,
+                                              int8_t* packed_dst, float* scale_dst, bool interleaved_w13) {
+  std::vector<int8_t> transposed(static_cast<size_t>(K_pad * N_pad), int8_t{0});
+  std::vector<float> channel_scales(static_cast<size_t>(N_pad), 1.0f);
+  const int64_t logical_features = interleaved_w13 ? out_features / 2 : out_features;
+  for (int64_t n = 0; n < out_features; ++n) {
+    int64_t packed_column = n;
+    if (interleaved_w13) {
+      const bool is_up = n >= logical_features;
+      const int64_t feature = is_up ? n - logical_features : n;
+      packed_column = (feature / 4) * 8 + (is_up ? 4 : 0) + feature % 4;
+    }
+    channel_scales[static_cast<size_t>(packed_column)] = scales[n];
+    const int8_t* src_row = weight + n * in_features;
+    for (int64_t k = 0; k < in_features; ++k) {
+      transposed[static_cast<size_t>(k * N_pad + packed_column)] = src_row[k];
     }
   }
-  TORCH_INTERNAL_ASSERT(scale_index == 2 * N_pad);
-  for (int64_t cb = 0; cb < N_pad; cb += n_tile) {
-    for (int64_t cp = 0; cp < 4; ++cp) {
-      for (int64_t segment = 0; segment < n_tile / 8; ++segment) {
-        const int64_t c0 = cb + segment * 8 + cp * 2;
-        const int64_t c1 = c0 + 1;
-        scale_dst[scale_index++] = channel_scales[static_cast<size_t>(c0)];
-        scale_dst[scale_index++] = channel_scales[static_cast<size_t>(c0)];
-        scale_dst[scale_index++] = channel_scales[static_cast<size_t>(c1)];
-        scale_dst[scale_index++] = channel_scales[static_cast<size_t>(c1)];
-      }
+  int8_pack_b(transposed.data(), packed_dst, static_cast<int>(K_pad), static_cast<int>(N_pad),
+              static_cast<int>(n_tile));
+  pack_w8a16_scale_layout(channel_scales, N_pad, n_tile, scale_dst);
+}
+
+using PreparedW8A16Tuple =
+    std::tuple<at::Tensor, int64_t, int64_t, at::Tensor, at::Tensor, int64_t, int64_t, at::Tensor, int64_t, int64_t>;
+
+struct QuantizedW8A16Source {
+  at::Tensor w13;
+  at::Tensor w13_scale;
+  at::Tensor w2;
+  at::Tensor w2_scale;
+};
+
+PreparedW8A16Tuple prepare_quantized_w8a16_sources(std::vector<QuantizedW8A16Source> sources) {
+#ifndef __aarch64__
+  TORCH_CHECK(false, "pre-quantized W8A16 fused MoE packing requires AArch64 SVE");
+#else
+  TORCH_CHECK(!sources.empty(), "pre-quantized W8A16 packing requires at least one source");
+  const ::fused_cpp::moe::MoeBackend& backend =
+      ::fused_cpp::moe::resolve_backend("arm_sve_bf16", /*fuse_silu=*/true);
+  int64_t total_experts = 0;
+  int64_t H = -1;
+  int64_t N13 = -1;
+  int64_t F = -1;
+  for (QuantizedW8A16Source& source : sources) {
+    TORCH_CHECK(source.w13.device().is_cpu() && source.w13.scalar_type() == at::kChar,
+                "W8A16 W13 source must be a CPU int8 tensor");
+    TORCH_CHECK(source.w2.device().is_cpu() && source.w2.scalar_type() == at::kChar,
+                "W8A16 W2 source must be a CPU int8 tensor");
+    TORCH_CHECK(source.w13.dim() == 3 && source.w2.dim() == 3,
+                "W8A16 quantized weights must be [E, 2F, H] and [E, H, F]");
+    TORCH_CHECK(source.w13.size(0) == source.w2.size(0), "W8A16 source expert counts must match");
+    const int64_t source_n13 = source.w13.size(1);
+    const int64_t source_h = source.w13.size(2);
+    TORCH_CHECK(source_n13 % 2 == 0, "W8A16 W13 output dimension must be even");
+    const int64_t source_f = source_n13 / 2;
+    TORCH_CHECK(source_f % 8 == 0, "W8A16 fused W13 requires F % 8 == 0, got ", source_f);
+    TORCH_CHECK(source.w2.size(1) == source_h && source.w2.size(2) == source_f, "W8A16 W2 shape mismatch");
+    TORCH_CHECK(source.w13_scale.device().is_cpu() && source.w13_scale.scalar_type() == at::kFloat,
+                "W8A16 W13 scales must be CPU float32");
+    TORCH_CHECK(source.w2_scale.device().is_cpu() && source.w2_scale.scalar_type() == at::kFloat,
+                "W8A16 W2 scales must be CPU float32");
+    TORCH_CHECK(source.w13_scale.numel() == source.w13.size(0) * source_n13,
+                "W8A16 W13 scales must contain one value per output channel");
+    TORCH_CHECK(source.w2_scale.numel() == source.w2.size(0) * source_h,
+                "W8A16 W2 scales must contain one value per output channel");
+    if (H < 0) {
+      H = source_h;
+      N13 = source_n13;
+      F = source_f;
+    } else {
+      TORCH_CHECK(source_h == H && source_n13 == N13 && source_f == F,
+                  "all W8A16 routed/shared sources must have matching expert shapes");
+    }
+    source.w13 = source.w13.contiguous();
+    source.w2 = source.w2.contiguous();
+    source.w13_scale = source.w13_scale.reshape({source.w13.size(0), N13}).contiguous();
+    source.w2_scale = source.w2_scale.reshape({source.w2.size(0), H}).contiguous();
+    total_experts += source.w13.size(0);
+  }
+
+  const int64_t n_tile = backend.n_tile();
+  const int64_t K13_pad = backend.round_k(static_cast<int>(H));
+  const int64_t N13_pad = backend.round_n(static_cast<int>(N13));
+  const int64_t K2_pad = backend.round_k(static_cast<int>(F));
+  const int64_t N2_pad = backend.round_n(static_cast<int>(H));
+  at::Tensor q13 = fused_cpp::page_backed_empty(
+      {total_experts, K13_pad * N13_pad}, sources.front().w13.options().dtype(at::kChar));
+  at::Tensor q2 = fused_cpp::page_backed_empty(
+      {total_experts, K2_pad * N2_pad}, sources.front().w2.options().dtype(at::kChar));
+  at::Tensor s13 = at::empty({total_experts, 4 * N13_pad}, sources.front().w13_scale.options().dtype(at::kFloat));
+  at::Tensor s2 = at::empty({total_experts, 4 * N2_pad}, sources.front().w2_scale.options().dtype(at::kFloat));
+
+  struct ExpertSource {
+    const int8_t* w13;
+    const float* w13_scale;
+    const int8_t* w2;
+    const float* w2_scale;
+  };
+  std::vector<ExpertSource> experts;
+  experts.reserve(static_cast<size_t>(total_experts));
+  for (const QuantizedW8A16Source& source : sources) {
+    const int8_t* w13 = source.w13.data_ptr<int8_t>();
+    const float* w13_scale = source.w13_scale.data_ptr<float>();
+    const int8_t* w2 = source.w2.data_ptr<int8_t>();
+    const float* w2_scale = source.w2_scale.data_ptr<float>();
+    for (int64_t expert = 0; expert < source.w13.size(0); ++expert) {
+      experts.push_back(ExpertSource{
+          w13 + expert * N13 * H,
+          w13_scale + expert * N13,
+          w2 + expert * H * F,
+          w2_scale + expert * H,
+      });
     }
   }
-  TORCH_INTERNAL_ASSERT(scale_index == 4 * N_pad);
+
+  int8_t* q13_ptr = q13.data_ptr<int8_t>();
+  int8_t* q2_ptr = q2.data_ptr<int8_t>();
+  float* s13_ptr = s13.data_ptr<float>();
+  float* s2_ptr = s2.data_ptr<float>();
+  const int64_t threads = std::min<int64_t>(total_experts, env_int_or_default("FUSED_CPP_MOE_PREPACK_THREADS", 1));
+  TORCH_CHECK(threads > 0, "FUSED_CPP_MOE_PREPACK_THREADS must be positive");
+  run_fixed_threads(threads, [&](int64_t tid) {
+    for (int64_t expert = tid; expert < total_experts; expert += threads) {
+      const ExpertSource& source = experts[static_cast<size_t>(expert)];
+      pack_quantized_expert_weight_per_channel(
+          source.w13, source.w13_scale, N13, H, K13_pad, N13_pad, n_tile,
+          q13_ptr + expert * K13_pad * N13_pad, s13_ptr + expert * 4 * N13_pad, /*interleaved_w13=*/true);
+      pack_quantized_expert_weight_per_channel(
+          source.w2, source.w2_scale, H, F, K2_pad, N2_pad, n_tile,
+          q2_ptr + expert * K2_pad * N2_pad, s2_ptr + expert * 4 * N2_pad, /*interleaved_w13=*/false);
+    }
+  });
+  prewarm_sve_jit_w8a16_kernels();
+  return std::make_tuple(q13, H, N13, s13, q2, F, H, s2, static_cast<int64_t>(backend.id), n_tile);
+#endif
 }
 
 }  // namespace
@@ -6104,6 +6252,28 @@ fused_moe_w8a16_tiled_prepare_weights(at::Tensor w13_weight, at::Tensor w2_weigh
   prewarm_sve_jit_w8a16_kernels();
   return std::make_tuple(q13, H, N13, s13, q2, F, H, s2, static_cast<int64_t>(backend.id), n_tile);
 #endif
+}
+
+std::tuple<at::Tensor, int64_t, int64_t, at::Tensor, at::Tensor, int64_t, int64_t, at::Tensor, int64_t, int64_t>
+fused_moe_w8a16_tiled_prepare_quantized_weights(at::Tensor w13_weight, at::Tensor w13_scale,
+                                                at::Tensor w2_weight, at::Tensor w2_scale) {
+  return prepare_quantized_w8a16_sources({QuantizedW8A16Source{
+      std::move(w13_weight), std::move(w13_scale), std::move(w2_weight), std::move(w2_scale)}});
+}
+
+std::tuple<at::Tensor, int64_t, int64_t, at::Tensor, at::Tensor, int64_t, int64_t, at::Tensor, int64_t, int64_t>
+fused_moe_w8a16_tiled_prepare_quantized_routed_shared_weights(
+    at::Tensor routed_w13_weight, at::Tensor routed_w13_scale, at::Tensor routed_w2_weight,
+    at::Tensor routed_w2_scale, at::Tensor shared_w13_weight, at::Tensor shared_w13_scale,
+    at::Tensor shared_w2_weight, at::Tensor shared_w2_scale) {
+  TORCH_CHECK(shared_w13_weight.dim() == 2 && shared_w2_weight.dim() == 2,
+              "shared W8A16 weights must be [2F, H] and [H, F]");
+  return prepare_quantized_w8a16_sources({
+      QuantizedW8A16Source{std::move(routed_w13_weight), std::move(routed_w13_scale),
+                           std::move(routed_w2_weight), std::move(routed_w2_scale)},
+      QuantizedW8A16Source{shared_w13_weight.unsqueeze(0), shared_w13_scale,
+                           shared_w2_weight.unsqueeze(0), shared_w2_scale},
+  });
 }
 
 std::tuple<at::Tensor, int64_t, int64_t, at::Tensor, int64_t, int64_t, int64_t, int64_t>

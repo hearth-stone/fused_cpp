@@ -115,6 +115,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("fused_moe_w8a16_tiled_prepare_weights", &fused_moe_w8a16_tiled_prepare_weights,
         "Quantize and pack per-output-channel INT8 expert weights for the experimental W8A16 Plan V2 path.",
         py::arg("w13_weight"), py::arg("w2_weight"), py::call_guard<py::gil_scoped_release>());
+  m.def("fused_moe_w8a16_tiled_prepare_quantized_weights",
+        &fused_moe_w8a16_tiled_prepare_quantized_weights,
+        "Pack pre-quantized per-output-channel INT8 expert weights for the W8A16 Plan V2 path.",
+        py::arg("w13_weight"), py::arg("w13_scale"), py::arg("w2_weight"), py::arg("w2_scale"),
+        py::call_guard<py::gil_scoped_release>());
+  m.def("fused_moe_w8a16_tiled_prepare_quantized_routed_shared_weights",
+        &fused_moe_w8a16_tiled_prepare_quantized_routed_shared_weights,
+        "Pack pre-quantized routed experts and one same-shape shared expert without a full source copy.",
+        py::arg("routed_w13_weight"), py::arg("routed_w13_scale"), py::arg("routed_w2_weight"),
+        py::arg("routed_w2_scale"), py::arg("shared_w13_weight"), py::arg("shared_w13_scale"),
+        py::arg("shared_w2_weight"), py::arg("shared_w2_scale"), py::call_guard<py::gil_scoped_release>());
 
   m.def("fused_moe_bf16_tiled", &fused_moe_bf16_tiled, "Run BF16 tiled fused MoE.", py::arg("input"),
         py::arg("w13_packed"), py::arg("w13_K"), py::arg("w13_N"), py::arg("w2_packed"), py::arg("w2_K"),

@@ -45,7 +45,8 @@ features:
     status: experimental
     implementation: >-
       csrc/moe/arm/common/fused_moe_bf16_tiled.cpp and
-      src/fused_cpp/moe/bf16_tiled.py
+      src/fused_cpp/moe/bf16_tiled.py, including checkpoint-native INT8+scale
+      packing and the routed+shared synthetic-expert wrapper
     hypothesis: >-
       Halving packed expert weight bytes can improve routed-MoE E2E when the
       saved shared-cache and DRAM traffic exceeds INT8-to-BF16 conversion
@@ -57,7 +58,8 @@ features:
     correctness: >-
       tests/test_moe_w8a16.py, tests/test_moe_planner_runtime.py, and the paired
       W8A16 Plan V2 benchmark compare against packed BF16 execution and verify
-      the optional high-level planner dispatch.
+      pre-quantized packed-layout equivalence, routed+shared limit-10 execution,
+      and the optional high-level planner dispatch.
     benchmark: >-
       AmazonM5192Cores NUMA0, 2048 tokens, TopK6, limit-10 SwiGLU,
       5 warmups and 21 alternating runs with FP32 route storage: V4-Pro TP4
@@ -85,7 +87,11 @@ features:
       reduced it to about 18.1 ms. M<=12 automatically retains register
       dequantization. The model-quality gate and automatic per-machine window
       selection remain open. Keep experimental and out of default dispatch. See
-      results/amazon_m5_96c_w8a16_plan_v2_20260817.md.
+      results/amazon_m5_96c_w8a16_plan_v2_20260817.md. On 2026-08-18 the
+      checkpoint-native DeepSeek-V4-Flash-INT8 TP2 integration completed a
+      2048-token E2E request and generated a reusable 262 GiB cache, but its
+      forced 8-token diagnostic text was not semantically valid; model-quality
+      validation therefore remains failed/open rather than adopted.
 
   - id: epilogue.indexed_polynomial_evaluation
     part: epilogue

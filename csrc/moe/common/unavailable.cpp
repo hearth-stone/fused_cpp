@@ -46,6 +46,17 @@ fused_moe_w8a16_tiled_prepare_weights(at::Tensor, at::Tensor) {
   unavailable();
 }
 
+std::tuple<at::Tensor, int64_t, int64_t, at::Tensor, at::Tensor, int64_t, int64_t, at::Tensor, int64_t, int64_t>
+fused_moe_w8a16_tiled_prepare_quantized_weights(at::Tensor, at::Tensor, at::Tensor, at::Tensor) {
+  unavailable();
+}
+
+std::tuple<at::Tensor, int64_t, int64_t, at::Tensor, at::Tensor, int64_t, int64_t, at::Tensor, int64_t, int64_t>
+fused_moe_w8a16_tiled_prepare_quantized_routed_shared_weights(at::Tensor, at::Tensor, at::Tensor, at::Tensor,
+                                                              at::Tensor, at::Tensor, at::Tensor, at::Tensor) {
+  unavailable();
+}
+
 std::tuple<at::Tensor, int64_t, int64_t, at::Tensor, int64_t, int64_t, int64_t, int64_t>
 fused_moe_bf16_tiled_prepare_routed_shared_weights(at::Tensor, at::Tensor, at::Tensor, at::Tensor, std::string) {
   unavailable();

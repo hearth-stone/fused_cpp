@@ -60,6 +60,15 @@ fused_moe_bf16_tiled_prepare_weights(at::Tensor w13_weight, at::Tensor w2_weight
                                      std::string backend_name);
 std::tuple<at::Tensor, int64_t, int64_t, at::Tensor, at::Tensor, int64_t, int64_t, at::Tensor, int64_t, int64_t>
 fused_moe_w8a16_tiled_prepare_weights(at::Tensor w13_weight, at::Tensor w2_weight);
+
+std::tuple<at::Tensor, int64_t, int64_t, at::Tensor, at::Tensor, int64_t, int64_t, at::Tensor, int64_t, int64_t>
+fused_moe_w8a16_tiled_prepare_quantized_weights(at::Tensor w13_weight, at::Tensor w13_scale,
+                                                at::Tensor w2_weight, at::Tensor w2_scale);
+std::tuple<at::Tensor, int64_t, int64_t, at::Tensor, at::Tensor, int64_t, int64_t, at::Tensor, int64_t, int64_t>
+fused_moe_w8a16_tiled_prepare_quantized_routed_shared_weights(
+    at::Tensor routed_w13_weight, at::Tensor routed_w13_scale, at::Tensor routed_w2_weight,
+    at::Tensor routed_w2_scale, at::Tensor shared_w13_weight, at::Tensor shared_w13_scale,
+    at::Tensor shared_w2_weight, at::Tensor shared_w2_scale);
 std::tuple<at::Tensor, int64_t, int64_t, at::Tensor, int64_t, int64_t, int64_t, int64_t>
 fused_moe_bf16_tiled_prepare_routed_shared_weights(at::Tensor routed_w13_weight, at::Tensor routed_w2_weight,
                                                    at::Tensor shared_w13_weight, at::Tensor shared_w2_weight,

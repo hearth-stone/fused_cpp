@@ -236,6 +236,18 @@ cache dequantization must provide machine-calibrated nonzero windows when a
 full stripe does not fit the intended cache level. Packed formats, expanded
 scale vectors, and cache scratch are internal.
 
+`prepare_fused_moe_w8a16_tiled_quantized_weights` accepts checkpoint-native
+signed INT8 `[E, 2 * F, H]` / `[E, H, F]` weights and one FP32 scale per
+output channel. It preserves the supplied quantized values and scales while
+producing the same opaque runtime layout; it never dequantizes or requantizes
+the source. `prepare_routed_shared_moe_w8a16_tiled_quantized_weights` appends
+one same-shape shared expert without materializing a full `E + 1` source copy.
+The returned `PreparedW8A16TiledRoutedSharedMoEWeights` is accepted by
+`fused_moe_w8a16_tiled_with_shared`, which requires a shared-aware compatible
+`MoePlannerRuntime`, appends one unit-weight shared route per token, and has no
+unplanned fallback. Existing BF16 and BF16-source W8A16 entrypoints remain
+compatible.
+
 This API is experimental. It supports no bias or non-SVE fallback, requires
 the direct-route W2 path, and currently uses FP32 route storage. Quantization
 changes numerical behavior relative to BF16 and callers must validate

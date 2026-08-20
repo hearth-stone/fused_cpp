@@ -51,6 +51,15 @@ class PreparedBF16TiledRoutedSharedMoEWeights:
     shared_expert_id: int
 
 
+@dataclass(frozen=True)
+class PreparedW8A16TiledRoutedSharedMoEWeights:
+    """Pre-quantized routed experts followed by one synthetic shared expert."""
+
+    packed: PreparedW8A16TiledFusedMoEWeights
+    routed_experts: int
+    shared_expert_id: int
+
+
 try:
     from fused_cpp import _moe_C as _moe_native  # type: ignore[attr-defined, import-untyped]
 
@@ -64,6 +73,16 @@ try:
     _shared_mlp_bf16_tiled_impl = getattr(_moe_native, "shared_mlp_bf16_tiled", None)
     _prepare_bf16_tiled_impl = _moe_native.fused_moe_bf16_tiled_prepare_weights
     _prepare_w8a16_tiled_impl = getattr(_moe_native, "fused_moe_w8a16_tiled_prepare_weights", None)
+    _prepare_quantized_w8a16_tiled_impl = getattr(
+        _moe_native,
+        "fused_moe_w8a16_tiled_prepare_quantized_weights",
+        None,
+    )
+    _prepare_quantized_routed_shared_w8a16_impl = getattr(
+        _moe_native,
+        "fused_moe_w8a16_tiled_prepare_quantized_routed_shared_weights",
+        None,
+    )
     _prepare_routed_shared_impl = getattr(
         _moe_native,
         "fused_moe_bf16_tiled_prepare_routed_shared_weights",
@@ -122,6 +141,8 @@ except ImportError as error:
     _shared_mlp_bf16_tiled_impl = None
     _prepare_bf16_tiled_impl = None
     _prepare_w8a16_tiled_impl = None
+    _prepare_quantized_w8a16_tiled_impl = None
+    _prepare_quantized_routed_shared_w8a16_impl = None
     _prepare_routed_shared_impl = None
     _available_backends_impl = None
     _HAS_BF16_TILED_FUSED_MOE = False
@@ -137,6 +158,8 @@ except AttributeError:
     _shared_mlp_bf16_tiled_impl = None
     _prepare_bf16_tiled_impl = None
     _prepare_w8a16_tiled_impl = None
+    _prepare_quantized_w8a16_tiled_impl = None
+    _prepare_quantized_routed_shared_w8a16_impl = None
     _prepare_routed_shared_impl = None
     _available_backends_impl = None
     _HAS_BF16_TILED_FUSED_MOE = False
@@ -408,6 +431,66 @@ def prepare_fused_moe_w8a16_tiled_weights(
     )
 
 
+def _prepared_w8a16_weights(packed: tuple[Any, ...]) -> PreparedW8A16TiledFusedMoEWeights:
+    return PreparedW8A16TiledFusedMoEWeights(
+        w13=(packed[0], int(packed[1]), int(packed[2]), packed[3]),
+        w2=(packed[4], int(packed[5]), int(packed[6]), packed[7]),
+        gemm_backend=int(packed[8]),
+        backend_n_tile=int(packed[9]),
+    )
+
+
+def prepare_fused_moe_w8a16_tiled_quantized_weights(
+    w13_weight: torch.Tensor,
+    w13_scale: torch.Tensor,
+    w2_weight: torch.Tensor,
+    w2_scale: torch.Tensor,
+) -> PreparedW8A16TiledFusedMoEWeights:
+    """Pack checkpoint INT8 expert weights without dequantizing or requantizing."""
+    _require_backend()
+    if _prepare_quantized_w8a16_tiled_impl is None:
+        raise RuntimeError("pre-quantized W8A16 fused MoE packing is unavailable in this build")
+    packed = _prepare_quantized_w8a16_tiled_impl(
+        w13_weight,
+        w13_scale,
+        w2_weight,
+        w2_scale,
+    )
+    return _prepared_w8a16_weights(packed)
+
+
+def prepare_routed_shared_moe_w8a16_tiled_quantized_weights(
+    routed_w13_weight: torch.Tensor,
+    routed_w13_scale: torch.Tensor,
+    routed_w2_weight: torch.Tensor,
+    routed_w2_scale: torch.Tensor,
+    shared_w13_weight: torch.Tensor,
+    shared_w13_scale: torch.Tensor,
+    shared_w2_weight: torch.Tensor,
+    shared_w2_scale: torch.Tensor,
+) -> PreparedW8A16TiledRoutedSharedMoEWeights:
+    """Pack checkpoint INT8 routed and shared experts without a full source copy."""
+    _require_backend()
+    if _prepare_quantized_routed_shared_w8a16_impl is None:
+        raise RuntimeError("pre-quantized routed+shared W8A16 packing is unavailable in this build")
+    packed = _prepare_quantized_routed_shared_w8a16_impl(
+        routed_w13_weight,
+        routed_w13_scale,
+        routed_w2_weight,
+        routed_w2_scale,
+        shared_w13_weight,
+        shared_w13_scale,
+        shared_w2_weight,
+        shared_w2_scale,
+    )
+    routed_experts = int(routed_w13_weight.shape[0])
+    return PreparedW8A16TiledRoutedSharedMoEWeights(
+        packed=_prepared_w8a16_weights(packed),
+        routed_experts=routed_experts,
+        shared_expert_id=routed_experts,
+    )
+
+
 def prepare_shared_mlp_bf16_tiled_weights(
     w13_weight: torch.Tensor,
     w2_weight: torch.Tensor,
@@ -673,6 +756,89 @@ def fused_moe_bf16_tiled_with_shared(
         out,
     )
     return out if out is not None else result
+
+
+def fused_moe_w8a16_tiled_with_shared(
+    input: torch.Tensor,
+    weights: PreparedW8A16TiledRoutedSharedMoEWeights,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    *,
+    num_threads: int = 1,
+    routed_scaling_factor: float = 1.0,
+    activation: Any = "silu",
+    silu_poly_degree: int = 5,
+    swiglu_limit: float | None = None,
+    cache_dequant: bool = False,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Schedule checkpoint W8A16 routed experts with one all-token shared expert."""
+    _require_backend()
+    if not isinstance(weights, PreparedW8A16TiledRoutedSharedMoEWeights):
+        raise TypeError("weights must be PreparedW8A16TiledRoutedSharedMoEWeights")
+    if input.dtype != torch.bfloat16 or input.device.type != "cpu":
+        raise TypeError("input must be a CPU torch.bfloat16 tensor")
+    if topk_ids.device.type != "cpu" or topk_ids.dtype not in _INTEGER_DTYPES:
+        raise TypeError("topk_ids must be an integer CPU tensor")
+    if topk_weights.device.type != "cpu" or not topk_weights.dtype.is_floating_point:
+        raise TypeError("topk_weights must be a floating CPU tensor")
+    if topk_ids.dim() != 2 or topk_weights.dim() != 2 or topk_ids.shape != topk_weights.shape:
+        raise ValueError("topk_ids and topk_weights must have matching [tokens, top_k] shapes")
+    if int(topk_ids.shape[0]) != int(input.shape[0]) or int(topk_ids.shape[1]) <= 0:
+        raise ValueError("topk tensors must match input tokens and have positive top_k")
+    if int(num_threads) <= 0:
+        raise ValueError(f"num_threads must be positive, got {num_threads}")
+    scaling = float(routed_scaling_factor)
+    if not math.isfinite(scaling):
+        raise ValueError("routed_scaling_factor must be finite")
+    _native_activation_name(activation, weights.packed, swiglu_limit)
+    if _activation_name(activation) != "silu":
+        raise ValueError("routed+shared W8A16 scheduling currently requires activation='silu'")
+    _validate_output_buffer(input, out)
+    if topk_ids.numel() > 0:
+        minimum_id = int(topk_ids.min().item())
+        maximum_id = int(topk_ids.max().item())
+        if minimum_id < 0 or maximum_id >= weights.routed_experts:
+            raise ValueError(
+                f"routed topk_ids must be in [0, {weights.routed_experts}), got [{minimum_id}, {maximum_id}]"
+            )
+
+    tokens, routed_top_k = topk_ids.shape
+    combined_ids = torch.empty((tokens, routed_top_k + 1), dtype=topk_ids.dtype)
+    combined_weights = torch.empty((tokens, routed_top_k + 1), dtype=topk_weights.dtype)
+    combined_ids[:, :routed_top_k].copy_(topk_ids)
+    combined_ids[:, routed_top_k].fill_(weights.shared_expert_id)
+    combined_weights[:, :routed_top_k].copy_(topk_weights * scaling)
+    combined_weights[:, routed_top_k].fill_(1.0)
+
+    from fused_cpp.moe.planner_runtime import get_default_moe_planner_runtime
+
+    planner_runtime = get_default_moe_planner_runtime()
+    plan = None
+    if planner_runtime is not None:
+        plan = planner_runtime.plan_for_shared_dispatch(
+            weights,
+            combined_ids,
+            num_threads=int(num_threads),
+            activation="silu",
+        )
+    if plan is None:
+        raise RuntimeError(
+            "routed+shared W8A16 fused MoE requires a compatible shared-aware MoePlannerRuntime"
+        )
+    return fused_moe_w8a16_tiled_async_plan(
+        input,
+        weights.packed,
+        combined_weights,
+        combined_ids,
+        plan,
+        activation="silu",
+        global_num_experts=weights.routed_experts + 1,
+        silu_poly_degree=silu_poly_degree,
+        swiglu_limit=swiglu_limit,
+        cache_dequant=cache_dequant,
+        out=out,
+    )
 
 
 def fused_moe_bf16_tiled_scheduled(
@@ -1388,6 +1554,7 @@ __all__ = [
     "PreparedBF16TiledFusedMoEWeights",
     "PreparedBF16TiledRoutedSharedMoEWeights",
     "PreparedW8A16TiledFusedMoEWeights",
+    "PreparedW8A16TiledRoutedSharedMoEWeights",
     "PreparedWeight",
     "_HAS_BF16_TILED_FUSED_MOE",
     "available_fused_moe_bf16_tiled_backends",
@@ -1401,6 +1568,7 @@ __all__ = [
     "fused_moe_tiled",
     "fused_moe_w8a16_tiled",
     "fused_moe_w8a16_tiled_async_plan",
+    "fused_moe_w8a16_tiled_with_shared",
     "shared_mlp_bf16_tiled",
     "bf16_tiled_fused_moe",
     "bf16_tiled_fused_moe_scheduled",
@@ -1410,7 +1578,9 @@ __all__ = [
     "bf16_tiled_fused_moe_vllm_staged",
     "prepare_fused_moe_bf16_tiled_weights",
     "prepare_fused_moe_w8a16_tiled_weights",
+    "prepare_fused_moe_w8a16_tiled_quantized_weights",
     "prepare_routed_shared_moe_bf16_tiled_weights",
+    "prepare_routed_shared_moe_w8a16_tiled_quantized_weights",
     "prepare_shared_mlp_bf16_tiled_weights",
     "prepare_bf16_tiled_fused_moe_weights",
 ]
