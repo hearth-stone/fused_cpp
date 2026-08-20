@@ -150,7 +150,22 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="write the predicted timeline without allocating weights or running the native kernel",
     )
+    parser.add_argument("--ready-file", type=Path, help="touch after warmup, before measured calls")
+    parser.add_argument("--start-file", type=Path, help="wait for this file after touching --ready-file")
+    parser.add_argument("--barrier-timeout", type=float, default=600.0)
     return parser.parse_args()
+
+
+def wait_for_external_start(args: argparse.Namespace) -> None:
+    if args.ready_file is None:
+        return
+    args.ready_file.parent.mkdir(parents=True, exist_ok=True)
+    args.ready_file.write_text("ready\n", encoding="utf-8")
+    deadline = time.monotonic() + args.barrier_timeout
+    while not args.start_file.is_file():
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"timed out waiting for start file {args.start_file}")
+        time.sleep(0.01)
 
 
 def parse_shape(value: str | None) -> tuple[int, ...] | None:
@@ -1081,6 +1096,7 @@ def capture_actual(
     else:
         for _ in range(args.warmup):
             run()
+        wait_for_external_start(args)
         untraced_samples_ms = []
         for _ in range(args.runs):
             begin = time.perf_counter_ns()
@@ -1147,6 +1163,14 @@ def main() -> int:
         raise ValueError("--warmup must be non-negative and --runs must be positive")
     if args.gflops_color_max <= 0:
         raise ValueError("--gflops-color-max must be positive")
+    if (args.ready_file is None) != (args.start_file is None):
+        raise ValueError("--ready-file and --start-file must be provided together")
+    if args.barrier_timeout <= 0:
+        raise ValueError("--barrier-timeout must be positive")
+    if args.ready_file is not None and (
+        args.compare_residual_m_split or args.compare_strict_tail_steal
+    ):
+        raise ValueError("external start barrier supports only the normal timing path")
     if args.compare_residual_m_split and args.residual_m_split is None:
         raise ValueError("--compare-residual-m-split requires --residual-m-split")
     if args.compare_residual_m_split and args.plan_only:
