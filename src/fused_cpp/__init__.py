@@ -93,6 +93,13 @@ from fused_cpp.deepseek_v4_attn_gemm_fused import (
     fused_wqa_wkv_compressor_kv_score_indexer_compressor_kv_score_indexer_weights_proj_qkv_rmsnorm_fused_prepacked,
     prepare_deepseek_v4_attn_gemm_weights,
 )
+from fused_cpp.deepseek_v4_inv_rope_woa import (
+    PreparedDeepseekV4InvRopeWoa,
+    _HAS_DEEPSEEK_V4_INV_ROPE_WOA,
+    deepseek_v4_inv_rope_grouped_woa,
+    deepseek_v4_inv_rope_grouped_woa_torch_reference,
+    prepare_deepseek_v4_inv_rope_woa,
+)
 from fused_cpp.deepseek_v4_post_gemm_stage import (
     CompressorState,
     PostGemmStageInputs,
@@ -175,6 +182,7 @@ __all__ = [
     "KAIGEMMHandler",
     "KAIThreadPool",
     "PreparedDeepSeekV4AttnGemmWeights",
+    "PreparedDeepseekV4InvRopeWoa",
     "PreparedDeepSeekV4PostGemmWeights",
     "PreparedBF16TiledFusedMoEWeights",
     "PreparedBF16TiledRoutedSharedMoEWeights",
@@ -188,6 +196,7 @@ __all__ = [
     "CompressorState",
     "VersionInfo",
     "_HAS_DEEPSEEK_V4_ATTN_GEMM_FUSED",
+    "_HAS_DEEPSEEK_V4_INV_ROPE_WOA",
     "_HAS_BF16_TILED_FUSED_MOE",
     "available_fused_moe_bf16_tiled_backends",
     "calibrate_moe_planner_quick",
@@ -212,6 +221,8 @@ __all__ = [
     "cpu_sparse_attn_indexer_op_torch_baseline",
     "deepseek_v4_attn_gemm_fused_prepacked",
     "deepseek_v4_attn_gemm_fused_prepacked_normed",
+    "deepseek_v4_inv_rope_grouped_woa",
+    "deepseek_v4_inv_rope_grouped_woa_torch_reference",
     "dequantize_and_gather_dual_k_cache_cpp",
     "dequantize_and_gather_dual_k_cache_torch_baseline",
     "dequantize_and_gather_k_cache_cpp",
@@ -256,6 +267,7 @@ __all__ = [
     "multi_query_attention_torch",
     "naive_fused_moe",
     "prepare_deepseek_v4_attn_gemm_weights",
+    "prepare_deepseek_v4_inv_rope_woa",
     "prepare_bf16_linear_weight",
     "PostGemmStageVariant",
     "_HAS_DEEPSEEK_V4_POST_GEMM_C128A_PREPACKED",

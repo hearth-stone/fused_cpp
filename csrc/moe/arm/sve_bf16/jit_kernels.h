@@ -19,6 +19,7 @@ enum class Operation : uint8_t {
   kW2,
   kW2Direct,
   kGemmF32,
+  kGemmBf16,
   kW8W13,
   kW8W13Clamped,
   kW8W2Direct,
@@ -47,6 +48,8 @@ W8KernelFn get_w8_kernel(Operation operation, int rows, int degree, std::string*
 W8DequantFn get_w8_dequant_kernel(std::string* error);
 // Standalone packed-A/packed-B BF16 GEMM with row-major FP32 output.
 KernelFn get_gemm_f32_kernel(int rows, std::string* error);
+// Standalone packed-A/packed-B BF16 GEMM with row-major BF16 output.
+KernelFn get_gemm_bf16_kernel(int rows, std::string* error);
 // Calibration-only variants of the pure GEMM kernel. Numeric values remain
 // stable because they are recorded in machine-profile provenance.
 KernelFn get_probe_kernel(int rows, ProbeMode mode, std::string* error);

@@ -261,6 +261,33 @@ Removing or reinterpreting a field requires a new schema version or an explicit
 migration. Runtime-only environment variables must not reinterpret the same
 serialized plan differently.
 
+## DeepSeek V4 Inverse RoPE And Grouped WO_A
+
+`PreparedDeepseekV4InvRopeWoa`, `prepare_deepseek_v4_inv_rope_woa`,
+`deepseek_v4_inv_rope_grouped_woa`, and
+`deepseek_v4_inv_rope_grouped_woa_torch_reference` are public Python symbols.
+The prepare function accepts a contiguous CPU BF16 weight with shape
+`[G * R, P * DH]` and records the explicit `G`, `P`, `DH`, and even `RG`
+geometry. The execution function accepts:
+
+- `o`: contiguous CPU BF16 `[T, G * P, DH]`;
+- `positions`: contiguous CPU int64 `[T]`;
+- `cos_sin_cache`: contiguous CPU FP32 `[max_position, RG]`, with cosine in
+  the first `RG / 2` columns and sine in the remaining columns;
+- optional non-aliasing contiguous CPU BF16 `out`: `[T, G, R]`.
+
+The last `RG` elements of every head use inverse GPT-J RoPE pair semantics
+`(even * cos + odd * sin, odd * cos - even * sin)`; the first `DH - RG`
+elements are unchanged. Heads are then flattened within each group and
+multiplied by that group's WO_A weight with FP32 accumulation and BF16 output.
+`T == 0` returns `[0, G, R]` without reading `positions`. Input tensors and the
+prepared weight are read-only, and `out` must not alias them.
+
+`backend="auto"` selects a native SVE BF16 implementation only when exported
+by the extension and otherwise selects the materialized Torch reference.
+`backend="torch"` is the stable correctness fallback. Native packing layout,
+thread assignment, and fusion strategy are internal implementation details.
+
 ## SDPA And Registered Implementations
 
 The public SDPA dispatcher functions and `VersionInfo` exported through

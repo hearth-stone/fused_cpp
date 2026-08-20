@@ -12,6 +12,19 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("fused_moe_bf16_tiled_available_backends", &fused_cpp::moe::available_backend_names,
         "Return the BF16 fused MoE backends supported by this build and CPU.");
 
+  m.def("deepseek_v4_inv_rope_woa_available", &deepseek_v4_inv_rope_woa_available,
+        "Return whether the SVE BF16 inverse-RoPE grouped WO_A kernel is available.");
+  m.def("deepseek_v4_inv_rope_woa_prepare", &deepseek_v4_inv_rope_woa_prepare,
+        "Pack grouped DeepSeek V4 WO_A weights for the SVE BF16 kernel.", py::arg("wo_a_weight"),
+        py::arg("n_groups"), py::arg("heads_per_group"), py::arg("head_dim"), py::arg("rope_dim"),
+        py::arg("backend") = "arm_sve_bf16", py::call_guard<py::gil_scoped_release>());
+  m.def("deepseek_v4_inv_rope_grouped_woa", &deepseek_v4_inv_rope_grouped_woa,
+        "Fuse inverse GPT-J RoPE pack-A with grouped SVE BF16 WO_A GEMM.", py::arg("o"), py::arg("positions"),
+        py::arg("cos_sin_cache"), py::arg("packed_weight"), py::arg("n_groups"),
+        py::arg("heads_per_group"), py::arg("head_dim"), py::arg("rope_dim"), py::arg("output_rank"),
+        py::arg("core_ids") = c10::nullopt, py::arg("out") = c10::nullopt,
+        py::call_guard<py::gil_scoped_release>());
+
   m.def("fused_moe_bf16_tiled_prepare_weights", &fused_moe_bf16_tiled_prepare_weights,
         "Pack BF16 MoE expert weights for the selected ISA backend.", py::arg("w13_weight"), py::arg("w2_weight"),
         py::arg("fuse_silu") = false, py::arg("backend") = "auto", py::call_guard<py::gil_scoped_release>());

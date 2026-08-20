@@ -26,6 +26,21 @@ at::Tensor fused_moe_bf16_tiled(at::Tensor, at::Tensor, int64_t, int64_t, at::Te
 }
 #endif
 
+#if !defined(FUSED_CPP_MOE_HAS_ARM_SVE)
+bool deepseek_v4_inv_rope_woa_available() { return false; }
+
+std::tuple<at::Tensor, int64_t, int64_t, int64_t> deepseek_v4_inv_rope_woa_prepare(
+    at::Tensor, int64_t, int64_t, int64_t, int64_t, std::string) {
+  unavailable();
+}
+
+at::Tensor deepseek_v4_inv_rope_grouped_woa(
+    at::Tensor, at::Tensor, at::Tensor, at::Tensor, int64_t, int64_t, int64_t, int64_t, int64_t,
+    c10::optional<at::Tensor>, c10::optional<at::Tensor>) {
+  unavailable();
+}
+#endif
+
 std::tuple<at::Tensor, int64_t, int64_t, at::Tensor, at::Tensor, int64_t, int64_t, at::Tensor, int64_t, int64_t>
 fused_moe_w8a16_tiled_prepare_weights(at::Tensor, at::Tensor) {
   unavailable();

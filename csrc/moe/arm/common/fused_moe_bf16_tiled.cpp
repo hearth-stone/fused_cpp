@@ -1112,6 +1112,8 @@ const char* sve_jit_operation_name(SveJitOperation operation) {
       return "W2 direct-route";
     case SveJitOperation::kGemmF32:
       return "plain GEMM FP32";
+    case SveJitOperation::kGemmBf16:
+      return "plain GEMM BF16";
     case SveJitOperation::kW8W13:
       return "W8A16 W13";
     case SveJitOperation::kW8W13Clamped:

@@ -8,6 +8,15 @@
 #include <utility>
 #include <vector>
 
+bool deepseek_v4_inv_rope_woa_available();
+std::tuple<at::Tensor, int64_t, int64_t, int64_t> deepseek_v4_inv_rope_woa_prepare(
+    at::Tensor wo_a_weight, int64_t n_groups, int64_t heads_per_group, int64_t head_dim, int64_t rope_dim,
+    std::string backend);
+at::Tensor deepseek_v4_inv_rope_grouped_woa(
+    at::Tensor o, at::Tensor positions, at::Tensor cos_sin_cache, at::Tensor packed_weight, int64_t n_groups,
+    int64_t heads_per_group, int64_t head_dim, int64_t rope_dim, int64_t output_rank,
+    c10::optional<at::Tensor> core_ids, c10::optional<at::Tensor> out);
+
 #if defined(__aarch64__)
 std::tuple<std::string, std::vector<std::pair<int64_t, int64_t>>, std::vector<std::pair<int64_t, int64_t>>>
 fused_moe_test_split_plan(std::string stage, int64_t M, int64_t K, int64_t N, int64_t group_size);

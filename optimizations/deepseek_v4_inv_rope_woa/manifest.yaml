@@ -1,0 +1,46 @@
+operator: deepseek_v4_inv_rope_woa
+
+baseline:
+  id: torch_materialized
+  implementation: src/fused_cpp/deepseek_v4_inv_rope_woa.py
+  entrypoint: deepseek_v4_inv_rope_grouped_woa_torch_reference
+  status: reference
+  correctness: >-
+    PYTHONPATH=src .venv/bin/python -m pytest -q
+    tests/test_deepseek_v4_inv_rope_woa.py
+
+features:
+  - id: compute.sve_fused_pack_rope_grouped_gemm
+    part: compute
+    status: candidate
+    implementation:
+      - csrc/moe/arm/common/deepseek_v4_inv_rope_woa.cpp
+      - csrc/moe/arm/sve_bf16/jit_kernels.cpp
+    hypothesis: >-
+      Applying inverse GPT-J RoPE while producing one shared packed-A panel
+      removes the materialized o_ref tensor. Scheduling (group, M panel, N
+      tile) tasks then reuses that packed panel across WO_A N tiles while
+      exposing both group and N parallelism to one OpenMP team.
+    depends_on: []
+    conflicts_with: []
+    selection: >-
+      backend=auto selects this path only when _moe_C reports an AArch64 SVE
+      BF16 build with xbyak_aarch64. backend=torch remains the correctness
+      fallback. The candidate is not enabled on unsupported builds.
+    correctness: >-
+      PYTHONPATH=src .venv/bin/python -m pytest -q
+      tests/test_deepseek_v4_inv_rope_woa.py
+    benchmark: >-
+      PYTHONPATH=src:. OMP_NUM_THREADS=8 OMP_DYNAMIC=FALSE
+      OMP_PROC_BIND=close OMP_PLACES=cores taskset -c 0-7
+      .venv/bin/python tests/bench_deepseek_v4_inv_rope_woa.py
+      --threads 8 --warmup 3 --runs 15
+    result: >-
+      optimizations/deepseek_v4_inv_rope_woa/results/amazon_8c_sve_fused_20260818.md
+
+variants:
+  - id: torch_reference
+    features: []
+  - id: sve_fused
+    features:
+      - compute.sve_fused_pack_rope_grouped_gemm

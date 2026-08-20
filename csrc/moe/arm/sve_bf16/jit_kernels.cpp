@@ -187,6 +187,9 @@ class SveFusedGenerator final : public CodeGenerator {
         break;
       case Operation::kGemmF32:
         break;
+      case Operation::kGemmBf16:
+        operation = "gemm_bf16";
+        break;
       case Operation::kW8W13:
         operation = "w8_w13";
         break;
@@ -380,16 +383,16 @@ class SveFusedGenerator final : public CodeGenerator {
     }
   }
 
-  void build_row_offsets(bool direct) {
+  void build_row_offsets(bool direct, bool output_bf16) {
     index(z0.s, 0, 1);
     mov(z1.d, z0.d);
     and_(z1.s, 3);
     mov(z2.d, z0.d);
     lsr(z2.s, z2.s, 2);
-    lsl(z2.s, z2.s, 5);
+    lsl(z2.s, z2.s, output_bf16 ? 4 : 5);
     mov(z3.d, z1.d);
     and_(z3.s, 1);
-    lsl(z3.s, z3.s, 2);
+    lsl(z3.s, z3.s, output_bf16 ? 1 : 2);
     add(z0.s, z2.s, z3.s);
     lsr(z1.s, z1.s, 1);
     and_(z1.s, 1);
@@ -398,6 +401,19 @@ class SveFusedGenerator final : public CodeGenerator {
       dup(z3.s, w16);
       mul(z1.s, p1 / T_m, z3.s);
       add(z0.s, p1 / T_m, z1.s);
+    }
+  }
+
+  void store_gemm_bf16_vectors(const XReg& base, const ZRegS& offsets, const PReg& predicate, int pair) {
+    for (int column = 0; column < 4; ++column) {
+      const ZRegS value = accumulator(pair, column);
+      bfcvt(ZRegH(value.getIdx()), p1 / T_m, value);
+      if (column == 0) {
+        st1h(value, predicate, ptr(base, offsets, SXTW));
+      } else {
+        add(x15, base, column * 4);
+        st1h(value, predicate, ptr(x15, offsets, SXTW));
+      }
     }
   }
 
@@ -414,7 +430,8 @@ class SveFusedGenerator final : public CodeGenerator {
 
   void store_w2() {
     const bool direct = operation_ == Operation::kW2Direct || operation_ == Operation::kW8W2Direct;
-    build_row_offsets(direct);
+    const bool output_bf16 = operation_ == Operation::kGemmBf16;
+    build_row_offsets(direct, output_bf16);
     for (int pair = 0; pair < row_pairs_; ++pair) {
       const bool partial = (rows_ & 1) != 0 && pair == row_pairs_ - 1;
       const PReg predicate = partial ? p4 : p1;
@@ -439,7 +456,11 @@ class SveFusedGenerator final : public CodeGenerator {
           mov(x14, pair * 2);
           madd(x13, x14, x16, x7);
         }
-        store_w2_vectors(x13, z0.s, predicate, pair);
+        if (output_bf16) {
+          store_gemm_bf16_vectors(x13, z0.s, predicate, pair);
+        } else {
+          store_w2_vectors(x13, z0.s, predicate, pair);
+        }
       }
     }
   }
@@ -783,7 +804,7 @@ class SveFusedGenerator final : public CodeGenerator {
     ldr(w12, ptr(x4, kParamN));
     ldr(w7, ptr(x4, kParamLdc));
     mov(w16, w7);
-    lsl(x16, x16, 2);
+    lsl(x16, x16, operation_ == Operation::kGemmBf16 ? 1 : 2);
     if (w8_weights_) {
       mov(x7, x3);
     } else {
@@ -807,7 +828,11 @@ class SveFusedGenerator final : public CodeGenerator {
       mov(x17, physical_rows_ / 2);
       mul(x17, x17, x9);
     } else {
-      lsl(x17, x9, 1);
+      if (operation_ == Operation::kGemmBf16) {
+        mov(x17, x9);
+      } else {
+        lsl(x17, x9, 1);
+      }
     }
     ptrue(p0.b);
     ptrue(p1.s);
@@ -957,7 +982,7 @@ struct KernelCacheSlot {
   KernelHandle handle;
 };
 
-constexpr size_t kOperationCount = 8;
+constexpr size_t kOperationCount = 9;
 constexpr size_t kRowCount = 12;
 constexpr size_t kDegreeCount = 3;
 constexpr size_t kProbeModeCount = 4;
@@ -1099,6 +1124,10 @@ void prewarm(Operation operation, int degree) {
 
 KernelFn get_gemm_f32_kernel(int rows, std::string* error) {
   return get_kernel(Operation::kGemmF32, rows, 0, error);
+}
+
+KernelFn get_gemm_bf16_kernel(int rows, std::string* error) {
+  return get_kernel(Operation::kGemmBf16, rows, 0, error);
 }
 
 }  // namespace fused_cpp::moe_sve::jit
