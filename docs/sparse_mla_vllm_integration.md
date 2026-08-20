@@ -290,7 +290,7 @@ Remote Arm-codex-internal/Arm-codex flow used during development:
 
 ```bash
 bash rsync.sh
-ssh Arm-codex-internal 'cd /home/zhangxu/code && touch csrc/sparse_mla.cpp && .venv/bin/python setup.py build_ext --inplace'
+ssh Arm-codex-internal 'cd /home/zhangxu/codex/fused_cpp && touch csrc/sparse_mla.cpp && .venv/bin/python setup.py build_ext --inplace'
 ```
 
 ## Correctness Checklist

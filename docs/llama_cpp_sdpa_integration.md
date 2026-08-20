@@ -18,7 +18,7 @@ libtorch 或 `fused_cpp._C`。它只保留一个纯 C/C++ 裸指针入口和一�
 在 Arm-codex-internal/Arm-codex 上：
 
 ```sh
-cd /home/zhangxu/code/standalone/fp32_packqkv
+cd /home/zhangxu/codex/fused_cpp/standalone/fp32_packqkv
 make -j
 ```
 

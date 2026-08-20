@@ -22,19 +22,19 @@ otherwise.
 - Preferred host alias: `Arm-codex-internal`
 - Alternate host alias: `Arm-codex`
 - User: `zhangxu`
-- Remote project root: `/home/zhangxu/code`
+- Remote project root: `/home/zhangxu/codex/fused_cpp`
 - Local project root: repository root
-- Python: `/home/zhangxu/code/.venv/bin/python`
+- Python: `/home/zhangxu/codex/fused_cpp/.venv/bin/python`
 - Package manager: `uv`
 
 The aliases name the same machine. Prefer `Arm-codex-internal` on the internal
 network; use `Arm-codex` when that is the configured reachable alias. Commands
 below use the preferred alias.
 
-The fused_cpp project root moved from `/home/zhangxu/codex/fused_cpp` to
-`/home/zhangxu/code` on 2026-08-12. Do not recreate or use the old project
-path. Populate the new root with `rsync.sh` before its first build, then create
-or migrate the project virtual environment there as needed.
+The fused_cpp project root moved to `/home/zhangxu/codex/fused_cpp` on
+2026-08-19. Do not use `/home/zhangxu/code` for this project. Populate the
+current root with `rsync.sh` before its first build, then create or migrate the
+project virtual environment there as needed.
 
 Sync with:
 
@@ -45,13 +45,13 @@ bash rsync.sh
 Example check:
 
 ```bash
-ssh Arm-codex-internal 'cd /home/zhangxu/code && .venv/bin/python -c "from fused_cpp import _C; print(_C.has_openmp())"'
+ssh Arm-codex-internal 'cd /home/zhangxu/codex/fused_cpp && .venv/bin/python -c "from fused_cpp import _C; print(_C.has_openmp())"'
 ```
 
 Install missing benchmark dependencies into the project environment:
 
 ```bash
-ssh Arm-codex-internal 'cd /home/zhangxu/code && uv pip install <package>'
+ssh Arm-codex-internal 'cd /home/zhangxu/codex/fused_cpp && uv pip install <package>'
 ```
 
 ## Amazon ECS 8 Cores

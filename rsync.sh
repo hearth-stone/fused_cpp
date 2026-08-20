@@ -16,12 +16,15 @@ rsync -avzP \
     --exclude='.eggs/' \
     --exclude='.hypothesis/' \
     --exclude='.pytest_cache/' \
+    --exclude='.ruff_cache/' \
+    --exclude='.ccache/' \
     --exclude='.benchmarks/' \
     --exclude='.codebuddy/' \
     --exclude='.claude/' \
     --exclude='.gemini/' \
     --exclude='.venv/' \
+    --exclude='tmp/' \
     --exclude='bench/sdpa/sdpa_versions_*.csv' \
     --exclude='bench/sdpa/sdpa_versions_*.json' \
     --exclude='.codegraph/' \
-    ./ "${ARM_CODEX_HOST}:/home/zhangxu/code"
+    ./ "${ARM_CODEX_HOST}:/home/zhangxu/codex/fused_cpp"
