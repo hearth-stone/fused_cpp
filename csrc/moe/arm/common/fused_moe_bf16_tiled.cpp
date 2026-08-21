@@ -78,7 +78,8 @@ void bf16gemm_k_ld4_bias_f(const uint16_t* A, const uint16_t* B_reo, float* C, u
 // columns; each 8-col tile yields 4 output features.
 void bf16gemm_k_ld_silu_linear(const uint16_t* A, const uint16_t* B_reo, uint16_t* C, uint16_t* A_reorder,
                                const gemm_params_t* params);
-// Fused w13 + SiLU-and-mul (poly4/5/6 exp), interleaved-packed w13, bf16 out.
+// Fused w13 + SiLU-and-mul, interleaved-packed w13, bf16 out. The legacy
+// poly4/5/6 symbol names remain ABI-compatible; SVE evaluates exp with FEXPA.
 void bf16gemm_k_ld_silu_poly4(const uint16_t* A, const uint16_t* B_reo, uint16_t* C, uint16_t* A_reorder,
                               const gemm_params_t* params);
 void bf16gemm_k_ld_silu_poly5(const uint16_t* A, const uint16_t* B_reo, uint16_t* C, uint16_t* A_reorder,
@@ -834,7 +835,9 @@ void single_thread_gemm(const uint16_t* A, const uint16_t* B_reo, float* C, uint
   }
 }
 
-// Fused w13 + SiLU-and-mul kernel pointers for a given exp polynomial degree
+// Fused w13 + SiLU-and-mul kernel pointers for a compatible degree selector.
+// On SVE, selectors 4/5/6 all use the FEXPA evaluator; NEON retains its
+// degree-specific polynomial implementations.
 // (4/5/6). Signature: (A, B_reo, C_bf16, A_reorder, params). Shared by the
 // test binding and the MoE wiring.
 using FusedSiluKernelFn = void (*)(const uint16_t*, const uint16_t*, uint16_t*, uint16_t*, const gemm_params_t*);
@@ -1143,7 +1146,7 @@ bool sve_jit_configuration_supported(SveJitOperation operation, int K, int64_t d
   }
   if (operation == SveJitOperation::kW13 || operation == SveJitOperation::kW13Clamped) {
     if (degree < 4 || degree > 6) {
-      return reject("the exact-M JIT supports SiLU polynomial degrees 4, 5, and 6");
+      return reject("the exact-M JIT accepts SiLU compatibility selectors 4, 5, and 6");
     }
   }
   return true;
@@ -5305,7 +5308,8 @@ at::Tensor fused_moe_test_fused_w13_linear(at::Tensor A, at::Tensor w13) {
 }
 
 // Test-only (Task 3+): fused w13 SiLU-and-mul kernel, bf16 output [M,F].
-// degree selects the exp polynomial (5 available in Task 3; 4/6 in Task 4).
+// degree is a compatibility selector. SVE maps 4/5/6 to the same FEXPA
+// evaluator, while NEON retains the degree-specific polynomial kernels.
 // out[m,f] = silu(gate[m,f]) * up[m,f]. M must be a multiple of 8 until Task 5.
 at::Tensor fused_moe_test_fused_w13_silu(at::Tensor A, at::Tensor w13, int64_t degree) {
 #ifndef __aarch64__

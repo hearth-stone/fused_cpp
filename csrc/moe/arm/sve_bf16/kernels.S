@@ -491,63 +491,47 @@
 	ADR_CONST x3, .Lmoe_sve_silu_consts
 	ld1rw {z6.s}, p1/z, [x3]      // 1.0
 	add x3, x3, #4
-	ld1rw {z7.s}, p1/z, [x3]      // 0.5
+	ld1rw {z7.s}, p1/z, [x3]      // exp c0
 	add x3, x3, #4
-	ld1rw {z8.s}, p1/z, [x3]      // invln2
+	ld1rw {z8.s}, p1/z, [x3]      // exp c1
 	add x3, x3, #4
-	ld1rw {z9.s}, p1/z, [x3]      // ln2
+	ld1rw {z9.s}, p1/z, [x3]      // invln2
 	add x3, x3, #4
-	ld1rw {z10.s}, p1/z, [x3]     // c3
+	ld1rw {z10.s}, p1/z, [x3]     // ln2 high
 	add x3, x3, #4
-	ld1rw {z11.s}, p1/z, [x3]     // c4
+	ld1rw {z11.s}, p1/z, [x3]     // ln2 low
 	add x3, x3, #4
-	ld1rw {z12.s}, p1/z, [x3]     // c5
+	ld1rw {z12.s}, p1/z, [x3]     // FEXPA shift
 	add x3, x3, #4
-	ld1rw {z13.s}, p1/z, [x3]     // c6
+	ld1rw {z13.s}, p1/z, [x3]     // clamp_hi
 	add x3, x3, #4
-	ld1rw {z14.s}, p1/z, [x3]     // clamp_hi
+	ld1rw {z14.s}, p1/z, [x3]     // clamp_lo
 	add x3, x3, #4
-	ld1rw {z15.s}, p1/z, [x3]     // clamp_lo
+	ld1rw {z15.s}, p1/z, [x3]     // swiglu_limit
 	.endm
 
 	.macro SILU_TO_BF16 gate, up, deg
 	fneg z0.s, p1/m, \gate\().s
-	fmin z0.s, p1/m, z0.s, z14.s
-	fmax z0.s, p1/m, z0.s, z15.s
+	fmin z0.s, p1/m, z0.s, z13.s
+	fmax z0.s, p1/m, z0.s, z14.s
 	mov z1.d, z0.d
-	fmul z1.s, p1/m, z1.s, z8.s
-	frintn z1.s, p1/m, z1.s
-	fcvtzs z2.s, p1/m, z1.s
-	fmls z0.s, p1/m, z1.s, z9.s
-	.if \deg == 4
-	mov z1.d, z11.d
-	.elseif \deg == 5
-	mov z3.d, z12.d
-	mov z1.d, z11.d
-	fmla z1.s, p1/m, z3.s, z0.s
-	.else
-	mov z1.d, z13.d
-	mov z3.d, z12.d
-	fmla z3.s, p1/m, z1.s, z0.s
-	mov z1.d, z11.d
-	fmla z1.s, p1/m, z3.s, z0.s
-	.endif
-	mov z3.d, z10.d
-	fmla z3.s, p1/m, z1.s, z0.s
-	mov z1.d, z7.d
-	fmla z1.s, p1/m, z3.s, z0.s
-	mov z3.d, z6.d
-	fmla z3.s, p1/m, z1.s, z0.s
-	mov z1.d, z6.d
-	fmla z1.s, p1/m, z3.s, z0.s
-	mov z4.s, #127
-	add z2.s, z2.s, z4.s
-	lsl z2.s, z2.s, #23
-	fmul z1.s, p1/m, z1.s, z2.s
-	fadd z1.s, p1/m, z1.s, z6.s
+	fmul z1.s, p1/m, z1.s, z9.s
+	fadd z1.s, p1/m, z1.s, z12.s
+	mov z2.d, z1.d
+	fsub z2.s, p1/m, z2.s, z12.s
+	fmls z0.s, p1/m, z2.s, z10.s
+	fmls z0.s, p1/m, z2.s, z11.s
+	fexpa z2.s, z1.s
+	mov z3.d, z8.d
+	mov z4.d, z7.d
+	fmla z4.s, p1/m, z3.s, z0.s
+	mov z3.d, z0.d
+	fmul z3.s, p1/m, z3.s, z4.s
+	fmla z2.s, p1/m, z2.s, z3.s
+	fadd z2.s, p1/m, z2.s, z6.s
 	mov z0.d, \gate\().d
 	fmul z0.s, p1/m, z0.s, \up\().s
-	fdiv z0.s, p1/m, z0.s, z1.s
+	fdiv z0.s, p1/m, z0.s, z2.s
 	bfcvt z0.h, p1/m, z0.s
 	.endm
 
@@ -572,48 +556,33 @@
 
 	.macro SILU_TO_BF16_LOW_TMP_BASE gate, up, deg
 	fneg z0.s, p1/m, \gate\().s
-	LOAD_SILU_CONST_BASE z4, 32
+	LOAD_SILU_CONST_BASE z4, 28
 	fmin z0.s, p1/m, z0.s, z4.s
-	LOAD_SILU_CONST_BASE z4, 36
+	LOAD_SILU_CONST_BASE z4, 32
 	fmax z0.s, p1/m, z0.s, z4.s
-	LOAD_SILU_CONST_BASE z4, 8
+	LOAD_SILU_CONST_BASE z4, 12
 	mov z1.d, z0.d
 	fmul z1.s, p1/m, z1.s, z4.s
-	frintn z1.s, p1/m, z1.s
-	fcvtzs z2.s, p1/m, z1.s
-	LOAD_SILU_CONST_BASE z4, 12
-	fmls z0.s, p1/m, z1.s, z4.s
-	.if \deg == 4
-	LOAD_SILU_CONST_BASE z3, 20
-	.elseif \deg == 5
-	LOAD_SILU_CONST_BASE z3, 24
-	LOAD_SILU_CONST_BASE z4, 20
-	fmla z4.s, p1/m, z3.s, z0.s
-	mov z3.d, z4.d
-	.else
-	LOAD_SILU_CONST_BASE z3, 28
 	LOAD_SILU_CONST_BASE z4, 24
-	fmla z4.s, p1/m, z3.s, z0.s
-	LOAD_SILU_CONST_BASE z3, 20
-	fmla z3.s, p1/m, z4.s, z0.s
-	.endif
+	fadd z1.s, p1/m, z1.s, z4.s
+	mov z2.d, z1.d
+	fsub z2.s, p1/m, z2.s, z4.s
 	LOAD_SILU_CONST_BASE z4, 16
+	fmls z0.s, p1/m, z2.s, z4.s
+	LOAD_SILU_CONST_BASE z4, 20
+	fmls z0.s, p1/m, z2.s, z4.s
+	fexpa z2.s, z1.s
+	LOAD_SILU_CONST_BASE z3, 8
+	LOAD_SILU_CONST_BASE z4, 4
 	fmla z4.s, p1/m, z3.s, z0.s
-	LOAD_SILU_CONST_BASE z3, 4
-	fmla z3.s, p1/m, z4.s, z0.s
+	mov z3.d, z0.d
+	fmul z3.s, p1/m, z3.s, z4.s
+	fmla z2.s, p1/m, z2.s, z3.s
 	LOAD_SILU_CONST_BASE z4, 0
-	fmla z4.s, p1/m, z3.s, z0.s
-	LOAD_SILU_CONST_BASE z3, 0
-	fmla z3.s, p1/m, z4.s, z0.s
-	mov z4.s, #127
-	add z2.s, z2.s, z4.s
-	lsl z2.s, z2.s, #23
-	fmul z3.s, p1/m, z3.s, z2.s
-	LOAD_SILU_CONST_BASE z4, 0
-	fadd z3.s, p1/m, z3.s, z4.s
+	fadd z2.s, p1/m, z2.s, z4.s
 	mov z0.d, \gate\().d
 	fmul z0.s, p1/m, z0.s, \up\().s
-	fdiv z0.s, p1/m, z0.s, z3.s
+	fdiv z0.s, p1/m, z0.s, z2.s
 	bfcvt z0.h, p1/m, z0.s
 	.endm
 
@@ -624,23 +593,23 @@
 	mov x3, x7
 	ld1rw {z6.s}, p1/z, [x3]       // 1.0
 	add x3, x3, #4
-	ld1rw {z7.s}, p1/z, [x3]       // 0.5
+	ld1rw {z7.s}, p1/z, [x3]       // exp c0
 	add x3, x3, #4
-	ld1rw {z24.s}, p1/z, [x3]      // invln2
+	ld1rw {z24.s}, p1/z, [x3]      // exp c1
 	add x3, x3, #4
-	ld1rw {z25.s}, p1/z, [x3]      // ln2
+	ld1rw {z25.s}, p1/z, [x3]      // invln2
 	add x3, x3, #4
-	ld1rw {z26.s}, p1/z, [x3]      // c3
+	ld1rw {z26.s}, p1/z, [x3]      // ln2 high
 	add x3, x3, #4
-	ld1rw {z27.s}, p1/z, [x3]      // c4
+	ld1rw {z27.s}, p1/z, [x3]      // ln2 low
 	add x3, x3, #4
-	ld1rw {z28.s}, p1/z, [x3]      // c5
+	ld1rw {z28.s}, p1/z, [x3]      // FEXPA shift
 	add x3, x3, #4
-	ld1rw {z29.s}, p1/z, [x3]      // c6
+	ld1rw {z29.s}, p1/z, [x3]      // clamp_hi
 	add x3, x3, #4
-	ld1rw {z30.s}, p1/z, [x3]      // clamp_hi
+	ld1rw {z30.s}, p1/z, [x3]      // clamp_lo
 	add x3, x3, #4
-	ld1rw {z31.s}, p1/z, [x3]      // clamp_lo
+	ld1rw {z31.s}, p1/z, [x3]      // swiglu_limit
 	.endm
 
 	// Compute both rows in a row-pair together. The independent chains use
@@ -649,53 +618,36 @@
 	.macro SILU_PAIR_TO_BF16_CACHED gate0, gate1, up0, up1, deg
 	fneg z0.s, p1/m, \gate0\().s
 	fneg z1.s, p1/m, \gate1\().s
-	fmin z0.s, p1/m, z0.s, z30.s
-	fmin z1.s, p1/m, z1.s, z30.s
-	fmax z0.s, p1/m, z0.s, z31.s
-	fmax z1.s, p1/m, z1.s, z31.s
-	mov z2.d, z0.d
-	mov z3.d, z1.d
-	fmul z2.s, p1/m, z2.s, z24.s
-	fmul z3.s, p1/m, z3.s, z24.s
-	frintn z2.s, p1/m, z2.s
-	frintn z3.s, p1/m, z3.s
-	fmls z0.s, p1/m, z2.s, z25.s
-	fmls z1.s, p1/m, z3.s, z25.s
-	fcvtzs z2.s, p1/m, z2.s
-	fcvtzs z3.s, p1/m, z3.s
+	fmin z0.s, p1/m, z0.s, z29.s
+	fmin z1.s, p1/m, z1.s, z29.s
+	fmax z0.s, p1/m, z0.s, z30.s
+	fmax z1.s, p1/m, z1.s, z30.s
 	fmul \gate0\().s, p1/m, \gate0\().s, \up0\().s
 	fmul \gate1\().s, p1/m, \gate1\().s, \up1\().s
-	.if \deg == 4
-	mov \up0\().d, z27.d
-	mov \up1\().d, z27.d
-	.elseif \deg == 5
-	mov \up0\().d, z27.d
-	mov \up1\().d, z27.d
-	fmla \up0\().s, p1/m, z28.s, z0.s
-	fmla \up1\().s, p1/m, z28.s, z1.s
-	.else
-	mov \up0\().d, z28.d
-	mov \up1\().d, z28.d
-	fmla \up0\().s, p1/m, z29.s, z0.s
-	fmla \up1\().s, p1/m, z29.s, z1.s
-	fmad \up0\().s, p1/m, z0.s, z27.s
-	fmad \up1\().s, p1/m, z1.s, z27.s
-	.endif
-	fmad \up0\().s, p1/m, z0.s, z26.s
-	fmad \up1\().s, p1/m, z1.s, z26.s
-	fmad \up0\().s, p1/m, z0.s, z7.s
-	fmad \up1\().s, p1/m, z1.s, z7.s
-	fmad \up0\().s, p1/m, z0.s, z6.s
-	fmad \up1\().s, p1/m, z1.s, z6.s
-	fmad \up0\().s, p1/m, z0.s, z6.s
-	fmad \up1\().s, p1/m, z1.s, z6.s
-	mov z4.s, #127
-	add z2.s, z2.s, z4.s
-	add z3.s, z3.s, z4.s
-	lsl z2.s, z2.s, #23
-	lsl z3.s, z3.s, #23
-	fmul \up0\().s, p1/m, \up0\().s, z2.s
-	fmul \up1\().s, p1/m, \up1\().s, z3.s
+	mov z2.d, z0.d
+	mov z3.d, z1.d
+	fmul z2.s, p1/m, z2.s, z25.s
+	fmul z3.s, p1/m, z3.s, z25.s
+	fadd z2.s, p1/m, z2.s, z28.s
+	fadd z3.s, p1/m, z3.s, z28.s
+	mov \up0\().d, z2.d
+	mov \up1\().d, z3.d
+	fsub \up0\().s, p1/m, \up0\().s, z28.s
+	fsub \up1\().s, p1/m, \up1\().s, z28.s
+	fmls z0.s, p1/m, \up0\().s, z26.s
+	fmls z1.s, p1/m, \up1\().s, z26.s
+	fmls z0.s, p1/m, \up0\().s, z27.s
+	fmls z1.s, p1/m, \up1\().s, z27.s
+	fexpa \up0\().s, z2.s
+	fexpa \up1\().s, z3.s
+	mov z2.d, z24.d
+	mov z3.d, z24.d
+	fmla z2.s, p1/m, z0.s, z7.s
+	fmla z3.s, p1/m, z1.s, z7.s
+	fmul z2.s, p1/m, z2.s, z0.s
+	fmul z3.s, p1/m, z3.s, z1.s
+	fmla \up0\().s, p1/m, \up0\().s, z2.s
+	fmla \up1\().s, p1/m, \up1\().s, z3.s
 	fadd \up0\().s, p1/m, \up0\().s, z6.s
 	fadd \up1\().s, p1/m, \up1\().s, z6.s
 	fdiv \gate0\().s, p1/m, \gate0\().s, \up0\().s
@@ -2213,14 +2165,14 @@ moe_sve_kc_kernel_m12:
 	.balign 16
 .Lmoe_sve_silu_consts:
 	.float 1.0
-	.float 0.5
+	.float 1.000003695487976
+	.float 0.5000003576278687
 	.float 1.4426950408889634
-	.float 0.6931471805599453
-	.float 0.16666666
-	.float 0.04166666
-	.float 0.00833333
-	.float 0.0013888889
+	.float 0.693145751953125
+	.float 1.428606765330187e-06
+	.float 196735.0
 	.float 87.0
 	.float -87.0
+	.float 10.0
 
 	.section .note.GNU-stack,"",@progbits

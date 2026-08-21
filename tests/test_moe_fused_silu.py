@@ -138,8 +138,8 @@ def test_fused_w13_silu_poly5_wide_range(scale):
     torch.testing.assert_close(out, ref, atol=8e-2, rtol=8e-2)
 
 
-# Task 4: all three exp-poly degrees produce silu(gate)*up. Higher degree =
-# more accurate; the tolerance is dominated by bf16 rounding anyway.
+# All three compatibility selectors produce silu(gate)*up. SVE maps them to
+# one FEXPA evaluator; NEON retains degree-specific polynomial kernels.
 @pytest.mark.parametrize("degree", [4, 5, 6])
 @pytest.mark.parametrize("m", [8, 64])
 def test_fused_w13_silu_all_degrees(degree, m):
@@ -154,8 +154,8 @@ def test_fused_w13_silu_all_degrees(degree, m):
 
 
 def test_fused_w13_silu_degree_error_ordering():
-    # poly6 should be at least as accurate as poly4 against an fp32-exp
-    # reference (both bounded by bf16 rounding, but the exp term differs).
+    # NEON poly6 should be at least as accurate as poly4; SVE's selectors are
+    # equivalent. Both paths are ultimately bounded by bf16 rounding.
     torch.manual_seed(5)
     h, f, m = 512, 512, 64
     a = torch.randn(m, h, dtype=torch.bfloat16) * 0.3

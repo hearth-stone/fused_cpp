@@ -48,39 +48,26 @@ inline svbfloat16_t load_bf16(const uint16_t* ptr) {
   return svld1_bf16(svptrue_b16(), reinterpret_cast<const __bf16*>(ptr));
 }
 
-inline svfloat32_t exp_poly_neg(svfloat32_t gate, int64_t degree) {
+inline svfloat32_t exp_fexpa_neg(svfloat32_t gate, int64_t degree) {
+  (void)degree;
   const svbool_t pg = svptrue_b32();
   svfloat32_t x = svneg_f32_x(pg, gate);
   x = svmin_n_f32_x(pg, x, 87.0f);
   x = svmax_n_f32_x(pg, x, -87.0f);
 
-  svfloat32_t fn = svmul_n_f32_x(pg, x, 1.4426950408889634f);
-  fn = svrintn_f32_x(pg, fn);
-  svint32_t ni = svcvt_s32_f32_x(pg, fn);
-  svfloat32_t r = svmls_n_f32_x(pg, x, fn, 0.6931471805599453f);
-
-  svfloat32_t poly;
-  if (degree == 4) {
-    poly = svdup_f32(0.04166666f);
-  } else if (degree == 5) {
-    poly = svmla_n_f32_x(pg, svdup_f32(0.04166666f), r, 0.00833333f);
-  } else {
-    svfloat32_t t = svmla_n_f32_x(pg, svdup_f32(0.00833333f), r, 0.0013888889f);
-    poly = svmla_f32_x(pg, svdup_f32(0.04166666f), t, r);
-  }
-  svfloat32_t t3 = svmla_f32_x(pg, svdup_f32(0.16666666f), poly, r);
-  svfloat32_t t2 = svmla_f32_x(pg, svdup_f32(0.5f), t3, r);
-  svfloat32_t t1 = svmla_f32_x(pg, svdup_f32(1.0f), t2, r);
-  poly = svmla_f32_x(pg, svdup_f32(1.0f), t1, r);
-
-  svint32_t exp_bits = svlsl_n_s32_x(pg, svadd_n_s32_x(pg, ni, 127), 23);
-  svfloat32_t pow2 = svreinterpret_f32_s32(exp_bits);
-  return svmul_f32_x(pg, poly, pow2);
+  svfloat32_t encoded = svmla_n_f32_x(pg, svdup_f32(196735.0f), x, 1.4426950216293335f);
+  const svfloat32_t k = svsub_n_f32_x(pg, encoded, 196735.0f);
+  svfloat32_t residual = svmls_n_f32_x(pg, x, k, 0.693145751953125f);
+  residual = svmls_n_f32_x(pg, residual, k, 1.428606765330187e-06f);
+  svfloat32_t scale = svexpa_f32(svreinterpret_u32_f32(encoded));
+  svfloat32_t poly = svmla_n_f32_x(pg, svdup_f32(1.000003695487976f), residual, 0.5000003576278687f);
+  poly = svmul_f32_x(pg, poly, residual);
+  return svmla_f32_x(pg, scale, scale, poly);
 }
 
 inline svfloat32_t silu_mul(svfloat32_t gate, svfloat32_t up, int64_t degree) {
   const svbool_t pg = svptrue_b32();
-  svfloat32_t denom = svadd_n_f32_x(pg, exp_poly_neg(gate, degree), 1.0f);
+  svfloat32_t denom = svadd_n_f32_x(pg, exp_fexpa_neg(gate, degree), 1.0f);
   svfloat32_t num = svmul_f32_x(pg, gate, up);
   return svdiv_f32_x(pg, num, denom);
 }

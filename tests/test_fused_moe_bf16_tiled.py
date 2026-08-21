@@ -849,6 +849,38 @@ def test_sve_xbyak_exact_m_matches_static_asm(
             )
 
 
+def test_sve_fexpa_degree_selectors_are_identical(monkeypatch: pytest.MonkeyPatch) -> None:
+    """SVE compatibility selectors must resolve to one FEXPA evaluator."""
+    if "arm_sve_bf16" not in available_fused_moe_bf16_tiled_backends():
+        pytest.skip("requires an SVE BF16 build/runtime")
+    monkeypatch.setenv("FUSED_CPP_MOE_SVE", "1")
+    monkeypatch.setenv("FUSED_CPP_MOE_W2_BF16_ROUTE", "0")
+
+    generator = torch.Generator().manual_seed(20260821)
+    hidden = _bf16_normal((12, 64), generator=generator, std=0.05)
+    w13 = _bf16_normal((1, 64, 64), generator=generator, std=0.05)
+    w2 = _bf16_normal((1, 64, 32), generator=generator, std=0.05)
+    packed = prepare_fused_moe_bf16_tiled_weights(w13, w2, fuse_silu=True, backend="sve")
+    topk_ids = torch.zeros((12, 1), dtype=torch.int32)
+    topk_weights = torch.ones((12, 1), dtype=torch.float32)
+
+    for implementation in ("jit", "asm"):
+        monkeypatch.setenv("FUSED_CPP_MOE_SVE_IMPL", implementation)
+        outputs = [
+            fused_moe_bf16_tiled(
+                hidden,
+                packed,
+                topk_weights,
+                topk_ids,
+                num_threads=1,
+                silu_poly_degree=degree,
+            )
+            for degree in (4, 5, 6)
+        ]
+        torch.testing.assert_close(outputs[1], outputs[0], atol=0, rtol=0)
+        torch.testing.assert_close(outputs[2], outputs[0], atol=0, rtol=0)
+
+
 def test_sve_xbyak_pure_gemm_matches_static_asm(monkeypatch: pytest.MonkeyPatch) -> None:
     """Validate the standalone FP32 GEMM operation for every exact-M shape."""
     if "arm_sve_bf16" not in available_fused_moe_bf16_tiled_backends():

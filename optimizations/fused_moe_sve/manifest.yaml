@@ -134,6 +134,59 @@ features:
       single-core control had the same ordering. See
       results/amazon_m5_92c_sve_exp_evaluators_20260817.md.
 
+  - id: epilogue.fexpa_poly2_exp
+    part: epilogue
+    status: enabled
+    implementation: >-
+      csrc/moe/arm/sve_bf16/jit_kernels.cpp,
+      csrc/moe/arm/sve_bf16/kernels.S,
+      csrc/moe/arm/sve_bf16/packing.cpp,
+      optimizations/fused_moe_sve/benchmarks/bench_sve_fexpa_exp.cpp,
+      optimizations/fused_moe_sve/benchmarks/sve_fexpa_exp.S, and
+      optimizations/fused_moe_sve/benchmarks/run_sve_fexpa_exp.sh
+    hypothesis: >-
+      SVE FEXPA table lookup plus a degree-2 residual polynomial reduces the
+      live-register exp/SiLU epilogue latency relative to the current
+      degree-4/5/6 Horner implementations while retaining poly4-class accuracy.
+    depends_on:
+      - compute.xbyak_exact_m
+    conflicts_with: []
+    correctness: >-
+      FUSED_CPP_MOE_SVE_VECTOR_BITS=256
+      optimizations/fused_moe_sve/benchmarks/run_sve_fexpa_exp.sh
+      --warmup 1 --runs 1 --inner 1 --threads 1 --accuracy-samples 65536
+    benchmark: >-
+      OMP_NUM_THREADS=80 OMP_DYNAMIC=FALSE OMP_PROC_BIND=close OMP_PLACES=cores
+      taskset -c 0-79 env FUSED_CPP_MOE_SVE_VECTOR_BITS=256
+      optimizations/fused_moe_sve/benchmarks/run_sve_fexpa_exp.sh
+      --warmup 30 --runs 51 --inner 4000 --threads 80
+      --accuracy-samples 262144
+    owner: zhangxu
+    opened: 2026-08-21
+    decision_by: 2026-09-20
+    next_decision: >-
+      Retain while focused JIT/static equivalence and clamped-SwiGLU tests pass;
+      re-evaluate only on an SVE implementation with materially different
+      FEXPA latency or throughput.
+    adoption_gate: >-
+      At least 2 percent M8/M12 full-SiLU improvement over poly5, no clamped
+      SiLU regression above 1 percent, and no worse max-relative or BF16-rounded
+      error than poly4 against libm expf semantics.
+    result: >-
+      Enabled on 2026-08-21. The degree-4/5/6 public compatibility selectors
+      now share one FEXPA JIT cache entry on SVE, and the static-assembly and
+      intrinsic SVE fallbacks use the same evaluator. Passed the isolated
+      evaluator gate on Arm-codex-internal SVE256. At 80T,
+      FEXPA+poly2 improved M8/M12 SiLU by 17.97/20.27 percent and clamped SiLU
+      by 27.85/33.74 percent versus poly5. Exp max ULP was 1 versus 661/39/3
+      for poly4/5/6. Complete H7168/F768 W13 was neutral within 0.21 percent
+      for standard SiLU at M12 and M2040; complete clamped expert improved by
+      1.53 and 0.70 percent respectively. The original 2 percent complete-W13
+      speed gate was not met, but the implementation was adopted by explicit
+      product decision because it improves accuracy and removes degree-specific
+      SVE code without a measured complete-expert regression. See
+      results/arm_codex_internal_fexpa_poly2_20260821.md.
+
   - id: epilogue.deepseek_v4_clamped_swiglu
     part: epilogue
     status: enabled
@@ -1923,6 +1976,13 @@ variants:
     entrypoint: Removed from the active tree; retained in Git history 233436a.
     status: retired
     history: 233436a
+
+  - id: sve_fexpa_poly2_epilogue
+    features:
+      - compute.xbyak_exact_m
+      - epilogue.fexpa_poly2_exp
+    entrypoint: optimizations/fused_moe_sve/benchmarks/run_sve_fexpa_exp.sh
+    status: experimental
 
   - id: sve_m12_silu_reciprocal
     features: []

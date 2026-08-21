@@ -575,7 +575,9 @@ def fused_moe_bf16_tiled(
 
     If ``weights`` were prepared with ``fuse_silu=True`` and ``activation`` is
     ``"silu"``, the w13 GEMM fuses SiLU-and-mul into its store epilogue
-    (``silu_poly_degree`` selects the exp polynomial, 4/5/6).
+    (``silu_poly_degree`` accepts 4/5/6 for compatibility; the SVE backend
+    maps all three values to its FEXPA evaluator, while other backends may
+    retain degree-specific polynomial implementations).
     ``swiglu_limit=10.0`` additionally applies DeepSeek-V4 gate/up clamping and
     requires the SVE JIT backend. ``None`` and ``0.0`` retain standard SwiGLU.
 

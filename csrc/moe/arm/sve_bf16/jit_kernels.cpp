@@ -20,13 +20,12 @@ namespace {
 
 struct alignas(64) SiluConstants {
   float one = 1.0f;
-  float half = 0.5f;
+  float exp_c0 = 1.000003695487976f;
+  float exp_c1 = 0.5000003576278687f;
   float inv_ln2 = 1.4426950408889634f;
-  float ln2 = 0.6931471805599453f;
-  float c3 = 0.16666666f;
-  float c4 = 0.04166666f;
-  float c5 = 0.00833333f;
-  float c6 = 0.0013888889f;
+  float ln2_hi = 0.693145751953125f;
+  float ln2_lo = 1.428606765330187e-06f;
+  float fexpa_shift = 196735.0f;
   float clamp_hi = 87.0f;
   float clamp_lo = -87.0f;
   float swiglu_limit = 10.0f;
@@ -517,50 +516,27 @@ class SveFusedGenerator final : public CodeGenerator {
     mov(z1.d, z0.d);
     load_silu_constant(offsetof(SiluConstants, inv_ln2));
     fmul(z1.s, p1 / T_m, z4.s);
-    frintn(z1.s, p1 / T_m, z1.s);
-    fcvtzs(z2.s, p1 / T_m, z1.s);
-    load_silu_constant(offsetof(SiluConstants, ln2));
-    fmls(z0.s, p1 / T_m, z1.s, z4.s);
-    if (degree_ == 4) {
-      load_silu_constant(offsetof(SiluConstants, c4));
-      mov(z3.d, z4.d);
-    } else if (degree_ == 5) {
-      load_silu_constant(offsetof(SiluConstants, c5));
-      mov(z3.d, z4.d);
-      load_silu_constant(offsetof(SiluConstants, c4));
-      fmla(z4.s, p1 / T_m, z3.s, z0.s);
-      mov(z3.d, z4.d);
-    } else {
-      load_silu_constant(offsetof(SiluConstants, c6));
-      mov(z3.d, z4.d);
-      load_silu_constant(offsetof(SiluConstants, c5));
-      fmla(z4.s, p1 / T_m, z3.s, z0.s);
-      mov(z3.d, z4.d);
-      load_silu_constant(offsetof(SiluConstants, c4));
-      fmla(z4.s, p1 / T_m, z3.s, z0.s);
-      mov(z3.d, z4.d);
-    }
-    load_silu_constant(offsetof(SiluConstants, c3));
-    fmla(z4.s, p1 / T_m, z3.s, z0.s);
+    load_silu_constant(offsetof(SiluConstants, fexpa_shift));
+    fadd(z1.s, p1 / T_m, z4.s);
+    mov(z2.d, z1.d);
+    fsub(z2.s, p1 / T_m, z4.s);
+    load_silu_constant(offsetof(SiluConstants, ln2_hi));
+    fmls(z0.s, p1 / T_m, z2.s, z4.s);
+    load_silu_constant(offsetof(SiluConstants, ln2_lo));
+    fmls(z0.s, p1 / T_m, z2.s, z4.s);
+    fexpa(z2.s, z1.s);
+    load_silu_constant(offsetof(SiluConstants, exp_c1));
     mov(z3.d, z4.d);
-    load_silu_constant(offsetof(SiluConstants, half));
+    load_silu_constant(offsetof(SiluConstants, exp_c0));
     fmla(z4.s, p1 / T_m, z3.s, z0.s);
-    mov(z3.d, z4.d);
+    mov(z3.d, z0.d);
+    fmul(z3.s, p1 / T_m, z4.s);
+    fmla(z2.s, p1 / T_m, z2.s, z3.s);
     load_silu_constant(offsetof(SiluConstants, one));
-    fmla(z4.s, p1 / T_m, z3.s, z0.s);
-    mov(z3.d, z4.d);
-    load_silu_constant(offsetof(SiluConstants, one));
-    fmla(z4.s, p1 / T_m, z3.s, z0.s);
-    mov(z3.d, z4.d);
-    mov(z4.s, 127);
-    add(z2.s, z2.s, z4.s);
-    lsl(z2.s, z2.s, 23);
-    fmul(z3.s, p1 / T_m, z2.s);
-    load_silu_constant(offsetof(SiluConstants, one));
-    fadd(z3.s, p1 / T_m, z4.s);
+    fadd(z2.s, p1 / T_m, z4.s);
     mov(z0.d, ZRegD(gate.getIdx()));
     fmul(z0.s, p1 / T_m, up);
-    fdiv(z0.s, p1 / T_m, z3.s);
+    fdiv(z0.s, p1 / T_m, z2.s);
     bfcvt(z0.h, p1 / T_m, z0.s);
   }
 
@@ -584,9 +560,7 @@ class SveFusedGenerator final : public CodeGenerator {
     add(x14, x14, 4);
     ld1rw(z14.s, p1 / T_z, ptr(x14));
     add(x14, x14, 4);
-    if (clamp_swiglu_) {
-      add(x14, x8, offsetof(SiluConstants, swiglu_limit));
-    }
+    add(x14, x8, offsetof(SiluConstants, swiglu_limit));
     ld1rw(z15.s, p1 / T_z, ptr(x14));
   }
 
@@ -598,44 +572,28 @@ class SveFusedGenerator final : public CodeGenerator {
       fmax(up, p1 / T_m, z4.s);
     }
     fneg(z0.s, p1 / T_m, gate);
-    fmin(z0.s, p1 / T_m, z14.s);
+    fmin(z0.s, p1 / T_m, z13.s);
     if (!clamp_swiglu_) {
-      fmax(z0.s, p1 / T_m, z15.s);
+      fmax(z0.s, p1 / T_m, z14.s);
     }
     mov(z1.d, z0.d);
-    fmul(z1.s, p1 / T_m, z8.s);
-    frintn(z1.s, p1 / T_m, z1.s);
-    fcvtzs(z2.s, p1 / T_m, z1.s);
-    fmls(z0.s, p1 / T_m, z1.s, z9.s);
-    if (degree_ == 4) {
-      mov(z1.d, z11.d);
-    } else if (degree_ == 5) {
-      mov(z3.d, z12.d);
-      mov(z1.d, z11.d);
-      fmla(z1.s, p1 / T_m, z3.s, z0.s);
-    } else {
-      mov(z1.d, z13.d);
-      mov(z3.d, z12.d);
-      fmla(z3.s, p1 / T_m, z1.s, z0.s);
-      mov(z1.d, z11.d);
-      fmla(z1.s, p1 / T_m, z3.s, z0.s);
-    }
-    mov(z3.d, z10.d);
-    fmla(z3.s, p1 / T_m, z1.s, z0.s);
-    mov(z1.d, z7.d);
-    fmla(z1.s, p1 / T_m, z3.s, z0.s);
-    mov(z3.d, z6.d);
-    fmla(z3.s, p1 / T_m, z1.s, z0.s);
-    mov(z1.d, z6.d);
-    fmla(z1.s, p1 / T_m, z3.s, z0.s);
-    mov(z4.s, 127);
-    add(z2.s, z2.s, z4.s);
-    lsl(z2.s, z2.s, 23);
-    fmul(z1.s, p1 / T_m, z2.s);
-    fadd(z1.s, p1 / T_m, z6.s);
+    fmul(z1.s, p1 / T_m, z9.s);
+    fadd(z1.s, p1 / T_m, z12.s);
+    mov(z2.d, z1.d);
+    fsub(z2.s, p1 / T_m, z12.s);
+    fmls(z0.s, p1 / T_m, z2.s, z10.s);
+    fmls(z0.s, p1 / T_m, z2.s, z11.s);
+    fexpa(z2.s, z1.s);
+    mov(z3.d, z8.d);
+    mov(z4.d, z7.d);
+    fmla(z4.s, p1 / T_m, z3.s, z0.s);
+    mov(z3.d, z0.d);
+    fmul(z3.s, p1 / T_m, z4.s);
+    fmla(z2.s, p1 / T_m, z2.s, z3.s);
+    fadd(z2.s, p1 / T_m, z6.s);
     mov(z0.d, ZRegD(gate.getIdx()));
     fmul(z0.s, p1 / T_m, up);
-    fdiv(z0.s, p1 / T_m, z1.s);
+    fdiv(z0.s, p1 / T_m, z2.s);
     bfcvt(z0.h, p1 / T_m, z0.s);
   }
 
@@ -659,9 +617,7 @@ class SveFusedGenerator final : public CodeGenerator {
     add(x14, x14, 4);
     ld1rw(z30.s, p1 / T_z, ptr(x14));
     add(x14, x14, 4);
-    if (clamp_swiglu_) {
-      add(x14, x8, offsetof(SiluConstants, swiglu_limit));
-    }
+    add(x14, x8, offsetof(SiluConstants, swiglu_limit));
     ld1rw(z31.s, p1 / T_z, ptr(x14));
   }
 
@@ -681,55 +637,38 @@ class SveFusedGenerator final : public CodeGenerator {
     }
     fneg(z0.s, p1 / T_m, gate0);
     fneg(z1.s, p1 / T_m, gate1);
-    fmin(z0.s, p1 / T_m, z30.s);
-    fmin(z1.s, p1 / T_m, z30.s);
+    fmin(z0.s, p1 / T_m, z29.s);
+    fmin(z1.s, p1 / T_m, z29.s);
     if (!clamp_swiglu_) {
-      fmax(z0.s, p1 / T_m, z31.s);
-      fmax(z1.s, p1 / T_m, z31.s);
+      fmax(z0.s, p1 / T_m, z30.s);
+      fmax(z1.s, p1 / T_m, z30.s);
     }
-    mov(z2.d, z0.d);
-    mov(z3.d, z1.d);
-    fmul(z2.s, p1 / T_m, z24.s);
-    fmul(z3.s, p1 / T_m, z24.s);
-    frintn(z2.s, p1 / T_m, z2.s);
-    frintn(z3.s, p1 / T_m, z3.s);
-    fmls(z0.s, p1 / T_m, z2.s, z25.s);
-    fmls(z1.s, p1 / T_m, z3.s, z25.s);
-    fcvtzs(z2.s, p1 / T_m, z2.s);
-    fcvtzs(z3.s, p1 / T_m, z3.s);
     fmul(gate0, p1 / T_m, up0);
     fmul(gate1, p1 / T_m, up1);
-    if (degree_ == 4) {
-      mov(ZRegD(up0.getIdx()), z27.d);
-      mov(ZRegD(up1.getIdx()), z27.d);
-    } else if (degree_ == 5) {
-      mov(ZRegD(up0.getIdx()), z27.d);
-      mov(ZRegD(up1.getIdx()), z27.d);
-      fmla(up0, p1 / T_m, z28.s, z0.s);
-      fmla(up1, p1 / T_m, z28.s, z1.s);
-    } else {
-      mov(ZRegD(up0.getIdx()), z28.d);
-      mov(ZRegD(up1.getIdx()), z28.d);
-      fmla(up0, p1 / T_m, z29.s, z0.s);
-      fmla(up1, p1 / T_m, z29.s, z1.s);
-      fmad(up0, p1 / T_m, z0.s, z27.s);
-      fmad(up1, p1 / T_m, z1.s, z27.s);
-    }
-    fmad(up0, p1 / T_m, z0.s, z26.s);
-    fmad(up1, p1 / T_m, z1.s, z26.s);
-    fmad(up0, p1 / T_m, z0.s, z7.s);
-    fmad(up1, p1 / T_m, z1.s, z7.s);
-    fmad(up0, p1 / T_m, z0.s, z6.s);
-    fmad(up1, p1 / T_m, z1.s, z6.s);
-    fmad(up0, p1 / T_m, z0.s, z6.s);
-    fmad(up1, p1 / T_m, z1.s, z6.s);
-    mov(z4.s, 127);
-    add(z2.s, z2.s, z4.s);
-    add(z3.s, z3.s, z4.s);
-    lsl(z2.s, z2.s, 23);
-    lsl(z3.s, z3.s, 23);
-    fmul(up0, p1 / T_m, z2.s);
-    fmul(up1, p1 / T_m, z3.s);
+    mov(z2.d, z0.d);
+    mov(z3.d, z1.d);
+    fmul(z2.s, p1 / T_m, z25.s);
+    fmul(z3.s, p1 / T_m, z25.s);
+    fadd(z2.s, p1 / T_m, z28.s);
+    fadd(z3.s, p1 / T_m, z28.s);
+    mov(ZRegD(up0.getIdx()), z2.d);
+    mov(ZRegD(up1.getIdx()), z3.d);
+    fsub(up0, p1 / T_m, z28.s);
+    fsub(up1, p1 / T_m, z28.s);
+    fmls(z0.s, p1 / T_m, up0, z26.s);
+    fmls(z1.s, p1 / T_m, up1, z26.s);
+    fmls(z0.s, p1 / T_m, up0, z27.s);
+    fmls(z1.s, p1 / T_m, up1, z27.s);
+    fexpa(up0, z2.s);
+    fexpa(up1, z3.s);
+    mov(z2.d, z24.d);
+    mov(z3.d, z24.d);
+    fmla(z2.s, p1 / T_m, z0.s, z7.s);
+    fmla(z3.s, p1 / T_m, z1.s, z7.s);
+    fmul(z2.s, p1 / T_m, z0.s);
+    fmul(z3.s, p1 / T_m, z1.s);
+    fmla(up0, p1 / T_m, up0, z2.s);
+    fmla(up1, p1 / T_m, up1, z3.s);
     fadd(up0, p1 / T_m, z6.s);
     fadd(up1, p1 / T_m, z6.s);
     fdiv(gate0, p1 / T_m, up0);
@@ -984,16 +923,13 @@ struct KernelCacheSlot {
 
 constexpr size_t kOperationCount = 9;
 constexpr size_t kRowCount = 12;
-constexpr size_t kDegreeCount = 3;
+constexpr size_t kDegreeCount = 1;
 constexpr size_t kProbeModeCount = 4;
 
 size_t operation_index(Operation operation) { return static_cast<size_t>(operation); }
 
-size_t degree_index(Operation operation, int degree) {
-  return operation == Operation::kW13 || operation == Operation::kW13Clamped ||
-                 operation == Operation::kW8W13 || operation == Operation::kW8W13Clamped
-             ? static_cast<size_t>(degree - 4)
-             : 0;
+size_t degree_index(Operation, int) {
+  return 0;
 }
 
 size_t probe_index(ProbeMode mode) {
@@ -1041,7 +977,8 @@ KernelFn get_kernel(Operation operation, int rows, int degree, std::string* erro
     }
     return nullptr;
   }
-  const KernelKey key{operation, static_cast<uint8_t>(rows), static_cast<uint8_t>(degree), ProbeMode::kNone};
+  const int canonical_degree = operation == Operation::kW13 || operation == Operation::kW13Clamped ? 5 : degree;
+  const KernelKey key{operation, static_cast<uint8_t>(rows), static_cast<uint8_t>(canonical_degree), ProbeMode::kNone};
   KernelHandle& handle = cached_kernel(key);
   if (error != nullptr) {
     *error = handle.error;
@@ -1060,7 +997,9 @@ W8KernelFn get_w8_kernel(Operation operation, int rows, int degree, std::string*
     }
     return nullptr;
   }
-  const KernelKey key{operation, static_cast<uint8_t>(rows), static_cast<uint8_t>(degree), ProbeMode::kNone};
+  const int canonical_degree =
+      operation == Operation::kW8W13 || operation == Operation::kW8W13Clamped ? 5 : degree;
+  const KernelKey key{operation, static_cast<uint8_t>(rows), static_cast<uint8_t>(canonical_degree), ProbeMode::kNone};
   KernelHandle& handle = cached_kernel(key);
   if (error != nullptr) {
     *error = handle.error;
