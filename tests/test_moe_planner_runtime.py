@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -156,6 +157,49 @@ def test_enable_quick_planner_calibrates_before_installing(
     assert events[1][2]["cpu_ids"] == (4, 5)
     assert events[1][2]["shared_experts"] == 1
     assert events[2][1] is runtime
+
+
+def test_runtime_planner_initialization_precomputes_dense_t_iso_table() -> None:
+    class Model:
+        supported_widths = (1, 2, 4)
+
+        def __init__(self):
+            self.entries = {}
+
+        def T_iso(self, routes, threads):
+            self.entries[(routes, threads)] = float(routes * threads)
+
+        def export_t_iso_cache(self):
+            return dict(self.entries)
+
+    runtime = object.__new__(MoePlannerRuntime)
+    runtime._lock = threading.RLock()
+    runtime.model = Model()
+    runtime._initialization_diagnostics = {}
+    runtime._persist_cost_cache_if_needed = lambda: None
+
+    first = runtime.initialize_planner(4)
+    second = runtime.initialize_planner(4)
+
+    assert first["initialized"] is True
+    assert first["max_routes"] == 4
+    assert first["generated_entries"] == 12
+    assert first["total_entries"] == 12
+    assert second["generated_entries"] == 0
+
+
+def test_fixed_planner_threads_environment_is_explicit(monkeypatch: pytest.MonkeyPatch) -> None:
+    import fused_cpp.moe.planner_runtime as planner_runtime
+
+    monkeypatch.delenv("FUSED_CPP_MOE_PLANNER_FIXED_THREADS", raising=False)
+    assert planner_runtime._fixed_planner_threads_from_env() is None
+    monkeypatch.setenv("FUSED_CPP_MOE_PLANNER_FIXED_THREADS", "0")
+    assert planner_runtime._fixed_planner_threads_from_env() is None
+    monkeypatch.setenv("FUSED_CPP_MOE_PLANNER_FIXED_THREADS", "8")
+    assert planner_runtime._fixed_planner_threads_from_env() == 8
+    monkeypatch.setenv("FUSED_CPP_MOE_PLANNER_FIXED_THREADS", "off")
+    with pytest.raises(ValueError, match="non-negative integer"):
+        planner_runtime._fixed_planner_threads_from_env()
 
 
 def test_normal_dispatch_uses_plan_v2_when_runtime_accepts_call(

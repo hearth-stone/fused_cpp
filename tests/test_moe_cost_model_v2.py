@@ -321,6 +321,41 @@ def test_planned_moe_quick_search_caches_selected_shape() -> None:
     assert planner.last["cache_hit"]
 
 
+def test_planned_moe_can_disable_route_plan_cache() -> None:
+    planner = PlannedMoE(
+        _QuickPlannerModel(),
+        num_cores=4,
+        search_mode="quick",
+        cache_plans=False,
+    )
+
+    first = planner.plan_spec_for([(0, 100), (1, 100)])
+    second = planner.plan_spec_for([(0, 100), (1, 100)])
+
+    assert second["bridge"] == first["bridge"]
+    assert planner.shape_cache == {}
+    assert planner.last["cache_enabled"] is False
+    assert planner.last["cache_hit"] is False
+    assert planner.last["sig_ns"] < planner.last["search_ns"]
+
+
+def test_planned_moe_fixed_threads_uses_one_homogeneous_greedy_shape() -> None:
+    planner = PlannedMoE(
+        _QuickPlannerModel(),
+        num_cores=4,
+        search_mode="quick",
+        cache_plans=False,
+        fixed_threads=2,
+    )
+
+    result = planner.plan_spec_for([(0, 100), (1, 80), (2, 1)])
+
+    assert result["shape"] == (2, 2)
+    assert planner.last["planner_backend"] == "python_fixed_quick"
+    assert planner.last["fixed_threads"] == 2
+    assert planner.last["strict_candidates"] == 1
+
+
 def test_shared_quick_planner_pins_shared_first_and_reuses_its_lane() -> None:
     planner = PlannedMoE(_SharedQuickPlannerModel(), num_cores=4, search_mode="quick")
     counts = [(expert, 1) for expert in range(8)] + [(8, 100)]

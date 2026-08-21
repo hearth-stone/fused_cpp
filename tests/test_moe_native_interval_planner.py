@@ -45,6 +45,17 @@ def _native_extension():
     return extension
 
 
+def _native_quick_extension():
+    for module_name in ("fused_cpp._moe_C", "fused_cpp._C"):
+        try:
+            extension = importlib.import_module(module_name)
+        except ImportError:
+            continue
+        if hasattr(extension, "NativeQuickPlanner"):
+            return extension
+    pytest.skip("no built fused_cpp extension exposes NativeQuickPlanner")
+
+
 def _assert_plan_equivalent(reference: dict, actual: dict) -> None:
     exact_fields = (
         "shape",
@@ -159,9 +170,7 @@ def test_native_parallel_cold_search_matches_python(iso_mode: str) -> None:
 
 
 def test_native_analytical_quick_search_matches_python() -> None:
-    extension = _native_extension()
-    if not hasattr(extension, "NativeQuickPlanner"):
-        pytest.skip("fused_cpp._C was built without NativeQuickPlanner")
+    _native_quick_extension()
     model = AnalyticMoeCostModel(
         ANALYTIC_PROFILE,
         hidden_size=64,
@@ -203,9 +212,7 @@ def test_native_analytical_quick_search_matches_python() -> None:
 
 
 def test_native_quick_assignment_preserves_rounded_score_tie_break() -> None:
-    extension = _native_extension()
-    if not hasattr(extension, "NativeQuickPlanner"):
-        pytest.skip("fused_cpp._C was built without NativeQuickPlanner")
+    extension = _native_quick_extension()
     planner = extension.NativeQuickPlanner(
         2,
         [[1, 1]],
@@ -221,7 +228,7 @@ def test_native_quick_assignment_preserves_rounded_score_tie_break() -> None:
 
 
 def test_native_shared_quick_search_matches_python() -> None:
-    extension = _native_extension()
+    extension = _native_quick_extension()
     if not hasattr(extension.NativeQuickPlanner, "plan_shared"):
         pytest.skip("fused_cpp._C was built without shared quick planning")
     model = AnalyticMoeCostModel(

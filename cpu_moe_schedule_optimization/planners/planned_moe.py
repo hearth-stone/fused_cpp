@@ -77,6 +77,8 @@ class PlannedMoE:
         cpu_ids: Sequence[int] | None = None,
         tail_repartition_widths: Sequence[int] | None = None,
         search_mode: str = "full",
+        cache_plans: bool = True,
+        fixed_threads: int | None = None,
     ):
         if callable(getattr(models, "T_iso", None)) and callable(getattr(models, "dag_makespan", None)):
             self.models = (models,)
@@ -90,6 +92,10 @@ class PlannedMoE:
         if search_mode not in {"full", "quick"}:
             raise ValueError("search_mode must be 'full' or 'quick'")
         self.search_mode = search_mode
+        self.cache_plans = bool(cache_plans)
+        self.fixed_threads = None if fixed_threads is None else int(fixed_threads)
+        if self.fixed_threads is not None and self.search_mode != "quick":
+            raise ValueError("fixed_threads requires quick search mode")
         self.cpu_ids = tuple(cpu_ids) if cpu_ids is not None else tuple(range(num_cores))
         self.interval_planners = tuple(
             IntervalPlanner(
@@ -212,6 +218,8 @@ class PlannedMoE:
         tail_pool_max_routes: int = 12,
         bounded_tail_repartition: bool | None = None,
         shared_expert_id: int | None = None,
+        shared_allowed_widths: Sequence[int] | None = None,
+        shared_homogeneous_only: bool = False,
     ) -> Dict[str, object]:
         begin = time.perf_counter_ns()
         counts = [(int(expert), int(routes)) for expert, routes in counts if int(routes) > 0]
@@ -224,6 +232,11 @@ class PlannedMoE:
                 raise ValueError("synthetic shared expert planning does not support a forced tail pool")
             dynamic_tail_pool = False
             bounded_tail_repartition = False
+        normalized_shared_widths = (
+            None
+            if shared_allowed_widths is None
+            else tuple(sorted({int(width) for width in shared_allowed_widths}))
+        )
         requested_mode = (
             "shared"
             if shared_expert_id is not None
@@ -235,20 +248,24 @@ class PlannedMoE:
         )
         tail_pool_cache_signature = (
             _tail_pool_signature(counts, tail_pool_max_routes)
-            if requested_mode in {"auto", "forced"}
+            if self.cache_plans and requested_mode in {"auto", "forced"}
             else ()
         )
-        cache_key = (
-            *signature(counts, self.policy_identity),
-            requested_mode,
-            tail_pool_threads,
-            tail_pool_max_routes if requested_mode != "strict" else None,
-            tail_pool_cache_signature,
-            bounded_tail_repartition,
-            shared_expert_id,
-        )
+        cache_key = None
+        if self.cache_plans:
+            cache_key = (
+                *signature(counts, self.policy_identity),
+                requested_mode,
+                tail_pool_threads,
+                tail_pool_max_routes if requested_mode != "strict" else None,
+                tail_pool_cache_signature,
+                bounded_tail_repartition,
+                shared_expert_id,
+                normalized_shared_widths,
+                bool(shared_homogeneous_only),
+            )
         after_signature = time.perf_counter_ns()
-        cached = self.shape_cache.get(cache_key)
+        cached = self.shape_cache.get(cache_key) if cache_key is not None else None
         hit = cached is not None
         if hit:
             assert cached is not None
@@ -280,6 +297,7 @@ class PlannedMoE:
                 )
                 after_search = time.perf_counter_ns()
             except (KeyError, ValueError):
+                assert cache_key is not None
                 self.shape_cache.pop(cache_key, None)
                 hit = False
         if not hit:
@@ -287,12 +305,21 @@ class PlannedMoE:
                 if tail_pool_threads is not None:
                     raise ValueError("quick search does not support a forced tail pool")
                 if shared_expert_id is None:
-                    result = self.interval_planners[0].plan_quick(counts, topk_ids=topk_ids)
+                    if self.fixed_threads is None:
+                        result = self.interval_planners[0].plan_quick(counts, topk_ids=topk_ids)
+                    else:
+                        result = self.interval_planners[0].plan_quick_fixed(
+                            counts,
+                            self.fixed_threads,
+                            topk_ids=topk_ids,
+                        )
                 else:
                     result = self.interval_planners[0].plan_quick_with_shared(
                         counts,
                         shared_expert_id=shared_expert_id,
                         topk_ids=topk_ids,
+                        allowed_widths=normalized_shared_widths,
+                        homogeneous_only=shared_homogeneous_only,
                     )
             else:
                 result = self.interval_planners[0].plan(
@@ -305,17 +332,18 @@ class PlannedMoE:
                 )
             planner_index = self._planner_index(result)
             shape = tuple(result["shape"])
-            self.shape_cache[cache_key] = (
-                planner_index,
-                shape,
-                str(result["execution_mode"]),
-                str(result["assignment_order"]),
-                result["tail_pool_threads"],
-                result["tail_pool_max_routes"],
-                result["tail_repartition_width"],
-                result["tail_repartition_tasks"],
-                result["tail_repartition_route_slices"],
-            )
+            if cache_key is not None:
+                self.shape_cache[cache_key] = (
+                    planner_index,
+                    shape,
+                    str(result["execution_mode"]),
+                    str(result["assignment_order"]),
+                    result["tail_pool_threads"],
+                    result["tail_pool_max_routes"],
+                    result["tail_repartition_width"],
+                    result["tail_repartition_tasks"],
+                    result["tail_repartition_route_slices"],
+                )
             after_search = time.perf_counter_ns()
         bridge = result["bridge"]
         after_assign = time.perf_counter_ns()
@@ -325,6 +353,8 @@ class PlannedMoE:
             "lookup_ns": (after_search - after_signature) if hit else 0,
             "assign_ns": after_assign - after_search,
             "cache_hit": hit,
+            "cache_enabled": self.cache_plans,
+            "fixed_threads": self.fixed_threads,
             "planner_overhead_ns": after_assign - begin,
             "plan_version": bridge["plan_version"],
             "execution_mode": bridge["execution_mode"],

@@ -193,6 +193,7 @@ class IntervalPlanner:
         if len(self.cpu_ids) != self.num_cores or len(set(self.cpu_ids)) != num_cores:
             raise ValueError("cpu_ids must contain num_cores unique physical CPUs")
 
+        self._shapes_explicit = shapes is not None
         if shapes is not None:
             candidates = [tuple(int(value) for value in shape) for shape in shapes]
         elif self.model.schema_version >= 2:
@@ -224,10 +225,14 @@ class IntervalPlanner:
         exporter = getattr(self.model, "native_quick_planner_payload", None)
         if not callable(exporter):
             return None
-        try:
-            extension = importlib.import_module("fused_cpp._C")
-            native_type = extension.NativeQuickPlanner
-        except (ImportError, AttributeError):
+        native_type = None
+        for module_name in ("fused_cpp._moe_C", "fused_cpp._C"):
+            try:
+                native_type = importlib.import_module(module_name).NativeQuickPlanner
+                break
+            except (ImportError, AttributeError):
+                continue
+        if native_type is None:
             return None
         homogeneous_shapes = [shape for shape in self.shapes if len(set(shape)) == 1]
         if not homogeneous_shapes:
@@ -559,6 +564,7 @@ class IntervalPlanner:
         makespan: float,
         *,
         use_full_workload_anchor: bool = True,
+        independent_analytic_samples: bool = False,
     ) -> float:
         if self.model.schema_version < 2:
             return 0.0
@@ -573,6 +579,10 @@ class IntervalPlanner:
             )
         else:
             relative = float(constant_relative)
+            if getattr(self.model, "iso_mode", None) == "analytic" and not independent_analytic_samples:
+                # Analytical calibration error is systematic model error. More
+                # experts or repeated probe runs do not make it independent.
+                return makespan * relative
         waves = max(1, math.ceil(len(experts) / len(shape)))
         return makespan * relative / math.sqrt(waves * self.model.profile_runs)
 
@@ -693,7 +703,13 @@ class IntervalPlanner:
         assignment, lane_loads = self._assign_homogeneous_lpt(experts, lanes)
         tasks = self._build_tasks(experts, lanes, assignment)
         makespan = max(lane_loads, default=0.0)
-        uncertainty = self._uncertainty(experts, signature, makespan, use_full_workload_anchor=False)
+        uncertainty = self._uncertainty(
+            experts,
+            signature,
+            makespan,
+            use_full_workload_anchor=False,
+            independent_analytic_samples=True,
+        )
         return {
             "shape": signature,
             "execution_mode": _ASYNC_EXECUTION_STRICT,
@@ -713,13 +729,68 @@ class IntervalPlanner:
             "resource_groups": len(lanes),
         }
 
+    def _uses_analytic_full(self) -> bool:
+        return (
+            self.stage is None
+            and not self._shapes_explicit
+            and getattr(self.model, "iso_mode", None) == "analytic"
+        )
+
+    def _analytic_full_baseline(self, experts) -> dict:
+        """Rescore the quick winner as an additional full-search candidate.
+
+        Full search evaluates the complete modeled candidate space. Keeping the
+        quick winner in that space makes the two objectives directly comparable
+        and guarantees that the model-optimal full score cannot exceed quick.
+        """
+        homogeneous_shapes = [shape for shape in self.shapes if len(set(shape)) == 1]
+        if not homogeneous_shapes:
+            raise ProfileCompatibilityError("analytic full search requires at least one homogeneous shape")
+        quick_candidates = [self._quick_candidate(experts, shape) for shape in homogeneous_shapes]
+        baseline = min(
+            quick_candidates,
+            key=lambda candidate: (
+                candidate["makespan_ns"],
+                candidate["active_working_set_bytes"],
+                candidate["resource_groups"],
+            ),
+        )
+        baseline["makespan_ns"] = self._score(baseline["tasks"])
+        baseline["uncertainty_ns"] = self._uncertainty(
+            experts,
+            baseline["shape"],
+            baseline["makespan_ns"],
+            use_full_workload_anchor=False,
+        )
+        baseline["pessimistic_ns"] = baseline["makespan_ns"] + baseline["uncertainty_ns"]
+        return baseline
+
+    @staticmethod
+    def _select_analytic_full(candidates: Sequence[dict]) -> dict:
+        """Select the minimum expected makespan over the complete model space."""
+        return min(
+            candidates,
+            key=lambda candidate: (
+                candidate["makespan_ns"],
+                candidate["pessimistic_ns"],
+                candidate["active_working_set_bytes"],
+                candidate.get("resource_groups", len(candidate["shape"])),
+            ),
+        )
+
     def _quick_shared_candidate(self, experts, shape, shared_expert_id: int) -> dict:
         signature = tuple(int(value) for value in shape)
         lanes = self._lanes(signature)
         assignment, lane_loads = self._assign_shared_lpt(experts, lanes, shared_expert_id)
         tasks = self._build_tasks(experts, lanes, assignment)
         makespan = max(lane_loads, default=0.0)
-        uncertainty = self._uncertainty(experts, signature, makespan, use_full_workload_anchor=False)
+        uncertainty = self._uncertainty(
+            experts,
+            signature,
+            makespan,
+            use_full_workload_anchor=False,
+            independent_analytic_samples=True,
+        )
         return {
             "shape": signature,
             "execution_mode": _ASYNC_EXECUTION_STRICT,
@@ -1324,7 +1395,8 @@ class IntervalPlanner:
             raise ValueError("at least one active expert is required")
         if bounded_tail_repartition is None:
             bounded_tail_repartition = dynamic_tail_pool and forced_tail_pool_threads is None
-        if self._native_planner is not None:
+        analytic_full = self._uses_analytic_full()
+        if self._native_planner is not None and not analytic_full:
             native = self._native_planner.plan(
                 [expert for expert, _ in experts],
                 [routes for _, routes in experts],
@@ -1344,6 +1416,9 @@ class IntervalPlanner:
                 tail_repartition_candidates=int(native["tail_repartition_candidates"]),
             )
         strict_candidates = [self._candidate(experts, shape) for shape in self.shapes]
+        analytic_baseline = self._analytic_full_baseline(experts) if analytic_full else None
+        if analytic_baseline is not None:
+            strict_candidates.append(analytic_baseline)
         tail_repartition_candidates: list[dict] = []
         if bounded_tail_repartition and forced_tail_pool_threads is None:
             tail_repartition_candidates = self._bounded_tail_repartition_candidates(
@@ -1376,12 +1451,16 @@ class IntervalPlanner:
                 candidates.extend(tail_repartition_candidates)
             if dynamic_tail_pool:
                 candidates.extend(tail_pool_candidates)
-        selected = self._select(candidates)
+        selected = (
+            self._select_analytic_full(candidates)
+            if analytic_baseline is not None and forced_tail_pool_threads is None
+            else self._select(candidates)
+        )
         return self._finalize_plan(
             selected,
             candidates,
             topk_ids=topk_ids,
-            planner_backend="python",
+            planner_backend="python_analytic_full" if analytic_full else "python",
             planner_workers=1,
             strict_candidates=len(strict_candidates),
             dynamic_candidates=len(tail_pool_candidates),
@@ -1437,12 +1516,57 @@ class IntervalPlanner:
             tail_repartition_candidates=0,
         )
 
+    def plan_quick_fixed(
+        self,
+        experts: List[Tuple[int, int]],
+        threads: int,
+        *,
+        topk_ids=None,
+    ) -> Dict[str, object]:
+        """Build one fixed-width homogeneous LPT plan without width search."""
+        experts = [(expert, routes) for expert, routes in experts if routes > 0]
+        if not experts:
+            raise ValueError("at least one active expert is required")
+        threads = int(threads)
+        if threads <= 0 or self.num_cores % threads:
+            raise ValueError(f"fixed threads must be a positive divisor of {self.num_cores}, got {threads}")
+        shape = (threads,) * (self.num_cores // threads)
+        if shape not in self.shapes:
+            raise ProfileCompatibilityError(
+                f"fixed {threads}T shape is not supported by {self.model.profile_path.name}"
+            )
+        if self._native_quick_planner is None:
+            candidate = self._quick_candidate(experts, shape)
+            backend = "python_fixed_quick"
+            workers = 1
+        else:
+            candidate = self._native_quick_planner.assign(
+                [expert for expert, _ in experts],
+                [routes for _, routes in experts],
+                list(shape),
+                self._quick_cost_rows(experts, (shape,))[0],
+            )
+            backend = "cpp_fixed_quick"
+            workers = int(self._native_quick_planner.configured_workers)
+        return self._finalize_plan(
+            candidate,
+            [candidate],
+            topk_ids=topk_ids,
+            planner_backend=backend,
+            planner_workers=workers,
+            strict_candidates=1,
+            dynamic_candidates=0,
+            tail_repartition_candidates=0,
+        )
+
     def plan_quick_with_shared(
         self,
         experts: List[Tuple[int, int]],
         *,
         shared_expert_id: int,
         topk_ids=None,
+        allowed_widths: Sequence[int] | None = None,
+        homogeneous_only: bool = False,
     ) -> Dict[str, object]:
         """Build a bounded mixed-width plan with one all-token synthetic expert."""
         experts = [(expert, routes) for expert, routes in experts if routes > 0]
@@ -1456,6 +1580,13 @@ class IntervalPlanner:
                 "shared-aware quick planning requires exactly one active synthetic shared expert"
             )
         shapes = self._shared_quick_shapes()
+        if allowed_widths is not None:
+            allowed = {int(width) for width in allowed_widths}
+            shapes = tuple(
+                shape for shape in shapes if all(int(width) in allowed for width in shape)
+            )
+        if homogeneous_only:
+            shapes = tuple(shape for shape in shapes if len(set(shape)) == 1)
         if len(experts) > 2:
             shapes = tuple(shape for shape in shapes if len(shape) > 1)
             shared_routes = shared_matches[0]
@@ -1467,7 +1598,7 @@ class IntervalPlanner:
                     shape for shape in shapes if int(shape[0]) <= self.num_cores // 2
                 )
         if not shapes:
-            raise ProfileCompatibilityError("shared-aware quick planning has no legal mixed-width shape")
+            raise ProfileCompatibilityError("shared-aware quick planning has no legal shape")
         if self._native_quick_planner is not None and hasattr(self._native_quick_planner, "plan_shared"):
             widths, cost_rows = self._shared_quick_cost_rows(experts, shapes)
             native = self._native_quick_planner.plan_shared(

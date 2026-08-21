@@ -464,6 +464,12 @@ all_cpp_sources = sorted(glob.glob("csrc/**/*.cpp", recursive=True))
 moe_source_prefix = os.path.join("csrc", "moe") + os.sep
 sources = [source for source in all_cpp_sources if not source.startswith(moe_source_prefix)]
 moe_sources = [source for source in all_cpp_sources if source.startswith(moe_source_prefix)]
+moe_sources.extend(
+    [
+        os.path.join("csrc", "moe_planner", "interval_planner.cpp"),
+        os.path.join("csrc", "moe_planner", "quick_bindings.cpp"),
+    ]
+)
 bf16gemm_c_sources = []
 bf16gemm_asm_sources = []
 i8gemm_c_sources = []
@@ -480,7 +486,12 @@ if is_aarch64:
     if platform.system() != "Linux":
         moe_sources = [source for source in moe_sources if os.path.join("arm", "sve_bf16") not in source]
 else:
-    moe_sources = [source for source in moe_sources if os.path.join("moe", "arm") not in source]
+    w8a8_stub_source = os.path.join("csrc", "moe", "arm", "i8mm_w8a8", "kernels.cpp")
+    moe_sources = [
+        source
+        for source in moe_sources
+        if os.path.join("moe", "arm") not in source or source == w8a8_stub_source
+    ]
 
 omp_available, omp_compile_args, omp_link_args = _detect_openmp()
 
@@ -619,6 +630,7 @@ if is_aarch64:
             os.path.join("csrc", "moe", "arm", "sve_bf16", "jit_kernels.cpp"),
             os.path.join("csrc", "moe", "arm", "sve_bf16", "packing.cpp"),
             os.path.join("csrc", "moe", "arm", "sve_bf16", "route_merge.cpp"),
+            os.path.join("csrc", "moe", "arm", "i8mm_w8a8", "kernels.cpp"),
         ]
         moe_sources = [source for source in moe_sources if source not in sve_sources]
         if target_has_sve:
@@ -708,6 +720,16 @@ if is_aarch64:
             )
         define_macros.append(("FUSED_CPP_HAS_I8GEMM", "1"))
         define_macros.append(("FUSED_CPP_I8GEMM_BACKEND", f'"{i8gemm_backend}"'))
+        if i8gemm_backend == "sve":
+            moe_define_macros.append(("FUSED_CPP_MOE_HAS_I8GEMM", "1"))
+            moe_native_sources.extend(
+                [
+                    (os.path.join(bf16gemm_lib, "i8gemm_sve.c"), sve_args),
+                    (os.path.join(bf16gemm_lib, "i8gemm_sve.S"), sve_args),
+                    (os.path.join(bf16gemm_lib, "i8gemm_hybrid.S"), sve_args),
+                    (os.path.join(bf16gemm_lib, "i8gemm_pack_a_neon.S"), sve_args),
+                ]
+            )
 
 if use_acl:
     define_macros.append(("FUSED_CPP_HAS_ACL", "1"))

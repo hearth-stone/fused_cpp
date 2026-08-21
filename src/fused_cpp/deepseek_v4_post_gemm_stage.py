@@ -30,6 +30,12 @@ from fused_cpp.deepseek_v4_attn_gemm_fused import (
 from fused_cpp.bf16_linear import (
     PreparedBF16LinearWeight,
 )
+from fused_cpp.deepseek_v4_w8a8 import (
+    PreparedDeepSeekV4W8A8LinearWeight,
+    deepseek_v4_w8a8_linear,
+    prepare_deepseek_v4_w8a8_linear_quantized_weight,
+    prepare_deepseek_v4_w8a8_linear_weight,
+)
 
 try:
     from fused_cpp._C import (  # type: ignore[import-untyped]
@@ -75,6 +81,20 @@ try:
 except (ImportError, AttributeError):
     _cpp_post_gemm_c128a_prepacked = None
     _HAS_DEEPSEEK_V4_POST_GEMM_C128A_PREPACKED = False
+
+try:
+    from fused_cpp._C import (  # type: ignore[import-untyped]
+        deepseek_v4_post_gemm_c128a_projected as _cpp_post_gemm_c128a_projected,
+        deepseek_v4_post_gemm_dense_projected as _cpp_post_gemm_dense_projected,
+        deepseek_v4_post_gemm_parallel_stage_projected as _cpp_post_gemm_stage_projected,
+    )
+
+    _HAS_DEEPSEEK_V4_POST_GEMM_PROJECTED = True
+except (ImportError, AttributeError):
+    _cpp_post_gemm_c128a_projected = None
+    _cpp_post_gemm_dense_projected = None
+    _cpp_post_gemm_stage_projected = None
+    _HAS_DEEPSEEK_V4_POST_GEMM_PROJECTED = False
 
 PostGemmStageVersion = Literal["auto", "torch", "cpp"]
 PostGemmStageVariant = Literal["dense", "c128a", "c4a"]
@@ -128,6 +148,14 @@ class PreparedDeepSeekV4PostGemmWeights:
     indexer_wq_b: PreparedBF16LinearWeight | None = None
 
 
+@dataclass(frozen=True)
+class PreparedDeepSeekV4PostGemmW8A8Weights:
+    """Explicit W8A8 weights for main and optional indexer Q projections."""
+
+    main_wq_b: PreparedDeepSeekV4W8A8LinearWeight
+    indexer_wq_b: PreparedDeepSeekV4W8A8LinearWeight | None = None
+
+
 @dataclass
 class PostGemmStageInputs:
     """All explicit tensors needed to replay the post-GEMM stage."""
@@ -149,7 +177,7 @@ class PostGemmStageInputs:
     indexer_compressor: CompressorState | None = None
     topk_indices_buffer: torch.Tensor | None = None
     prefill: SparseIndexerPrefillMetadata | None = None
-    prepared_weights: PreparedDeepSeekV4PostGemmWeights | None = None
+    prepared_weights: PreparedDeepSeekV4PostGemmWeights | PreparedDeepSeekV4PostGemmW8A8Weights | None = None
 
     def variant(self) -> PostGemmStageVariant:
         """Infer the compile-time C++ entry to call from present branch state."""
@@ -561,9 +589,160 @@ def prepare_deepseek_v4_post_gemm_weights(
     )
 
 
+def prepare_deepseek_v4_post_gemm_w8a8_weights(
+    main_wq_b_weight: torch.Tensor,
+    indexer_wq_b_weight: torch.Tensor | None = None,
+) -> PreparedDeepSeekV4PostGemmW8A8Weights:
+    """Quantize and pack BF16 main/indexer ``wq_b`` weights for W8A8."""
+    return PreparedDeepSeekV4PostGemmW8A8Weights(
+        main_wq_b=prepare_deepseek_v4_w8a8_linear_weight(main_wq_b_weight),
+        indexer_wq_b=(
+            prepare_deepseek_v4_w8a8_linear_weight(indexer_wq_b_weight)
+            if indexer_wq_b_weight is not None
+            else None
+        ),
+    )
+
+
+def prepare_deepseek_v4_post_gemm_w8a8_quantized_weights(
+    main_wq_b_weight: torch.Tensor,
+    main_wq_b_scale: torch.Tensor,
+    indexer_wq_b_weight: torch.Tensor | None = None,
+    indexer_wq_b_scale: torch.Tensor | None = None,
+) -> PreparedDeepSeekV4PostGemmW8A8Weights:
+    """Pack checkpoint INT8 main/indexer ``wq_b`` weights without requantizing."""
+    if (indexer_wq_b_weight is None) != (indexer_wq_b_scale is None):
+        raise ValueError("indexer_wq_b_weight and indexer_wq_b_scale must be provided together")
+    return PreparedDeepSeekV4PostGemmW8A8Weights(
+        main_wq_b=prepare_deepseek_v4_w8a8_linear_quantized_weight(main_wq_b_weight, main_wq_b_scale),
+        indexer_wq_b=(
+            prepare_deepseek_v4_w8a8_linear_quantized_weight(indexer_wq_b_weight, indexer_wq_b_scale)
+            if indexer_wq_b_weight is not None and indexer_wq_b_scale is not None
+            else None
+        ),
+    )
+
+
+def _indexer_select_all(inputs: PostGemmStageInputs) -> bool:
+    prefill = _require(inputs.prefill, "prefill")
+    tokens = int(inputs.qr.shape[0])
+    ks = prefill.cu_seqlen_ks.reshape(-1)
+    ke = prefill.cu_seqlen_ke.reshape(-1)
+    if ks.numel() < tokens or ke.numel() < tokens:
+        return False
+    if tokens == 0:
+        return False
+    return int((ke[:tokens] - ks[:tokens]).max()) <= int(prefill.topk_tokens)
+
+
+def _post_gemm_parallel_stage_w8a8(
+    inputs: PostGemmStageInputs,
+    weights: PreparedDeepSeekV4PostGemmW8A8Weights,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    if not _HAS_DEEPSEEK_V4_POST_GEMM_PROJECTED:
+        raise RuntimeError("DeepSeek V4 projected post-GEMM C++ stage is unavailable")
+    main_q_linear = deepseek_v4_w8a8_linear(inputs.qr, weights.main_wq_b)
+    variant = inputs.variant()
+    if variant == "dense":
+        assert _cpp_post_gemm_dense_projected is not None
+        q = _cpp_post_gemm_dense_projected(
+            main_q_linear,
+            inputs.kv,
+            inputs.positions,
+            inputs.main_cos_sin_cache,
+            inputs.swa.kv_cache,
+            inputs.swa.slot_mapping,
+            int(inputs.main_head_dim),
+            float(inputs.q_eps),
+        )
+        return q, None
+
+    kv_score = _require(inputs.kv_score, "kv_score")
+    mla_compressor = _require(inputs.mla_compressor, "mla_compressor")
+    if variant == "c128a":
+        assert _cpp_post_gemm_c128a_projected is not None
+        q = _cpp_post_gemm_c128a_projected(
+            main_q_linear,
+            inputs.kv,
+            kv_score,
+            inputs.positions,
+            inputs.main_cos_sin_cache,
+            inputs.swa.kv_cache,
+            inputs.swa.slot_mapping,
+            mla_compressor.ape,
+            mla_compressor.state_cache,
+            mla_compressor.state_slot_mapping,
+            mla_compressor.token_to_req_indices,
+            mla_compressor.block_table,
+            mla_compressor.kv_cache,
+            mla_compressor.kv_slot_mapping,
+            mla_compressor.norm_weight,
+            int(inputs.main_head_dim),
+            float(inputs.q_eps),
+            int(mla_compressor.compress_ratio),
+            float(mla_compressor.rms_norm_eps),
+        )
+        return q, None
+
+    indexer_wq_b = _require(weights.indexer_wq_b, "prepared W8A8 indexer_wq_b")
+    indexer_q_linear = (
+        torch.empty((0,), dtype=torch.bfloat16)
+        if _indexer_select_all(inputs)
+        else deepseek_v4_w8a8_linear(inputs.qr, indexer_wq_b)
+    )
+    indexer_kv_score = _require(inputs.indexer_kv_score, "indexer_kv_score")
+    indexer_weights = _require(inputs.indexer_weights, "indexer_weights")
+    indexer_cos_sin_cache = _require(inputs.indexer_cos_sin_cache, "indexer_cos_sin_cache")
+    indexer_compressor = _require(inputs.indexer_compressor, "indexer_compressor")
+    topk_indices_buffer = _require(inputs.topk_indices_buffer, "topk_indices_buffer")
+    prefill = _require(inputs.prefill, "prefill")
+    assert _cpp_post_gemm_stage_projected is not None
+    return _cpp_post_gemm_stage_projected(
+        main_q_linear,
+        indexer_q_linear,
+        inputs.kv,
+        kv_score,
+        indexer_kv_score,
+        indexer_weights,
+        inputs.positions,
+        inputs.main_cos_sin_cache,
+        indexer_cos_sin_cache,
+        inputs.swa.kv_cache,
+        inputs.swa.slot_mapping,
+        mla_compressor.ape,
+        mla_compressor.state_cache,
+        mla_compressor.state_slot_mapping,
+        mla_compressor.token_to_req_indices,
+        mla_compressor.block_table,
+        mla_compressor.kv_cache,
+        mla_compressor.kv_slot_mapping,
+        mla_compressor.norm_weight,
+        indexer_compressor.ape,
+        indexer_compressor.state_cache,
+        indexer_compressor.state_slot_mapping,
+        indexer_compressor.token_to_req_indices,
+        indexer_compressor.block_table,
+        indexer_compressor.kv_cache,
+        indexer_compressor.kv_slot_mapping,
+        indexer_compressor.norm_weight,
+        topk_indices_buffer,
+        prefill.cu_seq_lens,
+        prefill.cu_seqlen_ks,
+        prefill.cu_seqlen_ke,
+        prefill.block_table,
+        int(inputs.main_head_dim),
+        float(inputs.q_eps),
+        int(mla_compressor.compress_ratio),
+        float(mla_compressor.rms_norm_eps),
+        int(indexer_compressor.compress_ratio),
+        float(indexer_compressor.rms_norm_eps),
+        int(prefill.topk_tokens),
+    )
+
+
 def post_gemm_parallel_stage_cpp_prepacked(
     inputs: PostGemmStageInputs,
-    weights: PreparedDeepSeekV4PostGemmWeights | None = None,
+    weights: PreparedDeepSeekV4PostGemmWeights | PreparedDeepSeekV4PostGemmW8A8Weights | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Run the native C++ baseline with a variant-specific prepacked entry."""
     selected_weights = weights if weights is not None else inputs.prepared_weights
@@ -571,6 +750,10 @@ def post_gemm_parallel_stage_cpp_prepacked(
         raise RuntimeError(
             "post_gemm_parallel_stage_cpp_prepacked requires weights from prepare_deepseek_v4_post_gemm_weights"
         )
+    if isinstance(selected_weights, PreparedDeepSeekV4PostGemmW8A8Weights):
+        return _post_gemm_parallel_stage_w8a8(inputs, selected_weights)
+    if not isinstance(selected_weights, PreparedDeepSeekV4PostGemmWeights):
+        raise TypeError("weights must be prepared BF16 or W8A8 post-GEMM weights")
     variant = inputs.variant()
 
     if variant == "dense":
@@ -786,15 +969,19 @@ __all__ = [
     "PostGemmStageVariant",
     "PostGemmStageVersion",
     "PreparedDeepSeekV4PostGemmWeights",
+    "PreparedDeepSeekV4PostGemmW8A8Weights",
     "SWACacheState",
     "SparseIndexerPrefillMetadata",
     "_HAS_DEEPSEEK_V4_POST_GEMM_C128A_PREPACKED",
     "_HAS_DEEPSEEK_V4_POST_GEMM_DENSE_PREPACKED",
     "_HAS_DEEPSEEK_V4_POST_GEMM_STAGE",
     "_HAS_DEEPSEEK_V4_POST_GEMM_STAGE_PREPACKED",
+    "_HAS_DEEPSEEK_V4_POST_GEMM_PROJECTED",
     "post_gemm_parallel_stage_cpp_prepacked",
     "post_gemm_parallel_stage",
     "post_gemm_parallel_stage_cpp",
     "post_gemm_parallel_stage_torch_baseline",
     "prepare_deepseek_v4_post_gemm_weights",
+    "prepare_deepseek_v4_post_gemm_w8a8_quantized_weights",
+    "prepare_deepseek_v4_post_gemm_w8a8_weights",
 ]

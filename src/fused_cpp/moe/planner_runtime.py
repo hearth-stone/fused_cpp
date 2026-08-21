@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
@@ -16,6 +17,19 @@ from cpu_moe_schedule_optimization.cost_model.analytic_model import (
 from cpu_moe_schedule_optimization.planners.planned_moe import PlannedMoE, route_counts
 from fused_cpp.moe.cost_cache import DEFAULT_MOE_COST_CACHE_DIR, MoeCostDiskCache
 from fused_cpp.moe.plan import AsyncMoEPlanV2
+
+
+def _fixed_planner_threads_from_env() -> int | None:
+    raw = os.environ.get("FUSED_CPP_MOE_PLANNER_FIXED_THREADS")
+    if raw is None or raw.strip() in {"", "0"}:
+        return None
+    try:
+        threads = int(raw)
+    except ValueError as exc:
+        raise ValueError("FUSED_CPP_MOE_PLANNER_FIXED_THREADS must be a non-negative integer") from exc
+    if threads <= 0:
+        raise ValueError("FUSED_CPP_MOE_PLANNER_FIXED_THREADS must be a non-negative integer")
+    return threads
 
 
 class MoePlannerRuntime:
@@ -78,6 +92,8 @@ class MoePlannerRuntime:
             num_cores=self.num_cores,
             cpu_ids=self.cpu_ids,
             search_mode="quick",
+            cache_plans=False,
+            fixed_threads=_fixed_planner_threads_from_env(),
         )
         self._lock = threading.RLock()
         self._cost_disk_cache = (
@@ -104,6 +120,39 @@ class MoePlannerRuntime:
                 "total_entries": loaded_entries,
                 "error": loaded.error,
             }
+        self._initialization_diagnostics: dict[str, object] = {
+            "initialized": False,
+            "max_routes": 0,
+            "generated_entries": 0,
+            "total_entries": len(self.model.export_t_iso_cache()),
+            "elapsed_ms": 0.0,
+        }
+
+    def initialize_planner(self, max_routes: int) -> dict[str, object]:
+        """Precompute every runtime ``T_iso(M,T)`` scalar through ``max_routes``."""
+        max_routes = int(max_routes)
+        if max_routes <= 0:
+            raise ValueError(f"max_routes must be positive, got {max_routes}")
+        with self._lock:
+            before = set(self.model.export_t_iso_cache())
+            begin = time.perf_counter_ns()
+            for routes in range(1, max_routes + 1):
+                for threads in self.model.supported_widths:
+                    self.model.T_iso(routes, threads)
+            clear_predictions = getattr(getattr(self.model, "predict_expert", None), "cache_clear", None)
+            if callable(clear_predictions):
+                clear_predictions()
+            self._persist_cost_cache_if_needed()
+            elapsed_ms = (time.perf_counter_ns() - begin) / 1.0e6
+            entries = self.model.export_t_iso_cache()
+            self._initialization_diagnostics = {
+                "initialized": True,
+                "max_routes": max_routes,
+                "generated_entries": len(entries.keys() - before),
+                "total_entries": len(entries),
+                "elapsed_ms": elapsed_ms,
+            }
+            return dict(self._initialization_diagnostics)
 
     @staticmethod
     def _current_affinity(core_count: int) -> tuple[int, ...]:
@@ -208,11 +257,27 @@ class MoePlannerRuntime:
         counts = route_counts(combined_topk_ids, self.local_experts + 1)
         if not counts:
             return None
+        shared_allowed_widths = None
+        shared_homogeneous_only = False
+        if str(getattr(packed, "backend_name", "")) == "arm_sve_w8a8_i8mm":
+            n_tile = int(packed.backend_n_tile)
+            w13_n_tiles = int(packed.w13[2]) // n_tile
+            w2_n_tiles = int(packed.w2[2]) // n_tile
+            shared_allowed_widths = tuple(
+                width
+                for width in range(1, self.num_cores + 1)
+                if w13_n_tiles % width == 0 and w2_n_tiles % width == 0
+            )
+            # The v1 i8mm dispatcher uses one team width for the complete
+            # invocation.  Mixed shared/routed widths are therefore invalid.
+            shared_homogeneous_only = True
         with self._lock:
             spec = self._planner.plan_spec_for(
                 counts,
                 topk_ids=combined_topk_ids,
                 shared_expert_id=shared_expert_id,
+                shared_allowed_widths=shared_allowed_widths,
+                shared_homogeneous_only=shared_homogeneous_only,
             )
             self._planner.last["combined_top_k"] = int(combined_topk_ids.shape[1])
             self._persist_cost_cache_if_needed()
@@ -242,6 +307,7 @@ class MoePlannerRuntime:
         with self._lock:
             snapshot = dict(self._planner.last)
             snapshot["cost_disk_cache"] = dict(self._cost_cache_diagnostics)
+            snapshot["initialization"] = dict(self._initialization_diagnostics)
             return snapshot
 
 

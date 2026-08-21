@@ -122,6 +122,24 @@ at::Tensor fused_moe_w8a16_tiled_async_plan_v2(
     c10::optional<at::Tensor> task_w2_window_tiles, c10::optional<at::Tensor> thread_cpu_ids, int64_t num_threads,
     std::string activation, int64_t global_num_experts, bool skip_weighted, int64_t silu_poly_degree,
     int64_t backend_n_tile, c10::optional<at::Tensor> out, int64_t early_merge, bool cache_dequant);
+std::tuple<at::Tensor, int64_t, int64_t, at::Tensor, at::Tensor, int64_t, int64_t, at::Tensor, int64_t, int64_t>
+fused_moe_w8a8_tiled_prepare_weights(at::Tensor w13_weight, at::Tensor w2_weight);
+bool fused_moe_w8a8_tiled_available();
+std::tuple<at::Tensor, int64_t, int64_t, at::Tensor, at::Tensor, int64_t, int64_t, at::Tensor, int64_t, int64_t>
+fused_moe_w8a8_tiled_prepare_quantized_weights(at::Tensor w13_weight, at::Tensor w13_scale,
+                                               at::Tensor w2_weight, at::Tensor w2_scale);
+at::Tensor fused_moe_w8a8_tiled_async_plan_v2(
+    at::Tensor input, at::Tensor w13_packed, int64_t w13_K, int64_t w13_N, at::Tensor w13_scales,
+    at::Tensor w2_packed, int64_t w2_K, int64_t w2_N, at::Tensor w2_scales, at::Tensor topk_weights,
+    at::Tensor topk_ids, at::Tensor task_expert_ids, at::Tensor task_core_begins, at::Tensor task_threads,
+    at::Tensor task_dep_offsets, at::Tensor task_deps, int64_t plan_version, int64_t execution_mode,
+    at::Tensor task_preferred_threads, at::Tensor task_min_threads, at::Tensor task_max_threads,
+    at::Tensor task_allowed_thread_offsets, at::Tensor task_allowed_threads, at::Tensor task_placement_modes,
+    at::Tensor task_numa_nodes, at::Tensor task_stage_ids, at::Tensor task_resize_points,
+    at::Tensor task_range_granularities, c10::optional<at::Tensor> task_w13_window_tiles,
+    c10::optional<at::Tensor> task_w2_window_tiles, c10::optional<at::Tensor> thread_cpu_ids, int64_t num_threads,
+    std::string activation, int64_t global_num_experts, bool skip_weighted, int64_t backend_n_tile,
+    c10::optional<at::Tensor> out, int64_t early_merge, double swiglu_limit);
 at::Tensor fused_moe_bf16_tiled_planned_staged(
     at::Tensor input, at::Tensor w13_packed, int64_t w13_K, int64_t w13_N, at::Tensor w2_packed, int64_t w2_K,
     int64_t w2_N, at::Tensor topk_weights, at::Tensor topk_ids, at::Tensor w13_task_expert_ids,

@@ -3,11 +3,13 @@
 #include <pybind11/stl.h>
 
 #include "../page_policy.h"
+#include "../moe_planner/quick_bindings.h"
 #include "common/api.h"
 #include "common/backend.h"
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   fused_cpp::moe::validate_sve_vector_length_at_import();
+  register_moe_quick_planner(m);
 
   m.def("fused_moe_bf16_tiled_available_backends", &fused_cpp::moe::available_backend_names,
         "Return the BF16 fused MoE backends supported by this build and CPU.");
@@ -189,6 +191,32 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       py::arg("num_threads") = 1, py::arg("activation") = "silu", py::arg("global_num_experts") = -1,
       py::arg("skip_weighted") = false, py::arg("silu_poly_degree") = 5, py::arg("backend_n_tile") = 8,
       py::arg("out") = c10::nullopt, py::arg("early_merge") = -1, py::arg("cache_dequant") = false,
+      py::call_guard<py::gil_scoped_release>());
+
+  m.def("fused_moe_w8a8_tiled_available", &fused_moe_w8a8_tiled_available,
+        "Return whether the ARM SVE i8mm W8A8 fused MoE path is available.");
+  m.def("fused_moe_w8a8_tiled_prepare_weights", &fused_moe_w8a8_tiled_prepare_weights,
+        "Quantize and pack per-output-channel INT8 weights for the ARM SVE i8mm W8A8 MoE path.",
+        py::arg("w13_weight"), py::arg("w2_weight"), py::call_guard<py::gil_scoped_release>());
+  m.def("fused_moe_w8a8_tiled_prepare_quantized_weights", &fused_moe_w8a8_tiled_prepare_quantized_weights,
+        "Pack pre-quantized per-output-channel INT8 weights for the ARM SVE i8mm W8A8 MoE path.",
+        py::arg("w13_weight"), py::arg("w13_scale"), py::arg("w2_weight"), py::arg("w2_scale"),
+        py::call_guard<py::gil_scoped_release>());
+  m.def(
+      "fused_moe_w8a8_tiled_async_plan_v2", &fused_moe_w8a8_tiled_async_plan_v2,
+      "Run dynamic-per-row W8A8 fused MoE with a strict homogeneous Plan V2.", py::arg("input"),
+      py::arg("w13_packed"), py::arg("w13_K"), py::arg("w13_N"), py::arg("w13_scales"),
+      py::arg("w2_packed"), py::arg("w2_K"), py::arg("w2_N"), py::arg("w2_scales"),
+      py::arg("topk_weights"), py::arg("topk_ids"), py::arg("task_expert_ids"),
+      py::arg("task_core_begins"), py::arg("task_threads"), py::arg("task_dep_offsets"), py::arg("task_deps"),
+      py::arg("plan_version"), py::arg("execution_mode"), py::arg("task_preferred_threads"),
+      py::arg("task_min_threads"), py::arg("task_max_threads"), py::arg("task_allowed_thread_offsets"),
+      py::arg("task_allowed_threads"), py::arg("task_placement_modes"), py::arg("task_numa_nodes"),
+      py::arg("task_stage_ids"), py::arg("task_resize_points"), py::arg("task_range_granularities"),
+      py::arg("task_w13_window_tiles") = c10::nullopt, py::arg("task_w2_window_tiles") = c10::nullopt,
+      py::arg("thread_cpu_ids") = c10::nullopt, py::arg("num_threads") = 1, py::arg("activation") = "silu",
+      py::arg("global_num_experts") = -1, py::arg("skip_weighted") = false, py::arg("backend_n_tile") = 8,
+      py::arg("out") = c10::nullopt, py::arg("early_merge") = 0, py::arg("swiglu_limit") = 10.0,
       py::call_guard<py::gil_scoped_release>());
 
   m.def("fused_moe_bf16_tiled_planned_staged", &fused_moe_bf16_tiled_planned_staged,

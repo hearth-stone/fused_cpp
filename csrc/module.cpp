@@ -189,6 +189,27 @@ std::tuple<at::Tensor, at::Tensor> deepseek_v4_post_gemm_parallel_stage_prepacke
     at::Tensor prefill_cu_seqlen_ke, at::Tensor prefill_block_table, int64_t main_head_dim, double q_eps,
     int64_t mla_compress_ratio, double mla_rms_norm_eps, int64_t indexer_compress_ratio, double indexer_rms_norm_eps,
     int64_t topk_tokens);
+at::Tensor deepseek_v4_post_gemm_dense_projected(at::Tensor main_q_linear, at::Tensor kv, at::Tensor positions,
+                                                 at::Tensor main_cos_sin_cache, at::Tensor swa_kv_cache,
+                                                 at::Tensor swa_slot_mapping, int64_t main_head_dim, double q_eps);
+at::Tensor deepseek_v4_post_gemm_c128a_projected(
+    at::Tensor main_q_linear, at::Tensor kv, at::Tensor kv_score, at::Tensor positions,
+    at::Tensor main_cos_sin_cache, at::Tensor swa_kv_cache, at::Tensor swa_slot_mapping, at::Tensor mla_ape,
+    at::Tensor mla_state_cache, at::Tensor mla_state_slot_mapping, at::Tensor mla_token_to_req_indices,
+    at::Tensor mla_block_table, at::Tensor mla_kv_cache, at::Tensor mla_kv_slot_mapping, at::Tensor mla_norm_weight,
+    int64_t main_head_dim, double q_eps, int64_t mla_compress_ratio, double mla_rms_norm_eps);
+std::tuple<at::Tensor, at::Tensor> deepseek_v4_post_gemm_parallel_stage_projected(
+    at::Tensor main_q_linear, at::Tensor indexer_q_linear, at::Tensor kv, at::Tensor kv_score,
+    at::Tensor indexer_kv_score, at::Tensor indexer_weights, at::Tensor positions, at::Tensor main_cos_sin_cache,
+    at::Tensor indexer_cos_sin_cache, at::Tensor swa_kv_cache, at::Tensor swa_slot_mapping, at::Tensor mla_ape,
+    at::Tensor mla_state_cache, at::Tensor mla_state_slot_mapping, at::Tensor mla_token_to_req_indices,
+    at::Tensor mla_block_table, at::Tensor mla_kv_cache, at::Tensor mla_kv_slot_mapping, at::Tensor mla_norm_weight,
+    at::Tensor indexer_ape, at::Tensor indexer_state_cache, at::Tensor indexer_state_slot_mapping,
+    at::Tensor indexer_token_to_req_indices, at::Tensor indexer_block_table, at::Tensor indexer_kv_cache,
+    at::Tensor indexer_kv_slot_mapping, at::Tensor indexer_norm_weight, at::Tensor topk_indices_buffer,
+    at::Tensor prefill_cu_seq_lens, at::Tensor prefill_cu_seqlen_ks, at::Tensor prefill_cu_seqlen_ke,
+    at::Tensor prefill_block_table, int64_t main_head_dim, double q_eps, int64_t mla_compress_ratio,
+    double mla_rms_norm_eps, int64_t indexer_compress_ratio, double indexer_rms_norm_eps, int64_t topk_tokens);
 void deepseek_v4_dequantize_and_gather_k_cache(at::Tensor out, at::Tensor k_cache, at::Tensor seq_lens,
                                                c10::optional<at::Tensor> gather_lens, at::Tensor block_table,
                                                int64_t block_size, int64_t offset);
@@ -501,6 +522,35 @@ PYBIND11_MODULE(_C, m) {
         py::arg("main_head_dim"), py::arg("q_eps"), py::arg("mla_compress_ratio"), py::arg("mla_rms_norm_eps"),
         py::arg("indexer_compress_ratio"), py::arg("indexer_rms_norm_eps"), py::arg("topk_tokens"),
         py::call_guard<py::gil_scoped_release>());
+
+  m.def("deepseek_v4_post_gemm_dense_projected", &deepseek_v4_post_gemm_dense_projected,
+        "DeepSeek V4 dense post stage from a precomputed BF16 main-Q projection.", py::arg("main_q_linear"),
+        py::arg("kv"), py::arg("positions"), py::arg("main_cos_sin_cache"), py::arg("swa_kv_cache"),
+        py::arg("swa_slot_mapping"), py::arg("main_head_dim"), py::arg("q_eps"),
+        py::call_guard<py::gil_scoped_release>());
+  m.def("deepseek_v4_post_gemm_c128a_projected", &deepseek_v4_post_gemm_c128a_projected,
+        "DeepSeek V4 C128A post stage from a precomputed BF16 main-Q projection.", py::arg("main_q_linear"),
+        py::arg("kv"), py::arg("kv_score"), py::arg("positions"), py::arg("main_cos_sin_cache"),
+        py::arg("swa_kv_cache"), py::arg("swa_slot_mapping"), py::arg("mla_ape"), py::arg("mla_state_cache"),
+        py::arg("mla_state_slot_mapping"), py::arg("mla_token_to_req_indices"), py::arg("mla_block_table"),
+        py::arg("mla_kv_cache"), py::arg("mla_kv_slot_mapping"), py::arg("mla_norm_weight"),
+        py::arg("main_head_dim"), py::arg("q_eps"), py::arg("mla_compress_ratio"), py::arg("mla_rms_norm_eps"),
+        py::call_guard<py::gil_scoped_release>());
+  m.def("deepseek_v4_post_gemm_parallel_stage_projected", &deepseek_v4_post_gemm_parallel_stage_projected,
+        "DeepSeek V4 C4A post stage from precomputed BF16 main/indexer Q projections.",
+        py::arg("main_q_linear"), py::arg("indexer_q_linear"), py::arg("kv"), py::arg("kv_score"),
+        py::arg("indexer_kv_score"), py::arg("indexer_weights"), py::arg("positions"),
+        py::arg("main_cos_sin_cache"), py::arg("indexer_cos_sin_cache"), py::arg("swa_kv_cache"),
+        py::arg("swa_slot_mapping"), py::arg("mla_ape"), py::arg("mla_state_cache"),
+        py::arg("mla_state_slot_mapping"), py::arg("mla_token_to_req_indices"), py::arg("mla_block_table"),
+        py::arg("mla_kv_cache"), py::arg("mla_kv_slot_mapping"), py::arg("mla_norm_weight"),
+        py::arg("indexer_ape"), py::arg("indexer_state_cache"), py::arg("indexer_state_slot_mapping"),
+        py::arg("indexer_token_to_req_indices"), py::arg("indexer_block_table"), py::arg("indexer_kv_cache"),
+        py::arg("indexer_kv_slot_mapping"), py::arg("indexer_norm_weight"), py::arg("topk_indices_buffer"),
+        py::arg("prefill_cu_seq_lens"), py::arg("prefill_cu_seqlen_ks"), py::arg("prefill_cu_seqlen_ke"),
+        py::arg("prefill_block_table"), py::arg("main_head_dim"), py::arg("q_eps"),
+        py::arg("mla_compress_ratio"), py::arg("mla_rms_norm_eps"), py::arg("indexer_compress_ratio"),
+        py::arg("indexer_rms_norm_eps"), py::arg("topk_tokens"), py::call_guard<py::gil_scoped_release>());
 
   m.def("deepseek_v4_dequantize_and_gather_k_cache", &deepseek_v4_dequantize_and_gather_k_cache,
         "DeepSeek V4 CPU prefill bf16 paged K-cache gather baseline. CPU "

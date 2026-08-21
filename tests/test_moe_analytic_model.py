@@ -1012,11 +1012,88 @@ def test_planner_and_runtime_accept_analytic_model_without_profile_shapes() -> N
     result = planner.plan(experts)
     runtime = PlannedMoE(model, num_cores=6)
     spec = runtime.plan_spec_for(experts)
+    cached = runtime.plan_spec_for(experts)
 
     assert (3, 3) in planner.shapes
     assert sum(result["shape"]) == 6
     assert spec["plan_version"] == 2
     assert spec["bridge"]["num_threads"] == 6
+    assert cached["bridge"] == spec["bridge"]
+    assert runtime.last["cache_hit"] is True
+
+
+def test_analytic_full_searches_all_shapes_with_a_quick_baseline() -> None:
+    calibration = _calibration(
+        cores=6,
+        supported_widths=(1, 2, 3, 6),
+        dram_saturated_rate=40e9,
+    )
+    model = _model(calibration)
+    experts = [(expert, routes) for expert, routes in enumerate((48, 24, 12, 6))]
+    planner = IntervalPlanner(model, num_cores=6, native_cold_planner=False)
+
+    quick = planner.plan_quick(experts)
+    full = planner.plan(experts, dynamic_tail_pool=False)
+
+    assert full["planner_backend"] == "python_analytic_full"
+    assert full["strict_candidates"] == len(planner.shapes) + 1
+    assert full["dynamic_candidates"] == 0
+    assert len(full["ranking"]) == len(planner.shapes) + 1
+    assert any(len(set(candidate["shape"])) > 1 for candidate in full["ranking"])
+    quick_ranking = [candidate for candidate in full["ranking"] if candidate["shape"] == quick["shape"]]
+    assert quick_ranking
+    rounded_quick_ns = min(candidate["makespan_ms"] * 1e6 for candidate in quick_ranking)
+    assert full["makespan_ns"] <= rounded_quick_ns + 500.0
+
+    explicit = IntervalPlanner(
+        model,
+        num_cores=6,
+        shapes=((6,), (3, 3)),
+        native_cold_planner=False,
+    ).plan(experts, dynamic_tail_pool=False)
+
+    assert explicit["planner_backend"] == "python"
+    assert explicit["strict_candidates"] == 2
+
+
+def test_analytic_full_optimizes_expected_makespan_not_working_set() -> None:
+    fastest = {
+        "makespan_ns": 80.0,
+        "pessimistic_ns": 100.0,
+        "active_working_set_bytes": 2,
+        "resource_groups": 2,
+        "shape": (2, 2),
+    }
+    smaller_working_set = {
+        "makespan_ns": 81.0,
+        "pessimistic_ns": 90.0,
+        "active_working_set_bytes": 1,
+        "resource_groups": 1,
+        "shape": (4,),
+    }
+
+    assert IntervalPlanner._select_analytic_full([smaller_working_set, fastest]) is fastest
+
+
+def test_analytic_uncertainty_is_systematic_across_waves() -> None:
+    calibration = _calibration(
+        cores=4,
+        supported_widths=(1, 2, 4),
+        dram_saturated_rate=40e9,
+    )
+    model = _model(calibration)
+    planner = IntervalPlanner(model, num_cores=4, native_cold_planner=False)
+    experts = [(expert, 12) for expert in range(16)]
+    makespan = 1_000.0
+
+    uncertainty = planner._uncertainty(
+        experts,
+        (1, 1, 1, 1),
+        makespan,
+        use_full_workload_anchor=False,
+    )
+
+    assert uncertainty == pytest.approx(makespan * model.relative_error)
 
 
 def test_holdout_validator_reports_absolute_error_and_shape_regret() -> None:

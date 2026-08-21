@@ -3071,3 +3071,82 @@ std::tuple<at::Tensor, at::Tensor> deepseek_v4_post_gemm_parallel_stage_prepacke
                                PrintPostGemmProfile(*profile_ptr, ::fused_cpp::profile::elapsed_ms(total_start)));
   return std::make_tuple(q, topk_indices_buffer);
 }
+
+at::Tensor deepseek_v4_post_gemm_dense_projected(at::Tensor main_q_linear, at::Tensor kv, at::Tensor positions,
+                                                 at::Tensor main_cos_sin_cache, at::Tensor swa_kv_cache,
+                                                 at::Tensor swa_slot_mapping, int64_t main_head_dim, double q_eps) {
+  CheckCpuTensor(main_q_linear, "main_q_linear");
+  CheckDim(main_q_linear, "main_q_linear", 2);
+  TORCH_CHECK(main_q_linear.scalar_type() == at::kBFloat16, "main_q_linear must be torch.bfloat16");
+  TORCH_CHECK(main_head_dim > 0 && main_q_linear.size(1) % main_head_dim == 0,
+              "main_q_linear width must be divisible by main_head_dim");
+  at::Tensor q = main_q_linear.reshape({main_q_linear.size(0), main_q_linear.size(1) / main_head_dim, main_head_dim});
+  RunMainQAndSwaPostprocess(q, kv, positions, main_cos_sin_cache, swa_kv_cache, swa_slot_mapping, q_eps, nullptr);
+  return q;
+}
+
+at::Tensor deepseek_v4_post_gemm_c128a_projected(
+    at::Tensor main_q_linear, at::Tensor kv, at::Tensor kv_score, at::Tensor positions, at::Tensor main_cos_sin_cache,
+    at::Tensor swa_kv_cache, at::Tensor swa_slot_mapping, at::Tensor mla_ape, at::Tensor mla_state_cache,
+    at::Tensor mla_state_slot_mapping, at::Tensor mla_token_to_req_indices, at::Tensor mla_block_table,
+    at::Tensor mla_kv_cache, at::Tensor mla_kv_slot_mapping, at::Tensor mla_norm_weight, int64_t main_head_dim,
+    double q_eps, int64_t mla_compress_ratio, double mla_rms_norm_eps) {
+  at::Tensor q = deepseek_v4_post_gemm_dense_projected(main_q_linear, kv, positions, main_cos_sin_cache, swa_kv_cache,
+                                                       swa_slot_mapping, main_head_dim, q_eps);
+  RunCompressor(kv_score, positions, mla_ape, mla_state_cache, mla_state_slot_mapping, mla_token_to_req_indices,
+                mla_block_table, mla_kv_cache, mla_kv_slot_mapping, mla_norm_weight, main_cos_sin_cache,
+                mla_compress_ratio, mla_rms_norm_eps, nullptr, nullptr);
+  return q;
+}
+
+std::tuple<at::Tensor, at::Tensor> deepseek_v4_post_gemm_parallel_stage_projected(
+    at::Tensor main_q_linear, at::Tensor indexer_q_linear, at::Tensor kv, at::Tensor kv_score,
+    at::Tensor indexer_kv_score, at::Tensor indexer_weights, at::Tensor positions, at::Tensor main_cos_sin_cache,
+    at::Tensor indexer_cos_sin_cache, at::Tensor swa_kv_cache, at::Tensor swa_slot_mapping, at::Tensor mla_ape,
+    at::Tensor mla_state_cache, at::Tensor mla_state_slot_mapping, at::Tensor mla_token_to_req_indices,
+    at::Tensor mla_block_table, at::Tensor mla_kv_cache, at::Tensor mla_kv_slot_mapping, at::Tensor mla_norm_weight,
+    at::Tensor indexer_ape, at::Tensor indexer_state_cache, at::Tensor indexer_state_slot_mapping,
+    at::Tensor indexer_token_to_req_indices, at::Tensor indexer_block_table, at::Tensor indexer_kv_cache,
+    at::Tensor indexer_kv_slot_mapping, at::Tensor indexer_norm_weight, at::Tensor topk_indices_buffer,
+    at::Tensor prefill_cu_seq_lens, at::Tensor prefill_cu_seqlen_ks, at::Tensor prefill_cu_seqlen_ke,
+    at::Tensor prefill_block_table, int64_t main_head_dim, double q_eps, int64_t mla_compress_ratio,
+    double mla_rms_norm_eps, int64_t indexer_compress_ratio, double indexer_rms_norm_eps, int64_t topk_tokens) {
+  const int64_t num_tokens = main_q_linear.size(0);
+  const SparseIndexerPrefillPlan prefill_plan = PrepareSparseIndexerPrefillPlan(
+      num_tokens, topk_tokens, prefill_cu_seqlen_ks, prefill_cu_seqlen_ke, prefill_block_table);
+  at::Tensor q = deepseek_v4_post_gemm_dense_projected(main_q_linear, kv, positions, main_cos_sin_cache, swa_kv_cache,
+                                                       swa_slot_mapping, main_head_dim, q_eps);
+
+  at::Tensor q_quant;
+  at::Tensor scaled_weights;
+  if (!prefill_plan.select_all) {
+    CheckCpuTensor(indexer_q_linear, "indexer_q_linear");
+    CheckDim(indexer_q_linear, "indexer_q_linear", 2);
+    TORCH_CHECK(indexer_q_linear.scalar_type() == at::kBFloat16, "indexer_q_linear must be torch.bfloat16");
+    const int64_t indexer_head_dim = indexer_norm_weight.size(0);
+    TORCH_CHECK(indexer_head_dim > 0 && indexer_q_linear.size(0) == num_tokens &&
+                    indexer_q_linear.size(1) % indexer_head_dim == 0,
+                "indexer_q_linear shape is incompatible with indexer_norm_weight");
+    at::Tensor indexer_q =
+        indexer_q_linear.reshape({num_tokens, indexer_q_linear.size(1) / indexer_head_dim, indexer_head_dim});
+    auto indexer_q_and_weights = IndexerQRopeQuant(positions, indexer_q, indexer_cos_sin_cache, indexer_weights);
+    q_quant = std::get<0>(indexer_q_and_weights);
+    scaled_weights = std::get<1>(indexer_q_and_weights);
+  }
+
+  RunCompressor(kv_score, positions, mla_ape, mla_state_cache, mla_state_slot_mapping, mla_token_to_req_indices,
+                mla_block_table, mla_kv_cache, mla_kv_slot_mapping, mla_norm_weight, main_cos_sin_cache,
+                mla_compress_ratio, mla_rms_norm_eps, nullptr, nullptr);
+  RunCompressor(indexer_kv_score, positions, indexer_ape, indexer_state_cache, indexer_state_slot_mapping,
+                indexer_token_to_req_indices, indexer_block_table, indexer_kv_cache, indexer_kv_slot_mapping,
+                indexer_norm_weight, indexer_cos_sin_cache, indexer_compress_ratio, indexer_rms_norm_eps, nullptr,
+                nullptr);
+
+  if (prefill_plan.select_all) {
+    WriteSparseIndexerShortPath(prefill_plan, topk_indices_buffer, num_tokens, topk_tokens, nullptr);
+  } else {
+    SparseAttnIndexerPrefillLong(q_quant, scaled_weights, indexer_kv_cache, topk_indices_buffer, topk_tokens,
+                                 prefill_cu_seq_lens, prefill_plan, prefill_block_table, nullptr);
+  }
+  return std::make_tuple(q, topk_indices_buffer);
+}
