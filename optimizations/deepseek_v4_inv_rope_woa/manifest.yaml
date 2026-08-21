@@ -38,9 +38,82 @@ features:
     result: >-
       optimizations/deepseek_v4_inv_rope_woa/results/amazon_8c_sve_fused_20260818.md
 
+  - id: schedule.n_first_1mib_windows
+    part: schedule
+    status: enabled
+    implementation:
+      - csrc/moe/arm/common/deepseek_v4_inv_rope_woa.cpp
+      - csrc/moe/arm/common/nm_window_schedule.h
+    hypothesis: >-
+      Giving each (group, N-window) owner at most 1 MiB of packed weight before
+      splitting M bounds the active B stripe. Four equal M tasks per worker
+      absorb M12-panel remainders without shrinking N windows merely to make
+      the owner count divide the thread count.
+    depends_on:
+      - compute.sve_fused_pack_rope_grouped_gemm
+    conflicts_with: []
+    selection: >-
+      Enabled in the SVE native path. N ownership is chosen first from packed-B
+      bytes, then M panels are overdecomposed to approximately four tasks per
+      requested worker. No public API or packed-weight format changes.
+    correctness: >-
+      PYTHONPATH=src:. OMP_NUM_THREADS=80 taskset -c 0-79
+      .venv/bin/python -m pytest -q
+      tests/test_deepseek_v4_inv_rope_woa.py
+    benchmark: >-
+      PYTHONPATH=src:. OMP_NUM_THREADS=<T> taskset -c 0-<T-1>
+      .venv/bin/python tests/bench_deepseek_v4_inv_rope_woa.py
+      --tokens 2048 --threads <T> --warmup 3 --runs 15
+      --output-rank 1024 --native-only
+    result: >-
+      optimizations/deepseek_v4_inv_rope_woa/results/arm_codex_internal_n_first_windows_20260820.md
+
+  - id: diagnostic.prepacked_gemm_decomposition
+    part: diagnostic
+    status: experimental
+    owner: zhangxu
+    opened: 2026-08-20
+    decision_by: 2026-09-19
+    implementation:
+      - optimizations/deepseek_v4_inv_rope_woa/benchmarks/bench_prepacked_gemm.cpp
+      - optimizations/deepseek_v4_inv_rope_woa/benchmarks/run_prepacked_gemm.sh
+    hypothesis: >-
+      Replaying the production group/N-window/M-split geometry with prepacked A
+      isolates the GEMM body. Comparing it with an output-rank sweep of the
+      complete operator identifies whether the gap from the 80-core BFMMLA
+      reference is GEMM efficiency or pack/inverse-RoPE fixed work.
+    depends_on:
+      - schedule.n_first_1mib_windows
+    conflicts_with: []
+    selection: Lab-only standalone executable; never included in extension builds.
+    correctness: >-
+      Production numerical coverage remains tests/test_deepseek_v4_inv_rope_woa.py;
+      the diagnostic prints a deterministic output checksum on every run.
+    benchmark: >-
+      FUSED_CPP_MOE_SVE_VECTOR_BITS=256 OMP_DYNAMIC=FALSE OMP_PROC_BIND=close
+      OMP_PLACES=cores taskset -c 0-79
+      optimizations/deepseek_v4_inv_rope_woa/benchmarks/run_prepacked_gemm.sh
+      --tokens 2048 --groups 4 --k 4096 --n 1024 --threads 80
+      --warmup 5 --runs 31 --peak-tflops 7.418
+    result: >-
+      optimizations/deepseek_v4_inv_rope_woa/results/arm_codex_internal_stage_decomposition_20260820.md
+    next_decision: >-
+      The WOA decomposition is closed and a clean same-build 4-GEMM reference
+      is established at 89.1% peak efficiency. Decide whether the remaining
+      2.2% pure-GEMM gap warrants a standalone mixed-width comparator.
+    adoption_gate: >-
+      Diagnostic only; record the decomposition and retire the standalone
+      source after the conclusion is reproducible.
+
 variants:
   - id: torch_reference
     features: []
   - id: sve_fused
     features:
       - compute.sve_fused_pack_rope_grouped_gemm
+      - schedule.n_first_1mib_windows
+  - id: woa_prepacked_gemm_diagnostic
+    entrypoint: optimizations/deepseek_v4_inv_rope_woa/benchmarks/run_prepacked_gemm.sh
+    status: experimental
+    features:
+      - diagnostic.prepacked_gemm_decomposition

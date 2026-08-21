@@ -24,6 +24,7 @@
 
 #include "../sve_bf16/jit_kernels.h"
 #include "../sve_bf16/packing.h"
+#include "nm_window_schedule.h"
 
 #if defined(FUSED_CPP_MOE_HAS_ARM_SVE)
 namespace {
@@ -238,12 +239,10 @@ void run_grouped_gemm(const BFloat16* input, const int64_t* positions, const flo
 #else
   requested_threads = 1;
 #endif
-  // M panels and groups already provide ample parallelism for long sequences.
-  // Split N only when those tasks cannot occupy the requested worker set; each
-  // task keeps a contiguous multi-tile range so the JIT kernel amortizes its
-  // prologue while traversing N internally.
-  const int64_t n_splits = std::min(n_tiles, std::max<int64_t>(1, (requested_threads + pack_tasks - 1) / pack_tasks));
-  const int64_t gemm_tasks = pack_tasks * n_splits;
+  const fused_cpp::nm_window::Geometry geometry = fused_cpp::nm_window::Choose(
+      n_tiles, packed_k * n_tile * static_cast<int64_t>(sizeof(BFloat16)), static_cast<int64_t>(panels.size()),
+      requested_threads, groups, fused_cpp::nm_window::kDefaultTargetBytes, 4);
+  const int64_t gemm_tasks = geometry.task_count(groups);
   const int thread_count = static_cast<int>(std::max<int64_t>(1, std::min(requested_threads, gemm_tasks)));
 
 #if defined(FUSED_CPP_HAS_OMP)
@@ -272,35 +271,39 @@ void run_grouped_gemm(const BFloat16* input, const int64_t* positions, const flo
     }
 
 #if defined(FUSED_CPP_HAS_OMP)
-#pragma omp for schedule(dynamic, 1)
+#pragma omp for schedule(static, 1)
 #endif
     for (int64_t task = 0; task < gemm_tasks; ++task) {
-      const int64_t split = task % n_splits;
-      const int64_t panel_group = task / n_splits;
-      const int64_t panel_index = panel_group % static_cast<int64_t>(panels.size());
-      const int64_t group = panel_group / static_cast<int64_t>(panels.size());
-      const Panel& panel = panels[panel_index];
-      const int64_t split_tiles = n_tiles / n_splits;
-      const int64_t extra_tiles = n_tiles % n_splits;
-      const int64_t tile_count = split_tiles + (split < extra_tiles ? 1 : 0);
-      const int64_t tile_begin = split * split_tiles + std::min(split, extra_tiles);
+      const int64_t m_split = task % geometry.m_splits;
+      const int64_t owner = task / geometry.m_splits;
+      const int64_t window = owner % geometry.n_windows;
+      const int64_t group = owner / geometry.n_windows;
+      const int64_t tile_begin = window * n_tiles / geometry.n_windows;
+      const int64_t tile_end = (window + 1) * n_tiles / geometry.n_windows;
+      const int64_t tile_count = tile_end - tile_begin;
       const int64_t n_begin = tile_begin * n_tile;
       const int64_t n_columns = tile_count * n_tile;
-      const BFloat16* packed_a_panel = packed_a + group * physical_rows * packed_k + panel.packed_row_begin * packed_k;
       const BFloat16* packed_b_group = packed_weight + group * packed_k * packed_n;
-      BFloat16* output_tile = output + panel.row_begin * groups * packed_n + group * packed_n + n_begin;
-      SveParams params;
-      params.gemm.m = panel.rows;
-      params.gemm.k = static_cast<int>(packed_k);
-      params.gemm.n = static_cast<int>(n_columns);
-      params.gemm.lda = static_cast<int>(packed_k);
-      params.gemm.ldb = static_cast<int>(packed_k);
-      params.gemm.ldc = static_cast<int>(groups * packed_n);
-      params.kc = static_cast<int32_t>(packed_k);
-      params.packed_n = static_cast<int32_t>(packed_n);
-      params.n_begin = static_cast<int32_t>(n_begin);
-      panel.kernel(reinterpret_cast<const uint16_t*>(packed_a_panel), reinterpret_cast<const uint16_t*>(packed_b_group),
-                   output_tile, nullptr, &params.gemm);
+      const int64_t panel_begin = m_split * static_cast<int64_t>(panels.size()) / geometry.m_splits;
+      const int64_t panel_end = (m_split + 1) * static_cast<int64_t>(panels.size()) / geometry.m_splits;
+      for (int64_t panel_index = panel_begin; panel_index < panel_end; ++panel_index) {
+        const Panel& panel = panels[panel_index];
+        const BFloat16* packed_a_panel =
+            packed_a + group * physical_rows * packed_k + panel.packed_row_begin * packed_k;
+        BFloat16* output_tile = output + panel.row_begin * groups * packed_n + group * packed_n + n_begin;
+        SveParams params;
+        params.gemm.m = panel.rows;
+        params.gemm.k = static_cast<int>(packed_k);
+        params.gemm.n = static_cast<int>(n_columns);
+        params.gemm.lda = static_cast<int>(packed_k);
+        params.gemm.ldb = static_cast<int>(packed_k);
+        params.gemm.ldc = static_cast<int>(groups * packed_n);
+        params.kc = static_cast<int32_t>(packed_k);
+        params.packed_n = static_cast<int32_t>(packed_n);
+        params.n_begin = static_cast<int32_t>(n_begin);
+        panel.kernel(reinterpret_cast<const uint16_t*>(packed_a_panel),
+                     reinterpret_cast<const uint16_t*>(packed_b_group), output_tile, nullptr, &params.gemm);
+      }
     }
   }
 }
