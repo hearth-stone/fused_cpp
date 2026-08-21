@@ -8,6 +8,56 @@ baseline:
   selection: FUSED_CPP_POST_GEMM_M8_ALIGNED=0
 
 features:
+  - id: compute.sve_fcmla_rope
+    part: compute
+    status: experimental
+    owner: zhangxu
+    opened: 2026-08-20
+    decision_by: 2026-09-19
+    implementation:
+      - optimizations/deepseek_v4_post_gemm/benchmarks/bench_sve_fcmla_rope.cpp
+      - optimizations/deepseek_v4_post_gemm/benchmarks/run_sve_fcmla_rope.sh
+    hypothesis: >-
+      Storing each rotary-cache row as interleaved complex [cos,sin] values
+      lets SVE FCMLA consume contiguous FP32/BF16 complex vectors and removes
+      the production split-even/odd load and BF16 scatter-store structure.
+      Unrolling the one-vector FCMLA loop by 2, 4, or 8 should determine
+      whether its doubled loop count is a material front-end bottleneck. This
+      should reduce pure-RoPE latency despite processing half as many complex
+      pairs per Z register.
+    depends_on: []
+    conflicts_with: []
+    correctness: >-
+      FUSED_CPP_MOE_SVE_VECTOR_BITS=256
+      optimizations/deepseek_v4_post_gemm/benchmarks/run_sve_fcmla_rope.sh
+      --rows 2048 --head-dim 192 --rope-dim 64 --threads 1
+      --warmup 1 --runs 1 --inner 1 --unroll <1|2|4|8>
+    benchmark: >-
+      OMP_NUM_THREADS=<T> OMP_DYNAMIC=FALSE OMP_PROC_BIND=close
+      OMP_PLACES=cores taskset -c 0-<T-1>
+      optimizations/deepseek_v4_post_gemm/benchmarks/run_sve_fcmla_rope.sh
+      --rows <M*heads> --heads <heads> --rope-dim 64 --threads <T>
+      --warmup 20 --runs 51 --inner 20 --unroll <1|2|4|8>
+    next_decision: >-
+      Prototype only the BF16 Main-Q four-row production QNorm+RoPE kernel with
+      an explicitly prepared interleaved cache. Do not migrate KV, FP32,
+      inverse-RoPE, or global cache consumers from this result.
+    adoption_gate: >-
+      Bit-exact BF16 and max-absolute FP32 error no greater than 1e-5, with at
+      least 3 percent median pure-RoPE improvement at representative 1T and
+      full-NUMA thread counts and no tested-shape regression above 1 percent.
+    result: >-
+      Production adoption remains pending on Arm-codex-internal SVE256. The
+      initial one-vector prototype improved complete 80T BF16 QNorm+RoPE by
+      only 0.7-4.2 percent. Restructuring complete blocks around PTRUE reduced
+      the candidate from about 345 to 274 us, but FCMLA unroll 2/4/8 did not
+      improve that stronger Main-Q baseline. Unroll 8 reduced 2048-row 1T pure
+      BF16 candidate latency by 19.2 percent over unroll 1. Keep only the
+      narrow BF16 Main-Q follow-up because production integration, E2E impact,
+      and its non-bit-exact BF16 contract still require a separate decision.
+      See
+      results/arm_codex_internal_sve_fcmla_rope_20260820.md.
+
   - id: dispatch.indexer_select_all_early_exit
     part: dispatch
     status: enabled
@@ -351,6 +401,12 @@ features:
       optimizations/deepseek_v4_post_gemm/results/amazon_8c_indexer_native_batch_topk_20260813.md
 
 variants:
+  - id: post_gemm_sve_fcmla_rope_lab
+    entrypoint: optimizations/deepseek_v4_post_gemm/benchmarks/run_sve_fcmla_rope.sh
+    status: experimental
+    features:
+      - compute.sve_fcmla_rope
+
   - id: post_gemm_indexer_select_all_early_exit
     entrypoint: deepseek_v4_post_gemm_parallel_stage_prepacked
     status: enabled
