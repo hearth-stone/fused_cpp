@@ -193,15 +193,17 @@ sparse short-path 提前消除项。
 
 | 优先级 | Feature | TODO | 机制与验收重点 |
 |---|---|---|---|
-| P0 | `benchmark.post_gemm_stage` | 已增加 C4A 基准；继续覆盖 dense/C128A、M、prefix 长度和 backend | `tests/bench_deepseek_v4_post_gemm_stage.py` 已支持线程数、legacy/M8、shared/legacy/auto Q pool 和阶段 profile；后续继续扩展形状 |
+| 完成 | `benchmark.long_context_dual_q` | 补测 `M=2048, context_start=2048` 的真实双Q长路径 | Arm-codex-internal 0-79核：SVE双Q GEMM 80T为 `10.045 ms / 6.841 TFLOP/s`，相对1T线性效率98.9%；完整结果见 `optimizations/deepseek_v4_post_gemm/results/arm_codex_internal_dual_q_long_context_20260820.md` |
 | 完成 | `schedule.m8_aligned` | 按完整 M8 panel 静态分配，保留 legacy row-split 开关 | 192 核 NUMA0 NEON 96T：`13.942 -> 10.187 ms`；SVE：`11.082 -> 10.318 ms`；`FUSED_CPP_POST_GEMM_M8_ALIGNED=0` 回退 |
 | 完成 | `runtime.shared_q_gemm_pool` | 两次 Q GEMM 共用一个 OpenMP region 和动态 M8-panel worker pool | NEON 96T、M=2048：`10.309 -> 9.415 ms`；默认仅在 `T>=32 && ceil(M/8)>=T` 时启用，避免 M=192 强制共享时的 14.9% 退化 |
-| 候选 | `schedule.q_gemm_mn_groups` | 已复用 owner-first MN task groups，将每份 16 MiB packed-B 拆成 N stripe；当前保持显式选择 | NEON 96T、M=2048：2 groups `9.840 ms`，32 groups `3.861 ms`；SVE：2 groups `10.044 ms`，24 groups `4.609 ms`；有效 B window 约 1.0-1.33 MiB，默认尚未切换 |
-| P0 | `compute.shared_prepacked_qr` | `qr` 只 pack 一次，由 Main Q 和 Indexer Q 的全部 N groups 共享 | 依赖 MN pool；必须避免按 N group 重复 pack A，并保持现有 bf16 输出布局 |
+| 完成 | `schedule.q_gemm_mn_groups` | owner-first MN task groups按后端和线程数生成N窗口 | SVE现为默认后端；单Q使用约1 MiB L2 window，双Q使用shared pool和线程相关N groups |
+| 完成 | `compute.shared_prepacked_qr` | `qr` 只pack一次，由Main Q和Indexer Q的全部N groups共享 | SVE默认路径已启用；NEON保留显式fallback |
 | P1 | `runtime.post_stage_dag` | 将 Main Q、MLA compressor、Indexer compressor、KV cache insert 和 sparse indexer 表达为依赖任务，完成 GEMM 的线程继续领取 ready task | 先复用同一 worker region，避免用嵌套 OpenMP sections；目标是隐藏当前约 `0.5-0.9 ms` 的独立后处理 |
-| P1 | `backend.sve_mn_parity` | SVE N-range 已接入同一 MN pool；继续补 packed-A dispatch | 当前 SVE 每个 N group 仍在调用内重复 pack A；与 `compute.shared_prepacked_qr` 一起关闭该差距 |
+| 完成 | `backend.sve_mn_parity` | SVE exact-M/M12、共享packed-A和MN pool已接入默认路径 | 80T双Q GEMM比NEON快20.3%，并保持98.9%的相对1T线性效率 |
 | P1 | `compute.indexer_coff1_contiguous` | 为连续 prefill 的 coff=1 indexer compressor 增加当前 chunk 快路径，合并 save/compress 并减少 state-cache 回读 | 保留跨 chunk、负 position 和非连续 slot fallback；重点优化当前 `0.53-0.64 ms` 阶段 |
-| P1 | `sparse.long_path_blocked_topk` | Long path 使用分块 KV gather/matmul 和在线 Top-K，避免完整 `k_gathered`/logits 临时量 | 覆盖 prefix 后有效 KV 超过 Top-K 的情况；短路径结果必须保持不变 |
+| P1 | `sparse.long_path_blocked_topk` | 在已启用的SVE `8x2VL` score kernel上增加分块score和在线Top-K，避免完整logits临时量 | 专用kernel已将80T score从 `17.235` 降至 `5.471 ms`；后续重点是超长上下文临时内存和固定块任务化，而不是重新实现QK dot |
+| P1 | `sdpa.main_qk_pv` | 重新评估主Attention的`QK^T`和`P*V` microkernel、tile及多线程调度 | 作为SDPA专题执行并同步 `csrc/SDPA_TODO.md`/`csrc/SDPA_VERSIONS.md`；不得当作普通fixed-weight GEMM处理 |
+| P2 | `linear.attention_output_projection` | 定位并基准Attention输出投影`O*W_o`，再决定是否复用SVE M12/L2-window GEMM | 当前不在post-GEMM融合算子内；先确认生产调用点、TP形状、输出dtype和现有backend，再建立baseline |
 | P2 | `pipeline.qr_panel_handoff` | 第一段 parallel 产出 QR M8 panel 后，直接发布给第二段 Q GEMM，而不是等待第一段全部完成 | 高复杂度跨算子流水线；评估 QR panel 的 cache 复用和额外同步是否净收益 |
 | P2 | `fusion.compressor_state_store` | 第一段 kv-score GEMM epilogue 直接写 compressor state layout 并加 APE | 消除 kv-score 中间张量往返；需要保持 state cache 的持久化语义和边界窗口 |
 | P2 | `epilogue.indexer_rope` | 在 Indexer Q GEMM store 中融合 head-aligned RoPE | 当前独立阶段仅约 `0.14 ms`，必须在 MN pool 落地后重新测量才决定是否实现 |

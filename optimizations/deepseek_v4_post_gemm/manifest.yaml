@@ -44,14 +44,14 @@ features:
     status: enabled
     implementation: csrc/deepseek_v4_post_gemm_stage.cpp
     hypothesis: >-
-      Partitioning M as complete M8 panels removes the M4/M2 per-thread tails
-      produced by ceil(M / threads) while retaining the existing packed
-      weights, GEMM kernels, output layouts, and one OpenMP region per GEMM.
+      Partitioning M as complete backend-native panels (M8 NEON or M12 SVE)
+      removes per-thread tails produced by ceil(M / threads) while retaining
+      packed weights, output layouts, and one OpenMP region per GEMM.
     depends_on: []
     conflicts_with: []
     selection: >-
-      Enabled by default on AArch64. FUSED_CPP_POST_GEMM_M8_ALIGNED=0 restores
-      the legacy row split for correctness and performance comparisons.
+      Enabled by default on AArch64. FUSED_CPP_POST_GEMM_M8_ALIGNED=0 retains
+      its historical name and restores the legacy row split for comparisons.
     correctness: >-
       PYTHONPATH=src .venv/bin/python -m pytest -q
       tests/test_deepseek_v4_post_gemm_stage.py
@@ -65,12 +65,45 @@ features:
     result: >-
       optimizations/deepseek_v4_post_gemm/results/amazon_192c_m8_aligned_20260729.md
 
+  - id: schedule.single_q_l2_windows
+    part: schedule
+    status: enabled
+    implementation: csrc/deepseek_v4_post_gemm_stage.cpp
+    hypothesis: >-
+      Packing A once, partitioning a single Q GEMM into approximately 1 MiB
+      packed-B N windows, and subdividing M inside each window keeps the active
+      B stripe near private-L2 capacity. This replaces repeated full-weight
+      LLC-to-L2 scans with bounded B windows while retaining enough M tasks to
+      occupy the complete team.
+    depends_on:
+      - schedule.m8_aligned
+    conflicts_with: []
+    selection: >-
+      Enabled by the default aligned path for both NEON M8 and SVE exact-M/M12.
+      The number of N groups is chosen from packed-B bytes, backend N tile, and
+      thread count; FUSED_CPP_POST_GEMM_M8_ALIGNED=0 restores the historical
+      pure M split. NEON pads only its final M8 panel and crops the output; SVE
+      retains exact-M tails.
+    correctness: >-
+      PYTHONPATH=src:. OMP_NUM_THREADS=8 OMP_DYNAMIC=FALSE OMP_PROC_BIND=close
+      OMP_PLACES=cores taskset -c 0-7 .venv/bin/python -m pytest -q
+      tests/test_deepseek_v4_post_gemm_stage.py
+    benchmark: >-
+      PYTHONPATH=src:. FUSED_CPP_POST_GEMM_BACKEND=<neon|sve>
+      OMP_NUM_THREADS=<1..80> OMP_DYNAMIC=FALSE OMP_PROC_BIND=close
+      OMP_PLACES=cores taskset -c 0-<T-1> .venv/bin/python
+      tests/bench_deepseek_v4_post_gemm_stage.py --m 2048
+      --context-start 0 --threads <T> --warmup 3 --runs 9
+      --schedule <legacy|m8> --q-pool auto
+    result: >-
+      optimizations/deepseek_v4_post_gemm/results/arm_codex_internal_single_q_l2_windows_20260820.md
+
   - id: runtime.shared_q_gemm_pool
     part: runtime
     status: enabled
     implementation: csrc/deepseek_v4_post_gemm_stage.cpp
     hypothesis: >-
-      Running Main Q and Indexer Q in one OpenMP region lets M8-panel workers
+      Running Main Q and Indexer Q in one OpenMP region lets M8/M12-panel workers
       balance across both GEMMs and removes one region transition without
       changing packed weights, kernels, output layouts, or postprocessing.
     depends_on:
@@ -78,8 +111,9 @@ features:
     conflicts_with: []
     selection: >-
       Auto-enabled on AArch64 with OpenMP when threads >= 32 and each GEMM has
-      at least one M8 panel per thread. FUSED_CPP_POST_GEMM_SHARED_Q_POOL=0
-      disables it; any non-false value forces it for experiments.
+      at least one backend-native M panel per thread. The default SVE backend
+      always enables the pool so its M12/N-window task graph is complete.
+      FUSED_CPP_POST_GEMM_SHARED_Q_POOL=0 restores sequential GEMMs.
     correctness: >-
       PYTHONPATH=src .venv/bin/python -m pytest -q
       tests/test_deepseek_v4_post_gemm_stage.py
@@ -94,9 +128,41 @@ features:
     result: >-
       optimizations/deepseek_v4_post_gemm/results/amazon_192c_shared_q_pool_20260729.md
 
+  - id: schedule.indexer_score_n_first_windows
+    part: schedule
+    status: enabled
+    implementation:
+      - csrc/deepseek_v4_indexer_sve.cpp
+      - csrc/moe/arm/common/nm_window_schedule.h
+    hypothesis: >-
+      Partitioning packed indexer K into at-most-1-MiB N windows before
+      splitting score rows keeps each worker's streamed K stripe bounded while
+      retaining enough M work to occupy the requested team. Small packed-K
+      matrices naturally retain one N window and therefore the historical M
+      split.
+    depends_on:
+      - compute.sve_jit_m12_windows
+    conflicts_with: []
+    selection: >-
+      Enabled in the SVE 8x2VL score backend. The number of N windows is
+      derived from packed-K bytes and the 1 MiB target; M is divided only after
+      N ownership is established. No public API or environment control is
+      added.
+    correctness: >-
+      PYTHONPATH=src:. OMP_NUM_THREADS=80 taskset -c 0-79
+      .venv/bin/python -m pytest -q
+      tests/test_deepseek_v4_post_gemm_stage.py
+    benchmark: >-
+      PYTHONPATH=src:. OMP_NUM_THREADS=<T> taskset -c 0-<T-1>
+      .venv/bin/python tests/bench_deepseek_v4_post_gemm_stage.py
+      --m 2048 --context-start 32768 --threads <T> --warmup 5
+      --runs 15 --profile
+    result: >-
+      optimizations/deepseek_v4_post_gemm/results/arm_codex_internal_indexer_score_n_first_windows_20260820.md
+
   - id: schedule.q_gemm_mn_groups
     part: schedule
-    status: candidate
+    status: enabled
     implementation: csrc/deepseek_v4_post_gemm_stage.cpp
     hypothesis: >-
       Splitting each Q GEMM packed-B matrix into owner-first N stripes keeps a
@@ -108,8 +174,10 @@ features:
       - runtime.shared_q_gemm_pool
     conflicts_with: []
     selection: >-
-      Experimental opt-in through FUSED_CPP_POST_GEMM_N_GROUPS=<total groups>,
-      where the value must be at least two. The default remains two groups.
+      The default SVE backend uses max(2,T) groups through 48 threads and
+      max(2,T/2) above 48 in the shared two-Q path. Explicit NEON defaults to
+      two groups. FUSED_CPP_POST_GEMM_N_GROUPS=<total groups> overrides either
+      policy with a value of at least two, and
       FUSED_CPP_POST_GEMM_SHARED_Q_POOL=1 forces the required shared pool.
     correctness: >-
       PYTHONPATH=src .venv/bin/python -m pytest -q
@@ -125,10 +193,97 @@ features:
     result: >-
       optimizations/deepseek_v4_post_gemm/results/amazon_192c_q_gemm_mn_groups_20260729.md
 
+  - id: compute.sve_jit_m12_windows
+    part: compute
+    status: enabled
+    owner: zhangxu
+    opened: 2026-08-20
+    decision_by: 2026-09-19
+    implementation:
+      - csrc/deepseek_v4_post_gemm_stage.cpp
+      - csrc/deepseek_v4_attn_gemm_sve.cpp
+      - csrc/moe/arm/sve_bf16/jit_kernels.cpp
+    hypothesis: >-
+      Reusing the MoE exact-M SVE JIT changes Main/Indexer Q GEMM work from M8
+      to M12 panels while retaining the shared worker pool and contiguous
+      packed-B N windows. Exact M1-M11 tails remove padded row computation and
+      preserve the prepared-weight format.
+    depends_on:
+      - schedule.m8_aligned
+      - runtime.shared_q_gemm_pool
+      - schedule.q_gemm_mn_groups
+    conflicts_with: []
+    selection: >-
+      Selected by default when SVE BF16 JIT support is available. Explicit
+      FUSED_CPP_POST_GEMM_BACKEND=neon retains the NEON fallback, while auto,
+      default, and an unset value prefer SVE. FUSED_CPP_POST_GEMM_N_GROUPS
+      controls contiguous N windows in the shared two-Q path.
+    correctness: >-
+      PYTHONPATH=src OMP_NUM_THREADS=8 OMP_DYNAMIC=FALSE taskset -c 0-7
+      .venv/bin/python -m pytest -q
+      tests/test_deepseek_v4_post_gemm_stage.py
+      -k sve_m12_windows
+    benchmark: >-
+      PYTHONPATH=src FUSED_CPP_POST_GEMM_BACKEND=sve
+      OMP_NUM_THREADS=8 OMP_DYNAMIC=FALSE taskset -c 0-7
+      .venv/bin/python tests/bench_deepseek_v4_post_gemm_stage.py
+      --m 2048 --threads 8 --warmup 5 --runs 31 --schedule m8
+      --q-pool shared --n-groups 8 --profile
+    result: >-
+      optimizations/deepseek_v4_post_gemm/results/arm_codex_internal_sve_m12_windows_20260820.md
+    next_decision: >-
+      Retain NEON as an explicit fallback and refresh the second-machine
+      calibration before removing any backend-specific comparison controls.
+    adoption_gate: >-
+      Adopted by explicit user decision after Arm-codex-internal dense/C128A/C4A
+      correctness and the single-Q 1-80 thread comparison. NEON remains
+      available for unsupported SVE builds and machine-specific regressions.
+
+  - id: compute.sve_shared_q_prepacked_a
+    part: compute
+    status: enabled
+    owner: zhangxu
+    opened: 2026-08-20
+    decision_by: 2026-09-19
+    implementation:
+      - csrc/deepseek_v4_post_gemm_stage.cpp
+      - csrc/deepseek_v4_attn_gemm_sve.cpp
+    hypothesis: >-
+      Cooperatively packing QR once before publishing Main Q and Indexer Q
+      M12/N-window tasks removes repeated A conversion across both GEMMs and
+      all N groups. One barrier publishes the fixed-M12-stride buffer.
+    depends_on:
+      - runtime.shared_q_gemm_pool
+      - schedule.q_gemm_mn_groups
+      - compute.sve_jit_m12_windows
+    conflicts_with: []
+    selection: >-
+      Enabled whenever the default SVE shared-Q pool runs. Explicit NEON keeps
+      its per-task packing implementation in the shared two-Q path.
+    correctness: >-
+      PYTHONPATH=src OMP_NUM_THREADS=8 OMP_DYNAMIC=FALSE taskset -c 0-7
+      .venv/bin/python -m pytest -q tests/test_deepseek_v4_post_gemm_stage.py
+      -k sve_m12_windows
+    benchmark: >-
+      PYTHONPATH=src OMP_NUM_THREADS=8 OMP_DYNAMIC=FALSE taskset -c 0-7
+      .venv/bin/python tests/bench_deepseek_v4_post_gemm_stage.py
+      --m 2048 --threads 8 --warmup 5 --runs 31 --schedule m8
+      --q-pool shared --n-groups 8 --profile
+    result: >-
+      optimizations/deepseek_v4_post_gemm/results/arm_codex_internal_sve_m12_windows_20260820.md
+    next_decision: >-
+      Re-measure the true two-Q long-context path after the single-Q benchmark
+      FLOP-count correction; retain explicit NEON for machine-specific fallback.
+    adoption_gate: >-
+      Enabled by explicit user decision with SVE default dispatch. Dense/C128A/
+      C4A correctness is required; the corrected long-context performance gate
+      remains follow-up work.
+
   - id: compute.indexer_weighted_relu_sve_8x2vl
     part: compute
-    status: candidate
+    status: enabled
     implementation:
+      - setup.py
       - csrc/deepseek_v4_indexer_sve.cpp
       - csrc/deepseek_v4_post_gemm_stage.cpp
     hypothesis: >-
@@ -140,12 +295,13 @@ features:
     depends_on: []
     conflicts_with: []
     selection: >-
-      The working candidate dispatches automatically for contiguous bf16 Q/K,
+      Dispatches automatically for contiguous bf16 Q/K,
       fp32 weights, H divisible by 8, and D divisible by 4 on SVE BF16 builds.
       Other shapes and non-SVE builds use the headwise weighted-ReLU fp32
-      fallback. Amazon 8-core SVL256 correctness, generated-assembly spill
-      audit, single-/multi-request integration, and long-path performance are
-      validated; SVL128/192-core validation remains before adoption.
+      fallback. The source is compiled through the fixed-VL SVE native-source
+      path; GCC and Clang BF16 feature macros are both accepted. Amazon 8-core
+      and Arm-codex-internal 80-core SVL256 correctness and performance are
+      validated.
     correctness: >-
       PYTHONPATH=src .venv/bin/python -m pytest -q
       tests/test_sparse_attn_indexer.py
@@ -158,7 +314,7 @@ features:
       --m 2048 --context-start 4096 --threads 8 --warmup 3 --runs 15
       --profile
     result: >-
-      optimizations/deepseek_v4_post_gemm/results/amazon_8c_indexer_weighted_relu_sve_20260813.md
+      optimizations/deepseek_v4_post_gemm/results/arm_codex_internal_indexer_sve_8x2vl_20260820.md
 
   - id: compute.indexer_native_batch_topk
     part: compute
@@ -222,9 +378,19 @@ variants:
       - runtime.shared_q_gemm_pool
       - schedule.q_gemm_mn_groups
 
+  - id: post_gemm_sve_jit_m12_windows
+    entrypoint: deepseek_v4_post_gemm_parallel_stage_prepacked
+    status: enabled
+    features:
+      - schedule.m8_aligned
+      - runtime.shared_q_gemm_pool
+      - schedule.q_gemm_mn_groups
+      - compute.sve_jit_m12_windows
+      - compute.sve_shared_q_prepacked_a
+
   - id: post_gemm_indexer_weighted_relu_sve_8x2vl
     entrypoint: deepseek_v4_post_gemm_parallel_stage_prepacked
-    status: candidate
+    status: enabled
     features:
       - compute.indexer_weighted_relu_sve_8x2vl
 

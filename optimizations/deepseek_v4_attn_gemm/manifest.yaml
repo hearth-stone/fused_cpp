@@ -72,9 +72,10 @@ features:
     status: enabled
     implementation:
       - csrc/deepseek_v4_attn_gemm_fused.cpp
+      - csrc/deepseek_v4_attn_gemm_sve.cpp
       - csrc/moe/arm/neon_bf16/kernels.S
     hypothesis: >-
-      Cooperatively packing each M8 panel of A once before the MN task pool
+      Cooperatively packing each M8 or M12 panel of A once before the MN task pool
       removes repeated row-major-to-packed conversion across the four GEMMs
       and their N groups. One barrier publishes the packed buffer before the
       workers consume it.
@@ -82,9 +83,10 @@ features:
       - schedule.mn_groups
     conflicts_with: []
     selection: >-
-      Linux NEON MN execution enables shared prepack by default when the
+      Linux SVE MN execution always uses shared exact-M prepack. Linux NEON MN
+      execution enables shared prepack by default when the
       requested N-group budget is at least 24. FUSED_CPP_ATTN_GEMM_PREPACK_A
-      can force the path on or off; SVE keeps its existing per-call packing.
+      can force the NEON path on or off.
     correctness: >-
       PYTHONPATH=src FUSED_CPP_ATTN_GEMM_BACKEND=neon
       .venv/bin/python -m pytest -q
@@ -95,6 +97,52 @@ features:
       tests/bench_deepseek_v4_attn_gemm_fused.py
       --cores 0-95 --warmup 3 --runs 15 --schedule mn
       --prepack-a auto
+
+  - id: compute.sve_jit_m12_windows
+    part: compute
+    status: enabled
+    owner: zhangxu
+    opened: 2026-08-20
+    decision_by: 2026-09-19
+    implementation:
+      - csrc/deepseek_v4_attn_gemm_sve.cpp
+      - csrc/deepseek_v4_attn_gemm_fused.cpp
+      - csrc/moe/arm/sve_bf16/jit_kernels.cpp
+    hypothesis: >-
+      Reusing the MoE exact-M SVE JIT makes M12 the main attention GEMM panel,
+      removes the independent M8 intrinsic kernel, and lets the existing
+      contiguous N groups act as packed-B windows without changing the packed
+      weight format. M1-M11 JIT tails avoid padded row computation.
+    depends_on:
+      - schedule.mn_groups
+      - runtime.shared_task_pool
+    conflicts_with: []
+    selection: >-
+      Auto/default selection uses SVE when the build has SVE BF16 and
+      xbyak_aarch64, with NEON as the unsupported-machine fallback.
+      FUSED_CPP_ATTN_GEMM_BACKEND can force sve or neon and
+      FUSED_CPP_ATTN_GEMM_SVE=0 disables automatic SVE selection.
+      FUSED_CPP_ATTN_GEMM_N_GROUPS continues to control the number of contiguous
+      N windows; it is not expanded into a new search variable.
+    correctness: >-
+      PYTHONPATH=src OMP_NUM_THREADS=8 OMP_DYNAMIC=FALSE taskset -c 0-7
+      .venv/bin/python -m pytest -q
+      tests/test_deepseek_v4_attn_gemm_fused.py
+      -k sve_m12_windows
+    benchmark: >-
+      PYTHONPATH=src FUSED_CPP_ATTN_GEMM_BACKEND=sve
+      OMP_NUM_THREADS=8 OMP_DYNAMIC=FALSE taskset -c 0-7
+      .venv/bin/python tests/bench_deepseek_v4_attn_gemm_fused.py
+      --cores 0-7 --warmup 5 --runs 31 --schedule mn
+    result: >-
+      optimizations/deepseek_v4_attn_gemm/results/arm_codex_internal_sve_m12_windows_20260820.md
+    next_decision: >-
+      Compare SVE M12 JIT against the retained NEON MN path on the 8-core and
+      96-core Arm machines, including M12 boundaries and production prefill M.
+    adoption_gate: >-
+      All BF16/FP32 outputs pass exact-M and N-window correctness, no tested
+      production shape regresses by more than 2%, and geometric-mean GEMM-stage
+      latency improves by at least 3% on both Arm machines.
 
 variants:
   - id: attn_gemm_m8
@@ -110,3 +158,11 @@ variants:
       - runtime.shared_task_pool
       - schedule.mn_groups
       - compute.shared_prepacked_a
+  - id: attn_gemm_sve_jit_m12_windows
+    status: enabled
+    features:
+      - schedule.m8_aligned
+      - runtime.shared_task_pool
+      - schedule.mn_groups
+      - compute.shared_prepacked_a
+      - compute.sve_jit_m12_windows

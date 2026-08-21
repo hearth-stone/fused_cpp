@@ -178,6 +178,77 @@ def test_deepseek_v4_attn_gemm_fused_mt_matches_serial(
 
 
 @pytest.mark.skipif(not _HAS_OPENMP, reason="OpenMP is unavailable")
+@pytest.mark.parametrize("M", [1, 8, 11, 12, 13, 23, 24, 25])
+def test_deepseek_v4_attn_gemm_sve_m12_windows_match_torch(
+    M: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SVE M12 panels and exact-M tails must preserve all MN-window outputs."""
+    torch.manual_seed(20260820 + M)
+    K = 16
+    Ns = (37, 29, 41, 23)
+    hidden_states = _bf16_randn(M, K)
+    weights = tuple(_bf16_randn(K, N) for N in Ns)
+    monkeypatch.setenv("FUSED_CPP_ATTN_GEMM_BACKEND", "sve")
+    monkeypatch.setenv("FUSED_CPP_ATTN_GEMM_SCHEDULE", "mn")
+    monkeypatch.setenv("FUSED_CPP_ATTN_GEMM_N_GROUPS", "7")
+    try:
+        packed = prepare_deepseek_v4_attn_gemm_weights(*weights)
+    except RuntimeError as error:
+        if "does not support SVE BF16" in str(error):
+            pytest.skip("SVE BF16 JIT GEMM is unavailable")
+        raise
+
+    core_ids = _test_core_ids(4)
+    if len(core_ids) < 2:
+        pytest.skip("need at least two available CPU cores")
+    actual = deepseek_v4_attn_gemm_fused_prepacked(hidden_states, packed, cores=core_ids)
+    expected = (
+        (hidden_states.float() @ weights[0].float()).to(torch.bfloat16),
+        hidden_states.float() @ weights[1].float(),
+        hidden_states.float() @ weights[2].float(),
+        (hidden_states.float() @ weights[3].float()).to(torch.bfloat16),
+    )
+    for actual_tensor, expected_tensor in zip(actual, expected):
+        assert actual_tensor is not None
+        torch.testing.assert_close(actual_tensor.float(), expected_tensor.float(), atol=5e-2, rtol=5e-2)
+
+
+def test_deepseek_v4_attn_gemm_defaults_to_sve_with_neon_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Default packing must select supported SVE while retaining the explicit NEON fallback."""
+    weight = _bf16_randn(16, 17)
+    monkeypatch.delenv("FUSED_CPP_POST_GEMM_BACKEND", raising=False)
+    monkeypatch.delenv("FUSED_CPP_ATTN_GEMM_SVE", raising=False)
+    monkeypatch.setenv("FUSED_CPP_ATTN_GEMM_BACKEND", "sve")
+    try:
+        sve = prepare_deepseek_v4_attn_gemm_weights(weight)
+    except RuntimeError as error:
+        if "does not support SVE BF16" in str(error):
+            pytest.skip("SVE BF16 JIT GEMM is unavailable")
+        raise
+
+    monkeypatch.delenv("FUSED_CPP_ATTN_GEMM_BACKEND")
+    default = prepare_deepseek_v4_attn_gemm_weights(weight)
+    assert default.fused_wqa_wkv[0].numel() == sve.fused_wqa_wkv[0].numel()
+    torch.testing.assert_close(default.fused_wqa_wkv[0], sve.fused_wqa_wkv[0], rtol=0.0, atol=0.0)
+
+    monkeypatch.setenv("FUSED_CPP_POST_GEMM_BACKEND", "neon")
+    default_with_post_override = prepare_deepseek_v4_attn_gemm_weights(weight)
+    assert default_with_post_override.fused_wqa_wkv[0].numel() == sve.fused_wqa_wkv[0].numel()
+    monkeypatch.delenv("FUSED_CPP_POST_GEMM_BACKEND")
+
+    monkeypatch.setenv("FUSED_CPP_ATTN_GEMM_SVE", "0")
+    fallback = prepare_deepseek_v4_attn_gemm_weights(weight)
+    monkeypatch.setenv("FUSED_CPP_ATTN_GEMM_BACKEND", "neon")
+    neon = prepare_deepseek_v4_attn_gemm_weights(weight)
+    assert fallback.fused_wqa_wkv[0].numel() == neon.fused_wqa_wkv[0].numel()
+    torch.testing.assert_close(fallback.fused_wqa_wkv[0], neon.fused_wqa_wkv[0], rtol=0.0, atol=0.0)
+    assert sve.fused_wqa_wkv[0].numel() != neon.fused_wqa_wkv[0].numel()
+
+
+@pytest.mark.skipif(not _HAS_OPENMP, reason="OpenMP is unavailable")
 @pytest.mark.parametrize("M", [1, 3, 5, 7, 8, 13])
 def test_deepseek_v4_attn_gemm_prepacked_a_matches_repack(
     M: int,

@@ -42,6 +42,11 @@ except (ImportError, AttributeError):
     _HAS_DEEPSEEK_V4_POST_GEMM_STAGE = False
 
 try:
+    from fused_cpp._C import deepseek_v4_post_gemm_prepare as _prepare_post_gemm_weight  # type: ignore[import-untyped]
+except (ImportError, AttributeError):
+    _prepare_post_gemm_weight = _prepare_attn_gemm_weight
+
+try:
     from fused_cpp._C import (  # type: ignore[import-untyped]
         deepseek_v4_post_gemm_parallel_stage_prepacked as _cpp_post_gemm_stage_prepacked,
     )
@@ -540,7 +545,7 @@ def prepare_deepseek_v4_post_gemm_weights(
     """Prepack post-GEMM bf16 linear weights for repeated prefill calls."""
 
     def prepare_weight(weight: torch.Tensor) -> PreparedBF16LinearWeight:
-        packed, k, n = _prepare_attn_gemm_weight(weight.t().contiguous())
+        packed, k, n = _prepare_post_gemm_weight(weight.t().contiguous())
         k_pad = ((int(k) + 7) // 8) * 8
         n_padded = int(packed.numel()) // k_pad
         return PreparedBF16LinearWeight(

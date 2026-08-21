@@ -128,10 +128,7 @@ int requested_attn_gemm_n_groups(int num_threads) {
 }
 
 AttnGemmBackend selected_attn_gemm_backend() {
-  const char* backend = std::getenv("FUSED_CPP_POST_GEMM_BACKEND");
-  if (backend == nullptr) {
-    backend = std::getenv("FUSED_CPP_ATTN_GEMM_BACKEND");
-  }
+  const char* backend = std::getenv("FUSED_CPP_ATTN_GEMM_BACKEND");
   if (backend != nullptr) {
     if (std::strcmp(backend, "sve") == 0 || std::strcmp(backend, "SVE") == 0) {
       TORCH_CHECK(::fused_cpp::deepseek_v4::attn_sve::available(),
@@ -139,20 +136,17 @@ AttnGemmBackend selected_attn_gemm_backend() {
                   "build/CPU does not support SVE BF16");
       return AttnGemmBackend::kSve;
     }
-    if (std::strcmp(backend, "neon") == 0 || std::strcmp(backend, "NEON") == 0 ||
-        std::strcmp(backend, "default") == 0) {
+    if (std::strcmp(backend, "neon") == 0 || std::strcmp(backend, "NEON") == 0) {
       return AttnGemmBackend::kNeon;
     }
-    TORCH_CHECK(std::strcmp(backend, "auto") == 0 || std::strcmp(backend, "AUTO") == 0,
+    TORCH_CHECK(std::strcmp(backend, "auto") == 0 || std::strcmp(backend, "AUTO") == 0 ||
+                    std::strcmp(backend, "default") == 0,
                 "FUSED_CPP_ATTN_GEMM_BACKEND must be one of "
                 "auto/neon/sve, got ",
                 backend);
   }
 
-  // Preserve the existing NEON path by default; SVE is opt-in while it is
-  // being validated across the DeepSeek V4 operator shapes.
-  if (::fused_cpp::deepseek_v4::attn_sve::available() && std::getenv("FUSED_CPP_ATTN_GEMM_SVE") != nullptr &&
-      !env_false_local("FUSED_CPP_ATTN_GEMM_SVE")) {
+  if (::fused_cpp::deepseek_v4::attn_sve::available() && !env_false_local("FUSED_CPP_ATTN_GEMM_SVE")) {
     return AttnGemmBackend::kSve;
   }
   return AttnGemmBackend::kNeon;
@@ -175,6 +169,13 @@ int64_t attn_gemm_round_n(int64_t N, AttnGemmBackend backend) {
 int64_t attn_gemm_n_tile(AttnGemmBackend backend) {
   if (backend == AttnGemmBackend::kSve) {
     return ::fused_cpp::deepseek_v4::attn_sve::n_tile();
+  }
+  return kTile;
+}
+
+int64_t attn_gemm_m_panel_rows(AttnGemmBackend backend) {
+  if (backend == AttnGemmBackend::kSve) {
+    return ::fused_cpp::deepseek_v4::attn_sve::m_panel_rows();
   }
   return kTile;
 }
@@ -521,10 +522,27 @@ void dispatch_fp32_gemm_range_to_output(const at::Tensor& a_storage, const Packe
 }
 
 void dispatch_packed_gemm_range_to_output(const uint16_t* packed_a, const PackedWeight& weight, at::Tensor& output,
-                                          bool bf16_output, int64_t row_start, int64_t n_begin, int64_t n_cols) {
+                                          AttnGemmBackend backend, bool bf16_output, int64_t row_start,
+                                          int64_t row_count, int64_t n_begin, int64_t n_cols) {
   if (n_cols == 0) {
     return;
   }
+  const uint16_t* panel_b = bf16_data_const(weight.tensor) + n_begin * weight.K_pad;
+  if (backend == AttnGemmBackend::kSve) {
+    const uint16_t* panel_a = packed_a + row_start * weight.K_pad;
+    if (bf16_output) {
+      ::fused_cpp::deepseek_v4::attn_sve::dispatch_packed_bf16(
+          panel_a, panel_b, bf16_data(output) + row_start * weight.N_pad + n_begin, static_cast<int>(row_count),
+          static_cast<int>(weight.K_pad), static_cast<int>(n_cols), static_cast<int>(weight.N_pad));
+    } else {
+      ::fused_cpp::deepseek_v4::attn_sve::dispatch_packed_f32(
+          panel_a, panel_b, output.data_ptr<float>() + row_start * weight.N_pad + n_begin,
+          static_cast<int>(row_count), static_cast<int>(weight.K_pad), static_cast<int>(n_cols),
+          static_cast<int>(weight.N_pad));
+    }
+    return;
+  }
+
   gemm_params_t params;
   params.m = kTile;
   params.k = static_cast<int>(weight.K_pad);
@@ -533,7 +551,6 @@ void dispatch_packed_gemm_range_to_output(const uint16_t* packed_a, const Packed
   params.ldb = static_cast<int>(weight.K_pad);
   params.ldc = static_cast<int>(weight.N_pad);
   const uint16_t* panel_a = packed_a + row_start * weight.K_pad;
-  const uint16_t* panel_b = bf16_data_const(weight.tensor) + n_begin * weight.K_pad;
   if (bf16_output) {
     deepseek_v4_attn_gemm_packed_bf16(
         panel_a, panel_b, bf16_data(output) + row_start * weight.N_pad + n_begin, nullptr, &params);
@@ -866,26 +883,26 @@ AttnGemmSelectedOutputs run_attn_gemm_selected_mt(const at::Tensor& hidden_state
 
   const int64_t num_threads = static_cast<int64_t>(core_ids.size());
   const AttnGemmBackend backend = selected_attn_gemm_backend();
+  const int64_t m_panel_rows = attn_gemm_m_panel_rows(backend);
   const AttnGemmSchedule schedule = selected_attn_gemm_schedule();
   const bool uses_task_pool =
       schedule == AttnGemmSchedule::kSharedPool || schedule == AttnGemmSchedule::kMnPool;
   const int requested_n_groups =
       uses_task_pool ? requested_attn_gemm_n_groups(static_cast<int>(num_threads)) : 1;
   const int64_t rows_per_thread = ceil_div_int64(std::max<int64_t>(M, 1), num_threads);
-  const int64_t m_panels = ceil_div_int64(M, kTile);
+  const int64_t m_panels = ceil_div_int64(M, m_panel_rows);
 #if defined(__linux__)
   const bool use_prepacked_a =
-      backend == AttnGemmBackend::kNeon && uses_task_pool &&
-      attn_gemm_prepack_a_enabled(schedule, requested_n_groups);
+      uses_task_pool && (backend == AttnGemmBackend::kSve || attn_gemm_prepack_a_enabled(schedule, requested_n_groups));
 #else
   const bool use_prepacked_a = false;
 #endif
-  const int64_t output_rows = use_prepacked_a ? m_panels * kTile : M;
+  const int64_t output_rows = use_prepacked_a ? m_panels * m_panel_rows : M;
   int64_t scratch_rows = rows_per_thread;
   if (schedule == AttnGemmSchedule::kM8Aligned) {
-    scratch_rows = std::max<int64_t>(1, ceil_div_int64(m_panels, num_threads) * kTile);
+    scratch_rows = std::max<int64_t>(1, ceil_div_int64(m_panels, num_threads) * m_panel_rows);
   } else if (schedule == AttnGemmSchedule::kSharedPool || schedule == AttnGemmSchedule::kMnPool) {
-    scratch_rows = kTile;
+    scratch_rows = m_panel_rows;
   }
   const int64_t scratch_stride =
       use_prepacked_a
@@ -897,7 +914,10 @@ AttnGemmSelectedOutputs run_attn_gemm_selected_mt(const at::Tensor& hidden_state
   at::Tensor scratch = workspace_lease.empty({num_threads * scratch_stride}, hidden_states.options());
   at::Tensor packed_a;
   if (use_prepacked_a) {
-    packed_a = workspace_lease.empty({output_rows * K_pad}, hidden_states.options());
+    const int64_t packed_a_size = backend == AttnGemmBackend::kSve
+                                      ? ::fused_cpp::deepseek_v4::attn_sve::packed_a_elems(M, K_pad)
+                                      : output_rows * K_pad;
+    packed_a = workspace_lease.empty({packed_a_size}, hidden_states.options());
   }
 
   AttnGemmSelectedOutputs outputs;
@@ -955,8 +975,8 @@ AttnGemmSelectedOutputs run_attn_gemm_selected_mt(const at::Tensor& hidden_state
   auto dispatch_work_range = [&](const AttnGemmWork& item, int64_t row_start, int64_t row_count, int64_t n_begin,
                                  int64_t n_cols, int64_t scratch_offset) {
     if (use_prepacked_a) {
-      dispatch_packed_gemm_range_to_output(bf16_data_const(packed_a), *item.weight, *item.output, item.bf16_output,
-                                           row_start, n_begin, n_cols);
+      dispatch_packed_gemm_range_to_output(bf16_data_const(packed_a), *item.weight, *item.output, backend,
+                                           item.bf16_output, row_start, row_count, n_begin, n_cols);
       return;
     }
     if (item.bf16_output) {
@@ -988,8 +1008,14 @@ AttnGemmSelectedOutputs run_attn_gemm_selected_mt(const at::Tensor& hidden_state
     if (use_prepacked_a) {
       const int panel_begin = static_cast<int>(static_cast<int64_t>(tid) * m_panels / num_threads);
       const int panel_end = static_cast<int>(static_cast<int64_t>(tid + 1) * m_panels / num_threads);
-      pack_a_reorder_m8_range(bf16_data_const(a_storage), bf16_data(packed_a), static_cast<int>(M),
-                              static_cast<int>(K_pad), panel_begin, panel_end);
+      if (backend == AttnGemmBackend::kSve) {
+        ::fused_cpp::deepseek_v4::attn_sve::pack_a_range(
+            bf16_data_const(a_storage), bf16_data(packed_a), static_cast<int>(M), static_cast<int>(K_pad), panel_begin,
+            panel_end);
+      } else {
+        pack_a_reorder_m8_range(bf16_data_const(a_storage), bf16_data(packed_a), static_cast<int>(M),
+                                static_cast<int>(K_pad), panel_begin, panel_end);
+      }
 #pragma omp barrier
     }
 
@@ -999,8 +1025,9 @@ AttnGemmSelectedOutputs run_attn_gemm_selected_mt(const at::Tensor& hidden_state
       if (schedule == AttnGemmSchedule::kM8Aligned) {
         const int64_t panel_begin = static_cast<int64_t>(tid) * m_panels / num_threads;
         const int64_t panel_end = static_cast<int64_t>(tid + 1) * m_panels / num_threads;
-        row_start = panel_begin * kTile;
-        row_count = row_start >= M ? 0 : std::min<int64_t>((panel_end - panel_begin) * kTile, M - row_start);
+        row_start = panel_begin * m_panel_rows;
+        row_count =
+            row_start >= M ? 0 : std::min<int64_t>((panel_end - panel_begin) * m_panel_rows, M - row_start);
       }
       for (const AttnGemmWork& item : work) {
         dispatch_work_range(item, row_start, row_count, 0, item.weight->N_pad, scratch_offset);
@@ -1022,8 +1049,8 @@ AttnGemmSelectedOutputs run_attn_gemm_selected_mt(const at::Tensor& hidden_state
           }
           const AttnGemmTaskGroup& group = task_groups[static_cast<size_t>(group_index)];
           const AttnGemmWork& item = work[static_cast<size_t>(group.work_index)];
-          const int64_t row_start = panel * kTile;
-          const int64_t row_count = std::min<int64_t>(kTile, M - row_start);
+          const int64_t row_start = panel * m_panel_rows;
+          const int64_t row_count = std::min<int64_t>(m_panel_rows, M - row_start);
           dispatch_work_range(item, row_start, row_count, group.n_begin, group.n_cols, scratch_offset);
           preferred_group = group_index;
           executed = true;
@@ -1255,7 +1282,7 @@ AttnGemmNormedOutputs run_attn_gemm_normed_mt(const at::Tensor& hidden_states, c
 }  // namespace
 
 std::tuple<at::Tensor, int64_t, int64_t>
-fused_wqa_wkv_compressor_kv_score_indexer_compressor_kv_score_indexer_weights_proj_fused_prepare(at::Tensor weight) {
+deepseek_v4_gemm_prepare_weight_for_backend(at::Tensor weight, bool use_sve) {
 #ifndef __aarch64__
   TORCH_CHECK(false, "deepseek_v4 attn gemm fused prepare requires AArch64");
 #else
@@ -1264,7 +1291,11 @@ fused_wqa_wkv_compressor_kv_score_indexer_compressor_kv_score_indexer_weights_pr
   const int64_t N = weight.size(1);
   check_int_arg(K, "K");
   check_int_arg(N, "N");
-  const AttnGemmBackend backend = selected_attn_gemm_backend();
+  const AttnGemmBackend backend = use_sve ? AttnGemmBackend::kSve : AttnGemmBackend::kNeon;
+  if (use_sve) {
+    TORCH_CHECK(::fused_cpp::deepseek_v4::attn_sve::available(),
+                "DeepSeek V4 SVE weight packing requested but this build/CPU does not support SVE BF16");
+  }
   const int64_t K_pad = attn_gemm_round_k(K, backend);
   const int64_t N_pad = attn_gemm_round_n(N, backend);
 
@@ -1285,6 +1316,11 @@ fused_wqa_wkv_compressor_kv_score_indexer_compressor_kv_score_indexer_weights_pr
   }
   return std::make_tuple(packed, K, N);
 #endif
+}
+
+std::tuple<at::Tensor, int64_t, int64_t>
+fused_wqa_wkv_compressor_kv_score_indexer_compressor_kv_score_indexer_weights_proj_fused_prepare(at::Tensor weight) {
+  return deepseek_v4_gemm_prepare_weight_for_backend(weight, selected_attn_gemm_backend() == AttnGemmBackend::kSve);
 }
 
 at::Tensor fused_wqa_wkv_fused(at::Tensor hidden_states, at::Tensor fused_wqa_wkv_packed, int64_t fused_wqa_wkv_K,

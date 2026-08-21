@@ -7,7 +7,14 @@
 #include <stdexcept>
 #include <vector>
 
-#if defined(__aarch64__) && defined(__ARM_FEATURE_SVE) && defined(__ARM_FEATURE_BF16)
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
+#include "moe/arm/common/nm_window_schedule.h"
+
+#if defined(__aarch64__) && defined(__ARM_FEATURE_SVE) && \
+    (defined(__ARM_FEATURE_BF16) || defined(__ARM_FEATURE_BF16_VECTOR_ARITHMETIC))
 #include <arm_sve.h>
 #endif
 
@@ -58,7 +65,8 @@ void select_topk_row(const float* scores, int64_t valid_len, int64_t topk, TopkC
   }
 }
 
-#if defined(__aarch64__) && defined(__ARM_FEATURE_SVE) && defined(__ARM_FEATURE_BF16)
+#if defined(__aarch64__) && defined(__ARM_FEATURE_SVE) && \
+    (defined(__ARM_FEATURE_BF16) || defined(__ARM_FEATURE_BF16_VECTOR_ARITHMETIC))
 
 inline svbfloat16_t load_bf16(const uint16_t* ptr) {
   return svld1_bf16(svptrue_b16(), reinterpret_cast<const __bf16*>(ptr));
@@ -197,7 +205,8 @@ __attribute__((noinline)) void weighted_relu_tile(const uint16_t* packed_q, cons
 }  // namespace
 
 bool available() {
-#if defined(__aarch64__) && defined(__ARM_FEATURE_SVE) && defined(__ARM_FEATURE_BF16)
+#if defined(__aarch64__) && defined(__ARM_FEATURE_SVE) && \
+    (defined(__ARM_FEATURE_BF16) || defined(__ARM_FEATURE_BF16_VECTOR_ARITHMETIC))
   return true;
 #else
   return false;
@@ -205,7 +214,8 @@ bool available() {
 }
 
 int n_tile() {
-#if defined(__aarch64__) && defined(__ARM_FEATURE_SVE) && defined(__ARM_FEATURE_BF16)
+#if defined(__aarch64__) && defined(__ARM_FEATURE_SVE) && \
+    (defined(__ARM_FEATURE_BF16) || defined(__ARM_FEATURE_BF16_VECTOR_ARITHMETIC))
   return static_cast<int>(svcntb() / 2);
 #else
   return 8;
@@ -221,7 +231,8 @@ int round_n(int n) {
 }
 
 void pack_paged_k(const uint16_t* kv_cache, const int64_t* key_row_offsets, uint16_t* packed_k, int K, int N, int Np) {
-#if defined(__aarch64__) && defined(__ARM_FEATURE_SVE) && defined(__ARM_FEATURE_BF16)
+#if defined(__aarch64__) && defined(__ARM_FEATURE_SVE) && \
+    (defined(__ARM_FEATURE_BF16) || defined(__ARM_FEATURE_BF16_VECTOR_ARITHMETIC))
   const int segments = static_cast<int>(svcntb() / 16);
   const int tile = segments * 8;
   const int tile_count = Np / tile;
@@ -263,28 +274,46 @@ void pack_paged_k(const uint16_t* kv_cache, const int64_t* key_row_offsets, uint
 
 void weighted_relu_scores(const uint16_t* q, const float* weights, const uint16_t* packed_k, float* scores, int M,
                           int H, int K, int Np) {
-#if defined(__aarch64__) && defined(__ARM_FEATURE_SVE) && defined(__ARM_FEATURE_BF16)
+#if defined(__aarch64__) && defined(__ARM_FEATURE_SVE) && \
+    (defined(__ARM_FEATURE_BF16) || defined(__ARM_FEATURE_BF16_VECTOR_ARITHMETIC))
   const int tile = n_tile();
+  const int64_t n_tiles = Np / tile;
+  int64_t requested_threads = 1;
+#ifdef _OPENMP
+  requested_threads = omp_get_max_threads();
+#endif
+  const fused_cpp::nm_window::Geometry geometry = fused_cpp::nm_window::Choose(
+      n_tiles, static_cast<int64_t>(K) * tile * static_cast<int64_t>(sizeof(uint16_t)), M, requested_threads);
+  const int64_t task_count = geometry.task_count();
 
 #ifdef _OPENMP
-#pragma omp parallel
+#pragma omp parallel num_threads(static_cast<int>(std::min<int64_t>(requested_threads, task_count)))
 #endif
   {
     std::vector<uint16_t> packed_q(static_cast<int64_t>(H) * K);
 #ifdef _OPENMP
-#pragma omp for schedule(static)
+#pragma omp for schedule(static, 1)
 #endif
-    for (int m = 0; m < M; ++m) {
-      const uint16_t* q_row = q + static_cast<int64_t>(m) * H * K;
-      for (int head_base = 0; head_base < H; head_base += 8) {
-        pack_q_head_block(q_row + static_cast<int64_t>(head_base) * K,
-                          packed_q.data() + static_cast<int64_t>(head_base) * K, K);
-      }
-      const float* weight_row = weights + static_cast<int64_t>(m) * H;
-      float* score_row = scores + static_cast<int64_t>(m) * Np;
-      for (int column_base = 0; column_base < Np; column_base += tile) {
-        const uint16_t* packed_k_tile = packed_k + static_cast<int64_t>(column_base / tile) * K * tile;
-        weighted_relu_tile(packed_q.data(), weight_row, packed_k_tile, score_row + column_base, H, K);
+    for (int64_t task = 0; task < task_count; ++task) {
+      const int64_t window = task / geometry.m_splits;
+      const int64_t m_split = task % geometry.m_splits;
+      const int64_t tile_begin = window * n_tiles / geometry.n_windows;
+      const int64_t tile_end = (window + 1) * n_tiles / geometry.n_windows;
+      const int64_t m_begin = m_split * M / geometry.m_splits;
+      const int64_t m_end = (m_split + 1) * M / geometry.m_splits;
+      for (int64_t m = m_begin; m < m_end; ++m) {
+        const uint16_t* q_row = q + m * H * K;
+        for (int head_base = 0; head_base < H; head_base += 8) {
+          pack_q_head_block(q_row + static_cast<int64_t>(head_base) * K,
+                            packed_q.data() + static_cast<int64_t>(head_base) * K, K);
+        }
+        const float* weight_row = weights + m * H;
+        float* score_row = scores + m * Np;
+        for (int64_t n_tile_index = tile_begin; n_tile_index < tile_end; ++n_tile_index) {
+          const int64_t column_base = n_tile_index * tile;
+          const uint16_t* packed_k_tile = packed_k + n_tile_index * K * tile;
+          weighted_relu_tile(packed_q.data(), weight_row, packed_k_tile, score_row + column_base, H, K);
+        }
       }
     }
   }

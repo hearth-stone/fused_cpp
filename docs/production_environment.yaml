@@ -319,24 +319,32 @@ entries:
       - csrc/deepseek_v4_attn_gemm_fused.cpp
       - csrc/deepseek_v4_post_gemm_stage.cpp
     purpose: Force supported schedule components or their retained comparison baselines.
-    default: MN pool for attention; M8-aligned shared-Q policy when eligible.
+    default: MN pool for attention; backend-aligned shared-Q policy when eligible for post-GEMM.
 
-  - id: attention.sve_candidate
+  - id: attention.gemm_backend
     names:
       - FUSED_CPP_ATTN_GEMM_BACKEND
       - FUSED_CPP_ATTN_GEMM_SVE
-      - FUSED_CPP_POST_GEMM_BACKEND
     scope: runtime
-    class: temporary
+    class: supported
     owner: deepseek-v4-attention
     implementation:
       - csrc/deepseek_v4_attn_gemm_fused.cpp
       - csrc/deepseek_v4_attn_gemm_sve.cpp
+    purpose: Select the DeepSeek V4 BF16 GEMM backend or disable automatic SVE selection.
+    default: SVE exact-M with shared packed-A when available; NEON otherwise.
+
+  - id: attention.post_gemm_backend
+    names:
+      - FUSED_CPP_POST_GEMM_BACKEND
+    scope: runtime
+    class: supported
+    owner: deepseek-v4-attention
+    implementation:
       - csrc/deepseek_v4_post_gemm_stage.cpp
-    purpose: Select the opt-in SVE BF16 GEMM backend while cross-shape validation is incomplete.
-    default: NEON.
-    feature: optimizations/deepseek_v4_attn_gemm/manifest.yaml
-    decision_by: "2026-11-08"
+    purpose: Select the post-GEMM BF16 backend; auto and default prefer SVE BF16 JIT when available.
+    default: SVE exact-M with L2-window scheduling when available; NEON otherwise.
+    feature: optimizations/deepseek_v4_post_gemm/manifest.yaml
 
   - id: attention.post_gemm_n_groups_candidate
     names:
@@ -346,8 +354,8 @@ entries:
     owner: deepseek-v4-attention
     implementation:
       - csrc/deepseek_v4_post_gemm_stage.cpp
-    purpose: Select the candidate Q GEMM N-group count.
-    default: Two groups.
+    purpose: Select the candidate Main Q and Indexer Q GEMM contiguous N-window count.
+    default: Two groups for explicit NEON; thread-based groups for the default SVE backend.
     feature: schedule.q_gemm_mn_groups
     decision_by: "2026-09-09"
 

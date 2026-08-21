@@ -134,8 +134,8 @@ def _make_inputs(
     )
 
 
-def _make_dense_inputs(seed: int = 0) -> PostGemmStageInputs:
-    inputs = _make_inputs(seed)
+def _make_dense_inputs(seed: int = 0, num_tokens: int = 6) -> PostGemmStageInputs:
+    inputs = _make_inputs(seed, num_tokens=num_tokens)
     inputs.kv_score = None
     inputs.indexer_kv_score = None
     inputs.indexer_weights = None
@@ -673,6 +673,60 @@ def test_post_gemm_q_mn_groups_match_single_n_group_per_gemm(monkeypatch) -> Non
         single_group_inputs.indexer_compressor.state_cache,
         "Q MN groups indexer state_cache",
     )
+
+
+@pytest.mark.skipif(
+    platform.machine() not in ("aarch64", "arm64") or not _HAS_DEEPSEEK_V4_POST_GEMM_STAGE_PREPACKED,
+    reason="SVE M12 post-GEMM scheduling requires the AArch64 prepacked C++ stage",
+)
+@pytest.mark.parametrize("num_tokens", [11, 12, 13, 24, 25])
+def test_post_gemm_sve_m12_windows_match_torch(num_tokens: int, monkeypatch) -> None:
+    """SVE M12 panels and tails must preserve dense post-GEMM output and cache writes."""
+    ref_inputs = _make_dense_inputs(seed=20260820 + num_tokens, num_tokens=num_tokens)
+    cpp_inputs = _make_dense_inputs(seed=20260820 + num_tokens, num_tokens=num_tokens)
+
+    monkeypatch.setenv("FUSED_CPP_POST_GEMM_BACKEND", "sve")
+    monkeypatch.setenv("FUSED_CPP_POST_GEMM_M8_ALIGNED", "1")
+    try:
+        weights = prepare_deepseek_v4_post_gemm_weights(cpp_inputs.main_wq_b_weight)
+    except RuntimeError as error:
+        if "does not support SVE BF16" in str(error):
+            pytest.skip("SVE BF16 JIT GEMM is unavailable")
+        raise
+
+    expected_q, _ = post_gemm_parallel_stage_torch_baseline(ref_inputs)
+    previous_threads = torch.get_num_threads()
+    torch.set_num_threads(4)
+    try:
+        actual_q, actual_topk = post_gemm_parallel_stage_cpp_prepacked(cpp_inputs, weights)
+    finally:
+        torch.set_num_threads(previous_threads)
+    assert actual_topk is None
+    _assert_close(actual_q, expected_q, "SVE M12 dense q")
+    _assert_close(cpp_inputs.swa.kv_cache, ref_inputs.swa.kv_cache, "SVE M12 dense swa kv_cache")
+
+
+def test_post_gemm_prepare_defaults_to_sve_without_attention_override(monkeypatch) -> None:
+    """Post-GEMM packing defaults to SVE and ignores the attention backend override."""
+    weight = _bf16_randn(17, 16)
+    monkeypatch.delenv("FUSED_CPP_ATTN_GEMM_SVE", raising=False)
+    monkeypatch.setenv("FUSED_CPP_POST_GEMM_BACKEND", "sve")
+    try:
+        sve = prepare_deepseek_v4_post_gemm_weights(weight)
+    except RuntimeError as error:
+        if "does not support SVE BF16" in str(error):
+            pytest.skip("SVE BF16 JIT GEMM is unavailable")
+        raise
+
+    monkeypatch.setenv("FUSED_CPP_POST_GEMM_BACKEND", "neon")
+    neon = prepare_deepseek_v4_post_gemm_weights(weight)
+
+    monkeypatch.delenv("FUSED_CPP_POST_GEMM_BACKEND")
+    monkeypatch.setenv("FUSED_CPP_ATTN_GEMM_BACKEND", "sve")
+    default = prepare_deepseek_v4_post_gemm_weights(weight)
+    assert default.main_wq_b.n_padded == sve.main_wq_b.n_padded
+    torch.testing.assert_close(default.main_wq_b.packed_weight, sve.main_wq_b.packed_weight, rtol=0.0, atol=0.0)
+    assert sve.main_wq_b.n_padded != neon.main_wq_b.n_padded
 
 
 @pytest.mark.skipif(

@@ -469,6 +469,7 @@ bf16gemm_asm_sources = []
 i8gemm_c_sources = []
 i8gemm_asm_sources = []
 moe_native_sources = []
+deepseek_sve_gemm_native_sources = []
 is_aarch64 = platform.machine() in ("aarch64", "arm64")
 is_x86_64 = platform.machine() in ("x86_64", "AMD64")
 acl_available, acl_include_dirs, acl_library_dirs = _detect_acl()
@@ -620,6 +621,10 @@ if is_aarch64:
             os.path.join("csrc", "moe", "arm", "sve_bf16", "route_merge.cpp"),
         ]
         moe_sources = [source for source in moe_sources if source not in sve_sources]
+        if target_has_sve:
+            indexer_sve_source = os.path.join("csrc", "deepseek_v4_indexer_sve.cpp")
+            sources = [source for source in sources if source != indexer_sve_source]
+            deepseek_sve_gemm_native_sources.append((indexer_sve_source, sve_args))
         xbyak_aarch64_root = os.path.abspath(os.path.join("3rdparty", "xbyak_aarch64"))
         xbyak_aarch64_sources = [
             os.path.join(xbyak_aarch64_root, "src", "xbyak_aarch64_impl.cpp"),
@@ -627,14 +632,27 @@ if is_aarch64:
         ]
         xbyak_aarch64_available = all(os.path.isfile(source) for source in xbyak_aarch64_sources)
         if xbyak_aarch64_available:
-            moe_include_dirs.extend(
+            xbyak_aarch64_include_dirs = [
+                xbyak_aarch64_root,
+                os.path.join(xbyak_aarch64_root, "src"),
+                os.path.join(xbyak_aarch64_root, "xbyak_aarch64"),
+            ]
+            moe_include_dirs.extend(xbyak_aarch64_include_dirs)
+            include_dirs.extend(xbyak_aarch64_include_dirs)
+            moe_define_macros.append(("FUSED_CPP_MOE_HAS_XBYAK_AARCH64", "1"))
+            define_macros.append(("FUSED_CPP_DEEPSEEK_V4_HAS_SVE_JIT_GEMM", "1"))
+            shared_sve_jit_args = [
+                *sve_args,
+                "-DFUSED_CPP_MOE_HAS_ARM_SVE=1",
+                f"-DFUSED_CPP_MOE_SVE_VECTOR_BITS={sve_vector_bits}",
+                "-DFUSED_CPP_MOE_HAS_XBYAK_AARCH64=1",
+            ]
+            deepseek_sve_gemm_native_sources.extend(
                 [
-                    xbyak_aarch64_root,
-                    os.path.join(xbyak_aarch64_root, "src"),
-                    os.path.join(xbyak_aarch64_root, "xbyak_aarch64"),
+                    *[(source, shared_sve_jit_args) for source in sve_sources[:2]],
+                    *[(source, ["-O2", "-std=c++17"]) for source in xbyak_aarch64_sources],
                 ]
             )
-            moe_define_macros.append(("FUSED_CPP_MOE_HAS_XBYAK_AARCH64", "1"))
         else:
             moe_define_macros.append(("FUSED_CPP_MOE_HAS_XBYAK_AARCH64", "0"))
         moe_native_sources.extend(
@@ -749,7 +767,8 @@ native_sources_by_extension = {
             *i8gemm_c_sources,
             *i8gemm_asm_sources,
         ]
-    ],
+    ]
+    + deepseek_sve_gemm_native_sources,
     "fused_cpp._moe_C": moe_native_sources,
 }
 

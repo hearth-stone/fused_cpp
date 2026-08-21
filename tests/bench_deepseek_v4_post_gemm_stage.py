@@ -211,7 +211,10 @@ def main() -> None:
             post_gemm_parallel_stage_cpp_prepacked(inputs, weights)
 
     median_ms = statistics.median(samples_ms)
-    gemm_flops = 4 * args.m * 1024 * 8192
+    max_valid_compressed = (args.context_start + args.m) // 4
+    indexer_q_executed = max_valid_compressed > 512
+    executed_q_gemms = 1 + int(indexer_q_executed)
+    gemm_flops = executed_q_gemms * 2 * args.m * 1024 * 8192
     result = {
         "m": args.m,
         "context_start": args.context_start,
@@ -221,6 +224,7 @@ def main() -> None:
         "n_groups": args.n_groups,
         "warmup": args.warmup,
         "runs": args.runs,
+        "executed_q_gemms": executed_q_gemms,
         "median_ms": median_ms,
         "min_ms": min(samples_ms),
         "max_ms": max(samples_ms),

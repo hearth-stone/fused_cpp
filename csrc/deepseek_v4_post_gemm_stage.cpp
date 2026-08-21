@@ -47,6 +47,10 @@ void bf16gemm_k_ld2(const uint16_t* A, const uint16_t* B_reo, float* C, uint16_t
                     const gemm_params_t* params);
 void bf16gemm_k_ld4(const uint16_t* A, const uint16_t* B_reo, float* C, uint16_t* A_reorder,
                     const gemm_params_t* params);
+void deepseek_v4_attn_gemm_packed_f32(const uint16_t* A, const uint16_t* B_reo, float* C, uint16_t* A_reorder,
+                                      const gemm_params_t* params);
+void deepseek_v4_attn_gemm_packed_bf16(const uint16_t* A, const uint16_t* B_reo, uint16_t* C, uint16_t* A_reorder,
+                                       const gemm_params_t* params);
 #ifdef __linux__
 void bf16gemm_k_nld_b(const uint16_t* A, const uint16_t* B_reo, uint16_t* C, uint16_t* A_reorder,
                       const gemm_params_t* params);
@@ -65,6 +69,7 @@ at::Tensor bf16_linear_prepacked_to_dtype(at::Tensor input, at::Tensor packed_we
                                           bool output_bf16, int64_t nthreads);
 void bf16_linear_prepacked_to_dtype_out(at::Tensor input, at::Tensor packed_weight, int64_t K, int64_t N, int64_t Np,
                                         bool output_bf16, int64_t nthreads, at::Tensor output);
+std::tuple<at::Tensor, int64_t, int64_t> deepseek_v4_gemm_prepare_weight_for_backend(at::Tensor weight, bool use_sve);
 
 namespace {
 
@@ -164,9 +169,56 @@ enum class PostGemmBackend {
   kSve,
 };
 
-constexpr int64_t kPostGemmMPanelRows = 8;
+constexpr int64_t kPostGemmNeonMPanelRows = 8;
+constexpr int64_t kPostGemmTargetBWindowBytes = 1 << 20;
 constexpr int kPostGemmSharedQPoolMinThreads = 32;
 constexpr int kPostGemmDefaultNGroups = 2;
+
+PostGemmBackend SelectedPostGemmBackend();
+
+int64_t PostGemmMPanelRows(PostGemmBackend backend) {
+  return backend == PostGemmBackend::kSve ? ::fused_cpp::deepseek_v4::attn_sve::m_panel_rows()
+                                          : kPostGemmNeonMPanelRows;
+}
+
+int64_t ChoosePostGemmWindowGroups(int64_t K, int64_t Np, int64_t n_tile, int64_t num_threads) {
+  const int64_t n_tiles = Np / n_tile;
+  const int64_t bytes_per_tile = K * n_tile * static_cast<int64_t>(sizeof(uint16_t));
+  const int64_t min_groups = std::min<int64_t>(
+      n_tiles,
+      std::max<int64_t>(1, (Np * K * static_cast<int64_t>(sizeof(uint16_t)) + kPostGemmTargetBWindowBytes - 1) /
+                               kPostGemmTargetBWindowBytes));
+  if (num_threads < min_groups) {
+    return min_groups;
+  }
+  for (int64_t groups = min_groups; groups <= std::min(n_tiles, num_threads); ++groups) {
+    if (num_threads % groups == 0 &&
+        bytes_per_tile * ((n_tiles + groups - 1) / groups) <= kPostGemmTargetBWindowBytes) {
+      return groups;
+    }
+  }
+  return min_groups;
+}
+
+void PackPostGemmANeonRange(const uint16_t* input, uint16_t* packed, int64_t M, int64_t K, int64_t panel_begin,
+                            int64_t panel_end) {
+  const int64_t k_blocks = K / 4;
+  for (int64_t panel = panel_begin; panel < panel_end; ++panel) {
+    uint16_t* packed_panel = packed + panel * kPostGemmNeonMPanelRows * K;
+    for (int64_t k_block = 0; k_block < k_blocks; ++k_block) {
+      uint16_t* dst = packed_panel + k_block * kPostGemmNeonMPanelRows * 4;
+      for (int64_t row = 0; row < kPostGemmNeonMPanelRows; ++row) {
+        const int64_t source_row = panel * kPostGemmNeonMPanelRows + row;
+        uint16_t* dst_row = dst + row * 4;
+        if (source_row < M) {
+          std::memcpy(dst_row, input + source_row * K + k_block * 4, 4 * sizeof(uint16_t));
+        } else {
+          std::memset(dst_row, 0, 4 * sizeof(uint16_t));
+        }
+      }
+    }
+  }
+}
 
 bool EnvFalseLocal(const char* name) {
   const char* value = std::getenv(name);
@@ -192,7 +244,12 @@ bool PostGemmSharedQPoolEnabled(int64_t M) {
     return true;
   }
   const int num_threads = omp_get_max_threads();
-  const int64_t m_panels = (M + kPostGemmMPanelRows - 1) / kPostGemmMPanelRows;
+  const PostGemmBackend backend = SelectedPostGemmBackend();
+  const int64_t panel_rows = PostGemmMPanelRows(backend);
+  const int64_t m_panels = (M + panel_rows - 1) / panel_rows;
+  if (backend == PostGemmBackend::kSve) {
+    return m_panels > 0;
+  }
   return num_threads >= kPostGemmSharedQPoolMinThreads && m_panels >= num_threads;
 #else
   (void)M;
@@ -200,24 +257,25 @@ bool PostGemmSharedQPoolEnabled(int64_t M) {
 #endif
 }
 
-int RequestedPostGemmNGroups() {
+int RequestedPostGemmNGroups(PostGemmBackend backend, int num_threads) {
   const char* value = std::getenv("FUSED_CPP_POST_GEMM_N_GROUPS");
   if (value == nullptr || value[0] == '\0') {
+    if (backend == PostGemmBackend::kSve) {
+      return num_threads <= 48 ? std::max(kPostGemmDefaultNGroups, num_threads)
+                               : std::max(kPostGemmDefaultNGroups, num_threads / 2);
+    }
     return kPostGemmDefaultNGroups;
   }
   char* end = nullptr;
   const long parsed = std::strtol(value, &end, 10);
-  TORCH_CHECK(end != value && *end == '\0' && parsed >= kPostGemmDefaultNGroups &&
-                  parsed <= std::numeric_limits<int>::max(),
-              "FUSED_CPP_POST_GEMM_N_GROUPS must be an integer >= ", kPostGemmDefaultNGroups, ", got ", value);
+  TORCH_CHECK(
+      end != value && *end == '\0' && parsed >= kPostGemmDefaultNGroups && parsed <= std::numeric_limits<int>::max(),
+      "FUSED_CPP_POST_GEMM_N_GROUPS must be an integer >= ", kPostGemmDefaultNGroups, ", got ", value);
   return static_cast<int>(parsed);
 }
 
 PostGemmBackend SelectedPostGemmBackend() {
   const char* backend = std::getenv("FUSED_CPP_POST_GEMM_BACKEND");
-  if (backend == nullptr) {
-    backend = std::getenv("FUSED_CPP_ATTN_GEMM_BACKEND");
-  }
   if (backend != nullptr) {
     if (std::strcmp(backend, "sve") == 0 || std::strcmp(backend, "SVE") == 0) {
       TORCH_CHECK(::fused_cpp::deepseek_v4::attn_sve::available(),
@@ -225,17 +283,16 @@ PostGemmBackend SelectedPostGemmBackend() {
                   "support SVE BF16");
       return PostGemmBackend::kSve;
     }
-    if (std::strcmp(backend, "neon") == 0 || std::strcmp(backend, "NEON") == 0 ||
-        std::strcmp(backend, "default") == 0) {
+    if (std::strcmp(backend, "neon") == 0 || std::strcmp(backend, "NEON") == 0) {
       return PostGemmBackend::kNeon;
     }
-    TORCH_CHECK(std::strcmp(backend, "auto") == 0 || std::strcmp(backend, "AUTO") == 0,
-                "FUSED_CPP_POST_GEMM_BACKEND/FUSED_CPP_ATTN_GEMM_BACKEND must be "
-                "one of auto/neon/sve, got ",
-                backend);
+    TORCH_CHECK(
+        std::strcmp(backend, "auto") == 0 || std::strcmp(backend, "AUTO") == 0 || std::strcmp(backend, "default") == 0,
+        "FUSED_CPP_POST_GEMM_BACKEND must be "
+        "one of auto/default/neon/sve, got ",
+        backend);
   }
-  if (::fused_cpp::deepseek_v4::attn_sve::available() && std::getenv("FUSED_CPP_ATTN_GEMM_SVE") != nullptr &&
-      !EnvFalseLocal("FUSED_CPP_ATTN_GEMM_SVE")) {
+  if (::fused_cpp::deepseek_v4::attn_sve::available()) {
     return PostGemmBackend::kSve;
   }
   return PostGemmBackend::kNeon;
@@ -619,21 +676,67 @@ void DispatchPostGemmRange(const uint16_t* a_ptr, const uint16_t* b_ptr, at::Ten
                                                         static_cast<int>(row_count), static_cast<int>(K),
                                                         static_cast<int>(n_cols), static_cast<int>(Np));
     } else {
-      DispatchPostGemmBf16Neon(a_row, b_group, c_row, thread_scratch, static_cast<int>(row_count),
-                               static_cast<int>(K), static_cast<int>(n_cols), static_cast<int>(Np));
+      DispatchPostGemmBf16Neon(a_row, b_group, c_row, thread_scratch, static_cast<int>(row_count), static_cast<int>(K),
+                               static_cast<int>(n_cols), static_cast<int>(Np));
     }
     return;
   }
 
   float* c_row = output.data_ptr<float>() + row_start * Np + n_begin;
   if (backend == PostGemmBackend::kSve) {
-    ::fused_cpp::deepseek_v4::attn_sve::dispatch_f32(a_row, b_group, c_row, thread_scratch,
-                                                     static_cast<int>(row_count), static_cast<int>(K),
-                                                     static_cast<int>(n_cols), static_cast<int>(Np));
+    ::fused_cpp::deepseek_v4::attn_sve::dispatch_f32(a_row, b_group, c_row, thread_scratch, static_cast<int>(row_count),
+                                                     static_cast<int>(K), static_cast<int>(n_cols),
+                                                     static_cast<int>(Np));
   } else {
     DispatchPostGemmF32Neon(a_row, b_group, c_row, thread_scratch, static_cast<int>(row_count), static_cast<int>(K),
                             static_cast<int>(n_cols), static_cast<int>(Np));
   }
+}
+
+void DispatchPostGemmPackedSveRange(const uint16_t* packed_a, const uint16_t* b_ptr, at::Tensor& output,
+                                    at::ScalarType dtype, int64_t row_start, int64_t row_count, int64_t K, int64_t Np,
+                                    int64_t n_begin, int64_t n_cols) {
+  if (row_count <= 0 || n_cols <= 0) {
+    return;
+  }
+  const uint16_t* packed_panel = packed_a + row_start * K;
+  const uint16_t* b_group = b_ptr + n_begin * K;
+  if (dtype == at::kBFloat16) {
+    ::fused_cpp::deepseek_v4::attn_sve::dispatch_packed_bf16(
+        packed_panel, b_group, Bf16Data(output) + row_start * Np + n_begin, static_cast<int>(row_count),
+        static_cast<int>(K), static_cast<int>(n_cols), static_cast<int>(Np));
+    return;
+  }
+  ::fused_cpp::deepseek_v4::attn_sve::dispatch_packed_f32(
+      packed_panel, b_group, output.data_ptr<float>() + row_start * Np + n_begin, static_cast<int>(row_count),
+      static_cast<int>(K), static_cast<int>(n_cols), static_cast<int>(Np));
+}
+
+void DispatchPostGemmPackedRange(const uint16_t* packed_a, const uint16_t* b_ptr, at::Tensor& output,
+                                 PostGemmBackend backend, at::ScalarType dtype, int64_t row_start, int64_t row_count,
+                                 int64_t K, int64_t Np, int64_t n_begin, int64_t n_cols) {
+  if (backend == PostGemmBackend::kSve) {
+    DispatchPostGemmPackedSveRange(packed_a, b_ptr, output, dtype, row_start, row_count, K, Np, n_begin, n_cols);
+    return;
+  }
+  if (row_count <= 0 || n_cols <= 0) {
+    return;
+  }
+  gemm_params_t params;
+  params.m = static_cast<int>(row_count);
+  params.k = static_cast<int>(K);
+  params.n = static_cast<int>(n_cols);
+  params.lda = static_cast<int>(K);
+  params.ldb = static_cast<int>(K);
+  params.ldc = static_cast<int>(Np);
+  const uint16_t* panel_a = packed_a + row_start * K;
+  const uint16_t* panel_b = b_ptr + n_begin * K;
+  if (dtype == at::kBFloat16) {
+    deepseek_v4_attn_gemm_packed_bf16(panel_a, panel_b, Bf16Data(output) + row_start * Np + n_begin, nullptr, &params);
+    return;
+  }
+  deepseek_v4_attn_gemm_packed_f32(panel_a, panel_b, output.data_ptr<float>() + row_start * Np + n_begin, nullptr,
+                                   &params);
 }
 #endif
 
@@ -661,8 +764,8 @@ at::Tensor PostLinearPrepackedToDtypeWorkspace(const at::Tensor& input, const at
                                "PostLinearPrepackedToDtypeWorkspace packed_weight");
 
   const int64_t M = input.size(0);
-  at::Tensor output = at::empty({M, Np}, input.options().dtype(dtype));
   if (M == 0) {
+    at::Tensor output = at::empty({M, Np}, input.options().dtype(dtype));
     return N == Np ? output : output.narrow(1, 0, N).contiguous();
   }
 
@@ -685,18 +788,51 @@ at::Tensor PostLinearPrepackedToDtypeWorkspace(const at::Tensor& input, const at
   }
 #endif
   const bool m8_aligned = PostGemmM8AlignedEnabled();
-  const int64_t m_panels = (M + kPostGemmMPanelRows - 1) / kPostGemmMPanelRows;
-  const int64_t rows_per_thread = m8_aligned ? ((m_panels + num_threads - 1) / num_threads) * kPostGemmMPanelRows
-                                             : (M + num_threads - 1) / num_threads;
-  const int64_t scratch_stride = backend == PostGemmBackend::kSve
-                                     ? ::fused_cpp::deepseek_v4::attn_sve::a_scratch_elems(rows_per_thread, K)
-                                     : std::max<int64_t>(1, rows_per_thread * K);
-  at::Tensor scratch = workspace.empty({std::max<int64_t>(1, num_threads * scratch_stride)}, input.options());
-
+  const int64_t panel_rows = PostGemmMPanelRows(backend);
+  const int64_t m_panels = (M + panel_rows - 1) / panel_rows;
   at::Tensor input_contig = input.contiguous();
   const uint16_t* a_ptr = Bf16ConstData(input_contig);
   const uint16_t* b_ptr = Bf16ConstData(packed_weight);
-  uint16_t* scratch_ptr = Bf16Data(scratch);
+
+  if (!m8_aligned) {
+    at::Tensor output = at::empty({M, Np}, input.options().dtype(dtype));
+    const int64_t rows_per_thread = (M + num_threads - 1) / num_threads;
+    const int64_t scratch_stride = backend == PostGemmBackend::kSve
+                                       ? ::fused_cpp::deepseek_v4::attn_sve::a_scratch_elems(rows_per_thread, K)
+                                       : std::max<int64_t>(1, rows_per_thread * K);
+    at::Tensor scratch = workspace.empty({std::max<int64_t>(1, num_threads * scratch_stride)}, input.options());
+    uint16_t* scratch_ptr = Bf16Data(scratch);
+
+#ifdef _OPENMP
+#pragma omp parallel num_threads(num_threads)
+#endif
+    {
+#ifdef _OPENMP
+      const int64_t tid = omp_get_thread_num();
+#else
+      const int64_t tid = 0;
+#endif
+      const int64_t row_start = tid * rows_per_thread;
+      const int64_t row_count = row_start >= M ? 0 : std::min<int64_t>(rows_per_thread, M - row_start);
+      if (row_count > 0) {
+        DispatchPostGemmRange(a_ptr, b_ptr, output, scratch_ptr + tid * scratch_stride, backend, dtype, row_start,
+                              row_count, K, Np, 0, Np);
+      }
+    }
+    return N == Np ? output : output.narrow(1, 0, N).contiguous();
+  }
+
+  const int64_t output_rows = backend == PostGemmBackend::kNeon ? m_panels * panel_rows : M;
+  at::Tensor output = at::empty({output_rows, Np}, input.options().dtype(dtype));
+  const int64_t packed_a_size =
+      backend == PostGemmBackend::kSve ? ::fused_cpp::deepseek_v4::attn_sve::packed_a_elems(M, K) : output_rows * K;
+  at::Tensor packed_a = workspace.empty({packed_a_size}, input.options());
+  uint16_t* packed_a_ptr = Bf16Data(packed_a);
+  const int64_t n_tile = backend == PostGemmBackend::kSve ? ::fused_cpp::deepseek_v4::attn_sve::n_tile() : 8;
+  const int64_t n_tiles = Np / n_tile;
+  const int64_t n_groups = ChoosePostGemmWindowGroups(K, Np, n_tile, num_threads);
+  const int64_t m_splits = std::min<int64_t>(m_panels, std::max<int64_t>(1, (num_threads + n_groups - 1) / n_groups));
+  const int64_t task_count = n_groups * m_splits;
 
 #ifdef _OPENMP
 #pragma omp parallel num_threads(num_threads)
@@ -707,24 +843,42 @@ at::Tensor PostLinearPrepackedToDtypeWorkspace(const at::Tensor& input, const at
 #else
     const int64_t tid = 0;
 #endif
-    int64_t row_start;
-    int64_t row_count;
-    if (m8_aligned) {
-      const int64_t panel_begin = tid * m_panels / num_threads;
-      const int64_t panel_end = (tid + 1) * m_panels / num_threads;
-      row_start = panel_begin * kPostGemmMPanelRows;
-      row_count =
-          row_start >= M ? 0 : std::min<int64_t>((panel_end - panel_begin) * kPostGemmMPanelRows, M - row_start);
+    const int64_t pack_begin = tid * m_panels / num_threads;
+    const int64_t pack_end = (tid + 1) * m_panels / num_threads;
+    if (backend == PostGemmBackend::kSve) {
+      ::fused_cpp::deepseek_v4::attn_sve::pack_a_range(a_ptr, packed_a_ptr, static_cast<int>(M), static_cast<int>(K),
+                                                       static_cast<int>(pack_begin), static_cast<int>(pack_end));
     } else {
-      row_start = tid * rows_per_thread;
-      row_count = row_start >= M ? 0 : std::min<int64_t>(rows_per_thread, M - row_start);
+      PackPostGemmANeonRange(a_ptr, packed_a_ptr, M, K, pack_begin, pack_end);
     }
-    if (row_count > 0) {
-      uint16_t* thread_scratch = scratch_ptr + tid * scratch_stride;
-      DispatchPostGemmRange(a_ptr, b_ptr, output, thread_scratch, backend, dtype, row_start, row_count, K, Np, 0, Np);
+#ifdef _OPENMP
+#pragma omp barrier
+#pragma omp for schedule(static, 1)
+#endif
+    for (int64_t task = 0; task < task_count; ++task) {
+      const int64_t group = task / m_splits;
+      const int64_t split = task % m_splits;
+      const int64_t tile_begin = group * n_tiles / n_groups;
+      const int64_t tile_end = (group + 1) * n_tiles / n_groups;
+      const int64_t panel_begin = split * m_panels / m_splits;
+      const int64_t panel_end = (split + 1) * m_panels / m_splits;
+      const int64_t row_start = panel_begin * panel_rows;
+      const int64_t physical_row_count = (panel_end - panel_begin) * panel_rows;
+      if (backend == PostGemmBackend::kNeon) {
+        DispatchPostGemmPackedRange(packed_a_ptr, b_ptr, output, backend, dtype, row_start, physical_row_count, K, Np,
+                                    tile_begin * n_tile, (tile_end - tile_begin) * n_tile);
+      } else {
+        for (int64_t panel = panel_begin; panel < panel_end; ++panel) {
+          const int64_t panel_row_start = panel * panel_rows;
+          const int64_t panel_row_count = std::min<int64_t>(panel_rows, M - panel_row_start);
+          DispatchPostGemmPackedRange(packed_a_ptr, b_ptr, output, backend, dtype, panel_row_start, panel_row_count, K,
+                                      Np, tile_begin * n_tile, (tile_end - tile_begin) * n_tile);
+        }
+      }
     }
   }
-  return N == Np ? output : output.narrow(1, 0, N).contiguous();
+  at::Tensor result = output_rows == M ? output : output.narrow(0, 0, M);
+  return N == Np ? result : result.narrow(1, 0, N).contiguous();
 #endif
 }
 
@@ -758,6 +912,8 @@ std::pair<at::Tensor, at::Tensor> PostLinearPrepackedPairToDtypeWorkspace(
   }
 
   const PostGemmBackend backend = SelectedPostGemmBackend();
+  TORCH_CHECK(first_K == second_K, "shared Main Q/Indexer Q GEMMs must have the same K, got ", first_K, " and ",
+              second_K);
   if (backend == PostGemmBackend::kSve) {
     const int64_t n_tile = ::fused_cpp::deepseek_v4::attn_sve::n_tile();
     TORCH_CHECK(first_Np % n_tile == 0 && second_Np % n_tile == 0,
@@ -769,15 +925,15 @@ std::pair<at::Tensor, at::Tensor> PostLinearPrepackedPairToDtypeWorkspace(
   if (num_threads <= 0) {
     num_threads = 1;
   }
-  const int64_t m_panels = (M + kPostGemmMPanelRows - 1) / kPostGemmMPanelRows;
+  const int64_t panel_rows = PostGemmMPanelRows(backend);
+  const int64_t m_panels = (M + panel_rows - 1) / panel_rows;
   const int64_t scratch_stride =
-      backend == PostGemmBackend::kSve
-          ? std::max<int64_t>(
-                1,
-                std::max<int64_t>(::fused_cpp::deepseek_v4::attn_sve::a_scratch_elems(kPostGemmMPanelRows, first_K),
-                                  ::fused_cpp::deepseek_v4::attn_sve::a_scratch_elems(kPostGemmMPanelRows, second_K)))
-          : std::max<int64_t>(1, kPostGemmMPanelRows * std::max(first_K, second_K));
+      backend == PostGemmBackend::kSve ? 1 : std::max<int64_t>(1, panel_rows * std::max(first_K, second_K));
   at::Tensor scratch = workspace.empty({num_threads * scratch_stride}, input.options());
+  at::Tensor packed_a;
+  if (backend == PostGemmBackend::kSve) {
+    packed_a = workspace.empty({::fused_cpp::deepseek_v4::attn_sve::packed_a_elems(M, first_K)}, input.options());
+  }
   at::Tensor input_contig = input.contiguous();
 
   struct PostGemmPairWork {
@@ -797,6 +953,7 @@ std::pair<at::Tensor, at::Tensor> PostLinearPrepackedPairToDtypeWorkspace(
 
   const uint16_t* a_ptr = Bf16ConstData(input_contig);
   uint16_t* scratch_ptr = Bf16Data(scratch);
+  uint16_t* packed_a_ptr = packed_a.defined() ? Bf16Data(packed_a) : nullptr;
   std::array<PostGemmPairWork, 2> work = {
       PostGemmPairWork{Bf16ConstData(first_weight), &first_output, first_K, first_Np},
       PostGemmPairWork{Bf16ConstData(second_weight), &second_output, second_K, second_Np},
@@ -807,7 +964,7 @@ std::pair<at::Tensor, at::Tensor> PostLinearPrepackedPairToDtypeWorkspace(
   for (const PostGemmPairWork& item : work) {
     total_n_tiles += static_cast<int>(item.Np / n_tile);
   }
-  const int requested_groups = RequestedPostGemmNGroups();
+  const int requested_groups = RequestedPostGemmNGroups(backend, static_cast<int>(num_threads));
   const int target_groups = std::min(total_n_tiles, requested_groups);
   for (int assigned = static_cast<int>(work.size()); assigned < target_groups; ++assigned) {
     int best = -1;
@@ -840,17 +997,22 @@ std::pair<at::Tensor, at::Tensor> PostLinearPrepackedPairToDtypeWorkspace(
     for (int split = 0; split < splits; ++split) {
       const int64_t tile_begin = static_cast<int64_t>(split) * n_tiles / splits;
       const int64_t tile_end = static_cast<int64_t>(split + 1) * n_tiles / splits;
-      task_groups.push_back(
-          PostGemmTaskGroup{work_index, tile_begin * n_tile, (tile_end - tile_begin) * n_tile});
+      task_groups.push_back(PostGemmTaskGroup{work_index, tile_begin * n_tile, (tile_end - tile_begin) * n_tile});
     }
   }
-  std::unique_ptr<PostGemmPanelCursor[]> cursors =
-      std::make_unique<PostGemmPanelCursor[]>(task_groups.size());
+  std::unique_ptr<PostGemmPanelCursor[]> cursors = std::make_unique<PostGemmPanelCursor[]>(task_groups.size());
 
 #pragma omp parallel num_threads(num_threads)
   {
     const int64_t tid = omp_get_thread_num();
     uint16_t* thread_scratch = scratch_ptr + tid * scratch_stride;
+    if (backend == PostGemmBackend::kSve) {
+      const int panel_begin = static_cast<int>(tid * m_panels / num_threads);
+      const int panel_end = static_cast<int>((tid + 1) * m_panels / num_threads);
+      ::fused_cpp::deepseek_v4::attn_sve::pack_a_range(a_ptr, packed_a_ptr, static_cast<int>(M),
+                                                       static_cast<int>(first_K), panel_begin, panel_end);
+#pragma omp barrier
+    }
     const int group_count = static_cast<int>(task_groups.size());
     int preferred_group = static_cast<int>(tid % group_count);
     while (true) {
@@ -868,10 +1030,15 @@ std::pair<at::Tensor, at::Tensor> PostLinearPrepackedPairToDtypeWorkspace(
         const PostGemmTaskGroup& group = task_groups[static_cast<size_t>(group_index)];
         const int work_index = group.work_index;
         const PostGemmPairWork& item = work[static_cast<size_t>(work_index)];
-        const int64_t row_start = panel * kPostGemmMPanelRows;
-        const int64_t row_count = std::min<int64_t>(kPostGemmMPanelRows, M - row_start);
-        DispatchPostGemmRange(a_ptr, item.b_ptr, *item.output, thread_scratch, backend, dtype, row_start, row_count,
-                              item.K, item.Np, group.n_begin, group.n_cols);
+        const int64_t row_start = panel * panel_rows;
+        const int64_t row_count = std::min<int64_t>(panel_rows, M - row_start);
+        if (backend == PostGemmBackend::kSve) {
+          DispatchPostGemmPackedSveRange(packed_a_ptr, item.b_ptr, *item.output, dtype, row_start, row_count, item.K,
+                                         item.Np, group.n_begin, group.n_cols);
+        } else {
+          DispatchPostGemmRange(a_ptr, item.b_ptr, *item.output, thread_scratch, backend, dtype, row_start, row_count,
+                                item.K, item.Np, group.n_begin, group.n_cols);
+        }
         preferred_group = group_index;
         executed = true;
         break;
@@ -2628,6 +2795,10 @@ at::Tensor RunMainQAndSwaPrepacked(const at::Tensor& qr, const at::Tensor& kv, c
 }
 
 }  // namespace
+
+std::tuple<at::Tensor, int64_t, int64_t> deepseek_v4_post_gemm_prepare(at::Tensor weight) {
+  return deepseek_v4_gemm_prepare_weight_for_backend(weight, SelectedPostGemmBackend() == PostGemmBackend::kSve);
+}
 
 // Expected dtype contract for DeepSeek V4 post-GEMM stage on Arm CPU:
 // - qr: bf16

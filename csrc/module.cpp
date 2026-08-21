@@ -91,6 +91,7 @@ at::Tensor bf16_linear_to_dtype(at::Tensor input, at::Tensor weight, bool output
 // DeepSeek V4 attn_gemm_parallel_execute fused GEMM declarations
 std::tuple<at::Tensor, int64_t, int64_t>
 fused_wqa_wkv_compressor_kv_score_indexer_compressor_kv_score_indexer_weights_proj_fused_prepare(at::Tensor weight);
+std::tuple<at::Tensor, int64_t, int64_t> deepseek_v4_post_gemm_prepare(at::Tensor weight);
 at::Tensor fused_wqa_wkv_fused(at::Tensor hidden_states, at::Tensor fused_wqa_wkv_packed, int64_t fused_wqa_wkv_K,
                                int64_t fused_wqa_wkv_N);
 at::Tensor fused_wqa_wkv_fused_mt(at::Tensor hidden_states, at::Tensor fused_wqa_wkv_packed, int64_t fused_wqa_wkv_K,
@@ -345,6 +346,10 @@ PYBIND11_MODULE(_C, m) {
   m.def("fused_wqa_wkv_compressor_kv_score_indexer_compressor_kv_score_indexer_weights_proj_fused_prepare",
         &fused_wqa_wkv_compressor_kv_score_indexer_compressor_kv_score_indexer_weights_proj_fused_prepare,
         "Pack one bf16 [K, N] weight for the DeepSeek V4 fused attn GEMM path.", py::arg("weight"),
+        py::call_guard<py::gil_scoped_release>());
+
+  m.def("deepseek_v4_post_gemm_prepare", &deepseek_v4_post_gemm_prepare,
+        "Pack one bf16 [K, N] weight for the selected DeepSeek V4 post-GEMM backend.", py::arg("weight"),
         py::call_guard<py::gil_scoped_release>());
 
   m.def("fused_wqa_wkv_fused", &fused_wqa_wkv_fused, "DeepSeek V4 dense attention input GEMM path: fused_wqa_wkv bf16.",
