@@ -2005,6 +2005,52 @@ homogeneous 候选。实现复用固定 candidate-index 的 `ParallelFor`：每�
 hardware-bounded auto workers。m5 实测 2/4/8 workers 均未达到 10% 边界优化门槛，
 因此多线程只保留为诊断能力，不成为 production quick 默认。
 
+quick 与 full 的目标和预算明确分离。quick 只比较 homogeneous team shape，以
+isolated $T_{iso}$ 和 LPT lane load 给出有界延迟的较优方案；不运行 phase-DAG、
+mixed-width、temporal-order 或 dynamic-tail 搜索。full 枚举模型支持的全部 strict
+shape（包括 mixed-width 和 temporal order），再从有竞争力的 strict head 派生
+whole-expert tail pool 与合法 bounded tail repartition，并用 phase-DAG 评分。full
+因此寻找完整模型可行域内的最优或不可由校准误差区分的近优方案，而不是 quick 的
+别名；代价是显著更高的 cold planning latency，定位为离线分析或显式冷规划。
+
+对未显式传入 `shapes=` 的 analytical full search，homogeneous quick 胜者 $q^*$
+也作为一个 LPT strict candidate 加入完整候选集合。解析校准的 relative error 是
+共享公式、服务曲线和 residual 的系统误差，不是每 wave 独立采样噪声，因此其绝对
+不确定性为 $U_c=\epsilon\hat T_c$，不按 `profile_runs` 或 wave 数的平方根缩小。
+empirical full-call anchor 的采样误差仍沿用 profile-specific 估计。
+
+设重评分后的 quick 基线为 $(\hat T_q,U_q)$，候选 $c$ 为
+$(\hat T_c,U_c)$。full 的主目标明确为完整模型空间中的期望 makespan：
+
+$$
+c^*=\arg\min_{c\in\mathcal C_{full}}\hat T_c.
+$$
+
+不确定性和 pessimistic time 继续进入 ranking/诊断，但不再把统计不可区分的候选按
+active working set 替代主目标。该旧 tie policy 在当前 DSV4 上会把模型第一名换成
+实测明显更慢的小工作集 shape。若多个候选的 expected makespan 数值完全相同，才依次
+使用 pessimistic time、active working set 和 resource group 作确定性 tie-break。
+显式 `shapes=`、empirical profile、stage-specific planner 和 forced pool 保持原选择
+语义。Plan V2、cache key、runtime claim 和数值语义均不变。
+
+Production quick 进一步把生命周期分成初始化和逐请求规划。初始化对部署声明的
+$M_{max}$ 与合法宽度集合 $\mathcal T$ 生成并持久化
+
+$$
+\mathcal I=\{I(M,t)\mid 1\le M\le M_{max},\ t\in\mathcal T\}.
+$$
+
+逐请求 planner 只读取 $\mathcal I$、比较有限 homogeneous shapes、执行 LPT 并
+materialize Plan V2，不再调用解析 `predict_expert()`。Route histogram 被视为请求
+特有输入，production runtime 默认不缓存完整 route plan，也不构造 bucket signature；
+磁盘 cache 只保存机器/模型 identity 绑定的 `T_iso` 标量。这样
+`planner_initialization_ms` 与 `runtime_plan_ms` 具有互斥口径。
+
+部署诊断可设置 `FUSED_CPP_MOE_PLANNER_FIXED_THREADS=t_f`，将 routed-expert quick
+候选域退化为唯一 homogeneous shape
+$\left(t_f,\ldots,t_f\right)$，随后仍按 route 降序执行相同 LPT。`0`/未设置保留
+多宽度 C++ quick；该控制不进入 full 或 synthetic shared-expert 候选域。
+
 analytical DAG 的资源公式仍按上文 8 个固定 resource 顺序定义，但 production
 实现不再为每个 active phase、每个 resource 重复构造 Python demand/time dict。
 每个 phase/event 一次生成同序 demand/time tuple，contention loop 用固定下标读取，
@@ -5148,3 +5194,6 @@ planning 对未命中点执行原解析公式；首次调用结束后在文件�
 | 2026-08-16 | v1.25 | production planner 的 early-merge policy 固定为 `true`，删除 plan lowering 上逐 task completion-time DAG 与 routing-tail/burst gate；compute candidate、评分、剪枝、cache identity、Plan V2 三态 schema、native ABI 和手工 `true/false/null` runtime 控制均不变。m5 TP2、H4096/F1024/E256、2048-token TopK6 的 43 层真实 DSV4 路由上，旧 auto 在 43/43 层本来就解析为 on，on/off/auto 输出逐层完全一致，kernel 43 层总时间均约 1.24 s。双 rank 并发、每层 7 次 forced-miss 的 planner-overhead layer-median 从 23.565/23.549 ms 降至 1.424/1.401 ms；5 次同步全层 forced-miss planner+kernel 中位数从 2.973/2.968 s 降至 1.833/1.829 s，延迟降低 38.36%/38.38%。该 policy 是 m5 TP2 DSV4 的实测 operational default，不声称 merge service 已被 cost model 建模或跨 workload/机器最优。|
 | 2026-08-17 | v1.26 | 新增 9.41 的 synthetic shared expert quick plan：standalone/TP 下把一个同形 shared expert 作为全 token、单位权重的内部 expert；有限搜索 `1x shared_width + N x routed_width`，要求 routed width 不超过 shared width，routed 总工作不少于 shared 时 shared 最多占半个 rank，并删除多 routed task 的全核串行 endpoint。shared 固定 lane 0 首任务且该 lane 完成后复用；distinct-route 解析 cost 由 native C++ mixed-width LPT 搜索消费。isolated cost、stage window、uncertainty 与 Plan V2 lowering 全部复用现有解析模型，cache identity 增加 shared mode；routed-only 候选和 Plan V2 schema 不变。M5 V4-Pro TP4 BF16 proxy 的 balanced/uniform/hotspot 21-run 中位数分别提升 16.31%/19.93%/75.88%，最大 cold/hit planner 为 23.574/1.120 ms，最大绝对输出差为 5.96e-8，因而通过 2%/1%/25 ms/3 ms gate 并启用。 |
 | 2026-08-17 | v1.27 | SVE JIT W13 增加与标准 SiLU 分离 cache key 的 DeepSeek-V4 limit-10 clamped-SwiGLU epilogue；显式 `swiglu_limit=10.0` 才启用，0/None 保持旧指令流，static asm 和其他 limit 拒绝。该 variant 只增加逐 row-pair gate/up clamp，不改变 GEMM、packing、window、candidate、Plan V2 或解析资源公式；M5 H7168/F768 上 pure W13 的 M12/1T 与 M2040/16T 开销为 -0.00%/+0.12%，低于模型当前误差，因此首版复用同一 isolated cost。clamped V4-Pro TP4 balanced/uniform/hotspot 实测提升 16.99%/20.98%/78.59%，计划与 planner latency gate 不变。 |
+| 2026-08-21 | v1.29 | 明确拆分 analytical quick/full：quick 继续以 homogeneous isolated-LPT 在有界时间内求较优解；full 恢复全部 strict mixed-width/temporal-order 及派生 dynamic-tail 的 phase-DAG 搜索，并把 quick 胜者作为额外 strict baseline。修正解析系统误差被错误按 `sqrt(waves*profile_runs)` 缩小的问题，同时把 analytical full 主目标固定为 minimum expected makespan，不再在大范围不确定区间重叠时按 active working set 改选。Arm-codex NUMA3 80C DSV4 上，one-head safe-full cold/E2E 为 `584.9/37.033 ms`，但不具备 full 语义；完整 full 搜索 `142` strict+`327` dynamic，cold 约 `42 s`。模型第一名 `(16,16,16,16,8,8)` 实测 `34.418 ms`，比 quick `37.141 ms` 快 `7.91%`；前六名实际最好 `(16,16,8,8,8,8,8,8)` 为 `33.907 ms`，模型第一名 shortlist regret `1.51%`。旧 uncertainty-overlap/working-set 选择会改选 `(32,32,8,8)`，实测 `40.725 ms`，因此不符合 full 的最优目标。Plan V2 ABI、production quick runtime 和数值语义不变。 |
+| 2026-08-21 | v1.30 | 将既有 `NativeQuickPlanner` binding 拆为 `_C`/MoE-only `_moe_C` 共用的 module-local 注册，production 优先从 `_moe_C` 加载并保留 `_C`/Python fallback；候选、LPT tie-break 和 Plan V2 不变。新增显式 `MoePlannerRuntime.initialize_planner(max_routes)` 生成完整 dense `T_iso[M,T]`，并让 production runtime 默认关闭低命中率 route-plan cache。Arm-codex NUMA3 80C、captured DSV4、223 active/28 distinct M：`initialize_planner(2048)` 生成并落盘 16,384 个标量耗时 `3.452 s`；之后无 route cache 的 public `plan_for_dispatch()` 1000 次 median/P90 为 `4.584/4.612 ms`，其中内部 C++ quick 约 `1.20 ms`。直接 planner 对比中 Python quick 为 `7.25 ms`，C++ quick 为 `1.60 ms` 单次及 `1.056 ms` 1000 次 median；固定 8T greedy 为 `0.199 ms`。9-case operator-only 对比 fixed 8T：uniform/active8/active16 为 `-2.86/-15.54/-11.31%`，active32/active64 为 `+4.57/+0.65%`，active128/tiered/DSV4 的同计划差异为 `+0.17/+0.37/-0.13%`，bimodal 为 `+22.13%`。因此 C++ latency gate 通过，但 quick 质量不支配 fixed greedy；active8/16 的错误 `40T` 选择要求补宽 team isolated residual 后再宣称跨分布收益。 |
+| 2026-08-21 | v1.31 | 新增 supported runtime control `FUSED_CPP_MOE_PLANNER_FIXED_THREADS`：正整数值强制 routed-expert production planner 只生成对应 homogeneous LPT greedy shape，未设置或 `0` 保持多宽度 C++ quick。`8` 在 Arm-codex 80C 上对应 `10x8T`，用于与当前 quick 做线上回退和 A/B；Plan V2、full offline、synthetic shared expert 和默认行为不变。captured DSV4、dense `T_iso` disk hit、无 route cache 的 public `plan_for_dispatch()` 1000 次 median/P90 为 `2.698/2.708 ms`，内部 fixed planner 约 `0.257 ms`，shape=`10x8T`、backend=`cpp_fixed_quick`。 |

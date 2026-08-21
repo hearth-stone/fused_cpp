@@ -91,7 +91,77 @@ features:
       checkpoint-native DeepSeek-V4-Flash-INT8 TP2 integration completed a
       2048-token E2E request and generated a reusable 262 GiB cache, but its
       forced 8-token diagnostic text was not semantically valid; model-quality
-      validation therefore remains failed/open rather than adopted.
+      validation therefore remains failed/open rather than adopted. An
+      Arm-codex SVE256 NUMA3 follow-up used captured V4-Flash TP4 H4096/F512
+      routing and a locally calibrated strict 10x8T plan. Cache dequantization
+      at `(w13,w2)=(4,32)` tiles per thread reduced the median of three process
+      medians from 36.042 to 34.403 ms (1.0476x); full stripes measured 1.0402x.
+      This confirms a real gain but remains below the 5 percent adoption gate.
+      See results/arm_codex_80c_w8a16_cache_dequant_20260821.md.
+
+  - id: weights.w8a8_dynamic_activation_i8mm
+    part: weights
+    status: enabled
+    implementation:
+      - csrc/moe/arm/i8mm_w8a8/kernels.cpp
+      - src/fused_cpp/moe/bf16_tiled.py
+      - optimizations/fused_moe_sve/benchmarks/bench_w8a8_gemm.cpp
+      - optimizations/fused_moe_sve/benchmarks/bench_w8a8_i8mm.cpp
+      - optimizations/fused_moe_sve/benchmarks/bench_w8a8_plan_v2.py
+      - optimizations/fused_moe_sve/benchmarks/run_w8a8_gemm.sh
+      - optimizations/fused_moe_sve/benchmarks/run_w8a8_i8mm.sh
+    hypothesis: >-
+      Per-route symmetric dynamic A8 quantization plus per-output-channel W8
+      can use the existing SVE SMMLA kernel to recover enough compute and
+      weight-bandwidth headroom to pay for two activation quantization passes,
+      INT32-to-FP32 scaling, clamped SwiGLU, and the existing weighted merge.
+    depends_on: []
+    conflicts_with: []
+    correctness: >-
+      The standalone --check mode uses all-one packed weights and compares the
+      complete BF16-to-A8, W13, clamped SwiGLU, BF16 intermediate, second A8,
+      W2, weighted merge and BF16-store chain with a scalar reference. The
+      --check-kernels mode compares every final BF16 element from hybrid and
+      packed-M12 execution with the same random inputs and weights.
+    benchmark: >-
+      Arm-codex-internal NUMA3 CPUs 240-319, captured V4-Flash TP4
+      E256/T2048/TopK6/H4096/F512, strict 10x8T Plan V2, BF16 windows 4/32,
+      W8A8 windows 1/4, ordinary pages, 7 warmups and 31-51 runs.
+    owner: zhangxu
+    opened: 2026-08-21
+    decision_by: 2026-09-20
+    next_decision: >-
+      Run held-out formal-shape error and model-level quality with checkpoint
+      W8 weights before considering W8A8 for default or automatic dispatch.
+    adoption_gate: >-
+      At least 20 percent E2E latency reduction on captured and held-out V4
+      routes, no tested-shape regression above 1 percent, acceptable operator
+      error against matching BF16 weights, and model-quality validation.
+    result: >-
+      Arm-codex SVE256 captured TP4 measured BF16 at 36.29-36.44 ms. The first
+      hybrid W8A8 path measured 16.300 ms with full stripes and 15.317 ms after
+      window tuning. Updating the team-local GEMMs to packed-A M12/M8 measured
+      12.108-12.300 ms at `(t,w13,w2,R13,R2)=(8,1,4,8,8)`, a 1.245-1.265x
+      speedup over the tuned hybrid. The deterministic complete pipeline checks
+      for narrow M, M8 tails and M12-plus-tail had zero max-absolute error; a
+      random M918 hybrid/packed full-output comparison also had zero error.
+      A same-routing LPT width check found 4T slower than 8T by 3.79 percent at
+      full stripes and 2.07 percent at identical 64/32 KiB windows, rejecting
+      4T solely to obtain a 1 MiB W13 owner stripe.
+      Standalone BF16-I/O dynamic W8A8 GEMM reached 8.53/8.81 TFLOP/s for M918
+      W13/W2 at 80T and
+      9.67/10.06 TFLOP/s for M2048. A follow-up pure-INT8 comparison found that
+      the stable i8mm packed-A M12 dispatcher reaches 19.99/11.89 TOPS for M918
+      W13/W2 and 22.43/14.51 TOPS for M2048 at 80T, with exact INT32 agreement
+      against the fixed hybrid kernel. The formal run used independent random
+      packed weights, so it proves execution performance, not quantization
+      quality. On 2026-08-21 the same packed-M12/i8mm pipeline was promoted to
+      an explicit public Plan V2 implementation without changing BF16 default
+      dispatch. ARM target tests cover dynamic row quantization, per-channel
+      scaling, clamped SwiGLU, 2T N-split, M12 packing, weighted merge, and
+      repeatability; the M48/H64/F64 reference comparison measured max-absolute
+      error 2.861e-6. Model-level quality remains an adoption gate for any
+      automatic selection. See results/arm_codex_80c_w8a8_i8mm_20260821.md.
 
   - id: epilogue.indexed_polynomial_evaluation
     part: epilogue
@@ -1982,6 +2052,12 @@ variants:
       - compute.xbyak_exact_m
       - epilogue.fexpa_poly2_exp
     entrypoint: optimizations/fused_moe_sve/benchmarks/run_sve_fexpa_exp.sh
+    status: experimental
+
+  - id: sve_w8a8_dynamic_i8mm_lab
+    features:
+      - weights.w8a8_dynamic_activation_i8mm
+    entrypoint: optimizations/fused_moe_sve/benchmarks/bench_w8a8_plan_v2.py
     status: experimental
 
   - id: sve_m12_silu_reciprocal

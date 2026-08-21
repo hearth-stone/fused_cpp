@@ -8,7 +8,7 @@ The integration has three lifecycle phases:
 
 1. calibrate the machine or load an existing calibration profile;
 2. pack each MoE layer's weights once;
-3. call `fused_moe_tiled()` with BF16 or explicitly prepared W8A16 weights.
+3. call `fused_moe_tiled()` with BF16 or explicitly prepared W8A16/W8A8 weights.
 
 Calibration never runs at package import time or on the first MoE request.
 
@@ -29,6 +29,8 @@ from fused_cpp.moe import (
     prepare_fused_moe_bf16_tiled_weights,
     prepare_fused_moe_w8a16_tiled_weights,
     prepare_fused_moe_w8a16_tiled_quantized_weights,
+    prepare_fused_moe_w8a8_tiled_weights,
+    prepare_fused_moe_w8a8_tiled_quantized_weights,
     prepare_routed_shared_moe_bf16_tiled_weights,
     prepare_routed_shared_moe_w8a16_tiled_quantized_weights,
     set_default_moe_planner_runtime,
@@ -53,6 +55,13 @@ selected only by passing `PreparedW8A16TiledFusedMoEWeights` to
 `fused_moe_tiled()`. It requires a compatible installed planner, supports no
 W13/W2 bias, and has no native unplanned fallback. BF16 remains the default and
 supported fallback for integrations that do not explicitly prepare W8A16.
+
+Dynamic W8A8 is a formally selectable ARM SVE+i8mm implementation. Select it
+only through `PreparedW8A8TiledFusedMoEWeights`; it never replaces BF16
+implicitly. The initial supported domain is strict homogeneous fixed-team
+Plan V2, `activation="silu"`, `swiglu_limit=10.0`, H/F multiples of 16, and
+weighted TopK with local expert ids. It has no bias, EP remapping, shared
+expert, dynamic-tail, early-merge, or unplanned fallback support.
 
 Check backend availability before creating the optimized layer:
 
@@ -227,6 +236,20 @@ packed_weights = prepare_fused_moe_w8a16_tiled_weights(
 This is the implementation selection point. The planner does not quantize or
 replace BF16 weights at request time.
 
+To select dynamic W8A8 from BF16 source weights:
+
+```python
+from fused_cpp.moe import prepare_fused_moe_w8a8_tiled_weights
+
+packed_weights = prepare_fused_moe_w8a8_tiled_weights(w13_weight, w2_weight)
+```
+
+For checkpoint-native per-output-channel INT8 tensors, call
+`prepare_fused_moe_w8a8_tiled_quantized_weights(q13, s13, q2, s2)`. W13 uses
+`[E, 2F, H]` weights and `[E, 2F]` scales; W2 uses `[E, H, F]` weights and
+`[E, H]` scales. Activations remain BF16 at the API boundary and are quantized
+per route row inside the fused expert execution.
+
 For compressed-tensors checkpoints which already store symmetric channel-wise
 INT8 expert weights, use
 `prepare_fused_moe_w8a16_tiled_quantized_weights`. Pass raw INT8 W13/W2 and
@@ -274,6 +297,11 @@ For W8A16, `cache_dequant=False` selects register dequantization. Set
 stage windows; zero still means a full owner stripe and is not automatically
 an L2-sized window. W8A16 rejects bias arguments instead of silently ignoring
 them.
+
+For W8A8, pass `swiglu_limit=10.0`. The wrapper obtains a homogeneous strict
+plan from the installed runtime and disables early merge for this first
+implementation. An incompatible mixed-width, tail-pool, EP, or shared-expert
+plan fails explicitly.
 
 The wrapper counts routes, obtains or reuses a cached plan, and lowers a
 compatible call through `fused_moe_bf16_tiled_async_plan()`. Native execution

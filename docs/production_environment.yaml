@@ -134,6 +134,17 @@ entries:
     purpose: Disable an otherwise supported ISA backend for deployment fallback.
     default: Every compiled and runtime-supported backend is available.
 
+  - id: moe.planner_fixed_threads
+    names:
+      - FUSED_CPP_MOE_PLANNER_FIXED_THREADS
+    scope: runtime
+    class: supported
+    owner: moe
+    implementation:
+      - src/fused_cpp/moe/planner_runtime.py
+    purpose: Force the production routed-expert planner to use one homogeneous fixed-width LPT greedy plan.
+    default: Unset or 0 selects the calibrated C++ quick width search; a positive supported divisor such as 8 forces that team width.
+
   - id: moe.implementation_comparison
     names:
       - FUSED_CPP_MOE_AVX512_IMPL

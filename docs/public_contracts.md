@@ -99,6 +99,29 @@ The packed tensors are opaque implementation data: cross-version persistence,
 manual construction, and deserialization into a different ISA/VL are not public
 contracts unless a separate serialized format is introduced.
 
+`PreparedW8A8TiledFusedMoEWeights` is an additive public implementation-selecting
+weight type with the same planner-facing shape metadata and these packed fields:
+
+- `w13: tuple[Tensor, int, int, Tensor]`, containing packed INT8 weights,
+  logical K/N, and FP32 per-output-channel scales;
+- `w2` with the same structure;
+- `fused_silu=True`, `gemm_backend=1`, the runtime SVE N tile, and canonical
+  name `arm_sve_w8a8_i8mm`.
+
+It is constructed by `prepare_fused_moe_w8a8_tiled_weights` from BF16 weights
+or by `prepare_fused_moe_w8a8_tiled_quantized_weights` from checkpoint INT8
+weights and FP32 channel scales. It is selected explicitly by passing this
+type to `fused_moe_tiled`; BF16 remains the default implementation.
+
+The initial W8A8 execution contract is Linux AArch64 SVE+i8mm, BF16 input and
+output, per-row symmetric dynamic A8 quantization, per-output-channel W8,
+`activation="silu"`, `swiglu_limit=10.0`, FP32 weighted TopK merge, and a
+strict homogeneous fixed-team Plan V2. H and F must be multiples of 16.
+Biases, `skip_weighted`, expert-parallel id remapping, shared experts, dynamic
+resize/tail-pool plans, and early merge are rejected rather than silently
+lowered. There is no unplanned W8A8 fallback; callers must install a compatible
+planner or call `fused_moe_w8a8_tiled_async_plan` with an owned plan.
+
 Changing the in-memory packed layout is therefore an internal-stable migration:
 update packers, all consumers, backend metadata, correctness tests, and Lab
 adapters atomically. Do not reinterpret an existing prepared object silently.
@@ -152,11 +175,24 @@ the normal `fused_moe_bf16_tiled` entrypoint use a compatible Plan V2 and
 returns the previously installed runtime. Passing `None` restores the existing
 native dispatcher. Calls outside the runtime's calibrated CPU, expert-shape,
 backend, activation, or thread domain retain the existing dispatcher. The
-registry and planner cache are thread-safe; replacing a runtime does not cancel
-an invocation which already obtained the previous object. The initial runtime
+registry and planner are thread-safe; replacing a runtime does not cancel an
+invocation which already obtained the previous object. Runtime route plans are
+not cached because routing histograms are request-specific. The initial runtime
 uses a bounded homogeneous-team strict-plan search; mixed-width and dynamic-tail
 search remain offline behavior and are not part of this initial public runtime
 contract.
+
+`MoePlannerRuntime.initialize_planner(max_routes)` explicitly precomputes every
+`T_iso(M,T)` scalar for `1 <= M <= max_routes` and every calibrated thread
+width. This synchronous deployment step is initialization, not runtime
+planning, and may persist the scalar table through the configured cost cache.
+Normal dispatch does not implicitly run dense initialization.
+
+`FUSED_CPP_MOE_PLANNER_FIXED_THREADS=8` forces routed-expert production planning
+to use homogeneous 8-thread teams with the same descending-route LPT assignment.
+Unset or `0` retains calibrated C++ quick width search. Unsupported values fail
+explicitly; the control does not alter full offline or synthetic shared-expert
+planning.
 
 `MoePlannerRuntime` uses a versioned analytical-cost disk cache by default at
 `~/.fused_cpp/cache/moe_costs`; callers may pass `cost_cache_dir=` to relocate
@@ -170,6 +206,8 @@ analytical computation without changing planner results or operator behavior.
 same explicit synchronous quick calibration, constructs a shape-bound runtime,
 and installs it only after both steps succeed. After it returns, compatible
 calls to the normal fused-MoE entrypoint require no additional planner API.
+Deployments requiring disjoint initialization/runtime accounting call
+`runtime.initialize_planner(max_routes)` before serving.
 
 Bitwise equality between different backends is not promised unless a test or
 operator document explicitly requires it. Tolerance changes need a numerical
