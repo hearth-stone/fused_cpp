@@ -10,6 +10,7 @@ import fused_cpp.deepseek_v4_post_gemm_stage as post_gemm_stage_module
 from fused_cpp.deepseek_v4_post_gemm_stage import (
     CompressorState,
     PostGemmStageInputs,
+    PreparedDeepSeekV4PostGemmW8A8Weights,
     SWACacheState,
     SparseIndexerPrefillMetadata,
     _HAS_DEEPSEEK_V4_POST_GEMM_C128A_PREPACKED,
@@ -20,7 +21,9 @@ from fused_cpp.deepseek_v4_post_gemm_stage import (
     post_gemm_parallel_stage_cpp_prepacked,
     post_gemm_parallel_stage_torch_baseline,
     prepare_deepseek_v4_post_gemm_weights,
+    prepare_deepseek_v4_post_gemm_w8a8_weights,
 )
+from fused_cpp.deepseek_v4_w8a8 import _HAS_DEEPSEEK_V4_W8A8
 
 
 def _cos_sin_cache(max_pos: int, rope_dim: int) -> torch.Tensor:
@@ -255,6 +258,52 @@ def test_post_gemm_c128a_cpp_prepacked_matches_torch_baseline() -> None:
         ref_inputs.mla_compressor.kv_cache,
         "c128a mla kv_cache",
     )
+
+
+@pytest.mark.skipif(not _HAS_DEEPSEEK_V4_W8A8, reason="ARM SVE i8mm W8A8 is unavailable")
+def test_post_gemm_dense_w8a8_matches_torch_baseline() -> None:
+    ref_inputs = _make_dense_inputs(seed=31, num_tokens=13)
+    w8_inputs = _make_dense_inputs(seed=31, num_tokens=13)
+    weights = prepare_deepseek_v4_post_gemm_w8a8_weights(w8_inputs.main_wq_b_weight)
+    assert isinstance(weights, PreparedDeepSeekV4PostGemmW8A8Weights)
+
+    ref_q, _ = post_gemm_parallel_stage_torch_baseline(ref_inputs)
+    w8_q, w8_topk = post_gemm_parallel_stage_cpp_prepacked(w8_inputs, weights)
+    _assert_close(w8_q, ref_q, "dense W8A8 q")
+    assert w8_topk is None
+    _assert_close(w8_inputs.swa.kv_cache, ref_inputs.swa.kv_cache, "dense W8A8 swa kv_cache")
+
+
+@pytest.mark.skipif(not _HAS_DEEPSEEK_V4_W8A8, reason="ARM SVE i8mm W8A8 is unavailable")
+def test_post_gemm_c128a_w8a8_matches_torch_baseline() -> None:
+    ref_inputs = _make_c128a_inputs(seed=32)
+    w8_inputs = _make_c128a_inputs(seed=32)
+    weights = prepare_deepseek_v4_post_gemm_w8a8_weights(w8_inputs.main_wq_b_weight)
+    ref_q, _ = post_gemm_parallel_stage_torch_baseline(ref_inputs)
+    w8_q, w8_topk = post_gemm_parallel_stage_cpp_prepacked(w8_inputs, weights)
+    _assert_close(w8_q, ref_q, "c128a W8A8 q")
+    assert w8_topk is None
+    assert ref_inputs.mla_compressor is not None and w8_inputs.mla_compressor is not None
+    _assert_close(
+        w8_inputs.mla_compressor.kv_cache,
+        ref_inputs.mla_compressor.kv_cache,
+        "c128a W8A8 mla kv_cache",
+    )
+
+
+@pytest.mark.skipif(not _HAS_DEEPSEEK_V4_W8A8, reason="ARM SVE i8mm W8A8 is unavailable")
+def test_post_gemm_c4a_w8a8_runs_main_and_indexer_q() -> None:
+    ref_inputs = _make_inputs(seed=33, num_tokens=13)
+    w8_inputs = _make_inputs(seed=33, num_tokens=13)
+    weights = prepare_deepseek_v4_post_gemm_w8a8_weights(
+        w8_inputs.main_wq_b_weight,
+        w8_inputs.indexer_wq_b_weight,
+    )
+    ref_q, _ = post_gemm_parallel_stage_torch_baseline(ref_inputs)
+    w8_q, w8_topk = post_gemm_parallel_stage_cpp_prepacked(w8_inputs, weights)
+    _assert_close(w8_q, ref_q, "c4a W8A8 q")
+    assert w8_topk is not None and w8_topk.shape == (13, 2)
+    assert bool((w8_topk >= 0).any())
 
 
 @pytest.mark.skipif(
