@@ -111,6 +111,27 @@ def deepseek_v4_w8a8_linear(
     return out
 
 
+def deepseek_v4_w8a8_linear_pair(
+    input: torch.Tensor,
+    first: PreparedDeepSeekV4W8A8LinearWeight,
+    second: PreparedDeepSeekV4W8A8LinearWeight,
+    *,
+    num_threads: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run main/indexer Q projections with one shared activation quantization."""
+    if not isinstance(first, PreparedDeepSeekV4W8A8LinearWeight) or not isinstance(
+        second, PreparedDeepSeekV4W8A8LinearWeight
+    ):
+        raise TypeError("paired weights must be PreparedDeepSeekV4W8A8LinearWeight")
+    if input.device.type != "cpu" or input.dtype != torch.bfloat16 or input.dim() != 2:
+        raise TypeError("DeepSeek V4 paired W8A8 input must be CPU BF16 [M, K]")
+    if first.k != second.k or input.shape[1] != first.k:
+        raise ValueError("paired W8A8 weights and input must share K")
+    if int(num_threads) < 0:
+        raise ValueError("num_threads must be non-negative; zero selects the backend default")
+    return i8gemm.dynamic_scaled_mm_pair(input, first.packed, second.packed, nthreads=int(num_threads))
+
+
 def deepseek_v4_wo_b_w8a8(
     input: torch.Tensor,
     weight: PreparedDeepSeekV4W8A8LinearWeight,
@@ -126,6 +147,7 @@ __all__ = [
     "PreparedDeepSeekV4W8A8LinearWeight",
     "_HAS_DEEPSEEK_V4_W8A8",
     "deepseek_v4_w8a8_linear",
+    "deepseek_v4_w8a8_linear_pair",
     "deepseek_v4_wo_b_w8a8",
     "prepare_deepseek_v4_w8a8_linear_quantized_weight",
     "prepare_deepseek_v4_w8a8_linear_weight",

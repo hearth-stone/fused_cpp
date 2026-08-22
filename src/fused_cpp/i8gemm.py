@@ -27,6 +27,11 @@ try:
 except ImportError:
     _supports_i8gemm = False
 
+try:
+    from fused_cpp._C import i8gemm_dynamic_scaled_mm_pair as _i8gemm_dynamic_scaled_mm_pair  # type: ignore[import-untyped]
+except (ImportError, AttributeError):
+    _i8gemm_dynamic_scaled_mm_pair = None
+
 
 def _require_backend() -> None:
     if not _supports_i8gemm:
@@ -143,10 +148,52 @@ def mm(
     return dynamic_scaled_mm(x, packed, bias=bias, out_dtype=out_dtype, nthreads=nthreads)
 
 
+def dynamic_scaled_mm_pair(
+    x: torch.Tensor,
+    first: PreparedI8GEMMWeight,
+    second: PreparedI8GEMMWeight,
+    *,
+    nthreads: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run two BF16-output GEMMs while sharing dynamic per-row activation quantization."""
+    _require_backend()
+    if _i8gemm_dynamic_scaled_mm_pair is None:
+        raise RuntimeError("i8gemm dynamic pair kernel is unavailable in this build")
+    if not isinstance(first, PreparedI8GEMMWeight) or not isinstance(second, PreparedI8GEMMWeight):
+        raise TypeError("first and second must be PreparedI8GEMMWeight")
+    if x.device.type != "cpu" or x.dtype != torch.bfloat16 or x.dim() != 2:
+        raise TypeError("i8gemm.dynamic_scaled_mm_pair input must be CPU BF16 [M, K]")
+    if first.k != second.k or first.k_padded != second.k_padded or x.shape[1] != first.k:
+        raise ValueError("paired i8gemm weights and input must share K and Kp")
+    if int(nthreads) < 0:
+        raise ValueError("nthreads must be non-negative; zero selects the backend default")
+    x = x.contiguous()
+    first_output = torch.empty((x.shape[0], first.n), dtype=torch.bfloat16)
+    second_output = torch.empty((x.shape[0], second.n), dtype=torch.bfloat16)
+    _i8gemm_dynamic_scaled_mm_pair(
+        first_output,
+        second_output,
+        x,
+        first.packed_weight,
+        first.weight_scale,
+        first.k,
+        first.n,
+        first.k_padded,
+        first.n_padded,
+        second.packed_weight,
+        second.weight_scale,
+        second.n,
+        second.n_padded,
+        int(nthreads),
+    )
+    return first_output, second_output
+
+
 __all__ = [
     "PreparedI8GEMMWeight",
     "_supports_i8gemm",
     "dynamic_scaled_mm",
+    "dynamic_scaled_mm_pair",
     "mm",
     "prepare",
 ]

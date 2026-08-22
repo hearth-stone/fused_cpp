@@ -33,6 +33,7 @@ from fused_cpp.bf16_linear import (
 from fused_cpp.deepseek_v4_w8a8 import (
     PreparedDeepSeekV4W8A8LinearWeight,
     deepseek_v4_w8a8_linear,
+    deepseek_v4_w8a8_linear_pair,
     prepare_deepseek_v4_w8a8_linear_quantized_weight,
     prepare_deepseek_v4_w8a8_linear_weight,
 )
@@ -641,8 +642,17 @@ def _post_gemm_parallel_stage_w8a8(
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     if not _HAS_DEEPSEEK_V4_POST_GEMM_PROJECTED:
         raise RuntimeError("DeepSeek V4 projected post-GEMM C++ stage is unavailable")
-    main_q_linear = deepseek_v4_w8a8_linear(inputs.qr, weights.main_wq_b)
     variant = inputs.variant()
+    indexer_q_linear: torch.Tensor | None = None
+    if variant == "c4a" and not _indexer_select_all(inputs):
+        indexer_wq_b = _require(weights.indexer_wq_b, "prepared W8A8 indexer_wq_b")
+        main_q_linear, indexer_q_linear = deepseek_v4_w8a8_linear_pair(
+            inputs.qr,
+            weights.main_wq_b,
+            indexer_wq_b,
+        )
+    else:
+        main_q_linear = deepseek_v4_w8a8_linear(inputs.qr, weights.main_wq_b)
     if variant == "dense":
         assert _cpp_post_gemm_dense_projected is not None
         q = _cpp_post_gemm_dense_projected(
@@ -684,12 +694,8 @@ def _post_gemm_parallel_stage_w8a8(
         )
         return q, None
 
-    indexer_wq_b = _require(weights.indexer_wq_b, "prepared W8A8 indexer_wq_b")
-    indexer_q_linear = (
-        torch.empty((0,), dtype=torch.bfloat16)
-        if _indexer_select_all(inputs)
-        else deepseek_v4_w8a8_linear(inputs.qr, indexer_wq_b)
-    )
+    if indexer_q_linear is None:
+        indexer_q_linear = torch.empty((0,), dtype=torch.bfloat16)
     indexer_kv_score = _require(inputs.indexer_kv_score, "indexer_kv_score")
     indexer_weights = _require(inputs.indexer_weights, "indexer_weights")
     indexer_cos_sin_cache = _require(inputs.indexer_cos_sin_cache, "indexer_cos_sin_cache")

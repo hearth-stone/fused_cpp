@@ -81,6 +81,11 @@ std::tuple<at::Tensor, at::Tensor, int64_t, int64_t, int64_t, int64_t, std::stri
 void i8gemm_dynamic_scaled_mm(at::Tensor output, at::Tensor input, at::Tensor packed_weight, at::Tensor weight_scale,
                               c10::optional<at::Tensor> bias, int64_t K, int64_t N, int64_t Kp, int64_t Np,
                               int64_t nthreads);
+void i8gemm_dynamic_scaled_mm_pair(at::Tensor first_output, at::Tensor second_output, at::Tensor input,
+                                   at::Tensor first_packed_weight, at::Tensor first_weight_scale, int64_t K,
+                                   int64_t first_N, int64_t Kp, int64_t first_Np, at::Tensor second_packed_weight,
+                                   at::Tensor second_weight_scale, int64_t second_N, int64_t second_Np,
+                                   int64_t nthreads);
 
 // BF16 GEMM declarations - bf16_linear.cpp
 std::tuple<at::Tensor, int64_t, int64_t, int64_t> bf16_linear_prepare_weight(at::Tensor weight);
@@ -346,6 +351,13 @@ PYBIND11_MODULE(_C, m) {
         "Dynamic per-token scaled int8 GEMM with fp32/bf16 output.", py::arg("output"), py::arg("input"),
         py::arg("packed_weight"), py::arg("weight_scale"), py::arg("bias") = c10::nullopt, py::arg("K"), py::arg("N"),
         py::arg("Kp"), py::arg("Np"), py::arg("nthreads") = 0, py::call_guard<py::gil_scoped_release>());
+
+  m.def("i8gemm_dynamic_scaled_mm_pair", &i8gemm_dynamic_scaled_mm_pair,
+        "Run two dynamic W8A8 GEMMs while sharing one BF16-to-A8 quantization.", py::arg("first_output"),
+        py::arg("second_output"), py::arg("input"), py::arg("first_packed_weight"), py::arg("first_weight_scale"),
+        py::arg("K"), py::arg("first_N"), py::arg("Kp"), py::arg("first_Np"), py::arg("second_packed_weight"),
+        py::arg("second_weight_scale"), py::arg("second_N"), py::arg("second_Np"), py::arg("nthreads") = 0,
+        py::call_guard<py::gil_scoped_release>());
 
   m.def("bf16_linear_to_dtype", &bf16_linear_to_dtype,
         "BF16 [M,K] x [N,K]^T linear using refs/i8gemm bf16gemm. "

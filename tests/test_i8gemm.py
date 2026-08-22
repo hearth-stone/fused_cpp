@@ -76,6 +76,23 @@ def test_dynamic_scaled_mm_supports_batched_input_and_scalar_scale() -> None:
     torch.testing.assert_close(out, expected, atol=0, rtol=0)
 
 
+@pytest.mark.parametrize("out_dtype", [torch.float32, torch.bfloat16])
+def test_dynamic_scaled_mm_aligned_n_direct_scaled_store(out_dtype: torch.dtype) -> None:
+    torch.manual_seed(17)
+    m, k, n = 24, 64, 96
+    weight = torch.randint(-16, 17, (n, k), dtype=torch.int8)
+    weight_scale = torch.rand(n, dtype=torch.float32) * 0.01 + 0.001
+    bias = torch.randn(n, dtype=torch.bfloat16) * 0.01
+    x = torch.randn(m, k, dtype=torch.bfloat16) * 0.2
+
+    packed = i8gemm.prepare(weight, weight_scale)
+    assert packed.n == packed.n_padded
+    actual = i8gemm.dynamic_scaled_mm(x, packed, bias=bias, out_dtype=out_dtype, nthreads=2)
+    expected = _reference_dynamic_scaled_mm(x, weight, weight_scale, bias=bias, out_dtype=out_dtype)
+
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
 def test_prepare_rejects_bad_layout_dtype() -> None:
     weight = torch.randn(4, 8)
     scale = torch.ones(4)

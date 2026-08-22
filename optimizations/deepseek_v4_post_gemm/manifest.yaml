@@ -8,6 +8,47 @@ baseline:
   selection: FUSED_CPP_POST_GEMM_M8_ALIGNED=0
 
 features:
+  - id: compute.explicit_w8a8_q_projections
+    part: compute
+    status: enabled
+    implementation:
+      - csrc/i8gemm.cpp
+      - csrc/deepseek_v4_post_gemm_stage.cpp
+      - refs/i8gemm/lib/i8gemm_sve.S
+      - refs/i8gemm/lib/i8gemm_sve.c
+      - src/fused_cpp/deepseek_v4_w8a8.py
+      - src/fused_cpp/deepseek_v4_post_gemm_stage.py
+    hypothesis: >-
+      Per-row dynamic A8 quantization and per-output-channel W8 reduce weight
+      traffic. Applying row/channel scales in the i8mm accumulator registers
+      and directly storing BF16/FP32 removes the full FP32 intermediate, while
+      sharing activation quantization and packed A avoids duplicated conversion
+      work across Main-Q and Indexer-Q. M12/M8 panels from approximately 1 MiB
+      N windows share one worker pool. SVE activation quantization and all other
+      row-parallel work use the extension OpenMP runtime instead of switching
+      through the Torch intra-op pool. The same kernel supplies TP-local W8A8
+      WO_B.
+    depends_on: []
+    conflicts_with: []
+    selection: >-
+      Selected only by PreparedDeepSeekV4PostGemmW8A8Weights or
+      PreparedDeepSeekV4W8A8LinearWeight on Linux AArch64 SVE+i8mm. BF16
+      remains the default. The C4A select-all path skips the unused Indexer-Q
+      projection, and WO_B leaves the TP collective external.
+    correctness: >-
+      PYTHONPATH=src OMP_NUM_THREADS=8 OMP_DYNAMIC=FALSE
+      OMP_PROC_BIND=close OMP_PLACES=cores taskset -c 0-7
+      .venv/bin/python -m pytest -q tests/test_i8gemm.py
+      tests/test_deepseek_v4_w8a8.py tests/test_deepseek_v4_post_gemm_stage.py
+    benchmark: >-
+      PYTHONPATH=src:. OMP_NUM_THREADS=80 OMP_DYNAMIC=FALSE
+      OMP_PROC_BIND=FALSE
+      numactl --physcpubind=240-319 --membind=3
+      .venv/bin/python tests/bench_deepseek_v4_attention_w8a8.py
+      --m 2048 --threads 80 --warmup 5 --runs 15
+    result: >-
+      optimizations/deepseek_v4_post_gemm/results/arm_codex_internal_attention_w8a8_20260821.md
+
   - id: compute.sve_fcmla_rope
     part: compute
     status: experimental
@@ -401,6 +442,12 @@ features:
       optimizations/deepseek_v4_post_gemm/results/amazon_8c_indexer_native_batch_topk_20260813.md
 
 variants:
+  - id: post_gemm_explicit_w8a8_q
+    entrypoint: post_gemm_parallel_stage_cpp_prepacked
+    status: enabled
+    features:
+      - compute.explicit_w8a8_q_projections
+
   - id: post_gemm_sve_fcmla_rope_lab
     entrypoint: optimizations/deepseek_v4_post_gemm/benchmarks/run_sve_fcmla_rope.sh
     status: experimental

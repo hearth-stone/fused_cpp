@@ -338,6 +338,44 @@ by the extension and otherwise selects the materialized Torch reference.
 `backend="torch"` is the stable correctness fallback. Native packing layout,
 thread assignment, and fusion strategy are internal implementation details.
 
+## DeepSeek V4 Attention W8A8 Projections
+
+`PreparedDeepSeekV4W8A8LinearWeight`,
+`prepare_deepseek_v4_w8a8_linear_weight`, and
+`prepare_deepseek_v4_w8a8_linear_quantized_weight` provide an explicit W8A8
+selection for the TP-local `attn.wq_b`, `attn.indexer.wq_b`, and `attn.wo_b`
+linear projections. The BF16 prepare function quantizes `[N, K]` weights once;
+the quantized prepare function accepts checkpoint INT8 `[N, K]` weights and
+contiguous FP32 per-output-channel scales. Packed tensors are opaque and are
+valid only for their compatible build and ISA.
+
+Execution accepts contiguous CPU BF16 `[M, K]` input, applies symmetric
+per-row dynamic A8 quantization, accumulates the INT8 GEMM into INT32, converts
+and applies row/output-channel scales in the SVE microkernel registers, and
+stores contiguous CPU BF16 `[M, N]`. The generic linear API may instead request
+direct FP32 store. Logical-N tails use final-dtype padded scratch and crop; no
+SVE W8A8 path materializes a full FP32 accumulator.
+`deepseek_v4_w8a8_linear_pair` shares one activation quantization between the
+Main-Q and Indexer-Q projections. On SVE it also shares one packed-A buffer and
+one M12/M8 worker pool; approximately 1 MiB packed-B N windows from both
+projections participate in the same task graph. Dynamic activation
+quantization, logical-N copies, and fallback row work use the extension's
+OpenMP runtime rather than the Torch intra-op pool. `deepseek_v4_wo_b_w8a8`
+computes only the TP-local output projection; the caller remains responsible for the existing TP
+collective and any following operation.
+
+`PreparedDeepSeekV4PostGemmW8A8Weights` selects W8A8 Main-Q and optional
+Indexer-Q execution in `post_gemm_parallel_stage_cpp_prepacked`. Dense, C128A,
+and C4A postprocessing semantics remain unchanged. The C4A select-all path does
+not compute the unused Indexer-Q projection.
+
+This implementation is supported only by compatible Linux AArch64 SVE+i8mm
+builds. Selection is explicit through a prepared W8A8 type; BF16 packing and
+dispatch remain the default. The supported numerical contract is the result of
+the documented per-row/per-output-channel quantization, not equivalence to the
+BF16 projection. The native projected postprocessing entrypoints and the
+generic paired i8gemm binding are internal-stable implementation details.
+
 ## SDPA And Registered Implementations
 
 The public SDPA dispatcher functions and `VersionInfo` exported through
