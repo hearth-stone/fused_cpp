@@ -27,7 +27,8 @@
 #include "gemm_params.h"
 #include "../cxx17_compat.h"
 
-#if !defined(__aarch64__) || !defined(__ARM_FEATURE_SVE) || !defined(__ARM_FEATURE_BF16)
+#if !defined(__aarch64__) || !defined(__ARM_FEATURE_SVE) || \
+    (!defined(__ARM_FEATURE_BF16) && !defined(__ARM_FEATURE_BF16_VECTOR_ARITHMETIC))
 #error "unfused_pipeline requires AArch64 SVE BF16"
 #endif
 
