@@ -43,6 +43,8 @@ def test_suite_configs_render_for_every_machine(name: str) -> None:
             rendered = render_argv(entry["argv"], context)
             assert rendered
             assert not any("{" in argument or "}" in argument for argument in rendered)
+        build = next(entry for entry in suite["setup"] if entry["id"] == "build_extension")
+        assert "FUSED_CPP_BUILD_MOE_ONLY=1" in render_argv(build["argv"], context)
 
 
 def test_remote_command_quotes_paths_and_environment() -> None:

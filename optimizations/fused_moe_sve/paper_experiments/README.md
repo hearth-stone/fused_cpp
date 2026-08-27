@@ -19,6 +19,8 @@ Results are written under the ignored local directory
 commands, stdout/stderr, structured benchmark results, the source revision, and
 a summary. A unique mirror remains under the machine's configured
 `remote_results_root`; the runner does not remove it automatically.
+Suite builds set `FUSED_CPP_BUILD_MOE_ONLY=1`, so a paper run rebuilds the
+dedicated MoE extension without charging unrelated operators to setup time.
 
 ## Dry run
 

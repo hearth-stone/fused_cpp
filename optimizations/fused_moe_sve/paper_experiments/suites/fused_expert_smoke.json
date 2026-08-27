@@ -7,7 +7,7 @@
       "id": "build_extension",
       "use_affinity": false,
       "timeout_seconds": 1800,
-      "argv": ["env", "FUSED_CPP_SVE_VECTOR_BITS={sve_bits}", "MAX_JOBS={max_jobs}", "{python}", "setup.py", "build_ext", "--inplace", "--force"]
+      "argv": ["env", "FUSED_CPP_BUILD_MOE_ONLY=1", "FUSED_CPP_SVE_VECTOR_BITS={sve_bits}", "MAX_JOBS={max_jobs}", "{python}", "setup.py", "build_ext", "--inplace", "--force"]
     },
     {
       "id": "build_unfused_reference",
