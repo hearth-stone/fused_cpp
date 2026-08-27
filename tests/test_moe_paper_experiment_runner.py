@@ -26,6 +26,7 @@ def test_machine_configs_are_valid(name: str) -> None:
     assert machine["project_root"].startswith("/")
     assert machine["affinity_argv"]
     assert set(machine["environment"]["PYTHONPATH"].split(":")) >= {".", "src"}
+    assert machine["environment"]["OMP_PROC_BIND"] == "FALSE"
 
 
 @pytest.mark.parametrize("name", ["fused_expert_smoke.json", "fused_expert_pilot.json"])

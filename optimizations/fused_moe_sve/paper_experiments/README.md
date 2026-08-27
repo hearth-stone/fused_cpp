@@ -60,6 +60,10 @@ Copy one JSON file under `machines/` and set:
 - initialized submodules required by the committed build.
 - any ignored external source directories, each recorded with a content hash.
 
+Multi-core suites keep `OMP_NUM_THREADS=1` but set `OMP_PROC_BIND=FALSE`.
+Otherwise libgomp may narrow the importing process to one CPU before the native
+MoE worker pool reads its inherited affinity.
+
 Do not hide machine-specific shape changes in shell scripts. Add a named machine
 variable or a separate suite so the rendered command remains visible in each
 run's `command.json`.
