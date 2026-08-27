@@ -4,7 +4,20 @@ CPU Fused MLA (Multi-head Latent Attention) and MoE (Mixture of Experts) —
 a standalone, pip-installable PyTorch extension package.
 
 - **MLA**: fused forward pass (projection, RoPE, KV-cache write, attention, output projection)
-- **MoE**: full-token expert-parallel MoE forward pass
+- **MoE**: BF16 fused-expert kernels, Plan V2 async execution, explicit
+  machine calibration, and cost-guided scheduling; the pure-PyTorch full-token
+  EP implementation remains a reference path
+
+Current MoE entrypoints:
+
+- integration and supported runtime scope:
+  [`docs/vllm_bf16_tiled_moe_integration.md`](docs/vllm_bf16_tiled_moe_integration.md);
+- planner/cost-model index:
+  [`cpu_moe_schedule_optimization/README.md`](cpu_moe_schedule_optimization/README.md);
+- paper contribution and evidence map:
+  [`docs/moe_paper_readiness.md`](docs/moe_paper_readiness.md);
+- SVE feature lifecycle:
+  [`optimizations/fused_moe_sve/manifest.yaml`](optimizations/fused_moe_sve/manifest.yaml).
 
 ## Installation
 

@@ -2,6 +2,9 @@
 
 This file defines the versioned representation for CPU MoE scheduler output.
 
+Status date: 2026-08-26. Current paper claims and evidence boundaries are
+tracked in [`../../docs/moe_paper_readiness.md`](../../docs/moe_paper_readiness.md).
+
 The production async bridge is now **Plan V2**. Strict execution remains the
 default. The ARM native executor also accepts an explicit whole-expert
 `tail_pool` placement: aligned thread groups may claim pooled experts only
@@ -21,7 +24,11 @@ Plan -> AsyncTask DAG
 The same schema can be serialized as JSON by simulators and later translated into
 native C++ runtime structures.
 
-## Plan
+## Historical Plan Envelope
+
+The JSON below is the retired wave/offline envelope. It is retained only to
+interpret old result artifacts. New runtime integrations should start at
+[Async C++ Bridge: Plan V2](#async-c-bridge-plan-v2).
 
 ```json
 {
@@ -63,7 +70,7 @@ native C++ runtime structures.
   "async_bridge": null,
   "runtime_bridge": "wave_offsets",
   "metadata": {
-    "planner": "offline_simulator.py",
+    "planner": "historical/offline_simulator.py",
     "cost_metric": "median_ns",
     "planner_cost_source": "model",
     "planner_cost_model_ns": 35000
@@ -250,6 +257,8 @@ native `fused_moe_bf16_tiled_async_plan_v2` entrypoint:
   "task_stage_ids": [0, 0, 0],
   "task_resize_points": [0, 0, 0],
   "task_range_granularities": [0, 0, 0],
+  "task_w13_window_tiles": [0, 4, 4],
+  "task_w2_window_tiles": [0, 8, 8],
   "early_merge": null
 }
 ```
@@ -279,9 +288,15 @@ Rules:
   expert id. Repeated occurrences are consumed in task-array order; the final
   slice may be shorter, but the slices must cover the expert exactly. Resize
   mask `1` is retired and rejected.
-- W13 and W2 always execute one complete packed-N stage. There are no per-task
-  weight-range or byte-window fields. `task_threads[i]` partitions the full N
-  tile domain among workers, and W2 owner-scatter follows the same ownership.
+- W13 and W2 always cover one complete packed-N domain. There are no per-task
+  weight ranges, range counts, split flags, or byte-window fields.
+  `task_w13_window_tiles[i]` and `task_w2_window_tiles[i]` are optional
+  per-worker owner windows expressed in whole backend N tiles. Missing fields
+  materialize as zero; zero selects the full owner stripe
+  `ceil((N / n_tile) / task_threads[i])`. A positive value changes only the
+  serial visitation order of that same complete N domain. The native runtime
+  checks it against the stage tile count, and W2 direct/scatter ownership
+  follows every visited window.
 - `early_merge` is an optional plan-level tri-state. Missing or `null` retains
   the runtime team-load heuristic, `true` forces the ready-token path, and
   `false` waits for expert compute to finish before all workers merge uniform
@@ -329,13 +344,15 @@ Rules:
   Restore Git history commit `0b58091` and consult
   `optimizations/fused_moe_sve/results/amazon_192c_w2_boundary_elastic.md` to
   reproduce the experiment.
-- `IntervalPlanner` and `PlannedMoE` compare the original strict execution with
-  eligible whole-expert tail-pool and bounded terminal-repartition candidates
-  by default. The tail pool searches route buckets `1/2/4/8/12` at or below
-  `tail_pool_max_routes=12`, aligned `1/2/4T` pool widths, and
-  strict-competitive head shapes. Duplicate pooled sets are removed before it
-  lowers each online list schedule to a surrogate DAG and scores it with the
-  current contention model.
+- `IntervalPlanner.plan()` and `PlannedMoE(search_mode="full")` compare the
+  original strict execution with eligible whole-expert tail-pool and bounded
+  terminal-repartition candidates by default. The tail pool searches route
+  buckets `1/2/4/8/12` at or below `tail_pool_max_routes=12`, aligned `1/2/4T`
+  pool widths, and strict-competitive head shapes. Duplicate pooled sets are
+  removed before it lowers each online list schedule to a surrogate DAG and
+  scores it with the current contention model. Deployment
+  `MoePlannerRuntime` uses `search_mode="quick"` and therefore emits strict
+  homogeneous plans; it does not search these dynamic candidates.
 - A bounded terminal repartition is still a strict bridge. It is legal only
   when the selected head has exactly two second-wave tasks and both have no
   successor. On a 96-worker planner domain it searches `24/32/48T`, places the
@@ -367,18 +384,42 @@ Rules:
   reference implementation, while `FUSED_CPP_MOE_PLANNER_THREADS` controls
   native candidate workers. Cache hits rebuild the same bridge without rerunning
   either cold solver.
-- A plan has no W13/W2 split or window option. `PlannedMoE` accepts one full-N
-  calibration model and searches the existing core shape/tail strategy space.
-  For stage `(K,N)`, backend tile `nu`, and selected task width `t`, the maximum
-  owner stripe is derived, not searched:
+- A plan has no W13/W2 weight split or byte-window option. `PlannedMoE` accepts
+  one full-N calibration model and searches the existing core shape/tail
+  strategy space. After a task width is selected, the deterministic stage-window
+  policy may populate the two optional tile-window arrays. The window is not a
+  planner search dimension. For stage `(K,N)`, backend tile `nu`, selected width
+  `t`, and resolved per-worker tile window `omega`, the full-stripe endpoint and
+  active owner footprint are:
 
   ```text
-  owner_tiles = ceil((N / nu) / t)
-  owner_bytes = owner_tiles * K * nu * 2
+  full_stripe_tiles = ceil((N / nu) / t)
+  resolved_omega = omega > 0 ? omega : full_stripe_tiles
+  owner_bytes = resolved_omega * K * nu * 2
   ```
 
-  Tail-pool tasks use their selected pool width. The plan cache therefore needs
-  no stage-policy identity, range-profile variant, or `(1,1)/(2,1)` key.
+  Tail-pool tasks use their selected pool width. Window policy/calibration
+  identity is part of model compatibility; legacy range-profile variants and
+  `(1,1)/(2,1)` split identities are not.
+
+## Current Quick And Full Planner Modes
+
+The schema is shared by several planners, but their decision spaces differ:
+
+- `plan_quick`: homogeneous shapes only, isolated-cost LPT lane assignment,
+  strict execution, and native C++ candidate selection when available;
+- `plan_quick_fixed`: one supported homogeneous width and one LPT assignment;
+- `plan_quick_with_shared`: a bounded mixed-width family containing one
+  synthetic all-token shared expert;
+- `plan`: the full modeled space of strict mixed-width shapes, temporal lane
+  orders, derived tail-pool candidates, and bounded terminal repartition.
+
+Analytical full search rescored the quick winner as an explicit baseline and
+selects minimum expected modeled makespan. Analytical model error is systematic
+for this selection; it is not reduced by the number of experts or profile runs.
+The full path is currently for offline analysis. `MoePlannerRuntime` uses quick,
+keeps route-plan caching disabled, and may precompute the dense `T_iso[M,T]`
+grid before serving.
 
 ## Planner Kinds
 

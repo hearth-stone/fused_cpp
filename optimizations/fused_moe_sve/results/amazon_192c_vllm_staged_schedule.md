@@ -1,5 +1,12 @@
 # vLLM-style staged MoE scheduling on Amazon C5 192 cores
 
+> **Historical result series.** These July 2026 tables span several retired
+> profiles and pre-current execution geometries. They remain mechanism evidence
+> for staged queues, static teams, and tail-pool execution, but are not a
+> current-binary upstream-vLLM comparison or current planner-regret table. Rerun
+> requirements and admissible paper claims are tracked in
+> [`../../../docs/moe_paper_readiness.md`](../../../docs/moe_paper_readiness.md).
+
 Date: 2026-07-17
 
 ## Method

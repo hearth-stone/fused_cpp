@@ -1,4 +1,10 @@
-> **⚠ DEPRECATED — 本文档中的 wave 调度内容后续不考虑，仅作历史参考。** 见 [DEPRECATED_WAVE.md](DEPRECATED_WAVE.md)。async interval-DAG + cost model 保留并继续。
+> **ARCHIVED (2026-07-03).** This is the original wave-era design and is not a
+> current planner or paper specification. Wave scheduling, the AUTO selector,
+> and its roadmap are retired; see [DEPRECATED_WAVE.md](DEPRECATED_WAVE.md).
+> Current semantics live in [MATHEMATICAL_MODEL.md](MATHEMATICAL_MODEL.md),
+> [planners/plan_schema.md](planners/plan_schema.md), and the paper-facing
+> [readiness map](../docs/moe_paper_readiness.md). Do not cite numerical or
+> algorithmic claims from this file as current results.
 
 # CPU MoE Schedule Optimization Design
 

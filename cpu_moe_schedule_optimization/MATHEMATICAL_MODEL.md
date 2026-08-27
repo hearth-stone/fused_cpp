@@ -1,17 +1,23 @@
 # CPU MoE 调度数学模型
 
-> Runtime integration note (2026-08-14): machine calibration remains an
+> Runtime integration note (updated 2026-08-21): machine calibration remains an
 > explicit deployment action. An installed `MoePlannerRuntime` binds one
-> analytical model and cached `PlannedMoE` to the calibration's ordered CPU
-> rank. The normal BF16 tiled entrypoint lowers compatible standalone/TP SVE
-> fused-SiLU calls to Plan V2; calls outside that domain preserve the original
-> dispatcher. The first production version uses a bounded homogeneous-team LPT
-> search described below; the full analytical candidate space remains available
-> offline. The serialized Plan V2 schema is unchanged.
+> analytical model and `PlannedMoE` quick planner to the calibration's ordered
+> CPU rank. Compatible standalone/TP SVE fused-SiLU calls lower to Plan V2;
+> calls outside that domain preserve the original dispatcher. Production quick
+> search evaluates homogeneous-team isolated-LPT candidates in native C++ when
+> available, disables route-plan caching by default, and can precompute a dense
+> versioned `T_iso[M,T]` disk cache. `FUSED_CPP_MOE_PLANNER_FIXED_THREADS`
+> selects one homogeneous fixed-width LPT fallback. Full analytical search
+> evaluates mixed-width strict, temporal-order, tail-pool, and bounded-tail
+> candidates with the phase DAG, but is an offline performance-oracle path: the
+> current 80-core DSV4 run evaluated 469 candidates and took about 42 seconds
+> cold. Plan V2 schema and numerical execution semantics are unchanged.
 
 > 状态：调度问题定义的 source of truth。
 >
-> 最后更新：2026-08-16。
+> 最后更新：2026-08-21。论文 claim、证据和未闭合 gate 的统一索引见
+> [`../docs/moe_paper_readiness.md`](../docs/moe_paper_readiness.md)。
 >
 > 修改 planner 的决策变量、目标函数、硬约束、性能响应、线程宽度集合、调度语义、
 > rank 耦合方式或剪枝策略时，必须同步更新本文档及末尾变更记录。

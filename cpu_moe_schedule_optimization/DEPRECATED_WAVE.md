@@ -2,6 +2,11 @@
 
 **状态(2026-07-04):基于 wave 的离线模拟器与调度算法已删除(阶段 1)。**
 
+当前 async interval-DAG、quick/full planner 与论文证据入口分别见
+[`MATHEMATICAL_MODEL.md`](MATHEMATICAL_MODEL.md)、
+[`planners/plan_schema.md`](planners/plan_schema.md) 和
+[`../docs/moe_paper_readiness.md`](../docs/moe_paper_readiness.md)。
+
 Wave 调度整体废弃,不再演进,也不作为 planner 的目标形态。相关离线代码已从工作树移除;
 需要历史参考请查 git 历史(删除提交见 `git log -- cpu_moe_schedule_optimization/planners/offline_simulator.py`)。
 

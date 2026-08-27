@@ -3,13 +3,46 @@
 ## Status
 
 `analytic_model.py` is the planner-compatible analytical backend for the SVE
-BF16 fused expert. It is opt-in while machine calibrations are validated. The
-schema-v2 empirical model remains the production default and the holdout oracle;
-it is not an input to analytical prediction.
+BF16 fused expert. It is explicitly installable through `MoePlannerRuntime`,
+but remains opt-in while machine calibrations are validated. The schema-v2
+empirical model remains the default backend for full empirical planning and the
+holdout oracle; it is not an input to analytical prediction.
 
 The model targets one NUMA-local rank, cold distinct-expert weights, N-split
 teams, and the current packed-A Xbyak/static SVE kernel mapping. Communication,
 router cost, and final TopK merge remain outside this model.
+
+Paper-facing claims, current evidence, and open gates are indexed in
+[`../../docs/moe_paper_readiness.md`](../../docs/moe_paper_readiness.md).
+
+## Current Planner Modes
+
+As of 2026-08-21, analytical planning has two intentionally different modes:
+
+- **Quick** is the deployed bounded path. It evaluates homogeneous team shapes,
+  computes one exact analytical `T_iso(M,t)` per distinct route count and width,
+  assigns experts by deterministic LPT, and selects the minimum isolated lane
+  makespan. Candidate selection runs in native C++ when available. The emitted
+  Plan V2 is strict; quick does not search phase-DAG contention, temporal order,
+  dynamic tail pools, or bounded tail repartition.
+- **Full** is the offline performance-oracle path. It evaluates mixed-width
+  strict shapes, temporal lane orders, derived tail-pool candidates, and bounded
+  terminal repartition with the analytical phase-DAG simulator. It includes the
+  quick winner as a baseline and selects minimum expected modeled makespan.
+
+`MoePlannerRuntime` disables route-plan caching by default because exact route
+histograms have low reuse. It can precompute every supported `T_iso(M,t)` scalar
+through a declared maximum with `initialize_planner(max_routes)` and persist
+that versioned dense cost grid. `FUSED_CPP_MOE_PLANNER_FIXED_THREADS` switches
+the runtime to one supported homogeneous width for a controlled fallback; it
+does not change full offline search.
+
+The latest 80-core captured-DSV4 experiment evaluated 142 strict plus 327
+dynamic full candidates. Full cold search took about 42 seconds. Its selected
+plan measured 34.418 ms versus quick at 37.141 ms; the best measured candidate
+among the top six was 33.907 ms, for 1.51% selected shortlist regret. These
+numbers are preliminary changelog evidence, not a completed cross-workload or
+cross-machine validation.
 
 ## Separation Of Concerns
 
@@ -627,10 +660,13 @@ training and records a larger uncertainty than the full calibration.
 
 The production runtime currently bounds cold planning to homogeneous team
 shapes. It ranks those shapes with analytical isolated expert times and LPT
-lane loads, emits a strict Plan V2, and caches the selected shape. It does not
-run mixed-width phase-DAG, temporal-order, or dynamic-tail candidate search on
-the request path. Use the full `PlannedMoE` search for offline analysis; native
-analytical scoring and production candidate expansion remain follow-up work.
+lane loads, emits a strict Plan V2, and uses native C++ assignment/selection
+when the extension is available. It does not cache the route plan by default;
+only the identity-bound `T_iso(M,t)` scalars are cached. It does not run
+mixed-width phase-DAG, temporal-order, or dynamic-tail candidate search on the
+request path. Use `PlannedMoE(..., search_mode="full")` for offline analysis;
+reducing full-search cost and improving production candidate quality remain
+follow-up work.
 
 The effective fraction and three retention values should come from an
 independent packed-B repeated-scan probe. They must not be fitted from the
@@ -654,7 +690,7 @@ model = AnalyticMoeCostModel(
     degree=4,
     concurrent_ranks=2,
 )
-planner = PlannedMoE(model, num_cores=96)
+planner = PlannedMoE(model, num_cores=96, search_mode="full")
 plan = planner.plan_spec_for(route_counts)
 ```
 
@@ -750,6 +786,13 @@ gates still fail. Commands, anchors, and per-route decisions are recorded in
 ## Known Limits
 
 - SVE BF16 N-split only; a different ISA or M/MN split needs a new kernel mapper.
+- Production quick search ignores concurrent phase interactions when ranking
+  homogeneous shapes. On the 80-core nine-case check it improved long/short
+  bimodal by 22.13% versus fixed 8T, but regressed active-set 8/16 by
+  15.54%/11.31% after selecting an over-wide 40T team. It is therefore a
+  supported bounded planner, not a demonstrated universally superior policy.
+- Full analytical search is not online: the current captured-DSV4 run evaluates
+  469 strict/dynamic candidates and takes about 42 seconds cold.
 - Analytical stage-window v6 is shadow-only. Its 5% selection gate covers the
   192-core TP4 M=`72,216,384`, T=`4,16` transition domain, not arbitrary routes,
   widths, shapes, machines, or mixed-workload planner decisions.

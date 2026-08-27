@@ -6,7 +6,12 @@ Schema v2 is the active format for SVE fused-MoE scheduling profiles. A profile
 is valid only for the exact implementation, sharded expert shape, and NUMA/rank
 execution context recorded in the file. The only active SVE geometry is
 `full_n_team_stripes`: W13 and W2 each traverse their complete packed N domain
-once, and team width partitions N tiles among workers.
+and team width partitions N tiles among workers. Plan V2 may further divide one
+worker's complete owner stripe into serial tile windows. That is an execution
+order within the same full-N geometry, not a weight-range/profile variant.
+
+Paper-facing use of empirical profiles and current rerun requirements are
+indexed in [`../../docs/moe_paper_readiness.md`](../../docs/moe_paper_readiness.md).
 
 Historical schema-v2 files may record `w13_split`, `w13_split_chunks`,
 `weight_window_bytes`, `w13_window_ranges`, or `w2_window_ranges`. They are not
@@ -144,8 +149,10 @@ Catalog queries for the production JIT path must specify both fields; a mixed
 catalog intentionally rejects an implementation-unspecified ambiguous query.
 Static and JIT profiles remain distinct calibration domains.
 
-`ProfileCatalog` has no range/window variant API. It rejects non-full-N records
-and two records with the same domain identity.
+`ProfileCatalog` has no legacy weight-range, range-count, or byte-window variant
+API. It rejects non-full-N records and two records with the same domain identity.
+Optional Plan V2 `task_w13_window_tiles/task_w2_window_tiles` remain legal
+because every value covers the same complete N domain.
 
 The TP/EP evaluator's `--sve-implementation auto` lookup first requests one
 compatible `jit/xbyak_exact_m` calibration. It falls back to
@@ -306,8 +313,9 @@ Defaults bind rank 0 to CPUs 0-31/NUMA0 and rank 1 to CPUs 32-63/NUMA1.
 
 Generate one canonical full-N file per calibration domain. Historical
 range/window sweeps remain research artifacts only; they are not valid runtime
-profiles. Runtime profiles and the planner carry no weight-range or byte-window
-control.
+profiles. Runtime profiles and the planner carry no weight-range, range-count,
+or byte-window control. Per-task tile windows are Plan V2 execution metadata and
+must not be reconstructed from those retired fields.
 
 ## Legacy schema v1
 
@@ -470,7 +478,7 @@ Example:
 }
 ```
 
-Use this table with:
+Historical, non-runnable invocation (the consumer has been deleted):
 
 ```bash
 python -B cpu_moe_schedule_optimization/benchmarks/synthetic_sweep.py \

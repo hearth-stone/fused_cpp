@@ -5,6 +5,9 @@
 > model. All four files below were removed from the active catalog and remain
 > available only in Git history. Current validation uses one full-N calibration
 > per domain, enumerates core shapes, and records width-derived owner stripes.
+> It is historical mechanism evidence, not a current paper table. See
+> [`../docs/moe_paper_readiness.md`](../docs/moe_paper_readiness.md) for current
+> claim and rerun requirements.
 
 ## Current v0.89 validation
 

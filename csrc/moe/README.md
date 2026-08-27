@@ -4,6 +4,9 @@ The BF16 fused-expert operator is built as the independent Python extension
 `fused_cpp._moe_C`. This keeps its runtime ISA dispatch separate from the
 compile-time target used by the rest of `fused_cpp._C`.
 
+The paper-facing contribution scope, current evidence, and open validation
+gates are indexed in [`../../docs/moe_paper_readiness.md`](../../docs/moe_paper_readiness.md).
+
 ## Ownership
 
 ```text
@@ -114,18 +117,24 @@ adds a discrete allowed-width envelope plus reserved NUMA, stage, range, and
 resize metadata.
 
 Strict execution remains the default. The planner emits one allowed width per
-task, whole-expert stages, full-expert ranges, no resize points, and fixed
-placement. `AsyncMoEPlanV2` validates the complete bridge, and
+task, whole-expert stages, full-expert ranges unless an explicit bounded
+route-slice candidate is selected, no resize points, and fixed placement. Each
+task may carry optional W13/W2 per-worker owner windows in whole N tiles; zero
+selects the full stripe. These windows reorder the complete N domain and are
+not legacy weight ranges or byte windows. `AsyncMoEPlanV2` validates the
+complete bridge, and
 `fused_moe_bf16_tiled_async_plan` calls the native Plan V2 executor. It does
 not change a running task's thread count. Legacy fixed-width dictionaries can
 be upgraded with `upgrade_legacy_async_plan`.
 
 The ARM executor also supports explicit `tail_pool` placement. Aligned groups
 finish every fixed task covering their cores, then claim whole pooled experts
-from a shared queue. `PlannedMoE.plan_spec_for(..., tail_pool_threads=T,
-tail_pool_max_routes=12)` forces this bridge for experiments; the cost model
-does not select it automatically yet. Plan V2 execution ignores the legacy
-short-pool environment override.
+from a shared queue. `PlannedMoE(search_mode="full")` compares eligible
+tail-pool and bounded-terminal candidates with strict plans by default;
+`tail_pool_threads=T` forces one pool width for controlled experiments. The
+deployment `MoePlannerRuntime` uses the bounded `quick` search and emits strict
+homogeneous plans, so it does not automatically select tail-pool execution.
+Plan V2 execution ignores the legacy short-pool environment override.
 
 The schema and mathematical execution semantics are documented in
 `cpu_moe_schedule_optimization/planners/plan_schema.md` and

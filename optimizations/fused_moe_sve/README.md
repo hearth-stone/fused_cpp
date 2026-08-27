@@ -4,6 +4,13 @@ This directory contains SVE fused-MoE features and standalone experiments. The
 weighted route-merge U1 kernel and async ready-token merge are enabled by
 default for their supported SVE paths; neither changes the fused-MoE API.
 
+The paper-facing scope, admissible evidence, and open gates are maintained in
+[`../../docs/moe_paper_readiness.md`](../../docs/moe_paper_readiness.md). The
+manifest in this directory remains the source of truth for whether an
+individual feature is enabled, experimental, diagnostic, or retired. A dated
+result report is valid only for its recorded source, binary, profile, machine,
+and execution geometry.
+
 Production W13 and W2 each cover one complete packed-N stage. Legacy boolean
 split, range-count, and byte-window controls are gone. Their replacement is one
 explicit per-task owner window in Plan V2: `(threads, window_tiles)` uniquely
@@ -20,6 +27,27 @@ accepted `row_begin=0`, so it was an N-split compatibility layer rather than a
 mixed M-by-N implementation. The actual mixed-MN experiment remains isolated
 in `bench_mn_split.cpp`; restore Git `8e9fcbd` only when reproducing the retired
 production adapter.
+
+## Paper-facing current status
+
+The initial paper should use the BF16 SVE path with FP32 direct-route storage
+and FP32 weighted accumulation. W8A16, W8A8, BF16 route storage, experimental
+SiLU approximations, and synthetic shared-expert scheduling have separate
+quality or generalization gates and should not be mixed into the primary BF16
+claim.
+
+The strongest kernel evidence currently consists of the explicit-unfused
+control, exact-M tail specialization, adaptive gather-pack, FP32 W2 direct
+route store, and tile-window ablations. The July 2026 nine-workload
+vLLM-style comparison is mechanism evidence tied to retired profiles and older
+geometry; rerun it on the frozen paper binary before using it as a headline
+table.
+
+The deployment planner is `MoePlannerRuntime` quick search: homogeneous
+isolated-LPT shapes and strict Plan V2, with an optional fixed-width fallback.
+The broader mixed-width/contention-aware full planner is offline. Kernel result
+reports must state which planner mode and fixed-width control were used, and
+must include planner latency when claiming end-to-end improvement.
 
 ## Adaptive M-by-K gather-pack
 

@@ -48,9 +48,47 @@ The legacy weight-split removal is complete across the production stack:
 2. Repeat unseen routes, widths outside `4T/16T`, mixed distributions, and
    complete planner validation. The current 192-core full-Cartesian result
    closes only its declared transition domain.
-3. Fix cross-rank lifetime switching for the remaining EP absolute-time error.
+3. Validate the implemented companion-profile rank-lifetime switch on held-out
+   EP workloads, and isolate the remaining uniform-96 full-call residual.
 4. Add measured gather/pack, route merge, communication, and distributed TP/EP
    terms after the compute model passes its gates.
+
+Paper-facing contribution scope, reusable evidence, prohibited claims, and the
+required main-table matrix are maintained in
+[`../docs/moe_paper_readiness.md`](../docs/moe_paper_readiness.md). The
+checklist below remains the implementation ledger; paper closure uses the
+additional P0 gates here.
+
+## 0. Paper-critical closure (2026-08-26)
+
+- [ ] Freeze one paper commit and regenerate every headline profile/result from
+  that source and extension. Do not combine the July 2026 nine-workload table
+  with the August quick/full implementation.
+- [ ] Rerun the controlled nine-case catalog with the default FP32 direct-route
+  path on at least two Arm machines. If BF16 route storage appears in any main
+  table, first close its real model-level quality gate.
+- [ ] Compare the fused executor with the current upstream Arm CPU MoE path and
+  the explicit same-GEMM unfused control. Record identical shapes, routing,
+  affinity, page policy, warmups/runs, absolute latency, and numerical checks.
+- [ ] Replace reconstructed-only routing evidence with complete multi-layer
+  TopK traces, including at least one prefill and one decode-oriented corpus.
+- [ ] Decide the cost-model paper claim. Either refresh the empirical
+  phase-aware model as the primary model, or make the analytical backend pass
+  isolated MAPE <=10%, contention P90 <=15%, and maximum measured regret <=5%
+  on the declared two-machine domain.
+- [ ] Close the production quick-planner quality regression. On the current
+  80-core nine-case check, quick regresses active-set 8/16 by 15.54%/11.31%
+  against fixed 8T after selecting 40T; add a model correction or a measured
+  conservative gate before claiming quick dominates fixed-width planning.
+- [ ] Define full search explicitly as either an offline oracle/autotuner or a
+  bounded runtime algorithm. The current 142-strict + 327-dynamic analytical
+  DSV4 search takes about 42 seconds cold.
+- [ ] Publish a current quick/full result report with raw compact tables. The
+  August 21 result currently exists only in `MATHEMATICAL_MODEL.md` changelog.
+- [ ] Include `T_plan + T_execute` in every planner comparison. Report the
+  public runtime path, not only the internal C++ assignment kernel.
+- [ ] Add a real multi-layer vLLM measurement and measured TP/EP communication
+  before making layer- or model-level distributed performance claims.
 
 ## 1. Schema-v2 profiling
 
@@ -506,16 +544,29 @@ claims must include both long-route throughput and short-route latency.
   generation for the actual DeepSeek routing semantics. Prioritize decode and
   short-route latency; the prefill logits tensor is too small to assume a useful
   gain without measurement.
-- [ ] After direct FP32 route store is validated, optionally multiply each W2 row
-  by its route weight in the W2 epilogue so the final merge becomes an ordered
-  sum. Do not combine weighting with BF16 store until the additional rounding
-  point has a separate model-level accuracy result.
+- [ ] Low priority: after direct FP32 route store is validated, optionally run a
+  bounded experiment that multiplies each W2 row by its route weight in the W2
+  epilogue so the final merge becomes an ordered sum. This does not remove the
+  `route_out` write/read traffic and changes FP32 rounding relative to the
+  current merge FMA, so reject it if W2 regresses by more than 1% or local E2E
+  improves by less than 2%. Do not combine weighting with BF16 store until the
+  additional rounding point has a separate model-level accuracy result.
 - [ ] Evaluate a coarse ready-chunk communication pipeline that continues shared
   expert work and remaining route compute while earlier merged chunks are in
   flight. Include rank synchronization and collective launch overhead.
 
 ### Explicitly deprioritized fusion boundaries
 
+- Do not prioritize full W2-to-merge fusion. The expert-major W2 schedule
+  finishes one token's top-k routes in different teams and at different times;
+  preserving ordered FP32 accumulation would require contended atomics, a
+  rendezvous buffer, or a token-major schedule that sacrifices expert-weight
+  locality. Reconsider only if a real multi-layer, cold-weight workload shows
+  that weighted merge plus `route_out` traffic contributes at least 10-15% of
+  local MoE E2E time after ready-token overlap. Prefer reusable `route_out`
+  workspace, the existing ordered merge, and folding post-merge operations
+  before changing this execution boundary. (`top_k=1, skip_weighted=true`
+  already bypasses merge.)
 - Do not pursue full W13-to-W2 fusion by default. Avoiding the BF16 `[M,F]`
   intermediate either recomputes W13 for W2 H tiles or repeatedly spills FP32 W2
   partial outputs; require a concrete loop ordering and traffic proof before an

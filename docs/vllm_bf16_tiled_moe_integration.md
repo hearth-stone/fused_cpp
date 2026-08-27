@@ -12,6 +12,9 @@ The integration has three lifecycle phases:
 
 Calibration never runs at package import time or on the first MoE request.
 
+The paper-facing contribution scope, current measurements, and validation gates
+are indexed in [`moe_paper_readiness.md`](moe_paper_readiness.md).
+
 ## Supported Scope
 
 The public APIs used by an integration are exported from both `fused_cpp.moe`
@@ -44,6 +47,11 @@ The calibrated production runtime currently supports:
 - `activation="silu"`;
 - standalone and tensor-parallel execution;
 - one process-local runtime bound to a fixed CPU set and expert shape.
+
+Its routed-expert planner is the bounded `quick` path: homogeneous team shapes,
+isolated-cost LPT assignment, strict Plan V2, and native C++ candidate selection
+when available. The broader mixed-width/phase-DAG `full` planner is an offline
+analysis path and is not used by this integration.
 
 Expert-parallel execution is not yet owned by `MoePlannerRuntime`. Calls that
 do not satisfy the runtime domain use the existing native dispatcher instead.
@@ -92,8 +100,10 @@ Optional biases use `[E, 2 * F]` for W13 and `[E, H]` for W2. A supplied
 weight tensor.
 
 `skip_weighted=True` is valid only for `K == 1`. The default weighted path
-supports larger TopK values and performs the route accumulation in FP32 after
-loading the BF16 route results.
+supports larger TopK values, stores route results in FP32, and performs route
+accumulation in FP32. `FUSED_CPP_MOE_W2_BF16_ROUTE=1` selects an experimental
+BF16 route buffer while retaining FP32 accumulation; it is not the default and
+still requires model-level quality validation before use in a primary result.
 
 ## Build And Startup Check
 
@@ -175,6 +185,18 @@ runtime = MoePlannerRuntime(
 previous_runtime = set_default_moe_planner_runtime(runtime)
 ```
 
+Before serving, optionally materialize the complete planner cost grid for the
+largest supported route count:
+
+```python
+initialization = runtime.initialize_planner(max_routes=2048)
+print(initialization)
+```
+
+This computes every supported `T_iso(M,T)` scalar through `max_routes` and
+persists it in the versioned cost cache. It does not precompute or persist final
+route plans.
+
 The registry is process-global and thread-safe. Save `previous_runtime` when a
 test or temporary component needs to restore the prior process state:
 
@@ -201,6 +223,16 @@ the cache identity. Matching values are loaded at runtime construction;
 missing points are computed normally and atomically written back. Corrupt,
 stale, or unwritable files are ignored rather than failing inference. Final
 plans are not persisted because they still depend on the current routing input.
+Route-plan caching is disabled in `MoePlannerRuntime`; every compatible call
+reruns the bounded native quick assignment/selection over the current route
+histogram. This avoids a high-cardinality shape cache whose hit rate is low
+across layers and requests.
+
+For a controlled deployment fallback, set
+`FUSED_CPP_MOE_PLANNER_FIXED_THREADS=<T>` before constructing the runtime. A
+positive supported divisor such as 8 emits one homogeneous fixed-width LPT
+plan; unset or `0` retains multi-width quick search. This changes planner policy
+and should be recorded in every benchmark or deployment diagnostic.
 
 ## Weight Preparation
 
@@ -303,10 +335,12 @@ plan from the installed runtime and disables early merge for this first
 implementation. An incompatible mixed-width, tail-pool, EP, or shared-expert
 plan fails explicitly.
 
-The wrapper counts routes, obtains or reuses a cached plan, and lowers a
-compatible call through `fused_moe_bf16_tiled_async_plan()`. Native execution
-runs outside the planner cache lock. Callers should not invoke the Plan V2 API
-directly unless they own plan construction and validation.
+The wrapper counts routes, runs the bounded quick planner, and lowers a
+compatible call through `fused_moe_bf16_tiled_async_plan()`. Analytical
+`T_iso` scalars may come from the memory/disk cache, but the final route plan is
+rebuilt. Native execution runs outside the planner lock. Callers should not
+invoke the Plan V2 API directly unless they own plan construction and
+validation.
 
 `global_num_experts=-1` is the recommended value when `topk_ids` already use
 the packed local expert index space. For the current TP runtime, an explicit
@@ -430,8 +464,9 @@ if runtime is not None:
 ```
 
 `last_plan` is a snapshot intended for diagnostics and benchmarking. It
-contains the latest planner decision and cache information; callers should not
-treat its internal keys as a serialized public plan schema.
+contains the latest planner decision, planner backend, fixed-width policy,
+initialization state, and cost-cache information; callers should not treat its
+internal keys as a serialized public plan schema.
 
 The `cost_disk_cache` diagnostic reports `status`, `path`, `loaded_entries`,
 `total_entries`, and any non-fatal `error`. Expected states are `miss`, `hit`,
@@ -450,11 +485,13 @@ Use this order in each CPU rank:
 2. Import `fused_cpp` and verify `arm_sve_bf16` availability.
 3. Load a saved calibration into `MoePlannerRuntime`, or explicitly run quick
    calibration during machine provisioning.
-4. Install the runtime with `set_default_moe_planner_runtime()`.
-5. Load model weights and prepack each MoE layer with `fuse_silu=True`.
-6. Warm up representative route shapes outside the measured/request path so
-   the planner cache contains common distributions.
-7. Start serving and call only `fused_moe_bf16_tiled()` from layer forwards.
+4. Call `runtime.initialize_planner(max_routes)` when deployment policy permits
+   the one-time dense `T_iso` construction cost.
+5. Install the runtime with `set_default_moe_planner_runtime()`.
+6. Load model weights and prepack each MoE layer with `fuse_silu=True`.
+7. Warm the native kernels and buffers outside the measured/request path; do
+   not assume route-plan cache hits.
+8. Start serving and call only `fused_moe_bf16_tiled()` from layer forwards.
 
 The calibration is machine/placement-specific, while packed weights are
 model-layer/ISA-specific. Their lifecycles should therefore remain separate.

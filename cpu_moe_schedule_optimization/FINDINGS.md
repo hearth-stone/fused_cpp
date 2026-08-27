@@ -1,4 +1,10 @@
-> **⚠ DEPRECATED — 本文档中的 wave 调度内容后续不考虑，仅作历史参考。** 见 [DEPRECATED_WAVE.md](DEPRECATED_WAVE.md)。async interval-DAG + cost model 保留并继续。
+> **ARCHIVED (2026-07-03).** This file evaluates the retired wave-planner
+> family and old kernel-bound profiles. Its equivalence and regret tables are
+> historical provenance, not evidence for the current async interval-DAG,
+> Plan V2, quick/full planners, or current SVE kernel. See
+> [DEPRECATED_WAVE.md](DEPRECATED_WAVE.md),
+> [MATHEMATICAL_MODEL.md](MATHEMATICAL_MODEL.md), and the paper-facing
+> [readiness map](../docs/moe_paper_readiness.md).
 
 # CPU MoE Planner — C++ 实现与评测结论
 

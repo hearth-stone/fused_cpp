@@ -1,5 +1,13 @@
 # FusedMoEImpl API 参数说明
 
+> **Reference-path document.** `FusedMoEImpl` 是纯 PyTorch 参考实现，不是当前
+> SVE BF16 fused kernel、`MoePlannerRuntime` 或 Plan V2 production path。本文
+> 用于 API/数值对照，不提供当前 kernel、cost model 或 planner 的性能证据。
+> production 集成见
+> [`../../../docs/vllm_bf16_tiled_moe_integration.md`](../../../docs/vllm_bf16_tiled_moe_integration.md)，
+> 论文状态见
+> [`../../../docs/moe_paper_readiness.md`](../../../docs/moe_paper_readiness.md)。
+
 ## 概述
 
 `FusedMoEImpl` 是一个纯 PyTorch 实现的 Mixture of Experts（MoE）模块，支持 **Full-Token Expert Parallelism（全量 Token EP）** 优化。每个 EP 节点持有完整的 token batch，仅计算其本地专家子集，从而消除 token dispatch 通信开销。
