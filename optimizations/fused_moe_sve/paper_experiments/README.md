@@ -49,6 +49,11 @@ samples and is still exploratory. Paper tables should use a separately declared
 suite with at least 31 samples and the workload matrix required by
 `docs/moe_paper_readiness.md`.
 
+The explicit fused/unfused reference stays in its validated EP2
+`H=4096,F=2048` numerical domain. The exact-M and direct-route cases use the
+paper's TP4-oriented `H=4096,F=512` path. These are mechanism experiments, not
+one same-shape cumulative ablation.
+
 ## Adding a machine
 
 Copy one JSON file under `machines/` and set:

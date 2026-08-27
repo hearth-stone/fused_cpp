@@ -32,7 +32,7 @@
       "id": "explicit_fusion_smoke",
       "timeout_seconds": 1200,
       "result_prefix": "RESULT_JSON ",
-      "argv": ["optimizations/fused_moe_sve/benchmarks/bench_unfused_pipeline", "--experts", "{unfused_experts}", "--m", "192", "--h", "4096", "--f", "512", "--threads-per-expert", "{unfused_threads_per_expert}", "--w13-ranges", "1", "--copies", "2", "--cpu-start", "{cpu_start}", "--warmup", "2", "--iters", "5"]
+      "argv": ["optimizations/fused_moe_sve/benchmarks/bench_unfused_pipeline", "--experts", "{unfused_experts}", "--m", "192", "--h", "4096", "--f", "2048", "--threads-per-expert", "{unfused_threads_per_expert}", "--w13-ranges", "1", "--copies", "2", "--cpu-start", "{cpu_start}", "--warmup", "2", "--iters", "5"]
     },
     {
       "id": "direct_route_smoke",
