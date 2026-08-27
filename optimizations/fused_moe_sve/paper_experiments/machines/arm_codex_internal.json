@@ -25,5 +25,6 @@
     "unfused_experts": 4,
     "unfused_threads_per_expert": 20
   },
-  "snapshot_submodules": ["3rdparty/xbyak_aarch64"]
+  "snapshot_submodules": ["3rdparty/xbyak_aarch64"],
+  "snapshot_external_paths": ["refs/i8gemm/lib"]
 }

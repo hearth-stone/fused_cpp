@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import shlex
@@ -55,6 +56,7 @@ def validate_machine(payload: dict[str, Any]) -> dict[str, Any]:
     _require_string(payload.get("python"), field="machine.python")
     _require_string_list(payload.get("affinity_argv", []), field="machine.affinity_argv")
     _require_string_list(payload.get("snapshot_submodules", []), field="machine.snapshot_submodules")
+    _require_string_list(payload.get("snapshot_external_paths", []), field="machine.snapshot_external_paths")
     for field in ("environment", "variables"):
         values = payload.get(field, {})
         if not isinstance(values, dict) or any(not isinstance(key, str) for key in values):
@@ -150,7 +152,19 @@ def _submodule_commit(revision: str, path: str) -> str:
     return fields[2]
 
 
-def _populate_submodule(snapshot_root: Path, revision: str, relative_path: str) -> None:
+def _tree_digest(root: Path) -> str:
+    digest = hashlib.sha256()
+    files = sorted(path for path in root.rglob("*") if path.is_file())
+    for path in files:
+        digest.update(path.relative_to(root).as_posix().encode("utf-8"))
+        digest.update(b"\0")
+        with path.open("rb") as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _populate_submodule(snapshot_root: Path, revision: str, relative_path: str) -> dict[str, str]:
     source = REPO_ROOT / relative_path
     if not source.is_dir():
         raise RuntimeError(f"required submodule is not initialized: {relative_path}")
@@ -169,9 +183,25 @@ def _populate_submodule(snapshot_root: Path, revision: str, relative_path: str) 
     )
     if copied.returncode != 0:
         raise RuntimeError(f"failed to copy submodule {relative_path}: {copied.stderr.strip()}")
+    return {"path": relative_path, "commit": expected, "sha256": _tree_digest(destination)}
 
 
-def sync_snapshot(machine: dict[str, Any], revision: str) -> None:
+def _populate_external_path(snapshot_root: Path, relative_path: str) -> dict[str, str]:
+    source = (REPO_ROOT / relative_path).resolve()
+    if not source.is_dir():
+        raise RuntimeError(f"required external source directory is unavailable: {relative_path}")
+    destination = snapshot_root / relative_path
+    destination.mkdir(parents=True, exist_ok=True)
+    copied = _run(
+        ["rsync", "-a", "--copy-links", "--exclude=.git/", f"{source}/", f"{destination}/"],
+        timeout_seconds=300,
+    )
+    if copied.returncode != 0:
+        raise RuntimeError(f"failed to copy external source {relative_path}: {copied.stderr.strip()}")
+    return {"path": relative_path, "sha256": _tree_digest(destination)}
+
+
+def sync_snapshot(machine: dict[str, Any], revision: str) -> dict[str, Any]:
     with tempfile.TemporaryDirectory(prefix="moe-paper-snapshot-") as directory:
         temporary = Path(directory)
         archive = temporary / "source.tar"
@@ -187,8 +217,13 @@ def sync_snapshot(machine: dict[str, Any], revision: str) -> None:
         extracted = _run(["tar", "-xf", str(archive), "-C", str(snapshot)], timeout_seconds=120)
         if extracted.returncode != 0:
             raise RuntimeError(f"snapshot extraction failed: {extracted.stderr.strip()}")
-        for submodule in machine.get("snapshot_submodules", []):
-            _populate_submodule(snapshot, revision, submodule)
+        submodules = [
+            _populate_submodule(snapshot, revision, submodule) for submodule in machine.get("snapshot_submodules", [])
+        ]
+        external_paths = [
+            _populate_external_path(snapshot, external_path)
+            for external_path in machine.get("snapshot_external_paths", [])
+        ]
         created = _run(
             ["ssh", machine["ssh_host"], f"mkdir -p {shlex.quote(machine['project_root'])}"],
             timeout_seconds=60,
@@ -207,6 +242,7 @@ def sync_snapshot(machine: dict[str, Any], revision: str) -> None:
         )
         if synced.returncode != 0:
             raise RuntimeError(f"snapshot sync failed: {synced.stderr.strip()}")
+        return {"revision": revision, "submodules": submodules, "external_paths": external_paths}
 
 
 def _context(machine: dict[str, Any], remote_output: str) -> dict[str, object]:
@@ -351,8 +387,7 @@ def main() -> int:
     run_id = f"{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-{machine['id']}-{suite['id']}-{revision[:12]}"
     local_directory = args.output_root / run_id
     local_directory.mkdir(parents=True, exist_ok=False)
-    if args.sync:
-        sync_snapshot(machine, revision)
+    snapshot_provenance = sync_snapshot(machine, revision) if args.sync else None
     remote_directory = str(PurePosixPath(machine["remote_results_root"]) / run_id)
     created = _run(
         ["ssh", machine["ssh_host"], f"mkdir -p {shlex.quote(remote_directory)}"],
@@ -366,6 +401,7 @@ def main() -> int:
         "run_id": run_id,
         "source_revision": revision,
         "snapshot_sync": bool(args.sync),
+        "snapshot_provenance": snapshot_provenance,
         "machine": machine["id"],
         "suite": suite["id"],
         "remote_directory": remote_directory,

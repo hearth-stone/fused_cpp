@@ -7,7 +7,10 @@ add a kernel variant or change production dispatch.
 Each run is bound to one committed source revision. With `--sync` (the default),
 the runner creates a clean `git archive`, verifies and includes the pinned
 `xbyak_aarch64` submodule, and synchronizes that snapshot without copying local
-uncommitted work. Remote virtual environments and build products are preserved.
+uncommitted work. The repository's ignored `refs/i8gemm/lib` dependency is
+copied separately and bound to a deterministic content hash in `summary.json`;
+it must become a committed dependency before the final artifact freeze. Remote
+virtual environments and build products are preserved.
 The runner does not use `rsync --delete`, so a source deletion still requires the
 explicit remote cleanup required by `docs/agent_remote_execution.md`.
 
@@ -53,6 +56,7 @@ Copy one JSON file under `machines/` and set:
 - SVE vector width and machine-sized thread variables;
 - runtime environment controls;
 - initialized submodules required by the committed build.
+- any ignored external source directories, each recorded with a content hash.
 
 Do not hide machine-specific shape changes in shell scripts. Add a named machine
 variable or a separate suite so the rendered command remains visible in each

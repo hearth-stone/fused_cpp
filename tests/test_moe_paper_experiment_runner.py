@@ -11,6 +11,7 @@ from optimizations.fused_moe_sve.paper_experiments.run_matrix import (
     load_suite,
     parse_prefixed_json,
     render_argv,
+    _tree_digest,
     validate_suite,
 )
 
@@ -73,3 +74,15 @@ def test_output_json_requires_remote_output_placeholder() -> None:
     }
     with pytest.raises(ValueError, match="remote_output"):
         validate_suite(json.loads(json.dumps(payload)))
+
+
+def test_tree_digest_covers_relative_names_and_contents(tmp_path: Path) -> None:
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    (first / "source.c").write_text("one\n", encoding="utf-8")
+    (second / "source.c").write_text("one\n", encoding="utf-8")
+    assert _tree_digest(first) == _tree_digest(second)
+    (second / "source.c").write_text("two\n", encoding="utf-8")
+    assert _tree_digest(first) != _tree_digest(second)
