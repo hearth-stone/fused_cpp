@@ -634,9 +634,15 @@ if is_aarch64:
         ]
         moe_sources = [source for source in moe_sources if source not in sve_sources]
         if target_has_sve:
+            define_macros.append(("FUSED_CPP_DEEPSEEK_V4_MHC_SVE_ASM", "1"))
             indexer_sve_source = os.path.join("csrc", "deepseek_v4_indexer_sve.cpp")
             sources = [source for source in sources if source != indexer_sve_source]
-            deepseek_sve_gemm_native_sources.append((indexer_sve_source, sve_args))
+            deepseek_sve_gemm_native_sources.extend(
+                [
+                    (indexer_sve_source, sve_args),
+                    (os.path.abspath(os.path.join("csrc", "deepseek_v4_mhc_sve_kernels.S")), sve_args),
+                ]
+            )
         xbyak_aarch64_root = os.path.abspath(os.path.join("3rdparty", "xbyak_aarch64"))
         xbyak_aarch64_sources = [
             os.path.join(xbyak_aarch64_root, "src", "xbyak_aarch64_impl.cpp"),
