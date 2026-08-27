@@ -11,6 +11,15 @@ individual feature is enabled, experimental, diagnostic, or retired. A dated
 result report is valid only for its recorded source, binary, profile, machine,
 and execution geometry.
 
+Cross-machine paper experiments can be declared and run through
+[`paper_experiments/`](paper_experiments/). Machine JSON files keep SSH,
+affinity, NUMA, and build differences outside benchmark implementations, while
+each local result bundle records the committed source revision, extension hash,
+rendered command, raw logs, and structured output. The smoke and pilot suites
+validate orchestration and mechanism coverage; neither is a headline paper
+matrix without the larger sample and workload gates in the paper-readiness
+document.
+
 Production W13 and W2 each cover one complete packed-N stage. Legacy boolean
 split, range-count, and byte-window controls are gone. Their replacement is one
 explicit per-task owner window in Plan V2: `(threads, window_tiles)` uniquely

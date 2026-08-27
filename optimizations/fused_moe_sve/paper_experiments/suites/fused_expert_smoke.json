@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "id": "fused_expert_smoke",
+  "description": "Framework smoke test; results are not paper headline evidence.",
+  "setup": [
+    {
+      "id": "build_extension",
+      "use_affinity": false,
+      "timeout_seconds": 1800,
+      "argv": ["env", "FUSED_CPP_SVE_VECTOR_BITS={sve_bits}", "MAX_JOBS={max_jobs}", "{python}", "setup.py", "build_ext", "--inplace", "--force"]
+    },
+    {
+      "id": "build_unfused_reference",
+      "use_affinity": false,
+      "timeout_seconds": 600,
+      "argv": ["make", "-C", "optimizations/fused_moe_sve/benchmarks", "SVE_VECTOR_BITS={sve_bits}", "bench_unfused_pipeline"]
+    }
+  ],
+  "cases": [
+    {
+      "id": "direct_route_correctness",
+      "timeout_seconds": 900,
+      "argv": ["{python}", "-m", "pytest", "-q", "tests/test_fused_moe_bf16_tiled.py", "-k", "w2_direct_route_store_matches_scatter", "--maxfail=1"]
+    },
+    {
+      "id": "exact_m_smoke",
+      "timeout_seconds": 1200,
+      "output_json": true,
+      "argv": ["{python}", "optimizations/fused_moe_sve/benchmarks/bench_xbyak_exact_m.py", "--routes", "5,6,9,10,12", "--threads", "{exact_threads}", "--hidden", "4096", "--intermediate", "512", "--experts", "16", "--measurement-experts", "8", "--experts-per-wave", "1", "--warmup", "1", "--runs", "3", "--switch-period", "1", "--output", "{remote_output}"]
+    },
+    {
+      "id": "explicit_fusion_smoke",
+      "timeout_seconds": 1200,
+      "result_prefix": "RESULT_JSON ",
+      "argv": ["optimizations/fused_moe_sve/benchmarks/bench_unfused_pipeline", "--experts", "{unfused_experts}", "--m", "192", "--h", "4096", "--f", "512", "--threads-per-expert", "{unfused_threads_per_expert}", "--w13-ranges", "1", "--copies", "2", "--cpu-start", "{cpu_start}", "--warmup", "2", "--iters", "5"]
+    },
+    {
+      "id": "direct_route_smoke",
+      "timeout_seconds": 1200,
+      "output_json": true,
+      "argv": ["{python}", "optimizations/fused_moe_sve/benchmarks/bench_w2_direct_route.py", "--path", "async", "--tokens", "256", "--hidden", "4096", "--intermediate", "512", "--experts", "{direct_experts}", "--top-k", "6", "--threads", "{direct_threads}", "--warmup", "2", "--runs", "5", "--output", "{remote_output}"]
+    }
+  ]
+}

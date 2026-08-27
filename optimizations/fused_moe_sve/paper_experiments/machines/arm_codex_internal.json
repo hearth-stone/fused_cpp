@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "id": "arm_codex_internal",
+  "ssh_host": "Arm-codex-internal",
+  "project_root": "/home/zhangxu/codex/fused_cpp",
+  "remote_results_root": "/tmp/fused_cpp_moe_paper",
+  "python": ".venv/bin/python",
+  "affinity_argv": ["numactl", "--physcpubind=240-319", "--membind=3"],
+  "environment": {
+    "OMP_NUM_THREADS": "1",
+    "OMP_DYNAMIC": "FALSE",
+    "OMP_PROC_BIND": "close",
+    "MKL_NUM_THREADS": "1",
+    "OPENBLAS_NUM_THREADS": "1",
+    "VECLIB_MAXIMUM_THREADS": "1",
+    "PYTHONPATH": "src"
+  },
+  "variables": {
+    "sve_bits": 256,
+    "max_jobs": 16,
+    "cpu_start": 240,
+    "exact_threads": "1,4,8",
+    "direct_threads": 80,
+    "direct_experts": 8,
+    "unfused_experts": 4,
+    "unfused_threads_per_expert": 20
+  },
+  "snapshot_submodules": ["3rdparty/xbyak_aarch64"]
+}
