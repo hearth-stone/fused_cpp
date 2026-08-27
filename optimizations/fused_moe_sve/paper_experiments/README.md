@@ -75,3 +75,7 @@ MoE worker pool reads its inherited affinity.
 Do not hide machine-specific shape changes in shell scripts. Add a named machine
 variable or a separate suite so the rendered command remains visible in each
 run's `command.json`.
+
+The first two-machine smoke, including negative findings and the exact raw run
+ids, is recorded in
+[`../results/arm_codex_aws8_fused_expert_smoke_20260827.md`](../results/arm_codex_aws8_fused_expert_smoke_20260827.md).
