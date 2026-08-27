@@ -21,9 +21,7 @@
     "cpu_start": 0,
     "exact_threads": "1,4,8",
     "direct_threads": 8,
-    "direct_experts": 8,
-    "unfused_experts": 2,
-    "unfused_threads_per_expert": 4
+    "direct_experts": 8
   },
   "snapshot_submodules": ["3rdparty/xbyak_aarch64"],
   "snapshot_external_paths": ["refs/i8gemm/lib"]

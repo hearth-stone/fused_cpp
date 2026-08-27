@@ -8,12 +8,6 @@
       "use_affinity": false,
       "timeout_seconds": 1800,
       "argv": ["env", "FUSED_CPP_BUILD_MOE_ONLY=1", "FUSED_CPP_SVE_VECTOR_BITS={sve_bits}", "MAX_JOBS={max_jobs}", "{python}", "setup.py", "build_ext", "--inplace", "--force"]
-    },
-    {
-      "id": "build_unfused_reference",
-      "use_affinity": false,
-      "timeout_seconds": 600,
-      "argv": ["make", "-C", "optimizations/fused_moe_sve/benchmarks", "SVE_VECTOR_BITS={sve_bits}", "bench_unfused_pipeline"]
     }
   ],
   "cases": [
@@ -22,12 +16,6 @@
       "timeout_seconds": 1800,
       "output_json": true,
       "argv": ["{python}", "optimizations/fused_moe_sve/benchmarks/bench_xbyak_exact_m.py", "--routes", "1,2,3,4,5,6,7,8,9,10,11,12,48,192", "--threads", "{exact_threads}", "--hidden", "4096", "--intermediate", "512", "--experts", "16", "--measurement-experts", "8", "--experts-per-wave", "1", "--warmup", "3", "--runs", "15", "--switch-period", "3", "--output", "{remote_output}"]
-    },
-    {
-      "id": "explicit_fusion_pilot",
-      "timeout_seconds": 1800,
-      "result_prefix": "RESULT_JSON ",
-      "argv": ["optimizations/fused_moe_sve/benchmarks/bench_unfused_pipeline", "--experts", "{unfused_experts}", "--m", "1020", "--h", "4096", "--f", "2048", "--threads-per-expert", "{unfused_threads_per_expert}", "--w13-ranges", "1", "--copies", "2", "--cpu-start", "{cpu_start}", "--warmup", "3", "--iters", "15"]
     },
     {
       "id": "direct_route_pilot",

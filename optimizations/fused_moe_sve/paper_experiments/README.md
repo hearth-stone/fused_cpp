@@ -49,10 +49,13 @@ samples and is still exploratory. Paper tables should use a separately declared
 suite with at least 31 samples and the workload matrix required by
 `docs/moe_paper_readiness.md`.
 
-The explicit fused/unfused reference stays in its validated EP2
-`H=4096,F=2048` numerical domain. The exact-M and direct-route cases use the
-paper's TP4-oriented `H=4096,F=512` path. These are mechanism experiments, not
-one same-shape cumulative ablation.
+The exact-M and direct-route cases use the paper's TP4-oriented
+`H=4096,F=512` path. The former explicit fused/unfused case is deliberately not
+in an active suite: its explicit path still evaluates the historical poly5
+activation, while the current production fused W13 uses FEXPA+poly2. On both
+F=512 and F=2048 controls, that mismatch fails the reference's predeclared
+numerical gate. Reintroduce the comparison only after both paths use the same
+activation and rounding contract.
 
 ## Adding a machine
 

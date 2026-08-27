@@ -166,6 +166,13 @@ offline performance-oracle path, not a request-path algorithm.
 | Adaptive gather-pack | 2.3--12.6% complete-call gain for underfilled M=1--37 at 8T, with M=72/96 controls not regressing on the measured host | Underfilled-team ablation; needs a second-machine E2E repeat for a general claim | `optimizations/fused_moe_sve/results/amazon_8c_adaptive_mk_gather_pack_20260812.md` |
 | Tile windows | 12.4% on uniform and 10.6% on captured DSV4 in the recorded planner A/B | Scheduling-control evidence; rerun on the frozen paper binary | `optimizations/fused_moe_sve/results/amazon_192c_stage_window_tiles_20260810.md` |
 
+The explicit-fusion result is historical mechanism evidence only. A 2026-08-27
+rerun attempt showed that the standalone explicit path still evaluates poly5
+while the current production fused W13 uses FEXPA+poly2; F=512 and F=2048 both
+failed the benchmark's predeclared relative-L2 gate. Do not use a new timing
+from that comparator until its activation and rounding contract matches the
+current fused path.
+
 The July 2026 nine-workload vLLM-style table is useful for motivating load
 imbalance and tail-pool execution, but it is bound to retired profiles and
 older geometry. It must be rerun before becoming a headline table.
