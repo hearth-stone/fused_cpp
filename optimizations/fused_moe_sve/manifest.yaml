@@ -161,7 +161,14 @@ features:
       scaling, clamped SwiGLU, 2T N-split, M12 packing, weighted merge, and
       repeatability; the M48/H64/F64 reference comparison measured max-absolute
       error 2.861e-6. Model-level quality remains an adoption gate for any
-      automatic selection. See results/arm_codex_80c_w8a8_i8mm_20260821.md.
+      automatic selection. A 2026-08-23 vLLM TP4 follow-up found that routing-
+      dependent lane capacities repeatedly rebuilt every W8A8 workspace. The
+      runtime now reserves each homogeneous lane for the current token count
+      (or the actual larger duplicate-expert route count). On one 80-core rank,
+      a second unseen captured route changed from 41.425 ms cold / 20.901 ms
+      steady to 21.300 / 20.831 ms after the first route established capacity;
+      the first process call remains a one-time 64.578 ms allocation. See
+      results/arm_codex_80c_w8a8_i8mm_20260821.md.
 
   - id: epilogue.indexed_polynomial_evaluation
     part: epilogue

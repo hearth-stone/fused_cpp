@@ -560,12 +560,15 @@ at::Tensor fused_moe_w8a8_tiled_async_plan_v2(
     TORCH_CHECK(routes[static_cast<size_t>(expert)].empty() || seen[static_cast<size_t>(expert)] == 1,
                 "W8A8 plan is missing an active expert");
   }
-  std::vector<int> required_rows(static_cast<size_t>(lane_count), 1);
-  for (size_t lane_id = 0; lane_id < lanes.size(); ++lane_id) {
-    for (const auto& task : lanes[lane_id]) {
-      required_rows[lane_id] = std::max(required_rows[lane_id], static_cast<int>(routes[task.expert].size()));
-    }
+  // A new route plan can assign a larger expert to any lane.  Size every lane
+  // for the full token count so prompt-to-prompt lane reassignment does not
+  // rebuild all workspaces.  Keep duplicate expert ids safe even though normal
+  // top-k routing selects each expert at most once per token.
+  int workspace_rows = std::max(tokens, 1);
+  for (const auto& expert_routes : routes) {
+    workspace_rows = std::max(workspace_rows, static_cast<int>(expert_routes.size()));
   }
+  std::vector<int> required_rows(static_cast<size_t>(lane_count), workspace_rows);
   RuntimeScratch& scratch = runtime_scratch();
   scratch.ensure(topk_ids.numel(), h, f, static_cast<int>(team_width), required_rows, input.options());
   auto& workspaces = scratch.workspaces;

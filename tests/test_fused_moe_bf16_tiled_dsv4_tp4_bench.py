@@ -3,8 +3,9 @@
 
 from __future__ import annotations
 
-import multiprocessing as mp
+import importlib
 import json
+import multiprocessing as mp
 import os
 import platform
 import queue
@@ -78,6 +79,13 @@ def _env_float(name: str, default: float) -> float:
     return default if value is None or value == "" else float(value)
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return default
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
 def _config_from_env() -> DSV4TP4MoEBenchConfig:
     defaults = DSV4TP4MoEBenchConfig()
     return DSV4TP4MoEBenchConfig(
@@ -118,6 +126,8 @@ def _config_from_env() -> DSV4TP4MoEBenchConfig:
 
 def _rank_cpus(rank: int, config: DSV4TP4MoEBenchConfig) -> list[int]:
     base = rank * config.cores_per_numa
+    if _env_bool("FUSED_CPP_DSV4_MOE_BENCH_FULL_NUMA_AFFINITY"):
+        return list(range(base, base + config.cores_per_numa))
     return [
         *range(base, base + 32),
         *range(base + config.core_skip, base + config.core_skip + 32),
@@ -147,6 +157,10 @@ def _set_vllm_like_rank_env(rank: int, config: DSV4TP4MoEBenchConfig) -> list[in
     os.environ["OMP_NUM_THREADS"] = str(config.threads_per_rank)
     os.environ["OMP_PLACES"] = "{" + cpu_list + "}"
     os.environ["OMP_PROC_BIND"] = "true"
+    if _env_bool("FUSED_CPP_DSV4_MOE_BENCH_FULL_NUMA_AFFINITY"):
+        os.environ["KMP_AFFINITY"] = f"granularity=fine,explicit,proclist=[{cpu_list}]"
+        os.environ["KMP_BLOCKTIME"] = "5"
+        os.environ["KMP_TPAUSE"] = "0"
     os.environ["FUSED_CPP_MOE_HIERARCHICAL_N_SPLIT"] = "1"
     os.environ["FUSED_CPP_MOE_N_SPLIT_CORE_SKIP"] = str(config.core_skip)
     os.environ["FUSED_CPP_MOE_N_SPLIT_GROUPS_PER_PARTITION"] = str(config.groups_per_partition)
@@ -308,9 +322,33 @@ def _bench_rank_worker(
     config: DSV4TP4MoEBenchConfig,
     barrier: Any,
     results: Any,
+    shm_group_name: str | None,
 ) -> None:
     try:
         cpus = _set_vllm_like_rank_env(rank, config)
+        shm_handle: int | None = None
+        if shm_group_name is not None:
+            importlib.import_module("vllm._C")
+            required_ops = (
+                "init_cpu_memory_env",
+                "init_shm_manager",
+                "join_shm_manager",
+                "shm_allreduce",
+            )
+            missing_ops = [name for name in required_ops if not hasattr(torch.ops._C, name)]
+            if missing_ops:
+                raise RuntimeError(f"vLLM CPU SHM ops unavailable: {missing_ops}")
+            torch.ops._C.init_cpu_memory_env([rank])
+            shm_handle = torch.ops._C.init_shm_manager(
+                shm_group_name,
+                config.tp_size,
+                rank,
+                config.threads_per_rank,
+            )
+            barrier.wait(timeout=config.barrier_timeout_s)
+            torch.ops._C.join_shm_manager(shm_handle, shm_group_name)
+            barrier.wait(timeout=config.barrier_timeout_s)
+
         data_gen = torch.Generator().manual_seed(config.seed + rank)
         route_gen = torch.Generator().manual_seed(config.seed)
 
@@ -379,6 +417,54 @@ def _bench_rank_worker(
             barrier.wait(timeout=config.barrier_timeout_s)
             times.append(elapsed)
 
+        allreduce_times: list[float] = []
+        combined_times: list[float] = []
+        combined_checksum = 0.0
+        if shm_handle is not None:
+            expected_sum = float(config.tp_size * (config.tp_size + 1) // 2)
+            collective_input = torch.full_like(hidden_states, float(rank + 1))
+
+            for _ in range(max(config.warmup, 1)):
+                collective_input.fill_(float(rank + 1))
+                barrier.wait(timeout=config.barrier_timeout_s)
+                torch.ops._C.shm_allreduce(shm_handle, collective_input)
+                barrier.wait(timeout=config.barrier_timeout_s)
+            if float(collective_input.flatten()[0]) != expected_sum:
+                raise AssertionError(
+                    "vLLM SHM all-reduce warmup mismatch: "
+                    f"rank={rank} actual={float(collective_input.flatten()[0])} expected={expected_sum}"
+                )
+
+            for _ in range(config.runs):
+                collective_input.fill_(float(rank + 1))
+                barrier.wait(timeout=config.barrier_timeout_s)
+                t0 = time.perf_counter()
+                torch.ops._C.shm_allreduce(shm_handle, collective_input)
+                elapsed = time.perf_counter() - t0
+                barrier.wait(timeout=config.barrier_timeout_s)
+                if float(collective_input.flatten()[-1]) != expected_sum:
+                    raise AssertionError(
+                        "vLLM SHM all-reduce mismatch: "
+                        f"rank={rank} actual={float(collective_input.flatten()[-1])} expected={expected_sum}"
+                    )
+                allreduce_times.append(elapsed)
+
+            for _ in range(max(config.warmup, 1)):
+                barrier.wait(timeout=config.barrier_timeout_s)
+                out = run_once()
+                torch.ops._C.shm_allreduce(shm_handle, out)
+                barrier.wait(timeout=config.barrier_timeout_s)
+
+            for _ in range(config.runs):
+                barrier.wait(timeout=config.barrier_timeout_s)
+                t0 = time.perf_counter()
+                out = run_once()
+                torch.ops._C.shm_allreduce(shm_handle, out)
+                elapsed = time.perf_counter() - t0
+                barrier.wait(timeout=config.barrier_timeout_s)
+                combined_checksum = float(out.flatten()[0])
+                combined_times.append(elapsed)
+
         allowed = sorted(os.sched_getaffinity(0))
         results.put(
             {
@@ -390,6 +476,9 @@ def _bench_rank_worker(
                 "routing_seq": config.routing_seq,
                 "pack_ms": pack_s * 1e3,
                 "times_s": times,
+                "allreduce_times_s": allreduce_times,
+                "combined_times_s": combined_times,
+                "combined_checksum": combined_checksum,
                 "routes_min": int(counts.min().item()),
                 "routes_max": int(counts.max().item()),
                 "routes_mean": float(counts.float().mean().item()),
@@ -478,6 +567,37 @@ def _print_report(rows: list[dict[str, Any]], config: DSV4TP4MoEBenchConfig) -> 
         f"step_wall_ms={[round(t * 1e3, 3) for t in step_wall_s]}"
     )
 
+    if rows[0]["allreduce_times_s"]:
+        allreduce_times = [[float(t) for t in row["allreduce_times_s"]] for row in rows]
+        combined_times = [[float(t) for t in row["combined_times_s"]] for row in rows]
+        allreduce_step_s = [max(times[i] for times in allreduce_times) for i in range(config.runs)]
+        combined_step_s = [max(times[i] for times in combined_times) for i in range(config.runs)]
+        for row, rank_allreduce, rank_combined in zip(
+            rows,
+            allreduce_times,
+            combined_times,
+            strict=True,
+        ):
+            print(
+                f"rank={row['rank']} vllm_shm_allreduce_ms="
+                f"{[round(t * 1e3, 3) for t in rank_allreduce]} "
+                f"kernel_plus_allreduce_ms="
+                f"{[round(t * 1e3, 3) for t in rank_combined]}"
+            )
+        print(
+            "vllm_shm_allreduce "
+            f"tensor=[{config.tokens},{config.hidden_size}] dtype=bf16 "
+            f"median_step_ms={statistics.median(allreduce_step_s) * 1e3:.3f} "
+            f"best_step_ms={min(allreduce_step_s) * 1e3:.3f} "
+            f"step_wall_ms={[round(t * 1e3, 3) for t in allreduce_step_s]}"
+        )
+        print(
+            "kernel_plus_vllm_shm_allreduce "
+            f"median_step_ms={statistics.median(combined_step_s) * 1e3:.3f} "
+            f"best_step_ms={min(combined_step_s) * 1e3:.3f} "
+            f"step_wall_ms={[round(t * 1e3, 3) for t in combined_step_s]}"
+        )
+
 
 def _run_tp4_bound_bench(config: DSV4TP4MoEBenchConfig) -> None:
     if config.tp_size != 4:
@@ -492,10 +612,12 @@ def _run_tp4_bound_bench(config: DSV4TP4MoEBenchConfig) -> None:
     ctx = mp.get_context("spawn")
     barrier = ctx.Barrier(config.tp_size, timeout=config.barrier_timeout_s)
     results = ctx.Queue()
+    measure_shm_allreduce = _env_bool("FUSED_CPP_DSV4_MOE_BENCH_SHM_ALLREDUCE")
+    shm_group_name = f"fused-cpp-moe-bench-{os.getpid()}-{time.time_ns()}" if measure_shm_allreduce else None
     processes = [
         ctx.Process(
             target=_bench_rank_worker,
-            args=(rank, config, barrier, results),
+            args=(rank, config, barrier, results, shm_group_name),
             name=f"fused_cpp_moe_tp{rank}",
         )
         for rank in range(config.tp_size)
@@ -524,6 +646,11 @@ def _run_tp4_bound_bench(config: DSV4TP4MoEBenchConfig) -> None:
 
     _print_report(rows, config)
     assert all(len(row["times_s"]) == config.runs for row in rows)
+    if measure_shm_allreduce:
+        assert all(len(row["allreduce_times_s"]) == config.runs for row in rows)
+        assert all(len(row["combined_times_s"]) == config.runs for row in rows)
+        checksums = [float(row["combined_checksum"]) for row in rows]
+        assert checksums == pytest.approx([checksums[0]] * config.tp_size, abs=0.0)
 
 
 def test_fused_moe_bf16_tiled_deepseek_v4_flash_tp4_bound_gflops() -> None:

@@ -261,3 +261,37 @@ numactl --physcpubind=240-319 --membind=3 .venv/bin/python \
   --w13-window 4 --w2-window 32 --warmup 7 --runs 31 --swiglu-limit 10 \
   --w8a8-gemm-kernel packed_m12 --w8a8-w13-window 1 --w8a8-w2-window 4
 ```
+
+## Max-token lane workspace follow-up (2026-08-23)
+
+The vLLM TP4 integration exposed a cold-plan cost hidden by repeated-routing
+operator benchmarks. `RuntimeScratch::ensure()` previously sized each of five
+16-thread lane workspaces to that lane's largest currently assigned expert. If
+one later plan needed more rows on any lane, it cleared and rebuilt all five
+workspaces. The W8A8 profile was therefore bimodal: steady calls were typically
+18--22 ms while rebuild calls took 45--55 ms.
+
+Production now reserves every lane for the current input token count. It also
+uses the actual maximum expert route count when duplicate expert ids make that
+larger than the token count. This preserves the general input contract while a
+normal routed-plus-shared call allocates at most once for each larger token
+length. At T2048/H4096/F512, width 16 and five lanes, the retained workspace is
+approximately 315 MiB per rank.
+
+The alternating captured-route reproducer used one rank, CPUs 0--79,
+`OMP_NUM_THREADS=80`, SVE256, TP degree 4, checkpoint-native packed INT8 weights,
+and two real 2048-token route plans on the same layer weights:
+
+| Build | Route A first | Route A repeat | Route B first | Route B repeat |
+| --- | ---: | ---: | ---: | ---: |
+| Before | 53.119 ms | 22.949 ms | 41.425 ms | 20.901 ms |
+| Max-token lanes | 64.578 ms | 22.485 ms | 21.300 ms | 20.831 ms |
+
+The candidate intentionally moves the full allocation to the first process
+call. A different route no longer incurs a second rebuild. The focused target
+suite passed with `7 passed`. One non-strict-NUMA vLLM engine ran five public
+2048-token cases with the fixed 10-second spacing and produced the expected
+tokens in 4.586/4.655/4.707/4.646/4.614 s (mean 4.642 s, median 4.646 s). The
+formal strict-NUMA multi-engine gate remains required because `numactl` rejected
+the machine's configured CPU range before worker model loading during this
+follow-up.
