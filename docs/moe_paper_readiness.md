@@ -1,6 +1,6 @@
 # CPU MoE Paper Readiness And Evidence Map
 
-Status date: 2026-08-26.
+Status date: 2026-08-27.
 
 This document is the paper-facing index for the CPU MoE work in this
 repository. It does not replace the mathematical, schema, implementation, or
@@ -19,7 +19,8 @@ The three contributions should be stated narrowly:
 
 1. **Moldable fused execution.** An Arm SVE BF16 expert pipeline that preserves
    shared packed-A reuse while fusing gather-pack, W13, SwiGLU and packed-C
-   production, W2 direct-route stores, and ordered weighted reduction. Team
+   production, W2 direct-route stores, and deterministic FP32 weighted
+   reduction. Team
    width and per-stage owner windows remain explicit scheduling controls.
 2. **Phase/resource cost model.** A model that lowers exact kernel demand into
    setup, cold packed-B, and steady packed-B phases, then maps those phases
@@ -32,6 +33,9 @@ Do not describe contribution 1 merely as "fusing SiLU with GEMM": current CPU
 MoE systems already implement that boundary. The paper-specific mechanism is
 the combination of Arm SVE exact-M execution, shared packed-A ownership,
 direct-route output, tile-window control, and a planner-executable task ABI.
+The detailed implementation, evidence, negative-result, and AI-drafting dossier
+for this contribution is
+[`moe_fused_expert_contribution.md`](moe_fused_expert_contribution.md).
 
 ## Recommended Paper Structure
 
