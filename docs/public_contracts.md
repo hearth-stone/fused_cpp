@@ -338,6 +338,60 @@ by the extension and otherwise selects the materialized Torch reference.
 `backend="torch"` is the stable correctness fallback. Native packing layout,
 thread assignment, and fusion strategy are internal implementation details.
 
+## DeepSeek V4 Multi-Head Hyper-Connections
+
+`PreparedDeepSeekV4MHCWeight` and `prepare_mhc_weight` define the reusable
+FP32 projection-weight contract for DeepSeek V4 mHC. Preparation accepts a
+contiguous CPU FP32 `[N,C*H]` tensor, owns a copy, infers `C/H`, and requires
+`kind="pre"` with `N=C*C+2*C` or `kind="head"` with `N=C`. The only supported
+baseline backend is the explicit value `"fp32"`; it never narrows the weight.
+
+`mhc_pre_rmsnorm`, `mhc_post_pre_rmsnorm`, and
+`mhc_post_hc_head_rmsnorm` currently dispatch to their corresponding
+`*_torch_baseline` functions. Inputs are contiguous CPU tensors: residual and
+layer/norm tensors use BF16, while mixing coefficients, scales, bases, and mHC
+projection weights use FP32. `num_threads` is validated for API compatibility;
+the Torch baseline follows the process-wide Torch intra-op thread setting.
+
+The numerical contract uses FP32 projection, accumulation, sigmoid, softmax,
+Sinkhorn, residual mixing, and weighted sums. It explicitly rounds post output
+to BF16 before the next pre, rounds pre weighted input to BF16 before RMSNorm,
+and rounds HC-head weighted output to BF16 before final RMSNorm. Outputs are
+contiguous and have these forms:
+
+- pre: FP32 `[T,C,1]`, FP32 `[T,C,C]`, BF16 `[T,H]`;
+- post-pre: BF16 `[T,C,H]` followed by the three pre outputs;
+- post-head: BF16 `[T,H]` and BF16 `[T,C,H]` final residual.
+
+All three interfaces accept `T=0` and do not mutate inputs. The current Torch
+baseline supports any positive geometry represented by a valid prepared
+weight; a future optimized backend may explicitly restrict its supported
+geometry without changing baseline semantics.
+
+The explicit `mhc_pre_rmsnorm_sve_candidate` and
+`mhc_post_pre_rmsnorm_sve_candidate` entrypoints are experimental and are not
+re-exported from the package root. They require SVE128 or SVE256 and fixed
+projection width `N=24`; their packed-B layout, approximately 1 MiB K-window,
+and M-first/K-fallback thread decomposition are not public contracts. Their
+control postprocess is also internal: pre/post sigmoid uses FP32 FEXPA plus a
+degree-2 residual polynomial, while the FP32 `4x4` Sinkhorn kernel gathers one
+matrix position across the T dimension and retains each vector batch in SVE
+registers for all normalization iterations. The candidate materializes FP32
+`pre_mix` before a separate H-vectorized SVE consumer performs four-stream
+residual reduction, the required BF16 round trip, and in-place two-pass
+RMSNorm; `post_mix` and `comb_mix` remain materialized across the sublayer.
+The candidate post consumer specializes the fixed `C=4` geometry: it initializes
+each FP32 output accumulator from the first residual stream with multiply,
+fused-multiply-adds the remaining three residual streams and rank-one layer
+injection, then performs the required BF16 rounding and store. This native ABI
+is internal and requires contiguous `post_mix` shape `[T,4,1]`.
+The explicit `mhc_post_hc_head_rmsnorm_sve_candidate` is also internal and
+requires fixed `C=4`. It reuses the native SVE post boundary, computes the
+FP32 `[T,4H] x [4H,4]` head projection with a VL-independent NEON M12xN4
+kernel, applies FP32 head sigmoid controls, performs the four-stream BF16
+reduction boundary, and runs final RMSNorm. The public final-head entrypoint
+continues to dispatch to the Torch baseline.
+
 ## DeepSeek V4 Attention W8A8 Projections
 
 `PreparedDeepSeekV4W8A8LinearWeight`,

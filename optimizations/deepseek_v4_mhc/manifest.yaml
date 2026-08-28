@@ -1,0 +1,374 @@
+operator: deepseek_v4_mhc
+
+baseline:
+  id: torch_cpu_bf16_boundary
+  implementation: src/fused_cpp/deepseek_v4_mhc.py
+  entrypoints:
+    - mhc_pre_rmsnorm_torch_baseline
+    - mhc_post_pre_rmsnorm_torch_baseline
+    - mhc_post_hc_head_rmsnorm_torch_baseline
+  status: reference
+  numerical_contract: >-
+    FP32 projection and mixing with explicit BF16 post-to-pre,
+    pre-weighted-input-to-RMSNorm, and HC-head-to-final-RMSNorm boundaries.
+  correctness: >-
+    PYTHONPATH=src:. .venv/bin/python -m pytest -q
+    tests/test_deepseek_v4_mhc.py
+  benchmark: >-
+    PYTHONPATH=src:. OMP_NUM_THREADS=<T> .venv/bin/python
+    tests/bench_deepseek_v4_mhc.py --tokens 2048 --hc-mult 4
+    --hidden-size 4096 --threads <T> --warmup 3 --runs 10
+
+features:
+  - id: compute.sve_n24_pipeline
+    part: compute
+    status: candidate
+    owner: cpu-kernels
+    opened: 2026-08-22
+    decision_by: 2026-09-21
+    next_decision: >-
+      Repeat the projection and full-stage sweep on the second SVE machine;
+      enable only if the 8-thread full-stage result is confirmed non-regressing.
+    adoption_gate: >-
+      Pass SVE128/SVE256 equivalence, improve isolated projection by at least
+      3% at 1 and 80 threads, and keep every full pre/post-pre point within 2%
+      of the intrinsic candidate.
+    depends_on: []
+    conflicts_with: []
+    implementation:
+      - csrc/deepseek_v4_mhc_sve.cpp
+      - csrc/deepseek_v4_mhc_sve_kernels.S
+      - setup.py
+      - src/fused_cpp/deepseek_v4_mhc.py
+    hypothesis: >-
+      For the fixed N=24 FP32 mHC projection, an M7 by 3-vector indexed-FMLA
+      kernel at SVE256 and an M4 by 6-vector kernel at SVE128 retain all
+      accumulators in registers. A roughly 1 MiB packed-B budget determines a
+      balanced K window count (K=16384 becomes two 8192-element, 768 KiB windows);
+      M-first parallelism streams A while reusing each B window, with K split
+      used only when M does not expose enough row blocks. The assembly K loop
+      follows the BF16/INT8 load-compute pipeline: M7 holds four consecutive K
+      values for each of seven A rows and uses indexed FMLA, while M4 replaces
+      each B register after its last use. When enough M7 tasks exist, a partial
+      final block uses a seven-row scratch rather than a slower M8 critical
+      lane. M=2048 therefore runs 292 direct M7 blocks plus one scratch M7
+      block containing four real and three zero rows; only the final 224 KiB A
+      block is copied, not the full input.
+    selection: >-
+      Explicit mhc_pre_rmsnorm_sve_candidate and
+      mhc_post_pre_rmsnorm_sve_candidate calls only. Public dispatch remains
+      on the Torch baseline.
+    correctness: >-
+      Arm-codex-internal, SVE256, CPUs 240-247, NUMA3:
+      PYTHONPATH=src:. OMP_NUM_THREADS=8 OMP_DYNAMIC=FALSE
+      numactl --physcpubind=240-247 --membind=3 .venv/bin/python
+      -m pytest -q tests/test_deepseek_v4_mhc.py; 25 passed. Rebuilt with
+      FUSED_CPP_SVE_VECTOR_BITS=128, set the process VL to 128 bits with
+      PR_SVE_SET_VL before import, and repeated the same test; 24 passed.
+    benchmark: >-
+      Arm-codex-internal, CPUs 240-319, NUMA3, Torch GNU libgomp-linked
+      release build: PYTHONPATH=src:. OMP_NUM_THREADS=<T>
+      OMP_DYNAMIC=FALSE OMP_PROC_BIND=close OMP_PLACES=cores
+      numactl --physcpubind=240-<end> --membind=3
+      .venv/bin/python tests/bench_deepseek_v4_mhc.py --tokens 2048
+      --hc-mult 4 --hidden-size 4096 --threads <T> --warmup 3 --runs 10
+      --candidate sve.
+    result: >-
+      Versus the intrinsic projection at 1/8/32/64/80 threads, median changed
+      from 42.738/6.002/1.483/0.746/0.859 ms to
+      39.689/5.359/1.432/0.743/0.819 ms, or
+      +7.7%/+12.0%/+3.6%/+0.3%/+4.9%. Full pre at 1/8/80 threads changed from
+      92.264/25.153/14.701 ms to 91.388/25.635/13.698 ms; post-pre changed
+      from 145.112/45.037/25.853 ms to 145.101/45.411/25.356 ms. Forced
+      SVE128 at 8 threads changed pre from 26.872 to 26.596 ms and left
+      post-pre effectively unchanged at 46.774 ms. The HC-head stage is
+      unchanged. Adding M7 indexed-FMLA reduced the SVE256 M=2048 projection
+      from the M8 candidate's 39.689/5.359 ms at 1/8 threads to
+      31.778/4.992 ms (+24.9%/+7.3% throughput); at 16 threads it reached
+      2.718 ms and 592.5 GFLOP/s. The apparent unbound-thread regression was
+      caused by OpenMP worker migration losing private-L2 residency. With
+      OMP_PROC_BIND=close and OMP_PLACES=cores, the isolated L2-hot M7 kernel
+      reached 0.948/1.847/3.574/4.663 TFLOP/s at 16/32/64/80 threads and
+      remained faster than M8 throughout. The original mixed geometry placed
+      all four M8 blocks on one 80-thread lane; its estimated 305 us work was
+      about 64% above a four-M7 lane. A synthetic pre-padded M=2051 run reached
+      1.088/2.164/2.670 TFLOP/s at 32/64/80 threads. Copying only the final
+      partial block produced 1.070/2.140/2.503 TFLOP/s, including padding
+      overhead, and improved the prior 80-thread mixed result by about 27%.
+      Full pre at 1/8/16 threads was 83.876/24.419/16.117 ms; full post-pre was
+      135.933/43.893/29.310 ms. At 80 threads, full pre/post-pre was
+      14.164/25.897 ms, within the observed spread of the M8 candidate rather
+      than a confirmed stage-level gain. These are candidate measurements, not
+      default-dispatch gains.
+  - id: epilogue.sve_strided_t_control
+    part: epilogue
+    status: candidate
+    owner: cpu-kernels
+    opened: 2026-08-24
+    decision_by: 2026-09-23
+    next_decision: >-
+      Repeat the full pre/post-pre comparison on the second SVE machine, then
+      decide whether to keep the materialized [T,24] boundary or fuse the
+      control transform directly into the projection epilogue.
+    adoption_gate: >-
+      Pass SVE128/SVE256, extreme-logit, tail-T, repeatability, and strict-BF16
+      tests; improve full pre by at least 5% at 1/8/80 threads on the primary
+      machine; and avoid a greater than 2% regression on the second SVE host.
+    depends_on:
+      - compute.sve_n24_pipeline
+    conflicts_with: []
+    implementation:
+      - csrc/deepseek_v4_mhc_sve.cpp
+      - csrc/module.cpp
+      - src/fused_cpp/deepseek_v4_mhc.py
+      - tests/test_deepseek_v4_mhc.py
+      - optimizations/deepseek_v4_mhc/benchmarks/bench_sve_control_postprocess.py
+    hypothesis: >-
+      The first eight token-major FP32 controls fill one SVE256 vector and can
+      share one stable FEXPA sigmoid pipeline before the pre/post-specific
+      epsilon and multiplier. Writing the remaining 16 affine controls as
+      [T,4,4] permits stride-16 gather of each matrix position across T; 16 Z
+      registers then retain one VL-sized batch for the initial row softmax and
+      all 20 alternating row/column normalizations, eliminating Torch tensor
+      launches and per-iteration memory traffic. T is the sole thread split.
+    selection: >-
+      Explicit mhc_pre_rmsnorm_sve_candidate and
+      mhc_post_pre_rmsnorm_sve_candidate calls only. Public dispatch remains
+      on the Torch baseline.
+    correctness: >-
+      Arm-codex-internal NUMA3 CPUs 240-247, Torch bundled libgomp preloaded:
+      SVE256 and forced SVE128 each passed 27 tests in
+      tests/test_deepseek_v4_mhc.py. Coverage includes T=1/7/9/17/64, 1/2/20
+      Sinkhorn rounds, K splitting, strict BF16 boundaries, and logits through
+      +/-100. The 80-thread full-stage check had maximum post/comb absolute
+      error 1.79e-7/1.34e-7 and normed-input relative L2 error 1.40e-5.
+    benchmark: >-
+      Arm-codex-internal NUMA3, SVE256, T=2048/C=4/H=4096, FP32 controls,
+      BF16 residual, 5 warmups, 21 alternating AB/BA samples:
+      PYTHONPATH=src:. LD_PRELOAD=<torch-bundled-libgomp>
+      OMP_NUM_THREADS=<T> OMP_DYNAMIC=FALSE OMP_PROC_BIND=close
+      OMP_PLACES=cores numactl --physcpubind=<cpus> --membind=3
+      .venv/bin/python optimizations/deepseek_v4_mhc/benchmarks/
+      bench_sve_control_postprocess.py --threads <T> --warmup 5 --runs 21.
+    result: >-
+      Native control processing versus Torch was 0.226 vs 5.904 ms at 1T,
+      0.040 vs 3.125 ms at 8T, and 0.079 vs 3.992 ms at 80T. Full projection
+      plus pre processing changed from 82.519/24.302/13.559 ms to
+      77.019/21.124/9.576 ms at 1/8/80T, reducing latency by
+      6.67%/13.08%/29.37%. Replacing SVE tuple helpers with direct named-vector
+      normalization removed all Z-register stack loads/stores from the
+      outlined control function. The machine currently loads both system and
+      Torch libgomp; without preloading the Torch copy, omp_get_num_procs
+      reports one processor inside the bound cpuset, so those invalid runs are
+      excluded.
+  - id: epilogue.sve_pre_apply_rmsnorm
+    part: epilogue
+    status: candidate
+    owner: cpu-kernels
+    opened: 2026-08-24
+    decision_by: 2026-09-23
+    next_decision: >-
+      Implement the fixed-K4 post residual kernel and compare the complete
+      post-pre chain before considering a public SVE dispatch change.
+    adoption_gate: >-
+      Pass SVE128/SVE256 T/H-tail and strict-BF16 tests, keep normed-input
+      relative L2 error below 1e-4, improve isolated pre-apply by at least 3x,
+      and avoid a full-pre regression at 1/8/80 threads on the primary host.
+    depends_on:
+      - epilogue.sve_strided_t_control
+    conflicts_with: []
+    implementation:
+      - csrc/deepseek_v4_mhc_sve.cpp
+      - csrc/module.cpp
+      - src/fused_cpp/deepseek_v4_mhc.py
+      - tests/test_deepseek_v4_mhc.py
+      - optimizations/deepseek_v4_mhc/benchmarks/bench_sve_control_postprocess.py
+    hypothesis: >-
+      Materializing FP32 pre_mix costs only 32 KiB at T=2048 and preserves a
+      clean T-vectorized control/H-vectorized consumer boundary. For each token,
+      one SVE pass reads four BF16 residual streams, accumulates the FP32
+      weighted sum, rounds and stores BF16 raw input, and accumulates squares
+      from the rounded value. A second immediate pass reuses that token-local
+      raw working set and overwrites it with BF16 RMSNorm output, eliminating
+      Torch's large FP32 broadcast temporaries and repeated parallel kernels.
+    selection: >-
+      Explicit mhc_pre_rmsnorm_sve_candidate and
+      mhc_post_pre_rmsnorm_sve_candidate calls only. Public dispatch remains
+      on the Torch baseline.
+    correctness: >-
+      Arm-codex-internal NUMA3 CPUs 240-247 with Torch bundled libgomp
+      preloaded: SVE256 and forced SVE128 each passed all 31 tests in
+      tests/test_deepseek_v4_mhc.py. Direct pre-apply coverage includes
+      T=0/1/9/17 and H=65/128. At T=2048/H=4096, normed-input maximum absolute
+      error was 0.03125 and relative L2 error was 3.25e-5, with no NaN or Inf.
+    benchmark: >-
+      Same AB/BA command and T=2048/C=4/H=4096 configuration as
+      epilogue.sve_strided_t_control, using 5 warmups and 21 median samples.
+    result: >-
+      Isolated Torch versus SVE pre-apply plus RMSNorm was 43.069 vs 9.442 ms
+      at 1T, 13.611 vs 1.438 ms at 8T, and 8.522 vs 0.726 ms at 80T, or
+      4.56x/9.46x/11.74x. Full SVE projection plus postprocess changed from
+      82.934/23.804/12.791 ms to 42.630/7.368/1.588 ms at 1/8/80T, reducing
+      latency by 48.60%/69.05%/87.59%. Against the all-Torch stage at 80T,
+      complete pre changed from 18.882 to 0.943 ms and post-pre from 29.464 to
+      12.719 ms; the remaining post-pre time is the Torch post operation.
+  - id: epilogue.sve_post_k4_rank1
+    part: epilogue
+    status: candidate
+    owner: cpu-kernels
+    opened: 2026-08-24
+    decision_by: 2026-09-23
+    next_decision: >-
+      Run the complete SVE candidate on the second SVE machine and decide
+      whether it is ready to replace the public Torch dispatch.
+    adoption_gate: >-
+      Pass T=0, H-tail, invalid-layout, repeated-call, SVE128 and SVE256 tests;
+      keep BF16 post maximum absolute error at or below 0.03125; improve the
+      isolated post at 1/8/80 threads; and avoid a full post-pre regression.
+    depends_on:
+      - epilogue.sve_strided_t_control
+    conflicts_with: []
+    implementation:
+      - csrc/deepseek_v4_mhc_sve.cpp
+      - csrc/module.cpp
+      - src/fused_cpp/deepseek_v4_mhc.py
+      - tests/test_deepseek_v4_mhc.py
+      - optimizations/deepseek_v4_mhc/benchmarks/bench_sve_control_postprocess.py
+    hypothesis: >-
+      For fixed C=4, mixed is a K4 GEMM and injected is a rank-one update over
+      the same [T,4,H] output. An H-U2 SVE loop can initialize each of eight
+      live FP32 accumulators with the first residual stream using FMUL, consume
+      the other three streams and layer injection with FMLA, and round directly
+      to BF16. This removes accumulator clearing and the FP32 mixed/injected
+      materializations while preserving T-only thread ownership.
+    selection: >-
+      Explicit mhc_post_pre_rmsnorm_sve_candidate calls only. Public dispatch
+      remains on the Torch baseline.
+    correctness: >-
+      Arm-codex-internal NUMA3 CPUs 240-247 with Torch bundled libgomp
+      preloaded: SVE256 and process-forced SVE128 each passed all 36 tests in
+      tests/test_deepseek_v4_mhc.py. Direct coverage includes T=0/1/9/17,
+      H=65/128, invalid post_mix layout, and the complete post-pre boundary.
+    benchmark: >-
+      Use the same Arm-codex-internal placement and AB/BA method as
+      epilogue.sve_strided_t_control; the benchmark emits post_k4_rank1 Torch
+      and SVE timings for 1/8/80 threads.
+    result: >-
+      At T=2048/C=4/H=4096, isolated Torch versus SVE post was
+      54.179/14.113 ms at 1T, 22.700/3.299 ms at 8T, and 12.890/1.503 ms at
+      80T, or 3.84x/6.88x/8.58x. Complete Torch versus SVE post-pre was
+      172.904/58.349 ms, 57.131/10.008 ms, and 30.603/2.345 ms, or
+      2.96x/5.71x/13.05x. Maximum post BF16 absolute error was 0.015625 and
+      relative L2 error was 9.89e-6. GNU objdump confirmed an accumulator chain
+      of one FMUL followed by four FMLA instructions before direct ST1H, with
+      no accumulator-zeroing instruction. An H-U4 experiment was rejected:
+      versus U2 it changed isolated-post latency by +19.1%/+0.1%/+74.5%/
+      -57.8%/+57.9%/-7.7% at 1/8/16/32/64/80T. The non-monotonic crossovers do
+      not support a robust thread threshold, so U2 remains the implementation.
+      A separate U1-only build confirmed the U2 choice at every sampled point:
+      U2 reduced isolated-post latency by 39.6%/20.4%/52.6%/6.0%/13.6%/4.0%
+      at 1/8/16/32/64/80T.
+      A control-to-pre-apply pipeline was also rejected. Same-process AB/BA
+      changed native-pre latency by -0.4%/+1.0%/+0.9%/+2.7%/+10.4%/+1.8% at
+      1/8/16/32/64/80T; positive values are regressions. The pipeline removed
+      pre_mix and one OpenMP region but coupled control and H-scan scheduling.
+  - id: compute.neon_m12_n4_head
+    part: compute
+    status: candidate
+    owner: cpu-kernels
+    opened: 2026-08-24
+    decision_by: 2026-09-23
+    next_decision: >-
+      Repeat the full final-head comparison on the second SVE machine and
+      profile the remaining native post/head/reduction stage composition.
+    adoption_gate: >-
+      Pass SVE128/SVE256 C=4 tail and empty-input tests, preserve both BF16
+      boundaries within 0.03125 maximum absolute error, improve the complete
+      final head at 1/8/80 threads, and avoid a second-machine regression.
+    depends_on:
+      - epilogue.sve_post_k4_rank1
+    conflicts_with: []
+    implementation:
+      - csrc/deepseek_v4_mhc_sve.cpp
+      - csrc/module.cpp
+      - src/fused_cpp/deepseek_v4_mhc.py
+      - tests/test_deepseek_v4_mhc.py
+      - tests/bench_deepseek_v4_mhc.py
+    hypothesis: >-
+      Fixed head N=4 exactly fills one 128-bit NEON FP32 vector independently
+      of the process SVE VL. An M12 kernel holds twelve output rows in registers,
+      loads each four-column FP32 weight once per K, and reuses it across twelve
+      indexed FMLA instructions. Reusing the native post and existing SVE
+      sigmoid/four-stream reduction removes Torch FP32 [T,4,H] temporaries.
+    selection: >-
+      Explicit mhc_post_hc_head_rmsnorm_sve_candidate calls only. Public
+      dispatch remains on the Torch baseline.
+    correctness: >-
+      Arm-codex-internal NUMA3 CPUs 240-247 with Torch bundled libgomp
+      preloaded: SVE256 and process-forced SVE128 each passed all 39 tests in
+      tests/test_deepseek_v4_mhc.py. Candidate coverage includes T=0/1/17,
+      fixed C=4, an M12 tail, and both strict BF16 boundaries.
+    benchmark: >-
+      Arm-codex-internal NUMA3, T=2048/C=4/H=4096, five warmups and 21 median
+      samples: PYTHONPATH=src:. LD_PRELOAD=<torch-bundled-libgomp>
+      OMP_NUM_THREADS=<T> OMP_DYNAMIC=FALSE OMP_PROC_BIND=close
+      OMP_PLACES=cores numactl --physcpubind=<cpus> --membind=3
+      .venv/bin/python tests/bench_deepseek_v4_mhc.py --tokens 2048
+      --hc-mult 4 --hidden-size 4096 --threads <T> --warmup 5 --runs 21
+      --candidate sve.
+    result: >-
+      Complete Torch versus native final head was 152.839/55.076 ms at 1T,
+      48.922/8.404 ms at 8T, 33.435/4.465 ms at 16T, 27.779/2.844 ms at 32T,
+      24.994/2.242 ms at 64T, and 25.226/1.917 ms at 80T, or
+      2.78x/5.82x/7.49x/9.77x/11.15x/13.16x. Hidden-state maximum absolute
+      error was 0.03125 with relative L2 4.10e-5; final-residual error was
+      0.015625 with relative L2 9.89e-6. GNU objdump showed twelve live NEON
+      accumulators and no Q-register stack spill in the M12 loop.
+  - id: dispatch.omp_team_reuse
+    part: dispatch
+    status: enabled
+    owner: cpu-kernels
+    implementation:
+      - csrc/deepseek_v4_mhc_sve.cpp
+    hypothesis: >-
+      Reusing one OpenMP team across independent work-sharing loops and using
+      nowait between independent sqrsum/projection loops reduces fork/join and
+      barrier overhead without coupling task ownership.
+    depends_on:
+      - compute.sve_n24_pipeline
+      - compute.neon_m12_n4_head
+    conflicts_with: []
+    correctness: >-
+      The experimental SVE256 build passed all 39 tests in
+      tests/test_deepseek_v4_mhc.py and produced bit-identical Pre outputs.
+    benchmark: >-
+      Arm-codex-internal NUMA3, T=2048/C=4/H=4096, five warmups and 21 AB/BA
+      median samples for Pre; matching separate-build measurements for final
+      head at 1/8/80T.
+    result: >-
+      Pre team reuse changed latency by +0.1%/+1.3%/+0.5%/+2.0%/+0.1%/-7.3%
+      at 1/8/16/32/64/80T, so only 80T improved. Final-head sqrsum nowait
+      changed latency by +5.6%/-1.3%/+1.6% at 1/8/80T. The user explicitly
+      selected the unified lower-boundary design despite these measured narrow-
+      width regressions; it is enabled inside explicit SVE candidates. Public
+      Torch dispatch remains unchanged. The simplified enabled build measured
+      Pre/Post-Pre/Final at 41.393/58.411/56.299 ms (1T),
+      6.812/9.955/8.360 ms (8T), and 0.844/2.310/1.983 ms (80T).
+    selection: >-
+      Always enabled inside the explicit SVE Pre and final-head candidates.
+
+variants:
+  - id: sve_n24_strided_t_control
+    features:
+      - compute.sve_n24_pipeline
+      - epilogue.sve_strided_t_control
+      - epilogue.sve_pre_apply_rmsnorm
+      - epilogue.sve_post_k4_rank1
+    entrypoint: mhc_pre_rmsnorm_sve_candidate
+    status: candidate
+  - id: sve_post_neon_m12_n4_head
+    features:
+      - epilogue.sve_post_k4_rank1
+      - compute.neon_m12_n4_head
+    entrypoint: mhc_post_hc_head_rmsnorm_sve_candidate
+    status: candidate

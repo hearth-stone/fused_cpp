@@ -87,6 +87,33 @@ void i8gemm_dynamic_scaled_mm_pair(at::Tensor first_output, at::Tensor second_ou
                                    at::Tensor second_weight_scale, int64_t second_N, int64_t second_Np,
                                    int64_t nthreads);
 
+// DeepSeek V4 mHC SVE narrow projection declarations.
+bool deepseek_v4_mhc_sve_projection_available();
+std::tuple<at::Tensor, at::Tensor, int64_t, int64_t> deepseek_v4_mhc_sve_projection(at::Tensor residual,
+                                                                                    at::Tensor packed_b,
+                                                                                    int64_t num_threads,
+                                                                                    int64_t b_window_bytes);
+std::tuple<at::Tensor, at::Tensor, at::Tensor> deepseek_v4_mhc_sve_control_postprocess(
+    at::Tensor mixes, at::Tensor sqrsum, at::Tensor hc_scale, at::Tensor hc_base, int64_t rms_elements, double rms_eps,
+    double pre_eps, double post_multiplier, double sinkhorn_eps, int64_t sinkhorn_repeat, int64_t num_threads);
+std::tuple<at::Tensor, at::Tensor, at::Tensor, int64_t, int64_t> deepseek_v4_mhc_sve_projection_control(
+    at::Tensor residual, at::Tensor packed_b, at::Tensor hc_scale, at::Tensor hc_base, double rms_eps, double pre_eps,
+    double post_multiplier, double sinkhorn_eps, int64_t sinkhorn_repeat, int64_t num_threads, int64_t b_window_bytes);
+at::Tensor deepseek_v4_mhc_sve_pre_apply_rmsnorm(at::Tensor residual, at::Tensor pre_mix, at::Tensor norm_weight,
+                                                 double norm_eps, int64_t num_threads);
+at::Tensor deepseek_v4_mhc_sve_post(at::Tensor layer_output, at::Tensor residual, at::Tensor post_mix,
+                                    at::Tensor comb_mix, int64_t num_threads);
+std::tuple<at::Tensor, at::Tensor> deepseek_v4_mhc_sve_post_head_rmsnorm(at::Tensor layer_output, at::Tensor residual,
+                                                                         at::Tensor post_mix, at::Tensor comb_mix,
+                                                                         at::Tensor packed_head, at::Tensor head_scale,
+                                                                         at::Tensor head_base, at::Tensor norm_weight,
+                                                                         double rms_eps, double head_eps,
+                                                                         double norm_eps, int64_t num_threads);
+std::tuple<at::Tensor, at::Tensor, at::Tensor, int64_t, int64_t> deepseek_v4_mhc_sve_pre_rmsnorm(
+    at::Tensor residual, at::Tensor packed_b, at::Tensor hc_scale, at::Tensor hc_base, at::Tensor norm_weight,
+    double rms_eps, double pre_eps, double post_multiplier, double sinkhorn_eps, int64_t sinkhorn_repeat,
+    double norm_eps, int64_t num_threads, int64_t b_window_bytes);
+
 // BF16 GEMM declarations - bf16_linear.cpp
 std::tuple<at::Tensor, int64_t, int64_t, int64_t> bf16_linear_prepare_weight(at::Tensor weight);
 at::Tensor bf16_linear_prepacked_to_dtype(at::Tensor input, at::Tensor packed_weight, int64_t K, int64_t N, int64_t Np,
@@ -357,6 +384,42 @@ PYBIND11_MODULE(_C, m) {
         py::arg("second_output"), py::arg("input"), py::arg("first_packed_weight"), py::arg("first_weight_scale"),
         py::arg("K"), py::arg("first_N"), py::arg("Kp"), py::arg("first_Np"), py::arg("second_packed_weight"),
         py::arg("second_weight_scale"), py::arg("second_N"), py::arg("second_Np"), py::arg("nthreads") = 0,
+        py::call_guard<py::gil_scoped_release>());
+
+  m.def("deepseek_v4_mhc_sve_projection_available", &deepseek_v4_mhc_sve_projection_available,
+        "Return whether the M8/M4 by N24 SVE FP32 projection is available.");
+  m.def("deepseek_v4_mhc_sve_projection", &deepseek_v4_mhc_sve_projection,
+        "Project BF16 [M,C,H] by packed FP32 [C*H,24] and return FP32 mixes/sqrsum.", py::arg("residual"),
+        py::arg("packed_b"), py::arg("num_threads") = 0, py::arg("b_window_bytes") = 1 << 20,
+        py::call_guard<py::gil_scoped_release>());
+  m.def("deepseek_v4_mhc_sve_control_postprocess", &deepseek_v4_mhc_sve_control_postprocess,
+        "Apply FP32 mHC pre/post sigmoid and strided-T Sinkhorn to [T,24] projection controls.", py::arg("mixes"),
+        py::arg("sqrsum"), py::arg("hc_scale"), py::arg("hc_base"), py::arg("rms_elements"), py::arg("rms_eps"),
+        py::arg("pre_eps"), py::arg("post_multiplier"), py::arg("sinkhorn_eps"), py::arg("sinkhorn_repeat"),
+        py::arg("num_threads") = 0, py::call_guard<py::gil_scoped_release>());
+  m.def("deepseek_v4_mhc_sve_projection_control", &deepseek_v4_mhc_sve_projection_control,
+        "Run the FP32 N24 projection followed by native SVE pre/post sigmoid and strided-T Sinkhorn.",
+        py::arg("residual"), py::arg("packed_b"), py::arg("hc_scale"), py::arg("hc_base"), py::arg("rms_eps"),
+        py::arg("pre_eps"), py::arg("post_multiplier"), py::arg("sinkhorn_eps"), py::arg("sinkhorn_repeat"),
+        py::arg("num_threads") = 0, py::arg("b_window_bytes") = 1 << 20, py::call_guard<py::gil_scoped_release>());
+  m.def("deepseek_v4_mhc_sve_pre_apply_rmsnorm", &deepseek_v4_mhc_sve_pre_apply_rmsnorm,
+        "Apply FP32 pre controls to four BF16 residual streams, preserve the BF16 boundary, and run RMSNorm.",
+        py::arg("residual"), py::arg("pre_mix"), py::arg("norm_weight"), py::arg("norm_eps"),
+        py::arg("num_threads") = 0, py::call_guard<py::gil_scoped_release>());
+  m.def("deepseek_v4_mhc_sve_post", &deepseek_v4_mhc_sve_post,
+        "Apply fixed-K4 residual mixing plus the rank-one layer-output injection and store BF16 residual.",
+        py::arg("layer_output"), py::arg("residual"), py::arg("post_mix"), py::arg("comb_mix"),
+        py::arg("num_threads") = 0, py::call_guard<py::gil_scoped_release>());
+  m.def("deepseek_v4_mhc_sve_post_head_rmsnorm", &deepseek_v4_mhc_sve_post_head_rmsnorm,
+        "Run native post, NEON M12xN4 HC-head projection, four-stream reduction, and final RMSNorm.",
+        py::arg("layer_output"), py::arg("residual"), py::arg("post_mix"), py::arg("comb_mix"), py::arg("packed_head"),
+        py::arg("head_scale"), py::arg("head_base"), py::arg("norm_weight"), py::arg("rms_eps"), py::arg("head_eps"),
+        py::arg("norm_eps"), py::arg("num_threads") = 0, py::call_guard<py::gil_scoped_release>());
+  m.def("deepseek_v4_mhc_sve_pre_rmsnorm", &deepseek_v4_mhc_sve_pre_rmsnorm,
+        "Run SVE mHC projection, control processing, pre residual reduction, and RMSNorm.", py::arg("residual"),
+        py::arg("packed_b"), py::arg("hc_scale"), py::arg("hc_base"), py::arg("norm_weight"), py::arg("rms_eps"),
+        py::arg("pre_eps"), py::arg("post_multiplier"), py::arg("sinkhorn_eps"), py::arg("sinkhorn_repeat"),
+        py::arg("norm_eps"), py::arg("num_threads") = 0, py::arg("b_window_bytes") = 1 << 20,
         py::call_guard<py::gil_scoped_release>());
 
   m.def("bf16_linear_to_dtype", &bf16_linear_to_dtype,
