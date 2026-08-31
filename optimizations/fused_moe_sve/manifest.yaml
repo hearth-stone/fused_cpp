@@ -1724,9 +1724,10 @@ features:
     implementation: optimizations/fused_moe_sve/features/unfused_pipeline.cpp
     hypothesis: >-
       With preallocated buffers and the identical production M12 SVE GEMM
-      body, direct gather-pack plus fused W13 SiLU/multiply/packC has lower
-      expert wall time than explicitly materializing extract, both pack-A
-      operations, FP32 W1/SiLU/W3 tensors, and the BF16 gated product.
+      body and FEXPA-plus-quadratic SiLU approximation, direct gather-pack plus
+      fused W13 SiLU/multiply/packC has lower expert wall time than explicitly
+      materializing extract, both pack-A operations, FP32 W1/SiLU/W3 tensors,
+      and the BF16 gated product.
     depends_on: []
     conflicts_with: []
     correctness: >-

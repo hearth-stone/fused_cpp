@@ -395,21 +395,22 @@ class WorkerPool {
   bool stopping_ = false;
 };
 
-svfloat32_t exp_poly5_neg(svbool_t predicate, svfloat32_t gate) {
+// Mirrors .Lmoe_sve_silu_consts and the production SILU_TO_BF16 sequence in
+// csrc/moe/arm/sve_bf16/kernels.S. The comparator correctness gate detects
+// drift if that production approximation changes.
+svfloat32_t exp_fexpa_poly2_neg(svbool_t predicate, svfloat32_t gate) {
   svfloat32_t x = svneg_f32_x(predicate, gate);
   x = svmin_n_f32_x(predicate, x, 87.0f);
   x = svmax_n_f32_x(predicate, x, -87.0f);
-  svfloat32_t rounded = svmul_n_f32_x(predicate, x, 1.4426950408889634f);
-  rounded = svrintn_f32_x(predicate, rounded);
-  const svint32_t exponent = svcvt_s32_f32_x(predicate, rounded);
-  const svfloat32_t reduced = svmls_n_f32_x(predicate, x, rounded, 0.6931471805599453f);
-  svfloat32_t polynomial = svmla_n_f32_x(predicate, svdup_f32(0.04166666f), reduced, 0.00833333f);
-  polynomial = svmla_f32_x(predicate, svdup_f32(0.16666666f), polynomial, reduced);
-  polynomial = svmla_f32_x(predicate, svdup_f32(0.5f), polynomial, reduced);
-  polynomial = svmla_f32_x(predicate, svdup_f32(1.0f), polynomial, reduced);
-  polynomial = svmla_f32_x(predicate, svdup_f32(1.0f), polynomial, reduced);
-  const svint32_t exponent_bits = svlsl_n_s32_x(predicate, svadd_n_s32_x(predicate, exponent, 127), 23);
-  return svmul_f32_x(predicate, polynomial, svreinterpret_f32_s32(exponent_bits));
+  svfloat32_t encoded = svmul_n_f32_x(predicate, x, 1.4426950408889634f);
+  encoded = svadd_n_f32_x(predicate, encoded, 196735.0f);
+  const svfloat32_t rounded = svsub_n_f32_x(predicate, encoded, 196735.0f);
+  svfloat32_t reduced = svmls_n_f32_x(predicate, x, rounded, 0.693145751953125f);
+  reduced = svmls_n_f32_x(predicate, reduced, rounded, 1.428606765330187e-06f);
+  const svfloat32_t table = svexpa_f32(svreinterpret_u32_f32(encoded));
+  svfloat32_t correction = svmla_n_f32_x(predicate, svdup_f32(1.000003695487976f), reduced, 0.5000003576278687f);
+  correction = svmul_f32_x(predicate, reduced, correction);
+  return svmla_f32_x(predicate, table, table, correction);
 }
 
 svuint32_t f32_to_bf16_bits(svbool_t predicate, svfloat32_t value) {
@@ -523,7 +524,7 @@ void run_silu(const float* gate, float* output, int64_t elements, int lanes, int
   for (int64_t index = range.begin; index < end; index += vector_length) {
     const svbool_t predicate = svwhilelt_b32(index, end);
     const svfloat32_t value = svld1_f32(predicate, gate + index);
-    const svfloat32_t denominator = svadd_n_f32_x(predicate, exp_poly5_neg(predicate, value), 1.0f);
+    const svfloat32_t denominator = svadd_n_f32_x(predicate, exp_fexpa_poly2_neg(predicate, value), 1.0f);
     svst1_f32(predicate, output + index, svdiv_f32_x(predicate, value, denominator));
   }
 }
