@@ -86,6 +86,13 @@ copies. It reports both the legacy minimum-expected full winner and the current
 one-step width uncertainty gate, so a regression remains visible rather than
 being hidden by selection.
 
+The first clean committed run completed successfully at revision `b219627`:
+`20260901T080803Z-arm_codex_internal-arm_high_skew_closure-b2196270211b`.
+Both external asset hashes matched, focused correctness reported 95 passed, and
+all three structured result files were copied locally and retained remotely.
+The result summary is
+[`../results/arm_codex_80c_high_skew_planner_gate_20260901.md`](../results/arm_codex_80c_high_skew_planner_gate_20260901.md).
+
 The exact-M and direct-route cases use the paper's TP4-oriented
 `H=4096,F=512` path. The explicit fused/unfused Lab comparator was repaired in
 commit `266da2c`: both paths now use the production FEXPA-plus-quadratic SiLU

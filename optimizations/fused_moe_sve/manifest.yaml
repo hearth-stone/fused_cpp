@@ -736,12 +736,13 @@ features:
       --suite
       optimizations/fused_moe_sve/paper_experiments/suites/arm_high_skew_closure.json
     result: >-
-      The Arm-codex development run found that fixed-width model ranking was
+      The Arm-codex committed run found that fixed-width model ranking was
       mostly sound, while legacy full underpriced mixed shapes with 32T lanes.
       A one-step width uncertainty gate reduced the three trace medians by
-      5.68-22.34 percent and kept measured-set regret at 0-0.20 percent. The
-      production analytical-full selector now implements that bounded rule;
-      final evidence still requires a committed-runner repeat.
+      5.69-17.95 percent and kept measured-set regret at 0-0.26 percent. The
+      production analytical-full selector now implements that bounded rule.
+      Formal run:
+      20260901T080803Z-arm_codex_internal-arm_high_skew_closure-b2196270211b.
 
   - id: measurement.gemm_operand_memory_services
     part: measurement
@@ -1705,11 +1706,11 @@ features:
       explicit-shape, empirical, and native planners are unchanged. On
       Arm-codex NUMA3 80C with three complete 2048-token TopK6 traces, 5
       warmups, 31 randomized paired runs, and four rotating packed-weight
-      copies, legacy expected-best versus the gate measured 42.216 to 35.281
-      ms on high skew, 42.117 to 34.426 ms on median, and 34.019 to 32.190 ms
-      on uniformish. Regret versus the measured candidate set was 0/0.07/0.20
-      percent. These development-snapshot results require one committed-runner
-      repeat before paper use.
+      copies, legacy expected-best versus the gate measured 42.091 to 36.525
+      ms on high skew, 40.643 to 34.433 ms on median, and 33.859 to 31.987 ms
+      on uniformish. Paired gains were 15.27/17.95/5.69 percent and regret
+      versus the measured candidate set was 0/0.26/0 percent. Formal run:
+      20260901T080803Z-arm_codex_internal-arm_high_skew_closure-b2196270211b.
 
   - id: planner.analytic_resource_vectors
     part: dispatch

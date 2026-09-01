@@ -180,7 +180,7 @@ On Arm-codex NUMA3 80C, the analytical full selector now applies a one-step
 width uncertainty gate only when a narrower calibrated width overlaps the
 expected winner's systematic-error interval. Across complete
 high-skew/median/uniformish traces it reduces legacy full latency by
-19.63/22.56/5.43% in paired medians and leaves 0/0.07/0.20% regret against the
+15.27/17.95/5.69% in paired medians and leaves 0/0.26/0% regret against the
 measured candidate set. This closes the declared three-trace 80C selection
 gate, not general temporal-order accuracy or the cross-machine claim.
 

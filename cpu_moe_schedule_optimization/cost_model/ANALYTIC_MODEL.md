@@ -54,11 +54,11 @@ gate for implicit-shape analytical full search. When the expected winner uses
 more than 8T and a candidate capped at the next narrower calibrated width has
 an overlapping systematic-error interval, full selects minimum expected time
 inside that narrower set. On complete high-skew/median/uniformish traces this
-reduced legacy full latency by 19.63/22.56/5.43% in paired medians and left
-0/0.07/0.20% regret against the measured candidate set. The old 80-core
+reduced legacy full latency by 15.27/17.95/5.69% in paired medians and left
+0/0.26/0% regret against the measured candidate set. The old 80-core
 42-second search remains historical evidence for broader candidate-space cost;
-the current three development runs took 29.46--50.41 s cold and still require a
-committed-runner repeat.
+the current committed three-trace run took 29.39--50.63 s cold. Its run id is
+`20260901T080803Z-arm_codex_internal-arm_high_skew_closure-b2196270211b`.
 
 ## Separation Of Concerns
 

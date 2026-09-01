@@ -222,10 +222,10 @@ A 2026-09-01 Arm-codex NUMA3 80C follow-up closes one bounded part of that
 problem. Analytical full now uses a one-step width uncertainty gate when a
 narrower calibrated width overlaps the expected winner. On complete
 high-skew/median/uniformish traces, the gate improves legacy full by
-19.63/22.56/5.43% in paired medians and leaves 0/0.07/0.20% measured-set
+15.27/17.95/5.69% in paired medians and leaves 0/0.26/0% measured-set
 regret. The run used 5 warmups, 31 randomized paired rounds, and four rotating
-weight copies. It remains development-snapshot evidence pending a committed
-runner repeat and does not close the 192-core or general temporal-order gate.
+weight copies at commit `b219627`; it does not close the 192-core or general
+temporal-order gate.
 
 ## Claims Allowed Now
 
@@ -374,9 +374,9 @@ design narrative.
 ### P0: planner
 
 - remove or gate the production quick active-set 8/16 wide-team regressions;
-- repeat the analytical-full one-step width gate on a committed snapshot and a
-  second Arm machine; its current three-trace 80C result is closed only inside
-  that declared domain;
+- repeat the analytical-full one-step width gate on a second Arm machine and a
+  larger route corpus; its committed three-trace 80C result is closed only
+  inside that declared domain;
 - define the quick/full relationship and the exact candidate space in paper
   pseudocode;
 - report measured regret over the full workload matrix;

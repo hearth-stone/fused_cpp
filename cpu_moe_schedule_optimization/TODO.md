@@ -143,10 +143,10 @@ below before becoming final paper tables.
 - [x] Close the analytical-full wide-team misranking on the current Arm-codex
   three-trace domain with a one-step width uncertainty gate. On NUMA3 80C, 5
   warmups, 31 randomized paired rounds, and four rotating weight copies, the
-  gate improves high-skew/median/uniformish by `19.63/22.56/5.43%` paired
-  medians and leaves `0/0.07/0.20%` measured-set regret. It does not change
-  quick/request-path, explicit-shape, empirical, or native planners. The result
-  remains development-snapshot evidence until the committed runner repeats it.
+  committed `b219627` runner improves high-skew/median/uniformish by
+  `15.27/17.95/5.69%` paired medians and leaves `0/0.26/0%` measured-set
+  regret. It does not change quick/request-path, explicit-shape, empirical, or
+  native planners.
 - [ ] Close the production quick-planner quality regression. Active-set 8/16
   still select over-wide homogeneous teams on the existing evidence; do not
   claim quick dominates fixed-width execution until a separate gate passes.

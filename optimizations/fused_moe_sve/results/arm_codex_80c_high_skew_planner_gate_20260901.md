@@ -9,13 +9,11 @@ candidate was already present but ranked incorrectly. Does the same failure
 occur on Arm-codex NUMA3, and can a bounded planner rule remove it without
 regressing less-skewed captured traces?
 
-This report is development-snapshot evidence. The benchmark and selector were
-uncommitted when measured; the base Git revision was `266da2c` and the measured
-`_moe_C` SHA256 was
+The final run is bound to Git revision
+`b2196270211b4049c2872350fce1b9188aa77de5`. The measured `_moe_C` SHA256 was
 `dd554ea366a2374a8ed51527d1e7a56942f0c824b4c348860457ac5a922b943f`.
-The exact suite is now declared in
-`paper_experiments/suites/arm_high_skew_closure.json`, but it must be rerun from
-one committed revision before paper use.
+The exact runner id is
+`20260901T080803Z-arm_codex_internal-arm_high_skew_closure-b2196270211b`.
 
 ## Configuration
 
@@ -29,14 +27,18 @@ one committed revision before paper use.
   request008/layer38.
 - Calibration SHA256:
   `e0ec1cd4ede5dfbdb1ef1748807357292cbad2b1786431642a9934908e42884b`.
+- Route-asset tree SHA256:
+  `cb263814f56665d6ac0e6af36572b0735d45794e99c95a288b7cae895923e840`.
 - Candidates: all 142 analytical strict full shapes plus explicit
   4T/8T/16T x LPT/reverse-odd/reverse-even controls.
 - Measurement: 5 warmups, 31 randomized paired rounds, four rotating packed
   weight copies. Every candidate produced bitwise-identical BF16 output.
-- Full cold planning: 29.46--50.41 s across the three traces. This remains an
+- Page policy: ordinary THP (`policy=thp`); no HugeTLB mapping was latched.
+- Focused runner correctness: 95 passed, 96 deselected.
+- Full cold planning: 29.39--50.63 s across the three traces. This remains an
   offline planner/autotuner, not a request-path algorithm.
 
-The development command for each route was:
+The runner rendered the following command for each route:
 
 ```bash
 env OMP_NUM_THREADS=1 OMP_DYNAMIC=FALSE OMP_PROC_BIND=FALSE \
@@ -72,13 +74,13 @@ empirical, and native planners are unchanged.
 
 | Trace | Legacy full plan | Legacy | One-step plan | One-step | Paired gain median/P10/P90 | Regret vs measured set |
 | --- | --- | ---: | --- | ---: | ---: | ---: |
-| high-skew | `(32,32,8,8)`, reverse-even | 42.216 ms | `(16,16,16,16,8,8)`, reverse-even | 35.281 ms | 19.63/18.21/20.41% | 0.00% |
-| median | `(32,32,8,8)`, reverse-odd | 42.117 ms | `(16,16,16,16,8,8)`, reverse-odd | 34.426 ms | 22.56/21.40/23.59% | 0.07% |
-| uniformish | `(16,16,8,8,8,8,8,8)`, reverse-even | 34.019 ms | `10x8T`, reverse-even | 32.190 ms | 5.43/3.75/7.30% | 0.20% |
+| high-skew | `(32,32,8,8)`, reverse-even | 42.091 ms | `(16,16,16,16,8,8)`, reverse-even | 36.525 ms | 15.27/14.30/16.00% | 0.00% |
+| median | `(32,32,8,8)`, reverse-odd | 40.643 ms | `(16,16,16,16,8,8)`, reverse-odd | 34.433 ms | 17.95/17.42/18.76% | 0.26% |
+| uniformish | `(16,16,8,8,8,8,8,8)`, reverse-even | 33.859 ms | `10x8T`, reverse-even | 31.987 ms | 5.69/4.23/7.29% | 0.00% |
 
 The gate passes the declared <=5% measured-regret and <=2% held-out-regression
 criteria on this three-trace corpus. The manual fixed-width/order model rank
-Spearman values are 0.988/0.842/0.316 for high-skew/median/uniformish. Thus the
+Spearman values are 1.000/0.855/0.158 for high-skew/median/uniformish. Thus the
 gate closes selection on the measured corpus but does not establish accurate
 temporal-order ranking or absolute-time prediction.
 
@@ -91,6 +93,6 @@ paired execution. The current DAG still does not carry physical core intervals
 into its two-LLC-domain service calculation, so this evidence supports a
 conservative planner gate rather than a fitted route-pair correction.
 
-Remaining gates are a committed-runner repeat, a larger multi-layer/request
-corpus, and a second Arm machine. The result does not close production quick
-planner quality or the general analytical contention/regret target.
+Remaining gates are a larger multi-layer/request corpus and a second Arm
+machine. The result does not close production quick planner quality or the
+general analytical contention/regret target.
