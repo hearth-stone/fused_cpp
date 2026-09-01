@@ -35,6 +35,7 @@ bench/sdpa/sdpa_versions_*.json
 
 # Local scratch / benchmark outputs
 tmp/
+/bench_assets/
 *.dSYM/
 standalone/clean_sdpa/clean_sdpa_bench
 standalone/moe_planner/*.o

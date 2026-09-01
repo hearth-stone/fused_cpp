@@ -21,8 +21,25 @@
     "cpu_start": 240,
     "exact_threads": "1,4,8",
     "direct_threads": 80,
-    "direct_experts": 8
+    "direct_experts": 8,
+    "high_skew_route": "bench_assets/moe_paper/dsv4_routes_pt_20260830/measured_request008_case009_zh2048-010.pt",
+    "high_skew_layer": 38,
+    "median_route": "bench_assets/moe_paper/dsv4_routes_pt_20260830/measured_request016_case017_zh2048-018.pt",
+    "median_layer": 4,
+    "uniformish_route": "bench_assets/moe_paper/dsv4_routes_pt_20260830/measured_request022_case023_zh2048-024.pt",
+    "uniformish_layer": 20,
+    "analytic_calibration": "bench_assets/moe_paper/arm_codex_numa3_80c/analytic_machine_numa3_80c_topology_v2_20260813.json"
   },
   "snapshot_submodules": ["3rdparty/xbyak_aarch64"],
-  "snapshot_external_paths": ["refs/i8gemm/lib"]
+  "snapshot_external_paths": ["refs/i8gemm/lib"],
+  "snapshot_external_assets": [
+    {
+      "path": "bench_assets/moe_paper/dsv4_routes_pt_20260830",
+      "sha256": "cb263814f56665d6ac0e6af36572b0735d45794e99c95a288b7cae895923e840"
+    },
+    {
+      "path": "bench_assets/moe_paper/arm_codex_numa3_80c",
+      "sha256": "6b341ff7bc998f89c8ead2f784a78a6688abd4374779f71b93e7a94836967ebd"
+    }
+  ]
 }

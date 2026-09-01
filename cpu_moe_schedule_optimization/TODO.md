@@ -1,5 +1,14 @@
 # MoE scheduling implementation checklist
 
+Status refresh: 2026-09-01. The latest validated comparator commit before this
+refresh is `266da2c`, but most supplemental executor/planner measurements below
+are still bound to the prior extension SHA256
+`5ed0b9c440acbf151cfbc22d95b00b6eee13fcd977ea2a16050018ee8cce73a9`.
+They close experimental questions, not the final artifact-freeze gate. Rebuild
+and rerun every headline result from one clean paper commit before submission.
+The durable project summary for these provisional measurements is
+[`amazon_192c_paper_closure_20260831.md`](../optimizations/fused_moe_sve/results/amazon_192c_paper_closure_20260831.md).
+
 The policy-aware TP2/EP2 scheduling update is implemented as one change set.
 Cross-profile interpolation deliberately remains disabled. A captured routing
 summary now passes exact-profile validation, but interpolation still requires
@@ -17,7 +26,26 @@ cost modeling have all landed. Legacy split/range controls were replaced by the
 single `(threads, window_tiles)` stage geometry: a task still covers full N, but
 may do so as multiple serial owner windows. The next phase should not accumulate
 isolated micro-optimizations. It should close the remaining high-value variables
-first, then refresh calibration and validate the system coherently.
+first, then refresh calibration and validate the system coherently. In order:
+
+1. Replace the template paper body with a claim-aligned draft and update the
+   paper-readiness/model documents to the current evidence.
+2. Freeze one source revision and regenerate every headline result through the
+   declarative paper runner. The 192C raw artifacts are preserved under ignored
+   workspace storage, and the Arm 80C route/calibration assets plus high-skew
+   suite are now runner-managed with expected SHA256 checks.
+3. Close or explicitly narrow the cost-model claim. Machine-local single-core
+   packed-B retention is now measured on AmazonC5192Cores, but multi-team
+   refill/topology and wide-team concurrent pressure remain open.
+4. Fix or conservatively gate planner misranking on skewed traces before
+   calling full search near-optimal or quick search generally superior to a
+   fixed-width fallback.
+5. Add the current upstream Arm CPU MoE baseline, a full multi-layer vLLM run,
+   a second Arm machine, and measured TP/EP communication before making system
+   or portability claims.
+6. Keep W8A16/W8A8, BF16 route storage, shared-expert extensions, W2-to-merge
+   fusion, router fusion, communication pipelining, and large-K specialization
+   outside the primary paper claim until the BF16 Arm path is closed.
 
 The legacy weight-split removal is complete across the production stack:
 
@@ -59,36 +87,106 @@ required main-table matrix are maintained in
 checklist below remains the implementation ledger; paper closure uses the
 additional P0 gates here.
 
-## 0. Paper-critical closure (2026-08-26)
+## 0. Paper-critical closure (refreshed 2026-08-31)
+
+The provisional AmazonC5192Cores NUMA1 closure run currently establishes:
+
+- a five-process local packed-B repeated-scan fit with an effective knee at
+  `0.662 x 2 MiB`, miss floor `17.37%`, nominal-L2 miss `68.03%`, and
+  two-L2 miss `79.80%`;
+- analytical isolated holdout MAPE `7.96%`, contention MAPE/P90
+  `10.85/16.08%`, and maximum measured shape regret `9.21%`;
+- a high-skew captured trace where measured `8T reverse-even` is `17.282 ms`
+  versus `22.857 ms` for the full-planner selection, a paired `24.43%`
+  latency reduction despite the model ranking 16T ahead of 8T;
+- complete captured-trace two-stage grids where the best independently staged
+  W13/W2 execution remains `1.93--5.87%` slower than the best whole-expert
+  plan; and
+- a repaired canonical explicit same-GEMM comparator: fused execution is
+  `17.87%` slower at `24 x 4T, M=48`, neutral within `0.79%` at
+  `12 x 8T, M=192`, and `19.11%` lower latency at `6 x 16T, M=2040`.
+
+These measurements require the artifact-integration and clean-rerun items
+below before becoming final paper tables.
 
 - [ ] Freeze one paper commit and regenerate every headline profile/result from
-  that source and extension. Do not combine the July 2026 nine-workload table
-  with the August quick/full implementation.
-- [ ] Rerun the controlled nine-case catalog with the default FP32 direct-route
-  path on at least two Arm machines. If BF16 route storage appears in any main
+  that source and extension. The current provisional results mix the prior
+  extension snapshot with the comparator repair in `266da2c`.
+- [x] Rerun the controlled nine-case catalog with the default FP32 direct-route
+  path on AmazonC5192Cores NUMA1 using 31 samples and the current empirical
+  profile.
+- [ ] Add the nine-case catalog to a committed >=31-sample paper suite and
+  repeat it on a second Arm machine. If BF16 route storage appears in any main
   table, first close its real model-level quality gate.
-- [ ] Compare the fused executor with the current upstream Arm CPU MoE path and
-  the explicit same-GEMM unfused control. Record identical shapes, routing,
-  affinity, page policy, warmups/runs, absolute latency, and numerical checks.
-- [ ] Replace reconstructed-only routing evidence with complete multi-layer
-  TopK traces, including at least one prefill and one decode-oriented corpus.
+- [x] Repair and measure the canonical explicit same-GEMM unfused control with
+  the production FEXPA-plus-quadratic SiLU approximation. H64/F64 plus
+  H4096/F512 M=`24,192,2040` correctness gates pass; the paper comparison must
+  use the standard `SiLU(gate) * up` artifact, not the rejected
+  exact-association control that adds an extra gate read.
+- [ ] Compare the fused executor with the current upstream Arm CPU MoE path.
+  Record identical shapes, routing, affinity, page policy, warmups/runs,
+  absolute latency, and numerical checks.
+- [x] Replace reconstructed-only evidence for the first route-distribution
+  study with three complete 2048-token TopK=6 captures (uniformish, median,
+  and high-skew). The converted `.pt` expert/layer tensors are elementwise
+  identical to their source `.npz` files and contain no duplicate expert per
+  token.
+- [ ] Run complete multi-layer traces across multiple requests, including at
+  least one full prefill sweep and one decode-oriented corpus. The current
+  three selected layers do not close this gate.
 - [ ] Decide the cost-model paper claim. Either refresh the empirical
   phase-aware model as the primary model, or make the analytical backend pass
   isolated MAPE <=10%, contention P90 <=15%, and maximum measured regret <=5%
-  on the declared two-machine domain.
-- [ ] Close the production quick-planner quality regression. On the current
-  80-core nine-case check, quick regresses active-set 8/16 by 15.54%/11.31%
-  against fixed 8T after selecting 40T; add a model correction or a measured
-  conservative gate before claiming quick dominates fixed-width planning.
-- [ ] Define full search explicitly as either an offline oracle/autotuner or a
-  bounded runtime algorithm. The current 142-strict + 327-dynamic analytical
-  DSV4 search takes about 42 seconds cold.
-- [ ] Publish a current quick/full result report with raw compact tables. The
-  August 21 result currently exists only in `MATHEMATICAL_MODEL.md` changelog.
-- [ ] Include `T_plan + T_execute` in every planner comparison. Report the
-  public runtime path, not only the internal C++ assignment kernel.
+  on the declared two-machine domain. The current local-retention result passes
+  isolated MAPE (`7.96%`) but still fails contention P90 (`16.08%`) and maximum
+  regret (`9.21%`); otherwise narrow the claim and domain explicitly.
+- [x] Close the analytical-full wide-team misranking on the current Arm-codex
+  three-trace domain with a one-step width uncertainty gate. On NUMA3 80C, 5
+  warmups, 31 randomized paired rounds, and four rotating weight copies, the
+  gate improves high-skew/median/uniformish by `19.63/22.56/5.43%` paired
+  medians and leaves `0/0.07/0.20%` measured-set regret. It does not change
+  quick/request-path, explicit-shape, empirical, or native planners. The result
+  remains development-snapshot evidence until the committed runner repeats it.
+- [ ] Close the production quick-planner quality regression. Active-set 8/16
+  still select over-wide homogeneous teams on the existing evidence; do not
+  claim quick dominates fixed-width execution until a separate gate passes.
+- [x] Define the current full planner as an offline planner/autotuner, not a
+  proven oracle or request-path algorithm. Keep empirical full-search latency
+  separate from the older 142-strict + 327-dynamic analytical search result.
+- [ ] Write the exact quick/full candidate spaces, objectives, pruning, and
+  complexity in the paper; report empirical and analytical full-search costs
+  separately.
+- [x] Generate provisional compact quick/full tables for the nine-case catalog
+  and three captured traces, including cold/warm planning time, execution time,
+  selected action, and raw 31-sample arrays.
+- [ ] Finish moving the provisional real-route, retention, two-stage, and
+  unfused cases into `paper_experiments/`. The 192C artifacts are preserved in
+  `tmp/moe_paper_archive/amazon_192c_20260831`; ignored route/calibration assets
+  now have runner-enforced tree hashes, and `arm_high_skew_closure.json` covers
+  the three Arm-codex 80C planner traces. Amazon 192C machine configuration and
+  a clean frozen >=31-sample rerun remain blocked while that host is unavailable.
+- [ ] Include `T_plan + T_execute` in every final planner comparison. The
+  captured-trace artifact already reports it, but the complete paper matrix
+  must use the public runtime path rather than only internal assignment cost.
+- [ ] Replace the remaining template content in the companion paper's
+  `main.tex`: write the abstract and keywords, remove `Ease of Use` and the
+  IEEE example sections, and add complete cost
+  model, planner, execution, evaluation, related-work, and limitations
+  sections.
+- [ ] Align the paper thesis with the demonstrated scope: Linux AArch64 SVE
+  BF16 is primary; x86, W8A16/W8A8, general plan-then-adapt superiority, and a
+  near-optimal full planner are not current headline claims.
+- [ ] Replace both method figure placeholders, add the kernel/cost/planner
+  tables, create the missing bibliography database, and synchronize the
+  Chinese translation after the English method is stable.
+- [ ] Run model-level quality validation for the production FEXPA SiLU and
+  DeepSeek clamp-10 path. Keep BF16 route storage out of headline tables unless
+  its separate real TopK=6 model-level gate also passes.
 - [ ] Add a real multi-layer vLLM measurement and measured TP/EP communication
   before making layer- or model-level distributed performance claims.
+- [ ] Either exclude 30k-token execution from the paper domain or repair the
+  current FP32 direct-route int32-offset limit (TopK=6 reaches it at about
+  21,845 tokens) and rerun the default path without forcing fallback.
 
 ## 1. Schema-v2 profiling
 
@@ -165,9 +263,19 @@ additional P0 gates here.
   (40,768 B); the 4096-run 2026-08-02 refresh measured 0.340/30.377 TFLOP/s at
   1/96T, while holdout MAPE/contention P90/max regret were
   9.18%/49.57%/8.17%. Only the isolated gate now passes.
+- [x] Replace the transferred AmazonC5192Cores packed-B retention prior with a
+  machine-local single-core repeated-scan probe. Five independent M12/M120
+  process pairs locate the stable miss floor at `17.37%` around 1.25 MiB, the
+  fitted knee at `0.662 x 2 MiB`, nominal-L2 miss at `68.03%`, and two-L2 miss
+  at `79.80%`. Rebuilding the current thin model with these anchors yields
+  isolated holdout MAPE `7.96%`, contention MAPE/P90 `10.85/16.08%`, and
+  maximum shape regret `9.21%`; the local prior improves absolute contention
+  but does not close ranking.
 - [ ] Measure independent exact-M M1-M11 core-efficiency ratios relative to the
   M12 L1-hot service. Admit them only if they improve unseen tail routes without
-  becoming another route/thread latency table.
+  becoming another route/thread latency table. The current complete-call
+  exact-M speedup A/B does not by itself provide these independent service
+  ratios.
 - [x] Measure the corresponding machine-local cache topology and
   L1-hot/L2/LLC/DRAM service curves on AmazonECS8Cores. The runtime uses
   `backend_n_tile=16`; the profile marks its current 1/8-L2 packed-B retention
@@ -185,7 +293,9 @@ additional P0 gates here.
   have up to 17.69% paired-round residual even though selected regret is below
   5% throughout the declared 192-core domain.
 - [ ] Calibrate multi-team packed-B retention/refill and below-NUMA LLC topology
-  from independent probes; do not add a task-pair slowdown table.
+  from independent probes; do not add a task-pair slowdown table. The new local
+  single-core retention curve closes only the task-local reuse input, not the
+  wide-team/cache-data pressure exposed by the high-skew planner miss.
 - [ ] Validate unseen routes, widths, mixed distributions, and full-stage
   owner-stripe behavior against the acceptance gates in
   `cost_model/ANALYTIC_MODEL.md`.
@@ -461,11 +571,16 @@ bytes, not predicted DRAM traffic.
     1001-pair M=48 run showed that the sub-10 us difference is below E2E noise,
     so direct route is now default-on; `FUSED_CPP_MOE_SVE_W2_DIRECT_ROUTE=0`
     retains the contiguous-down plus owner-scatter fallback.
-  - [ ] Measure uniform, hotspot, and captured distributions across short and
-    medium routes, and regenerate iso/contention profiles under the default
-    direct-route path. Existing profiles predate this default and represent the
-    contiguous-down plus scatter implementation. Separate route-buffer
-    first-touch page faults from steady kernel time when evaluating tail latency.
+  - [x] Measure uniform and complete captured distributions across short,
+    medium, and long routes on the current AmazonC5192Cores binary, and generate
+    the matching default FP32 direct-route iso/contention profile. The current
+    bounded result is `-3.12/-0.69/+0.01/+4.36/+3.98%` for synthetic
+    M=`12,48,192,1536,2040`; captured high-skew gains are `+2.68/+3.68%` at
+    2048/4096 tokens, while several uniform/median points remain around the
+    noise floor. Do not reuse the historical `15--16%` as a general claim.
+  - [ ] Repeat the direct-route matrix on a second Arm machine through the
+    frozen paper runner and retain route-buffer first-touch controls before
+    promoting a cross-machine claim.
 - [x] Add a direct BF16 route-store variant after the FP32 prototype. The SVE
   M12/M8/M4/M2/M1 W2 epilogues convert each result vector to BF16 and store it
   directly at the route-row destination; final top-k accumulation remains FP32.

@@ -1059,6 +1059,7 @@ def test_analytic_full_searches_all_shapes_with_a_quick_baseline() -> None:
 def test_analytic_full_optimizes_expected_makespan_not_working_set() -> None:
     fastest = {
         "makespan_ns": 80.0,
+        "uncertainty_ns": 1.0,
         "pessimistic_ns": 100.0,
         "active_working_set_bytes": 2,
         "resource_groups": 2,
@@ -1066,6 +1067,7 @@ def test_analytic_full_optimizes_expected_makespan_not_working_set() -> None:
     }
     smaller_working_set = {
         "makespan_ns": 81.0,
+        "uncertainty_ns": 1.0,
         "pessimistic_ns": 90.0,
         "active_working_set_bytes": 1,
         "resource_groups": 1,
@@ -1073,6 +1075,39 @@ def test_analytic_full_optimizes_expected_makespan_not_working_set() -> None:
     }
 
     assert IntervalPlanner._select_analytic_full([smaller_working_set, fastest]) is fastest
+
+
+def test_analytic_full_steps_down_one_width_inside_systematic_uncertainty() -> None:
+    fastest = {
+        "makespan_ns": 100.0,
+        "uncertainty_ns": 15.0,
+        "pessimistic_ns": 115.0,
+        "active_working_set_bytes": 10,
+        "resource_groups": 4,
+        "shape": (32, 32, 8, 8),
+    }
+    one_step_narrower = {
+        "makespan_ns": 104.0,
+        "uncertainty_ns": 15.6,
+        "pessimistic_ns": 119.6,
+        "active_working_set_bytes": 20,
+        "resource_groups": 6,
+        "shape": (16, 16, 16, 16, 8, 8),
+    }
+    two_steps_narrower = {
+        "makespan_ns": 107.0,
+        "uncertainty_ns": 16.05,
+        "pessimistic_ns": 123.05,
+        "active_working_set_bytes": 30,
+        "resource_groups": 10,
+        "shape": (8,) * 10,
+    }
+
+    selected = IntervalPlanner._select_analytic_full(
+        [two_steps_narrower, one_step_narrower, fastest]
+    )
+
+    assert selected is one_step_narrower
 
 
 def test_analytic_uncertainty_is_systematic_across_waves() -> None:

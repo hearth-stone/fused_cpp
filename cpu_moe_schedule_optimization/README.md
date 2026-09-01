@@ -120,16 +120,21 @@ It does not load a route/thread latency table or measured contention-shape
 table. Machine calibration is explicit and never runs at import or on the first
 request.
 
-The current analytical evidence is mixed:
+The current Amazon 192-core analytical evidence uses a machine-local
+single-core packed-B retention probe:
 
-- 9.18% isolated MAPE on 108 true holdout points passes the 10% gate;
-- 49.57% contention P90 error fails the 15% gate;
-- 8.17% maximum measured shape regret fails the 5% gate;
-- the narrower tile-window selector reaches 1.10/3.45/4.40% median/P90/max
-  regret on its six declared 192-core transition points.
+- 7.96% isolated holdout MAPE passes the 10% gate;
+- 10.85% contention MAPE and 16.08% P90 error narrowly miss the 15% P90 gate;
+- 9.21% maximum measured shape regret fails the 5% gate;
+- replacing the transferred retention prior improves contention P90 from
+  16.97% to 16.08% but leaves maximum regret unchanged;
+- the narrower tile-window selector reaches approximately 0.83/3.05/4.18%
+  median/P90/max regret after repeating its boundary point.
 
 The analytical runtime is therefore an explicit deployment capability, not a
-general replacement for the empirical holdout oracle.
+general replacement for the empirical reference model. Retention is a required
+physical variable, but the high-skew result shows that wide-team concurrency
+and temporal-order ranking remain under-modeled.
 
 ## Planner Modes
 
@@ -158,13 +163,26 @@ modeled candidate family:
 - the quick winner rescored as an explicit strict baseline for analytical full
   search.
 
-Analytical full selects minimum expected modeled makespan. Its systematic model
-error is not reduced by the number of experts or calibration runs.
+Analytical full first identifies minimum expected modeled makespan. For an
+implicit-shape winner wider than 8T, it may step down one calibrated width only
+when the candidates' systematic-error intervals overlap. Systematic model error
+is not reduced by the number of experts or calibration runs.
 
-Full is currently an offline performance-oracle path. The latest 80-core DSV4
-run evaluated 142 strict and 327 dynamic candidates and took about 42 seconds
-cold. Its selected plan measured 34.418 ms versus quick at 37.141 ms; the best
-measured top-six candidate was 33.907 ms, for 1.51% selected shortlist regret.
+Full is currently an offline reference/autotuning path, not an oracle. On the
+latest 96-core, 31-sample matrix, cold/warm planning took 0.55--7.06/0.11--3.19
+ms. It found measured-best plans on the captured uniformish and median traces,
+and a 4T tail pool improved long/short bimodal by 36.8%. On the captured
+high-skew trace, however, it selected 16T LPT at 22.857 ms while 8T reverse-even
+measured 17.282 ms. The 24.43% paired gap and 0.692 measured/predicted rank
+Spearman identify cost ranking, not candidate coverage, as the current blocker.
+
+On Arm-codex NUMA3 80C, the analytical full selector now applies a one-step
+width uncertainty gate only when a narrower calibrated width overlaps the
+expected winner's systematic-error interval. Across complete
+high-skew/median/uniformish traces it reduces legacy full latency by
+19.63/22.56/5.43% in paired medians and leaves 0/0.07/0.20% regret against the
+measured candidate set. This closes the declared three-trace 80C selection
+gate, not general temporal-order accuracy or the cross-machine claim.
 
 ### Deployment runtime
 
@@ -178,10 +196,12 @@ native C++ selection when available, and strict Plan V2. It:
 - supports `initialize_planner(max_routes)` to precompute the dense cost grid;
 - supports `FUSED_CPP_MOE_PLANNER_FIXED_THREADS` for fixed-width LPT.
 
-The current quick path is not uniformly better than fixed 8T. In the latest
-80-core nine-case operator check it improved long/short bimodal by 22.13%, but
-regressed active-set 8/16 by 15.54%/11.31% after selecting an over-wide 40T
-team. This is an open paper-critical gate, not a hidden limitation.
+The quick path is not uniformly better than fixed-width execution. Earlier
+80-core checks regressed active-set 8/16 by 15.54%/11.31% after selecting an
+over-wide 40T team, and the current high-skew study shows the broader full model
+can also underprice wide-team contention even though the new full-only gate
+mitigates it on three traces. Quick quality remains an open paper-critical gate,
+not a hidden limitation.
 
 ## Plan V2
 
@@ -218,8 +238,9 @@ long/short evidence contains a known regression when early merge stays on.
 | `dsv4-real-2048-seq70` | captured top-16 counts plus a deterministic moment-matched synthetic tail |
 
 The DSV4 artifact is a reconstructed routing summary, not a complete original
-`topk_ids` trace. Paper evaluation must add complete multi-layer traces and
-decode-oriented inputs.
+`topk_ids` trace. The 2026-08-31 supplemental study adds three complete
+single-layer traces, but paper evaluation must still add complete multi-layer,
+multi-request, and decode-oriented inputs.
 
 ## Current Commands
 
@@ -295,6 +316,10 @@ local non-SVE build is not correctness evidence for the native path.
 - Plan V2 schema: [planners/plan_schema.md](planners/plan_schema.md)
 - Offline isolated oracle: [planners/ISOLATED_CP_SAT_ORACLE.md](planners/ISOLATED_CP_SAT_ORACLE.md)
 - SVE implementation and experiments: [optimizations/fused_moe_sve/README.md](../optimizations/fused_moe_sve/README.md)
+- Current Amazon 192-core closure measurements:
+  [amazon_192c_paper_closure_20260831.md](../optimizations/fused_moe_sve/results/amazon_192c_paper_closure_20260831.md)
+- Arm-codex 80-core analytical-full width gate:
+  [arm_codex_80c_high_skew_planner_gate_20260901.md](../optimizations/fused_moe_sve/results/arm_codex_80c_high_skew_planner_gate_20260901.md)
 - SVE feature lifecycle: [optimizations/fused_moe_sve/manifest.yaml](../optimizations/fused_moe_sve/manifest.yaml)
 - vLLM integration: [docs/vllm_bf16_tiled_moe_integration.md](../docs/vllm_bf16_tiled_moe_integration.md)
 - Retired wave design: [DEPRECATED_WAVE.md](DEPRECATED_WAVE.md)

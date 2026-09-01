@@ -767,9 +767,44 @@ class IntervalPlanner:
 
     @staticmethod
     def _select_analytic_full(candidates: Sequence[dict]) -> dict:
-        """Select the minimum expected makespan over the complete model space."""
-        return min(
+        """Select expected-best full plan with one bounded uncertainty fallback."""
+        if not candidates:
+            raise ValueError("analytical full selection requires at least one candidate")
+        fastest = min(
             candidates,
+            key=lambda candidate: (
+                candidate["makespan_ns"],
+                candidate["pessimistic_ns"],
+                candidate["active_working_set_bytes"],
+                candidate.get("resource_groups", len(candidate["shape"])),
+            ),
+        )
+        fastest_width = max(int(width) for width in fastest["shape"])
+        if fastest_width <= 8:
+            return fastest
+        narrower_widths = sorted(
+            {
+                max(int(width) for width in candidate["shape"])
+                for candidate in candidates
+                if max(int(width) for width in candidate["shape"]) < fastest_width
+            }
+        )
+        if not narrower_widths:
+            return fastest
+        target_width = narrower_widths[-1]
+        fastest_lower = fastest["makespan_ns"] - fastest["uncertainty_ns"]
+        fastest_upper = fastest["pessimistic_ns"]
+        narrowed = [
+            candidate
+            for candidate in candidates
+            if max(int(width) for width in candidate["shape"]) <= target_width
+            and candidate["makespan_ns"] - candidate["uncertainty_ns"] <= fastest_upper
+            and candidate["pessimistic_ns"] >= fastest_lower
+        ]
+        if not narrowed:
+            return fastest
+        return min(
+            narrowed,
             key=lambda candidate: (
                 candidate["makespan_ns"],
                 candidate["pessimistic_ns"],

@@ -1,6 +1,6 @@
 # Moldable Fused-Expert Execution: Implementation and Evidence Dossier
 
-Status date: 2026-08-27.
+Status date: 2026-08-31.
 
 This document is the paper-drafting source for the fused-expert part of the CPU
 MoE project. It records what was implemented, why each mechanism exists, the
@@ -40,9 +40,10 @@ narrow-domain path but is not an automatic default.
 
 The implementation is substantially complete. The remaining fused-expert work
 is evidence closure: a frozen-build cumulative ablation, a current upstream Arm
-baseline, a repaired same-activation explicit pipeline, full captured routing,
-multi-layer integration, second-machine repeats for all headline mechanisms,
-and model-level quality for quantized paths.
+baseline, full multi-layer captured routing, multi-layer integration,
+second-machine repeats for all headline mechanisms, and model-level quality for
+quantized paths. The same-activation explicit pipeline is repaired, but its
+current measurements remain provisional until the final frozen-build rerun.
 
 ## Paper-facing claim and novelty boundary
 
@@ -232,10 +233,10 @@ materialized product tensor, and a second pack-A pass before W2.
 The SVE compatibility selectors `silu_poly_degree=4/5/6` now share one
 FEXPA+degree-2 residual evaluator. The current evaluator improved isolated SiLU
 latency and accuracy but was approximately neutral for full standard-SiLU W13;
-its stronger complete-expert result is on the clamp-10 path. Historical
-poly5-based explicit-fusion comparisons therefore cannot be directly rerun
-against the current production fused path without updating their activation
-contract.
+its stronger complete-expert result is on the clamp-10 path. The Lab
+explicit-unfused comparator now uses the same evaluator. Its residual numerical
+difference is the expected FP32 accumulation/rounding difference between
+separate W1/W3 GEMMs and interleaved W13, rather than an activation mismatch.
 
 Supported activation surfaces are broader at the generic API than in the paper
 path. Materialized BF16 execution supports SiLU, GELU, and `swigluoai`; the
@@ -348,13 +349,13 @@ workloads.
 | Shared fused gather-pack | Extract+pack traffic and idle gather workers | Production | 2.3-12.6% complete-call gain for sampled underfilled M1-37 on the 8-core host | Second-machine E2E repeat |
 | Exact-M JIT | M8/M12 tail overcompute | Production | Gains concentrated at M5/6 and M9/10 on two Arm machines; M12 neutral | Frozen-build full matrix |
 | Double-buffered small-M K loop | Generated-kernel load latency | Production | Restored M<=8 controls to neutral/near-neutral while retaining exact-M wins | No new gate beyond frozen repeat |
-| W13+SwiGLU+packed-C | Intermediate tensors and second pack-A | Production | Historical same-GEMM explicit fusion reduced latency 3.29-5.63% as the working set grew, with lower LLC misses/stalls | Rebuild explicit baseline with current FEXPA activation |
+| W13+SwiGLU+packed-C | Intermediate tensors and second pack-A | Production | Current canonical control: -17.87% at M48, neutral within 0.79% at M192, +19.11% at M2040 | Repeat from the frozen paper commit and add upstream baseline |
 | FEXPA+poly2 SiLU | Activation latency and approximation error | Production SVE | Isolated SiLU improved 18-34%; full standard-SiLU W13 was neutral, clamp path up to 1.53% complete-expert gain | Model-level quality for approximate activation |
-| W2 FP32 direct route | Per-team down buffer and scatter | Production default | M192 +2.18%; M1536 +15.82%; M2040 +16.44%; short routes near noise | Captured distributions on frozen build |
+| W2 FP32 direct route | Per-team down buffer and scatter | Production default | Current uniform M1536/M2040: +4.36/+3.98%; captured high-skew 2048/4096: +2.68/+3.68%; short/moderate cases near noise | Frozen-build and second-machine repeat |
 | BF16 direct route | Halve route traffic again | Experimental | M1536 +4.68% versus FP32 direct; short M mostly neutral | Model-level quality |
 | Register-resident SVE merge | Worker FP32 accumulator allocation/traffic | Production | Small E2E gain, but removes hot-path allocation | Fixed-TopK numerical disclosure and broader shapes |
 | Ready-token merge | Hide merge behind expert tails | Production on supported async path | Less than 0.4% change on existing balanced/skew tests; one trace merged 605/2048 tokens early | Captured multi-wave heavy tails |
-| Per-stage tile windows | Owner-stripe cache pressure | Production policy on declared domains | Recorded planner A/B: +12.4% uniform, +10.6% captured DSV4 | Frozen-binary rerun and wider holdout |
+| Per-stage tile windows | Owner-stripe cache pressure | Production policy on declared domains | Current captured uniformish 2048/4096: +7.23/+4.85%; other measured traces are neutral to +1.12% | Frozen-binary rerun and wider holdout |
 | Plan V2 task ABI | Make kernel controls executable | Production | Strict, tail-pool, and bounded route-sliced execution tested | Paper pseudocode and current end-to-end matrix |
 
 ## Quantized execution extensions
@@ -445,39 +446,48 @@ Framework smoke:
 
 ### Fusion mechanism evidence
 
-The historical same-GEMM explicit pipeline measured 3.29-5.63% lower latency
-for the fused path as routed working sets increased. PMU runs also reported
-lower LLC read misses and backend memory-stall cycles. The experiment isolates
-the dataflow mechanism and is not an upstream-system comparison.
+The canonical explicit pipeline now uses the production
+FEXPA-plus-quadratic evaluator and computes the explicit
+`SiLU(gate) * up` intermediate. Production-size output relative-L2 is
+0.215%--0.231%, within the declared gate. On uniform controls, fused execution
+is 17.87% slower at M=48, neutral within 0.79% at M=192, and 19.11% lower
+latency at M=2040.
 
-It is historical only. A current rerun is blocked because its explicit path
-evaluates poly5 while current fused W13 evaluates FEXPA+poly2. F512 and F2048
-controls both failed the comparator's predeclared relative-L2 limit. No new
-timing should be reported until both variants have identical activation and
-rounding semantics.
+The mechanism is therefore materialization avoidance whose value grows with
+the routed working set, not a universal small-route speedup. The comparator is
+a standalone same-GEMM control, excludes route construction and merge, and is
+not an upstream-system comparison. Historical PMU evidence remains useful for
+mechanism interpretation but should not replace the current timing.
 
-Source:
+Current source:
+[`../optimizations/fused_moe_sve/results/amazon_192c_paper_closure_20260831.md`](../optimizations/fused_moe_sve/results/amazon_192c_paper_closure_20260831.md).
+Historical PMU source:
 [`../optimizations/fused_moe_sve/results/amazon_192c_unfused_pipeline.md`](../optimizations/fused_moe_sve/results/amazon_192c_unfused_pipeline.md).
 
 ### Direct-route evidence
 
 The FP32 direct-route path is bitwise identical to FP32 scatter in focused
-tests. Its benefit grows with route count:
+tests. The current uniform eight-expert control is:
 
 | Routes per expert | Recorded E2E effect |
 | ---: | ---: |
-| 12 | -0.95%, within the short-route noise region |
-| 48 | no measurable gain in the repeated control |
-| 192 | +2.18% |
-| 1536 | +15.82% |
-| 2040 | +16.44% |
+| 12 | -3.12% |
+| 48 | -0.69% |
+| 192 | +0.01% |
+| 1536 | +4.36% |
+| 2040 | +3.98% |
 
-The correct paper interpretation is not that direct route always speeds up an
-expert. It removes one materialization/scatter boundary and strongly benefits
-large route tensors; short calls are dominated by fixed kernel and scheduling
-costs.
+Complete high-skew traces improve by +2.68% at 2048 tokens and +3.68% at 4096
+tokens, with positive paired P10. Other captured cases are smaller or cross
+zero. The correct interpretation is that direct route removes one
+materialization/scatter boundary and modestly benefits sufficiently long or
+skewed route tensors; short and moderate calls are dominated by fixed kernel
+and scheduling costs. The current binary does not reproduce the historical
+15--16% long-route result.
 
-Source:
+Current source:
+[`../optimizations/fused_moe_sve/results/amazon_192c_paper_closure_20260831.md`](../optimizations/fused_moe_sve/results/amazon_192c_paper_closure_20260831.md).
+Historical source:
 [`../optimizations/fused_moe_sve/results/amazon_192c_w2_direct_route.md`](../optimizations/fused_moe_sve/results/amazon_192c_w2_direct_route.md).
 
 ### Merge evidence
@@ -492,12 +502,16 @@ Source:
 
 ### Tile-window evidence
 
-The recorded stage-window policy A/B improved uniform and captured DSV4 calls
-by approximately 12.4% and 10.6%. This is evidence that stage traversal and
-owner-stripe cache fit are useful controls. It must be rerun with the frozen
-paper binary and matching current profile before becoming a headline result.
+The current complete-trace A/B improves uniformish 2048/4096 by +7.23/+4.85%.
+Other median/high-skew points range from -0.16% to +1.12%, and the measured
+30,720-token cases are neutral. This is evidence that stage traversal and
+owner-stripe cache fit are useful controls only in a bounded route domain. The
+historical uniform/captured result remains mechanism provenance, and the
+headline matrix still needs a frozen-binary repeat.
 
-Source:
+Current source:
+[`../optimizations/fused_moe_sve/results/amazon_192c_paper_closure_20260831.md`](../optimizations/fused_moe_sve/results/amazon_192c_paper_closure_20260831.md).
+Historical source:
 [`../optimizations/fused_moe_sve/results/amazon_192c_stage_window_tiles_20260810.md`](../optimizations/fused_moe_sve/results/amazon_192c_stage_window_tiles_20260810.md).
 
 ## Negative results and intentionally bounded fusion
@@ -510,6 +524,18 @@ the paper narrative.
 Avoiding the BF16 `[M,F]` packed intermediate would require either recomputing
 W13 for different W2 H tiles or retaining/spilling much larger FP32 partial W2
 outputs. No loop ordering and traffic proof currently justifies this change.
+
+### Global two-stage scheduling is retained only as a conditional candidate
+
+Separating the whole MoE call into one fused W13 stage and one fused W2 stage
+allows independent widths. The current captured-trace search consistently
+prefers 8T W13 and 4T W2, confirming that the two GEMMs have different
+stage-local optima. Nevertheless, the best two-stage schedules are 1.93%--5.87%
+slower than the best whole-expert schedules on the three measured traces. The
+global barrier and full intermediate lifetime outweigh the recovered
+stage-width flexibility. Keep this as a planner candidate/control; do not make
+it the default without a workload where its paired gain clears the adoption
+gate.
 
 ### Full W2-to-merge fusion is deprioritized
 
@@ -559,7 +585,8 @@ ablation only after captured heavy-tail validation.
 
 ### Paper-critical implementation or artifact gaps
 
-- repair the current same-activation explicit-unfused control;
+- rerun the repaired same-activation explicit-unfused control from the frozen
+  paper commit;
 - pin or commit the ignored external `refs/i8gemm/lib` source rather than only
   recording its content hash;
 - freeze one source/extension/profile identity;
@@ -582,9 +609,10 @@ The current implementation and evidence support these bounded statements:
 - shared adaptive gather-pack activates otherwise idle team workers on
   underfilled expert calls;
 - fused W13 produces a W2-ready BF16 packed intermediate without materializing
-  the explicit activation pipeline;
+  the explicit activation pipeline, with a measured benefit only once the
+  routed working set is sufficiently large;
 - FP32 W2 direct route removes the per-team down buffer and scatter traffic,
-  with the strongest measured benefit on long routes;
+  with a modest measured benefit on sufficiently long or skewed routes;
 - Plan V2 makes width/window/task dependencies executable in the native
   runtime;
 - the same dataflow has explicit W8A16 and W8A8 extensions, subject to their
@@ -598,7 +626,9 @@ A draft must not claim:
 - a current general speedup over upstream vLLM, oneDNN, or another production
   baseline;
 - one monolithic kernel fuses the whole MoE layer;
-- current explicit-fusion speedup is 3.29-5.63% without labeling it historical;
+- fusion universally improves short, medium, and long expert calls;
+- the historical 3.29--5.63% fusion or 15--16% direct-route result describes
+  current-binary performance;
 - all fixed-TopK reductions preserve sequential FP32 FMA association;
 - BF16 route storage is quality-neutral at model level;
 - W8A16 or W8A8 preserves model quality;
@@ -681,14 +711,16 @@ automatic precision selection remain open.
 
 ### Facts that must remain paired with caveats
 
-- Pair the 3.29-5.63% fusion result with "historical same-GEMM control; current
-  FEXPA comparator must be rebuilt."
-- Pair direct-route 15-16% gains with "long routes" and the neutral short-route
-  controls.
+- Pair the current fusion result with its regime split: -17.87% at M48,
+  neutral within 0.79% at M192, and +19.11% at M2040; it is a standalone
+  same-GEMM control rather than an upstream comparison.
+- Pair current direct-route gains with the bounded +2.68/+3.68% captured
+  high-skew result and the neutral or negative short/moderate controls; label
+  the historical 15--16% result as non-current provenance.
 - Pair adaptive gather gains with "underfilled 8T points on one performance
   machine."
-- Pair tile-window 10-12% gains with "recorded planner A/B requiring frozen
-  rerun."
+- Pair tile-window gains with the current +7.23/+4.85% uniformish 2048/4096
+  domain and the neutral median/high-skew/30K controls.
 - Pair W8A16 speedups with the captured register-dequant regression and open
   model-quality gate.
 - Pair W8A8 near-3x captured speed with its strict clamp-10 domain and open
@@ -766,19 +798,22 @@ Contracts and lifecycle:
 
 Primary result reports:
 
-- explicit fusion:
+- current 192-core closure measurements, including canonical fusion,
+  direct-route, tile-window, two-stage, retention, and planner diagnosis:
+  [`../optimizations/fused_moe_sve/results/amazon_192c_paper_closure_20260831.md`](../optimizations/fused_moe_sve/results/amazon_192c_paper_closure_20260831.md);
+- historical explicit-fusion PMU evidence:
   [`../optimizations/fused_moe_sve/results/amazon_192c_unfused_pipeline.md`](../optimizations/fused_moe_sve/results/amazon_192c_unfused_pipeline.md);
 - exact-M:
   [`../optimizations/fused_moe_sve/results/amazon_8c_192c_xbyak_exact_m.md`](../optimizations/fused_moe_sve/results/amazon_8c_192c_xbyak_exact_m.md);
 - adaptive gather-pack:
   [`../optimizations/fused_moe_sve/results/amazon_8c_adaptive_mk_gather_pack_20260812.md`](../optimizations/fused_moe_sve/results/amazon_8c_adaptive_mk_gather_pack_20260812.md);
-- W2 direct route:
+- historical W2 direct-route result:
   [`../optimizations/fused_moe_sve/results/amazon_192c_w2_direct_route.md`](../optimizations/fused_moe_sve/results/amazon_192c_w2_direct_route.md);
 - route merge:
   [`../optimizations/fused_moe_sve/results/amazon_192c_route_merge_tree.md`](../optimizations/fused_moe_sve/results/amazon_192c_route_merge_tree.md);
 - ready-token merge:
   [`../optimizations/fused_moe_sve/results/amazon_192c_async_ready_token_merge.md`](../optimizations/fused_moe_sve/results/amazon_192c_async_ready_token_merge.md);
-- tile windows:
+- historical tile-window result:
   [`../optimizations/fused_moe_sve/results/amazon_192c_stage_window_tiles_20260810.md`](../optimizations/fused_moe_sve/results/amazon_192c_stage_window_tiles_20260810.md);
 - W8A16:
   [`../optimizations/fused_moe_sve/results/amazon_m5_96c_w8a16_plan_v2_20260817.md`](../optimizations/fused_moe_sve/results/amazon_m5_96c_w8a16_plan_v2_20260817.md);

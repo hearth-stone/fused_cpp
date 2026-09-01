@@ -17,6 +17,7 @@ from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 IDENTIFIER = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
 def _load_object(path: Path) -> dict[str, Any]:
@@ -44,6 +45,27 @@ def _require_string_list(value: object, *, field: str) -> list[str]:
     return value
 
 
+def _require_external_assets(value: object, *, field: str) -> list[dict[str, str]]:
+    if not isinstance(value, list):
+        raise ValueError(f"{field} must be a list")
+    assets: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for index, item in enumerate(value):
+        if not isinstance(item, dict):
+            raise ValueError(f"{field}[{index}] must be an object")
+        path = _require_string(item.get("path"), field=f"{field}[{index}].path")
+        expected = _require_string(item.get("sha256"), field=f"{field}[{index}].sha256")
+        if SHA256.fullmatch(expected) is None:
+            raise ValueError(f"{field}[{index}].sha256 must be 64 lowercase hexadecimal characters")
+        if PurePosixPath(path).is_absolute() or ".." in PurePosixPath(path).parts:
+            raise ValueError(f"{field}[{index}].path must be repository-relative without '..': {path!r}")
+        if path in seen:
+            raise ValueError(f"duplicate external asset path {path!r}")
+        seen.add(path)
+        assets.append({"path": path, "sha256": expected})
+    return assets
+
+
 def validate_machine(payload: dict[str, Any]) -> dict[str, Any]:
     if payload.get("schema_version") != 1:
         raise ValueError("machine schema_version must be 1")
@@ -57,6 +79,10 @@ def validate_machine(payload: dict[str, Any]) -> dict[str, Any]:
     _require_string_list(payload.get("affinity_argv", []), field="machine.affinity_argv")
     _require_string_list(payload.get("snapshot_submodules", []), field="machine.snapshot_submodules")
     _require_string_list(payload.get("snapshot_external_paths", []), field="machine.snapshot_external_paths")
+    payload["snapshot_external_assets"] = _require_external_assets(
+        payload.get("snapshot_external_assets", []),
+        field="machine.snapshot_external_assets",
+    )
     for field in ("environment", "variables"):
         values = payload.get(field, {})
         if not isinstance(values, dict) or any(not isinstance(key, str) for key in values):
@@ -70,6 +96,9 @@ def validate_suite(payload: dict[str, Any]) -> dict[str, Any]:
     if payload.get("schema_version") != 1:
         raise ValueError("suite schema_version must be 1")
     _require_identifier(payload.get("id"), field="suite.id")
+    machine_ids = _require_string_list(payload.get("machine_ids", []), field="suite.machine_ids")
+    for index, machine_id in enumerate(machine_ids):
+        _require_identifier(machine_id, field=f"suite.machine_ids[{index}]")
     for section in ("setup", "cases"):
         entries = payload.get(section)
         if not isinstance(entries, list):
@@ -201,6 +230,17 @@ def _populate_external_path(snapshot_root: Path, relative_path: str) -> dict[str
     return {"path": relative_path, "sha256": _tree_digest(destination)}
 
 
+def _populate_external_asset(snapshot_root: Path, asset: dict[str, str]) -> dict[str, str]:
+    record = _populate_external_path(snapshot_root, asset["path"])
+    if record["sha256"] != asset["sha256"]:
+        raise RuntimeError(
+            f"external asset digest mismatch for {asset['path']}: "
+            f"expected {asset['sha256']}, got {record['sha256']}"
+        )
+    record["expected_sha256"] = asset["sha256"]
+    return record
+
+
 def sync_snapshot(machine: dict[str, Any], revision: str) -> dict[str, Any]:
     with tempfile.TemporaryDirectory(prefix="moe-paper-snapshot-") as directory:
         temporary = Path(directory)
@@ -224,6 +264,10 @@ def sync_snapshot(machine: dict[str, Any], revision: str) -> dict[str, Any]:
             _populate_external_path(snapshot, external_path)
             for external_path in machine.get("snapshot_external_paths", [])
         ]
+        external_assets = [
+            _populate_external_asset(snapshot, asset)
+            for asset in machine.get("snapshot_external_assets", [])
+        ]
         created = _run(
             ["ssh", machine["ssh_host"], f"mkdir -p {shlex.quote(machine['project_root'])}"],
             timeout_seconds=60,
@@ -242,7 +286,12 @@ def sync_snapshot(machine: dict[str, Any], revision: str) -> dict[str, Any]:
         )
         if synced.returncode != 0:
             raise RuntimeError(f"snapshot sync failed: {synced.stderr.strip()}")
-        return {"revision": revision, "submodules": submodules, "external_paths": external_paths}
+        return {
+            "revision": revision,
+            "submodules": submodules,
+            "external_paths": external_paths,
+            "external_assets": external_assets,
+        }
 
 
 def _context(machine: dict[str, Any], remote_output: str) -> dict[str, object]:
@@ -378,6 +427,11 @@ def main() -> int:
     args = parse_args()
     machine = load_machine(args.machine)
     suite = load_suite(args.suite)
+    if suite.get("machine_ids") and machine["id"] not in suite["machine_ids"]:
+        raise ValueError(
+            f"suite {suite['id']!r} does not support machine {machine['id']!r}; "
+            f"allowed machines: {suite['machine_ids']}"
+        )
     cases = _selected_cases(suite, set(args.case))
     if args.dry_run:
         print(json.dumps(_dry_run_plan(machine, suite, cases), indent=2))

@@ -2,11 +2,13 @@
 
 ## Status
 
+Status date: 2026-09-01.
+
 `analytic_model.py` is the planner-compatible analytical backend for the SVE
 BF16 fused expert. It is explicitly installable through `MoePlannerRuntime`,
 but remains opt-in while machine calibrations are validated. The schema-v2
 empirical model remains the default backend for full empirical planning and the
-holdout oracle; it is not an input to analytical prediction.
+holdout reference; it is not an input to analytical prediction.
 
 The model targets one NUMA-local rank, cold distinct-expert weights, N-split
 teams, and the current packed-A Xbyak/static SVE kernel mapping. Communication,
@@ -17,7 +19,7 @@ Paper-facing claims, current evidence, and open gates are indexed in
 
 ## Current Planner Modes
 
-As of 2026-08-21, analytical planning has two intentionally different modes:
+Analytical planning has two intentionally different modes:
 
 - **Quick** is the deployed bounded path. It evaluates homogeneous team shapes,
   computes one exact analytical `T_iso(M,t)` per distinct route count and width,
@@ -25,10 +27,13 @@ As of 2026-08-21, analytical planning has two intentionally different modes:
   makespan. Candidate selection runs in native C++ when available. The emitted
   Plan V2 is strict; quick does not search phase-DAG contention, temporal order,
   dynamic tail pools, or bounded tail repartition.
-- **Full** is the offline performance-oracle path. It evaluates mixed-width
+- **Full** is the offline reference/autotuning path. It evaluates mixed-width
   strict shapes, temporal lane orders, derived tail-pool candidates, and bounded
   terminal repartition with the analytical phase-DAG simulator. It includes the
-  quick winner as a baseline and selects minimum expected modeled makespan.
+  quick winner as a baseline, identifies minimum expected modeled makespan, and
+  applies the bounded one-step width gate described below only inside an
+  overlapping systematic-error interval. It is not an oracle because model
+  ranking error remains measurable.
 
 `MoePlannerRuntime` disables route-plan caching by default because exact route
 histograms have low reuse. It can precompute every supported `T_iso(M,t)` scalar
@@ -37,12 +42,23 @@ that versioned dense cost grid. `FUSED_CPP_MOE_PLANNER_FIXED_THREADS` switches
 the runtime to one supported homogeneous width for a controlled fallback; it
 does not change full offline search.
 
-The latest 80-core captured-DSV4 experiment evaluated 142 strict plus 327
-dynamic full candidates. Full cold search took about 42 seconds. Its selected
-plan measured 34.418 ms versus quick at 37.141 ms; the best measured candidate
-among the top six was 33.907 ms, for 1.51% selected shortlist regret. These
-numbers are preliminary changelog evidence, not a completed cross-workload or
-cross-machine validation.
+On the 2026-08-31 96-core, 31-sample matrix, full cold/warm planning took
+0.55--7.06/0.11--3.19 ms in the bounded measured candidate spaces. It found
+measured-best plans on the captured uniformish and median traces, but selected
+16T LPT at 22.857 ms on high skew while 8T reverse-even measured 17.282 ms. The
+24.43% paired gap and 0.692 measured/predicted rank Spearman show that full is
+an offline search mode, not a near-optimal oracle.
+
+The 2026-09-01 Arm-codex 80-core follow-up adds a one-step width uncertainty
+gate for implicit-shape analytical full search. When the expected winner uses
+more than 8T and a candidate capped at the next narrower calibrated width has
+an overlapping systematic-error interval, full selects minimum expected time
+inside that narrower set. On complete high-skew/median/uniformish traces this
+reduced legacy full latency by 19.63/22.56/5.43% in paired medians and left
+0/0.07/0.20% regret against the measured candidate set. The old 80-core
+42-second search remains historical evidence for broader candidate-space cost;
+the current three development runs took 29.46--50.41 s cold and still require a
+committed-runner repeat.
 
 ## Separation Of Concerns
 
@@ -777,11 +793,28 @@ The 2026-08-02 AmazonC5192Cores NUMA0 cache-derived calibration measured
 0.340/30.377 TFLOP/s at 1/96 threads for the L1-hot M12 GEMM core, versus
 0.412/39.309 TFLOP/s for the register-only diagnostic. The core curve uses 64
 warmups and 4096 timed calls per width because one call is only about 0.8 us.
-It reached 9.18% isolated MAPE on 108 true holdout points, 49.57% contention
-P90 error, and 8.17% maximum shape regret. The isolated gate now passes and the
-compute ceiling has the correct kernel-level meaning, but the contention/regret
-gates still fail. Commands, anchors, and per-route decisions are recorded in
+That historical run reached 9.18% isolated MAPE on 108 true holdout points,
+49.57% contention P90 error, and 8.17% maximum shape regret. The isolated gate
+passed and the compute ceiling obtained the correct kernel-level meaning, but
+the contention/regret gates failed. Commands, anchors, and per-route decisions
+are recorded in
 `optimizations/fused_moe_sve/results/amazon_192c_analytic_hot_gemm_core_20260802.md`.
+
+The 2026-08-31 NUMA1 refresh adds a machine-local packed-B repeated-scan probe
+instead of transferring the old retention prior. Five independent processes
+give a fitted retention knee at 0.662 x the nominal private-L2 capacity, a
+17.37% repeated-scan miss floor, 68.03% miss fraction at 2 MiB, and 79.80% at
+4 MiB. With these anchors, isolated holdout MAPE is 7.96%, contention MAPE/P90
+is 10.85/16.08%, and maximum measured shape regret is 9.21%. Relative to the
+transferred prior, contention P90 improves from 16.97% while maximum regret is
+unchanged. Retention is therefore justified as a model variable, but wide-team
+concurrent pressure and temporal-order ranking remain open. The current report
+is
+`optimizations/fused_moe_sve/results/amazon_192c_paper_closure_20260831.md`.
+
+Repeating the sole six-point tile-window boundary case with 31 samples gives an
+updated approximate median/P90/maximum regret of 0.83/3.05/4.18%. This retains
+the narrow 5% window-selection result without expanding its declared domain.
 
 ## Known Limits
 
@@ -791,8 +824,11 @@ gates still fail. Commands, anchors, and per-route decisions are recorded in
   bimodal by 22.13% versus fixed 8T, but regressed active-set 8/16 by
   15.54%/11.31% after selecting an over-wide 40T team. It is therefore a
   supported bounded planner, not a demonstrated universally superior policy.
-- Full analytical search is not online: the current captured-DSV4 run evaluates
-  469 strict/dynamic candidates and takes about 42 seconds cold.
+- Full analytical search is an offline reference/autotuning mode. The current
+  bounded 96-core empirical matrix plans in 0.55--7.06 ms cold, while the
+  Arm-codex analytical strict search takes 29.46--50.41 s for 142 candidates
+  and the broader historical 469-candidate search took about 42 seconds.
+  Candidate-space-dependent cost must always be reported.
 - Analytical stage-window v6 is shadow-only. Its 5% selection gate covers the
   192-core TP4 M=`72,216,384`, T=`4,16` transition domain, not arbitrary routes,
   widths, shapes, machines, or mixed-workload planner decisions.
@@ -809,6 +845,10 @@ gates still fail. Commands, anchors, and per-route decisions are recorded in
   tested grid, but does not represent cache sets or prefetch streams. Machine
   schema v2 represents LLC domains, but the current planner DAG does not yet
   carry physical placement into scoring.
+- The Amazon 192-core machine-local retention probe closes only task-local
+  single-core reuse. It does not identify active multi-team LLC refill or
+  wide-team concurrent-service behavior; the unchanged 9.21% shape regret and
+  high-skew misranking demonstrate that distinction.
 - W13 and W2 share one task width even though their full-stage N/K shapes and
   resulting owner stripes differ. A future stage-width planner would need an
   explicit handoff/runtime contract; there is no hidden window selector.

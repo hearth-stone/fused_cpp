@@ -2026,16 +2026,28 @@ whole-expert tail pool 与合法 bounded tail repartition，并用 phase-DAG 评
 empirical full-call anchor 的采样误差仍沿用 profile-specific 估计。
 
 设重评分后的 quick 基线为 $(\hat T_q,U_q)$，候选 $c$ 为
-$(\hat T_c,U_c)$。full 的主目标明确为完整模型空间中的期望 makespan：
+$(\hat T_c,U_c)$。先取完整模型空间中的期望 makespan 最小者：
 
 $$
-c^*=\arg\min_{c\in\mathcal C_{full}}\hat T_c.
+c_0=\arg\min_{c\in\mathcal C_{full}}\hat T_c.
 $$
 
-不确定性和 pessimistic time 继续进入 ranking/诊断，但不再把统计不可区分的候选按
-active working set 替代主目标。该旧 tie policy 在当前 DSV4 上会把模型第一名换成
-实测明显更慢的小工作集 shape。若多个候选的 expected makespan 数值完全相同，才依次
-使用 pessimistic time、active working set 和 resource group 作确定性 tie-break。
+令 $w(c)$ 为 candidate shape 的最大 team width，并令不确定区间
+$I_c=[\hat T_c-U_c,\hat T_c+U_c]$。当 $w(c_0)>8$ 时，只考虑与 $I_{c_0}$ 相交且
+最大宽度不超过下一个已校准窄档
+$w^- = \max\{t\in\mathcal T:t<w(c_0)\}$ 的候选集合 $\mathcal O^-$。若
+$\mathcal O^-$ 非空，则
+
+$$
+c^*=\arg\min_{c\in\mathcal O^-}\hat T_c;
+$$
+
+否则 $c^*=c_0$。该 gate 最多降低一个宽度档，不会从 32T 连续退到 8T；当 winner
+最大宽度不超过 8T 时也不启用。它针对当前模型尚未携带 interval-to-LLC placement、
+因而在系统误差内低估 wide mixed-team 并发压力的边界。它不恢复旧的最小 active
+working-set tie policy：该策略曾把模型第一名换成实测明显更慢的
+`(32,32,8,8)`。在同一最大宽度档内仍以 expected makespan 为主，数值相同才依次使用
+pessimistic time、active working set 和 resource group 作确定性 tie-break。
 显式 `shapes=`、empirical profile、stage-specific planner 和 forced pool 保持原选择
 语义。Plan V2、cache key、runtime claim 和数值语义均不变。
 
@@ -5203,3 +5215,5 @@ planning 对未命中点执行原解析公式；首次调用结束后在文件�
 | 2026-08-21 | v1.29 | 明确拆分 analytical quick/full：quick 继续以 homogeneous isolated-LPT 在有界时间内求较优解；full 恢复全部 strict mixed-width/temporal-order 及派生 dynamic-tail 的 phase-DAG 搜索，并把 quick 胜者作为额外 strict baseline。修正解析系统误差被错误按 `sqrt(waves*profile_runs)` 缩小的问题，同时把 analytical full 主目标固定为 minimum expected makespan，不再在大范围不确定区间重叠时按 active working set 改选。Arm-codex NUMA3 80C DSV4 上，one-head safe-full cold/E2E 为 `584.9/37.033 ms`，但不具备 full 语义；完整 full 搜索 `142` strict+`327` dynamic，cold 约 `42 s`。模型第一名 `(16,16,16,16,8,8)` 实测 `34.418 ms`，比 quick `37.141 ms` 快 `7.91%`；前六名实际最好 `(16,16,8,8,8,8,8,8)` 为 `33.907 ms`，模型第一名 shortlist regret `1.51%`。旧 uncertainty-overlap/working-set 选择会改选 `(32,32,8,8)`，实测 `40.725 ms`，因此不符合 full 的最优目标。Plan V2 ABI、production quick runtime 和数值语义不变。 |
 | 2026-08-21 | v1.30 | 将既有 `NativeQuickPlanner` binding 拆为 `_C`/MoE-only `_moe_C` 共用的 module-local 注册，production 优先从 `_moe_C` 加载并保留 `_C`/Python fallback；候选、LPT tie-break 和 Plan V2 不变。新增显式 `MoePlannerRuntime.initialize_planner(max_routes)` 生成完整 dense `T_iso[M,T]`，并让 production runtime 默认关闭低命中率 route-plan cache。Arm-codex NUMA3 80C、captured DSV4、223 active/28 distinct M：`initialize_planner(2048)` 生成并落盘 16,384 个标量耗时 `3.452 s`；之后无 route cache 的 public `plan_for_dispatch()` 1000 次 median/P90 为 `4.584/4.612 ms`，其中内部 C++ quick 约 `1.20 ms`。直接 planner 对比中 Python quick 为 `7.25 ms`，C++ quick 为 `1.60 ms` 单次及 `1.056 ms` 1000 次 median；固定 8T greedy 为 `0.199 ms`。9-case operator-only 对比 fixed 8T：uniform/active8/active16 为 `-2.86/-15.54/-11.31%`，active32/active64 为 `+4.57/+0.65%`，active128/tiered/DSV4 的同计划差异为 `+0.17/+0.37/-0.13%`，bimodal 为 `+22.13%`。因此 C++ latency gate 通过，但 quick 质量不支配 fixed greedy；active8/16 的错误 `40T` 选择要求补宽 team isolated residual 后再宣称跨分布收益。 |
 | 2026-08-21 | v1.31 | 新增 supported runtime control `FUSED_CPP_MOE_PLANNER_FIXED_THREADS`：正整数值强制 routed-expert production planner 只生成对应 homogeneous LPT greedy shape，未设置或 `0` 保持多宽度 C++ quick。`8` 在 Arm-codex 80C 上对应 `10x8T`，用于与当前 quick 做线上回退和 A/B；Plan V2、full offline、synthetic shared expert 和默认行为不变。captured DSV4、dense `T_iso` disk hit、无 route cache 的 public `plan_for_dispatch()` 1000 次 median/P90 为 `2.698/2.708 ms`，内部 fixed planner 约 `0.257 ms`，shape=`10x8T`、backend=`cpp_fixed_quick`。 |
+| 2026-08-31 | v1.32 | 仅更新实验闭合状态，不改变公式、候选、剪枝、schema、ABI 或默认 runtime。AmazonC5192Cores NUMA1 的五进程独立 packed-B repeated-scan probe 得到 private-L2 retention knee `0.662x`、miss floor `17.37%`、2/4 MiB miss `68.03/79.80%`；替换 transferred prior 后 isolated MAPE、contention MAPE/P90、max shape regret 为 `7.96/10.85/16.08/9.21%`，相对旧 prior 仅改善 contention P90 `0.89` 点且 regret 不变。完整 high-skew TopK trace 上模型选择的 16T LPT 为 `22.857 ms`，候选集中已有的 8T reverse-even 为 `17.282 ms`，配对降低 `24.43%`，manual candidate 的预测/实测 rank Spearman 仅 `0.692`；因此当前主要缺口是 wide-team concurrent pressure 与 temporal-order ranking，而非 retention 或候选覆盖。三条 captured trace 的独立 W13/W2 two-stage 最优均为 `8T/4T`，但仍比 best whole-expert 慢 `1.93%--5.87%`，故保留为 conditional candidate/control。完整记录见 `optimizations/fused_moe_sve/results/amazon_192c_paper_closure_20260831.md`。 |
+| 2026-09-01 | v1.33 | analytical full 增加仅作用于未显式 shape 的离线搜索的 one-step width uncertainty gate：先求 expected-makespan winner；若其最大宽度大于 8T，则在与 winner 系统误差区间重叠的候选中把最大宽度最多降低一个已校准档，并在该档内仍最小化 expected makespan。该规则不使用 active working set 作主 tie-break，不改变 quick/request path、候选、剪枝、Plan V2、cache identity、kernel 或 empirical/native planner。Arm-codex NUMA3 80C、三份完整 2048-token TopK6 trace、5 warmup/31 randomized paired runs/4 rotating weight copies上，原 full 到 gate 为 high-skew `42.216->35.281 ms`（`+19.66%`）、median `42.117->34.426 ms`（`+22.34%`）、uniformish `34.019->32.190 ms`（`+5.68%`）；相对 measured candidate set 的 regret 为 `0/0.07/0.20%`，全部低于 5%，输出逐位一致。结果仍绑定未提交 development snapshot，需由 committed paper runner 复跑后才能作为最终证据。 |

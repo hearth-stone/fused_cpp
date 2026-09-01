@@ -52,11 +52,23 @@ vLLM-style comparison is mechanism evidence tied to retired profiles and older
 geometry; rerun it on the frozen paper binary before using it as a headline
 table.
 
+The current Amazon 192-core closure measurements are indexed in
+[`results/amazon_192c_paper_closure_20260831.md`](results/amazon_192c_paper_closure_20260831.md).
+They narrow the claims materially: canonical fusion is beneficial at large M
+but regresses the short control, current direct-route gains are about 3--4% in
+the clear long/high-skew cases, tile-window gains are concentrated in the
+uniformish 2048/4096 domain, and the best two-stage schedules remain
+1.93%--5.87% slower than the best whole-expert schedules on three captured
+traces. Most of that matrix predates comparator commit `266da2c`; it is
+provisional until the declarative runner reproduces it from one frozen build.
+
 The deployment planner is `MoePlannerRuntime` quick search: homogeneous
 isolated-LPT shapes and strict Plan V2, with an optional fixed-width fallback.
-The broader mixed-width/contention-aware full planner is offline. Kernel result
-reports must state which planner mode and fixed-width control were used, and
-must include planner latency when claiming end-to-end improvement.
+The broader mixed-width/contention-aware full planner is an offline
+reference/autotuning mode, not an oracle: the current high-skew case contains a
+24.43% gap between its selection and an existing 8T/order candidate. Kernel
+result reports must state which planner mode and fixed-width control were used,
+and must include planner latency when claiming end-to-end improvement.
 
 ## Adaptive M-by-K gather-pack
 

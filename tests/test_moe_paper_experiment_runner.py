@@ -11,6 +11,7 @@ from optimizations.fused_moe_sve.paper_experiments.run_matrix import (
     load_suite,
     parse_prefixed_json,
     render_argv,
+    _require_external_assets,
     _tree_digest,
     validate_suite,
 )
@@ -49,6 +50,24 @@ def test_suite_configs_render_for_every_machine(name: str) -> None:
         assert "FUSED_CPP_BUILD_MOE_ONLY=1" in render_argv(build["argv"], context)
 
 
+def test_arm_high_skew_closure_suite_renders_with_external_assets() -> None:
+    suite = load_suite(EXPERIMENT_ROOT / "suites" / "arm_high_skew_closure.json")
+    machine = load_machine(EXPERIMENT_ROOT / "machines" / "arm_codex_internal.json")
+    assert suite["machine_ids"] == [machine["id"]]
+    assert len(machine["snapshot_external_assets"]) == 2
+    context = {
+        "machine_id": machine["id"],
+        "project_root": machine["project_root"],
+        "python": machine["python"],
+        "remote_output": "/tmp/result.json",
+        **machine["variables"],
+    }
+    for entry in [*suite["setup"], *suite["cases"]]:
+        rendered = render_argv(entry["argv"], context)
+        assert rendered
+        assert not any("{" in argument or "}" in argument for argument in rendered)
+
+
 def test_remote_command_quotes_paths_and_environment() -> None:
     command = build_remote_command(
         project_root="/tmp/project with space",
@@ -78,6 +97,24 @@ def test_output_json_requires_remote_output_placeholder() -> None:
     }
     with pytest.raises(ValueError, match="remote_output"):
         validate_suite(json.loads(json.dumps(payload)))
+
+
+def test_external_assets_require_safe_paths_and_sha256() -> None:
+    valid = _require_external_assets(
+        [{"path": "bench_assets/routes", "sha256": "a" * 64}],
+        field="machine.snapshot_external_assets",
+    )
+    assert valid == [{"path": "bench_assets/routes", "sha256": "a" * 64}]
+    with pytest.raises(ValueError, match="repository-relative"):
+        _require_external_assets(
+            [{"path": "../routes", "sha256": "a" * 64}],
+            field="machine.snapshot_external_assets",
+        )
+    with pytest.raises(ValueError, match="64 lowercase hexadecimal"):
+        _require_external_assets(
+            [{"path": "bench_assets/routes", "sha256": "invalid"}],
+            field="machine.snapshot_external_assets",
+        )
 
 
 def test_tree_digest_covers_relative_names_and_contents(tmp_path: Path) -> None:

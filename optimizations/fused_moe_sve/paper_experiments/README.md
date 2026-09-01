@@ -49,13 +49,70 @@ samples and is still exploratory. Paper tables should use a separately declared
 suite with at least 31 samples and the workload matrix required by
 `docs/moe_paper_readiness.md`.
 
+## External benchmark assets
+
+Large route captures, calibration JSON, and raw benchmark dumps remain outside
+Git. A machine may declare `snapshot_external_assets`, where each entry contains
+a repository-relative ignored directory and its expected deterministic tree
+SHA256. The runner verifies the digest before copying the directory into the
+clean snapshot; a missing or modified asset fails closed.
+
+The Arm-codex closure suite requires:
+
+- `bench_assets/moe_paper/dsv4_routes_pt_20260830`, tree SHA256
+  `cb263814f56665d6ac0e6af36572b0735d45794e99c95a288b7cae895923e840`;
+- `bench_assets/moe_paper/arm_codex_numa3_80c`, tree SHA256
+  `6b341ff7bc998f89c8ead2f784a78a6688abd4374779f71b93e7a94836967ebd`.
+
+The route bundle contains three 43-layer, 2048-token TopK6 captures. The
+calibration bundle contains the 80-core NUMA3 topology-v2 analytical machine
+calibration. The current workspace copies came from the preserved
+`tmp/moe_paper_archive/amazon_192c_20260831/` route artifacts and the recorded
+Arm-codex calibration. Generated asset directories are ignored and must not be
+staged.
+
+Run the three-trace high-skew closure with:
+
+```bash
+.venv/bin/python \
+  optimizations/fused_moe_sve/paper_experiments/run_matrix.py \
+  --machine optimizations/fused_moe_sve/paper_experiments/machines/arm_codex_internal.json \
+  --suite optimizations/fused_moe_sve/paper_experiments/suites/arm_high_skew_closure.json
+```
+
+The suite runs focused correctness followed by uniformish, median, and
+high-skew 31-sample width/order matrices with four rotating packed-weight
+copies. It reports both the legacy minimum-expected full winner and the current
+one-step width uncertainty gate, so a regression remains visible rather than
+being hidden by selection.
+
 The exact-M and direct-route cases use the paper's TP4-oriented
-`H=4096,F=512` path. The former explicit fused/unfused case is deliberately not
-in an active suite: its explicit path still evaluates the historical poly5
-activation, while the current production fused W13 uses FEXPA+poly2. On both
-F=512 and F=2048 controls, that mismatch fails the reference's predeclared
-numerical gate. Reintroduce the comparison only after both paths use the same
-activation and rounding contract.
+`H=4096,F=512` path. The explicit fused/unfused Lab comparator was repaired in
+commit `266da2c`: both paths now use the production FEXPA-plus-quadratic SiLU
+evaluator, while retaining the intentional rounding difference between two
+independent W1/W3 GEMMs and one interleaved W13 GEMM. Production-size controls
+pass the declared relative-L2 gate. The case is still absent from the active
+suite because its current 31-sample result was collected outside this runner;
+add it only together with structured parsing, the numerical gate, and a frozen
+source/extension identity.
+
+## Current closure status
+
+The 2026-08-31 Amazon 192-core supplemental study is recorded in
+[`../results/amazon_192c_paper_closure_20260831.md`](../results/amazon_192c_paper_closure_20260831.md).
+It includes current exact-M, direct-route, tile-window, canonical fusion,
+cost-model retention, planner-ranking, and one-kernel/two-stage results. Those
+measurements are provisional because most use the pre-`266da2c` extension hash
+and were orchestrated by temporary scripts rather than this declarative
+runner.
+
+Before artifact freeze, this directory still needs:
+
+- an Amazon 192-core machine definition with NUMA-local placement;
+- a >=31-sample closure suite covering the retained kernel, model, and planner
+  cases;
+- committed structured parsers/table builders for the supplemental outputs;
+- a second-Arm-machine repeat from the same frozen commit.
 
 ## Adding a machine
 

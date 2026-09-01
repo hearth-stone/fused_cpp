@@ -1,6 +1,6 @@
 # CPU MoE Paper Readiness And Evidence Map
 
-Status date: 2026-08-27.
+Status date: 2026-09-01.
 
 This document is the paper-facing index for the CPU MoE work in this
 repository. It does not replace the mathematical, schema, implementation, or
@@ -149,14 +149,16 @@ The current planner modes are:
 - **shared quick:** a bounded mixed-width family with one synthetic all-token
   shared expert;
 - **full:** mixed-width strict shapes, temporal ordering, derived tail-pool and
-  bounded-tail candidates, scored with the phase-DAG model.
+  bounded-tail candidates, scored with the phase-DAG model for offline search
+  and autotuning.
 
 `MoePlannerRuntime` uses quick search, disables route-plan caching by default,
 and may precompute the dense `T_iso[M,T]` grid with
 `initialize_planner(max_routes)`. The environment control
 `FUSED_CPP_MOE_PLANNER_FIXED_THREADS` selects fixed quick when a stable width is
 preferred over the multi-width search. The full analytical search is an
-offline performance-oracle path, not a request-path algorithm.
+offline reference/autotuning path, not an oracle and not a request-path
+algorithm.
 
 ## Evidence That Can Be Reused
 
@@ -164,18 +166,19 @@ offline performance-oracle path, not a request-path algorithm.
 
 | Mechanism | Recorded result | Paper use | Source |
 | --- | --- | --- | --- |
-| Explicit fusion | 3.29--5.63% lower latency than a same-GEMM explicit pipeline as route working set grows; LLC misses and backend memory stalls also fall | Controlled fusion ablation, not an upstream system comparison | `optimizations/fused_moe_sve/results/amazon_192c_unfused_pipeline.md` |
-| FP32 W2 direct route | -0.95% at M=12, +2.18% at M=192, +15.82% at M=1536, +16.44% at M=2040 | Route-output ablation with the default numerical path | `optimizations/fused_moe_sve/results/amazon_192c_w2_direct_route.md` |
+| Explicit fusion | Current canonical comparator: fused is 17.87% slower at M=48, neutral within 0.79% at M=192, and 19.11% lower latency at M=2040 | Fusion is a large-route dataflow win, not a universal speedup or upstream comparison | `optimizations/fused_moe_sve/results/amazon_192c_paper_closure_20260831.md` |
+| FP32 W2 direct route | Current uniform controls: -3.12/-0.69/+0.01/+4.36/+3.98% at M=12/48/192/1536/2040; captured high-skew gains are +2.68/+3.68% at 2048/4096 tokens | Bounded route-output ablation; do not reuse the historical 15--16% as current performance | `optimizations/fused_moe_sve/results/amazon_192c_paper_closure_20260831.md` |
 | Exact-M JIT | Largest gains occur at formerly overcomputed M=5/6 and M=9/10; full-M12 controls are neutral | Tail-kernel ablation on two Arm machines | `optimizations/fused_moe_sve/results/amazon_8c_192c_xbyak_exact_m.md` |
 | Adaptive gather-pack | 2.3--12.6% complete-call gain for underfilled M=1--37 at 8T, with M=72/96 controls not regressing on the measured host | Underfilled-team ablation; needs a second-machine E2E repeat for a general claim | `optimizations/fused_moe_sve/results/amazon_8c_adaptive_mk_gather_pack_20260812.md` |
-| Tile windows | 12.4% on uniform and 10.6% on captured DSV4 in the recorded planner A/B | Scheduling-control evidence; rerun on the frozen paper binary | `optimizations/fused_moe_sve/results/amazon_192c_stage_window_tiles_20260810.md` |
+| Tile windows | Current captured traces: +7.23/+4.85% on uniformish 2048/4096; other cases range from -0.16% to +1.12%, and 30,720-token cases are neutral | Scheduling-control evidence in a bounded route domain; rerun on the frozen paper binary | `optimizations/fused_moe_sve/results/amazon_192c_paper_closure_20260831.md` |
 
-The explicit-fusion result is historical mechanism evidence only. A 2026-08-27
-rerun attempt showed that the standalone explicit path still evaluates poly5
-while the current production fused W13 uses FEXPA+poly2; F=512 and F=2048 both
-failed the benchmark's predeclared relative-L2 gate. Do not use a new timing
-from that comparator until its activation and rounding contract matches the
-current fused path.
+The canonical explicit comparator now uses the same production
+FEXPA-plus-quadratic SiLU evaluator. Its remaining numerical difference comes
+from the two independent W1/W3 GEMMs versus interleaved W13 accumulation and a
+different, mathematically equivalent FP32 rounding boundary. The production
+sizes pass the declared relative-L2 gate. The result is still a standalone
+same-GEMM mechanism control: it excludes route construction and merge and does
+not replace a current upstream baseline.
 
 The July 2026 nine-workload vLLM-style table is useful for motivating load
 imbalance and tail-pool execution, but it is bound to retired profiles and
@@ -185,10 +188,11 @@ older geometry. It must be rerun before becoming a headline table.
 
 | Model/subproblem | Current result | Gate status |
 | --- | --- | --- |
-| Analytical isolated time on AmazonC5192Cores | 9.18% MAPE on 108 true holdout points | Passes the 10% isolated gate |
-| Analytical contention | 49.57% P90 absolute error | Fails the 15% contention gate |
-| Analytical shape selection | 8.17% maximum measured regret | Fails the 5% regret gate |
-| Analytical tile-window selector v6 | 1.10/3.45/4.40% median/P90/max regret on six declared transition points | Passes only the declared window-selection subproblem |
+| Analytical isolated time on AmazonC5192Cores | 7.96% holdout MAPE with machine-local retention | Passes the 10% isolated gate |
+| Analytical contention | 10.85% MAPE and 16.08% P90 absolute error | Close, but still fails the 15% contention gate |
+| Analytical shape selection | 9.21% maximum measured regret | Fails the 5% regret gate |
+| Machine-local packed-B retention | Knee at 0.662 x private-L2 capacity; improves contention P90 from 16.97% to 16.08% but leaves regret unchanged | Retention is justified, but is not the missing ranking variable by itself |
+| Analytical tile-window selector | Approximately 0.83/3.05/4.18% median/P90/max regret after the boundary repeat | Passes only the declared six-point window-selection subproblem |
 | Historical empirical phase model | Approximately 2% median error on an 8-core heterogeneous holdout | Promising mechanism evidence; stale kernel/profile, must be refreshed |
 
 The paper may currently claim that the analytical model explains and selects
@@ -197,22 +201,31 @@ or machine-portable scheduling.
 
 ### Planner evidence
 
-The latest analytical quick/full measurements are preliminary because they are
-recorded only in the mathematical-model changelog:
+The latest 96-core matrix uses 31 samples per case. Full cold/warm planning is
+0.55--7.06/0.11--3.19 ms on the measured synthetic and captured workloads, so
+full is practical as an offline/autotuning search in this bounded candidate
+space. It is not an oracle:
 
-- on one 80-core captured DSV4 workload, analytical full selected a 34.418 ms
-  plan versus quick at 37.141 ms, while the best measured top-six candidate was
-  33.907 ms; selected shortlist regret was 1.51%;
-- the complete full search evaluated 142 strict and 327 dynamic candidates and
-  took about 42 seconds cold;
-- the public quick path after dense `T_iso` initialization measured
-  4.584/4.612 ms median/P90 for 1000 calls on that setup;
-- fixed-8T planning measured 2.698/2.708 ms through the public path;
-- quick beat fixed 8T by 22.13% on long/short bimodal but regressed by 15.54%
-  and 11.31% on active-set 8 and 16 because it selected an over-wide 40T team.
+- on long/short bimodal, full selected a 4T tail pool and reduced strict
+  execution from 17.25 ms to 12.61 ms (+36.8%);
+- on captured uniformish and median traces, full found measured-best plans at
+  16.89 ms and 18.97 ms;
+- on the captured high-skew trace, full selected 16T LPT at 22.857 ms while 8T
+  reverse-even measured 17.282 ms, a 24.43% paired reduction;
+- measured/predicted rank Spearman on the high-skew manual candidates is only
+  0.692, diagnosing a ranking rather than candidate-coverage failure.
 
-These results establish an online-quality gap and an offline-search-cost gap;
-they do not yet support a robust online-planner superiority claim.
+These results show that broader planning can expose useful schedules, while
+also making cost-model ranking the principal blocker to a near-optimal claim.
+
+A 2026-09-01 Arm-codex NUMA3 80C follow-up closes one bounded part of that
+problem. Analytical full now uses a one-step width uncertainty gate when a
+narrower calibrated width overlaps the expected winner. On complete
+high-skew/median/uniformish traces, the gate improves legacy full by
+19.63/22.56/5.43% in paired medians and leaves 0/0.07/0.20% measured-set
+regret. The run used 5 warmups, 31 randomized paired rounds, and four rotating
+weight copies. It remains development-snapshot evidence pending a committed
+runner repeat and does not close the 192-core or general temporal-order gate.
 
 ## Claims Allowed Now
 
@@ -220,14 +233,16 @@ The current evidence supports these bounded statements:
 
 - the SVE executor implements a fused, moldable whole-expert substrate with
   explicit task width and tile-window controls;
-- direct W2 route stores remove materialization/scatter traffic and benefit
-  long routes while remaining neutral around the short-route noise floor;
+- direct W2 route stores remove materialization/scatter traffic and provide a
+  modest benefit on sufficiently long or skewed routes while short/moderate
+  cases remain around the noise floor;
 - exact-M specialization removes selected tail overcompute without changing the
   packed ABI;
 - event-based contention modeling is materially more appropriate than applying
   one slowdown for an entire heterogeneous call;
-- full mixed-width search can find better plans than homogeneous quick search
-  on the measured DSV4 case;
+- full search can find better plans than homogeneous quick search on some
+  measured workloads, but its current ranking can also miss the best fixed
+  width and temporal order badly on high skew;
 - Plan V2 can execute strict, whole-expert tail-pool, and bounded route-sliced
   schedules without resizing a running task.
 
@@ -239,7 +254,10 @@ Do not claim any of the following without new evidence:
 - a general fused-kernel speedup over current upstream vLLM, oneDNN, or another
   declared production baseline;
 - analytical contention prediction within the declared acceptance gate;
+- a universal fused-versus-explicit speedup or a current 15--16% direct-route
+  improvement;
 - quick planning that consistently beats fixed-width greedy execution;
+- full planning as an oracle or generally near-optimal planner;
 - online full-search feasibility;
 - end-to-end TP/EP improvement, because current distributed communication is
   analytical rather than a measured runtime;
@@ -283,9 +301,11 @@ Retain the deterministic nine-case catalog for controlled coverage, but add:
 - at least two model shapes, including the target DeepSeek configuration;
 - standalone and TP rank-local execution; EP only after measured integration.
 
-The current `dsv4-real-2048-seq70` artifact retains exact top-16 counts and a
-moment-matched synthetic tail. Label it as a reconstructed routing summary,
-not a full real trace.
+The deterministic `dsv4-real-2048-seq70` catalog artifact retains exact top-16
+counts and a moment-matched synthetic tail. Label it as reconstructed. The
+2026-08-31 supplemental matrix adds three complete single-layer TopK traces
+(uniformish, median, and high-skew), but complete many-layer and multi-request
+coverage is still missing.
 
 ### Baselines
 
@@ -342,7 +362,8 @@ design narrative.
 
 ### P0: cost model
 
-- replace the 8-core transferred packed-B retention prior with local probes;
+- extend the completed single-core machine-local packed-B retention probe to
+  active multi-team LLC/refill behavior;
 - validate unseen routes, widths, mixed shapes, and multi-LLC placements on at
   least two Arm machines;
 - pass isolated MAPE <=10%, contention P90 <=15%, and maximum selected regret
@@ -352,12 +373,15 @@ design narrative.
 
 ### P0: planner
 
-- remove or gate the active-set 8/16 wide-team regressions;
+- remove or gate the production quick active-set 8/16 wide-team regressions;
+- repeat the analytical-full one-step width gate on a committed snapshot and a
+  second Arm machine; its current three-trace 80C result is closed only inside
+  that declared domain;
 - define the quick/full relationship and the exact candidate space in paper
   pseudocode;
 - report measured regret over the full workload matrix;
 - either reduce full cold search substantially or define it explicitly as an
-  offline oracle/autotuner;
+  offline reference/autotuner;
 - include planner overhead in all end-to-end comparisons.
 
 ### P1: system completeness
@@ -388,3 +412,7 @@ design narrative.
   `docs/vllm_bf16_tiled_moe_integration.md`
 - Active implementation checklist:
   `cpu_moe_schedule_optimization/TODO.md`
+- Current supplemental measurements:
+  `optimizations/fused_moe_sve/results/amazon_192c_paper_closure_20260831.md`
+- Arm-codex analytical-full gate:
+  `optimizations/fused_moe_sve/results/arm_codex_80c_high_skew_planner_gate_20260901.md`
