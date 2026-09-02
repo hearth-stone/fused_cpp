@@ -489,19 +489,17 @@ def main() -> int:
             if args.cp_sat_domain_hint == "greedy"
             else conservative_selected["tasks"]
         )
-        full_widths = {int(task[3]) for task in requested_incumbent_tasks}
         greedy_widths = {int(task[3]) for task in greedy_result["tasks"]}
+        cp_sat_widths = tuple(sorted(set(widths) | greedy_widths))
         largest_domain = max(domain.core_count for domain in domains)
         projection_tasks = requested_incumbent_tasks
         incumbent_source = f"{args.cp_sat_domain_hint}_strict_plan"
-        if any(int(task[3]) > largest_domain for task in projection_tasks):
-            projection_tasks = conservative_selected["tasks"]
-            incumbent_source = f"{args.cp_sat_domain_hint}_exact_union_with_one_step_domain_hint"
-        cp_sat_widths = tuple(
-            sorted(
-                set(widths) | full_widths | greedy_widths
-            )
-        )
+        if any(
+            int(task[3]) > largest_domain or int(task[3]) not in cp_sat_widths
+            for task in projection_tasks
+        ):
+            projection_tasks = greedy_result["tasks"]
+            incumbent_source = f"{args.cp_sat_domain_hint}_outside_cp_width_domain_use_greedy_hint"
         jobs = build_cold_phase_jobs(
             counts,
             cp_sat_widths,
@@ -704,9 +702,20 @@ def main() -> int:
     cp_names = sorted(name for name in plans if name.startswith("cp_sat_"))
     if cp_names:
         cp_measured_best = min(cp_names, key=lambda name: float(stats[name]["median_ms"]))
-        cp_selected = cp_names[0]
+        event_union_names = (
+            "full_selected",
+            "conservative_selected",
+            "greedy_strict",
+            *cp_names,
+        )
+        cp_selected = min(event_union_names, key=lambda name: predicted_ms[name])
         cp_best_ms = float(stats[cp_measured_best]["median_ms"])
         cp_selected_ms = float(stats[cp_selected]["median_ms"])
+        measured_union_best = min(
+            event_union_names,
+            key=lambda name: float(stats[name]["median_ms"]),
+        )
+        measured_union_best_ms = float(stats[measured_union_best]["median_ms"])
         one_step_ms = float(stats["conservative_selected"]["median_ms"])
         greedy_ms = float(stats["greedy_strict"]["median_ms"])
         lower_bound_ms = resource_certificate.lower_bound_s * 1.0e3
@@ -716,8 +725,13 @@ def main() -> int:
         ]
         cp_sat_measured = {
             "event_selected": cp_selected,
-            "measured_best": cp_measured_best,
-            "shortlist_regret_pct": 100.0 * (cp_selected_ms / cp_best_ms - 1.0),
+            "cp_only_measured_best": cp_measured_best,
+            "cp_only_measured_best_ms": cp_best_ms,
+            "event_union": list(event_union_names),
+            "measured_union_best": measured_union_best,
+            "shortlist_regret_pct": 100.0 * (
+                cp_selected_ms / measured_union_best_ms - 1.0
+            ),
             "vs_one_step_gate_pct": 100.0 * (cp_selected_ms / one_step_ms - 1.0),
             "vs_pure_greedy_pct": 100.0 * (cp_selected_ms / greedy_ms - 1.0),
             "paired_vs_pure_greedy_pct": {

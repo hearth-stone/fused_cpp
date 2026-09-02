@@ -20,6 +20,7 @@ from analytic_model import (  # noqa: E402
     LlcDomainCalibration,
     RuntimeOverheads,
     SaturatingServiceCurve,
+    WideTeamPressureCalibration,
     analytic_candidate_shapes,
 )
 from analytic_probe_geometry import (  # noqa: E402
@@ -614,11 +615,58 @@ def test_thin_residual_fit_recovers_nonnegative_operator_terms() -> None:
 
 
 def test_machine_calibration_json_round_trip() -> None:
-    calibration = _calibration()
+    calibration = replace(
+        _calibration(),
+        wide_team_pressure=WideTeamPressureCalibration(
+            isolated_dilation=((4, 1.05), (8, 1.2)),
+            full_cohort_dilation=((4, 1.1), (8, 1.4)),
+        ),
+    )
 
     restored = AnalyticMachineCalibration.from_dict(calibration.to_dict())
 
     assert restored == calibration
+
+
+def test_wide_team_pressure_calibration_is_discrete_and_rejects_speedup() -> None:
+    pressure = WideTeamPressureCalibration(
+        isolated_dilation=((4, 1.0), (8, 1.2)),
+        full_cohort_dilation=((4, 1.1), (8, 1.4)),
+    )
+
+    assert pressure.isolated_scale(8) == pytest.approx(1.2)
+    assert pressure.full_cohort_scale(4) == pytest.approx(1.1)
+    assert pressure.full_cohort_scale(6) == pytest.approx(1.0)
+    with pytest.raises(ValueError, match="dilation must be at least one"):
+        WideTeamPressureCalibration(isolated_dilation=((4, 0.9),))
+    with pytest.raises(ValueError, match="cannot be below isolated"):
+        WideTeamPressureCalibration(
+            isolated_dilation=((4, 1.2),),
+            full_cohort_dilation=((4, 1.1),),
+        )
+
+
+def test_placed_phase_interpolates_internal_and_concurrent_wide_team_pressure() -> None:
+    base = _placement_sensitive_model()
+    calibration = replace(
+        base.calibration,
+        wide_team_pressure=WideTeamPressureCalibration(
+            isolated_dilation=((4, 1.25),),
+            full_cohort_dilation=((4, 2.0),),
+        ),
+    )
+    model = _model(calibration)
+    phase = next(item for item in model.predict_expert(48, 4).phases if item.kind == "cold_b")
+
+    single = model._active_phase_state_placed({0: phase}, ((0, 1, 2, 3),))
+    full_cohort = model._active_phase_state_placed(
+        {0: phase, 1: phase},
+        ((0, 1, 2, 3), (4, 5, 6, 7)),
+    )
+
+    assert single[-1] == {0: pytest.approx(1.25)}
+    assert full_cohort[-1] == {0: pytest.approx(2.0), 1: pytest.approx(2.0)}
+    assert full_cohort[3][0] > single[3][0]
 
 
 def test_model_defaults_to_calibrated_runtime_n_tile() -> None:
@@ -1275,8 +1323,8 @@ def test_holdout_validator_reports_absolute_error_and_shape_regret() -> None:
 
     report = build_validation_report(calibration, profile, isolated_training_points={(12, 1)})
 
-    assert report["analytic_model_schema_version"] == 7
-    assert report["analytic_model"] == "phase_ecm_llc_domain_v4"
+    assert report["analytic_model_schema_version"] == 8
+    assert report["analytic_model"] == "phase_ecm_llc_domain_team_pressure_v5"
     assert report["isolated"]["coverage"] == {
         "profile_points": 2,
         "evaluated_points": 2,

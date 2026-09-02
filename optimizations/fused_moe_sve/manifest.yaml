@@ -7,6 +7,45 @@ baseline:
   status: reference
 
 features:
+  - id: planner.wide_team_concurrent_pressure
+    part: planner
+    status: experimental
+    implementation: >-
+      cpu_moe_schedule_optimization/cost_model/analytic_model.py and
+      optimizations/fused_moe_sve/benchmarks/bench_wide_team_pressure.py
+    hypothesis: >-
+      A placement-aware, peer-occupancy-scaled residual dilation indexed by
+      fixed team width corrects the event model's preference for wide gangs
+      without changing isolated expert cost or the runtime executor.
+    depends_on: []
+    conflicts_with: []
+    correctness: >-
+      tests/test_moe_analytic_model.py covers calibration round-trip,
+      non-accelerating validation, uncalibrated-width fallback, no-peer
+      identity, and full-cohort dilation.
+    benchmark: >-
+      Arm-codex-internal NUMA3 CPUs 240-319, BF16 TP4 H4096/F512/E256,
+      six non-gate layers from three captured 2048-token TopK6 traces,
+      fixed 4/8/16T teams, two 64-active-core 2x32T and two 80-core 2x40T
+      controls, plus single-team 8/16/32/40/80T controls; early merge off,
+      no tail pool, 2 warmups and 9 runs.
+    owner: zhangxu
+    opened: 2026-09-01
+    decision_by: 2026-09-02
+    next_decision: >-
+      Repeat the three strict proof-plan gates, then extend only after all
+      traces meet the 2 percent no-regression and 5 percent regret criteria.
+    adoption_gate: >-
+      Three strict gates have proof gap at most 5 percent, measured shortlist
+      regret at most 5 percent, and no trace regresses more than 2 percent.
+    result: >-
+      Six held-out layers produced median measured/event residuals of 0.920,
+      1.303, and 1.470 for 4T, 8T, and 16T. Two 64-active-core controls imply
+      single-team internal dilations are 1.144/1.251/1.494/1.424/2.306 for
+      8/16/32/40/80T. Full-cohort total dilations are
+      1.000/1.303/1.470/1.619/1.821/2.306 for 4/8/16/32/40/80T. Final gates
+      are pending.
+
   - id: planner.t_iso_disk_cache
     part: planner
     status: production

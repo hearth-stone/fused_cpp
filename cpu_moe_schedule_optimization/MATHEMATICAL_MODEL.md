@@ -1553,6 +1553,11 @@ $$
 \mathcal F_{strict}=\{G\}\cup\mathcal F_D.
 $$
 
+$\mathcal F_D$ 的 width domain 仅由 runner 显式声明的已校准宽度与 exact greedy 使用的宽度
+组成；full/one-step plan 只提供 hint，不得把其余宽度隐式扩入 proof master。若 hint 含域外宽度，
+改用 exact greedy plan 作为可行 hint。普通 analytical full controls 仍可使用 machine profile 的
+其它 supported widths，但它们不属于本次 CP gap 所证明的集合。
+
 两个分支不允许逐 task 混合，因此可分别求解再取最小，严格等价于一个 plan-level disjunction：
 
 $$
@@ -1566,6 +1571,19 @@ $$
 同时 exact greedy 始终由独立分支保留。该保证不自动推出硬件 wall time 不劣，必须用相同
 strict executor、输入、权重轮换和 paired runs 验证。动态尾池属于后续在线 recourse 策略，
 不由本节 union gap 覆盖。
+
+最终 executable event union 还必须显式保留当前 analytical full incumbent、one-step
+incumbent 与 exact greedy，不允许 CP solve 后把这些已知可执行计划丢掉。CP shortlist 与三种
+incumbent 一起由完整 event model 排序：
+
+$$
+P^*_{event}=\arg\min_{P\in\{P_{full},P_{one},G\}\cup\mathcal S_{CP}}
+\widehat T_{event}(P).
+$$
+
+因此“proof gap”与“最终 plan”是两个不同结论：前者只证明 fluid cold surrogate 上的
+$\{G\}\cup\mathcal F_D$，后者是包含 incumbents 的 measured shortlist decision；二者都必须
+单独报告，不能把 incumbent 的收益记为 CP-SAT 新发现。
 
 **Placement-aware LLC event state。** 旧 analytical DAG 在 `_score()` 中删除
 `core_begin`，所有 active task 共用 rank-global LLC working set、capacity 和 service；这会
@@ -1615,6 +1633,61 @@ domain 的 active threads、working set、spill、offered rate、capacity、util
 该修改只作用于 analytical heavy event scoring；empirical model、production quick planner、
 Plan V2、runtime 和 kernel 不变。
 
+**Wide-team concurrent pressure。** Placement-aware LLC/DRAM allocation仍无法区分
+“相同 active cores、不同 fixed-team width”的同步与负载不均衡开销。例如 80C 上
+$10\times8T$ 与 $5\times16T$ 具有相同总 core 数，但后者每个 expert 的 gang barrier、
+owner-stripe 尾部和 phase 交接更宽。该残差不能从 isolated $T_{iso}$ 或 aggregate
+bandwidth curve 单独识别，因此使用独立的 fixed-cohort control 校准，而不把它混入 LLC
+service curve。进一步的 single-team control 证明超宽 gang 即使无 peer 也有内部 barrier/
+owner-imbalance residual，因此把 isolated 与 concurrent 两部分分开识别。
+
+令 $B_t\ge1$ 为 single-team internal dilation，$S_t\ge B_t$ 为 team width $t$ 在满 rank
+fixed cohort 下的总 dilation，$C$ 为 rank cores，
+$A(e)$ 为 event $e$ 中所有 active task 的完整 team-width 之和（截断到 $C$）。对 active task
+$i$ 定义 peer occupancy：
+
+$$
+q_i(e)=
+\begin{cases}
+\min\left(1,\frac{\max(0,A(e)-t_i)}{C-t_i}\right), & t_i<C,\\
+0, & t_i=C.
+\end{cases}
+$$
+
+仅对 `cold_b/steady_b` GEMM phase 施加：
+
+$$
+D_i^{team}(e)=B_{t_i}+(S_{t_i}-B_{t_i})q_i(e),
+\qquad
+D_i(e)=D_i^{resource}(e)D_i^{team}(e).
+$$
+
+因此单 task 或无 peer 时达到 $B_t$，满 cohort 时达到 $S_t$，且不允许
+$S_t<B_t<1$ 破坏 resource lower bound。$B_t/S_t$ 都是离散宽度表；未校准宽度返回 1，
+不做跨宽度外推。该项只在
+有真实 CPU placement 的 heavy event path 生效，旧 unplaced API 和 production quick
+$T_{iso}$ 不变。cold-phase CP-SAT 无法在线性 cumulative master 中精确表达随 active set 变化的
+$q_i(e)$，而把 $B_t$ 或 $S_t$ 静态乘到整个 mode 会错误改变 wave 数与宽度的权衡。因此
+analytical CP master 保持原 isolated cold surrogate；proof gap明确不包含 wide-team pressure，
+不能声称证明完整并发 event objective。
+完整 event rerank仍使用上式的 occupancy-aware $D_i^{team}(e)$，所以尾部 active teams 减少时
+不会继续支付满 cohort 系数。
+
+Arm-codex 80C 的校准使用三份真实 trace 中与最终 gate 不重叠的六层
+（request008 L0/L10、request016 L10/L20、request022 L0/L10），固定 80 active cores、
+4/8/16T、三种 deterministic order、early merge off、无 tail pool，每点 2 warmup/9 runs/
+2 rotating weight copies。以各层、各 width 的三种 order 的
+`median(measured/event-predicted)` 为样本，再跨六层取中位数，得到原始
+4/8/16T=`0.920/1.303/1.470`；应用非加速下界后校准为
+32T 因不能整除 80C，另用两个非 gate 层的 64-active-core `2x32T` 控制；40T 使用
+`2x40T` full cohort。随后在相同两个 held-out 层分别只启用一个 8/16/32/40/80T team，得到
+$B_8/B_{16}/B_{32}/B_{40}/B_{80}=1.144/1.251/1.494/1.424/2.306$，并取 $B_4=1$。
+满 cohort 得到 $S_4/S_8/S_{16}/S_{40}=1.000/1.303/1.470/1.821$；32T 的
+$q_{32}=2/3$，由残差中位 `1.577` 解得 $S_{32}=1.619$；80T 不存在 peer，取
+$S_{80}=B_{80}=2.306$。这只能识别该机器、BF16 TP4 proxy、离散
+4/8/16/32/40/80T cohort
+域内的 residual pressure；route class、partial occupancy 和第二台 Arm 仍是 holdout 风险。
+
 **Diverse shortlist 与 lowering。** proof 与 pool 使用两个独立 solve。proof 在长时限内只
 输出完整 master 的 $U_{CP},L_{CP},gap_{CP}$；pool 使用较短 root，不让更长 proof 偶然改变
 候选邻域。pool root 后固定非热点 expert 的 width/domain 和 surrogate interval，保留 route
@@ -1628,9 +1701,12 @@ $$
 并要求后续解的 surrogate makespan 不超过 pool root incumbent 的 $1+\epsilon_s$，重复至
 32 个解或时限。因此相同 width/domain vector 的不同 order 是合法的 diverse plan；报告同时
 保留 width/domain 与完整 schedule signature，不能把 pool 中 32 个解都解释为全局
-$gap_{CP}$ 内的独立证明。每个解再以二维 no-overlap 将固定 surrogate residence interval
-放入对应 domain 的连续 core 区间。相邻 core 使用者形成 runtime dependency；surrogate
-start time 不下沉为主动 idling/release gate。随后用完整 analytical event model（包含
+$gap_{CP}$ 内的独立证明。每个解再固定 width/domain，以无 internal wait 的 service duration
+建立较小的二维 no-overlap lowering。第一步固定 fluid master start，只求 contiguous core
+placement；若不可行，第二步才允许 task 不早于 fluid start 地最小延迟，并以 lowering makespan
+为目标，状态显式标为 `*_DELAYED`。相邻 core 使用者形成 runtime dependency；lowered start
+time 不下沉为主动 idling/release gate。该 fallback stretch 必须计入 lowering 状态与耗时，
+且 root proof gap 仍只属于 fluid surrogate。随后用完整 analytical event model（包含
 current cache/refill、LLC/DRAM contention 和 deterministic window）重排，硬件只测前 8 名。
 
 第一版必须分别报告 root CP gap、32 解生成数、lowering 成功数、event ranking、前 8 名实测

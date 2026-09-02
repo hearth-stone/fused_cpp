@@ -36,8 +36,8 @@ except ImportError:  # pragma: no cover - package-style import
 
 ANALYTIC_MACHINE_SCHEMA_VERSION = 2
 SUPPORTED_ANALYTIC_MACHINE_SCHEMA_VERSIONS = frozenset({1, 2})
-ANALYTIC_MODEL_SCHEMA_VERSION = 7
-ANALYTIC_MODEL_NAME = "phase_ecm_llc_domain_v4"
+ANALYTIC_MODEL_SCHEMA_VERSION = 8
+ANALYTIC_MODEL_NAME = "phase_ecm_llc_domain_team_pressure_v5"
 _SHARED_RESOURCES = (
     "gemm_core_flops",
     "matrix_flops",
@@ -347,6 +347,70 @@ class RuntimeOverheads:
 
 
 @dataclass(frozen=True)
+class WideTeamPressureCalibration:
+    """Residual full-cohort dilation indexed by fixed team width."""
+
+    isolated_dilation: tuple[tuple[int, float], ...] = ()
+    full_cohort_dilation: tuple[tuple[int, float], ...] = ()
+
+    def __post_init__(self) -> None:
+        isolated = tuple(sorted((int(width), float(scale)) for width, scale in self.isolated_dilation))
+        full = tuple(sorted((int(width), float(scale)) for width, scale in self.full_cohort_dilation))
+        for name, points in (("isolated", isolated), ("full-cohort", full)):
+            if any(width <= 0 or scale < 1.0 for width, scale in points):
+                raise ValueError(
+                    f"wide-team {name} widths must be positive and dilation must be at least one"
+                )
+            if len({width for width, _ in points}) != len(points):
+                raise ValueError(f"wide-team {name} widths must be unique")
+        isolated_by_width = dict(isolated)
+        if any(scale < isolated_by_width.get(width, 1.0) for width, scale in full):
+            raise ValueError("full-cohort dilation cannot be below isolated dilation")
+        object.__setattr__(self, "isolated_dilation", isolated)
+        object.__setattr__(self, "full_cohort_dilation", full)
+
+    @staticmethod
+    def _scale(points: tuple[tuple[int, float], ...], team_width: int) -> float:
+        if team_width <= 0:
+            raise ValueError("team_width must be positive")
+        return dict(points).get(team_width, 1.0)
+
+    def isolated_scale(self, team_width: int) -> float:
+        return self._scale(self.isolated_dilation, team_width)
+
+    def full_cohort_scale(self, team_width: int) -> float:
+        return max(
+            self._scale(self.full_cohort_dilation, team_width),
+            self.isolated_scale(team_width),
+        )
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> "WideTeamPressureCalibration":
+        return cls(
+            isolated_dilation=tuple(
+                (int(point["threads"]), float(point["dilation"]))
+                for point in payload.get("isolated_dilation", ())
+            ),
+            full_cohort_dilation=tuple(
+                (int(point["threads"]), float(point["dilation"]))
+                for point in payload.get("full_cohort_dilation", ())
+            )
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "isolated_dilation": [
+                {"threads": width, "dilation": scale}
+                for width, scale in self.isolated_dilation
+            ],
+            "full_cohort_dilation": [
+                {"threads": width, "dilation": scale}
+                for width, scale in self.full_cohort_dilation
+            ]
+        }
+
+
+@dataclass(frozen=True)
 class AnalyticMachineCalibration:
     """Thin machine calibration independent of route and expert shape."""
 
@@ -370,6 +434,7 @@ class AnalyticMachineCalibration:
     rank_cpu_ids: tuple[int, ...] = ()
     llc_domains: tuple[LlcDomainCalibration, ...] = ()
     dram_scope: str = "numa_rank"
+    wide_team_pressure: WideTeamPressureCalibration = WideTeamPressureCalibration()
 
     def __post_init__(self) -> None:
         if not self.machine_id:
@@ -562,6 +627,9 @@ class AnalyticMachineCalibration:
                 for domain in topology.get("llc_domains", ())
             ),
             dram_scope=str(topology.get("dram_scope", "numa_rank")),
+            wide_team_pressure=WideTeamPressureCalibration.from_dict(
+                payload.get("planner", {}).get("wide_team_pressure", {})
+            ),
         )
 
     @classmethod
@@ -605,6 +673,11 @@ class AnalyticMachineCalibration:
                 "llc_domains": [domain.to_dict() for domain in self.llc_domains],
                 "dram_scope": self.dram_scope,
             }
+        if (
+            self.wide_team_pressure.isolated_dilation
+            or self.wide_team_pressure.full_cohort_dilation
+        ):
+            payload["planner"]["wide_team_pressure"] = self.wide_team_pressure.to_dict()
         return payload
 
 
@@ -2024,6 +2097,7 @@ class AnalyticMoeCostModel:
         dict[str, AnalyticResourcePressure],
         dict[int, float],
         dict[str, dict[str, float | int | None]],
+        dict[int, float],
     ]:
         """Allocate LLC capacity and service by the tasks' physical domains."""
 
@@ -2228,7 +2302,37 @@ class AnalyticMoeCostModel:
             )
             for index, phase in current_items
         }
-        return task_spill, provisional, pressures, multipliers, domain_details
+        occupied_team_threads = min(
+            sum(len(task_cpu_ids[index]) for index, _ in current_items),
+            self.calibration.cores_per_rank,
+        )
+        team_pressure_dilation = {}
+        for index, phase in current_items:
+            team_width = len(task_cpu_ids[index])
+            available_peer_threads = self.calibration.cores_per_rank - team_width
+            peer_threads = max(occupied_team_threads - team_width, 0)
+            peer_fraction = (
+                min(peer_threads / available_peer_threads, 1.0)
+                if available_peer_threads > 0
+                else 0.0
+            )
+            isolated_scale = self.calibration.wide_team_pressure.isolated_scale(team_width)
+            full_cohort_scale = self.calibration.wide_team_pressure.full_cohort_scale(team_width)
+            dilation = (
+                isolated_scale + (full_cohort_scale - isolated_scale) * peer_fraction
+                if phase.kind in {"cold_b", "steady_b"}
+                else 1.0
+            )
+            team_pressure_dilation[index] = dilation
+            multipliers[index] *= dilation
+        return (
+            task_spill,
+            provisional,
+            pressures,
+            multipliers,
+            domain_details,
+            team_pressure_dilation,
+        )
 
     def active_resource_pressure(self, phases: Sequence[AnalyticPhase]) -> dict[str, AnalyticResourcePressure]:
         """Return physically named offered-load pressure for one concurrent phase set."""
@@ -2284,7 +2388,14 @@ class AnalyticMoeCostModel:
                 spill_log: float | dict[str, float] = spill_fraction
                 domain_log = None
             else:
-                task_spill, _, pressures, multipliers, domain_log = self._active_phase_state_placed(
+                (
+                    task_spill,
+                    _,
+                    pressures,
+                    multipliers,
+                    domain_log,
+                    team_pressure_dilation,
+                ) = self._active_phase_state_placed(
                     current,
                     task_cpu_ids,
                 )
@@ -2311,6 +2422,10 @@ class AnalyticMoeCostModel:
                 }
                 if domain_log is not None:
                     event["llc_domains"] = domain_log
+                    event["team_pressure_dilation"] = {
+                        str(index): team_pressure_dilation[index]
+                        for index in active
+                    }
                 event_log.append(event)
             wall_ns += elapsed
             for index in active:

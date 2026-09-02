@@ -701,8 +701,9 @@ def materialize_domain_candidate(
     max_time_s: float = 30.0,
     workers: int = 1,
     random_seed: int = 0,
+    allow_start_delay: bool = False,
 ) -> ColdPhaseRuntimePlacement:
-    """Lower one fluid domain schedule to contiguous teams and dependency edges."""
+    """Delay a fluid domain schedule minimally to form contiguous runtime teams."""
 
     if not candidate.assignments:
         raise ValueError("candidate must contain at least one assignment")
@@ -714,6 +715,9 @@ def materialize_domain_candidate(
     cp_model = _cp_model_module()
     model = cp_model.CpModel()
     variables = []
+    horizon = max(item.assignment.start_ns for item in candidate.assignments) + sum(
+        item.assignment.service_ns for item in candidate.assignments
+    )
     for task_id, item in enumerate(candidate.assignments):
         domain = by_id.get(item.domain_id)
         if domain is None:
@@ -726,9 +730,25 @@ def materialize_domain_candidate(
             domain.core_begin + domain.core_count - assignment.threads,
             f"core_begin_t{task_id}_e{item.expert_id}",
         )
-        time_interval = model.new_fixed_size_interval_var(
+        latest_start = (
+            horizon - assignment.service_ns
+            if allow_start_delay
+            else assignment.start_ns
+        )
+        start = model.new_int_var(
             assignment.start_ns,
-            assignment.end_ns - assignment.start_ns,
+            latest_start,
+            f"start_t{task_id}_e{item.expert_id}",
+        )
+        end = model.new_int_var(
+            assignment.start_ns + assignment.service_ns,
+            horizon,
+            f"end_t{task_id}_e{item.expert_id}",
+        )
+        time_interval = model.new_interval_var(
+            start,
+            assignment.service_ns,
+            end,
             f"time_t{task_id}_e{item.expert_id}",
         )
         core_interval = model.new_fixed_size_interval_var(
@@ -736,11 +756,14 @@ def materialize_domain_candidate(
             assignment.threads,
             f"cores_t{task_id}_e{item.expert_id}",
         )
-        variables.append((item, core_begin, time_interval, core_interval))
+        variables.append((item, core_begin, start, end, time_interval, core_interval))
     model.add_no_overlap_2d(
-        [row[2] for row in variables],
-        [row[3] for row in variables],
+        [row[4] for row in variables],
+        [row[5] for row in variables],
     )
+    makespan = model.new_int_var(0, horizon, "lowered_makespan")
+    model.add_max_equality(makespan, [row[3] for row in variables])
+    model.minimize(makespan)
     model.add_decision_strategy(
         [row[1] for row in variables],
         cp_model.CHOOSE_FIRST,
@@ -761,16 +784,41 @@ def materialize_domain_candidate(
     status = status_names.get(status_code, f"STATUS_{status_code}")
     num_cores = sum(domain.core_count for domain in normalized_domains)
     if status_code not in (cp_model.FEASIBLE, cp_model.OPTIMAL):
+        if not allow_start_delay:
+            delayed = materialize_domain_candidate(
+                candidate,
+                domains=normalized_domains,
+                max_time_s=max_time_s,
+                workers=workers,
+                random_seed=random_seed,
+                allow_start_delay=True,
+            )
+            if delayed.tasks:
+                return ColdPhaseRuntimePlacement(
+                    f"{delayed.status}_DELAYED",
+                    float(solver.wall_time) + delayed.wall_time_s,
+                    delayed.num_cores,
+                    delayed.tasks,
+                )
+            return delayed
         return ColdPhaseRuntimePlacement(status, float(solver.wall_time), num_cores, ())
 
     ordered = sorted(
-        ((row[0], int(solver.value(row[1]))) for row in variables),
-        key=lambda row: (row[0].assignment.start_ns, row[0].assignment.end_ns, row[0].expert_id),
+        (
+            (
+                row[0],
+                int(solver.value(row[1])),
+                int(solver.value(row[2])),
+                int(solver.value(row[3])),
+            )
+            for row in variables
+        ),
+        key=lambda row: (row[2], row[3], row[0].expert_id),
     )
     previous_by_core = [-1] * num_cores
     tasks = []
-    origin = min(item.assignment.start_ns for item, _ in ordered)
-    for task_id, (item, core_begin) in enumerate(ordered):
+    origin = min(start for _, _, start, _ in ordered)
+    for task_id, (item, core_begin, _, end) in enumerate(ordered):
         assignment = item.assignment
         core_end = core_begin + assignment.threads
         dependencies = tuple(sorted({value for value in previous_by_core[core_begin:core_end] if value >= 0}))
@@ -781,7 +829,7 @@ def materialize_domain_candidate(
                 assignment.threads,
                 core_begin,
                 0,
-                assignment.end_ns - origin,
+                end - origin,
                 dependencies,
             )
         )

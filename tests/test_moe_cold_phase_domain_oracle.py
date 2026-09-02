@@ -19,6 +19,7 @@ from cold_phase_cp_sat_oracle import (  # noqa: E402
 )
 from cold_phase_domain_oracle import (  # noqa: E402
     DomainAssignment,
+    DomainCandidate,
     LlcDomain,
     compare_strict_greedy_union,
     materialize_domain_candidate,
@@ -159,6 +160,39 @@ def test_domain_candidate_lowering_keeps_teams_inside_domains() -> None:
             2 <= task.core_begin < task.core_begin + task.threads <= 4
         )
         assert all(dependency < placement.tasks.index(task) for dependency in task.dependencies)
+
+
+def test_domain_candidate_lowering_may_delay_fluid_starts_to_make_contiguous_teams() -> None:
+    pytest.importorskip("ortools")
+    candidate = DomainCandidate(
+        10,
+        tuple(
+            DomainAssignment(
+                "only",
+                ColdPhaseAssignment(
+                    expert_id,
+                    1,
+                    2,
+                    0,
+                    10,
+                    0,
+                    10,
+                    (),
+                ),
+            )
+            for expert_id in range(2)
+        ),
+    )
+
+    placement = materialize_domain_candidate(
+        candidate,
+        domains=(LlcDomain("only", 0, 2),),
+        workers=1,
+    )
+
+    assert placement.status == "OPTIMAL_DELAYED"
+    assert [task.modeled_end_ns for task in placement.tasks] == [10, 20]
+    assert placement.tasks[1].dependencies == (0,)
 
 
 def test_fixed_strict_greedy_branch_preserves_width_order_and_union_bound() -> None:

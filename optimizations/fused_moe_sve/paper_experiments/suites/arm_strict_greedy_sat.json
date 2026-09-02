@@ -2,7 +2,7 @@
   "schema_version": 1,
   "id": "arm_strict_greedy_sat",
   "description": "Arm-codex 80-core strict-only pure-greedy versus greedy-inclusive CP-SAT comparison.",
-  "machine_ids": ["arm_codex_internal"],
+  "machine_ids": ["arm_codex_internal_wide_pressure"],
   "setup": [
     {
       "id": "focused_correctness",
@@ -15,19 +15,19 @@
       "id": "uniformish_strict_greedy_sat",
       "timeout_seconds": 7200,
       "output_json": true,
-      "argv": ["{python}", "optimizations/fused_moe_sve/benchmarks/bench_high_skew_planner_closure.py", "--route-file", "{uniformish_route}", "--route-layer", "{uniformish_layer}", "--analytic-calibration", "{analytic_calibration}", "--hidden", "4096", "--intermediate", "512", "--experts", "256", "--threads", "80", "--widths", "4,8,16", "--orders", "lpt,reverse_odd,reverse_even", "--cp-sat-shortlist", "1", "--cp-sat-measure", "1", "--cp-sat-root-time", "60", "--cp-sat-pool-root-time", "60", "--cp-sat-next-time", "5", "--cp-sat-gap", "0.01", "--cp-sat-slack", "0.50", "--cp-sat-repair-experts", "16", "--cp-sat-incumbent", "greedy", "--cp-sat-domain-hint", "one_step", "--warmup", "5", "--runs", "31", "--weight-copies", "4", "--output", "{remote_output}"]
+      "argv": ["{python}", "optimizations/fused_moe_sve/benchmarks/bench_high_skew_planner_closure.py", "--route-file", "{uniformish_route}", "--route-layer", "{uniformish_layer}", "--analytic-calibration", "{analytic_calibration}", "--hidden", "4096", "--intermediate", "512", "--experts", "256", "--threads", "80", "--widths", "1,2,4,8,16", "--orders", "lpt,reverse_odd,reverse_even", "--cp-sat-shortlist", "32", "--cp-sat-measure", "8", "--cp-sat-root-time", "60", "--cp-sat-pool-root-time", "60", "--cp-sat-next-time", "5", "--cp-sat-gap", "0.01", "--cp-sat-slack", "0.50", "--cp-sat-repair-experts", "16", "--cp-sat-incumbent", "greedy", "--cp-sat-domain-hint", "one_step", "--warmup", "5", "--runs", "31", "--weight-copies", "4", "--output", "{remote_output}"]
     },
     {
       "id": "median_strict_greedy_sat",
       "timeout_seconds": 7200,
       "output_json": true,
-      "argv": ["{python}", "optimizations/fused_moe_sve/benchmarks/bench_high_skew_planner_closure.py", "--route-file", "{median_route}", "--route-layer", "{median_layer}", "--analytic-calibration", "{analytic_calibration}", "--hidden", "4096", "--intermediate", "512", "--experts", "256", "--threads", "80", "--widths", "4,8,16", "--orders", "lpt,reverse_odd,reverse_even", "--cp-sat-shortlist", "1", "--cp-sat-measure", "1", "--cp-sat-root-time", "60", "--cp-sat-pool-root-time", "60", "--cp-sat-next-time", "5", "--cp-sat-gap", "0.01", "--cp-sat-slack", "0.50", "--cp-sat-repair-experts", "16", "--cp-sat-incumbent", "greedy", "--cp-sat-domain-hint", "one_step", "--warmup", "5", "--runs", "31", "--weight-copies", "4", "--output", "{remote_output}"]
+      "argv": ["{python}", "optimizations/fused_moe_sve/benchmarks/bench_high_skew_planner_closure.py", "--route-file", "{median_route}", "--route-layer", "{median_layer}", "--analytic-calibration", "{analytic_calibration}", "--hidden", "4096", "--intermediate", "512", "--experts", "256", "--threads", "80", "--widths", "1,2,4,8,16", "--orders", "lpt,reverse_odd,reverse_even", "--cp-sat-shortlist", "32", "--cp-sat-measure", "8", "--cp-sat-root-time", "60", "--cp-sat-pool-root-time", "60", "--cp-sat-next-time", "5", "--cp-sat-gap", "0.01", "--cp-sat-slack", "0.50", "--cp-sat-repair-experts", "16", "--cp-sat-incumbent", "greedy", "--cp-sat-domain-hint", "one_step", "--warmup", "5", "--runs", "31", "--weight-copies", "4", "--output", "{remote_output}"]
     },
     {
       "id": "high_skew_strict_greedy_sat",
       "timeout_seconds": 7200,
       "output_json": true,
-      "argv": ["{python}", "optimizations/fused_moe_sve/benchmarks/bench_high_skew_planner_closure.py", "--route-file", "{high_skew_route}", "--route-layer", "{high_skew_layer}", "--analytic-calibration", "{analytic_calibration}", "--hidden", "4096", "--intermediate", "512", "--experts", "256", "--threads", "80", "--widths", "4,8,16", "--orders", "lpt,reverse_odd,reverse_even", "--cp-sat-shortlist", "1", "--cp-sat-measure", "1", "--cp-sat-root-time", "60", "--cp-sat-pool-root-time", "60", "--cp-sat-next-time", "5", "--cp-sat-gap", "0.01", "--cp-sat-slack", "0.50", "--cp-sat-repair-experts", "16", "--cp-sat-incumbent", "greedy", "--cp-sat-domain-hint", "one_step", "--warmup", "5", "--runs", "31", "--weight-copies", "4", "--output", "{remote_output}"]
+      "argv": ["{python}", "optimizations/fused_moe_sve/benchmarks/bench_high_skew_planner_closure.py", "--route-file", "{high_skew_route}", "--route-layer", "{high_skew_layer}", "--analytic-calibration", "{analytic_calibration}", "--hidden", "4096", "--intermediate", "512", "--experts", "256", "--threads", "80", "--widths", "1,2,4,8,16", "--orders", "lpt,reverse_odd,reverse_even", "--cp-sat-shortlist", "32", "--cp-sat-measure", "8", "--cp-sat-root-time", "60", "--cp-sat-pool-root-time", "60", "--cp-sat-next-time", "5", "--cp-sat-gap", "0.01", "--cp-sat-slack", "0.50", "--cp-sat-repair-experts", "16", "--cp-sat-incumbent", "greedy", "--cp-sat-domain-hint", "one_step", "--warmup", "5", "--runs", "31", "--weight-copies", "4", "--output", "{remote_output}"]
     }
   ]
 }
