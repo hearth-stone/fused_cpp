@@ -37,8 +37,9 @@ features:
     opened: 2026-09-03
     decision_by: 2026-10-03
     next_decision: >-
-      Run the commit-bound three-trace width-neighborhood suite with the frozen
-      v8 calibration and verify ranking of the stable high-skew lane merges.
+      Keep the correction for offline guarded search and repeat on a second Arm
+      machine before any portability claim. Do not tune it further on these
+      three now-consumed real-trace holdouts.
     adoption_gate: >-
       At most 5 percent error on every independent synthetic state; no selected
       real-trace regression above 2 percent; measured shortlist regret no larger
@@ -48,7 +49,9 @@ features:
       88799.963/5909.533 ns and full-cohort correction factors of 0.784898 for
       1T and 0.532344 for 2T. Six background and three isolated-pair validation
       errors are within 2.95 percent. A frozen high-skew event-only precheck was
-      not used to refit; real-trace hardware remains the holdout. See
+      not used to refit. The commit-bound real-trace holdout kept all baselines,
+      did not reproduce the old merge gains, and ranked a stable high-skew
+      16T-to-8T split first. See
       results/arm_codex_80c_narrow_lane_merge_calibration_20260903.md.
 
   - id: planner.topology_preserving_width_neighborhood_audit
@@ -83,22 +86,24 @@ features:
     opened: 2026-09-03
     decision_by: 2026-10-03
     next_decision: >-
-      Repeat the committed three-trace suite with the frozen v8 calibration.
-      Do not enter width-VND until the robust scorer ranks and accepts the
-      stable merge opportunity.
+      Retain width operators for offline shortlist/LNS experiments. Do not
+      enter deterministic width-VND or lower the 2 percent action gate; repeat
+      the frozen method on a second Arm machine before broader claims.
     adoption_gate: >-
       At least one width candidate with positive paired P10 speedup; no selected
       plan regression above 2 percent on any trace; measured shortlist regret
       no larger than 5 percent; and explicit order-only, width-only, and
       combined ablations under equal per-operator budgets.
     result: >-
-      A prefinal direct-sync Arm 80C run found no stable uniformish or median
-      candidate, but two high-skew domain-local lane merges improved paired
-      median by 1.436 and 1.248 percent with positive 0.262 and 0.340 percent
-      P10. All guarded decisions retained baseline and shortlist regret stayed
-      at or below 1.449 percent. Point ranking remains inaccurate: the model
-      ranked a regressing split ahead of both stable merges. See
-      results/arm_codex_80c_width_neighborhood_audit_prefinal_20260903.md.
+      Formal commit 1fcbc7b retained baseline on all traces with combined
+      shortlist regret 0.386/0.637/0.983 percent. Uniformish/median had no
+      stable candidate; high-skew's model-ranked 16T-to-8T split improved
+      paired median by 1.037 percent with 0.334 percent P10 and 30/31 wins in
+      the first run. A same-commit repeat measured 1.271 percent median but
+      negative 0.632 percent P10; a different merge was positive-P10 only in
+      the repeat. No candidate was stable across both sessions, and point
+      Spearman remained weak on median/high-skew. See
+      results/arm_codex_80c_width_neighborhood_narrow_calibrated_20260903.md.
 
   - id: planner.uncertainty_aware_neighborhood_gate
     part: planner

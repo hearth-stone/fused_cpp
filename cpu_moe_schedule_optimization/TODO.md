@@ -166,9 +166,19 @@ Temporal-ranking remediation in progress before this gate may be reconsidered:
   corrections and reduces all nine declared synthetic validation errors below
   3%. The three captured route traces remain the commit-bound holdout; see
   `results/arm_codex_80c_narrow_lane_merge_calibration_20260903.md`.
-- [ ] From the calibration/model commit, rerun
-  `arm_width_neighborhood_audit` and decide whether the corrected robust score
-  recovers the two previously stable high-skew merges without a >2% regression.
+- [x] From model commit `1fcbc7b`, rerun `arm_width_neighborhood_audit`.
+  All three guarded decisions retained baseline; combined shortlist regret was
+  `0.386%/0.637%/0.983%`. The old 1T-to-2T merge gains did not reproduce, but
+  the model-ranked high-skew `16T -> 8T+8T` split was stable at `+1.037%`
+  paired median, `+0.334%` P10, and 30/31 wins. Retain width operators in Lab,
+  but keep width-VND disabled because predicted gain was only `0.278%` and
+  median/high-skew point Spearman remained near zero. See
+  `results/arm_codex_80c_width_neighborhood_narrow_calibrated_20260903.md`.
+  An independent same-commit high-skew repeat kept the split at `+1.271%`
+  median but changed its P10 to `-0.632%`; another merge changed from
+  `+0.864%/-0.813%` median/P10 to `+1.437%/+0.433%`. No candidate has positive
+  P10 in both formal sessions, confirming that sub-2% width gains are not yet
+  cross-session stable.
 
 ### Step 4: make event-guided search affordable
 

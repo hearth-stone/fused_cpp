@@ -82,8 +82,11 @@ It does not support interpolation to another Arm CPU, another rank size, W8A8,
 W8A16, or a different H/F shape. It does not alter production quick planning or
 Plan V2 execution semantics.
 
-The decisive holdout is the commit-bound
-`arm_width_neighborhood_audit` suite on uniformish, median, and high-skew real
-routes. Adoption still requires no selected regression above 2%, measured
-shortlist regret at most 5%, and correct ranking of the previously observed
-stable high-skew lane merges.
+The decisive commit-bound `arm_width_neighborhood_audit` holdout subsequently
+completed from revision `1fcbc7b`. It retained baseline on all three traces and
+did not reproduce the prefinal merge gains; instead, it ranked a stable
+high-skew `16T -> 8T+8T` split first within that run. A same-commit repeat kept
+the split's median positive but not its P10, and no candidate was positive-P10
+in both formal sessions. See
+[`arm_codex_80c_width_neighborhood_narrow_calibrated_20260903.md`](arm_codex_80c_width_neighborhood_narrow_calibrated_20260903.md)
+for the final decision.

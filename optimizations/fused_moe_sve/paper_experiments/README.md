@@ -127,6 +127,16 @@ The `arm_codex_internal_temporal_overhead` machine now points to that v8 asset;
 therefore the next width-neighborhood suite run is the real-trace holdout and
 must use the same committed model source.
 
+That holdout completed successfully at revision `1fcbc7b` with run id
+`20260902T155347Z-arm_codex_internal_temporal_overhead-arm_width_neighborhood_audit-1fcbc7b130f0`.
+All guarded decisions retained baseline; the only stable candidate was the
+model-ranked high-skew `16T -> 8T+8T` split at `+1.037%` paired median and
+`+0.334%` P10 within that run. A same-commit high-skew repeat
+`20260902T161403Z-arm_codex_internal_temporal_overhead-arm_width_neighborhood_audit-1fcbc7b130f0`
+kept its median positive at `+1.271%` but changed P10 to `-0.632%`; no candidate
+was positive-P10 in both sessions. The full decision is recorded in
+[`../results/arm_codex_80c_width_neighborhood_narrow_calibrated_20260903.md`](../results/arm_codex_80c_width_neighborhood_narrow_calibrated_20260903.md).
+
 The analytical heavy planner now has an additive placement-aware LLC event
 path. Prefinal reruns correct greedy-versus-SAT ranking on high and median skew,
 but uniformish regresses 1.89% and wins only 4/31 pairs; full-search time also
