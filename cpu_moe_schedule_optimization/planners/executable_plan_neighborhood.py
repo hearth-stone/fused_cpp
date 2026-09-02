@@ -56,6 +56,52 @@ class SampledNeighborhood:
         return sum(self.duplicate_by_operator.values())
 
 
+@dataclass(frozen=True)
+class ExecutablePlanScore:
+    """Event estimate plus a serial-lane uncertainty guard."""
+
+    event_ns: float
+    lane_guard_ns: float
+    robust_ns: float
+
+
+def score_executable_plan(
+    model,
+    state: ExecutablePlanState,
+    *,
+    relative_uncertainty: float | None = None,
+) -> ExecutablePlanScore:
+    """Score one state without hiding a newly heavy lane below the event path."""
+
+    uncertainty = (
+        float(getattr(model, "relative_error", 0.0)) if relative_uncertainty is None else float(relative_uncertainty)
+    )
+    if not 0.0 <= uncertainty < 1.0:
+        raise ValueError("relative_uncertainty must be in [0, 1)")
+    event_ns = float(model.dag_makespan_placed(placed_tasks(state)))
+    lane_guard_ns = max(
+        sum(float(model.T_iso(task.routes, lane.threads)) for task in lane.tasks) for lane in state.lanes
+    ) * (1.0 + uncertainty)
+    return ExecutablePlanScore(
+        event_ns=event_ns,
+        lane_guard_ns=lane_guard_ns,
+        robust_ns=max(event_ns, lane_guard_ns),
+    )
+
+
+def is_resolvable_improvement(
+    incumbent: ExecutablePlanScore,
+    candidate: ExecutablePlanScore,
+    *,
+    minimum_gain_fraction: float,
+) -> bool:
+    """Require a positive robust gain larger than the action-resolution margin."""
+
+    if not 0.0 <= minimum_gain_fraction < 1.0:
+        raise ValueError("minimum_gain_fraction must be in [0, 1)")
+    return candidate.robust_ns <= incumbent.robust_ns * (1.0 - minimum_gain_fraction)
+
+
 def _with_lane_tasks(
     state: ExecutablePlanState,
     replacements: Mapping[int, Sequence],
@@ -267,9 +313,12 @@ __all__ = [
     "ORDER_ONLY_OPERATORS",
     "SAME_LANE_INSERTION",
     "ExecutablePlanNeighbor",
+    "ExecutablePlanScore",
     "SampledNeighborhood",
     "critical_expert_scores",
     "enumerate_order_only_neighbors",
     "placed_tasks",
+    "is_resolvable_improvement",
     "sample_order_only_neighborhood",
+    "score_executable_plan",
 ]

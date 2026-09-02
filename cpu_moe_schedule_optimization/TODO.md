@@ -115,9 +115,15 @@ Temporal-ranking remediation in progress before this gate may be reconsidered:
   and separate early-merge time from scheduled expert compute.
 - [x] Add an independent three-state 1T victim probe and fit width-specific
   expert fixed/per-route overhead without using planner-neighbor measurements.
-- [ ] Freeze the new Arm calibration and repeat the uniformish, median, and
-  high-skew neighborhood audit. Reopen VND only if ranking improves and no new
-  measured selection regression exceeds 2%.
+- [x] Freeze the new Arm calibration and repeat the uniformish, median, and
+  high-skew neighborhood audit. Point ranking improved only on high-skew and
+  exposed new sub-1%-predicted counterexamples, so VND remains gated off.
+- [x] Add a serial-lane uncertainty guard and a 2% minimum actionable gain;
+  candidates below the resolution margin may be measured but cannot replace
+  the incumbent automatically.
+- [ ] Repeat the committed three-trace suite with the uncertainty-aware decision
+  output and require zero selected-plan regression above 2%. Keep point-ranking
+  accuracy and safe planner selection as separate reported results.
 
 - [ ] Starting independently from full, one-step, greedy, and fixed-width
   controls, run best-improvement descent over same-lane insertion, same-width

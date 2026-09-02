@@ -29,8 +29,10 @@ from analytic_model import AnalyticMoeCostModel  # noqa: E402
 from executable_plan_neighborhood import (  # noqa: E402
     ORDER_ONLY_OPERATORS,
     critical_expert_scores,
+    is_resolvable_improvement,
     placed_tasks,
     sample_order_only_neighborhood,
+    score_executable_plan,
 )
 from executable_plan_state import ExecutablePlanState  # noqa: E402
 from fused_cpp import _moe_C  # noqa: E402
@@ -62,6 +64,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--critical-experts", type=int, default=32)
     parser.add_argument("--neighbors-per-operator", type=int, default=64)
     parser.add_argument("--event-top-per-strategy", type=int, default=4)
+    parser.add_argument("--minimum-actionable-gain-pct", type=float, default=2.0)
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--runs", type=int, default=31)
     parser.add_argument("--weight-copies", type=int, default=4)
@@ -110,21 +113,24 @@ def _score_neighborhood(
         per_operator=per_operator,
         seed=seed,
     )
-    baseline_ns = model.dag_makespan_placed(placed_tasks(state))
+    baseline_score = score_executable_plan(model, state)
     scored = []
     states = {}
     begin = time.perf_counter_ns()
     for neighbor in sampled.neighbors:
         state_hash = neighbor.state.canonical_hash()
-        score_ns = model.dag_makespan_placed(placed_tasks(neighbor.state))
+        score = score_executable_plan(model, neighbor.state)
         states[state_hash] = neighbor.state
         scored.append(
             {
                 "state_hash": state_hash,
                 "operator": neighbor.operator,
                 "moved_experts": list(neighbor.moved_experts),
-                "event_ns": score_ns,
-                "event_gain_pct": 100.0 * (baseline_ns / score_ns - 1.0),
+                "event_ns": score.event_ns,
+                "lane_guard_ns": score.lane_guard_ns,
+                "robust_ns": score.robust_ns,
+                "event_gain_pct": 100.0 * (baseline_score.event_ns / score.event_ns - 1.0),
+                "robust_gain_pct": 100.0 * (baseline_score.robust_ns / score.robust_ns - 1.0),
             }
         )
     score_wall_s = (time.perf_counter_ns() - begin) / 1.0e9
@@ -161,6 +167,10 @@ def _score_neighborhood(
         ),
         "best_event_gain_pct": max(
             (float(item["event_gain_pct"]) for item in scored),
+            default=None,
+        ),
+        "best_robust_gain_pct": max(
+            (float(item["robust_gain_pct"]) for item in scored),
             default=None,
         ),
         "operators": operator_summary,
@@ -277,6 +287,8 @@ def main() -> int:
         <= 0
     ):
         raise ValueError("dimensions and audit budgets must be positive")
+    if not 0.0 <= args.minimum_actionable_gain_pct < 100.0:
+        raise ValueError("minimum-actionable-gain-pct must be in [0, 100)")
     affinity = sorted(os.sched_getaffinity(0))
     if len(affinity) < args.threads:
         raise ValueError(f"threads={args.threads} exceeds affinity size {len(affinity)}")
@@ -334,6 +346,32 @@ def main() -> int:
         reports[strategy] = report
         all_states.update(states)
 
+    baseline_score = score_executable_plan(model, baseline)
+    decision_rows = [(strategy, row) for strategy, report in reports.items() for row in report["scored"]]
+    best_strategy, best_row = min(
+        decision_rows,
+        key=lambda item: (
+            float(item[1]["robust_ns"]),
+            str(item[1]["state_hash"]),
+        ),
+    )
+    best_state_hash = str(best_row["state_hash"])
+    best_score = score_executable_plan(model, all_states[best_state_hash])
+    accepted = is_resolvable_improvement(
+        baseline_score,
+        best_score,
+        minimum_gain_fraction=args.minimum_actionable_gain_pct / 100.0,
+    )
+    decision = {
+        "minimum_actionable_gain_pct": args.minimum_actionable_gain_pct,
+        "selected": best_state_hash if accepted else "baseline",
+        "candidate_strategy": best_strategy,
+        "candidate_state_hash": best_state_hash,
+        "candidate_event_gain_pct": float(best_row["event_gain_pct"]),
+        "candidate_robust_gain_pct": float(best_row["robust_gain_pct"]),
+        "resolvable": accepted,
+    }
+
     selected_hashes = []
     selected_sources: dict[str, list[str]] = {}
     for strategy, report in reports.items():
@@ -342,6 +380,8 @@ def main() -> int:
             selected_sources.setdefault(state_hash, []).append(strategy)
             if state_hash not in selected_hashes:
                 selected_hashes.append(state_hash)
+    if accepted and best_state_hash not in selected_hashes:
+        selected_hashes.append(best_state_hash)
 
     hardware = None
     if args.measure_hardware:
@@ -359,6 +399,17 @@ def main() -> int:
         hardware["stable_improving_candidates"] = sum(
             bool(item["stable_improvement"]) for item in hardware["candidates"]
         )
+        baseline_median_ms = float(hardware["baseline"]["median_ms"])
+        selected_median_ms = (
+            float(hardware_by_hash[best_state_hash]["stats"]["median_ms"]) if accepted else baseline_median_ms
+        )
+        shortlist_best_ms = min(
+            baseline_median_ms,
+            *(float(item["stats"]["median_ms"]) for item in hardware["candidates"]),
+        )
+        decision["measured_selected_ms"] = selected_median_ms
+        decision["measured_shortlist_best_ms"] = shortlist_best_ms
+        decision["measured_shortlist_regret_pct"] = 100.0 * (selected_median_ms / shortlist_best_ms - 1.0)
 
     result = {
         "kind": "executable_neighborhood_audit",
@@ -377,6 +428,7 @@ def main() -> int:
             "critical_experts": budget,
             "neighbors_per_operator": args.neighbors_per_operator,
             "event_top_per_strategy": args.event_top_per_strategy,
+            "minimum_actionable_gain_pct": args.minimum_actionable_gain_pct,
             "hardware_warmup": args.warmup if args.measure_hardware else 0,
             "hardware_runs": args.runs if args.measure_hardware else 0,
             "weight_copies": args.weight_copies if args.measure_hardware else 0,
@@ -398,6 +450,7 @@ def main() -> int:
             for expert in sorted(scores, key=lambda expert: (-scores[expert], expert))
         ],
         "strategies": reports,
+        "uncertainty_aware_decision": decision,
         "hardware_shortlist": {
             "state_hashes": selected_hashes,
             "sources": selected_sources,

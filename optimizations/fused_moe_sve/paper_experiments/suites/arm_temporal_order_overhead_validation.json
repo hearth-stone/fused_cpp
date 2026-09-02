@@ -27,19 +27,19 @@
       "id": "uniformish_temporal_holdout",
       "timeout_seconds": 2400,
       "output_json": true,
-      "argv": ["{python}", "optimizations/fused_moe_sve/benchmarks/bench_executable_neighborhood_audit.py", "--route-file", "{uniformish_route}", "--route-layer", "{uniformish_layer}", "--analytic-calibration", "{analytic_calibration}", "--hidden", "4096", "--intermediate", "512", "--experts", "256", "--threads", "80", "--critical-experts", "32", "--neighbors-per-operator", "64", "--event-top-per-strategy", "4", "--measure-hardware", "--warmup", "5", "--runs", "31", "--weight-copies", "4", "--output", "{remote_output}"]
+      "argv": ["{python}", "optimizations/fused_moe_sve/benchmarks/bench_executable_neighborhood_audit.py", "--route-file", "{uniformish_route}", "--route-layer", "{uniformish_layer}", "--analytic-calibration", "{analytic_calibration}", "--hidden", "4096", "--intermediate", "512", "--experts", "256", "--threads", "80", "--critical-experts", "32", "--neighbors-per-operator", "64", "--event-top-per-strategy", "4", "--minimum-actionable-gain-pct", "2", "--measure-hardware", "--warmup", "5", "--runs", "31", "--weight-copies", "4", "--output", "{remote_output}"]
     },
     {
       "id": "median_temporal_holdout",
       "timeout_seconds": 2400,
       "output_json": true,
-      "argv": ["{python}", "optimizations/fused_moe_sve/benchmarks/bench_executable_neighborhood_audit.py", "--route-file", "{median_route}", "--route-layer", "{median_layer}", "--analytic-calibration", "{analytic_calibration}", "--hidden", "4096", "--intermediate", "512", "--experts", "256", "--threads", "80", "--critical-experts", "32", "--neighbors-per-operator", "64", "--event-top-per-strategy", "4", "--measure-hardware", "--warmup", "5", "--runs", "31", "--weight-copies", "4", "--output", "{remote_output}"]
+      "argv": ["{python}", "optimizations/fused_moe_sve/benchmarks/bench_executable_neighborhood_audit.py", "--route-file", "{median_route}", "--route-layer", "{median_layer}", "--analytic-calibration", "{analytic_calibration}", "--hidden", "4096", "--intermediate", "512", "--experts", "256", "--threads", "80", "--critical-experts", "32", "--neighbors-per-operator", "64", "--event-top-per-strategy", "4", "--minimum-actionable-gain-pct", "2", "--measure-hardware", "--warmup", "5", "--runs", "31", "--weight-copies", "4", "--output", "{remote_output}"]
     },
     {
       "id": "high_skew_temporal_holdout",
       "timeout_seconds": 2400,
       "output_json": true,
-      "argv": ["{python}", "optimizations/fused_moe_sve/benchmarks/bench_executable_neighborhood_audit.py", "--route-file", "{high_skew_route}", "--route-layer", "{high_skew_layer}", "--analytic-calibration", "{analytic_calibration}", "--hidden", "4096", "--intermediate", "512", "--experts", "256", "--threads", "80", "--critical-experts", "32", "--neighbors-per-operator", "64", "--event-top-per-strategy", "4", "--measure-hardware", "--warmup", "5", "--runs", "31", "--weight-copies", "4", "--output", "{remote_output}"]
+      "argv": ["{python}", "optimizations/fused_moe_sve/benchmarks/bench_executable_neighborhood_audit.py", "--route-file", "{high_skew_route}", "--route-layer", "{high_skew_layer}", "--analytic-calibration", "{analytic_calibration}", "--hidden", "4096", "--intermediate", "512", "--experts", "256", "--threads", "80", "--critical-experts", "32", "--neighbors-per-operator", "64", "--event-top-per-strategy", "4", "--minimum-actionable-gain-pct", "2", "--measure-hardware", "--warmup", "5", "--runs", "31", "--weight-copies", "4", "--output", "{remote_output}"]
     }
   ]
 }

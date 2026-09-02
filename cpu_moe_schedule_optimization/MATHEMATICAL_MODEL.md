@@ -1643,6 +1643,20 @@ operator phase加入`predict_expert`，不乘LLC/DRAM或wide-team dilation。首
 15x1T peers concurrent三态，并以31轮随机交错trace中all-delayed的per-task median非负线性
 回归拟合$(a_1,b_1)$。planner真实trace及其neighborhood候选不参与拟合，只作为后续holdout。
 
+**Uncertainty-aware executable decision。** Point event score仍可能把低于模型分辨率的
+temporal delta排成确定顺序。对order-neighborhood候选增加不冒充统计上界的lane guard：
+
+$$
+T_{guard}(P)=\max\left(\widehat T_{event}(P),
+(1+\epsilon)\max_l\sum_{i\in Q_l}T_{iso}(R_i,t_l)\right).
+$$
+
+$\epsilon$读取machine calibration的systematic relative uncertainty。第二项用于阻止新重lane
+被point event错误隐藏在旧critical path之下，但不声称是硬件时间上界。候选只有满足
+$T_{guard}(P')\le(1-\delta_{min})T_{guard}(P)$才可自动替换incumbent；首版
+$\delta_{min}=2\%$与既有no-regression/actionability gate一致。低于margin的候选可进入
+measured shortlist，但不能驱动VND接受或作为模型证明收益。
+
 **Placement-aware LLC event state。** 旧 analytical DAG 在 `_score()` 中删除
 `core_begin`，所有 active task 共用 rank-global LLC working set、capacity 和 service；这会
 把“task 分散在两个 LLC domain”与“task 全部挤在一个 domain”错误视为同一状态。当前
@@ -5494,3 +5508,4 @@ planning 对未命中点执行原解析公式；首次调用结束后在文件�
 | 2026-09-02 | v1.39 | 增加Step-1 executable order-neighborhood审计，不改变production planner。五类move保持lane topology、width、window和early merge不变，并直接生成strict fixed Plan V2；canonical hash对跨算子重复候选去重。analytical model新增只读`explain_dag_placed`，与placed scorer共用原placement校验并暴露已有LLC-domain/team-pressure event。criticality采用tail-weighted event duration乘task phase dilation，仅控制等预算候选采样，不进入objective。正式Arm suite固定比较32个critical与32个uniform-random experts、每算子64个event评分、每组event top-4和31轮硬件paired measurement；在结果完成前不进入VND或ALNS。 |
 | 2026-09-02 | v1.40 | Step-1 order-only neighborhood gate在commit `5252d67`、Arm-codex NUMA3 80C和三条2048-token TopK6 trace上完成。每条生成约9.2k--14.1k eligible proposals，每个critical/random arm实际event评分266--309个候选，吞吐5.64--8.60 plans/s；24个event-top实测候选没有一个paired P10为正。event/hardware Spearman在uniformish/median/high-skew为`0.143/-0.156/-0.690`；high-skew中event预测`0.068%--0.115%`收益的8个候选实测全部回退，最大`14.50%`。critical event-improving fraction为`22.6%/20.4%/48.8%`，random为`24.6%/43.3%/47.4%`，没有一致富集。故当前event model下拒绝进入order-only VND/LNS；先修复temporal-order ranking，或转向template-level global search。该结论不否定canonical executable state，也不改变production planner/runtime。 |
 | 2026-09-03 | v1.41 | 为修复1T长lane的temporal critical-path crossing，analytical runtime overhead增加可选离散`by_width` override；旧profile与未命中width保持原global fixed/route overhead，persisted `T_iso` identity覆盖新字段。独立Arm 80C三态probe以同一任务/placement和31轮随机交错phase trace拟合1T `expert_fixed_ns=147999.019`、`route_ns=10471.803`：all-delayed/wide-only/all-concurrent victim实测`25.491/25.518/26.251 ms`，修正模型为`25.419/25.793/26.621 ms`，误差`-0.28/+1.08/+1.41%`。该参数尚需绑定commit的三条真实trace holdout；在通过前不恢复Step-2 VND。 |
+| 2026-09-03 | v1.42 | commit `e74e187`的冻结v4 holdout显示width-specific overhead只部分修复point ranking：high-skew Spearman从`-0.690`升至`0.357`且旧critical relocation反例消失，但新random 1T swap/relocation仍实测回退`13.59%/3.50%`；median因full shape变为`1x16T+8x8T`后Spearman为`-0.756`，uniformish纯8T分数按设计不变。raw trace证明新反例仍在scheduled compute而非early merge。后续executable decision增加`max(event, (1+uncertainty)*max-lane isolated sum)` guard和2% minimum actionable gain；在已测24候选的离线重放中，high-skew Spearman提高到`0.548`并将13.59%反例判为`-1.016%` robust gain，三trace均无候选达到2%自动接受门槛。该gate待绑定commit正式重跑，不宣称point event排序已完全准确。 |

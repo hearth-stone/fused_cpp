@@ -7,6 +7,46 @@ baseline:
   status: reference
 
 features:
+  - id: planner.uncertainty_aware_neighborhood_gate
+    part: planner
+    status: experimental
+    implementation: >-
+      cpu_moe_schedule_optimization/planners/executable_plan_neighborhood.py
+      and optimizations/fused_moe_sve/benchmarks/bench_executable_neighborhood_audit.py
+    hypothesis: >-
+      Combining the event estimate with a pessimistic serial-lane workload
+      guard and requiring a 2 percent actionable gain prevents unresolved
+      temporal deltas from replacing a stronger executable incumbent.
+    depends_on:
+      - planner.width_specific_expert_overhead
+      - planner.executable_order_neighborhood_audit
+    conflicts_with: []
+    correctness: >-
+      PYTHONPATH=.:src .venv/bin/python -m pytest -q
+      tests/test_moe_executable_plan_neighborhood.py
+      tests/test_moe_mixed_width_victim_pressure.py tests/test_moe_plan_v2.py
+    benchmark: >-
+      .venv/bin/python optimizations/fused_moe_sve/paper_experiments/run_matrix.py
+      --machine
+      optimizations/fused_moe_sve/paper_experiments/machines/arm_codex_internal_temporal_overhead.json
+      --suite
+      optimizations/fused_moe_sve/paper_experiments/suites/arm_temporal_order_overhead_validation.json
+    owner: zhangxu
+    opened: 2026-09-03
+    decision_by: 2026-10-03
+    next_decision: >-
+      Commit and rerun the three-trace suite with explicit robust-score and
+      uncertainty-aware selection output.
+    adoption_gate: >-
+      Zero selected-plan regression above 2 percent on all three traces;
+      catastrophic lane crossings rank behind the incumbent; and point-model
+      correlation is reported separately rather than treated as resolved.
+    result: >-
+      Offline replay of the 24 frozen v4 holdout candidates retained the
+      incumbent on all traces. The lane guard raised high-skew Spearman from
+      0.357 to 0.548 and classified the 13.59 percent hardware regression as a
+      negative 1.016 percent robust gain. A committed formal rerun is pending.
+
   - id: planner.width_specific_expert_overhead
     part: planner
     status: experimental

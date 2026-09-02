@@ -14,10 +14,13 @@ from executable_plan_neighborhood import (  # noqa: E402
     CROSS_LANE_SWAP,
     CROSS_LLC_RELOCATION,
     SAME_LANE_INSERTION,
+    ExecutablePlanScore,
     critical_expert_scores,
     enumerate_order_only_neighbors,
+    is_resolvable_improvement,
     placed_tasks,
     sample_order_only_neighborhood,
+    score_executable_plan,
 )
 from executable_plan_state import (  # noqa: E402
     ExecutableExpertTask,
@@ -133,3 +136,38 @@ def test_critical_scores_are_tail_and_dilation_weighted() -> None:
     assert scores[0] == 20.0 * 1.0 * 1.2 + 20.0 * 1.0 * 2.0
     assert scores[3] == 20.0 * 2.0 * 1.2
     assert scores[1] == 0.0
+
+
+def test_robust_score_exposes_heavy_serial_lane() -> None:
+    class _ScoreModel:
+        relative_error = 0.15
+
+        @staticmethod
+        def T_iso(routes: int, threads: int) -> float:
+            return routes * 10.0 / threads
+
+        @staticmethod
+        def dag_makespan_placed(tasks) -> float:
+            assert tasks
+            return 300.0
+
+    score = score_executable_plan(_ScoreModel(), _state())
+
+    assert score.event_ns == 300.0
+    assert score.lane_guard_ns == (20 + 10 + 5) * 10.0 * 1.15
+    assert score.robust_ns == score.lane_guard_ns
+
+
+def test_resolvable_improvement_requires_robust_margin() -> None:
+    incumbent = ExecutablePlanScore(event_ns=100.0, lane_guard_ns=90.0, robust_ns=100.0)
+
+    assert not is_resolvable_improvement(
+        incumbent,
+        ExecutablePlanScore(99.0, 90.0, 99.0),
+        minimum_gain_fraction=0.02,
+    )
+    assert is_resolvable_improvement(
+        incumbent,
+        ExecutablePlanScore(95.0, 90.0, 95.0),
+        minimum_gain_fraction=0.02,
+    )
