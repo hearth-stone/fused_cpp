@@ -109,6 +109,16 @@ global search. See
 
 Status: gated off by Step 1; do not implement against the current event model.
 
+Temporal-ranking remediation in progress before this gate may be reconsidered:
+
+- [x] Reproduce the high-skew critical-path crossing with runtime phase traces
+  and separate early-merge time from scheduled expert compute.
+- [x] Add an independent three-state 1T victim probe and fit width-specific
+  expert fixed/per-route overhead without using planner-neighbor measurements.
+- [ ] Freeze the new Arm calibration and repeat the uniformish, median, and
+  high-skew neighborhood audit. Reopen VND only if ranking improves and no new
+  measured selection regression exceeds 2%.
+
 - [ ] Starting independently from full, one-step, greedy, and fixed-width
   controls, run best-improvement descent over same-lane insertion, same-width
   cross-lane relocation, pair swap, and cross-domain relocation.

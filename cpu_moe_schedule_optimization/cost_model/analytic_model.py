@@ -297,6 +297,7 @@ class RuntimeOverheads:
     panel_range_restart_ns: float = 0.0
     w13_panel_range_restart_ns: float | None = None
     w2_panel_range_restart_ns: float | None = None
+    by_width: tuple[tuple[int, float, float], ...] = ()
 
     def __post_init__(self) -> None:
         values = (
@@ -313,6 +314,27 @@ class RuntimeOverheads:
         )
         if min(values) < 0.0:
             raise ValueError("runtime overheads must be non-negative")
+        by_width = tuple(
+            sorted(
+                (int(width), float(expert_fixed), float(route))
+                for width, expert_fixed, route in self.by_width
+            )
+        )
+        if any(width <= 0 or min(expert_fixed, route) < 0.0 for width, expert_fixed, route in by_width):
+            raise ValueError("width-specific runtime overheads require positive widths and non-negative values")
+        if len({width for width, _, _ in by_width}) != len(by_width):
+            raise ValueError("width-specific runtime overhead widths must be unique")
+        object.__setattr__(self, "by_width", by_width)
+
+    def expert_overhead_ns(self, routes: int, threads: int) -> float:
+        expert_fixed_ns = self.expert_fixed_ns
+        route_ns = self.route_ns
+        for width, width_expert_fixed_ns, width_route_ns in self.by_width:
+            if width == threads:
+                expert_fixed_ns = width_expert_fixed_ns
+                route_ns = width_route_ns
+                break
+        return expert_fixed_ns + routes * route_ns
 
     def panel_range_restart_for_stage(self, stage: str) -> float:
         if stage == "w13":
@@ -342,7 +364,37 @@ class RuntimeOverheads:
                 if payload.get("w2_panel_range_restart_ns") is not None
                 else None
             ),
+            by_width=tuple(
+                (
+                    int(point["threads"]),
+                    float(point.get("expert_fixed_ns", 0.0)),
+                    float(point.get("route_ns", 0.0)),
+                )
+                for point in payload.get("by_width", ())
+            ),
         )
+
+    def to_dict(self) -> dict[str, object]:
+        payload = {
+            "call_setup_ns": self.call_setup_ns,
+            "expert_fixed_ns": self.expert_fixed_ns,
+            "route_ns": self.route_ns,
+            "stage_fixed_ns": self.stage_fixed_ns,
+            "range_fixed_ns": self.range_fixed_ns,
+            "panel_range_restart_ns": self.panel_range_restart_ns,
+            "w13_panel_range_restart_ns": self.w13_panel_range_restart_ns,
+            "w2_panel_range_restart_ns": self.w2_panel_range_restart_ns,
+        }
+        if self.by_width:
+            payload["by_width"] = [
+                {
+                    "threads": width,
+                    "expert_fixed_ns": expert_fixed_ns,
+                    "route_ns": route_ns,
+                }
+                for width, expert_fixed_ns, route_ns in self.by_width
+            ]
+        return payload
 
 
 @dataclass(frozen=True)
@@ -661,7 +713,7 @@ class AnalyticMachineCalibration:
             "kernel": {"backend_n_tile": self.backend_n_tile},
             "caches": asdict(self.caches),
             "services": services,
-            "overheads": asdict(self.overheads),
+            "overheads": self.overheads.to_dict(),
             "planner": {"supported_widths": list(self.supported_widths)},
             "uncertainty": {"relative": self.relative_uncertainty},
             "stage_scales": {"w13": self.w13_scale, "w2": self.w2_scale},
@@ -1875,7 +1927,7 @@ class AnalyticMoeCostModel:
         )
         w13_demand = self._stage_demand("w13", w13_mapping, self._w13_geometry)
         w2_demand = self._stage_demand("w2", w2_mapping, self._w2_geometry)
-        overhead_ns = self.calibration.overheads.expert_fixed_ns + routes * self.calibration.overheads.route_ns
+        overhead_ns = self.calibration.overheads.expert_overhead_ns(routes, threads)
         phases: list[AnalyticPhase] = []
         if overhead_ns > 0.0:
             phases.append(

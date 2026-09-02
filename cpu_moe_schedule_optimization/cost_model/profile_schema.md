@@ -13,6 +13,14 @@ order within the same full-N geometry, not a weight-range/profile variant.
 Paper-facing use of empirical profiles and current rerun requirements are
 indexed in [`../../docs/moe_paper_readiness.md`](../../docs/moe_paper_readiness.md).
 
+Analytical machine calibrations may include an optional
+`overheads.by_width` list of discrete `{threads, expert_fixed_ns, route_ns}`
+overrides. Widths must be unique and positive and costs must be non-negative.
+A missing width inherits the scalar `expert_fixed_ns` and `route_ns`; the model
+never interpolates or extrapolates these overheads. The complete analytical
+calibration is part of the persisted `T_iso` cache identity, so adding or
+changing an override invalidates stale scalar costs automatically.
+
 Historical schema-v2 files may record `w13_split`, `w13_split_chunks`,
 `weight_window_bytes`, `w13_window_ranges`, or `w2_window_ranges`. They are not
 active calibration inputs. A non-unit legacy range pair is rejected because its

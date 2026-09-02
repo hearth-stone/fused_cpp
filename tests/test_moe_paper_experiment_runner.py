@@ -21,7 +21,14 @@ ROOT = Path(__file__).resolve().parents[1]
 EXPERIMENT_ROOT = ROOT / "optimizations" / "fused_moe_sve" / "paper_experiments"
 
 
-@pytest.mark.parametrize("name", ["arm_codex_internal.json", "amazon_ecs_8cores.json"])
+@pytest.mark.parametrize(
+    "name",
+    [
+        "arm_codex_internal.json",
+        "arm_codex_internal_temporal_overhead.json",
+        "amazon_ecs_8cores.json",
+    ],
+)
 def test_machine_configs_are_valid(name: str) -> None:
     machine = load_machine(EXPERIMENT_ROOT / "machines" / name)
     assert machine["project_root"].startswith("/")
@@ -58,6 +65,10 @@ def test_suite_configs_render_for_every_machine(name: str) -> None:
             "arm_executable_neighborhood_audit.json",
             "arm_codex_internal_wide_pressure.json",
         ),
+        (
+            "arm_temporal_order_overhead_validation.json",
+            "arm_codex_internal_temporal_overhead.json",
+        ),
     ],
 )
 def test_arm_high_skew_closure_suite_renders_with_external_assets(
@@ -67,7 +78,8 @@ def test_arm_high_skew_closure_suite_renders_with_external_assets(
     suite = load_suite(EXPERIMENT_ROOT / "suites" / suite_name)
     machine = load_machine(EXPERIMENT_ROOT / "machines" / machine_name)
     assert suite["machine_ids"] == [machine["id"]]
-    assert len(machine["snapshot_external_assets"]) == 2
+    assert len(machine["snapshot_external_assets"]) >= 2
+    assert all(len(asset["sha256"]) == 64 for asset in machine["snapshot_external_assets"])
     context = {
         "machine_id": machine["id"],
         "project_root": machine["project_root"],

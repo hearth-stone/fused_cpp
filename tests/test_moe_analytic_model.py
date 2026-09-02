@@ -630,6 +630,10 @@ def test_thin_residual_fit_recovers_nonnegative_operator_terms() -> None:
 def test_machine_calibration_json_round_trip() -> None:
     calibration = replace(
         _calibration(),
+        overheads=replace(
+            _calibration().overheads,
+            by_width=((1, 150_000.0, 7_500.0),),
+        ),
         wide_team_pressure=WideTeamPressureCalibration(
             isolated_dilation=((4, 1.05), (8, 1.2)),
             full_cohort_dilation=((4, 1.1), (8, 1.4)),
@@ -639,6 +643,42 @@ def test_machine_calibration_json_round_trip() -> None:
     restored = AnalyticMachineCalibration.from_dict(calibration.to_dict())
 
     assert restored == calibration
+
+
+def test_width_specific_expert_overhead_overrides_only_calibrated_width() -> None:
+    overheads = RuntimeOverheads(
+        expert_fixed_ns=200.0,
+        route_ns=2.0,
+        by_width=((1, 1_000.0, 10.0),),
+    )
+
+    assert overheads.expert_overhead_ns(12, 1) == pytest.approx(1_120.0)
+    assert overheads.expert_overhead_ns(12, 2) == pytest.approx(224.0)
+    assert RuntimeOverheads.from_dict(overheads.to_dict()) == overheads
+
+
+def test_predict_expert_uses_width_specific_operator_phase() -> None:
+    calibration = replace(
+        _calibration(),
+        overheads=RuntimeOverheads(by_width=((1, 1_000.0, 10.0),)),
+    )
+    model = _model(calibration)
+
+    width_one = model.predict_expert(12, 1).phases[0]
+    width_two = model.predict_expert(12, 2).phases
+
+    assert width_one.kind == "operator"
+    assert width_one.base_ns == pytest.approx(1_120.0)
+    assert all(phase.kind != "operator" for phase in width_two)
+
+
+def test_width_specific_expert_overhead_rejects_invalid_points() -> None:
+    with pytest.raises(ValueError, match="positive widths"):
+        RuntimeOverheads(by_width=((0, 1.0, 1.0),))
+    with pytest.raises(ValueError, match="non-negative"):
+        RuntimeOverheads(by_width=((1, -1.0, 1.0),))
+    with pytest.raises(ValueError, match="must be unique"):
+        RuntimeOverheads(by_width=((1, 1.0, 1.0), (1, 2.0, 2.0)))
 
 
 def test_wide_team_pressure_calibration_is_discrete_and_rejects_speedup() -> None:

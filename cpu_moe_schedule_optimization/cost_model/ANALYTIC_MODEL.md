@@ -595,6 +595,9 @@ shape. Rates use units per second; overheads use nanoseconds.
     "call_setup_ns": 0.0,
     "expert_fixed_ns": 0.0,
     "route_ns": 0.0,
+    "by_width": [
+      {"threads": 1, "expert_fixed_ns": 148000.0, "route_ns": 10472.0}
+    ],
     "stage_fixed_ns": 0.0,
     "range_fixed_ns": 0.0,
     "panel_range_restart_ns": 0.0,
@@ -615,6 +618,12 @@ shape. Rates use units per second; overheads use nanoseconds.
 ```
 
 The numbers above illustrate the schema and are not a production calibration.
+`overheads.by_width` is an optional discrete override for expert-level fixed
+and per-route overhead. Missing widths inherit the scalar `expert_fixed_ns`
+and `route_ns`; the model does not interpolate or extrapolate these overheads.
+This term is a serialized operator phase and is not multiplied by cache or
+bandwidth dilation. It is intended for measured task-fragmentation/runtime
+cost that is width-specific but independent of the active memory-service set.
 `gemm_core_flops` is the active compute service. `matrix_flops` and `l1_bytes`
 are retained in new files for diagnostics. Removing `gemm_core_flops` makes the
 calibration invalid because register-only BFMMLA is not an attainable kernel

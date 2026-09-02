@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "id": "arm_codex_internal_temporal_overhead",
+  "ssh_host": "Arm-codex-internal",
+  "project_root": "/home/zhangxu/codex/fused_cpp",
+  "remote_results_root": "/tmp/fused_cpp_moe_paper",
+  "python": ".venv/bin/python",
+  "affinity_argv": ["numactl", "--physcpubind=240-319", "--membind=3"],
+  "environment": {
+    "OMP_NUM_THREADS": "1",
+    "OMP_DYNAMIC": "FALSE",
+    "OMP_PROC_BIND": "FALSE",
+    "MKL_NUM_THREADS": "1",
+    "OPENBLAS_NUM_THREADS": "1",
+    "VECLIB_MAXIMUM_THREADS": "1",
+    "PYTHONPATH": ".:src"
+  },
+  "variables": {
+    "sve_bits": 256,
+    "max_jobs": 16,
+    "high_skew_route": "bench_assets/moe_paper/dsv4_routes_pt_20260830/measured_request008_case009_zh2048-010.pt",
+    "high_skew_layer": 38,
+    "median_route": "bench_assets/moe_paper/dsv4_routes_pt_20260830/measured_request016_case017_zh2048-018.pt",
+    "median_layer": 4,
+    "uniformish_route": "bench_assets/moe_paper/dsv4_routes_pt_20260830/measured_request022_case023_zh2048-024.pt",
+    "uniformish_layer": 20,
+    "base_analytic_calibration": "bench_assets/moe_paper/arm_codex_numa3_80c/analytic_machine_numa3_80c_topology_wide_pressure_v3_20260901.json",
+    "analytic_calibration": "bench_assets/moe_paper/arm_codex_numa3_80c_temporal/analytic_machine_numa3_80c_temporal_overhead_v4_20260903.json"
+  },
+  "snapshot_submodules": ["3rdparty/xbyak_aarch64"],
+  "snapshot_external_paths": ["refs/i8gemm/lib"],
+  "snapshot_external_assets": [
+    {
+      "path": "bench_assets/moe_paper/dsv4_routes_pt_20260830",
+      "sha256": "cb263814f56665d6ac0e6af36572b0735d45794e99c95a288b7cae895923e840"
+    },
+    {
+      "path": "bench_assets/moe_paper/arm_codex_numa3_80c",
+      "sha256": "a06ed06e5f7b5099eedca50490e34df729ea02a648aa782a18725192340f0791"
+    },
+    {
+      "path": "bench_assets/moe_paper/arm_codex_numa3_80c_temporal",
+      "sha256": "aed8e5b895a3955e2551d085fd81e2c500d769faaea7ce8bcb4b971cee00624c"
+    }
+  ]
+}

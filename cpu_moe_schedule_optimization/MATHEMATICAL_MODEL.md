@@ -1629,6 +1629,20 @@ uniform-random集合，分别记录proposal、valid、duplicate、unique、event
 稳定实测改进、critical引导明显富集优质候选、且event改进没有被硬件系统性反转时，才进入
 VND。否则该结果用于拒绝当前order-only LNS结构，而不是继续增加自适应权重。
 
+**Width-specific expert overhead。** Temporal counterexample显示，当1T lane串行执行许多
+whole experts时，只用GEMM/cache service会低估其绝对lane完成时间，即使active-set slowdown
+的相对趋势基本正确。将已有global runtime overhead扩展为离散width override：
+
+$$
+O_{expert}(R,t)=a_t+b_tR,
+$$
+
+其中未校准$t$严格回退global $(a,b)$，width之间不插值或外推。该项作为每个expert的串行
+operator phase加入`predict_expert`，不乘LLC/DRAM或wide-team dilation。首个Arm 80C probe
+固定同一1T victim lane和任务序列，比较all peers delayed、仅4x16T peers concurrent、再加入
+15x1T peers concurrent三态，并以31轮随机交错trace中all-delayed的per-task median非负线性
+回归拟合$(a_1,b_1)$。planner真实trace及其neighborhood候选不参与拟合，只作为后续holdout。
+
 **Placement-aware LLC event state。** 旧 analytical DAG 在 `_score()` 中删除
 `core_begin`，所有 active task 共用 rank-global LLC working set、capacity 和 service；这会
 把“task 分散在两个 LLC domain”与“task 全部挤在一个 domain”错误视为同一状态。当前
@@ -5479,3 +5493,4 @@ planning 对未命中点执行原解析公式；首次调用结束后在文件�
 | 2026-09-02 | v1.38 | 为event-guided VND/LNS增加内部version-1 canonical executable state，不改变搜索候选或选择结果。state将rank表示为gap-free contiguous fixed-width lanes及其whole-expert序列，独立记录ordered physical CPUs、contiguous LLC-domain partition、per-task windows和early-merge三态；lane依赖唯一派生，hash覆盖全部执行语义。现有跨LLC-domain lane原样保留并记录相交domain，不为了新抽象改写incumbent。适配器只接受strict/fixed/unsliced/lane-chain planner result，显式拒绝tail pool、route slice、resize和一般DAG；result→state→tasks/Plan V2逐字段往返并保持analytical event score。该步骤只建立后续邻域搜索的合法性边界，无性能或近似最优结论。 |
 | 2026-09-02 | v1.39 | 增加Step-1 executable order-neighborhood审计，不改变production planner。五类move保持lane topology、width、window和early merge不变，并直接生成strict fixed Plan V2；canonical hash对跨算子重复候选去重。analytical model新增只读`explain_dag_placed`，与placed scorer共用原placement校验并暴露已有LLC-domain/team-pressure event。criticality采用tail-weighted event duration乘task phase dilation，仅控制等预算候选采样，不进入objective。正式Arm suite固定比较32个critical与32个uniform-random experts、每算子64个event评分、每组event top-4和31轮硬件paired measurement；在结果完成前不进入VND或ALNS。 |
 | 2026-09-02 | v1.40 | Step-1 order-only neighborhood gate在commit `5252d67`、Arm-codex NUMA3 80C和三条2048-token TopK6 trace上完成。每条生成约9.2k--14.1k eligible proposals，每个critical/random arm实际event评分266--309个候选，吞吐5.64--8.60 plans/s；24个event-top实测候选没有一个paired P10为正。event/hardware Spearman在uniformish/median/high-skew为`0.143/-0.156/-0.690`；high-skew中event预测`0.068%--0.115%`收益的8个候选实测全部回退，最大`14.50%`。critical event-improving fraction为`22.6%/20.4%/48.8%`，random为`24.6%/43.3%/47.4%`，没有一致富集。故当前event model下拒绝进入order-only VND/LNS；先修复temporal-order ranking，或转向template-level global search。该结论不否定canonical executable state，也不改变production planner/runtime。 |
+| 2026-09-03 | v1.41 | 为修复1T长lane的temporal critical-path crossing，analytical runtime overhead增加可选离散`by_width` override；旧profile与未命中width保持原global fixed/route overhead，persisted `T_iso` identity覆盖新字段。独立Arm 80C三态probe以同一任务/placement和31轮随机交错phase trace拟合1T `expert_fixed_ns=147999.019`、`route_ns=10471.803`：all-delayed/wide-only/all-concurrent victim实测`25.491/25.518/26.251 ms`，修正模型为`25.419/25.793/26.621 ms`，误差`-0.28/+1.08/+1.41%`。该参数尚需绑定commit的三条真实trace holdout；在通过前不恢复Step-2 VND。 |

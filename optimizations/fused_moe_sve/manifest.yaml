@@ -7,6 +7,49 @@ baseline:
   status: reference
 
 features:
+  - id: planner.width_specific_expert_overhead
+    part: planner
+    status: experimental
+    implementation: >-
+      cpu_moe_schedule_optimization/cost_model/analytic_model.py,
+      optimizations/fused_moe_sve/benchmarks/bench_mixed_width_victim_pressure.py,
+      and paper_experiments/suites/arm_temporal_order_overhead_validation.json
+    hypothesis: >-
+      A discrete 1T expert fixed/per-route overhead fitted without planner
+      candidates corrects long 1T-lane critical-path crossings while preserving
+      calibrated wider-team behavior and improving held-out temporal ranking.
+    depends_on:
+      - planner.wide_team_concurrent_pressure
+      - planner.executable_order_neighborhood_audit
+    conflicts_with: []
+    correctness: >-
+      PYTHONPATH=.:src .venv/bin/python -m pytest -q
+      tests/test_moe_analytic_model.py
+      tests/test_moe_mixed_width_victim_pressure.py
+      tests/test_moe_executable_plan_neighborhood.py tests/test_moe_plan_v2.py
+    benchmark: >-
+      .venv/bin/python optimizations/fused_moe_sve/paper_experiments/run_matrix.py
+      --machine
+      optimizations/fused_moe_sve/paper_experiments/machines/arm_codex_internal_temporal_overhead.json
+      --suite
+      optimizations/fused_moe_sve/paper_experiments/suites/arm_temporal_order_overhead_validation.json
+    owner: zhangxu
+    opened: 2026-09-03
+    decision_by: 2026-10-03
+    next_decision: >-
+      Commit the additive calibration schema and independent probe, then run
+      the three captured traces as a frozen-parameter holdout.
+    adoption_gate: >-
+      Victim-span error within 5 percent for all three calibration states;
+      improved median/high-skew event-to-hardware ranking; unchanged uniformish
+      scores when no 1T lane exists; and no selected-plan regression above 2
+      percent on the declared three-trace holdout.
+    result: >-
+      The uncommitted Arm probe fitted 1T expert_fixed_ns=147999.019 and
+      route_ns=10471.803. Measured victim spans were 25.491/25.518/26.251 ms
+      for all-delayed/wide-only/all-concurrent, versus corrected predictions of
+      25.419/25.793/26.621 ms. The committed holdout run is pending.
+
   - id: planner.executable_order_neighborhood_audit
     part: planner
     status: experimental
