@@ -80,20 +80,34 @@ optimizer in this track.
 
 ### Step 1: falsifiable neighborhood audit
 
-- [ ] On the current uniformish, median, and high-skew traces, enumerate or
+- [x] On the current uniformish, median, and high-skew traces, enumerate or
   sample order-only legal neighbors around `full_selected`: same-lane adjacent
   swap/insertion, same-width cross-lane relocation/swap, and same-width
   cross-LLC relocation.
-- [ ] Record neighbor count, valid/duplicate ratio, event-score delta, best
+- [x] Record neighbor count, valid/duplicate ratio, event-score delta, best
   gain, evaluation throughput, and hardware result for the event top candidates.
   Compare critical-event-guided expert selection with uniform random selection.
-- [ ] Continue to VND only if useful locality is observed: at least one stable
+- [x] Continue to VND only if useful locality is observed: at least one stable
   improving neighbor, critical guidance materially enriches the top candidates,
   and event improvements are not erased systematically by hardware execution.
   If local scores are effectively random or all useful plans require global
   reconstruction, reject LNS and move to template-level global search.
 
+**Decision: the Step-1 gate failed; do not enter Step 2 with the current event
+model.** The committed Arm 80C run evaluated 561--601 neighbors per trace and
+measured four event-top candidates from each of the critical and random arms
+(24 candidates total). No candidate had positive paired P10 speedup. Event to
+hardware Spearman was `0.143/-0.156/-0.690` on uniformish/median/high-skew, and
+high-skew event-top candidates regressed by up to `14.50%`. Critical improving
+fractions were `22.6%/20.4%/48.8%`, versus random `24.6%/43.3%/47.4%`, so the
+guidance did not consistently enrich candidates. Keep Step 2 gated off until
+temporal-order/event ranking is corrected, or move directly to template-level
+global search. See
+`optimizations/fused_moe_sve/results/arm_codex_80c_executable_neighborhood_audit_20260902.md`.
+
 ### Step 2: deterministic variable-neighborhood descent baseline
+
+Status: gated off by Step 1; do not implement against the current event model.
 
 - [ ] Starting independently from full, one-step, greedy, and fixed-width
   controls, run best-improvement descent over same-lane insertion, same-width

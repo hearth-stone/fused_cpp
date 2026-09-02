@@ -39,17 +39,21 @@ features:
     opened: 2026-09-02
     decision_by: 2026-10-02
     next_decision: >-
-      Run the committed three-trace audit and proceed to deterministic VND only
-      if critical guidance and event ranking survive paired hardware execution.
+      Do not enter deterministic VND. First correct temporal-order/event ranking
+      on high-skew traces, or replace order-local search with template-level
+      global search; rerun this audit only after the evaluator changes.
     adoption_gate: >-
       At least one stable paired hardware improvement, material enrichment from
       critical selection over equal-budget random selection, and no systematic
       hardware reversal of event-ranked improvements on the three declared
       traces. Otherwise reject the order-only LNS premise.
     result: >-
-      Implementation and focused local/Arm correctness are complete. The formal
-      committed three-trace performance run is pending; no optimization claim
-      is made from the short runner smoke.
+      The committed Arm 80C three-trace audit rejected the current order-only
+      VND/LNS premise. None of 24 event-top candidates had positive paired P10
+      hardware speedup; event/hardware Spearman was 0.143, -0.156, and -0.690,
+      and high-skew candidates regressed by as much as 14.50 percent. Critical
+      selection did not consistently enrich event improvements versus random.
+      See results/arm_codex_80c_executable_neighborhood_audit_20260902.md.
 
   - id: planner.executable_search_state
     part: planner
