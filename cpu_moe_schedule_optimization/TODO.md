@@ -1,8 +1,9 @@
 # MoE scheduling implementation checklist
 
-Status refresh: 2026-09-01. The latest validated comparator commit before this
-refresh is `266da2c`, but most supplemental executor/planner measurements below
-are still bound to the prior extension SHA256
+Status refresh: 2026-09-02. The latest formal Arm 80-core planner run is bound
+to `6b6b4d1` and summarized by the report commit `1b7e353`, but most
+supplemental executor/planner measurements below are still bound to the prior
+extension SHA256
 `5ed0b9c440acbf151cfbc22d95b00b6eee13fcd977ea2a16050018ee8cce73a9`.
 They close experimental questions, not the final artifact-freeze gate. Rebuild
 and rerun every headline result from one clean paper commit before submission.
@@ -34,18 +35,157 @@ first, then refresh calibration and validate the system coherently. In order:
    declarative paper runner. The 192C raw artifacts are preserved under ignored
    workspace storage, and the Arm 80C route/calibration assets plus high-skew
    suite are now runner-managed with expected SHA256 checks.
-3. Close or explicitly narrow the cost-model claim. Machine-local single-core
-   packed-B retention is now measured on AmazonC5192Cores, but multi-team
-   refill/topology and wide-team concurrent pressure remain open.
-4. Fix or conservatively gate planner misranking on skewed traces before
-   calling full search near-optimal or quick search generally superior to a
-   fixed-width fallback.
+3. Close or explicitly narrow the cost-model claim. Placement-aware LLC and
+   single-team/full-cohort wide-team pressure now pass the current Arm 80-core
+   three-trace gate; temporal top-candidate ranking, multi-layer holdout, and
+   cross-machine calibration remain open.
+4. Replace whole-problem CP-SAT as the primary optimizer with an executable,
+   event-model-guided VND/LNS track. Retain CP-SAT only as a reduced exact
+   oracle or bounded neighborhood repair until it demonstrates independent
+   value over the full incumbent.
 5. Add the current upstream Arm CPU MoE baseline, a full multi-layer vLLM run,
    a second Arm machine, and measured TP/EP communication before making system
    or portability claims.
 6. Keep W8A16/W8A8, BF16 route storage, shared-expert extensions, W2-to-merge
    fusion, router fusion, communication pipelining, and large-K specialization
    outside the primary paper claim until the BF16 Arm path is closed.
+
+## Next planner track: event-guided VND, LNS, then ALNS
+
+Do not start by adding adaptive operator weights. First establish that the
+executable-plan neighborhood is locally useful, repairable, and sufficiently
+cheap to evaluate. The primary objective is the complete heavy event-model
+makespan; every intermediate state must lower directly to a legal strict Plan
+V2. The current analytical full, one-step, fixed-width greedy, and measured
+controls remain immutable incumbents. CP-SAT is not the whole-problem primary
+optimizer in this track.
+
+### Step 0: canonical executable search state
+
+- [x] Represent the rank as a gap-free partition of contiguous fixed-width
+  lanes, each carrying an ordered expert sequence, and represent LLC domains as
+  a second contiguous partition. Every active expert appears exactly once.
+  Existing full-plan lanes that cross a domain boundary are preserved and
+  report both intersected domain ids; later topology-changing moves must not
+  create new cross-domain lanes.
+- [x] Implement deterministic conversions among the current full-plan result,
+  the search state, and Plan V2. Preserve width, physical core interval, lane
+  order, dependencies, windows, early-merge setting, and output semantics.
+- [x] Add a canonical state hash and reject duplicate states. Round-trip tests
+  must reproduce the original Plan V2 and event score; Arm correctness must be
+  bitwise identical before any performance search. The implementation and
+  focused tests are in `planners/executable_plan_state.py` and
+  `tests/test_moe_executable_plan_state.py`; Arm-codex NUMA3 additionally
+  passed the SVE Plan V2 strict/tail-pool versus legacy bitwise execution test.
+
+### Step 1: falsifiable neighborhood audit
+
+- [ ] On the current uniformish, median, and high-skew traces, enumerate or
+  sample order-only legal neighbors around `full_selected`: same-lane adjacent
+  swap/insertion, same-width cross-lane relocation/swap, and same-width
+  cross-LLC relocation.
+- [ ] Record neighbor count, valid/duplicate ratio, event-score delta, best
+  gain, evaluation throughput, and hardware result for the event top candidates.
+  Compare critical-event-guided expert selection with uniform random selection.
+- [ ] Continue to VND only if useful locality is observed: at least one stable
+  improving neighbor, critical guidance materially enriches the top candidates,
+  and event improvements are not erased systematically by hardware execution.
+  If local scores are effectively random or all useful plans require global
+  reconstruction, reject LNS and move to template-level global search.
+
+### Step 2: deterministic variable-neighborhood descent baseline
+
+- [ ] Starting independently from full, one-step, greedy, and fixed-width
+  controls, run best-improvement descent over same-lane insertion, same-width
+  cross-lane relocation, pair swap, and cross-domain relocation.
+- [ ] Keep every accepted state executable and preserve the best incumbent at
+  all times. Report per-operator proposals, accepted improvements, event calls,
+  wall time, and best-so-far curve.
+- [ ] Use the known high-skew `cp_sat_06` result (`33.148 ms` versus the
+  `34.484 ms` full incumbent) as a diagnostic target: determine whether local
+  executable moves can recover the opportunity, not merely whether one seed
+  improves one model score.
+
+### Step 3: topology-preserving width neighborhoods
+
+- [ ] Add domain-local lane split/merge moves such as `16 -> 8+8`,
+  `8 -> 4+4`, and their inverses. Reassign only experts on affected lanes and
+  maintain the exact 40-core domain partition throughout the move.
+- [ ] Add adjacent-width expert migration through existing lanes before
+  permitting arbitrary per-expert core intervals. Every candidate must remain
+  directly executable without fluid-to-contiguous lowering.
+- [ ] Measure order-only, width-only, and combined ablations. Retain width
+  moves only when they improve held-out plan regret rather than just expanding
+  the search space.
+
+### Step 4: make event-guided search affordable
+
+- [ ] Precompute immutable expert/width phase descriptions and memoize plans by
+  canonical hash. Profile event evaluation before changing the search budget.
+- [ ] Add a two-level evaluator: generate hundreds of legal neighbors with a
+  cheap affected-lane/domain delta bound, then run the complete event model on
+  only the best diverse subset. Verify that screening does not discard the
+  measured best on the audit corpus.
+- [ ] If evaluation remains dominant, incrementally replay only affected event
+  intervals or move the deterministic simulator to native code. Report plans
+  evaluated per second and quality versus equal wall-clock budget.
+
+### Step 5: critical-window large-neighborhood search
+
+- [ ] Derive expert criticality from the event log: final critical lane,
+  maximum LLC/DRAM or wide-team dilation interval, cross-domain finish
+  imbalance, and idle-core tail.
+- [ ] Implement destroy sizes 4/8/16 over those critical windows. Keep all
+  unaffected lanes fixed and repair the removed experts with bounded beam
+  search over legal lane, domain, adjacent width, and a small set of insertion
+  positions; start with beam widths 16/32/64.
+- [ ] Maintain a diverse elite pool rather than one trajectory. Diversity must
+  cover width histograms, LLC-domain assignments, critical-expert placement,
+  and temporal order, not only distinct serialized start vectors.
+- [ ] Compare LNS with VND under identical event-call and wall-clock budgets.
+  Adopt LNS only if larger destroy/repair neighborhoods escape reproducible VND
+  local optima on held-out traces.
+
+### Step 6: decide whether adaptation is warranted
+
+- [ ] Measure which destroy/repair operators win on each trace class. Add ALNS
+  reward-weight updates only if operator effectiveness is complementary across
+  workloads; otherwise retain the simpler fixed-mixture LNS.
+- [ ] If adopted, reward separately for a new global best, current-state
+  improvement, elite-pool admission, duplicate, and invalid repair. Freeze the
+  update rule before the final holdout and provide operator/size ablations.
+- [ ] Add bounded diversification through multiple starts, tabu state hashes,
+  or occasional worse-state acceptance. The returned plan must always be the
+  best incumbent, independent of the exploratory trajectory.
+
+### Step 7: establish the near-optimality claim
+
+- [ ] Build exact reduced instances from real routes with 8/16/32 experts and
+  compare VND/LNS/ALNS against exhaustive search, branch-and-bound, or reduced
+  CP-SAT. Report model-objective regret to the true reduced optimum.
+- [ ] Strengthen and report large-instance core-work, critical-chain,
+  per-domain, LLC, and DRAM lower bounds. Label calibrated relaxations
+  separately from hardware certificates; do not infer a global guarantee from
+  a loose resource bound.
+- [ ] Report 1/10/30/60/300-second anytime curves and multiple independent
+  starts. Require the final event-guided planner to preserve full/one-step/
+  greedy incumbents, achieve measured shortlist regret no larger than 5%, and
+  have no trace regression above 2%.
+- [ ] Run the final comparison across complete 43-layer captured requests and a
+  second Arm machine when available. Report `T_plan`, `T_execute`, and
+  `T_plan + T_execute` separately.
+
+### Step 8: connect the offline reference to runtime planning
+
+- [ ] Compare the lightweight quick planner and fixed 8T fallback against the
+  frozen event-guided offline reference on every evaluated layer. Report quick
+  regret and planning latency rather than claiming it inherits offline quality.
+- [ ] Only after the strict search is closed, add dynamic tail-pool recourse as
+  a separate runtime stage and measure its incremental gain and variance. Do
+  not include tail-pool behavior in the strict near-optimality certificate.
+- [ ] Keep CP-SAT available only for reduced exact validation or repair of a
+  bounded critical neighborhood; promote it again only if it improves the
+  executable event incumbent under equal wall-clock budget.
 
 The legacy weight-split removal is complete across the production stack:
 

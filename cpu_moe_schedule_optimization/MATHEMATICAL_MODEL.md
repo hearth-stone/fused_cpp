@@ -1585,6 +1585,30 @@ $$
 $\{G\}\cup\mathcal F_D$，后者是包含 incumbents 的 measured shortlist decision；二者都必须
 单独报告，不能把 incumbent 的收益记为 CP-SAT 新发现。
 
+**Canonical executable search state。** Event-guided VND/LNS 在进入搜索前使用一个内部
+version-1 fixed-lane state，而不是直接修改Plan V2数组。令rank logical cores为
+$[0,C)$，lane集合为：
+
+$$
+\mathcal L=\{(b_l,t_l,Q_l)\},\qquad
+b_0=0,\quad b_{l+1}=b_l+t_l,\quad \sum_l t_l=C,
+$$
+
+其中$Q_l$是lane内有序whole-expert task序列。每个active expert恰好出现一次；第一个task
+无依赖，后续task只依赖同lane前驱。因此core interval和dependency由state唯一决定，每个
+state天然是strict fixed executable DAG。独立的LLC-domain interval集合也必须按logical CPU
+顺序无缝覆盖$[0,C)$；现有incumbent中跨domain的lane保持原interval，并记录所有相交domain，
+v0转换不得为了拓扑整齐而改写基线。
+
+state另外保留ordered physical CPU ids、per-task W13/W2 window tiles和plan-level
+early-merge三态。canonical hash覆盖state schema、CPU/domain topology、lane partition、task
+顺序、route counts、windows和early merge。当前适配器只接受strict、fixed、unsliced、
+whole-expert lane chains；tail pool、route slice、resize和一般interval DAG显式拒绝。planner
+result $\rightarrow$ state $\rightarrow$ planner tasks/Plan V2 bridge必须逐字段往返，且同一
+analytical event scorer结果不变。该内部状态不修改public Plan V2 schema、runtime ABI、
+planner candidate space或默认dispatch；它只是后续executable-neighborhood search的合法性
+边界。
+
 **Placement-aware LLC event state。** 旧 analytical DAG 在 `_score()` 中删除
 `core_begin`，所有 active task 共用 rank-global LLC working set、capacity 和 service；这会
 把“task 分散在两个 LLC domain”与“task 全部挤在一个 domain”错误视为同一状态。当前
@@ -5432,3 +5456,4 @@ planning 对未命中点执行原解析公式；首次调用结束后在文件�
 | 2026-09-01 | v1.35 | 将 production quick planner 的原始 homogeneous LPT greedy strict DAG 作为 exact fixed branch 加入离线搜索域，与 domain-aware SAT strict 分支组成不混合的 plan-level union；greedy 原始 width、core placement、order 和 dependencies 不做 domain projection。两分支分别用 cold-phase CP-SAT 求 UB/LB 后取最小，因而在相同 surrogate 下严格不劣于 greedy。第一阶段只测 union proof 产生的同一个 60 s SAT incumbent 与一个 pure greedy fixed plan，不启用 tail pool、tail repartition、stealing 或 resize；one-step projection仅作为 domain search hint。Arm 80C 三条 2048-token TopK6 trace 的 union gap 为 `2.071%--2.129%`，全部选择 SAT；31-run paired SAT 相对 greedy 的 high/median/uniformish 中位收益为 `2.21%/12.49%/7.27%`，三条均 `31/31` 获胜。该结果只覆盖 fixed strict plan class；SAT 相对 one-step strict control 在 uniformish 仍回退 `3.89%`。动态尾池留作第二阶段在线 recourse，不改变 production 默认、Plan V2、kernel、schema 或 ABI。 |
 | 2026-09-01 | v1.36 | analytical heavy event model 增加 placement-aware LLC path：planner 将 logical core interval 映射到真实 CPU IDs；event 按 owner-thread 比例拆分每个 task 的 LLC working set/demand，逐 domain 计算 capacity miss、service pressure 和 dilation，再施加 rank-level LLC fabric cap；task spill fraction 只影响自身 spillable DRAM，DRAM 仍为 NUMA-rank global，跨 domain gang 取最慢 domain dilation。旧 unplaced API、无-topology fallback、empirical/quick planner、Plan V2、runtime 和 kernel 保持不变。Arm 80C strict proof-plan 的 event 预测 SAT 相对 greedy 为 high/median/uniformish `-2.47/-2.98/-6.20%`，实测为 `-4.83/-10.92/+1.89%`；high/median 排序方向闭合，但 uniformish 仅 `4/31` 获胜并回退，证明剩余主要缺口是 wide-team concurrent pressure/width scaling，而非 LLC placement 丢失。placement-aware full planning 时间相对旧版约增加 `1.7--1.9x`，该实验未通过三 trace no-regression gate。 |
 | 2026-09-02 | v1.37 | placement-aware heavy event model 增加离散 wide-team residual：以非 gate 层分别拟合 single-team internal dilation $B_t$ 与 full-cohort total dilation $S_t$，active event 使用 $B_t+(S_t-B_t)q$，未校准宽度不外推；4/8/16/32/40/80T 的 $S_t$ 为 `1.000/1.303/1.470/1.619/1.821/2.306`。CP fluid master 保持原 cold surrogate，其 gap 不冒充完整 event proof；lowering 固定 width/domain，先保持 fluid start 求 contiguous placement，失败时才最小延迟并标记 `*_DELAYED`。最终 event union 显式保留 full、one-step、exact greedy incumbents 与 CP top-8。commit `6b6b4d1` 的 Arm 80C 正式三 trace run 得到 proof gap `4.02/4.99/4.81%`、measured union regret `0/0/4.03%`，相对 one-step 和 greedy 均无回退且对 greedy 全部 `31/31` 获胜；但三条最终都保留 full incumbent，high-skew 中未选中的 CP plan 实测再快 `4.03%`，故只关闭 incumbent-plus-shortlist 的近似计划 gate，CP-only 与 temporal/lowering quality 仍 open。见 `optimizations/fused_moe_sve/results/arm_codex_80c_wide_team_strict_gate_20260902.md`。 |
+| 2026-09-02 | v1.38 | 为event-guided VND/LNS增加内部version-1 canonical executable state，不改变搜索候选或选择结果。state将rank表示为gap-free contiguous fixed-width lanes及其whole-expert序列，独立记录ordered physical CPUs、contiguous LLC-domain partition、per-task windows和early-merge三态；lane依赖唯一派生，hash覆盖全部执行语义。现有跨LLC-domain lane原样保留并记录相交domain，不为了新抽象改写incumbent。适配器只接受strict/fixed/unsliced/lane-chain planner result，显式拒绝tail pool、route slice、resize和一般DAG；result→state→tasks/Plan V2逐字段往返并保持analytical event score。该步骤只建立后续邻域搜索的合法性边界，无性能或近似最优结论。 |

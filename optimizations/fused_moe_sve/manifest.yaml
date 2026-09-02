@@ -7,6 +7,44 @@ baseline:
   status: reference
 
 features:
+  - id: planner.executable_search_state
+    part: planner
+    status: experimental
+    implementation: >-
+      cpu_moe_schedule_optimization/planners/executable_plan_state.py and
+      tests/test_moe_executable_plan_state.py
+    hypothesis: >-
+      A canonical fixed-lane state whose dependencies are derived from ordered
+      executable lanes removes fluid-lowering ambiguity and provides a safe
+      basis for direct event-model neighborhood search.
+    depends_on:
+      - planner.wide_team_concurrent_pressure
+    conflicts_with: []
+    correctness: >-
+      PYTHONPATH=.:src .venv/bin/python -m pytest -q
+      tests/test_moe_executable_plan_state.py tests/test_moe_plan_v2.py
+    benchmark: >-
+      Step 0 is behavior-only and makes no performance claim. Step 1 must add
+      the declared three-trace neighborhood-audit runner before evaluating
+      search throughput or plan quality.
+    owner: zhangxu
+    opened: 2026-09-02
+    decision_by: 2026-10-02
+    next_decision: >-
+      Run the falsifiable order-only neighborhood audit on uniformish, median,
+      and high-skew traces and reject LNS if useful locality is absent.
+    adoption_gate: >-
+      Exact planner-result and Plan V2 round trip, stable canonical hash,
+      unchanged analytical event score, and target-Arm strict-plan validation
+      before any performance search.
+    result: >-
+      Step 0 implemented the internal strict/fixed/unsliced lane-chain state.
+      Six local focused tests and the current IntervalPlanner integration pass;
+      the broader local planner/Plan V2 set reports 183 passed, and the Arm
+      focused state/strict Plan V2 set reports 11 passed. The Arm SVE Plan V2
+      strict/tail-pool versus legacy bitwise execution test also passes. No
+      performance result is claimed.
+
   - id: planner.wide_team_concurrent_pressure
     part: planner
     status: experimental

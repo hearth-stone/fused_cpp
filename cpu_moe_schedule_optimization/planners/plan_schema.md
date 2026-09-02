@@ -10,6 +10,31 @@ default. The ARM native executor also accepts an explicit whole-expert
 `tail_pool` placement: aligned thread groups may claim pooled experts only
 after their fixed work completes. Neither mode resizes a running task.
 
+## Internal executable search state
+
+`executable_plan_state.py` defines an internal version-1 canonical state for
+future event-guided VND/LNS. It is not a new runtime plan version, is not
+exported by `fused_cpp`, and does not change Plan V2 serialization or native
+ABI.
+
+The initial state covers only strict, fixed-placement, unsliced whole-expert
+lane chains. The logical rank is a gap-free ordered partition of contiguous
+lanes; each lane owns an ordered task sequence, so dependencies are derived
+uniquely from the previous task in that lane. Empty lanes are retained so the
+original shape is not lost. A separate contiguous LLC-domain partition records
+topology. Existing planner lanes may span two domains and are preserved rather
+than rewritten; future topology-changing search moves must enforce their own
+domain-local preconditions.
+
+The canonical identity includes ordered physical CPU ids, LLC-domain
+intervals, lane widths and positions, expert ids, route counts, W13/W2 window
+tiles, and the early-merge tri-state. Conversion from a current planner result
+validates all fixed singleton-width metadata and requires exact lane-chain
+dependencies. Converting back reproduces the original planner tasks and Plan
+V2 bridge. Tail-pool placement, route slices, resize semantics, non-lane DAGs,
+and duplicate whole-expert tasks are deliberately rejected in this first
+search domain.
+
 > **⚠ DEPRECATED — wave 调度后续不考虑。** 见 [../DEPRECATED_WAVE.md](../DEPRECATED_WAVE.md)。
 > 本文件中的 `Wave` 层、`wave_offsets` scheduled bridge、以及除 `ASYNC_INTERVAL_DAG` 外的
 > 所有 planner kinds 均已废弃,仅作历史参考。**保留并继续**:`ASYNC_INTERVAL_DAG` /
