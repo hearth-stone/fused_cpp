@@ -23,6 +23,14 @@ PLANNER_DIR = REPO_ROOT / "cpu_moe_schedule_optimization" / "planners"
 sys.path[:0] = [str(REPO_ROOT / "src"), str(COST_MODEL_DIR), str(PLANNER_DIR)]
 
 from analytic_model import AnalyticMoeCostModel  # noqa: E402
+from cold_phase_cp_sat_oracle import ColdPhaseJob, build_cold_phase_jobs  # noqa: E402
+from cold_phase_domain_oracle import (  # noqa: E402
+    LlcDomain,
+    compare_strict_greedy_union,
+    materialize_domain_candidate,
+    solve_fixed_strict_greedy_cp_sat,
+    solve_cold_phase_domain_shortlist,
+)
 from fused_cpp import _moe_C  # noqa: E402
 from fused_cpp.moe import (  # noqa: E402
     AsyncMoEPlanV2,
@@ -31,6 +39,12 @@ from fused_cpp.moe import (  # noqa: E402
 )
 from interval_planner import IntervalPlanner  # noqa: E402
 from planned_moe import PlannedMoE  # noqa: E402
+from resource_lower_bound import build_lower_bound_certificate  # noqa: E402
+from sve_fused_expert_lower_bound import (  # noqa: E402
+    ServiceUpperBound,
+    SveFusedExpertHardwareEnvelope,
+    build_sve_fused_expert_lower_bound_problem,
+)
 
 
 ORDERS = ("lpt", "reverse_odd", "reverse_even")
@@ -51,6 +65,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--runs", type=int, default=31)
     parser.add_argument("--weight-copies", type=int, default=4)
     parser.add_argument("--seed", type=int, default=20260901)
+    parser.add_argument("--cp-sat-shortlist", type=int, default=0)
+    parser.add_argument("--cp-sat-measure", type=int, default=8)
+    parser.add_argument("--cp-sat-root-time", type=float, default=60.0)
+    parser.add_argument("--cp-sat-pool-root-time", type=float, default=10.0)
+    parser.add_argument("--cp-sat-next-time", type=float, default=5.0)
+    parser.add_argument("--cp-sat-gap", type=float, default=0.01)
+    parser.add_argument("--cp-sat-slack", type=float, default=0.10)
+    parser.add_argument("--cp-sat-workers", type=int, default=8)
+    parser.add_argument("--cp-sat-repair-experts", type=int, default=16)
+    parser.add_argument(
+        "--cp-sat-incumbent",
+        choices=("one_step", "greedy"),
+        default="one_step",
+    )
+    parser.add_argument(
+        "--cp-sat-domain-hint",
+        choices=("one_step", "greedy"),
+        default="one_step",
+    )
+    parser.add_argument("--cold-panel-rows", type=int, default=12)
     parser.add_argument("--output", type=Path)
     return parser.parse_args()
 
@@ -231,6 +265,23 @@ def _prepare_weights(args: argparse.Namespace) -> list[object]:
     return packed
 
 
+def _full_width_jobs(
+    jobs: tuple[ColdPhaseJob, ...],
+    tasks: list[tuple[int, int, int, int, list[int]]],
+) -> tuple[ColdPhaseJob, ...]:
+    width_by_expert = {int(expert): int(width) for expert, _, _, width, _ in tasks}
+    if len(width_by_expert) != len(tasks):
+        raise ValueError("CP-SAT incumbent projection requires one task per active expert")
+    projected = []
+    for job in jobs:
+        width = width_by_expert[job.expert_id]
+        modes = tuple(mode for mode in job.modes if mode.threads == width)
+        if len(modes) != 1:
+            raise ValueError(f"full-plan width={width} is unavailable for expert_id={job.expert_id}")
+        projected.append(ColdPhaseJob(job.expert_id, job.routes, modes))
+    return tuple(projected)
+
+
 @torch.inference_mode()
 def main() -> int:
     args = parse_args()
@@ -281,6 +332,51 @@ def main() -> int:
         cache_plans=False,
     )
     interval = planned.interval_planners[0]
+
+    calibration = model.calibration
+    frontend = calibration.frontend_instructions
+    resource_envelope = SveFusedExpertHardwareEnvelope(
+        num_cores=args.threads,
+        bfmmla=ServiceUpperBound(
+            "bfmmla_flops",
+            calibration.matrix_flops.saturated_rate,
+            calibration.matrix_flops.single_thread_rate,
+        ),
+        key_instructions=ServiceUpperBound(
+            "key_instructions",
+            frontend.saturated_rate if frontend is not None else 1.0e30,
+            frontend.single_thread_rate if frontend is not None else 1.0e30,
+        ),
+        l1_load_bytes=ServiceUpperBound(
+            "l1_load_bytes",
+            calibration.l1_bytes.saturated_rate,
+            calibration.l1_bytes.single_thread_rate,
+        ),
+        epilogue_elements=ServiceUpperBound(
+            "epilogue_elements",
+            (
+                calibration.epilogue_elements.saturated_rate
+                if calibration.epilogue_elements is not None
+                else 1.0e30
+            ),
+            (
+                calibration.epilogue_elements.single_thread_rate
+                if calibration.epilogue_elements is not None
+                else 1.0e30
+            ),
+        ),
+        dram_bytes=ServiceUpperBound("dram_bytes", calibration.dram_bytes.saturated_rate),
+    )
+    resource_problem = build_sve_fused_expert_lower_bound_problem(
+        route_counts.tolist(),
+        hidden_size=args.hidden,
+        intermediate_size=args.intermediate,
+        widths=tuple(width for width in model.supported_widths if width <= args.threads),
+        n_tile=calibration.backend_n_tile,
+        envelope=resource_envelope,
+        include_weight_dram=True,
+    )
+    resource_certificate = build_lower_bound_certificate(resource_problem)
 
     plan_begin = time.perf_counter_ns()
     strict_candidates = [interval._candidate(counts, shape) for shape in interval.shapes]
@@ -352,6 +448,200 @@ def main() -> int:
                 "plan": _plan_summary(bridge),
             }
     manual_plan_ms = (time.perf_counter_ns() - manual_begin) / 1.0e6
+    cp_sat_report = None
+    cp_sat_plan_ms = 0.0
+    if args.cp_sat_shortlist:
+        if args.cp_sat_measure <= 0 or args.cp_sat_measure > args.cp_sat_shortlist:
+            raise ValueError("cp-sat-measure must be in [1, cp-sat-shortlist]")
+        if not model.calibration.llc_domains:
+            raise ValueError("CP-SAT domain search requires LLC topology in the analytical calibration")
+        cp_begin = time.perf_counter_ns()
+        greedy_begin = time.perf_counter_ns()
+        greedy_result = interval.plan_quick(counts, topk_ids=topk_ids)
+        greedy_plan_ms = (time.perf_counter_ns() - greedy_begin) / 1.0e6
+        if (
+            greedy_result["execution_mode"] != "strict"
+            or greedy_result["tail_pool_threads"] is not None
+            or greedy_result["tail_pool_tasks"]
+            or greedy_result["tail_repartition_tasks"]
+        ):
+            raise RuntimeError("pure greedy control must be a fixed strict plan without a tail pool")
+        greedy_event_ns = float(interval._score(greedy_result["tasks"]))
+        bridges["greedy_strict"] = greedy_result["bridge"]
+        predicted_ms["greedy_strict"] = greedy_event_ns / 1.0e6
+        candidate_metadata["greedy_strict"] = {
+            "shape": list(greedy_result["shape"]),
+            "assignment_order": greedy_result["assignment_order"],
+            "quick_predicted_ms": float(greedy_result["makespan_ns"]) / 1.0e6,
+            "event_model_ms": greedy_event_ns / 1.0e6,
+            "planner_ms": greedy_plan_ms,
+            "plan": _plan_summary(greedy_result["bridge"]),
+        }
+        domain_cursor = 0
+        domains = []
+        for calibrated_domain in model.calibration.llc_domains:
+            core_count = len(calibrated_domain.cpu_ids)
+            domains.append(LlcDomain(calibrated_domain.domain_id, domain_cursor, core_count))
+            domain_cursor += core_count
+        dram_bandwidth_gbps = model.calibration.dram_bytes.saturated_rate / 1.0e9
+        requested_incumbent_tasks = (
+            greedy_result["tasks"]
+            if args.cp_sat_domain_hint == "greedy"
+            else conservative_selected["tasks"]
+        )
+        full_widths = {int(task[3]) for task in requested_incumbent_tasks}
+        greedy_widths = {int(task[3]) for task in greedy_result["tasks"]}
+        largest_domain = max(domain.core_count for domain in domains)
+        projection_tasks = requested_incumbent_tasks
+        incumbent_source = f"{args.cp_sat_domain_hint}_strict_plan"
+        if any(int(task[3]) > largest_domain for task in projection_tasks):
+            projection_tasks = conservative_selected["tasks"]
+            incumbent_source = f"{args.cp_sat_domain_hint}_exact_union_with_one_step_domain_hint"
+        cp_sat_widths = tuple(
+            sorted(
+                set(widths) | full_widths | greedy_widths
+            )
+        )
+        jobs = build_cold_phase_jobs(
+            counts,
+            cp_sat_widths,
+            interval.model,
+            num_cores=args.threads,
+            cold_panel_rows=args.cold_panel_rows,
+            phase_granularity="expert",
+        )
+        incumbent_projection = solve_cold_phase_domain_shortlist(
+            _full_width_jobs(jobs, projection_tasks),
+            num_cores=args.threads,
+            domains=domains,
+            dram_bandwidth_gbps=dram_bandwidth_gbps,
+            solution_limit=1,
+            max_time_s=args.cp_sat_root_time,
+            subsequent_time_s=args.cp_sat_next_time,
+            workers=args.cp_sat_workers,
+            relative_gap_limit=args.cp_sat_gap,
+        )
+        if not incumbent_projection.candidates:
+            raise RuntimeError(
+                f"failed to project the current full plan into LLC domains: {incumbent_projection.status}"
+            )
+        proof = solve_cold_phase_domain_shortlist(
+            jobs,
+            num_cores=args.threads,
+            domains=domains,
+            dram_bandwidth_gbps=dram_bandwidth_gbps,
+            initial_assignments=incumbent_projection.candidates[0].assignments,
+            solution_limit=1,
+            max_signature_changes=args.cp_sat_repair_experts,
+            shortlist_objective_slack=args.cp_sat_slack,
+            max_time_s=args.cp_sat_root_time,
+            subsequent_time_s=args.cp_sat_next_time,
+            workers=args.cp_sat_workers,
+            relative_gap_limit=args.cp_sat_gap,
+        )
+        greedy_oracle = None
+        strict_union = None
+        if args.cp_sat_incumbent == "greedy":
+            greedy_oracle = solve_fixed_strict_greedy_cp_sat(
+                jobs,
+                greedy_result["tasks"],
+                num_cores=args.threads,
+                dram_bandwidth_gbps=dram_bandwidth_gbps,
+                max_time_s=args.cp_sat_root_time,
+                workers=args.cp_sat_workers,
+                relative_gap_limit=args.cp_sat_gap,
+            )
+            strict_union = compare_strict_greedy_union(greedy_oracle, proof)
+        if args.cp_sat_shortlist == 1 and args.cp_sat_measure == 1:
+            shortlist = proof
+        else:
+            shortlist = solve_cold_phase_domain_shortlist(
+                jobs,
+                num_cores=args.threads,
+                domains=domains,
+                dram_bandwidth_gbps=dram_bandwidth_gbps,
+                initial_assignments=incumbent_projection.candidates[0].assignments,
+                solution_limit=args.cp_sat_shortlist,
+                max_signature_changes=args.cp_sat_repair_experts,
+                shortlist_objective_slack=args.cp_sat_slack,
+                max_time_s=args.cp_sat_pool_root_time,
+                subsequent_time_s=args.cp_sat_next_time,
+                workers=args.cp_sat_workers,
+                relative_gap_limit=args.cp_sat_gap,
+            )
+        reranked = []
+        lowering_ms = 0.0
+        for candidate_index, candidate in enumerate(shortlist.candidates):
+            lower_begin = time.perf_counter_ns()
+            placement = materialize_domain_candidate(
+                candidate,
+                domains=domains,
+                max_time_s=args.cp_sat_next_time,
+                workers=args.cp_sat_workers,
+                random_seed=args.seed + candidate_index,
+            )
+            lowering_ms += (time.perf_counter_ns() - lower_begin) / 1.0e6
+            if not placement.tasks:
+                continue
+            tasks = [task.planner_tuple() for task in placement.tasks]
+            event_makespan_ns = float(interval._score(tasks))
+            reranked.append((event_makespan_ns, candidate_index, candidate, placement, tasks))
+        reranked.sort(key=lambda row: (row[0], row[2].objective_ns, row[1]))
+        if len(reranked) < args.cp_sat_measure:
+            raise RuntimeError(
+                f"only {len(reranked)} of {len(shortlist.candidates)} CP-SAT candidates lowered; "
+                f"need {args.cp_sat_measure}"
+            )
+        for rank, (event_ns, candidate_index, candidate, placement, tasks) in enumerate(
+            reranked[: args.cp_sat_measure]
+        ):
+            name = f"cp_sat_{rank:02d}"
+            bridge = interval.to_async_bridge(tasks, topk_ids=topk_ids)
+            bridges[name] = bridge
+            predicted_ms[name] = event_ns / 1.0e6
+            candidate_metadata[name] = {
+                "shortlist_index": candidate_index,
+                "surrogate_ms": candidate.objective_ns / 1.0e6,
+                "event_model_ms": event_ns / 1.0e6,
+                "surrogate_mode_histogram": candidate.mode_histogram(),
+                "surrogate_domain_histogram": candidate.domain_histogram(),
+                "lowering_status": placement.status,
+                "lowering_ms": placement.wall_time_s * 1.0e3,
+                "plan": _plan_summary(bridge),
+            }
+        cp_sat_plan_ms = (time.perf_counter_ns() - cp_begin) / 1.0e6
+        cp_sat_report = {
+            "incumbent_source": incumbent_source,
+            "greedy_union_enabled": args.cp_sat_incumbent == "greedy",
+            "searched_widths": list(cp_sat_widths),
+            "repair_experts": args.cp_sat_repair_experts,
+            "pure_greedy": {
+                "planner_ms": greedy_plan_ms,
+                "plan": _plan_summary(greedy_result["bridge"]),
+                "event_model_ms": greedy_event_ns / 1.0e6,
+                "oracle": (
+                    greedy_oracle.to_dict(include_phases=False)
+                    if greedy_oracle is not None
+                    else None
+                ),
+            },
+            "incumbent_projection": incumbent_projection.to_dict(include_phases=False),
+            "proof": proof.to_dict(include_phases=False),
+            "strict_union": strict_union.to_dict() if strict_union is not None else None,
+            "shortlist": shortlist.to_dict(include_phases=False),
+            "lowered_candidates": len(reranked),
+            "measured_candidates": args.cp_sat_measure,
+            "lowering_wall_ms": lowering_ms,
+            "reranked": [
+                {
+                    "shortlist_index": candidate_index,
+                    "surrogate_ms": candidate.objective_ns / 1.0e6,
+                    "event_model_ms": event_ns / 1.0e6,
+                    "lowering_status": placement.status,
+                }
+                for event_ns, candidate_index, candidate, placement, _ in reranked
+            ],
+        }
     plans = {name: AsyncMoEPlanV2.from_dict(bridge) for name, bridge in bridges.items()}
 
     os.environ["FUSED_CPP_MOE_SVE"] = "1"
@@ -410,6 +700,37 @@ def main() -> int:
     full_samples = samples["full_selected"]
     best_samples = samples[measured_best]
     paired_speedup = [100.0 * (full / best - 1.0) for full, best in zip(full_samples, best_samples)]
+    cp_sat_measured = None
+    cp_names = sorted(name for name in plans if name.startswith("cp_sat_"))
+    if cp_names:
+        cp_measured_best = min(cp_names, key=lambda name: float(stats[name]["median_ms"]))
+        cp_selected = cp_names[0]
+        cp_best_ms = float(stats[cp_measured_best]["median_ms"])
+        cp_selected_ms = float(stats[cp_selected]["median_ms"])
+        one_step_ms = float(stats["conservative_selected"]["median_ms"])
+        greedy_ms = float(stats["greedy_strict"]["median_ms"])
+        lower_bound_ms = resource_certificate.lower_bound_s * 1.0e3
+        paired_vs_greedy = [
+            100.0 * (cp / greedy - 1.0)
+            for cp, greedy in zip(samples[cp_selected], samples["greedy_strict"], strict=True)
+        ]
+        cp_sat_measured = {
+            "event_selected": cp_selected,
+            "measured_best": cp_measured_best,
+            "shortlist_regret_pct": 100.0 * (cp_selected_ms / cp_best_ms - 1.0),
+            "vs_one_step_gate_pct": 100.0 * (cp_selected_ms / one_step_ms - 1.0),
+            "vs_pure_greedy_pct": 100.0 * (cp_selected_ms / greedy_ms - 1.0),
+            "paired_vs_pure_greedy_pct": {
+                "median": statistics.median(paired_vs_greedy),
+                "p10": _percentile(paired_vs_greedy, 0.10),
+                "p90": _percentile(paired_vs_greedy, 0.90),
+                "wins": sum(value < 0.0 for value in paired_vs_greedy),
+                "runs": len(paired_vs_greedy),
+            },
+            "resource_lower_bound_ms": lower_bound_ms,
+            "measured_to_resource_lb_ratio": cp_selected_ms / lower_bound_ms,
+            "t_plan_plus_t_execute_ms": cp_sat_plan_ms + cp_selected_ms,
+        }
 
     result = {
         "kind": "high_skew_planner_closure",
@@ -442,12 +763,20 @@ def main() -> int:
         "planning": {
             "full_cold_ms": full_plan_ms,
             "manual_candidates_ms": manual_plan_ms,
+            "cp_sat_total_ms": cp_sat_plan_ms,
             "strict_candidates": len(strict_candidates),
             "dynamic_candidates": full_result["dynamic_candidates"],
             "conservative_rule": (
                 "when the winner uses more than 8 threads, step its maximum team width down "
                 "by one calibrated level inside the uncertainty overlap, then minimize expected makespan"
             ),
+        },
+        "cp_sat": cp_sat_report,
+        "cp_sat_measured": cp_sat_measured,
+        "resource_lower_bound": {
+            "scope": "calibrated-service GEMM-only relaxation with compulsory cold weights",
+            "is_hardware_peak_certificate": False,
+            "certificate": resource_certificate.to_dict(),
         },
         "full_ranking_top20": full_result["ranking"][:20],
         "candidates": candidate_metadata,

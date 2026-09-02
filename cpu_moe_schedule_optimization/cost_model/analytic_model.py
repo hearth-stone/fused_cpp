@@ -1856,6 +1856,27 @@ class AnalyticMoeCostModel:
         self._t_iso_scalar_cache[key] = value
         return value
 
+    def task_stage_phases(
+        self,
+        stage: str,
+        routes: int,
+        threads: int,
+    ) -> tuple[tuple[float, int], ...]:
+        """Expose stage-isolated time and compulsory packed-B bytes.
+
+        This is the narrow adapter consumed by the offline cold-phase oracle.
+        It does not expose analytical cache phases as CP-SAT decision variables:
+        the master retains one cold-B phase per GEMM stage, while the complete
+        event model remains responsible for cache/refill contention in reranking.
+        """
+
+        prediction = self.predict_expert(int(routes), int(threads))
+        if stage == "w13":
+            return ((prediction.w13_ns, prediction.w13_demand.stage_bytes),)
+        if stage == "w2":
+            return ((prediction.w2_ns, prediction.w2_demand.stage_bytes),)
+        raise ValueError(f"unsupported stage {stage!r}")
+
     def t_iso_cache_identity(self) -> dict[str, object]:
         """Return every stable input needed to validate persisted T_iso values."""
         return {
@@ -1993,6 +2014,222 @@ class AnalyticMoeCostModel:
         }
         return spill_fraction, provisional, pressures, multipliers
 
+    def _active_phase_state_placed(
+        self,
+        current: Mapping[int, AnalyticPhase],
+        task_cpu_ids: Sequence[Sequence[int]],
+    ) -> tuple[
+        dict[int, float],
+        dict[int, float],
+        dict[str, AnalyticResourcePressure],
+        dict[int, float],
+        dict[str, dict[str, float | int | None]],
+    ]:
+        """Allocate LLC capacity and service by the tasks' physical domains."""
+
+        domains = self.calibration.llc_domains
+        if not domains:
+            raise ValueError("placement-aware phase state requires calibrated LLC domains")
+        cpu_to_domain = {
+            cpu: domain.domain_id
+            for domain in domains
+            for cpu in domain.cpu_ids
+        }
+        current_items = tuple(current.items())
+        task_domain_counts: dict[int, dict[str, int]] = {}
+        domain_thread_counts = {domain.domain_id: 0 for domain in domains}
+        domain_working_sets = {domain.domain_id: 0.0 for domain in domains}
+        for index, phase in current_items:
+            active_cpu_ids = tuple(task_cpu_ids[index][: phase.active_threads])
+            if len(active_cpu_ids) != phase.active_threads:
+                raise ValueError(f"task {index} placement is narrower than its active phase")
+            counts = {domain.domain_id: 0 for domain in domains}
+            for cpu in active_cpu_ids:
+                try:
+                    counts[cpu_to_domain[cpu]] += 1
+                except KeyError as error:
+                    raise ValueError(f"task {index} uses CPU {cpu} outside the calibrated rank") from error
+            task_domain_counts[index] = counts
+            for domain_id, count in counts.items():
+                if count <= 0:
+                    continue
+                share = count / phase.active_threads
+                domain_thread_counts[domain_id] += count
+                domain_working_sets[domain_id] += phase.working_set_bytes * share
+
+        domain_spill = {}
+        for domain in domains:
+            domain_id = domain.domain_id
+            threads = domain_thread_counts[domain_id]
+            domain_spill[domain_id] = (
+                self._llc_miss_fraction(
+                    domain_working_sets[domain_id],
+                    llc_domain_threads={domain_id: threads},
+                )
+                if threads > 0
+                else 0.0
+            )
+        task_spill = {
+            index: sum(
+                count / phase.active_threads * domain_spill[domain_id]
+                for domain_id, count in task_domain_counts[index].items()
+                if count > 0
+            )
+            for index, phase in current_items
+        }
+        resource_vectors = {
+            index: phase.resource_vectors(task_spill[index])
+            for index, phase in current_items
+        }
+        provisional = {
+            index: phase._duration_from_resource_times(resource_vectors[index][1])
+            for index, phase in current_items
+        }
+        pressures: dict[str, AnalyticResourcePressure] = {}
+        resource_scales = {index: {} for index, _ in current_items}
+        for resource_index, resource in enumerate(_SHARED_RESOURCES):
+            if resource == "llc_bytes":
+                continue
+            demands = {
+                index: resource_vectors[index][0][resource_index]
+                for index, _ in current_items
+            }
+            active_threads = min(
+                sum(current[index].active_threads for index, demand in demands.items() if demand > 0.0),
+                self.calibration.cores_per_rank,
+            )
+            capacity = self.calibration.service_rate(resource, active_threads) if active_threads > 0 else math.inf
+            if math.isfinite(capacity):
+                offered_rate = sum(
+                    demand
+                    / max(
+                        current[index].residual_scale
+                        * resource_vectors[index][1][resource_index]
+                        * 1e-9,
+                        1e-30,
+                    )
+                    for index, demand in demands.items()
+                    if demand > 0.0
+                )
+            else:
+                offered_rate = sum(
+                    demand / max(provisional[index] * 1e-9, 1e-30)
+                    for index, demand in demands.items()
+                    if demand > 0.0
+                )
+            utilization = offered_rate / capacity if math.isfinite(capacity) else 0.0
+            dilation = max(1.0, utilization)
+            pressures[resource] = AnalyticResourcePressure(
+                active_threads=active_threads,
+                offered_rate=offered_rate,
+                capacity=capacity,
+                utilization=utilization,
+                dilation=dilation,
+                allocated_rate=offered_rate / dilation,
+                allocated_utilization=(offered_rate / dilation / capacity if math.isfinite(capacity) else 0.0),
+            )
+            for index, demand in demands.items():
+                if demand > 0.0:
+                    resource_scales[index][resource] = dilation
+
+        llc_index = _SHARED_RESOURCES.index("llc_bytes")
+        domain_details: dict[str, dict[str, float | int | None]] = {}
+        domain_dilations = {}
+        total_llc_offered = 0.0
+        requesting_domain_threads = {domain.domain_id: 0 for domain in domains}
+        for domain in domains:
+            domain_id = domain.domain_id
+            offered_rate = 0.0
+            active_threads = 0
+            for index, phase in current_items:
+                count = task_domain_counts[index][domain_id]
+                demand = resource_vectors[index][0][llc_index]
+                if count <= 0 or demand <= 0.0:
+                    continue
+                share = count / phase.active_threads
+                offered_rate += (
+                    demand
+                    * share
+                    / max(
+                        phase.residual_scale * resource_vectors[index][1][llc_index] * 1e-9,
+                        1e-30,
+                    )
+                )
+                active_threads += count
+            requesting_domain_threads[domain_id] = active_threads
+            capacity = (
+                self.calibration.service_rate(
+                    "llc_bytes",
+                    active_threads,
+                    llc_domain_threads={domain_id: active_threads},
+                )
+                if active_threads > 0
+                else math.inf
+            )
+            utilization = offered_rate / capacity if math.isfinite(capacity) else 0.0
+            dilation = max(1.0, utilization)
+            domain_dilations[domain_id] = dilation
+            total_llc_offered += offered_rate
+            domain_details[domain_id] = {
+                "active_threads": active_threads,
+                "working_set_bytes": domain_working_sets[domain_id],
+                "spill_fraction": domain_spill[domain_id],
+                "offered_rate": offered_rate,
+                "capacity": capacity if math.isfinite(capacity) else None,
+                "utilization": utilization,
+                "dilation": dilation,
+            }
+        total_requesting_threads = sum(requesting_domain_threads.values())
+        rank_llc_capacity = (
+            self.calibration.service_rate(
+                "llc_bytes",
+                total_requesting_threads,
+                llc_domain_threads=requesting_domain_threads,
+            )
+            if total_requesting_threads > 0
+            else math.inf
+        )
+        rank_llc_utilization = (
+            total_llc_offered / rank_llc_capacity if math.isfinite(rank_llc_capacity) else 0.0
+        )
+        rank_llc_dilation = max(1.0, rank_llc_utilization)
+        pressures["llc_bytes"] = AnalyticResourcePressure(
+            active_threads=total_requesting_threads,
+            offered_rate=total_llc_offered,
+            capacity=rank_llc_capacity,
+            utilization=rank_llc_utilization,
+            dilation=rank_llc_dilation,
+            allocated_rate=total_llc_offered / rank_llc_dilation,
+            allocated_utilization=(
+                total_llc_offered / rank_llc_dilation / rank_llc_capacity
+                if math.isfinite(rank_llc_capacity)
+                else 0.0
+            ),
+        )
+        for index, phase in current_items:
+            if resource_vectors[index][0][llc_index] <= 0.0:
+                continue
+            local_dilation = max(
+                (
+                    domain_dilations[domain_id]
+                    for domain_id, count in task_domain_counts[index].items()
+                    if count > 0
+                ),
+                default=1.0,
+            )
+            resource_scales[index]["llc_bytes"] = max(rank_llc_dilation, local_dilation)
+
+        multipliers = {
+            index: (
+                phase._duration_from_resource_times(
+                    resource_vectors[index][1], resource_scales[index]
+                )
+                / phase.base_ns
+            )
+            for index, phase in current_items
+        }
+        return task_spill, provisional, pressures, multipliers, domain_details
+
     def active_resource_pressure(self, phases: Sequence[AnalyticPhase]) -> dict[str, AnalyticResourcePressure]:
         """Return physically named offered-load pressure for one concurrent phase set."""
         current = {index: phase for index, phase in enumerate(phases)}
@@ -2017,6 +2254,7 @@ class AnalyticMoeCostModel:
         tasks,
         *,
         event_log: list[dict] | None = None,
+        task_cpu_ids: Sequence[Sequence[int]] | None = None,
     ) -> tuple[float, tuple[float, ...]]:
         tasks = [(int(routes), int(threads), list(dependencies)) for routes, threads, dependencies in tasks]
         if not tasks:
@@ -2041,29 +2279,39 @@ class AnalyticMoeCostModel:
             if not active:
                 raise ValueError("DAG deadlock (cycle or unreachable task)")
             current = {index: phases[index][phase_index[index]] for index in active}
-            spill_fraction, _, pressures, multipliers = self._active_phase_state(current)
+            if task_cpu_ids is None:
+                spill_fraction, _, pressures, multipliers = self._active_phase_state(current)
+                spill_log: float | dict[str, float] = spill_fraction
+                domain_log = None
+            else:
+                task_spill, _, pressures, multipliers, domain_log = self._active_phase_state_placed(
+                    current,
+                    task_cpu_ids,
+                )
+                spill_log = {str(index): task_spill[index] for index in active}
             elapsed = min(remaining[index] * multipliers[index] for index in active)
             if event_log is not None:
-                event_log.append(
-                    {
-                        "start_ns": wall_ns,
-                        "duration_ns": elapsed,
-                        "active_tasks": list(active),
-                        "phases": {str(index): current[index].name for index in active},
-                        "phase_kinds": {str(index): current[index].kind for index in active},
-                        "phase_dilation": {str(index): multipliers[index] for index in active},
-                        "working_set_bytes": sum(phase.working_set_bytes for phase in current.values()),
-                        "llc_spill_fraction": spill_fraction,
-                        "resources": {
-                            resource: {
-                                "path": _RESOURCE_PATHS[resource],
-                                **self._pressure_dict(pressure),
-                            }
-                            for resource, pressure in pressures.items()
-                            if pressure.offered_rate > 0.0
-                        },
-                    }
-                )
+                event = {
+                    "start_ns": wall_ns,
+                    "duration_ns": elapsed,
+                    "active_tasks": list(active),
+                    "phases": {str(index): current[index].name for index in active},
+                    "phase_kinds": {str(index): current[index].kind for index in active},
+                    "phase_dilation": {str(index): multipliers[index] for index in active},
+                    "working_set_bytes": sum(phase.working_set_bytes for phase in current.values()),
+                    "llc_spill_fraction": spill_log,
+                    "resources": {
+                        resource: {
+                            "path": _RESOURCE_PATHS[resource],
+                            **self._pressure_dict(pressure),
+                        }
+                        for resource, pressure in pressures.items()
+                        if pressure.offered_rate > 0.0
+                    },
+                }
+                if domain_log is not None:
+                    event["llc_domains"] = domain_log
+                event_log.append(event)
             wall_ns += elapsed
             for index in active:
                 remaining[index] -= elapsed / multipliers[index]
@@ -2084,6 +2332,37 @@ class AnalyticMoeCostModel:
 
     def dag_makespan(self, tasks) -> float:
         return self._dag_result(tasks)[0]
+
+    def dag_makespan_placed(self, tasks) -> float:
+        """Score a DAG whose tasks carry exact physical CPU placements."""
+
+        if not self.calibration.llc_domains:
+            unplaced = [(routes, threads, dependencies) for routes, threads, _, dependencies in tasks]
+            return self.dag_makespan(unplaced)
+        normalized = []
+        task_cpu_ids = []
+        ancestors: list[set[int]] = []
+        for task_index, (routes, threads, raw_cpu_ids, raw_dependencies) in enumerate(tasks):
+            threads = int(threads)
+            cpu_ids = tuple(int(cpu) for cpu in raw_cpu_ids)
+            dependencies = tuple(sorted({int(value) for value in raw_dependencies}))
+            if threads <= 0 or len(cpu_ids) != threads or len(set(cpu_ids)) != threads:
+                raise ValueError(f"task {task_index} placement must contain one unique CPU per thread")
+            if dependencies and (dependencies[0] < 0 or dependencies[-1] >= task_index):
+                raise ValueError("placed task dependencies must refer to earlier tasks")
+            reachable = set(dependencies)
+            for dependency in dependencies:
+                reachable.update(ancestors[dependency])
+            for earlier, earlier_cpu_ids in enumerate(task_cpu_ids):
+                if set(cpu_ids).intersection(earlier_cpu_ids) and earlier not in reachable:
+                    raise ValueError(
+                        "overlapping placed tasks must be ordered by dependencies: "
+                        f"earlier_task={earlier}, task={task_index}"
+                    )
+            ancestors.append(reachable)
+            normalized.append((int(routes), threads, list(dependencies)))
+            task_cpu_ids.append(cpu_ids)
+        return self._dag_result(normalized, task_cpu_ids=task_cpu_ids)[0]
 
     def dag_task_finish_times(self, tasks) -> tuple[float, ...]:
         """Return task completion timestamps from the analytical simulator."""

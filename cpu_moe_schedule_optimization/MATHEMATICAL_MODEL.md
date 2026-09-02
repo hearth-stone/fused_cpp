@@ -1505,7 +1505,142 @@ merge、跨 rank 通信和 NUMA placement；加入这些项前必须先证明其
 certificate、M1 exact-M physical padding，以及 N tile 不均衡时不使用 $t\ell_{jm}$ 高估
 core-time。
 
-### 6.5 Production cold search 的 native 并行编码
+### 6.5 LLC-domain cold-phase shortlist master
+
+离线 heavy planner 在 6.2 的 cold-phase CP-SAT 上做增量扩展，不把完整 nonlinear event
+simulator 直接编码进整数规划。令 LLC domain 集合为 $\mathcal D$，domain $d$ 的连续 logical
+core 区间为 $[b_d,b_d+C_d)$。第一版对 expert $i$、width mode $t$ 和能容纳该 width 的
+domain $d$ 引入：
+
+$$
+y_{itd}\in\{0,1\},\qquad
+\sum_{t,d:t\le C_d}y_{itd}=1.
+$$
+
+每个 $(i,t,d)$ 复用 6.2 的 optional master interval 和有序 W13/W2 cold/steady phase；
+CPU cumulative constraint 从 rank-global 改为每个 domain 独立：
+
+$$
+\sum_{i,t:\tau\in[s_i,e_i)}t\,y_{itd}\le C_d,\qquad \forall d,\tau.
+$$
+
+cold packed-B 仍共享一个 NUMA-rank DRAM cumulative constraint，依赖边保持
+$s_i\ge e_j$。因此 master 只搜索 whole-expert width、LLC domain 和 start/order；不搜索
+stage window、W13/W2 独立 width、route slice、tail pool 或 merge policy。给定
+$(M_i,t_i)$ 后，W13/W2 window 继续由 9.36 的确定性 policy 生成。
+
+**Incumbent。** 当前 analytical full plan 可能包含跨 LLC 边界的 lane，不能直接成为
+single-domain master 的可行解。实现保留其 per-expert width 和 lane order 信息，先用同一个
+cold-phase master 只修复 domain/start，得到 projected feasible incumbent；projection 与
+mixed solve 都计入 $T_{plan}$。该 incumbent 同时作为 CP-SAT hint 和显式 upper bound。即使
+求解器在时限内只有 lower bound $L_{CP}$，仍可报告：
+
+$$
+gap_{CP}=\frac{U_{inc}-L_{CP}}{U_{inc}}.
+$$
+
+该 gap 只证明 fixed-rate cold-phase surrogate 的近似最优性，不证明硬件 makespan 的
+近似最优性。6.4 的 resource bound $L_R$ 另行报告；若容量来自实测饱和服务而非架构上界，
+必须标为 calibrated-model relaxation，不能称 hardware certificate。
+
+**Strict greedy union。** 第一阶段不启用 tail pool、tail repartition、stealing 或 resize。
+运行时 quick planner 产生的 homogeneous LPT greedy plan $G$ 保留原始 per-expert width、
+`core_begin`、lane order 和 dependency，不投影到 single-domain plan。固定 greedy 分支仍用
+cold-phase CP-SAT 优化合法 phase start/wait，但 overlapping core interval 必须由 dependency
+path 排序。domain-aware SAT 分支的可行域记为 $\mathcal F_D$，第一阶段完整域为：
+
+$$
+\mathcal F_{strict}=\{G\}\cup\mathcal F_D.
+$$
+
+两个分支不允许逐 task 混合，因此可分别求解再取最小，严格等价于一个 plan-level disjunction：
+
+$$
+U_{strict}=\min(U_G,U_D),\qquad
+L_{strict}=\min(L_G,L_D),\qquad
+gap_{strict}=\frac{U_{strict}-L_{strict}}{U_{strict}}.
+$$
+
+故 $U_{strict}\le U_G$ 在相同 cold surrogate 下成立。domain solve 的 hint 只影响搜索效率，
+不定义 $\mathcal F_{strict}$；实验中可继续使用 one-step strict projection 作为 domain hint，
+同时 exact greedy 始终由独立分支保留。该保证不自动推出硬件 wall time 不劣，必须用相同
+strict executor、输入、权重轮换和 paired runs 验证。动态尾池属于后续在线 recourse 策略，
+不由本节 union gap 覆盖。
+
+**Placement-aware LLC event state。** 旧 analytical DAG 在 `_score()` 中删除
+`core_begin`，所有 active task 共用 rank-global LLC working set、capacity 和 service；这会
+把“task 分散在两个 LLC domain”与“task 全部挤在一个 domain”错误视为同一状态。当前
+additive placed path 将 task 的 logical core interval 通过 planner `cpu_ids` 映射为真实 CPU
+集合 $P_i$，再由 machine calibration 映射到 LLC domain。旧 `dag_makespan()` 保持不变；
+有 topology 且调用方提供 placement 时使用 `dag_makespan_placed()`，无 topology 时回退旧
+rank aggregate。
+
+对 active phase $i$，令 $n_{id}$ 为其 active owner CPUs 中属于 domain $d$ 的数量，
+$p_{id}=n_{id}/n_i$。第一版按 owner-thread 比例分摊 working set 和 LLC demand：
+
+$$
+W_d=\sum_i p_{id}W_i,
+\qquad
+q^{LLC}_{id}=p_{id}q^{LLC}_i.
+$$
+
+每个 domain 独立使用容量 $C_d$ 计算 miss fraction：
+
+$$
+m_d=f(W_d,C_d),
+\qquad
+m_i=\sum_d p_{id}m_d.
+$$
+
+task-specific $m_i$ 只作用于该 task 的 spillable DRAM demand；compulsory packed-B 首读保持
+不变，DRAM contention 继续按 NUMA-rank 全局计算。LLC injection 在每个 domain 上分别得到：
+
+$$
+\rho_d=
+\frac{\sum_i r^{LLC}_{id}}
+     {B_d(\sum_i n_{id})}.
+$$
+
+多个 domain 还共享校准的 rank-level LLC fabric ceiling，得到 $\rho_R$。一个跨 domain gang
+phase 由最慢 owner stripe 限制，因此其 LLC dilation 为：
+
+$$
+D_i^{LLC}=\max\left(1,\rho_R,\max_{d:n_{id}>0}\rho_d\right).
+$$
+
+当前 exact-N ownership 下 active owners 取 team CPU interval 的前 `phase.active_threads` 个
+logical workers。输入校验要求每个 task placement 内 CPU 唯一、属于 calibration rank，并且
+共享物理 CPU 的两个 task 必须由 dependency path 排序。placed event diagnostics 记录每个
+domain 的 active threads、working set、spill、offered rate、capacity、utilization 和 dilation。
+该修改只作用于 analytical heavy event scoring；empirical model、production quick planner、
+Plan V2、runtime 和 kernel 不变。
+
+**Diverse shortlist 与 lowering。** proof 与 pool 使用两个独立 solve。proof 在长时限内只
+输出完整 master 的 $U_{CP},L_{CP},gap_{CP}$；pool 使用较短 root，不让更长 proof 偶然改变
+候选邻域。pool root 后固定非热点 expert 的 width/domain 和 surrogate interval，保留 route
+数最大的 16 个 expert 为 repair set；这些 expert 可重新选择 width/domain/start。每次得到解
+$k$ 后禁止完全相同的 per-expert start vector：
+
+$$
+(s_1,\ldots,s_E)\ne(s_1^k,\ldots,s_E^k),
+$$
+
+并要求后续解的 surrogate makespan 不超过 pool root incumbent 的 $1+\epsilon_s$，重复至
+32 个解或时限。因此相同 width/domain vector 的不同 order 是合法的 diverse plan；报告同时
+保留 width/domain 与完整 schedule signature，不能把 pool 中 32 个解都解释为全局
+$gap_{CP}$ 内的独立证明。每个解再以二维 no-overlap 将固定 surrogate residence interval
+放入对应 domain 的连续 core 区间。相邻 core 使用者形成 runtime dependency；surrogate
+start time 不下沉为主动 idling/release gate。随后用完整 analytical event model（包含
+current cache/refill、LLC/DRAM contention 和 deterministic window）重排，硬件只测前 8 名。
+
+第一版必须分别报告 root CP gap、32 解生成数、lowering 成功数、event ranking、前 8 名实测
+regret、相对 legacy full/one-step gate/fixed controls 的回退、resource-LB gap，以及
+$T_{plan}+T_{execute}$。验收条件为 root gap 不超过 1%（资源有限时可明确放宽到 5%）、
+measured shortlist regret 不超过 5%、三个真实 trace 相对 one-step gate 均不回退超过 2%。
+通过后才扩展到完整 43 层和第二台 Arm；该 solver 始终为离线 paper oracle，不改变
+production quick/full 默认、Plan V2 schema 或 native ABI。
+
+### 6.6 Production cold search 的 native 并行编码
 
 schema-v2 empirical backend 的 cold miss 路径将剪枝后的 `IntervalPlanner`
 搜索原样编码到 C++。Python 只负责解析 profile、生成合法 width/shape 集合并
@@ -5217,3 +5352,6 @@ planning 对未命中点执行原解析公式；首次调用结束后在文件�
 | 2026-08-21 | v1.31 | 新增 supported runtime control `FUSED_CPP_MOE_PLANNER_FIXED_THREADS`：正整数值强制 routed-expert production planner 只生成对应 homogeneous LPT greedy shape，未设置或 `0` 保持多宽度 C++ quick。`8` 在 Arm-codex 80C 上对应 `10x8T`，用于与当前 quick 做线上回退和 A/B；Plan V2、full offline、synthetic shared expert 和默认行为不变。captured DSV4、dense `T_iso` disk hit、无 route cache 的 public `plan_for_dispatch()` 1000 次 median/P90 为 `2.698/2.708 ms`，内部 fixed planner 约 `0.257 ms`，shape=`10x8T`、backend=`cpp_fixed_quick`。 |
 | 2026-08-31 | v1.32 | 仅更新实验闭合状态，不改变公式、候选、剪枝、schema、ABI 或默认 runtime。AmazonC5192Cores NUMA1 的五进程独立 packed-B repeated-scan probe 得到 private-L2 retention knee `0.662x`、miss floor `17.37%`、2/4 MiB miss `68.03/79.80%`；替换 transferred prior 后 isolated MAPE、contention MAPE/P90、max shape regret 为 `7.96/10.85/16.08/9.21%`，相对旧 prior 仅改善 contention P90 `0.89` 点且 regret 不变。完整 high-skew TopK trace 上模型选择的 16T LPT 为 `22.857 ms`，候选集中已有的 8T reverse-even 为 `17.282 ms`，配对降低 `24.43%`，manual candidate 的预测/实测 rank Spearman 仅 `0.692`；因此当前主要缺口是 wide-team concurrent pressure 与 temporal-order ranking，而非 retention 或候选覆盖。三条 captured trace 的独立 W13/W2 two-stage 最优均为 `8T/4T`，但仍比 best whole-expert 慢 `1.93%--5.87%`，故保留为 conditional candidate/control。完整记录见 `optimizations/fused_moe_sve/results/amazon_192c_paper_closure_20260831.md`。 |
 | 2026-09-01 | v1.33 | analytical full 增加仅作用于未显式 shape 的离线搜索的 one-step width uncertainty gate：先求 expected-makespan winner；若其最大宽度大于 8T，则在与 winner 系统误差区间重叠的候选中把最大宽度最多降低一个已校准档，并在该档内仍最小化 expected makespan。该规则不使用 active working set 作主 tie-break，不改变 quick/request path、候选、剪枝、Plan V2、cache identity、kernel 或 empirical/native planner。正式 runner 固定 commit `b219627`、Arm-codex NUMA3 80C、三份完整 2048-token TopK6 trace、5 warmup/31 randomized paired runs/4 rotating weight copies；原 full 到 gate 为 high-skew `42.091->36.525 ms`（paired `+15.27%`）、median `40.643->34.433 ms`（`+17.95%`）、uniformish `33.859->31.987 ms`（`+5.69%`）。相对 measured candidate set 的 regret 为 `0/0.26/0%`，全部低于 5%，输出逐位一致；run id 为 `20260901T080803Z-arm_codex_internal-arm_high_skew_closure-b2196270211b`。 |
+| 2026-09-01 | v1.34 | 在既有 cold-phase CP-SAT 上增加离线 LLC-domain shortlist master：只搜索 whole-expert width、single-domain placement 和 start/order，window 继续由确定性 policy 给出；当前 one-step full plan 的 width vector 先投影成 domain-feasible incumbent/hint。独立 60 s proof 输出完整 surrogate UB/LB/gap；10 s pool root 固定非热点 interval、保留 top-16 route expert repair，并以 start-vector forbidden assignment 生成 32 个 order/width/domain 异构 schedule。二维 contiguous-core lowering 不下沉 modeled release time，完整 analytical event model 重排后只实测前 8 名。Arm 80C 三 trace 均得到 32/32 lowering、proof gap `1.507%--2.345%`、最大 pool regret `0.330%`；high-skew/uniformish 相对 one-step 为 `-10.380%/-0.638%`，但 median 回退 `+2.388%`，未过 2% gate，故不扩展 43 层/第二 Arm。runner 同时输出 calibrated resource relaxation、fixed/legacy/one-step controls 和 `T_plan+T_execute`。该路径为 Lab/offline paper oracle，不改变 production planner、Plan V2、kernel、schema、ABI 或默认 dispatch；正式 committed runner 尚待代码 review/commit 后重跑。 |
+| 2026-09-01 | v1.35 | 将 production quick planner 的原始 homogeneous LPT greedy strict DAG 作为 exact fixed branch 加入离线搜索域，与 domain-aware SAT strict 分支组成不混合的 plan-level union；greedy 原始 width、core placement、order 和 dependencies 不做 domain projection。两分支分别用 cold-phase CP-SAT 求 UB/LB 后取最小，因而在相同 surrogate 下严格不劣于 greedy。第一阶段只测 union proof 产生的同一个 60 s SAT incumbent 与一个 pure greedy fixed plan，不启用 tail pool、tail repartition、stealing 或 resize；one-step projection仅作为 domain search hint。Arm 80C 三条 2048-token TopK6 trace 的 union gap 为 `2.071%--2.129%`，全部选择 SAT；31-run paired SAT 相对 greedy 的 high/median/uniformish 中位收益为 `2.21%/12.49%/7.27%`，三条均 `31/31` 获胜。该结果只覆盖 fixed strict plan class；SAT 相对 one-step strict control 在 uniformish 仍回退 `3.89%`。动态尾池留作第二阶段在线 recourse，不改变 production 默认、Plan V2、kernel、schema 或 ABI。 |
+| 2026-09-01 | v1.36 | analytical heavy event model 增加 placement-aware LLC path：planner 将 logical core interval 映射到真实 CPU IDs；event 按 owner-thread 比例拆分每个 task 的 LLC working set/demand，逐 domain 计算 capacity miss、service pressure 和 dilation，再施加 rank-level LLC fabric cap；task spill fraction 只影响自身 spillable DRAM，DRAM 仍为 NUMA-rank global，跨 domain gang 取最慢 domain dilation。旧 unplaced API、无-topology fallback、empirical/quick planner、Plan V2、runtime 和 kernel 保持不变。Arm 80C strict proof-plan 的 event 预测 SAT 相对 greedy 为 high/median/uniformish `-2.47/-2.98/-6.20%`，实测为 `-4.83/-10.92/+1.89%`；high/median 排序方向闭合，但 uniformish 仅 `4/31` 获胜并回退，证明剩余主要缺口是 wide-team concurrent pressure/width scaling，而非 LLC placement 丢失。placement-aware full planning 时间相对旧版约增加 `1.7--1.9x`，该实验未通过三 trace no-regression gate。 |

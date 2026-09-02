@@ -93,6 +93,31 @@ all three structured result files were copied locally and retained remotely.
 The result summary is
 [`../results/arm_codex_80c_high_skew_planner_gate_20260901.md`](../results/arm_codex_80c_high_skew_planner_gate_20260901.md).
 
+The domain-aware cold-phase CP-SAT follow-up is declared in
+`suites/arm_cp_sat_shortlist.json`. It runs an independent 60-second proof
+solve, a 32-plan repair pool, complete event-model reranking, and eight measured
+plans per trace. Prefinal direct-sync results pass the 5% proof-gap and 5%
+shortlist-regret gates, but median skew regresses 2.388% versus the one-step
+control and fails the 2% no-regression gate. They are recorded in
+[`../results/arm_codex_80c_cp_sat_shortlist_prefinal_20260901.md`](../results/arm_codex_80c_cp_sat_shortlist_prefinal_20260901.md).
+Because those runs used an uncommitted tree, rerun this suite through
+`run_matrix.py` after review and commit before treating it as a paper artifact.
+
+The strict-only decomposition is declared in `suites/arm_strict_greedy_sat.json`.
+It retains the original `plan_quick()` homogeneous-LPT plan as an exact fixed
+branch of the CP-SAT union and compares one SAT fixed plan with one pure-greedy
+fixed plan. Dynamic tail pool, repartition, stealing, and resize are disabled.
+Prefinal direct-sync runs selected SAT on all three traces with 2.071--2.129%
+union gap and improved paired median latency by 2.21%, 12.49%, and 7.27%; all
+three won 31/31 pairs. See
+[`../results/arm_codex_80c_strict_greedy_sat_prefinal_20260901.md`](../results/arm_codex_80c_strict_greedy_sat_prefinal_20260901.md).
+
+The analytical heavy planner now has an additive placement-aware LLC event
+path. Prefinal reruns correct greedy-versus-SAT ranking on high and median skew,
+but uniformish regresses 1.89% and wins only 4/31 pairs; full-search time also
+increases about 1.7--1.9x. The feature therefore remains experimental. See
+[`../results/arm_codex_80c_placement_aware_cost_model_20260901.md`](../results/arm_codex_80c_placement_aware_cost_model_20260901.md).
+
 The exact-M and direct-route cases use the paper's TP4-oriented
 `H=4096,F=512` path. The explicit fused/unfused Lab comparator was repaired in
 commit `266da2c`: both paths now use the production FEXPA-plus-quadratic SiLU

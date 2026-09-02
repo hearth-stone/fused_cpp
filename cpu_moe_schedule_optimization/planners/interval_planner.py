@@ -545,6 +545,19 @@ class IntervalPlanner:
         return tasks
 
     def _score(self, tasks) -> float:
+        placed = getattr(self.model, "dag_makespan_placed", None)
+        if self.stage is None and callable(placed):
+            return placed(
+                [
+                    (
+                        routes,
+                        threads,
+                        self.cpu_ids[core_begin : core_begin + threads],
+                        deps,
+                    )
+                    for _, routes, core_begin, threads, deps in tasks
+                ]
+            )
         return self._dag_makespan([(routes, threads, deps) for _, routes, _, threads, deps in tasks])
 
     def _task_time(self, routes: int, threads: int) -> float:

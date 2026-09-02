@@ -101,6 +101,20 @@ def _model(
     )
 
 
+def test_task_stage_phases_exposes_isolated_stage_time_and_packed_b_bytes() -> None:
+    model = _model()
+    prediction = model.predict_expert(12, 2)
+
+    assert model.task_stage_phases("w13", 12, 2) == (
+        (prediction.w13_ns, prediction.w13_demand.stage_bytes),
+    )
+    assert model.task_stage_phases("w2", 12, 2) == (
+        (prediction.w2_ns, prediction.w2_demand.stage_bytes),
+    )
+    with pytest.raises(ValueError, match="unsupported stage"):
+        model.task_stage_phases("merge", 12, 2)
+
+
 def _runtime_weights(experts: int = 8) -> PreparedBF16TiledFusedMoEWeights:
     import torch
 
@@ -404,6 +418,90 @@ def test_topology_aware_llc_service_sums_domains_then_applies_rank_cap() -> None
     model = _model(calibration)
     assert model._llc_miss_fraction(10 * 1024 * 1024, active_cpu_ids=(0, 1)) > 0.0
     assert model._llc_miss_fraction(10 * 1024 * 1024, active_cpu_ids=(0, 4)) == 0.0
+
+
+def _placement_sensitive_model() -> AnalyticMoeCostModel:
+    fast = _curve(1e15, 8e15, 8)
+    base = replace(
+        _calibration(),
+        caches=replace(
+            _calibration().caches,
+            llc_bytes_per_rank=64 * 1024,
+            llc_effective_fraction=0.5,
+        ),
+        matrix_flops=fast,
+        gemm_core_flops=fast,
+        frontend_instructions=fast,
+        l1_bytes=fast,
+        l2_bytes=fast,
+        llc_bytes=_curve(1e8, 4e8, 8),
+        dram_bytes=fast,
+        epilogue_elements=fast,
+        rank_cpu_ids=tuple(range(8)),
+    )
+    domain_curve = _curve(1e8, 2e8, 2)
+    calibration = replace(
+        base,
+        llc_domains=(
+            LlcDomainCalibration("0", (0, 1, 2, 3), 32 * 1024, domain_curve),
+            LlcDomainCalibration("1", (4, 5, 6, 7), 32 * 1024, domain_curve),
+        ),
+    )
+    return _model(calibration)
+
+
+def test_placed_dag_models_llc_domains_and_symmetric_swap() -> None:
+    model = _placement_sensitive_model()
+    same_domain = model.dag_makespan_placed(
+        [(48, 2, (0, 1), ()), (48, 2, (2, 3), ())]
+    )
+    split_domains = model.dag_makespan_placed(
+        [(48, 2, (0, 1), ()), (48, 2, (4, 5), ())]
+    )
+    swapped_domains = model.dag_makespan_placed(
+        [(48, 2, (4, 5), ()), (48, 2, (0, 1), ())]
+    )
+
+    assert split_domains < same_domain
+    assert swapped_domains == pytest.approx(split_domains)
+
+
+def test_placed_dag_rejects_unordered_overlapping_cpu_teams() -> None:
+    model = _placement_sensitive_model()
+
+    with pytest.raises(ValueError, match="overlapping placed tasks"):
+        model.dag_makespan_placed(
+            [(48, 2, (0, 1), ()), (48, 2, (1, 2), ())]
+        )
+
+
+def test_interval_planner_scores_analytic_tasks_with_physical_placement() -> None:
+    model = _placement_sensitive_model()
+    planner = IntervalPlanner(
+        model,
+        num_cores=8,
+        cpu_ids=tuple(range(8)),
+        shapes=((4, 4),),
+        native_cold_planner=False,
+    )
+    tasks = [
+        (0, 48, 0, 2, []),
+        (1, 48, 4, 2, []),
+    ]
+
+    expected = model.dag_makespan_placed(
+        [(48, 2, (0, 1), ()), (48, 2, (4, 5), ())]
+    )
+    assert planner._score(tasks) == pytest.approx(expected)
+
+
+def test_placed_dag_without_topology_preserves_rank_aggregate_fallback() -> None:
+    model = _model()
+    tasks = [(48, 2, (0, 1), ()), (48, 2, (2, 3), ())]
+
+    assert model.dag_makespan_placed(tasks) == pytest.approx(
+        model.dag_makespan([(48, 2, ()), (48, 2, ())])
+    )
 
 
 def test_calibration_builder_attaches_explicit_and_symmetric_llc_domains() -> None:

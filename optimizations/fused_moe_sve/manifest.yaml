@@ -2080,6 +2080,150 @@ features:
       --threads-per-team 4 --schedule dynamic --split-factors 1,2,5,10
       --cpu-start 0 --numa-node 0 --warmup 2 --runs 7 --repeats 3
 
+  - id: planner.domain_cold_phase_shortlist
+    part: planner
+    status: experimental
+    implementation: >-
+      cpu_moe_schedule_optimization/planners/cold_phase_domain_oracle.py and
+      optimizations/fused_moe_sve/benchmarks/bench_high_skew_planner_closure.py
+    hypothesis: >-
+      Extending the existing cold-phase CP-SAT master with whole-expert width,
+      LLC-domain, and temporal-order choices, then reranking 32 diverse
+      schedule solutions with the complete analytical event model, can put
+      the event-ranked winner within 5 percent of the measured best among the
+      first eight without regressing any of three captured traces by more than
+      2 percent versus the current one-step gate.
+    depends_on:
+      - planner.analytic_full_one_step_width_gate
+      - planner.analytic_resource_vectors
+    conflicts_with: []
+    owner: zhangxu
+    opened: 2026-09-01
+    decision_by: 2026-09-30
+    next_decision: >-
+      Close holdout-safe incumbent-versus-CP family selection or correct the
+      event model's cross-family placement/contention ranking, then rerun the
+      same three traces. Expand to 43 layers and a second Arm only after the
+      2 percent no-regression gate passes.
+    adoption_gate: >-
+      Root CP-SAT gap at most 1 percent, or explicitly accepted 5 percent;
+      measured shortlist regret at most 5 percent; no trace more than 2 percent
+      slower than the one-step gate; report T_plan plus T_execute and the
+      calibrated resource lower bound.
+    correctness: >-
+      .venv/bin/python -m pytest -q
+      tests/test_moe_cold_phase_domain_oracle.py
+      tests/test_moe_cold_phase_cp_sat_oracle.py
+      tests/test_moe_resource_lower_bound.py
+      tests/test_moe_analytic_model.py
+    benchmark: >-
+      .venv/bin/python
+      optimizations/fused_moe_sve/paper_experiments/run_matrix.py
+      --machine
+      optimizations/fused_moe_sve/paper_experiments/machines/arm_codex_internal.json
+      --suite
+      optimizations/fused_moe_sve/paper_experiments/suites/arm_cp_sat_shortlist.json
+    result: >-
+      Prefinal uncommitted Arm 80C runs generated and lowered 32/32 schedules
+      on all three traces. Proof gap was 1.507--2.345 percent and maximum
+      measured pool regret was 0.330 percent. High-skew and uniformish improved
+      over the one-step gate by 10.380 and 0.638 percent, but median regressed
+      2.388 percent and failed the 2 percent adoption gate. Do not expand to 43
+      layers or a second Arm before closing cross-family selection. See
+      results/arm_codex_80c_cp_sat_shortlist_prefinal_20260901.md.
+
+  - id: planner.strict_greedy_sat_union
+    part: planner
+    status: experimental
+    implementation: >-
+      cpu_moe_schedule_optimization/planners/cold_phase_domain_oracle.py,
+      optimizations/fused_moe_sve/benchmarks/bench_high_skew_planner_closure.py,
+      and paper_experiments/suites/arm_strict_greedy_sat.json
+    hypothesis: >-
+      Adding the original homogeneous-LPT quick greedy plan as an exact fixed
+      strict branch makes the offline surrogate search provably no worse than
+      greedy, while one domain-aware SAT fixed plan improves measured latency
+      on all three captured traces without any dynamic tail execution.
+    depends_on:
+      - planner.domain_cold_phase_shortlist
+      - planner.quick_homogeneous_heap_lpt
+    conflicts_with:
+      - dispatch.dynamic_short_expert_pool
+    owner: zhangxu
+    opened: 2026-09-01
+    decision_by: 2026-09-30
+    next_decision: >-
+      Freeze and commit the strict-only runner result, then decide whether the
+      second-stage dynamic tail pool adds expected-time benefit on top of the
+      SAT base plan using a 2x2 greedy/SAT by strict/pool experiment.
+    adoption_gate: >-
+      Union gap at most 5 percent; exact greedy branch retained without domain
+      projection; no tail-pool or repartition tasks; and SAT wins at least 30
+      of 31 paired runs on every declared trace.
+    correctness: >-
+      .venv/bin/python -m pytest -q
+      tests/test_moe_cold_phase_domain_oracle.py
+      tests/test_moe_cold_phase_cp_sat_oracle.py
+    benchmark: >-
+      .venv/bin/python
+      optimizations/fused_moe_sve/paper_experiments/run_matrix.py
+      --machine
+      optimizations/fused_moe_sve/paper_experiments/machines/arm_codex_internal.json
+      --suite
+      optimizations/fused_moe_sve/paper_experiments/suites/arm_strict_greedy_sat.json
+    result: >-
+      Prefinal direct-sync Arm 80C, 5 warmups, 31 paired runs, four rotating
+      weight copies. Union gap was 2.071--2.129 percent and selected domain SAT
+      on all traces. The measured SAT plan is exactly the proof incumbent. SAT
+      versus pure greedy paired median gains were 2.21, 12.49, and 7.27 percent
+      for high-skew, median, and uniformish; every trace
+      won 31/31 pairs. No tail pool, tail repartition, stealing, or resize was
+      enabled. See results/arm_codex_80c_strict_greedy_sat_prefinal_20260901.md.
+
+  - id: planner.placement_aware_llc_events
+    part: planner
+    status: experimental
+    implementation: >-
+      cpu_moe_schedule_optimization/cost_model/analytic_model.py and
+      cpu_moe_schedule_optimization/planners/interval_planner.py
+    hypothesis: >-
+      Preserving each strict task's physical CPU placement and modeling LLC
+      working set, spill, and injection per calibrated domain should correct
+      greedy-versus-SAT cross-family ranking on all three captured traces.
+    depends_on:
+      - planner.strict_greedy_sat_union
+      - planner.analytic_resource_vectors
+    conflicts_with: []
+    owner: zhangxu
+    opened: 2026-09-01
+    decision_by: 2026-09-30
+    next_decision: >-
+      Model or calibrate wide-team concurrent pressure and width scaling, then
+      rerun the same strict proof-plan traces. Optimize placed event-simulator
+      overhead only after the three-trace ranking gate passes.
+    adoption_gate: >-
+      Preserve old unplaced and no-topology behavior; correct SAT-versus-greedy
+      ranking on all three traces; no measured trace regression; and keep full
+      heavy-planner overhead within 1.25x after optimization.
+    correctness: >-
+      .venv/bin/python -m pytest -q
+      tests/test_moe_analytic_model.py tests/test_moe_cost_model_v2.py
+    benchmark: >-
+      .venv/bin/python
+      optimizations/fused_moe_sve/paper_experiments/run_matrix.py
+      --machine
+      optimizations/fused_moe_sve/paper_experiments/machines/arm_codex_internal.json
+      --suite
+      optimizations/fused_moe_sve/paper_experiments/suites/arm_strict_greedy_sat.json
+    result: >-
+      Prefinal direct-sync Arm 80C. Placement-aware event prediction for SAT
+      versus greedy was -2.47/-2.98/-6.20 percent on high/median/uniformish;
+      measured differences were -4.83/-10.92/+1.89 percent. High and median
+      closed the ranking direction, but uniformish regressed and won only 4/31
+      pairs. Full heavy-planner time increased from roughly 29--51 s to
+      53--84 s. The feature fails its adoption gate; see
+      results/arm_codex_80c_placement_aware_cost_model_20260901.md.
+
 variants:
   - id: sve_static_nsplit
     features: []

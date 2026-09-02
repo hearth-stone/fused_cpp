@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "id": "arm_cp_sat_shortlist",
+  "description": "Arm-codex NUMA3 80-core domain-aware cold-phase CP-SAT shortlist closure.",
+  "machine_ids": ["arm_codex_internal"],
+  "setup": [
+    {
+      "id": "build_extension",
+      "use_affinity": false,
+      "timeout_seconds": 1800,
+      "argv": ["env", "FUSED_CPP_BUILD_MOE_ONLY=1", "FUSED_CPP_SVE_VECTOR_BITS={sve_bits}", "MAX_JOBS={max_jobs}", "{python}", "setup.py", "build_ext", "--inplace", "--force"]
+    },
+    {
+      "id": "focused_correctness",
+      "timeout_seconds": 1200,
+      "argv": ["{python}", "-m", "pytest", "-q", "tests/test_moe_cold_phase_domain_oracle.py", "tests/test_moe_cold_phase_cp_sat_oracle.py", "tests/test_moe_resource_lower_bound.py", "tests/test_moe_analytic_model.py", "tests/test_moe_plan_v2.py", "tests/test_fused_moe_bf16_tiled.py", "-k", "domain_oracle or cold_phase or resource_lower_bound or task_stage_phases or plan_v2_strict or w2_direct_route_store_matches_scatter", "--maxfail=1"]
+    }
+  ],
+  "cases": [
+    {
+      "id": "uniformish_cp_sat_shortlist",
+      "timeout_seconds": 7200,
+      "output_json": true,
+      "argv": ["{python}", "optimizations/fused_moe_sve/benchmarks/bench_high_skew_planner_closure.py", "--route-file", "{uniformish_route}", "--route-layer", "{uniformish_layer}", "--analytic-calibration", "{analytic_calibration}", "--hidden", "4096", "--intermediate", "512", "--experts", "256", "--threads", "80", "--widths", "4,8,16", "--orders", "lpt,reverse_odd,reverse_even", "--cp-sat-shortlist", "32", "--cp-sat-measure", "8", "--cp-sat-root-time", "60", "--cp-sat-next-time", "5", "--cp-sat-gap", "0.01", "--cp-sat-slack", "0.50", "--cp-sat-repair-experts", "16", "--warmup", "5", "--runs", "31", "--weight-copies", "4", "--output", "{remote_output}"]
+    },
+    {
+      "id": "median_cp_sat_shortlist",
+      "timeout_seconds": 7200,
+      "output_json": true,
+      "argv": ["{python}", "optimizations/fused_moe_sve/benchmarks/bench_high_skew_planner_closure.py", "--route-file", "{median_route}", "--route-layer", "{median_layer}", "--analytic-calibration", "{analytic_calibration}", "--hidden", "4096", "--intermediate", "512", "--experts", "256", "--threads", "80", "--widths", "4,8,16", "--orders", "lpt,reverse_odd,reverse_even", "--cp-sat-shortlist", "32", "--cp-sat-measure", "8", "--cp-sat-root-time", "60", "--cp-sat-next-time", "5", "--cp-sat-gap", "0.01", "--cp-sat-slack", "0.50", "--cp-sat-repair-experts", "16", "--warmup", "5", "--runs", "31", "--weight-copies", "4", "--output", "{remote_output}"]
+    },
+    {
+      "id": "high_skew_cp_sat_shortlist",
+      "timeout_seconds": 7200,
+      "output_json": true,
+      "argv": ["{python}", "optimizations/fused_moe_sve/benchmarks/bench_high_skew_planner_closure.py", "--route-file", "{high_skew_route}", "--route-layer", "{high_skew_layer}", "--analytic-calibration", "{analytic_calibration}", "--hidden", "4096", "--intermediate", "512", "--experts", "256", "--threads", "80", "--widths", "4,8,16", "--orders", "lpt,reverse_odd,reverse_even", "--cp-sat-shortlist", "32", "--cp-sat-measure", "8", "--cp-sat-root-time", "60", "--cp-sat-next-time", "5", "--cp-sat-gap", "0.01", "--cp-sat-slack", "0.50", "--cp-sat-repair-experts", "16", "--warmup", "5", "--runs", "31", "--weight-copies", "4", "--output", "{remote_output}"]
+    }
+  ]
+}
