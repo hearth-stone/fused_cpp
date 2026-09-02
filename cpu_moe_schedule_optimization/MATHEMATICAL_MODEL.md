@@ -1657,6 +1657,24 @@ $T_{guard}(P')\le(1-\delta_{min})T_{guard}(P)$才可自动替换incumbent；首�
 $\delta_{min}=2\%$与既有no-regression/actionability gate一致。低于margin的候选可进入
 measured shortlist，但不能驱动VND接受或作为模型证明收益。
 
+**Topology-preserving width neighborhood。** Step 3仍在canonical executable state内搜索，
+不允许先生成fluid assignment再做contiguous lowering。设lane $l=(b,t,Q)$ 完全包含于单一
+LLC domain $d$。若$t/2$属于已校准宽度集合，则split将其替换为
+$(b,t/2,Q_0),(b+t/2,t/2,Q_1)$；若两个物理相邻、同域、等宽lane
+$(b,t,Q_0),(b+t,t,Q_1)$满足$2t$已校准，则merge将其替换为
+$(b,2t,Q')$。$Q_0,Q_1,Q'$只由受影响lane中的expert组成，并用新宽度的isolated-time LPT
+确定性重排。既有跨domain lane可保留，但禁止split、merge或作为width migration端点，因而
+LLC-domain partition和所有未受影响lane保持逐字节不变。
+
+第三类move在同一domain内的现有lane之间迁移一个whole expert，并要求两个lane宽度在有序
+已校准集合中相邻。源、目标lane原有task的相对顺序不变，目标插入点被显式枚举；被迁移task
+在执行时采用目标lane宽度。任一task从$t$变为$t'$时，必须通过已有确定性policy重新计算
+$(w_{13}(M,t'),w_2(M,t'))$，不得沿用旧宽度窗口。三类move均保持
+$\sum_l t_l=C$、每个active expert恰好一次、strict fixed whole-expert依赖和Plan V2 v2
+执行语义。order-only、width-only及二者候选并集使用相同per-operator预算、canonical hash
+去重、完整placed event scorer、lane guard与2\% actionable gate；该审计不改变production
+planner候选或默认dispatch。
+
 **Placement-aware LLC event state。** 旧 analytical DAG 在 `_score()` 中删除
 `core_begin`，所有 active task 共用 rank-global LLC working set、capacity 和 service；这会
 把“task 分散在两个 LLC domain”与“task 全部挤在一个 domain”错误视为同一状态。当前
@@ -5510,3 +5528,5 @@ planning 对未命中点执行原解析公式；首次调用结束后在文件�
 | 2026-09-03 | v1.41 | 为修复1T长lane的temporal critical-path crossing，analytical runtime overhead增加可选离散`by_width` override；旧profile与未命中width保持原global fixed/route overhead，persisted `T_iso` identity覆盖新字段。独立Arm 80C三态probe以同一任务/placement和31轮随机交错phase trace拟合1T `expert_fixed_ns=147999.019`、`route_ns=10471.803`：all-delayed/wide-only/all-concurrent victim实测`25.491/25.518/26.251 ms`，修正模型为`25.419/25.793/26.621 ms`，误差`-0.28/+1.08/+1.41%`。该参数尚需绑定commit的三条真实trace holdout；在通过前不恢复Step-2 VND。 |
 | 2026-09-03 | v1.42 | commit `e74e187`的冻结v4 holdout显示width-specific overhead只部分修复point ranking：high-skew Spearman从`-0.690`升至`0.357`且旧critical relocation反例消失，但新random 1T swap/relocation仍实测回退`13.59%/3.50%`；median因full shape变为`1x16T+8x8T`后Spearman为`-0.756`，uniformish纯8T分数按设计不变。raw trace证明新反例仍在scheduled compute而非early merge。后续executable decision增加`max(event, (1+uncertainty)*max-lane isolated sum)` guard和2% minimum actionable gain；在已测24候选的离线重放中，high-skew Spearman提高到`0.548`并将13.59%反例判为`-1.016%` robust gain，三trace均无候选达到2%自动接受门槛。该gate待绑定commit正式重跑，不宣称point event排序已完全准确。 |
 | 2026-09-03 | v1.43 | uncertainty-aware executable decision在commit `d51cb0e`正式复验：Arm 80C uniformish/median/high-skew均因best robust gain仅`0.666%/0.872%/0.153%`而保留baseline；相对同轮measured shortlist best的regret为`0.242%/0.578%/0.516%`，全部低于2%，24个候选仍无paired P10为正的稳定改进。high-skew point Spearman相对原v3从`-0.690`改善到`0.690`；median/uniformish为`-0.756/-0.048`，说明亚百分点point ordering仍不可识别，安全选择闭合不能冒充精确排序闭合。冻结v4在正式三态calibration rerun的all-delayed/wide-only/all-concurrent误差为`-2.33/+0.22/+0.61%`；当次重新回归参数有漂移但未用于holdout。Step-2 VND继续关闭，只有robust gain超过action margin的未来邻域才允许自动接受。 |
+| 2026-09-03 | v1.44 | 增加Step-3 topology-preserving width-neighborhood审计框架，不改变production planner。只允许完整位于单一LLC domain内的等分lane split、相邻等宽lane merge和已校准相邻宽度lane间whole-expert migration；已有跨domain lane保持但不能作为width move端点。split/merge仅重排受影响lane，migration保留既有task相对顺序并枚举目标插入点；所有改宽task重新读取确定性stage-window policy。order-only、width-only、combined三种ablation共享canonical去重、placed event score、lane uncertainty guard、2% gate及同轮硬件shortlist。正式三trace结果完成前不进入width-VND/LNS，也不作性能收益结论。 |
+| 2026-09-03 | v1.45 | Step-3 prefinal direct-sync Arm 80C三trace审计完成：uniformish/median的12/16个硬件shortlist均无paired P10为正的稳定候选；high-skew 13个shortlist中两个domain-local lane merge稳定提升`1.436%/1.248%` paired median、`0.262%/0.340%` P10，说明width邻域具有局部实测价值。但模型只预测两者`0.0197%/0.0130%`，反而把预测`+0.110%`、实测`-0.446%`的split排为width第一；median/high-skew combined Spearman为`-0.018/-0.011`。三trace无robust gain达到2%，故全部保留baseline，measured shortlist regret不超过`1.449%`。保留width operators作Lab候选，但在独立校准`1T+1T -> 2T` merge/concurrency transition并完成commit-bound复验前不进入width-VND。完整记录见`optimizations/fused_moe_sve/results/arm_codex_80c_width_neighborhood_audit_prefinal_20260903.md`。 |

@@ -9,17 +9,25 @@ PLANNERS = ROOT / "cpu_moe_schedule_optimization" / "planners"
 sys.path.insert(0, str(PLANNERS))
 
 from executable_plan_neighborhood import (  # noqa: E402
+    ADJACENT_WIDTH_MIGRATION,
     ADJACENT_SWAP,
     CROSS_LANE_RELOCATION,
     CROSS_LANE_SWAP,
     CROSS_LLC_RELOCATION,
+    LANE_MERGE,
+    LANE_SPLIT,
+    ORDER_ONLY_OPERATORS,
     SAME_LANE_INSERTION,
+    WIDTH_ONLY_OPERATORS,
     ExecutablePlanScore,
     critical_expert_scores,
     enumerate_order_only_neighbors,
+    enumerate_width_only_neighbors,
     is_resolvable_improvement,
     placed_tasks,
+    sample_combined_neighborhood,
     sample_order_only_neighborhood,
+    sample_width_only_neighborhood,
     score_executable_plan,
 )
 from executable_plan_state import (  # noqa: E402
@@ -171,3 +179,125 @@ def test_resolvable_improvement_requires_robust_margin() -> None:
         ExecutablePlanScore(95.0, 90.0, 95.0),
         minimum_gain_fraction=0.02,
     )
+
+
+def _isolated_cost(routes: int, threads: int) -> float:
+    return routes * 100.0 / threads
+
+
+def _windows(routes: int, threads: int) -> tuple[int, int]:
+    return (routes + threads, routes + 2 * threads)
+
+
+def test_width_neighbors_preserve_domain_topology_and_refresh_windows() -> None:
+    state = _state()
+    neighbors = list(
+        enumerate_width_only_neighbors(
+            state,
+            allowed_widths=(1, 2, 4),
+            isolated_cost=_isolated_cost,
+            window_selector=_windows,
+        )
+    )
+
+    assert {neighbor.operator for neighbor in neighbors} == set(WIDTH_ONLY_OPERATORS)
+    expected_experts = sorted(task.expert_id for lane in state.lanes for task in lane.tasks)
+    for neighbor in neighbors:
+        assert neighbor.state.thread_cpu_ids == state.thread_cpu_ids
+        assert neighbor.state.llc_domains == state.llc_domains
+        assert neighbor.state.early_merge is False
+        assert sum(neighbor.state.shape) == state.num_threads
+        assert sorted(task.expert_id for lane in neighbor.state.lanes for task in lane.tasks) == expected_experts
+        assert all(len(neighbor.state.lane_domain_ids(index)) == 1 for index in range(len(neighbor.state.lanes)))
+        for lane in neighbor.state.lanes:
+            for task in lane.tasks:
+                if task.expert_id in neighbor.moved_experts:
+                    assert (task.w13_window_tiles, task.w2_window_tiles) == _windows(task.routes, lane.threads)
+        bridge = neighbor.state.to_bridge()
+        assert bridge["execution_mode"] == "strict"
+        assert bridge["task_threads"] == [task[3] for task in neighbor.state.to_planner_tasks()]
+
+
+def test_width_neighbors_have_expected_split_merge_and_migration_shapes() -> None:
+    neighbors = list(
+        enumerate_width_only_neighbors(
+            _state(),
+            allowed_widths=(1, 2, 4),
+            isolated_cost=_isolated_cost,
+            window_selector=_windows,
+        )
+    )
+
+    split_shapes = {neighbor.state.shape for neighbor in neighbors if neighbor.operator == LANE_SPLIT}
+    merge_shapes = {neighbor.state.shape for neighbor in neighbors if neighbor.operator == LANE_MERGE}
+    migrations = [neighbor for neighbor in neighbors if neighbor.operator == ADJACENT_WIDTH_MIGRATION]
+    assert split_shapes == {(1, 1, 1, 1, 1)}
+    assert merge_shapes == {(2, 1, 2)}
+    assert migrations
+    assert all(neighbor.state.shape == _state().shape for neighbor in migrations)
+
+
+def test_width_expert_filter_and_sampling_are_deterministic() -> None:
+    state = _state()
+    kwargs = {
+        "allowed_widths": (1, 2, 4),
+        "isolated_cost": _isolated_cost,
+        "window_selector": _windows,
+        "expert_filter": {7},
+        "per_operator": 3,
+        "seed": 19,
+    }
+    first = sample_width_only_neighborhood(state, **kwargs)
+    second = sample_width_only_neighborhood(state, **kwargs)
+
+    first_hashes = [neighbor.state.canonical_hash() for neighbor in first.neighbors]
+    assert first_hashes == [neighbor.state.canonical_hash() for neighbor in second.neighbors]
+    assert len(first_hashes) == len(set(first_hashes))
+    assert all(7 in neighbor.moved_experts for neighbor in first.neighbors)
+    assert first.proposed == first.unique + first.duplicates
+
+
+def test_combined_sampling_contains_both_operator_families() -> None:
+    sampled = sample_combined_neighborhood(
+        _state(),
+        allowed_widths=(1, 2, 4),
+        isolated_cost=_isolated_cost,
+        window_selector=_windows,
+        expert_filter=None,
+        per_operator=2,
+        seed=23,
+    )
+
+    sampled_operators = {neighbor.operator for neighbor in sampled.neighbors}
+    assert sampled_operators & set(ORDER_ONLY_OPERATORS)
+    assert sampled_operators & set(WIDTH_ONLY_OPERATORS)
+    hashes = [neighbor.state.canonical_hash() for neighbor in sampled.neighbors]
+    assert len(hashes) == len(set(hashes))
+
+
+def test_width_neighbors_preserve_but_never_modify_cross_domain_lanes() -> None:
+    task = ExecutableExpertTask
+    state = ExecutablePlanState(
+        num_threads=4,
+        thread_cpu_ids=(10, 11, 20, 21),
+        lanes=(
+            ExecutableLane(0, 1, (task(0, 8),)),
+            ExecutableLane(1, 2, (task(1, 16), task(2, 4))),
+            ExecutableLane(3, 1, (task(3, 8),)),
+        ),
+        llc_domains=(
+            ExecutableLlcDomain("left", 0, 2),
+            ExecutableLlcDomain("right", 2, 2),
+        ),
+    )
+
+    neighbors = list(
+        enumerate_width_only_neighbors(
+            state,
+            allowed_widths=(1, 2, 4),
+            isolated_cost=_isolated_cost,
+            window_selector=_windows,
+        )
+    )
+
+    assert not neighbors

@@ -1,13 +1,14 @@
-"""Order-only executable neighborhoods for the Step-1 MoE planner audit."""
+"""Executable order and topology-preserving width neighborhoods for MoE audits."""
 
 from __future__ import annotations
 
 import random
 from collections import defaultdict
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from itertools import chain
 
-from executable_plan_state import ExecutableLane, ExecutablePlanState
+from executable_plan_state import ExecutableExpertTask, ExecutableLane, ExecutablePlanState
 
 
 ADJACENT_SWAP = "same_lane_adjacent_swap"
@@ -22,11 +23,19 @@ ORDER_ONLY_OPERATORS = (
     CROSS_LANE_SWAP,
     CROSS_LLC_RELOCATION,
 )
+LANE_SPLIT = "domain_local_lane_split"
+LANE_MERGE = "domain_local_lane_merge"
+ADJACENT_WIDTH_MIGRATION = "domain_local_adjacent_width_migration"
+WIDTH_ONLY_OPERATORS = (
+    LANE_SPLIT,
+    LANE_MERGE,
+    ADJACENT_WIDTH_MIGRATION,
+)
 
 
 @dataclass(frozen=True)
 class ExecutablePlanNeighbor:
-    """One legal order-only move and its resulting executable state."""
+    """One legal local move and its resulting executable state."""
 
     operator: str
     moved_experts: tuple[int, ...]
@@ -129,6 +138,73 @@ def _is_cross_llc(state: ExecutablePlanState, source_lane: int, target_lane: int
     return state.lane_domain_ids(source_lane) != state.lane_domain_ids(target_lane)
 
 
+def _containing_domain_id(state: ExecutablePlanState, lane_index: int) -> str | None:
+    """Return the sole LLC domain containing a lane, rejecting cross-domain lanes."""
+
+    domain_ids = state.lane_domain_ids(lane_index)
+    return domain_ids[0] if len(domain_ids) == 1 else None
+
+
+def _retarget_task(
+    task: ExecutableExpertTask,
+    threads: int,
+    window_selector: Callable[[int, int], tuple[int, int]],
+) -> ExecutableExpertTask:
+    w13_window_tiles, w2_window_tiles = window_selector(task.routes, threads)
+    return ExecutableExpertTask(
+        expert_id=task.expert_id,
+        routes=task.routes,
+        w13_window_tiles=int(w13_window_tiles),
+        w2_window_tiles=int(w2_window_tiles),
+    )
+
+
+def _lpt_assign_tasks(
+    tasks: Sequence[ExecutableExpertTask],
+    lane_widths: Sequence[int],
+    isolated_cost: Callable[[int, int], float],
+    window_selector: Callable[[int, int], tuple[int, int]],
+) -> tuple[tuple[ExecutableExpertTask, ...], ...]:
+    lane_tasks: list[list[ExecutableExpertTask]] = [[] for _ in lane_widths]
+    lane_loads = [0.0 for _ in lane_widths]
+    ordered = sorted(
+        tasks,
+        key=lambda task: (
+            -max(float(isolated_cost(task.routes, width)) for width in lane_widths),
+            task.expert_id,
+        ),
+    )
+    for task in ordered:
+        lane_index = min(
+            range(len(lane_widths)),
+            key=lambda index: (
+                lane_loads[index] + float(isolated_cost(task.routes, lane_widths[index])),
+                lane_loads[index],
+                index,
+            ),
+        )
+        width = lane_widths[lane_index]
+        lane_tasks[lane_index].append(_retarget_task(task, width, window_selector))
+        lane_loads[lane_index] += float(isolated_cost(task.routes, width))
+    return tuple(tuple(tasks_for_lane) for tasks_for_lane in lane_tasks)
+
+
+def _with_replaced_lanes(
+    state: ExecutablePlanState,
+    first_lane: int,
+    remove_count: int,
+    replacement: Sequence[ExecutableLane],
+) -> ExecutablePlanState:
+    lanes = state.lanes[:first_lane] + tuple(replacement) + state.lanes[first_lane + remove_count :]
+    return ExecutablePlanState(
+        num_threads=state.num_threads,
+        thread_cpu_ids=state.thread_cpu_ids,
+        lanes=lanes,
+        llc_domains=state.llc_domains,
+        early_merge=state.early_merge,
+    )
+
+
 def enumerate_order_only_neighbors(
     state: ExecutablePlanState,
     *,
@@ -219,23 +295,134 @@ def enumerate_order_only_neighbors(
                         )
 
 
-def sample_order_only_neighborhood(
+def enumerate_width_only_neighbors(
     state: ExecutablePlanState,
     *,
-    expert_filter: Iterable[int] | None,
+    allowed_widths: Iterable[int],
+    isolated_cost: Callable[[int, int], float],
+    window_selector: Callable[[int, int], tuple[int, int]],
+    expert_filter: Iterable[int] | None = None,
+) -> Iterable[ExecutablePlanNeighbor]:
+    """Yield domain-local split, merge, and adjacent-width migration moves.
+
+    Split and merge deterministically reassign only the tasks on the replaced
+    lanes with isolated-time LPT. Migration preserves the relative order of all
+    existing tasks and enumerates every insertion point on the target lane.
+    Every task whose width changes receives the deterministic stage windows for
+    its new ``(routes, threads)`` pair.
+    """
+
+    widths = tuple(sorted({int(width) for width in allowed_widths}))
+    if not widths or widths[0] <= 0:
+        raise ValueError("allowed_widths must contain positive widths")
+    selected_experts = None if expert_filter is None else frozenset(int(value) for value in expert_filter)
+
+    for lane_index, lane in enumerate(state.lanes):
+        domain_id = _containing_domain_id(state, lane_index)
+        half_width = lane.threads // 2
+        if (
+            domain_id is not None
+            and lane.tasks
+            and lane.threads % 2 == 0
+            and half_width in widths
+            and _selected((task.expert_id for task in lane.tasks), selected_experts)
+        ):
+            assignments = _lpt_assign_tasks(
+                lane.tasks,
+                (half_width, half_width),
+                isolated_cost,
+                window_selector,
+            )
+            replacement = (
+                ExecutableLane(lane.core_begin, half_width, assignments[0]),
+                ExecutableLane(lane.core_begin + half_width, half_width, assignments[1]),
+            )
+            yield ExecutablePlanNeighbor(
+                LANE_SPLIT,
+                tuple(task.expert_id for task in lane.tasks),
+                _with_replaced_lanes(state, lane_index, 1, replacement),
+            )
+
+        for target_lane_index, target_lane in enumerate(state.lanes):
+            if target_lane_index == lane_index:
+                continue
+            target_domain_id = _containing_domain_id(state, target_lane_index)
+            if domain_id is None or target_domain_id != domain_id:
+                continue
+            if lane.threads not in widths or target_lane.threads not in widths:
+                continue
+            width_distance = abs(widths.index(lane.threads) - widths.index(target_lane.threads))
+            if width_distance != 1:
+                continue
+            for source_position, task in enumerate(lane.tasks):
+                if not _selected((task.expert_id,), selected_experts):
+                    continue
+                new_source = list(lane.tasks)
+                new_source.pop(source_position)
+                moved_task = _retarget_task(task, target_lane.threads, window_selector)
+                for target_position in range(len(target_lane.tasks) + 1):
+                    new_target = list(target_lane.tasks)
+                    new_target.insert(target_position, moved_task)
+                    yield ExecutablePlanNeighbor(
+                        ADJACENT_WIDTH_MIGRATION,
+                        (task.expert_id,),
+                        _with_lane_tasks(
+                            state,
+                            {
+                                lane_index: new_source,
+                                target_lane_index: new_target,
+                            },
+                        ),
+                    )
+
+    for lane_index in range(len(state.lanes) - 1):
+        left = state.lanes[lane_index]
+        right = state.lanes[lane_index + 1]
+        domain_id = _containing_domain_id(state, lane_index)
+        merged_width = left.threads + right.threads
+        moved = tuple(task.expert_id for task in (*left.tasks, *right.tasks))
+        if (
+            domain_id is None
+            or _containing_domain_id(state, lane_index + 1) != domain_id
+            or left.threads != right.threads
+            or merged_width not in widths
+            or not _selected(moved, selected_experts)
+        ):
+            continue
+        (merged_tasks,) = _lpt_assign_tasks(
+            (*left.tasks, *right.tasks),
+            (merged_width,),
+            isolated_cost,
+            window_selector,
+        )
+        yield ExecutablePlanNeighbor(
+            LANE_MERGE,
+            moved,
+            _with_replaced_lanes(
+                state,
+                lane_index,
+                2,
+                (ExecutableLane(left.core_begin, merged_width, merged_tasks),),
+            ),
+        )
+
+
+def _sample_neighborhood(
+    state: ExecutablePlanState,
+    neighbors: Iterable[ExecutablePlanNeighbor],
+    *,
+    operators: Sequence[str],
     per_operator: int,
     seed: int,
 ) -> SampledNeighborhood:
-    """Deduplicate all eligible moves and sample equal budgets per operator."""
-
     if per_operator <= 0:
         raise ValueError("per_operator must be positive")
     baseline_hash = state.canonical_hash()
-    proposed = {operator: 0 for operator in ORDER_ONLY_OPERATORS}
-    duplicates = {operator: 0 for operator in ORDER_ONLY_OPERATORS}
-    unique: dict[str, dict[str, ExecutablePlanNeighbor]] = {operator: {} for operator in ORDER_ONLY_OPERATORS}
+    proposed = {operator: 0 for operator in operators}
+    duplicates = {operator: 0 for operator in operators}
+    unique: dict[str, dict[str, ExecutablePlanNeighbor]] = {operator: {} for operator in operators}
     seen_global = {baseline_hash}
-    for neighbor in enumerate_order_only_neighbors(state, expert_filter=expert_filter):
+    for neighbor in neighbors:
         proposed[neighbor.operator] += 1
         state_hash = neighbor.state.canonical_hash()
         if state_hash in seen_global:
@@ -248,7 +435,7 @@ def sample_order_only_neighborhood(
     sampled = []
     sampled_counts = {}
     unique_counts = {}
-    for operator in ORDER_ONLY_OPERATORS:
+    for operator in operators:
         candidates = list(unique[operator].values())
         unique_counts[operator] = len(candidates)
         rng.shuffle(candidates)
@@ -261,6 +448,80 @@ def sample_order_only_neighborhood(
         unique_by_operator=unique_counts,
         duplicate_by_operator=duplicates,
         sampled_by_operator=sampled_counts,
+    )
+
+
+def sample_order_only_neighborhood(
+    state: ExecutablePlanState,
+    *,
+    expert_filter: Iterable[int] | None,
+    per_operator: int,
+    seed: int,
+) -> SampledNeighborhood:
+    """Deduplicate all eligible moves and sample equal budgets per operator."""
+    return _sample_neighborhood(
+        state,
+        enumerate_order_only_neighbors(state, expert_filter=expert_filter),
+        operators=ORDER_ONLY_OPERATORS,
+        per_operator=per_operator,
+        seed=seed,
+    )
+
+
+def sample_width_only_neighborhood(
+    state: ExecutablePlanState,
+    *,
+    allowed_widths: Iterable[int],
+    isolated_cost: Callable[[int, int], float],
+    window_selector: Callable[[int, int], tuple[int, int]],
+    expert_filter: Iterable[int] | None,
+    per_operator: int,
+    seed: int,
+) -> SampledNeighborhood:
+    """Deduplicate and sample equal budgets from the legal width operators."""
+
+    return _sample_neighborhood(
+        state,
+        enumerate_width_only_neighbors(
+            state,
+            allowed_widths=allowed_widths,
+            isolated_cost=isolated_cost,
+            window_selector=window_selector,
+            expert_filter=expert_filter,
+        ),
+        operators=WIDTH_ONLY_OPERATORS,
+        per_operator=per_operator,
+        seed=seed,
+    )
+
+
+def sample_combined_neighborhood(
+    state: ExecutablePlanState,
+    *,
+    allowed_widths: Iterable[int],
+    isolated_cost: Callable[[int, int], float],
+    window_selector: Callable[[int, int], tuple[int, int]],
+    expert_filter: Iterable[int] | None,
+    per_operator: int,
+    seed: int,
+) -> SampledNeighborhood:
+    """Sample the union of order and width moves with global deduplication."""
+
+    return _sample_neighborhood(
+        state,
+        chain(
+            enumerate_order_only_neighbors(state, expert_filter=expert_filter),
+            enumerate_width_only_neighbors(
+                state,
+                allowed_widths=allowed_widths,
+                isolated_cost=isolated_cost,
+                window_selector=window_selector,
+                expert_filter=expert_filter,
+            ),
+        ),
+        operators=(*ORDER_ONLY_OPERATORS, *WIDTH_ONLY_OPERATORS),
+        per_operator=per_operator,
+        seed=seed,
     )
 
 
@@ -306,19 +567,26 @@ def critical_expert_scores(
 
 
 __all__ = [
+    "ADJACENT_WIDTH_MIGRATION",
     "ADJACENT_SWAP",
     "CROSS_LANE_RELOCATION",
     "CROSS_LANE_SWAP",
     "CROSS_LLC_RELOCATION",
+    "LANE_MERGE",
+    "LANE_SPLIT",
     "ORDER_ONLY_OPERATORS",
     "SAME_LANE_INSERTION",
+    "WIDTH_ONLY_OPERATORS",
     "ExecutablePlanNeighbor",
     "ExecutablePlanScore",
     "SampledNeighborhood",
     "critical_expert_scores",
     "enumerate_order_only_neighbors",
+    "enumerate_width_only_neighbors",
     "placed_tasks",
     "is_resolvable_improvement",
     "sample_order_only_neighborhood",
+    "sample_combined_neighborhood",
+    "sample_width_only_neighborhood",
     "score_executable_plan",
 ]

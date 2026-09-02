@@ -7,6 +7,54 @@ baseline:
   status: reference
 
 features:
+  - id: planner.topology_preserving_width_neighborhood_audit
+    part: planner
+    status: experimental
+    implementation: >-
+      cpu_moe_schedule_optimization/planners/executable_plan_neighborhood.py,
+      optimizations/fused_moe_sve/benchmarks/bench_executable_neighborhood_audit.py,
+      and paper_experiments/suites/arm_width_neighborhood_audit.json
+    hypothesis: >-
+      Domain-local lane split, merge, and adjacent-width migration expose
+      stable multi-percent improvements that order-only moves cannot reach,
+      while every candidate remains a directly executable strict Plan V2.
+    depends_on:
+      - planner.executable_search_state
+      - planner.uncertainty_aware_neighborhood_gate
+    conflicts_with:
+      - dispatch.dynamic_short_expert_pool
+    correctness: >-
+      PYTHONPATH=.:src .venv/bin/python -m pytest -q
+      tests/test_moe_executable_plan_neighborhood.py
+      tests/test_moe_executable_plan_state.py tests/test_moe_analytic_model.py
+      tests/test_moe_plan_v2.py
+    benchmark: >-
+      .venv/bin/python optimizations/fused_moe_sve/paper_experiments/run_matrix.py
+      --machine
+      optimizations/fused_moe_sve/paper_experiments/machines/arm_codex_internal_temporal_overhead.json
+      --suite
+      optimizations/fused_moe_sve/paper_experiments/suites/arm_width_neighborhood_audit.json
+    owner: zhangxu
+    opened: 2026-09-03
+    decision_by: 2026-10-03
+    next_decision: >-
+      Calibrate the 1T+1T to 2T merge/concurrency transition independently,
+      then repeat the committed three-trace suite. Do not enter width-VND until
+      the robust scorer ranks and accepts the stable merge opportunity.
+    adoption_gate: >-
+      At least one width candidate with positive paired P10 speedup; no selected
+      plan regression above 2 percent on any trace; measured shortlist regret
+      no larger than 5 percent; and explicit order-only, width-only, and
+      combined ablations under equal per-operator budgets.
+    result: >-
+      A prefinal direct-sync Arm 80C run found no stable uniformish or median
+      candidate, but two high-skew domain-local lane merges improved paired
+      median by 1.436 and 1.248 percent with positive 0.262 and 0.340 percent
+      P10. All guarded decisions retained baseline and shortlist regret stayed
+      at or below 1.449 percent. Point ranking remains inaccurate: the model
+      ranked a regressing split ahead of both stable merges. See
+      results/arm_codex_80c_width_neighborhood_audit_prefinal_20260903.md.
+
   - id: planner.uncertainty_aware_neighborhood_gate
     part: planner
     status: experimental

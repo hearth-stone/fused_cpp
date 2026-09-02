@@ -112,6 +112,14 @@ union gap and improved paired median latency by 2.21%, 12.49%, and 7.27%; all
 three won 31/31 pairs. See
 [`../results/arm_codex_80c_strict_greedy_sat_prefinal_20260901.md`](../results/arm_codex_80c_strict_greedy_sat_prefinal_20260901.md).
 
+The topology-preserving width-neighborhood audit is declared in
+`suites/arm_width_neighborhood_audit.json`. It evaluates order-only,
+domain-local width-only, and their candidate union from the same canonical
+strict Plan V2 state, using equal per-operator budgets and one deduplicated
+hardware shortlist. The first direct-sync development run is recorded in
+[`../results/arm_codex_80c_width_neighborhood_audit_prefinal_20260903.md`](../results/arm_codex_80c_width_neighborhood_audit_prefinal_20260903.md);
+rerun after commit before treating it as a paper artifact.
+
 The analytical heavy planner now has an additive placement-aware LLC event
 path. Prefinal reruns correct greedy-versus-SAT ranking on high and median skew,
 but uniformish regresses 1.89% and wins only 4/31 pairs; full-search time also

@@ -141,15 +141,24 @@ Temporal-ranking remediation in progress before this gate may be reconsidered:
 
 ### Step 3: topology-preserving width neighborhoods
 
-- [ ] Add domain-local lane split/merge moves such as `16 -> 8+8`,
+- [x] Add domain-local lane split/merge moves such as `16 -> 8+8`,
   `8 -> 4+4`, and their inverses. Reassign only experts on affected lanes and
-  maintain the exact 40-core domain partition throughout the move.
-- [ ] Add adjacent-width expert migration through existing lanes before
+  maintain the exact 40-core domain partition throughout the move. Existing
+  cross-domain incumbent lanes are preserved but cannot be width-move endpoints.
+- [x] Add adjacent-width expert migration through existing lanes before
   permitting arbitrary per-expert core intervals. Every candidate must remain
-  directly executable without fluid-to-contiguous lowering.
-- [ ] Measure order-only, width-only, and combined ablations. Retain width
+  directly executable without fluid-to-contiguous lowering. Changed-width
+  tasks refresh deterministic W13/W2 windows before Plan V2 lowering.
+- [x] Measure order-only, width-only, and combined ablations. Retain width
   moves only when they improve held-out plan regret rather than just expanding
-  the search space.
+  the search space. The prefinal Arm 80C three-trace run found two stable
+  high-skew lane merges (`+1.436%/+1.248%` paired median,
+  `+0.262%/+0.340%` P10) but no stable uniformish/median candidate. Keep the
+  operators in Lab, but do not enter width-VND: the model ranked a regressing
+  split above both merges and no robust prediction crossed 2%. Rerun the
+  committed `paper_experiments/suites/arm_width_neighborhood_audit.json` after
+  calibrating the `1T+1T -> 2T` merge/concurrency transition. See
+  `results/arm_codex_80c_width_neighborhood_audit_prefinal_20260903.md`.
 
 ### Step 4: make event-guided search affordable
 

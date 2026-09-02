@@ -10,6 +10,8 @@ import random
 import statistics
 import sys
 import time
+from collections import Counter
+from math import ceil
 from pathlib import Path
 
 import torch
@@ -28,10 +30,13 @@ sys.path[:0] = [
 from analytic_model import AnalyticMoeCostModel  # noqa: E402
 from executable_plan_neighborhood import (  # noqa: E402
     ORDER_ONLY_OPERATORS,
+    WIDTH_ONLY_OPERATORS,
     critical_expert_scores,
     is_resolvable_improvement,
     placed_tasks,
+    sample_combined_neighborhood,
     sample_order_only_neighborhood,
+    sample_width_only_neighborhood,
     score_executable_plan,
 )
 from executable_plan_state import ExecutablePlanState  # noqa: E402
@@ -63,6 +68,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--threads", type=int, default=80)
     parser.add_argument("--critical-experts", type=int, default=32)
     parser.add_argument("--neighbors-per-operator", type=int, default=64)
+    parser.add_argument(
+        "--neighborhood-mode",
+        choices=("order", "width", "combined"),
+        default="order",
+    )
     parser.add_argument("--event-top-per-strategy", type=int, default=4)
     parser.add_argument("--minimum-actionable-gain-pct", type=float, default=2.0)
     parser.add_argument("--warmup", type=int, default=5)
@@ -99,20 +109,69 @@ def _full_strict_result(
     return result, (time.perf_counter_ns() - begin) / 1.0e6
 
 
+def _window_geometry(
+    state: ExecutablePlanState,
+    *,
+    hidden: int,
+    intermediate: int,
+    backend_n_tile: int,
+) -> list[dict[str, int]]:
+    w13_tiles = 2 * intermediate // backend_n_tile
+    w2_tiles = hidden // backend_n_tile
+    counts = Counter(
+        (lane.threads, task.w13_window_tiles, task.w2_window_tiles)
+        for lane in state.lanes
+        for task in lane.tasks
+    )
+    return [
+        {
+            "tasks": task_count,
+            "threads": threads,
+            "w13_window_tiles": w13_window,
+            "w2_window_tiles": w2_window,
+            "w13_ranges": 1 if w13_window == 0 else ceil(w13_tiles / (threads * w13_window)),
+            "w2_ranges": 1 if w2_window == 0 else ceil(w2_tiles / (threads * w2_window)),
+        }
+        for (threads, w13_window, w2_window), task_count in sorted(counts.items())
+    ]
+
+
 def _score_neighborhood(
     model: AnalyticMoeCostModel,
     state: ExecutablePlanState,
     *,
+    interval,
+    neighborhood_mode: str,
     expert_ids: list[int],
     per_operator: int,
     seed: int,
 ) -> tuple[dict[str, object], dict[str, ExecutablePlanState]]:
-    sampled = sample_order_only_neighborhood(
-        state,
-        expert_filter=expert_ids,
-        per_operator=per_operator,
-        seed=seed,
-    )
+    policy = interval._stage_window_policy()
+
+    def window_selector(routes: int, threads: int) -> tuple[int, int]:
+        return (0, 0) if policy is None else policy.select(routes, threads)
+
+    sample_kwargs = {
+        "expert_filter": expert_ids,
+        "per_operator": per_operator,
+        "seed": seed,
+    }
+    if neighborhood_mode == "order":
+        sampled = sample_order_only_neighborhood(state, **sample_kwargs)
+        operators = ORDER_ONLY_OPERATORS
+    else:
+        width_kwargs = {
+            "allowed_widths": interval.widths,
+            "isolated_cost": model.T_iso,
+            "window_selector": window_selector,
+            **sample_kwargs,
+        }
+        if neighborhood_mode == "width":
+            sampled = sample_width_only_neighborhood(state, **width_kwargs)
+            operators = WIDTH_ONLY_OPERATORS
+        else:
+            sampled = sample_combined_neighborhood(state, **width_kwargs)
+            operators = (*ORDER_ONLY_OPERATORS, *WIDTH_ONLY_OPERATORS)
     baseline_score = score_executable_plan(model, state)
     scored = []
     states = {}
@@ -136,7 +195,7 @@ def _score_neighborhood(
     score_wall_s = (time.perf_counter_ns() - begin) / 1.0e9
     scored.sort(key=lambda item: (float(item["event_ns"]), str(item["state_hash"])))
     operator_summary = {}
-    for operator in ORDER_ONLY_OPERATORS:
+    for operator in operators:
         rows = [item for item in scored if item["operator"] == operator]
         operator_summary[operator] = {
             "proposed": sampled.proposed_by_operator[operator],
@@ -175,6 +234,23 @@ def _score_neighborhood(
         ),
         "operators": operator_summary,
         "scored": scored,
+    }
+    ablation_operators = {
+        "order_only": frozenset(ORDER_ONLY_OPERATORS),
+        "width_only": frozenset(WIDTH_ONLY_OPERATORS),
+    }
+    if neighborhood_mode == "combined":
+        ablation_operators["combined"] = frozenset(operators)
+    report["ablations"] = {
+        name: {
+            "sampled": len(rows := [item for item in scored if item["operator"] in selected_operators]),
+            "event_improving": sum(float(item["event_gain_pct"]) > 0.0 for item in rows),
+            "best_event_gain_pct": max((float(item["event_gain_pct"]) for item in rows), default=None),
+            "best_robust_gain_pct": max((float(item["robust_gain_pct"]) for item in rows), default=None),
+            "ordered_state_hashes": [str(item["state_hash"]) for item in rows],
+        }
+        for name, selected_operators in ablation_operators.items()
+        if any(item["operator"] in selected_operators for item in scored)
     }
     return report, states
 
@@ -318,12 +394,14 @@ def main() -> int:
         search_mode="full",
         cache_plans=False,
     )
+    interval = planned.interval_planners[0]
     full_result, full_plan_ms = _full_strict_result(planned, counts, topk_ids)
     llc_domains = tuple((domain.domain_id, domain.cpu_ids) for domain in model.calibration.llc_domains)
     baseline = ExecutablePlanState.from_planner_result(
         full_result,
         llc_domains=llc_domains,
     )
+    backend_n_tile = int(model.policy.backend_n_tile)
     explanation = model.explain_dag_placed(placed_tasks(baseline))
     scores = critical_expert_scores(baseline, explanation)
     budget = min(args.critical_experts, len(scores))
@@ -339,6 +417,8 @@ def main() -> int:
         report, states = _score_neighborhood(
             model,
             baseline,
+            interval=interval,
+            neighborhood_mode=args.neighborhood_mode,
             expert_ids=expert_ids,
             per_operator=args.neighbors_per_operator,
             seed=args.seed ^ seed_delta,
@@ -348,6 +428,8 @@ def main() -> int:
 
     baseline_score = score_executable_plan(model, baseline)
     decision_rows = [(strategy, row) for strategy, report in reports.items() for row in report["scored"]]
+    if not decision_rows:
+        raise RuntimeError(f"no legal {args.neighborhood_mode} neighbors were generated")
     best_strategy, best_row = min(
         decision_rows,
         key=lambda item: (
@@ -372,21 +454,83 @@ def main() -> int:
         "resolvable": accepted,
     }
 
+    ablation_decisions = {}
+    ablation_names = sorted(
+        {name for report in reports.values() for name in report["ablations"]}
+    )
+    for ablation_name in ablation_names:
+        allowed_hashes = {
+            state_hash
+            for report in reports.values()
+            for state_hash in report["ablations"].get(ablation_name, {}).get("ordered_state_hashes", [])
+        }
+        ablation_rows = [
+            (strategy, row)
+            for strategy, report in reports.items()
+            for row in report["scored"]
+            if row["state_hash"] in allowed_hashes
+        ]
+        if not ablation_rows:
+            continue
+        ablation_strategy, ablation_row = min(
+            ablation_rows,
+            key=lambda item: (float(item[1]["robust_ns"]), str(item[1]["state_hash"])),
+        )
+        ablation_hash = str(ablation_row["state_hash"])
+        ablation_score = score_executable_plan(model, all_states[ablation_hash])
+        ablation_accepted = is_resolvable_improvement(
+            baseline_score,
+            ablation_score,
+            minimum_gain_fraction=args.minimum_actionable_gain_pct / 100.0,
+        )
+        ablation_decisions[ablation_name] = {
+            "selected": ablation_hash if ablation_accepted else "baseline",
+            "candidate_strategy": ablation_strategy,
+            "candidate_state_hash": ablation_hash,
+            "candidate_event_gain_pct": float(ablation_row["event_gain_pct"]),
+            "candidate_robust_gain_pct": float(ablation_row["robust_gain_pct"]),
+            "resolvable": ablation_accepted,
+        }
+
     selected_hashes = []
     selected_sources: dict[str, list[str]] = {}
     for strategy, report in reports.items():
-        for row in report["scored"][: args.event_top_per_strategy]:
-            state_hash = str(row["state_hash"])
-            selected_sources.setdefault(state_hash, []).append(strategy)
-            if state_hash not in selected_hashes:
-                selected_hashes.append(state_hash)
+        for ablation_name, ablation in report["ablations"].items():
+            for state_hash in ablation["ordered_state_hashes"][: args.event_top_per_strategy]:
+                selected_sources.setdefault(state_hash, []).append(f"{strategy}:{ablation_name}")
+                if state_hash not in selected_hashes:
+                    selected_hashes.append(state_hash)
     if accepted and best_state_hash not in selected_hashes:
         selected_hashes.append(best_state_hash)
+    for ablation_name, ablation_decision in ablation_decisions.items():
+        candidate_hash = str(ablation_decision["candidate_state_hash"])
+        selected_sources.setdefault(candidate_hash, []).append(f"decision:{ablation_name}")
+        if candidate_hash not in selected_hashes:
+            selected_hashes.append(candidate_hash)
 
     hardware = None
     if args.measure_hardware:
         hardware = _hardware_measurement(args, topk_ids, all_states, selected_hashes)
         hardware_by_hash = {str(item["state_hash"]): item for item in hardware["candidates"]}
+        scored_by_hash = {
+            str(row["state_hash"]): row
+            for report in reports.values()
+            for row in report["scored"]
+        }
+        for state_hash, item in hardware_by_hash.items():
+            scored_row = scored_by_hash[state_hash]
+            item["operator"] = scored_row["operator"]
+            item["moved_experts"] = scored_row["moved_experts"]
+            item["event_gain_pct"] = scored_row["event_gain_pct"]
+            item["robust_gain_pct"] = scored_row["robust_gain_pct"]
+            item["sources"] = selected_sources[state_hash]
+            item["shape"] = list(all_states[state_hash].shape)
+            item["window_geometry"] = _window_geometry(
+                all_states[state_hash],
+                hidden=args.hidden,
+                intermediate=args.intermediate,
+                backend_n_tile=backend_n_tile,
+            )
         event_values = []
         measured_values = []
         for state_hash in selected_hashes:
@@ -410,6 +554,28 @@ def main() -> int:
         decision["measured_selected_ms"] = selected_median_ms
         decision["measured_shortlist_best_ms"] = shortlist_best_ms
         decision["measured_shortlist_regret_pct"] = 100.0 * (selected_median_ms / shortlist_best_ms - 1.0)
+        for ablation_name, ablation_decision in ablation_decisions.items():
+            measured_hashes = {
+                state_hash
+                for report in reports.values()
+                for state_hash in report["ablations"].get(ablation_name, {}).get("ordered_state_hashes", [])
+                if state_hash in hardware_by_hash
+            }
+            candidate_hash = str(ablation_decision["candidate_state_hash"])
+            selected_ablation_ms = (
+                float(hardware_by_hash[candidate_hash]["stats"]["median_ms"])
+                if ablation_decision["resolvable"]
+                else baseline_median_ms
+            )
+            ablation_best_ms = min(
+                baseline_median_ms,
+                *(float(hardware_by_hash[state_hash]["stats"]["median_ms"]) for state_hash in measured_hashes),
+            )
+            ablation_decision["measured_selected_ms"] = selected_ablation_ms
+            ablation_decision["measured_shortlist_best_ms"] = ablation_best_ms
+            ablation_decision["measured_shortlist_regret_pct"] = 100.0 * (
+                selected_ablation_ms / ablation_best_ms - 1.0
+            )
 
     result = {
         "kind": "executable_neighborhood_audit",
@@ -421,9 +587,14 @@ def main() -> int:
             "tokens": int(topk_ids.shape[0]),
             "top_k": int(topk_ids.shape[1]),
             "threads": args.threads,
+            "backend_n_tile": backend_n_tile,
+            "w13_stage_bytes": 4 * args.hidden * args.intermediate,
+            "w2_stage_bytes": 2 * args.hidden * args.intermediate,
         },
         "method": {
             "search_state": "strict_fixed_whole_expert_v1",
+            "neighborhood_mode": args.neighborhood_mode,
+            "width_policy": "domain_local_split_merge_adjacent_migration_with_deterministic_windows",
             "criticality": "tail_weighted_event_duration_times_task_dilation",
             "critical_experts": budget,
             "neighbors_per_operator": args.neighbors_per_operator,
@@ -444,6 +615,12 @@ def main() -> int:
             "shape": list(baseline.shape),
             "event_ms": float(explanation["makespan_ns"]) / 1.0e6,
             "planning_ms": full_plan_ms,
+            "window_geometry": _window_geometry(
+                baseline,
+                hidden=args.hidden,
+                intermediate=args.intermediate,
+                backend_n_tile=backend_n_tile,
+            ),
         },
         "critical_scores": [
             {"expert_id": expert, "score": scores[expert]}
@@ -451,6 +628,7 @@ def main() -> int:
         ],
         "strategies": reports,
         "uncertainty_aware_decision": decision,
+        "ablation_decisions": ablation_decisions,
         "hardware_shortlist": {
             "state_hashes": selected_hashes,
             "sources": selected_sources,
