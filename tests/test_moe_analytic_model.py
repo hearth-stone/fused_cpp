@@ -18,6 +18,7 @@ from analytic_model import (  # noqa: E402
     AnalyticMoeCostModel,
     CacheCalibration,
     LlcDomainCalibration,
+    NarrowTeamContentionCorrection,
     RuntimeOverheads,
     SaturatingServiceCurve,
     WideTeamPressureCalibration,
@@ -638,6 +639,9 @@ def test_machine_calibration_json_round_trip() -> None:
             isolated_dilation=((4, 1.05), (8, 1.2)),
             full_cohort_dilation=((4, 1.1), (8, 1.4)),
         ),
+        narrow_team_contention_correction=NarrowTeamContentionCorrection(
+            full_cohort_correction=((1, 0.95), (2, 0.72)),
+        ),
     )
 
     restored = AnalyticMachineCalibration.from_dict(calibration.to_dict())
@@ -697,6 +701,52 @@ def test_wide_team_pressure_calibration_is_discrete_and_rejects_speedup() -> Non
             isolated_dilation=((4, 1.2),),
             full_cohort_dilation=((4, 1.1),),
         )
+
+
+def test_narrow_team_correction_is_discrete_interpolated_and_validated() -> None:
+    correction = NarrowTeamContentionCorrection(
+        full_cohort_correction=((1, 0.95), (2, 0.72)),
+    )
+
+    assert correction.scale(2, 0.0) == pytest.approx(1.0)
+    assert correction.scale(2, 0.5) == pytest.approx(0.86)
+    assert correction.scale(2, 1.0) == pytest.approx(0.72)
+    assert correction.scale(4, 1.0) == pytest.approx(1.0)
+    assert NarrowTeamContentionCorrection.from_dict(correction.to_dict()) == correction
+    with pytest.raises(ValueError, match="positive and finite"):
+        NarrowTeamContentionCorrection(full_cohort_correction=((1, 0.0),))
+    with pytest.raises(ValueError, match="must be unique"):
+        NarrowTeamContentionCorrection(full_cohort_correction=((1, 0.9), (1, 1.1)))
+
+
+def test_placed_narrow_team_correction_reduces_only_concurrent_overprediction() -> None:
+    base = _placement_sensitive_model()
+    corrected = _model(
+        replace(
+            base.calibration,
+            narrow_team_contention_correction=NarrowTeamContentionCorrection(
+                full_cohort_correction=((2, 0.72),),
+            ),
+        )
+    )
+    phase = next(item for item in base.predict_expert(48, 2).phases if item.kind == "cold_b")
+    peer = next(item for item in base.predict_expert(48, 4).phases if item.kind == "cold_b")
+
+    base_single = base._active_phase_state_placed({0: phase}, ((0, 1),))
+    corrected_single = corrected._active_phase_state_placed({0: phase}, ((0, 1),))
+    base_concurrent = base._active_phase_state_placed(
+        {0: phase, 1: peer},
+        ((0, 1), (2, 3, 4, 5)),
+    )
+    corrected_concurrent = corrected._active_phase_state_placed(
+        {0: phase, 1: peer},
+        ((0, 1), (2, 3, 4, 5)),
+    )
+
+    assert corrected_single[3][0] == pytest.approx(base_single[3][0])
+    assert corrected_concurrent[3][0] < base_concurrent[3][0]
+    assert corrected_concurrent[3][0] >= 1.0
+    assert corrected_concurrent[3][1] == pytest.approx(base_concurrent[3][1])
 
 
 def test_placed_phase_interpolates_internal_and_concurrent_wide_team_pressure() -> None:
@@ -1377,7 +1427,7 @@ def test_holdout_validator_reports_absolute_error_and_shape_regret() -> None:
     report = build_validation_report(calibration, profile, isolated_training_points={(12, 1)})
 
     assert report["analytic_model_schema_version"] == 8
-    assert report["analytic_model"] == "phase_ecm_llc_domain_team_pressure_v5"
+    assert report["analytic_model"] == "phase_ecm_llc_domain_team_pressure_v6"
     assert report["isolated"]["coverage"] == {
         "profile_points": 2,
         "evaluated_points": 2,

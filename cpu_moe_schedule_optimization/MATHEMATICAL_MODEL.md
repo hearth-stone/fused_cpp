@@ -1675,6 +1675,33 @@ $\sum_l t_l=C$、每个active expert恰好一次、strict fixed whole-expert依�
 去重、完整placed event scorer、lane guard与2\% actionable gate；该审计不改变production
 planner候选或默认dispatch。
 
+**Narrow-team full-cohort correction。** 独立`2x1T concurrent -> 1x2T serial`
+probe表明，现有shared-resource event方程对2T task在满载mixed background下的dilation
+系统性高估，而不是漏掉1T slowdown。先用无背景的merged 2T逐task phase span拟合离散
+operator overhead：
+
+$$
+O_{expert}(R,2)=a_2+b_2R.
+$$
+
+然后令$q_i$为前述team peer occupancy fraction，并对已校准narrow width $t\in\{1,2\}$
+引入full-cohort residual correction $c_t>0$：
+
+$$
+k_t(q_i)=1+(c_t-1)q_i,
+$$
+
+$$
+D_i^{final}=\max\left(1,D_i^{resource}D_i^{wide}k_t(q_i)\right).
+$$
+
+$c_t<1$表示修正解析resource dilation的系统性高估，不表示真实执行相对isolated获得加速；
+最终dilation仍以1为下界。未校准width严格使用$k_t=1$，不按width插值或外推。首个Arm
+80C校准固定相同两个target cores、4x16T加14x1T background、early merge off和三组与真实
+planner trace隔离的合成短任务序列；$a_2,b_2$只使用`merge_isolated`逐task span，$c_1,c_2$
+分别通过完整placed event simulator令三组`pair_background`和`merge_background`的median
+log span error为零。isolated 1T pair和三条真实route trace不参与correction拟合。
+
 **Placement-aware LLC event state。** 旧 analytical DAG 在 `_score()` 中删除
 `core_begin`，所有 active task 共用 rank-global LLC working set、capacity 和 service；这会
 把“task 分散在两个 LLC domain”与“task 全部挤在一个 domain”错误视为同一状态。当前
@@ -5530,3 +5557,4 @@ planning 对未命中点执行原解析公式；首次调用结束后在文件�
 | 2026-09-03 | v1.43 | uncertainty-aware executable decision在commit `d51cb0e`正式复验：Arm 80C uniformish/median/high-skew均因best robust gain仅`0.666%/0.872%/0.153%`而保留baseline；相对同轮measured shortlist best的regret为`0.242%/0.578%/0.516%`，全部低于2%，24个候选仍无paired P10为正的稳定改进。high-skew point Spearman相对原v3从`-0.690`改善到`0.690`；median/uniformish为`-0.756/-0.048`，说明亚百分点point ordering仍不可识别，安全选择闭合不能冒充精确排序闭合。冻结v4在正式三态calibration rerun的all-delayed/wide-only/all-concurrent误差为`-2.33/+0.22/+0.61%`；当次重新回归参数有漂移但未用于holdout。Step-2 VND继续关闭，只有robust gain超过action margin的未来邻域才允许自动接受。 |
 | 2026-09-03 | v1.44 | 增加Step-3 topology-preserving width-neighborhood审计框架，不改变production planner。只允许完整位于单一LLC domain内的等分lane split、相邻等宽lane merge和已校准相邻宽度lane间whole-expert migration；已有跨domain lane保持但不能作为width move端点。split/merge仅重排受影响lane，migration保留既有task相对顺序并枚举目标插入点；所有改宽task重新读取确定性stage-window policy。order-only、width-only、combined三种ablation共享canonical去重、placed event score、lane uncertainty guard、2% gate及同轮硬件shortlist。正式三trace结果完成前不进入width-VND/LNS，也不作性能收益结论。 |
 | 2026-09-03 | v1.45 | Step-3 prefinal direct-sync Arm 80C三trace审计完成：uniformish/median的12/16个硬件shortlist均无paired P10为正的稳定候选；high-skew 13个shortlist中两个domain-local lane merge稳定提升`1.436%/1.248%` paired median、`0.262%/0.340%` P10，说明width邻域具有局部实测价值。但模型只预测两者`0.0197%/0.0130%`，反而把预测`+0.110%`、实测`-0.446%`的split排为width第一；median/high-skew combined Spearman为`-0.018/-0.011`。三trace无robust gain达到2%，故全部保留baseline，measured shortlist regret不超过`1.449%`。保留width operators作Lab候选，但在独立校准`1T+1T -> 2T` merge/concurrency transition并完成commit-bound复验前不进入width-VND。完整记录见`optimizations/fused_moe_sve/results/arm_codex_80c_width_neighborhood_audit_prefinal_20260903.md`。 |
+| 2026-09-03 | v1.46 | 独立建模并校准high-skew中的`2x1T concurrent -> 1x2T serial` transition。三组合成短任务在无背景与4x16T+14x1T满载背景下的实测dilation对pair/merge分别为近似相同的`1.09/1.09`、`1.07/1.09`、`1.14/1.14`，否定“缺少额外1T slowdown”，并定位为shared-resource model对2T background dilation高估。新增可低于1但保持final dilation不低于1的离散narrow-team correction；旧calibration和未校准width保持identity。`merge_isolated`拟合2T `expert_fixed_ns=88799.963`、`route_ns=5909.533`，完整event求根得到full-cohort correction `c1=0.784898`、`c2=0.532344`。三组pair/merge background holdout误差由`+5.43/+17.62%`、`+3.05/+17.55%`、`+13.23/+27.71%`降至`+0.12/-1.89%`、`-0.63/+1.01%`、`0.00/0.00%`；isolated pair保持`-2.85%--+2.37%`。模型名升到v6；冻结后的high-skew event-only预检查未再调参，真实三trace硬件仍为holdout，必须从同一commit正式重跑后再决定width-VND。 |

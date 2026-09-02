@@ -160,6 +160,16 @@ Temporal-ranking remediation in progress before this gate may be reconsidered:
   calibrating the `1T+1T -> 2T` merge/concurrency transition. See
   `results/arm_codex_80c_width_neighborhood_audit_prefinal_20260903.md`.
 
+- [x] Independently calibrate the high-skew `1T+1T -> 2T` transition without
+  planner-neighbor traces. The three-case Arm 80C probe separates a 2T
+  fixed/per-route overhead from discrete 1T/2T full-cohort resource
+  corrections and reduces all nine declared synthetic validation errors below
+  3%. The three captured route traces remain the commit-bound holdout; see
+  `results/arm_codex_80c_narrow_lane_merge_calibration_20260903.md`.
+- [ ] From the calibration/model commit, rerun
+  `arm_width_neighborhood_audit` and decide whether the corrected robust score
+  recovers the two previously stable high-skew merges without a >2% regression.
+
 ### Step 4: make event-guided search affordable
 
 - [ ] Precompute immutable expert/width phase descriptions and memoize plans by

@@ -37,7 +37,7 @@ except ImportError:  # pragma: no cover - package-style import
 ANALYTIC_MACHINE_SCHEMA_VERSION = 2
 SUPPORTED_ANALYTIC_MACHINE_SCHEMA_VERSIONS = frozenset({1, 2})
 ANALYTIC_MODEL_SCHEMA_VERSION = 8
-ANALYTIC_MODEL_NAME = "phase_ecm_llc_domain_team_pressure_v5"
+ANALYTIC_MODEL_NAME = "phase_ecm_llc_domain_team_pressure_v6"
 _SHARED_RESOURCES = (
     "gemm_core_flops",
     "matrix_flops",
@@ -462,6 +462,58 @@ class WideTeamPressureCalibration:
 
 
 @dataclass(frozen=True)
+class NarrowTeamContentionCorrection:
+    """Width-specific correction to modeled full-cohort resource dilation.
+
+    Unlike a physical slowdown factor, this is a residual correction and may
+    be below one when the analytical shared-resource model overpredicts narrow
+    team contention. The final phase multiplier is still clamped to at least
+    one, and uncalibrated widths remain unchanged.
+    """
+
+    full_cohort_correction: tuple[tuple[int, float], ...] = ()
+
+    def __post_init__(self) -> None:
+        points = tuple(
+            sorted(
+                (int(width), float(correction))
+                for width, correction in self.full_cohort_correction
+            )
+        )
+        if any(
+            width <= 0 or not math.isfinite(correction) or correction <= 0.0
+            for width, correction in points
+        ):
+            raise ValueError("narrow-team widths and corrections must be positive and finite")
+        if len({width for width, _ in points}) != len(points):
+            raise ValueError("narrow-team correction widths must be unique")
+        object.__setattr__(self, "full_cohort_correction", points)
+
+    def scale(self, team_width: int, peer_fraction: float) -> float:
+        if team_width <= 0 or not 0.0 <= peer_fraction <= 1.0:
+            raise ValueError("team_width must be positive and peer_fraction must be in [0, 1]")
+        full_scale = dict(self.full_cohort_correction).get(team_width, 1.0)
+        return 1.0 + (full_scale - 1.0) * peer_fraction
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> "NarrowTeamContentionCorrection":
+        return cls(
+            full_cohort_correction=tuple(
+                (int(point["threads"]), float(point["correction"]))
+                for point in payload.get("full_cohort_correction", ())
+            )
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "full_cohort_correction": [
+                {"threads": width, "correction": correction}
+                for width, correction in self.full_cohort_correction
+            ]
+        }
+
+
+@dataclass(frozen=True)
 class AnalyticMachineCalibration:
     """Thin machine calibration independent of route and expert shape."""
 
@@ -486,6 +538,9 @@ class AnalyticMachineCalibration:
     llc_domains: tuple[LlcDomainCalibration, ...] = ()
     dram_scope: str = "numa_rank"
     wide_team_pressure: WideTeamPressureCalibration = WideTeamPressureCalibration()
+    narrow_team_contention_correction: NarrowTeamContentionCorrection = (
+        NarrowTeamContentionCorrection()
+    )
 
     def __post_init__(self) -> None:
         if not self.machine_id:
@@ -681,6 +736,9 @@ class AnalyticMachineCalibration:
             wide_team_pressure=WideTeamPressureCalibration.from_dict(
                 payload.get("planner", {}).get("wide_team_pressure", {})
             ),
+            narrow_team_contention_correction=NarrowTeamContentionCorrection.from_dict(
+                payload.get("planner", {}).get("narrow_team_contention_correction", {})
+            ),
         )
 
     @classmethod
@@ -729,6 +787,10 @@ class AnalyticMachineCalibration:
             or self.wide_team_pressure.full_cohort_dilation
         ):
             payload["planner"]["wide_team_pressure"] = self.wide_team_pressure.to_dict()
+        if self.narrow_team_contention_correction.full_cohort_correction:
+            payload["planner"]["narrow_team_contention_correction"] = (
+                self.narrow_team_contention_correction.to_dict()
+            )
         return payload
 
 
@@ -2374,8 +2436,16 @@ class AnalyticMoeCostModel:
                 if phase.kind in {"cold_b", "steady_b"}
                 else 1.0
             )
-            team_pressure_dilation[index] = dilation
-            multipliers[index] *= dilation
+            correction = (
+                self.calibration.narrow_team_contention_correction.scale(
+                    team_width,
+                    peer_fraction,
+                )
+                if phase.kind in {"cold_b", "steady_b"}
+                else 1.0
+            )
+            team_pressure_dilation[index] = dilation * correction
+            multipliers[index] = max(1.0, multipliers[index] * dilation * correction)
         return (
             task_spill,
             provisional,

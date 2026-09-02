@@ -7,6 +7,50 @@ baseline:
   status: reference
 
 features:
+  - id: planner.narrow_team_contention_correction
+    part: planner
+    status: experimental
+    implementation: >-
+      cpu_moe_schedule_optimization/cost_model/analytic_model.py and
+      optimizations/fused_moe_sve/benchmarks/bench_narrow_lane_merge_transition.py
+    hypothesis: >-
+      Separating 2T isolated expert overhead from a discrete full-cohort
+      narrow-team resource correction fixes the model's incorrect ranking of
+      2x1T concurrent lanes versus one serial 2T lane.
+    depends_on:
+      - planner.width_specific_expert_overhead
+      - planner.wide_team_concurrent_pressure
+    conflicts_with: []
+    correctness: >-
+      PYTHONPATH=.:src .venv/bin/python -m pytest -q
+      tests/test_moe_narrow_lane_merge_transition.py
+      tests/test_moe_analytic_model.py
+      -k 'transition or narrow_team or width_specific'
+    benchmark: >-
+      PYTHONPATH=.:src numactl --physcpubind=240-319 --membind=3
+      .venv/bin/python
+      optimizations/fused_moe_sve/benchmarks/bench_narrow_lane_merge_transition.py
+      --analytic-calibration
+      bench_assets/moe_paper/arm_codex_numa3_80c_temporal/analytic_machine_numa3_80c_temporal_overhead_v4_20260903.json
+      --warmup 5 --runs 31 --weight-copies 4
+    owner: zhangxu
+    opened: 2026-09-03
+    decision_by: 2026-10-03
+    next_decision: >-
+      Run the commit-bound three-trace width-neighborhood suite with the frozen
+      v8 calibration and verify ranking of the stable high-skew lane merges.
+    adoption_gate: >-
+      At most 5 percent error on every independent synthetic state; no selected
+      real-trace regression above 2 percent; measured shortlist regret no larger
+      than 5 percent; and improved high-skew width-candidate ranking.
+    result: >-
+      The independent Arm 80C probe fitted 2T expert fixed/route overheads of
+      88799.963/5909.533 ns and full-cohort correction factors of 0.784898 for
+      1T and 0.532344 for 2T. Six background and three isolated-pair validation
+      errors are within 2.95 percent. A frozen high-skew event-only precheck was
+      not used to refit; real-trace hardware remains the holdout. See
+      results/arm_codex_80c_narrow_lane_merge_calibration_20260903.md.
+
   - id: planner.topology_preserving_width_neighborhood_audit
     part: planner
     status: experimental
@@ -21,6 +65,7 @@ features:
     depends_on:
       - planner.executable_search_state
       - planner.uncertainty_aware_neighborhood_gate
+      - planner.narrow_team_contention_correction
     conflicts_with:
       - dispatch.dynamic_short_expert_pool
     correctness: >-
@@ -38,9 +83,9 @@ features:
     opened: 2026-09-03
     decision_by: 2026-10-03
     next_decision: >-
-      Calibrate the 1T+1T to 2T merge/concurrency transition independently,
-      then repeat the committed three-trace suite. Do not enter width-VND until
-      the robust scorer ranks and accepts the stable merge opportunity.
+      Repeat the committed three-trace suite with the frozen v8 calibration.
+      Do not enter width-VND until the robust scorer ranks and accepts the
+      stable merge opportunity.
     adoption_gate: >-
       At least one width candidate with positive paired P10 speedup; no selected
       plan regression above 2 percent on any trace; measured shortlist regret

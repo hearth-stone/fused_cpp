@@ -25,7 +25,7 @@
     "uniformish_route": "bench_assets/moe_paper/dsv4_routes_pt_20260830/measured_request022_case023_zh2048-024.pt",
     "uniformish_layer": 20,
     "base_analytic_calibration": "bench_assets/moe_paper/arm_codex_numa3_80c/analytic_machine_numa3_80c_topology_wide_pressure_v3_20260901.json",
-    "analytic_calibration": "bench_assets/moe_paper/arm_codex_numa3_80c_temporal/analytic_machine_numa3_80c_temporal_overhead_v4_20260903.json"
+    "analytic_calibration": "bench_assets/moe_paper/arm_codex_numa3_80c_temporal/analytic_machine_numa3_80c_narrow_merge_v8_20260903.json"
   },
   "snapshot_submodules": ["3rdparty/xbyak_aarch64"],
   "snapshot_external_paths": ["refs/i8gemm/lib"],
@@ -40,7 +40,7 @@
     },
     {
       "path": "bench_assets/moe_paper/arm_codex_numa3_80c_temporal",
-      "sha256": "aed8e5b895a3955e2551d085fd81e2c500d769faaea7ce8bcb4b971cee00624c"
+      "sha256": "23f5f7d222029181b1541d6dab5a01df23c2e340a2bcdb9f85371887fbbc68df"
     }
   ]
 }

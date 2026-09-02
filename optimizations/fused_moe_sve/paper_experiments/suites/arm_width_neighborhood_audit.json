@@ -13,7 +13,7 @@
     {
       "id": "focused_correctness",
       "timeout_seconds": 1200,
-      "argv": ["{python}", "-m", "pytest", "-q", "tests/test_moe_executable_plan_state.py", "tests/test_moe_executable_plan_neighborhood.py", "tests/test_moe_analytic_model.py", "tests/test_moe_plan_v2.py", "-k", "executable_plan or placed_dag or plan_v2_strict", "--maxfail=1"]
+      "argv": ["{python}", "-m", "pytest", "-q", "tests/test_moe_executable_plan_state.py", "tests/test_moe_executable_plan_neighborhood.py", "tests/test_moe_narrow_lane_merge_transition.py", "tests/test_moe_analytic_model.py", "tests/test_moe_plan_v2.py", "-k", "executable_plan or placed_dag or plan_v2_strict or narrow_team or transition", "--maxfail=1"]
     }
   ],
   "cases": [

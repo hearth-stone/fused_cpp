@@ -120,6 +120,13 @@ hardware shortlist. The first direct-sync development run is recorded in
 [`../results/arm_codex_80c_width_neighborhood_audit_prefinal_20260903.md`](../results/arm_codex_80c_width_neighborhood_audit_prefinal_20260903.md);
 rerun after commit before treating it as a paper artifact.
 
+The independent `2x1T -> 1x2T` transition probe and frozen Arm calibration are
+described in
+[`../results/arm_codex_80c_narrow_lane_merge_calibration_20260903.md`](../results/arm_codex_80c_narrow_lane_merge_calibration_20260903.md).
+The `arm_codex_internal_temporal_overhead` machine now points to that v8 asset;
+therefore the next width-neighborhood suite run is the real-trace holdout and
+must use the same committed model source.
+
 The analytical heavy planner now has an additive placement-aware LLC event
 path. Prefinal reruns correct greedy-versus-SAT ranking on high and median skew,
 but uniformish regresses 1.89% and wins only 4/31 pairs; full-search time also

@@ -21,6 +21,18 @@ never interpolates or extrapolates these overheads. The complete analytical
 calibration is part of the persisted `T_iso` cache identity, so adding or
 changing an override invalidates stale scalar costs automatically.
 
+Analytical machine calibrations may also include an optional
+`planner.narrow_team_contention_correction.full_cohort_correction` list of
+discrete `{threads, correction}` points. This is a residual correction to the
+placed event model's shared-resource dilation, not an additional physical
+slowdown: a value below one is legal when the resource equations overpredict
+contention. For peer occupancy fraction `q`, the applied factor is
+`1 + (correction - 1) * q`, and the final phase dilation is clamped to at least
+one. Widths must be positive and unique and corrections finite and positive;
+missing widths use one, with no interpolation or extrapolation. The first
+calibration covers only 1T/2T BF16 narrow teams in one fully occupied 80-core
+mixed cohort. Historical files without the field retain their previous scores.
+
 Historical schema-v2 files may record `w13_split`, `w13_split_chunks`,
 `weight_window_bytes`, `w13_window_ranges`, or `w2_window_ranges`. They are not
 active calibration inputs. A non-unit legacy range pair is rejected because its
