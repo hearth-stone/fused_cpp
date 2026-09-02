@@ -33,18 +33,21 @@ features:
     opened: 2026-09-01
     decision_by: 2026-09-02
     next_decision: >-
-      Repeat the three strict proof-plan gates, then extend only after all
-      traces meet the 2 percent no-regression and 5 percent regret criteria.
+      Improve CP-only temporal/lowering quality, then extend to 43 layers and
+      a second Arm machine when one is available.
     adoption_gate: >-
       Three strict gates have proof gap at most 5 percent, measured shortlist
       regret at most 5 percent, and no trace regresses more than 2 percent.
     result: >-
       Six held-out layers produced median measured/event residuals of 0.920,
       1.303, and 1.470 for 4T, 8T, and 16T. Two 64-active-core controls imply
-      single-team internal dilations are 1.144/1.251/1.494/1.424/2.306 for
+      Single-team internal dilations are 1.144/1.251/1.494/1.424/2.306 for
       8/16/32/40/80T. Full-cohort total dilations are
-      1.000/1.303/1.470/1.619/1.821/2.306 for 4/8/16/32/40/80T. Final gates
-      are pending.
+      1.000/1.303/1.470/1.619/1.821/2.306 for 4/8/16/32/40/80T. The formal
+      three-trace event union passed: proof gaps 4.02/4.99/4.81 percent,
+      measured regrets 0/0/4.03 percent, and no regression versus one-step or
+      greedy. All final decisions retained the full incumbent; CP-only quality
+      remains open. See results/arm_codex_80c_wide_team_strict_gate_20260902.md.
 
   - id: planner.t_iso_disk_cache
     part: planner
