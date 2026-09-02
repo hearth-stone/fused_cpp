@@ -121,9 +121,12 @@ Temporal-ranking remediation in progress before this gate may be reconsidered:
 - [x] Add a serial-lane uncertainty guard and a 2% minimum actionable gain;
   candidates below the resolution margin may be measured but cannot replace
   the incumbent automatically.
-- [ ] Repeat the committed three-trace suite with the uncertainty-aware decision
+- [x] Repeat the committed three-trace suite with the uncertainty-aware decision
   output and require zero selected-plan regression above 2%. Keep point-ranking
-  accuracy and safe planner selection as separate reported results.
+  accuracy and safe planner selection as separate reported results. Commit
+  `d51cb0e` retained baseline on all traces; measured shortlist regret was
+  `0.242%/0.578%/0.516%`, with no stable local improvement. Point ranking below
+  1% remains unresolved, so Step 2 stays closed.
 
 - [ ] Starting independently from full, one-step, greedy, and fixed-width
   controls, run best-improvement descent over same-lane insertion, same-width

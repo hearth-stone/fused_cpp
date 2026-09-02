@@ -35,17 +35,19 @@ features:
     opened: 2026-09-03
     decision_by: 2026-10-03
     next_decision: >-
-      Commit and rerun the three-trace suite with explicit robust-score and
-      uncertainty-aware selection output.
+      Keep VND disabled. Revisit only when a new neighborhood produces robust
+      gains above 2 percent or a stochastic event model can resolve sub-percent
+      temporal deltas on independent holdouts.
     adoption_gate: >-
       Zero selected-plan regression above 2 percent on all three traces;
       catastrophic lane crossings rank behind the incumbent; and point-model
       correlation is reported separately rather than treated as resolved.
     result: >-
-      Offline replay of the 24 frozen v4 holdout candidates retained the
-      incumbent on all traces. The lane guard raised high-skew Spearman from
-      0.357 to 0.548 and classified the 13.59 percent hardware regression as a
-      negative 1.016 percent robust gain. A committed formal rerun is pending.
+      Formal commit d51cb0e retained the baseline on uniformish, median, and
+      high-skew because best robust gains were only 0.666, 0.872, and 0.153
+      percent. Measured shortlist regret was 0.242, 0.578, and 0.516 percent,
+      with no stable candidate among 24. This closes safe selection, not exact
+      point ranking. See results/arm_codex_80c_temporal_ranking_guard_20260903.md.
 
   - id: planner.width_specific_expert_overhead
     part: planner
@@ -77,18 +79,21 @@ features:
     opened: 2026-09-03
     decision_by: 2026-10-03
     next_decision: >-
-      Commit the additive calibration schema and independent probe, then run
-      the three captured traces as a frozen-parameter holdout.
+      Retain the machine-local v4 calibration for guarded offline search and
+      add another Arm machine before treating the 1T overhead as portable.
     adoption_gate: >-
       Victim-span error within 5 percent for all three calibration states;
       improved median/high-skew event-to-hardware ranking; unchanged uniformish
       scores when no 1T lane exists; and no selected-plan regression above 2
       percent on the declared three-trace holdout.
     result: >-
-      The uncommitted Arm probe fitted 1T expert_fixed_ns=147999.019 and
-      route_ns=10471.803. Measured victim spans were 25.491/25.518/26.251 ms
-      for all-delayed/wide-only/all-concurrent, versus corrected predictions of
-      25.419/25.793/26.621 ms. The committed holdout run is pending.
+      The frozen Arm v4 calibration uses 1T expert_fixed_ns=147999.019 and
+      route_ns=10471.803. On the committed formal rerun, frozen predictions of
+      25.419/25.793/26.621 ms differed from measured all-delayed/wide-only/
+      all-concurrent spans by -2.33/+0.22/+0.61 percent. High-skew point
+      Spearman improved from -0.690 to 0.690, but median/uniformish sub-percent
+      point ordering remains unresolved. See
+      results/arm_codex_80c_temporal_ranking_guard_20260903.md.
 
   - id: planner.executable_order_neighborhood_audit
     part: planner
