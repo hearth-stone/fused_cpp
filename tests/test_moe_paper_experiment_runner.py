@@ -50,9 +50,22 @@ def test_suite_configs_render_for_every_machine(name: str) -> None:
         assert "FUSED_CPP_BUILD_MOE_ONLY=1" in render_argv(build["argv"], context)
 
 
-def test_arm_high_skew_closure_suite_renders_with_external_assets() -> None:
-    suite = load_suite(EXPERIMENT_ROOT / "suites" / "arm_high_skew_closure.json")
-    machine = load_machine(EXPERIMENT_ROOT / "machines" / "arm_codex_internal.json")
+@pytest.mark.parametrize(
+    ("suite_name", "machine_name"),
+    [
+        ("arm_high_skew_closure.json", "arm_codex_internal.json"),
+        (
+            "arm_executable_neighborhood_audit.json",
+            "arm_codex_internal_wide_pressure.json",
+        ),
+    ],
+)
+def test_arm_high_skew_closure_suite_renders_with_external_assets(
+    suite_name: str,
+    machine_name: str,
+) -> None:
+    suite = load_suite(EXPERIMENT_ROOT / "suites" / suite_name)
+    machine = load_machine(EXPERIMENT_ROOT / "machines" / machine_name)
     assert suite["machine_ids"] == [machine["id"]]
     assert len(machine["snapshot_external_assets"]) == 2
     context = {

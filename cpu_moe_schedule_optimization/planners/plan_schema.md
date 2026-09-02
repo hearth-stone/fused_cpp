@@ -35,6 +35,14 @@ V2 bridge. Tail-pool placement, route slices, resize semantics, non-lane DAGs,
 and duplicate whole-expert tasks are deliberately rejected in this first
 search domain.
 
+`executable_plan_neighborhood.py` keeps Step-1 moves inside this state. It may
+reorder tasks within a lane or relocate/swap whole experts only between lanes
+of the same width. It never changes lane intervals, windows, early-merge mode,
+or the set of experts. Cross-LLC relocation is recorded as a distinct audit
+operator, while all candidates still lower through the same canonical Plan V2
+bridge. This is an internal diagnostic search surface, not an extension to the
+runtime schema.
+
 > **⚠ DEPRECATED — wave 调度后续不考虑。** 见 [../DEPRECATED_WAVE.md](../DEPRECATED_WAVE.md)。
 > 本文件中的 `Wave` 层、`wave_offsets` scheduled bridge、以及除 `ASYNC_INTERVAL_DAG` 外的
 > 所有 planner kinds 均已废弃,仅作历史参考。**保留并继续**:`ASYNC_INTERVAL_DAG` /

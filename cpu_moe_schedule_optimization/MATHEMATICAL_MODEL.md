@@ -1609,6 +1609,26 @@ analytical event scorer结果不变。该内部状态不修改public Plan V2 sch
 planner candidate space或默认dispatch；它只是后续executable-neighborhood search的合法性
 边界。
 
+**Step-1 executable order neighborhood audit。** 在不改变lane interval、team width、window
+或early-merge语义时，首个局部搜索域只允许五类whole-expert move：同lane相邻交换、同lane
+插入、同宽lane间迁移、同宽lane间交换，以及同宽跨LLC-domain迁移。每次move直接构造上述
+canonical state，依赖重新由lane序列派生；因此不存在先搜索fluid解再lowering的误差。
+
+placement-aware event trace为task $i$ 定义诊断criticality：
+
+$$
+q_i=\sum_{e:i\in A_e}\Delta_e d_{e,i}
+\left(1+\frac{s_e+\Delta_e}{T_{event}}\right),
+$$
+
+其中$A_e$、$s_e$和$\Delta_e$分别是event的active tasks、起点和持续时间，$d_{e,i}$是该
+task在event内的phase dilation。该式只用于选择要移动的expert，不改变objective，也不作为
+新的cost-model参数。审计以相同expert数、相同per-operator评分预算比较$q_i$最高集合和
+uniform-random集合，分别记录proposal、valid、duplicate、unique、event improvement及评分
+吞吐；两组event top candidates再以同一输入/权重、随机交错paired rounds实机执行。只有存在
+稳定实测改进、critical引导明显富集优质候选、且event改进没有被硬件系统性反转时，才进入
+VND。否则该结果用于拒绝当前order-only LNS结构，而不是继续增加自适应权重。
+
 **Placement-aware LLC event state。** 旧 analytical DAG 在 `_score()` 中删除
 `core_begin`，所有 active task 共用 rank-global LLC working set、capacity 和 service；这会
 把“task 分散在两个 LLC domain”与“task 全部挤在一个 domain”错误视为同一状态。当前
@@ -5457,3 +5477,4 @@ planning 对未命中点执行原解析公式；首次调用结束后在文件�
 | 2026-09-01 | v1.36 | analytical heavy event model 增加 placement-aware LLC path：planner 将 logical core interval 映射到真实 CPU IDs；event 按 owner-thread 比例拆分每个 task 的 LLC working set/demand，逐 domain 计算 capacity miss、service pressure 和 dilation，再施加 rank-level LLC fabric cap；task spill fraction 只影响自身 spillable DRAM，DRAM 仍为 NUMA-rank global，跨 domain gang 取最慢 domain dilation。旧 unplaced API、无-topology fallback、empirical/quick planner、Plan V2、runtime 和 kernel 保持不变。Arm 80C strict proof-plan 的 event 预测 SAT 相对 greedy 为 high/median/uniformish `-2.47/-2.98/-6.20%`，实测为 `-4.83/-10.92/+1.89%`；high/median 排序方向闭合，但 uniformish 仅 `4/31` 获胜并回退，证明剩余主要缺口是 wide-team concurrent pressure/width scaling，而非 LLC placement 丢失。placement-aware full planning 时间相对旧版约增加 `1.7--1.9x`，该实验未通过三 trace no-regression gate。 |
 | 2026-09-02 | v1.37 | placement-aware heavy event model 增加离散 wide-team residual：以非 gate 层分别拟合 single-team internal dilation $B_t$ 与 full-cohort total dilation $S_t$，active event 使用 $B_t+(S_t-B_t)q$，未校准宽度不外推；4/8/16/32/40/80T 的 $S_t$ 为 `1.000/1.303/1.470/1.619/1.821/2.306`。CP fluid master 保持原 cold surrogate，其 gap 不冒充完整 event proof；lowering 固定 width/domain，先保持 fluid start 求 contiguous placement，失败时才最小延迟并标记 `*_DELAYED`。最终 event union 显式保留 full、one-step、exact greedy incumbents 与 CP top-8。commit `6b6b4d1` 的 Arm 80C 正式三 trace run 得到 proof gap `4.02/4.99/4.81%`、measured union regret `0/0/4.03%`，相对 one-step 和 greedy 均无回退且对 greedy 全部 `31/31` 获胜；但三条最终都保留 full incumbent，high-skew 中未选中的 CP plan 实测再快 `4.03%`，故只关闭 incumbent-plus-shortlist 的近似计划 gate，CP-only 与 temporal/lowering quality 仍 open。见 `optimizations/fused_moe_sve/results/arm_codex_80c_wide_team_strict_gate_20260902.md`。 |
 | 2026-09-02 | v1.38 | 为event-guided VND/LNS增加内部version-1 canonical executable state，不改变搜索候选或选择结果。state将rank表示为gap-free contiguous fixed-width lanes及其whole-expert序列，独立记录ordered physical CPUs、contiguous LLC-domain partition、per-task windows和early-merge三态；lane依赖唯一派生，hash覆盖全部执行语义。现有跨LLC-domain lane原样保留并记录相交domain，不为了新抽象改写incumbent。适配器只接受strict/fixed/unsliced/lane-chain planner result，显式拒绝tail pool、route slice、resize和一般DAG；result→state→tasks/Plan V2逐字段往返并保持analytical event score。该步骤只建立后续邻域搜索的合法性边界，无性能或近似最优结论。 |
+| 2026-09-02 | v1.39 | 增加Step-1 executable order-neighborhood审计，不改变production planner。五类move保持lane topology、width、window和early merge不变，并直接生成strict fixed Plan V2；canonical hash对跨算子重复候选去重。analytical model新增只读`explain_dag_placed`，与placed scorer共用原placement校验并暴露已有LLC-domain/team-pressure event。criticality采用tail-weighted event duration乘task phase dilation，仅控制等预算候选采样，不进入objective。正式Arm suite固定比较32个critical与32个uniform-random experts、每算子64个event评分、每组event top-4和31轮硬件paired measurement；在结果完成前不进入VND或ALNS。 |

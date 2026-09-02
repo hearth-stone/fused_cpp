@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "id": "arm_executable_neighborhood_audit",
+  "description": "Arm-codex NUMA3 80-core Step-1 executable order-neighborhood audit.",
+  "machine_ids": ["arm_codex_internal_wide_pressure"],
+  "setup": [
+    {
+      "id": "build_extension",
+      "use_affinity": false,
+      "timeout_seconds": 1800,
+      "argv": ["env", "FUSED_CPP_BUILD_MOE_ONLY=1", "FUSED_CPP_SVE_VECTOR_BITS={sve_bits}", "MAX_JOBS={max_jobs}", "{python}", "setup.py", "build_ext", "--inplace", "--force"]
+    },
+    {
+      "id": "focused_correctness",
+      "timeout_seconds": 1200,
+      "argv": ["{python}", "-m", "pytest", "-q", "tests/test_moe_executable_plan_state.py", "tests/test_moe_executable_plan_neighborhood.py", "tests/test_moe_analytic_model.py", "tests/test_moe_plan_v2.py", "-k", "executable_plan or placed_dag or plan_v2_strict", "--maxfail=1"]
+    }
+  ],
+  "cases": [
+    {
+      "id": "uniformish_order_neighborhood",
+      "timeout_seconds": 2400,
+      "output_json": true,
+      "argv": ["{python}", "optimizations/fused_moe_sve/benchmarks/bench_executable_neighborhood_audit.py", "--route-file", "{uniformish_route}", "--route-layer", "{uniformish_layer}", "--analytic-calibration", "{analytic_calibration}", "--hidden", "4096", "--intermediate", "512", "--experts", "256", "--threads", "80", "--critical-experts", "32", "--neighbors-per-operator", "64", "--event-top-per-strategy", "4", "--measure-hardware", "--warmup", "5", "--runs", "31", "--weight-copies", "4", "--output", "{remote_output}"]
+    },
+    {
+      "id": "median_order_neighborhood",
+      "timeout_seconds": 2400,
+      "output_json": true,
+      "argv": ["{python}", "optimizations/fused_moe_sve/benchmarks/bench_executable_neighborhood_audit.py", "--route-file", "{median_route}", "--route-layer", "{median_layer}", "--analytic-calibration", "{analytic_calibration}", "--hidden", "4096", "--intermediate", "512", "--experts", "256", "--threads", "80", "--critical-experts", "32", "--neighbors-per-operator", "64", "--event-top-per-strategy", "4", "--measure-hardware", "--warmup", "5", "--runs", "31", "--weight-copies", "4", "--output", "{remote_output}"]
+    },
+    {
+      "id": "high_skew_order_neighborhood",
+      "timeout_seconds": 2400,
+      "output_json": true,
+      "argv": ["{python}", "optimizations/fused_moe_sve/benchmarks/bench_executable_neighborhood_audit.py", "--route-file", "{high_skew_route}", "--route-layer", "{high_skew_layer}", "--analytic-calibration", "{analytic_calibration}", "--hidden", "4096", "--intermediate", "512", "--experts", "256", "--threads", "80", "--critical-experts", "32", "--neighbors-per-operator", "64", "--event-top-per-strategy", "4", "--measure-hardware", "--warmup", "5", "--runs", "31", "--weight-copies", "4", "--output", "{remote_output}"]
+    }
+  ]
+}

@@ -7,6 +7,50 @@ baseline:
   status: reference
 
 features:
+  - id: planner.executable_order_neighborhood_audit
+    part: planner
+    status: experimental
+    implementation: >-
+      cpu_moe_schedule_optimization/planners/executable_plan_neighborhood.py,
+      optimizations/fused_moe_sve/benchmarks/bench_executable_neighborhood_audit.py,
+      and paper_experiments/suites/arm_executable_neighborhood_audit.json
+    hypothesis: >-
+      Around the current full strict plan, directly executable order-only moves
+      contain reproducible hardware improvements, and experts selected from the
+      placement-aware critical event trace enrich improving candidates relative
+      to an equal-budget uniform-random control.
+    depends_on:
+      - planner.executable_search_state
+      - planner.wide_team_concurrent_pressure
+    conflicts_with:
+      - dispatch.dynamic_short_expert_pool
+    correctness: >-
+      PYTHONPATH=.:src .venv/bin/python -m pytest -q
+      tests/test_moe_executable_plan_neighborhood.py
+      tests/test_moe_executable_plan_state.py tests/test_moe_analytic_model.py
+      tests/test_moe_plan_v2.py
+    benchmark: >-
+      .venv/bin/python optimizations/fused_moe_sve/paper_experiments/run_matrix.py
+      --machine
+      optimizations/fused_moe_sve/paper_experiments/machines/arm_codex_internal_wide_pressure.json
+      --suite
+      optimizations/fused_moe_sve/paper_experiments/suites/arm_executable_neighborhood_audit.json
+    owner: zhangxu
+    opened: 2026-09-02
+    decision_by: 2026-10-02
+    next_decision: >-
+      Run the committed three-trace audit and proceed to deterministic VND only
+      if critical guidance and event ranking survive paired hardware execution.
+    adoption_gate: >-
+      At least one stable paired hardware improvement, material enrichment from
+      critical selection over equal-budget random selection, and no systematic
+      hardware reversal of event-ranked improvements on the three declared
+      traces. Otherwise reject the order-only LNS premise.
+    result: >-
+      Implementation and focused local/Arm correctness are complete. The formal
+      committed three-trace performance run is pending; no optimization claim
+      is made from the short runner smoke.
+
   - id: planner.executable_search_state
     part: planner
     status: experimental

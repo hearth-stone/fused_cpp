@@ -223,7 +223,6 @@ class LlcDomainCalibration:
             "service": self.service.to_dict(),
         }
 
-
 @dataclass(frozen=True)
 class CacheCalibration:
     l1d_bytes_per_core: int
@@ -2448,12 +2447,10 @@ class AnalyticMoeCostModel:
     def dag_makespan(self, tasks) -> float:
         return self._dag_result(tasks)[0]
 
-    def dag_makespan_placed(self, tasks) -> float:
-        """Score a DAG whose tasks carry exact physical CPU placements."""
-
-        if not self.calibration.llc_domains:
-            unplaced = [(routes, threads, dependencies) for routes, threads, _, dependencies in tasks]
-            return self.dag_makespan(unplaced)
+    @staticmethod
+    def _normalize_placed_tasks(
+        tasks,
+    ) -> tuple[list[tuple[int, int, list[int]]], list[tuple[int, ...]]]:
         normalized = []
         task_cpu_ids = []
         ancestors: list[set[int]] = []
@@ -2477,6 +2474,14 @@ class AnalyticMoeCostModel:
             ancestors.append(reachable)
             normalized.append((int(routes), threads, list(dependencies)))
             task_cpu_ids.append(cpu_ids)
+        return normalized, task_cpu_ids
+
+    def dag_makespan_placed(self, tasks) -> float:
+        """Score a DAG whose tasks carry exact physical CPU placements."""
+
+        normalized, task_cpu_ids = self._normalize_placed_tasks(tasks)
+        if not self.calibration.llc_domains:
+            return self.dag_makespan(normalized)
         return self._dag_result(normalized, task_cpu_ids=task_cpu_ids)[0]
 
     def dag_task_finish_times(self, tasks) -> tuple[float, ...]:
@@ -2488,6 +2493,24 @@ class AnalyticMoeCostModel:
         normalized = [(int(routes), int(threads), list(dependencies)) for routes, threads, dependencies in tasks]
         events: list[dict] = []
         makespan_ns, finish_times = self._dag_result(normalized, event_log=events)
+        return {
+            "model": ANALYTIC_MODEL_NAME,
+            "machine_id": self.calibration.machine_id,
+            "makespan_ns": makespan_ns,
+            "task_finish_ns": list(finish_times),
+            "events": events,
+        }
+
+    def explain_dag_placed(self, tasks) -> dict:
+        """Explain a DAG while preserving every task's physical CPU placement."""
+
+        normalized, task_cpu_ids = self._normalize_placed_tasks(tasks)
+        events: list[dict] = []
+        makespan_ns, finish_times = self._dag_result(
+            normalized,
+            event_log=events,
+            task_cpu_ids=task_cpu_ids if self.calibration.llc_domains else None,
+        )
         return {
             "model": ANALYTIC_MODEL_NAME,
             "machine_id": self.calibration.machine_id,

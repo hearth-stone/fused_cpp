@@ -467,6 +467,19 @@ def test_placed_dag_models_llc_domains_and_symmetric_swap() -> None:
     assert swapped_domains == pytest.approx(split_domains)
 
 
+def test_placed_dag_explanation_matches_score_and_exposes_domains() -> None:
+    model = _placement_sensitive_model()
+    tasks = [(48, 2, (0, 1), ()), (48, 2, (4, 5), ())]
+
+    explanation = model.explain_dag_placed(tasks)
+
+    assert explanation["makespan_ns"] == pytest.approx(model.dag_makespan_placed(tasks))
+    assert max(explanation["task_finish_ns"]) == pytest.approx(explanation["makespan_ns"])
+    assert explanation["events"]
+    assert all("llc_domains" in event for event in explanation["events"])
+    assert all("team_pressure_dilation" in event for event in explanation["events"])
+
+
 def test_placed_dag_rejects_unordered_overlapping_cpu_teams() -> None:
     model = _placement_sensitive_model()
 
