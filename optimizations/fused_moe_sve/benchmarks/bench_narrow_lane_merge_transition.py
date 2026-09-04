@@ -37,13 +37,20 @@ TARGET_ROUTE_CASES = {
     "balanced": ((35, 13, 8, 3, 1), (27, 12, 6, 2, 1)),
     "head_heavy": ((68, 22, 10, 3, 1), (13, 8, 5, 2, 1)),
     "tail_dense": ((16, 10, 6, 3, 1), (15, 9, 5, 2, 1)),
+    "swap_sensitive": ((68, 13, 10, 8, 1), (35, 27, 22, 13, 3)),
+    "tail_head_transition": ((1, 2, 5, 19, 68), (1, 2, 6, 24, 57)),
 }
+CALIBRATION_CASES = ("balanced", "head_heavy", "tail_dense")
 WIDE_BACKGROUND_ROUTES = ((1800, 600),) * 4
 NARROW_BACKGROUND_ROUTES = ((68, 35, 13),) * 14
 MODES = (
     "pair_isolated",
+    "pair_swapped_isolated",
     "merge_isolated",
     "pair_background",
+    "pair_swapped_background",
+    "pair_tail_head_swapped_isolated",
+    "pair_tail_head_swapped_background",
     "merge_background",
 )
 TARGET_CORE_BEGIN = 64
@@ -130,8 +137,24 @@ def _build_bridge(
     if mode not in MODES:
         raise ValueError(f"mode must be one of {MODES}, got {mode!r}")
     merged = mode.startswith("merge")
+    head_swapped = mode.startswith("pair_swapped")
+    tail_head_swapped = mode.startswith("pair_tail_head_swapped")
     isolated = mode.endswith("isolated")
     target = _target_specs(model, target_routes, merged=merged)
+    if head_swapped:
+        lane_size = len(target_routes[0])
+        target[0], target[lane_size] = (
+            (*target[lane_size][:2], target[0][2], target[0][3]),
+            (*target[0][:2], target[lane_size][2], target[lane_size][3]),
+        )
+    elif tail_head_swapped:
+        lane_size = len(target_routes[0])
+        first_index = lane_size - 1
+        second_index = lane_size
+        target[first_index], target[second_index] = (
+            (*target[second_index][:2], target[first_index][2], target[first_index][3]),
+            (*target[first_index][:2], target[second_index][2], target[second_index][3]),
+        )
     tasks = target + _background_specs(len(target))
     target_tails = []
     dependencies: list[list[int]] = []
@@ -388,6 +411,8 @@ def _write_calibration(
     if output.exists():
         raise FileExistsError(f"refusing to overwrite calibration: {output}")
     payload = json.loads(source.read_text(encoding="utf-8"))
+    if payload.get("provenance", {}).get("narrow_lane_merge_transition") is not None:
+        raise ValueError("source calibration already contains a narrow-lane merge fit; refusing a second fit")
     overheads = payload.setdefault("overheads", {})
     by_width = [point for point in overheads.get("by_width", []) if int(point["threads"]) != 2]
     overheads["by_width"] = [
@@ -545,7 +570,8 @@ def main() -> int:
             },
         }
 
-    width2_expert_fixed_ns, width2_route_ns = _fit_width2_overhead(model, case_results)
+    calibration_cases = {name: case_results[name] for name in CALIBRATION_CASES}
+    width2_expert_fixed_ns, width2_route_ns = _fit_width2_overhead(model, calibration_cases)
     overhead_model = _model_with_narrow_calibration(
         model,
         width2_expert_fixed_ns=width2_expert_fixed_ns,
@@ -553,7 +579,7 @@ def main() -> int:
     )
     width1_correction, width2_correction = _fit_narrow_corrections(
         overhead_model,
-        case_results,
+        calibration_cases,
     )
     fitted_model = _model_with_narrow_calibration(
         model,
@@ -592,6 +618,43 @@ def main() -> int:
             for mode in MODES
         }
         measured = case["measured_target_span_ms"]
+        measured_swap_gain = {
+            scope: 100.0 * (measured[f"pair_{scope}"] / measured[f"pair_swapped_{scope}"] - 1.0)
+            for scope in ("isolated", "background")
+        }
+        base_swap_gain = {
+            scope: 100.0
+            * (base_predictions[f"pair_{scope}"] / base_predictions[f"pair_swapped_{scope}"] - 1.0)
+            for scope in ("isolated", "background")
+        }
+        fitted_swap_gain = {
+            scope: 100.0
+            * (fitted_predictions[f"pair_{scope}"] / fitted_predictions[f"pair_swapped_{scope}"] - 1.0)
+            for scope in ("isolated", "background")
+        }
+        measured_tail_head_swap_gain = {
+            scope: 100.0
+            * (measured[f"pair_{scope}"] / measured[f"pair_tail_head_swapped_{scope}"] - 1.0)
+            for scope in ("isolated", "background")
+        }
+        base_tail_head_swap_gain = {
+            scope: 100.0
+            * (
+                base_predictions[f"pair_{scope}"]
+                / base_predictions[f"pair_tail_head_swapped_{scope}"]
+                - 1.0
+            )
+            for scope in ("isolated", "background")
+        }
+        fitted_tail_head_swap_gain = {
+            scope: 100.0
+            * (
+                fitted_predictions[f"pair_{scope}"]
+                / fitted_predictions[f"pair_tail_head_swapped_{scope}"]
+                - 1.0
+            )
+            for scope in ("isolated", "background")
+        }
         serializable_cases[case_name] = {
             "target_routes": case["target_routes"],
             "target_span": case["target_span"],
@@ -613,6 +676,25 @@ def main() -> int:
             "fitted_model_pair_over_merge": {
                 "isolated": fitted_predictions["pair_isolated"] / fitted_predictions["merge_isolated"],
                 "background": fitted_predictions["pair_background"] / fitted_predictions["merge_background"],
+            },
+            "swap_order_gain_pct": {
+                "measured": measured_swap_gain,
+                "base_model": base_swap_gain,
+                "fitted_model": fitted_swap_gain,
+                "fitted_residual": {
+                    scope: measured_swap_gain[scope] - fitted_swap_gain[scope]
+                    for scope in ("isolated", "background")
+                },
+            },
+            "tail_head_swap_gain_pct": {
+                "measured": measured_tail_head_swap_gain,
+                "base_model": base_tail_head_swap_gain,
+                "fitted_model": fitted_tail_head_swap_gain,
+                "fitted_residual": {
+                    scope: measured_tail_head_swap_gain[scope]
+                    - fitted_tail_head_swap_gain[scope]
+                    for scope in ("isolated", "background")
+                },
             },
         }
 
@@ -639,9 +721,16 @@ def main() -> int:
             "trace_order": "randomized_paired_rounds",
             "weight_copies": args.weight_copies,
             "early_merge": False,
-            "fit_cases": list(TARGET_ROUTE_CASES),
+            "fit_cases": list(CALIBRATION_CASES),
             "fit_observation": "merge_isolated per-task spans plus background/isolated dilation ratios",
-            "holdouts": ["pair_isolated absolute span", "captured planner traces"],
+            "holdouts": [
+                "pair_isolated absolute span",
+                "all pair_swapped modes",
+                "all pair_tail_head_swapped modes",
+                "swap_sensitive route case",
+                "tail_head_transition route case",
+                "captured planner traces",
+            ],
         },
         "fitted_width2_overhead": {
             "expert_fixed_ns": width2_expert_fixed_ns,

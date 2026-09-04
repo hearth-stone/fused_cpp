@@ -9,9 +9,9 @@ calibration:
   measured service curves, and fixed runtime costs.
 
 Unlike ``ContentionCostModel``, no route/thread latency table or measured
-contention shape is required. Concurrent tasks are simulated as W13/W2
-setup/cold-B/steady-B phases which consume calibrated aggregate matrix,
-frontend, cache, DRAM, and epilogue service ceilings.
+contention shape is required. Concurrent tasks are simulated as optional
+gather plus W13/W2 setup/cold-B/steady-B phases which consume calibrated
+aggregate matrix, frontend, cache, DRAM, and epilogue service ceilings.
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from functools import cached_property, lru_cache
 from pathlib import Path
 from typing import Iterable, Mapping, Sequence
@@ -36,8 +36,8 @@ except ImportError:  # pragma: no cover - package-style import
 
 ANALYTIC_MACHINE_SCHEMA_VERSION = 2
 SUPPORTED_ANALYTIC_MACHINE_SCHEMA_VERSIONS = frozenset({1, 2})
-ANALYTIC_MODEL_SCHEMA_VERSION = 8
-ANALYTIC_MODEL_NAME = "phase_ecm_llc_domain_team_pressure_v6"
+ANALYTIC_MODEL_SCHEMA_VERSION = 11
+ANALYTIC_MODEL_NAME = "phase_reaccount_llc_domain_dram_injection_v9"
 _SHARED_RESOURCES = (
     "gemm_core_flops",
     "matrix_flops",
@@ -514,6 +514,230 @@ class NarrowTeamContentionCorrection:
 
 
 @dataclass(frozen=True)
+class GatherPressureCalibration:
+    """Optional explicit gather phase and its effective DRAM traffic.
+
+    The duration follows the slowest worker's row count.  Effective bytes may
+    exceed architectural payload bytes to represent cache-line amplification
+    and read/write turnaround, but remain zero when the calibration is absent.
+    """
+
+    enabled: bool = False
+    minimum_ns: float = 0.0
+    fixed_ns: float = 0.0
+    row_ns: float = 0.0
+    input_element_bytes: float = 2.0
+    packed_element_bytes: float = 2.0
+    effective_traffic_multiplier: float = 1.0
+    by_width: tuple[tuple[int, float, float, float], ...] = ()
+
+    def __post_init__(self) -> None:
+        values = (
+            self.minimum_ns,
+            self.fixed_ns,
+            self.row_ns,
+            self.input_element_bytes,
+            self.packed_element_bytes,
+            self.effective_traffic_multiplier,
+        )
+        if any(not math.isfinite(value) or value < 0.0 for value in values):
+            raise ValueError("gather-pressure values must be non-negative and finite")
+        if self.enabled and self.row_ns <= 0.0 and not self.by_width:
+            raise ValueError("enabled gather pressure requires a positive row time")
+        points = tuple(
+            sorted(
+                (int(width), float(minimum), float(fixed), float(row))
+                for width, minimum, fixed, row in self.by_width
+            )
+        )
+        if any(
+            width <= 0
+            or min(minimum, fixed, row) < 0.0
+            or not all(math.isfinite(value) for value in (minimum, fixed, row))
+            or row <= 0.0
+            for width, minimum, fixed, row in points
+        ):
+            raise ValueError("gather width points require positive widths/row time and finite non-negative costs")
+        if len({width for width, _, _, _ in points}) != len(points):
+            raise ValueError("gather width points must use unique widths")
+        object.__setattr__(self, "by_width", points)
+        if self.enabled and (
+            self.input_element_bytes + self.packed_element_bytes <= 0.0
+            or self.effective_traffic_multiplier <= 0.0
+        ):
+            raise ValueError("enabled gather pressure requires positive traffic")
+
+    def duration_ns(self, routes: int, threads: int) -> float:
+        if routes <= 0 or threads <= 0:
+            raise ValueError("gather duration requires positive routes and threads")
+        minimum_ns = self.minimum_ns
+        fixed_ns = self.fixed_ns
+        row_ns = self.row_ns
+        for width, width_minimum, width_fixed, width_row in self.by_width:
+            if width == threads:
+                minimum_ns = width_minimum
+                fixed_ns = width_fixed
+                row_ns = width_row
+                break
+        if row_ns <= 0.0:
+            raise KeyError(f"gather calibration does not cover threads={threads}")
+        return max(minimum_ns, fixed_ns + row_ns * math.ceil(routes / threads))
+
+    def dram_bytes(self, routes: int, hidden_size: int) -> float:
+        if routes <= 0 or hidden_size <= 0:
+            raise ValueError("gather traffic requires positive routes and hidden_size")
+        return (
+            routes
+            * hidden_size
+            * (self.input_element_bytes + self.packed_element_bytes)
+            * self.effective_traffic_multiplier
+        )
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> "GatherPressureCalibration":
+        return cls(
+            enabled=bool(payload.get("enabled", False)),
+            minimum_ns=float(payload.get("minimum_ns", 0.0)),
+            fixed_ns=float(payload.get("fixed_ns", 0.0)),
+            row_ns=float(payload.get("row_ns", 0.0)),
+            input_element_bytes=float(payload.get("input_element_bytes", 2.0)),
+            packed_element_bytes=float(payload.get("packed_element_bytes", 2.0)),
+            effective_traffic_multiplier=float(payload.get("effective_traffic_multiplier", 1.0)),
+            by_width=tuple(
+                (
+                    int(point["threads"]),
+                    float(point.get("minimum_ns", 0.0)),
+                    float(point.get("fixed_ns", 0.0)),
+                    float(point["row_ns"]),
+                )
+                for point in payload.get("by_width", ())
+            ),
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        payload = {
+            "enabled": self.enabled,
+            "minimum_ns": self.minimum_ns,
+            "fixed_ns": self.fixed_ns,
+            "row_ns": self.row_ns,
+            "input_element_bytes": self.input_element_bytes,
+            "packed_element_bytes": self.packed_element_bytes,
+            "effective_traffic_multiplier": self.effective_traffic_multiplier,
+        }
+        if self.by_width:
+            payload["by_width"] = [
+                {
+                    "threads": width,
+                    "minimum_ns": minimum,
+                    "fixed_ns": fixed,
+                    "row_ns": row,
+                }
+                for width, minimum, fixed, row in self.by_width
+            ]
+        return payload
+
+
+@dataclass(frozen=True)
+class StagePhaseCalibration:
+    """Per-stage/team service floor plus scale over the physical phase model."""
+
+    w13_by_width: tuple[tuple[int, float, float], ...] = ()
+    w2_by_width: tuple[tuple[int, float, float], ...] = ()
+
+    def __post_init__(self) -> None:
+        for name, raw_points in (
+            ("w13", self.w13_by_width),
+            ("w2", self.w2_by_width),
+        ):
+            points = tuple(
+                sorted(
+                    (int(width), float(minimum), float(scale))
+                    for width, minimum, scale in raw_points
+                )
+            )
+            if any(
+                width <= 0
+                or minimum < 0.0
+                or scale <= 0.0
+                or not math.isfinite(minimum)
+                or not math.isfinite(scale)
+                for width, minimum, scale in points
+            ):
+                raise ValueError(f"{name} phase points require positive widths/scales and finite costs")
+            if len({width for width, _, _ in points}) != len(points):
+                raise ValueError(f"{name} phase points must use unique widths")
+            object.__setattr__(self, f"{name}_by_width", points)
+
+    def target_ns(self, stage: str, threads: int, physical_ns: float) -> float:
+        if physical_ns <= 0.0 or not math.isfinite(physical_ns):
+            raise ValueError("physical stage time must be positive and finite")
+        if stage == "w13":
+            points = self.w13_by_width
+        elif stage == "w2":
+            points = self.w2_by_width
+        else:
+            raise ValueError(f"unsupported stage {stage!r}")
+        for width, minimum_ns, scale in points:
+            if width == threads:
+                return max(minimum_ns, scale * physical_ns)
+        return physical_ns
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> "StagePhaseCalibration":
+        def points(name: str) -> tuple[tuple[int, float, float], ...]:
+            return tuple(
+                (
+                    int(point["threads"]),
+                    float(point.get("minimum_ns", 0.0)),
+                    float(point.get("scale", 1.0)),
+                )
+                for point in payload.get(name, ())
+            )
+
+        return cls(
+            w13_by_width=points("w13_by_width"),
+            w2_by_width=points("w2_by_width"),
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        def points(values: tuple[tuple[int, float, float], ...]) -> list[dict[str, float | int]]:
+            return [
+                {"threads": width, "minimum_ns": minimum, "scale": scale}
+                for width, minimum, scale in values
+            ]
+
+        return {
+            "w13_by_width": points(self.w13_by_width),
+            "w2_by_width": points(self.w2_by_width),
+        }
+
+
+@dataclass(frozen=True)
+class DramDomainInjectionCalibration:
+    """Optional per-LLC-domain cap relative to an equal rank-bandwidth share."""
+
+    enabled: bool = False
+    capacity_scale: float = 1.0
+
+    def __post_init__(self) -> None:
+        if not math.isfinite(self.capacity_scale) or self.capacity_scale <= 0.0:
+            raise ValueError("DRAM domain-injection capacity_scale must be positive and finite")
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> "DramDomainInjectionCalibration":
+        return cls(
+            enabled=bool(payload.get("enabled", False)),
+            capacity_scale=float(payload.get("capacity_scale", 1.0)),
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "enabled": self.enabled,
+            "capacity_scale": self.capacity_scale,
+        }
+
+
+@dataclass(frozen=True)
 class AnalyticMachineCalibration:
     """Thin machine calibration independent of route and expert shape."""
 
@@ -541,6 +765,9 @@ class AnalyticMachineCalibration:
     narrow_team_contention_correction: NarrowTeamContentionCorrection = (
         NarrowTeamContentionCorrection()
     )
+    gather_pressure: GatherPressureCalibration = GatherPressureCalibration()
+    stage_phase_calibration: StagePhaseCalibration = StagePhaseCalibration()
+    dram_domain_injection: DramDomainInjectionCalibration = DramDomainInjectionCalibration()
 
     def __post_init__(self) -> None:
         if not self.machine_id:
@@ -580,6 +807,8 @@ class AnalyticMachineCalibration:
                 raise ValueError("LLC domains must partition rank_cpu_ids")
             if sum(domain.capacity_bytes for domain in self.llc_domains) != self.caches.llc_bytes_per_rank:
                 raise ValueError("LLC domain capacities must sum to llc_bytes_per_rank")
+        elif self.dram_domain_injection.enabled:
+            raise ValueError("DRAM domain injection requires calibrated LLC domains")
         object.__setattr__(self, "supported_widths", widths)
         object.__setattr__(self, "rank_cpu_ids", rank_cpu_ids)
 
@@ -739,6 +968,15 @@ class AnalyticMachineCalibration:
             narrow_team_contention_correction=NarrowTeamContentionCorrection.from_dict(
                 payload.get("planner", {}).get("narrow_team_contention_correction", {})
             ),
+            gather_pressure=GatherPressureCalibration.from_dict(
+                payload.get("planner", {}).get("gather_pressure", {})
+            ),
+            stage_phase_calibration=StagePhaseCalibration.from_dict(
+                payload.get("planner", {}).get("stage_phase_calibration", {})
+            ),
+            dram_domain_injection=DramDomainInjectionCalibration.from_dict(
+                payload.get("planner", {}).get("dram_domain_injection", {})
+            ),
         )
 
     @classmethod
@@ -791,6 +1029,17 @@ class AnalyticMachineCalibration:
             payload["planner"]["narrow_team_contention_correction"] = (
                 self.narrow_team_contention_correction.to_dict()
             )
+        if self.gather_pressure.enabled:
+            payload["planner"]["gather_pressure"] = self.gather_pressure.to_dict()
+        if (
+            self.stage_phase_calibration.w13_by_width
+            or self.stage_phase_calibration.w2_by_width
+        ):
+            payload["planner"]["stage_phase_calibration"] = (
+                self.stage_phase_calibration.to_dict()
+            )
+        if self.dram_domain_injection.enabled:
+            payload["planner"]["dram_domain_injection"] = self.dram_domain_injection.to_dict()
         return payload
 
 
@@ -1035,11 +1284,11 @@ class AnalyticPhase:
     residual_scale: float = 1.0
 
     def __post_init__(self) -> None:
-        if self.kind not in {"operator", "stage_setup", "cold_b", "steady_b"}:
+        if self.kind not in {"operator", "gather", "stage_setup", "cold_b", "steady_b"}:
             raise ValueError(f"unsupported analytical phase kind {self.kind!r}")
         if self.panel_count < 0:
             raise ValueError("panel_count must be non-negative")
-        if self.kind in {"operator", "stage_setup"} and self.panel_count != 0:
+        if self.kind in {"operator", "gather", "stage_setup"} and self.panel_count != 0:
             raise ValueError("non-GEMM phases cannot contain GEMM panels")
         if self.kind in {"cold_b", "steady_b"} and self.panel_count == 0:
             raise ValueError("GEMM phases must contain at least one panel")
@@ -1991,7 +2240,38 @@ class AnalyticMoeCostModel:
         w2_demand = self._stage_demand("w2", w2_mapping, self._w2_geometry)
         overhead_ns = self.calibration.overheads.expert_overhead_ns(routes, threads)
         phases: list[AnalyticPhase] = []
-        if overhead_ns > 0.0:
+        gather = self.calibration.gather_pressure
+        if gather.enabled:
+            gather_ns = gather.duration_ns(routes, threads)
+            gather_dram_bytes = gather.dram_bytes(routes, self.hidden_size)
+            phases.append(
+                AnalyticPhase(
+                    name="gather_pack_a",
+                    kind="gather",
+                    panel_count=0,
+                    active_threads=min(routes, threads),
+                    fixed_ns=0.0,
+                    gemm_core_ns=0.0,
+                    matrix_ns=0.0,
+                    frontend_ns=0.0,
+                    l1_ns=0.0,
+                    l2_ns=0.0,
+                    llc_ns=0.0,
+                    epilogue_ns=0.0,
+                    matrix_flops=0.0,
+                    frontend_instructions=0.0,
+                    l1_bytes=0.0,
+                    l2_bytes=0.0,
+                    llc_bytes=0.0,
+                    epilogue_elements=0.0,
+                    compulsory_dram_bytes=gather_dram_bytes,
+                    spillable_dram_bytes=0.0,
+                    dram_rate=gather_dram_bytes / (gather_ns * 1.0e-9),
+                    working_set_bytes=0.0,
+                    isolated_spill_fraction=0.0,
+                )
+            )
+        elif overhead_ns > 0.0:
             phases.append(
                 AnalyticPhase(
                     name="operator",
@@ -2019,8 +2299,43 @@ class AnalyticMoeCostModel:
                     isolated_spill_fraction=0.0,
                 )
             )
-        phases.extend(self._stage_phases(w13_demand))
-        phases.extend(self._stage_phases(w2_demand))
+        def calibrated_stage_phases(
+            stage: str,
+            stage_demand: AnalyticStageDemand,
+        ) -> list[AnalyticPhase]:
+            raw_phases = list(self._stage_phases(stage_demand))
+            if not raw_phases:
+                return raw_phases
+            physical_ns = sum(phase.base_ns for phase in raw_phases)
+            target_ns = self.calibration.stage_phase_calibration.target_ns(
+                stage,
+                threads,
+                physical_ns,
+            )
+            scale = target_ns / physical_ns
+            return [
+                replace(phase, residual_scale=phase.residual_scale * scale)
+                for phase in raw_phases
+            ]
+
+        stage_phases = [
+            *calibrated_stage_phases("w13", w13_demand),
+            *calibrated_stage_phases("w2", w2_demand),
+        ]
+        if gather.enabled and stage_phases:
+            # The legacy residual fit placed all unexplained task time before
+            # W13.  Once gather is explicit, retain that isolated total while
+            # moving the non-gather residual into the compute phases where the
+            # trace observes it.  This changes temporal overlap, not the old
+            # isolated prediction, for widths covered by the residual fit.
+            residual_ns = max(overhead_ns - gather_ns, 0.0)
+            stage_ns = sum(phase.base_ns for phase in stage_phases)
+            residual_scale = 1.0 + residual_ns / stage_ns
+            stage_phases = [
+                replace(phase, residual_scale=phase.residual_scale * residual_scale)
+                for phase in stage_phases
+            ]
+        phases.extend(stage_phases)
         return ExpertPrediction(
             routes=routes,
             threads=threads,
@@ -2405,6 +2720,68 @@ class AnalyticMoeCostModel:
                 default=1.0,
             )
             resource_scales[index]["llc_bytes"] = max(rank_llc_dilation, local_dilation)
+
+        injection = self.calibration.dram_domain_injection
+        if injection.enabled:
+            dram_index = _SHARED_RESOURCES.index("dram_bytes")
+            domain_dram_dilations = {}
+            for domain in domains:
+                domain_id = domain.domain_id
+                offered_rate = 0.0
+                active_threads = 0
+                for index, phase in current_items:
+                    count = task_domain_counts[index][domain_id]
+                    demand = resource_vectors[index][0][dram_index]
+                    if count <= 0 or demand <= 0.0:
+                        continue
+                    share = count / phase.active_threads
+                    offered_rate += (
+                        demand
+                        * share
+                        / max(
+                            phase.residual_scale * resource_vectors[index][1][dram_index] * 1e-9,
+                            1e-30,
+                        )
+                    )
+                    active_threads += count
+                if active_threads > 0:
+                    active_capacity = self.calibration.service_rate("dram_bytes", active_threads)
+                    equal_share_capacity = (
+                        self.calibration.dram_bytes.saturated_rate / len(domains)
+                    )
+                    capacity = min(
+                        active_capacity,
+                        injection.capacity_scale * equal_share_capacity,
+                    )
+                else:
+                    capacity = math.inf
+                utilization = offered_rate / capacity if math.isfinite(capacity) else 0.0
+                dilation = max(1.0, utilization)
+                domain_dram_dilations[domain_id] = dilation
+                domain_details[domain_id].update(
+                    {
+                        "dram_injection_active_threads": active_threads,
+                        "dram_injection_offered_rate": offered_rate,
+                        "dram_injection_capacity": capacity if math.isfinite(capacity) else None,
+                        "dram_injection_utilization": utilization,
+                        "dram_injection_dilation": dilation,
+                    }
+                )
+            for index, phase in current_items:
+                if resource_vectors[index][0][dram_index] <= 0.0:
+                    continue
+                local_dilation = max(
+                    (
+                        domain_dram_dilations[domain_id]
+                        for domain_id, count in task_domain_counts[index].items()
+                        if count > 0
+                    ),
+                    default=1.0,
+                )
+                resource_scales[index]["dram_bytes"] = max(
+                    resource_scales[index].get("dram_bytes", 1.0),
+                    local_dilation,
+                )
 
         multipliers = {
             index: (

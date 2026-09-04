@@ -127,6 +127,186 @@ Temporal-ranking remediation in progress before this gate may be reconsidered:
   `d51cb0e` retained baseline on all traces; measured shortlist regret was
   `0.242%/0.578%/0.516%`, with no stable local improvement. Point ranking below
   1% remains unresolved, so Step 2 stays closed.
+- [x] Add an anchor-relative pairwise validation report and a three-way partial
+  order without changing the analytical mean model. A same-v8 cross-session
+  replay retained the measured best at top-8 on all three traces and made zero
+  false-dominance decisions, but all 41 evaluated pairs were incomparable and
+  decision coverage on the three hardware-resolvable pairs was zero. This is a
+  safe diagnostic, not a useful VND pruning relation. A targeted two-lane swap
+  probe did not justify a generic temporal correction; see
+  `results/arm_codex_80c_pairwise_ordering_mvp_20260902.md`.
+- [x] Serialize measured-shortlist affected lanes, exact before/after task and
+  route sequences, isolated loads, and compressed placed-event context. On the
+  high-skew trace, three cross-lane swaps with `+4.02--5.70 ms` affected-tail
+  exposure regressed `12.61--15.17%`; the no-new-tail swap was unresolved at
+  `+0.40%`. No placed critical lane/expert switched. An excluded synthetic
+  `68-route tail <-> 1-route head` probe reproduced the slowdown but left only
+  `+1.95/-0.17` point background/isolated residual, so no new physical
+  parameter or calibration revision is justified.
+- [x] Connect the anchor-relative comparator to the offline shortlist and a
+  reusable best-improvement search loop. Only confidently worse candidates are
+  dominance-pruned; incomparable candidates stay eligible and budget deferral
+  is reported separately. The runner requires matching model/extension identity
+  plus zero-false-pruning and requested top-K recall gates. Known-counterexample
+  replay has zero false pruning; the mixed historical corpus fails top-8 but
+  passes top-16, so the guarded offline default is top-16. The same-v8 41-pair
+  replay remains 41/41 incomparable, therefore this closes plumbing and safety,
+  not search effectiveness or the multi-start VND measurement below.
+- [x] Decompose one fixed 1-route 1T expert across full-head, after-68,
+  16T-only, 1T-only, and isolated contexts without changing total work. Two
+  Arm 80C sessions found a stable `+0.823/+0.881 ms` full-head penalty: roughly
+  two thirds from 16T background, one third from 1T peers, and negligible
+  interaction. Delaying the same expert behind 68 routes removed
+  `0.557/0.545 ms`, almost entirely from W13. Frozen v8 underpredicts full-head
+  by about 58% and treats 1T-only as isolated. The concrete context is now
+  reproduced independently, but no parameter is added until a predeclared
+  route sweep establishes its shape and held-out explanatory value; see
+  `results/arm_codex_80c_small_expert_context_20260903.md`.
+- [x] Harden the small-expert probe to strict-DRAM measurement semantics while
+  retaining measured-copy rotation. Every sample now runs an untraced,
+  synchronous full-workload scrub on a fifth disjoint 660 MiB packed copy,
+  followed by the measured mode on one of four rotating copies. Two scrubbed
+  sessions preserve the decomposition (`+0.811/+0.819 ms` full,
+  `+0.558/+0.559 ms` 16T, `+0.272/+0.270 ms` 1T), while address-filtered SPE
+  reduces sampled target-W13 L3-hit incidence from about `6.9%` to `1.7%`.
+  Scrub is excluded from target timing and trace output.
+- [x] Run the predeclared scrubbed `M={1,2,5,6,12}` context sweep and prototype
+  explicit gather pressure. Full-head excess falls from `+0.811/+0.836 ms` at
+  M1/M2 to `+0.283 ms` at M12; 1T-only excess falls to `+0.022 ms`. An opt-in,
+  default-off gather phase plus residual time redistribution lowers in-sample
+  25-point mean absolute relative error from `21.7%` to `12.6%`, but one global
+  traffic multiplier overpredicts M1 1T-only/after-68 as `1.254/1.171 ms`
+  versus `0.907/0.921 ms`. Do not freeze this calibration or open VND/LNS.
+- [x] Add an independent placement/overlap probe separating same-LLC and
+  cross-LLC 1T background in gather-transition and pure-W13 windows. Two
+  31-round sessions reproduce local-minus-remote penalties of `0.244/0.248 ms`
+  at head and `0.225/0.233 ms` after one route, with every paired P10 above
+  `0.21 ms`. Select per-LLC-domain memory injection as the primary resource.
+  The opt-in cap reduces locality-contrast mean absolute error from about
+  `0.230 ms` to `0.055 ms`, but stacking it on frozen-v8 corrections worsens
+  the old route-context holdout MAPE to about `28.5%`; do not freeze a value.
+- [x] Re-account gather/W13/W2 from a new disjoint isolated phase corpus across
+  all supported widths, reset whole-total and old wide/narrow residuals, fit
+  domain injection only from cross-LLC after-1, and add gather coupling only
+  after a stable head residual. Isolated holdout W13/W2/total MAPE improves to
+  `1.46/9.18/3.69%`, but the contrast-only gather multiplier is unidentifiable:
+  full route-context MAPE is `273.97%`, high-skew top-8 misses measured best,
+  and real traces contain 16 false-dominance pairs. Reject the full candidate;
+  keep frozen v8 and VND/LNS closed.
+- [x] Add an absolute-pressure identification probe that sweeps local and remote
+  gather aggressor count. Jointly fit isolated-relative slowdown and locality
+  contrast; do not fit another parameter from a single difference. Reuse the
+  accepted phase floor/scale form, and retain the old route/real traces as
+  untouched holdout. Two Arm sessions saturate local slowdown near four
+  68-route streams and keep remote near zero. The session-1 joint fit lands
+  on $\beta=0.78$, $\alpha_g=0.25$ at the multiplier bound, with fit/validation
+  joint MAE `0.689/0.719 ms` and 739 near-optima. Rank `dram_bytes` sharing,
+  not gather coupling, supplies the ~0.9 ms common-mode overprediction.
+  Reject the candidate; keep frozen v8, holdout unread, and VND/LNS closed.
+- [x] Change DRAM contention scope rather than retune $(\beta,\alpha_g)$.
+  First ablate rank-wide `dram_bytes` versus domain-only injection on the
+  locked count-sweep DAGs, then add a default-off structure only if one
+  missing resource explains the local n≈4 plateau and near-zero remote.
+  Do not read holdout or add an empirical residual. Rank DRAM accounts for
+  about 49% of remote n15 (`+0.893` to `+0.454 ms`); leftover LLC dilation
+  is `~2.44`. No arm saturates at n≈4 or makes remote near zero. Do not add
+  a structure.
+- [x] Ablate rank LLC versus domain LLC on the same locked DAGs. Rank LLC
+  accounts for 100% of leftover remote n15 (`+0.454` to `0 ms`); same-LLC
+  is unchanged, as required. Domain LLC still grows through n=15
+  (`0.168/0.397/0.447/0.590 ms`). After rank DRAM, rank LLC, domain LLC,
+  and L2 are removed, the 1-route 1T victim is isolated (`+0.001 ms`)
+  while hardware same-LLC n15 remains `+0.312 ms`. Do not add a structure.
+- [x] Propose victim-asymmetric dilation on the same locked DAGs: a 1-route
+  1T victim must not inherit 68-route peer GEMM LLC/DRAM dilation, and any
+  remaining same-LLC tax must saturate near four streams. Add a default-off
+  structure only if one arm hits remote-near-zero, n4 contrast, and the
+  n≈4 plateau together. Do not read holdout or add an empirical residual.
+  `compute_bound_skip` matches symmetric because the 1-route 1T W13 victim
+  is transfer-bound. `same_llc_peers` zeros remote and leaves the growing
+  local curve. `own_demand` zeros both (n15 `+0.001/0 ms`). No arm hits all
+  three gates. Do not add a structure. The leftover is a saturating
+  same-LLC occupancy tax that cannot be identified on this count sweep.
+- [x] Identify the leftover saturating same-LLC occupancy tax with a probe
+  independent of this count sweep: vary aggressor $M$ at fixed count. Do not
+  fit $T_\mathrm{sat}$ or $n_\mathrm{knee}$ on the existing n=1/2/4/8/15
+  curve, do not add an empirical residual, and do not read holdout. Probe is
+  `bench_aggressor_m_occupancy.py`: victim $M=1$, counts 0/1/4, aggressor
+  $M\in\{1,4,16,68\}$, same/cross LLC, head and after_1. Session-1 overlap is
+  valid and remote n4 is near zero. same-LLC n4 head is
+  $+0.660/+0.639/+0.402/+0.290\,\mathrm{ms}$ at $M=1/4/16/68$: the tax falls
+  as aggressor $M$ grows. Predeclared occupancy / duration occupancy /
+  utilization all miss. Do not add a structure. The leftover is same-LLC
+  contention among concurrent transfer-bound streams, not 68-route byte
+  utilization.
+- [x] Split 16 fill ports from 16 streams on LLC7 logical `48-63`. Arm
+  session-1: 1T / 1×16T / 16×1T same-LLC head $+0.018/+0.014/+0.160\,\mathrm{ms}$.
+  `fill_ports` is false; predeclared `one_stream` misses the $0.20\,\mathrm{ms}$
+  gap. Do not add a structure. Do not read holdout.
+- [x] Count streams, not threads: on cores `48-63` the 16-thread ladder is
+  $+0.003/+0.035/+0.075/+0.155\,\mathrm{ms}$ at $1/2/4/16$ streams, and
+  4×4T matches 4×1T ($+0.075$ vs $+0.070$). On `43-63`, `8+8+4+1` matches
+  four mix-start 1T ($+0.110$ vs $+0.103$) not 21×1T ($+0.301$). Signature
+  `stream_count`. Do not add a structure. Do not read holdout.
+- [x] Put one layer's W13+W2 into one contiguous DRAM allocation and compare
+  it with the current two packed tensors. Arm session-1: 16×1T leftover
+  split/unified $+0.153/+0.157\,\mathrm{ms}$ (diff $0.004$). Signature
+  `layout_neutral`. This cannot collapse 16 concurrent expert streams into
+  one. Do not add a structure. Do not read holdout.
+- [x] Put the same contiguous W13+W2 block on mmap+MADV_NOHUGEPAGE versus
+  mmap+MADV_HUGEPAGE and verify AnonHugePages. Arm session-1: 4 KiB huge
+  pages $0$, THP coverage $100\%$; 16×1T leftover small/THP
+  $+0.167/+0.162\,\mathrm{ms}$ (diff $0.005$). Signature `page_neutral`.
+  Do not add a structure. Do not read holdout.
+- [x] Write the leftover-identification handoff:
+  `optimizations/fused_moe_sve/results/cost_model_leftover_identification_handoff_20260904.md`.
+  Do not add a structure from this chain.
+- [x] Attribute the stream-count leftover with simultaneous core PMU, all LLC7
+  L3C slices, and all NUMA3 DDRC counters. Use a PMU-only active-task plan so
+  dependency-delayed post-victim work is excluded, and gate counters around
+  each measured cell after the disjoint full-weight scrub. Two joint 31-run Arm
+  sessions show that DDR read-command latency and victim LLC-miss/backend-stall
+  response saturate near four distinct packed-B fills while aggregate DRAM
+  traffic continues from about 10 to 108 MiB/call. Do not add a formula from
+  five cells; 4x1T remains noisy and needs an independent count/team sweep.
+  See `optimizations/fused_moe_sve/results/arm_codex_80c_stream_pressure_pmu_20260904.md`.
+- [x] Sweep 0/1/2/4/8/16 distinct packed-B blocks at fixed 16 peer threads,
+  independently repeat 4x1T, and compare anchored DDRC-queue and victim-LLC
+  single-feature models with leave-one-count-out. Queue/LLC LOCO MAE is
+  `0.0453/0.0364 ms`, but LLC pressure becomes negative at count 1 and has a
+  larger max error. Queue transfers better to the two 4x1T layout checks
+  (`-0.0274/-0.0010 ms` error versus LLC `+0.0558/+0.0248 ms`) but still
+  underpredicts counts 8/16. Prefer queue only for follow-up; freeze neither
+  model. See
+  `optimizations/fused_moe_sve/results/arm_codex_80c_stream_pressure_count_loco_20260904.md`.
+- [x] Remove process-per-cell baseline drift: keep all modes and packed copies
+  in one long-lived process, randomize isolated/candidates per round, and use
+  direct `perf_event_open` reset/enable/disable/read for each cell. Main and
+  independent 4x1T sessions have 31 paired rounds and 60 counters/cell, all at
+  running ratio 1.0. Paired queue/LLC LOCO MAE is `0.0515/0.0778 ms`; affine
+  sensitivity is `0.0355/0.0432 ms`. Queue wins and tracks the 4-to-8-stream
+  transition, but its linear form overpredicts 1--4 and underpredicts 8--16.
+  Accept the protocol; freeze neither feature and add no knee/residual. See
+  `optimizations/fused_moe_sve/results/arm_codex_80c_stream_pressure_paired_pmu_20260904.md`.
+- [x] Hold packed-B count and expert starts fixed while changing request-arrival
+  shape: compare start-aligned 4x4T/4x2T/4x1T and 8x2T/8x1T in two independent
+  same-process paired PMU sessions. At count 4, narrower teams lower queue
+  latency but victim-span differences remain inside zero-crossing intervals.
+  At count 8, 8x1T versus 8x2T lowers queue by `16.90/14.06 cycles` and victim
+  span by `0.1133/0.0775 ms`; both P90s remain negative in both sessions.
+  Reject victim-asymmetric narrow harm. Request pressure depends on distinct B
+  count and team-width/issuer shape, but two counts do not identify a formula.
+  See
+  `optimizations/fused_moe_sve/results/arm_codex_80c_stream_pressure_request_shape_20260904.md`.
+- [x] Run the locked `count={4,6,8} x width={1T,2T}` proxy grid with count 6
+  as untouched holdout in two sessions. Fit count 4/8 only and test distinct-B,
+  requester threads, their product, and a measured-W13-overlap oracle through
+  `proxy -> DDR queue -> victim slowdown`. No proxy passes all queue, slowdown,
+  direction, and 20% parameter-stability gates. Proxy-to-queue drift is
+  `25.8--32.3%`; queue-to-slowdown drift is only `7.5%`. Set
+  `stop_absolute_model_expansion=true`; keep frozen v8 and move safety work to
+  partial order, top-K recall, and false-pruning replay. See
+  `optimizations/fused_moe_sve/results/arm_codex_80c_stream_pressure_proxy_grid_20260904.md`.
 
 - [ ] Starting independently from full, one-step, greedy, and fixed-width
   controls, run best-improvement descent over same-lane insertion, same-width
@@ -182,12 +362,19 @@ Temporal-ranking remediation in progress before this gate may be reconsidered:
 
 ### Step 4: make event-guided search affordable
 
-- [ ] Precompute immutable expert/width phase descriptions and memoize plans by
+- [x] Precompute immutable expert/width phase descriptions and memoize plans by
   canonical hash. Profile event evaluation before changing the search budget.
+  The current Lab evaluator caches exact scores and lane phases; on the frozen-v8
+  three-trace repeat, exact scoring sustained `6.34--9.90` plans/s and the cheap
+  screen sustained `186--349` plans/s.
 - [ ] Add a two-level evaluator: generate hundreds of legal neighbors with a
   cheap affected-lane/domain delta bound, then run the complete event model on
   only the best diverse subset. Verify that screening does not discard the
-  measured best on the audit corpus.
+  measured best on the audit corpus. The first evaluator projects `1.57--5.06x`
+  wall-time speedup and `42--85%` fewer exact calls, but failed this gate: every
+  tested `8/16/32` per-operator budget discarded the uniformish measured-best
+  state. Its retained-baseline regret was only `0.603%` and the candidate was
+  not stable, but the strict recall requirement remains unmet.
 - [ ] If evaluation remains dominant, incrementally replay only affected event
   intervals or move the deterministic simulator to native code. Report plans
   evaluated per second and quality versus equal wall-clock budget.

@@ -7,6 +7,399 @@ baseline:
   status: reference
 
 features:
+  - id: planner.dram_domain_injection_probe
+    part: planner
+    status: experimental
+    implementation: >-
+      optimizations/fused_moe_sve/benchmarks/bench_gather_injection_overlap.py,
+      fit_absolute_pressure_calibration.py,
+      ablate_rank_dram_domain_scope.py,
+      ablate_rank_llc_domain_scope.py,
+      ablate_victim_asymmetric_dilation.py,
+      bench_aggressor_m_occupancy.py,
+      bench_fill_port_vs_stream.py,
+      bench_stream_count_composition.py,
+      bench_stream_pressure_pmu.py,
+      analyze_stream_pressure_pmu.py,
+      bench_stream_pressure_pmu_paired.py,
+      analyze_stream_pressure_pmu_paired.py,
+      analyze_stream_pressure_request_shape.py,
+      analyze_stream_pressure_proxy_grid.py,
+      linux_perf_event.py,
+      bench_unified_weight_block.py,
+      bench_weight_thp.py, and
+      cpu_moe_schedule_optimization/cost_model/analytic_model.py
+    hypothesis: >-
+      A per-LLC-domain memory-injection ceiling explains the stable locality
+      penalty of a cold 1T W13 victim under both gather-transition and W13-stream
+      peers better than a first-order gather-versus-stream resource split.
+    depends_on:
+      - planner.small_expert_context_probe
+    conflicts_with: []
+    correctness: >-
+      PYTHONPATH=.:src .venv/bin/python -m pytest -q
+      tests/test_moe_gather_injection_overlap.py
+      tests/test_moe_absolute_pressure_calibration.py
+      tests/test_moe_rank_dram_domain_scope.py
+      tests/test_moe_rank_llc_domain_scope.py
+      tests/test_moe_victim_asymmetric_dilation.py
+      tests/test_moe_aggressor_m_occupancy.py
+      tests/test_moe_fill_port_vs_stream.py
+      tests/test_moe_stream_count_composition.py
+      tests/test_moe_stream_pressure_pmu.py
+      tests/test_moe_stream_pressure_pmu_analysis.py
+      tests/test_moe_stream_pressure_pmu_paired.py
+      tests/test_moe_stream_pressure_pmu_paired_analysis.py
+      tests/test_moe_stream_pressure_request_shape.py
+      tests/test_moe_stream_pressure_proxy_grid.py
+      tests/test_moe_linux_perf_event.py
+      tests/test_moe_unified_weight_block.py
+      tests/test_moe_weight_thp.py
+      tests/test_moe_analytic_model.py
+    benchmark: >-
+      On Arm-codex-internal NUMA3 CPUs 240-319, keep a 1-route 1T target on
+      CPU304 and sweep 0/1/2/4/8/15 one-thread 68-route aggressors on LLC7,
+      LLC6, and a pre-fixed half-and-half split, at lane head and after one
+      route; then, independently, keep counts 0/1/4 and sweep aggressor
+      routes 1/4/16/68 on the same placement/phase protocol. Independently, on
+      LLC7 logical cores 48-63, compare one 16-thread M=1 team against sixteen
+      1-thread M=1 streams and one       1-thread neighbor, with LLC6 remote controls. Independently, keep 16
+      threads on cores 48-63 and compare 1x16T / 2x8T / 4x4T / 16x1T, then
+      compare 8+8+4+1 on cores 43-63 against four 1T starts and 21x1T.
+      Independently, keep the same 16x1T vs 1x16T DAG and compare split W13/W2
+      packed tensors against one contiguous W13+W2 allocation. Independently,
+      copy that contiguous block onto mmap+MADV_NOHUGEPAGE versus
+      mmap+MADV_HUGEPAGE and verify AnonHugePages. Record absolute
+      isolated-relative slowdown and same-minus-cross contrast with 5 warmups,
+      31 randomized paired traces, 4 measured copies, and one disjoint scrub
+      copy. Finally, run all stream-count cells in one long-lived process with
+      shared packed allocations and direct per-cell `perf_event_open`
+      reset/read for CPU304, all LLC7 L3C slices, and all NUMA3 DDRCs.
+    owner: zhangxu
+    opened: 2026-09-03
+    decision_by: 2026-10-03
+    next_decision: >-
+      The locked count-6 proxy holdout rejects every executable-state proxy;
+      stop absolute-model expansion. Keep frozen v8 and move to anchor-relative
+      partial order, top-K recall, and false-pruning replay. Do not add a queue
+      term, knee, width multiplier, or residual, and do not read old holdout.
+    adoption_gate: >-
+      Stable positive local-minus-remote P10 in both phase windows and sessions,
+      lower held-out route-context MAPE and false pruning, and no regression on
+      the three frozen real-trace shortlists.
+    result: >-
+      Two cross-LLC sessions measured local-minus-remote head penalties of
+      0.244/0.248 ms and pure-W13 after-1 penalties of 0.225/0.233 ms, with all
+      P10 above 0.21 ms. The count sweep then showed local isolated-relative
+      slowdown saturating near four 68-route streams and remote remaining near
+      zero. Joint absolute-plus-contrast fitting on session 1 landed at
+      capacity_scale 0.78 and gather coupling 0.25, on the multiplier bound,
+      with fit/validation joint MAE 0.689/0.719 ms and 739 near-optima.
+      Rank dram_bytes sharing, not gather coupling, supplies about half of the
+      ~0.9 ms common-mode overprediction; removing rank DRAM leaves ~0.45 ms
+      remote n15 from llc_bytes dilation ~2.44. Rank LLC then accounts for that
+      leftover remote entirely (cross n15 0.454 to 0 ms); domain LLC keeps the
+      growing local leftover and does not saturate at n≈4. After all LLC and L2
+      sharing is removed the model victim is isolated (+0.001 ms) while hardware
+      same-LLC n15 remains +0.312 ms. Victim-asymmetric dilation then shows the
+      1-route 1T W13 victim is transfer-bound, so compute-bound skip matches
+      symmetric; same-LLC peers zeros remote only; own-demand zeros both
+      (n15 +0.001/0 ms). No arm hits remote-near-zero, n4 contrast, and the
+      n≈4 plateau together. Reject every candidate; keep the structure
+      default-off; do not freeze calibration or enter VND. Aggressor-M occupancy
+      session-1 then shows same-LLC n4 head +0.660/+0.639/+0.402/+0.290 ms at
+      M=1/4/16/68, so the leftover tax falls as aggressor routes grow. Reject
+      utilization and M-independent occupancy; do not add a structure. The
+      leftover is concurrent transfer-bound fills. Fill-port session-1 on LLC7
+      cores 48-63 then shows 1T / 1x16T / 16x1T same-LLC head
+      +0.018/+0.014/+0.160 ms: a 16-thread M=1 team matches one 1T neighbor,
+      not sixteen independent fills. Predeclared signature is inconclusive
+      because 16x1T minus 1x16T is 0.146 ms, below the 0.20 ms gap. Stream-count
+      composition is the next probe. Do not add a structure. Stream-count
+      session-1 then accepts concurrent packed-B streams, not threads: 4x4T
+      +0.075 ms matches 4x1T +0.070 and not 16x1T +0.155; 8+8+4+1 +0.110
+      matches four mix-start 1T +0.103 and not 21x1T +0.301. Do not add a
+      structure. Unified weight-block session-1 is layout_neutral: 16x1T
+      leftover split/unified +0.153/+0.157 ms (diff 0.004). One contiguous
+      W13+W2 allocation does not collapse 16 concurrent expert streams and
+      does not lower the leftover. Weight-THP session-1 is page_neutral:
+      16x1T leftover 4KiB/THP +0.167/+0.162 ms (diff 0.005) with smaps
+      AnonHugePages 0 vs 100%. Do not add a structure. Handoff:
+      results/cost_model_leftover_identification_handoff_20260904.md. A later
+      joint PMU probe excludes post-victim delayed tasks and synchronously
+      measures CPU304, all LLC7 L3C slices, and all NUMA3 DDRCs. Session-3
+      isolated/1x16T/4x4T/4x1T/16x1T victim spans are
+      0.477/0.517/0.627/0.644/0.704 ms; DDR read-command latency is
+      32.6/43.9/55.8/49.2/57.0 cycles while DRAM traffic keeps growing to
+      108.3 MiB/call. Attribute the knee to victim-visible LLC miss plus DDR
+      queueing, not aggregate-byte saturation. The noisy 4x1T cell and five
+      points do not identify a formula; add no structure. The subsequent
+      fixed-16-thread 0/1/2/4/8/16 sweep gives anchored LOCO
+      MAE 0.0453 ms for DDRC queue latency and 0.0364 ms for victim LLC miss
+      ratio. LLC has a negative count-1 pressure and larger maximum error;
+      queue predicts the independent 4x1T repeat within 0.0010 ms but still
+      underpredicts counts 8/16. Freeze neither feature. A same-process direct-
+      perf-event repeat then removes isolated baseline drift. Paired queue/LLC
+      LOCO MAE is 0.0515/0.0778 ms and affine MAE is 0.0355/0.0432 ms. Queue
+      pressure is positive at every count and jumps with the measured
+      4-to-8-stream slowdown; LLC pressure is negative at counts 1/2/4. Queue
+      wins the feature comparison but its linear form still misses the
+      transition and underpredicts the independent 4x1T control by 0.0283 ms.
+      Accept the protocol, not a model. Fixed-count shape sessions then keep
+      expert starts constant across 4x4T/4x2T/4x1T and 8x2T/8x1T. Count-4 width
+      effects do not separate from zero in both sessions. At count 8, 8x1T
+      lowers queue by 16.90/14.06 cycles and victim span by 0.1133/0.0775 ms
+      versus 8x2T, with both P90s negative. Reject narrow-team asymmetric harm;
+      retain a count-by-issuer-shape interaction as the next hypothesis, not a
+      fitted structure. The subsequent count 4/6/8 grid fits 4/8 and locks 6 as
+      holdout. Distinct B, requester threads, their product, and a measured-W13-
+      overlap oracle all fail the two-session gates; proxy-to-queue parameter
+      drift is 25.8--32.3% while queue-to-slowdown drift is only 7.5%. Stop
+      absolute-model expansion and pivot to conservative ordering. See
+      results/arm_codex_80c_dram_domain_injection_20260903.md,
+      results/arm_codex_80c_absolute_pressure_20260904.md,
+      results/arm_codex_80c_absolute_pressure_joint_fit_20260904.md,
+      results/arm_codex_80c_rank_dram_domain_scope_20260904.md,
+      results/arm_codex_80c_rank_llc_domain_scope_20260904.md,
+      results/arm_codex_80c_victim_asymmetric_dilation_20260904.md,
+      results/arm_codex_80c_aggressor_m_occupancy_20260904.md,
+      results/arm_codex_80c_fill_port_vs_stream_20260904.md,
+      results/arm_codex_80c_stream_count_composition_20260904.md,
+      results/arm_codex_80c_unified_weight_block_20260904.md,
+      results/arm_codex_80c_weight_thp_20260904.md,
+      results/arm_codex_80c_stream_pressure_pmu_20260904.md,
+      results/arm_codex_80c_stream_pressure_count_loco_20260904.md,
+      results/arm_codex_80c_stream_pressure_paired_pmu_20260904.md,
+      results/arm_codex_80c_stream_pressure_request_shape_20260904.md,
+      results/arm_codex_80c_stream_pressure_proxy_grid_20260904.md, and
+      results/cost_model_leftover_identification_handoff_20260904.md.
+
+  - id: planner.phase_reaccount_calibration
+    part: planner
+    status: experimental
+    implementation: >-
+      cpu_moe_schedule_optimization/cost_model/analytic_model.py,
+      optimizations/fused_moe_sve/benchmarks/bench_isolated_phase_reaccount.py,
+      fit_phase_reaccount_calibration.py, evaluate_phase_reaccount_holdout.py,
+      and rescore_measured_neighborhood_states.py
+    hypothesis: >-
+      Separately calibrated gather/W13/W2 service floors plus domain injection
+      can replace whole-expert and wide/narrow residuals while improving both
+      absolute and pairwise real-trace accuracy.
+    depends_on:
+      - planner.dram_domain_injection_probe
+      - planner.small_expert_context_probe
+    conflicts_with: []
+    correctness: >-
+      PYTHONPATH=.:src .venv/bin/python -m pytest -q
+      tests/test_moe_analytic_model.py tests/test_moe_isolated_phase_reaccount.py
+      tests/test_moe_phase_reaccount_calibration.py
+      tests/test_moe_phase_reaccount_holdout.py
+    benchmark: >-
+      Fit two 31-round isolated phase sessions on disjoint routes and all eight
+      supported widths, freeze before reading the five old route-context and
+      three real-trace artifacts, then exhaustively recover and rescore every
+      measured state hash.
+    owner: zhangxu
+    opened: 2026-09-03
+    decision_by: 2026-10-03
+    next_decision: >-
+      Keep the accepted phase floor/scale frozen. The joint absolute-pressure
+      fitter now owns domain/gather parameter selection; do not retune from
+      locked route or real-trace holdout.
+    adoption_gate: >-
+      Lower route-context holdout MAPE than frozen v8, zero false dominance on
+      hardware-resolvable pairs, measured-best top-8 recall on all three traces,
+      and no selected regression above two percent.
+    result: >-
+      Isolated phase attribution passed: repeat W13/W2/total MAPE was
+      3.49/4.70/4.38 percent and old-route isolated holdout was
+      1.46/9.18/3.69 percent. The full candidate failed because cross-LLC
+      contrast alone drove gather coupling to 22.26: concurrent holdout MAPE was
+      273.97 percent, high-skew top-8 missed measured best, and high/median had
+      10/6 false-dominance pairs. Reject the candidate and retain frozen v8.
+      See results/arm_codex_80c_phase_reaccount_20260903.md.
+
+  - id: planner.small_expert_context_probe
+    part: planner
+    status: experimental
+    implementation: >-
+      optimizations/fused_moe_sve/benchmarks/bench_small_expert_context.py
+    hypothesis: >-
+      The absolute 1T small-expert bias can be decomposed into a full-cohort
+      head-position effect, a 68-route predecessor effect, independent 16T and
+      1T background effects, and their interaction while holding target expert,
+      routes, weights, CPU, and total work constant.
+    depends_on:
+      - planner.serial_lane_swap_probe
+      - planner.narrow_team_contention_correction
+    conflicts_with: []
+    correctness: >-
+      PYTHONPATH=.:src .venv/bin/python -m pytest -q
+      tests/test_moe_small_expert_context.py
+    benchmark: >-
+      On Arm-codex-internal NUMA3 CPUs 240-319, run
+      bench_small_expert_context.py against frozen-v8 with H=4096, F=512,
+      a 1T target swept over M={1,2,5,6,12}, a fixed 68-route predecessor,
+      5 warmups, 21 or 31 randomized paired trace rounds, 4 rotating measured
+      weight copies, and one disjoint full-workload scrub copy before every
+      sample.
+    owner: zhangxu
+    opened: 2026-09-03
+    decision_by: 2026-10-03
+    next_decision: >-
+      Use the measured decomposition to choose at most one independently
+      identifiable missing context; do not update calibration when the effect
+      is interaction-dominated or does not explain the real-trace bias.
+    adoption_gate: >-
+      Bit-exact outputs across all five plans, stable paired P10/P90 direction,
+      an additive or explicitly isolated interaction effect, and explanatory
+      power for the observed mixed-width critical-path switch on held-out
+      real-trace candidates.
+    result: >-
+      The final strict-DRAM protocol preserved 4-copy rotation and ran one
+      disjoint 660 MiB packed scrub copy before every sample. Two 31-round
+      sessions measured full-head at 1.445/1.453 ms versus isolated
+      0.633/0.640 ms. The excess decomposed into 0.558/0.559 ms from 16T
+      background, 0.272/0.270 ms from 1T peers, and -0.022/-0.022 ms
+      interaction. Moving the target after 68 routes reduced span by
+      0.523/0.531 ms. Address-filtered SPE reduced sampled target-W13 L3-hit
+      incidence from about 6.9 to 1.7 percent. The route sweep reduced the
+      full-head excess from 0.811/0.836 ms at M1/M2 to 0.283 ms at M12. A
+      default-off explicit gather-pressure prototype reduced in-sample
+      25-point mean absolute relative error from 21.7 to 12.6 percent, but one
+      traffic multiplier overpredicted M1 1T-only and after-68. No calibration
+      is frozen; next separate domain-local gather from rank-wide streaming.
+      See results/arm_codex_80c_small_expert_context_20260903.md.
+
+  - id: planner.anchor_relative_partial_order
+    part: planner
+    status: experimental
+    implementation: >-
+      cpu_moe_schedule_optimization/planners/pairwise_plan_ordering.py and
+      optimizations/fused_moe_sve/benchmarks/analyze_plan_pairwise_ordering.py,
+      integrated optionally by bench_executable_neighborhood_audit.py
+    hypothesis: >-
+      A context-calibrated candidate-versus-anchor residual interval can avoid
+      false dominance while retaining measured-best plans in a bounded hardware
+      shortlist, without changing the analytical event-model mean.
+    depends_on:
+      - planner.uncertainty_aware_neighborhood_gate
+    conflicts_with: []
+    correctness: >-
+      PYTHONPATH=.:src .venv/bin/python -m pytest -q
+      tests/test_moe_pairwise_plan_ordering.py
+      tests/test_moe_pairwise_ordering_report.py
+    benchmark: >-
+      Run analyze_plan_pairwise_ordering.py with the first frozen-v8
+      three-trace neighborhood results as --fit and an independent same-v8
+      session as --evaluate, using 90 percent residual coverage, four minimum
+      context samples, and top-K budgets 8,16,32.
+    owner: zhangxu
+    opened: 2026-09-02
+    decision_by: 2026-10-02
+    next_decision: >-
+      Run the guarded top-16 policy from independent full, one-step, greedy,
+      and fixed-width starts. Require nonzero correct decision coverage on
+      stable >2 percent pairs before claiming useful VND/LNS pruning.
+    adoption_gate: >-
+      Zero false pruning above the 2 percent hardware resolution margin,
+      measured-best top-16 recall on every held-out trace, matching model and
+      extension identity, and no fit/evaluation artifact overlap. Nonzero
+      correct decision coverage is additionally required for an effectiveness
+      claim, but not for conservative shortlist wiring.
+    result: >-
+      Provisional same-v8 cross-session replay evaluated 41 pairs. All 41 were
+      incomparable, including all three hardware-resolvable pairs; false
+      dominance was zero and top-8 retained the measured best on all three
+      traces. The offline runner now accepts only a gate-bearing, identity-
+      matched report; it uses top-16 by default, distinguishes dominance pruning
+      from budget deferral, retains incomparable candidates for measurement,
+      and only accepts confidently better moves. A broader 129-pair historical
+      replay has zero false pruning and preserves the cp_sat_06 reversal as
+      incomparable; top-8 misses three measured bests while top-16 retains all.
+      The relation is still vacuous on the same-v8 replay, so useful multi-start
+      VND remains unproven. See
+      results/arm_codex_80c_pairwise_ordering_mvp_20260902.md.
+
+  - id: planner.executable_two_level_evaluator
+    part: planner
+    status: experimental
+    implementation: >-
+      cpu_moe_schedule_optimization/planners/executable_plan_neighborhood.py
+      and optimizations/fused_moe_sve/benchmarks/bench_executable_neighborhood_audit.py
+    hypothesis: >-
+      Reusing immutable lane phases and screening with phase, lane, domain, and
+      rank bounds reduces complete placed-event calls while retaining the
+      measured-best executable neighbor.
+    depends_on:
+      - planner.executable_search_state
+      - planner.topology_preserving_width_neighborhood_audit
+    conflicts_with: []
+    correctness: >-
+      PYTHONPATH=.:src .venv/bin/python -m pytest -q
+      tests/test_moe_executable_plan_neighborhood.py
+    benchmark: >-
+      Run paper_experiments/suites/arm_width_neighborhood_audit.json with
+      screen audit budgets 8,16,32 on Arm-codex-internal NUMA3.
+    owner: zhangxu
+    opened: 2026-09-02
+    decision_by: 2026-10-02
+    next_decision: >-
+      Replace the current per-operator phase-surrogate cutoff with a diverse
+      uncertainty-aware screen and repeat the exact/measured-best recall audit.
+    adoption_gate: >-
+      Retain the exact and measured best on all three traces at one declared
+      budget, report exact-call and wall-time reduction, and preserve exact
+      scorer/cache semantics.
+    result: >-
+      Provisional Arm 80C rates were 6.34--9.90 exact versus 186--349 screened
+      plans/s, with projected 1.57--5.06x wall-time speedup. Median/high-skew
+      retained the measured best, but every tested budget missed uniformish;
+      the fidelity gate therefore fails. See
+      results/arm_codex_80c_pairwise_ordering_mvp_20260902.md.
+
+  - id: planner.serial_lane_swap_probe
+    part: planner
+    status: experimental
+    implementation: >-
+      optimizations/fused_moe_sve/benchmarks/bench_narrow_lane_merge_transition.py
+    hypothesis: >-
+      Independently constructed two-1T-lane head and tail-to-head swaps under mixed
+      4x16T+14x1T background reproduces the large real-trace cross-lane-swap
+      residual and identifies one missing generic temporal correction.
+    depends_on:
+      - planner.narrow_team_contention_correction
+      - planner.uncertainty_aware_neighborhood_gate
+    conflicts_with: []
+    correctness: >-
+      PYTHONPATH=.:src .venv/bin/python -m pytest -q
+      tests/test_moe_narrow_lane_merge_transition.py
+    benchmark: >-
+      On Arm-codex-internal NUMA3 CPUs 240-319, run
+      bench_narrow_lane_merge_transition.py against the frozen-v8 calibration
+      with 5 warmups, 31 randomized paired trace rounds, and 4 weight copies.
+    owner: zhangxu
+    opened: 2026-09-02
+    decision_by: 2026-10-02
+    next_decision: >-
+      Do not add a generic or tail/head correction. Refine the real-trace
+      context beyond tail exposure, because the independent tail/head probe
+      reproduced the slowdown but not the missing-model residual.
+    adoption_gate: >-
+      Reproduce a stable multi-percent residual in an excluded holdout mode,
+      identify one independent physical parameter, and reduce that residual on
+      a frozen rerun without regressing the original narrow-merge holdouts.
+    result: >-
+      Exact shortlist context tied three real-trace regressions of 12.61--15.17
+      percent to 4.02--5.70 ms of new affected-tail exposure, without a modeled
+      critical-lane switch. An independent 68-route-tail/1-route-head exchange
+      reproduced a 32.40/34.97 percent background/isolated slowdown, but the
+      model residual was only +1.95/-0.17 points and stayed below 1.96 points
+      across five tail/head cases. No new parameter is identified, and the
+      original v8 calibration remains frozen. See
+      results/arm_codex_80c_pairwise_ordering_mvp_20260902.md.
+
   - id: planner.narrow_team_contention_correction
     part: planner
     status: experimental

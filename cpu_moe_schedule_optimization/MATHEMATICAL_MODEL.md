@@ -1657,6 +1657,71 @@ $T_{guard}(P')\le(1-\delta_{min})T_{guard}(P)$才可自动替换incumbent；首�
 $\delta_{min}=2\%$与既有no-regression/actionability gate一致。低于margin的候选可进入
 measured shortlist，但不能驱动VND接受或作为模型证明收益。
 
+**Anchor-relative partial-order diagnostic。** 离线搜索不需要把低于分辨率的候选强制排成
+全序。固定一个可执行anchor $P_0$，采用“正值表示candidate更快”的相对增益：
+
+$$
+\widehat g(P;P_0)=100\left(\frac{\widehat T(P_0)}{\widehat T(P)}-1\right),
+\qquad
+g^{hw}(P;P_0)=\operatorname{median}_r
+100\left(\frac{T_r(P_0)}{T_r(P)}-1\right).
+$$
+
+校准样本的delta residual为$e=g^{hw}-\widehat g$。首版不修改event mean，只取
+$|e|$的预声明coverage分位数$q_c$；context样本不足时依次回退operator family与全局
+分位数。对未进入生产的离线诊断关系：
+
+$$
+P\prec P_0\iff \widehat g-q_c>\delta_d,
+\qquad
+P_0\prec P\iff \widehat g+q_c<-\delta_d,
+$$
+
+其中$\delta_d$是dominance margin，与硬件actionable threshold分离；区间覆盖anchor的
+pair保持incomparable。首版只比较candidate与当前可执行anchor，避免任意pairwise classifier
+形成偏序环。
+
+**Offline shortlist/search policy。** 离线runner只加载带replay gate和匹配
+calibration/extension identity的pairwise report。候选分为：`better`进入acceptance集合，
+`incomparable`保留在硬件frontier，只有`worse`可由partial order做dominance pruning。
+有限budget导致的未入选单独记为`budget_deferred`，不得记作模型pruning。shortlist先按context
+各保留一个leader，再按区间下界和point gain补满；anchor始终隐式保留。搜索每轮只接受
+完整下界超过actionable margin的best-improvement，并以该状态成为下一轮anchor；没有
+`better`即停止，不能把`incomparable`当作下降失败证明。启用前必须满足对应top-K的
+measured-best recall与zero-false-pruning gate；首版默认$K=16$。该策略只进入离线Lab路径，
+不改变production quick planner、Plan V2或runtime dispatch。
+
+**Two-level executable evaluator。** 完整placed event score保持唯一权威objective，并按
+canonical state hash缓存。cheap screen复用不可变lane phase及isolated lane load，构造
+lane bound $L$、按core-time平均的rank bound $R$、按lane与LLC domain物理交集分摊的
+domain bound $D$，再以忽略完整resource vector、仅保留wide/narrow team residual的
+phase surrogate $S$排序：
+
+$$
+B(P)=\max(L(P),D(P),R(P)),\qquad
+S_{priority}(P)=\max(S(P),B(P)).
+$$
+
+$S_{priority}$不是完整event objective或硬件上界，只能筛选进入完整评分的diverse subset。
+如果任一声明budget丢失audit corpus的measured best，则不得启用该screen；增加吞吐本身不
+构成采用证据。
+
+**Measured-shortlist context contract。** 对进入硬件shortlist的真实候选，离线artifact必须
+保存相对anchor的真实affected lane集合。每条affected lane记录物理CPU/LLC、isolated load
+以及完整有序$(expert,routes,window)$序列；placed event log压缩为affected-task的head/tail
+暴露、solo time、phase/team dilation、peer threads、resource overlap、cohort transition及
+critical lane/task摘要。原始event序列不进入artifact，以控制体积。pairwise residual context
+可以使用这些解析模型产生的标签，但不得使用硬件结果本身构造标签。
+
+high-skew诊断中，三个大幅退化的same-width cross-lane swap都把`62/68`-route的1T lane尾
+任务换到另一1T lane头部，使affected-tail暴露增加`4.02--5.70 ms`；硬件退化
+`12.61--15.17%`。无新增tail暴露的swap硬件median为`+0.40%`且区间跨零；四者均没有
+placed critical-lane/expert switch。因此该批反例首先按tail exposure而非critical switch分组。
+但独立`68-route tail <-> 1-route head` probe的background/isolated硬件与模型增益分别为
+`-32.40/-34.35%`和`-34.97/-34.80%`，只留下`+1.95/-0.17`个百分点residual。该物理转换
+已由现有lane/event模型表达，未复现real-trace剩余residual，故不得增加新参数或修改冻结
+calibration；需要找到更具体且能在独立probe上复现的context。
+
 **Topology-preserving width neighborhood。** Step 3仍在canonical executable state内搜索，
 不允许先生成fluid assignment再做contiguous lowering。设lane $l=(b,t,Q)$ 完全包含于单一
 LLC domain $d$。若$t/2$属于已校准宽度集合，则split将其替换为
@@ -5382,6 +5447,514 @@ planning 对未命中点执行原解析公式；首次调用结束后在文件�
 加 `os.replace` 原子写回。文件缺失、损坏、identity 不符或不可写都降级为进程内解析，
 不改变候选、排序、目标、Plan V2 或算子正确性。`cost_cache_dir=None` 可显式关闭。
 
+#### 9.43 显式 gather 压力原型（默认关闭）
+
+原 v8 把 isolated total residual 全部表示为 W13 前的零资源 `operator` phase。这能拟合
+$T_{iso}$，却会把真实的 `gather_pack_a` DRAM 流量从并发事件中删除，并把非 gather
+residual 错放到 W13 之前。scrubbed trace 直接显示 lane-head target 的 W13 与 peer
+gather 重叠，因此增加一个 calibration 可选、默认关闭的原型：
+
+$$
+T_g(M,t)=f_g+r_g\left\lceil\frac{M}{t}\right\rceil,
+\qquad
+Q_g(M)=\alpha_g M H(b_{in}+b_{pack}).
+$$
+
+启用时，`gather_pack_a` 成为 active-thread 数为 $\min(M,t)$ 的显式 phase，平均请求率为
+$Q_g/T_g$；它与 cold/steady GEMM phase 一同进入既有 event resource allocator。为不把
+旧 isolated residual 丢掉，若旧 width-specific residual 为 $O(M,t)$，则
+$\max(O-T_g,0)$ 按原 W13/W2 phase 时间比例分配回 compute phase。因而已有 residual-fit
+width 的 isolated 总时间保持为旧 $O+T_{W13}+T_{W2}$，但时间位置和资源身份被修正；
+未启用该字段的旧 calibration 逐位保持 v8 行为。
+
+首个 Arm 原型取 trace-derived $f_g=5\ \mu s$、$r_g=2.9\ \mu s$/worker-row，扫描单一
+effective-traffic 参数 $\alpha_g$。在 $M\in\{1,2,5,6,12\}$、五种 context 的同一批
+25 个点上，$\alpha_g\approx3$ 将 absolute-relative-error mean 从 frozen-v8 的
+21.7% 降到 12.6%，并使 M1 full/16T-only 达到 1.500/1.192 ms（实测
+1.445/1.193 ms）。但同一点把 1T-only/after-68 预测为 1.254/1.171 ms（实测
+0.907/0.921 ms），不能同时解释 domain-local latency-bound gather 与跨 domain
+连续权重流；独立 M1 repeat 的五 context MAPE 为 17.34%，其中 1T-only/after-68
+仍过估 38.03%/26.74%。故该式仅是默认关闭的可证伪原型，模型 schema/name 升为 9/v7 以隔离 cache，
+**不生成或冻结新 calibration，也不进入 VND/LNS**。下一 probe 必须分别测 1T/16T
+gather 的 phase duration、有效 DRAM/LLC-domain 流量和 victim W13 overlap；在此之前禁止
+把 $\alpha_g$ 当成通用带宽倍率。
+
+#### 9.44 LLC-domain memory-injection ceiling（默认关闭）
+
+独立 placement probe 固定 target、aggressor 数量、route、权重与总工作，仅把十五个 1T
+aggressor 从 target 所在 LLC domain 移到另一个 LLC domain。两次 31-round session 中，
+local-minus-remote 的 head 差为 0.244/0.248 ms，after-1（target 开始时 15/15 peer 均在
+W13）差为 0.225/0.233 ms；四个 paired P10 均大于 0.21 ms。locality penalty 在 gather
+transition 与 W13 stream 两种窗口近似保持，因此首要缺口选择 domain injection，而不是
+先拆两个独立资源。
+
+令 LLC domain 集为 $\mathcal D$，rank DRAM service curve 为 $C_R(n)$，饱和值为
+$C_R^{sat}$。可选 calibration $\beta>0$ 定义：
+
+$$
+C_{d,inj}(n_d)=\min\left(C_R(n_d),
+\beta\frac{C_R^{sat}}{|\mathcal D|}\right),
+$$
+
+$$
+R_{d,inj}=\sum_{i:d\cap CPU_i\ne\varnothing}
+\frac{|CPU_i\cap d|}{a_i}\frac{Q_{i,dram}}{T_{i,dram}},
+\qquad
+D_{d,inj}=\max\left(1,\frac{R_{d,inj}}{C_{d,inj}}\right).
+$$
+
+其中 $a_i$ 是 phase active threads；跨 domain task 按 active-thread share 分流。task 的
+DRAM dilation 取既有 rank dilation 与所触及 domain injection dilation 的最大值。event
+explanation 同步保存每个 domain 的 active threads、offered rate、capacity、utilization 和
+dilation。字段缺失时不计算 domain cap，旧 calibration 保持 rank-only 行为。
+
+原型 $\beta=0.76$ 把 local-minus-remote 的 head/after 预测从约 0.004/0.004 ms 修正到
+0.145/0.235 ms，mean absolute contrast error 从约 0.230 ms 降到 0.055 ms；但与冻结 v8
+residual 直接叠加后，旧 25 点 route-context holdout MAPE 从 21.7% 恶化到约 28.5%。这说明
+wide-team、narrow-team 与新 domain cap 对同一 contention 有双计数。故只接受资源结构，
+不冻结 $\beta$，模型 identity 升为 schema 10/v8，VND/LNS 继续关闭；后续必须联合重估或
+替换旧 residual，再以 route sweep 和三条 real trace 做 holdout。
+
+#### 9.45 Phase re-accounting 与不可识别的 gather coupling
+
+为避免 whole-expert total residual 掩盖 phase 误差，独立 fit corpus 使用与旧 holdout
+不相交的 route 集 $\{3,4,7,8,10,16,24,48,68,600,1800\}$ 和全部支持宽度
+$\{1,2,4,8,16,32,40,80\}$，对 gather/W13/W2 分别拟合：
+
+$$
+T_g(M,t)=\max\left(G_t, r_t\left\lceil\frac Mt\right\rceil\right),
+$$
+
+$$
+T_s(M,t)=\max\left(F_{s,t},\gamma_{s,t}T_s^{physical}(M,t)\right),
+\qquad s\in\{W13,W2\}.
+$$
+
+$G_t$ 是 gather 小工作服务下限，$r_t$ 是每 worker-row 时间；$F_{s,t}$ 是 cold stage
+服务下限，$\gamma_{s,t}$ 只缩放原 physical stage。参数只消费 phase trace envelope，
+whole-expert span 仅验证三 phase 求和，不进入 loss。旧 expert fixed/route overhead 的拟合项、
+wide-team pressure 和 narrow-team correction 在 candidate 中归零；panel/range restart 与机器
+service curve 保留。模型 identity 升为 schema 11/v9。
+
+第二个独立 phase session 的 gather/W13/W2/total MAPE 为
+16.13%/3.49%/4.70%/4.38%。纯 holdout 的 $M=\{1,2,5,6,12\}$ isolated W13/W2/total
+MAPE 为 1.46%/9.18%/3.69%，证明重分账本身有效。
+
+随后只用 cross-LLC after-1 contrast 拟合 $\beta=0.787$，validation residual 为
+0.0086 ms；head contrast 留下稳定 $>0.02$ ms residual，且预测值落在fit paired区间外，
+按预声明规则需要 gather/stream coupling。只用 head contrast 拟合得到 $\alpha_g=22.26$，fit/repeat residual 为近零/0.0040
+ms。但这个值只由差分约束，local/remote 的巨大共模误差被抵消，不能识别 absolute pressure。
+
+冻结后才读取的 25 点 route-context holdout 将 MAPE 从 frozen-v8 的 21.72% 恶化到
+273.97%；48 个可分辨 mode pair 中出现 2 个 false dominance。三条 real trace 完整找回
+13/16/12 个旧 measured state，high/median/uniformish Spearman 为 0.345/0.075/0.368，
+high-skew top-8 漏 measured best；high-skew/median 的 43/9 个可分辨 pair 中分别出现
+10/6 个 false dominance。因此接受 phase floor/scale 结构，拒绝完整 candidate 和
+$\beta/\alpha_g$ 参数；不得替换 frozen v8 或接入 VND/LNS。下一 probe 必须同时提供
+absolute slowdown 与 local-minus-remote contrast，并扫描 aggressor 数量，才能联合识别
+domain cap 与 gather traffic。
+
+#### 9.46 联合 absolute/contrast 拟合仍不能识别 $\beta$ 与 $\alpha_g$
+
+本节不改公式、不升 schema、不替换 frozen v8。拟合器重放 9.45 已接受的
+$T_g=\max(G_t,r_t\lceil M/t\rceil)$ 与 $T_s=\max(F_{s,t},\gamma_{s,t}T_s^{physical})$，
+将 wide-team / narrow-team 与 whole-expert overhead 置 identity/zero，并在锁定的
+aggressor-count probe 上联合最小化
+
+$$
+L=\mathrm{MAE}(\Delta^{\mathrm{abs}})+\mathrm{MAE}(\Delta^{\mathrm{loc}}),
+$$
+
+其中 $\Delta^{\mathrm{abs}}$ 是每个非 isolated mode 相对 matched isolated 的 median
+span，$\Delta^{\mathrm{loc}}$ 是同一 count/phase 的 $\mathrm{same\text{-}LLC}-\mathrm{cross\text{-}LLC}$。
+split 只进入绝对族。$\alpha_g$ 搜索上界固定为 8，禁止回到 contrast-only 的 22.26。
+session 2 只做 validation；holdout SHA 在读入前拒绝。
+
+Arm-codex NUMA3 两次 31-round count sweep（seed `20260907`/`20260908`）的硬件事实见
+`optimizations/fused_moe_sve/results/arm_codex_80c_absolute_pressure_20260904.md`：
+same-LLC 绝对减速在约 4 条 68-route 1T 流处饱和（head 相对 isolated 约
+$+0.14/+0.20/+0.29/+0.30/+0.31\,\mathrm{ms}$，$n=1/2/4/8/15$），cross-LLC 相对
+isolated 接近 0，split 看起来像 local 而不是 local/remote 平均。
+
+session-1 粗网格 $\beta\in[0.20,2.00]$、$\alpha_g\in[0.25,8.00]$ 后邻域加密，最优点为
+$\beta=0.78$、$\alpha_g=0.25$（贴 $\alpha_g$ 下界）。fit 绝对/对比/联合 MAE 为
+$0.549/0.140/0.689\,\mathrm{ms}$；session-2 联合 MAE $0.719\,\mathrm{ms}$，对比残差全为正、
+均值 $0.171\,\mathrm{ms}$，超过预声明的 $0.03\,\mathrm{ms}$ 同号门槛。近优集合有 739 个点
+（loss $\le 1.05L^\star$），$\beta$ 跨度比 2.82、$\alpha_g$ 跨度比 11，判定不可辨识。
+该点不是被拒绝的 contrast-only $(0.787,22.26)$。
+
+即使 $\alpha_g$ 取下界，模型仍把高 count 的绝对压力高估约 3--5 倍：fit session 的
+same-LLC head $n=15$ 实测 $+0.312\,\mathrm{ms}$、预测 $+1.057\,\mathrm{ms}$；cross-LLC
+head $n=15$ 实测 $+0.043\,\mathrm{ms}$、预测 $+0.893\,\mathrm{ms}$。head $n\le 4$ 的
+预测 contrast 为 0，因为 same 与 cross 被同一份 rank DRAM dilation 拖到几乎相同的
+span。离线消融表明，关闭 domain cap 或把 $\alpha_g$ 从 0.25 提到 1.00，n15 head 的
+绝对预测几乎不变（约 $+0.90\,\mathrm{ms}$）；$\beta=2$ 与 domain-off 重合。因此主导共模
+来自既有 rank `dram_bytes` 曲线对重叠 68-route W13/W2 的共享服务，而不是 gather
+offered-rate。把 $\beta$ 降到 0.20 能造出 locality contrast，但 same-LLC n15 head
+绝对预测跳到 $+5.38\,\mathrm{ms}$。
+
+仍不可识别的物理量是 **DRAM contention 的作用域与饱和形态**，不是再一个
+$(\beta,\alpha_g)$ 数值：
+
+1. 远程 LLC 上的 68-route 流为何几乎不通过 rank DRAM 拉长本地 1-route 1T victim，
+   而模型用共享 $C_R(n)$ 对所有并发 task 做 dilation；
+2. 本地 victim 为何在约 4 条 same-LLC 流处饱和，而 rank/domain utilization 会一直
+   长到 $n=15$；
+3. domain injection 只能叠在这份过大的共模之上，因此无法同时拟合 $\approx 0.3\,\mathrm{ms}$
+   的 local plateau 和 $\approx 0$ 的 remote。
+
+禁止为此加经验 residual、禁止扩大 $\alpha_g$ 上界、禁止读取 holdout、禁止替换
+frozen v8 或接入 VND/LNS。下一步必须先改 DRAM 作用域（例如 domain-local DRAM
+service，或 victim-asymmetric dilation），而不是重估 9.44/9.45 的两个标量。完整拟合
+记录见
+`optimizations/fused_moe_sve/results/arm_codex_80c_absolute_pressure_joint_fit_20260904.md`。
+锁定 DAG 上的 rank DRAM vs domain-only 消融见 9.47；rank LLC vs domain LLC
+消融见 9.48。
+
+#### 9.47 Rank DRAM 只解释约一半远程共模，不能单独改成 domain-only
+
+本节不改公式、不升 schema、不替换 frozen v8。诊断脚本在与 9.46 相同的锁定
+session-1 DAG 上比较预声明的作用域臂，不搜索 $(\beta,\alpha_g)$。关掉 rank DRAM
+dilation 时，只把 placed allocator 中第一次 `service_rate(dram_bytes)`（rank 共享容量）
+设为无穷，后续 domain injection 仍使用原来的 $C_R(n_d)$；禁止直接放大
+`dram_bytes` 曲线，否则 equal-share cap 会一起被抬高。
+
+预声明判定：远程 n15 head 绝对预测须 $\le 0.08\,\mathrm{ms}$，n4 locality contrast
+须 $\ge 0.10\,\mathrm{ms}$，且 same-LLC n15 与 n4 之差 $\le 0.05\,\mathrm{ms}$。只有三
+者同时被单一臂满足才允许新增 default-off 结构。
+
+结果：rank-only 的 cross/same n15 head 为 $+0.893/+0.897\,\mathrm{ms}$。去掉 rank
+DRAM 后降到 $+0.454/+0.590\,\mathrm{ms}$，远程共模只去掉约 $49\%$。剩余 dilation 由
+`llc_bytes` 主导（cross n15 的 LLC dilation $\approx 2.44$，L2 仅 $\approx 1.10$），
+gather 与首个 W13 cold 面板仍不膨胀。domain-only $\beta=0.78$ 把 n4 contrast 抬到
+$0.543\,\mathrm{ms}$，但远程仍是 $+0.454\,\mathrm{ms}$，same-LLC n15$-$n4 仍为
+$0.328\,\mathrm{ms}$；$\beta=0.20$ 把 same n15 推到 $+5.71\,\mathrm{ms}$。没有任何臂
+达到预声明的单一资源门槛。
+
+另外，n=1 的本地 $+0.144\,\mathrm{ms}$ 也不能由该消融恢复：rank DRAM 给 same 与
+cross 同样的 $+0.082\,\mathrm{ms}$，去掉后 same n1 预测为 0。硬件是 saturating、
+same-LLC-only 的小税；模型是随 count 增长的 rank/LLC utilization。
+
+因此不新增 default-off 结构。锁定 DAG 上的 rank LLC vs domain LLC 消融见 9.48。
+
+#### 9.48 Rank LLC 解释全部剩余远程共模，domain LLC 仍是随 count 增长的本地税
+
+本节不改公式、不升 schema、不替换 frozen v8。诊断脚本在与 9.46/9.47 相同的锁定
+session-1 DAG 上比较预声明的 LLC 作用域臂；全部臂保持 rank DRAM 关闭、
+$\alpha_g=1$、domain DRAM injection 关闭，不搜索参数。
+
+placed allocator 对 LLC 走两条容量：逐域单 key 的 $B_d(n_d)$，以及传入全部
+domain id 的 rank 调用。单活跃域时 rank 容量等于 domain 容量；两域同时活跃时
+rank 取 $\min(\sum B_d, B_{LLC,rank}^{sat})$。task 的 LLC dilation 为
+$\max(\mathrm{rank},\mathrm{local})$。关掉 rank LLC 时，只对
+`len(llc_domain_threads)>1` 的 `service_rate(llc_bytes)` 返回无穷；禁止套用
+DRAM 的第一次调用规则，因为 domain LLC 先于 rank LLC 被调用。
+
+预声明判定与 9.47 相同：远程 n15 head 绝对预测须 $\le 0.08\,\mathrm{ms}$，n4
+locality contrast 须 $\ge 0.10\,\mathrm{ms}$，且 same-LLC n15 与 n4 之差
+$\le 0.05\,\mathrm{ms}$。只有三者同时被单一臂满足才允许新增 default-off 结构。
+
+结果：`no_rank_dram` 的 cross/same n15 head 为 $+0.454/+0.590\,\mathrm{ms}$。
+`domain_llc_only` 把远程打到 $0$，本地曲线不变，因此
+`rank_llc_fraction_of_leftover_remote_n15=1$。same-LLC 下两臂逐点相同，符合
+单活跃域时 rank LLC 已等于 domain LLC。事件上，cross n15 的 victim domain LLC
+dilation 已是 $1.00$，aggressor domain 为 $2.84$，victim 通过 rank fabric
+$2.44$ 继承远程共模；关掉 rank LLC 后 victim phase dilation 变为 $1$。
+
+但 `domain_llc_only` 的 same-LLC n15$-$n4 仍为 $0.194\,\mathrm{ms}$，count 形状
+为 $0.168/0.397/0.447/0.590\,\mathrm{ms}$（n2/4/8/15），达不到 n≈4 饱和。
+`no_llc` 把本地 n15 降到 $+0.001\,\mathrm{ms}$，`no_llc_no_l2` 与之相同，L2
+dilation $\approx 1.10$ 不是剩余项。去掉全部共享 cache/DRAM 后，模型中的
+1-route 1T victim 近似 isolated，而硬件 same-LLC n15 仍为 $+0.312\,\mathrm{ms}$、
+n1 为 $+0.144\,\mathrm{ms}$。
+
+因此不新增 default-off 结构。锁定 DAG 上的 victim-asymmetric dilation 消融见 9.49。
+
+#### 9.49 1-route victim 继承的是 cohort 字节 dilation，own-demand 会把它打成 isolated
+
+本节不改公式、不升 schema、不替换 frozen v8。诊断脚本在与 9.46--9.48 相同的锁定
+session-1 DAG 上比较 dilation **分配规则**，不搜索参数、不加 additive residual。
+全部臂保持 domain DRAM injection 关闭，并保留 rank DRAM 与 rank LLC 容量。
+
+对称规则把 cohort 的 DRAM/L2/LLC dilation 套到每一个并发 task。对照臂为：
+孤立 GEMM$\ge$transfer 的 phase 不再吃 transfer dilation（`compute_bound_skip`）；
+只把同一 LLC domain 内 task 的 DRAM offered 计入 victim，并去掉 rank LLC
+（`same_llc_peers`）；每个 task 只用自己的 offered/capacity
+（`own_demand`）。禁止把 peer count 截断到 4 作为可接受结构，因为那会在定义
+gate 的同一条 count 曲线上**强制**制造平台。
+
+孤立瓶颈：1-route 1T 的 W13 cold 是 transfer-bound（DRAM $0.243\,\mathrm{ms}$，
+GEMM $0.189\,\mathrm{ms}$），68-route 1T 是 GEMM-bound（$1.134$ vs $0.243$）。
+两者 cold packed-B 几乎相同（约 $8.4\,\mathrm{MiB}$）。因此
+`compute_bound_skip` 与对称臂逐点相同。
+
+结果（head isolated-relative）：对称臂 same/cross n15 为
+$+0.897/+0.893\,\mathrm{ms}$。`same_llc_peers` 把远程打到 $0$，本地曲线不变。
+`own_demand` 把本地/远程 n15 打到 $+0.001/0\,\mathrm{ms}$（单条 cold-B 流约
+$24\,\mathrm{GB/s}$，低于 rank DRAM $166\,\mathrm{GB/s}$ 与 domain LLC
+$216\,\mathrm{GB/s}$）。没有任何臂同时满足远程近零、n4 contrast 与 n≈4 平台。
+
+因此不新增 default-off 结构。own-demand 证明过预测来自「短 transfer-bound
+victim 继承 68-route cohort 字节利用率」；硬件留下的是
+$\approx 0.31\,\mathrm{ms}$、n≈4 饱和、same-LLC-only 的 occupancy 税，不能由现有
+service curve 识别，也不能在本 count sweep 上拟合 additive residual。固定 count
+变 aggressor $M$ 的识别见 9.50。holdout 仍未读。完整记录见
+`optimizations/fused_moe_sve/results/arm_codex_80c_victim_asymmetric_dilation_20260904.md`。
+
+#### 9.50 固定 count 变 aggressor $M$，识别 leftover 是 occupancy 还是利用率
+
+本节不改公式、不升 schema、不替换 frozen v8、不读 holdout。识别必须独立于
+n=1/2/4/8/15 count 曲线：victim 仍是 1-route 1T，peer 人数固定在孤立对照、n=1
+与 n=4，aggressor 的 route 数取 $M\in\{1,4,16,68\}$。packed-B 几乎不随 $M$ 变
+（约 $8.4\,\mathrm{MiB}$）；A/C 流与 GEMM 时长随 $M$ 增长。$M=1$ 的 aggressor
+与 victim 一样是 transfer-bound，$M=68$ 是 GEMM-bound。
+
+预声明判定（head isolated-relative），本 probe **不加结构**：
+
+- occupancy：same-LLC n1 与 n4 从 $M=1$ 到 $M=68$ 的变化绝对值 $\le 0.05\,\mathrm{ms}$
+- duration occupancy：$M=1$ 的 n4 税 $\le 0.08\,\mathrm{ms}$，且 $M=16$ 与 $M=68$
+  相差 $\le 0.05\,\mathrm{ms}$，同时 $M=68$ 的 n4 税 $\ge 0.10\,\mathrm{ms}$
+- utilization：n4 税从 $M=1$ 到 $M=68$、以及从 $M=16$ 到 $M=68$，增长都
+  $\ge 0.15\,\mathrm{ms}$
+- overlap：same-LLC n1/n4 的 `peer_overlap_experts` 中位数至少为 $0.8\times$ count，
+  否则本 cell 作废
+
+probe：`optimizations/fused_moe_sve/benchmarks/bench_aggressor_m_occupancy.py`。
+Affinity 与 count sweep 相同：`taskset -c 240-319 numactl --membind=3`，5 warmup、
+31 randomized rounds、4 measured copies、每 sample 前用最大 $M$ 的 isolated scrub。
+$M$ 与 placement 在同一轮内打乱，避免跨 $M$ 时间漂移。未启用的 background 仍
+dependency-delay 到 target lane tail，每个 $M$ 内部保持同一 route histogram。
+
+Session-1（seed `20260909`，SHA
+`f1daf1e5b4aa02cc9d0c61fcfbde72005eb4f678be2bb20e48d25e031a3217b0`）overlap 有效，
+远程 n4 近零。same-LLC n4 head isolated-relative 为
+$M=1/4/16/68$：$+0.660/+0.639/+0.402/+0.290\,\mathrm{ms}$。$M=68$ 的 $+0.290$ 与
+锁定 count sweep 的 n4 $+0.291$ 一致。P10/P90 把 $M=1$（$0.637$--$0.701$）与
+$M=68$（$0.274$--$0.317$）分开。预声明三态都不成立：税随 $M$ **下降**，不是
+occupancy 平台，也不是 utilization 上升。after_1 上 $M=1/4$ 税消失，因为短
+peer 在 1-route delay 期间已经结束，不是 head 的对照。
+
+因此不新增结构。leftover 是同 LLC 上并发 **transfer-bound** 流的争用：短
+DRAM-bound peer 罚得更重，长 GEMM-bound peer 反而更轻。holdout 仍未读。完整记录见
+`optimizations/fused_moe_sve/results/arm_codex_80c_aggressor_m_occupancy_20260904.md`。
+
+#### 9.51 同一 16 核上拆 1×16T 与 16×1T
+
+本节不改公式。问 16 线程宽队是一条访存流还是 16 个填数口。victim 仍是 1-route
+1T；全部 aggressor $M=1$（transfer-bound）。对照核为 LLC7 logical `48-63`
+（不含 victim 64）。预声明：`fill_ports` 若 1×16T 与 16×1T 的 same-LLC 税相差
+$\le 0.10\,\mathrm{ms}$ 且 16×1T $\ge 0.40\,\mathrm{ms}$；`one_stream` 若 1×16T
+接近单条 1T（$\le 0.10\,\mathrm{ms}$）且 16×1T 比它至少再重 $0.20\,\mathrm{ms}$。
+Arm session-1 overlap 有效、远程近零；same-LLC head 为 1T / 1×16T / 16×1T 的
+$+0.018/+0.014/+0.160\,\mathrm{ms}$。`fill_ports` 不成立。`one_stream` 方向成立
+但 many$-$wide 仅 $0.146\,\mathrm{ms}$，未过 $0.20\,\mathrm{ms}$ 门槛，故
+`inconclusive`。1×16T $M=1$ 是一条 packed-B，不是 16 条独立填数。本 probe
+不加结构。完整记录见
+`optimizations/fused_moe_sve/results/arm_codex_80c_fill_port_vs_stream_20260904.md`。
+
+#### 9.52 数流不数线程：`8+8+4+1` 对照
+
+本节不改公式。问 leftover 税跟并发 packed-B 流数走，还是跟线程数走。victim
+仍是 1-route 1T。全部 aggressor $M=1$。等线程阶梯固定 16 线程于 logical
+`48-63`，流数为 $1/2/4/16$（1×16T、2×8T、4×4T、16×1T），另用 4×1T 作四流对照。
+用户构图 `8+8+4+1` 放在 `43-63`（21 线程、4 流），对照同起点 4×1T 与 21×1T。
+预声明：`stream_count` 若 4×4T 更接近 4×1T 而不是 16×1T，且 `8+8+4+1` 更接近
+四流 1T 而不是 21×1T；`thread_count` 则相反。Arm session-1 overlap 有效；
+等线程阶梯 same-LLC head 为 1×16T / 2×8T / 4×4T / 4×1T / 16×1T 的
+$+0.003/+0.035/+0.075/+0.070/+0.155\,\mathrm{ms}$；`8+8+4+1` / 四起点 1T /
+21×1T 为 $+0.110/+0.103/+0.301\,\mathrm{ms}$。自动化签名 `stream_count`。
+21×1T 远程 $+0.211\,\mathrm{ms}$，四流 mix 远程 $+0.042$。本 probe 不加结构。
+完整记录见
+`optimizations/fused_moe_sve/results/arm_codex_80c_stream_count_composition_20260904.md`。
+
+#### 9.53 整层权重放进一块连续 DRAM
+
+本节不改公式。当前 packed 已是每矩阵一块 `[E,\mathrm{packed}]`；kernel 要求
+contiguous 2-D，不能在专家之间插入空洞。本 probe 把一层 W13 与 W2 再拷进
+同一匿名 allocation 的两个 view，对照现在的两块 tensor。问的是：再并成一块
+会不会降低 16×1T leftover。它不能把 16 条并发专家流变成 1 条流。victim 仍是
+1-route 1T，全部 $M=1$，核位与 fill-port 相同。本机未预留 HugeTLB。预声明：
+`unified_helps` 若 unified 比 split 至少轻 $0.08\,\mathrm{ms}$；`layout_neutral`
+若两者相差 $\le 0.04\,\mathrm{ms}$。Arm session-1 overlap 有效；16×1T leftover
+split/unified 为 $+0.153/+0.157\,\mathrm{ms}$，差 $0.004$，签名 `layout_neutral`。
+1×16T 为 $+0.041/+0.042$。远程 16×1T 为 $+0.088/+0.098$，略超 $0.08$ 报告门槛。
+本 probe 不加结构。完整记录见
+`optimizations/fused_moe_sve/results/arm_codex_80c_unified_weight_block_20260904.md`。
+
+#### 9.54 权重块 THP 对照 4 KiB
+
+本节不改公式。unified-block 已证明把 W13+W2 拼成一块不降 leftover，但
+`torch.empty` 可能静默继承 THP。本 probe 把同一块 W13+W2 拷进
+`mmap+MADV_NOHUGEPAGE` 与 `mmap+MADV_HUGEPAGE`，用 `/proc/self/smaps` 的
+`AnonHugePages` 验证页大小。victim 仍是 1-route 1T，全部 $M=1$，核位与
+fill-port 相同。不改 `FUSED_CPP_PAGES`，scratch 保持进程默认。本机 THP 为
+`[always]`，未预留 HugeTLB。预声明：`thp_helps` 若 4 KiB 比 THP 至少重
+$0.08\,\mathrm{ms}$；`page_neutral` 若两者 leftover 相差 $\le 0.04\,\mathrm{ms}$；
+`thp_not_latched` 若 4 KiB 仍有大页或 THP 覆盖不足 $80\%$。Arm session-1 overlap
+有效且页验证通过：4 KiB AnonHugePages $=0$，THP 覆盖 $100\%$。16×1T leftover
+small/THP 为 $+0.167/+0.162\,\mathrm{ms}$，差 $0.005$，签名 `page_neutral`。
+1×16T 为 $+0.006/+0.008$。isolated 绝对 span 为 $0.577/0.571\,\mathrm{ms}$。
+远程 16×1T 为 $+0.145/+0.143$，高于 $0.08$ 报告门槛。本 probe 不加结构。完整
+记录见
+`optimizations/fused_moe_sve/results/arm_codex_80c_weight_thp_20260904.md`。
+
+#### 9.55 core PMU、L3C 与 DDRC 对 leftover 的硬件分账
+
+本节不改公式、不读 holdout。PMU 不能直接包住 9.52 的完整等工作量 DAG，因为被
+禁用的 background 会在 victim 结束后执行并污染 uncore 总量。因此新增 Lab-only
+`bench_stream_pressure_pmu.py`：每个 cell 只保留 victim 与实际并发 peer；初始化、
+warmup 和第五份不相交 packed copy 的 18-expert scrub 均在 counter disabled 时完成。
+两个嵌套 `perf stat --delay=-1 --control=fifo` 在同一次 31-run cell 上同步采 CPU304
+core PMU、LLC7 十个 L3C slice、NUMA3 八个 DDRC 与 native target trace。
+
+session-2/3 的 victim span 在 isolated、1x16T、4x4T、4x1T、16x1T 上分别为
+$0.482/0.519/0.630/0.691/0.705$ 与
+$0.477/0.517/0.627/0.644/0.704\,\mathrm{ms}$；除 4x1T 外跨 session 差不超过
+$0.005\,\mathrm{ms}$。session-3 的 DDR read-command latency 为
+$32.6/43.9/55.8/49.2/57.0$ cycles，victim LLC read-miss ratio 为
+$5.3/13.3/33.8/55.9/52.7\%$，backend-stall ratio 为
+$70.6/71.3/74.3/75.7/75.6\%$。这些延迟/失速量在约四份互异 B 后趋于平台；相反，
+DRAM read traffic 仍为 $10.0/21.5/37.0/37.5/108.3\,\mathrm{MiB/call}$，估算带宽
+为 $5.8/12.1/19.0/19.0/42.0\,\mathrm{GB/s}$，没有在四流处平台。
+
+因此排除“aggregate DRAM bytes 或带宽本身直接线性决定 victim leftover”。当前
+物理解释是：互异 transfer-bound packed-B fill 增加 victim-visible LLC miss 与
+DDRC read-command 排队，二者对应硬件 leftover 的饱和形状。但 4x4T 与 4x1T 的 DRAM
+量相同、victim miss ratio 不同，且 4x1T span 跨 session 漂移 $0.048\,\mathrm{ms}$；
+stream count 不是完整定量变量。本节只完成来源分账，不新增结构或经验 residual。
+若继续，必须独立 sweep $0/1/2/4/8/16$ 互异 transfer-bound B、重复 4x1T，并以
+leave-one-count-out 和独立 session 识别 queue/miss pressure 参数。完整记录见
+`optimizations/fused_moe_sve/results/arm_codex_80c_stream_pressure_pmu_20260904.md`。
+
+#### 9.56 packed-B count sweep 的 queue/miss LOCO 比较
+
+本节不改公式、不读旧 route/real-trace holdout。PMU-only probe 增加 2x8T 与 8x2T，
+在固定 16 个 peer 线程下 sweep $0/1/2/4/8/16$ 份互异 transfer-bound packed-B；
+另以独立 seed/session 重复 isolated 与 4x1T。core/L3C/DDRC 仍由两个 perf FIFO 在
+同一次 cell 同步采集，5 warmup、31 measured、4-copy rotation 与 18-expert scrub
+协议不变。全部 event running 为 $100\%$，overlap 中位数精确为
+$0/1/2/4/8/16$。
+
+主 session 的 count/spans 为
+$0/1/2/4/8/16:\;0.5690/0.5410/0.5811/0.6000/0.6787/0.6774\,\mathrm{ms}$；
+DDRC queue latency 为 $36.46/45.36/49.96/57.38/65.02/57.81$ cycles；victim LLC
+read-miss ratio 为 $0.3656/0.2679/0.3705/0.3853/0.4883/0.4331$。count-1 的负
+span delta 与负 LLC pressure 均保留在主分析中；它的非配对 P10--P90 与 isolated
+重叠，不能声称稳定收益。
+
+主比较使用过 isolated 原点、非负 slope 的单变量 LOCO。DDRC queue/LLC miss 的
+MAE 为 $0.0453/0.0364\,\mathrm{ms}$，RMSE 为 $0.0464/0.0459\,\mathrm{ms}$，最大
+绝对误差为 $0.0574/0.0767\,\mathrm{ms}$。LLC 虽有较低 MAE，但 count-1 pressure
+为负并产生一个非正预测，不满足单调压力变量；queue 在所有 count 保持非负，但
+低估 count 8/16。允许 intercept 的敏感性 LOCO 也只把 MAE 降到
+$0.0379/0.0274\,\mathrm{ms}$，不改变不可冻结结论。
+
+固定 16-thread ladder 之外的 4x1T layout holdout 上，主/独立 repeat 的 queue 误差
+为 $-0.0274/-0.0010\,\mathrm{ms}$，LLC 误差为
+$+0.0558/+0.0248\,\mathrm{ms}$。因此 queue latency 只作为下一轮 measurement-design
+候选，LLC miss ratio 只作解释与 guardrail；两者均不进入 cost model。当前主要
+identifiability 缺口是每个 mode 在独立进程中初始化，isolated 绝对 span 可跨 session
+漂移。下一步若继续，应在同一长生命周期 allocation/process 中配对 isolated 与
+candidate，并获得 per-cell counter reset/read，而不是增加回归参数。完整记录见
+`optimizations/fused_moe_sve/results/arm_codex_80c_stream_pressure_count_loco_20260904.md`。
+
+#### 9.57 同进程、同 allocation、逐 cell counter reset 的 paired PMU
+
+本节不改公式、不读旧 holdout。9.56 的 mode-per-process 协议仍有 isolated baseline
+漂移；本 probe 在一个长生命周期进程中一次性构建全部 plan/input/output、四份轮换
+measured packed allocation 与第五份 scrub allocation。每轮将 isolated、1x16T、
+2x8T、4x4T、8x2T、16x1T、4x1T 各执行一次并随机排序。Linux
+`perf_event_open` 一次打开 60 个 CPU304 core、LLC7 L3C 和 NUMA3 DDRC event；每个
+cell 独立 reset/enable/run/disable/read。warmup 后控制线程固定 CPU240，victim 保持
+CPU304，避免 Python control syscall 进入 victim core 计数。
+
+主 session（31 paired rounds）全部 event 的 running ratio 为 1，overlap 中位数精确
+为 $0/1/2/4/8/16$。count $0/1/2/4/8/16$ 的绝对 victim span 为
+$0.5833/0.5909/0.6120/0.6211/0.7821/0.7798\,\mathrm{ms}$；同轮 paired delta 为
+$0/+0.0082/+0.0295/+0.0455/+0.2040/+0.2042\,\mathrm{ms}$。count 8/16 的 delta
+P10 为 $+0.1616/+0.1466\,\mathrm{ms}$，形成稳定平台；count 1 区间跨零，count 4
+P10 为 $-0.0004\,\mathrm{ms}$。DDRC queue pressure paired median 为
+$0/+11.1/+19.0/+21.0/+41.8/+36.0$ cycles，所有正 count 的 P10 均为正，也在 4 到
+8 之间跳变。victim LLC miss pressure 在 count 1/2/4 为负，且除 count 8 外 P10
+多跨零，不能作为稳定单调压力变量。
+
+isolated-anchored queue/LLC LOCO MAE 为 $0.0515/0.0778\,\mathrm{ms}$，RMSE 为
+$0.0528/0.0860\,\mathrm{ms}$，最大误差为 $0.0677/0.1220\,\mathrm{ms}$；LLC 有三个
+非正预测。允许 intercept 的敏感性仍由 queue 胜出，MAE 为
+$0.0355/0.0432\,\mathrm{ms}$。独立 4x1T paired repeat 测得 slowdown P10/median/P90
+$=+0.0329/+0.0878/+0.1374\,\mathrm{ms}$、queue pressure median $+13.50$ cycles；
+queue 线性模型稳定低估约 $0.028\,\mathrm{ms}$，LLC 则高估 $0.071\,\mathrm{ms}$。
+
+因此接受 paired per-cell PMU 协议，拒绝 LLC standalone feature；queue latency 是
+明确胜出的物理变量，但当前线性形式仍在 count 1--4 过估、count 8--16 低估，不能
+冻结。不得从本 session 添加 count knee、queue threshold、双特征拟合或 layout
+residual。若继续，应固定互异 B count，独立改变 request-arrival/team shape，寻找
+planner 可见的 queue-pressure proxy；production planner 不能读取未来 PMU。完整记录见
+`optimizations/fused_moe_sve/results/arm_codex_80c_stream_pressure_paired_pmu_20260904.md`。
+
+#### 9.58 固定 packed-B count 的 request-arrival shape 分解
+
+本节不改公式、不读旧 holdout。在 9.57 的同进程逐 cell PMU 协议上固定 expert id、
+$M=1$、packed allocation、same-LLC placement 与 expert 起点，只改变每份 B 的 team
+width：count 4 在 logical $48/52/56/60$ 对照 4x4T/4x2T/4x1T；count 8 在
+$48/50/\ldots/62$ 对照 8x2T/8x1T。两次独立 session 均为 5 warmup、31 randomized
+paired rounds，60 个 event 全部 running ratio 1，overlap 等于固定 B count。
+
+count 4 下，4x4T/4x2T/4x1T 相对 isolated 的 queue pressure 在 session-1 为
+$+18.82/+17.06/+13.44$ cycles，session-2 为 $+20.94/+16.13/+11.12$ cycles；team
+变窄稳定降低 aggregate queue。但 4x1T-4x4T 的 victim span 为
+$-0.0338\,[-0.0618,+0.0026]$ 与 $+0.0225\,[-0.0122,+0.0512]\,\mathrm{ms}$，
+两轮方向不同且区间跨零；4x2T-4x4T 也在两轮跨零。故 count 4 未识别出稳定 width
+对 victim latency 的影响。
+
+count 8 下结果稳定：8x1T-8x2T 的 victim span 在两轮为
+$-0.1133\,[-0.1676,-0.0815]$ 与 $-0.0775\,[-0.1411,-0.0247]\,\mathrm{ms}$；
+queue latency 为 $-16.90\,[-30.68,-7.65]$ 与
+$-14.06\,[-20.61,-7.19]$ cycles。较窄 team 同时稳定降低 queue 与 victim latency。
+预声明的“narrower slower despite lower queue”在全部 pair 上拒绝；count 8 接受
+`narrower_faster_with_lower_queue`。
+
+因此互异 transfer-bound B count 是必要但不充分的 pressure 变量。team width 不增加
+互异 B，却增加同一 B 上并发 N-stripe requester 与短窗 injection rate；硬件压力至少
+依赖 $(n_B,\{t_e\})$ 的交互。相同总 peer 线程下，8x1T 比 4x2T queue 更高；相同
+$n_B=8$ 下，8x2T 比 8x1T queue 更高。count 4 仍在 latency 噪声区，count 8 进入可
+分辨高压区。只有两个 count，禁止拟合 count knee、width multiplier 或 residual。
+若继续，应以 start-aligned count $4/6/8$ × width $1/2$ 的独立网格验证 planner-visible
+injection proxy，并记录 per-stage overlap duration。完整记录见
+`optimizations/fused_moe_sve/results/arm_codex_80c_stream_pressure_request_shape_20260904.md`。
+
+#### 9.59 count-6 锁定 holdout 的结构 proxy 停止门槛
+
+本节不改公式、不读旧 route/real-trace holdout。以 nested-prefix 起点构造 count
+$\{4,6,8\}\times$ width $\{1,2\}$ 网格；只用 count 4/8 拟合，count 6 在运行前锁为
+holdout。两次独立同进程 paired session 均为 31 rounds、逐 cell 60-event PMU；全部
+running ratio 为 1。候选结构 proxy 预声明为 $n_B$、active requester threads、二者
+乘积，以及 $n_B\times$ measured W13 overlap core-ms oracle。每个 proxy 先过原点预测
+DDRC queue，再由同一训练集 queue slope 预测 victim slowdown。
+
+预声明门槛要求两个 count-6 width 在两轮同时满足：queue error
+$\le\max(3\text{ cycles},15\%)$、slowdown error $\le0.02\,\mathrm{ms}$、1T/2T
+方向正确，并且 proxy-to-queue 与 queue-to-slowdown 参数跨 session 漂移 $\le20\%$。
+count-6 实测在两轮为：1T queue $16.93/16.29$ cycles、slowdown
+$0.0685/0.0650\,\mathrm{ms}$；2T queue $22.50/18.45$ cycles、slowdown
+$0.1166/0.1103\,\mathrm{ms}$。holdout 自身足够稳定用于拒绝。
+
+除只看 $n_B$ 因无法区分 width 而方向失败外，其余 proxy 方向正确，但全部失败。
+$n_B$/requesters/product/oracle 的
+proxy-to-queue slope 漂移为 $26.2/28.7/32.3/25.8\%$。oracle 仅 session-1 通过；
+session-2 的 1T queue error 为 $-5.60$ cycles，2T slowdown error 为
+$-0.0268\,\mathrm{ms}$。相反，queue-to-slowdown slope 为
+$0.00440/0.00476\,\mathrm{ms/cycle}$，只漂移 $7.5\%$。因此不可辨识点位于
+plan geometry 到 memory-controller queue state 的映射，而不是 victim slowdown
+系数。
+
+最终 `accepted=[]`、`stop_absolute_model_expansion=true`。即使 measured-overlap oracle
+也不能跨 session 通过，禁止继续添加 count knee、width multiplier、queue threshold、
+双特征项或经验 residual。绝对基线保持 frozen v8；后续安全性转向 anchor-relative
+partial order、top-K recall 与 false-pruning replay，只有这些门槛通过后才接 VND/LNS。
+完整记录见
+`optimizations/fused_moe_sve/results/arm_codex_80c_stream_pressure_proxy_grid_20260904.md`。
+
 ## 10. 同步规则
 
 
@@ -5559,3 +6132,25 @@ planning 对未命中点执行原解析公式；首次调用结束后在文件�
 | 2026-09-03 | v1.45 | Step-3 prefinal direct-sync Arm 80C三trace审计完成：uniformish/median的12/16个硬件shortlist均无paired P10为正的稳定候选；high-skew 13个shortlist中两个domain-local lane merge稳定提升`1.436%/1.248%` paired median、`0.262%/0.340%` P10，说明width邻域具有局部实测价值。但模型只预测两者`0.0197%/0.0130%`，反而把预测`+0.110%`、实测`-0.446%`的split排为width第一；median/high-skew combined Spearman为`-0.018/-0.011`。三trace无robust gain达到2%，故全部保留baseline，measured shortlist regret不超过`1.449%`。保留width operators作Lab候选，但在独立校准`1T+1T -> 2T` merge/concurrency transition并完成commit-bound复验前不进入width-VND。完整记录见`optimizations/fused_moe_sve/results/arm_codex_80c_width_neighborhood_audit_prefinal_20260903.md`。 |
 | 2026-09-03 | v1.46 | 独立建模并校准high-skew中的`2x1T concurrent -> 1x2T serial` transition。三组合成短任务在无背景与4x16T+14x1T满载背景下的实测dilation对pair/merge分别为近似相同的`1.09/1.09`、`1.07/1.09`、`1.14/1.14`，否定“缺少额外1T slowdown”，并定位为shared-resource model对2T background dilation高估。新增可低于1但保持final dilation不低于1的离散narrow-team correction；旧calibration和未校准width保持identity。`merge_isolated`拟合2T `expert_fixed_ns=88799.963`、`route_ns=5909.533`，完整event求根得到full-cohort correction `c1=0.784898`、`c2=0.532344`。三组pair/merge background holdout误差由`+5.43/+17.62%`、`+3.05/+17.55%`、`+13.23/+27.71%`降至`+0.12/-1.89%`、`-0.63/+1.01%`、`0.00/0.00%`；isolated pair保持`-2.85%--+2.37%`。模型名升到v6；冻结后的high-skew event-only预检查未再调参，真实三trace硬件仍为holdout，必须从同一commit正式重跑后再决定width-VND。 |
 | 2026-09-03 | v1.47 | narrow-calibrated Step-3 suite从commit `1fcbc7b`完成正式Arm 80C三trace holdout。uniformish/median/high-skew均因best robust gain仅`0.666%/1.476%/0.278%`保留baseline，combined measured shortlist regret为`0.386%/0.637%/0.983%`，无selected regression。首轮唯一positive-P10候选是模型排名第一的high-skew `16T -> 8T+8T` split，paired median/P10为`+1.037%/+0.334%`；同commit独立repeat为`+1.271%/-0.632%`。repeat中一个merge为`+1.437%/+0.433%`，但首轮同plan为`+0.864%/-0.813%`，故没有候选跨两个formal session保持positive P10。uniformish/median/high-skew首轮event-hardware Spearman为`0.629/-0.003/0.049`，说明sub-2% width delta非平稳且point ranking未闭合。width邻域仅作为Lab搜索空间保留，不进入deterministic VND，也不降低2% action gate。主run id为`20260902T155347Z-arm_codex_internal_temporal_overhead-arm_width_neighborhood_audit-1fcbc7b130f0`，repeat为`20260902T161403Z-arm_codex_internal_temporal_overhead-arm_width_neighborhood_audit-1fcbc7b130f0`。 |
+| 2026-09-02 | v1.48 | 增加不改变analytical mean公式的离线anchor-relative pairwise report：以candidate相对anchor的paired gain residual绝对分位数构造context→family→global回退区间，仅当完整区间越过anchor才声明better/worse，其余保持incomparable。same-v8前次session拟合、新session复验的41个pair中，3个满足硬件2%可分辨标准，但partial order对三者均不下判断，`0` false dominance且`41/41` incomparable；top-8仍保留三trace各自measured best，但当前关系安全而无判别力，禁止接入VND/LNS。配套two-level evaluator的exact/screen吞吐为`6.34--9.90`/`186--349` plans/s，预计减少`42--85%` exact calls并加速`1.57--5.06x`，但`8/16/32` budget均漏掉uniformish measured-best，故screen fidelity gate失败。独立1T lane-head swap probe在mixed `4x16T+14x1T`背景下的四组original-v8 residual为`-1.00/+3.76/-0.96/-0.25`个百分点，刻意失衡case预测/实测为`-18.40/-19.36%`，不支持新增generic swap correction；保留原v8 calibration。该轮为HEAD `935d643`加未提交Python/Lab改动的direct-sync provisional run，不是clean-commit paper artifact；生产quick、Plan V2、kernel、ABI与默认dispatch均不变。完整记录见`optimizations/fused_moe_sve/results/arm_codex_80c_pairwise_ordering_mvp_20260902.md`。 |
+| 2026-09-02 | v1.49 | hardware shortlist新增真实affected-lane与placed-event context contract：保存前后完整task/route序列、isolated lane load、head/tail暴露、phase/team dilation、cohort transition及critical lane/task，不保存raw event log。same-v8 high-skew复测的三个cross-lane swap把`62/68`-route的1T tail换到peer lane head，模型affected-tail增加`4.02--5.70 ms`且硬件退化`12.61--15.17%`；无新增tail的swap为`+0.40%`且区间跨零，四者均无placed critical-lane/expert switch。独立`68-route tail <-> 1-route head` holdout复现物理slowdown，但background/isolated模型residual仅`+1.95/-0.17`个百分点，五个tail/head case绝对residual均小于`1.96`点，未复现real-trace剩余误差。按predeclared gate不增加新物理参数、不改冻结v8 calibration，继续细化完整real-trace event context。 |
+| 2026-09-03 | v1.50 | 独立分解固定1-route、1T expert的context bias；五个Plan V2执行完全相同tasks/routes/weights/total work，仅用首任务依赖将被禁用背景移到target lane结束之后。两次Arm 80C、31-round session中，full-cohort lane head相对isolated增加`0.823/0.881 ms`，其中16T background贡献`0.546/0.599 ms`、1T peers贡献`0.272/0.311 ms`，非加性交互仅`-0.011/-0.037 ms`。同一expert放在68-route前驱后减少`0.557/0.545 ms`，差异几乎全部来自W13；方向在paired P10/P90及独立session均稳定。冻结v8把1T-only预测为与isolated完全相同，并将full-head预测为`0.613 ms`而硬件为`1.475--1.482 ms`，独立复现了cold-W13 lane-head/background context缺口。但单个`M=1`点不足以识别新参数，因此不改公式或calibration；下一门槛是预声明`M={1,2,5,6,12}`route sweep及real-trace critical-switch holdout。完整记录见`optimizations/fused_moe_sve/results/arm_codex_80c_small_expert_context_20260903.md`。 |
+| 2026-09-03 | v1.51 | small-expert probe升级为显式strict-DRAM协议，同时保留4-copy measured rotation：每个sample前关闭trace，在第五份地址不重叠的约660 MiB packed copy上同步执行完整`full_head` scrub，返回形成barrier后才运行measured mode；scrub不进入target span或trace。两次31-round scrub session保持原分解：full-head相对isolated `+0.811/+0.819 ms`，16T background `+0.558/+0.559 ms`，1T peers `+0.272/+0.270 ms`，interaction `-0.022/-0.022 ms`，after-68 `-0.523/-0.531 ms`。按target packed-weight虚拟地址过滤的Arm SPE高延迟样本中，W13 L3-hit incidence由pre-scrub约`6.9%`降到`1.7%`（356 miss/6 hit）；该比例受30-cycle采样门槛影响，不作为字节占比。结论升级为以DRAM cold-weight来源为默认，LLC residency视为benchmark干扰；模型与calibration仍未修改。 |
+| 2026-09-03 | v1.52 | 完成预声明的scrubbed `M={1,2,5,6,12}` small-expert route sweep：full-head相对isolated增量为`0.811/0.836/0.621/0.655/0.283 ms`，1T-only增量为`0.272/0.302/0.113/0.128/0.022 ms`，证明victim敏感度随M增大快速衰减。trace同时证明target W13先与peer gather、后与peer W13重叠。解析模型增加默认关闭的显式gather-pressure calibration：`T_g=f_g+r_g ceil(M/t)`、`Q_g=alpha_g M H(b_in+b_pack)`，并把旧pre-W13 residual按stage时间比例移回compute phase；旧profile行为不变，schema/name升为9/v7。in-sample扫描`alpha_g≈3`使25点mean absolute relative error从21.7%降至12.6%，但M1的1T-only/after-68仍分别过估到`1.254/1.171 ms`（实测`0.907/0.921 ms`），因此不冻结calibration、不接入VND/LNS；下一步必须分离domain-local latency-bound gather与rank-wide streaming pressure。 |
+| 2026-09-03 | v1.53 | 独立cross-LLC placement/phase probe选择每LLC-domain memory-injection作为首要缺失资源：固定1-route 1T target与15个68-route 1T aggressor，两次31-round session的local-minus-remote head差为`0.244/0.248 ms`，after-1纯W13窗口差为`0.225/0.233 ms`，四个paired P10均大于`0.21 ms`；remote相对isolated无稳定正惩罚。解析event模型增加默认关闭的domain cap `C_d=min(C_R(n_d), beta*C_R_sat/|D|)`，task DRAM dilation取rank与所触及domain最大值，explanation保存domain injection细节；旧profile保持rank-only，schema/name升为10/v8。`beta=0.76`把两项locality contrast mean absolute error由约`0.230 ms`降到`0.055 ms`，但叠加冻结v8 residual后旧25点route-context holdout MAPE由`21.7%`恶化到约`28.5%`，故只接受结构、不冻结参数、不接入VND/LNS；下一步联合替换已双计数的wide/narrow residual。 |
+| 2026-09-03 | v1.54 | 完成严格fit/holdout隔离的phase re-accounting。新Arm fit corpus用不相交route `{3,4,7,8,10,16,24,48,68,600,1800}`覆盖全部`1/2/4/8/16/32/40/80T`，按stage envelope分别拟合`T_g=max(G_t,r_t ceil(M/t))`与`T_s=max(F_st,gamma_st T_physical)`；旧whole-total fixed/route、wide-team和narrow-team residual归零。独立phase repeat的gather/W13/W2/total MAPE为`16.13/3.49/4.70/4.38%`，旧route isolated holdout的W13/W2/total为`1.46/9.18/3.69%`。cross-LLC after/head差分拟合得到domain scale `0.787`和gather coupling `22.26`，但该差分无法识别absolute pressure：冻结后的25点并发holdout MAPE由v8 `21.72%`恶化到`273.97%`，48个可分辨pair错2个；real-trace high/median/uniformish Spearman为`0.345/0.075/0.368`，high top-8漏best，high/median分别有`10/6` false dominance。接受phase floor/scale结构，拒绝完整candidate及其domain/gather参数，不替换v8、不接VND/LNS；下一probe必须联合absolute slowdown、locality contrast和aggressor-count sweep。 |
+| 2026-09-04 | v1.55 | 用锁定的aggressor-count probe做session-1联合absolute+contrast拟合，session-2只validation，不读holdout。重放已接受phase floor/scale，wide/narrow与whole-expert overhead保持identity/zero；loss为两类MAE之和，`alpha_g`上界8。最优点`beta=0.78`、`alpha_g=0.25`贴搜索下界，fit/validation联合MAE为`0.689/0.719 ms`，739个近优点、session-2对比残差系统为正，判定不可辨识。即使最小gather coupling，cross-LLC n15 head仍被预测为`+0.893 ms`（实测`+0.043 ms`）；关闭domain cap或把`alpha_g`从0.25提到1.00几乎不改该共模，说明主导项是rank `dram_bytes`对重叠68-route流的共享dilation，而不是9.44/9.45的两个标量。公式与production schema未改；拒绝冻结candidate，不替换v8、不接VND/LNS。下一缺口是DRAM contention作用域与n≈4饱和，而不是再估`(beta, alpha_g)`。完整记录见`optimizations/fused_moe_sve/results/arm_codex_80c_absolute_pressure_joint_fit_20260904.md`。 |
+| 2026-09-04 | v1.56 | 在锁定session-1 DAG上做rank DRAM vs domain-only离线消融，不改公式、不搜索参数、不读holdout。关掉rank DRAM dilation只影响placed allocator的第一次`dram_bytes`容量，domain cap仍用原来的`C_R(n_d)`。rank-only的cross n15 head为`+0.893 ms`，去掉rank DRAM后为`+0.454 ms`，只去掉约49%远程共模；剩余由`llc_bytes` dilation约`2.44`主导。domain-only不能把远程打到近零，也不能在n≈4饱和，`beta=0.20`仍把same n15推到`+5.71 ms`。不新增default-off结构。下一缺口是同一DAG上的LLC作用域与victim是否不该继承68-route peer的GEMM dilation。完整记录见`optimizations/fused_moe_sve/results/arm_codex_80c_rank_dram_domain_scope_20260904.md`。 |
+| 2026-09-04 | v1.57 | 在同一锁定DAG上做rank LLC vs domain LLC离线消融，不改公式。关掉rank LLC只对传入全部domain id的`llc_bytes`调用返回无穷，保留单key domain LLC；全部臂保持rank DRAM关闭。rank LLC解释剩余远程共模的100%（cross n15 `+0.454`→`0 ms`），same-LLC曲线不变。domain LLC仍随count增长（n2/4/8/15为`0.168/0.397/0.447/0.590 ms`），达不到n≈4饱和。去掉全部LLC后本地n15仅`+0.001 ms`，再关L2不变；模型victim已近似isolated，硬件same-LLC n15仍为`+0.312 ms`。不新增结构。下一缺口是victim-asymmetric saturating same-LLC tax。完整记录见`optimizations/fused_moe_sve/results/arm_codex_80c_rank_llc_domain_scope_20260904.md`。 |
+| 2026-09-04 | v1.58 | 在同一锁定DAG上做victim-asymmetric dilation消融，不改公式、不搜索参数。对称臂仍把cohort DRAM/L2/LLC dilation套到每个task。`compute_bound_skip`与对称臂相同，因为1-route 1T W13是transfer-bound。`same_llc_peers`把远程打到0、本地曲线不变。`own_demand`把n15打到`+0.001/0 ms`。没有任何臂同时满足远程近零、n4 contrast与n≈4平台。不新增结构。过预测来自短transfer-bound victim继承68-route字节dilation；硬件留下saturating same-LLC occupancy税，不能在本count sweep上拟合。完整记录见`optimizations/fused_moe_sve/results/arm_codex_80c_victim_asymmetric_dilation_20260904.md`。 |
+| 2026-09-04 | v1.59 | 增加独立于count sweep的aggressor-$M$ occupancy probe，不改公式。victim仍是1-route 1T；count固定0/1/4；aggressor $M\in\{1,4,16,68\}$。Arm session-1 overlap有效、远程近零；same-LLC n4 head为$M=1/4/16/68$的$+0.660/+0.639/+0.402/+0.290 ms$，随$M$下降。预声明occupancy/duration/utilization三态都不成立。不新增结构。leftover是同LLC上并发transfer-bound流的争用，不是68-route字节利用率。完整记录见`optimizations/fused_moe_sve/results/arm_codex_80c_aggressor_m_occupancy_20260904.md`。 |
+| 2026-09-04 | v1.60 | 增加fill-port vs stream probe，不改公式。同一16个LLC7核（logical `48-63`）上对照1×16T $M=1$与16×1T $M=1$。Arm session-1 overlap有效、远程近零；same-LLC head为1T/1×16T/16×1T的$+0.018/+0.014/+0.160 ms$。`fill_ports`不成立；`one_stream`方向成立但many$-$wide=$0.146<0.20$，预声明为`inconclusive`。1×16T $M=1$是一条packed-B，W13 overlap core-ms为$1.08$对many的$10.58$。该切片上16×1T远小于occupancy在victim邻域`65-79`的n4 $M=1$ `$+0.660 ms$。不新增结构、不读holdout。完整记录见`optimizations/fused_moe_sve/results/arm_codex_80c_fill_port_vs_stream_20260904.md`。 |
+| 2026-09-04 | v1.61 | 增加stream-count composition probe，不改公式。等线程阶梯在`48-63`上对照1×16T/2×8T/4×4T/16×1T与4×1T；`8+8+4+1`放在`43-63`对照同起点4×1T与21×1T。Arm session-1 overlap有效；阶梯same-LLC head为$+0.003/+0.035/+0.075/+0.070/+0.155 ms$；mix/四起点1T/21×1T为$+0.110/+0.103/+0.301 ms$。自动化签名`stream_count`，`thread_count`不成立。21×1T远程$+0.211 ms$，四流mix远程$+0.042$。不新增结构、不读holdout。完整记录见`optimizations/fused_moe_sve/results/arm_codex_80c_stream_count_composition_20260904.md`。 |
+| 2026-09-04 | v1.62 | 增加unified weight-block probe，不改公式。把一层W13+W2拷进同一匿名allocation的两个contiguous view，对照现有两块packed tensor。问16×1T leftover是否因此下降；这不能把16条并发专家流变成1条流。本机未预留HugeTLB。Arm session-1 overlap有效；16×1T leftover split/unified为$+0.153/+0.157 ms$，差$0.004$，签名`layout_neutral`。1×16T为$+0.041/+0.042$。远程16×1T为$+0.088/+0.098$。本probe不加结构、不读holdout。完整记录见`optimizations/fused_moe_sve/results/arm_codex_80c_unified_weight_block_20260904.md`。 |
+| 2026-09-04 | v1.63 | 增加weight THP probe，不改公式。同一W13+W2块上对照mmap+MADV_NOHUGEPAGE与mmap+MADV_HUGEPAGE，用smaps AnonHugePages验证。问2 MiB页是否降低16×1T leftover。不改FUSED_CPP_PAGES，不预留HugeTLB。Arm session-1 overlap有效且页验证通过：4 KiB AnonHugePages为0，THP覆盖100%。16×1T leftover small/THP为$+0.167/+0.162 ms$，差$0.005$，签名`page_neutral`。1×16T为$+0.006/+0.008$。isolated span为$0.577/0.571 ms$。远程16×1T为$+0.145/+0.143$。本probe不加结构、不读holdout。完整记录见`optimizations/fused_moe_sve/results/arm_codex_80c_weight_thp_20260904.md`。 |
+| 2026-09-04 | v1.64 | 增加stream-pressure PMU分账，不改公式。PMU-only DAG只保留victim与实际并发peer，排除旧等工作量协议中victim后的delayed background；初始化、warmup与18-expert不相交packed-copy scrub均在counter disabled时完成。两个嵌套perf FIFO在同一31-run cell同步采CPU304 core、LLC7十个L3C slice、NUMA3八个DDRC与native trace。session-3在isolated/1x16T/4x4T/4x1T/16x1T上测得victim span $0.477/0.517/0.627/0.644/0.704 ms$，DDRC read-command latency $32.6/43.9/55.8/49.2/57.0$ cycles，DRAM read traffic $10.0/21.5/37.0/37.5/108.3 MiB/call$。queue latency、victim LL-read miss与backend-stall在约四份互异B后趋于平台，而aggregate bytes/bandwidth继续增长；排除bytes线性模型，识别为victim-visible LLC miss加DDRC排队。4x1T跨session仍漂移$0.048 ms$，故五点不足以识别公式，不新增结构、不读holdout。完整记录见`optimizations/fused_moe_sve/results/arm_codex_80c_stream_pressure_pmu_20260904.md`。 |
+| 2026-09-04 | v1.65 | 完成固定16 peer线程的$0/1/2/4/8/16$互异packed-B PMU sweep及独立4x1T repeat，不改公式。全部cell以嵌套perf FIFO同步CPU304 core、LLC7 L3C和NUMA3 DDRC，event running 100%、overlap精确。过isolated原点的queue/LLC单变量LOCO MAE为$0.0453/0.0364 ms$、RMSE为$0.0464/0.0459 ms$、最大误差为$0.0574/0.0767 ms$。LLC平均误差虽低，但count-1 pressure为负；queue保持非负并在独立4x1T repeat仅误差$-0.0010 ms$，但低估count 8/16。允许intercept的敏感性不改变结论。两者均不冻结；queue仅作为同一长生命周期process内paired counter-reset实验的下一候选，LLC只作guardrail。不读旧holdout、不替换v8。完整记录见`optimizations/fused_moe_sve/results/arm_codex_80c_stream_pressure_count_loco_20260904.md`。 |
+| 2026-09-04 | v1.66 | 完成同进程、同packed allocations、随机交错isolated/candidate及逐cell直接`perf_event_open` reset/read的paired PMU。主session一次打开60个CPU304 core、LLC7 L3C、NUMA3 DDRC event，31轮全部running ratio 1、overlap精确。count $0/1/2/4/8/16$ paired slowdown为$0/+0.0082/+0.0295/+0.0455/+0.2040/+0.2042 ms$，queue pressure为$0/+11.1/+19.0/+21.0/+41.8/+36.0$ cycles；queue在全部正count的P10为正，LLC miss pressure在1/2/4为负。paired queue/LLC anchored LOCO MAE为$0.0515/0.0778 ms$，affine MAE为$0.0355/0.0432 ms$。独立4x1T repeat slowdown P10/median/P90为$+0.0329/+0.0878/+0.1374 ms$，queue模型仍低估$0.0283 ms$。接受测量协议，拒绝LLC standalone与queue线性模型；不得从本session加knee/threshold/residual。不读旧holdout、不替换v8。完整记录见`optimizations/fused_moe_sve/results/arm_codex_80c_stream_pressure_paired_pmu_20260904.md`。 |
+| 2026-09-04 | v1.67 | 固定packed-B count与expert起点，完成两次同进程paired request-shape分解，不改公式。count 4对照start-aligned 4x4T/4x2T/4x1T：变窄稳定降低queue，但全部victim span pair至少一轮区间跨零，未识别width latency效应。count 8的8x1T-8x2T在两轮victim span为$-0.1133[-0.1676,-0.0815]/-0.0775[-0.1411,-0.0247] ms$，queue为$-16.90[-30.68,-7.65]/-14.06[-20.61,-7.19]$ cycles，接受`narrower_faster_with_lower_queue`。拒绝narrow-team asymmetric harm。压力至少依赖互异B count与team-width/issuer shape的交互；只有两个count，禁止拟合knee、width multiplier或residual。不读旧holdout、不替换v8。完整记录见`optimizations/fused_moe_sve/results/arm_codex_80c_stream_pressure_request_shape_20260904.md`。 |
+| 2026-09-04 | v1.68 | 完成预声明的count $\{4,6,8\}\times$ width $\{1,2\}$结构proxy网格，count 6全锁holdout，不改公式。两次同进程31-round session中count-6 1T/2T slowdown为$0.0685/0.1166$与$0.0650/0.1103 ms$。以count 4/8拟合的distinct-B、requester threads、product、measured-W13-overlap oracle全部失败；distinct-B不能区分width，其余虽方向正确但proxy-to-queue参数漂移$25.8--32.3\%$并至少失败一个queue/slowdown gate，oracle仅首轮通过。queue-to-slowdown slope为$0.00440/0.00476 ms/cycle$，漂移仅$7.5\%$，故缺口在plan geometry到controller queue state而非victim系数。最终`accepted=[]`、`stop_absolute_model_expansion=true`；禁止再加knee/width/queue/residual，保持frozen v8，转向partial order、top-K recall与false pruning。不读旧holdout。完整记录见`optimizations/fused_moe_sve/results/arm_codex_80c_stream_pressure_proxy_grid_20260904.md`。 |
+| 2026-09-04 | v1.69 | 将anchor-relative partial order接入离线shortlist与可复用best-improvement闭环，不改event mean、production planner、Plan V2或runtime。只有完整区间低于anchor的candidate可做dominance pruning；incomparable保留，因budget未入选单列为`budget_deferred`；只有完整区间越过2% actionable margin才更新incumbent。neighborhood audit仅接受带zero-false-pruning、对应top-K measured-best recall及匹配calibration/extension identity的report，默认top-16。same-v8跨session 41-pair replay仍为41/41 incomparable、0 false pruning且top-8/16/32均保留三条trace measured best；混合历史129-pair反例replay为0 false pruning，high-skew `cp_sat_06`从point-model错误方向保留为incomparable，但top-8漏3个measured best、top-16全部保留。因此完成保守接线和gate，尚未证明有效decision coverage或multi-start VND收益。 |

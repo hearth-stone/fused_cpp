@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -19,6 +20,7 @@ from executable_plan_neighborhood import (  # noqa: E402
     ORDER_ONLY_OPERATORS,
     SAME_LANE_INSERTION,
     WIDTH_ONLY_OPERATORS,
+    ExecutablePlanEvaluator,
     ExecutablePlanScore,
     critical_expert_scores,
     enumerate_order_only_neighbors,
@@ -29,6 +31,8 @@ from executable_plan_neighborhood import (  # noqa: E402
     sample_order_only_neighborhood,
     sample_width_only_neighborhood,
     score_executable_plan,
+    summarize_executable_plan_pair,
+    summarize_placed_event_context,
 )
 from executable_plan_state import (  # noqa: E402
     ExecutableExpertTask,
@@ -118,6 +122,106 @@ def test_placed_tasks_preserve_lane_dependencies_and_cpu_placement() -> None:
     assert tasks[3] == (15, 1, (11,), [])
     assert tasks[5] == (12, 1, (20,), [])
     assert tasks[7] == (9, 2, (21, 22), [])
+
+
+def test_plan_pair_summary_serializes_affected_lane_sequences_and_loads() -> None:
+    before = _state()
+    task = ExecutableExpertTask
+    after = ExecutablePlanState(
+        num_threads=before.num_threads,
+        thread_cpu_ids=before.thread_cpu_ids,
+        lanes=(
+            ExecutableLane(0, 1, (task(1, 10), task(2, 5))),
+            ExecutableLane(1, 1, (task(3, 15), task(4, 8), task(0, 20))),
+            before.lanes[2],
+            before.lanes[3],
+        ),
+        llc_domains=before.llc_domains,
+        early_merge=before.early_merge,
+    )
+
+    summary = summarize_executable_plan_pair(_ScreenModel(), before, after)
+
+    assert summary["changed_expert_ids"] == [0, 1, 2]
+    assert summary["affected_expert_ids"] == [0, 1, 2, 3, 4]
+    assert summary["affected_route_counts"] == [
+        {"expert_id": 0, "routes": 20},
+        {"expert_id": 1, "routes": 10},
+        {"expert_id": 2, "routes": 5},
+        {"expert_id": 3, "routes": 15},
+        {"expert_id": 4, "routes": 8},
+    ]
+    assert [lane["lane_index"] for lane in summary["before_affected_lanes"]] == [0, 1]
+    assert [lane["lane_index"] for lane in summary["after_affected_lanes"]] == [0, 1]
+    assert [
+        task_row["expert_id"]
+        for task_row in summary["before_affected_lanes"][0]["tasks"]
+    ] == [0, 1, 2]
+    assert [
+        task_row["expert_id"]
+        for task_row in summary["after_affected_lanes"][1]["tasks"]
+    ] == [3, 4, 0]
+    assert summary["before_affected_lanes"][0]["isolated_load_ns"] == 350.0
+    assert summary["after_affected_lanes"][1]["isolated_load_ns"] == 430.0
+    assert summary["critical_isolated_lane_switched"] is True
+
+
+def test_placed_event_context_summarizes_head_tail_pressure_and_transitions() -> None:
+    explanation = {
+        "makespan_ns": 100.0,
+        "task_finish_ns": [10.0, 20.0, 100.0, 15.0, 30.0, 40.0, 50.0, 70.0, 90.0],
+        "events": [
+            {
+                "start_ns": 0.0,
+                "duration_ns": 10.0,
+                "active_tasks": [2, 3],
+                "phase_kinds": {"2": "cold_b", "3": "hot"},
+                "phase_dilation": {"2": 2.0, "3": 1.0},
+                "team_pressure_dilation": {"2": 1.5, "3": 1.0},
+                "resources": {"dram": {"dilation": 2.0}},
+            },
+            {
+                "start_ns": 10.0,
+                "duration_ns": 15.0,
+                "active_tasks": [2],
+                "phase_kinds": {"2": "cold_b"},
+                "phase_dilation": {"2": 1.2},
+                "team_pressure_dilation": {"2": 1.1},
+                "resources": {},
+            },
+            {
+                "start_ns": 80.0,
+                "duration_ns": 20.0,
+                "active_tasks": [2, 7],
+                "phase_kinds": {"2": "hot", "7": "cold_a"},
+                "phase_dilation": {"2": 1.4, "7": 1.1},
+                "team_pressure_dilation": {"2": 1.3, "7": 1.0},
+                "resources": {"llc": {"dilation": 1.4}},
+            },
+        ],
+    }
+
+    summary = summarize_placed_event_context(
+        _state(),
+        explanation,
+        affected_expert_ids={2},
+    )
+
+    assert summary["affected_task_count"] == 1
+    assert summary["affected_active_ns"] == 45.0
+    assert summary["affected_solo_ns"] == 15.0
+    assert summary["affected_head_ns"] == 20.0
+    assert summary["affected_tail_ns"] == 20.0
+    assert summary["mean_peer_threads_while_affected"] == 50.0 / 45.0
+    assert summary["cohort_transition_count"] == 3
+    assert summary["cohort_transition_ns"] == {
+        "1x1T->1x1T+1x2T": 20.0,
+        "2x1T->1x1T": 15.0,
+        "idle->2x1T": 10.0,
+    }
+    assert summary["critical_lane"]["lane_index"] == 0
+    assert summary["critical_task"]["expert_id"] == 2
+    assert summary["critical_task"]["affected"] is True
 
 
 def test_critical_scores_are_tail_and_dilation_weighted() -> None:
@@ -301,3 +405,79 @@ def test_width_neighbors_preserve_but_never_modify_cross_domain_lanes() -> None:
     )
 
     assert not neighbors
+
+
+class _ScreenPressure:
+    @staticmethod
+    def isolated_scale(threads: int) -> float:
+        del threads
+        return 1.0
+
+    @staticmethod
+    def full_cohort_scale(threads: int) -> float:
+        del threads
+        return 1.0
+
+
+class _ScreenCorrection:
+    @staticmethod
+    def scale(threads: int, peer_fraction: float) -> float:
+        del threads, peer_fraction
+        return 1.0
+
+
+class _ScreenModel:
+    relative_error = 0.1
+    call_setup_ns = 5.0
+    calibration = SimpleNamespace(
+        wide_team_pressure=_ScreenPressure(),
+        narrow_team_contention_correction=_ScreenCorrection(),
+    )
+
+    @staticmethod
+    def T_iso(routes: int, threads: int) -> float:
+        return routes * 10.0 / threads
+
+    @staticmethod
+    def predict_expert(routes: int, threads: int):
+        return SimpleNamespace(
+            phases=(SimpleNamespace(base_ns=routes * 10.0 / threads, kind="cold_b"),)
+        )
+
+    @staticmethod
+    def dag_makespan_placed(tasks) -> float:
+        return 100.0 + len(tasks)
+
+
+def test_two_level_evaluator_caches_exact_states_and_unchanged_lane_loads() -> None:
+    state = _state()
+    evaluator = ExecutablePlanEvaluator(_ScreenModel())
+
+    first_exact = evaluator.exact(state)
+    second_exact = evaluator.exact(state)
+    first_screen = evaluator.screen(state)
+    lane_misses = evaluator.lane_cache_misses
+    neighbor = next(iter(enumerate_order_only_neighbors(state)))
+    neighbor_screen = evaluator.screen(neighbor.state)
+    repeated_screen = evaluator.screen(neighbor.state)
+
+    assert first_exact == second_exact
+    assert evaluator.exact_calls == 1
+    assert evaluator.exact_cache_hits == 1
+    assert first_screen.lower_bound_ns <= first_screen.priority_ns
+    assert neighbor_screen == repeated_screen
+    assert evaluator.screen_calls == 2
+    assert evaluator.screen_cache_hits == 1
+    assert evaluator.lane_cache_misses == lane_misses
+    assert evaluator.lane_cache_hits >= len(state.lanes)
+
+
+def test_screening_bounds_include_lane_domain_and_rank_capacity() -> None:
+    evaluator = ExecutablePlanEvaluator(_ScreenModel())
+
+    score = evaluator.screen(_state())
+
+    assert score.lane_bound_ns == 350.0
+    assert score.rank_bound_ns == 178.0
+    assert score.domain_bound_ns == 290.0
+    assert score.lower_bound_ns == 350.0

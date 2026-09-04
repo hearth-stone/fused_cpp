@@ -17,10 +17,13 @@ from analytic_model import (  # noqa: E402
     AnalyticMachineCalibration,
     AnalyticMoeCostModel,
     CacheCalibration,
+    DramDomainInjectionCalibration,
+    GatherPressureCalibration,
     LlcDomainCalibration,
     NarrowTeamContentionCorrection,
     RuntimeOverheads,
     SaturatingServiceCurve,
+    StagePhaseCalibration,
     WideTeamPressureCalibration,
     analytic_candidate_shapes,
 )
@@ -629,10 +632,11 @@ def test_thin_residual_fit_recovers_nonnegative_operator_terms() -> None:
 
 
 def test_machine_calibration_json_round_trip() -> None:
+    base = _placement_sensitive_model().calibration
     calibration = replace(
-        _calibration(),
+        base,
         overheads=replace(
-            _calibration().overheads,
+            base.overheads,
             by_width=((1, 150_000.0, 7_500.0),),
         ),
         wide_team_pressure=WideTeamPressureCalibration(
@@ -641,6 +645,21 @@ def test_machine_calibration_json_round_trip() -> None:
         ),
         narrow_team_contention_correction=NarrowTeamContentionCorrection(
             full_cohort_correction=((1, 0.95), (2, 0.72)),
+        ),
+        gather_pressure=GatherPressureCalibration(
+            enabled=True,
+            fixed_ns=5_000.0,
+            row_ns=3_000.0,
+            effective_traffic_multiplier=2.5,
+            by_width=((1, 8_000.0, 0.0, 3_000.0),),
+        ),
+        stage_phase_calibration=StagePhaseCalibration(
+            w13_by_width=((1, 400_000.0, 1.05),),
+            w2_by_width=((1, 200_000.0, 1.02),),
+        ),
+        dram_domain_injection=DramDomainInjectionCalibration(
+            enabled=True,
+            capacity_scale=0.6,
         ),
     )
 
@@ -674,6 +693,142 @@ def test_predict_expert_uses_width_specific_operator_phase() -> None:
     assert width_one.kind == "operator"
     assert width_one.base_ns == pytest.approx(1_120.0)
     assert all(phase.kind != "operator" for phase in width_two)
+
+
+def test_explicit_gather_phase_replaces_synthetic_operator_overhead() -> None:
+    gather = GatherPressureCalibration(
+        enabled=True,
+        fixed_ns=5_000.0,
+        row_ns=3_000.0,
+        effective_traffic_multiplier=2.0,
+    )
+    calibration = replace(
+        _calibration(),
+        overheads=RuntimeOverheads(by_width=((1, 100_000.0, 10_000.0),)),
+        gather_pressure=gather,
+    )
+
+    phase = _model(calibration).predict_expert(12, 2).phases[0]
+
+    assert phase.name == "gather_pack_a"
+    assert phase.kind == "gather"
+    assert phase.active_threads == 2
+    assert phase.base_ns == pytest.approx(23_000.0)
+    assert phase.compulsory_dram_bytes == pytest.approx(12 * 64 * 4 * 2)
+
+
+def test_gather_pressure_calibration_validates_and_round_trips() -> None:
+    gather = GatherPressureCalibration(
+        enabled=True,
+        fixed_ns=5_000.0,
+        row_ns=3_000.0,
+        effective_traffic_multiplier=2.5,
+    )
+
+    assert GatherPressureCalibration.from_dict(gather.to_dict()) == gather
+    assert gather.duration_ns(12, 5) == pytest.approx(14_000.0)
+    with pytest.raises(ValueError, match="positive row time"):
+        GatherPressureCalibration(enabled=True)
+
+
+def test_gather_width_point_applies_a_service_floor() -> None:
+    gather = GatherPressureCalibration(
+        enabled=True,
+        by_width=((1, 8_000.0, 0.0, 3_000.0), (8, 45_000.0, 0.0, 4_000.0)),
+    )
+
+    assert gather.duration_ns(1, 1) == pytest.approx(8_000.0)
+    assert gather.duration_ns(4, 1) == pytest.approx(12_000.0)
+    assert gather.duration_ns(3, 8) == pytest.approx(45_000.0)
+    assert GatherPressureCalibration.from_dict(gather.to_dict()) == gather
+
+
+def test_stage_phase_calibration_applies_floor_then_scale() -> None:
+    stage = StagePhaseCalibration(
+        w13_by_width=((1, 400_000.0, 1.05),),
+        w2_by_width=((1, 200_000.0, 1.02),),
+    )
+
+    assert stage.target_ns("w13", 1, 250_000.0) == pytest.approx(400_000.0)
+    assert stage.target_ns("w13", 1, 500_000.0) == pytest.approx(525_000.0)
+    assert stage.target_ns("w2", 2, 100_000.0) == pytest.approx(100_000.0)
+    assert StagePhaseCalibration.from_dict(stage.to_dict()) == stage
+    with pytest.raises(ValueError, match="positive widths/scales"):
+        StagePhaseCalibration(w13_by_width=((1, 0.0, 0.0),))
+
+
+def test_missing_gather_calibration_keeps_legacy_operator_phase() -> None:
+    calibration = replace(
+        _calibration(),
+        overheads=RuntimeOverheads(by_width=((1, 1_000.0, 10.0),)),
+    )
+    payload = calibration.to_dict()
+
+    assert "gather_pressure" not in payload["planner"]
+    assert "dram_domain_injection" not in payload["planner"]
+    restored = AnalyticMachineCalibration.from_dict(payload)
+    phase = _model(restored).predict_expert(12, 1).phases[0]
+    assert restored.gather_pressure == GatherPressureCalibration()
+    assert restored.stage_phase_calibration == StagePhaseCalibration()
+    assert restored.dram_domain_injection == DramDomainInjectionCalibration()
+    assert phase.kind == "operator"
+    assert phase.base_ns == pytest.approx(1_120.0)
+
+
+def test_domain_dram_injection_penalizes_colocated_streams() -> None:
+    domain_curve = _curve(1e15, 4e15, 4)
+    dram_curve = SaturatingServiceCurve(
+        single_thread_rate=10e9,
+        saturated_rate=30e9,
+        saturation_threads=8,
+        curve="piecewise_linear",
+        points=((1, 10e9), (2, 15e9), (4, 18e9), (8, 30e9)),
+    )
+    base = _calibration(cores=8, dram_saturated_rate=30e9)
+    calibration = replace(
+        base,
+        caches=replace(base.caches, llc_bytes_per_rank=64 * 1024 * 1024),
+        matrix_flops=domain_curve,
+        gemm_core_flops=domain_curve,
+        frontend_instructions=domain_curve,
+        l1_bytes=domain_curve,
+        l2_bytes=domain_curve,
+        llc_bytes=domain_curve,
+        dram_bytes=dram_curve,
+        epilogue_elements=domain_curve,
+        rank_cpu_ids=tuple(range(8)),
+        llc_domains=(
+            LlcDomainCalibration("0", (0, 1, 2, 3), 32 * 1024 * 1024, domain_curve),
+            LlcDomainCalibration("1", (4, 5, 6, 7), 32 * 1024 * 1024, domain_curve),
+        ),
+        dram_domain_injection=DramDomainInjectionCalibration(
+            enabled=True,
+            capacity_scale=0.5,
+        ),
+    )
+    model = _model(calibration)
+    colocated = model.explain_dag_placed([(12, 1, (cpu,), ()) for cpu in (0, 1, 2, 3)])
+    split = model.explain_dag_placed([(12, 1, (cpu,), ()) for cpu in (0, 1, 4, 5)])
+
+    assert split["makespan_ns"] < colocated["makespan_ns"]
+    assert any(
+        domain["dram_injection_dilation"] > 1.0
+        for event in colocated["events"]
+        for domain in event["llc_domains"].values()
+    )
+
+
+def test_domain_dram_injection_calibration_validates_and_round_trips() -> None:
+    injection = DramDomainInjectionCalibration(enabled=True, capacity_scale=0.6)
+
+    assert DramDomainInjectionCalibration.from_dict(injection.to_dict()) == injection
+    with pytest.raises(ValueError, match="positive and finite"):
+        DramDomainInjectionCalibration(enabled=True, capacity_scale=0.0)
+    with pytest.raises(ValueError, match="requires calibrated LLC domains"):
+        replace(
+            _calibration(),
+            dram_domain_injection=DramDomainInjectionCalibration(enabled=True),
+        )
 
 
 def test_width_specific_expert_overhead_rejects_invalid_points() -> None:
@@ -1426,8 +1581,8 @@ def test_holdout_validator_reports_absolute_error_and_shape_regret() -> None:
 
     report = build_validation_report(calibration, profile, isolated_training_points={(12, 1)})
 
-    assert report["analytic_model_schema_version"] == 8
-    assert report["analytic_model"] == "phase_ecm_llc_domain_team_pressure_v6"
+    assert report["analytic_model_schema_version"] == 11
+    assert report["analytic_model"] == "phase_reaccount_llc_domain_dram_injection_v9"
     assert report["isolated"]["coverage"] == {
         "profile_points": 2,
         "evaluated_points": 2,
