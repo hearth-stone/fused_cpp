@@ -1,0 +1,39 @@
+{
+  "audit_budget": 32,
+  "categories": [
+    "operator",
+    "target_destroy_size",
+    "actual_closure_bin",
+    "width_histogram",
+    "domain_assignment_signature",
+    "score_quantile"
+  ],
+  "closure_bins": [
+    "1_15",
+    "16_31",
+    "32_63",
+    "64_127",
+    "128_plus"
+  ],
+  "hardware_weights": null,
+  "operator_order": "lexicographic_name",
+  "policy": "relation_agnostic_categorical_farthest_first_v1",
+  "quantile_fill_order": [
+    0,
+    4,
+    1,
+    2,
+    3
+  ],
+  "relation_agnostic": true,
+  "rule_sha256": "6c07e7b9fbf78412a103e3265d9dabbed224c1b9e3e248334e2ab1fb6ab08c97",
+  "schema_version": 1,
+  "score_quantile_count": 5,
+  "shortlist_budget": 16,
+  "source_commit": "055fe250a376622e7595d452d90e0947abbdd337",
+  "source_dirty": true,
+  "tie_break": [
+    "token_reuse_ascending",
+    "canonical_state_hash"
+  ]
+}

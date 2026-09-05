@@ -308,16 +308,44 @@ Temporal-ranking remediation in progress before this gate may be reconsidered:
   partial order, top-K recall, and false-pruning replay. See
   `optimizations/fused_moe_sve/results/arm_codex_80c_stream_pressure_proxy_grid_20260904.md`.
 
-- [ ] Starting independently from full, one-step, greedy, and fixed-width
+- [x] Starting independently from full, one-step, greedy, and fixed-width
   controls, run best-improvement descent over same-lane insertion, same-width
-  cross-lane relocation, pair swap, and cross-domain relocation.
-- [ ] Keep every accepted state executable and preserve the best incumbent at
+  cross-lane relocation, pair swap, and cross-domain relocation. The Arm 80C
+  three-trace model-only replay evaluated 7,326 unique neighbors from 12 named
+  starts; all starts stopped after iteration zero because no lower gain bound
+  cleared the 2% margin.
+- [x] Keep every accepted state executable and preserve the best incumbent at
   all times. Report per-operator proposals, accepted improvements, event calls,
-  wall time, and best-so-far curve.
-- [ ] Use the known high-skew `cp_sat_06` result (`33.148 ms` versus the
+  wall time, and best-so-far curve. The replay made zero accepted moves, used
+  7,350 event calls and 1,067.58 s, and records all requested fields in the raw
+  artifacts. Operator-only calibration resolution avoids candidate placed-event
+  replay that cannot hit any calibrated context key.
+- [x] Use the known high-skew `cp_sat_06` result (`33.148 ms` versus the
   `34.484 ms` full incumbent) as a diagnostic target: determine whether local
   executable moves can recover the opportunity, not merely whether one seed
-  improves one model score.
+  improves one model score. No high-skew start has an acceptable first move, so
+  monotone partial-order VND cannot recover it. Its saved width histogram also
+  differs from the full start in at least 53 expert-width assignments; the old
+  artifact lacks the exact task sequence needed for a canonical connectivity
+  proof. See
+  `results/arm_codex_80c_partial_order_vnd_model_replay_20260904.md`.
+- [x] Freeze the high-skew four-start top-16 incomparable frontier with complete
+  canonical states and PlanV2 bridges, add two worse sentinels per start, and
+  measure all 76 deduplicated plans in two independent 31-round sessions. Two
+  incomparable candidates are stable above 2% in both sessions: a fixed-width
+  adjacent swap at `+4.690/+3.988%` and a greedy `16T -> 8T+8T` split at
+  `+3.819/+3.376%`. No worse sentinel is a cross-session false prune. Adopt a
+  hardware-assisted beam next; defer template-level LNS until the measured beam
+  stops improving. See
+  `results/arm_codex_80c_partial_order_hardware_frontier_20260904.md`.
+- [x] Run the measured beam through depth 3 while expanding the absolute global
+  incumbent, not only candidates that improve a weaker parent. Corrected depth
+  2 found state `514ced0d...` fastest in both sessions at `31.808/31.721 ms`,
+  with `+2.146/+3.228%` median over original full, despite only
+  `+0.745/+1.055%` over its immediate parent. Depth 3 found no stable >2%
+  relative candidate in either session and no repeated absolute winner. Stop
+  local beam and hand off to template-level LNS. See
+  `results/arm_codex_80c_hardware_assisted_beam_20260904.md`.
 
 ### Step 3: topology-preserving width neighborhoods
 
@@ -383,29 +411,71 @@ Temporal-ranking remediation in progress before this gate may be reconsidered:
 
 - [ ] Derive expert criticality from the event log: final critical lane,
   maximum LLC/DRAM or wide-team dilation interval, cross-domain finish
-  imbalance, and idle-core tail.
-- [ ] Implement destroy sizes 4/8/16 over those critical windows. Keep all
-  unaffected lanes fixed and repair the removed experts with bounded beam
-  search over legal lane, domain, adjacent width, and a small set of insertion
-  positions; start with beam widths 16/32/64.
-- [ ] Maintain a diverse elite pool rather than one trajectory. Diversity must
+  imbalance, and idle-core tail. The first template-LNS gate reuses the existing
+  tail-weighted event-dilation score plus an equal-budget random control; add the
+  other declared signals only if the next cross-trace replay shows a recall gap.
+- [x] Implement lane-atomic target destroy sizes 4/8/16 over critical windows.
+  Keep all unaffected lanes fixed and jointly repair legal width templates,
+  domain placement, assignment, and four bounded temporal-order policies with
+  placement beam widths 16/32/64. Record the full lane closure because a target
+  destroy size can move more experts than its nominal 4/8/16 target.
+- [x] Maintain a diverse elite pool rather than one trajectory. Diversity must
   cover width histograms, LLC-domain assignments, critical-expert placement,
-  and temporal order, not only distinct serialized start vectors.
+  and temporal order, not only distinct serialized start vectors. The high-skew
+  gate used three measured incumbents, two proposal restarts each, six
+  scope/size operators, and retained 92 unique top-16 states across 9 shapes.
 - [ ] Compare LNS with VND under identical event-call and wall-clock budgets.
   Adopt LNS only if larger destroy/repair neighborhoods escape reproducible VND
-  local optima on held-out traces.
+  local optima on held-out traces. The high-skew equal-call/equal-hardware gate
+  passed: LNS used 3,512 event calls and 106 plans versus local beam 3,535/106,
+  found 40 cross-session stable unique candidates with zero false pruning, and
+  improved the preserved `514ced0d...` median by `3.961/3.528%`. LNS model wall
+  time was 1,193.47 s versus 507.06 s. Repeat on median and uniformish before
+  marking this cross-trace item complete. See
+  `results/arm_codex_80c_template_lns_20260904.md`.
+- [x] Repeat the frozen LNS operator mixture on median and uniformish without
+  importing the high-skew winner as a start. All three traces found a consensus
+  winner more than 2% faster than the strongest preserved anchor in both
+  sessions. Median also exposed two stable false-pruning sentinels, including
+  its absolute best; uniformish exposed one strict-P10 false acceptance. Keep
+  the LNS neighborhood, but disable partial-order acceptance and dominance
+  pruning for LNS. See
+  `results/arm_codex_80c_template_lns_suite_20260904.md`.
+- [x] Build a relation-agnostic diverse hardware shortlist that reserves
+  operator, target destroy, actual closure, width histogram, LLC-domain
+  assignment, and model-score quantile coverage without using the partial-order
+  relation. The frozen measured-suite design replay at K=16 retains the absolute
+  measured best and consensus winner on high-skew L1/L2, median, and uniformish
+  with zero selected-best regret. Freeze selector v1. See
+  `results/arm_codex_80c_lns_diverse_shortlist_replay_20260904.md`.
+- [x] After freezing selector v1, generate one independent median proposal
+  frontier with seed `20261010`, measure the nested top-32 audit in two Arm
+  NUMA3 sessions, and require top-16 to contain the top-32 absolute best and
+  consensus winner with zero selected-best regret. Do not change the selector
+  after opening that frontier. Nested recall passed, including K=8; the
+  1-restart neighborhood missed the two-session 2% strongest-full gate
+  (`+2.579/+1.916%`). Adopt selector v1 for offline LNS shortlists only. See
+  `results/arm_codex_80c_lns_diverse_independent_median_20260905.md`.
 
 ### Step 6: decide whether adaptation is warranted
 
-- [ ] Measure which destroy/repair operators win on each trace class. Add ALNS
+- [x] Measure which destroy/repair operators win on each trace class. Add ALNS
   reward-weight updates only if operator effectiveness is complementary across
-  workloads; otherwise retain the simpler fixed-mixture LNS.
+  workloads; otherwise retain the simpler fixed-mixture LNS. Cross-domain
+  repair dominates all first layers, while the only high-skew depth-2 stable
+  move is domain-local d8. This is depth-dependent complementarity, but do not
+  add ALNS weights until the independent median holdout of the
+  relation-agnostic diverse shortlist passes; comparator safety remains closed,
+  and design-replay recall is not that holdout.
 - [ ] If adopted, reward separately for a new global best, current-state
   improvement, elite-pool admission, duplicate, and invalid repair. Freeze the
   update rule before the final holdout and provide operator/size ablations.
-- [ ] Add bounded diversification through multiple starts, tabu state hashes,
+- [x] Add bounded diversification through multiple starts, tabu state hashes,
   or occasional worse-state acceptance. The returned plan must always be the
-  best incumbent, independent of the exploratory trajectory.
+  best incumbent, independent of the exploratory trajectory. The fixed LNS
+  uses canonical-deduplicated controls/elites and two proposal restarts per
+  parent; model decisions never replace the incumbent in diagnostic mode, and
+  the returned state is selected only from cross-session hardware consensus.
 
 ### Step 7: establish the near-optimality claim
 

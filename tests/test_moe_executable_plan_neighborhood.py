@@ -4,6 +4,8 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[1]
 PLANNERS = ROOT / "cpu_moe_schedule_optimization" / "planners"
@@ -19,16 +21,19 @@ from executable_plan_neighborhood import (  # noqa: E402
     LANE_SPLIT,
     ORDER_ONLY_OPERATORS,
     SAME_LANE_INSERTION,
+    TEMPLATE_LNS_REPARTITION,
     WIDTH_ONLY_OPERATORS,
     ExecutablePlanEvaluator,
     ExecutablePlanScore,
     critical_expert_scores,
     enumerate_order_only_neighbors,
+    enumerate_template_lns_neighbors,
     enumerate_width_only_neighbors,
     is_resolvable_improvement,
     placed_tasks,
     sample_combined_neighborhood,
     sample_order_only_neighborhood,
+    sample_template_lns_neighborhood,
     sample_width_only_neighborhood,
     score_executable_plan,
     summarize_executable_plan_pair,
@@ -405,6 +410,151 @@ def test_width_neighbors_preserve_but_never_modify_cross_domain_lanes() -> None:
     )
 
     assert not neighbors
+
+
+def _template_lns_state() -> ExecutablePlanState:
+    task = ExecutableExpertTask
+    return ExecutablePlanState(
+        num_threads=12,
+        thread_cpu_ids=tuple(range(100, 112)),
+        lanes=(
+            ExecutableLane(0, 4, (task(0, 80), task(1, 32), task(2, 8))),
+            ExecutableLane(4, 4, (task(3, 64), task(4, 24), task(5, 12), task(6, 4))),
+            ExecutableLane(8, 2, (task(7, 20), task(8, 6))),
+            ExecutableLane(10, 2, (task(9, 18), task(10, 5))),
+        ),
+        llc_domains=(
+            ExecutableLlcDomain("left", 0, 6),
+            ExecutableLlcDomain("right", 6, 6),
+        ),
+        early_merge=True,
+    )
+
+
+def test_template_lns_repairs_lane_atomic_local_and_cross_domain_windows() -> None:
+    state = _template_lns_state()
+    neighbors = list(
+        enumerate_template_lns_neighbors(
+            state,
+            allowed_widths=(1, 2, 4, 6),
+            isolated_cost=_isolated_cost,
+            window_selector=_windows,
+            critical_expert_ids=(3, 9),
+            destroy_sizes=(4,),
+            repair_beam_widths=(4,),
+            templates_per_block=4,
+        )
+    )
+
+    assert neighbors
+    assert {"domain_local", "cross_domain"} == {
+        "cross_domain" if "_cross_domain_" in neighbor.operator else "domain_local"
+        for neighbor in neighbors
+    }
+    expected_experts = sorted(task.expert_id for lane in state.lanes for task in lane.tasks)
+    for neighbor in neighbors:
+        assert neighbor.operator.startswith(TEMPLATE_LNS_REPARTITION)
+        assert neighbor.operator.endswith("_d4_b4")
+        assert len(neighbor.moved_experts) >= 4
+        assert neighbor.state.thread_cpu_ids == state.thread_cpu_ids
+        assert neighbor.state.llc_domains == state.llc_domains
+        assert neighbor.state.early_merge is True
+        assert sum(neighbor.state.shape) == state.num_threads
+        assert sorted(
+            task.expert_id for lane in neighbor.state.lanes for task in lane.tasks
+        ) == expected_experts
+        assert all(lane.tasks for lane in neighbor.state.lanes)
+        for original_lane in state.lanes:
+            original_experts = {task.expert_id for task in original_lane.tasks}
+            if original_experts.isdisjoint(neighbor.moved_experts):
+                assert original_lane in neighbor.state.lanes
+        for lane in neighbor.state.lanes:
+            if any(task.expert_id in neighbor.moved_experts for task in lane.tasks):
+                for task in lane.tasks:
+                    assert (task.w13_window_tiles, task.w2_window_tiles) == _windows(
+                        task.routes,
+                        lane.threads,
+                    )
+        bridge = neighbor.state.to_bridge()
+        assert bridge["execution_mode"] == "strict"
+        assert bridge["task_threads"] == [task[3] for task in neighbor.state.to_planner_tasks()]
+
+    cross_neighbors = [neighbor for neighbor in neighbors if "_cross_domain_" in neighbor.operator]
+    assert cross_neighbors
+    for neighbor in cross_neighbors:
+        repaired_lanes = [
+            lane
+            for lane in neighbor.state.lanes
+            if any(task.expert_id in neighbor.moved_experts for task in lane.tasks)
+        ]
+        assert all(
+            any(
+                domain.core_begin <= lane.core_begin and lane.core_end <= domain.core_end
+                for domain in neighbor.state.llc_domains
+            )
+            for lane in repaired_lanes
+        )
+
+
+def test_template_lns_sampling_is_deterministic_and_validates_budgets() -> None:
+    state = _template_lns_state()
+    kwargs = {
+        "allowed_widths": (1, 2, 4, 6),
+        "isolated_cost": _isolated_cost,
+        "window_selector": _windows,
+        "critical_expert_ids": (3, 9),
+        "destroy_sizes": (4,),
+        "repair_beam_widths": (4,),
+        "templates_per_block": 3,
+        "per_operator": 3,
+        "seed": 29,
+    }
+    first = sample_template_lns_neighborhood(state, **kwargs)
+    second = sample_template_lns_neighborhood(state, **kwargs)
+
+    first_hashes = [neighbor.state.canonical_hash() for neighbor in first.neighbors]
+    assert first_hashes == [neighbor.state.canonical_hash() for neighbor in second.neighbors]
+    assert len(first_hashes) == len(set(first_hashes))
+    assert state.canonical_hash() not in first_hashes
+    assert first.proposed == first.unique + first.duplicates
+    assert all(count <= 3 for count in first.sampled_by_operator.values())
+
+    one_template_neighbors = list(
+        enumerate_template_lns_neighbors(
+            state,
+            allowed_widths=(1, 2, 4, 6),
+            isolated_cost=_isolated_cost,
+            window_selector=_windows,
+            critical_expert_ids=(3, 9),
+            destroy_sizes=(4,),
+            repair_beam_widths=(4,),
+            templates_per_block=1,
+        )
+    )
+    assert len(one_template_neighbors) <= 2 * 2 * 4
+
+    with pytest.raises(ValueError, match="match repair_beam_widths"):
+        list(
+            enumerate_template_lns_neighbors(
+                state,
+                allowed_widths=(1, 2, 4),
+                isolated_cost=_isolated_cost,
+                window_selector=_windows,
+                critical_expert_ids=(3,),
+                destroy_sizes=(4, 8),
+                repair_beam_widths=(16,),
+            )
+        )
+    with pytest.raises(ValueError, match="critical_expert_ids"):
+        list(
+            enumerate_template_lns_neighbors(
+                state,
+                allowed_widths=(1, 2, 4),
+                isolated_cost=_isolated_cost,
+                window_selector=_windows,
+                critical_expert_ids=(),
+            )
+        )
 
 
 class _ScreenPressure:

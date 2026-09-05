@@ -31,6 +31,25 @@ WIDTH_ONLY_OPERATORS = (
     LANE_MERGE,
     ADJACENT_WIDTH_MIGRATION,
 )
+TEMPLATE_LNS_REPARTITION = "critical_window_template_repartition"
+TEMPLATE_LNS_SCOPES = ("domain_local", "cross_domain")
+TEMPLATE_LNS_DEFAULT_DESTROY_SIZES = (4, 8, 16)
+TEMPLATE_LNS_DEFAULT_REPAIR_BEAM_WIDTHS = (16, 32, 64)
+
+
+def _template_lns_operator(scope: str, destroy_size: int, repair_beam_width: int) -> str:
+    return f"{TEMPLATE_LNS_REPARTITION}_{scope}_d{destroy_size}_b{repair_beam_width}"
+
+
+TEMPLATE_LNS_OPERATORS = tuple(
+    _template_lns_operator(scope, destroy_size, beam_width)
+    for scope in TEMPLATE_LNS_SCOPES
+    for destroy_size, beam_width in zip(
+        TEMPLATE_LNS_DEFAULT_DESTROY_SIZES,
+        TEMPLATE_LNS_DEFAULT_REPAIR_BEAM_WIDTHS,
+        strict=True,
+    )
+)
 
 
 @dataclass(frozen=True)
@@ -595,6 +614,351 @@ def enumerate_width_only_neighbors(
         )
 
 
+def _region_width_templates(
+    total_threads: int,
+    allowed_widths: Sequence[int],
+    *,
+    maximum_lanes: int,
+) -> tuple[tuple[int, ...], ...]:
+    templates: set[tuple[int, ...]] = set()
+
+    def visit(remaining: int, maximum_width: int, prefix: tuple[int, ...]) -> None:
+        if remaining == 0:
+            templates.add(prefix)
+            templates.add(tuple(reversed(prefix)))
+            return
+        if len(prefix) >= maximum_lanes:
+            return
+        for width in reversed(allowed_widths):
+            if width <= min(remaining, maximum_width):
+                visit(remaining - width, width, (*prefix, width))
+
+    visit(total_threads, total_threads, ())
+    return tuple(sorted(templates, key=lambda item: (len(item), item)))
+
+
+def _block_domain_ids(
+    state: ExecutablePlanState,
+    first_lane: int,
+    end_lane: int,
+) -> frozenset[str]:
+    return frozenset(
+        domain_id
+        for lane_index in range(first_lane, end_lane)
+        for domain_id in state.lane_domain_ids(lane_index)
+    )
+
+
+def _minimum_critical_block(
+    state: ExecutablePlanState,
+    center_lane: int,
+    destroy_size: int,
+    *,
+    scope: str,
+) -> tuple[int, int, int] | None:
+    center_domain = _containing_domain_id(state, center_lane)
+    candidates = []
+    for first_lane in range(center_lane + 1):
+        for end_lane in range(center_lane + 1, len(state.lanes) + 1):
+            domain_ids = _block_domain_ids(state, first_lane, end_lane)
+            if scope == "domain_local":
+                if center_domain is None or domain_ids != {center_domain}:
+                    continue
+                if any(
+                    _containing_domain_id(state, lane_index) != center_domain
+                    for lane_index in range(first_lane, end_lane)
+                ):
+                    continue
+            elif scope == "cross_domain":
+                if len(domain_ids) < 2:
+                    continue
+            else:
+                raise ValueError(f"unknown template LNS scope: {scope}")
+            task_count = sum(len(state.lanes[index].tasks) for index in range(first_lane, end_lane))
+            if task_count < destroy_size:
+                continue
+            core_span = state.lanes[end_lane - 1].core_end - state.lanes[first_lane].core_begin
+            candidates.append(
+                (
+                    task_count - destroy_size,
+                    end_lane - first_lane,
+                    core_span,
+                    first_lane,
+                    end_lane,
+                    task_count,
+                )
+            )
+    if not candidates:
+        return None
+    _, _, _, first_lane, end_lane, task_count = min(candidates)
+    return first_lane, end_lane, task_count
+
+
+def _template_is_domain_local(
+    state: ExecutablePlanState,
+    core_begin: int,
+    lane_widths: Sequence[int],
+) -> bool:
+    cursor = core_begin
+    for width in lane_widths:
+        core_end = cursor + width
+        if not any(
+            domain.core_begin <= cursor and core_end <= domain.core_end
+            for domain in state.llc_domains
+        ):
+            return False
+        cursor = core_end
+    return True
+
+
+def _width_histogram_distance(left: Sequence[int], right: Sequence[int]) -> int:
+    left_counts = Counter(left)
+    right_counts = Counter(right)
+    return sum(abs(left_counts[width] - right_counts[width]) for width in left_counts | right_counts)
+
+
+def _select_region_width_templates(
+    templates: Sequence[tuple[int, ...]],
+    original_widths: tuple[int, ...],
+    *,
+    maximum_templates: int,
+) -> tuple[tuple[int, ...], ...]:
+    if maximum_templates <= 0:
+        raise ValueError("maximum_templates must be positive")
+    candidates = tuple(dict.fromkeys(templates))
+    if len(candidates) <= maximum_templates:
+        return candidates
+
+    def distance(template: tuple[int, ...]) -> tuple[int, int, tuple[int, ...]]:
+        return (
+            _width_histogram_distance(original_widths, template),
+            abs(len(original_widths) - len(template)),
+            template,
+        )
+
+    near_budget = (maximum_templates + 1) // 2
+    far_budget = maximum_templates - near_budget
+    selected = list(sorted(candidates, key=distance)[:near_budget])
+    for template in sorted(candidates, key=distance, reverse=True):
+        if len(selected) >= near_budget + far_budget:
+            break
+        if template not in selected:
+            selected.append(template)
+    return tuple(selected)
+
+
+def _beam_assign_tasks(
+    tasks: Sequence[ExecutableExpertTask],
+    lane_widths: Sequence[int],
+    isolated_cost: Callable[[int, int], float],
+    window_selector: Callable[[int, int], tuple[int, int]],
+    critical_expert_ids: frozenset[int],
+    *,
+    repair_beam_width: int,
+) -> tuple[tuple[tuple[ExecutableExpertTask, ...], ...], ...]:
+    """Repair one width template with a bounded placement beam and four order policies."""
+
+    if repair_beam_width <= 0:
+        raise ValueError("repair_beam_width must be positive")
+    if len(lane_widths) > len(tasks):
+        return ()
+    order_policies = 4
+    placement_beam_width = max(1, (repair_beam_width + order_policies - 1) // order_policies)
+    task_costs = {
+        (task.expert_id, width): float(isolated_cost(task.routes, width))
+        for task in tasks
+        for width in lane_widths
+    }
+    ordered_tasks = sorted(
+        tasks,
+        key=lambda task: (
+            -max(task_costs[(task.expert_id, width)] for width in lane_widths),
+            task.expert_id,
+        ),
+    )
+    empty_assignment = tuple(() for _ in lane_widths)
+    beam = [(empty_assignment, tuple(0.0 for _ in lane_widths))]
+    for task_index, task in enumerate(ordered_tasks):
+        remaining_tasks = len(ordered_tasks) - task_index - 1
+        next_beam: dict[
+            tuple[tuple[int, ...], ...],
+            tuple[tuple[tuple[ExecutableExpertTask, ...], ...], tuple[float, ...]],
+        ] = {}
+        for lane_tasks, lane_loads in beam:
+            for lane_index, width in enumerate(lane_widths):
+                empty_after = sum(
+                    not tasks_for_lane
+                    for index, tasks_for_lane in enumerate(lane_tasks)
+                    if index != lane_index
+                )
+                if empty_after > remaining_tasks:
+                    continue
+                updated_lanes = list(lane_tasks)
+                updated_lanes[lane_index] = (
+                    *updated_lanes[lane_index],
+                    _retarget_task(task, width, window_selector),
+                )
+                updated_loads = list(lane_loads)
+                updated_loads[lane_index] += task_costs[(task.expert_id, width)]
+                assignment = tuple(updated_lanes)
+                signature = tuple(
+                    tuple(item.expert_id for item in tasks_for_lane)
+                    for tasks_for_lane in assignment
+                )
+                next_beam[signature] = (assignment, tuple(updated_loads))
+
+        def placement_priority(item):
+            signature, (_, lane_loads) = item
+            return (
+                max(lane_loads),
+                sum(load * load for load in lane_loads),
+                max(lane_loads) - min(lane_loads),
+                signature,
+            )
+
+        beam = [value for _, value in sorted(next_beam.items(), key=placement_priority)[:placement_beam_width]]
+        if not beam:
+            return ()
+
+    repaired: dict[
+        tuple[tuple[int, ...], ...],
+        tuple[tuple[ExecutableExpertTask, ...], ...],
+    ] = {}
+    for lane_tasks, _ in beam:
+        variants = (
+            lane_tasks,
+            tuple(tuple(reversed(row)) for row in lane_tasks),
+            tuple(
+                tuple(sorted(row, key=lambda task: (task.expert_id not in critical_expert_ids, -task.routes, task.expert_id)))
+                for row in lane_tasks
+            ),
+            tuple(
+                tuple(sorted(row, key=lambda task: (task.expert_id in critical_expert_ids, -task.routes, task.expert_id)))
+                for row in lane_tasks
+            ),
+        )
+        for variant in variants:
+            signature = tuple(tuple(task.expert_id for task in row) for row in variant)
+            repaired.setdefault(signature, variant)
+            if len(repaired) == repair_beam_width:
+                return tuple(repaired.values())
+    return tuple(repaired.values())
+
+
+def enumerate_template_lns_neighbors(
+    state: ExecutablePlanState,
+    *,
+    allowed_widths: Iterable[int],
+    isolated_cost: Callable[[int, int], float],
+    window_selector: Callable[[int, int], tuple[int, int]],
+    critical_expert_ids: Iterable[int],
+    destroy_sizes: Iterable[int] = TEMPLATE_LNS_DEFAULT_DESTROY_SIZES,
+    repair_beam_widths: Iterable[int] = TEMPLATE_LNS_DEFAULT_REPAIR_BEAM_WIDTHS,
+    templates_per_block: int = 4,
+) -> Iterable[ExecutablePlanNeighbor]:
+    """Repartition lane-atomic critical windows into executable templates.
+
+    ``destroy_sizes`` are target expert counts. The actual moved set is the
+    smallest whole-lane closure that reaches the target and contains the
+    selected critical expert. Local proposals stay inside one LLC domain;
+    cross-domain proposals must repair the window into domain-contained lanes.
+    """
+
+    widths = tuple(sorted({int(width) for width in allowed_widths}))
+    size_values = tuple(int(size) for size in destroy_sizes)
+    beam_widths = tuple(int(width) for width in repair_beam_widths)
+    if len(size_values) != len(beam_widths) or len(set(size_values)) != len(size_values):
+        raise ValueError("destroy_sizes must be unique and match repair_beam_widths")
+    size_beam_pairs = tuple(sorted(zip(size_values, beam_widths, strict=True)))
+    sizes = tuple(size for size, _ in size_beam_pairs)
+    beam_widths = tuple(beam for _, beam in size_beam_pairs)
+    critical = frozenset(int(expert) for expert in critical_expert_ids)
+    if not widths or widths[0] <= 0:
+        raise ValueError("allowed_widths must contain positive widths")
+    if not sizes or sizes[0] <= 0:
+        raise ValueError("destroy_sizes must contain positive integers")
+    if not beam_widths or min(beam_widths) <= 0:
+        raise ValueError("repair_beam_widths must be positive and match destroy_sizes")
+    if templates_per_block <= 0:
+        raise ValueError("templates_per_block must be positive")
+    if not critical:
+        raise ValueError("critical_expert_ids must be non-empty")
+
+    lane_by_expert = {
+        task.expert_id: lane_index
+        for lane_index, lane in enumerate(state.lanes)
+        for task in lane.tasks
+    }
+    blocks: set[tuple[str, int, int, int, int, int]] = set()
+    for expert_id in sorted(critical):
+        center = lane_by_expert.get(expert_id)
+        if center is None:
+            continue
+        for destroy_size, repair_beam_width in zip(sizes, beam_widths, strict=True):
+            for scope in TEMPLATE_LNS_SCOPES:
+                block = _minimum_critical_block(
+                    state,
+                    center,
+                    destroy_size,
+                    scope=scope,
+                )
+                if block is not None:
+                    first, end, task_count = block
+                    blocks.add((scope, first, end, destroy_size, task_count, repair_beam_width))
+
+    for scope, first, end, destroy_size, task_count, repair_beam_width in sorted(blocks):
+        original_lanes = state.lanes[first:end]
+        original_widths = tuple(lane.threads for lane in original_lanes)
+        total_threads = sum(original_widths)
+        tasks = tuple(task for lane in original_lanes for task in lane.tasks)
+        if len(tasks) != task_count:
+            raise RuntimeError("template LNS block task count changed during enumeration")
+        templates = tuple(
+            template
+            for template in _region_width_templates(
+                total_threads,
+                widths,
+                maximum_lanes=min(len(tasks), max(len(original_lanes) + 4, 8)),
+            )
+            if len(template) <= len(tasks)
+            and (
+                scope == "domain_local"
+                or _template_is_domain_local(state, original_lanes[0].core_begin, template)
+            )
+        )
+        templates = _select_region_width_templates(
+            templates,
+            original_widths,
+            maximum_templates=templates_per_block,
+        )
+        for template in templates:
+            repairs = _beam_assign_tasks(
+                tasks,
+                template,
+                isolated_cost,
+                window_selector,
+                critical,
+                repair_beam_width=repair_beam_width,
+            )
+            for ordering in repairs:
+                cursor = original_lanes[0].core_begin
+                replacement = []
+                for width, lane_tasks in zip(template, ordering, strict=True):
+                    replacement.append(ExecutableLane(cursor, width, lane_tasks))
+                    cursor += width
+                candidate = _with_replaced_lanes(
+                    state,
+                    first,
+                    end - first,
+                    replacement,
+                )
+                yield ExecutablePlanNeighbor(
+                    _template_lns_operator(scope, destroy_size, repair_beam_width),
+                    tuple(task.expert_id for task in tasks),
+                    candidate,
+                )
+
+
 def _sample_neighborhood(
     state: ExecutablePlanState,
     neighbors: Iterable[ExecutablePlanNeighbor],
@@ -708,6 +1072,51 @@ def sample_combined_neighborhood(
             ),
         ),
         operators=(*ORDER_ONLY_OPERATORS, *WIDTH_ONLY_OPERATORS),
+        per_operator=per_operator,
+        seed=seed,
+    )
+
+
+def sample_template_lns_neighborhood(
+    state: ExecutablePlanState,
+    *,
+    allowed_widths: Iterable[int],
+    isolated_cost: Callable[[int, int], float],
+    window_selector: Callable[[int, int], tuple[int, int]],
+    critical_expert_ids: Iterable[int],
+    destroy_sizes: Iterable[int] = TEMPLATE_LNS_DEFAULT_DESTROY_SIZES,
+    repair_beam_widths: Iterable[int] = TEMPLATE_LNS_DEFAULT_REPAIR_BEAM_WIDTHS,
+    templates_per_block: int = 4,
+    per_operator: int,
+    seed: int,
+) -> SampledNeighborhood:
+    """Sample executable multi-lane template repairs around critical experts."""
+
+    sizes = tuple(int(size) for size in destroy_sizes)
+    beams = tuple(int(width) for width in repair_beam_widths)
+    if len(sizes) != len(beams) or len(set(sizes)) != len(sizes):
+        raise ValueError("destroy_sizes must be unique and match repair_beam_widths")
+    pairs = tuple(sorted(zip(sizes, beams, strict=True)))
+    sizes = tuple(size for size, _ in pairs)
+    beams = tuple(beam for _, beam in pairs)
+    operators = tuple(
+        _template_lns_operator(scope, destroy_size, beam_width)
+        for scope in TEMPLATE_LNS_SCOPES
+        for destroy_size, beam_width in zip(sizes, beams, strict=True)
+    )
+    return _sample_neighborhood(
+        state,
+        enumerate_template_lns_neighbors(
+            state,
+            allowed_widths=allowed_widths,
+            isolated_cost=isolated_cost,
+            window_selector=window_selector,
+            critical_expert_ids=critical_expert_ids,
+            destroy_sizes=sizes,
+            repair_beam_widths=beams,
+            templates_per_block=templates_per_block,
+        ),
+        operators=operators,
         per_operator=per_operator,
         seed=seed,
     )
@@ -1095,6 +1504,11 @@ __all__ = [
     "LANE_SPLIT",
     "ORDER_ONLY_OPERATORS",
     "SAME_LANE_INSERTION",
+    "TEMPLATE_LNS_DEFAULT_DESTROY_SIZES",
+    "TEMPLATE_LNS_DEFAULT_REPAIR_BEAM_WIDTHS",
+    "TEMPLATE_LNS_OPERATORS",
+    "TEMPLATE_LNS_REPARTITION",
+    "TEMPLATE_LNS_SCOPES",
     "WIDTH_ONLY_OPERATORS",
     "ExecutablePlanNeighbor",
     "ExecutablePlanEvaluator",
@@ -1103,11 +1517,13 @@ __all__ = [
     "SampledNeighborhood",
     "critical_expert_scores",
     "enumerate_order_only_neighbors",
+    "enumerate_template_lns_neighbors",
     "enumerate_width_only_neighbors",
     "placed_tasks",
     "is_resolvable_improvement",
     "sample_order_only_neighborhood",
     "sample_combined_neighborhood",
+    "sample_template_lns_neighborhood",
     "sample_width_only_neighborhood",
     "score_executable_plan",
     "summarize_executable_plan_pair",

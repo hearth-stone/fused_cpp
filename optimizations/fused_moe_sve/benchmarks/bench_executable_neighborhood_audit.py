@@ -18,6 +18,7 @@ import torch
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
+BENCHMARK_DIR = Path(__file__).resolve().parent
 COST_MODEL_DIR = REPO_ROOT / "cpu_moe_schedule_optimization" / "cost_model"
 PLANNER_DIR = REPO_ROOT / "cpu_moe_schedule_optimization" / "planners"
 sys.path[:0] = [
@@ -25,11 +26,14 @@ sys.path[:0] = [
     str(REPO_ROOT / "src"),
     str(COST_MODEL_DIR),
     str(PLANNER_DIR),
+    str(BENCHMARK_DIR),
 ]
 
 from analytic_model import AnalyticMoeCostModel  # noqa: E402
 from executable_plan_neighborhood import (  # noqa: E402
     ORDER_ONLY_OPERATORS,
+    TEMPLATE_LNS_DEFAULT_DESTROY_SIZES,
+    TEMPLATE_LNS_DEFAULT_REPAIR_BEAM_WIDTHS,
     WIDTH_ONLY_OPERATORS,
     ExecutablePlanEvaluator,
     critical_expert_scores,
@@ -37,17 +41,27 @@ from executable_plan_neighborhood import (  # noqa: E402
     placed_tasks,
     sample_combined_neighborhood,
     sample_order_only_neighborhood,
+    sample_template_lns_neighborhood,
     sample_width_only_neighborhood,
     summarize_executable_plan_pair,
     summarize_placed_event_context,
 )
 from executable_plan_state import ExecutablePlanState  # noqa: E402
+from interval_planner import IntervalPlanner  # noqa: E402
 from pairwise_plan_ordering import (  # noqa: E402
     AnchorRelativePartialOrder,
     PartialOrderCandidate,
     comparator_from_validated_report,
     neighborhood_context,
     select_partial_order_shortlist,
+)
+from lns_diverse_shortlist import (  # noqa: E402
+    DEFAULT_AUDIT_BUDGET,
+    assign_model_score_quantiles,
+    build_candidate_feature,
+    compact_structure,
+    merge_duplicate_features,
+    select_lns_diverse_shortlist,
 )
 from fused_cpp import _moe_C  # noqa: E402
 from fused_cpp.moe import (  # noqa: E402
@@ -85,9 +99,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--screen-audit-budgets", default="8,16,32")
     parser.add_argument(
         "--neighborhood-mode",
-        choices=("order", "width", "combined"),
+        choices=("order", "width", "combined", "lns"),
         default="order",
     )
+    parser.add_argument("--lns-destroy-sizes", default="4,8,16")
+    parser.add_argument("--lns-repair-beam-widths", default="16,32,64")
+    parser.add_argument("--lns-templates-per-block", type=int, default=4)
     parser.add_argument("--event-top-per-strategy", type=int, default=4)
     parser.add_argument("--minimum-actionable-gain-pct", type=float, default=2.0)
     parser.add_argument(
@@ -96,6 +113,12 @@ def parse_args() -> argparse.Namespace:
         help="enable offline partial-order shortlist/acceptance with this gated validation report",
     )
     parser.add_argument("--partial-order-shortlist-budget", type=int, default=16)
+    parser.add_argument("--partial-order-max-iterations", type=int, default=1)
+    parser.add_argument(
+        "--initial-plan",
+        choices=("full", "one_step", "greedy", "fixed_width", "all"),
+        default="full",
+    )
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--runs", type=int, default=31)
     parser.add_argument("--weight-copies", type=int, default=4)
@@ -115,11 +138,21 @@ def _parse_screen_budgets(value: str) -> tuple[int, ...]:
     return budgets
 
 
+def _parse_positive_int_list(value: str, name: str) -> tuple[int, ...]:
+    try:
+        values = tuple(int(item) for item in value.split(",") if item.strip())
+    except ValueError as error:
+        raise ValueError(f"{name} must be comma-separated integers") from error
+    if not values or min(values) <= 0:
+        raise ValueError(f"{name} must contain positive integers")
+    return values
+
+
 def _full_strict_result(
     planned: PlannedMoE,
     counts: list[tuple[int, int]],
     topk_ids: torch.Tensor,
-) -> tuple[dict[str, object], float]:
+) -> tuple[dict[str, object], tuple[dict[str, object], ...], float]:
     interval = planned.interval_planners[0]
     begin = time.perf_counter_ns()
     candidates = [interval._candidate(counts, shape) for shape in interval.shapes]
@@ -137,7 +170,87 @@ def _full_strict_result(
         dynamic_candidates=0,
         tail_repartition_candidates=0,
     )
-    return result, (time.perf_counter_ns() - begin) / 1.0e6
+    return result, tuple(candidates), (time.perf_counter_ns() - begin) / 1.0e6
+
+
+def _finalize_strict_candidate(
+    interval: IntervalPlanner,
+    candidate: dict[str, object],
+    candidates: tuple[dict[str, object], ...],
+    topk_ids: torch.Tensor,
+    *,
+    planner_backend: str,
+) -> dict[str, object]:
+    return interval._finalize_plan(
+        candidate,
+        candidates,
+        topk_ids=topk_ids,
+        planner_backend=planner_backend,
+        planner_workers=1,
+        strict_candidates=len(candidates),
+        dynamic_candidates=0,
+        tail_repartition_candidates=0,
+    )
+
+
+def _build_initial_results(
+    interval: IntervalPlanner,
+    counts: list[tuple[int, int]],
+    topk_ids: torch.Tensor,
+    full_result: dict[str, object],
+    strict_candidates: tuple[dict[str, object], ...],
+) -> tuple[dict[str, dict[str, object]], dict[str, object]]:
+    begin = time.perf_counter_ns()
+    one_step_candidate = IntervalPlanner._select_analytic_full(strict_candidates)
+    one_step_result = _finalize_strict_candidate(
+        interval,
+        one_step_candidate,
+        strict_candidates,
+        topk_ids,
+        planner_backend="python_analytic_one_step_control",
+    )
+    greedy_result = interval.plan_quick(counts, topk_ids=topk_ids)
+    if (
+        greedy_result["execution_mode"] != "strict"
+        or greedy_result["tail_pool_threads"] is not None
+        or greedy_result["tail_pool_tasks"]
+        or greedy_result["tail_repartition_tasks"]
+    ):
+        raise RuntimeError("greedy initial plan must be fixed strict without tail recourse")
+    homogeneous = tuple(
+        candidate
+        for candidate in strict_candidates
+        if len(set(int(width) for width in candidate["shape"])) == 1
+    )
+    if not homogeneous:
+        raise RuntimeError("no homogeneous strict candidate is available for fixed-width initial plan")
+    fixed_candidate = _select_expected(list(homogeneous))
+    fixed_result = _finalize_strict_candidate(
+        interval,
+        fixed_candidate,
+        strict_candidates,
+        topk_ids,
+        planner_backend="python_analytic_fixed_width_control",
+    )
+    results = {
+        "full": full_result,
+        "one_step": one_step_result,
+        "greedy": greedy_result,
+        "fixed_width": fixed_result,
+    }
+    metadata = {
+        "construction_wall_ms": (time.perf_counter_ns() - begin) / 1.0e6,
+        "sources": {
+            name: {
+                "state_shape": list(result["shape"]),
+                "planner_backend": result["planner_backend"],
+                "planner_makespan_ms": float(result["makespan_ns"]) / 1.0e6,
+            }
+            for name, result in results.items()
+        },
+        "fixed_width": int(fixed_result["shape"][0]),
+    }
+    return results, metadata
 
 
 def _window_geometry(
@@ -179,6 +292,9 @@ def _score_neighborhood(
     screen_budgets: tuple[int, ...],
     exact_top: int,
     scoring_evaluator: ExecutablePlanEvaluator | None = None,
+    lns_destroy_sizes: tuple[int, ...] = TEMPLATE_LNS_DEFAULT_DESTROY_SIZES,
+    lns_repair_beam_widths: tuple[int, ...] = TEMPLATE_LNS_DEFAULT_REPAIR_BEAM_WIDTHS,
+    lns_templates_per_block: int = 4,
 ) -> tuple[dict[str, object], dict[str, ExecutablePlanState]]:
     model = evaluator.model
     policy = interval._stage_window_policy()
@@ -194,6 +310,20 @@ def _score_neighborhood(
     if neighborhood_mode == "order":
         sampled = sample_order_only_neighborhood(state, **sample_kwargs)
         operators = ORDER_ONLY_OPERATORS
+    elif neighborhood_mode == "lns":
+        sampled = sample_template_lns_neighborhood(
+            state,
+            allowed_widths=interval.widths,
+            isolated_cost=model.T_iso,
+            window_selector=window_selector,
+            critical_expert_ids=expert_ids,
+            destroy_sizes=lns_destroy_sizes,
+            repair_beam_widths=lns_repair_beam_widths,
+            templates_per_block=lns_templates_per_block,
+            per_operator=per_operator,
+            seed=seed,
+        )
+        operators = tuple(sampled.proposed_by_operator)
     else:
         width_kwargs = {
             "allowed_widths": interval.widths,
@@ -226,21 +356,24 @@ def _score_neighborhood(
         score = scorer.exact(neighbor.state)
         screen = screen_rows[state_hash]
         states[state_hash] = neighbor.state
-        scored.append(
-            {
-                "state_hash": state_hash,
-                "operator": neighbor.operator,
-                "moved_experts": list(neighbor.moved_experts),
-                "event_ns": score.event_ns,
-                "lane_guard_ns": score.lane_guard_ns,
-                "robust_ns": score.robust_ns,
-                "screen_priority_ns": screen.priority_ns,
-                "screen_phase_ns": screen.phase_surrogate_ns,
-                "screen_lower_bound_ns": screen.lower_bound_ns,
-                "event_gain_pct": 100.0 * (baseline_score.event_ns / score.event_ns - 1.0),
-                "robust_gain_pct": 100.0 * (baseline_score.robust_ns / score.robust_ns - 1.0),
-            }
-        )
+        row = {
+            "state_hash": state_hash,
+            "operator": neighbor.operator,
+            "moved_experts": list(neighbor.moved_experts),
+            "moved_expert_count": len(neighbor.moved_experts),
+            "shape": list(neighbor.state.shape),
+            "event_ns": score.event_ns,
+            "lane_guard_ns": score.lane_guard_ns,
+            "robust_ns": score.robust_ns,
+            "screen_priority_ns": screen.priority_ns,
+            "screen_phase_ns": screen.phase_surrogate_ns,
+            "screen_lower_bound_ns": screen.lower_bound_ns,
+            "event_gain_pct": 100.0 * (baseline_score.event_ns / score.event_ns - 1.0),
+            "robust_gain_pct": 100.0 * (baseline_score.robust_ns / score.robust_ns - 1.0),
+        }
+        if neighborhood_mode == "lns":
+            row["structure"] = compact_structure(neighbor.state)
+        scored.append(row)
     score_wall_s = (time.perf_counter_ns() - begin) / 1.0e9
     exact_calls = scorer.exact_calls - exact_calls_before
     exact_cache_hits = scorer.exact_cache_hits - exact_hits_before
@@ -339,6 +472,8 @@ def _score_neighborhood(
     }
     if neighborhood_mode == "combined":
         ablation_operators["combined"] = frozenset(operators)
+    elif neighborhood_mode == "lns":
+        ablation_operators["template_lns"] = frozenset(operators)
     report["ablations"] = {
         name: {
             "sampled": len(rows := [item for item in scored if item["operator"] in selected_operators]),
@@ -561,10 +696,379 @@ def _candidate_context(
     return neighborhood_context(operator, features)
 
 
+def _candidate_context_for_calibration(
+    comparator: AnchorRelativePartialOrder,
+    model: AnalyticMoeCostModel,
+    anchor: ExecutablePlanState,
+    anchor_explanation: dict[str, object],
+    candidate: ExecutablePlanState,
+    operator: str,
+) -> tuple[str, bool]:
+    calibrated_contexts = dict(comparator.calibration.context_radii_pct)
+    has_placed_context_keys = any("|" in key for key in calibrated_contexts)
+    if operator in calibrated_contexts or not has_placed_context_keys:
+        return operator, False
+    return (
+        _candidate_context(
+            model,
+            anchor,
+            anchor_explanation,
+            candidate,
+            operator,
+        ),
+        True,
+    )
+
+
+def _run_partial_order_vnd_start(
+    args: argparse.Namespace,
+    *,
+    start_name: str,
+    initial_state: ExecutablePlanState,
+    interval: IntervalPlanner,
+    proposal_model: AnalyticMoeCostModel,
+    score_model: AnalyticMoeCostModel,
+    comparator: AnchorRelativePartialOrder,
+    screen_budgets: tuple[int, ...],
+) -> dict[str, object]:
+    evaluator = ExecutablePlanEvaluator(score_model)
+    proposal_evaluator = ExecutablePlanEvaluator(proposal_model)
+    incumbent = initial_state
+    incumbent_hash = incumbent.canonical_hash()
+    visited = {incumbent_hash}
+    initial_score = evaluator.exact(incumbent)
+    best_curve = [
+        {
+            "iteration": -1,
+            "state_hash": incumbent_hash,
+            "event_ns": initial_score.event_ns,
+            "robust_ns": initial_score.robust_ns,
+        }
+    ]
+    iterations = []
+    accepted_by_operator: Counter[str] = Counter()
+    proposed_by_operator: Counter[str] = Counter()
+    placed_context_calls = 0
+    search_begin = time.perf_counter_ns()
+    stop_reason = "iteration_limit"
+    start_seed = sum((index + 1) * byte for index, byte in enumerate(start_name.encode("utf-8")))
+    for iteration in range(args.partial_order_max_iterations):
+        iteration_begin = time.perf_counter_ns()
+        anchor_hash = incumbent.canonical_hash()
+        anchor_shape = list(incumbent.shape)
+        anchor_score = evaluator.exact(incumbent)
+        anchor_explanation = score_model.explain_dag_placed(placed_tasks(incumbent))
+        placed_context_calls += 1
+        expert_scores = critical_expert_scores(incumbent, anchor_explanation)
+        critical_budget = min(args.critical_experts, len(expert_scores))
+        critical_ids = sorted(
+            expert_scores,
+            key=lambda expert: (-expert_scores[expert], expert),
+        )[:critical_budget]
+        random_ids = sorted(
+            random.Random(args.seed ^ start_seed ^ (iteration * 0x9E3779B1)).sample(
+                list(expert_scores),
+                critical_budget,
+            )
+        )
+        reports = {}
+        candidate_states: dict[str, ExecutablePlanState] = {}
+        exact_calls_before = evaluator.exact_calls
+        for strategy, expert_ids, seed_delta in (
+            ("critical", critical_ids, 0xC17),
+            ("random", random_ids, 0xA11),
+        ):
+            report, states = _score_neighborhood(
+                proposal_evaluator,
+                incumbent,
+                interval=interval,
+                neighborhood_mode=args.neighborhood_mode,
+                expert_ids=expert_ids,
+                per_operator=args.neighbors_per_operator,
+                seed=args.seed ^ start_seed ^ (iteration * 0x9E3779B1) ^ seed_delta,
+                screen_budgets=screen_budgets,
+                exact_top=args.event_top_per_strategy,
+                scoring_evaluator=evaluator,
+                lns_destroy_sizes=getattr(
+                    args,
+                    "lns_destroy_sizes",
+                    TEMPLATE_LNS_DEFAULT_DESTROY_SIZES,
+                ),
+                lns_repair_beam_widths=getattr(
+                    args,
+                    "lns_repair_beam_widths",
+                    TEMPLATE_LNS_DEFAULT_REPAIR_BEAM_WIDTHS,
+                ),
+                lns_templates_per_block=getattr(args, "lns_templates_per_block", 4),
+            )
+            reports[strategy] = report
+            candidate_states.update(states)
+            for operator, summary in report["operators"].items():
+                proposed_by_operator[operator] += int(summary["proposed"])
+
+        rows_by_hash: dict[str, tuple[str, dict[str, object]]] = {}
+        for strategy, report in reports.items():
+            for row in report["scored"]:
+                state_hash = str(row["state_hash"])
+                rows_by_hash.setdefault(state_hash, (strategy, row))
+        revisited = sorted(state_hash for state_hash in rows_by_hash if state_hash in visited)
+        context_begin = time.perf_counter_ns()
+        partial_candidates = []
+        detailed_context_calls = 0
+        for state_hash, (_, row) in sorted(rows_by_hash.items()):
+            if state_hash in visited:
+                continue
+            operator = str(row["operator"])
+            context, used_detailed_context = _candidate_context_for_calibration(
+                comparator,
+                score_model,
+                incumbent,
+                anchor_explanation,
+                candidate_states[state_hash],
+                operator,
+            )
+            detailed_context_calls += int(used_detailed_context)
+            partial_candidates.append(
+                PartialOrderCandidate(
+                    key=state_hash,
+                    family=_operator_family(operator),
+                    context=context,
+                    predicted_gain_pct=float(row["robust_gain_pct"]),
+                )
+            )
+        context_wall_s = (time.perf_counter_ns() - context_begin) / 1.0e9
+        placed_context_calls += detailed_context_calls
+        if not partial_candidates:
+            stop_reason = "no_unvisited_neighbors"
+            iterations.append(
+                {
+                    "iteration": iteration,
+                    "anchor_state_hash": anchor_hash,
+                    "revisited_state_hashes": revisited,
+                    "stop_reason": stop_reason,
+                }
+            )
+            break
+        shortlist = select_partial_order_shortlist(
+            comparator,
+            partial_candidates,
+            budget=args.partial_order_shortlist_budget,
+        )
+        shortlist_payload = shortlist.to_dict()
+        diagnostic_only = (
+            args.neighborhood_mode == "lns"
+            or getattr(args, "partial_order_decision_mode", "active") == "diagnostic_only"
+        )
+        lns_mode = args.neighborhood_mode == "lns"
+        diverse_shortlist = None
+        candidate_features: list[dict[str, object]] = []
+        diagnostic_worse_keys = list(shortlist.dominated_keys) if diagnostic_only else []
+        if lns_mode:
+            feature_rows = []
+            for state_hash, (strategy, row) in rows_by_hash.items():
+                if state_hash in visited:
+                    continue
+                feature_rows.append(
+                    build_candidate_feature(
+                        candidate_states[state_hash],
+                        incumbent,
+                        operator=str(row["operator"]),
+                        moved_experts=row["moved_experts"],
+                        predicted_gain_pct=float(row["robust_gain_pct"]),
+                        start=start_name,
+                        strategy=strategy,
+                    )
+                )
+            diverse_shortlist = select_lns_diverse_shortlist(
+                feature_rows,
+                shortlist_budget=int(
+                    getattr(args, "shortlist_budget", args.partial_order_shortlist_budget)
+                ),
+                audit_budget=int(getattr(args, "audit_budget", DEFAULT_AUDIT_BUDGET)),
+            )
+            candidate_features = [
+                item.to_dict()
+                for item in assign_model_score_quantiles(merge_duplicate_features(feature_rows))
+            ]
+            shortlist_payload["diagnostic_worse_keys"] = diagnostic_worse_keys
+            shortlist_payload["dominated_keys"] = []
+            shortlist_payload["selected_keys"] = list(diverse_shortlist.selected_keys)
+            shortlist_payload["budget_deferred_keys"] = list(diverse_shortlist.budget_deferred_keys)
+            shortlist_payload["dominance_pruning_enabled"] = False
+            shortlist_payload["automatic_acceptance_enabled"] = False
+        elif diagnostic_only:
+            shortlist_payload["diagnostic_worse_keys"] = diagnostic_worse_keys
+            shortlist_payload["dominated_keys"] = []
+            shortlist_payload["budget_deferred_keys"] = sorted(
+                {
+                    *shortlist_payload["budget_deferred_keys"],
+                    *diagnostic_worse_keys,
+                }
+            )
+            shortlist_payload["dominance_pruning_enabled"] = False
+            shortlist_payload["automatic_acceptance_enabled"] = False
+        else:
+            shortlist_payload["diagnostic_worse_keys"] = []
+            shortlist_payload["dominance_pruning_enabled"] = True
+            shortlist_payload["automatic_acceptance_enabled"] = True
+
+        def frontier_row(state_hash: str) -> dict[str, object]:
+            strategy, row = rows_by_hash[state_hash]
+            selected_state = candidate_states[state_hash]
+            payload = {
+                "state_hash": state_hash,
+                "strategy": strategy,
+                "operator": row["operator"],
+                "moved_experts": row["moved_experts"],
+                "shape": list(selected_state.shape),
+                "event_ns": row["event_ns"],
+                "robust_ns": row["robust_ns"],
+                "event_gain_pct": row["event_gain_pct"],
+                "robust_gain_pct": row["robust_gain_pct"],
+                "partial_order": shortlist_payload["evidence"][state_hash],
+                "canonical_state": selected_state.canonical_payload(),
+                "plan_v2_bridge": selected_state.to_bridge(),
+            }
+            if "structure" in row:
+                payload["structure"] = row["structure"]
+            return payload
+
+        if diverse_shortlist is not None:
+            selected = [frontier_row(key) for key in diverse_shortlist.selected_keys]
+            audit_frontier = [frontier_row(key) for key in diverse_shortlist.audit_keys]
+            worse_sentinels: list[dict[str, object]] = []
+        else:
+            selected = [frontier_row(key) for key in shortlist.selected_keys]
+            audit_frontier = []
+            worse_keys = (
+                diagnostic_worse_keys if diagnostic_only else list(shortlist.dominated_keys)
+            )
+            sentinel_keys = []
+            if worse_keys:
+                by_upper = sorted(
+                    worse_keys,
+                    key=lambda key: (
+                        float(shortlist_payload["evidence"][key]["upper_gain_pct"]),
+                        key,
+                    ),
+                )
+                sentinel_keys.append(by_upper[0])
+                if by_upper[-1] != by_upper[0]:
+                    sentinel_keys.append(by_upper[-1])
+            worse_sentinels = [frontier_row(key) for key in sentinel_keys]
+        accepted_hash = None if diagnostic_only else shortlist.accepted_key
+        accepted_move = None
+        if accepted_hash is not None:
+            strategy, accepted_row = rows_by_hash[accepted_hash]
+            accepted_move = {
+                "state_hash": accepted_hash,
+                "strategy": strategy,
+                "operator": accepted_row["operator"],
+                "moved_experts": accepted_row["moved_experts"],
+                "event_gain_pct": accepted_row["event_gain_pct"],
+                "robust_gain_pct": accepted_row["robust_gain_pct"],
+                "partial_order": shortlist_payload["evidence"][accepted_hash],
+            }
+            incumbent = candidate_states[accepted_hash]
+            incumbent_hash = accepted_hash
+            visited.add(accepted_hash)
+            accepted_by_operator[str(accepted_row["operator"])] += 1
+            accepted_score = evaluator.exact(incumbent)
+            if accepted_score.robust_ns >= anchor_score.robust_ns:
+                raise RuntimeError("partial-order acceptance did not improve the robust incumbent")
+            best_curve.append(
+                {
+                    "iteration": iteration,
+                    "state_hash": accepted_hash,
+                    "event_ns": accepted_score.event_ns,
+                    "robust_ns": accepted_score.robust_ns,
+                }
+            )
+        else:
+            stop_reason = (
+                "diagnostic_only_no_model_acceptance"
+                if diagnostic_only
+                else "no_confident_improvement"
+            )
+
+        operator_summary = {}
+        for report in reports.values():
+            for operator, summary in report["operators"].items():
+                target = operator_summary.setdefault(
+                    operator,
+                    {"proposed": 0, "unique": 0, "sampled": 0},
+                )
+                for field in target:
+                    target[field] += int(summary[field])
+        iterations.append(
+            {
+                "iteration": iteration,
+                "anchor_state_hash": anchor_hash,
+                "anchor_shape": anchor_shape,
+                "anchor_event_ns": anchor_score.event_ns,
+                "anchor_robust_ns": anchor_score.robust_ns,
+                "critical_expert_ids": critical_ids,
+                "random_expert_ids": random_ids,
+                "operators": operator_summary,
+                "unique_candidates": len(rows_by_hash),
+                "revisited_state_hashes": revisited,
+                "partial_order": shortlist_payload,
+                "lns_diverse_shortlist": None if diverse_shortlist is None else diverse_shortlist.to_dict(),
+                "selected_frontier": selected,
+                "audit_frontier": audit_frontier,
+                "candidate_features": candidate_features,
+                "worse_sentinels": worse_sentinels,
+                "accepted_move": accepted_move,
+                "exact_event_calls": evaluator.exact_calls - exact_calls_before,
+                "placed_context_event_calls": 1 + detailed_context_calls,
+                "context_evaluation_wall_s": context_wall_s,
+                "iteration_wall_s": (time.perf_counter_ns() - iteration_begin) / 1.0e9,
+                "stop_reason": stop_reason if accepted_hash is None else None,
+            }
+        )
+        if accepted_hash is None:
+            break
+    final_score = evaluator.exact(incumbent)
+    return {
+        "start": start_name,
+        "initial_state_hash": initial_state.canonical_hash(),
+        "initial_shape": list(initial_state.shape),
+        "initial_canonical_state": initial_state.canonical_payload(),
+        "initial_plan_v2_bridge": initial_state.to_bridge(),
+        "final_state_hash": incumbent.canonical_hash(),
+        "final_shape": list(incumbent.shape),
+        "accepted_moves": sum(accepted_by_operator.values()),
+        "accepted_by_operator": dict(sorted(accepted_by_operator.items())),
+        "proposed_by_operator": dict(sorted(proposed_by_operator.items())),
+        "visited_incumbents": sorted(visited),
+        "iterations": iterations,
+        "best_so_far_curve": best_curve,
+        "initial_event_ns": initial_score.event_ns,
+        "initial_robust_ns": initial_score.robust_ns,
+        "final_event_ns": final_score.event_ns,
+        "final_robust_ns": final_score.robust_ns,
+        "event_gain_pct": 100.0 * (initial_score.event_ns / final_score.event_ns - 1.0),
+        "robust_gain_pct": 100.0 * (initial_score.robust_ns / final_score.robust_ns - 1.0),
+        "exact_event_calls": evaluator.exact_calls + placed_context_calls,
+        "scoring_event_calls": evaluator.exact_calls,
+        "placed_context_event_calls": placed_context_calls,
+        "search_wall_s": (time.perf_counter_ns() - search_begin) / 1.0e9,
+        "stop_reason": stop_reason,
+    }
+
+
 @torch.inference_mode()
 def main() -> int:
     args = parse_args()
     screen_budgets = _parse_screen_budgets(args.screen_audit_budgets)
+    args.lns_destroy_sizes = _parse_positive_int_list(
+        args.lns_destroy_sizes,
+        "lns-destroy-sizes",
+    )
+    args.lns_repair_beam_widths = _parse_positive_int_list(
+        args.lns_repair_beam_widths,
+        "lns-repair-beam-widths",
+    )
     if (
         min(
             args.hidden,
@@ -574,14 +1078,24 @@ def main() -> int:
             args.critical_experts,
             args.neighbors_per_operator,
             args.event_top_per_strategy,
+            args.lns_templates_per_block,
         )
         <= 0
     ):
         raise ValueError("dimensions and audit budgets must be positive")
     if not 0.0 <= args.minimum_actionable_gain_pct < 100.0:
         raise ValueError("minimum-actionable-gain-pct must be in [0, 100)")
-    if args.partial_order_shortlist_budget <= 0:
-        raise ValueError("partial-order-shortlist-budget must be positive")
+    if args.partial_order_shortlist_budget <= 0 or args.partial_order_max_iterations <= 0:
+        raise ValueError("partial-order shortlist budget and maximum iterations must be positive")
+    if len(args.lns_destroy_sizes) != len(args.lns_repair_beam_widths):
+        raise ValueError("lns destroy sizes and repair beam widths must have the same length")
+    if len(set(args.lns_destroy_sizes)) != len(args.lns_destroy_sizes):
+        raise ValueError("lns destroy sizes must be unique")
+    vnd_requested = args.initial_plan != "full" or args.partial_order_max_iterations > 1
+    if vnd_requested and args.pairwise_calibration is None:
+        raise ValueError("multi-start or multi-iteration VND requires --pairwise-calibration")
+    if vnd_requested and args.measure_hardware:
+        raise ValueError("multi-start VND is model-only; measure its frozen frontier separately")
     if args.measure_hardware and args.rescore_calibration is not None:
         raise ValueError("--rescore-calibration is score-only and cannot measure hardware")
     affinity = sorted(os.sched_getaffinity(0))
@@ -614,7 +1128,7 @@ def main() -> int:
         cache_plans=False,
     )
     interval = planned.interval_planners[0]
-    full_result, full_plan_ms = _full_strict_result(planned, counts, topk_ids)
+    full_result, strict_candidates, full_plan_ms = _full_strict_result(planned, counts, topk_ids)
     llc_domains = tuple((domain.domain_id, domain.cpu_ids) for domain in model.calibration.llc_domains)
     baseline = ExecutablePlanState.from_planner_result(
         full_result,
@@ -638,6 +1152,116 @@ def main() -> int:
         else model
     )
     evaluator = ExecutablePlanEvaluator(score_model)
+    if vnd_requested:
+        initial_results, initial_metadata = _build_initial_results(
+            interval,
+            counts,
+            topk_ids,
+            full_result,
+            strict_candidates,
+        )
+        initial_states = {
+            name: ExecutablePlanState.from_planner_result(
+                result,
+                llc_domains=llc_domains,
+            )
+            for name, result in initial_results.items()
+        }
+        comparator = _load_pairwise_comparator(
+            args.pairwise_calibration,
+            args.minimum_actionable_gain_pct,
+            args.partial_order_shortlist_budget,
+            calibration_sha256=_sha256(
+                args.rescore_calibration or args.analytic_calibration
+            ),
+            extension_sha256=_sha256(Path(_moe_C.__file__)),
+        )
+        start_names = tuple(initial_states) if args.initial_plan == "all" else (args.initial_plan,)
+        runs = {
+            name: _run_partial_order_vnd_start(
+                args,
+                start_name=name,
+                initial_state=initial_states[name],
+                interval=interval,
+                proposal_model=model,
+                score_model=score_model,
+                comparator=comparator,
+                screen_budgets=screen_budgets,
+            )
+            for name in start_names
+        }
+        result = {
+            "kind": "executable_partial_order_vnd_model_replay",
+            "route": route_metadata,
+            "shape": {
+                "hidden": args.hidden,
+                "intermediate": args.intermediate,
+                "experts": args.experts,
+                "tokens": int(topk_ids.shape[0]),
+                "top_k": int(topk_ids.shape[1]),
+                "threads": args.threads,
+                "backend_n_tile": backend_n_tile,
+            },
+            "method": {
+                "initial_plan": args.initial_plan,
+                "start_names": list(start_names),
+                "neighborhood_mode": args.neighborhood_mode,
+                "critical_experts": args.critical_experts,
+                "neighbors_per_operator": args.neighbors_per_operator,
+                "partial_order_shortlist_budget": args.partial_order_shortlist_budget,
+                "partial_order_max_iterations": args.partial_order_max_iterations,
+                "minimum_actionable_gain_pct": args.minimum_actionable_gain_pct,
+                "lns_destroy_sizes": list(args.lns_destroy_sizes),
+                "lns_repair_beam_widths": list(args.lns_repair_beam_widths),
+                "lns_templates_per_block": args.lns_templates_per_block,
+                "acceptance": (
+                    "diagnostic_only_hardware_consensus"
+                    if args.neighborhood_mode == "lns"
+                    else "complete_residual_interval_clears_actionable_margin"
+                ),
+                "dominance_pruning_enabled": args.neighborhood_mode != "lns",
+                "incomparable_policy": "retain_in_frontier_never_accept_or_dominance_prune",
+                "budget_policy": "context_leader_then_interval_lower_bound",
+            },
+            "identity": {
+                "calibration": str(args.analytic_calibration),
+                "calibration_sha256": _sha256(args.analytic_calibration),
+                "rescore_calibration": (
+                    str(args.rescore_calibration)
+                    if args.rescore_calibration is not None
+                    else None
+                ),
+                "rescore_calibration_sha256": (
+                    _sha256(args.rescore_calibration)
+                    if args.rescore_calibration is not None
+                    else None
+                ),
+                "pairwise_calibration": str(args.pairwise_calibration),
+                "pairwise_calibration_sha256": _sha256(args.pairwise_calibration),
+                "extension": str(_moe_C.__file__),
+                "extension_sha256": _sha256(Path(_moe_C.__file__)),
+            },
+            "initial_plans": initial_metadata,
+            "runs": runs,
+            "summary": {
+                "starts": len(runs),
+                "starts_with_accepted_move": sum(
+                    int(run["accepted_moves"]) > 0 for run in runs.values()
+                ),
+                "accepted_moves": sum(int(run["accepted_moves"]) for run in runs.values()),
+                "stop_reasons": dict(Counter(str(run["stop_reason"]) for run in runs.values())),
+                "total_event_calls": sum(int(run["exact_event_calls"]) for run in runs.values()),
+                "total_search_wall_s": sum(float(run["search_wall_s"]) for run in runs.values()),
+            },
+        }
+        print(json.dumps(result["summary"], sort_keys=True))
+        if args.output is not None:
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            args.output.write_text(
+                json.dumps(result, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+        return 0
     explanation = model.explain_dag_placed(placed_tasks(baseline))
     score_explanation = (
         explanation
@@ -666,6 +1290,9 @@ def main() -> int:
             screen_budgets=screen_budgets,
             exact_top=args.event_top_per_strategy,
             scoring_evaluator=evaluator,
+            lns_destroy_sizes=args.lns_destroy_sizes,
+            lns_repair_beam_widths=args.lns_repair_beam_widths,
+            lns_templates_per_block=args.lns_templates_per_block,
         )
         reports[strategy] = report
         all_states.update(states)
@@ -699,20 +1326,24 @@ def main() -> int:
             state_hash = str(row["state_hash"])
             rows_by_hash.setdefault(state_hash, (strategy, row))
         partial_candidates = []
+        detailed_context_calls = 0
         context_begin = time.perf_counter_ns()
         for state_hash, (_, row) in sorted(rows_by_hash.items()):
             operator = str(row["operator"])
+            context, used_detailed_context = _candidate_context_for_calibration(
+                comparator,
+                score_model,
+                baseline,
+                score_explanation,
+                all_states[state_hash],
+                operator,
+            )
+            detailed_context_calls += int(used_detailed_context)
             partial_candidates.append(
                 PartialOrderCandidate(
                     key=state_hash,
                     family=_operator_family(operator),
-                    context=_candidate_context(
-                        score_model,
-                        baseline,
-                        score_explanation,
-                        all_states[state_hash],
-                        operator,
-                    ),
+                    context=context,
                     predicted_gain_pct=float(row["robust_gain_pct"]),
                 )
             )
@@ -724,7 +1355,25 @@ def main() -> int:
         )
         partial_order = shortlist.to_dict()
         partial_order["context_evaluation_wall_s"] = context_wall_s
-        accepted_hash = shortlist.accepted_key
+        partial_order["placed_context_event_calls"] = detailed_context_calls
+        if args.neighborhood_mode == "lns":
+            diagnostic_worse_keys = list(shortlist.dominated_keys)
+            partial_order["diagnostic_worse_keys"] = diagnostic_worse_keys
+            partial_order["dominated_keys"] = []
+            partial_order["budget_deferred_keys"] = sorted(
+                {
+                    *partial_order["budget_deferred_keys"],
+                    *diagnostic_worse_keys,
+                }
+            )
+            partial_order["dominance_pruning_enabled"] = False
+            partial_order["automatic_acceptance_enabled"] = False
+            accepted_hash = None
+        else:
+            partial_order["diagnostic_worse_keys"] = []
+            partial_order["dominance_pruning_enabled"] = True
+            partial_order["automatic_acceptance_enabled"] = True
+            accepted_hash = shortlist.accepted_key
         accepted = accepted_hash is not None
         if accepted_hash is not None:
             best_state_hash = accepted_hash
@@ -949,11 +1598,17 @@ def main() -> int:
             "criticality": "tail_weighted_event_duration_times_task_dilation",
             "critical_experts": budget,
             "neighbors_per_operator": args.neighbors_per_operator,
+            "lns_destroy_sizes": list(args.lns_destroy_sizes),
+            "lns_repair_beam_widths": list(args.lns_repair_beam_widths),
+            "lns_templates_per_block": args.lns_templates_per_block,
             "screen_audit_budgets": list(screen_budgets),
             "event_top_per_strategy": args.event_top_per_strategy,
             "minimum_actionable_gain_pct": args.minimum_actionable_gain_pct,
             "partial_order_shortlist_budget": (
                 args.partial_order_shortlist_budget if args.pairwise_calibration is not None else 0
+            ),
+            "partial_order_decision_mode": (
+                "diagnostic_only" if args.neighborhood_mode == "lns" else "active"
             ),
             "hardware_warmup": args.warmup if args.measure_hardware else 0,
             "hardware_runs": args.runs if args.measure_hardware else 0,
