@@ -436,6 +436,108 @@ def test_lns_diverse_builder_uses_nested_roles_and_rejects_sentinels(tmp_path: P
     assert frontier["lns_diverse_shortlist"]["selected_keys"] == [top16.canonical_hash()]
 
 
+def test_known_elite_is_an_extra_control_without_dropping_lns_roles(tmp_path: Path) -> None:
+    task = ExecutableExpertTask
+    anchor = ExecutablePlanState(
+        num_threads=2,
+        thread_cpu_ids=(10, 11),
+        lanes=(ExecutableLane(0, 2, (task(0, 7), task(1, 5))),),
+        llc_domains=(ExecutableLlcDomain("llc", 0, 2),),
+    )
+    top16 = ExecutablePlanState(
+        num_threads=2,
+        thread_cpu_ids=(10, 11),
+        lanes=(ExecutableLane(0, 2, (task(1, 5), task(0, 7))),),
+        llc_domains=(ExecutableLlcDomain("llc", 0, 2),),
+    )
+    audit_only = ExecutablePlanState(
+        num_threads=2,
+        thread_cpu_ids=(10, 11),
+        lanes=(ExecutableLane(0, 1, (task(0, 7),)), ExecutableLane(1, 1, (task(1, 5),))),
+        llc_domains=(ExecutableLlcDomain("llc", 0, 2),),
+    )
+    elite = ExecutablePlanState(
+        num_threads=2,
+        thread_cpu_ids=(10, 11),
+        lanes=(ExecutableLane(0, 1, (task(1, 5),)), ExecutableLane(1, 1, (task(0, 7),))),
+        llc_domains=(ExecutableLlcDomain("llc", 0, 2),),
+    )
+
+    def row(state: ExecutablePlanState) -> dict[str, object]:
+        return {
+            "state_hash": state.canonical_hash(),
+            "operator": "critical_window_template_repartition_cross_domain_d4_b16",
+            "moved_experts": [1],
+            "event_gain_pct": 1.0,
+            "robust_gain_pct": 1.0,
+            "canonical_state": state.canonical_payload(),
+            "plan_v2_bridge": state.to_bridge(),
+        }
+
+    payload = {
+        "kind": "executable_partial_order_template_lns_model_replay",
+        "route": {},
+        "shape": {},
+        "identity": {"parent_source": {"named_state_hashes": {"full": anchor.canonical_hash()}}},
+        "method": {
+            "start_names": ["lns_00_r00"],
+            "shortlist_budget": 1,
+            "audit_budget": 2,
+        },
+        "parents": {"lns_00_r00": {"state_hash": anchor.canonical_hash(), "roles": ["full"]}},
+        "runs": {
+            "lns_00_r00": {
+                "start": "lns_00_r00",
+                "initial_state_hash": anchor.canonical_hash(),
+                "initial_canonical_state": anchor.canonical_payload(),
+                "initial_plan_v2_bridge": anchor.to_bridge(),
+                "iterations": [
+                    {
+                        "partial_order": {
+                            "automatic_acceptance_enabled": False,
+                            "dominance_pruning_enabled": False,
+                        },
+                        "lns_diverse_shortlist": {
+                            "schema_version": 1,
+                            "policy": "relation_agnostic_categorical_farthest_first_v1",
+                            "shortlist_budget": 1,
+                            "audit_budget": 2,
+                            "ranked_keys": [top16.canonical_hash(), audit_only.canonical_hash()],
+                            "selected_keys": [top16.canonical_hash()],
+                            "audit_keys": [top16.canonical_hash(), audit_only.canonical_hash()],
+                            "budget_deferred_keys": [audit_only.canonical_hash()],
+                            "coverage": {},
+                        },
+                        "selected_frontier": [row(top16)],
+                        "audit_frontier": [row(top16), row(audit_only)],
+                        "worse_sentinels": [],
+                    }
+                ],
+            }
+        },
+    }
+    source = tmp_path / "model.json"
+    source.write_text("{}\n", encoding="utf-8")
+    elite_plan = {
+        "state_hash": elite.canonical_hash(),
+        "canonical_state": elite.canonical_payload(),
+        "plan_v2_bridge": elite.to_bridge(),
+    }
+    with_audit = build_lns_diverse_frontier(payload, source_path=source, known_elite=elite_plan)
+    assert with_audit["unique_plans"] == 4
+    assert "known_hardware_elite" in with_audit["records"][elite.canonical_hash()]["roles"]
+    assert "lns_diverse_top16" in with_audit["records"][top16.canonical_hash()]["roles"]
+    no_audit = build_lns_diverse_frontier(
+        payload,
+        source_path=source,
+        known_elite=elite_plan,
+        include_audit=False,
+    )
+    assert audit_only.canonical_hash() not in no_audit["plans"]
+    assert elite.canonical_hash() in no_audit["plans"]
+    assert no_audit["unique_plans"] == 3
+
+
 def test_lns_diverse_analyzer_requires_nested_top16_to_keep_measured_best() -> None:
     frontier = {
         "kind": "partial_order_hardware_frontier",

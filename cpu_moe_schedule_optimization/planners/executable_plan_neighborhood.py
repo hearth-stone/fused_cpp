@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import random
+import time
 from collections import Counter, defaultdict
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -61,6 +62,43 @@ class ExecutablePlanNeighbor:
     state: ExecutablePlanState
 
 
+@dataclass
+class LnsSearchBreakdown:
+    """Wall-time and counter split for one template-LNS enumeration/sample."""
+
+    closure_ns: int = 0
+    template_ns: int = 0
+    beam_ns: int = 0
+    assemble_ns: int = 0
+    hash_ns: int = 0
+    unique_blocks: int = 0
+    template_enumerations: int = 0
+    templates_selected: int = 0
+    beam_calls: int = 0
+    neighbors_emitted: int = 0
+    hashed_states: int = 0
+    unique_hashed_states: int = 0
+    duplicate_hashed_states: int = 0
+
+    def to_dict(self) -> dict[str, object]:
+        scale = 1.0e-9
+        return {
+            "assemble_s": self.assemble_ns * scale,
+            "beam_calls": self.beam_calls,
+            "beam_s": self.beam_ns * scale,
+            "closure_s": self.closure_ns * scale,
+            "duplicate_hashed_states": self.duplicate_hashed_states,
+            "hash_s": self.hash_ns * scale,
+            "hashed_states": self.hashed_states,
+            "neighbors_emitted": self.neighbors_emitted,
+            "template_enumerations": self.template_enumerations,
+            "template_s": self.template_ns * scale,
+            "templates_selected": self.templates_selected,
+            "unique_blocks": self.unique_blocks,
+            "unique_hashed_states": self.unique_hashed_states,
+        }
+
+
 @dataclass(frozen=True)
 class SampledNeighborhood:
     """Deduplicated, per-operator sampled neighbors plus audit counters."""
@@ -70,6 +108,7 @@ class SampledNeighborhood:
     unique_by_operator: Mapping[str, int]
     duplicate_by_operator: Mapping[str, int]
     sampled_by_operator: Mapping[str, int]
+    breakdown: Mapping[str, object] | None = None
 
     @property
     def proposed(self) -> int:
@@ -776,39 +815,44 @@ def _beam_assign_tasks(
             task.expert_id,
         ),
     )
+    retargeted = {
+        (task.expert_id, width): _retarget_task(task, width, window_selector)
+        for task in ordered_tasks
+        for width in lane_widths
+    }
     empty_assignment = tuple(() for _ in lane_widths)
-    beam = [(empty_assignment, tuple(0.0 for _ in lane_widths))]
+    empty_signature = empty_assignment
+    beam = [(empty_assignment, tuple(0.0 for _ in lane_widths), empty_signature)]
     for task_index, task in enumerate(ordered_tasks):
         remaining_tasks = len(ordered_tasks) - task_index - 1
         next_beam: dict[
             tuple[tuple[int, ...], ...],
-            tuple[tuple[tuple[ExecutableExpertTask, ...], ...], tuple[float, ...]],
+            tuple[tuple[tuple[ExecutableExpertTask, ...], ...], tuple[float, ...], tuple[tuple[int, ...], ...]],
         ] = {}
-        for lane_tasks, lane_loads in beam:
+        expert_id = task.expert_id
+        for lane_tasks, lane_loads, signature in beam:
+            empty_count = sum(not row for row in lane_tasks)
             for lane_index, width in enumerate(lane_widths):
-                empty_after = sum(
-                    not tasks_for_lane
-                    for index, tasks_for_lane in enumerate(lane_tasks)
-                    if index != lane_index
-                )
+                empty_after = empty_count if lane_tasks[lane_index] else empty_count - 1
                 if empty_after > remaining_tasks:
                     continue
-                updated_lanes = list(lane_tasks)
-                updated_lanes[lane_index] = (
-                    *updated_lanes[lane_index],
-                    _retarget_task(task, width, window_selector),
+                updated_row = (*lane_tasks[lane_index], retargeted[(expert_id, width)])
+                assignment = (
+                    *lane_tasks[:lane_index],
+                    updated_row,
+                    *lane_tasks[lane_index + 1 :],
                 )
                 updated_loads = list(lane_loads)
-                updated_loads[lane_index] += task_costs[(task.expert_id, width)]
-                assignment = tuple(updated_lanes)
-                signature = tuple(
-                    tuple(item.expert_id for item in tasks_for_lane)
-                    for tasks_for_lane in assignment
+                updated_loads[lane_index] += task_costs[(expert_id, width)]
+                new_signature = (
+                    *signature[:lane_index],
+                    (*signature[lane_index], expert_id),
+                    *signature[lane_index + 1 :],
                 )
-                next_beam[signature] = (assignment, tuple(updated_loads))
+                next_beam[new_signature] = (assignment, tuple(updated_loads), new_signature)
 
         def placement_priority(item):
-            signature, (_, lane_loads) = item
+            signature, (_, lane_loads, _) = item
             return (
                 max(lane_loads),
                 sum(load * load for load in lane_loads),
@@ -824,7 +868,7 @@ def _beam_assign_tasks(
         tuple[tuple[int, ...], ...],
         tuple[tuple[ExecutableExpertTask, ...], ...],
     ] = {}
-    for lane_tasks, _ in beam:
+    for lane_tasks, _, _ in beam:
         variants = (
             lane_tasks,
             tuple(tuple(reversed(row)) for row in lane_tasks),
@@ -855,6 +899,7 @@ def enumerate_template_lns_neighbors(
     destroy_sizes: Iterable[int] = TEMPLATE_LNS_DEFAULT_DESTROY_SIZES,
     repair_beam_widths: Iterable[int] = TEMPLATE_LNS_DEFAULT_REPAIR_BEAM_WIDTHS,
     templates_per_block: int = 4,
+    breakdown: LnsSearchBreakdown | None = None,
 ) -> Iterable[ExecutablePlanNeighbor]:
     """Repartition lane-atomic critical windows into executable templates.
 
@@ -890,6 +935,7 @@ def enumerate_template_lns_neighbors(
         for task in lane.tasks
     }
     blocks: set[tuple[str, int, int, int, int, int]] = set()
+    closure_begin = time.perf_counter_ns()
     for expert_id in sorted(critical):
         center = lane_by_expert.get(expert_id)
         if center is None:
@@ -905,6 +951,9 @@ def enumerate_template_lns_neighbors(
                 if block is not None:
                     first, end, task_count = block
                     blocks.add((scope, first, end, destroy_size, task_count, repair_beam_width))
+    if breakdown is not None:
+        breakdown.closure_ns += time.perf_counter_ns() - closure_begin
+        breakdown.unique_blocks += len(blocks)
 
     for scope, first, end, destroy_size, task_count, repair_beam_width in sorted(blocks):
         original_lanes = state.lanes[first:end]
@@ -913,6 +962,7 @@ def enumerate_template_lns_neighbors(
         tasks = tuple(task for lane in original_lanes for task in lane.tasks)
         if len(tasks) != task_count:
             raise RuntimeError("template LNS block task count changed during enumeration")
+        template_begin = time.perf_counter_ns()
         templates = tuple(
             template
             for template in _region_width_templates(
@@ -931,7 +981,12 @@ def enumerate_template_lns_neighbors(
             original_widths,
             maximum_templates=templates_per_block,
         )
+        if breakdown is not None:
+            breakdown.template_ns += time.perf_counter_ns() - template_begin
+            breakdown.template_enumerations += 1
+            breakdown.templates_selected += len(templates)
         for template in templates:
+            beam_begin = time.perf_counter_ns()
             repairs = _beam_assign_tasks(
                 tasks,
                 template,
@@ -940,7 +995,11 @@ def enumerate_template_lns_neighbors(
                 critical,
                 repair_beam_width=repair_beam_width,
             )
+            if breakdown is not None:
+                breakdown.beam_ns += time.perf_counter_ns() - beam_begin
+                breakdown.beam_calls += 1
             for ordering in repairs:
+                assemble_begin = time.perf_counter_ns()
                 cursor = original_lanes[0].core_begin
                 replacement = []
                 for width, lane_tasks in zip(template, ordering, strict=True):
@@ -952,6 +1011,9 @@ def enumerate_template_lns_neighbors(
                     end - first,
                     replacement,
                 )
+                if breakdown is not None:
+                    breakdown.assemble_ns += time.perf_counter_ns() - assemble_begin
+                    breakdown.neighbors_emitted += 1
                 yield ExecutablePlanNeighbor(
                     _template_lns_operator(scope, destroy_size, repair_beam_width),
                     tuple(task.expert_id for task in tasks),
@@ -966,6 +1028,7 @@ def _sample_neighborhood(
     operators: Sequence[str],
     per_operator: int,
     seed: int,
+    breakdown: LnsSearchBreakdown | None = None,
 ) -> SampledNeighborhood:
     if per_operator <= 0:
         raise ValueError("per_operator must be positive")
@@ -976,12 +1039,20 @@ def _sample_neighborhood(
     seen_global = {baseline_hash}
     for neighbor in neighbors:
         proposed[neighbor.operator] += 1
+        hash_begin = time.perf_counter_ns()
         state_hash = neighbor.state.canonical_hash()
+        if breakdown is not None:
+            breakdown.hash_ns += time.perf_counter_ns() - hash_begin
+            breakdown.hashed_states += 1
         if state_hash in seen_global:
             duplicates[neighbor.operator] += 1
+            if breakdown is not None:
+                breakdown.duplicate_hashed_states += 1
             continue
         seen_global.add(state_hash)
         unique[neighbor.operator][state_hash] = neighbor
+        if breakdown is not None:
+            breakdown.unique_hashed_states += 1
 
     rng = random.Random(seed)
     sampled = []
@@ -1000,6 +1071,7 @@ def _sample_neighborhood(
         unique_by_operator=unique_counts,
         duplicate_by_operator=duplicates,
         sampled_by_operator=sampled_counts,
+        breakdown=None if breakdown is None else breakdown.to_dict(),
     )
 
 
@@ -1104,6 +1176,7 @@ def sample_template_lns_neighborhood(
         for scope in TEMPLATE_LNS_SCOPES
         for destroy_size, beam_width in zip(sizes, beams, strict=True)
     )
+    breakdown = LnsSearchBreakdown()
     return _sample_neighborhood(
         state,
         enumerate_template_lns_neighbors(
@@ -1115,10 +1188,12 @@ def sample_template_lns_neighborhood(
             destroy_sizes=sizes,
             repair_beam_widths=beams,
             templates_per_block=templates_per_block,
+            breakdown=breakdown,
         ),
         operators=operators,
         per_operator=per_operator,
         seed=seed,
+        breakdown=breakdown,
     )
 
 

@@ -22,6 +22,9 @@ from optimizations.fused_moe_sve.benchmarks.lns_diverse_shortlist import (  # no
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--lns-artifact", type=Path, required=True)
+    parser.add_argument("--known-elite-plan", type=Path)
+    parser.add_argument("--include-audit", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--include-stratified", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--output", type=Path, required=True)
     return parser.parse_args()
 
@@ -35,7 +38,32 @@ def _canonical_hash(payload: dict[str, object]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def build_lns_diverse_frontier(payload: dict[str, object], *, source_path: Path) -> dict[str, object]:
+def _load_known_elite(path: Path) -> dict[str, object]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    state_hash = str(payload["state_hash"])
+    canonical_state = payload["canonical_state"]
+    bridge = payload["plan_v2_bridge"]
+    if not isinstance(canonical_state, dict) or not isinstance(bridge, dict):
+        raise ValueError("known elite plan is missing canonical state or PlanV2 bridge")
+    if _canonical_hash(canonical_state) != state_hash:
+        raise ValueError(f"known elite canonical hash mismatch: {state_hash}")
+    return {
+        "state_hash": state_hash,
+        "canonical_state": canonical_state,
+        "plan_v2_bridge": bridge,
+        "source": str(path),
+        "sha256": _sha256(path),
+    }
+
+
+def build_lns_diverse_frontier(
+    payload: dict[str, object],
+    *,
+    source_path: Path,
+    known_elite: dict[str, object] | None = None,
+    include_audit: bool = True,
+    include_stratified: bool = True,
+) -> dict[str, object]:
     if payload.get("kind") != "executable_partial_order_template_lns_model_replay":
         raise ValueError("input must be a template-LNS model replay")
     runs = payload.get("runs")
@@ -79,6 +107,8 @@ def build_lns_diverse_frontier(payload: dict[str, object], *, source_path: Path)
 
     shortlist_budget = int(payload["method"].get("shortlist_budget", 16))
     audit_budget = int(payload["method"].get("audit_budget", 32))
+    pooled = payload.get("parent_pooled_shortlists") or {}
+    pooled_rows = payload.get("pooled_frontier_rows") or {}
     for start_name, run in runs.items():
         iterations = run.get("iterations", [])
         if len(iterations) != 1:
@@ -97,16 +127,6 @@ def build_lns_diverse_frontier(payload: dict[str, object], *, source_path: Path)
         if shortlist.selected_keys != shortlist.audit_keys[: len(shortlist.selected_keys)]:
             raise ValueError(f"{start_name} selected_keys are not a prefix of audit_keys")
         per_start[start_name] = shortlist
-        audit_rows = {
-            str(row["state_hash"]): row
-            for row in iteration.get("audit_frontier") or iteration.get("selected_frontier") or []
-        }
-        if set(shortlist.audit_keys) - set(audit_rows):
-            raise ValueError(f"{start_name} audit keys are missing canonical states")
-        for key in shortlist.audit_keys:
-            row = audit_rows[key]
-            if row.get("canonical_state") is None or row.get("plan_v2_bridge") is None:
-                raise ValueError(f"{start_name} audit plan is missing state or PlanV2: {key}")
         anchor_hash = str(run["initial_state_hash"])
         register(
             anchor_hash,
@@ -118,9 +138,20 @@ def build_lns_diverse_frontier(payload: dict[str, object], *, source_path: Path)
                 "anchor_state_hash": anchor_hash,
             },
         )
+        if pooled:
+            continue
+        audit_rows = {
+            str(row["state_hash"]): row
+            for row in iteration.get("audit_frontier") or iteration.get("selected_frontier") or []
+        }
+        measured_keys = shortlist.audit_keys if include_audit else shortlist.selected_keys
+        if set(measured_keys) - set(audit_rows):
+            raise ValueError(f"{start_name} measured keys are missing canonical states")
         selected = set(shortlist.selected_keys)
-        for key in shortlist.audit_keys:
+        for key in measured_keys:
             row = audit_rows[key]
+            if row.get("canonical_state") is None or row.get("plan_v2_bridge") is None:
+                raise ValueError(f"{start_name} plan is missing state or PlanV2: {key}")
             register(
                 key,
                 row["canonical_state"],
@@ -137,19 +168,108 @@ def build_lns_diverse_frontier(payload: dict[str, object], *, source_path: Path)
                 },
             )
 
-    global_shortlist = select_lns_global_shortlist(
-        per_start,
-        shortlist_budget=shortlist_budget,
-        audit_budget=audit_budget,
-    )
+    if pooled:
+        parent_shortlists = {
+            parent_hash: LnsDiverseShortlist.from_dict(spec["shortlist"])
+            for parent_hash, spec in pooled.items()
+        }
+        global_shortlist = select_lns_global_shortlist(
+            parent_shortlists,
+            shortlist_budget=shortlist_budget,
+            audit_budget=audit_budget,
+        )
+        for parent_hash, spec in pooled.items():
+            shortlist = parent_shortlists[parent_hash]
+            selected = set(shortlist.selected_keys)
+            measured = list(shortlist.selected_keys)
+            if include_audit:
+                measured = list(shortlist.audit_keys)
+            if include_stratified:
+                measured = list(dict.fromkeys([*measured, *spec.get("stratified_keys", ())]))
+            for key in measured:
+                row = pooled_rows.get(key)
+                if not isinstance(row, dict) or row.get("canonical_state") is None:
+                    raise ValueError(f"pooled parent {parent_hash} is missing canonical state for {key}")
+                if key in selected:
+                    role = "lns_diverse_top16"
+                elif key in set(shortlist.audit_keys):
+                    role = "lns_diverse_audit_top32"
+                else:
+                    role = "lns_stratified_outside_top32"
+                register(
+                    key,
+                    row["canonical_state"],
+                    row["plan_v2_bridge"],
+                    {
+                        "role": role,
+                        "start": str(row.get("start", spec.get("starts", ["pooled"])[0])),
+                        "anchor_state_hash": parent_hash,
+                        "operator": row.get("operator"),
+                        "moved_experts": row.get("moved_experts"),
+                        "event_gain_pct": row.get("event_gain_pct"),
+                        "robust_gain_pct": row.get("robust_gain_pct"),
+                        "partial_order": row.get("partial_order"),
+                    },
+                )
+    else:
+        global_shortlist = select_lns_global_shortlist(
+            per_start,
+            shortlist_budget=shortlist_budget,
+            audit_budget=audit_budget,
+        )
+
+    if known_elite is not None:
+        elite_hash = str(known_elite["state_hash"])
+        full_hashes = [
+            str(run["initial_state_hash"])
+            for run in runs.values()
+            if "full" in payload.get("parents", {}).get(run["start"], {}).get("roles", [])
+        ]
+        if not full_hashes:
+            named = payload.get("identity", {}).get("parent_source", {}).get("named_state_hashes", {})
+            if isinstance(named, dict) and named.get("full"):
+                full_hashes = [str(named["full"])]
+        anchor_for_elite = full_hashes[0] if full_hashes else elite_hash
+        register(
+            elite_hash,
+            known_elite["canonical_state"],
+            known_elite["plan_v2_bridge"],
+            {
+                "role": "known_hardware_elite",
+                "start": "known_median_elite",
+                "anchor_state_hash": anchor_for_elite,
+                "operator": None,
+                "moved_experts": [],
+            },
+        )
+
     for record in records.values():
         record["roles"].sort()
         record["comparisons"].sort(
             key=lambda item: (str(item["role"]), str(item["start"]), str(item.get("operator", "")))
         )
+    role_names = (
+        "anchor",
+        "lns_diverse_top16",
+        "lns_diverse_audit_top32",
+        "lns_stratified_outside_top32",
+        "known_hardware_elite",
+    )
     role_counts = {
         role: sum(role in record["roles"] for record in records.values())
-        for role in ("anchor", "lns_diverse_top16", "lns_diverse_audit_top32")
+        for role in role_names
+    }
+    method = {
+        "starts": list(expected_starts),
+        "shortlist_budget": shortlist_budget,
+        "audit_budget": audit_budget,
+        "policy": "relation_agnostic_categorical_farthest_first_v1",
+        "policy_sha256": payload.get("method", {}).get("lns_shortlist_policy_sha256"),
+        "deduplication": "canonical_state_hash",
+        "pool_restarts_by_parent": bool(pooled),
+        "include_audit": bool(include_audit),
+        "include_stratified": bool(include_stratified and pooled),
+        "known_elite_state_hash": None if known_elite is None else known_elite["state_hash"],
     }
     return {
         "kind": "partial_order_hardware_frontier",
@@ -160,14 +280,7 @@ def build_lns_diverse_frontier(payload: dict[str, object], *, source_path: Path)
         "route": payload["route"],
         "shape": payload["shape"],
         "identity": payload["identity"],
-        "method": {
-            "starts": list(expected_starts),
-            "shortlist_budget": shortlist_budget,
-            "audit_budget": audit_budget,
-            "policy": "relation_agnostic_categorical_farthest_first_v1",
-            "policy_sha256": payload.get("method", {}).get("lns_shortlist_policy_sha256"),
-            "deduplication": "canonical_state_hash",
-        },
+        "method": method,
         "lns_diverse_shortlist": global_shortlist,
         "role_counts": role_counts,
         "unique_plans": len(plans),
@@ -179,7 +292,14 @@ def build_lns_diverse_frontier(payload: dict[str, object], *, source_path: Path)
 def main() -> int:
     args = parse_args()
     payload = json.loads(args.lns_artifact.read_text(encoding="utf-8"))
-    result = build_lns_diverse_frontier(payload, source_path=args.lns_artifact)
+    elite = None if args.known_elite_plan is None else _load_known_elite(args.known_elite_plan)
+    result = build_lns_diverse_frontier(
+        payload,
+        source_path=args.lns_artifact,
+        known_elite=elite,
+        include_audit=args.include_audit,
+        include_stratified=args.include_stratified,
+    )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(json.dumps({"unique_plans": result["unique_plans"], **result["role_counts"]}, sort_keys=True))

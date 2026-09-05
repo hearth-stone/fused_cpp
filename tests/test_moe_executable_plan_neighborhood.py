@@ -25,6 +25,8 @@ from executable_plan_neighborhood import (  # noqa: E402
     WIDTH_ONLY_OPERATORS,
     ExecutablePlanEvaluator,
     ExecutablePlanScore,
+    _beam_assign_tasks,
+    _retarget_task,
     critical_expert_scores,
     enumerate_order_only_neighbors,
     enumerate_template_lns_neighbors,
@@ -431,6 +433,104 @@ def _template_lns_state() -> ExecutablePlanState:
     )
 
 
+def _reference_beam_assign_tasks(tasks, lane_widths, isolated_cost, window_selector, critical_expert_ids, *, repair_beam_width):
+    if repair_beam_width <= 0:
+        raise ValueError("repair_beam_width must be positive")
+    if len(lane_widths) > len(tasks):
+        return ()
+    order_policies = 4
+    placement_beam_width = max(1, (repair_beam_width + order_policies - 1) // order_policies)
+    task_costs = {
+        (task.expert_id, width): float(isolated_cost(task.routes, width))
+        for task in tasks
+        for width in lane_widths
+    }
+    ordered_tasks = sorted(
+        tasks,
+        key=lambda task: (
+            -max(task_costs[(task.expert_id, width)] for width in lane_widths),
+            task.expert_id,
+        ),
+    )
+    empty_assignment = tuple(() for _ in lane_widths)
+    beam = [(empty_assignment, tuple(0.0 for _ in lane_widths))]
+    for task_index, task in enumerate(ordered_tasks):
+        remaining_tasks = len(ordered_tasks) - task_index - 1
+        next_beam = {}
+        for lane_tasks, lane_loads in beam:
+            for lane_index, width in enumerate(lane_widths):
+                empty_after = sum(
+                    not tasks_for_lane
+                    for index, tasks_for_lane in enumerate(lane_tasks)
+                    if index != lane_index
+                )
+                if empty_after > remaining_tasks:
+                    continue
+                updated_lanes = list(lane_tasks)
+                updated_lanes[lane_index] = (
+                    *updated_lanes[lane_index],
+                    _retarget_task(task, width, window_selector),
+                )
+                updated_loads = list(lane_loads)
+                updated_loads[lane_index] += task_costs[(task.expert_id, width)]
+                assignment = tuple(updated_lanes)
+                signature = tuple(
+                    tuple(item.expert_id for item in tasks_for_lane)
+                    for tasks_for_lane in assignment
+                )
+                next_beam[signature] = (assignment, tuple(updated_loads))
+
+        def placement_priority(item):
+            signature, (_, lane_loads) = item
+            return (
+                max(lane_loads),
+                sum(load * load for load in lane_loads),
+                max(lane_loads) - min(lane_loads),
+                signature,
+            )
+
+        beam = [value for _, value in sorted(next_beam.items(), key=placement_priority)[:placement_beam_width]]
+        if not beam:
+            return ()
+    repaired = {}
+    for lane_tasks, _ in beam:
+        variants = (
+            lane_tasks,
+            tuple(tuple(reversed(row)) for row in lane_tasks),
+            tuple(
+                tuple(sorted(row, key=lambda task: (task.expert_id not in critical_expert_ids, -task.routes, task.expert_id)))
+                for row in lane_tasks
+            ),
+            tuple(
+                tuple(sorted(row, key=lambda task: (task.expert_id in critical_expert_ids, -task.routes, task.expert_id)))
+                for row in lane_tasks
+            ),
+        )
+        for variant in variants:
+            signature = tuple(tuple(task.expert_id for task in row) for row in variant)
+            repaired.setdefault(signature, variant)
+            if len(repaired) == repair_beam_width:
+                return tuple(repaired.values())
+    return tuple(repaired.values())
+
+
+def test_beam_assign_matches_reference_repair_signatures() -> None:
+    state = _template_lns_state()
+    tasks = tuple(task for lane in state.lanes for task in lane.tasks)
+    kwargs = {
+        "isolated_cost": _isolated_cost,
+        "window_selector": _windows,
+        "critical_expert_ids": frozenset({3, 9}),
+        "repair_beam_width": 8,
+    }
+    for template in ((4, 4, 2, 2), (8, 4), (2, 2, 2, 2, 4)):
+        got = _beam_assign_tasks(tasks, template, **kwargs)
+        expected = _reference_beam_assign_tasks(tasks, template, **kwargs)
+        got_ids = tuple(tuple(tuple(task.expert_id for task in row) for row in assignment) for assignment in got)
+        expected_ids = tuple(tuple(tuple(task.expert_id for task in row) for row in assignment) for assignment in expected)
+        assert got_ids == expected_ids
+
+
 def test_template_lns_repairs_lane_atomic_local_and_cross_domain_windows() -> None:
     state = _template_lns_state()
     neighbors = list(
@@ -514,6 +614,14 @@ def test_template_lns_sampling_is_deterministic_and_validates_budgets() -> None:
 
     first_hashes = [neighbor.state.canonical_hash() for neighbor in first.neighbors]
     assert first_hashes == [neighbor.state.canonical_hash() for neighbor in second.neighbors]
+    assert first.breakdown is not None
+    assert first.breakdown["unique_blocks"] > 0
+    assert first.breakdown["hashed_states"] == first.unique + first.duplicates
+    assert first.breakdown["unique_hashed_states"] == first.unique
+    assert first.breakdown["duplicate_hashed_states"] == first.duplicates
+    for key in ("assemble_s", "beam_s", "closure_s", "hash_s", "template_s"):
+        assert first.breakdown[key] >= 0.0
+    assert first.breakdown["beam_calls"] >= 1
     assert len(first_hashes) == len(set(first_hashes))
     assert state.canonical_hash() not in first_hashes
     assert first.proposed == first.unique + first.duplicates

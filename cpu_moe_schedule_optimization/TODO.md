@@ -456,6 +456,25 @@ Temporal-ranking remediation in progress before this gate may be reconsidered:
   1-restart neighborhood missed the two-session 2% strongest-full gate
   (`+2.579/+1.916%`). Adopt selector v1 for offline LNS shortlists only. See
   `results/arm_codex_80c_lns_diverse_independent_median_20260905.md`.
+- [x] Split the 797 s median search wall and apply one equivalent optimization
+  of the confirmed enumeration hotspot. Closure/template time is negligible;
+  `_beam_assign_tasks` was the isolated-profiler hotspot (full 7.045→2.245 s,
+  one-step 67.573→17.221 s). Frozen seed `20261010` ranking (hashes, sampling,
+  scores, quantiles, ordered top-16/32) is unchanged. Production-path wall
+  797.01→687.55 s; remaining cost is exact event 341.43 s and diagnostic
+  shortlist 278.77 s. See
+  `results/arm_codex_80c_lns_search_breakdown_beam_equiv_20260905.md`.
+- [x] Keep selector v1 / K=16 / the current operator mixture frozen. Compare
+  1-restart versus multiple restarts under the same candidate-evaluation and
+  hardware-plan budget, including the four reconstructed controls and the known
+  median elite `2ab43572...`. Report cross-session stable gain, seed success
+  rate, regret versus that elite, and total search/measure cost. Do not treat
+  extra budget as a restart win. Top-32 versus all generated candidates remains
+  an open sample, not a closed recall proof. Equal cap 2,400 / 85 plans: both
+  arms select `0418b884...` and beat full by >2% in both sessions; 2-restart
+  also beats the elite in both sessions and overlaps K=16 in only 15/64.
+  Adopt 2 restarts with `N=25` for offline median LNS. See
+  `results/arm_codex_80c_lns_restart_budget_20260905.md`.
 
 ### Step 6: decide whether adaptation is warranted
 

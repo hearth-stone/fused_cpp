@@ -1771,9 +1771,10 @@ $$
 $\max_{w\in W}T_{iso}(R_i,w)$递减处理expert；placement beam以
 $(\max_lL_l,\sum_lL_l^2,\max_lL_l-\min_lL_l)$排序，并强制每条新lane非空。
 $d=4/8/16$分别使用beam width $16/32/64$。每个placement再生成load-desc、reverse、
-critical-head与critical-tail四种确定性顺序，并为变宽task重新计算W13/W2 window。这里没有
-新增cost-model参数；$T_{iso}$只指导repair，完整placed-event score仍是shortlist point
-estimate。
+critical-head与critical-tail四种确定性顺序，并为变宽task重新计算W13/W2 window。实现可以对
+同一$(i,w)$预计算window retarget，并用增量expert-id signature做last-write-wins去重；排序键
+与四种顺序策略保持不变。这里没有新增cost-model参数；$T_{iso}$只指导repair，完整placed-event
+score仍是shortlist point estimate。
 
 正式high-skew首层从full、`4115ab99...`与`514ced0d...`三个实测incumbent各做两个独立
 proposal restart；critical与random各按六个scope/size operator抽50个，partial order只做
@@ -1835,6 +1836,26 @@ K=8前缀已经零regret。该seed相对strongest full的绝对median收益为`+
 作为离线LNS硬件shortlist，不改默认K=16，不把该seed当作production或全局最优。该安全
 默认只影响template-LNS Lab runner；local VND的已校准family comparator语义不变，
 production planner、Plan V2、runtime与v8 mean全部不变。
+
+独立median之后，Lab runner补齐search-cost split：closure、width template、beam repair、
+assemble、canonical hash/去重、screen、exact event，以及shortlist（diagnostic partial-order
+labeling加上feature/quantile构造）。冻结seed `20261010`的生产路径在等价beam rewrite后为
+687.55 s：exact 341.43 s、shortlist 278.77 s、sample 56.31 s（其中beam 40.56 s）。隔离profiler
+（`window_selector=(0,0)`、单strategy）曾把enumeration热点定在beam（full 7.045→2.245 s，
+one-step 67.573→17.221 s）；生产路径上墙钟从797.01 s降到687.55 s，候选hash、抽样计数、
+模型分数、quantile与有序top-16/top-32保持不变。event simulator未改；跨lane增量回放不能事先
+当成等价。relation-agnostic selector本身不是279 s：全局farthest-first merge仅53 µs。
+完整记录见`optimizations/fused_moe_sve/results/arm_codex_80c_lns_search_breakdown_beam_equiv_20260905.md`。
+
+在冻结selector v1、K=16（按unique parent池化restart）和现有operator mixture下，把同一
+2,400 exact-eval cap与同一85-plan硬件名额分给1 restart（N=50、4 start）和2 restart
+（N=25、8 start）。两边都选出`0418b884...`为K=16硬件最好，且两场相对strongest full
+都超过2%。2-restart的K=16集合与1-restart只重叠15/64；selected-best在两场都快于已知
+median elite `2ab43572...`（`+0.797/+0.449%`），1-restart第二场相对elite为负。top-32外
+16个分层样本没有打过K=16。2-restart搜索墙钟558.71 s对683.67 s。因此离线median LNS在
+该预算下采用每parent两次restart、N=25，不改K、不改selector。这不是新的neighborhood
+winner，也不是production结果。完整记录见
+`optimizations/fused_moe_sve/results/arm_codex_80c_lns_restart_budget_20260905.md`。
 
 **Narrow-team full-cohort correction。** 独立`2x1T concurrent -> 1x2T serial`
 probe表明，现有shared-resource event方程对2T task在满载mixed background下的dilation
@@ -6257,3 +6278,5 @@ partial order、top-K recall 与 false-pruning replay，只有这些门槛通过
 | 2026-09-04 | v1.74 | 完成template-LNS high-skew第二层与median/uniformish冻结mixture复验，并将LNS partial order降为diagnostic-only。high-skew depth-2用2,351 event call/72 plan，只剩1个strict stable candidate，停止第三层。median用4,659 call/145 plan，winner `2ab435...`为`31.381/31.393 ms`，相对strongest full anchor `+2.671/+2.863%`；uniformish用2,345 call/74 plan，winner `50a7d4...`为`31.517/31.698 ms`，相对strongest control `+2.057/+3.250%`。三trace固定LNS neighborhood均通过两场strongest-anchor 2% gate。但median有2个cross-session false-pruning sentinel，absolute best被模型以`-3.770%`、upper `-2.001%`错误判为worse；uniformish有1/26 model-better未通过strict P10复验。因此LNS runner设`Prune=Accept=empty`：relation仅诊断，未测项为budget-deferred，硬件frontier区分`model_better_frontier/model_worse_spectrum`并返回跨session共识elite。local VND comparator、frozen v8 mean、production planner、Plan V2、kernel、ABI和runtime不变。suite总计12,867 event call、3,488.51 s model wall、397 frontier plan与8个hardware session。完整记录见`optimizations/fused_moe_sve/results/arm_codex_80c_template_lns_suite_20260904.md`。 |
 | 2026-09-04 | v1.75 | 为template-LNS增加relation-agnostic categorical farthest-first shortlist，不改production planner、Plan V2、kernel、ABI、冻结v8或local VND comparator。候选特征只用operator、target destroy、actual closure、width histogram、LLC-domain assignment和同一proposal pool内的score quantile；relation、残差半径和硬件时间不进入选择。每start top-16是top-32 audit前缀，落选一律`budget_deferred`。冻结measured-suite设计回放在K=16上四条case均保住绝对实测最好与共识winner，selected-best regret为0，三次打乱输入顺序hash不变；K=8/12在high-skew L2与uniformish上仍有regret。政策`relation_agnostic_categorical_farthest_first_v1` rule SHA256为`6c07e7b9...`。独立median holdout未跑，不得adopt进production。完整记录见`optimizations/fused_moe_sve/results/arm_codex_80c_lns_diverse_shortlist_replay_20260904.md`。 |
 | 2026-09-05 | v1.76 | 在Arm-codex NUMA3上冻结selector v1后打开独立median frontier：route layer 4、proposal seed `20261010`、每unique parent一次restart、shortlist 16/audit 32。4个reconstructed control的canonical hash与旧median VND一致。模型2,330次event call、797.01 s，冻结132-plan frontier；两场31-round session各约168 s，bit-exact。Selector nested-recall全部通过，K=8到K=32的selected-best regret均为0。共识`7cac2afd...`为`31.720 ms`量级的cross-domain d8、48-expert closure，模型预测`-0.087%`且incomparable。相对strongest full `98a32da5...`的绝对median收益为`+2.579/+1.916%`，第二场未过2%，故neighborhood/proposal失败与selector召回成功分开记录。采用v1作离线LNS shortlist，不改K、不改selector、不进production。完整记录见`optimizations/fused_moe_sve/results/arm_codex_80c_lns_diverse_independent_median_20260905.md`。 |
+| 2026-09-05 | v1.77 | 为template-LNS补齐search-cost split，并对确认的enumeration热点`_beam_assign_tasks`做一轮等价加速：预计算`(expert,width)` retarget与增量signature，不改last-write-wins、placement_priority或四种顺序策略。隔离profiler上full/one-step的beam为7.045→2.245 s与67.573→17.221 s，计数不变。冻结median seed `20261010`生产路径墙钟797.01→687.55 s；exact 341.43 s、diagnostic shortlist 278.77 s、sample 56.31 s（beam 40.56 s）。候选hash、抽样、模型分数、quantile与有序top-16/top-32与冻结artifact一致，`equal=true`。event simulator与跨lane增量回放未改。峰值RSS 309,092 KB，无797 s基线RSS。下一步才是等预算multi-restart。完整记录见`optimizations/fused_moe_sve/results/arm_codex_80c_lns_search_breakdown_beam_equiv_20260905.md`。 |
+| 2026-09-05 | v1.78 | 冻结selector v1、K=16（按unique parent池化）和现有operator mixture，在exact cap 2,400与硬件85-plan（4 reconstructed + elite `2ab43572...` + 64 top-16 + 16层外抽查）下比较1 restart（N=50）与2 restart（N=25）。两边都选出`0418b884...`，两场相对full均超过2%。2-restart相对elite两场为正，1-restart第二场为负；K=16集合只重叠15/64；层外16个样本未打过selected。搜索墙钟558.71/683.67 s，实际event call 2384/2330（八个start多付parent exact）。离线median采用2 restart+N=25，不改K、不改selector、不进production。完整记录见`optimizations/fused_moe_sve/results/arm_codex_80c_lns_restart_budget_20260905.md`。 |

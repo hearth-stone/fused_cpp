@@ -307,10 +307,12 @@ def _score_neighborhood(
         "per_operator": per_operator,
         "seed": seed,
     }
+    sample_wall_s = None
     if neighborhood_mode == "order":
         sampled = sample_order_only_neighborhood(state, **sample_kwargs)
         operators = ORDER_ONLY_OPERATORS
     elif neighborhood_mode == "lns":
+        sample_begin = time.perf_counter_ns()
         sampled = sample_template_lns_neighborhood(
             state,
             allowed_widths=interval.widths,
@@ -323,6 +325,7 @@ def _score_neighborhood(
             per_operator=per_operator,
             seed=seed,
         )
+        sample_wall_s = (time.perf_counter_ns() - sample_begin) / 1.0e9
         operators = tuple(sampled.proposed_by_operator)
     else:
         width_kwargs = {
@@ -402,6 +405,15 @@ def _score_neighborhood(
         "duplicates": sampled.duplicates,
         "unique": sampled.unique,
         "sampled": len(scored),
+        "sample_wall_s": sample_wall_s,
+        "search_breakdown": None
+        if sampled.breakdown is None
+        else {
+            **dict(sampled.breakdown),
+            "exact_s": score_wall_s,
+            "sample_s": sample_wall_s,
+            "screen_s": screen_wall_s,
+        },
         "evaluation_wall_s": score_wall_s,
         "evaluations_per_second": exact_calls / score_wall_s if score_wall_s else None,
         "exact_calls": exact_calls,
@@ -751,6 +763,8 @@ def _run_partial_order_vnd_start(
     placed_context_calls = 0
     search_begin = time.perf_counter_ns()
     stop_reason = "iteration_limit"
+    last_candidate_states: dict[str, ExecutablePlanState] = {}
+    last_candidate_rows: dict[str, tuple[str, dict[str, object]]] = {}
     start_seed = sum((index + 1) * byte for index, byte in enumerate(start_name.encode("utf-8")))
     for iteration in range(args.partial_order_max_iterations):
         iteration_begin = time.perf_counter_ns()
@@ -849,6 +863,7 @@ def _run_partial_order_vnd_start(
                 }
             )
             break
+        shortlist_begin = time.perf_counter_ns()
         shortlist = select_partial_order_shortlist(
             comparator,
             partial_candidates,
@@ -911,6 +926,7 @@ def _run_partial_order_vnd_start(
             shortlist_payload["diagnostic_worse_keys"] = []
             shortlist_payload["dominance_pruning_enabled"] = True
             shortlist_payload["automatic_acceptance_enabled"] = True
+        shortlist_s = (time.perf_counter_ns() - shortlist_begin) / 1.0e9
 
         def frontier_row(state_hash: str) -> dict[str, object]:
             strategy, row = rows_by_hash[state_hash]
@@ -1000,6 +1016,15 @@ def _run_partial_order_vnd_start(
                 )
                 for field in target:
                     target[field] += int(summary[field])
+        search_breakdown = {}
+        for report in reports.values():
+            item = report.get("search_breakdown")
+            if not isinstance(item, dict):
+                continue
+            for key, value in item.items():
+                if isinstance(value, (int, float)) and value is not True and value is not False:
+                    search_breakdown[key] = search_breakdown.get(key, 0) + value
+        search_breakdown["shortlist_s"] = search_breakdown.get("shortlist_s", 0.0) + shortlist_s
         iterations.append(
             {
                 "iteration": iteration,
@@ -1022,10 +1047,13 @@ def _run_partial_order_vnd_start(
                 "exact_event_calls": evaluator.exact_calls - exact_calls_before,
                 "placed_context_event_calls": 1 + detailed_context_calls,
                 "context_evaluation_wall_s": context_wall_s,
+                "search_breakdown": search_breakdown or None,
                 "iteration_wall_s": (time.perf_counter_ns() - iteration_begin) / 1.0e9,
                 "stop_reason": stop_reason if accepted_hash is None else None,
             }
         )
+        last_candidate_states = candidate_states
+        last_candidate_rows = rows_by_hash
         if accepted_hash is None:
             break
     final_score = evaluator.exact(incumbent)
@@ -1054,6 +1082,8 @@ def _run_partial_order_vnd_start(
         "placed_context_event_calls": placed_context_calls,
         "search_wall_s": (time.perf_counter_ns() - search_begin) / 1.0e9,
         "stop_reason": stop_reason,
+        "_candidate_states": last_candidate_states,
+        "_candidate_rows": last_candidate_rows,
     }
 
 

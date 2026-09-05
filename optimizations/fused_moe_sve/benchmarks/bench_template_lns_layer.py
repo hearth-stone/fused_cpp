@@ -7,7 +7,10 @@ import argparse
 import hashlib
 import json
 import os
+import resource
 import sys
+import time
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -42,9 +45,12 @@ from optimizations.fused_moe_sve.benchmarks.bench_partial_order_beam_layer impor
     _state_from_payload,
 )
 from optimizations.fused_moe_sve.benchmarks.lns_diverse_shortlist import (  # noqa: E402
+    LnsCandidateFeature,
     LnsDiverseShortlist,
     policy_sha256,
     select_lns_global_shortlist,
+    select_lns_parent_pooled_shortlists,
+    stratified_keys_outside_audit,
 )
 
 
@@ -72,6 +78,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lns-repair-beam-widths", default="16,32,64")
     parser.add_argument("--lns-templates-per-block", type=int, default=4)
     parser.add_argument("--restarts-per-parent", type=int, default=2)
+    parser.add_argument("--max-parents", type=int, default=0)
+    parser.add_argument("--pool-restarts-by-parent", action="store_true")
+    parser.add_argument("--stratified-outside-audit", type=int, default=0)
+    parser.add_argument("--stratified-seed", type=int, default=20261013)
     parser.add_argument("--seed", type=int, default=20260917)
     parser.add_argument("--output", type=Path, required=True)
     return parser.parse_args()
@@ -79,6 +89,72 @@ def parse_args() -> argparse.Namespace:
 
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _peak_rss_kb() -> int:
+    usage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    if sys.platform == "darwin":
+        return int(round(usage / 1024.0))
+    return int(usage)
+
+
+def _sum_search_breakdowns(runs: dict[str, dict[str, object]]) -> dict[str, float | int] | None:
+    merged: dict[str, float | int] = {}
+    for run in runs.values():
+        iterations = run.get("iterations") or []
+        if not iterations:
+            continue
+        item = iterations[0].get("search_breakdown")
+        if not isinstance(item, dict):
+            continue
+        for key, value in item.items():
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                continue
+            merged[key] = merged.get(key, 0) + value
+    return merged or None
+
+
+def _frontier_row_from_library(
+    state_hash: str,
+    *,
+    start_name: str,
+    state: ExecutablePlanState,
+    strategy: str,
+    row: Mapping[str, object],
+) -> dict[str, object]:
+    payload = {
+        "state_hash": state_hash,
+        "strategy": strategy,
+        "operator": row["operator"],
+        "moved_experts": row["moved_experts"],
+        "shape": list(state.shape),
+        "event_ns": row["event_ns"],
+        "robust_ns": row["robust_ns"],
+        "event_gain_pct": row["event_gain_pct"],
+        "robust_gain_pct": row["robust_gain_pct"],
+        "start": start_name,
+        "canonical_state": state.canonical_payload(),
+        "plan_v2_bridge": state.to_bridge(),
+    }
+    if "structure" in row:
+        payload["structure"] = row["structure"]
+    if "partial_order" in row:
+        payload["partial_order"] = row["partial_order"]
+    return payload
+
+
+def _library_lookup(
+    state_hash: str,
+    start_names: Sequence[str],
+    libraries: Mapping[str, Mapping[str, object]],
+) -> tuple[str, ExecutablePlanState, str, dict[str, object]]:
+    for start_name in start_names:
+        rows = libraries[start_name]["rows"]
+        states = libraries[start_name]["states"]
+        if state_hash in rows and state_hash in states:
+            strategy, row = rows[state_hash]
+            return start_name, states[state_hash], strategy, row
+    raise KeyError(f"pooled candidate is missing from restart libraries: {state_hash}")
 
 
 def _load_parent_states(
@@ -283,10 +359,18 @@ def main() -> int:
     )
     runs = {}
     parents = {}
-    for parent_index, (state_hash, state) in enumerate(parent_states.items()):
+    libraries: dict[str, dict[str, object]] = {}
+    parent_items = list(parent_states.items())
+    if args.max_parents:
+        if args.max_parents < 0:
+            raise ValueError("max-parents must be non-negative")
+        parent_items = parent_items[: args.max_parents]
+    if args.stratified_outside_audit < 0:
+        raise ValueError("stratified-outside-audit must be non-negative")
+    for parent_index, (state_hash, state) in enumerate(parent_items):
         for restart in range(args.restarts_per_parent):
             start_name = f"lns_{parent_index:02d}_r{restart:02d}"
-            runs[start_name] = _run_partial_order_vnd_start(
+            run = _run_partial_order_vnd_start(
                 search_args,
                 start_name=start_name,
                 initial_state=state,
@@ -296,6 +380,11 @@ def main() -> int:
                 comparator=comparator,
                 screen_budgets=(args.shortlist_budget,),
             )
+            libraries[start_name] = {
+                "states": run.pop("_candidate_states"),
+                "rows": run.pop("_candidate_rows"),
+            }
+            runs[start_name] = run
             parents[start_name] = {
                 "state_hash": state_hash,
                 "parent_index": parent_index,
@@ -307,21 +396,91 @@ def main() -> int:
     maximum_exact_candidates = (
         len(runs) * 2 * operator_count * args.neighbors_per_operator
     )
-    maximum_hardware_frontier_plans = len(parent_states) + len(runs) * args.audit_budget
     per_start_shortlists = {
         start_name: LnsDiverseShortlist.from_dict(run["iterations"][0]["lns_diverse_shortlist"])
         for start_name, run in runs.items()
         if run.get("iterations") and run["iterations"][0].get("lns_diverse_shortlist")
     }
-    global_shortlist = (
-        select_lns_global_shortlist(
-            per_start_shortlists,
+    parent_of_start = {start_name: item["state_hash"] for start_name, item in parents.items()}
+    pooled_shortlists: dict[str, LnsDiverseShortlist] = {}
+    stratified_by_parent: dict[str, tuple[str, ...]] = {}
+    pooled_frontier_rows: dict[str, dict[str, object]] = {}
+    if args.pool_restarts_by_parent and per_start_shortlists:
+        per_start_features = {
+            start_name: [
+                LnsCandidateFeature.from_dict(row)
+                for row in run["iterations"][0].get("candidate_features") or []
+            ]
+            for start_name, run in runs.items()
+            if run.get("iterations")
+        }
+        pooled_shortlists = select_lns_parent_pooled_shortlists(
+            per_start_features,
+            parent_of_start,
             shortlist_budget=args.shortlist_budget,
             audit_budget=args.audit_budget,
         )
-        if per_start_shortlists
+        starts_by_parent: dict[str, list[str]] = {}
+        for start_name, parent_hash in parent_of_start.items():
+            starts_by_parent.setdefault(parent_hash, []).append(start_name)
+        all_features = [feature for rows in per_start_features.values() for feature in rows]
+        audit_union = {key for shortlist in pooled_shortlists.values() for key in shortlist.audit_keys}
+        ranked_outside: list[str] = []
+        seen_outside: set[str] = set()
+        for shortlist in pooled_shortlists.values():
+            for key in shortlist.ranked_keys:
+                if key in audit_union or key in seen_outside:
+                    continue
+                ranked_outside.append(key)
+                seen_outside.add(key)
+        global_stratified = stratified_keys_outside_audit(
+            all_features,
+            ranked_outside,
+            (),
+            sample_size=args.stratified_outside_audit,
+            seed=args.stratified_seed,
+        )
+        for parent_hash in pooled_shortlists:
+            stratified_by_parent[parent_hash] = tuple(
+                key
+                for key in global_stratified
+                if any(key in libraries[start]["rows"] for start in starts_by_parent[parent_hash])
+            )
+        needed = [
+            *{key for shortlist in pooled_shortlists.values() for key in shortlist.audit_keys},
+            *global_stratified,
+        ]
+        for state_hash in needed:
+            start_name, state, strategy, row = _library_lookup(
+                state_hash,
+                sorted(libraries),
+                libraries,
+            )
+            pooled_frontier_rows[state_hash] = _frontier_row_from_library(
+                state_hash,
+                start_name=start_name,
+                state=state,
+                strategy=strategy,
+                row=row,
+            )
+    global_shortlist_begin = time.perf_counter_ns()
+    shortlist_source = pooled_shortlists if pooled_shortlists else per_start_shortlists
+    global_shortlist = (
+        select_lns_global_shortlist(
+            shortlist_source,
+            shortlist_budget=args.shortlist_budget,
+            audit_budget=args.audit_budget,
+        )
+        if shortlist_source
         else None
     )
+    global_shortlist_s = (time.perf_counter_ns() - global_shortlist_begin) / 1.0e9
+    measured_lns_keys = 0
+    if pooled_shortlists:
+        measured_lns_keys = len({*global_shortlist["selected_keys"], *sum(stratified_by_parent.values(), ())})
+    else:
+        measured_lns_keys = len(runs) * args.audit_budget
+    maximum_hardware_frontier_plans = len(parent_items) + measured_lns_keys
     result = {
         "kind": "executable_partial_order_template_lns_model_replay",
         "route": route_metadata,
@@ -355,10 +514,23 @@ def main() -> int:
             "lns_shortlist_policy_sha256": policy_sha256(),
             "maximum_exact_candidate_budget": maximum_exact_candidates,
             "maximum_hardware_frontier_plan_budget": maximum_hardware_frontier_plans,
+            "pool_restarts_by_parent": bool(args.pool_restarts_by_parent),
+            "stratified_outside_audit": int(args.stratified_outside_audit),
+            "stratified_seed": int(args.stratified_seed),
             "seed": args.seed,
         },
         "parents": parents,
         "runs": runs,
+        "parent_pooled_shortlists": {
+            parent_hash: {
+                "starts": sorted(start for start, item in parents.items() if item["state_hash"] == parent_hash),
+                "shortlist": shortlist.to_dict(),
+                "stratified_keys": list(stratified_by_parent.get(parent_hash, ())),
+            }
+            for parent_hash, shortlist in pooled_shortlists.items()
+        }
+        or None,
+        "pooled_frontier_rows": pooled_frontier_rows or None,
         "lns_diverse_shortlist": global_shortlist,
         "summary": {
             "parents": len(parent_states),
@@ -378,6 +550,9 @@ def main() -> int:
             ),
             "event_calls": sum(run["exact_event_calls"] for run in runs.values()),
             "search_wall_s": sum(run["search_wall_s"] for run in runs.values()),
+            "search_breakdown": _sum_search_breakdowns(runs),
+            "global_shortlist_s": global_shortlist_s,
+            "ru_maxrss_kb": _peak_rss_kb(),
         },
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)

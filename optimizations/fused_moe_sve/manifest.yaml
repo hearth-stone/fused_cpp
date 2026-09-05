@@ -398,10 +398,10 @@ features:
     opened: 2026-09-04
     decision_by: 2026-10-04
     next_decision: >-
-      Selector v1 nested recall is closed. Preserve the independent median
-      ranked prefix while reducing enumeration cost, or open a new neighborhood
-      seed if a two-session 2% full-anchor improvement is required. Do not edit
-      selector v1 and do not add ALNS weights yet.
+      Equal-budget 2-restart with N=25 is the offline median allocation under
+      selector v1 and K=16 per parent. A second proposal seed is still a
+      neighborhood-quality question. Do not edit selector v1 and do not add
+      ALNS weights yet.
     adoption_gate: >-
       On each trace, retain a candidate more than 2 percent faster than the
       strongest preserved anchor in both sessions and preserve exact outputs.
@@ -438,6 +438,21 @@ features:
       two-session 2 percent neighborhood gate. Adopt selector v1 for offline
       LNS shortlists; do not change it and do not claim production planning.
       See results/arm_codex_80c_lns_diverse_independent_median_20260905.md.
+      Search-cost instrumentation then showed the 797.01 s wall was exact event
+      plus diagnostic shortlist plus enumeration. Equivalent _beam_assign_tasks
+      kept the frozen seed 20261010 ranked prefix identical and cut production
+      search wall to 687.55 s (exact 341.43 s, shortlist 278.77 s, sample
+      56.31 s of which beam 40.56 s). Isolated profiler beam went 7.045 to
+      2.245 s on full and 67.573 to 17.221 s on one-step. Event simulation was
+      not changed. See
+      results/arm_codex_80c_lns_search_breakdown_beam_equiv_20260905.md.
+      Equal-budget 1-restart (N=50) versus 2-restart (N=25) then used the same
+      2,400 exact cap and 85 hardware plans, including elite 2ab43572.... Both
+      arms selected 0418b884... and beat strongest full by more than 2 percent
+      in both sessions. 2-restart also beat the elite in both sessions;
+      1-restart did not. K=16 overlap was 15/64. Adopt 2 restarts plus N=25
+      for offline median LNS. See
+      results/arm_codex_80c_lns_restart_budget_20260905.md.
 
   - id: planner.executable_two_level_evaluator
     part: planner

@@ -8,9 +8,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import random
 import re
 import sys
-from collections import Counter
+from collections import Counter, defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -294,6 +295,39 @@ class LnsCandidateFeature:
             "width_histogram_delta": [list(item) for item in self.width_histogram_delta],
         }
         return payload
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "LnsCandidateFeature":
+        histogram = tuple(tuple(int(part) for part in item) for item in payload["candidate_width_histogram"])
+        delta = tuple(tuple(int(part) for part in item) for item in payload["width_histogram_delta"])
+        domain = payload["domain_assignment"]
+        domain_json = domain if isinstance(domain, str) else canonical_json(domain)
+        quantile = payload.get("model_score_quantile")
+        return cls(
+            state_hash=str(payload["state_hash"]),
+            anchor_state_hash=str(payload["anchor_state_hash"]),
+            start=str(payload["start"]),
+            restart=int(payload["restart"]),
+            strategy=str(payload["strategy"]),
+            operator=str(payload["operator"]),
+            scope=str(payload["scope"]),
+            target_destroy_size=int(payload["target_destroy_size"]),
+            actual_closure_size=int(payload["actual_closure_size"]),
+            actual_closure_bin=str(payload["actual_closure_bin"]),
+            changed_core_begin=int(payload["changed_core_begin"]),
+            changed_core_end=int(payload["changed_core_end"]),
+            candidate_width_histogram=histogram,
+            width_histogram_delta=delta,
+            domain_assignment=domain_json,
+            domain_assignment_signature=str(payload["domain_assignment_signature"]),
+            anchor_domain_assignment_signature=str(
+                payload.get("anchor_domain_assignment_signature", "")
+            ),
+            cross_domain_lane_count=int(payload["cross_domain_lane_count"]),
+            predicted_gain_pct=float(payload["predicted_gain_pct"]),
+            model_score_quantile=None if quantile is None else int(quantile),
+            schema_version=int(payload.get("schema_version", SCHEMA_VERSION)),
+        )
 
 
 @dataclass(frozen=True)
@@ -649,6 +683,79 @@ def select_lns_global_shortlist(
         "shortlist_budget": int(shortlist_budget),
         "starts": list(start_order),
     }
+
+
+def select_lns_parent_pooled_shortlists(
+    per_start_features: Mapping[str, Sequence[LnsCandidateFeature | Mapping[str, Any]]],
+    parent_of_start: Mapping[str, str],
+    *,
+    shortlist_budget: int = DEFAULT_SHORTLIST_BUDGET,
+    audit_budget: int = DEFAULT_AUDIT_BUDGET,
+) -> dict[str, LnsDiverseShortlist]:
+    """Run selector v1 once per unique parent over pooled restart features."""
+
+    grouped: dict[str, list[LnsCandidateFeature]] = {}
+    for start, rows in per_start_features.items():
+        parent = parent_of_start[start]
+        for row in rows:
+            feature = row if isinstance(row, LnsCandidateFeature) else LnsCandidateFeature.from_dict(row)
+            grouped.setdefault(parent, []).append(feature)
+    return {
+        parent: select_lns_diverse_shortlist(
+            features,
+            shortlist_budget=shortlist_budget,
+            audit_budget=audit_budget,
+        )
+        for parent, features in grouped.items()
+    }
+
+
+def stratified_keys_outside_audit(
+    features: Sequence[LnsCandidateFeature | Mapping[str, Any]],
+    ranked_keys: Sequence[str],
+    audit_keys: Sequence[str],
+    *,
+    sample_size: int,
+    seed: int,
+) -> tuple[str, ...]:
+    """Deterministic round-robin sample from ranked keys beyond the audit prefix."""
+
+    if sample_size < 0:
+        raise ValueError("sample_size must be non-negative")
+    if sample_size == 0:
+        return ()
+    parsed = [
+        row if isinstance(row, LnsCandidateFeature) else LnsCandidateFeature.from_dict(row)
+        for row in features
+    ]
+    unique = assign_model_score_quantiles(merge_duplicate_features(parsed))
+    by_hash = {item.state_hash: item for item in unique}
+    audit = {str(key) for key in audit_keys}
+    outside = [str(key) for key in ranked_keys if str(key) not in audit and str(key) in by_hash]
+    buckets: dict[tuple[str, str, int], list[str]] = defaultdict(list)
+    for key in outside:
+        feature = by_hash[key]
+        quantile = 0 if feature.model_score_quantile is None else int(feature.model_score_quantile)
+        buckets[(feature.operator, feature.actual_closure_bin, quantile)].append(key)
+    rng = random.Random(int(seed))
+    for bucket_key in buckets:
+        items = list(buckets[bucket_key])
+        rng.shuffle(items)
+        buckets[bucket_key] = items
+    selected: list[str] = []
+    selected_set: set[str] = set()
+    while len(selected) < sample_size and any(buckets.values()):
+        for bucket_key in sorted(buckets):
+            if not buckets[bucket_key]:
+                continue
+            key = buckets[bucket_key].pop(0)
+            if key in selected_set:
+                continue
+            selected.append(key)
+            selected_set.add(key)
+            if len(selected) == sample_size:
+                break
+    return tuple(selected)
 
 
 def features_from_hardware_frontier(

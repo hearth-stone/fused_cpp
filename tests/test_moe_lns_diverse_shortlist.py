@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import random
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 
@@ -17,6 +18,7 @@ from executable_plan_state import (  # noqa: E402
     ExecutableLlcDomain,
     ExecutablePlanState,
 )
+from compare_lns_frozen_ranking import compare_artifacts  # noqa: E402
 from lns_diverse_shortlist import (  # noqa: E402
     DEFAULT_AUDIT_BUDGET,
     DEFAULT_SHORTLIST_BUDGET,
@@ -29,7 +31,9 @@ from lns_diverse_shortlist import (  # noqa: E402
     policy_sha256,
     select_lns_diverse_shortlist,
     select_lns_global_shortlist,
+    select_lns_parent_pooled_shortlists,
     state_from_canonical_payload,
+    stratified_keys_outside_audit,
 )
 
 
@@ -391,3 +395,160 @@ def test_frozen_policy_rule_hash_matches_selector() -> None:
     assert payload["rule_sha256"] == policy_sha256(policy_document())
     assert payload["hardware_weights"] is None
     assert payload["relation_agnostic"] is True
+
+
+def _ranking_artifact(gain: float = 1.25) -> dict[str, object]:
+    feature = {
+        "actual_closure_bin": "16_31",
+        "actual_closure_size": 18,
+        "anchor_state_hash": "anchor",
+        "candidate_width_histogram": [[8, 4]],
+        "changed_core_begin": 0,
+        "changed_core_end": 32,
+        "cross_domain_lane_count": 0,
+        "domain_assignment": {"left": 4},
+        "domain_assignment_signature": "left:4",
+        "model_score_quantile": 4,
+        "operator": OPERATORS[0],
+        "predicted_gain_pct": gain,
+        "restart": 0,
+        "scope": "cross_domain",
+        "start": "lns_00_r00",
+        "state_hash": "cand",
+        "strategy": "critical",
+        "target_destroy_size": 16,
+        "width_histogram_delta": [[8, 1]],
+    }
+    frontier = {
+        "state_hash": "cand",
+        "event_ns": 1.0,
+        "robust_ns": 1.1,
+        "event_gain_pct": gain,
+        "robust_gain_pct": gain,
+        "operator": OPERATORS[0],
+        "strategy": "critical",
+    }
+    return {
+        "identity": {
+            "calibration_sha256": "cal",
+            "pairwise_calibration_sha256": "pair",
+            "extension_sha256": "ext",
+            "parent_source": {"named_state_hashes": {"full": "anchor"}},
+        },
+        "method": {
+            "seed": 20261010,
+            "restarts_per_parent": 1,
+            "lns_shortlist_policy_sha256": "policy",
+        },
+        "summary": {
+            "unique_candidates": 1,
+            "event_calls": 2,
+            "better": 0,
+            "worse": 0,
+            "incomparable": 1,
+            "search_wall_s": 12.0,
+        },
+        "lns_diverse_shortlist": {
+            "selected_keys": ["cand"],
+            "audit_keys": ["cand"],
+        },
+        "runs": {
+            "lns_00_r00": {
+                "iterations": [
+                    {
+                        "unique_candidates": 1,
+                        "operators": {OPERATORS[0]: {"proposed": 2, "unique": 1, "sampled": 1}},
+                        "critical_expert_ids": [1],
+                        "random_expert_ids": [2],
+                        "lns_diverse_shortlist": {
+                            "selected_keys": ["cand"],
+                            "audit_keys": ["cand"],
+                            "ranked_keys": ["cand"],
+                        },
+                        "candidate_features": [feature],
+                        "selected_frontier": [frontier],
+                        "audit_frontier": [frontier],
+                    }
+                ]
+            }
+        },
+    }
+
+
+def test_parent_pooled_shortlist_matches_union_selector() -> None:
+    first = _pool()
+    extra = _feature(
+        _salted(_split_local(), 99),
+        operator=OPERATORS[0],
+        moved=list(range(16)),
+        gain=12.0,
+        start="lns_00_r01",
+    )
+    parent = "parent-hash"
+    pooled = select_lns_parent_pooled_shortlists(
+        {"lns_00_r00": first, "lns_00_r01": [extra]},
+        {"lns_00_r00": parent, "lns_00_r01": parent},
+        shortlist_budget=16,
+        audit_budget=32,
+    )
+    union = select_lns_diverse_shortlist([*first, extra], shortlist_budget=16, audit_budget=32)
+    assert pooled[parent].selected_keys == union.selected_keys
+    assert pooled[parent].audit_keys == union.audit_keys
+    assert extra.state_hash in pooled[parent].ranked_keys
+
+
+def test_one_restart_pool_matches_per_start_shortlist() -> None:
+    features = _pool()
+    parent = "parent-hash"
+    pooled = select_lns_parent_pooled_shortlists(
+        {"lns_00_r00": features},
+        {"lns_00_r00": parent},
+    )
+    per_start = select_lns_diverse_shortlist(features)
+    assert pooled[parent].selected_keys == per_start.selected_keys
+    assert pooled[parent].audit_keys == per_start.audit_keys
+
+
+def test_stratified_outside_audit_is_disjoint_nested_and_deterministic() -> None:
+    features = _pool()
+    selected = select_lns_diverse_shortlist(features, shortlist_budget=4, audit_budget=8)
+    first = stratified_keys_outside_audit(
+        features,
+        selected.ranked_keys,
+        selected.audit_keys,
+        sample_size=4,
+        seed=20261013,
+    )
+    second = stratified_keys_outside_audit(
+        [replace(item, predicted_gain_pct=item.predicted_gain_pct) for item in features],
+        selected.ranked_keys,
+        selected.audit_keys,
+        sample_size=4,
+        seed=20261013,
+    )
+    assert len(first) == 4
+    assert first == second
+    assert set(first).isdisjoint(selected.audit_keys)
+    assert all(key in selected.ranked_keys for key in first)
+
+
+def test_feature_from_dict_round_trips_selector_fields() -> None:
+    feature = _pool()[0]
+    restored = LnsCandidateFeature.from_dict(feature.to_dict())
+    assert restored.state_hash == feature.state_hash
+    assert restored.operator == feature.operator
+    assert restored.predicted_gain_pct == feature.predicted_gain_pct
+    assert restored.candidate_width_histogram == feature.candidate_width_histogram
+
+
+def test_frozen_ranking_compare_ignores_search_wall_and_detects_score_drift() -> None:
+    baseline = _ranking_artifact()
+    faster = _ranking_artifact()
+    faster["summary"]["search_wall_s"] = 4.0
+    faster["summary"]["search_breakdown"] = {"beam_s": 1.0}
+    assert compare_artifacts(baseline, faster)["equal"] is True
+
+    drifted = _ranking_artifact(gain=0.5)
+    result = compare_artifacts(baseline, drifted)
+    assert result["equal"] is False
+    assert any("predicted_gain_pct" in item["path"] for item in result["mismatches"])
