@@ -149,6 +149,9 @@ are not source-controlled.
 - Search-cost split and equivalent beam repair preserved this ranked prefix;
   remaining cost is exact event scoring and diagnostic shortlist. See
   `arm_codex_80c_lns_search_breakdown_beam_equiv_20260905.md`.
+  Clarification: `shortlist_s` includes per-start ranking plus other work;
+  `search_wall_s` excludes parent-pooled ranking. Historical numbers are
+  unchanged.
 - Optimize exact scoring or diagnostic shortlist only while preserving
   this ranked prefix on a replay of the frozen model artifact.
 - A second independent seed, or a return to two restarts per parent, is a

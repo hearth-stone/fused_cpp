@@ -193,6 +193,19 @@ def test_lns_diagnostic_mode_never_accepts_a_model_better_candidate(monkeypatch)
     assert iteration["lns_diverse_shortlist"]["selected_keys"] == ["step-1"]
     assert iteration["lns_diverse_shortlist"]["audit_keys"][:1] == ["step-1"]
     assert iteration["candidate_features"][0]["actual_closure_size"] == 1
+    breakdown = iteration["search_breakdown"]
+    assert "shortlist_s" in breakdown
+    components = breakdown["shortlist_components"]
+    assert components["nesting"] == runner.SHORTLIST_TIMER_NESTING
+    nested_sum = 0.0
+    for field in runner.SHORTLIST_NESTED_TIMER_FIELDS:
+        assert field in components
+        assert components[field] >= 0.0
+        nested_sum += float(components[field])
+    assert components["unaccounted_s"] >= -1.0e-9
+    assert abs(nested_sum + float(components["unaccounted_s"]) - float(breakdown["shortlist_s"])) < 1.0e-9
+    assert "search_wall_s" in result
+    assert result["search_wall_s"] >= breakdown["shortlist_s"]
 
 
 def test_calibrated_operator_context_skips_unused_placed_event_replay(monkeypatch) -> None:

@@ -52,6 +52,17 @@ first, then refresh calibration and validate the system coherently. In order:
 
 ## Next planner track: event-guided VND, LNS, then ALNS
 
+Current Cursor handoff (2026-09-06):
+[`template_lns_cursor_todo.md`](../optimizations/fused_moe_sve/results/template_lns_cursor_todo.md).
+Tasks 2A and 1A are closed; Task 3 is closed for its five-plan/full-parent scope.
+Lab presamplers
+`structural_coverage_then_random_v1` and `structural_coverage_closure_width_v1`
+were design-replayed and rejected; keep N=25 shuffle-truncate and injected
+elites. Next is Task 6A: prepare the complete full-parent critical cross-domain
+d4 reference pool (reported 452 unique plans), evidence join, and explicit
+measurement budget. Task 5 stays closed; additional hardware acquisition is
+conditional on its separate budget. Historical records retain their scope.
+
 Do not start by adding adaptive operator weights. First establish that the
 executable-plan neighborhood is locally useful, repairable, and sufficiently
 cheap to evaluate. The primary objective is the complete heavy event-model
@@ -475,6 +486,15 @@ Temporal-ranking remediation in progress before this gate may be reconsidered:
   also beats the elite in both sessions and overlaps K=16 in only 15/64.
   Adopt 2 restarts with `N=25` for offline median LNS. See
   `results/arm_codex_80c_lns_restart_budget_20260905.md`.
+- [x] Keep selector v1 / K=16 / 2-restart `N=25` frozen and run a second
+  independent median proposal seed. Seed `20261011` used the same 2,400 exact
+  cap and 64+16 LNS hardware slots, generated 2,362 unique candidates in
+  550.90 s, and never sampled `0418b884...`. K=16 overlap with seed `20261010`
+  was 3/64. Selected-best vs full was `−0.018% / +0.371%`, so the two-session
+  2% neighborhood gate fails. The injected previous winner still beat full in
+  both sessions. Keep the allocation; do not replace the seed-`20261010`
+  proposal. See
+  `results/arm_codex_80c_lns_second_proposal_seed_20260905.md`.
 
 ### Step 6: decide whether adaptation is warranted
 

@@ -23,6 +23,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--lns-artifact", type=Path, required=True)
     parser.add_argument("--known-elite-plan", type=Path)
+    parser.add_argument("--reference-plan", type=Path)
     parser.add_argument("--include-audit", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--include-stratified", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--output", type=Path, required=True)
@@ -38,15 +39,15 @@ def _canonical_hash(payload: dict[str, object]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _load_known_elite(path: Path) -> dict[str, object]:
+def _load_control_plan(path: Path, *, label: str) -> dict[str, object]:
     payload = json.loads(path.read_text(encoding="utf-8"))
     state_hash = str(payload["state_hash"])
     canonical_state = payload["canonical_state"]
     bridge = payload["plan_v2_bridge"]
     if not isinstance(canonical_state, dict) or not isinstance(bridge, dict):
-        raise ValueError("known elite plan is missing canonical state or PlanV2 bridge")
+        raise ValueError(f"{label} plan is missing canonical state or PlanV2 bridge")
     if _canonical_hash(canonical_state) != state_hash:
-        raise ValueError(f"known elite canonical hash mismatch: {state_hash}")
+        raise ValueError(f"{label} canonical hash mismatch: {state_hash}")
     return {
         "state_hash": state_hash,
         "canonical_state": canonical_state,
@@ -56,11 +57,31 @@ def _load_known_elite(path: Path) -> dict[str, object]:
     }
 
 
+def _load_known_elite(path: Path) -> dict[str, object]:
+    return _load_control_plan(path, label="known elite")
+
+
+def _full_parent_hash(payload: dict[str, object], runs: dict[str, object]) -> str | None:
+    full_hashes = [
+        str(run["initial_state_hash"])
+        for start_name, run in runs.items()
+        if "full" in payload.get("parents", {}).get(start_name, {}).get("roles", [])
+        or "full" in payload.get("parents", {}).get(run.get("start"), {}).get("roles", [])
+    ]
+    if full_hashes:
+        return full_hashes[0]
+    named = payload.get("identity", {}).get("parent_source", {}).get("named_state_hashes", {})
+    if isinstance(named, dict) and named.get("full"):
+        return str(named["full"])
+    return None
+
+
 def build_lns_diverse_frontier(
     payload: dict[str, object],
     *,
     source_path: Path,
     known_elite: dict[str, object] | None = None,
+    reference_plan: dict[str, object] | None = None,
     include_audit: bool = True,
     include_stratified: bool = True,
 ) -> dict[str, object]:
@@ -218,29 +239,28 @@ def build_lns_diverse_frontier(
             audit_budget=audit_budget,
         )
 
-    if known_elite is not None:
-        elite_hash = str(known_elite["state_hash"])
-        full_hashes = [
-            str(run["initial_state_hash"])
-            for run in runs.values()
-            if "full" in payload.get("parents", {}).get(run["start"], {}).get("roles", [])
-        ]
-        if not full_hashes:
-            named = payload.get("identity", {}).get("parent_source", {}).get("named_state_hashes", {})
-            if isinstance(named, dict) and named.get("full"):
-                full_hashes = [str(named["full"])]
-        anchor_for_elite = full_hashes[0] if full_hashes else elite_hash
+    def register_control(plan: dict[str, object], *, role: str, start: str) -> None:
+        state_hash = str(plan["state_hash"])
         register(
-            elite_hash,
-            known_elite["canonical_state"],
-            known_elite["plan_v2_bridge"],
+            state_hash,
+            plan["canonical_state"],
+            plan["plan_v2_bridge"],
             {
-                "role": "known_hardware_elite",
-                "start": "known_median_elite",
-                "anchor_state_hash": anchor_for_elite,
+                "role": role,
+                "start": start,
+                "anchor_state_hash": _full_parent_hash(payload, runs) or state_hash,
                 "operator": None,
                 "moved_experts": [],
             },
+        )
+
+    if known_elite is not None:
+        register_control(known_elite, role="known_hardware_elite", start="known_median_elite")
+    if reference_plan is not None:
+        register_control(
+            reference_plan,
+            role="previous_seed_selected",
+            start="previous_seed_selected",
         )
 
     for record in records.values():
@@ -254,6 +274,7 @@ def build_lns_diverse_frontier(
         "lns_diverse_audit_top32",
         "lns_stratified_outside_top32",
         "known_hardware_elite",
+        "previous_seed_selected",
     )
     role_counts = {
         role: sum(role in record["roles"] for record in records.values())
@@ -270,6 +291,7 @@ def build_lns_diverse_frontier(
         "include_audit": bool(include_audit),
         "include_stratified": bool(include_stratified and pooled),
         "known_elite_state_hash": None if known_elite is None else known_elite["state_hash"],
+        "reference_state_hash": None if reference_plan is None else reference_plan["state_hash"],
     }
     return {
         "kind": "partial_order_hardware_frontier",
@@ -293,10 +315,16 @@ def main() -> int:
     args = parse_args()
     payload = json.loads(args.lns_artifact.read_text(encoding="utf-8"))
     elite = None if args.known_elite_plan is None else _load_known_elite(args.known_elite_plan)
+    reference = (
+        None
+        if args.reference_plan is None
+        else _load_control_plan(args.reference_plan, label="reference")
+    )
     result = build_lns_diverse_frontier(
         payload,
         source_path=args.lns_artifact,
         known_elite=elite,
+        reference_plan=reference,
         include_audit=args.include_audit,
         include_stratified=args.include_stratified,
     )

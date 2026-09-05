@@ -5,12 +5,23 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from lns_diverse_shortlist import (  # noqa: E402
+    AnchorRecoveryError,
+    domain_assignment_payload_from_mapping,
+    domain_assignment_signature,
+    iteration_anchor_from_run,
+)
 
 
 RANKING_FEATURE_FIELDS = (
     "actual_closure_bin",
     "actual_closure_size",
+    "anchor_domain_assignment_signature",
     "anchor_state_hash",
     "candidate_width_histogram",
     "changed_core_begin",
@@ -38,6 +49,15 @@ FRONTIER_SCORE_FIELDS = (
     "operator",
     "strategy",
 )
+FRONTIER_PLAN_FIELDS = (
+    "canonical_state",
+    "plan_v2_bridge",
+)
+POOLED_SHORTLIST_KEY_FIELDS = (
+    "ranked_keys",
+    "selected_keys",
+    "audit_keys",
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -59,10 +79,38 @@ def _mismatch(path: str, left: object, right: object) -> dict[str, object]:
     return {"path": path, "baseline": left, "candidate": right}
 
 
+def _recovered_anchor_signature(run: dict[str, object]) -> str | None:
+    try:
+        _hashed, payload = iteration_anchor_from_run(run, iteration_index=0)
+    except (AnchorRecoveryError, KeyError, TypeError, ValueError):
+        return None
+    return domain_assignment_signature(domain_assignment_payload_from_mapping(payload))
+
+
+def _feature_field(
+    field: str,
+    left_row: dict[str, object],
+    right_row: dict[str, object],
+    *,
+    expected_anchor_signature: str | None,
+) -> tuple[object, object]:
+    left = left_row.get(field)
+    right = right_row.get(field)
+    if field != "anchor_domain_assignment_signature":
+        return left, right
+    if left in (None, "") and right in (None, "") and expected_anchor_signature is None:
+        return left, right
+    if left in (None, ""):
+        return expected_anchor_signature, right
+    return left, right
+
+
 def _compare_features(
     start: str,
     baseline: list[dict[str, object]],
     candidate: list[dict[str, object]],
+    *,
+    expected_anchor_signature: str | None = None,
 ) -> list[dict[str, object]]:
     mismatches = []
     if len(baseline) != len(candidate):
@@ -77,12 +125,18 @@ def _compare_features(
     right = sorted(candidate, key=lambda row: str(row["state_hash"]))
     for index, (left_row, right_row) in enumerate(zip(left, right, strict=True)):
         for field in RANKING_FEATURE_FIELDS:
-            if left_row.get(field) != right_row.get(field):
+            left_value, right_value = _feature_field(
+                field,
+                left_row,
+                right_row,
+                expected_anchor_signature=expected_anchor_signature,
+            )
+            if left_value != right_value:
                 mismatches.append(
                     _mismatch(
                         f"runs.{start}.candidate_features[{index}].{field}",
-                        left_row.get(field),
-                        right_row.get(field),
+                        left_value,
+                        right_value,
                     )
                 )
                 if len(mismatches) >= 20:
@@ -100,11 +154,77 @@ def _compare_frontier(
     if len(baseline) != len(candidate):
         return [_mismatch(f"runs.{start}.{name}.length", len(baseline), len(candidate))]
     for index, (left_row, right_row) in enumerate(zip(baseline, candidate, strict=True)):
-        for field in FRONTIER_SCORE_FIELDS:
+        for field in (*FRONTIER_SCORE_FIELDS, *FRONTIER_PLAN_FIELDS):
             if left_row.get(field) != right_row.get(field):
                 mismatches.append(
                     _mismatch(
                         f"runs.{start}.{name}[{index}].{field}",
+                        left_row.get(field),
+                        right_row.get(field),
+                    )
+                )
+                if len(mismatches) >= 20:
+                    return mismatches
+    return mismatches
+
+
+def _compare_parent_pooled(
+    baseline: dict[str, object],
+    candidate: dict[str, object],
+) -> list[dict[str, object]]:
+    mismatches: list[dict[str, object]] = []
+    left = baseline.get("parent_pooled_shortlists") or {}
+    right = candidate.get("parent_pooled_shortlists") or {}
+    if not isinstance(left, dict) or not isinstance(right, dict):
+        return [_mismatch("parent_pooled_shortlists.type", type(left).__name__, type(right).__name__)]
+    if sorted(left) != sorted(right):
+        return [_mismatch("parent_pooled_shortlists.keys", sorted(left), sorted(right))]
+    for parent in sorted(left):
+        left_row = left[parent]
+        right_row = right[parent]
+        left_shortlist = (left_row or {}).get("shortlist") or {}
+        right_shortlist = (right_row or {}).get("shortlist") or {}
+        for field in POOLED_SHORTLIST_KEY_FIELDS:
+            if left_shortlist.get(field) != right_shortlist.get(field):
+                mismatches.append(
+                    _mismatch(
+                        f"parent_pooled_shortlists.{parent}.shortlist.{field}",
+                        left_shortlist.get(field),
+                        right_shortlist.get(field),
+                    )
+                )
+        if (left_row or {}).get("stratified_keys") != (right_row or {}).get("stratified_keys"):
+            mismatches.append(
+                _mismatch(
+                    f"parent_pooled_shortlists.{parent}.stratified_keys",
+                    (left_row or {}).get("stratified_keys"),
+                    (right_row or {}).get("stratified_keys"),
+                )
+            )
+        if len(mismatches) >= 20:
+            return mismatches
+    return mismatches
+
+
+def _compare_pooled_frontier_rows(
+    baseline: dict[str, object],
+    candidate: dict[str, object],
+) -> list[dict[str, object]]:
+    mismatches: list[dict[str, object]] = []
+    left = baseline.get("pooled_frontier_rows") or {}
+    right = candidate.get("pooled_frontier_rows") or {}
+    if not isinstance(left, dict) or not isinstance(right, dict):
+        return [_mismatch("pooled_frontier_rows.type", type(left).__name__, type(right).__name__)]
+    if sorted(left) != sorted(right):
+        return [_mismatch("pooled_frontier_rows.keys", sorted(left), sorted(right))]
+    for state_hash in sorted(left):
+        left_row = left[state_hash] or {}
+        right_row = right[state_hash] or {}
+        for field in ("state_hash", *FRONTIER_PLAN_FIELDS):
+            if left_row.get(field) != right_row.get(field):
+                mismatches.append(
+                    _mismatch(
+                        f"pooled_frontier_rows.{state_hash}.{field}",
                         left_row.get(field),
                         right_row.get(field),
                     )
@@ -240,6 +360,7 @@ def compare_artifacts(
                 start,
                 baseline_iter.get("candidate_features") or [],
                 candidate_iter.get("candidate_features") or [],
+                expected_anchor_signature=_recovered_anchor_signature(baseline_run),
             )
         )
         mismatches.extend(
@@ -260,6 +381,9 @@ def compare_artifacts(
         )
         if len(mismatches) >= 40:
             break
+
+    mismatches.extend(_compare_parent_pooled(baseline, candidate))
+    mismatches.extend(_compare_pooled_frontier_rows(baseline, candidate))
 
     return {
         "equal": not mismatches,

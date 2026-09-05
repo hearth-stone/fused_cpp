@@ -126,8 +126,14 @@ source-controlled.
   exact/hardware cap. Do not raise K, do not edit selector v1, do not add
   ALNS weights.
 - A second proposal seed is still a neighborhood-quality question. This file
-  is one seed and two allocations.
+  is one seed and two allocations. Seed `20261011` under the adopted 2-restart
+  `N=25` allocation missed the two-session 2% gate and did not resample
+  `0418b884...`; see
+  `arm_codex_80c_lns_second_proposal_seed_20260905.md`.
 - Stratified 16 is not a proof that K=16/32 contains every fast plan in the
   generated pool. Keep a small outside sample on later frontiers.
+- `shortlist_s` includes per-start ranking plus other work; `search_wall_s` excludes
+  parent-pooled ranking. Historical search-wall numbers in this file are
+  unchanged.
 - Production planner, Plan V2, kernel, ABI, frozen v8, and the local VND
   comparator remain unchanged.

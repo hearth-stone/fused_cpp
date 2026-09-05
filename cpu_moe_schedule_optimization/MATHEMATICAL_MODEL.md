@@ -1857,6 +1857,33 @@ median elite `2ab43572...`（`+0.797/+0.449%`），1-restart第二场相对elite
 winner，也不是production结果。完整记录见
 `optimizations/fused_moe_sve/results/arm_codex_80c_lns_restart_budget_20260905.md`。
 
+同一冻结协议下把proposal seed换成`20261011`（stratified seed仍为`20261013`）后，
+exact cap仍为2,400，LNS硬件名额仍为64 top-16加16层外抽查。搜索2,378次event、
+2,362个unique、550.90 s，但没有生成上一seed的selected-best `0418b884...`；K=16
+与`20261010`只重叠3/64。两场K=16最快解不同（`2fd99a11...` / `8deba718...`），
+相对full为`−0.018% / +0.371%`，未过2%。注入的`0418b884...`在session 1仍是实测
+最快（`31.122 ms`，相对full `+3.302%`），session 2与elite `2ab43572...`相差
+`0.030 ms`。这是neighborhood/proposal失败，不是selector或2-restart分配失败。
+离线median仍用2 restart + `N=25`，不改K、不改selector、不把`20261011`当作替代
+proposal。完整记录见
+`optimizations/fused_moe_sve/results/arm_codex_80c_lns_second_proposal_seed_20260905.md`。
+
+对冻结median协议下相对reconstructed full绝对median至少2%的五个实测快plan
+（`0418b884...`、`2ab43572...`、`7cac2afd...`、`1faf090a...`、`07355dde...`），
+用shipped `enumerate_template_lns_neighbors` / `_sample_neighborhood` 在full parent
+`98a32da5...` 的 `lns_00_r00`/`lns_00_r01` 上回放。五者都在该parent可达邻域内。
+`0418b884...` 在seed `20261010` 被选中，在 `20261011` 于N=25 shuffle截断丢失
+（index 373/452）；`7cac2afd...` / `1faf090a...` 在 `20261010` 的shuffle index为
+40/716与26/1016，N=50会留下、N=25不会；`2ab43572...` 两边都进入event scoring但
+parent-pooled rank在top32之外。Lab候选presampler
+`structural_coverage_then_random_v1`（SHA256 `275dd663...`）与baseline共用同一次
+shuffle、把每个非空closure bin的首次代表提前，design replay不改变这五个hash的
+sampled membership，也不接入 `sample_template_lns_neighborhood`。不打开独立硬件
+frontier。后续候选 `structural_coverage_closure_width_v1`（`e5a35b06...`）把coverage
+key扩成`(closure_bin, width_histogram)`，同一回放在seed `20261010` 把已抽中的
+`0418b884...` 挤出N=25，且未恢复任何sampling-lost tracked hash，判定reject。完整记录见
+`optimizations/fused_moe_sve/results/template_lns_cursor_todo.md`。
+
 **Narrow-team full-cohort correction。** 独立`2x1T concurrent -> 1x2T serial`
 probe表明，现有shared-resource event方程对2T task在满载mixed background下的dilation
 系统性高估，而不是漏掉1T slowdown。先用无背景的merged 2T逐task phase span拟合离散
@@ -6280,3 +6307,6 @@ partial order、top-K recall 与 false-pruning replay，只有这些门槛通过
 | 2026-09-05 | v1.76 | 在Arm-codex NUMA3上冻结selector v1后打开独立median frontier：route layer 4、proposal seed `20261010`、每unique parent一次restart、shortlist 16/audit 32。4个reconstructed control的canonical hash与旧median VND一致。模型2,330次event call、797.01 s，冻结132-plan frontier；两场31-round session各约168 s，bit-exact。Selector nested-recall全部通过，K=8到K=32的selected-best regret均为0。共识`7cac2afd...`为`31.720 ms`量级的cross-domain d8、48-expert closure，模型预测`-0.087%`且incomparable。相对strongest full `98a32da5...`的绝对median收益为`+2.579/+1.916%`，第二场未过2%，故neighborhood/proposal失败与selector召回成功分开记录。采用v1作离线LNS shortlist，不改K、不改selector、不进production。完整记录见`optimizations/fused_moe_sve/results/arm_codex_80c_lns_diverse_independent_median_20260905.md`。 |
 | 2026-09-05 | v1.77 | 为template-LNS补齐search-cost split，并对确认的enumeration热点`_beam_assign_tasks`做一轮等价加速：预计算`(expert,width)` retarget与增量signature，不改last-write-wins、placement_priority或四种顺序策略。隔离profiler上full/one-step的beam为7.045→2.245 s与67.573→17.221 s，计数不变。冻结median seed `20261010`生产路径墙钟797.01→687.55 s；exact 341.43 s、diagnostic shortlist 278.77 s、sample 56.31 s（beam 40.56 s）。候选hash、抽样、模型分数、quantile与有序top-16/top-32与冻结artifact一致，`equal=true`。event simulator与跨lane增量回放未改。峰值RSS 309,092 KB，无797 s基线RSS。下一步才是等预算multi-restart。完整记录见`optimizations/fused_moe_sve/results/arm_codex_80c_lns_search_breakdown_beam_equiv_20260905.md`。 |
 | 2026-09-05 | v1.78 | 冻结selector v1、K=16（按unique parent池化）和现有operator mixture，在exact cap 2,400与硬件85-plan（4 reconstructed + elite `2ab43572...` + 64 top-16 + 16层外抽查）下比较1 restart（N=50）与2 restart（N=25）。两边都选出`0418b884...`，两场相对full均超过2%。2-restart相对elite两场为正，1-restart第二场为负；K=16集合只重叠15/64；层外16个样本未打过selected。搜索墙钟558.71/683.67 s，实际event call 2384/2330（八个start多付parent exact）。离线median采用2 restart+N=25，不改K、不改selector、不进production。完整记录见`optimizations/fused_moe_sve/results/arm_codex_80c_lns_restart_budget_20260905.md`。 |
+| 2026-09-05 | v1.79 | 冻结selector v1、K=16、2 restart、N=25和exact cap 2,400，将proposal seed从`20261010`换成`20261011`。搜索2,378 event / 2,362 unique / 550.90 s，未生成`0418b884...`；K=16与上一seed只重叠3/64。两场selected-best为`2fd99a11...` / `8deba718...`，相对full `−0.018% / +0.371%`，未过2%，也未快于elite或注入的上一seed winner。`0418b884...`作为`previous_seed_selected`对照在session 1仍是实测最快（`+3.302%` vs full）。这是proposal-seed失败，不改分配、不改selector、不进production。完整记录见`optimizations/fused_moe_sve/results/arm_codex_80c_lns_second_proposal_seed_20260905.md`。 |
+| 2026-09-06 | v1.80 | 在冻结2-restart N=25路径上审计五个实测快plan的丢失阶段，不改sampler、selector、K或production。full parent `98a32da5...` 的 `lns_00_r00`/`lns_00_r01` 枚举表明五者都可达；`0418b884...`/`7cac2afd...`/`1faf090a...` 的seed间丢失是operator内shuffle-truncate，不是预采样缺失；`2ab43572...` 进入scoring后排在parent top32之外。Lab候选 `structural_coverage_then_random_v1`（`275dd663...`）与baseline同shuffle，design replay不恢复sampling-lost hash，不接入生产抽样，不开Task 5硬件。完整记录见`optimizations/fused_moe_sve/results/template_lns_cursor_todo.md`。 |
+| 2026-09-06 | v1.81 | Lab候选 `structural_coverage_closure_width_v1`（`e5a35b06...`）在同一shuffle上按`(closure_bin, width_histogram)`做coverage。冻结模型 `9b334b78...`/`cc53d43d...` 的full-parent回放相对N=25 shuffle-truncate：seed `20261010` 丢掉已抽中的 `0418b884...`，五个tracked hash中没有任何sampling-lost成员被恢复；`(bin,hist)` key覆盖在24/24 operator cell上升。判定reject，不改 `sample_template_lns_neighborhood`、selector、K，不开Task 5。完整记录见`optimizations/fused_moe_sve/results/template_lns_cursor_todo.md`。 |

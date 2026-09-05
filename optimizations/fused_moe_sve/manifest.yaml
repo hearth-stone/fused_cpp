@@ -368,8 +368,12 @@ features:
       lns_diverse_shortlist.py, replay_lns_diverse_shortlist.py,
       build_lns_diverse_hardware_frontier.py,
       analyze_lns_diverse_hardware_frontier.py,
+      analyze_lns_restart_budget.py, analyze_lns_second_proposal_seed.py,
+      compare_lns_frozen_ranking.py, replay_lns_frozen_ranking.py,
+      audit_lns_fast_plan_loss.py, lns_structural_presample.py,
       build_partial_order_hardware_frontier.py,
-      bench_partial_order_hardware_frontier.py, and
+      bench_partial_order_hardware_frontier.py,
+      run_lns_restart_budget_compare.sh, run_lns_second_proposal_seed.sh, and
       analyze_template_lns_frontier.py and analyze_template_lns_suite.py
     hypothesis: >-
       Jointly repairing a lane-atomic critical window across width template,
@@ -384,6 +388,7 @@ features:
     correctness: >-
       PYTHONPATH=.:src .venv/bin/python -m pytest -q
       tests/test_moe_executable_plan_neighborhood.py
+      tests/test_moe_lns_structural_presample.py
       tests/test_moe_lns_diverse_shortlist.py
       tests/test_moe_partial_order_vnd_runner.py
       tests/test_moe_partial_order_hardware_frontier.py
@@ -398,10 +403,15 @@ features:
     opened: 2026-09-04
     decision_by: 2026-10-04
     next_decision: >-
-      Equal-budget 2-restart with N=25 is the offline median allocation under
-      selector v1 and K=16 per parent. A second proposal seed is still a
-      neighborhood-quality question. Do not edit selector v1 and do not add
-      ALNS weights yet.
+      Equal-budget 2-restart with N=25 remains the offline median allocation
+      under selector v1 and K=16 per parent. Ranking/replay and Arm model-only
+      gates passed; the full-parent audit found losses at both sampling and
+      pooled shortlist retention. Both coarse structural presamplers failed
+      their design adoption gate. Prepare the complete critical cross-domain
+      d4 reference pool, evidence join, and explicit measurement budget in
+      Cursor TODO Task 6A. Do not launch its additional hardware acquisition
+      without that budget being authorized; do not open Task 5 for the rejected
+      policies or add ALNS weights.
     adoption_gate: >-
       On each trace, retain a candidate more than 2 percent faster than the
       strongest preserved anchor in both sessions and preserve exact outputs.
@@ -452,7 +462,24 @@ features:
       in both sessions. 2-restart also beat the elite in both sessions;
       1-restart did not. K=16 overlap was 15/64. Adopt 2 restarts plus N=25
       for offline median LNS. See
-      results/arm_codex_80c_lns_restart_budget_20260905.md.
+      results/arm_codex_80c_lns_restart_budget_20260905.md. A second proposal
+      seed 20261011 under that frozen allocation generated 2,362 unique
+      candidates in 550.90 s, overlapped K=16 in only 3/64, and never sampled
+      0418b884.... Selected-best versus full was -0.018/+0.371 percent, so the
+      two-session 2 percent neighborhood gate fails. Keep the allocation and
+      the seed-20261010 proposal; do not change selector v1. See
+      results/arm_codex_80c_lns_second_proposal_seed_20260905.md.
+      Lab ranking fill is now incremental_min_distance_v1, kept exact against
+      the naive selected-scan reference. shortlist_s includes ranking and other work;
+      search_wall_s does not include parent-pooled ranking. Historical 797.01 /
+      687.55 / 558.71 / 550.90 s search-wall numbers are unchanged. Arm model-only
+      regeneration for both seeds matched frozen rankings with zero mismatches;
+      post-write main-stage elapsed was 622.820/618.783 s. A comparable complete-
+      model before/after baseline was not measured. Lab
+      presamplers structural_coverage_then_random_v1 and
+      structural_coverage_closure_width_v1 were design-replayed and rejected;
+      keep N=25 shuffle-truncate. See
+      results/template_lns_cursor_todo.md.
 
   - id: planner.executable_two_level_evaluator
     part: planner

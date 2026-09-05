@@ -45,12 +45,25 @@ from optimizations.fused_moe_sve.benchmarks.bench_partial_order_beam_layer impor
     _state_from_payload,
 )
 from optimizations.fused_moe_sve.benchmarks.lns_diverse_shortlist import (  # noqa: E402
+    RANKING_FILL_NAME,
+    RANKING_FILL_REFERENCE_NAME,
     LnsCandidateFeature,
     LnsDiverseShortlist,
     policy_sha256,
     select_lns_global_shortlist,
     select_lns_parent_pooled_shortlists,
     stratified_keys_outside_audit,
+)
+
+MODEL_STAGE_TIMER_FIELDS = (
+    "control_construction_s",
+    "search_wall_s",
+    "restart_pooling_s",
+    "parent_pooled_ranking_s",
+    "outside_audit_sampling_s",
+    "frontier_construction_s",
+    "global_shortlist_s",
+    "serialization_s",
 )
 
 
@@ -98,8 +111,10 @@ def _peak_rss_kb() -> int:
     return int(usage)
 
 
-def _sum_search_breakdowns(runs: dict[str, dict[str, object]]) -> dict[str, float | int] | None:
-    merged: dict[str, float | int] = {}
+def _sum_search_breakdowns(runs: dict[str, dict[str, object]]) -> dict[str, float | int | dict[str, object]] | None:
+    merged: dict[str, float | int | dict[str, object]] = {}
+    nested_shortlist: dict[str, float] = {}
+    nesting_label = None
     for run in runs.values():
         iterations = run.get("iterations") or []
         if not iterations:
@@ -108,10 +123,238 @@ def _sum_search_breakdowns(runs: dict[str, dict[str, object]]) -> dict[str, floa
         if not isinstance(item, dict):
             continue
         for key, value in item.items():
+            if key == "shortlist_components" and isinstance(value, dict):
+                if nesting_label is None and isinstance(value.get("nesting"), str):
+                    nesting_label = value["nesting"]
+                for inner_key, inner_value in value.items():
+                    if isinstance(inner_value, bool) or not isinstance(inner_value, (int, float)):
+                        continue
+                    nested_shortlist[inner_key] = nested_shortlist.get(inner_key, 0.0) + float(inner_value)
+                continue
             if isinstance(value, bool) or not isinstance(value, (int, float)):
                 continue
-            merged[key] = merged.get(key, 0) + value
+            current = merged.get(key, 0)
+            if isinstance(current, (int, float)) and not isinstance(current, bool):
+                merged[key] = current + value
+    if nested_shortlist:
+        components: dict[str, object] = dict(nested_shortlist)
+        if nesting_label is not None:
+            components["nesting"] = nesting_label
+        merged["shortlist_components"] = components
     return merged or None
+
+
+def reconcile_model_stage_timing(
+    *,
+    elapsed_s: float,
+    components: Mapping[str, float],
+) -> dict[str, object]:
+    accounted = float(sum(float(value) for value in components.values()))
+    return {
+        "accounted_s": accounted,
+        "components": {key: float(value) for key, value in components.items()},
+        "elapsed_s": float(elapsed_s),
+        "nested": {
+            "global_shortlist_s": "global unique-key merge only; not parent-pooled ranking",
+            "search_wall_s": "sum of per-start runs; includes shortlist_s",
+            "shortlist_components": "nested_in_shortlist_s",
+            "shortlist_s": "nested_in_search_wall_s; not ranking-only",
+        },
+        "unaccounted_s": float(elapsed_s) - accounted,
+    }
+
+
+def assemble_template_lns_post_search(
+    *,
+    runs: Mapping[str, dict[str, object]],
+    parents: Mapping[str, Mapping[str, object]],
+    libraries: Mapping[str, Mapping[str, object]],
+    shortlist_budget: int,
+    audit_budget: int,
+    pool_restarts_by_parent: bool,
+    stratified_outside_audit: int,
+    stratified_seed: int,
+) -> dict[str, object]:
+    """Pool restarts, rank, sample, and merge after per-start search.
+
+    ``global_shortlist_s`` keeps its historical meaning: only the global unique-key
+    merge. Parent-pooled ranking and outside-audit sampling are timed separately.
+    """
+
+    per_start_shortlists = {
+        start_name: LnsDiverseShortlist.from_dict(run["iterations"][0]["lns_diverse_shortlist"])
+        for start_name, run in runs.items()
+        if run.get("iterations") and run["iterations"][0].get("lns_diverse_shortlist")
+    }
+    parent_of_start = {start_name: str(item["state_hash"]) for start_name, item in parents.items()}
+    pooled_shortlists: dict[str, LnsDiverseShortlist] = {}
+    stratified_by_parent: dict[str, tuple[str, ...]] = {}
+    pooled_frontier_rows: dict[str, dict[str, object]] = {}
+    restart_pooling_s = 0.0
+    parent_pooled_ranking_s = 0.0
+    outside_audit_sampling_s = 0.0
+    frontier_construction_s = 0.0
+    if pool_restarts_by_parent and per_start_shortlists:
+        pooling_begin = time.perf_counter_ns()
+        per_start_features = {
+            start_name: [
+                LnsCandidateFeature.from_dict(row)
+                for row in run["iterations"][0].get("candidate_features") or []
+            ]
+            for start_name, run in runs.items()
+            if run.get("iterations")
+        }
+        restart_pooling_s = (time.perf_counter_ns() - pooling_begin) / 1.0e9
+        ranking_begin = time.perf_counter_ns()
+        pooled_shortlists = select_lns_parent_pooled_shortlists(
+            per_start_features,
+            parent_of_start,
+            shortlist_budget=shortlist_budget,
+            audit_budget=audit_budget,
+        )
+        parent_pooled_ranking_s = (time.perf_counter_ns() - ranking_begin) / 1.0e9
+        starts_by_parent: dict[str, list[str]] = {}
+        for start_name, parent_hash in parent_of_start.items():
+            starts_by_parent.setdefault(parent_hash, []).append(start_name)
+        audit_begin = time.perf_counter_ns()
+        all_features = [feature for rows in per_start_features.values() for feature in rows]
+        audit_union = {key for shortlist in pooled_shortlists.values() for key in shortlist.audit_keys}
+        ranked_outside: list[str] = []
+        seen_outside: set[str] = set()
+        for shortlist in pooled_shortlists.values():
+            for key in shortlist.ranked_keys:
+                if key in audit_union or key in seen_outside:
+                    continue
+                ranked_outside.append(key)
+                seen_outside.add(key)
+        global_stratified = stratified_keys_outside_audit(
+            all_features,
+            ranked_outside,
+            (),
+            sample_size=stratified_outside_audit,
+            seed=stratified_seed,
+        )
+        for parent_hash in pooled_shortlists:
+            stratified_by_parent[parent_hash] = tuple(
+                key
+                for key in global_stratified
+                if any(key in libraries[start]["rows"] for start in starts_by_parent[parent_hash])
+            )
+        outside_audit_sampling_s = (time.perf_counter_ns() - audit_begin) / 1.0e9
+        frontier_begin = time.perf_counter_ns()
+        needed = [
+            *{key for shortlist in pooled_shortlists.values() for key in shortlist.audit_keys},
+            *global_stratified,
+        ]
+        for state_hash in needed:
+            start_name, state, strategy, row = _library_lookup(
+                state_hash,
+                sorted(libraries),
+                libraries,
+            )
+            pooled_frontier_rows[state_hash] = _frontier_row_from_library(
+                state_hash,
+                start_name=start_name,
+                state=state,
+                strategy=strategy,
+                row=row,
+            )
+        frontier_construction_s = (time.perf_counter_ns() - frontier_begin) / 1.0e9
+    global_shortlist_begin = time.perf_counter_ns()
+    shortlist_source = pooled_shortlists if pooled_shortlists else per_start_shortlists
+    global_shortlist = (
+        select_lns_global_shortlist(
+            shortlist_source,
+            shortlist_budget=shortlist_budget,
+            audit_budget=audit_budget,
+        )
+        if shortlist_source
+        else None
+    )
+    global_shortlist_s = (time.perf_counter_ns() - global_shortlist_begin) / 1.0e9
+    if pooled_shortlists:
+        measured_lns_keys = len({*global_shortlist["selected_keys"], *sum(stratified_by_parent.values(), ())})
+    else:
+        measured_lns_keys = len(runs) * audit_budget
+    return {
+        "frontier_construction_s": frontier_construction_s,
+        "global_shortlist": global_shortlist,
+        "global_shortlist_s": global_shortlist_s,
+        "measured_lns_keys": measured_lns_keys,
+        "outside_audit_sampling_s": outside_audit_sampling_s,
+        "parent_pooled_ranking_s": parent_pooled_ranking_s,
+        "per_start_shortlists": per_start_shortlists,
+        "pooled_frontier_rows": pooled_frontier_rows,
+        "pooled_shortlists": pooled_shortlists,
+        "restart_pooling_s": restart_pooling_s,
+        "stratified_by_parent": stratified_by_parent,
+    }
+
+
+def write_template_lns_model_artifact(
+    path: Path,
+    result: dict[str, object],
+    *,
+    command_begin_ns: int,
+    sidecar: bool = True,
+) -> dict[str, float]:
+    """Serialize the model payload and record elapsed time through the final write."""
+
+    summary = result.setdefault("summary", {})
+    if not isinstance(summary, dict):
+        raise TypeError("model summary must be an object")
+    components = {
+        field: float(summary.get(field, 0.0) or 0.0)
+        for field in MODEL_STAGE_TIMER_FIELDS
+        if field != "serialization_s"
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    serialization_begin = time.perf_counter_ns()
+    summary["serialization_s"] = 0.0
+    summary["model_command_elapsed_s"] = 0.0
+    summary["timing_reconciliation"] = reconcile_model_stage_timing(
+        elapsed_s=0.0,
+        components={**components, "serialization_s": 0.0},
+    )
+    json.dumps(result, indent=2, sort_keys=True)
+    serialization_s = (time.perf_counter_ns() - serialization_begin) / 1.0e9
+    elapsed_s = (time.perf_counter_ns() - command_begin_ns) / 1.0e9
+    summary["serialization_s"] = serialization_s
+    summary["model_command_elapsed_s"] = elapsed_s
+    summary["timing_reconciliation"] = reconcile_model_stage_timing(
+        elapsed_s=elapsed_s,
+        components={**components, "serialization_s": serialization_s},
+    )
+    path.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    serialization_s = (time.perf_counter_ns() - serialization_begin) / 1.0e9
+    elapsed_s = (time.perf_counter_ns() - command_begin_ns) / 1.0e9
+    summary["serialization_s"] = serialization_s
+    summary["model_command_elapsed_s"] = elapsed_s
+    summary["timing_reconciliation"] = reconcile_model_stage_timing(
+        elapsed_s=elapsed_s,
+        components={**components, "serialization_s": serialization_s},
+    )
+    if sidecar:
+        sidecar_path = path.with_name(path.name + ".wall.json")
+        sidecar_path.write_text(
+            json.dumps(
+                {
+                    "model_command_elapsed_s": elapsed_s,
+                    "output": str(path),
+                    "serialization_s": serialization_s,
+                    "timing_reconciliation": summary["timing_reconciliation"],
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+    return {
+        "model_command_elapsed_s": elapsed_s,
+        "serialization_s": serialization_s,
+        "unaccounted_s": float(summary["timing_reconciliation"]["unaccounted_s"]),
+    }
 
 
 def _frontier_row_from_library(
@@ -199,6 +442,7 @@ def _deduplicate_named_states(
 
 @torch.inference_mode()
 def main() -> int:
+    command_begin = time.perf_counter_ns()
     args = parse_args()
     destroy_sizes = _parse_positive_int_list(args.lns_destroy_sizes, "lns-destroy-sizes")
     repair_beam_widths = _parse_positive_int_list(
@@ -231,6 +475,7 @@ def main() -> int:
     if args.audit_budget < args.shortlist_budget:
         raise ValueError("audit-budget must be at least shortlist-budget")
 
+    control_begin = time.perf_counter_ns()
     actual_extension = _sha256(Path(_moe_C.__file__))
     affinity = sorted(os.sched_getaffinity(0))
     if len(affinity) < args.threads:
@@ -357,6 +602,7 @@ def main() -> int:
         lns_repair_beam_widths=repair_beam_widths,
         lns_templates_per_block=args.lns_templates_per_block,
     )
+    control_construction_s = (time.perf_counter_ns() - control_begin) / 1.0e9
     runs = {}
     parents = {}
     libraries: dict[str, dict[str, object]] = {}
@@ -396,90 +642,22 @@ def main() -> int:
     maximum_exact_candidates = (
         len(runs) * 2 * operator_count * args.neighbors_per_operator
     )
-    per_start_shortlists = {
-        start_name: LnsDiverseShortlist.from_dict(run["iterations"][0]["lns_diverse_shortlist"])
-        for start_name, run in runs.items()
-        if run.get("iterations") and run["iterations"][0].get("lns_diverse_shortlist")
-    }
-    parent_of_start = {start_name: item["state_hash"] for start_name, item in parents.items()}
-    pooled_shortlists: dict[str, LnsDiverseShortlist] = {}
-    stratified_by_parent: dict[str, tuple[str, ...]] = {}
-    pooled_frontier_rows: dict[str, dict[str, object]] = {}
-    if args.pool_restarts_by_parent and per_start_shortlists:
-        per_start_features = {
-            start_name: [
-                LnsCandidateFeature.from_dict(row)
-                for row in run["iterations"][0].get("candidate_features") or []
-            ]
-            for start_name, run in runs.items()
-            if run.get("iterations")
-        }
-        pooled_shortlists = select_lns_parent_pooled_shortlists(
-            per_start_features,
-            parent_of_start,
-            shortlist_budget=args.shortlist_budget,
-            audit_budget=args.audit_budget,
-        )
-        starts_by_parent: dict[str, list[str]] = {}
-        for start_name, parent_hash in parent_of_start.items():
-            starts_by_parent.setdefault(parent_hash, []).append(start_name)
-        all_features = [feature for rows in per_start_features.values() for feature in rows]
-        audit_union = {key for shortlist in pooled_shortlists.values() for key in shortlist.audit_keys}
-        ranked_outside: list[str] = []
-        seen_outside: set[str] = set()
-        for shortlist in pooled_shortlists.values():
-            for key in shortlist.ranked_keys:
-                if key in audit_union or key in seen_outside:
-                    continue
-                ranked_outside.append(key)
-                seen_outside.add(key)
-        global_stratified = stratified_keys_outside_audit(
-            all_features,
-            ranked_outside,
-            (),
-            sample_size=args.stratified_outside_audit,
-            seed=args.stratified_seed,
-        )
-        for parent_hash in pooled_shortlists:
-            stratified_by_parent[parent_hash] = tuple(
-                key
-                for key in global_stratified
-                if any(key in libraries[start]["rows"] for start in starts_by_parent[parent_hash])
-            )
-        needed = [
-            *{key for shortlist in pooled_shortlists.values() for key in shortlist.audit_keys},
-            *global_stratified,
-        ]
-        for state_hash in needed:
-            start_name, state, strategy, row = _library_lookup(
-                state_hash,
-                sorted(libraries),
-                libraries,
-            )
-            pooled_frontier_rows[state_hash] = _frontier_row_from_library(
-                state_hash,
-                start_name=start_name,
-                state=state,
-                strategy=strategy,
-                row=row,
-            )
-    global_shortlist_begin = time.perf_counter_ns()
-    shortlist_source = pooled_shortlists if pooled_shortlists else per_start_shortlists
-    global_shortlist = (
-        select_lns_global_shortlist(
-            shortlist_source,
-            shortlist_budget=args.shortlist_budget,
-            audit_budget=args.audit_budget,
-        )
-        if shortlist_source
-        else None
+    assembled = assemble_template_lns_post_search(
+        runs=runs,
+        parents=parents,
+        libraries=libraries,
+        shortlist_budget=args.shortlist_budget,
+        audit_budget=args.audit_budget,
+        pool_restarts_by_parent=bool(args.pool_restarts_by_parent),
+        stratified_outside_audit=args.stratified_outside_audit,
+        stratified_seed=args.stratified_seed,
     )
-    global_shortlist_s = (time.perf_counter_ns() - global_shortlist_begin) / 1.0e9
-    measured_lns_keys = 0
-    if pooled_shortlists:
-        measured_lns_keys = len({*global_shortlist["selected_keys"], *sum(stratified_by_parent.values(), ())})
-    else:
-        measured_lns_keys = len(runs) * args.audit_budget
+    pooled_shortlists = assembled["pooled_shortlists"]
+    stratified_by_parent = assembled["stratified_by_parent"]
+    pooled_frontier_rows = assembled["pooled_frontier_rows"]
+    global_shortlist = assembled["global_shortlist"]
+    global_shortlist_s = float(assembled["global_shortlist_s"])
+    measured_lns_keys = int(assembled["measured_lns_keys"])
     maximum_hardware_frontier_plans = len(parent_items) + measured_lns_keys
     result = {
         "kind": "executable_partial_order_template_lns_model_replay",
@@ -512,6 +690,8 @@ def main() -> int:
             "partial_order_decision_mode": "diagnostic_only",
             "lns_shortlist_policy": "relation_agnostic_categorical_farthest_first_v1",
             "lns_shortlist_policy_sha256": policy_sha256(),
+            "lns_ranking_fill": RANKING_FILL_NAME,
+            "lns_ranking_fill_reference": RANKING_FILL_REFERENCE_NAME,
             "maximum_exact_candidate_budget": maximum_exact_candidates,
             "maximum_hardware_frontier_plan_budget": maximum_hardware_frontier_plans,
             "pool_restarts_by_parent": bool(args.pool_restarts_by_parent),
@@ -551,12 +731,20 @@ def main() -> int:
             "event_calls": sum(run["exact_event_calls"] for run in runs.values()),
             "search_wall_s": sum(run["search_wall_s"] for run in runs.values()),
             "search_breakdown": _sum_search_breakdowns(runs),
+            "control_construction_s": control_construction_s,
+            "restart_pooling_s": float(assembled["restart_pooling_s"]),
+            "parent_pooled_ranking_s": float(assembled["parent_pooled_ranking_s"]),
+            "outside_audit_sampling_s": float(assembled["outside_audit_sampling_s"]),
+            "frontier_construction_s": float(assembled["frontier_construction_s"]),
             "global_shortlist_s": global_shortlist_s,
             "ru_maxrss_kb": _peak_rss_kb(),
         },
     }
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    write_template_lns_model_artifact(
+        args.output,
+        result,
+        command_begin_ns=command_begin,
+    )
     print(json.dumps(result["summary"], sort_keys=True))
     return 0
 

@@ -11,6 +11,7 @@ import json
 import random
 import re
 import sys
+import time
 from collections import Counter, defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -30,6 +31,8 @@ from executable_plan_state import (  # noqa: E402
 
 
 POLICY_NAME = "relation_agnostic_categorical_farthest_first_v1"
+RANKING_FILL_NAME = "incremental_min_distance_v1"
+RANKING_FILL_REFERENCE_NAME = "naive_selected_scan_v1"
 SCHEMA_VERSION = 1
 DEFAULT_SHORTLIST_BUDGET = 16
 DEFAULT_AUDIT_BUDGET = 32
@@ -275,6 +278,7 @@ class LnsCandidateFeature:
         payload = {
             "actual_closure_bin": self.actual_closure_bin,
             "actual_closure_size": self.actual_closure_size,
+            "anchor_domain_assignment_signature": self.anchor_domain_assignment_signature,
             "anchor_state_hash": self.anchor_state_hash,
             "candidate_width_histogram": [list(item) for item in self.candidate_width_histogram],
             "changed_core_begin": self.changed_core_begin,
@@ -328,6 +332,120 @@ class LnsCandidateFeature:
             model_score_quantile=None if quantile is None else int(quantile),
             schema_version=int(payload.get("schema_version", SCHEMA_VERSION)),
         )
+
+
+class AnchorRecoveryError(ValueError):
+    """A frozen feature cannot be bound to its iteration anchor."""
+
+
+def iteration_anchor_from_run(
+    run: Mapping[str, Any],
+    *,
+    iteration_index: int = 0,
+) -> tuple[str, Mapping[str, Any]]:
+    """Return the bound iteration anchor hash and canonical payload.
+
+    Single-iteration LNS uses ``initial_canonical_state``. Later iterations must
+    supply that iteration's actual incumbent; this helper never assumes the
+    initial state once ``iteration_index`` is positive.
+    """
+
+    if iteration_index < 0:
+        raise AnchorRecoveryError("iteration_index must be non-negative")
+    payload: Mapping[str, Any] | None
+    stated: object
+    if iteration_index == 0:
+        payload = run.get("initial_canonical_state")
+        stated = run.get("initial_state_hash")
+    else:
+        iterations = run.get("iterations") or []
+        if iteration_index > len(iterations):
+            raise AnchorRecoveryError(f"iteration {iteration_index} is missing")
+        previous = iterations[iteration_index - 1]
+        accepted = previous.get("accepted_move") if isinstance(previous, Mapping) else None
+        payload = None
+        if isinstance(previous, Mapping):
+            payload = previous.get("accepted_canonical_state") or previous.get("canonical_state")
+        stated = None
+        if isinstance(accepted, Mapping):
+            stated = accepted.get("state_hash")
+        if payload is None:
+            raise AnchorRecoveryError(
+                f"iteration {iteration_index} has no bound canonical incumbent to recover from"
+            )
+    if not isinstance(payload, Mapping) or isinstance(payload, (str, bytes)):
+        raise AnchorRecoveryError("missing iteration canonical state for anchor recovery")
+    restored = state_from_canonical_payload(payload)
+    hashed = restored.canonical_hash()
+    if stated is not None and str(stated) != hashed:
+        raise AnchorRecoveryError(
+            f"stated iteration hash {stated} does not match canonical hash {hashed}"
+        )
+    return hashed, payload
+
+
+def recover_anchor_domain_signature(
+    feature: Mapping[str, Any] | LnsCandidateFeature,
+    *,
+    anchor_canonical_state: Mapping[str, Any],
+    anchor_canonical_hash: str,
+) -> LnsCandidateFeature:
+    """Restore omitted ``anchor_domain_assignment_signature`` from the bound anchor.
+
+    ``anchor_state_hash`` must equal the saved iteration canonical hash. A
+    serialized signature that disagrees with the recovered value is an error.
+    """
+
+    row = feature.to_dict() if isinstance(feature, LnsCandidateFeature) else dict(feature)
+    if "state_hash" not in row or "anchor_state_hash" not in row:
+        raise AnchorRecoveryError("feature is missing state_hash or anchor_state_hash")
+    stored_anchor = str(row["anchor_state_hash"])
+    if stored_anchor != str(anchor_canonical_hash):
+        raise AnchorRecoveryError(
+            f"anchor_state_hash {stored_anchor} does not match iteration canonical hash "
+            f"{anchor_canonical_hash} for {row['state_hash']}"
+        )
+    recovered = domain_assignment_signature(
+        domain_assignment_payload_from_mapping(anchor_canonical_state)
+    )
+    stored_sig = row.get("anchor_domain_assignment_signature")
+    if stored_sig not in (None, "", recovered):
+        raise AnchorRecoveryError(
+            f"serialized anchor_domain_assignment_signature disagrees with recovered "
+            f"value for {row['state_hash']}"
+        )
+    return LnsCandidateFeature.from_dict({**row, "anchor_domain_assignment_signature": recovered})
+
+
+def recover_run_features(
+    run: Mapping[str, Any],
+    *,
+    iteration_index: int = 0,
+) -> tuple[list[LnsCandidateFeature], dict[str, Any]]:
+    """Recover ranking inputs for one start and record provenance."""
+
+    hashed, payload = iteration_anchor_from_run(run, iteration_index=iteration_index)
+    iterations = run.get("iterations") or []
+    if iteration_index >= len(iterations):
+        raise AnchorRecoveryError(f"iteration {iteration_index} is missing")
+    iteration = iterations[iteration_index]
+    rows = iteration.get("candidate_features") or []
+    recovered = [
+        recover_anchor_domain_signature(
+            row,
+            anchor_canonical_state=payload,
+            anchor_canonical_hash=hashed,
+        )
+        for row in rows
+    ]
+    provenance = {
+        "anchor_canonical_hash": hashed,
+        "iteration_index": int(iteration_index),
+        "recovered_fields": ["anchor_domain_assignment_signature"],
+        "recovery_source": "iteration_canonical_state",
+        "row_count": len(recovered),
+    }
+    return recovered, provenance
 
 
 @dataclass(frozen=True)
@@ -551,8 +669,13 @@ def _novelty_key(
     )
 
 
-def rank_lns_diverse_candidates(features: Sequence[LnsCandidateFeature]) -> list[LnsCandidateFeature]:
-    unique = assign_model_score_quantiles(merge_duplicate_features(features))
+def _category_hamming(left: Sequence[Any], right: Sequence[Any]) -> int:
+    return sum(first != second for first, second in zip(left, right, strict=True))
+
+
+def _seed_operator_quantile_coverage(
+    unique: Sequence[LnsCandidateFeature],
+) -> tuple[dict[str, LnsCandidateFeature], list[LnsCandidateFeature]]:
     remaining = {item.state_hash: item for item in unique}
     selected: list[LnsCandidateFeature] = []
 
@@ -575,30 +698,109 @@ def rank_lns_diverse_candidates(features: Sequence[LnsCandidateFeature]) -> list
             continue
         take(min(pool, key=lambda item: _novelty_key(item, selected)))
         represented.add(quantile)
+    return remaining, selected
 
+
+def _farthest_first_fill_reference(
+    unique: Sequence[LnsCandidateFeature],
+) -> list[LnsCandidateFeature]:
+    """Naive selected-set scan. Test reference only; ranking order is the contract."""
+
+    remaining, selected = _seed_operator_quantile_coverage(unique)
     while remaining:
-        take(
-            min(
-                remaining.values(),
-                key=lambda item: (
-                    -min(categorical_distance(item, chosen) for chosen in selected) if selected else 0,
-                    token_reuse(item, selected),
-                    item.state_hash,
-                ),
-            )
+        chosen = min(
+            remaining.values(),
+            key=lambda item: (
+                -min(categorical_distance(item, chosen) for chosen in selected) if selected else 0,
+                token_reuse(item, selected),
+                item.state_hash,
+            ),
         )
+        selected.append(chosen)
+        remaining.pop(chosen.state_hash, None)
     return selected
 
 
-def select_lns_diverse_shortlist(
+def _farthest_first_fill(unique: Sequence[LnsCandidateFeature]) -> list[LnsCandidateFeature]:
+    """Incremental min-distance / token-reuse fill. Exact versus the reference."""
+
+    remaining, selected = _seed_operator_quantile_coverage(unique)
+    if not remaining:
+        return selected
+    categories = {item.state_hash: item.categories() for item in unique}
+    n_dims = len(next(iter(categories.values())))
+    min_dist: dict[str, int] = {}
+    reuse: dict[str, int] = {}
+    selected_tokens = [categories[item.state_hash] for item in selected]
+    for item in remaining.values():
+        tokens = categories[item.state_hash]
+        if selected_tokens:
+            distances = [_category_hamming(tokens, chosen) for chosen in selected_tokens]
+            min_dist[item.state_hash] = min(distances)
+            reuse[item.state_hash] = sum(n_dims - distance for distance in distances)
+        else:
+            min_dist[item.state_hash] = 0
+            reuse[item.state_hash] = 0
+    initialized = bool(selected_tokens)
+    while remaining:
+        chosen = min(
+            remaining.values(),
+            key=lambda item: (
+                -min_dist[item.state_hash],
+                reuse[item.state_hash],
+                item.state_hash,
+            ),
+        )
+        selected.append(chosen)
+        remaining.pop(chosen.state_hash, None)
+        min_dist.pop(chosen.state_hash, None)
+        reuse.pop(chosen.state_hash, None)
+        chosen_tokens = categories[chosen.state_hash]
+        for item in remaining.values():
+            state_hash = item.state_hash
+            distance = _category_hamming(categories[state_hash], chosen_tokens)
+            matches = n_dims - distance
+            if initialized:
+                if distance < min_dist[state_hash]:
+                    min_dist[state_hash] = distance
+                reuse[state_hash] += matches
+            else:
+                min_dist[state_hash] = distance
+                reuse[state_hash] = matches
+        initialized = True
+    return selected
+
+
+def rank_lns_diverse_candidates(
     features: Sequence[LnsCandidateFeature],
     *,
-    shortlist_budget: int = DEFAULT_SHORTLIST_BUDGET,
-    audit_budget: int = DEFAULT_AUDIT_BUDGET,
+    timing: dict[str, float] | None = None,
+    fill: str = RANKING_FILL_NAME,
+) -> list[LnsCandidateFeature]:
+    prepare_begin = time.perf_counter_ns()
+    unique = assign_model_score_quantiles(merge_duplicate_features(features))
+    prepare_s = (time.perf_counter_ns() - prepare_begin) / 1.0e9
+    if fill == RANKING_FILL_REFERENCE_NAME:
+        fill_fn = _farthest_first_fill_reference
+    elif fill == RANKING_FILL_NAME:
+        fill_fn = _farthest_first_fill
+    else:
+        raise ValueError(f"unknown ranking fill: {fill}")
+    fill_begin = time.perf_counter_ns()
+    ranked = fill_fn(unique)
+    fill_s = (time.perf_counter_ns() - fill_begin) / 1.0e9
+    if timing is not None:
+        timing["quantile_dedup_s"] = prepare_s
+        timing["per_start_diverse_ranking_s"] = fill_s
+    return ranked
+
+
+def _shortlist_from_ranked(
+    ranked: Sequence[LnsCandidateFeature],
+    *,
+    shortlist_budget: int,
+    audit_budget: int,
 ) -> LnsDiverseShortlist:
-    if shortlist_budget <= 0 or audit_budget < shortlist_budget:
-        raise ValueError("audit budget must be at least the shortlist budget, and both must be positive")
-    ranked = rank_lns_diverse_candidates(features)
     ranked_keys = tuple(item.state_hash for item in ranked)
     selected_keys = ranked_keys[:shortlist_budget]
     audit_keys = ranked_keys[:audit_budget]
@@ -611,6 +813,24 @@ def select_lns_diverse_shortlist(
         coverage=_coverage(selected_features),
         shortlist_budget=int(shortlist_budget),
         audit_budget=int(audit_budget),
+    )
+
+
+def select_lns_diverse_shortlist(
+    features: Sequence[LnsCandidateFeature],
+    *,
+    shortlist_budget: int = DEFAULT_SHORTLIST_BUDGET,
+    audit_budget: int = DEFAULT_AUDIT_BUDGET,
+    timing: dict[str, float] | None = None,
+    fill: str = RANKING_FILL_NAME,
+) -> LnsDiverseShortlist:
+    if shortlist_budget <= 0 or audit_budget < shortlist_budget:
+        raise ValueError("audit budget must be at least the shortlist budget, and both must be positive")
+    ranked = rank_lns_diverse_candidates(features, timing=timing, fill=fill)
+    return _shortlist_from_ranked(
+        ranked,
+        shortlist_budget=shortlist_budget,
+        audit_budget=audit_budget,
     )
 
 
@@ -691,6 +911,7 @@ def select_lns_parent_pooled_shortlists(
     *,
     shortlist_budget: int = DEFAULT_SHORTLIST_BUDGET,
     audit_budget: int = DEFAULT_AUDIT_BUDGET,
+    fill: str = RANKING_FILL_NAME,
 ) -> dict[str, LnsDiverseShortlist]:
     """Run selector v1 once per unique parent over pooled restart features."""
 
@@ -705,6 +926,7 @@ def select_lns_parent_pooled_shortlists(
             features,
             shortlist_budget=shortlist_budget,
             audit_budget=audit_budget,
+            fill=fill,
         )
         for parent, features in grouped.items()
     }

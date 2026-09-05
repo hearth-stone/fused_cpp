@@ -63,6 +63,14 @@ from lns_diverse_shortlist import (  # noqa: E402
     merge_duplicate_features,
     select_lns_diverse_shortlist,
 )
+
+SHORTLIST_NESTED_TIMER_FIELDS = (
+    "partial_order_evidence_selection_s",
+    "feature_construction_s",
+    "quantile_dedup_s",
+    "per_start_diverse_ranking_s",
+)
+SHORTLIST_TIMER_NESTING = "nested_in_shortlist_s"
 from fused_cpp import _moe_C  # noqa: E402
 from fused_cpp.moe import (  # noqa: E402
     AsyncMoEPlanV2,
@@ -864,11 +872,13 @@ def _run_partial_order_vnd_start(
             )
             break
         shortlist_begin = time.perf_counter_ns()
+        partial_order_begin = time.perf_counter_ns()
         shortlist = select_partial_order_shortlist(
             comparator,
             partial_candidates,
             budget=args.partial_order_shortlist_budget,
         )
+        partial_order_evidence_selection_s = (time.perf_counter_ns() - partial_order_begin) / 1.0e9
         shortlist_payload = shortlist.to_dict()
         diagnostic_only = (
             args.neighborhood_mode == "lns"
@@ -878,7 +888,11 @@ def _run_partial_order_vnd_start(
         diverse_shortlist = None
         candidate_features: list[dict[str, object]] = []
         diagnostic_worse_keys = list(shortlist.dominated_keys) if diagnostic_only else []
+        feature_construction_s = 0.0
+        quantile_dedup_s = 0.0
+        per_start_diverse_ranking_s = 0.0
         if lns_mode:
+            feature_begin = time.perf_counter_ns()
             feature_rows = []
             for state_hash, (strategy, row) in rows_by_hash.items():
                 if state_hash in visited:
@@ -894,17 +908,26 @@ def _run_partial_order_vnd_start(
                         strategy=strategy,
                     )
                 )
+            feature_construction_s = (time.perf_counter_ns() - feature_begin) / 1.0e9
+            ranking_timing: dict[str, float] = {}
             diverse_shortlist = select_lns_diverse_shortlist(
                 feature_rows,
                 shortlist_budget=int(
                     getattr(args, "shortlist_budget", args.partial_order_shortlist_budget)
                 ),
                 audit_budget=int(getattr(args, "audit_budget", DEFAULT_AUDIT_BUDGET)),
+                timing=ranking_timing,
             )
+            quantile_dedup_s = float(ranking_timing.get("quantile_dedup_s", 0.0))
+            per_start_diverse_ranking_s = float(
+                ranking_timing.get("per_start_diverse_ranking_s", 0.0)
+            )
+            export_begin = time.perf_counter_ns()
             candidate_features = [
                 item.to_dict()
                 for item in assign_model_score_quantiles(merge_duplicate_features(feature_rows))
             ]
+            quantile_dedup_s += (time.perf_counter_ns() - export_begin) / 1.0e9
             shortlist_payload["diagnostic_worse_keys"] = diagnostic_worse_keys
             shortlist_payload["dominated_keys"] = []
             shortlist_payload["selected_keys"] = list(diverse_shortlist.selected_keys)
@@ -1025,6 +1048,20 @@ def _run_partial_order_vnd_start(
                 if isinstance(value, (int, float)) and value is not True and value is not False:
                     search_breakdown[key] = search_breakdown.get(key, 0) + value
         search_breakdown["shortlist_s"] = search_breakdown.get("shortlist_s", 0.0) + shortlist_s
+        nested_accounted = (
+            partial_order_evidence_selection_s
+            + feature_construction_s
+            + quantile_dedup_s
+            + per_start_diverse_ranking_s
+        )
+        search_breakdown["shortlist_components"] = {
+            "feature_construction_s": feature_construction_s,
+            "nesting": SHORTLIST_TIMER_NESTING,
+            "partial_order_evidence_selection_s": partial_order_evidence_selection_s,
+            "per_start_diverse_ranking_s": per_start_diverse_ranking_s,
+            "quantile_dedup_s": quantile_dedup_s,
+            "unaccounted_s": shortlist_s - nested_accounted,
+        }
         iterations.append(
             {
                 "iteration": iteration,

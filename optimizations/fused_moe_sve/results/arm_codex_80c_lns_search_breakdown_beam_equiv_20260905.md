@@ -153,11 +153,20 @@ this is not a before/after memory claim.
 | Total |  | 797.013 | 687.545 | −109.47 | 2,322 | 341.43 | 278.77 | 56.31 | 40.56 |
 
 Almost all of the wall reduction is the one-step parent, matching the
-profiler. `shortlist_s` is ~68–72 s on every start and is *not* the
-relation-agnostic selector: the global farthest-first merge is 53 µs.
-`shortlist_s` currently bundles `select_partial_order_shortlist` (still
-computed in diagnostic-only mode) with feature construction and quantile
-assignment. Context evaluation is ~1.5 ms/start.
+profiler. `shortlist_s` is ~68–72 s on every start. It bundles
+`select_partial_order_shortlist` (still computed in diagnostic-only mode),
+feature construction, quantile assignment, and per-start diverse ranking.
+The 53 µs global merge is a separate operation and does not measure that
+ranking work. Context evaluation is ~1.5 ms/start.
+
+Clarification (2026-09-05, historical numbers unchanged): `shortlist_s` is
+not ranking-only. It remains the per-start wall covering partial-order evidence,
+feature construction, quantile/dedup, and per-start diverse ranking.
+`search_wall_s` is still the sum of per-start runs and does not include
+parent-pooled ranking, outside-audit sampling, canonical/PlanV2 frontier
+construction, or the global unique-key merge (`global_shortlist_s`). Those
+later stages are now timed separately in the layer bench; a complete
+model-command elapsed time is recorded through the artifact write.
 
 ## Artifacts
 

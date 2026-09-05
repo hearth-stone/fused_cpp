@@ -348,6 +348,38 @@ def test_width_neighbors_have_expected_split_merge_and_migration_shapes() -> Non
     assert all(neighbor.state.shape == _state().shape for neighbor in migrations)
 
 
+def _sampled_hashes_by_operator(sampled, operators: tuple[str, ...]) -> dict[str, list[str]]:
+    grouped: dict[str, list[str]] = {}
+    cursor = 0
+    for operator in operators:
+        count = int(sampled.sampled_by_operator[operator])
+        grouped[operator] = [
+            neighbor.state.canonical_hash() for neighbor in sampled.neighbors[cursor : cursor + count]
+        ]
+        cursor += count
+    assert cursor == len(sampled.neighbors)
+    return grouped
+
+
+def test_per_operator_sample_is_prefix_of_larger_budget() -> None:
+    state = _state()
+    kwargs = {
+        "allowed_widths": (1, 2, 4),
+        "isolated_cost": _isolated_cost,
+        "window_selector": _windows,
+        "expert_filter": None,
+        "seed": 41,
+    }
+    small = sample_combined_neighborhood(state, per_operator=1, **kwargs)
+    large = sample_combined_neighborhood(state, per_operator=4, **kwargs)
+    operators = (*ORDER_ONLY_OPERATORS, *WIDTH_ONLY_OPERATORS)
+    small_by_operator = _sampled_hashes_by_operator(small, operators)
+    large_by_operator = _sampled_hashes_by_operator(large, operators)
+    for operator in operators:
+        small_keys = small_by_operator[operator]
+        assert large_by_operator[operator][: len(small_keys)] == small_keys
+
+
 def test_width_expert_filter_and_sampling_are_deterministic() -> None:
     state = _state()
     kwargs = {
