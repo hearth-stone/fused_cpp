@@ -54,14 +54,13 @@ first, then refresh calibration and validate the system coherently. In order:
 
 Current Cursor handoff (2026-09-06):
 [`template_lns_cursor_todo.md`](../optimizations/fused_moe_sve/results/template_lns_cursor_todo.md).
-Tasks 2A and 1A are closed; Task 3 is closed for its five-plan/full-parent scope.
-Lab presamplers
+Tasks 2A, 1A, 3, and 6A are closed. Lab presamplers
 `structural_coverage_then_random_v1` and `structural_coverage_closure_width_v1`
-were design-replayed and rejected; keep N=25 shuffle-truncate and injected
-elites. Next is Task 6A: prepare the complete full-parent critical cross-domain
-d4 reference pool (reported 452 unique plans), evidence join, and explicit
-measurement budget. Task 5 stays closed; additional hardware acquisition is
-conditional on its separate budget. Historical records retain their scope.
+were rejected. The full-parent critical cross-domain d4 pool has 452 unique
+members (digest `a10eeba6...`); 11/452 were measured historically. Diagnostic
+budget is 456 unique plans and exceeds the 80 LNS-candidate slots. Task 6B is
+unauthorized; Task 5 stays closed. Keep N=25 shuffle-truncate and injected
+elites. Historical records retain their scope.
 
 Do not start by adding adaptive operator weights. First establish that the
 executable-plan neighborhood is locally useful, repairable, and sufficiently

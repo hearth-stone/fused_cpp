@@ -1881,7 +1881,11 @@ shuffle、把每个非空closure bin的首次代表提前，design replay不改�
 sampled membership，也不接入 `sample_template_lns_neighborhood`。不打开独立硬件
 frontier。后续候选 `structural_coverage_closure_width_v1`（`e5a35b06...`）把coverage
 key扩成`(closure_bin, width_histogram)`，同一回放在seed `20261010` 把已抽中的
-`0418b884...` 挤出N=25，且未恢复任何sampling-lost tracked hash，判定reject。完整记录见
+`0418b884...` 挤出N=25，且未恢复任何sampling-lost tracked hash，判定reject。随后冻结
+full-parent critical cross-domain d4 参考池：全局去重后该operator unique 452
+（digest `a10eeba6...`），四个critical输入集合相同；历史session只测到11/452。
+完整池诊断预算456 unique（去重后），约541 s/场，超出既有80 LNS-candidate槽，
+不改默认N=25/K=16，Task 6B未授权。完整记录见
 `optimizations/fused_moe_sve/results/template_lns_cursor_todo.md`。
 
 **Narrow-team full-cohort correction。** 独立`2x1T concurrent -> 1x2T serial`
@@ -6310,3 +6314,4 @@ partial order、top-K recall 与 false-pruning replay，只有这些门槛通过
 | 2026-09-05 | v1.79 | 冻结selector v1、K=16、2 restart、N=25和exact cap 2,400，将proposal seed从`20261010`换成`20261011`。搜索2,378 event / 2,362 unique / 550.90 s，未生成`0418b884...`；K=16与上一seed只重叠3/64。两场selected-best为`2fd99a11...` / `8deba718...`，相对full `−0.018% / +0.371%`，未过2%，也未快于elite或注入的上一seed winner。`0418b884...`作为`previous_seed_selected`对照在session 1仍是实测最快（`+3.302%` vs full）。这是proposal-seed失败，不改分配、不改selector、不进production。完整记录见`optimizations/fused_moe_sve/results/arm_codex_80c_lns_second_proposal_seed_20260905.md`。 |
 | 2026-09-06 | v1.80 | 在冻结2-restart N=25路径上审计五个实测快plan的丢失阶段，不改sampler、selector、K或production。full parent `98a32da5...` 的 `lns_00_r00`/`lns_00_r01` 枚举表明五者都可达；`0418b884...`/`7cac2afd...`/`1faf090a...` 的seed间丢失是operator内shuffle-truncate，不是预采样缺失；`2ab43572...` 进入scoring后排在parent top32之外。Lab候选 `structural_coverage_then_random_v1`（`275dd663...`）与baseline同shuffle，design replay不恢复sampling-lost hash，不接入生产抽样，不开Task 5硬件。完整记录见`optimizations/fused_moe_sve/results/template_lns_cursor_todo.md`。 |
 | 2026-09-06 | v1.81 | Lab候选 `structural_coverage_closure_width_v1`（`e5a35b06...`）在同一shuffle上按`(closure_bin, width_histogram)`做coverage。冻结模型 `9b334b78...`/`cc53d43d...` 的full-parent回放相对N=25 shuffle-truncate：seed `20261010` 丢掉已抽中的 `0418b884...`，五个tracked hash中没有任何sampling-lost成员被恢复；`(bin,hist)` key覆盖在24/24 operator cell上升。判定reject，不改 `sample_template_lns_neighborhood`、selector、K，不开Task 5。完整记录见`optimizations/fused_moe_sve/results/template_lns_cursor_todo.md`。 |
+| 2026-09-06 | v1.82 | 冻结full-parent critical cross-domain d4 参考池：shipped枚举、全局canonical去重后再滤该operator。四个保存的critical输入hash集合相同，unique 452，digest `a10eeba6...`。`0418b884...`与`2ab43572...`均在池内；加四个reconstructed control后去重为456。历史session只测到11/452。诊断预算约541 s/场、两场约1083 s，超出既有80 LNS-candidate槽，不改N=25/K=16/64+16。Task 6B未授权，Task 5关闭。完整记录见`optimizations/fused_moe_sve/results/template_lns_cursor_todo.md`。 |

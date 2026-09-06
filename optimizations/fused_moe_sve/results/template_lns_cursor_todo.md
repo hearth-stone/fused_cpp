@@ -12,16 +12,16 @@ full-parent audit. Both Task 4 Lab presamplers failed the design adoption gate.
 Keep shuffle-truncate N=25, selector v1 / K16, and preserved hardware elites.
 Keep `incremental_min_distance_v1`; ranking is no longer the main cost.
 
-Next: Task 6A, prepare one finite hardware-reference pool and its budget. Use
-the frozen full-parent critical cross-domain d4 neighborhood (reported unique
-pool size 452, to be verified). Serialize the complete pool, join existing
-measurements by exact identity, and specify a complete-pool measurement protocol.
-This produces a reviewable diagnostic plan; it does not launch new hardware
-sessions or silently expand the existing 64+16 hardware budget.
+Task 6A is closed. The full-parent critical cross-domain d4 pool has 452 unique
+members (digest `a10eeba6...`), identical on all four saved critical inputs.
+Both historical elites are already in that operator pool. Existing sessions
+measured 11/452 members; 441 remain unmeasured. The diagnostic budget is 456
+unique plans after control/elite dedup and is extra measurement, not a change
+to N=25 / K=16 / 64+16. Task 6B stays unauthorized. Task 5 stays closed.
 
 Do not open Task 5 for either rejected presampler. Do not add a third feature
-quota solely to rescue the five known hashes. We now need a less selected set
-of hardware labels to distinguish sparse good plans from shortlist misses.
+quota solely to rescue the five known hashes. Task 6B needs explicit extra
+budget authorization before any complete-pool hardware session.
 
 ## Current checkpoint and evidence
 
@@ -64,16 +64,12 @@ of hardware labels to distinguish sparse good plans from shortlist misses.
   (`equal=true`, zero mismatches), full model and sidecar hashes, and the five
   plans' scored/pooled membership in the original frozen models. Current tests:
   neighborhood + presampler 26 passed; ranking + runner/frontier 45 passed.
-- [ ] Task 6A finite-pool manifest, evidence join, and budget preparation.
+- [x] Task 6A finite-pool manifest, evidence join, and budget preparation.
 - [ ] Task 6B complete-pool hardware diagnostic, only after its separate budget
   is explicitly authorized. Task 5 remains closed.
 
-Source checkpoint: `db95b7e` contains beam optimization and restart comparison.
-At review time, the second-seed work, timing instrumentation, incremental ranking,
-replay helper, reference-plan support, tests, and documentation were uncommitted.
-Inspect
-`git status --short` and preserve them before editing; do not assume a clean
-checkout or overwrite that work.
+Source checkpoint: `061d691` records ranking replay, second seed, and sampling
+audit. Task 6A source is uncommitted on top of that revision.
 
 Read these result reports:
 
@@ -529,41 +525,73 @@ elites; it does not justify changing K or refitting calibration after the fact.
 This is the immediate next task. Preparation does not include launching new
 hardware sessions. Existing N=25, K16, and 64+16 search budgets remain unchanged.
 
-- [ ] Recover/register the Task 2A/3/4 raw outputs named in the completion log,
+- [x] Recover/register the Task 2A/3/4 raw outputs named in the completion log,
   with exact local/remote paths, full SHA256, and executable commands. Preserve
   original bytes; if recovery fails, record the gap and create any replacement
   audit under a new identity rather than reusing its historical digest.
-- [ ] Freeze one pool from full parent `98a32da5...`, the original critical IDs,
+- [x] Freeze one pool from full parent `98a32da5...`, the original critical IDs,
   operator `critical_window_template_repartition_cross_domain_d4_b16`, and the
   same calibrated stage-window policy. Use shipped enumeration and canonical
   global duplicate ownership before filtering to this operator. Do not choose
   candidates by score, relation, known-winner status, or the current shortlist.
-- [ ] Verify the reported 452 unique members and compare pool hash sets across
+- [x] Verify the reported 452 unique members and compare pool hash sets across
   the two saved full-parent critical inputs. Store the actual count/digest;
   do not force the count or insert a missing winner to make the check pass.
-- [ ] Serialize every pool member's full executable state and PlanV2 bridge.
+- [x] Serialize every pool member's full executable state and PlanV2 bridge.
   Require valid geometry, exact canonical hash/bridge round trips, and a sorted
   pool hash list. Record all operator/closure/width/domain/order provenance.
-- [ ] Add all four original controls and both historical elites as reference
+- [x] Add all four original controls and both historical elites as reference
   roles, with canonical deduplication and separate role accounting. Verify
   whether `0418b884...` and `2ab43572...` already belong to the pool.
-- [ ] Join existing median frontier/session artifacts to this pool by full
+- [x] Join existing median frontier/session artifacts to this pool by full
   state hash and protocol identity. Report measured, repeated, and unmeasured
   counts. Keep same-session times/gains distinct; selected historical samples
   cannot estimate the pool's fast-plan density or supply one common oracle.
-- [ ] Correct audit aggregation to use pooled/global final membership when
+- [x] Correct audit aggregation to use pooled/global final membership when
   pooling is enabled. Per-start top16 is an intermediate state; an injected
   elite is a control, not a successful new proposal. Derive stable versus
   single-session-positive labels from measurements, not descriptive strings.
-- [ ] Produce the proposed hardware manifest, exact runner command, number of
+- [x] Produce the proposed hardware manifest, exact runner command, number of
   plans/comparisons, memory estimate, and expected wall time for two sessions.
   Report timing/correctness/setup costs separately and label estimates.
   The initial ceiling is 452 pool members + 4 controls + 2 elite roles before
   dedup (458); the verified manifest determines the actual total.
-- [ ] Explicitly state the total diagnostic budget. Measuring this pool exceeds
+- [x] Explicitly state the total diagnostic budget. Measuring this pool exceeds
   the existing 80 LNS-candidate hardware slots and needs separate authorization;
   it is not a change to the default search budget. Keep original inputs, v8,
   selector v1, operator definitions, and production runtime unchanged.
+
+Verified pool (command
+`build_lns_reference_pool.py --model-20261010 <9b334b78...> --model-20261011
+<cc53d43d...>`): unique count **452** (matches the reported figure), sorted-hash
+SHA256 `a10eeba6a4c0dd20ac973ea36bd1591f963be681db95b730244a17d2ebc0fbb0`. All
+four saved full-parent critical inputs (`20261010`/`20261011` × `lns_00_r00`/
+`lns_00_r01`) produced the same hash set. `0418b884...` and `2ab43572...` are
+both operator-pool members. Four reconstructed controls plus those two elites
+dedup to **456** unique plans (ceiling 458). Scratch artifacts:
+`task6a_pool.json` `b5750cab...` (full states, keep out of source),
+`task6a_join.json` `c7bd36e2...`, `task6a_budget.json` `bfb3e4a6...`.
+Identity digest is `sha256(json(sorted(unique hashes)))` = `a10eeba6...`; emission
+order is stored separately as `emission_order_hashes`.
+
+Join: 11/452 pool members appear in any historical median session; 441 are
+unmeasured. That 11-set is not a density oracle. Measurement labels versus
+reconstructed full use session absolute medians, not report prose. Pooled
+selected keys (64) are the final shortlist membership; per-start top16 is
+intermediate. `2ab43572...` is a control, not a proposal; `0418b884...` is both
+a pool member and the seed-`20261010` pooled selected plan.
+
+Diagnostic budget (estimates, scaled linearly from two-restart session 1:
+85 plans, 100.892 s): **456** timed plans, ~541 s/session, ~1083 s for two
+sessions, 36×456 timed calls/session, 4 weight copies. This exceeds the
+existing 80 LNS-candidate hardware slots and is not a default-search change.
+Task 6B is not authorized by completing 6A.
+
+Task 2A/3/4 raw JSON recovery: previous local scratch directories were gone.
+Only truncated completion-log prefixes remain (`71db5c5f`, `6a43c046`,
+`72aff4ec`, `3fa830fe`, `4fe4dd55`, `32bf1d54`, `f2d095cf`, `be793c46`,
+`fa2a6846`). Any replacement audit must use a new identity and must not reuse
+those prefixes as if full SHA256s were recovered.
 
 Done when: the complete candidate manifest, evidence join, scope, protocol, and
 cost estimate are concrete and reviewable. Retain the rejected policy records;
@@ -610,7 +638,7 @@ the files changed:
 
 ```bash
 PYTHONPATH=.:src .venv/bin/python -m pytest -q tests/test_moe_lns_diverse_shortlist.py
-PYTHONPATH=.:src .venv/bin/python -m pytest -q tests/test_moe_executable_plan_neighborhood.py tests/test_moe_lns_structural_presample.py
+PYTHONPATH=.:src .venv/bin/python -m pytest -q tests/test_moe_executable_plan_neighborhood.py tests/test_moe_lns_structural_presample.py tests/test_moe_lns_reference_pool.py
 PYTHONPATH=.:src .venv/bin/python -m pytest -q tests/test_moe_partial_order_vnd_runner.py tests/test_moe_partial_order_hardware_frontier.py
 ```
 
@@ -677,6 +705,7 @@ previous selected plan is `previous_seed_selected.json` and the older elite is
 | 2026-09-06 | 4 | Specified; not adopted | Lab policy `structural_coverage_then_random_v1` SHA256 `275dd663...`. Same shuffle as baseline; coverage is first representative of each nonempty `CLOSURE_BINS` bin. Design replay tracked-hash retention unchanged vs N=25 shuffle-truncate; rare-bin coverage improved on a few operators; sampling-lost tracked plans are later members of already-covered bins. Not wired into `sample_template_lns_neighborhood`. | Do not open Task 5 on this candidate. |
 | 2026-09-06 | 4 | Width iteration rejected | `structural_coverage_closure_width_v1` SHA256 `e5a35b06...`. Locked `(closure_bin, width_histogram)` coverage on the same shuffle as baseline. Replay on frozen `9b334b78...` / `cc53d43d...` full-parent starts: prefix-stable baseline; v2 dropped `0418b884...` on seed `20261010` (idx 19, hist `[[4,8],[8,4],[16,1]]`) and recovered no sampling-lost tracked hash. Coverage keys increased on 24/24 operator cells. Artifact `task4_feature_replay.json` `f2d095cf...`. Tests: neighborhood+presample 26 passed; ranking 25 passed. Keep N=25 shuffle-truncate. | Task 5 stays closed. |
 | 2026-09-06 | Post-Task-4 review | Verified with scoped caveats | Read and SHA-verified both fresh Arm models, compare JSONs (zero mismatches), and sidecars (622.820/618.783 s); checked five-plan scored/pooled membership in the original models and both presampler policy hashes. `PYTHONPATH=.:src .venv/bin/python -m pytest -q tests/test_moe_lns_structural_presample.py tests/test_moe_executable_plan_neighborhood.py` -> 26 passed in 0.12 s; the same command with `tests/test_moe_lns_diverse_shortlist.py tests/test_moe_partial_order_vnd_runner.py tests/test_moe_partial_order_hardware_frontier.py` -> 45 passed in 0.26 s. | Task 3/4 raw locations/full digests still need registration. No new hardware measurements in this review. Next: Task 6A preparation; Task 6B requires its explicit extra budget, Task 5 remains closed. |
+| 2026-09-06 | 6A | Done | Shipped `enumerate_template_lns_neighbors` + global unique-then-operator-filter on frozen full parent `98a32da5...`, operator cross-domain d4. Unique count 452 (digest `a10eeba6...`); four critical inputs identical. Elites `0418b884...` and `2ab43572...` are in-pool. Deduped unique plans 456. Join: 11 measured / 441 unmeasured across historical sessions. Budget estimate 541 s/session, 1083 s two-session, exceeds 80 LNS slots. Command: `build_lns_reference_pool.py`. Scratch `task6a_pool.json` `b5750cab...`, `task6a_join.json` `c7bd36e2...`, `task6a_budget.json` `bfb3e4a6...`. Tests: neighborhood+presample+shortlist+pool 56 passed. Sorted identity digest `a10eeba6...` (emission order kept separately). Task 2A/3/4 raw JSON unrecovered (truncated prefixes only). | Task 6B unauthorized; Task 5 closed. |
 
 For each completed task, add the source revision, artifact hashes, exact commands,
 test results, measured baseline/candidate values where relevant, and the next
