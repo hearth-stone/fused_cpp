@@ -57,14 +57,25 @@ B_s=2K_sN_s,\qquad
 b_s=2K_s\nu.
 $$
 
-令每线程窗口为 $w_s$ 个 tile，则
+N domain 先按 worker 划分：worker $j$ 独占一条连续 stripe
+
+$$
+\sigma_s(j)=\left\lfloor\frac{q_s}{t}\right\rfloor+\mathbb 1\!\left[j<q_s\bmod t\right],
+$$
+
+即前 $q_s\bmod t$ 个 worker 各多一个 tile（与 native `split_evenly` 一致），窗口在各自
+stripe 内部切分（thread-major）。令每线程窗口为 $w_s$ 个 tile，则
 
 $$
 g_s=t w_s,\qquad
-R_s=\left\lceil\frac{q_s}{g_s}\right\rceil,
+R_s=\left\lceil\frac{\max_j\sigma_s(j)}{w_s}\right\rceil
+=\left\lceil\frac{\lceil q_s/t\rceil}{w_s}\right\rceil
+=\left\lceil\frac{q_s}{g_s}\right\rceil,
 $$
 
-且 $w_s=\lceil q_s/t\rceil$ 即 full-stripe、$R_s=1$ 端点。
+最后一步是取整恒等式，故 pass 数与团队每 pass 消耗的 $g_s$ 个 tile 都与旧的
+window-major 映射相同；不同的只是 worker 所属的列。$w_s=\lceil q_s/t\rceil$ 即
+full-stripe、$R_s=1$ 端点。
 
 $B_s$ 是该 expert 的完整 packed-B stage 字节数；$w_sb_s$ 是最忙 worker 在一个
 window 内的 tile-aligned owner footprint。当前 fused expert 中：
@@ -9380,5 +9391,6 @@ Context residual opening (2026-09-05): 独立 Lab candidate 增加冻结 v8 even
 | 2026-09-20 | v1.113 | 候选 v12/v13：P7 测得背景 lane 宽度对争用的影响（2T 背景最重、16T 最轻）并作为超额因子；P8 在真实背景下检验组合，定位 2T 低估 18--49% 的两项成因，v13 令 2T lane 在所有 phase 计为装载，复现 P8 的 2T 格（中位 0.978）。E2 上 2T 计划 1.237→1.144、含 2T 的 regret 中位 6.07%→0。验收在 E5（新层）。 |
 | 2026-09-20 | v1.114 | E5 验收：v13 未过 W1/W2/W3（2T 计划实测/预测 1.281、regret 中位 11.95% 对 v11 的 4.45%、符号一致 0/18），按冻结规则保留 v11 为参照模型、2T 仍在搜索空间外。E5 第三次独立确认：$\ge$4T 搜索较生产 quick 快 9.97%、快速 planner 快 8.01%（均 18/18），两者与实测最优差 0.05% 与 3.03%。 |
 | 2026-09-20 | v1.115 | 标定域约束：模型给出 `calibrated_widths`(2--32T) 与 `reliable_widths`(扣除 2T)，tail-pool 候选与 LNS 默认宽度按可信集过滤。依据 E8：1T 池化任务实测为预测的 3.25--4.25 倍，使 tail-pool 计划慢 1.0--1.3 ms 而打分认为快 0.7--3.3%。新增路由切片移动(默认关闭)：54 个层上最热 expert/工作量下界比值中位 0.38、最大 0.44，切片无收益。 |
+| 2026-09-20 | v1.116 | Stage window 映射改为 thread-major：N domain 先按 worker 切连续 stripe（§1.1 的 $\sigma_s(j)$），窗口在 stripe 内部切分。取整恒等式给出 $R_s$、每 pass 的 $g_s$、每 worker 单窗口 footprint 与 A 扫描次数均不变，改变的只是列归属；C++ 与 `full_stage_geometry.py` 同步。证据：原型网格（加载 44 格中位 −0.033%、29 负；小 M 33 格中位 −0.574%、27 负；checksum 全等）与 E9 整计划 A/B（同一 checkout 的两个构建，6 个真实层 × 11 计划 = 66 点，A B B A 四 session）：中位 −0.027%、符号 37/66、p10/p90 −0.245%/+0.291%，构建内 session 差中位 0.261%；每层 Spearman 0.82--0.99、最快计划均未变；两构建 66 个计划输出 sha256 全等。V3 窗口表与 v11 window 项仍是在旧顺序下标定的，其逐 (M, width) 最优尚未重测。报告：`optimizations/fused_moe_sve/results/window_order_thread_major_20260920.md`。 |
 
 Change record (2026-09-14, Lab): implemented predeclared matched block history/pressure interpolation and training-only extraction; zero/pooled-history controls, bounded domain, signed-delta and conditional-pressure limitations recorded. No active planner or production equation replacement.
