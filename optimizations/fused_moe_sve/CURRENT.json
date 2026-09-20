@@ -3,8 +3,8 @@
   "objective": "论文用单一融合 cost model(解析事件骨架+联合运行模型的需求/响应机理,系数仅作有界残差)；按 window/计划选择 regret 验收；quick 为产品,full/LNS 为参照",
   "phase": "ready",
   "active_run": null,
-  "updated_at": "2026-09-20T10:57:06.598559+00:00",
-  "current_work": "E8 完成：tail-pool 打分错误定位为 1T 超出标定域(池化任务实测 3.25-4.25x)，已按可信宽度修正；路由切片按工作量下界证明在这些层上无价值",
+  "updated_at": "2026-09-20T12:44:32.868110+00:00",
+  "current_work": "窗口遍历顺序改为 thread-major(先按线程切 N 条带，再在条带内切窗口)，Python/C++ 同步，原型对比 44 个加载单元中位 -0.03%(小 M 中位 -0.57%，29/33 为负)、校验和一致；n_tile 改为从构建读取(新绑定 fused_moe_bf16_tiled_backend_n_tile)，测试不再钉死 8。隔离构建树验证：209 通过，剩余 6 个 test_r1_matches_the_legacy_n_split_ranges[3|6|12] 在改动前 kernel 上同样失败(legacy N 切分按 8 对齐、窗口计划按构建的 16 对齐，仅非 2 的幂宽度受影响)。已提交 cefc48f(thread-major)、8b7031c(n_tile 自动化)。遗留：V3 窗口表在旧顺序下标定，尚未重测。",
   "baseline": {
     "model": "tmp/joint_cost_model_20260911/dynamic_resource_candidate/simulate.py",
     "policy": "联合运行模型不再作为独立基线推进；其结构与留出验证过的结论移交 v10，queue/块历史/W13→W2 迁移留作 future work"
