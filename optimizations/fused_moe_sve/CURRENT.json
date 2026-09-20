@@ -3,8 +3,8 @@
   "objective": "论文用单一融合 cost model(解析事件骨架+联合运行模型的需求/响应机理,系数仅作有界残差)；按 window/计划选择 regret 验收；quick 为产品,full/LNS 为参照",
   "phase": "ready",
   "active_run": null,
-  "updated_at": "2026-09-20T14:05:48.598625+00:00",
-  "current_work": "E9 完成：thread-major 窗口顺序在整计划上与旧顺序等价。远端已按最小 patch 落地(4 个文件，备份与控制构建在 tmp/window_mapping_20260920/minimal_patch)，测试 255 通过、仅剩 6 个既有 legacy N 切分对齐失败。下一步待定：V3 窗口表在新顺序下的逐 (M,width) 重测；native fast planner；2T 机理。",
+  "updated_at": "2026-09-20T16:07:15.946774+00:00",
+  "current_work": "窗口表筛查完成：R1 触发(2 格，均在 M=12：t=8 的 one vs four 差 1.23%、t=16 的 two vs full 差 1.03%)，R2 0 格(最大 |Δr|=0.018)、R3 0.288% 未触发(老构建自身 session 差中位 0.246%)。按冻结规则结论为重建窗口表；M=12 属 V3 的 routes≤16 全条带带，整计划层面 E9 已测无差异。证据：tmp/window_table_order_screen_20260920/decision.md。等用户决定是否跑 45-60 min 的重建链。 | E10(跨 NUMA 干扰)：其他 node 上的计算型负载对 node3 测量无可测影响(+0.01%/+0.24%)；DRAM 流式负载单 node +0.8%(node2 同 socket)/+1.8%(node1 跨 socket)、三个 node 同时 +13.1%；node3 核频率全程 2900 MHz，排除降频。证据：tmp/numa_interference_20260920/decision.md。",
   "baseline": {
     "model": "tmp/joint_cost_model_20260911/dynamic_resource_candidate/simulate.py",
     "policy": "联合运行模型不再作为独立基线推进；其结构与留出验证过的结论移交 v10，queue/块历史/W13→W2 迁移留作 future work"
