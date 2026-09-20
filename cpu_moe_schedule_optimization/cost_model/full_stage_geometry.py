@@ -105,7 +105,9 @@ class StageWindowPlan:
         stripe_begin, stripe_tiles = self.thread_stripe(local_tid)
         begin = stripe_begin + window_index * self.window_tiles
         remaining = stripe_begin + stripe_tiles - begin
-        return ThreadWindowRange(begin_tile=begin, tiles=max(0, min(self.window_tiles, remaining)))
+        if remaining <= 0:  # past the end of this worker's stripe; the native plan reports (0, 0)
+            return ThreadWindowRange(begin_tile=0, tiles=0)
+        return ThreadWindowRange(begin_tile=begin, tiles=min(self.window_tiles, remaining))
 
     def idle_threads(self, window_index: int) -> int:
         """Workers that receive no tiles in this window."""

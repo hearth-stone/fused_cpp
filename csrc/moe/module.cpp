@@ -14,6 +14,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("fused_moe_bf16_tiled_available_backends", &fused_cpp::moe::available_backend_names,
         "Return the BF16 fused MoE backends supported by this build and CPU.");
 
+  // The packed-B N tile is a build constant (SVE: vector bytes / 2, so the fixed vector length
+  // picked at compile time decides it). Callers that need it without packing weights - tests and
+  // geometry checks above all - read it here instead of hard-coding a value for one vector length.
+  m.def(
+      "fused_moe_bf16_tiled_backend_n_tile",
+      [](const std::string& backend, bool fuse_silu) {
+        return static_cast<int64_t>(fused_cpp::moe::resolve_backend(backend, fuse_silu).n_tile());
+      },
+      "Return the packed-B N tile of a backend in this build.", py::arg("backend") = std::string("auto"),
+      py::arg("fuse_silu") = true);
+
   m.def("deepseek_v4_inv_rope_woa_available", &deepseek_v4_inv_rope_woa_available,
         "Return whether the SVE BF16 inverse-RoPE grouped WO_A kernel is available.");
   m.def("deepseek_v4_inv_rope_woa_prepare", &deepseek_v4_inv_rope_woa_prepare,

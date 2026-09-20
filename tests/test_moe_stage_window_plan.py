@@ -31,7 +31,20 @@ pytestmark = pytest.mark.skipif(
 
 # TP4 production stages: w13 is [2F, H] with K=H, N=2F; w2 is [H, F] with K=F, N=H.
 _STAGES = {"w13": (4096, 1024), "w2": (512, 4096)}
-_N_TILE = 8
+
+
+def _build_n_tile() -> int:
+    """The packed-B N tile this build compiled, not a constant for one vector length.
+
+    On SVE it is vector_bytes / 2, so an SVE-128 build tiles by 8 and an SVE-256 build by 16;
+    hard-coding either makes every geometry test fail on the other build.
+    """
+    from fused_cpp import _moe_C
+
+    return int(_moe_C.fused_moe_bf16_tiled_backend_n_tile())
+
+
+_N_TILE = _build_n_tile() if _HAS_BF16_TILED_FUSED_MOE else 8
 _WIDTHS = [1, 2, 3, 4, 6, 8, 12, 16, 32]
 
 
@@ -121,25 +134,32 @@ def test_windows_tile_the_stage_for_every_legal_window(stage, threads):
 
 
 def test_uneven_width_keeps_every_worker_on_one_contiguous_stripe():
-    """t=6, omega=7 over 128 tiles: stripes 22/22/21/21/21/21, windows inside each stripe.
+    """Ownership first: each worker walks windows inside its own contiguous stripe.
 
-    Ownership comes first, so a worker's windows are consecutive tiles of its own stripe and
-    only the workers with the shorter stripe run out of work in the last pass.
+    The stripes differ by at most one tile, so only the workers with the shorter stripe can run
+    out of work, and only in the last pass. Expectations are derived from the build's tile count
+    rather than written for one vector length.
     """
+    threads, window_tiles = 6, 7
     n = _STAGES["w13"][1]
-    windows, range_tiles, _, ranges = _stage_window_plan(n, _N_TILE, 6, 7)
-    assert (windows, range_tiles) == (4, 42)
+    total_tiles = n // _N_TILE
+    windows, range_tiles, _, ranges = _stage_window_plan(n, _N_TILE, threads, window_tiles)
+    share, extra = divmod(total_tiles, threads)
+    expected_sizes = [share + 1 if tid < extra else share for tid in range(threads)]
+    assert range_tiles == threads * window_tiles
+    assert windows == -(-max(expected_sizes) // window_tiles)
     per_thread = [[(begin // _N_TILE, cols // _N_TILE) for (begin, cols) in (window[tid] for window in ranges)
-                   if cols > 0] for tid in range(6)]
-    sizes = [sum(tiles for _, tiles in thread) for thread in per_thread]
-    assert sizes == [22, 22, 21, 21, 21, 21]
-    for thread in per_thread:  # contiguous inside the stripe, in order
-        cursor = thread[0][0]
+                   if cols > 0] for tid in range(threads)]
+    assert [sum(tiles for _, tiles in thread) for thread in per_thread] == expected_sizes
+    cursor = 0
+    for thread, size in zip(per_thread, expected_sizes):  # contiguous stripes, laid out in order
+        assert thread[0][0] == cursor
         for begin, tiles in thread:
             assert begin == cursor
             cursor += tiles
+    assert cursor == total_tiles
     idle = sum(1 for (_, cols) in ranges[-1] if cols == 0)
-    assert idle == 4  # the four 21-tile stripes are done after three windows
+    assert idle == sum(1 for size in expected_sizes if -(-size // window_tiles) < windows)
 
 
 def test_stage_window_plan_rejects_illegal_geometry():
@@ -162,7 +182,7 @@ def _team_w13_packc_window(a, w13, group_size, window_tiles, use_sve, degree=5, 
 
 @pytest.mark.parametrize("use_sve", [True, False])
 @pytest.mark.parametrize("group_size", [1, 2, 4, 8])
-@pytest.mark.parametrize("rows", [1, 7, 12, 13, 28, 72, 120])
+@pytest.mark.parametrize("rows", [12, 24, 72, 120])
 def test_windowed_w13_is_bitwise_identical_to_the_full_stripe(rows, group_size, use_sve):
     """Every legal window must produce the same bytes as the R=1 full stripe.
 
@@ -170,6 +190,13 @@ def test_windowed_w13_is_bitwise_identical_to_the_full_stripe(rows, group_size, 
     once and each worker writes disjoint output columns, and the fused W13 has no
     K blocking so nothing accumulates across windows. So this is exact equality,
     not a tolerance comparison.
+
+    Row counts here fill whole panels, so the packed-C buffer has no padding rows. A
+    row count that leaves padding writes those rows out of the kernel's per-thread
+    partial-C scratch, which still holds whatever the previous call left there, so the
+    padding changes whenever the traversal hands a column to another worker. That is
+    outside the buffer's contract; those row counts are checked on the consumer path
+    by `test_windowed_plan_v2_output_is_bitwise_identical_to_the_full_stripe`.
     """
     import torch
 
@@ -181,11 +208,53 @@ def test_windowed_w13_is_bitwise_identical_to_the_full_stripe(rows, group_size, 
     reference = _team_w13_packc_window(a, w13, group_size, 0, use_sve)
     total_tiles = (2 * f) // _N_TILE
     full = -(-total_tiles // group_size)
+    # The packed-C buffer is padded to whole row blocks (12 + 8 rows), and the padding is never
+    # written or read; whatever is left there depends on the traversal, so compare the rows the
+    # W2 stage consumes. The operator-level equality is covered by the Plan V2 tests.
+    live = rows * f
     for window_tiles in range(1, full + 1):
         got = _team_w13_packc_window(a, w13, group_size, window_tiles, use_sve)
-        assert torch.equal(got, reference), (
+        assert torch.equal(got[:live], reference[:live]), (
             f"rows={rows} t={group_size} sve={use_sve} omega={window_tiles} differs from the full stripe"
         )
+
+
+@pytest.mark.parametrize("rows", [1, 7, 13, 14, 28])
+def test_windowed_plan_v2_output_is_bitwise_identical_to_the_full_stripe(rows):
+    """The operator output must not depend on the windows, including padded row counts."""
+    import torch
+
+    from fused_cpp.moe import AsyncMoEPlanV2, fused_moe_bf16_tiled_async_plan, prepare_fused_moe_bf16_tiled_weights
+
+    hidden_size, intermediate, experts, threads = 256, 128, 4, 4
+    torch.manual_seed(rows)
+    w13 = torch.randn(experts, 2 * intermediate, hidden_size, dtype=torch.bfloat16) * 0.05
+    w2 = torch.randn(experts, hidden_size, intermediate, dtype=torch.bfloat16) * 0.05
+    packed = prepare_fused_moe_bf16_tiled_weights(w13, w2, fuse_silu=True, backend="arm_sve_bf16")
+    ids = torch.arange(experts, dtype=torch.int32).repeat_interleave(rows).reshape(-1, 1)
+    tokens = torch.randn(ids.shape[0], hidden_size, dtype=torch.bfloat16) * 0.05
+    weights = torch.ones(ids.shape[0], 1)
+
+    def run(window_tiles):
+        count = experts
+        plan = AsyncMoEPlanV2.from_dict({
+            "plan_version": 2, "execution_mode": "strict", "num_threads": threads,
+            "thread_cpu_ids": list(range(threads)), "task_expert_ids": list(range(count)),
+            "task_core_begins": [0] * count, "task_threads": [threads] * count,
+            "task_dep_offsets": [0] + list(range(count)), "task_deps": list(range(count - 1)),
+            "task_preferred_threads": [threads] * count, "task_min_threads": [threads] * count,
+            "task_max_threads": [threads] * count, "task_allowed_thread_offsets": list(range(count + 1)),
+            "task_allowed_threads": [threads] * count, "task_placement_modes": [0] * count,
+            "task_numa_nodes": [-1] * count, "task_stage_ids": [0] * count, "task_resize_points": [0] * count,
+            "task_range_granularities": [0] * count, "task_w13_window_tiles": [window_tiles] * count,
+            "task_w2_window_tiles": [window_tiles] * count, "early_merge": False,
+        })
+        return fused_moe_bf16_tiled_async_plan(tokens, packed, weights, ids, plan, global_num_experts=experts,
+                                               out=torch.empty_like(tokens)).clone()
+
+    reference = run(0)
+    for window_tiles in (1, 2):
+        assert torch.equal(run(window_tiles), reference), f"rows={rows} omega={window_tiles}"
 
 
 @pytest.mark.parametrize("use_sve", [True, False])
