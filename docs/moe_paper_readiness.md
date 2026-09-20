@@ -1,11 +1,121 @@
 # CPU MoE Paper Readiness And Evidence Map
 
-Status date: 2026-09-01.
+Status date: 2026-09-19 (evidence tables below are dated individually; the
+2026-09-01 entries are unchanged unless marked).
 
 This document is the paper-facing index for the CPU MoE work in this
 repository. It does not replace the mathematical, schema, implementation, or
 experiment sources of truth. Its purpose is to keep the proposed paper claims,
 current implementation, admissible evidence, and remaining gates aligned.
+
+## Status Refresh (2026-09-19)
+
+Work between 2026-09-01 and 2026-09-19 was almost entirely cost-model mechanism
+diagnosis and offline planner search on Arm-codex NUMA3 80C. The
+paper-critical items that do not depend on the cost model (upstream baseline,
+multi-layer vLLM, model quality, second machine, artifact freeze, paper text)
+have no new evidence. What changed:
+
+- **Allocator methodology.** Plan V2 calls without a resident route workspace
+  paid 15--35% page-fault and zeroing cost per call under glibc with THP
+  `always`. Arm-codex runs now preload jemalloc with purging disabled
+  (`docs/agent_benchmark_hygiene.md`, Allocator State). Every Arm 80C headline
+  number collected through the public call path before 2026-09-19 is glibc-era
+  and must be rerun before it enters a paper table. Measurements that used
+  `FixedRouteWorkspace` or native probes are not affected
+  (`tmp/dram_write_20260919/decision.md`).
+- **Analytical calibration v9 (candidate).** The contaminated v8 layers were
+  refit under jemalloc; gate-layer holdout measured/predicted median moved from
+  0.898 (v8) to 0.984 (v9). No consumer has been switched to v9.
+- **Window table V3 (candidate, not registered).** Under jemalloc the W2
+  large-M window penalty disappeared and the table structure changed.
+- **Located model errors.** On 48 unseen full-stripe whole plans v9 has
+  measured/predicted 0.97--0.99 but 3.6--8.6% regret on one layer; the error is
+  concentrated in plans that pin a hot expert on a wide lane next to narrow
+  lanes (0.79--0.94). Two terms are responsible: the multiplicative width
+  dilation overstates one large-M task on 32T by 24--28%, and the DRAM term
+  overstates concurrent narrow-lane demand about 6x against DDRC counters.
+  Lane-level traces show the true concurrent narrow-lane slowdown is small and
+  flat (about 1.05--1.10 for 12--20 lanes, with or without a 32T neighbor) where
+  v9 predicts a DRAM saturation cliff (1.015 at 12 lanes, 1.43 at 20).
+- **Offline search.** Executable VND/LNS with hardware-consensus selection is
+  implemented. Under the resident-workspace baseline most historical
+  order/transfer winners no longer pass the >2% both-session gate; greedy
+  insertion and the high-skew LNS elites retain 2--4% gains.
+
+- **v10 and its validation (2026-09-20).** The fused model was rebuilt as a
+  probe-calibrated model: four directly measured service curves over
+  weight-loading and steady phases, composed without free parameters; nothing is
+  fitted on plan timings (`MATHEMATICAL_MODEL.md` v1.107). On 18 unseen-layer
+  workloads with frozen predictions: measured/predicted 1.05--1.08 in every plan
+  family (gate passed); selection regret@1 median 0%, maximum 5.003%, 17/18
+  workloads within 5% (gate missed on one workload by 0.003 points), regret@2 at
+  most 3.4%; v9 event reaches 10.4% and the frozen quick cost 15.1%. The same task
+  in different plans: slowdown error halves against a no-contention model for
+  large-M tasks, but small-M tasks under load are under-predicted by up to 0.4.
+  The V3 window table passed out of sample (32 unseen-M cells, regret at most
+  3.65%); the window choice is nearly background-independent but its gain ranges
+  from 2% to 21% with load. Supported claim: the model prunes to a two-plan
+  shortlist and a measured tuner resolves it; the contention layer is a measured
+  service table, not a single hardware mechanism (that test failed).
+
+The planning consequence is recorded in
+`cpu_moe_schedule_optimization/TODO.md` ("Cost model and planner plan
+(2026-09-19)").
+
+## Status Refresh (2026-09-20): v11 and the searched-plan effect
+
+User decision of 2026-09-20: wire the model into the planner code, see the effect, fix the
+model or the search where they fall short, reach a near-optimal search, and build a fast
+planner from its features. What this produced, all measured on Arm-codex NUMA3 80C under
+jemalloc with the frozen W-group protocol:
+
+- The v10 model is a planner cost model in the repository
+  (`cost_model/probe_event_model.py`, opt-in), with a model-objective LNS
+  (`planners/model_lns.py`) whose multi-start descent reaches the exact optimum on all 36
+  reduced instances that can be solved exactly.
+- Searching under v10 exposed model error rather than plans: its plans measured 1.18-1.33
+  against prediction where anchors measured 1.09-1.11 (E1). A traced per-task diagnosis
+  located the error in loaded mid-M tasks on narrow lanes, and probes P6 produced v11
+  (measured isolated correction, M-indexed steady curves, loading equivalence of mid-M
+  background phases; no fit on plan timings).
+- E2, 18 fresh layers, one measurement: the v11 search with lanes >= 4T is the fastest of
+  eight plans on 17/18 workloads, **13.2% faster than production quick** (median; -14.9% to
+  -5.5%) and 10.2% faster than the best fixed construction. v11 ranks the 2T-free plans with
+  regret@1 median 0% and max 7.9% (v10: 3.4% / 14.8%).
+- 2T lanes remain an unexplained model defect (measured / predicted 1.24, sign agreement
+  0/18) and are excluded from the search space; the paper states this limitation.
+- E3, 18 further fresh layers, one measurement: the reference search (v11 LNS, lanes >= 4T,
+  90 s) is **12.9% faster than production quick** (median; -15.0% to -7.6%) and the measured
+  best plan on 17/18 workloads; **10 s of search is within 0.61%** of it. A fast planner built
+  from three features of the searched plans (wide lanes for hot experts plus 4T bulk,
+  per-width load scale, hot-first-then-ascending lane order;
+  `planners/hot_wide_planner.py`, 30 ms warm in Python) is **9.6% faster than production
+  quick on 18/18 workloads** and 3.8% behind the reference. Measured / predicted is 1.09-1.10
+  for all three, so that 3.8% is search depth, not model error; it comes from event-level
+  phase overlap between lanes that no cheap rule reproduced (template event scoring 0.6
+  points at 272 ms, order patterns 0.8 points at 98 ms, load rebalancing nothing).
+  [Record](../tmp/fast_planner_20260920/decision.md).
+
+Adoption and the 2T follow-up (2026-09-20): the window table, the fast planner and the event
+model are wired into the production runtime and verified on the machine (the runtime reproduces
+the measured plans on 18/18 workloads and plans a layer in 6.6 ms against 10.4 ms for the
+planner it replaces); against the pre-adoption default the fast planner runs 12.75% faster and
+the offline search 14.90% faster (E4). The 2T defect was chased to a measured mechanism
+(narrower background lanes contend more; a 2T lane's steady phases load like a loading phase)
+that reproduces the probe cells but still fails on whole plans (E5), so v11 stays the reference
+model and 2T lanes stay out of the search space, now with a named and measured limitation.
+
+Together, contribution 2 (cost model) and contribution 3 (planner) now have a measured chain
+on 54 layers that were never used to build either: the model ranks 2T-free plans with
+regret@1 median 0% (max 7.9%), the search built on it beats the deployed planner by 12.9%,
+and the fast planner distilled from its output keeps 9.6% of that at 30 ms of planning.
+
+Records: [v10 integration and E1](../tmp/v10_integration_20260920/decision.md),
+[P6 and v11](../tmp/v11_probes_20260920/decision.md),
+[E2](../tmp/v11_validation_20260920/decision.md). The non-model paper gaps (upstream
+baseline, multi-layer vLLM, model quality, second machine, artifact freeze, paper text) still
+have no new evidence.
 
 ## Proposed Paper Thesis
 
@@ -28,6 +138,34 @@ The three contributions should be stated narrowly:
 3. **Executable planner.** A route-histogram planner that emits Plan V2
    core-interval DAGs, with a bounded online homogeneous search and a broader
    offline mixed-width/contention-aware search.
+
+Positioning of contributions 2 and 3 (agreed 2026-09-19):
+
+- The paper presents one fused cost model. The analytical event model is the
+  skeleton; the joint run model of 2026-09-11 contributes the memory-request
+  demand layer (conserved per-stage budgets calibrated against DDRC bytes) and
+  the shared versus same-LLC-domain contention response. Width-indexed dilation
+  coefficients remain only as a bounded, reported residual. The argument for
+  mechanism over coefficients is that the same task slows down differently in
+  different plans, which a per-width coefficient cannot express; the evaluation
+  carries a four-step ablation (no contention / coefficients only / mechanism /
+  mechanism plus residual) on that plan-dependent slowdown.
+
+- The cost model exists to make two decisions: choose the per-stage tile
+  windows handed to the kernel, and predict execution time so the planner can
+  compare and adjust plans for route distributions that cannot be measured
+  online. It is accepted on decision quality (window and plan selection regret,
+  rank agreement on unseen layers and requests). Absolute error (MAPE, P90) is
+  reported as a diagnostic, not as the claim. The paper must state how the
+  window table relates to the event model (see P0: cost model).
+- The planner's product is the request-path quick planner: a plan as fast as
+  possible at a planning cost that is small against one MoE layer. The full
+  planner and offline LNS are the reference that answers "how far is quick from
+  a carefully searched plan", because no absolute efficiency metric exists.
+  They are not a deployed algorithm and not an oracle, so the gap is reported
+  in two layers: under the model objective (search quality, anchored by exact
+  optima on reduced instances) and against the best measured plan in the
+  candidate set (search plus model quality).
 
 Do not describe contribution 1 merely as "fusing SiLU with GEMM": current CPU
 MoE systems already implement that boundary. The paper-specific mechanism is
@@ -195,6 +333,18 @@ older geometry. It must be rerun before becoming a headline table.
 | Analytical tile-window selector | Approximately 0.83/3.05/4.18% median/P90/max regret after the boundary repeat | Passes only the declared six-point window-selection subproblem |
 | Historical empirical phase model | Approximately 2% median error on an 8-core heterogeneous holdout | Promising mechanism evidence; stale kernel/profile, must be refreshed |
 
+Arm-codex NUMA3 80C, jemalloc, 2026-09-19 (descriptive; rules were written
+after the data had been seen, so these are not acceptance results):
+
+| Model/subproblem | Current result | Gate status |
+| --- | --- | --- |
+| v9 gate-layer holdout | measured/predicted median 0.984, median abs log error 0.038 (v8: 0.898, 0.107) | Recalibration gate H1 passed; one layer, one machine |
+| v9 unseen full-stripe whole plans (48 plans, 2 layers) | measured/predicted 0.97--0.99, Spearman 0.67--1.00, regret 0% and 3.6--8.6% | Fails the 5% regret gate on one layer |
+| Frozen quick cost on the same plans | regret 0.5--17% | Does not rank pinned hot-expert plans |
+| Single large-M expert by width | 32T over-predicted 24--28%; 4T under load over-predicted 17--23% | Two model terms identified as wrong; revision open |
+| DRAM demand vs DDRC counters | measured/modeled 0.155--0.166 under load | Demand rule rejected for concurrent lanes |
+| Joint resource model | 4 acceptance items open; 5/54 validation plans inside its domain | Not an adoptable model yet |
+
 The paper may currently claim that the analytical model explains and selects
 tile windows in a narrow domain. It may not claim general contention-accurate
 or machine-portable scheduling.
@@ -209,7 +359,7 @@ space. It is not an oracle:
 - on long/short bimodal, full selected a 4T tail pool and reduced strict
   execution from 17.25 ms to 12.61 ms (+36.8%);
 - on captured uniformish and median traces, full found measured-best plans at
-  16.89 ms and 18.97 ms;
+  16.89 ms and 18.97 ms (glibc-era absolute times);
 - on the captured high-skew trace, full selected 16T LPT at 22.857 ms while 8T
   reverse-even measured 17.282 ms, a 24.43% paired reduction;
 - measured/predicted rank Spearman on the high-skew manual candidates is only
@@ -226,6 +376,13 @@ high-skew/median/uniformish traces, the gate improves legacy full by
 regret. The run used 5 warmups, 31 randomized paired rounds, and four rotating
 weight copies at commit `b219627`; it does not close the 192-core or general
 temporal-order gate.
+
+Status on 2026-09-19: production quick still does not dominate fixed 8T
+(dense active-set cases lose 11--14% after the wide-team occupancy scale was
+wired in), and under jemalloc the quick cost fails to rank pinned or windowed
+plans that measure 2--10% faster than its choice (window validation G1/G1w/G2:
+0/3/1 of 6). The near-optimality track (reduced exact instances, lower bounds,
+anytime curves) has not started.
 
 ## Claims Allowed Now
 
@@ -353,6 +510,10 @@ design narrative.
 
 ### P0: freeze and reproduce
 
+- rerun every Arm 80C headline result under the jemalloc never-purge
+  configuration, or land a resident route output in the runtime so the result
+  no longer depends on the allocator; do not mix glibc-era and jemalloc numbers
+  in one table;
 - choose one paper commit and rebuild every headline result from it;
 - generate matching empirical profiles for every evaluated machine and
   geometry;
@@ -362,24 +523,43 @@ design narrative.
 
 ### P0: cost model
 
+- bound the model revision: one revision each of the DRAM demand/spill rule
+  and the width residual, validated on a prospectively frozen whole-plan set
+  that includes pinned hot-expert plans; then freeze the model and state the
+  claim the result supports rather than opening another diagnosis round;
 - extend the completed single-core machine-local packed-B retention probe to
   active multi-team LLC/refill behavior;
 - validate unseen routes, widths, mixed shapes, and multi-LLC placements on at
   least two Arm machines;
-- pass isolated MAPE <=10%, contention P90 <=15%, and maximum selected regret
-  <=5%, or narrow the claim and domain explicitly;
+- primary gate: window-selection and plan-selection regret <=5% on unseen
+  layers and requests, reported per plan family, or narrow the claim and domain
+  explicitly; isolated MAPE <=10% and contention P90 <=15% remain reported
+  diagnostics rather than acceptance gates;
+- decide and state the relation between the window table and the event model:
+  either the event model explains/predicts the window choice (done for the 192C
+  policy v6 domain, not on 80C), or the table is a calibration artifact derived
+  from the model structure plus a declared number of measurements, with its
+  calibration cost reported;
 - report calibration wall time and number of measured points versus the
   empirical table baseline.
 
 ### P0: planner
 
+- make the request-path cost rank pinned hot-expert and windowed candidates,
+  or keep those shapes out of the quick candidate space and say so;
 - remove or gate the production quick active-set 8/16 wide-team regressions;
 - repeat the analytical-full one-step width gate on a second Arm machine and a
   larger route corpus; its committed three-trace 80C result is closed only
   inside that declared domain;
 - define the quick/full relationship and the exact candidate space in paper
   pseudocode;
-- report measured regret over the full workload matrix;
+- report the quick-to-reference gap in two layers over the full workload
+  matrix: model-objective gap to full/LNS, and measured gap to the best plan of
+  the measured candidate set; anchor the reference with exact optima on reduced
+  instances;
+- compare quick against every calibrated fixed width, not only 8T, and report
+  the planning-time budget relative to one layer (including the token count
+  below which falling back to a fixed width is the right decision);
 - either reduce full cold search substantially or define it explicitly as an
   offline reference/autotuner;
 - include planner overhead in all end-to-end comparisons.

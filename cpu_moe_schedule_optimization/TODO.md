@@ -50,7 +50,477 @@ first, then refresh calibration and validate the system coherently. In order:
    fusion, router fusion, communication pipelining, and large-K specialization
    outside the primary paper claim until the BF16 Arm path is closed.
 
+## Cost model and planner plan (adopted 2026-09-19)
+
+Purpose: turn the open-ended mechanism diagnosis into a bounded path to a paper
+claim. The acceptance target is decision quality (does the model pick a good
+plan), not per-term physical fidelity. Evidence so far: the large measured wins
+are coarse structural choices (team width 5--18%, hot expert pinned on a wide
+lane or windows 2--10%, tail pool about 30% on bimodal); fine order/transfer
+moves are 2--4% or inside noise under the resident-workspace baseline.
+Paper status: [`../docs/moe_paper_readiness.md`](../docs/moe_paper_readiness.md).
+
+Agreed positioning (2026-09-19): the cost model serves two decisions, kernel
+tile windows and planner time prediction, and is accepted on selection regret
+and ranking; MAPE/P90 are diagnostics. The planner's product is quick (fast plan,
+small `T_plan`); full/LNS is the reference for "how far is quick from a carefully
+searched plan", not a deployed algorithm or an oracle.
+
+User decisions (2026-09-19):
+
+- [x] One fused model in the paper. The analytical event model supplies the
+  skeleton (phases, event simulation, LLC-domain placement; widths 1--80T, whole
+  layer plans, the planner's consumer). The joint run model
+  (`tmp/joint_cost_model_20260911`) supplies mechanism: declared and conserved
+  per-stage read/write request budgets calibrated against DDRC bytes, and a
+  contention response split into globally shared (DRAM) and same-LLC-domain
+  (LLC, L2 refill) parts. Width-indexed coefficients (B_t/S_t, c1/c2) survive
+  only as a bounded residual whose size the paper reports. Only structure and
+  holdout-verified facts are imported from the joint model; it did not pass its
+  own acceptance and is not imported wholesale. Its queue response, block-history
+  demand, and W13-to-W2 migration are out of v10 (future work).
+- [x] Bounded revision: exactly one revision round (v10) below, then freeze,
+  whatever the gate result.
+
+Track M (cost model), in order:
+
+- [x] M1a Lane-level spans of the `tmp/single_expert_width_20260919` traces
+  versus v9: no neighbor-of-wide-team term exists. A 4T M=384 task takes
+  15.5-16.3 ms next to 12-20 lanes with or without a 32T team (load slowdown about
+  1.05-1.10, flat), while v9 predicts a cliff (1.015 at 12 lanes, 1.43 at 20).
+  The 32T-loaded whole-call gap = 4T T_iso 7-9% low + that flat slowdown +
+  pre-compute/merge time outside the makespan (4-6% of the call). Missing data:
+  slowdown at 1-10 lanes and one- versus two-domain placement.
+  [Record](../tmp/single_expert_width_20260919/decision.md).
+- [x] M1b Joint-model inventory:
+  [`inventory.md`](../tmp/joint_model_inventory_20260919/inventory.md).
+  Importable (holdout-passed or two-session repeat): conserved per-call request
+  budgets with realized rate = budget x speed; per-stage read budgets by width
+  and M; only measured DRAM plateau 292-294 GB/s read (170 GB/s refuted as a
+  capacity, the model's 380 GB/s unverified); slowdown convex in total DRAM load,
+  multiplicative on T0 and zero when neighbors' weights are cache-resident;
+  8T GEMM/gather contention globally shared, a same-domain share for narrow
+  foregrounds (local about 2x cross); narrow solo stage costs transfer within
+  0.6-1.6%. Not importable: all fitted capacity numbers, the rational response
+  form, M/pressure interpolation, history models. Gap: every high-load probe ran
+  at 141-276 GB/s background read, real loaded plans measure 44-71 GB/s, and the
+  report has no 32T data.
+- [x] M2 frozen 2026-09-19:
+  [`tmp/m2_validation_20260919/decision.md`](../tmp/m2_validation_20260919/decision.md)
+  (group W: 18 unseen-layer workloads x 17 frozen bridges; group S: same task in
+  different plans, with disjoint fit and validation cells; group N: V3 windows at
+  unseen M). Measured once in M4; group N may run earlier. Original item:
+  Freeze the validation set and gates before fitting. Whole plans on at
+  least 6 layers x 3 captured requests, families: homogeneous 4/8/16T, hot
+  expert pinned on 16/32T plus narrow lanes, mixed width, windowed (V3). Two
+  sessions, jemalloc, 31 paired samples. Gates: per-family measured/predicted
+  median within 0.92--1.08; selection regret@1 <= 5% on every layer; report
+  regret@2/@3 and Spearman. Fit data and validation layers are disjoint.
+  Window selection is its own group: per (t, M) band, regret of the selected
+  (w13, w2) window against the measured best window, gate <= 5%.
+  Plan-dependent slowdown is its own group: the same task (width, M) placed in
+  different plans; gate on the predicted versus measured slowdown difference,
+  with the four-step ablation (no contention / width coefficients only /
+  mechanism / mechanism plus residual) reported on it.
+- [x] M2b decided by an offline check (2026-09-19,
+  [record](../tmp/window_model_check_20260919/decision.md)): option B for v10. On
+  the 36 full-load 80C cells the v9 `score_stage_window` pick has measured regret
+  median 4.96%, P90 17%, max 24% and hits the best window in 2/36 cells (always
+  FULL: 8.0/39/67%; V3 in-sample 0.14/2.1/2.7%). The objective is binary in the
+  owner window and has no W2 sensitivity; 80C lacks a machine-local packed-B
+  retention calibration. Task-level window gains under full load are 17-40% (2T),
+  4-27% (4T), 3-16% (8T), 2-8% (16T), so v10 must apply r(t, M) in the event model
+  used by full/LNS, not only in quick cost. Load-context dependence of the window
+  choice is tested by M2 group C (Amendment 1); a retention probe that would enable
+  option A is optional and separate. Original item:
+  Decide the relation between the window table and the event model,
+  which does not see windows today (`dag_makespan` ignores them; the 80C table
+  is measured per (t, M)). Option A: the event model explains/predicts the
+  window choice on 80C as policy v6 did on 192C. Option B: the table is a
+  declared calibration artifact (model structure plus N measured points) and
+  the paper reports its calibration cost. Supersedes the open "make the event
+  model window-aware" item below.
+- [x] M2 groups N and C and the S fit cells measured 2026-09-19
+  ([record](../tmp/m2_validation_20260919/decision.md), After collection).
+  N passes after a reported scoring fix (32/32 unseen-M cells <= 5% regret, max
+  3.65%; window gain 18-46% at 2T, 4.5-36% at 4T, 3-25% at 8T). C1 fails: the
+  static window choice loses up to 2.7% (5% on a 0.6 ms 16T task) in small-M and
+  large-M backgrounds, and the gain of the same window ranges from 2% (isolated)
+  to 21% (full same-M load), so r(t, M) needs a load context before the choice
+  does. S fit: slowdown of a 4T task is ~0 up to 5 concurrent lanes, then 1.05 /
+  1.08 / 1.12 at 9 / 14 / 19 lanes (M 384; 1.03 / 1.04 / 1.06 at M 1024), 1.24 next to
+  19 lanes of chained M-24 experts; the added time looks per-expert additive.
+  Small-M targets slow down 1.2-1.6x under full load.
+- [x] M3 done as a probe-calibrated v10 (MATHEMATICAL_MODEL v1.107; user decision
+  2026-09-19: no regression on plan timings). Four measured service curves
+  D_LL/D_LS/D_SL/D_SS(t, n) over loading/steady phases, composition rule frozen
+  before measurement, isolated time (1 + 0.065) x v9 phases + O(t), t_over 0.78 ms
+  measured; no B_t/S_t, no spill rule, no residual. Contention sits almost entirely
+  between weight-loading phases (D_LL up to 1.6-2.0, D_SS <= 1.03); the single
+  hardware-curve test failed (width-indexed table). A first regression attempt
+  (ladder of fitted forms) is kept only as an ablation baseline.
+  [Probes](../tmp/v10_probes_20260919/decision.md),
+  [model](../tmp/v10_model_20260919/v10.py). Superseded plan text:
+  Revision v10 (M class, MATHEMATICAL_MODEL update), fused model:
+  (a) memory demand: per-stage read/write request budgets, conserved, calibrated
+  against DDRC bytes, replacing spill 1.0 for concurrent lanes; (b) contention
+  response split into globally shared (DRAM) and same-LLC-domain parts, carrying
+  the non-additive high-total-load slowdown; (c) intra-team overhead (today
+  B_t) as a fixed per-expert cost (fork/join, sync, gather) amortized by
+  per-expert work; (d) slowdown from neighboring teams (today S_t - B_t) comes
+  from (b), with the unexplained remainder kept as a reported bounded residual;
+  (e) no neighbor-of-wide-team term (M1a found none); whole-call predictions add
+  pre-compute and route-merge time. Inputs limited to the M1b inventory. Refit on A1 layer data plus the single-expert cells only.
+- [x] M4 measured once, 2026-09-20
+  ([record](../tmp/m2_validation_20260919/decision.md)): W1 PASS (measured /
+  predicted 1.05-1.08 in every family); W2 FAIL on one workload by 0.003 points
+  (regret@1 median 0, max 5.003%, 17/18 <= 5%; regret@2 max 3.4%; v9 event max
+  10.4%, frozen quick cost max 15.1%); S2 PASS (slowdown MAE 0.030 vs null 0.062,
+  v9 0.043), S1 FAIL (small-M target under-predicted by up to 0.4). Narrowed
+  claim adopted: two-plan shortlist within 3.4% plus the measured-consensus tuner;
+  contention layer reported as a measured service table valid for large-M tasks.
+  No second revision round. Open defects: 5-8% level bias, p16_r4 preference on
+  8T-type layers, small-M slowdown, static window choice (C1). Original item:
+  Run M2 once. Pass: v10 is the 80C paper model; switch consumers by
+  separate decision. Fail: keep v10 frozen and narrow the claim to "the model
+  prunes to a k-plan shortlist and the measured-consensus tuner
+  (`bench_selection_pair.py tune`) picks", reporting regret@k and tuning cost.
+  No second revision round before the non-model paper gates have evidence.
+- [ ] M5 Deferred until M4: service re-probe under jemalloc, A2 1T split
+  identifiability, window-aware event model, second machine calibration.
+  Do each only if M4 shows it limits a gate.
+
+Track P (planner):
+
+- [x] Reference objective (user decision 2026-09-19): the offline reference is
+  searched and reported on the event objective (`dag_makespan_placed`), the same
+  quantity the cost model predicts; the robust objective (max with 1.15 x heaviest
+  lane T_iso) is not the yardstick. Needs a model-objective LNS loop and the
+  compound split-and-reassign move from P2.
+- [ ] P1 Fix the paper's planner definition: request-path quick over a small
+  structured family (homogeneous widths, hot-pinned shapes, tail pool; windows
+  from the table), and the event-guided full + fixed-mixture LNS as the offline
+  reference used to measure quick regret. No ALNS; CP-SAT only for reduced
+  exact instances.
+- [x] P2 first round done:
+  [`record`](../tmp/planner_reduced_optimum_20260919/decision.md). Exact optima
+  for E=6 (exhaustive) and E=8 (branch and bound, conditional on "no task runs
+  faster in a plan than alone", 0 violations in 1.15 M audited states); E>=16 not
+  tractable. Reference (best of full/one_step/VND/LNS) gap to optimum on the event
+  objective: median 0, max 7.26% (frozen gate inconclusive: above 5%, below 10%);
+  on the robust objective max 0.6%. Quick: median 0.001%, max 8.9%. Full 80C
+  layers: reference / contention-free lower bound 1.26 (upper bound on the gap,
+  not an estimate); quick / reference 1.089-1.094. Follow-ups: fix the yardstick
+  objective (event vs robust: a robust-accepting descent lands up to 12% above
+  the event optimum); add a compound split-and-reassign move (the >3% gaps are
+  mixed shapes single moves cannot reach); add a model-objective LNS loop to the
+  repository (the existing LNS driver is hardware-diagnostic only); reach the
+  contention regime with a contention-aware bound or scaled-machine instances
+  (reduced optima sit within 0-2.9% of the packing bound). Original item:
+  No hardware needed, can start now: reduced exact instances (8/16/32
+  experts from real routes) with exhaustive or reduced CP-SAT optimum under the
+  model objective; core-work and critical-expert lower bounds on full
+  instances; 1/10/30/60/300 s anytime curves (Step 7).
+- [ ] P3 After M4: close the quick regressions with the frozen model. Gates:
+  quick no worse than fixed 8T by more than 2% on any catalog case or captured
+  layer (currently -11--14% on dense active-set cases); quick ranks the pinned
+  and windowed candidates of the M2 set with regret <= 5%, or those shapes stay
+  out of its candidate space and the paper says so.
+- [ ] P4 Final planner matrix from the frozen commit: 43 layers x 3 requests,
+  every calibrated fixed width / quick / full / LNS reference / measured
+  shortlist oracle, with `T_plan`, `T_execute`, and their sum. Report the quick
+  gap in two layers: model-objective gap to full/LNS (search quality, anchored
+  by the P2 reduced-instance optima) and measured gap to the best plan of the
+  measured candidate set (search plus model). Also report `T_plan` against one
+  layer's execution time and the token count below which a fixed width wins.
+
+Integration and revision round (user decision 2026-09-20: wire v10 into the code, fix the
+model or the search where they fall short, reach a near-optimal search, extract a fast
+planner from it). Records: [`v10 integration/E1`](../tmp/v10_integration_20260920/decision.md),
+[`P6 probes/v11`](../tmp/v11_probes_20260920/decision.md),
+[`E2`](../tmp/v11_validation_20260920/decision.md),
+[`fast planner/E3`](../tmp/fast_planner_20260920/decision.md).
+
+- [x] v10 as a planner cost model (`cost_model/probe_event_model.py`, asset
+  `probe_event_v10_20260919.json`, opt-in; native planner export disabled; numerically equal
+  to the Lab module on all 306 M4 plans, 8.6 ms per 220-task evaluation) and a model-objective
+  LNS (`planners/model_lns.py`).
+- [x] E1 (18 M2 workloads, measured): v10-driven search exploits model error. Searched plans
+  measured / predicted 1.325 (with 2T lanes) and 1.175 (without), anchors 1.09-1.11; the
+  2T-free search still ran 6.5% faster than the best frozen M2 candidate. Traced per-task
+  diagnosis (E1d): under load the model under-predicts narrow-lane mid-M tasks (2T M 25-384
+  1.19-1.41, 4T M 13-192 1.12-1.26, 8T M<=24 1.30; large-M 8-32T 0.97-0.99); isolated times
+  are not the cause; intra-lane dispatch gaps are 5-40 us.
+- [x] v11 (MATHEMATICAL_MODEL v1.109, asset `probe_event_v11_20260920.json`): measured
+  isolated correction c(t, M), M-indexed steady curves, and loading equivalence w(M) of a
+  mid-M background steady phase (0.79 at M 24 to 0.11 at M 384), all from probes P6
+  (`tmp/v11_probes_20260920`), composition frozen before measurement, no fit on plan timings.
+- [x] Search: multi-start descent plus rebalance / recreate / reorder-all moves. On the 36
+  reduced instances of P2 the search now reaches the exact optimum on every one (max 0.004%;
+  single-start was up to 2.0% off).
+- [x] E2 (18 fresh layers, measured once): the v11 search restricted to lanes >= 4T is the
+  fastest of eight plans on 17/18 workloads, 13.2% faster than production quick (median,
+  -14.9% to -5.5%), 10.2% faster than the best anchor construction, 3.7% faster than the v10
+  search. v11 selection over the 2T-free plans: regret@1 median 0%, max 7.9%, @2 max 1.8%
+  (v10: 3.4% / 14.8% / 5.5%). 2T lanes stay out of the search space (measured / predicted
+  1.237, sign agreement 0/18) and are reported as a limitation.
+- [x] E3 (18 more fresh layers, measured once,
+  [record](../tmp/fast_planner_20260920/decision.md)): the reference search (v11 LNS, 90 s)
+  is 12.87% faster than production quick (median, -15.0% to -7.6%) and the measured best plan
+  on 17/18 workloads; 10 s of search is within 0.61% of it. The fast planner
+  `planners/hot_wide_planner.py` (wide lanes for hot experts + 4T bulk, per-width load scale,
+  hot-first-then-ascending order; 30 ms warm in Python) is 9.63% faster than production quick
+  on 18/18 workloads but 3.82% behind the reference (F2 not met). Measured / predicted is
+  1.09-1.10 for all three, so the gap is search depth, not model error: template scoring with
+  the event model closes 0.6 points (272 ms), order patterns 0.8 points (98 ms), load
+  rebalancing nothing; the rest is event-level phase overlap between lanes.
+- [x] Production adoption (user decision 2026-09-20,
+  [record](../tmp/v13_adoption_20260920/decision.md)): the V3 window table is registered for its
+  machine (`machine_ids`), `PlannedMoE` has a `hot_wide` search mode, `MoePlannerRuntime` takes
+  an event calibration, and `enable_moe_planner_fast()` installs the fast planner. Verified on
+  the machine: the runtime reproduces the measured `hwt` bridges on 18/18 workloads and plans a
+  layer in 6.6 ms against the quick runtime's 10.4 ms. Measured against the pre-adoption default
+  (quick, full stripe; E4, 18 layers, 18/18): fast planner -12.75%, reference search -14.90%,
+  window registration alone -1.94%.
+- [x] The 2T defect chased (user decision 2026-09-20,
+  [probes](../tmp/v12_probes_20260920/decision.md),
+  [validation](../tmp/v13_validation_20260920/decision.md)): P7 measured that contention grows
+  as the background lanes narrow (4T target at ~76 other cores: 2.01 with 2T lanes, 1.91 with
+  4T, 1.70 with 8T, 1.40 with 16T) and P8 that the composition is right for 4T and wider
+  backgrounds (1.03-1.10, including a real-layer route mix) but under-predicts 2T backgrounds by
+  18-49%. v13 (2T lanes count as loading in every phase plus the width factors) reproduces the
+  probe cells (0.978) but fails E5 on fresh layers (W1/W2/W3 all fail, regret 11.95% against
+  v11's 4.45%): v11 stays the reference model and 2T stays out of the search space.
+- [x] E6, is the searched plan a measured local optimum
+  ([record](../tmp/search_reliability_20260920/decision.md)): on six workloads, nine model
+  neighbours each (0-2% and 2-6% above the incumbent) plus 600 s of further search, measured in
+  a verified idle window. The best neighbour is at most 0.17% faster (inside the 0.38% session
+  spread), the neighbours the model puts 2-6% behind measure 1.1-3.7% slower on all six, the
+  Spearman inside the neighbourhood is 0.62 in median (0.09-0.85: no ranking power in the 0-2%
+  band), and 600 s more search gains 0.69% in median. The reference is a measured local optimum
+  of the model's neighbourhood; no global claim. One earlier session set was discarded after an
+  external load spike on the shared machine (sar: load 191, about 38 foreign cores).
+- [x] E7, does the search space miss a better plan
+  ([record](../tmp/search_reliability_20260920/decision.md)): on the same six workloads, LLC
+  placement variants (invisible to the model by construction) measure 0.04-0.30% faster than the
+  searched plan, tail-pool plans 1.2-3.6% slower on five of six (the planner's tail-pool score
+  says the opposite), and the one workload with an equal-score different-width plan measures it
+  slower. Gate passed: nothing outside the search space beat the searched plan by more than 1%.
+  Route slicing was not exercised (the candidate list came back empty) and stays open.
+- [x] Route slicing and the tail-pool score (user decision 2026-09-20,
+  [record](../tmp/search_reliability_20260920/decision.md), MATHEMATICAL_MODEL v1.115).
+  Slicing: the repository's bounded-tail family cannot run here (96-core widths, two-terminal-task
+  precondition); implemented instead as `slice`/`unslice` moves in the search, and shown
+  worthless on these workloads by a bound - the hottest expert takes 0.38 of the work bound in
+  median (0.44 at most) over all 54 measured layers, so no expert constrains the makespan.
+  Tail pool: traced runs locate the error outside the tail-pool simulation. The automatic
+  candidates pool onto 1T, a width the probes never measured (curves clamp at 2T), and those
+  pooled tasks measure 3.25-4.25x their predicted isolated time. The model now publishes
+  `calibrated_widths` / `reliable_widths` and the planner keeps automatic pool widths inside
+  them, which flips the r008_l21 preference back to the strict plan, as measured.
+- [ ] Open: a native (C++) hot-wide planner; a mechanism for 2T lanes that survives whole plans;
+  the model's unexplained ~1.09 level bias; the paper's planner matrix (P1/P4).
+
+Stop rules: no new physical term unless it changes a measured plan choice by
+>= 2% in both sessions; no new order/transfer search layers; glibc-era results
+keep their label and are not refit.
+
+## Cost model track after the jemalloc switch (2026-09-19)
+
+Benchmarks and deployment on Arm-codex now preload jemalloc with purging disabled
+(`docs/agent_benchmark_hygiene.md`, Allocator State). Plan V2 calls without a
+resident route workspace carried 15-35% page-fault cost under glibc; the joint
+model inputs used `FixedRouteWorkspace` or native probes and are clean
+([correction](../tmp/dram_write_20260919/decision.md)). Live status stays in
+`optimizations/fused_moe_sve/CURRENT.json`.
+
+- [x] Rerun the four window experiments under jemalloc; replace the opt-in
+  candidate table with `ARM_CODEX_NUMA3_80C_TP4_F512_N16_V3` (not registered).
+  [Record](../tmp/jemalloc_rerun_20260919/decision.md), MATHEMATICAL_MODEL v1.105.
+- [x] Recalibrate the contaminated v8 layers (wide-team pressure, 1T/2T
+  by_width, narrow correction) as v9: gate-layer holdout measured/predicted median
+  0.898 (v8) -> 0.984 (v9); published under
+  `bench_assets/moe_paper/arm_codex_numa3_80c_jemalloc/` with machine config
+  `arm_codex_internal_jemalloc.json`. Addresses the contaminated part of
+  "Revalidate absolute v8 errors under resident-output methodology" above.
+  [Record](../tmp/jemalloc_recal_20260919/decision.md), MATHEMATICAL_MODEL v1.106.
+- [ ] Service rates under jemalloc: a single short probe failed the 3% rule
+  (DRAM 80T -8%, LLC +-10%, L1 40T +24% vs glibc; glibc DRAM 80T also 14% below
+  the August probe). Decide on a repeated full re-probe before trusting v2 services.
+- [ ] Switch existing consumers (LNS tool defaults, machine configs, frozen
+  anchor/frontier plans chosen with v8) to v9 only by separate decision.
+- [x] Unseen whole-plan error (analytic, full stripe, descriptive): on the 48
+  unique jemalloc window_validation plans v9 has meas/pred 0.97-0.99, Spearman
+  0.67-1.00, regret 0% (layer 12) and 3.6-8.6% (layer 29); frozen quick scores
+  regret 0.5-17%. Errors concentrate on pinned wide lane + narrow lanes (meas/pred
+  0.79-0.94). [Record](../tmp/whole_plan_eval_20260919/decision.md).
+- [x] Single large-M expert per width (4/8/16/32T, M 256-2048, isolated and under
+  4T background): 32T over-predicted 24-28% (width dilation B32/S32 1.45/1.52 vs a
+  width-independent single-task residual of 1.06-1.11); 4T loaded over-predicted
+  17-23% via the DRAM term (spill 1.0, offered 2.4x capacity) while measured load
+  slowdown is 1.06-1.12x. [Record](../tmp/single_expert_width_20260919/decision.md).
+- [ ] Model revision (MATHEMATICAL_MODEL): width residual tied to per-expert work
+  instead of per-task B_t/S_t; refit on A1 layer data plus the single-expert cells.
+- [x] PMU check of the DRAM term: loaded measured/modeled DRAM reads 0.15-0.17
+  (v9 spill 1.0 at capacity vs measured about 5x compulsory, 44-71 GB/s); isolated
+  teams re-read weights at 21-27 GB/s (model assumes LLC-resident, not binding).
+  [Record](../tmp/narrow_dram_pmu_20260919/decision.md).
+- [ ] Model revision: DRAM demand/LLC spill for concurrent lanes consistent with
+  the PMU bytes; first identify the term behind the 32T-target loaded whole-call
+  under-prediction (1.06-1.22), which the DRAM over-estimate currently masks.
+  (M1a: no masked term; see the plan section.)
+  Validate on the pinned whole-plan set.
+- [ ] Joint model whole-plan error needs in-domain data: only 5/54 of these points
+  fit its domain (M <= 1718, widths <= 16 inside one LLC domain, no 32T).
+- [ ] Rank pinned hot-expert plans: the isolated-LPT quick cost does not
+  (window_validation G1/G1w/G2 0/3/1 of 6 under jemalloc), although pinned or
+  windowed plans beat the baseline by 2-10%. Required before any pinned-shape
+  candidate or window default.
+- [ ] (Tracked as M2b in the plan above.) Make the event model window-aware: `dag_makespan` and full search ignore
+  windows; only quick cost uses r(t, M). Choose between a per-task time scale and
+  resource terms (PMU: W13 1-tile windows cut DRAM reads 27-75%, glibc-era).
+- [ ] Joint model acceptance items remaining: block-history demand and
+  independent-session stability; same-condition contention response and dynamic
+  mixed phases; real W13 to W2 migration; unseen whole-plan error and
+  equal-budget planner search.
+- [ ] A2 1T fit identifiability: the fixed/route split moves across runs
+  (fixed 100-210 us; jemalloc route_ns 3.4 vs glibc 11.5 us) while totals agree;
+  under jemalloc the non-fit peer modes are overpredicted by 4.5-5%. Constrain the
+  fit or validate totals only before relying on the split.
+- [ ] Glibc-era window diagnostics (m2040, m_mid, m24, peff, window_pmu,
+  shared_combined) keep their glibc label; rerun one only when a decision needs it.
+- [ ] Low priority, needs approval: resident route_out inside the runtime, which
+  removes the allocator dependence.
+
 ## Next planner track: event-guided VND, LNS, then ALNS
+
+- [x] Execute the four-step workspace baseline plan in order: explicit profile
+  and identity separation; common-session anchor/elite confirmation; frozen-v8
+  model reassessment without fitting; independent median smoothing confirmation.
+  Current experimental anchors: median2ab43572, high-skew189d70 (+61ea6f elite),
+  uniformish retained. Weak-start VND remains valid. Smoothing beats old anchor
+  but not current elite, so not adopted. Old residuals cannot authorize pruning.
+  [Registry/evidence](../optimizations/fused_moe_sve/results/arm_codex_80c_workspace_baseline_confirmation_20260907.md).
+  [Mandatory baseline for new offline runs](../optimizations/fused_moe_sve/results/workspace_experiment_baseline.md).
+
+- [x] Workspace model/search audit: reuse52 unique existing plan measurements and
+  replay46 representative old VND/LNS plans in8 sessions. Greedy insertion now
+  gains3.350/3.377%; median elite2ab43572 still passes despite old candidate_worse
+  label; high-skew LNS elites retain gains. Uniformish only repairs weaker parent.
+  [Evidence](../optimizations/fused_moe_sve/results/arm_codex_80c_workspace_model_search_audit_20260907.md).
+- [ ] Revalidate absolute v8 errors under resident-output methodology with separate
+  calibration/evaluation data. Preserve2ab43572 as an extended-domain pruning
+  counterexample. Do not fit old output first-touch residuals as bandwidth terms.
+- [x] Correct geometry reporting: frozen calibration and actual packed object
+  use backend_n_tile16, not the8 stated in earlier workspace prose. Runtime unchanged.
+
+- [x] Replay8 historical order/pressure/GEMM/interleave frontiers with workspace,
+  16 sessions. Only median block retains the old robust positive classification;
+  neither historical actionable winner retains its >2% gate. No winner overwrite.
+  [Evidence](../optimizations/fused_moe_sve/results/arm_codex_80c_workspace_order_replay_20260907.md).
+- [x] Confirm median smooth: same complete plan passes2 GEMM-frontier sessions
+  but not both pressure-frontier sessions. Do not cherry-pick the passing subset.
+- [ ] Audit remaining workspace-regime model errors, starting with high-skew
+  union p02 predicted+12.041% versus measured-3.282/-2.430%; no new physical term yet.
+
+- [x] Replay both complete seven-plan transfer frontiers with workspace, two
+  untraced sessions each. No >2% stable winner; median bad relocation becomes
+  +1.11% but misses P10; high-skew cross-domain relocation becomes neutral,
+  same-domain swap/relocation remain around-6.6%/-13%. Retain anchors.
+  [Evidence](../optimizations/fused_moe_sve/results/arm_codex_80c_workspace_transfer_replay_20260907.md).
+- [x] If continuing: replay older order frontiers under the workspace baseline
+  before treating old allocation-mode gains/residuals as valid in the new regime.
+
+- [x] Fixed max_tokens workspace Lab version: preallocate/touch once, exclusive
+  lease, overflow rejection, NaN overwrite checks. Two sessions improve anchor
+  steady state3.078/3.382%, swap8.310/8.278%, relocation8.224/8.719%; initial
+  allocation/touch8.049/8.176ms. No production-default change.
+  [Evidence/usage](../optimizations/fused_moe_sve/results/arm_codex_80c_fixed_route_workspace_20260907.md).
+
+- [ ] Low priority: grow route-output workspace capacity safely at an idle boundary.
+  First version uses explicit max_tokens, rejects overflow and does not shrink/grow.
+
+- [x] Output pretouch control: two independent sessions, all outputs equal. Head
+  W2 collapses2.804/2.876→0.539/0.542ms; outside-touch minor faults1/1. Reject
+  per-call full clearing:9.1–9.3ms pretouch worsens inclusive latency17–22%.
+  [Evidence](../optimizations/fused_moe_sve/results/arm_codex_80c_route_output_pretouch_20260907.md).
+- [x] Next candidate, if requested: explicit route-output workspace lifecycle with
+  amortized first touch and concurrent-call isolation. Measure initialization and
+  steady state separately; do not reuse old first-touch penalties as contention calibration.
+
+- [x] Trace actual transfer task timelines in two sessions per trace. Median's
+  recipient consumes slack and is last only2/62 rounds; high-skew swap/relocation
+  recipient suffix is last62/62. Donor acceleration only grows compute slack.
+  [Evidence](../optimizations/fused_moe_sve/results/arm_codex_80c_transfer_task_trace_20260907.md).
+- [ ] If deeper attribution is needed, decompose existing M164 head/donor phase
+  records; do not infer bandwidth or true idle time from task envelopes alone.
+
+- [x] Implement bounded same-width swap/relocation, split same/cross LLC, preserving full task metadata.
+- [x] Measure frozen median/high-skew transfer frontiers, two sessions each, six candidates plus anchor.
+  No candidate passes both-session >2% gate. Median same-LLC swap gains0.750/0.576%;
+  high-skew model-best candidates regress5.8–13.2%. Retain both original anchors.
+  [Protocol/status](../optimizations/fused_moe_sve/results/arm_codex_80c_same_width_transfer_20260907.md).
+- [ ] Replay existing transfer evidence against isolated lane-load/critical-lane changes;
+  assess whether a load-aware shortlist guard can identify large regressions without
+  losing known measured gains. Do not launch another hardware layer or refit yet.
+
+- [x] Add explicit interleave templates (`--proposal-set interleave`) and broader
+  order transforms (`extended`) to the bounded offline freeze entrypoint. Keep
+  original `legacy` default, per-family representatives and seven-plan hardware cap.
+  [Usage](../optimizations/fused_moe_sve/results/interleave_order_templates_usage_20260907.md).
+- [x] Compare interleave/extended from latest measured anchors with frozen shared
+  unions (median8/high-skew9 plans), two sessions each. No actionable winner;
+  median block relocation yields 1.716/2.342% but misses S1 margin. Preserve it
+  as near-elite, retain anchors, and stop this order-only budget.
+  [Evidence](../optimizations/fused_moe_sve/results/arm_codex_80c_order_strategy_compare_20260907.md).
+- [ ] New-domain calibration/gates remain necessary before automatic VND/LNS
+  acceptance/pruning or production default changes. No new task-migration
+  experiment has been launched.
+
+Bounded offline selection workflow (2026-09-06):
+
+- [x] Freeze score-best and historical fallback; deduplicate complete PlanV2 bridges.
+- [x] Add `bench_selection_pair.py tune`: at most two unique plans, two independent
+  measured sessions, then persist the complete hardware-consensus winner.
+- [x] Replay median/high-skew evidence into winner artifacts; uniformish deduplicates
+  without a hardware run. Reject mismatched/incomplete evidence and label session
+  disagreement inconclusive. Small consensus gains remain non-actionable.
+- [ ] Broaden evaluation before any production selector/default adoption.
+
+- [x] Complete one bounded order-only layer around median/high-skew hardware
+  winners: 72 model candidates, six measured candidates plus anchor per trace,
+  two sessions. Median retains anchor; high-skew diversity rotation
+  `34c08621...` passes at 3.887/2.243% paired speedup (model predicted -4.478%).
+  Full bridge/evidence: [bounded order report](../optimizations/fused_moe_sve/results/arm_codex_80c_bounded_order_extension_20260906.md).
+  No next layer or model refit has been launched.
+
+- [x] Pressure-balanced order proposal screen: global/domain smoothness,
+  bursty control and alternating routes, two traces and two sessions each.
+  No candidate passes the unchanged >2%/positive-P10 gate in both sessions.
+  High-skew alternating gains 1.037/1.960% but remains sub-threshold. Do not
+  adopt isolated smoothness as a ranking objective or fit a new physical term.
+  [Evidence](../optimizations/fused_moe_sve/results/arm_codex_80c_pressure_balanced_orders_20260906.md).
+
+- [x] GEMM-average density direct comparison: high-skew smooth beats uneven by
+  3.695/3.973% and the prior rotation anchor by 2.355/3.464%, passing both-session
+  gates. Median has no benefit. Retain as a candidate-generating heuristic, not
+  a universal selector or physical-model fit; no next layer started.
+  [Evidence](../optimizations/fused_moe_sve/results/arm_codex_80c_gemm_density_comparison_20260907.md).
+
+- [x] Fixed high-skew smooth/uneven pair under 0/4/16 remote-reader pressure:
+  user restored PMU access; pilot and two formal sessions completed. Smooth
+  gain shrinks from 5.259/4.780% to 3.239/3.285% as extra pressure increases.
+  No support for increasing gain over this range; no certified absolute-low
+  endpoint. All reader processes cleaned up; no additional OS settings changed.
+  [Protocol/blocker](../optimizations/fused_moe_sve/results/arm_codex_80c_density_pressure_sweep_20260907.md).
+
+- [x] Synthetic M experiment (E60, 10x8T, early merge off): five uniform references
+  and four clustered/staggered grids, two sessions. (4,32), (16,128), (64,512)
+  pass at ~3.4%, ~25.2%, ~17.4%; (1,8) has no stable gain. Do not infer monotonic
+  gain from average bandwidth alone or generalize to real traces without tests.
+  [Evidence](../optimizations/fused_moe_sve/results/arm_codex_80c_synthetic_m_density_20260907.md).
+
+Usage and evidence: [selection pair report](../optimizations/fused_moe_sve/results/arm_codex_80c_selection_pair_validation_20260906.md).
 
 Current Cursor handoff (2026-09-06):
 [`template_lns_cursor_todo.md`](../optimizations/fused_moe_sve/results/template_lns_cursor_todo.md).
@@ -61,6 +531,24 @@ members (digest `a10eeba6...`); 11/452 were measured historically. Diagnostic
 budget is 456 unique plans and exceeds the 80 LNS-candidate slots. Task 6B is
 unauthorized; Task 5 stays closed. Keep N=25 shuffle-truncate and injected
 elites. Historical records retain their scope.
+
+Independent context-residual track (opened 2026-09-05):
+[`context_aware_residual_experiment_20260905.md`](../optimizations/fused_moe_sve/results/context_aware_residual_experiment_20260905.md).
+The Lab candidate retains frozen v8 as its event-time baseline and adds a
+23-feature regularized residual. It does not change VND/LNS scoring, pruning,
+calibration, or production. Experimental runs use a terra/medium subagent.
+
+- [x] Implement plan-visible structure/timeline/interaction features, frozen
+  identity validation, label-free time prediction, and focused negative tests.
+- [x] Run fixed-alpha parent-disjoint development replay on the published
+  high-skew LNS frontier; exclude cross-parent duplicate states. Compare a
+  constant-offset control before attributing absolute-error gains to context.
+- [ ] Validate on a prospectively sampled plan set with untouched evaluation
+  groups and session provenance. Existing selected-frontier results do not
+  establish unbiased neighbor recall or justify adoption.
+- [ ] If that test supports a residual model, calibrate its own uncertainty
+  on separate data before considering any search integration. Do not reuse
+  the v8 pairwise radius. The 452-plan hardware budget is still not authorized.
 
 Do not start by adding adaptive operator weights. First establish that the
 executable-plan neighborhood is locally useful, repairable, and sufficiently
@@ -317,6 +805,19 @@ Temporal-ranking remediation in progress before this gate may be reconsidered:
   `stop_absolute_model_expansion=true`; keep frozen v8 and move safety work to
   partial order, top-K recall, and false-pruning replay. See
   `optimizations/fused_moe_sve/results/arm_codex_80c_stream_pressure_proxy_grid_20260904.md`.
+- [x] Post-hoc planner-visible geometry on the same locked grid, without
+  measured overlap: \(n_B\sqrt{t}\), frozen-v8 isolated peer W13 core-ms,
+  isolated operator core-ms, and \(a n_B+b n_{\text{threads}}\). No proxy
+  passes both sessions and 20% drift. Session-2 operator and two-coefficient
+  fits can pass count-6 alone, but 8x2T queue is 48.17 vs 29.14 cycles on
+  identical live teams (ratio 1.653). Keep
+  `stop_absolute_model_expansion=true`. See
+  `optimizations/fused_moe_sve/results/arm_codex_80c_stream_pressure_plan_geometry_proxies_20260905.md`.
+- [x] Repeat the locked proxy grid three more times (seeds 20260926/27/28) on
+  Arm NUMA3 without changing v8. 8x2T paired queue medians were 12.58 / 32.19 /
+  27.89 cycles versus historical 48.17 / 29.14. The node was not exclusive
+  (`bench_meformer_`, `tokio-rt-worker`). Do not freeze a queue term. See
+  `optimizations/fused_moe_sve/results/arm_codex_80c_stream_pressure_queue_repeat_20260906.md`.
 
 - [x] Starting independently from full, one-step, greedy, and fixed-width
   controls, run best-improvement descent over same-lane insertion, same-width
@@ -631,7 +1132,9 @@ below before becoming final paper tables.
 - [ ] Run complete multi-layer traces across multiple requests, including at
   least one full prefill sweep and one decode-oriented corpus. The current
   three selected layers do not close this gate.
-- [ ] Decide the cost-model paper claim. Either refresh the empirical
+- [ ] (Gate definition superseded 2026-09-19: selection regret is primary,
+  MAPE/P90 are diagnostics; see the plan section above.)
+  Decide the cost-model paper claim. Either refresh the empirical
   phase-aware model as the primary model, or make the analytical backend pass
   isolated MAPE <=10%, contention P90 <=15%, and maximum measured regret <=5%
   on the declared two-machine domain. The current local-retention result passes
@@ -644,6 +1147,13 @@ below before becoming final paper tables.
   `15.27/17.95/5.69%` paired medians and leaves `0/0.26/0%` measured-set
   regret. It does not change quick/request-path, explicit-shape, empirical, or
   native planners.
+- [x] Wire the existing frozen-v8 $B_t/S_t$ occupancy scale into homogeneous
+  quick width ranking (LPT packing still isolated $T_{iso}$). Arm 80C 5/31/4
+  paired rerun: active-set-8/16 no longer choose 40T and are tied with fixed
+  8T (`-0.03%/+0.30%`). Denser cases over-narrow to 20x4T and lose
+  11--14% (active64/128/tiered). Bimodal still wins (`+30.26%`). Quick still
+  does not dominate fixed 8T. See
+  `optimizations/fused_moe_sve/results/arm_codex_80c_quick_vs_fixed8_wide_team_20260906.md`.
 - [ ] Close the production quick-planner quality regression. Active-set 8/16
   still select over-wide homogeneous teams on the existing evidence; do not
   claim quick dominates fixed-width execution until a separate gate passes.
@@ -802,6 +1312,20 @@ below before becoming final paper tables.
   communication, and cross-rank lifetime changes before claiming full E2E time.
 
 ## Deferred external validation
+
+- [ ] Four-rank concurrent validation (added 2026-09-20). Every current
+  Arm-codex 80C result is one TP rank on NUMA3 (`--physcpubind=240-319
+  --membind=3`, `concurrent_ranks=1`) with the other three NUMA nodes idle,
+  while the deployment is TP4 on 320 cores with all ranks executing the same
+  route histogram at once. Run the same plan on all four NUMA nodes
+  concurrently (one process per node, barrier-aligned start, per-rank call
+  time and max-over-ranks recorded) for the held-out layers already used in
+  E2/E4 and report: (a) per-rank slowdown against the single-rank
+  measurement, (b) whether the fast-planner and reference-search gains over
+  the production quick path survive, (c) whether plan ranking is preserved
+  (regret@1 under concurrency). All-reduce stays out of scope; state that
+  explicitly. Until this is measured, claims are limited to "MoE operator time
+  of one TP rank".
 
 - [ ] Cross-profile interpolation stays disabled. A target-model routing dump
   now exists and passes the exact-profile regret gate, but interpolation still

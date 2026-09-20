@@ -6,9 +6,20 @@ import time
 from typing import Dict, List, Sequence, Tuple
 
 try:
+    from hot_wide_planner import HotWidePlanner  # noqa: E402
     from interval_planner import IntervalPlanner, PlannerCostModel  # noqa: E402
+    from model_lns import pack_lanes, planner_tasks  # noqa: E402
 except ImportError:  # pragma: no cover - installed package import
+    from .hot_wide_planner import HotWidePlanner
     from .interval_planner import IntervalPlanner, PlannerCostModel
+    from .model_lns import pack_lanes, planner_tasks
+
+
+def _domain_cores(model, num_cores: int) -> tuple[int, ...]:
+    """Cores per LLC domain of the calibrated rank, or one domain when none is calibrated."""
+    domains = getattr(getattr(model, "calibration", None), "llc_domains", ())
+    sizes = tuple(len(getattr(domain, "cpu_ids", ())) for domain in domains)
+    return sizes if sizes and sum(sizes) == int(num_cores) else (int(num_cores),)
 
 
 _BUCKETS = [1, 2, 4, 8, 12, 24, 48, 96, 192, 384, 768, 1536, 2040, 4096, 8192]
@@ -89,8 +100,8 @@ class PlannedMoE:
                 "PlannedMoE requires one calibration model"
             )
         self.num_cores = int(num_cores)
-        if search_mode not in {"full", "quick"}:
-            raise ValueError("search_mode must be 'full' or 'quick'")
+        if search_mode not in {"full", "quick", "hot_wide"}:
+            raise ValueError("search_mode must be 'full', 'quick', or 'hot_wide'")
         self.search_mode = search_mode
         self.cache_plans = bool(cache_plans)
         self.fixed_threads = None if fixed_threads is None else int(fixed_threads)
@@ -106,6 +117,15 @@ class PlannedMoE:
             )
             for model in self.models
         )
+        self.hot_wide_planners = tuple(
+            HotWidePlanner(
+                model,
+                num_cores=num_cores,
+                domain_cores=_domain_cores(model, num_cores),
+                window_policy=planner._stage_window_policy(),
+            )
+            for model, planner in zip(self.models, self.interval_planners)
+        ) if self.search_mode == "hot_wide" else ()
         self.policy_identity = tuple(
             (
                 model.policy.identity_key(),
@@ -141,7 +161,17 @@ class PlannedMoE:
         shared_expert_id: int | None = None,
     ):
         planner = self.interval_planners[planner_index]
-        if self.search_mode == "quick" and shared_expert_id is not None:
+        if self.search_mode == "hot_wide" and shared_expert_id is None:
+            lanes, _ = self.hot_wide_planners[planner_index].assign(
+                sorted(((int(e), int(r)) for e, r in counts if int(r) > 0), key=lambda item: (-item[1], item[0])),
+                shape,
+            )
+            used = tuple(lane for lane in lanes if lane.experts)
+            begins = pack_lanes(used, self.hot_wide_planners[planner_index].domain_cores)
+            if begins is None:
+                raise ValueError("cached hot-wide template no longer packs")
+            tasks = planner_tasks(used, begins)
+        elif self.search_mode == "quick" and shared_expert_id is not None:
             tasks = planner.quick_tasks_for_shared_shape(counts, shape, shared_expert_id)
         elif self.search_mode == "quick" and len(set(shape)) == 1:
             tasks = planner.quick_tasks_for_shape(counts, shape)
@@ -301,7 +331,30 @@ class PlannedMoE:
                 self.shape_cache.pop(cache_key, None)
                 hit = False
         if not hit:
-            if self.search_mode == "quick":
+            if self.search_mode == "hot_wide" and shared_expert_id is None:
+                if tail_pool_threads is not None:
+                    raise ValueError("hot-wide search does not support a forced tail pool")
+                fast = self.hot_wide_planners[0].plan(counts)
+                tasks = fast.tasks()
+                result = {
+                    "shape": tuple(fast.shape),
+                    "execution_mode": "strict",
+                    "assignment_order": "hot_wide",
+                    "tail_pool_threads": None,
+                    "tail_pool_max_routes": None,
+                    "tail_repartition_width": None,
+                    "tail_repartition_tasks": 0,
+                    "tail_repartition_route_slices": 1,
+                    "makespan_ns": fast.score_ns,
+                    "uncertainty_ns": 0.0,
+                    "tasks": tasks,
+                    "bridge": self.interval_planners[0].to_async_bridge(tasks, topk_ids=topk_ids),
+                    "policy": None,
+                    "shared_expert_id": None,
+                    "shared_width": None,
+                    "routed_width": None,
+                }
+            elif self.search_mode == "quick" or (self.search_mode == "hot_wide" and shared_expert_id is not None):
                 if tail_pool_threads is not None:
                     raise ValueError("quick search does not support a forced tail pool")
                 if shared_expert_id is None:

@@ -46,6 +46,9 @@ class StageWindowBand:
     w2_tiles: int
     widths: tuple[int, ...] = (1, 2, 4, 8)
     overrides: Mapping[int, tuple[int, int]] = field(default_factory=dict)
+    # Measured full-load T(window) / T(full stripe) per width. A width without an
+    # entry scales by 1, i.e. the cost model's full-stripe time is kept.
+    time_scales: Mapping[int, float] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.min_routes <= 0 or self.max_routes < self.min_routes:
@@ -59,6 +62,11 @@ class StageWindowBand:
                 raise ValueError(f"override width {width} is not in {self.widths}")
             if w13 < 0 or w2 < 0:
                 raise ValueError(f"override for width {width} must be non-negative tile counts")
+        for width, scale in self.time_scales.items():
+            if width not in self.widths:
+                raise ValueError(f"time scale width {width} is not in {self.widths}")
+            if not 0.0 < float(scale) <= 1.0:
+                raise ValueError(f"time scale for width {width} must be in (0, 1], got {scale}")
 
     def contains(self, routes: int) -> bool:
         return self.min_routes <= routes <= self.max_routes
@@ -67,6 +75,11 @@ class StageWindowBand:
         if threads not in self.widths:
             return None
         return self.overrides.get(threads, (self.w13_tiles, self.w2_tiles))
+
+    def time_scale(self, threads: int) -> float:
+        if threads not in self.widths:
+            return 1.0
+        return float(self.time_scales.get(threads, 1.0))
 
 
 @dataclass(frozen=True)
@@ -78,6 +91,9 @@ class StageWindowPolicy:
     intermediate_size: int
     backend_n_tile: int
     bands: tuple[StageWindowBand, ...]
+    # Machines this table was measured on. Empty means "any machine with the shape", which is
+    # how the tables predating the field are resolved; a table measured on one machine lists it.
+    machine_ids: tuple[str, ...] = ()
 
     def select(self, routes: int, threads: int) -> tuple[int, int]:
         """`(w13_tiles, w2_tiles)`, or `(FULL_STRIPE, FULL_STRIPE)` when uncovered."""
@@ -88,6 +104,18 @@ class StageWindowPolicy:
                 chosen = band.select(int(threads))
                 return chosen if chosen is not None else (FULL_STRIPE, FULL_STRIPE)
         return (FULL_STRIPE, FULL_STRIPE)
+
+    def time_scale(self, routes: int, threads: int) -> float:
+        """Full-load window/full-stripe time ratio of the selected windows; 1 when uncovered."""
+        if routes <= 0 or threads <= 0:
+            return 1.0
+        for band in self.bands:
+            if band.contains(int(routes)):
+                return band.time_scale(int(threads))
+        return 1.0
+
+    def matches_machine(self, machine_id: str | None) -> bool:
+        return not self.machine_ids or (machine_id is not None and str(machine_id) in self.machine_ids)
 
     def matches_shape(self, hidden_size: int, intermediate_size: int, backend_n_tile: int) -> bool:
         return (
@@ -148,15 +176,116 @@ AMAZON_C5_192C_TP4_F512_V5 = StageWindowPolicy(
     ),
 )
 
-_POLICIES: tuple[StageWindowPolicy, ...] = (AMAZON_C5_192C_TP4_F512_V5,)
+# Registered for the calibrated machine only (2026-09-20): Arm-codex NUMA3 80 cores (2 x 40-core LLC),
+# TP4 H=4096 F=512, SVE BF16 n_tile 16 (W13 tile 128 KiB, W2 tile 16 KiB).
+# Measured at full load (all lanes busy with the same width and window), producer-hot
+# A and cold B, two sessions, with jemalloc preloaded and purging disabled
+# (`tmp/jemalloc_rerun_20260919/decision.md`): the window table grid and the W2 sweep
+# at W13 = 1 tile, composed as for V2 (`build_v3.py` -> `table_v3.json`). V1/V2 were
+# measured under glibc, where the per-call route output page-faulted every call; that
+# cost hid most large-M window gains and caused the old W2 large-M penalty. Windows are
+# (W13 tiles, W2 tiles); `time_scales` is the measured full-load T(window)/T(full
+# stripe) the planner multiplies into T(M, t). Routes 1-16 are DRAM bound and every
+# window ties; above 720 there is no evidence, so both keep the full stripe. Widths
+# outside (2, 4, 8, 16) are uncalibrated and keep the full stripe.
+ARM_CODEX_NUMA3_80C_TP4_F512_N16_V3 = StageWindowPolicy(
+    name="arm_codex_numa3_80c_tp4_f512_n16_v3_full_load_jemalloc",
+    hidden_size=4096,
+    intermediate_size=512,
+    backend_n_tile=16,
+    machine_ids=("arm_codex_320c_numa3_80c_sve256_jemalloc_narrow_merge_v9",),
+    bands=(
+        StageWindowBand(
+            min_routes=17,
+            max_routes=33,
+            w13_tiles=1,
+            w2_tiles=8,
+            widths=(2, 4, 8, 16),
+            overrides={2: (1, 4)},
+            time_scales={2: 0.6555, 4: 0.7317, 8: 0.8483, 16: 0.9191},
+        ),
+        StageWindowBand(
+            min_routes=34,
+            max_routes=67,
+            w13_tiles=1,
+            w2_tiles=8,
+            widths=(2, 4, 8, 16),
+            overrides={4: (1, 4), 16: (2, 16)},
+            time_scales={2: 0.6061, 4: 0.748, 8: 0.8566, 16: 0.9687},
+        ),
+        StageWindowBand(
+            min_routes=68,
+            max_routes=117,
+            w13_tiles=1,
+            w2_tiles=4,
+            widths=(2, 4, 8, 16),
+            overrides={16: (FULL_STRIPE, FULL_STRIPE)},
+            time_scales={2: 0.6593, 4: 0.8169, 8: 0.8926},
+        ),
+        StageWindowBand(
+            min_routes=118,
+            max_routes=166,
+            w13_tiles=1,
+            w2_tiles=4,
+            widths=(2, 4, 8, 16),
+            overrides={16: (FULL_STRIPE, FULL_STRIPE)},
+            time_scales={2: 0.6999, 4: 0.8638, 8: 0.9323},
+        ),
+        StageWindowBand(
+            min_routes=167,
+            max_routes=235,
+            w13_tiles=1,
+            w2_tiles=4,
+            widths=(2, 4, 8, 16),
+            overrides={8: (1, 8), 16: (FULL_STRIPE, FULL_STRIPE)},
+            time_scales={2: 0.7187, 4: 0.885, 8: 0.9457},
+        ),
+        StageWindowBand(
+            min_routes=236,
+            max_routes=371,
+            w13_tiles=1,
+            w2_tiles=FULL_STRIPE,
+            widths=(2, 4, 8, 16),
+            overrides={4: (1, 4), 8: (1, 8), 16: (FULL_STRIPE, FULL_STRIPE)},
+            time_scales={2: 0.7789, 4: 0.911, 8: 0.9578},
+        ),
+        StageWindowBand(
+            min_routes=372,
+            max_routes=587,
+            w13_tiles=1,
+            w2_tiles=FULL_STRIPE,
+            widths=(2, 4, 8, 16),
+            overrides={2: (1, 4), 16: (FULL_STRIPE, FULL_STRIPE)},
+            time_scales={2: 0.8123, 4: 0.9601, 8: 0.9727},
+        ),
+        StageWindowBand(
+            min_routes=588,
+            max_routes=720,
+            w13_tiles=1,
+            w2_tiles=4,
+            widths=(2, 4, 8, 16),
+            overrides={4: (1, FULL_STRIPE), 8: (FULL_STRIPE, FULL_STRIPE), 16: (FULL_STRIPE, FULL_STRIPE)},
+            time_scales={2: 0.8345, 4: 0.9716},
+        ),
+    ),
+)
+
+_POLICIES: tuple[StageWindowPolicy, ...] = (
+    AMAZON_C5_192C_TP4_F512_V5,
+    ARM_CODEX_NUMA3_80C_TP4_F512_N16_V3,
+)
 
 
 def default_stage_window_policy(
-    *, hidden_size: int, intermediate_size: int, backend_n_tile: int
+    *, hidden_size: int, intermediate_size: int, backend_n_tile: int, machine_id: str | None = None
 ) -> StageWindowPolicy | None:
-    """The calibrated policy for this shape, or None when none was calibrated."""
+    """The calibrated policy for this shape and machine, or None when none was calibrated.
+
+    A table measured on one machine (``machine_ids``) resolves only for that machine; tables
+    without the field resolve on shape alone, as before.
+    """
     for policy in _POLICIES:
-        if policy.matches_shape(hidden_size, intermediate_size, backend_n_tile):
+        if policy.matches_shape(hidden_size, intermediate_size, backend_n_tile) and policy.matches_machine(machine_id):
             return policy
     return None
 
@@ -174,6 +303,7 @@ def stage_geometry_name(w13_windows: Sequence[int], w2_windows: Sequence[int]) -
 
 __all__ = [
     "AMAZON_C5_192C_TP4_F512_V5",
+    "ARM_CODEX_NUMA3_80C_TP4_F512_N16_V3",
     "FULL_STRIPE",
     "StageWindowBand",
     "StageWindowPolicy",

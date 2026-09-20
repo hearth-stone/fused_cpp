@@ -163,12 +163,15 @@ class IntervalPlanner:
         planner_threads: int | None = None,
         tail_repartition_widths: Sequence[int] | None = None,
         stage: str | None = None,
+        stage_window_policy=_UNSET,
     ):
         if stage not in {None, "w13", "w2"}:
             raise ValueError(f"stage must be None, 'w13', or 'w2', got {stage!r}")
         self.stage = stage
         self.model = model
-        self._stage_window_policy_cached = _UNSET
+        # _UNSET resolves the calibrated policy for the model's shape; None forces
+        # the full stripe; an explicit policy overrides both (opt-in tables).
+        self._stage_window_policy_cached = stage_window_policy
         self._shared_quick_cost_cache: dict[tuple[int, int], float] = {}
         self.num_cores = int(num_cores)
         model_widths = getattr(self.model, "supported_widths", None)
@@ -359,12 +362,34 @@ class IntervalPlanner:
             lane_loads[lane] = load
         return lane_experts, lane_loads
 
+    def _quick_homogeneous_scale(self, shape: Sequence[int]) -> float:
+        """Apply calibrated wide-team dilation to one homogeneous shape.
+
+        Quick still uses isolated LPT packing. The scale only ranks widths; it
+        is a whole-task proxy of the event-path GEMM occupancy term and is 1
+        when the profile has no wide-team table. A model exposing
+        ``quick_homogeneous_scale`` supplies the scale itself.
+        """
+        signature = tuple(int(part) for part in shape)
+        if not signature:
+            return 1.0
+        occupied = min(sum(signature), self.num_cores)
+        model_scale = getattr(self.model, "quick_homogeneous_scale", None)
+        if callable(model_scale):
+            return float(model_scale(int(signature[0]), occupied, self.num_cores))
+        pressure = getattr(getattr(self.model, "calibration", None), "wide_team_pressure", None)
+        occupancy = getattr(pressure, "occupancy_scale", None)
+        if occupancy is None:
+            return 1.0
+        return float(occupancy(int(signature[0]), occupied, self.num_cores))
+
     def _quick_cost_rows(self, experts, shapes):
         rows = []
         for shape in shapes:
             width = int(shape[0])
+            scale = self._quick_homogeneous_scale(shape)
             task_times = {
-                routes: self._task_time(routes, width)
+                routes: self._task_time(routes, width) * scale
                 for routes in dict.fromkeys(routes for _, routes in experts)
             }
             rows.append([task_times[routes] for _, routes in experts])
@@ -561,9 +586,21 @@ class IntervalPlanner:
         return self._dag_makespan([(routes, threads, deps) for _, routes, _, threads, deps in tasks])
 
     def _task_time(self, routes: int, threads: int) -> float:
+        """Task time under the windows the plan will carry.
+
+        The cost model prices the full stripe. A window policy with measured
+        full-load time scales turns that into T*(M, t) = T(M, t) * r(t, M), so
+        width selection sees the windows the lowering emits. Stage planners and
+        policies without scales keep r = 1.
+        """
         if self.stage is None:
-            return self.model.T_iso(routes, threads)
+            return self.model.T_iso(routes, threads) * self._window_time_scale(routes, threads)
         return self.model.stage_T_iso(self.stage, routes, threads)
+
+    def _window_time_scale(self, routes: int, threads: int) -> float:
+        policy = self._stage_window_policy()
+        scale = getattr(policy, "time_scale", None)
+        return 1.0 if scale is None else float(scale(int(routes), int(threads)))
 
     def _dag_makespan(self, tasks) -> float:
         if self.stage is None:
@@ -705,9 +742,9 @@ class IntervalPlanner:
     def _quick_candidate(self, experts, shape) -> dict:
         """Score one homogeneous shape with isolated LPT lane loads.
 
-        This deliberately avoids the event-time contention simulator.  It is
-        the bounded online path used before analytical native scoring exists;
-        the full planner remains the source of performance-oracle decisions.
+        Packing stays isolated-LPT. Width ranking multiplies the lane makespan
+        by the calibrated wide-team occupancy scale when present. This is not
+        the event simulator; full search remains the mixed-width oracle.
         """
         signature = tuple(int(value) for value in shape)
         if len(set(signature)) != 1:
@@ -715,7 +752,7 @@ class IntervalPlanner:
         lanes = self._lanes(signature)
         assignment, lane_loads = self._assign_homogeneous_lpt(experts, lanes)
         tasks = self._build_tasks(experts, lanes, assignment)
-        makespan = max(lane_loads, default=0.0)
+        makespan = max(lane_loads, default=0.0) * self._quick_homogeneous_scale(signature)
         uncertainty = self._uncertainty(
             experts,
             signature,
@@ -1308,6 +1345,12 @@ class IntervalPlanner:
             if forced_pool_threads is not None
             else [width for width in self.widths if width in _AUTO_TAIL_POOL_WIDTHS]
         )
+        # A pool width the cost model never measured is scored with the nearest one it did, which
+        # is how one-thread pools got chosen and then ran 3.2-4.3x their predicted time
+        # (tmp/search_reliability_20260920, E8). Keep the automatic search inside the calibration.
+        supports_width = getattr(self.model, "supports_width", None)
+        if callable(supports_width) and forced_pool_threads is None:
+            widths = [width for width in widths if supports_width(int(width))]
         candidates: list[dict] = []
         for strict_candidate in strict_candidates:
             for threshold in thresholds:
@@ -1782,6 +1825,7 @@ class IntervalPlanner:
                     hidden_size=int(hidden_size),
                     intermediate_size=int(intermediate_size),
                     backend_n_tile=int(backend_n_tile),
+                    machine_id=getattr(getattr(self.model, "calibration", None), "machine_id", None),
                 )
         self._stage_window_policy_cached = resolved
         return resolved

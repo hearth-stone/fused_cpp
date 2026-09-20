@@ -14,6 +14,7 @@ from cpu_moe_schedule_optimization.cost_model.analytic_model import (
     AnalyticMachineCalibration,
     AnalyticMoeCostModel,
 )
+from cpu_moe_schedule_optimization.cost_model.probe_event_model import ProbeEventModel
 from cpu_moe_schedule_optimization.planners.planned_moe import PlannedMoE, route_counts
 from fused_cpp.moe.cost_cache import DEFAULT_MOE_COST_CACHE_DIR, MoeCostDiskCache
 from fused_cpp.moe.plan import AsyncMoEPlanV2
@@ -53,13 +54,18 @@ class MoePlannerRuntime:
         cpu_ids: Sequence[int] | None = None,
         shared_experts: int = 0,
         cost_cache_dir: str | Path | None = DEFAULT_MOE_COST_CACHE_DIR,
+        event_calibration: str | Path | None = None,
+        search_mode: str = "quick",
     ) -> None:
         if int(shared_experts) not in {0, 1}:
             raise ValueError("shared_experts must be 0 or 1")
         self.shared_experts = int(shared_experts)
         planner_global_experts = int(global_experts) + self.shared_experts
         planner_local_experts = int(local_experts) + self.shared_experts
-        self.model = AnalyticMoeCostModel(
+        if search_mode not in {"quick", "hot_wide"}:
+            raise ValueError("search_mode must be 'quick' or 'hot_wide'")
+        self.search_mode = search_mode
+        analytic = AnalyticMoeCostModel(
             calibration,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
@@ -69,7 +75,14 @@ class MoePlannerRuntime:
             degree=degree,
             concurrent_ranks=concurrent_ranks,
         )
-        machine = self.model.calibration
+        # The hot-wide planner reads the probe-calibrated event model's isolated times; the
+        # analytic model keeps supplying the phase skeleton, shapes and byte accounting.
+        self.model = (
+            analytic
+            if event_calibration is None
+            else ProbeEventModel(analytic, event_calibration)
+        )
+        machine = analytic.calibration
         if cpu_ids is None:
             cpu_ids = machine.rank_cpu_ids or self._current_affinity(machine.cores_per_rank)
         resolved_cpu_ids = tuple(int(cpu) for cpu in cpu_ids)
@@ -91,7 +104,7 @@ class MoePlannerRuntime:
             self.model,
             num_cores=self.num_cores,
             cpu_ids=self.cpu_ids,
-            search_mode="quick",
+            search_mode=self.search_mode,
             cache_plans=False,
             fixed_threads=_fixed_planner_threads_from_env(),
         )
@@ -385,10 +398,51 @@ def enable_moe_planner_quick(
     return runtime
 
 
+def enable_moe_planner_fast(
+    calibration: AnalyticMachineCalibration | str | Path,
+    event_calibration: str | Path,
+    *,
+    hidden_size: int,
+    intermediate_size: int,
+    global_experts: int,
+    local_experts: int,
+    cpu_ids: Sequence[int] | None = None,
+    mode: str = "standalone",
+    degree: int = 1,
+    concurrent_ranks: int = 1,
+    cost_cache_dir: str | Path | None = DEFAULT_MOE_COST_CACHE_DIR,
+) -> MoePlannerRuntime:
+    """Install the hot-wide fast planner on an already calibrated machine.
+
+    ``calibration`` is the analytic machine file (phase skeleton, shapes, bytes) and
+    ``event_calibration`` the probe-calibrated event model (isolated times of the planner's
+    cost function). Measured on Arm-codex NUMA3 80C with the v9 and v11 files, the plans this
+    runtime emits run 9.6% faster than the quick runtime's
+    (`tmp/fast_planner_20260920/decision.md`).
+    """
+    runtime = MoePlannerRuntime(
+        calibration,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        global_experts=global_experts,
+        local_experts=local_experts,
+        mode=mode,
+        degree=degree,
+        concurrent_ranks=concurrent_ranks,
+        cpu_ids=cpu_ids,
+        cost_cache_dir=cost_cache_dir,
+        event_calibration=event_calibration,
+        search_mode="hot_wide",
+    )
+    set_default_moe_planner_runtime(runtime)
+    return runtime
+
+
 __all__ = [
     "DEFAULT_MOE_COST_CACHE_DIR",
     "MoePlannerRuntime",
     "calibrate_moe_planner_quick",
+    "enable_moe_planner_fast",
     "enable_moe_planner_quick",
     "get_default_moe_planner_runtime",
     "set_default_moe_planner_runtime",

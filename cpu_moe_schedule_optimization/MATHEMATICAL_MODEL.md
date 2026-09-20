@@ -1657,6 +1657,68 @@ $T_{guard}(P')\le(1-\delta_{min})T_{guard}(P)$才可自动替换incumbent；首�
 $\delta_{min}=2\%$与既有no-regression/actionability gate一致。低于margin的候选可进入
 measured shortlist，但不能驱动VND接受或作为模型证明收益。
 
+**离线双候选选择（Lab，2026-09-06）。** 对现有 strict shape/order 候选集及 analytic
+baseline，保留 $P_m=\arg\min_P\widehat T(P)$（沿用现有 tie-break）和历史 width-fallback
+选择 $P_f$。以完整 PlanV2 bridge 的确定性 JSON 内容去重：
+$S=\operatorname{unique}_{bridge}\{P_m,P_f\}$，因此 $1\le|S|\le2$。
+该去重不重排 task，也不宣称能识别所有语义等价的不同编码。单候选直接保存，标记未进行
+硬件比较；双候选沿用两次独立进程、每次5 warmup与31 paired rounds、同copy配对、4-copy
+轮换和216 MiB scrub。每个session取中位耗时最小的计划，只有两个session一致才输出
+`hardware_consensus_winner`及完整bridge；不一致输出未决，不自动回退并冒称硬件winner。
+若两次session对另一计划的paired gain中位数均大于2%且P10大于0，才标记`actionable`。
+较小但一致的经验winner可保存，不能当作稳定收益保证。winner携带route/layer、calibration、
+extension、计划hash及session证据；证据不匹配或轮次不完整时拒绝生成。
+这只改变独立离线Lab工作流，不改变模型公式、生产selector、partial-order pruning或PlanV2
+格式。已知三trace中median/high-skew支持score-best，uniformish完整bridge相同；不是新的
+未见数据泛化验证，更不是全局最优证明。入口为`bench_selection_pair.py tune`，历史session
+可通过`offline_selection_winner.py`直接生成结果，避免重复硬件测量。
+
+**有预算的单层order-only扩展（Lab）。** 以已保存硬件winner为anchor，保持每条lane的
+CPU区间、width、task集合、routes、window和early-merge不变，仅调整序列并重新派生链依赖。
+三类proposal为随机子集lane独立反转、随机非零循环位移、多lane联合交换head/tail；每类
+最多256次尝试得到24个唯一候选。保留每类event-score最小者及与其task位置Hamming距离
+最大者，跨类别去重并保留anchor；每trace最多72次候选评分、7个硬件计划，只有一层。
+这不是全排列搜索，也不是新的默认neighborhood。两次session均满足paired gain中位数>2%
+且P10>0才考虑后续层；不根据结果追加预算。实现及证据见
+`bench_bounded_order_extension.py`和对应20260906报告。
+
+**访存压力平滑proposal（Lab，不是时间模型）。** 固定每lane task集合和width，将isolated
+phase串接，令每phase offered rate为其既有isolated DRAM字节估计除以base时长。
+以$q(t)$表示各lane rate之和，候选目标为$J=\int q(t)^2dt/T$；固定工作与isolated horizon
+保证其变化不是总流量变化或主动延迟。domain版本使用$\int\sum_d q_d(t)^2dt/T$，按lane
+CPU落入LLC domain的比例拆分offered rate；不假设两domain有独立DDRC容量。它只是生成
+顺序候选的近似指标，忽略真实contention引起的phase位移，不能解释为实测带宽/queue。
+每目标64次mutation，生成global平滑、domain平滑、global增峰反向对照，加routes大小交替
+策略和anchor，每trace最多5个硬件计划。两session硬件gate沿用中位gain>2%、P10>0。
+不改v8公式、calibration或生产默认，不能根据本轮结果反向拟合物理项。
+
+GEMM平均密度对照（2026-09-07）将每个W13/W2的连续phase分别合并成单个区间，
+$\rho_{gemm}=\sum_p B_p/\sum_p T_p$，非GEMM区间保持独立；总流量和时间守恒。
+只生成global二阶矩下降/上升各64次尝试的终点，加anchor共3计划。主要比较均匀计划
+相对非均匀计划的实测paired gain，另行检查相对anchor是否满足原actionable gate。
+此Lab模式不修改原phase模式、不代表真实访存速率、也不进入生产评分或pruning。
+
+合成M验证（2026-09-07，Lab）固定E60、10x8T、每lane三小三大任务，比较全部LLLHHH
+与奇数lane HHHLLL，关闭early merge；全同M参考为1/4/16/64/256。两session中(4,32)、
+(16,128)、(64,512)交错收益约3.4%、25.2%、17.4%，(1,8)无稳定收益。平均DDR流量
+随大M下降，但收益非单调，因此不能用平均压力或M阈值直接替代实测选择。此结果只属合成
+固定宽度验证，不新增生产规则、物理参数或真实trace泛化结论。
+
+显式交错模板与扩展顺序（2026-09-07，opt-in Lab）：`interleave`生成按routes升降序的
+lane奇偶错排（两种方向），以及lane内大小任务按1/2个为块交替（两种起始方向）；同M
+lane保持不变。`extended`再加入独立反转、循环位移、多lane head/tail交换、完整连续块
+迁移，每随机family最多256次尝试、24唯一候选。每个操作保留每lane task集合及width、
+CPU/window/merge语义，依赖由序列重新派生。新模式先为每family保留一个代表，再用剩余
+名额；模板/反转/head-tail用模型最好代表，rotation/block用最大顺序距离代表，最多6候选
+加anchor。分类标签和moved experts进入artifact。默认`legacy`不变；此接口不直接扩展
+生产neighbor或VND/LNS自动接受域，也不复用旧residual radius作新family的确定性剪枝。
+
+策略对照（Lab，2026-09-07）：interleave/extended各自最多6候选加同一最新已测anchor；
+跨策略按完整bridge去重，显式union测量上限13，默认单策略上限7保持不变。共享候选只测
+一次，归属映射保留；不足预算不补样，报告生成/评分数与实际测量数。新的anchor输入必须
+通过原始frontier对应双session的稳定收益gate，并以原始routes metadata完整恢复bridge。
+这不是生产接受规则，不把已选union当成全局oracle，也不因新策略标签复用旧残差剪枝。
+
 **Anchor-relative partial-order diagnostic。** 离线搜索不需要把低于分辨率的候选强制排成
 全序。固定一个可执行anchor $P_0$，采用“正值表示candidate更快”的相对增益：
 
@@ -1690,6 +1752,43 @@ calibration/extension identity的pairwise report。候选分为：`better`进入
 `better`即停止，不能把`incomparable`当作下降失败证明。启用前必须满足对应top-K的
 measured-best recall与zero-false-pruning gate；首版默认$K=16$。该策略只进入离线Lab路径，
 不改变production quick planner、Plan V2或runtime dispatch。
+
+**独立 context-aware residual 候选（Lab）。** 不修改冻结 v8 或现有搜索 objective，
+实验模块 `optimizations/fused_moe_sve/benchmarks/context_aware_residual.py` 预测
+
+$$
+\widehat T_{ctx}(P)=\widehat T_{v8,event}(P)+10^6(b+\beta^T z(P)),
+\qquad z_j(P)=(x_j(P)-\mu_j)/s_j.
+$$
+
+时间输入/输出为 ns，拟合 residual 为 ms；$\mu,s$ 只用训练计划，常量列令 $s=1$。
+训练目标为 $n^{-1}\|y-b-Z\beta\|_2^2+\alpha\|\beta\|_2^2$，
+$y=(T_{hw}-\widehat T_{v8,event})/10^6$，截距不惩罚，首轮固定 $\alpha=10$。
+输出非正或非有限时间直接报错，不静默裁剪。此为经验 residual，不声称新增物理定律。
+
+首版仅支持显式 LLC domain、非空 strict whole-expert plan、W13/W2 `window_tiles=0`。
+23 个白名单特征按结构（8）、预测时序（12）、交互（3）递增做并列消融：lane isolated
+load 与 domain core-time、head/tail route fraction；每 domain 的 B-active task count、
+requester count 与时间加权波动、small-route exposure、operator/B overlap、cohort
+transition、lane finish spread；count/requester 与 small-route exposure 交互。
+small-route 指 $M\le12$，不表示权重更小；B-active 是预测的 cold_b/steady_b phase，
+不是实测 DDR stream，也不等同 transfer-bound。跨 domain task 在每个触及 domain 计一次，
+requester 按实际 active CPU 分摊；统计按 domain 等权及事件时长加权。
+
+特征从完整 plan 与重新生成的冻结 v8 预测事件提取，不使用实测 PMU、实测结束时间、
+expert/hash identity 或 search outcome。时间线仍是 v8 近似；本版 plan-level residual
+不反馈到 phase simulator，不声称解决队列动态或阶段误差归属。model profile 独立序列化，
+校验 v8 calibration SHA、extension SHA、重评分源码 SHA、shape 和 protocol identity。
+特征语义变更必须更新独立 schema，不能借用 production calibration schema。
+
+每个训练 plan 仅一条聚合 observation。验证默认拒绝与训练的 canonical plan hash 或
+structural group 重叠；显式 replay overlap 只作诊断。同 plan 的另一 session 不是新 plan
+holdout。报告 MAPE/MAE、同 group 同 session 内 pairwise gain error 与 2% median-margin
+direction、top-K measured-best recall/regret、训练范围外特征；median-margin 不冒充 paired
+round 的稳定置信标签。$K$ 覆盖整个已测组时标记 trivial recall。无剪枝政策，false pruning
+为 not applicable 而不是 0；`Accept=Prune=empty`，不得复用旧 partial-order radius。
+保留旧 route sweep/三 trace holdout；后续已公开 LNS 数据仅用于 development，不能因重放
+收益而宣称独立硬件验证或采用。运行实验由用户指定的 terra/medium agent 执行。
 
 **Two-level executable evaluator。** 完整placed event score保持唯一权威objective，并按
 canonical state hash缓存。cheap screen复用不可变lane phase及isolated lane load，构造
@@ -1994,9 +2093,12 @@ $$
 
 因此单 task 或无 peer 时达到 $B_t$，满 cohort 时达到 $S_t$，且不允许
 $S_t<B_t<1$ 破坏 resource lower bound。$B_t/S_t$ 都是离散宽度表；未校准宽度返回 1，
-不做跨宽度外推。该项只在
-有真实 CPU placement 的 heavy event path 生效，旧 unplaced API 和 production quick
-$T_{iso}$ 不变。cold-phase CP-SAT 无法在线性 cumulative master 中精确表达随 active set 变化的
+不做跨宽度外推。该项在有真实 CPU placement 的 heavy event path 上按 phase 作用于 GEMM。
+unplaced `dag_makespan()` 仍不加该项。production quick 的 $T_{iso}$ 与 LPT packing 不变，
+但齐次形状之间的 makespan 比较乘上 occupancy-aware 整任务代理
+$D^{team}(t,A)=B_t+(S_t-B_t)q(t,A)$，其中 $A=\min(\sum t_{\mathrm{lane}},C)$。
+这只修正「孤立 $T_{iso}$ 选过宽齐次队」；不是 event 精度，也不恢复局部邻居序。
+无表或未校准宽度时系数为 1。cold-phase CP-SAT 无法在线性 cumulative master 中精确表达随 active set 变化的
 $q_i(e)$，而把 $B_t$ 或 $S_t$ 静态乘到整个 mode 会错误改变 wave 数与宽度的权衡。因此
 analytical CP master 保持原 isolated cold surrogate；proof gap明确不包含 wide-team pressure，
 不能声称证明完整并发 event objective。
@@ -2017,6 +2119,237 @@ $q_{32}=2/3$，由残差中位 `1.577` 解得 $S_{32}=1.619$；80T 不存在 pee
 $S_{80}=B_{80}=2.306$。这只能识别该机器、BF16 TP4 proxy、离散
 4/8/16/32/40/80T cohort
 域内的 residual pressure；route class、partial occupancy 和第二台 Arm 仍是 holdout 风险。
+
+**jemalloc 重标定（v9，2026-09-19）。** 上述 $B_t/S_t$、1T/2T `by_width` 与窄 team
+修正均通过无 workspace 的 Plan V2 调用测得，glibc 下含每次调用新分配 `route_out` 的
+缺页与清零。改用 jemalloc never-purge 后以相同脚本、相同层与推导重测（服务速率与
+topology v2 不变）：$S_{4/8/16/32/40/80}=1.000/1.192/1.276/1.516/1.512/2.029$，
+$B_{8/16/32/40/80}=1.120/1.169/1.452/1.435/2.029$；1T `by_width` 为
+$210.0\,\mu s+3.37\,\mu s\cdot R$，2T 为 $81.9+3.92R$；$c_1/c_2=0.717/0.507$。
+同源 glibc 对照复现旧值（除 $S_{32}$、$B_{40}$ 漂移约 11%）。三个闸门层留出上，
+event 模型实测/预测中位由 v8 的 0.898 变为 v9 的 0.984（中位 $|\log|$ 0.107→0.038）。
+1T 的固定/每路由拆分不可良好识别（多次拟合固定项 100--210 µs），非拟合 peer 模式高估
+约 5%。服务探针单次抽查显示 80T DRAM 可能低于 v2（未重测）。见
+`tmp/jemalloc_recal_20260919/decision.md`；文件在
+`bench_assets/moe_paper/arm_codex_numa3_80c_jemalloc/`，现有消费方未切换。
+
+**探针校准的融合 event 模型（v10，Lab 候选，2026-09-19）。** v9 的三处已被实测否定：并发窄
+lane 的 DRAM 需求（spill=1.0）比 DDRC 计数高约 6 倍；DRAM 服务"到 380 GB/s 才稀释"的饱和位置
+不对（真实满载只有 44--71 GB/s 却已有减速）；$B_t/S_t$ 对单个大 M task 在 32T 上高估 24--28%。
+v10 保留 phase 划分、事件模拟与 placement，删除 spill 规则、DRAM 饱和稀释、$B_t/S_t$ 与
+$c_1/c_2$，并规定：**任何一项都由隔离该项的探针直接测量，不在 plan 时间上回归；整计划只用于验证。**
+（先前一版在单目标实验格上回归响应形式，拟合格 MAE 0.026，但整计划开发集高估约 20%：单目标
+bench 中目标的权重装载段总与全部后台 lane 的同步起跑相撞。该回归结果只保留为消融基线。）
+
+孤立时间：
+
+$$
+T^{iso}_{v10}(M,t)=(1+\varepsilon)\sum_p \tau_p(M,t)+O(t),\qquad
+\varepsilon=0.065,\quad O(t)=10\,\mu s+2.5\,\mu s\cdot t\ (t\ge4),
+$$
+
+$\tau_p$ 为 v9 的 phase 基准时长；$\varepsilon$ 由单 expert 孤立格（4/8/16/32T，M 256--2048）
+测得，$O(t)$ 由"单个 team 顺序执行整层"的对照测得（8/16/32T 两层，误差 $\le1.8\%$）。
+1T/2T 保留 v9 的 `by_width` operator phase。
+
+争用：task 的每个 phase 属于 **装载**（$L$：v9 的 cold-B，即 W13 与 W2 的首个 12-row panel，
+首次读入该 expert 的权重）或 **稳态**（$S$）。事件 $e$ 中，除 task $i$ 自身外正在装载的核数为
+$n_L$，处于稳态的核数为 $n_S$。四条服务曲线由探针直接测得（$t\in\{2,4,8,16,32\}$，
+$n\in\{0,8,16,32,48,64,76\}$，4T 后台 lane）：
+
+| 曲线 | 目标 | 后台 | 测量量 |
+| --- | --- | --- | --- |
+| $D_{LL}(t,n)$ | M=12 expert 链（整段即装载） | M=12 链 | 目标链每 expert 跨度 / $n=0$ |
+| $D_{LS}(t,n)$ | 同上 | M=2048 链 | 同上 |
+| $D_{SS}(t,n)$ | 两个 route 数的单 expert | M=2048 链 | 每 route 斜率 / $n=0$ 斜率 |
+| $D_{SL}(t,n)$ | 同上 | M=12 链 | 同上 |
+
+斜率法 $(T(M_b)-T(M_a))/(M_b-M_a)$ 消去同步起跑碰撞与装载段。组合规则在测量前冻结，无自由
+参数：
+
+$$
+D_i(e)=1+\bigl(D_{xL}(t_i,n_L)-1\bigr)+\bigl(D_{xS}(t_i,n_S)-1\bigr),\qquad x\in\{L,S\}
+\text{ 为 } i \text{ 当前 phase 的类别},
+$$
+
+曲线对 $n$ 分段线性、超出末点取常数，对宽度按 $\log_2 t$ 线性插值。Arm-codex NUMA3 80C 实测
+（两会话均值）：$D_{SS}\le1.03$；$D_{LL}$ 在 $n=48/64/76$ 为 4T 的 1.32/1.64/1.90、16T 的
+1.53/1.85（$n=64$）；$D_{SL}$ 为 4T 的 1.05/1.09/1.13、2T 的 1.13/1.27/1.38；$D_{LS}$ 对 2T/4T
+$\le1.016$，对 8/16/32T 为 1.11--1.35（$n=48$）。即争用几乎全部发生在权重装载段之间，
+稳态对稳态可忽略；20 个忙核以内四条曲线均 $\le1.05$。16T/32T 的装载曲线两会话相差 3--15%
+（0.10--0.15 ms 的任务），记为不稳定点并仍用均值；三个背景覆盖率 <1 的点按冻结规则剔除。
+机理检验未通过：装载段每 expert 的核时超额 $(D_{LL}-1)\tau_L t$ 在 $n=48$ 为
+0.39/0.60/0.89/1.23/2.09 core-ms（2/4/8/16/32T），不重合，因此曲线按"宽度分档的服务表"
+报告，而不是单一硬件带宽曲线。同核数下后台 lane 越宽施加的负载略低（16T 后台比 4T 后台的
+超额在 $n=64$ 小约 20--40%），模型只按核数计，不区分后台宽度。
+
+整调用时间 $T_{call}=\text{makespan}+t_{over}$，$t_{over}=0.78$ ms 由 W 组协议（ready-token
+merge 开、producer-hot 输入）下成对的"不追踪 wall / 追踪 compute makespan"直接测得（追踪只
+推迟调用结束，不改变计算跨度：追踪调用的 native e2e 与不追踪 wall 相差 <0.2 ms）。
+
+Stage window：选择取 V3 表（M2 的 N 组在 32 个未见 M 格上 regret $\le3.65\%$）。时间尺度随
+负载变化（M2 的 C 组：同一 window 的收益从孤立 2% 到满载 21%）：windowed task 孤立时为
+$(1-g_0)\tau$，$g_0=0.02$；在表的校准负载（同宽同 M 满载，模型超额 $e_{cal}$）下为
+$r(t,M)\,\tau(1+e_{cal})$；其间按当前超额 $e/e_{cal}$ 线性过渡，超过取 $r$。无拟合参数。
+静态选择在小 M/大 M 后台下最多损失 2.7%（C1 未过），本轮不处理。事件模型因此与 quick 使用
+同一套 window 时间。
+
+不进入预测的量：按宽度的残差 $\eta_t$ 只作诊断报告；DRAM 字节不作为时间模型的输入（孤立
+4T team 以 21--27 GB/s 持续读 DRAM 而不受时间惩罚，满载每 lane 仅约 3.4 GB/s，该现象未解释）。
+
+拟合外检查（未参与任何标定）：layer 12/29 的 54 个 full-stripe 开发整计划上 regret@1 为
+0/0/0.08/0/2.70/0%，Spearman 0.85--1.00，wall/预测 中位 1.076（齐次）与 1.044（热点固定），
+53/54 落在 $[0.85,1.15]$（v9：layer 29 regret 3.6--8.6%，热点固定计划 0.79--0.94）。先前采集的
+68 个单目标负载格减速 MAE 0.054（无争用基准 0.115）：大 M 目标 0.02--0.035，小 M 目标在
+同步/小 M 后台下低估 0.13--0.43（最大为 2T M144）。验收以 M2 的 W 组与 S 验证格为准
+（`tmp/m2_validation_20260919/decision.md`），预测文件在测量前冻结。实现为 Lab 模块
+`tmp/v10_model_20260919/v10.py`，不改 production、Plan V2、kernel 与默认消费方；探针记录见
+`tmp/v10_probes_20260919/decision.md`。
+
+验收结果（M4，2026-09-20，预测文件冻结后一次性测量，18 个未见层工作负载 × 11 个 full-stripe
+候选，两会话）：W1 通过，实测/预测中位为齐次 1.072、热点固定 1.05、混合 1.075（模型整体偏低
+5--8%，未修正）；W2 按冻结规则未过，regret@1 中位 0%、17/18 $\le5\%$、最大 5.003%
+（差 0.003 个百分点），regret@2 最大 3.4%，失误集中为"8T 型层上偏好 p16_r4"（损失 4--5%）；
+对照 v9 event 最大 10.35%、冻结 quick cost 最大 15.09%、无争用 10.35%。S 验证格：S2 通过
+（减速 MAE 0.030，对无争用 0.062、v9 0.043），S1 未过——大 M 目标（M 768--1536）MAE
+0.007--0.016，小 M 目标（4T M48）负载下低估至 0.40。按冻结规则采用收窄声明：模型把候选剪到
+2 个（其最优与实测最优相差 $\le3.4\%$）并由实测共识 tuner 决定；争用层按"实测服务表、对大 M
+任务成立"报告。不开第二轮修订；v10 仍为 Lab 候选，消费方未切换。
+
+**v10 接入与模型目标 LNS（2026-09-20，opt-in，默认不变）。** 用户决定（2026-09-20）：将 v10
+接入正式代码观察效果，按结果修正模型或搜索。实现：`cost_model/probe_event_model.py` 的
+`ProbeEventModel` 以上述公式实现 `dag_makespan_placed`/`explain_dag_placed`/`T_iso`/
+`call_time_placed`，phase 骨架取包装的 `AnalyticMoeCostModel`（v9 标定），其余 planner 接口
+委托给它；native planner 导出被关闭（native 路径使用自身的 v8/v9 服务模型，会绕过该目标）。
+标定文件 `bench_assets/moe_paper/arm_codex_numa3_80c_jemalloc/probe_event_v10_20260919.json`
+即冻结的 `params_v10_probe.json`。给定 window policy 时，每个 task 的 window 由 lowering 同一
+张表决定，事件模型因此看到与运行时相同的 window。事件模拟中曲线按整数核数预制表，并以装载/
+稳态核数计数器增量维护，数值与 Lab 实现一致（306 个 M4 计划相对偏差 $\le 6\times10^{-15}$），
+单次 220 task 评估 8.6 ms。quick：`IntervalPlanner` 若模型提供 `quick_homogeneous_scale` 则用它
+代替 $B_t/S_t$ 占用比例；v10 返回 1，即 quick 按 v10 孤立时间 × window 时间尺度做齐次 LPT。
+
+模型目标 LNS（`planners/model_lns.py`，离线参照物）：计划为一组串行 lane，lane 宽度
+$t\in\{2,4,8,16,32\}$、位于单个 LLC 域内（首次适配递减装箱，v10 只读宽度与并发，不读物理
+位置，因此任何合法装箱等价），目标为 v10 event makespan。移动：迟 lane 的 expert 迁到/换到早
+lane（relocate/swap）、宽度拆分/合并（split/merge，孤立 LPT 重分）、复合重装（repack：迟 lane
+与随机 1--7 条 lane 的 expert 合池，在同核数的宽度模板——齐次或一宽多窄——上孤立 LPT 重分；
+P2 中单步移动够不到的混合形状由它覆盖）、lane 内顺序（降序/升序/热点先行其余升序）。每轮
+评估一批采样邻居，改进则接受；连续 patience 批无改进时从最优解扰动重启。它不是 native
+planner 的替代，而是 quick 的对照标尺与特征来源。效果实验 E1 的设计与结果见
+`tmp/v10_integration_20260920/decision.md`。
+
+**v11：中 M 服务探针修正（2026-09-20，Lab 候选，opt-in）。** E1（`tmp/v10_integration_20260920`）
+显示 v10 驱动的搜索利用模型误差：含 2T lane 的搜索计划实测/预测 1.325、无 2T 的 1.175，锚点
+1.09--1.11；逐 task trace（E1d）定位到负载下窄 lane 的中小 M 任务（2T M25--384 为 1.19--1.41，
+4T M13--192 为 1.12--1.26），孤立时间不是原因。v11 在 v10 上加三项，均由探针 P6 直接测得
+（`tmp/v11_probes_20260920/decision.md`），组合规则测量前冻结，不在整计划时间上拟合：
+
+1. 孤立校正 $c(t,M)=T_{meas}/T_{v10}$（A 组 $n=0$ 每 expert 跨度，$M\in[24,384]$），孤立时间与
+   per-expert 开销乘以 $c$；$M$ 上 log-log 插值，超出实测范围 1.5 倍后取 1，32T 不校正。
+2. 按 $M$ 索引的稳态曲线：相邻实测 $M$ 对的每 route 斜率在装载/稳态背景下相对孤立斜率的比值
+   给出 $D_{SL}(t,n;M_{mid})$、$D_{SS}(t,n;M_{mid})$，$M_{mid}=\sqrt{M_aM_b}$；v10 曲线作为其自身
+   $M_{mid}$（2T 362、4T 724、8--32T 1448）处的点；稳态 phase 按任务 $M$ 在 $\log M$ 上插值。
+3. 中 M 背景的装载等价：处于稳态 phase、路由数为 $M$ 的任务按 $w(M)\cdot t$ 计入装载核数，
+   $(1-w(M))\cdot t$ 计入稳态核数。$w$ 由 B 组（4T M12 装载目标旁的 M 链背景）把实测 $D$ 反演为
+   等价装载核数 $n_{eq}$（反演 $D_{LL}(4,\cdot)$），$w=\mathrm{median}_n\,(n_{eq}-f_L n)/((1-f_L)n)$，
+   $f_L$ 为背景链的模型装载时间份额；实测 $w(24,48,96,192,384)=0.79,0.56,0.35,0.18,0.11$，
+   $w(2048)=0$。装载 phase 仍按 $w=1$ 计。核数计数因此可为小数，曲线按 1/4 核制表。
+
+window 的标定负载条件同样按 $w$ 拆分。装载曲线 $D_{LL},D_{LS}$、$\varepsilon$、$O(t)$、$t_{over}$、
+$g_0$ 与 v10 相同；无 v11 扩展字段的标定文件与 v10 数值一致（306 个 M4 计划 $\le6\times10^{-15}$）。
+偏离冻结文本一处（已记录）：11 个由小路由差斜率得到、低于 1 的稳态点取 1。描述性检查（E1 已见
+数据，未参与构建）：无 2T 搜索计划实测/预测 1.088--1.097，与锚点一致；2T 计划仍为 1.15--1.16；
+E1 七个计划中的选择 regret 中位 0、最大 7.9%（v10 为 7.7%/10.6%）。残差：2T M97--384 任务
+约 1.25，8T M$\le$24 约 1.15--1.29；探针背景均为 4T lane，而背景 lane 越窄争用越重（v10 对照），
+核数组合看不到这一点（候选原因，未检验）。验证见 E2（`tmp/v11_validation_20260920/decision.md`）。
+
+模型目标 LNS 的补充（同日）：新增 rebalance（晚/早两条 lane 的 expert 合池后按孤立负载最小最大
+做分支定界重分）、recreate（随机化贪心重建）、更多 lane 内顺序与阈值接受；搜索时限在最好的
+至多 4 个不同起点间均分，各自下降（多起点）。在 P2 的 36 个可精确求解小实例（v10 目标）上，
+单起点版本最大差距 2.0%，多起点版本全部达到精确最优（最大 0.004%）。
+
+**v11 验收与快速 planner（E2/E3，2026-09-20）。** E2 在 18 个从未使用过的层上一次性测量：v11
+搜索（lane 宽度限 $\ge4$）的计划在 17/18 个层上实测最快，比生产 quick 快 13.2%（中位，区间
+$-14.9\%$ 到 $-5.5\%$）、比四个锚点构造中最好的快 10.2%、比 v10 搜索的同族计划快 3.7%；v11 在
+7 个非 2T 计划上的 regret@1 中位 0%、最大 7.9%、regret@2 最大 1.8%（v10 为 3.4%/14.8%/5.5%）。
+按 E2 冻结规则，2T lane 移出参照搜索空间：其计划实测/预测 1.237（锚点 1.085），预测与实测的
+快慢符号一致 0/18。限制说明：P1--P6 的背景一律为 4T lane，而模型只按核数组合，背景 lane 越窄
+争用越重（v10 对照已见），因此全 2T 计划被系统性低估约 14%；该现象未解释，留作 future work。
+
+快速 planner（`planners/hot_wide_planner.py`，从参照计划中提取的三个特征）：形状取"少数宽 lane
+（8/16/32T）承载最热 expert + 其余核全为 4T lane"的 14 个模板；lane 负载用孤立（含 window 尺度）
+时间乘按宽度的事件/孤立比 $\{4:1.119,\,8:1.065,\,16:1.045,\,32:1.032\}$（由参照计划在 v11 下统计
+得到）；lane 内顺序为"最大 expert 先行、其余按 M 升序"。在异构 lane 上做一次 LPT，取标定负载
+最小的模板，请求路径上不跑事件模拟（Python 预热后约 30 ms，现有 Python quick 为 39 ms）。
+模型目标下（E1 的 18 个工作负载、v11 评分）它与 75 s LNS 计划相差 $-0.3\%$（中位，最大 $+1.6\%$），
+比生产 quick 低 8.8%。lane 内顺序这一项单独贡献约 2.5 个百分点（同一形状与装填下，降序
+$+2.5\%$、升序 $+3.9\%$、热点先行升序 $-0.8\%$，相对 LNS）。硬件验收（E3，18 个新层）：较生产 quick 快 9.63%（中位，18/18），落后 90 s 参照搜索 3.82%（中位，最大 7.1%）；记录见 `tmp/fast_planner_20260920/decision.md`。
+
+**生产接入（2026-09-20，用户决定）。** 三处改动，默认行为随之改变，依据均为已实测：
+
+1. window 表按机器注册。`StageWindowPolicy` 增加 `machine_ids`（为空表示按 shape 匹配，保持既有
+   表的行为），`default_stage_window_policy` 增加 `machine_id` 参数，`IntervalPlanner` 传入
+   `model.calibration.machine_id`。V3 表登记到
+   `arm_codex_320c_numa3_80c_sve256_jemalloc_narrow_merge_v9`，因此该机器上的 lowering 现在默认
+   发出 window。实测依据（M4，18 层两会话）：生产 quick 计划加 window 后快 1.61%（中位，区间
+   0.53%--5.81%），同族其余计划 0.99%--2.92%。
+2. `PlannedMoE` 增加 `search_mode="hot_wide"`：用 `HotWidePlanner` 出计划，形状缓存按模板重建
+   （模板与装填对给定路由计数是确定的）。
+3. `MoePlannerRuntime` 增加 `event_calibration` 与 `search_mode`，并提供
+   `enable_moe_planner_fast(analytic, event, ...)`：cost model 为 `ProbeEventModel`（孤立时间来自
+   v11），phase 骨架、shape 与字节仍来自解析标定。`ProbeEventModel` 因此实现 `T_iso` 磁盘缓存
+   接口（identity 含 v11 标定文件摘要，与 v9 的缓存不互串）。
+
+快速 planner 的实现成本：每层规划中位 1.85 ms（Python，预热，18 个真实层；模板按上次胜出者
+优先并在超过当前最好值时提前放弃，结果与穷举模板一致）。native quick 路径仍为 v8/v9，未改；
+在 native 实现之前，请求路径上的净收益要扣掉这部分规划开销。
+
+**v12/v13：背景 lane 宽度与 2T 装载等价（2026-09-20，候选，验收见 E5）。** E2 把 2T lane 逐出
+搜索空间时留下的未解释项，由 P7/P8 两组探针定位（`tmp/v12_probes_20260920/decision.md`）。
+
+P7（背景 lane 宽度）：同样核数下背景 lane 越窄争用越重。4T 目标在约 76 个背景核下的装载减速为
+2.01（2T 背景）、1.91（4T）、1.70（8T，72 核）、1.40（16T，64 核）。以 4T 背景为基准的超额因子
+$f_{L},f_{S}$ 由此测得（2T 背景 1.10--1.65，8--16T 背景 0.53--0.90），v12 把它乘在装载邻居带来的
+超额上，背景宽度取"其他处于装载状态任务的核加权几何平均宽度"。单独加 v12 无效：E2 的 2T 计划
+实测/预测 1.237→1.234，决策质量不变。
+
+P8（真实背景下的组合检验）：4T 及以上背景下 v11 的组合是对的，包括真实层路由混合背景
+（实测/预测 1.03--1.10）；2T 背景下低估 18--49%，且随背景路由数增大而恶化（M12 1.14--1.18、
+M48 1.35--1.40、M96 1.38--1.56、真实混合 1.43--1.49）。按冻结规则反演装载等价会在曲线末端
+饱和（超过约 76 等价装载核后曲线为常数），说明需要两项同时成立：(a) 2T lane 的稳态段对邻居
+等同于装载段（4T 上测得的 $w(M)=0.35$--$0.79$ 在 2T 不成立）；(b) 2T 背景下曲线水平本身更高。
+两项一起施加可复现 P8 全部 2T 格：实测/预测中位 0.978（v11 1.374、只加因子 1.310），逐格
+0.93--1.03。
+
+v13 = v11 + P7 因子 + `loading_weight_by_width = {2: 1.0}`。在已测数据上（描述性，未参与构建）：
+E2 的 2T 计划 1.237→1.144，含 2T 候选时 regret@1 中位 6.07%→0.00%（最大 11.58% 不变）；E3 决策
+不变，两个锚点因宽背景因子上移 0.01--0.02。模型整体约 1.09 的水平低估仍未解释，与此无关。
+E5 验收（18 个全新层，一次性测量）：W1/W2/W3 全部未过——`l13` 实测/预测 1.281（锚点 1.098）、
+九个计划上的 regret@1 中位 11.95%（v11 为 4.45%）、与 `l13_no2` 的快慢符号一致 0/18 且实测慢
+11.82%。按冻结采用规则保留 v11：**v11 仍是参照模型，2T lane 仍在参照搜索空间之外**，v12/v13
+作为"已测得但不充分的修正"记录。v13 能复现 P8 的探针格（0.978）却不能使整计划可预测：探针格
+只有一种齐次背景，而计划里 2T lane 与宽 lane 混合、路由数各异，按 lane 宽度的单一装载权重不是
+完整机理。生产路径不受影响（快速 planner 只读孤立时间，v11 与 v13 相同）。
+记录：`tmp/v13_validation_20260920/decision.md`。
+
+**标定域与可信宽度（2026-09-20，E8）。** 探针 P1--P8 只覆盖 lane 宽度 2--32T，`ProbeCurves`
+对范围外的宽度夹到边界，因此 1T/40T/80T 的打分是外推。实测后果：`plan()` 的 tail-pool 候选
+自动选中 1T 池（93/70/14 个池化任务），其池化任务实测跨度是预测孤立时间的 3.25--4.25 倍
+（p90 5.69），尾部因此拖长 2.4--6.1 ms，使整计划比搜索结果慢 1.0--1.3 ms，而 planner 的
+tail-pool 打分却认为它快 0.7--3.3%。修正不在 tail-pool 模拟，而在标定域：模型给出
+`calibrated_widths`（曲线实测集）与 `reliable_widths`（再扣除整计划反证的宽度，v11+ 资产将
+2T 列入 `unreliable_widths`，依据 E2/E5），`IntervalPlanner._tail_pool_candidates` 只在可信宽度
+上自动生成候选（显式指定仍可用），`ModelLnsSearch` 默认取可信宽度。施加后 r008_l21 的最优
+tail-pool 候选由 25.79 ms（2T 池）变为 26.74 ms（4T 池），高于最优严格候选 25.99 ms，planner
+不再选它——与实测一致。
+
+**路由切片（2026-09-20，E8）。** `ModelLnsSearch` 增加 `slice`/`unslice` 移动（等长 route
+range，与运行时的 lowering 语义一致），默认关闭。在本工作的 54 个已测层上它没有价值，原因是
+结构性的：最热 expert 在最宽 lane 上的时间与工作量下界（总孤立核时/80）之比中位 0.38、最大
+0.44，没有任何一层由单个 expert 定界，切分它不能降低 makespan；打开该移动后搜索一次也不接受。
+只有当单 expert 时间超过工作量下界时才需要开启，对这些 2048-token TopK6 请求约需 4500 条路由，
+实测最大为 2034。仓库原有的 bounded tail repartition 家族在此机器上不可用（宽度表只为 96 核
+标定，且要求计划恰有两个终端任务）。
 
 **Diverse shortlist 与 lowering。** proof 与 pool 使用两个独立 solve。proof 在长时限内只
 输出完整 master 的 $U_{CP},L_{CP},gap_{CP}$；pool 使用较短 root，不让更长 proof 偶然改变
@@ -2776,7 +3109,272 @@ offered/allocated rate、capacity、utilization 和 dilation，且与 planner �
 解析 backend 先用于显式 shadow/what-if 规划。完整 schema、假设和运行命令见
 `cost_model/ANALYTIC_MODEL.md`。
 
+#### 8.2.4a Workspace isolated 阶段候选与离线消融（Lab，2026-09-07）
+
+冻结 v8 不变。`reaccount_workspace_phase_model.py` 仅生成独立候选：
+\(G(M,t)=a_t+b_t\lceil M/t\rceil\)，\(a_t\ge0,b_t>0\)；
+\(T_s(M,t)=\max(f_{s,t},k_{s,t}T^{physical}_s(M,t))\)，
+\(f_{s,t}\ge0,k_{s,t}>0\)，\(s\in\{W13,W2\}\)。复用已有
+gather/stage calibration 语义，不改变资源公式、schema、native 或 production。
+候选将 expert fixed/route/by-width operator residual 全部归零，因而旧 total
+residual 不再通过 gather 分支重新分摊到 GEMM。只拟合 workspace isolated
+session1 的阶段时间，不读取 full-workload 时间或总时间作为 fit target；
+session2 是同 shape 重复性检查。M1 完全不拟合，是已知反例的外推检查而非全新
+prospective holdout。8T 只有一个 M 点，floor/scale 不可充分辨识；不得宣称
+全 route 区间准确。宽度仅支持实测的1/8/16，含2/4T 的完整计划明确跳过。
+
+消融在 v8 和阶段候选上分别重跑完整 placed DAG：去掉 wide、narrow、两者，
+去掉 wide 的 isolated floor 或 peer increment，再分别去掉共享 GEMM/L2/LLC/
+DRAM/epilogue 放大或将 spill 固定到各 phase 的 isolated 值。共享资源消融保持
+isolated service cost 不变，只在独立 Lab 单线程进程中屏蔽对应 event scale。
+事件时序会改变，各项消融差值不可相加，亦不能直接解释为真实硬件因果贡献。
+
+剪枝表与候选空间不变：本候选的 `Prune=Accept=empty`，旧 partial-order
+calibration 不可绑定它。必须同时报告大 M/16T 与小 M/1T 的阶段增量及错误方向；
+改善一类不能掩盖另一类退化。未完成独立 shape/width holdout 前，不替换 v8。
+
+#### 8.2.4b A/B 供给账单与 phase-lifetime 重叠候选（Lab，2026-09-07）
+
+`audit_ab_supply.py` 复算冻结 v8 的首 panel/steady A、B、C 账，不修改
+`analytic_model.py`、calibration、production 默认值或 native parity。
+每个 phase 验证 \(Q_A+Q_B+Q_C=Q_{L2}=Q_{LLC}\)；这个等式反映现有
+endpoint-refill 口径，不表示真实 L2-to-L1 与 LLC-to-L2 物理流量相等。
+L2 驻留的 B 仍有向 L1/register 供给，但当前 L2 资源没有独立记录该流量；
+不能在未厘清 endpoint probe 语义前直接叠加全部 B load，否则也可能重复收费。
+
+A 有效 load 字节与 touched cache-line footprint 分开审计。对对齐 panel，
+K4 块 \(j\) 访问区间为
+\([8jm_p,8jm_p+8m_c)\)，对所有块求 cache-line 集合的并集。
+例如64-byte line、K4096、M1-exact 的 \(m_c=2,m_p=8\)，有效 payload16 KiB，
+但 touched lines64 KiB。该值不等于实测 LLC miss，也未直接替换 v8 流量。
+
+新增仅 Lab 的 `LifetimeOverlapModel`，沿用原 demand、placed spill、service
+capacity 和可选旧 wide/narrow 项。对当前 phase 的无额外资源争用耗时 \(T_i^0\)
+（保留 isolated 下界及选定旧项），按完整 phase 平均请求率计算每个 rank/domain
+资源约束 \(r\)：
+
+\[
+U_r=\frac{\sum_i q_{ir}/T_i^0}{C_r},\qquad
+f_i=\max\left(1,\max_{r:q_{ir}>0}U_r\right),\qquad
+T_i'=f_iT_i^0.
+\]
+
+对每个约束，其所有 requester 都至少放慢 \(\max(1,U_r)\)，所以
+\(\sum_i q_{ir}/T_i'\le C_r\)。缩放的是 phase progress，不是仅缩放一个
+可能被 ECM max 隐藏的 transfer 项；因此避免简单替换 offered-rate 分母后
+破坏总容量约束。这个 fluid 近似不表达 burst arrival 或 DDR queue latency，
+并非声明旧 service-interval 定义有实现 bug。zero-demand setup 不因该约束放慢。
+
+验证采用25个账单 shape、7个已知 workspace 固定计划的28次 placed replay，
+比较保留/清零旧 wide+narrow 与原/lifetime 分配的交叉消融。不拟合数据。
+须报告 small-M 阶段反例与 median 顺序，不用总误差改善掩盖退化；两次硬件
+session 的中位方向一致也不等于通过 actionable-margin/置信区间 gate。
+候选 `Prune=Accept=empty`，不绑定旧 partial-order report、不接搜索。
+结果与局限见 `optimizations/fused_moe_sve/results/ab_supply_ledger_overlap_20260907.md`。
+
+#### 8.2.4c Cache-line 与 private-endpoint 分账候选（Lab，2026-09-07）
+
+`burst_endpoint_model.py` 仅支持固定 H4096/F512/SVE256 full-stripe 诊断。
+实际 A/B 地址归属 refill 未观测，字段保留 null；已有 PMU 仅按 victim 汇总，
+不从总 counter 相减伪造逐 tensor 流量。A payload、touched lines、模型 refill
+估计分开保存。每个 panel 的64-byte line 集合沿用8.2.4b计算，记为 \(L_p\)。
+候选以 \(Q_{3,A}=t\sum_p L_p\) 替代有效 payload 的 owner 聚合 refill 估计；
+B 的下层 refill 继续沿用冻结的 L2 驻留规则，未新增命中率拟合。
+
+私有 L2 endpoint 还须供给缓存命中的数据。候选用显式几何近似：
+当 \(L_p+B_{tile}>C_{L1}\) 时，A 每个 N tile 重扫，否则每个 owner 一扫；
+owner B 加 A panel 超过 L1 时 B 每个 M panel 重扫，否则仅首 panel 收费。
+这只是 L1 驻留假设，不是完整替换模拟器；不含未知 write-allocate/RFO。
+
+\[
+Q_2=\max(Q_3,Q_{2,A}+Q_{2,B}+Q_C),\qquad
+T_2=Q_2/R_2(t),\qquad T_3=Q_3/R_3(t).
+\]
+
+L2 是 private-team endpoint 下界，不再作为 rank 间的第二份共享请求；
+通过独立字段保存 \(Q_2\)，共享 resource demand 中 L2为0，但 \(T_2\) 保留。
+GEMM body 仍为 \(\max(T_{core},T_2,T_3,T_{DRAM})\)，endpoint 时间不相加。
+LLC/DRAM、cold/gather、domain injection 保留原 service-interval burst 计算，
+绝不使用8.2.4b已拒绝的 phase-lifetime 平均。stage floor、scale、旧 wide/narrow
+均原样保留，并以清零旧项的独立消融检查依赖。
+
+源码核对表明 service sampler 的 L2/LLC是 shared-read-only B-only 循环，
+计费单位为 B scan payload，包含到寄存器的完整路径；cold DRAM靠互异 B池轮换，
+没有新 workload 的逐轮 scrub。该定义不证明采样时每次访问都来自命名层，
+也不证明旧曲线可直接推广为新 A-pattern 或 disjoint-owner 的精确服务率。
+
+35-shape isolated账与42次已有 workspace placed 回放表明：新的私有 L2约束
+仍被 compute隐藏，line-only与完整候选在这7个计划上的预测相同。保留旧项时
+compute-end MAPE20.24%→20.39%，M1/1T阶段MAPE38.79%→38.71%，两场中位
+方向一致的8对中正确数6→5；未通过精度/排序采用条件。该改动完成分账与
+burst-preserving诊断参考，不替换v8，不改生产/native/schema或candidate空间，
+`Prune=Accept=empty`。原有通用 stage-window explanation/native export不适用于
+该Lab候选，显式拒绝。报告：`optimizations/fused_moe_sve/results/burst_private_endpoint_20260907.md`。
+
+#### 8.2.4d 小 T isolated 阶段限定（Lab，2026-09-08）
+
+`small_t_isolated.py` 将已有校验数据限定到1/2/4T，共29个shape/width、87个
+gather/W13/W2阶段点，各两场中位数。只用第一场且M不为1/7的点拟合；M1保留
+guard，M7是历史validation，不声称新的prospective holdout。完全不读并发计划
+作为fit/evaluation，不拟合operator总时长，也不运行placed event。
+
+GEMM复现已存在的非负affine形式 \(T_s=f_{s,t}+k_{s,t}P_s\)。冻结物理基底
+按每个cold/steady/setup phase分解为
+\(P_s=\sum_p(C_p+\max(X_p-C_p,0)+E_p+O_p)\)，其中
+\(X_p=\max(T_{L2,p},T_{LLC,p},T_{DRAM,p})\)。额外启动项 \(f\) 单列，
+不生成memory demand；\(k\) 是effective stage scale，不能解释为独立拟合的
+compute/A/B bandwidth。8.2.4c的新endpoint账仅作旁列诊断，不能静默替换拟合基底。
+
+Gather独立使用 \(f_{g,t}+b_{g,t}\lceil M/t\rceil\)，不拿operator residual
+充当gather。对相同可见特征下的观测中位数最小/最大值 \(a,b>0\)，任意固定
+预测至少有一项相对误差不小于 \((b-a)/(b+a)\)，最优常数为 \(2ab/(a+b)\)。
+这只是匹配既有观测的下界，不是未来真实硬件误差的统计下界。M1/2T gather两场
+12.97/29.22us使该下界为38.52%；M7/M8在2T的ceil特征相同，合并观测下界28.14%。
+
+复现结果：GEMM历史M1 guard和M7 20%检查通过，但W13/M7平均误差5.76%→10.13%，
+并非所有M改善。Gather的1/2T M7失败，故完整isolated模型不合格。stage-only
+估计器明确拒绝`T_iso`/planner总时长导出，不扩宽度、不加并发项、不替换v8；
+`Prune=Accept=empty`。报告：`optimizations/fused_moe_sve/results/small_t_isolated_stages_20260908.md`。
+
+#### 8.2.4e Exact-M W13 条件供给响应（Lab，2026-09-08）
+
+固定H4096/F512，M1/4/8/12×1/2/4T，B scrubbed/preloaded×0/4/8个reader，
+两场各31轮。`bench_kernel_response.py`复用生产JIT但不修改生产；分别测真实
+kernel与B-only供给控制。仅第一场peers0两种缓存状态拟合：
+\(\beta_{raw}=(T_c-H)/(D_c-D_h)\)，
+\(\widehat T(D)=H+\operatorname{clip}(\beta_{raw},0,1)\max(D-D_h,0)\)。
+这里H是B-preloaded真实kernel时间，不是纯compute；D是独立实测B-only时间，
+不是plan-visible pressure或DDR latency。B stripe为8/4/2MiB，均超过1.25MiB
+私有L2；预热不等于L2-hit，scrub也不证明所有请求都来自DRAM。
+
+冻结第一场参数验证两场peers4/8；第二场重新拟合仅检查稳定性。预设门槛为
+供给分离≥10%、两场raw beta∈[0,1]、漂移≤0.15、holdout MAPE≤5%、最大≤10%、
+不劣于常数H，clipping不豁免raw beta。12组仅3组通过。平均误差2.008%，
+同缓存状态isolated lookup为2.252%；M1/1T仍有17.074%最大误差。额外诊断
+\(T=F+C+D-\alpha\min(C,D)\)使用旧compute proxy，3组不可辨识、6组参数
+越界，不能把响应系数解释成计算/访存百分比。
+
+冷B isolated第一场查表预测第二场同shape，MAPE0.437%（v8阶段7.499%），
+仅证明已测shape的重复性，不证明未见M插值、完整阶段wrapper或并发预测。
+下一步限定exact-M/kernel-family基准的未见M验证；不扩W2、不换v8、
+不替换wide/narrow、`Prune=Accept=empty`。报告：
+`optimizations/fused_moe_sve/results/kernel_joint_response_20260908.md`。
+
+后续压力曲线（同日，独立数据）：M1/M12×1/2/4T，cold B，0/1/2/4/8/12/16
+reader，两场各31轮，同时记录DDRC与B-only供给。16 reader时domain27实测读流量
+约72–76GB/s，1T B-only时间增加约25.6%；M1约增加33/13/10%，M12约增加
+1–1.7%。M12最高档小幅损失可重复，但没有两场均>2%的operational crossing，
+不能据此拟合物理拐点或证明已变为memory-bound。DDRC flux包含victim与后台，
+occupancy/command只是计数器单位的queue特征，不是victim latency纳秒；低reader
+档位非单调，不能将count当带宽。此后续仅诊断，不修改模型公式或剪枝。
+报告：`optimizations/fused_moe_sve/results/memory_pressure_curve_20260908.md`。
+
+压力响应拟合（Lab）：冻结第一场零reader的\(T_0,D_0\)，
+\(p=\max(0,D/D_0-1)\)，比较
+\(\widehat T=T_0(1+ap)\)与\(T_0[1+a\max(0,p-p_0)]\)，\(a\ge0\)。
+D是独立实测B-only时间，a不是访存占比。第一场六个非零reader档逐档LOPO；
+零档是共同校准anchor，不声称将零档独立留出。按cell相对时间平方误差拟合。
+阈值只有LOPO MAPE改善≥10%且≥0.1百分点、max不恶化、各折正阈值、阈值span
+≤全训练p范围上限的20%、斜率CV≤25%才保留。选型仅第一场，序列化后才加载第二场；
+第二场连victim/supply anchor也不重新归一化。全部六组选择linear。第二场M1
+平均/最大误差7.516/25.526%→0.896/1.871%，M12为0.538/2.084%→0.140/0.690%。
+M12/1T阈值LOPO有0.088百分点的小改善且参数稳定，但不满足复杂度收益门槛，不能
+误称所有阈值都不稳定。六个第二场最高档p略超第一场范围，显式标记且不排除。
+两场此前已观察，属于历史回放，不是新盲测；不识别plan→pressure映射、不导出
+生产profile、不改v8或剪枝。报告：
+`optimizations/fused_moe_sve/results/pressure_response_fit_20260908.md`。
+
+冻结响应的新数据验证（同日，参数冻结后采集）：M1/M12×1/2/4T，两场各31轮，
+新的3/6/10/14 reader作为主验证，0/16档仅作独立控制。固定a、T0、D0，不重新
+拟合、选阈值或设anchor；二进制与原校准一致。每shape/session要求新四档
+MAPE≤2%、max≤5%、且优于isolated常数，11/12通过。M1汇总平均/最大误差
+9.709/25.733%→0.749/2.347%，M12为0.424/1.303%→0.194/0.445%。第一场
+M12/1T平均误差0.322%略劣于常数0.267%，不隐藏该失败。只验证已知shape与
+同类synthetic background下的未见count，不证明未见M、混合计划或plan→pressure。
+不改生产profile、v8或剪枝。报告：
+`optimizations/fused_moe_sve/results/pressure_response_prospective_20260908.md`。
+
+真实W13后台迁移（同日，Lab）：固定16个1T后台核心，分别运行M1、M120（10个
+M12 panel）或8+8混合；无后台/reader为对照。两场各31轮，victim与后台输出独立
+校验。扩展probe二进制但不改生产JIT；冻结原a/T0/D0，不选新阈值。对照12/12通过
+≤5%最大误差门槛，真实后台仅5/12 shape/session通过原2%/5%且优于isolated要求。
+M1汇总MAPE15.414%→2.027%（max7.998%），M12从0.247%恶化到0.664%。M1/1T
+小/大后台B-only中位约334/335us、337/337us，真实victim约428/459us；逐轮配对
+增幅7.994%/7.794%，B-only配对差异CI均跨0。不能直接将单一供给标量推广到
+任意真实kernel竞争；同时显式保留1T全部真实压力超原拟合范围的限制，不声称已
+归因到A、B、缓存或queue。旧reader模型保留，生产profile、v8与剪枝不变。
+报告：`optimizations/fused_moe_sve/results/real_kernel_background_20260908.md`。
+
+A-only/A+B对照（同日，Lab，M1/1T）：生产无对应load-only模式，因此仅在Lab
+生成M1加载骨架，B-only版本与生产机器码逐字节一致；保留A地址/双缓冲加载顺序，
+删除矩阵指令与输出。A逻辑payload8KiB、含配对padding的唯一请求16KiB、line覆盖
+64KiB、64个Ntile重复请求合计1MiB，均不等于实测refill。两场各31轮，大/小后台
+真实W13配对差+34.77/+29.29us；A-only为−0.33/−0.20us，AB load-only为
+−15.21/−15.74us，方向相反；保留计算去掉epilogue/store仍为+38.90/+33.57us。
+不支持新增正A供给惩罚来解释31us，亦不排除完整kernel中的A交互；不同probe
+之差不是可相加纯compute/memory时间。只保留load/compute共同执行的待查方向，
+不拟合、不改冻结模型、production/v8/剪枝。报告：
+`optimizations/fused_moe_sve/results/ab_supply_contrast_20260908.md`。
+
+计算/依赖对照（同日，Lab）：M1固定A/B加载，0/1/2/4/8条矩阵指令每K4，并比较
+loaded4/resident4/serial4/NOP4。B与标准loaded4机器码均逐字节匹配生产；第一阶段
+两场36-cell×31轮。切断矩阵指令对加载值的依赖后差距仍在，故补两场24-cell确认：
+无A/B加载的同值寄存器矩阵约192.6–192.8us，小/大后台差−0.06/−0.10us；
+AB+loaded4差38.53/37.62us、AB+resident4差38.96/33.52us，AB+整数/NOP仍为
+负差。额外约10–12万cycles伴随同量级backend-stall增量；大后台LLC miss更多，
+L2 refill近似不变，DDR总流量更低。证据局部定位到矩阵执行与访存流共存的
+重叠/吞吐损失，不能指定某个load queue、端口、预取或DDR参数，亦不是可独立
+加上的31us固定项。两阶段分别保留身份与波动，不拟合、不改v8/生产/剪枝。
+报告：`optimizations/fused_moe_sve/results/m1_compute_issue_20260908.md`。
+
+#### 8.2.4f 实测分层供给小模型（Lab，2026-09-08）
+
+仅对双LLC M12后台数据的M1/1T W13作离线条件预测。定义实测事件特征
+\(m=\mathrm{LL\_CACHE\_MISS\_RD}/\mathrm{L2D\_CACHE\_REFILL}\)，
+\(Q=\sum\mathrm{DDRC\ occupancy}/\sum\mathrm{DDRC\ read\ commands}\)，
+\(B=\sum\mathrm{DDRC\ read\ GB/s}\)。先逐cell逐轮求比值，再取31轮中位；
+Q不是纳秒，m不是精确cache命中概率，B必须包含两组DDRC。
+仅第一场无后台固定\(T_0,m_0,Q_0,B_0\)，不以第二场重新设anchor。
+
+令\(l=\max(0,m-m_0)\)，\(q=\max(0,Q/Q_0-1)\)，候选为
+\(\widehat T=T_0(1+\beta_q q+\beta_l l)\)，或增加
+\(\beta_{ql}ql\)，所有系数非负。以cell相对时间平方误差拟合。
+对照是isolated常数、单一带宽\(\max(0,B/B_0-1)\)、queue与local模型。
+系数只代表此shape/协议下的条件响应，不分解为独立可相加物理服务时间。
+
+第一场只使用无后台、same/other各8/24/39后台。按count同时留出两个placement
+做训练内部LOCO；交互项仅当CV MAPE改善≥10%且max不恶化才保留。16/32后台
+及全部balanced placement均不参与拟合或选型。序列化后再回放第二场所有点；
+48/64/78独立报告为高压力外推，超训练特征范围显式标记。精度参考门槛为每组
+MAPE≤5%、max≤10%，禁止用平均结果掩盖外推失败。
+
+输入是目标执行期间的实测PMU事件，虽然排除cycles/backend stall/target time，
+仍不是plan-visible前瞻模型或因果识别；历史数据此前已看过，非全新盲测。
+只使用新的双LLC协议，不混入旧worker/scrub生命周期。生产v8与旧冻结响应模型
+不变，`Prune=Accept=empty`。结果见
+`optimizations/fused_moe_sve/results/layered_measured_supply_20260908.md`。
+
+本轮训练内部LOCO选择交互式：MAPE由相加式7.42%降至1.57%，max由19.63%
+降至5.30%。冻结系数\((\beta_q,\beta_l,\beta_{ql})=(0.101799,0.402751,0.208058)\)，
+\(T_0=302.74\,\mu s\)。第二场留出count16/32的MAPE/max为1.54%/4.18%，
+未训练balanced16/24/32为2.92%/4.48%；balanced48/64/78外推为11.70%/15.57%，
+未过门槛。第二场整体3.22%平均误差不能豁免高压力失败。保留有界Lab参考，
+不重拟合留出、不导出production profile、不修改v8或偏序剪枝。
+
 #### 8.2.5 Full-stage packed-B 复用与 width-derived owner stripe
+
+> Workspace floor identification 后续（Lab）：固定 M3/4/8/16/24 ×
+> 1/2/4/8/16T，补 M62/1341 ×2/4T，M7 全宽度不拟合，M1 继续保护。
+> 比较既有 max-floor 形式与仅 Lab 的非负 affine 阶段形式
+> \(T_s=f_{s,t}+k_{s,t}T_s^{physical}\)。第一场拟合，第二场复现；
+> M7 用于形式验证（若用于选择就不是最终独立测试），要求每个阶段两场
+> 误差不超过20%，并且 M1 GEMM 不劣于 v8。报告参数跨 session 及
+> leave-one-M-out 稳定性，不把低训练误差视为 floor 可辨识。未过门槛时
+> 不替换 wide/narrow 项，production schema、默认值及剪枝不变。
+> Lab affine adapter 把 fixed 部分作为零资源需求的独立 stage-setup phase，
+> 只对原 GEMM body 应用 scale，不把 startup 再作为带宽需求或 wide-team
+> 放大对象。隔离 probe 移走 lane 中间 task 时，原后继必须接回原前驱，
+> 不能只等待已经被提前完成的目标；目标仍作为所有后台 task 的依赖。
 
 当前 production 对每个 stage 只有一个 full-N tile domain。沿用 1.1 的记号，
 单 tile 字节数、活跃 owner 数和最忙 owner stripe 为：
@@ -6103,6 +6701,2298 @@ partial order、top-K recall 与 false-pruning replay，只有这些门槛通过
 完整记录见
 `optimizations/fused_moe_sve/results/arm_codex_80c_stream_pressure_proxy_grid_20260904.md`。
 
+#### 9.60 事后 planner-visible geometry 不能预测 queue
+
+在同一锁定网格上，不用实测 overlap，只使用 live team 与冻结 v8 的 isolated
+W13/operator 相位，补测 \(n_B\sqrt{t}\)、predicted peer W13 core-ms、predicted
+operator core-ms，以及过原点的 \(a n_B+b n_{\text{threads}}\)。门槛与 9.59 相同。
+全部失败：proxy-to-queue 漂移 \(26.9\%\)--\(62.4\%\)。session 2 的 operator 与双系数
+拟合可以单独过 count-6，但不能跨 session。同一 8x2T live-team 的 queue 为
+\(48.168/29.142\) cycle（比 \(1.653\)），确定性 \(g(P)\) 无法给出稳定斜率。
+`accepted=[]`，保持 `stop_absolute_model_expansion` 与 frozen v8。完整记录见
+`optimizations/fused_moe_sve/results/arm_codex_80c_stream_pressure_plan_geometry_proxies_20260905.md`。
+
+### 核数压力的完整 MoE 外推回放（Lab，2026-09-09）
+
+`optimizations/fused_moe_sve/benchmarks/replay_core_pressure_moe.py` 提供独立
+Lab 子类，不注册到 production planner，也不修改 frozen v8 calibration。
+目的仅是检查当前核数压力响应接入完整 phase DAG 后的总耗时误差。
+
+在每个 active phase 集合中，仅将 GEMM (`cold_b`/`steady_b`) 的 active CPU
+计入局部竞争。对任务 i，排除自身，在其覆盖的各 LLC domain 中取最大 peer
+core 数 n_i，令 x_i=n_i/32，f_i=1+0.28902964424300354*x_i+
+0.4536242509371087*x_i^2。系数来自独立 M12 团队实验的 1T 训练条件，
+本回放不拟合参数、不利用完整 forward 实测时间构造输入。
+
+保留原模型的 domain spill fraction、global resource dilation、任务依赖和
+isolated phase 成本；GEMM 的 LLC resource scale 替换为 f_i，DRAM scale
+取 max(global DRAM dilation,f_i)。计算/访存仍以 max 合成，不将整个 GEMM
+时间乘以 f_i。原 concurrent wide/narrow team correction 被替换，保留
+isolated wide-team scale；只有一个 active phase 时直接沿用原模型。
+非 GEMM phase 保持原 placed-state 结果。该接法的改善不能唯一归因于核数
+指标，因为它同时替换了旧局部响应组合。
+
+这是明确的外推假设：独立实验只覆盖 M1 W13 victim、M12 1/2/4T 背景及
+steady-state 协议；完整回放覆盖 M1–1945、width1–16、W13/W2 和不同缓存
+生命周期。不是已识别的 LLC 服务率，也不是 production adoption。
+未更改剪枝、候选集合、Plan V2、native planner parity 或默认选择。
+
+46 个历史样本位置、两场各方案中位数共 92 个观测：原 v8 MAE3.733ms /
+MAPE12.018%，Lab 外推 MAE1.143ms / MAPE3.652%。uniformish 从 MAE1.166ms
+退化到1.718ms；绝对时间改善不保证排序改善。样本已被历史筛选，跨组存在
+相同方案，不是92个独立 holdout。阶段 trace 关闭，无法由这些数据给出实测
+阶段误差分解。完整证据见 `optimizations/fused_moe_sve/results/core_pressure_full_moe_20260909.md`。
+
+### 完整块与历史相关尾块拆分（Lab，2026-09-09）
+
+独立实验 `full_tail_cost.py` 对 W13 K4096/N1024、1T 定义
+`M=12q+r`，`T=q F(p)+R(r,q,p)`；`r=0` 时尾块成本为零。
+`p` 为同 LLC 的独立 M12 后台任务数，端点0/38；F来自第一场 M192
+完整块中位数，R按余数1/5/11、此前完整 B 扫描次数0/1/2/8/15分别采集，
+在扫描次数和压力上作分段线性插值。M不超过192；未测余数显式拒绝。
+不施加额外压力倍率，也不强制尾块由冷到热单调变化。
+
+扫描次数4留出；第二场尾块 MAE18.04→3.71us，但留出位置的完整时间
+MAE14.10→16.49us。真实独立 M13/17/35/65均改善；p11 M13联合实测
+2.897ms仍超过模型0–38背景的敏感性范围1.564–1.940ms。该范围不是物理上界。
+这是已查看数据的回顾性验证，未验证中间压力尾块、混合竞争者、W2或多线程。
+不接入生产校准、默认调度或剪枝。详见
+`optimizations/fused_moe_sve/results/full_tail_cost_20260909.md`。
+
+### 新旧 cost model 的等预算 full/strict 搜索对照（Lab，2026-09-09）
+
+在三条既有 high-skew/median/uniformish route 上分别从 route counts 重新执行
+`IntervalPlanner.plan(dynamic_tail_pool=False, bounded_tail_repartition=False)`，
+而非重排历史46个计划。保持现有141个模板、isolated-LPT、奇偶 lane reversal
+和 `_select_analytic_full` 的不确定性 fallback；仅将模型替换为上文核数压力
+Lab 子类。两边显式 `early_merge=False`，不改变 production 默认行为。
+
+预算按完整模板集合及实际 `_score` DAG 调用核对，包含 quick winner 的额外
+event 重评分；同时保存有序 task digest，不能仅以相同 iteration 数声称等预算。
+这是现有 strict/fixed/full-stripe 空间的完整搜索，不含动态 tail pool、route
+slicing 或额外 VND/LNS 扩展。原 residual comparator 不迁移为新模型的剪枝依据。
+每条 route、每个模型以独立进程重复两次冷搜索，检查预算、计划与分数的确定性，
+单独报告初始化和搜索耗时。选出的计划在任何新硬件结果可见前冻结。
+
+沿用关闭 early merge 的 last-W2 计算完成时间口径；对共同 reference、旧模型
+选择和新模型选择做同进程 paired 硬件对照及独立重复。先验证输出与实际 merge
+状态，再报告计算时间、E2E、选择差距和搜索成本。此记录是 Lab 方法声明；结果
+见 `optimizations/fused_moe_sve/results/full_model_search_compare_20260909.md`，
+不授权生产模型导出、native planner parity 或超出既有 profile 的精度结论。
+
+对照已完成：12 次正式搜索均为141模板/422次评分，计划、分数与有序 DAG
+在独立重复中一致；7个去重计划的硬件对照全部通过。新选择在 high-skew
+只改善约0.26%，median 改善1.96–2.03%，uniformish 选择不变；冷搜索成本
+约为旧模型的1.85–1.91倍。更大的限制来自既有 fallback：high-skew/median
+的低均值16T候选被替换为max-width8T计划，已测reference仍快约4.3–10.2ms。
+本次不修改该规则，也不把旧不确定性校准视为已适用于新模型；后续选择器
+验证必须与本次冻结对照分开。
+
+### 固定评分池的 fallback 对照（Lab，2026-09-09）
+
+固定上轮新核数压力模型的三条 route、141模板和422次评分，重建每个有序
+DAG 并逐项匹配冻结 digest 后复用其分数；完整 ranking 和原 fallback bridge
+必须与原搜索一致。对同一候选池比较既有 `_select_analytic_full` 与直接取
+`(makespan, pessimistic, working_set, resource_groups)` 字典序最小候选。
+只改变最终选择规则，不改变模型、候选生成、预算或 production 行为。
+此操作是冻结池重放，不是重新计时的冷搜索；冷搜索成本沿用上轮证据。
+
+两边 `early_merge=False`、full owner stripes，冻结 bridge 后在同一进程中
+配对测量 last-W2 计算完成时间，两次独立 session 和无 trace E2E 对照。
+uniformish 若两边 bridge 相同则去重，不能把同一计划解释为独立零方差样本。
+结果记录于 `optimizations/fused_moe_sve/results/fallback_compare_20260909.md`；
+不重新拟合不确定性，也不把三条既有 route 当作全域 holdout。
+
+2026-09-10 验证完成：直接 mean-best 在 high-skew 两轮均降低计算时间约22.93%，
+median 降低16.18%/12.55%；无 trace E2E 分别降低22.12%/15.52%。uniformish
+计划相同。9次硬件运行正确，406个 trace call 无 early merge，6份压缩 trace
+哈希一致。median 候选跨 session 漂移1.22ms，保留收益范围而不合并为固定值。
+此结果支持后续 Lab 选择器决策；本次只验证，未修改既有 fallback 或生产默认。
+
+2026-09-10 后续用户决策：实验基线采用“冻结新模型 + 直接预测最小值”。
+Lab `bench_full_model_search.py` CLI 默认 `--model new --selector mean`，
+`--selector fallback` 保留旧选择规则作为同模型对照。均值相同时仍依次按
+pessimistic、working set、resource groups 打破平局。候选空间、模型系数、
+early merge 关闭和 last-W2 时间口径不变；生产 Python/native planner 未迁移。
+归档 helper 的默认 fallback 保持兼容，CLI 显式传入新默认，历史 runner 快照保留。
+
+### 统一 mean-best 的新旧模型效果对照（Lab，2026-09-10）
+
+两模型均使用 mean-best 选择，重建各自既有141模板/422次有序 DAG 的完整评分池，
+保持模型、候选生成和 early merge 关闭设置不变。对各自选择计划的并集去重，
+两模型都预测同一组计划，以该共同样本计算 MAE/MAPE/bias；另行比较所选计划的
+实测计算时间，不能用不同计划上的各自误差替代共同样本精度比较。
+
+三条 route 产生四个去重计划。median/uniformish 两模型选中完全相同的 bridge，
+复用刚完成的对应实测；high-skew 的旧模型 reverse-odd 和新模型 LPT 在相同
+`4×16T+16×1T` 下不同，补做两次31轮配对 trace 与无 trace E2E 对照。报告复用
+来源、共同计划的误差和选择差距；不把三条既有 route 视作全域 holdout，也不将
+之前去掉 fallback 的收益归因于模型替换。结果见
+`optimizations/fused_moe_sve/results/mean_model_compare_20260910.md`。
+
+验证完成：共同8条观测 MAE 从5.531降至1.739ms，MAPE 从19.454%降至6.152%。
+但 high-skew 新模型选择的 LPT 比旧模型 reverse-odd 两轮慢1.578/1.576ms，
+约5.69%/5.68%，无 trace E2E 慢4.26%；其余两条 route 计划相同。两模型都只
+预测约0.07–0.09ms 的顺序差异，而实测约1.58ms。绝对精度改善不能替代排序
+精度；保留负结果，用户实验基线不因此自动改变，不重新拟合。
+
+后续只读 trace 诊断定位到两层：新模型将16T lane32置为关键路径，而 LPT
+实测62/62次在1T lane69结束；自身顺序不变的1T队列也有明显 W13/W2 增时。
+24–26ms 的 M2/M3 任务在较少总活跃核、更多小M竞争者下明显减速，模型的
+16T队列进入 M1 尾部又比实测晚约4ms，导致预测竞争组成错位。此为描述性
+证据，不区分 isolated/联合尺度的具体误差，也未识别 LLC/DDR 物理瓶颈。
+详见 `optimizations/fused_moe_sve/results/order_differential_20260910.md`；
+不修改压力函数或引入 oracle 到 planner。
+
+2026-09-10补齐真实 expert M1–11 的独立1T网格，统一 CPU316、目标先执行、
+其余任务全部等待、early merge关闭。两轮各31次，冻结模型 W13 MAE51.012us、
+MAPE9.353%，W2 MAE32.175us、MAPE10.466%。M1/2低估约20–28%，M7/8的W13
+在0.6%内，M9/10再次有约9–13%低估；不能用统一乘数视作已修复。880个
+含预热/正确性调用的隔离目标均无后台重叠，实际CPU316验证通过；不拟合或
+更换模型。完整协议和逐M结果见
+`optimizations/fused_moe_sve/results/small_m_complete_isolated_20260910.md`。
+
+### M1–11 的统一可控竞争响应（Lab，2026-09-10）
+
+固定前台1T CPU316，分别测 W13/W2；背景均为同LLC的1T W13循环，比较无背景、
+16/38个M2、16/38个M120，以及38核中19+19混合。相同核数下B分配空间相同，
+每核4份8MiB权重；M120在一次调用的10个M12 panel中逻辑复用B，M2每次单panel。
+该干预同时改变计算与A/C工作集，不能解释为纯B带宽变化或计算/访存固定比例。
+
+每个前台M/stage使用本harness自己的无背景基线，报告同round的增量和比例；
+不与真实expert独立点混算。两轮各5warm+31measured，132格smoke和9504次正式
+调用全部完成。38核时所有11个M、两个stage的小背景减速都高于大背景，两轮
+各自区间均同向排除零；M1/2 W13增时约210%对130–132%，M11约11%对3%。
+16核下不少较大M响应很小，W2部分负增量完整保留。仅核数不足以表达该实测
+类型差异，但本次不拟合/导出cost model，也未覆盖真实16T背景和阶段转换。
+完整数据见 `optimizations/fused_moe_sve/results/small_m_controlled_pressure_20260910.md`。
+
+### 有效计算/访存重叠原型（Lab，2026-09-10）
+
+现有底层的 `max(C,D)` 已表示完全重叠。新增独立 Lab 形式：
+
+$$
+C=C_{ref}/\eta_c(M,s),\quad D_0=D_{ref}/\eta_d(M,s),\quad
+T=C+g_s(P)D_0-\rho(M,s)\min(C,g_s(P)D_0).
+$$
+
+约束 $0<\eta_c,\eta_d\le1$、$0\le\rho\le1$，并以自身无背景时间 $T_0$
+约束 $C+D_0-\rho\min(C,D_0)=T_0$。搜索范围 $C_{ref}\le C\le T_0$、
+$D_{ref}\le D_0\le T_0$、$C+D_0\ge T_0$；不增加自由启动常数。
+$C_{ref}$ 为包含前端/L1的既有M12代理，$D_{ref}$ 为层级端点时间代理，因此
+效率与重叠参数只是有效模型分量，不能当作独立测得的硬件占比。
+
+背景先用 $x=(n_{large}+w n_{small})/38$ 和 $g_s=1+a_sx+b_sx^2$，仅用
+session1/M1的16/38纯背景拟合，M1归一化假设为访存主导。前台用奇数M与
+纯背景拟合，同代理签名的偶数M不参与拟合；第二轮与所有混合条件留出。
+这是既有数据的回溯验证，不是新的盲测。204留出格的部分重叠 MAPE2.035%，
+重标定完全重叠对照2.533%，串行加权3.786%。混合44格仍全部低估，MAPE5.319%，
+且不优于串行4.255%；以混合M1实测压力作oracle可降至1.791%，但不是可部署预测。
+保留原型，不修改当前planner基线。具体参数/域/验证见
+`optimizations/fused_moe_sve/results/small_m_overlap_20260910.md`。
+
+### 六类 kernel 的访问历史函数（Lab，2026-09-10）
+
+采用六个共享函数形式的实例 $F_g(r,s,h,p)$，$g=\lceil r/2\rceil$、
+$r\in[1,12]$ 保留精确有效行数，$s$ 区分W13/W2，$h$ 是同一B的前序完整panel
+数量，$p$ 为显式传入的访存服务倍率。冷/过渡/热是历史参考标签：0、(0,8)、
+以及8以上，不表示已观测的缓存层驻留。它们不对应18个固定耗时。
+
+无背景状态曲线用新测的1–12行、历史0/1/2/4/8/15构建；session1奇数行加完整12
+在0/1/2/8/15上校准，保留历史4、偶数行2/4/6/8/10及第二轮。比较冷值常量、
+0/1/8三个锚点插值和连续历史插值，后者允许非单调过渡，不强制B越热越快。
+每个stage有独立参数；完整12单独保存，不能把M11的尾行store等同于M12。
+
+任意正整数 $M=12q+r$ 可组合为 $\sum_{i=0}^{q-1}F_6(12,s,h_0+i,p)$，
+若$r>0$再加$F_{\lceil r/2\rceil}(r,s,h_0+q,p)$。超过15个历史panel需显式允许
+平台期外推；模型不会自动判断竞争导致的逐出，调用方必须更新/重置历史。
+
+保留前一重叠原型的归一化C/D/重叠系数，以新历史基线共同缩放C和D；这是
+有效历史修正，不把全部预热效应归于B。新测数据只有无背景，故$p>1$时的
+热状态与压力交互明确标记未验证，不能直接作为生产planner的已验证预测。
+218个留出条件上，冷值/三锚点/连续历史的块级MAPE分别为5.203%/2.704%/0.808%，
+完整M的MAPE为1.276%/0.434%/0.344%。完整M的MAE为58.821/12.386/12.810us：
+连续历史的总体绝对误差略高于三锚点，不声称所有指标均改善。两轮共10512次
+含预热及smoke的调用均通过数值检查；6项局部测试通过。当前planner基线不变。
+源代码为 `kernel_state_model.py`，报告为
+`optimizations/fused_moe_sve/results/six_kernel_state_20260910.md`。
+
+### 冻结无竞争基线的条件竞争增量（Lab，2026-09-10）
+
+后续M1交叉测量否定无竞争历史倍率与外部竞争普遍独立相乘。按用户要求保留
+原无竞争函数 $B_s(r,h)$ 及其参数，仅拟合
+$T_s(1,h,n_S,n_L)=B_s(1,h)+\Delta_s(h,n_S,n_L)$，严格满足
+$\Delta_s(h,0,0)=0$。非零压力暂仅支持M1、$0\le h\le8$、$n_S+n_L\le38$。
+
+令 $n=n_S+n_L>0$，使用
+$\Delta_s=(n_S/n)d_{S,s}(h,n)+(n_L/n)d_{L,s}(h,n)$。
+纯背景增量在核数0/16/38及历史0/1/8间分段线性插值；零核数锚点固定为0，
+其余24个锚点由第一轮纯背景实测减去冻结基线得到。它们是有效时间增量，
+不能解读为已识别的C/D分解；无竞争误差不会通过改截距被消除。
+
+第一轮混合与第二轮竞争共36点作回顾性留出，独立相乘/条件增量的MAE为
+63.573/18.023us，MAPE为12.674%/2.991%。12个混合点仍全部低估，条件模型
+MAPE7.283%；原无竞争对新实验的MAPE8.279%保持不变。训练24锚点精确插值
+不是泛化证据，内部历史/核数插值及其余行类别未验证。当前planner基线不变。
+实现为 `conditional_pressure_model.py`，详情见
+`optimizations/fused_moe_sve/results/conditional_pressure_refit_20260910.md`。
+
+### 固定19+19混合背景增量（Lab，2026-09-10）
+
+保留上述无竞争与纯竞争曲线，针对已有19个M2加19个M120背景增加
+$T_{mix,s}(h)=T_{linear,s}(h)+a_s+b_sh$，仅支持M1、历史0–8。
+W13的$(a,b)=(45.073026,4.285658)$，W2为$(27.516140,2.671842)$，单位us。
+每stage用第一轮历史0/1/8三个混合点拟合两个系数；第二轮6个混合点回顾性
+留出MAE由47.344降至1.847us，MAPE由7.307%降至0.301%。全部第二轮30个
+竞争点MAE为3.182us、MAPE0.736%。无竞争和纯竞争返回保持逐字段一致。
+这不是其他混合比例的验证：非19+19混合请求拒绝，未测历史插值不声称已验证。
+当前planner未接入。见 `optimizations/fused_moe_sve/results/mixed_pressure_refit_20260910.md`。
+
+### 混合比例与中间历史的前瞻验证（2026-09-10）
+
+冻结参数后新测38总竞争者、M2数量0/8/19/30/38以及历史0/1/2/4/8。
+预先固定推广项$4f(1-f)(a_s+b_sh)$，两轮全部混合MAPE3.763%，优于无修正
+线性混合8.290%；但历史2/4的24个混合点全部低估，MAPE6.689%。旧19+19
+历史0/1/8复测MAPE0.605%，新比例在旧历史点MAPE2.416%。纯竞争历史2/4
+本身MAPE6.721%；诊断性替换同期纯端点后，中间历史混合MAPE降至2.568%，
+仍有W13/history4/8+30额外误差。故不能宣布比例推广与历史插值普遍成立，
+本轮不重拟合、不改planner。详情见
+`optimizations/fused_moe_sve/results/mixed_pressure_prospective_20260910.md`。
+
+### 顺序修复纯竞争历史与混合增量（Lab，2026-09-10）
+
+冻结无竞争模型及纯竞争历史0/1/8，在38竞争者下用第一轮纯背景补齐历史2/4
+的8个修正锚点，之后固定纯背景，再拟合第一轮5个历史乘3个混合比例乘2stage
+的30个混合残差节点。纯修正按比例加权，混合残差在纯端点严格为0，比例及历史
+间分段线性插值。第二轮为回顾性同条件留出，不是新的前瞻验证。
+纯h2/4 MAPE从6.734%降至0.662%；混合h2/4在原模型/只修纯/两层修复下
+MAPE为6.824%/2.553%/0.434%。全部50竞争点最终MAE3.740us、MAPE0.630%。
+对原修正30点改善、12不变、8变差；最差最终误差12.140us。无竞争预测保持
+逐字段一致。38个新自由节点精确对应38个校准观测，不能以此声称未测比例/历史
+泛化。38总竞争者外的纯背景沿用旧模型，其他总数混合拒绝，planner不变。
+见 `optimizations/fused_moe_sve/results/history_mix_repair_20260910.md`。
+
+### 修正版内部节点的前瞻验证（2026-09-10）
+
+冻结修正版，新测历史3/6和M2/M120比例12/26、26/12（总38）。80个新条件中位数
+MAE7.371us、MAPE1.253%，32低估48高估，整体未重现旧版6–7%的普遍低估。
+但26/12的20点全部低估（MAE7.794us、MAPE1.242%），12/26的20点全部高估
+（MAE8.078us、MAPE1.450%）；仍有局部比例偏差。最大新点误差20.882us，
+来自W2/history6/12+26的高估。旧节点复测MAPE0.770%。不使用本轮数据回调参数，
+不改planner；见 `optimizations/fused_moe_sve/results/repair_interpolation_20260910.md`。
+
+### 修正版M1响应的planner局部接入（Lab，2026-09-10）
+
+仅替换整expert M1/1T的GEMM阶段基线与压力倍率，使用冻结history0响应；未拆分
+大M的panel历史，故history2/4修正本次不触发。竞争近似为同LLC活跃GEMM核数，
+peer M<=12归small、其余归large，宽team按核计，W2 peer沿用W13背景响应，
+39核封顶38。混合增量按n/38缩放。这些均为显式Lab外推，非测量支持的普遍规则。
+
+三组各141形状、422DAG的mean-best/early-mergeoff完整搜索：高偏斜同形状LPT
+但24个M1 expert换分配，实测两轮计算时间降低2.193%/2.418%；其余两组计划
+完全相同。共同4计划×2轮MAE由1.655降至1.638ms，修正版仍把较慢基线计划
+预测为较快，不能由选中计划提速声称排序模型已准确。模型改变候选任务分配，
+同预算不意味着同DAG集合，联合候选重排反而会选回较慢计划。当前基线未切换。
+见 `optimizations/fused_moe_sve/results/planner_repaired_pressure_20260910.md`。
+
+### 新版Lab取消宽窄team残差倍率（2026-09-10）
+
+按用户要求，后续新版Lab采用 `planner_no_team_residual.CorePressureModel`：
+在新内存校准对象中清空wide_team_pressure与narrow_team_contention_correction，
+所有宽度的独立/满并发倍率和窄team修正均为1。资源竞争、spill、明确开销和
+M1局部响应保留；原校准文件/惩罚版保存对照，生产默认不变。
+
+固定两份高偏斜计划后，预计31.139/31.285ms变为26.558/26.284ms，排序方向
+与实测一致但总时长仍低估。16T平均偏差为-1.737/-1.816ms，W2计算接近实测，
+剩余包括约0.98ms gather、0.34–0.36ms未分配间隙和约0.4ms W13低估。
+1T平均仍低估约2.40ms：kernel阶段低估被约2.95–2.98ms旧operator残差部分抵消，
+不能把残差直接视为真实开销。M1–4联合阶段误差最大；trace不能唯一分离独立
+成本与竞争错误。本次不重搜、不重测硬件、不拟合补偿系数。
+见 `optimizations/fused_moe_sve/results/no_team_residual_20260910.md`。
+
+### 无team倍率基线上显式加入16T gather（Lab，2026-09-10）
+
+`planner_gather16.CorePressureModel`在每个16T expert的W13前加入gather_pack_a，
+$t_g=4.220+6.012680(\lceil M/16\rceil-1)$ us，支持H4096、M1–1945。
+使用第一份计划第一轮63个expert gather中位数拟合两参数；其余195个观察回顾性
+留出MAE5.924us/MAPE14.162%。这是联合条件下的阶段延迟，不再乘竞争倍率、
+暂不额外注入共享访存流量，故尚不能代表gather对其他任务的带宽影响。
+
+原GEMM阶段及1T/其他宽度不变，宽窄team倍率继续为1。固定计划的16T平均
+低估1.737/1.816ms减至0.910/1.000ms；总体预测26.894/26.952ms仍低于实测，
+相对排序再次错误。显式gather改善归账但没有修复小M联合响应。本次不重搜或
+新测硬件；见 `optimizations/fused_moe_sve/results/gather16_model_20260910.md`。
+
+### 实际8T条带的协同历史采集（2026-09-10）
+
+新增真实8线程共同执行同一expert的采集：W13每线程128个GEMM N列/1MiB B，
+W2每线程512列/512KiB B，full-stripe `(8,0,0,1,1)`。测尾行1/2/4/8/12、
+前序完整块0/1/2/3/7及无背景/4个8T M2/4个8T M120背景；两轮10950条件
+全部数值/几何验证通过。线程自身服务与team包络分开，前序panel间不加barrier。
+W2无背景1行尾块h0约49–50us、h1约50us、h7约41–42us；h7完整12行约77us，
+小尾成本远高于按2/12计算行比例缩放。W13八行h1比h0慢10.6%/13.3%，
+表明历史响应依赖行形状/阶段/宽度，不能直接移植1T曲线。未拟合或改planner，
+不由容量推断实际缓存驻留；见 `optimizations/fused_moe_sve/results/eight_team_history_20260910.md`。
+
+### 8T 精确尾块基线与限定竞争增量（Lab，2026-09-10）
+
+对 $M=12q+r$，$T_{8T,s}=\sum_{h=0}^{q-1}F_{12,s}(h)+[r>0]F_{r,s}(q)$。
+第一轮无背景50节点冻结为 $F^0$，随后100背景节点拟合
+$\Delta_{r,s,b}(h)=F^{bg}_{r,s,b}(h)-F^0_{r,s}(h)$，不再按M12计算行比例缩放尾块。
+W13/W2 分离；r支持1/2/4/8/12，h节点0/1/2/3/7，区间内线性插值，不越界外推。
+Lab adapter仅替换M≤96且精确尾行受支持的8T expert，其余保留旧模型；
+分块保持计算/访存工作总量。未测尾行的覆盖边界存在不连续，不用于完整搜索。
+竞争仅在同LLC恰有四个8T W13 M2或M120 peers时使用测量增量，否则仍用旧竞争项。
+
+第二轮无背景块MAPE2.663%；背景块MAPE4.923%→2.840%，但整段MAE6.004→6.092us。
+固定median/uniformish trace中W2 M13–24支持子集MAE36.69→15.39/35.30→9.09us，
+8T lane MAE2.274→1.614/2.775→1.792ms；W13、M12及部分更大M回退。
+两份trace的新竞争描述命中均为0，不能归功于新竞争项；微基准W2无真实W13继承状态。
+不切换当前基线、不做新搜索或硬件采集。详见
+`optimizations/fused_moe_sve/results/eight_block_model_20260910.md`。
+
+### 单expert完整路径的8T无竞争桥接（Lab，2026-09-10）
+
+目标expert移到真实计划首位，其余任务依赖其完成；实际gather→W13/SiLU/packC→W2，
+8T CPU312–319，1MiB/512KiB条带、early merge关闭，两份输入24条件各两轮。
+第一轮完整包络精确M查表预测第二轮MAE4.918us/MAPE1.035%；已有精确块分开模型
+补相同第一轮非GEMM剩余量后MAE15.348us/MAPE2.418%。同M跨输入MAE5.688us。
+已有精确块基线自身W13/W2 MAPE3.446%/1.842%，未复现联合trace的W13大幅高估。
+完整路径标定更贴近该运行条件，不说明必须取消阶段分解，也未唯一识别竞争误差机制。
+M12等总时间有回退/波动；未测M泛化和联合竞争仍未验证，不替换planner默认或实验基线。
+详见 `optimizations/fused_moe_sve/results/eight_single_expert_20260910.md`。
+
+### 8T分阶段DRAM需求表（Lab，2026-09-10）
+
+独立stage测量定义 $p_s=(R^{read}_s,R^{write}_s)$，按M、W13/W2、实际owner条带及
+权重复用状态条件化，另保留每调用流量与P10/P90。两轮DDRC read/write采集及无PMU对照：
+8T轮换32份B的W13 M1/M12/M48约61/47/26GB/s；重复一份B全部条件低于0.5GB/s。
+W2模式不同，M1存在较大轮内波动；连续/stride7路由差异未跨两轮稳定复现。
+这些是独立的已服务DRAM需求代理，不是排队延迟或供给上限。未测M不插值，未将副本数
+映射成panel历史h，也不把平均压力视为瞬时压力。联合使用仍需验证缓存状态与请求节奏反馈。
+无planner/基线切换；见 `optimizations/fused_moe_sve/results/eight_stage_demand_20260910.md`。
+
+### 固定8T/M12成本的需求加权竞争响应（Lab，2026-09-10）
+
+固定真实完整路径第一轮成本 $T^0_{13}=161.765$us、$T^0_2=82.720$us，
+冻结上一轮独立需求表。$x=\sum_j(p^{read}_j+p^{write}_j)/47.15856035147088$，
+$T_s=T^0_s(1+a_sx+b_sx^2)$，非负系数、无拟合截距；无背景必回到原成本。
+W13 $(a,b)=(0.018287133,0.000393287)$；W2 $(0.020100800,0)$。
+第一轮同类32副本后台训练，混合/单份复用和第二轮全部留出；任务数对照参数预算相同。
+第二轮28联合条件MAE2.936→1.083us、MAPE2.293%→0.882%；混合仅1.230→1.155us，
+部分混合点回退。无背景约1%协议残差保留不拟合。压力和不是实测联合流量守恒等式。
+仅验证同LLC、前台8T/M12、持续后台；其他M、动态阶段切换和真实trace尚未验证，
+不切换planner基线。见 `optimizations/fused_moe_sve/results/eight_joint_response_20260910.md`。
+
+### 冻结需求响应的跨M与动态事件验证（Lab，2026-09-10）
+
+冻结全部成本/系数与需求，测前保存自主事件预测；有限8expert批次，W13→W2真实packed C依赖。
+M8仅固定后台前台预测，无缺失需求插值；M12/13/48自主推进所有team的阶段与结束事件。
+新M静态需求模型前台完成MAPE5.06%，任务数5.27%；M8单独仍11.88%。
+动态需求模型前台/总体完成MAPE1.13%/1.04%，任务数0.94%/0.53%，未全面胜出。
+对同协议无背景作诊断差分：M12/M13/M48实际批次增量约102.90/185.99/143.40us，
+需求预测112.84/137.60/225.87us。直接误差包含基线与竞争误差抵消，不能视为响应推广成功。
+2976个动态前台阶段中2519个跨后台阶段边界；验证了混合重叠但未重新拟合或切换基线。
+后续需前台M/块敏感度及阶段状态/间隙验证；见
+`optimizations/fused_moe_sve/results/eight_response_transfer_20260910.md`。
+
+### 前台块／尾块的非线性需求响应（Lab，2026-09-11）
+
+保留全部阶段成本和原需求条目，独立补M8需求。以旧F块曲线分配成本并归一化，
+$t^0_{s,b}=T^0_{s,M}F_{s,b}/\sum_bF_{s,b}$，确保无背景总成本不变。
+首个12行块响应保持原系数；W13/W2各新增reuse12(h1..3)、row8(h0)、tail1(h1)三条
+$R_{s,g}(x)=1+a_{s,g}x+b_{s,g}x^2$，非负系数、无自由截距。
+块级相对变化仅用完全处于1/4个W13-M12后台覆盖内的训练样本，不用绝对残差回调成本。
+曲线冻结后两轮新鲜无额外panel计时留出：静态/动态竞争增量MAE51.28/77.17→21.43/18.27us。
+但动态全部team绝对完成MAE85.47→183.08us，基线、间隙与静态M48残余仍未解决。
+保留曲线响应候选，不切换整体planner；未知尾行/历史不外推。详见
+`optimizations/fused_moe_sve/results/eight_block_sensitivity_20260911.md`。
+
+### 联合资源模型的基线闭合（Lab，2026-09-11，进行中）
+
+`analyze_joint_baseline.py`在真实单expert trace上定义可加核算：
+`T_expert = T_gather + T_W13 + T_W2 + G_before_gather + G_before_W13 + G_before_W2 + G_after_W2`。
+逐样本核对时间端点、阶段不重叠和总和，均值保持可加；独立中位数不具有该性质。
+已有24条件两会话GEMM重复MAPE为W13 0.3914%、W2 0.4722%，总时间1.0353%，
+不能据不同状态的连续GEMM链偏差直接回写真实路径T0。
+新增两会话完成2084次调用校验；历史同形状session1预测新两会话，W13/W2 MAPE为
+0.5141%/0.4200%，总时间1.1632%。这支持真实路径重复性，不证明未见M泛化。
+新模型计划先闭合协议匹配基线，再引入状态需求、共享服务容量及重叠反馈，最后验证混合宽度
+和未见联合计划；目前为基础组合与worker诊断候选，没有新增已验证资源公式或更换planner默认。
+Lab基础组合候选`joint_baseline_model.py`定义`P_s(b)=T_s(12b)`、
+`D_s(r)=T_s(12+r)-T_s(12)`，主假设`T_s(12b+r)=P_s(b)+D_s(r)`，r=0只取P；
+M<=12直接保留首块逐行成本。完整前缀已含stage setup，不能重复添加。
+历史缩放尾块仅作诊断对照，两个版本均只拟合训练session1，域限8T/M1..60真实路径。
+gather非负仿射与间隙常数分别标定；这些尚未通过留出，不代表可靠资源模型已完成。
+训练两会话2406次调用校验完成，主版本session2完整expert MAPE1.4642%，P90误差3.8601%，
+14个后续尾块留出预测已冻结并完成验证，结果如下。
+原始worker trace进一步确认gather包络混入到达错位：M1包络45.79us、最大worker区间1.87us，
+M12分别56.53/5.395us（两会话中位数均值）。单样本应按
+`E_gather=max_i(a_i+g_i)-min_i(a_i)`核算；不能将整段包络作为资源服务时间或对外需求。
+现有gather仿射只限isolated-first-expert对照，初始worker到达与后续任务状态仍需建模。
+14个后续尾块留出已完成1284次调用校验：主版本完整expert MAPE1.8896%、P90误差3.9385%，
+但W2 MAPE5.8632%且全部条件高估，平均+13.9243us；不能由总时间通过推断阶段模型通过。
+完整块比例缩放对照W2仍4.5071%，保持候选不采用，需辨识前缀与尾块的历史残差。
+新增worker时间可选解析及同核首任务/先行M36后任务对照；先行任务严格串行，其他任务
+仍必须晚于target结束。实际到达标记只作诊断，不作为模型预测输入。
+同核首任务/先行M36后任务两轮1042次调用已验证：目标完成减少约38.78–47.05us，
+gather最大worker区间仅变化-1.68至+1.05us，到达跨度减少约35.97–42.44us。
+W2变化-1.615至+0.740us，不能解释尾块留出13.9243us偏差。启动/到达项与
+GEMM历史残差需独立处理，隔离首任务的到达跨度不能逐expert重复收取。
+同expert/同packed-B/嵌套route前缀对照1968次调用已验证：W2的1行整阶段净增量在
+h1/2/3/4为49.085/38.210/29.515/21.515us，11行h1/2/3为83.455/80.330/79.525us。
+因此历史响应依赖kernel类别；仍是跨M整阶段差分，未声称真实panel内部计时。
+其余3/5/9行及首块的同权重补采进行中，未据此切换默认模型。
+初始时序候选定义`start_i=max(R_task,A_i)`、`finish=max_i(start_i+G_i)`，避免逐任务
+重复添加启动时间。固定CPU中位入口表在跨计划诊断中单次MAE约23us，最早入口中位数
+偏差约31us，不能视为已验证的完整到达模型；当前只实现校准/时序不变量，尚未接入planner。
+六类kernel历史候选已进一步采用`D_g(h)=a+b*exp(-lambda*(h-1))`（非负参数、h1..4），
+用奇数行代表拟合，偶数行仅加首块配对差；a不解释为物理计算下限。
+18点两会话前瞻验证1640次调用通过，W13/W2/GEMM MAPE分别0.6593%/0.5252%/0.4581%，
+P90相对误差1.3631%/1.1121%/0.9822%。这是8T/M<=60/固定窗口的基础GEMM证据，
+不等于联合或其他宽度已验证。此前真实route回顾性迁移W13/W2 MAPE为0.3904%/0.4741%。
+Gather整数工作映射已与native的300配置对齐，算法读写量不能冒充缓存/DRAM流量；8T
+worker区间线性候选形状检查MAE1.8133us、MAPE15.9391%，仍需与到达/共享服务分开验证。
+Lab新增进程局部JIT getter包装以观察真实panel区间，原kernel不变，无panel barrier。
+按实际调用序列和B指针验证数据，预设同进程control/observe阶段中位扰动<=1%；
+两场原观测版1066次调用/21760条panel通过完整性校验，但W2/M49阶段配对扰动
+为+1.949%/+2.079%，多个M重复超过1%，拒绝用于成本或资源校准。避免重复发布相同
+kernel指针的变体另两场也未通过：W2/M25为+1.686%/+1.231%，M49为+0.653%/+1.519%。
+计时/记录/门槛不变，后续独立定位时间戳和记录开销。逐worker配对分解显示缓存发布版
+24个M/stage/session组的last-finisher到达偏移均值变化绝对值<0.1us，不能将主要差异
+归为team入口错位。Lab count-only编译消融保留包装/CPU查询/计数，关闭时间戳和事件payload；
+独立日志类型禁止其作为panel时间数据。该消融两场1066调用/21760拦截校验通过，
+24个GEMM组中22组满足1%，但第二场W2/M12为+1.065%、M49为+1.398%，仍不通过整体门槛。
+去掉时间戳和payload并不足以消除全部扰动；下一候选为稀疏worker/panel采样。
+单worker候选按call ID轮换CPU312–319，未选worker直接调用原kernel；仍按实际8T N切分验证，
+另检查同pair同CPU的worker区间扰动<=1%，防止team最大值掩盖单worker减速。分次采样不得拼成
+同时team包络，完整native阶段trace负责全team阶段先后检查。两场稀疏实验1066调用/2720panel
+校验通过，但team仅22/24组、被采样worker仅15/24组满足1%；M13/W2 worker为+2.155%/+1.779%。
+拒绝将其校准为真实panel成本。观测变体保留诊断，独立共享服务实验继续使用已验证whole-GEMM
+无竞争基线，不能把历史净增量参数解释为物理计算下限。尚未加入PMU或将
+panel观测作为已通过的资源模型证据。
+验收预设为未见计划MAPE<=3%、P90误差<=5%，固定实测候选集选择损失median<=2%、P90<=5%，
+首批真实locality对照固定前台expert13/M13/8T及后台expert37/233/151/157（M48/24/12/12），
+启用0/1/2/4后台，同LLC CPU280–311与跨LLC CPU248–279对照；前台CPU312–319。
+后台按真实gather→W13→W2推进，其他任务等待观测cohort全部完成。零背景也保留相同任务配置，
+仅让后台等待前台完成；不把后台数量或local/cross差直接当独立LLC/DRAM需求或容量。
+首版提升head遗漏旧lane前驱旁路，烟测发现NaN；补齐依赖并验证所有共享核任务对有DAG先后，
+修复版两场738调用校验通过。零背景冻结T0相对偏差W13为+0.745..+1.023%、W2为+0.104..+0.737%。
+四后台时W13配对增量44.05..47.56us，W2为1.44..2.79us；local与cross均出现主要W13减速。
+前台W2期间实际仅约两个后台活跃，不能将整段四后台常数用于W2，也不能独立归因前台敏感度。
+这仍是M13动态cohort诊断，不是资源容量识别或未见M泛化验收；模型参数尚未改。
+同时要求分组偏差、噪声和相同搜索预算检查。报告：`results/joint_cost_model_20260911.md`（MoE Lab）。
+
+**首块请求窗口候选（Lab，条件时间线）。** 固定8T/M<=60的上述无竞争模型，令
+`tau_s(M)=T0_s(min(M,12))`，一个stage在该参考窗口内请求Q13=8MiB或Q2=4MiB，
+剩余`T0_s(M)-tau_s(M)`作为不竞争本资源的服务时间。这里Q是packed-B需求代理，
+不是实测DRAM流量；首窗口也不是已验证的真实panel时间分解。
+活跃请求窗口的参考速率`r_i=Q_i/tau_i`，容量C下先取
+`u_i=1/(1+alpha*sum_peer(r)/C)`，再取`v_i=u_i*min(1,C/sum(r*u))`；
+窗口按v_i推进，剩余服务按1推进，故减速会延长请求窗口并反馈到后续重叠。
+alpha=0为纯容量对照。无竞争严格恢复T0；若C低于单个任务参考速率则拒绝参数。
+W13结束后经过固定gap再启动W2，两stage均自主推进，不读取实测W2起点/终点。
+首版仍以每个活跃team的实测W13起点为条件，因此不含gather/入口预测，不能作为完整planner模型。
+只拟合M13 session1：纯容量C=202.5GB/s等效单位；低压力响应版C=200、alpha=0.08；
+gap=0.39us来自零背景。训练16个阶段条件中位数MAE分别2.1843/1.3914us。
+这两个容量是需求窗口模型的有效参数，不是硬件带宽测量。M12/M48采集前已冻结绝对/相对增量
+迁移对照；动态候选在新数据开始采集后、读取其时间前冻结，只称拟合留出，不称测前冻结验证。
+M12/M48四场1476调用校验通过。有竞争条件下低压力版目标双GEMM跨度MAPE0.925%/0.639%，
+cohort跨度MAPE0.337%/0.570%，均仍以实测初始W13起点为条件；不是完整计划预测精度。
+M12/W13最大阶段误差3.513%，M48/W2较纯容量版MAE0.683→1.745us回退，不能只报告有利项。
+保留候选和对照，下一步移除实测起点并验证gather/ready及全动态时间线，不替换planner基线。
+
+**入口/gather组合候选。** 对初始无依赖且核不重叠的8T cohort，逐worker gather服务
+`G_i(M)`来自既有逻辑工作量模型。每个旧入口场景保留同一次调用80CPU的向量A，
+以`W13_start=max_i(A_i+G_i(M))+g_setup`启动请求窗口模拟，最终取各场景输出的中位数。
+对照先取每CPU入口中位数，再计算team最大值。g_setup=2.28us仅从M13第一场零背景阶段间隙获得；
+resource C/alpha/gap、GEMM基线、gather系数及旧入口样本均不重拟合。现在不输入目标运行的实测时刻，
+但gather尚无共享资源反馈，仅支持初始cohort，显式拒绝依赖任务和非8T/重叠核集合。
+回顾性correlated版本M13/M12/M48目标完成MAPE0.705%/1.805%/2.085%，cohort完成
+0.789%/0.818%/2.203%；起点为scheduled_compute，非最终merge或全计划完成。
+M48第二场入口共同延后使起点误差显著，不能新增M48残差掩盖；旧入口场景分位数不自动等于校准置信区间。
+冻结M17/M35完整数值预测后再采两场新条件，correlated预先指定主版本、per-CPU median为对照。
+四场1476调用校验通过，主版本M17/M35前台完成MAPE1.485%/1.073%、P90为3.159%/1.923%；
+cohort完成MAPE1.134%/0.935%、P90为2.130%/1.640%，通过初始cohort完成时间门槛。
+W13起点MAE8.570/6.542us仍较大；入口场景带对cohort样本覆盖率仅58.5%/71.2%，不能用于
+声称已校准置信区间或安全剪枝。此结果不覆盖依赖后继、大M>60、其他宽度或完整planner搜索。
+
+**依赖驱动队列候选。** 请求窗口模拟新增按DAG释放任务：`R_j=max_{p in deps(j)} end_W2(p)`，
+root取0；释放后逐worker取`start_gather_i=max(A_i,R_j)`，gather结束和既定setup决定W13起点。
+因此初始入口不在每个后继上重复计费，W2/后继起点均由预测完成事件触发。共享请求速度、
+T0、gather系数和所有resource参数保持冻结，gather仍未竞争本资源。依赖必须按输入顺序拓扑有序，
+任意共享worker的任务对必须通过DAG祖先关系排序；无依赖结果与前一cohort预测逐字段相同。
+首批15个真实expert分五条8T队列，每条3任务，M8..60；比较forward/reverse/rotate/staggered，
+以及joins/joins_reverse/serial控制。其他原任务等15任务全部完成才执行，故仍是全计划的受控前缀。
+测前冻结完成预测约1.996..2.033ms（四队列顺序）、2.654/2.659ms（joins）、8.566ms（serial）；
+不读实测时刻、不重拟合参数，随后两场验证并检查实际依赖边与阶段先后。
+首批稠密实验图的连续队列MAPE4.273%、P90=5.196%未通过；joins/serial为1.902%/0.947%。
+trace显示同lane后继在gather前等待约40..50us，GEMM自身误差不是主要来源。原native代码在W2后
+先barrier、发布task状态并逐个通知successors，再由本team越过最后barrier；模型把数据完成与
+worker可复用合并成一个时刻，遗漏了该区别。实验给每个pilot接约209个剩余任务造成高fanout，
+原anchor仅224任务/215边，因此不能把此间隙拟合为所有8T后继的常量惩罚。
+配对传递约简保持每个节点祖先集合、pilot依赖、核/输入完全一致，边数3345→255等。
+两场1066调用通过数值/trace校验，同lane关键交接间隙中位43.47→3.01us；连续队列实际缩短
+67.42..92.77us，冻结模型MAPE4.413%→0.787%，P90=1.537%。joins/serial约简后为1.242%/1.188%，
+没有同等收益，说明部分通知成本可被其他lane的工作隐藏。没有修改生产图或重新拟合参数。
+后续需区分边通知就绪与worker退休时刻，并保留原稠密图反例；混合首波M8/W13仍有约10..15us
+低估，约简并未消除该独立竞争响应问题。当前仍非完整planner模型。
+
+**发布/worker退休候选。** 令task p的计算终点为E_p，完整native successor列表长度为d_p，
+其中child j的零基rank为k_pj。候选`notify(p,j)=E_p+b+nu*k_pj`，
+`reusable(p)=E_p+b+nu*d_p`。新任务gather逐worker从
+`max(initial_entry_i, max_parent notify(p,j), previous_worker_reusable_i)`开始，保持通知与占用分离。
+模拟器在W2结束时回调，记录未来通知/可复用时刻；completion仍取W2最大终点，不冒充最终merge完成。
+publication启用时必须提供完整有序successors（包括未在受控前缀中执行的任务），拒绝缺失通知元数据。
+未启用时保持原模型输出。C、alpha、T0、gather参数均冻结。
+只用queue_reduction第一场三条链的1/210 fanout交接中位数2.955/44.115us，得到
+b=2.758062us、nu=0.196938us/通知；这是80-worker/8T环境的有效模型，不是独立atomic指令延迟。
+保持完全相同可达关系，构造fanout9/33/65的forward/reverse/joins/serial新图，测前冻结新旧预测。
+模型预测串行在这些fanout下不随d增长（worker退休已被其他lane工作隐藏），连续链随d增长，
+joins可能因错开竞争而非单调变慢；等待新两场验证，不把拟合端点当泛化证据。
+新两场1066调用校验通过，发布版forward/reverse/joins/serial完成MAPE分别2.209%/1.653%/
+0.717%/0.920%，P90均<5%；旧版forward为3.119%。Joins较旧版0.496%回退，不能只报告有利项。
+局部gap仍系统低估：fanout9/33/65预测4.531/9.257/15.559us，实测中位4.955/12.130/23.460us。
+因此保留通知与worker复用分离结构，但不宣称线性通知成本已可靠泛化，也不由完成门槛通过
+推断M8竞争、独立资源需求、其他宽度/大M或完整planner已验证。
+
+**等宽team服务分配对照（Lab，未采用）。** 在既有参考请求r与低压力速度u上，
+令期望服务d_i=r_i*u_i。默认仍按比例分配；可选max_min在总需求超过C时选择lambda，
+使`b_i=min(d_i,lambda)`且`sum(b_i)=C`，请求进度`v_i=b_i/r_i`。
+总需求未达容量时直接b_i=d_i；私有服务速度保持1。仅比较相同8T宽度，不能据此定义混合宽度公平权重。
+固定C=200、alpha=0.08、gap=0.39及T0的旧混合首波条件诊断：M8误差-15.387→+11.463us，
+M12为+33.446→+8.364us；M16筛选子集为+11.433→-13.226us。公平分配不能单独闭合误差，
+请求窗口/重叠假设仍待辨识；该诊断输入实测W13入口，不是自主泛化。
+新前台M4/M8各8个0/1/2/4背景与local/cross条件，背景M48/24/12/12，使用旧完整入口场景
+分别冻结两种分配的自主预测。产物`tmp/joint_cost_model_20260911/allocation_small_m`，
+预测先于采集；当前未评分，不更改planner默认。独立需求、混合宽度和全计划验证仍欠缺。
+
+M4/M8四会话1476调用校验通过，测前评分两分配的有竞争前台完成均未达门槛：
+比例MAPE5.108%/8.469%，公平3.670%/6.515%；cohort均<3%，不能掩盖前台失败。
+无竞争W13 MAPE0.465%/0.509%，W2 1.209%/0.771%，但M8入口到完成低估约19.683us。
+1/2背景两分配预测相同且均低估；条件实测入口后M4 W13仍低估4.497/12.938us，
+M8为3.132/9.860us。因此低压力响应也需辨识，不能仅改变容量饱和分配；本批若用于
+后续拟合即转为开发集，另采留出。详见上述报告与allocation_small_m/evaluation.json。
+
+**请求密度敏感度候选（Lab）。** 原比例分配中仅替换W13窗口alpha为
+`alpha_i=0.08+beta*max(0,T0_W13(12)/T0_W13(min(M_i,12))-1)`。
+beta=0保持旧模型，M>=12保持原alpha；无竞争peer需求为0，故不改变T0。
+比值来自首窗口packed-B代理速率，不是独立硬件流量。beta只用M4 session1的n1/n2
+条件W13拟合为0.632；W2、capacity、gather、到达、后台M>=12全部冻结。
+新M6/M10数值预测先于采集保存于`tmp/joint_cost_model_20260911/density_small_m`，
+必须按前台阶段及完成误差评分，不能让cohort最长后台掩盖小M失败。尚未完成留出评分。
+另有回顾性独立anchor早期10调用预测后续21调用的入口校准诊断，M8零背景完成MAE
+19.166→1.964us；不修改原前瞻分数，也不默认使用目标运行时刻。两问题分开验证。
+
+请求密度候选M6/M10四会话1476调用通过数值/trace检查，但冻结验证未支持通用采用。
+有竞争W13 MAE：M6 14.295→1.135us，M10 1.876→4.431us；M6 W2 MAE2.951→4.250us回退。
+新前台完成MAPE8.942%/3.923%均未过门槛，入口误差独立保留。
+实测入口条件诊断下M6 n4仍低估5.828us，M10 n1/n2/n4均高估约2.8..3.6us，
+说明自主阶段分数可能有误差抵消，不能只选有利项。保留beta冻结反例，不加M阈值或事后重拟合。
+下一步辨识计算/访存重叠与kernel响应转折；独立需求、其他宽度、大M、完整计划及planner仍未验收。
+
+**独立首块时钟的重叠对照（Lab，未采用）。** 计算时钟c=T0_s(min(M,12))，
+W13请求窗口q=min(c,tau)、W2为q=c；首块计算与请求并行，首块结束=max(计算结束,请求结束)，
+随后执行T0_s(M)-c的原私有增量。c/tau只是有效时钟，非实测物理计算下限/服务分解。
+资源速率为Q/q，请求完成后退出竞争；无竞争保持T0，tau=inf且alpha保持旧值时退化为旧模型。
+以M4/M13第一场训练所有活跃expert W13，原网格最优C200/tau116/alpha13=0.2，扩展后
+C260/tau140/alpha13=0.5。扩展训练MAE4.292→3.349us，但M10 W13迁移MAE
+原2.790→10.524us，M6 W2原3.087→7.015us；不采用，不修改默认。
+此为已观察数据的条件诊断，不能据此排除所有重叠结构。保留完整网格、残差和不变量检查于
+`tmp/joint_cost_model_20260911/overlap_diagnostic`，下一步必须增强参数独立可辨识性。
+
+**实际K循环类别条件响应（Lab，待验证）。** 原生BF16 exact-M生成器在rows<=8使用
+physical_rows=8及双缓冲K循环，rows9..12切换physical_rows=12及分组K循环；并非任意M阈值。
+首请求窗口r=min(M,12)仅当r<=8时令
+`alpha_s=0.08+beta_s*max(0,T0_s(12)/T0_s(r)-1)`，否则保持0.08。
+W13 beta0.632冻结，W2 beta0.458仅用M4第一场n1/n2拟合；T0/C/gap不变。
+六个row-pair类别不意味着奇偶行完整kernel等同，也不能以静态分支证明物理瓶颈。
+M6开发条件W2残差缩小，M10逐字段恢复原模型；M7/M9新鲜预测已冻结并启动验证于
+`tmp/joint_cost_model_20260911/family_small_m`，尚未评分。后续尾块暴露、宽度及全计划仍欠缺。
+
+kernel类别候选M7/M9四会话1476调用校验通过。冻结有竞争M7 W13/W2 MAE
+11.523/2.369→1.364/0.929us；M9保持原模型3.018/0.799us，不引入额外修正。
+但新前台完成MAPE3.891%/5.215%均未过门槛，零背景完成也因入口等误差未通过。
+独立Lab DAG adapter传递原prepare/on_complete，24个一致性检查通过。旧15-expert
+reduced队列自主回放完成MAPE0.966%→0.883%，M8首波W13改善、forward/joins后续
+W13却回退（MAE5.648→15.842、4.762→22.465us）。保留kernel类别特征与反例，
+不采用全局候选；需分开验证动态重叠与后续环境，不以整体平均分数掩盖阶段失配。
+
+后续M8定位新增同波上下文反例：joins最终波与joins_reverse首波的expert/M/核完全一致
+（M8/8/12/12/16），只模拟该波、输入实测起点且排除同时运行的其他任务后，family仍对
+后续M8高估约20..23us。配对实测后续M8比首波快18..20us，其他三个任务也快约11..25us，
+均在两场方向一致；模型只预测M8约0.3..1.4us变化。该差异不是前驱预测clamp造成的。
+因此仅有静态kernel类别和当前活跃请求集合不足以闭合当前数据；需辨识可迁移的前序执行
+状态对需求/服务的作用，不能按波次减常量或直接认定B历史因果。证据matched_wave.json。
+
+固定目标波次上下文辨识已启动：M8/8/12/12/16始终在CPU280–319，以真实任务构造
+0/1/2前序波；相同前序工作分别在同LLC或CPU240–279跨LLC执行，全部先于目标完成。
+原任务集合与目标窗口保持，完整资源依赖静态验证；seeds611601/611602，数据与协议
+`tmp/joint_cost_model_20260911/wave_context`。此为状态辨识实验，不新拟合模型；
+位置变化仍包含局部worker/缓存与共享域作用，不能单独解释成DRAM效应，结果待采集。
+
+前序位置实验两会话492调用通过完整校验。目标M8的W13在同LLC前序1/2波后
+配对缩短约17.5..22.9us，跨LLC相同前序仅缩短约4.3..7.0us；直接cross-minus-same
+差约10.4..17.3us，pair MAD约2.3..3.1us。cross起点并不更早，简单等待时长不能闭合该模式。
+这支持局部执行上下文贡献，尚不能区分目标核与同LLC共享状态。下一步用目标核/同域其他核/
+跨域的相同前序工作区分，不按波次加常数。证据wave_context/analysis.json，未改模型参数。
+
+目标核/同域其他核辨识已启动于core_context：同五个前序expert统一两条8T依赖链，
+只改变CPU280–295（M8目标核）、296–311（同LLC背景核）、248–263（跨LLC）的放置。
+三种bridge仅前五个core_begin不同，目标五expert及完整依赖保持；无前序另作基线。
+seeds611621/611622，结果待采集，不新增状态系数。peer核活动也可能改变背景需求，不能
+仅凭目标速度差宣称纯缓存因果；各目标/背景阶段一起分析。
+
+两lane前序位置对照两会话410调用校验通过：M8在目标核前序或同LLC其他核前序后
+均缩短约9..11us，直接配对两位置差-0.190/0.000us，描述bootstrap区间均含0，未宣称严格等价。
+两种同域位置相对跨域均快约4..6us，且从未执行前序的M16核也获得同域收益。
+目标核自身活动不是此收益的必要条件，下一步以共享域执行状态辨识为主；尚不能单独归因缓存或时钟，
+也不能把五lane与两lane的差简单当线程数系数。数据core_context/analysis.json与intervals.json，
+无新状态参数采用，完整目标范围保持。
+
+共享域历史代理诊断显示累计工作量不足：相同5expert/60MiB逻辑权重/1.598GFLOP的
+40核与16核前序，局部收益约15..17us与4..6us；加倍前序工作没有加倍收益。
+单条件比例标定的已观察条件迁移中，峰值分配核数优于累计工作和所测EWMA，但仅两种
+并发水平，不采用参数或宣称物理机理。GEMM核区间也未包括native等待worker的状态轮询/yield，
+不能视为实际全域请求压力。证据domain_history_diagnostic/results.json，下一步需新水平和独立服务验证。
+
+共享域峰值代理的24/32核新水平已冻结验证：同五个前序任务分3/4条8T链，同/跨LLC配对，
+目标波次不变。旧单条件系数0.427875us/core预测局部收益10.269/13.692us，累计任务数对照
+均17.115us；测前文件mid_context/frozen_predictions.json，seeds611641/611642。
+这是上下文收益代理验证，不是硬件带宽或全计划预测，结果待采集；未采用峰值状态公式。
+
+24/32核前瞻两会话492调用通过，实际峰值逐调用核对。冻结峰值规则预测局部收益
+10.269/13.692us，新实测分别7.550/8.865及10.585/9.985us；MAE2.734us，优于累计任务
+对照7.869us，但四点均高估。保留共享域活动强度特征，不把它直接转成每任务时间减项；
+状态衰减与资源响应的连接、其他形状/宽度和全计划仍未验证。证据mid_context/evaluation.json。
+
+**状态到资源响应的条件对照（Lab）。** 固定T0/kernel响应，C_eff=C0*(1+gamma*P/40)，
+gamma只由旧one_same/session1 M8上下文差拟合为0.088；或保持C0而只将W13 Q归一化为
+Q/(1+gamma*P/40)。全stage同倍Q归一化与C增大代数等价，不凭时间数据声明物理容量/流量。
+旧同域条件中W13特定压力候选使M8/M12/M16 W13 MAE19.398/27.695/16.521→
+7.543/16.697/5.553us，M12/W2保持约1.43us；全stage C变化会使其W2回退至3.25us。
+仍有系统残差，P相同的不同历史也未闭合；未实现动态状态衰减或跨域并发分配，未采用。
+证据state_service_diagnostic，60隔离/100代数等价/5非法参数检查通过。
+
+**自主状态DAG原型（Lab）。** 每域记录预测active expert核数及峰值；W2完成事件锁存峰值，
+之后真正激活的W13按Q/(1+0.088*latched_peak/40)归一化。初始状态0，每预测call重置，
+当前假设call内不衰减；不是已经辨识的物理状态。只支持既定NUMA3单LLC8T team。
+activation必须发生在预测事件时刻，不能在未来任务准备时提前读历史；原依赖/publication继续保留。
+30个零效应DAG及延后激活、域隔离、重置检查通过。旧15expert队列自主回放M8 W13 MAE
+8.976→4.262us，forward/joins后续误差明显减小，首波保持；完成MAPE0.883%→0.921%，
+总体基本持平。未见队列/衰减/其他宽度/全计划/选择效果未验收，不采用默认。
+证据dynamic_state_candidate/results.json与identity.json。
+
+自主状态的新顺序验证已冻结：同15expert/5x8T，10个未见队列排列加forward/reverse控制，
+三模型在固定12候选中均直接选择new_06。seeds611681/611682，预测先于采集保存于
+state_order_holdout；新顺序完成误差与集合内选择损失分别报告，不按同赢家重新挑候选。
+范围仍是受控15expert前缀，非完整224expert或相同预算完整planner搜索，结果待采集。
+
+新顺序前瞻两场1066调用通过：10个新排列的dynamic完成MAPE0.479%、P90=0.777%，
+publication/family也约0.468%，不能宣称整体精度领先。首波M8阶段改善保持，后续M8
+W13 MAE6.233→4.368us。三模型同选new_06，两场集合内选择损失0.260%/0.081%，差异小于
+配对波动；不是广泛regret或完整planner搜索验收。支持保留候选，仍不默认切换。
+实际原anchor224任务/12288路由中，当前支持域8T/M<=60仅2124路由；15pilot仅402路由。
+下一优先级大M8T（7709路由）与16T（2455路由），路由份额不等于实测时间份额。
+证据state_order_holdout/evaluation.json与coverage_audit/results.json。
+
+大M8T基线扩展已准备并仅启动训练：真实expert85原M1205，同B/嵌套输入前缀、CPU312–319、
+full stripes，12训练点与12留出点分开。主候选在M60连续，完整块每stage稳态斜率仅拟合
+session1完整12行倍数；尾块沿用原h4独立曲线平台，M<=60不改。尾部平台与稳态斜率均待验证，
+第二场作重复性，留出必须在模型/预测冻结后采集。产物large8_baseline，非联合/16T完成声明。
+
+大M8T训练两会话1066调用通过，完整块稳态斜率W13/W2=150.469/72.293us每12行，
+重复场整阶段MAPE0.239%/0.554%，旧M12/M60锚点未改变。但r5/h100整阶段配对增量
+W13约69..71us而h4平台预测106us，W2约15..19us而预测37us；尾项平台不足，不能据整阶段
+低百分比误差宣称分解准确。保留原候选反例，留出尚未采集，先补长历史各尾类训练再冻结修正版。
+证据large8_baseline/model.json和tail_diagnostic.json，非独立panel测量、非联合验证。
+
+长历史尾项补充训练已启动：同expert85/8T，在M600与M1176完整基点之后分别追加
+r1/3/5/7/9/11，h50/h98各两会话。与原留出不重合，逐pair保留整阶段净增量和MAD，
+不能把净差当独立panel服务或截断噪声。产物large8_tails，留出仍未采集，结果待完成。
+
+长历史六类尾项四会话1312调用通过。W13 r1/r3在h50→h98仍下降；W2 r1整阶段
+净增量四组约-10..-18us，描述bootstrap区间均不含0，不能当作非负独立尾kernel成本或截断。
+完整M12块数未变，但阶段继承/布局/worker时序尚未独立辨识。下一候选以有符号形状净修正
+表达全阶段时间，保留正总成本及M<=60原基线，禁止把该修正当作负资源需求或物理计算下限。
+原留出未采集，先冻结修正版；证据large8_tails/analysis.json、intervals.json、worker_check.json。
+
+大M8T修正版测前冻结：完整前缀斜率不变，尾部改为h4/h50/h98节点的有符号全阶段
+形状净修正，h50/h98只用session1，history线性插值，最多延伸到h100/M1205。保留M<=60
+原模型；全部1205形状通过正阶段时间/首块下界检查，不提供M单调剪枝保证。
+原12留出加6个r8/r10点共18形状，预测冻结于large8_baseline/model_v2_frozen.json，
+四会话留出串行采集中。不得将有符号净修正解释为负资源需求，完整联合和16T仍未验收。
+
+大M8T修正版18形状留出四会话1640调用通过：W13/W2 MAPE0.183%/0.394%，双GEMM
+合计0.153%、MAE11.846us，均达到本批门槛；原h4合计MAE26.624us。保留无竞争阶段候选，
+不据此认定联合需求、gather/入口或完整计划通过。16T首批独立标定随后启动：expert96/M<=1718、
+CPU304–319、owner512/256KiB，first_rows与bulk两批四场；尚未覆盖所有16T尾历史或拟合模型。
+证据large8_baseline/validation_results.json和width16_baseline/protocol.json。
+
+16T首批四会话2132调用通过，W13/W2重复MAPE约1.03%/1.03%；完整块每12行
+斜率75.246/36.432us，第二场完整块MAPE0.384%/0.709%。仅为基线发现，不是任意M模型。
+M13-M12净增量W13约69us，长历史M1718-M1716仅约8..11us，W2长历史差噪声较大，
+不从两个点推物理负尾成本。h1/h2/h4/h140六类odd尾项训练已顺序启动于width16_tails，
+不借8T参数，留出尚未准备或采集。默认planner保持原基线。
+
+已冻结steady_background联合诊断：M8在M48同team前驱之后启动，0/1/2/4个大M8T
+后台为1205/768/714/529。接入已验证大M基线后，首块请求+private模型在全部旧入口场景
+预测后台请求先结束、W13仍持续，目标两GEMM均不减速（125.440/59.750us）。
+实际阶段覆盖仍待测，不能把模型private区间当实测缓存状态。实验当前仅准备，等待16T采集结束；
+用于检验持续请求缺口，不是全模型完成或DRAM机理结论。
+
+### 大M gather多panel服务候选（Lab，尚未前瞻验收）
+
+晚阶段8T混合背景验证中，GEMM阶段MAPE两场0.502%/0.248%，但六expert完成低估135..212us。
+worker trace顺序替换表明入口第一场晚约35..59us、第二场基本对齐，同时gather服务存在重复的
+基线低估与联合增量。因此不以GEMM竞争系数吸收启动误差，先固定无竞争gather。
+
+令原逐worker服务为g0_j(M)，P(M)为真实gather panel数，S_j为worker_features的segments。
+限定8T/H4096/M1..1205，候选为
+`g_j(M) = g0_j(M) + beta * 1[P(M)>=8] * max(S_j(M)-1, 0)`。
+P来自原native分工镜像：main=floor(M/12)+1[M%12>=9]，P=main+1[M-12*main>0]。
+只在完整panel分配分支施加额外项；beta>=0，仅用large8_baseline/train/session1逐worker
+中位服务残差最小二乘标定，beta=3.887047182501948us。它是经验服务修正，不宣称物理panel
+延迟或独立read/write带宽。M1..84特征为零，原模型不变；正服务检查覆盖M1..1205。
+
+已有18个未参与拟合形状的回顾检查：原12点两场worker MAE21.081/19.688us降至6.845/6.146us；
+额外6点25.405/24.872us降至7.647/7.290us。测得worker entry条件下finish MAE也下降，
+但M104/M106逐worker MAE两场均恶化约0.49us，尾/分工边界残差仍存在。
+这些GEMM留出数据此前已采集，不是新gather前瞻证据；不接入默认planner、不改变竞争、entry或
+资源需求。先冻结候选、补新gather验证，再决定是否采用。产物gather_large_candidate/model.json、
+results.json、identity.json，完整协议与失败形状见joint_cost_model_20260911.md。
+
+gather候选新增12形状前瞻验证已采前冻结，seeds611961/611962，门槛与逐worker数值见
+`gather_large_validation/frozen_predictions.json`。两场串行采集中，尚未形成采用结论。
+
+gather新12形状两场前瞻均通过采前门槛，支持保留隔离服务候选；第二场大M worker MAPE3.055%、
+条件finish MAE8.857us。仍不代表自主计划或并发服务通过。
+
+独立Lab gather动态响应以各worker无竞争service为工作量，r_j=(read+write KiB)/g_j，
+`dx_j/dt=1/(1+alpha*sum_{active k, expert(k)!=expert(j)} r_k)`，按预测完成事件更新集合。
+同expert已有并行成本包含在g_j；不额外施压。只用late_background/session1/n1代表性向量
+拟合alpha=0.00175，其他条件用实测starts作诊断。n2/n4条件finish MAE改善，但n4 M529
+高估约23us、M1205低估50..73us，平均bias抵消，不接入planner。名义logical需求不是物理
+DRAM量，跨域、GEMM并发、依赖激活仍未覆盖。产物gather_response_candidate，公式仅为待证候选。
+
+gather跨阶段诊断发现大M gather与较短peer W13大量重叠。固定原alpha直接叠加外生
+W13名义8MiB/161.18us请求pulse虽改善M1205，却增加其他expert高估，n4 MAE两场
+28.26/21.43→33.73/22.87us，拒绝采用。实测W13 starts仅为oracle输入，没有自主或反向反馈。
+需独立辨识gather-gather与gather-W13后再验证统一时间线；不把该负结果改写为已解决。
+
+分离n1/session1前台标定得到gather系数0.0016和W13 pulse系数0.0002，但n4 M1205仍
+低估49..72us，M529高估约19us。两个系数尚未解决形状响应，保留split_results.json反例，
+不部署、不把实测start条件诊断改称自主模型。
+
+固定M1205前台、三组四个8T后台的同/跨LLC对照两场均显示约86..117us gather worker
+服务增量，而同组local-cross仅数us。拒绝将该主效应仅局限同LLC；不唯一认定DRAM，
+不据发现网格冻结共享容量。跨LLC共享域和阶段需求须进入下一验证范围。证据gather_shapes。
+
+root-cohort自主事件原型已用预测gather结束触发W13/W2，不再输入实测stage starts。
+但GEMM仍固定T0、没有反向反馈；沿用旧alpha/beta在新背景形状下gather服务低估60..107us。
+仅事件顺序和无竞争不变量通过，需求响应迁移失败，不接入planner。产物unified_gather_candidate。
+
+自主gather候选只用small/local四后台第一场配对增量重标定beta=0.0037，固定alpha=0.0016。
+中/较大后台回顾误差仍约9..20us；1/2后台与cross2新预测已冻结并串行采集中，
+尚未验收，固定GEMM/no reverse-feedback限制保持。产物unified_gather_recalibrated与gather_count_holdout。
+
+1/2后台前瞻两场均系统高估减速，delta MAE23.006/20.519us，拒绝数量泛化。
+保持固定窗口/系数改用实测stage starts的诊断只改变预测减速不足0.4us，不能修复主偏差；
+该oracle存在阶段因果不一致，非可采用模型。需独立服务/非线性压力证据，不以同批失败数据
+事后加knee宣称前瞻通过。证据gather_count_holdout。
+
+独立1/2/4x8T阶段PMU两场+控制完成：流量可重复、计时扰动<0.60%，但同步吞吐不能
+识别硬容量。32副本M48/W13每调用约15.4..16.4MiB，对照M12约7.5..8.0MiB，
+不支持所有M统一Q8MiB；协议差异使其不能直接替代真实短时Q。保留证据、不采用容量。
+产物independent_stage_service/analysis.json和reuse_contrasts.json。
+
+独立team的命令占用PMU两场显示：W13/M12占用/读命令约36→45→80（1/2/4team），
+即使吞吐近线性，代理仍显著非线性增长。其他stage/M对应关系不同，不能仅按GB/s预测队列。
+这是吞吐/延迟分离的独立证据，不是实际gather加载延迟或计划未来PMU输入；需真实短时迁移验证。
+queue_analysis_session1/2保留原始与逐controller指标，当前不冻结新模型参数。
+
+独立稳态占用代理尝试q(n)=a+b*n²，仅用同shape第一场n1/n4标定；n2回顾MAE
+0.390/1.073，小于线性count插值3.278/3.259。只限同质8T/M12或48/n1..4，不是异构队列模型。
+新n3预测已冻结，queue_count3正在构建烟测，尚无前瞻验收，不能直接换算gather延迟。
+
+新n3占用代理验证MAPE2.166%/2.465%，但同场W13/M48 n4控制第一场预测高17.10%、
+第二场恢复，W2/M48 n4第二场高7.44%。保留控制失败，不能宣称曲线稳定或可迁移到瞬时异构计划；
+n3局部插值结果不替代完整可靠性。证据queue_count3/evaluation_session1/2。
+
+直接hybrid gather独立持续PMU两场完成：大M32输入/输出槽有显著读写流量，M1205约
+35GB/s读与17GB/s写，每调用约19.2MiB读/9.5MiB写；源大小约9.4MiB，写分配解释仅为推断。
+不能只建只读压力，也不能把同时轮换输入输出的数据外推成统一字节放大系数。真实T0保留，
+需分开输入/输出复用并验证短时迁移。产物gather_native_probe/matched_analysis_session1/2。
+
+直接gather输入/输出槽2×2两场均出现正服务交互（M529约14..18us、M1205约11..15us），
+而每调用读写流量交互为负。不能用固定可加逻辑字节成本替代完整服务响应；也不据此追加经验
+interaction项。下一步需可控GEMM后台下的前台需求/服务验证。证据gather_io_states。
+
+直接gather+持续M12/W13后台的两场PMU显示：M529/M1205相对减速在n1/n2/n4均约4%/14%/44%，
+后台吞吐仅下降约1..3.6%，占用/命令代理同步非线性上升；n4单份B控制前台几乎不减速。
+可支持分离资源响应与前台敏感度的下一标定，但仅稳态双进程/大M全panel范围，
+不得把未来PMU直接作为planner输入。证据gather_with_gemm。
+
+分层稳态gather候选固定真实T0，q(n)=43.47618+3.49334*n+3.66666*n²，
+T=T0*(1+0.00605628*(q-q0))。资源仅用M529/s1/n0,1,4标定，敏感度仅用M529/s1/n4；
+M1205和n2回顾误差多在3us内。仅限同质B32持续后台与大M529..1205，非CPU延迟/异构模型。
+M768/n3预测已冻结，扩展采集器正在烟测；不接入planner，不替代瞬时和完整计划验收。
+产物gather_queue_model及gather_queue_holdout。
+
+稳态gather队列候选的两PMU留出评分已完成：active service MAPE1.803%/2.319%，
+但delta MAE8.758/7.084us，且存在基线高估与竞争低估抵消。使用各M同轮实际占用代理差，
+固定T0/k的条件诊断MAE为8.481/4.545us；M1205/n3改善至-3.870/-2.412us，
+M768/n2反而为-14.401/-9.786us。代理误差和敏感度/状态残差必须分开，不能仅修q(n)。
+实测压力仅用于诊断；不作为自主预测输入，不把同质count映射用于异构或瞬时计划。
+证据gather_queue_holdout/evaluation_session2.json及measured_pressure_diagnostic.json；
+保持受限稳态对照，完整时间线与planner验收仍待完成。
+
+完整anchor两场各31pair观测依赖路径均为42个16T任务，最后expert167；
+最后W2中位数28697.71/28642.22us，不能用8T小前缀完成精度代表完整模型。
+16T exact-M独立参照仅覆盖其中29任务，缺M14/16/18/20/22/26/32/43/73/77。
+M1718联合gather比独立包络多约470us，后续小M同时存在入口包络差异与GEMM服务残差；
+独立/联合CPU位置及expert上下文有差别，不作唯一竞争归因。
+下一步优先16T服务/入口与缺失形状，同时保留全部8T背景反馈。
+证据full_timeline_audit/results.json、baseline_transfer.json；这是观测分解，不是自主预测。
+
+16T/M1718 worker诊断：联合平均worker gather858.943/857.857us，对比旧独立
+412.087/418.602us；入口散布联合60.66/61.89us、独立64.11/66.54us。
+保持联合实测起点并替换为独立local-worker服务，仍低估完成473.29/462.53us。
+入口散布不是主要解释，但位置/状态/竞争仍须分离，不能将该差值直接当共享资源参数。
+width16_anchor_missing已启动实际CPU240..255缺失十形状和M12/M1718位置控制标定；
+参数冻结，不作为泛化留出。证据full_timeline_audit/gather16_workers.json。
+
+完整224expert零竞争消融已闭合（full_baseline_candidate）：8T冻结解析服务、16T相同M
+session1实测GEMM及worker gather服务，未知16T形状拒绝；初始入口使用历史31场景，
+真实依赖/CPU释放按事件端点推进，无新trace时间作为预测输入。8T发布/setup参数在16T
+仍属未验证迁移。完成27148.855us vs两场28697.71/28642.22us，低估5.397%/5.214%。
+16T lane均值误差分解gather约-612/-620us、W13 -365/-243us、W2 -499/-535us、
+入口/间隙-61/-119us。九lane均低估，需接双向动态响应，不按全计划残差加宽度倍率。
+这只是完整DAG零响应对照，不是最终模型或泛化验收；16T全M、混合竞争与planner仍待验证。
+
+完整动态事件消融full_dynamic_candidate将gather/GEMM请求窗口放进统一DAG，
+lambda_i=d_i*v_i，v_i=1/(1+sum_type(a_type_to_receiver*sum_other_expert(lambda)))，
+阻尼固定点收敛后推进到下个预测事件。通知/CPU释放只由预测W2完成触发；无实测端点输入。
+31场景zero端点与旧完整基线误差<1e-7us，非零四组最多32轮收敛。当前仍用首块Q8/4MiB、
+后续零共享需求及未验证的8T系数迁移，不是最终状态需求模型或硬容量模型。
+全关闭/仅gather/仅GEMM/同时响应完成27148.855/27218.159/27414.505/27477.503us，
+both仍低估两场4.252%/4.066%，不通过采用。需分段状态需求与敏感度校准，不乘全局残差倍率。
+证据full_dynamic_candidate/results.json和ablation_summary.json，默认planner未改变。
+
+显式分段接口segmented_dynamic_candidate将每阶段表示为(state,service_us,read_kib,
+write_kib,sensitivity)序列；正服务成本之和严格还原冻结T0，非负请求随进度积分并逐资源守恒。
+旧首块/private适配后四组×31场景全部224任务端点差<3e-10us，属于等价实现，不增加精度声明。
+当前read/write仍合并进入issuer型响应，不是已识别的独立内存资源模型。
+旧8T需求表只与anchor29任务/225路由行形状重合，真实状态/阶段时间分布未知，明确标为未测，
+不得自动填零或从不同M整阶段请求差构造物理panel需求。
+证据segmented_dynamic_candidate/legacy_parity.json和demand_inventory.json；需补16T/大M需求迁移。
+
+16T大M整阶段需求标定large16_stage_demand已启动：M12/48/1718，W13/W2，B1/B32，
+16T真实full stripes，synthetic连续routes，独立常数A/B，不等同真实4-copy/scrub状态。
+M1718观测500ms、其余100ms，完成边沿计数并报告量化误差；首版packed-A尾部填充不足
+导致烟测失败，v2补物理行后26格无PMU/PMU烟测通过，旧失败证据保留。正式三场串行采集中。
+只采整阶段预算，不假设已经测得段内分布，不更新模型参数。8T大M及真实状态迁移仍待验证。
+
+16T整阶段需求首场显示M1718/B32 W13读49.385MiB/call、W2读17.956/写9.513MiB/call；
+B1大M仍有W13读27.123、W2读6.573/写6.814MiB/call，不能以B热推断后续总共享需求为零。
+这是连续常数A/B探针、idle-subtracted/完成边沿归一化的整阶段预算，非panel或地址归因；
+近零负write估计保留，不作为负物理请求。第二场重复与真实路径迁移尚待完成。
+证据large16_stage_demand/analysis_session1.json和contrasts_session1.json，当前不更新模型参数。
+
+16T整阶段需求两场完成：W13/M1718读预算相差约2%，但W2/B32读/写相差14.87%/27.44%，
+B1相差26.44%/33.62%，而时长几乎不变；各场内部MAD小且前后轮次接近。
+因此大M非零请求结论重复，但不能把绝对预算直接冻结为可靠形状函数，状态/分配因素尚未识别。
+保留repeat.json和w2_drift.json，近零负估计不作为负物理请求。8T同协议版本26格烟测通过，
+正式control+两PMU串行采集已启动；完整模型需求迁移和泛化仍待验收。
+
+单独expert96/M1718的请求分布/接收mask消融（request_distribution_diagnostic）：
+两场B32整阶段预算×前半/均匀/后半发出×首窗口/全阶段接收，12×31完整DAG场景均通过守恒。
+该受限设置三种分布完成跨度<0.15us，不是通用时序不敏感结论。全阶段相同响应使完成增加
+约407us，却将W13从低估61..89us变为高估259..288us，与gather低估408us抵消。
+不采用全阶段统一敏感度，需独立标定输入/阶段/历史相关接收响应；不据总误差改善加倍率。
+这是回顾诊断，未证明需求状态迁移或planner泛化。
+
+8T/M1205整阶段需求两场完成：B32 W13读39.5745/39.5503MiB，W2读16.0585/17.1721、
+写8.1993/8.9449MiB；B1 W2读2.8949/3.6787、写3.5999/4.7583，状态偏移并非仅16T。
+不直接采用固定预算或由整阶段推断panel流量。width16_response已启动真实路径标定：
+固定16T M77前缀、16T前台M12/48/1718，对照0/local1/local3/cross3个长8T背景。
+需用trace验证实际阶段重叠并分离前缀时序变化，才可拟合接收敏感度；这批不是泛化留出。
+
+width16_response两场完成：前台M12/M48与三长背景W13近100%重叠但减速仅约0..3us；
+M1718 local3 W13/W2增量12.23/8.84和17.78/8.51us。背景已运行一段时间，非完整anchor的
+并发/阶段变化条件；保留为弱响应对照，不用近零增量标定强响应。
+width16_wave_response进一步以三条实际21expert小/长/小队列创造阶段变化，原路由/几何保持，
+两场标定采集已启动。目标gather的少量负增量也须与共享输入/状态区分，不盲加正倍率。
+
+receiver16_candidate预划分M12/M48 local1训练后，first/reuse拟合W13=.90/0、W2=.35/0，
+但7个未拟合条件的增量MAE两场由6.965/8.497变为7.798/9.330us，拒绝采用。
+实测起点/背景时序诊断仍为7.631/9.120us，不能仅修时序。M1718/W2 local3增量29.94/49.08us，
+cross3为-3.47/3.67us，而名义首窗口重叠量两种放置均约281..284MiB。
+gather local/cross均减速约183..196us；下一版需区分跨LLC共享与本地共享域响应，并检验非线性，
+不通过team倍率弥补。以上为真实队列实验及有限名义需求诊断，非唯一硬件因果或最终模型。
+
+local_domain_candidate增加按既有40核LLC分组的同域接收项：
+v=1/(1+s_global*P_global+s_local*P_same_domain)，请求量仍只生成/积分一次。
+local默认0，124个完整DAG回放与原模型端点差<3e-10us；隔离和跨域压力不产生本地减速。
+已看过的M1718/local3 W2标定得到reuse local系数0.28，跨域和W13预测保持不变。
+除标定条件的W2增量MAE两场2.910/2.810us（初始2.375/2.883），绝对阶段MAE有所降低，
+但存在噪声和分项抵消边界，不宣称全面改进；需新的数量/形状冻结验证，再看完整模型。
+本项是有效局部资源响应，不是宽度奖励/惩罚，也不是已证明的LLC缓存缺失模型。
+
+本地W2 reuse0.28的前瞻验证width16_local_holdout已采前冻结：M12/24/96/1718，
+none/local2/cross2，共12对照+anchor，双模型各31历史入口场景，不读取新实测时序。
+本地项预测local2额外W2为M24 .606us、M96 3.908us、M1718 17.139us，M12与cross不变。
+真实两场采集已启动，结果未出；按绝对阶段误差、n0配对增量和local-cross差/MAD评分，
+不以此替代完整模型/搜索验收。
+
+本地项前瞻两场完成：W2阶段MAE由4.633/5.843降到2.745/3.813us，local-cross差MAE
+由3.360/6.358降到3.182/1.552us；M1718差值噪声较大，支持保留组件而非精确物理系数声明。
+full_local_transfer对完整anchor回放，family8+local16完成27482.750us，仍低估4.234%/4.048%，
+local项只增加6.770us，完整目标尚未闭合。后续段零共享需求仍是待解决的结构缺口。
+硬件只读核对L2=1280KiB、LLC=71680KiB/40核域；B owner大小不等于命中率或无后续请求证明。
+
+后续段需求的L2/DDRC分离观测已启动l2_stage_demand16：内核别名确认PMU type8，
+L2 access/refill/writeback事件0x16/17/18，16核48事件与64DDRC合计112事件烟测通过。
+复用原验证二进制，整阶段每调用事件数保留，不把refill直接等同精确LLC字节或纯B请求。
+正式控制+两PMU串行采集中；目标是约束后续共享需求，尚无新数据结论或参数更新。
+
+L2/DDRC首场：16T/B32 M12→M48，W13 refill增长4.10倍而DRAM read约2.03倍，
+W2分别3.30/2.11倍；M1718/B1仍有W13约387万、W2约81万refill/call。
+支持分别保留本地请求与DRAM需求观测，但system-wide事件含运行时且无panel时间归因，
+不换算精确LLC字节。第二场继续验证；8T/88事件版本仅准备，参数和默认行为不变。
+
+16T L2/DDRC两场完成，B32 M12→M48的refill约4.1/3.3倍而DRAM读约2倍，重复支持
+分层需求特征；但部分B1中M及大M事件仍跨场变化，不能冻结一个无状态精确请求表。
+8T对应88事件烟测已通过并开始串行正式采集，复用原二进制；尚未更新模型参数。
+
+request_budget_bank提供有单位、来源和观测场次的整阶段向量，16T两场12格已整理；
+L2事件不转成精确LLC字节，负idle估计保留，未知M/段内时间分布不填零，真实路径迁移标记未通过。
+8T首场88事件完成，M1205/B32 refill约W13 1078万/W2 159万；第二场仍在测量。
+该库是拟合输入的观测记录，不是已采用的时间模型或固定无状态请求预测器。
+
+### 2026-09-12 Lab gather worker响应回顾对照
+
+冻结独立worker gather成本、legacy请求、入口与其他系数，只标定
+`gemm_to_gather`，以M1718/16T、一个8T混合队列的配对worker平均执行减速为目标。
+不使用阶段包络或背景任务数作为响应目标/特征。候选系数0.00176953125对比原0.0002，
+其他51条已见记录的增量MAE22.426→6.883us，绝对worker服务MAE21.302→8.074us。
+三队列预测约122us仍低于175–185us实测；保持后续请求为零的旧表达也未被验证。
+因此仅保留为回顾性结构对照，不能当作独立需求模型、硬件参数或新鲜泛化证据。
+模拟器增加worker端点输出，在训练计划剥离新增字段后完整结果与原engine精确相同；
+事件方程未改变。完整计划迁移/强压力非线性/新数据验证仍未完成，默认模型不变。
+记录与数据位于`results/joint_cost_model_20260911.md`和
+`tmp/joint_cost_model_20260911/gather_response_worker/`。
+
+### 2026-09-12 Lab gather请求率二次响应
+
+在冻结需求、独立成本和其他响应参数下，仅gather接收端使用
+`v = 1 / (1 + c_GG*q_G + a*q_K + b*(q_K/100)^2)`，其中`q_K`是其他expert
+当时实际GEMM发出率（KiB/us，随执行减速反馈），`q_G`为对应gather发出率。
+100 KiB/us只是数值归一化，不是硬件峰值；没有加入队列数特征。b=0恢复线性模型。
+参数非负，沿用原反馈迭代及不收敛拒绝；不改变请求预算。常速发出方解析时间、独立极限、
+负/NaN参数拒绝与两训练计划b=0完整输出相等检查通过。
+已见wave/session1 M1718 local n1/n3回顾标定a=.001220703125、b=.083203125。
+其余50条既有记录增量MAE线性5.817→二次2.583us，但绝对服务MAE7.499→8.596us。
+两队列集合增量MAE3.706→3.778us、绝对MAE3.458→9.380us，不能以总增量指标掩盖恶化。
+标定仅覆盖16T接收方，完整回放应用到其他宽度属于待验证迁移；后续零需求等旧表达缺陷
+仍保留。默认不采用，完整计划回放及新的条件验证未完成。详见同日报告与
+`tmp/joint_cost_model_20260911/gather_response_quadratic/`。
+
+二次gather候选的原224task anchor回顾回放已完成：原/线性/二次完成时间
+27482.750/27665.478/27803.196us；二次对原两场误差-3.117/-2.929%，仍低估839–895us。
+原臂31入口场景全部端点与既有full_local_transfer在1e-7us内一致。M1718 gather仍低估，
+其他team宽度响应迁移、后续需求、新计划和planner搜索仍未验证。固定无竞争gather均值
+416.256us与前缀条件n0的392–395us差异独立保留，不能重新拟合竞争去维持误差抵消。
+
+2026-09-12新队列顺序前瞻验证结论：冻结二次响应不推广。保持expert集合/team数相同，
+frontloaded/staggered两种新顺序在两场均使二次增量MAE劣于线性：M1718线性9.129/6.897us，
+二次14.981/14.388us；M96线性1.090/1.178us，二次1.668/1.756us。冻结比较门槛未通过。
+原完整anchor回顾误差下降不能替代此验证。线性仅保留为对照，不自动采用；不在本holdout
+继续调参，优先审计需求时序与前台敏感度。详见gather_response_holdout/decision.json。
+
+### 2026-09-12 Lab自身基线归一化资源响应
+
+回顾诊断`h(P)=1+aP+bP²`，`P=(R+wW)/100`（R/W为GB/s），相对响应
+`h(P_joint)/h(P_solo)-1`保证相同状态变化为0。参数a=.01、b=.10、w=2来自有限网格，
+w落在边界，不解释为硬件常量。实测压力oracle的34非训练格MAE1.768us，简单外部对照2.316us。
+只输入solo数据、按前台`cycle(v)=max_worker_T0/v+overhead0`推导请求率反馈后，MAE2.739us，
+尚未优于对照。背景速率仍固定，worker统一速度，不能代表完整资源反馈或任意计划预测。
+联合流量不作为正式预测输入；无背景v=1极限通过。下一步检验背景反馈，默认不采用。
+记录见`gather_self_pressure/oracle.json`与`solo_prediction.json`及同日报告。
+
+双角色稳态反馈后续：保持h固定，背景`vB=1/(1+gamma*max(0,h(P)/h(PB0)-1))`，
+前台`vF=min(1,h(PF0)/h(P))`与原cycle关系一起求总P；gamma=.121234566由一个既有训练
+条件的BG吞吐标定。gamma0旧solver一致、无背景/对称极限和输入拒绝通过。
+34非训练格时间MAE2.312us，但总read MAE2.663GB/s未改善，仍不推广。
+以双方实测调用率重构联合流量仍有状态相关残差，固定solo每调用下层请求预算尚未成立；
+需求状态与服务反馈需分开验证。详见gather_self_pressure/coupled_prediction.json与budget_audit.json。
+
+2026-09-12热参考差额消融：保持h/gamma不变，逐worker仅放大
+`max(0,T0-Thot)`，保留原T0与cycle余项。无背景/热reference不变检查通过；IO1/1 MAE
+12.124→.338us，但32/32为1.924→18.516us，不推广。热组零响应由构造保证；未重拟合
+参数和热冷差的非物理可分性限制归因。下一步需区分重叠与新增需求，不能把差额当纯访存成本。
+见gather_self_pressure/exposed_prediction.json。
+
+### 2026-09-13 Lab请求服务重叠候选
+
+固定各worker T0，令`L_i=min(T_i0,kr*Qri+kw*Qwi)`，
+`T_i=max(T_i0,L_i*max(1,h(P)/h(P0)))`；cycle取最慢worker加原余项，保留BG反馈。
+Q为solo每调用总流量按逻辑工作份额分配，尚非逐worker实测需求；kr/kw不是硬件带宽。
+三格回顾标定kr=1200/kw=200 us/MiB，33非训练格增量MAE1.216us，整体放大/差额版
+同集合5.462/3.927us；总read约2.08GB/s、write约.97GB/s误差未明显改善。
+无背景和零latent极限、份额守恒检查通过，候选仅保留，不采用。中间复用状态、真实计划、
+需求变化和完整planner验收仍缺失。见gather_overlap/results.json及同日报告。
+
+2026-09-13中间IO前瞻验证：solo profile后、joint采集前冻结的重叠预测，M96两场
+MAE .970/1.019us、max2.588/2.655us通过；M180 MAE2.213/2.217us、max6.043/6.142us失败。
+16/1实际增量近0而预测5.850us是主要缺口。比全成本对照改善不等于通用模型通过；
+`gather_overlap_holdout/decision.json`明确not_promoted，参数未回调，默认保持。
+
+### 2026-09-13 Lab：固定预算的阶段时序／响应分离诊断
+
+`tmp/joint_cost_model_20260911/plan_completion_audit/ablate_segments.py`
+在完整历史计划评分之后，使用两个既有计划做2×2机制对照，不改变生产模型或planner。
+每个stage的独立服务分段为 \(c_b\)，请求总预算为 \(Q_r\)。请求时序因子比较原首段集中
+与 \(q_{b,r}=Q_r c_b/\sum_b c_b\)；二者保持 \(\sum_b q_{b,r}=Q_r\) 和全部 \(c_b\) 不变。
+响应因子仅比较8T后段原有零敏感度与该stage首段敏感度；16T响应和全部拟合系数保持冻结。
+四个条件须复现相同的零竞争端点，原条件须保持历史预测；不使用实测joint端点作为输入。
+这不是从PMU测得的panel时序，也不声称首段敏感度可迁移至后段。已有B32全stage请求量
+仅提示首块预算不足，尚未验证真实路径迁移；本对照故意保持旧总预算，以分离时序与响应。
+结果仅决定后续独立标定方向，不用于在该历史集合调参后宣称泛化通过。完整历史集合评分已完成，
+2×2计算对照已完成：anchor时序单因子约+4.98us、后段响应约+94.51us；control_forward
+分别约-.68us、+486.10us。后者的8T/W13和W2路径低估减少，但仍有残差，不能由此采用
+统一敏感度或证明请求时序无关。下一步须在独立可控竞争条件中标定后段响应，再验证动态
+迁移；当前全部结果只作历史机制诊断。记录见 `optimizations/fused_moe_sve/results/joint_cost_model_20260911.md`。
+
+### 2026-09-13 Lab：共享逻辑请求容量诊断
+
+`plan_completion_audit/capacity_simulate.py`是冻结event simulator的独立实验快照。
+保留原响应固定点生成的速度 \(\widetilde v_i\)，对当前发出请求的活动片段使用
+\(R=\sum_i r_i\widetilde v_i\)、\(\alpha=\min(1,C/R)\)，将其速度改为
+\(v_i=\alpha\widetilde v_i\)；零请求片段不受这项缩放。原压力反馈继续迭代，并在每个
+事件区间检查 \(\sum_i r_i v_i\le C\)。未传容量时保持旧行为。
+首轮诊断固定 \(C=200000/1024\) KiB/us，不拟合。\(r_i\)仍来自旧GEMM/gather逻辑预算，
+所以C是有效逻辑服务率，不是已经验证的DRAM带宽；不能将所有逻辑请求当作实际DRAM流量。
+检查覆盖1/3/5个同步team的 \(\max(T_0,nQ/C)\)、关闭/高容量时完整anchor端点等价，
+以及非法容量拒绝。随后只在已有M12/13/48可控cohort比较容量开关及后段响应开关。
+该机制诊断不改变生产模型、默认planner或已冻结的独立成本，不构成新鲜泛化验收。
+固定200诊断已完成：可控M12/M13的W13增量MAE从9.429/12.362us降至3.148/1.775us，
+但M48从6.829升至7.379us。完整anchor/control_forward预测29261.321/30022.113us，
+相对两场实测高估约1.96..2.16%/.83..1.25%。同时开放全部8T后段响应使这两计划高估更大。
+因此不能独立采用前一轮后段系数，也不能以总时间改善证明请求预算/阶段映射正确；
+后续容量须从独立竞争条件标定，并保持完整计划只用于迁移检查。
+随后仅用历史M12/cross_n4/session1的W13配对增量38.48us，固定其它参数，在150..300
+等效GB/s区间作16轮二分标定，得到206.86455。该值是开发标定，不是物理带宽测量。
+冻结后历史anchor/control_forward误差为+1.36..1.56%/+.19...61%；其余M的响应仍有残差。
+新M17/M35联合条件已准备，须先冻结全部数值预测再测量；在独立验证前不采用此参数。
+新M验证随后完成：四场各369call校验通过，M17/M35的W13配对增量MAE分别
+1.434/1.733us和3.916/3.571us，W2分别.930/.648us和.622/.840us；各场各stage均通过
+预设MAE5us、max12us、相对原模型MAE回归不超过1us门槛。结论仅覆盖同路由/同背景的
+新joint M，不能扩展为新工作负载、所有宽度或planner改善。默认模型保持，继续完整计划迁移。
+
+### 2026-09-13 Lab：uniformish完整计划迁移范围
+
+冻结206.86455等效容量在另一route/layer的234-expert、全8T、四个固定lane顺序上完成
+两场采前预测验证。完整时间MAE393/239us，对照原Lab响应1629/1681us；每plan完成时间
+误差<=5%、十lane误差<=max(100us,10%)及候选集regret<=2%的预设门槛均通过。
+两模型都选anchor，所以此结果不证明搜索选择改善。small_first的实测配对减速稳定，但
+容量模型夸大幅度，仍保留误差。当前provider仅支持这234任务的全部8T成本、155个16T成本，
+1/2/4T无实现；完整混合宽度搜索须先补齐并验证成本，不能将全8T顺序对照当作该目标完成。
+
+### 2026-09-13 Lab：窄team gather打包路径候选
+
+`width_provider_audit/gather_paths.py`对每个实际gather工作片段使用
+\(G=a_p+b_p Q_{\rm read,KiB}+c_p Q_{\rm write,KiB}\)，\(p\in\{8,12\}\)为packed rows。
+系数跨1/2/4T共享；到达时序不在此worker服务公式中。用同expert M1..12第一场奇数M作
+非负最小二乘，每个(width,M)条件总权重相等。8行路径系数约(1.41679,.105715,.079857)，
+12行路径(1.708158,.417754,0)。这些是有效回归系数，零write系数不表示写入没有成本。
+已经看过的偶数M两场条件等权MAE为.688/.778us，对照不分路径3.132/3.160us；该划分
+是开发检查，不是前瞻验证，分路径模型也使用更多参数。
+默认只接受M1..12；显式实验选项可将各片段服务相加到M96，以待测新M验证。单panel数据
+不能区分每片段启动开销和每worker一次启动开销，因此不能提前采用多panel相加假设。
+已冻结M13/15/17/19/21/23/24/36/48/60/96的worker预测，M12作控制；GEMM另作基线标定。
+
+### 2026-09-13 Lab：窄team多panel验证与GEMM候选边界
+
+冻结gather分路径模型在1/2/4T六场均通过预设相对MAE10%及每worker max(3us,15%)门槛。
+1T误差随panel数增加且绝对误差高于shared对照，仍保留；shared对照在2T/4T未通过。
+结论仅覆盖已声明的同expert、M<=96选定多panel组合，不是联合运行或任意大M验证。
+`width_provider_audit/narrow_gemm.py`另定义待验证候选：M<=12保持首块实测成本；
+M=12h+r>12时，\(T_s=T_s(12)+(h-1)b_s+d_{s,2\lceil r/2\rceil}\)，r=0不加尾项。
+\(b_s\)只用第一场完整块点拟合，\(d\)只取h1奇数尾块配对差。第二场最大相对误差
+约2.20%，但这仅是已测形状重复；偶数尾块、后续历史及M>96都没有通过该候选验证。
+1T低M首块状态漂移不因上述重复结果而消失，不能据此直接补齐完整planner成本接口。
+
+### 2026-09-13 Lab：窄team独立组合／大M验证准备
+
+不改变M<=96候选或已有参数，单独的`narrow_extrapolation.py`将同公式用于至M1718的
+明确待验证预测。保留M12控制，验证M14/18/22的偶数h1尾块、M25/35和49/59的h2/h4尾块，
+以及M384/697/1200/1718。数值正值/有限检查不是准确性证明。
+GEMM预设每stage条件等权相对MAE<=3%、每点误差<=max(5us,5%)；gather单独要求条件
+等权相对MAE<=10%、每worker误差<=max(3us,15%)，M12控制单列。三宽度正确性烟测通过，
+预测已冻结，六场正式采集已启动；当前没有扩大已验证的provider范围或改变默认planner。
+随后六场完成：gather和W13均通过冻结门槛，W2六场均未通过，M49是重复失败点，2/4T还
+有大M高估。保持原失败记录，不采用完整窄team provider。M384/1200完整块的观测差商
+乘width约575..576us，而短范围later-full常数归一化后约593/605/614us，说明W2尚需
+区分渐变与后期成本；该差商是诊断，不是硬件峰值或已冻结的新参数。
+
+### 2026-09-13 Lab：W2暖态完整块与历史净尾项候选
+
+保留前次失败结果后，仅用第一场开发数据修W2。令 \(b_T=575.51/T\)，\(c_T=T^0_2(12,T)\)，
+完整块前缀采用 \(P_T(h)=h b_T+(c_T-b_T)\sum_{j=0}^{h-1}\rho_T^j\)。
+对tail kernel rows \(k=2\lceil r/2\rceil\)，令 \(u=(k-2)/10\)，净尾项为
+\(d_{T,k}(1)+[(1-u)A_{T,2}+uA_{T,12}](1-\eta_T^{h-1})\)。
+\(\rho\)只拟合完整块，\(A,\eta\)只拟合已测端点kernel的后续历史；中间类别插值待新点验证。
+该尾项是whole-shape净变化，不能解释为被单独计时的物理尾块服务；kernel2幅度触及
+\(-d(1)\)边界也不表示实际计算免费。W13、gather、首M1..12及h1尾项保持不变。
+模型文件`width_provider_audit/w2_warm_candidate.json`；旧第二场重复误差改善不能挽回
+原冻结验证失败。新M27/29/31/33、51/53/55/57、37、192/768已冻结预测，M12作控制，
+六场正式验证已启动；未采用到完整混合宽度provider或默认planner。
+随后六场结束：1T/2T新点全部通过，4T第一场M31高估5.061%而第二场4.704%，原门槛
+保持且整体记为not_fully_passed。4T/M55两场仍高估约29.59/28.35us，说明中间kernel
+历史插值有重复残差，不只是一项通过率统计。gather/W13及控制全部通过，下一修正仍只针对W2。
+
+### 2026-09-13 Lab：W2中间kernel独立历史节点
+
+`width_provider_audit/w2_kernel_history.py`仅替换kernel rows4/6/8/10的净尾项。
+保持前版完整前缀P_T(h)、h1节点和kernel2/12端点；h2/h4节点用前次transfer第一场
+whole-stage中位数减固定P_T(h)得到。h1到h2、h2到h4分段线性插值，h>=4保持h4节点。
+这是待验证的常数延拓假设，节点不等于单独计时的物理尾块服务。前次transfer数据现在
+属于开发数据，旧not_fully_passed结论保留；第二场开发重复相对MAE约.361/.330/.316%。
+5154个M/width检查保持W13、首块、h1和端点行为且输出正值有限；不构成准确性证据。
+新冻结验证为M39/41/43/45(h3)、63/65/67/69(h5)、199/775(长历史kernel8)，M71端点
+和M12控制；1/2/4T各两场。沿用此前分项门槛，当前仅完成本地准备，未开始硬件采集。
+该变更只影响Lab候选，不改变默认planner、生产成本接口或Plan V2。
+随后六场冻结验证全部通过原分项和控制门槛；W2相对MAE1T .308/.472%、2T .630/.588%、
+4T .531/.528%。4T同点旧warm公式绝对MAE18.671/18.549us，节点版9.017/9.018us；
+2T接近持平。decision为passed_declared_kernel_history_gate，仅声明同expert独立测试域。
+16T、混合竞争和完整搜索尚未验证，旧失败记录保留。
+
+### 2026-09-13 Lab：16T完整块渐变候选
+
+`width_provider_audit/fit_full16.py`只拟合16T full-stripe完整块，令
+P_s(h)=h*b_s+(c_s-b_s)*(1-rho_s^h)/(1-rho_s)。c固定bulk第一场M12，
+在rho=0,.001,...,.999网格上对第一场完整块作条件等权相对平方误差最小化；
+每rho解析求b，约束0<b<=c。W13参数(c,b,rho)=(93.14,75.450350,.658)，
+W2=(44.52,36.449660,.702)，单位us。这是假设性的有效服务收敛，不唯一归因为cache。
+保持h1锚点，h1..143正值和单调性检查通过。第二场开发重复相对MAE W13 .617%、W2
+1.018%，最大2.060/4.258%（W2最大在M12控制）；未采新holdout，不能宣称泛化通过。
+未拟合尾块或gather，尤其不能用h140异常负净差作为物理尾块服务；原provider不变。
+
+### 2026-09-13 Lab：16T绝对误差前缀与短历史尾项候选
+
+保留relative-fit前缀，`fit_full16_absolute.py`使用相同参数量和第一场完整块，
+改为绝对平方误差拟合。W13(c,b,rho)=(93.14,75.009457,.749)，W2=(44.52,36.289064,.769)。
+第二场W13 MAE由9.276降至2.718us；W2由3.441升至3.891us，保留退化。
+`fit_tail16.py`固定该前缀，用第一场h1/h2/h4的whole-stage减前缀得到六种kernel
+净尾项节点，历史间线性插值、h4后常数延拓。M1..11保持first_rows第一场，M12统一
+bulk前缀锚点。h140两场全部保留为开发诊断，不用于拟合节点；不能将节点当物理尾块。
+3436个M/stage正值检查通过。短历史第二场最大误差W13/W2=3.948/3.471%；
+长历史开发数据最大误差=.397/5.638%，W2包络异常仍未解释，不能宣布16T验证通过。
+两候选均Lab开发范围，尚无新M验证、gather组合或联合环境支持，原provider不变。
+
+### 2026-09-13 Lab：16T gather worker服务候选
+
+`fit_gather16.py`采用G_w=a+b*n_segments+c*read_KiB+d*write_KiB，工作片段来自
+实际M-panel/K-stripe镜像。第一场first_rows和bulk标定，bulk重复M12不重复计权；
+非负最小二乘按max(3us,实测worker服务)归一化残差。矩阵rank4，系数为
+(0,.234406782,.332427214,.133418525)，不是独立物理带宽；零截距不证明启动免费。
+第二场first_rows MAE.173us/相对11.031%，bulk4.071us/3.499%；每worker均满足
+max(3us,15%)但first_rows平均相对误差超过10%，不能宣称全部旧门槛通过。
+模型仅预测worker服务，不包含到达跨度；M1..1718输出正值有限。新M和联合运行仍待验证。
+
+### 2026-09-13 Lab：16T新M冻结验证准备
+
+GEMM尾项候选与gather服务候选合并为分项预测，冻结M14/18/22、39/43、65/71、
+192/1692、775/1201，M12控制。数据和参数不因评分回调；两场沿用GEMM相对MAE3%、
+单点max(5us,5%)以及gather相对MAE10%、worker max(3us,15%)。此时仅本地准备完成。
+新点通过不能替代旧h140完成时间异常解释、M1..11相对误差、联合需求或完整搜索验证。
+随后两场结束，decision=not_fully_passed。gather两场M43/M65同worker高估，主要涉及
+8行尾段；W2第二场M1692低估5.661%，包络增加约310us而worker平均服务中位数仅增加
+13.43us，慢线程完成分布仍未解决。W13两场通过，不能将部分通过作为完整provider采用。
+
+### 2026-09-13 Lab：16T gather分路径需求修正
+
+`fit_gather16_paths.py`按packed8/12各自累计片段数、读KiB和写KiB，六系数非负拟合；
+训练数据和损失保持，只用原第一场标定。旧新点已参与结构选择，复算属于开发诊断。
+旧full16两场gather相对MAE4.073/4.090%，M43/M65及其他worker不再超单点门槛；
+原bulk第二场绝对MAE4.071->4.599us退化保留。需要新的M验证，旧失败决策不撤销。
+GEMM和长W2完成分布问题不因这一修正而改变，原provider不变。
+
+### 2026-09-13 Lab：16T gather分路径新点冻结
+
+固定分路径gather候选和原GEMM，冻结M26/32/38/44/62/68以及179/180/181/188/193，
+M12控制；后组检验panel数跨过16时的工作分配变化。两场沿用原分项门槛，当前烟测中。
+不重新拟合，不把新点结果作为长W2慢线程或真实联合需求验证的替代。
+随后两场结束，gather M68/M188重复失败，M44第二场也失败，均余8；W13/W2通过。
+decision=not_fully_passed。native m8循环无显式完整8行专用kernel分支，尚不能唯一
+归因于kernel切换或缓存；有效源行数与K片段长度需要独立验证。
+
+### 2026-09-13 Lab：16T有效源行配对诊断
+
+固定work分配，比较base={0,36,60,180}各自M=base+{6,7,8}，逐pair计算
+D7=G7-G6、D8=G8-G7以及D8-D7。原公式冻结，M8控制；含旧点，属于机制诊断。
+尾段K长度从约240到4096元素变化，检查源行增量与片段长度关系；暂不新增模型系数。
+work等价不等于缓存或指令状态相同，不能据此单独声明硬件原因。
+随后两场完成，长片段D8-D7重复：K约1936..2160时第一场6.07..6.51us、第二场
+6.22..6.40us；K4096为14.14/13.89us。支持为全部8行有效片段建立待验证服务候选，
+不支持把D2无条件加到有偏基线或宣称跨输入泛化。
+
+### 2026-09-13 Lab：完整8行gather服务候选
+
+仅packed8且valid8片段改为G8full(K)=.056573513+7.298524055*K/1024 us；
+partial8与12行片段保持原分路径系数。参数只拟合配对控制第一场22个tail worker，
+减去混合worker中固定12行服务，采用max(3us,actual)归一化非负最小二乘。
+第二场worker MAE.314186us/相对8.238088%，无单点超限，但只是同点重复。
+M余数非8保持，全部预测正值有限；新的M与联合环境尚未验证，旧失败记录不撤销。
+
+### 2026-09-13 Lab：完整8行服务新M冻结
+
+固定valid8服务与其他路径，冻结M20/56/80/104/140/176/200/776，79/103/108作未改
+路径guard，M12控制。两场沿用原GEMM/gather分项门槛；当前仅准备与烟测，无新点结论。
+随后两场结束，valid8新M gather在M80/176/200重复高估，GEMM通过；decision未通过。
+M200同一8x4096工作仅约14.42/15.44us，对比M188约28..29us，valid8/K长度特征不足。
+下一步做固定工作量的输入位置对照，不将候选作为通用成本采用。
+
+### 2026-09-13 Lab：固定M的源token位置干预
+
+source_position16对M188/M200分别构造base、改变奇偶占比的单行交换、保持占比的
+单行交换。每expert数量、target前M-8源行、CPU/工作量和同M输出位置不变；源值与地址
+一起改变。比较配对worker gather时间，不增加cost系数；该干预不单独证明物理cache索引。
+独立Lab runner保存旧快照，两场位级与输入tensor身份核验通过。
+M188改变占比3/5->4/4配对变化-14.00/-13.03us，M200 4/4->5/3为+14.23/+14.02us；
+同占比换行对照约-.46..+.38us。支持实际源地址类影响服务，但不证明唯一物理cache机制。
+后续候选需要source-token信息或明确的不确定性；expert M计数本身不足以确定该状态。
+
+### 2026-09-13 Lab：source-token条件gather候选
+
+完整8行片段按实际source tokens奇偶最大占数c选择G_c(K)=a_c+b_c*K/1024。
+c4系数(1.116485,3.384607)，c5=(.560325,6.988803)；仅当前16T/H4096布局开发候选，
+不宣称物理cache-index证明。输入必须提供actual tokens，c>5明确未支持，不能从M猜测。
+旧第二场MAE .407/1.004us，c4平均相对10.652%限制保留；无新holdout。
+原expert96五个余8形状落入c>5，尚不能完整覆盖planner。partial8/12与GEMM保持。
+
+### 2026-09-13 Lab：新源集合与更高占数采集准备
+
+固定M212/M224，每个M构造尾8源行最大奇偶占数4..8。c4/5四个条件冻结gather预测，
+c6..8六个条件仅采集且预测为空，不计入准确性通过率。保持目标前M-8源行与全部expert
+数量；11plans、两场，使用原gather门槛。
+随后两场完成，四个c4/c5新源条件相对MAE3.049/2.302%、单点均通过。c6..8服务在
+两场重复，但全部K4096，只是discovery，不能宣称更高占数跨K支持或联合验证。
+
+### 2026-09-13 Lab：高source占数增量候选
+
+c6..8只新增G_c(K)=G_5(K)+.566549731*(c-5)*K/1024 us。eta由第一场六个K4096
+条件拟合，第二场MAE.960799us。c4/c5及其他路径保持不变，跨K缩放尚未验证。
+原expert96全部M可生成数值候选不等于已覆盖准确性，需独立验证后才能接入完整provider。
+
+### 2026-09-13 Lab：高占数跨K冻结验证
+
+固定M32/92/152，各构造占数4/5/6/8的新source集合，12条件全部冻结预测。尾K片段
+覆盖56..4096元素，评分仍逐worker，避免长worker掩盖短片段错误。两场原gather门槛，
+随后两场完成，12条件相对MAE3.522/3.481%、worker MAE.716/.671us，单点全通过。
+仅保留为带source-token的Lab服务基线；不将GEMM未评分、任意源路由或整体联合运行视为通过。
+
+### 2026-09-13 Lab：扩展独立成本接口
+
+expanded_baseline.Baseline.service(M,T,source_tokens)整合窄team、16T候选与注入的旧8T
+服务，返回gather逐worker和两个GEMM成本及限制。16T强制源tokens，8T M>1205仍拒绝。
+8077组合与原候选逐项一致，仅为接线验证。成本未包含gather到达、联合竞争和慢线程
+完成波动；限制字段不等于已标定置信区间。生产和旧provider未修改。
+
+### 2026-09-13 Lab：8T大M外推验证准备
+
+保留全部8T系数，在独立候选中将max_m扩至1718；原接口仍拒绝>1205。
+expert96的9个M>1205点冻结预测，M12/1200/1205单独作为范围内guard；每stage均值
+只计算9外推点，原门槛不变。
+随后两场全部通过，第二场gather/W13/W2相对MAE1.191/.146/.162%，guard也通过。
+Lab接口显式extended8 callback可用于1206..1718并检查通过decision；<=1205仍旧回调，
+未配置时仍拒绝大M。1718个输出接线一致，不构成联合或任意route泛化证明。
+
+### 2026-09-13 Lab：独立成本替换的完整历史回放
+
+固定31arrival场景、全部请求/响应和容量参数，只替换独立service。anchor预测
+29088.960->29068.013us，control_forward29832.188->29822.080us，误差小幅改善。
+旧结果复现，放置/依赖/请求和响应字段逐项一致。仅8T/16T两计划历史诊断，不构成
+窄team联合、后续需求正确性或等预算搜索结论；legacy后续零请求假设仍未修正。
+
+### 2026-09-13 Lab：窄team持续背景联合验证准备
+
+前台M48/T1,2,4，背景四个8T真实expert M1205/768/714/529，local/cross n0,1,2,4。
+冻结隔离成本、arrival和原capacity/response，保留legacy后续零请求。四背景下模型只
+预测W13约15..27us增量、W2零增量且local/cross几乎相同；用配对n0作诊断，
+预设stage delta MAE5us/max12us。
+随后六场结束，整体未通过原门槛；4T local n4 W13实际24.75/29.58us、cross15.02/
+15.34us，局部差异较小但重复。W2没有显著持续减速，不能等价为后续物理请求为零。
+四个8T背景不代表更多窄team，后续固定总核数改变team组合验证。
+
+### 2026-09-13 Lab：固定背景核预算的team组合验证准备
+
+固定4T/M48前台，背景32核分别32x1T/16x2T/8x4T/4x8T，local/cross加bg0。
+实际背景expert集合随team数量变化，全部形状进入冻结模型；不是相同计算工作量的纯
+width消融。旧模型预测W13约16us，W2在32x1T约22.7us、其余0..3.3us，局部差异小。
+配对delta门槛保持。
+随后两场结束，整体未通过。local16x2T W2实际38.15/28.83us而预测3.256us，cross
+10.70/10.39us；局部差异重复但幅度有场次变化。下一步用独立窄team需求测量分离后台
+压力和前台敏感度，不将任务数直接作为惩罚或假称物理LLC流量已知。
+
+### 2026-09-13 Lab：窄team独立请求标定准备
+
+standalone1/2/4T测M12/48/96、W13/W2、1/32copies；观察DDRC读写与core L2事件，
+保留idle-subtracted结果和completion-count误差。独立服务成本不替换runtime T0，
+不把L2事件直接当LLC字节。预设计数边界5%、PMU扰动5%、counter running99%质量限制。
+当前仅源与协议准备，native未构建，尚无新需求数据或竞争公式变更。
+
+### 2026-09-13 Lab：请求增量的分层统计
+
+在独立需求协议内按同round计算每调用预算Q(M)，再比较[Q(48)-Q(12)]/3和
+[Q(96)-Q(48)]/4。保留有符号差和端点质量标记，不能解释成直接instrumented panel流量。
+1T第一场12cell测量质量通过；持续L2 refill与状态相关DRAM增量同时存在，支持将二者
+作为不同单位的需求特征。重复场次/其他宽度和真实联合迁移尚未完成，不新增竞争系数。
+
+### 2026-09-13 Lab：独立需求曲线接口
+
+`narrow_stage_demand/request_curve.py`独立消费1/2/4T两场请求bank，固定full stripes、
+H4096/F512及1/32copies，保留DRAM MiB/call与L2 events/call。默认只允许M12/48/96；
+显式piecewise假设为相邻节点a,b之间Q(M)=Q(a)+(M-a)/(b-a)*(Q(b)-Q(a))。
+显式late_linear将48..96斜率延伸到1718，仅为待验证候选；M<12拒绝，未借用其它宽度。
+两场参数分别查询，不插值复用状态，不裁剪有符号测量，不声称插值包含尾块机制。
+给定独立阶段耗时D，平均请求率为Q/D；D变大时平均率降低、总预算守恒。
+此为whole-stage预算接口，不能解释为已知panel时间分布，未自动送入资源容量约束。
+实测节点也未通过真实route迁移；插值/外推返回显式未验证标记。生产/default不变。
+19项L1测试及72原始观测精确复现通过；120个组合数值检查不是L3泛化验收。
+
+### 2026-09-13 Lab：实测时间线条件响应诊断
+
+`narrow_stage_demand/fit_trace_response.py`仅在core_budget_joint的1/2/4T背景上，按实测
+阶段重叠比例计算四项特征：共享DRAM读、同域L2 refill、共享/同域gather逻辑工作率。
+阶段请求率假设Q/D_bg，D_bg为实测背景阶段耗时；乘固定前台T0后，以非负四参数拟合
+第一场配对减速delta。前台窗口同样来自实测，故这是条件诊断，有目标时间信息，
+不是可直接部署的自主预测。gather逻辑量不是实测DRAM量，不含独立写压力项。
+需求1/32copies与场次1/2为四套独立情景；主要探索情景预定32copies/第一需求场，
+不按分数挑选情景。所有未测M显式使用待验证late_linear，不改变独立T0。
+
+第二场六条件MAE：W13 10.108us、W2 5.211us；同条件旧模型16.089/9.663us。
+两者信息输入不同，此差值不是模型泛化改进证据。按背景宽度留出时W2 MAE为
+10.654/4.696/10.839us（留出1/2/4T），不稳定。W13主拟合DRAM系数零、gather占主导；
+不可解释为物理DRAM无效。四参数只有六条件，留宽度仅四训练条件；归一化条件数
+W2留4T达353.15，参数辨识不足。未通过响应门槛，不接入planner默认。
+
+### 2026-09-13 Lab：独立gather总响应约束
+
+`narrow_stage_demand/constrained_response.py`在四项条件特征回归中显式约束
+kg_shared+kg_local=k_independent，且所有系数非负。同LLC域的独立实验只能约束
+此总和，不能自行分离shared/local。消去kg_local后回归矩阵为
+[X_DRAM,X_L2,X_gshared-X_glocal]，目标y-k_independent*X_glocal，
+约束0<=kg_shared<=k_independent。枚举非负最小二乘解和上界固定解取最小残差。
+固定总量必须由调用方提供，不从联合y重新推断；保留有符号响应y。
+返回降维矩阵rank/condition；秩亏不宣称物理参数已辨识。
+8项解析边界/不可辨识/输入拒绝测试通过，尚未使用正式实验生成参数，默认不变。
+
+### 2026-09-13 Lab：第一场独立gather响应冻结与约束诊断
+
+独立4T/M48探针第一PMU按stage/reuse分组，使用两种gather M的条件中位，拟合
+k=max(0,sum(x*y)/sum(x*x))，x=T0_gemm*Qlogical/cycle_gather，y为配对服务delta。
+保留原始负y及无约束k，未读取第二PMU。k W13 1/32copy=.048226/.201719，
+W2=0/.253004；零边界不证明真实响应为零。有限压力段、实测gather周期和合成路径
+限制外推，不能直接映射真实4copy复用状态。
+固定此总量约束旧联合诊断，主32copy假设第二旧会话MAE W13/W2=10.515/4.713us，
+最大18.507/16.266us，仍不通过。W2同域4T背景高估16.266us；留4T训练外的MAE
+15.732us，max29.114us。未改善宽度迁移，默认不采用；不重调已冻结独立系数。
+
+### 2026-09-13 Lab：请求总量守恒的前缀时序对照
+
+request_timing.py以Q(12)、Q(48)、Q(96)、Q(M)的差作为分段预算，时间边界
+假设t(m)=t_start+(t_end-t_start)*m/M；整段预算守恒。这是均匀行进度假设，
+不是实测panel历史；负read/refill增量拒绝而不裁剪。fit_trace_response的--timing prefix
+仅运行预定32copy/需求场1情景，不改默认uniform路径。gather特征、y与T0保持一致。
+固定原约束响应系数时第二旧会话MAE W13/W2=46.476/21.921us，劣于uniform。
+分开允许重拟合响应后为10.251/4.543us，但W2 local4仍高估16.238us，未解决问题。
+7项分配/响应测试与Ruff通过，仅诊断，不采用；下一步应直接检验GEMM竞争响应。
+
+### 2026-09-13 Lab：单背景需求响应宽度留出候选
+
+`gemm_pair_response/fit_response.py`只用背景1/2T第一PMU拟合，前台固定4T/M48，
+W13/W2与前台1/32copies各有两系数，delta=T0*(kD*Rbg_solo+kL*L2bg_solo)。
+R为idle-subtracted MiB/us，L2为events/us；特征来自独立后台与前台solo，不使用
+joint阶段窗口/请求率。响应负y保留，系数非负，零压力回到T0。
+4T背景排除于拟合，须用其独立solo标定输入评估；不读取其joint值校准。
+第二场重复评分保留第一场的solo特征，不以第二场输入重校准。1/2T第二场MAE
+.265138/.270108us，max.602187/.853621us，仅同条件重复。32copy前台两个stage
+L2系数均零，不代表高压力或多team局部服务无效。4T留出、多team、真实route未通过。
+
+### 2026-09-13 Lab：单背景4T留出两场完成
+
+冻结1/2T拟合、以4T独立solo标定输入，4T两场delta MAE .434134/.377835us，
+max .898440/1.122620us；零预测MAE1.376875/1.457500us。全部引用质量通过，
+达到预定单背景5us/12us诊断门槛，保留此M48稳态候选，参数未回调。
+`gemm_pair_response/decision.json`明确multiteam_transfer_passed=false、
+production_adopted=false。独立系数直接多team迁移仍失败，需固定stage/M增加压力
+检验非线性响应；不得将小范围宽度通过升级为完整planner模型已完成。
+
+### 2026-09-13 Lab：多team需求聚合与响应分层诊断
+
+`gemm_multiteam_response/diagnose.py`固定单背景系数，比较三种后台压力：
+P_sum=n*R1；P_feedback=R1*lambda_group/lambda1；P_group为后台组独立实测率。
+前两者区分是否考虑后台吞吐反馈，后两者差异检查每调用预算能否聚合。
+同域L2项保留，跨域置零；DRAM共享。FG T0独立测得，不从joint y拟合。
+P_group与lambda_group为条件诊断输入，不能充当任意新plan已知量。count4留出规则
+保持；2项聚合单位测试通过，尚未生成正式结果或增加响应系数。
+
+### 2026-09-13 Lab：饱和响应候选及否决
+
+在第一PMU的count1/2/8上试验delta=T0*(a_s*R/(1+R/Rc)+
+b_s*L/(1+L/Lc)*I_local)，R为GB/s，L为refill events/us，两个饱和尺度跨前台stage共享。
+两stage各两非负敏感度，R/L尺度分别31个对数节点[1,512]/[10,10000]；零压力返回T0。
+只拟合开发counts，不读取count4响应或第二场。冻结Rc34.296751GB/s、Lc2511.886432
+ events/us，均为经验尺度，不作硬件容量解释。
+后台组独立实测压力输入时count4两场MAE2.406925/2.721925us，max5.297006/6.037006。
+改用单team独立压力相加、不使用组profile时MAE3.792611/4.092621us，零预测却为
+2.15125/1.84625us。虽满足原5us/12us绝对门槛，仍不采用；单调饱和不能解释所有
+非单调服务中位数。saturating_decision.json记录not_adopted，不按已见留出调参。
+2项极限/位置测试及Ruff通过；尚无自主动时序或planner采用。
+
+### 2026-09-13 Lab：动态事件模拟的独立refill通道
+
+`dynamic_resource_candidate/simulate.py`复用已冻结DAG/gather-worker/阶段切换/发布状态机，
+额外引入segment.l2_refill_events、refill_sensitivity和gather_l2_refill_events。
+每个活动片段率r_i=Q_i/T_i0*v_i，局部压力按LLC域求和且排除同expert自身请求；
+v_i的分母增加refill_sensitivity_i*k_refill_to_kind*P_local，所有参与者同时更新反馈。
+字节预算与event预算分别积分守恒，事件率不换算为LLC字节。片段结束立即重算活跃集。
+可选local_refill_capacity_events_us按域独立约束比例服务；低于孤立请求率时拒绝，
+不偷偷改变新通道的无竞争基线。这是待校准比例策略，不声称硬件公平性或重叠机理。
+旧shared-cap逻辑保留为对照，不将旧logical字节误称实测DRAM。
+
+9项测试覆盖解析fixed point、同/跨域、相同总预算不同相位顺序、阶段起止、单expert
+自身排除、域容量及非法预算；9passed、Ruff通过。关闭新通道时，一份既有33job
+结构的事件、segment与字节交付逐字段复现旧引擎。尚未接入真实profile和planner评分，
+参数准确度/完整计划泛化未验证，生产/default不变。
+
+### 2026-09-13 Lab：独立需求接入与自主队列回放
+
+`dynamic_resource_candidate/adapter.py`仅对T1/2/4、M12..1718适配独立read/refill预算。
+前缀时间用冻结isolated模型的T(node)差；node为12/48/96及最终M。读/refill总量守恒，
+原first/later响应敏感度、gather逻辑量和T0不变；首段边界不一致则拒绝。
+写请求原值保留但本read-only消融不参与预测，未裁剪负测量。uniform与prefix显式选择，
+不能称逐panel真实需求已知。refill通道供给已记账，当前仍用原响应系数（新增refill响应零）。
+
+`replay_narrow.py`对8个窄team队列条件、31独立arrival场景自行推进阶段，不以联合
+trace时间作预测输入；trace只在评分使用。原路径精确复现。第二会话阶段delta MAE：
+legacy W13/W2=16.089/9.663us，uniform17.063/14.116，prefix16.128/8.764。
+任务组完成MAPE .5854%/.5768%/.5693%，改善很小，不能作为全MoE或排序改进证明。
+8/16T、小M<12及完整计划剩余任务尚未接入，不能称完整新模型完成。
+最终adapter与engine共15测试通过，240次实际输入适配的边界守恒核验通过。
+
+### 2026-09-13 Lab：完整计划需求消融与响应覆盖审查
+
+后续adapter显式支持T8/16独立bank；8T节点12/48/1205，16T节点12/48/1718。
+插值与外推标注来源，M<12默认拒绝；仅显式m12_anchor策略借用M12请求预算，
+保留该M自身T0。该小M需求假设未验证。48个宽team测量观测及896次job适配检查通过，
+engine/adapter/wide-bank共18测试通过；不代表真实route需求迁移通过。
+
+replay_full.py对两个既有224-expert计划、31独立arrival场景自主模拟，固定T0、
+入口、交接和旧响应。测量仅在预测写出后评分。两场历史数据的四项完成误差汇总：
+legacy/uniform/prefix MAE253.366/143.102/397.204us，MAPE .877/.492/1.370%。
+三版均预测anchor较快；预测计划差754.066/757.225/774.294us，实测953.080/1133.780us。
+只有两计划，不构成新鲜泛化、排序改善或等预算搜索结论，不据此采用uniform。
+
+structural_audit.json发现按任务T0累加约80%的W13/W2服务仍为零shared sensitivity，
+全部refill sensitivity为零；局部旧响应可能仍存在。这是响应覆盖限制，并非80%的
+关键路径时间无竞争或对残差的因果归因。后续必须独立验证后段响应及请求时序。
+写请求仍省略、gather仍为logical预算、32copy独立需求与真实路径状态差异保留。
+
+### 2026-09-13 Lab：容量与显式敏感度的交互审查
+
+共享容量分配独立于显式sensitivity：当offered=sum(q_i*v_i)>C时，对q_i>0片段
+再乘C/offered。因此零shared/local sensitivity仍可能减速，不应自动增加接收系数。
+full_replay/capacity_channel_audit.json固定四臂首个独立arrival，仅移除旧容量参数，
+完成时间降低1192.999..1678.991us；prefix与uniform的差由348.063/370.361us降到
+-4.084/-3.894us。各零shared/local片段移除容量后服务回到T0（数值残差<1e-9us）。
+这是模型结构消融，非物理瓶颈归因、精度评分或新鲜验收。旧C=202.01615989208221
+KiB/us作用于混合的DRAM读与gather logical预算，物理口径未闭合；优先验证资源口径、
+容量和剩余接收响应的分工，避免重复计费。默认不变。
+
+### 2026-09-13 Lab：独立DRAM容量预算通道
+
+为避免旧logical响应特征隐式充当物理需求，simulate.py新增可选dram_capacity_kib_us。
+各GEMM片段显式提供dram_read_kib/dram_write_kib，gather提供对应逐worker数组。
+任意一个DRAM预算出现或启用容量时，所有任务/阶段/worker的读写预算必须完整、有限且
+非负；未提供不等于物理零。旧shared_capacity与新dram_capacity禁止同时启用。
+
+定义d_i=(Q_i,read+Q_i,write)/T_i0。响应固定点先产生v_i，再对sum(d_i*v_i)>C_D时
+的d_i>0参与者按C_D/sum(d_i*v_i)比例缩速，并随事件推进重算。旧read/write/logical
+特征仍独立用于旧响应公式，不计入新容量；DRAM读写各自积分守恒。读写合用标量容量
+及比例分配仍是待验证假设，不代表控制器读写服务等价或硬件公平规则。
+容量低于任一孤立片段或同team所有gather worker同时发出率时拒绝，以保留T0。
+新通道不自动改变响应系数，也不解决剩余响应与容量重复计费的标定问题。
+
+30项测试通过，包括12项新DRAM检查。两完整224-expert计划首入口场景的旧事件、
+片段、字节和refill逐字段一致，dram_legacy_parity.json记录。未接真实计划物理预算，
+不能据此声称新预测准确度。独立16T gather预算20个状态/会话观测保存在
+gather_dram_observations.json：同round idle差除native调用率，保留31个有符号样本；
+未测worker归属、时间分布与真实route迁移，不自动填入模型。生产/default不变。
+
+### 2026-09-13 Lab：平均容量可行区间反例
+
+audit_average_capacity.py限定检验delta=T0*max(0,Roffered/C-1)，Roffered是独立FG/BG
+各自扣同round idle后的cycle平均读写率之和，T0为FG平均worker服务的跨round中位数。
+它不等同动态模拟器，也未考虑请求突发、cycle固定余项或计算访存重叠。
+描述性容差epsilon=2us时，每条件要求C>=R/(1+(delta+epsilon)/T0)，若delta>epsilon
+另要求C<=R/(1+(delta-epsilon)/T0)。delta+epsilon<0则正减速模型无解。
+
+既有gather_demand_states两场各18联合条件：第一场全条件C下界168.379GB/s、上界
+118.869GB/s；第二场168.471/119.426，区间均空。独立solo已达到的中位读写率为
+134.814/134.725GB/s，仅是经验诊断下界，不是统计置信界或硬件peak。36条件有7个
+区间与该下界不相容，其中一项贴边，不能脱离噪声强调计数。保留原始逐条件结果，
+不按这些结果修改容量、T0或容差，也不据此否定动态通道；下一步需辨识阶段内需求
+分布与可受资源影响的服务。3项解析区间测试通过，默认不变。
+
+### 2026-09-13 Lab：独立基线与DRAM服务进度
+
+simulate.py以可选segment.dram_service_us及job.gather_dram_service_us逐worker数组
+启用双进度模式。所有阶段必须显式给出窗口L：正DRAM预算时0<L<=T0，零预算时L=0。
+基线工作剩余c以单位速度推进，DRAM服务剩余d初值L、按容量分配速度v推进；
+q_read/write=Q_read/write/L*v，仅d>0时发出。阶段在c和d均完成后结束，依赖/CPU释放
+仍由原DAG状态机控制；任一请求完成或新阶段启动均重算压力。T0是冻结服务基准，
+不宣称已测得纯计算成本；L是待标定有效窗口，不由历史失败kr/kw自动换算。
+
+该候选能表达T=max(T0,L/v)的常压极限，但动态时使用事件积分而非预先固定v。
+孤立请求率检查使用Q/L而非Q/T0，并对同team gather所有worker求和。DRAM请求完成
+后即停止占容量，计算仍可继续；反之计算完成后必须等待请求才可发布后继。
+为避免语义混用，本模式拒绝旧shared容量、refill容量和任意非零旧响应系数；
+旧logical/refill仅按基线进度记账、无资源响应作用。纯DRAM比例分配仍待硬件验证，
+尚不表示任意指令依赖/预取延迟/读写调度或真实phase window已辨识。
+
+12项新测试加33项既有测试共45passed，覆盖隐藏延迟、请求完成后的压力释放、
+计算先完时依赖等待、gather与窗口边界/缺失、孤立基线及混用拒绝。
+旧steady gather_overlap的M180留出失败保持，不移植其参数；新结构未做精度采用。
+
+### 2026-09-13 Lab：请求窗口辨识的实验条件选择
+
+design_window_probe.py仅用gather_demand_states第一场IO32/32独立成本与请求预算，
+按logical read/write份额分配到16worker（不是实测物理归属），考察L_i=lambda*T_i0。
+给定诊断参考C=134.814005GB/s，为保持孤立T0，lambda下界为sum_i(Q_i/T_i0)/C；
+M96/180/1718分别.212983/.625719/.737969，上界为1。C仅来自已达到solo吞吐，
+不是标定硬件上限；这些范围是条件假设，不能作为测得的窗口置信区间。
+
+两角色各short/full、4个M组合、8个偏移，共128次事件模拟。M180前台/M1718后台
+同时启动的四假设减速3.008..23.747us；偏移350us时短后台窗口约零、长后台窗口
+仍为3.008..13.167us；偏移500us均约零。选择0/350/500us分别检查受压响应、请求
+结束边界和无重叠控制。M96/M96同步四假设仅差.672us，不优先采集。
+该脚本只评价gather，W13/W2为终止占位，不能叫MoE完整计划。原生单次、可验证
+偏移的测量实现和实际结果仍待完成；不从这些模拟更新模型参数或声明准确度。
+
+### 2026-09-13 Lab：原生非对称偏移对照两场结果
+
+gather_offset_probe实现单次FG M180/16T与BG M1718/16T，独立32copy buffer，固定FG64call
+再BG64call准备；所有worker ready后共同epoch+2ms，偏移0/350/500us。线程回收延后到
+所有计时调用完成。两场各5warmup31round×7条件结束，FG同round同偏移n0对照的服务
+增量为7.626/9.270/-.023us和7.819/9.655/.159us。350us时stage包络仍完全重叠，500us
+不重叠；这不是直接的DRAM请求观测。两场FG配对时序均合格，第二场BG-only有一个
+预热及一个正式start跨度超界，完整保留并单独标记后台参考质量。
+
+同round比较delta350-delta0，中位数1.823/1.656us、MAD .870/.671us。晚期响应没有
+消失，并略强于起始响应；先前short后台窗口情景在350us约零的预测与本批不一致。
+不过本批准备/单次状态与旧steady profile不同，不可按此直接判定真实L、唯一DRAM
+原因或拟合采用long参数。原生worker窗口/空载控制为后续状态及资源响应辨识提供约束。
+默认未改，完整计划与等预算搜索仍待完成。
+
+### 2026-09-13 Lab：同域／跨域原生偏移辨识启动
+
+gather_offset_locality固定FG16T/M180 CPU288..303，仅将BG16T/M1718置于304..319或
+256..271，同NUMA3。两placement各自匹配准备/offset的无后台控制，主指标为350us
+同round的(delta_local-delta_cross)；0/500us、BG耗时及实际stage重叠同时记录。
+不同核位置也可能改变后台需求与状态，不把形状相同当作物理请求相同。
+首烟测BG-only时序失败保留；原子状态分cacheline的v2重新构建，14cell烟测通过。
+两场5warmup31round正式采集已启动，尚无结果、拟合参数或默认模型变更。
+
+### 2026-09-13 Lab：同域／跨域偏移两场完成
+
+gather_offset_locality两场各504调用结束，350us local/cross配对增量分别6.359/5.396us
+和8.539/4.752us，阶段包络基本完全重叠；500us两位置均无重叠、差值接近零。
+同round local-minus-cross增量350us为1.047/2.963us、MAD2.142/2.432us；0us为
+3.121/2.992us。局部额外响应幅度不稳定，不据此拟合固定LLC惩罚。
+FG无后台成本local约42us、cross约39us，说明匹配准备/放置流程也影响基线状态。
+已分开扣各自n0，但不据形状相同断言物理请求相同，不能把剩余差额唯一归因LLC。
+第一场有一预热joint及一正式FGonly时序异常，均保留；第二场时序全部通过。
+下一步必须使用匹配单次状态的独立读写预算约束窗口/容量，避免混合需求变化和服务
+变化。无PMU数据、无新响应拟合或默认采用，完整目标未完成。
+
+### 2026-09-13 Lab：匹配单次状态的独立DRAM计数启动
+
+gather_offset_pmu复用原单次gather，只增加ARMED/GO/DONE/ACK：准备结束后才启用
+计数器，固定epoch为ready+2ms；全部调用结束后停止计数，随后才回收线程/校验。
+Python CLOCK_MONOTONIC边界验证每worker begin/end被所有计数器启用完毕与开始
+停用之间完整包围，保留每event的count/enabled/running；单次无需steady calls/s估计。
+各event预算为(count_active-count_idle*enabled_active/enabled_idle)*32bytes后求和，
+不混用不同controller的计数窗口。负估计保留，写计数不等于全部dirty store同步落DRAM。
+
+六个独立角色条件（FG180两offset、BG1718，各local/cross）在同进程同buffer内随机
+交错PMU开/关；四个匹配idle只需PMU。两场16cell×5warmup31round启动，预定各条件
+配对service偏差中位数绝对<=5%，running>=.99，时序门槛10/5us不变。烟测完成覆盖
+检查，但单轮服务差仍有超界，不作为扰动已通过的结论。正式结果待完成，无参数采用。
+
+### 2026-09-13 Lab：单次独立预算两场通过测量门槛
+
+gather_offset_pmu两场完成，各6条件的PMU开关配对服务偏差中位数绝对最大.627/.390%，
+全部通过5%门槛；quality.py同时要求两侧时序无异常和读写预算中位数非负，原样本保留。
+同round FG local-minus-cross读预算差：offset0为939.433/814.889KiB，offset350为
+921.973/861.132KiB，服务差约3.0..3.5us。写差较小且方向不稳定，不能用一个统一
+read/write倍率概括。相同M/T不等于相同独立请求预算，位置响应拟合须输入匹配状态。
+
+matched_profiles.json保留12个session/role/placement/offset显式profile、每个31轮，
+每轮用无PMU worker成本配同round PMU预算；两场不平均、不插值、不分配物理请求到
+worker，不将负原始样本截零。范围仅native_single_gather_fg64_bg64_ready2ms_io32，
+没有真实MoE历史迁移、同步写回或窗口L标定声明。5项计数/资格测试和来源/372观测检查
+通过，模型参数与默认不变，后续窗口/联合运行和完整搜索验证仍待完成。
+
+### 2026-09-13 Lab：匹配预算的窗口参数诊断
+
+fit_matched_windows.py固定matched_profiles的无PMU worker T0及独立读写预算，以逻辑
+份额分配物理请求（仍是假设），设rho=sum_i(Q_i/T0_i)/C，L_i=T0_i[rho+theta(1-rho)]。
+C为140/170/200GB/s诊断网格、前后台theta各取0/.25/.5/.75/1，共75组。rho>1拒绝，
+不改变T0或裁剪需求；只用DRAM容量与双进度，不启旧响应系数。500us复用350us的FG
+profile作无重叠控制，不能称500us需求已测。900次模拟先写出，再读取既有联合评分。
+
+仅session1的offset0 local/cross两个点选择参数：C170、theta_F1、theta_B.75，训练
+MAE .283us。350us预测第一场local/cross1.835/1.712us，对实测6.359/5.396；第二场
+2.163/1.975，对8.539/4.752。四组训练MAE距最优<=1us的参数均保留，晚期预测仍小。
+事后让第一场0/350都参与开发，网格最优第一场MAE1.795us但最大误差3.962us；该结果
+不再是350us留出，也不作为参数采用。当前网格显示前后期折中，不证明所有连续窗口
+模型不可能成立；还需区分时变需求和容量以下的服务延迟。
+PMU solo与旧joint来自不同driver/process，转移未闭合；这是回顾诊断而非新鲜验收。
+2项参数化约束测试通过，生产/default及正式系数不变。
+
+### 2026-09-13 Lab：联合请求量与command占用代理辨识启动
+
+已有单次solo计数按event独立扣idle，再计算sum(occupancy)/sum(read_commands)，
+FG cross/local两场约51..52/54..55，BG约61..62，重复较稳；不转换为CPU延迟us。
+gather_joint_pmu复用相同准备/epoch/计数握手，新增joint0/350us及其同进程无PMU
+对照，两个placement全24cell。联合字节残差Qjoint-Qfgsolo-Qbgsolo无需吞吐缩放，
+因为每活跃角色恰好执行一次；command代理对照采用独立corrected计数的加权总比。
+联合计数/残差均是aggregate，不能指定给FG；所有有符号时间和流量差保留。
+构建与单轮烟测通过覆盖/数值/CPU/时序检查，但服务偏差的正式5%门槛未评价。
+两场5warmup31round已启动，不拟合参数或改变默认。该实验检验需求是否可加与服务
+代理是否变化，不等价于精确队列延迟、LLC事件或完整计划验证。
+
+### 2026-09-13 Lab：联合计数分布与同调用状态关联
+
+gather_joint_pmu两场结束，8组通过既定计数/服务偏差/时序门槛。读残差有符号中位数
+约-1.3%..+.35%，但逐轮绝对误差均值21.2..32.5%、P90 53.0..70.4%，不能据中心接近
+零宣称固定solo预算可加。BGsolo最大间隙描述性分组：低组约14MiB、高读组23..25MiB，
+同调用服务中位数差33..38us；分组不是硬件机制或可用于预测的已知状态标签。
+按两个PMU读组服务中心中点区分control时间，14..17/31配对落在相反时间组，说明
+按round配对的control成本与PMU预算不保证同一状态实现。control没有读计数，不能据
+时间组直接断言其物理请求状态。
+
+same_call_profiles.json保留同一次PMU的worker成本/请求/command代理，另列另一调用
+的control成本，不将二者合成确定性状态或独立取中位数。旧profile和拟合保留。
+全部记录的occupancy代理差中位数两场为3.4..5.5；事后近似可加子集仍为正，但这
+不是过滤后验收、前台latency或微秒换算，不能自动提取响应系数。
+
+### 2026-09-13 Lab：显式DRAM请求服务响应候选
+
+新增可选dram_queue_us_per_kib=k，仅在separate DRAM clocks下允许非零；其他旧响应
+及refill容量仍禁止混用。每次固定点求解使用实际请求率q_j*v_j，排除同expert所有
+worker自身压力，令v_i=1/(1+k*sum_other(q_j*v_j))，再施加显式DRAM容量约束。
+仅请求进度受到影响，基线工作仍独立推进；零请求或请求已结束不受此项影响。
+它是有效服务响应假设，不是从aggregate occupancy换算的物理CPU延迟。
+5项新增解析/边界测试加47项既有测试共52passed；k默认0，没有拟合或默认采用。
+必须先处理状态/协方差与容量-响应辨识，再做完整计划泛化和等预算搜索验证。
+
+### 2026-09-13 Lab：独立状态分布与动态传播对照
+
+state_distribution.py仅使用第一场solo profile，枚举31x31 FG/BG独立组合，保留每role
+内部read/write关联。预测先写出后评分两场joint；读量边际W1/实测均值约2.1..12.0%，
+写量约.8..3.2%。按预测分布最大间隙作事后状态分组时，组内读量W1约.2..2.2%，
+主要分布差异落在组权重。联合状态分组只用于描述，不作为预测输入；不能从31样本
+的比例差异直接认定因果状态转换或排除抽样波动。W1不等于逐调用误差或计划指标。
+
+state_time_replay.py固定原C170/theta_F1/theta_B.75、queue系数0，将第一场同调用
+PMU成本与预算的31x31组合传播到4个gather条件，共3844个分布场景与4个中位数输入
+对照，49.279s。第二场不更新profile；PMU/无PMU实测分开评分。无PMU FG350us均值
+误差仍-3.77..-6.26us，故状态关联修正不能单独修复晚期低估。BG均值误差约-9.79..
++6.83us，而中位数误差可到-37.73/+30.54us，混合权重使中位数不稳定；不能以W1
+或均值代替原完整计划/选择验收。role间独立性与逻辑worker分配仍是假设，参数未拟合，
+默认未变。3项分布距离测试通过，下一步检验服务响应而非仅重新选择状态权重。
+
+### 2026-09-13 Lab：状态条件服务校准与无条件复核
+
+fit_state_service.py仅用第一场数据选择参数。独立FG读量三分层、BG最大间隙两组各取
+真实调用代表及经验权重，保留同调用成本/需求。训练损失按第一场PMU joint计数的
+低/高组分别计算FG/BG平均服务误差；实际joint组只用于训练/诊断评分，前向预测
+使用独立输入组及其权重，不读取目标组。角色间独立与逻辑物理字节分配仍是假设。
+
+C∈{170,200,230}、theta_F∈{.75,.875,1}、theta_B∈{.9,.95,.975,1}、k∈{0,.001,.002,.004}，
+共144组。容量-only和非零k分别选代表性状态最优者，再用各4x31x31场景完整复核。
+容量-only C170/theta_F.75/theta_B1，完整训练MAE3.957us；响应候选C170/theta_F1/
+theta_B1/k.002，完整训练MAE1.608us。第二场状态条件诊断3.546→2.350us，非盲测。
+三种C在最佳代表性θ/k处误差完全相同，不能据选中的170宣称容量已标定。
+
+无条件预测仍固定第一场独立状态权重。对无PMU结果，两场FG/BG各条件的均值误差
+MAE5.623/5.543→2.921/3.566us；中位数误差MAE16.521/13.989→13.112/11.683us，
+后台中位数仍有明显问题。第二场FG均值误差约-.490..+2.077us，晚期低估改善；窗口
+与响应均有重标定，不能将全部改善单独归因k。代表性状态固定窗口2x2对照另存。
+该M类Lab候选不替换默认，需独立容量约束、未见条件及完整计划/等预算搜索验证。
+
+### Lab独立读容量约束与标定边界（2026-09-13）
+
+可选dram_read_capacity_kib_us=C_read要求sum_i(read_rate_i*v_i)<=C_read，
+仅对仍有读请求的actor作比例约束，write-only actor不消耗该读cap；读写预算各自守恒。
+可选total cap仍约束read+write，若同时声明则要求C_total>=C_read；旧logical cap不能混用。
+独立速率超过声明容量时拒绝输入。此结构不证明物理读写互不干扰，mixed响应需另标定。
+
+dram_capacity_probe两场M1/1T四copy、20/40/60/79team读主导测量全部通过既定仪器门槛。
+79team W13为294.217/294.177GB/s，W2为292.534/292.559；60→79增幅约1.3–2.0%。
+描述性平台通过，非通用硬件峰值。此前170/200/230总cap不能解释成通用物理容量；
+旧候选留作历史对照，读平台不可直接赋给mixed总cap。当前不采用新默认数值。
+56项Lab引擎测试通过，完整计划/未见条件/等预算搜索验收仍待完成。
+
+容量消融已冻结theta_F=theta_B=1、queue=.002与第一场同调用输入；比较total170、
+read292、read295、no-cap，保持L=T0不变。逐样本legacy等价检查后评分；当前运行中，
+不能从首个local0四组相同推断所有动态条件。完整记录见Lab报告capacity_ablation段。
+
+### Lab物理GEMM预算适配（2026-09-13）
+
+physical_adapter.py保留T0与DAG，Q_read/write由raw_request_nodes显式构造：prefix为
+相邻累计预算差，uniform为总预算乘阶段片段T0占比。检查非负、有限、读分配一致与守恒，
+不截断负值。L=window_fraction*T0（零请求L=0），参数必须显式传入并标为未验证假设。
+gather预算及旧response字段不变，需调用方补齐provider并选择兼容响应后才可模拟。
+四组历史计划输入共896expert/3152片段转换检查通过，7项定向测试通过，默认不变。
+这只完成GEMM输入转换，不能声称全计划物理模型已验证或采用。
+
+容量消融最终15376场景完成：四arm所有条件逐样本相同，legacy差0，不能在此数据
+辨识容量；不能推广为高并发无需容量。真实runner四copy仅为weights；gather input固定、
+packed-A由resident scratch提供，FP32 route workspace与其不同，采集须按此生命周期设计。
+
+真实route历史输入已提取14target：保留同scratch完整前序及target token集合。直接
+前序地址交集可能为0而更早前序交集很大，故不能将previous_M视为完整输入状态。
+集合交集仅作已访问地址特征，不等同cache驻留；其他lane/前次调用仍需动态历史处理。
+
+同scratch实际route链gap实验两场完成：0/200/1000us忙等对mean-worker服务的配对
+中位变化最大.383us，但team envelope可变2.23us。后续物理需求计数需独立验证到达
+与服务，不能从服务稳定推出包络稳定或直接替换真实T0；详见gap_decision及报告。
+
+实际前序PMU pilot两场表明M4/8T预算不可辨识（第二场read MAD115.62KiB，
+write18/31负值），M73/16T读中心196.88/199.90KiB较稳定。仪器服务偏差小不等于
+物理请求可辨识。history-to-start约2.4ms含人为2ms epoch，先缩短等待重验，不采用
+或裁剪小M预算；此前1ms gap检查不能证明该2.4ms协议等价真实路径。
+
+去掉额外2ms后两场PMU短epoch完成，history gap约400us，M4 read MAD64.31/24.32KiB
+仍较大，不采用或裁剪。下一步完整计划gather需求敏感度；已核对两计划各788GEMM片段
+L=T0下最大独立读率86.920GB/s，不超过295读参考，但此可行性不能证明需求预算准确。
+
+完整计划nuisance敏感度首到达场景完成：小M gather从0到2倍仅改变约19–40us，
+但全局queue=.002使nominal计划增加约4.7–4.8ms。gather逻辑/RFO参考非物理边界。
+phase对照显示W13/W2从低估转明显高估而gather仍低估，不能统一迁移gather系数；
+应分离接收响应和可隐藏时间。全31arrival主要对照exec46618运行中，非采用/泛化验收。
+
+全31arrival的248预测已完成：capacity-only nominal低估两计划约3.1–4.2%，全局
+queue=.002高估约12–13.3%。小M gather 0→2倍跨度中位30.34/19.12us，最大34.18/19.18us。
+全部arm选anchor，无新选择收益；先分离接收响应和重叠，不按总时间拟合全局queue。
+
+### Lab接收侧queue分离（2026-09-13）
+
+k_receiver分别对应gather、W13、W2；缺省回退原global k，显式0允许覆盖。
+v_i=1/(1+k_receiver(i)*sum_{j not own expert}(q_j*v_j))，其后保持原容量约束。
+同一shared请求集合供所有receiver使用，不把来源阶段误当接收阶段；separate clocks
+及有限非负验证不变。6项新测试，完整Lab71passed；四个完整计划结果global与明确
+receiver参数逐字段等价。生产/default未改变。
+
+固定.002逐receiver消融显示gather-only约+258us，W13-only约+3.3–3.5ms；W2-only
+总时间接近却具有明显阶段误差抵消，不采用。进一步固定参数、L_gemm/T0=.35/.5/.75/1
+得到非单调时间，缩短L同时压缩请求时序并增加峰值压力。L不是已测硬件窗口，粗大M
+片段的请求提前完成也不是已验证的跨panel预取能力；需独立区分隐藏服务与时序后标定。
+
+### Lab请求结束诊断（2026-09-13）
+
+可选record_dram_timing记录虚拟memory clock结束；默认不输出新字段，不影响事件或预算。
+72项Lab测试通过，6次完整预测剥离诊断字段后与已冻结结果完全相同。
+L/T0=.35时两计划669/724个GEMM片段提前结束请求，大M后续片段约后60%时间无DRAM
+请求、最大约8.5ms。L同时控制Q/L速率和请求活跃区间，不是单独的服务隐藏比例。
+该时序尚未由硬件验证，不能凭总时间接近采用。下一步固定请求时序检验接收响应，
+保持服务隐藏与请求集中两个假设可分别检验。
+
+固定L=T0的接收强度标定仅用anchor session1的W13/W2阶段绝对误差，不使用
+makespan训练。粗25点在零边界最优（20.3879us），因此在0..0.0002用同训练集
+细化36点，不能据粗网格零点宣称无响应。回顾验证与训练分离，非新鲜泛化验收。
+
+固定窗口细网格36训练点完成：k_W13=.000025、k_W2=.00005，阶段MAE19.9929us，
+比粗零点20.3879us改善约1.94%，不作显著性/泛化声明。已冻结后启动两计划31arrival
+回顾评分（exec83759），不根据总时间重新选值。新鲜计划和搜索验收尚未完成。
+
+fine固定窗口回顾完成：anchor28094.345us、control28861.951us，误差仍约-1.9..-3.1%。
+第二场8T小M W13低估而16T较大M高估，说明常量接收系数残差仍分组，不直接归因T0。
+已准备uniformish新lane顺序615101/615102和anchor控制，234expert/10x8T；预测冻结中，
+硬件尚未启动，不按该holdout调参；此批不等于混合宽度或完整搜索验收。
+
+uniformish新顺序留出两场完成，candidate MAPE2.273%、P90abs3.209%，capacity
+对照1.204%/2.058%；均选实测候选最快order615101，regret0、lane诊断通过。
+仅本批新顺序检查通过，候选准确度较差且无选择收益，不采用或按holdout调参；
+下一步冻结参数验证混合宽度，完整搜索仍待完成。
+
+混合宽度留出已准备：每40核[4,2,1,1]x5或[16,8,8,4,2,1,1]，无竞争cost的
+list scheduling分配234expert，完整PlanV2资源/依赖验证通过。source-conditioned
+gather使用实际token列表。首arrival预测完成，全31arrival在冻结参数下进行；
+不以此预测充当实测或等预算搜索结果。
+
+混合宽度两场留出完成并失败：narrow低估约14.5%、wide低估约11.3–11.5%，
+总MAPE9.448%、P90abs14.570%，lane诊断亦失败；regret0不能抵消时间误差。
+主差额在1/2/4T GEMM，不能直接归因T0或特定硬件资源。先做匹配无竞争/前序对照，
+保持冻结模型和失败记录，不加任意宽度惩罚，不宣称泛化或采用。
+
+混合失败后的精确形状direct/prefix对照四场已完成并通过数值/隔离trace校验，
+但回传连接超时，备用别名不可解析，尚无本地分解结果；不得重启已完成实验或
+宣称原因已确认。分析器保持gather服务与到达分离，较大M直接对照仅准备未运行。
+
+2026-09-14精确形状基线对照已收回：M14..22、1/2/4T的direct两场基线MAPE
+0.703%/0.948%，保留同team前序的prefix为1.552%/1.267%。1T/M16 W13第二场
+T0=1680.33us、direct隔离1660.02us、joint4007.75us；prefix隔离1664.10us，
+联合减速仍大。证据支持在这些点优先修竞争响应，不支持统一抬高T0；不唯一归因
+DRAM/LLC，也不外推大M。M99..240直接隔离两场已启动，尚未评分。冻结参数保持，
+详见joint_cost_model_20260911.md及receiver_mixed_baseline_contrast/analysis.json。
+
+2026-09-14大M补充已完成：8目标M99..240、双GEMM、两场direct隔离基线MAPE
+0.634%/0.652%，各点误差均在±3%内。narrow1T/M111 W13联合增量中位2534/2510us，
+2T/M168为1197/1208us；不能由当前T0偏差解释。保持T0冻结，后续以局部/跨LLC
+受控多team对照区分局部压力与全局DRAM响应。原4T/M48单后台校准不覆盖此问题。
+16T/M155 W13在联合计划快约42/45us，但direct改变了前序历史，不视作竞争加速。
+详见receiver_mixed_upper_contrast/analysis.json；无新参数拟合或默认采用。
+
+2026-09-14启动1T竞争响应诊断准备：receiver_locality_response以M16/M112、
+W13/W2、4copy前台和4T/M48/W13、2/8team、1/32copy后台作36条件位置对照。
+局部/跨LLC后台核集合相差40核；固定工作量不等于固定实际请求率。主观测为同round
+窗口mean-service之差，保留负值和离散度，不把稳态重复权重对照当成真实route T0。
+旧4T/M48单调饱和迁移失败记录保留；新实验暂不拟合或替换响应公式。
+
+2026-09-14 1T位置对照第一场通过：M16/W13在8个4T/M48/W13、32copy后台
+下的同域/跨域增量44.44/27.30us，远小于真实mixed_narrow约2300us。探针最多33
+活跃核且后台固定阶段，不能将两环境视作同压力。先验证第二场，再补齐双域总体
+压力覆盖/后台形状及请求量变化诊断，不直接从这批局部差异拟合修复系数。
+
+2026-09-14第二场1T位置对照完成：M16/W13同域/跨域增量45.06/28.15us，与
+第一场44.44/27.30us接近，均远小于真实联合减速；M112/W13同域93.1→104.9us，
+不把所有条件称作精确稳定。双域20条件三角色控制已通过烟测/原始数据复核，
+两场正式对照已启动，保留固定32后台核位置对照及64后台核总压力对照。非加性
+诊断为T_both-T_local-T_cross+T_solo，非唯一硬件归因；未修改模型参数。
+
+2026-09-14双域第一场完成：M16/W13在32同域后台核下增量46.0us，32核分域
+34.58us，64核分域434.4us；M112/W13相应99.9/94.5/1396.5us。逐round非加性
+T_both-T_local-T_cross+T_solo中位360.65/1245.8us，表明高总负载响应不可由
+单域低负载直接相加预测。仅第一场、无PMU，不唯一归因DRAM容量或请求量变化；
+第二场验证中。原参数与T0保持冻结，未据此采用新公式。
+
+2026-09-14双域两场均完成：64后台核的M16/W13增量434.4/436.32us，M112/W13
+1396.5/1390.4us，支持高总负载非加性现象重复；无PMU不唯一归因容量或预算变化。
+下一步仅准备receiver_dual_domain_pmu计数方案，覆盖全部65活跃核及同16个NUMA3
+DDRC，加入BG-only/idle/同批无PMU对照；旧core范围漏8核须修正。未拟合或采用。
+
+2026-09-14高负载PMU采集实现：65核L2 access/refill/writeback及16DDRC四事件，
+共259事件，50个PMU/无PMU格点含BG-only/idle，500ms。三项本地测试及原始烟测
+复核通过；最大单调用比例2.63%、前台仪器偏差0.757%。两场正式采集已启动，
+尚无正式计数结论，不能由烟测或聚合DDRC推断前台DRAM预算；模型参数保持冻结。
+
+### Lab intermediate-pressure validation (2026-09-14)
+
+The dual-domain PMU experiment completed two matched 5/31 sessions with raw-data
+parity and quality gates passed. High shared-load slowdown repeats without an
+increase in foreground L2 refill/call; M112/W2 response shows cross-session drift.
+This does not uniquely identify DRAM queueing or allocate global DDRC bytes.
+The optional `receiver_pressure_curve` experiment adds 5+5, 6+6, 7+7 and
+8+4/4+8 background-team placements with unchanged native binaries and 500 ms
+windows. Fit placements are 4+4/6+6/8+8; 5+5/7+7/8+4/4+8 are held out.
+T0, response coefficients, planner objective and production defaults remain frozen.
+The new 80-cell protocol has four passing local checks; target smoke and raw
+parity passed (maximum paired perturbation1.615%). Two formal sessions are running;
+response holdout validation remains pending. This is not model adoption.
+
+### Bounded response-shape diagnostic update (2026-09-14)
+
+Both intermediate-pressure sessions completed and passed raw-data parity and
+quality gates. Optional `receiver_pressure_curve/fit_response.py` compares
+`delta = a * rho` and `delta = a * rho / (1-rho)`, with independently fixed
+`rho = BG-only-read-GBps / 295`, restricted to `0 <= rho < 1`. Each nonnegative
+coefficient is fitted only to session1 placements4+4/6+6/8+8, separately for
+M16/M112 and W13/W2. Session1 measured pressure features are frozen for session2.
+Rational heldout increment MAE14.483/18.676us versus linear165.852/161.749us;
+M16 heldout underprediction remains systematic. These are descriptive-viewed
+holdouts, fixed-stage measured-pressure diagnostics, not cross-M or full-plan
+validation. The rational form is empirical and is not proof of physical queueing.
+No production equation or T0 change. Receiver feature transfer and dynamic joint
+validation remain necessary before adoption.
+
+### Receiver-feature transfer limitation (2026-09-14)
+
+A proportional transfer of the bounded rational-response coefficient from M16 to
+M112 fails when scaled by isolated time or L2 refill/call. M112/M16 coefficient
+ratios are3.209 (W13) and2.623 (W2), versus time ratios about6.9 and refill about5.3.
+Solo DDRC read/call proxy yields M112 heldout increment MAE29.774/32.833us for
+W13 but148.615/142.060us for W2. Thus an invariant sensitivity per byte/refill is
+not established. These are retrospective diagnostics on viewed shapes; no change
+to production equations. New M/history and request-exposure validation is required
+before replacing per-shape sensitivity with independently derived features.
+
+### Prospective receiver interpolation check (2026-09-14)
+
+Optional `receiver_m_holdout/design.json` freezes `a(M,s)` as affine interpolation
+between the existing M16/M112 diagnostic coefficients. Previous session1 BG-only
+rates and295GB/s reference remain fixed. New M48/52 and96/100 validate full-block
+versus four-row-tail sensitivity at6+6/8+8; M16/112 check concurrent anchor drift.
+No fitting to these new M observations is permitted in the primary score. New
+probe extends only the input whitelist; local grid/source tests and Arm
+build/smoke/raw parity passed (max perturbation0.930%). Two formal sessions
+are running with frozen predictions; measurements remain pending. This is a bounded empirical null hypothesis;
+full-plan and dynamic-overlap validation remain outstanding.
+
+### Matched block history/pressure interpolation diagnostic (2026-09-14)
+
+Optional `tmp/joint_cost_model_20260911/receiver_tail_matched/fit_response.py`
+implements the predeclared `fit_plan.json` conditional diagnostic. This does not
+replace the active DRAM response, planner parameters, or isolated costs.
+Only validated train1 (M52/M100, 6+6/8+8, 31 paired rounds) may fit parameters;
+train2 is repeatability, M76 and7+7 are excluded from fitting.
+
+For stage s, block history h and training pressure n, let
+`d(s,h,n) = median_round(T_joint_block - T_solo_block)` in microseconds,
+using PMU-off, block-timing-on samples. The difference is taken before the median.
+At matching full-block histories, average these node medians across available
+training M. Four-row tails retain separate h4 and h8 nodes. Independent BG-only
+PMU-on idle-corrected read rates provide `p6,p8`, requiring `0 < p6 < p8`.
+For each history, define `G(s,h,p)` by piecewise-linear interpolation through
+`(0,0), (p6,d(s,h,6)), (p8,d(s,h,8))`.
+
+The primary four-row-tail prediction for integer h in[4,8] is
+`Delta_tail(s,h,p) = (1-lambda)*G(s,4,p) + lambda*G(s,8,p)`,
+`lambda=(h-4)/4`. Full blocks support only measured histories h0..7.
+Pressure is restricted to[0,p8]; unsupported rows/history and extrapolation are
+rejected. All signed training increments are preserved without clipping;
+a negative predicted increment is a diagnostic output, not a validated physical
+speedup. T0 is unchanged and is not estimated by this function.
+
+Controls: zero competition response and history-pooled first/reuse/tail4 groups,
+with the same pressure interpolation. Validation cannot select the family or
+change knots/coefficients. Conditioning on validation BG-only measured pressure
+must be reported separately from autonomous pressure prediction. This scope does
+not establish a queueing law, complete-plan accuracy, or planner selection benefit.
+Both matched holdout sessions completed with full raw validation. All42 pressure7
+nodes overestimate in both sessions; the linear-pressure candidate is not adopted.
+A post-hoc q=p/(295-p) coordinate diagnostic reduces pressure error but retains
+tail and history/context errors; it is not a new independent validation.
+
+### Background-only composition selection (Lab, 2026-09-14)
+
+`tmp/joint_cost_model_20260911/receiver_pressure_composition/selection.py` selects
+conditions from independently validated BG-only screening, without foreground
+response inputs. Grid: M12/48/96 x W13/W2 x symmetric5/6/7/8 four-thread teams
+per LLC, copies32, two sessions,31 finite read/write samples per condition/session.
+The caller must verify raw identities, counters, geometry and complete protocol;
+the selector alone cannot authenticate measurement provenance. Missing/duplicate
+cells or failed gates reject selection. Out-of-domain medians remain ineligible.
+
+For each same-team-count pair with distinct(M,stage), define
+`dr=max_session(abs(read_a-read_b)/max(read_a,read_b))` and
+`dw=max_session(abs(write_a-write_b))`. Require dr<=0.02 and dw<=2GB/s in the
+original calibrated[p6,p8] interval. Sort by(dr,dw,condition identities), greedily
+choose up to two disjoint pairs. This is deterministic greedy selection, not a
+maximum-cardinality matching objective. No qualifying pair means no matched-pair
+claim. Signed idle-corrected writes are preserved.
+
+For target pressures p6+f*(p8-p6), f=0.25/0.75, choose the eligible new condition
+with smallest worst-session distance, requiring distance<=0.1*(p8-p6); break ties
+by condition identity and deduplicate. Exclude original M48/W13 at6/7/8 from these
+new-pressure targets. Freeze selected conditions before foreground acquisition.
+The BG-only collector now implements all50 paired-PMU/idle cells per round with
+two native background processes and no foreground process. The raw analyzer
+checks the frozen protocol/candidate/native identities, exact counter-name set,
+complete grid, native validation and finite service/counter values. It retains
+signed idle-corrected rates and gates count resolution and per-role paired PMU
+perturbation. Synthetic selector/protocol/raw-reduction tests:35 passed.
+freeze_selection.py independently revalidates both raw JSONL inputs, requires
+the predeclared distinct seeds and5/31 observations, and rejects failed gates.
+Arm smoke exposed simplified synthetic DDRC names and a foreground-style native
+service schema. Before formal data, protocol v2 uses actual
+ddrc{0,2,3,5}_{0,1} names and the existing BG median_ns field; its paired
+median-service perturbation gate remains5percent. Original failed smoke remains
+preserved. Revised35 local tests pass.
+It derives pressure bounds from the frozen candidate, preserves all48
+condition/session observations, and writes an exclusive output containing input
+and implementation identities plus deterministic selections. Reversing input
+order leaves the output unchanged; no eligible condition is an explicit empty
+selection, not a relaxed threshold. These hashes provide traceability, not proof
+that a hardware measurement took place. Protocol-v2 Arm50-cell smoke passed numerical/CPU and quality checks
+(maximum PMU perturbation1.197762percent; single-call fraction0.520833percent)
+with exact local/remote raw-analysis parity. This validates this integration
+sample, not formal repeatability or generalization. Foreground follow-up
+integration, formal measurements, dynamic model and full planner acceptance
+remain pending. No active equation or production default changed.
+
+
+### Composition foreground follow-up protocol (Lab, 2026-09-14)
+
+followup_protocol.py verifies a frozen selection by independently rerunning
+freeze_selection.py on both original BG-only JSONL sessions. Mismatched output
+or no eligible conditions rejects collection. New cells explicitly encode
+(foreground M, foreground stage, background M, background stage, teams per LLC,
+block timing, PMU). For K selected conditions, include:
+4 foreground(M52/100,W13/W2) x(K+1, including solo) x4 timing/PMU controls,
+plus(K+1) BG-only/idle x2 PMU controls, giving18(K+1) cells; K<=6 implies126.
+Preserve foreground-first ARMED/GO ordering from the matched probe and disjoint
+CPU319 foreground, local/cross4T groups ending316/276. T0 remains fixed.
+
+measure_followup.py and analyze_followup.py retain separate FG mean_ns and BG
+median_ns schemas. Validate complete grids, native/protocol/selection identities,
+counter coverage/time, finite observations, and FG block-sum plus overhead
+accounting. Gate FG/BG paired PMU and FG block-timing perturbation independently
+at5percent, retaining the5percent single-call-resolution gate. No response is
+fitted or evaluated by this raw analyzer. Synthetic full-grid, command/control,
+selection-tampering and accounting/gate tests bring local total to50 passing.
+Foreground hardware integration and frozen linear/queue comparison remain
+pending; this is not model or planner acceptance.
+
+
+### Frozen composition-response evaluator (Lab, 2026-09-14)
+
+evaluate_followup.py revalidates foreground raw data and requires5/31 rounds
+with seed616411 or616412. CLI selection is recomputed from original screening.
+For each condition/M/stage/block, use PMU-off, block-timing-on same-round
+joint-minus-solo increments; preserve31 signed samples, median and MAD.
+Prediction conditions on median same-session BG-only read pressure, not
+joint-run DRAM totals or observed foreground progress. Linear and q=p/(295-p)
+comparators share frozen parent block/history values; neither fits capacity,
+responses or T0. Original support is enforced before transforming coordinates.
+Unsupported pressures retain all observed points and explicit supported counts
+rather than disappearing from aggregate errors. Report stage/full-tail MAE/bias.
+
+For each preselected composition pair, recheck contemporaneous BG-only read
+medians (relative mismatch<=2percent), write medians (absolute mismatch<=2GB/s)
+and original[p6,p8] domain. Report paired-round response differences, MAD and
+observed-minus-predicted difference for both families, including failed matches.
+A failed contemporaneous match is not matched-pressure evidence. One-session
+differences/MAD do not establish significance or cross-session repeatability.
+Endpoint/zero equivalence, curvature, raw integration, unsupported retention
+and matched-pressure drift tests pass. Two-session conclusions, hardware
+foreground integration and full-plan/planner acceptance remain pending.
+run_formal.sh now sequences raw screening, frozen selection, actual-selected
+foreground smoke, then two formal foreground sessions with all gates. It has
+an exclusive output directory, no restart and a210min timeout.54 synthetic tests
+pass on Arm; the new bounded formal batch is not launched pending resource
+approval. Pipeline completion cannot substitute for model acceptance.
+compare_sessions.py independently reevaluates two original foreground raw files,
+requires both distinct predeclared seeds, and retains per-session group errors
+and supported counts. A group can report lower queue MAE in both sessions only
+with complete support in both. Composition residual sign agreement requires
+contemporaneous pressure matches in both sessions and nonzero same-sign
+residuals; it is descriptive, not a significance or mechanism test. Unsupported
+conditions and disagreement remain visible. Seven focused tests passed, including
+full raw revalidation and isolated sign/matching logic. The local formal runner
+now writes comparison.json after both session evaluations; resource approval
+remains pending and no formal run has started.
+
+
+### Composition batch outcome and next contrast (2026-09-15)
+
+Authorized batch completed all stages within approximately79min; five raw
+analyses, frozen selection and cross-session comparison match local reanalysis.
+No same-team composition pair qualified. The selectedM12W2/6+6 condition fails
+the frozen queue candidate: every response error is negative in both sessions;
+no stage/full-tail group improves MAE in both. No coefficient/default adoption.
+
+Retrospective oldM48W13/7+7 vsnewM12W2/6+6 at similar BG read pressure suggests
+additional configuration/history dependence, particularly W13 tails andM52 W2
+tail. M100 W2 tail stays close. This comparison varies task count, date and
+acquisition grid and cannot establish scalar-pressure insufficiency or hardware
+cause. A separately prepared fixed54-cell interleaved two-configuration design
+will test contemporaneous response; it retains same pressure-match thresholds
+but deliberately permits different team counts and does not retroactively
+change the original selection rules. Implementation and new measurement remain
+pending, as do dynamic full-plan and equal-budget planner acceptance.
+
+
+### Independent fixed-configuration implementation (Lab, 2026-09-15)
+
+receiver_configuration_contrast snapshots the validated collector/analysis
+structure without editing receiver_pressure_composition or its selection rules.
+The new CLI requires --design, verifies the frozen design and binds
+design_sha256 in raw metadata; fixed conditions areM12W2/6+6 andM48W13/7+7.
+Two formal seeds616421/616422 are disjoint from prior data. Its54-cell grid
+retains both FG stages/M52/100, solo, same-session BG-only and all timing/PMU
+controls. Different team counts are deliberate, so conclusions concern whole
+background configurations; no isolated task-count, M or stage attribution.
+The new evaluator permits this unequal-team pair while retaining pressure
+matching, support, finite-data and raw quality gates. Original same-team
+selection is unchanged.
+
+Four focused tests pass, including full two-session synthetic raw evaluation,
+28 paired block comparisons, consistent pressure, second-session drift,
+design tampering and rejection of old formal seeds. Old/new implementation
+origin hashes are retained. The independent90min fail-fast runner has an
+exclusive output directory and first gates a54-cell smoke. Remote synthetic integration now passes4 tests in3.48s and runner/design
+hashes match locally; no formal directory exists. Actual native smoke remains
+the first gated step of the prepared90min batch. New resource authorization,
+measurements and dynamic/planner acceptance remain pending. No calibrated response, T0 or native/default behavior changed.
+
+### Controlled background precondition protocol (Lab, 2026-09-15)
+
+The completed fixed-configuration contrast passed both raw quality checks and
+local JSON reanalysis parity. Queue-coordinate response improves W13 full/tail
+and W2 full blocks, but not W2 tails; no adoption. Retrospective same-A data
+show small solo changes and larger joint changes, with a repeated predecessor
+association at M100/W2. Association is not cache-residency identification.
+
+`receiver_precondition_control` holds native binaries, per-session allocations,
+foreground M52/M100 and W13/W2 fixed. Before every target window, execute a
+500ms background-only A=M12/W2/6+6, B=M48/W13/7+7, or idle precondition.
+The target is A-joint or solo; repeat its precondition before each member of
+an adjacent joint/solo pair. Reverse pair order on consecutive rounds and
+between formal seeds616431/616432. Preserve all PMU/block-timing controls and
+BG-only/idle targets:108 target plus108 conditioning windows per round.
+
+For precondition c, use the same-round signed block difference
+`Delta_c = T_joint,c - T_solo,c`; compare `median_round(Delta_c-Delta_A)`
+separately per M, stage and block history in each session. Validate actual
+sequence and conditioning native/window records before inherited per-context
+quality gates. No coefficients, T0, active model or planner defaults change.
+Foreground native lead-in remains >=64 calls; idle does not reset caches.
+This tests conditioning under this protocol, not continuous expert history.
+Local and target synthetic integration passed 12 tests. The approximately
+194-minute batch completed within its 210-minute limit. Smoke and both formal
+raw sessions passed all context quality gates; local independent reanalysis
+exactly matches the three analyses and all 112 comparison records after JSON
+normalization, with all 17 source/protocol hashes matching.
+
+For tail-4 blocks, paired B-minus-A increments in sessions 1/2 (us) are:
+M52/W13 -14.102/-14.955; M52/W2 4.805/13.809;
+M100/W13 -17.264/-13.108; M100/W2 40.112/38.501.
+This is descriptive conditional evidence, not an identified cache cost.
+BG-only read pressure also changes with precondition, and session 2 has lower
+read pressure but larger absolute tail increments under both A and B.
+Thus controlled immediate background history does not remove session drift;
+a universal history multiplier or pressure-only correction is not validated.
+No fitted coefficients or model defaults change. See the experiment record
+and receiver_precondition_control/formal/local_parity.json for evidence.
+Complete-plan and equal-budget planner gates remain open.
+
+### Fixed-schedule process repeat diagnostic (Lab, 2026-09-15)
+
+The completed receiver_restart_control experiment held the six-round
+schedule constant across four independent native-process sessions. Each session
+has three warmup rounds and twelve formal rounds, repeating the six-round
+schedule without restarting native processes between the two blocks. A/B
+background-only preconditions, all four foreground M/stage combinations and
+all PMU/timing controls remain; idle is not a conditioning state.
+
+Compare paired positions between the two blocks within a session, and unpaired
+node medians between sessions. Record native PIDs and reject reused process
+identities, duplicate session identifiers or incomplete schedules. Time and
+restart/allocation remain confounded across sessions; this diagnoses variability,
+not causal cache residency. Original quality thresholds remain unchanged.
+No cost-model coefficient or planner decision changes. Four short sessions
+must not be substituted for unseen-plan and equal-budget planner acceptance.
+
+All four sessions and the smoke passed the frozen acquisition gates. Local
+raw reanalysis exactly matches remote JSON for every session and the 224
+within-process / 336 between-session comparisons; source hashes match and all
+12 native PIDs are distinct. See receiver_restart_control/formal/local_parity.json.
+For B-conditioned M100/W13, summed block competition increments range from
+906.640 to 1004.158 us across sessions, while paired within-session block changes
+range from -2.633 to +6.132 us. BG-only read rates remain close (262.042–262.188
+GB/s). This is not independently measured whole-GEMM wall time and does not
+identify a restart or allocation cause. Tail-4 B-minus-A increments for M100/W2
+remain positive (40.880–47.304 us); M52/W2 does not retain one sign. Do not fit a
+universal history penalty or session label from these data. Next identification
+must control allocation within process or validate an independent reference
+calibration before continuous-trace and full-plan transfer. Model acceptance
+and equal-budget planner gates remain open.
+
+### Foreground allocation identity diagnostic (Lab, 2026-09-15)
+
+receiver_allocation_control adds a standalone foreground probe with one or two
+resident equal-content buffer banks. Bank selection occurs before a target
+window; the timed kernel loop is unchanged. Each result records bank count,
+bank identity, and all six virtual buffer addresses and sizes. Buffers are
+4096-byte aligned, which differs from the original vector allocator and must
+be checked using a one-bank control before attributing changes to switching.
+Additional resident memory and physical placement remain possible confounders.
+Virtual address identity is not a physical cache/DRAM mapping measurement.
+
+Native validation covers all previously supported foreground shapes, both
+stages, both timing modes, invalid bank commands, and switch-return address
+stability/nonoverlap. The paired collector now shares two background processes among three resident
+foreground actors (old, new single-bank, new dual-bank), retaining eight
+precondition/variant contexts and bank-aware raw checks. Its 160 targets per
+round each retain independent 500 ms A/B preconditioning, matched solo/joint,
+and the original instrumentation gates. All actors remain resident, so the
+extra memory footprint is a stated experimental condition. Two twelve-round
+sessions with three warmups are bounded by a 180-minute runner. Real smoke
+passed all eight-context gates with exact independent raw-analysis parity;
+maximum PMU/timing perturbations were 0.601%/0.541%. Formal acquisition is now
+started; no formal repeatability or model acceptance claim is available. This diagnostic does not add a model parameter or authorize
+using bank/session labels as planner features.
+
+### Full-load window table and window-aware quick cost (Lab, 2026-09-19)
+
+Scope: Arm-codex NUMA3 80C, TP4 H=4096 F=512, SVE BF16 $\nu=16$, protocol
+producer-hot A / cold B. Default dispatch is unchanged.
+
+**Table.** For width $t\in\{2,4,8,16\}$ and uniform $M$, all lanes run the same
+window at full load. The candidate policy `ARM_CODEX_NUMA3_80C_TP4_F512_N16_V3` stores,
+per route band and width, the chosen $(\omega_{13},\omega_2)$ and the measured ratio
+$r(t,M)=T(M,t,\omega)/T(M,t,\text{full})$. V3 is measured with jemalloc preloaded and
+purging disabled (`tmp/jemalloc_rerun_20260919`: the window grid, then a W2 sweep at
+W13 = 1 tile, composed by the V2 procedure). $M\le16$ is DRAM bound and keeps the full
+stripe. For $t=2,4$ a 1-tile W13 window wins at every $M$ from 24 to 720 ($r$ 0.61--0.83
+for 2T, 0.73--0.97 for 4T); W2 windows of 4--8 tiles help at small $M$ (2T $-14\%$,
+4T $-7$ to $-11\%$ vs W2 full at $M\le48$) and stay neutral to helpful at large $M$
+(2T $-2$ to $-5\%$ at $M$ 288--720). $t=8$ windows $M$ 24--480 ($r$ 0.85--0.97);
+$t=16$ only $M=24$ (0.92) and $M=48$ (0.97). The constant is not registered in
+`_POLICIES`.
+
+V1/V2 (`tmp/window_table_20260918`, `tmp/w2_window_20260919`) were measured under
+glibc, where Plan V2's per-call FP32 route output page-faulted and was zeroed on every
+call (v1.104); jemalloc times are 17--44% lower at $M\ge48$. That cost hid most
+large-$M$ window gains (V2 kept W13-only or full at $M\ge236$ and 8T full at
+$M\ge372$), produced the W2 large-$M$ penalty (up to $+7\%$) that is absent under
+jemalloc, and caused the first-session $M=24$ bimodality. It also moved the full-stripe
+best width to 8T; under jemalloc it is 16T for $M\ge48$, and with V3 windows the fastest
+width is 2T at $M$ 12--48 and 720, 4T at 96--144, 8T at 192--480 (within 0.2--4%).
+
+**PMU mechanism check** (glibc allocator; `tmp/window_pmu_20260919`, 2T/4T, $M\in\{24,96,288,720\}$). The full
+stripe re-streams B from DRAM about once per 12-row M panel while the concurrent stripes
+exceed the LLC: 2T reads 1.9/5.8/14/29 $\times B$ per call (panels 2/8/24/60). A 1-tile W13
+window cuts DRAM reads by 27--75% and raises the L3C hit rate (2T $M=96$: 0.20 to 0.67);
+L2 refill falls only 0--9%, so the gain is at the LLC/DRAM level, not L2. The cost is A13
+rescans per window: at $M\ge288$ the windowed plan still reads 1.8--11 $\times(B+A_{13})$, and
+DRAM savings turn into time sublinearly. The W2 window's large-$M$ loss is not explained by
+A2 rescans (A2 fits L2); it coincides with 15--30% more DRAM writes. Total DRAM writes
+(about 120--200 KiB per route) and an L2-refill-only bimodality at $M=24$ remain unexplained.
+
+**Cost.** `IntervalPlanner(stage_window_policy=...)` is opt-in. With a policy carrying
+`time_scales`, every quick/shared/LPT task cost becomes
+
+$$
+T^\ast(M,t)=T_{iso}(M,t)\,r(t,M),
+$$
+
+and lowering emits the same table windows. $r=1$ outside the table, for stage planners
+and for policies without scales, so the Amazon V5 table and all defaults are unchanged.
+The event model (`dag_makespan`, full search) remains window-blind.
+
+**Validation (failed).** On six untouched routed layers (requests 008/016/022, layers
+12/29; `tmp/window_validation_20260918`), every layer has one hot expert with $M$
+1086--1984, so homogeneous quick stays at 16T/8T and the table changes it by at most
+2%. With heavy-pinned heterogeneous shapes (hottest expert first on a 16T/32T lane,
+the rest on 4T/8T/16T lanes), the fastest measured variant beats the current quick
+choice by 2--15%, and windows contribute 0.5--5% of that (9% for `p16_r4` on r022 L12).
+But the $T^\ast$ argmin passed the frozen gates only on 3/6 (G1: >=3% faster than the
+baseline), 2/6 (G1w: windows attributable) and 1/6 (G2: within 3% of the fastest), and
+was 4.6--6.8% slower on r008 L29. Predicted levels are 25--40% low and the per-layer
+Spearman is 0.15--0.92: the isolated-LPT quick cost cannot rank pinned wide-lane plans.
+Decision: no planner or default change; the table stays an opt-in candidate. Pinned
+hot-expert shapes are the larger lever but need a cost model that ranks them.
+Under jemalloc the same frozen plans and gates give G1 0/6 (the pick is 4--8% slower than
+the baseline on the three layer-29 workloads), G1w 3/6 and G2 1/6; the fastest variant
+beats the baseline by 2--10%, still pinned or windowed. The conclusion is unchanged.
+
 ## 10. 同步规则
 
 
@@ -6130,6 +9020,148 @@ partial order、top-K recall 与 false-pruning replay，只有这些门槛通过
 4. 下方变更记录。
 
 ## 11. 变更记录
+
+- 2026-09-11：增加等宽team max-min服务分配对照，固定原参数冻结M4/M8前瞻验证；默认仍为比例分配。
+
+- 2026-09-11：启动联合资源模型，新增真实路径逐样本基线/间隙审计与独立会话复测；冻结完整泛化验收目标，模型与planner仍在后续阶段。
+- 2026-09-11：新增六条块级非线性竞争响应，冻结成本及首12锚点，补M8需求；
+  新鲜留出增量改善但绝对完成仍回退，保留实验候选，不切换整体基线。
+
+- 2026-09-10：冻结响应完成跨M与真实链式动态重叠验证；M8失准、M13/M48增量
+  偏差相反，记录完成时间抵消现象，不重拟合、不切换planner基线。
+
+- 2026-09-10：固定完整路径成本与需求表，只拟合8T/M12竞争响应；第二轮需求
+  特征优于等预算任务数，保留混合局部回退及动态迁移未验证范围，不切换基线。
+
+- 2026-09-10：新增8T分阶段/形状/复用状态的DRAM需求测量与区间表，记录路由
+  对照未稳定复现、W2波动及独立需求不等于联合减速，不自动接入planner。
+
+- 2026-09-10：完成8T单expert真实完整路径桥接，第二轮及同M跨输入验证；
+  完整标定改善小幅基线误差，保留联合竞争待验证与M12波动，不切换基线。
+
+- 2026-09-10：实验性拆分8T完整块/精确尾块基线与限定竞争增量，完成第二轮及
+  固定真实trace验证；记录W13/M12迁移回退和竞争零命中，保持当前基线。
+
+- 2026-09-10：完成实际1MiB/512KiB owner stripe的协同8T历史/尾块采集，
+  记录行形状依赖和线程到达偏斜；尚未将数据回拟合模型。
+
+- 2026-09-10：无team倍率新版显式加入16T gather延迟，记录阶段留出和固定计划
+  改善及剩余排序错误；不改1T operator、不引入重复竞争放大。
+
+- 2026-09-10：新版Lab移除所有宽窄team残差倍率，保留资源竞争；用固定计划
+  揭示小M kernel低估、operator残差补偿与16T gather/间隙缺项。
+
+- 2026-09-10：完成修正版M1/1T局部响应的同预算planner实验，高偏斜实测提速但
+  共同计划排序仍错误，记录候选集变化与外推范围，不切换当前基线。
+
+- 2026-09-10：完成冻结修正版历史3/6和比例12/26、26/12前瞻验证，记录较小但
+  持续的比例方向偏差；模型参数及planner均未改动。
+
+- 2026-09-10：先补纯竞争历史2/4，再固定纯背景拟合混合残差；记录第二轮留出、
+  逐点回退与表格拟合的泛化限制，无竞争和planner基线不变。
+
+- 2026-09-10：完成冻结混合修正的新比例/历史2、4前瞻验证；记录纯竞争插值与
+  混合残差两类失败，未将验证集回用于拟合或切换planner。
+
+- 2026-09-10：冻结无竞争/纯竞争曲线，新增有界19+19混合历史增量，记录第二轮
+  回顾性验证与未测混合比例限制；planner基线不变。
+
+- 2026-09-10：冻结六类无竞争曲线，仅重拟合M1条件竞争增量；记录36点回顾性
+  留出、混合背景剩余低估和零竞争不变约束，未变更planner基线。
+
+- 2026-09-10：实现六个参数化kernel历史函数及完整块/尾块组合；补测精确行数
+  与完整panel历史，显式区分无背景验证和未验证的热状态压力交互。
+
+- 2026-09-10：增加有代理下界和基线等式约束的有效部分重叠 Lab 原型；冻结
+  奇数M/纯背景拟合，报告混合压力组合仍低估，不导出生产模型。
+
+- 2026-09-10：完成M1–11/W13/W2统一可控竞争网格，固定核数对照M2/M120背景，
+  保留两轮完整减速响应与负控制；不拟合计算/访存比例或修改模型。
+
+- 2026-09-10：增加统一 mean-best 的新旧模型共同计划精度与所选计划实测对照，
+  固定原评分池，复用相同 bridge 的证据并补测 high-skew 顺序差异。
+
+- 2026-09-10：根据用户决策将 Lab full/strict CLI 默认设为新模型与 mean-best
+  选择；保留显式 fallback 对照，生产选择器不变。
+
+- 2026-09-09：增加冻结新模型评分池的 fallback/mean-best Lab 对照，逐项核对
+  422个有序 DAG 与完整 ranking，保持生产选择器和模型不变。2026-09-10完成
+  配对实测，high-skew改善22.93%、median改善12.55–16.18%，uniformish计划不变。
+
+- 2026-09-09：增加新旧冻结模型的等预算 full/strict 搜索 Lab 对照方法；重新生成
+  三条 route 的模板/顺序候选，核对实际 DAG 调用、冷搜索重复与关闭 early merge
+  的硬件选择结果。生产 planner、候选空间、calibration 和 kernel 均不变。
+
+- 2026-09-09：新增完整块/历史相关尾块 Lab 公式与回顾性验证；独立基础成本改善，
+  真实联合 M13/M35仍有残差；生产模型不变。
+
+- 2026-09-09：新增核数压力完整 MoE Lab 外推适配器，对46个历史方案样本进行
+  不拟合回放，原模型预测零漂移。整体 MAE3.733→1.143ms，但 uniformish 退化，
+  选型损失需单列；生产模型、校准与剪枝不变。
+
+- 2026-09-07：按序固定workspace实验profile/身份隔离、同场确认anchor/elite、评估冻结v8
+  误差、独立确认median smoothing。实验anchor更新为median2ab和high-skew189（61保留），
+  uniformish不变；smoothing相对旧anchor约2.5%但不优于新elite，未采用。无公式拟合或新
+  物理项，旧偏序仅诊断不授权硬剪枝；生产默认不变，容量增长仍低优先级。
+
+- 2026-09-07：workspace方法补测46个旧VND/LNS代表plan共8场。greedy insertion出现稳定
+  3.350/3.377%收益；median2ab43572仍是实测best且旧偏序标candidate_worse；high-skew
+  LNS elite仍有效，uniformish仅对弱parent有效。绝对MAPE与增益误差需分开评估，不拟合。
+  同时核实冻结backend_n_tile实际为16，旧workspace文档中的8为笔误，运行几何未变。
+
+- 2026-09-07：8份历史order/交错相关frontier在workspace下完成16场无插桩回放。
+  6个历史稳健正收益只保留median block一个，两个旧2% winner不再过gate。
+  median smooth在一组过gate、同计划另一组未全过，待确认；38唯一计划对的冻结相对增益
+  MAE诊断由5.128pp变3.591pp，仍有预测+12.041%而实测-3.282/-2.430%的反例。
+  无重新拟合、候选生成、自动anchor替换或生产默认变化。
+
+- 2026-09-07：固定workspace无插桩复测两条完整transfer frontier，各两场7计划，无通过原
+  双场2%门槛的候选。high-skew跨域relocation由约-6%变持平，同域swap/relocation仍约
+  -6.6%/-13%；保留anchor，分离两种输出生命周期证据，不重新拟合模型或变更剪枝。
+
+- 2026-09-07：Lab固定max_tokens route workspace预分配并触页一次，独占lease、超容量拒绝；
+  NaN覆盖正确性通过。两场steady-state收益anchor3.078/3.382%、transfer8.2–8.7%，
+  初始化8.049/8.176ms单列。无模型、计划或生产默认变化；增长为低优先级TODO。
+
+- 2026-09-07：输出预触诊断在两场中将M164 head W2从2.804/2.876ms降至0.539/0.542ms，
+  预触之外minor faults中位数为1；完整清零自身9.1–9.3ms使inclusive时间回退17–22%。
+  该异常优先归为输出first-write/page-state混杂，不用旧总residual拟合权重竞争项。
+  不改公式、workspace生命周期或生产默认，保留Lab对照等待独立workspace验证。
+
+- 2026-09-07：同宽transfer双trace各两场、每场7计划完成，输出一致且配对验证通过。
+  median同域swap收益0.750/0.576%，未过2%；high-skew模型最佳代表实测回退5.8–13.2%。
+  保留原anchor，不改公式或pruning；下一步仅对现有artifact复查isolated lane-load变化。
+
+- 2026-09-07：Lab `transfer`按同域/跨域各采样swap和relocation，每类最多1024次尝试、
+  24唯一候选；仅同宽、完整单域且非空lane，relocation不清空source。保留全部task元数据、
+  CPU/width/window/merge，以新lane序列重建依赖。四类各保留model-best，剩余两槽按family
+  顺序保留最大位置距离代表，最多6候选加anchor。记录完整state与affected-lane context。
+  v8只提供评分，不拟合、不自动接受/剪枝；双session硬件gate尚待验证，生产默认不变。
+
+- 2026-09-07：增加最新已测anchor输入校验与interleave/extended共享union对照，单策略
+  cap不变，union显式cap13；生产默认与模型公式不变。
+
+- 2026-09-07：分两阶段加入opt-in交错模板和更广顺序变换，保留旧模式及7计划预算；
+  仅离线候选生成，无新硬件性能或生产采用结论。
+
+- 2026-09-07：记录E60/10x8T合成M梯度和集中/交错实测验证；收益不随平均DDR压力单调，
+  不改变cost-model公式或生产选择策略。
+
+- 2026-09-07：新增GEMM平均密度均匀/非均匀直接对照，保持工作/时间和生产模型不变。
+
+- 2026-09-06：新增isolated phase offered-rate二阶矩驱动的有预算顺序proposal实验；
+  仅生成候选，包含增峰与大小交替对照，不作为cost-model修正或pruning依据。
+
+- 2026-09-06：增加硬件winner周围的单层order-only Lab扩展，固定lane归属及72评分/7硬件
+  计划预算；模型公式和生产neighborhood保持不变。
+
+- 2026-09-06：新增独立离线双候选freeze/dedup/measure/winner流程，明确session一致性与
+  actionable分离；复用已知三trace证据，不改生产默认或v8公式。
+
+Context residual opening (2026-09-05): 独立 Lab candidate 增加冻结 v8 event baseline 上的
+23-feature ridge residual、identity 校验、parent/group-disjoint replay 与范围外诊断。
+不修改 physical calibration、Plan V2、production 或搜索评分/剪枝；首次实验与后续决定见
+`optimizations/fused_moe_sve/results/context_aware_residual_experiment_20260905.md`。
 
 | 日期 | 版本 | 变更 |
 | --- | --- | --- |
@@ -6315,3 +9347,38 @@ partial order、top-K recall 与 false-pruning replay，只有这些门槛通过
 | 2026-09-06 | v1.80 | 在冻结2-restart N=25路径上审计五个实测快plan的丢失阶段，不改sampler、selector、K或production。full parent `98a32da5...` 的 `lns_00_r00`/`lns_00_r01` 枚举表明五者都可达；`0418b884...`/`7cac2afd...`/`1faf090a...` 的seed间丢失是operator内shuffle-truncate，不是预采样缺失；`2ab43572...` 进入scoring后排在parent top32之外。Lab候选 `structural_coverage_then_random_v1`（`275dd663...`）与baseline同shuffle，design replay不恢复sampling-lost hash，不接入生产抽样，不开Task 5硬件。完整记录见`optimizations/fused_moe_sve/results/template_lns_cursor_todo.md`。 |
 | 2026-09-06 | v1.81 | Lab候选 `structural_coverage_closure_width_v1`（`e5a35b06...`）在同一shuffle上按`(closure_bin, width_histogram)`做coverage。冻结模型 `9b334b78...`/`cc53d43d...` 的full-parent回放相对N=25 shuffle-truncate：seed `20261010` 丢掉已抽中的 `0418b884...`，五个tracked hash中没有任何sampling-lost成员被恢复；`(bin,hist)` key覆盖在24/24 operator cell上升。判定reject，不改 `sample_template_lns_neighborhood`、selector、K，不开Task 5。完整记录见`optimizations/fused_moe_sve/results/template_lns_cursor_todo.md`。 |
 | 2026-09-06 | v1.82 | 冻结full-parent critical cross-domain d4 参考池：shipped枚举、全局canonical去重后再滤该operator。四个保存的critical输入hash集合相同，unique 452，digest `a10eeba6...`。`0418b884...`与`2ab43572...`均在池内；加四个reconstructed control后去重为456。历史session只测到11/452。诊断预算约541 s/场、两场约1083 s，超出既有80 LNS-candidate槽，不改N=25/K=16/64+16。Task 6B未授权，Task 5关闭。完整记录见`optimizations/fused_moe_sve/results/template_lns_cursor_todo.md`。 |
+| 2026-09-06 | v1.83 | 在已拒绝的 count-6 proxy 网格上做事后 planner-visible geometry：\(n_B\sqrt{t}\)、冻结 v8 isolated peer W13/operator core-ms，以及 \(a n_B+b n_{\text{threads}}\)，不用实测 overlap。原门槛下全部失败，斜率漂移 \(26.9\%\)--\(62.4\%\)；同一 8x2T plan 的 queue 为 \(48.17/29.14\) cycle。不改公式、不读旧 holdout、不替换 v8。完整记录见 `optimizations/fused_moe_sve/results/arm_codex_80c_stream_pressure_plan_geometry_proxies_20260905.md`。 |
+| 2026-09-06 | v1.84 | 按原 proxy-grid 协议在 Arm NUMA3 加测三场（seed `20260926/27/28`）。8x2T 配对 queue 中位为 \(12.58/32.19/27.89\) cycle，与历史 \(48.17/29.14\) 一起跨度 \(12.58\)--\(48.17\)。三场均非独占（`bench_meformer_`、`tokio-rt-worker`）。不改公式、不冻 queue、不替换 v8。完整记录见 `optimizations/fused_moe_sve/results/arm_codex_80c_stream_pressure_queue_repeat_20260906.md`。 |
+| 2026-09-06 | v1.85 | production quick 齐次宽度比较改用已校准 wide-team occupancy 代理：LPT packing 仍用孤立 $T_{iso}$，makespan 乘 $B_t+(S_t-B_t)q$，与 placed event 的 peer fraction 一致。冻结 v8 表已含 $B_t/S_t$，此前只在 heavy event 生效。不改 Plan V2、kernel、ABI、$T_{iso}$ 公式或 LNS。无表时系数为 1。这只针对过宽齐次队，不恢复局部邻居序。 |
+| 2026-09-06 | v1.86 | Arm NUMA3 5 warmup/31 pair/4 copy 复测 quick 对 fixed 8T。active-set-8/16 不再选 40T，配对 `-0.03%/+0.30%`，关闭原 40T 回退；active-set-64/128 与 tiered 过窄到 20x4T，稳定亏损 `11.90/10.92/14.25%`；bimodal 仍为 5x16T 且 `+30.26%`。quick 仍不支配 fixed 8T。完整记录见 `optimizations/fused_moe_sve/results/arm_codex_80c_quick_vs_fixed8_wide_team_20260906.md`。 |
+| 2026-09-07 | v1.87 | Lab workspace 阶段候选清零 operator residual，独立拟合 gather/W13/W2；第一场拟合、第二场重复，M1 不拟合。拟合点阶段误差下降但 M1/1T 外推失败，拒绝采用，2/4T 不外推。156 个完整 placed 消融定位 wide-team pressure 为大 M/16T 过度放大的主要模型来源，同时保留 narrow/DRAM 的小 M/1T 反例。v8、production、搜索域和剪枝不变。报告：`optimizations/fused_moe_sve/results/workspace_phase_reaccount_ablation_20260907.md`。 |
+| 2026-09-07 | v1.88 | 完成36-cell 小 M/2T/4T isolated 网格与6场3126-call校验；修复中间 task 移到 head 后旧后继未接回前驱的 Lab 依赖错误，失败数据不参与分析。M7 不拟合，M1 保护保留。Affine GEMM 通过已测 M1 guard 与 M7 GEMM 20%检查，硬 floor 仍高估 M1/1T；但 gather 留出失败且部分 intercept 跨场不稳定，整套候选不合格，不替换 wide/narrow，不改 production/schema/剪枝。报告：`optimizations/fused_moe_sve/results/workspace_floor_identification_20260907.md`。 |
+| 2026-09-07 | v1.89 | 完成冻结 v8 A/B/C 账单与28次 workspace placed 回放。A 已按 owner 计费，M1341/16T steady B 下层 refill 已为0；M1 A payload 与 cache-line footprint 不同，L2-hit delivery 与 LLC refill 尚需独立核对。Lab 容量安全 lifetime 分配虽将 compute-end MAPE20.24%降至13.01%，但 M1/1T 阶段 MAPE38.79%恶化到66.72%，且 median elite 顺序仍错，拒绝替换。保留有界诊断参考，不改 production、schema、校准或剪枝。报告：`optimizations/fused_moe_sve/results/ab_supply_ledger_overlap_20260907.md`。 |
+| 2026-09-07 | v1.90 | Lab区分A payload/line coverage/refill估计与未识别实际A/B refill，核对B-only endpoint探针；独立私有L2供给下界与LLC/DRAM refill，保留原burst服务，不用phase平均。35形状与42次workspace回放中私有下界仍被compute隐藏；整体MAPE20.24%→20.39%、M1阶段38.79%→38.71%，排序未改善，不采用。旧probe的共享B与无逐轮scrub条件限制仍显式保留，不改v8、production/native/schema/剪枝。报告：`optimizations/fused_moe_sve/results/burst_private_endpoint_20260907.md`。 |
+| 2026-09-08 | v1.91 | 将已有isolated证据限定到1/2/4T的29形状、87阶段点，复现无operator residual的独立affine候选，启动/compute/暴露供给单列，不引入并发。M1 W13/W2平均误差降至3.28%/3.72%，但M7 W13恶化至10.13%；gather历史验证仍失败。M1/2T两场gather中位13/29us对任意固定预测的观测误差下界38.52%，相同ceil特征亦有冲突。只保留stage-only估计器，拒绝T_iso/planner导出；不换校准、不部署。报告：`optimizations/fused_moe_sve/results/small_t_isolated_stages_20260908.md`。 |
+| 2026-09-08 | v1.92 | Lab exact-M W13×1/2/4T两场99-cell网格，第一场peers0拟合条件B-only响应，两场peers4/8验证MAPE2.008%，同缓存lookup2.252%，仅3/12门槛通过。冷isolated同shape跨场lookup误差0.437%对v8 7.499%；固定计算/访存占比未被识别，保留未见M基准验证方向，不扩W2、不部署、不改剪枝。报告：`optimizations/fused_moe_sve/results/kernel_joint_response_20260908.md`。 |
+| 2026-09-08 | v1.93 | Lab M1/M12访存压力曲线：0–16 reader、1/2/4T、两场84-cell×31轮。最高档DDRC读流量72–76GB/s、1T B-only变慢25.6%；M1约变慢33/13/10%，M12仅约1–1.7%，未覆盖两场均>2%的转折。区分实测小幅损失、操作门槛与未知物理瓶颈；不拟合拐点、不改模型或剪枝。报告：`optimizations/fused_moe_sve/results/memory_pressure_curve_20260908.md`。 |
+| 2026-09-08 | v1.94 | Lab条件供给响应：第一场拟合与六档LOPO选型、冻结双anchor预测第二场，六组均选择linear。M1第二场MAPE0.896%/max1.871%，M12为0.140%/0.690%，优于isolated常数。阈值收益不足或不稳定；明确历史回放、实测供给输入和轻微外推限制，不部署、不改剪枝。报告：`optimizations/fused_moe_sve/results/pressure_response_fit_20260908.md`。 |
+| 2026-09-08 | v1.95 | 冻结响应采集新3/6/10/14 reader两场，M1主验证MAPE0.749%/max2.347%，M12为0.194%/0.445%；11/12 shape/session门槛通过，首场M12/1T略劣于isolated基线。0/16控制不混入主评分，不重设双anchor、不拟合新数据、不改v8或剪枝。报告：`optimizations/fused_moe_sve/results/pressure_response_prospective_20260908.md`。 |
+| 2026-09-08 | v1.96 | 冻结响应换真实W13后台，两场60-cell×31轮，reader/无后台对照全过，真实背景仅5/12门槛通过。M1平均误差2.027%/max7.998%，M12平均误差0.664%劣于isolated0.247%；近等B-only的小/大后台造成M1/1T约8%配对差异。保留原模型及上下文反例，注明1T超拟合范围，不增加参数、不部署。报告：`optimizations/fused_moe_sve/results/real_kernel_background_20260908.md`。 |
+| 2026-09-08 | v1.97 | Lab补M1/1T A-only与AB加载骨架，B-only机器码精确匹配生产。两场18-cell×31轮真实大/小后台差34.77/29.29us复现，但A-only基本不变、AB反向快15us；full-no-store仍慢38.90/33.57us。否定直接加正A供给项的本轮解释，保留计算/加载交互方向，不拟合或部署。报告：`optimizations/fused_moe_sve/results/ab_supply_contrast_20260908.md`。 |
+| 2026-09-08 | v1.98 | Lab计算数量/依赖扫与无加载确认共4场。相同矩阵指令改用预置寄存器仍有后台差；去掉A/B加载差近0，换整数/NOP保持负差。额外backend等待与LLC路径变化相伴，局部定位为矩阵执行与访存共存损失，不声称唯一硬件端口/队列来源；模型冻结，无生产改动。报告：`optimizations/fused_moe_sve/results/m1_compute_issue_20260908.md`。 |
+| 2026-09-08 | v1.99 | Lab L1热A4KiB/B8KiB环形探针两场39-cell×31轮全部通过命中事件比门槛；流式matrix4大/小后台差33.82/35.31us，热版本仅+0.62/-0.53us且区间跨零。固定指令组合不足以解释原后台差；热matrix2仍不完全重叠，matrix8快于所选pure控制，禁止据此拟合单一发射端口系数。保留缓存供给/执行交互方向，冻结模型、公式与剪枝。报告：`optimizations/fused_moe_sve/results/l1_matrix_mix_20260908.md`。 |
+| 2026-09-08 | v1.100 | Lab实测分层供给候选仅用双LLC第一场same/other8/24/39拟合；训练count-LOCO选择queue+local+interaction。冻结预测第二场，留出16/32 MAPE/max1.54/4.18%，未训练balanced16/24/32为2.92/4.48%；高压力48/64/78外推11.70/15.57%失败。总体3.22%平均误差不豁免失败；输入为执行期间PMU，非plan-visible、非盲测或唯一物理分解。不重拟合holdout、不改生产v8/profile/剪枝。报告：`optimizations/fused_moe_sve/results/layered_measured_supply_20260908.md`。 |
+| 2026-09-19 | v1.101 | Lab：Arm-codex n_tile16 满载窗口表候选 `ARM_CODEX_NUMA3_80C_TP4_F512_N16_V1`（v1.102 起为 V2）（含每宽度实测时间比 $r(t,M)$，未注册为默认）；`IntervalPlanner` 新增显式 opt-in `stage_window_policy`，有 `time_scales` 时 task cost 为 $T_{iso}r$，默认、Amazon 表、schema 与 ABI 不变。六个未见层验证 G1/G1w/G2 仅 3/2/1 of 6 通过且一层慢 4.6--6.8%，不改 planner 默认。 |
+| 2026-09-19 | v1.102 | Lab：W13=1 tile 下的 W2 窗口满载扫描；W2 4--8 tile 只在 M 48--192（2T）/48--96（4T、8T）按冻结规则采用，M≥288 一律 W2 整条 stripe；候选表更名 V2，仍为 opt-in，默认不变。 |
+| 2026-09-19 | v1.103 | Lab：窗口机制 PMU 验证。整条 stripe 在并发 stripe 超过 LLC 时约每个 12 行 M panel 从 DRAM 重读一次 B；W13 1-tile 窗口使 DRAM 读减少 27--75%，L2 refill 仅降 0--9%，收益在 LLC/DRAM 层；大 M 代价是每窗口重扫 A13。W2 窗口大 M 变慢与 DRAM 写增加相伴，而非 A2 重扫。无表或 planner 改动。 |
+| 2026-09-19 | v1.104 | Lab：满载 DRAM 写归因。glibc 默认 + THP always 下，Plan V2 每次调用新分配的 FP32 `route_out` 每次缺页清零（M=720 写 22--29 GiB），常驻分配器配置无缺页且快 17--35%；jemalloc 默认会在调用间归还该内存，永不归还时等同常驻。此前满载实测与机器响应标定均包含此开销；模型公式与默认未改。 |
+| 2026-09-19 | v1.105 | Lab：jemalloc never-purge 下重跑四个窗口实验（`tmp/jemalloc_rerun_20260919`）。候选表以 V3 替换 V2（`ARM_CODEX_NUMA3_80C_TP4_F512_N16_V3`，同一构建流程）：2T/4T 在 M 24--720 均用 W13 1 tile，8T 扩到 M 24--480，16T 仅 M 24/48；glibc 期的 W2 大 M 惩罚与 M=24 双峰为缺页伪影。runtime_windows 结论保持（4T 窗口 vs 8T 全条带 −8.6%）；未见层验证 G1/G1w/G2 为 0/3/1 of 6，仍不改 planner 默认。V3 仍为 opt-in 未注册；公式与 schema 不变。 |
+| 2026-09-19 | v1.106 | Calibration：jemalloc never-purge 下重测 v8 中受 `route_out` 缺页污染的三层（wide-team $B_t/S_t$、1T/2T `by_width`、窄 team 修正），得到 v9（`arm_codex_numa3_80c_jemalloc`）；$S_{8/16/40}$ 下降 9--16%，闸门层留出实测/预测中位 0.898→0.984。服务速率、公式、schema 与默认消费方不变。 |
+| 2026-09-19 | v1.107 | Lab：探针校准的融合 event 模型 v10 候选。删除 v9 的 spill=1.0 DRAM 需求、DRAM 饱和稀释、$B_t/S_t$ 与窄 team 修正；孤立时间为 $(1+\varepsilon)\sum\tau_p+O(t)$（$\varepsilon=0.065$，$O=10+2.5t$ µs）；争用由四条探针实测曲线 $D_{LL},D_{LS},D_{SL},D_{SS}(t,n)$ 给出，phase 分装载/稳态，组合规则测量前冻结、无自由参数，整计划只作验证。实测争用集中在权重装载段之间（$D_{LL}$ 至 1.6--2.0，$D_{SS}\le1.03$）；单一硬件曲线的机理检验未通过，按宽度分档服务表报告。window 选择取 V3 表，时间尺度随模型超额在孤立收益与表值间线性过渡；$t_{over}=0.78$ ms 直接测得。开发整计划 regret@1 0--2.7%，wall/预测 1.03--1.10。production、Plan V2、默认消费方不变。M4 验收：W1 过、W2 差 0.003 个百分点未过（regret@1 最大 5.003%，@2 最大 3.4%）、S2 过、S1 未过（小 M 目标低估）；采用收窄声明，不开第二轮。 |
+| 2026-09-20 | v1.108 | opt-in 接入：`ProbeEventModel`（v10 作为 planner cost model，与 Lab 数值一致）、标定资产 `probe_event_v10_20260919.json`、`IntervalPlanner` 的模型 quick 比例钩子、模型目标 LNS `model_lns.py`（relocate/swap/split/merge/复合 repack/reorder，lane 限于单 LLC 域）。默认消费方、native planner、Plan V2 不变。效果实验 E1 设计冻结于 `tmp/v10_integration_20260920/decision.md`。 |
+| 2026-09-20 | v1.109 | Lab/opt-in：v11 标定（孤立校正、按 M 索引的稳态曲线、中 M 背景装载等价 $w(M)$，均由 P6 探针测得，组合规则冻结，无整计划拟合），`ProbeEventModel` 支持小数核计数与上述可选字段（v10 资产数值不变）；模型目标 LNS 增加 rebalance/recreate/阈值接受与多起点下降（P2 小实例全部达到精确最优）。E1 结果：v10 驱动搜索利用 2T 与中小 M 误差；E2 在新层上验证 v11。 |
+| 2026-09-20 | v1.110 | E2 验收：v11 + lane$\ge$4T 搜索为本工作的参照模型与搜索（18 个新层，17/18 实测最优，较生产 quick 快 13.2%，非 2T 计划 regret@1 中位 0%/最大 7.9%）；2T lane 按冻结规则移出搜索空间并记为限制（实测/预测 1.237，符号一致 0/18）。新增快速 planner `hot_wide_planner.py`（宽 lane 承载热点 + 4T 主体、按宽度负载系数、热点先行升序），模型目标下与 75 s LNS 相差 $-0.3\%$（中位）。默认消费方与 native 路径仍为 v8/v9。 |
+| 2026-09-20 | v1.111 | E3 验收（18 个新层）：参照搜索（v11 + lane$\ge$4T LNS 90 s）较生产 quick 快 12.87%（中位）、17/18 实测最优，10 s 搜索在其 0.61% 以内；快速 planner 快 9.63%（18/18）但落后参照 3.82%。三者实测/预测 1.094--1.100，说明差距为搜索深度而非模型误差；模板事件评分 0.6 个点（272 ms）、顺序模式 0.8 个点（98 ms）、负载再平衡 0 个点，其余为 lane 间相位错开。 |
+| 2026-09-20 | v1.112 | 生产接入：V3 window 表按 `machine_ids` 注册（该机器 lowering 默认带 window，实测 quick 快 1.61%）、`PlannedMoE` 增加 `hot_wide` 搜索模式、`MoePlannerRuntime` 增加 `event_calibration`/`search_mode` 与 `enable_moe_planner_fast`、`ProbeEventModel` 实现 T_iso 磁盘缓存接口。快速 planner 每层规划 1.85 ms（Python 预热）。native planner 路径未改。 |
+| 2026-09-20 | v1.113 | 候选 v12/v13：P7 测得背景 lane 宽度对争用的影响（2T 背景最重、16T 最轻）并作为超额因子；P8 在真实背景下检验组合，定位 2T 低估 18--49% 的两项成因，v13 令 2T lane 在所有 phase 计为装载，复现 P8 的 2T 格（中位 0.978）。E2 上 2T 计划 1.237→1.144、含 2T 的 regret 中位 6.07%→0。验收在 E5（新层）。 |
+| 2026-09-20 | v1.114 | E5 验收：v13 未过 W1/W2/W3（2T 计划实测/预测 1.281、regret 中位 11.95% 对 v11 的 4.45%、符号一致 0/18），按冻结规则保留 v11 为参照模型、2T 仍在搜索空间外。E5 第三次独立确认：$\ge$4T 搜索较生产 quick 快 9.97%、快速 planner 快 8.01%（均 18/18），两者与实测最优差 0.05% 与 3.03%。 |
+| 2026-09-20 | v1.115 | 标定域约束：模型给出 `calibrated_widths`(2--32T) 与 `reliable_widths`(扣除 2T)，tail-pool 候选与 LNS 默认宽度按可信集过滤。依据 E8：1T 池化任务实测为预测的 3.25--4.25 倍，使 tail-pool 计划慢 1.0--1.3 ms 而打分认为快 0.7--3.3%。新增路由切片移动(默认关闭)：54 个层上最热 expert/工作量下界比值中位 0.38、最大 0.44，切片无收益。 |
+
+Change record (2026-09-14, Lab): implemented predeclared matched block history/pressure interpolation and training-only extraction; zero/pooled-history controls, bounded domain, signed-delta and conditional-pressure limitations recorded. No active planner or production equation replacement.
