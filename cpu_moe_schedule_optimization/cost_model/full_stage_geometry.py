@@ -6,9 +6,13 @@ tiles. A tile is the smallest addressable unit because the packed layout is
 tile-contiguous and the microkernel's output tile is `n_tile` wide, so a window is
 always a whole number of tiles.
 
-The team consumes `threads * window_tiles` tiles per window, and the stage is
-covered by `ceil(total_tiles / range_tiles)` windows. The final window may be
-short; its tiles are spread over the team the same way a full window's are.
+Order (2026-09-20): ownership first, windows second. The stage's tiles are split
+across the team once, so every worker owns one contiguous stripe of
+`total_tiles / threads` tiles, and the worker then walks its own stripe in windows
+of `window_tiles` tiles. A worker therefore always touches one contiguous region of
+packed B, and the last window of a stripe is the only short one. The team still
+consumes `threads * window_tiles` tiles per pass, so the per-worker L2 footprint and
+the number of passes over A are the same as in the window-first order this replaces.
 
 Setting `window_tiles = tiles_per_worker(threads)` yields exactly one window, which
 is the `full_n_team_stripes` geometry: every worker owns one contiguous stripe and
@@ -68,35 +72,50 @@ class StageWindowPlan:
 
     @property
     def windows(self) -> int:
-        """`R`, the number of windows covering the stage."""
-        return _ceil_div(self.total_tiles, self.range_tiles)
+        """`R`, the number of window passes; the longest stripe sets it."""
+        longest = max((self.thread_stripe(tid)[1] for tid in range(self.threads)), default=0)
+        return _ceil_div(longest, self.window_tiles) if longest > 0 else 0
 
     @property
     def bytes_per_worker(self) -> int:
         return self.window_tiles * self.bytes_per_tile
 
+    def thread_stripe(self, local_tid: int) -> tuple[int, int]:
+        """`(begin_tile, tiles)` of the contiguous stripe this worker owns."""
+        return _split_evenly(self.total_tiles, self.threads, local_tid)
+
     def window_tile_span(self, window_index: int) -> tuple[int, int]:
-        """`(begin_tile, tiles)` for one window; the last one may be short."""
+        """`(begin_tile, tiles)` covered by the team in one pass.
+
+        The pass is the union of every worker's `window_index`-th window, which is not
+        contiguous once the stage is wider than one pass; the span reports its hull, and
+        `thread_range` is what the kernel iterates.
+        """
         if window_index < 0 or window_index >= self.windows:
             raise IndexError(f"window index out of range: {window_index} of {self.windows}")
-        begin = window_index * self.range_tiles
-        return (begin, min(self.range_tiles, self.total_tiles - begin))
+        ranges = [self.thread_range(window_index, tid) for tid in range(self.threads)]
+        active = [item for item in ranges if not item.is_empty]
+        if not active:
+            return (0, 0)
+        begin = min(item.begin_tile for item in active)
+        end = max(item.begin_tile + item.tiles for item in active)
+        return (begin, end - begin)
 
     def thread_range(self, window_index: int, local_tid: int) -> ThreadWindowRange:
-        window_begin, window_tiles = self.window_tile_span(window_index)
-        offset, tiles = _split_evenly(window_tiles, self.threads, local_tid)
-        return ThreadWindowRange(begin_tile=window_begin + offset, tiles=tiles)
+        stripe_begin, stripe_tiles = self.thread_stripe(local_tid)
+        begin = stripe_begin + window_index * self.window_tiles
+        remaining = stripe_begin + stripe_tiles - begin
+        return ThreadWindowRange(begin_tile=begin, tiles=max(0, min(self.window_tiles, remaining)))
 
     def idle_threads(self, window_index: int) -> int:
         """Workers that receive no tiles in this window."""
         return sum(1 for tid in range(self.threads) if self.thread_range(window_index, tid).is_empty)
 
     def starves_any_thread(self) -> bool:
-        """True when some window leaves a worker with no work.
+        """True when some pass leaves a worker with no work.
 
-        Only reachable through a short tail window: a full window holds
-        `threads * window_tiles >= threads` tiles. When `threads` divides
-        `total_tiles` the tail is a multiple of `threads`, so this is always False.
+        With ownership first this only happens when a worker's stripe is shorter than
+        the longest one by a whole window, or when there are more workers than tiles.
         """
         return any(self.idle_threads(index) > 0 for index in range(self.windows))
 

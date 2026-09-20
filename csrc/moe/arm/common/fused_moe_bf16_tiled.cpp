@@ -357,28 +357,52 @@ struct StageWindowPlan {
   int64_t threads = 1;
   int64_t window_tiles = 0;
 
+  // Tiles the team consumes per pass; the per-worker L2 footprint is window_tiles.
   int64_t range_tiles() const { return threads * window_tiles; }
 
-  int64_t windows() const { return range_tiles() > 0 ? ceil_div_int64(total_tiles, range_tiles()) : 0; }
+  // Ownership comes first: every worker owns one contiguous stripe of the stage.
+  SplitRange thread_stripe(int64_t local_tid) const { return split_evenly(total_tiles, threads, local_tid); }
 
-  // Tile span of one window; the final window is short when the range does not
-  // divide the stage.
-  SplitRange window_tile_span(int64_t window_index) const {
-    if (window_index < 0 || window_index >= windows()) {
-      return SplitRange{};
+  // Passes over the stripes; the longest stripe sets the count, shorter ones end early.
+  int64_t windows() const {
+    if (window_tiles <= 0 || threads <= 0) {
+      return 0;
     }
-    const int64_t begin = window_index * range_tiles();
-    return SplitRange{begin, std::min(range_tiles(), total_tiles - begin)};
+    int64_t longest = 0;
+    for (int64_t tid = 0; tid < threads; ++tid) {
+      longest = std::max(longest, thread_stripe(tid).size);
+    }
+    return longest > 0 ? ceil_div_int64(longest, window_tiles) : 0;
   }
 
-  // One worker's tile range inside one window.
+  // One worker's window inside its own stripe; only the stripe's last window is short.
   SplitRange thread_tile_range(int64_t window_index, int64_t local_tid) const {
-    const SplitRange window = window_tile_span(window_index);
-    if (window.size <= 0) {
+    const SplitRange stripe = thread_stripe(local_tid);
+    if (stripe.size <= 0 || window_index < 0) {
       return SplitRange{};
     }
-    const SplitRange local = split_evenly(window.size, threads, local_tid);
-    return SplitRange{window.begin + local.begin, local.size};
+    const int64_t begin = stripe.begin + window_index * window_tiles;
+    const int64_t remaining = stripe.begin + stripe.size - begin;
+    if (remaining <= 0) {
+      return SplitRange{};
+    }
+    return SplitRange{begin, std::min(window_tiles, remaining)};
+  }
+
+  // The hull of one pass: the union of every worker's window_index-th window. It is
+  // contiguous only when one pass covers the stage; the kernel iterates thread ranges.
+  SplitRange window_tile_span(int64_t window_index) const {
+    int64_t begin = total_tiles;
+    int64_t end = 0;
+    for (int64_t tid = 0; tid < threads; ++tid) {
+      const SplitRange range = thread_tile_range(window_index, tid);
+      if (range.size <= 0) {
+        continue;
+      }
+      begin = std::min(begin, range.begin);
+      end = std::max(end, range.begin + range.size);
+    }
+    return end > begin ? SplitRange{begin, end - begin} : SplitRange{};
   }
 
   // The same range in packed-B columns, which is what the kernel ABI takes.
@@ -400,8 +424,8 @@ StageWindowPlan make_stage_window_plan(int64_t N, int64_t n_tile, int64_t thread
   return StageWindowPlan{tile, total_tiles, team, resolved};
 }
 
-// Visit this worker's column range in every window, in window order. `fn` takes
-// the range and the window index, so a caller can treat the first window
+// Visit this worker's column range in every window of its own stripe, in order.
+// `fn` takes the range and the window index, so a caller can treat the first window
 // specially without recovering the index itself.
 template <typename Fn>
 void for_each_stage_window(const StageWindowPlan& plan, int64_t local_tid, Fn&& fn) {
@@ -416,11 +440,9 @@ void for_each_stage_window(const StageWindowPlan& plan, int64_t local_tid, Fn&& 
 
 // Visit the H ranges this worker is responsible for scattering.
 //
-// The owner path mirrors the W2 GEMM windows exactly. That matters once R > 1:
-// a worker then owns a strided set of tile runs rather than one contiguous
-// stripe, so scattering a single stripe would touch columns it never computed.
-// Mirroring is what lets this path skip the W2-to-scatter team barrier, because
-// a worker only reads back its own stores.
+// The owner path mirrors the W2 GEMM windows exactly, which is what lets it skip the
+// W2-to-scatter team barrier: a worker only reads back its own stores. Since ownership
+// now comes first, a worker's windows are consecutive inside one contiguous stripe.
 //
 // The non-owner path runs after a team barrier, so every column is visible and
 // any exact partition of N will do; it does not mirror the windows.

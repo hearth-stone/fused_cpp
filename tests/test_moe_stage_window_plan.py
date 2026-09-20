@@ -120,15 +120,26 @@ def test_windows_tile_the_stage_for_every_legal_window(stage, threads):
             assert all(cols > 0 for (_, cols) in window)
 
 
-def test_short_tail_window_can_starve_a_non_power_of_two_width():
-    """t=6, omega=7 leaves a 2-tile tail for 6 workers, only in the last window."""
+def test_uneven_width_keeps_every_worker_on_one_contiguous_stripe():
+    """t=6, omega=7 over 128 tiles: stripes 22/22/21/21/21/21, windows inside each stripe.
+
+    Ownership comes first, so a worker's windows are consecutive tiles of its own stripe and
+    only the workers with the shorter stripe run out of work in the last pass.
+    """
     n = _STAGES["w13"][1]
     windows, range_tiles, _, ranges = _stage_window_plan(n, _N_TILE, 6, 7)
     assert (windows, range_tiles) == (4, 42)
-    for window in ranges[:-1]:
-        assert all(cols > 0 for (_, cols) in window)
+    per_thread = [[(begin // _N_TILE, cols // _N_TILE) for (begin, cols) in (window[tid] for window in ranges)
+                   if cols > 0] for tid in range(6)]
+    sizes = [sum(tiles for _, tiles in thread) for thread in per_thread]
+    assert sizes == [22, 22, 21, 21, 21, 21]
+    for thread in per_thread:  # contiguous inside the stripe, in order
+        cursor = thread[0][0]
+        for begin, tiles in thread:
+            assert begin == cursor
+            cursor += tiles
     idle = sum(1 for (_, cols) in ranges[-1] if cols == 0)
-    assert idle == 4
+    assert idle == 4  # the four 21-tile stripes are done after three windows
 
 
 def test_stage_window_plan_rejects_illegal_geometry():

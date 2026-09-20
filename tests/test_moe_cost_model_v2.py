@@ -882,18 +882,27 @@ def test_power_of_two_widths_never_starve_a_worker(threads: int) -> None:
             assert not plan.starves_any_thread(), f"t={threads} omega={window_tiles}"
 
 
-def test_short_tail_window_can_starve_a_non_power_of_two_width() -> None:
-    """t=6, omega=7 leaves a 2-tile tail for 6 workers, only in the last window."""
+def test_uneven_width_keeps_every_worker_on_one_contiguous_stripe() -> None:
+    """t=6, omega=7 over 128 tiles: stripes 22/22/21/21/21/21, windows cut inside each stripe."""
     geometry = full_stage_geometry(k=4096, n=1024, n_tile=8)
     plan = geometry.window_plan(threads=6, window_tiles=7)
 
     assert plan.range_tiles == 42
     assert plan.windows == 4
-    assert plan.window_tile_span(3) == (126, 2)
-
+    assert [plan.thread_stripe(tid)[1] for tid in range(6)] == [22, 22, 21, 21, 21, 21]
+    for tid in range(6):
+        stripe_begin, stripe_tiles = plan.thread_stripe(tid)
+        cursor = stripe_begin
+        for index in range(plan.windows):
+            item = plan.thread_range(index, tid)
+            if item.is_empty:
+                continue
+            assert item.begin_tile == cursor
+            cursor += item.tiles
+        assert cursor == stripe_begin + stripe_tiles
     for index in range(plan.windows - 1):
         assert plan.idle_threads(index) == 0
-    assert plan.idle_threads(3) == 4
+    assert plan.idle_threads(3) == 4  # the 21-tile stripes end one window earlier
     assert plan.starves_any_thread()
 
 
@@ -1399,3 +1408,100 @@ def test_ep_rank_lifetime_switches_to_single_rank_profile(
     assert switched_result.compute_ms < conservative_result.compute_ms
     assert switched_result.compute_ms > min(rank.predicted_ms for rank in switched_result.rank_compute)
     assert switched_result.compute_ms == max(rank.predicted_ms for rank in switched_result.rank_compute)
+
+
+def _windowed_short_route_policy():
+    from stage_window_policy import StageWindowBand, StageWindowPolicy
+
+    return StageWindowPolicy(
+        name="test_windowed_short_routes",
+        hidden_size=1,
+        intermediate_size=1,
+        backend_n_tile=16,
+        bands=(
+            StageWindowBand(
+                min_routes=1,
+                max_routes=12,
+                w13_tiles=1,
+                w2_tiles=8,
+                widths=(1, 2, 4),
+                overrides={1: (0, 0)},
+                time_scales={2: 0.5},
+            ),
+        ),
+    )
+
+
+def test_window_time_scales_change_quick_width_and_lowered_windows() -> None:
+    experts = [(expert, 1) for expert in range(8)]
+    baseline = IntervalPlanner(_QuickPlannerModel(), num_cores=4, native_cold_planner=False)
+    windowed = IntervalPlanner(
+        _QuickPlannerModel(),
+        num_cores=4,
+        native_cold_planner=False,
+        stage_window_policy=_windowed_short_route_policy(),
+    )
+
+    unscaled = baseline.plan_quick(experts)
+    scaled = windowed.plan_quick(experts)
+
+    # Full stripe: 4x1T takes 2 x 10; windows halve 2T to 4 x 8 x 0.5 = 16.
+    assert unscaled["shape"] == (1, 1, 1, 1)
+    assert unscaled["bridge"]["task_w13_window_tiles"] == [0] * 8
+    assert scaled["shape"] == (2, 2)
+    assert scaled["makespan_ns"] == 16.0
+    assert scaled["bridge"]["task_w13_window_tiles"] == [1] * 8
+    assert scaled["bridge"]["task_w2_window_tiles"] == [8] * 8
+
+
+def test_window_time_scale_defaults_to_one_outside_the_table() -> None:
+    policy = _windowed_short_route_policy()
+    assert policy.time_scale(12, 2) == 0.5
+    assert policy.time_scale(13, 2) == 1.0
+    assert policy.time_scale(4, 4) == 1.0
+    assert policy.time_scale(4, 8) == 1.0
+    planner = IntervalPlanner(_QuickPlannerModel(), num_cores=4, native_cold_planner=False, stage_window_policy=None)
+    assert planner._task_time(1, 2) == 8.0
+    with pytest.raises(ValueError, match="time scale"):
+        type(policy.bands[0])(min_routes=1, max_routes=2, w13_tiles=1, w2_tiles=8, time_scales={2: 1.2})
+
+
+def test_arm_codex_n16_v3_candidate_pins_the_jemalloc_table() -> None:
+    """Spot-check V3 against tmp/jemalloc_rerun_20260919/table_v3.json; it stays opt-in."""
+    from stage_window_policy import ARM_CODEX_NUMA3_80C_TP4_F512_N16_V3 as policy
+    from stage_window_policy import default_stage_window_policy
+
+    assert default_stage_window_policy(hidden_size=4096, intermediate_size=512, backend_n_tile=16) is None
+    # Bands tile routes 17-720 without gaps; 1-16 and above 720 keep the full stripe.
+    assert [(b.min_routes, b.max_routes) for b in policy.bands] == [
+        (17, 33), (34, 67), (68, 117), (118, 166), (167, 235), (236, 371), (372, 587), (588, 720)
+    ]
+    for routes, threads in ((16, 2), (721, 2), (96, 1), (96, 32)):
+        assert policy.select(routes, threads) == (0, 0)
+        assert policy.time_scale(routes, threads) == 1.0
+    # (routes, threads) -> (w13 tiles, w2 tiles), time scale at grid points.
+    expected = {
+        (24, 2): ((1, 4), 0.6555),
+        (24, 8): ((1, 8), 0.8483),
+        (24, 16): ((1, 8), 0.9191),
+        (48, 16): ((2, 16), 0.9687),
+        (96, 4): ((1, 4), 0.8169),
+        (96, 16): ((0, 0), 1.0),
+        (288, 2): ((1, 0), 0.7789),
+        (288, 4): ((1, 4), 0.911),
+        (480, 8): ((1, 0), 0.9727),
+        (720, 2): ((1, 4), 0.8345),
+        (720, 4): ((1, 0), 0.9716),
+        (720, 8): ((0, 0), 1.0),
+    }
+    for (routes, threads), (windows, scale) in expected.items():
+        assert policy.select(routes, threads) == windows
+        assert policy.time_scale(routes, threads) == scale
+    # Every emitted window fits its stage (W13 64 tiles, W2 256 tiles at n_tile 16).
+    w13 = full_stage_geometry(k=4096, n=1024, n_tile=16)
+    w2 = full_stage_geometry(k=512, n=4096, n_tile=16)
+    for band in policy.bands:
+        for threads in band.widths:
+            w13_tiles, w2_tiles = band.select(threads)
+            assert 0 <= w13_tiles <= w13.total_tiles // threads
+            assert 0 <= w2_tiles <= w2.total_tiles // threads
