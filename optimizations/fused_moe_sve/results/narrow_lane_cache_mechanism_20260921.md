@@ -199,6 +199,36 @@ In the plans this would touch about a tenth of the work: weighting tasks by isol
 E5 reference runs 78.8% of its work at rho <= 0.2 but 10.2% above rho = 1, in the small experts
 the table cannot window and the wide lanes it leaves on full stripes.
 
+## v14: the correction improves levels and fails on ranking
+
+The mechanism was turned into a model (`probe_event_v14_20260921.json`, built by
+`tmp/footprint_model_20260921/build_v14.py`): the simulator tracks the weights each LLC domain
+holds live, and a table measured on P9's cells - the measured dilation over this model's own at
+that footprint and M, faded in with how busy the domain is - multiplies the composed dilation.
+The table is calibrated on probe cells only.
+
+Descriptively it works. Over the 588 measured plans of E3, E5, E6b, E11, E12 and E13, none of
+which entered the calibration, `measured / predicted` moves from 1.090 to 1.061, the median
+absolute deviation from 0.090 to 0.061, and the plans with at least a fifth of their work on 2T
+lanes from 1.112 to 1.031.
+
+E14 validated it on nine fresh layers with six plans each, two of them searched under each
+model with the same starts and seed (`tmp/footprint_validation_20260921/design.md`):
+
+| gate | v11 | v14 | verdict |
+| --- | --- | --- | --- |
+| W1 level (median measured/predicted) | 1.075 | 1.055 | pass, +0.021 against a 0.02 bar |
+| W2 ranking (Spearman, median) | +0.94 | +0.89 | fail |
+| W3 selection (regret@1 median/max) | 0.00% / 0.00% | 1.89% / 4.16% | fail |
+
+and the searched plans settle it: `lns_v14` measures 1.89% slower than `lns_v11` and wins none
+of the nine layers. **v14 is not adopted; v11 remains the reference model.**
+
+This is the same failure as v13: a correction that lowers the average error while changing the
+error's shape gives the search a new seam to exploit. The state variable is right - P9 shows the
+footprint, not the width, governs the dilation - but multiplying a homogeneous-cell ratio into a
+heterogeneous plan is not the way to spend it.
+
 ## What a fix would have to do
 
 Parameterize the contention state by the live weight footprint the LLC domain carries - the sum
