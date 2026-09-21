@@ -1569,3 +1569,48 @@ def test_arm_codex_n16_v4_pins_the_thread_major_table() -> None:
             w13_tiles, w2_tiles = band.select(threads)
             assert 0 <= w13_tiles <= w13.total_tiles // threads
             assert 0 <= w2_tiles <= w2.total_tiles // threads
+
+
+def test_every_registered_window_table_names_its_machines() -> None:
+    """A registered table must not resolve on shape alone.
+
+    A window table is a measurement of one machine's LLC domain geometry. The C5 table
+    carried no `machine_ids`, so every machine with H=4096, F=512 and n_tile 8 inherited
+    it - which is exactly C9g's TP4 shape, and that machine's own grid selects different
+    windows. The registry guard keeps a new table from reintroducing the leak.
+    """
+    import pytest
+    import stage_window_policy
+
+    for policy in _registered_policies():
+        assert policy.machine_ids, policy.name
+
+    unscoped = stage_window_policy.StageWindowPolicy(
+        name="unscoped",
+        hidden_size=4096,
+        intermediate_size=512,
+        backend_n_tile=8,
+        bands=(stage_window_policy.StageWindowBand(min_routes=1, max_routes=2, w13_tiles=1, w2_tiles=8),),
+    )
+    # Directly constructed policies stay usable; only registering one is refused.
+    assert unscoped.matches_machine("any machine")
+    with pytest.raises(ValueError, match="must name their machines"):
+        stage_window_policy._validate_registry((unscoped,))
+
+
+def test_amazon_c5_table_resolves_only_on_the_machine_it_was_measured_on() -> None:
+    """C9g TP4 is H=4096, F=512, n_tile 8 - the C5 table's shape on a different machine."""
+    from stage_window_policy import AMAZON_C5_192C_TP4_F512_V5 as policy
+    from stage_window_policy import default_stage_window_policy
+
+    shape = dict(hidden_size=4096, intermediate_size=512, backend_n_tile=8)
+    assert policy in _registered_policies()
+    for machine in policy.machine_ids:
+        assert default_stage_window_policy(**shape, machine_id=machine) is policy
+    for machine in (None, "amazon_c9g_192c_2numa_96c_sve128_tp4", "some_other_machine"):
+        assert default_stage_window_policy(**shape, machine_id=machine) is None
+    # C9g's other shape has no table at all, on any machine.
+    for machine in (None, *policy.machine_ids, "amazon_c9g_192c_2numa_96c_sve128_tp4"):
+        assert default_stage_window_policy(
+            hidden_size=4096, intermediate_size=1024, backend_n_tile=8, machine_id=machine
+        ) is None

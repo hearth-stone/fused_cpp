@@ -10,7 +10,8 @@ planner search dimension: the planner picks a width, then reads the windows off.
 
 `FULL_STRIPE` (0) means one window per worker, which is the `full_n_team_stripes`
 geometry. Route counts outside every band fall back to it, so an uncalibrated shape
-keeps the pre-window behaviour rather than inheriting a guess.
+keeps the pre-window behaviour rather than inheriting a guess. The same holds across
+machines: a table resolves only for the machines it was measured on.
 
 Windows are tile counts, not bytes. The runtime ABI carries tiles and
 `FullStageGeometry.window_tiles_from_bytes` is the only sanctioned byte conversion,
@@ -140,11 +141,21 @@ class StageWindowPolicy:
 #
 # 32 threads is deliberately absent: its stripe is already 4 tiles and every window
 # landed within 0.6% of it, inside the noise floor.
+#
+# `machine_ids` names the two NUMA0 calibrations this table was measured against. Without
+# it the table matched on shape alone, so every machine with H=4096, F=512 and n_tile 8
+# inherited it - C9g's TP4 shape is exactly that, and its own grid selects different
+# windows (`results/second_machine_c9g_20260921.md`). Window optimality is a property of
+# the LLC domain geometry, which does not transfer.
 AMAZON_C5_192C_TP4_F512_V5 = StageWindowPolicy(
     name="amazon_c5_192c_tp4_f512_v5_tiles",
     hidden_size=4096,
     intermediate_size=512,
     backend_n_tile=8,
+    machine_ids=(
+        "AmazonC5192Cores-numa0-sve-jit-thin-20260801",
+        "AmazonC5192Cores-numa0-sve-jit-hot-gemm-20260802",
+    ),
     bands=(
         StageWindowBand(
             min_routes=13,
@@ -372,13 +383,31 @@ _POLICIES: tuple[StageWindowPolicy, ...] = (
 )
 
 
+def _validate_registry(policies: Sequence[StageWindowPolicy]) -> None:
+    """Every registered table names the machines it was measured on.
+
+    A table is a measurement of one machine's LLC domain geometry, so a registered table
+    without ``machine_ids`` would resolve on shape alone and hand its windows to machines it
+    was never measured against. Directly constructed policies (tests, lab tables) are not
+    covered: they are passed to the planner explicitly rather than resolved by shape.
+    """
+    unscoped = [policy.name for policy in policies if not policy.machine_ids]
+    if unscoped:
+        raise ValueError(f"registered stage window policies must name their machines: {unscoped}")
+
+
+_validate_registry(_POLICIES)
+
+
 def default_stage_window_policy(
     *, hidden_size: int, intermediate_size: int, backend_n_tile: int, machine_id: str | None = None
 ) -> StageWindowPolicy | None:
     """The calibrated policy for this shape and machine, or None when none was calibrated.
 
-    A table measured on one machine (``machine_ids``) resolves only for that machine; tables
-    without the field resolve on shape alone, as before.
+    A table resolves only for the machines its ``machine_ids`` names, so an uncalibrated
+    machine keeps the pre-window full-stripe behaviour instead of inheriting another
+    machine's windows. Calibrating a new machine or a new shape therefore means registering
+    its table here; there is no shape-only fallback.
     """
     for policy in _POLICIES:
         if policy.matches_shape(hidden_size, intermediate_size, backend_n_tile) and policy.matches_machine(machine_id):
