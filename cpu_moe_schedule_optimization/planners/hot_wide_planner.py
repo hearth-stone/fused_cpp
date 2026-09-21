@@ -33,6 +33,24 @@ except ImportError:  # pragma: no cover - direct script import
 DEFAULT_LANE_SCALE = {4: 1.119, 8: 1.065, 16: 1.045, 32: 1.032}
 
 
+_UNSET = object()
+
+
+def _begins(tasks) -> tuple[int, ...]:
+    """Core offset of each lane, in the order the tasks introduce them."""
+    seen: dict[tuple[int, int], None] = {}
+    for _, _, core, threads, _ in tasks:
+        seen.setdefault((int(core), int(threads)), None)
+    return tuple(core for core, _ in seen)
+
+
+def _lanes_from_tasks(tasks) -> tuple[Lane, ...]:
+    groups: dict[tuple[int, int], list[tuple[int, int]]] = {}
+    for expert, routes, core, threads, _ in tasks:
+        groups.setdefault((int(core), int(threads)), []).append((int(expert), int(routes)))
+    return tuple(Lane(threads, tuple(members)) for (_, threads), members in groups.items())
+
+
 @dataclass(frozen=True)
 class HotWidePlan:
     lanes: tuple[Lane, ...]
@@ -59,6 +77,7 @@ class HotWidePlanner:
         max_wide_cores: int = 48,
         lane_scale: Mapping[int, float] | None = None,
         window_policy=None,
+        use_native: bool = True,
     ):
         if sum(domain_cores) != num_cores:
             raise ValueError("domain cores must cover num_cores")
@@ -68,7 +87,13 @@ class HotWidePlanner:
         self.bulk_width = int(bulk_width)
         self.lane_scale = dict(DEFAULT_LANE_SCALE if lane_scale is None else lane_scale)
         self.window_policy = window_policy
+        self.use_native = bool(use_native)
+        self.wide_widths = tuple(sorted(wide_widths, reverse=True))
+        self.max_wide_lanes = int(max_wide_lanes)
+        self.max_wide_cores = int(max_wide_cores)
+        self._native_planner = _UNSET
         self._cost: dict[tuple[int, int], float] = {}
+        self._raw: dict[tuple[int, int], float] = {}
         self._last_shape: tuple[int, ...] | None = None
         shapes = []
         for count in range(0, max_wide_lanes + 1):
@@ -82,6 +107,20 @@ class HotWidePlanner:
         if not shapes:
             raise ValueError("no template packs into the LLC domains")
         self.shapes = tuple(dict.fromkeys(shapes))
+
+    def raw_cost(self, routes: int, width: int) -> float:
+        """Isolated time scaled by the window table, before the per-width lane scale.
+
+        The native planner applies the lane scale itself, so it takes these values; caching them
+        here keeps both paths paying the same price for the model lookups.
+        """
+        key = (routes, width)
+        value = self._raw.get(key)
+        if value is None:
+            scale = 1.0 if self.window_policy is None else float(self.window_policy.time_scale(routes, width))
+            value = float(self.model.T_iso(routes, width)) * scale
+            self._raw[key] = value
+        return value
 
     def cost(self, routes: int, width: int) -> float:
         key = (routes, width)
@@ -127,6 +166,45 @@ class HotWidePlanner:
                 return None, load
         lanes = tuple(Lane(width, tuple(group[:1] + group[1:][::-1])) for width, group in zip(shape, members))
         return lanes, max(loads, default=0.0)
+
+    def _native(self):
+        """The C++ port of this planner, or None when the extension does not carry it."""
+        if self._native_planner is not _UNSET:
+            return self._native_planner
+        self._native_planner = None
+        if self.use_native:
+            try:
+                from fused_cpp import _moe_C
+            except Exception:  # pragma: no cover - no extension in this environment
+                _moe_C = None
+            factory = getattr(_moe_C, "NativeHotWidePlanner", None) if _moe_C is not None else None
+            if factory is not None:
+                self._native_planner = factory(
+                    num_cores=self.num_cores, domain_cores=list(self.domain_cores), bulk_width=self.bulk_width,
+                    wide_widths=list(self.wide_widths), max_wide_lanes=self.max_wide_lanes,
+                    max_wide_cores=self.max_wide_cores,
+                    lane_scale=[(int(w), float(v)) for w, v in sorted(self.lane_scale.items())],
+                )
+        return self._native_planner
+
+    def plan_native(self, experts: Sequence[tuple[int, int]]) -> HotWidePlan | None:
+        """The same plan from the native planner, or None when it is unavailable.
+
+        The costs cross the boundary as plain doubles - one row per width, before the lane
+        scale - so the native side holds no model state and the two paths score identically.
+        """
+        native = self._native()
+        if native is None:
+            return None
+        active = [(int(e), int(r)) for e, r in experts if int(r) > 0]
+        if not active:
+            raise ValueError("at least one active expert is required")
+        widths = sorted({w for shape in self.shapes for w in shape})
+        rows = [[self.raw_cost(routes, width) for _, routes in active] for width in widths]
+        result = native.plan([e for e, _ in active], [r for _, r in active], widths, rows)
+        return HotWidePlan(lanes=_lanes_from_tasks(result["tasks"]), begins=_begins(result["tasks"]),
+                           shape=tuple(result["shape"]), score_ns=float(result["score_ns"]),
+                           templates=int(result["templates"]))
 
     def plan(self, experts: Sequence[tuple[int, int]]) -> HotWidePlan:
         experts = sorted(((int(e), int(r)) for e, r in experts if int(r) > 0), key=lambda item: (-item[1], item[0]))

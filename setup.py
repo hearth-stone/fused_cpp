@@ -467,6 +467,7 @@ moe_sources = [source for source in all_cpp_sources if source.startswith(moe_sou
 moe_sources.extend(
     [
         os.path.join("csrc", "moe_planner", "interval_planner.cpp"),
+        os.path.join("csrc", "moe_planner", "hot_wide_planner.cpp"),
         os.path.join("csrc", "moe_planner", "quick_bindings.cpp"),
     ]
 )

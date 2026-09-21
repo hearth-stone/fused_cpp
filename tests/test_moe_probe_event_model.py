@@ -138,6 +138,39 @@ def test_hot_wide_planner_template_and_order(windowed) -> None:
     assert windowed.dag_makespan_placed([(r, t, CPUS[c:c + t], d) for _, r, c, t, d in tasks]) > 0.0
 
 
+def test_footprint_correction_reads_the_domains_live_weights() -> None:
+    """v14: contention follows the weights an LLC domain holds live, faded in by how busy it is.
+
+    The table below says a domain holding 2.0 x its LLC dilates 1.5 x what the curves alone give,
+    and a domain at 0.1 x nothing, so the same plan must slow down when its lanes hold full
+    stripes and stay put when a window caps them - and an almost empty machine must not move at
+    all, whatever the footprint.
+    """
+    model = ProbeEventModel.from_calibration(CALIBRATION, window_policy=TABLE, **ANALYTIC)
+    model.footprint = {"llc_bytes": 70 << 20, "domain_cores": 40, "n_tile": 16,
+                       "rho": [0.1, 2.0], "routes": [24, 720], "values": [[1.0, 1.0], [1.5, 1.5]]}
+    full_load = [(96, 2, CPUS[2 * k:2 * k + 2], ()) for k in range(40)]
+    windows = [None] * len(full_load)
+    stripe = model.live_weight_bytes(96, 2, windowed=False)
+    tile = model.live_weight_bytes(96, 2, windowed=True)
+    assert stripe > 8 * tile  # a full stripe at two threads is 4 MiB, a one-tile window 128 KiB
+
+    capped = model.simulate(full_load, windows=windows, footprints=[tile] * len(full_load))["makespan_ns"]
+    spilling = model.simulate(full_load, windows=windows, footprints=[stripe] * len(full_load))["makespan_ns"]
+    assert spilling > capped * 1.2
+
+    model.footprint = None
+    assert model.simulate(full_load, windows=windows)["makespan_ns"] == pytest.approx(capped, rel=1e-12)
+
+    # One lane on an idle machine: the domain is 5% busy, so at most 5% of the correction applies.
+    model.footprint = {"llc_bytes": 70 << 20, "domain_cores": 40, "n_tile": 16,
+                       "rho": [0.1, 2.0], "routes": [24, 720], "values": [[1.0, 1.0], [1.5, 1.5]]}
+    alone = [(96, 2, CPUS[:2], ())]
+    quiet = model.simulate(alone, windows=[None], footprints=[stripe])["makespan_ns"]
+    model.footprint = None
+    assert quiet == pytest.approx(model.simulate(alone, windows=[None])["makespan_ns"], rel=0.03)
+
+
 def test_window_table_resolves_only_on_its_machine() -> None:
     from stage_window_policy import ARM_CODEX_NUMA3_80C_TP4_F512_N16_V4, default_stage_window_policy
 
@@ -146,6 +179,31 @@ def test_window_table_resolves_only_on_its_machine() -> None:
     assert default_stage_window_policy(**shape, machine_id="some_other_machine") is None
     resolved = default_stage_window_policy(**shape, machine_id=ARM_CODEX_NUMA3_80C_TP4_F512_N16_V4.machine_ids[0])
     assert resolved is ARM_CODEX_NUMA3_80C_TP4_F512_N16_V4
+
+
+def test_native_hot_wide_planner_matches_the_python_one(windowed) -> None:
+    """The C++ port plans exactly what the Python planner plans, or it is not built here.
+
+    Costs cross as plain doubles before the lane scale, so the two paths score identically; a
+    difference in the chosen template, in a lane's contents or in the score is a port bug.
+    """
+    from hot_wide_planner import HotWidePlanner
+
+    planner = HotWidePlanner(windowed, window_policy=TABLE)
+    if planner._native() is None:
+        pytest.skip("this build carries no NativeHotWidePlanner")
+    for routes in ([1800, 1200, 700] + [90] * 40 + [30] * 80 + [5] * 60,
+                   [600] * 12 + [24] * 60,
+                   [2048] + [17] * 100):
+        experts = [(index, value) for index, value in enumerate(routes)]
+        python_plan = planner.plan(experts)
+        native_plan = planner.plan_native(experts)
+        assert native_plan is not None
+        assert native_plan.shape == python_plan.shape
+        assert native_plan.score_ns == pytest.approx(python_plan.score_ns, rel=1e-12)
+        canonical = lambda plan: sorted((lane.width, lane.experts) for lane in plan.lanes if lane.experts)
+        assert canonical(native_plan) == canonical(python_plan)
+        assert sorted(native_plan.tasks()) == sorted(python_plan.tasks())
 
 
 def test_planned_moe_hot_wide_mode_and_cache(windowed) -> None:

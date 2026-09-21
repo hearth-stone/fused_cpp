@@ -9,6 +9,7 @@
 #include <utility>
 #include <vector>
 
+#include "hot_wide_planner.h"
 #include "interval_planner.h"
 
 namespace py = pybind11;
@@ -19,6 +20,7 @@ using moe_planner::IntervalAssignmentOrder;
 using moe_planner::IntervalCandidate;
 using moe_planner::IntervalPlanResult;
 using moe_planner::IntervalTask;
+using moe_planner::NativeHotWidePlanner;
 using moe_planner::NativeQuickPlanner;
 
 const char* AssignmentOrderName(IntervalAssignmentOrder order) {
@@ -115,9 +117,33 @@ py::dict PlanShared(const NativeQuickPlanner& planner, const std::vector<int>& e
   return result;
 }
 
+py::dict HotWidePlan(const NativeHotWidePlanner& planner, const std::vector<int>& expert_ids,
+                     const std::vector<int>& routes, const std::vector<int>& cost_widths,
+                     const std::vector<std::vector<double>>& costs_by_width) {
+  NativeHotWidePlanner::Plan plan;
+  {
+    py::gil_scoped_release release;
+    plan = planner.PlanExperts(expert_ids, routes, cost_widths, costs_by_width);
+  }
+  py::dict result;
+  result["tasks"] = TasksToPython(plan.tasks);
+  result["shape"] = plan.shape;
+  result["score_ns"] = plan.score_ns;
+  result["templates"] = plan.templates;
+  return result;
+}
+
 }  // namespace
 
 void register_moe_quick_planner(py::module_& m) {
+  py::class_<NativeHotWidePlanner>(m, "NativeHotWidePlanner", py::module_local())
+      .def(py::init<int, std::vector<int>, int, std::vector<int>, int, int, std::vector<std::pair<int, double>>>(),
+           py::arg("num_cores"), py::arg("domain_cores"), py::arg("bulk_width"), py::arg("wide_widths"),
+           py::arg("max_wide_lanes"), py::arg("max_wide_cores"), py::arg("lane_scale"))
+      .def("plan", &HotWidePlan, py::arg("expert_ids"), py::arg("routes"), py::arg("cost_widths"),
+           py::arg("costs_by_width"))
+      .def_property_readonly("shapes", [](const NativeHotWidePlanner& planner) { return planner.shapes(); });
+
   py::class_<NativeQuickPlanner>(m, "NativeQuickPlanner", py::module_local())
       .def(py::init<int, std::vector<std::vector<int>>, int64_t, std::vector<std::pair<int, int64_t>>, double, int,
                     int>(),
