@@ -63,6 +63,40 @@ On `AmazonECS8Cores`, use one process per core from `0` through `7`. Example:
 ssh AmazonECS8Cores 'cd /home/ubuntu/zhangxu/fused_cpp && OMP_NUM_THREADS=1 OMP_DYNAMIC=FALSE OMP_PROC_BIND=close MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 taskset -c 0 .venv/bin/python tests/bench_microkernel_qkt.py'
 ```
 
+## Machine Sharing And Other NUMA Nodes
+
+`Arm-codex` has four 80-core NUMA nodes (node0 `0-79`, node1 `80-159`, node2
+`160-239`, node3 `240-319`) over two sockets, so nodes 2 and 3 share a socket.
+Measurements run on node3 with `--physcpubind=240-319 --membind=3`; other work
+often runs at the same time. What that costs was measured on 2026-09-20 with the
+unchanged plan benchmark on node3 (22 points, two sessions per condition,
+`tmp/numa_interference_20260920/decision.md`), background placed only on the
+other nodes:
+
+| background on other nodes | node3 plan time |
+| --- | --- |
+| BF16 matmul, one node at 3.9 TFLOP/s | +0.01% (node2), +0.24% (node1) |
+| memory streaming, one node at 266 GB/s | +0.83% (node2), +1.84% (node1) |
+| memory streaming, three nodes | +13.1% |
+
+Rules that follow:
+
+- Compute-bound work - builds, tests, planner searches, analysis - may run on
+  nodes 0-2 during a measurement on node3.
+- Memory-streaming work must not overlap a measurement, wherever it is placed:
+  large copies, dataset generation, archive extraction, another MoE benchmark.
+  Sequence it before or after, or accept and report the contamination.
+- The 1-minute load-average idle guard stays the cheap pre-session check, but it
+  means "no foreign work of unknown kind", not "other nodes are harmless".
+- A measurement whose cores are shared with a foreign job is not recoverable by
+  any of this. The E6 r022 sessions measured 79-100 ms against 27-28 ms (+190%),
+  far beyond anything foreign nodes cause, and were discarded.
+
+Node-3 core frequency stays at its 2900 MHz maximum under the heaviest of these
+backgrounds, so the effect is memory-path contention beyond the node, not power
+or frequency; the reason node1 (other socket) costs more than node2 (same
+socket) is not identified.
+
 ## Sanity Checks
 
 Before comparing GFLOP/s with peak, read

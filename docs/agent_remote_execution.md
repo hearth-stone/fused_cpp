@@ -26,6 +26,12 @@ otherwise.
 - Local project root: repository root
 - Python: `/home/zhangxu/codex/fused_cpp/.venv/bin/python`
 - Package manager: `uv`
+- CPU topology: 2 sockets x 160 cores, four NUMA nodes of 80 cores - node0
+  `0-79`, node1 `80-159`, node2 `160-239`, node3 `240-319`; nodes 2 and 3 share
+  a socket. L3 is 560 MiB in 8 instances, two 70 MiB instances per node.
+- Measurement placement: node3, `numactl --physcpubind=240-319 --membind=3`.
+  What concurrent work on the other nodes costs a measurement is in
+  `docs/agent_benchmark_hygiene.md`, "Machine Sharing And Other NUMA Nodes".
 
 The aliases name the same machine. Prefer `Arm-codex-internal` on the internal
 network; use `Arm-codex` when that is the configured reachable alias. Commands
