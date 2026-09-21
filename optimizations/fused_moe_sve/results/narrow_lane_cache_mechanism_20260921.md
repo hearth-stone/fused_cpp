@@ -165,6 +165,40 @@ So 2T stays out of the search space, and no 2T-specific model work follows. What
 doing with the mechanism is general: it explains the window table's value and the model's
 residual level bias, and it would tighten the model wherever a plan's lanes run unwindowed.
 
+## P9: the footprint is the state variable, the width is not
+
+The mechanism's falsifiable consequence is that the footprint is set by the window, not by the
+lane: rho = 40 x w13_tiles x 128 KiB / 70 MiB. P9 (`tmp/footprint_probe_20260921/design.md`)
+swept the W13 window over 1, 2, 4, 8, 16 and 32 tiles at widths 2, 4, 8 and 16, with W2 pinned
+at 4 tiles so only the swept stage moves, and measured the dilation of each cell.
+
+| w13 (rho) | M = 24 | M = 96 | M = 288 | M = 720 |
+| --- | --- | --- | --- | --- |
+| 1 (0.07) | 1.17 1.15 1.18 1.24 | 1.04 1.03 1.02 1.05 | 1.08 1.06 1.03 1.04 | 1.02 1.09 1.06 1.04 |
+| 2 (0.14) | 1.36 1.35 1.33 1.35 | 1.07 1.08 1.05 1.05 | 1.11 1.09 1.05 1.05 | 1.06 1.10 1.07 1.04 |
+| 4 (0.29) | 1.35 1.35 1.34 | 1.10 1.11 1.09 | 1.12 1.10 1.07 | 1.07 1.12 1.08 |
+| 8 (0.57) | 1.37 1.36 | 1.16 1.14 | 1.13 1.12 | 1.07 1.13 |
+| 16 (1.14) | 1.53 | 1.24 | 1.15 | 1.08 |
+| full stripe | 1.60 1.51 1.35 1.35 | 1.48 1.20 1.12 1.08 | 1.36 1.13 1.08 1.06 | 1.17 1.13 1.09 1.05 |
+
+(each cell lists 2T, 4T, 8T, 16T where the width can reach that window)
+
+At matched rho the widths agree to 0.008-0.083, a median of about 0.04; at matched width with
+the footprint free - the last row - they spread by up to 0.40. **The footprint is the state
+variable and the width is not.** The frozen tolerance of 0.05 is exceeded in 4 of the 16
+comparable cells, so D is not a function of rho alone at that precision; the residual is
+largest at 16T with M = 24 and at 4T with M = 720.
+
+D rises monotonically with rho at every M and does so smoothly from the smallest footprint
+rather than at a knee at the capacity: at 2T, M = 96 it runs 1.04, 1.07, 1.10, 1.16, 1.24, 1.48
+across rho 0.07 to 2.29. The confound points the safe way: a wider window also means fewer
+passes over A, which would make the high-rho cells faster, so the footprint effect is at least
+as large as measured.
+
+In the plans this would touch about a tenth of the work: weighting tasks by isolated time, the
+E5 reference runs 78.8% of its work at rho <= 0.2 but 10.2% above rho = 1, in the small experts
+the table cannot window and the wide lanes it leaves on full stripes.
+
 ## What a fix would have to do
 
 Parameterize the contention state by the live weight footprint the LLC domain carries - the sum
