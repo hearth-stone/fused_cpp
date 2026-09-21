@@ -1,12 +1,13 @@
-# Why narrow lanes are under-predicted: the per-core B slice against private L2
+# Why narrow lanes are under-predicted: the concurrent weight footprint against the LLC
 
 ## Status
 
 The 2T defect - plans built from two-thread lanes measure 1.21-1.24 x their prediction while
 every other family sits at 1.09 - has a mechanism. It is not specific to 2T and not a property
-of the window term: **a lane's per-core live weight slice is 12 MiB / t, private L2 is 1.25 MiB
-per core, and the full-load dilation of a lane follows how far that slice overflows L2.** When a
-one-tile window caps the live slice at 128 KiB, every width dilates the same.
+of the window term: **the weights a 40-core LLC domain holds live at once are 480 MiB / t when
+lanes run full stripes, against 70 MiB of LLC, and the full-load dilation follows that
+overflow.** A one-tile window makes the live footprint about 5 MiB whatever the lane width,
+and then every width dilates the same.
 
 This is a diagnosis. No model, table, planner default or search space changes with it; the
 model revision it implies is designed and validated separately.
@@ -81,21 +82,28 @@ the model's isolated time for the same chain gives the measured dilation:
 
 Read across a row: unwindowed, the four widths differ by 0.16 to 0.56 and the narrow lane is
 always worst; with a one-tile window they differ by 0.03 to 0.13 and all four sit at 1.05-1.13.
-The ordering is exactly the order of the per-core live weight slice against private L2 (400 MiB
-over 320 cores = 1.25 MiB per core):
+The ordering is the order of the weight footprint a 40-core LLC domain (70 MiB) holds live.
+An expert's packed B is 12 MiB (8 MiB W13 + 4 MiB W2); a domain runs 40/t lanes at once, so
+unwindowed it holds 480 MiB / t live, and with a one-tile W13 window each core holds 128 KiB,
+which is 5 MiB per domain at every width:
 
-| width | per-core B slice | overflow | dilation at M=96, unwindowed |
-| --- | --- | --- | --- |
-| 2T | 6.00 MiB | 4.8x | 1.57 |
-| 4T | 3.00 MiB | 2.4x | 1.26 |
-| 8T | 1.50 MiB | 1.2x | 1.15 |
-| 16T | 0.75 MiB | 0.6x | 1.10 |
+| width | lanes per domain | live B per domain, full stripe | vs 70 MiB | with a 1-tile window | dilation at M=96 (full / win) |
+| --- | --- | --- | --- | --- | --- |
+| 2T | 20 | 240 MiB | 3.4x | 5.0 MiB (0.07x) | 1.57 / 1.07 |
+| 4T | 10 | 120 MiB | 1.7x | 5.0 MiB (0.07x) | 1.26 / 1.06 |
+| 8T | 5 | 60 MiB | 0.9x | 5.0 MiB (0.07x) | 1.15 / 1.06 |
+| 16T | 2 | 24 MiB | 0.3x | 4.0 MiB (0.06x) | 1.10 / 1.09 |
 
-An expert's packed B is 12 MiB (8 MiB W13 + 4 MiB W2) and a lane of t cores splits it t ways.
-A core whose slice does not fit L2 re-streams it for every 12-row panel, so its DRAM traffic
-scales with M; a core whose slice fits reads it once. A one-tile window caps the live slice at
-128 KiB and restores the reuse, which is why the window gain is largest exactly where the
-overflow is largest (the table credits 2T r = 0.60-0.84, more than any other width).
+A domain whose concurrent weights do not fit the LLC re-reads them from DRAM for every 12-row
+panel, so its DRAM traffic scales with M; one whose weights fit reads them once and serves the
+later panels from the LLC. The window restores that reuse, which is why the gain is largest
+exactly where the overflow is largest (the table credits 2T r = 0.60-0.84, more than any other
+width), and why the windowed footprint - and with it the dilation - stops depending on width.
+
+The private L2 tells the same story less sharply (the per-core slice is 12 MiB / t against
+1.25 MiB, so 4.8x at 2T down to 0.6x at 16T), but the PMU measurement of the windows says the
+LLC is where it happens: a one-tile W13 window cuts DRAM reads by 27-75% while L2 refills move
+by 0-9% (MATHEMATICAL_MODEL v1.103, `tmp/window_pmu_20260919`).
 
 M = 12 is the exception that fits: one panel means there is no cross-panel reuse to lose, so
 windows do not help (1.72 against 1.76 at 2T) and all widths dilate by 1.5-1.8.
@@ -119,14 +127,16 @@ isolated time would appear in both. It appears only in the unwindowed cells.
 - Why searched 2T plans are worse than hand-built ones: the search packs the machine, and it is
   free to put small experts - which the table leaves unwindowed below 17 routes - on 2T lanes,
   where their slice overflows L2 by 4.8x.
-- Why the stage window table gives narrow lanes the largest gains at all.
+- Why the stage window table gives narrow lanes the largest gains at all: the narrower the
+  lane, the more lanes share a domain, and the more the window cuts from its live footprint.
 
 ## What a fix would have to do
 
-Parameterize the contention state by the live weight slice per core - `window_tiles x tile
-bytes`, or the full stripe share when unwindowed - against private L2, instead of by lane width.
-The measurements to calibrate it already exist for overflow 0.6x to 4.8x (the unwindowed grid)
-and for overflow well under 1 (the windowed grid). The revision has to be validated on fresh
+Parameterize the contention state by the live weight footprint the LLC domain carries - the sum
+over its concurrent lanes of `threads x window_tiles x tile bytes`, or the full stripe when
+unwindowed - against the domain's 70 MiB, instead of by lane width. The measurements to
+calibrate it already exist for overflow 0.3x to 3.4x (the unwindowed grid) and for 0.07x (the
+windowed grid). The revision has to be validated on fresh
 layers against the current reference before it can change the model, and only then does the
 question of returning 2T lanes to the search space reopen.
 
