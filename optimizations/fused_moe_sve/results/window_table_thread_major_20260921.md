@@ -41,9 +41,13 @@ in the grid. No data was produced; the retry used widths (2, 8) and new seeds.
 
 ### The skeleton holds, the fine structure does not reproduce
 
-Against V3, 16 of 36 cells change their (w13, w2) choice, and no cell's scale moves by more
-than 0.043 (0.017 for the production widths). Except 4/480 (W13 1 -> 2 tiles) and 16/48
-(W13 2 -> 1), every change is a W2 tile count among near-tied options.
+Against V3, 16 of 36 cells change their (w13, w2) choice. In the 20 cells that keep their
+choice, the scale moves by at most 0.017 (8/96). In the 16 that change it the scale is a
+different variant's ratio, so it moves more - a median 0.013 and at most 0.061 (8/24,
+0.848 -> 0.909, where V4 leaves W2 unwindowed). The W13 window itself differs in only
+three cells (4/480 1 -> 2 tiles, 16/48 2 -> 1, 8/720 full -> 1); every other change is a W2
+tile count among near-tied options, six of them turning the W2 window off and three
+turning it on.
 
 The 2T run repeated the 8T column an hour after the rebuild measured it, under identical
 conditions - the grid's own reproducibility control:
