@@ -130,6 +130,41 @@ isolated time would appear in both. It appears only in the unwindowed cells.
 - Why the stage window table gives narrow lanes the largest gains at all: the narrower the
   lane, the more lanes share a domain, and the more the window cuts from its live footprint.
 
+## Is a fix worth it? No, for 2T
+
+The mechanism says how to model narrow lanes; it does not say they are worth modelling. E13
+(`tmp/two_thread_value_20260921/design.md`) asked what 2T could buy, on the 18 layers of E5.
+
+Per-expert core time at full load, from the grid cells the table selects, says narrow lanes are
+more core-efficient at small M: at M = 24, 4.81 core-ms at 2T against 5.13 at 4T, 5.59 at 8T
+and 6.13 at 16T; at M = 96 the four widths tie within 1%; at M = 720 2T and 8T tie and 4T is 4%
+worse. Giving every expert of a layer its cheapest width and dividing by 80 cores bounds any
+plan's makespan:
+
+| bound | median over the 18 layers |
+| --- | --- |
+| widths 2 to 16 | 27.88 ms |
+| widths 4 to 16 | 28.13 ms |
+| measured `l13_no2` reference | 28.25 ms |
+
+**2T improves the bound by 0.82%, and the reference plan is already 1.3% above the bound that
+includes 2T.** A perfect 2T planner could win about one point, most of which is not even
+attributable to the width.
+
+The measurement agrees, if less sharply: six hand-built variants on those layers, balanced with
+the measured grid costs, are all 15-20% slower than the reference and win no layer. The 4T
+control with the same shape is +15.23% against the best 2T variant's +17.53%, so most of that
+gap is the hand-built shape rather than the width - the measurement rules out hand-built 2T
+plans, and the bound rules out the rest.
+
+One placement rule died here too: keeping experts of 16 routes or fewer off 2T lanes, which the
+mechanism suggests because they cannot be windowed, makes the plan 5.10% *slower*. Pushing them
+onto the wide lanes unbalances it, and that costs more than their LLC overflow.
+
+So 2T stays out of the search space, and no 2T-specific model work follows. What remains worth
+doing with the mechanism is general: it explains the window table's value and the model's
+residual level bias, and it would tighten the model wherever a plan's lanes run unwindowed.
+
 ## What a fix would have to do
 
 Parameterize the contention state by the live weight footprint the LLC domain carries - the sum
