@@ -8946,7 +8946,10 @@ Scope: Arm-codex NUMA3 80C, TP4 H=4096 F=512, SVE BF16 $\nu=16$, protocol
 producer-hot A / cold B. Default dispatch is unchanged.
 
 **Table.** For width $t\in\{2,4,8,16\}$ and uniform $M$, all lanes run the same
-window at full load. The candidate policy `ARM_CODEX_NUMA3_80C_TP4_F512_N16_V3` stores,
+window at full load. 自 v1.118 起注册表为 `ARM_CODEX_NUMA3_80C_TP4_F512_N16_V4`，即同样的
+两张网格在 thread-major 顺序下的重测（v1.117）；本节以下的数值仍描述 V3 的那次测量，骨架
+（$M\le16$ 整条带、$M$ 17--500 取 W13 1 tile）在两次测量中一致，差异集中在 W2 tile 数且在
+网格自身复现范围内。The policy `ARM_CODEX_NUMA3_80C_TP4_F512_N16_V3` stores,
 per route band and width, the chosen $(\omega_{13},\omega_2)$ and the measured ratio
 $r(t,M)=T(M,t,\omega)/T(M,t,\text{full})$. V3 is measured with jemalloc preloaded and
 purging disabled (`tmp/jemalloc_rerun_20260919`: the window grid, then a W2 sweep at
@@ -9393,5 +9396,6 @@ Context residual opening (2026-09-05): 独立 Lab candidate 增加冻结 v8 even
 | 2026-09-20 | v1.115 | 标定域约束：模型给出 `calibrated_widths`(2--32T) 与 `reliable_widths`(扣除 2T)，tail-pool 候选与 LNS 默认宽度按可信集过滤。依据 E8：1T 池化任务实测为预测的 3.25--4.25 倍，使 tail-pool 计划慢 1.0--1.3 ms 而打分认为快 0.7--3.3%。新增路由切片移动(默认关闭)：54 个层上最热 expert/工作量下界比值中位 0.38、最大 0.44，切片无收益。 |
 | 2026-09-20 | v1.116 | Stage window 映射改为 thread-major：N domain 先按 worker 切连续 stripe（§1.1 的 $\sigma_s(j)$），窗口在 stripe 内部切分。取整恒等式给出 $R_s$、每 pass 的 $g_s$、每 worker 单窗口 footprint 与 A 扫描次数均不变，改变的只是列归属；C++ 与 `full_stage_geometry.py` 同步。证据：原型网格（加载 44 格中位 −0.033%、29 负；小 M 33 格中位 −0.574%、27 负；checksum 全等）与 E9 整计划 A/B（同一 checkout 的两个构建，6 个真实层 × 11 计划 = 66 点，A B B A 四 session）：中位 −0.027%、符号 37/66、p10/p90 −0.245%/+0.291%，构建内 session 差中位 0.261%；每层 Spearman 0.82--0.99、最快计划均未变；两构建 66 个计划输出 sha256 全等。V3 窗口表与 v11 window 项仍是在旧顺序下标定的，其逐 (M, width) 最优尚未重测。报告：`optimizations/fused_moe_sve/results/window_order_thread_major_20260920.md`。 |
 | 2026-09-21 | v1.117 | thread-major 下重测窗口表（4/8/16T 与 2T 两轮网格，bench 仅改 WIDTHS、分析与组表规则照旧）。骨架与旧顺序一致：M 17--500 取 W13 1 tile，M=12 与 16T 大 M 取整条带，筛查在 M=12 的两个 R1 标记未过 2% 采纳门而消解；2T 改为新顺序实测（W13 1 tile、r 0.60--0.84），不再沿用旧标定。候选 V4 与 V3 有 16 格选择差异，但 W13 窗口只在 3 格不同(4/480、16/48、8/720)，其余均为 W2 tile 数之争；选择不变的 20 格 r 漂移不超过 0.017，选择改变的 16 格因换了变体而中位 0.013、最大 0.061；同条件重复的 8T 列显示网格自身复现只有 Δr −0.046--+0.024、9 格中 1 格选择翻转，故这些差异属实测并列。18 个全新层的计划级验证（同一 quick 结构、仅换窗口）：V4 较 V3 中位 −0.27%（16/18 更快，最差层 +0.96%），未达事先冻结的 −0.3% 采纳门，**保持 V3 注册**；同批显示窗口相对无窗口值 1.69%，按 V4 尺度重新规划不改变规划决策。公式、schema、planner 默认与模型资产不变。报告：`optimizations/fused_moe_sve/results/window_table_thread_major_20260921.md`。 |
+| 2026-09-21 | v1.118 | 注册表由 V3 换为 V4（`ARM_CODEX_NUMA3_80C_TP4_F512_N16_V4`，同一 machine_id）。依据不是性能：18 个新层上 V4 仅快 0.27%（未达冻结的 0.3% 采纳门），两表在本协议下为实测并列；换表的理由是谱系一致——V4 全部行（含 2T）都在当前 kernel 的 thread-major 顺序下测得，而 V3 的 2T 行来自旧顺序。V3 保留在文件中但不再注册（lab 记录与事件模型的冻结 Lab parity 值由它产生）。公式、schema、planner 默认与标定资产不变；选择不变的格子 r 漂移 ≤0.017。 |
 
 Change record (2026-09-14, Lab): implemented predeclared matched block history/pressure interpolation and training-only extraction; zero/pooled-history controls, bounded domain, signed-delta and conditional-pressure limitations recorded. No active planner or production equation replacement.

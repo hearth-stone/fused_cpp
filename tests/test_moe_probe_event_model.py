@@ -15,7 +15,8 @@ sys.path[:0] = [
 from interval_planner import IntervalPlanner  # noqa: E402
 from model_lns import Lane, ModelLnsSearch, lanes_from_planner_tasks, pack_lanes, placed_from_lanes  # noqa: E402
 from probe_event_model import ProbeEventModel  # noqa: E402
-from stage_window_policy import ARM_CODEX_NUMA3_80C_TP4_F512_N16_V3 as TABLE  # noqa: E402
+from stage_window_policy import ARM_CODEX_NUMA3_80C_TP4_F512_N16_V3 as TABLE_V3  # noqa: E402
+from stage_window_policy import ARM_CODEX_NUMA3_80C_TP4_F512_N16_V4 as TABLE  # noqa: E402
 
 CALIBRATION = ROOT / "bench_assets/moe_paper/arm_codex_numa3_80c_jemalloc/probe_event_v10_20260919.json"
 V11 = ROOT / "bench_assets/moe_paper/arm_codex_numa3_80c_jemalloc/probe_event_v11_20260920.json"
@@ -40,10 +41,13 @@ def _reference_plan():
             + [(384, 4, CPUS[16 + 4 * k : 20 + 4 * k], ()) for k in range(14)])
 
 
-def test_matches_frozen_lab_v10_values(model, windowed) -> None:
+def test_matches_frozen_lab_v10_values(model) -> None:
     # Values of the frozen Lab implementation (tmp/v10_model_20260919/v10.py) on the same plan.
+    # The windowed value was produced with the V3 table, so this parity check keeps V3 rather
+    # than following the registered table.
+    windowed_v3 = ProbeEventModel.from_calibration(CALIBRATION, window_policy=TABLE_V3, **ANALYTIC)
     assert model.dag_makespan_placed(_reference_plan()) == pytest.approx(20144693.91842572, rel=1e-12)
-    assert windowed.dag_makespan_placed(_reference_plan()) == pytest.approx(20128665.200195182, rel=1e-12)
+    assert windowed_v3.dag_makespan_placed(_reference_plan()) == pytest.approx(20128665.200195182, rel=1e-12)
     assert model.T_iso(384, 4) == pytest.approx(14631500.259939512, rel=1e-12)
 
 
@@ -135,13 +139,13 @@ def test_hot_wide_planner_template_and_order(windowed) -> None:
 
 
 def test_window_table_resolves_only_on_its_machine() -> None:
-    from stage_window_policy import ARM_CODEX_NUMA3_80C_TP4_F512_N16_V3, default_stage_window_policy
+    from stage_window_policy import ARM_CODEX_NUMA3_80C_TP4_F512_N16_V4, default_stage_window_policy
 
     shape = dict(hidden_size=4096, intermediate_size=512, backend_n_tile=16)
     assert default_stage_window_policy(**shape) is None
     assert default_stage_window_policy(**shape, machine_id="some_other_machine") is None
-    resolved = default_stage_window_policy(**shape, machine_id=ARM_CODEX_NUMA3_80C_TP4_F512_N16_V3.machine_ids[0])
-    assert resolved is ARM_CODEX_NUMA3_80C_TP4_F512_N16_V3
+    resolved = default_stage_window_policy(**shape, machine_id=ARM_CODEX_NUMA3_80C_TP4_F512_N16_V4.machine_ids[0])
+    assert resolved is ARM_CODEX_NUMA3_80C_TP4_F512_N16_V4
 
 
 def test_planned_moe_hot_wide_mode_and_cache(windowed) -> None:

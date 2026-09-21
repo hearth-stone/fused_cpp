@@ -3,12 +3,17 @@
 ## Status
 
 The window table was re-measured under the thread-major window order that landed on
-2026-09-20. **The registered table `ARM_CODEX_NUMA3_80C_TP4_F512_N16_V3` stays registered**:
-the rebuilt table (V4) is 0.27% faster on 18 fresh layers, below the 0.3% adoption
-threshold frozen before collection. The rebuild did establish that the table's skeleton is
-order-independent, that its fine structure is not reproducible at the level of its own
-grid, and that 2T - carried in V3 from the old order - keeps its large window gain under
-the new one.
+2026-09-20. The rebuilt table (V4) is 0.27% faster on 18 fresh layers, below the 0.3%
+adoption threshold frozen before collection, so the measurement alone would have kept V3.
+**V4 is nevertheless the registered table** (`ARM_CODEX_NUMA3_80C_TP4_F512_N16_V4`), on the
+user's decision of 2026-09-21: since the two are measured equals, the table whose whole
+derivation matches the kernel the machine now runs is the one worth keeping. That is a
+lineage decision, not a measured speedup, and this report keeps both numbers so the
+distinction survives.
+
+The rebuild also established that the table's skeleton is order-independent, that its fine
+structure is not reproducible at the level of its own grid, and that 2T - carried in V3
+from the old order - keeps its large window gain under the new one.
 
 ## Why it was rebuilt
 
@@ -101,18 +106,24 @@ V3-planned structure does, so the scale refresh does not move planning decisions
 
 ## Decisions
 
-- V3 stays registered in `stage_window_policy.py`; no planner default, asset or model
-  change follows from this work.
-- V4 (`tmp/window_table_rebuild_20260920/table_v4.json`) is kept as the table measured
-  under the thread-major order, for reference and for any future adoption attempt.
+- V4 is registered in `stage_window_policy.py` for this machine, replacing V3 (2026-09-21,
+  user decision). The measured difference is inside the tie band; the reason is that V4's
+  whole derivation - including its 2T rows - was measured under the order the kernel now
+  uses, which makes the table's provenance one piece instead of two.
+- V3 stays in the file, unregistered, because the lab records and the event model's frozen
+  Lab parity value were produced with it.
+- No planner default, calibration asset or model formula changes: the table feeds the
+  planner through `time_scales`, whose values moved by at most 0.017 wherever the window
+  choice is unchanged.
 - The window table is confirmed valid under the new order, which closes the limitation the
   thread-major change carried.
 
 ## Open
 
-- Adoption of V4 was not decided by evidence but by a threshold it missed by 0.03 points.
-  Resolving it needs a design powered for a 0.3% effect - more sessions or paired rounds -
-  not another grid.
+- Whether V4 is genuinely faster than V3 remains unresolved: it missed the adoption
+  threshold by 0.03 points with 16 of 18 layers better. Deciding it needs a design powered
+  for a 0.3% effect - more sessions or paired rounds - not another grid. The registration
+  does not depend on that answer, since the two are equals within this protocol.
 - 32T is still uncalibrated. The full-load grid cannot represent it: 80 cores hold only two
   32T lanes and leave 16 cores idle, so covering 32T needs a different design, for example
   filler load on the remaining cores.

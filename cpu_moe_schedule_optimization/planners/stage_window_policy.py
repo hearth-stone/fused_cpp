@@ -176,7 +176,9 @@ AMAZON_C5_192C_TP4_F512_V5 = StageWindowPolicy(
     ),
 )
 
-# Registered for the calibrated machine only (2026-09-20): Arm-codex NUMA3 80 cores (2 x 40-core LLC),
+# Superseded by V4 below and no longer registered; kept because the lab records and the
+# frozen Lab parity value of the event model were produced with it.
+# Measured for the calibrated machine (2026-09-19): Arm-codex NUMA3 80 cores (2 x 40-core LLC),
 # TP4 H=4096 F=512, SVE BF16 n_tile 16 (W13 tile 128 KiB, W2 tile 16 KiB).
 # Measured at full load (all lanes busy with the same width and window), producer-hot
 # A and cold B, two sessions, with jemalloc preloaded and purging disabled
@@ -270,9 +272,103 @@ ARM_CODEX_NUMA3_80C_TP4_F512_N16_V3 = StageWindowPolicy(
     ),
 )
 
+# Registered for the calibrated machine (2026-09-21): the same grids re-measured after the
+# stage window order became thread-major (`optimizations/fused_moe_sve/results/
+# window_table_thread_major_20260921.md`), so table and kernel now share one order - V3's 2T
+# rows had been measured under the previous one. Composition is unchanged (the window grid
+# plus the W2 sweep at W13 = 1 tile, `build_v4.py`), and so are the adoption rules. On 18
+# fresh layers V4 measured 0.27% faster than V3 with 16 of 18 layers better, inside the
+# frozen tie band, so this replacement is a lineage decision, not a measured speedup; the
+# two tables' 16 differing cells are ties the grid cannot separate from its own repeat
+# (scales move by up to 0.046 between two runs of the same cells). Windows are (W13 tiles,
+# W2 tiles); `time_scales` is the measured full-load T(window)/T(full stripe) the planner
+# multiplies into T(M, t). Routes 1-16 tie on every window and above 720 there is no
+# evidence, so both keep the full stripe; widths outside (2, 4, 8, 16) are uncalibrated.
+ARM_CODEX_NUMA3_80C_TP4_F512_N16_V4 = StageWindowPolicy(
+    name="arm_codex_numa3_80c_tp4_f512_n16_v4_thread_major_jemalloc",
+    hidden_size=4096,
+    intermediate_size=512,
+    backend_n_tile=16,
+    machine_ids=("arm_codex_320c_numa3_80c_sve256_jemalloc_narrow_merge_v9",),
+    bands=(
+        StageWindowBand(
+            min_routes=17,
+            max_routes=33,
+            w13_tiles=1,
+            w2_tiles=4,
+            widths=(2, 4, 8, 16),
+            overrides={8: (1, FULL_STRIPE), 16: (1, 8)},
+            time_scales={2: 0.6561, 4: 0.7324, 8: 0.9091, 16: 0.9181},
+        ),
+        StageWindowBand(
+            min_routes=34,
+            max_routes=67,
+            w13_tiles=1,
+            w2_tiles=4,
+            widths=(2, 4, 8, 16),
+            overrides={16: (1, 8)},
+            time_scales={2: 0.5992, 4: 0.7486, 8: 0.8439, 16: 0.9596},
+        ),
+        StageWindowBand(
+            min_routes=68,
+            max_routes=117,
+            w13_tiles=1,
+            w2_tiles=4,
+            widths=(2, 4, 8, 16),
+            overrides={4: (1, 8), 16: (FULL_STRIPE, FULL_STRIPE)},
+            time_scales={2: 0.6635, 4: 0.8253, 8: 0.9098},
+        ),
+        StageWindowBand(
+            min_routes=118,
+            max_routes=166,
+            w13_tiles=1,
+            w2_tiles=FULL_STRIPE,
+            widths=(2, 4, 8, 16),
+            overrides={4: (1, 4), 8: (1, 8), 16: (FULL_STRIPE, FULL_STRIPE)},
+            time_scales={2: 0.7426, 4: 0.8645, 8: 0.938},
+        ),
+        StageWindowBand(
+            min_routes=167,
+            max_routes=235,
+            w13_tiles=1,
+            w2_tiles=FULL_STRIPE,
+            widths=(2, 4, 8, 16),
+            overrides={4: (1, 4), 16: (FULL_STRIPE, FULL_STRIPE)},
+            time_scales={2: 0.7517, 4: 0.8866, 8: 0.9607},
+        ),
+        StageWindowBand(
+            min_routes=236,
+            max_routes=371,
+            w13_tiles=1,
+            w2_tiles=FULL_STRIPE,
+            widths=(2, 4, 8, 16),
+            overrides={4: (1, 4), 16: (FULL_STRIPE, FULL_STRIPE)},
+            time_scales={2: 0.7784, 4: 0.9107, 8: 0.9712},
+        ),
+        StageWindowBand(
+            min_routes=372,
+            max_routes=587,
+            w13_tiles=1,
+            w2_tiles=FULL_STRIPE,
+            widths=(2, 4, 8, 16),
+            overrides={4: (2, 16), 8: (1, 4), 16: (FULL_STRIPE, FULL_STRIPE)},
+            time_scales={2: 0.8396, 4: 0.9596, 8: 0.9623},
+        ),
+        StageWindowBand(
+            min_routes=588,
+            max_routes=720,
+            w13_tiles=1,
+            w2_tiles=8,
+            widths=(2, 4, 8, 16),
+            overrides={4: (1, FULL_STRIPE), 8: (1, 4), 16: (FULL_STRIPE, FULL_STRIPE)},
+            time_scales={2: 0.8349, 4: 0.9752, 8: 0.9708},
+        ),
+    ),
+)
+
 _POLICIES: tuple[StageWindowPolicy, ...] = (
     AMAZON_C5_192C_TP4_F512_V5,
-    ARM_CODEX_NUMA3_80C_TP4_F512_N16_V3,
+    ARM_CODEX_NUMA3_80C_TP4_F512_N16_V4,
 )
 
 
@@ -304,6 +400,7 @@ def stage_geometry_name(w13_windows: Sequence[int], w2_windows: Sequence[int]) -
 __all__ = [
     "AMAZON_C5_192C_TP4_F512_V5",
     "ARM_CODEX_NUMA3_80C_TP4_F512_N16_V3",
+    "ARM_CODEX_NUMA3_80C_TP4_F512_N16_V4",
     "FULL_STRIPE",
     "StageWindowBand",
     "StageWindowPolicy",

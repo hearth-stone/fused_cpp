@@ -1466,12 +1466,13 @@ def test_window_time_scale_defaults_to_one_outside_the_table() -> None:
         type(policy.bands[0])(min_routes=1, max_routes=2, w13_tiles=1, w2_tiles=8, time_scales={2: 1.2})
 
 
-def test_arm_codex_n16_v3_candidate_pins_the_jemalloc_table() -> None:
-    """Spot-check V3 against tmp/jemalloc_rerun_20260919/table_v3.json; it stays opt-in."""
+def test_arm_codex_n16_v3_pins_the_superseded_jemalloc_table() -> None:
+    """Spot-check V3 against tmp/jemalloc_rerun_20260919/table_v3.json; V4 replaced it in the registry."""
     from stage_window_policy import ARM_CODEX_NUMA3_80C_TP4_F512_N16_V3 as policy
     from stage_window_policy import default_stage_window_policy
 
     assert default_stage_window_policy(hidden_size=4096, intermediate_size=512, backend_n_tile=16) is None
+    assert policy not in _registered_policies()
     # Bands tile routes 17-720 without gaps; 1-16 and above 720 keep the full stripe.
     assert [(b.min_routes, b.max_routes) for b in policy.bands] == [
         (17, 33), (34, 67), (68, 117), (118, 166), (167, 235), (236, 371), (372, 587), (588, 720)
@@ -1497,6 +1498,69 @@ def test_arm_codex_n16_v3_candidate_pins_the_jemalloc_table() -> None:
     for (routes, threads), (windows, scale) in expected.items():
         assert policy.select(routes, threads) == windows
         assert policy.time_scale(routes, threads) == scale
+    # Every emitted window fits its stage (W13 64 tiles, W2 256 tiles at n_tile 16).
+    w13 = full_stage_geometry(k=4096, n=1024, n_tile=16)
+    w2 = full_stage_geometry(k=512, n=4096, n_tile=16)
+    for band in policy.bands:
+        for threads in band.widths:
+            w13_tiles, w2_tiles = band.select(threads)
+            assert 0 <= w13_tiles <= w13.total_tiles // threads
+            assert 0 <= w2_tiles <= w2.total_tiles // threads
+
+
+def _registered_policies():
+    import stage_window_policy
+
+    return stage_window_policy._POLICIES
+
+
+def test_arm_codex_n16_v4_pins_the_thread_major_table() -> None:
+    """The registered table, against tmp/window_table_rebuild_20260920/table_v4.json.
+
+    V4 re-measured the same grids after the stage window order became thread-major, so the
+    table and the kernel share one order; V3's 2T rows had been measured under the previous
+    one. The two tables differ in 16 cells the grid cannot separate from its own repeat, and
+    on 18 fresh layers V4 measured 0.27% faster, inside the frozen tie band.
+    """
+    from stage_window_policy import ARM_CODEX_NUMA3_80C_TP4_F512_N16_V4 as policy
+    from stage_window_policy import default_stage_window_policy
+
+    machine = "arm_codex_320c_numa3_80c_sve256_jemalloc_narrow_merge_v9"
+    shape = dict(hidden_size=4096, intermediate_size=512, backend_n_tile=16)
+    assert default_stage_window_policy(**shape) is None
+    assert default_stage_window_policy(**shape, machine_id=machine) is policy
+    # Bands tile routes 17-720 without gaps; 1-16 and above 720 keep the full stripe.
+    assert [(b.min_routes, b.max_routes) for b in policy.bands] == [
+        (17, 33), (34, 67), (68, 117), (118, 166), (167, 235), (236, 371), (372, 587), (588, 720)
+    ]
+    for routes, threads in ((16, 2), (721, 2), (96, 1), (96, 32)):
+        assert policy.select(routes, threads) == (0, 0)
+        assert policy.time_scale(routes, threads) == 1.0
+    # (routes, threads) -> (w13 tiles, w2 tiles), time scale at grid points.
+    expected = {
+        (24, 2): ((1, 4), 0.6561),
+        (24, 8): ((1, 0), 0.9091),
+        (24, 16): ((1, 8), 0.9181),
+        (48, 16): ((1, 8), 0.9596),
+        (96, 4): ((1, 8), 0.8253),
+        (96, 16): ((0, 0), 1.0),
+        (288, 2): ((1, 0), 0.7784),
+        (288, 4): ((1, 4), 0.9107),
+        (480, 8): ((1, 4), 0.9623),
+        (720, 2): ((1, 8), 0.8349),
+        (720, 4): ((1, 0), 0.9752),
+        (720, 8): ((1, 4), 0.9708),
+    }
+    for (routes, threads), (windows, scale) in expected.items():
+        assert policy.select(routes, threads) == windows
+        assert policy.time_scale(routes, threads) == scale
+    # The W13 window is one tile wherever the table windows at all: that skeleton is what the
+    # grid reproduces across runs, unlike the W2 tile count.
+    for band in policy.bands:
+        for threads in band.widths:
+            w13_tiles, w2_tiles = band.select(threads)
+            assert w13_tiles in (0, 1, 2)
+            assert (w13_tiles, w2_tiles) != (0, 0) or threads == 16
     # Every emitted window fits its stage (W13 64 tiles, W2 256 tiles at n_tile 16).
     w13 = full_stage_geometry(k=4096, n=1024, n_tile=16)
     w2 = full_stage_geometry(k=512, n=4096, n_tile=16)
