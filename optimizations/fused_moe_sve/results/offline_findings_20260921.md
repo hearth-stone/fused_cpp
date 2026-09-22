@@ -73,8 +73,43 @@ documented layout in `refs/i8gemm/lib/i8gemm.h` is an 8-column N block while the
 `svcntb()/2`).
 
 **The proposed fix is therefore wrong and must not be applied**: forcing the packed path below
-256 bits moves the work onto a path that is also broken there. Locating the packed-path
-assumption is the prerequisite, and is tracked in `TODO.md`.
+256 bits moves the work onto a path that is also broken there.
+
+### Located: it is one mechanism, and my file was wrong
+
+`setup.py:688` picks `i8gemm_backend = "sve" if target_has_sve else "neon"`, so an SVE build
+compiles `i8gemm_sve.S` and **never compiles `i8gemm_k.S`**. `i8gemm_k.S` is the NEON fallback,
+and it is the file I read when I called the packed family "VL-generic NEON". The packed
+kernels `i8gemm_k_nld_m12` and `i8gemm_k_nld{,1,2,4}` are defined in `i8gemm_sve.S`, which
+carries the same construction as `i8gemm_hybrid.S`: `ptrue p2.s, vl4` (:811), an N step of
+`cntb; lsr #1` = VL/2 columns (:816), and a `DEINT_QUADS` macro (:530) that writes four 16-byte
+`st1w`s with `ext ..., #16` between them - 64 bytes, 16 int32 columns, per row. Its own comments
+say "8x2VL block" and "the 8x16 tile", which agree only at 256 bits.
+
+**Every SVE i8gemm microkernel hard-codes a 16-column deinterleave store while deriving its N
+step from the runtime vector length.** Below 256 bits each store lays down 8 valid columns and 8
+duplicates past the tile. `i8gemm_msplit_k.S` shares the macro, and `setup.py` hands these
+kernels to every SVE machine, not only 256-bit ones.
+
+This predicts that width is irrelevant, since width only chooses between two equally affected
+families - and width 1 fails too, which supersedes the 2026-09-21 note that a single-thread lane
+was clean (that run shared a process; a corrupted chunk is only detected when it is freed):
+
+| H=F | tokens | width | C9g 128-bit | `Arm-codex` 256-bit |
+| --- | --- | --- | --- | --- |
+| 64 | 48 | 1 | `free(): chunks in smallbin corrupted` | repeatable, max abs err 2.9e-06 |
+| 2048 | 96 | 1 | `corrupted size vs. prev_size` | repeatable, max abs err 1.0e-03 |
+| 2048 | 96 | 2 | `corrupted size vs. prev_size` | repeatable, max abs err 1.0e-03 |
+
+With the six-shape run above: **10 of 10 correct at 256 bits, 10 of 10 corrupt at 128 bits**,
+over widths 1, 2 and 4 and both families.
+
+Three repairs are open, from narrowest to widest: refuse W8A8 unless `svcntb() == 32` (one
+condition, validatable on both machines today, and it narrows the execution contract in
+`docs/public_contracts.md`, which currently names only "Linux AArch64 SVE+i8mm"); build the
+VL-independent NEON `i8gemm_k.S` when the vector length is not 256, which restores function but
+changes the global build for a machine class; or make the store macros VL-generic inside the
+vendored library. None is applied. Evidence and probes: `tmp/w8a8_vector_length_20260921/`.
 
 ---
 
