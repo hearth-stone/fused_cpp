@@ -4,14 +4,23 @@
 An optional isolated training profile contributes only three scalar residuals:
 one expert-fixed cost, one per-route cost, and one common W13/W2 stage scale.
 Contention rows are never read during fitting.
+
+Pass several probe runs, not one. Some service points are not reproducible: on
+Amazon C9g three consecutive runs of the same probe spread 45-47% on
+`gemm_core_flops`, and one of the three produced a degenerate calibration - every
+fitted overhead zero, training MAPE 20% against 10% for its neighbours, and the
+planner's own region 7.8% against 2.3%. Combining runs point by point with the
+median removes that lottery for the cost of a second and third probe run.
 """
 
 from __future__ import annotations
 
 import argparse
+import copy
 import itertools
 import json
 import statistics
+import sys
 from pathlib import Path
 from typing import Mapping, Sequence
 
@@ -400,6 +409,49 @@ def fit_operator_residuals(
     }
 
 
+def median_service_probe(probes: Sequence[Mapping], *, sources: Sequence[str] | None = None) -> dict:
+    """Combine probe runs into one by taking each measured point's median rate.
+
+    Rows are matched by position within a resource, which is how a probe writes them:
+    one row per width, in the order the widths were requested. A point present in
+    fewer than two runs keeps the first run's value.
+    """
+    if not probes:
+        raise ValueError("at least one service probe is required")
+    merged = copy.deepcopy(dict(probes[0]))
+    if len(probes) == 1:
+        return merged
+    kinds = {probe.get("kind") for probe in probes}
+    if len(kinds) != 1:
+        raise ValueError(f"service probes disagree on kind: {sorted(str(k) for k in kinds)}")
+    machines = {probe.get("machine", {}).get("id") for probe in probes}
+    if len(machines) != 1:
+        raise ValueError(f"service probes come from different machines: {sorted(str(m) for m in machines)}")
+    combined = 0
+    for resource, body in merged.get("services", {}).items():
+        for index, row in enumerate(body.get("rows", [])):
+            samples = []
+            for other in probes:
+                try:
+                    value = other["services"][resource]["rows"][index].get("aggregate_rate")
+                except (KeyError, IndexError, TypeError):
+                    value = None
+                if value:
+                    samples.append(float(value))
+            if len(samples) < 2:
+                continue
+            row["aggregate_rate"] = statistics.median(samples)
+            if "aggregate_gbytes_per_second" in row:
+                row["aggregate_gbytes_per_second"] = row["aggregate_rate"] / 1.0e9
+            combined += 1
+    merged.setdefault("provenance", {})["service_probe_median"] = {
+        "runs": len(probes),
+        "points_combined": combined,
+        "sources": list(sources) if sources is not None else None,
+    }
+    return merged
+
+
 def build_calibration(
     probe: dict,
     *,
@@ -578,7 +630,12 @@ def build_calibration(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("service_probe", type=Path)
+    parser.add_argument(
+        "service_probe",
+        type=Path,
+        nargs="+",
+        help="one or more service-probe runs; several are combined point by point with the median",
+    )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--report", type=Path)
     parser.add_argument("--machine-id")
@@ -635,7 +692,14 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    probe = json.loads(args.service_probe.read_text(encoding="utf-8"))
+    probes = [json.loads(path.read_text(encoding="utf-8")) for path in args.service_probe]
+    probe = median_service_probe(probes, sources=[str(path) for path in args.service_probe])
+    if len(probes) == 1:
+        print(
+            "warning: calibrating from a single service-probe run. Some points are not "
+            "reproducible and one bad run yields a degenerate fit; pass three runs.",
+            file=sys.stderr,
+        )
     machine_id = args.machine_id or f"{probe['machine']['id']}-rank-sve-jit-thin-v2"
     llc_domain_probes = {
         domain_id: json.loads(path.read_text(encoding="utf-8"))

@@ -36,6 +36,7 @@ from analytic_probe_geometry import (  # noqa: E402
 from build_analytic_calibration import (  # noqa: E402
     build_calibration,
     fit_nonnegative_residuals,
+    median_service_probe,
     select_curve,
 )
 from interval_planner import IntervalPlanner  # noqa: E402
@@ -849,6 +850,9 @@ def test_wide_team_pressure_calibration_is_discrete_and_rejects_speedup() -> Non
     assert pressure.isolated_scale(8) == pytest.approx(1.2)
     assert pressure.full_cohort_scale(4) == pytest.approx(1.1)
     assert pressure.full_cohort_scale(6) == pytest.approx(1.0)
+    assert pressure.occupancy_scale(8, 8, 16) == pytest.approx(1.2)
+    assert pressure.occupancy_scale(8, 16, 16) == pytest.approx(1.4)
+    assert pressure.occupancy_scale(16, 16, 16) == pytest.approx(1.0)
     with pytest.raises(ValueError, match="dilation must be at least one"):
         WideTeamPressureCalibration(isolated_dilation=((4, 0.9),))
     with pytest.raises(ValueError, match="cannot be below isolated"):
@@ -925,6 +929,40 @@ def test_placed_phase_interpolates_internal_and_concurrent_wide_team_pressure() 
     assert single[-1] == {0: pytest.approx(1.25)}
     assert full_cohort[-1] == {0: pytest.approx(2.0), 1: pytest.approx(2.0)}
     assert full_cohort[3][0] > single[3][0]
+
+
+def test_quick_width_ranking_applies_wide_team_occupancy_scale() -> None:
+    cores = 8
+    calibration = replace(
+        _calibration(cores=cores, supported_widths=(2, 4)),
+        wide_team_pressure=WideTeamPressureCalibration(
+            isolated_dilation=((2, 1.0), (4, 1.0)),
+            full_cohort_dilation=((2, 1.0), (4, 4.0)),
+        ),
+    )
+    model = _model(calibration)
+    experts = [(index, 48) for index in range(8)]
+    planner = IntervalPlanner(model, num_cores=cores, native_cold_planner=False)
+    isolated = IntervalPlanner(
+        _model(_calibration(cores=cores, supported_widths=(2, 4))),
+        num_cores=cores,
+        native_cold_planner=False,
+    )
+
+    assert planner._quick_homogeneous_scale((4, 4)) == pytest.approx(4.0)
+    assert planner._quick_homogeneous_scale((2,) * 4) == pytest.approx(1.0)
+    four_t = planner._quick_candidate(experts, (4, 4))
+    two_t = planner._quick_candidate(experts, (2,) * 4)
+    isolated_four = isolated._quick_candidate(experts, (4, 4))
+    isolated_two = isolated._quick_candidate(experts, (2,) * 4)
+    assert four_t["makespan_ns"] == pytest.approx(4.0 * isolated_four["makespan_ns"])
+    assert two_t["makespan_ns"] == pytest.approx(isolated_two["makespan_ns"])
+    assert planner.plan_quick(experts)["shape"] == (2,) * 4
+    assert four_t["makespan_ns"] > two_t["makespan_ns"]
+    assert model.policy.identity_key() != isolated.model.policy.identity_key()
+    assert PlannedMoE(model, num_cores=cores).policy_identity != PlannedMoE(
+        isolated.model, num_cores=cores
+    ).policy_identity
 
 
 def test_model_defaults_to_calibrated_runtime_n_tile() -> None:
@@ -1623,3 +1661,68 @@ def test_runtime_uses_one_calibration_and_emits_no_stage_split_controls() -> Non
     assert "task_w13_ranges" not in first["bridge"]
     assert "task_w2_ranges" not in first["bridge"]
     assert first["bridge"] == cached["bridge"]
+
+
+def _service_probe(rates, *, machine="c9g", kind="moe_analytic_service_probe"):
+    return {
+        "kind": kind,
+        "machine": {"id": machine},
+        "services": {
+            "l2_bytes": {
+                "rows": [
+                    {"threads": t, "aggregate_rate": r, "aggregate_gbytes_per_second": r / 1e9}
+                    for t, r in rates
+                ]
+            }
+        },
+    }
+
+
+def test_median_service_probe_outvotes_a_single_bad_run() -> None:
+    """Calibrating from one probe run is a lottery, so the builder combines runs.
+
+    Measured on Amazon C9g: three consecutive runs of the same probe spread 45-47% on
+    `gemm_core_flops`, and one of them produced a degenerate calibration - every fitted
+    overhead zero and the planner's own region at 7.8% instead of 2.3%.
+    """
+    runs = [
+        _service_probe([(1, 100.0), (2, 200.0)]),
+        _service_probe([(1, 130.0), (2, 190.0)]),
+        _service_probe([(1, 110.0), (2, 1.0e9)]),
+    ]
+    merged = median_service_probe(runs, sources=["a", "b", "c"])
+    rows = merged["services"]["l2_bytes"]["rows"]
+
+    assert rows[0]["aggregate_rate"] == 110.0
+    assert rows[1]["aggregate_rate"] == 200.0
+    assert rows[0]["aggregate_gbytes_per_second"] == 110.0 / 1e9
+    assert merged["provenance"]["service_probe_median"] == {
+        "runs": 3,
+        "points_combined": 2,
+        "sources": ["a", "b", "c"],
+    }
+    # The inputs are evidence; combining them must not rewrite them.
+    assert runs[0]["services"]["l2_bytes"]["rows"][0]["aggregate_rate"] == 100.0
+
+
+def test_median_service_probe_passes_one_run_through_and_refuses_mismatched_ones() -> None:
+    single = _service_probe([(1, 100.0)])
+    passed = median_service_probe([single])
+    assert passed["services"]["l2_bytes"]["rows"][0]["aggregate_rate"] == 100.0
+    assert "service_probe_median" not in passed.get("provenance", {})
+
+    with pytest.raises(ValueError, match="different machines"):
+        median_service_probe([single, _service_probe([(1, 1.0)], machine="arm-codex")])
+    with pytest.raises(ValueError, match="disagree on kind"):
+        median_service_probe([single, _service_probe([(1, 1.0)], kind="contention_async")])
+    with pytest.raises(ValueError, match="at least one"):
+        median_service_probe([])
+
+
+def test_median_service_probe_keeps_a_point_only_one_run_measured() -> None:
+    full = _service_probe([(1, 100.0)])
+    empty = {"kind": "moe_analytic_service_probe", "machine": {"id": "c9g"},
+             "services": {"l2_bytes": {"rows": []}}}
+    merged = median_service_probe([full, empty, empty])
+    assert merged["services"]["l2_bytes"]["rows"][0]["aggregate_rate"] == 100.0
+    assert merged["provenance"]["service_probe_median"]["points_combined"] == 0
