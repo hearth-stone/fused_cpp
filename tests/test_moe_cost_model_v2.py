@@ -1614,3 +1614,58 @@ def test_amazon_c5_table_resolves_only_on_the_machine_it_was_measured_on() -> No
         assert default_stage_window_policy(
             hidden_size=4096, intermediate_size=1024, backend_n_tile=8, machine_id=machine
         ) is None
+
+
+def test_amazon_c9g_tp4_table_is_registered_for_that_machine_only() -> None:
+    """C9g's table, against tmp/c9g_grid_20260922/tp4_table.json.
+
+    It shares a shape with the Amazon C5 table - H=4096, F=512, n_tile 8, because C9g's
+    128-bit SVE tiles by 8 - so the two are told apart only by `machine_ids`. Registered on
+    whole-plan evidence: 18 fresh layers, windows against full stripes, 18 of 18 faster by a
+    median 2.07% (`results/c9g_window_table_20260922.md`).
+    """
+    from stage_window_policy import AMAZON_C5_192C_TP4_F512_V5 as c5
+    from stage_window_policy import AMAZON_C9G_192C_TP4_F512_N8_V1 as policy
+    from stage_window_policy import default_stage_window_policy
+
+    machine = "amazon_c9g_192c_2numa_96c_sve128_tp4"
+    shape = dict(hidden_size=4096, intermediate_size=512, backend_n_tile=8)
+    assert policy in _registered_policies()
+    assert policy.matches_shape(**shape) and c5.matches_shape(**shape)
+    assert default_stage_window_policy(**shape, machine_id=machine) is policy
+    for other in (None, *c5.machine_ids, "arm_codex_320c_numa3_80c_sve256_jemalloc_narrow_merge_v9"):
+        assert default_stage_window_policy(**shape, machine_id=other) is not policy
+
+    # Bands tile routes 17-720 without gaps; 1-16 and above 720 keep the full stripe.
+    assert [(b.min_routes, b.max_routes) for b in policy.bands] == [
+        (17, 33), (34, 67), (68, 135), (136, 271), (272, 525), (526, 720)
+    ]
+    for routes, threads in ((16, 2), (721, 2), (96, 1), (96, 64)):
+        assert policy.select(routes, threads) == (0, 0)
+        assert policy.time_scale(routes, threads) == 1.0
+
+    # (routes, threads) -> (w13 tiles, w2 tiles), time scale at grid points.
+    expected = {
+        (24, 2): ((1, 8), 0.6108),
+        (24, 32): ((1, 8), 0.972),
+        (48, 2): ((1, 8), 0.4323),
+        (48, 32): ((0, 0), 1.0),
+        (96, 2): ((2, 16), 0.3363),
+        (96, 4): ((1, 8), 0.5068),
+        (192, 8): ((2, 16), 0.8613),
+        (384, 2): ((8, 64), 0.4326),
+        (720, 4): ((16, 128), 0.7013),
+        (720, 8): ((0, 0), 1.0),
+    }
+    for (routes, threads), (windows, scale) in expected.items():
+        assert policy.select(routes, threads) == windows
+        assert policy.time_scale(routes, threads) == scale
+
+    # Every emitted window fits its stage (W13 128 tiles, W2 512 tiles at n_tile 8).
+    w13 = full_stage_geometry(k=4096, n=1024, n_tile=8)
+    w2 = full_stage_geometry(k=512, n=4096, n_tile=8)
+    for band in policy.bands:
+        for threads in band.widths:
+            w13_tiles, w2_tiles = band.select(threads)
+            assert 0 <= w13_tiles <= w13.total_tiles // threads
+            assert 0 <= w2_tiles <= w2.total_tiles // threads

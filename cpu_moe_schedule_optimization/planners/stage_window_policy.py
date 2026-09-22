@@ -377,8 +377,93 @@ ARM_CODEX_NUMA3_80C_TP4_F512_N16_V4 = StageWindowPolicy(
     ),
 )
 
+# Calibrated on Amazon C9g, 2026-09-22: Neoverse-V3, two NUMA nodes of 96 cores, one 96 MiB
+# LLC instance per node, SVE-128 so the packed-B tile is 8 (a W13 tile is 2*4096*8 = 64 KiB and
+# a W2 tile 2*512*8 = 8 KiB). TP4 H=4096 F=512, measured on node 0 at full load with the same
+# grid and the same 2026-09-19 composition rule as the Arm-codex tables, producer-hot A, cold
+# B, jemalloc never-purge, two sessions.
+#
+# The instance this was measured on is not the one that produced the 2026-09-21 grid - that one
+# was reprovisioned - and the table reproduces across the two: 28 of 35 (width, M) cells choose
+# the same window and the time scales drift by 0.001 in median. Ten of the twelve disagreements
+# flip between a one-tile and a two-tile window while `r` barely moves.
+#
+# Registered on whole-plan evidence, not on the grid: 18 fresh layers, the same quick plan with
+# and without these windows, two sessions. Windows won on 18 of 18 by a median 2.07% (best
+# 7.56%, worst 1.24%), against a session-to-session floor of 0.1% and a repeat error of at most
+# 0.16% (`results/c9g_window_table_20260922.md`). The grid's 3-4x per-cell gain does not carry
+# to whole plans; 2.07% is the number production sees, next to Arm-codex's 1.69%.
+#
+# Widths outside (2, 4, 8, 16, 32) are uncalibrated and keep the full stripe, as do routes 1-16,
+# where every window tied, and routes above 720, where there is no evidence.
+AMAZON_C9G_192C_TP4_F512_N8_V1 = StageWindowPolicy(
+    name="amazon_c9g_192c_2numa_tp4_f512_n8_v1_full_load_jemalloc",
+    hidden_size=4096,
+    intermediate_size=512,
+    backend_n_tile=8,
+    machine_ids=("amazon_c9g_192c_2numa_96c_sve128_tp4",),
+    bands=(
+        StageWindowBand(
+            min_routes=17,
+            max_routes=33,
+            w13_tiles=1,
+            w2_tiles=8,
+            widths=(2, 4, 8, 16, 32),
+            overrides={2: (1, 8), 4: (1, 8), 8: (1, 8), 16: (1, 8), 32: (1, 8)},
+            time_scales={2: 0.6108, 4: 0.6927, 8: 0.8339, 16: 0.9024, 32: 0.972},
+        ),
+        StageWindowBand(
+            min_routes=34,
+            max_routes=67,
+            w13_tiles=1,
+            w2_tiles=8,
+            widths=(2, 4, 8, 16, 32),
+            overrides={2: (1, 8), 4: (2, 16), 8: (2, 16), 16: (2, 16), 32: (0, 0)},
+            time_scales={2: 0.4323, 4: 0.573, 8: 0.7898, 16: 0.8774, 32: 1.0},
+        ),
+        StageWindowBand(
+            min_routes=68,
+            max_routes=135,
+            w13_tiles=2,
+            w2_tiles=16,
+            widths=(2, 4, 8, 16, 32),
+            overrides={2: (2, 16), 4: (1, 8), 8: (1, 8), 16: (2, 16), 32: (0, 0)},
+            time_scales={2: 0.3363, 4: 0.5068, 8: 0.7649, 16: 0.9341, 32: 1.0},
+        ),
+        StageWindowBand(
+            min_routes=136,
+            max_routes=271,
+            w13_tiles=2,
+            w2_tiles=16,
+            widths=(2, 4, 8, 16, 32),
+            overrides={2: (2, 16), 4: (2, 16), 8: (2, 16), 16: (0, 0), 32: (0, 0)},
+            time_scales={2: 0.3646, 4: 0.5785, 8: 0.8613, 16: 1.0, 32: 1.0},
+        ),
+        StageWindowBand(
+            min_routes=272,
+            max_routes=525,
+            w13_tiles=8,
+            w2_tiles=64,
+            widths=(2, 4, 8, 16, 32),
+            overrides={2: (8, 64), 4: (8, 64), 8: (0, 0), 16: (0, 0), 32: (0, 0)},
+            time_scales={2: 0.4326, 4: 0.6765, 8: 1.0, 16: 1.0, 32: 1.0},
+        ),
+        StageWindowBand(
+            min_routes=526,
+            max_routes=720,
+            w13_tiles=16,
+            w2_tiles=128,
+            widths=(2, 4, 8, 16, 32),
+            overrides={2: (16, 128), 4: (16, 128), 8: (0, 0), 16: (0, 0), 32: (0, 0)},
+            time_scales={2: 0.4406, 4: 0.7013, 8: 1.0, 16: 1.0, 32: 1.0},
+        ),
+    ),
+)
+
+
 _POLICIES: tuple[StageWindowPolicy, ...] = (
     AMAZON_C5_192C_TP4_F512_V5,
+    AMAZON_C9G_192C_TP4_F512_N8_V1,
     ARM_CODEX_NUMA3_80C_TP4_F512_N16_V4,
 )
 
@@ -428,6 +513,7 @@ def stage_geometry_name(w13_windows: Sequence[int], w2_windows: Sequence[int]) -
 
 __all__ = [
     "AMAZON_C5_192C_TP4_F512_V5",
+    "AMAZON_C9G_192C_TP4_F512_N8_V1",
     "ARM_CODEX_NUMA3_80C_TP4_F512_N16_V3",
     "ARM_CODEX_NUMA3_80C_TP4_F512_N16_V4",
     "FULL_STRIPE",
