@@ -201,6 +201,20 @@ Correctness and second-machine follow-ups (2026-09-21..22):
   packed-B geometry, where `i8gemm.h` documents B_reo as 8-column N blocks while
   `fused_moe_w8a8_tiled_prepare_quantized_weights` pads N to `svcntb()/2`.
   Evidence and probe: `tmp/w8a8_vector_length_20260921/`.
+- [ ] Triage the 16 lab scripts that pin `n_tile = 16`. Three classes, and only
+  one is dangerous: a `backend_n_tile != 16` guard refuses to run on the wrong
+  machine and is merely inconvenient (`dram_write_20260919`,
+  `footprint_probe_20260921`, `window_table_20260918`, `v10_probes_20260919`,
+  `v10_integration_20260920`); a literal in `full_stage_geometry(..., n_tile=16)`
+  computes wrong geometry silently and is the one to fix
+  (`window_table_20260918`, `w2_window_20260919`, `runtime_windows_20260918`,
+  `footprint_probe_20260921`, `dram_write_20260919`); and a hardcoded
+  `"backend_n_tile": 16` in an output record makes the metadata lie. Do not
+  rewrite scripts whose experiment is finished - that breaks reproducibility of
+  the evidence they produced. Fix only the ones still being reused, and give
+  each a declared tile plus a consumer check, as `tmp/c9g_2t_20260922/bench.py`
+  now has. Tracked code is already clean: the only `backend_n_tile=16` in the
+  repository is the Arm-codex window table declaring its own measurement.
 - [ ] The full `tests/` directory aborts (SIGABRT, rc 134) on both machines,
   inside the SDPA suite - `tests/test_sdpa.py::test_sdpa_standard` on
   `Arm-codex`, earlier on C9g. It dies before pytest writes its summary, so the

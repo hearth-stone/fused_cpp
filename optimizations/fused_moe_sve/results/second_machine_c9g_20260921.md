@@ -28,6 +28,17 @@ machines and fail on `Arm-codex` too.
 
 ## The grids: windows matter much more here, and narrow lanes win
 
+> **The width claim in this section is withdrawn (2026-09-22).** The grid ranking below
+> reproduces on a rebuilt instance, but the inference from it to real layers does not. On 18
+> real layers the width search never picks 2T even when allowed, and forcing 48 two-thread
+> lanes loses on 18 of 18 by a median 157%
+> (`c9g_width_and_panel_20260922.md`). A homogeneous full-load grid gives every expert the same
+> M and loads every lane equally, which is 2T's best case; a real layer routes unevenly and the
+> makespan is pinned by the heaviest of 48 narrow lanes. E13's conclusion holds on this machine
+> too, for the same reason it held on `Arm-codex`. What does transfer is the footprint
+> mechanism and the window value, not the width ranking.
+
+
 The 2026-09-19 grid bench with the machine and the shape lifted into environment variables
 (CPU range, `n_tile`, F, widths, routes, windows), 144 experts, two sessions per shape, one
 node, jemalloc never-purge. Design and rules: `tmp/c9g_calibration_20260921/design.md`.

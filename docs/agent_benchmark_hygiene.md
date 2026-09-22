@@ -213,6 +213,38 @@ and the FLOP formula.
 Performance conclusions require measured data. A successful build, profiler
 estimate, analytical prediction, or one favorable sample is not a speedup.
 
+## Reusing A Benchmark On A Machine With Another Vector Length
+
+Before running an existing experiment script on a machine it was not written for, check what
+it assumes about the packed-B tile. Two constants coincide on a 256-bit machine and separate
+everywhere else:
+
+| | value | nature |
+| --- | --- | --- |
+| the NEON quad | always 8 int32 columns (a pair of `q` registers) | a hardware constant |
+| the SVE packed-B tile | `svcntb()/2`: 8 at VL 128, 16 at VL 256, 32 at VL 512 | per machine |
+
+At VL 256 the tile is twice the quad; at VL 128 they are numerically equal. Code that confuses
+them is correct on a 256-bit machine by accident, and fails on another vector length in ways
+that look unrelated to each other. Three instances in one day on C9g: the legacy team N split
+uses the quad where the window plan uses the tile, the vendored i8gemm SVE kernels store a
+fixed 16 columns while stepping `svcntb()/2`, and a plan benchmark refused to run because it
+pinned `n_tile == 16`.
+
+Rules:
+
+- Read the tile from the build, never from a literal:
+  `_moe_C.fused_moe_bf16_tiled_backend_n_tile()`. The repository's geometry tests do this and
+  needed no edit to run on a second vector length.
+- **An artifact that encodes tile counts declares the tile it was built for, and its consumer
+  refuses a mismatch.** Plan V2 windows are counted in tiles, so running a plan built at
+  `n_tile` 8 on a build that tiles by 16 silently doubles every window's physical size and
+  reports no error. A pinned constant at least refuses; removing it without adding the
+  declaration opens a worse hole than it closes.
+- A script that refuses on the wrong machine is an inconvenience. A script that computes
+  geometry from a literal tile - `full_stage_geometry(..., n_tile=16)` - returns wrong numbers
+  quietly, and is the case to look for first.
+
 ## Calibrating From Service Probes
 
 Never build a calibration from a single service-probe run. Run the probe at
