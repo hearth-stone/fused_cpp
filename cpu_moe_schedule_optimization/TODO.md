@@ -50,6 +50,349 @@ first, then refresh calibration and validate the system coherently. In order:
    fusion, router fusion, communication pipelining, and large-K specialization
    outside the primary paper claim until the BF16 Arm path is closed.
 
+## Open code work (refreshed 2026-09-22)
+
+Consolidated from `CURRENT.json`, the sections below, the decision records and
+the working tree. It indexes open work and adds the items no section recorded
+yet; the detailed sections stay authoritative for their own history.
+Paper-facing items live in
+[`../docs/moe_paper_readiness.md`](../docs/moe_paper_readiness.md) ("Paper
+TODO"). Live run status stays in `optimizations/fused_moe_sve/CURRENT.json`.
+
+Both measurement machines have been unreachable since 2026-09-21 (`Arm-codex`
+rejects the SSH key, C9g times out), so everything that needs hardware is
+parked behind access rather than behind a decision. Items marked **needs a
+machine** cannot start until then.
+
+Closed since the 2026-09-20 review:
+
+- [x] Window table under the thread-major order. The 2T rows were re-measured
+  in the new order rather than carried over from V3, and E11 validated the
+  table on 18 unused layers: V4 was 0.27% faster (16/18), inside the frozen
+  0.3% tie band, and the same batch put windows at 1.69% against no windows
+  (v1.117). V4 is registered in place of V3 on the user's decision - lineage
+  consistency, not performance (v1.118).
+- [x] Native (C++) hot-wide planner. `csrc/moe_planner/hot_wide_planner.{h,cpp}`
+  with `NativeHotWidePlanner` bound through `quick_bindings.cpp`: 0.703 ms ->
+  0.205 ms per layer (3.4x) with 45/45 plans identical to the Python planner
+  (`ec85f54`, v1.123). This also removes the cost argument that blocked a short
+  event-scored refinement pass; see the fast-planner gap below.
+- [x] 2T lanes, as a model and product question. The mechanism is the live
+  weight footprint of an LLC domain, not the lane width: at matched footprint
+  the widths agree to 0.008-0.083, at matched width with the footprint free
+  they spread by 0.40 (P9, v1.121). The value is bounded at 0.82% by measured
+  per-expert core time, and six hand-built 2T variants lost on 18/18 layers,
+  with the "keep small experts off 2T" rule measuring 5.10% *slower* (E13,
+  v1.120). 2T stays out of the search space and gets no model correction. What
+  is still open is the code audit, below.
+- [x] Window tables resolving on shape alone - see the one-click section below
+  (`ca843f3`, v1.125).
+
+P0, code that blocks a paper table:
+
+- [ ] **Needs a machine.** Upstream baseline timing on Arm (R2 of "Related-work
+  comparison plan (adopted 2026-09-21)" below, which fixes its scope and
+  attribution). `optimizations/moe_upstream_baselines/` is correctness-only and
+  was run on x86, where the `fused_cpp` backend is skipped (28 passed, 7
+  skipped). Next: build it on Arm-codex, run the correctness suite with
+  `fused_cpp` included, then add a timing harness that follows
+  `docs/agent_benchmark_hygiene.md` (per-backend thread placement,
+  upstream-recommended flags, jemalloc, identical routes). vLLM `neon` is the
+  only upstream with a real Arm BF16 path; llama.cpp BF16 `vec_dot` is scalar
+  and SGLang runs a torch loop, so state what each row means. The clamped
+  SwiGLU (`swiglu_limit=10`) case is not exercised yet.
+- [ ] **Needs a machine.** Four-rank concurrent validation (see "Deferred
+  external validation"). It bounds every current claim, which is one TP rank
+  with three idle nodes. E10 already shows cross-node DRAM traffic is visible
+  (+0.8--13.1% from streaming load), so expect a level shift; the question is
+  whether gains and ranking survive. C9g is a cheaper partial answer: two nodes,
+  and its per-domain footprint is already 2-4x Arm-codex's.
+- [ ] **Needs a machine.** Final planner matrix P4 (43 layers x 3 requests)
+  through the public runtime path with `T_plan + T_execute`, after P1 fixes the
+  planner definition. The definition has moved since P1 was written: the
+  deployed fast path is now `hot_wide` (`enable_moe_planner_fast()`), not the
+  old homogeneous quick, so P1 and P3 need rewording before P4 runs. `T_plan`
+  is now the native planner's 0.205 ms, not Python's 6.6 ms.
+- [ ] **Needs a machine.** Independent repeat of E2/E3/E4. Each is one session
+  set; the talk outline lists this as a gap. One repeat on fresh layers is
+  enough to put a spread on the 12.9% / 9.6% headline numbers. Fold it into P4
+  rather than running it separately if P4 happens first.
+- [ ] **Needs a machine.** Cumulative K1 ablation on one frozen binary (static
+  kernel, exact-M, adaptive gather-pack, fused W13, W2 direct route, windows,
+  merge). Today every row comes from a different date, machine, and build,
+  several glibc-era.
+- [ ] **Needs a machine.** Fused W13 cache blocking in production.
+  `tmp/fusion_stage_20260920` measured the fused path 6--8% slower than the
+  explicit pipeline at M=24--192 on 20 busy 4T lanes without blocking and up to
+  15.6% faster with `--w13-ranges 8`, in the standalone comparator only,
+  blocking on the fused side only, one session for the extension run, no PMU.
+  Open: check how this relates to the production W13 window (`w13 = 1 tile` in
+  most bands), repeat with a second session and L2 refill counters, and only
+  then decide whether a kernel or policy change follows.
+- [ ] Calibration cost as one number: probe points and wall time for P1--P8 plus
+  the window table, against the 418-point / 18 min 25 s empirical profile. Two
+  measured anchors exist now: the C9g service probe at 21 s and its training
+  profile at 60--106 s per shape.
+- [ ] Artifact freeze prerequisites: move the remaining provisional cases into
+  `paper_experiments/` (section 0) and add suites for the 2026-09-20..22
+  experiments (M2/M4, E2--E7, E9--E14, P9) so the frozen commit can regenerate
+  them.
+
+P1, product and model follow-ups (user decisions pending in `CURRENT.json`):
+
+- [ ] Finish the 2T width audit. `IntervalPlanner.widths` still falls back from
+  the caller to the model's `supported_widths` to `_default_widths` (every power
+  of two), while `reliable_widths` is consulted only for tail-pool candidates
+  and the `model_lns` defaults, so production plans can still contain 2T lanes
+  that the model mispredicts. E13 closed the question of whether 2T is worth
+  predicting; it did not change this fallback chain. Audit which widths each
+  production entry point actually emits, then extend the filter to every
+  candidate source or state why not. Note that the answer is machine-specific:
+  on C9g 2T is the *fastest* width at every M up to 192 (v1.123), so the filter
+  must be a property of the calibration, not a constant.
+- [ ] The ~1.09 level bias. Decomposed 2026-09-21 over 546 measured plans:
+  15.3% of the error variance is the per-layer level and 84.7% is between plans
+  of one layer, so the bias is not one constant and a near-constant correction
+  cannot fix ranking - which is exactly how v12, v13 and v14 failed (v1.124).
+  Still unexplained mechanically; report it as a level plus a ranking residual
+  rather than as one number.
+- [ ] **Needs a machine.** E15: the candidate ranking residual
+  `0.61*window_credit - 2.94*loading_share`, frozen in
+  `tmp/v15_candidate_20260921/analysis.md`. It survives leave-one-workload-out
+  and leave-one-set-out on the existing corpus, which v14 never faced, but by
+  the E14 precedent it must be shown on layers nobody has run. Gates weighted to
+  ranking and selection, the reverse of E14's emphasis.
+- [ ] **Needs a machine.** Load-context window choice (M4 defect C1: the static
+  choice loses up to 2.7%, the gain of one window ranges 2--21% with load).
+  Blocked on the stop rule unless it changes a plan choice by >= 2% in both
+  sessions.
+- [ ] Small-M slowdown under load (S1 fail, under-predicted by up to 0.4) and
+  the `p16_r4` preference on 8T-type layers: recorded as limitations unless P4
+  shows they cost a gate. C9g's calibration puts a number on the isolated half
+  of this: the `M < threads` region is over-predicted by up to 42% because the
+  physics charges every core while most hold no row, and a non-negative overhead
+  cannot subtract it.
+- [ ] Fast planner gap to the reference (3.8%, event-level phase overlap). No
+  cheap rule closed it, but the precondition named in the 2026-09-20 review is
+  now met: the native planner is 3.4x faster, so a short event-scored refinement
+  pass is affordable. Decide whether to spend that budget on refinement or keep
+  it as headroom for `T_plan`.
+- [ ] The FP32 direct-route int32 offset limit (about 21,845 tokens at TopK=6):
+  repair it or exclude 30k-token runs from the paper domain (section 0).
+- [ ] User decisions still open: whether to power a proper V4-versus-V3 adoption
+  test for a 0.3% effect; whether to calibrate 32T at all (the full-load grid
+  cannot represent it and it needs a filler-load design); whether to commit or
+  drop the unadopted v14 footprint code in
+  `cost_model/probe_event_model.py` (+95 lines, measured but rejected in E14).
+
+Correctness and second-machine follow-ups (2026-09-21..22):
+
+- [ ] **Needs a machine.** W8A8 on a 128-bit SVE machine. Diagnosed statically
+  as a vector-length assumption, not the race the first C9g pass reported:
+  `i8gemm_k_hybrid` / `narrow` / `narrow2` store a fixed 16 int32 columns per
+  row while their N loop steps `svcntb()/2`, so below 256 bits they write 8
+  columns past each tile, into the neighbouring thread's stripe and past the
+  accumulator's end. `refs/i8gemm/lib/i8gemm_msplit_k.S` shares the macro, and
+  both W8A8 benchmarks call the hybrid kernel directly. The one-condition fix
+  (`svcntb() != 32` forces the packed NEON path) is written down in
+  `tmp/w8a8_vector_length_20260921/analysis.md` but deliberately not applied: it
+  cannot be compiled or tested without a machine. Three falsifiable predictions
+  are pre-registered there, the cheapest being that a `k > 1024, rows > 16`
+  shape at width 2 must already be correct on C9g today.
+- [ ] **Needs a machine.** The analytic model's missing per-panel term. The
+  kernel re-streams an expert's weights once per M12 panel, so about 210 of
+  every 495 us does not scale with the panel's rows; the parameter-free identity
+  `cost(16) = cost(4) + cost(24) - cost(12)` lands within 0.5% where the
+  calibrated model is off by 9.4% (`tmp/panel_boundary_20260921/analysis.md`).
+  `phase_model._formula_iso` and `tiso_roofline.panel_histogram` already carry
+  the structure - the latter has no consumer outside its own test - and
+  `analytic_model` does not. Profile routes 13, 17, 20 and 36 to separate the
+  two, and routes 9, 10, 13, 14, 17, 18 to separate the tail table's `routes %
+  12` from the m8 dispatch's `routes % 8`.
+- [ ] **Needs a machine.** Port the event-model probe curves to C9g; until then
+  that machine has no contention side and cannot run the fast planner. Tracked
+  with the rest of the portability work in the next section.
+
+Repository hygiene (no measurements needed):
+
+- [ ] Triage the uncommitted working tree: 270 untracked paths (was about 390),
+  mostly the 2026-09-05..11 joint-model era (`results/*_202609*.md`,
+  `benchmarks/analyze_*.py`, `tests/test_moe_*.py`), plus
+  `moe_upstream_baselines/`, `scripts/experiment_remote_job.py` and its tests,
+  `docs/moe_talk/`, and a 3099-line `manifest.yaml` addition. Per
+  `docs/git_workflow.md`: commit what is still evidence or live tooling, archive
+  the retired joint-model experiments, and keep the
+  `WideTeamPressureCalibration.occupancy_scale` change with its tests as its own
+  commit. Also still uncommitted and unrelated to this workstream: the
+  shared-packed-A / vLLM staged-queue work in
+  `csrc/moe/arm/common/fused_moe_bf16_tiled.cpp` and the files that move with
+  it. 39 commits on local `main` are unpushed against `origin/main`, and the
+  thread-major commit on `Arm-codex` was never pushed either.
+- [ ] Mark superseded items. "Cost model track after the jemalloc switch" still
+  lists model revisions that v10/v11 replaced (width residual, DRAM demand
+  rule, window-aware event model); "0. Paper-critical closure" still describes
+  the quick regression against fixed 8T that the `hot_wide` adoption changed.
+  Close or annotate them so the open count reflects real work.
+- [ ] Switch remaining consumers (LNS tool defaults, machine configs, frozen
+  anchor plans chosen under v8) to the current model only by separate decision;
+  until then list which consumer uses which calibration in one place.
+
+## One-click calibration and deployment portability (2026-09-21)
+
+What a new ARM machine or a new parallel shape needs today, and what is missing
+before "calibrate once, then just call it" holds. The machine layer is already
+shape-independent and automatic: `calibrate_moe_planner_quick` probes cache
+geometry and service rates with synthetic micro-geometries that never read the
+expert's H/F, detects `backend_n_tile` and the LLC domains, and derives a
+machine id. `enable_moe_planner_quick` takes the shape as arguments, so TP4 to
+TP2 needs no new machine probe. Four gaps remain.
+
+- [x] Window tables resolved on shape alone. `AMAZON_C5_192C_TP4_F512_V5`
+  carried no `machine_ids`, so every machine with H=4096, F=512 and n_tile 8
+  inherited it - C9g's TP4 shape exactly, whose own grid selects different
+  windows. Fixed 2026-09-21: the table names the two NUMA0 calibrations it was
+  measured against, and `_validate_registry` refuses a registered table without
+  `machine_ids`. Unregistered machines now keep the full stripe.
+- [ ] `overheads` are zero after a quick calibration.
+  `build_analytic_calibration.build_calibration` defaults
+  `expert_fixed_ns`/`route_ns` to 0 and only `--training-profile` fills them;
+  `calibrate_moe_planner_quick` does not pass one. Measured, the term is
+  44.3 us + 264.6 ns/route on C9g TP4, 80.2 us + 127.0 ns on TP2 and 210 us +
+  3373 ns on Arm-codex, so small-M is systematically under-predicted. The
+  training profile costs 60-106 s per shape (`profile_contention_async.py` on
+  C9g), so folding it into `enable_moe_planner_quick` behind the H/F it already
+  takes would close the gap at a bounded cost. Shape-dependent: it must rerun
+  when the parallel strategy changes.
+- [ ] Event-model probe curves are per machine and outside the one-click path.
+  `enable_moe_planner_fast` needs a probe-calibrated event model file that only
+  a full probe run produces, so C9g can use the quick runtime but not the fast
+  planner or anything on the contention side.
+- [ ] Profile-based models carry no machine identity. `ContentionCostModel`
+  exposes `policy` but no `calibration`, so `machine_id` is always `None` and,
+  after the fix above, that path never resolves a window table. Before the fix
+  it resolved one by shape regardless of machine, which is the same defect. If
+  windows are wanted there, the profile payload needs a machine id; until then
+  the empirical path is full-stripe by construction.
+- [ ] The C5 machine's own quick-calibration id is unknown, so a quick
+  calibration there no longer resolves its table. Record the id the next time
+  that machine is used and add it, or re-measure the table under a current
+  calibration.
+
+Making the first three true would give: one machine probe per machine, one
+short shape probe per parallel strategy, one registered window table per
+(machine, shape), and plan search at runtime keyed on the bucketed route
+histogram. Only the last of these is per-request.
+
+## Related-work comparison plan (adopted 2026-09-21)
+
+Purpose: give the paper an attributable comparison against the CPU MoE systems
+it positions against, instead of one wall-clock number that mixes microkernel
+and scheduling differences. Positioning, the verified code evidence for
+"different microkernels, same scheduling structure", and the 2x2 table are in
+[`../docs/moe_paper_readiness.md`](../docs/moe_paper_readiness.md)
+("Related-work comparison design"). This section holds the experiments,
+acceptance and cost. Supersedes the scope of the "Upstream baseline timing on
+Arm" item above, which stays open as the R2 work.
+
+Measured cells: **A** vLLM Arm op (upstream kernel, flat queue), **B**
+`staged_queue` control (our kernel, flat queue), **C** production quick/full
+(our kernel, planned schedule). `A -> B` is contribution 1, `B -> C` is
+contribution 3, `A -> C` is context only.
+
+Arm-codex NUMA3 is one shared measurement resource and the window-table chain
+(E11) is in flight in another session. R1-R3 queue behind it.
+
+### R1 Scheduling ablation (B versus C) - the only experiment that licenses a scheduling claim
+
+- [ ] P0 code. Derive `staged_queue` from `fused_moe_bf16_tiled_vllm_staged`
+  (`csrc/moe/arm/common/fused_moe_bf16_tiled.cpp:4491`). Two deltas only:
+  (a) replace the per-N-task A rescan with one gather plus one pack per expert,
+  matching KTransformers (`kt-kernel/operators/amx/moe_base.hpp:310` and `:327`)
+  rather than vLLM; (b) make the column-block size a benchmark-settable
+  parameter instead of deriving it from the L2 budget. Everything else -
+  packing, fused W13 SiLU epilogue, direct-route store, SVE merge, numerical
+  contract - stays identical to production. Experimental entry point only: no
+  change to default dispatch, Plan V2, or any public contract.
+- [ ] Workload axis, ordered by route heterogeneity, all at 2048 tokens,
+  `H=4096`, `F=512`, `E=256`, TopK=6: `moe256-uniform`,
+  `moe256-active-set-{32,64}`, `moe256-tiered-hotspot`,
+  `moe256-long-short-bimodal`, `dsv4-real-2048-seq70` (223 active, max 918,
+  mean 55.1, std 119.6; head of six experts at 500-918 routes, a mass at 27-28,
+  71 single-route experts). The figure is relative `B -> C` gain against this
+  axis, not a single number.
+- [ ] Arms: `staged_queue` with its block size swept ({128, 256, 512,
+  L2-derived}, report its own best), fixed-width homogeneous LPT for every
+  calibrated legal width, quick, full. Report `T_plan + T_execute`, not
+  execution time alone.
+- Expectation before running, from the retired 192C series
+  (`optimizations/fused_moe_sve/results/amazon_192c_vllm_staged_schedule.md`,
+  geometry retired, shape reference only): the flat queue lost 13.07% on six
+  long experts and tied fixed-8T (-0.82%) on 256 uniform `M=48` experts. The
+  paper claim is therefore conditional - when per-expert assignment matters -
+  not a universal win.
+
+### R2 External baseline (A) - closes the P0 upstream-baseline gate
+
+- [ ] `optimizations/moe_upstream_baselines/` already selects isa `neon` and
+  `-march=armv8.2-a+bf16+dotprod+fp16 -DARM_BF16_SUPPORT` on aarch64
+  (`vllm_cpu_moe/__init__.py:21,33`); it has never been built or run on
+  Arm-codex. Run the correctness suite there first, with `fused_cpp` included,
+  against the frozen acceptance (relative L2 <= 1e-2 and
+  `assert_close(atol=7e-2, rtol=7e-2)`); the existing error table is x86.
+- [ ] Then time it on the R1 shapes and routes. vLLM uses `#pragma omp parallel
+  for`, so pin with `OMP_NUM_THREADS=80 OMP_PROC_BIND=close` under the same
+  node-3 placement, and record that its thread model differs from our executor.
+- [ ] Shared expert follows the contract already fixed in the lab README
+  (vLLM applies it outside the op with the scaling folded into router weights).
+- llama.cpp may be added as a third kernel point but stays out of the
+  performance table: its Arm BF16 `vec_dot` is scalar and is a correctness
+  oracle only.
+
+### R3 Mechanism (B versus C)
+
+- [ ] Process-level PMU on two or three representative workloads: concurrent
+  weight footprint over time plus LLC/DDRC counters, via `--profile-variant`
+  and `benchmarks/linux_perf_event.py`. Purpose is to tie `B -> C` to the P9
+  result that the contention state variable is the footprint, not the lane
+  width. Do not claim a single hardware mechanism; that test already failed.
+
+### Protocol and acceptance
+
+- jemalloc preloaded with purging disabled; refuse to run when it is not mapped.
+- node3 `numactl --physcpubind=240-319 --membind=3`, exclusive. During a
+  measurement, nodes 0-2 may run compute-bound work only; no memory-streaming
+  work anywhere (E10: +13.1% from three streaming nodes).
+- One process per data point; 3 warmups, 11 runs, A/B/B/A interleaving, output
+  checked bitwise before timing.
+- Record commit and uncommitted diff, `.so` sha256, `LD_PRELOAD`/`MALLOC_CONF`,
+  team width and backend N tile, W13/W2 stage bytes, affinity.
+- Resolution gate: measured noise is 0.38% (E6 repeat) with a 0.261% median
+  session difference inside one build. Any cell under 1% is reported as a
+  measured tie, never as a win.
+
+### Phases and cost
+
+| Phase | Work | Machine | Estimate |
+| --- | --- | --- | --- |
+| P0 | `staged_queue` implementation and correctness tests | no | half a day |
+| P1 | R1 grid | yes | 30-60 min |
+| P2 | R2 correctness then timing | yes | 1-2 h including first build |
+| P3 | R3 PMU | yes | 30 min |
+| P4 | Tables, figures, related-work text | no | one day |
+
+Machine time is about 2-3.5 h, inside the 2026-09-15 standing authorization.
+
+### Risks
+
+- "Your kernel was co-designed with your scheduler." Mitigation: the control
+  gets the same packing, fusion and one-shot gather, its block size is swept,
+  and R3 reports the mechanism rather than only the number.
+- A tie on uniform workloads is half the thesis, not a failure; the
+  heterogeneity axis exists to express that.
+- Every number remains one TP rank on one 80-core node with three idle nodes
+  until the four-rank validation closes. The abstract says "MoE operator time of
+  one TP rank" until then.
+
 ## Cost model and planner plan (adopted 2026-09-19)
 
 Purpose: turn the open-ended mechanism diagnosis into a bounded path to a paper
@@ -318,8 +661,66 @@ planner from it). Records: [`v10 integration/E1`](../tmp/v10_integration_2026092
   pooled tasks measure 3.25-4.25x their predicted isolated time. The model now publishes
   `calibrated_widths` / `reliable_widths` and the planner keeps automatic pool widths inside
   them, which flips the r008_l21 preference back to the strict plan, as measured.
-- [ ] Open: a native (C++) hot-wide planner; a mechanism for 2T lanes that survives whole plans;
-  the model's unexplained ~1.09 level bias; the paper's planner matrix (P1/P4).
+- [x] E9, does the stage window order matter
+  ([record](../optimizations/fused_moe_sve/results/window_order_thread_major_20260920.md),
+  MATHEMATICAL_MODEL v1.116): thread-major against window-major, two builds of one checkout,
+  6 real layers x 11 plans = 66 points, A B B A. Median -0.027%, sign 37/66, p10/p90
+  -0.245%/+0.291% against a 0.261% median session spread inside a build; per-layer Spearman
+  0.82-0.99, the fastest plan never moved, and all 66 plan outputs hash equal. Thread-major
+  adopted: each worker owns a contiguous N stripe and windows cut inside it.
+- [x] E10, what concurrent work on the other NUMA nodes costs a measurement
+  ([record](../optimizations/fused_moe_sve/results/numa_interference_20260920.md)):
+  +0.8--13.1% depending on how many nodes stream DRAM. Written into
+  `docs/agent_benchmark_hygiene.md` as a protocol rule, and the reason Arm-codex runs are
+  serialised across sessions.
+- [x] E11, does the window table survive the order change
+  ([record](../optimizations/fused_moe_sve/results/window_table_thread_major_20260921.md),
+  v1.117/v1.118): the 4/8/16T grids and the 2T rows were re-measured thread-major, composed
+  as V4 by the unchanged 2026-09-19 rule. V4 and V3 differ in 16 cells, but the grid's own
+  repeat moves choices by as much, so they are measured ties; on 18 fresh layers V4 was
+  0.27% faster (16/18), short of the frozen 0.3% adoption gate. The same batch measured
+  windows at 1.69% against no windows on whole plans. V4 registered on the user's decision
+  for lineage consistency - every row, including 2T, now comes from the current kernel order.
+- [x] E12/P9, what the 2T error actually is
+  ([record](../optimizations/fused_moe_sve/results/narrow_lane_cache_mechanism_20260921.md),
+  v1.119/v1.121): not the window term (E12's three frozen readings all negative) and not the
+  lane width. The state variable is rho, the live weight bytes an LLC domain holds over its
+  capacity: at matched rho the widths agree to 0.008-0.083, at matched width with the
+  footprint free they spread by 0.40. The window PMU evidence (DRAM reads -27..-75%, L2
+  refills -0..-9%) puts it at the shared LLC, not private L2. The model's curves are indexed
+  by (target width, other cores) and cannot express one core count at different slices.
+- [x] E13, is 2T worth anything
+  ([record](../optimizations/fused_moe_sve/results/second_machine_c9g_20260921.md) for the
+  cross-machine part, v1.120): closed on Arm-codex. Measured per-expert core time bounds the
+  gain at 0.82%, and six hand-built 2T variants lost on 18/18 layers by 15-20%; the rule the
+  mechanism suggested - keep routes <= 16 experts off 2T lanes - measured 5.10% slower,
+  because the imbalance costs more than the LLC overflow. **This result does not transfer**:
+  on C9g 2T is the fastest width at every M up to 192 (v1.123).
+- [x] E14, does the footprint correction beat v11
+  (`tmp/footprint_validation_20260921`, v1.122): v14 indexes the correction by rho and fades
+  it in with domain occupancy. Descriptively it improved 588 already-measured plans
+  (1.090 -> 1.061), and on 9 fresh layers it passed the level gate (+0.021 against a 0.020
+  threshold) but failed ranking (Spearman 0.94 -> 0.89) and selection (regret@1 median/max
+  0.00%/0.00% against 1.89%/4.16%), with `lns_v14` measuring 1.89% slower and winning 0/9.
+  Not adopted; v11 remains the reference. The mechanism stands, the composition rule does not.
+- [x] Native (C++) hot-wide planner (`ec85f54`, v1.123): 0.703 ms -> 0.205 ms per layer,
+  45/45 plans identical.
+- [x] Second machine (C9g: Neoverse-V3, 2 x 96 cores, 96 MiB L3 per node, SVE-128 so
+  n_tile 8)
+  ([record](../optimizations/fused_moe_sve/results/second_machine_c9g_20260921.md), v1.123):
+  the footprint mechanism holds across machines and shapes - two shapes whose per-expert
+  weights differ by 2x land on one rho curve - while the level and the best lane width do
+  not. Its analytic calibration reaches 2.0%/4.5% MAPE in the planner's own region.
+- [x] Error decomposition and the window table's machine scope
+  ([record](../optimizations/fused_moe_sve/results/offline_findings_20260921.md),
+  v1.124/v1.125): 84.7% of the plan error variance is between plans of one layer and only
+  15.3% is the per-layer level, which is why v12-v14 all moved the level and left the
+  ranking alone; a candidate ranking residual is frozen for E15. Separately, a window table
+  no longer resolves on a machine it was not measured on.
+- [ ] Open: E15 (the ranking residual on fresh layers); the analytic model's missing
+  per-panel term; W8A8 below 256-bit SVE; the model's unexplained level bias, now split into
+  a per-layer level and a within-layer ranking residual; the paper's planner matrix (P1/P4).
+  The 2T mechanism and value questions are closed above, and the native planner is done.
 
 Stop rules: no new physical term unless it changes a measured plan choice by
 >= 2% in both sessions; no new order/transfer search layers; glibc-era results
