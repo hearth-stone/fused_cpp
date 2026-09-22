@@ -59,10 +59,11 @@ Paper-facing items live in
 [`../docs/moe_paper_readiness.md`](../docs/moe_paper_readiness.md) ("Paper
 TODO"). Live run status stays in `optimizations/fused_moe_sve/CURRENT.json`.
 
-Both measurement machines have been unreachable since 2026-09-21 (`Arm-codex`
-rejects the SSH key, C9g times out), so everything that needs hardware is
-parked behind access rather than behind a decision. Items marked **needs a
-machine** cannot start until then.
+C9g is available and has carried this session's work. **`Arm-codex` is not to
+be used for performance measurement for now (user, 2026-09-22)**, so items
+marked **needs Arm-codex** are parked behind that decision rather than behind
+access. Correctness runs on that machine are not obviously covered by the
+constraint; confirm before using it for one.
 
 Closed since the 2026-09-20 review:
 
