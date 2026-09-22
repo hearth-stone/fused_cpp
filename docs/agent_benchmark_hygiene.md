@@ -153,8 +153,24 @@ Rules that follow:
 - Memory-streaming work must not overlap a measurement, wherever it is placed:
   large copies, dataset generation, archive extraction, another MoE benchmark.
   Sequence it before or after, or accept and report the contamination.
-- The 1-minute load-average idle guard stays the cheap pre-session check, but it
-  means "no foreign work of unknown kind", not "other nodes are harmless".
+- The idle guard must watch the 5-minute load average as well as the 1-minute
+  one, and a chain waits out a fixed cooldown before its first measured session.
+  A 1-minute average is too fast a filter to separate a session from the work
+  immediately before it: on C9g a session admitted at 1-minute load 0.39, with
+  the 5-minute average still at 3.10, came out 0.54% off a clean baseline whose
+  own session-to-session spread is 0.1%, and it was the run that had just
+  finished 27 s earlier - our own - that it had not been separated from. The
+  guard means "no foreign work of unknown kind" and "not immediately after our
+  own work"; it never means "other nodes are harmless". `scripts/wait_idle.sh`
+  implements it:
+
+  ```sh
+  source scripts/wait_idle.sh
+  wait_idle            # 1-min <= 2 and 5-min <= 4, held for 60 s, giving up after 30 min
+  ```
+
+  It returns nonzero on timeout so a chain records the failure rather than
+  measuring through it.
 - A measurement whose cores are shared with a foreign job is not recoverable by
   any of this. The E6 r022 sessions measured 79-100 ms against 27-28 ms (+190%),
   far beyond anything foreign nodes cause, and were discarded.
@@ -163,6 +179,29 @@ Node-3 core frequency stays at its 2900 MHz maximum under the heaviest of these
 backgrounds, so the effect is memory-path contention beyond the node, not power
 or frequency; the reason node1 (other socket) costs more than node2 (same
 socket) is not identified.
+
+Repeated on Amazon C9g on 2026-09-22 - two nodes of 96 cores, one 96 MiB LLC
+instance per node, one socket - with the full-load grid on node 0 and the same
+backgrounds on node 1
+(`results/numa_interference_c9g_20260922.md`):
+
+| background on node 1 | node-0 grid time |
+| --- | --- |
+| BF16 matmul, 96 threads | -0.06% and +0.15%, 4 of 12 cells slower |
+| memory streaming, 96 threads | +1.06% and +0.90%, 12 of 12 cells slower |
+
+The rule above holds on both machines and the per-node streaming cost is the
+same to within the measurement, although C9g shares one LLC slice among 96 cores
+where `Arm-codex` shares one among 40, and carries 2-4x the per-domain weight
+footprint. Cross-node interference therefore lives on the path between nodes,
+not in the last-level cache, and is a different mechanism from the footprint
+effect that governs window value.
+
+Session-to-session reproducibility, measured on C9g from four identical idle
+sessions run back to back: per-cell spread median 0.49% and at most 1.14%, with
+session medians inside 0.1%. Treat a difference below that as unresolved
+regardless of how many runs a single session averages - within one session the
+same cell reproduces to about 0.1%, which is not the same quantity.
 
 ## Sanity Checks
 
