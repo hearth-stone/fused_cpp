@@ -187,6 +187,12 @@ P1, product and model follow-ups (user decisions pending in `CURRENT.json`):
 
 Correctness and second-machine follow-ups (2026-09-21..22):
 
+- [ ] Routes 9 and 10 are under-predicted by 5.2% and 5.7% at one thread by
+  every candidate row count, the model's own `exact_m` included, so no tail
+  table addresses it (`results/panel_term_c9g_20260922.md`). This is what is
+  left of the tail-table question after the `routes % 12` claim was withdrawn:
+  the model's active policy is `xbyak_exact_m`, which rounds nothing and is
+  already the best of the three candidates.
 - [ ] W8A8 below 256-bit SVE: find the packed path's vector-length assumption.
   Measured 2026-09-22 on both machines, one process per case: **six of six
   shapes correct at 256 bits, six of six corrupt at 128 bits**, so the defect

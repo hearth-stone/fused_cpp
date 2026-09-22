@@ -79,6 +79,35 @@ up to a full twelve-row panel that the kernel never runs.
 Neither table is right at routes 9 and 10 - `% 8` is 5% low on both shapes - so fixing the
 modulus alone moves the error from +11% to -5%, not to zero.
 
+### Correction (2026-09-22): the modulus comparison used a table the model does not use
+
+The section above compares the kernel's `routes % 8` dispatch against the model applying its
+tail table to `routes % 12`. That is the `static_bucketed` tail policy. **These calibrations
+use `xbyak_exact_m`**, where `_exact_m` is true and `m12_effective_rows(q) == q` for every q -
+the model rounds nothing at all. Scoring the row count the model actually charges against the
+two tables:
+
+| routes | measured (TP4) | exact q, the model's | `% 8` | `% 12` |
+| --- | --- | --- | --- | --- |
+| 9 | 454.8 us | **-5.2%** | -5.2% | +11.4% |
+| 10 | 457.7 us | **-5.2%** | -5.2% | +10.7% |
+| 13 | 765.0 us | +2.8% | +2.2% | +2.8% |
+| 14 | 764.9 us | **-1.0%** | +2.2% | -1.0% |
+| 17 | 842.9 us | **-0.7%** | -0.7% | +5.6% |
+| 18 | 844.9 us | **-0.9%** | -0.9% | +5.4% |
+| 20 | 895.5 us | **-0.6%** | -0.6% | -0.6% |
+
+Mean absolute error: exact 2.3%, `% 8` 2.4%, `% 12` 5.4% on TP4; 3.4%, 3.6%, 5.9% on TP2.
+
+So **the active path is already the best of the three and there is no modulus defect to fix**.
+The `% 12` claim stands only against the `static_bucketed` policy, which no calibration in use
+here selects. The earlier statement that "the model's modulus is wrong and it costs 11% at
+routes 9 and 10" is withdrawn.
+
+What survives is the residual the tables were competing to explain: **routes 9 and 10 are
+under-predicted by 5.2% and 5.7% by every candidate**, exact included. That is the real open
+item, and no row-count table addresses it, since exact and `% 8` charge the same rows there.
+
 ## What changes
 
 Nothing yet. The identity result is inconclusive by the rule that was frozen for it, and the
