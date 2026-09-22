@@ -104,6 +104,31 @@ was clean (that run shared a process; a corrupted chunk is only detected when it
 With the six-shape run above: **10 of 10 correct at 256 bits, 10 of 10 corrupt at 128 bits**,
 over widths 1, 2 and 4 and both families.
 
+### Confirmed on the kernel alone, with no MoE code involved
+
+`i8gemm_vl_unit.cpp` links only `i8gemm_sve.S` and `i8gemm_hybrid.S` - no torch, no threads, no
+MoE wrapper, no windows. It asks each kernel for exactly `N = svcntb()/2` columns, which is the
+tile width the kernel's own N loop computes, and gives C a `ldc` of 64 so an overrun shows up as
+nonzero columns instead of corrupting the heap:
+
+```
+SVE vector length 128 bits, n_tile = VL/2 = 8 columns
+asking each kernel for N = 8 columns, with ldc = 64 so an overrun is visible
+
+i8gemm_k_hybrid : highest nonzero column = 15, expected at most 7 -> WROTE PAST ITS N
+i8gemm_k_nld_m12: highest nonzero column = 15, expected at most 7 -> WROTE PAST ITS N
+```
+
+Both families write columns 0-15 when asked for 8: exactly the fixed 64-byte, 16-column store,
+eight columns past the tile. **The defect is in the i8gemm library, not in how the MoE path calls
+it.** The kernels are internally inconsistent at any vector length other than 256 bits: no caller
+contract can repair a loop that advances N by 8 while each iteration writes 16.
+
+The library intends to support this machine. `refs/i8gemm/results/reports/HANDOFF.md:28` states
+that V3 is `VL=128bit` so `n_tile = VL_bytes/2 = 8`, and warns against carrying over the
+"V3 VL=256 / n_tile=16" assumption - which is precisely the assumption still frozen into the
+store macros.
+
 Three repairs are open, from narrowest to widest: refuse W8A8 unless `svcntb() == 32` (one
 condition, validatable on both machines today, and it narrows the execution contract in
 `docs/public_contracts.md`, which currently names only "Linux AArch64 SVE+i8mm"); build the
