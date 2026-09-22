@@ -217,6 +217,72 @@ design with gates weighted to ranking and selection is drafted in the lab record
 
 ---
 
+---
+
+## 4. The i8gemm vector-length defect is fixed, and verified on both vector lengths
+
+The repair is in the store macros themselves, chosen at assembly time. `setup.py` already
+forwards the extension's `define_macros` to native sources (`setup.py:186`) and `.S` files run
+through cpp, so `FUSED_CPP_MOE_SVE_VECTOR_BITS` - which the build detects and
+`csrc/moe/common/backend.cpp:281` verifies against the running thread - is available to the
+assembler with no build change.
+
+Each of `DEINT_QUADS` (`i8gemm_sve.S`) and `HSTORE_PAIR` (`i8gemm_hybrid.S`, both halves) now
+emits **two 128-bit quads per 128 bits of vector length** instead of four unconditionally, which
+is exactly the `n_tile = svcntb()/2` columns its N loop steps:
+
+```c
+#ifndef FUSED_CPP_MOE_SVE_VECTOR_BITS
+#define FUSED_CPP_MOE_SVE_VECTOR_BITS 256
+#endif
+#if FUSED_CPP_MOE_SVE_VECTOR_BITS != 128 && FUSED_CPP_MOE_SVE_VECTOR_BITS != 256
+#error "i8gemm SVE kernels support a 128- or 256-bit vector length; the 4-quad epilogue
+        and its scale/bias register budget have not been generalised further"
+#endif
+#define I8GEMM_SVE_QUAD_PAIRS (FUSED_CPP_MOE_SVE_VECTOR_BITS / 128)
+```
+
+and the second quad pair, its `ext` rotations and its `fadd` bias terms sit behind
+`#if I8GEMM_SVE_QUAD_PAIRS >= 2`. 43 changed lines across the two files.
+
+512 bits is refused at assembly time rather than generalised: the `bias` mode holds four quads
+of bias in z8-z11 and `LOAD_SCALED_TILE_AUX` loads four scale quads, so eight would need the
+register budget reworked, and there is no machine here to validate it on. A build error is the
+right answer for the direction that otherwise leaves half of every tile unwritten.
+
+### Verification
+
+| check | result |
+| --- | --- |
+| kernel-only unit check at 128 bits | `i8gemm_k_hybrid` and `i8gemm_k_nld_m12` now write columns 0-7 when asked for 8 (was 0-15) |
+| **256-bit output unchanged** | disassembly of both files at `-DFUSED_CPP_MOE_SVE_VECTOR_BITS=256` is **identical** to the original, so this is a no-op on `Arm-codex` |
+| 512-bit build | fails with the `#error`, as intended |
+| `test_moe_w8a8.py` on C9g | **7 passed** (previously corrupted the heap) |
+| four shapes against the dynamic-quantisation reference on C9g | repeatable, max abs err 2.861e-06 at H=64 and 1.007e-03 at H=2048 - **the same values `Arm-codex` produces** |
+| MoE suites on C9g | 298 passed |
+| kernel suite on C9g | 80 passed, 1 skipped |
+
+The two machines now agree numerically on the same shapes, which is a stronger statement than
+"no longer crashes".
+
+### Not fixed, and deliberately so
+
+`DEINT_SCALED_QUADS` and `LOAD_SCALED_TILE_AUX` in `i8gemm_sve.S` carry the same defect - the
+latter loads four scale and four bias quads for what is only `n_tile` columns, so below 256 bits
+it reads past those arrays - and `i8gemm_msplit_k.S` shares the store macro. None of them is
+reached by the W8A8 MoE path (`i8gemm_k_scaled_*` and `i8gemm_msplit_dispatch` have no caller
+here), so there is no way to validate a change to them from this repository. They stay broken and
+recorded rather than changed blind.
+
+### Delivery is unresolved
+
+`refs/` is in `.gitignore:15`, so **nothing under it can be committed**; the patch currently
+exists only in the working trees of this host and C9g, and as
+`tmp/w8a8_vector_length_20260921/i8gemm_vl.patch`. The content is recorded above so the knowledge
+survives regardless. Three ways to version it, for the user to choose: a `.gitignore` exception
+for the two files, a patch applied by the build, or our own copy of the two `.S` files under
+`csrc/moe/arm/i8mm_w8a8/` that `setup.py` prefers.
+
 ## What is now waiting on a machine
 
 | item | first action when access returns |
