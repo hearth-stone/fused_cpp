@@ -1,0 +1,15 @@
+{
+  "exclude": [
+    "tmp/",
+    "3rdparty/",
+    ".venv/",
+    "build/",
+    "bench_assets/",
+    "**/profiles/*.json",
+    "**/results/*.json",
+    "**/paper_experiments/**/*.json"
+  ],
+  "includeIgnored": [
+    "refs/i8gemm/"
+  ]
+}
