@@ -40,10 +40,41 @@ the barrier.
 the hybrid kernel directly, so they would report wrong numbers, not just wrong timings, on any
 non-256-bit machine.
 
-The minimal fix is one condition - take the packed path whenever `svcntb() != 32` - and it is
-**not applied**: it cannot be compiled or tested here, and the machine that exercises it is
-unreachable. Three falsifiable predictions are pre-registered in the lab record, the cheapest
+The minimal fix looked like one condition - take the packed path whenever `svcntb() != 32` -
+and was **not applied**, because it could not be compiled or tested while both machines were
+unreachable. Three falsifiable predictions were pre-registered in the lab record, the cheapest
 being that a `k > 1024, rows > 16` shape at width 2 on C9g must already be correct today.
+
+### Measured 2026-09-22: the vector length is confirmed, this mechanism is not the whole defect
+
+Both machines came back and the predictions were run, one process per case because heap
+corruption poisons every later observation in the same process
+(`tmp/w8a8_vector_length_20260921/probe.py`):
+
+| H=F | tokens | width | rows | family | `Arm-codex` 256-bit | C9g 128-bit |
+| --- | --- | --- | --- | --- | --- | --- |
+| 64 | 48 | 2 | 24 | hybrid | repeatable | `free(): chunks in smallbin corrupted` |
+| 64 | 48 | 4 | 24 | hybrid | repeatable | `free(): chunks in smallbin corrupted` |
+| 256 | 96 | 2 | 48 | hybrid | repeatable | `free(): chunks in smallbin corrupted` |
+| 2048 | 96 | 2 | 48 | **packed** | repeatable | `corrupted size vs. prev_size` |
+| 2048 | 96 | 4 | 48 | **packed** | repeatable | `corrupted size vs. prev_size` |
+| 2048 | 192 | 4 | 96 | **packed** | repeatable | `free(): chunks in smallbin corrupted` |
+
+**Six of six correct at 256 bits, six of six corrupt at 128 bits.** That the defect follows the
+vector length rather than the thread count is now measured across two microkernel families and
+two machines, which is stronger evidence than the static read gave.
+
+But the last three shapes take the **packed NEON path** and never execute `HSTORE_PAIR`, and they
+corrupt the heap all the same. So `i8gemm_k_hybrid`'s fixed 16-column store is a real
+vector-length bug and it explains the hybrid rows, but it is **not the whole defect**: at least
+one more vector-length assumption sits in the packed path (`i8gemm_k_nld*`,
+`i8_pack_A_neon_m8_asm`, `pack_m12`/`prepare_packed_a`, or the packed-B geometry, whose
+documented layout in `refs/i8gemm/lib/i8gemm.h` is an 8-column N block while the wrapper uses
+`svcntb()/2`).
+
+**The proposed fix is therefore wrong and must not be applied**: forcing the packed path below
+256 bits moves the work onto a path that is also broken there. Locating the packed-path
+assumption is the prerequisite, and is tracked in `TODO.md`.
 
 ---
 

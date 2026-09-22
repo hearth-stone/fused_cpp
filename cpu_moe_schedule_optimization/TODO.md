@@ -187,18 +187,25 @@ P1, product and model follow-ups (user decisions pending in `CURRENT.json`):
 
 Correctness and second-machine follow-ups (2026-09-21..22):
 
-- [ ] **Needs a machine.** W8A8 on a 128-bit SVE machine. Diagnosed statically
-  as a vector-length assumption, not the race the first C9g pass reported:
-  `i8gemm_k_hybrid` / `narrow` / `narrow2` store a fixed 16 int32 columns per
-  row while their N loop steps `svcntb()/2`, so below 256 bits they write 8
-  columns past each tile, into the neighbouring thread's stripe and past the
-  accumulator's end. `refs/i8gemm/lib/i8gemm_msplit_k.S` shares the macro, and
-  both W8A8 benchmarks call the hybrid kernel directly. The one-condition fix
-  (`svcntb() != 32` forces the packed NEON path) is written down in
-  `tmp/w8a8_vector_length_20260921/analysis.md` but deliberately not applied: it
-  cannot be compiled or tested without a machine. Three falsifiable predictions
-  are pre-registered there, the cheapest being that a `k > 1024, rows > 16`
-  shape at width 2 must already be correct on C9g today.
+- [ ] W8A8 below 256-bit SVE: find the packed path's vector-length assumption.
+  Measured 2026-09-22 on both machines, one process per case: **six of six
+  shapes correct at 256 bits, six of six corrupt at 128 bits**, so the defect
+  follows the vector length and not the thread count. But three of those shapes
+  take the packed NEON path and never execute `HSTORE_PAIR`, so
+  `i8gemm_k_hybrid`'s fixed 16-column store - a real bug, and the one the static
+  read found - is not the whole defect. **The `svcntb() != 32` gate written down
+  earlier is invalid**: it routes onto a path that is equally broken. Bisect, in
+  the order the packed path touches them: `prepare_packed_a` / `pack_m12` /
+  `pack_m8` (which calls `i8_pack_A_neon_m8_asm`), `i8gemm_k_nld_m12` and
+  `run_m8`'s `i8gemm_k_nld{,1,2,4}` in `refs/i8gemm/lib/i8gemm_k.S`, and the
+  packed-B geometry, where `i8gemm.h` documents B_reo as 8-column N blocks while
+  `fused_moe_w8a8_tiled_prepare_quantized_weights` pads N to `svcntb()/2`.
+  Evidence and probe: `tmp/w8a8_vector_length_20260921/`.
+- [ ] The full `tests/` directory aborts (SIGABRT, rc 134) on both machines,
+  inside the SDPA suite - `tests/test_sdpa.py::test_sdpa_standard` on
+  `Arm-codex`, earlier on C9g. It dies before pytest writes its summary, so the
+  failure list is lost and the MoE suites have to be selected explicitly. This
+  is an SDPA-side gate, not MoE.
 - [ ] **Needs a machine.** The analytic model's missing per-panel term. The
   kernel re-streams an expert's weights once per M12 panel, so about 210 of
   every 495 us does not scale with the panel's rows; the parameter-free identity
