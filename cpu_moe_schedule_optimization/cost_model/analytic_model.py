@@ -435,6 +435,22 @@ class WideTeamPressureCalibration:
             self.isolated_scale(team_width),
         )
 
+    def occupancy_scale(self, team_width: int, occupied_threads: int, total_threads: int) -> float:
+        """Interpolate isolated and full-cohort dilation from occupied cores.
+
+        Matches the placed-event peer fraction: no peers when the team owns the
+        whole rank, otherwise q = min(1, max(0, A-t)/(C-t)).
+        """
+        width = int(team_width)
+        total = int(total_threads)
+        occupied = min(max(int(occupied_threads), 0), total)
+        isolated = self.isolated_scale(width)
+        full = self.full_cohort_scale(width)
+        if width >= total:
+            return isolated
+        peer_fraction = min(max(occupied - width, 0) / (total - width), 1.0)
+        return isolated + (full - isolated) * peer_fraction
+
     @classmethod
     def from_dict(cls, payload: Mapping[str, object]) -> "WideTeamPressureCalibration":
         return cls(
@@ -1080,6 +1096,7 @@ class AnalyticPolicy:
     concurrent_ranks: int
     llc_bytes_per_rank: int
     llc_topology_signature: tuple[tuple[tuple[int, ...], int], ...]
+    wide_team_pressure: WideTeamPressureCalibration = WideTeamPressureCalibration()
 
     def identity_key(self) -> tuple[object, ...]:
         return (
@@ -1101,6 +1118,8 @@ class AnalyticPolicy:
             self.concurrent_ranks,
             self.llc_bytes_per_rank,
             self.llc_topology_signature,
+            self.wide_team_pressure.isolated_dilation,
+            self.wide_team_pressure.full_cohort_dilation,
         )
 
 def analytic_candidate_shapes(cores: int, widths: Iterable[int]) -> tuple[tuple[int, ...], ...]:
@@ -1543,6 +1562,7 @@ class AnalyticMoeCostModel:
                 (domain.cpu_ids, domain.capacity_bytes)
                 for domain in self.calibration.llc_domains
             ),
+            wide_team_pressure=self.calibration.wide_team_pressure,
         )
         self._t_iso_scalar_cache: dict[tuple[int, int], float] = {}
 
