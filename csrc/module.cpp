@@ -74,6 +74,7 @@ void destroy_kai_thread_pool(int64_t pool_handle);
 int64_t create_kai_gemm_handler(at::Tensor packed_weight, int64_t K, int64_t N);
 void kai_gemm(at::Tensor output, at::Tensor input, int64_t handler_ptr, int64_t pool_handle);
 void release_kai_gemm_handler(int64_t handler_ptr);
+bool kai_gemm_available();
 
 // I8 GEMM declarations - i8gemm.cpp
 std::tuple<at::Tensor, at::Tensor, int64_t, int64_t, int64_t, int64_t, std::string> i8gemm_prepare(
@@ -678,6 +679,8 @@ PYBIND11_MODULE(_C, m) {
 
   // ── KAI GEMM 接口 ──
 #ifdef __aarch64__
+  m.def("kai_gemm_available", &kai_gemm_available,
+        "Whether this build compiled the KleidiAI GEMM (the other kai_* bindings are stubs otherwise).");
   m.def("kai_gemm_prepare", &kai_gemm_prepare, "Prepare (prepack) weight and optional bias for KAI GEMM",
         py::arg("weight"), py::arg("bias") = c10::nullopt);
 

@@ -1,6 +1,5 @@
 #include <ATen/MemoryOverlap.h>
 #include <torch/extension.h>
-#include <torch/csrc/autograd/variable.h>
 
 #include <algorithm>
 #include <array>
@@ -1828,7 +1827,8 @@ at::Tensor prepare_moe_output(const at::Tensor& input, const at::Tensor& w13_pac
 
 at::Tensor finalize_moe_output(at::Tensor output, const c10::optional<at::Tensor>& out) {
   if (out.has_value()) {
-    torch::autograd::impl::bump_version(output);
+    // Same version-counter bump as the autograd helper, without depending on autograd.
+    output.unsafeGetTensorImpl()->bump_version();
   }
   return output;
 }

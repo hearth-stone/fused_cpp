@@ -32,7 +32,10 @@ try:
         destroy_kai_thread_pool as _destroy_kai_thread_pool,
     )
 
-    _supports_kai = True
+    from fused_cpp._C import kai_gemm_available as _kai_gemm_available  # type: ignore[import-untyped]
+
+    # The bindings import even without KleidiAI (stubs that raise); the build flag decides.
+    _supports_kai = bool(_kai_gemm_available())
 except ImportError:
     _supports_kai = False
 

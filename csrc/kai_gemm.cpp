@@ -782,7 +782,13 @@ void kai_gemm(at::Tensor output, at::Tensor input, int64_t handler_ptr, int64_t 
   }
 }
 
+bool kai_gemm_available() { return true; }
+
 #else  // !(__aarch64__ && FUSED_CPP_HAS_KLEIDIAI) -- stub 实现
+
+// The stubs below keep the bindings resolvable when KleidiAI is not built; this is the flag
+// callers must check, since importing the bindings succeeds either way.
+bool kai_gemm_available() { return false; }
 
 at::Tensor kai_gemm_prepare(at::Tensor /*weight*/, c10::optional<at::Tensor> /*bias*/) {
   throw std::runtime_error("KAI GEMM: KleidiAI 后端不可用（需要 AArch64 且构建时启用 KleidiAI）");

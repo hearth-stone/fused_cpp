@@ -728,6 +728,11 @@ if is_aarch64:
         define_macros.append(("FUSED_CPP_HAS_I8GEMM", "1"))
         define_macros.append(("FUSED_CPP_I8GEMM_BACKEND", f'"{i8gemm_backend}"'))
         if i8gemm_backend == "sve":
+            # The SVE i8gemm stores are sized at assembly time from the vector length and
+            # default to 256 bits; _moe_C passes it through its SVE macros, _C must pass it too,
+            # or a 128-bit build of _C's i8gemm writes twice the columns it owns.
+            if platform.system() == "Linux":
+                define_macros.append(("I8GEMM_SVE_VECTOR_BITS", str(sve_vector_bits)))
             moe_define_macros.append(("FUSED_CPP_MOE_HAS_I8GEMM", "1"))
             moe_native_sources.extend(
                 [
