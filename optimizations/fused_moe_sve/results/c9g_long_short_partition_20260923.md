@@ -97,3 +97,13 @@ quick_partition beats the flat queue by 3.7% / 3.2% and quick by 11.0% / 10.2%. 
 2.2-2.5% on the table against L14S1 because the model prices narrow long teams optimistically.
 Its cold plan costs 118 ms (15 placed-DAG scores) against quick's 0.4 ms; a cache hit rebuilds
 the partition from its shape.
+
+### Width descent
+
+The simulated makespan is unimodal in the long width on this batch (falls until the short
+region becomes the tail, then rises: 11.50 ms at 8T, 9.27 at 12T, 11.46 at 16T), so the
+candidate now descends from the middle width instead of scoring all 15. Rerun
+(`qp_all_s{1,2}.json`; the first run is kept in `qp_v1/`): same plan, cold plan 118 -> 61 ms
+(7 placed-DAG scores, one of them quick's plan as the reference), execution 10.52 / 10.58 ms
+against the flat queue's 10.96 / 11.02 (4.0% / 4.0% faster) and quick's 11.86 / 11.85.
+The remaining plan cost is the Python placed-DAG simulator itself.

@@ -824,8 +824,9 @@ class IntervalPlanner:
 
         Applies only when the sorted route counts have a gap of at least
         ``_LONG_SHORT_MIN_ROUTE_RATIO``; the experts above the widest gap get one lane
-        each, every remaining core runs 1T short lanes. Scored by the placed DAG
-        simulator, the same scorer used to compare it against another plan.
+        each, every remaining core runs 1T short lanes. The width is found by descent on
+        the placed DAG simulator score, the same scorer used to compare it against
+        another plan.
         """
         widths = tuple(getattr(self.model, "partition_widths", ()))
         routes = sorted((int(r) for _, r in experts if int(r) > 0), reverse=True)
@@ -834,18 +835,30 @@ class IntervalPlanner:
         long_count = max(range(1, len(routes)), key=lambda k: (routes[k - 1] / routes[k], -k))
         if routes[long_count - 1] < _LONG_SHORT_MIN_ROUTE_RATIO * routes[long_count]:
             return None
-        best = None
-        for width in widths:
-            if width <= 1 or long_count * width >= self.num_cores:
-                continue
-            shape = (width,) * long_count + (1,) * (self.num_cores - long_count * width)
-            tasks = self.long_short_partition_tasks(experts, shape)
-            makespan = self._score(tasks)
-            if best is None or makespan < best[0]:
-                best = (makespan, shape, tasks)
-        if best is None:
+        legal = [width for width in widths if width > 1 and long_count * width < self.num_cores]
+        if not legal:
             return None
-        makespan, shape, tasks = best
+        scored: dict[int, tuple[float, tuple[int, ...], list]] = {}
+
+        def score(index: int) -> float:
+            width = legal[index]
+            if width not in scored:
+                shape = (width,) * long_count + (1,) * (self.num_cores - long_count * width)
+                tasks = self.long_short_partition_tasks(experts, shape)
+                scored[width] = (self._score(tasks), shape, tasks)
+            return scored[width][0]
+
+        # The simulated makespan falls with the long width until the short region
+        # becomes the tail, then rises; descend from the middle instead of scoring
+        # every width (each score is a full placed-DAG simulation).
+        index = len(legal) // 2
+        while True:
+            neighbours = [n for n in (index - 1, index + 1) if 0 <= n < len(legal)]
+            step = min(neighbours, key=score, default=index)
+            if score(step) >= score(index):
+                break
+            index = step
+        makespan, shape, tasks = scored[legal[index]]
         return {
             "shape": shape,
             "execution_mode": _ASYNC_EXECUTION_STRICT,
