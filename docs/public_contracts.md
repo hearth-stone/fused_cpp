@@ -204,7 +204,14 @@ analytical computation without changing planner results or operator behavior.
 
 `enable_moe_planner_quick(...)` is the deployment convenience API. It runs the
 same explicit synchronous quick calibration, constructs a shape-bound runtime,
-and installs it only after both steps succeed. After it returns, compatible
+and installs it only after both steps succeed. With the default
+`train_overheads=True` it also measures isolated experts of the given expert
+shape (`train_quick_operator_overheads`) and fits the operator overheads the
+machine probe cannot see; the written calibration is then bound to that shape
+and must be regenerated when the parallel strategy changes it.
+`train_overheads=False` keeps the shape-independent machine calibration.
+`calibrate_moe_planner_quick` combines `service_repeats` (default 3) probe runs
+by per-point median. After it returns, compatible
 calls to the normal fused-MoE entrypoint require no additional planner API.
 Deployments requiring disjoint initialization/runtime accounting call
 `runtime.initialize_planner(max_routes)` before serving.

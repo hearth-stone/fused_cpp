@@ -409,6 +409,81 @@ def fit_operator_residuals(
     }
 
 
+def _fit_nonnegative_pair(points: Sequence[tuple[float, float]]) -> tuple[float, float]:
+    """Least squares of ``value = fixed + route * routes`` with both terms non-negative."""
+    n = float(len(points))
+    sx = sum(routes for routes, _ in points)
+    sxx = sum(routes * routes for routes, _ in points)
+    sy = sum(value for _, value in points)
+    sxy = sum(routes * value for routes, value in points)
+    determinant = n * sxx - sx * sx
+    fixed, route = 0.0, 0.0
+    if determinant != 0.0:
+        route = (n * sxy - sx * sy) / determinant
+        fixed = (sy - route * sx) / n
+    if fixed >= 0.0 and route >= 0.0:
+        return fixed, route
+    if route < 0.0:
+        return max(sy / n, 0.0), 0.0
+    return 0.0, max(sxy / sxx if sxx else 0.0, 0.0)
+
+
+def fit_width_overheads(calibration_payload: dict, profile: dict) -> dict:
+    """Fit one non-negative (expert_fixed, route) overhead pair per measured width.
+
+    A single overhead pair charges a wide team the fixed cost of a narrow one; on
+    C9g that over-predicts a 12-route expert on 16 threads by 46%. The calibration's
+    own stage scale is kept, so the physics is not refitted per width. Widths with
+    fewer than two isolated rows are skipped and keep the common pair.
+    """
+    AnalyticMachineCalibration.from_dict(calibration_payload)
+    stage_scales = calibration_payload.get("stage_scales", {})
+    stage_scale = float(stage_scales.get("w13", 1.0))
+    untrained = copy.deepcopy(calibration_payload)
+    untrained["overheads"] = {
+        **untrained["overheads"],
+        "expert_fixed_ns": 0.0,
+        "route_ns": 0.0,
+        "by_width": [],
+    }
+    untrained["stage_scales"] = {"w13": 1.0, "w2": 1.0}
+    physics = _model_from_profile(
+        AnalyticMachineCalibration.from_dict(untrained), profile, down_output_element_bytes=2
+    )
+    rows_by_width: dict[int, list[tuple[int, float]]] = {}
+    for row in profile["isolated"]:
+        threads = int(row["threads"])
+        if threads in physics.supported_widths:
+            rows_by_width.setdefault(threads, []).append((int(row["routes"]), float(row["median_ns"])))
+    entries, rows = [], []
+    for width in sorted(rows_by_width):
+        measured = sorted(rows_by_width[width])
+        if len(measured) < 2:
+            continue
+        physical = [stage_scale * physics.T_iso(routes, width) for routes, _ in measured]
+        fixed, route = _fit_nonnegative_pair(
+            [(float(routes), value - scaled) for (routes, value), scaled in zip(measured, physical)]
+        )
+        entries.append({"threads": width, "expert_fixed_ns": fixed, "route_ns": route})
+        for (routes, value), scaled in zip(measured, physical):
+            predicted = fixed + route * routes + scaled
+            rows.append(
+                {
+                    "routes": routes,
+                    "threads": width,
+                    "measured_ns": value,
+                    "predicted_ns": predicted,
+                    "relative_error": predicted / value - 1.0,
+                }
+            )
+    return {
+        "by_width": entries,
+        "stage_scale": stage_scale,
+        "mape": statistics.fmean(abs(row["relative_error"]) for row in rows) if rows else None,
+        "rows": rows,
+    }
+
+
 def median_service_probe(probes: Sequence[Mapping], *, sources: Sequence[str] | None = None) -> dict:
     """Combine probe runs into one by taking each measured point's median rate.
 

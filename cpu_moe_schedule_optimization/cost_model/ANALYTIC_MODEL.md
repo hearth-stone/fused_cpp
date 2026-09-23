@@ -680,8 +680,25 @@ runtime = enable_moe_planner_quick(
 Call this during deployment or service setup. Compatible calls through the
 normal `fused_moe_bf16_tiled` entrypoint then use cached Plan V2 scheduling;
 passing `None` to `set_default_moe_planner_runtime` restores the existing
-dispatcher. The quick workflow deliberately omits isolated-operator residual
-training and records a larger uncertainty than the full calibration.
+dispatcher.
+
+The machine probe never reads the expert shape, so on its own it leaves the
+operator overheads at zero. `enable_moe_planner_quick` therefore follows it, by
+default, with `train_quick_operator_overheads`: isolated experts of the given
+shape at routes 1/4/12/48/192/2040 on every supported width, one common
+`(expert_fixed, route, stage_scale)` residual on 12/192/2040 as the research
+calibration fits it, then one `(expert_fixed, route)` pair per width. The
+service probe itself runs three times and takes the per-point median. On
+Amazon C9g NUMA0 this takes 49 s for TP4 (H=4096, F=512) and 70 s for TP2
+(F=1024), and three independent runs score 7.71-7.85% (TP4) and 8.72-10.55%
+(TP2) mean absolute error on 434 held-out isolated points per shape, against
+7.66% and 10.55% for the research calibration; the untrained single-probe
+workflow scored 20.7-31.4% and 17.2-30.2%
+(`optimizations/fused_moe_sve/results/c9g_one_click_calibration_20260923.md`).
+The trained file is bound to that expert shape: regenerate it when the parallel
+strategy changes the shape. `train_overheads=False` keeps the shape-independent
+machine calibration. Packed-B retention stays at the builder defaults; measured
+C9g values did not change isolated accuracy (`c9g_b_retention_20260923.md`).
 
 The production runtime currently bounds cold planning to homogeneous team
 shapes. It ranks those shapes with analytical isolated expert times and LPT

@@ -19,7 +19,12 @@ import torch
 try:
     from analytic_model import AnalyticMachineCalibration
     from analytic_probe_geometry import b_only_geometry, m12_gemm_geometry, read_cache_info, read_llc_domains
-    from build_analytic_calibration import build_calibration
+    from build_analytic_calibration import (
+        build_calibration,
+        fit_operator_residuals,
+        fit_width_overheads,
+        median_service_probe,
+    )
     from profile_analytic_services import (
         M12_ROWS,
         PROBE_FULL_NO_STORE,
@@ -33,7 +38,12 @@ try:
 except ImportError:  # pragma: no cover - package-style import
     from .analytic_model import AnalyticMachineCalibration
     from .analytic_probe_geometry import b_only_geometry, m12_gemm_geometry, read_cache_info, read_llc_domains
-    from .build_analytic_calibration import build_calibration
+    from .build_analytic_calibration import (
+        build_calibration,
+        fit_operator_residuals,
+        fit_width_overheads,
+        median_service_probe,
+    )
     from .profile_analytic_services import (
         M12_ROWS,
         PROBE_FULL_NO_STORE,
@@ -46,7 +56,16 @@ except ImportError:  # pragma: no cover - package-style import
     )
 
 
-QUICK_CALIBRATION_VERSION = 1
+QUICK_CALIBRATION_VERSION = 2
+# A single quick service probe is a lottery on C9g: three idle runs gave a
+# one-thread isolated error of -16%, -17% and +51% (tmp/c9g_quick_cal_20260923).
+QUICK_SERVICE_REPEATS = 3
+# Operator-overhead training routes, a subset of the research training profile's
+# routes. 12/192/2040 fit the common residual as the research calibration does;
+# all of them fit the per-width pairs.
+QUICK_TRAIN_ROUTES = (1, 4, 12, 48, 192, 2040)
+QUICK_RESIDUAL_ROUTES = (12, 192, 2040)
+QUICK_TRAIN_MEASUREMENT_EXPERTS = 8
 
 
 @dataclass(frozen=True)
@@ -60,6 +79,7 @@ class QuickMoeCalibrationResult:
     supported_widths: tuple[int, ...]
     elapsed_seconds: float
     fit_report: Mapping[str, object]
+    payload: Mapping[str, object] | None = None
 
 
 def _positive_unique(values: Sequence[int], *, maximum: int, name: str) -> tuple[int, ...]:
@@ -365,26 +385,41 @@ def calibrate_moe_planner_quick(
     overwrite: bool = False,
     seed: int = 20260814,
     report: Callable[[str], None] | None = None,
+    service_repeats: int = QUICK_SERVICE_REPEATS,
 ) -> QuickMoeCalibrationResult:
     """Measure and return a thin Plan V2 analytical machine calibration.
 
     This function is intentionally explicit and synchronous. Call it during
     deployment or service setup, before constructing ``PlannedMoE``. It never
     runs at import time or from the fused-MoE execution entrypoints.
+
+    The service probe runs ``service_repeats`` times and each measured point takes
+    the median rate. The result is shape-independent and carries no operator
+    overheads; ``train_quick_operator_overheads`` adds them for one expert shape.
     """
     _validate_host()
+    if int(service_repeats) <= 0:
+        raise ValueError(f"service_repeats must be positive, got {service_repeats}")
     resolved_cpu_ids = _resolve_cpu_ids(cpu_ids)
     output_path = Path(output).expanduser() if output is not None else None
     if output_path is not None and output_path.exists() and not overwrite:
         raise FileExistsError(f"calibration output already exists: {output_path}")
 
     begin = time.perf_counter()
+    probes, domain_runs = [], []
     with _calibration_process_state():
-        probe, domain_probes, service_widths = _collect_quick_service_probe(
-            resolved_cpu_ids,
-            seed=int(seed),
-            report=report,
-        )
+        for repeat in range(int(service_repeats)):
+            run_probe, run_domains, service_widths = _collect_quick_service_probe(
+                resolved_cpu_ids,
+                seed=int(seed) + 1000 * repeat,
+                report=report,
+            )
+            probes.append(run_probe)
+            domain_runs.append(run_domains)
+    probe = median_service_probe(probes)
+    domain_probes = {
+        domain_id: median_service_probe([run[domain_id] for run in domain_runs]) for domain_id in domain_runs[0]
+    }
     ordered_cpu_ids = tuple(int(cpu) for cpu in probe["machine"]["cpu_ids"])
     domain_sizes = tuple(len(domain["cpu_ids"]) for domain in probe["topology"]["llc_domains"])
     planner_widths = (
@@ -410,6 +445,7 @@ def calibrate_moe_planner_quick(
         "service_widths": list(service_widths),
         "supported_widths": list(planner_widths),
         "seed": int(seed),
+        "service_repeats": int(service_repeats),
         "operator_residual_training": False,
     }
     calibration = AnalyticMachineCalibration.from_dict(calibration_payload)
@@ -423,7 +459,180 @@ def calibrate_moe_planner_quick(
         supported_widths=planner_widths,
         elapsed_seconds=time.perf_counter() - begin,
         fit_report=fit_report,
+        payload=calibration_payload,
     )
+
+
+def _measure_isolated_training_rows(
+    *,
+    cpu_ids: tuple[int, ...],
+    hidden_size: int,
+    intermediate_size: int,
+    routes: Sequence[int],
+    widths: Sequence[int],
+    measurement_experts: int,
+    warmup: int,
+    runs: int,
+    seed: int,
+    report: Callable[[str], None] | None,
+) -> tuple[list[dict], int]:
+    """Measure per-expert isolated time the way the research training profile does.
+
+    ``measurement_experts`` experts run back to back on one team of each width and
+    the call time is divided by their count; the same experts repeat every call.
+    """
+    try:
+        from profile_contention_async import bf16, make_async_run, measure, summarize_times
+    except ImportError:  # pragma: no cover - package-style import
+        from .profile_contention_async import bf16, make_async_run, measure, summarize_times
+    from fused_cpp.moe import prepare_fused_moe_bf16_tiled_weights
+
+    class _NoSync:
+        def wait(self) -> None:
+            return None
+
+    generator = torch.Generator().manual_seed(int(seed))
+    std = 0.01
+    w13 = bf16((measurement_experts, 2 * intermediate_size, hidden_size), generator, std)
+    w2 = bf16((measurement_experts, hidden_size, intermediate_size), generator, std)
+    packed = prepare_fused_moe_bf16_tiled_weights(w13, w2, fuse_silu=True)
+    del w13, w2
+    if int(packed.gemm_backend) != 1:
+        raise RuntimeError("operator-overhead training requires the arm_sve_bf16 backend")
+    rows = []
+    try:
+        for route_count in routes:
+            for width in widths:
+                run, groups, _, _ = make_async_run(
+                    packed=packed,
+                    hidden_size=hidden_size,
+                    routes=int(route_count),
+                    shape=[int(width)],
+                    measurement_experts=measurement_experts,
+                    num_profile_experts=measurement_experts,
+                    cpu_ids=list(cpu_ids),
+                    generator=generator,
+                    std=std,
+                )
+                times = measure(run, warmup=warmup, runs=runs, sync_client=_NoSync())
+                per_expert = [max(1, int(round(value / groups))) for value in times]
+                rows.append({"routes": int(route_count), "threads": int(width), **summarize_times(per_expert)})
+                if report is not None:
+                    report(f"train routes={route_count} threads={width} median={rows[-1]['median_ns'] / 1e6:.3f} ms")
+        return rows, int(packed.backend_n_tile)
+    finally:
+        del packed
+        gc.collect()
+
+
+def train_quick_operator_overheads(
+    calibration_payload: Mapping[str, object],
+    *,
+    hidden_size: int,
+    intermediate_size: int,
+    global_experts: int,
+    local_experts: int,
+    cpu_ids: Sequence[int],
+    mode: str = "standalone",
+    degree: int = 1,
+    concurrent_ranks: int = 1,
+    routes: Sequence[int] = QUICK_TRAIN_ROUTES,
+    residual_routes: Sequence[int] = QUICK_RESIDUAL_ROUTES,
+    widths: Sequence[int] | None = None,
+    measurement_experts: int = QUICK_TRAIN_MEASUREMENT_EXPERTS,
+    warmup: int = 3,
+    runs: int = 11,
+    seed: int = 20260923,
+    report: Callable[[str], None] | None = None,
+) -> tuple[dict, dict]:
+    """Fit the operator overheads a quick machine calibration leaves at zero.
+
+    The machine probe never reads the expert shape, so the fixed and per-route cost
+    around the GEMMs stays zero; that under-predicts every width, and the widest by
+    the most (C9g TP4: -54% to -76% at 32-96 threads). This measures isolated
+    experts of one shape and fits, as the research calibration does, one common
+    ``(expert_fixed, route, stage_scale)`` residual on ``residual_routes`` and then
+    one ``(expert_fixed, route)`` pair per width on all ``routes``. The result is
+    shape-bound: rerun it when the parallel strategy changes the expert shape.
+
+    Returns the trained calibration payload and a fit report.
+    """
+    payload = json.loads(json.dumps(calibration_payload))
+    AnalyticMachineCalibration.from_dict(payload)
+    resolved_cpu_ids = _resolve_cpu_ids(cpu_ids)
+    train_widths = tuple(sorted({int(width) for width in (widths or payload["planner"]["supported_widths"])}))
+    if not train_widths or train_widths[-1] > len(resolved_cpu_ids):
+        raise ValueError(f"training widths {train_widths} exceed the {len(resolved_cpu_ids)} calibration CPUs")
+    route_set = tuple(sorted({int(value) for value in routes}))
+    residual_set = {int(value) for value in residual_routes}
+    if not residual_set <= set(route_set) or min(route_set) <= 0:
+        raise ValueError("residual_routes must be a subset of positive routes")
+
+    begin = time.perf_counter()
+    with _calibration_process_state():
+        rows, n_tile = _measure_isolated_training_rows(
+            cpu_ids=resolved_cpu_ids,
+            hidden_size=int(hidden_size),
+            intermediate_size=int(intermediate_size),
+            routes=route_set,
+            widths=train_widths,
+            measurement_experts=int(measurement_experts),
+            warmup=int(warmup),
+            runs=int(runs),
+            seed=int(seed),
+            report=report,
+        )
+    if n_tile != int(payload["kernel"]["backend_n_tile"]):
+        raise RuntimeError(f"training packed n_tile {n_tile} differs from the calibration's")
+    profile = {
+        "isolated": rows,
+        "expert_shape": {
+            "hidden_size": int(hidden_size),
+            "intermediate_size": int(intermediate_size),
+            "activation": "silu",
+            "dtype": "bf16",
+        },
+        "kernel": {"m_tail_policy": "xbyak_exact_m", "backend_n_tile": n_tile},
+        "parallelism": {
+            "mode": str(mode),
+            "degree": int(degree),
+            "global_experts": int(global_experts),
+            "local_experts": int(local_experts),
+        },
+        "target": {"concurrent_ranks": int(concurrent_ranks)},
+    }
+    residual = fit_operator_residuals(
+        payload, profile, train_routes=residual_set, train_threads=set(train_widths)
+    )
+    payload["overheads"]["expert_fixed_ns"] = residual["expert_fixed_ns"]
+    payload["overheads"]["route_ns"] = residual["route_ns"]
+    payload["stage_scales"] = {"w13": residual["stage_scale"], "w2": residual["stage_scale"]}
+    by_width = fit_width_overheads(payload, profile)
+    payload["overheads"]["by_width"] = by_width["by_width"]
+    payload["provenance"]["isolated_residual_training"] = {
+        "routes": residual["train_routes"],
+        "threads": residual["train_threads"],
+        "points": len(residual["rows"]),
+        "source": "quick_operator_overhead_training",
+    }
+    payload["provenance"]["width_specific_overhead"] = {
+        "fit_statistic": "non-negative least squares on the isolated rows, one pair per width",
+        "stage_scale_source": "the calibration's own operator residual fit",
+        "routes": list(route_set),
+        "widths": [entry["threads"] for entry in by_width["by_width"]],
+    }
+    payload["provenance"].setdefault("quick_calibration", {})["operator_residual_training"] = {
+        "hidden_size": int(hidden_size),
+        "intermediate_size": int(intermediate_size),
+        "mode": str(mode),
+        "degree": int(degree),
+        "measurement_experts": int(measurement_experts),
+        "warmup": int(warmup),
+        "runs": int(runs),
+        "elapsed_seconds": time.perf_counter() - begin,
+    }
+    AnalyticMachineCalibration.from_dict(payload)
+    return payload, {"residual": residual, "by_width": by_width, "rows": rows}
 
 
 __all__ = [
@@ -431,5 +640,6 @@ __all__ = [
     "QuickMoeCalibrationResult",
     "calibrate_moe_planner_quick",
     "quick_service_widths",
+    "train_quick_operator_overheads",
     "quick_supported_widths",
 ]

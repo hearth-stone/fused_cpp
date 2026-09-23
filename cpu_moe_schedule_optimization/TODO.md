@@ -281,16 +281,21 @@ TP2 needs no new machine probe. Four gaps remain.
   windows. Fixed 2026-09-21: the table names the two NUMA0 calibrations it was
   measured against, and `_validate_registry` refuses a registered table without
   `machine_ids`. Unregistered machines now keep the full stripe.
-- [ ] `overheads` are zero after a quick calibration.
-  `build_analytic_calibration.build_calibration` defaults
-  `expert_fixed_ns`/`route_ns` to 0 and only `--training-profile` fills them;
-  `calibrate_moe_planner_quick` does not pass one. Measured, the term is
-  44.3 us + 264.6 ns/route on C9g TP4, 80.2 us + 127.0 ns on TP2 and 210 us +
-  3373 ns on Arm-codex, so small-M is systematically under-predicted. The
-  training profile costs 60-106 s per shape (`profile_contention_async.py` on
-  C9g), so folding it into `enable_moe_planner_quick` behind the H/F it already
-  takes would close the gap at a bounded cost. Shape-dependent: it must rerun
-  when the parallel strategy changes.
+- [x] `overheads` were zero after a quick calibration, and one quick service
+  probe was not reproducible. Fixed 2026-09-23 (v1.138):
+  `enable_moe_planner_quick` trains the operator overheads for its expert shape
+  by default (`train_quick_operator_overheads`, 49 s TP4 / 70 s TP2 on C9g) and
+  the probe runs three times with a per-point median. Held-out isolated error
+  went from 20.7-31.4% (TP4) and 17.2-30.2% (TP2) to 7.71-7.85% and 8.72-10.55%,
+  against 7.66% and 10.55% for the research calibration.
+- [ ] Plan quality from a one-click calibration is unmeasured. v1.138 validates
+  isolated accuracy only; compare the widths and windows a v2 quick calibration
+  selects on real layers against the research calibration's, measured.
+- [ ] One-click calibration is validated on C9g only. Repeat the v2 end-to-end
+  run on Arm-codex once performance runs there are allowed again.
+- [ ] Multi-panel under-prediction at wide widths (TP4 >= 8T, TP2 >= 16T;
+  routes 13-96 low by 6-41%). Not packed-B retention (v1.137); attribute the
+  added-panel cost with a PMU-counted thin-panel probe before changing the model.
 - [ ] Event-model probe curves are per machine and outside the one-click path.
   `enable_moe_planner_fast` needs a probe-calibrated event model file that only
   a full probe run produces, so C9g can use the quick runtime but not the fast

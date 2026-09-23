@@ -148,15 +148,92 @@ def test_enable_quick_planner_calibrates_before_installing(
         degree=4,
         shared_experts=1,
         output="machine.json",
+        train_overheads=False,
     )
 
     assert actual is runtime
     assert [event[0] for event in events] == ["calibrate", "construct", "install"]
     assert events[0][1] == ((4, 5),)
+    assert str(events[0][2]["output"]) == "machine.json"
     assert events[1][1] == (calibration,)
     assert events[1][2]["cpu_ids"] == (4, 5)
     assert events[1][2]["shared_experts"] == 1
     assert events[2][1] is runtime
+
+
+def test_enable_quick_planner_trains_the_shape_before_writing_and_installing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    import fused_cpp.moe.planner_runtime as planner_runtime
+    from cpu_moe_schedule_optimization.cost_model import quick_calibration
+
+    machine_payload = {"machine": "payload"}
+    trained_payload = {"trained": True}
+    trained_calibration = object()
+    runtime = _runtime_with_plan(None)
+    events = []
+
+    def calibrate(*args, **kwargs):
+        events.append(("calibrate", kwargs["output"]))
+        return SimpleNamespace(calibration=object(), cpu_ids=(4, 5), payload=machine_payload)
+
+    def train(payload, **kwargs):
+        events.append(("train", payload, kwargs["hidden_size"], kwargs["intermediate_size"], kwargs["degree"]))
+        return trained_payload, {}
+
+    def write(path, payload, *, overwrite):
+        events.append(("write", path, payload))
+
+    monkeypatch.setattr(planner_runtime, "calibrate_moe_planner_quick", calibrate)
+    monkeypatch.setattr(quick_calibration, "train_quick_operator_overheads", train)
+    monkeypatch.setattr(quick_calibration, "_write_json_atomic", write)
+    monkeypatch.setattr(
+        planner_runtime.AnalyticMachineCalibration,
+        "from_dict",
+        classmethod(lambda cls, payload: trained_calibration if payload is trained_payload else None),
+    )
+    monkeypatch.setattr(
+        planner_runtime, "MoePlannerRuntime", lambda *args, **kwargs: events.append(("construct", args[0])) or runtime
+    )
+    monkeypatch.setattr(planner_runtime, "set_default_moe_planner_runtime", lambda value: events.append(("install",)))
+    output = tmp_path / "machine.json"
+
+    planner_runtime.enable_moe_planner_quick(
+        hidden_size=4096,
+        intermediate_size=1024,
+        global_experts=256,
+        local_experts=128,
+        cpu_ids=(4, 5),
+        mode="tp",
+        degree=2,
+        output=output,
+    )
+
+    assert events == [
+        ("calibrate", None),
+        ("train", machine_payload, 4096, 1024, 2),
+        ("write", output, trained_payload),
+        ("construct", trained_calibration),
+        ("install",),
+    ]
+
+
+def test_enable_quick_planner_refuses_an_existing_output_before_calibrating(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    import fused_cpp.moe.planner_runtime as planner_runtime
+
+    output = tmp_path / "machine.json"
+    output.write_text("{}\n", encoding="utf-8")
+    monkeypatch.setattr(
+        planner_runtime, "calibrate_moe_planner_quick", lambda *a, **k: pytest.fail("calibrated before the check")
+    )
+    with pytest.raises(FileExistsError, match="already exists"):
+        planner_runtime.enable_moe_planner_quick(
+            hidden_size=4096, intermediate_size=512, global_experts=256, local_experts=256, output=output
+        )
 
 
 def test_runtime_planner_initialization_precomputes_dense_t_iso_table() -> None:

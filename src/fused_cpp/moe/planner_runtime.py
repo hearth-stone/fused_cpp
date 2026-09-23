@@ -370,19 +370,51 @@ def enable_moe_planner_quick(
     overwrite: bool = False,
     seed: int = 20260814,
     report: Callable[[str], None] | None = None,
+    train_overheads: bool = True,
 ) -> MoePlannerRuntime:
-    """Calibrate, construct, and install the default MoE planner runtime."""
+    """Calibrate, construct, and install the default MoE planner runtime.
+
+    With ``train_overheads`` (the default) the machine calibration is followed by
+    a short isolated-expert measurement of this expert shape that fits the operator
+    overheads the machine probe cannot see. The written calibration is then bound to
+    this shape; call again when the parallel strategy changes the expert shape.
+    """
+    from cpu_moe_schedule_optimization.cost_model.quick_calibration import (
+        _write_json_atomic,
+        train_quick_operator_overheads,
+    )
+
+    output_path = Path(output).expanduser() if output is not None else None
+    if output_path is not None and output_path.exists() and not overwrite:
+        raise FileExistsError(f"calibration output already exists: {output_path}")
     result = calibrate_moe_planner_quick(
         cpu_ids,
-        output=output,
+        output=None if train_overheads else output_path,
         supported_widths=supported_widths,
         machine_id=machine_id,
         overwrite=overwrite,
         seed=seed,
         report=report,
     )
+    calibration = result.calibration
+    if train_overheads:
+        payload, _ = train_quick_operator_overheads(
+            result.payload,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            global_experts=global_experts,
+            local_experts=local_experts,
+            cpu_ids=result.cpu_ids,
+            mode=mode,
+            degree=degree,
+            concurrent_ranks=concurrent_ranks,
+            report=report,
+        )
+        calibration = AnalyticMachineCalibration.from_dict(payload)
+        if output_path is not None:
+            _write_json_atomic(output_path, payload, overwrite=overwrite)
     runtime = MoePlannerRuntime(
-        result.calibration,
+        calibration,
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
         global_experts=global_experts,
