@@ -74,9 +74,12 @@ inherited C9g's.
 
 ## Limitations
 
-- TP4 only. The TP2 table is composed (`tmp/c9g_grid_20260922/tp2_table.json`) and reproduces
-  across instances at 30 of 35 cells, but no whole-plan validation was run for it, so it is not
-  registered.
+- TP2 was validated separately on 2026-09-22 and is now registered too. Six layers the TP4
+  validation did not use, same method and the same frozen rule: windows won on **18 of 18** by
+  a median **4.82%** (best 8.81%, worst 1.11%), more than twice TP4's 2.07%. That is the
+  direction the footprint mechanism gives - TP2 carries twice the weight per expert, so twice
+  the per-domain footprint at a given width - although the worst layer clears the 1% threshold
+  by little.
 - The quick planner only. No reference search was run, because C9g has no event-model probe
   curves.
 - The gain is measured against full stripes, which is what C9g runs today. It does not say the

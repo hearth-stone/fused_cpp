@@ -1669,3 +1669,41 @@ def test_amazon_c9g_tp4_table_is_registered_for_that_machine_only() -> None:
             w13_tiles, w2_tiles = band.select(threads)
             assert 0 <= w13_tiles <= w13.total_tiles // threads
             assert 0 <= w2_tiles <= w2.total_tiles // threads
+
+
+def test_amazon_c9g_tp2_table_is_scoped_to_its_own_shape_and_machine() -> None:
+    """C9g's TP2 table, against tmp/c9g_grid_20260922/tp2_table.json.
+
+    Registered on its own whole-plan evidence: 18 layers the TP4 validation did not use,
+    windows against full stripes, 18 of 18 faster by a median 4.82% - more than twice TP4's
+    2.07%, which is what twice the weight per expert predicts
+    (`results/c9g_window_table_20260922.md`).
+    """
+    from stage_window_policy import AMAZON_C9G_192C_TP2_F1024_N8_V1 as policy
+    from stage_window_policy import AMAZON_C9G_192C_TP4_F512_N8_V1 as tp4
+    from stage_window_policy import default_stage_window_policy
+
+    tp2_machine = "amazon_c9g_192c_2numa_96c_sve128_tp2"
+    shape = dict(hidden_size=4096, intermediate_size=1024, backend_n_tile=8)
+    assert policy in _registered_policies()
+    assert default_stage_window_policy(**shape, machine_id=tp2_machine) is policy
+    # The two shapes of one machine are separate tables and must not cross.
+    assert default_stage_window_policy(**shape, machine_id=tp4.machine_ids[0]) is None
+    assert default_stage_window_policy(
+        hidden_size=4096, intermediate_size=512, backend_n_tile=8, machine_id=tp2_machine
+    ) is None
+
+    for routes, threads in ((16, 2), (721, 2), (96, 1), (96, 64)):
+        assert policy.select(routes, threads) == (0, 0)
+        assert policy.time_scale(routes, threads) == 1.0
+    # A W2 tile is 2*1024*8 = 16 KiB here against TP4's 8 KiB, so its tile counts are halved.
+    assert policy.select(96, 2) == (1, 4)
+    assert policy.time_scale(96, 2) == 0.2276
+
+    w13 = full_stage_geometry(k=4096, n=2048, n_tile=8)
+    w2 = full_stage_geometry(k=1024, n=4096, n_tile=8)
+    for band in policy.bands:
+        for threads in band.widths:
+            w13_tiles, w2_tiles = band.select(threads)
+            assert 0 <= w13_tiles <= w13.total_tiles // threads
+            assert 0 <= w2_tiles <= w2.total_tiles // threads

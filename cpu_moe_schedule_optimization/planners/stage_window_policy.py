@@ -461,8 +461,82 @@ AMAZON_C9G_192C_TP4_F512_N8_V1 = StageWindowPolicy(
 )
 
 
+# The TP2 shape of the same machine and the same grid: H=4096 F=1024, so a W13 tile is
+# 2*4096*8 = 64 KiB and a W2 tile 2*1024*8 = 16 KiB. Twice TP4's weight per expert, hence twice
+# its per-domain footprint at a given width, which is why windows pay more here.
+#
+# Registered on its own whole-plan evidence, on six layers the TP4 validation did not use:
+# windows won on 18 of 18 by a median 4.82% (best 8.81%, worst 1.11%), against TP4's 2.07%
+# (`results/c9g_window_table_20260922.md`). The worst layer clears the 1% threshold by little,
+# which the report records.
+AMAZON_C9G_192C_TP2_F1024_N8_V1 = StageWindowPolicy(
+    name="amazon_c9g_192c_2numa_tp2_f1024_n8_v1_full_load_jemalloc",
+    hidden_size=4096,
+    intermediate_size=1024,
+    backend_n_tile=8,
+    machine_ids=("amazon_c9g_192c_2numa_96c_sve128_tp2",),
+    bands=(
+        StageWindowBand(
+            min_routes=17,
+            max_routes=33,
+            w13_tiles=2,
+            w2_tiles=8,
+            widths=(2, 4, 8, 16, 32),
+            overrides={2: (2, 8), 4: (2, 8), 8: (1, 4), 16: (1, 4), 32: (1, 4)},
+            time_scales={2: 0.576, 4: 0.6003, 8: 0.6858, 16: 0.8173, 32: 0.8892},
+        ),
+        StageWindowBand(
+            min_routes=34,
+            max_routes=67,
+            w13_tiles=1,
+            w2_tiles=4,
+            widths=(2, 4, 8, 16, 32),
+            overrides={2: (1, 4), 4: (1, 4), 8: (2, 8), 16: (2, 8), 32: (1, 4)},
+            time_scales={2: 0.3441, 4: 0.4219, 8: 0.5493, 16: 0.7568, 32: 0.863},
+        ),
+        StageWindowBand(
+            min_routes=68,
+            max_routes=135,
+            w13_tiles=1,
+            w2_tiles=4,
+            widths=(2, 4, 8, 16, 32),
+            overrides={2: (1, 4), 4: (1, 4), 8: (1, 4), 16: (1, 4), 32: (1, 4)},
+            time_scales={2: 0.2276, 4: 0.3196, 8: 0.4901, 16: 0.7632, 32: 0.9236},
+        ),
+        StageWindowBand(
+            min_routes=136,
+            max_routes=271,
+            w13_tiles=2,
+            w2_tiles=8,
+            widths=(2, 4, 8, 16, 32),
+            overrides={2: (2, 8), 4: (2, 8), 8: (2, 8), 16: (2, 8), 32: (0, 0)},
+            time_scales={2: 0.2294, 4: 0.3539, 8: 0.5735, 16: 0.8423, 32: 1.0},
+        ),
+        StageWindowBand(
+            min_routes=272,
+            max_routes=525,
+            w13_tiles=8,
+            w2_tiles=32,
+            widths=(2, 4, 8, 16, 32),
+            overrides={2: (8, 32), 4: (8, 32), 8: (8, 32), 16: (0, 0), 32: (0, 0)},
+            time_scales={2: 0.2708, 4: 0.4142, 8: 0.6694, 16: 1.0, 32: 1.0},
+        ),
+        StageWindowBand(
+            min_routes=526,
+            max_routes=720,
+            w13_tiles=16,
+            w2_tiles=64,
+            widths=(2, 4, 8, 16, 32),
+            overrides={2: (16, 64), 4: (16, 64), 8: (8, 32), 16: (0, 0), 32: (0, 0)},
+            time_scales={2: 0.2649, 4: 0.424, 8: 0.6988, 16: 1.0, 32: 1.0},
+        ),
+    ),
+)
+
+
 _POLICIES: tuple[StageWindowPolicy, ...] = (
     AMAZON_C5_192C_TP4_F512_V5,
+    AMAZON_C9G_192C_TP2_F1024_N8_V1,
     AMAZON_C9G_192C_TP4_F512_N8_V1,
     ARM_CODEX_NUMA3_80C_TP4_F512_N16_V4,
 )
@@ -513,6 +587,7 @@ def stage_geometry_name(w13_windows: Sequence[int], w2_windows: Sequence[int]) -
 
 __all__ = [
     "AMAZON_C5_192C_TP4_F512_V5",
+    "AMAZON_C9G_192C_TP2_F1024_N8_V1",
     "AMAZON_C9G_192C_TP4_F512_N8_V1",
     "ARM_CODEX_NUMA3_80C_TP4_F512_N16_V3",
     "ARM_CODEX_NUMA3_80C_TP4_F512_N16_V4",
