@@ -90,3 +90,34 @@ panel structure. A period-two staircase is invisible to a sample that does not c
   shapes (-24.4 us TP4, -9.2 us TP2). Distinct kernels, not pairing.
 - Routes 14 -> 15 increments by 25.4 us against the ~50 us of other even-to-odd steps, and
   26 -> 27 by 25.0. Unexplained, and it sits just after a panel boundary.
+
+## Correction and close-out (2026-09-23)
+
+**The "model's `exact` (`q`)" column above is not the model.** It is an interpolation over the
+measured even counts, priced at `q` rows, written for this report and labelled as what the model
+charges. The planner's `AnalyticMoeCostModel` already charges row pairs: `kernel_panels` sets an
+exact-M tail's `compute_rows = 2*ceil(r/2)`, so the shipped C9g calibration predicts
+`T(9) = T(10)`, `T(13) = T(14)`, `T(25) = T(26)`. The `m12_effective_rows` that returns `q` has
+no caller in the analytic model; only the table-driven `ContentionCostModel` charges `q`, and
+only where a profile lacks odd tail buckets. So the 2.47% -> 0.12% improvement is against a
+proxy, and there is no row-count change to adopt.
+
+What survives is the measurement: the staircase is real. Two further rounds on route counts
+this sweep did not cover:
+
+- **Pairs round** (`tmp/c9g_pairs_valid_20260923/`, pre-registered): odd -> even within 1% on
+  9/9 counts, both shapes, at one thread; post hoc, at 2/4/8/16 as well. Its width rule measured
+  `cost(50) - cost(49)`, which pairing predicts to be zero, and so compared noise; its "failure"
+  is withdrawn.
+- **Triplet round** (`tmp/c9g_triplets_20260923/`, pre-registered, `q-1, q, q+1` inside one M12
+  panel, twelve fresh odd q, widths 1-16, three passes): the frozen verdict is **not testable**
+  at most widths. Its noise gate used the spread of cell levels across passes, which includes a
+  whole-pass offset (TP4 1T passes differ by 2.1%) that cancels in within-pass steps. Post hoc,
+  with steps taken inside each pass and noise as the steps' spread across passes, every testable
+  triplet at every width has `r = flat / (up + flat) <= 0.25` (medians -0.013 to +0.088; 3-11
+  testable of 12 per width). Pairing holds at every width, as a description.
+
+The same data show a different error in the shipped model: its increment for two more rows
+inside a panel is 1.5-3x the measured one (TP4 1T 81 vs 54 us, TP2 2T 81 vs 25 us). That is a
+slope error, not a pairing error, and it is taken up with the multi-panel bias in
+`c9g_b_retention_20260923` rather than here. This line is closed.
