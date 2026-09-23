@@ -120,6 +120,11 @@ flat queue wins with its dynamic tail - idle threads take the remaining N blocks
 static plan cannot express. Mixed widths come closest (7.5%). On 32 equal experts the loss is
 lane imbalance, not a critical path; an M split that balances the lanes beats the flat queue.
 
+> Correction (2026-09-23, `c9g_dynamic_tail_bound_20260923.md`): the dynamic-tail explanation
+> for the long/short workload does not hold. Quick's lanes there end within 0.05 ms of each other
+> (2.5% tail idle), and the flat queue loses on the long and on the short experts run alone; it
+> wins only while the two overlap.
+
 Route-sliced plans are not bitwise equal to the unsliced fused result (1.3-1.5e-3 relative L2,
 BF16 last place), because the final merge's rounding path changes; unsplit plans are bitwise
 equal. Production's bounded tail repartition with route slices carries the same caveat.
