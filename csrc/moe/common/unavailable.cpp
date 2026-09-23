@@ -106,7 +106,19 @@ at::Tensor fused_moe_bf16_tiled_planned_staged(
 
 at::Tensor fused_moe_bf16_tiled_vllm_staged(at::Tensor, at::Tensor, int64_t, int64_t, at::Tensor, int64_t, int64_t,
                                              at::Tensor, at::Tensor, c10::optional<at::Tensor>, int64_t, int64_t, bool,
-                                             int64_t, int64_t, int64_t, c10::optional<at::Tensor>) {
+                                             int64_t, int64_t, int64_t, c10::optional<at::Tensor>, bool, int64_t,
+                                             int64_t) {
+  unavailable();
+}
+
+std::tuple<at::Tensor, int64_t, int64_t, at::Tensor, int64_t, int64_t, int64_t, int64_t>
+fused_moe_bf16_tiled_kt_prepare_weights(at::Tensor, at::Tensor) {
+  unavailable();
+}
+
+at::Tensor fused_moe_bf16_tiled_kt_staged(at::Tensor, at::Tensor, int64_t, int64_t, at::Tensor, int64_t, int64_t,
+                                          at::Tensor, at::Tensor, c10::optional<at::Tensor>, int64_t, int64_t, bool,
+                                          int64_t, int64_t, c10::optional<at::Tensor>, int64_t) {
   unavailable();
 }
 #endif

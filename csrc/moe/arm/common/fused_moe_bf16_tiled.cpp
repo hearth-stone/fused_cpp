@@ -4461,6 +4461,14 @@ struct VllmStagedThreadScratch {
   std::vector<uint16_t, backend_allocator<uint16_t>> packed_a;
 };
 
+// One gather-and-pack unit of the shared packed-A pre-pass: an M12 panel of one
+// expert's routes.
+struct VllmStagedPanelTask {
+  int64_t expert = 0;
+  int64_t row_begin = 0;
+  int64_t rows = 0;
+};
+
 struct SharedMlpTask {
   int64_t n_begin = 0;
   int64_t n_cols = 0;
@@ -4510,6 +4518,18 @@ int64_t vllm_staged_task_n(MoeGemmStage stage, int64_t K, int64_t N, int64_t n_t
   const int64_t candidate = std::min(cache_limit, thread_limit);
   const int64_t aligned = candidate / minimum_task_n * minimum_task_n;
   return std::min<int64_t>(N, std::max<int64_t>(minimum_task_n, aligned));
+}
+
+// vLLM derives the column block from private L2 (`vllm_staged_task_n`), while
+// KTransformers fixes it at a build constant (`N_BLOCK = 256`,
+// kt-kernel/operators/amx/la/amx_raw_kernels.hpp). A positive override selects the
+// latter so the staged-queue control can be swept and reported at its own best
+// block size instead of at whichever value the L2 policy happens to pick.
+int64_t vllm_staged_task_n_override(MoeGemmStage stage, int64_t request, int64_t n_tile) {
+  TORCH_CHECK(request > 0, "staged task width override must be positive, got ", request);
+  TORCH_CHECK(n_tile > 0, "staged task width override needs a positive N tile, got ", n_tile);
+  const int64_t minimum_task_n = stage == MoeGemmStage::kW13 ? 2 * n_tile : n_tile;
+  return std::max<int64_t>(minimum_task_n, ceil_to_multiple(request, minimum_task_n));
 }
 
 std::vector<VllmStagedNTask> build_vllm_staged_tasks(int64_t num_experts, int64_t N, int64_t task_n,
@@ -10087,7 +10107,8 @@ at::Tensor fused_moe_bf16_tiled_vllm_staged(
     at::Tensor input, at::Tensor w13_packed, int64_t w13_K, int64_t w13_N, at::Tensor w2_packed, int64_t w2_K,
     int64_t w2_N, at::Tensor topk_weights, at::Tensor topk_ids, c10::optional<at::Tensor> thread_cpu_ids,
     int64_t num_threads, int64_t global_num_experts, bool fuse_silu, int64_t silu_poly_degree, int64_t gemm_backend,
-    int64_t backend_n_tile, c10::optional<at::Tensor> out) {
+    int64_t backend_n_tile, c10::optional<at::Tensor> out, bool share_packed_a, int64_t w13_task_n_request,
+    int64_t w2_task_n_request) {
 #ifndef __aarch64__
   TORCH_CHECK(false, "fused_moe_bf16_tiled_vllm_staged requires AArch64");
 #else
@@ -10106,6 +10127,9 @@ at::Tensor fused_moe_bf16_tiled_vllm_staged(
   TORCH_CHECK(topk_ids.size(1) > 0, "top_k must be non-zero");
   TORCH_CHECK(num_threads > 0 && num_threads <= std::numeric_limits<int>::max(),
               "num_threads must be in [1, INT_MAX], got ", num_threads);
+  TORCH_CHECK(w13_task_n_request >= 0, "w13_task_n must be non-negative (0 derives it), got ",
+              w13_task_n_request);
+  TORCH_CHECK(w2_task_n_request >= 0, "w2_task_n must be non-negative (0 derives it), got ", w2_task_n_request);
 
   const ::fused_cpp::moe::MoeBackend& backend = ::fused_cpp::moe::backend_from_id(gemm_backend);
   TORCH_CHECK(backend.id == ::fused_cpp::moe::BackendId::kArmSveBf16,
@@ -10219,16 +10243,82 @@ at::Tensor fused_moe_bf16_tiled_vllm_staged(
   const uint16_t* w2_ptr = bf16_data_const(w2.tensor);
 
   const int64_t w13_task_n =
-      vllm_staged_task_n(MoeGemmStage::kW13, w13.K_pad, w13.N_pad, w13.n_tile, num_threads, top_k);
+      w13_task_n_request > 0
+          ? vllm_staged_task_n_override(MoeGemmStage::kW13, w13_task_n_request, w13.n_tile)
+          : vllm_staged_task_n(MoeGemmStage::kW13, w13.K_pad, w13.N_pad, w13.n_tile, num_threads, top_k);
   const int64_t w2_task_n =
-      vllm_staged_task_n(MoeGemmStage::kW2, w2.K_pad, w2.N_pad, w2.n_tile, num_threads, top_k);
+      w2_task_n_request > 0
+          ? vllm_staged_task_n_override(MoeGemmStage::kW2, w2_task_n_request, w2.n_tile)
+          : vllm_staged_task_n(MoeGemmStage::kW2, w2.K_pad, w2.N_pad, w2.n_tile, num_threads, top_k);
   const std::vector<VllmStagedNTask> w13_tasks =
       build_vllm_staged_tasks(num_experts, w13.N_pad, w13_task_n, w13.n_tile);
   const std::vector<VllmStagedNTask> w2_tasks =
       build_vllm_staged_tasks(num_experts, w2.N_pad, w2_task_n, w2.n_tile);
+
+  // Schedule structure is the same in both modes: one flat queue per stage with a
+  // global barrier between them. Only the A dataflow differs. vLLM rescans and packs
+  // A inside every N task (csrc/cpu/cpu_fused_moe.cpp), while KTransformers gathers
+  // each expert once into a contiguous buffer and packs it once
+  // (kt-kernel/operators/amx/moe_base.hpp). `share_packed_a` selects the latter; the
+  // packed bytes a GEMM range reads are identical either way, so the two modes must
+  // agree bit for bit.
+  constexpr int64_t kStagedPanelRows = 12;
+  std::vector<int64_t> packed_a_offsets;
+  at::Tensor packed_a_shared;
+  uint16_t* packed_a_shared_ptr = nullptr;
+  if (share_packed_a) {
+    packed_a_offsets.assign(static_cast<size_t>(num_experts + 1), 0);
+    const int64_t panel_elements = kStagedPanelRows * w13.K_pad;
+    for (int64_t expert = 0; expert < num_experts; ++expert) {
+      const int64_t panels = ceil_div_int64(route_counts[static_cast<size_t>(expert)], kStagedPanelRows);
+      TORCH_CHECK(panels == 0 || panel_elements <= std::numeric_limits<int64_t>::max() / panels,
+                  "staged shared packed-A size overflows int64");
+      const int64_t elements = panels * panel_elements;
+      TORCH_CHECK(packed_a_offsets[static_cast<size_t>(expert)] <=
+                      std::numeric_limits<int64_t>::max() - elements,
+                  "staged cumulative shared packed-A size overflows int64");
+      packed_a_offsets[static_cast<size_t>(expert + 1)] =
+          packed_a_offsets[static_cast<size_t>(expert)] + elements;
+    }
+    packed_a_shared = at::empty({packed_a_offsets.back()}, input.options());
+    packed_a_shared_ptr = bf16_data(packed_a_shared);
+  }
+
   std::vector<VllmStagedThreadScratch> scratches(static_cast<size_t>(num_threads));
-  for (VllmStagedThreadScratch& scratch : scratches) {
-    scratch.packed_a.resize(static_cast<size_t>(12 * w13.K_pad));
+  if (!share_packed_a) {
+    for (VllmStagedThreadScratch& scratch : scratches) {
+      scratch.packed_a.resize(static_cast<size_t>(kStagedPanelRows * w13.K_pad));
+    }
+  }
+
+  double gather_ms = 0.0;
+  if (share_packed_a) {
+    std::vector<VllmStagedPanelTask> panel_tasks;
+    for (int64_t expert = 0; expert < num_experts; ++expert) {
+      const int64_t rows = route_counts[static_cast<size_t>(expert)];
+      for (int64_t row_begin = 0; row_begin < rows; row_begin += kStagedPanelRows) {
+        panel_tasks.push_back(
+            VllmStagedPanelTask{expert, row_begin, std::min<int64_t>(kStagedPanelRows, rows - row_begin)});
+      }
+    }
+    alignas(64) std::atomic<int64_t> next_panel_task{0};
+    const auto gather_begin = ::fused_cpp::profile::now();
+    run_fixed_threads(num_threads, [&](int64_t) {
+      while (true) {
+        const int64_t task_id = next_panel_task.fetch_add(1, std::memory_order_relaxed);
+        if (task_id >= static_cast<int64_t>(panel_tasks.size())) {
+          break;
+        }
+        const VllmStagedPanelTask& panel = panel_tasks[static_cast<size_t>(task_id)];
+        const int64_t* routes = expert_routes.data() + route_offsets[static_cast<size_t>(panel.expert)] +
+                                panel.row_begin;
+        uint16_t* dst = packed_a_shared_ptr + packed_a_offsets[static_cast<size_t>(panel.expert)] +
+                        panel.row_begin * w13.K_pad;
+        gather_pack_a_reorder_sve_hybrid(input_ptr, H, routes, top_k, dst, static_cast<int>(panel.rows),
+                                         static_cast<int>(w13.K_pad), int64_t{1}, int64_t{0});
+      }
+    });
+    gather_ms = ::fused_cpp::profile::elapsed_ms(gather_begin);
   }
 
   alignas(64) std::atomic<int64_t> next_w13_task{0};
@@ -10249,15 +10339,22 @@ at::Tensor fused_moe_bf16_tiled_vllm_staged(
       uint16_t* expert_intermediate =
           intermediate_ptr + intermediate_offsets[static_cast<size_t>(task.expert)];
       const uint16_t* expert_w13 = w13_ptr + task.expert * w13.packed_stride;
-      for (int64_t row_begin = 0; row_begin < rows; row_begin += 12) {
-        const int64_t panel_rows = std::min<int64_t>(12, rows - row_begin);
-        gather_pack_a_reorder_sve_hybrid(input_ptr, H, routes + row_begin, top_k, scratch.packed_a.data(),
-                                         static_cast<int>(panel_rows), static_cast<int>(w13.K_pad), int64_t{1},
-                                         int64_t{0});
+      for (int64_t row_begin = 0; row_begin < rows; row_begin += kStagedPanelRows) {
+        const int64_t panel_rows = std::min<int64_t>(kStagedPanelRows, rows - row_begin);
+        const uint16_t* panel_a = nullptr;
+        if (share_packed_a) {
+          panel_a = packed_a_shared_ptr + packed_a_offsets[static_cast<size_t>(task.expert)] +
+                    row_begin * w13.K_pad;
+        } else {
+          gather_pack_a_reorder_sve_hybrid(input_ptr, H, routes + row_begin, top_k, scratch.packed_a.data(),
+                                           static_cast<int>(panel_rows), static_cast<int>(w13.K_pad), int64_t{1},
+                                           int64_t{0});
+          panel_a = scratch.packed_a.data();
+        }
         vllm_staged_w13_range_sve(
-            scratch.packed_a.data(), expert_w13, expert_intermediate + row_begin * w2.K_pad,
-            static_cast<int>(panel_rows), static_cast<int>(w13.K_pad), static_cast<int>(w2.K_pad),
-            silu_poly_degree, w13.n_tile, task.n_begin, task.n_cols, false);
+            panel_a, expert_w13, expert_intermediate + row_begin * w2.K_pad, static_cast<int>(panel_rows),
+            static_cast<int>(w13.K_pad), static_cast<int>(w2.K_pad), silu_poly_degree, w13.n_tile,
+            task.n_begin, task.n_cols, false);
       }
     }
   });
@@ -10307,12 +10404,366 @@ at::Tensor fused_moe_bf16_tiled_vllm_staged(
   if (env_flag_enabled("FUSED_CPP_MOE_STAGE_TIMING")) {
     std::fprintf(stderr,
                  "[fused_moe_bf16_tiled_vllm_staged][stage_timing] threads=%lld experts=%lld routes=%lld "
-                 "available_l2_bytes=%lld w13_task_n=%lld w13_tasks=%zu w2_task_n=%lld w2_tasks=%zu "
-                 "route_build_ms=%.3f w13_ms=%.3f w2_ms=%.3f merge_ms=%.3f e2e_ms=%.3f\n",
+                 "available_l2_bytes=%lld share_packed_a=%d w13_task_n=%lld w13_tasks=%zu w2_task_n=%lld "
+                 "w2_tasks=%zu route_build_ms=%.3f gather_ms=%.3f w13_ms=%.3f w2_ms=%.3f merge_ms=%.3f "
+                 "e2e_ms=%.3f\n",
                  static_cast<long long>(num_threads), static_cast<long long>(num_experts),
                  static_cast<long long>(num_routes), static_cast<long long>(vllm_staged_available_l2_bytes()),
-                 static_cast<long long>(w13_task_n), w13_tasks.size(), static_cast<long long>(w2_task_n),
-                 w2_tasks.size(), route_build_ms, w13_ms, w2_ms, merge_ms,
+                 share_packed_a ? 1 : 0, static_cast<long long>(w13_task_n), w13_tasks.size(),
+                 static_cast<long long>(w2_task_n), w2_tasks.size(), route_build_ms, gather_ms, w13_ms, w2_ms,
+                 merge_ms, ::fused_cpp::profile::elapsed_ms(call_begin));
+  }
+  return finalize_moe_output(output, out);
+#endif
+}
+
+#if defined(__aarch64__)
+namespace {
+
+// KTransformers-dataflow comparator helpers. NEON rather than SVE so this block
+// adds no ISA requirement to the translation unit; on a 128-bit SVE machine the
+// vector width is the same.
+inline float32x4_t kt_staged_exp_neon(float32x4_t x) {
+  x = vminq_f32(vmaxq_f32(x, vdupq_n_f32(-87.0f)), vdupq_n_f32(87.0f));
+  const float32x4_t n = vrndnq_f32(vmulq_f32(x, vdupq_n_f32(1.4426950408889634f)));
+  float32x4_t r = vfmsq_f32(x, n, vdupq_n_f32(0.693145751953125f));
+  r = vfmsq_f32(r, n, vdupq_n_f32(1.428606765330187e-06f));
+  // exp(r) on [-ln2/2, ln2/2], degree 5.
+  float32x4_t p = vdupq_n_f32(1.0f / 120.0f);
+  p = vfmaq_f32(vdupq_n_f32(1.0f / 24.0f), p, r);
+  p = vfmaq_f32(vdupq_n_f32(1.0f / 6.0f), p, r);
+  p = vfmaq_f32(vdupq_n_f32(0.5f), p, r);
+  p = vfmaq_f32(vdupq_n_f32(1.0f), p, r);
+  p = vfmaq_f32(vdupq_n_f32(1.0f), p, r);
+  const int32x4_t scale = vshlq_n_s32(vaddq_s32(vcvtq_s32_f32(n), vdupq_n_s32(127)), 23);
+  return vmulq_f32(p, vreinterpretq_f32_s32(scale));
+}
+
+inline float32x4_t kt_staged_bf16x4_to_f32(const uint16_t* src) {
+  return vreinterpretq_f32_u32(vshll_n_u16(vld1_u16(src), 16));
+}
+
+inline void kt_staged_store_f32x4_as_bf16(uint16_t* dst, float32x4_t value) {
+  const uint32x4_t bits = vreinterpretq_u32_f32(value);
+  const uint32x4_t lsb = vandq_u32(vshrq_n_u32(bits, 16), vdupq_n_u32(1));
+  const uint32x4_t rounded = vaddq_u32(bits, vaddq_u32(lsb, vdupq_n_u32(0x7fff)));
+  vst1_u16(dst, vshrn_n_u32(rounded, 16));
+}
+
+struct KtStagedTask {
+  int64_t expert = 0;
+  int64_t n_begin = 0;
+  int64_t n_cols = 0;
+};
+
+}  // namespace
+#endif
+
+std::tuple<at::Tensor, int64_t, int64_t, at::Tensor, int64_t, int64_t, int64_t, int64_t>
+fused_moe_bf16_tiled_kt_prepare_weights(at::Tensor w13_weight, at::Tensor w2_weight) {
+#ifndef __aarch64__
+  TORCH_CHECK(false, "fused_moe_bf16_tiled_kt_prepare_weights requires AArch64");
+#else
+  // The public prepare path only offers the SVE backend with the interleaved
+  // fused-SiLU W13. The KTransformers-dataflow comparator runs gate and up as
+  // plain GEMMs, so W13 is packed here the way W2 always is: plain columns,
+  // gate first, with the SVE backend's tile. Comparator use only.
+  const ::fused_cpp::moe::MoeBackend& backend = ::fused_cpp::moe::resolve_backend("arm_sve_bf16", true);
+  check_bf16_cpu(w13_weight, "w13_weight");
+  check_bf16_cpu(w2_weight, "w2_weight");
+  TORCH_CHECK(w13_weight.dim() == 3 && w2_weight.dim() == 3, "weights must be 3-D");
+  TORCH_CHECK(w13_weight.size(0) == w2_weight.size(0), "w13 and w2 expert counts differ");
+  w13_weight = w13_weight.contiguous();
+  w2_weight = w2_weight.contiguous();
+  const int64_t E = w13_weight.size(0);
+  const int64_t N13 = w13_weight.size(1);
+  const int64_t H = w13_weight.size(2);
+  TORCH_CHECK(N13 % 2 == 0, "w13 output dim must be even, got ", N13);
+  const int64_t F = N13 / 2;
+  TORCH_CHECK(w2_weight.size(1) == H && w2_weight.size(2) == F, "w2 must be [E, H, F]");
+  const int64_t K13_pad = backend.round_k(static_cast<int>(H));
+  const int64_t N13_pad = backend.round_n(static_cast<int>(N13));
+  const int64_t K2_pad = backend.round_k(static_cast<int>(F));
+  const int64_t N2_pad = backend.round_n(static_cast<int>(H));
+  at::Tensor w13_packed = at::empty({E, K13_pad * N13_pad}, w13_weight.options());
+  at::Tensor w2_packed = at::empty({E, K2_pad * N2_pad}, w2_weight.options());
+  const uint16_t* w13_ptr = bf16_data_const(w13_weight);
+  const uint16_t* w2_ptr = bf16_data_const(w2_weight);
+  uint16_t* w13_packed_ptr = bf16_data(w13_packed);
+  uint16_t* w2_packed_ptr = bf16_data(w2_packed);
+  for (int64_t e = 0; e < E; ++e) {
+    pack_transposed_expert_weight(w13_ptr, e * N13 * H, N13, H, K13_pad, N13_pad,
+                                  w13_packed_ptr + e * K13_pad * N13_pad, &backend);
+    pack_transposed_expert_weight(w2_ptr, e * H * F, H, F, K2_pad, N2_pad, w2_packed_ptr + e * K2_pad * N2_pad,
+                                  &backend);
+  }
+  return std::make_tuple(w13_packed, H, N13, w2_packed, F, H, static_cast<int64_t>(backend.id), backend.n_tile());
+#endif
+}
+
+at::Tensor fused_moe_bf16_tiled_kt_staged(
+    at::Tensor input, at::Tensor w13_packed, int64_t w13_K, int64_t w13_N, at::Tensor w2_packed, int64_t w2_K,
+    int64_t w2_N, at::Tensor topk_weights, at::Tensor topk_ids, c10::optional<at::Tensor> thread_cpu_ids,
+    int64_t num_threads, int64_t global_num_experts, bool fuse_silu, int64_t gemm_backend, int64_t backend_n_tile,
+    c10::optional<at::Tensor> out, int64_t n_block) {
+#ifndef __aarch64__
+  TORCH_CHECK(false, "fused_moe_bf16_tiled_kt_staged requires AArch64");
+#else
+  // Experimental comparator: KTransformers' MoE dataflow and scheduling
+  // (kt-kernel/operators/amx/moe_base.hpp, forward path at f7607c0) with this
+  // repository's plain packed GEMM as the only borrowed part. Seven passes, each
+  // a separate flat queue ended by a barrier:
+  //   1. per-token copy of the input rows into per-expert contiguous buffers;
+  //   2. per-expert pack of those rows into the GEMM's A panels;
+  //   3. gate and up as separate (expert, N block) GEMM tasks, BF16 outputs;
+  //   4. SiLU(gate) * up per (expert, N block), BF16;
+  //   5. per-expert pack of the activation into the down GEMM's A panels;
+  //   6. down as (expert, N block) GEMM tasks, BF16 per-expert output;
+  //   7. per-token weighted sum over top_k.
+  // Tasks are claimed one at a time from a single atomic counter in expert-major
+  // order, which is what KTransformers' do_work_stealing_job does (block = 1).
+  // The fused production kernel's SiLU epilogue and direct-route store are not used.
+  const auto call_begin = ::fused_cpp::profile::now();
+  check_bf16_cpu(input, "input");
+  TORCH_CHECK(input.dim() == 2 && input.is_contiguous(), "input must be contiguous 2-D [tokens, hidden]");
+  TORCH_CHECK(topk_ids.device().is_cpu() && topk_weights.device().is_cpu(), "routing tensors must be CPU");
+  TORCH_CHECK(is_integer_dtype(topk_ids.scalar_type()), "topk_ids must use an integer dtype");
+  TORCH_CHECK(is_floating_dtype(topk_weights.scalar_type()), "topk_weights must use a floating dtype");
+  TORCH_CHECK(topk_ids.dim() == 2 && topk_ids.sizes() == topk_weights.sizes(),
+              "topk_ids and topk_weights must be matching 2-D [tokens, top_k]");
+  TORCH_CHECK(topk_ids.size(0) == input.size(0) && topk_ids.size(1) > 0, "routing shape mismatch");
+  TORCH_CHECK(num_threads > 0 && num_threads <= std::numeric_limits<int>::max(), "num_threads must be positive");
+  TORCH_CHECK(n_block > 0, "n_block must be positive, got ", n_block);
+
+  const ::fused_cpp::moe::MoeBackend& backend = ::fused_cpp::moe::backend_from_id(gemm_backend);
+  TORCH_CHECK(backend.id == ::fused_cpp::moe::BackendId::kArmSveBf16,
+              "KTransformers-dataflow comparator requires the SVE BF16 backend, got ", backend.name);
+  TORCH_CHECK(backend_n_tile == backend.n_tile(), "MoE backend_n_tile mismatch: weights use ", backend_n_tile,
+              ", runtime uses ", backend.n_tile());
+  TORCH_CHECK(!fuse_silu, "KTransformers-dataflow comparator needs plain W13 (prepare with fuse_silu=False): "
+              "gate and up are separate GEMMs");
+
+  PackedExperts w13 = checked_packed_experts(w13_packed, w13_K, w13_N, "w13_packed", backend_n_tile);
+  PackedExperts w2 = checked_packed_experts(w2_packed, w2_K, w2_N, "w2_packed", backend_n_tile);
+  TORCH_CHECK(w13.E == w2.E, "w13 and w2 expert count mismatch");
+  const int64_t H = input.size(1);
+  TORCH_CHECK(w13.K == H && w13.N % 2 == 0, "w13 must be [2F, H] with H=", H);
+  const int64_t F = w13.N / 2;
+  TORCH_CHECK(w2.K == F && w2.N == H, "w2 must be [H, F]");
+  TORCH_CHECK(F % w13.n_tile == 0 && w13.N_pad == 2 * F, "F must be a multiple of the N tile (", w13.n_tile, ")");
+  TORCH_CHECK(w2.K_pad == F && w2.N_pad == H && H % 4 == 0 && F % 4 == 0,
+              "comparator requires unpadded W2 and H, F multiples of 4");
+  const int64_t K13 = w13.K_pad;
+
+  const int64_t num_tokens = input.size(0);
+  const int64_t top_k = topk_ids.size(1);
+  if (num_tokens == 0) {
+    return finalize_moe_output(prepare_moe_output(input, w13_packed, w2_packed, topk_weights, topk_ids, out), out);
+  }
+  const int64_t num_experts = global_num_experts < 0 ? w13.E : global_num_experts;
+  TORCH_CHECK(num_experts > 0 && num_experts <= w13.E, "global_num_experts out of range");
+
+  ThreadPinningConfig pinning;
+  bool has_pinning = false;
+  if (thread_cpu_ids.has_value() && thread_cpu_ids->defined() && thread_cpu_ids->numel() > 0) {
+    pinning.cpus = tensor_to_i64_vector(*thread_cpu_ids, "thread_cpu_ids");
+    TORCH_CHECK(static_cast<int64_t>(pinning.cpus.size()) == num_threads,
+                "thread_cpu_ids must have exactly num_threads entries");
+    pinning.enabled = true;
+    has_pinning = true;
+  }
+  ThreadPinningScope pinning_scope(has_pinning ? &pinning : nullptr);
+  prepare_moe_threads_for_operator(num_threads);
+
+  // Route bookkeeping: position of every (token, slot) inside its expert's block.
+  at::Tensor ids_i64 = topk_ids.to(at::kLong).contiguous();
+  at::Tensor weights_f32 = topk_weights.to(at::kFloat).contiguous();
+  const int64_t* ids = ids_i64.data_ptr<int64_t>();
+  const float* route_weights = weights_f32.data_ptr<float>();
+  const int64_t num_routes = num_tokens * top_k;
+  std::vector<int64_t> route_counts(static_cast<size_t>(num_experts), 0);
+  for (int64_t flat = 0; flat < num_routes; ++flat) {
+    TORCH_CHECK(ids[flat] >= 0 && ids[flat] < num_experts, "topk_ids out of range: ", ids[flat]);
+    ++route_counts[static_cast<size_t>(ids[flat])];
+  }
+  std::vector<int64_t> route_offsets(static_cast<size_t>(num_experts + 1), 0);
+  std::vector<int64_t> packed13_offsets(static_cast<size_t>(num_experts + 1), 0);
+  std::vector<int64_t> packed2_offsets(static_cast<size_t>(num_experts + 1), 0);
+  std::vector<int64_t> active_experts;
+  int64_t max_rows = 0;
+  for (int64_t expert = 0; expert < num_experts; ++expert) {
+    const int64_t rows = route_counts[static_cast<size_t>(expert)];
+    const int64_t packed_rows = rows > 0 ? sve_hybrid_packed_rows(rows) : 0;
+    route_offsets[static_cast<size_t>(expert + 1)] = route_offsets[static_cast<size_t>(expert)] + rows;
+    packed13_offsets[static_cast<size_t>(expert + 1)] = packed13_offsets[static_cast<size_t>(expert)] + packed_rows * K13;
+    packed2_offsets[static_cast<size_t>(expert + 1)] = packed2_offsets[static_cast<size_t>(expert)] + packed_rows * F;
+    if (rows > 0) {
+      active_experts.push_back(expert);
+      max_rows = std::max(max_rows, rows);
+    }
+  }
+  std::vector<int64_t> position(static_cast<size_t>(num_routes));
+  {
+    std::vector<int64_t> cursor(route_offsets.begin(), route_offsets.end() - 1);
+    for (int64_t flat = 0; flat < num_routes; ++flat) {
+      position[static_cast<size_t>(flat)] = cursor[static_cast<size_t>(ids[flat])]++;
+    }
+  }
+  std::vector<int64_t> identity_rows(static_cast<size_t>(max_rows));
+  std::iota(identity_rows.begin(), identity_rows.end(), int64_t{0});
+
+  at::Tensor output = prepare_moe_output(input, w13_packed, w2_packed, topk_weights, topk_ids, out);
+  const at::TensorOptions bf16 = input.options();
+  at::Tensor gathered = at::empty({num_routes * H}, bf16);
+  at::Tensor packed13 = at::empty({std::max<int64_t>(packed13_offsets.back(), 1)}, bf16);
+  at::Tensor gate_up = at::empty({num_routes * 2 * F}, bf16);
+  at::Tensor activation = at::empty({num_routes * F}, bf16);
+  at::Tensor packed2 = at::empty({std::max<int64_t>(packed2_offsets.back(), 1)}, bf16);
+  at::Tensor down = at::empty({num_routes * H}, bf16);
+  const uint16_t* input_ptr = bf16_data_const(input);
+  uint16_t* gathered_ptr = bf16_data(gathered);
+  uint16_t* packed13_ptr = bf16_data(packed13);
+  uint16_t* gate_up_ptr = bf16_data(gate_up);
+  uint16_t* activation_ptr = bf16_data(activation);
+  uint16_t* packed2_ptr = bf16_data(packed2);
+  uint16_t* down_ptr = bf16_data(down);
+  uint16_t* output_ptr = bf16_data(output);
+  const uint16_t* w13_ptr = bf16_data_const(w13.tensor);
+  const uint16_t* w2_ptr = bf16_data_const(w2.tensor);
+
+  const int64_t block = ceil_to_multiple(n_block, w13.n_tile);
+  auto expert_blocks = [&](int64_t n_total) {
+    std::vector<KtStagedTask> tasks;
+    for (const int64_t expert : active_experts) {
+      for (int64_t n_begin = 0; n_begin < n_total; n_begin += block) {
+        tasks.push_back(KtStagedTask{expert, n_begin, std::min<int64_t>(block, n_total - n_begin)});
+      }
+    }
+    return tasks;
+  };
+  const std::vector<KtStagedTask> f_tasks = expert_blocks(F);
+  const std::vector<KtStagedTask> h_tasks = expert_blocks(H);
+  const int64_t active = static_cast<int64_t>(active_experts.size());
+
+  auto flat_queue = [&](int64_t count, const auto& body) {
+    alignas(64) std::atomic<int64_t> next{0};
+    run_fixed_threads(num_threads, [&](int64_t) {
+      while (true) {
+        const int64_t task = next.fetch_add(1, std::memory_order_relaxed);
+        if (task >= count) {
+          break;
+        }
+        body(task);
+      }
+    });
+  };
+
+  double stage_ms[7] = {};
+  auto timed = [&](int index, const auto& fn) {
+    const auto begin = ::fused_cpp::profile::now();
+    fn();
+    stage_ms[index] = ::fused_cpp::profile::elapsed_ms(begin);
+  };
+
+  // 1. Copy each token's row to every expert it routes to.
+  timed(0, [&] {
+    flat_queue(num_tokens, [&](int64_t token) {
+      for (int64_t slot = 0; slot < top_k; ++slot) {
+        const int64_t pos = position[static_cast<size_t>(token * top_k + slot)];
+        std::memcpy(gathered_ptr + pos * H, input_ptr + token * H, static_cast<size_t>(H) * sizeof(uint16_t));
+      }
+    });
+  });
+  // 2. Pack each expert's rows once.
+  timed(1, [&] {
+    flat_queue(active, [&](int64_t index) {
+      const int64_t expert = active_experts[static_cast<size_t>(index)];
+      gather_pack_a_reorder_sve_hybrid(gathered_ptr + route_offsets[static_cast<size_t>(expert)] * H, H,
+                                       identity_rows.data(), 1,
+                                       packed13_ptr + packed13_offsets[static_cast<size_t>(expert)],
+                                       static_cast<int>(route_counts[static_cast<size_t>(expert)]),
+                                       static_cast<int>(K13), int64_t{1}, int64_t{0});
+    });
+  });
+  // 3. Gate and up as separate tasks: task 2i is gate, 2i+1 is up, of block i.
+  timed(2, [&] {
+    flat_queue(2 * static_cast<int64_t>(f_tasks.size()), [&](int64_t task_id) {
+      const KtStagedTask& task = f_tasks[static_cast<size_t>(task_id / 2)];
+      const int64_t column = (task_id % 2 == 0 ? 0 : F) + task.n_begin;
+      const int64_t base = route_offsets[static_cast<size_t>(task.expert)];
+      vllm_staged_w2_direct_bf16_route_range_sve(
+          packed13_ptr + packed13_offsets[static_cast<size_t>(task.expert)], w13_ptr + task.expert * w13.packed_stride,
+          gate_up_ptr + base * 2 * F, identity_rows.data(),
+          static_cast<int>(route_counts[static_cast<size_t>(task.expert)]), static_cast<int>(K13),
+          static_cast<int>(2 * F), w13.n_tile, column, task.n_cols);
+    });
+  });
+  // 4. SiLU(gate) * up.
+  timed(3, [&] {
+    flat_queue(static_cast<int64_t>(f_tasks.size()), [&](int64_t task_id) {
+      const KtStagedTask& task = f_tasks[static_cast<size_t>(task_id)];
+      const int64_t base = route_offsets[static_cast<size_t>(task.expert)];
+      const int64_t rows = route_counts[static_cast<size_t>(task.expert)];
+      const float32x4_t one = vdupq_n_f32(1.0f);
+      for (int64_t row = 0; row < rows; ++row) {
+        const uint16_t* gate = gate_up_ptr + (base + row) * 2 * F;
+        const uint16_t* up = gate + F;
+        uint16_t* dst = activation_ptr + (base + row) * F;
+        for (int64_t n = task.n_begin; n < task.n_begin + task.n_cols; n += 4) {
+          const float32x4_t g = kt_staged_bf16x4_to_f32(gate + n);
+          const float32x4_t u = kt_staged_bf16x4_to_f32(up + n);
+          const float32x4_t sig = vdivq_f32(one, vaddq_f32(one, kt_staged_exp_neon(vnegq_f32(g))));
+          kt_staged_store_f32x4_as_bf16(dst + n, vmulq_f32(vmulq_f32(g, sig), u));
+        }
+      }
+    });
+  });
+  // 5. Pack each expert's activation once for the down GEMM.
+  timed(4, [&] {
+    flat_queue(active, [&](int64_t index) {
+      const int64_t expert = active_experts[static_cast<size_t>(index)];
+      gather_pack_a_reorder_sve_hybrid(activation_ptr + route_offsets[static_cast<size_t>(expert)] * F, F,
+                                       identity_rows.data(), 1,
+                                       packed2_ptr + packed2_offsets[static_cast<size_t>(expert)],
+                                       static_cast<int>(route_counts[static_cast<size_t>(expert)]),
+                                       static_cast<int>(F), int64_t{1}, int64_t{0});
+    });
+  });
+  // 6. Down projection into per-expert rows.
+  timed(5, [&] {
+    flat_queue(static_cast<int64_t>(h_tasks.size()), [&](int64_t task_id) {
+      const KtStagedTask& task = h_tasks[static_cast<size_t>(task_id)];
+      const int64_t base = route_offsets[static_cast<size_t>(task.expert)];
+      vllm_staged_w2_direct_bf16_route_range_sve(
+          packed2_ptr + packed2_offsets[static_cast<size_t>(task.expert)], w2_ptr + task.expert * w2.packed_stride,
+          down_ptr + base * H, identity_rows.data(), static_cast<int>(route_counts[static_cast<size_t>(task.expert)]),
+          static_cast<int>(F), static_cast<int>(H), w2.n_tile, task.n_begin, task.n_cols);
+    });
+  });
+  // 7. Weighted sum over the token's experts.
+  timed(6, [&] {
+    flat_queue(num_tokens, [&](int64_t token) {
+      uint16_t* dst = output_ptr + token * H;
+      for (int64_t n = 0; n < H; n += 4) {
+        float32x4_t acc = vdupq_n_f32(0.0f);
+        for (int64_t slot = 0; slot < top_k; ++slot) {
+          const int64_t flat = token * top_k + slot;
+          const uint16_t* row = down_ptr + position[static_cast<size_t>(flat)] * H;
+          acc = vfmaq_n_f32(acc, kt_staged_bf16x4_to_f32(row + n), route_weights[flat]);
+        }
+        kt_staged_store_f32x4_as_bf16(dst + n, acc);
+      }
+    });
+  });
+
+  if (env_flag_enabled("FUSED_CPP_MOE_STAGE_TIMING")) {
+    std::fprintf(stderr,
+                 "[fused_moe_bf16_tiled_kt_staged][stage_timing] threads=%lld experts=%lld routes=%lld n_block=%lld "
+                 "copy_ms=%.3f pack_a_ms=%.3f gate_up_ms=%.3f act_ms=%.3f pack_down_ms=%.3f down_ms=%.3f "
+                 "merge_ms=%.3f e2e_ms=%.3f\n",
+                 static_cast<long long>(num_threads), static_cast<long long>(active),
+                 static_cast<long long>(num_routes), static_cast<long long>(block), stage_ms[0], stage_ms[1],
+                 stage_ms[2], stage_ms[3], stage_ms[4], stage_ms[5], stage_ms[6],
                  ::fused_cpp::profile::elapsed_ms(call_begin));
   }
   return finalize_moe_output(output, out);

@@ -250,7 +250,20 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("topk_weights"), py::arg("topk_ids"), py::arg("thread_cpu_ids") = c10::nullopt,
         py::arg("num_threads") = 1, py::arg("global_num_experts") = -1, py::arg("fuse_silu") = true,
         py::arg("silu_poly_degree") = 5, py::arg("gemm_backend") = 1, py::arg("backend_n_tile") = 8,
-        py::arg("out") = c10::nullopt, py::call_guard<py::gil_scoped_release>());
+        py::arg("out") = c10::nullopt, py::arg("share_packed_a") = false, py::arg("w13_task_n") = 0,
+        py::arg("w2_task_n") = 0, py::call_guard<py::gil_scoped_release>());
+
+  m.def("fused_moe_bf16_tiled_kt_prepare_weights", &fused_moe_bf16_tiled_kt_prepare_weights,
+        "Pack plain SVE W13/W2 for the KTransformers-dataflow comparator.", py::arg("w13_weight"),
+        py::arg("w2_weight"), py::call_guard<py::gil_scoped_release>());
+
+  m.def("fused_moe_bf16_tiled_kt_staged", &fused_moe_bf16_tiled_kt_staged,
+        "Run the experimental KTransformers-dataflow comparator with this repository's plain SVE GEMM.",
+        py::arg("input"), py::arg("w13_packed"), py::arg("w13_K"), py::arg("w13_N"), py::arg("w2_packed"),
+        py::arg("w2_K"), py::arg("w2_N"), py::arg("topk_weights"), py::arg("topk_ids"),
+        py::arg("thread_cpu_ids") = c10::nullopt, py::arg("num_threads") = 1, py::arg("global_num_experts") = -1,
+        py::arg("fuse_silu") = false, py::arg("gemm_backend") = 1, py::arg("backend_n_tile") = 8,
+        py::arg("out") = c10::nullopt, py::arg("n_block") = 256, py::call_guard<py::gil_scoped_release>());
 
   m.def("shared_mlp_bf16_tiled", &shared_mlp_bf16_tiled,
         "Run one packed BF16 expert as a standalone shared MLP.", py::arg("input"), py::arg("w13_packed"),

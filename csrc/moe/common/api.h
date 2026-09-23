@@ -154,7 +154,15 @@ at::Tensor fused_moe_bf16_tiled_vllm_staged(
     at::Tensor input, at::Tensor w13_packed, int64_t w13_K, int64_t w13_N, at::Tensor w2_packed, int64_t w2_K,
     int64_t w2_N, at::Tensor topk_weights, at::Tensor topk_ids, c10::optional<at::Tensor> thread_cpu_ids,
     int64_t num_threads, int64_t global_num_experts, bool fuse_silu, int64_t silu_poly_degree, int64_t gemm_backend,
-    int64_t backend_n_tile, c10::optional<at::Tensor> out);
+    int64_t backend_n_tile, c10::optional<at::Tensor> out, bool share_packed_a, int64_t w13_task_n,
+    int64_t w2_task_n);
+std::tuple<at::Tensor, int64_t, int64_t, at::Tensor, int64_t, int64_t, int64_t, int64_t>
+fused_moe_bf16_tiled_kt_prepare_weights(at::Tensor w13_weight, at::Tensor w2_weight);
+at::Tensor fused_moe_bf16_tiled_kt_staged(
+    at::Tensor input, at::Tensor w13_packed, int64_t w13_K, int64_t w13_N, at::Tensor w2_packed, int64_t w2_K,
+    int64_t w2_N, at::Tensor topk_weights, at::Tensor topk_ids, c10::optional<at::Tensor> thread_cpu_ids,
+    int64_t num_threads, int64_t global_num_experts, bool fuse_silu, int64_t gemm_backend, int64_t backend_n_tile,
+    c10::optional<at::Tensor> out, int64_t n_block);
 at::Tensor shared_mlp_bf16_tiled(
     at::Tensor input, at::Tensor w13_packed, int64_t w13_K, int64_t w13_N, at::Tensor w2_packed, int64_t w2_K,
     int64_t w2_N, c10::optional<at::Tensor> thread_cpu_ids, int64_t num_threads, bool fuse_silu,

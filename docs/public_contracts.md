@@ -167,6 +167,17 @@ weights, and backend `arm_sve_bf16`; it selects the DeepSeek-V4 SVE JIT
 clamped-SwiGLU operation. The experimental planned-staged and vLLM-staged
 comparators do not expose this mode.
 
+`fused_moe_bf16_tiled_vllm_staged` accepts the additive keywords
+`share_packed_a` (default `False`), `w13_task_n` and `w2_task_n` (default `0`).
+The defaults reproduce the previous behaviour exactly. `share_packed_a=True`
+gathers and packs each expert's A once in a parallel pre-pass instead of
+repacking it inside every W13 N range; both modes feed the GEMM ranges the same
+packed bytes and must return bit-identical results, so this keyword selects a
+dataflow and memory profile, not a numerical mode. A positive `w13_task_n` or
+`w2_task_n` fixes that stage's column block instead of deriving it from private
+L2, rounded up to the stage's N-tile multiple. The comparator remains
+experimental and carries no compatibility promise.
+
 `MoePlannerRuntime` is an additive, process-local scheduling API for the SVE
 BF16 fused-SiLU path. Calibration is explicit through
 `calibrate_moe_planner_quick`; importing the package and the first operator call

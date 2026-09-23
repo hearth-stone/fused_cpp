@@ -93,6 +93,8 @@ try:
     _w8a8_available_impl = getattr(_moe_native, "fused_moe_w8a8_tiled_available", None)
     _fused_moe_bf16_tiled_planned_staged_impl = getattr(_moe_native, "fused_moe_bf16_tiled_planned_staged", None)
     _fused_moe_bf16_tiled_vllm_staged_impl = _moe_native.fused_moe_bf16_tiled_vllm_staged
+    _fused_moe_bf16_tiled_kt_staged_impl = getattr(_moe_native, "fused_moe_bf16_tiled_kt_staged", None)
+    _prepare_kt_impl = getattr(_moe_native, "fused_moe_bf16_tiled_kt_prepare_weights", None)
     _shared_mlp_bf16_tiled_impl = getattr(_moe_native, "shared_mlp_bf16_tiled", None)
     _prepare_bf16_tiled_impl = _moe_native.fused_moe_bf16_tiled_prepare_weights
     _prepare_w8a16_tiled_impl = getattr(_moe_native, "fused_moe_w8a16_tiled_prepare_weights", None)
@@ -170,6 +172,8 @@ except ImportError as error:
     _w8a8_available_impl = None
     _fused_moe_bf16_tiled_planned_staged_impl = None
     _fused_moe_bf16_tiled_vllm_staged_impl = None
+    _fused_moe_bf16_tiled_kt_staged_impl = None
+    _prepare_kt_impl = None
     _shared_mlp_bf16_tiled_impl = None
     _prepare_bf16_tiled_impl = None
     _prepare_w8a16_tiled_impl = None
@@ -192,6 +196,8 @@ except AttributeError:
     _w8a8_available_impl = None
     _fused_moe_bf16_tiled_planned_staged_impl = None
     _fused_moe_bf16_tiled_vllm_staged_impl = None
+    _fused_moe_bf16_tiled_kt_staged_impl = None
+    _prepare_kt_impl = None
     _shared_mlp_bf16_tiled_impl = None
     _prepare_bf16_tiled_impl = None
     _prepare_w8a16_tiled_impl = None
@@ -1739,17 +1745,34 @@ def fused_moe_bf16_tiled_vllm_staged(
     global_num_experts: int = -1,
     silu_poly_degree: int = 5,
     out: torch.Tensor | None = None,
+    share_packed_a: bool = False,
+    w13_task_n: int = 0,
+    w2_task_n: int = 0,
 ) -> torch.Tensor:
-    """Run the experimental vLLM-style staged SVE scheduling baseline.
+    """Run the experimental flat staged-queue SVE scheduling baseline.
 
     The compute kernels, packed weights, direct route store, and weighted
-    merge are the same as the production fused SVE path. Scheduling follows
-    the vLLM CPU implementation instead: all ``(expert, W13 N-range)`` tasks
-    share one dynamic queue, a global stage barrier separates W13 from W2,
-    and all ``(expert, W2 N-range)`` tasks then share a second queue. Each W13
-    range rescans and packs its expert input in M12 panels, matching vLLM's
-    per-N-task A scan. This entrypoint is experimental and does not change the
-    default fused MoE dispatch.
+    merge are the same as the production fused SVE path. Scheduling follows the
+    structure that vLLM CPU, KTransformers and llama.cpp share instead: all
+    ``(expert, W13 N-range)`` tasks share one dynamic queue, a global stage
+    barrier separates W13 from W2, and all ``(expert, W2 N-range)`` tasks then
+    share a second queue. This entrypoint is experimental and does not change
+    the default fused MoE dispatch.
+
+    The two additive keywords select where in that policy class the control
+    sits, without changing its schedule:
+
+    ``share_packed_a``
+        ``False`` (default) reproduces vLLM: every W13 range rescans and packs
+        its expert input in M12 panels. ``True`` reproduces KTransformers: one
+        parallel pre-pass gathers and packs each expert once, and the W13
+        ranges read those panels. The packed bytes a GEMM range consumes are
+        the same either way, so both modes return bit-identical results; they
+        differ in redundant packing work and in peak memory.
+    ``w13_task_n`` / ``w2_task_n``
+        ``0`` (default) derives the column block from private L2 the way vLLM
+        does. A positive value fixes it the way KTransformers fixes
+        ``N_BLOCK``; it is rounded up to the stage's N-tile multiple.
     """
     _require_backend()
     if _fused_moe_bf16_tiled_vllm_staged_impl is None:
@@ -1767,6 +1790,10 @@ def fused_moe_bf16_tiled_vllm_staged(
         raise TypeError(f"topk_weights must use a floating dtype, got {topk_weights.dtype}")
     if int(num_threads) <= 0:
         raise ValueError(f"num_threads must be positive, got {num_threads}")
+    if int(w13_task_n) < 0:
+        raise ValueError(f"w13_task_n must be non-negative (0 derives it), got {w13_task_n}")
+    if int(w2_task_n) < 0:
+        raise ValueError(f"w2_task_n must be non-negative (0 derives it), got {w2_task_n}")
     if not weights.fused_silu:
         raise ValueError("vLLM-staged baseline requires weights prepared with fuse_silu=True")
     if weights.gemm_backend != 1:
@@ -1798,6 +1825,96 @@ def fused_moe_bf16_tiled_vllm_staged(
         int(weights.gemm_backend),
         int(weights.backend_n_tile),
         out,
+        bool(share_packed_a),
+        int(w13_task_n),
+        int(w2_task_n),
+    )
+    return out if out is not None else result
+
+
+def prepare_fused_moe_bf16_tiled_kt_weights(
+    w13_weight: torch.Tensor,
+    w2_weight: torch.Tensor,
+) -> PreparedBF16TiledFusedMoEWeights:
+    """Pack plain (non-interleaved) SVE weights for ``fused_moe_bf16_tiled_kt_staged``.
+
+    Comparator use only: the public prepare path pairs the SVE backend with the
+    interleaved fused-SiLU W13, which the KTransformers dataflow does not use.
+    """
+    _require_backend()
+    if _prepare_kt_impl is None:
+        raise RuntimeError("KTransformers-dataflow comparator is unavailable; rebuild the C++ extension.")
+    packed = _prepare_kt_impl(w13_weight, w2_weight)
+    return PreparedBF16TiledFusedMoEWeights(
+        w13=(packed[0], int(packed[1]), int(packed[2])),
+        w2=(packed[3], int(packed[4]), int(packed[5])),
+        fused_silu=False,
+        gemm_backend=int(packed[6]),
+        backend_n_tile=int(packed[7]),
+        backend_name="arm_sve_bf16",
+    )
+
+
+def fused_moe_bf16_tiled_kt_staged(
+    input: torch.Tensor,
+    weights: PreparedBF16TiledFusedMoEWeights,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    *,
+    thread_cpu_ids: torch.Tensor | None = None,
+    num_threads: int = 1,
+    global_num_experts: int = -1,
+    out: torch.Tensor | None = None,
+    n_block: int = 256,
+) -> torch.Tensor:
+    """Run the experimental KTransformers-dataflow comparator on this repository's GEMM.
+
+    KTransformers' MoE forward (``kt-kernel/operators/amx/moe_base.hpp``) with only
+    the packed GEMM microkernel replaced: per-token copy into per-expert buffers,
+    per-expert A pack, gate and up as separate ``(expert, n_block)`` GEMM tasks with
+    BF16 outputs, a separate SiLU-times-up pass, a per-expert pack of the
+    activation, the down GEMM, and a per-token weighted sum. Every pass is one flat
+    queue ended by a barrier. ``weights`` come from
+    ``prepare_fused_moe_bf16_tiled_kt_weights`` so gate and up are plain columns. Not exported from the package; lab use only.
+    Results differ from the fused path by BF16 rounding of the intermediates.
+    """
+    _require_backend()
+    if _fused_moe_bf16_tiled_kt_staged_impl is None:
+        raise RuntimeError("KTransformers-dataflow comparator is unavailable; rebuild the C++ extension.")
+    if input.dtype != torch.bfloat16 or input.device.type != "cpu":
+        raise TypeError("input must be a CPU torch.bfloat16 tensor")
+    if weights.fused_silu:
+        raise ValueError(
+            "the KTransformers-dataflow comparator needs plain weights (fuse_silu=False) "
+            "from prepare_fused_moe_bf16_tiled_kt_weights"
+        )
+    if weights.gemm_backend != 1:
+        raise ValueError(f"the comparator requires the SVE BF16 backend; weights use {weights.backend_name}")
+    if int(num_threads) <= 0 or int(n_block) <= 0:
+        raise ValueError("num_threads and n_block must be positive")
+    if thread_cpu_ids is not None:
+        _check_integer_schedule_tensor(thread_cpu_ids, "thread_cpu_ids")
+        if int(thread_cpu_ids.numel()) != int(num_threads):
+            raise ValueError("thread_cpu_ids must have exactly num_threads entries")
+    _validate_output_buffer(input, out)
+    result = _fused_moe_bf16_tiled_kt_staged_impl(
+        input.contiguous(),
+        weights.w13[0],
+        weights.w13[1],
+        weights.w13[2],
+        weights.w2[0],
+        weights.w2[1],
+        weights.w2[2],
+        topk_weights.contiguous(),
+        topk_ids.contiguous(),
+        None if thread_cpu_ids is None else thread_cpu_ids.contiguous(),
+        int(num_threads),
+        int(global_num_experts),
+        bool(weights.fused_silu),
+        int(weights.gemm_backend),
+        int(weights.backend_n_tile),
+        out,
+        int(n_block),
     )
     return out if out is not None else result
 

@@ -162,6 +162,95 @@ def test_vllm_staged_matches_fused_sve_with_multiple_n_tasks(
     torch.testing.assert_close(candidate.float(), reference.float(), atol=0, rtol=0)
 
 
+@pytest.mark.parametrize(
+    ("share_packed_a", "w13_task_n", "w2_task_n"),
+    [
+        (False, 0, 0),
+        (True, 0, 0),
+        (True, 1, 1),
+        (True, 256, 256),
+        (False, 256, 256),
+    ],
+)
+def test_staged_queue_dataflow_and_block_size_are_bitwise_neutral(
+    monkeypatch: pytest.MonkeyPatch,
+    share_packed_a: bool,
+    w13_task_n: int,
+    w2_task_n: int,
+) -> None:
+    """The staged-queue control must return the production result in every mode.
+
+    `share_packed_a` and the column-block overrides change how much packing work
+    is repeated and how the N domain is cut, never which packed bytes a GEMM
+    range consumes, so every combination has to match the production path bit
+    for bit. The route counts cover an inactive expert, tails below the M8
+    bridge, the padded 9-11 tail, a full M12 panel, and multi-panel experts with
+    a short final panel.
+    """
+    affinity = sorted(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else list(range(4))
+    if len(affinity) < 4:
+        pytest.skip("requires 4 available CPUs to exercise a contended task queue")
+    num_threads = 4
+
+    monkeypatch.setenv("FUSED_CPP_MOE_SVE", "1")
+    monkeypatch.setenv("FUSED_CPP_MOE_SVE_W2_DIRECT_ROUTE", "1")
+    generator = torch.Generator().manual_seed(20260921)
+    hidden_size, intermediate_size = 128, 64
+    route_counts = [0, 1, 5, 8, 9, 11, 12, 13, 24, 25]
+    num_experts = len(route_counts)
+    num_tokens = sum(route_counts)
+    hidden = _bf16_normal((num_tokens, hidden_size), generator=generator, std=0.01)
+    w13 = _bf16_normal((num_experts, 2 * intermediate_size, hidden_size), generator=generator, std=0.01)
+    w2 = _bf16_normal((num_experts, hidden_size, intermediate_size), generator=generator, std=0.01)
+    topk_ids = torch.cat(
+        [torch.full((count,), expert, dtype=torch.int32) for expert, count in enumerate(route_counts)]
+    ).reshape(num_tokens, 1)
+    topk_weights = torch.softmax(torch.randn((num_tokens, 1), generator=generator), dim=-1)
+    packed = prepare_fused_moe_bf16_tiled_weights(w13, w2, fuse_silu=True)
+    if packed.gemm_backend != 1:
+        pytest.skip("requires an SVE BF16 build/runtime")
+
+    reference = fused_moe_bf16_tiled(hidden, packed, topk_weights, topk_ids, num_threads=num_threads)
+    candidate = fused_moe_bf16_tiled_vllm_staged(
+        hidden,
+        packed,
+        topk_weights,
+        topk_ids,
+        thread_cpu_ids=torch.tensor(affinity[:num_threads], dtype=torch.int32),
+        num_threads=num_threads,
+        share_packed_a=share_packed_a,
+        w13_task_n=w13_task_n,
+        w2_task_n=w2_task_n,
+    )
+
+    torch.testing.assert_close(candidate.float(), reference.float(), atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("keyword", ["w13_task_n", "w2_task_n"])
+def test_staged_queue_rejects_negative_task_width(keyword: str) -> None:
+    """A negative column block is a caller error, not a silent fall back to 0."""
+    generator = torch.Generator().manual_seed(20260921)
+    hidden_size, intermediate_size, num_experts = 128, 64, 2
+    hidden = _bf16_normal((4, hidden_size), generator=generator, std=0.01)
+    w13 = _bf16_normal((num_experts, 2 * intermediate_size, hidden_size), generator=generator, std=0.01)
+    w2 = _bf16_normal((num_experts, hidden_size, intermediate_size), generator=generator, std=0.01)
+    packed = prepare_fused_moe_bf16_tiled_weights(w13, w2, fuse_silu=True)
+    if packed.gemm_backend != 1:
+        pytest.skip("requires an SVE BF16 build/runtime")
+    topk_ids = torch.zeros((4, 1), dtype=torch.int32)
+    topk_weights = torch.ones((4, 1), dtype=torch.float32)
+
+    with pytest.raises(ValueError, match=f"{keyword} must be non-negative"):
+        fused_moe_bf16_tiled_vllm_staged(
+            hidden,
+            packed,
+            topk_weights,
+            topk_ids,
+            num_threads=1,
+            **{keyword: -1},
+        )
+
+
 def test_sve_m12_silu_and_w2_bf16_route_for_unit_top1(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
