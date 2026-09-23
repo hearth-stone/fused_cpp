@@ -1789,9 +1789,14 @@ class AnalyticMoeCostModel:
         seen_active_threads = 0
         windows: list[AnalyticWindowDemand] = []
         for window_index in range(plan.windows):
-            begin_tile, n_tiles = plan.window_tile_span(window_index)
-            active_threads = min(n_tiles, threads)
-            owner_tiles = math.ceil(n_tiles / threads)
+            # Thread-major windows: pass i is every worker's i-th window inside its own
+            # stripe, which is not contiguous. Count the tiles the workers actually own;
+            # the span's hull would count the stripes between them too.
+            begin_tile, _ = plan.window_tile_span(window_index)
+            owned = [plan.thread_range(window_index, tid).tiles for tid in range(threads)]
+            n_tiles = sum(owned)
+            active_threads = sum(1 for tiles in owned if tiles > 0)
+            owner_tiles = max(owned, default=0)
             balanced_tiles = owner_tiles * active_threads
             owner_window_bytes = owner_tiles * tile_bytes
             weight_bytes = n_tiles * tile_bytes
