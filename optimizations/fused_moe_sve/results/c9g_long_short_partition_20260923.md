@@ -70,3 +70,30 @@ bandwidth-bound work, and a static disjoint core partition inside the existing P
 executor recovers it with margin. What is missing is planner support: widths outside the
 calibrated set and a long/short partition candidate scored against quick's plan with the same
 simulator. Next: add both as an opt-in planner candidate and measure what it selects.
+
+## Planner candidate (opt-in, MATHEMATICAL_MODEL v1.141)
+
+`PlannedMoE(model, search_mode="quick", long_short_partition=True)` with
+`AnalyticMoeCostModel(..., partition_widths=range(2, 17))`: split at the widest route-count gap
+(ratio >= 8), one lane of width w per long expert, 1T lanes for the rest, w over the partition
+widths, scored against quick's homogeneous choice by the same placed DAG simulator.
+
+Plan only (`plan_partition.py`, C9g calibration): of the nine catalog workloads only the bimodal
+batch changes plan; the other eight bridges are field-for-field identical with the flag on.
+On the bimodal batch it selects 5 x 12T + 36 x 1T.
+
+Measured (`bench_split.py --partition-widths 2-16`, runs `qp_all_s{1,2}.json`), execution
+medians in ms; all arms bitwise equal:
+
+| arm | session 1 | session 2 |
+| --- | --- | --- |
+| L14S1 (hand-built best) | 10.34 | 10.40 |
+| quick_partition | **10.57** | **10.66** |
+| L12S1 (hand-built, same plan) | 10.60 | 10.61 |
+| flat queue (staged L2) | 10.98 | 11.01 |
+| quick | 11.87 | 11.87 |
+
+quick_partition beats the flat queue by 3.7% / 3.2% and quick by 11.0% / 10.2%. It leaves
+2.2-2.5% on the table against L14S1 because the model prices narrow long teams optimistically.
+Its cold plan costs 118 ms (15 placed-DAG scores) against quick's 0.4 ms; a cache hit rebuilds
+the partition from its shape.

@@ -102,7 +102,7 @@ class AnalyticStageWindowPolicy:
         threads = int(threads)
         if routes <= 0 or threads <= 0:
             raise ValueError("routes and threads must be positive")
-        if threads not in self.model.supported_widths:
+        if threads not in getattr(self.model, "priced_widths", self.model.supported_widths):
             raise KeyError(f"unsupported analytical thread width {threads}")
 
         _, geometry = self.model._stage_mapping_and_geometry(stage, routes, threads)

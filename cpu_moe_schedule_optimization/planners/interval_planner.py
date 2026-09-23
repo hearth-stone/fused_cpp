@@ -41,6 +41,9 @@ _TEMPORAL_ASSIGNMENT_ABS_NS = 1e-6
 _ASSIGNMENT_ORDER_LPT = "lpt"
 _ASSIGNMENT_ORDER_REVERSE_ODD = "reverse_odd"
 _ASSIGNMENT_ORDER_REVERSE_EVEN = "reverse_even"
+_ASSIGNMENT_ORDER_LONG_SHORT = "long_short_partition"
+# Smallest route-count ratio across the split for a batch to count as long/short.
+_LONG_SHORT_MIN_ROUTE_RATIO = 8.0
 # Sentinel so a resolved-to-None stage-window policy is only looked up once.
 _UNSET = object()
 
@@ -779,6 +782,87 @@ class IntervalPlanner:
             "active_working_set_bytes": self.active_working_set_bytes(signature, tasks),
             "window_bytes_per_worker": self.window_bytes_per_worker(signature, tasks),
             "resource_groups": len(lanes),
+        }
+
+    def long_short_partition_tasks(self, experts, shape):
+        """Tasks for a disjoint long/short core partition given by its lane shape.
+
+        The leading lanes wider than the last one each run one of the longest experts
+        from call start; the remaining experts run LPT on the narrow trailing lanes.
+        Compute-bound long experts and bandwidth-bound short ones then overlap for the
+        whole call instead of the shorts queueing behind the longs.
+        """
+        signature = tuple(int(value) for value in shape)
+        if not signature or sum(signature) != self.num_cores:
+            raise ValueError(f"long/short partition shape must cover {self.num_cores} cores: {signature}")
+        long_width, short_width = signature[0], signature[-1]
+        long_lanes = sum(1 for width in signature if width == long_width)
+        if long_width <= short_width or any(width != short_width for width in signature[long_lanes:]):
+            raise ValueError(f"not a long/short partition shape: {signature}")
+        ordered = sorted(experts, key=lambda item: (-item[1], item[0]))
+        if len(ordered) <= long_lanes:
+            raise ValueError("a long/short partition needs at least one short expert")
+        lanes = self._lanes(signature)
+        lane_experts: List[List[Tuple[int, int]]] = [[job] for job in ordered[:long_lanes]]
+        lane_experts += [[] for _ in range(len(signature) - long_lanes)]
+        heap = [(0.0, lane) for lane in range(long_lanes, len(signature))]
+        heapify(heap)
+        for expert, routes in ordered[long_lanes:]:
+            load, lane = heappop(heap)
+            lane_experts[lane].append((expert, routes))
+            heappush(heap, (load + self._task_time(routes, short_width), lane))
+        tasks = []
+        for (core_begin, width), members in zip(lanes, lane_experts):
+            previous = None
+            for expert, routes in members:
+                tasks.append((expert, routes, core_begin, width, [previous] if previous is not None else []))
+                previous = len(tasks) - 1
+        return tasks
+
+    def long_short_partition_candidate(self, experts) -> dict | None:
+        """Best disjoint long/short partition over the model's partition widths.
+
+        Applies only when the sorted route counts have a gap of at least
+        ``_LONG_SHORT_MIN_ROUTE_RATIO``; the experts above the widest gap get one lane
+        each, every remaining core runs 1T short lanes. Scored by the placed DAG
+        simulator, the same scorer used to compare it against another plan.
+        """
+        widths = tuple(getattr(self.model, "partition_widths", ()))
+        routes = sorted((int(r) for _, r in experts if int(r) > 0), reverse=True)
+        if not widths or len(routes) < 2:
+            return None
+        long_count = max(range(1, len(routes)), key=lambda k: (routes[k - 1] / routes[k], -k))
+        if routes[long_count - 1] < _LONG_SHORT_MIN_ROUTE_RATIO * routes[long_count]:
+            return None
+        best = None
+        for width in widths:
+            if width <= 1 or long_count * width >= self.num_cores:
+                continue
+            shape = (width,) * long_count + (1,) * (self.num_cores - long_count * width)
+            tasks = self.long_short_partition_tasks(experts, shape)
+            makespan = self._score(tasks)
+            if best is None or makespan < best[0]:
+                best = (makespan, shape, tasks)
+        if best is None:
+            return None
+        makespan, shape, tasks = best
+        return {
+            "shape": shape,
+            "execution_mode": _ASYNC_EXECUTION_STRICT,
+            "tail_pool_threads": None,
+            "tail_pool_max_routes": None,
+            "tail_pool_tasks": 0,
+            "tail_repartition_width": None,
+            "tail_repartition_tasks": 0,
+            "tail_repartition_route_slices": 1,
+            "assignment_order": _ASSIGNMENT_ORDER_LONG_SHORT,
+            "makespan_ns": makespan,
+            "uncertainty_ns": 0.0,
+            "pessimistic_ns": makespan,
+            "tasks": tasks,
+            "active_working_set_bytes": self.active_working_set_bytes(shape, tasks),
+            "window_bytes_per_worker": self.window_bytes_per_worker(shape, tasks),
+            "resource_groups": len(shape),
         }
 
     def _uses_analytic_full(self) -> bool:
@@ -1565,8 +1649,14 @@ class IntervalPlanner:
         experts: List[Tuple[int, int]],
         *,
         topk_ids=None,
+        long_short_partition: bool = False,
     ) -> Dict[str, object]:
-        """Build a low-overhead strict plan from homogeneous team shapes."""
+        """Build a low-overhead strict plan from homogeneous team shapes.
+
+        With ``long_short_partition`` the best long/short partition replaces the
+        homogeneous choice when the placed DAG simulator scores it faster than that
+        choice; both are scored by the same simulator for the comparison.
+        """
         experts = [(expert, routes) for expert, routes in experts if routes > 0]
         if not experts:
             raise ValueError("at least one active expert is required")
@@ -1579,32 +1669,35 @@ class IntervalPlanner:
                 [routes for _, routes in experts],
                 self._quick_cost_rows(experts, homogeneous_shapes),
             )
-            return self._finalize_plan(
-                native["selected"],
-                native["candidates"],
-                topk_ids=topk_ids,
-                planner_backend="cpp_quick",
-                planner_workers=int(native["configured_workers"]),
-                strict_candidates=int(native["strict_candidates"]),
-                dynamic_candidates=0,
-                tail_repartition_candidates=0,
+            selected, candidates = native["selected"], list(native["candidates"])
+            backend, workers = "cpp_quick", int(native["configured_workers"])
+            strict_count = int(native["strict_candidates"])
+        else:
+            candidates = [self._quick_candidate(experts, shape) for shape in homogeneous_shapes]
+            selected = min(
+                candidates,
+                key=lambda candidate: (
+                    candidate["makespan_ns"],
+                    candidate["active_working_set_bytes"],
+                    candidate["resource_groups"],
+                ),
             )
-        candidates = [self._quick_candidate(experts, shape) for shape in homogeneous_shapes]
-        selected = min(
-            candidates,
-            key=lambda candidate: (
-                candidate["makespan_ns"],
-                candidate["active_working_set_bytes"],
-                candidate["resource_groups"],
-            ),
-        )
+            backend, workers, strict_count = "python_quick", 1, len(candidates)
+        if long_short_partition:
+            partition = self.long_short_partition_candidate(experts)
+            if partition is not None:
+                partition["reference_makespan_ns"] = self._score(selected["tasks"])
+                candidates.append(partition)
+                strict_count += 1
+                if partition["makespan_ns"] < partition["reference_makespan_ns"]:
+                    selected = partition
         return self._finalize_plan(
             selected,
             candidates,
             topk_ids=topk_ids,
-            planner_backend="python_quick",
-            planner_workers=1,
-            strict_candidates=len(candidates),
+            planner_backend=backend,
+            planner_workers=workers,
+            strict_candidates=strict_count,
             dynamic_candidates=0,
             tail_repartition_candidates=0,
         )

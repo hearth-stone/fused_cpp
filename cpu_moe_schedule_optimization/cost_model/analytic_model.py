@@ -1471,6 +1471,7 @@ class AnalyticMoeCostModel:
         down_output_element_bytes: int = 2,
         supported_widths: Sequence[int] | None = None,
         supported_shapes: Sequence[Sequence[int]] | None = None,
+        partition_widths: Sequence[int] = (),
     ):
         if isinstance(calibration, (str, Path)):
             self.profile_path = Path(calibration)
@@ -1527,6 +1528,12 @@ class AnalyticMoeCostModel:
         )
         if not self.supported_widths:
             raise ValueError("no supported thread widths remain")
+        # Widths priced only for explicit long/short partition candidates: never in
+        # candidate shapes or planner_widths, so default search is unchanged.
+        if any(not 0 < int(width) <= self.calibration.cores_per_rank for width in partition_widths):
+            raise ValueError("partition_widths must be in [1, cores_per_rank]")
+        self.partition_widths = tuple(sorted({int(width) for width in partition_widths}))
+        self.priced_widths = tuple(sorted(set(self.supported_widths) | set(self.partition_widths)))
         unreliable = set(self.calibration.unreliable_widths)
         # Widths the planner chooses among by itself; every supported width still runs when asked.
         self.planner_widths = tuple(width for width in self.supported_widths if width not in unreliable) or (
@@ -1736,7 +1743,7 @@ class AnalyticMoeCostModel:
             raise ValueError(f"unsupported stage {stage!r}")
         if routes <= 0 or threads <= 0 or requested_window_tiles < 0:
             raise ValueError("routes and threads must be positive and window_tiles non-negative")
-        if threads not in self.supported_widths:
+        if threads not in self.priced_widths:
             raise KeyError(f"unsupported analytical thread width {threads}")
 
         requested_cohort_threads = threads if cohort_threads is None else int(cohort_threads)
@@ -2265,7 +2272,7 @@ class AnalyticMoeCostModel:
         threads = int(threads)
         if routes <= 0:
             raise ValueError("predict_expert requires positive routes")
-        if threads not in self.supported_widths:
+        if threads not in self.priced_widths:
             raise KeyError(f"unsupported analytical thread width {threads}")
         work = fused_expert_work(
             routes,
@@ -2443,7 +2450,7 @@ class AnalyticMoeCostModel:
             routes = int(routes)
             threads = int(threads)
             value = float(value)
-            if routes <= 0 or threads not in self.supported_widths or not math.isfinite(value) or value <= 0.0:
+            if routes <= 0 or threads not in self.priced_widths or not math.isfinite(value) or value <= 0.0:
                 continue
             self._t_iso_scalar_cache[(routes, threads)] = value
             loaded += 1

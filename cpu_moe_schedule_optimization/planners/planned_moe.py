@@ -90,6 +90,7 @@ class PlannedMoE:
         search_mode: str = "full",
         cache_plans: bool = True,
         fixed_threads: int | None = None,
+        long_short_partition: bool = False,
     ):
         if callable(getattr(models, "T_iso", None)) and callable(getattr(models, "dag_makespan", None)):
             self.models = (models,)
@@ -107,6 +108,9 @@ class PlannedMoE:
         self.fixed_threads = None if fixed_threads is None else int(fixed_threads)
         if self.fixed_threads is not None and self.search_mode != "quick":
             raise ValueError("fixed_threads requires quick search mode")
+        self.long_short_partition = bool(long_short_partition)
+        if self.long_short_partition and (self.search_mode != "quick" or self.fixed_threads is not None):
+            raise ValueError("long_short_partition requires quick search without fixed_threads")
         self.cpu_ids = tuple(cpu_ids) if cpu_ids is not None else tuple(range(num_cores))
         self.interval_planners = tuple(
             IntervalPlanner(
@@ -135,6 +139,11 @@ class PlannedMoE:
             else (str(model.profile_path),)
             for model in self.models
         )
+        if self.long_short_partition:
+            self.policy_identity += tuple(
+                ("long_short_partition", tuple(getattr(model, "partition_widths", ())))
+                for model in self.models
+            )
         self.shape_cache: Dict[
             Tuple[object, ...],
             Tuple[int, Tuple[int, ...], str, str, int | None, int | None, int | None, int, int],
@@ -171,6 +180,8 @@ class PlannedMoE:
             if begins is None:
                 raise ValueError("cached hot-wide template no longer packs")
             tasks = planner_tasks(used, begins)
+        elif assignment_order == "long_short_partition":
+            tasks = planner.long_short_partition_tasks(counts, shape)
         elif self.search_mode == "quick" and shared_expert_id is not None:
             tasks = planner.quick_tasks_for_shared_shape(counts, shape, shared_expert_id)
         elif self.search_mode == "quick" and len(set(shape)) == 1:
@@ -359,7 +370,11 @@ class PlannedMoE:
                     raise ValueError("quick search does not support a forced tail pool")
                 if shared_expert_id is None:
                     if self.fixed_threads is None:
-                        result = self.interval_planners[0].plan_quick(counts, topk_ids=topk_ids)
+                        result = self.interval_planners[0].plan_quick(
+                            counts,
+                            topk_ids=topk_ids,
+                            long_short_partition=self.long_short_partition,
+                        )
                     else:
                         result = self.interval_planners[0].plan_quick_fixed(
                             counts,
