@@ -700,6 +700,16 @@ strategy changes the shape. `train_overheads=False` keeps the shape-independent
 machine calibration. Packed-B retention stays at the builder defaults; measured
 C9g values did not change isolated accuracy (`c9g_b_retention_20260923.md`).
 
+A calibration may name `planner.unreliable_widths`: supported widths that whole-plan
+measurements refuted. The planner's own width search skips them (`AnalyticMoeCostModel.planner_widths`),
+while an explicitly requested width - `fixed_threads`, `FUSED_CPP_MOE_PLANNER_FIXED_THREADS` -
+still runs. The one-click calibration marks {1, 2} by default (`QUICK_UNRELIABLE_WIDTHS`;
+`unreliable_widths=()` allows all); `build_analytic_calibration.py --unreliable-widths` sets it
+for a research calibration. Isolated times cannot see dozens of concurrent narrow lanes: on C9g
+fixed 1T ran 2.8-7.7x the best width on 2048-token batches, and without the exclusion quick
+picked 2T on moe256-active-set-64 and ran 22% slower
+(`optimizations/fused_moe_sve/results/c9g_related_work_20260923.md`).
+
 The production runtime currently bounds cold planning to homogeneous team
 shapes. It ranks those shapes with analytical isolated expert times and LPT
 lane loads, emits a strict Plan V2, and uses native C++ assignment/selection

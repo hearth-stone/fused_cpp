@@ -711,6 +711,12 @@ def parse_args() -> argparse.Namespace:
         nargs="+",
         help="one or more service-probe runs; several are combined point by point with the median",
     )
+    parser.add_argument(
+        "--unreliable-widths",
+        type=parse_int_set,
+        default=None,
+        help="supported widths whole-plan measurements refuted; the planner will not pick them by itself",
+    )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--report", type=Path)
     parser.add_argument("--machine-id")
@@ -822,6 +828,8 @@ def main() -> int:
             "threads": residual_fit["train_threads"],
             "points": len(residual_fit["rows"]),
         }
+    if args.unreliable_widths:
+        calibration["planner"]["unreliable_widths"] = sorted(args.unreliable_widths)
     AnalyticMachineCalibration.from_dict(calibration)
 
     report = {

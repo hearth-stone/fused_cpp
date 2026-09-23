@@ -106,8 +106,10 @@ def test_quick_calibration_returns_valid_model_and_writes_atomically(
         "supported_widths": [1, 2, 4],
         "seed": 20260814,
         "service_repeats": 3,
+        "unreliable_widths": [1, 2],
         "operator_residual_training": False,
     }
+    assert payload["planner"]["unreliable_widths"] == [1, 2]
     assert result.payload == payload
 
 

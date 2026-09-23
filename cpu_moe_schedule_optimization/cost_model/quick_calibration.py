@@ -66,6 +66,15 @@ QUICK_SERVICE_REPEATS = 3
 QUICK_TRAIN_ROUTES = (1, 4, 12, 48, 192, 2040)
 QUICK_RESIDUAL_ROUTES = (12, 192, 2040)
 QUICK_TRAIN_MEASUREMENT_EXPERTS = 8
+# Widths the planner must not pick by itself. On C9g (tmp/c9g_related_work_20260923, nine
+# workloads, two sessions, registered windows): fixed 1T runs 2.8-7.7x the best width on the
+# six 2048-token workloads and ties on decode-like batches; 2T ranges from tied to 4.4x.
+# Without the exclusion quick picked 2T on three 2048-token workloads - 22% slower execution
+# on moe256-active-set-64 - and 1T on decode batches, where it ties. Excluding both never cost
+# more than 0.4% and halves quick's planning time, since fewer shapes are scored
+# (0.5-1.1 ms -> 0.2-0.6 ms, 5-10% of a decode batch). 2T also lost 18/18 real layers on C9g
+# and ran ~24% above prediction on Arm-codex (E2, E5). An explicit fixed width still runs.
+QUICK_UNRELIABLE_WIDTHS = (1, 2)
 
 
 @dataclass(frozen=True)
@@ -386,6 +395,7 @@ def calibrate_moe_planner_quick(
     seed: int = 20260814,
     report: Callable[[str], None] | None = None,
     service_repeats: int = QUICK_SERVICE_REPEATS,
+    unreliable_widths: Sequence[int] = QUICK_UNRELIABLE_WIDTHS,
 ) -> QuickMoeCalibrationResult:
     """Measure and return a thin Plan V2 analytical machine calibration.
 
@@ -396,6 +406,8 @@ def calibrate_moe_planner_quick(
     The service probe runs ``service_repeats`` times and each measured point takes
     the median rate. The result is shape-independent and carries no operator
     overheads; ``train_quick_operator_overheads`` adds them for one expert shape.
+    ``unreliable_widths`` are kept as supported widths but excluded from the
+    planner's own search (see ``QUICK_UNRELIABLE_WIDTHS``); pass ``()`` to allow all.
     """
     _validate_host()
     if int(service_repeats) <= 0:
@@ -440,12 +452,18 @@ def calibrate_moe_planner_quick(
         llc_domain_probes=domain_probes,
         supported_widths=planner_widths,
     )
+    excluded = sorted({int(width) for width in unreliable_widths} & set(planner_widths))
+    if len(excluded) == len(planner_widths):
+        excluded = []
+    if excluded:
+        calibration_payload["planner"]["unreliable_widths"] = excluded
     calibration_payload["provenance"]["quick_calibration"] = {
         "version": QUICK_CALIBRATION_VERSION,
         "service_widths": list(service_widths),
         "supported_widths": list(planner_widths),
         "seed": int(seed),
         "service_repeats": int(service_repeats),
+        "unreliable_widths": excluded,
         "operator_residual_training": False,
     }
     calibration = AnalyticMachineCalibration.from_dict(calibration_payload)
@@ -642,4 +660,5 @@ __all__ = [
     "quick_service_widths",
     "train_quick_operator_overheads",
     "quick_supported_widths",
+    "QUICK_UNRELIABLE_WIDTHS",
 ]

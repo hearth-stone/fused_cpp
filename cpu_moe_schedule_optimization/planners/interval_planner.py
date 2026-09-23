@@ -174,7 +174,9 @@ class IntervalPlanner:
         self._stage_window_policy_cached = stage_window_policy
         self._shared_quick_cost_cache: dict[tuple[int, int], float] = {}
         self.num_cores = int(num_cores)
-        model_widths = getattr(self.model, "supported_widths", None)
+        # A model may name widths it supports but that whole-plan measurements refuted
+        # (``planner_widths``); the planner searches only the rest unless told otherwise.
+        model_widths = getattr(self.model, "planner_widths", None) or getattr(self.model, "supported_widths", None)
         self.widths = tuple(widths or model_widths or _default_widths(self.num_cores))
         configured_tail_widths = (
             _default_tail_repartition_widths(self.num_cores)
@@ -1622,7 +1624,8 @@ class IntervalPlanner:
         if threads <= 0 or self.num_cores % threads:
             raise ValueError(f"fixed threads must be a positive divisor of {self.num_cores}, got {threads}")
         shape = (threads,) * (self.num_cores // threads)
-        if shape not in self.shapes:
+        supported = getattr(self.model, "supported_widths", None) or self.widths
+        if shape not in self.shapes and threads not in supported:
             raise ProfileCompatibilityError(
                 f"fixed {threads}T shape is not supported by {self.model.profile_path.name}"
             )

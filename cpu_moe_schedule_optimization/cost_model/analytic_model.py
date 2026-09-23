@@ -768,6 +768,11 @@ class AnalyticMachineCalibration:
     gather_pressure: GatherPressureCalibration = GatherPressureCalibration()
     stage_phase_calibration: StagePhaseCalibration = StagePhaseCalibration()
     dram_domain_injection: DramDomainInjectionCalibration = DramDomainInjectionCalibration()
+    # Calibrated widths that whole-plan measurements refuted: the planner does not pick them
+    # by itself, although an explicitly requested width still runs. Isolated times cannot see
+    # dozens of concurrent narrow lanes contending; see QUICK_UNRELIABLE_WIDTHS for the C9g
+    # evidence behind the one-click default.
+    unreliable_widths: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.machine_id:
@@ -809,7 +814,13 @@ class AnalyticMachineCalibration:
                 raise ValueError("LLC domain capacities must sum to llc_bytes_per_rank")
         elif self.dram_domain_injection.enabled:
             raise ValueError("DRAM domain injection requires calibrated LLC domains")
+        unreliable = tuple(sorted(set(int(width) for width in self.unreliable_widths)))
+        if any(width not in widths for width in unreliable):
+            raise ValueError("unreliable_widths must be a subset of supported_widths")
+        if len(unreliable) == len(widths):
+            raise ValueError("unreliable_widths must leave at least one supported width")
         object.__setattr__(self, "supported_widths", widths)
+        object.__setattr__(self, "unreliable_widths", unreliable)
         object.__setattr__(self, "rank_cpu_ids", rank_cpu_ids)
 
     def llc_domain_thread_counts(self, active_cpu_ids: Iterable[int]) -> dict[str, int]:
@@ -953,6 +964,7 @@ class AnalyticMachineCalibration:
             ),
             overheads=RuntimeOverheads.from_dict(payload.get("overheads", {})),
             supported_widths=tuple(int(value) for value in payload["planner"]["supported_widths"]),
+            unreliable_widths=tuple(int(value) for value in payload["planner"].get("unreliable_widths", ())),
             relative_uncertainty=float(payload.get("uncertainty", {}).get("relative", 0.05)),
             w13_scale=float(stage_scales.get("w13", 1.0)),
             w2_scale=float(stage_scales.get("w2", 1.0)),
@@ -1010,7 +1022,10 @@ class AnalyticMachineCalibration:
             "caches": asdict(self.caches),
             "services": services,
             "overheads": self.overheads.to_dict(),
-            "planner": {"supported_widths": list(self.supported_widths)},
+            "planner": {
+                "supported_widths": list(self.supported_widths),
+                **({"unreliable_widths": list(self.unreliable_widths)} if self.unreliable_widths else {}),
+            },
             "uncertainty": {"relative": self.relative_uncertainty},
             "stage_scales": {"w13": self.w13_scale, "w2": self.w2_scale},
         }
@@ -1493,6 +1508,11 @@ class AnalyticMoeCostModel:
         )
         if not self.supported_widths:
             raise ValueError("no supported thread widths remain")
+        unreliable = set(self.calibration.unreliable_widths)
+        # Widths the planner chooses among by itself; every supported width still runs when asked.
+        self.planner_widths = tuple(width for width in self.supported_widths if width not in unreliable) or (
+            self.supported_widths
+        )
         self._shape_keys = (
             tuple(tuple(int(value) for value in shape) for shape in supported_shapes)
             if supported_shapes is not None

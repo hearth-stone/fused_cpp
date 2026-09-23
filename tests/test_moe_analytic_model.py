@@ -1663,7 +1663,7 @@ def test_runtime_uses_one_calibration_and_emits_no_stage_split_controls() -> Non
     assert first["bridge"] == cached["bridge"]
 
 
-def _service_probe(rates, *, machine="c9g", kind="moe_analytic_service_probe"):
+def _rate_probe(rates, *, machine="c9g", kind="moe_analytic_service_probe"):
     return {
         "kind": kind,
         "machine": {"id": machine},
@@ -1686,9 +1686,9 @@ def test_median_service_probe_outvotes_a_single_bad_run() -> None:
     overhead zero and the planner's own region at 7.8% instead of 2.3%.
     """
     runs = [
-        _service_probe([(1, 100.0), (2, 200.0)]),
-        _service_probe([(1, 130.0), (2, 190.0)]),
-        _service_probe([(1, 110.0), (2, 1.0e9)]),
+        _rate_probe([(1, 100.0), (2, 200.0)]),
+        _rate_probe([(1, 130.0), (2, 190.0)]),
+        _rate_probe([(1, 110.0), (2, 1.0e9)]),
     ]
     merged = median_service_probe(runs, sources=["a", "b", "c"])
     rows = merged["services"]["l2_bytes"]["rows"]
@@ -1706,21 +1706,21 @@ def test_median_service_probe_outvotes_a_single_bad_run() -> None:
 
 
 def test_median_service_probe_passes_one_run_through_and_refuses_mismatched_ones() -> None:
-    single = _service_probe([(1, 100.0)])
+    single = _rate_probe([(1, 100.0)])
     passed = median_service_probe([single])
     assert passed["services"]["l2_bytes"]["rows"][0]["aggregate_rate"] == 100.0
     assert "service_probe_median" not in passed.get("provenance", {})
 
     with pytest.raises(ValueError, match="different machines"):
-        median_service_probe([single, _service_probe([(1, 1.0)], machine="arm-codex")])
+        median_service_probe([single, _rate_probe([(1, 1.0)], machine="arm-codex")])
     with pytest.raises(ValueError, match="disagree on kind"):
-        median_service_probe([single, _service_probe([(1, 1.0)], kind="contention_async")])
+        median_service_probe([single, _rate_probe([(1, 1.0)], kind="contention_async")])
     with pytest.raises(ValueError, match="at least one"):
         median_service_probe([])
 
 
 def test_median_service_probe_keeps_a_point_only_one_run_measured() -> None:
-    full = _service_probe([(1, 100.0)])
+    full = _rate_probe([(1, 100.0)])
     empty = {"kind": "moe_analytic_service_probe", "machine": {"id": "c9g"},
              "services": {"l2_bytes": {"rows": []}}}
     merged = median_service_probe([full, empty, empty])

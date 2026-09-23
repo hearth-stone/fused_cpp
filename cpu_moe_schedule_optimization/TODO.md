@@ -52,6 +52,16 @@ first, then refresh calibration and validate the system coherently. In order:
 
 ## Open code work (refreshed 2026-09-22)
 
+- [ ] **Arm-codex has 8 NUMA nodes of 40 CPUs since its 2026-09-22 reboot**, not 4
+  of 80. The documented placement `--physcpubind=240-319 --membind=3` now puts
+  the CPUs on nodes 6-7 and memory on node 3, and every calibration made on the
+  old 80-core NUMA3 describes hardware that no longer exists in that form.
+  Update `docs/agent_remote_execution.md` and recalibrate before any Arm-codex
+  performance run.
+- [ ] Remote trees must be synced whole, not file by file. On 2026-09-23 the C9g
+  tree lacked the two C9g window-table registrations, which silently invalidated
+  a first related-work pass.
+
 Consolidated from `CURRENT.json`, the sections below, the decision records and
 the working tree. It indexes open work and adds the items no section recorded
 yet; the detailed sections stay authoritative for their own history.
@@ -417,6 +427,35 @@ Arm-codex NUMA3 is one shared measurement resource and the window-table chain
 | P4 | Tables, figures, related-work text | no | one day |
 
 Machine time is about 2-3.5 h, inside the 2026-09-15 standing authorization.
+
+### Status on C9g (2026-09-23)
+
+Run on Amazon C9g NUMA0 instead of Arm-codex (parked); report
+`optimizations/fused_moe_sve/results/c9g_related_work_20260923.md`.
+
+- [x] P0 correctness: `staged_queue` tests pass on C9g (the implementation is the
+  uncommitted `share_packed_a` / `w13_task_n` work in the tree).
+- [x] P1/R1: two sessions, nine workloads. Planned beats the best flat queue on
+  uniform and moderately skewed batches (up to 13.0%), ties on the DSV4 layer and
+  decode batches, loses on 32 equal experts (22.6%) and on 5 x 2040 + 174 x 12
+  routes (10.5%).
+- [x] P2/R2 correctness on Arm for vLLM, llama.cpp, SGLang native and fused_cpp
+  (vLLM needed a torch-2.8 compat header for `at::cpu::get_cpu_capabilities`).
+- [x] P2/R2 timing: vLLM's Arm op matches this repository's kernel under the flat
+  schedule (within 2% on four of six workloads) and beats production quick on the
+  DSV4 layer by 3.2%; no general kernel speedup over vLLM can be claimed. The
+  first run was invalid (OMP_PROC_BIND=close put all of vLLM's threads on one CPU).
+- [x] K (added by the user): KTransformers' dataflow and scheduling on this
+  repository's GEMM, `fused_moe_bf16_tiled_kt_staged`. Uncommitted.
+- [ ] P3/R3 PMU.
+- [ ] The planner has no shape for a few very long experts among many tiny ones:
+  the flat queue's dynamic tail beats every static plan measured (M split,
+  96T N split, mixed widths; best 7.5% behind). A dynamic tail over the long
+  experts' N blocks is the candidate mechanism, not an M split.
+- [ ] Quick still leans narrow: 4T on 32 equal experts where 16T is 20% faster.
+- [ ] Quick's planning time is 0.2-0.6 ms, 5-10% of a decode batch.
+- [ ] Route-sliced plans are not bitwise equal to unsliced ones (BF16 last place
+  in the final merge); applies to bounded tail repartition with route slices.
 
 ### Risks
 

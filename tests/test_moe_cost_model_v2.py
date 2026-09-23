@@ -1607,9 +1607,12 @@ def test_amazon_c5_table_resolves_only_on_the_machine_it_was_measured_on() -> No
     assert policy in _registered_policies()
     for machine in policy.machine_ids:
         assert default_stage_window_policy(**shape, machine_id=machine) is policy
-    for machine in (None, "amazon_c9g_192c_2numa_96c_sve128_tp4", "some_other_machine"):
+    for machine in (None, "some_other_machine"):
         assert default_stage_window_policy(**shape, machine_id=machine) is None
-    # C9g's other shape has no table at all, on any machine.
+    # The same shape on C9g resolves C9g's own table, never the C5 one.
+    c9g = default_stage_window_policy(**shape, machine_id="amazon_c9g_192c_2numa_96c_sve128_tp4")
+    assert c9g is not None and c9g is not policy
+    # The F=1024 shape has a table only on C9g's TP2 calibration.
     for machine in (None, *policy.machine_ids, "amazon_c9g_192c_2numa_96c_sve128_tp4"):
         assert default_stage_window_policy(
             hidden_size=4096, intermediate_size=1024, backend_n_tile=8, machine_id=machine
