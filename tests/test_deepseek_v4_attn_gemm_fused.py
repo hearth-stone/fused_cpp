@@ -245,7 +245,12 @@ def test_deepseek_v4_attn_gemm_defaults_to_sve_with_neon_fallback(
     neon = prepare_deepseek_v4_attn_gemm_weights(weight)
     assert fallback.fused_wqa_wkv[0].numel() == neon.fused_wqa_wkv[0].numel()
     torch.testing.assert_close(fallback.fused_wqa_wkv[0], neon.fused_wqa_wkv[0], rtol=0.0, atol=0.0)
-    assert sve.fused_wqa_wkv[0].numel() != neon.fused_wqa_wkv[0].numel()
+    # The SVE layout pads N to the SVE tile (vector bytes / 2) and NEON to 8, so the sizes tell the
+    # two apart only when the SVE tile is not 8; on a 128-bit build both pad to 8.
+    from fused_cpp import _moe_C
+
+    if int(_moe_C.fused_moe_bf16_tiled_backend_n_tile("arm_sve_bf16", True)) != 8:
+        assert sve.fused_wqa_wkv[0].numel() != neon.fused_wqa_wkv[0].numel()
 
 
 @pytest.mark.skipif(not _HAS_OPENMP, reason="OpenMP is unavailable")

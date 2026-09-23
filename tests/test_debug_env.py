@@ -92,6 +92,7 @@ class TestOrigRmsNormEnvVar:
             fused_w.weight = torch.randn(fused_out_dim, 64)
             fused_w.bias = None
             fused_w.skip_bias_add = False
+            fused_w.cpu_linear = None  # a MagicMock would invent one; _linear prefers it
             wrapper.fused_qkv_a_proj = fused_w
 
             # q_b_proj
@@ -100,6 +101,7 @@ class TestOrigRmsNormEnvVar:
             q_b_w.weight = torch.randn(q_b_out_dim, 512)
             q_b_w.bias = None
             q_b_w.skip_bias_add = False
+            q_b_w.cpu_linear = None  # a MagicMock would invent one; _linear prefers it
             wrapper.q_b_proj = q_b_w
 
             # rotary_emb
@@ -110,6 +112,7 @@ class TestOrigRmsNormEnvVar:
             o_w.weight = torch.randn(64, NUM_HEADS * V_HEAD_DIM)
             o_w.bias = None
             o_w.skip_bias_add = False
+            o_w.cpu_linear = None  # a MagicMock would invent one; _linear prefers it
             wrapper.o_proj = o_w
 
             # Minimal attn_metadata
@@ -185,6 +188,7 @@ class TestOrigRopeEnvVar:
             fused_w.weight = torch.randn(fused_out_dim, 64)
             fused_w.bias = None
             fused_w.skip_bias_add = False
+            fused_w.cpu_linear = None  # a MagicMock would invent one; _linear prefers it
             wrapper.fused_qkv_a_proj = fused_w
 
             # q_b_proj
@@ -193,6 +197,7 @@ class TestOrigRopeEnvVar:
             q_b_w.weight = torch.randn(q_b_out_dim, 512)
             q_b_w.bias = None
             q_b_w.skip_bias_add = False
+            q_b_w.cpu_linear = None  # a MagicMock would invent one; _linear prefers it
             wrapper.q_b_proj = q_b_w
 
             # rotary_emb: mock that returns modified tensors
@@ -212,6 +217,7 @@ class TestOrigRopeEnvVar:
             o_w.weight = torch.randn(64, NUM_HEADS * V_HEAD_DIM)
             o_w.bias = None
             o_w.skip_bias_add = False
+            o_w.cpu_linear = None  # a MagicMock would invent one; _linear prefers it
             wrapper.o_proj = o_w
 
             attn_metadata = MagicMock()

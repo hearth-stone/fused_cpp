@@ -85,11 +85,25 @@ def test_full_stripe_is_the_single_window_endpoint(stage, threads):
 @pytest.mark.parametrize("stage", sorted(_STAGES))
 @pytest.mark.parametrize("threads", _WIDTHS)
 def test_r1_matches_the_legacy_n_split_ranges(stage, threads):
-    """The R=1 endpoint must reproduce `fused_moe_test_split_plan`'s N ranges."""
+    """The R=1 endpoint is the legacy even N split, at this build's tile.
+
+    `fused_moe_test_split_plan` is the NEON/bf16gemm team split and always cuts in
+    `kKernelTile` = 8 columns, which is the SVE tile only on a 128-bit build. On a
+    wider build the SVE executor cuts in its own tile, so the same rule - an even
+    split of N / n_tile tiles - is checked at that granularity instead.
+    """
     k, n = _STAGES[stage]
     _, _, _, ranges = _stage_window_plan(n, _N_TILE, threads)
-    legacy = _split_plan_n_ranges(stage, 128, k, n, threads)
-    assert ranges[0] == legacy
+    if _N_TILE == 8:
+        expected = _split_plan_n_ranges(stage, 128, k, n, threads)
+    else:
+        base, extra = divmod(n // _N_TILE, threads)
+        expected, begin = [], 0
+        for tid in range(threads):
+            tiles = base + (1 if tid < extra else 0)
+            expected.append((begin * _N_TILE, tiles * _N_TILE))
+            begin += tiles
+    assert ranges[0] == expected
 
 
 @pytest.mark.parametrize("stage", sorted(_STAGES))

@@ -218,7 +218,11 @@ Correctness and second-machine follow-ups (2026-09-21..22):
   packed-B geometry, where `i8gemm.h` documents B_reo as 8-column N blocks while
   `fused_moe_w8a8_tiled_prepare_quantized_weights` pads N to `svcntb()/2`.
   Evidence and probe: `tmp/w8a8_vector_length_20260921/`.
-- [ ] Triage the 16 lab scripts that pin `n_tile = 16`. Three classes, and only
+- [x] Closed 2026-09-23: none of the 16 is reused. Their `n_tile = 16` computes the
+  Arm-codex (SVE-256) geometry they measured, which is correct there; every script
+  reused on C9g this week reads the tile from the build and checks it, and tracked
+  code carries no pinned tile. Left untouched per the rule below.
+  Triage the 16 lab scripts that pin `n_tile = 16`. Three classes, and only
   one is dangerous: a `backend_n_tile != 16` guard refuses to run on the wrong
   machine and is merely inconvenient (`dram_write_20260919`,
   `footprint_probe_20260921`, `window_table_20260918`, `v10_probes_20260919`,
@@ -232,7 +236,18 @@ Correctness and second-machine follow-ups (2026-09-21..22):
   each a declared tile plus a consumer check, as `tmp/c9g_2t_20260922/bench.py`
   now has. Tracked code is already clean: the only `backend_n_tile=16` in the
   repository is the Arm-codex window table declaring its own measurement.
-- [ ] The full `tests/` directory aborts (SIGABRT, rc 134) on both machines,
+- [x] Closed 2026-09-23: the abort was heap corruption from the i8gemm scaled
+  kernels at 128 bits (`LOAD_SCALED_TILE_AUX`, `DEINT_SCALED_QUADS`,
+  `M12_DEINT_STORE_PAIR_SCALED` still emitted 16 columns; now gated on
+  `I8GEMM_SVE_QUAD_PAIRS`, 256-bit disassembly unchanged). Single-process
+  `tests/`: C9g 4166 passed, 0 aborts, the one failure (a 128-bit padding
+  assumption in `test_deepseek_v4_post_gemm_stage`) fixed and 29/29 on rerun;
+  Arm-codex 4182 passed, 0 failed, 8 errors only from untracked joint-model tests
+  whose `tmp/` inputs exist only locally (10/10 there). Also fixed on the way:
+  `torch::autograd` use in `fused_moe_bf16_tiled.cpp`, KleidiAI availability
+  probe, and 128-bit tile assumptions in several tests. Logs:
+  `tmp/c9g_full_tests_20260923/`, `tmp/codex_full_tests_20260923/` (Arm-codex).
+  Original item: the full `tests/` directory aborts (SIGABRT, rc 134) on both machines,
   inside the SDPA suite - `tests/test_sdpa.py::test_sdpa_standard` on
   `Arm-codex`, earlier on C9g. It dies before pytest writes its summary, so the
   failure list is lost and the MoE suites have to be selected explicitly. This

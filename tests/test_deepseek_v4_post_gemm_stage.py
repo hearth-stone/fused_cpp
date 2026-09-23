@@ -775,7 +775,12 @@ def test_post_gemm_prepare_defaults_to_sve_without_attention_override(monkeypatc
     default = prepare_deepseek_v4_post_gemm_weights(weight)
     assert default.main_wq_b.n_padded == sve.main_wq_b.n_padded
     torch.testing.assert_close(default.main_wq_b.packed_weight, sve.main_wq_b.packed_weight, rtol=0.0, atol=0.0)
-    assert sve.main_wq_b.n_padded != neon.main_wq_b.n_padded
+    # The SVE layout pads N to the SVE tile (vector bytes / 2) and NEON to 8, so the padding tells the
+    # two apart only when the SVE tile is not 8; on a 128-bit build both pad to 8.
+    from fused_cpp import _moe_C
+
+    if int(_moe_C.fused_moe_bf16_tiled_backend_n_tile("arm_sve_bf16", True)) != 8:
+        assert sve.main_wq_b.n_padded != neon.main_wq_b.n_padded
 
 
 @pytest.mark.skipif(

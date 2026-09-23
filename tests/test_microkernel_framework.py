@@ -125,10 +125,21 @@ def _registered_sdpa_versions() -> list[str]:
     return list(_C.list_sdpa_versions())
 
 
+# The impls wired into the SDPA path. The QK pack and layout traits added later (starred in
+# csrc/SDPA_VERSIONS.md, "是否接入 SDPA = 否") are microkernel-benchmark traits only and get no
+# SDPA entry; they are validated by the microkernel tests above.
+_SDPA_IMPLS = ("baseline", "scalar", "pquad", "qk_ublock4")
+
+
+def _sdpa_impls() -> list[str]:
+    return [impl for impl in _impls() if impl in _SDPA_IMPLS]
+
+
 def test_sdpa_versions_have_per_impl_entries():
-    """每个 enabled MK impl 都注册 flash2_neon_cache_<name> SDPA 版本。"""
+    """每个接入 SDPA 的 enabled MK impl 都注册 flash2_neon_cache_<name> SDPA 版本。"""
     versions = _registered_sdpa_versions()
-    for impl in _impls():
+    assert set(_SDPA_IMPLS) <= set(_impls()), _impls()
+    for impl in _sdpa_impls():
         name = f"flash2_neon_cache_{impl}"
         assert name in versions, (name, versions)
     # 历史名仍然在。
@@ -215,7 +226,7 @@ def test_sdpa_flash2_neon_cache_impls_equiv(dtype):
     ref = _run_sdpa("flash2_neon_cache_baseline", q, k, v)
     atol = 1e-4 if dtype == torch.float32 else 5e-2
     rtol = 1e-4 if dtype == torch.float32 else 5e-2
-    for impl in _impls():
+    for impl in _sdpa_impls():
         if impl == "baseline":
             continue
         got = _run_sdpa(f"flash2_neon_cache_{impl}", q, k, v)
