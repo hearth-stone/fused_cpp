@@ -288,9 +288,12 @@ TP2 needs no new machine probe. Four gaps remain.
   the probe runs three times with a per-point median. Held-out isolated error
   went from 20.7-31.4% (TP4) and 17.2-30.2% (TP2) to 7.71-7.85% and 8.72-10.55%,
   against 7.66% and 10.55% for the research calibration.
-- [ ] Plan quality from a one-click calibration is unmeasured. v1.138 validates
-  isolated accuracy only; compare the widths and windows a v2 quick calibration
-  selects on real layers against the research calibration's, measured.
+- [x] Plan quality from a one-click calibration (v1.139): on 18 real layers per
+  shape the v2 file's quick plans are equivalent to the research calibration's
+  (median -0.04% TP4, -0.12% TP2). The old untrained file is too (+0.20%,
+  -0.02%): the quick planner's choice is robust to calibration error.
+- [ ] Measure where calibration accuracy should matter: full search, the fast
+  planner, cross-rank or shared-expert balance, which use absolute times.
 - [ ] One-click calibration is validated on C9g only. Repeat the v2 end-to-end
   run on Arm-codex once performance runs there are allowed again.
 - [ ] Multi-panel under-prediction at wide widths (TP4 >= 8T, TP2 >= 16T;

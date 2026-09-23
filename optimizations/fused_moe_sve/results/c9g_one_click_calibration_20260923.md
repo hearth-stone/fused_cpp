@@ -72,3 +72,35 @@ widths (`c9g_b_retention_20260923.md`), which is a model defect rather than a ca
   the full stripe.
 
 Lab: `tmp/c9g_quick_cal_20260923/` (old path), `tmp/c9g_quick_cal_v2_20260923/` (this change).
+
+## Plan selection on real layers (added 2026-09-23)
+
+The isolated result above left plan quality open. Measured: 18 real layers per shape (requests
+008/016/022, layers 2/9/15/25/36/40, none used by an earlier C9g run), one quick planner
+(`plan_quick`, widths 4/8/16/32, CPUs 0-95) with the shape's registered C9g window table, and
+three calibrations as the only difference - `research`, `v2` (the first end-to-end one-click run,
+chosen before any plan was generated) and `v1` (the old untrained single-probe one-click file,
+a control). Every variant's Plan V2 differed from `research`'s: the widths agree on 34 of 36
+layers (v1 picks 16T over 8T on two TP4 layers), but predicted times differ and so does the LPT
+assignment of experts to lanes. The window validation's `bench.py`, unchanged, two sessions;
+`research` repeats between sessions at a median 0.12% (TP4) and 0.06% (TP2).
+
+| vs `research`, mean of two sessions | median | range | faster | > 2% slower |
+| --- | --- | --- | --- | --- |
+| TP4, `v2` | -0.04% | -0.25% to +0.24% | 10/18 | 0 |
+| TP2, `v2` | -0.12% | -0.48% to +0.17% | 12/18 | 0 |
+| TP4, `v1` (control) | +0.20% | -0.18% to +0.99% | 2/18 | 0 |
+| TP2, `v1` (control) | -0.02% | -0.31% to +0.26% | 10/18 | 0 |
+
+Frozen rule (median <= +0.5% and no layer > 2% slower): `v2` is **equivalent** to the research
+calibration on both shapes.
+
+So is the old one-click file, which is the more informative result. A calibration 20-31% off on
+isolated experts picks plans within 0.2% of the research calibration's, because the quick
+planner only chooses one homogeneous width among four and assigns experts by LPT: errors that
+move every width the same way do not reorder them. Plan choice by this planner is robust to the
+calibration; the v2 accuracy buys about 0.2% on TP4 here and nothing measurable on TP2. Where
+absolute times drive decisions - full search, the fast planner, cross-rank or shared-expert
+balance - the accuracy should matter more; that is not measured.
+
+Lab: `tmp/c9g_quick_plans_20260923/` (design, gen, bench, score).
