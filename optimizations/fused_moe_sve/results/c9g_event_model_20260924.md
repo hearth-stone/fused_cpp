@@ -425,3 +425,47 @@ Item 2 needs a self-consistent bandwidth share: solve for the phase durations at
 phase's achieved rate fits each resource's capacity, instead of dilating isolated times by
 isolated offered rates. A composition tweak does not fix it. The window model stays the best
 probe-consistent variant.
+
+### Core-PMU counters on C9g (which fix the hardware supports)
+
+Design, script and raw data: `tmp/c9g_event_model_20260924/counter_design.md`, `bench_counters.py`,
+`counters_session{1,2}.json` (also on `AmazonC9g192Cores` at the same path), analysis
+`analyze_counters.py`, `old_spill_bytes.py`. The machine is c9g.metal-48xl (Neoverse V3, bare
+metal), but ACPI describes no CMN or DMC device, so only the core PMU is usable. Events: cycles +
+5 (no multiplexing, checked): l2d_cache_refill, l2d_cache_wb, ll_cache_miss_rd, ll_cache_rd,
+stall_backend_mem. The run used all 96 node-0 CPUs system-wide, two sessions with 120 s cooldown,
+and set `perf_event_paranoid` to -1 for the run only (restored). Per-cell L2 refill bytes agree
+between sessions within 1%. `ll_cache_miss_rd` misses prefetch fills (0.03-0.06 GB against 3.22
+GB of weights), so SLC and DRAM cannot be told apart. Every line a core reads from DRAM is refilled
+into its L2, so L2 refill bytes bound the DRAM reads from above.
+
+1. **The aggregate LLC spill rule is physically impossible.** On fixed_4 it charges 9.63 GB of
+   DRAM per call, but the cores refill only 5.49 GB into L2 in total (1.75x the bound); fast:
+   7.95 vs 4.98 GB. The L2 window rule charges 2.88 GB (the weights), within the bound. Fix 0 is
+   supported.
+2. **Window geometry matches the L2 traffic.** Measured L2 refill per call against the model's L2
+   bytes (A + B + C) with full-stripe / executed-window geometry: fixed_4 5.49 vs 11.22 / 6.85,
+   fast 4.98 vs 8.72 / 4.73, fixed_8 4.88 vs 4.01 / 4.43, fixed_16 5.50 vs 4.92 / 4.92. The
+   full-stripe B re-reads the model charged for 4T do not happen. Fix 2 is supported.
+3. **Pure loading.** The cells have 256 distinct experts at M=12, 3.22 GB of weights per call.
+   L2 refill is 3.47 / 3.62 / 3.88 / 4.39 GB per call at 4 / 8 / 16 / 32T, i.e. 372 / 379 / 387 /
+   402 GB/s. Only 346 / 337 / 322 / 295 GB/s of that is weights; the rest is A replicated into each
+   thread's L2 and C. L2 write-backs add 0.28-0.79 GB. The lone 4T lane moves 88 GB/s.
+   The weight rate reproduces the probe-derived multi-stream capacity (Fix 1, 345 GB/s at 96
+   cores). But the total bytes through the L2s are close to the single-team 411 GB/s curve, and
+   the model routes the extra A/C traffic to the LLC rather than DRAM. So the counters cannot say
+   whether DRAM or the SLC/mesh saturates. Fix 1 is supported as an effective weight-stream
+   capacity; its mechanism is unresolved.
+4. **The steady-target slowdown is mostly not memory stalls.** Targets alone vs full background
+   (span ratio): P2 (steady background) 8T x1.33, 16T x1.51, 4T x1.79; P3 (loading background)
+   8T x1.28, 16T x1.28, 4T x1.37. Extra stall_backend_mem on the target CPUs covers only 20-28%
+   of the extra cycles, and the clock stays at about 3.25 GHz (3.33 alone). L2 refill of the
+   target barely changes under loading background (8T 0.24 -> 0.25 GB); under steady background
+   it rises 25-30%.
+   - The target's average refill rate alone is 22 / 70 / 31 GB/s (8T / 16T / 4T). The model's
+     bytes / isolated steady duration gives 17 / 60 / 72, while its LLC-service offer gives
+     178 / 328 / 127. So the offered-rate correction matches the counters for 8T/16T; the current
+     offer is 5-8x too high.
+   - But neither composition explains the slowdown: most of it is not backend memory stalls.
+   Next measurement: stall_backend, stall_frontend, inst_retired and op_spec on the same cells,
+   to see where the remaining ~75% of extra cycles go.
