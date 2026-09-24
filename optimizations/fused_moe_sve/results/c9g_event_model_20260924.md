@@ -543,3 +543,43 @@ The model term that follows: a steady phase's time grows with memory-system util
 latency-exposed accesses (A refills, C write-backs), a queueing-latency term with no bandwidth
 share. Which store/load path stalls needs the V3 implementation events (raw codes, for example
 store-buffer or write-back stalls), which sysfs does not list.
+
+#### Round 4: which path stalls (Neoverse V3 backend-stall breakdown)
+
+Data `bgmicro_stall_session{1,2}.json`, analysis `analyze_bgstall.py`, design
+`bgmicro_design.md` round 2. Targets: the kernel's steady expert at 8T/16T (M=2048) and 4T
+(M=1024), full stripe, alone or with the stream background. Three event groups, raw architected
+V3 codes checked to count. STALL_BACKEND_L2D, _ILOCK and L2D_CACHE_REFILL_WR read 0 on this core.
+
+| target | slowdown | extra backend stall / extra cycles | MEMBOUND | CPUBOUND | L1D-pending load | L2-miss-pending load (MEM) | store not committed (ST) | issue queue full (BUSY) |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 8T M=2048 | x1.23 | 88% | 88% | 1% | 70% | 18% | 0% | 74% |
+| 16T M=2048 | x1.27 | 85% | 81% | 4% | 66% | 16% | 0% | 76% |
+| 4T M=1024 | x1.45 | 91% | 91% | 1% | 78% | 13% | 0% | 84% |
+
+Columns are each event's added cycles as a share of the extra cycles; the events overlap (BUSY is
+the issue-queue view of the same load waits). The target's own traffic does not change under the
+background. Bus reads equal L2 refills (BUS_ACCESS counts 32-byte beats, `caps/bus_width` 32):
+8T 268 -> 266 MB, 16T 415 -> 411, 4T 393 -> 414 MB per call. L2 victim write-backs stay at 95-360
+MB per call.
+
+- The stalled path is the load path. Nearly all extra cycles are memory-bound backend stalls on
+  demand loads that missed L1 and are waiting on refills; the issue queues fill behind them.
+- It is not the store/write-back path (ST 0%), not a CPU-bound limit (CPUBOUND unchanged), not TLB,
+  and not rename.
+- The target moves the same bytes; each refill just takes longer.
+- In an 8T M=2048 expert those bytes are mostly A. N-split makes every thread read all of A:
+  16.7 MB x 8 threads for W13, about 134 MB, plus W2's A. The weights are 12.6 MB.
+- The counters cannot say whether the refills turn slow because SLC hits get slower in a saturated
+  mesh, or because the background's streams evict A from the SLC so the refills go to DRAM. Only
+  18% of the extra cycles are loads pending beyond L2 (MEM). The L1D-pending share is 70% and
+  STALL_BACKEND_L2D is not implemented, so the split between L2-hit and L2-miss waits is not
+  resolved.
+
+Model consequence: the steady-phase contention term is a latency term on the phase's A refill
+traffic (the model's `a_l2_refill_bytes`, which already scales with team width and windows). Its
+latency grows with memory-system utilization, independent of the target's own bandwidth share:
+steady time += A-refill lines x exposed fraction x extra latency(utilization). It does not apply to
+C writes or write-backs. The utilization-to-latency curve and the exposed fraction can be
+calibrated on the stream-background cells (target alone vs stream background, 3 widths). The
+P2/P3 probes and the whole plans then serve as validation.
