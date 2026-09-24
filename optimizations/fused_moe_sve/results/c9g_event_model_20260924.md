@@ -316,3 +316,41 @@ picked over 8T (6T -24%). In the tuning set, 8 of the 10 layers where fast is me
 homog_8, because fast is underpriced by 12% and homog_8 by 30%. The rule is not proposed for
 adoption on its own; it needs the loading-contention fix first, and then a measured whole-plan
 validation.
+
+### Lab: DRAM capacity under concurrent loading streams
+
+The earlier reading of cause 2 was wrong. Spreading each traced task's weight bytes over its
+measured W13/W2 stages (`measured_dram_timeline.py`) gives only 260-310 GB/s summed while small
+experts load, not the 411 GB/s ceiling. And in the model only about 5 tasks are loading at a
+time (`dram_timeline.py`). The P1 probes (`probe_absolute.py`: M=12 target chain plus 4T M=12
+background chains, i.e. every lane streaming its own experts) give the same aggregate model-free:
+219 / 297 / 296 / 291 / 303 / 326 / 345 GB/s at 12 / 20 / 36 / 52 / 68 / 84 / 96 busy cores.
+The single-team curve the model uses says 242 / 316 / 400 / 400 / 403 / 408 / 411. Rebuilt inside
+the analytic DAG (`probe_repro.py`), D_LL is underpredicted for 2T-16T (4T n=64: 3.47 vs 4.72).
+
+`multi_stream_dram.py` keeps the L2 window spill rule and adds one term: with two or more
+concurrent DRAM-demanding phases the capacity is min(single-team curve, the 4T P1 aggregate
+above). A lone phase keeps the single-team curve and its isolated calibration. The capacity was
+frozen from the probes before any whole-plan comparison. Python placed DAG only.
+
+| set | L2 window rule | + multi-stream DRAM capacity |
+| --- | --- | --- |
+| D_LL 4T n=32/64/92 (fit set) | 1.96 / 3.47 / 4.74 (meas 2.56 / 4.72 / 5.86) | 2.57 / 4.56 / 5.60 |
+| D_LL 32T n=32/64 | 1.69 / 2.41 (meas 1.55 / 1.86) | 2.05 / 2.91 |
+| D_LS 16T n=64, 32T n=64 | 1.51, 1.37 (meas 2.25, 2.13) | 1.56, 1.41 |
+| traces 4T / 8T / 16T / fast | +19% / -27% / -20% / -5% | +22% / -13% / -10% / +7% |
+| width-error median, 8T / 16T / 32T | -28% / -23% / -18% | -16% / -13% / -12% |
+| width pick | 12/18, max regret 10.38% | 13/18, max 9.85% |
+| tuning median, fast / homog 8 / 16 / 32 | -12% / -30% / -28% / -22% | -1% / -18% / -16% / -17% |
+| family pick | 6/18, regret median 1.21%, max 4.87% | 8/18, median 0.89%, max 5.43% |
+
+Small-expert loading is now right in the traces: M <= 12 measured / predicted 4.92 / 5.10,
+4.03 / 3.94, 3.02 / 3.04 at 4T / 8T / 16T (`multi_vs_trace.py`). Two errors remain, and they
+now decide the picks:
+
+- 4T mid and large M are overpredicted: 1.37 vs 1.91 for M 49-192, 1.30 vs 1.83 for 193-768.
+  The phases are built from full-stripe geometry, while the runtime executes the window table,
+  whose full-load window/full-stripe ratio for 4T is 0.51-0.70.
+- 8T/16T mid and large M are underpredicted by 10-20% (8T M 49-192: 1.41 vs 1.16). Steady
+  phases get no dilation from loading neighbours in the model; the probes measure D_SL
+  1.28-1.37 at full load for 8T/16T. D_LS for 16T/32T and D_LL for 32T are also still off.
