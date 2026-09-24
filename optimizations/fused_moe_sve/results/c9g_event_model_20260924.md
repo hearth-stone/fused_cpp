@@ -503,3 +503,43 @@ a bandwidth share. Neither the additive composition nor the offered-rate fix mod
 model it would be a gemm_core_flops service curve that saturates with concurrently computing cores;
 today that curve is linear in threads. Verification: target alone vs a background running only
 register-resident BFMMLA loops (no memory traffic) vs a background of scalar spin.
+
+#### Round 3: register-only BFMMLA background (the throttling hypothesis is rejected)
+
+Design `tmp/c9g_event_model_20260924/bgmicro_design.md`, code `bgmicro.c` and `bench_bgmicro.py`,
+data `bgmicro_session{1,2}.json`. The target runs continuously on CPUs [0, t), so no wait
+correction is needed. The background (`bgmicro`) runs on the next n CPUs in one of four modes:
+
+- none;
+- spin (dependent scalar adds);
+- bfmmla (12 register-resident SVE BFMMLA accumulators, no memory traffic; 8.0-8.8e9 BFMMLA/s
+  per core in the background, 9.3e9 with 4 threads);
+- stream (SVE loads over a private 256 MiB buffer per thread; 3.2-3.6 GB/s per thread, about
+  290-315 GB/s over 88 cores).
+
+Targets are the fused kernel's single steady expert (full stripe, 32 rotating experts) and the
+bfmmla loop itself. Each combination runs 2.5 s with perf on the target CPUs; two sessions,
+shuffled, 120 s cooldown. Target time over the no-background time:
+
+| target | spin | bfmmla | stream | IPC none -> stream | backend stall none -> stream (memory part) |
+| --- | --- | --- | --- | --- | --- |
+| kernel 8T M=2048 (n=88) | x1.000 | x1.000 | x1.225 | 4.66 -> 3.95 | 22% -> 33% (1% -> 4%) |
+| kernel 16T M=2048 (n=80) | x1.006 | x1.006 | x1.269 | 4.47 -> 3.71 | 25% -> 37% (2% -> 4%) |
+| kernel 4T M=1024 (n=92) | x1.007 | x1.007 | x1.433 | 4.52 -> 3.26 | 24% -> 45% (1% -> 5%) |
+| bfmmla loop 8T (n=88) | x1.038 | x1.035 | x0.997 | 3.35 -> 3.36 | 15% -> 17% |
+
+By the frozen reading, the compute-throttling hypothesis is rejected. 88 cores of back-to-back
+BFMMLA do not slow the kernel at all (<= 0.7%), and slow a pure BFMMLA target by only 3.5%. A pure
+memory-streaming background, with no matrix instructions, reproduces the steady slowdown
+(x1.22-1.43, against P2 x1.32-1.79 and P3 x1.28-1.40) at an unchanged 3.2-3.3 GHz clock. The
+slowdown is memory-side. It shows up as backend stalls that the architected stall_backend_mem
+does not count; on Neoverse that event counts only stalls with a demand load pending in the L2.
+The target's own traffic is small (8T: 22 GB/s), and a target with no memory traffic is not
+slowed. So the mechanism is latency or queueing on the path the kernel's A reads and C writes
+use when the memory system is saturated, not a bandwidth share of the target's own bytes. This is
+why neither max() nor sum composition of the target's own transfer time reproduces it.
+
+The model term that follows: a steady phase's time grows with memory-system utilization by its
+latency-exposed accesses (A refills, C write-backs), a queueing-latency term with no bandwidth
+share. Which store/load path stalls needs the V3 implementation events (raw codes, for example
+store-buffer or write-back stalls), which sysfs does not list.
