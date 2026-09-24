@@ -253,3 +253,41 @@ when a homogeneous shape wins: the fastest one is mostly 8T (7 layers), and fast
 makes 8T look expensive. No k makes fast never worse than quick, so the change was not
 validated on the fresh layers and is not kept. The patch is in
 `tmp/c9g_event_model_20260924/fast_homogeneous_templates.patch` (Python and native, with tests).
+
+## Why the analytic model misprices whole plans with contention (r008 layer 9, per-task traces)
+
+`trace_tasks.py` traced four plans on node 0: homogeneous 4T/8T/16T and fast's mixed plan (5
+traced calls each, trace overhead under 1%). `analytic_vs_trace.py` / `spill_test.py` /
+`small_m_stages.py` compare each task's measured time with the analytic placed DAG's prediction
+(task time over the analytic isolated time). The analytic calibration carries no wide-team,
+narrow-team, gather or DRAM-injection terms (all absent), one 96 MB LLC domain (64 MB
+effective) and a DRAM curve saturating at 411 GB/s.
+
+| plan | measured | analytic | analytic without LLC spill |
+| --- | --- | --- | --- |
+| homogeneous 4T | 21.29 ms | 38.72 | 25.23 |
+| homogeneous 8T | 13.82 | 12.07 | 10.16 |
+| homogeneous 16T | 14.25 | 11.62 | - |
+| fast mixed (1x16T + 4T bulk) | 13.65 | 21.90 | 12.95 |
+
+1. **The LLC-spill rule overprices mid and large M on narrow lanes (the main error).** When the
+   concurrent tasks' working sets exceed the effective LLC, the model re-reads B from DRAM for
+   every 12-row panel of every steady phase. For a 4T expert that is 61.6 MB at M=96 and 1090 MB
+   at M=1500, against 8.4 MB of W13 weights. With 24 lanes the spill fraction is 0.6-0.8, and
+   those phases become DRAM-bound. Measured dilation of 4T tasks with M 49-192 / 193-768 / >768
+   is 1.37 / 1.30 / 1.21; the model predicts 4.50 / 4.29 / 2.47. With the spill disabled the
+   same tasks predict 1.88 / 1.79 / 1.47, and the 4T and mixed makespans move to within 18% / 5%
+   of measured. B reuse across panels evidently stays in each core's private L2 (the kernel's
+   windowed stripes), so aggregate LLC pressure does not force the re-reads the rule charges.
+2. **Loading of small experts is underpriced once the spill is removed.** M <= 12 tasks
+   measured 4.92 / 4.03 / 3.02 x their isolated time on 4T / 8T / 16T; the model predicts
+   3.80 / 2.97 / 2.32 without the spill. The measured W13+W2 loading of those tasks implies
+   about 18.5 / 34.6 / 61 GB/s per lane, 440 / 415 / 368 GB/s summed over the lanes, i.e. the
+   calibrated 411 GB/s ceiling. The capacity is right; the model has fewer lanes loading at once
+   than the hardware does. This is not yet checked event by event.
+3. Not modeled at all on C9g: wide-team pressure, narrow-team correction, gather pressure, DRAM
+   domain injection; merge and call overhead are outside the DAG.
+
+Candidate fix for (1): charge the panel re-read only when a task's own per-core B window exceeds
+its private L2, not when the aggregate working set exceeds the LLC. It must be validated on the
+width table and on these traces before any adoption.
