@@ -387,3 +387,41 @@ families, so the picks are mostly right. Remaining:
 - Mid and large M on every width are 10-20% slower than predicted (item 2: no steady-phase
   dilation from loading neighbours). Fast's 4T M <= 12 tasks are also underpredicted (5.20 vs
   4.44), and its 16T M <= 12 tasks overpredicted (3.02 vs 4.17).
+
+### Lab: steady-phase slowdown under loading neighbours (item 2), not resolved
+
+The steady probes rebuilt in the analytic DAG (`probe_steady.py`, full-stripe policy as in the
+probes) give 8T/16T steady targets exactly no slowdown: D_SS 1.00-1.01 vs measured 1.12-1.24, and
+D_SL 1.00 vs 1.09-1.37, all at full load. `steady_breakdown.py` shows the model does dilate their
+LLC (2.2-2.5x), but under max(compute, transfer) the dilated LLC time (8T M=2048: 1044 us x 2.45)
+stays under the compute time (10911 us). 2T/4T full-stripe targets are the opposite, overpredicted
+(D_SS 4T 1.77 vs 1.51). Three structural variants were tried, all with isolated times held fixed:
+
+- `additive_ecm.py`: time = compute + transfer (ECM non-overlap).
+- `offered_rate.py`: a phase offers demand / its own isolated duration, instead of demand / its
+  isolated time on that resource (rewrites exactly the two offered-rate expressions).
+- The two combined.
+
+| set | window (previous) | additive | offered rate | offered + additive |
+| --- | --- | --- | --- | --- |
+| D_SS 8T / 16T / 32T at max n (meas 1.16 / 1.24 / 1.46) | 1.01 / 1.00 / 1.29 | 1.98 / 1.92 / 1.65 | 1.01 / 1.00 / 1.10 | 1.09 / 1.13 / 1.22 |
+| D_LL 4T n=92, 8T n=88 (meas 5.86, 5.01) | 5.60, 5.25 | 4.12, 4.09 | 4.75, 4.54 | 3.11, 2.90 |
+| tuning median, fast / homog 8 / 16 / 32 / quick | -17 / -15 / -15 / -16 / -13% | -3 / -3 / -1 / +4 / +3% | -25 / -21 / -18 / -20 / -16% | -36 / -33 / -29 / -23 / -26% |
+| family pick | 13/18, max 4.82% | 13/18, max 3.20% | 9/18, max 4.92% | 9/18, max 4.92% |
+| width pick over 4/8/16/32/48/96 | 16/18, max 0.34% | 14/18, max 0.88% | 15/18, max 0.36% | 13/18, max 5.91% |
+
+No variant matches both the probes and the whole plans:
+
+- The additive composition puts whole plans within +-5% on average. The probes show it does so for
+  the wrong reason: it overstates steady slowdown about 6x (8T D_SS 1.98 vs 1.16) and understates
+  loading contention, so the errors cancel.
+- The offered-rate correction with the additive composition gets the steady probes about right
+  (8T 1.09 vs 1.16). But it collapses loading contention (D_LL 4T n=92 3.11 vs 5.86), and whole
+  plans move to -23..-36%. The reason: dilation is applied to the resource time while
+  utilization is now measured over the phase duration, so a saturated loader no longer takes
+  N x bytes / capacity.
+
+Item 2 needs a self-consistent bandwidth share: solve for the phase durations at which every
+phase's achieved rate fits each resource's capacity, instead of dilating isolated times by
+isolated offered rates. A composition tweak does not fix it. The window model stays the best
+probe-consistent variant.
