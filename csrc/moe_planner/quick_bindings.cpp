@@ -5,10 +5,13 @@
 
 #include <pybind11/stl.h>
 
+#include <cstdint>
 #include <stdexcept>
+#include <tuple>
 #include <utility>
 #include <vector>
 
+#include "analytic_placed_dag.h"
 #include "hot_wide_planner.h"
 #include "interval_planner.h"
 
@@ -16,7 +19,11 @@ namespace py = pybind11;
 
 namespace {
 
+using moe_planner::AnalyticDagMachine;
+using moe_planner::AnalyticDagPhase;
+using moe_planner::AnalyticDagTasks;
 using moe_planner::IntervalAssignmentOrder;
+using moe_planner::NativeAnalyticPlacedDag;
 using moe_planner::IntervalCandidate;
 using moe_planner::IntervalPlanResult;
 using moe_planner::IntervalTask;
@@ -133,7 +140,46 @@ py::dict HotWidePlan(const NativeHotWidePlanner& planner, const std::vector<int>
   return result;
 }
 
+// (gemm, active_threads, fixed_ns, residual_scale, base_ns, working_set_bytes, gemm_demand,
+//  l2_demand, llc_demand, epilogue_demand, compulsory_dram_bytes, spillable_dram_bytes,
+//  dram_rate, gemm_ns, l2_ns, llc_ns, epilogue_ns)
+using PhaseTuple = std::tuple<bool, int, double, double, double, double, double, double, double, double, double,
+                              double, double, double, double, double, double>;
+
+AnalyticDagPhase PhaseFromTuple(const PhaseTuple& value) {
+  AnalyticDagPhase phase;
+  std::tie(phase.gemm, phase.active_threads, phase.fixed_ns, phase.residual_scale, phase.base_ns,
+           phase.working_set_bytes, phase.gemm_demand, phase.l2_demand, phase.llc_demand, phase.epilogue_demand,
+           phase.compulsory_dram_bytes, phase.spillable_dram_bytes, phase.dram_rate, phase.gemm_ns, phase.l2_ns,
+           phase.llc_ns, phase.epilogue_ns) = value;
+  return phase;
+}
+
+using PlacedTasksTuple =
+    std::tuple<std::vector<int64_t>, std::vector<int>, std::vector<std::vector<int>>, std::vector<std::vector<int>>>;
+
+AnalyticDagTasks TasksFromTuple(PlacedTasksTuple value) {
+  AnalyticDagTasks tasks;
+  tasks.routes = std::move(std::get<0>(value));
+  tasks.threads = std::move(std::get<1>(value));
+  tasks.cpu_ids = std::move(std::get<2>(value));
+  tasks.dependencies = std::move(std::get<3>(value));
+  return tasks;
+}
+
+using AggregateTasksTuple = std::tuple<std::vector<int64_t>, std::vector<int>, std::vector<std::vector<int>>>;
+
+AnalyticDagTasks AggregateTasksFromTuple(AggregateTasksTuple value) {
+  AnalyticDagTasks tasks;
+  tasks.routes = std::move(std::get<0>(value));
+  tasks.threads = std::move(std::get<1>(value));
+  tasks.dependencies = std::move(std::get<2>(value));
+  tasks.cpu_ids.resize(tasks.routes.size());
+  return tasks;
+}
+
 }  // namespace
+
 
 void register_moe_quick_planner(py::module_& m) {
   py::class_<NativeHotWidePlanner>(m, "NativeHotWidePlanner", py::module_local())
@@ -156,4 +202,88 @@ void register_moe_quick_planner(py::module_& m) {
       .def_property_readonly("configured_workers", [](const NativeQuickPlanner& planner) {
         return planner.configured_workers();
       });
+
+  py::class_<NativeAnalyticPlacedDag>(m, "NativeAnalyticPlacedDag", py::module_local())
+      .def(py::init([](int cores_per_rank, double call_setup_ns, std::vector<int> cpu_domain,
+                       std::vector<int> domain_sizes, std::vector<double> domain_capacity_bytes,
+                       double llc_effective_fraction, std::vector<double> gemm_rate, std::vector<double> l2_rate,
+                       std::vector<double> dram_rate, std::vector<double> epilogue_rate,
+                       std::vector<std::vector<double>> domain_llc_rate, std::vector<double> llc_rate,
+                       double llc_saturated_rate, double rank_llc_capacity_bytes, bool dram_injection,
+                       double dram_injection_capacity_scale, double dram_saturated_rate,
+                       std::vector<double> wide_isolated_scale, std::vector<double> wide_full_cohort_scale,
+                       std::vector<double> narrow_full_cohort_correction) {
+             AnalyticDagMachine machine;
+             machine.cores_per_rank = cores_per_rank;
+             machine.call_setup_ns = call_setup_ns;
+             machine.cpu_domain = std::move(cpu_domain);
+             machine.domain_sizes = std::move(domain_sizes);
+             machine.domain_capacity_bytes = std::move(domain_capacity_bytes);
+             machine.llc_effective_fraction = llc_effective_fraction;
+             machine.gemm_rate = std::move(gemm_rate);
+             machine.l2_rate = std::move(l2_rate);
+             machine.dram_rate = std::move(dram_rate);
+             machine.epilogue_rate = std::move(epilogue_rate);
+             machine.domain_llc_rate = std::move(domain_llc_rate);
+             machine.llc_rate = std::move(llc_rate);
+             machine.llc_saturated_rate = llc_saturated_rate;
+             machine.rank_llc_capacity_bytes = rank_llc_capacity_bytes;
+             machine.dram_injection = dram_injection;
+             machine.dram_injection_capacity_scale = dram_injection_capacity_scale;
+             machine.dram_saturated_rate = dram_saturated_rate;
+             machine.wide_isolated_scale = std::move(wide_isolated_scale);
+             machine.wide_full_cohort_scale = std::move(wide_full_cohort_scale);
+             machine.narrow_full_cohort_correction = std::move(narrow_full_cohort_correction);
+             return NativeAnalyticPlacedDag(std::move(machine));
+           }),
+           py::arg("cores_per_rank"), py::arg("call_setup_ns"), py::arg("cpu_domain"), py::arg("domain_sizes"),
+           py::arg("domain_capacity_bytes"), py::arg("llc_effective_fraction"), py::arg("gemm_rate"),
+           py::arg("l2_rate"), py::arg("dram_rate"), py::arg("epilogue_rate"), py::arg("domain_llc_rate"),
+           py::arg("llc_rate"), py::arg("llc_saturated_rate"), py::arg("rank_llc_capacity_bytes"),
+           py::arg("dram_injection"), py::arg("dram_injection_capacity_scale"), py::arg("dram_saturated_rate"),
+           py::arg("wide_isolated_scale"), py::arg("wide_full_cohort_scale"),
+           py::arg("narrow_full_cohort_correction"))
+      .def(
+          "register_phases",
+          [](NativeAnalyticPlacedDag& dag, int64_t routes, int threads, const std::vector<PhaseTuple>& phases) {
+            std::vector<AnalyticDagPhase> converted;
+            converted.reserve(phases.size());
+            for (const PhaseTuple& phase : phases) {
+              converted.push_back(PhaseFromTuple(phase));
+            }
+            dag.register_phases(routes, threads, std::move(converted));
+          },
+          py::arg("routes"), py::arg("threads"), py::arg("phases"))
+      .def("has_phases", &NativeAnalyticPlacedDag::has_phases, py::arg("routes"), py::arg("threads"))
+      .def(
+          "makespan",
+          [](const NativeAnalyticPlacedDag& dag, PlacedTasksTuple tasks) {
+            return dag.makespan(TasksFromTuple(std::move(tasks)));
+          },
+          py::arg("tasks"))
+      .def(
+          "makespans",
+          [](const NativeAnalyticPlacedDag& dag, std::vector<PlacedTasksTuple> batch, int workers) {
+            std::vector<AnalyticDagTasks> converted;
+            converted.reserve(batch.size());
+            for (PlacedTasksTuple& tasks : batch) {
+              converted.push_back(TasksFromTuple(std::move(tasks)));
+            }
+            return dag.makespans(converted, workers);
+          },
+          py::arg("batch"), py::arg("workers") = 1)
+      .def(
+          "makespan_aggregate",
+          [](const NativeAnalyticPlacedDag& dag, AggregateTasksTuple tasks) {
+            return dag.makespan_aggregate(AggregateTasksFromTuple(std::move(tasks)));
+          },
+          py::arg("tasks"))
+      .def(
+          "finish_times_aggregate",
+          [](const NativeAnalyticPlacedDag& dag, AggregateTasksTuple tasks) {
+            std::vector<double> finish_times;
+            const double makespan = dag.makespan_aggregate(AggregateTasksFromTuple(std::move(tasks)), &finish_times);
+            return py::make_tuple(makespan, finish_times);
+          },
+          py::arg("tasks"));
 }

@@ -17,8 +17,10 @@ aggregate matrix, frontend, cache, DRAM, and epilogue service ceilings.
 from __future__ import annotations
 
 import hashlib
+import importlib
 import json
 import math
+import os
 from dataclasses import asdict, dataclass, replace
 from functools import cached_property, lru_cache
 from pathlib import Path
@@ -38,6 +40,8 @@ ANALYTIC_MACHINE_SCHEMA_VERSION = 2
 SUPPORTED_ANALYTIC_MACHINE_SCHEMA_VERSIONS = frozenset({1, 2})
 ANALYTIC_MODEL_SCHEMA_VERSION = 11
 ANALYTIC_MODEL_NAME = "phase_reaccount_llc_domain_dram_injection_v9"
+# Sentinel for the lazily built native placed-DAG scorer (None means unavailable).
+_NATIVE_UNSET = object()
 _SHARED_RESOURCES = (
     "gemm_core_flops",
     "matrix_flops",
@@ -2996,6 +3000,9 @@ class AnalyticMoeCostModel:
         return wall_ns, tuple(finish_times)
 
     def dag_makespan(self, tasks) -> float:
+        native = self._native_placed_dag()
+        if native is not None:
+            return native.makespan_aggregate(self._native_aggregate_tasks(native, tasks))
         return self._dag_result(tasks)[0]
 
     @staticmethod
@@ -3028,15 +3035,146 @@ class AnalyticMoeCostModel:
         return normalized, task_cpu_ids
 
     def dag_makespan_placed(self, tasks) -> float:
-        """Score a DAG whose tasks carry exact physical CPU placements."""
+        """Score a DAG whose tasks carry exact physical CPU placements.
 
+        Runs the native port of the placed simulator when the extension is built
+        and the calibration describes LLC domains; the Python path is the reference.
+        """
+
+        native = self._native_placed_dag() if self.calibration.llc_domains else None
+        if native is not None:
+            return native.makespan(self._native_placed_tasks(native, tasks))
+        return self._python_dag_makespan_placed(tasks)
+
+    def dag_makespans_placed(self, batch, *, workers: int | None = None) -> list[float]:
+        """Score independent placed DAGs; the native path runs them on ``workers`` threads."""
+
+        native = self._native_placed_dag() if self.calibration.llc_domains else None
+        if native is None:
+            return [self._python_dag_makespan_placed(tasks) for tasks in batch]
+        if workers is None:
+            workers = min(len(batch), os.cpu_count() or 1, 8)
+        prepared = [self._native_placed_tasks(native, tasks) for tasks in batch]
+        return list(native.makespans(prepared, max(1, int(workers))))
+
+    def _python_dag_makespan_placed(self, tasks) -> float:
         normalized, task_cpu_ids = self._normalize_placed_tasks(tasks)
         if not self.calibration.llc_domains:
-            return self.dag_makespan(normalized)
+            return self._dag_result(normalized)[0]
         return self._dag_result(normalized, task_cpu_ids=task_cpu_ids)[0]
+
+    def _native_placed_dag(self):
+        cached = self.__dict__.get("_native_placed_dag_state", _NATIVE_UNSET)
+        if cached is not _NATIVE_UNSET:
+            return cached
+        native = None
+        for module_name in ("fused_cpp._moe_C", "fused_cpp._C"):
+            try:
+                native_type = importlib.import_module(module_name).NativeAnalyticPlacedDag
+            except (ImportError, AttributeError):
+                continue
+            native = native_type(**self._native_placed_dag_machine())
+            break
+        self.__dict__["_native_placed_dag_state"] = native
+        return native
+
+    def _native_placed_dag_machine(self) -> dict[str, object]:
+        calibration = self.calibration
+        cores = calibration.cores_per_rank
+        domains = calibration.llc_domains
+        cpu_domain = [-1] * (max((cpu for domain in domains for cpu in domain.cpu_ids), default=-1) + 1)
+        for index, domain in enumerate(domains):
+            for cpu in domain.cpu_ids:
+                cpu_domain[cpu] = index
+
+        def rates(resource: str) -> list[float]:
+            return [math.inf] + [calibration.service_rate(resource, threads) for threads in range(1, cores + 1)]
+
+        pressure = calibration.wide_team_pressure
+        narrow = dict(calibration.narrow_team_contention_correction.full_cohort_correction)
+        widths = range(cores + 1)
+        return {
+            "cores_per_rank": cores,
+            "call_setup_ns": float(self.call_setup_ns),
+            "cpu_domain": cpu_domain,
+            "domain_sizes": [len(domain.cpu_ids) for domain in domains],
+            "domain_capacity_bytes": [float(domain.capacity_bytes) for domain in domains],
+            "llc_effective_fraction": float(calibration.caches.llc_effective_fraction),
+            "gemm_rate": rates("gemm_core_flops"),
+            "l2_rate": rates("l2_bytes"),
+            "dram_rate": rates("dram_bytes"),
+            "epilogue_rate": rates("epilogue_elements"),
+            "domain_llc_rate": [
+                [math.inf] + [domain.service.rate(threads) for threads in range(1, len(domain.cpu_ids) + 1)]
+                for domain in domains
+            ],
+            "llc_rate": rates("llc_bytes"),
+            "llc_saturated_rate": float(calibration.llc_bytes.saturated_rate),
+            "rank_llc_capacity_bytes": float(calibration.caches.llc_bytes_per_rank),
+            "dram_injection": bool(calibration.dram_domain_injection.enabled),
+            "dram_injection_capacity_scale": float(calibration.dram_domain_injection.capacity_scale),
+            "dram_saturated_rate": float(calibration.dram_bytes.saturated_rate),
+            "wide_isolated_scale": [1.0] + [pressure.isolated_scale(width) for width in widths[1:]],
+            "wide_full_cohort_scale": [1.0] + [pressure.full_cohort_scale(width) for width in widths[1:]],
+            "narrow_full_cohort_correction": [1.0] + [float(narrow.get(width, 1.0)) for width in widths[1:]],
+        }
+
+    def _native_placed_tasks(self, native, tasks):
+        registered = self.__dict__.setdefault("_native_placed_dag_keys", set())
+        routes, threads, cpu_ids, dependencies = [], [], [], []
+        for task_routes, task_threads, task_cpu_ids, task_dependencies in tasks:
+            key = (int(task_routes), int(task_threads))
+            if key not in registered:
+                phases = [self._native_phase(phase) for phase in self.predict_expert(*key).phases]
+                native.register_phases(key[0], key[1], phases)
+                registered.add(key)
+            routes.append(key[0])
+            threads.append(key[1])
+            cpu_ids.append(task_cpu_ids)
+            dependencies.append(task_dependencies)
+        return routes, threads, cpu_ids, dependencies
+
+    def _native_aggregate_tasks(self, native, tasks):
+        registered = self.__dict__.setdefault("_native_placed_dag_keys", set())
+        routes, threads, dependencies = [], [], []
+        for task_routes, task_threads, task_dependencies in tasks:
+            key = (int(task_routes), int(task_threads))
+            if key not in registered:
+                phases = [self._native_phase(phase) for phase in self.predict_expert(*key).phases]
+                native.register_phases(key[0], key[1], phases)
+                registered.add(key)
+            routes.append(key[0])
+            threads.append(key[1])
+            dependencies.append(task_dependencies)
+        return routes, threads, dependencies
+
+    @staticmethod
+    def _native_phase(phase: AnalyticPhase) -> tuple:
+        return (
+            phase.kind in {"cold_b", "steady_b"},
+            int(phase.active_threads),
+            float(phase.fixed_ns),
+            float(phase.residual_scale),
+            float(phase.base_ns),
+            float(phase.working_set_bytes),
+            float(phase.matrix_flops),
+            float(phase.l2_bytes),
+            float(phase.llc_bytes),
+            float(phase.epilogue_elements),
+            float(phase.compulsory_dram_bytes),
+            float(phase.spillable_dram_bytes),
+            float(phase.dram_rate),
+            float(phase.gemm_core_ns),
+            float(phase.l2_ns),
+            float(phase.llc_ns),
+            float(phase.epilogue_ns),
+        )
 
     def dag_task_finish_times(self, tasks) -> tuple[float, ...]:
         """Return task completion timestamps from the analytical simulator."""
+        native = self._native_placed_dag()
+        if native is not None:
+            return tuple(native.finish_times_aggregate(self._native_aggregate_tasks(native, tasks))[1])
         return self._dag_result(tasks)[1]
 
     def explain_dag(self, tasks) -> dict:
