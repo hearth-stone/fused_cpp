@@ -183,3 +183,44 @@ traces available. There is no decode trace.
 So on prefill routing a signature-keyed plan cache, with or without background refinement,
 would neither hit nor transfer. Not covered: decode batches, whose small route counts could
 repeat more often.
+
+## Head-to-head with vLLM, the flat queue and KTransformers (`bench_h2h.py`, `analyze_h2h.py`)
+
+Frozen in `design.md` before the full plans were generated. Same 18 fresh layers, one process per
+request file. Arms, all timed on the same tensors:
+
+- this repository's planned arms: production quick (`baseline`), `fast` (C9g configuration),
+  `full` (full search scored by the C9g event model, 0.15 s per layer) and `lns` (60 s search);
+- the flat staged queue with this repository's kernel, blocks L2/128/256/512;
+- vLLM's Arm `cpu_fused_moe` (neon/BFMMLA, its own prepacked weights);
+- KTransformers' dataflow on this repository's GEMM, blocks 128/256/512.
+
+Protocol v2, 3 warmup + 15 runs, two sessions, 120 s cooldown, node 0,
+`OMP_NUM_THREADS=96 OMP_PROC_BIND=false`. Fused arms were bitwise equal to the baseline plan; vLLM
+and KT passed the BF16 tolerance. Session spread median 0.25%. One point is unstable (r008_l13
+`full`, 16.6% between sessions) and four sit at 2.5-3.7%.
+
+Median over layers of X / reference - 1 (wins = layers where X is faster):
+
+| arm | vs vLLM op | vs flat queue (L2 block = best block on every layer) | vs KT (best block) |
+| --- | --- | --- | --- |
+| production quick | -4.12% (11/18) | -3.34% (11/18) | -21.5% (18/18) |
+| fast | -4.08% (12/18) | -3.27% (11/18) | -22.2% (18/18) |
+| full (event model) | -4.35% (13/18) | -3.58% (12/18) | -22.4% (18/18) |
+| **lns (60 s)** | **-6.56% (18/18)** | **-5.95% (18/18)** | **-27.5% (18/18)** |
+| flat queue | -0.85% (17/18) | - | -20.6% (18/18) |
+
+- On these real layers every planned arm is ahead of vLLM's op and of the flat queue in median.
+  The request-path planners (production quick, fast, full) are ahead by 3-4% but lose on 5-7 of
+  18 layers, by up to about 9%. vLLM's op and the flat queue win on some layers, so the planned
+  arms cannot claim to be faster on every layer.
+- Only the 60 s searched plan wins on all 18 layers, by 1.5-22% over vLLM. Its cost is the search
+  that does not fit the request path.
+- The flat queue with this repository's kernel is 0.85% faster than vLLM's op (17/18). Its L2
+  block was the best of the four on every layer.
+- KTransformers' dataflow is 20-27% slower than everything else, as in the K comparison.
+- `full` scored by the C9g event model is only slightly better than production quick here (-0.2
+  points against vLLM in median), well short of the searched plan.
+
+Scope: one machine, TP4 expert shape, 18 prefill layers of three DSV4 requests. Decode is not
+covered.
