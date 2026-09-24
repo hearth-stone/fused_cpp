@@ -164,3 +164,22 @@ request-path search per call is therefore not viable at these costs. A 14 ms lay
 even the 50 evaluations that match fast. Ways that keep the gain off the per-call path: a plan
 cache keyed by routing signature, refined by a background search; a C++ search with batch
 evaluation; or better fast rules distilled from searched plans.
+
+## Plan cache hit rate and template transfer (`cache_hit.py`)
+
+Data: the three measured DSV4 prefill requests (2048 tokens each) x 43 layers, the only routing
+traces available. There is no decode trace.
+
+- **Exact signature hits (PlannedMoE `signature`): 0 of 129.** All 129 (request, layer) signatures
+  are distinct. The same layer in two requests differs in 8-19 of the 24 fields (median 14). A
+  stream r008 -> r016 -> r022 hits neither a shared nor a per-layer cache.
+- **Template transfer: none of the search gain carries over.** Over 72 same-layer transfers, one
+  request's LNS lane widths were filled by the fast planner's LPT with another request's
+  routes. Under the C9g event model, the transferred plans are +11.9% above that request's own
+  LNS (max +54%). They are +1.0% against its own fast plan (range -4.5% to +39%), and they recover
+  -0.09 of the fast-to-LNS gap in median. The searched gain lives in the per-batch assignment, not
+  in a reusable shape.
+
+So on prefill routing a signature-keyed plan cache, with or without background refinement,
+would neither hit nor transfer. Not covered: decode batches, whose small route counts could
+repeat more often.
