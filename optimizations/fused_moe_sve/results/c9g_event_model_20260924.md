@@ -103,3 +103,32 @@ The model predicts fast 11.1% faster than production quick (range -13.1% to +3.7
 planning takes 6.3 ms per layer. The configuration is written to the asset's `hot_wide` entry,
 and `PlannedMoE(search_mode="hot_wide")` reads it (`_hot_wide_config`). Measured validation on
 fresh layers follows.
+
+## Measured validation on fresh layers (stage 4)
+
+Frozen in `design.md` before plan generation. 18 real TP4 layers never used on C9g (r008/r016/r022
+x layers 1/7/13/19/30/39). Four plans per layer, all with the registered window table:
+production quick (`baseline`), `fast` (the C9g `hot_wide` entry), `fast_default` (Arm-codex
+template and scales) and `lns` (60 s model LNS). Measured with the width-table bench (protocol v2,
+bitwise gate) on node 0, two sessions, 120 s fixed cooldown; session spread median 0.21%, max
+3.35%. Analysis: `analyze_e3.py`.
+
+| comparison (measured, median over layers) | result | gate |
+| --- | --- | --- |
+| F1 `fast` vs production quick | +0.12% (range -3.31% to +2.66%, faster on 8 of 18) | FAIL (needs <= -5%) |
+| F2 `fast` vs `lns` | +7.83% median, +12.47% max | FAIL (needs <= 2% / 5%) |
+| `fast_default` vs production quick | +3.23% (+0.13% to +10.63%) | reported |
+| `lns` vs production quick | **-7.63% (-10.56% to -0.06%), faster on 18 of 18** | reported |
+
+Measured / event-predicted call time, median: production quick 1.070, fast 1.191,
+fast_default 1.182, lns 1.223. The model underprices mixed plans (4T bulk with wide lanes) by
+about 12% relative to homogeneous ones. It still ranks the searched plan first, but predicts its
+gain at about 20% against 7.6% measured. Planning time (Python): fast 6.3 ms, production quick
+12.3 ms.
+
+Reading. The C9g event model is useful: plans searched under it are faster than production quick
+on every fresh layer, 7.6% in median. The fast planner's rule (LPT on per-width scaled isolated
+loads over fixed templates) does not capture that gain on C9g; it ties production quick. The
+C9g configuration still beats the Arm-codex constants by about 3 points. Candidate next steps:
+make the search usable on the request path (native event model plus a time-budgeted search, or
+plans cached by route signature), and find the cause of the family-dependent underprediction.
