@@ -711,3 +711,71 @@ Session spread is 0.43% median. The exception is r008 layer 13, where full and f
 effect). The min-of-sessions column shows the conclusion does not depend on it. Among the six
 plans the window model picks the measured best on 8/18. Most misses are between near-equal LNS
 and full_w/full_r plans.
+
+## A fast student distilled from the window model, for online planning
+
+Teacher: the window model (placed DAG). Student (`tmp/c9g_event_model_20260924/distill_fit.py`):
+
+    d = a_w * T_iso + b_w * T_iso * l          makespan = heaviest dependency chain (for lanes: max lane sum)
+
+`T_iso` and the loading share `l` (cold-phase share of `T_iso`) come from the teacher's
+isolated breakdown. a_w is the full-load slowdown of a width-w team's work; b_w is the extra
+slowdown of its weight loading. This is the fast planner's own structure (lane sum of
+per-(routes, width) costs, max over lanes), so the student slots into it with lane scale 1.
+
+- **Data** (`distill_data.py`, native teacher on C9g node 1, 1.8 s for all). All 43 layers of
+  the three requests, 31 candidates per layer: every hot-wide template, homogeneous
+  4/8/16/32T, and the fast plan perturbed by 1/3/10 expert swaps. Test layers are the 18 h2h
+  plus the 18 derivation layers; the other 93 layers (2883 plans) are training.
+- **Fit.** Alternating fixed-critical-lane least squares on relative error. 4T a=1.214 b=1.800 / 8T a=1.075 b=2.440 / 16T a=1.021 b=2.257 / 32T a=1.158 b=0.294.
+  The b terms say a lane's weight loading runs about 3.3x (4T 1.21+1.80), 3.5x (8T) and 3.3x
+  (16T) slower at full load while its compute runs 1.02-1.21x slower. That is the magnitude
+  the loading probes measured.
+
+Against the teacher on the 36 held-out layers:
+
+| scorer | pairwise order (teacher gap > 1%) | top-1 | teacher regret median / max | level error median (abs) |
+| --- | --- | --- | --- | --- |
+| raw lane sum | 75.4% | 0/36 | +4.51% / +21.88% | -36.2% (36.2%) |
+| fast score today (T_iso x window scale x lane scale) | 73.1% | 0/36 | +4.51% / +21.88% | -33.7% (35.7%) |
+| student, a_w only | 76.9% | 0/36 | +6.36% / +21.88% | -8.6% (13.0%) |
+| **student, a_w + b_w** | **84.7%** | **11/36** | **+0.35%** / +27.44% | -4.1% (6.4%) |
+
+A plan-level lane-count factor, score x (1 + g N_lanes / 24), cut the max regret to 10.5% and the
+level error to 3.7%, but lowered pairwise order to 82.2%. It is recorded as an alternative, not
+used.
+
+Picks among measured plans (`distill_measured.py`):
+
+- tuning set (fast / homog 8 / 16 / 32 / quick): student 11/18, teacher 12/18, fast score 6/18;
+- fw set (quick / fast / full / LNS / full_w / full_r): student 5/18 (regret max 11.9%), teacher
+  8/18, fast score 1/18.
+
+**Online planner with the student** (`fast_d`, `gen_fast_distilled.py`): the hot-wide templates
+plus homogeneous 8/16/32T, LPT with the distilled costs. Same-session measurement against quick,
+fast, event-model full, LNS and full_w on the 18 h2h layers (`chain_fd.sh`, `fd_r*_session*.json`,
+`analyze_fd.py`; two sessions, 120 s cooldown):
+
+| fast_d against | median | faster on | min-of-sessions median |
+| --- | --- | --- | --- |
+| fast (current online) | -4.35% | 18/18 | -4.25% |
+| production quick | -5.16% | 18/18 | -5.31% |
+| event-model full | -2.23% | 15/18 | -2.13% |
+| full_w | +0.41% | 8/18 | +1.44% |
+| LNS (60 s) | +2.98% | 1/18 | +3.04% |
+
+Session spread is 0.59% median. r008 layer 13 again shows the full/full_w plans switching
+between about 13.0 and 15.6-15.9 ms between sessions; it follows those plans, not fast_d.
+
+**Online cost** (`timing_online.py`, C9g node 1):
+
+- The existing native hot-wide planner takes the distilled cost rows unchanged: 227 us median
+  (276 us max) per layer over all templates, and the same template as the Python path on 18/18.
+  full_w plans in 0.35 s.
+- Scoring one plan: student 43 us from tasks in Python (2.4 us from lane features), teacher
+  2.87 ms (native DAG with Python marshalling).
+
+So the student recovers most of the teacher's plan quality at online cost. Not done here:
+production wiring of the distilled rows into `MoePlannerRuntime(search_mode="hot_wide")`. The
+hot-wide asset carries only `lane_scale`; it would need the a/b rows and the model's loading
+share per (routes, width).
