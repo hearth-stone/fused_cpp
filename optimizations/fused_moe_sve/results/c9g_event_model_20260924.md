@@ -583,3 +583,42 @@ steady time += A-refill lines x exposed fraction x extra latency(utilization). I
 C writes or write-backs. The utilization-to-latency curve and the exposed fraction can be
 calibrated on the stream-background cells (target alone vs stream background, 3 widths). The
 P2/P3 probes and the whole plans then serve as validation.
+
+### Lab: refill-latency term (frozen variant rejected)
+
+`latency_term.py` on top of the window model. Every GEMM phase gets extra time
+refill lines per thread x C_SAT x min(1, U). The lines are A refills plus B refills, not C
+writes. U is the other concurrent phases' average-rate DRAM or L2 traffic over whole-rank
+capacity.
+
+The first frozen form used A refills only. It gave inconsistent per-line constants on the
+calibration cells, so it was redefined to all read refills before any validation. C_SAT = 6.22 ns
+per line at saturation (median of 2.01 / 6.22 / 9.43 at 4T / 16T / 8T). The spread comes from the
+model's refill accounting, not the mechanism: the model gives 2.98M / 0.31M / 0.32M lines per
+thread, the counters 1.58M / 0.40M / 0.52M. With measured lines the constant is 2.9-4.2 ns.
+
+Validation (`latency_probes.log`, `latency_plans.log`) rejects this form:
+
+| set | window | + latency term | measured |
+| --- | --- | --- | --- |
+| D_SS 8T / 16T / 32T at max n | 1.01 / 1.00 / 1.29 | 1.17 / 1.33 / 1.95 | 1.16 / 1.24 / 1.46 |
+| D_SS 4T n=92 | 1.77 | 3.52 | 1.51 |
+| D_LL 8T n=8 / n=88 | 1.32 / 5.25 | 2.24 / 6.58 | 1.15 / 5.01 |
+| traces 8T / 16T / fast | -12 / -10 / -13% | +26 / +20 / +33% | |
+| tuning median fast / homog 8 / 16 / 32 | -17 / -15 / -15 / -16% | +24 / +22 / +16 / +8% | |
+| width pick / family pick | 10/18, 13/18 | 1/18, 5/18 | |
+
+It fixes the 8T/16T steady probes (D_SS 1.17 / 1.33 vs 1.16 / 1.24) and breaks everything else.
+
+- Applied to loading phases, it charges latency on top of the multi-stream DRAM share, which
+  already reproduces loading contention, so loading is counted twice. D_LL 8T at n=8 becomes 2.24
+  vs 1.15.
+- U_llc counts every loader's weight stream as mesh traffic, so it saturates at a few background
+  lanes.
+- 2T/4T full-stripe steady phases carry the model's inflated B re-read counts (1.9x the
+  counters), so D_SS 4T becomes 3.52 vs 1.51.
+
+A second form would apply the term to steady phases only, take U from DRAM-side traffic only, and
+fix the refill accounting of full-stripe narrow widths first. Those choices are informed by this
+validation, so a clean test needs data this form has not seen, for example new probe cells or
+layers.
