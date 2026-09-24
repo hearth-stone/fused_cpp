@@ -622,3 +622,46 @@ A second form would apply the term to steady phases only, take U from DRAM-side 
 fix the refill accounting of full-stripe narrow widths first. Those choices are informed by this
 validation, so a clean test needs data this form has not seen, for example new probe cells or
 layers.
+
+### Refill-latency term v2 (pre-registered, rejected by its own acceptance rule)
+
+Design `tmp/c9g_event_model_20260924/latency_v2_design.md`, frozen before new data. New data
+(C9g, two sessions, `chain_v2.sh`):
+
+- refill accounting cells `v2_refill_session*`;
+- V1: new targets alone vs stream (`v2_v1_session*`);
+- V2: new targets with 8T-wide real background lanes (`v2_v2_session*`, background coverage 1.00).
+
+V3 is the h2h run's plans, never used in this line. Fit: `latency_v2.py` -> `latency_v2_fit.json`.
+Validation: `validate_v2.py` -> `validate_v2.json`.
+
+- **Stage 1, refill accounting.** BUS_ACCESS_RD equals L2 refills exactly, so no read bypasses
+  the L2. The gather and merge traffic is 51 KB per route. Implied steady B re-read miss when the
+  window exceeds L2 is 0.21-0.32 (4T, x=1.05), 0.47-0.51 (3T, x=1.39), 0.15-0.28 (2T, x=2.05). That
+  is not monotonic in footprint, so the frozen linear ramp was replaced by one constant, PHI = 0.34.
+  Only 4T M>720 runs a full stripe above L2 in production. Full-stripe refill error falls from up
+  to +95% (production step rule) to -22..+12%.
+- **Stage 2.** DL = 6.51 ns per steady refill line at saturation (4T / 16T / 8T: 4.16 / 6.51 /
+  10.28). The spread shows the per-line wait depends on overlap. It is not a constant; this is
+  stated as a limit.
+- **Stage 3.**
+
+| check (frozen) | window model | v2 | verdict |
+| --- | --- | --- | --- |
+| V1+V2 target slowdown, median abs error | 19.2% (max 28.7%) | 11.6% (max 23.9%) | pass |
+| V3 picks of the measured-best of quick/fast/full/lns | 17/18 (regret max 5.11%) | 14/18 (max 7.54%) | **fail** |
+| V3 median abs error | 16.0% (signed -16.0%) | 7.8% (signed -7.8%) | pass |
+| isolated times at table widths | - | unchanged | pass |
+
+The production model on V3 has 70.3% median abs error and 0/18 picks. v2 is not adopted.
+
+The window model is the interpretable model carried forward. Its three terms each have a
+hardware check:
+
+- private-L2 window spill (L2-refill bound);
+- multi-stream DRAM capacity (P1 probes, pure-loading counters);
+- executed-window geometry (L2 traffic of real plans).
+
+On data it never saw it picks the best of four planned plans on 17/18 layers, with a near-uniform
+-16% level error. The steady-phase refill latency is characterized (load path, 4-10 ns per refill at
+saturation) but left out, because it worsened plan choice.
