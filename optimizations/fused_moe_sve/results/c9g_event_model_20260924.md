@@ -354,3 +354,36 @@ now decide the picks:
 - 8T/16T mid and large M are underpredicted by 10-20% (8T M 49-192: 1.41 vs 1.16). Steady
   phases get no dilation from loading neighbours in the model; the probes measure D_SL
   1.28-1.37 at full load for 8T/16T. D_LS for 16T/32T and D_LL for 32T are also still off.
+
+### Lab: stage phases from the executed window geometry
+
+`window_geometry.py`, on top of the multi-stream model. When the table windows a stage, each
+window becomes a cold phase and a steady phase. The cold phase is the window's first panel,
+which loads that window's B from DRAM; the steady phase is the remaining panels, which reuse B
+from L2. The demand fields come from the model's own `score_stage_window`, and range restarts
+become a setup phase. Full-stripe stages are unchanged. Assumption: the per-(stage, width)
+isolated residual scales were fitted on full-stripe runs and are reused unchanged, since no
+windowed isolated profile exists. The modeled isolated time moves by only 0-7%, while the
+table's measured full-load ratio is 0.51-0.70 for 4T. So in this model the benefit of windows
+appears only through contention: the full stripe's B re-reads leave the L2 and load the shared
+LLC and DRAM paths.
+
+| set | multi-stream | + window geometry |
+| --- | --- | --- |
+| traces 4T / 8T / 16T / fast | +22% / -13% / -10% / +7% | +18% / -12% / -10% / -13% |
+| tuning median, fast / homog 8 / 16 / 32 / quick | -1% / -18% / -16% / -17% / -13% | -17% / -15% / -15% / -16% / -13% |
+| family pick (fast, homog 8/16/32) | 8/18, regret median 0.89%, max 5.43% | 13/18, median 0.00%, max 4.82% |
+| width pick over production widths 4/8/16/32/48/96 | 14/18, max 0.88% | 16/18, max 0.34% |
+| width pick over all divisor widths 1-96 | 13/18, max 9.85% | 10/18, max 15.40% |
+
+4T mid-M tasks in the traces are now close to measured: M 49-192 1.35 vs 1.19, M 193-768 1.29
+vs 1.08 (before 1.37 vs 1.91). The error is now a near-uniform 13-17% underpricing across plan
+families, so the picks are mostly right. Remaining:
+
+- All eight wrong picks over all divisor widths choose 6T, measured 15-16 ms vs 12 ms predicted.
+  6T is not a production width and the table has no 6T entry, so it runs the full stripe.
+- 4T M > 768 still runs the full stripe and is overpredicted (1.46 vs 1.21). These three hot
+  tasks set the fixed_4 makespan (+18%).
+- Mid and large M on every width are 10-20% slower than predicted (item 2: no steady-phase
+  dilation from loading neighbours). Fast's 4T M <= 12 tasks are also underpredicted (5.20 vs
+  4.44), and its 16T M <= 12 tasks overpredicted (3.02 vs 4.17).
