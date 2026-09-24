@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "analytic_placed_dag.h"
+#include "probe_event_sim.h"
 #include "hot_wide_planner.h"
 #include "interval_planner.h"
 
@@ -28,7 +29,9 @@ using moe_planner::IntervalCandidate;
 using moe_planner::IntervalPlanResult;
 using moe_planner::IntervalTask;
 using moe_planner::NativeHotWidePlanner;
+using moe_planner::NativeProbeEventSim;
 using moe_planner::NativeQuickPlanner;
+using moe_planner::ProbeEventProfile;
 
 const char* AssignmentOrderName(IntervalAssignmentOrder order) {
   switch (order) {
@@ -286,4 +289,42 @@ void register_moe_quick_planner(py::module_& m) {
             return py::make_tuple(makespan, finish_times);
           },
           py::arg("tasks"));
+
+  py::class_<NativeProbeEventSim>(m, "NativeProbeEventSim", py::module_local())
+      .def(py::init<int, double>(), py::arg("resolution"), py::arg("g0"))
+      .def("add_table", &NativeProbeEventSim::add_table, py::arg("values"))
+      .def(
+          "add_profile",
+          [](NativeProbeEventSim& sim, std::vector<double> phase_ns, std::vector<bool> phase_load, double overhead_ns,
+             int width, double steady_load_cores, double steady_steady_cores, int ll_table, int ls_table,
+             int sl_table, int ss_table, bool windowed, double r_cal, double e_cal) {
+            ProbeEventProfile profile;
+            profile.phase_ns = std::move(phase_ns);
+            profile.phase_load.assign(phase_load.begin(), phase_load.end());
+            profile.overhead_ns = overhead_ns;
+            profile.width = width;
+            profile.steady_load_cores = steady_load_cores;
+            profile.steady_steady_cores = steady_steady_cores;
+            profile.ll_table = ll_table;
+            profile.ls_table = ls_table;
+            profile.sl_table = sl_table;
+            profile.ss_table = ss_table;
+            profile.windowed = windowed;
+            profile.r_cal = r_cal;
+            profile.e_cal = e_cal;
+            return sim.add_profile(std::move(profile));
+          },
+          py::arg("phase_ns"), py::arg("phase_load"), py::arg("overhead_ns"), py::arg("width"),
+          py::arg("steady_load_cores"), py::arg("steady_steady_cores"), py::arg("ll_table"), py::arg("ls_table"),
+          py::arg("sl_table"), py::arg("ss_table"), py::arg("windowed"), py::arg("r_cal"), py::arg("e_cal"))
+      .def(
+          "simulate",
+          [](const NativeProbeEventSim& sim, const std::vector<int>& profiles,
+             const std::vector<std::vector<int>>& dependencies) {
+            auto result = sim.simulate(profiles, dependencies);
+            return py::make_tuple(result.makespan_ns, result.finish_ns);
+          },
+          py::arg("profiles"), py::arg("dependencies"))
+      .def("makespans", &NativeProbeEventSim::makespans, py::arg("profiles"), py::arg("dependencies"),
+           py::arg("workers") = 1);
 }

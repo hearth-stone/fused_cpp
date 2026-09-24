@@ -132,3 +132,35 @@ loads over fixed templates) does not capture that gain on C9g; it ties productio
 C9g configuration still beats the Arm-codex constants by about 3 points. Candidate next steps:
 make the search usable on the request path (native event model plus a time-budgeted search, or
 plans cached by route signature), and find the cause of the family-dependent underprediction.
+
+## Native event scorer and time-budgeted search (option 1, model only)
+
+`NativeProbeEventSim` (`csrc/moe_planner/probe_event_sim.cpp`) ports `ProbeEventModel.simulate`
+without background width factors, event logs or calibration hooks. Those stay in Python, and
+`probe_event_model.py` is unchanged. `NativeProbeEventScorer`
+(`cost_model/probe_event_native.py`) wraps a model and is a drop-in `simulate` for the LNS.
+Parity (`tests/test_moe_probe_event_native.py`): random multi-lane chains on the Arm-codex and C9g
+v11 assets, windowed and full-stripe, makespan and finish times within 1e-9 relative. The only
+difference from Python is the summation order of the active set; Python's round-half-even is
+kept. One simulation of an 18-layer LNS plan: Python 15.0 ms, native 0.24 ms.
+
+Time-budgeted LNS with the native scorer, single process (`budget_lns.py`), on the 18
+derivation layers (model objective, median over layers):
+
+| search | evaluations | gap to 60 s LNS | vs production quick (model) |
+| --- | --- | --- | --- |
+| fast (no search) | - | +10.3% | -11.1% |
+| 0.05 s | 49 | +9.1% | -12.5% |
+| 0.1 s | 94 | +7.7% | -13.4% |
+| 0.5 s | 478 | +4.0% | -16.2% |
+| 1 s | 895 | +2.9% | -17.5% |
+| 2 s | 1700 | +1.5% | -18.3% |
+| 5 s | 3990 | +0.7% | -18.7% |
+
+The search evaluates about 1000 candidates per second. The simulation takes a quarter of each
+evaluation; the rest is the Python LNS itself (moves, lane packing, task construction). The
+model overstates gains: it predicted about 20% for the 60 s LNS plans that measured 7.6%. A
+request-path search per call is therefore not viable at these costs. A 14 ms layer cannot pay
+even the 50 evaluations that match fast. Ways that keep the gain off the per-call path: a plan
+cache keyed by routing signature, refined by a background search; a C++ search with batch
+evaluation; or better fast rules distilled from searched plans.

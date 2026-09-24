@@ -469,6 +469,7 @@ moe_sources.extend(
         os.path.join("csrc", "moe_planner", "interval_planner.cpp"),
         os.path.join("csrc", "moe_planner", "hot_wide_planner.cpp"),
         os.path.join("csrc", "moe_planner", "analytic_placed_dag.cpp"),
+        os.path.join("csrc", "moe_planner", "probe_event_sim.cpp"),
         os.path.join("csrc", "moe_planner", "quick_bindings.cpp"),
     ]
 )
