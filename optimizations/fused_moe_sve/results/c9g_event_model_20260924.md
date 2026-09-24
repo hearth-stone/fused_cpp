@@ -224,3 +224,32 @@ Median over layers of X / reference - 1 (wins = layers where X is faster):
 
 Scope: one machine, TP4 expert shape, 18 prefill layers of three DSV4 requests. Decode is not
 covered.
+
+## Adding quick's homogeneous shapes to fast (negative)
+
+Motivation: on the 18 validation layers fast was slower than production quick on 10 (up to
++2.7%). Its templates cannot produce quick's whole-machine 8T/16T/32T shapes; only all-4T
+overlaps.
+
+- Adding 8/16/32T whole-machine templates and refitting the lane scales under the event model
+  makes fast worse (gap to LNS +10.7% median, +24.3% max, against +10.3% / +15.2%). The model
+  underprices mixed plans relative to homogeneous ones by about 12%, so it almost never
+  prefers them (1 of 18).
+- A separate exchange rate k for the homogeneous templates was then fitted on measured times.
+  Tuning used the 18 derivation layers only (`gen_tune.py`, `fit_k.py`; two sessions, same
+  process; fast, fast's homogeneous 8/16/32T plans and production quick). Against production
+  quick:
+
+| rule | median | layers > 0.5% slower |
+| --- | --- | --- |
+| fast (hot-wide templates only) | -0.79% | 2 of 18 |
+| k >= 1.05 (never picks homogeneous) | -0.79% | 2 |
+| k = 0.95 | -0.79% (worst +3.05%) | 2 |
+| k <= 0.90 | -0.58% to -0.77% | 5-8 |
+| per-layer best of fast and homogeneous (oracle) | -1.73% | 1 |
+
+The headroom over fast is about one point even with an oracle. Fast's scaled loads cannot say
+when a homogeneous shape wins: the fastest one is mostly 8T (7 layers), and fast's 8T scale
+makes 8T look expensive. No k makes fast never worse than quick, so the change was not
+validated on the fresh layers and is not kept. The patch is in
+`tmp/c9g_event_model_20260924/fast_homogeneous_templates.patch` (Python and native, with tests).
