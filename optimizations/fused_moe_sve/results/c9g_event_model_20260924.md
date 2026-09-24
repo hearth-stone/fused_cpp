@@ -291,3 +291,28 @@ effective) and a DRAM curve saturating at 411 GB/s.
 Candidate fix for (1): charge the panel re-read only when a task's own per-core B window exceeds
 its private L2, not when the aggregate working set exceeds the LLC. It must be validated on the
 width table and on these traces before any adoption.
+
+### Lab: a private-L2 window spill rule in place of the aggregate LLC rule
+
+`tmp/c9g_event_model_20260924/l2_window_spill.py` (Lab subclass, production unchanged). A task's
+spillable bytes reach DRAM only if its executed per-core packed-B window (the C9g window table's
+window, else the full stripe) plus one A panel exceeds the private L2, and then only in the
+fraction its own working set misses the LLC. No cross-task aggregation. Stage phases are rebuilt
+before the isolated stage calibration; isolated times change by at most 1.3e-5. On this table only
+1T-3T and 4T W13 windows exceed the L2, so in practice the rule removes the aggregate spill.
+Research calibration `cal_median_tp4_guarded.json`; no remeasurement, all times from earlier runs.
+
+| set | old rule | L2 window rule |
+| --- | --- | --- |
+| traces r008 l9, pred/meas-1: 4T / 8T / 16T / fast | +82% / -13% / -19% / +60% | +19% / -27% / -20% / -5% |
+| width-error run, 18 real layers, median pred/meas-1: 2T / 4T / 8T / 16T / 32T | +36% / +65% / -17% / -21% / -18% | -2% / +6% / -28% / -23% / -18% |
+| same, picks measured-best width | 5/18, regret median 1.52%, max 5.91% | 12/18, median 0.00%, max 10.38% |
+| tuning run, 18 layers, median pred/meas-1: fast / homog 8 / 16 / 32 | +56% / -14% / -25% / -23% | -12% / -30% / -28% / -22% |
+| same, picks measured-best of fast and homog 8/16/32 | 2/18, regret median 2.21%, max 6.29% | 6/18, median 1.21%, max 4.87% |
+
+The rule removes the narrow-width and mixed-plan overpricing. What is left is a uniform underpricing
+of 6T-32T by 20-30% (cause 2 above), and it now decides the picks. Both 10% width regrets are 6T
+picked over 8T (6T -24%). In the tuning set, 8 of the 10 layers where fast is measured fastest pick
+homog_8, because fast is underpriced by 12% and homog_8 by 30%. The rule is not proposed for
+adoption on its own; it needs the loading-contention fix first, and then a measured whole-plan
+validation.
