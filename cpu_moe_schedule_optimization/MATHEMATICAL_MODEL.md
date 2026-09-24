@@ -9007,6 +9007,58 @@ Under jemalloc the same frozen plans and gates give G1 0/6 (the pick is 4--8% sl
 the baseline on the three layer-29 workloads), G1w 3/6 and G2 1/6; the fastest variant
 beats the baseline by 2--10%, still pinned or windowed. The conclusion is unchanged.
 
+### 可解释窗口模型（analytic，C9g，2026-09-24）
+
+三项改动都由标定文件显式开启，默认值保持原模型不变：`planner.llc_spill_rule`、
+`planner.executed_window_geometry`、`services.dram_multi_stream_bytes`。C9g 资产为
+`bench_assets/moe_paper/amazon_c9g_96c_tp4/analytic_c9g_window_tp4.json`，由
+`tmp/c9g_event_model_20260924/build_window_asset.py` 生成。每一项都有独立的硬件证据；证据和
+全部数字见 `optimizations/fused_moe_sve/results/c9g_event_model_20260924.md`。
+
+**私有 L2 窗口 spill（`llc_spill_rule = private_l2_window`）。** 原规则把同一 LLC 域内所有并发
+phase 的工作集相加，再用 $h_3(\sum_i W_i)$ 决定 spillable 字节中有多少进 DRAM。新规则不做跨任务聚合：
+
+$$
+s_i = m_{L2}\bigl(w_i + a_{panel}\bigr)\cdot h_3(W_i),
+$$
+
+其中 $w_i$ 是实际执行的每核 packed-B 窗口字节，$a_{panel}$ 是一个 A panel 的字节，
+$m_{L2}$ 是已有的 L2 B-reuse miss 函数，$W_i$ 是该任务自身的 LLC 工作集。$s_i$ 固定，并入 compulsory
+DRAM 字节；事件模拟器因此看不到工作集，也就不再有聚合 spill。依据：核心 PMU 实测的 L2 回填字节是核心
+DRAM 读取量的上界，而原规则在 fixed_4 计划上计入的 DRAM 字节是这个上界的 1.75 倍，在 fast 计划上是
+1.60 倍，物理上不可能。
+
+**执行窗口几何（`executed_window_geometry`）。** 对注册窗口表开了窗口的 stage，每个窗口 $k$ 生成一个
+cold phase（第一个 M panel，读入该窗口的 B）和一个 steady phase（其余 panel，B 从 L2 复用）。需求字段来自
+`score_stage_window` 的逐窗口 A/B/C 流量；range restart 开销作为 setup phase。未开窗口的 stage 保持
+full-stripe phase。孤立残差系数不变（它是在 full-stripe 孤立测量上拟合的），孤立时间变化在 0–7%。
+依据：实测 L2 回填与模型 L2 字节在 full-stripe 几何下为 5.49 GB 对 11.22 GB，在执行窗口几何下为 5.49 GB
+对 6.85 GB（fixed_4）。
+
+**多流 DRAM 容量（`dram_multi_stream_bytes`）。** 某个事件中，若有 $n_s\ge2$ 个 phase 需要 DRAM，
+rank 容量取
+
+$$
+C_{DRAM}(T) = \min\bigl(C_{single}(T),\ C_{multi}(T)\bigr);
+$$
+
+单个 phase 仍用 $C_{single}$，与孤立标定一致。$C_{multi}$ 取 P1 探针的模型无关聚合量，即每条 lane
+每个 expert 的权重字节除以实测跨度，再取单调包络：12/20/36/52/68/84/96 核上为
+219/297/297/297/303/326/345 GB/s；单 team 曲线为 400–411 GB/s。纯加载计划的 PMU 计数复现了这一权重流
+速率（295–346 GB/s）。Python 与 native placed/aggregate 模拟器实现同一规则
+（`AnalyticDagMachine::dram_multi_stream_rate`，表为空则关闭）。
+
+**验证。** 留出集为 h2h 的 18 层，这些计划从未用于构建本模型。在其 4 个已规划计划中，窗口模型挑中实测
+最优的有 17/18 层，原模型为 0/18；整体水平误差中位数 −16%，原模型为 +70%，偏差近似均匀。
+在同一 18 层上以本模型做 full 搜索（native DAG，每层规划中位 0.35 s，最多 0.83 s），同场两轮实测：
+比生产 quick 快 5.23%（16/18 层），比 fast 快 4.63%（17/18），比探针事件模型下的 full 快 2.48%（16/18），
+比 60 s LNS 慢 1.57%（在 5/18 层上更快）。两轮取较小值时结论相同（−5.90% / −5.42% / −2.53% / +1.26%）。
+
+**未采用的项。** 稳态 phase 在满载邻居下变慢 1.2–1.8 倍，定位到读路径的回填延迟：V3 后端停顿计数中
+85–91% 为 L1-miss 读等待，不是存储、不是功耗，BFMMLA 背景不会让它变慢。预注册的 v2 项
+$\Delta t = R/T\cdot\Delta L\cdot\min(1,U)$（$\Delta L=6.5$ ns/行）把留出集误差减半，但挑选从 17/18 降到
+14/18，按预注册规则不采用；每行等待在 4–10 ns 之间，说明它依赖重叠程度，不是常数。
+
 ## 10. 同步规则
 
 
@@ -9424,5 +9476,6 @@ Context residual opening (2026-09-05): 独立 Lab candidate 增加冻结 v8 even
 | 2026-09-24 | v1.143 | **analytic 事件模拟器的 C++ 实现（性能，公式不变）**。`AnalyticMoeCostModel` 的 placed（`dag_makespan_placed`，含 `_normalize_placed_tasks` 校验、LLC 域 spill/服务、rank LLC 上限、DRAM 域注入、宽/窄团队项）与 rank 聚合（`dag_makespan`、`dag_task_finish_times`）模拟器移植为 `csrc/moe_planner/analytic_placed_dag.cpp`（`NativeAnalyticPlacedDag`，内部绑定），扩展缺失时回退 Python，`explain_dag*` 仍为 Python 参照。phase 字段与 `base_ns` 由 Python 计算，服务曲线按整数线程数制表，所有共享资源求和按活跃任务升序进行，与 Python 逐项同序。单次模拟保持串行（事件依赖且求和须保序），多线程只在独立 DAG 之间（`dag_makespans_placed(batch, workers)`）。C9g：135 个真实计划最大相对差 3.8e-15；单次 placed 评分 2T/8T/32T 由 183/76/51 ms 降到 0.65/0.32/0.29 ms；full 搜索冷规划 bimodal 1706→112 ms、真实层 11514→256 ms，quick+长短分区 64→5.7 ms，25/25 次规划所选计划与 Python 一致。full 的剩余时间在 Python LPT 分配而非模拟器。证据：`optimizations/fused_moe_sve/results/c9g_native_analytic_dag_20260924.md`。 |
 | 2026-09-24 | v1.144 | **C9g 事件模型与 fast planner 配置来源（规划语义增量，默认不变）**。按 Arm-codex 流程在 C9g（96 核单 LLC 域、SVE-128）重做 v10/v11 探针与标定：争用远强于 Arm-codex（4T 装载对装载 $D_{LL}$ 在 92 核装载背景下 5.86，Arm-codex 76 核 1.90；2T 稳态对稳态 1.92，Arm-codex ≤1.03），探针后台余量由 1.2 提到 3.0 倍以保证覆盖（偏离记录见 lab design）。在标定未见的 27×宽度实测表上，C9g 事件模型选宽度 regret 中位 0%、均值 1.09%，优于 quick 分数（0.34%/2.01%）与 analytic DAG（1.73%/2.18%）。fast（hot_wide）planner 的模板参数与 lane 系数改为可由事件模型标定的 `hot_wide` 字段给出（`bulk_width`、`wide_widths`、`max_wide_lanes`、`max_wide_cores`、`lane_scale`），缺省沿用原 Arm-codex 默认。C9g 值：模板取自该模型下 LNS 在 18 个推导层上的计划（4T 主体 + 至多 5 条 8/16T 宽 lane、宽 lane ≤48 核，从未出现 32T）；lane 系数不能用搜索计划的 lane 事件/孤立比值中位（4T 2.56、8T 1.32、16T 1.28，照搬后 fast 比 LNS 慢 25%，因比值取决于 lane 内 expert 而非宽度），改为在同一 18 层上以模型目标网格拟合（只比值有效，16T 固定为 1）：4T 1.60、8T 1.45，模型下 fast 距 LNS 中位 +10.3%（原默认 +17.8%，生产 quick +24.9%）。实测验收见后续条目。证据：`optimizations/fused_moe_sve/results/c9g_event_model_20260924.md`。 |
 | 2026-09-24 | v1.145 | **探针事件模型的 native 打分器（实现，公式不变）**。`NativeProbeEventSim`（`csrc/moe_planner/probe_event_sim.cpp`）移植 `ProbeEventModel.simulate` 的事件循环（phase 表、装载/稳态核数计数器、LL/LS/SL/SS 曲线查表含 Python 的 round-half-even、窗口时间尺度、per-expert overhead），`cost_model/probe_event_native.py` 的 `NativeProbeEventScorer` 包装模型并作为 LNS 的 `simulate`；背景宽度系数、事件日志、显式窗口与标定 hook 回退 Python。与 Python 相对误差 ≤1e-9（活跃集合求和顺序不同），单次模拟 15.0→0.24 ms。C9g 18 层上单进程限时 LNS：0.1/0.5/2 s 距 60 s LNS +7.7%/+4.0%/+1.5%（fast +10.3%），每秒约 1000 次评估，仿真只占四分之一；因单层执行约 14 ms，逐次调用现场搜索不可行。证据：`optimizations/fused_moe_sve/results/c9g_event_model_20260924.md`。 |
+| 2026-09-24 | v1.146 | **可解释窗口模型（analytic，可选，默认关闭）**。标定新增 `planner.llc_spill_rule`（`aggregate`/`private_l2_window`）、`planner.executed_window_geometry`、`services.dram_multi_stream_bytes`：私有 L2 窗口 spill 取代聚合 LLC spill；按注册窗口表逐窗口生成 cold/steady phase；两个及以上 DRAM 需求 phase 并发时 rank DRAM 容量取 $\min(C_{single},C_{multi})$。Python 与 native placed/aggregate 模拟器一致（C9g 上 216 项测试通过，其中 20 项为全开时的一致性测试）。C9g 资产 `analytic_c9g_window_tp4.json`；留出 18 层上 full 搜索实测比 quick 快 5.23%、比事件模型 full 快 2.48%。默认调度、Plan V2 与 runtime 不变。见"可解释窗口模型"一节与 `optimizations/fused_moe_sve/results/c9g_event_model_20260924.md`。 |
 
 Change record (2026-09-14, Lab): implemented predeclared matched block history/pressure interpolation and training-only extraction; zero/pooled-history controls, bounded domain, signed-delta and conditional-pressure limitations recorded. No active planner or production equation replacement.

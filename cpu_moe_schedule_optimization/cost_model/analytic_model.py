@@ -42,6 +42,17 @@ ANALYTIC_MODEL_SCHEMA_VERSION = 11
 ANALYTIC_MODEL_NAME = "phase_reaccount_llc_domain_dram_injection_v9"
 # Sentinel for the lazily built native placed-DAG scorer (None means unavailable).
 _NATIVE_UNSET = object()
+LLC_SPILL_RULES = ("aggregate", "private_l2_window")
+
+
+def _registered_stage_window_policy(**shape):
+    """The planner's registered window table for this shape and machine, or None."""
+    try:
+        from ..planners.stage_window_policy import default_stage_window_policy
+    except ImportError:  # pragma: no cover - direct script and legacy path import
+        from stage_window_policy import default_stage_window_policy
+    return default_stage_window_policy(**shape)
+
 _SHARED_RESOURCES = (
     "gemm_core_flops",
     "matrix_flops",
@@ -793,6 +804,14 @@ class AnalyticMachineCalibration:
     # dozens of concurrent narrow lanes contending; see QUICK_UNRELIABLE_WIDTHS for the C9g
     # evidence behind the one-click default.
     unreliable_widths: tuple[int, ...] = ()
+    # Interpretable contention terms, off unless the calibration names them
+    # (MATHEMATICAL_MODEL.md, "window model"). ``dram_multi_stream_bytes`` is the rank DRAM
+    # capacity when two or more concurrent phases stream their own data; a lone phase keeps
+    # ``dram_bytes``. ``llc_spill_rule`` selects the aggregate LLC spill or the private-L2 window
+    # rule. ``executed_window_geometry`` builds stage phases from the registered window table.
+    dram_multi_stream_bytes: SaturatingServiceCurve | None = None
+    llc_spill_rule: str = "aggregate"
+    executed_window_geometry: bool = False
 
     def __post_init__(self) -> None:
         if not self.machine_id:
@@ -834,6 +853,8 @@ class AnalyticMachineCalibration:
                 raise ValueError("LLC domain capacities must sum to llc_bytes_per_rank")
         elif self.dram_domain_injection.enabled:
             raise ValueError("DRAM domain injection requires calibrated LLC domains")
+        if self.llc_spill_rule not in LLC_SPILL_RULES:
+            raise ValueError(f"llc_spill_rule must be one of {LLC_SPILL_RULES}")
         unreliable = tuple(sorted(set(int(width) for width in self.unreliable_widths)))
         if any(width not in widths for width in unreliable):
             raise ValueError("unreliable_widths must be a subset of supported_widths")
@@ -842,6 +863,12 @@ class AnalyticMachineCalibration:
         object.__setattr__(self, "supported_widths", widths)
         object.__setattr__(self, "unreliable_widths", unreliable)
         object.__setattr__(self, "rank_cpu_ids", rank_cpu_ids)
+
+    def contended_dram_capacity(self, capacity: float, active_threads: int, demanding_phases: int) -> float:
+        """Rank DRAM capacity for ``demanding_phases`` concurrent DRAM-demanding phases."""
+        if self.dram_multi_stream_bytes is None or demanding_phases < 2 or active_threads <= 0:
+            return capacity
+        return min(capacity, self.dram_multi_stream_bytes.rate(min(active_threads, self.cores_per_rank)))
 
     def llc_domain_thread_counts(self, active_cpu_ids: Iterable[int]) -> dict[str, int]:
         if not self.llc_domains:
@@ -1009,6 +1036,13 @@ class AnalyticMachineCalibration:
             dram_domain_injection=DramDomainInjectionCalibration.from_dict(
                 payload.get("planner", {}).get("dram_domain_injection", {})
             ),
+            dram_multi_stream_bytes=(
+                SaturatingServiceCurve.from_dict(services["dram_multi_stream_bytes"])
+                if services.get("dram_multi_stream_bytes") is not None
+                else None
+            ),
+            llc_spill_rule=str(payload.get("planner", {}).get("llc_spill_rule", "aggregate")),
+            executed_window_geometry=bool(payload.get("planner", {}).get("executed_window_geometry", False)),
         )
 
     @classmethod
@@ -1031,6 +1065,8 @@ class AnalyticMachineCalibration:
             services["frontend_instructions"] = service(self.frontend_instructions)
         if self.epilogue_elements is not None:
             services["epilogue_elements"] = service(self.epilogue_elements)
+        if self.dram_multi_stream_bytes is not None:
+            services["dram_multi_stream_bytes"] = service(self.dram_multi_stream_bytes)
         payload = {
             "schema_version": ANALYTIC_MACHINE_SCHEMA_VERSION,
             "kind": "moe_analytic_machine",
@@ -1075,6 +1111,10 @@ class AnalyticMachineCalibration:
             )
         if self.dram_domain_injection.enabled:
             payload["planner"]["dram_domain_injection"] = self.dram_domain_injection.to_dict()
+        if self.llc_spill_rule != "aggregate":
+            payload["planner"]["llc_spill_rule"] = self.llc_spill_rule
+        if self.executed_window_geometry:
+            payload["planner"]["executed_window_geometry"] = True
         return payload
 
 
@@ -1476,6 +1516,7 @@ class AnalyticMoeCostModel:
         supported_widths: Sequence[int] | None = None,
         supported_shapes: Sequence[Sequence[int]] | None = None,
         partition_widths: Sequence[int] = (),
+        stage_window_policy=None,
     ):
         if isinstance(calibration, (str, Path)):
             self.profile_path = Path(calibration)
@@ -1525,6 +1566,17 @@ class AnalyticMoeCostModel:
         self.call_setup_ns = self.calibration.overheads.call_setup_ns
         self.relative_error = self.calibration.relative_uncertainty
         self.profile = self.calibration.to_dict()
+        # With executed_window_geometry, stage phases follow the window table the runtime runs:
+        # the explicit ``stage_window_policy`` when given, else the one registered for this shape
+        # and machine (None -> full stripe). Without it the argument is ignored.
+        self._executed_window_policy = None
+        if self.calibration.executed_window_geometry:
+            self._executed_window_policy = stage_window_policy or _registered_stage_window_policy(
+                hidden_size=self.hidden_size,
+                intermediate_size=self.intermediate_size,
+                backend_n_tile=resolved_n_tile,
+                machine_id=self.calibration.machine_id,
+            )
 
         widths = tuple(supported_widths or self.calibration.supported_widths)
         self.supported_widths = tuple(
@@ -2147,6 +2199,7 @@ class AnalyticMoeCostModel:
             compulsory_dram_bytes: float,
             spillable_dram_bytes: float,
             working_set_bytes: float,
+            name: str | None = None,
         ) -> None:
             compute_rows = sum(panel.compute_rows for panel in panels)
             store_rows = sum(panel.store_rows for panel in panels)
@@ -2175,7 +2228,7 @@ class AnalyticMoeCostModel:
                 epilogue_ns = epilogue_elements / machine.service_rate("epilogue_elements", active_threads) * 1e9
             phases.append(
                 AnalyticPhase(
-                    name=f"{demand.stage}:{phase_kind}",
+                    name=name or f"{demand.stage}:{phase_kind}",
                     kind=phase_kind,
                     panel_count=panel_count,
                     active_threads=active_threads,
@@ -2205,6 +2258,76 @@ class AnalyticMoeCostModel:
         stripe = demand.stripe_demand
         if stripe is None:
             return ()
+        window_tiles = self._executed_window_tiles(demand.stage, logical.routes, mapping.schedule.threads)
+        if window_tiles:
+            # Executed-window geometry: the runtime walks the windows in order and, inside each,
+            # every M panel. A window's first panel loads that window's packed B (cold); the other
+            # panels reuse it from L2 (steady). Demand fields are score_stage_window's per window.
+            score = self.score_stage_window(demand.stage, logical.routes, mapping.schedule.threads, window_tiles)
+            if score.window_overhead_ns > 0.0:
+                phases.append(
+                    AnalyticPhase(
+                        name=f"{demand.stage}:windows",
+                        kind="stage_setup",
+                        panel_count=0,
+                        active_threads=1,
+                        fixed_ns=score.window_overhead_ns,
+                        gemm_core_ns=0.0,
+                        matrix_ns=0.0,
+                        frontend_ns=0.0,
+                        l1_ns=0.0,
+                        l2_ns=0.0,
+                        llc_ns=0.0,
+                        epilogue_ns=0.0,
+                        matrix_flops=0.0,
+                        frontend_instructions=0.0,
+                        l1_bytes=0.0,
+                        l2_bytes=0.0,
+                        llc_bytes=0.0,
+                        epilogue_elements=0.0,
+                        compulsory_dram_bytes=0.0,
+                        spillable_dram_bytes=0.0,
+                        dram_rate=machine.service_rate("dram_bytes", 1),
+                        working_set_bytes=0.0,
+                        isolated_spill_fraction=0.0,
+                        residual_scale=residual_scale,
+                    )
+                )
+            cold_compute_fraction = mapping.panels[0].compute_rows / total_compute_rows
+            cold_store_fraction = mapping.panels[0].store_rows / total_store_rows
+            for window in score.window_demands:
+                if window.active_threads <= 0:
+                    continue
+                cold_a_l2_bytes = window.a_l2_refill_bytes * cold_compute_fraction
+                cold_c_write_bytes = window.c_write_bytes * cold_store_fraction
+                append_phase(
+                    phase_kind="cold_b",
+                    panels=mapping.panels[:1],
+                    active_threads=window.active_threads,
+                    balanced_tiles=window.balanced_tiles,
+                    a_l2_bytes=cold_a_l2_bytes,
+                    b_l2_bytes=window.compulsory_dram_bytes,
+                    c_write_bytes=cold_c_write_bytes,
+                    compulsory_dram_bytes=window.compulsory_dram_bytes,
+                    spillable_dram_bytes=cold_a_l2_bytes + cold_c_write_bytes,
+                    working_set_bytes=window.llc_working_set_bytes,
+                    name=f"{demand.stage}:w{window.window_index}:cold_b",
+                )
+                if len(mapping.panels) > 1:
+                    append_phase(
+                        phase_kind="steady_b",
+                        panels=mapping.panels[1:],
+                        active_threads=window.active_threads,
+                        balanced_tiles=window.balanced_tiles,
+                        a_l2_bytes=window.a_l2_refill_bytes - cold_a_l2_bytes,
+                        b_l2_bytes=window.b_l2_refill_bytes - window.compulsory_dram_bytes,
+                        c_write_bytes=window.c_write_bytes - cold_c_write_bytes,
+                        compulsory_dram_bytes=0.0,
+                        spillable_dram_bytes=window.spillable_dram_bytes - cold_a_l2_bytes - cold_c_write_bytes,
+                        working_set_bytes=window.llc_working_set_bytes,
+                        name=f"{demand.stage}:w{window.window_index}:steady_b",
+                    )
+            return self._apply_llc_spill_rule(demand, score.owner_window_bytes, phases)
         active_threads = min(stripe.n_tiles, mapping.schedule.threads)
         balanced_tiles = math.ceil(stripe.n_tiles / mapping.schedule.threads) * active_threads
         if machine.overheads.stage_fixed_ns > 0.0:
@@ -2268,7 +2391,52 @@ class AnalyticMoeCostModel:
                 spillable_dram_bytes=stripe.spillable_dram_bytes - cold_a_l2_bytes - cold_c_write_bytes,
                 working_set_bytes=stripe.llc_working_set_bytes,
             )
-        return tuple(phases)
+        return self._apply_llc_spill_rule(demand, stripe.owner_window_bytes, phases)
+
+    def _executed_window_tiles(self, stage: str, routes: int, threads: int) -> int:
+        """Per-thread window tiles the runtime executes for this stage; 0 = full stripe."""
+        policy = self._executed_window_policy
+        if policy is None:
+            return 0
+        w13_tiles, w2_tiles = policy.select(int(routes), int(threads))
+        return int(w13_tiles if stage == "w13" else w2_tiles)
+
+    def _apply_llc_spill_rule(
+        self,
+        demand: AnalyticStageDemand,
+        owner_window_bytes: float,
+        phases: Sequence[AnalyticPhase],
+    ) -> tuple[AnalyticPhase, ...]:
+        """Apply the calibration's LLC spill rule to a stage's GEMM phases.
+
+        ``aggregate`` keeps the phases' working sets, so concurrent phases share one LLC-domain
+        capacity miss. ``private_l2_window`` has no cross-task aggregation: a phase's spillable
+        bytes reach DRAM only when the per-core packed-B window plus one A panel exceeds the
+        private L2, and then only in the fraction its own working set misses the LLC. The fixed
+        fraction is folded into the compulsory bytes, so the event simulators see no working set.
+        """
+        if self.calibration.llc_spill_rule == "aggregate":
+            return tuple(phases)
+        mapping = demand.mapping
+        logical = mapping.logical_work
+        a_panel_bytes = max(panel.compute_rows for panel in mapping.panels) * logical.k * logical.input_element_bytes
+        l2_miss = self._l2_b_reuse_miss_fraction(owner_window_bytes + a_panel_bytes)
+        folded = []
+        for phase in phases:
+            if phase.kind not in {"cold_b", "steady_b"}:
+                folded.append(phase)
+                continue
+            fraction = l2_miss * phase.isolated_spill_fraction
+            folded.append(
+                replace(
+                    phase,
+                    compulsory_dram_bytes=phase.compulsory_dram_bytes + fraction * phase.spillable_dram_bytes,
+                    spillable_dram_bytes=0.0,
+                    working_set_bytes=0.0,
+                    isolated_spill_fraction=0.0,
+                )
+            )
+        return tuple(folded)
 
     @lru_cache(maxsize=4096)
     def predict_expert(self, routes: int, threads: int) -> ExpertPrediction:
@@ -2445,6 +2613,9 @@ class AnalyticMoeCostModel:
             "supported_widths": list(self.supported_widths),
             "down_output_element_bytes": self.down_output_element_bytes,
             "exact_m": self._exact_m,
+            "executed_window_policy": (
+                self._executed_window_policy.name if self._executed_window_policy is not None else None
+            ),
         }
 
     def import_t_iso_cache(self, entries: Mapping[tuple[int, int], float]) -> int:
@@ -2525,6 +2696,10 @@ class AnalyticMoeCostModel:
                 self.calibration.cores_per_rank,
             )
             capacity = self.calibration.service_rate(resource, active_threads) if active_threads > 0 else math.inf
+            if resource == "dram_bytes":
+                capacity = self.calibration.contended_dram_capacity(
+                    capacity, active_threads, sum(1 for demand in demands.values() if demand > 0.0)
+                )
             # Request rate is measured over the interval in which this resource
             # is active, not averaged over the whole ECM phase.  Averaging over
             # compute time and then scaling only the resource term can violate
@@ -2657,6 +2832,10 @@ class AnalyticMoeCostModel:
                 self.calibration.cores_per_rank,
             )
             capacity = self.calibration.service_rate(resource, active_threads) if active_threads > 0 else math.inf
+            if resource == "dram_bytes":
+                capacity = self.calibration.contended_dram_capacity(
+                    capacity, active_threads, sum(1 for demand in demands.values() if demand > 0.0)
+                )
             if math.isfinite(capacity):
                 offered_rate = sum(
                     demand
@@ -3114,6 +3293,12 @@ class AnalyticMoeCostModel:
             "dram_injection": bool(calibration.dram_domain_injection.enabled),
             "dram_injection_capacity_scale": float(calibration.dram_domain_injection.capacity_scale),
             "dram_saturated_rate": float(calibration.dram_bytes.saturated_rate),
+            "dram_multi_stream_rate": (
+                [math.inf]
+                + [calibration.dram_multi_stream_bytes.rate(threads) for threads in range(1, cores + 1)]
+                if calibration.dram_multi_stream_bytes is not None
+                else []
+            ),
             "wide_isolated_scale": [1.0] + [pressure.isolated_scale(width) for width in widths[1:]],
             "wide_full_cohort_scale": [1.0] + [pressure.full_cohort_scale(width) for width in widths[1:]],
             "narrow_full_cohort_correction": [1.0] + [float(narrow.get(width, 1.0)) for width in widths[1:]],

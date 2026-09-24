@@ -59,6 +59,9 @@ struct AnalyticDagMachine {
   bool dram_injection = false;
   double dram_injection_capacity_scale = 1.0;
   double dram_saturated_rate = 0.0;
+  // Rank DRAM capacity when two or more concurrent phases demand DRAM, by active threads
+  // 0..cores_per_rank; empty disables the term (a lone phase always keeps dram_rate).
+  std::vector<double> dram_multi_stream_rate;
   // Per team width (index = width, 0..cores_per_rank).
   std::vector<double> wide_isolated_scale;
   std::vector<double> wide_full_cohort_scale;
@@ -89,6 +92,16 @@ class NativeAnalyticPlacedDag {
   double makespan_aggregate(const AnalyticDagTasks& tasks, std::vector<double>* finish_times = nullptr) const;
 
  private:
+  // Rank DRAM capacity for `streams` concurrent DRAM-demanding phases (multi-stream term).
+  double ContendedDramCapacity(double capacity, int threads, int streams) const {
+    if (machine_.dram_multi_stream_rate.empty() || streams < 2 || threads <= 0) {
+      return capacity;
+    }
+    const int capped = threads < machine_.cores_per_rank ? threads : machine_.cores_per_rank;
+    const double multi = machine_.dram_multi_stream_rate[static_cast<size_t>(capped)];
+    return multi < capacity ? multi : capacity;
+  }
+
   AnalyticDagMachine machine_;
   std::map<std::pair<int64_t, int>, std::vector<AnalyticDagPhase>> phases_;
 };

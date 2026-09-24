@@ -153,6 +153,9 @@ NativeAnalyticPlacedDag::NativeAnalyticPlacedDag(AnalyticDagMachine machine) : m
       throw std::invalid_argument("per-thread tables must have cores_per_rank + 1 entries");
     }
   }
+  if (!machine_.dram_multi_stream_rate.empty() && machine_.dram_multi_stream_rate.size() != cores + 1) {
+    throw std::invalid_argument("dram_multi_stream_rate must be empty or have cores_per_rank + 1 entries");
+  }
   if (machine_.domain_capacity_bytes.size() != domains || machine_.domain_llc_rate.size() != domains) {
     throw std::invalid_argument("LLC domain tables must match the domain count");
   }
@@ -310,7 +313,7 @@ double NativeAnalyticPlacedDag::makespan(const AnalyticDagTasks& tasks) const {
     }
 
     // Spill-dependent DRAM traffic and the threads requesting each rank resource.
-    int gemm_threads = 0, l2_threads = 0, dram_rank_threads = 0, epilogue_threads = 0;
+    int gemm_threads = 0, l2_threads = 0, dram_rank_threads = 0, epilogue_threads = 0, dram_streams = 0;
     for (size_t slot = 0; slot < slots; ++slot) {
       const AnalyticDagPhase& phase = *phase_of[slot];
       const int* counts = counts_of[slot];
@@ -325,6 +328,7 @@ double NativeAnalyticPlacedDag::makespan(const AnalyticDagTasks& tasks) const {
       gemm_threads += phase.gemm_demand > 0.0 ? phase.active_threads : 0;
       l2_threads += phase.l2_demand > 0.0 ? phase.active_threads : 0;
       dram_rank_threads += dram_bytes[slot] > 0.0 ? phase.active_threads : 0;
+      dram_streams += dram_bytes[slot] > 0.0 ? 1 : 0;
       epilogue_threads += phase.epilogue_demand > 0.0 ? phase.active_threads : 0;
     }
     const auto capacity_of = [&](const std::vector<double>& rates, int threads) {
@@ -333,7 +337,8 @@ double NativeAnalyticPlacedDag::makespan(const AnalyticDagTasks& tasks) const {
     };
     const double gemm_capacity = capacity_of(machine_.gemm_rate, gemm_threads);
     const double l2_capacity = capacity_of(machine_.l2_rate, l2_threads);
-    const double dram_capacity = capacity_of(machine_.dram_rate, dram_rank_threads);
+    const double dram_capacity = ContendedDramCapacity(capacity_of(machine_.dram_rate, dram_rank_threads),
+                                                      dram_rank_threads, dram_streams);
     const double epilogue_capacity = capacity_of(machine_.epilogue_rate, epilogue_threads);
 
     // Offered rates: one sequential sum per resource, plus LLC and DRAM injection by domain.
@@ -566,7 +571,7 @@ double NativeAnalyticPlacedDag::makespan_aggregate(const AnalyticDagTasks& tasks
     }
     const double spill = SmoothCapacityMiss(working_set, effective_llc, physical_llc);
 
-    int gemm_threads = 0, l2_threads = 0, llc_threads = 0, dram_threads = 0, epilogue_threads = 0;
+    int gemm_threads = 0, l2_threads = 0, llc_threads = 0, dram_threads = 0, epilogue_threads = 0, dram_streams = 0;
     for (size_t slot = 0; slot < slots; ++slot) {
       const AnalyticDagPhase& phase = *phase_of[slot];
       dram_bytes[slot] = phase.compulsory_dram_bytes + spill * phase.spillable_dram_bytes;
@@ -575,6 +580,7 @@ double NativeAnalyticPlacedDag::makespan_aggregate(const AnalyticDagTasks& tasks
       l2_threads += phase.l2_demand > 0.0 ? phase.active_threads : 0;
       llc_threads += phase.llc_demand > 0.0 ? phase.active_threads : 0;
       dram_threads += dram_bytes[slot] > 0.0 ? phase.active_threads : 0;
+      dram_streams += dram_bytes[slot] > 0.0 ? 1 : 0;
       epilogue_threads += phase.epilogue_demand > 0.0 ? phase.active_threads : 0;
     }
     const auto capacity_of = [&](const std::vector<double>& rates, int threads) {
@@ -604,7 +610,8 @@ double NativeAnalyticPlacedDag::makespan_aggregate(const AnalyticDagTasks& tasks
     const double gemm_dilation = Dilation(gemm_offered, capacity_of(machine_.gemm_rate, gemm_threads));
     const double l2_dilation = Dilation(l2_offered, capacity_of(machine_.l2_rate, l2_threads));
     const double llc_dilation = Dilation(llc_offered, capacity_of(machine_.llc_rate, llc_threads));
-    const double dram_dilation = Dilation(dram_offered, capacity_of(machine_.dram_rate, dram_threads));
+    const double dram_dilation = Dilation(
+        dram_offered, ContendedDramCapacity(capacity_of(machine_.dram_rate, dram_threads), dram_threads, dram_streams));
     const double epilogue_dilation = Dilation(epilogue_offered, capacity_of(machine_.epilogue_rate, epilogue_threads));
 
     double elapsed = kInfinity;

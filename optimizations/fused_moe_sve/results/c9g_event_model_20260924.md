@@ -665,3 +665,49 @@ hardware check:
 On data it never saw it picks the best of four planned plans on 17/18 layers, with a near-uniform
 -16% level error. The steady-phase refill latency is characterized (load path, 4-10 ns per refill at
 saturation) but left out, because it worsened plan choice.
+
+## The window model in production code, and the full planner under it
+
+The three window-model terms are now optional calibration fields of `AnalyticMoeCostModel`, all
+off by default:
+
+- `planner.llc_spill_rule: private_l2_window`;
+- `planner.executed_window_geometry: true` (window table resolved by machine id; a
+  `stage_window_policy=` argument overrides it);
+- `services.dram_multi_stream_bytes`.
+
+The multi-stream capacity is also in the native placed/aggregate simulator
+(`AnalyticDagMachine::dram_multi_stream_rate`). The C9g asset is
+`bench_assets/moe_paper/amazon_c9g_96c_tp4/analytic_c9g_window_tp4.json`, built by
+`tmp/c9g_event_model_20260924/build_window_asset.py`. Its multi-stream curve is the monotone
+envelope of the P1 aggregate: 219 / 297 / 297 / 297 / 303 / 326 / 345 GB/s at 12..96 cores.
+
+Checks:
+
+- Against the lab window model (Python DAG), isolated times are identical and the traced
+  plans' makespans agree within 0.31%.
+- Existing analytic tests give identical results on the change and on clean HEAD (local, native
+  skipped: 109 passed, 83 skipped).
+- On C9g after the rebuild, 216 tests pass: the new file, the native placed DAG and the analytic
+  model tests. That includes 20 Python/native equality checks with every term on.
+
+Full search (`PlannedMoE(search_mode="full")`, native DAG, C9g node 1) under this model is
+`full_w`; under the research calibration it is `full_r` (`gen_full_window.py`). It ran on the 18
+h2h layers, which were never used to build the model. The measurement was same-session with
+quick (`baseline`), fast, event-model full and LNS: protocol v2, two sessions, 120 s cooldown
+(`chain_fw.sh`, `fw_r*_session*.json`, `analyze_fw.py`).
+
+| full_w against | median | mean | faster on | min-of-sessions median |
+| --- | --- | --- | --- | --- |
+| production quick | -5.23% | -4.91% | 16/18 | -5.90% |
+| fast | -4.63% | -4.47% | 17/18 | -5.42% |
+| event-model full | -2.48% | -2.84% | 16/18 | -2.53% |
+| LNS (60 s) | +1.57% | +2.30% | 5/18 | +1.26% |
+
+`full_r` against quick: -3.52% (14/18). full_w plans in 0.35 s median, 0.83 s max.
+
+Session spread is 0.43% median. The exception is r008 layer 13, where full and full_w measured
+13.0 ms in session 1 and 15.2 ms in session 2, with tight within-session p90s (a session-level
+effect). The min-of-sessions column shows the conclusion does not depend on it. Among the six
+plans the window model picks the measured best on 8/18. Most misses are between near-equal LNS
+and full_w/full_r plans.

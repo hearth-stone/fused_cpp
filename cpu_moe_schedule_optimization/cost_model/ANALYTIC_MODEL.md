@@ -710,6 +710,23 @@ fixed 1T ran 2.8-7.7x the best width on 2048-token batches, and without the excl
 picked 2T on moe256-active-set-64 and ran 22% slower
 (`optimizations/fused_moe_sve/results/c9g_related_work_20260923.md`).
 
+A calibration may also switch on the interpretable "window model" terms; all are off by default
+(`MATHEMATICAL_MODEL.md`, "可解释窗口模型"):
+
+- `planner.llc_spill_rule: "private_l2_window"` replaces the aggregate LLC spill. A phase's
+  spillable bytes reach DRAM only when its per-core packed-B window plus one A panel exceeds
+  the private L2, and then only in the fraction its own working set misses the LLC.
+- `planner.executed_window_geometry: true` builds a windowed stage's phases window by window
+  from the registered window table: one cold and one steady phase per window. A model argument
+  `stage_window_policy=` overrides the table.
+- `services.dram_multi_stream_bytes` is a piecewise curve that caps the rank DRAM capacity
+  whenever two or more concurrent phases demand DRAM; a lone phase keeps `dram_bytes`.
+
+The Python and native simulators implement all three. The C9g asset is
+`bench_assets/moe_paper/amazon_c9g_96c_tp4/analytic_c9g_window_tp4.json`. On 18 held-out
+layers, full search under it measured 5.2% faster than production quick and 2.5% faster than
+full under the probe event model (`optimizations/fused_moe_sve/results/c9g_event_model_20260924.md`).
+
 The production runtime currently bounds cold planning to homogeneous team
 shapes. It ranks those shapes with analytical isolated expert times and LPT
 lane loads, emits a strict Plan V2, and uses native C++ assignment/selection

@@ -215,7 +215,8 @@ void register_moe_quick_planner(py::module_& m) {
                        double llc_saturated_rate, double rank_llc_capacity_bytes, bool dram_injection,
                        double dram_injection_capacity_scale, double dram_saturated_rate,
                        std::vector<double> wide_isolated_scale, std::vector<double> wide_full_cohort_scale,
-                       std::vector<double> narrow_full_cohort_correction) {
+                       std::vector<double> narrow_full_cohort_correction,
+                       std::vector<double> dram_multi_stream_rate) {
              AnalyticDagMachine machine;
              machine.cores_per_rank = cores_per_rank;
              machine.call_setup_ns = call_setup_ns;
@@ -237,6 +238,7 @@ void register_moe_quick_planner(py::module_& m) {
              machine.wide_isolated_scale = std::move(wide_isolated_scale);
              machine.wide_full_cohort_scale = std::move(wide_full_cohort_scale);
              machine.narrow_full_cohort_correction = std::move(narrow_full_cohort_correction);
+             machine.dram_multi_stream_rate = std::move(dram_multi_stream_rate);
              return NativeAnalyticPlacedDag(std::move(machine));
            }),
            py::arg("cores_per_rank"), py::arg("call_setup_ns"), py::arg("cpu_domain"), py::arg("domain_sizes"),
@@ -245,7 +247,7 @@ void register_moe_quick_planner(py::module_& m) {
            py::arg("llc_rate"), py::arg("llc_saturated_rate"), py::arg("rank_llc_capacity_bytes"),
            py::arg("dram_injection"), py::arg("dram_injection_capacity_scale"), py::arg("dram_saturated_rate"),
            py::arg("wide_isolated_scale"), py::arg("wide_full_cohort_scale"),
-           py::arg("narrow_full_cohort_correction"))
+           py::arg("narrow_full_cohort_correction"), py::arg("dram_multi_stream_rate") = std::vector<double>{})
       .def(
           "register_phases",
           [](NativeAnalyticPlacedDag& dag, int64_t routes, int threads, const std::vector<PhaseTuple>& phases) {
