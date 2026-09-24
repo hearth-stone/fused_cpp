@@ -469,3 +469,37 @@ into its L2, so L2 refill bytes bound the DRAM reads from above.
    - But neither composition explains the slowdown: most of it is not backend memory stalls.
    Next measurement: stall_backend, stall_frontend, inst_retired and op_spec on the same cells,
    to see where the remaining ~75% of extra cycles go.
+
+#### Round 2: where the steady target's extra cycles go
+
+Same 12 steady cells, events cycles, stall_backend, stall_backend_mem, stall_frontend,
+inst_retired, op_spec (`counters_stall_session{1,2}.json`, `analyze_stall.py`). The target CPUs
+also count their wait after the target finishes. It is removed using the per-ms rates of the pool's
+idle CPUs in the n0 cell.
+
+| cell (background) | slowdown | extra cycles M | backend, not L2-miss memory | backend memory | frontend | unstalled | instructions |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| P2 8T M=2048 (steady) | x1.32 | 106 | 84% | 14% | -4% | 5% | +0.0% |
+| P2 16T M=2048 (steady) | x1.52 | 217 | 78% | 9% | -4% | 17% | +13.5% |
+| P2 4T M=1024 (steady) | x1.79 | 138 | 77% | 8% | -4% | 20% | +16.7% |
+
+- The 8T row is clean. With the same instruction count, 84% of the extra cycles are backend
+  stalls that are not waits on L2 misses (the architected stall_backend_mem). IPC falls 4.62 ->
+  3.34 at an unchanged clock (about 3.2 GHz on every CPU). Alone the target has 21% backend
+  stalls, of which 3% are memory.
+- The 16T/4T instruction increases are probably residue of the wait correction.
+- The per-thread time inside stage phases stays at 0.97-1.00 of the span, so the slowdown is not
+  waiting inside the team.
+- P3 (loading background) cannot be split this way. After the correction, the target shows
+  +106-216% instructions and IPC 6.4-9.0, which is impossible. The waiting workers evidently
+  behave differently while many small background tasks are dispatched, so the idle-CPU rates do not
+  transfer. Measuring P3 needs a target that stays busy for the whole call.
+
+Reading (hypothesis, not verified): the steady slowdown is a shared compute-side limit, not a
+memory one. A steady background slows the target more than a loading background at 16T and 4T
+(x1.52 vs 1.28, x1.79 vs 1.40), with no clock change and mostly non-memory backend stalls. That
+fits core power management throttling matrix-instruction dispatch when many cores run BFMMLA, not
+a bandwidth share. Neither the additive composition nor the offered-rate fix models this. In the
+model it would be a gemm_core_flops service curve that saturates with concurrently computing cores;
+today that curve is linear in threads. Verification: target alone vs a background running only
+register-resident BFMMLA loops (no memory traffic) vs a background of scalar spin.
