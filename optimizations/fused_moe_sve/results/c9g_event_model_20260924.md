@@ -73,3 +73,33 @@ The C9g event model is the best width selector of the three. Its misses:
 
 Next: derive the fast planner's templates and lane scales on C9g under this model, then validate
 fast against production quick on fresh layers.
+
+## Fast planner configuration on C9g (stage 3, model only)
+
+`derive_fast.py`: on the 18 derivation layers (r008/r016/r022 x layers 2/9/15/25/36/40) the
+model-objective LNS ran 60 s per layer (widths 4/8/16/32, one 96-core domain). It started from
+quick's homogeneous plans and the default fast plan. The searched plans share one shape: 4T bulk
+lanes plus at most five wide lanes, 8T (one to four) and 16T (zero or one), at most 48 wide cores,
+never 32T. The three layer-2 workloads are all 4T. Under the model the searched plans are 15-20%
+below the best homogeneous plan.
+
+Lane scales. The Arm-codex rule, the median lane event / isolated load ratio of the searched
+plans, gives 4T 2.56, 8T 1.32, 16T 1.28 here (Arm-codex: 1.119 / 1.065 / 1.045). Used as is, it
+makes fast worse than with the Arm-codex constants (+25.2% against LNS in median, against
++17.8%). The ratio depends on what a lane holds (4T lanes carry the small, strongly
+load-dilated experts), not on its width. `fit_fast_scale.py` therefore fits the scales on the
+same 18 layers under the model instead (16T fixed at 1, since only ratios matter). The result is
+a flat optimum at 4T 1.6 and 8T 1.15-1.6; 4T 1.60, 8T 1.45, 16T 1.00 are used.
+
+Model-only result (`fast_check.py`, event call time, median over the 18 layers):
+
+| plan | gap to LNS (median / max) |
+| --- | --- |
+| fast, C9g configuration | +10.3% / +15.2% |
+| fast, Arm-codex defaults | +17.8% / +25.4% |
+| production quick | +24.9% / +28.1% |
+
+The model predicts fast 11.1% faster than production quick (range -13.1% to +3.7%). Python
+planning takes 6.3 ms per layer. The configuration is written to the asset's `hot_wide` entry,
+and `PlannedMoE(search_mode="hot_wide")` reads it (`_hot_wide_config`). Measured validation on
+fresh layers follows.

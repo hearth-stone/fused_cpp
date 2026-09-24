@@ -221,6 +221,25 @@ def test_planned_moe_hot_wide_mode_and_cache(windowed) -> None:
     assert any(first["bridge"]["task_w13_window_tiles"]), "the machine's window table must be applied"
 
 
+def test_planned_moe_hot_wide_takes_its_templates_from_the_calibration(windowed) -> None:
+    from planned_moe import PlannedMoE
+
+    payload = dict(windowed.payload)
+    payload["hot_wide"] = {"bulk_width": 8, "wide_widths": [16, 32], "max_wide_lanes": 2, "max_wide_cores": 32,
+                           "lane_scale": {"8": 1.3, "16": 1.1, "32": 1.05}}
+    configured = ProbeEventModel(windowed.base, payload, window_policy=TABLE)
+    experts = [(e, r) for e, r in enumerate([1800, 1200, 700] + [90] * 40 + [30] * 80 + [5] * 60)]
+    planner = PlannedMoE(configured, num_cores=80, cpu_ids=CPUS, search_mode="hot_wide", cache_plans=False)
+    hot_wide = planner.hot_wide_planners[0]
+
+    assert hot_wide.bulk_width == 8 and hot_wide.wide_widths == (32, 16)
+    assert hot_wide.lane_scale == {8: 1.3, 16: 1.1, 32: 1.05}
+    widths = set(planner.plan_spec_for(experts)["bridge"]["task_threads"])
+    assert 4 not in widths and 8 in widths
+    default = PlannedMoE(windowed, num_cores=80, cpu_ids=CPUS, search_mode="hot_wide", cache_plans=False)
+    assert default.hot_wide_planners[0].bulk_width == 4
+
+
 def test_probe_model_t_iso_cache_round_trip(model) -> None:
     value = model.T_iso(384, 4)
     exported = model.export_t_iso_cache()

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Mapping, Sequence, Tuple
 
 try:
     from hot_wide_planner import HotWidePlanner  # noqa: E402
@@ -20,6 +20,25 @@ def _domain_cores(model, num_cores: int) -> tuple[int, ...]:
     domains = getattr(getattr(model, "calibration", None), "llc_domains", ())
     sizes = tuple(len(getattr(domain, "cpu_ids", ())) for domain in domains)
     return sizes if sizes and sum(sizes) == int(num_cores) else (int(num_cores),)
+
+
+def _hot_wide_config(model) -> dict[str, object]:
+    """Fast-planner template parameters named by the model's calibration (its ``hot_wide``
+    entry), so a machine calibrated with its own searched plans does not inherit another
+    machine's lane widths and lane scales. Without the entry the planner defaults apply."""
+    payload = getattr(model, "payload", None)
+    config = payload.get("hot_wide") if isinstance(payload, Mapping) else None
+    if not config:
+        return {}
+    result: dict[str, object] = {}
+    for key in ("bulk_width", "max_wide_lanes", "max_wide_cores"):
+        if key in config:
+            result[key] = int(config[key])
+    if "wide_widths" in config:
+        result["wide_widths"] = tuple(int(width) for width in config["wide_widths"])
+    if "lane_scale" in config:
+        result["lane_scale"] = {int(width): float(scale) for width, scale in config["lane_scale"].items()}
+    return result
 
 
 _BUCKETS = [1, 2, 4, 8, 12, 24, 48, 96, 192, 384, 768, 1536, 2040, 4096, 8192]
@@ -127,6 +146,7 @@ class PlannedMoE:
                 num_cores=num_cores,
                 domain_cores=_domain_cores(model, num_cores),
                 window_policy=planner._stage_window_policy(),
+                **_hot_wide_config(model),
             )
             for model, planner in zip(self.models, self.interval_planners)
         ) if self.search_mode == "hot_wide" else ()
