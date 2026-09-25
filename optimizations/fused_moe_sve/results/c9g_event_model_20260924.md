@@ -841,3 +841,48 @@ v2 still ranks lns_w60 ahead of the event LNS on 13 of the 15 layers where it me
 The steady-phase slowdown is not what makes lns_w60 slow, and searching under v2 would not
 remove the drift. The remaining cause is unidentified. The next step would be per-task traces
 of event LNS vs lns_w60 on a few layers, to see which tasks and lanes run longer than modelled.
+
+### Per-task traces: why lns_w60 loses
+
+`trace_lns.py` (C9g node 0, 120 s cooldown; per plan 3 warmup, 9 untraced, 5 traced calls),
+`analyze_trace_lns.py`. Plans: event LNS, lns_w60, lns_w5 on the four layers where lns_w60 lost
+most (r022_l13, r008_l7, r016_l19, r008_l1: +1.9..+3.4% measured, -2..-5% predicted).
+
+The loss has two parts, neither the steady term.
+
+1. **Post-compute tail, about 43% of the gap; the DAG does not model it.** Untraced call minus
+   last compute-task end, event LNS vs lns_w60:
+
+   | layer | event LNS | lns_w60 |
+   | --- | --- | --- |
+   | r008_l1 | 0.58 ms | 0.61 ms |
+   | r008_l7 | 0.59 ms | 1.09 ms |
+   | r016_l19 | 0.40 ms | 0.47 ms |
+   | r022_l13 | 0.47 ms | 0.72 ms |
+
+   The mean gap is 0.50 ms untraced, 0.29 ms of it in the compute span. In r008_l7 lns_w60's
+   last lane is a 4T lane ending with a 427-route expert, whose merge cannot overlap compute.
+2. **Compute span, about 57%: the model underprices 4T small and mid experts relative to wider
+   lanes, and the search exploits it.**
+   - In all four layers the measured last lane is a 4T lane. For lns_w60 the model's last lane is
+     8T in 3/4 layers.
+   - Measured/predicted task time summed over the layers:
+
+     | tasks | measured / predicted |
+     | --- | --- |
+     | 4T, M <= 12 | x1.25 (lns), x1.36 (w60), x1.35 (w5) |
+     | 4T, M 13-48 | x1.41-1.47 |
+     | 4T, M 49-192 and 193-768 | x1.14-1.17 |
+     | 8T | x1.06-1.30 |
+     | 16T | x0.95-1.16 |
+
+   Balancing lanes on the model's costs moves load onto 4T lanes whose small and mid experts it
+   prices too low; those lanes then finish last. These tasks are loading-dominated, with many
+   windows each loading B, so a steady-phase term cannot address them. That matches the v2
+   pre-check.
+
+Model gaps implied for longer searches:
+
+- a merge/finalize tail term, driven by the routes of the last-finishing experts;
+- the relative underpricing of 4T M <= 48 tasks in mixed plans. In homogeneous 4T plans the
+  level error is +5%, so this appears only when 4T lanes share the machine with wider lanes.
