@@ -722,7 +722,14 @@ A calibration may also switch on the interpretable "window model" terms; all are
 - `services.dram_multi_stream_bytes` is a piecewise curve that caps the rank DRAM capacity
   whenever two or more concurrent phases demand DRAM; a lone phase keeps `dram_bytes`.
 
-The Python and native simulators implement all three. The C9g asset is
+Two further terms, for long plan searches:
+
+- `planner.merge_tail: {route_thread_ns, fixed_ns}` ends the call at
+  `max_i(finish_i + route_thread_ns * routes_i / threads_i) + fixed_ns`.
+- `planner.loading_steady_dilation` multiplies a loading phase's DRAM dilation by
+  `1 + gamma * S`, where S is the steady share of the other concurrent GEMM-phase threads.
+
+The Python and native simulators implement all five. The C9g asset is
 `bench_assets/moe_paper/amazon_c9g_96c_tp4/analytic_c9g_window_tp4.json`. On 18 held-out
 layers, full search under it measured 5.2% faster than production quick and 2.5% faster than
 full under the probe event model (`optimizations/fused_moe_sve/results/c9g_event_model_20260924.md`).

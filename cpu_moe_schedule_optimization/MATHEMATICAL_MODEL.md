@@ -9059,6 +9059,27 @@ $$
 $\Delta t = R/T\cdot\Delta L\cdot\min(1,U)$（$\Delta L=6.5$ ns/行）把留出集误差减半，但挑选从 17/18 降到
 14/18，按预注册规则不采用；每行等待在 4–10 ns 之间，说明它依赖重叠程度，不是常数。
 
+**长时间搜索补充项（2026-09-25，可选，默认关闭）。** 在窗口模型下搜 60 s 的 LNS 实测比搜 5 s 更差：
+模型预测它比事件模型 LNS 快 4.0%，实测慢 1.0%。逐任务 trace 把差距定位到两个未建模项，
+均改为标定可选字段：
+
+$$
+T_{call}=\max_i\Bigl(f_i+K\frac{R_i}{w_i}\Bigr)+\tau_0,\qquad
+D^{DRAM}_i \leftarrow D^{DRAM}_i\,(1+\gamma S_i)\ \ (i\ \text{为 cold\_b}),
+$$
+
+- merge 尾部 `planner.merge_tail`：$f_i$ 为任务完成时刻，$R_i$、$w_i$ 为其路由数与团队宽度。
+  $K=5000$ 线程·ns/路由，$\tau_0=0.43$ ms，由 16 个 trace 计划拟合。
+- 加载段受稳态邻居拖慢 `planner.loading_steady_dilation`：$S_i$ 为同一事件中其他 GEMM phase 线程里
+  处于 steady 的比例，$\gamma=0.5$。$\gamma$ 只在 LNS trace 的任务上拟合；全加载探针中 $S=0$，
+  因此不受影响。
+
+逐线程公平的 DRAM 分配在跨宽度探针上更准，但在整计划上把 16T 小 expert 定价偏低，未采用。
+C9g 资产为 `analytic_c9g_window_ls_tp4.json`。在同一 18 个留出层上预注册的四条判据全部通过：
+- 60 s 比 5 s 快 0.29%；180 s 比 60 s 再快 0.19%；
+- 60 s 比事件模型 LNS 快 1.60%（18/18 层）；
+- 180 s 比生产 quick 快 9.19%（18/18）。
+
 ## 10. 同步规则
 
 
@@ -9477,5 +9498,6 @@ Context residual opening (2026-09-05): 独立 Lab candidate 增加冻结 v8 even
 | 2026-09-24 | v1.144 | **C9g 事件模型与 fast planner 配置来源（规划语义增量，默认不变）**。按 Arm-codex 流程在 C9g（96 核单 LLC 域、SVE-128）重做 v10/v11 探针与标定：争用远强于 Arm-codex（4T 装载对装载 $D_{LL}$ 在 92 核装载背景下 5.86，Arm-codex 76 核 1.90；2T 稳态对稳态 1.92，Arm-codex ≤1.03），探针后台余量由 1.2 提到 3.0 倍以保证覆盖（偏离记录见 lab design）。在标定未见的 27×宽度实测表上，C9g 事件模型选宽度 regret 中位 0%、均值 1.09%，优于 quick 分数（0.34%/2.01%）与 analytic DAG（1.73%/2.18%）。fast（hot_wide）planner 的模板参数与 lane 系数改为可由事件模型标定的 `hot_wide` 字段给出（`bulk_width`、`wide_widths`、`max_wide_lanes`、`max_wide_cores`、`lane_scale`），缺省沿用原 Arm-codex 默认。C9g 值：模板取自该模型下 LNS 在 18 个推导层上的计划（4T 主体 + 至多 5 条 8/16T 宽 lane、宽 lane ≤48 核，从未出现 32T）；lane 系数不能用搜索计划的 lane 事件/孤立比值中位（4T 2.56、8T 1.32、16T 1.28，照搬后 fast 比 LNS 慢 25%，因比值取决于 lane 内 expert 而非宽度），改为在同一 18 层上以模型目标网格拟合（只比值有效，16T 固定为 1）：4T 1.60、8T 1.45，模型下 fast 距 LNS 中位 +10.3%（原默认 +17.8%，生产 quick +24.9%）。实测验收见后续条目。证据：`optimizations/fused_moe_sve/results/c9g_event_model_20260924.md`。 |
 | 2026-09-24 | v1.145 | **探针事件模型的 native 打分器（实现，公式不变）**。`NativeProbeEventSim`（`csrc/moe_planner/probe_event_sim.cpp`）移植 `ProbeEventModel.simulate` 的事件循环（phase 表、装载/稳态核数计数器、LL/LS/SL/SS 曲线查表含 Python 的 round-half-even、窗口时间尺度、per-expert overhead），`cost_model/probe_event_native.py` 的 `NativeProbeEventScorer` 包装模型并作为 LNS 的 `simulate`；背景宽度系数、事件日志、显式窗口与标定 hook 回退 Python。与 Python 相对误差 ≤1e-9（活跃集合求和顺序不同），单次模拟 15.0→0.24 ms。C9g 18 层上单进程限时 LNS：0.1/0.5/2 s 距 60 s LNS +7.7%/+4.0%/+1.5%（fast +10.3%），每秒约 1000 次评估，仿真只占四分之一；因单层执行约 14 ms，逐次调用现场搜索不可行。证据：`optimizations/fused_moe_sve/results/c9g_event_model_20260924.md`。 |
 | 2026-09-24 | v1.146 | **可解释窗口模型（analytic，可选，默认关闭）**。标定新增 `planner.llc_spill_rule`（`aggregate`/`private_l2_window`）、`planner.executed_window_geometry`、`services.dram_multi_stream_bytes`：私有 L2 窗口 spill 取代聚合 LLC spill；按注册窗口表逐窗口生成 cold/steady phase；两个及以上 DRAM 需求 phase 并发时 rank DRAM 容量取 $\min(C_{single},C_{multi})$。Python 与 native placed/aggregate 模拟器一致（C9g 上 216 项测试通过，其中 20 项为全开时的一致性测试）。C9g 资产 `analytic_c9g_window_tp4.json`；留出 18 层上 full 搜索实测比 quick 快 5.23%、比事件模型 full 快 2.48%。默认调度、Plan V2 与 runtime 不变。见"可解释窗口模型"一节与 `optimizations/fused_moe_sve/results/c9g_event_model_20260924.md`。 |
+| 2026-09-25 | v1.147 | **长时间搜索补充项（可选，默认关闭）**。标定新增 `planner.merge_tail`（调用结束 = $\max_i(f_i+K R_i/w_i)+\tau_0$）与 `planner.loading_steady_dilation`（cold_b 的 DRAM 拖慢 ×$(1+\gamma S)$），Python/native 一致（C9g 239 项测试通过）。C9g 资产 `analytic_c9g_window_ls_tp4.json`（$\gamma=0.5$，$K=5000$ 线程·ns/路由，$\tau_0=0.43$ ms）。预注册验证四条全过：该模型下 LNS 5→60→180 s 单调改进，60 s 比事件模型 LNS 快 1.60%（18/18 层），180 s 比 quick 快 9.19%（18/18）。 |
 
 Change record (2026-09-14, Lab): implemented predeclared matched block history/pressure interpolation and training-only extraction; zero/pooled-history controls, bounded domain, signed-delta and conditional-pressure limitations recorded. No active planner or production equation replacement.

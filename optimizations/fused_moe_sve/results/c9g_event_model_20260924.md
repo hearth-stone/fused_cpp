@@ -886,3 +886,54 @@ Model gaps implied for longer searches:
 - a merge/finalize tail term, driven by the routes of the last-finishing experts;
 - the relative underpricing of 4T M <= 48 tasks in mixed plans. In homogeneous 4T plans the
   level error is +5%, so this appears only when 4T lanes share the machine with wider lanes.
+
+## Long search: two model terms from the traces, and 5/60/180 s LNS under them
+
+Both gaps the per-task traces located are now calibration-selected terms of `AnalyticMoeCostModel`
+(off by default; Python and native, equality tested; commit 949a477).
+
+- **Merge tail** (`planner.merge_tail`). After compute, the team that finished an expert merges
+  its routes. The call ends at max_i(finish_i + K R_i / w_i) + tau0. Fit on the 16 traced plans
+  (`fit_merge_tail.py`): K = 5000 thread-ns per route (1.25 us per route on 4T), tau0 = 0.43 ms.
+  Residuals are mostly < 0.1 ms; fixed_4's 2.57 ms tail is predicted as 2.56.
+- **Loading phases next to steady ones** (`planner.loading_steady_dilation`). A cold phase's DRAM
+  dilation grows by (1 + gamma S), where S is the steady share of the other concurrent GEMM-phase
+  threads; it is 0 in the all-loading probes, which therefore stay unchanged. Small, loading-bound
+  tasks in the LNS traces ran 1.36-1.39x the model while large ones ran 1.10-1.19x.
+  `fit_gamma.py` on those tasks: gamma 0.25-0.5 minimises the time-weighted spread of
+  log(meas/pred), 0.156 -> 0.117 at gamma 0.5.
+- **Rejected on the way.** Per-thread fair DRAM share (`fair_share.py`) fits the cross-width P1
+  probes much better: a 4T target next to 16T lanes goes from -38% to -23%, a 16T target next to
+  4T lanes from +32% to -5%, with alpha = 1 best in a width-exponent scan. In whole plans it
+  mispriced 16T small experts (x1.01 -> x1.21) and did not help plan order, so it was not used.
+
+Order check on the lw set (`validate_fair_tail.py`, 18 h2h layers x 8 measured plans):
+
+| model | picks | regret median / max | "event LNS faster than lns_w60" | level median (IQR) |
+| --- | --- | --- | --- | --- |
+| window | 3/18 | 1.9% / 5.6% | 3/18 | -20.2% (8.6%) |
+| window + tail | 3/18 | 0.8% / 5.6% | 4/18 | -15.5% |
+| window + gamma 0.5 + tail | 5/18 | 0.7% / 3.4% | 11/18 | -5.3% (3.1%) |
+
+C9g asset: `analytic_c9g_window_ls_tp4.json`, the window model + gamma 0.5 + merge tail
+(`build_longsearch_asset.py`).
+
+**Long search, pre-registered** (`longsearch_design.md`). Same LNS, starts and seed as before, under
+the new model, budgets 5 / 60 / 180 s (`lns_ls5/60/180`, `gen_lns_window.py` with
+`chain_ls_gen.sh`). Same-session measurement with the earlier plans on the 18 h2h layers
+(`chain_ls.sh`, `ls_r*_session*.json`, `analyze_ls.py`; two sessions, 120 s cooldown, spread 0.37%
+median). The session outliers are all in reference plans (full, full_w, full_r, some lns_w60);
+the lns_ls plans have none.
+
+| check (frozen) | mean of sessions | min of sessions |
+| --- | --- | --- |
+| L1 lns_ls60 vs lns_ls5 <= +0.3% | -0.29% (12/18 faster) | -0.28% |
+| L2 lns_ls60 vs event LNS <= +0.3% | -1.60% (18/18) | -1.21% |
+| L3 lns_ls60 faster than lns_w60 on >= 12/18 | 18/18, -2.09% | 18/18, -1.95% |
+| L4 lns_ls180 vs lns_ls60 <= +0.3% | -0.19% (12/18) | -0.22% |
+
+All four pass. Longer search now keeps improving: 5 s -> 60 s -> 180 s. lns_ls180 is 2.03% faster
+than the event-model LNS (16/18), 2.71% faster than full_w (18/18) and 9.19% faster than
+production quick (18/18). lns_ls5 is 1.00% faster than lns_w5 (15/18). The new model's own
+predictions no longer favour the drifted plan: lns_w60 vs event LNS is -0.5% predicted (was
+-4.0%).
