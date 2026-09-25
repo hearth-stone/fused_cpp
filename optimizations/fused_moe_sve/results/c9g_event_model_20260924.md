@@ -779,3 +779,36 @@ So the student recovers most of the teacher's plan quality at online cost. Not d
 production wiring of the distilled rows into `MoePlannerRuntime(search_mode="hot_wide")`. The
 hot-wide asset carries only `lane_scale`; it would need the a/b rows and the model's loading
 share per (routes, width).
+
+## LNS under the window model
+
+`gen_lns_window.py` (C9g node 1, native DAG) runs the same ModelLnsSearch as the event-model LNS:
+widths 4/8/16/32, batch 48, same seed. It is scored by the window model and starts from 4/8/16/32T
+homogeneous, fast, fast_d, full_w and the event-model LNS plan. Budgets are 60 s (`lns_w60`, as
+the event LNS) and 5 s (`lns_w5`). The same-session measurement on the 18 h2h layers was two
+sessions with 120 s cooldown (`chain_lw.sh`, `lw_r*_session*.json`, `analyze_lw.py`); session
+spread was 0.25% median.
+
+| candidate against | event LNS | full_w | fast_d | fast | quick |
+| --- | --- | --- | --- | --- | --- |
+| lns_w5 | -0.20% (10/18) | -2.16% (14/18) | -2.75% (17/18) | -6.72% (18/18) | -7.91% (18/18) |
+| lns_w60 | +0.96% (3/18) | -1.18% (11/18) | -1.72% (15/18) | -6.18% (17/18) | -7.11% (16/18) |
+
+Min-of-sessions gives the same picture: lns_w5 vs event LNS +0.25%, vs quick -7.90% (18/18).
+
+The longer search is worse. The window model predicted lns_w60 3.97% faster than the event LNS;
+it measured 0.96% slower. The search drifts into what the model underprices. Model level error
+(pred/meas - 1, median):
+
+| plan | model error | lanes 4T / 8T / 16T over 18 layers |
+| --- | --- | --- |
+| fast_d | -18.1% | 342 / 15 / 15 |
+| full_w | -21.8% | 58 / 177 / 5 |
+| event LNS | -22.2% | 344 / 20 / 12 |
+| lns_w5 | -25.9% | 298 / 35 / 16 |
+| lns_w60 | -27.2% | 290 / 43 / 14 |
+
+The longer search adds 8T lanes, where the model's unmodeled steady-phase slowdown (8T/16T D_SS
+1.00 vs 1.16-1.24) underprices most. A short budget near good starts is safe. Longer searches
+need the steady term, or a search penalty on it; ranking among a few candidates did not show
+this.
