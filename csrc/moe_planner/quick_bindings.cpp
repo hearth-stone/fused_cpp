@@ -145,16 +145,16 @@ py::dict HotWidePlan(const NativeHotWidePlanner& planner, const std::vector<int>
 
 // (gemm, active_threads, fixed_ns, residual_scale, base_ns, working_set_bytes, gemm_demand,
 //  l2_demand, llc_demand, epilogue_demand, compulsory_dram_bytes, spillable_dram_bytes,
-//  dram_rate, gemm_ns, l2_ns, llc_ns, epilogue_ns)
+//  dram_rate, gemm_ns, l2_ns, llc_ns, epilogue_ns, loading)
 using PhaseTuple = std::tuple<bool, int, double, double, double, double, double, double, double, double, double,
-                              double, double, double, double, double, double>;
+                              double, double, double, double, double, double, bool>;
 
 AnalyticDagPhase PhaseFromTuple(const PhaseTuple& value) {
   AnalyticDagPhase phase;
   std::tie(phase.gemm, phase.active_threads, phase.fixed_ns, phase.residual_scale, phase.base_ns,
            phase.working_set_bytes, phase.gemm_demand, phase.l2_demand, phase.llc_demand, phase.epilogue_demand,
            phase.compulsory_dram_bytes, phase.spillable_dram_bytes, phase.dram_rate, phase.gemm_ns, phase.l2_ns,
-           phase.llc_ns, phase.epilogue_ns) = value;
+           phase.llc_ns, phase.epilogue_ns, phase.loading) = value;
   return phase;
 }
 
@@ -216,7 +216,8 @@ void register_moe_quick_planner(py::module_& m) {
                        double dram_injection_capacity_scale, double dram_saturated_rate,
                        std::vector<double> wide_isolated_scale, std::vector<double> wide_full_cohort_scale,
                        std::vector<double> narrow_full_cohort_correction,
-                       std::vector<double> dram_multi_stream_rate) {
+                       std::vector<double> dram_multi_stream_rate, double loading_steady_dilation,
+                       double merge_route_thread_ns, double merge_fixed_ns) {
              AnalyticDagMachine machine;
              machine.cores_per_rank = cores_per_rank;
              machine.call_setup_ns = call_setup_ns;
@@ -239,6 +240,9 @@ void register_moe_quick_planner(py::module_& m) {
              machine.wide_full_cohort_scale = std::move(wide_full_cohort_scale);
              machine.narrow_full_cohort_correction = std::move(narrow_full_cohort_correction);
              machine.dram_multi_stream_rate = std::move(dram_multi_stream_rate);
+             machine.loading_steady_dilation = loading_steady_dilation;
+             machine.merge_route_thread_ns = merge_route_thread_ns;
+             machine.merge_fixed_ns = merge_fixed_ns;
              return NativeAnalyticPlacedDag(std::move(machine));
            }),
            py::arg("cores_per_rank"), py::arg("call_setup_ns"), py::arg("cpu_domain"), py::arg("domain_sizes"),
@@ -247,7 +251,9 @@ void register_moe_quick_planner(py::module_& m) {
            py::arg("llc_rate"), py::arg("llc_saturated_rate"), py::arg("rank_llc_capacity_bytes"),
            py::arg("dram_injection"), py::arg("dram_injection_capacity_scale"), py::arg("dram_saturated_rate"),
            py::arg("wide_isolated_scale"), py::arg("wide_full_cohort_scale"),
-           py::arg("narrow_full_cohort_correction"), py::arg("dram_multi_stream_rate") = std::vector<double>{})
+           py::arg("narrow_full_cohort_correction"), py::arg("dram_multi_stream_rate") = std::vector<double>{},
+           py::arg("loading_steady_dilation") = 0.0, py::arg("merge_route_thread_ns") = 0.0,
+           py::arg("merge_fixed_ns") = 0.0)
       .def(
           "register_phases",
           [](NativeAnalyticPlacedDag& dag, int64_t routes, int threads, const std::vector<PhaseTuple>& phases) {

@@ -21,6 +21,7 @@ import importlib
 import json
 import math
 import os
+import sys
 from dataclasses import asdict, dataclass, replace
 from functools import cached_property, lru_cache
 from pathlib import Path
@@ -50,7 +51,13 @@ def _registered_stage_window_policy(**shape):
     try:
         from ..planners.stage_window_policy import default_stage_window_policy
     except ImportError:  # pragma: no cover - direct script and legacy path import
-        from stage_window_policy import default_stage_window_policy
+        try:
+            from cpu_moe_schedule_optimization.planners.stage_window_policy import default_stage_window_policy
+        except ImportError:
+            planners = str(Path(__file__).resolve().parents[1] / "planners")
+            if planners not in sys.path:
+                sys.path.append(planners)
+            from stage_window_policy import default_stage_window_policy
     return default_stage_window_policy(**shape)
 
 _SHARED_RESOURCES = (
@@ -812,6 +819,15 @@ class AnalyticMachineCalibration:
     dram_multi_stream_bytes: SaturatingServiceCurve | None = None
     llc_spill_rule: str = "aggregate"
     executed_window_geometry: bool = False
+    # Long-search terms (MATHEMATICAL_MODEL.md, "window model" addendum), off at 0.
+    # ``loading_steady_dilation`` (gamma): a loading (cold_b) phase's DRAM dilation grows by
+    # (1 + gamma * S), S = share of the other concurrent GEMM-phase threads that are in steady
+    # phases. ``merge_route_thread_ns`` / ``merge_fixed_ns``: after compute, the team that finished
+    # an expert merges its routes, so the call ends at max_i(finish_i + K routes_i / threads_i) plus
+    # a fixed tail.
+    loading_steady_dilation: float = 0.0
+    merge_route_thread_ns: float = 0.0
+    merge_fixed_ns: float = 0.0
 
     def __post_init__(self) -> None:
         if not self.machine_id:
@@ -855,6 +871,8 @@ class AnalyticMachineCalibration:
             raise ValueError("DRAM domain injection requires calibrated LLC domains")
         if self.llc_spill_rule not in LLC_SPILL_RULES:
             raise ValueError(f"llc_spill_rule must be one of {LLC_SPILL_RULES}")
+        if min(self.loading_steady_dilation, self.merge_route_thread_ns, self.merge_fixed_ns) < 0.0:
+            raise ValueError("loading_steady_dilation and the merge tail must be non-negative")
         unreliable = tuple(sorted(set(int(width) for width in self.unreliable_widths)))
         if any(width not in widths for width in unreliable):
             raise ValueError("unreliable_widths must be a subset of supported_widths")
@@ -1043,6 +1061,9 @@ class AnalyticMachineCalibration:
             ),
             llc_spill_rule=str(payload.get("planner", {}).get("llc_spill_rule", "aggregate")),
             executed_window_geometry=bool(payload.get("planner", {}).get("executed_window_geometry", False)),
+            loading_steady_dilation=float(payload.get("planner", {}).get("loading_steady_dilation", 0.0)),
+            merge_route_thread_ns=float(payload.get("planner", {}).get("merge_tail", {}).get("route_thread_ns", 0.0)),
+            merge_fixed_ns=float(payload.get("planner", {}).get("merge_tail", {}).get("fixed_ns", 0.0)),
         )
 
     @classmethod
@@ -1115,6 +1136,13 @@ class AnalyticMachineCalibration:
             payload["planner"]["llc_spill_rule"] = self.llc_spill_rule
         if self.executed_window_geometry:
             payload["planner"]["executed_window_geometry"] = True
+        if self.loading_steady_dilation:
+            payload["planner"]["loading_steady_dilation"] = self.loading_steady_dilation
+        if self.merge_route_thread_ns or self.merge_fixed_ns:
+            payload["planner"]["merge_tail"] = {
+                "route_thread_ns": self.merge_route_thread_ns,
+                "fixed_ns": self.merge_fixed_ns,
+            }
         return payload
 
 
@@ -2393,6 +2421,31 @@ class AnalyticMoeCostModel:
             )
         return self._apply_llc_spill_rule(demand, stripe.owner_window_bytes, phases)
 
+    def _loading_steady_scale(self, current: Mapping[int, AnalyticPhase], index: int) -> float:
+        """(1 + gamma * S) for a loading phase; S = steady share of the other GEMM-phase threads."""
+        gamma = self.calibration.loading_steady_dilation
+        if gamma <= 0.0 or current[index].kind != "cold_b":
+            return 1.0
+        gemm_threads = steady_threads = 0
+        for other, phase in current.items():
+            if other == index or phase.kind not in {"cold_b", "steady_b"}:
+                continue
+            gemm_threads += phase.active_threads
+            if phase.kind == "steady_b":
+                steady_threads += phase.active_threads
+        return 1.0 + gamma * steady_threads / gemm_threads if gemm_threads else 1.0
+
+    def _call_end_ns(self, wall_ns: float, tasks, finish_times: Sequence[float]) -> float:
+        """Compute end plus the merge tail: max_i(finish_i + K routes_i / threads_i) + fixed."""
+        calibration = self.calibration
+        if not (calibration.merge_route_thread_ns or calibration.merge_fixed_ns):
+            return wall_ns
+        end = max(
+            finish + calibration.merge_route_thread_ns * task[0] / task[1]
+            for finish, task in zip(finish_times, tasks)
+        )
+        return max(end, wall_ns) + calibration.merge_fixed_ns
+
     def _executed_window_tiles(self, stage: str, routes: int, threads: int) -> int:
         """Per-thread window tiles the runtime executes for this stage; 0 = full stripe."""
         policy = self._executed_window_policy
@@ -2735,15 +2788,16 @@ class AnalyticMoeCostModel:
                 allocated_utilization=allocated_utilization,
             )
             resource_scales[resource] = dilation
-        multipliers = {
-            index: (
-                phase._duration_from_resource_times(
-                    resource_vectors[index][1], resource_scales
-                )
-                / phase.base_ns
+        multipliers = {}
+        dram_index = _SHARED_RESOURCES.index("dram_bytes")
+        for index, phase in current_items:
+            scales = resource_scales
+            loading_scale = self._loading_steady_scale(current, index)
+            if loading_scale != 1.0 and resource_vectors[index][0][dram_index] > 0.0:
+                scales = {**resource_scales, "dram_bytes": resource_scales["dram_bytes"] * loading_scale}
+            multipliers[index] = (
+                phase._duration_from_resource_times(resource_vectors[index][1], scales) / phase.base_ns
             )
-            for index, phase in current_items
-        }
         return spill_fraction, provisional, pressures, multipliers
 
     def _active_phase_state_placed(
@@ -2867,7 +2921,11 @@ class AnalyticMoeCostModel:
             )
             for index, demand in demands.items():
                 if demand > 0.0:
-                    resource_scales[index][resource] = dilation
+                    resource_scales[index][resource] = (
+                        dilation * self._loading_steady_scale(current, index)
+                        if resource == "dram_bytes"
+                        else dilation
+                    )
 
         llc_index = _SHARED_RESOURCES.index("llc_bytes")
         domain_details: dict[str, dict[str, float | int | None]] = {}
@@ -3176,7 +3234,7 @@ class AnalyticMoeCostModel:
                     dependency_count[successor] -= 1
                     if dependency_count[successor] == 0:
                         started[successor] = True
-        return wall_ns, tuple(finish_times)
+        return self._call_end_ns(wall_ns, tasks, finish_times), tuple(finish_times)
 
     def dag_makespan(self, tasks) -> float:
         native = self._native_placed_dag()
@@ -3299,6 +3357,9 @@ class AnalyticMoeCostModel:
                 if calibration.dram_multi_stream_bytes is not None
                 else []
             ),
+            "loading_steady_dilation": float(calibration.loading_steady_dilation),
+            "merge_route_thread_ns": float(calibration.merge_route_thread_ns),
+            "merge_fixed_ns": float(calibration.merge_fixed_ns),
             "wide_isolated_scale": [1.0] + [pressure.isolated_scale(width) for width in widths[1:]],
             "wide_full_cohort_scale": [1.0] + [pressure.full_cohort_scale(width) for width in widths[1:]],
             "narrow_full_cohort_correction": [1.0] + [float(narrow.get(width, 1.0)) for width in widths[1:]],
@@ -3353,6 +3414,7 @@ class AnalyticMoeCostModel:
             float(phase.l2_ns),
             float(phase.llc_ns),
             float(phase.epilogue_ns),
+            phase.kind == "cold_b",
         )
 
     def dag_task_finish_times(self, tasks) -> tuple[float, ...]:

@@ -249,6 +249,7 @@ double NativeAnalyticPlacedDag::makespan(const AnalyticDagTasks& tasks) const {
   }
   std::vector<size_t> phase_index(count, 0);
   std::vector<double> remaining(count);
+  std::vector<double> finish(count, 0.0);
   // Active tasks in ascending id: every shared-resource sum below runs in this order,
   // the order in which the Python reference iterates its active phases.
   std::vector<int> active;
@@ -314,6 +315,7 @@ double NativeAnalyticPlacedDag::makespan(const AnalyticDagTasks& tasks) const {
 
     // Spill-dependent DRAM traffic and the threads requesting each rank resource.
     int gemm_threads = 0, l2_threads = 0, dram_rank_threads = 0, epilogue_threads = 0, dram_streams = 0;
+    int gemm_phase_threads = 0, steady_phase_threads = 0;
     for (size_t slot = 0; slot < slots; ++slot) {
       const AnalyticDagPhase& phase = *phase_of[slot];
       const int* counts = counts_of[slot];
@@ -329,6 +331,8 @@ double NativeAnalyticPlacedDag::makespan(const AnalyticDagTasks& tasks) const {
       l2_threads += phase.l2_demand > 0.0 ? phase.active_threads : 0;
       dram_rank_threads += dram_bytes[slot] > 0.0 ? phase.active_threads : 0;
       dram_streams += dram_bytes[slot] > 0.0 ? 1 : 0;
+      gemm_phase_threads += phase.gemm ? phase.active_threads : 0;
+      steady_phase_threads += phase.gemm && !phase.loading ? phase.active_threads : 0;
       epilogue_threads += phase.epilogue_demand > 0.0 ? phase.active_threads : 0;
     }
     const auto capacity_of = [&](const std::vector<double>& rates, int threads) {
@@ -423,7 +427,9 @@ double NativeAnalyticPlacedDag::makespan(const AnalyticDagTasks& tasks) const {
       const AnalyticDagPhase& phase = *phase_of[slot];
       const int* counts = counts_of[slot];
       double llc_scale = 1.0;
-      double dram_scale = dram_bytes[slot] > 0.0 ? dram_rank_dilation : 1.0;
+      double dram_scale = dram_bytes[slot] > 0.0
+                              ? dram_rank_dilation * LoadingSteadyScale(phase, gemm_phase_threads, steady_phase_threads)
+                              : 1.0;
       if (phase.llc_demand > 0.0 || (machine_.dram_injection && dram_bytes[slot] > 0.0)) {
         double llc_local = 0.0, dram_local = 0.0;
         bool any = false;
@@ -482,6 +488,7 @@ double NativeAnalyticPlacedDag::makespan(const AnalyticDagTasks& tasks) const {
         } else {
           done = true;
           ++finished_count;
+          finish[task] = wall_ns;
           for (int successor : successors[task]) {
             if (--waiting[static_cast<size_t>(successor)] == 0) {
               started_now.push_back(successor);
@@ -498,7 +505,7 @@ double NativeAnalyticPlacedDag::makespan(const AnalyticDagTasks& tasks) const {
       active.insert(std::lower_bound(active.begin(), active.end(), task), task);
     }
   }
-  return wall_ns;
+  return CallEnd(wall_ns, tasks, finish);
 }
 
 double NativeAnalyticPlacedDag::makespan_aggregate(const AnalyticDagTasks& tasks,
@@ -538,6 +545,7 @@ double NativeAnalyticPlacedDag::makespan_aggregate(const AnalyticDagTasks& tasks
   }
   std::vector<size_t> phase_index(count, 0);
   std::vector<double> remaining(count);
+  std::vector<double> finish(count, 0.0);
   std::vector<int> active;
   active.reserve(count);
   for (size_t task = 0; task < count; ++task) {
@@ -572,6 +580,7 @@ double NativeAnalyticPlacedDag::makespan_aggregate(const AnalyticDagTasks& tasks
     const double spill = SmoothCapacityMiss(working_set, effective_llc, physical_llc);
 
     int gemm_threads = 0, l2_threads = 0, llc_threads = 0, dram_threads = 0, epilogue_threads = 0, dram_streams = 0;
+    int gemm_phase_threads = 0, steady_phase_threads = 0;
     for (size_t slot = 0; slot < slots; ++slot) {
       const AnalyticDagPhase& phase = *phase_of[slot];
       dram_bytes[slot] = phase.compulsory_dram_bytes + spill * phase.spillable_dram_bytes;
@@ -581,6 +590,8 @@ double NativeAnalyticPlacedDag::makespan_aggregate(const AnalyticDagTasks& tasks
       llc_threads += phase.llc_demand > 0.0 ? phase.active_threads : 0;
       dram_threads += dram_bytes[slot] > 0.0 ? phase.active_threads : 0;
       dram_streams += dram_bytes[slot] > 0.0 ? 1 : 0;
+      gemm_phase_threads += phase.gemm ? phase.active_threads : 0;
+      steady_phase_threads += phase.gemm && !phase.loading ? phase.active_threads : 0;
       epilogue_threads += phase.epilogue_demand > 0.0 ? phase.active_threads : 0;
     }
     const auto capacity_of = [&](const std::vector<double>& rates, int threads) {
@@ -617,8 +628,11 @@ double NativeAnalyticPlacedDag::makespan_aggregate(const AnalyticDagTasks& tasks
     double elapsed = kInfinity;
     for (size_t slot = 0; slot < slots; ++slot) {
       const AnalyticDagPhase& phase = *phase_of[slot];
+      const double dram_scale =
+          dram_bytes[slot] > 0.0 ? dram_dilation * LoadingSteadyScale(phase, gemm_phase_threads, steady_phase_threads)
+                                 : dram_dilation;
       const double transfer_ns =
-          std::max({phase.l2_ns * l2_dilation, phase.llc_ns * llc_dilation, dram_ns[slot] * dram_dilation});
+          std::max({phase.l2_ns * l2_dilation, phase.llc_ns * llc_dilation, dram_ns[slot] * dram_scale});
       const double body_ns = std::max(phase.gemm_ns * gemm_dilation, transfer_ns);
       const double duration = phase.residual_scale * (phase.fixed_ns + body_ns + phase.epilogue_ns * epilogue_dilation);
       multipliers[slot] = duration / phase.base_ns;
@@ -639,6 +653,7 @@ double NativeAnalyticPlacedDag::makespan_aggregate(const AnalyticDagTasks& tasks
         } else {
           done = true;
           ++finished_count;
+          finish[task] = wall_ns;
           if (finish_times != nullptr) {
             (*finish_times)[task] = wall_ns;
           }
@@ -658,7 +673,7 @@ double NativeAnalyticPlacedDag::makespan_aggregate(const AnalyticDagTasks& tasks
       active.insert(std::lower_bound(active.begin(), active.end(), task), task);
     }
   }
-  return wall_ns;
+  return CallEnd(wall_ns, tasks, finish);
 }
 
 std::vector<double> NativeAnalyticPlacedDag::makespans(const std::vector<AnalyticDagTasks>& batch, int workers) const {

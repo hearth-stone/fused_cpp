@@ -12,7 +12,8 @@ namespace moe_planner {
 // fields the placed contention simulator reads are kept; the Python model
 // computes them (and base_ns) so both paths start from identical values.
 struct AnalyticDagPhase {
-  bool gemm = false;  // kind in {"cold_b", "steady_b"}
+  bool gemm = false;     // kind in {"cold_b", "steady_b"}
+  bool loading = false;  // kind == "cold_b"
   int active_threads = 0;
   double fixed_ns = 0.0;
   double residual_scale = 1.0;
@@ -62,6 +63,12 @@ struct AnalyticDagMachine {
   // Rank DRAM capacity when two or more concurrent phases demand DRAM, by active threads
   // 0..cores_per_rank; empty disables the term (a lone phase always keeps dram_rate).
   std::vector<double> dram_multi_stream_rate;
+  // Long-search terms, off at 0: loading phases' DRAM dilation grows by (1 + gamma * S) with S the
+  // steady share of the other GEMM-phase threads; the call ends at
+  // max_i(finish_i + merge_route_thread_ns * routes_i / threads_i) + merge_fixed_ns.
+  double loading_steady_dilation = 0.0;
+  double merge_route_thread_ns = 0.0;
+  double merge_fixed_ns = 0.0;
   // Per team width (index = width, 0..cores_per_rank).
   std::vector<double> wide_isolated_scale;
   std::vector<double> wide_full_cohort_scale;
@@ -100,6 +107,29 @@ class NativeAnalyticPlacedDag {
     const int capped = threads < machine_.cores_per_rank ? threads : machine_.cores_per_rank;
     const double multi = machine_.dram_multi_stream_rate[static_cast<size_t>(capped)];
     return multi < capacity ? multi : capacity;
+  }
+
+  // (1 + gamma * S) for a loading phase, from the event's GEMM and steady thread totals.
+  double LoadingSteadyScale(const AnalyticDagPhase& phase, int gemm_threads, int steady_threads) const {
+    if (!(machine_.loading_steady_dilation > 0.0) || !phase.loading) {
+      return 1.0;
+    }
+    const int others = gemm_threads - phase.active_threads;
+    return others > 0 ? 1.0 + machine_.loading_steady_dilation * steady_threads / others : 1.0;
+  }
+
+  // Compute end plus the merge tail.
+  double CallEnd(double wall_ns, const AnalyticDagTasks& tasks, const std::vector<double>& finish) const {
+    if (!(machine_.merge_route_thread_ns > 0.0) && !(machine_.merge_fixed_ns > 0.0)) {
+      return wall_ns;
+    }
+    double end = 0.0;
+    for (size_t task = 0; task < finish.size(); ++task) {
+      const double value =
+          finish[task] + machine_.merge_route_thread_ns * static_cast<double>(tasks.routes[task]) / tasks.threads[task];
+      end = task == 0 ? value : (value > end ? value : end);
+    }
+    return (end > wall_ns ? end : wall_ns) + machine_.merge_fixed_ns;
   }
 
   AnalyticDagMachine machine_;

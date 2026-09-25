@@ -106,3 +106,57 @@ def test_native_matches_python_with_every_window_term(seed: int) -> None:
     reference_makespan, reference_finish = model._dag_result(aggregate)
     assert model.dag_makespan(aggregate) == pytest.approx(reference_makespan, rel=1e-12)
     assert model.dag_task_finish_times(aggregate) == pytest.approx(reference_finish, rel=1e-12)
+
+
+LONG_SEARCH = dict(loading_steady_dilation=0.5, merge_route_thread_ns=5000.0, merge_fixed_ns=4.0e5)
+
+
+def test_long_search_terms_default_off_and_round_trip() -> None:
+    default = _calibration()
+    assert (default.loading_steady_dilation, default.merge_route_thread_ns, default.merge_fixed_ns) == (0.0, 0.0, 0.0)
+    assert "merge_tail" not in default.to_dict()["planner"]
+    terms = replace(default, **LONG_SEARCH)
+    assert AnalyticMachineCalibration.from_dict(terms.to_dict()) == terms
+    with pytest.raises(ValueError, match="non-negative"):
+        replace(default, loading_steady_dilation=-1.0)
+
+
+def test_loading_phases_slow_only_next_to_steady_phases() -> None:
+    # Rank-level DRAM only: the domain-injection maximum would otherwise hide the term.
+    rank_only = replace(_contended_model().calibration, dram_domain_injection=DramDomainInjectionCalibration())
+    base = _window_model(rank_only)
+    slowed = _window_model(rank_only, loading_steady_dilation=0.5)
+    loaders = [(12, 2, (2 * lane, 2 * lane + 1), ()) for lane in range(4)]
+    assert slowed.dag_makespan_placed(loaders) == base.dag_makespan_placed(loaders)
+    # A chain of small experts next to a large one: the later links load while it is steady.
+    mixed = [(4000, 4, (2, 3, 4, 5), ())] + [(12, 2, (0, 1), (k - 1,) if k > 1 else ()) for k in range(1, 61)]
+    chain_end = len(mixed) - 1
+    assert slowed.explain_dag_placed(mixed)["task_finish_ns"][chain_end] > \
+        base.explain_dag_placed(mixed)["task_finish_ns"][chain_end]
+    aggregate = [(r, t, d) for r, t, _, d in mixed]
+    assert slowed.dag_task_finish_times(aggregate)[chain_end] > base.dag_task_finish_times(aggregate)[chain_end]
+
+
+def test_merge_tail_extends_the_call_past_the_last_finishing_team() -> None:
+    model = _window_model(merge_route_thread_ns=5000.0, merge_fixed_ns=4.0e5)
+    tasks = [(300, 2, (0, 1), ()), (12, 4, (2, 3, 4, 5), ()), (48, 2, (6, 7), ())]
+    finish = model.explain_dag_placed(tasks)["task_finish_ns"]
+    expected = max(max(f + 5000.0 * r / t for f, (r, t, _, _) in zip(finish, tasks)), max(finish)) + 4.0e5
+    assert model._python_dag_makespan_placed(tasks) == pytest.approx(expected, rel=1e-12)
+    aggregate = [(r, t, d) for r, t, _, d in tasks]
+    agg_finish = model.dag_task_finish_times(aggregate)
+    assert model.dag_makespan(aggregate) == pytest.approx(
+        max(max(f + 5000.0 * r / t for f, (r, t, _) in zip(agg_finish, aggregate)), max(agg_finish)) + 4.0e5, rel=1e-12)
+
+
+@pytest.mark.parametrize("seed", range(20))
+def test_native_matches_python_with_the_long_search_terms(seed: int) -> None:
+    model = _window_model(dram_multi_stream_bytes=MULTI, llc_spill_rule="private_l2_window",
+                          executed_window_geometry=True, **LONG_SEARCH)
+    _native(model)
+    tasks = _random_plan(random.Random(seed))
+    assert model.dag_makespan_placed(tasks) == pytest.approx(model._python_dag_makespan_placed(tasks), rel=1e-12)
+    aggregate = [(routes, threads, deps) for routes, threads, _, deps in tasks]
+    reference_makespan, reference_finish = model._dag_result(aggregate)
+    assert model.dag_makespan(aggregate) == pytest.approx(reference_makespan, rel=1e-12)
+    assert model.dag_task_finish_times(aggregate) == pytest.approx(reference_finish, rel=1e-12)
