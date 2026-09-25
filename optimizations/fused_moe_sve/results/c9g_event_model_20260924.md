@@ -812,3 +812,32 @@ The longer search adds 8T lanes, where the model's unmodeled steady-phase slowdo
 1.00 vs 1.16-1.24) underprices most. A short budget near good starts is safe. Longer searches
 need the steady term, or a search penalty on it; ranking among a few candidates did not show
 this.
+
+### LNS with the steady term: stopped at the pre-check, hypothesis refuted
+
+Design `tmp/c9g_event_model_20260924/lns_v2_design.md`, frozen before the run. The dynamic lab v2
+(Python DAG) costs about 2 s per evaluation on C9g. Matching lns_w60's 55k evaluations per layer
+would take about 11 h, so the design used a static form on the native DAG:
+
+- the production window model, plus PHI = 0.34;
+- a fixed steady-phase extra of refill lines per thread x 6.51 ns, i.e. v2 with U = 1
+  (`static_v2.py`).
+
+Its frozen pre-check against the dynamic v2 on the 18 h2h layers x 9 measured plans was
+Spearman median 0.95 (pass) and the same pick on 12/18 (needs >= 14). It failed, so no search was
+run.
+
+A direct check answers the question behind it. Each model's order on the plan pairs that
+decided the LNS result, against the measured order (`static_v2_precheck.json`):
+
+| pair | measured | window | static v2 | dynamic v2 |
+| --- | --- | --- | --- | --- |
+| event LNS faster than lns_w60 | 15/18 layers | 3/18 agree | 5/18 | 5/18 |
+| lns_w5 faster than lns_w60 | 13/18 | 4/18 | 9/18 | 10/18 |
+| event LNS faster than lns_w5 | 8/18 | 10/18 | 12/18 | 12/18 |
+
+The steady term moves the order the measured way (w5 vs w60: 4 -> 10/18). But even the dynamic
+v2 still ranks lns_w60 ahead of the event LNS on 13 of the 15 layers where it measured slower.
+The steady-phase slowdown is not what makes lns_w60 slow, and searching under v2 would not
+remove the drift. The remaining cause is unidentified. The next step would be per-task traces
+of event LNS vs lns_w60 on a few layers, to see which tasks and lanes run longer than modelled.
