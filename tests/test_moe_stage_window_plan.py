@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import platform
 import sys
+from functools import lru_cache
 from pathlib import Path
 
 import pytest
@@ -33,6 +34,21 @@ pytestmark = pytest.mark.skipif(
 _STAGES = {"w13": (4096, 1024), "w2": (512, 4096)}
 _N_TILE = 8
 _WIDTHS = [1, 2, 3, 4, 6, 8, 12, 16, 32]
+
+
+@lru_cache(maxsize=1)
+def _sve_n_tile():
+    import torch
+
+    from fused_cpp.moe import prepare_fused_moe_bf16_tiled_weights
+
+    w13 = torch.zeros((1, 32, 16), dtype=torch.bfloat16)
+    w2 = torch.zeros((1, 16, 16), dtype=torch.bfloat16)
+    return prepare_fused_moe_bf16_tiled_weights(w13, w2, fuse_silu=True, backend="arm_sve_bf16").backend_n_tile
+
+
+def _execution_n_tile(use_sve):
+    return _sve_n_tile() if use_sve else _N_TILE
 
 
 def _stage_window_plan(n, n_tile, threads, window_tiles=0):
@@ -143,9 +159,11 @@ def test_stage_window_plan_rejects_illegal_geometry():
 # ── W13 execution: reordering the (M panel, window) traversal is a no-op ──
 
 
-def _team_w13_packc_window(a, w13, group_size, window_tiles, use_sve, degree=5, n_tile=_N_TILE):
+def _team_w13_packc_window(a, w13, group_size, window_tiles, use_sve, degree=5, n_tile=None):
     from fused_cpp import _C
 
+    if n_tile is None:
+        n_tile = _execution_n_tile(use_sve)
     return _C.fused_moe_test_team_w13_silu_packc_window(a, w13, group_size, degree, n_tile, window_tiles, use_sve)
 
 
@@ -168,11 +186,11 @@ def test_windowed_w13_is_bitwise_identical_to_the_full_stripe(rows, group_size, 
     w13 = torch.randn(2 * f, h, dtype=torch.bfloat16) * 0.05
 
     reference = _team_w13_packc_window(a, w13, group_size, 0, use_sve)
-    total_tiles = (2 * f) // _N_TILE
+    total_tiles = (2 * f) // _execution_n_tile(use_sve)
     full = -(-total_tiles // group_size)
     for window_tiles in range(1, full + 1):
         got = _team_w13_packc_window(a, w13, group_size, window_tiles, use_sve)
-        assert torch.equal(got, reference), (
+        assert torch.equal(got.view(torch.int16), reference.view(torch.int16)), (
             f"rows={rows} t={group_size} sve={use_sve} omega={window_tiles} differs from the full stripe"
         )
 
@@ -198,7 +216,7 @@ def test_windowed_w13_rejects_an_oversized_window():
 
     a = torch.randn(8, 256, dtype=torch.bfloat16) * 0.05
     w13 = torch.randn(256, 256, dtype=torch.bfloat16) * 0.05
-    total_tiles = 256 // _N_TILE
+    total_tiles = 256 // _execution_n_tile(True)
     with pytest.raises(RuntimeError, match="exceed stage tiles"):
         _team_w13_packc_window(a, w13, 4, total_tiles + 1, True)
 
@@ -215,14 +233,14 @@ def _prepare_w2_packed(h, f):
     torch.manual_seed(11)
     w13 = torch.randn(1, 2 * f, h, dtype=torch.bfloat16) * 0.05
     w2 = torch.randn(1, h, f, dtype=torch.bfloat16) * 0.05
-    packed = _C.fused_moe_bf16_tiled_prepare_weights(w13, w2, False, "auto")
-    return packed[3], packed[4], packed[5]
+    packed = _C.fused_moe_bf16_tiled_prepare_weights(w13, w2, True, "arm_sve_bf16")
+    return packed[3], packed[4], packed[5], packed[7]
 
 
-def _team_w2_window(a, w2_packed, k, n, group_size, window_tiles, mode):
+def _team_w2_window(a, w2_packed, k, n, group_size, n_tile, window_tiles, mode):
     from fused_cpp import _C
 
-    return _C.fused_moe_test_team_w2_window(a, w2_packed, k, n, group_size, _N_TILE, window_tiles, mode)
+    return _C.fused_moe_test_team_w2_window(a, w2_packed, k, n, group_size, n_tile, window_tiles, mode)
 
 
 @pytest.mark.parametrize("mode", [0, 1])
@@ -232,17 +250,17 @@ def test_windowed_w2_is_bitwise_identical_to_the_full_stripe(rows, group_size, m
     import torch
 
     k, n = 128, 256
-    packed, packed_k, packed_n = _prepare_w2_packed(n, k)
+    packed, packed_k, packed_n, n_tile = _prepare_w2_packed(n, k)
     torch.manual_seed(rows * 31 + group_size)
     a = torch.randn(rows, packed_k, dtype=torch.bfloat16) * 0.05
 
-    reference = _team_w2_window(a, packed, packed_k, packed_n, group_size, 0, mode)
-    total_tiles = packed_n // _N_TILE
+    reference = _team_w2_window(a, packed, packed_k, packed_n, group_size, n_tile, 0, mode)
+    total_tiles = packed_n // n_tile
     full = -(-total_tiles // group_size)
     for window_tiles in sorted({1, 2, 3, 5, full}):
         if window_tiles > total_tiles:
             continue
-        got = _team_w2_window(a, packed, packed_k, packed_n, group_size, window_tiles, mode)
+        got = _team_w2_window(a, packed, packed_k, packed_n, group_size, n_tile, window_tiles, mode)
         assert torch.equal(got, reference), (
             f"rows={rows} t={group_size} mode={mode} omega={window_tiles} differs from the full stripe"
         )

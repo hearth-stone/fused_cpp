@@ -5,29 +5,13 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "fused-cpp"
 version = "0.1.0"
-description = "CPU fused MLA, MoE, GEMM, and SDPA kernels for PyTorch"
+description = "DeepSeek V4 CPU kernels for vLLM 0.28.0"
 requires-python = ">=3.9"
 dependencies = ["torch"]
 
 [project.optional-dependencies]
 test = [
     "pytest",
-    "hypothesis",
-]
-bench = [
-    "pytest",
-    "pytest-benchmark",
-    "openpyxl",
-]
-oracle = [
-    "ortools>=9.10",
-]
-dev = [
-    "pytest",
-    "hypothesis",
-    "pytest-benchmark",
-    "openpyxl",
-    "ortools>=9.10",
 ]
 
 # ── uv 专用：强制 Linux / Windows 上从 PyTorch 官方 CPU 索引拉取 torch ──
@@ -47,14 +31,12 @@ explicit = true
 [tool.pytest.ini_options]
 markers = [
     "bench: 性能基准测试（默认 skip，需 -m bench 触发）",
-    "equiv: SDPA 多版本等价性矩阵（默认收集）",
     "slow: 大 shape / 长时间用例（默认 skip，需 -m slow 触发）",
 ]
 
 [tool.ruff]
 line-length = 120
 target-version = "py39"
-extend-exclude = ["refs"]
 
 [tool.ruff.lint]
 select = ["E4", "E7", "E9", "F"]

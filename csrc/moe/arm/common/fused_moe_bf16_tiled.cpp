@@ -5647,9 +5647,16 @@ at::Tensor fused_moe_test_team_w13_silu_packc_window(at::Tensor A, at::Tensor w1
   for (int64_t m = 0; m < M; ++m) {
     std::copy(a_src + m * H, a_src + m * H + H, a_pad.data() + m * K_pad);
   }
-  std::vector<uint16_t> packed_a(static_cast<size_t>(Mp * K_pad), static_cast<uint16_t>(0));
-  pack_a_reorder_m8(a_pad.data(), packed_a.data(), static_cast<int>(M), static_cast<int>(K_pad), 0,
-                    static_cast<int>(Mp / 8));
+  std::vector<uint16_t> packed_a(static_cast<size_t>(packed_rows * K_pad), static_cast<uint16_t>(0));
+  if (use_sve) {
+    std::vector<int64_t> routes(static_cast<size_t>(M));
+    std::iota(routes.begin(), routes.end(), int64_t{0});
+    gather_pack_a_reorder_sve_hybrid(a_pad.data(), K_pad, routes.data(), 1, packed_a.data(), static_cast<int>(M),
+                                     static_cast<int>(K_pad), 1, 0);
+  } else {
+    pack_a_reorder_m8(a_pad.data(), packed_a.data(), static_cast<int>(M), static_cast<int>(K_pad), 0,
+                      static_cast<int>(Mp / 8));
+  }
 
   at::Tensor C = at::zeros({packed_rows * ldc}, at::TensorOptions().dtype(at::kBFloat16));
   for (int64_t local_tid = 0; local_tid < group_size; ++local_tid) {

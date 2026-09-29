@@ -460,10 +460,25 @@ def _profiling_enabled_for_build() -> bool:
     return not is_release
 
 
-all_cpp_sources = sorted(glob.glob("csrc/**/*.cpp", recursive=True))
-moe_source_prefix = os.path.join("csrc", "moe") + os.sep
-sources = [source for source in all_cpp_sources if not source.startswith(moe_source_prefix)]
-moe_sources = [source for source in all_cpp_sources if source.startswith(moe_source_prefix)]
+sources = [
+    os.path.join("csrc", name)
+    for name in (
+        "bf16_linear.cpp",
+        "deepseek_v4_attn_gemm_fused.cpp",
+        "deepseek_v4_attn_gemm_sve.cpp",
+        "deepseek_v4_indexer_sve.cpp",
+        "deepseek_v4_mhc_sve.cpp",
+        "deepseek_v4_post_gemm_stage.cpp",
+        "deepseek_v4_prefill_cache.cpp",
+        "deepseek_v4_q_norm_rope_sve.cpp",
+        "i8gemm.cpp",
+        "module.cpp",
+        "omp_info.cpp",
+        "sparse_mla.cpp",
+        "workspace_pool.cpp",
+    )
+]
+moe_sources = sorted(glob.glob("csrc/moe/**/*.cpp", recursive=True))
 moe_sources.extend(
     [
         os.path.join("csrc", "moe_planner", "interval_planner.cpp"),
@@ -477,7 +492,6 @@ i8gemm_asm_sources = []
 moe_native_sources = []
 deepseek_sve_gemm_native_sources = []
 is_aarch64 = platform.machine() in ("aarch64", "arm64")
-is_x86_64 = platform.machine() in ("x86_64", "AMD64")
 acl_available, acl_include_dirs, acl_library_dirs = _detect_acl()
 use_acl = is_aarch64 and acl_available
 
@@ -509,7 +523,7 @@ include_dirs = ["csrc"]
 library_dirs = []
 define_macros = []
 
-bf16gemm_workspace = os.path.abspath("refs/i8gemm")
+bf16gemm_workspace = os.path.abspath("third_party/zlgemm")
 bf16gemm_lib = os.path.join(bf16gemm_workspace, "lib")
 moe_include_dirs = ["csrc", bf16gemm_workspace, bf16gemm_lib]
 moe_compile_args = [*omp_compile_args, "-O2", _cxx17_compile_flag()]
@@ -520,33 +534,6 @@ moe_define_macros = [
 ]
 if omp_available:
     moe_define_macros.append(("FUSED_CPP_HAS_OMP", "1"))
-
-if is_x86_64:
-    moe_define_macros.append(("FUSED_CPP_MOE_HAS_X86_AVX512_BF16", "1"))
-    # BuildExtension may invoke Ninja from its temporary directory, so this
-    # external header-only dependency must use an absolute include path.
-    xbyak_root = os.path.abspath(os.path.join("3rdparty", "xbyak"))
-    # The first generator uses the System V x86-64 ABI. Windows keeps the
-    # intrinsic path until its nonvolatile GPR/ZMM save contract is emitted.
-    if platform.system() != "Windows" and os.path.isfile(os.path.join(xbyak_root, "xbyak", "xbyak.h")):
-        moe_include_dirs.append(xbyak_root)
-        moe_define_macros.append(("FUSED_CPP_MOE_HAS_XBYAK", "1"))
-    avx512_bf16_source = os.path.join("csrc", "moe", "x86", "avx512_bf16", "kernels.cpp")
-    moe_sources = [source for source in moe_sources if source != avx512_bf16_source]
-    moe_native_sources.append(
-        (
-            avx512_bf16_source,
-            [
-                "-O3",
-                "-std=c++17",
-                "-mavx512f",
-                "-mavx512bw",
-                "-mavx512vl",
-                "-mavx512bf16",
-                "-mfma",
-            ],
-        )
-    )
 
 define_macros.append(("FUSED_CPP_ENABLE_PROFILING", "1" if _profiling_enabled_for_build() else "0"))
 define_macros.append(("FUSED_CPP_STRICT_MODE", "1" if _env_truthy("FUSED_CPP_STRICT_MODE") else "0"))

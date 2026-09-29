@@ -1,13 +1,5 @@
 """Fused MoE (Mixture of Experts) with full-token EP optimization."""
 
-from fused_cpp.moe.awq_impl import AWQFusedMoEImpl
-from fused_cpp.moe.awq_moe import (
-    AWQExpertWeights,
-    awq_moe_expert_ffn_reference,
-    awq_moe_expert_ffn_w4a8,
-    dequant_awq_to_bf16,
-)
-from fused_cpp.moe.impl import FusedMoEImpl
 from fused_cpp.moe.plan import (
     ASYNC_MOE_EXECUTION_STRICT,
     ASYNC_MOE_EXECUTION_TAIL_POOL,
@@ -73,8 +65,6 @@ from fused_cpp.moe.planner_runtime import (
 )
 
 __all__ = [
-    "AWQExpertWeights",
-    "AWQFusedMoEImpl",
     "ASYNC_MOE_EXECUTION_STRICT",
     "ASYNC_MOE_EXECUTION_TAIL_POOL",
     "ASYNC_MOE_FULL_EXPERT_RANGE",
@@ -85,7 +75,6 @@ __all__ = [
     "ASYNC_MOE_STAGE_EXPERT",
     "AsyncMoEPlanV2",
     "DEFAULT_MOE_COST_CACHE_DIR",
-    "FusedMoEImpl",
     "MoePlannerRuntime",
     "PreparedBF16TiledFusedMoEWeights",
     "PreparedBF16TiledRoutedSharedMoEWeights",
@@ -98,9 +87,6 @@ __all__ = [
     "available_fused_moe_bf16_tiled_backends",
     "calibrate_moe_planner_quick",
     "enable_moe_planner_quick",
-    "awq_moe_expert_ffn_reference",
-    "awq_moe_expert_ffn_w4a8",
-    "dequant_awq_to_bf16",
     "fused_moe_bf16_tiled",
     "fused_moe_bf16_tiled_with_shared",
     "fused_moe_bf16_tiled_scheduled",
