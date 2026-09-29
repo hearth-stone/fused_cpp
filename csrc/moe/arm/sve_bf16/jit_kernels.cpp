@@ -178,7 +178,7 @@ KernelFn get_probe_kernel(int rows, ProbeMode mode, std::string* error) {
   } else if (mode == ProbeMode::kMatrixOnly && rows == 12) {
     function = &fused_cpp_sve_probe_matrix_m12;
   }
-  SetError(error, function == nullptr ? "unsupported precompiled SVE probe specialization" : "");
+  SetError(error, function == nullptr ? "SVE JIT probe requires M1/M2, or an M12-compatible mode" : "");
   return function;
 }
 
