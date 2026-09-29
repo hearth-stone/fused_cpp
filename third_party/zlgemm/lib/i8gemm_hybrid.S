@@ -1,7 +1,7 @@
 // i8gemm_hybrid.S -- small-shape "hybrid" i8 microkernel.
 //
 // Reads A directly from the original row-major layout (no separate A-reorder
-// pack pass) using branch-free ldr/ld1/dup, computes an 8-row x 2VL(=16 col)
+// pack pass) using branch-free ldr/ld1/dup, computes an 8-row x 2VL
 // tile with the double-buffered smmla schedule, and writes int32 C with the
 // contiguous deinterleave store (no scatter). Aimed at tiny shapes where the
 // A-pack pass and scatter store dominate.
@@ -67,9 +67,9 @@
 	smmla \c3\().s, \areg\().b, z7.b
 	.endm
 
-	// Deinterleave-store one row-pair (rows 2*rp,2*rp+1) of the 8x16 i32 tile,
+	// Deinterleave-store one row-pair (rows 2*rp,2*rp+1) of the 8xN i32 tile,
 	// contiguous st1w (no scatter). x18 = tile base byte addr; x12 = ldc;
-	// x3 = m_now; p2 = VL4; x4/x7 scratch.
+	// x3 = m_now; p2 = VL4; p3 masks high quads at VL128; x4/x7 scratch.
 	.macro HSTORE_PAIR rp, a0, a1, a2, a3
 	cmp x3, #(\rp * 2)
 	b.le .Lhs_\@_\rp\()_done
@@ -84,11 +84,11 @@
 	add x7, x7, #16
 	mov z2.d, z0.d
 	ext z2.b, z2.b, z2.b, #16
-	st1w z2.s, p2, [x7]
+	st1w z2.s, p3, [x7]
 	add x7, x7, #16
 	mov z3.d, z1.d
 	ext z3.b, z3.b, z3.b, #16
-	st1w z3.s, p2, [x7]
+	st1w z3.s, p3, [x7]
 	cmp x3, #(\rp * 2 + 1)
 	b.le .Lhs_\@_\rp\()_done
 	trn2 z0.d, \a0\().d, \a1\().d
@@ -102,11 +102,11 @@
 	add x7, x7, #16
 	mov z2.d, z0.d
 	ext z2.b, z2.b, z2.b, #16
-	st1w z2.s, p2, [x7]
+	st1w z2.s, p3, [x7]
 	add x7, x7, #16
 	mov z3.d, z1.d
 	ext z3.b, z3.b, z3.b, #16
-	st1w z3.s, p2, [x7]
+	st1w z3.s, p3, [x7]
 .Lhs_\@_\rp\()_done:
 	.endm
 
@@ -123,6 +123,9 @@ i8gemm_k_hybrid:
 
 	ptrue p0.b
 	ptrue p2.s, vl4
+	cntw x4
+	sub x4, x4, #4
+	whilelt p3.s, xzr, x4
 
 	cntb x13
 	lsr x13, x13, #1          // n_tile = VL/2 (cols)
@@ -221,6 +224,9 @@ i8gemm_k_narrow:
 
 	ptrue p0.b
 	ptrue p2.s, vl4
+	cntw x4
+	sub x4, x4, #4
+	whilelt p3.s, xzr, x4
 
 	cntb x13
 	lsr x13, x13, #1          // n_tile = VL/2
@@ -283,6 +289,9 @@ i8gemm_k_narrow2:
 
 	ptrue p0.b
 	ptrue p2.s, vl4
+	cntw x4
+	sub x4, x4, #4
+	whilelt p3.s, xzr, x4
 
 	cntb x13
 	lsr x13, x13, #1          // n_tile = VL/2

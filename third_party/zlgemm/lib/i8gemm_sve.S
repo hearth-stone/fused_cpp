@@ -524,8 +524,9 @@
 	msub x18, x4, x12, x18
 	.endm
 
-	// Emit the 4 contiguous quad-stores for one deinterleaved row.
-	// z0=[c0-3|c8-11], z1=[c4-7|c12-15] (int32 accum); x7 = row byte addr.
+	// Emit two quads at VL128 or four at VL256 for one deinterleaved row.
+	// z0=[c0-3|c8-11], z1=[c4-7|c12-15] at VL256; x7 = row byte addr.
+	// p3 masks the high quads when the N tile has only 8 columns.
 	// mode: i32 (raw), f32 (scvtf), bias (scvtf + per-col bias in z8..z11).
 	.macro DEINT_QUADS mode
 	.ifnc \mode, i32
@@ -546,12 +547,12 @@
 	add x7, x7, #16
 	st1w z1.s, p2, [x7]
 	add x7, x7, #16
-	st1w z4.s, p2, [x7]
+	st1w z4.s, p3, [x7]
 	add x7, x7, #16
-	st1w z5.s, p2, [x7]
+	st1w z5.s, p3, [x7]
 	.endm
 
-	// Deinterleave-store one row-pair (rows 2*rp, 2*rp+1) of the 8x16 tile
+	// Deinterleave-store one row-pair (rows 2*rp, 2*rp+1) of the 8xN tile
 	// using contiguous st1w instead of scatter. The smmla 2x2 output is laid
 	// out (per accumulator) as [r0c0,r0c1,r1c0,r1c1 | r0c8,r0c9,r1c8,r1c9].
 	// trn1.d gathers the even (r0) col pairs, trn2.d the odd (r1); ext brings
@@ -587,18 +588,18 @@
 	add x5, x5, #16
 	ld1w z9.s, p2/z, [x5]
 	add x5, x5, #16
-	ld1w z10.s, p2/z, [x5]
+	ld1w z10.s, p3/z, [x5]
 	add x5, x5, #16
-	ld1w z11.s, p2/z, [x5]
+	ld1w z11.s, p3/z, [x5]
 	cbz x23, .L_\tag\()_scaled_no_bias
 	add x5, x23, x16, lsl #2
 	ld1w z12.s, p2/z, [x5]
 	add x5, x5, #16
 	ld1w z13.s, p2/z, [x5]
 	add x5, x5, #16
-	ld1w z14.s, p2/z, [x5]
+	ld1w z14.s, p3/z, [x5]
 	add x5, x5, #16
-	ld1w z15.s, p2/z, [x5]
+	ld1w z15.s, p3/z, [x5]
 	b .L_\tag\()_scaled_aux_done
 .L_\tag\()_scaled_no_bias:
 	mov z12.s, #0
@@ -633,9 +634,9 @@
 	add x7, x7, #16
 	st1w z1.s, p2, [x7]
 	add x7, x7, #16
-	st1w z4.s, p2, [x7]
+	st1w z4.s, p3, [x7]
 	add x7, x7, #16
-	st1w z5.s, p2, [x7]
+	st1w z5.s, p3, [x7]
 	.else
 	lsr z6.s, z0.s, #16
 	and z6.s, z6.s, #1
@@ -656,14 +657,14 @@
 	add z6.s, z6.s, z7.s
 	add z4.s, z4.s, z6.s
 	lsr z4.s, z4.s, #16
-	st1h z4.s, p2, [x7]
+	st1h z4.s, p3, [x7]
 	add x7, x7, #8
 	lsr z6.s, z5.s, #16
 	and z6.s, z6.s, #1
 	add z6.s, z6.s, z7.s
 	add z5.s, z5.s, z6.s
 	lsr z5.s, z5.s, #16
-	st1h z5.s, p2, [x7]
+	st1h z5.s, p3, [x7]
 	.endif
 	.endm
 
@@ -731,21 +732,21 @@
 	msub x18, x4, x12, x18
 	.endm
 
-	.macro M12_SCALE_STORE_QUAD mode, tag, rp, half, cp, value
+	.macro M12_SCALE_STORE_QUAD mode, tag, rp, half, cp, value, pred
 	add x4, x22, x16, lsl #2
 	add x4, x4, #(\cp * 16)
-	ld1w z2.s, p2/z, [x4]
+	ld1w z2.s, \pred/z, [x4]
 	scvtf \value\().s, p1/m, \value\().s
 	fmul \value\().s, \value\().s, z6.s
 	fmul \value\().s, \value\().s, z2.s
 	cbz x23, .L_\tag\()_m12_no_bias_\rp\()_\half\()_\cp
 	add x4, x23, x16, lsl #2
 	add x4, x4, #(\cp * 16)
-	ld1w z3.s, p2/z, [x4]
+	ld1w z3.s, \pred/z, [x4]
 	fadd \value\().s, \value\().s, z3.s
 .L_\tag\()_m12_no_bias_\rp\()_\half\()_\cp:
 	.ifc \mode, f32
-	st1w \value\().s, p2, [x7]
+	st1w \value\().s, \pred, [x7]
 	add x7, x7, #16
 	.else
 	lsr z2.s, \value\().s, #16
@@ -755,7 +756,7 @@
 	add z2.s, z2.s, z3.s
 	add \value\().s, \value\().s, z2.s
 	lsr \value\().s, \value\().s, #16
-	st1h \value\().s, p2, [x7]
+	st1h \value\().s, \pred, [x7]
 	add x7, x7, #8
 	.endif
 	.endm
@@ -772,10 +773,10 @@
 	add x7, x18, x7, lsl #\shift
 	add x4, x21, x4, lsl #2
 	ld1rw z6.s, p1/z, [x4]
-	M12_SCALE_STORE_QUAD \mode, \tag, \rp, 0, 0, z0
-	M12_SCALE_STORE_QUAD \mode, \tag, \rp, 0, 1, z1
-	M12_SCALE_STORE_QUAD \mode, \tag, \rp, 0, 2, z4
-	M12_SCALE_STORE_QUAD \mode, \tag, \rp, 0, 3, z5
+	M12_SCALE_STORE_QUAD \mode, \tag, \rp, 0, 0, z0, p2
+	M12_SCALE_STORE_QUAD \mode, \tag, \rp, 0, 1, z1, p2
+	M12_SCALE_STORE_QUAD \mode, \tag, \rp, 0, 2, z4, p3
+	M12_SCALE_STORE_QUAD \mode, \tag, \rp, 0, 3, z5, p3
 	trn2 z0.d, \a0\().d, \a1\().d
 	trn2 z1.d, \a2\().d, \a3\().d
 	mov z4.d, z0.d
@@ -787,10 +788,10 @@
 	add x7, x18, x7, lsl #\shift
 	add x4, x21, x4, lsl #2
 	ld1rw z6.s, p1/z, [x4]
-	M12_SCALE_STORE_QUAD \mode, \tag, \rp, 1, 0, z0
-	M12_SCALE_STORE_QUAD \mode, \tag, \rp, 1, 1, z1
-	M12_SCALE_STORE_QUAD \mode, \tag, \rp, 1, 2, z4
-	M12_SCALE_STORE_QUAD \mode, \tag, \rp, 1, 3, z5
+	M12_SCALE_STORE_QUAD \mode, \tag, \rp, 1, 0, z0, p2
+	M12_SCALE_STORE_QUAD \mode, \tag, \rp, 1, 1, z1, p2
+	M12_SCALE_STORE_QUAD \mode, \tag, \rp, 1, 2, z4, p3
+	M12_SCALE_STORE_QUAD \mode, \tag, \rp, 1, 3, z5, p3
 	.endm
 
 
@@ -809,6 +810,9 @@ i8gemm_k_nld_m12:
 	ptrue p0.b
 	ptrue p1.s
 	ptrue p2.s, vl4
+	cntw x4
+	sub x4, x4, #4
+	whilelt p3.s, xzr, x4     // four high-quad lanes at VL256, none at VL128
 	index z0.s, #0, #1
 	and z0.s, z0.s, #2
 	cmpeq p4.s, p1/z, z0.s, #0
@@ -867,6 +871,9 @@ i8gemm_k_nld_m12:
 	ptrue p0.b
 	ptrue p1.s
 	ptrue p2.s, vl4
+	cntw x4
+	sub x4, x4, #4
+	whilelt p3.s, xzr, x4
 	cntb x13
 	lsr x13, x13, #1
 	mul x14, x9, x13
@@ -935,9 +942,9 @@ i8gemm_k_nld_m12:
 	add x6, x6, #16
 	ld1w {z9.s}, p2/z, [x6]          // bias c4-7
 	add x6, x6, #16
-	ld1w {z10.s}, p2/z, [x6]         // bias c8-11
+	ld1w {z10.s}, p3/z, [x6]         // bias c8-11
 	add x6, x6, #16
-	ld1w {z11.s}, p2/z, [x6]         // bias c12-15
+	ld1w {z11.s}, p3/z, [x6]         // bias c12-15
 	DEINT_STORE_PAIR bias, \tag, x3, 0, z16, z17, z18, z19
 	DEINT_STORE_PAIR bias, \tag, x3, 1, z20, z21, z22, z23
 	DEINT_STORE_PAIR bias, \tag, x3, 2, z24, z25, z26, z27
@@ -965,6 +972,9 @@ i8gemm_k_nld_m12:
 	ptrue p0.b
 	ptrue p1.s
 	ptrue p2.s, vl4           // first 4 .s lanes (one 128-bit quad) for deint stores
+	cntw x4
+	sub x4, x4, #4
+	whilelt p3.s, xzr, x4
 
 	index z0.s, #0, #1
 	and z0.s, z0.s, #2

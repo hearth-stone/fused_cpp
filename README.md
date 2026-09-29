@@ -40,10 +40,13 @@ uv pip install --python /path/to/vllm/.venv/bin/python pytest
 PYTHONPATH=src:. /path/to/vllm/.venv/bin/python -m pytest -q
 ```
 
-The unfiltered suite is validated on a VL256 Linux AArch64 build. Focused VL128
-MoE kernel tests pass, but the full VL128 suite is not yet a valid release check:
-the W8A8 path can abort the process. Keep the W8A8 tests in the suite so this
-gap remains visible.
+The unfiltered suite passes with matching VL128 and VL256 builds on Linux
+AArch64. To test a VL128 build on a host whose default VL is 256 bits, set the
+test process to a 16-byte SVE vector length before importing PyTorch:
+
+~~~bash
+PYTHONPATH=src:. /path/to/vllm/.venv/bin/python -c 'import ctypes, pytest; assert ctypes.CDLL(None).prctl(50, 16, 0, 0, 0) == 16; raise SystemExit(pytest.main(["-q"]))'
+~~~
 
 Model-level performance comparisons should use the same vLLM source, NUMA
 binding, model checkpoint, prompt token IDs, request spacing, and warmup for

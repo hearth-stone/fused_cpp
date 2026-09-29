@@ -93,6 +93,43 @@ def test_dynamic_scaled_mm_aligned_n_direct_scaled_store(out_dtype: torch.dtype)
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
+@pytest.mark.parametrize("M,K,n_tiles", [(1, 16, 1), (12, 64, 2)])
+@pytest.mark.parametrize("out_dtype", [torch.float32, torch.bfloat16])
+def test_dynamic_scaled_mm_direct_store_respects_output_boundary(
+    M: int, K: int, n_tiles: int, out_dtype: torch.dtype
+) -> None:
+    """A direct SVE store must leave storage beyond the output tensor untouched."""
+    base = i8gemm.prepare(torch.ones((8, 16), dtype=torch.int8), torch.ones(8))
+    n_tile = base.n_padded
+    N = n_tile * n_tiles
+    torch.manual_seed(23)
+    weight = torch.randint(-16, 17, (N, K), dtype=torch.int8)
+    weight_scale = torch.rand(N, dtype=torch.float32) * 0.05 + 0.01
+    bias = torch.randn(N, dtype=torch.bfloat16)
+    x = torch.randn(M, K, dtype=torch.bfloat16)
+    packed = i8gemm.prepare(weight, weight_scale)
+    assert packed.n_padded == N
+
+    storage = torch.full((M * N + n_tile,), 123.0, dtype=out_dtype)
+    out = storage[: M * N].view(M, N)
+    i8gemm._i8gemm_dynamic_scaled_mm(
+        out,
+        x,
+        packed.packed_weight,
+        packed.weight_scale,
+        bias,
+        packed.k,
+        packed.n,
+        packed.k_padded,
+        packed.n_padded,
+        1,
+    )
+
+    torch.testing.assert_close(storage[M * N :], torch.full_like(storage[M * N :], 123.0), atol=0, rtol=0)
+    expected = _reference_dynamic_scaled_mm(x, weight, weight_scale, bias=bias, out_dtype=out_dtype)
+    torch.testing.assert_close(out, expected, atol=0, rtol=0)
+
+
 def test_prepare_rejects_bad_layout_dtype() -> None:
     weight = torch.randn(4, 8)
     scale = torch.ones(4)

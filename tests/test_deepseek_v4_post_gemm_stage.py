@@ -764,18 +764,14 @@ def test_post_gemm_prepare_defaults_to_sve_without_attention_override(monkeypatc
         sve = prepare_deepseek_v4_post_gemm_weights(weight)
     except RuntimeError as error:
         if "does not support SVE BF16" in str(error):
-            pytest.skip("SVE BF16 JIT GEMM is unavailable")
+            pytest.skip("SVE BF16 GEMM is unavailable")
         raise
-
-    monkeypatch.setenv("FUSED_CPP_POST_GEMM_BACKEND", "neon")
-    neon = prepare_deepseek_v4_post_gemm_weights(weight)
 
     monkeypatch.delenv("FUSED_CPP_POST_GEMM_BACKEND")
     monkeypatch.setenv("FUSED_CPP_ATTN_GEMM_BACKEND", "sve")
     default = prepare_deepseek_v4_post_gemm_weights(weight)
     assert default.main_wq_b.n_padded == sve.main_wq_b.n_padded
     torch.testing.assert_close(default.main_wq_b.packed_weight, sve.main_wq_b.packed_weight, rtol=0.0, atol=0.0)
-    assert sve.main_wq_b.n_padded != neon.main_wq_b.n_padded
 
 
 @pytest.mark.skipif(
