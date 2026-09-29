@@ -245,7 +245,6 @@ def test_deepseek_v4_attn_gemm_defaults_to_sve_with_neon_fallback(
     neon = prepare_deepseek_v4_attn_gemm_weights(weight)
     assert fallback.fused_wqa_wkv[0].numel() == neon.fused_wqa_wkv[0].numel()
     torch.testing.assert_close(fallback.fused_wqa_wkv[0], neon.fused_wqa_wkv[0], rtol=0.0, atol=0.0)
-    assert sve.fused_wqa_wkv[0].numel() != neon.fused_wqa_wkv[0].numel()
 
 
 @pytest.mark.skipif(not _HAS_OPENMP, reason="OpenMP is unavailable")

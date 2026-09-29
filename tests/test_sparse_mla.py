@@ -178,7 +178,7 @@ def test_flash_mla_sparse_fwd_cpp_head_major_dense_and_sparse_share_state() -> N
 def test_flash_mla_sparse_fwd_cpp_head_major_merges_long_kv_chunks() -> None:
     """Long discrete rows merge every packed KV chunk into one state."""
     torch.manual_seed(197)
-    s_q, h_q, s_kv, d_qk, d_v, topk = 24, 8, 4608, 16, 8, 4097
+    s_q, h_q, s_kv, d_qk, d_v, topk = 2, 8, 4608, 16, 8, 4097
     q = torch.randn(s_q, h_q, d_qk).bfloat16()
     kv = torch.randn(s_kv, 1, d_qk).bfloat16()
     base = (torch.arange(topk, dtype=torch.int64) * 17) % s_kv

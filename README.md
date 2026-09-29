@@ -37,9 +37,13 @@ without vLLM.
 
 ```bash
 uv pip install --python /path/to/vllm/.venv/bin/python pytest
-PYTHONPATH=src:. /path/to/vllm/.venv/bin/python -m pytest -q \
-  -m 'not bench and not slow' tests
+PYTHONPATH=src:. /path/to/vllm/.venv/bin/python -m pytest -q
 ```
+
+The unfiltered suite is validated on a VL256 Linux AArch64 build. Focused VL128
+MoE kernel tests pass, but the full VL128 suite is not yet a valid release check:
+the W8A8 path can abort the process. Keep the W8A8 tests in the suite so this
+gap remains visible.
 
 Model-level performance comparisons should use the same vLLM source, NUMA
 binding, model checkpoint, prompt token IDs, request spacing, and warmup for

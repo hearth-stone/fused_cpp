@@ -30,8 +30,7 @@ explicit = true
 
 [tool.pytest.ini_options]
 markers = [
-    "bench: 性能基准测试（默认 skip，需 -m bench 触发）",
-    "slow: 大 shape / 长时间用例（默认 skip，需 -m slow 触发）",
+    "slow: 大 shape / 长时间用例",
 ]
 
 [tool.ruff]

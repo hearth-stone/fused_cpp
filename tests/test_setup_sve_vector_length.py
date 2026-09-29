@@ -60,15 +60,15 @@ def test_detect_max_sve_vector_bits_restores_original_configuration() -> None:
         return next(responses)
 
     assert _DETECT_MAX(fake_prctl) == 256
-    assert calls == [(51, 0), (50, 256), (50, 16)]
+    assert calls == [(51, 0), (50, 32), (50, 16)]
 
 
 def test_sve_vector_bits_explicit_override_skips_detection(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("FUSED_CPP_SVE_VECTOR_BITS", "512")
-    assert _SELECT_FOR_BUILD() == 512
+    monkeypatch.setenv("FUSED_CPP_SVE_VECTOR_BITS", "256")
+    assert _SELECT_FOR_BUILD() == 256
 
 
-@pytest.mark.parametrize("value", ["", "abc", "384", "4096"])
+@pytest.mark.parametrize("value", ["", "abc", "384", "512", "4096"])
 def test_sve_vector_bits_rejects_invalid_override(monkeypatch: pytest.MonkeyPatch, value: str) -> None:
     monkeypatch.setenv("FUSED_CPP_SVE_VECTOR_BITS", value)
     with pytest.raises(RuntimeError, match="FUSED_CPP_SVE_VECTOR_BITS"):
