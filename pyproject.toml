@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=64", "wheel", "torch"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fused-cpp"
+version = "0.1.0"
+description = "DeepSeek V4 CPU kernels for vLLM 0.28.0"
+requires-python = ">=3.9"
+dependencies = ["torch"]
+
+[project.optional-dependencies]
+test = [
+    "pytest",
+]
+
+# ── uv 专用：强制 Linux / Windows 上从 PyTorch 官方 CPU 索引拉取 torch ──
+# 本项目是 CPU-only 实现，PyPI 默认 wheel 在 linux x86_64 会带整套 nvidia-*-cu12 (~3GB)，
+# 通过显式声明 source 把它指向 pytorch-cpu 索引即可避免。
+# macOS / Linux aarch64 在 PyPI 上本身就是 CPU wheel，因此不在 marker 中包含，走默认 PyPI。
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cpu", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.pytest.ini_options]
+markers = [
+    "bench: 性能基准测试（默认 skip，需 -m bench 触发）",
+    "slow: 大 shape / 长时间用例（默认 skip，需 -m slow 触发）",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
+
+[tool.ruff.format]
+indent-style = "space"
+line-ending = "lf"
+quote-style = "double"

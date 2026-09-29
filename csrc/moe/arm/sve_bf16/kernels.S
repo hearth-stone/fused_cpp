@@ -1,0 +1,2178 @@
+// fused_cpp-owned SVE BF16 MoE kernels.
+//
+// This file intentionally does not export the upstream bf16gemm_k_* symbols.
+// The ABI matches the existing low-level GEMM entry points:
+//   x0 packed A (reorder-m8)
+//   x1 packed B (SVE N-tile layout)
+//   x2 C
+//   x3 unused A_reorder slot, or int64 route ids for direct-route W2 entries
+//   x4 gemm_params_t*
+//
+// Each entry computes a single M tile: m8/m4/m2/m1. The C++ dispatcher owns
+// the outer M loop and tail policy.
+
+	.text
+	.align 4
+
+	.macro SAVE_REGS
+	stp x19, x20, [sp, #-16]!
+	stp x21, x22, [sp, #-16]!
+	stp x23, x24, [sp, #-16]!
+	stp x25, x26, [sp, #-16]!
+	stp x27, x28, [sp, #-16]!
+	stp x29, x30, [sp, #-16]!
+	stp d8,  d9,  [sp, #-16]!
+	stp d10, d11, [sp, #-16]!
+	stp d12, d13, [sp, #-16]!
+	stp d14, d15, [sp, #-16]!
+	.endm
+
+	.macro RESTORE_REGS
+	ldp d14, d15, [sp], #16
+	ldp d12, d13, [sp], #16
+	ldp d10, d11, [sp], #16
+	ldp d8,  d9,  [sp], #16
+	ldp x29, x30, [sp], #16
+	ldp x27, x28, [sp], #16
+	ldp x25, x26, [sp], #16
+	ldp x23, x24, [sp], #16
+	ldp x21, x22, [sp], #16
+	ldp x19, x20, [sp], #16
+	.endm
+
+	.macro ADR_CONST reg, label
+#ifdef __APPLE__
+	adrp \reg, \label@PAGE
+	add  \reg, \reg, \label@PAGEOFF
+#else
+	adrp \reg, \label
+	add  \reg, \reg, :lo12:\label
+#endif
+	.endm
+
+	.macro ZERO_ACC_M8
+	mov z16.s, #0
+	mov z17.s, #0
+	mov z18.s, #0
+	mov z19.s, #0
+	mov z20.s, #0
+	mov z21.s, #0
+	mov z22.s, #0
+	mov z23.s, #0
+	mov z24.s, #0
+	mov z25.s, #0
+	mov z26.s, #0
+	mov z27.s, #0
+	mov z28.s, #0
+	mov z29.s, #0
+	mov z30.s, #0
+	mov z31.s, #0
+	.endm
+
+	.macro ZERO_ACC_M4
+	mov z16.s, #0
+	mov z17.s, #0
+	mov z18.s, #0
+	mov z19.s, #0
+	mov z20.s, #0
+	mov z21.s, #0
+	mov z22.s, #0
+	mov z23.s, #0
+	.endm
+
+	.macro ZERO_ACC_M2
+	mov z16.s, #0
+	mov z17.s, #0
+	mov z18.s, #0
+	mov z19.s, #0
+	.endm
+
+	.macro LOAD_AB_PACKED a0, a1, a2, a3, b0, b1, b2, b3
+	ld1h {\b0\().h}, p0/z, [x17]
+	ld1h {\b1\().h}, p0/z, [x17, #1, mul vl]
+	ld1h {\b2\().h}, p0/z, [x17, #2, mul vl]
+	ld1h {\b3\().h}, p0/z, [x17, #3, mul vl]
+	add x17, x17, x27, lsl #2
+	ld1rqh {\a0\().h}, p0/z, [x18]
+	ld1rqh {\a1\().h}, p0/z, [x18, #16]
+	ld1rqh {\a2\().h}, p0/z, [x18, #32]
+	ld1rqh {\a3\().h}, p0/z, [x18, #48]
+	add x18, x18, #64
+	.endm
+
+	.macro LOAD_AB_PACKED_M4 a0, a1, b0, b1, b2, b3
+	ld1h {\b0\().h}, p0/z, [x17]
+	ld1h {\b1\().h}, p0/z, [x17, #1, mul vl]
+	ld1h {\b2\().h}, p0/z, [x17, #2, mul vl]
+	ld1h {\b3\().h}, p0/z, [x17, #3, mul vl]
+	add x17, x17, x27, lsl #2
+	ld1rqh {\a0\().h}, p0/z, [x18]
+	ld1rqh {\a1\().h}, p0/z, [x18, #16]
+	add x18, x18, #64
+	.endm
+
+	.macro LOAD_AB_PACKED_M2 a0, b0, b1, b2, b3
+	ld1h {\b0\().h}, p0/z, [x17]
+	ld1h {\b1\().h}, p0/z, [x17, #1, mul vl]
+	ld1h {\b2\().h}, p0/z, [x17, #2, mul vl]
+	ld1h {\b3\().h}, p0/z, [x17, #3, mul vl]
+	add x17, x17, x27, lsl #2
+	ld1rqh {\a0\().h}, p0/z, [x18]
+	add x18, x18, #64
+	.endm
+
+	.macro BFMMLA_BLOCK_AB a0, a1, a2, a3, b0, b1, b2, b3
+	bfmmla z16.s, \a0\().h, \b0\().h
+	bfmmla z20.s, \a1\().h, \b0\().h
+	bfmmla z24.s, \a2\().h, \b0\().h
+	bfmmla z28.s, \a3\().h, \b0\().h
+	bfmmla z17.s, \a0\().h, \b1\().h
+	bfmmla z21.s, \a1\().h, \b1\().h
+	bfmmla z25.s, \a2\().h, \b1\().h
+	bfmmla z29.s, \a3\().h, \b1\().h
+	bfmmla z18.s, \a0\().h, \b2\().h
+	bfmmla z22.s, \a1\().h, \b2\().h
+	bfmmla z26.s, \a2\().h, \b2\().h
+	bfmmla z30.s, \a3\().h, \b2\().h
+	bfmmla z19.s, \a0\().h, \b3\().h
+	bfmmla z23.s, \a1\().h, \b3\().h
+	bfmmla z27.s, \a2\().h, \b3\().h
+	bfmmla z31.s, \a3\().h, \b3\().h
+	.endm
+
+	.macro BFMMLA_M4_AB a0, a1, b0, b1, b2, b3
+	bfmmla z16.s, \a0\().h, \b0\().h
+	bfmmla z20.s, \a1\().h, \b0\().h
+	bfmmla z17.s, \a0\().h, \b1\().h
+	bfmmla z21.s, \a1\().h, \b1\().h
+	bfmmla z18.s, \a0\().h, \b2\().h
+	bfmmla z22.s, \a1\().h, \b2\().h
+	bfmmla z19.s, \a0\().h, \b3\().h
+	bfmmla z23.s, \a1\().h, \b3\().h
+	.endm
+
+	.macro BFMMLA_M2_AB a0, b0, b1, b2, b3
+	bfmmla z16.s, \a0\().h, \b0\().h
+	bfmmla z17.s, \a0\().h, \b1\().h
+	bfmmla z18.s, \a0\().h, \b2\().h
+	bfmmla z19.s, \a0\().h, \b3\().h
+	.endm
+
+	.macro ZERO_ACC_M12
+	mov z8.s, #0
+	mov z9.s, #0
+	mov z10.s, #0
+	mov z11.s, #0
+	mov z12.s, #0
+	mov z13.s, #0
+	mov z14.s, #0
+	mov z15.s, #0
+	mov z16.s, #0
+	mov z17.s, #0
+	mov z18.s, #0
+	mov z19.s, #0
+	mov z20.s, #0
+	mov z21.s, #0
+	mov z22.s, #0
+	mov z23.s, #0
+	mov z24.s, #0
+	mov z25.s, #0
+	mov z26.s, #0
+	mov z27.s, #0
+	mov z28.s, #0
+	mov z29.s, #0
+	mov z30.s, #0
+	mov z31.s, #0
+	.endm
+
+	.macro BFMMLA_M12_2ROWS a0, a1, c00, c01, c02, c03, c10, c11, c12, c13
+	bfmmla \c00\().s, \a0\().h, z4.h
+	bfmmla \c10\().s, \a1\().h, z4.h
+	bfmmla \c01\().s, \a0\().h, z5.h
+	bfmmla \c11\().s, \a1\().h, z5.h
+	bfmmla \c02\().s, \a0\().h, z6.h
+	bfmmla \c12\().s, \a1\().h, z6.h
+	bfmmla \c03\().s, \a0\().h, z7.h
+	bfmmla \c13\().s, \a1\().h, z7.h
+	.endm
+
+	.macro BFMMLA_M12_2A
+	bfmmla z24.s, z0.h, z4.h
+	bfmmla z28.s, z1.h, z4.h
+	bfmmla z25.s, z0.h, z5.h
+	bfmmla z29.s, z1.h, z5.h
+	bfmmla z26.s, z0.h, z6.h
+	bfmmla z30.s, z1.h, z6.h
+	bfmmla z27.s, z0.h, z7.h
+	bfmmla z31.s, z1.h, z7.h
+	.endm
+
+	.macro M12_K4_BODY
+	ld1h {z4.h}, p0/z, [x17]
+	ld1h {z5.h}, p0/z, [x17, #1, mul vl]
+	ld1h {z6.h}, p0/z, [x17, #2, mul vl]
+	ld1h {z7.h}, p0/z, [x17, #3, mul vl]
+	add x17, x17, x27, lsl #2
+	ld1rqh {z0.h}, p0/z, [x18]
+	ld1rqh {z1.h}, p0/z, [x18, #16]
+	ld1rqh {z2.h}, p0/z, [x18, #32]
+	ld1rqh {z3.h}, p0/z, [x18, #48]
+	BFMMLA_M12_2ROWS z0, z1, z8, z9, z10, z11, z12, z13, z14, z15
+	ld1rqh {z0.h}, p0/z, [x18, #64]
+	ld1rqh {z1.h}, p0/z, [x18, #80]
+	BFMMLA_M12_2ROWS z2, z3, z16, z17, z18, z19, z20, z21, z22, z23
+	BFMMLA_M12_2A
+	add x18, x18, #96
+	.endm
+
+	.macro LOAD_PARTIAL_M12 base
+	addvl x7, \base, #8
+	addvl x8, \base, #16
+	ld1w {z8.s}, p1/z, [\base]
+	ld1w {z9.s}, p1/z, [\base, #1, mul vl]
+	ld1w {z10.s}, p1/z, [\base, #2, mul vl]
+	ld1w {z11.s}, p1/z, [\base, #3, mul vl]
+	ld1w {z12.s}, p1/z, [\base, #4, mul vl]
+	ld1w {z13.s}, p1/z, [\base, #5, mul vl]
+	ld1w {z14.s}, p1/z, [\base, #6, mul vl]
+	ld1w {z15.s}, p1/z, [\base, #7, mul vl]
+	ld1w {z16.s}, p1/z, [x7]
+	ld1w {z17.s}, p1/z, [x7, #1, mul vl]
+	ld1w {z18.s}, p1/z, [x7, #2, mul vl]
+	ld1w {z19.s}, p1/z, [x7, #3, mul vl]
+	ld1w {z20.s}, p1/z, [x7, #4, mul vl]
+	ld1w {z21.s}, p1/z, [x7, #5, mul vl]
+	ld1w {z22.s}, p1/z, [x7, #6, mul vl]
+	ld1w {z23.s}, p1/z, [x7, #7, mul vl]
+	ld1w {z24.s}, p1/z, [x8]
+	ld1w {z25.s}, p1/z, [x8, #1, mul vl]
+	ld1w {z26.s}, p1/z, [x8, #2, mul vl]
+	ld1w {z27.s}, p1/z, [x8, #3, mul vl]
+	ld1w {z28.s}, p1/z, [x8, #4, mul vl]
+	ld1w {z29.s}, p1/z, [x8, #5, mul vl]
+	ld1w {z30.s}, p1/z, [x8, #6, mul vl]
+	ld1w {z31.s}, p1/z, [x8, #7, mul vl]
+	.endm
+
+	.macro STORE_PARTIAL_M12 base
+	addvl x7, \base, #8
+	addvl x8, \base, #16
+	st1w {z8.s}, p1, [\base]
+	st1w {z9.s}, p1, [\base, #1, mul vl]
+	st1w {z10.s}, p1, [\base, #2, mul vl]
+	st1w {z11.s}, p1, [\base, #3, mul vl]
+	st1w {z12.s}, p1, [\base, #4, mul vl]
+	st1w {z13.s}, p1, [\base, #5, mul vl]
+	st1w {z14.s}, p1, [\base, #6, mul vl]
+	st1w {z15.s}, p1, [\base, #7, mul vl]
+	st1w {z16.s}, p1, [x7]
+	st1w {z17.s}, p1, [x7, #1, mul vl]
+	st1w {z18.s}, p1, [x7, #2, mul vl]
+	st1w {z19.s}, p1, [x7, #3, mul vl]
+	st1w {z20.s}, p1, [x7, #4, mul vl]
+	st1w {z21.s}, p1, [x7, #5, mul vl]
+	st1w {z22.s}, p1, [x7, #6, mul vl]
+	st1w {z23.s}, p1, [x7, #7, mul vl]
+	st1w {z24.s}, p1, [x8]
+	st1w {z25.s}, p1, [x8, #1, mul vl]
+	st1w {z26.s}, p1, [x8, #2, mul vl]
+	st1w {z27.s}, p1, [x8, #3, mul vl]
+	st1w {z28.s}, p1, [x8, #4, mul vl]
+	st1w {z29.s}, p1, [x8, #5, mul vl]
+	st1w {z30.s}, p1, [x8, #6, mul vl]
+	st1w {z31.s}, p1, [x8, #7, mul vl]
+	.endm
+
+	.macro LOAD_PARTIAL_M8 base
+	addvl x7, \base, #8
+	ld1w {z16.s}, p1/z, [\base]
+	ld1w {z17.s}, p1/z, [\base, #1, mul vl]
+	ld1w {z18.s}, p1/z, [\base, #2, mul vl]
+	ld1w {z19.s}, p1/z, [\base, #3, mul vl]
+	ld1w {z20.s}, p1/z, [\base, #4, mul vl]
+	ld1w {z21.s}, p1/z, [\base, #5, mul vl]
+	ld1w {z22.s}, p1/z, [\base, #6, mul vl]
+	ld1w {z23.s}, p1/z, [\base, #7, mul vl]
+	ld1w {z24.s}, p1/z, [x7]
+	ld1w {z25.s}, p1/z, [x7, #1, mul vl]
+	ld1w {z26.s}, p1/z, [x7, #2, mul vl]
+	ld1w {z27.s}, p1/z, [x7, #3, mul vl]
+	ld1w {z28.s}, p1/z, [x7, #4, mul vl]
+	ld1w {z29.s}, p1/z, [x7, #5, mul vl]
+	ld1w {z30.s}, p1/z, [x7, #6, mul vl]
+	ld1w {z31.s}, p1/z, [x7, #7, mul vl]
+	.endm
+
+	.macro STORE_PARTIAL_M8 base
+	addvl x7, \base, #8
+	st1w {z16.s}, p1, [\base]
+	st1w {z17.s}, p1, [\base, #1, mul vl]
+	st1w {z18.s}, p1, [\base, #2, mul vl]
+	st1w {z19.s}, p1, [\base, #3, mul vl]
+	st1w {z20.s}, p1, [\base, #4, mul vl]
+	st1w {z21.s}, p1, [\base, #5, mul vl]
+	st1w {z22.s}, p1, [\base, #6, mul vl]
+	st1w {z23.s}, p1, [\base, #7, mul vl]
+	st1w {z24.s}, p1, [x7]
+	st1w {z25.s}, p1, [x7, #1, mul vl]
+	st1w {z26.s}, p1, [x7, #2, mul vl]
+	st1w {z27.s}, p1, [x7, #3, mul vl]
+	st1w {z28.s}, p1, [x7, #4, mul vl]
+	st1w {z29.s}, p1, [x7, #5, mul vl]
+	st1w {z30.s}, p1, [x7, #6, mul vl]
+	st1w {z31.s}, p1, [x7, #7, mul vl]
+	.endm
+
+	.macro LOAD_PARTIAL_M4 base
+	ld1w {z16.s}, p1/z, [\base]
+	ld1w {z17.s}, p1/z, [\base, #1, mul vl]
+	ld1w {z18.s}, p1/z, [\base, #2, mul vl]
+	ld1w {z19.s}, p1/z, [\base, #3, mul vl]
+	ld1w {z20.s}, p1/z, [\base, #4, mul vl]
+	ld1w {z21.s}, p1/z, [\base, #5, mul vl]
+	ld1w {z22.s}, p1/z, [\base, #6, mul vl]
+	ld1w {z23.s}, p1/z, [\base, #7, mul vl]
+	.endm
+
+	.macro STORE_PARTIAL_M4 base
+	st1w {z16.s}, p1, [\base]
+	st1w {z17.s}, p1, [\base, #1, mul vl]
+	st1w {z18.s}, p1, [\base, #2, mul vl]
+	st1w {z19.s}, p1, [\base, #3, mul vl]
+	st1w {z20.s}, p1, [\base, #4, mul vl]
+	st1w {z21.s}, p1, [\base, #5, mul vl]
+	st1w {z22.s}, p1, [\base, #6, mul vl]
+	st1w {z23.s}, p1, [\base, #7, mul vl]
+	.endm
+
+	.macro LOAD_PARTIAL_M2 base
+	ld1w {z16.s}, p1/z, [\base]
+	ld1w {z17.s}, p1/z, [\base, #1, mul vl]
+	ld1w {z18.s}, p1/z, [\base, #2, mul vl]
+	ld1w {z19.s}, p1/z, [\base, #3, mul vl]
+	.endm
+
+	.macro STORE_PARTIAL_M2 base
+	st1w {z16.s}, p1, [\base]
+	st1w {z17.s}, p1, [\base, #1, mul vl]
+	st1w {z18.s}, p1, [\base, #2, mul vl]
+	st1w {z19.s}, p1, [\base, #3, mul vl]
+	.endm
+
+	.macro BUILD_C_OFFSETS
+	index z14.s, #0, #1
+	mov z15.d, z14.d
+	and z15.s, z15.s, #3
+	mov z9.d, z14.d
+	lsr z9.s, z9.s, #2
+	lsl z9.s, z9.s, #5
+	mov z13.d, z15.d
+	and z13.s, z13.s, #1
+	lsl z13.s, z13.s, #2
+	add z9.s, z9.s, z13.s
+	mov z12.d, z15.d
+	lsr z12.s, z12.s, #1
+	and z12.s, z12.s, #1
+	cmpeq p4.s, p1/z, z12.s, #0
+	dup z13.s, w25
+	mul z12.s, p1/m, z12.s, z13.s
+	add z9.s, z9.s, z12.s
+	.endm
+
+	.macro STORE_PAIR_F32 base, pred, a0, a1, a2, a3
+	add x3, \base, #8
+	add x4, \base, #16
+	add x5, \base, #24
+	st1w {\a0\().s}, \pred, [\base, z9.s, sxtw]
+	st1w {\a1\().s}, \pred, [x3, z9.s, sxtw]
+	st1w {\a2\().s}, \pred, [x4, z9.s, sxtw]
+	st1w {\a3\().s}, \pred, [x5, z9.s, sxtw]
+	.endm
+
+	.macro STORE_W2_PAIR base, row, a0, a1, a2, a3
+	cmp w19, #\row
+	b.le 940\@f
+	cmp w19, #(\row + 1)
+	b.eq 941\@f
+	STORE_PAIR_F32 \base, p1, \a0, \a1, \a2, \a3
+	b 940\@f
+941\@:
+	STORE_PAIR_F32 \base, p4, \a0, \a1, \a2, \a3
+940\@:
+	.endm
+
+	.macro BUILD_C_BF16_OFFSETS
+	index z14.s, #0, #1
+	mov z15.d, z14.d
+	and z15.s, z15.s, #3
+	mov z9.d, z14.d
+	lsr z9.s, z9.s, #2
+	lsl z9.s, z9.s, #4
+	mov z13.d, z15.d
+	and z13.s, z13.s, #1
+	lsl z13.s, z13.s, #1
+	add z9.s, z9.s, z13.s
+	mov z12.d, z15.d
+	lsr z12.s, z12.s, #1
+	and z12.s, z12.s, #1
+	cmpeq p4.s, p1/z, z12.s, #0
+	dup z13.s, w25
+	mul z12.s, p1/m, z12.s, z13.s
+	add z9.s, z9.s, z12.s
+	.endm
+
+	.macro STORE_PAIR_BF16 base, pred, a0, a1, a2, a3
+	add x3, \base, #4
+	add x4, \base, #8
+	add x5, \base, #12
+	bfcvt z13.h, p1/m, \a0\().s
+	st1h {z13.s}, \pred, [\base, z9.s, sxtw]
+	bfcvt z13.h, p1/m, \a1\().s
+	st1h {z13.s}, \pred, [x3, z9.s, sxtw]
+	bfcvt z13.h, p1/m, \a2\().s
+	st1h {z13.s}, \pred, [x4, z9.s, sxtw]
+	bfcvt z13.h, p1/m, \a3\().s
+	st1h {z13.s}, \pred, [x5, z9.s, sxtw]
+	.endm
+
+	.macro STORE_W2_PAIR_BF16 base, row, a0, a1, a2, a3
+	cmp w19, #\row
+	b.le 944\@f
+	cmp w19, #(\row + 1)
+	b.eq 945\@f
+	STORE_PAIR_BF16 \base, p1, \a0, \a1, \a2, \a3
+	b 944\@f
+945\@:
+	STORE_PAIR_BF16 \base, p4, \a0, \a1, \a2, \a3
+944\@:
+	.endm
+
+	.macro BUILD_PACKC_OFFSETS
+	index z0.s, #0, #1
+	mov z1.d, z0.d
+	lsr z1.s, z1.s, #2
+	lsl z1.s, z1.s, #6       // segment * 64 bytes
+	mov z2.d, z0.d
+	and z2.s, z2.s, #3
+	mov z3.d, z2.d
+	and z3.s, z3.s, #1
+	lsl z3.s, z3.s, #1       // col_bit * sizeof(bf16)
+	add z5.s, z1.s, z3.s
+	mov z4.d, z2.d
+	lsr z4.s, z4.s, #1
+	and z4.s, z4.s, #1       // row_bit inside the row pair
+	cmpeq p4.s, p1/z, z4.s, #0
+	lsl z4.s, z4.s, #3       // row_bit * 4 bf16 values
+	add z5.s, z5.s, z4.s
+	.endm
+
+	.macro BUILD_PACKC_OFFSETS_M12
+	index z0.s, #0, #1
+	mov z1.d, z0.d
+	lsr z1.s, z1.s, #2
+	mov z5.d, z1.d
+	lsl z1.s, z1.s, #6       // segment * 64 bytes
+	lsl z5.s, z5.s, #5       // segment * 32 bytes
+	add z5.s, z5.s, z1.s     // segment * 96 bytes
+	mov z2.d, z0.d
+	and z2.s, z2.s, #3
+	mov z3.d, z2.d
+	and z3.s, z3.s, #1
+	lsl z3.s, z3.s, #1       // col_bit * sizeof(bf16)
+	add z5.s, z5.s, z3.s
+	mov z4.d, z2.d
+	lsr z4.s, z4.s, #1
+	and z4.s, z4.s, #1       // row_bit inside the row pair
+	lsl z4.s, z4.s, #3       // row_bit * 4 bf16 values
+	add z5.s, z5.s, z4.s
+	.endm
+
+	.macro SILU_CONSTS_LOAD
+	ADR_CONST x3, .Lmoe_sve_silu_consts
+	ld1rw {z6.s}, p1/z, [x3]      // 1.0
+	add x3, x3, #4
+	ld1rw {z7.s}, p1/z, [x3]      // exp c0
+	add x3, x3, #4
+	ld1rw {z8.s}, p1/z, [x3]      // exp c1
+	add x3, x3, #4
+	ld1rw {z9.s}, p1/z, [x3]      // invln2
+	add x3, x3, #4
+	ld1rw {z10.s}, p1/z, [x3]     // ln2 high
+	add x3, x3, #4
+	ld1rw {z11.s}, p1/z, [x3]     // ln2 low
+	add x3, x3, #4
+	ld1rw {z12.s}, p1/z, [x3]     // FEXPA shift
+	add x3, x3, #4
+	ld1rw {z13.s}, p1/z, [x3]     // clamp_hi
+	add x3, x3, #4
+	ld1rw {z14.s}, p1/z, [x3]     // clamp_lo
+	add x3, x3, #4
+	ld1rw {z15.s}, p1/z, [x3]     // swiglu_limit
+	.endm
+
+	.macro SILU_TO_BF16 gate, up, deg
+	fneg z0.s, p1/m, \gate\().s
+	fmin z0.s, p1/m, z0.s, z13.s
+	fmax z0.s, p1/m, z0.s, z14.s
+	mov z1.d, z0.d
+	fmul z1.s, p1/m, z1.s, z9.s
+	fadd z1.s, p1/m, z1.s, z12.s
+	mov z2.d, z1.d
+	fsub z2.s, p1/m, z2.s, z12.s
+	fmls z0.s, p1/m, z2.s, z10.s
+	fmls z0.s, p1/m, z2.s, z11.s
+	fexpa z2.s, z1.s
+	mov z3.d, z8.d
+	mov z4.d, z7.d
+	fmla z4.s, p1/m, z3.s, z0.s
+	mov z3.d, z0.d
+	fmul z3.s, p1/m, z3.s, z4.s
+	fmla z2.s, p1/m, z2.s, z3.s
+	fadd z2.s, p1/m, z2.s, z6.s
+	mov z0.d, \gate\().d
+	fmul z0.s, p1/m, z0.s, \up\().s
+	fdiv z0.s, p1/m, z0.s, z2.s
+	bfcvt z0.h, p1/m, z0.s
+	.endm
+
+	.macro LOAD_SILU_CONST zd, byteoff
+	ADR_CONST x3, .Lmoe_sve_silu_consts
+	.if \byteoff != 0
+	add x3, x3, #\byteoff
+	.endif
+	ld1rw {\zd\().s}, p1/z, [x3]
+	.endm
+
+	// M12 optimized epilogue keeps the literal-table base in x7 for the whole
+	// output tile. x3 remains a temporary address/store register.
+	.macro LOAD_SILU_CONST_BASE zd, byteoff
+	.if \byteoff == 0
+	ld1rw {\zd\().s}, p1/z, [x7]
+	.else
+	add x3, x7, #\byteoff
+	ld1rw {\zd\().s}, p1/z, [x3]
+	.endif
+	.endm
+
+	.macro SILU_TO_BF16_LOW_TMP_BASE gate, up, deg
+	fneg z0.s, p1/m, \gate\().s
+	LOAD_SILU_CONST_BASE z4, 28
+	fmin z0.s, p1/m, z0.s, z4.s
+	LOAD_SILU_CONST_BASE z4, 32
+	fmax z0.s, p1/m, z0.s, z4.s
+	LOAD_SILU_CONST_BASE z4, 12
+	mov z1.d, z0.d
+	fmul z1.s, p1/m, z1.s, z4.s
+	LOAD_SILU_CONST_BASE z4, 24
+	fadd z1.s, p1/m, z1.s, z4.s
+	mov z2.d, z1.d
+	fsub z2.s, p1/m, z2.s, z4.s
+	LOAD_SILU_CONST_BASE z4, 16
+	fmls z0.s, p1/m, z2.s, z4.s
+	LOAD_SILU_CONST_BASE z4, 20
+	fmls z0.s, p1/m, z2.s, z4.s
+	fexpa z2.s, z1.s
+	LOAD_SILU_CONST_BASE z3, 8
+	LOAD_SILU_CONST_BASE z4, 4
+	fmla z4.s, p1/m, z3.s, z0.s
+	mov z3.d, z0.d
+	fmul z3.s, p1/m, z3.s, z4.s
+	fmla z2.s, p1/m, z2.s, z3.s
+	LOAD_SILU_CONST_BASE z4, 0
+	fadd z2.s, p1/m, z2.s, z4.s
+	mov z0.d, \gate\().d
+	fmul z0.s, p1/m, z0.s, \up\().s
+	fdiv z0.s, p1/m, z0.s, z2.s
+	bfcvt z0.h, p1/m, z0.s
+	.endm
+
+	// After rows 8..11 have been stored, z24..z31 are dead and can cache the
+	// constants that M12 could not keep live during BFMMLA. z5 remains the packC
+	// scatter offset vector; z0..z4 are arithmetic temporaries.
+	.macro SILU_CONSTS_LOAD_M12_CACHED
+	mov x3, x7
+	ld1rw {z6.s}, p1/z, [x3]       // 1.0
+	add x3, x3, #4
+	ld1rw {z7.s}, p1/z, [x3]       // exp c0
+	add x3, x3, #4
+	ld1rw {z24.s}, p1/z, [x3]      // exp c1
+	add x3, x3, #4
+	ld1rw {z25.s}, p1/z, [x3]      // invln2
+	add x3, x3, #4
+	ld1rw {z26.s}, p1/z, [x3]      // ln2 high
+	add x3, x3, #4
+	ld1rw {z27.s}, p1/z, [x3]      // ln2 low
+	add x3, x3, #4
+	ld1rw {z28.s}, p1/z, [x3]      // FEXPA shift
+	add x3, x3, #4
+	ld1rw {z29.s}, p1/z, [x3]      // clamp_hi
+	add x3, x3, #4
+	ld1rw {z30.s}, p1/z, [x3]      // clamp_lo
+	add x3, x3, #4
+	ld1rw {z31.s}, p1/z, [x3]      // swiglu_limit
+	.endm
+
+	// Compute both rows in a row-pair together. The independent chains use
+	// z0/z2/gate0/up0 and z1/z3/gate1/up1, allowing the two FDIV operations to
+	// overlap. Results replace gate0/gate1 as bf16 values ready for st1h.
+	.macro SILU_PAIR_TO_BF16_CACHED gate0, gate1, up0, up1, deg
+	fneg z0.s, p1/m, \gate0\().s
+	fneg z1.s, p1/m, \gate1\().s
+	fmin z0.s, p1/m, z0.s, z29.s
+	fmin z1.s, p1/m, z1.s, z29.s
+	fmax z0.s, p1/m, z0.s, z30.s
+	fmax z1.s, p1/m, z1.s, z30.s
+	fmul \gate0\().s, p1/m, \gate0\().s, \up0\().s
+	fmul \gate1\().s, p1/m, \gate1\().s, \up1\().s
+	mov z2.d, z0.d
+	mov z3.d, z1.d
+	fmul z2.s, p1/m, z2.s, z25.s
+	fmul z3.s, p1/m, z3.s, z25.s
+	fadd z2.s, p1/m, z2.s, z28.s
+	fadd z3.s, p1/m, z3.s, z28.s
+	mov \up0\().d, z2.d
+	mov \up1\().d, z3.d
+	fsub \up0\().s, p1/m, \up0\().s, z28.s
+	fsub \up1\().s, p1/m, \up1\().s, z28.s
+	fmls z0.s, p1/m, \up0\().s, z26.s
+	fmls z1.s, p1/m, \up1\().s, z26.s
+	fmls z0.s, p1/m, \up0\().s, z27.s
+	fmls z1.s, p1/m, \up1\().s, z27.s
+	fexpa \up0\().s, z2.s
+	fexpa \up1\().s, z3.s
+	mov z2.d, z24.d
+	mov z3.d, z24.d
+	fmla z2.s, p1/m, z0.s, z7.s
+	fmla z3.s, p1/m, z1.s, z7.s
+	fmul z2.s, p1/m, z2.s, z0.s
+	fmul z3.s, p1/m, z3.s, z1.s
+	fmla \up0\().s, p1/m, \up0\().s, z2.s
+	fmla \up1\().s, p1/m, \up1\().s, z3.s
+	fadd \up0\().s, p1/m, \up0\().s, z6.s
+	fadd \up1\().s, p1/m, \up1\().s, z6.s
+	fdiv \gate0\().s, p1/m, \gate0\().s, \up0\().s
+	fdiv \gate1\().s, p1/m, \gate1\().s, \up1\().s
+	bfcvt \gate0\().h, p1/m, \gate0\().s
+	bfcvt \gate1\().h, p1/m, \gate1\().s
+	.endm
+
+	.macro STORE_PACKC_PAIR base, pred, g0, g1, u0, u1, deg
+	SILU_TO_BF16 \g0, \u0, \deg
+	st1h {z0.s}, \pred, [\base, z5.s, sxtw]
+	SILU_TO_BF16 \g1, \u1, \deg
+	add x3, \base, #4
+	st1h {z0.s}, \pred, [x3, z5.s, sxtw]
+	.endm
+
+	.macro STORE_PACKC_PAIR_GUARDED base, row, g0, g1, u0, u1, deg
+	cmp w19, #\row
+	b.le 950\@f
+	cmp w19, #(\row + 1)
+	b.eq 951\@f
+	STORE_PACKC_PAIR \base, p1, \g0, \g1, \u0, \u1, \deg
+	b 950\@f
+951\@:
+	STORE_PACKC_PAIR \base, p4, \g0, \g1, \u0, \u1, \deg
+950\@:
+	.endm
+
+	.macro STORE_PACKC_M8 deg
+	BUILD_PACKC_OFFSETS
+	SILU_CONSTS_LOAD
+	mov x16, x12
+	STORE_PACKC_PAIR_GUARDED x16, 0, z16, z17, z18, z19, \deg
+	add x16, x12, #16
+	STORE_PACKC_PAIR_GUARDED x16, 2, z20, z21, z22, z23, \deg
+	add x16, x12, #32
+	STORE_PACKC_PAIR_GUARDED x16, 4, z24, z25, z26, z27, \deg
+	add x16, x12, #48
+	STORE_PACKC_PAIR_GUARDED x16, 6, z28, z29, z30, z31, \deg
+	.endm
+
+	.macro STORE_PACKC_M4 deg
+	BUILD_PACKC_OFFSETS
+	SILU_CONSTS_LOAD
+	mov x16, x12
+	STORE_PACKC_PAIR_GUARDED x16, 0, z16, z17, z18, z19, \deg
+	add x16, x12, #16
+	STORE_PACKC_PAIR_GUARDED x16, 2, z20, z21, z22, z23, \deg
+	.endm
+
+	.macro STORE_PACKC_M2 deg
+	BUILD_PACKC_OFFSETS
+	SILU_CONSTS_LOAD
+	mov x16, x12
+	STORE_PACKC_PAIR_GUARDED x16, 0, z16, z17, z18, z19, \deg
+	.endm
+
+	.macro STORE_PACKC_PAIR_M12_BASE base, g0, g1, u0, u1, deg
+	SILU_TO_BF16_LOW_TMP_BASE \g0, \u0, \deg
+	st1h {z0.s}, p1, [\base, z5.s, sxtw]
+	SILU_TO_BF16_LOW_TMP_BASE \g1, \u1, \deg
+	add x3, \base, #4
+	st1h {z0.s}, p1, [x3, z5.s, sxtw]
+	.endm
+
+	.macro STORE_PACKC_PAIR_M12_CACHED base, g0, g1, u0, u1, deg
+	SILU_PAIR_TO_BF16_CACHED \g0, \g1, \u0, \u1, \deg
+	st1h {\g0\().s}, p1, [\base, z5.s, sxtw]
+	add x3, \base, #4
+	st1h {\g1\().s}, p1, [x3, z5.s, sxtw]
+	.endm
+
+	.macro STORE_PACKC_M12_OPT deg
+	BUILD_PACKC_OFFSETS_M12
+	ADR_CONST x7, .Lmoe_sve_silu_consts
+	// Free z24..z31 first. These four output rows use the low-register path,
+	// but share one literal-table base instead of rebuilding it per constant.
+	add x16, x12, #64
+	STORE_PACKC_PAIR_M12_BASE x16, z24, z25, z26, z27, \deg
+	add x16, x12, #80
+	STORE_PACKC_PAIR_M12_BASE x16, z28, z29, z30, z31, \deg
+	// Cache all constants in the now-dead accumulators, then process the other
+	// four row-pairs with two independent arithmetic/divide chains.
+	SILU_CONSTS_LOAD_M12_CACHED
+	mov x16, x12
+	STORE_PACKC_PAIR_M12_CACHED x16, z8, z9, z10, z11, \deg
+	add x16, x12, #16
+	STORE_PACKC_PAIR_M12_CACHED x16, z12, z13, z14, z15, \deg
+	add x16, x12, #32
+	STORE_PACKC_PAIR_M12_CACHED x16, z16, z17, z18, z19, \deg
+	add x16, x12, #48
+	STORE_PACKC_PAIR_M12_CACHED x16, z20, z21, z22, z23, \deg
+	.endm
+
+	.macro STORE_W2_M8
+	BUILD_C_OFFSETS
+	mov x16, x12
+	STORE_W2_PAIR x16, 0, z16, z17, z18, z19
+	add x16, x12, x25, lsl #1
+	STORE_W2_PAIR x16, 2, z20, z21, z22, z23
+	add x16, x12, x25, lsl #2
+	STORE_W2_PAIR x16, 4, z24, z25, z26, z27
+	add x16, x16, x25, lsl #1
+	STORE_W2_PAIR x16, 6, z28, z29, z30, z31
+	.endm
+
+	.macro STORE_W2_M4
+	BUILD_C_OFFSETS
+	mov x16, x12
+	STORE_W2_PAIR x16, 0, z16, z17, z18, z19
+	add x16, x12, x25, lsl #1
+	STORE_W2_PAIR x16, 2, z20, z21, z22, z23
+	.endm
+
+	.macro STORE_W2_M2
+	BUILD_C_OFFSETS
+	mov x16, x12
+	STORE_W2_PAIR x16, 0, z16, z17, z18, z19
+	.endm
+
+	.macro BUILD_C_DIRECT_OFFSETS
+	index z9.s, #0, #1
+	mov z10.d, z9.d
+	and z10.s, z10.s, #3
+	mov z11.d, z9.d
+	lsr z11.s, z11.s, #2
+	lsl z11.s, z11.s, #5
+	mov z12.d, z10.d
+	and z12.s, z12.s, #1
+	lsl z12.s, z12.s, #2
+	add z9.s, z11.s, z12.s
+	lsr z10.s, z10.s, #1
+	and z10.s, z10.s, #1
+	cmpeq p4.s, p1/z, z10.s, #0
+	.endm
+
+	.macro STORE_PAIR_W2_OFFSETS base, pred, offsets, a0, a1, a2, a3
+	add x3, \base, #8
+	add x4, \base, #16
+	add x5, \base, #24
+	st1w {\a0\().s}, \pred, [\base, \offsets\().s, sxtw]
+	st1w {\a1\().s}, \pred, [x3, \offsets\().s, sxtw]
+	st1w {\a2\().s}, \pred, [x4, \offsets\().s, sxtw]
+	st1w {\a3\().s}, \pred, [x5, \offsets\().s, sxtw]
+	.endm
+
+	.macro STORE_W2_PAIR_DIRECT row, a0, a1, a2, a3
+	cmp w19, #\row
+	b.le 942\@f
+	cmp w19, #(\row + 1)
+	b.eq 943\@f
+	// Keep w6 (store mode) and w22 (K-chunk start) intact across N tiles.
+	ldp x8, x7, [x29, #(\row * 8)]
+	madd x16, x8, x25, x12
+	sub x7, x7, x8
+	mul x7, x7, x25
+	mov z11.d, z9.d
+	dup z12.s, w7
+	mul z12.s, p1/m, z12.s, z10.s
+	add z11.s, z11.s, z12.s
+	STORE_PAIR_W2_OFFSETS x16, p1, z11, \a0, \a1, \a2, \a3
+	b 942\@f
+943\@:
+	ldr x8, [x29, #(\row * 8)]
+	madd x16, x8, x25, x12
+	STORE_PAIR_W2_OFFSETS x16, p4, z9, \a0, \a1, \a2, \a3
+942\@:
+	.endm
+
+	.macro STORE_W2_M8_DIRECT
+	BUILD_C_DIRECT_OFFSETS
+	STORE_W2_PAIR_DIRECT 0, z16, z17, z18, z19
+	STORE_W2_PAIR_DIRECT 2, z20, z21, z22, z23
+	STORE_W2_PAIR_DIRECT 4, z24, z25, z26, z27
+	STORE_W2_PAIR_DIRECT 6, z28, z29, z30, z31
+	.endm
+
+	.macro STORE_W2_M4_DIRECT
+	BUILD_C_DIRECT_OFFSETS
+	STORE_W2_PAIR_DIRECT 0, z16, z17, z18, z19
+	STORE_W2_PAIR_DIRECT 2, z20, z21, z22, z23
+	.endm
+
+	.macro STORE_W2_M2_DIRECT
+	BUILD_C_DIRECT_OFFSETS
+	STORE_W2_PAIR_DIRECT 0, z16, z17, z18, z19
+	.endm
+
+	.macro BUILD_C_DIRECT_BF16_OFFSETS
+	index z9.s, #0, #1
+	mov z10.d, z9.d
+	and z10.s, z10.s, #3
+	mov z11.d, z9.d
+	lsr z11.s, z11.s, #2
+	lsl z11.s, z11.s, #4
+	mov z12.d, z10.d
+	and z12.s, z12.s, #1
+	lsl z12.s, z12.s, #1
+	add z9.s, z11.s, z12.s
+	lsr z10.s, z10.s, #1
+	and z10.s, z10.s, #1
+	cmpeq p4.s, p1/z, z10.s, #0
+	.endm
+
+	.macro STORE_PAIR_W2_OFFSETS_BF16 base, pred, offsets, a0, a1, a2, a3
+	add x3, \base, #4
+	add x4, \base, #8
+	add x5, \base, #12
+	bfcvt z13.h, p1/m, \a0\().s
+	st1h {z13.s}, \pred, [\base, \offsets\().s, sxtw]
+	bfcvt z13.h, p1/m, \a1\().s
+	st1h {z13.s}, \pred, [x3, \offsets\().s, sxtw]
+	bfcvt z13.h, p1/m, \a2\().s
+	st1h {z13.s}, \pred, [x4, \offsets\().s, sxtw]
+	bfcvt z13.h, p1/m, \a3\().s
+	st1h {z13.s}, \pred, [x5, \offsets\().s, sxtw]
+	.endm
+
+	.macro STORE_W2_PAIR_DIRECT_BF16 row, a0, a1, a2, a3
+	cmp w19, #\row
+	b.le 948\@f
+	cmp w19, #(\row + 1)
+	b.eq 949\@f
+	ldp x8, x7, [x29, #(\row * 8)]
+	madd x16, x8, x25, x12
+	sub x7, x7, x8
+	mul x7, x7, x25
+	mov z11.d, z9.d
+	dup z12.s, w7
+	mul z12.s, p1/m, z12.s, z10.s
+	add z11.s, z11.s, z12.s
+	STORE_PAIR_W2_OFFSETS_BF16 x16, p1, z11, \a0, \a1, \a2, \a3
+	b 948\@f
+949\@:
+	ldr x8, [x29, #(\row * 8)]
+	madd x16, x8, x25, x12
+	STORE_PAIR_W2_OFFSETS_BF16 x16, p4, z9, \a0, \a1, \a2, \a3
+948\@:
+	.endm
+
+	.macro STORE_W2_M8_DIRECT_BF16
+	BUILD_C_DIRECT_BF16_OFFSETS
+	STORE_W2_PAIR_DIRECT_BF16 0, z16, z17, z18, z19
+	STORE_W2_PAIR_DIRECT_BF16 2, z20, z21, z22, z23
+	STORE_W2_PAIR_DIRECT_BF16 4, z24, z25, z26, z27
+	STORE_W2_PAIR_DIRECT_BF16 6, z28, z29, z30, z31
+	.endm
+
+	.macro STORE_W2_M4_DIRECT_BF16
+	BUILD_C_DIRECT_BF16_OFFSETS
+	STORE_W2_PAIR_DIRECT_BF16 0, z16, z17, z18, z19
+	STORE_W2_PAIR_DIRECT_BF16 2, z20, z21, z22, z23
+	.endm
+
+	.macro STORE_W2_M2_DIRECT_BF16
+	BUILD_C_DIRECT_BF16_OFFSETS
+	STORE_W2_PAIR_DIRECT_BF16 0, z16, z17, z18, z19
+	.endm
+
+	.macro STORE_W2_M8_BF16
+	BUILD_C_BF16_OFFSETS
+	mov x16, x12
+	STORE_W2_PAIR_BF16 x16, 0, z16, z17, z18, z19
+	add x16, x12, x25, lsl #1
+	STORE_W2_PAIR_BF16 x16, 2, z20, z21, z22, z23
+	add x16, x12, x25, lsl #2
+	STORE_W2_PAIR_BF16 x16, 4, z24, z25, z26, z27
+	add x16, x16, x25, lsl #1
+	STORE_W2_PAIR_BF16 x16, 6, z28, z29, z30, z31
+	.endm
+
+	.macro STORE_W2_M4_BF16
+	BUILD_C_BF16_OFFSETS
+	mov x16, x12
+	STORE_W2_PAIR_BF16 x16, 0, z16, z17, z18, z19
+	add x16, x12, x25, lsl #1
+	STORE_W2_PAIR_BF16 x16, 2, z20, z21, z22, z23
+	.endm
+
+	.macro STORE_W2_M2_BF16
+	BUILD_C_BF16_OFFSETS
+	mov x16, x12
+	STORE_W2_PAIR_BF16 x16, 0, z16, z17, z18, z19
+	.endm
+
+	.macro BUILD_C_OFFSETS_M12
+	index z0.s, #0, #1
+	mov z1.d, z0.d
+	and z1.s, z1.s, #3
+	mov z2.d, z0.d
+	lsr z2.s, z2.s, #2
+	lsl z2.s, z2.s, #5
+	mov z3.d, z1.d
+	and z3.s, z3.s, #1
+	lsl z3.s, z3.s, #2
+	add z0.s, z2.s, z3.s
+	mov z2.d, z1.d
+	lsr z2.s, z2.s, #1
+	and z2.s, z2.s, #1
+	dup z3.s, w25
+	mul z2.s, p1/m, z2.s, z3.s
+	add z0.s, z0.s, z2.s
+	.endm
+
+	.macro STORE_PAIR_W2_M12 base, a0, a1, a2, a3
+	add x3, \base, #8
+	add x4, \base, #16
+	add x5, \base, #24
+	st1w {\a0\().s}, p1, [\base, z0.s, sxtw]
+	st1w {\a1\().s}, p1, [x3, z0.s, sxtw]
+	st1w {\a2\().s}, p1, [x4, z0.s, sxtw]
+	st1w {\a3\().s}, p1, [x5, z0.s, sxtw]
+	.endm
+
+	.macro STORE_W2_M12
+	BUILD_C_OFFSETS_M12
+	mov x16, x12
+	STORE_PAIR_W2_M12 x16, z8, z9, z10, z11
+	add x16, x12, x25, lsl #1
+	STORE_PAIR_W2_M12 x16, z12, z13, z14, z15
+	add x16, x12, x25, lsl #2
+	STORE_PAIR_W2_M12 x16, z16, z17, z18, z19
+	add x16, x16, x25, lsl #1
+	STORE_PAIR_W2_M12 x16, z20, z21, z22, z23
+	add x16, x12, x25, lsl #3
+	STORE_PAIR_W2_M12 x16, z24, z25, z26, z27
+	add x16, x16, x25, lsl #1
+	STORE_PAIR_W2_M12 x16, z28, z29, z30, z31
+	.endm
+
+	// Direct-route stores retain the BFMMLA accumulator layout but replace the
+	// fixed ldc row stride with the distance between two routed output rows.
+	// The C++ dispatcher guarantees that the signed byte delta fits in int32.
+	.macro BUILD_C_DIRECT_OFFSETS_M12
+	index z0.s, #0, #1
+	mov z1.d, z0.d
+	and z1.s, z1.s, #3
+	mov z2.d, z0.d
+	lsr z2.s, z2.s, #2
+	lsl z2.s, z2.s, #5
+	mov z3.d, z1.d
+	and z3.s, z3.s, #1
+	lsl z3.s, z3.s, #2
+	add z0.s, z2.s, z3.s
+	lsr z1.s, z1.s, #1
+	and z1.s, z1.s, #1
+	cmpeq p4.s, p1/z, z1.s, #0
+	.endm
+
+	.macro STORE_PAIR_W2_M12_OFFSETS base, pred, offsets, a0, a1, a2, a3
+	add x3, \base, #8
+	add x4, \base, #16
+	add x5, \base, #24
+	st1w {\a0\().s}, \pred, [\base, \offsets\().s, sxtw]
+	st1w {\a1\().s}, \pred, [x3, \offsets\().s, sxtw]
+	st1w {\a2\().s}, \pred, [x4, \offsets\().s, sxtw]
+	st1w {\a3\().s}, \pred, [x5, \offsets\().s, sxtw]
+	.endm
+
+	.macro STORE_W2_PAIR_DIRECT_M12 row, a0, a1, a2, a3
+	cmp w19, #\row
+	b.le 946\@f
+	cmp w19, #(\row + 1)
+	b.eq 947\@f
+	// Keep w6 (store mode) and w22 (K-chunk start) intact across N tiles.
+	ldp x8, x7, [x29, #(\row * 8)]
+	madd x16, x8, x25, x12
+	sub x7, x7, x8
+	mul x7, x7, x25
+	mov z2.d, z0.d
+	dup z3.s, w7
+	mul z3.s, p1/m, z3.s, z1.s
+	add z2.s, z2.s, z3.s
+	STORE_PAIR_W2_M12_OFFSETS x16, p1, z2, \a0, \a1, \a2, \a3
+	b 946\@f
+947\@:
+	ldr x8, [x29, #(\row * 8)]
+	madd x16, x8, x25, x12
+	STORE_PAIR_W2_M12_OFFSETS x16, p4, z0, \a0, \a1, \a2, \a3
+946\@:
+	.endm
+
+	.macro STORE_W2_M12_DIRECT
+	BUILD_C_DIRECT_OFFSETS_M12
+	STORE_W2_PAIR_DIRECT_M12 0,  z8,  z9,  z10, z11
+	STORE_W2_PAIR_DIRECT_M12 2,  z12, z13, z14, z15
+	STORE_W2_PAIR_DIRECT_M12 4,  z16, z17, z18, z19
+	STORE_W2_PAIR_DIRECT_M12 6,  z20, z21, z22, z23
+	STORE_W2_PAIR_DIRECT_M12 8,  z24, z25, z26, z27
+	STORE_W2_PAIR_DIRECT_M12 10, z28, z29, z30, z31
+	.endm
+
+	.macro BUILD_C_DIRECT_BF16_OFFSETS_M12
+	index z0.s, #0, #1
+	mov z1.d, z0.d
+	and z1.s, z1.s, #3
+	mov z2.d, z0.d
+	lsr z2.s, z2.s, #2
+	lsl z2.s, z2.s, #4
+	mov z3.d, z1.d
+	and z3.s, z3.s, #1
+	lsl z3.s, z3.s, #1
+	add z0.s, z2.s, z3.s
+	lsr z1.s, z1.s, #1
+	and z1.s, z1.s, #1
+	cmpeq p4.s, p1/z, z1.s, #0
+	.endm
+
+	.macro STORE_PAIR_W2_M12_OFFSETS_BF16 base, pred, offsets, a0, a1, a2, a3
+	add x3, \base, #4
+	add x4, \base, #8
+	add x5, \base, #12
+	bfcvt z4.h, p1/m, \a0\().s
+	st1h {z4.s}, \pred, [\base, \offsets\().s, sxtw]
+	bfcvt z4.h, p1/m, \a1\().s
+	st1h {z4.s}, \pred, [x3, \offsets\().s, sxtw]
+	bfcvt z4.h, p1/m, \a2\().s
+	st1h {z4.s}, \pred, [x4, \offsets\().s, sxtw]
+	bfcvt z4.h, p1/m, \a3\().s
+	st1h {z4.s}, \pred, [x5, \offsets\().s, sxtw]
+	.endm
+
+	.macro STORE_W2_PAIR_DIRECT_BF16_M12 row, a0, a1, a2, a3
+	cmp w19, #\row
+	b.le 954\@f
+	cmp w19, #(\row + 1)
+	b.eq 955\@f
+	ldp x8, x7, [x29, #(\row * 8)]
+	madd x16, x8, x25, x12
+	sub x7, x7, x8
+	mul x7, x7, x25
+	mov z2.d, z0.d
+	dup z3.s, w7
+	mul z3.s, p1/m, z3.s, z1.s
+	add z2.s, z2.s, z3.s
+	STORE_PAIR_W2_M12_OFFSETS_BF16 x16, p1, z2, \a0, \a1, \a2, \a3
+	b 954\@f
+955\@:
+	ldr x8, [x29, #(\row * 8)]
+	madd x16, x8, x25, x12
+	STORE_PAIR_W2_M12_OFFSETS_BF16 x16, p4, z0, \a0, \a1, \a2, \a3
+954\@:
+	.endm
+
+	.macro STORE_W2_M12_DIRECT_BF16
+	BUILD_C_DIRECT_BF16_OFFSETS_M12
+	STORE_W2_PAIR_DIRECT_BF16_M12 0,  z8,  z9,  z10, z11
+	STORE_W2_PAIR_DIRECT_BF16_M12 2,  z12, z13, z14, z15
+	STORE_W2_PAIR_DIRECT_BF16_M12 4,  z16, z17, z18, z19
+	STORE_W2_PAIR_DIRECT_BF16_M12 6,  z20, z21, z22, z23
+	STORE_W2_PAIR_DIRECT_BF16_M12 8,  z24, z25, z26, z27
+	STORE_W2_PAIR_DIRECT_BF16_M12 10, z28, z29, z30, z31
+	.endm
+
+	.macro BUILD_C_BF16_OFFSETS_M12
+	index z0.s, #0, #1
+	mov z1.d, z0.d
+	and z1.s, z1.s, #3
+	mov z2.d, z0.d
+	lsr z2.s, z2.s, #2
+	lsl z2.s, z2.s, #4
+	mov z3.d, z1.d
+	and z3.s, z3.s, #1
+	lsl z3.s, z3.s, #1
+	add z0.s, z2.s, z3.s
+	mov z2.d, z1.d
+	lsr z2.s, z2.s, #1
+	and z2.s, z2.s, #1
+	dup z3.s, w25
+	mul z2.s, p1/m, z2.s, z3.s
+	add z0.s, z0.s, z2.s
+	.endm
+
+	.macro STORE_PAIR_W2_M12_BF16 base, a0, a1, a2, a3
+	add x3, \base, #4
+	add x4, \base, #8
+	add x5, \base, #12
+	bfcvt z4.h, p1/m, \a0\().s
+	st1h {z4.s}, p1, [\base, z0.s, sxtw]
+	bfcvt z4.h, p1/m, \a1\().s
+	st1h {z4.s}, p1, [x3, z0.s, sxtw]
+	bfcvt z4.h, p1/m, \a2\().s
+	st1h {z4.s}, p1, [x4, z0.s, sxtw]
+	bfcvt z4.h, p1/m, \a3\().s
+	st1h {z4.s}, p1, [x5, z0.s, sxtw]
+	.endm
+
+	.macro STORE_W2_M12_BF16
+	BUILD_C_BF16_OFFSETS_M12
+	mov x16, x12
+	STORE_PAIR_W2_M12_BF16 x16, z8, z9, z10, z11
+	add x16, x12, x25, lsl #1
+	STORE_PAIR_W2_M12_BF16 x16, z12, z13, z14, z15
+	add x16, x12, x25, lsl #2
+	STORE_PAIR_W2_M12_BF16 x16, z16, z17, z18, z19
+	add x16, x16, x25, lsl #1
+	STORE_PAIR_W2_M12_BF16 x16, z20, z21, z22, z23
+	add x16, x12, x25, lsl #3
+	STORE_PAIR_W2_M12_BF16 x16, z24, z25, z26, z27
+	add x16, x16, x25, lsl #1
+	STORE_PAIR_W2_M12_BF16 x16, z28, z29, z30, z31
+	.endm
+
+	.p2align 4
+moe_sve_kernel_m12_rows:
+	SAVE_REGS
+	ldr w22, [x4]             // total M rows, multiple of 12
+	ldr w20, [x4, #4]         // K
+	ldr w21, [x4, #8]         // N columns in this slice
+	ldr w23, [x4, #20]        // ldc
+	mov x28, x0               // current packed A block
+	mov x29, x2               // current C block
+	cntb x27
+	lsr x9, x27, #1           // SVE N tile in bf16 columns
+	mul x13, x20, x27         // packed-B bytes per SVE N tile
+	lsl x24, x27, #2
+	add x24, x24, x27, lsl #1 // M12 packC advance per N tile: VL * 6 bytes
+	lsl x26, x20, #4
+	add x26, x26, x20, lsl #3 // A advance per M12 block: K * 24 bytes
+	lsl x19, x23, #4
+	add x19, x19, x23, lsl #3 // C advance per M12 block: ldc * 24 bytes
+	ptrue p0.b
+	ptrue p1.s
+
+.L_m12_rows_loop:
+	cmp w22, #12
+	b.lt .L_m12_rows_done
+	mov x11, x1
+	mov x12, x29
+	mov w10, w21
+
+.L_m12_rows_n_loop:
+	cmp w10, #0
+	b.le .L_m12_rows_next_m
+	ZERO_ACC_M12
+	mov x17, x11
+	mov x18, x28
+	mov w15, w20
+
+.L_m12_rows_k_loop:
+	M12_K4_BODY
+	M12_K4_BODY
+	subs w15, w15, #8
+	b.gt .L_m12_rows_k_loop
+
+	cmp w6, #14
+	b.eq .L_m12_rows_store_opt_p4
+	cmp w6, #15
+	b.eq .L_m12_rows_store_opt_p5
+	cmp w6, #16
+	b.eq .L_m12_rows_store_opt_p6
+	STORE_PACKC_M12_OPT 6
+	b .L_m12_rows_advance_n
+.L_m12_rows_store_opt_p4:
+	STORE_PACKC_M12_OPT 4
+	b .L_m12_rows_advance_n
+.L_m12_rows_store_opt_p5:
+	STORE_PACKC_M12_OPT 5
+	b .L_m12_rows_advance_n
+.L_m12_rows_store_opt_p6:
+	STORE_PACKC_M12_OPT 6
+	b .L_m12_rows_advance_n
+.L_m12_rows_advance_n:
+	add x12, x12, x24
+	add x11, x11, x13
+	sub w10, w10, w9
+	b .L_m12_rows_n_loop
+
+.L_m12_rows_next_m:
+	add x28, x28, x26
+	add x29, x29, x19
+	sub w22, w22, #12
+	b .L_m12_rows_loop
+
+.L_m12_rows_done:
+	RESTORE_REGS
+	ret
+
+	.p2align 4
+moe_sve_kernel_m12:
+	SAVE_REGS
+	ldp w19, w20, [x4]        // valid M rows, K
+	ldr w21, [x4, #8]         // N columns in this slice
+	ldr w23, [x4, #20]        // ldc
+	mov x28, x0               // packed A
+	mov x29, x3               // direct-route row ids (mode 3)
+	cntb x27
+	lsr x9, x27, #1           // SVE N tile in bf16 columns
+	lsl x25, x23, #2          // f32 ldc bytes
+	mul x13, x20, x27         // packed-B bytes per SVE N tile
+	lsl x14, x27, #1          // row-major f32 C advance per N tile
+	lsl x24, x27, #2
+	add x24, x24, x27, lsl #1 // M12 packC advance per N tile: VL * 6 bytes
+	ptrue p0.b
+	ptrue p1.s
+	cmp w6, #2
+	b.eq .L_m12_store_mode_bf16
+	cmp w6, #44
+	b.ne .L_m12_store_mode_ready
+.L_m12_store_mode_bf16:
+	lsl x25, x23, #1          // bf16 ldc bytes
+	mov x14, x27              // row-major bf16 C advance per N tile
+.L_m12_store_mode_ready:
+	mov x11, x1
+	mov x12, x2
+	mov w10, w21
+
+.L_m12_n_loop:
+	cmp w10, #0
+	b.le .L_m12_done
+	ZERO_ACC_M12
+	mov x17, x11
+	mov x18, x28
+	mov w15, w20
+
+.L_m12_k_loop:
+	M12_K4_BODY
+	M12_K4_BODY
+	subs w15, w15, #8
+	b.gt .L_m12_k_loop
+
+	cmp w6, #0
+	b.eq .L_m12_store_w2
+	cmp w6, #2
+	b.eq .L_m12_store_w2_bf16
+	cmp w6, #3
+	b.eq .L_m12_store_w2_direct
+	cmp w6, #44
+	b.eq .L_m12_store_w2_direct_bf16
+	cmp w6, #14
+	b.eq .L_m12_store_opt_p4
+	cmp w6, #15
+	b.eq .L_m12_store_opt_p5
+	cmp w6, #16
+	b.eq .L_m12_store_opt_p6
+	STORE_PACKC_M12_OPT 6
+	b .L_m12_advance_packc
+.L_m12_store_opt_p4:
+	STORE_PACKC_M12_OPT 4
+	b .L_m12_advance_packc
+.L_m12_store_opt_p5:
+	STORE_PACKC_M12_OPT 5
+	b .L_m12_advance_packc
+.L_m12_store_opt_p6:
+	STORE_PACKC_M12_OPT 6
+	b .L_m12_advance_packc
+.L_m12_store_w2:
+	STORE_W2_M12
+	add x12, x12, x14
+	b .L_m12_advance_common
+.L_m12_store_w2_bf16:
+	STORE_W2_M12_BF16
+	add x12, x12, x14
+	b .L_m12_advance_common
+.L_m12_store_w2_direct:
+	STORE_W2_M12_DIRECT
+	add x12, x12, x14
+	b .L_m12_advance_common
+.L_m12_store_w2_direct_bf16:
+	STORE_W2_M12_DIRECT_BF16
+	add x12, x12, x14
+	b .L_m12_advance_common
+.L_m12_advance_packc:
+	add x12, x12, x24
+.L_m12_advance_common:
+	add x11, x11, x13
+	sub w10, w10, w9
+	b .L_m12_n_loop
+
+.L_m12_done:
+	RESTORE_REGS
+	ret
+
+	.p2align 4
+moe_sve_kernel_m8:
+	SAVE_REGS
+	ldp w19, w20, [x4]        // M rows in this tile, K
+	ldr w21, [x4, #8]         // N columns in this slice
+	ldr w23, [x4, #20]        // ldc
+	mov x28, x0               // packed A
+	mov x29, x3               // direct-route row ids (mode 3)
+	cntb x27
+	lsr x9, x27, #1           // SVE N tile in bf16 columns
+	lsl x25, x23, #2          // f32 ldc bytes
+	mul x13, x20, x27         // packed-B bytes per SVE N tile
+	lsl x14, x27, #1          // row-major f32 C advance per N tile
+	lsl x24, x27, #2          // packC advance per N tile
+	ptrue p0.b
+	ptrue p1.s
+	cmp w6, #2
+	b.eq .L_m8_store_mode_bf16
+	cmp w6, #44
+	b.ne .L_m8_store_mode_ready
+.L_m8_store_mode_bf16:
+	lsl x25, x23, #1
+	mov x14, x27
+.L_m8_store_mode_ready:
+	mov x11, x1
+	mov x12, x2
+	mov w10, w21
+
+.L_m8_n_loop:
+	cmp w10, #0
+	b.le .L_m8_done
+	ZERO_ACC_M8
+	mov x17, x11
+	mov x18, x28
+	mov w15, w20
+
+	LOAD_AB_PACKED z0, z1, z2, z3, z4, z5, z6, z7
+	subs w15, w15, #4
+	b.eq .L_m8_tail_cur
+
+.L_m8_k_loop:
+	LOAD_AB_PACKED z8, z9, z10, z11, z12, z13, z14, z15
+	BFMMLA_BLOCK_AB z0, z1, z2, z3, z4, z5, z6, z7
+	subs w15, w15, #4
+	b.eq .L_m8_tail_next
+	LOAD_AB_PACKED z0, z1, z2, z3, z4, z5, z6, z7
+	BFMMLA_BLOCK_AB z8, z9, z10, z11, z12, z13, z14, z15
+	subs w15, w15, #4
+	b.gt .L_m8_k_loop
+
+.L_m8_tail_cur:
+	BFMMLA_BLOCK_AB z0, z1, z2, z3, z4, z5, z6, z7
+	b .L_m8_store
+
+.L_m8_tail_next:
+	BFMMLA_BLOCK_AB z8, z9, z10, z11, z12, z13, z14, z15
+
+.L_m8_store:
+	cmp w6, #0
+	b.eq .L_m8_store_w2
+	cmp w6, #2
+	b.eq .L_m8_store_w2_bf16
+	cmp w6, #3
+	b.eq .L_m8_store_w2_direct
+	cmp w6, #44
+	b.eq .L_m8_store_w2_direct_bf16
+	cmp w6, #4
+	b.eq .L_m8_store_p4
+	cmp w6, #5
+	b.eq .L_m8_store_p5
+	STORE_PACKC_M8 6
+	b .L_m8_advance_packc
+.L_m8_store_p4:
+	STORE_PACKC_M8 4
+	b .L_m8_advance_packc
+.L_m8_store_p5:
+	STORE_PACKC_M8 5
+	b .L_m8_advance_packc
+.L_m8_store_w2:
+	STORE_W2_M8
+	add x12, x12, x14
+	b .L_m8_advance_common
+.L_m8_store_w2_bf16:
+	STORE_W2_M8_BF16
+	add x12, x12, x14
+	b .L_m8_advance_common
+.L_m8_store_w2_direct:
+	STORE_W2_M8_DIRECT
+	add x12, x12, x14
+	b .L_m8_advance_common
+.L_m8_store_w2_direct_bf16:
+	STORE_W2_M8_DIRECT_BF16
+	add x12, x12, x14
+	b .L_m8_advance_common
+.L_m8_advance_packc:
+	add x12, x12, x24
+.L_m8_advance_common:
+	add x11, x11, x13
+	sub w10, w10, w9
+	b .L_m8_n_loop
+
+.L_m8_done:
+	RESTORE_REGS
+	ret
+
+	.p2align 4
+moe_sve_kernel_m4:
+	SAVE_REGS
+	ldp w19, w20, [x4]
+	ldr w21, [x4, #8]
+	ldr w23, [x4, #20]
+	mov x28, x0
+	mov x29, x3
+	cntb x27
+	lsr x9, x27, #1
+	lsl x25, x23, #2
+	mul x13, x20, x27
+	lsl x14, x27, #1
+	lsl x24, x27, #2
+	ptrue p0.b
+	ptrue p1.s
+	cmp w6, #2
+	b.eq .L_m4_store_mode_bf16
+	cmp w6, #44
+	b.ne .L_m4_store_mode_ready
+.L_m4_store_mode_bf16:
+	lsl x25, x23, #1
+	mov x14, x27
+.L_m4_store_mode_ready:
+	mov x11, x1
+	mov x12, x2
+	mov w10, w21
+
+.L_m4_n_loop:
+	cmp w10, #0
+	b.le .L_m4_done
+	ZERO_ACC_M4
+	mov x17, x11
+	mov x18, x28
+	mov w15, w20
+
+	LOAD_AB_PACKED_M4 z0, z1, z4, z5, z6, z7
+	subs w15, w15, #4
+	b.eq .L_m4_tail_cur
+
+.L_m4_k_loop:
+	LOAD_AB_PACKED_M4 z8, z9, z12, z13, z14, z15
+	BFMMLA_M4_AB z0, z1, z4, z5, z6, z7
+	subs w15, w15, #4
+	b.eq .L_m4_tail_next
+	LOAD_AB_PACKED_M4 z0, z1, z4, z5, z6, z7
+	BFMMLA_M4_AB z8, z9, z12, z13, z14, z15
+	subs w15, w15, #4
+	b.gt .L_m4_k_loop
+
+.L_m4_tail_cur:
+	BFMMLA_M4_AB z0, z1, z4, z5, z6, z7
+	b .L_m4_store
+
+.L_m4_tail_next:
+	BFMMLA_M4_AB z8, z9, z12, z13, z14, z15
+
+.L_m4_store:
+	cmp w6, #0
+	b.eq .L_m4_store_w2
+	cmp w6, #2
+	b.eq .L_m4_store_w2_bf16
+	cmp w6, #3
+	b.eq .L_m4_store_w2_direct
+	cmp w6, #44
+	b.eq .L_m4_store_w2_direct_bf16
+	cmp w6, #4
+	b.eq .L_m4_store_p4
+	cmp w6, #5
+	b.eq .L_m4_store_p5
+	STORE_PACKC_M4 6
+	b .L_m4_advance_packc
+.L_m4_store_p4:
+	STORE_PACKC_M4 4
+	b .L_m4_advance_packc
+.L_m4_store_p5:
+	STORE_PACKC_M4 5
+	b .L_m4_advance_packc
+.L_m4_store_w2:
+	STORE_W2_M4
+	add x12, x12, x14
+	b .L_m4_advance_common
+.L_m4_store_w2_bf16:
+	STORE_W2_M4_BF16
+	add x12, x12, x14
+	b .L_m4_advance_common
+.L_m4_store_w2_direct:
+	STORE_W2_M4_DIRECT
+	add x12, x12, x14
+	b .L_m4_advance_common
+.L_m4_store_w2_direct_bf16:
+	STORE_W2_M4_DIRECT_BF16
+	add x12, x12, x14
+	b .L_m4_advance_common
+.L_m4_advance_packc:
+	add x12, x12, x24
+.L_m4_advance_common:
+	add x11, x11, x13
+	sub w10, w10, w9
+	b .L_m4_n_loop
+
+.L_m4_done:
+	RESTORE_REGS
+	ret
+
+	.p2align 4
+moe_sve_kernel_m2:
+	SAVE_REGS
+	ldp w19, w20, [x4]
+	ldr w21, [x4, #8]
+	ldr w23, [x4, #20]
+	mov x28, x0
+	mov x29, x3
+	cntb x27
+	lsr x9, x27, #1
+	lsl x25, x23, #2
+	mul x13, x20, x27
+	lsl x14, x27, #1
+	lsl x24, x27, #2
+	ptrue p0.b
+	ptrue p1.s
+	cmp w6, #2
+	b.eq .L_m2_store_mode_bf16
+	cmp w6, #44
+	b.ne .L_m2_store_mode_ready
+.L_m2_store_mode_bf16:
+	lsl x25, x23, #1
+	mov x14, x27
+.L_m2_store_mode_ready:
+	mov x11, x1
+	mov x12, x2
+	mov w10, w21
+
+.L_m2_n_loop:
+	cmp w10, #0
+	b.le .L_m2_done
+	ZERO_ACC_M2
+	mov x17, x11
+	mov x18, x28
+	mov w15, w20
+
+	LOAD_AB_PACKED_M2 z0, z4, z5, z6, z7
+	subs w15, w15, #4
+	b.eq .L_m2_tail_cur
+
+.L_m2_k_loop:
+	LOAD_AB_PACKED_M2 z8, z12, z13, z14, z15
+	BFMMLA_M2_AB z0, z4, z5, z6, z7
+	subs w15, w15, #4
+	b.eq .L_m2_tail_next
+	LOAD_AB_PACKED_M2 z0, z4, z5, z6, z7
+	BFMMLA_M2_AB z8, z12, z13, z14, z15
+	subs w15, w15, #4
+	b.gt .L_m2_k_loop
+
+.L_m2_tail_cur:
+	BFMMLA_M2_AB z0, z4, z5, z6, z7
+	b .L_m2_store
+
+.L_m2_tail_next:
+	BFMMLA_M2_AB z8, z12, z13, z14, z15
+
+.L_m2_store:
+	cmp w6, #0
+	b.eq .L_m2_store_w2
+	cmp w6, #2
+	b.eq .L_m2_store_w2_bf16
+	cmp w6, #3
+	b.eq .L_m2_store_w2_direct
+	cmp w6, #44
+	b.eq .L_m2_store_w2_direct_bf16
+	cmp w6, #4
+	b.eq .L_m2_store_p4
+	cmp w6, #5
+	b.eq .L_m2_store_p5
+	STORE_PACKC_M2 6
+	b .L_m2_advance_packc
+.L_m2_store_p4:
+	STORE_PACKC_M2 4
+	b .L_m2_advance_packc
+.L_m2_store_p5:
+	STORE_PACKC_M2 5
+	b .L_m2_advance_packc
+.L_m2_store_w2:
+	STORE_W2_M2
+	add x12, x12, x14
+	b .L_m2_advance_common
+.L_m2_store_w2_bf16:
+	STORE_W2_M2_BF16
+	add x12, x12, x14
+	b .L_m2_advance_common
+.L_m2_store_w2_direct:
+	STORE_W2_M2_DIRECT
+	add x12, x12, x14
+	b .L_m2_advance_common
+.L_m2_store_w2_direct_bf16:
+	STORE_W2_M2_DIRECT_BF16
+	add x12, x12, x14
+	b .L_m2_advance_common
+.L_m2_advance_packc:
+	add x12, x12, x24
+.L_m2_advance_common:
+	add x11, x11, x13
+	sub w10, w10, w9
+	b .L_m2_n_loop
+
+.L_m2_done:
+	RESTORE_REGS
+	ret
+
+	// Default production body. Packed B is Kchunk-major/Ntile-minor. Extended
+	// params at offsets 24..40 carry Kc, full packed N, absolute N begin, store
+	// mode, and a thread-private accumulator-native FP32 partial-C buffer.
+	.global moe_sve_kc_kernel_m12
+	.type moe_sve_kc_kernel_m12, %function
+	.p2align 4
+moe_sve_kc_kernel_m12:
+	SAVE_REGS
+	sub sp, sp, #64
+	stp x0, x1, [sp]
+	stp x2, x3, [sp, #16]
+	ldr x7, [x4, #40]
+	str x7, [sp, #32]
+	ldr w7, [x4, #24]
+	str w7, [sp, #40]
+	ldr w7, [x4, #28]
+	str w7, [sp, #44]
+	ldr w7, [x4, #32]
+	str w7, [sp, #48]
+	ldp w19, w20, [x4]        // valid M rows, K
+	ldr w21, [x4, #8]         // N columns in this slice
+	ldr w23, [x4, #20]        // ldc
+	ldr w6, [x4, #36]         // final epilogue mode
+	ldr x29, [sp, #24]        // direct-route row ids
+	cntb x27
+	lsr x9, x27, #1           // runtime SVE N tile
+	lsl x25, x23, #2          // f32 ldc bytes
+	lsl x14, x27, #1          // row-major f32 C advance
+	lsl x24, x27, #2
+	add x24, x24, x27, lsl #1 // M12 packC advance: 6 * VL
+	ptrue p0.b
+	ptrue p1.s
+	cmp w6, #2
+	b.eq .L_kc_m12_store_mode_bf16
+	cmp w6, #44
+	b.ne .L_kc_m12_store_mode_ready
+.L_kc_m12_store_mode_bf16:
+	lsl x25, x23, #1
+	mov x14, x27
+.L_kc_m12_store_mode_ready:
+	mov w22, #0               // K chunk start
+
+.L_kc_m12_outer:
+	ldr w7, [sp, #40]
+	sub w26, w20, w22
+	cmp w26, w7
+	csel w26, w26, w7, le     // min(K-k_start, Kc)
+	ldr x28, [sp]
+	uxtw x7, w22
+	lsl x8, x7, #4
+	add x8, x8, x7, lsl #3
+	add x28, x28, x8          // packed A + k_start * 24 bytes
+
+	ldr x11, [sp, #8]
+	ldr w8, [sp, #44]
+	uxtw x8, w8
+	mul x23, x7, x8
+	lsl x23, x23, #1          // bytes before this K chunk
+	ldr w8, [sp, #48]
+	uxtw x8, w8
+	uxtw x15, w26
+	mul x8, x8, x15
+	lsl x8, x8, #1            // N-slice offset inside this K chunk
+	add x23, x23, x8
+	add x11, x11, x23
+	mul x13, x15, x27         // bytes per N tile in this K chunk
+	ldr x12, [sp, #16]
+	ldr x16, [sp, #32]
+	mov w10, w21
+
+.L_kc_m12_n_loop:
+	cmp w10, #0
+	b.le .L_kc_m12_next_k
+	cbz w22, .L_kc_m12_zero
+	LOAD_PARTIAL_M12 x16
+	b .L_kc_m12_compute
+.L_kc_m12_zero:
+	ZERO_ACC_M12
+.L_kc_m12_compute:
+	mov x17, x11
+	mov x18, x28
+	mov w15, w26
+.L_kc_m12_k_loop:
+	M12_K4_BODY
+	M12_K4_BODY
+	subs w15, w15, #8
+	b.gt .L_kc_m12_k_loop
+
+	add w7, w22, w26
+	cmp w7, w20
+	b.eq .L_kc_m12_final_store
+	STORE_PARTIAL_M12 x16
+	addvl x16, x16, #24
+	b .L_kc_m12_advance_n
+
+.L_kc_m12_final_store:
+	addvl x30, x16, #24
+	cmp w6, #0
+	b.eq .L_kc_m12_store_w2
+	cmp w6, #2
+	b.eq .L_kc_m12_store_w2_bf16
+	cmp w6, #3
+	b.eq .L_kc_m12_store_w2_direct
+	cmp w6, #44
+	b.eq .L_kc_m12_store_w2_direct_bf16
+	cmp w6, #14
+	b.eq .L_kc_m12_store_opt_p4
+	cmp w6, #15
+	b.eq .L_kc_m12_store_opt_p5
+	cmp w6, #16
+	b.eq .L_kc_m12_store_opt_p6
+	STORE_PACKC_M12_OPT 6
+	b .L_kc_m12_advance_packc
+.L_kc_m12_store_opt_p4:
+	STORE_PACKC_M12_OPT 4
+	b .L_kc_m12_advance_packc
+.L_kc_m12_store_opt_p5:
+	STORE_PACKC_M12_OPT 5
+	b .L_kc_m12_advance_packc
+.L_kc_m12_store_opt_p6:
+	STORE_PACKC_M12_OPT 6
+	b .L_kc_m12_advance_packc
+.L_kc_m12_store_w2:
+	STORE_W2_M12
+	add x12, x12, x14
+	b .L_kc_m12_advance_common
+.L_kc_m12_store_w2_bf16:
+	STORE_W2_M12_BF16
+	add x12, x12, x14
+	b .L_kc_m12_advance_common
+.L_kc_m12_store_w2_direct:
+	STORE_W2_M12_DIRECT
+	add x12, x12, x14
+	b .L_kc_m12_advance_common
+.L_kc_m12_store_w2_direct_bf16:
+	STORE_W2_M12_DIRECT_BF16
+	add x12, x12, x14
+	b .L_kc_m12_advance_common
+.L_kc_m12_advance_packc:
+	add x12, x12, x24
+.L_kc_m12_advance_common:
+	mov x16, x30
+.L_kc_m12_advance_n:
+	add x11, x11, x13
+	sub w10, w10, w9
+	b .L_kc_m12_n_loop
+
+.L_kc_m12_next_k:
+	add w22, w22, w26
+	cmp w22, w20
+	b.lt .L_kc_m12_outer
+	add sp, sp, #64
+	RESTORE_REGS
+	ret
+	.size moe_sve_kc_kernel_m12, .-moe_sve_kc_kernel_m12
+
+	.macro DEFINE_KC_MSMALL name, height
+	.global \name
+	.type \name, %function
+	.p2align 4
+\name:
+	SAVE_REGS
+	sub sp, sp, #64
+	stp x0, x1, [sp]
+	stp x2, x3, [sp, #16]
+	ldr x7, [x4, #40]
+	str x7, [sp, #32]
+	ldr w7, [x4, #24]
+	str w7, [sp, #40]
+	ldr w7, [x4, #28]
+	str w7, [sp, #44]
+	ldr w7, [x4, #32]
+	str w7, [sp, #48]
+	ldp w19, w20, [x4]
+	ldr w21, [x4, #8]
+	ldr w23, [x4, #20]
+	ldr w6, [x4, #36]
+	ldr x29, [sp, #24]
+	cntb x27
+	lsr x9, x27, #1
+	lsl x25, x23, #2
+	lsl x14, x27, #1
+	lsl x24, x27, #2          // physical m8 packC stride
+	ptrue p0.b
+	ptrue p1.s
+	cmp w6, #2
+	b.eq .L_\name\()_store_mode_bf16
+	cmp w6, #44
+	b.ne .L_\name\()_store_mode_ready
+.L_\name\()_store_mode_bf16:
+	lsl x25, x23, #1
+	mov x14, x27
+.L_\name\()_store_mode_ready:
+	mov w22, #0
+
+.L_\name\()_outer:
+	ldr w7, [sp, #40]
+	sub w26, w20, w22
+	cmp w26, w7
+	csel w26, w26, w7, le
+	ldr x28, [sp]
+	uxtw x7, w22
+	lsl x8, x7, #4
+	add x28, x28, x8          // packed m8 A + k_start * 16 bytes
+
+	ldr x11, [sp, #8]
+	ldr w8, [sp, #44]
+	uxtw x8, w8
+	mul x23, x7, x8
+	lsl x23, x23, #1
+	ldr w8, [sp, #48]
+	uxtw x8, w8
+	uxtw x15, w26
+	mul x8, x8, x15
+	lsl x8, x8, #1
+	add x23, x23, x8
+	add x11, x11, x23
+	mul x13, x15, x27
+	ldr x12, [sp, #16]
+	ldr x16, [sp, #32]
+	mov w10, w21
+
+.L_\name\()_n_loop:
+	cmp w10, #0
+	b.le .L_\name\()_next_k
+	cbz w22, .L_\name\()_zero
+	.if \height == 8
+	LOAD_PARTIAL_M8 x16
+	.elseif \height == 4
+	LOAD_PARTIAL_M4 x16
+	.else
+	LOAD_PARTIAL_M2 x16
+	.endif
+	b .L_\name\()_compute
+.L_\name\()_zero:
+	.if \height == 8
+	ZERO_ACC_M8
+	.elseif \height == 4
+	ZERO_ACC_M4
+	.else
+	ZERO_ACC_M2
+	.endif
+.L_\name\()_compute:
+	mov x17, x11
+	mov x18, x28
+	mov w15, w26
+	.if \height == 8
+	LOAD_AB_PACKED z0, z1, z2, z3, z4, z5, z6, z7
+	subs w15, w15, #4
+	b.eq .L_\name\()_tail_cur
+.L_\name\()_k_loop:
+	LOAD_AB_PACKED z8, z9, z10, z11, z12, z13, z14, z15
+	BFMMLA_BLOCK_AB z0, z1, z2, z3, z4, z5, z6, z7
+	subs w15, w15, #4
+	b.eq .L_\name\()_tail_next
+	LOAD_AB_PACKED z0, z1, z2, z3, z4, z5, z6, z7
+	BFMMLA_BLOCK_AB z8, z9, z10, z11, z12, z13, z14, z15
+	subs w15, w15, #4
+	b.gt .L_\name\()_k_loop
+.L_\name\()_tail_cur:
+	BFMMLA_BLOCK_AB z0, z1, z2, z3, z4, z5, z6, z7
+	b .L_\name\()_computed
+.L_\name\()_tail_next:
+	BFMMLA_BLOCK_AB z8, z9, z10, z11, z12, z13, z14, z15
+	.elseif \height == 4
+	LOAD_AB_PACKED_M4 z0, z1, z4, z5, z6, z7
+	subs w15, w15, #4
+	b.eq .L_\name\()_tail_cur
+.L_\name\()_k_loop:
+	LOAD_AB_PACKED_M4 z8, z9, z12, z13, z14, z15
+	BFMMLA_M4_AB z0, z1, z4, z5, z6, z7
+	subs w15, w15, #4
+	b.eq .L_\name\()_tail_next
+	LOAD_AB_PACKED_M4 z0, z1, z4, z5, z6, z7
+	BFMMLA_M4_AB z8, z9, z12, z13, z14, z15
+	subs w15, w15, #4
+	b.gt .L_\name\()_k_loop
+.L_\name\()_tail_cur:
+	BFMMLA_M4_AB z0, z1, z4, z5, z6, z7
+	b .L_\name\()_computed
+.L_\name\()_tail_next:
+	BFMMLA_M4_AB z8, z9, z12, z13, z14, z15
+	.else
+	LOAD_AB_PACKED_M2 z0, z4, z5, z6, z7
+	subs w15, w15, #4
+	b.eq .L_\name\()_tail_cur
+.L_\name\()_k_loop:
+	LOAD_AB_PACKED_M2 z8, z12, z13, z14, z15
+	BFMMLA_M2_AB z0, z4, z5, z6, z7
+	subs w15, w15, #4
+	b.eq .L_\name\()_tail_next
+	LOAD_AB_PACKED_M2 z0, z4, z5, z6, z7
+	BFMMLA_M2_AB z8, z12, z13, z14, z15
+	subs w15, w15, #4
+	b.gt .L_\name\()_k_loop
+.L_\name\()_tail_cur:
+	BFMMLA_M2_AB z0, z4, z5, z6, z7
+	b .L_\name\()_computed
+.L_\name\()_tail_next:
+	BFMMLA_M2_AB z8, z12, z13, z14, z15
+	.endif
+
+.L_\name\()_computed:
+	add w7, w22, w26
+	cmp w7, w20
+	b.eq .L_\name\()_final_store
+	.if \height == 8
+	STORE_PARTIAL_M8 x16
+	addvl x16, x16, #16
+	.elseif \height == 4
+	STORE_PARTIAL_M4 x16
+	addvl x16, x16, #8
+	.else
+	STORE_PARTIAL_M2 x16
+	addvl x16, x16, #4
+	.endif
+	b .L_\name\()_advance_n
+
+.L_\name\()_final_store:
+	.if \height == 8
+	addvl x30, x16, #16
+	.elseif \height == 4
+	addvl x30, x16, #8
+	.else
+	addvl x30, x16, #4
+	.endif
+	cmp w6, #0
+	b.eq .L_\name\()_store_w2
+	cmp w6, #2
+	b.eq .L_\name\()_store_w2_bf16
+	cmp w6, #3
+	b.eq .L_\name\()_store_w2_direct
+	cmp w6, #44
+	b.eq .L_\name\()_store_w2_direct_bf16
+	cmp w6, #4
+	b.eq .L_\name\()_store_p4
+	cmp w6, #5
+	b.eq .L_\name\()_store_p5
+	.if \height == 8
+	STORE_PACKC_M8 6
+	.elseif \height == 4
+	STORE_PACKC_M4 6
+	.else
+	STORE_PACKC_M2 6
+	.endif
+	b .L_\name\()_advance_packc
+.L_\name\()_store_p4:
+	.if \height == 8
+	STORE_PACKC_M8 4
+	.elseif \height == 4
+	STORE_PACKC_M4 4
+	.else
+	STORE_PACKC_M2 4
+	.endif
+	b .L_\name\()_advance_packc
+.L_\name\()_store_p5:
+	.if \height == 8
+	STORE_PACKC_M8 5
+	.elseif \height == 4
+	STORE_PACKC_M4 5
+	.else
+	STORE_PACKC_M2 5
+	.endif
+	b .L_\name\()_advance_packc
+.L_\name\()_store_w2:
+	.if \height == 8
+	STORE_W2_M8
+	.elseif \height == 4
+	STORE_W2_M4
+	.else
+	STORE_W2_M2
+	.endif
+	add x12, x12, x14
+	b .L_\name\()_advance_common
+.L_\name\()_store_w2_bf16:
+	.if \height == 8
+	STORE_W2_M8_BF16
+	.elseif \height == 4
+	STORE_W2_M4_BF16
+	.else
+	STORE_W2_M2_BF16
+	.endif
+	add x12, x12, x14
+	b .L_\name\()_advance_common
+.L_\name\()_store_w2_direct:
+	.if \height == 8
+	STORE_W2_M8_DIRECT
+	.elseif \height == 4
+	STORE_W2_M4_DIRECT
+	.else
+	STORE_W2_M2_DIRECT
+	.endif
+	add x12, x12, x14
+	b .L_\name\()_advance_common
+.L_\name\()_store_w2_direct_bf16:
+	.if \height == 8
+	STORE_W2_M8_DIRECT_BF16
+	.elseif \height == 4
+	STORE_W2_M4_DIRECT_BF16
+	.else
+	STORE_W2_M2_DIRECT_BF16
+	.endif
+	add x12, x12, x14
+	b .L_\name\()_advance_common
+.L_\name\()_advance_packc:
+	add x12, x12, x24
+.L_\name\()_advance_common:
+	mov x16, x30
+.L_\name\()_advance_n:
+	add x11, x11, x13
+	sub w10, w10, w9
+	b .L_\name\()_n_loop
+
+.L_\name\()_next_k:
+	add w22, w22, w26
+	cmp w22, w20
+	b.lt .L_\name\()_outer
+	add sp, sp, #64
+	RESTORE_REGS
+	ret
+	.size \name, .-\name
+	.endm
+
+	DEFINE_KC_MSMALL moe_sve_kc_kernel_m8, 8
+	DEFINE_KC_MSMALL moe_sve_kc_kernel_m4, 4
+	DEFINE_KC_MSMALL moe_sve_kc_kernel_m2, 2
+
+	.macro ENTRY_W13 name, target, degree
+	.global \name
+	.type \name, %function
+	.p2align 4
+\name:
+	mov w6, #\degree
+	b \target
+	.size \name, .-\name
+	.endm
+
+	.macro ENTRY_W13_ROWS name, target, degree
+	.global \name
+	.type \name, %function
+	.p2align 4
+\name:
+	mov w6, #\degree
+	b \target
+	.size \name, .-\name
+	.endm
+
+	.macro ENTRY_W2 name, target
+	.global \name
+	.type \name, %function
+	.p2align 4
+\name:
+	mov w6, #0
+	b \target
+	.size \name, .-\name
+	.endm
+
+	.macro ENTRY_W2_BF16 name, target
+	.global \name
+	.type \name, %function
+	.p2align 4
+\name:
+	mov w6, #2
+	b \target
+	.size \name, .-\name
+	.endm
+
+	.macro ENTRY_W2_DIRECT name, target
+	.global \name
+	.type \name, %function
+	.p2align 4
+\name:
+	mov w6, #3
+	b \target
+	.size \name, .-\name
+	.endm
+
+	.macro ENTRY_W2_DIRECT_BF16 name, target
+	.global \name
+	.type \name, %function
+	.p2align 4
+\name:
+	mov w6, #44
+	b \target
+	.size \name, .-\name
+	.endm
+
+	ENTRY_W13 moe_sve_w13_silu_poly4_packc_m12_opt, moe_sve_kernel_m12, 14
+	ENTRY_W13 moe_sve_w13_silu_poly5_packc_m12_opt, moe_sve_kernel_m12, 15
+	ENTRY_W13 moe_sve_w13_silu_poly6_packc_m12_opt, moe_sve_kernel_m12, 16
+	ENTRY_W13_ROWS moe_sve_w13_silu_poly4_packc_m12_rows_opt, moe_sve_kernel_m12_rows, 14
+	ENTRY_W13_ROWS moe_sve_w13_silu_poly5_packc_m12_rows_opt, moe_sve_kernel_m12_rows, 15
+	ENTRY_W13_ROWS moe_sve_w13_silu_poly6_packc_m12_rows_opt, moe_sve_kernel_m12_rows, 16
+	ENTRY_W13 moe_sve_w13_silu_poly4_packc,     moe_sve_kernel_m8, 4
+	ENTRY_W13 moe_sve_w13_silu_poly5_packc,     moe_sve_kernel_m8, 5
+	ENTRY_W13 moe_sve_w13_silu_poly6_packc,     moe_sve_kernel_m8, 6
+	ENTRY_W13 moe_sve_w13_silu_poly4_packc_m4, moe_sve_kernel_m4, 4
+	ENTRY_W13 moe_sve_w13_silu_poly5_packc_m4, moe_sve_kernel_m4, 5
+	ENTRY_W13 moe_sve_w13_silu_poly6_packc_m4, moe_sve_kernel_m4, 6
+	ENTRY_W13 moe_sve_w13_silu_poly4_packc_m2, moe_sve_kernel_m2, 4
+	ENTRY_W13 moe_sve_w13_silu_poly5_packc_m2, moe_sve_kernel_m2, 5
+	ENTRY_W13 moe_sve_w13_silu_poly6_packc_m2, moe_sve_kernel_m2, 6
+	ENTRY_W13 moe_sve_w13_silu_poly4_packc_m1, moe_sve_kernel_m2, 4
+	ENTRY_W13 moe_sve_w13_silu_poly5_packc_m1, moe_sve_kernel_m2, 5
+	ENTRY_W13 moe_sve_w13_silu_poly6_packc_m1, moe_sve_kernel_m2, 6
+	ENTRY_W2 moe_sve_w2_packed_m12, moe_sve_kernel_m12
+	ENTRY_W2 moe_sve_w2_packed,     moe_sve_kernel_m8
+	ENTRY_W2 moe_sve_w2_packed_m4,  moe_sve_kernel_m4
+	ENTRY_W2 moe_sve_w2_packed_m2,  moe_sve_kernel_m2
+	ENTRY_W2 moe_sve_w2_packed_m1,  moe_sve_kernel_m2
+	ENTRY_W2_DIRECT moe_sve_w2_packed_direct_m12, moe_sve_kernel_m12
+	ENTRY_W2_DIRECT moe_sve_w2_packed_direct,     moe_sve_kernel_m8
+	ENTRY_W2_DIRECT moe_sve_w2_packed_direct_m4,  moe_sve_kernel_m4
+	ENTRY_W2_DIRECT moe_sve_w2_packed_direct_m2,  moe_sve_kernel_m2
+	ENTRY_W2_DIRECT moe_sve_w2_packed_direct_m1,  moe_sve_kernel_m2
+	ENTRY_W2_DIRECT_BF16 moe_sve_w2_packed_direct_bf16_m12, moe_sve_kernel_m12
+	ENTRY_W2_DIRECT_BF16 moe_sve_w2_packed_direct_bf16,     moe_sve_kernel_m8
+	ENTRY_W2_DIRECT_BF16 moe_sve_w2_packed_direct_bf16_m4,  moe_sve_kernel_m4
+	ENTRY_W2_DIRECT_BF16 moe_sve_w2_packed_direct_bf16_m2,  moe_sve_kernel_m2
+	ENTRY_W2_DIRECT_BF16 moe_sve_w2_packed_direct_bf16_m1,  moe_sve_kernel_m2
+	ENTRY_W2_BF16 moe_sve_w2_packed_bf16_m12, moe_sve_kernel_m12
+	ENTRY_W2_BF16 moe_sve_w2_packed_bf16,     moe_sve_kernel_m8
+	ENTRY_W2_BF16 moe_sve_w2_packed_bf16_m4,  moe_sve_kernel_m4
+	ENTRY_W2_BF16 moe_sve_w2_packed_bf16_m2,  moe_sve_kernel_m2
+	ENTRY_W2_BF16 moe_sve_w2_packed_bf16_m1,  moe_sve_kernel_m2
+
+	.balign 16
+.Lmoe_sve_silu_consts:
+	.float 1.0
+	.float 1.000003695487976
+	.float 0.5000003576278687
+	.float 1.4426950408889634
+	.float 0.693145751953125
+	.float 1.428606765330187e-06
+	.float 196735.0
+	.float 87.0
+	.float -87.0
+	.float 10.0
+
+	.section .note.GNU-stack,"",@progbits

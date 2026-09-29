@@ -1,0 +1,53 @@
+__pycache__/
+.ccache/
+*.pyc
+*.pyo
+*.egg-info/
+*.so
+*.dylib
+build/
+dist/
+.eggs/
+.hypothesis/
+.pytest_cache/
+.venv/
+*.egg
+refs/
+.codegraph/
+
+# OS / editor
+.DS_Store
+
+# Local tooling state
+.codebuddy/
+.claude/worktrees/
+
+# Local third-party source references
+/3rdparty/oneDNN/
+/3rdparty/ktransformers/
+
+# Lock files (not tracked for this project)
+uv.lock
+
+# Benchmark result artifacts (keep scripts, drop generated data)
+bench/sdpa/sdpa_versions_*.csv
+bench/sdpa/sdpa_versions_*.json
+
+# Local scratch / benchmark outputs
+tmp/
+*.dSYM/
+standalone/clean_sdpa/clean_sdpa_bench
+standalone/moe_planner/*.o
+standalone/moe_planner/moe_planner
+standalone/moe_planner/moe_planner_omp
+standalone/moe_planner/moe_planner_st
+optimizations/fused_moe_sve/benchmarks/bench_elastic_nsplit
+optimizations/fused_moe_sve/results/expert_barriers_*.json
+
+# Ad hoc MoE benchmark outputs. Curated reports stay as Markdown; raw JSON
+# required to reproduce a report can still be force-added deliberately.
+optimizations/fused_moe_sve/results/*.json
+optimizations/fused_moe_sve/results/*.trace
+optimizations/fused_moe_sve/results/*.html
+optimizations/fused_moe_sve/results/*.png
+optimizations/fused_moe_sve/results/*.svg

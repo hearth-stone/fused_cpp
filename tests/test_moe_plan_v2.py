@@ -1,0 +1,318 @@
+from __future__ import annotations
+
+import inspect
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+import fused_cpp.moe.bf16_tiled as bf16_tiled
+from fused_cpp.moe.plan import (
+    ASYNC_MOE_EXECUTION_TAIL_POOL,
+    ASYNC_MOE_PLACEMENT_FIXED,
+    ASYNC_MOE_PLACEMENT_TAIL_POOL,
+    ASYNC_MOE_PLAN_VERSION,
+    AsyncMoEPlanV2,
+    upgrade_legacy_async_plan,
+)
+
+
+def _legacy_bridge() -> dict[str, object]:
+    return {
+        "num_threads": 4,
+        "thread_cpu_ids": [8, 9, 10, 11],
+        "task_expert_ids": [3, 7],
+        "task_core_begins": [0, 2],
+        "task_threads": [2, 2],
+        "task_dep_offsets": [0, 0, 1],
+        "task_deps": [0],
+    }
+
+
+def _tail_pool_bridge() -> dict[str, object]:
+    plan = upgrade_legacy_async_plan(_legacy_bridge())
+    plan.update(
+        {
+            "execution_mode": ASYNC_MOE_EXECUTION_TAIL_POOL,
+            "task_core_begins": [0, -1],
+            "task_dep_offsets": [0, 0, 0],
+            "task_deps": [],
+            "task_placement_modes": [
+                ASYNC_MOE_PLACEMENT_FIXED,
+                ASYNC_MOE_PLACEMENT_TAIL_POOL,
+            ],
+        }
+    )
+    return plan
+
+
+def _prepared_weights() -> SimpleNamespace:
+    packed = torch.empty(1, dtype=torch.bfloat16)
+    return SimpleNamespace(
+        w13=(packed, 1, 2),
+        w2=(packed, 1, 1),
+        fused_silu=True,
+        gemm_backend=1,
+        backend_n_tile=8,
+    )
+
+
+def test_production_api_has_no_weight_range_controls() -> None:
+    entrypoints = (
+        bf16_tiled.fused_moe_bf16_tiled,
+        bf16_tiled.fused_moe_bf16_tiled_scheduled,
+        bf16_tiled.fused_moe_bf16_tiled_async,
+        bf16_tiled.fused_moe_bf16_tiled_async_plan,
+        bf16_tiled.fused_moe_bf16_tiled_planned_staged,
+    )
+    removed_controls = {"w13_ranges", "w2_ranges", "task_w13_ranges", "task_w2_ranges"}
+
+    for entrypoint in entrypoints:
+        assert removed_controls.isdisjoint(inspect.signature(entrypoint).parameters)
+    assert removed_controls.isdisjoint(AsyncMoEPlanV2.__dataclass_fields__)
+
+
+def test_upgrade_legacy_plan_produces_strict_singleton_widths() -> None:
+    upgraded = upgrade_legacy_async_plan(_legacy_bridge())
+    plan = AsyncMoEPlanV2.from_dict(upgraded)
+
+    assert upgraded["plan_version"] == ASYNC_MOE_PLAN_VERSION
+    assert upgraded["execution_mode"] == "strict"
+    assert upgraded["task_allowed_thread_offsets"] == [0, 1, 2]
+    assert upgraded["task_allowed_threads"] == [2, 2]
+    assert upgraded["task_placement_modes"] == [
+        ASYNC_MOE_PLACEMENT_FIXED,
+        ASYNC_MOE_PLACEMENT_FIXED,
+    ]
+    assert plan.plan_version == ASYNC_MOE_PLAN_VERSION
+    assert plan.num_threads == 4
+    assert plan.thread_cpu_ids.tolist() == [8, 9, 10, 11]
+    assert plan.task_threads.tolist() == [2, 2]
+    assert plan.early_merge is None
+    assert plan.native_early_merge == -1
+    assert plan.legacy_schedule()[0].tolist() == [3, 7]
+
+
+@pytest.mark.parametrize(("early_merge", "native"), [(False, 0), (True, 1)])
+def test_plan_v2_materializes_early_merge_control(early_merge: bool, native: int) -> None:
+    bridge = upgrade_legacy_async_plan(_legacy_bridge())
+    bridge["early_merge"] = early_merge
+
+    plan = AsyncMoEPlanV2.from_dict(bridge)
+
+    assert plan.early_merge is early_merge
+    assert plan.native_early_merge == native
+
+
+def test_plan_v2_rejects_invalid_early_merge_control() -> None:
+    bridge = upgrade_legacy_async_plan(_legacy_bridge())
+    bridge["early_merge"] = 1
+
+    with pytest.raises(TypeError, match="bool or None"):
+        AsyncMoEPlanV2.from_dict(bridge)
+
+
+@pytest.mark.parametrize(
+    "field",
+    ("task_release_ns", "task_resize_timeout_ns", "task_preferred_core_begins"),
+)
+def test_plan_v2_rejects_retired_task_fields(field: str) -> None:
+    bridge = upgrade_legacy_async_plan(_legacy_bridge())
+    bridge[field] = [0, 0]
+
+    with pytest.raises(ValueError, match=f"{field} has been retired"):
+        AsyncMoEPlanV2.from_dict(bridge)
+
+
+def test_plan_v2_rejects_retired_elastic_execution() -> None:
+    bridge = upgrade_legacy_async_plan(_legacy_bridge())
+    bridge["execution_mode"] = "elastic"
+
+    with pytest.raises(ValueError, match="must be 'strict' or 'tail_pool'"):
+        AsyncMoEPlanV2.from_dict(bridge)
+
+
+def test_strict_plan_accepts_equal_contiguous_route_slices() -> None:
+    bridge = upgrade_legacy_async_plan(
+        {
+            "num_threads": 4,
+            "thread_cpu_ids": [8, 9, 10, 11],
+            "task_expert_ids": [3, 3, 7],
+            "task_core_begins": [0, 2, 0],
+            "task_threads": [2, 2, 4],
+            "task_dep_offsets": [0, 0, 0, 2],
+            "task_deps": [0, 1],
+        }
+    )
+    bridge["task_range_granularities"] = [64, 64, 0]
+
+    plan = AsyncMoEPlanV2.from_dict(bridge)
+
+    assert plan.task_expert_ids.tolist() == [3, 3, 7]
+    assert plan.task_range_granularities.tolist() == [64, 64, 0]
+
+
+@pytest.mark.parametrize("granularities", ([0, 0, 0], [64, 32, 0]))
+def test_strict_plan_rejects_invalid_duplicate_expert_ranges(granularities) -> None:
+    bridge = upgrade_legacy_async_plan(
+        {
+            "num_threads": 4,
+            "thread_cpu_ids": [8, 9, 10, 11],
+            "task_expert_ids": [3, 3, 7],
+            "task_core_begins": [0, 2, 0],
+            "task_threads": [2, 2, 4],
+            "task_dep_offsets": [0, 0, 0, 2],
+            "task_deps": [0, 1],
+        }
+    )
+    bridge["task_range_granularities"] = granularities
+
+    with pytest.raises(ValueError, match="route-sliced expert"):
+        AsyncMoEPlanV2.from_dict(bridge)
+
+
+def test_strict_plan_accepts_a_wider_future_width_envelope() -> None:
+    upgraded = upgrade_legacy_async_plan(_legacy_bridge())
+    upgraded.update(
+        {
+            "task_preferred_threads": [1, 2],
+            "task_min_threads": [1, 2],
+            "task_max_threads": [2, 2],
+            "task_allowed_thread_offsets": [0, 2, 3],
+            "task_allowed_threads": [1, 2, 2],
+        }
+    )
+
+    plan = AsyncMoEPlanV2.from_dict(upgraded)
+
+    assert plan.task_threads.tolist() == [2, 2]
+    assert plan.task_preferred_threads.tolist() == [1, 2]
+    assert plan.task_allowed_threads.tolist() == [1, 2, 2]
+
+
+def test_plan_v2_rejects_unsupported_resize_semantics() -> None:
+    upgraded = upgrade_legacy_async_plan(_legacy_bridge())
+    upgraded["task_resize_points"] = [1, 0]
+
+    try:
+        AsyncMoEPlanV2.from_dict(upgraded)
+    except ValueError as error:
+        assert "do not support resize points" in str(error)
+    else:
+        raise AssertionError("unsupported resize metadata was accepted")
+
+
+def test_plan_v2_rejects_inconsistent_allowed_widths() -> None:
+    upgraded = upgrade_legacy_async_plan(_legacy_bridge())
+    upgraded["task_allowed_threads"] = [1, 2]
+
+    try:
+        AsyncMoEPlanV2.from_dict(upgraded)
+    except ValueError as error:
+        assert "task_threads[0] is not present" in str(error)
+    else:
+        raise AssertionError("an inconsistent selected width was accepted")
+
+
+def test_tail_pool_plan_accepts_explicit_whole_expert_placement() -> None:
+    plan = AsyncMoEPlanV2.from_dict(_tail_pool_bridge())
+
+    assert plan.execution_mode == ASYNC_MOE_EXECUTION_TAIL_POOL
+    assert plan.native_execution_mode == 1
+    assert plan.task_core_begins.tolist() == [0, -1]
+    assert plan.task_placement_modes.tolist() == [
+        ASYNC_MOE_PLACEMENT_FIXED,
+        ASYNC_MOE_PLACEMENT_TAIL_POOL,
+    ]
+    with pytest.raises(RuntimeError, match="only strict Plan V2"):
+        plan.legacy_schedule()
+
+
+def test_tail_pool_plan_requires_a_pooled_task() -> None:
+    plan = _tail_pool_bridge()
+    plan["task_core_begins"] = [0, 2]
+    plan["task_placement_modes"] = [
+        ASYNC_MOE_PLACEMENT_FIXED,
+        ASYNC_MOE_PLACEMENT_FIXED,
+    ]
+
+    with pytest.raises(ValueError, match="at least one pooled task"):
+        AsyncMoEPlanV2.from_dict(plan)
+
+
+def test_tail_pool_plan_rejects_unaligned_fixed_interval() -> None:
+    plan = _tail_pool_bridge()
+    plan["task_core_begins"] = [1, -1]
+
+    with pytest.raises(ValueError, match="align to the tail-pool width"):
+        AsyncMoEPlanV2.from_dict(plan)
+
+
+def test_tail_pool_plan_rejects_pooled_dependencies() -> None:
+    plan = _tail_pool_bridge()
+    plan["task_dep_offsets"] = [0, 0, 1]
+    plan["task_deps"] = [0]
+
+    with pytest.raises(ValueError, match="must not have dependencies"):
+        AsyncMoEPlanV2.from_dict(plan)
+
+
+def test_async_plan_wrapper_calls_native_plan_v2(monkeypatch) -> None:
+    plan = AsyncMoEPlanV2.from_dict(upgrade_legacy_async_plan(_legacy_bridge()))
+    captured: dict[str, object] = {}
+    sentinel = torch.empty(0)
+
+    def fake_async_plan_v2(*args):
+        captured["args"] = args
+        return sentinel
+
+    monkeypatch.setattr(bf16_tiled, "_HAS_BF16_TILED_FUSED_MOE", True)
+    monkeypatch.setattr(
+        bf16_tiled,
+        "_fused_moe_bf16_tiled_async_plan_v2_impl",
+        fake_async_plan_v2,
+    )
+    result = bf16_tiled.fused_moe_bf16_tiled_async_plan(
+        torch.empty((1, 1), dtype=torch.bfloat16),
+        _prepared_weights(),
+        torch.ones((1, 1)),
+        torch.zeros((1, 1), dtype=torch.int32),
+        plan,
+        skip_weighted=True,
+    )
+
+    assert result is sentinel
+    args = captured["args"]
+    assert isinstance(args, tuple)
+    assert args[9].tolist() == [3, 7]
+    assert args[10].tolist() == [0, 2]
+    assert args[11].tolist() == [2, 2]
+    assert args[14] == ASYNC_MOE_PLAN_VERSION
+    assert args[15] == 0
+    assert args[21].tolist() == [
+        ASYNC_MOE_PLACEMENT_FIXED,
+        ASYNC_MOE_PLACEMENT_FIXED,
+    ]
+    assert args[25].tolist() == [0, 0]
+    # Windows default to 0, i.e. the full stripe, and sit between the route
+    # granularities and thread_cpu_ids.
+    assert args[26].tolist() == [0, 0]
+    assert args[27].tolist() == [0, 0]
+    assert args[28].tolist() == [8, 9, 10, 11]
+    assert args[31] == 4
+    assert args[34] is True
+    assert args[38] == 8
+    assert args[40] == -1
+
+
+def test_async_plan_wrapper_requires_native_plan_v2(monkeypatch) -> None:
+    plan = AsyncMoEPlanV2.from_dict(upgrade_legacy_async_plan(_legacy_bridge()))
+    monkeypatch.setattr(bf16_tiled, "_fused_moe_bf16_tiled_async_plan_v2_impl", None)
+    with pytest.raises(RuntimeError, match="Plan V2 requires native"):
+        bf16_tiled.fused_moe_bf16_tiled_async_plan(
+            torch.empty((1, 1), dtype=torch.bfloat16),
+            object(),
+            torch.ones((1, 1)),
+            torch.zeros((1, 1), dtype=torch.int32),
+            plan,
+        )
