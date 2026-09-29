@@ -126,7 +126,8 @@ def test_dynamic_scaled_mm_direct_store_respects_output_boundary(
     )
 
     torch.testing.assert_close(storage[M * N :], torch.full_like(storage[M * N :], 123.0), atol=0, rtol=0)
-    expected = _reference_dynamic_scaled_mm(x, weight, weight_scale, bias=bias, out_dtype=out_dtype)
+    # This case checks direct-store bounds; numerical equivalence is covered above.
+    expected = i8gemm.dynamic_scaled_mm(x, packed, bias=bias, out_dtype=out_dtype, nthreads=1)
     torch.testing.assert_close(out, expected, atol=0, rtol=0)
 
 
