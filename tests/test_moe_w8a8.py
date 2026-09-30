@@ -198,9 +198,10 @@ def test_w8a8_quantized_routed_shared_prepare_appends_shared_expert() -> None:
     not module._HAS_W8A8_TILED_FUSED_MOE,
     reason="ARM SVE i8mm W8A8 extension is unavailable",
 )
-def test_w8a8_plan_v2_matches_dynamic_quantization_reference() -> None:
+@pytest.mark.parametrize(("experts", "team_width"), [(1, 1), (2, 1), (2, 2)])
+def test_w8a8_plan_v2_matches_dynamic_quantization_reference(experts: int, team_width: int) -> None:
     generator = torch.Generator().manual_seed(23)
-    experts, hidden, intermediate, tokens = 2, 64, 64, 48
+    hidden, intermediate, tokens = 64, 64, 48
     q13 = torch.randint(-12, 13, (experts, 2 * intermediate, hidden), dtype=torch.int8, generator=generator)
     q2 = torch.randint(-12, 13, (experts, hidden, intermediate), dtype=torch.int8, generator=generator)
     s13 = torch.rand((experts, 2 * intermediate), generator=generator) * 0.003 + 0.0005
@@ -210,9 +211,15 @@ def test_w8a8_plan_v2_matches_dynamic_quantization_reference() -> None:
     topk_weights = torch.ones((tokens, 1), dtype=torch.float32)
 
     weights = prepare_fused_moe_w8a8_tiled_quantized_weights(q13, s13, q2, s2)
-    plan = _strict_plan(experts, team_width=2)
-    actual = fused_moe_w8a8_tiled_async_plan(input, weights, topk_weights, topk_ids, plan)
-    repeated = fused_moe_w8a8_tiled_async_plan(input, weights, topk_weights, topk_ids, plan)
+    plan = _strict_plan(experts, team_width=team_width)
+    original_affinity = os.sched_getaffinity(0)
+    try:
+        actual = fused_moe_w8a8_tiled_async_plan(input, weights, topk_weights, topk_ids, plan)
+        assert os.sched_getaffinity(0) == original_affinity
+        repeated = fused_moe_w8a8_tiled_async_plan(input, weights, topk_weights, topk_ids, plan)
+        assert os.sched_getaffinity(0) == original_affinity
+    finally:
+        os.sched_setaffinity(0, original_affinity)
     expected = _reference(input, q13, s13, q2, s2, topk_weights, topk_ids)
 
     torch.testing.assert_close(actual.float(), expected.float(), rtol=0.0, atol=3.0e-6)

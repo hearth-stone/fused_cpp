@@ -379,6 +379,36 @@ void bind_thread(int cpu, std::atomic<int>& error) {
   if (status != 0) error.store(status, std::memory_order_relaxed);
 }
 
+// OpenMP also runs tid 0 on the caller: restore both it and reused workers.
+class ThreadAffinityGuard {
+ public:
+  ThreadAffinityGuard(int cpu, std::atomic<int>& error) : error_(error) {
+    if (cpu < 0) return;
+    const int status = pthread_getaffinity_np(pthread_self(), sizeof(original_), &original_);
+    if (status != 0) {
+      error_.store(status, std::memory_order_relaxed);
+      return;
+    }
+    restore_ = true;
+    bind_thread(cpu, error_);
+  }
+
+  ~ThreadAffinityGuard() {
+    if (restore_) {
+      const int status = pthread_setaffinity_np(pthread_self(), sizeof(original_), &original_);
+      if (status != 0) error_.store(status, std::memory_order_relaxed);
+    }
+  }
+
+  ThreadAffinityGuard(const ThreadAffinityGuard&) = delete;
+  ThreadAffinityGuard& operator=(const ThreadAffinityGuard&) = delete;
+
+ private:
+  std::atomic<int>& error_;
+  cpu_set_t original_{};
+  bool restore_ = false;
+};
+
 #endif
 
 }  // namespace
@@ -597,7 +627,7 @@ at::Tensor fused_moe_w8a8_tiled_async_plan_v2(
 #pragma omp parallel num_threads(num_threads)
   {
     const int tid = omp_get_thread_num();
-    if (cpu_ids[static_cast<size_t>(tid)] >= 0) bind_thread(cpu_ids[static_cast<size_t>(tid)], affinity_error);
+    ThreadAffinityGuard affinity_guard(cpu_ids[static_cast<size_t>(tid)], affinity_error);
     const int lane_id = tid / team_width;
     const int local_tid = tid % team_width;
     Workspace& workspace = *workspaces[static_cast<size_t>(lane_id)];
@@ -657,7 +687,8 @@ at::Tensor fused_moe_w8a8_tiled_async_plan_v2(
       }
     }
   }
-  TORCH_CHECK(affinity_error.load(std::memory_order_relaxed) == 0, "W8A8 worker affinity binding failed");
+  TORCH_CHECK(affinity_error.load(std::memory_order_relaxed) == 0,
+              "W8A8 worker affinity binding or restoration failed");
   return output;
 #endif
 }
