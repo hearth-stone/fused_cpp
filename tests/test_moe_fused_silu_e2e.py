@@ -73,3 +73,43 @@ def test_fused_silu_requires_multiple_of_8_F():
     w2 = _bf16(4, 16, 11)
     with pytest.raises(Exception):
         prepare_fused_moe_bf16_tiled_weights(w13, w2, fuse_silu=True)
+
+
+@pytest.mark.parametrize("impl,swiglu_limit", [("jit", None), ("jit", 10.0), ("asm", None)])
+@pytest.mark.parametrize("num_tokens", [9, 10, 11, 12, 24, 37])
+def test_sve_fused_silu_panel_rows_match_single_row(
+    monkeypatch: pytest.MonkeyPatch,
+    impl: str,
+    num_tokens: int,
+    swiglu_limit: float | None,
+) -> None:
+    """Identical rows must match the small-M result, including M9-M12 tails.
+
+    The cached two-row SiLU epilogue must use the same exp coefficients as
+    the per-row epilogue. The delivery's historical jit selector uses AOT code.
+    """
+    monkeypatch.setenv("FUSED_CPP_MOE_SVE", "1")
+    monkeypatch.setenv("FUSED_CPP_MOE_SVE_IMPL", impl)
+    generator = torch.Generator().manual_seed(29)
+    hidden, ffn = 512, 64
+    w13 = (torch.randn((1, 2 * ffn, hidden), generator=generator) * 0.05).to(torch.bfloat16)
+    w2 = (torch.randn((1, hidden, ffn), generator=generator) * 0.05).to(torch.bfloat16)
+    packed = prepare_fused_moe_bf16_tiled_weights(w13, w2, fuse_silu=True)
+    if packed.gemm_backend != 1:
+        pytest.skip("requires an SVE BF16 build/runtime")
+    one = (torch.randn((1, hidden), generator=generator) * 0.5).to(torch.bfloat16)
+
+    def run(rows: int) -> torch.Tensor:
+        return fused_moe_bf16_tiled(
+            one.expand(rows, hidden).contiguous(),
+            packed,
+            torch.ones((rows, 1), dtype=torch.float32),
+            torch.zeros((rows, 1), dtype=torch.int32),
+            num_threads=1,
+            activation="silu",
+            swiglu_limit=swiglu_limit,
+        ).clone()
+
+    reference = run(1).expand(num_tokens, hidden)
+    output = run(num_tokens)
+    torch.testing.assert_close(output, reference, atol=0, rtol=0)

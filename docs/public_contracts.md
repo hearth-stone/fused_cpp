@@ -34,3 +34,12 @@ The bitwise and performance acceptance tests for this branch compare the
 Flash BF16 and W8A8 INT8 paths against the 0.28.0 baseline on the same Arm
 host. Changes to backend numerics require explicit validation in the relevant
 operator and model tests.
+
+The SVE fused W13 SiLU epilogues use the same exp polynomial for cached
+row pairs, individual rows and exact-M tails. Identical BF16 input rows must
+produce identical outputs regardless of their panel position; strict Plan V2
+route slices preserve the full-expert output even when their sizes are not
+multiples of 12. This also applies to the supported limit-10 clamped AOT path.
+Static `asm` retains its existing unclamped-only contract. See
+[`bf16_silu_fix_validation.md`](bf16_silu_fix_validation.md) for the delivery
+backport and target-machine validation.

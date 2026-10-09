@@ -355,33 +355,39 @@ def test_sve_jit_clamped_swiglu_matches_deepseek_v4_reference(
         )
 
 
+@pytest.mark.parametrize("impl,swiglu_limit", [("jit", None), ("jit", 10.0), ("asm", None)])
+@pytest.mark.parametrize("granularity", [24, 20, 13, 7, 1])
 def test_sve_plan_v2_route_slices_match_full_experts(
     monkeypatch: pytest.MonkeyPatch,
+    impl: str,
+    granularity: int,
+    swiglu_limit: float | None,
 ) -> None:
     """Concurrent route slices must preserve full-expert output and completion."""
     if "arm_sve_bf16" not in available_fused_moe_bf16_tiled_backends():
         pytest.skip("requires an SVE BF16 build/runtime")
     monkeypatch.setenv("FUSED_CPP_MOE_SVE", "1")
+    monkeypatch.setenv("FUSED_CPP_MOE_SVE_IMPL", impl)
     monkeypatch.setenv("FUSED_CPP_MOE_ASYNC_READY_TOKEN_MERGE", "1")
     generator = torch.Generator().manual_seed(20260730)
-    hidden_size = 64
-    ffn_hidden_size = 32
-    route_counts = [48, 24]
+    hidden_size = 256
+    ffn_hidden_size = 64
+    route_counts = [50, 26]
     num_tokens = sum(route_counts)
     hidden_states = _bf16_normal(
         (num_tokens, hidden_size),
         generator=generator,
-        std=0.01,
+        std=0.5,
     )
     w13_weight = _bf16_normal(
         (len(route_counts), 2 * ffn_hidden_size, hidden_size),
         generator=generator,
-        std=0.01,
+        std=0.05,
     )
     w2_weight = _bf16_normal(
         (len(route_counts), hidden_size, ffn_hidden_size),
         generator=generator,
-        std=0.01,
+        std=0.05,
     )
     topk_ids = torch.cat(
         [torch.full((count,), expert, dtype=torch.int32) for expert, count in enumerate(route_counts)]
@@ -411,18 +417,32 @@ def test_sve_plan_v2_route_slices_match_full_experts(
             "task_deps": [],
         }
     )
+    task_expert_ids = []
+    task_core_begins = []
+    task_dep_offsets = [0]
+    task_deps = []
+    previous_on_core = {}
+    for expert, routes in enumerate(route_counts):
+        for index in range((routes + granularity - 1) // granularity):
+            core = 2 * expert + index % 2
+            if core in previous_on_core:
+                task_deps.append(previous_on_core[core])
+            previous_on_core[core] = len(task_expert_ids)
+            task_expert_ids.append(expert)
+            task_core_begins.append(core)
+            task_dep_offsets.append(len(task_deps))
     sliced_bridge = upgrade_legacy_async_plan(
         {
             "num_threads": 4,
             "thread_cpu_ids": cpu_ids,
-            "task_expert_ids": [0, 0, 1, 1],
-            "task_core_begins": [0, 1, 2, 3],
-            "task_threads": [1, 1, 1, 1],
-            "task_dep_offsets": [0, 0, 0, 0, 0],
-            "task_deps": [],
+            "task_expert_ids": task_expert_ids,
+            "task_core_begins": task_core_begins,
+            "task_threads": [1] * len(task_expert_ids),
+            "task_dep_offsets": task_dep_offsets,
+            "task_deps": task_deps,
         }
     )
-    sliced_bridge["task_range_granularities"] = [24, 24, 12, 12]
+    sliced_bridge["task_range_granularities"] = [granularity] * len(task_expert_ids)
 
     full = fused_moe_bf16_tiled_async_plan(
         hidden_states,
@@ -430,6 +450,7 @@ def test_sve_plan_v2_route_slices_match_full_experts(
         topk_weights,
         topk_ids,
         AsyncMoEPlanV2.from_dict(full_bridge),
+        swiglu_limit=swiglu_limit,
     )
     sliced = fused_moe_bf16_tiled_async_plan(
         hidden_states,
@@ -437,6 +458,7 @@ def test_sve_plan_v2_route_slices_match_full_experts(
         topk_weights,
         topk_ids,
         AsyncMoEPlanV2.from_dict(sliced_bridge),
+        swiglu_limit=swiglu_limit,
     )
 
     torch.testing.assert_close(sliced.float(), full.float(), atol=0, rtol=0)

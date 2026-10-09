@@ -640,10 +640,12 @@
 	fmls z1.s, p1/m, \up1\().s, z27.s
 	fexpa \up0\().s, z2.s
 	fexpa \up1\().s, z3.s
-	mov z2.d, z24.d
-	mov z3.d, z24.d
-	fmla z2.s, p1/m, z0.s, z7.s
-	fmla z3.s, p1/m, z1.s, z7.s
+	// Match the per-row epilogue: exp(r) - 1 ~= r * (c0 + c1 * r).
+	// z7 = c0, z24 = c1; swapping them changes BF16 rounding by row.
+	mov z2.d, z7.d
+	mov z3.d, z7.d
+	fmla z2.s, p1/m, z0.s, z24.s
+	fmla z3.s, p1/m, z1.s, z24.s
 	fmul z2.s, p1/m, z2.s, z0.s
 	fmul z3.s, p1/m, z3.s, z1.s
 	fmla \up0\().s, p1/m, \up0\().s, z2.s
