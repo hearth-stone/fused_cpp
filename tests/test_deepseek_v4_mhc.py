@@ -483,3 +483,39 @@ def test_mhc_post_pre_sve_candidate_preserves_strict_post_boundary() -> None:
     torch.testing.assert_close(actual[1], expected[1], rtol=2e-4, atol=2e-4)
     torch.testing.assert_close(actual[2], expected[2], rtol=2e-4, atol=2e-4)
     torch.testing.assert_close(actual[3].float(), expected[3].float(), rtol=0.0, atol=0.015625)
+
+
+@pytest.mark.skipif(not _HAS_DEEPSEEK_V4_MHC_SVE_PROJECTION, reason="SVE VL128/VL256 projection is unavailable")
+@pytest.mark.parametrize("tokens", [1, 6, 7, 8, 379, 553, 554, 555])
+@pytest.mark.parametrize("num_threads", [8, 80])
+def test_mhc_sve_projection_preserves_batch_rows(tokens: int, num_threads: int) -> None:
+    """Keep K accumulation identical across small-M, full panels and tails."""
+    values = _inputs(560, c=4, h=4096)
+    prepared = prepare_mhc_weight(values["pre_fn"], kind="pre")
+    # Shift the selected rows to exercise a different panel position as well.
+    offset = 3
+    residual = values["residual"][offset : offset + tokens].contiguous()
+    assert _native_sve_projection is not None
+    small, small_sums, small_mr, small_kc = _native_sve_projection(residual, prepared.packed, num_threads, 1 << 20)
+    batched, batched_sums, batch_mr, batch_kc = _native_sve_projection(
+        values["residual"], prepared.packed, num_threads, 1 << 20
+    )
+    assert small_mr == batch_mr
+    assert small_kc == batch_kc == 8192
+    torch.testing.assert_close(small, batched[offset : offset + tokens], rtol=0.0, atol=0.0)
+    torch.testing.assert_close(small_sums, batched_sums[offset : offset + tokens], rtol=0.0, atol=0.0)
+
+
+@pytest.mark.skipif(not _HAS_DEEPSEEK_V4_MHC_SVE_PROJECTION, reason="SVE VL128/VL256 projection is unavailable")
+@pytest.mark.parametrize("tokens", [1, 379, 555])
+def test_mhc_sve_pre_rmsnorm_preserves_batch_rows(tokens: int) -> None:
+    values = _inputs(560, c=4, h=4096)
+    prepared = prepare_mhc_weight(values["pre_fn"], kind="pre")
+    common = (prepared, values["hc_scale"], values["hc_base"], values["norm_weight"])
+    offset = 3
+    small = mhc_pre_rmsnorm_sve_candidate(
+        values["residual"][offset : offset + tokens].contiguous(), *common, num_threads=80
+    )
+    batched = mhc_pre_rmsnorm_sve_candidate(values["residual"], *common, num_threads=80)
+    for actual, expected in zip(small, batched, strict=True):
+        torch.testing.assert_close(actual, expected[offset : offset + tokens], rtol=0.0, atol=0.0)

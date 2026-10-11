@@ -739,7 +739,6 @@ std::tuple<at::Tensor, at::Tensor, int64_t, int64_t> deepseek_v4_mhc_sve_project
   }
   const ProjectionBlockGeometry geometry = MakeProjectionBlockGeometry(m, mr, pad_m7_tail);
   const int64_t blocks = geometry.blocks();
-  const int64_t windows = (k + kc - 1) / kc;
 
   const int sum_threads = EffectiveThreads(requested, m);
 #pragma omp parallel for num_threads(sum_threads) schedule(static)
@@ -747,7 +746,9 @@ std::tuple<at::Tensor, at::Tensor, int64_t, int64_t> deepseek_v4_mhc_sve_project
     sums[row] = SquaredSum(input + row * k, k);
   }
 
-  if (blocks >= max_threads || windows == 1) {
+  // Keep each row on one K accumulation chain, independent of M and thread count.
+  // Cache windows reuse that accumulator rather than reducing independent partial sums.
+  {
     const int threads = EffectiveThreads(max_threads, blocks);
 #pragma omp parallel num_threads(threads)
     {
@@ -770,33 +771,6 @@ std::tuple<at::Tensor, at::Tensor, int64_t, int64_t> deepseek_v4_mhc_sve_project
           RunBlock(block_input + k_begin, k, weight + k_begin * kMhcProjectionN, block_output, rows, k_length, mr,
                    k_begin != 0);
         }
-      }
-    }
-  } else {
-    const int64_t k_parts = std::min<int64_t>(windows, (max_threads + blocks - 1) / blocks);
-    at::Tensor partial = at::empty({k_parts, m, kMhcProjectionN}, at::TensorOptions().dtype(at::kFloat));
-    auto* partial_data = partial.data_ptr<float>();
-    const int64_t tasks = blocks * k_parts;
-    const int threads = EffectiveThreads(max_threads, tasks);
-#pragma omp parallel for num_threads(threads) schedule(static)
-    for (int64_t task = 0; task < tasks; ++task) {
-      const int64_t part = task / blocks;
-      const int64_t block = task % blocks;
-      const int64_t k_begin = k * part / k_parts;
-      const int64_t k_end = k * (part + 1) / k_parts;
-      const auto [m_begin, rows] = geometry.block(block);
-      RunBlock(input + m_begin * k + k_begin, k, weight + k_begin * kMhcProjectionN,
-               partial_data + (part * m + m_begin) * kMhcProjectionN, rows, k_end - k_begin, mr, false);
-    }
-    const int reduce_threads = EffectiveThreads(max_threads, m);
-#pragma omp parallel for num_threads(reduce_threads) schedule(static)
-    for (int64_t row = 0; row < m; ++row) {
-      for (int64_t column = 0; column < kMhcProjectionN; ++column) {
-        float value = 0.0f;
-        for (int64_t part = 0; part < k_parts; ++part) {
-          value += partial_data[(part * m + row) * kMhcProjectionN + column];
-        }
-        result[row * kMhcProjectionN + column] = value;
       }
     }
   }

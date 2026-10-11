@@ -43,3 +43,11 @@ multiples of 12. This also applies to the supported limit-10 clamped AOT path.
 Static `asm` retains its existing unclamped-only contract. See
 [`bf16_silu_fix_validation.md`](bf16_silu_fix_validation.md) for the delivery
 backport and target-machine validation.
+
+The SVE mHC pre projection accumulates each row along K in order, including
+across its existing packed-B cache windows. Small M does not select independent
+K partial sums: changing the batch size or thread count must not change this
+projection's accumulation order. The Python/native signatures, default 1 MiB
+window and returned MR/KC geometry are unchanged. This is an operator-level
+invariant; it does not guarantee batch invariance for the entire vLLM model.
+See [`mhc_no_split_k_validation.md`](mhc_no_split_k_validation.md).
