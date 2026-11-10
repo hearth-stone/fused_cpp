@@ -281,9 +281,15 @@ class MoePlannerRuntime:
             )
             self._planner.last["combined_top_k"] = int(combined_topk_ids.shape[1])
             self._persist_cost_cache_if_needed()
-        return AsyncMoEPlanV2.from_dict(spec["bridge"])
+        return AsyncMoEPlanV2._from_planner_bridge(spec["bridge"])
 
     def _persist_cost_cache_if_needed(self) -> None:
+        if self._cost_disk_cache is None:
+            # Nothing to persist: count the entries without copying the table.
+            cache = getattr(self.model, "_t_iso_scalar_cache", None)
+            total = len(cache) if isinstance(cache, dict) else len(self.model.export_t_iso_cache())
+            self._cost_cache_diagnostics["total_entries"] = total
+            return
         entries = self.model.export_t_iso_cache()
         total_entries = len(entries)
         if self._cost_disk_cache is None or entries.keys() <= self._cost_cache_persisted_keys:

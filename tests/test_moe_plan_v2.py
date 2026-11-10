@@ -316,3 +316,23 @@ def test_async_plan_wrapper_requires_native_plan_v2(monkeypatch) -> None:
             torch.zeros((1, 1), dtype=torch.int32),
             plan,
         )
+
+
+@pytest.mark.parametrize("windows", [False, True])
+def test_planner_bridge_materializes_like_from_dict(windows: bool) -> None:
+    bridge = upgrade_legacy_async_plan(_legacy_bridge())
+    bridge["early_merge"] = True
+    if windows:
+        bridge["task_w13_window_tiles"] = [2, 0]
+        bridge["task_w2_window_tiles"] = [16, 8]
+    expected = AsyncMoEPlanV2.from_dict(bridge)
+    actual = AsyncMoEPlanV2._from_planner_bridge(bridge)
+
+    assert vars(actual).keys() == vars(expected).keys()
+    for name, value in vars(expected).items():
+        if isinstance(value, torch.Tensor):
+            assert getattr(actual, name).dtype == value.dtype == torch.int64, name
+            assert torch.equal(getattr(actual, name), value), name
+        else:
+            assert getattr(actual, name) == value, name
+    actual.validate()

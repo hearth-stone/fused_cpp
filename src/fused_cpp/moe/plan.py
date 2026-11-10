@@ -179,6 +179,25 @@ class AsyncMoEPlanV2:
             **tensors,
         )
 
+    @classmethod
+    def _from_planner_bridge(cls, plan: Mapping[str, object]) -> "AsyncMoEPlanV2":
+        """Materialize a bridge built by this package's planner without re-validating it.
+
+        ``from_dict`` converts element by element and runs :meth:`validate` in Python,
+        about 1 ms per DeepSeek V4 call; the planner's own bridges skip both.
+        """
+        instance = object.__new__(cls)
+        num_tasks = len(plan["task_expert_ids"])
+        object.__setattr__(instance, "num_threads", int(plan["num_threads"]))
+        object.__setattr__(instance, "execution_mode", str(plan["execution_mode"]))
+        object.__setattr__(instance, "early_merge", plan.get("early_merge"))
+        for name in _V2_SEQUENCE_FIELDS:
+            object.__setattr__(instance, name, torch.tensor(plan[name], dtype=torch.int64))
+        for name in _V2_OPTIONAL_PER_TASK_FIELDS:
+            value = plan.get(name, [_V2_OPTIONAL_PER_TASK_DEFAULTS[name]] * num_tasks)
+            object.__setattr__(instance, name, torch.tensor(value, dtype=torch.int64))
+        return instance
+
     def validate(self) -> None:
         if self.execution_mode not in {
             ASYNC_MOE_EXECUTION_STRICT,
