@@ -1,5 +1,5 @@
 <!--
-Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+Copyright (c) 2026 Huawei Technologies Co., Ltd.
 -->
 
 # DeepSeek V4 CPU 交付版：安装、测试与结果对比

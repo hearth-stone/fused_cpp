@@ -1,5 +1,5 @@
 <!--
-Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+Copyright (c) 2026 Huawei Technologies Co., Ltd.
 -->
 
 # BF16 fused W13 SiLU delivery backport

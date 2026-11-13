@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+ * Copyright (c) 2026 Huawei Technologies Co., Ltd.
  */
 
 // Single place that decides how large working buffers are backed by pages.

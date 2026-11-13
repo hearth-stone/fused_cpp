@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+ * Copyright (c) 2026 Huawei Technologies Co., Ltd.
  */
 
 // ARM NEON/BFMMLA fused MoE kernels (fused_cpp-owned; do NOT edit i8gemm)

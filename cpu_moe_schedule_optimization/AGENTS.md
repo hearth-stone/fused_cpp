@@ -1,5 +1,5 @@
 <!--
-Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+Copyright (c) 2026 Huawei Technologies Co., Ltd.
 -->
 
 # CPU MoE Planner And Cost Model Guide
