@@ -52,3 +52,12 @@ Model-level performance comparisons should use the same vLLM source, NUMA
 binding, model checkpoint, prompt token IDs, request spacing, and warmup for
 both builds. This matters because an already warm prefix cache and different
 process state can change 2k-prompt latency by more than a kernel edit.
+
+## License
+
+Copyright 2026 fused_cpp contributors.
+
+This project is licensed under the [Apache License, Version 2.0](LICENSE),
+except for third-party components covered by their own license notices.
+The bundled [zlgemm sources](third_party/zlgemm) retain their
+[MIT License](third_party/zlgemm/LICENSE).
