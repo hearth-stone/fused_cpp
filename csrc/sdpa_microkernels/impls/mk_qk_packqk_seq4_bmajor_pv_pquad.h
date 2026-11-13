@@ -1,3 +1,7 @@
+/*
+ * Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+ */
+
 #pragma once
 // ── 微内核 impl：MK_QkPackqkSeq4BmajorPvPquad ───────────────────────────────
 //

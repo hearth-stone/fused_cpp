@@ -1,4 +1,6 @@
 # -*- coding: utf-8 -*-
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+
 """Task 6: end-to-end MoE equivalence for the fused SiLU-and-mul path.
 
 The opt-in fused path (prepare with fuse_silu=True) must match the baseline

@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+
 """Domain-bound, exact-shape and stage-aware MoE contention model.
 
 Schema-v2 profiles bind measurements to a sharded expert shape, kernel binary,

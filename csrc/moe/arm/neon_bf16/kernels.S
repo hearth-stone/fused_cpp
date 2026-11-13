@@ -1,3 +1,7 @@
+/*
+ * Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+ */
+
 // ARM NEON/BFMMLA fused MoE kernels (fused_cpp-owned; do NOT edit i8gemm)
 // Self-contained copy of the ldp_silu kernel machinery from
 // refs/i8gemm/lib/bf16gemm_k.S, with a packed-C (reorder-m8) store so the

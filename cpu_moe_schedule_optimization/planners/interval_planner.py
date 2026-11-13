@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+
 """Static interval-DAG planner with exact-domain calibration."""
 
 from __future__ import annotations

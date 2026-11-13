@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+
 """Parametric isolated-expert latency model.
 
 The active formula separates route work from thread scaling::

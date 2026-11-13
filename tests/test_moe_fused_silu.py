@@ -1,4 +1,6 @@
 # -*- coding: utf-8 -*-
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+
 """Unit tests for the fused w13-GEMM + SiLU-and-mul epilogue.
 
 Task 1: the interleaved w13 prepack must place gate/up columns per 8-col

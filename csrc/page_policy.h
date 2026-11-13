@@ -1,3 +1,7 @@
+/*
+ * Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+ */
+
 // Single place that decides how large working buffers are backed by pages.
 //
 // Before this header the choice was made independently in three places with

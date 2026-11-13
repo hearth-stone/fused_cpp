@@ -1,3 +1,7 @@
+/*
+ * Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+ */
+
 #pragma once
 // ── 三级 cache 常量 / tile 尺寸推导（共享头）─────────────────────────────
 //

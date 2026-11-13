@@ -1,3 +1,7 @@
+<!--
+Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+-->
+
 # Agent Benchmark Hygiene
 
 Read this document before collecting, comparing, or reporting performance.

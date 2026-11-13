@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+
 """Compare delivery builds with fixed inputs, CPU placement and a shared profile.
 
 Run each build in a fresh process with its src directory first on PYTHONPATH.

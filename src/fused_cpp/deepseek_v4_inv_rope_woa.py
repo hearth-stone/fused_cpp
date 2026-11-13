@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+
 """DeepSeek-V4 inverse-RoPE plus grouped WO_A operator contract."""
 
 from __future__ import annotations

@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+
 """Hardware-grounded analytical cost model for fused CPU MoE.
 
 The model deliberately separates route-dependent work from machine

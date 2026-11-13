@@ -1,4 +1,6 @@
 # -*- coding: utf-8 -*-
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+
 """Explicit W8A8 linear selection for DeepSeek V4 attention projections."""
 
 from __future__ import annotations

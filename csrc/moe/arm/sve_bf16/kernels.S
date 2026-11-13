@@ -1,3 +1,7 @@
+/*
+ * Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+ */
+
 // fused_cpp-owned SVE BF16 MoE kernels.
 //
 // This file intentionally does not export the upstream bf16gemm_k_* symbols.

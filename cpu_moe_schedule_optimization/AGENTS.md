@@ -1,3 +1,7 @@
+<!--
+Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+-->
+
 # CPU MoE Planner And Cost Model Guide
 
 These rules apply under `cpu_moe_schedule_optimization/` in addition to the

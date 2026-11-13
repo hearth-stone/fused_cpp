@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+
 [build-system]
 requires = ["setuptools>=64", "wheel", "torch"]
 build-backend = "setuptools.build_meta"

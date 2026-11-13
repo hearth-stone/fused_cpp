@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+
 """Fused MoE (Mixture of Experts) with full-token EP optimization."""
 
 from fused_cpp.moe.plan import (

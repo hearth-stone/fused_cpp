@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+
 """Correctness tests for the DeepSeek V4 mHC Torch baseline."""
 
 from __future__ import annotations

@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+
 """Runtime integration for cached policy-aware interval-DAG planning."""
 
 from __future__ import annotations

@@ -1,3 +1,7 @@
+<!--
+Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+-->
+
 # vLLM CPU BF16 MoE Integration Guide
 
 This document describes the supported Python integration for the `fused_cpp`

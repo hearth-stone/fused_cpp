@@ -1,4 +1,6 @@
 # -*- coding: utf-8 -*-
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+
 """BF16 tiled fused MoE wrapper."""
 
 from __future__ import annotations

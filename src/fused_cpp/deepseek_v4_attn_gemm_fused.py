@@ -1,4 +1,6 @@
 # -*- coding: utf-8 -*-
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+
 """DeepSeek V4 attn_gemm_parallel_execute fused GEMM helper."""
 
 from __future__ import annotations

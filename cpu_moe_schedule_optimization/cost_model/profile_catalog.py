@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+
 """Strict schema-v2 profile identity and selection helpers."""
 
 from __future__ import annotations

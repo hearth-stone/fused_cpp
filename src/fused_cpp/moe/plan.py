@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+
 """Versioned execution plans for the async CPU MoE runtime."""
 
 from __future__ import annotations

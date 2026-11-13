@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+
 """SVE BF16 packed-A implementation mapping for the layered GEMM model."""
 
 from __future__ import annotations

@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+
 """Torch reference implementation of DeepSeek V4 Multi-Head Hyper-Connections."""
 
 from __future__ import annotations

@@ -1,3 +1,7 @@
+/*
+ * Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+ */
+
 // ATen tensors whose storage comes from the shared page policy.
 //
 // Kept separate from page_policy.h so that header stays free of ATen: the policy

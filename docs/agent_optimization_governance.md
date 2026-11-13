@@ -1,3 +1,7 @@
+<!--
+Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+-->
+
 # Agent Optimization Governance
 
 Read this file before operator/kernel optimization work, optimization manifest

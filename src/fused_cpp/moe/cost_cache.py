@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+
 """Versioned disk cache for analytical MoE isolated-cost scalars."""
 
 from __future__ import annotations

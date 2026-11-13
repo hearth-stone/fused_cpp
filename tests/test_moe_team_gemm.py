@@ -1,4 +1,6 @@
 # -*- coding: utf-8 -*-
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+
 """Unit tests for the refactored MoE GEMM layers.
 
 Task 1: the bottom-layer single-thread GEMM (`fused_moe_test_single_thread_gemm`)

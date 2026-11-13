@@ -1,3 +1,7 @@
+<!--
+Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+-->
+
 # DeepSeek V4 CPU 交付版：安装、测试与结果对比
 
 本文从空目录在 `final_test` 下安装一套独立的交付环境：一份 vLLM、一份 AOT `fused_cpp`、一个 Python 虚拟环境，以及独立的 MMLU 评测环境和结果。原有部署环境保留在原目录，便于与交付环境比较。随后验证内核、运行少量 MMLU 题目，并说明如何沿用现有脚本做性能测试。命令面向 Linux AArch64；模型服务和性能测试示例使用 `Arm-codex-internal` 的 320 核拓扑。以下命令在同一个 Bash shell 中按顺序执行。

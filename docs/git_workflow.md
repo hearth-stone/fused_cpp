@@ -1,3 +1,7 @@
+<!--
+Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+-->
+
 # Git Workflow
 
 This repository uses Git to preserve reviewable engineering decisions, not as a

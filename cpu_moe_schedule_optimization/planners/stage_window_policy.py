@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+
 """Per-thread stage-window policy, denominated in whole packed-B N tiles.
 
 A stage's computation pattern is determined by `(threads, window_tiles)`; see

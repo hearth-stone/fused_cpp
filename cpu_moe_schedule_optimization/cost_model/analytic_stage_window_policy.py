@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+
 """Formula-generated shadow policy for exact per-thread stage windows.
 
 The policy deliberately stays outside the production planner until its

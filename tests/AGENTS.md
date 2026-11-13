@@ -1,3 +1,7 @@
+<!--
+Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+-->
+
 # Test And Benchmark Guide
 
 These rules apply under `tests/` in addition to the repository guide and

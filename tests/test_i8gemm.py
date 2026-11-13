@@ -1,4 +1,6 @@
 # -*- coding: utf-8 -*-
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+
 """Tests for the public ``fused_cpp.i8gemm`` wrapper."""
 
 from __future__ import annotations

@@ -1,4 +1,6 @@
 # -*- coding: utf-8 -*-
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+
 """BF16 linear wrapper backed by refs/i8gemm bf16gemm.
 
 Public API:

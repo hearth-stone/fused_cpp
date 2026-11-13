@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+
 """The `(threads, window_tiles)` -> computation pattern mapping.
 
 The native `StageWindowPlan` and the planner-side derivation in

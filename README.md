@@ -1,3 +1,7 @@
+<!--
+Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+-->
+
 # fused_cpp: DeepSeek V4 CPU kernels for vLLM 0.28.0
 
 This branch packages the fused_cpp operators used by the DeepSeek V4 CPU path in

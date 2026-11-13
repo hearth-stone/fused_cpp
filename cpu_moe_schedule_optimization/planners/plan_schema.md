@@ -1,3 +1,7 @@
+<!--
+Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+-->
+
 # Plan Schema
 
 This file defines the versioned representation for CPU MoE scheduler output.

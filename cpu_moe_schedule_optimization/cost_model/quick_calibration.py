@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+
 """Explicit quick machine calibration for the analytical MoE planner."""
 
 from __future__ import annotations

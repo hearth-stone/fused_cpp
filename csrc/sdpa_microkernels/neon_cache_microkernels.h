@@ -1,3 +1,7 @@
+/*
+ * Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+ */
+
 #pragma once
 // ── FlashAttention-2 SDPA NEON micro-kernels ───────────────────────────────
 //

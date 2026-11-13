@@ -1,4 +1,6 @@
 # -*- coding: utf-8 -*-
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+
 """packA fusion: fused gather + M12/M8 reorder packing.
 
 Task 1: `gather_pack_a_reorder_m8` must produce a byte-for-byte identical

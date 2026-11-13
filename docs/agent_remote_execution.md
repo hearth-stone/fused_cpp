@@ -1,3 +1,7 @@
+<!--
+Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+-->
+
 # Agent Remote Execution
 
 Read this document before remote builds, tests, or benchmarks. The local Git

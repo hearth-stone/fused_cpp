@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+
 schema_version: 1
 description: >-
   Authoritative inventory of repository-owned environment variables parsed by

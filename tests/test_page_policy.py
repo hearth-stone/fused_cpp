@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+
 """The shared page policy: one environment surface for every large buffer.
 
 The policy latches on the first allocation, so each case runs in a subprocess.

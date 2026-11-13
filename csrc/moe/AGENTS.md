@@ -1,3 +1,7 @@
+<!--
+Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+-->
+
 # MoE Native Code Guide
 
 These rules apply under `csrc/moe/` in addition to the repository guide.

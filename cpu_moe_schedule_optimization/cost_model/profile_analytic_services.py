@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+
 """Profile route-independent service anchors for the analytical MoE model.
 
 The load probes execute the generated SVE packed-B loop with all arithmetic and

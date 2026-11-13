@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+
 """Implementation-weak contracts for layered GEMM cost models.
 
 The model core separates three concerns:

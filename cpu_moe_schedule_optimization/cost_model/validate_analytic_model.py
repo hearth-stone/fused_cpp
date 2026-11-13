@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+
 """Validate an analytical machine calibration against an empirical profile.
 
 The empirical profile is a holdout oracle only. It is never loaded by the

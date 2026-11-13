@@ -1,4 +1,6 @@
 # -*- coding: utf-8 -*-
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+
 """DeepSeek V4 CPU prefill cache/index helper baselines."""
 
 from __future__ import annotations

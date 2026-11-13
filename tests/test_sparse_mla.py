@@ -1,4 +1,6 @@
 # -*- coding: utf-8 -*-
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+
 """Tests for the vLLM-style naive sparse prefill MLA reference."""
 
 from __future__ import annotations

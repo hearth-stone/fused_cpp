@@ -1,3 +1,7 @@
+<!--
+Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+-->
+
 # Public contracts for the DeepSeek V4 CPU delivery
 
 The explicit `__all__` lists in `src/fused_cpp/__init__.py` and

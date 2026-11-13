@@ -1,3 +1,7 @@
+<!--
+Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+-->
+
 # Expert Cost Profile Schema
 
 ## Schema v2: calibration-domain- and topology-bound contention profile

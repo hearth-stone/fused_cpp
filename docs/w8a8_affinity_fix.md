@@ -1,3 +1,7 @@
+<!--
+Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+-->
+
 # W8A8 MoE CPU affinity restoration
 
 The W8A8 Plan V2 executor pins threads inside an OpenMP parallel region.

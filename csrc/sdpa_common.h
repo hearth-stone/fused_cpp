@@ -1,3 +1,7 @@
+/*
+ * Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+ */
+
 #pragma once
 // ── SDPA 多版本框架公共头 ──────────────────────────────────────────────
 //

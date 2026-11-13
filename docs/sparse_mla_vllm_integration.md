@@ -1,3 +1,7 @@
+<!--
+Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+-->
+
 # Sparse MLA vLLM Integration Guide
 
 本文档说明如何把 `fused_cpp` 的 CPU sparse MLA forward 接入 vLLM

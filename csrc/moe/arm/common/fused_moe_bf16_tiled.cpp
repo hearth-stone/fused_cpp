@@ -1,3 +1,7 @@
+/*
+ * Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+ */
+
 #include <ATen/MemoryOverlap.h>
 #include <torch/extension.h>
 #include <torch/csrc/autograd/variable.h>

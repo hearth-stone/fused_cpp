@@ -1,3 +1,7 @@
+/*
+ * Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+ */
+
 #include "deepseek_v4_attn_gemm_sve.h"
 
 #include <algorithm>

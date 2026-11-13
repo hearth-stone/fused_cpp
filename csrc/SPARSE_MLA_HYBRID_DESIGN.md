@@ -1,3 +1,7 @@
+<!--
+Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+-->
+
 # Sparse MLA Hybrid NEON 设计草案
 
 > 状态：设计草案，尚未实现。

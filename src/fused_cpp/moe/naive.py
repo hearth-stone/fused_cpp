@@ -1,4 +1,6 @@
 # -*- coding: utf-8 -*-
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+
 """Naive PyTorch Fused MoE expert FFN.
 
 This module mirrors the tensor semantics of vLLM's ``cpu_fused_moe_torch``:

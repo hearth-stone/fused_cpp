@@ -1,3 +1,7 @@
+<!--
+Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+-->
+
 # Agent Performance References
 
 Read this file only when comparing benchmark results with peak/sanity reference

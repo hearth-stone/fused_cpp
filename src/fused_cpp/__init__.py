@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+
 """Native CPU operators used by vLLM 0.28.0 DeepSeek V4 on Arm."""
 
 from . import bf16_linear, deepseek_v4_attn_gemm_fused, i8gemm, moe

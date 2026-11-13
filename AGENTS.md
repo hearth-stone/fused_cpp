@@ -1,3 +1,7 @@
+<!--
+Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+-->
+
 # Agent Guide
 
 This repository is an independent C++/Python extension workspace. Keep this

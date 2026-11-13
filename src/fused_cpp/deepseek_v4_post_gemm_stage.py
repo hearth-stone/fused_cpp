@@ -1,4 +1,6 @@
 # -*- coding: utf-8 -*-
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+
 """DeepSeek V4 post-GEMM attention stage baselines.
 
 This module mirrors the CPU prefill semantics of the second

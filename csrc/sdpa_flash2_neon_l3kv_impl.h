@@ -1,3 +1,7 @@
+/*
+ * Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+ */
+
 #pragma once
 // ── L3-Resident FlashAttention-2 SDPA 内层模板（impl header）─────────────
 //

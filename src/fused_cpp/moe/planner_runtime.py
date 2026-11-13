@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+
 """Explicit process runtime for analytical Plan V2 MoE dispatch."""
 
 from __future__ import annotations

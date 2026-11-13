@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+
 """Full-N packed-B geometry for production fused-MoE GEMM stages.
 
 A stage's computation pattern is determined by the pair `(threads, window_tiles)`,

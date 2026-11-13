@@ -1,3 +1,7 @@
+<!--
+Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+-->
+
 # Native MoE backend layout
 
 The BF16 fused-expert operator is built as the independent Python extension

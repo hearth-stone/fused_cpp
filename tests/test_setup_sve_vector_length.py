@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+
 """Focused tests for the build-time fixed SVE vector-length selection."""
 
 from __future__ import annotations

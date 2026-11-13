@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+
 """Hardware-derived cache-resident geometries for analytical service probes."""
 
 from __future__ import annotations
